@@ -6225,7 +6225,8 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # ...and nor is a glob or a tilde, which bash may expand to one (QA).
                     "exec -a *-x busybox rm -rf /etc", "exec -a [b]usybox-x busybox rm -rf /etc",
                     "exec -a busybo? busybox rm -rf /etc", "exec -a t* toybox rm -rf /etc",
-                    "exec -a ~ busybox rm -rf /etc"):
+                    "exec -a ~ busybox rm -rf /etc", "exec -a toybox/ toybox rm -rf /etc",
+                    "exec -a x/toybox-x86_64// toybox-x86_64 rm -rf /etc"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$x/$y"', 'rm -rf "$dir/$f"', 'chmod 644 "$x/$y"', 'find "$x/$y" -name a',

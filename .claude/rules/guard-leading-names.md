@@ -59,6 +59,7 @@ paths:
       with `busybox`/`toybox`, an expansion (`"$n"`, `$(…)` as `_OPAQUE_SUBST`), a glob (`*-x`)
       or a tilde: each may become `busybox…`, which makes argv[1] the applet. A denylist of
       those let `exec -a *-x busybox <rm>` run after `touch busybox-x` (QA, 2 passes).
+      Nor one ending in `/`: toybox takes `toybox/` as its own name (QA).
     - toybox keeps a leading `-` (no applet runs); stripping it there too over-denies, safely.
     - `_CMD_START` takes one as a wrapper word, so `cat a.sh | busybox sh` is a stdin shell
       for the write-then-run rule (was allowed on main). Rollup XERK-1701.

@@ -7296,7 +7296,8 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
 
 
 # An `exec -a` name bash passes through unchanged: no expansion, glob, brace or tilde.
-_PLAIN_ARGV0_RE = re.compile(r"[\w.+/-]+\Z")
+# Never ending in `/`: toybox reads `toybox/` as `toybox`, which `_basename` reads as "".
+_PLAIN_ARGV0_RE = re.compile(r"[\w.+/-]*[\w.+-]\Z")
 
 
 def _opt_takes_next(opt: str, takes_value: set[str]) -> bool:
