@@ -157,6 +157,9 @@ class SessionsTest {
         assertEquals("⏳ waiting · Sleep\u00A0·\u00A012m left", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, timed, now))
         val ci = LiveSignals(agents = listOf(shell("wait-external", "Watch CI")))
         assertEquals("⏳ waiting · Watch CI", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, ci, now))
+        // A padded label reads trimmed, as on the web (rollup XERK-1701).
+        val padded = LiveSignals(agents = listOf(shell("wait-external", "  Watch CI  ")))
+        assertEquals("⏳ waiting · Watch CI", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, padded, now))
         val two = LiveSignals(agents = listOf(shell("wait-external"), shell("wait-timed")))
         assertEquals("⏳ waiting on 2 background shells", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, two, now))
         // XERK-1571: no ETA, but a startedAt — how long it has been waiting, off the oldest row.
@@ -611,6 +614,8 @@ class SessionsTest {
         // A stalled wait names what it stalled on, in the danger tone, with no age.
         assertEquals(st("stalled · Watch CI", com.xerktech.turma.ui.CardTone.STALLED),
             card(waitingOn(shell("wait-external", "Watch CI"), ageSec = 46 * 60.0)))
+        assertEquals(st("stalled · Watch CI", com.xerktech.turma.ui.CardTone.STALLED),
+            card(waitingOn(shell("wait-external", " Watch CI\t"), ageSec = 46 * 60.0)))
         assertEquals(st("stalled on 2 background shells", com.xerktech.turma.ui.CardTone.STALLED),
             card(waitingOn(shell("wait-external"), shell("wait-timed"), ageSec = 46 * 60.0)))
         assertEquals(st("stalled on 1 background shell", com.xerktech.turma.ui.CardTone.STALLED),
