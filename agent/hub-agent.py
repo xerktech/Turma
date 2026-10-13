@@ -5208,7 +5208,11 @@ def runtime_hooks(managed=None):
 # allowed until then. So the beat re-checks the same baseline and, on a
 # mismatch, logs it and starts that updater run now. Inert where no baseline
 # exists (a repo checkout, the Windows agent, an install from before this).
-HOOK_REPAIR_MIN_INTERVAL = 600   # seconds between updater kicks for one mismatch
+HOOK_REPAIR_MIN_INTERVAL = 600   # seconds before the first re-kick for one mismatch
+# A mismatch the updater cannot repair (an installed build newer than the latest
+# release is never downgraded) would otherwise start it every 600s forever. The
+# gap doubles per kick for the same mismatch, up to the hourly timer's own pace.
+HOOK_REPAIR_MAX_INTERVAL = 3600
 
 
 HOOK_MAX_BYTES = 8 << 20          # a hook bigger than this is not one we shipped
@@ -5294,23 +5298,46 @@ def hook_integrity_failures(script_dir=None):
 def check_hook_integrity(state, script_dir=None, now=None, spawn=None):
     """Beat-time half of the check above. ``state`` is a dict the caller keeps
     across beats (last kick time + last reported set). Returns the mismatched
-    list (or None). Kicks ``bin/turma-agent-update`` detached at most once per
-    HOOK_REPAIR_MIN_INTERVAL; that run takes the update lock, reinstalls the
+    list (or None). Kicks ``bin/turma-agent-update`` detached once a mismatch
+    holds for two checks, then again after HOOK_REPAIR_MIN_INTERVAL, doubling to
+    HOOK_REPAIR_MAX_INTERVAL; that run takes the update lock, reinstalls the
     current version and restarts this manager with sessions preserved."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
     bad = hook_integrity_failures(script_dir)
+    if bad is None and state.get("baselined"):
+        # A baseline this manager has read is gone. Inert here would let deleting
+        # it switch the check off until the hourly timer run; the updater
+        # reinstalls a version with no baseline, which records a fresh one.
+        bad = ["hooks.sha256"]
+    elif bad is not None:
+        state["baselined"] = True
     if not bad:
-        state.pop("reported", None)
+        for key in ("reported", "pending", "kicked", "kicks"):
+            state.pop(key, None)
+        return bad
+    # Act only on checks that mismatch twice in a row. install_payload swaps the
+    # hooks in before it records their baseline (and replaces the baseline by
+    # rm + mv), so a beat landing in between reads a mismatch that is gone by
+    # the next one; one beat is all a real one waits for. Any mismatch counts,
+    # not only the same set: stubbing guard.py and fileguard.py in turn must not
+    # dodge it.
+    if not state.get("pending"):
+        state["pending"] = True
         return bad
     now = time.time() if now is None else now
     if state.get("reported") != bad:
         log(f"WARNING: installed safety hooks do not match {script_dir}/hooks.sha256 "
             f"(tampered or truncated): {', '.join(bad)} — starting the updater to restore them")
         state["reported"] = bad
+    # The backoff survives a changed set and resets only on a clean check: a set
+    # that flips (an editor backup coming and going) re-armed an immediate kick.
     updater = os.path.join(script_dir, "bin", "turma-agent-update")
-    if now - state.get("kicked", 0) < HOOK_REPAIR_MIN_INTERVAL or not os.path.isfile(updater):
+    kicks = state.get("kicks", 0)
+    gap = min(HOOK_REPAIR_MIN_INTERVAL * 2 ** max(kicks - 1, 0), HOOK_REPAIR_MAX_INTERVAL)
+    if (kicks and now - state.get("kicked", 0) < gap) or not os.path.isfile(updater):
         return bad
     state["kicked"] = now
+    state["kicks"] = kicks + 1
     try:
         (spawn or subprocess.Popen)(
             [updater], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

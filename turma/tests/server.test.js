@@ -16036,6 +16036,32 @@ function collectFrames(socket, leftover) {
   return frames;
 }
 
+// collectFrames for a test standing in for an agent's CONTROL channel. It does
+// the two things a real tunnel-agent does that a bare collector does not:
+//   - auto-pongs the hub's protocol ping, so the test-mode silence drop
+//     (CONTROL_DEAD_AFTER_MS, 400ms) cannot reap the channel mid-test on a
+//     loaded box (rollup XERK-1584 #17);
+//   - leaves the hub's keepalive `{ping}` text frames out of the list, so a
+//     test can read "the Nth text frame" without a ping landing at that index
+//     first (XERK-1584 #12.1, the XERK-454 class).
+// A test of liveness itself must keep using collectFrames.
+function collectControlFrames(socket, leftover) {
+  const frames = [];
+  const parse = wsParser((op, payload) => {
+    if (op === 0x9) {
+      if (!socket.destroyed && !socket.writableEnded) socket.write(maskedFrame(0xa, Buffer.alloc(0)));
+      return;
+    }
+    if (op === 0x1) {
+      try { if (JSON.parse(payload.toString("utf8")).ping) return; } catch {}
+    }
+    frames.push({ op, payload });
+  });
+  if (leftover && leftover.length) parse(leftover);
+  socket.on("data", parse);
+  return frames;
+}
+
 function waitFor(predicate, timeoutMs = 3000) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
@@ -16468,7 +16494,7 @@ test("queueCommand pokes a connected control channel so the agent beats immediat
   agents.pokehost = { device: "pokehost", lastSeen: Date.now(), commands: [], history: {}, sessions: [] };
   const ctrl = await wsConnect(`/agent/control?name=pokehost&token=agenttok`);
   assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
-  const frames = collectFrames(ctrl.socket, ctrl.leftover);
+  const frames = collectControlFrames(ctrl.socket, ctrl.leftover);
 
   const cmdId = queueCommand("pokehost", { type: "kill", sessionId: "s1" });
 
@@ -16542,7 +16568,7 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
   // watch/unwatch on and that we push tail deltas back over.
   const ctrl = await wsConnect(`/agent/control?name=livehost&token=agenttok`);
   assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
-  const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
+  const ctrlFrames = collectControlFrames(ctrl.socket, ctrl.leftover);
 
   // The glasses live socket.
   const token = await issueToken();
@@ -16639,7 +16665,7 @@ test("live WS: a control channel connecting after watchers exist re-arms their w
   // Now the tunnel connects — it must be told to watch the already-attached
   // session, and re-armed with the same target a first watch would carry.
   const ctrl = await wsConnect(`/agent/control?name=rehost&token=agenttok`);
-  const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
+  const ctrlFrames = collectControlFrames(ctrl.socket, ctrl.leftover);
   const watch = await nextTextJson(ctrlFrames, 0);
   assert.equal(watch.watch, "rs1");
   assert.equal(watch.worktreePath, "/wt/rs1");
@@ -22829,26 +22855,45 @@ test("control WS: a non-string session id is refused, not used as a property key
     sessions: [{ id: "pk1", status: "running", repo: "r", worktreePath: "/w",
       transcriptId: "conv-pk1", session: { tail: [] } }],
   };
-  const ctrl = await wsConnect(`/agent/control?name=${host}&token=agenttok`);
-  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
   const token = await issueToken();
   const live = await wsConnect(`/live/${host}/pk1?auth=${token}`);
   assert.match(live.statusLine, /^HTTP\/1\.1 101/);
-  // On a loaded box this test can outlast the hub's (test-mode) 1s tunnel-silence
-  // drop, which resets the control socket. wsConnect stops listening for errors
-  // once the upgrade lands, so that reset would surface as an uncaught `read
-  // ECONNRESET` (XERK-1095). It is not what this test checks: the hub staying up is.
-  ctrl.socket.on("error", () => {});
+  const liveFrames = collectFrames(live.socket, live.leftover);
+  // wsConnect stops listening for errors once the upgrade lands, so a reset
+  // would surface as an uncaught `read ECONNRESET` (XERK-1095).
   live.socket.on("error", () => {});
+  const isAfter = (f) => {
+    if (f.op !== 0x1) return false;
+    try { return JSON.parse(f.payload.toString("utf8")).entries?.[0]?.text === "after"; } catch { return false; }
+  };
 
-  for (const frame of [
-    { turn: UNSTRINGIFIABLE, text: "hi" },
-    { tail: UNSTRINGIFIABLE, entries: [] },
-  ]) {
-    ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(frame))));
+  // The poison is followed by a well-formed delta. The hub reads a channel in
+  // order, so that delta reaching the viewer proves a LIVE channel parsed the
+  // two poison frames. A stall longer than the test-mode silence drop (400ms)
+  // can still reap the channel before it reads them; the test then passed
+  // without reaching the guards (rollup XERK-1584 #17). So a dropped channel
+  // is retried on a fresh one, and only a delivered delta counts.
+  let delivered = false;
+  let ctrl;
+  for (let attempt = 0; attempt < 3 && !delivered; attempt++) {
+    ctrl = await wsConnect(`/agent/control?name=${host}&token=agenttok`);
+    assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+    collectControlFrames(ctrl.socket, ctrl.leftover);   // pongs like a real agent
+    ctrl.socket.on("error", () => {});
+    let dropped = false;
+    ctrl.socket.on("close", () => { dropped = true; });
+    for (const frame of [
+      { turn: UNSTRINGIFIABLE, text: "hi" },
+      { tail: UNSTRINGIFIABLE, entries: [] },
+      { tail: "pk1", entries: [{ id: "e1", role: "assistant", text: "after" }] },
+    ]) {
+      ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(frame))));
+    }
+    await waitFor(() => dropped || liveFrames.some(isAfter)).catch(() => {});
+    delivered = liveFrames.some(isAfter);
+    if (!delivered) ctrl.socket.destroy();
   }
-
-  await waitFor(() => true, 200);
+  assert.ok(delivered, "the hub never read the poison frames on a live channel");
   const alive = await request("GET", "/api/agents", { headers: userHeaders });
   assert.equal(alive.status, 200);
   live.socket.destroy();
