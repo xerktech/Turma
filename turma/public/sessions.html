@@ -2353,7 +2353,10 @@ function backgroundWaitLabel(rows, wait, now) {
   const word = wait.state === "stalled" ? "stalled" : "⏳ waiting";
   // One named wait keeps its subject on every branch (XERK-1571): a timed wait
   // that read only "11m left" said nothing about what it waits for.
-  const what = waits.length === 1 && waits[0].label ? " · " + waits[0].label : "";
+  // A blank label names nothing (rollup XERK-1701): "stalled ·  " read as a cut-off
+  // subject, where Android's isNotBlank falls back to the shell count.
+  const named = waits.length === 1 ? String(waits[0].label || "").trim() : "";
+  const what = named ? " · " + named : "";
   // The age's "·" is glued by no-break spaces (XERK-1571): a line never ends on it.
   if (wait.eta != null && wait.eta > now) return word + what + "\u00a0·\u00a0" + ago(wait.eta - now).replace(/ ago$/, "") + " left";
   // No ETA: how long it has been waiting, off the oldest wait row's startedAt

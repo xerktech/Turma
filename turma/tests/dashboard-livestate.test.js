@@ -154,6 +154,12 @@ test("dashboard liveState: a wait with no ETA says how long it has waited", () =
   // State row's, and a second number here read as a second stall length.
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [ci] }), onlineHost, NOW).label,
     "stalled · Watch CI on PR #412");
+  // A blank label names nothing: the shell count, as Android shows (rollup XERK-1701).
+  const blank = { ...ci, label: "   " };
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [blank] }), onlineHost, NOW).label,
+    "stalled on 1 background shell");
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 12 * 60, agents: [blank] }), onlineHost, NOW).label,
+    "⏳ waiting on 1 background shell\u00a0·\u00a012m");
 });
 
 // XERK-1571 screenshot defect: a stalled card showed a second age (its last
