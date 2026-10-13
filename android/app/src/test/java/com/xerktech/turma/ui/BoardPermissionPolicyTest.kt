@@ -103,7 +103,7 @@ class BoardPermissionPolicyTest {
         // A VM bound to THIS test's Application, never `viewModel()`'s default:
         // under Robolectric that handed a later test a BoardViewModel still
         // reading an earlier test's container, so the board showed a stale fleet.
-        val vm = BoardViewModel(hub.app)
+        val vm = main.track(BoardViewModel(hub.app))
         compose.setContent { BoardScreen(vm = vm) }
         compose.waitForIdle()
     }
@@ -280,7 +280,7 @@ class BoardPermissionPolicyTest {
         )
         hub.json("/api/ws-token", """{"token":"t"}""")
         hub.seedFleet(HubHarness.fleetJson(host = "nas01", jira = jiraBlock))
-        val vm = BoardViewModel(hub.app)
+        val vm = main.track(BoardViewModel(hub.app))
         vm.loadPermissionPolicy("acme")
         hub.awaitFlow(vm.permission) { it.loaded }
 

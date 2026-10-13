@@ -34,7 +34,7 @@ class ChatQuestionTest {
     private val host = "nas01"
     private val session = "s1"
 
-    private fun vm() = ChatViewModel(hub.app, host, session)
+    private fun vm() = main.track(ChatViewModel(hub.app, host, session))
 
     private fun asking(q: String) = HubHarness.fleetJson(
         host = host,

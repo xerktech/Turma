@@ -84,7 +84,7 @@ class TrajectoryScreenTest {
      *  no-op that cannot re-open the fetch and un-settle the paint. */
     private fun open(json: String, code: Int = 200) {
         hub.json("/api/dsh/$tid/trajectory", json, code = code)
-        val vm = TrajectoryViewModel(hub.app)
+        val vm = main.track(TrajectoryViewModel(hub.app))
         vm.load(tid)
         hub.awaitFlow(vm.state) { it.data != null || it.notSynced || it.error != null }
         compose.setContent { TrajectoryScreen(host = "nas01", transcriptId = tid, onBack = {}, vm = vm) }

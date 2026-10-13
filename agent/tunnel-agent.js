@@ -1059,18 +1059,25 @@ function kubectlPositionals(args) {
 // it are text, so `$(echo ')'; make)` closes where bash does. An unclosed one
 // runs to the end (its rest is read as the body: work).
 function shellGroupEnd(s, i) {
+  // A `$(` inside "…" is its own substitution with its own quotes, kept on an
+  // explicit stack (mirror of _shell_group_end: recursion blew the stack).
   let depth = 1, quote = "";
-  const n = s.length;
+  const n = s.length, outer = [];
   for (; i < n; i++) {
     const c = s[i];
     if (quote === "'") { if (c === "'") quote = ""; }
     else if (c === "\\") i++;
-    else if (quote) { if (c === '"') quote = ""; }
-    else if (c === "'" || c === '"') quote = c;
+    else if (quote) {
+      if (c === '"') quote = "";
+      else if (c === "$" && s[i + 1] === "(") { outer.push([depth, quote]); depth = 1; quote = ""; i++; }
+    } else if (c === "'" || c === '"') quote = c;
     else if (c === "#" && (i === 0 || " \t\n;&|(".includes(s[i - 1]))) {
       while (i + 1 < n && s[i + 1] !== "\n") i++;
     } else if (c === "(") depth++;
-    else if (c === ")" && --depth === 0) return [i + 1, true];
+    else if (c === ")" && --depth === 0) {
+      if (!outer.length) return [i + 1, true];
+      [depth, quote] = outer.pop();
+    }
   }
   return [n, false];
 }
@@ -1100,7 +1107,11 @@ function shellSegments(command) {
     if (quote) {
       if (c === quote) quote = "";
       else if (c === "\\" && quote === '"' && i + 1 < n) word.push(s[++i]);
-      else word.push(c);
+      else if (quote === '"' && c === "$" && s[i + 1] === "(") {
+        // `"$(…)"` still runs its body, quotes and all: kept whole.
+        const [j] = shellGroupEnd(s, i + 2);
+        word.push(s.slice(i, j)); i = j - 1;
+      } else word.push(c);
       continue;
     }
     if (c === "'" || c === '"') { quote = c; inWord = true; }

@@ -74,8 +74,16 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
   anywhere else is work. A process substitution `<(…)`/`>(…)` runs its body like `$(…)` (XERK-1584).
   One scanner (`_shell_group_end`/`shellGroupEnd`, `_shell_tick_end`) ends a substitution for both
   the tokenizer and the body extractor; quotes, `\` escapes and `#` comments inside it are text.
+  A `$(` inside double quotes is a substitution with its own quotes, in the tokenizer and the
+  group scanner alike: `x="$(echo ")"; make)"` runs `make` (rollup XERK-1584).
+  The scanner nests on an explicit stack, never recursion: ~1000 `"$(` under the 4096-char cap
+  raised RecursionError on the beat and blanked that session's signals (QA).
   An in-place filter stage is work too (`| sed -i`/`--in`, `awk --inc`:
   getopt_long takes any unambiguous long-option prefix).
+- **A `while`/`until` CONDITION is trusted as a poll, whatever program it runs** (accepted, rollup
+  XERK-1584): `until npm test; do sleep 60; done` reads as a wait. Classifying it needs a list of
+  build/test runners that cannot be complete, and a "work unless a known probe" rule turns every
+  `curl -sf …/healthz` or `kubectl get` poll into work. A `$(…)` in the condition is still work.
 - **Anything unrecognised is `work`** — that is the pre-XERK-1570 reading, so a classifier miss
   costs nothing new; the reverse miss (work read as waiting) would hide a busy session. Every rule
   errs toward `work`; nested timeouts/loops classify as work rather than recurse on the beat.

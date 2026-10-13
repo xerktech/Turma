@@ -36,7 +36,7 @@ class FleetOutcomeTest {
     private val host = "nas01"
 
     private fun spawn(): String {
-        val vm = FleetViewModel(hub.app)
+        val vm = main.track(FleetViewModel(hub.app))
         val message = hub.expectMessage(vm.messages)
         vm.spawn(host = host, repo = "Turma", modelSource = "local")
         return message()

@@ -81,7 +81,7 @@ class SessionsPaneSpawnTest {
             SessionsListPane(
                 selectedKey = null,
                 onSelect = { _, _ -> },
-                vm = FleetViewModel(hub.app),
+                vm = main.track(FleetViewModel(hub.app)),
             )
         }
         compose.onNodeWithContentDescription("New session").performClick()

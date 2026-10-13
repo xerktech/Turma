@@ -129,6 +129,11 @@ Mirrors the glasses pure-core/adapter-shell split:
   runs eagerly, no `advanceUntilIdle()` needed (a forgotten one passes against unwritten state). Does
   NOT make the network synchronous — join the `Job` a VM action returns, or use
   `awaitValue`/`collectMessages`.
+- **Wrap every ViewModel a test builds in `main.track(…)`** (rollup XERK-1584 #6): a late OkHttp
+  answer otherwise resumes on `Dispatchers.Main` mid `setMain`/`resetMain` and throws "used
+  concurrently with setting it". `HubHarness.after()` cancels them BEFORE `server.shutdown()`,
+  which aborts in-flight calls and is itself a source of late answers (QA); the rule's
+  `finished()` runs after it. `viewModel()` VMs in composables are cleared by the compose rule.
 - **Assert a model-switch memo on the STORE (`container.modelSwitches`), never `ChatUiState`** — the
   state copy is a VM-rebuilt mirror; asserting it passes on a change that dropped the real thing.
 - **The in-app updater is silenced in tests (XERK-281)** — Robolectric rebuilds the Application per

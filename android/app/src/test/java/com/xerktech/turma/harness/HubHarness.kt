@@ -114,6 +114,9 @@ class HubHarness : ExternalResource() {
         }
 
     override fun after() {
+        // Before the shutdown below, which would answer their in-flight calls
+        // late, on an OkHttp thread, while Main is being reset (XERK-1584 #6).
+        MainDispatcherRule.cancelTracked()
         scope.cancel()
         container.fleet.stop()
         server.shutdown()

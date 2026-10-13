@@ -46,7 +46,7 @@ class UsageScreenPermissionsTest {
         hub.json("/api/permissions", """{"days":7,"top":[],"recent":[]}""")
         hub.container.org.set(setOf("acme"))
         hub.seedFleet(HubHarness.fleetJson(jira = """{"siteKey":"acme","site":"Acme"}"""))
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         compose.setContent { UsageScreen(vm = vm) }
         compose.waitForIdle()
 
