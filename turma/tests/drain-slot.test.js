@@ -387,6 +387,84 @@ test("XERK-1598: anonymous pre-body refusals cannot take an agent refusal's ling
   }
 });
 
+// XERK-1885: a request PIPELINED behind a close refusal is never run. The refusal's linger
+// keeps Node's parser draining the unread body, and the parser dispatches whatever follows
+// it — RFC 9112 says a server that sent close must not process it. The pipelined request
+// here is a Kill, so "was it run" reads off the host's command queue.
+test("XERK-1885: a request pipelined behind a close refusal is never dispatched", async () => {
+  const net = require("net");
+  const host = "pipe1885";
+  hub.agents[host] = { device: host, lastSeen: Date.now(), sessions: [], commands: [] };
+  const kills = () => (hub.agents[host].commands || []).filter((c) => c.type === "kill").length;
+  const basic = "Basic " + Buffer.from("hubuser:hubpass").toString("base64");
+  const kill = `POST /api/agents/${host}/sessions/s1/kill HTTP/1.1\r\nhost: x\r\n` +
+    `authorization: ${basic}\r\ncontent-length: 0\r\n\r\n`;
+  const send = (bytes) => new Promise((resolve) => {
+    const sock = net.connect({ port: server.address().port, host: "127.0.0.1", allowHalfOpen: true });
+    let buf = "";
+    sock.on("error", () => {});
+    sock.on("data", (c) => (buf += c));
+    sock.on("end", () => sock.end());
+    sock.on("close", () => resolve(buf));
+    sock.write(bytes, () => sock.end());
+  });
+  try {
+    // Control: the same Kill, alone, is run.
+    await send(kill);
+    assert.equal(kills(), 1, "the Kill on its own queues");
+    // A 401 (no credential) to a 256 KiB unread body — answered close — with the Kill
+    // pipelined behind it in the SAME write.
+    const big = 256 << 10;
+    const got = await send(`POST /api/agents/${host}/uploads?name=a.bin HTTP/1.1\r\nhost: x\r\n` +
+      `content-length: ${big}\r\n\r\n` + "x".repeat(big) + kill);
+    assert.match(got, /^HTTP\/1\.1 401 /, "the refusal reached the client");
+    assert.match(got, /\r\nconnection: close\r\n/i);
+    assert.equal((got.match(/HTTP\/1\.1 /g) || []).length, 1, "only the refusal was answered");
+    await sleep(100);
+    assert.equal(kills(), 1, "the pipelined Kill was not run");
+  } finally {
+    delete hub.agents[host];
+  }
+});
+
+// An upgrade pipelined behind a close refusal is refused with the connection — run, a
+// second /agent/control for a host replaces (tears down) its live control channel.
+test("XERK-1885: an upgrade pipelined behind a close refusal never reaches its handler", async () => {
+  const net = require("net");
+  const host = "upg1885";
+  const port = server.address().port;
+  const upgrade = `GET /agent/control?name=${host}&token=agenttok HTTP/1.1\r\nhost: x\r\n` +
+    "upgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+    "sec-websocket-version: 13\r\n\r\n";
+  const live = net.connect({ port, host: "127.0.0.1" });
+  let liveClosed = false;
+  live.on("error", () => {});
+  live.on("data", () => {});
+  live.on("close", () => { liveClosed = true; });
+  live.write(upgrade);
+  try {
+    for (let i = 0; i < 40 && !hub.controlChannels[host]; i++) await sleep(25);
+    assert.ok(hub.controlChannels[host], "the live control channel is up");
+    const big = 256 << 10;
+    const got = await new Promise((resolve) => {
+      const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: true });
+      let buf = "";
+      s.on("error", () => {});
+      s.on("data", (c) => (buf += c));
+      s.on("end", () => s.end());
+      s.on("close", () => resolve(buf));
+      s.write(`POST /api/agents/${host}/uploads?name=a.bin HTTP/1.1\r\nhost: x\r\n` +
+        `content-length: ${big}\r\n\r\n` + "x".repeat(big) + upgrade);
+    });
+    assert.match(got, /^HTTP\/1\.1 401 /);
+    assert.doesNotMatch(got, / 101 /, "the pipelined upgrade was never answered");
+    await sleep(200);
+    assert.equal(liveClosed, false, "the live control channel survived");
+  } finally {
+    live.destroy();
+  }
+});
+
 test("XERK-1598: a refusal of a SMALL unread body keeps the connection", async () => {
   const { port } = server.address();
   const got = await new Promise((resolve) => {

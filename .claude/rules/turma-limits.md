@@ -122,6 +122,14 @@ with `restart: unless-stopped`
     past the FIN; a test client that stops at `'end'` cannot tell a lingering close from a pause.
   - The linger's own `sock.end()` IS the FIN: overriding `destroySoon` removes Node's. Time the FIN
     from the status line, never from the client's last write (a 2s timer close hides in that gap).
+- **Nothing pipelined behind a close refusal runs** (XERK-1885, RFC 9112 §9.6). The linger keeps
+  Node's parser draining, and it dispatches whatever follows the refused body; its answer is lost.
+  - Every close refusal `markClosing`s its socket (`endRefusedConnection`, and in `forward.js`
+    `lingerRelay`, `refuseOversize`, the 508/503); every dispatch point `dropIfClosing`s: both
+    server.js handlers (before AND after the forwarder's await) and `forwardRequest`.
+  - A dropped request's body is resumed (the drain must keep reading) and nothing answers it.
+  - A new close-refusal path must mark too. Tests: `XERK-1885: …` in `drain-slot.test.js` and
+    `forward.test.js` (a raw socket — urllib cannot pipeline).
 - **A drainable SIZE (413) refusal DEFERS its response to the body's `end`, never mid-stream**
   (XERK-291). A client that streams a large body writes it in FULL before it reads (python urllib,
   which the agents post with); answering at `cap` and then closing reaches it as a bare ECONNRESET,

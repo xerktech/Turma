@@ -1472,6 +1472,65 @@ test("XERK-1090: a leader's early refusal reaches a still-writing client as the 
   srv.close(); leader.close(); f.close();
 });
 
+test("XERK-1885: a request pipelined behind a relayed close refusal is never forwarded", async () => {
+  let seen = 0;
+  const leader = http.createServer((rq, rs) => {
+    seen += 1;
+    rs.writeHead(401, { "content-type": "application/json", connection: "close" });
+    rs.end('{"error":"unauthorized"}');
+    rq.socket.destroySoon = () => { rq.socket.end(); rq.resume(); };
+  });
+  const lport = await listen(leader);
+  const { f } = await follower(`127.0.0.1:${lport}`, { drainLingerMs: 2000 });
+  const { srv, port } = await followerServer(f);
+  // A 4 MiB body the leader refuses before it is read, the second request pipelined
+  // behind it in the same write: parsed only once the refusal has gone out. The client
+  // keeps its side open (as a still-reading pipeliner would), so the socket lingers.
+  const size = 4 << 20;
+  const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: true });
+  let got = "";
+  s.on("error", () => {});
+  s.on("data", (d) => { got += d; });
+  s.write(Buffer.concat([
+    Buffer.from(`POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: ${size}\r\n\r\n`),
+    Buffer.alloc(size, 120),
+    Buffer.from("GET /api/agents HTTP/1.1\r\nHost: x\r\n\r\n"),
+  ]));
+  await new Promise((r) => s.once("end", r));
+  await sleep(300);
+  s.destroy();
+  assert.match(got, /^HTTP\/1\.1 401 /, `got ${got.slice(0, 80)}`);
+  assert.equal((got.match(/HTTP\/1\.1 /g) || []).length, 1, "only the refusal was answered");
+  assert.equal(seen, 1, "the pipelined request never reached the leader");
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-1885: a request pipelined behind the follower's own 413 is never forwarded", async () => {
+  const { leader, seen, port: lport } = await countingLeader();
+  const { f } = await follower(`127.0.0.1:${lport}`, {
+    bodyRoute: () => "hb", drainMax: 2, drainLingerMs: 2000, drainIdleMs: 60000,
+  }, { bodyCaps: { hb: 100 }, drainSlack: 100 });
+  const { srv, port } = await followerServer(f);
+  // Declared past cap + slack (200), all of it sent, the second request behind it: the follower
+  // refuses locally (refuseOversize) and drains to its end, so the GET is parsed after.
+  const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: true });
+  let got = "";
+  s.on("error", () => {});
+  s.on("data", (d) => { got += d; });
+  s.write(Buffer.concat([
+    Buffer.from("POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: 300\r\n\r\n"),
+    Buffer.alloc(300, 120),
+    Buffer.from("GET /api/agents HTTP/1.1\r\nHost: x\r\n\r\n"),
+  ]));
+  await new Promise((r) => s.once("end", r));
+  await sleep(300);
+  s.destroy();
+  assert.match(got, /^HTTP\/1\.1 413 /, `got ${got.slice(0, 80)}`);
+  assert.equal((got.match(/HTTP\/1\.1 /g) || []).length, 1, "only the 413 was answered");
+  assert.equal(seen.length, 0, "the pipelined request never reached the leader");
+  srv.close(); leader.close(); f.close();
+});
+
 test("XERK-1090: relay lingers are capped at drainMax and bounded by drainLingerMs", async () => {
   const { leader, port: lport } = await earlyRefusingLeader();
   const { f } = await follower(`127.0.0.1:${lport}`, { drainMax: 1, drainLingerMs: 300 });

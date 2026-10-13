@@ -38,6 +38,24 @@ const FORWARDED_HEADER = "x-turma-forwarded-by";
 // follower to hold nor to serve as a second writer. Binding only the list (the XERK-919
 // shape) let one captured header pair be replayed forever, onto any request.
 const FORWARD_AUTH_HEADER = "x-turma-forward-auth";
+
+// A connection we answered with a `connection: close` REFUSAL is finished: RFC 9112 §9.6
+// says a server that sent close must not process later requests on it (XERK-1885). Node's
+// parser keeps running while such a socket lingers to drain the unread body, so a request
+// PIPELINED behind the refusal would still be dispatched — forwarded or served, its answer
+// lost (Node never hands it the socket). Every close refusal marks its socket here, and
+// every dispatch point (the hub's request/upgrade handlers, forwardRequest past its
+// awaits) drops a request on a marked socket. One symbol, shared by server.js.
+const CLOSING_SOCKET = Symbol("turma.closingAfterRefusal");
+function markClosing(sock) { if (sock) sock[CLOSING_SOCKET] = true; }
+// Whether `req` arrived on a connection already closing behind a refusal. A request that
+// did is DROPPED: its body is discarded (so the linger keeps draining to the client's
+// close) and nothing answers it. Returns true when dropped, for `if (...) return`.
+function dropIfClosing(req) {
+  if (!req || !req.socket || !req.socket[CLOSING_SOCKET]) return false;
+  try { req.resume(); } catch { /* gone */ }
+  return true;
+}
 // A proof older (or further in the future) than this is refused. It is minted as the hop
 // is sent and checked on arrival, pod to pod, so this only has to cover node clock skew.
 // Too tight for a badly skewed cluster = every proof refused = the bounce guard off (the
@@ -554,6 +572,7 @@ function makeForwarder(store, replicaId, deps = {}) {
       settled = true;
       disarm();
       req.removeListener("data", onData);
+      markClosing(sock); // the 413 says close, drained or cut
       if (!cut) release();
       else if (!sock || sock.destroyed) { release(); return; }
       else {
@@ -602,6 +621,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     const sock = req.socket;
     if (!sock || sock.destroyed || relayLingering >= drainMax) return false;
     relayLingering += 1;
+    markClosing(sock);
     const kill = () => { try { sock.destroy(); } catch { /* gone */ } };
     // Bounded from the answer, so one that never flushes cannot hold the slot either.
     const t = setTimeout(kill, drainLingerMs);
@@ -615,6 +635,7 @@ function makeForwarder(store, replicaId, deps = {}) {
   // refused as oversize, or the client left while held), false when the caller
   // should serve it locally. Never throws, never rejects.
   async function forwardRequest(req, res) {
+    if (dropIfClosing(req)) return true; // pipelined behind a close refusal (XERK-1885)
     const over = oversizeCap(req);
     if (over) {
       refusing += 1; // held across the liveness dial, so drainMax still bounds us
@@ -629,6 +650,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (!r) return false;
     if (r.gone) return true;
     if (r.loop) {
+      markClosing(req.socket);
       if (!res.headersSent) {
         res.writeHead(508, { "content-type": "application/json", [LOOP_HEADER]: loopProof(authToken, r.loop), connection: "close" });
         res.end(JSON.stringify({ error: "hub forwarding loop: the leader endpoint leads back to this replica — retry" }));
@@ -636,6 +658,7 @@ function makeForwarder(store, replicaId, deps = {}) {
       return true;
     }
     if (r.refuse) {
+      markClosing(req.socket);
       if (!res.headersSent) {
         res.writeHead(503, { "content-type": "application/json", "retry-after": "1", connection: "close" });
         res.end(JSON.stringify({ error: r.reason || "this hub replica is shutting down — retry" }));
@@ -644,6 +667,8 @@ function makeForwarder(store, replicaId, deps = {}) {
     }
     const sock = r.sock;
     if (res.destroyed || res.writableEnded) { sock.destroy(); return true; } // client left meanwhile
+    // A refusal on this connection landed while we dialed (a pipelined request).
+    if (dropIfClosing(req)) { sock.destroy(); return true; }
     stats.requests += 1;
     track(sock);
     const headers = endToEnd(req.rawHeaders || []);
@@ -935,4 +960,6 @@ module.exports = {
   loopProof,
   stripForwardHeaders,
   PROOF_MAX_AGE_MS,
+  markClosing,
+  dropIfClosing,
 };
