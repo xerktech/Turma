@@ -6261,6 +6261,9 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # A raw-text check sees the applet only after the strip (rollup XERK-1701).
                     "kill -9 -1", "busybox kill -9 -1", "exec -a kill busybox -9 -1",
                     "exec -a kill toybox -1 1",
+                    # An unreadable program word may be one too (rollup XERK-1701).
+                    "exec -a rm $(which busybox) -rf /etc", 'exec -a rm "$BB" -rf /etc',
+                    "exec -a rm `which busybox` -rf /etc",
                     # An unread argv[0] may itself start with `busybox`, making argv[1]
                     # the applet: it is never inserted (QA).
                     'exec -a "$n" busybox rm -rf /etc', 'exec -a "$(cat f)" toybox rm -rf /etc',
@@ -6279,6 +6282,7 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "echo hi | busybox hush", "toybox ls -la", "busybox.static ls /",
                     'toybox rm -rf "$dir"/build', "exec -a ls busybox -la /", "exec -a rm bash -c ls",
                     "exec -a kill busybox -9 1234", "kill -1 1234",
+                    'exec -a myapp "$BIN" --serve', 'exec -a rm "$BIN" -rf ./build',
                     "exec -al ls busybox -la /"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
