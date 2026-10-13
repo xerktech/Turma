@@ -163,6 +163,19 @@ class ProseTest {
         }
     }
 
+    @Test fun `a fence line full of blanks parses in linear time`() {
+        // Rollup XERK-1701: ``` + 40k spaces + a backtick backtracked quadratically (3 s).
+        val line = "```" + " ".repeat(200_000) + "`"
+        // Quadratic took ~75 s at this size, linear a few ms: a 10 s wall bound can't flake.
+        val t = System.nanoTime()
+        codes("a\n$line\nb")
+        stripFraming("<x>\n$line\n<system-reminder>")
+        assertTrue("took too long", (System.nanoTime() - t) / 1_000_000 < 10_000)
+        assertEquals("code", codes("```js  \t\ncode\n```  ").single().body)
+        // Only space/tab are cut, never other whitespace: "```js\u00A0" opens nothing (QA).
+        assertTrue(codes("```js\u00A0\ncode\n```").none { it.body == "code" })
+    }
+
     @Test fun `code body is not linkified`() {
         val c = codes("```js\nconst u = \"https://x.io\";\n```").single()
         assertEquals("const u = \"https://x.io\";", c.body)

@@ -514,7 +514,10 @@ private fun paragraphOf(text: String): ProseBlock.Paragraph? {
 // and ICU's set on a device, which differs from JS on U+FEFF and U+0085: a fence
 // indented by either rendered as code on one platform and as prose on the other.
 internal const val JS_WS = "\t\u000B\u000C\r \u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF"
-private val FENCE_OPEN = Regex("^[$JS_WS]*(`{3,})[ \t]*([^$JS_WS`]*)[ \t]*$")
+// Matched on the line with trailing blanks cut (fenceLine): the trailing `[ \t]*` after
+// the optional info backtracked quadratically on ``` + 40k spaces + a backtick (3 s).
+private val FENCE_OPEN = Regex("^[$JS_WS]*(`{3,})[ \t]*([^$JS_WS`]*)$")
+internal fun fenceLine(line: String): String = line.trimEnd(' ', '\t')
 private val FENCE_CLOSE = Regex("^[$JS_WS]*(`{3,})[ \t]*$")
 
 private fun fenceCloses(line: String, openLen: Int): Boolean {
@@ -542,7 +545,7 @@ fun parseProse(raw: String): List<ProseBlock> {
     fun flush() { if (buf.isNotEmpty()) { out.addAll(parseTables(buf.joinToString("\n"))); buf.clear() } }
     var i = 0
     while (i < lines.size) {
-        val open = FENCE_OPEN.matchEntire(lines[i])
+        val open = FENCE_OPEN.matchEntire(fenceLine(lines[i]))
         if (open != null) {
             flush()
             i++

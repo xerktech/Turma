@@ -677,7 +677,15 @@
   // (```hcl), so an inline run of backticks in prose can't open a block. The
   // body is never linkified or table-scanned — it's code, and esc() alone is
   // what makes it injection-safe.
-  const FENCE_OPEN = /^\s*(`{3,})[ \t]*([^\s`]*)[ \t]*$/;
+  // Matched against the line with its trailing blanks already cut (fenceLine):
+  // `[ \t]*([^\s`]*)[ \t]*$` backtracked quadratically on ``` + 40k spaces + a
+  // backtick, ~1 s in a chat bubble (rollup XERK-1701). Same rule, linear.
+  const FENCE_OPEN = /^\s*(`{3,})[ \t]*([^\s`]*)$/;
+  function fenceLine(line) {
+    let e = line.length;
+    while (e > 0 && (line.charCodeAt(e - 1) === 32 || line.charCodeAt(e - 1) === 9)) e--;
+    return e === line.length ? line : line.slice(0, e);
+  }
   function fenceCloses(line, open) {
     const m = /^\s*(`{3,})[ \t]*$/.exec(line);
     return !!m && m[1].length >= open.length;
@@ -757,7 +765,7 @@
     let out = "", i = 0, buf = [];
     const flush = () => { if (buf.length) { out += renderSvgAndText(buf.join("\n")); buf = []; } };
     while (i < lines.length) {
-      const open = FENCE_OPEN.exec(lines[i]);
+      const open = FENCE_OPEN.exec(fenceLine(lines[i]));
       if (open) {
         flush();
         i++;
@@ -1389,8 +1397,10 @@
   // The renderer's fence rule (FENCE_OPEN / fenceCloses), tolerating the raw text's
   // CR. Android spells JS `\s` out (Prose.kt JS_WS): its own `\s` differs from JS's
   // (ASCII-only on the JVM; ICU on a device, apart on U+FEFF and U+0085).
-  const FRAME_FENCE_OPEN = /^\s*(`{3,})[ \t]*([^\s`]*)[ \t]*\r?$/;
-  const FRAME_FENCE_CLOSE = /^\s*(`{3,})[ \t]*\r?$/;
+  // Matched on frameLine(line): one trailing CR, then trailing blanks, cut first.
+  const FRAME_FENCE_OPEN = /^\s*(`{3,})[ \t]*([^\s`]*)$/;
+  const FRAME_FENCE_CLOSE = /^\s*(`{3,})$/;
+  const frameLine = (line) => fenceLine(line.endsWith("\r") ? line.slice(0, -1) : line);
   function stripFraming(text) {
     const t = String(text == null ? "" : text);
     if (t.indexOf("<") === -1) return t;
@@ -1406,10 +1416,10 @@
     const kept = [];
     lines.forEach((line, i) => {
       if (fence) {
-        const c = FRAME_FENCE_CLOSE.exec(line);
+        const c = FRAME_FENCE_CLOSE.exec(frameLine(line));
         if (c && c[1].length >= fence.length) fence = null;
       } else {
-        const open = FRAME_FENCE_OPEN.exec(line);
+        const open = FRAME_FENCE_OPEN.exec(frameLine(line));
         if (open) fence = open[1];
       }
       const m = tags[i];

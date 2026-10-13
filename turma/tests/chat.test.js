@@ -1998,6 +1998,21 @@ test("renderProse + stripFraming: every JS whitespace indents a fence; none sits
   assert.equal(strip("a\n```js\u00a0x\n<system-reminder>\n```\nb"), "a\n```js\u00a0x\n```\nb");
 });
 
+test("renderProse/stripFraming: a fence line full of blanks reads in linear time", () => {
+  // Rollup XERK-1701: ``` + 40k spaces + a backtick backtracked quadratically (~1 s).
+  const line = "```" + " ".repeat(200000) + "`";
+  const t = process.cpuUsage();  // CPU time, not wall: a loaded runner must not flake it
+  renderProse("a\n" + line + "\nb");
+  buildItems([{ id: "z", role: "user", blocks: [{ t: "text", text: "<x>\n" + line + "\n<system-reminder>" }] }]);
+  const used = process.cpuUsage(t);
+  assert.ok((used.user + used.system) / 1000 < 500, "took too long");
+  // Only ONE CR and the blanks before it are cut: "```\r\t" closes nothing (QA).
+  const strip = (text) => buildItems([{ id: "z", role: "user", blocks: [{ t: "text", text }] }])[0].text;
+  assert.equal(strip("a\n```\nx\n```\r\t\n<system-reminder>\nb"), "a\n```\nx\n```\r\t\n<system-reminder>\nb");
+  // Trailing blanks (and a CR) still don't stop a fence.
+  assert.match(renderProse("```js  \t\ncode\n```  "), /<code>code<\/code>/);
+});
+
 test("renderProse: a fenced block carries a copy button in a positioning wrapper (XERK-183)", () => {
   const html = renderProse("```\nplain\n```");
   // The wrapper is the positioning context; the button sits OUTSIDE the <pre>
