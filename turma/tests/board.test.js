@@ -3070,6 +3070,18 @@ test("epicRunView: a blocker holds a child exactly when the hub driver's would",
   assert.deepEqual(status, { "C-1": "ready", "C-2": "ready", "C-3": "blocked", "C-4": "ready", "C-5": "ready" });
 });
 
+test("epicRunView: an In Progress or In Review child with no session reads in progress, not ready", () => {
+  // Rollup XERK-1701: the driver starts only To Do children, so these never dispatch.
+  const site = epicSite([
+    ticket("C-1", { statusCategory: "inprogress", status: "In Progress" }),
+    ticket("C-2", { statusCategory: "inprogress", status: "In Review" }),
+    ticket("C-3", { statusCategory: "todo", status: "To Do" }),
+  ]);
+  const view = epicRunView(run({ waves: [["C-1", "C-2", "C-3"]] }), site, { sessionIndex: new Map() });
+  assert.deepEqual(view.waves[0].map((c) => c.status), ["running", "running", "ready"]);
+  assert.deepEqual(view.counts, { done: 0, running: 2, ready: 1, blocked: 0 });
+});
+
 test("epicRunView: a queued child counts as running; a cycle child is blocked", () => {
   const site = epicSite([
     ticket("C-1", { statusCategory: "todo" }),

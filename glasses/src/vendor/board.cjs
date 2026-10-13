@@ -486,7 +486,7 @@
   // Each child gets one of four states, matching the hub driver's own readiness
   // (epicChildBlockersDone / buildEpicWaves ordering):
   //   done     — the child ticket is in the Done column.
-  //   running  — a live/queued session names it.
+  //   running  — a live/queued session names it, or it is In Progress / In Review.
   //   ready    — not started, and no blocker holds it (next to dispatch).
   //   blocked  — waiting on a blocker, or stuck in a dependency cycle.
   // A blocker holds as the driver's does (rollup XERK-1701): an in-epic one until
@@ -514,9 +514,16 @@
       return ticketSessionsOf(o.sessionIndex, siteKey, k)
         .some((s) => s && (s.status === "running" || s.status === "queued"));
     };
+    // In Progress / In Review with no session is being handled elsewhere: the
+    // driver never starts it (only a To Do child is a fresh start), so it reads
+    // "In progress", never "ready" (rollup XERK-1701).
+    const isUnderway = (k) => {
+      const c = categoryOf(byKey.get(k));
+      return !!byKey.get(k) && (c === "inprogress" || c === "review");
+    };
     const statusOf = (k) => {
       if (isDone(k)) return "done";
-      if (isRunning(k)) return "running";
+      if (isRunning(k) || isUnderway(k)) return "running";
       if (cycleSet.has(k)) return "blocked";
       const t = byKey.get(k);
       const blockers = (t && Array.isArray(t.blockedBy) ? t.blockedBy : [])
