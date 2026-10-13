@@ -52,6 +52,9 @@ paths:
   - Any name STARTING with `busybox` or `toybox` is read as `busybox` (`_basename`,
     `_MULTICALL_PREFIXES`): both binaries dispatch on that prefix, and the shipped files are
     `toybox-x86_64`, `busybox.static`. Exact names only let `toybox-x86_64 rm -rf /etc` run.
+    - They dispatch on argv[0] alone, which `exec -a NAME` sets: the prefix strip inserts NAME
+      (one leading `-` dropped, as BusyBox does) after the multi-call word, so `exec -a rm
+      busybox -rf /etc` is `busybox rm -rf /etc`. Was allowed on main. Rollup XERK-1701.
     - `_CMD_START` takes one as a wrapper word, so `cat a.sh | busybox sh` is a stdin shell
       for the write-then-run rule (was allowed on main). Rollup XERK-1701.
     - `_MULTICALL_WORD` is anchored by a lookbehind: unanchored, every `-busybox` in one long

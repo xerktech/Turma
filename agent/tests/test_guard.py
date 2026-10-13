@@ -6213,7 +6213,11 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # Both dispatch on any name STARTING with theirs (the shipped files).
                     "toybox-x86_64 rm -rf /etc", "busybox-x86_64 rm -rf /etc", "busybox1 rm -rf /etc",
                     "toybox.static rm -rf /etc", "echo 'rm -rf /etc' | toybox-x86_64 sh",
-                    'busybox-x86_64 rm -rf "$a/$b"'):
+                    'busybox-x86_64 rm -rf "$a/$b"',
+                    # ...and on argv[0] alone, which `exec -a` sets (rollup XERK-1701).
+                    "exec -a rm busybox -rf /etc", "exec -arm toybox -rf /etc",
+                    "exec -la rm busybox -rf /etc", "exec -c -a /bin/rm busybox.static -rf /etc",
+                    "exec -a -rm busybox -rf /etc", "exec -a sh busybox -c 'rm -rf /etc'"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$x/$y"', 'rm -rf "$dir/$f"', 'chmod 644 "$x/$y"', 'find "$x/$y" -name a',
@@ -6221,7 +6225,8 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     'find "$d"/out -delete', 'busybox rm -rf "$dir"/build', "busybox ls /",
                     'find "$dir"/out -name "*.o" | xargs rm -f', "busybox tar -czf x.tgz dir",
                     "echo hi | busybox hush", "toybox ls -la", "busybox.static ls /",
-                    'toybox rm -rf "$dir"/build'):
+                    'toybox rm -rf "$dir"/build', "exec -a ls busybox -la /", "exec -a rm bash -c ls",
+                    "exec -al ls busybox -la /"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 

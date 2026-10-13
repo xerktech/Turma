@@ -7238,9 +7238,14 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
             out.pop(0)
             # The wrapper's own flags, plus any value they consume.
             takes_value = _PREFIX_OPTS_WITH_VALUE.get(wrapper, set())
+            argv0 = None
             # `env -` is `env -i`: a bare dash is env's option, not its program.
             while out and out[0].startswith("-") and (len(out[0]) > 1 or wrapper == "env"):
                 opt = out.pop(0)
+                if wrapper == "exec" and not opt.startswith("--") and "a" in opt:
+                    # `exec -a NAME`: the value is the rest of the cluster after
+                    # `a`, else the next word (`-la rm`, `-arm`).
+                    argv0 = opt[opt.index("a") + 1:] or (out[0] if out else None)
                 split = _env_split_string(opt, out) if wrapper == "env" else None
                 if split is not None:
                     # `env -S "sh -c 'rm -rf /'"` runs its operand as a command
@@ -7265,6 +7270,11 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
                         or wrapper == "nice" and re.match(r"^[0-9]", out[0])
                         or wrapper == "chrt" and re.match(r"^[-+]?[0-9]|^[$`]", out[0])):
                 out.pop(0)
+            # A multi-call binary runs the applet its argv[0] names, so `exec -a rm
+            # busybox -rf /etc` is `busybox rm -rf /etc` (rollup XERK-1701). A login
+            # shell's leading `-` is dropped first, as BusyBox does (`-a -rm`).
+            if argv0 and out and _basename(out[0]) == "busybox":
+                out.insert(1, argv0[1:] if argv0.startswith("-") else argv0)
             # BusyBox rm has no preserve-root: `busybox rm -rf "$x/$y"` empties
             # `/`, so it is read as GNU rm told not to refuse it (XERK-1687).
             if wrapper == "busybox" and out and _basename(out[0]) == "rm":
