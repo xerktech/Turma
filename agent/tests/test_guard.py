@@ -16,6 +16,7 @@ import importlib.util
 import io
 import json
 import shlex
+import contextlib
 import os
 import subprocess
 import sys
@@ -6743,6 +6744,40 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         with mock.patch.object(guard, "_MAX_DECIDE_SECONDS", 0):
             self.assertEqual(guard.decide("Bash", {"command": cmd}, overrides=["eval *"],
                                           cwd="/tmp")[::2], ("deny", "policy"))
+
+    def test_a_checker_past_its_deadline_denies(self):
+        # Rollup XERK-1701: `_expand` checks the deadline, but the checkers then
+        # rescan the segment once per command; `find . -exec true {} +` x5000
+        # under a larger growth budget ran 90s and allowed. Each such loop
+        # refuses once the decision is out of time.
+        entries = [(["true"], "true")] * 3
+        for name, fn in (("_is_destructive", guard._is_destructive),
+                         ("_destructive_database", guard._destructive_database),
+                         ("pr_summary_reason", lambda c: guard.pr_summary_reason(c, "/tmp"))):
+            for late in (True, False):
+                with self.subTest(fn=name, late=late), \
+                        mock.patch.object(guard, "_expand_both", lambda *a, **k: entries), \
+                        mock.patch.object(guard, "_destructive_database", lambda c: None) \
+                        if name == "_is_destructive" else contextlib.nullcontext(), \
+                        mock.patch.object(guard, "_past_deadline", lambda: late):
+                    self.assertEqual(fn("true; true; true"),
+                                     guard._TOO_LARGE_REASON if late else None)
+        # Out of time spends the budget, so the deny stays the non-grantable one.
+        budget = {"until": 0, "left": 5}
+        with mock.patch.object(guard, "_budget", budget):
+            self.assertTrue(guard._past_deadline())
+        self.assertEqual(budget["left"], -1)
+        with mock.patch.object(guard, "_budget", None):
+            self.assertFalse(guard._past_deadline())
+        # The unreadable-construct scan runs after the last checker loop: out of
+        # time there, the final verdict still refuses (QA).
+        def late(command):
+            guard._budget["until"] = 0
+            return None
+        with mock.patch.object(guard, "_unreadable_construct", late):
+            self.assertEqual(guard.decide("Bash", {"command": "ls"}, cwd="/tmp"),
+                             ("deny", guard._TOO_LARGE_REASON, "policy"))
+        self.assertEqual(guard.decide("Bash", {"command": "ls"}, cwd="/tmp")[0], "allow")
 
     def test_a_continuation_is_dropped_only_where_bash_drops_it(self):
         # Outside single quotes, a live `\\<newline>` is nothing; an escaped
