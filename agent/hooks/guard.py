@@ -9322,13 +9322,12 @@ _DECISION_FLAGS = (_VALUES_DIFFER, _CHAIN_DIFFERS, _ORDER_DIFFERS, _VALUES_TAINT
                    _READINGS_SEEN, _PRINTED_DROP_SEEN, _READINGS_MOST, _PWD_SEEN)
 
 
-@functools.lru_cache(maxsize=256)
 def _pipes_into_stdin_shell(raw_commands: str) -> bool:
     """Whether a stage of the line reads its stdin as a script, on its words.
-    Cached: `_expand` re-reads the same text at every reading and depth, and a
-    per-call scan doubled the cost of long real lines (QA). No per-stage word
-    filter: `| s\\h` and `| 's'h` hold no literal `sh` (QA). Only a stage
-    holding a brace is name-read (`| {,env} sh`).
+    No per-stage word filter: `| s\\h` and `| 's'h` hold no literal `sh` (QA).
+    Only a stage holding a brace is name-read (`| {,env} sh`). Never cached on
+    the text alone: the answer depends on the reading mode (`_reading()`), and a
+    text-keyed cache let the first mode's answer stand for every reading (QA).
 
     The readings' SEEN flags it sets are put back: `_BRACE_OTHER_SEEN` raised by
     this one scan made the rest of the decision add brace readings to every

@@ -6307,7 +6307,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # the stage's words (rollup XERK-1701).
                     "cat f | env -i sh", "cat f | env -- sh", "cat f | env -u X sh",
                     "cat f | b\\usybox sh", "cat f | {,env} sh", "cat f | s\\h", "cat f | 's'h",
-                    "cat f | env -i s\\h", "cat f | nice -n 5 s\\h"):
+                    "cat f | env -i s\\h", "cat f | nice -n 5 s\\h",
+                    # The answer depends on the reading mode, so it is never cached
+                    # on the text alone (QA).
+                    'echo "${";}" x; cat f | env -i sh', 'echo "${";}" x; cat f | {,env} sh'):
             with self.subTest(run=run):
                 cmd = "echo 'rm -rf /etc' > f; " + run
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
