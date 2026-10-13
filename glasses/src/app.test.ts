@@ -700,11 +700,17 @@ describe("App", () => {
     display.emit({ type: "tap" }); // idle -> recording
     dictation.resolve({ text: "deploy the fix " });
     expect(app.getState().session?.draft).toBe("deploy the fix");
+    // With a draft, a tap opens the menu: Back, Send, Clear, Dictate more.
     display.emit({ type: "tap" });
+    for (let i = 0; i < 3; i++) display.emit({ type: "scrollDown" });
+    display.emit({ type: "tap" }); // Dictate more -> recording
+    expect(app.getState().session?.mic).toBe("recording");
     dictation.resolve({ text: " " }); // silence: no stray trailing space (rollup XERK-1701)
     expect(app.getState().session?.draft).toBe("deploy the fix");
     expect(app.getState().session?.mic).toBe("idle");
     expect(app.getState().flash).toBe(HEARD_NOTHING);
+    // ...and DRAWN: a flash set after the repaint stayed off the glasses (QA).
+    expect(display.lines.join(" ")).toContain("heard nothing");
   });
 
   it("input mode: doubleTap opens the actions menu; Send/Clear only appear once there's a draft", async () => {

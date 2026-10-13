@@ -1059,8 +1059,9 @@ export class App {
     }
     const text = result.text.trim();
     if (!text) {
-      this.setState({ session: { ...s, mic: "idle" } });
+      // flash() only sets state: it must precede the repaint, as above.
       this.flash(HEARD_NOTHING);
+      this.setState({ session: { ...s, mic: "idle" } });
       return;
     }
     const draft = s.draft ? `${s.draft} ${text}` : text;
