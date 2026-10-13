@@ -44,6 +44,10 @@ a nested agent dir.
   `resolveId`, which is agent-internal, so the `tunnel-agent.js` mirror does not keep it (it never
   resolves). Tests: the `_past_the_window_`
   cases in `TestStageSubagentHistory`, `TestLiveAgentResolveId`, `TestWorkflowRunDir`.
+- **A row's label picks its launch through `_row_label_rank`, shared by all three resolvers.**
+  An empty label matches every launch, so an unlabelled row prefers an unlabelled launch and only
+  then the newest labelled one; an unlabelled LAUNCH never claims a labelled row. Without the rank
+  a newer labelled launch opened in place of the row's own (rollup XERK-1701).
 - **The run dir is named after the launch record's `runId`, NOT its `taskId`** — different handles
   on the same launch (`wf_86e01141-7bc` vs `we1gtmfyd`), and `_async_launch` keys the ROW on taskId
   (XERK-304's bug). The record's absolute `transcriptDir` is ignored too: untrusted input on a path

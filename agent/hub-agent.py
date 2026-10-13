@@ -11615,7 +11615,7 @@ def _live_agent_resolve_id(state, agent_type, label):
     want_label, _ = _strip_pane_ellipsis((label or "").strip())
     if not want_type:
         return None
-    found = None
+    found, found_rank = None, -1
     for entry in (state.get("liveAgents") or {}).values():
         have_type = str(entry.get("type") or "")
         if want_type == "agent":
@@ -11625,11 +11625,12 @@ def _live_agent_resolve_id(state, agent_type, label):
                 continue
         elif have_type != want_type:
             continue
-        if not _row_label_matches(want_label, str(entry.get("label") or "")):
+        rank = _row_label_rank(want_label, str(entry.get("label") or ""))
+        if rank is None:
             continue
         rid = str(entry.get("resolveId") or "").strip()
-        if rid:
-            found = rid   # keep scanning: newest matching launch wins
+        if rid and rank >= found_rank:
+            found, found_rank = rid, rank   # keep scanning: newest best launch wins
     return found
 
 
@@ -12535,6 +12536,17 @@ def _row_label_matches(want_label, have_label):
     return have_label.startswith(want_label) or want_label.startswith(have_label)
 
 
+def _row_label_rank(want_label, have_label):
+    """How well a launch's label names a row: None for no match (_row_label_matches),
+    0 when an UNLABELLED row merely accepts a labelled launch, else 1. An empty
+    want matches every launch, so without the rank a click on an unlabelled row
+    opened the newest launch even when that one was labelled and an unlabelled
+    launch was the row's own (rollup XERK-1701). Newest best rank wins."""
+    if not _row_label_matches(want_label, have_label):
+        return None
+    return 0 if not want_label and have_label else 1
+
+
 def _resolve_subagent(main_path, agent_type, label):
     """Map a pane agent-list row (its `type` + short `label`/description) to the
     background agent's transcript file, via the main transcript's Task calls.
@@ -12586,16 +12598,20 @@ def _resolve_subagent(main_path, agent_type, label):
                 if m and block.get("tool_use_id"):
                     agent_ids[block["tool_use_id"]] = m.group(1)
 
+    fallback = None
     for tool_id, desc in reversed(tasks):  # newest matching call wins
-        if not _row_label_matches(want_label, desc):
+        rank = _row_label_rank(want_label, desc)
+        if rank is None:
             continue
         aid = agent_ids.get(tool_id)
         if not aid:
             continue
         path = os.path.join(_subagents_dir(main_path), f"agent-{aid}.jsonl")
         if os.path.isfile(path):
-            return path
-    return None
+            if rank:
+                return path
+            fallback = fallback or path
+    return fallback
 
 
 # ---- workflow runs (XERK-304) ----------------------------------------------
@@ -12721,16 +12737,20 @@ def _resolve_workflow_run(main_path, label):
             continue
         # The same name _async_launch put on the row, or the row can never match.
         name = str(tur.get("workflowName") or tur.get("summary") or "").strip()
-        if not _row_label_matches(want_label, name):
+        rank = _row_label_rank(want_label, name)
+        if rank is None:
             continue
         run_id = str(tur.get("runId") or "").strip()
         if VALID_WORKFLOW_RUN_ID_RE.match(run_id):
-            runs.append(run_id)
-    for run_id in reversed(runs):  # newest matching launch wins
+            runs.append((run_id, rank))
+    fallback = None
+    for run_id, rank in reversed(runs):  # newest matching launch wins
         path = _workflow_run_dir(main_path, run_id)
         if path:
-            return path
-    return None
+            if rank:
+                return path
+            fallback = fallback or path
+    return fallback
 
 
 def _workflow_agent_files(run_dir):
