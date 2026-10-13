@@ -2948,3 +2948,45 @@ test("buildItems: Claude Code's framing tags never reach a user bubble", () => {
   // A turn that was only tags leaves no empty bubble.
   assert.equal(byId.em, undefined);
 });
+
+test("buildItems: a framing tag inside an operator's code fence is their text (rollup XERK-1701)", () => {
+  const fenced = "how do I filter these?\n```\n<system-reminder>\nnoise\n</system-reminder>\n```";
+  const pasted = '<pasted_content id="p">\n```\n<system-reminder>\nlog\n</pasted_content id="p">\n';
+  const closed = "```\n<system-reminder>\n```\nafter\n<system-reminder>";
+  // A real Claude Code 2.1 transcript (QA): the operator typed the fence, then
+  // pasted a log into it, and Claude Code framed the paste INSIDE that fence.
+  const intoFence = 'look at this log:\n```\n\n\n<pasted_content id="6550">\nE1 boom\nE2 boom\n'
+    + '</pasted_content id="6550">\n\n```\nwhy does it fail?';
+  const items = buildItems([
+    { id: "f", role: "user", blocks: [{ t: "text", text: fenced }] },
+    { id: "p", role: "user", blocks: [{ t: "text", text: pasted }] },
+    { id: "t", role: "user", blocks: [{ t: "text", text: closed }] },
+    { id: "i", role: "user", blocks: [{ t: "text", text: intoFence }] },
+  ]);
+  const byId = Object.fromEntries(items.map((i) => [i.id, i]));
+  assert.equal(byId.f.text, fenced);
+  // A paste whose fence never closes still loses its own outer tags.
+  assert.equal(byId.p.text, "```\n<system-reminder>\nlog");
+  // Outside the (closed) fence a tag line is framing again.
+  assert.equal(byId.t.text, "```\n<system-reminder>\n```\nafter");
+  const strip = (text) => buildItems([{ id: "z", role: "user", blocks: [{ t: "text", text }] }])[0].text;
+  // Only a matched pair is paste framing: a lone open tag inside a fence is text.
+  assert.equal(strip('a\n```\n<pasted_content id="q">\nb\n```\nc'), 'a\n```\n<pasted_content id="q">\nb\n```\nc');
+  // A ```` fence is not closed by an inner ```, and ~~~ opens nothing.
+  assert.equal(strip("a\n````\n```\n<system-reminder>\n````\nc"), "a\n````\n```\n<system-reminder>\n````\nc");
+  assert.equal(strip("a\n~~~\n<system-reminder>\n~~~\nc"), "a\n~~~\n~~~\nc");
+  // A lone U+FEFF line is not blank, so a tag before it is not the last line.
+  assert.equal(strip("a\n```\n<system-reminder>\n\ufeff"), "a\n```\n<system-reminder>\n\ufeff");
+  // The last non-blank line goes when it is a tag, even inside an unclosed fence.
+  assert.equal(strip("a\n```\nb\n<system-reminder>\n"), "a\n```\nb");
+  // U+001C is not blank; ```js does not close; CRLF fences count; a spaced info string opens nothing (QA).
+  assert.equal(strip("a\n```\n<system-reminder>\n\u001c"), "a\n```\n<system-reminder>\n\u001c");
+  assert.equal(strip("a\n```\n<system-reminder>\n```js\n<system-reminder>\n```\nb"), "a\n```\n<system-reminder>\n```js\n<system-reminder>\n```\nb");
+  assert.equal(strip("a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc"), "a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc");
+  assert.equal(strip("a\r\n```\r\nb\r\n```\r\n<system-reminder>\r\nc"), "a\r\n```\r\nb\r\n```\r\nc");
+  assert.equal(strip("a\n```js x\n<system-reminder>\n```\nb"), "a\n```js x\n```\nb");
+  // A fence line with a Unicode space before it opens nothing, as on Android.
+  assert.equal(strip("i\n\u00a0```\n<system-reminder>\nb\n```\ne"), "i\n\u00a0```\nb\n```\ne");
+  // Claude Code's own matched paste framing goes even inside the operator's fence.
+  assert.equal(byId.i.text, "look at this log:\n```\n\n\nE1 boom\nE2 boom\n\n```\nwhy does it fail?");
+});

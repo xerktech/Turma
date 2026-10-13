@@ -425,6 +425,36 @@ class ChatItemsTest {
             stripFraming("keep <b> and a <system-reminder> mid-line"))
     }
 
+    @Test fun `stripFraming keeps a tag line inside an operator's code fence`() {
+        // Rollup XERK-1701, in step with chat.js.
+        val fenced = "how do I filter these?\n```\n<system-reminder>\nnoise\n</system-reminder>\n```"
+        assertEquals(fenced, stripFraming(fenced))
+        assertEquals("```\n<system-reminder>\nlog",
+            stripFraming("<pasted_content id=\"p\">\n```\n<system-reminder>\nlog\n</pasted_content id=\"p\">\n"))
+        assertEquals("```\n<system-reminder>\n```\nafter",
+            stripFraming("```\n<system-reminder>\n```\nafter\n<system-reminder>"))
+        // Each rule, in step with chat.test.js (QA mutants).
+        assertEquals("a\n```\n<pasted_content id=\"q\">\nb\n```\nc",
+            stripFraming("a\n```\n<pasted_content id=\"q\">\nb\n```\nc"))
+        assertEquals("a\n````\n```\n<system-reminder>\n````\nc",
+            stripFraming("a\n````\n```\n<system-reminder>\n````\nc"))
+        assertEquals("a\n~~~\n~~~\nc", stripFraming("a\n~~~\n<system-reminder>\n~~~\nc"))
+        assertEquals("a\n```\n<system-reminder>\n\uFEFF", stripFraming("a\n```\n<system-reminder>\n\uFEFF"))
+        assertEquals("a\n```\nb", stripFraming("a\n```\nb\n<system-reminder>\n"))
+        // U+001C is not blank; ```js does not close; CRLF fences count; a spaced info string opens nothing (QA).
+        assertEquals("a\n```\n<system-reminder>\n\u001C", stripFraming("a\n```\n<system-reminder>\n\u001C"))
+        assertEquals("a\n```\n<system-reminder>\n```js\n<system-reminder>\n```\nb", stripFraming("a\n```\n<system-reminder>\n```js\n<system-reminder>\n```\nb"))
+        assertEquals("a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc", stripFraming("a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc"))
+        assertEquals("a\r\n```\r\nb\r\n```\r\nc", stripFraming("a\r\n```\r\nb\r\n```\r\n<system-reminder>\r\nc"))
+        assertEquals("a\n```js x\n```\nb", stripFraming("a\n```js x\n<system-reminder>\n```\nb"))
+        // A fence line with a Unicode space before it opens nothing, on both platforms.
+        assertEquals("i\n\u00A0```\nb\n```\ne", stripFraming("i\n\u00A0```\n<system-reminder>\nb\n```\ne"))
+        // Claude Code's matched paste framing goes even inside the operator's fence (QA).
+        assertEquals("look at this log:\n```\n\n\nE1 boom\nE2 boom\n\n```\nwhy does it fail?",
+            stripFraming("look at this log:\n```\n\n\n<pasted_content id=\"6550\">\nE1 boom\nE2 boom\n" +
+                "</pasted_content id=\"6550\">\n\n```\nwhy does it fail?"))
+    }
+
     // ---- messageOrigin: a user turn's real source (web parity) --------------
 
     @Test fun `messageOrigin classifies each relay framing, operator by default`() {

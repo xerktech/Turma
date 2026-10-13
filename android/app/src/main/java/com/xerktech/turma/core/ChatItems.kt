@@ -340,8 +340,12 @@ fun messageOrigin(text: String): String {
     return "operator"
 }
 
-private val FRAMING_TAG_RE =
-    Regex("(?m)^[ \\t]*</?(?:pasted_content(?: id=\"[^\"\\n]*\")?|system-reminder)>[ \\t]*(?:\\r?\\n|$)")
+private val FRAMING_TAG_LINE =
+    Regex("^[ \\t]*<(/?)(pasted_content(?: id=\"([^\"\\n]*)\")?|system-reminder)>[ \\t]*\\r?$")
+// The renderer's fence rule with ASCII blanks, as chat.js FRAME_FENCE_OPEN/_CLOSE
+// (JS `\\s` and Kotlin's differ on Unicode spaces; both platforms must strip alike).
+private val FENCE_OPEN = Regex("^[ \\t]*(`{3,})[ \\t]*([^ \\t\\r`]*)[ \\t]*\\r?$")
+private val FENCE_CLOSE = Regex("^[ \\t]*(`{3,})[ \\t]*\\r?$")
 
 /**
  * Claude Code's own framing tags on a user turn, each on a line of its own —
@@ -352,7 +356,37 @@ private val FRAMING_TAG_RE =
  */
 fun stripFraming(text: String): String {
     if (!text.contains('<')) return text
-    return text.replace(FRAMING_TAG_RE, "").trim('\r', '\n')
+    // In step with chat.js: a tag inside a ``` fence is the operator's text (rollup
+    // XERK-1701), except a matched `<pasted_content id="X">` pair (Claude Code's own
+    // paste framing, wherever the paste landed); the first and last non-blank lines
+    // always go when they are tags. Blank = space/tab/CR only, as on the web.
+    val lines = text.split("\n")
+    val tags = lines.map { FRAMING_TAG_LINE.matchEntire(it) }
+    val opened = HashSet<String>(); val closed = HashSet<String>()
+    for (m in tags) {
+        val id = m?.groups?.get(3)?.value ?: continue
+        if (m.groupValues[1].isNotEmpty()) closed.add(id) else opened.add(id)
+    }
+    fun solid(l: String) = l.any { it != ' ' && it != '\t' && it != '\r' }
+    val first = lines.indexOfFirst(::solid)
+    val last = lines.indexOfLast(::solid)
+    var fence: String? = null
+    val kept = ArrayList<String>(lines.size)
+    lines.forEachIndexed { i, line ->
+        val f = fence
+        if (f != null) {
+            val c = FENCE_CLOSE.matchEntire(line)
+            if (c != null && c.groupValues[1].length >= f.length) fence = null
+        } else {
+            FENCE_OPEN.matchEntire(line)?.let { fence = it.groupValues[1] }
+        }
+        val m = tags[i]
+        val id = m?.groups?.get(3)?.value
+        val pairedPaste = id != null && id in opened && id in closed
+        if (m != null && (pairedPaste || i == first || i == last || fence == null)) return@forEachIndexed
+        kept.add(line)
+    }
+    return kept.joinToString("\n").trim('\r', '\n')
 }
 
 /**
