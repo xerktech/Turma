@@ -2952,16 +2952,23 @@ test("buildItems: Claude Code's framing tags never reach a user bubble", () => {
 test("buildItems: a framing tag inside an operator's code fence is their text (rollup XERK-1701)", () => {
   const fenced = "how do I filter these?\n```\n<system-reminder>\nnoise\n</system-reminder>\n```";
   const pasted = '<pasted_content id="p">\n```\n<system-reminder>\nlog\n</pasted_content id="p">\n';
-  const tilde = "~~~xml\n<pasted_content>\n~~~\nafter\n<system-reminder>";
+  const closed = "```\n<system-reminder>\n```\nafter\n<system-reminder>";
+  // A real Claude Code 2.1 transcript (QA): the operator typed the fence, then
+  // pasted a log into it, and Claude Code framed the paste INSIDE that fence.
+  const intoFence = 'look at this log:\n```\n\n\n<pasted_content id="6550">\nE1 boom\nE2 boom\n'
+    + '</pasted_content id="6550">\n\n```\nwhy does it fail?';
   const items = buildItems([
     { id: "f", role: "user", blocks: [{ t: "text", text: fenced }] },
     { id: "p", role: "user", blocks: [{ t: "text", text: pasted }] },
-    { id: "t", role: "user", blocks: [{ t: "text", text: tilde }] },
+    { id: "t", role: "user", blocks: [{ t: "text", text: closed }] },
+    { id: "i", role: "user", blocks: [{ t: "text", text: intoFence }] },
   ]);
   const byId = Object.fromEntries(items.map((i) => [i.id, i]));
   assert.equal(byId.f.text, fenced);
   // A paste whose fence never closes still loses its own outer tags.
   assert.equal(byId.p.text, "```\n<system-reminder>\nlog");
   // Outside the (closed) fence a tag line is framing again.
-  assert.equal(byId.t.text, "~~~xml\n<pasted_content>\n~~~\nafter");
+  assert.equal(byId.t.text, "```\n<system-reminder>\n```\nafter");
+  // Claude Code's own matched paste framing goes even inside the operator's fence.
+  assert.equal(byId.i.text, "look at this log:\n```\n\n\nE1 boom\nE2 boom\n\n```\nwhy does it fail?");
 });

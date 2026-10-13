@@ -431,8 +431,12 @@ class ChatItemsTest {
         assertEquals(fenced, stripFraming(fenced))
         assertEquals("```\n<system-reminder>\nlog",
             stripFraming("<pasted_content id=\"p\">\n```\n<system-reminder>\nlog\n</pasted_content id=\"p\">\n"))
-        assertEquals("~~~xml\n<pasted_content>\n~~~\nafter",
-            stripFraming("~~~xml\n<pasted_content>\n~~~\nafter\n<system-reminder>"))
+        assertEquals("```\n<system-reminder>\n```\nafter",
+            stripFraming("```\n<system-reminder>\n```\nafter\n<system-reminder>"))
+        // Claude Code's matched paste framing goes even inside the operator's fence (QA).
+        assertEquals("look at this log:\n```\n\n\nE1 boom\nE2 boom\n\n```\nwhy does it fail?",
+            stripFraming("look at this log:\n```\n\n\n<pasted_content id=\"6550\">\nE1 boom\nE2 boom\n" +
+                "</pasted_content id=\"6550\">\n\n```\nwhy does it fail?"))
     }
 
     // ---- messageOrigin: a user turn's real source (web parity) --------------

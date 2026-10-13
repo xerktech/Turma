@@ -1378,26 +1378,45 @@
   // bubble drops the tag lines and keeps what they wrap. Run AFTER messageOrigin,
   // which classifies a system turn by its leading tag. Keep in step with
   // ChatItems.kt `stripFraming`.
-  // A tag line inside a ``` / ~~~ fence is the operator's own text (rollup XERK-1701),
-  // so only lines outside one go; the first and last lines always go when they are
-  // tags, so a paste with an unclosed fence can't leave its closing tag showing.
-  const FRAMING_TAG_LINE = /^[ \t]*<\/?(?:pasted_content(?: id="[^"\n]*")?|system-reminder)>[ \t]*\r?$/;
-  const FENCE_LINE = /^[ \t]*(?:```|~~~)/;
+  // A tag line inside a ``` fence (as the bubble's renderer reads fences:
+  // FENCE_OPEN / fenceCloses) is the operator's own text (rollup XERK-1701), so
+  // only lines outside one go — except Claude Code's own paste framing: a
+  // `<pasted_content id="X">` with its matching close is always dropped, since
+  // Claude Code writes it wherever the paste landed, an operator's fence included.
+  // The first and last non-blank lines always go when they are tags. "Blank" is
+  // space/tab/CR only, the same on Android (ChatItems.kt `stripFraming`).
+  const FRAMING_TAG_LINE = /^[ \t]*<(\/?)(pasted_content(?: id="([^"\n]*)")?|system-reminder)>[ \t]*\r?$/;
   function stripFraming(text) {
     const t = String(text == null ? "" : text);
     if (t.indexOf("<") === -1) return t;
     const lines = t.split("\n");
-    const solid = (l) => l.trim() !== "";
+    const tags = lines.map((l) => FRAMING_TAG_LINE.exec(l));
+    const opened = new Set(), closed = new Set();
+    for (const m of tags) if (m && m[3] != null) (m[1] ? closed : opened).add(m[3]);
+    const solid = (l) => /[^ \t\r]/.test(l);
     const first = lines.findIndex(solid);
     let last = lines.length - 1;
     while (last > 0 && !solid(lines[last])) last--;
-    let fenced = false;
-    const kept = lines.filter((line, i) => {
-      if (FENCE_LINE.test(line)) { fenced = !fenced; return true; }
-      const edge = i === first || i === last;
-      return !(FRAMING_TAG_LINE.test(line) && (edge || !fenced));
+    let fence = null;
+    const kept = [];
+    lines.forEach((line, i) => {
+      if (fence) {
+        if (fenceCloses(line, fence)) fence = null;
+      } else {
+        const open = FENCE_OPEN.exec(line);
+        if (open) fence = open[1];
+      }
+      const m = tags[i];
+      const pairedPaste = m && m[3] != null && opened.has(m[3]) && closed.has(m[3]);
+      if (m && (pairedPaste || i === first || i === last || !fence)) return;
+      kept.push(line);
     });
-    return kept.join("\n").replace(/^[\r\n]+|[\r\n]+$/g, "");
+    // Linear, not /[\r\n]+$/ (that regex is quadratic on a long run of newlines).
+    const joined = kept.join("\n");
+    let s0 = 0, e0 = joined.length;
+    while (s0 < e0 && (joined[s0] === "\r" || joined[s0] === "\n")) s0++;
+    while (e0 > s0 && (joined[e0 - 1] === "\r" || joined[e0 - 1] === "\n")) e0--;
+    return joined.slice(s0, e0);
   }
 
   // ---- build display items from rich entries --------------------------------
