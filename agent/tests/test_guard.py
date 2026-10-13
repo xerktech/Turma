@@ -6306,7 +6306,8 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # A wrapper's options, an escaped or brace-formed name: read on
                     # the stage's words (rollup XERK-1701).
                     "cat f | env -i sh", "cat f | env -- sh", "cat f | env -u X sh",
-                    "cat f | b\\usybox sh", "cat f | {,env} sh"):
+                    "cat f | b\\usybox sh", "cat f | {,env} sh", "cat f | s\\h", "cat f | 's'h",
+                    "cat f | env -i s\\h", "cat f | nice -n 5 s\\h"):
             with self.subTest(run=run):
                 cmd = "echo 'rm -rf /etc' > f; " + run
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
