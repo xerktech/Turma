@@ -72,6 +72,9 @@ Split out of `agent-hooks.md` (size ceiling); the guard's other categories live 
     present the command is read with its LIVE redirections moved after the words
     (`_redirects_last`), so `--body-file 2>/dev/null f.md` checks f.md, as gh reads it. A quoted
     `'2>x'` is not live and stays the file name.
+  - That moved reading is used only when EVERY redirection target is a plain word
+    (`_redirect_targets_plain`); an expansion or bracket in one keeps the raw reading, which
+    refuses. Where a target ends is the shell's call, and a misread one moved a creds path out.
   - **A shorthand CLUSTER is a description flag too** (`_shorthand_value`): pflag reads `-dF x` as
     `-d -F x`, so `--body-file ok.md -dF hosts.yml` (also `-dFhosts.yml`, `-wF`, glab `-yd`) is
     two sources. ANY letter of a single-dash token counts (gh `b`/`F`, glab `d`): a glued value

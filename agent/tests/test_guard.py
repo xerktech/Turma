@@ -3631,7 +3631,13 @@ class TestScriptChannels(unittest.TestCase):
                     f"bash <(echo '{R}' 2>&1)",
                     # A bare `{` in a target is text: the word ends at the blank.
                     f"bash -c 2>x{{ '{R}' }} y", f"sh -c 2>x{{ '{R}' }} a b",
-                    f"bash -c 2>x( '{R}' ) y"):
+                    f"bash -c 2>x( '{R}' ) y",
+                    # ...nor one after the PID `$$`, an escaped `\$`, or inside a
+                    # frame of another kind (QA pass 2).
+                    f"bash -c 2>$${{ '{R}' }} y", f"bash -c 2>\\${{ '{R}' }} y",
+                    f"bash -c 2>a$${{ '{R}' }} y", f"sh -c 2>$${{ '{R}' }} a b",
+                    f"bash -c &>$${{ '{R}' }} y", f"bash -c {{fd}}>$${{ '{R}' }} y",
+                    f"bash -c 2>$[ y ] '{R}'", f"bash -c 2>$(echo {{a) '{R}'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("2>/dev/null ls /etc", "> out echo hi", "ls 2>&1 | tail",
@@ -6917,7 +6923,11 @@ class TestPrSummary(unittest.TestCase):
                     "gh pr create -t x -F 2>/dev/null good.md -F bad.md",
                     # A bare `{` does not stretch the target over the file gh reads.
                     "gh pr edit --body-file 2>x{ bad.md -t } good.md",
-                    "gh pr edit --body-file >{ bad.md --add-label } good.md"):
+                    "gh pr edit --body-file >{ bad.md --add-label } good.md",
+                    "gh pr edit --body-file 2>$${ bad.md -t } good.md",
+                    "gh pr edit --body-file 2>\\${ bad.md -t } good.md",
+                    "gh pr edit --body-file 2>$[ good.md ] bad.md",
+                    "gh pr edit --body-file 2>${PWD#) good.md }/q bad.md"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(self.reason(cmd))
 
