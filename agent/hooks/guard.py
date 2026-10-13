@@ -7272,9 +7272,15 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
                 out.pop(0)
             # A multi-call binary runs the applet its argv[0] names, so `exec -a rm
             # busybox -rf /etc` is `busybox rm -rf /etc` (rollup XERK-1701). A login
-            # shell's leading `-` is dropped first, as BusyBox does (`-a -rm`).
+            # shell's leading `-` is dropped first, as BusyBox does (`-a -rm`). Only
+            # a literal name: an expansion (or its `_OPAQUE_SUBST` stand-in) may hold
+            # `busybox…`, and then argv[1] is the applet, so inserting it hid
+            # `exec -a "$n" busybox rm -rf /etc`.
             if argv0 and out and _basename(out[0]) == "busybox":
-                out.insert(1, argv0[1:] if argv0.startswith("-") else argv0)
+                applet = argv0[1:] if argv0.startswith("-") else argv0
+                if (not re.search(r"[$`\\'\"]", applet) and _OPAQUE_SUBST not in applet
+                        and _basename(applet) != "busybox"):
+                    out.insert(1, applet)
             # BusyBox rm has no preserve-root: `busybox rm -rf "$x/$y"` empties
             # `/`, so it is read as GNU rm told not to refuse it (XERK-1687).
             if wrapper == "busybox" and out and _basename(out[0]) == "rm":

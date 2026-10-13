@@ -55,6 +55,10 @@ paths:
     - They dispatch on argv[0] alone, which `exec -a NAME` sets: the prefix strip inserts NAME
       (one leading `-` dropped, as BusyBox does) after the multi-call word, so `exec -a rm
       busybox -rf /etc` is `busybox rm -rf /etc`. Was allowed on main. Rollup XERK-1701.
+    - Only a LITERAL NAME is inserted, never one that starts with `busybox`/`toybox` itself or
+      an expansion (`"$n"`, `$(…)`, `_OPAQUE_SUBST`): such an argv[0] makes argv[1] the applet,
+      and inserting it hid `exec -a "$n" busybox rm -rf /etc` (QA).
+    - toybox keeps a leading `-` (no applet runs); stripping it there too over-denies, safely.
     - `_CMD_START` takes one as a wrapper word, so `cat a.sh | busybox sh` is a stdin shell
       for the write-then-run rule (was allowed on main). Rollup XERK-1701.
     - `_MULTICALL_WORD` is anchored by a lookbehind: unanchored, every `-busybox` in one long

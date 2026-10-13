@@ -6217,7 +6217,11 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # ...and on argv[0] alone, which `exec -a` sets (rollup XERK-1701).
                     "exec -a rm busybox -rf /etc", "exec -arm toybox -rf /etc",
                     "exec -la rm busybox -rf /etc", "exec -c -a /bin/rm busybox.static -rf /etc",
-                    "exec -a -rm busybox -rf /etc", "exec -a sh busybox -c 'rm -rf /etc'"):
+                    "exec -a -rm busybox -rf /etc", "exec -a sh busybox -c 'rm -rf /etc'",
+                    # An unread argv[0] may itself start with `busybox`, making argv[1]
+                    # the applet: it is never inserted (QA).
+                    'exec -a "$n" busybox rm -rf /etc', 'exec -a "$(cat f)" toybox rm -rf /etc',
+                    "exec -a `cat f` busybox rm -rf /etc", "exec -a busybox-x busybox rm -rf /etc"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$x/$y"', 'rm -rf "$dir/$f"', 'chmod 644 "$x/$y"', 'find "$x/$y" -name a',
