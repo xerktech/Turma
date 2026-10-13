@@ -31,6 +31,7 @@ for `qa`, `qa-delta` and any `subagent_type` containing `review` not after a `p`
     with `agent` a vm-context global; a wrapper param made a body-level `const agent` a SyntaxError.
   - Runtime stack lines are BODY-relative after the runtime strips `^[;\s]*\n` past the meta, so
     the pin prefixes the first surviving line; glued after `}` it shifted every line by one.
+    Accepted cost: an error ON that first line reports a column off by the pin's length.
   - `meta` must be the first statement (after comments/hashbang), as the runtime requires; a
     decoy `export const meta = {` in a leading comment must not be matched.
   - Any doubt passes through: unfound/odd meta, already-pinned marker, past the 524288-byte cap.
