@@ -131,3 +131,13 @@ test("a repo row says clean only for a real read of zero dirty files", () => {
     assert.match(meta(unknown), /<b>main<\/b>/);
   }
 });
+
+// XERK-1887: a repo whose `git status` always fails (corrupt index, dubious
+// ownership) says so, with git's reason on hover — never "clean", never blank.
+test("a repo git cannot read says so with the reason, never clean", () => {
+  const { repoBlock } = loadDashboard();
+  const html = repoBlock(host([]), { ...REPO, dirtyFiles: null,
+    gitProblem: { unreadable: "index file smaller than <expected>" } }, [], Date.now());
+  assert.match(html, /<span class="git-problem" title="index file smaller than &lt;expected&gt;">git unreadable<\/span>/);
+  assert.doesNotMatch(html, /clean/);
+});

@@ -208,13 +208,16 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     runs before the session payload, so on a cold start the card cache holds the placeholder.
   - The cheap reads are `strict`: NO answer — a git TIMEOUT, or a launch failure in a dir that
     still exists (XERK-1263) — raises `GitTimeout` (plain `run()` folds both into "gone"/"clean").
-    The worker keeps the last real answer on it. A fast failure — missing cwd, broken `.git` link —
-    is still "gone". A cached `None` is served, never re-read inline.
+    The worker keeps the last real answer on it. A missing cwd is "gone" (`GIT_MISSING`); git
+    ANSWERING with a failure in a dir that exists (corrupt index, dubious ownership, a broken `.git`
+    link) is `GitUnreadable`, cached as `gitProblem.unreadable` (XERK-1887, `_cheap_job_value`).
+    Both are kept apart from the first-sight placeholder; a cached answer is never re-read inline.
   - The worker can still hang past the timeout: `subprocess.run` waits UNBOUNDED after `kill()`, and a
     git in D sleep can't be reaped (XERK-1537). The stage path's watchdog abandons a worker mid-job
     with no spawn for `CHEAP_GIT_STALL_SEC` (`run`/`run_out`/`_strict_git` stamp `spawnedAt`); its
     stuck key isn't re-staged while stuck. Tests: `test_a_read_stuck_past_its_timeout_*`.
-  - A nonzero `status` exit is no answer too (`fail_is_unknown`); a failed `rev-parse` stays "gone".
+  - A nonzero `status`/`rev-parse` exit in a dir that exists is never "clean" or "gone"
+    (`fail_is_unknown`); only a missing dir is "gone".
     The open-PR reader is strict, so a no-answer read stays PENDING — never decided as clean.
   - The poller also skips on `branch_sync`'s None (`pushed` None on a live branch, or a pushed
     branch with no `aheadOfRemote`) — that is a failed read, never "delivered". Only when CLEAN:

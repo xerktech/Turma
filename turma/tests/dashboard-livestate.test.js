@@ -456,3 +456,18 @@ test("dashboard stateAge: the age's dot never ends a line", () => {
   assert.ok(!html.includes('live.detail ? " · "'), "no breakable separator left");
   assert.match(html, /\.state-age \{ white-space: nowrap; \}/);
 });
+
+// XERK-1887: a card whose git block is null says why when the agent knows —
+// the worktree is gone, or git could not read it (reason on hover) — and keeps
+// "…" only for "not read yet".
+test("dashboard card: the Branch row names a git problem instead of an endless …", () => {
+  const { sessCard } = loadDashboard();
+  const host = { key: "h1", online: true, lastSeen: NOW, terminalOnline: true };
+  const card = (extra) => sessCard(host, { id: "s1", status: "stopped", repo: "r", git: null,
+    session: { paneBusy: false }, ...extra }, NOW);
+  assert.match(card({}), /<dt>Branch<\/dt><dd><b>…<\/b><\/dd>/);
+  assert.match(card({ gitProblem: { missing: true } }),
+    /<dt>Branch<\/dt><dd><b>worktree gone<\/b><\/dd>/);
+  assert.match(card({ gitProblem: { unreadable: "dubious <ownership>" } }),
+    /<dt>Branch<\/dt><dd><b title="dubious &lt;ownership&gt;">git unreadable<\/b><\/dd>/);
+});

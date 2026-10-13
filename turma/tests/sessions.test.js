@@ -2890,6 +2890,10 @@ test("sessMeta shows the repo and branch, dropping blanks", () => {
   assert.equal(sessMeta({ repo: "Turma" }), "Turma");
   // Repos-root sessions have no repo/branch of their own.
   assert.equal(sessMeta({ root: true, repo: "" }), "repos root");
+  // XERK-1887: the agent says WHY there is no git block when it knows.
+  assert.equal(sessMeta({ repo: "Turma", gitProblem: { missing: true } }), "Turma · worktree gone");
+  assert.equal(sessMeta({ repo: "Turma", gitProblem: { unreadable: "bad index" } }),
+    "Turma · git unreadable");
 });
 
 // --- local-model failover, on the page you actually scan (XERK-246) ----------

@@ -60,3 +60,9 @@ The heartbeat payload and what `/api/agents` serves to every client. Spans `hub-
 - **`readyForReview` has FOUR mirrors that must agree**: `turma/public/sessions.html`,
   `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`. Changing the rule means
   changing all four.
+- **`gitProblem` says why git facts are absent when that is not "not read yet"** (XERK-1887): on a
+  session (`git` null) and a `repos[]` entry (`dirtyFiles` null), `{missing:true}` or
+  `{unreadable:"<git's reason>"}`. Absent keeps the old "not read yet" meaning (`…` / `–`).
+  - Agent: `_cheap_job_value`; hub: `coerceGitProblem` (rebuilt or deleted, Android TYPES it);
+    clients: web `gitProblemText`, Android `gitProblemText`. Glasses reads no git field.
+  - Unreadable never claims "clean": the repo's `dirtyFiles` stays null and delete still warns.

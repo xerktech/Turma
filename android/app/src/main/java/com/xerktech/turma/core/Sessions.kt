@@ -2,6 +2,7 @@ package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.Attention
+import com.xerktech.turma.model.GitProblem
 import com.xerktech.turma.model.LiveAgent
 import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.PrInfo
@@ -364,8 +365,19 @@ fun sessionName(session: SessionInfo): String {
  * Callers drop or placeholder the blank, as web sessions.html `sessMeta` does.
  */
 fun sessionBranch(session: SessionInfo): String {
-    val b = session.git?.branch ?: return ""
+    val b = session.git?.branch ?: return gitProblemText(session.gitProblem)
     return if (b.isBlank() || b == "HEAD") "detached" else b
+}
+
+/**
+ * The agent's `gitProblem` in words, as web index.html `gitProblemText`
+ * (XERK-1887): "worktree gone" / "git unreadable", "" when there is none.
+ */
+fun gitProblemText(p: GitProblem?): String = when {
+    p == null -> ""
+    p.missing -> "worktree gone"
+    !p.unreadable.isNullOrBlank() -> "git unreadable"
+    else -> ""
 }
 
 /**
@@ -377,6 +389,8 @@ fun deleteConfirmText(session: SessionInfo): String {
     val dirty = session.git?.dirtyFiles
     return when {
         dirty != null && dirty > 0 -> "Confirm delete — uncommitted changes will be lost"
+        // A worktree the agent found gone has nothing left to lose (XERK-1887).
+        dirty == null && session.gitProblem?.missing == true -> "Confirm delete — worktree already gone"
         dirty == null && !session.root -> "Confirm delete — may have uncommitted changes"
         else -> "Confirm delete"
     }

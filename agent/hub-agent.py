@@ -6664,14 +6664,53 @@ class GitTimeout(Exception):
     this a stalled disk reads as a removed worktree, or as a clean one."""
 
 
+class GitUnreadable(GitTimeout):
+    """A `strict` cheap read where git ANSWERED with a failure in a directory
+    that still exists (XERK-1887): a corrupt index, "dubious ownership" from
+    safe.directory, a .git link to a pruned gitdir. `reason` is git's own
+    first error line. A subclass of GitTimeout, so every caller that only
+    needs "no usable answer" (the open-PR poller, delete) is unchanged; the
+    cheap-git worker alone turns it into a `gitProblem` the card can say."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+GIT_PROBLEM_REASON_MAX = 200
+
+
+def _git_error_reason(stderr):
+    """git's first non-empty stderr line, `fatal: `/`error: ` dropped, control
+    characters removed and capped — what the card says after "git unreadable"."""
+    for line in (stderr or "").splitlines():
+        line = re.sub(r"[\x00-\x1f\x7f]", " ", line).strip()
+        line = re.sub(r"^(fatal|error):\s*", "", line, flags=re.I)
+        if line:
+            return line[:GIT_PROBLEM_REASON_MAX]
+    return "git exited with an error"
+
+
+# What the session/repo git caches hold for a worktree git cannot read, keyed
+# apart from the first-sight placeholder (None / dirtyFiles None) so the card
+# can say why instead of "…" forever (XERK-1887). Rides the payload as
+# `gitProblem`: {missing: true} or {unreadable: "<reason>"}.
+GIT_MISSING = {"gitProblem": {"missing": True}}
+
+
+def _git_unreadable(reason):
+    return {"gitProblem": {"unreadable": reason}}
+
+
 def _strict_git(cmd, cwd, timeout=15, fail_is_unknown=False):
     """run() for a `strict` cheap read: stripped stdout on success, "" when git
     answered with a failure or `cwd` is gone, GitTimeout when there was no
     answer — a timeout, or a launch failure in a directory that still exists.
 
-    `fail_is_unknown` makes a nonzero exit GitTimeout too: for `status`, whose
-    EMPTY output is itself the verdict "clean", a failure (a corrupt index, an
-    EIO) must not read as one. rev-parse keeps "" — that failure IS "gone"."""
+    `fail_is_unknown` makes a nonzero exit in a directory that still exists
+    GitUnreadable (a GitTimeout): for `status`, whose EMPTY output is itself
+    the verdict "clean", a failure (a corrupt index, an EIO) must not read as
+    one. A missing `cwd` stays "" — that failure IS "gone"."""
     _note_spawn()
     try:
         out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
@@ -6685,7 +6724,9 @@ def _strict_git(cmd, cwd, timeout=15, fail_is_unknown=False):
             return ""
         raise GitTimeout(" ".join(cmd[1:3]))
     if out.returncode != 0 and fail_is_unknown:
-        raise GitTimeout(" ".join(cmd[1:3]))
+        if cwd and not os.path.isdir(cwd):
+            return ""
+        raise GitUnreadable(_git_error_reason(out.stderr))
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
@@ -6698,9 +6739,12 @@ def git_info_cheap(cwd, strict=False):
 
     `strict` raises GitTimeout instead of answering None / dirtyFiles 0 when a
     read timed out — what the heartbeat's cache (_cheap_read) needs to keep its
-    last real answer through a disk stall."""
+    last real answer through a disk stall — and GitUnreadable when git answered
+    with a failure in a directory that still exists (XERK-1887). None then
+    means only that `cwd` is gone."""
     if strict:
-        if not _strict_git(["git", "rev-parse", "--git-dir"], cwd):
+        if not _strict_git(["git", "rev-parse", "--git-dir"], cwd,
+                           fail_is_unknown=True):
             return None
         dirty = _strict_git(["git", "status", "--porcelain"], cwd,
                             fail_is_unknown=True)
@@ -18379,8 +18423,12 @@ def repo_cheap_facts(path, strict=False):
 
 def _root_cheap_facts(path, strict=False):
     """git_info_cheap for the repos-root pseudo-repo, which reports {} rather
-    than None when REPOS_ROOT is not itself a git checkout."""
-    return git_info_cheap(path, strict=strict) or {}
+    than None when REPOS_ROOT is not itself a git checkout — git's "not a git
+    repository" answer included, which is the ordinary case there."""
+    try:
+        return git_info_cheap(path, strict=strict) or {}
+    except GitUnreadable:
+        return {}
 
 
 def repo_entry(repo, slow, cheap=None):
@@ -36048,13 +36096,34 @@ class SessionManager:
                     fn, path = me.cheapLeft.pop(job)
                     me.cheapJob, me.jobAt = job, time.monotonic()
                 try:
-                    value = fn(path, strict=True)
+                    value = self._cheap_job_value(job[0], fn, path)
                 except GitTimeout:
                     continue        # a stalled disk: keep the last real answer
                 except Exception as e:
                     log(f"cheap git refresh of {path} failed: {e}")
                     continue
                 self._cheap_store(job[0], job[1], value, only_if_present=True)
+
+    @staticmethod
+    def _cheap_job_value(attr, fn, path):
+        """Run one cheap-git job and return what `attr` should cache. Raises
+        GitTimeout when there is no answer to publish (keep the last one).
+
+        git that ANSWERED with a failure (GitUnreadable) and a session worktree
+        that is gone (None) become `gitProblem` markers rather than the
+        first-sight placeholder, which said "…" or "–" forever (XERK-1887). The
+        slow-fact maps have no such state, so they keep their last answer."""
+        try:
+            value = fn(path, strict=True)
+        except GitUnreadable as e:
+            if attr == "session_cheap":
+                return _git_unreadable(e.reason)
+            if attr == "repo_cheap":
+                return {"branch": "", "dirtyFiles": None, **_git_unreadable(e.reason)}
+            raise
+        if value is None and attr == "session_cheap":
+            return GIT_MISSING
+        return value
 
     def _refresh_jira_if_configured(self):
         """The worker's jira arm. The configured() re-check keeps 'unset creds =
@@ -38123,7 +38192,9 @@ class SessionManager:
             # card cache may still hold the placeholder — and a None branch
             # reads a never-pushed branch as delivered.
             facts = _session_slow_facts(sess, gi, path)
-            self._cheap_store("session_cheap", sid, gi, only_if_present=True)
+            self._cheap_store("session_cheap", sid,
+                              gi if gi is not None else GIT_MISSING,
+                              only_if_present=True)
             self._cheap_store("session_facts", sid, facts, only_if_present=True)
             return {"dirtyFiles": (gi or {}).get("dirtyFiles") or 0,
                     "liveBranch": facts["liveBranch"], "work": facts["work"]}
@@ -40624,7 +40695,9 @@ class SessionManager:
         sid = sess["id"]
         gi = self._cheap_read("session_cheap", sid, git_info_cheap,
                               sess["worktreePath"], refresh=not light)
-        gi = dict(gi) if gi is not None else None      # never hand out the cache
+        # A gitProblem marker is not a git block: the card reads it from the
+        # session's own `gitProblem` field (_session_git_problem).
+        gi = dict(gi) if gi is not None and "gitProblem" not in gi else None
         # The app owns no branch, so the branch to report is the LIVE one the
         # running agent named for its work ("HEAD" = still detached, not yet
         # branched -> no branch to sync).
@@ -40640,6 +40713,14 @@ class SessionManager:
         if gi is not None:
             gi.update(cached["slow"])  # fold cached repoName/remote/lastCommit in
         return gi, cached["work"]
+
+    def _session_git_problem(self, sid):
+        """{missing: true} / {unreadable: "<reason>"} when the session's last
+        cheap read found its worktree gone or git unable to read it, else None
+        — distinct from git None, which is "not read yet" (XERK-1887)."""
+        cached = self.session_cheap.get(sid)
+        problem = cached.get("gitProblem") if isinstance(cached, dict) else None
+        return dict(problem) if isinstance(problem, dict) else None
 
     def _session_facts_reader(self, sess):
         """The worker job behind a session's slow facts. It reads the live branch
@@ -40896,6 +40977,9 @@ class SessionManager:
             "stoppedAt": sess.get("stoppedAt"),
             "errorMsg": sess.get("errorMsg"),
             "git": gi,
+            # Why `git` is None when it is not merely "not read yet"
+            # (XERK-1887): {missing: true} or {unreadable: "<reason>"}.
+            "gitProblem": self._session_git_problem(sid),
             # The live branch's relation to its base/origin, computed from the
             # shared repo so it's reported even for a stopped session. Empty
             # while the agent is still on detached HEAD (no branch to sync).
