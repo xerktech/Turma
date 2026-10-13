@@ -8140,6 +8140,60 @@ GH_API_PULLS_PATH_RE = re.compile(
 GH_API_BODY_RE = re.compile(r"(?:^|\s)(?:--input|--field|--raw-field|-[fF])")
 GH_API_GET_RE = re.compile(r"(?:^|\s)(?:-X|--method)(?:\s+|=)?['\"]?GET\b", re.IGNORECASE)
 
+# The GitLab twin: a request that WRITES to a project's merge_requests
+# COLLECTION (`POST /api/v4/projects/<id>/merge_requests`) opens an MR. A
+# session reaches for it when `glab` is missing or can't auth, or SSH is blocked
+# and it pushed over another route — through curl, a python/node script (the
+# heredoc is part of the command text), or `glab api`. Leaving it out dropped
+# that MR's chip in silence. The `(?![\w/-])` keeps `/merge_requests/<iid>`
+# (one existing MR) out.
+#
+# A GET of the collection LISTS other people's MRs, so the WRITE must be bound
+# to the very request naming the path — anything looser chipped a foreign MR
+# (a listing script's `data = …`, a `cut -d` in its pipeline, a "list, then
+# POST a note/Slack message" script), and a physical-line rule dropped real
+# multi-line creates (QA). So:
+# - In a SCRIPT the path must sit inside a CALL (`_mr_api_call_writes`): the
+#   innermost call opened before it whose paren is still open. `.post(` writes;
+#   `Request(`/`urlopen(`/`fetch(`/`.request(` write when their own argument
+#   list carries `data=` or a "POST" string. A path assigned to a variable
+#   (`url = f"…/merge_requests"`) binds to a later call taking that variable as
+#   its first argument.
+# - For curl / `glab api` a flag must be in the path's pipeline SEGMENT
+#   (`_mr_api_segments`, a small shell lexer), with no GET override there.
+# Every scan is linear or bounded: this runs on the beat over session text.
+GITLAB_API_MR_PATH_RE = re.compile(r"projects/[^/\n]{1,200}?/merge_requests(?![\w/-])")
+# How far back a call may open, and forward its arguments may run, around a path.
+GITLAB_API_CALL_SPAN = 600
+# Path occurrences examined per command — bounds the call scans.
+GITLAB_API_PATHS_MAX = 20
+# The openers that make a request: `.post(` always writes; the generic ones
+# write only with `data=` or a "POST" string in their own arguments.
+GITLAB_API_READ_OPENERS = (".get", ".put", ".patch", ".delete", ".head")
+GITLAB_API_CALL_NAME_RE = re.compile(r"(\.?[A-Za-z_]\w{0,63})\s*\Z")
+GITLAB_API_CALL_WRITE_RE = re.compile(r"""\bdata\s*=|['"]POST['"]""", re.IGNORECASE)
+GITLAB_API_POST_STR_RE = re.compile(r"""['"]POST['"]""", re.IGNORECASE)
+# `url = …` (or `const url = …`) at the start of the path's line.
+GITLAB_API_ASSIGN_RE = re.compile(r"\s*(?:(?:const|let|var)\s+)?([A-Za-z_]\w{0,63})\s*=(?!=)")
+# Heredoc consumers whose body is code a shell runs, so it stays lexed.
+GITLAB_HEREDOC_SHELL_RE = re.compile(
+    r"(?<![^\s;|&(])(?:bash|sh|zsh|dash|ksh|ssh)(?:\s|$)|>\s*\S+\.sh(?:\s|$)")
+# (A lookbehind, not `^`: searched from a segment's start, `^` never matches there.)
+GITLAB_API_TOOL_RE = re.compile(r"(?<![\w-])(curl|glab\s+api)(?![\w-])")
+GITLAB_API_POST_FLAG_RE = re.compile(
+    r"""(?<![\w-])(?:-X\s*|--request[\s=]+|--method[\s=]+)['"]?POST\b""", re.IGNORECASE)
+GITLAB_API_GET_FLAG_RE = re.compile(
+    r"""(?<![\w-])(?-i:-[A-Za-z]{0,8}G[A-Za-z]{0,8}|--get)(?![\w-])|(?<![\w-])(?:-X\s*|--request[\s=]+|--method[\s=]+)['"]?GET\b""",
+    re.IGNORECASE)
+# A request body makes curl POST; `-f` is a body flag to `glab api` but
+# `--fail` to curl, so it counts only there.
+GITLAB_CURL_BODY_RE = re.compile(
+    r"(?<![\w-])(?:-d|-F|--data(?:-raw|-binary|-urlencode|-ascii)?|--json|--form)(?![\w-])")
+GITLAB_GLAB_BODY_RE = re.compile(r"(?<![\w-])(?:-[fF]|--field|--raw-field|--input)(?![\w-])")
+# A `web_url` key's value, in JSON or a python dict repr. An MR object's own
+# `web_url` is its link; the nested author/milestone ones are not MR URLs.
+GITLAB_WEB_URL_RE = re.compile(r"""["']web_url["']\s*:\s*["']([^"'\s]+)["']""")
+
 # A creating call run in the background (`run_in_background`, or moved there on
 # its timeout) answers only "running in background", and the PR URL lands in the
 # task's output FILE, announced later by a `<task-notification>`. Remembered per
@@ -10249,8 +10303,209 @@ def _gh_api_created_pr_url(text):
     return urls.pop() if len(urls) == 1 and alone == urls else None
 
 
+def _mr_api_segments(cmd):
+    r"""`cmd`'s shell segments: split on `|`, `;`, `&` and newlines OUTSIDE
+    quotes, with heredoc bodies and `#` comments dropped (an apostrophe in
+    either is not a quote), `\"` and `$'…'` escapes honoured, `\`-newline
+    joined, and the spaces and dashes INSIDE quotes turned to `_` — so a quoted
+    value (`"title=Fix -Gradle"`) can't read as a flag while a quoted URL or
+    `"POST"` stays matchable. One linear pass."""
+    segs, cur, q, i, n = [], [], None, 0, len(cmd)
+    heredocs = []   # delimiters whose bodies start at the next newline
+    seg_start = 0   # where the current segment began in `cmd`
+    while i < n:
+        c = cmd[i]
+        if q:
+            if c == "\\" and q != "'" and i + 1 < n:
+                cur.append("__")   # an escaped char never ends the quote
+                i += 2
+                continue
+            if c == q[-1]:
+                q = None
+            cur.append("_" if c in " \t-" else c)
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            cur.append(" " if cmd[i + 1] == "\n" else c + cmd[i + 1])
+            i += 2
+            continue
+        if c == "$" and cmd.startswith("$'", i):
+            q = "$'"   # ANSI-C quoting: backslash escapes, ends at a bare '
+            cur.append("$'")
+            i += 2
+            continue
+        if c in "'\"":
+            q = c
+            cur.append(c)
+        elif c == "#" and (not cur or cur[-1][-1:] in " \t"):
+            j = cmd.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        elif c == "<" and cmd.startswith("<<", i) and not cmd.startswith("<<<", i):
+            m = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w{0,63})\1").match(cmd, i)
+            if m:
+                # Only the words just before `<<`, in this segment, name its consumer — bounded,
+                # since rejoining the whole segment per `<<` was quadratic.
+                runs = GITLAB_HEREDOC_SHELL_RE.search(cmd, max(seg_start, i - 120), i)
+                if not runs and len(heredocs) < 8:   # bounds the per-delimiter scans
+                    heredocs.append(m.group(2))
+                cur.append(" ")
+                i = m.end()
+                continue
+            cur.append(c)
+        elif c == "&" and (cmd[i - 1:i] == ">" or cmd[i + 1:i + 2] == ">"):
+            cur.append(c)   # `2>&1`, `&>log`: a redirection, not a separator
+        elif c in "|;&\n":
+            segs.append("".join(cur))
+            cur = []
+            seg_start = i + 1
+            if c == "\n" and heredocs:
+                # Skip each pending heredoc body up to its delimiter line.
+                i += 1
+                for delim in heredocs:
+                    while i < n:
+                        j = cmd.find("\n", i)
+                        j = n if j < 0 else j
+                        line, i = cmd[i:j], j + 1
+                        if line.strip() == delim:
+                            break
+                    i = min(i, n)
+                heredocs = []
+                seg_start = i
+                continue
+        else:
+            cur.append(c)
+        i += 1
+    segs.append("".join(cur))
+    return segs
+
+
+def _mr_api_call_end(cmd, start):
+    """Index of the `)` closing the call whose arguments begin at `start`
+    (bounded by GITLAB_API_CALL_SPAN)."""
+    depth, j, end = 1, start, min(len(cmd), start + GITLAB_API_CALL_SPAN)
+    while j < end and depth:
+        ch = cmd[j]
+        depth += (ch in "([{") - (ch in ")]}")
+        j += 1
+    return j
+
+
+def _mr_api_call_writes(cmd, start, name):
+    """Does the call named `name`, whose arguments begin at `start`, write?
+    `.post(` always; urllib's `Request(`/`urlopen(` with `data=` or a "POST"
+    string in their own arguments; a read opener never; anything else
+    (`fetch(`, `.request(`, `gl(`) only when its own arguments carry a "POST"
+    string — `.request("GET", u, data=q)` is a read."""
+    if name.lstrip(".") in ("Request", "urlopen", "fetch"):
+        name = name.lstrip(".")   # `urllib.request.Request(`, `window.fetch(`
+    if name == ".post":
+        return True
+    if name in GITLAB_API_READ_OPENERS:
+        return False
+    end = _mr_api_call_end(cmd, start)
+    if name in ("Request", "urlopen"):   # urllib POSTs whenever it has data
+        return bool(GITLAB_API_CALL_WRITE_RE.search(cmd, start, end))
+    # Any other function writes only when its own arguments say "POST"
+    # (`gl("POST", path, body)`). A helper whose body writes is NOT followed:
+    # one helper serves reads and writes alike, and searching for its body cost
+    # paths x uses x command length on the beat (QA).
+    return bool(GITLAB_API_POST_STR_RE.search(cmd, start, end))
+
+
+def _mr_api_enclosing_call(cmd, pos):
+    """The innermost call still open at `pos`, as (name, index after its `(`),
+    else None — found by walking BACK with a depth count, so a call that
+    opened and closed before the path (`os.environ.get('X') + "/projects/…"`)
+    is stepped over. Bounded by GITLAB_API_CALL_SPAN."""
+    depth, j, lo = 0, pos - 1, max(0, pos - GITLAB_API_CALL_SPAN)
+    while j >= lo:
+        ch = cmd[j]
+        if ch in ")]}":
+            depth += 1
+        elif ch in "([{":
+            if depth == 0:
+                if ch != "(":
+                    return None   # inside a dict/list literal, not a call's args
+                m = GITLAB_API_CALL_NAME_RE.search(cmd, max(0, j - 80), j)
+                return (m.group(1), j + 1) if m else None
+            depth -= 1
+        j -= 1
+    return None
+
+
+def _gitlab_api_mr_create(cmd):
+    """True when `cmd` writes to a GitLab project's merge_requests collection
+    (see GITLAB_API_MR_PATH_RE) — an MR create, not a listing."""
+    paths = []
+    for m in GITLAB_API_MR_PATH_RE.finditer(cmd):
+        paths.append(m)
+        if len(paths) >= GITLAB_API_PATHS_MAX:
+            break
+    if not paths:
+        return False
+    for m in paths:
+        call = _mr_api_enclosing_call(cmd, m.start())
+        if call:
+            if _mr_api_call_writes(cmd, call[1], call[0]):
+                return True
+            continue
+        # `url = f"…/merge_requests"`, then a call taking `url` as an argument.
+        nl = cmd.rfind("\n", max(0, m.start() - GITLAB_API_CALL_SPAN), m.start())
+        if nl < 0 and m.start() > GITLAB_API_CALL_SPAN:
+            continue   # a line too long to be an assignment we'd read
+        a = GITLAB_API_ASSIGN_RE.match(cmd, nl + 1, m.start())
+        if not a:
+            continue
+        use = re.compile(r"(\.?[A-Za-z_]\w{0,63})\s*\(\s*"
+                         r"""(?:['"]POST['"]\s*,\s*)?""" + re.escape(a.group(1)) + r"\s*[,)]")
+        for u in use.finditer(cmd, m.end(), m.end() + 4 * GITLAB_API_CALL_SPAN):
+            if _mr_api_call_writes(cmd, cmd.index("(", u.end(1)) + 1, u.group(1)):
+                return True
+    for seg in _mr_api_segments(cmd):
+        tool = GITLAB_API_TOOL_RE.search(seg)
+        if (not tool or not GITLAB_API_MR_PATH_RE.search(seg)
+                or GITLAB_API_GET_FLAG_RE.search(seg)):
+            continue
+        body = GITLAB_CURL_BODY_RE if tool.group(1) == "curl" else GITLAB_GLAB_BODY_RE
+        if GITLAB_API_POST_FLAG_RE.search(seg) or body.search(seg):
+            return True
+    return False
+
+
+def _gitlab_api_created_mr_url(text):
+    """The URL of the MR a GitLab API create opened, from its OWN output, or None.
+    The output is the MR object (JSON, or a script's dict repr) or whatever the
+    script chose to print; its description can quote OTHER MRs. So the object's
+    own `web_url` wins; else exactly one distinct MR URL that ENDS its line
+    (`!44 https://…/merge_requests/44`), which prose quoting one mid-sentence
+    does not. A JSON array is a listing, never a create."""
+    s = str(text or "")
+    if s.lstrip().startswith("["):
+        return None
+    own = {u for u in GITLAB_WEB_URL_RE.findall(s) if MR_URL_RE.fullmatch(u)}
+    if own:
+        return own.pop() if len(own) == 1 else None
+    urls = set(MR_URL_RE.findall(s))
+    if len(urls) != 1:
+        return None
+    url = urls.pop()
+    ends = any(ln.rstrip().endswith(url) for ln in s.splitlines())
+    return url if ends else None
+
+
 def _created_pr_urls(text, api=False):
-    """Every PR/MR URL a creating call's output names as the one it opened."""
+    """Every PR/MR URL a creating call's output names as the one it opened.
+    `api` is "" for a CLI create, "gh" for a `gh api` POST, "gitlab" for a
+    GitLab API create — the two API outputs are whole objects, read strictly.
+    "gitlab+cli" is a command that is BOTH: its MR by the strict rule, and any
+    non-MR link the CLI create beside it printed (a `gh pr create` PR)."""
+    if api in ("gitlab", "gitlab+cli"):
+        url = _gitlab_api_created_mr_url(text)
+        found = [url] if url else []
+        if api == "gitlab+cli":
+            found += [u for u in _created_pr_urls(text) if not MR_URL_RE.match(u)]
+        return found
     if api:
         url = _gh_api_created_pr_url(text)
         return [url] if url else []
@@ -10348,6 +10603,7 @@ def _scan_pr_entry(entry, state, report):
     if isinstance(content, list):
         calls = state.setdefault("pr_calls", [])
         api_calls = state.setdefault("pr_api_calls", [])
+        gl_calls = state.setdefault("pr_gl_api_calls", [])
         for block in content:
             if not isinstance(block, dict):
                 continue
@@ -10360,15 +10616,24 @@ def _scan_pr_entry(entry, state, report):
                 # gh api …/pulls`) reads its output by the stricter api rule, or
                 # PRs its body quotes would chip too.
                 api = _gh_api_pr_create(cmd)
-                if api or PR_CREATE_RE.search(cmd):
+                # A GitLab API create (curl, a script, `glab api`) — read by
+                # its own strict rule, which wins over a CLI create beside it.
+                gl = not api and _gitlab_api_mr_create(cmd)
+                cli = PR_CREATE_RE.search(cmd)
+                if api or gl or cli:
                     calls.append(block["id"])
                     del calls[:-PR_CALLS_MAX]
                 if api:
                     api_calls.append(block["id"])
                     del api_calls[:-PR_CALLS_MAX]
+                if gl:
+                    gl_calls.append((block["id"], "gitlab+cli" if cli else "gitlab"))
+                    del gl_calls[:-PR_CALLS_MAX]
             elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
                 text = _tool_result_text(block.get("content"))
-                api = block["tool_use_id"] in api_calls
+                tid = block["tool_use_id"]
+                gl = next((k for i, k in gl_calls if i == tid), "")
+                api = "gh" if tid in api_calls else gl
                 tur = entry.get("toolUseResult")
                 task = tur.get("backgroundTaskId") if isinstance(tur, dict) else None
                 if isinstance(task, str) and task:

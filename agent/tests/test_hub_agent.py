@@ -2207,6 +2207,274 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [self.MR1])
 
+    MR2 = "https://gitlab.example.com/grp/other/-/merge_requests/3"
+    GL_PY_CREATE = (
+        "cd wt && python3 - <<'EOF'\nimport json, os, urllib.request\n"
+        "api = os.environ['GITLAB_URL'] + '/api/v4'\n"
+        "pid = 'grp%2Fsub%2Fapp'\n"
+        "body = json.dumps({'source_branch': 'x', 'target_branch': 'main', 'title': 't'})\n"
+        "req = urllib.request.Request(f'{api}/projects/{pid}/merge_requests', "
+        "data=body.encode(), method='POST')\n"
+        "mr = json.load(urllib.request.urlopen(req))\nprint(mr['iid'], mr['web_url'])\nEOF")
+
+    def test_gitlab_api_mr_create_by_script_counts(self):
+        """SSH blocked, no glab: the session opened the MR with a python script
+        POSTing to the API. That MR is its own and must chip."""
+        path, state = self._primed()
+        write_jsonl(path, [self.pr_create_call("gl1", cmd=self.GL_PY_CREATE),
+                           self.tool_result("gl1", f"12 {self.MR1}\n")])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.MR1])
+
+    def test_gitlab_api_mr_create_takes_the_objects_own_url(self):
+        """curl prints the whole MR object; its description quotes another MR and
+        its author carries a web_url too — only the MR's own web_url counts."""
+        path, state = self._primed()
+        obj = {"iid": 12, "description": f"Follows {self.MR2}",
+               "author": {"web_url": "https://gitlab.example.com/me"}, "web_url": self.MR1}
+        cmd = ("curl -sS -X POST -H \"PRIVATE-TOKEN: $GITLAB_TOKEN\" "
+               "\"$GITLAB_URL/api/v4/projects/42/merge_requests\" -d source_branch=x")
+        write_jsonl(path, [self.pr_create_call("gl2", cmd=cmd),
+                           self.tool_result("gl2", json.dumps(obj))])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.MR1])
+
+    def test_gitlab_api_dict_repr_and_glab_api_count(self):
+        path, state = self._primed()
+        write_jsonl(path, [
+            self.pr_create_call("gl3", cmd=self.GL_PY_CREATE.replace(
+                "print(mr['iid'], mr['web_url'])", "print(mr)")),
+            self.tool_result("gl3", repr({"iid": 12, "description": f"See {self.MR2}",
+                                          "web_url": self.MR1})),
+            self.pr_create_call("gl4", cmd="glab api projects/:id/merge_requests -f source_branch=y"),
+            self.tool_result("gl4", json.dumps({"web_url": self.MR2})),
+        ])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.MR1, self.MR2])
+
+    def test_gitlab_api_reads_are_not_a_create(self):
+        path, state = self._primed()
+        write_jsonl(path, [
+            # A listing: no write marker (curl -f is --fail, not a field).
+            self.pr_create_call("r1", cmd="curl -fsS \"$GITLAB_URL/api/v4/projects/42/merge_requests?state=opened\" | jq -r '.[0].web_url'"),
+            self.tool_result("r1", f"{self.MR1}\n"),
+            # One existing MR, even with a body (an update).
+            self.pr_create_call("r2", cmd="curl -X PUT \"$GITLAB_URL/api/v4/projects/42/merge_requests/12\" -d title=t"),
+            self.tool_result("r2", json.dumps({"web_url": self.MR1})),
+            # A write to the collection whose output is a listing array.
+            self.pr_create_call("r3", cmd="curl -d x=1 \"$GITLAB_URL/api/v4/projects/42/merge_requests\""),
+            self.tool_result("r3", json.dumps([{"web_url": self.MR1}])),
+            # Output only QUOTING an MR mid-sentence.
+            self.pr_create_call("r4", cmd=self.GL_PY_CREATE),
+            self.tool_result("r4", f"error: conflicts with {self.MR2} already open\n"),
+            # Two MR objects' web_urls: can't tell which is ours.
+            self.pr_create_call("r5", cmd=self.GL_PY_CREATE),
+            self.tool_result("r5", json.dumps({"web_url": self.MR1}) + json.dumps({"web_url": self.MR2})),
+        ])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
+    def test_gitlab_api_write_markers_must_bind_to_the_request(self):
+        """QA: a marker anywhere in the command made a LISTING a create, and its
+        jq/print output then chipped another author's MR."""
+        lst = "\"$GITLAB_URL/api/v4/projects/42/merge_requests?state=opened\""
+        reads = [
+            "python3 - <<'EOF'\nfrom urllib.request import urlopen\nimport json\n"
+            "data = json.load(urlopen('https://gl/api/v4/projects/42/merge_requests?state=opened'))\n"
+            "print(data[0]['web_url'])\nEOF",
+            "python3 - <<'EOF'\nimport requests\nr = requests.get('https://gl/api/v4/projects/42/merge_requests')\n"
+            "data = r.json()\nprint(data[0]['web_url'])\nEOF",
+            f"curl -sG {lst} --data-urlencode search=login | jq -r '.[].web_url'",
+            "glab api -X GET projects/:id/merge_requests -f state=opened | jq -r '.[0].web_url'",
+            f"curl -s {lst} | jq -r '.[0].web_url' | cut -d' ' -f1",
+            f"if [ -d .git ]; then curl -s {lst} | jq -r '.[0].web_url'; fi",
+            f"curl -s {lst} | jq -r '.[].web_url' | grep -F app",
+            f"curl -f {lst} | jq -r '.[0].web_url'",
+            "python3 - <<'EOF'\nimport requests\nurl = 'https://gl/api/v4/projects/42/merge_requests'\n"
+            "requests.put(url + '/3', json={'title': 't'})\nprint(requests.get(url).json()[0]['web_url'])\nEOF",
+            "curl -X POST https://gl/api/v4/projects/42/merge_requests/3/notes -d body=x; "
+            f"curl -s {lst} | jq -r '.[0].web_url'",
+        ]
+        path, state = self._primed()
+        lines = []
+        for i, cmd in enumerate(reads):
+            self.assertFalse(ha._gitlab_api_mr_create(cmd), cmd)
+            lines += [self.pr_create_call(f"q{i}", cmd=cmd), self.tool_result(f"q{i}", f"{self.MR2}\n")]
+        write_jsonl(path, lines)
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
+    def test_gitlab_api_create_spellings(self):
+        for cmd in ["curl -XPOST \"$GITLAB_URL/api/v4/projects/42/merge_requests?source_branch=x\"",
+                    "curl --request POST \\\n  \"$GITLAB_URL/api/v4/projects/42/merge_requests\" \\\n  --json @mr.json",
+                    "node -e \"fetch(u+'/projects/42/merge_requests',{method:'POST',body:b})\"",
+                    "python3 -c \"import requests; requests.post(f'{api}/projects/{pid}/merge_requests', json=b)\"",
+                    "glab api projects/:id/merge_requests -F source_branch=y",
+                    # Multi-line calls (QA: line binding dropped these).
+                    "python3 - <<'EOF'\nimport requests\nr = requests.post(\n"
+                    "    f\"{api}/projects/{pid}/merge_requests\",\n    json=body,\n)\nEOF",
+                    "python3 - <<'EOF'\nreq = urllib.request.Request(\n  f'{api}/projects/{pid}/merge_requests',\n"
+                    "  data=body,\n  method=\"POST\")\nEOF",
+                    "python3 - <<'EOF'\nurl = f'{api}/projects/{pid}/merge_requests'\n"
+                    "r = requests.post(url, json=b)\nEOF",
+                    "node - <<'EOF'\nconst r = await fetch(`${api}/projects/${pid}/merge_requests`, {\n"
+                    "  method: \"POST\",\n  body: JSON.stringify(b),\n});\nEOF",
+                    # `&` and `|` inside quotes are not separators.
+                    "curl -d \"source_branch=x&target_branch=main&title=t\" \"$GITLAB_URL/api/v4/projects/42/merge_requests\"",
+                    "curl \"$GITLAB_URL/api/v4/projects/42/merge_requests?a=1&b=2\" -X POST",
+                    "curl -d \"$(jq -n '{title: $t} | .')\" \"$GITLAB_URL/api/v4/projects/42/merge_requests\"",
+                    # A quoted value is not a `-G` flag.
+                    "curl --data-urlencode \"title=Fix -Gradle build\" \"$GITLAB_URL/api/v4/projects/42/merge_requests\""]:
+            self.assertTrue(ha._gitlab_api_mr_create(cmd), cmd)
+
+    def test_a_listing_then_another_post_is_not_a_create(self):
+        """QA pass 3: a write NEAR the path but in another call chipped a foreign MR."""
+        for cmd in [
+            "python3 - <<'EOF'\nimport requests\nU = f'{api}/projects/{pid}/merge_requests'\n"
+            "for m in requests.get(f'{U}?state=opened').json(): requests.post("
+            "f\"{api}/projects/{pid}/merge_requests/{m['iid']}/notes\", json={'body': 'ping'}); "
+            "print('pinged', m['web_url'])\nEOF",
+            "python3 - <<'EOF'\nU = f'{api}/projects/{pid}/merge_requests'\n"
+            "mr = requests.get(U, params={'state': 'opened'}).json()[0]\n"
+            "requests.post(SLACK, json={'text': mr['title']})\nprint(json.dumps(mr))\nEOF",
+            "node - <<'EOF'\nconst U = `${api}/projects/${pid}/merge_requests`;\n"
+            "const l = await (await fetch(U + '?state=opened')).json();\n"
+            "await fetch(SLACK, {method: 'POST', body: l[0].title});\nEOF",
+            # Listing and a note POST separated only by `&&`.
+            "curl -s \"$U/projects/42/merge_requests\" > l.json && curl -X POST \"$U/projects/42/issues/3/notes\" -d body=x",
+        ]:
+            self.assertFalse(ha._gitlab_api_mr_create(cmd), cmd)
+
+    def test_shell_text_that_is_not_code_does_not_hide_a_curl_create(self):
+        """QA pass 3: an apostrophe in a heredoc body or a comment, or `\\"` in a
+        JSON body, threw the lexer into quote mode and dropped the create."""
+        u = "\"$GITLAB_URL/api/v4/projects/42/merge_requests\""
+        for cmd in [
+            f"DESC=$(cat <<'EOF'\nThis doesn't break anything.\nEOF\n)\ncurl -sS --request POST "
+            f"--data-urlencode \"description=$DESC\" -d source_branch=x {u}",
+            f"# let's open the MR\ncurl -X POST -d source_branch=x {u}",
+            f"printf $'it\\'s\\n'; curl -X POST -d source_branch=x {u}",
+            f"curl -X POST -d \"{{\\\"title\\\":\\\"Fix -Gradle build\\\"}}\" {u}",
+            f"curl -X POST -d \"{{\\\"title\\\":\\\"a & b\\\"}}\" {u}",
+            f"curl -d \"-Gx=1\" {u}",
+            # Only the later occurrence of the path is a create.
+            "python3 -c \"requests.get(f'{a}/projects/1/merge_requests'); "
+            "requests.post(f'{a}/projects/1/merge_requests', json=b)\"",
+            f"echo {u}; curl -d x=1 {u}",
+            # A later fetch of the same variable is the POST.
+            "node - <<'EOF'\nconst U = `${api}/projects/${pid}/merge_requests`;\n"
+            "await fetch(U + '?state=opened');\nconst r = await fetch(U, {method: 'POST', body: b});\nEOF",
+        ]:
+            self.assertTrue(ha._gitlab_api_mr_create(cmd), cmd)
+
+    def test_call_binding_finds_the_real_call(self):
+        """QA pass 4: shapes the first call-binding missed."""
+        pad = "x = 1\n" * 150   # > GITLAB_API_CALL_SPAN between assignment and use
+        for cmd in [
+            # A call closed BEFORE the path inside the .post( arguments.
+            "python3 -c \"requests.post(f\\\"{os.environ.get('GITLAB_URL')}/api/v4/projects/{pid}/merge_requests\\\", json=p)\"",
+            "python3 - <<'EOF'\nrequests.post(cfg.get('base') + f'/projects/{pid}/merge_requests', json=p)\nEOF",
+            # A URL variable whose f-string holds quotes, used far below.
+            "python3 - <<'EOF'\nurl = f\"{os.environ['GITLAB_URL']}/api/v4/projects/{pid}/merge_requests\"\n"
+            + pad + "r = requests.post(url, json=b)\nEOF",
+            # urllib with only data= (no method=).
+            "python3 - <<'EOF'\nreq = urllib.request.Request(f'{api}/projects/{pid}/merge_requests', data=body)\nEOF",
+            # requests.request("POST", url, ...).
+            "python3 - <<'EOF'\nurl = f'{api}/projects/{pid}/merge_requests'\nrequests.request(\"POST\", url, json=b)\nEOF",
+            # Helper functions.
+            "python3 - <<'EOF'\nmr = gl(\"POST\", f'/projects/{pid}/merge_requests', body)\nEOF",
+            # curl inside a heredoc a shell runs.
+            "cat > /tmp/mr.sh <<'EOF'\ncurl -X POST -d source_branch=x \"$U/projects/42/merge_requests\"\nEOF\nbash /tmp/mr.sh",
+            "bash <<'EOF'\ncurl -X POST -d source_branch=x \"$U/projects/42/merge_requests\"\nEOF",
+            "ssh host <<EOF\ncurl -X POST -d source_branch=x \"$U/projects/42/merge_requests\"\nEOF",
+            # The write check starts after the use's own `(`: "POST" first.
+            "python3 - <<'EOF'\nurl = f'{api}/projects/{pid}/merge_requests'\nr = gl('POST', url)\nEOF",
+            # A consumer opening its segment, or behind a redirection.
+            "cd /repos/app\nbash -s <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF",
+            "cat > n.md <<'EOF'\nx\nEOF\nssh build <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF",
+            "bash -s 2>&1 <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF",
+            "bash -s &>log <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF",
+            "bash -s &>>log <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF",
+            "cd x;bash <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF",
+            "cd x&&bash <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF",
+            "(bash <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF",
+            "$(bash <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF",
+            # An apostrophe in a NON-run heredoc after an earlier `bash` segment.
+            "bash setup.sh; cat > notes.md <<'EOF'\nit doesn't matter\nEOF\n"
+            "curl -X POST -d x=1 \"$U/projects/42/merge_requests\"",
+            # `<<-` with an indented closing delimiter, then a real create.
+            "cat <<-EOF\n\tit's a note\n\tEOF\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"",
+        ]:
+            self.assertTrue(ha._gitlab_api_mr_create(cmd), cmd)
+        for cmd in [
+            # The collection variable reused for one MR's notes.
+            "python3 - <<'EOF'\nurl = f'{api}/projects/{pid}/merge_requests'\nrequests.post(url + '/3/notes', json=n)\nEOF",
+            # A helper is not followed into its body: it serves reads too
+            # (`gl(path, {"state": "opened"})`), so even a body-passing call
+            # is not a create (narrow by design).
+            "python3 - <<'EOF'\ndef gl(path, data=None):\n    req = urllib.request.Request(GL + path, "
+            "data=json.dumps(data).encode() if data else None)\n    return json.load(urlopen(req))\n"
+            "mr = gl(f'/projects/{pid}/merge_requests', {'state': 'opened'})\nEOF",
+            # A read opener with a body-ish argument, a GET method string.
+            "python3 - <<'EOF'\nrequests.get(f'{api}/projects/{pid}/merge_requests', data=q)\nEOF",
+            "python3 - <<'EOF'\nrequests.request('GET', f'{api}/projects/{pid}/merge_requests', data=q)\nEOF",
+            # A path inside a dict literal is no call's argument.
+            "python3 - <<'EOF'\nfoo({'url': f'{api}/projects/{pid}/merge_requests'})\nEOF",
+            # `==` is a comparison, not an assignment of the path.
+            "python3 - <<'EOF'\nu == f'{api}/projects/{pid}/merge_requests'\nrequests.post(u, json=b)\nEOF",
+            # A shell word in an EARLIER segment does not make this heredoc run.
+            "bash setup.sh; cat > notes.md <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF\n"
+            "curl -fsS \"$U/projects/7/merge_requests/3\"",
+            # A `bash` word in an earlier heredoc BODY does not run the next one.
+            "cat > a.md <<'EOF'\nuse bash\nEOF\ncat > b.md <<'EOF'\n"
+            "curl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF\n"
+            "curl -fsS \"$U/projects/7/merge_requests/3\"",
+            # The use's write check covers its own args, not the call after it.
+            "python3 - <<'EOF'\nurl = f'{api}/projects/{pid}/merge_requests'\nr = gl(url)\n"
+            "requests.request('POST', hook, json=x)\nEOF",
+            # A file whose NAME ends in "sh" is no shell.
+            "cat > publish <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF",
+            "tee refresh <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF",
+            # sudo tee writes a file; its body is not run.
+            "sudo tee /etc/x.conf <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF",
+            # A helper that CAN write, called with the path alone (a listing).
+            "python3 - <<'EOF'\ndef api(path, data=None):\n    return json.load(urlopen(urllib.request.Request("
+            "GL + path, data=data)))\nprint(api(f'/projects/{pid}/merge_requests?state=opened')[0]['web_url'])\nEOF",
+            # A curl shown in a document, not run.
+            "cat > notes.md <<'EOF'\ncurl -X POST -d x=1 \"$U/projects/42/merge_requests\"\nEOF",
+        ]:
+            self.assertFalse(ha._gitlab_api_mr_create(cmd), cmd)
+
+    def test_a_script_write_far_from_the_path_is_not_its_request(self):
+        """QA: a listing script that POSTs somewhere else further down."""
+        cmd = ("python3 - <<'EOF'\nimport requests\n"
+               "mrs = requests.get(f'{api}/projects/{pid}/merge_requests').json()\n"
+               + "# filler\n" * 60 +
+               "requests.post(f'{api}/projects/{pid}/issues/3/notes', json={'body': 'x'})\n"
+               "print(mrs[0]['web_url'])\nEOF")
+        self.assertFalse(ha._gitlab_api_mr_create(cmd))
+
+    def test_a_gh_pr_beside_a_gitlab_api_create_keeps_both(self):
+        path, state = self._primed()
+        cmd = ("gh pr create --fill && curl -X POST "
+               "\"$GITLAB_URL/api/v4/projects/42/merge_requests\" -d source_branch=x")
+        write_jsonl(path, [self.pr_create_call("gb", cmd=cmd),
+                           self.tool_result("gb", f"{self.PR1}\n" + json.dumps({"web_url": self.MR1}))])
+        self.assertEqual(sorted(ha.session_report(self.WORKDIR, state)["prUrls"]),
+                         sorted([self.MR1, self.PR1]))
+
+    def test_gitlab_api_detection_is_linear(self):
+        """QA: a lazy span from every `glab api` word was quadratic (352 KB took
+        122s) — on the beat, past OFFLINE_AFTER_MS."""
+        cmd = "projects/x/merge_requests " + "glab api " * 40000
+        t0 = time.monotonic()
+        ha._gitlab_api_mr_create(cmd)
+        ha._gitlab_api_mr_create(cmd.replace(" ", "|"))
+        ha._gitlab_api_mr_create("Request(" * 40000 + " projects/x/merge_requests")
+        ha._gitlab_api_mr_create("projects/x/merge_requests\n" + "".join(
+            f"cat <<D{i}\n" for i in range(20000)))
+        ha._gitlab_api_mr_create("w " * 500000 + "projects/x/merge_requests " * 20)
+        ha._gitlab_api_mr_create("cat " + "<<A " * 60000 + "\ncurl -X POST projects/42/merge_requests")
+        ha._gitlab_api_mr_create(('u = "projects/42/merge_requests"\n' + "f(u, 1) " * 300) * 20)
+        ha._gitlab_api_mr_create("x = 1\n" + "y " * 300000 + "/projects/x/merge_requests")
+        ha._gitlab_api_mr_create(("requests.post(projects/x/merge_requests " + "(" * 500) * 200)
+        self.assertLess(time.monotonic() - t0, 2.0)
+
     def test_http_self_hosted_mr_is_attributed(self):
         """XERK-741: a self-hosted GitLab served over plain http on a LAN prints
         an http:// MR URL from `glab mr create` / a push option. A scheme-only
