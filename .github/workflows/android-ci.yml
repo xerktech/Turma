@@ -102,6 +102,20 @@ jobs:
       - name: Unit tests (core, ViewModels, Compose)
         run: gradle :app:testDebugUnitTest --no-daemon --stacktrace
 
+      # Gradle's console only prints the exception class and line of a failed
+      # test; the message (which node, which count) is in the XML/HTML report.
+      # Without this a CI-only failure can't be diagnosed from the run.
+      - name: Upload unit-test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-reports
+          path: |
+            android/app/build/reports/tests/testDebugUnitTest/
+            android/app/build/test-results/testDebugUnitTest/
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: Assemble debug APK
         run: gradle :app:assembleDebug --no-daemon --stacktrace
 
