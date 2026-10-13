@@ -238,9 +238,13 @@ fun epicRunView(
         return ticketSessionsOf(sessionIndex, siteKey, k)
             .any { it.status == "running" || it.status == "queued" }
     }
+    // In Progress / In Review with no session is handled elsewhere: the driver never
+    // starts it, so it reads "In progress", never Ready (rollup XERK-1701).
+    fun isUnderway(k: String): Boolean =
+        byKey[k]?.let { categoryOf(it) == "inprogress" || categoryOf(it) == "review" } == true
     fun statusOf(k: String): EpicChildStatus = when {
         isDone(k) -> EpicChildStatus.DONE
-        isRunning(k) -> EpicChildStatus.RUNNING
+        isRunning(k) || isUnderway(k) -> EpicChildStatus.RUNNING
         cycleSet.contains(k) -> EpicChildStatus.BLOCKED
         else -> {
             // As the hub driver's epicChildBlockersDone (rollup XERK-1701): an in-epic or a

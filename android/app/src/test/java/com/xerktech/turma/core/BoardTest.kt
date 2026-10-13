@@ -1517,6 +1517,18 @@ class BoardTest {
         assertEquals(EpicChildStatus.READY, flat["C-5"])
     }
 
+    @Test fun `epicRunView shows an In Progress or In Review child as in progress, not ready`() {
+        // Rollup XERK-1701: the driver starts only To Do children.
+        val site = epicSite(listOf(
+            child("C-1", cat = "inprogress"),
+            JiraTicket(key = "C-2", statusCategory = "inprogress", status = "In Review"),
+            child("C-3"),
+        ))
+        val view = epicRunView(mkRun(waves = listOf(listOf("C-1", "C-2", "C-3"))), site, emptyMap())
+        assertEquals(listOf(EpicChildStatus.RUNNING, EpicChildStatus.RUNNING, EpicChildStatus.READY),
+            view.waves[0].map { it.status })
+    }
+
     @Test fun `epicRunView counts a queued child as running and a cycle child as blocked`() {
         val site = epicSite(listOf(child("C-1"), child("C-2"), child("C-3")))
         val q = listOf(com.xerktech.turma.model.QueuedTicket(siteKey = "org", issueKey = "C-1"))
