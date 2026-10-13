@@ -5637,7 +5637,7 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     subagent_model_path = subagent_model_path or subagent_model_script_path()
     if os.path.exists(subagent_model_path):
         pre.append({
-            "matcher": "Agent|Task",   # Task: the tool's pre-2.1 name
+            "matcher": "Agent|Task|Workflow",   # Task: the tool's pre-2.1 name
             "hooks": [{"type": "command",
                        "command": f'"{python_exe}" -SI "{subagent_model_path}"'}],
         })

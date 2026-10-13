@@ -7,7 +7,7 @@ paths:
 
 # QA/review sub-agents run on Opus (XERK-1851)
 
-`hooks/subagent_model.py` — a `PreToolUse` hook over `Agent|Task` wired by `build_guard_settings`.
+`hooks/subagent_model.py` — a `PreToolUse` hook over `Agent|Task|Workflow` wired by `build_guard_settings`.
 It rewrites the call's `model` to `$TURMA_PIN_SUBAGENT_MODEL` (`GRADER_SUBAGENT_MODEL` = `opus`)
 for `qa`, `qa-delta` and any `subagent_type` containing `review` not after a `p` (`ui-preview` is not).
 `docs/model-quality-adr.md` decision 3: QA and review always run on Opus, whatever did the work.
@@ -24,9 +24,14 @@ for `qa`, `qa-delta` and any `subagent_type` containing `review` not after a `p`
 - **stdin is read as BYTES and decoded UTF-8**: the hook echoes the whole prompt back, and text
   stdin on Windows is cp1252 (`-SI` ignores `PYTHONUTF8`) — `—` came back as `â€”`.
 - Explore, general-purpose and Plan are deliberately NOT pinned, so search stays cheap.
-- Residual: a **Workflow** script's `agent(…, {subagent_type: 'qa'})` is no Agent tool call, so
-  the hook never sees it and it runs on the sub-agent default (QA-reproduced). XERK-1856.
+- **Workflow** (XERK-1856): `agent(…, {agentType: 'qa'})` is no Agent call, so the hook rewrites
+  the script — the body after the `meta` literal becomes an async arrow whose `agent` param adds
+  `model` to grader opts. Verified live: call + frontmatter `haiku` → Opus; general-purpose untouched.
+  - Wrap the body, never rewrite call sites: the only JS parsed is where `meta`'s `{…}` ends.
+  - A marker comment stops double-wrapping (a resume re-reads the persisted, wrapped script).
+  - `scriptPath` is inlined and dropped (it beats `script`). Residual: a saved workflow run by
+    `name`, and a nested `workflow()` child, are not wrapped.
 - Residual: a built-in skill reviewing through generic agents (`/code-review`) names no `review`
   type, so it follows the session default; the ADR's Opus review gate is XERK-1848.
-- Tests: `test_subagent_model.py`, `test_wires_the_subagent_model_pin`,
+- Tests: `test_subagent_model.py` (`TestWorkflowPin` evaluates the wrapped script in node), `test_wires_the_subagent_model_pin`,
   `test_spawn_onto_the_local_model`, `test_windows_launch_pins_grader_subagents_off_the_local_model`.
