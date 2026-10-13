@@ -44148,6 +44148,15 @@ class TestHookIntegrity(unittest.TestCase):
         if os.path.exists("/dev/null"):
             self.assertIsNone(ha._read_regular("/dev/null", 10))
 
+    def test_only_a_regular_file_is_tailed(self):
+        # The task-output tail too: a device planted at the path reads as b""
+        # (/dev/null) or never ends (/dev/zero) unless its type is checked
+        # (rollup XERK-1701).
+        for dev in ("/dev/null", "/dev/zero"):
+            if os.path.exists(dev):
+                with self.subTest(dev=dev):
+                    self.assertIsNone(ha._read_regular_tail(dev, 10))
+
     def test_no_baseline_without_o_nonblock(self):
         # Windows CPython has no os.O_NONBLOCK; the check must stay quietly inert.
         os.unlink(os.path.join(self.dir, "hooks.sha256"))
