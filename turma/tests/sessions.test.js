@@ -213,7 +213,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " openSubagentView, transcriptBack,"
       + " armTermWatch, disarmTermWatch, termWatchdog, getTermWatch: () => termWatch,"
       + " chatToTerminal, terminalToChat, chatToTrajectory, trajectoryToChat, renderTrajectory,"
-      + " transcriptToTrajectory, trajectoryBack, trajScrollClick, trajScrollKey, trajToggleTurn,"
+      + " transcriptToTrajectory, trajectoryBack, trajScrollClick, trajScrollKey, trajToggleTurn, loadTrajectory,"
       + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml, hostCapHtml,"
       + " applyAgent, mergeSnapshot, sseClock: () => sseClock,"
       + " setCache: (c) => { cache = c; }, getCache: () => cache, setDraft: (t) => { renameDraft = t; },"
@@ -3677,6 +3677,131 @@ test("XERK-717: chatToTrajectory reveals the pane and loads from the unified /ap
   assert.equal(page.els.chatPane.hidden, true, "the chat pane is hidden");
   assert.ok(page.gets.some((u) => u.includes("/api/archive/tid1/trajectory")),
     "loadTrajectory fetches the runtime-dispatched archive endpoint, not /api/dsh");
+});
+
+// XERK-1584 #13: a trajectory 404 only promises "a few beats" for the plain
+// not-here-yet case; closed ingest or a refused push is said instead.
+test("trajectory pane: closed ingest and a refused push are not worded as 'syncs within a few beats'", async () => {
+  const page = loadPage();
+  const c = host([{ ...running("s1", "T", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tid1" }]);
+  page.beat({ now: c.now, agents: [c.host] });
+  page.selectSession("s1");
+  const open = async (body) => {
+    page.setGet((url) => url.includes("/trajectory")
+      ? { ok: false, status: 404, json: async () => body } : null);
+    page.chatToTrajectory();
+    page.trajectoryRefresh && page.trajectoryRefresh();
+    for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+    return page.els.trajScroll.innerHTML;
+  };
+  const since = Date.now() - 3 * 86400e3;
+  let html = await open({ error: "no trajectory for this session", ingestClosed: { since } });
+  assert.match(html, /has not been accepting archive pushes since/);
+  assert.doesNotMatch(html, /within a few beats/);
+  page.els.trajScroll.dataset.loaded = "";
+  html = await open({ error: "no trajectory for this session", refused: { host: "nas", error: "too big" } });
+  assert.match(html, /nas&rsquo;s last push/);
+  page.els.trajScroll.dataset.loaded = "";
+  html = await open({ error: "no trajectory for this session" });
+  assert.match(html, /within a few beats/);
+});
+
+// A slower answer for the session the operator already left must never paint
+// over the one now open — every loadTrajectory outcome (404 note, 5xx, network).
+test("trajectory pane: a late answer for a session left behind does not overwrite the open one", async () => {
+  const page = loadPage();
+  const c = host([
+    { ...running("s1", "A", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tidA" },
+    { ...running("s2", "B", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tidB" },
+  ]);
+  page.beat({ now: c.now, agents: [c.host] });
+  for (const late of [
+    { ok: false, status: 404, json: async () => ({ ingestClosed: { since: Date.now() - 60e3 } }) },
+    { ok: false, status: 502, json: async () => ({}) },
+    null,   // a network failure
+  ]) {
+    let releaseA;
+    page.setGet((url) => {
+      // A thenable carrying `json` is passed through as the response itself, so
+      // the fetch settles only when releaseA() hands it the late answer.
+      if (url.includes("/tidA/trajectory")) return {
+        json: () => null, then: (res, rej) => { releaseA = () => late ? res(late) : rej(new Error("down")); } };
+      if (url.includes("/tidB/trajectory")) return { ok: false, status: 404, json: async () => ({}) };
+      return null;
+    });
+    if (page.els.trajScroll) page.els.trajScroll.dataset.loaded = "";
+    page.selectSession("s1");
+    page.chatToTrajectory();
+    page.selectSession("s2");
+    page.chatToTrajectory();
+    for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+    const shown = page.els.trajScroll.innerHTML;
+    assert.match(shown, /within a few beats/, "B's own plain 404");
+    releaseA();
+    for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+    assert.equal(page.els.trajScroll.innerHTML, shown, `late ${late ? late.status : "network error"} for A left B alone`);
+  }
+});
+
+test("trajectory pane: a slow answer does not overwrite a refresh of the same session", async () => {
+  const page = loadPage();
+  const c = host([{ ...running("s1", "A", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tidA" }]);
+  page.beat({ now: c.now, agents: [c.host] });
+  let releaseSlow, calls = 0;
+  page.setGet((url) => {
+    if (!url.includes("/tidA/trajectory")) return null;
+    if (++calls === 1) return { json: () => null, then: (res) => { releaseSlow = () => res({ ok: false, status: 502, json: async () => ({}) }); } };
+    return { ok: false, status: 404, json: async () => ({ refused: { host: "nas", error: "too big" } }) };
+  });
+  page.selectSession("s1");
+  page.chatToTrajectory();
+  page.loadTrajectory("tidA", true);   // the ↻ Refresh
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  const shown = page.els.trajScroll.innerHTML;
+  assert.match(shown, /nas&rsquo;s last push/);
+  releaseSlow();
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(page.els.trajScroll.innerHTML, shown, "the stale 502 left the refreshed pane alone");
+});
+
+test("trajectory pane: a slow 200 for a session left behind paints nothing, nor over the no-transcript note", async () => {
+  const page = loadPage();
+  const c = host([{ ...running("s1", "A", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tidA" }]);
+  page.beat({ now: c.now, agents: [c.host] });
+  let releaseA;
+  page.setGet((url) => url.includes("/tidA/trajectory")
+    ? { json: () => null, then: (res) => { releaseA = () => res({ ok: true, status: 200, json: async () => ({ turns: [], runtime: "claude" }) }); } }
+    : null);
+  page.selectSession("s1");
+  page.chatToTrajectory();
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  page.loadTrajectory(null);          // a session with no transcript id opened meanwhile
+  const shown = page.els.trajScroll.innerHTML;
+  assert.match(shown, /no transcript id yet/);
+  releaseA();
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(page.els.trajScroll.innerHTML, shown);
+  assert.notEqual(page.els.trajScroll.dataset.loaded, "1");
+});
+
+test("trajectory pane: after the no-transcript note, reopening the last session fetches it again", async () => {
+  const page = loadPage();
+  const c = host([{ ...running("s1", "A", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tidA" }]);
+  page.beat({ now: c.now, agents: [c.host] });
+  page.setGet((url) => url.includes("/tidA/trajectory")
+    ? { ok: false, status: 404, json: async () => ({ refused: { host: "nas", error: "too big" } }) } : null);
+  const settle = async () => { for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r)); };
+  page.selectSession("s1");
+  page.chatToTrajectory();
+  await settle();
+  page.els.trajScroll.dataset.loaded = "1";   // as if A's trajectory had painted
+  page.loadTrajectory(null);
+  assert.match(page.els.trajScroll.innerHTML, /no transcript id yet/);
+  const before = page.gets.length;
+  page.loadTrajectory("tidA");                 // back to A, non-forced
+  await settle();
+  assert.ok(page.gets.length > before, "A is fetched again, not served from a stale cache flag");
+  assert.match(page.els.trajScroll.innerHTML, /nas&rsquo;s last push/);
 });
 
 // --- Trajectory on the read-only stage (XERK-718) ----------------------------
