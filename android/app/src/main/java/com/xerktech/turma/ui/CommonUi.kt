@@ -298,7 +298,9 @@ fun liveStateLabel(state: LiveState, live: LiveSignals?, now: Long = System.curr
         val waits = live?.agents.orEmpty().filter(::isWaitAgent)
         val eta = waits.mapNotNull { it.eta }.maxOrNull()
         // One named wait keeps its subject on every branch (XERK-1571), a timed one too.
-        val what = if (waits.size == 1 && waits[0].label.isNotBlank()) " · ${waits[0].label}" else ""
+        // Trimmed, as the web's backgroundWaitLabel (rollup XERK-1701): a padded label
+        // drew its stray spaces around the "·".
+        val what = if (waits.size == 1 && waits[0].label.isNotBlank()) " · ${waits[0].label.trim()}" else ""
         if (eta != null && eta > now) return "⏳ waiting$what\u00A0·\u00A0${waitLeftText(eta - now)} left"
         // No ETA: how long it has waited, off the oldest row's startedAt (XERK-1571).
         val started = waits.mapNotNull { it.startedAt }.filter { it <= now }.minOrNull()
@@ -358,7 +360,7 @@ private fun sessionLiveState(session: SessionInfo, agentLastSeen: Long, now: Lon
             // hub's `since` carries that on the why line).
             if (com.xerktech.turma.core.sessionWait(session, agentLastSeen, now)?.stalled == true) {
                 val waits = s.agents.filter(::isWaitAgent)
-                val label = if (waits.size == 1 && waits[0].label.isNotBlank()) "stalled · ${waits[0].label}"
+                val label = if (waits.size == 1 && waits[0].label.isNotBlank()) "stalled · ${waits[0].label.trim()}"
                     else "stalled on ${waits.size} background shell" + if (waits.size == 1) "" else "s"
                 CardState(label, CardTone.STALLED)
             } else CardState("idle", CardTone.IDLE)

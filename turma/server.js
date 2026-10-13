@@ -12758,7 +12758,9 @@ const ATTENTION_WHY_MAX = 200;
 // label, else a count. Same wording as the clients' backgroundWaitLabel.
 function waitSubject(rows) {
   const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
-  if (waits.length === 1 && waits[0].label) return waits[0].label;
+  // A blank label names nothing: the shell count, as both clients' cards read it.
+  const label = waits.length === 1 && typeof waits[0].label === "string" ? waits[0].label.trim() : "";
+  if (label) return label;
   return `${waits.length} background shell${waits.length === 1 ? "" : "s"}`;
 }
 
@@ -12811,7 +12813,12 @@ function permissionWhy(pp) {
 function sessionAttention(session, working, wait, now) {
   if (session.status !== "running") return { state: "idle" };
   const s = session.session || {};
-  const why = (t) => (typeof t === "string" && t ? { why: t.slice(0, ATTENTION_WHY_MAX) } : {});
+  // Trimmed (rollup XERK-1701): a padded wait label reached every client's card as
+  // "stalled ·    Watch CI   ", and a blank one as a why of spaces.
+  const why = (t) => {
+    const v = typeof t === "string" ? t.trim() : "";
+    return v ? { why: v.slice(0, ATTENTION_WHY_MAX) } : {};
+  };
   const eta = (t) => (Number.isSafeInteger(t) && t > 0 ? { eta: t } : {});
   if (s.question) return { state: "needs-you:question", ...why(s.question) };
   if (s.panePrompt && s.panePrompt.prompt) return { state: "needs-you:permission", ...why(permissionWhy(s.panePrompt)) };
