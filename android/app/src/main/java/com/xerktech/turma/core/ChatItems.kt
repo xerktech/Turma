@@ -340,8 +340,9 @@ fun messageOrigin(text: String): String {
     return "operator"
 }
 
-private val FRAMING_TAG_RE =
-    Regex("(?m)^[ \\t]*</?(?:pasted_content(?: id=\"[^\"\\n]*\")?|system-reminder)>[ \\t]*(?:\\r?\\n|$)")
+private val FRAMING_TAG_LINE =
+    Regex("^[ \\t]*</?(?:pasted_content(?: id=\"[^\"\\n]*\")?|system-reminder)>[ \\t]*\\r?$")
+private val FENCE_LINE = Regex("^[ \\t]*(?:```|~~~)")
 
 /**
  * Claude Code's own framing tags on a user turn, each on a line of its own —
@@ -352,7 +353,17 @@ private val FRAMING_TAG_RE =
  */
 fun stripFraming(text: String): String {
     if (!text.contains('<')) return text
-    return text.replace(FRAMING_TAG_RE, "").trim('\r', '\n')
+    // A tag line inside a ``` / ~~~ fence is the operator's own text (rollup XERK-1701);
+    // the first and last lines always go when they are tags (an unclosed fence in a paste).
+    val lines = text.split("\n")
+    val first = lines.indexOfFirst { it.isNotBlank() }
+    val last = lines.indexOfLast { it.isNotBlank() }
+    var fenced = false
+    val kept = lines.filterIndexed { i, line ->
+        if (FENCE_LINE.containsMatchIn(line)) { fenced = !fenced; true }
+        else !(FRAMING_TAG_LINE.matches(line) && (i == first || i == last || !fenced))
+    }
+    return kept.joinToString("\n").trim('\r', '\n')
 }
 
 /**

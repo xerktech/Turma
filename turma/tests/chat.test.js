@@ -2948,3 +2948,20 @@ test("buildItems: Claude Code's framing tags never reach a user bubble", () => {
   // A turn that was only tags leaves no empty bubble.
   assert.equal(byId.em, undefined);
 });
+
+test("buildItems: a framing tag inside an operator's code fence is their text (rollup XERK-1701)", () => {
+  const fenced = "how do I filter these?\n```\n<system-reminder>\nnoise\n</system-reminder>\n```";
+  const pasted = '<pasted_content id="p">\n```\n<system-reminder>\nlog\n</pasted_content id="p">\n';
+  const tilde = "~~~xml\n<pasted_content>\n~~~\nafter\n<system-reminder>";
+  const items = buildItems([
+    { id: "f", role: "user", blocks: [{ t: "text", text: fenced }] },
+    { id: "p", role: "user", blocks: [{ t: "text", text: pasted }] },
+    { id: "t", role: "user", blocks: [{ t: "text", text: tilde }] },
+  ]);
+  const byId = Object.fromEntries(items.map((i) => [i.id, i]));
+  assert.equal(byId.f.text, fenced);
+  // A paste whose fence never closes still loses its own outer tags.
+  assert.equal(byId.p.text, "```\n<system-reminder>\nlog");
+  // Outside the (closed) fence a tag line is framing again.
+  assert.equal(byId.t.text, "~~~xml\n<pasted_content>\n~~~\nafter");
+});

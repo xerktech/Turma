@@ -1378,11 +1378,26 @@
   // bubble drops the tag lines and keeps what they wrap. Run AFTER messageOrigin,
   // which classifies a system turn by its leading tag. Keep in step with
   // ChatItems.kt `stripFraming`.
-  const FRAMING_TAG_RE = /^[ \t]*<\/?(?:pasted_content(?: id="[^"\n]*")?|system-reminder)>[ \t]*(?:\r?\n|$)/gm;
+  // A tag line inside a ``` / ~~~ fence is the operator's own text (rollup XERK-1701),
+  // so only lines outside one go; the first and last lines always go when they are
+  // tags, so a paste with an unclosed fence can't leave its closing tag showing.
+  const FRAMING_TAG_LINE = /^[ \t]*<\/?(?:pasted_content(?: id="[^"\n]*")?|system-reminder)>[ \t]*\r?$/;
+  const FENCE_LINE = /^[ \t]*(?:```|~~~)/;
   function stripFraming(text) {
     const t = String(text == null ? "" : text);
     if (t.indexOf("<") === -1) return t;
-    return t.replace(FRAMING_TAG_RE, "").replace(/^[\r\n]+|[\r\n]+$/g, "");
+    const lines = t.split("\n");
+    const solid = (l) => l.trim() !== "";
+    const first = lines.findIndex(solid);
+    let last = lines.length - 1;
+    while (last > 0 && !solid(lines[last])) last--;
+    let fenced = false;
+    const kept = lines.filter((line, i) => {
+      if (FENCE_LINE.test(line)) { fenced = !fenced; return true; }
+      const edge = i === first || i === last;
+      return !(FRAMING_TAG_LINE.test(line) && (edge || !fenced));
+    });
+    return kept.join("\n").replace(/^[\r\n]+|[\r\n]+$/g, "");
   }
 
   // ---- build display items from rich entries --------------------------------

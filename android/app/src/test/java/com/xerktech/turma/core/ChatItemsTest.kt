@@ -425,6 +425,16 @@ class ChatItemsTest {
             stripFraming("keep <b> and a <system-reminder> mid-line"))
     }
 
+    @Test fun `stripFraming keeps a tag line inside an operator's code fence`() {
+        // Rollup XERK-1701, in step with chat.js.
+        val fenced = "how do I filter these?\n```\n<system-reminder>\nnoise\n</system-reminder>\n```"
+        assertEquals(fenced, stripFraming(fenced))
+        assertEquals("```\n<system-reminder>\nlog",
+            stripFraming("<pasted_content id=\"p\">\n```\n<system-reminder>\nlog\n</pasted_content id=\"p\">\n"))
+        assertEquals("~~~xml\n<pasted_content>\n~~~\nafter",
+            stripFraming("~~~xml\n<pasted_content>\n~~~\nafter\n<system-reminder>"))
+    }
+
     // ---- messageOrigin: a user turn's real source (web parity) --------------
 
     @Test fun `messageOrigin classifies each relay framing, operator by default`() {
