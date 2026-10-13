@@ -372,6 +372,9 @@ paths:
   `_destructive_database`, `pr_summary_reason`). They rescan the segment once per command, so
   `find . -exec true {} +` x5000 under a larger growth budget ran 90s in `decide` and allowed;
   only main()'s hard deadline caught it (rollup XERK-1701).
+  - Out of time also spends the budget (`left = -1`), so a deny surfacing through a nested
+    reading (a tmux argument) stays the non-grantable too-large one; and the final verdict
+    re-checks it, since the unreadable-construct scan runs after the last loop (QA).
 - **main() has a hard deadline too** (`_HOOK_DEADLINE_SECONDS`, XERK-1619): `decide` runs on a
   daemon thread; past it the hook prints a deny and `os._exit`s. The in-decide check never runs
   inside one frame — shlex on one 300 KB word took 126-181s, quadratic in its length. The hook

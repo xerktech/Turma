@@ -1857,8 +1857,14 @@ def _past_deadline() -> bool:
     it, but the per-command checkers rescan the segment once per command, and
     `find . -exec true {} +` x5000 under a larger growth budget ran 90s past it
     and allowed (rollup XERK-1701). Claude Code RUNS a command whose hook timed
-    out, so each such loop refuses once it is out of time."""
-    return _budget is not None and time.monotonic() > _budget["until"]
+    out, so each such loop refuses once it is out of time. Out of time spends
+    the budget, as `_expand`'s check does, so the deny stays the non-grantable
+    too-large one wherever it surfaces (QA: a nested tmux-argument reading
+    wrapped it in a grantable reason)."""
+    if _budget is not None and time.monotonic() > _budget["until"]:
+        _budget["left"] = -1
+        return True
+    return False
 
 
 class _ExpansionTooLarge(Exception):
@@ -15061,7 +15067,9 @@ def _decide_bash(command: str, overrides: list[str], no_attribution: bool, pr_su
     # fed to psql, a fork bomb) let it run out inside them, and `gh pr merge`
     # through — so it is checked here, last, as well as before the grant.
     # Likewise a cap on readings.
-    if _budget["left"] < 0 or _budget["capped"]:
+    # ...and out of time: the checks after the last checker loop (the unreadable
+    # constructs) can run past it too (QA).
+    if _budget["left"] < 0 or _budget["capped"] or _past_deadline():
         return ("deny", _TOO_LARGE_REASON, "policy")
     return ("allow", None, None)
 

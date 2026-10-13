@@ -16,6 +16,7 @@ import importlib.util
 import io
 import json
 import shlex
+import contextlib
 import os
 import subprocess
 import sys
@@ -6750,16 +6751,24 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # under a larger growth budget ran 90s and allowed. Each such loop
         # refuses once the decision is out of time.
         entries = [(["true"], "true")] * 3
-        for fn in (guard._is_destructive, guard._destructive_database,
-                   lambda c: guard.pr_summary_reason(c, "/tmp")):
-            with self.subTest(fn=getattr(fn, "__name__", "pr_summary_reason")), \
-                    mock.patch.object(guard, "_expand_both", lambda *a, **k: entries), \
-                    mock.patch.object(guard, "_budget", {"until": 0}):
-                self.assertEqual(fn("true; true; true"), guard._TOO_LARGE_REASON)
-            with self.subTest(fn=getattr(fn, "__name__", "pr_summary_reason"), budget="open"), \
-                    mock.patch.object(guard, "_expand_both", lambda *a, **k: entries), \
-                    mock.patch.object(guard, "_past_deadline", lambda: False):
-                self.assertIsNone(fn("true; true; true"))
+        for name, fn in (("_is_destructive", guard._is_destructive),
+                         ("_destructive_database", guard._destructive_database),
+                         ("pr_summary_reason", lambda c: guard.pr_summary_reason(c, "/tmp"))):
+            for late in (True, False):
+                with self.subTest(fn=name, late=late), \
+                        mock.patch.object(guard, "_expand_both", lambda *a, **k: entries), \
+                        mock.patch.object(guard, "_destructive_database", lambda c: None) \
+                        if name == "_is_destructive" else contextlib.nullcontext(), \
+                        mock.patch.object(guard, "_past_deadline", lambda: late):
+                    self.assertEqual(fn("true; true; true"),
+                                     guard._TOO_LARGE_REASON if late else None)
+        # Out of time spends the budget, so the deny stays the non-grantable one.
+        budget = {"until": 0, "left": 5}
+        with mock.patch.object(guard, "_budget", budget):
+            self.assertTrue(guard._past_deadline())
+        self.assertEqual(budget["left"], -1)
+        with mock.patch.object(guard, "_budget", None):
+            self.assertFalse(guard._past_deadline())
 
     def test_a_continuation_is_dropped_only_where_bash_drops_it(self):
         # Outside single quotes, a live `\\<newline>` is nothing; an escaped
