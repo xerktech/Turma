@@ -11454,6 +11454,15 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # line that writes text and runs ANY file it cannot pin to a written path
     # reads every written file it has not read (XERK-1674).
     unnamed = written != {} and bool(_RUNS_UNNAMED_RE.search(raw_commands))
+    # ...and a pipe stage the regex can't name: a wrapper's options or an escaped
+    # name before the shell (`| env -i sh`, `| env -- sh`, `| b\\usybox sh`), read
+    # on its words as a heredoc's reader is (rollup XERK-1701).
+    if not unnamed and written != {} and "|" in raw_commands and _MAY_RUN_FILE_RE.search(raw_commands):
+        # Split once; only a stage holding a brace is expanded (`| {,env} sh`): name
+        # readings of the whole line doubled the cost of long real lines (replay).
+        unnamed = any(_reads_stdin_grouped(t) for st in _split_segments(raw_commands)
+                      if _MAY_RUN_FILE_RE.search(st)
+                      for t in (_name_readings(st) if "{" in st else (st,)))
     if written is None and (unnamed or _C_OR_EVAL_RE.search(raw_commands)):
         written = _written_scripts(
             _split_on_operators(command, include_pipe=False, groups=True), heredocs)

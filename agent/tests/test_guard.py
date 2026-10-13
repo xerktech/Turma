@@ -6302,11 +6302,16 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "${x}env sh < f", "$(true)env sh < f", '\\env sh -c "$(cat f)"',
                     "cat f | \\command sh", "cat f | /usr/bin/timeout 5 sh",
                     'case x in x)env sh -c "$(cat f)";; esac', "cat f | /bin/busybox sh",
-                    "cat f | $@env sh", "$*nohup sh < f", '$!exec sh -c "$(cat f)"'):
+                    "cat f | $@env sh", "$*nohup sh < f", '$!exec sh -c "$(cat f)"',
+                    # A wrapper's options, an escaped or brace-formed name: read on
+                    # the stage's words (rollup XERK-1701).
+                    "cat f | env -i sh", "cat f | env -- sh", "cat f | env -u X sh",
+                    "cat f | b\\usybox sh", "cat f | {,env} sh"):
             with self.subTest(run=run):
                 cmd = "echo 'rm -rf /etc' > f; " + run
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
-        for cmd in ("echo hi | busybox sh", "cat notes.md | busybox wc -l",
+        for cmd in ("echo hi | busybox sh", "cat notes.md | busybox wc -l", "cat f | env -i sh",
+                    "echo x > n.txt; cat a.sh | env -i grep -c x",
                     "busybox-static tar -xzf a.tgz", "echo toybox rm -rf /etc"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
