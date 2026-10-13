@@ -6221,7 +6221,11 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # An unread argv[0] may itself start with `busybox`, making argv[1]
                     # the applet: it is never inserted (QA).
                     'exec -a "$n" busybox rm -rf /etc', 'exec -a "$(cat f)" toybox rm -rf /etc',
-                    "exec -a `cat f` busybox rm -rf /etc", "exec -a busybox-x busybox rm -rf /etc"):
+                    "exec -a `cat f` busybox rm -rf /etc", "exec -a busybox-x busybox rm -rf /etc",
+                    # ...and nor is a glob or a tilde, which bash may expand to one (QA).
+                    "exec -a *-x busybox rm -rf /etc", "exec -a [b]usybox-x busybox rm -rf /etc",
+                    "exec -a busybo? busybox rm -rf /etc", "exec -a t* toybox rm -rf /etc",
+                    "exec -a ~ busybox rm -rf /etc"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$x/$y"', 'rm -rf "$dir/$f"', 'chmod 644 "$x/$y"', 'find "$x/$y" -name a',

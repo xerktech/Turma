@@ -7273,12 +7273,12 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
             # A multi-call binary runs the applet its argv[0] names, so `exec -a rm
             # busybox -rf /etc` is `busybox rm -rf /etc` (rollup XERK-1701). A login
             # shell's leading `-` is dropped first, as BusyBox does (`-a -rm`). Only
-            # a literal name: an expansion (or its `_OPAQUE_SUBST` stand-in) may hold
-            # `busybox…`, and then argv[1] is the applet, so inserting it hid
-            # `exec -a "$n" busybox rm -rf /etc`.
+            # a plain name bash leaves as it is: an expansion (`$n`, `$(…)` read as
+            # `_OPAQUE_SUBST`), a glob (`*-x`) or a tilde may become `busybox…`, and
+            # then argv[1] is the applet, so inserting it hid `exec -a "$n" busybox rm`.
             if argv0 and out and _basename(out[0]) == "busybox":
                 applet = argv0[1:] if argv0.startswith("-") else argv0
-                if (not re.search(r"[$`\\'\"]", applet) and _OPAQUE_SUBST not in applet
+                if (_PLAIN_ARGV0_RE.match(applet) and _OPAQUE_SUBST not in applet
                         and _basename(applet) != "busybox"):
                     out.insert(1, applet)
             # BusyBox rm has no preserve-root: `busybox rm -rf "$x/$y"` empties
@@ -7293,6 +7293,10 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
             continue
         break
     return out
+
+
+# An `exec -a` name bash passes through unchanged: no expansion, glob, brace or tilde.
+_PLAIN_ARGV0_RE = re.compile(r"[\w.+/-]+\Z")
 
 
 def _opt_takes_next(opt: str, takes_value: set[str]) -> bool:
