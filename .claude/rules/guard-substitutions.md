@@ -148,8 +148,11 @@ paths:
     decode. A blind-decode reading beside it was tried and lost to one decoy per model.
   - Only an ODD run of `$` before the `'` is ANSI-C (`_ansi_c_dollar`): `$$'a\'` is the PID and a
     plain `'a\'`, which bash closes at the `\'`; read as ANSI-C it hid the command after it.
+  - Every `$'` reader asks it (`_word_end`, `_unquoted_text`, the `_brace_end` memo scan,
+    `_replacement_tildes`, `_FOR_WORD_RE`), so the scanners agree with bash and with each other
+    (rollup XERK-1584). `_FOR_WORD_RE` reads a `$` run whole: per position it was quadratic.
   - Divergence kept (no bypass found): bash decodes `$'…'` inside `"${x:-…}"` (extquote).
-  Tests: `test_ansi_c_strings_decode_as_bash_does` (against real bash).
+  Tests: `test_ansi_c_strings_decode_as_bash_does` (against real bash), `test_rollup_batch_seven_pins`.
 - **`_ANSI_C_RE` checks the backslash run's PARITY**: an odd run (`"\$'…'"`) is literal here and
   ANSI-C only to a `-c` re-parse; an even run (`\\$'…'`) is still live. A bare lookbehind bypassed.
 - **A filtered or partly-unread body gets a TAINT reading too** (XERK-1613, `_body_tainted`): the

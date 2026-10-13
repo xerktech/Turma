@@ -5918,6 +5918,46 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         self.assertEqual(guard.decide("Bash", {"command": "HOME=/; c\\d; echo {x'" + taken
                                                + "',${HOME}}"}, cwd="/tmp")[0], "deny")
 
+    def test_rollup_batch_seven_pins(self):
+        # Rollup XERK-1584: a `$` run pairs left to right in every `$'` reader,
+        # as `_ansi_c_dollar` reads it: `$$'a\'` is the PID and a plain `'a\'`
+        # (bash: `for v in $$'a\' 'b'` binds `<pid>a\` then `b`).
+        self.assertEqual(guard._word_end("$$'a\\'; b", 0), 6)
+        self.assertEqual(guard._word_end("\\$$'a\\'b' c", 0), 9)  # `\$` is literal: `$'…'` is ANSI-C
+        self.assertEqual(guard._unquoted_text("$$'a b'"), "$$")
+        self.assertEqual(guard._brace_end("${x:-$$'\\'}", 0, False), 10)
+        self.assertEqual(guard._FOR_WORD_RE.match("$$'a\\' 'b'").group(), "$$'a\\'")
+        self.assertEqual(guard._FOR_WORD_RE.match("$$$'a\\'b' c").group(), "$$$'a\\'b'")
+        # ...and the `${y/pat/~…}` replacement scan: the pattern `$$'\'` ends at its `/`.
+        self.assertEqual(guard._replacement_tildes("${y/$$'\\'/~/etc}"), [(10, "")])
+        t = time.process_time()
+        for text in ("$" * 200000 + "x", "$" * 200001 + "x", "$" * 200000 + "'", "$x" * 100000):
+            guard._FOR_WORD_RE.match(text)
+        self.assertLess(time.process_time() - t, 3)
+        # An EVEN backslash run before `$(` escapes the backslash, not the
+        # substitution, which stays live (no skip, no raw-pass request).
+        before = guard._SPLICES_ESCAPED[0]
+        self.assertEqual(guard._sub_substs("rm -rf \\\\$(echo x)", lambda m: "X"), "rm -rf \\\\X")
+        self.assertEqual(guard._SPLICES_ESCAPED[0], before)
+        self.assertEqual(guard._sub_substs("rm -rf \\$(echo x)", lambda m: "X"), "rm -rf \\$(echo x)")
+        self.assertEqual(guard._SPLICES_ESCAPED[0], before + 1)
+        # Only the cut-at-closer reading of a group names the shell here, and
+        # bash runs the heredoc through it.
+        for seg in ("(bash){fd}>/dev/null<<E", "(bash){fd}>/dev/null"):
+            self.assertIn("bash", guard._heredoc_segment_programs(seg))
+        # Glue needs a `=` (or `\`) before the expansion: no assignment can hold
+        # it otherwise, and gluing every `${…}` doubled lines that only use one.
+        self.assertEqual(guard._glued_param_values("echo ${v:-a b} | sh", {}), "echo ${v:-a b} | sh")
+        self.assertEqual(guard._glued_param_values("X=${v:-a b} cmd", {}), "X=${v:-a_b} cmd")
+        # Every per-decision memo starts a decision empty: a hit skips the
+        # readings' SEEN side effects, so an earlier decision's entry would
+        # never ask for this one's extra readings.
+        caches = (guard._closers, guard._body_printed, guard._body_tainted_at, guard._unsplit_cuts_at)
+        guard.decide("Bash", {"command": "X=${v:-a b} eval \"$(echo 'y=\"${z}\"')\""})
+        self.assertTrue(all(c.cache_info().currsize for c in caches))
+        opened = guard._budgeted(lambda: [c.cache_info().currsize for c in caches])
+        self.assertEqual(opened(), [0, 0, 0, 0])
+
     def test_a_filtered_or_unread_body_runs_as_its_producers_text(self):
         # XERK-1613: a here-string producer, a rewriting filter, or an unread
         # statement left the body opaque while bash ran its output.
