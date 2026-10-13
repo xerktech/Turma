@@ -93,7 +93,7 @@ const { createIndexStore } = require("./index-store.js");
 // (which supply the pod-to-pod `dial`/listener + this replica's `endpoint`) are the
 // follow-up (w2-relay-consumers). See `.claude/rules/turma-ha-tunnel.md`.
 const { makeRelay } = require("./relay.js");
-const { makeForwarder, stripForwardHeaders } = require("./forward.js");
+const { makeForwarder, stripForwardHeaders, markClosing, dropIfClosing } = require("./forward.js");
 
 // XERK-757 externalized-store persistence config, declared here so it can be
 // handed to the module-load store below. It maps each `policy:<name>` store key to
@@ -11534,6 +11534,8 @@ function endRefusedConnection(req, res, pool = refusedLingers) {
   try { req.pause(); } catch {}
   const sock = req.socket;
   if (!sock || sock.destroyed) return;
+  // Nothing pipelined behind this refusal may run while the socket drains (XERK-1885).
+  markClosing(sock);
   const kill = () => { try { sock.destroy(); } catch {} };
   if (pool.n >= pool.max) {
     if (res.writableFinished) kill();
@@ -18276,6 +18278,9 @@ const server = http.createServer(async (req, res) => {
   const parts = url.pathname.split("/").filter(Boolean); // e.g. api/agents/<id>/sessions
 
   try {
+    // A request pipelined behind a close refusal is never run (XERK-1885, see
+    // dropIfClosing) — checked again once the forwarder's await lets a refusal land.
+    if (dropIfClosing(req)) return;
     // XERK-919: under HA a FOLLOWER forwards the whole request to the lease leader,
     // which serves everything (single-writer — the per-process state this handler
     // is built on then lives in one process). Only /healthz and /readyz are always
@@ -18285,6 +18290,7 @@ const server = http.createServer(async (req, res) => {
     // Served HERE: hop proofs are for replicas, never relayed on (the /term proxy hands
     // req.headers to an agent's ttyd, which could then echo them — XERK-936 QA).
     stripForwardHeaders(req);
+    if (dropIfClosing(req)) return;
 
     // No GET/HEAD/OPTIONS route reads a body, and several answer one through a raw
     // writeHead (the login redirect, static assets) that json() never sees — so a
@@ -22320,6 +22326,8 @@ server.on("upgrade", async (req, socket, head) => {
   // `pendingChannels` there; a re-dialed tunnel reaps its stale predecessor there).
   // Never let a forwarding fault escape this async listener: an unhandled rejection
   // here exits the hub, and an upgrade is reachable unauthenticated.
+  // An upgrade pipelined behind a close refusal is refused with the connection (XERK-1885).
+  if (dropIfClosing(req)) { try { socket.destroy(); } catch {} return; }
   try {
     if (forwarder && (await forwarder.forwardUpgrade(req, socket, head))) return;
     stripForwardHeaders(req); // served here: never relay hop proofs to an agent (see the request handler)

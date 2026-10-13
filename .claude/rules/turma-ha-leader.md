@@ -119,8 +119,8 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
     FIN after the 413, discard until the client closes, destroy after `drainLingerMs` (2s); the slot
     stays held meanwhile so `drainMax` still bounds it. Node's own `destroySoon` (the `connection:
     close` teardown) is overridden on that one socket. Tests: `XERK-1051: a cut refusal lingers`.
-  - While lingering, Node's parser still runs: a request PIPELINED after the refused body is
-    dispatched (forwarded) and its response lost. Accepted: urllib, nginx, browsers don't pipeline.
+  - A request PIPELINED behind any close refusal is dropped, never forwarded (XERK-1885,
+    `markClosing`/`dropIfClosing`; rule in `turma-limits.md`).
   - The leader's own `endRefusedConnection` lingers the same way, count-capped (XERK-1076,
     `turma-limits.md`).
   - The follower judges against the LEADER's caps + slack ALONE, published in `hubLeader:endpoint`
@@ -148,8 +148,8 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   at `drainMax` (not the `refusing` slots); past it, the old reset. Tests: `XERK-1090: …`.
   - Only a status >= 400, and the follower's own 502 (leader reset mid-body). An early 2xx may be
     a long-lived stream that `drainLingerMs` would truncate.
-  - Residual (accepted, as on the leader): a request PIPELINED after the lingered answer is still
-    parsed and forwarded, its answer lost. urllib and nginx don't pipeline.
+  - A request pipelined behind the lingered answer is dropped, not forwarded (XERK-1885).
+    Residual: one whose handler STARTED before the leader's answer arrived is already forwarded.
   - Test clients must read NOTHING until their write completes (`writeThenRead`): an in-process
     client that reads as it writes wins the race and passes against the broken code.
 - **Asymmetric store partition — a store-less leader STEPS DOWN, a store-less replica REFUSES if the
