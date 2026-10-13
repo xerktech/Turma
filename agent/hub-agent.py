@@ -6702,7 +6702,7 @@ def _git_unreadable(reason):
     return {"gitProblem": {"unreadable": reason}}
 
 
-def _strict_git(cmd, cwd, timeout=15, fail_is_unknown=False):
+def _strict_git(cmd, cwd, timeout=15, fail_is_unknown=False, missing_is_gone=False):
     """run() for a `strict` cheap read: stripped stdout on success, "" when git
     answered with a failure or `cwd` is gone, GitTimeout when there was no
     answer — a timeout, or a launch failure in a directory that still exists.
@@ -6710,7 +6710,9 @@ def _strict_git(cmd, cwd, timeout=15, fail_is_unknown=False):
     `fail_is_unknown` makes a nonzero exit in a directory that still exists
     GitUnreadable (a GitTimeout): for `status`, whose EMPTY output is itself
     the verdict "clean", a failure (a corrupt index, an EIO) must not read as
-    one. A missing `cwd` stays "" — that failure IS "gone"."""
+    one. A missing `cwd` answers "" ("gone") only with `missing_is_gone` (the
+    rev-parse probe); for `status` a dir removed mid-read is no answer, never
+    the "" that reads as clean."""
     _note_spawn()
     try:
         out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
@@ -6721,11 +6723,15 @@ def _strict_git(cmd, cwd, timeout=15, fail_is_unknown=False):
         # A missing cwd fails the launch too, and that one IS an answer:
         # the worktree is gone.
         if cwd and not os.path.isdir(cwd):
+            if fail_is_unknown and not missing_is_gone:
+                raise GitTimeout(" ".join(cmd[1:3]))
             return ""
         raise GitTimeout(" ".join(cmd[1:3]))
     if out.returncode != 0 and fail_is_unknown:
         if cwd and not os.path.isdir(cwd):
-            return ""
+            if missing_is_gone:
+                return ""
+            raise GitTimeout(" ".join(cmd[1:3]))
         raise GitUnreadable(_git_error_reason(out.stderr))
     return out.stdout.strip() if out.returncode == 0 else ""
 
@@ -6744,7 +6750,7 @@ def git_info_cheap(cwd, strict=False):
     means only that `cwd` is gone."""
     if strict:
         if not _strict_git(["git", "rev-parse", "--git-dir"], cwd,
-                           fail_is_unknown=True):
+                           fail_is_unknown=True, missing_is_gone=True):
             return None
         dirty = _strict_git(["git", "status", "--porcelain"], cwd,
                             fail_is_unknown=True)
@@ -40979,7 +40985,10 @@ class SessionManager:
             "git": gi,
             # Why `git` is None when it is not merely "not read yet"
             # (XERK-1887): {missing: true} or {unreadable: "<reason>"}.
-            "gitProblem": self._session_git_problem(sid),
+            # A root session runs in REPOS_ROOT, which is normally no repo at
+            # all — that is not a problem worth a word.
+            "gitProblem": (None if sess.get("root")
+                           else self._session_git_problem(sid)),
             # The live branch's relation to its base/origin, computed from the
             # shared repo so it's reported even for a stopped session. Empty
             # while the agent is still on detached HEAD (no branch to sync).

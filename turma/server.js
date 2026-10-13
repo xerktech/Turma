@@ -10257,8 +10257,11 @@ function coerceGitProblem(o) {
   const p = o.gitProblem;
   if (objectish(p) && p.missing === true) {
     o.gitProblem = { missing: true };
-  } else if (objectish(p) && typeof p.unreadable === "string" && p.unreadable.trim()) {
-    o.gitProblem = { unreadable: [...p.unreadable.trim()].slice(0, 200).join("") };
+  } else if (objectish(p) && typeof p.unreadable === "string"
+    // C0/DEL/C1 become spaces, as the agent's own _git_error_reason does.
+    && p.unreadable.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim()) {
+    const clean = p.unreadable.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
+    o.gitProblem = { unreadable: [...clean].slice(0, 200).join("") };
   } else {
     delete o.gitProblem;
   }

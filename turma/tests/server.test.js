@@ -3735,9 +3735,12 @@ test("XERK-1887: gitProblem is rebuilt from its two shapes or dropped, on sessio
   for (const o of rec({ unreadable: `  ${"x".repeat(500)} `, missing: "yes" })) {
     assert.deepEqual(o.gitProblem, { unreadable: "x".repeat(200) });
   }
+  for (const o of rec({ unreadable: "\u0000\u001b[31mred\u0085" })) {
+    assert.deepEqual(o.gitProblem, { unreadable: "[31mred" });
+  }
   // Junk is dropped — absent reads as "not read yet", never a guessed problem.
   for (const bad of [null, true, "gone", [], {}, { missing: 1 }, { unreadable: "" },
-    { unreadable: "  " }, { unreadable: 5 }]) {
+    { unreadable: "  " }, { unreadable: "\u0000\u001b" }, { unreadable: 5 }]) {
     for (const o of rec(bad)) {
       assert.equal("gitProblem" in o, false, `kept ${JSON.stringify(bad)}`);
     }

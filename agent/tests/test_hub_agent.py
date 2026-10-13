@@ -26360,6 +26360,58 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
             gi, _work = sm._session_git(sess, refresh=False, light=True)
         self.assertIsNone(gi)
 
+    def test_a_dir_removed_mid_status_is_no_answer_never_clean(self):
+        """QA (XERK-1887): a worktree/repo deleted between rev-parse and
+        `status` must keep the last answer, not read as 0 dirty files."""
+        d = tempfile.mkdtemp()
+
+        def fake(cmd, **kw):
+            if "status" in cmd:
+                shutil.rmtree(d, True)
+                return mock.Mock(returncode=128, stdout="", stderr="fatal: gone")
+            return mock.Mock(returncode=0, stdout="main", stderr="")
+        for read in (ha.git_info_cheap, ha.repo_cheap_facts):
+            os.makedirs(d, exist_ok=True)
+            with mock.patch.object(ha.subprocess, "run", side_effect=fake):
+                with self.assertRaises(ha.GitTimeout) as caught:
+                    read(d, strict=True)
+            self.assertNotIsInstance(caught.exception, ha.GitUnreadable)
+        # A status that cannot even launch in a vanished dir is no answer too.
+        with mock.patch.object(ha.subprocess, "run", side_effect=FileNotFoundError):
+            with self.assertRaises(ha.GitTimeout):
+                ha._strict_git(["git", "status"], d, fail_is_unknown=True)
+            self.assertEqual(ha._strict_git(["git", "rev-parse"], d,
+                                            fail_is_unknown=True, missing_is_gone=True), "")
+
+    def test_a_root_session_never_reports_a_git_problem(self):
+        """QA (XERK-1887): REPOS_ROOT is normally no repo, so a root session's
+        rev-parse fails — that must not read "git unreadable"."""
+        sm = self.make_manager()
+        sm.session_cheap = {"r1": ha._git_unreadable("not a git repository")}
+        with mock.patch.object(sm, "_stage_cheap_refresh"):
+            payload = sm._session_payload(
+                {"id": "r1", "status": "stopped", "root": True,
+                 "repoPath": "/r", "worktreePath": "/r"}, refresh=False)
+            self.assertIsNone(payload["gitProblem"])
+            self.assertIsNone(payload["git"])
+            payload = sm._session_payload(
+                {"id": "r1", "status": "stopped",
+                 "repoPath": "/r", "worktreePath": "/r"}, refresh=False)
+        self.assertEqual(payload["gitProblem"], {"unreadable": "not a git repository"})
+
+    def test_the_open_pr_reader_publishes_a_gone_worktree_as_missing(self):
+        """QA (XERK-1887): the nudge reader also writes session_cheap; a None
+        there would read "not read yet" again."""
+        sm = self.make_manager()
+        sm.session_cheap = {"s1": {"branch": "feat", "dirtyFiles": 0}}
+        sm.session_facts = {"s1": {"liveBranch": "feat", "slow": {}, "work": None}}
+        sess = {"id": "s1", "repoPath": "/r", "worktreePath": "/w/s1"}
+        with mock.patch.object(ha, "git_info_cheap", return_value=None), \
+                mock.patch.object(ha, "_session_slow_facts", return_value={
+                    "liveBranch": None, "slow": {}, "work": None}):
+            sm._open_pr_nudge_reader(sess)("/w/s1")
+        self.assertEqual(sm.session_cheap["s1"], ha.GIT_MISSING)
+
     def test_the_repos_root_not_being_a_repo_is_not_a_problem(self):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
