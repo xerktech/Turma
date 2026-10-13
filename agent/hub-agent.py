@@ -10635,6 +10635,13 @@ def _shell_group_end(s, i):
         elif quote:
             if c == '"':
                 quote = ""
+            elif c == "$" and s[i + 1:i + 2] == "(":
+                # A `$(` inside "…" is its own substitution, with its own quotes:
+                # `"$(echo ")"; make)"` closes at the last `)`, not the quoted one.
+                i, closed = _shell_group_end(s, i + 2)
+                if not closed:
+                    return n, False
+                continue
         elif c in ("'", '"'):
             quote = c
         elif c == "#" and (i == 0 or s[i - 1] in " \t\n;&|("):
@@ -10703,6 +10710,12 @@ def _shell_segments(command):
             elif c == "\\" and quote == '"' and i + 1 < n:
                 i += 1
                 word.append(s[i])
+            elif quote == '"' and c == "$" and s[i + 1:i + 2] == "(":
+                # `"$(…)"` still runs its body, quotes and all: kept whole.
+                j, _ = _shell_group_end(s, i + 2)
+                word.append(s[i:j])
+                i = j
+                continue
             else:
                 word.append(c)
             i += 1

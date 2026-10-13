@@ -1065,8 +1065,16 @@ function shellGroupEnd(s, i) {
     const c = s[i];
     if (quote === "'") { if (c === "'") quote = ""; }
     else if (c === "\\") i++;
-    else if (quote) { if (c === '"') quote = ""; }
-    else if (c === "'" || c === '"') quote = c;
+    else if (quote) {
+      if (c === '"') quote = "";
+      else if (c === "$" && s[i + 1] === "(") {
+        // A `$(` inside "…" is its own substitution, with its own quotes:
+        // `"$(echo ")"; make)"` closes at the last `)`, not the quoted one.
+        const [j, closed] = shellGroupEnd(s, i + 2);
+        if (!closed) return [n, false];
+        i = j - 1;
+      }
+    } else if (c === "'" || c === '"') quote = c;
     else if (c === "#" && (i === 0 || " \t\n;&|(".includes(s[i - 1]))) {
       while (i + 1 < n && s[i + 1] !== "\n") i++;
     } else if (c === "(") depth++;
@@ -1100,7 +1108,11 @@ function shellSegments(command) {
     if (quote) {
       if (c === quote) quote = "";
       else if (c === "\\" && quote === '"' && i + 1 < n) word.push(s[++i]);
-      else word.push(c);
+      else if (quote === '"' && c === "$" && s[i + 1] === "(") {
+        // `"$(…)"` still runs its body, quotes and all: kept whole.
+        const [j] = shellGroupEnd(s, i + 2);
+        word.push(s.slice(i, j)); i = j - 1;
+      } else word.push(c);
       continue;
     }
     if (c === "'" || c === '"') { quote = c; inWord = true; }
