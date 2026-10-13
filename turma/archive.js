@@ -2905,6 +2905,26 @@ const dedupPendingIds = new Set();
 // one acking while a newer one is still queued would clear it, and that newer one
 // failing after its DELETE would then leave Postgres empty with nothing to redo it.
 const dedupRepairGen = new Map();
+// Where the trailing whitespace of a raw line starts: every character String#trim()
+// drops (what heldEntries and parseEntries read past), as its complete UTF-8 bytes.
+// Scanned from the end, so a long blank run costs linear time, not a regex's square.
+function blankTailStart(line) {
+  let e = line.length;
+  for (;;) {
+    const b = line[e - 1];
+    if (b === 0x20 || (b >= 0x09 && b <= 0x0d)) { e -= 1; continue; }
+    if (e >= 2 && b === 0xa0 && line[e - 2] === 0xc2) { e -= 2; continue; } // U+00A0
+    if (e < 3) return e;
+    const a = line[e - 3], m = line[e - 2];
+    if ((a === 0xe1 && m === 0x9a && b === 0x80) // U+1680
+      || (a === 0xe2 && m === 0x80 && ((b >= 0x80 && b <= 0x8a) || b === 0xa8 || b === 0xa9
+        || b === 0xaf)) // U+2000-200A, U+2028, U+2029, U+202F
+      || (a === 0xe2 && m === 0x81 && b === 0x9f) // U+205F
+      || (a === 0xe3 && m === 0x80 && b === 0x80) // U+3000
+      || (a === 0xef && m === 0xbb && b === 0xbf)) { e -= 3; continue; } // U+FEFF
+    return e;
+  }
+}
 function dedupLines(buf) {
   const seen = new Set();
   const parts = [];
@@ -2916,11 +2936,11 @@ function dedupLines(buf) {
     const nl = buf.indexOf(10, start);
     const end = nl === -1 ? buf.length : nl + 1;
     const line = buf.subarray(start, nl === -1 ? buf.length : nl);
-    // Trailing JSON whitespace is not part of the key: a copy torn between a line
-    // and its \r (or other trailing blank) must still de-dup to a prefix of the
-    // repaired file. Only JSON's own blanks: trimEnd() also strips a latin1 0xA0,
-    // which made a valid line a "duplicate" of a corrupt one and dropped it.
-    const key = line.toString("latin1").replace(/[ \t\r]+$/, "");
+    // Trailing whitespace is not part of the key: a copy torn between a line and its
+    // \r (or any blank the reader's trim() drops) must still de-dup to a prefix of
+    // the repaired file. Matched as whole UTF-8 sequences: trimEnd() on latin1 also
+    // stripped a lone 0xA0, which made a valid line a "duplicate" of a corrupt one.
+    const key = line.toString("latin1", 0, blankTailStart(line));
     if (key.trim() && seen.has(key)) dropped += 1;
     else { seen.add(key); parts.push(buf.subarray(start, end)); }
     start = end;
