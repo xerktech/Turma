@@ -1495,6 +1495,28 @@ class BoardTest {
         assertEquals(2, view.count(EpicChildStatus.READY))
     }
 
+    @Test fun `epicRunView holds a child exactly when the hub driver would`() {
+        // Rollup XERK-1701: a self-block or the epic never holds; a visible external
+        // blocker holds until Done; one the board can't see never holds.
+        val site = epicSite(listOf(
+            child("C-1", blockedBy = listOf("C-1")),
+            child("C-2", blockedBy = listOf("E-1")),
+            child("C-3", blockedBy = listOf("X-1")),
+            child("C-4", blockedBy = listOf("Z-9")),
+            child("C-5", blockedBy = listOf("X-2")),
+            child("X-1"),
+            child("X-2", cat = "done"),
+        ))
+        val keys = listOf("C-1", "C-2", "C-3", "C-4", "C-5")
+        val view = epicRunView(mkRun(children = keys, waves = listOf(keys)), site, emptyMap())
+        val flat = view.waves.flatten().associate { it.key to it.status }
+        assertEquals(EpicChildStatus.READY, flat["C-1"])
+        assertEquals(EpicChildStatus.READY, flat["C-2"])
+        assertEquals(EpicChildStatus.BLOCKED, flat["C-3"])
+        assertEquals(EpicChildStatus.READY, flat["C-4"])
+        assertEquals(EpicChildStatus.READY, flat["C-5"])
+    }
+
     @Test fun `epicRunView counts a queued child as running and a cycle child as blocked`() {
         val site = epicSite(listOf(child("C-1"), child("C-2"), child("C-3")))
         val q = listOf(com.xerktech.turma.model.QueuedTicket(siteKey = "org", issueKey = "C-1"))

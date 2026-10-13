@@ -3052,6 +3052,24 @@ test("epicRunView: a child with all in-epic blockers Done reads ready (not block
   assert.deepEqual(view.counts, { done: 1, running: 0, ready: 2, blocked: 0 });
 });
 
+test("epicRunView: a blocker holds a child exactly when the hub driver's would", () => {
+  // Rollup XERK-1701: the panel read "Blocked" on a self-block the driver drops,
+  // and "Ready" behind a visible external blocker the driver holds on.
+  const site = epicSite([
+    ticket("C-1", { statusCategory: "todo", blockedBy: ["C-1"] }),           // itself
+    ticket("C-2", { statusCategory: "todo", blockedBy: ["E-1"] }),           // the epic
+    ticket("C-3", { statusCategory: "todo", blockedBy: ["X-1"] }),           // visible, not Done
+    ticket("C-4", { statusCategory: "todo", blockedBy: ["Z-9"] }),           // not on the board
+    ticket("C-5", { statusCategory: "todo", blockedBy: ["X-2"] }),           // visible, Done
+    ticket("X-1", { statusCategory: "todo" }),
+    ticket("X-2", { statusCategory: "done" }),
+  ]);
+  const keys = ["C-1", "C-2", "C-3", "C-4", "C-5"];
+  const view = epicRunView(run({ children: keys, waves: [keys] }), site, { sessionIndex: new Map() });
+  const status = Object.fromEntries(view.waves[0].map((c) => [c.key, c.status]));
+  assert.deepEqual(status, { "C-1": "ready", "C-2": "ready", "C-3": "blocked", "C-4": "ready", "C-5": "ready" });
+});
+
 test("epicRunView: a queued child counts as running; a cycle child is blocked", () => {
   const site = epicSite([
     ticket("C-1", { statusCategory: "todo" }),
@@ -3165,7 +3183,8 @@ test("epicPreviewRun: an un-armed epic previews the waves arming would build", (
   const view = epicRunView(run, site, {});
   assert.equal(view.total, 4);
   assert.equal(view.done, 1);
-  assert.deepEqual(view.waves[1].map((c) => c.status), ["ready", "ready"]);
+  // C-3 waits on X-9 too: a visible external blocker the driver holds on (rollup XERK-1701).
+  assert.deepEqual(view.waves[1].map((c) => c.status), ["ready", "blocked"]);
   assert.equal(view.waves[2][0].status, "blocked");
   // A loop is annotated, never dropped.
   site.tickets.push(ticket("C-5", { epicKey: "E-1", blockedBy: ["C-6"] }),
