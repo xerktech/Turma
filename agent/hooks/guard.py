@@ -1852,6 +1852,15 @@ _TOO_LARGE_REASON = ("refusing a command too large to classify (its variables or
                      "arguments expand too far) — split it, or put the data in a file")
 
 
+def _past_deadline() -> bool:
+    """Whether this decision has run past `_MAX_DECIDE_SECONDS`. `_expand` checks
+    it, but the per-command checkers rescan the segment once per command, and
+    `find . -exec true {} +` x5000 under a larger growth budget ran 90s past it
+    and allowed (rollup XERK-1701). Claude Code RUNS a command whose hook timed
+    out, so each such loop refuses once it is out of time."""
+    return _budget is not None and time.monotonic() > _budget["until"]
+
+
 class _ExpansionTooLarge(Exception):
     pass
 
@@ -14168,6 +14177,8 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
     # Without the `~` reading (XERK-1685): it repeats the line, and a writer
     # read twice is "another part" naming the file it wrote.
     for tokens, segment, *_flags in _expand_both(command, home=False):
+        if _past_deadline():
+            return _TOO_LARGE_REASON
         if _basename(tokens[0]) == "cd" and len(tokens) > 1:
             cwd = _join_path(cwd, tokens[1])
             continue
@@ -14557,6 +14568,8 @@ def _stage_executes_sql(tokens: list[str], depth: int = 0) -> bool:
 
 def _destructive_database(command: str) -> str | None:
     for tokens, segment, *_flags in _expand_both(command):
+        if _past_deadline():
+            return _TOO_LARGE_REASON
         if not _DB_DESTRUCTION.search(segment):
             continue
         if not _stage_executes_sql(tokens):
@@ -14654,6 +14667,8 @@ def _is_destructive(command: str) -> str | None:
         if reason:
             return reason
     for tokens, segment, *flags in _expand_both(command):
+        if _past_deadline():
+            return _TOO_LARGE_REASON
         if tokens[0] == _TOO_DEEP:
             return "refusing a command nested too deeply to classify — flatten it"
         if tokens[0] == _UNREAD_PROG:

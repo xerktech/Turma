@@ -6744,6 +6744,23 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             self.assertEqual(guard.decide("Bash", {"command": cmd}, overrides=["eval *"],
                                           cwd="/tmp")[::2], ("deny", "policy"))
 
+    def test_a_checker_past_its_deadline_denies(self):
+        # Rollup XERK-1701: `_expand` checks the deadline, but the checkers then
+        # rescan the segment once per command; `find . -exec true {} +` x5000
+        # under a larger growth budget ran 90s and allowed. Each such loop
+        # refuses once the decision is out of time.
+        entries = [(["true"], "true")] * 3
+        for fn in (guard._is_destructive, guard._destructive_database,
+                   lambda c: guard.pr_summary_reason(c, "/tmp")):
+            with self.subTest(fn=getattr(fn, "__name__", "pr_summary_reason")), \
+                    mock.patch.object(guard, "_expand_both", lambda *a, **k: entries), \
+                    mock.patch.object(guard, "_budget", {"until": 0}):
+                self.assertEqual(fn("true; true; true"), guard._TOO_LARGE_REASON)
+            with self.subTest(fn=getattr(fn, "__name__", "pr_summary_reason"), budget="open"), \
+                    mock.patch.object(guard, "_expand_both", lambda *a, **k: entries), \
+                    mock.patch.object(guard, "_past_deadline", lambda: False):
+                self.assertIsNone(fn("true; true; true"))
+
     def test_a_continuation_is_dropped_only_where_bash_drops_it(self):
         # Outside single quotes, a live `\\<newline>` is nothing; an escaped
         # backslash, a single-quoted one and a comment's are kept (XERK-1615).
