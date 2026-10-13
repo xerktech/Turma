@@ -48,14 +48,26 @@ class MainDispatcherRule(
         Dispatchers.setMain(dispatcher)
     }
 
-    private val tracked = mutableListOf<ViewModel>()
-
-    /** Registers [vm] to have its scope cancelled before `Dispatchers.Main` is reset. */
-    fun <T : ViewModel> track(vm: T): T = vm.also { tracked += it }
+    /** Registers [vm] to have its scope cancelled before the hub stops and `Dispatchers.Main` resets. */
+    fun <T : ViewModel> track(vm: T): T = vm.also { synchronized(tracked) { tracked += it } }
 
     override fun finished(description: Description) {
-        tracked.forEach { it.viewModelScope.cancel() }
-        tracked.clear()
+        cancelTracked()
         Dispatchers.resetMain()
+    }
+
+    companion object {
+        // Process-wide, not per rule: [HubHarness] (an INNER rule) must cancel
+        // these before its server.shutdown(), which aborts every in-flight call
+        // and resumes it from an OkHttp thread; this rule's finished() runs
+        // after that (QA: 5 of 150 calls resumed there). Tests in a JVM fork
+        // run one at a time, so the list only ever holds this test's VMs.
+        private val tracked = mutableListOf<ViewModel>()
+
+        /** Cancels every tracked ViewModel's scope; idempotent. */
+        fun cancelTracked() {
+            val vms = synchronized(tracked) { tracked.toList().also { tracked.clear() } }
+            vms.forEach { it.viewModelScope.cancel() }
+        }
     }
 }

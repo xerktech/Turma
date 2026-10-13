@@ -73,6 +73,7 @@ class ArchiveViewModel(app: Application) : AndroidViewModel(app) {
             delay(250) // debounce — one search per pause, not per keystroke
             _state.update { it.copy(searching = true) }
             val res = runCatching { container.client.api.search(q = trimmed, limit = 50) }.getOrNull()
+            ensureActive() // a superseded search must not clear the next one's spinner
             // Stamp the query the results answer even on failure: an unreachable
             // hub is "no matches", not a spinner that never stops.
             _state.update {
