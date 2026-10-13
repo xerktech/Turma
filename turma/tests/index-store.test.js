@@ -1279,6 +1279,15 @@ test("a CRLF copy torn before a \\r still de-dups to a prefix of the repaired fi
   // A stray 0xA0 byte is not JSON whitespace: the valid twin must survive.
   const nbsp = Buffer.concat([Buffer.from('{"k":"z"}'), Buffer.from([0xa0]), Buffer.from('\n{"k":"z"}\n')]);
   assert.equal(archive.dedupLines(nbsp).dropped, 0);
+  // Whitespace trim() drops is blank as whole UTF-8 sequences, NBSP and U+3000 too:
+  // a copy torn before one keys as the repaired file's line does (rollup XERK-1701).
+  for (const ws of ["\u00a0", "\u3000", "\ufeff", "\v"]) {
+    const wide = Buffer.from(`{"a":1}${ws}\n{"a":1}${ws}\n`, "utf8");
+    const cut = wide.subarray(0, wide.length - Buffer.byteLength(ws) - 1);
+    assert.equal(archive.dedupLines(cut).dropped, 1, JSON.stringify(ws));
+    assert.ok(archive.dedupLines(wide).out.toString("latin1")
+      .startsWith(archive.dedupLines(cut).out.toString("latin1")), JSON.stringify(ws));
+  }
 });
 
 test("XERK-1450 pg mode: a lost Postgres repair stays pending and the next leader redoes it", async () => {
