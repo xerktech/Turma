@@ -85,6 +85,14 @@ class BoardTriageTest {
         )
         compose.setContent { BoardScreen() }
         compose.waitForIdle()
+        // On a slow CI runner the first idle frame can still be the empty board
+        // (it renders off the fleet StateFlow), so a test that clicks a card
+        // straight away found no node. Wait until every seeded card is composed.
+        compose.waitUntil(timeoutMillis = 10_000) {
+            listOf("XERK-100", "XERK-101", "XERK-102", "XERK-103").all {
+                compose.onAllNodesWithText(it).fetchSemanticsNodes().isNotEmpty()
+            }
+        }
     }
 
     /**
