@@ -243,8 +243,13 @@ fun epicRunView(
         isRunning(k) -> EpicChildStatus.RUNNING
         cycleSet.contains(k) -> EpicChildStatus.BLOCKED
         else -> {
-            val blockers = (byKey[k]?.blockedBy ?: emptyList()).filter { it in keySet }
-            if (blockers.all { isDone(it) }) EpicChildStatus.READY else EpicChildStatus.BLOCKED
+            // As the hub driver's epicChildBlockersDone (rollup XERK-1701): an in-epic or a
+            // visible external blocker holds until Done; the child, the epic and an unseen
+            // external ticket never hold.
+            val blockers = (byKey[k]?.blockedBy ?: emptyList())
+                .filter { it.isNotEmpty() && it != k && it != run.epicKey }
+            val holds = blockers.any { (it in keySet || byKey.containsKey(it)) && !isDone(it) }
+            if (holds) EpicChildStatus.BLOCKED else EpicChildStatus.READY
         }
     }
     fun node(k: String) = EpicChild(k, byKey[k]?.summary.orEmpty(), statusOf(k))

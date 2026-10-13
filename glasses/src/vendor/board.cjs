@@ -487,8 +487,11 @@
   // (epicChildBlockersDone / buildEpicWaves ordering):
   //   done     — the child ticket is in the Done column.
   //   running  — a live/queued session names it.
-  //   ready    — not started, every IN-EPIC blocker is Done (next to dispatch).
-  //   blocked  — waiting on an in-epic blocker, or stuck in a dependency cycle.
+  //   ready    — not started, and no blocker holds it (next to dispatch).
+  //   blocked  — waiting on a blocker, or stuck in a dependency cycle.
+  // A blocker holds as the driver's does (rollup XERK-1701): an in-epic one until
+  // Done, a visible external one until Done; the child itself, the epic and an
+  // external ticket the board can't see never hold.
   // Returns { state, total, done, counts, waves:[[{key,summary,status}]],
   //   cycleChildren:[…], cycle:bool }. `waves` is the hub's topological layering,
   //   so rendering them in order shows the wave-by-wave progression the ticket
@@ -517,8 +520,9 @@
       if (cycleSet.has(k)) return "blocked";
       const t = byKey.get(k);
       const blockers = (t && Array.isArray(t.blockedBy) ? t.blockedBy : [])
-        .filter((b) => keySet.has(b));
-      return blockers.every(isDone) ? "ready" : "blocked";
+        .filter((b) => typeof b === "string" && b && b !== k && b !== run.epicKey);
+      const holds = (b) => (keySet.has(b) || byKey.has(b)) && !isDone(b);
+      return blockers.some(holds) ? "blocked" : "ready";
     };
     const node = (k) => {
       const t = byKey.get(k);
