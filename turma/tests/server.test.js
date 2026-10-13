@@ -1236,10 +1236,13 @@ test("XERK-1571: sessionAttention derives every state in precedence order", () =
   assert.deepEqual(att(s({ agents: [timed] })), { state: "waiting", eta: now + 10 * WMIN, why: "Sleep" });
   assert.deepEqual(att(s({ agents: [ci] })), { state: "waiting", why: "Watch CI" });
   assert.deepEqual(att(s({ agents: [ci], transcriptAgeSec: 46 * 60 })), { state: "needs-you:stalled", why: "Watch CI" });
-  // A padded label is trimmed, and a blank one carries no why (rollup XERK-1701).
+  // A padded label is trimmed, and a blank one reads as the shell count (rollup XERK-1701).
   assert.deepEqual(att(s({ agents: [{ ...ci, label: "  Watch CI \t" }], transcriptAgeSec: 46 * 60 })),
     { state: "needs-you:stalled", why: "Watch CI" });
   assert.equal(att(s({ agents: [{ ...ci, label: "   " }], transcriptAgeSec: 46 * 60 })).why, "1 background shell");
+  // Every why is trimmed, and a blank one is dropped.
+  assert.equal(att(s({ question: "  Which DB?  " })).why, "Which DB?");
+  assert.equal(att(s({ wakeAt: now + 20 * WMIN, wakeReason: "   " })).why, undefined);
   // Review splits on the existing inputs: the PR and its CI, or nothing to merge.
   assert.deepEqual(att(s({})), { state: "needs-you:review", why: "finished · nothing to merge" });
   const pr = (extra) => s({}, { prs: [{ url: "u", state: "OPEN", ...extra }] });
