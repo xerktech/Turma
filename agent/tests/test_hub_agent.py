@@ -23211,6 +23211,38 @@ class TestResolveSubagent(unittest.TestCase):
             f.write("{}\n")
         self.assertEqual(ha._resolve_subagent(main, "agent", "Find the parser"), sub)
 
+    def test_an_unlabelled_row_prefers_the_unlabelled_launch(self):
+        # The converse of the case above: a NEWER labelled launch used to claim
+        # the row an unlabelled launch drew (rollup XERK-1701).
+        main, labelled = self._main_with_agent_call("good1", "Find the parser")
+        older = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_bare", "name": "Agent",
+             "input": {"prompt": "go"}}]}}
+        result = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_bare", "content": [
+                {"type": "text", "text": "agentId: bare1 (internal)"}]}]}}
+        # An even older LABELLED launch: the fallback must still pick the newest.
+        oldest = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_old0", "name": "Agent",
+             "input": {"description": "Older task", "prompt": "go"}}]}}
+        oldest_result = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_old0", "content": [
+                {"type": "text", "text": "agentId: old0 (internal)"}]}]}}
+        with open(os.path.join(self.tmp, "main", "subagents", "agent-old0.jsonl"), "w") as f:
+            f.write("{}\n")
+        with open(main) as f:
+            newer = f.read()
+        with open(main, "w") as f:
+            f.write(json.dumps(oldest) + "\n" + json.dumps(oldest_result) + "\n"
+                    + json.dumps(older) + "\n" + json.dumps(result) + "\n" + newer)
+        bare = os.path.join(self.tmp, "main", "subagents", "agent-bare1.jsonl")
+        with open(bare, "w") as f:
+            f.write("{}\n")
+        self.assertEqual(ha._resolve_subagent(main, "agent", ""), bare)
+        # With its transcript gone, the newest launch still answers the row.
+        os.unlink(bare)
+        self.assertEqual(ha._resolve_subagent(main, "agent", ""), labelled)
+
     def test_resolves_exact_type_and_label(self):
         main, sub = self._main_with_task("abc123", "Explore", "Find the parser")
         self.assertEqual(ha._resolve_subagent(main, "Explore", "Find the parser"), sub)
@@ -23381,6 +23413,20 @@ class TestResolveWorkflowRun(unittest.TestCase):
         named = self._run_dir("wf_old111")
         self._run_dir("wf_new222")
         self.assertEqual(ha._resolve_workflow_run(self.main, "build"), named)
+
+    def test_a_nameless_row_prefers_the_nameless_run(self):
+        # ...and the converse: a NEWER named run must not claim it (rollup XERK-1701).
+        nameless = self._launch("", "wf_old111")
+        nameless[1]["toolUseResult"]["summary"] = ""
+        self._write_main(nameless, self._launch("build", "wf_new222"))
+        mine = self._run_dir("wf_old111")
+        self._run_dir("wf_new222")
+        self.assertEqual(ha._resolve_workflow_run(self.main, ""), mine)
+        # With no nameless run on disk, the newest named one still answers the row.
+        shutil.rmtree(mine)
+        self._write_main(self._launch("old", "wf_old000"), nameless, self._launch("build", "wf_new222"))
+        self._run_dir("wf_old000")
+        self.assertEqual(ha._resolve_workflow_run(self.main, ""), self._run_dir("wf_new222"))
 
     def test_newest_matching_launch_wins(self):
         self._write_main(self._launch("nightly", "wf_old111"),
@@ -24095,6 +24141,16 @@ class TestLiveAgentResolveId(unittest.TestCase):
         st = self._state(("a1", "explore", "map it", "good"),
                          ("a2", "general-purpose", "", "evil"))
         self.assertEqual(ha._live_agent_resolve_id(st, "agent", "map it"), "good")
+
+    def test_an_unlabelled_row_prefers_the_unlabelled_launch(self):
+        # An empty want matches every launch, so a NEWER labelled launch used to
+        # win a click on the row an unlabelled launch drew (rollup XERK-1701).
+        st = self._state(("a1", "general-purpose", "", "mine"),
+                         ("a2", "explore", "map it", "newer"))
+        self.assertEqual(ha._live_agent_resolve_id(st, "agent", ""), "mine")
+        # With no unlabelled launch, the newest one still answers the row.
+        st = self._state(("a2", "explore", "map it", "newer"))
+        self.assertEqual(ha._live_agent_resolve_id(st, "agent", ""), "newer")
 
     def test_a_pane_truncated_label_matches_by_prefix(self):
         st = self._state(("a1", "explore", "map the whole repository", "a1"))
