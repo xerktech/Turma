@@ -13194,8 +13194,11 @@ def _destructive_disk_power(tokens: list[str], segment: str) -> str | None:
         return "refusing raw write to a block device (dd of=/dev/...)"
     if re.search(r">\s*/dev/(sd|nvme|hd|disk|mmcblk)", low):
         return "refusing redirect onto a block device"
-    if re.search(r"\bkill\s+-9\s+-1\b", low) or re.search(r"\bkill\s+-1\b\s+1\b", low):
-        return "refusing system-wide kill"
+    # Over the raw text AND the unwrapped words: `exec -a kill busybox -9 -1` names
+    # its `kill` only once the prefix strip has read argv[0] (rollup XERK-1701).
+    for text in (low, " ".join(tokens).lower()):
+        if re.search(r"\bkill\s+-9\s+-1\b", text) or re.search(r"\bkill\s+-1\b\s+1\b", text):
+            return "refusing system-wide kill"
     return None
 
 
