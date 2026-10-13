@@ -76,6 +76,8 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
   the tokenizer and the body extractor; quotes, `\` escapes and `#` comments inside it are text.
   A `$(` inside double quotes is a substitution with its own quotes, in the tokenizer and the
   group scanner alike: `x="$(echo ")"; make)"` runs `make` (rollup XERK-1584).
+  An empty `<()`/`>()` (blanks/comments only) is DROPPED, as bash drops it: `<()make` is the
+  command `make`, never a redirect (XERK-1889). An empty `$()` is not dropped (it reads as work).
   The scanner nests on an explicit stack, never recursion: ~1000 `"$(` under the 4096-char cap
   raised RecursionError on the beat and blanked that session's signals (QA).
   An in-place filter stage is work too (`| sed -i`/`--in`, `awk --inc`:

@@ -1093,13 +1093,20 @@ function shellTickEnd(s, i) {
   return [n, false];
 }
 
+// True when a substitution body runs nothing: only blanks and `#` comments.
+const shellBlankBody = (body) => body.split("\n").every((ln) => {
+  const t = ln.replace(/^[ \t]+/, "");
+  return t === "" || t.startsWith("#");
+});
+
 function shellSegments(command) {
   const segs = [];
   let stages = [], words = [], word = [], inWord = false;
+  let glued = false;   // a dropped empty `<()` started a word: a `#` after it is text
   let quote = "";
   const s = String(command == null ? "" : command);
   const n = s.length;
-  const endWord = () => { if (inWord) words.push(word.join("")); word = []; inWord = false; };
+  const endWord = () => { if (inWord) words.push(word.join("")); word = []; inWord = false; glued = false; };
   const endStage = () => { endWord(); if (words.length) stages.push(words); words = []; };
   const endSeg = () => { endStage(); if (stages.length) segs.push(stages); stages = []; };
   for (let i = 0; i < n; i++) {
@@ -1120,13 +1127,15 @@ function shellSegments(command) {
       if (s[i] !== "\n") { word.push(s[i]); inWord = true; }
     } else if ((c === "$" || c === "<" || c === ">") && i + 1 < n && s[i + 1] === "(") {
       // `<(…)`/`>(…)` run their body like `$(…)`; the whole group is one word.
-      const [j] = shellGroupEnd(s, i + 2);
+      const [j, closed] = shellGroupEnd(s, i + 2);
+      // Bash drops an empty `<()`, so `<()make` is the word `make`.
+      if (closed && c !== "$" && shellBlankBody(s.slice(i + 2, j - 1))) { glued = true; i = j - 1; continue; }
       word.push(s.slice(i, j)); inWord = true; i = j - 1;
     } else if (c === "`") {
       const [j] = shellTickEnd(s, i + 1);
       word.push(s.slice(i, j)); inWord = true; i = j - 1;
     }
-    else if (c === "#" && !inWord) { while (i + 1 < n && s[i + 1] !== "\n") i++; }
+    else if (c === "#" && !inWord && !glued) { while (i + 1 < n && s[i + 1] !== "\n") i++; }
     else if (c === ";" || c === "\n") endSeg();
     else if (c === "|") {
       if (i + 1 < n && s[i + 1] === "|") { i++; endSeg(); } else endStage();
