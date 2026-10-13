@@ -12428,7 +12428,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         loaded = json.loads(open(settings).read())
         matchers = [e["matcher"] for e in loaded["hooks"]["PreToolUse"]]
         self.assertEqual(matchers, ["Bash", "Write|Edit|MultiEdit|NotebookEdit",
-                                    "AskUserQuestion", "Agent|Task"])
+                                    "AskUserQuestion", "Agent|Task|Workflow"])
 
     def test_spawn_exports_gitlab_host_for_glab(self):
         """A GitLab-configured host tells every session's glab WHERE to auth:
