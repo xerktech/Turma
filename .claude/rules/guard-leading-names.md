@@ -63,6 +63,8 @@ paths:
     - A check that reads the RAW segment misses an applet named only by argv[0]; the
       system-wide `kill -9 -1` check also reads the unwrapped words (`exec -a kill busybox -9 -1`).
       Any new raw-text check needs the same second reading.
+    - An unreadable program word after `exec -a NAME` (`$(which busybox)`, `"$BB"`) gets an ADDED
+      reading as `busybox` (`_expand`); replacing the word lost `exec -a x $SHELL -c '…'` (a shell).
     - toybox keeps a leading `-` (no applet runs); stripping it there too over-denies, safely.
     - `_CMD_START` takes one as a wrapper word, so `cat a.sh | busybox sh` is a stdin shell
       for the write-then-run rule (was allowed on main). Rollup XERK-1701.

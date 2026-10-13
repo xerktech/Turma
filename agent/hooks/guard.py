@@ -11179,6 +11179,16 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         if bb >= 0:
             out.extend(_expand_segments(
                 " ".join(shlex.quote(t) for t in ["sh", *raw_toks[bb + 1:]]), depth + 1, cwds))
+        # A program word the guard can't read after `exec -a NAME` (`$(which busybox)`,
+        # `$BB`) may be a multi-call binary, which runs NAME: the words are also read
+        # with it as `busybox`, an ADDED reading (rollup XERK-1701).
+        at = len(raw_toks) - len(tokens)
+        if (at > 0 and raw_toks[at] == tokens[0]
+                and (re.search(r"[$`]", tokens[0]) or _OPAQUE_SUBST in tokens[0])
+                and any(_basename(t) == "exec" for t in raw_toks[:at])):
+            as_bb = _strip_prefixes(raw_toks[:at] + ["busybox"] + raw_toks[at + 1:])
+            if as_bb and as_bb != _strip_prefixes(["busybox"] + raw_toks[at + 1:]):
+                out.append((as_bb, seg))
         # The file a shell or `.` runs, or one run by its path (`./s.sh`).
         script_path = (_script_file(prog, rest) if prog in _SHELL_PROGS or prog in ("source", ".")
                        else posixpath.normpath(tokens[0]) if "/" in tokens[0] else None)
