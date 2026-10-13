@@ -228,8 +228,16 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   - Every read on the beat goes through `_read_regular` (non-blocking, no-follow, type checked on the
     fd, size-capped, fd always closed): a FIFO hook or baseline otherwise blocks the beat forever.
   - The manager re-checks the same baseline every full beat (`check_hook_integrity`) and kicks
-    `bin/turma-agent-update` detached, at most once per `HOOK_REPAIR_MIN_INTERVAL` — exposure is one
-    beat plus an update run, not up to an hour. Inert with no baseline (checkout, Windows).
+    `bin/turma-agent-update` detached — exposure is two beats plus an update run, not up to an
+    hour. Inert with no baseline (checkout, Windows).
+  - TWO consecutive mismatching checks (any set) before a report or kick: `install_payload` swaps the
+    hooks in before it records their baseline (rm + mv), so one beat can land in between.
+    Residual: a stub restored every other beat escapes the beat; the hourly timer repairs it.
+  - A baseline this manager has read that then disappears is a mismatch (`hooks.sha256`), never
+    inert again — else deleting it switched the check off until the hourly timer.
+  - Re-kicks back off (`HOOK_REPAIR_MIN_INTERVAL` doubling to `HOOK_REPAIR_MAX_INTERVAL`), reset
+    only by a clean check, never by a changed set: an installed build newer than the release is
+    never repaired, and the updater logs why rather than kicking a no-op run every 600s.
   - The baseline is as writable as the hooks: this repairs a model that stubs its guard to get
     unblocked, not a shell set on hiding it (XERK-309). Tests: `run_integrity_case` in
     `test_turma_agent_update.sh`, `TestHookIntegrity`.

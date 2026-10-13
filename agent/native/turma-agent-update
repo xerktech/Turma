@@ -210,8 +210,13 @@ hooks_intact() {
 # <release_version> anyway. Only ever the SAME version — an installed build newer
 # than the release (a hand install) is never downgraded to repair it.
 needs_repair() {  # <release_version> <installed_version>
-  [ "$1" = "$2" ] || return 1
   hooks_intact && return 1
+  if [ "$1" != "$2" ]; then
+    # The manager kicks this run on drifted hooks; say why nothing changes.
+    logmsg "installed hooks are not vouched for by $HOOKS_BASELINE, but installed $2 is" \
+           "newer than release $1: not downgrading to repair them; reinstall $2 by hand"
+    return 1
+  fi
   if [ -f "$HOOKS_BASELINE" ]; then
     logmsg "installed hooks do NOT match $HOOKS_BASELINE (tampered or truncated);" \
            "reinstalling $2 to restore them"

@@ -44150,15 +44150,67 @@ class TestHookIntegrity(unittest.TestCase):
         self.assertIsNone(self._check({}, 1000))
         self.assertEqual([], self.spawned)
 
-    def test_stubbed_guard_kicks_the_updater_once_per_interval(self):
+    def test_stubbed_guard_kicks_the_updater_once_confirmed_then_backs_off(self):
         self._write("hooks/guard.py", "import sys\nsys.exit(0)\n")
         state = {}
         self.assertEqual(["hooks/guard.py"], self._check(state, 1000))
+        self.assertEqual([], self.spawned, "one sighting may be an install mid-swap")
+        self.assertEqual(["hooks/guard.py"], self._check(state, 1020))
         self.assertEqual([[os.path.join(self.dir, "bin", "turma-agent-update")]], self.spawned)
-        self._check(state, 1000 + ha.HOOK_REPAIR_MIN_INTERVAL - 1)
-        self.assertEqual(1, len(self.spawned))
-        self._check(state, 1000 + ha.HOOK_REPAIR_MIN_INTERVAL)
+        t = 1020
+        # Each re-kick waits twice as long as the last, up to the hourly cap
+        # (rollup XERK-1584 #81: an unrepairable mismatch kicked every 600s).
+        for gap in (600, 1200, 2400, 3600, 3600):
+            self._check(state, t + gap - 1)
+            n = len(self.spawned)
+            self._check(state, t + gap)
+            self.assertEqual(n + 1, len(self.spawned), f"re-kick after {gap}s")
+            t += gap
+
+    def test_a_mismatch_gone_by_the_next_check_never_kicks(self):
+        # install_payload swaps the hooks in before it records their baseline.
+        good = open(os.path.join(self.dir, "hooks", "guard.py")).read()
+        state = {}
+        self._write("hooks/guard.py", "# the new release\n")
+        self.assertEqual(["hooks/guard.py"], self._check(state, 1000))
+        self._write("hooks/guard.py", good)
+        self.assertEqual([], self._check(state, 1020))
+        self._write("hooks/guard.py", "# the next release\n")
+        self._check(state, 1040)
+        self.assertEqual([], self.spawned)
+
+    def test_a_changing_mismatch_set_keeps_the_backoff(self):
+        # QA: a stray file coming and going every beat reset the backoff and
+        # kicked the updater every 40s.
+        self._write("hooks/guard.py", "import sys\nsys.exit(0)\n")
+        state, stray = {}, os.path.join(self.dir, "hooks", "guard.py~")
+        for beat in range(40):
+            if beat % 2:
+                self._write("hooks/guard.py~", "x")
+            elif os.path.exists(stray):
+                os.unlink(stray)
+            self._check(state, 1000 + 20 * beat)
         self.assertEqual(2, len(self.spawned))
+
+    def test_stubbing_the_hooks_in_turn_is_still_confirmed(self):
+        state = {}
+        good = {n: open(os.path.join(self.dir, "hooks", n)).read() for n in ("guard.py", "fileguard.py")}
+        self._write("hooks/guard.py", "import sys\nsys.exit(0)\n")
+        self._check(state, 1000)
+        self._write("hooks/guard.py", good["guard.py"])
+        self._write("hooks/fileguard.py", "import sys\nsys.exit(0)\n")
+        self._check(state, 1020)
+        self.assertEqual(1, len(self.spawned))
+
+    def test_a_deleted_baseline_is_a_mismatch_once_one_was_read(self):
+        # Deleting hooks.sha256 must not switch the check off until the hourly
+        # timer run (rollup XERK-1584 #81).
+        state = {}
+        self.assertEqual([], self._check(state, 1000))
+        os.unlink(os.path.join(self.dir, "hooks.sha256"))
+        self.assertEqual(["hooks.sha256"], self._check(state, 1020))
+        self.assertEqual(["hooks.sha256"], self._check(state, 1040))
+        self.assertEqual(1, len(self.spawned))
 
     def test_a_deleted_hook_is_a_mismatch(self):
         os.unlink(os.path.join(self.dir, "hooks", "fileguard.py"))

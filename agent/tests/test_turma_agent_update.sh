@@ -1513,8 +1513,13 @@ HOME="$root/home" TMPDIR="$root/tmp" PATH="$bin:$PATH" TURMA_REPO="xerktech/turm
   TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_RUN_DEADLINE=20 TURMA_RUN_KILL_GRACE=1 \
   "$bin/turma-agent-update" --boot >/dev/null 2>&1 &
 run_pid=$!
+# Never the killed run's leftover ($second): on a loaded box the poll can find it
+# before this run's own sweep removes it, and it names a dead pid by design
+# (rollup XERK-1584 #81).
 cur=""; i=0
-while [ -z "$cur" ] && [ "$i" -lt 50 ]; do sleep 0.2; cur="$(own_stages)"; i=$((i + 1)); done
+while [ -z "$cur" ] && [ "$i" -lt 50 ]; do
+  sleep 0.2; cur="$(own_stages | grep -vxF "$second" | head -n1 || true)"; i=$((i + 1))
+done
 stage_pid="${cur#turma-update."$tag".}"; stage_pid="${stage_pid%%.*}"
 if [ -n "$cur" ] && kill -0 "$stage_pid" 2>/dev/null; then
   pass "a running updater's stage names its own live pid ($stage_pid)"
@@ -1850,6 +1855,7 @@ run_integrity_case() {  # <installed> <release> <tamper|intact|nobaseline> [lega
   else
     printf '%s|%s|baseline-bad\n' "$(head -n1 "$prefix/hooks/guard.py")" "$restarted"
   fi
+  [ -z "${INTEGRITY_LOG_OUT:-}" ] || cp "$root/home/.turma/update.log" "$INTEGRITY_LOG_OUT" 2>/dev/null || true
   rm -rf "$root" "$d"
 }
 
@@ -1865,9 +1871,18 @@ assert_eq "# guard|no|baseline-ok" "$got" "intact hooks at the current version s
 got="$(run_integrity_case 0.6.0 0.6.0 nobaseline)"
 assert_eq "# guard|yes|baseline-ok" "$got" "no baseline: reinstall once and record one" \
   "missing baseline not recorded ($got)"
-got="$(run_integrity_case 0.6.1 0.6.0 tamper)"
+integrity_log="$(mktemp)"
+got="$(INTEGRITY_LOG_OUT="$integrity_log" run_integrity_case 0.6.1 0.6.0 tamper)"
 assert_eq "import sys|no|baseline-bad" "$got" "an installed build newer than the release is never downgraded" \
   "repair downgraded a newer install ($got)"
+# The manager kicks a run for drifted hooks; it must say why nothing changed
+# (rollup XERK-1584 #81).
+if grep -q "newer than release 0.6.0: not downgrading" "$integrity_log"; then
+  pass "a newer install with drifted hooks logs why it is not repaired"
+else
+  fail "no log line explains the unrepaired newer install: $(cat "$integrity_log")"
+fi
+rm -f "$integrity_log"
 for m in fifo devzero plant basedir; do
   got="$(timeout 120 bash -c "$(declare -f run_integrity_case new_gh_dir add_unified_release make_tarball install_fake_restart install_fake_gh); SCRIPT='$SCRIPT'; run_integrity_case 0.6.0 0.6.0 $m")"
   assert_eq "# guard|yes|baseline-ok" "$got" "$m: repaired by one reinstall, without hanging" \
