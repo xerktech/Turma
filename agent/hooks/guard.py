@@ -9316,6 +9316,31 @@ def _stage_may_read_stdin(stage: str, vals: dict[str, list[str]],
     return False
 
 
+# The per-decision reading flags `_budgeted` resets (one-element lists).
+_DECISION_FLAGS = (_VALUES_DIFFER, _CHAIN_DIFFERS, _ORDER_DIFFERS, _VALUES_TAINT_N, _VALUES_MOST,
+                   _VALUES_ASSIGNED, _BRACE_OTHER_SEEN, _MAIN_PARSE_SEEN, _BRACE_QUOTED_SEEN,
+                   _READINGS_SEEN, _PRINTED_DROP_SEEN, _READINGS_MOST, _PWD_SEEN)
+
+
+def _pipes_into_stdin_shell(raw_commands: str) -> bool:
+    """Whether a stage of the line reads its stdin as a script, on its words.
+    No per-stage word filter: `| s\\h` and `| 's'h` hold no literal `sh` (QA).
+    Only a stage holding a brace is name-read (`| {,env} sh`). Never cached on
+    the text alone: the answer depends on the reading mode (`_reading()`), and a
+    text-keyed cache let the first mode's answer stand for every reading (QA).
+
+    The readings' SEEN flags it sets are put back: `_BRACE_OTHER_SEEN` raised by
+    this one scan made the rest of the decision add brace readings to every
+    word, doubling long real lines that it then allowed (QA)."""
+    seen = [(flag, flag[0]) for flag in _DECISION_FLAGS]
+    try:
+        return any(_reads_stdin_grouped(t) for st in _split_segments(raw_commands)
+                   for t in (_name_readings(st) if "{" in st else (st,)))
+    finally:
+        for flag, value in seen:
+            flag[0] = value
+
+
 def _line_feeds_shell(raw_commands: str) -> bool:
     """Whether any command on a heredoc-free line may read its stdin as a
     script: `_heredoc_owner_feeds_shell`'s ``commands_feed_shell``."""
@@ -11454,6 +11479,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # line that writes text and runs ANY file it cannot pin to a written path
     # reads every written file it has not read (XERK-1674).
     unnamed = written != {} and bool(_RUNS_UNNAMED_RE.search(raw_commands))
+    # ...and a pipe stage the regex can't name: a wrapper's options or an escaped
+    # name before the shell (`| env -i sh`, `| env -- sh`, `| s\\h`), read on its
+    # words as a heredoc's reader is (rollup XERK-1701).
+    if not unnamed and written != {} and "|" in raw_commands:
+        unnamed = _pipes_into_stdin_shell(raw_commands)
     if written is None and (unnamed or _C_OR_EVAL_RE.search(raw_commands)):
         written = _written_scripts(
             _split_on_operators(command, include_pipe=False, groups=True), heredocs)

@@ -68,6 +68,13 @@ paths:
     - toybox keeps a leading `-` (no applet runs); stripping it there too over-denies, safely.
     - `_CMD_START` takes one as a wrapper word, so `cat a.sh | busybox sh` is a stdin shell
       for the write-then-run rule (was allowed on main). Rollup XERK-1701.
+    - A pipe stage the regex can't name (`| env -i sh`, `| env -- sh`, `| b\usybox sh`,
+      `| {,env} sh`) is read on its words by `_reads_stdin_grouped`, over `_name_readings`, when
+      the line writes a file. Not in `_CMD_START`: wrapper options there re-open XERK-1866.
+    - `_pipes_into_stdin_shell` puts back the readings' SEEN flags: its name readings raised
+      `_BRACE_OTHER_SEEN`, and the rest of the decision then doubled (QA). It is NOT cached on
+      the text: the answer depends on `_reading()`, and a text key hid `| env -i sh` (QA).
+      No per-stage word filter: `| s\h` holds no literal `sh`.
     - `_MULTICALL_WORD` is anchored by a lookbehind: unanchored, every `-busybox` in one long
       word started a match, quadratic (1 MB: 945s, past the hook timeout, which runs it).
       Test: `test_multicall_names_scan_linearly`.
