@@ -2969,6 +2969,18 @@ test("buildItems: a framing tag inside an operator's code fence is their text (r
   assert.equal(byId.p.text, "```\n<system-reminder>\nlog");
   // Outside the (closed) fence a tag line is framing again.
   assert.equal(byId.t.text, "```\n<system-reminder>\n```\nafter");
+  const strip = (text) => buildItems([{ id: "z", role: "user", blocks: [{ t: "text", text }] }])[0].text;
+  // Only a matched pair is paste framing: a lone open tag inside a fence is text.
+  assert.equal(strip('a\n```\n<pasted_content id="q">\nb\n```\nc'), 'a\n```\n<pasted_content id="q">\nb\n```\nc');
+  // A ```` fence is not closed by an inner ```, and ~~~ opens nothing.
+  assert.equal(strip("a\n````\n```\n<system-reminder>\n````\nc"), "a\n````\n```\n<system-reminder>\n````\nc");
+  assert.equal(strip("a\n~~~\n<system-reminder>\n~~~\nc"), "a\n~~~\n~~~\nc");
+  // A lone U+FEFF line is not blank, so a tag before it is not the last line.
+  assert.equal(strip("a\n```\n<system-reminder>\n\ufeff"), "a\n```\n<system-reminder>\n\ufeff");
+  // The last non-blank line goes when it is a tag, even inside an unclosed fence.
+  assert.equal(strip("a\n```\nb\n<system-reminder>\n"), "a\n```\nb");
+  // A fence line with a Unicode space before it opens nothing, as on Android.
+  assert.equal(strip("i\n\u00a0```\n<system-reminder>\nb\n```\ne"), "i\n\u00a0```\nb\n```\ne");
   // Claude Code's own matched paste framing goes even inside the operator's fence.
   assert.equal(byId.i.text, "look at this log:\n```\n\n\nE1 boom\nE2 boom\n\n```\nwhy does it fail?");
 });

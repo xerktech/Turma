@@ -433,6 +433,16 @@ class ChatItemsTest {
             stripFraming("<pasted_content id=\"p\">\n```\n<system-reminder>\nlog\n</pasted_content id=\"p\">\n"))
         assertEquals("```\n<system-reminder>\n```\nafter",
             stripFraming("```\n<system-reminder>\n```\nafter\n<system-reminder>"))
+        // Each rule, in step with chat.test.js (QA mutants).
+        assertEquals("a\n```\n<pasted_content id=\"q\">\nb\n```\nc",
+            stripFraming("a\n```\n<pasted_content id=\"q\">\nb\n```\nc"))
+        assertEquals("a\n````\n```\n<system-reminder>\n````\nc",
+            stripFraming("a\n````\n```\n<system-reminder>\n````\nc"))
+        assertEquals("a\n~~~\n~~~\nc", stripFraming("a\n~~~\n<system-reminder>\n~~~\nc"))
+        assertEquals("a\n```\n<system-reminder>\n\uFEFF", stripFraming("a\n```\n<system-reminder>\n\uFEFF"))
+        assertEquals("a\n```\nb", stripFraming("a\n```\nb\n<system-reminder>\n"))
+        // A fence line with a Unicode space before it opens nothing, on both platforms.
+        assertEquals("i\n\u00A0```\nb\n```\ne", stripFraming("i\n\u00A0```\n<system-reminder>\nb\n```\ne"))
         // Claude Code's matched paste framing goes even inside the operator's fence (QA).
         assertEquals("look at this log:\n```\n\n\nE1 boom\nE2 boom\n\n```\nwhy does it fail?",
             stripFraming("look at this log:\n```\n\n\n<pasted_content id=\"6550\">\nE1 boom\nE2 boom\n" +
