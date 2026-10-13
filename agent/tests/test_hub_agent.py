@@ -23221,10 +23221,20 @@ class TestResolveSubagent(unittest.TestCase):
         result = {"type": "user", "message": {"content": [
             {"type": "tool_result", "tool_use_id": "toolu_bare", "content": [
                 {"type": "text", "text": "agentId: bare1 (internal)"}]}]}}
+        # An even older LABELLED launch: the fallback must still pick the newest.
+        oldest = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_old0", "name": "Agent",
+             "input": {"description": "Older task", "prompt": "go"}}]}}
+        oldest_result = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_old0", "content": [
+                {"type": "text", "text": "agentId: old0 (internal)"}]}]}}
+        with open(os.path.join(self.tmp, "main", "subagents", "agent-old0.jsonl"), "w") as f:
+            f.write("{}\n")
         with open(main) as f:
             newer = f.read()
         with open(main, "w") as f:
-            f.write(json.dumps(older) + "\n" + json.dumps(result) + "\n" + newer)
+            f.write(json.dumps(oldest) + "\n" + json.dumps(oldest_result) + "\n"
+                    + json.dumps(older) + "\n" + json.dumps(result) + "\n" + newer)
         bare = os.path.join(self.tmp, "main", "subagents", "agent-bare1.jsonl")
         with open(bare, "w") as f:
             f.write("{}\n")
@@ -23412,6 +23422,11 @@ class TestResolveWorkflowRun(unittest.TestCase):
         mine = self._run_dir("wf_old111")
         self._run_dir("wf_new222")
         self.assertEqual(ha._resolve_workflow_run(self.main, ""), mine)
+        # With no nameless run on disk, the newest named one still answers the row.
+        shutil.rmtree(mine)
+        self._write_main(self._launch("old", "wf_old000"), nameless, self._launch("build", "wf_new222"))
+        self._run_dir("wf_old000")
+        self.assertEqual(ha._resolve_workflow_run(self.main, ""), self._run_dir("wf_new222"))
 
     def test_newest_matching_launch_wins(self):
         self._write_main(self._launch("nightly", "wf_old111"),
