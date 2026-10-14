@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createInitialState, newSessionState, type AppState } from "./app.ts";
 import { DISPLAY_LINES, LINE_WIDTH_PX, render, sessionContentLines, sessionTranscriptArea, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
 import { setGlyphCoverage } from "./font.ts";
-import { charMeasure, setDefaultMeasure, wrapText, type Measure } from "./text-wrap.ts";
+import { charMeasure, measureDefault, setDefaultMeasure, wrapText, type Measure } from "./text-wrap.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
 const NOW = 1_700_000_000_000;
@@ -200,7 +200,9 @@ describe("render: home", () => {
     const lines = asLines(render(base({ agents: [agent({ sessions })], home: { cursor: 1 } })));
     labels.forEach((label, i) => {
       const row = lines[2 + i] ?? "";
-      expect(wrapText(row, LINE_WIDTH_PX)).toHaveLength(1);
+      // Measured, not wrapText: wrapText never splits a spaceless word, so it
+      // can't see a row a few px too wide.
+      expect(measureDefault(row)).toBeLessThanOrEqual(LINE_WIDTH_PX);
       expect(row.endsWith("…")).toBe(true);
       // The name itself is shown, not just "<glyph> …".
       expect(row).toContain(label.replace(/\s+/g, " ").slice(0, 10));
