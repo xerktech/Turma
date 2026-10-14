@@ -178,12 +178,17 @@ class ProseTest {
 
     @Test fun `a URL's dot run, a bracket run and a backtick run parse in linear time`() {
         // Rollup XERK-1701: each was quadratic (a URL + 64k dots took ~46 s here).
-        // The old code took minutes at this size: a 10 s wall bound can't flake.
+        // The quadratic forms took tens of seconds at these sizes: a 10 s wall bound can't flake.
         val t = System.nanoTime()
         parseProse("http://" + ".".repeat(200_000) + "x")
         parseProse("[".repeat(200_000) + "x")
-        parseProse("x``" + " `".repeat(100_000))
+        parseProse("x``" + " `".repeat(1_000_000))
+        parseProse("`a` ".repeat(1_000_000))
         assertTrue("took too long", (System.nanoTime() - t) / 1_000_000 < 10_000)
+        // Curly quotes peel out of a bare URL too, as on the web.
+        val link = parseProse("see https://x.io/a’”.").flatMap { (it as? ProseBlock.Paragraph)?.spans.orEmpty() }
+            .filterIsInstance<Span.Link>().single()
+        assertEquals("https://x.io/a", link.url)
     }
 
     @Test fun `code body is not linkified`() {

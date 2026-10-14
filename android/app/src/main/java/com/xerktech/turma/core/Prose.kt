@@ -233,17 +233,19 @@ private fun parseInline(text: String): List<Span> {
     if (!text.contains('`')) return parseEmph(text)
     val out = ArrayList<Span>()
     var i = 0
+    // The current line's end, cached across openers (as chat.js renderInline): a
+    // per-opener scan was quadratic on one long line of spans. MAX once none is left.
+    var eol = -1
     while (i < text.length) {
         val open = text.indexOf('`', i)
         if (open < 0) { out.addAll(parseEmph(text.substring(i))); break }
         val n = runLen(text, open)
         var j = open + n
         var close = -1
-        // The line's end, found once: substring-per-backtick was quadratic (as chat.js).
-        val eol = text.indexOf('\n', open + n)
+        if (eol < open + n) { val k = text.indexOf('\n', open + n); eol = if (k < 0) Int.MAX_VALUE else k }
         while (j < text.length) {
             val c = text.indexOf('`', j)
-            if (c < 0 || (eol >= 0 && eol < c)) break
+            if (c < 0 || eol < c) break
             val m = runLen(text, c)
             if (m == n) { close = c; break }
             j = c + m

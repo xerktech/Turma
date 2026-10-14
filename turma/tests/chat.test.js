@@ -2018,9 +2018,11 @@ test("renderProse: a URL's dot run, a [ run and a backtick run render in linear 
   const t = process.cpuUsage();  // CPU time, not wall: a loaded runner must not flake it
   renderProse("http://" + ".".repeat(200000) + "x");
   renderProse("[".repeat(200000) + "x");
-  renderProse("x``" + " `".repeat(100000));
+  renderProse("x``" + " `".repeat(1000000));
+  renderProse("`a` ".repeat(500000));
+  renderProse("![".repeat(200000) + "x");
   const used = process.cpuUsage(t);
-  assert.ok((used.user + used.system) / 1000 < 1000, "took too long");
+  assert.ok((used.user + used.system) / 1000 < 1500, "took too long");
   // Behaviour kept: trailing punctuation still peels out of a bare URL...
   assert.match(renderProse("see https://x.io/a."), /href="https:\/\/x\.io\/a"[^>]*>https:\/\/x\.io\/a<\/a>\./);
   // ...a code span still stops at a line break...

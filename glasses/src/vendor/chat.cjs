@@ -372,17 +372,20 @@
     const s = normalizeEol(String(text == null ? "" : text));
     if (s.indexOf("`") < 0) return renderEmph(s); // no backtick → nothing to lift out
     let out = "", i = 0;
+    // The current line's end, cached across openers and re-found only once an
+    // opener is past it: per-opener (or per-backtick) scans were quadratic on one
+    // long line of spans (rollup XERK-1701). Infinity once no newline is left.
+    let eol = -1;
     while (i < s.length) {
       const open = s.indexOf("`", i);
       if (open < 0) { out += renderEmph(s.slice(i)); break; }
       const n = runLen(s, open);
       // Scan for a closing run of the same length, bailing at a line break.
       let j = open + n, close = -1;
-      // The line's end, found once: slicing from `open` per backtick was quadratic.
-      const eol = s.indexOf("\n", open + n);
+      if (eol < open + n) { const k = s.indexOf("\n", open + n); eol = k < 0 ? Infinity : k; }
       while (j < s.length) {
         const c = s.indexOf("`", j);
-        if (c < 0 || (eol >= 0 && eol < c)) break;
+        if (c < 0 || eol < c) break;
         const m = runLen(s, c);
         if (m === n) { close = c; break; }
         j = c + m;
