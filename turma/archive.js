@@ -455,7 +455,7 @@ function mirrorEntry(e) {
 }
 // What the mirror re-sends to REFILL a transcript whose queued write it had to drop
 // (XERK-1834): the full current session row and every entry the local `.jsonl`
-// holds. The local file is complete for what this replica ingested, so a wholesale
+// holds, first copies only. The local file is complete for what this replica ingested, so a wholesale
 // replace from it closes any seq gap. null when there is no filed row or the file
 // can't be read — never an empty list from a missing file, which would wipe the
 // of-record's entries for a copy that just isn't here.
@@ -463,7 +463,11 @@ function mirrorRefillOf(transcriptId) {
   const row = idxGetSession(transcriptId);
   if (!row || !row.filePath) return null;
   let raw;
-  try { raw = fs.readFileSync(filePaths(row.filePath).jsonl, "utf8"); } catch { return null; }
+  // The FIRST copy of each line, as dedupArchive leaves the file and the msgCount counts
+  // it: a duplicate line not yet repaired would otherwise land in Postgres as an extra
+  // row, which the reconcile's behind guard (maxSeq >= msgCount) then never corrects.
+  try { raw = dedupLines(fs.readFileSync(filePaths(row.filePath).jsonl)).out.toString("utf8"); }
+  catch { return null; }
   return { row: mirrorRow(row), entries: parseEntries(raw).map(mirrorEntry) };
 }
 // Mirror newly-appended entries at ordinals [startSeq, startSeq+n). `list` is the

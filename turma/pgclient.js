@@ -499,6 +499,8 @@ function buildUpsertGreatest({ table, keys, values, greatest = [] }) {
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 15000;
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
+// Bind's parameter count is an Int16 (`ByteWriter.int16` writes it signed).
+const MAX_BIND_PARAMS = 32767;
 
 class PgConnection {
   constructor(cfg) {
@@ -781,6 +783,27 @@ class PgConnection {
         reject(new Error("postgres connection already has a query in flight"));
         return;
       }
+      // Encode BEFORE claiming the connection: a statement that cannot be encoded (more
+      // bind parameters than Bind's int16 count holds) is refused cleanly, never thrown
+      // with `_q` set — that left the connection "in flight" until the query timeout.
+      if (!Array.isArray(params) || params.length > MAX_BIND_PARAMS) {
+        reject(new Error(`postgres query has ${Array.isArray(params) ? params.length : "non-array"} ` +
+          `bind parameters (max ${MAX_BIND_PARAMS})`));
+        return;
+      }
+      let batch;
+      try {
+        batch = Buffer.concat([
+          encodeParse(sql),
+          encodeBind(params),
+          encodeDescribe("P"),
+          encodeExecute(),
+          encodeSync(),
+        ]);
+      } catch (e) {
+        reject(e);
+        return;
+      }
       const timer = setTimeout(() => {
         // A timed-out query poisons the connection (we can't tell where in the
         // reply stream we are), so we fail it AND tear the socket down — the pool
@@ -793,13 +816,6 @@ class PgConnection {
       }, timeoutMs);
       timer.unref?.();
       this._q = { resolve, reject, fields: null, rows: [], command: null, rowCount: null, timer, error: null };
-      const batch = Buffer.concat([
-        encodeParse(sql),
-        encodeBind(params),
-        encodeDescribe("P"),
-        encodeExecute(),
-        encodeSync(),
-      ]);
       this._write(batch);
     });
   }
@@ -1149,6 +1165,7 @@ module.exports = {
   encodeQuery,
   encodeParse,
   encodeBind,
+  MAX_BIND_PARAMS,
   encodeDescribe,
   encodeExecute,
   encodeSync,

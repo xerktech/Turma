@@ -639,6 +639,25 @@ test("live: idle connections the server closed never wedge the pool", async () =
   }
 });
 
+test("live: too many bind parameters is refused cleanly and leaves the connection usable", async () => {
+  const fake = await startFakePg();
+  // A long query timeout: a wedged connection would hang the next query, not fail fast.
+  const pool = poolFor(fake, { max: 1, queryTimeoutMs: 10000 });
+  try {
+    await pool.query("SELECT $1", ["warm"]);
+    const many = Array.from({ length: 40000 }, (_, i) => String(i));
+    const refused = await settleWithin(pool.query("SELECT 1", many), 2000);
+    assert.ok(refused.rejected, "refused, not sent");
+    const after = await settleWithin(pool.query("SELECT $1", ["ok"]), 2000);
+    assert.ok(after.resolved, `the connection still serves a query (${JSON.stringify(after)})`);
+    assert.equal(after.resolved[0].p0, "ok");
+    assert.equal(fake.connectionCount, 1, "the same connection, not a replacement");
+  } finally {
+    pool.close();
+    await fake.close();
+  }
+});
+
 test("live: a query that never gets a reply times out and poisons its connection", async () => {
   const fake = await startFakePg({ hangOnQuery: true });
   const pool = poolFor(fake, { queryTimeoutMs: 250 });

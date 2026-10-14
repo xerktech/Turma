@@ -10,11 +10,17 @@ paths:
 # The archive index mirror's refill (XERK-1834)
 
 `IndexMirror` (server.js) drains archive index writes to Postgres under HA. Its queue is bounded
-(`INDEX_MIRROR_QUEUE_MAX`, drop-oldest). The rest of the mirror: `turma-ha-archive.md`.
+(`INDEX_MIRROR_QUEUE_MAX`). The rest of the mirror: `turma-ha-archive.md`.
+
+- **Overflow drops the oldest op that is NOT a reconcile refill**; a queue of nothing but refills
+  drops the incoming op. Dropping the head refill sent it to the owed set, which drains only on an
+  empty queue and so starved under the backlog the head placement exists for (QA).
 
 - **A dropped op does NOT self-heal on the next write.** Appends land at their own seqs, so a
   dropped append left a permanent seq hole in Postgres. A dropped (or retry-exhausted) op owes its
   transcript a REFILL: row + a replace of every entry in the local `.jsonl` (`archive.mirrorRefillOf`).
+  - **First copies only** (`dedupLines`), as msgCount counts them: an unrepaired duplicate line
+    sent as an extra row put maxSeq past msgCount, where the reconcile's behind guard never fixes it.
   - Not for a dropped `remove`, nor the duplicate `repair` (XERK-1450: its sidecar stays pending).
 - **A refill runs only on an EMPTY queue** and reads the file when APPLIED, so every op queued
   before it has landed and a retry never replaces with a stale snapshot.
@@ -32,8 +38,9 @@ paths:
 - **An unreadable or missing file is skipped**, never replaced with empty (that would wipe the
   of-record for a copy that just isn't here).
 - **Mirrored rows and entries drop NUL** (`mirrorRow`/`mirrorEntry`): Postgres refuses it in text.
-- The owed set is capped at the queue size, a refill dropped at a deposition is not re-owed, and a
-  skipped gated replace is not owed at all. The periodic reconcile below closes all three.
+- The owed set is capped at the queue size (an exhausted refill re-owed included), a refill dropped
+  at a deposition is not re-owed, and a skipped gated replace is not owed at all. The periodic
+  reconcile below closes all three.
 
 ## The periodic reconcile (XERK-1701)
 
@@ -42,6 +49,10 @@ paths:
 - **Bounded per tick:** `INDEX_RECONCILE_BATCH` ids per Postgres round trip
   (`PgIndexStore.transcriptCounts`), until `INDEX_RECONCILE_BUDGET_MS`, resuming from a cursor
   over the sorted local ids. Single-flight; skipped mid-hydrate.
+  - The batch is clamped to 10000: it is bound as one statement's parameters (int16 count).
+  - **At most one batch of refills queued at once** (earlier ticks' included), so the queue
+    overshoots `INDEX_MIRROR_QUEUE_MAX` by one batch at most; the cursor stops before the first id
+    with no room. Uncapped, one tick queued every damaged id it compared.
 - **Leader only, under ONE term**, re-checked after every round trip; each refill it queues carries
   that term, so the drain drops it once this replica is deposed.
 - Compares Postgres (row msg_count, entry rows n, max seq) against the LOCAL msgCount — no file read.
@@ -50,6 +61,9 @@ paths:
     otherwise it is an append still in flight, not damage.
   - **Never when the local copy is behind** (maxSeq >= local msgCount): another leader appended past
     it, and the refill's replace would trim their rows.
+  - **Not again when Postgres holds exactly what its last refill sent** and the local msgCount has
+    not moved (`_refilled`, bounded like the owed set). A torn final line counts in msgCount but
+    parses to no entry, so that transcript otherwise looked short and was re-sent every tick.
 - **Its refill goes to the queue HEAD**, not the owed set: a refill waiting for an empty queue
   starves under sustained overflow. Safe out of order because it reads the file when applied, and
   ops behind it for that id re-write rows it already sent (appends are DO NOTHING).

@@ -578,3 +578,241 @@ test("reconcile: a seq hole heals even while the transcript still has writes que
     assert.deepEqual(seqs(store, "t"), ["0:n0", "1:n1", "2:n2", "3:a3"]);
   } finally { teardown(); }
 });
+
+// ---- reconcile QA fixes (XERK-1701) ------------------------------------------
+
+const jsonlOf = (id) => path.join(process.env.ARCHIVE_DIR, archive.sessionRow(id).filePath);
+const tick = (ms = 5) => new Promise((r) => setTimeout(r, ms));
+
+test("reconcile: a full queue drops the oldest PLAIN op, never the reconcile's head refill", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0"), ent("n1", "n1"), ent("n2", "n2")]);
+    await settle(mirror);
+    store.entries.get("t").delete(1);                          // a hole
+    store.hold();
+    mirror.sink().session({ transcriptId: "other" });          // in flight, blocked
+    for (const id of ["f0", "f1", "f2"]) mirror.sink().session({ transcriptId: id }); // full (3)
+    assert.equal(await mirror.reconcile(), 1);
+    assert.equal(mirror._q[0].t, "refill");
+    mirror.sink().session({ transcriptId: "late" });           // overflows
+    assert.equal(mirror._q[0].t, "refill", "the refill survives the overflow");
+    assert.equal(mirror._q[0].transcriptId, "t");
+    assert.deepEqual(mirror._q.slice(1).map((o) => o.row.transcriptId), ["f1", "f2", "late"]);
+    assert.ok(!mirror._refill.has("t"), "not pushed back into the owed set");
+    assert.ok(mirror._refill.has("f0"), "the dropped plain op is owed instead");
+    store.release();
+    await settle(mirror);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "1:n1", "2:n2"]);
+  } finally { teardown(); }
+});
+
+test("reconcile: a queue of nothing but refills drops the incoming plain op", async () => {
+  const { store, mirror } = setup();
+  try {
+    store.hold();
+    mirror.sink().session({ transcriptId: "other" });          // in flight, blocked
+    for (const id of ["r0", "r1", "r2"]) mirror._q.push({ t: "refill", transcriptId: id, term });
+    mirror.sink().session({ transcriptId: "late" });
+    assert.deepEqual(mirror._q.map((o) => o.t), ["refill", "refill", "refill"]);
+    assert.ok(mirror._refill.has("late"));
+    store.release();
+    await settle(mirror);
+  } finally { teardown(); }
+});
+
+test("an exhausted refill is owed only within the owed-set cap", () => {
+  const { mirror } = setup();
+  try {
+    for (const id of ["a", "b", "c"]) mirror._lost({ t: "entries", transcriptId: id });
+    mirror._lost({ t: "refill", transcriptId: "d", term });
+    assert.equal(mirror._refill.size, 3);
+    assert.ok(!mirror._refill.has("d"));
+  } finally { teardown(); }
+});
+
+test("reconcile: a torn final line (msgCount above the parsed entries) is re-sent once, not every tick", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0"), ent("n1", "n1"), ent("n2", "n2")]);
+    await settle(mirror);
+    fs.appendFileSync(jsonlOf("t"), '{"uuid":"tor\n');         // a crash mid-append
+    archive.reconcileHydratedCursors();                         // counts lines: 4
+    assert.equal(archive.sessionRow("t").msgCount, 4);
+    store.entries.get("t").delete(1);
+    assert.equal(await mirror.reconcile(), 1);
+    await settle(mirror);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "1:n1", "2:n2"]);
+    const replaces = store.log.filter((l) => l.startsWith("replace:t")).length;
+    assert.equal(await mirror.reconcile(), 0, "Postgres holds what the file parses to");
+    assert.equal(await mirror.reconcile(), 0);
+    assert.equal(store.log.filter((l) => l.startsWith("replace:t")).length, replaces);
+    // New damage is still healed.
+    store.entries.get("t").delete(0);
+    assert.equal(await mirror.reconcile(), 1);
+    await settle(mirror);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "1:n1", "2:n2"]);
+  } finally { teardown(); }
+});
+
+test("reconcile: queues at most one batch of refills, the rest resume next tick", async () => {
+  const { store, mirror } = setup();
+  try {
+    for (const id of ["a", "b", "c"]) { off = 0; push(id, [ent(`${id}0`, `${id}0`)]); }
+    await settle(mirror);
+    for (const id of ["a", "b", "c"]) store.entries.delete(id);
+    store.hold();                                               // nothing drains
+    assert.equal(await mirror.reconcile({ batch: 2, budgetMs: 5000 }), 2);
+    assert.equal(mirror._reconcileCursor, "b", "stopped before c");
+    assert.equal(await mirror.reconcile({ batch: 2, budgetMs: 5000 }), 0,
+      "a batch of refills is still waiting: no more");
+    store.release();
+    await settle(mirror);
+    assert.equal(await mirror.reconcile({ batch: 2, budgetMs: 5000 }), 1, "c, next tick");
+    await settle(mirror);
+    for (const id of ["a", "b", "c"]) assert.deepEqual(seqs(store, id), [`0:${id}0`]);
+  } finally { teardown(); }
+});
+
+test("reconcile: a batch is clamped to what one Postgres statement can bind", async () => {
+  const { mirror } = setup();
+  const orig = archive.reconcileCandidates;
+  const limits = [];
+  archive.reconcileCandidates = (after, limit) => { limits.push(limit); return []; };
+  try {
+    await mirror.reconcile({ batch: 50000, budgetMs: 50 });
+    assert.ok(limits.length && limits.every((l) => l <= 10000), `limits ${limits}`);
+  } finally { archive.reconcileCandidates = orig; teardown(); }
+});
+
+test("reconcile: a refill re-sends first copies only (an unrepaired duplicate line)", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0"), ent("n1", "n1"), ent("n2", "n2")]);
+    await settle(mirror);
+    const lines = fs.readFileSync(jsonlOf("t"), "utf8").split("\n");
+    fs.writeFileSync(jsonlOf("t"), [lines[0], ...lines].join("\n"));
+    assert.equal(archive.mirrorRefillOf("t").entries.length, 3);
+    store.entries.get("t").delete(2);
+    assert.equal(await mirror.reconcile(), 1);
+    await settle(mirror);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "1:n1", "2:n2"]);
+  } finally { teardown(); }
+});
+
+test("reconcile: deposed or re-termed during a Postgres round trip, it queues nothing", async () => {
+  for (const flip of [() => { leading = false; }, () => { term++; }]) {
+    const { store, mirror } = setup();
+    try {
+      push("t", [ent("n0", "n0"), ent("n1", "n1"), ent("n2", "n2")]);
+      await settle(mirror);
+      store.entries.get("t").delete(1);
+      store.countDelay = 30;
+      const r = mirror.reconcile();
+      await tick();
+      flip();
+      assert.equal(await r, 0);
+      assert.ok(!mirror._q.some((o) => o.t === "refill"));
+    } finally { teardown(); }
+  }
+});
+
+test("reconcile: skipped while the index hydrates, before or during a round trip", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0"), ent("n1", "n1"), ent("n2", "n2")]);
+    await settle(mirror);
+    store.entries.get("t").delete(1);
+    archive.setHydrating(true);
+    assert.equal(await mirror.reconcile(), 0);
+    assert.equal(store.countCalls || 0, 0, "Postgres is not asked");
+    archive.setHydrating(false);
+    store.countDelay = 30;
+    const r = mirror.reconcile();
+    await tick();
+    archive.setHydrating(true);
+    assert.equal(await r, 0);
+    assert.ok(!mirror._q.some((o) => o.t === "refill"));
+  } finally { archive.setHydrating(false); teardown(); }
+});
+
+test("reconcile: single-flight, overlapping calls share one run", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0"), ent("n1", "n1"), ent("n2", "n2")]);
+    await settle(mirror);
+    store.entries.get("t").delete(1);
+    store.countDelay = 20;
+    const a = mirror.reconcile();
+    const b = mirror.reconcile();
+    assert.equal(a, b);
+    assert.equal(await a, 1);
+    assert.equal(store.countCalls, 1);
+    await settle(mirror);
+  } finally { teardown(); }
+});
+
+test("reconcile: an id already holding a queued refill is not queued again", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0"), ent("n1", "n1"), ent("n2", "n2")]);
+    await settle(mirror);
+    store.entries.get("t").delete(1);                          // a hole: always healed
+    store.hold();
+    mirror.sink().session({ transcriptId: "other" });          // in flight, blocked
+    mirror._q.push({ t: "refill", transcriptId: "t", term });
+    assert.equal(await mirror.reconcile(), 0);
+    assert.equal(mirror._q.filter((o) => o.t === "refill").length, 1);
+    store.release();
+    await settle(mirror);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "1:n1", "2:n2"]);
+  } finally { teardown(); }
+});
+
+test("reconcileCandidates leaves out a pending duplicate repair and a blocked download", async () => {
+  const { mirror } = setup();
+  const errOrig = console.error;
+  console.error = () => {};
+  try {
+    for (const id of ["d", "g", "u"]) { off = 0; push(id, [ent(`${id}0`, `${id}0`), ent(`${id}1`, `${id}1`)]); }
+    await settle(mirror);
+    const ids = () => archive.reconcileCandidates("", 10).map((r) => r.transcriptId);
+    assert.deepEqual(ids(), ["d", "g", "u"]);
+    // d: a duplicate line whose repair Postgres never confirms (this store has no setCounts).
+    const lines = fs.readFileSync(jsonlOf("d"), "utf8").split("\n");
+    fs.writeFileSync(jsonlOf("d"), [lines[0], ...lines].join("\n"));
+    await archive.dedupArchive({ publish: true });
+    await settle(mirror);
+    assert.deepEqual(ids(), ["g", "u"], "the repair owns d");
+    // g: its rendered download is blocked.
+    const gPath = jsonlOf("g");
+    archive.setRenderedGate((p) => p === gPath);
+    assert.deepEqual(ids(), ["u"]);
+  } finally { console.error = errOrig; archive.setRenderedGate(null); teardown(); }
+});
+
+test("reconcile: the timer exists only with HA on", () => {
+  const origSet = global.setInterval;
+  const origClear = global.clearInterval;
+  const made = [];
+  let cleared = 0;
+  global.setInterval = (fn, ms, ...a) => { const t = origSet(fn, ms, ...a); made.push({ ms, t }); return t; };
+  global.clearInterval = (t) => { cleared++; return origClear(t); };
+  const store = slowStore();
+  try {
+    hub.setIndexMirror(store, false);
+    assert.equal(made.length, 0, "HA off: no timer");
+    hub.setIndexMirror(store, true);
+    assert.equal(made.length, 1, "HA on: one timer");
+    assert.equal(made[0].t.hasRef(), false, "unref'd");
+    hub.setIndexMirror(store, false);
+    assert.equal(made.length, 1);
+    assert.ok(cleared >= 1, "turning HA off stops it");
+  } finally {
+    global.setInterval = origSet;
+    global.clearInterval = origClear;
+    hub.setIndexMirror(null, false);
+    for (const m of made) origClear(m.t);
+    archive.closeDb();
+  }
+});

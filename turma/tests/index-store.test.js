@@ -1318,6 +1318,26 @@ test("a file stamped checked under an older de-dup keying is re-checked (rollup 
   } finally { pgTeardown(); }
 });
 
+test("a CLEAN file re-checked under the current keying is stamped with it, so no later pass reads it", async () => {
+  pgSetup();
+  const orig = fs.readFileSync;
+  try {
+    const b = [ent("c0", "user", "first"), ent("c1", "assistant", "second")];
+    archive.ingestChunk("nas", "t-clean", META, 0, Buffer.byteLength(JSON.stringify(b)), b, "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-clean").filePath);
+    const meta = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    // Stamped checked by a pass before the keying was recorded.
+    fs.writeFileSync(jsonl + ".meta", JSON.stringify({ ...meta, dedupChecked: fs.statSync(jsonl).size }));
+    let reads = 0;
+    fs.readFileSync = function (p, ...a) { if (p === jsonl) reads++; return orig.call(this, p, ...a); };
+    assert.equal(await archive.dedupArchive({ publish: true }), 0);
+    assert.equal(reads, 1, "the old stamp is re-checked once");
+    reads = 0;
+    assert.equal(await archive.dedupArchive({ publish: true }), 0);
+    assert.equal(reads, 0, "the new stamp is trusted: not read again");
+  } finally { fs.readFileSync = orig; pgTeardown(); }
+});
+
 test("XERK-1450 pg mode: a lost Postgres repair stays pending and the next leader redoes it", async () => {
   const mem = pgSetup();
   try {
