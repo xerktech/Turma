@@ -1293,6 +1293,31 @@ test("a CRLF copy torn before a \\r still de-dups to a prefix of the repaired fi
   assert.equal(archive.dedupLines(Buffer.from('{"a":1}\u200b\n{"a":1}\n', "utf8")).dropped, 0);
 });
 
+test("a file stamped checked under an older de-dup keying is re-checked (rollup XERK-1701)", async () => {
+  const mem = pgSetup();
+  try {
+    const b = [ent("w0", "user", "first"), ent("w1", "assistant", "second")];
+    archive.ingestChunk("nas", "t-skew", META, 0, Buffer.byteLength(JSON.stringify(b)), b, "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-skew").filePath);
+    const once = fs.readFileSync(jsonl, "utf8");
+    const first = once.split("\n")[0];
+    // A re-sent copy of the first line that differs only by a trailing U+3000: the
+    // keying before blankTailStart kept both, and stamped the file checked.
+    fs.appendFileSync(jsonl, `${first}　\n`);
+    const size = fs.statSync(jsonl).size;
+    const meta = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    fs.writeFileSync(jsonl + ".meta", JSON.stringify({ ...meta, dedupChecked: size }));
+    assert.equal(await archive.dedupArchive({ publish: true }), 1, "the old stamp is not trusted");
+    assert.equal(fs.readFileSync(jsonl, "utf8"), once);
+    assert.equal(mem.sessions.get("t-skew").msgCount, 2);
+    // Re-stamped under the current keying: the next pass skips it (idempotent).
+    assert.equal(await archive.dedupArchive({ publish: true }), 0);
+    const stamp = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    assert.equal(stamp.dedupChecked, Buffer.byteLength(once));
+    assert.ok(stamp.dedupKeying >= 2);
+  } finally { pgTeardown(); }
+});
+
 test("XERK-1450 pg mode: a lost Postgres repair stays pending and the next leader redoes it", async () => {
   const mem = pgSetup();
   try {

@@ -2894,7 +2894,8 @@ function backfillPgIndexFromFiles() {
 // The sidecar carries `dedupPending` from before the file shrinks until the index
 // is re-seated — in pg mode, until Postgres confirms the repair op — so a crash or
 // a dropped mirror op is redone by the next publishing pass rather than skipped.
-// `dedupChecked` (the size a pass covered) lets later passes skip unchanged files.
+// `dedupChecked` (the size a pass covered) lets later passes skip unchanged files —
+// only when `dedupKeying` says the current keying made it.
 // The agent cursor (`bytesStored`) is untouched: it counts the agent's raw bytes,
 // not the lines we kept. Synchronous, like the other whole-store boot passes.
 // Returns the number of files rewritten or re-seated.
@@ -2925,6 +2926,12 @@ function blankTailStart(line) {
     return e;
   }
 }
+// The version of dedupLines' line keying a `dedupChecked` stamp was made under. A file
+// stamped by an older keying is re-checked once (rollup XERK-1701): keyed before
+// trailing Unicode blanks were, a pair differing only by one stayed under a stamp the
+// pass then skipped, while the first-copy readers counted it once. Bump it whenever
+// the keying changes what counts as a duplicate.
+const DEDUP_KEYING = 2;
 function dedupLines(buf) {
   const seen = new Set();
   const parts = [];
@@ -2982,14 +2989,14 @@ async function dedupPass(opts) {
     const redo = publish && !!meta.dedupPending;
     let size;
     try { size = fs.statSync(jsonl).size; } catch { continue; }
-    if (meta.dedupChecked === size && !redo) continue;
+    if (meta.dedupChecked === size && meta.dedupKeying === DEDUP_KEYING && !redo) continue;
     let buf;
     try { buf = fs.readFileSync(jsonl); } catch { continue; }
     const { out, dropped } = dedupLines(buf);
     if (!dropped && !redo) {
       // Only the publisher stamps: a local-only stamp would differ from the
       // bucket's sidecar and just be refetched over.
-      if (publish) writeSidecar(metaPath, { ...meta, dedupChecked: buf.length });
+      if (publish) writeSidecar(metaPath, { ...meta, dedupChecked: buf.length, dedupKeying: DEDUP_KEYING });
       continue;
     }
     if (dropped) {
@@ -3005,7 +3012,8 @@ async function dedupPass(opts) {
     const archiveBytes = out.length;
     const entries = heldEntries(jsonl).entries;
     const msgCount = entries.length;
-    const fixed = { ...meta, msgCount, archiveBytes, dedupChecked: archiveBytes, dedupPending: true };
+    const fixed = { ...meta, msgCount, archiveBytes, dedupChecked: archiveBytes,
+      dedupKeying: DEDUP_KEYING, dedupPending: true };
     if (!publish) { writeSidecar(metaPath, fixed, true); continue; }
     noteWrite(jsonl);
     const id = meta.transcriptId;
