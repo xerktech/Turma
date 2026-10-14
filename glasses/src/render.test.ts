@@ -187,6 +187,26 @@ describe("render: home", () => {
     expect(asLines(render(base({ agents, home: { cursor: 14 } })))).toContain("> Settings");
   });
 
+  // wrapText breaks only on whitespace, so clipping via its first line reduced a
+  // spaceless name (a slug, CJK) to just its status glyph — every row read "!…".
+  it("clips a spaceless or CJK row by character, keeping the readable start of the name", () => {
+    const labels = [
+      "very-long-label-number-0-that-definitely-wraps-past-the-glasses-canvas-width-and-then-some",
+      "A".repeat(96),
+      "这是一个非常长的会话标签名称它没有任何空格所以不能在空白处换行".repeat(3),
+      "first paragraph of a label\nsecond paragraph that would otherwise vanish entirely here ok",
+    ];
+    const sessions = labels.map((label, i) => session({ id: `s${i}`, label, session: signals({ transcriptAgeSec: 999 }) }));
+    const lines = asLines(render(base({ agents: [agent({ sessions })], home: { cursor: 1 } })));
+    labels.forEach((label, i) => {
+      const row = lines[2 + i] ?? "";
+      expect(wrapText(row, LINE_WIDTH_PX)).toHaveLength(1);
+      expect(row.endsWith("…")).toBe(true);
+      // The name itself is shown, not just "<glyph> …".
+      expect(row).toContain(label.replace(/\s+/g, " ").slice(0, 10));
+    });
+  });
+
   it("shows a flash message in place of the header", () => {
     const state = base({ flash: "hub unreachable", flashUntil: NOW + 1000 });
     expect(asLines(render(state))[0]).toBe("hub unreachable");

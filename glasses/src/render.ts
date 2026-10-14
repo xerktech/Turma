@@ -135,8 +135,29 @@ function findAgentLocal(state: AppState, hostKey: string): AgentInfo | undefined
 function markerLine(text: string, selected: boolean): string {
   const prefix = selected ? "> " : "  ";
   const width = LINE_WIDTH_PX - Math.max(measureDefault("> "), measureDefault("  "));
-  if (wrapCached(text, width).length <= 1) return prefix + text;
-  return `${prefix}${wrapCached(text, width - measureDefault("…"))[0] ?? ""}…`;
+  return prefix + clipToWidth(text, width);
+}
+
+// Clips by CHARACTER, not via wrapText: wrapText breaks only on whitespace, so
+// its first line of a spaceless name ("very-long-slug…", CJK) is just the
+// status glyph — every such row read as "!…". Newlines fold to spaces so a
+// multi-line label can't clip to its first paragraph. The scan is capped: a
+// row never shows more than a line's worth of characters anyway.
+const CLIP_SCAN_MAX = 200;
+function clipToWidth(text: string, width: number): string {
+  const flat = text.replace(/\s+/g, " ");
+  if (measureDefault(flat) <= width) return flat;
+  const chars = Array.from(flat).slice(0, CLIP_SCAN_MAX);
+  // Largest prefix that still fits with the ellipsis (binary search: the
+  // measure is monotone in prefix length).
+  let lo = 0;
+  let hi = chars.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (measureDefault(chars.slice(0, mid).join("") + "…") <= width) lo = mid;
+    else hi = mid - 1;
+  }
+  return chars.slice(0, lo).join("").trimEnd() + "…";
 }
 
 interface WindowResult<T> {
