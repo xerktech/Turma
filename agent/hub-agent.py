@@ -16665,7 +16665,7 @@ def _type_into_tmux_pane(tmux_name, text):
     """_type_into_pane's tmux half, run under that pane's lock."""
     buf = f"turma-input-{tmux_name}"      # per-pane, so two sessions can't race
     # The cap is judged on the text as TYPED (tabs as 4 spaces): judged before,
-    # 4000 tabs became 40 slices, each a tmux call, on the beat's resend path.
+    # 4000 tabs became 40 slices, each a tmux call.
     typed = text.replace("\t", "    ")
     sliced = len(typed) <= PASTE_SLICED_MAX_CHARS and not _SLICE_UNSAFE_RE.search(typed)
     if sliced:
@@ -30872,6 +30872,11 @@ class SessionManager:
                 log(f"resend queue past {INPUT_QUEUE_MAX}; dropped {over} oldest")
         self._input_wake.set()
 
+    def _resend_queued(self, sid, text):
+        """Is this message already waiting in `resend_queue`?"""
+        with self._input_lock:
+            return (sid, text) in self.resend_queue
+
     def _deliver_staged_resends(self):
         """Type the staged compaction resends (input worker). A message the
         session no longer holds on its outbox (delivered meanwhile, cleared by a
@@ -31272,8 +31277,11 @@ class SessionManager:
                         log(f"gave up re-sending a compaction-dropped message "
                             f"in session {sess['id']}")
                         continue
-                    if resent:
-                        keep.append(item)   # already re-sent one this beat
+                    if resent or self._resend_queued(sess["id"], text):
+                        # Already re-sent one this beat, or this one is still waiting
+                        # for the input worker: a second compaction must not queue
+                        # it twice. Judged again once the worker has typed it.
+                        keep.append(item)
                         continue
                     # Typed by the input worker, never here: a typed submit waits
                     # out its draw and submit deadlines, seconds on the beat.
@@ -31283,7 +31291,7 @@ class SessionManager:
                     item["at"] = now
                     resent = changed = True
                     keep.append(item)
-                    log(f"re-sent a message dropped by compaction in "
+                    log(f"queued a re-send of a message dropped by compaction in "
                         f"session {sess['id']}")
                     continue
                 if now - item.get("at", now) > PENDING_INPUT_TTL_SEC:
