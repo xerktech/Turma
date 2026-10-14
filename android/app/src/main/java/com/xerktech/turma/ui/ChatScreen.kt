@@ -864,7 +864,7 @@ private fun ChatFooter(
             // draft then routes to the answer, and stopping would destroy it.
             if (busy) {
                 IconButton(onClick = onStop) {
-                    Icon(Icons.Filled.Stop, "Stop turn", tint = com.xerktech.turma.ui.theme.TurmaColors.waiting)
+                    Icon(Icons.Filled.Stop, "Stop turn", tint = com.xerktech.turma.ui.theme.TurmaColors.waitingText())
                 }
             }
             // A message can be attachments alone, so Send lights up for either.
