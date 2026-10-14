@@ -173,7 +173,7 @@ fun resumablePicks(
 /** "💤 paused until 14:05 · reason" — web `pausedLabel` (index.html, sessions.html). */
 fun pausedLabel(p: com.xerktech.turma.model.PausedSleep, now: Long = System.currentTimeMillis()): String =
     "💤 paused until " + clockTime(p.wakeAt, now) +
-        p.wakeReason.trim().let { if (it.isNotEmpty()) " · $it" else "" }
+        jsTrim(p.wakeReason).let { if (it.isNotEmpty()) " · $it" else "" }
 
 private fun localMidnight(ms: Long): Long = java.util.Calendar.getInstance().apply {
     timeInMillis = ms
@@ -263,7 +263,7 @@ fun attentionLabel(att: Attention?): String? {
     // A review the classifier says needs a human TEST (XERK-1572) reads as one,
     // not as a bare "test" chip word — the web dashboard and Sessions headline.
     val word = if (chip == "test") "awaiting your test" else chip
-    return listOf(word, att.why.orEmpty()).filter { it.isNotBlank() }.joinToString(" · ")
+    return listOf(word, att.why.orEmpty()).filterNot(::isJsBlank).joinToString(" · ")
 }
 
 /** Does the hub say this session has STALLED on a background wait (XERK-1571)? */
@@ -288,7 +288,7 @@ fun hintKind(label: String): String = when (label) {
 fun attentionHintLine(att: Attention?): String {
     if (att == null || needsYouChip(att.state) == null) return ""
     val h = att.hint ?: return ""
-    if (h.why.isBlank()) return ""
+    if (isJsBlank(h.why)) return ""
     val kind = hintKind(h.label)
     return if (kind.isEmpty()) h.why else "$kind\u00A0·\u00A0${h.why}"
 }

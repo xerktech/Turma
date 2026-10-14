@@ -636,6 +636,38 @@ class SessionsTest {
             session = LiveSignals(question = " ", transcriptAgeSec = 1.0)), now, now))
     }
 
+    @Test fun `wait labels and whys trim JavaScript's whitespace, not Kotlin's`() {
+        // Rollup XERK-1701: JS trim() cuts U+FEFF and keeps U+001C..U+001F; Kotlin's
+        // trim()/isBlank() do the reverse. The web and hub use JS's, so a label of
+        // only those read as the shell count on one client and " · <char>" on the other.
+        val S = com.xerktech.turma.ui.CardTone.STALLED
+        val bom = "\uFEFF"; val fs = "\u001C"
+        assertEquals("⏳ waiting on 1 background shell",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, LiveSignals(agents = listOf(shell("wait-external", bom))), now))
+        assertEquals("⏳ waiting · $fs",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, LiveSignals(agents = listOf(shell("wait-external", fs))), now))
+        assertEquals("⏳ waiting · Watch CI\u001F", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING,
+            LiveSignals(agents = listOf(shell("wait-external", "${bom}Watch CI\u001F"))), now))
+        assertEquals(com.xerktech.turma.ui.CardState("stalled on 1 background shell", S),
+            card(waitingOn(shell("wait-external", bom), ageSec = 46 * 60.0)))
+        assertEquals(com.xerktech.turma.ui.CardState("stalled · \u001D", S),
+            card(waitingOn(shell("wait-external", "\u001D"), ageSec = 46 * 60.0)))
+        val wakeAt = now + 30 * 60_000L
+        assertEquals("💤 sleeping until ${clockTime(wakeAt, now)}", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING,
+            LiveSignals(paneBusy = false, transcriptAgeSec = 5.0, wakeAt = wakeAt, wakeReason = bom), now))
+        assertEquals("💤 paused until ${clockTime(wakeAt, now)} · $fs",
+            pausedLabel(com.xerktech.turma.model.PausedSleep(wakeAt = wakeAt, wakeReason = fs), now))
+        // The hub's why (JS-trimmed there) shows whenever it is non-empty, as the web's filter(Boolean).
+        assertEquals("stalled · \u001E", attentionLabel(att("needs-you:stalled", now, "\u001E")))
+        val done = SessionInfo(status = "running", session = LiveSignals(paneBusy = false, transcriptAgeSec = 1.0, lastRole = "assistant"))
+        assertEquals(com.xerktech.turma.ui.CardState("stalled · $fs", S),
+            card(done.copy(attention = att("needs-you:stalled", now, fs)), review = true))
+        val hinted = com.xerktech.turma.model.Attention(state = "needs-you:review", since = now,
+            hint = com.xerktech.turma.model.AttentionHint("unknown-label", fs))
+        assertEquals(fs, attentionHintLine(hinted))
+        assertEquals("", attentionHintLine(hinted.copy(hint = hinted.hint!!.copy(why = bom))))
+    }
+
     @Test fun `sessionCardState under Ready for review says why it qualified`() {
         val R = com.xerktech.turma.ui.CardTone.REVIEW
         val done = SessionInfo(status = "running", session = LiveSignals(paneBusy = false, transcriptAgeSec = 1.0, lastRole = "assistant"))
