@@ -154,7 +154,9 @@ class ChatModelSourceTest {
         // (and returning at once when it has already happened, since a
         // StateFlow replays its value) is deterministic where a 10s timed poll
         // reddened on a loaded runner.
-        hub.awaitFlow(hub.container.modelSwitches.of(host, session)) { it == null }
+        // 30 s, as the Compose tests' WAIT_MS: the default 10 s timed out once on a
+        // loaded android-ci runner (run 38102453547, rollup #56). A pass returns at once.
+        hub.awaitFlow(hub.container.modelSwitches.of(host, session), timeoutMs = 30_000) { it == null }
         vm.onLeave()
     }
 
