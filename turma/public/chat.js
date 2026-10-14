@@ -182,7 +182,10 @@
     const s = String(text == null ? "" : text);
     // Markdown image (http(s) or data:image/* src), a markdown link, OR a bare
     // http(s) URL — image tried first so its leading `!` isn't left as stray text.
-    const re = /!\[([^\]]*)\]\((https?:\/\/[^)\s]+|data:image\/[^)\s]+)\)|\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<]+)/g;
+    // A label never holds a `[` (rollup XERK-1701): with `[^\]]` every `[` of a long
+    // "[[[[…" run re-scanned the rest of the text, quadratic (2 s at 64k).
+    const TRAIL_CHARS = ".,;:!?'\"*_‘’“”";
+    const re = /!\[([^[\]]*)\]\((https?:\/\/[^)\s]+|data:image\/[^)\s]+)\)|\[([^[\]]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<]+)/g;
     let out = "", last = 0, m;
     while ((m = re.exec(s))) {
       out += esc(s.slice(last, m.index));
@@ -197,8 +200,11 @@
         // and a trailing ')' only when it isn't part of the URL (e.g. a URL
         // wrapped in parens) — keep it for balanced ones like /wiki/Foo_(bar).
         let url = m[5], trail = "";
-        const tp = /[.,;:!?'"*_‘’“”]+$/.exec(url);
-        if (tp) { trail = tp[0]; url = url.slice(0, -tp[0].length); }
+        // A backward scan, not /[…]+$/: that regex restarted at every dot of
+        // "http://" + 64k dots, quadratic (rollup XERK-1701).
+        let e = url.length;
+        while (e > 0 && TRAIL_CHARS.indexOf(url[e - 1]) >= 0) e--;
+        if (e < url.length) { trail = url.slice(e); url = url.slice(0, e); }
         if (url.endsWith(")") && !url.includes("(")) { trail = ")" + trail; url = url.slice(0, -1); }
         out += anchor(url, url) + esc(trail);
       }
@@ -366,15 +372,20 @@
     const s = normalizeEol(String(text == null ? "" : text));
     if (s.indexOf("`") < 0) return renderEmph(s); // no backtick → nothing to lift out
     let out = "", i = 0;
+    // The current line's end, cached across openers and re-found only once an
+    // opener is past it: per-opener (or per-backtick) scans were quadratic on one
+    // long line of spans (rollup XERK-1701). Infinity once no newline is left.
+    let eol = -1;
     while (i < s.length) {
       const open = s.indexOf("`", i);
       if (open < 0) { out += renderEmph(s.slice(i)); break; }
       const n = runLen(s, open);
       // Scan for a closing run of the same length, bailing at a line break.
       let j = open + n, close = -1;
+      if (eol < open + n) { const k = s.indexOf("\n", open + n); eol = k < 0 ? Infinity : k; }
       while (j < s.length) {
         const c = s.indexOf("`", j);
-        if (c < 0 || s.slice(open + n, c).indexOf("\n") >= 0) break;
+        if (c < 0 || eol < c) break;
         const m = runLen(s, c);
         if (m === n) { close = c; break; }
         j = c + m;

@@ -2013,6 +2013,26 @@ test("renderProse/stripFraming: a fence line full of blanks reads in linear time
   assert.match(renderProse("```js  \t\ncode\n```  "), /<code>code<\/code>/);
 });
 
+test("renderProse: a URL's dot run, a [ run and a backtick run render in linear time", () => {
+  // Rollup XERK-1701: each was quadratic (a URL + 64k dots took ~46 s on Android).
+  const t = process.cpuUsage();  // CPU time, not wall: a loaded runner must not flake it
+  renderProse("http://" + ".".repeat(200000) + "x");
+  renderProse("[".repeat(200000) + "x");
+  renderProse("x``" + " `".repeat(1000000));
+  renderProse("`a` ".repeat(500000));
+  renderProse("![".repeat(200000) + "x");
+  const used = process.cpuUsage(t);
+  assert.ok((used.user + used.system) / 1000 < 1500, "took too long");
+  // Behaviour kept: trailing punctuation still peels out of a bare URL...
+  assert.match(renderProse("see https://x.io/a."), /href="https:\/\/x\.io\/a"[^>]*>https:\/\/x\.io\/a<\/a>\./);
+  // ...a span on a later line of the paragraph still closes (the cached line end is re-found)...
+  assert.equal((renderProse("`a`\n`b`").match(/<code/g) || []).length, 2);
+  // ...a code span still stops at a line break...
+  assert.doesNotMatch(renderProse("a `b\nc` d"), /<code/);
+  // ...and a label holding `[` links only from its last `[`.
+  assert.match(renderProse("[a[b](https://x.io)"), /\[a<a [^>]*href="https:\/\/x\.io"[^>]*>b<\/a>/);
+});
+
 test("renderProse: a fenced block carries a copy button in a positioning wrapper (XERK-183)", () => {
   const html = renderProse("```\nplain\n```");
   // The wrapper is the positioning context; the button sits OUTSIDE the <pre>

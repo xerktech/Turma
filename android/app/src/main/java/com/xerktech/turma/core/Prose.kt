@@ -73,8 +73,10 @@ sealed interface ProseBlock {
 // is plain Text. Only http/https is linkified. For a bare URL, trailing sentence
 // punctuation / emphasis markers / typographic quotes are peeled back out, and a
 // trailing ')' is kept only when it balances an opening one (…/Foo_(bar)).
-private val LINK_RE = Regex("""\[([^\]]+)]\((https?://[^)\s]+)\)|(https?://[^\s<]+)""")
-private val TRAIL_RE = Regex("""[.,;:!?'"*_‘’“”]+$""")
+// A label never holds a `[`, as chat.js: `[^\]]` re-scanned the rest of a "[[[[…" run.
+private val LINK_RE = Regex("""\[([^\[\]]+)]\((https?://[^)\s]+)\)|(https?://[^\s<]+)""")
+// Peeled by a backward scan (as chat.js): `[…]+$` was quadratic on a long dot run.
+private const val TRAIL_CHARS = ".,;:!?'\"*_‘’“”"
 
 private fun linkify(text: String): List<Span> {
     if (text.isEmpty()) return emptyList()
@@ -89,7 +91,9 @@ private fun linkify(text: String): List<Span> {
         } else {
             var url = m.groupValues[3]
             var trail = ""
-            TRAIL_RE.find(url)?.let { trail = it.value; url = url.dropLast(it.value.length) }
+            var e = url.length
+            while (e > 0 && url[e - 1] in TRAIL_CHARS) e--
+            if (e < url.length) { trail = url.substring(e); url = url.substring(0, e) }
             if (url.endsWith(")") && !url.contains("(")) { trail = ")$trail"; url = url.dropLast(1) }
             out.add(Span.Link(url, url))
             pushText(trail)
@@ -229,15 +233,19 @@ private fun parseInline(text: String): List<Span> {
     if (!text.contains('`')) return parseEmph(text)
     val out = ArrayList<Span>()
     var i = 0
+    // The current line's end, cached across openers (as chat.js renderInline): a
+    // per-opener scan was quadratic on one long line of spans. MAX once none is left.
+    var eol = -1
     while (i < text.length) {
         val open = text.indexOf('`', i)
         if (open < 0) { out.addAll(parseEmph(text.substring(i))); break }
         val n = runLen(text, open)
         var j = open + n
         var close = -1
+        if (eol < open + n) { val k = text.indexOf('\n', open + n); eol = if (k < 0) Int.MAX_VALUE else k }
         while (j < text.length) {
             val c = text.indexOf('`', j)
-            if (c < 0 || text.substring(open + n, c).contains('\n')) break
+            if (c < 0 || eol < c) break
             val m = runLen(text, c)
             if (m == n) { close = c; break }
             j = c + m

@@ -176,6 +176,24 @@ class ProseTest {
         assertTrue(codes("```js\u00A0\ncode\n```").none { it.body == "code" })
     }
 
+    @Test fun `a URL's dot run, a bracket run and a backtick run parse in linear time`() {
+        // Rollup XERK-1701: each was quadratic (a URL + 64k dots took ~46 s here).
+        // The quadratic forms took tens of seconds at these sizes: a 10 s wall bound can't flake.
+        val t = System.nanoTime()
+        parseProse("http://" + ".".repeat(200_000) + "x")
+        parseProse("[".repeat(200_000) + "x")
+        parseProse("x``" + " `".repeat(1_000_000))
+        parseProse("`a` ".repeat(1_000_000))
+        assertTrue("took too long", (System.nanoTime() - t) / 1_000_000 < 10_000)
+        // A span on a later line of the paragraph still closes (the cached line end is re-found).
+        val spans = parseProse("`a`\n`b`").flatMap { (it as? ProseBlock.Paragraph)?.spans.orEmpty() }
+        assertEquals(2, spans.count { it is Span.Code })
+        // Curly quotes peel out of a bare URL too, as on the web.
+        val link = parseProse("see https://x.io/a’”.").flatMap { (it as? ProseBlock.Paragraph)?.spans.orEmpty() }
+            .filterIsInstance<Span.Link>().single()
+        assertEquals("https://x.io/a", link.url)
+    }
+
     @Test fun `code body is not linkified`() {
         val c = codes("```js\nconst u = \"https://x.io\";\n```").single()
         assertEquals("const u = \"https://x.io\";", c.body)
