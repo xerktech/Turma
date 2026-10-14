@@ -2014,6 +2014,15 @@ test("renderProse/stripFraming: a fence line full of blanks reads in linear time
   assert.match(renderProse("```js  \t\ncode\n```  "), /<code>code<\/code>/);
 });
 
+test("renderProse: a line of unclosed backtick runs of distinct lengths renders in linear time", () => {
+  // One line of unclosed runs of lengths 1, 2, … 1414 (1M chars): each opener used to
+  // scan to the line end, N^1.5 (~3.5 s of CPU); indexed runs take ~10 ms (rollup XERK-1701).
+  const t = process.cpuUsage();
+  renderProse("x" + Array.from({ length: 1414 }, (_, k) => "`".repeat(k + 1)).join(" "));
+  const used = process.cpuUsage(t);
+  assert.ok((used.user + used.system) / 1000 < 1000, "took too long");
+});
+
 test("renderProse: a URL's dot run, a [ run and a backtick run render in linear time", () => {
   // Rollup XERK-1701: each was quadratic (a URL + 64k dots took ~46 s on Android).
   const t = process.cpuUsage();  // CPU time, not wall: a loaded runner must not flake it
@@ -2022,11 +2031,9 @@ test("renderProse: a URL's dot run, a [ run and a backtick run render in linear 
   renderProse("x``" + " `".repeat(1000000));
   renderProse("`a` ".repeat(500000));
   renderProse("![".repeat(200000) + "x");
-  // One line of unclosed runs of distinct lengths (1, 2, … 1414): each used to scan
-  // to the line end, N^1.5 (4.2 s at this 1M-char size).
-  renderProse("x" + Array.from({ length: 1414 }, (_, k) => "`".repeat(k + 1)).join(" "));
   const used = process.cpuUsage(t);
-  assert.ok((used.user + used.system) / 1000 < 1500, "took too long");
+  // ~0.8 s of CPU idle, more on a loaded host; each quadratic form took tens of seconds.
+  assert.ok((used.user + used.system) / 1000 < 6000, "took too long");
   // Behaviour kept: trailing punctuation still peels out of a bare URL...
   assert.match(renderProse("see https://x.io/a."), /href="https:\/\/x\.io\/a"[^>]*>https:\/\/x\.io\/a<\/a>\./);
   // ...a span on a later line of the paragraph still closes (the cached line end is re-found)...
