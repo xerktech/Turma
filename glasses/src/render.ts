@@ -128,8 +128,36 @@ function findAgentLocal(state: AppState, hostKey: string): AgentInfo | undefined
   return state.agents.find((a) => a.key === hostKey);
 }
 
+// A menu row is exactly ONE display line: windowRows counts rows, so a row that
+// wrapped would push the page past the canvas — the rows below the edge never
+// drew, yet the cursor still walked onto them and a tap selected blind. Clip a
+// long row (a long session name) to one line with an ellipsis instead.
 function markerLine(text: string, selected: boolean): string {
-  return (selected ? "> " : "  ") + text;
+  const prefix = selected ? "> " : "  ";
+  const width = LINE_WIDTH_PX - Math.max(measureDefault("> "), measureDefault("  "));
+  return prefix + clipToWidth(text, width);
+}
+
+// Clips by CHARACTER, not via wrapText: wrapText breaks only on whitespace, so
+// its first line of a spaceless name ("very-long-slug…", CJK) is just the
+// status glyph — every such row read as "!…". Newlines fold to spaces so a
+// multi-line label can't clip to its first paragraph. The scan is capped: a
+// row never shows more than a line's worth of characters anyway.
+const CLIP_SCAN_MAX = 200;
+function clipToWidth(text: string, width: number): string {
+  const flat = text.replace(/\s+/g, " ");
+  if (measureDefault(flat) <= width) return flat;
+  const chars = Array.from(flat).slice(0, CLIP_SCAN_MAX);
+  // Largest prefix that still fits with the ellipsis (binary search: the
+  // measure is monotone in prefix length).
+  let lo = 0;
+  let hi = chars.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (measureDefault(chars.slice(0, mid).join("") + "…") <= width) lo = mid;
+    else hi = mid - 1;
+  }
+  return chars.slice(0, lo).join("").trimEnd() + "…";
 }
 
 interface WindowResult<T> {
