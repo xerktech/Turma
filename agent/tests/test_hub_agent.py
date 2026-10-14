@@ -2462,7 +2462,9 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         """QA: a lazy span from every `glab api` word was quadratic (352 KB took
         122s) — on the beat, past OFFLINE_AFTER_MS."""
         cmd = "projects/x/merge_requests " + "glab api " * 40000
-        t0 = time.monotonic()
+        # CPU on THIS thread, not wall: the defect is the regex's work, and a
+        # loaded host stretched the wall clock of the linear version past 2s.
+        t0 = time.thread_time()
         ha._gitlab_api_mr_create(cmd)
         ha._gitlab_api_mr_create(cmd.replace(" ", "|"))
         ha._gitlab_api_mr_create("Request(" * 40000 + " projects/x/merge_requests")
@@ -2473,7 +2475,7 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         ha._gitlab_api_mr_create(('u = "projects/42/merge_requests"\n' + "f(u, 1) " * 300) * 20)
         ha._gitlab_api_mr_create("x = 1\n" + "y " * 300000 + "/projects/x/merge_requests")
         ha._gitlab_api_mr_create(("requests.post(projects/x/merge_requests " + "(" * 500) * 200)
-        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertLess(time.thread_time() - t0, 2.0)
 
     def test_http_self_hosted_mr_is_attributed(self):
         """XERK-741: a self-hosted GitLab served over plain http on a LAN prints
@@ -4584,14 +4586,15 @@ class TestShellKind(unittest.TestCase):
         for cmd in ("tail " + hostile, "tail " + hostile + " " + hostile,
                     "sleep 5 " + "x" * (1 << 20), "a b " * 300000):
             with self.subTest(cmd=cmd[:20]):
-                t0 = time.monotonic()
+                # Thread CPU, not wall: the defect is backtracking work.
+                t0 = time.thread_time()
                 self.assertEqual(ha._shell_kind(cmd), ("work", None))
-                self.assertLess(time.monotonic() - t0, 0.5)
+                self.assertLess(time.thread_time() - t0, 0.5)
         # The follow check itself is linear too, past the input caps.
-        t0 = time.monotonic()
+        t0 = time.thread_time()
         self.assertFalse(ha._shell_tail_follow(hostile))
         self.assertTrue(ha._shell_tail_follow("-" + "q" * 200000 + "f"))
-        self.assertLess(time.monotonic() - t0, 0.5)
+        self.assertLess(time.thread_time() - t0, 0.5)
 
 
 class TestTsMs(unittest.TestCase):
@@ -7413,8 +7416,8 @@ class TestQwenPrAttribution(ManagerMixin, unittest.TestCase):
     def test_conflict_nudge_reaches_a_qwen_session_over_its_pane(self):
         """A CONFLICTING PR nudges the session that opened it. A qwen session has
         NO inbox record (it writes no ~/.claude/sessions/<pid>.json), so
-        notify_session falls back to the pane — send_input — exactly as a Claude
-        session with no inbox does. The nudge carries the MERGE instruction
+        notify_session falls back to the pane — staged for send_input on the input
+        worker — exactly as a Claude session with no inbox does. The nudge carries the MERGE instruction
         _pr_conflict_message builds, and the episode is recorded so it isn't
         re-nudged every beat."""
         sm = self.make_manager()
@@ -7426,7 +7429,7 @@ class TestQwenPrAttribution(ManagerMixin, unittest.TestCase):
             "mergeable": "CONFLICTING", "base": "main"}
         with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False), \
                 mock.patch.object(ha, "_session_inbox", return_value=None), \
-                mock.patch.object(sm, "send_input") as si:
+                mock.patch.object(sm, "_stage_input") as si:
             sm._poll_pr_conflicts()
         si.assert_called_once()
         args = si.call_args[0]
@@ -7451,7 +7454,7 @@ class TestQwenPrAttribution(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False), \
                 mock.patch.object(ha, "_session_inbox", return_value=None), \
                 mock.patch.object(ha, "_pr_comment_events", return_value=events), \
-                mock.patch.object(sm, "send_input") as si:
+                mock.patch.object(sm, "_stage_input") as si:
             sm._poll_pr_comments()   # first sighting: baseline, no delivery
             si.assert_not_called()
             events.append({"key": "c2", "is_self": False, "author": "reviewer",
@@ -7874,7 +7877,7 @@ class TestUsageScanWorker(ManagerMixin, unittest.TestCase):
 
         def slow_scan(inputs):
             threads.append(threading.current_thread().name)
-            release.wait(5)
+            release.wait(30)           # inline, the beat would sit this out
             return real(inputs)
 
         empty = tempfile.mkdtemp(dir=self.tmp)
@@ -7882,7 +7885,7 @@ class TestUsageScanWorker(ManagerMixin, unittest.TestCase):
              mock.patch.object(ha, "REPOS_ROOT", empty):
             t0 = time.time()
             sm.build_payload(0)
-            self.assertLess(time.time() - t0, 3.0, "the beat waited on the scan")
+            self.assertLess(time.time() - t0, 10.0, "the beat waited on the scan")
             self.assertEqual(sm.repo_usage, [])      # nothing landed yet
             release.set()
             self._wait_ready(sm)
@@ -8745,7 +8748,9 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
         # baseline a NEW submitted turn is counted against.
         self.make_manager()             # the mixin's tmux fakes
         self.run_calls.clear()
-        frames = [LINUX_COMPOSER_PANE if before is None else before] + list(caps)
+        # The first read is _type_into_pane's dialog check, before typing.
+        frames = ([LINUX_COMPOSER_PANE, LINUX_COMPOSER_PANE if before is None else before]
+                  + list(caps))
         # The per-slice draw wait (XERK-1842) is pinned on its own below.
         with mock.patch.object(ha, "_capture_pane",
                                side_effect=lambda t: frames.pop(0) if frames else caps[-1]), \
@@ -8852,9 +8857,9 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
         # Past the slicing cap the text is pasted, not typed: no read-back.
         self.make_manager()
         self.run_calls.clear()
-        with mock.patch.object(ha, "_capture_pane") as cap:
+        with mock.patch.object(ha, "_capture_pane", return_value=None) as cap:
             ha._type_into_pane("agent-abcde", "x" * (ha.PASTE_SLICED_MAX_CHARS + 1))
-        cap.assert_not_called()
+        self.assertEqual(cap.call_count, 1)        # the dialog check only
         self.assertEqual([c[-1] for c in self.run_calls], ["Enter"])
 
     def test_each_slice_waits_until_the_composer_draws_the_text_so_far(self):
@@ -8932,7 +8937,8 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "_capture_pane", return_value=None) as cap, \
                 mock.patch.object(ha, "_submit_typed"):
             ha._type_into_pane("agent-abcde", "x" * (n * 3))
-        self.assertEqual(cap.call_count, 1)        # one look, then the bare gap
+        # The dialog check, one look, then the bare gap.
+        self.assertEqual(cap.call_count, 2)
         self.assertEqual(len(self.run_stdin_calls), 3)
 
     def test_the_wait_is_bounded_per_message(self):
@@ -8942,13 +8948,13 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
         n = ha.PASTE_CHUNK_CHARS
         with mock.patch.object(ha, "_capture_pane", return_value=LINUX_COMPOSER_PANE), \
                 mock.patch.object(ha, "_submit_typed"), \
-                mock.patch.object(ha, "PASTE_SLICE_DRAWN_DEADLINE_SEC", 0.2), \
+                mock.patch.object(ha, "PASTE_SLICE_DRAWN_DEADLINE_SEC", 0.5), \
                 mock.patch.object(ha, "PASTE_SLICE_DRAWN_POLL_SEC", 0.01):
             t0 = time.monotonic()
             ha._type_into_pane("agent-abcde", "x" * (n * 6))
             took = time.monotonic() - t0
         self.assertEqual(len(self.run_stdin_calls), 6)
-        self.assertLess(took, 0.6)
+        self.assertLess(took, 1.5)       # per slice it would be 5 x 0.5s
 
     def test_the_windows_typed_path_waits_for_each_slice_too(self):
         n = ha.PASTE_CHUNK_CHARS
@@ -8977,6 +8983,209 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
                 mock.patch.object(ha.time, "sleep"):
             self.assertTrue(ha._pty_inject("agent-x", _STUCK_MSG))
         self.assertEqual(sent.count("\r"), 2)
+
+
+def _typed_frame(copies, box):
+    """A Claude Code frame: `copies` earlier submitted turns of _STUCK_MSG above
+    the composer, and `box` in it."""
+    above = "".join("❯ " + _STUCK_MSG + "\n● PONG\n" for _ in range(copies))
+    return (above + "─" * 120 + "\n❯ " + box + "\n" + "─" * 120 + "\n"
+            "  ⏵⏵ auto mode on (shift+tab to cycle)\n")
+
+
+class TestSubmitTypedDialogsAndBaselines(ManagerMixin, unittest.TestCase):
+    """Rollup XERK-1701 #71/#72/#70.2: a dialog pane, a late-drawn identical
+    copy above the box, and which rule pair is the box."""
+
+    def _send(self, frames, text=_STUCK_MSG):
+        self.make_manager()
+        self.run_calls.clear()
+        self.run_stdin_calls.clear()
+        frames = list(frames)
+        with mock.patch.object(ha, "_capture_pane",
+                               side_effect=lambda t: frames.pop(0) if len(frames) > 1
+                               else frames[0]), \
+                mock.patch.object(ha, "_await_slice_drawn", return_value=True):
+            result = ha._type_into_pane("agent-abcde", text)
+        return result, [c for c in self.run_calls if c[-1] == "Enter"]
+
+    def test_a_pane_showing_a_dialog_is_never_typed_into(self):
+        # A typed digit picks an option and any Enter approves the highlighted
+        # one: nothing at all may reach a dialog pane.
+        for dialog in (PANE_PERMISSION_DIALOG, PANE_PLAN_DIALOG):
+            with self.subTest(dialog=dialog[:20]):
+                result, enters = self._send([dialog])
+                self.assertIsNone(result)
+                self.assertEqual(enters, [])
+                self.assertEqual(self.run_stdin_calls, [])
+
+    def test_a_dialog_up_before_the_enter_is_never_entered(self):
+        # It came up while the text was being typed: the first Enter would
+        # answer it.
+        _result, enters = self._send([LINUX_COMPOSER_PANE, PANE_PERMISSION_DIALOG])
+        self.assertEqual(enters, [])
+
+    def test_a_dialog_after_the_enter_ends_the_watch_at_once(self):
+        # #71: the turn ran into a permission prompt. It reads "can't tell" to
+        # the composer read, so the watch used to sit out the whole deadline
+        # (holding the pane lock) -- and must still never Enter into it.
+        with mock.patch.object(ha, "TYPED_SUBMIT_DEADLINE_SEC", 3):
+            start = time.monotonic()
+            _result, enters = self._send([LINUX_COMPOSER_PANE, COMPOSER_STUCK,
+                                          PANE_PERMISSION_DIALOG])
+            took = time.monotonic() - start
+        self.assertEqual(len(enters), 1)
+        self.assertLess(took, 2.0)      # the 3s deadline is the defect
+
+    def test_a_late_drawn_earlier_copy_is_not_read_as_this_one_sent(self):
+        # #72: the baseline frame did not show the earlier identical message
+        # yet. It draws while this one still sits in the box (so it cannot be
+        # this one): the count from then on is the baseline. Then the box
+        # redraws empty for a frame -- not a send -- and shows the text again.
+        frames = [LINUX_COMPOSER_PANE,                 # dialog check
+                  _typed_frame(0, ""),                 # baseline: nothing drawn
+                  _typed_frame(1, _STUCK_MSG),         # earlier copy drawn; holds
+                  _typed_frame(1, ""),                 # redraw: NOT sent
+                  _typed_frame(1, _STUCK_MSG),         # still held: Enter again
+                  _typed_frame(2, "")]                 # now it went
+        _result, enters = self._send(frames)
+        self.assertEqual(len(enters), 3)
+
+    def test_a_fragment_of_the_text_in_the_box_is_never_sent(self):
+        # #72: a short pane shows only the last wrapped line of a message that
+        # did not go, while a late copy raises the count above it.
+        fragment = _typed_frame(1, "merged pull requests.")
+        self.assertIsNone(ha._composer_state(fragment, _STUCK_MSG, 0))
+        self.assertIsNone(ha._composer_state(fragment, _STUCK_MSG, 0, held=True))
+        frames = [LINUX_COMPOSER_PANE, _typed_frame(0, _STUCK_MSG), fragment,
+                  _typed_frame(1, _STUCK_MSG), _typed_frame(2, "")]
+        _result, enters = self._send(frames)
+        self.assertEqual(len(enters), 2)
+
+    def test_the_box_is_the_last_rule_pair_under_a_reply_with_a_rule(self):
+        # #70.2: a reply containing a horizontal rule puts an extra rule above
+        # the box. The earlier copy BELOW that rule is above the composer: it
+        # counts, and the box is only what sits between the last two rules.
+        text = "please verify the staging deploy checklist once more today"
+        frame = ("❯ first ask\n● Here is a summary\n" + "─" * 40 + "\n"
+                 "❯ " + text + "\n● PONG\n"
+                 + "─" * 120 + "\n❯ \n" + "─" * 120 + "\n")
+        above, box = ha._composer_split(frame)
+        self.assertEqual(box, "❯")
+        self.assertIn("PONG", above)
+        self.assertEqual(ha._sent_count(frame, text), 1)
+        self.assertIsNone(ha._composer_state(frame, text))
+        self.assertEqual(ha._composer_state(frame, text, 0), "sent")
+
+
+class TestPaneRelaunchStopsTyping(ManagerMixin, unittest.TestCase):
+    """Rollup XERK-1701 #70.1: a clear-context restart relaunches the same
+    `agent-<id>` tmux while the input worker may be mid-message. What was typed
+    before goes to the old conversation; the Enter must never reach the new."""
+
+    def setUp(self):
+        super().setUp()
+        for name, value in [("REPOS_ROOT", self.tmp), ("scan_repos", lambda: [])]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        os.makedirs(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.tmp)),
+                    exist_ok=True)
+
+    def _session(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        sm.spawn(ha.ROOT_REPO_NAME)
+        return sm, sm.registry[-1]
+
+    def test_a_restart_mid_message_stops_its_enter(self):
+        sm, sess = self._session()
+        tmux = sess["tmuxName"]
+        in_submit, restarted = threading.Event(), threading.Event()
+        typer = {}
+
+        def capture(_name):
+            if threading.current_thread().name != "typer":
+                return None
+            typer["reads"] = typer.get("reads", 0) + 1
+            if typer["reads"] == 2:              # _submit_typed's pre-Enter read
+                in_submit.set()
+                restarted.wait(5)
+            return _typed_frame(0, "hello there")
+
+        def type_it():
+            typer["result"] = ha._type_into_pane(tmux, "hello there")
+        with mock.patch.object(ha, "_capture_pane", side_effect=capture):
+            t = threading.Thread(target=type_it, name="typer")
+            t.start()
+            self.assertTrue(in_submit.wait(5))
+            self.run_calls.clear()
+            sm.restart(sess["id"])
+            restarted.set()
+            t.join(5)
+        self.assertEqual(sess.get("restartCount"), 1)
+        self.assertIsNone(typer["result"])
+        self.assertEqual([c for c in self.run_calls if c[-1] == "Enter"], [])
+
+    def test_a_relaunch_waits_out_only_the_write_in_flight(self):
+        # The gate: a paste being written when the relaunch comes lands (in the
+        # old pane), the relaunch waits for it, and nothing is written after.
+        self.make_manager()
+        pasting, release = threading.Event(), threading.Event()
+        real_run_ok, real_run = ha.run_ok, ha.run
+        events = []
+
+        def slow_paste(cmd, *a, **kw):
+            if "paste-buffer" in cmd:
+                pasting.set()
+                release.wait(5)
+            return real_run_ok(cmd, *a, **kw)
+
+        def logged_run(cmd, *a, **kw):
+            events.append(cmd[-1])
+            return real_run(cmd, *a, **kw)
+        retired = threading.Event()
+
+        def retire():
+            ha._retire_pane_writers("agent-gate")
+            events.append("retired")
+            retired.set()
+        with mock.patch.object(ha, "run_ok", side_effect=slow_paste), \
+                mock.patch.object(ha, "run", side_effect=logged_run), \
+                mock.patch.object(ha, "_capture_pane", return_value=None):
+            t = threading.Thread(target=ha._type_into_pane, args=("agent-gate", "hi"))
+            t.start()
+            self.assertTrue(pasting.wait(5))
+            r = threading.Thread(target=retire)
+            r.start()
+            self.assertFalse(retired.wait(0.3))   # waits for the paste in flight
+            release.set()
+            self.assertTrue(retired.wait(5))
+            t.join(5)
+            r.join(5)
+        # The Enter may still have reached the OLD pane before the relaunch took
+        # the gate; never after it.
+        self.assertIn("retired", events)
+        self.assertNotIn("Enter", events[events.index("retired"):])
+
+    def test_a_resend_whose_session_relaunches_after_its_check_types_nothing(self):
+        # The worker reads the epoch BEFORE the outbox: a relaunch between the
+        # check and the typing must stop it, not hand it the new conversation.
+        sm = self.make_manager()
+
+        class Relaunching(dict):
+            def get(self, key, default=None):
+                if key == "pendingInputs":
+                    ha._retire_pane_writers(self["tmuxName"])   # the beat, now
+                return super().get(key, default)
+        sess = Relaunching(id="s1", status="running", tmuxName="agent-rl",
+                           pendingInputs=[{"text": "hi"}])
+        sm.registry = [sess]
+        sm.resend_queue = [("s1", "hi")]
+        with mock.patch.object(ha, "_capture_pane", return_value=None):
+            sm._deliver_staged_resends()
+        self.assertEqual(self.run_stdin_calls, [])
+        self.assertEqual([c for c in self.run_calls if c[-1] == "Enter"], [])
 
 
 class TestTrustDialogIsABlockingDialog(unittest.TestCase):
@@ -15151,7 +15360,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
                                      "compactMetadata": {"trigger": "auto"}}])
         polled = []
 
-        def fake_type(name, text):
+        def fake_type(name, text, epoch=None):
             if not polled:                       # mid-batch: the beat runs again
                 with self._pane(False):
                     sm._poll_pending_inputs()
@@ -15176,7 +15385,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         typed = []
         done = threading.Event()
 
-        def fake_type(name, text):
+        def fake_type(name, text, epoch=None):
             typed.append((name, text, threading.current_thread().name))
             done.set()
             return True
@@ -15188,6 +15397,49 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
             sm._stage_resend("s1", "hi")
             self.assertTrue(done.wait(5))
         self.assertEqual(typed, [("agent-s1", "hi", "input-deliver")])
+
+    def test_a_worker_killed_mid_batch_leaves_nothing_in_flight(self):
+        # Rollup XERK-1701: a BaseException (not caught by the worker's loop)
+        # ended the batch with the rest still marked in flight, and the beat
+        # then kept those messages waiting forever.
+        sm = self.make_manager()
+        sm.registry = [{"id": s, "status": "running", "tmuxName": f"agent-{s}",
+                        "pendingInputs": [{"text": "hi"}]} for s in ("s1", "s2")]
+        sm.resend_queue = [("s1", "hi"), ("s2", "hi")]
+        with mock.patch.object(ha, "_type_into_pane", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            sm._deliver_staged_resends()
+        self.assertEqual(sm.resend_inflight, [])
+        self.assertFalse(sm._resend_queued("s2", "hi"))
+
+    def test_a_resend_waiting_on_the_worker_still_expires(self):
+        # One the worker will never type (dead or wedged) is dropped at the TTL,
+        # not kept on every beat for as long as it reads "queued".
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "hi", "attempts": 1, "compactBase": 0,
+                                       "at": time.time() - ha.PENDING_INPUT_TTL_SEC - 1}])
+        self._write_transcript(wt, [{"type": "system", "subtype": "compact_boundary",
+                                     "compactMetadata": {"trigger": "auto"}}])
+        sm.resend_inflight = [("s1", "hi")]
+        with self._pane(False):
+            sm._poll_pending_inputs()
+        self.assertNotIn("pendingInputs", sess)
+
+    def test_a_dead_input_worker_is_restarted_when_work_is_staged(self):
+        sm = self.make_manager()
+        with mock.patch.object(sm, "_start_input_worker") as start:
+            sm._stage_resend("s1", "hi")           # never started: run_forever's job
+            start.assert_not_called()
+            dead = threading.Thread(target=lambda: None)
+            dead.start()
+            dead.join()
+            sm._input_worker = dead
+            sm.resend_inflight = [("s1", "old")]
+            sm._stage_resend("s1", "hi")
+            start.assert_called_once_with()
+            sm._stage_input("s1", "typed")
+            self.assertEqual(start.call_count, 2)
+        self.assertEqual(sm.resend_inflight, [])
 
     def test_the_resend_queue_is_bounded(self):
         sm = self.make_manager()
@@ -15705,6 +15957,11 @@ class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sm.registry = [sess]
         return sess
 
+    def _deliver(self, sm):
+        """The input worker's pass, then the beat recording what it typed."""
+        sm._deliver_staged_inputs()
+        sm._apply_landed_inputs()
+
     def _posts(self):
         posts = []
         return posts, mock.patch.object(
@@ -15732,6 +15989,9 @@ class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sess = self._session(sm)                     # nothing registered
         self.assertFalse(sm.notify_session("s1", "resolve the conflicts"))
+        # Staged for the input worker: nothing types on the beat.
+        self.assertEqual(self.run_stdin_calls, [])
+        self._deliver(sm)
         self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
         self.assertEqual(sess["pendingInputs"][0]["text"], "resolve the conflicts")
 
@@ -15741,6 +16001,9 @@ class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self._register(7, self.SID)
         with mock.patch.object(ha, "_post_to_inbox", return_value=False):
             self.assertFalse(sm.notify_session("s1", "resolve the conflicts"))
+        # Staged for the input worker: nothing types on the beat.
+        self.assertEqual(self.run_stdin_calls, [])
+        self._deliver(sm)
         self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
         self.assertEqual(len(sess["pendingInputs"]), 1)
 
@@ -15757,6 +16020,9 @@ class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "_post_to_inbox") as post:
             self.assertFalse(sm.notify_session("s1", "resolve the conflicts"))
         post.assert_not_called()
+        # Staged for the input worker: nothing types on the beat.
+        self.assertEqual(self.run_stdin_calls, [])
+        self._deliver(sm)
         self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
         self.assertEqual(len(sess["pendingInputs"]), 1)
 
@@ -16339,6 +16605,7 @@ class TestPollPrComments(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sm = super().make_manager()
         sm.github = {"available": True, "login": "botlogin", "repos": []}
         self.run_calls.clear()
+        self._sm = sm
         return sm
 
     def _session(self, sm, base=None):
@@ -16352,7 +16619,10 @@ class TestPollPrComments(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
 
     def _typed(self):
         # The messages delivered into the pane — send_input pastes each one in
-        # slices (XERK-227), submitted by an Enter.
+        # slices (XERK-227), submitted by an Enter. A pane fallback is staged for
+        # the input worker, so run its pass (and the beat's record) first.
+        self._sm._deliver_staged_inputs()
+        self._sm._apply_landed_inputs()
         out, cur = [], []
         for item in self.pane_io:
             if item is None:
@@ -16505,6 +16775,7 @@ class TestPollPrConflicts(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sm = super().make_manager()
         sm.github = {"available": True, "login": "botlogin", "repos": []}
         self.run_calls.clear()
+        self._sm = sm
         return sm
 
     def _session(self, sm, **status):
@@ -16519,7 +16790,10 @@ class TestPollPrConflicts(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
 
     def _typed(self):
         # The messages delivered into the pane — send_input pastes each one in
-        # slices (XERK-227), submitted by an Enter.
+        # slices (XERK-227), submitted by an Enter. A pane fallback is staged for
+        # the input worker, so run its pass (and the beat's record) first.
+        self._sm._deliver_staged_inputs()
+        self._sm._apply_landed_inputs()
         out, cur = [], []
         for item in self.pane_io:
             if item is None:
@@ -16646,6 +16920,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sm = super().make_manager()
         sm.github = {"available": True, "login": "botlogin", "repos": []}
         self.run_calls.clear()
+        self._sm = sm
         return sm
 
     def _session(self, sm, dirty=1, live_branch="feature-x", pushed=False,
@@ -16683,7 +16958,10 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
 
     def _typed(self):
         # The messages delivered into the pane — send_input pastes each one in
-        # slices (XERK-227), submitted by an Enter.
+        # slices (XERK-227), submitted by an Enter. A pane fallback is staged for
+        # the input worker, so run its pass (and the beat's record) first.
+        self._sm._deliver_staged_inputs()
+        self._sm._apply_landed_inputs()
         out, cur = [], []
         for item in self.pane_io:
             if item is None:
@@ -24466,6 +24744,45 @@ class TestStageSubagentHistory(ManagerMixin, unittest.TestCase):
         self.assertTrue(any("found a bug" in (e.get("text") or "")
                             for e in r["entries"]))
 
+    def test_an_unlabelled_row_finds_its_launch_from_before_a_restart(self):
+        # Rollup XERK-1701: the row's own UNLABELLED launch predates a manager
+        # restart (the index never folded it) while a newer LABELLED launch is
+        # indexed. The index's labelled answer must not win over the window.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/repo/eee"
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj)
+
+        def launch(tool_id, agent_id, desc):
+            return [
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": tool_id, "name": "Agent",
+                     "input": {"description": desc, "prompt": "go",
+                               "run_in_background": True}}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": tool_id,
+                     "content": f"agentId: {agent_id}"}]},
+                 "toolUseResult": {"isAsync": True, "status": "async_launched",
+                                   "agentId": agent_id, "description": desc}}]
+        unlabelled, labelled = launch("toolu_u", "un111", ""), launch("toolu_l", "lab222",
+                                                                      "named one")
+        with open(os.path.join(proj, "trans5.jsonl"), "w") as f:
+            for e in unlabelled + labelled:
+                f.write(json.dumps(e) + "\n")
+        subdir = os.path.join(proj, "trans5", "subagents")
+        os.makedirs(subdir)
+        for aid, said in (("un111", "the unlabelled one"), ("lab222", "the named one")):
+            with open(os.path.join(subdir, f"agent-{aid}.jsonl"), "w") as f:
+                f.write(json.dumps({"type": "assistant", "uuid": "u1", "message": {
+                    "content": [{"type": "text", "text": said}]}}) + "\n")
+        sm.registry = [{"id": "s1", "status": "running", "worktreePath": wt}]
+        self._fold(sm, "s1", *labelled)          # only the post-restart launch
+        self.assertEqual(ha._live_agent_resolve_id(sm.sess_state["s1"], "agent", ""),
+                         "lab222")
+        sm._stage_subagent_history("s1", "agent", "")
+        texts = [e.get("text") or "" for e in sm.subagent_history_results[0]["entries"]]
+        self.assertIn("the unlabelled one", texts)
+
 
 class TestLiveAgentResolveId(unittest.TestCase):
     """_live_agent_resolve_id maps a clicked row (type+label) back to its launch
@@ -30303,7 +30620,7 @@ class TestArchiveInventory(ManagerMixin, unittest.TestCase):
         real_inputs = sm._archive_candidate_inputs
         def slow_walk(inputs):
             threads.append(threading.current_thread().name)
-            release.wait(5)
+            release.wait(30)           # inline, the beat would sit this out
             return real(inputs)
         def inputs_spy():
             input_threads.append(threading.current_thread().name)
@@ -30316,7 +30633,7 @@ class TestArchiveInventory(ManagerMixin, unittest.TestCase):
              mock.patch.object(ha, "REPOS_ROOT", empty):
             t0 = time.time()
             payload = sm.build_payload(0)
-            self.assertLess(time.time() - t0, 3, "the refresh beat waited for the walk")
+            self.assertLess(time.time() - t0, 10, "the refresh beat waited for the walk")
             self.assertNotIn("archiveInventory", payload)
             # A full beat while the walk is still running ships nothing.
             self.assertNotIn("archiveInventory", sm.build_payload(1))
@@ -30495,7 +30812,7 @@ class TestArchiveSyncWorker(ManagerMixin, unittest.TestCase):
             sm.queue_archive_sync({"archiveHave": {"t1": 0}})
             elapsed = time.time() - t0
             self.assertTrue(started.wait(5), "the pass never ran on the worker")
-            self.assertLess(elapsed, 0.5)
+            self.assertLess(elapsed, 5.0)      # inline, it would block the full 10s
             release.set()
 
     def test_cursors_and_flags_reach_both_passes(self):
@@ -40142,6 +40459,92 @@ class TestWindowsTerminalBackend(unittest.TestCase):
              mock.patch.object(ha.time, "sleep"):
             self.assertFalse(ha._pty_inject("agent-x", "a" * ha.PASTE_CHUNK_CHARS + "bb"))
         self.assertNotIn("\r", sent)   # retried once, then gave up: no Enter
+
+    def _inject_with(self, outcomes, text, drawn=True):
+        """_pty_inject over a control channel whose inject calls go per
+        `outcomes`: "ok", "unsent" (refused before the request went out) or
+        "lost" (the request went out, the reply did not come back)."""
+        outcomes, sent = iter(outcomes), []
+
+        def fake_control(name, op, **kw):
+            sent.append(kw.get("data"))
+            how = next(outcomes, "ok")
+            if how != "unsent" and kw.get("sent") is not None:
+                kw["sent"].append(True)
+            return {"ok": True} if how == "ok" else None
+
+        with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
+             mock.patch.object(ha.time, "sleep"), \
+             mock.patch.object(ha, "_await_slice_drawn", return_value=drawn), \
+             mock.patch.object(ha, "_capture_pane", return_value=COMPOSER_BUSY):
+            return ha._pty_inject("agent-x", text), sent
+
+    def test_pty_inject_never_retypes_a_slice_whose_reply_was_lost(self):
+        # Rollup XERK-1701 #29: the pty-host typed the slice, the reply was lost,
+        # and the retry typed it again (514 chars arrived as 628). The composer
+        # shows it, so it landed: carry on, once.
+        a, b = "a" * ha.PASTE_CHUNK_CHARS, "b" * 5
+        ok, sent = self._inject_with(["ok", "lost"], a + b)
+        self.assertTrue(ok)
+        self.assertEqual(sent, [a, b, "\r"])
+
+    def test_pty_inject_a_lost_slice_the_composer_never_shows_is_cleared(self):
+        a, b = "a" * ha.PASTE_CHUNK_CHARS, "b\nc"
+        ok, sent = self._inject_with(["ok", "lost"], a + b, drawn=False)
+        self.assertFalse(ok)
+        self.assertEqual(sent[:2], [a, b])          # never typed twice
+        self.assertEqual(sent[2:], ["\x15\x15"])    # one Ctrl+U per typed line
+        self.assertNotIn("\r", sent)
+
+    def test_pty_inject_clears_the_composer_when_the_retry_fails_too(self):
+        # Slices already typed would otherwise be submitted by the NEXT message.
+        a, b = "a" * ha.PASTE_CHUNK_CHARS, "b" * 5
+        ok, sent = self._inject_with(["ok", "unsent", "unsent"], a + b)
+        self.assertFalse(ok)
+        self.assertEqual(sent, [a, b, b, "\x15"])
+
+    def test_pty_inject_a_refused_first_slice_needs_no_clearing(self):
+        ok, sent = self._inject_with(["unsent"], "hello")
+        self.assertFalse(ok)
+        self.assertEqual(sent, ["hello"])
+
+    def test_ws_control_rpc_says_whether_the_request_went_out(self):
+        # "Not sent" (refused before the frame) vs "sent, no reply" (the frame
+        # went out, then the connection dropped): only the first is retryable.
+        def serve(upgrade):
+            srv = socket.socket()
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+
+            def run():
+                conn, _ = srv.accept()
+                with conn:
+                    req = b""
+                    while b"\r\n\r\n" not in req:
+                        req += conn.recv(4096)
+                    if not upgrade:
+                        conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                        return
+                    key = re.search(rb"Sec-WebSocket-Key: (\S+)", req).group(1).decode()
+                    accept = base64.b64encode(hashlib.sha1(
+                        (key + ha._WS_GUID).encode()).digest()).decode()
+                    conn.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket"
+                                  "\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
+                                  f"{accept}\r\n\r\n").encode())
+                    conn.recv(4096)                 # the request frame; no reply
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            return srv, t
+        for upgrade, want in ((False, []), (True, [True])):
+            with self.subTest(upgrade=upgrade):
+                srv, t = serve(upgrade)
+                sent = []
+                self.assertIsNone(ha._ws_control_rpc(
+                    srv.getsockname()[1], "tok", {"op": "inject", "data": "x"},
+                    timeout=2, sent=sent))
+                t.join(5)
+                srv.close()
+                self.assertEqual(sent, want)
 
     def test_pane_send_keys_translates_key_names_on_windows(self):
         with mock.patch.object(ha, "IS_WINDOWS", True), \

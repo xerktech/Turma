@@ -99,9 +99,17 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
   - **Host-unverified** (no Windows host in the fleet when it shipped). Verify on the first one:
     a typed two-line message must land as ONE turn with no `<pasted_content>` in the transcript.
     If LF submits there, revert `_pty_inject` to bracketing multi-line text.
-  - A failed slice returns False with no Enter; a failed LATER slice is retried once first,
-    since the earlier ones already sit in the composer. Residuals: a second failure leaves them
-    there for the NEXT message to submit; a lost reply on a slice that DID land types it twice.
+  - A failed slice returns False with no Enter. `_ws_control_rpc(sent=)` tells a request that
+    never went out ("unsent", retried once for a LATER slice) from one whose reply was lost
+    ("lost", never retried: it typed 514 chars as 628). A lost slice counts as typed only once
+    the composer draws it (`_await_slice_drawn`).
+  - On a final failure the typed part is cleared (`_pty_clear_composer`: one Ctrl+U per typed
+    line, set_model's key), else the NEXT message submits it. Host-unverified: whether Ctrl+U
+    at a line's start joins it to the line above. Tests: the `_pty_inject` lost/clear cases.
+  - **No message is typed on the beat** (input, compaction resend and `notify_session`'s pane
+    fallback all go through the input worker). The beat still drives KEYS through
+    `_pane_send_keys` — set_model's picker, the `/rename` reconcile, interrupt, a prompt
+    answer, the trust modal — each a bounded control op, never a typed message.
   - `_type_into_pane` holds `_PANE_TYPE_LOCKS` on Windows too: N injects from two writers (input
     worker, qwen peer) would otherwise splice into one turn.
 - **The multi-line retry loop is bounded by a WALL CLOCK, not just the iteration count** (XERK-867,

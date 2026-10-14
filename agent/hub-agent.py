@@ -11959,7 +11959,7 @@ def live_agents_report(state):
     return out
 
 
-def _live_agent_resolve_id(state, agent_type, label):
+def _live_agent_resolve_id(state, agent_type, label, with_rank=False):
     """The on-disk RESOLVE HANDLE of the newest live background-agent row matching
     a clicked row's type+label, or None (XERK-333).
 
@@ -11979,11 +11979,14 @@ def _live_agent_resolve_id(state, agent_type, label):
 
     A row this index does not know — a pane-scraped `status.agents` row from an
     older agent, or one whose launch predates a manager restart's EOF-primed scan
-    offsets — yields None, and the caller falls back to the windowed scan."""
+    offsets — yields None, and the caller falls back to the windowed scan.
+
+    `with_rank` returns (handle, _row_label_rank) instead: rank 0 is an
+    unlabelled row the index could only answer with a LABELLED launch."""
     want_type, _ = _strip_pane_ellipsis((agent_type or "").strip())
     want_label, _ = _strip_pane_ellipsis((label or "").strip())
     if not want_type:
-        return None
+        return (None, -1) if with_rank else None
     found, found_rank = None, -1
     for entry in (state.get("liveAgents") or {}).values():
         have_type = str(entry.get("type") or "")
@@ -12000,7 +12003,7 @@ def _live_agent_resolve_id(state, agent_type, label):
         rid = str(entry.get("resolveId") or "").strip()
         if rid and rank >= found_rank:
             found, found_rank = rid, rank   # keep scanning: newest best launch wins
-    return found
+    return (found, found_rank) if with_rank else found
 
 
 def _entry_blocks(entry, caps, preview=False):
@@ -16341,6 +16344,80 @@ _PANE_TYPE_LOCKS = {}
 PANE_TYPE_LOCK_WAIT_SEC = (PASTE_SLICE_DRAWN_DEADLINE_SEC + TYPED_SUBMIT_DEADLINE_SEC
                            + 2 * TYPED_SUBMIT_SETTLE_SEC + 2.0)
 _PANE_TYPE_LOCKS_GUARD = threading.Lock()
+# A pane's LAUNCH EPOCH: bumped (under the pane's write gate, the third slot of
+# its _PANE_TYPE_LOCKS entry) every time a tmux name is (re)launched. A writer
+# reads it when it starts and checks it before EVERY write into the pane, so a
+# message being typed when a clear-context restart relaunches `agent-<id>`
+# stops instead of pressing its Enter into the new conversation (rollup
+# XERK-1701 #70.1). The gate is held for ONE write, never a whole message, so
+# a relaunch waits out at most a single pane call. Never pruned: a name whose
+# epoch fell back to 0 would let a writer that read 0 type into its next launch.
+# One int per tmux name ever relaunched by this process.
+_PANE_EPOCHS = {}
+_PANE_EPOCH_SEQ = [0]
+# How long a relaunch waits for the write in flight (one tmux/control call,
+# bounded by its own 15s timeout). Past it the epoch is bumped anyway.
+PANE_WRITE_GATE_WAIT_SEC = 20.0
+_PANE_WRITER = threading.local()
+
+
+class _PaneRelaunched(Exception):
+    """The pane a message was being typed into was relaunched mid-message."""
+
+
+def _pane_epoch(tmux_name):
+    with _PANE_TYPE_LOCKS_GUARD:
+        return _PANE_EPOCHS.get(tmux_name, 0)
+
+
+def _pane_lock_entry(tmux_name):
+    """The pane's [type lock, users, write gate] entry, counted in (the caller
+    must _pane_lock_release it). Caller holds no lock."""
+    with _PANE_TYPE_LOCKS_GUARD:
+        entry = _PANE_TYPE_LOCKS.get(tmux_name)
+        if entry is None:
+            entry = _PANE_TYPE_LOCKS[tmux_name] = [threading.Lock(), 0, threading.Lock()]
+        entry[1] += 1
+    return entry
+
+
+def _pane_lock_release(tmux_name, entry):
+    with _PANE_TYPE_LOCKS_GUARD:
+        entry[1] -= 1
+        if entry[1] <= 0 and _PANE_TYPE_LOCKS.get(tmux_name) is entry:
+            del _PANE_TYPE_LOCKS[tmux_name]
+
+
+def _retire_pane_writers(tmux_name):
+    """A (re)launch of `tmux_name` is about to happen: every message being typed
+    into it now must stop before its next write. Waits out only the ONE write in
+    flight (the gate), never the rest of a message."""
+    if not tmux_name:
+        return
+    entry = _pane_lock_entry(tmux_name)
+    gated = entry[2].acquire(timeout=PANE_WRITE_GATE_WAIT_SEC)
+    try:
+        with _PANE_TYPE_LOCKS_GUARD:
+            _PANE_EPOCH_SEQ[0] += 1
+            _PANE_EPOCHS[tmux_name] = _PANE_EPOCH_SEQ[0]
+    finally:
+        if gated:
+            entry[2].release()
+        _pane_lock_release(tmux_name, entry)
+
+
+def _pane_write(fn, *args, **kwargs):
+    """Run one write into the pane being typed into on this thread, unless that
+    pane was relaunched since the message started (raises _PaneRelaunched).
+    Outside _type_into_pane it is a plain call."""
+    ctx = getattr(_PANE_WRITER, "ctx", None)
+    if ctx is None:
+        return fn(*args, **kwargs)
+    tmux_name, gate, epoch = ctx
+    with gate:
+        if _pane_epoch(tmux_name) != epoch:
+            raise _PaneRelaunched(tmux_name)
+        return fn(*args, **kwargs)
 
 
 def _input_slices(text):
@@ -16419,15 +16496,20 @@ def _composer_state(cap, text, sent_before=None, held=False):
     above, box = split
     if _box_ends_with(box, want):
         return "holds"
+    # A fragment of the text still in the box (a redraw, or a short pane
+    # showing only a wrapped line of it) is never "sent", whatever the count
+    # above says: an earlier identical copy drawn late raises that count while
+    # this one still sits in the composer (rollup XERK-1701 #72).
+    shown = box[1:] if box.startswith("\u276f") else box
+    if shown and shown in _composer_norm(text):
+        return None
     if sent_before is not None and above.count(want) > sent_before:
         return "sent"
     if held:
         # The text left a composer that drew it: submitted. The count above
         # can miss it on a short pane, where the turn wraps or scrolls off
-        # (XERK-1853). A fragment of the text is a redraw: keep watching.
-        shown = box[1:] if box.startswith("\u276f") else box
-        if not shown or shown not in _composer_norm(text):
-            return "sent"
+        # (XERK-1853).
+        return "sent"
     return None
 
 
@@ -16458,6 +16540,10 @@ def _submit_typed(tmux_name, text, press_enter):
     TYPED_SUBMIT_DEADLINE_SEC). A read that can't tell keeps watching."""
     time.sleep(TYPED_SUBMIT_SETTLE_SEC)
     before = _capture_pane(tmux_name)
+    if _pane_blocking_dialog(before):
+        # Came up while the text was typed: an Enter would answer it.
+        log(f"typing into {tmux_name}: a dialog came up before Enter; not pressing it")
+        return
     sent_before = _sent_count(before, text)
     held = _composer_state(before, text) == "holds"
     press_enter()
@@ -16468,10 +16554,21 @@ def _submit_typed(tmux_name, text, press_enter):
         cap = _capture_pane(tmux_name)
         if cap is None or _busy_from_capture(cap):
             return
+        if _pane_blocking_dialog(cap):
+            # The turn ran into a permission prompt (or another dialog owns the
+            # keyboard): never Enter into it, and there is no composer left to
+            # watch -- it reads "can't tell" and cost the whole deadline (#71).
+            return
         state = _composer_state(cap, text, sent_before, held)
         if state == "sent":
             return
         if state == "holds":
+            # This text is still in the box, so any copy above it is an
+            # earlier one, however late it was drawn: count from here (#72).
+            shown_above = _sent_count(cap, text)
+            if shown_above is not None:
+                sent_before = (shown_above if sent_before is None
+                               else max(sent_before, shown_above))
             if presses >= TYPED_SUBMIT_MAX_RETRIES:
                 # A lagging redraw can keep showing a message that did go.
                 log(f"typing into {tmux_name}: composer still shows the message "
@@ -16591,7 +16688,7 @@ def attachment_message(paths, failed, text):
     return "\n".join(lines)
 
 
-def _type_into_pane(tmux_name, text):
+def _type_into_pane(tmux_name, text, epoch=None):
     """Put `text` into a session pane's input line and submit it with Enter.
 
     The text is delivered as a tmux PASTE — `load-buffer` it into a per-session
@@ -16631,14 +16728,19 @@ def _type_into_pane(tmux_name, text):
 
     On Windows the pty-host stands in for tmux (XERK-697): `_pty_inject` applies
     the same typed-vs-bracketed rule over the control channel (XERK-1727), then
-    submits with Enter."""
+    submits with Enter.
+
+    Returns None when nothing reached the conversation: a dialog owned the pane
+    (nothing typed), or the pane was relaunched mid-message (`_PANE_EPOCHS`:
+    what was typed went to the old conversation, and no Enter follows)."""
     if not tmux_name:
         return False
-    with _PANE_TYPE_LOCKS_GUARD:
-        entry = _PANE_TYPE_LOCKS.get(tmux_name)
-        if entry is None:
-            entry = _PANE_TYPE_LOCKS[tmux_name] = [threading.Lock(), 0]
-        entry[1] += 1
+    # Read BEFORE waiting on the lock: a relaunch while this message waits must
+    # stop it too. A caller that checked something about the pane's session
+    # first (the resend worker's outbox check) passes the epoch it read before.
+    if epoch is None:
+        epoch = _pane_epoch(tmux_name)
+    entry = _pane_lock_entry(tmux_name)
     lock = entry[0]
     locked = False
     try:
@@ -16648,17 +16750,26 @@ def _type_into_pane(tmux_name, text):
         if not locked:
             log(f"typing into {tmux_name}: another writer still busy after "
                 f"{PANE_TYPE_LOCK_WAIT_SEC}s; typing unserialized")
+        _PANE_WRITER.ctx = (tmux_name, entry[2], epoch)
+        # A dialog owns the keyboard: a typed digit picks an option and any
+        # Enter confirms the highlighted one (a tool approval, or the trust
+        # modal's 'No, exit'). Checked under the lock, right before typing.
+        if _pane_blocking_dialog(_capture_pane(tmux_name)):
+            log(f"typing into {tmux_name}: a dialog owns the pane; typed nothing")
+            return None
         # A Windows message is N slice injects too, so it takes the same lock.
         if IS_WINDOWS:
             return _pty_inject(tmux_name, text)
         return _type_into_tmux_pane(tmux_name, text)
+    except _PaneRelaunched:
+        log(f"typing into {tmux_name}: the session was relaunched mid-message; "
+            f"stopped before the new conversation got any of it")
+        return None
     finally:
+        _PANE_WRITER.ctx = None
         if locked:
             lock.release()
-        with _PANE_TYPE_LOCKS_GUARD:
-            entry[1] -= 1
-            if entry[1] <= 0 and _PANE_TYPE_LOCKS.get(tmux_name) is entry:
-                del _PANE_TYPE_LOCKS[tmux_name]
+        _pane_lock_release(tmux_name, entry)
 
 
 def _type_into_tmux_pane(tmux_name, text):
@@ -16687,14 +16798,15 @@ def _type_into_tmux_pane(tmux_name, text):
             if await_drawn:
                 await_drawn = _await_slice_drawn(tmux_name, text[:sent], drawn_deadline)
         # The buffer is per-SERVER, so load and paste must address the same one.
-        if not run_stdin(_tmux("load-buffer", "-b", buf, "-", name=tmux_name), piece):
+        if not _pane_write(run_stdin, _tmux("load-buffer", "-b", buf, "-", name=tmux_name),
+                           piece):
             pasted = False
             break
         # -d drops the buffer once pasted, so a message never sits in tmux's
         # paste history waiting to be re-pasted by hand.
-        rc, _err = run_ok(_tmux("paste-buffer", *flags, "-b", buf,
-                                "-t", _tmux_pane(tmux_name), name=tmux_name),
-                          timeout=15)
+        rc, _err = _pane_write(run_ok, _tmux("paste-buffer", *flags, "-b", buf,
+                                             "-t", _tmux_pane(tmux_name), name=tmux_name),
+                               timeout=15)
         if rc != 0:
             run(_tmux("delete-buffer", "-b", buf, name=tmux_name))
             pasted = False
@@ -16712,11 +16824,12 @@ def _type_into_tmux_pane(tmux_name, text):
             # `--` ends tmux's own option parsing before the literal text, so a
             # message starting with '-' isn't misread as more send-keys flags.
             # Each chunk appends to the input line; only the Enter below submits.
-            run(_tmux("send-keys", "-t", _tmux_pane(tmux_name), "-l", "--", chunk,
-                      name=tmux_name))
+            _pane_write(run, _tmux("send-keys", "-t", _tmux_pane(tmux_name), "-l", "--",
+                                   chunk, name=tmux_name))
 
     def press_enter():
-        run(_tmux("send-keys", "-t", _tmux_pane(tmux_name), "Enter", name=tmux_name))
+        _pane_write(run, _tmux("send-keys", "-t", _tmux_pane(tmux_name), "Enter",
+                               name=tmux_name))
 
     if sliced or not pasted:
         # Typed, not bracketed: an immediate Enter can be read as a line break.
@@ -16988,13 +17101,17 @@ def _ws_encode_text(text):
 
 
 def _ws_control_rpc(port, token, msg, timeout=PTY_CONTROL_TIMEOUT_SEC,
-                    host="127.0.0.1"):
+                    host="127.0.0.1", sent=None):
     """A one-shot RFC 6455 client to the pty-host CONTROL websocket: open, send
     one JSON text frame, read one JSON reply frame, close. Loopback only, so the
     handshake is minimal (no TLS). Pure stdlib (socket/struct/base64/hashlib —
     already imported), so it is unit-testable and needs no `ws` dependency on the
     Python side. Returns the parsed reply dict, or None on ANY failure — the
-    caller treats None like a `tmux` command that returned nonzero."""
+    caller treats None like a `tmux` command that returned nonzero.
+
+    `sent`, a list, gets True appended once the request frame was written in
+    full: from then on a None means "no reply", not "not done" -- the pty-host
+    may have acted on it (an inject typed), so it must not be blindly retried."""
     key = base64.b64encode(os.urandom(16)).decode()
     path = f"/?token={urllib.parse.quote(str(token), safe='')}" if token else "/"
     req = (
@@ -17025,6 +17142,8 @@ def _ws_control_rpc(port, token, msg, timeout=PTY_CONTROL_TIMEOUT_SEC,
         if accept.encode().lower() not in head.lower():
             return None
         s.sendall(_ws_encode_text(json.dumps(msg)))
+        if sent is not None:
+            sent.append(True)
         return _ws_read_json(s, rest, timeout)
     except (OSError, ValueError):
         return None
@@ -17096,18 +17215,22 @@ def _ws_read_json(sock, initial, timeout):
         # ping / pong / continuation: ignore and keep reading
 
 
-def _pty_control(tmux_name, op, timeout=PTY_CONTROL_TIMEOUT_SEC, **extra):
+def _pty_control(tmux_name, op, timeout=PTY_CONTROL_TIMEOUT_SEC, sent=None, **extra):
     """Drive one control op on a session's pty-host, the tmux-CLI replacement.
     Reads the ctrlPort from the state file and authenticates with the same token
     the pty-host was minted with (read from `_pty_token_file`, which this
     process writes from its own TURMA_TOKEN), so no per-session secret has to be tracked here. Returns the reply dict (with
-    `ok`), or None when there is no live terminal / the call failed."""
+    `ok`), or None when there is no live terminal / the call failed. `sent`: see
+    _ws_control_rpc."""
     st = _pty_read_state(tmux_name)
     if not st or not st.get("ctrlPort"):
         return None
     msg = {"op": op}
     msg.update(extra)
-    return _ws_control_rpc(st["ctrlPort"], TURMA_TOKEN or "changeme", msg, timeout)
+    if sent is None:
+        return _ws_control_rpc(st["ctrlPort"], TURMA_TOKEN or "changeme", msg, timeout)
+    return _ws_control_rpc(st["ctrlPort"], TURMA_TOKEN or "changeme", msg, timeout,
+                           sent=sent)
 
 
 def _pty_capture(tmux_name):
@@ -17180,33 +17303,41 @@ def _pty_inject(tmux_name, text):
             if await_drawn:
                 await_drawn = _await_slice_drawn(
                     tmux_name, "".join(slices[:n]), drawn_deadline)
-        r = _pty_control(tmux_name, "inject", data=piece)
-        if not (r and r.get("ok")) and n:
+        state = _pty_inject_piece(tmux_name, piece)
+        if state == "unsent" and n:
             # Earlier slices already sit in the composer, where the NEXT
-            # message would submit them glued to its own text: retry once
-            # before giving up on a transient control failure. Accepted cost:
-            # None also means "reply lost", and if that inject DID land the
-            # retry types the slice twice (rarer than a refused connect).
+            # message would submit them glued to its own text: retry once on
+            # a transient control failure. Only a request that never went out
+            # is retried -- one whose REPLY was lost may have been typed.
             time.sleep(PTY_SUBMIT_SETTLE_SEC)
-            r = _pty_control(tmux_name, "inject", data=piece)
-        if not (r and r.get("ok")):
+            state = _pty_inject_piece(tmux_name, piece)
+        if state == "lost":
+            # Typed or not? Ask the composer, never type it again (a retry of
+            # a slice that did land typed it twice: 514 chars arrived as 628).
+            so_far = "".join(slices[:n + 1])
+            if sliced and _await_slice_drawn(
+                    tmux_name, so_far,
+                    max(drawn_deadline, time.monotonic() + PTY_SUBMIT_SETTLE_SEC)):
+                state = "ok"
+        if state != "ok":
             # No live terminal / control call failed. Nothing is submitted, so
-            # a cut message never goes out as if whole.
-            if n:
+            # a cut message never goes out as if whole. Whatever DID land is
+            # cleared, or the NEXT message would submit it glued to its own.
+            if n or state == "lost":
                 log(f"typing into {tmux_name}: slice {n + 1}/{len(slices)} "
-                    f"failed; {sum(map(len, slices[:n]))} chars typed but left "
-                    f"unsubmitted in the composer")
+                    f"failed; clearing what was typed from the composer")
+                _pty_clear_composer(tmux_name, "".join(slices[:n + 1]))
             return False
     if sliced:
         # Typed text: settle, Enter, and Enter again if it was read as a line
         # break (TYPED_SUBMIT_SETTLE_SEC — measured on the tmux path).
         _submit_typed(tmux_name, clean,
-                      lambda: _pty_control(tmux_name, "inject", data="\r"))
+                      lambda: _pane_write(_pty_control, tmux_name, "inject", data="\r"))
         return True
     chip = "\n" in clean
     if chip:
         time.sleep(PTY_SUBMIT_SETTLE_SEC)          # let the paste chip settle
-    _pty_control(tmux_name, "inject", data="\r")   # submit with Enter
+    _pane_write(_pty_control, tmux_name, "inject", data="\r")   # submit with Enter
     # Safety net: while a not-yet-submitted paste chip is still on screen and no
     # turn has started, Enter again. Never fires for typed text (no chip).
     # Bounded by PTY_SUBMIT_MAX_RETRIES *and* a wall-clock deadline
@@ -17221,8 +17352,33 @@ def _pty_inject(tmux_name, text):
         if PTY_PASTE_CHIP_MARK not in cap or _busy_from_capture(cap):
             break
         time.sleep(PTY_SUBMIT_SETTLE_SEC)
-        _pty_control(tmux_name, "inject", data="\r")
+        _pane_write(_pty_control, tmux_name, "inject", data="\r")
     return True
+
+
+def _pty_inject_piece(tmux_name, piece):
+    """One slice inject: "ok", "unsent" (the request never went out whole, so
+    nothing was typed) or "lost" (it went out and no good reply came back --
+    the pty-host may have typed it)."""
+    sent = []
+    r = _pane_write(_pty_control, tmux_name, "inject", data=piece, sent=sent)
+    if r and r.get("ok"):
+        return "ok"
+    return "lost" if sent else "unsent"
+
+
+def _pty_clear_composer(tmux_name, typed):
+    """Best-effort: erase a message that was typed but never submitted. One
+    Ctrl+U per typed line (Claude Code's delete-to-line-start, the key set_model
+    clears the input line with), in one inject. Host-unverified on Windows:
+    whether Ctrl+U at a line's start also joins it to the line above."""
+    try:
+        _pane_write(_pty_control, tmux_name, "inject",
+                    data="\x15" * (typed.count("\n") + 1))
+    except _PaneRelaunched:
+        raise
+    except Exception as e:
+        log(f"typing into {tmux_name}: could not clear the composer: {e}")
 
 
 # The terminal byte sequence to write into the pty for each tmux key TOKEN the
@@ -23045,7 +23201,7 @@ class SessionManager:
         self._build_done.set()
         # The memory guard (XERK-1019) kills on its own thread and stages each kill
         # here; the BEAT drains it and tells the session (_deliver_memguard_kills),
-        # since notify_session's pane fallback writes the registry.
+        # since notify_session is beat-only (its inbox bookkeeping, its staging).
         self.memguard_kills = []
         self._memguard_lock = threading.Lock()
         self._memguard_panes_cache = None  # (running tmux names, {(pane pid, start)})
@@ -26966,6 +27122,10 @@ class SessionManager:
         # claude wrote before it as history it missed (XERK-1845 qaPartial).
         if not resume and not resume_id and isinstance(sess.get("id"), str):
             self.sess_state[sess["id"]] = {"primed": True, "qaComplete": True}
+        # Stop any message still being typed into this pane name before the new
+        # process owns it: its Enter would land in the relaunched conversation
+        # (rollup XERK-1701 #70.1). Every launch passes here, restart included.
+        _retire_pane_writers(sess.get("tmuxName"))
         # Runtime dispatch (XERK-460). _launch_tmux is the ONE launch choke point
         # every path goes through (spawn provision, resume, restart, resume-any,
         # resume-on-boot), so the claude-vs-dsh branch lives here rather than at
@@ -30739,8 +30899,9 @@ class SessionManager:
         same "only the beat writes+saves the registry" discipline prune/archive/
         dsh-peer keep. (Its one in-memory registry touch is _clear_trust_dialog
         clearing `trustCheckUntil`, a benign key pop that never save()s.) Direct
-        callers (notify_session's fallback, tests) leave it False and are already
-        on the beat, so they record inline as before.
+        callers (tests) leave it False and record inline. notify_session's pane
+        fallback STAGES onto the worker like an `input` command: nothing types on
+        the beat.
 
         Machine-generated messages go to notify_session instead (XERK-340): the
         pane is what a person types into, and what this manager composes has a
@@ -30809,7 +30970,11 @@ class SessionManager:
             log(f"input for session {sid} held: Claude Code is still asking "
                 f"whether to trust this workspace — answer that first")
             return
-        _type_into_pane(sess["tmuxName"], text)
+        if _type_into_pane(sess["tmuxName"], text) is None:
+            # Nothing reached the conversation (a dialog owned the pane, or it was
+            # relaunched mid-message): there is nothing to confirm or resend.
+            log(f"input for session {sid} not delivered")
+            return
         if defer_record:
             # Off the beat: hand the outbox record + naming to the beat, which is
             # the only thread that may mutate the registry / self.summaries / save.
@@ -30860,6 +31025,7 @@ class SessionManager:
                 del self.input_queue[:over]
                 log(f"input queue past {INPUT_QUEUE_MAX}; dropped {over} oldest "
                     f"undelivered message(s)")
+        self._revive_input_worker()
         self._input_wake.set()
 
     def _stage_resend(self, sid, text):
@@ -30871,7 +31037,20 @@ class SessionManager:
             if over > 0:
                 del self.resend_queue[:over]
                 log(f"resend queue past {INPUT_QUEUE_MAX}; dropped {over} oldest")
+        self._revive_input_worker()
         self._input_wake.set()
+
+    def _revive_input_worker(self):
+        """Restart an input worker that DIED (a BaseException its loop does not
+        catch), so staged messages are not parked forever. Never starts the first
+        one: run_forever does that."""
+        with self._input_lock:
+            w = self._input_worker
+            if w is None or w.is_alive():
+                return
+            self.resend_inflight = []
+            log("input worker had died; restarting it")
+        self._start_input_worker()
 
     def _resend_queued(self, sid, text):
         """Is this message already waiting in `resend_queue`, or in the batch the
@@ -30887,20 +31066,30 @@ class SessionManager:
         with self._input_lock:
             batch, self.resend_queue = self.resend_queue, []
             self.resend_inflight = list(batch)
-        for sid, text in batch:
-            try:
-                sess = self._find(sid)
-                if (not sess or sess.get("status") != "running"
-                        or not any(p.get("text") == text
-                                   for p in sess.get("pendingInputs") or [])):
-                    continue
-                _type_into_pane(sess.get("tmuxName"), text)
-            except Exception as e:
-                log(f"resend failed for session {sid}: {type(e).__name__}: {e}")
-            finally:
-                with self._input_lock:
-                    if (sid, text) in self.resend_inflight:
-                        self.resend_inflight.remove((sid, text))
+        try:
+            for sid, text in batch:
+                try:
+                    sess = self._find(sid)
+                    # The epoch is read BEFORE the outbox: a restart pops the
+                    # outbox before it relaunches (bumping the epoch), so either
+                    # this sees the message gone or its typing stops at the bump.
+                    epoch = _pane_epoch(sess.get("tmuxName")) if sess else 0
+                    if (not sess or sess.get("status") != "running"
+                            or not any(p.get("text") == text
+                                       for p in sess.get("pendingInputs") or [])):
+                        continue
+                    _type_into_pane(sess.get("tmuxName"), text, epoch=epoch)
+                except Exception as e:
+                    log(f"resend failed for session {sid}: {type(e).__name__}: {e}")
+                finally:
+                    with self._input_lock:
+                        if (sid, text) in self.resend_inflight:
+                            self.resend_inflight.remove((sid, text))
+        finally:
+            # Whatever ends the batch -- a BaseException included -- nothing of it
+            # stays "in flight": the beat would keep waiting on it forever.
+            with self._input_lock:
+                self.resend_inflight = []
 
     def _start_input_worker(self):
         """Start the input-delivery worker once (from run_forever). Idempotent and
@@ -31150,8 +31339,7 @@ class SessionManager:
 
     def _deliver_memguard_kills(self):
         """Tell each running session the guard killed a tree of, over its inbox
-        (XERK-1019). On the beat, because notify_session's pane fallback records
-        an outbox entry and saves. A tree whose session has ended was orphaned
+        (XERK-1019). On the beat, because notify_session is beat-only. A tree whose session has ended was orphaned
         work; the guard's log line is its only record."""
         with self._memguard_lock:
             kills, self.memguard_kills = self.memguard_kills, []
@@ -31208,7 +31396,10 @@ class SessionManager:
                 f"pane instead")
         # Past INPUT_MAX_CHARS too: send_input owns that refusal, and one place
         # deciding it is what keeps the message and the log line consistent.
-        self.send_input(sid, text)
+        # STAGED for the input worker, never typed here: this runs on the beat,
+        # and a typed message waits out its draw and submit deadlines (seconds;
+        # on Windows each wait is a control-channel RPC).
+        self._stage_input(sid, text)
         return False
 
     def _poll_pending_inputs(self):
@@ -31282,7 +31473,14 @@ class SessionManager:
                     if self._resend_queued(sess["id"], text):
                         # Still waiting for (or being typed by) the input worker: a
                         # second compaction must not queue it twice, nor give it up
-                        # before it is typed. Judged again once the worker is done.
+                        # before it is typed. Judged again once the worker is done --
+                        # but never kept past the TTL, which is what drops one a dead
+                        # or wedged worker will never get to.
+                        if now - item.get("at", now) > PENDING_INPUT_TTL_SEC:
+                            changed = True
+                            log(f"queued re-send expired untyped in session "
+                                f"{sess['id']}")
+                            continue
                         keep.append(item)
                         continue
                     if item.get("attempts", 1) >= PENDING_INPUT_MAX_ATTEMPTS:
@@ -33789,11 +33987,18 @@ class SessionManager:
         if not main:
             self.subagent_history_results.append(result)
             return
-        row_id = _live_agent_resolve_id(self.sess_state.get(sid) or {}, agent_type, label)
+        row_id, row_rank = _live_agent_resolve_id(
+            self.sess_state.get(sid) or {}, agent_type, label, with_rank=True)
+        # An unlabelled row the index answers only with a LABELLED launch: its own
+        # unlabelled launch may predate a manager restart (not indexed) yet still
+        # be in the window, so the window, which ranks the same way, speaks first.
+        window_first = bool(row_id) and row_rank == 0
         if (agent_type or "").strip() == "workflow":
             # row_id is the run's runId; fall back to the windowed launch scan.
-            run_dir = (_workflow_run_dir(main, row_id) if row_id else None) \
-                or _resolve_workflow_run(main, label)
+            by_index = lambda: _workflow_run_dir(main, row_id) if row_id else None
+            by_window = lambda: _resolve_workflow_run(main, label)
+            first, second = (by_window, by_index) if window_first else (by_index, by_window)
+            run_dir = first() or second()
             if not run_dir:
                 self.subagent_history_results.append(result)
                 return
@@ -33807,8 +34012,10 @@ class SessionManager:
             path = _workflow_agent_path(run_dir, agent_id)
         else:
             # row_id is the agentId that names the transcript file directly.
-            path = (_subagent_transcript_path(main, row_id) if row_id else None) \
-                or _resolve_subagent(main, agent_type, label)
+            by_index = lambda: _subagent_transcript_path(main, row_id) if row_id else None
+            by_window = lambda: _resolve_subagent(main, agent_type, label)
+            first, second = (by_window, by_index) if window_first else (by_index, by_window)
+            path = first() or second()
         if not path:
             self.subagent_history_results.append(result)
             return
