@@ -219,6 +219,9 @@ private fun parseEmph(text: String, depth: Int = 0): List<Span> {
 // ---- inline code spans (chat.js renderInline) -----------------------------
 // A backtick run opens a span that closes on the next run of EXACTLY the same
 // length; a span never crosses a line break, and an unclosed run is literal.
+/** One line's backtick runs of a single length, in order, with a forward cursor. */
+private class RunList { val at = ArrayList<Int>(); var k = 0 }
+
 private fun runLen(s: String, i: Int): Int { var n = 0; while (i + n < s.length && s[i + n] == '`') n++; return n }
 
 private fun codeSpanBody(body: String): String {
@@ -233,23 +236,30 @@ private fun parseInline(text: String): List<Span> {
     if (!text.contains('`')) return parseEmph(text)
     val out = ArrayList<Span>()
     var i = 0
-    // The current line's end, cached across openers (as chat.js renderInline): a
-    // per-opener scan was quadratic on one long line of spans. MAX once none is left.
+    // The current line's backtick runs, indexed by length once per line (as chat.js
+    // renderInline): an opener's closer is the next run of its length on the line.
+    // A scan per opener was quadratic on one long line of spans, and N^1.5 on a line
+    // of unclosed runs of distinct lengths. MAX once no newline is left.
     var eol = -1
+    var runs = HashMap<Int, RunList>()
     while (i < text.length) {
         val open = text.indexOf('`', i)
         if (open < 0) { out.addAll(parseEmph(text.substring(i))); break }
         val n = runLen(text, open)
-        var j = open + n
-        var close = -1
-        if (eol < open + n) { val k = text.indexOf('\n', open + n); eol = if (k < 0) Int.MAX_VALUE else k }
-        while (j < text.length) {
-            val c = text.indexOf('`', j)
-            if (c < 0 || eol < c) break
-            val m = runLen(text, c)
-            if (m == n) { close = c; break }
-            j = c + m
+        if (eol < open + n) {
+            val k = text.indexOf('\n', open + n); eol = if (k < 0) Int.MAX_VALUE else k
+            runs = HashMap()
+            var c = open
+            while (c in 0 until eol) {
+                val m = runLen(text, c)
+                runs.getOrPut(m) { RunList() }.at.add(c)
+                c = text.indexOf('`', c + m)
+            }
         }
+        // Openers arrive in order, so each length's cursor only moves forward.
+        val r = runs.getValue(n)
+        while (r.k < r.at.size && r.at[r.k] <= open) r.k++
+        val close = if (r.k < r.at.size) r.at[r.k] else -1
         if (close < 0) { out.addAll(parseEmph(text.substring(i, open + n))); i = open + n; continue } // unclosed: literal
         out.addAll(parseEmph(text.substring(i, open)))
         out.add(Span.Code(codeSpanBody(text.substring(open + n, close))))

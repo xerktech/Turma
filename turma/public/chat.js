@@ -372,24 +372,31 @@
     const s = normalizeEol(String(text == null ? "" : text));
     if (s.indexOf("`") < 0) return renderEmph(s); // no backtick → nothing to lift out
     let out = "", i = 0;
-    // The current line's end, cached across openers and re-found only once an
-    // opener is past it: per-opener (or per-backtick) scans were quadratic on one
-    // long line of spans (rollup XERK-1701). Infinity once no newline is left.
-    let eol = -1;
+    // The current line's backtick runs, indexed by length once per line (rollup
+    // XERK-1701): an opener's closer is the next run of its length on the line.
+    // Scanning to it per opener was quadratic on one long line of spans, and
+    // still N^1.5 on a line of unclosed runs of distinct lengths, each of which
+    // scanned to the line end. `eol` is Infinity once no newline is left.
+    let eol = -1, runs = null;
     while (i < s.length) {
       const open = s.indexOf("`", i);
       if (open < 0) { out += renderEmph(s.slice(i)); break; }
       const n = runLen(s, open);
-      // Scan for a closing run of the same length, bailing at a line break.
-      let j = open + n, close = -1;
-      if (eol < open + n) { const k = s.indexOf("\n", open + n); eol = k < 0 ? Infinity : k; }
-      while (j < s.length) {
-        const c = s.indexOf("`", j);
-        if (c < 0 || eol < c) break;
-        const m = runLen(s, c);
-        if (m === n) { close = c; break; }
-        j = c + m;
+      if (eol < open + n) {
+        const k = s.indexOf("\n", open + n); eol = k < 0 ? Infinity : k;
+        runs = new Map();
+        for (let c = open; c >= 0 && c < eol; ) {
+          const m = runLen(s, c);
+          let r = runs.get(m);
+          if (!r) runs.set(m, (r = { at: [], k: 0 }));
+          r.at.push(c);
+          c = s.indexOf("`", c + m);
+        }
       }
+      // Openers arrive in order, so each length's cursor only moves forward.
+      const r = runs.get(n);
+      while (r.k < r.at.length && r.at[r.k] <= open) r.k++;
+      const close = r.k < r.at.length ? r.at[r.k] : -1;
       if (close < 0) { out += renderEmph(s.slice(i, open + n)); i = open + n; continue; } // unclosed: literal
       out += renderEmph(s.slice(i, open)) + codeSpan(s.slice(open + n, close));
       i = close + n;
