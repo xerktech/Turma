@@ -185,6 +185,9 @@ class ProseTest {
         parseProse("x``" + " `".repeat(1_000_000))
         parseProse("`a` ".repeat(1_000_000))
         assertTrue("took too long", (System.nanoTime() - t) / 1_000_000 < 10_000)
+        // A span on a later line of the paragraph still closes (the cached line end is re-found).
+        val spans = parseProse("`a`\n`b`").flatMap { (it as? ProseBlock.Paragraph)?.spans.orEmpty() }
+        assertEquals(2, spans.count { it is Span.Code })
         // Curly quotes peel out of a bare URL too, as on the web.
         val link = parseProse("see https://x.io/a’”.").flatMap { (it as? ProseBlock.Paragraph)?.spans.orEmpty() }
             .filterIsInstance<Span.Link>().single()
