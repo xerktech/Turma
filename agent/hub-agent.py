@@ -23028,6 +23028,7 @@ class SessionManager:
         # Compaction resends (_poll_pending_inputs) to TYPE off the beat: [(sid, text)].
         # Already on the outbox, so delivery records nothing (rollup XERK-1701 #70.1).
         self.resend_queue = []
+        self.resend_inflight = []                # the worker's batch, not yet all typed
         # Sids of the batch the worker is delivering right now (popped off
         # input_queue, not yet landed): a sleeper pause (XERK-1575) must see a
         # message in flight as well as one still queued.
@@ -30873,9 +30874,10 @@ class SessionManager:
         self._input_wake.set()
 
     def _resend_queued(self, sid, text):
-        """Is this message already waiting in `resend_queue`?"""
+        """Is this message already waiting in `resend_queue`, or in the batch the
+        worker has taken and not finished typing?"""
         with self._input_lock:
-            return (sid, text) in self.resend_queue
+            return (sid, text) in self.resend_queue or (sid, text) in self.resend_inflight
 
     def _deliver_staged_resends(self):
         """Type the staged compaction resends (input worker). A message the
@@ -30884,6 +30886,7 @@ class SessionManager:
         conversation never gets the old one's text. Never raises."""
         with self._input_lock:
             batch, self.resend_queue = self.resend_queue, []
+            self.resend_inflight = list(batch)
         for sid, text in batch:
             try:
                 sess = self._find(sid)
@@ -30894,6 +30897,10 @@ class SessionManager:
                 _type_into_pane(sess.get("tmuxName"), text)
             except Exception as e:
                 log(f"resend failed for session {sid}: {type(e).__name__}: {e}")
+            finally:
+                with self._input_lock:
+                    if (sid, text) in self.resend_inflight:
+                        self.resend_inflight.remove((sid, text))
 
     def _start_input_worker(self):
         """Start the input-delivery worker once (from run_forever). Idempotent and
@@ -31272,16 +31279,19 @@ class SessionManager:
                     # A compaction fired since this was sent and the pane is idle,
                     # yet it is neither a delivered turn nor still queued: the
                     # compaction ate it. Re-send (bounded), one per beat.
+                    if self._resend_queued(sess["id"], text):
+                        # Still waiting for (or being typed by) the input worker: a
+                        # second compaction must not queue it twice, nor give it up
+                        # before it is typed. Judged again once the worker is done.
+                        keep.append(item)
+                        continue
                     if item.get("attempts", 1) >= PENDING_INPUT_MAX_ATTEMPTS:
                         changed = True
                         log(f"gave up re-sending a compaction-dropped message "
                             f"in session {sess['id']}")
                         continue
-                    if resent or self._resend_queued(sess["id"], text):
-                        # Already re-sent one this beat, or this one is still waiting
-                        # for the input worker: a second compaction must not queue
-                        # it twice. Judged again once the worker has typed it.
-                        keep.append(item)
+                    if resent:
+                        keep.append(item)   # already re-sent one this beat
                         continue
                     # Typed by the input worker, never here: a typed submit waits
                     # out its draw and submit deadlines, seconds on the beat.

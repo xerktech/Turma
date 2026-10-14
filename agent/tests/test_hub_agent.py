@@ -15138,6 +15138,34 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.resend_queue, [("s1", "hi")])
         self.assertEqual(sess["pendingInputs"][0]["attempts"], 2)
 
+    def test_a_resend_in_the_workers_batch_is_not_queued_again(self):
+        # QA (rollup #70.1, D1b): the worker swaps the queue into its own batch
+        # before typing. While it types s1's resend, s2's sits in that batch; a
+        # second s2 compaction must not queue s2 again. An item at the attempt cap
+        # is kept, not given up, while its resend still waits (N3).
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
+                                       "attempts": ha.PENDING_INPUT_MAX_ATTEMPTS,
+                                       "compactBase": 0}])
+        self._write_transcript(wt, [{"type": "system", "subtype": "compact_boundary",
+                                     "compactMetadata": {"trigger": "auto"}}])
+        polled = []
+
+        def fake_type(name, text):
+            if not polled:                       # mid-batch: the beat runs again
+                with self._pane(False):
+                    sm._poll_pending_inputs()
+                polled.append(list(sm.resend_queue))
+            return True
+        sm.resend_queue = [("other", "x"), ("s1", "hi")]
+        sm.registry.append({"id": "other", "status": "running", "tmuxName": "agent-o",
+                            "pendingInputs": [{"text": "x"}]})
+        with mock.patch.object(ha, "_type_into_pane", side_effect=fake_type):
+            sm._deliver_staged_resends()
+        self.assertEqual(polled, [[]])                       # nothing queued twice
+        self.assertEqual(len(sess.get("pendingInputs") or []), 1)  # not given up
+        self.assertEqual(sm.resend_inflight, [])
+
     def test_the_input_worker_thread_types_a_lone_resend(self):
         # The real worker thread, not a direct call: a resend with no operator
         # input behind it must still be typed (the loop's exit test covers both
