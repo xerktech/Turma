@@ -190,12 +190,16 @@ describe("render: home", () => {
   // wrapText breaks only on whitespace, so clipping via its first line reduced a
   // spaceless name (a slug, CJK) to just its status glyph — every row read "!…".
   it("clips a spaceless or CJK row by character, keeping the readable start of the name", () => {
-    const labels = [
+    const labels: string[] = [
       "very-long-label-number-0-that-definitely-wraps-past-the-glasses-canvas-width-and-then-some",
       "A".repeat(96),
       "这是一个非常长的会话标签名称它没有任何空格所以不能在空白处换行".repeat(3),
       "first paragraph of a label\nsecond paragraph that would otherwise vanish entirely here ok",
     ];
+    // A spaceless label just a few px too wide — the case a loose fit check misses.
+    let nearMiss = "B";
+    while (measureDefault(`> - ${nearMiss}-s4`) <= LINE_WIDTH_PX) nearMiss += "B";
+    labels.push(nearMiss);
     const sessions = labels.map((label, i) => session({ id: `s${i}`, label, session: signals({ transcriptAgeSec: 999 }) }));
     const lines = asLines(render(base({ agents: [agent({ sessions })], home: { cursor: 1 } })));
     labels.forEach((label, i) => {
