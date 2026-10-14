@@ -784,7 +784,7 @@ private fun TicketCard(
                         },
                         color = when (action) {
                             "approve" -> TurmaColors.good
-                            "hold" -> TurmaColors.waitingText()
+                            "hold" -> TurmaColors.warning
                             else -> TurmaColors.critical
                         },
                     )
