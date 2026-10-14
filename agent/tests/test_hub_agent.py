@@ -15037,6 +15037,8 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
              "compactMetadata": {"trigger": "auto"}}])
         with self._pane(False):
             sm._poll_pending_inputs()
+            self.assertEqual(self.run_calls, [])   # staged, never typed on the beat
+            sm._deliver_staged_resends()
         # Re-typed the same way a first send goes in: pasted, then Enter.
         self.assertEqual(self.run_stdin_calls, [
             (["tmux", "-L", "turma", "load-buffer", "-b", "turma-input-agent-s1", "-"], "hi there"),
@@ -15098,9 +15100,27 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
              "compactMetadata": {"trigger": "auto"}}])
         with self._pane(False):
             sm._poll_pending_inputs()
+            sm._deliver_staged_resends()
         # Exactly one message re-typed this beat (paste + Enter); the other waits.
         self.assertEqual([data for _cmd, data in self.run_stdin_calls], ["one"])
         self.assertEqual(len(sess["pendingInputs"]), 2)
+
+    def test_a_staged_resend_the_session_no_longer_holds_is_skipped(self):
+        # Rollup XERK-1701 #70.1: the resend is typed off the beat. If the message
+        # left the outbox before the worker got to it (delivered, or a clear-context
+        # restart), it must not be typed into the session.
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
+                                       "attempts": 1, "compactBase": 0}])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with self._pane(False):
+            sm._poll_pending_inputs()
+            sess.pop("pendingInputs")
+            sm._deliver_staged_resends()
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(self.run_stdin_calls, [])
 
     def test_expired_unconfirmed_message_is_dropped(self):
         sm = self.make_manager()

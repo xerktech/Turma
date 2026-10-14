@@ -103,7 +103,7 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
     since the earlier ones already sit in the composer. Residuals: a second failure leaves them
     there for the NEXT message to submit; a lost reply on a slice that DID land types it twice.
   - `_type_into_pane` holds `_PANE_TYPE_LOCKS` on Windows too: N injects from two writers (input
-    worker, beat resend, qwen peer) would otherwise splice into one turn.
+    worker, qwen peer) would otherwise splice into one turn.
 - **The multi-line retry loop is bounded by a WALL CLOCK, not just the iteration count** (XERK-867,
   `PTY_SUBMIT_DEADLINE_SEC`): each iteration's `_capture_pane` + Enter is a ~5s-class control RPC, so
   `PTY_SUBMIT_MAX_RETRIES` alone let one degraded multi-line paste run ~15-30s. That was load-bearing

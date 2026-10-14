@@ -23025,6 +23025,9 @@ class SessionManager:
         # pop cannot tear it); do NOT grow the worker to write records or save().
         self.input_queue = []                    # [(sid, text, uploads)] to deliver
         self.input_landed = []                   # [(sid, typed, text)] to record on the beat
+        # Compaction resends (_poll_pending_inputs) to TYPE off the beat: [(sid, text)].
+        # Already on the outbox, so delivery records nothing (rollup XERK-1701 #70.1).
+        self.resend_queue = []
         # Sids of the batch the worker is delivering right now (popped off
         # input_queue, not yet landed): a sleeper pause (XERK-1575) must see a
         # message in flight as well as one still queued.
@@ -30858,6 +30861,35 @@ class SessionManager:
                     f"undelivered message(s)")
         self._input_wake.set()
 
+    def _stage_resend(self, sid, text):
+        """Queue a compaction resend for the input worker to type. Same bound and
+        drop-oldest rule as `_stage_input`."""
+        with self._input_lock:
+            self.resend_queue.append((sid, text))
+            over = len(self.resend_queue) - INPUT_QUEUE_MAX
+            if over > 0:
+                del self.resend_queue[:over]
+                log(f"resend queue past {INPUT_QUEUE_MAX}; dropped {over} oldest")
+        self._input_wake.set()
+
+    def _deliver_staged_resends(self):
+        """Type the staged compaction resends (input worker). A message the
+        session no longer holds on its outbox (delivered meanwhile, cleared by a
+        clear-context restart, the session gone) is skipped, so a relaunched
+        conversation never gets the old one's text. Never raises."""
+        with self._input_lock:
+            batch, self.resend_queue = self.resend_queue, []
+        for sid, text in batch:
+            try:
+                sess = self._find(sid)
+                if (not sess or sess.get("status") != "running"
+                        or not any(p.get("text") == text
+                                   for p in sess.get("pendingInputs") or [])):
+                    continue
+                _type_into_pane(sess.get("tmuxName"), text)
+            except Exception as e:
+                log(f"resend failed for session {sid}: {type(e).__name__}: {e}")
+
     def _start_input_worker(self):
         """Start the input-delivery worker once (from run_forever). Idempotent and
         restart-safe: a relaunched loop that finds a live worker is a no-op."""
@@ -30879,8 +30911,9 @@ class SessionManager:
             try:
                 while True:
                     with self._input_lock:
-                        if not self.input_queue:
+                        if not self.input_queue and not self.resend_queue:
                             break
+                    self._deliver_staged_resends()
                     self._deliver_staged_inputs()
             except Exception as e:
                 log(f"input worker error: {type(e).__name__}: {e}")
@@ -31242,7 +31275,9 @@ class SessionManager:
                     if resent:
                         keep.append(item)   # already re-sent one this beat
                         continue
-                    _type_into_pane(tmux_name, text)
+                    # Typed by the input worker, never here: a typed submit waits
+                    # out its draw and submit deadlines, seconds on the beat.
+                    self._stage_resend(sess["id"], text)
                     item["attempts"] = item.get("attempts", 1) + 1
                     item["compactBase"] = compactions  # only a NEWER compaction re-loses it
                     item["at"] = now
