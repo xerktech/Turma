@@ -96,17 +96,26 @@ describe("EvenHubDisplay", () => {
   });
 
   describe("start", () => {
-    it("creates exactly one full-canvas text container with isEventCapture: 1", async () => {
+    it("creates a full-canvas text container that is NOT the capture container, plus one transparent capture overlay", async () => {
       const { bridge, startCalls } = fakeBridge();
       const display = new EvenHubDisplay(bridge);
       await display.start();
 
       expect(startCalls).toHaveLength(1);
       const call = startCalls[0]!;
-      expect(call.containerTotalNum).toBe(1);
-      expect(call.textObject).toHaveLength(1);
-      const container = call.textObject![0]!;
-      expect(container.isEventCapture).toBe(1);
+      expect(call.containerTotalNum).toBe(2);
+      expect(call.textObject).toHaveLength(2);
+      // The firmware natively scrolls (with a scroll bar) the capture
+      // container when its content overflows, so a swipe on a long home list
+      // would move the page before our selector. Capture must sit on an empty
+      // overlay, never on the container showing the list.
+      const captures = call.textObject!.filter((c) => c.isEventCapture === 1);
+      expect(captures).toHaveLength(1);
+      expect(captures[0]!.content).toBe(" ");
+      expect(captures[0]!.width).toBe(576);
+      expect(captures[0]!.height).toBe(288);
+      const container = call.textObject!.find((c) => c.containerName === "main")!;
+      expect(container.isEventCapture).toBe(0);
       expect(container.width).toBe(576);
       expect(container.height).toBe(288);
       expect(container.xPosition).toBe(0);
@@ -409,16 +418,16 @@ describe("EvenHubDisplay", () => {
 
       // Going "back home" — a lines screen. The session layout (containers
       // 1-4) is on screen, so a bare textContainerUpgrade to container 0
-      // would no-op; this must rebuild back to one container.
+      // would no-op; this must rebuild back to the lines layout.
       display.render(linesModel(["TURMA 0 run", "  + New session"]));
 
       expect(rebuildCalls).toHaveLength(2);
       const backContainers = rebuildCalls[1]!.textObject!;
-      expect(backContainers).toHaveLength(1);
-      const single = backContainers[0]!;
+      expect(backContainers).toHaveLength(2);
+      expect(backContainers.filter((c) => c.isEventCapture === 1)).toHaveLength(1);
+      const single = backContainers.find((c) => c.containerName === "main")!;
       expect(single.containerID).toBe(0);
-      expect(single.containerName).toBe("main");
-      expect(single.isEventCapture).toBe(1);
+      expect(single.isEventCapture).toBe(0);
       expect(single.width).toBe(576);
       expect(single.height).toBe(288);
       expect(single.content).toBe("TURMA 0 run\n  + New session");
