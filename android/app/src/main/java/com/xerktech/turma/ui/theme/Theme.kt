@@ -88,6 +88,19 @@ object TurmaColors {
     @Composable
     fun waitingText(): Color =
         if (MaterialTheme.colorScheme.surface.luminance() > 0.5f) WarningTextLight else Warning
+
+    // Status TEXT as the web's `--good-text` / `--accent-text` / `--critical-text`
+    // (app.css): the fills drop under 4.5:1 as small text on the dark surface, so
+    // dark steps them up; light keeps the web's own values (rollup XERK-1701).
+    @Composable
+    fun workingText(): Color = if (isLight()) Good else GoodTextDark
+    @Composable
+    fun reviewText(): Color = if (isLight()) AccentTextLight else AccentTextDark
+    @Composable
+    fun criticalText(): Color = if (isLight()) Critical else CriticalTextDark
+
+    @Composable
+    private fun isLight() = MaterialTheme.colorScheme.surface.luminance() > 0.5f
 }
 
 @Composable

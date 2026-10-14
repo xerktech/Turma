@@ -1138,10 +1138,11 @@ private fun SessionListCard(
                     cs.label + if (r.terminalOnline) "" else "\u00A0·\u00A0terminal offline",
                     style = MaterialTheme.typography.bodySmall,
                     color = when (cs.tone) {
-                        CardTone.WORKING -> com.xerktech.turma.ui.theme.TurmaColors.working
+                        // Text tones, as sessions.html `.state.*` (web --*-text tokens).
+                        CardTone.WORKING -> com.xerktech.turma.ui.theme.TurmaColors.workingText()
                         CardTone.WAITING -> com.xerktech.turma.ui.theme.TurmaColors.waitingText()
-                        CardTone.REVIEW -> com.xerktech.turma.ui.theme.TurmaColors.review
-                        CardTone.STALLED -> MaterialTheme.colorScheme.error
+                        CardTone.REVIEW -> com.xerktech.turma.ui.theme.TurmaColors.reviewText()
+                        CardTone.STALLED -> com.xerktech.turma.ui.theme.TurmaColors.criticalText()
                         CardTone.HOLDING, CardTone.IDLE -> MaterialTheme.colorScheme.onSurfaceVariant
                     },
                     fontWeight = if (cs.tone == CardTone.WAITING || cs.tone == CardTone.REVIEW ||
