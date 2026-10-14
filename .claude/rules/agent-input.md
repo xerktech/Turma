@@ -21,6 +21,10 @@ composed.**
     sent (`compactBase` rose) AND it's neither delivered nor in the folded live queue AND the pane
     has settled idle (`_pane_busy` False, not None). `delivered` matches by text, biased AGAINST
     resend. Bounded by `PENDING_INPUT_MAX_ATTEMPTS`/`PENDING_INPUT_TTL_SEC`, one per beat.
+  - **The beat only STAGES a resend** (`_stage_resend`); the input worker types it
+    (`_deliver_staged_resends`), skipping one the session no longer holds on its outbox (delivered,
+    or cleared by a clear-context restart) so a new conversation never gets the old one's text.
+    Typing on the beat cost ~36s per message with a wedged tmux (rollup XERK-1701 #70.1).
   - Outbox is internal (not heartbeated), cleared on restart-clear-context; text typed directly into
     the raw ttyd terminal bypasses `send_input` and isn't covered.
   - Tests: `TestPendingScan`, `TestPollPendingInputs`, `TestSendInput`.
@@ -31,11 +35,12 @@ composed.**
   words as pasted DATA. So text ≤ `PASTE_SLICED_MAX_CHARS` with nothing in `_SLICE_UNSAFE_RE` goes
   in `PASTE_CHUNK_CHARS` slices with `-r` (LF = Ctrl+J = line break; tmux's default CR submits).
   - Do not slice past the cap or with astral/ZWJ/VS chars: typed dense emoji past ~10K chars never
-    submit and arrive corrupted, and slicing costs ~2 tmux calls per slice ON THE BEAT (resend, qwen
-    peer). Those keep one bracketed paste; `chat.js` `stripFraming` hides the tags.
+    submit and arrive corrupted, and slicing costs ~2 tmux calls per slice on a worker (input,
+    compaction resend, qwen peer). Those keep one bracketed paste; `chat.js` `stripFraming`
+    hides the tags.
   - A typed TAB is autocomplete, so tabs go as 4 spaces. One writer per pane (`_PANE_TYPE_LOCKS`).
   - **The cap is judged on the text AS TYPED** (tabs already 4 spaces), on tmux and Windows alike:
-    judged before, 4000 tabs became 40 slices, each a pane call, on the beat's resend path.
+    judged before, 4000 tabs became 40 slices, each a pane call.
   - **A pane's lock entry lives only while a writer uses it** (`[lock, users]`): a writer counts
     itself in under the guard BEFORE waiting, the last out drops it. Never prune on kill/teardown
     instead — a waiting writer would hold the old lock while a newcomer got a fresh one.
@@ -66,9 +71,9 @@ composed.**
   - **Never read one empty composer as "sent"** — a loaded TUI draws typed text seconds late, and
     stopping there left 7/12 stuck in QA. A FRESH session swallows its first Enter whatever the
     gap, so the re-press, not the settle, is the fix. Never Enter on a busy pane (it may be a
-    dialog next). Beat cost on the compaction resend: the draw deadline + the submit deadline
-    (each can overshoot by one 5s capture), plus up to `PANE_TYPE_LOCK_WAIT_SEC` waiting out a writer.
-    Tests: `TestSubmitTyped`.
+    dialog next). A message's cost is the draw deadline + the submit deadline (each can
+    overshoot by one 5s capture), plus up to `PANE_TYPE_LOCK_WAIT_SEC` waiting out a writer —
+    so nothing types on the beat. Tests: `TestSubmitTyped`.
   - **Except a composer that HELD the text before Enter and now shows none of it** (`held`,
     XERK-1853): that is a send. On a short pane (40x12) the turn wraps or scrolls off, so the
     count never rises and every send waited out the deadline holding the pane lock. A fragment of

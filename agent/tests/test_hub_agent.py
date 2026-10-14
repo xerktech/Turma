@@ -15037,6 +15037,8 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
              "compactMetadata": {"trigger": "auto"}}])
         with self._pane(False):
             sm._poll_pending_inputs()
+            self.assertEqual(self.run_calls, [])   # staged, never typed on the beat
+            sm._deliver_staged_resends()
         # Re-typed the same way a first send goes in: pasted, then Enter.
         self.assertEqual(self.run_stdin_calls, [
             (["tmux", "-L", "turma", "load-buffer", "-b", "turma-input-agent-s1", "-"], "hi there"),
@@ -15098,9 +15100,101 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
              "compactMetadata": {"trigger": "auto"}}])
         with self._pane(False):
             sm._poll_pending_inputs()
+            sm._deliver_staged_resends()
         # Exactly one message re-typed this beat (paste + Enter); the other waits.
         self.assertEqual([data for _cmd, data in self.run_stdin_calls], ["one"])
         self.assertEqual(len(sess["pendingInputs"]), 2)
+
+    def test_a_staged_resend_the_session_no_longer_holds_is_skipped(self):
+        # Rollup XERK-1701 #70.1: the resend is typed off the beat. If the message
+        # left the outbox before the worker got to it (delivered, or a clear-context
+        # restart), it must not be typed into the session.
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
+                                       "attempts": 1, "compactBase": 0}])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with self._pane(False):
+            sm._poll_pending_inputs()
+            sess.pop("pendingInputs")
+            sm._deliver_staged_resends()
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(self.run_stdin_calls, [])
+
+    def test_a_second_compaction_does_not_queue_a_waiting_resend_twice(self):
+        # QA (rollup #70.1): the worker had not typed the first resend yet when a
+        # second compaction landed; the message was queued, then typed, twice.
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
+                                       "attempts": 1, "compactBase": 0}])
+        boundary = {"type": "system", "subtype": "compact_boundary",
+                    "compactMetadata": {"trigger": "auto"}}
+        self._write_transcript(wt, [boundary])
+        with self._pane(False):
+            sm._poll_pending_inputs()
+            self._write_transcript(wt, [boundary, boundary])
+            sm._poll_pending_inputs()
+        self.assertEqual(sm.resend_queue, [("s1", "hi")])
+        self.assertEqual(sess["pendingInputs"][0]["attempts"], 2)
+
+    def test_a_resend_in_the_workers_batch_is_not_queued_again(self):
+        # QA (rollup #70.1, D1b): the worker swaps the queue into its own batch
+        # before typing. While it types s1's resend, s2's sits in that batch; a
+        # second s2 compaction must not queue s2 again. An item at the attempt cap
+        # is kept, not given up, while its resend still waits (N3).
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
+                                       "attempts": ha.PENDING_INPUT_MAX_ATTEMPTS,
+                                       "compactBase": 0}])
+        self._write_transcript(wt, [{"type": "system", "subtype": "compact_boundary",
+                                     "compactMetadata": {"trigger": "auto"}}])
+        polled = []
+
+        def fake_type(name, text):
+            if not polled:                       # mid-batch: the beat runs again
+                with self._pane(False):
+                    sm._poll_pending_inputs()
+                polled.append(list(sm.resend_queue))
+            return True
+        sm.resend_queue = [("other", "x"), ("s1", "hi")]
+        sm.registry.append({"id": "other", "status": "running", "tmuxName": "agent-o",
+                            "pendingInputs": [{"text": "x"}]})
+        with mock.patch.object(ha, "_type_into_pane", side_effect=fake_type):
+            sm._deliver_staged_resends()
+        self.assertEqual(polled, [[]])                       # nothing queued twice
+        self.assertEqual(len(sess.get("pendingInputs") or []), 1)  # not given up
+        self.assertEqual(sm.resend_inflight, [])
+
+    def test_the_input_worker_thread_types_a_lone_resend(self):
+        # The real worker thread, not a direct call: a resend with no operator
+        # input behind it must still be typed (the loop's exit test covers both
+        # queues), and only for a session still running.
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
+                                       "attempts": 1, "compactBase": 0}])
+        typed = []
+        done = threading.Event()
+
+        def fake_type(name, text):
+            typed.append((name, text, threading.current_thread().name))
+            done.set()
+            return True
+        with mock.patch.object(ha, "_type_into_pane", side_effect=fake_type):
+            sm._start_input_worker()
+            sm.registry.append({"id": "s2", "status": "stopped", "tmuxName": "agent-s2",
+                                "pendingInputs": [{"text": "gone"}]})
+            sm._stage_resend("s2", "gone")
+            sm._stage_resend("s1", "hi")
+            self.assertTrue(done.wait(5))
+        self.assertEqual(typed, [("agent-s1", "hi", "input-deliver")])
+
+    def test_the_resend_queue_is_bounded(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "INPUT_QUEUE_MAX", 2):
+            for i in range(4):
+                sm._stage_resend("s1", f"m{i}")
+        self.assertEqual(sm.resend_queue, [("s1", "m2"), ("s1", "m3")])
 
     def test_expired_unconfirmed_message_is_dropped(self):
         sm = self.make_manager()
