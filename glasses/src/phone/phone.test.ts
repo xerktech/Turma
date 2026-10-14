@@ -36,7 +36,7 @@ function sessionState(id: string, host: string): AppState {
 describe("phone controller", () => {
   let root: HTMLElement;
   let client: Record<string, ReturnType<typeof vi.fn>>;
-  let app: { getState: () => AppState; enterSession: ReturnType<typeof vi.fn>; setOrgFilter: ReturnType<typeof vi.fn>; setAutoStartOrg: ReturnType<typeof vi.fn> };
+  let app: { getState: () => AppState; enterSession: ReturnType<typeof vi.fn>; setOrgFilter: ReturnType<typeof vi.fn>; setAutoStartOrg: ReturnType<typeof vi.fn>; answerQuestion: ReturnType<typeof vi.fn> };
   let handle: ReturnType<typeof mountPhone>;
   let onSignOut: ReturnType<typeof vi.fn>;
   let state: AppState;
@@ -77,6 +77,8 @@ describe("phone controller", () => {
         get state() { return state; },
         setState(p: Partial<AppState>) { state = { ...state, ...p }; handle.render(state); },
       } as unknown as App, site, enabled)),
+      // The real App hides the question then calls the client (app.test.ts).
+      answerQuestion: vi.fn((host: string, id: string, a: unknown) => (client.answerQuestion as unknown as (...x: unknown[]) => unknown)(host, id, a)),
     };
     onSignOut = vi.fn();
     handle = mountPhone({ root, app: app as never, client: client as never, onSignOut: onSignOut as unknown as () => void });
@@ -204,12 +206,13 @@ describe("phone controller", () => {
     );
   });
 
-  it("answering a pending question routes to HubClient.answerQuestion", () => {
+  it("answering a pending question routes through App.answerQuestion", () => {
     state = { ...sessionState("s1", "host-a"),
       agents: [agent({ key: "host-a", sessions: [session({ id: "s1", session: signals({ question: "Go?", questionOptions: ["Yes", "No"] }) })] })] };
     handle.render(state);
     handle.enterFromGlasses("host-a", "s1");
     root.querySelectorAll<HTMLElement>("[data-answer]")[1]!.click();
+    expect(app.answerQuestion).toHaveBeenCalledWith("host-a", "s1", { optionIndex: 1 });
     expect(client.answerQuestion).toHaveBeenCalledWith("host-a", "s1", { optionIndex: 1 });
   });
 

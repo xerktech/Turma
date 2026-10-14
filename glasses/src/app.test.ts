@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { App, FLASH_HUB_UNREACHABLE, FLASH_QUEUED, HEARD_NOTHING, newSessionState } from "./app.ts";
+import { App, FLASH_ANSWERED, FLASH_HUB_UNREACHABLE, FLASH_QUEUED, HEARD_NOTHING, PENDING_TIMEOUT_MS, newSessionState } from "./app.ts";
 import type { HubClient } from "./hub-client.ts";
 import type { GlassesDisplay } from "./display/index.ts";
 import type { Dictation, DictationResult } from "./dictation.ts";
@@ -468,8 +468,93 @@ describe("App", () => {
     expect(app.getState().pending["s1"]).toBeDefined();
 
     await vi.advanceTimersByTimeAsync(0); // flush the answerQuestion promise
-    expect(app.getState().flash).toBe(FLASH_QUEUED);
-    expect(display.lines.some((l) => l.includes("queued"))).toBe(true);
+    expect(app.getState().flash).toBe(FLASH_ANSWERED);
+    expect(display.lines.some((l) => l.includes("answer sent"))).toBe(true);
+  });
+
+  it("sheet mode: an answered question leaves the screen at once, before the send settles, and re-polls immediately", async () => {
+    let settle: (v: { ok: boolean; cmdId: string }) => void = () => {};
+    const listAgents = vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] }));
+    const client = fakeClient({
+      listAgents,
+      answerQuestion: vi.fn(() => new Promise((r) => { settle = r; })),
+    });
+    const app = makeApp(client);
+    await toSheet(app);
+    expect(bottomMode()).toBe("sheet");
+
+    display.emit({ type: "tap" });
+    // Hidden synchronously — no waiting on the POST, the agent's beat, or a poll.
+    expect(bottomMode()).toBe("input");
+    expect(app.getState().agents[0]!.sessions[0]!.session?.question).toBeNull();
+
+    const polls = listAgents.mock.calls.length;
+    settle({ ok: true, cmdId: "answer-1" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(listAgents.mock.calls.length).toBe(polls + 1); // nudged, not the 6s tick
+
+    // The hub still reports the question until the agent's beat lands: it stays hidden.
+    expect(bottomMode()).toBe("input");
+    expect(app.getState().answered["s1"]).toBeDefined();
+  });
+
+  it("sheet mode: the hidden question is forgotten once the hub drops it, so a later identical question shows again", async () => {
+    let agents = [questionAgent()];
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents })) });
+    const app = makeApp(client);
+    await toSheet(app);
+    display.emit({ type: "tap" });
+    await vi.advanceTimersByTimeAsync(0);
+
+    agents = [agent({ sessions: [session({ session: signals({ transcriptAgeSec: 1 }) })] })];
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(app.getState().answered).toEqual({});
+
+    agents = [questionAgent()];
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(bottomMode()).toBe("sheet");
+  });
+
+  it("sheet mode: a different question replacing the answered one shows at once", async () => {
+    let agents = [questionAgent()];
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents })) });
+    const app = makeApp(client);
+    await toSheet(app);
+    display.emit({ type: "tap" });
+    await vi.advanceTimersByTimeAsync(0);
+
+    agents = [questionAgentWith("next?", ["X", "Y"])];
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(bottomMode()).toBe("sheet");
+    expect(app.getState().answered).toEqual({});
+  });
+
+  it("sheet mode: a refused answer brings the question back so the wearer can retry", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })),
+      answerQuestion: vi.fn(async () => { throw Object.assign(new Error("host offline"), { status: 503 }); }),
+    });
+    const app = makeApp(client);
+    await toSheet(app);
+    display.emit({ type: "tap" });
+    expect(bottomMode()).toBe("input");
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.getState().flash).toBe("x host offline");
+    expect(app.getState().answered).toEqual({});
+    expect(bottomMode()).toBe("sheet");
+  });
+
+  it("sheet mode: an answer the agent never applies shows the question again after the pending timeout", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await toSheet(app);
+    display.emit({ type: "tap" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bottomMode()).toBe("input");
+
+    await vi.advanceTimersByTimeAsync(PENDING_TIMEOUT_MS + 6000);
+    expect(bottomMode()).toBe("sheet");
   });
 
   it("sheet mode: tap on option index 0 sends optionIndex 0", async () => {
