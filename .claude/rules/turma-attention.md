@@ -93,13 +93,16 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   `attentionLabel`) plus an ask line / dashboard `Permission` row naming the hub's why (the command),
   falling back to `panePrompt.prompt` from an older hub — never the quoted "Do you want to proceed?".
 - **Stalled is the danger colour on every surface** (`.dot.stalled`, `.state.stalled`,
-  `.sess-stalled`, Android `colorScheme.error`/`TurmaColors.critical`) — never the review accent. A
+  `.sess-stalled`, Android `TurmaColors.criticalText()` on the Sessions state line, `colorScheme.error`
+  on the Dashboard's) — never the review accent. A
   card the hub says stalled where the page can't judge silence (host gone quiet) still reads
   "stalled · <why>" in that tone (`reviewState`).
 - Status TEXT uses `--good-text`/`--accent-text`/`--critical-text`/`--warning-text` (`app.css`):
   the first three equal the fill in light and step UP in dark; amber steps DOWN in light
   (`#8a5a00`, the fill is <2:1 as text there) and is the fill in dark — both clear 4.5:1 on a
   tinted card. "waiting for your answer/permission" (`.sess-wait`, `.state.waiting`) uses it.
+  - Android mirrors them as `TurmaColors.workingText()/reviewText()/criticalText()/waitingText()`
+    (theme by surface luminance); the Sessions state line uses them. Tests: `StatusTextColorsTest`.
 - **Each review card carries a `.why` line** (`attentionWhy`: the why + the time — "for 12m" on
   every needs-you card, "stalled 31m" on a stall; the why is dropped on a
   question/permission/stalled card, whose label or ask line already says it). The age is glued to

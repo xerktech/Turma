@@ -34,6 +34,11 @@ val Good = Color(0xFF12A312)
 val Warning = Color(0xFFFAB219)
 // Amber as text on a light surface (web --warning-text, light).
 val WarningTextLight = Color(0xFF8A5A00)
+// Status text stepped for each surface, as app.css `--*-text` (XERK-1571 contrast set).
+val AccentTextLight = Color(0xFF2A78D6)
+val AccentTextDark = Color(0xFF78AEF2)
+val GoodTextDark = Color(0xFF4CC94C)
+val CriticalTextDark = Color(0xFFF08080)
 val Critical = Color(0xFFD03B3B)
 // A mid purple that reads on both surfaces (web --s5 is #4a3aa7 / #9085e9).
 val Purple = Color(0xFF7D6FE0)
