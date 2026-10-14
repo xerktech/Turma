@@ -188,6 +188,9 @@ class ProseTest {
         // to scan to the line end, N^1.5 (tens of seconds here).
         parseProse("x" + (1..4500).joinToString(" ") { "`".repeat(it) })
         assertTrue("took too long", (System.nanoTime() - t) / 1_000_000 < 10_000)
+        // A code span still stops at a line break.
+        val broken = parseProse("a `b\nc` d").flatMap { (it as? ProseBlock.Paragraph)?.spans.orEmpty() }
+        assertTrue("span crossed a line break", broken.none { it is Span.Code })
         // An opener still closes on the next run of its own length, past longer and shorter ones.
         val mixed = parseProse("``a ` b ``` c`` d").flatMap { (it as? ProseBlock.Paragraph)?.spans.orEmpty() }
         assertEquals(listOf("a ` b ``` c"), mixed.filterIsInstance<Span.Code>().map { it.text })
