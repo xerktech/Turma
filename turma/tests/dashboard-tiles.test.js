@@ -91,7 +91,7 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
     TurmaNav: { preserveScroll: (_el, paint) => paint(), toast: noop },
     TurmaOrg: { get: () => "", update: noop, filter: (a) => orgFilter(a), subscribe: noop, sse: noop,
       orgColors: () => ({}) },
-    TurmaBoard: { orgName: (k) => k || "", orgColorMap: () => new Map() },
+    TurmaBoard: { orgName: (k, o) => o || k || "", orgColorMap: () => new Map() },
     TurmaNewTicket: { update: noop },
     console, URL: global.URL, URLSearchParams: global.URLSearchParams,
   };
@@ -99,7 +99,7 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   const keys = Object.keys(g);
   const fn = new Function(...keys, src +
     "\n;return { render, fmtTokens, applyAgent, connectSSE, contextMeterHtml, refresh, mergeSnapshot," +
-    " autoPausedBadge, refusedBadge, pausedKill, reconcilePending, toggleResume," +
+    " autoPausedBadge, refusedBadge, pausedKill, reconcilePending, toggleResume, hostsOpenToggle," +
     " sseClock: () => sseClock," +
     " setCache: (c) => { cache = c; }, getCache: () => cache };");
   const api = fn(...keys.map((k) => g[k]));
@@ -643,7 +643,10 @@ test("dashboard: the Resume picker does not list a paused sleeper a second time"
   D.setCache({ now, agents: [h] });
   D.toggleResume("vm::web");
   const g = D.els.groups.innerHTML;
-  const picker = g.slice(g.indexOf('<div class="resume-list">'), g.indexOf('<div class="sess paused'));
+  // The paused card is listed under its org, above the Hosts section the picker
+  // lives in, so the picker runs to its own closing tag.
+  const from = g.indexOf('<div class="resume-list">');
+  const picker = g.slice(from, g.indexOf("</div></div>", from));
   assert.ok(picker.includes("Older Work"), picker);
   assert.ok(!picker.includes("t-nap") && !picker.includes("Napping"), picker);
   assert.ok(g.includes('<div class="sess paused">'), "the paused card itself stays");
@@ -688,4 +691,57 @@ test("dashboard: a paused card's Kill arms, confirms, and clears once it is no l
   D.render({ now, agents: [killed] });
   g = D.els.groups.innerHTML;
   assert.ok(!g.includes("Napping") && !g.includes("Killing…"), "an ordinary kill leaves the card grid");
+});
+
+// XERK-1913: the page leads with sessions grouped by STATUS — the Sessions
+// page's sections — with no host name shown; each card names its org. The host
+// cards sit in one collapsed Hosts section below.
+test("dashboard: sessions are grouped by status, host names only in the collapsed Hosts section", () => {
+  const D = loadDashboard();
+  const now = Date.now();
+  const mk = (key, site, orgName, sessions) => ({ ...liveHost(key, 1), jira: site ? { siteKey: site, orgName } : undefined,
+    repos: [{ name: "web", branch: "main" }], sessions });
+  const s = (id, summary, createdMin, extra = {}) => ({ id, summary, status: "running", repo: "web",
+    rcName: "box-web-" + id, createdAt: new Date(now - createdMin * 60e3).toISOString(), ...extra });
+  const busy = { session: { paneBusy: true, transcriptAgeSec: 1 } };
+  const quiet = { session: { paneBusy: false, transcriptAgeSec: 900 } };
+  D.render({ now, agents: [
+    mk("box-a", "acme.atlassian.net", "Acme", [s("a1", "Acme Old", 30, busy), s("a2", "Acme Review", 2,
+      { attention: { state: "needs-you:review", since: now - 60e3, why: "PR open" } })]),
+    mk("box-b", "acme.atlassian.net", "Acme", [s("b1", "Acme New", 1, busy)]),
+    mk("box-c", "zeta.atlassian.net", "Zeta", [s("c1", "Zeta Quiet", 5, quiet),
+      s("c2", "Zeta Waiting", 3, { status: "queued" }), s("c3", "Zeta Done", 9, { status: "stopped" })]),
+  ] });
+  const g = D.els.groups.innerHTML;
+  const cut = g.indexOf('<details class="hosts-admin"');
+  assert.ok(cut > 0, g);
+  const top = g.slice(0, cut), hosts = g.slice(cut);
+  const heads = [...top.matchAll(/<h2 class="status-h">([^<]+?) <span class="count">(\d+)<\/span>/g)]
+    .map(m => m[1] + " " + m[2]);
+  assert.deepEqual(heads, ["Queued 1", "Ready for review 1", "Active 2", "Idle 1", "Stopped 1"]);
+  const sectionOf = (name) => { const i = top.indexOf(`>${name} <`); return top.slice(i, top.indexOf("</section>", i)); };
+  // Active holds both hosts' working sessions, newest first; no org grouping.
+  const active = sectionOf("Active");
+  assert.ok(active.indexOf("Acme New") < active.indexOf("Acme Old"), active);
+  assert.ok(sectionOf("Ready for review").includes("Acme Review"));
+  assert.ok(sectionOf("Idle").includes("Zeta Quiet"));
+  // Each card names its org.
+  assert.ok(top.includes('<span class="sess-org">Acme</span>') && top.includes('<span class="sess-org">Zeta</span>'));
+  // No machine name (nor the RC name, which embeds it) in the visible text above
+  // the Hosts section — handlers still address the host, which no one sees.
+  const visible = top.replace(/<[^>]*>/g, " ");
+  for (const k of ["box-a", "box-b", "box-c"]) assert.ok(!visible.includes(k), k);
+  assert.ok(top.includes("<dt>Repo</dt><dd><b>web</b></dd>"), "a card names its repo instead");
+  // The Hosts section is collapsed by default, still carries the host controls,
+  // and no longer repeats the session cards.
+  assert.ok(!hosts.startsWith('<details class="hosts-admin" open'), hosts.slice(0, 80));
+  assert.ok(hosts.includes("box-a") && hosts.includes("+ New session"));
+  assert.ok(!hosts.includes('<div class="sess '), "session cards are listed once, above");
+  assert.ok(hosts.includes("2 sessions — listed above."));
+  // The tile no longer lists machine names.
+  assert.doesNotMatch(tileOf(D.els.tiles.innerHTML, "Hosts online").hint, /box-/);
+  // Opening the section persists.
+  D.hostsOpenToggle(true);
+  D.render({ now, agents: [mk("box-a", "acme.atlassian.net", "Acme", [])] });
+  assert.ok(D.els.groups.innerHTML.includes('<details class="hosts-admin" open'));
 });

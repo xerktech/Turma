@@ -256,7 +256,7 @@ describe("App", () => {
     expect(display.exitRequested).toBe(true);
   });
 
-  it("navigates newHost -> newRepo -> newPrompt and spawns on Skip", async () => {
+  it("navigates newOrg -> newRepo -> newPrompt and spawns on Skip", async () => {
     const client = fakeClient({
       listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent()] })),
     });
@@ -264,15 +264,15 @@ describe("App", () => {
     await app.start();
     await vi.advanceTimersByTimeAsync(0);
 
-    // Home rows: [hostHeader(0), newSession(1), settings(2)] — no sessions on
-    // this agent, so home.cursor auto-snaps straight past the header to newSession(1).
-    expect(app.getState().home.cursor).toBe(1);
+    // Home rows: [newSession(0), settings(1)] — no sessions, so no status
+    // header, and the cursor starts on newSession.
+    expect(app.getState().home.cursor).toBe(0);
     display.emit({ type: "tap" });
-    expect(app.getState().screen).toBe("newHost");
+    expect(app.getState().screen).toBe("newOrg");
 
-    display.emit({ type: "tap" }); // pick host-a (only online host, cursor 0)
+    display.emit({ type: "tap" }); // pick "No org" (the only org with an online host)
     expect(app.getState().screen).toBe("newRepo");
-    expect(app.getState().newRepo?.hostKey).toBe("host-a");
+    expect(app.getState().newRepo?.orgKey).toBe("");
 
     display.emit({ type: "tap" }); // pick myrepo (only repo, cursor 0)
     expect(app.getState().screen).toBe("newPrompt");
@@ -295,8 +295,8 @@ describe("App", () => {
     const app = makeApp(client);
     await app.start();
     await vi.advanceTimersByTimeAsync(0);
-    display.emit({ type: "tap" }); // newSession -> newHost
-    display.emit({ type: "tap" }); // host-a -> newRepo
+    display.emit({ type: "tap" }); // newSession -> newOrg
+    display.emit({ type: "tap" }); // org -> newRepo
     display.emit({ type: "tap" }); // myrepo -> newPrompt
     display.emit({ type: "tap" }); // "Dictate prompt" -> reply/listening
     expect(app.getState().screen).toBe("reply");
@@ -311,12 +311,12 @@ describe("App", () => {
   });
 
   // ---- post-mutation refresh: immediate poll + grace window -------------
-  // A bare spawn via newHost -> newRepo -> newPrompt -> "Skip (spawn now)",
+  // A bare spawn via newOrg -> newRepo -> newPrompt -> "Skip (spawn now)",
   // then flush the spawnSession promise (which triggers nudgePoll's immediate
   // re-poll). Mirrors the "spawns on Skip" nav above.
   async function spawnBare(app: App): Promise<void> {
-    display.emit({ type: "tap" }); // home newSession -> newHost
-    display.emit({ type: "tap" }); // pick host-a
+    display.emit({ type: "tap" }); // home newSession -> newOrg
+    display.emit({ type: "tap" }); // pick the org
     display.emit({ type: "tap" }); // pick myrepo -> newPrompt
     display.emit({ type: "scrollDown" }); // -> "Skip (spawn now)"
     display.emit({ type: "tap" }); // spawn
@@ -1202,59 +1202,56 @@ describe("App", () => {
     });
     const app = makeApp(client, 1000);
     await app.start();
-    await vi.advanceTimersByTimeAsync(0); // 1st poll: rows = [header, s1, s2, newSession, settings]
+    await vi.advanceTimersByTimeAsync(0); // 1st poll: rows = [Active header, s1, s2, newSession, settings]
 
     expect(app.getState().home.cursor).toBe(1); // auto-snapped to s1
     display.emit({ type: "scrollDown" });
     expect(app.getState().home.cursor).toBe(2); // s2
 
-    await vi.advanceTimersByTimeAsync(1000); // 2nd poll: rows shrink to [header, newSession, settings]
-    // Without the clamp fix this stays 2, but row 2 no longer exists as a
-    // session — it's now "Settings" here, so a stale (undefined) index would
-    // have been the actual bug on a further-shrunk list. Either way the
-    // cursor must land on a valid, selectable row automatically.
-    expect(app.getState().home.cursor).toBe(2);
+    await vi.advanceTimersByTimeAsync(1000); // 2nd poll: rows shrink to [newSession, settings]
+    // Without the clamp fix this stays 2, an index that no longer exists, so
+    // the cursor must land on a valid, selectable row automatically.
+    expect(app.getState().home.cursor).toBe(1); // "Settings"
 
     // Scroll still works from the clamped position (doesn't get stuck).
     display.emit({ type: "scrollUp" });
-    expect(app.getState().home.cursor).toBe(1); // "+ New session"
+    expect(app.getState().home.cursor).toBe(0); // "+ New session"
 
     // Tap works — not a no-op against a stale/undefined row.
     display.emit({ type: "tap" });
-    expect(app.getState().screen).toBe("newHost");
+    expect(app.getState().screen).toBe("newOrg");
   });
 
   it("rows shrinking so the cursor lands exactly on a header searches outward for the nearest selectable row", async () => {
-    const hostA = agent({ key: "host-a", device: "host-a", sessions: [session({ id: "sA1" })] });
-    const hostB = agent({ key: "host-b", device: "host-b", sessions: [session({ id: "sB1" })] });
+    // XERK-1913: the headers are status groups now. Two sessions wait on the
+    // operator (Ready for review) and one is idle; the first review one goes,
+    // so the Idle header slides up under the cursor.
+    const ask = (id: string, at: string) =>
+      session({ id, createdAt: at, session: signals({ question: "pick one" }) });
+    const quiet = session({ id: "sI", createdAt: "2026-01-01T00:00:09Z", session: signals({ transcriptAgeSec: 999 }) });
+    const r1 = ask("sR1", "2026-01-01T00:00:01Z"), r2 = ask("sR2", "2026-01-01T00:00:02Z");
     const client = fakeClient({
       listAgents: vi
         .fn()
-        .mockResolvedValueOnce({ now: Date.now(), agents: [hostA, hostB] })
-        // Both hosts' sessions disappear but both stay online — headerA and
-        // headerB now sit back-to-back, right where the cursor (on sA1) was.
-        .mockResolvedValue({
-          now: Date.now(),
-          agents: [
-            agent({ key: "host-a", device: "host-a", sessions: [] }),
-            agent({ key: "host-b", device: "host-b", sessions: [] }),
-          ],
-        }),
+        .mockResolvedValueOnce({ now: Date.now(), agents: [agent({ sessions: [r1, r2, quiet] })] })
+        .mockResolvedValue({ now: Date.now(), agents: [agent({ sessions: [r2, quiet] })] }),
     });
     const app = makeApp(client, 1000);
     await app.start();
     await vi.advanceTimersByTimeAsync(0);
-    // rows = [headerA(0), sA1(1), headerB(2), sB1(3), newSession(4), settings(5)]
-    expect(app.getState().home.cursor).toBe(1); // auto-snapped to sA1
+    // rows = [reviewH(0), sR1(1), sR2(2), idleH(3), sI(4), newSession(5), settings(6)]
+    expect(app.getState().home.cursor).toBe(1);
+    display.emit({ type: "scrollDown" });
+    expect(app.getState().home.cursor).toBe(2); // sR2
 
-    await vi.advanceTimersByTimeAsync(1000); // 2nd poll: both sessions gone
-    // rows = [headerA(0), headerB(1), newSession(2), settings(3)] — the old
-    // cursor (1) is now squarely on a non-selectable header, so the clamp
-    // must search outward rather than just bounds-clamping.
-    expect(app.getState().home.cursor).toBe(2); // newSession — never a header
+    await vi.advanceTimersByTimeAsync(1000); // 2nd poll: sR1 gone
+    // rows = [reviewH(0), sR2(1), idleH(2), sI(3), ...] — the old cursor (2) is
+    // now squarely on a non-selectable header, so the clamp must search outward.
+    const c = app.getState().home.cursor;
+    expect([1, 3]).toContain(c); // a session — never a header
 
     display.emit({ type: "tap" }); // must not be a no-op
-    expect(app.getState().screen).toBe("newHost");
+    expect(app.getState().screen).toBe("session");
   });
 
   // ---- history polling: pause / leave-screen / retry cap (finding #3) ---

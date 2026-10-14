@@ -4,16 +4,18 @@ import type { Dictation, DictationResult } from "./dictation.ts";
 import { fontSafe } from "./font.ts";
 import { emptyBuffer, mergeTail, prependHistory, type TranscriptBuffer } from "./transcript.ts";
 import { NoopLiveTail, type LiveTailLike } from "./live.ts";
-import { flattenSessions } from "./sessions.ts";
+import { flattenSessions, siteKeyOf } from "./sessions.ts";
 import { draftMaxViewOffset, type MicState } from "./input-box.ts";
 import {
   buildActionsRows,
   buildHomeRows,
   buildNewRepoRows,
+  newOrgRows,
   questionSheetActive,
   render,
   sessionContentLines,
   sessionTranscriptArea,
+  spawnHostFor,
   SESSION_SCROLL_STEP,
   type HomeRow,
   type SessionFocus,
@@ -26,7 +28,7 @@ export type Screen =
   | "actions"
   | "reply"
   | "confirm"
-  | "newHost"
+  | "newOrg"
   | "newRepo"
   | "newPrompt"
   | "settings";
@@ -131,12 +133,12 @@ export interface ConfirmScreenState {
   cursor: number; // 0 = Cancel (preselected), 1 = Confirm
 }
 
-export interface NewHostScreenState {
+export interface NewOrgScreenState {
   cursor: number;
 }
 
 export interface NewRepoScreenState {
-  hostKey: string;
+  orgKey: string;
   cursor: number;
 }
 
@@ -196,7 +198,7 @@ export interface AppState {
   actions: ActionsScreenState | null;
   reply: ReplyScreenState | null;
   confirm: ConfirmScreenState | null;
-  newHost: NewHostScreenState | null;
+  newOrg: NewOrgScreenState | null;
   newRepo: NewRepoScreenState | null;
   newPrompt: NewPromptScreenState | null;
   settings: SettingsScreenState | null;
@@ -225,7 +227,7 @@ export function createInitialState(now: number): AppState {
     actions: null,
     reply: null,
     confirm: null,
-    newHost: null,
+    newOrg: null,
     newRepo: null,
     newPrompt: null,
     settings: null,
@@ -790,8 +792,8 @@ export class App {
         return this.onReply(e);
       case "confirm":
         return this.onConfirm(e);
-      case "newHost":
-        return this.onNewHost(e);
+      case "newOrg":
+        return this.onNewOrg(e);
       case "newRepo":
         return this.onNewRepo(e);
       case "newPrompt":
@@ -840,7 +842,7 @@ export class App {
           session: newSessionState(row.hostKey, row.sessionId),
         });
       } else if (row.kind === "newSession") {
-        this.setState({ screen: "newHost", newHost: { cursor: 0 } });
+        this.setState({ screen: "newOrg", newOrg: { cursor: 0 } });
       } else if (row.kind === "settings") {
         this.setState({ screen: "settings", settings: { cursor: 0 } });
       }
@@ -1423,26 +1425,24 @@ export class App {
     }
   }
 
-  // ---- newHost / newRepo / newPrompt ------------------------------------
+  // ---- newOrg / newRepo / newPrompt -------------------------------------
+  // The operator picks an org and a repo; the host is picked for them
+  // (`spawnHostFor`, XERK-1913), so no machine is ever named on the display.
 
-  private onlineHosts(): AgentInfo[] {
-    return this.state.agents.filter((a) => a.online);
-  }
-
-  private onNewHost(e: InputEvent): void {
-    const n = this.state.newHost;
+  private onNewOrg(e: InputEvent): void {
+    const n = this.state.newOrg;
     if (!n) return this.goHome();
     if (e.type === "doubleTap") return this.goHome();
-    const hosts = this.onlineHosts();
+    const orgs = newOrgRows(this.state);
     if (e.type === "scrollDown" || e.type === "scrollUp") {
       const dir = e.type === "scrollDown" ? 1 : -1;
-      this.setState({ newHost: { cursor: clamp(n.cursor + dir, 0, Math.max(0, hosts.length - 1)) } });
+      this.setState({ newOrg: { cursor: clamp(n.cursor + dir, 0, Math.max(0, orgs.length - 1)) } });
       return;
     }
     if (e.type === "tap") {
-      const host = hosts[n.cursor];
-      if (!host) return;
-      this.setState({ screen: "newRepo", newRepo: { hostKey: host.key, cursor: 0 } });
+      const org = orgs[n.cursor];
+      if (!org) return;
+      this.setState({ screen: "newRepo", newRepo: { orgKey: org.orgKey, cursor: 0 } });
     }
   }
 
@@ -1450,10 +1450,10 @@ export class App {
     const n = this.state.newRepo;
     if (!n) return this.goHome();
     if (e.type === "doubleTap") {
-      this.setState({ screen: "newHost", newHost: { cursor: 0 } });
+      this.setState({ screen: "newOrg", newOrg: { cursor: 0 } });
       return;
     }
-    const rows = buildNewRepoRows(this.state, n.hostKey);
+    const rows = buildNewRepoRows(this.state, n.orgKey);
     if (e.type === "scrollDown" || e.type === "scrollUp") {
       const dir = e.type === "scrollDown" ? 1 : -1;
       this.setState({ newRepo: { ...n, cursor: clamp(n.cursor + dir, 0, Math.max(0, rows.length - 1)) } });
@@ -1462,9 +1462,11 @@ export class App {
     if (e.type === "tap") {
       const row = rows[n.cursor];
       if (!row) return;
+      const host = spawnHostFor(this.state, n.orgKey, row.repo);
+      if (!host) return;
       this.setState({
         screen: "newPrompt",
-        newPrompt: { hostKey: n.hostKey, repo: row.repo, cursor: 0 },
+        newPrompt: { hostKey: host.key, repo: row.repo, cursor: 0 },
       });
     }
   }
@@ -1473,7 +1475,8 @@ export class App {
     const n = this.state.newPrompt;
     if (!n) return this.goHome();
     if (e.type === "doubleTap") {
-      this.setState({ screen: "newRepo", newRepo: { hostKey: n.hostKey, cursor: 0 } });
+      const host = this.state.agents.find((a) => a.key === n.hostKey);
+      this.setState({ screen: "newRepo", newRepo: { orgKey: host ? siteKeyOf(host) : "", cursor: 0 } });
       return;
     }
     if (e.type === "scrollDown" || e.type === "scrollUp") {

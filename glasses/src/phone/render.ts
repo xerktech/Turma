@@ -76,7 +76,8 @@ const STATE_LABEL: Record<LiveState, string> = {
 
 // ---- Sessions list --------------------------------------------------------
 
-// device · repo · branch — the web card's meta line, ticket key appended.
+// org · repo · branch — the web card's meta line, ticket key appended. The org
+// stands where the machine name was: no host is named on the phone (XERK-1913).
 function metaLine(hostLabel: string, s: SessionInfo): string {
   const parts = [esc(hostLabel), esc(s.repo)];
   const branch = s.branch || s.label;
@@ -236,8 +237,9 @@ export function sessionsBodyHtml(state: AppState): string {
   // so they get their own section rather than the capped Ended history.
   const paused: Row[] = [];
   for (const a of agents) {
-    const hostLabel = a.device ?? a.key;
     const siteKey = siteKeyOf(a);
+    // Rows are labelled by org, never by machine (XERK-1913).
+    const hostLabel = siteKey ? orgLabel(siteKey, a.jira?.orgName ?? null) : "No org";
     for (const s of a.sessions ?? []) {
       const row = { hostKey: a.key, hostLabel, s, siteKey, lastSeen: typeof a.lastSeen === "number" ? a.lastSeen : undefined };
       if (s.status === "queued") queued.push(row);
@@ -325,7 +327,9 @@ export function sessionViewHtml(state: AppState, verbosity: VerbosityPreset, sho
   if (!s) return `<div class="ph-empty">Session ended.</div>`;
   const live = findSession(state, s.hostKey, s.sessionId);
   const title = live ? sessionName(live) : s.sessionId.slice(0, 6);
-  const sub = live ? [s.hostKey, live.repo, live.branch].filter(Boolean).join(" · ") : s.hostKey;
+  const host = state.agents.find((a) => a.key === s.hostKey);
+  const org = host && siteKeyOf(host) ? orgLabel(siteKeyOf(host), host.jira?.orgName ?? null) : "";
+  const sub = live ? [org, live.repo, live.branch].filter(Boolean).join(" · ") : org;
   const question = live?.session?.question ?? null;
   const options = live?.session?.questionOptions ?? [];
 

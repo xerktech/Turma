@@ -760,6 +760,11 @@ Many of these need Android's wire model (`model/Models.kt`) to decode fields the
 those are marked `[MODEL]`.
 
 ### Dashboard (`index.html` → `FleetScreen`/`FleetDialogs`)
+- P1 Sessions by status, no host names (XERK-1913, WEB + GLASSES ONLY for now): the dashboard lists
+  every session in the Sessions page's status sections (Queued / Ready for review / Active / Idle /
+  Paused / Stopped), each card tagged + tinted by org, with no machine name or RC name shown; the
+  host cards (and their per-repo New session / Resume / Prune) moved into one collapsed "Hosts"
+  section below. Mirror on `FleetScreen` by grouping off `core/Sessions.kt`'s `LiveGroups`.
 - ~~P0 Session card detail~~ / ~~P0 queued/stopping + Cancel + optimistic pending~~ — done (XERK-78,
   see Done above). Still open from that pass: the spawn "ghost card" (a pending spawn shows only as
   the composer's toast today) — P2.

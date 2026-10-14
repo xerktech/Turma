@@ -235,9 +235,9 @@ describe("snapshotFromState", () => {
     expect(snapshotFromState(s)).toEqual(HOME);
   });
 
-  it("maps the transient spawn-flow screens (newHost/newRepo/newPrompt) to home", () => {
-    expect(snapshotFromState(state({ screen: "newHost", newHost: { cursor: 0 } }))).toEqual(HOME);
-    expect(snapshotFromState(state({ screen: "newRepo", newRepo: { hostKey: "h", cursor: 0 } }))).toEqual(HOME);
+  it("maps the transient spawn-flow screens (newOrg/newRepo/newPrompt) to home", () => {
+    expect(snapshotFromState(state({ screen: "newOrg", newOrg: { cursor: 0 } }))).toEqual(HOME);
+    expect(snapshotFromState(state({ screen: "newRepo", newRepo: { orgKey: "", cursor: 0 } }))).toEqual(HOME);
     expect(
       snapshotFromState(state({ screen: "newPrompt", newPrompt: { hostKey: "h", repo: "r", cursor: 0 } }))
     ).toEqual(HOME);

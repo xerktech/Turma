@@ -5,9 +5,10 @@ import type { AppState, ReplyScreenState, SessionScreenState } from "./app.ts";
 import { fontSafe, fontStrip } from "./font.ts";
 import { bottomBoxLines, inputBoxBody, menuBox, sheetBody, statusLabel, type MicState } from "./input-box.ts";
 import { DISPLAY_LINES, LINE_WIDTH_PX } from "./layout.ts";
-import { filterAgents, glyph, liveState, sessionName } from "./sessions.ts";
+import { filterAgents, glyph, inReview, liveState, sessionName, siteKeyOf } from "./sessions.ts";
 import { measureDefault, measureGeneration, wrapText } from "./text-wrap.ts";
 import type { AgentInfo, SessionInfo } from "./types.ts";
+import { Board } from "./vendor/engines.ts";
 
 export { DISPLAY_LINES, LINE_WIDTH_PX };
 
@@ -154,7 +155,7 @@ function windowRows<T>(rows: T[], selectedIndex: number, area: number): WindowRe
 // ---- home -------------------------------------------------------------
 
 export interface HomeRow {
-  kind: "hostHeader" | "hostOffline" | "session" | "newSession" | "settings";
+  kind: "groupHeader" | "offline" | "session" | "newSession" | "settings";
   hostKey?: string;
   sessionId?: string;
   selectable: boolean;
@@ -188,25 +189,63 @@ function homeHeaderText(state: AppState): string {
   return `TURMA ${working} run · ${waiting} ask`;
 }
 
+// The display name of an org (XERK-1913): board.js's own orgName, the same label
+// the web and the phone's org filter show; a host with no tracker is "No org".
+export function orgDisplayName(key: string, agents: AgentInfo[]): string {
+  if (!key) return "No org";
+  const named = agents.find((a) => siteKeyOf(a) === key && a.jira?.orgName);
+  return Board.orgName(key, named?.jira?.orgName ?? null);
+}
+
+// The fleet partitioned by org, orgs by display name with "No org" last — what
+// the new-session flow offers. Machines are never named on the display
+// (XERK-1913), so the hosts behind an org are an implementation detail.
+export function orgGroups(agents: AgentInfo[]): { key: string; name: string; agents: AgentInfo[] }[] {
+  const byKey = new Map<string, AgentInfo[]>();
+  for (const a of [...agents].sort((x, y) => x.key.localeCompare(y.key))) {
+    const k = siteKeyOf(a);
+    byKey.set(k, [...(byKey.get(k) ?? []), a]);
+  }
+  return [...byKey.entries()]
+    .map(([key, list]) => ({ key, name: orgDisplayName(key, agents), agents: list }))
+    .sort((x, y) => Number(!x.key) - Number(!y.key) || x.name.localeCompare(y.name));
+}
+
+// The home list in the Sessions page's status sections (XERK-1913), the same
+// split the phone, the web and Android make: Ready for review (`inReview`),
+// Active (working / waiting / holding), Idle, then Queued. Machines are never
+// named — every online host's sessions share one list. A host that is offline
+// hides its sessions, as before; with none online the list says so once.
 export function buildHomeRows(state: AppState): HomeRow[] {
   const rows: HomeRow[] = [];
-  const hosts = [...homeAgents(state)].sort((a, b) => (a.device ?? a.key).localeCompare(b.device ?? b.key));
-  for (const agent of hosts) {
-    const device = agent.device ?? agent.key;
-    if (!agent.online) {
-      rows.push({ kind: "hostOffline", hostKey: agent.key, selectable: false, text: `${device} offline` });
-      continue;
-    }
-    rows.push({ kind: "hostHeader", hostKey: agent.key, selectable: false, text: device });
-    const sessions = [...(agent.sessions ?? [])].sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
-    for (const session of sessions) {
+  const agents = homeAgents(state);
+  const online = agents.filter((a) => a.online);
+  if (agents.length && !online.length) rows.push({ kind: "offline", selectable: false, text: "Hosts offline" });
+  const now = Date.now();
+  const all = online
+    .flatMap((agent) => (agent.sessions ?? []).map((session) => ({ agent, session })))
+    .sort((a, b) => (a.session.createdAt ?? "").localeCompare(b.session.createdAt ?? ""));
+  const seen = (a: AgentInfo) => (typeof a.lastSeen === "number" ? a.lastSeen : undefined);
+  const live = all.filter((x) => x.session.status !== "queued");
+  const review = live.filter((x) => inReview(x.session, seen(x.agent), now));
+  const rest = live.filter((x) => !review.includes(x));
+  const ACTIVE = ["working", "waiting", "holding"];
+  const groups: [string, typeof all][] = [
+    ["Ready for review", review],
+    ["Active", rest.filter((x) => ACTIVE.includes(liveState(x.session, seen(x.agent), now)))],
+    ["Idle", rest.filter((x) => !ACTIVE.includes(liveState(x.session, seen(x.agent), now)))],
+    ["Queued", all.filter((x) => x.session.status === "queued")],
+  ];
+  for (const [title, list] of groups) {
+    if (!list.length) continue;
+    rows.push({ kind: "groupHeader", selectable: false, text: `${title} (${list.length})` });
+    for (const { agent, session } of list) {
       const display = state.pending[session.id] ? "pending" : liveState(session);
       const g = glyph(display);
       const labelOrRepo = session.label || session.repo;
       const name = glassesName(session);
-      // The host is already the header above these rows, so the row itself is
-      // just <repo>-<generated name> (e.g. "Turma-Adding Compose Flag"),
-      // falling back to <repo>-<short id> when the session is unnamed.
+      // The row is just <repo>-<generated name> (e.g. "Turma-Adding Compose
+      // Flag"), falling back to <repo>-<short id> when the session is unnamed.
       rows.push({
         kind: "session",
         hostKey: agent.key,
@@ -548,16 +587,17 @@ function renderConfirm(state: AppState): ScreenModel {
   return sessionOverlay(state, c.action.hostKey, c.action.sessionId, bottom);
 }
 
-// ---- newHost ------------------------------------------------------------
+// ---- newOrg ---------------------------------------------------------------
 
-function newHostRows(state: AppState): { hostKey: string; text: string }[] {
-  return state.agents.filter((a) => a.online).map((a) => ({ hostKey: a.key, text: a.device ?? a.key }));
+// The orgs a session can be started in: those with at least one online host.
+export function newOrgRows(state: AppState): { orgKey: string; text: string }[] {
+  return orgGroups(state.agents.filter((a) => a.online)).map((g) => ({ orgKey: g.key, text: fontSafe(g.name) }));
 }
 
-function renderNewHost(state: AppState): string[] {
-  const n = state.newHost;
-  const header = headerLine(state, "New session · Choose host");
-  const rows = newHostRows(state);
+function renderNewOrg(state: AppState): string[] {
+  const n = state.newOrg;
+  const header = headerLine(state, "New session · Choose org");
+  const rows = newOrgRows(state);
   if (!n) return [header];
   const { visible, start } = windowRows(rows, n.cursor, DISPLAY_LINES - 1);
   const lines = [header];
@@ -569,11 +609,20 @@ function renderNewHost(state: AppState): string[] {
 
 export type NewRepoRow = { kind: "repo"; repo: string; text: string };
 
-export function buildNewRepoRows(state: AppState, hostKey: string): NewRepoRow[] {
-  const agent = findAgentLocal(state, hostKey);
-  if (!agent) return [];
+function orgOnlineAgents(state: AppState, orgKey: string): AgentInfo[] {
+  return state.agents
+    .filter((a) => a.online && siteKeyOf(a) === orgKey)
+    .sort((x, y) => x.key.localeCompare(y.key));
+}
+
+// Every repo cloned on any online host in the org, once each, repos root first.
+export function buildNewRepoRows(state: AppState, orgKey: string): NewRepoRow[] {
   const rows: NewRepoRow[] = [];
-  for (const repo of agent.repos ?? []) {
+  const seen = new Set<string>();
+  const repos = orgOnlineAgents(state, orgKey).flatMap((a) => a.repos ?? []);
+  for (const repo of [...repos.filter((r) => r.isRoot), ...repos.filter((r) => !r.isRoot)]) {
+    if (seen.has(repo.name)) continue;
+    seen.add(repo.name);
     // The repos-root pseudo-repo spawns a session at the root (no worktree);
     // give it a legible label instead of the bare "(root)" sentinel name.
     rows.push({ kind: "repo", repo: repo.name, text: repo.isRoot ? "Repos root (all repos)" : repo.name });
@@ -581,12 +630,22 @@ export function buildNewRepoRows(state: AppState, hostKey: string): NewRepoRow[]
   return rows;
 }
 
+// The host a new session in (org, repo) starts on, chosen for the operator
+// (XERK-1913): an online host in that org with the repo cloned, the one running
+// the fewest sessions, ties by host key so the pick is stable.
+export function spawnHostFor(state: AppState, orgKey: string, repo: string): AgentInfo | undefined {
+  const running = (a: AgentInfo) => (a.sessions ?? []).filter((s) => s.status === "running").length;
+  return orgOnlineAgents(state, orgKey)
+    .filter((a) => (a.repos ?? []).some((r) => r.name === repo))
+    .sort((x, y) => running(x) - running(y))[0];
+}
+
 function renderNewRepo(state: AppState): string[] {
   const n = state.newRepo;
-  const device = n ? findAgentLocal(state, n.hostKey)?.device ?? n.hostKey : "";
-  const header = headerLine(state, `New session · ${device} · Choose repo`);
+  const org = n ? fontSafe(orgDisplayName(n.orgKey, state.agents)) : "";
+  const header = headerLine(state, `New session · ${org} · Choose repo`);
   if (!n) return [header];
-  const rows = buildNewRepoRows(state, n.hostKey);
+  const rows = buildNewRepoRows(state, n.orgKey);
   const { visible, start } = windowRows(rows, n.cursor, DISPLAY_LINES - 1);
   const lines = [header];
   visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === n.cursor)));
@@ -628,8 +687,8 @@ export function render(state: AppState): ScreenModel {
       return linesModel(renderReply(state));
     case "confirm":
       return renderConfirm(state);
-    case "newHost":
-      return linesModel(renderNewHost(state));
+    case "newOrg":
+      return linesModel(renderNewOrg(state));
     case "newRepo":
       return linesModel(renderNewRepo(state));
     case "newPrompt":
