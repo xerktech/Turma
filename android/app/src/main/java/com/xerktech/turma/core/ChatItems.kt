@@ -356,8 +356,13 @@ private fun frameLine(line: String): String = fenceLine(line.removeSuffix("\r"))
  * tag lines, keep what they wrap. Run AFTER [messageOrigin], which classifies a
  * system turn by its leading tag. A port of chat.js `stripFraming`.
  */
-fun stripFraming(text: String): String {
-    if (!text.contains('<')) return text
+private val LONE_CR = Regex("\r(?!\n)")
+
+fun stripFraming(raw: String): String {
+    if (!raw.contains('<')) return raw
+    // A lone CR is a line break to the renderer (Prose.kt normalises EOL): split on it
+    // too, as chat.js, or a fence line it ends is missed (rollup XERK-1701).
+    val text = if (raw.contains('\r')) raw.replace(LONE_CR, "\n") else raw
     // In step with chat.js: a tag inside a ``` fence is the operator's text (rollup
     // XERK-1701), except a matched `<pasted_content id="X">` pair (Claude Code's own
     // paste framing, wherever the paste landed); the first and last non-blank lines
