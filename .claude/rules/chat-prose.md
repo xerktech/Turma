@@ -55,6 +55,9 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
     - **Capping the run count was tried and REVERTED.** It bought nothing the memo doesn't already
       give, and it changed output — a saturated count made `m === len` true for a longer run and
       resumed the scan INSIDE one, fabricating emphasis on input that had none. Don't re-add it.
+    - **An inline code span's closer comes from the line's runs indexed BY LENGTH** (`renderInline`,
+      `parseInline`), built once per line with a forward cursor per length. Scanning to the closer per
+      opener was N^1.5 on a line of unclosed runs of distinct lengths (3.5 s at 1M chars).
   - **A rule line is a SCAN (`isRuleLine`), never `/(?:-[ \t]*){3,}/`.** That regex is linear in V8
     but `java.util.regex` recurses once per iteration of a quantified GROUP, so the Android port of
     it threw an **uncatchable `StackOverflowError`** out of `parseProse` inside a Composable (an

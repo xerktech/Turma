@@ -2022,6 +2022,9 @@ test("renderProse: a URL's dot run, a [ run and a backtick run render in linear 
   renderProse("x``" + " `".repeat(1000000));
   renderProse("`a` ".repeat(500000));
   renderProse("![".repeat(200000) + "x");
+  // One line of unclosed runs of distinct lengths (1, 2, … 1414): each used to scan
+  // to the line end, N^1.5 (4.2 s at this 1M-char size).
+  renderProse("x" + Array.from({ length: 1414 }, (_, k) => "`".repeat(k + 1)).join(" "));
   const used = process.cpuUsage(t);
   assert.ok((used.user + used.system) / 1000 < 1500, "took too long");
   // Behaviour kept: trailing punctuation still peels out of a bare URL...
@@ -2030,6 +2033,8 @@ test("renderProse: a URL's dot run, a [ run and a backtick run render in linear 
   assert.equal((renderProse("`a`\n`b`").match(/<code/g) || []).length, 2);
   // ...a code span still stops at a line break...
   assert.doesNotMatch(renderProse("a `b\nc` d"), /<code/);
+  // ...an opener still closes on the next run of its own length, past longer and shorter ones...
+  assert.match(renderProse("``a ` b ``` c`` d"), /<code[^>]*>a ` b ``` c<\/code> d/);
   // ...and a label holding `[` links only from its last `[`.
   assert.match(renderProse("[a[b](https://x.io)"), /\[a<a [^>]*href="https:\/\/x\.io"[^>]*>b<\/a>/);
 });
