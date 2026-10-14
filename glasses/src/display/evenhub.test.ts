@@ -116,6 +116,8 @@ describe("EvenHubDisplay", () => {
       expect(captures[0]!.height).toBe(288);
       const container = call.textObject!.find((c) => c.containerName === "main")!;
       expect(container.isEventCapture).toBe(0);
+      // Distinct ids: the overlay must not share (and replace) the text container.
+      expect(new Set(call.textObject!.map((c) => c.containerID)).size).toBe(2);
       expect(container.width).toBe(576);
       expect(container.height).toBe(288);
       expect(container.xPosition).toBe(0);

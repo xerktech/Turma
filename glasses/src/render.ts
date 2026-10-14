@@ -128,8 +128,15 @@ function findAgentLocal(state: AppState, hostKey: string): AgentInfo | undefined
   return state.agents.find((a) => a.key === hostKey);
 }
 
+// A menu row is exactly ONE display line: windowRows counts rows, so a row that
+// wrapped would push the page past the canvas — the rows below the edge never
+// drew, yet the cursor still walked onto them and a tap selected blind. Clip a
+// long row (a long session name) to one line with an ellipsis instead.
 function markerLine(text: string, selected: boolean): string {
-  return (selected ? "> " : "  ") + text;
+  const prefix = selected ? "> " : "  ";
+  const width = LINE_WIDTH_PX - Math.max(measureDefault("> "), measureDefault("  "));
+  if (wrapCached(text, width).length <= 1) return prefix + text;
+  return `${prefix}${wrapCached(text, width - measureDefault("…"))[0] ?? ""}…`;
 }
 
 interface WindowResult<T> {

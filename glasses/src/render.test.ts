@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createInitialState, newSessionState, type AppState } from "./app.ts";
-import { render, sessionContentLines, sessionTranscriptArea, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
+import { DISPLAY_LINES, LINE_WIDTH_PX, render, sessionContentLines, sessionTranscriptArea, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
 import { setGlyphCoverage } from "./font.ts";
-import { charMeasure, setDefaultMeasure, type Measure } from "./text-wrap.ts";
+import { charMeasure, setDefaultMeasure, wrapText, type Measure } from "./text-wrap.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
 const NOW = 1_700_000_000_000;
@@ -164,6 +164,27 @@ describe("render: home", () => {
     const state3 = base({ agents, home: { cursor: 7 } }); // s6 (rows: header=0, s0=1, ...)
     const lines3 = asLines(render(state3));
     expect(lines3.some((l) => l.startsWith("> "))).toBe(true);
+  });
+
+  // A row that wrapped onto two display lines pushed the window past the
+  // canvas: the rows below the edge never drew, yet the cursor walked onto
+  // them (and a tap selected blind). Every row is clipped to ONE line instead.
+  it("clips a long session row to one display line so the window never overflows the canvas", () => {
+    const longLabel = "a very long session label that would never fit on one glasses line at all";
+    const sessions = Array.from({ length: 12 }, (_, i) =>
+      session({ id: `s${i}`, label: `${longLabel} ${i}`, session: signals({ transcriptAgeSec: 999 }) })
+    );
+    const agents: AgentInfo[] = [agent({ sessions })];
+    for (const cursor of [1, 7, 14]) {
+      const lines = asLines(render(base({ agents, home: { cursor } })));
+      const physical = lines.flatMap((l) => wrapText(l, LINE_WIDTH_PX));
+      expect(physical.length).toBeLessThanOrEqual(DISPLAY_LINES);
+      expect(lines.filter((l) => l.startsWith("> "))).toHaveLength(1);
+    }
+    const row = asLines(render(base({ agents, home: { cursor: 1 } })))[2] ?? "";
+    expect(row.startsWith("> ")).toBe(true);
+    expect(row.endsWith("…")).toBe(true);
+    expect(asLines(render(base({ agents, home: { cursor: 14 } })))).toContain("> Settings");
   });
 
   it("shows a flash message in place of the header", () => {
