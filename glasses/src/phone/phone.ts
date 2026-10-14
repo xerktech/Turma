@@ -133,6 +133,8 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
       }
       autoGrow(inp2);
     }
+    if (!view.inSession) sendError = null;
+    applySendError();
     if (view.inSession) {
       fillTranscript();
       void ensureTerminal();
@@ -570,15 +572,26 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
   // 401, an offline host — disappeared with nothing on screen and no way to
   // recover what was typed (XERK-235). The web restores the text and paints
   // the reason; so does this now.
-  function showSendError(message: string): void {
+  // The send error outlives repaints: paint() rebuilds the DOM, and a refused
+  // answer re-polls at once (App.answerQuestion), which used to wipe the
+  // message within one round trip. It is held for SEND_ERROR_MS, or until the
+  // next send or leaving the session.
+  const SEND_ERROR_MS = 8000;
+  let sendError: { message: string; until: number } | null = null;
+  function applySendError(): void {
     const box = root.querySelector<HTMLElement>("#ph-senderr");
     if (!box) return;
-    box.textContent = message;
-    box.hidden = false;
+    if (sendError && Date.now() >= sendError.until) sendError = null;
+    box.textContent = sendError ? sendError.message : "";
+    box.hidden = !sendError;
+  }
+  function showSendError(message: string): void {
+    sendError = { message, until: Date.now() + SEND_ERROR_MS };
+    applySendError();
   }
   function clearSendError(): void {
-    const box = root.querySelector<HTMLElement>("#ph-senderr");
-    if (box) { box.textContent = ""; box.hidden = true; }
+    sendError = null;
+    applySendError();
   }
   function sendFailed(text: string, err: unknown): void {
     const e = err as { status?: number; message?: string } | null;

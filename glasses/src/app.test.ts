@@ -586,6 +586,30 @@ describe("App", () => {
     expect(app.getState().pending["s1"]).toBeUndefined();
   });
 
+  it("an answer from outside the sheet (the phone) marks the session pending too", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    void app.answerQuestion("host-a", "s1", { optionIndex: 0 });
+    expect(app.getState().pending["s1"]).toBeDefined();
+  });
+
+  it("an action queued while the answered question is hidden stays pending until the hub moves", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await toSheet(app);
+    display.emit({ type: "tap" });
+    await vi.advanceTimersByTimeAsync(0);
+    // A free-text send in the mask window snapshots pending from the masked view.
+    (app as unknown as { markPending(id: string, s: unknown): void }).markPending(
+      "s1",
+      app.getState().agents[0]!.sessions[0]
+    );
+    await vi.advanceTimersByTimeAsync(6000); // hub still reports the question: nothing converged
+    expect(app.getState().pending["s1"]).toBeDefined();
+  });
+
   it("a second answer that fails does not bring back a question the first answer got through on", async () => {
     const answerQuestion = vi
       .fn()

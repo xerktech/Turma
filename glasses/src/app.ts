@@ -833,7 +833,9 @@ export class App {
     const entry: PendingEntry = {
       at: this.now(),
       status: s?.status,
-      question: s?.session?.question ?? null,
+      // An answered question is hidden locally (maskAnswered) but the hub still
+      // reports it; pending converges on the hub's word, so snapshot that.
+      question: this.state.answered[sessionId]?.question ?? s?.session?.question ?? null,
       tailLen: s?.session?.tail.length ?? 0,
     };
     this.state = { ...this.state, pending: { ...this.state.pending, [sessionId]: entry } };
@@ -1442,6 +1444,8 @@ export class App {
     const question = live?.question;
     const at = this.now();
     const seq = ++this.answerSeq;
+    // Every answer path (glasses sheet, dictation, phone) shows the pending glyph.
+    this.markPending(sessionId, findSession(this.state, hostKey, sessionId));
     if (question) {
       const entry = { hostKey, question, options: live?.questionOptions ?? [], at, until: at + PENDING_TIMEOUT_MS, seq };
       const answered = { ...this.state.answered, [sessionId]: entry };

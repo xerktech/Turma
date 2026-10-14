@@ -240,6 +240,11 @@ describe("phone controller", () => {
     const err = root.querySelector<HTMLElement>("#ph-senderr")!;
     expect(err.hidden).toBe(false);
     expect(err.textContent).toContain("host is offline");
+    // The real App re-polls on a refusal and repaints; the message must survive it.
+    handle.render({ ...state });
+    const again = root.querySelector<HTMLElement>("#ph-senderr")!;
+    expect(again.hidden).toBe(false);
+    expect(again.textContent).toContain("host is offline");
   });
 
   it("enterFromGlasses pulls the phone into the session the glasses entered", () => {
