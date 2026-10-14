@@ -36,7 +36,7 @@ function sessionState(id: string, host: string): AppState {
 describe("phone controller", () => {
   let root: HTMLElement;
   let client: Record<string, ReturnType<typeof vi.fn>>;
-  let app: { getState: () => AppState; enterSession: ReturnType<typeof vi.fn>; setOrgFilter: ReturnType<typeof vi.fn>; setAutoStartOrg: ReturnType<typeof vi.fn> };
+  let app: { getState: () => AppState; enterSession: ReturnType<typeof vi.fn>; setOrgFilter: ReturnType<typeof vi.fn>; setAutoStartOrg: ReturnType<typeof vi.fn>; answerQuestion: ReturnType<typeof vi.fn> };
   let handle: ReturnType<typeof mountPhone>;
   let onSignOut: ReturnType<typeof vi.fn>;
   let state: AppState;
@@ -77,6 +77,8 @@ describe("phone controller", () => {
         get state() { return state; },
         setState(p: Partial<AppState>) { state = { ...state, ...p }; handle.render(state); },
       } as unknown as App, site, enabled)),
+      // The real App hides the question then calls the client (app.test.ts).
+      answerQuestion: vi.fn((host: string, id: string, a: unknown) => (client.answerQuestion as unknown as (...x: unknown[]) => unknown)(host, id, a)),
     };
     onSignOut = vi.fn();
     handle = mountPhone({ root, app: app as never, client: client as never, onSignOut: onSignOut as unknown as () => void });
@@ -204,13 +206,83 @@ describe("phone controller", () => {
     );
   });
 
-  it("answering a pending question routes to HubClient.answerQuestion", () => {
+  it("answering a pending question routes through App.answerQuestion", () => {
     state = { ...sessionState("s1", "host-a"),
       agents: [agent({ key: "host-a", sessions: [session({ id: "s1", session: signals({ question: "Go?", questionOptions: ["Yes", "No"] }) })] })] };
     handle.render(state);
     handle.enterFromGlasses("host-a", "s1");
     root.querySelectorAll<HTMLElement>("[data-answer]")[1]!.click();
+    expect(app.answerQuestion).toHaveBeenCalledWith("host-a", "s1", { optionIndex: 1 });
     expect(client.answerQuestion).toHaveBeenCalledWith("host-a", "s1", { optionIndex: 1 });
+  });
+
+  it("a compose-box reply to a pending question answers it through App.answerQuestion", () => {
+    state = { ...sessionState("s1", "host-a"),
+      agents: [agent({ key: "host-a", sessions: [session({ id: "s1", session: signals({ question: "Go?", questionOptions: ["Yes", "No"] }) })] })] };
+    handle.render(state);
+    handle.enterFromGlasses("host-a", "s1");
+    root.querySelector<HTMLTextAreaElement>("#ph-input")!.value = "only staging";
+    root.querySelector<HTMLElement>("[data-send]")!.click();
+    expect(app.answerQuestion).toHaveBeenCalledWith("host-a", "s1", { optionIndex: -1, custom: "only staging" });
+    expect(client.sendInput).not.toHaveBeenCalled();
+  });
+
+  it("a refused option click says so on the phone instead of failing silently", async () => {
+    client.answerQuestion = vi.fn(async () => {
+      throw Object.assign(new Error("host is offline"), { name: "HttpError", status: 503 });
+    });
+    state = { ...sessionState("s1", "host-a"),
+      agents: [agent({ key: "host-a", sessions: [session({ id: "s1", session: signals({ question: "Go?", questionOptions: ["Yes", "No"] }) })] })] };
+    handle.render(state);
+    handle.enterFromGlasses("host-a", "s1");
+    root.querySelectorAll<HTMLElement>("[data-answer]")[0]!.click();
+    await Promise.resolve(); await Promise.resolve();
+    const err = root.querySelector<HTMLElement>("#ph-senderr")!;
+    expect(err.hidden).toBe(false);
+    expect(err.textContent).toContain("host is offline");
+    // The real App re-polls on a refusal and repaints; the message must survive it.
+    handle.render({ ...state });
+    const again = root.querySelector<HTMLElement>("#ph-senderr")!;
+    expect(again.hidden).toBe(false);
+    expect(again.textContent).toContain("host is offline");
+  });
+
+  it("a phone send error clears on expiry, on the next good send, and on leaving the session", async () => {
+    vi.useFakeTimers();
+    try {
+      client.answerQuestion = vi.fn(async () => {
+        throw Object.assign(new Error("host is offline"), { name: "HttpError", status: 503 });
+      });
+      const withQ = { ...sessionState("s1", "host-a"),
+        agents: [agent({ key: "host-a", sessions: [session({ id: "s1", session: signals({ question: "Go?", questionOptions: ["Yes", "No"] }) })] })] };
+      const fail = async () => {
+        state = withQ; handle.render(state); handle.enterFromGlasses("host-a", "s1");
+        root.querySelectorAll<HTMLElement>("[data-answer]")[0]!.click();
+        await Promise.resolve(); await Promise.resolve();
+        expect(root.querySelector<HTMLElement>("#ph-senderr")!.hidden).toBe(false);
+      };
+      const shown = () => !root.querySelector<HTMLElement>("#ph-senderr")!.hidden;
+
+      await fail(); // expiry
+      vi.advanceTimersByTime(8001);
+      handle.render({ ...state });
+      expect(shown()).toBe(false);
+
+      await fail(); // the next successful send clears it
+      client.answerQuestion = vi.fn(async () => ({ ok: true, cmdId: "c" }));
+      root.querySelectorAll<HTMLElement>("[data-answer]")[1]!.click();
+      expect(shown()).toBe(false);
+
+      client.answerQuestion = vi.fn(async () => {
+        throw Object.assign(new Error("host is offline"), { name: "HttpError", status: 503 });
+      });
+      await fail(); // leaving the session clears it
+      state = homeState(); handle.render(state);
+      state = withQ; handle.render(state); handle.enterFromGlasses("host-a", "s1");
+      expect(shown()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("enterFromGlasses pulls the phone into the session the glasses entered", () => {

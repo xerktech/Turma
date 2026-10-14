@@ -133,6 +133,8 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
       }
       autoGrow(inp2);
     }
+    if (!view.inSession) sendError = null;
+    applySendError();
     if (view.inSession) {
       fillTranscript();
       void ensureTerminal();
@@ -423,7 +425,7 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
     const org = t.closest<HTMLElement>("[data-org]");
     if (org) { app.setOrgFilter(org.dataset.org || ""); orgOpen = false; paint(); return; }
     const answer = t.closest<HTMLElement>("[data-answer]");
-    if (answer) { const f = focused(); if (f) void client.answerQuestion(f.host, f.id, { optionIndex: Number(answer.dataset.answer) }).catch(() => {}); return; }
+    if (answer) { const f = focused(); if (f) { clearSendError(); void app.answerQuestion(f.host, f.id, { optionIndex: Number(answer.dataset.answer) }).catch((err: unknown) => sendFailed("", err)); } return; }
     if (t.closest("[data-send]")) { send(); return; }
     if (t.closest("[data-signout]")) { onSignOut?.(); return; }
 
@@ -570,15 +572,26 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
   // 401, an offline host — disappeared with nothing on screen and no way to
   // recover what was typed (XERK-235). The web restores the text and paints
   // the reason; so does this now.
-  function showSendError(message: string): void {
+  // The send error outlives repaints: paint() rebuilds the DOM, and a refused
+  // answer re-polls at once (App.answerQuestion), which used to wipe the
+  // message within one round trip. It is held for SEND_ERROR_MS, or until the
+  // next send or leaving the session.
+  const SEND_ERROR_MS = 8000;
+  let sendError: { message: string; until: number } | null = null;
+  function applySendError(): void {
     const box = root.querySelector<HTMLElement>("#ph-senderr");
     if (!box) return;
-    box.textContent = message;
-    box.hidden = false;
+    if (sendError && Date.now() >= sendError.until) sendError = null;
+    box.textContent = sendError ? sendError.message : "";
+    box.hidden = !sendError;
+  }
+  function showSendError(message: string): void {
+    sendError = { message, until: Date.now() + SEND_ERROR_MS };
+    applySendError();
   }
   function clearSendError(): void {
-    const box = root.querySelector<HTMLElement>("#ph-senderr");
-    if (box) { box.textContent = ""; box.hidden = true; }
+    sendError = null;
+    applySendError();
   }
   function sendFailed(text: string, err: unknown): void {
     const e = err as { status?: number; message?: string } | null;
@@ -610,7 +623,7 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
     // A pending question answers through /answer; otherwise /input.
     const live = last.agents.find((a) => a.key === f.host)?.sessions.find((s) => s.id === f.id);
     if (live?.session?.question) {
-      void client.answerQuestion(f.host, f.id, { optionIndex: -1, custom: text })
+      void app.answerQuestion(f.host, f.id, { optionIndex: -1, custom: text })
         .catch((err: unknown) => sendFailed(text, err));
     } else {
       void client.sendInput(f.host, f.id, text)
