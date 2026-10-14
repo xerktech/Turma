@@ -344,7 +344,7 @@ private fun TerminalInputBar(
         )
         if (busy) {
             IconButton(onClick = onStop) {
-                Icon(Icons.Filled.Stop, "Stop turn", tint = com.xerktech.turma.ui.theme.TurmaColors.waiting)
+                Icon(Icons.Filled.Stop, "Stop turn", tint = com.xerktech.turma.ui.theme.TurmaColors.waitingText())
             }
         }
         IconButton(
