@@ -2006,9 +2006,10 @@ test("renderProse/stripFraming: a fence line full of blanks reads in linear time
   buildItems([{ id: "z", role: "user", blocks: [{ t: "text", text: "<x>\n" + line + "\n<system-reminder>" }] }]);
   const used = process.cpuUsage(t);
   assert.ok((used.user + used.system) / 1000 < 500, "took too long");
-  // Only ONE CR and the blanks before it are cut: "```\r\t" closes nothing (QA).
+  // A lone CR ends the line, as the renderer reads it: "```\r\t" closes the fence,
+  // so the tag after it is outside and goes (and a "\t" is not cut as a blank).
   const strip = (text) => buildItems([{ id: "z", role: "user", blocks: [{ t: "text", text }] }])[0].text;
-  assert.equal(strip("a\n```\nx\n```\r\t\n<system-reminder>\nb"), "a\n```\nx\n```\r\t\n<system-reminder>\nb");
+  assert.equal(strip("a\n```\nx\n```\r\t\n<system-reminder>\nb"), "a\n```\nx\n```\n\t\nb");
   // Trailing blanks (and a CR) still don't stop a fence.
   assert.match(renderProse("```js  \t\ncode\n```  "), /<code>code<\/code>/);
 });
@@ -3039,6 +3040,10 @@ test("buildItems: a framing tag inside an operator's code fence is their text (r
   assert.equal(strip("a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc"), "a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc");
   assert.equal(strip("a\r\n```\r\nb\r\n```\r\n<system-reminder>\r\nc"), "a\r\n```\r\nb\r\n```\r\nc");
   assert.equal(strip("a\n```js x\n<system-reminder>\n```\nb"), "a\n```js x\n```\nb");
+  // A lone CR ends a line, as the renderer reads it: the fence after it holds the tag.
+  assert.equal(strip("see:\n```\r\r\n<system-reminder>\n```\nend"), "see:\n```\n\r\n<system-reminder>\n```\nend");
+  // Every lone CR, not just the first (QA).
+  assert.equal(strip("a\rb\n```\r\r\n<system-reminder>\n```\nend"), "a\nb\n```\n\r\n<system-reminder>\n```\nend");
   // A fence indented by a non-breaking space is a fence, as the renderer reads it.
   assert.equal(strip("i\n\u00a0```\n<system-reminder>\nb\n```\ne"), "i\n\u00a0```\n<system-reminder>\nb\n```\ne");
   // Claude Code's own matched paste framing goes even inside the operator's fence.

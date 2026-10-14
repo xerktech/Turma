@@ -453,6 +453,12 @@ class ChatItemsTest {
                 stripFraming("a\n" + w + "```\n<system-reminder>\nb\n```\nc"))
         }
         assertEquals("a\n```js\u00A0x\n```\nb", stripFraming("a\n```js\u00A0x\n<system-reminder>\n```\nb"))
+        // A lone CR ends a line, as the renderer reads it (in step with chat.test.js).
+        assertEquals("see:\n```\n\r\n<system-reminder>\n```\nend",
+            stripFraming("see:\n```\r\r\n<system-reminder>\n```\nend"))
+        // Every lone CR, not just the first (QA).
+        assertEquals("a\nb\n```\n\r\n<system-reminder>\n```\nend",
+            stripFraming("a\rb\n```\r\r\n<system-reminder>\n```\nend"))
         // A fence indented by a non-breaking space is a fence, as on the web.
         assertEquals("i\n\u00A0```\n<system-reminder>\nb\n```\ne",
             stripFraming("i\n\u00A0```\n<system-reminder>\nb\n```\ne"))

@@ -1413,8 +1413,12 @@
   const FRAME_FENCE_CLOSE = /^\s*(`{3,})$/;
   const frameLine = (line) => fenceLine(line.endsWith("\r") ? line.slice(0, -1) : line);
   function stripFraming(text) {
-    const t = String(text == null ? "" : text);
+    let t = String(text == null ? "" : text);
     if (t.indexOf("<") === -1) return t;
+    // A lone CR is a line break to the renderer (normalizeEol): split on it too, or
+    // a fence line it ends is not seen and the tag after it goes (rollup XERK-1701).
+    // A CRLF stays as it is; frameLine and the tag regex tolerate its CR.
+    if (t.indexOf("\r") >= 0) t = t.replace(/\r(?!\n)/g, "\n");
     const lines = t.split("\n");
     const tags = lines.map((l) => FRAMING_TAG_LINE.exec(l));
     const opened = new Set(), closed = new Set();
