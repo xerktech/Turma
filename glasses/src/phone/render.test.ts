@@ -426,22 +426,3 @@ describe("phone render", () => {
     expect(html).toContain("ph-nav");
   });
 });
-
-// XERK-1913: no machine is named on the phone — a card's meta line and the
-// session header read the org where the host name was.
-describe("phone render: no machine names (XERK-1913)", () => {
-  it("labels cards and the session header by org, never by host", () => {
-    const a = agent({ key: "box-7", device: "box-7", jira: { siteKey: "acme.atlassian.net", orgName: "Acme" },
-      sessions: [session({ id: "s1", branch: "feat" }), session({ id: "s2", status: "queued" })] });
-    const loose = agent({ key: "box-9", device: "box-9", sessions: [session({ id: "s3", repo: "repoZ" })] });
-    const st = state({ agents: [a, loose] });
-    const html = sessionsBodyHtml(st);
-    expect(html.replace(/<[^>]*>/g, " ")).not.toMatch(/box-[79]/);
-    expect(html).toContain("Acme · repoA");
-    expect(html).toContain("No org · repoZ");
-    const view = sessionViewHtml(state({ agents: [a], screen: "session", session: newSessionState("box-7", "s1") }),
-      "normal", false, "closed");
-    expect(view.replace(/<[^>]*>/g, " ")).not.toContain("box-7");
-    expect(view).toContain("Acme · repoA · feat");
-  });
-});

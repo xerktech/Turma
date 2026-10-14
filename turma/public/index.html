@@ -232,17 +232,6 @@
   .clone-job.done { color: var(--good); }
   .clone-job.err { color: var(--critical); }
 
-  /* Sessions grouped by status (XERK-1913), the Sessions page's sections; a
-     card's org is its tint and its org tag. */
-  .status-group { display: flex; flex-direction: column; margin-bottom: 18px; }
-  .status-h { font-size: 15px; font-weight: 600; margin: 0; }
-  .status-h .count, .org-count { color: var(--muted); font-size: 12px; font-weight: 400; }
-  .sess[style*="--org"] { background: color-mix(in srgb, var(--org) 8%, var(--page)); }
-  .sess-org { font-size: 11px; color: var(--ink-2); white-space: nowrap; }
-  .sess-org::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-    background: var(--org, var(--muted)); margin-right: 5px; vertical-align: 0; }
-  details.hosts-admin { border-top: 1px solid var(--hairline); padding-top: 12px; }
-  details.hosts-admin > summary { cursor: pointer; font-size: 15px; font-weight: 600; margin-bottom: 10px; }
   .sess-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; margin-top: 10px; }
   .sess {
     background: var(--page); border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -1478,7 +1467,7 @@ function render(data) {
 
   $tiles.innerHTML =
     tile("Hosts online", `${online.length} / ${agents.length}`,
-         agents.length ? "machines reporting in" : "no devices yet") +
+         [...new Set(agents.map(a => a.device))].join(", ") || "no devices yet") +
     tile("Running sessions", runningValue,
          sess.length + " total" + (pausedCount ? ` · ${pausedCount} paused` : "")) +
     tile("Ready for review", String(needs.length), "sessions waiting on you") +
@@ -1505,16 +1494,15 @@ function render(data) {
     return;
   }
 
-  // The page reads as SESSIONS grouped by status (XERK-1913): no host names above
-  // the fold. The host cards — restart, login, clone, the per-repo New session /
-  // Resume / Prune controls — sit in one collapsed "Hosts" section below.
+  // One container per host, so each agent IS a host — render them as a flat
+  // list of host cards keyed/titled by host name (no container-name layer).
   // Preserve focus/caret in an open composer across the full innerHTML swap, and
   // wrap the swap in preserveScroll so a background poll re-render can't reset
   // the page scroll or a mid-selection scroll inside an open clone-repo list (a
   // scrolled `.clone-list`, id-keyed, is captured by preserveScroll).
   const focus = captureComposerFocus();
   TurmaNav.preserveScroll($groups, () => {
-    $groups.innerHTML = statusSections(agents, now) + hostsSection(agents, now);
+    $groups.innerHTML = `<div class="hosts">${agents.map(a => hostCard(a, now)).join("")}</div>`;
   });
   restoreComposerFocus(focus);
 }
@@ -1536,66 +1524,6 @@ function refreshOrgColors(agents) {
 function orgTintStyle(a) {
   const c = orgColorByKey.get((a.jira && a.jira.siteKey) || "");
   return c ? ` style="--org:${c}"` : "";
-}
-
-// Sessions grouped by STATUS (XERK-1913), the Sessions page's sections in its
-// order: Queued, Ready for review, Active, Idle, Paused — plus Stopped, the
-// non-running records this page alone offers Start/Delete on. No host name is
-// shown; each card wears its org's tint and name instead. Ready for review is
-// the SAME set the tile counts (`needsYou`), oldest-waiting first.
-function orgKeyOf(a) { return (a.jira && a.jira.siteKey) || ""; }
-function orgLabelOf(a) {
-  const k = orgKeyOf(a);
-  return k ? window.TurmaBoard.orgName(k, a.jira && a.jira.orgName) : "";
-}
-// The holding/working live states count as Active, as the Sessions page's
-// `live.kind !== "idle"` split does.
-const ACTIVE_CLS = new Set(["sess-working", "sess-holding", "sess-stalled", "sess-wait"]);
-function statusSections(agents, now) {
-  const all = agents.flatMap(a => (a.sessions || []).map(s => ({ a, s })));
-  const created = (x, y) => (Date.parse(y.s.createdAt) || 0) - (Date.parse(x.s.createdAt) || 0);
-  const running = all.filter(x => x.s.status === "running").sort(created);
-  const review = needsYou(running.map(x => ({ s: x.s, a: x.a, host: x.a })));
-  const inReview = new Set(review.map(x => x.s));
-  const rest = running.filter(x => !inReview.has(x.s));
-  const isActive = x => ACTIVE_CLS.has(liveState(x.s, x.a, now).cls);
-  const queued = all.filter(x => x.s.status === "queued").sort(created);
-  const stopped = all.filter(x => x.s.status !== "running" && x.s.status !== "queued").sort(created);
-  const paused = agents.flatMap(a => pausedSleepers(a).map(c => ({ a, c })))
-    .sort((x, y) => x.c.paused.wakeAt - y.c.paused.wakeAt);
-  // An in-flight spawn's placeholder leads Queued: it is the work about to start.
-  const ghosts = agents.flatMap(a => [...pending.values()].filter(p => p.kind === "spawn" && p.host === a.key))
-    .map(() => ghostCard());
-  const card = x => sessCard(x.a, x.s, now);
-  const section = (title, cards, always) => (cards.length || always)
-    ? `<section class="status-group">
-        <h2 class="status-h">${title} <span class="count">${cards.length}</span></h2>
-        ${cards.length ? `<div class="sess-grid">${cards.join("")}</div>`
-          : `<div class="repo-empty">No active sessions.</div>`}
-      </section>` : "";
-  return section("Queued", [...ghosts, ...queued.map(card)].filter(Boolean)) +
-    section("Ready for review", review.map(x => sessCard(x.a, x.s, now))) +
-    section("Active", rest.filter(isActive).map(card), true) +
-    section("Idle", rest.filter(x => !isActive(x)).map(card)) +
-    section("Paused", paused.map(x => pausedCard(x.a, x.c, now))) +
-    section("Stopped", stopped.map(card));
-}
-
-// The host cards, folded into one section that starts collapsed (XERK-1913):
-// host administration is reachable, but the page leads with sessions. The open
-// state persists like the per-host collapse does.
-const HOSTS_OPEN_KEY = "turma.hostsOpen";
-let hostsOpen = (() => { try { return localStorage.getItem(HOSTS_OPEN_KEY) === "1"; } catch { return false; } })();
-function hostsOpenToggle(open) {
-  hostsOpen = open;
-  try { localStorage.setItem(HOSTS_OPEN_KEY, open ? "1" : "0"); } catch { /* private mode / quota — ignore */ }
-}
-function hostsSection(agents, now) {
-  const online = agents.filter(a => a.online).length;
-  return `<details class="hosts-admin" ${hostsOpen ? "open" : ""} ontoggle="hostsOpenToggle(this.open)">
-    <summary>Hosts <span class="org-count">${online} / ${agents.length} online</span></summary>
-    <div class="hosts">${agents.map(a => hostCard(a, now)).join("")}</div>
-  </details>`;
 }
 
 function hostCard(a, now) {
@@ -1879,11 +1807,10 @@ function repoBlock(a, repo, sessList, now, pausedList = []) {
   const spawnBtn = canSpawn
     ? `<button class="primary btn-sm" ${spawning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();toggleComposer('${escJs(rkey)}','${escJs(repo.name)}')">${spawning ? '<span class="spin"></span> Starting…' : composerOpen.has(rkey) ? "− New session" : "+ New session"}</button>`
     : "";
-  // The session cards themselves are listed by status above (XERK-1913);
-  // the repo only says how many it holds.
-  const body = (sessList.length || pausedList.length)
-    ? `<div class="repo-empty">${sessList.length} session${sessList.length === 1 ? "" : "s"}${
-        pausedList.length ? ` · ${pausedList.length} paused` : ""} — listed above.</div>`
+  const ghost = spawning ? ghostCard() : "";
+  const body = (sessList.length || spawning || pausedList.length)
+    ? `<div class="sess-grid">${ghost}${sessList.map(s => sessCard(a, s, now)).join("")}${
+        pausedList.map(c => pausedCard(a, c, now)).join("")}</div>`
     : `<div class="repo-empty">No sessions yet${canSpawn ? " — start one with “+ New session”." : "."}</div>`;
 
   // Resumable prior sessions of this repo — the "Resume any session" picker.
@@ -2156,11 +2083,9 @@ function sessCard(a, s, now) {
   // the order the Sessions page's Ready-for-review card uses.
   const hint = live && !killing ? attentionHintHtml(s.attention) : "";
 
-  const org = orgLabelOf(a);
-  return `<div class="sess ${st}${killing ? " killing" : ""}"${orgTintStyle(a)}>
+  return `<div class="sess ${st}${killing ? " killing" : ""}">
     <div class="sess-hd">
       <span class="sid">${id}</span>
-      ${org ? `<span class="sess-org">${esc(org)}</span>` : ""}
       ${s.summary ? `<span class="sess-summary" title="auto task name (from the initial prompt)">${esc(s.summary)}</span>` : ""}
       ${s.label ? `<span class="sess-label" title="session label">${esc(s.label)}</span>` : ""}
       ${killing
@@ -2170,10 +2095,10 @@ function sessCard(a, s, now) {
     <dl>
       ${s.root
         ? `<dt>Location</dt><dd><b>repos root (no worktree)</b></dd>`
-        : `<dt>Repo</dt><dd><b>${esc(s.repo || "–")}</b></dd>
-      <dt>Worktree</dt><dd><b>${esc(worktreeName(s))}</b></dd>
+        : `<dt>Worktree</dt><dd><b>${esc(worktreeName(s))}</b></dd>
       <dt>Branch</dt><dd><b${s.git ? "" : gitProblemTitle(s.gitProblem)}>${esc(sessBranch(s))}</b></dd>`}
       ${work ? `<dt>Work</dt><dd>${work}</dd>` : ""}
+      <dt>RC name</dt><dd>${esc(s.rcName || "–")}</dd>
       ${killing
         ? `<dt>State</dt><dd><b class="sess-dying">shutting down…</b></dd>`
         : live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${stateAge(live.detail)}</dd>`
@@ -2219,11 +2144,9 @@ function pausedCard(a, c, now) {
       `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" ${rp ? "disabled" : ""}
         title="Stop it for good: it will not wake"
         onclick="pausedKill('${escJs(a.key)}','${escJs(c.id)}')">${confirming.has(kKey) ? "Confirm kill" : "Kill"}</button>`;
-  const org = orgLabelOf(a);
-  return `<div class="sess paused${killing ? " killing" : ""}"${orgTintStyle(a)}>
+  return `<div class="sess paused${killing ? " killing" : ""}">
     <div class="sess-hd">
       <span class="sid">${esc(c.id)}</span>
-      ${org ? `<span class="sess-org">${esc(org)}</span>` : ""}
       ${c.summary ? `<span class="sess-summary">${esc(c.summary)}</span>` : ""}
       ${c.label ? `<span class="sess-label" title="session label">${esc(c.label)}</span>` : ""}
       ${killing
@@ -2233,8 +2156,7 @@ function pausedCard(a, c, now) {
     <dl>
       ${c.root
         ? `<dt>Location</dt><dd><b>repos root (no worktree)</b></dd>`
-        : `<dt>Repo</dt><dd><b>${esc(c.repo || "–")}</b></dd>
-      <dt>Worktree</dt><dd><b>${esc(worktreeName(c))}</b></dd>`}
+        : `<dt>Worktree</dt><dd><b>${esc(worktreeName(c))}</b></dd>`}
       <dt>State</dt><dd><b class="sess-holding">${esc(pausedLabel(c.paused, now))}</b></dd>
       ${prs}
     </dl>

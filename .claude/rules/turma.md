@@ -129,19 +129,7 @@ Cross-component contract in `CLAUDE.md` ("The peer roster IS the org boundary");
 
 ## Dashboard (`index.html`)
 
-### Sessions by status, hosts folded away (XERK-1913)
-
-- **The page leads with SESSIONS in the Sessions page's status sections** (`statusSections`): Queued,
-  Ready for review, Active, Idle, Paused, then Stopped (the records only this page can Start/Delete).
-  Operator's call: no machine name above the fold — don't re-add host headers or the RC name row
-  (it embeds the hostname). A card names its org (`sess-org` + tint) and its repo instead.
-  - Ready for review is `needsYou` — the SAME set the tile counts. Active = a `liveState` class in
-    `ACTIVE_CLS`, mirroring the Sessions page's `live.kind !== "idle"` split.
-- **The host cards live in ONE collapsed `<details class="hosts-admin">`** below (open state persisted
-  in `turma.hostsOpen`). Their repo blocks keep every control but list NO session cards — a session
-  is shown once, above. Tests: the XERK-1913 case in `dashboard-tiles.test.js`.
-
-### Host cards (inside the Hosts section)
+### Fleet tree (host → repo → session)
 
 - Each host row reads `<hostname> - <org>` (`TurmaBoard.orgName`, why the dashboard loads `board.js`).
 - A **"Clone from GitHub" bar**: dropdown of the `gh` login's repos (present ones disabled) + a

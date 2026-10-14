@@ -29,11 +29,10 @@ paths:
   iframe/postMessage) — a tap is `App.enterSession`, the org filter `App.setOrgFilter`. **ENTER
   syncs, LEAVE doesn't**: entering on one pulls the other in (`App.onEnterSession`); the org filter
   scopes the list too. Board is Phase 2.
-- **No machine is named on the display or the phone (XERK-1913)**, operator's call. The home list
-  uses the Sessions page's status sections (Ready for review / Active / Idle / Queued); the phone
-  labels a card by org where the host was. New session is org → repo, and `spawnHostFor` picks the
-  org's least-busy online host with that repo. Tests: `render.test.ts` "new session by org",
-  `phone/render.test.ts` "no machine names".
+- **The glasses DISPLAY names no machine (XERK-1913)**, operator's call. The home list uses the
+  Sessions page's status sections (Ready for review / Active / Idle / Queued), never host headers.
+  New session is org → repo, and `spawnHostFor` picks the org's least-busy online host with that
+  repo. The phone companion is out of that scope. Tests: `render.test.ts` "new session by org".
 - CI: `glasses-ci.yml`, path-filtered to `glasses/**`, runs typecheck + Vitest + a production build
   in a throwaway `node:24-alpine` container.
 - **Keep `@evenrealities/even_hub_sdk` >= 0.0.14.** Older SDKs strip long-press eventTypes (9/10),
