@@ -3065,6 +3065,18 @@ test("buildItems: a framing tag inside an operator's code fence is their text (r
   assert.equal(strip("a\rb\n```\r\r\n<system-reminder>\n```\nend"), "a\nb\n```\n\r\n<system-reminder>\n```\nend");
   // A fence indented by a non-breaking space is a fence, as the renderer reads it.
   assert.equal(strip("i\n\u00a0```\n<system-reminder>\nb\n```\ne"), "i\n\u00a0```\n<system-reminder>\nb\n```\ne");
+  // A tag line's ending, as the renderer reads it (rollup XERK-1701, in step with
+  // ChatItemsTest.kt). Each lone CR ends a line: the tag goes whole, and the blank
+  // line the second CR makes stays, with no CR left on the tag's line.
+  assert.equal(strip("a\n<system-reminder>\r\rb\n</system-reminder>\nc"), "a\n\nb\nc");
+  assert.equal(strip("a\n<system-reminder>\r\r\nb\n</system-reminder>\nc"), "a\n\r\nb\nc");
+  // U+2028/U+2029 (and NEL) end no line for the renderer ("## H\u2028" is no heading),
+  // so a tag line carrying one is the operator's text, kept whole — never the tag
+  // dropped with the separator left behind.
+  for (const w of ["\u2028", "\u2029", "\u0085"]) {
+    assert.equal(strip("a\n<system-reminder>" + w + "\nb\nc"), "a\n<system-reminder>" + w + "\nb\nc", JSON.stringify(w));
+    assert.equal(strip("a\n<system-reminder>" + w + "b\nc"), "a\n<system-reminder>" + w + "b\nc", JSON.stringify(w));
+  }
   // Claude Code's own matched paste framing goes even inside the operator's fence.
   assert.equal(byId.i.text, "look at this log:\n```\n\n\nE1 boom\nE2 boom\n\n```\nwhy does it fail?");
 });

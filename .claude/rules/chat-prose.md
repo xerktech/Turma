@@ -5,6 +5,8 @@ paths:
   - "turma/tests/chat.test.js"
   - "android/app/src/main/java/com/xerktech/turma/core/Prose.kt"
   - "android/app/src/test/java/com/xerktech/turma/core/ProseTest.kt"
+  - "android/app/src/main/java/com/xerktech/turma/core/ChatItems.kt"
+  - "android/app/src/test/java/com/xerktech/turma/core/ChatItemsTest.kt"
 ---
 
 # Chat bubble prose — the `renderProse` markdown engine
@@ -81,11 +83,12 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
     not `find`, on the fully-anchored line patterns: **Java's `$` also matches BEFORE a final line
     terminator and JavaScript's does not.** Pinned by the U+2028/U+2029 cases in `chat.test.js` +
     `ProseTest.kt` — CR alone cannot pin it, because the normalisation below already handles CR.
-    - **Two exotic-whitespace classes still differ and are knowingly left.** U+0085 NEL is a Java
+    - **One exotic-whitespace class still differs and is knowingly left.** U+0085 NEL is a Java
       line terminator that JavaScript's `.` matches, so `## H<NEL>` is a heading on the web and
-      prose on Android; and `FENCE_OPEN`'s `\s` is each runtime's own (NBSP, BOM and friends open
-      a fence on one side and not the other, in both directions). Neither appears anywhere in the
-      real corpus. Don't assert either answer in a test — that codifies the disagreement.
+      prose on Android. It appears nowhere in the real corpus. Don't assert either answer in a
+      test — that codifies the disagreement.
+    - `FENCE_OPEN`'s `\s` is JavaScript's on both (Prose.kt / ChatItems.kt spell it as `JS_WS`):
+      the JVM's `\s` is ASCII and a device's ICU one is Unicode, so neither runtime's own will do.
   - **Line endings are normalised at EVERY entry point** — `renderProse` AND `renderInline` on the
     web, `parseProse` on Android (its only one). Every block rule ends
     `[ \t]*$`, so the `\r` that `split("\n")` leaves behind defeated all of them and a CRLF message
@@ -95,6 +98,12 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
     entry point, and un-normalised, an emphasis or code span would form ACROSS a lone `\r` — the
     thing `findEmphClose`'s newline bail exists to prevent. Leaving one entry point unnormalised
     also puts the web's two out of step with each other and with Android's one.
+  - **`stripFraming` reads line ends exactly as the renderer does** (rollup XERK-1701): a lone CR
+    ends a line, so `<tag>\r\r` is a tag line (dropped whole) plus a blank line (kept). U+2028,
+    U+2029 and NEL end no line, so `<tag><U+2028>` is the operator's text, kept whole — never the tag
+    dropped with the separator left behind (what the old `/m` regex did). That is why the tag regex
+    has no `m` flag and Kotlin runs it as `matchEntire`. Tests: the line-ending cases beside the
+    NBSP-fence case in `chat.test.js` and `ChatItemsTest.kt`.
   - A **wrapped bullet's continuation line belongs to its item** (GFM lazy continuation: more
     indented, not itself a construct). Without it a wrap ended the list, printed its own second
     line as a bare paragraph flush left, and started a new list underneath — 3% of the real
