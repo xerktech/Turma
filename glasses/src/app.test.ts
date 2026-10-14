@@ -990,6 +990,25 @@ describe("App", () => {
     expect(display.lines.some((l) => l.includes("earlier msg"))).toBe(true);
   });
 
+  it("a stopped session's Options menu also ends with Home, which leaves without starting it (XERK-1914)", async () => {
+    const stopped = agent({ sessions: [session({ status: "stopped", session: null })] });
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [stopped] })) });
+    const app = makeApp(client);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    display.emit({ type: "tap" }); // session
+    display.emit({ type: "tap" }); // focus:"bottom"
+    display.emit({ type: "doubleTap" }); // -> actions: Back / Start / Home
+    expect(app.getState().screen).toBe("actions");
+    display.emit({ type: "scrollDown" });
+    display.emit({ type: "scrollDown" }); // Home
+    display.emit({ type: "tap" });
+
+    expect(app.getState().screen).toBe("home");
+    expect(client.sessionAction).not.toHaveBeenCalled();
+  });
+
   it("pending overlay clears once a poll shows the session's status changed", async () => {
     const running = agent({ sessions: [session({ status: "running" })] });
     const stopped = agent({ sessions: [session({ status: "stopped", session: null })] });
