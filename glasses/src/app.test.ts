@@ -256,7 +256,7 @@ describe("App", () => {
     expect(display.exitRequested).toBe(true);
   });
 
-  it("navigates newHost -> newRepo -> newPrompt and spawns on Skip", async () => {
+  it("navigates newOrg -> newRepo -> newPrompt and spawns on Skip", async () => {
     const client = fakeClient({
       listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent()] })),
     });
@@ -264,15 +264,15 @@ describe("App", () => {
     await app.start();
     await vi.advanceTimersByTimeAsync(0);
 
-    // Home rows: [hostHeader(0), newSession(1), settings(2)] — no sessions on
-    // this agent, so home.cursor auto-snaps straight past the header to newSession(1).
-    expect(app.getState().home.cursor).toBe(1);
+    // Home rows: [newSession(0), settings(1)] — no sessions, so no status
+    // header, and the cursor starts on newSession.
+    expect(app.getState().home.cursor).toBe(0);
     display.emit({ type: "tap" });
-    expect(app.getState().screen).toBe("newHost");
+    expect(app.getState().screen).toBe("newOrg");
 
-    display.emit({ type: "tap" }); // pick host-a (only online host, cursor 0)
+    display.emit({ type: "tap" }); // pick "No org" (the only org with an online host)
     expect(app.getState().screen).toBe("newRepo");
-    expect(app.getState().newRepo?.hostKey).toBe("host-a");
+    expect(app.getState().newRepo?.orgKey).toBe("");
 
     display.emit({ type: "tap" }); // pick myrepo (only repo, cursor 0)
     expect(app.getState().screen).toBe("newPrompt");
@@ -295,8 +295,8 @@ describe("App", () => {
     const app = makeApp(client);
     await app.start();
     await vi.advanceTimersByTimeAsync(0);
-    display.emit({ type: "tap" }); // newSession -> newHost
-    display.emit({ type: "tap" }); // host-a -> newRepo
+    display.emit({ type: "tap" }); // newSession -> newOrg
+    display.emit({ type: "tap" }); // org -> newRepo
     display.emit({ type: "tap" }); // myrepo -> newPrompt
     display.emit({ type: "tap" }); // "Dictate prompt" -> reply/listening
     expect(app.getState().screen).toBe("reply");
@@ -310,13 +310,168 @@ describe("App", () => {
     expect(app.getState().reply?.text).toBe("fix the build");
   });
 
+
+  // From home: scroll to the bottom (Settings), one up is "+ New session", tap.
+  function openNewSession(): void {
+    for (let i = 0; i < 12; i++) display.emit({ type: "scrollDown" });
+    display.emit({ type: "scrollUp" });
+    display.emit({ type: "tap" });
+  }
+
+  // ---- XERK-1913: status groups + the org-first new-session flow ---------
+
+  it("the home cursor follows its session when a status flip regroups the list", async () => {
+    const idle = signals({ paneBusy: false, transcriptAgeSec: 999 });
+    const sA = session({ id: "sA", summary: "Alpha", createdAt: "2026-01-01T00:00:02Z", session: idle });
+    const sB = session({ id: "sB", summary: "Bravo", createdAt: "2026-01-01T00:00:01Z", session: idle });
+    const busyB = { ...sB, session: signals({ paneBusy: true, transcriptAgeSec: 1 }) };
+    const client = fakeClient({
+      listAgents: vi.fn()
+        .mockResolvedValueOnce({ now: Date.now(), agents: [agent({ sessions: [sA, sB] })] })
+        .mockResolvedValue({ now: Date.now(), agents: [agent({ sessions: [sA, busyB] })] }),
+    });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    // rows = [Idle(0), sA(1), sB(2), ...]
+    expect(app.getState().home.cursor).toBe(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    // rows = [Active(0), sB(1), Idle(2), sA(3), ...] — the cursor moved with sA.
+    expect(app.getState().home.cursor).toBe(3);
+    display.emit({ type: "tap" });
+    expect(app.getState().session?.sessionId).toBe("sA");
+  });
+
+  it("New session: org, then repo, starts on the org's least-busy host and Back returns to that org", async () => {
+    const acme = { siteKey: "acme.atlassian.net", orgName: "Acme" };
+    const repos = [{ name: "web", path: "/r/web" }];
+    const busy = agent({ key: "h1", device: "h1", jira: acme, repos,
+      sessions: [session({ id: "x1" }), session({ id: "x2" })] });
+    const free = agent({ key: "h2", device: "h2", jira: acme, repos });
+    const zeta = agent({ key: "h3", device: "h3", jira: { siteKey: "zeta.atlassian.net", orgName: "Zeta" }, repos });
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [zeta, busy, free] })) });
+    const app = makeApp(client);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    openNewSession();
+    display.emit({ type: "tap" }); // Acme (listed before Zeta)
+    expect(app.getState().newRepo?.orgKey).toBe("acme.atlassian.net");
+    display.emit({ type: "tap" }); // web
+    expect(app.getState().newPrompt?.hostKey).toBe("h2");
+    display.emit({ type: "doubleTap" }); // back to the repo list of the SAME org
+    expect(app.getState().screen).toBe("newRepo");
+    expect(app.getState().newRepo?.orgKey).toBe("acme.atlassian.net");
+  });
+
+  it("New session: tapping a repo whose org lost its hosts does nothing", async () => {
+    const acme = { siteKey: "acme.atlassian.net", orgName: "Acme" };
+    const up = agent({ key: "h1", jira: acme, repos: [{ name: "web", path: "/r/web" }] });
+    const client = fakeClient({
+      listAgents: vi.fn()
+        .mockResolvedValueOnce({ now: Date.now(), agents: [up] })
+        .mockResolvedValue({ now: Date.now(), agents: [{ ...up, online: false }] }),
+    });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    openNewSession();
+    display.emit({ type: "tap" });
+    expect(app.getState().screen).toBe("newRepo");
+    await vi.advanceTimersByTimeAsync(1000); // the org's only host went offline
+    expect(() => display.emit({ type: "tap" })).not.toThrow();
+    expect(app.getState().screen).toBe("newRepo");
+    expect(client.spawnSession).not.toHaveBeenCalled();
+  });
+
+  it("the home cursor stays on its session when the list regroups with NO poll (a host ages offline)", async () => {
+    const t0 = Date.now();
+    const hA = agent({ key: "hA", lastSeen: t0,
+      sessions: [session({ id: "sA", summary: "Alpha", createdAt: "2026-01-01T00:00:02Z", session: signals({ paneBusy: false, transcriptAgeSec: 999 }) })] });
+    const hB = agent({ key: "hB", lastSeen: t0,
+      sessions: [session({ id: "sB", summary: "Bravo", createdAt: "2026-01-01T00:00:01Z", session: signals({ paneBusy: true, transcriptAgeSec: 1 }) })] });
+    const client = fakeClient({
+      listAgents: vi.fn()
+        .mockResolvedValueOnce({ now: t0, agents: [hA, hB] })
+        .mockRejectedValue(new Error("offline")),
+    });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    // rows = [Active(0), sB(1), Idle(2), sA(3), ...]
+    expect(app.getState().home.cursor).toBe(1);
+    // Every poll now fails; past OFFLINE_AFTER_MS sB reads idle and regroups:
+    // rows = [Idle(0), sA(1), sB(2), ...] with no successful poll to re-pin it.
+    await vi.advanceTimersByTimeAsync(80_000);
+    const screen = display.lines.join("\n");
+    expect(screen).toMatch(/> . myrepo-Bravo/);
+    display.emit({ type: "tap" });
+    expect(app.getState().session?.sessionId).toBe("sB");
+  });
+
+  it("the home cursor stays on '+ New session' when a group header appears above it", async () => {
+    const quiet = session({ id: "s1", summary: "One", session: signals({ paneBusy: false, transcriptAgeSec: 999 }) });
+    const client = fakeClient({
+      listAgents: vi.fn()
+        .mockResolvedValueOnce({ now: Date.now(), agents: [agent({ sessions: [quiet] })] })
+        .mockResolvedValue({ now: Date.now(), agents: [agent({ sessions: [quiet,
+          session({ id: "s2", summary: "Two", createdAt: "2026-01-02T00:00:00Z", session: signals({ paneBusy: true, transcriptAgeSec: 1 }) })] })] }),
+    });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    display.emit({ type: "scrollDown" }); // [Idle, s1, New, Settings] -> New
+    await vi.advanceTimersByTimeAsync(1000); // [Active, s2, Idle, s1, New, Settings]
+    display.emit({ type: "tap" });
+    expect(app.getState().screen).toBe("newOrg");
+  });
+
+  it("the home cursor keeps to its HOST's copy of a session id listed on two hosts", async () => {
+    const dup = (summary: string) => session({ id: "dup", summary, session: signals({ paneBusy: false, transcriptAgeSec: 999 }) });
+    const hA = agent({ key: "hA", sessions: [dup("OnA")] });
+    const hB = agent({ key: "hB", sessions: [dup("OnB")] });
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [hA, hB] })) });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    display.emit({ type: "scrollDown" }); // second copy
+    const host = app.getState().home.selected;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(app.getState().home.selected).toBe(host);
+    display.emit({ type: "tap" });
+    expect(`s:${app.getState().session?.hostKey}:dup`).toBe(host);
+  });
+
+  it("New session pickers: a later org, a scroll past the end, and a tap after the repo list shrank", async () => {
+    const repos = (...names: string[]) => names.map((name) => ({ name, path: "/r/" + name }));
+    const acme = agent({ key: "h1", jira: { siteKey: "acme.atlassian.net", orgName: "Acme" }, repos: repos("a") });
+    const zeta = (r: string[]) => agent({ key: "h3", jira: { siteKey: "zeta.atlassian.net", orgName: "Zeta" }, repos: repos(...r) });
+    const client = fakeClient({
+      listAgents: vi.fn()
+        .mockResolvedValueOnce({ now: Date.now(), agents: [acme, zeta(["x", "y", "z"])] })
+        .mockResolvedValue({ now: Date.now(), agents: [acme, zeta(["x"])] }),
+    });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    openNewSession();
+    for (let i = 0; i < 5; i++) display.emit({ type: "scrollDown" }); // clamped to Zeta, the last
+    expect(app.getState().newOrg?.cursor).toBe(1);
+    display.emit({ type: "tap" });
+    expect(app.getState().newRepo?.orgKey).toBe("zeta.atlassian.net");
+    display.emit({ type: "scrollDown" });
+    display.emit({ type: "scrollDown" }); // on "z"
+    await vi.advanceTimersByTimeAsync(1000); // only "x" left
+    display.emit({ type: "tap" });
+    expect(app.getState().newPrompt).toMatchObject({ hostKey: "h3", repo: "x" });
+  });
+
   // ---- post-mutation refresh: immediate poll + grace window -------------
-  // A bare spawn via newHost -> newRepo -> newPrompt -> "Skip (spawn now)",
+  // A bare spawn via newOrg -> newRepo -> newPrompt -> "Skip (spawn now)",
   // then flush the spawnSession promise (which triggers nudgePoll's immediate
   // re-poll). Mirrors the "spawns on Skip" nav above.
   async function spawnBare(app: App): Promise<void> {
-    display.emit({ type: "tap" }); // home newSession -> newHost
-    display.emit({ type: "tap" }); // pick host-a
+    display.emit({ type: "tap" }); // home newSession -> newOrg
+    display.emit({ type: "tap" }); // pick the org
     display.emit({ type: "tap" }); // pick myrepo -> newPrompt
     display.emit({ type: "scrollDown" }); // -> "Skip (spawn now)"
     display.emit({ type: "tap" }); // spawn
@@ -1096,8 +1251,9 @@ describe("App", () => {
   });
 
   it("input mode: a result delivered after navigating to a different session is NOT appended to the new session's draft", async () => {
-    const s1 = session({ id: "s1", createdAt: "2026-01-01T00:00:00Z" });
-    const s2 = session({ id: "s2", createdAt: "2026-01-01T00:00:01Z" });
+    // Newest first (XERK-1913), so s1 is the newer one and heads the list.
+    const s1 = session({ id: "s1", createdAt: "2026-01-01T00:00:01Z" });
+    const s2 = session({ id: "s2", createdAt: "2026-01-01T00:00:00Z" });
     const client = fakeClient({
       listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [s1, s2] })] })),
     });
@@ -1397,59 +1553,56 @@ describe("App", () => {
     });
     const app = makeApp(client, 1000);
     await app.start();
-    await vi.advanceTimersByTimeAsync(0); // 1st poll: rows = [header, s1, s2, newSession, settings]
+    await vi.advanceTimersByTimeAsync(0); // 1st poll: rows = [Active header, s1, s2, newSession, settings]
 
     expect(app.getState().home.cursor).toBe(1); // auto-snapped to s1
     display.emit({ type: "scrollDown" });
     expect(app.getState().home.cursor).toBe(2); // s2
 
-    await vi.advanceTimersByTimeAsync(1000); // 2nd poll: rows shrink to [header, newSession, settings]
-    // Without the clamp fix this stays 2, but row 2 no longer exists as a
-    // session — it's now "Settings" here, so a stale (undefined) index would
-    // have been the actual bug on a further-shrunk list. Either way the
-    // cursor must land on a valid, selectable row automatically.
-    expect(app.getState().home.cursor).toBe(2);
+    await vi.advanceTimersByTimeAsync(1000); // 2nd poll: rows shrink to [newSession, settings]
+    // Without the clamp fix this stays 2, an index that no longer exists, so
+    // the cursor must land on a valid, selectable row automatically.
+    expect(app.getState().home.cursor).toBe(1); // "Settings"
 
     // Scroll still works from the clamped position (doesn't get stuck).
     display.emit({ type: "scrollUp" });
-    expect(app.getState().home.cursor).toBe(1); // "+ New session"
+    expect(app.getState().home.cursor).toBe(0); // "+ New session"
 
     // Tap works — not a no-op against a stale/undefined row.
     display.emit({ type: "tap" });
-    expect(app.getState().screen).toBe("newHost");
+    expect(app.getState().screen).toBe("newOrg");
   });
 
   it("rows shrinking so the cursor lands exactly on a header searches outward for the nearest selectable row", async () => {
-    const hostA = agent({ key: "host-a", device: "host-a", sessions: [session({ id: "sA1" })] });
-    const hostB = agent({ key: "host-b", device: "host-b", sessions: [session({ id: "sB1" })] });
+    // XERK-1913: the headers are status groups now. Two sessions wait on the
+    // operator (Ready for review) and one is idle; the first review one goes,
+    // so the Idle header slides up under the cursor.
+    const ask = (id: string, at: string) =>
+      session({ id, createdAt: at, session: signals({ question: "pick one" }) });
+    const quiet = session({ id: "sI", createdAt: "2026-01-01T00:00:09Z", session: signals({ transcriptAgeSec: 999 }) });
+    const r1 = ask("sR1", "2026-01-01T00:00:01Z"), r2 = ask("sR2", "2026-01-01T00:00:02Z");
     const client = fakeClient({
       listAgents: vi
         .fn()
-        .mockResolvedValueOnce({ now: Date.now(), agents: [hostA, hostB] })
-        // Both hosts' sessions disappear but both stay online — headerA and
-        // headerB now sit back-to-back, right where the cursor (on sA1) was.
-        .mockResolvedValue({
-          now: Date.now(),
-          agents: [
-            agent({ key: "host-a", device: "host-a", sessions: [] }),
-            agent({ key: "host-b", device: "host-b", sessions: [] }),
-          ],
-        }),
+        .mockResolvedValueOnce({ now: Date.now(), agents: [agent({ sessions: [r1, r2, quiet] })] })
+        .mockResolvedValue({ now: Date.now(), agents: [agent({ sessions: [r2, quiet] })] }),
     });
     const app = makeApp(client, 1000);
     await app.start();
     await vi.advanceTimersByTimeAsync(0);
-    // rows = [headerA(0), sA1(1), headerB(2), sB1(3), newSession(4), settings(5)]
-    expect(app.getState().home.cursor).toBe(1); // auto-snapped to sA1
+    // rows = [reviewH(0), sR1(1), sR2(2), idleH(3), sI(4), newSession(5), settings(6)]
+    expect(app.getState().home.cursor).toBe(1);
+    display.emit({ type: "scrollDown" });
+    expect(app.getState().home.cursor).toBe(2); // sR2
 
-    await vi.advanceTimersByTimeAsync(1000); // 2nd poll: both sessions gone
-    // rows = [headerA(0), headerB(1), newSession(2), settings(3)] — the old
-    // cursor (1) is now squarely on a non-selectable header, so the clamp
-    // must search outward rather than just bounds-clamping.
-    expect(app.getState().home.cursor).toBe(2); // newSession — never a header
+    await vi.advanceTimersByTimeAsync(1000); // 2nd poll: sR1 gone
+    // rows = [reviewH(0), sR2(1), idleH(2), sI(3), ...] — the old cursor (2) is
+    // now squarely on a non-selectable header, so the clamp must search outward.
+    const c = app.getState().home.cursor;
+    expect([1, 3]).toContain(c); // a session — never a header
 
     display.emit({ type: "tap" }); // must not be a no-op
-    expect(app.getState().screen).toBe("newHost");
+    expect(app.getState().screen).toBe("session");
   });
 
   // ---- history polling: pause / leave-screen / retry cap (finding #3) ---
@@ -2045,7 +2198,7 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       const client = fakeClient({
         listAgents: vi.fn(async () => ({
           now: Date.now(),
-          agents: [agent({ sessions: [session({ id: "s1" }), session({ id: "s2", createdAt: "2026-01-02T00:00:00Z" })] })],
+          agents: [agent({ sessions: [session({ id: "s1", createdAt: "2026-01-03T00:00:00Z" }), session({ id: "s2", createdAt: "2026-01-02T00:00:00Z" })] })],
         })),
       });
       const app = new App({

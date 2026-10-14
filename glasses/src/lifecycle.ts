@@ -112,7 +112,7 @@ export function resetLifecycleForTests(): void {
 
 // Only these three screens are worth resurrecting after a background →
 // foreground WebView migration. Transient screens (actions/confirm/
-// reply/newHost/newRepo/newPrompt) carry sub-state (cursors, dictation
+// reply/newOrg/newRepo/newPrompt) carry sub-state (cursors, dictation
 // phases, half-built spawn targets) that would restore as null and render a
 // degraded header-only fallback — so the snapshot records their *parent*
 // instead: the session they were operating on when they have one, else home.
@@ -151,7 +151,7 @@ export function snapshotFromState(state: AppState): AppSnapshot {
       return home; // spawn-target reply (or no reply state) → home
     }
     // Transient spawn-flow screens → home.
-    case "newHost":
+    case "newOrg":
     case "newRepo":
     case "newPrompt":
       return home;

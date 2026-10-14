@@ -5,9 +5,10 @@ import type { AppState, ReplyScreenState, SessionScreenState } from "./app.ts";
 import { fontSafe, fontStrip } from "./font.ts";
 import { bottomBoxLines, inputBoxBody, menuBox, sheetBody, statusLabel, type MicState } from "./input-box.ts";
 import { DISPLAY_LINES, LINE_WIDTH_PX } from "./layout.ts";
-import { filterAgents, glyph, liveState, sessionName } from "./sessions.ts";
+import { filterAgents, glyph, inReview, liveState, sessionName, siteKeyOf } from "./sessions.ts";
 import { measureDefault, measureGeneration, wrapText } from "./text-wrap.ts";
 import type { AgentInfo, SessionInfo } from "./types.ts";
+import { Board } from "./vendor/engines.ts";
 
 export { DISPLAY_LINES, LINE_WIDTH_PX };
 
@@ -182,7 +183,7 @@ function windowRows<T>(rows: T[], selectedIndex: number, area: number): WindowRe
 // ---- home -------------------------------------------------------------
 
 export interface HomeRow {
-  kind: "hostHeader" | "hostOffline" | "session" | "newSession" | "settings";
+  kind: "groupHeader" | "offline" | "session" | "newSession" | "settings";
   hostKey?: string;
   sessionId?: string;
   selectable: boolean;
@@ -207,8 +208,9 @@ function homeHeaderText(state: AppState): string {
   let waiting = 0;
   for (const agent of homeAgents(state)) {
     if (!agent.online) continue;
+    const seen = typeof agent.lastSeen === "number" ? agent.lastSeen : undefined;
     for (const session of agent.sessions ?? []) {
-      const s = liveState(session);
+      const s = liveState(session, seen);
       if (s === "working") working++;
       else if (s === "waiting") waiting++;
     }
@@ -216,25 +218,78 @@ function homeHeaderText(state: AppState): string {
   return `TURMA ${working} run · ${waiting} ask`;
 }
 
+// The display name of an org (XERK-1913): board.js's own orgName, the same label
+// the web and the phone's org filter show; a host with no tracker is "No org".
+export function orgDisplayName(key: string, agents: AgentInfo[]): string {
+  if (!key) return "No org";
+  const named = agents.find((a) => siteKeyOf(a) === key && a.jira?.orgName);
+  return Board.orgName(key, named?.jira?.orgName ?? null);
+}
+
+// The fleet partitioned by org, orgs by display name with "No org" last — what
+// the new-session flow offers. Machines are never named on the display
+// (XERK-1913), so the hosts behind an org are an implementation detail.
+export function orgGroups(agents: AgentInfo[]): { key: string; name: string; agents: AgentInfo[] }[] {
+  const byKey = new Map<string, AgentInfo[]>();
+  for (const a of [...agents].sort((x, y) => x.key.localeCompare(y.key))) {
+    const k = siteKeyOf(a);
+    byKey.set(k, [...(byKey.get(k) ?? []), a]);
+  }
+  return [...byKey.entries()]
+    .map(([key, list]) => ({ key, name: orgDisplayName(key, agents), agents: list }))
+    .sort((x, y) => Number(!x.key) - Number(!y.key) || x.name.localeCompare(y.name));
+}
+
+// The home list in the Sessions page's status sections (XERK-1913), the split
+// and order the phone, the web and Android use: Ready for review (`inReview`,
+// oldest-waiting first), Active (working / waiting / holding), Idle, Queued,
+// then Ended (stopped / errored records). Newest first within a group, like
+// the phone. Machines are never named — every online host's sessions share one
+// list; an offline host's sessions stay hidden, as before, and a count row
+// says how many hosts that is.
 export function buildHomeRows(state: AppState): HomeRow[] {
   const rows: HomeRow[] = [];
-  const hosts = [...homeAgents(state)].sort((a, b) => (a.device ?? a.key).localeCompare(b.device ?? b.key));
-  for (const agent of hosts) {
-    const device = agent.device ?? agent.key;
-    if (!agent.online) {
-      rows.push({ kind: "hostOffline", hostKey: agent.key, selectable: false, text: `${device} offline` });
-      continue;
-    }
-    rows.push({ kind: "hostHeader", hostKey: agent.key, selectable: false, text: device });
-    const sessions = [...(agent.sessions ?? [])].sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
-    for (const session of sessions) {
-      const display = state.pending[session.id] ? "pending" : liveState(session);
+  const agents = homeAgents(state);
+  const online = agents.filter((a) => a.online);
+  const offline = agents.length - online.length;
+  if (offline) {
+    const text = online.length ? `${offline} host${offline === 1 ? "" : "s"} offline` : "Hosts offline";
+    rows.push({ kind: "offline", selectable: false, text });
+  }
+  const now = Date.now();
+  const seen = (a: AgentInfo) => (typeof a.lastSeen === "number" ? a.lastSeen : undefined);
+  const all = online
+    .flatMap((agent) => (agent.sessions ?? []).map((session) => ({ agent, session })))
+    .sort((a, b) => (b.session.createdAt ?? "").localeCompare(a.session.createdAt ?? ""));
+  const running = all.filter((x) => x.session.status === "running");
+  const review = running.filter((x) => inReview(x.session, seen(x.agent), now));
+  // Oldest-waiting first by the hub's attention `since` (phone `render.ts`);
+  // a row with none keeps its place after them (the sort is stable).
+  review.sort((a, b) => {
+    const x = a.session.attention?.since, y = b.session.attention?.since;
+    if (typeof x === "number" && typeof y === "number") return x - y;
+    return typeof x === "number" ? -1 : typeof y === "number" ? 1 : 0;
+  });
+  const rest = running.filter((x) => !review.includes(x));
+  const ACTIVE = ["working", "waiting", "holding"];
+  const isActive = (x: (typeof all)[number]) => ACTIVE.includes(liveState(x.session, seen(x.agent), now));
+  const groups: [string, typeof all][] = [
+    ["Ready for review", review],
+    ["Active", rest.filter(isActive)],
+    ["Idle", rest.filter((x) => !isActive(x))],
+    ["Queued", all.filter((x) => x.session.status === "queued")],
+    ["Ended", all.filter((x) => x.session.status !== "running" && x.session.status !== "queued")],
+  ];
+  for (const [title, list] of groups) {
+    if (!list.length) continue;
+    rows.push({ kind: "groupHeader", selectable: false, text: `${title} (${list.length})` });
+    for (const { agent, session } of list) {
+      const display = state.pending[session.id] ? "pending" : liveState(session, seen(agent), now);
       const g = glyph(display);
       const labelOrRepo = session.label || session.repo;
       const name = glassesName(session);
-      // The host is already the header above these rows, so the row itself is
-      // just <repo>-<generated name> (e.g. "Turma-Adding Compose Flag"),
-      // falling back to <repo>-<short id> when the session is unnamed.
+      // The row is just <repo>-<generated name> (e.g. "Turma-Adding Compose
+      // Flag"), falling back to <repo>-<short id> when the session is unnamed.
       rows.push({
         kind: "session",
         hostKey: agent.key,
@@ -249,12 +304,52 @@ export function buildHomeRows(state: AppState): HomeRow[] {
   return rows;
 }
 
+// A home row's identity: a session by host + id (one id can sit on two hosts
+// mid-migration), an action row by its kind. Headers have none.
+export function homeRowKey(row: HomeRow | undefined): string | undefined {
+  if (!row || !row.selectable) return undefined;
+  return row.kind === "session" ? `s:${row.hostKey}:${row.sessionId}` : row.kind;
+}
+
+// Where the home cursor sits in `rows`: on the selected row wherever the
+// status groups moved it (XERK-1913), else the index, kept in range and off
+// headers. Render and input both resolve through this, so the marker and a tap
+// agree even when the list regrouped with no poll (a host aging offline).
+export function homeCursor(rows: HomeRow[], home: { cursor: number; selected?: string }): number {
+  if (home.selected) {
+    const i = rows.findIndex((r) => homeRowKey(r) === home.selected);
+    if (i >= 0) return i;
+  }
+  return clampHomeCursor(rows, home.cursor);
+}
+
+// Keeps the home cursor in range as the row list shrinks/grows (host
+// offline, sessions converging away) and off non-selectable rows (host
+// group headers, offline lines) — including the very first render, where the
+// cursor starts at 0 and row 0 is a non-selectable header once any session is
+// listed. Searches outward (nearest first, forward on ties) for
+// the closest selectable row; "+ New session"/"Settings" are always present
+// and selectable, so a selectable row always exists once rows is non-empty.
+function clampHomeCursor(rows: { selectable: boolean }[], cursor: number): number {
+  if (rows.length === 0) return 0;
+  const c = Math.max(0, Math.min(cursor, rows.length - 1));
+  if (rows[c]?.selectable) return c;
+  for (let d = 1; d < rows.length; d++) {
+    const forward = c + d;
+    if (forward < rows.length && rows[forward]?.selectable) return forward;
+    const backward = c - d;
+    if (backward >= 0 && rows[backward]?.selectable) return backward;
+  }
+  return c;
+}
+
 function renderHome(state: AppState): string[] {
   const header = headerLine(state, homeHeaderText(state));
   const rows = buildHomeRows(state);
-  const { visible, start } = windowRows(rows, state.home.cursor, DISPLAY_LINES - 1);
+  const cursor = homeCursor(rows, state.home);
+  const { visible, start } = windowRows(rows, cursor, DISPLAY_LINES - 1);
   const lines = [header];
-  visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === state.home.cursor)));
+  visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === cursor)));
   return lines;
 }
 
@@ -583,20 +678,28 @@ function renderConfirm(state: AppState): ScreenModel {
   return sessionOverlay(state, c.action.hostKey, c.action.sessionId, bottom);
 }
 
-// ---- newHost ------------------------------------------------------------
-
-function newHostRows(state: AppState): { hostKey: string; text: string }[] {
-  return state.agents.filter((a) => a.online).map((a) => ({ hostKey: a.key, text: a.device ?? a.key }));
+// A picker's cursor held inside its list: hosts going offline mid-flow shrink
+// the org/repo lists under a cursor the operator left further down.
+export function pickerCursor(cursor: number, length: number): number {
+  return Math.max(0, Math.min(cursor, length - 1));
 }
 
-function renderNewHost(state: AppState): string[] {
-  const n = state.newHost;
-  const header = headerLine(state, "New session · Choose host");
-  const rows = newHostRows(state);
+// ---- newOrg ---------------------------------------------------------------
+
+// The orgs a session can be started in: those with at least one online host.
+export function newOrgRows(state: AppState): { orgKey: string; text: string }[] {
+  return orgGroups(state.agents.filter((a) => a.online)).map((g) => ({ orgKey: g.key, text: fontSafe(g.name) }));
+}
+
+function renderNewOrg(state: AppState): string[] {
+  const n = state.newOrg;
+  const header = headerLine(state, "New session · Choose org");
+  const rows = newOrgRows(state);
   if (!n) return [header];
-  const { visible, start } = windowRows(rows, n.cursor, DISPLAY_LINES - 1);
+  const cursor = pickerCursor(n.cursor, rows.length);
+  const { visible, start } = windowRows(rows, cursor, DISPLAY_LINES - 1);
   const lines = [header];
-  visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === n.cursor)));
+  visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === cursor)));
   return lines;
 }
 
@@ -604,11 +707,20 @@ function renderNewHost(state: AppState): string[] {
 
 export type NewRepoRow = { kind: "repo"; repo: string; text: string };
 
-export function buildNewRepoRows(state: AppState, hostKey: string): NewRepoRow[] {
-  const agent = findAgentLocal(state, hostKey);
-  if (!agent) return [];
+function orgOnlineAgents(state: AppState, orgKey: string): AgentInfo[] {
+  return state.agents
+    .filter((a) => a.online && siteKeyOf(a) === orgKey)
+    .sort((x, y) => x.key.localeCompare(y.key));
+}
+
+// Every repo cloned on any online host in the org, once each, repos root first.
+export function buildNewRepoRows(state: AppState, orgKey: string): NewRepoRow[] {
   const rows: NewRepoRow[] = [];
-  for (const repo of agent.repos ?? []) {
+  const seen = new Set<string>();
+  const repos = orgOnlineAgents(state, orgKey).flatMap((a) => a.repos ?? []);
+  for (const repo of [...repos.filter((r) => r.isRoot), ...repos.filter((r) => !r.isRoot)]) {
+    if (seen.has(repo.name)) continue;
+    seen.add(repo.name);
     // The repos-root pseudo-repo spawns a session at the root (no worktree);
     // give it a legible label instead of the bare "(root)" sentinel name.
     rows.push({ kind: "repo", repo: repo.name, text: repo.isRoot ? "Repos root (all repos)" : repo.name });
@@ -616,15 +728,26 @@ export function buildNewRepoRows(state: AppState, hostKey: string): NewRepoRow[]
   return rows;
 }
 
+// The host a new session in (org, repo) starts on, chosen for the operator
+// (XERK-1913): an online host in that org with the repo cloned, the one running
+// the fewest sessions, ties by host key so the pick is stable.
+export function spawnHostFor(state: AppState, orgKey: string, repo: string): AgentInfo | undefined {
+  const running = (a: AgentInfo) => (a.sessions ?? []).filter((s) => s.status === "running").length;
+  return orgOnlineAgents(state, orgKey)
+    .filter((a) => (a.repos ?? []).some((r) => r.name === repo))
+    .sort((x, y) => running(x) - running(y))[0];
+}
+
 function renderNewRepo(state: AppState): string[] {
   const n = state.newRepo;
-  const device = n ? findAgentLocal(state, n.hostKey)?.device ?? n.hostKey : "";
-  const header = headerLine(state, `New session · ${device} · Choose repo`);
+  const org = n ? fontSafe(orgDisplayName(n.orgKey, state.agents)) : "";
+  const header = headerLine(state, `New session · ${org} · Choose repo`);
   if (!n) return [header];
-  const rows = buildNewRepoRows(state, n.hostKey);
-  const { visible, start } = windowRows(rows, n.cursor, DISPLAY_LINES - 1);
+  const rows = buildNewRepoRows(state, n.orgKey);
+  const cursor = pickerCursor(n.cursor, rows.length);
+  const { visible, start } = windowRows(rows, cursor, DISPLAY_LINES - 1);
   const lines = [header];
-  visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === n.cursor)));
+  visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === cursor)));
   return lines;
 }
 
@@ -663,8 +786,8 @@ export function render(state: AppState): ScreenModel {
       return linesModel(renderReply(state));
     case "confirm":
       return renderConfirm(state);
-    case "newHost":
-      return linesModel(renderNewHost(state));
+    case "newOrg":
+      return linesModel(renderNewOrg(state));
     case "newRepo":
       return linesModel(renderNewRepo(state));
     case "newPrompt":

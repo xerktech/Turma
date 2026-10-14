@@ -4,16 +4,21 @@ import type { Dictation, DictationResult } from "./dictation.ts";
 import { fontSafe } from "./font.ts";
 import { emptyBuffer, mergeTail, prependHistory, type TranscriptBuffer } from "./transcript.ts";
 import { NoopLiveTail, type LiveTailLike } from "./live.ts";
-import { flattenSessions } from "./sessions.ts";
+import { flattenSessions, siteKeyOf } from "./sessions.ts";
 import { draftMaxViewOffset, type MicState } from "./input-box.ts";
 import {
   buildActionsRows,
   buildHomeRows,
   buildNewRepoRows,
+  homeCursor,
+  homeRowKey,
+  newOrgRows,
+  pickerCursor,
   questionSheetActive,
   render,
   sessionContentLines,
   sessionTranscriptArea,
+  spawnHostFor,
   SESSION_SCROLL_STEP,
   type HomeRow,
   type SessionFocus,
@@ -26,7 +31,7 @@ export type Screen =
   | "actions"
   | "reply"
   | "confirm"
-  | "newHost"
+  | "newOrg"
   | "newRepo"
   | "newPrompt"
   | "settings";
@@ -140,6 +145,11 @@ export function pendingKeyForSpawn(hostKey: string, repo: string): string {
 
 export interface HomeScreenState {
   cursor: number;
+  // The row the cursor is ON, by identity (`homeRowKey`), so it stays on that
+  // session while the status groups regroup around it (XERK-1913) — by a poll,
+  // or by time alone (a host aging offline) with no poll at all. Absent = the
+  // cursor index alone decides (fresh state, an org-filter change).
+  selected?: string;
 }
 
 export interface SessionScreenState {
@@ -193,12 +203,12 @@ export interface ConfirmScreenState {
   cursor: number; // 0 = Cancel (preselected), 1 = Confirm
 }
 
-export interface NewHostScreenState {
+export interface NewOrgScreenState {
   cursor: number;
 }
 
 export interface NewRepoScreenState {
-  hostKey: string;
+  orgKey: string;
   cursor: number;
 }
 
@@ -259,7 +269,7 @@ export interface AppState {
   actions: ActionsScreenState | null;
   reply: ReplyScreenState | null;
   confirm: ConfirmScreenState | null;
-  newHost: NewHostScreenState | null;
+  newOrg: NewOrgScreenState | null;
   newRepo: NewRepoScreenState | null;
   newPrompt: NewPromptScreenState | null;
   settings: SettingsScreenState | null;
@@ -289,7 +299,7 @@ export function createInitialState(now: number): AppState {
     actions: null,
     reply: null,
     confirm: null,
-    newHost: null,
+    newOrg: null,
     newRepo: null,
     newPrompt: null,
     settings: null,
@@ -739,7 +749,7 @@ export class App {
       // going offline, sessions converging/disappearing) — keep the cursor
       // in range and off non-selectable rows rather than leaving it stranded
       // on a row that no longer exists or never was tappable.
-      this.state = { ...this.state, home: { cursor: clampHomeCursor(this.homeRows(), this.state.home.cursor) } };
+      this.state = { ...this.state, home: settleHome(this.homeRows(), this.state.home) };
       // A poll can grow the focused session's transcript too (the 20s
       // heartbeat, or a beat the live stream missed) — keep a scrolled-up view
       // pinned to the same lines when it does. Skipped while paused: a
@@ -862,8 +872,8 @@ export class App {
         return this.onReply(e);
       case "confirm":
         return this.onConfirm(e);
-      case "newHost":
-        return this.onNewHost(e);
+      case "newOrg":
+        return this.onNewOrg(e);
       case "newRepo":
         return this.onNewRepo(e);
       case "newPrompt":
@@ -889,10 +899,11 @@ export class App {
     // session dies, a host drops offline) — reclamp before acting so a tap
     // never indexes a row that's gone and never lands on a non-selectable
     // row (host headers/offline lines).
-    const cursor = clampHomeCursor(rows, this.state.home.cursor);
-    if (cursor !== this.state.home.cursor) {
-      this.state = { ...this.state, home: { cursor } };
+    const home = settleHome(rows, this.state.home);
+    if (home.cursor !== this.state.home.cursor || home.selected !== this.state.home.selected) {
+      this.state = { ...this.state, home };
     }
+    const cursor = home.cursor;
     if (e.type === "doubleTap") {
       this.display.requestExit();
       return;
@@ -900,7 +911,7 @@ export class App {
     if (e.type === "scrollDown" || e.type === "scrollUp") {
       const dir = e.type === "scrollDown" ? 1 : -1;
       const next = nextSelectableIndex(rows, cursor, dir);
-      this.setState({ home: { cursor: next } });
+      this.setState({ home: { cursor: next, selected: homeRowKey(rows[next]) } });
       return;
     }
     if (e.type === "tap") {
@@ -912,7 +923,7 @@ export class App {
           session: newSessionState(row.hostKey, row.sessionId),
         });
       } else if (row.kind === "newSession") {
-        this.setState({ screen: "newHost", newHost: { cursor: 0 } });
+        this.setState({ screen: "newOrg", newOrg: { cursor: 0 } });
       } else if (row.kind === "settings") {
         this.setState({ screen: "settings", settings: { cursor: 0 } });
       }
@@ -1561,26 +1572,25 @@ export class App {
     }
   }
 
-  // ---- newHost / newRepo / newPrompt ------------------------------------
+  // ---- newOrg / newRepo / newPrompt -------------------------------------
+  // The operator picks an org and a repo; the host is picked for them
+  // (`spawnHostFor`, XERK-1913), so no machine is ever named on the display.
 
-  private onlineHosts(): AgentInfo[] {
-    return this.state.agents.filter((a) => a.online);
-  }
-
-  private onNewHost(e: InputEvent): void {
-    const n = this.state.newHost;
+  private onNewOrg(e: InputEvent): void {
+    const n = this.state.newOrg;
     if (!n) return this.goHome();
     if (e.type === "doubleTap") return this.goHome();
-    const hosts = this.onlineHosts();
+    const orgs = newOrgRows(this.state);
+    const cursor = pickerCursor(n.cursor, orgs.length);
     if (e.type === "scrollDown" || e.type === "scrollUp") {
       const dir = e.type === "scrollDown" ? 1 : -1;
-      this.setState({ newHost: { cursor: clamp(n.cursor + dir, 0, Math.max(0, hosts.length - 1)) } });
+      this.setState({ newOrg: { cursor: pickerCursor(cursor + dir, orgs.length) } });
       return;
     }
     if (e.type === "tap") {
-      const host = hosts[n.cursor];
-      if (!host) return;
-      this.setState({ screen: "newRepo", newRepo: { hostKey: host.key, cursor: 0 } });
+      const org = orgs[cursor];
+      if (!org) return;
+      this.setState({ screen: "newRepo", newRepo: { orgKey: org.orgKey, cursor: 0 } });
     }
   }
 
@@ -1588,21 +1598,24 @@ export class App {
     const n = this.state.newRepo;
     if (!n) return this.goHome();
     if (e.type === "doubleTap") {
-      this.setState({ screen: "newHost", newHost: { cursor: 0 } });
+      this.setState({ screen: "newOrg", newOrg: { cursor: 0 } });
       return;
     }
-    const rows = buildNewRepoRows(this.state, n.hostKey);
+    const rows = buildNewRepoRows(this.state, n.orgKey);
+    const cursor = pickerCursor(n.cursor, rows.length);
     if (e.type === "scrollDown" || e.type === "scrollUp") {
       const dir = e.type === "scrollDown" ? 1 : -1;
-      this.setState({ newRepo: { ...n, cursor: clamp(n.cursor + dir, 0, Math.max(0, rows.length - 1)) } });
+      this.setState({ newRepo: { ...n, cursor: pickerCursor(cursor + dir, rows.length) } });
       return;
     }
     if (e.type === "tap") {
-      const row = rows[n.cursor];
+      const row = rows[cursor];
       if (!row) return;
+      const host = spawnHostFor(this.state, n.orgKey, row.repo);
+      if (!host) return;
       this.setState({
         screen: "newPrompt",
-        newPrompt: { hostKey: n.hostKey, repo: row.repo, cursor: 0 },
+        newPrompt: { hostKey: host.key, repo: row.repo, cursor: 0 },
       });
     }
   }
@@ -1611,7 +1624,8 @@ export class App {
     const n = this.state.newPrompt;
     if (!n) return this.goHome();
     if (e.type === "doubleTap") {
-      this.setState({ screen: "newRepo", newRepo: { hostKey: n.hostKey, cursor: 0 } });
+      const host = this.state.agents.find((a) => a.key === n.hostKey);
+      this.setState({ screen: "newRepo", newRepo: { orgKey: host ? siteKeyOf(host) : "", cursor: 0 } });
       return;
     }
     if (e.type === "scrollDown" || e.type === "scrollUp") {
@@ -1664,6 +1678,15 @@ function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
 }
 
+// The home state re-resolved against the current rows: the cursor moved onto
+// the selected row wherever it now sits (`homeCursor`), and the selection
+// re-pinned to whatever row that is — so a session that vanished hands the
+// selection to the row that took its place instead of re-resolving each frame.
+function settleHome(rows: HomeRow[], home: HomeScreenState): HomeScreenState {
+  const cursor = homeCursor(rows, home);
+  return { cursor, selected: homeRowKey(rows[cursor]) };
+}
+
 function nextSelectableIndex(rows: { selectable: boolean }[], from: number, dir: 1 | -1): number {
   let i = from;
   for (let steps = 0; steps < rows.length; steps++) {
@@ -1675,22 +1698,3 @@ function nextSelectableIndex(rows: { selectable: boolean }[], from: number, dir:
   return from;
 }
 
-// Keeps the home cursor in range as the row list shrinks/grows (host
-// offline, sessions converging away) and off non-selectable rows (host
-// headers, offline lines) — including the very first render, where the
-// cursor starts at 0 and row 0 is always a non-selectable host header once
-// any host is known. Searches outward (nearest first, forward on ties) for
-// the closest selectable row; "+ New session"/"Settings" are always present
-// and selectable, so a selectable row always exists once rows is non-empty.
-function clampHomeCursor(rows: { selectable: boolean }[], cursor: number): number {
-  if (rows.length === 0) return 0;
-  const c = clamp(cursor, 0, rows.length - 1);
-  if (rows[c]?.selectable) return c;
-  for (let d = 1; d < rows.length; d++) {
-    const forward = c + d;
-    if (forward < rows.length && rows[forward]?.selectable) return forward;
-    const backward = c - d;
-    if (backward >= 0 && rows[backward]?.selectable) return backward;
-  }
-  return c;
-}
