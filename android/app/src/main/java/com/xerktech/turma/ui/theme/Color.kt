@@ -43,7 +43,21 @@ val Critical = Color(0xFFD03B3B)
 // A mid purple that reads on both surfaces (web --s5 is #4a3aa7 / #9085e9).
 val Purple = Color(0xFF7D6FE0)
 
-// ---- validated categorical chart slots (web --s1..--s8, dark stepping) -----
+// ---- validated categorical chart slots (web --s1..--s8) ---------------------
+// Light: the web's `:root` slots. Org card tints and chart lines read these on the
+// light surface; the dark set below is stepped for the dark surface only.
+val ChartSeriesLight = listOf(
+    Color(0xFF2A78D6), // s1 blue
+    Color(0xFF1BAF7A), // s2 green
+    Color(0xFFEDA100), // s3 amber
+    Color(0xFF008300), // s4 green-2
+    Color(0xFF4A3AA7), // s5 violet
+    Color(0xFFE34948), // s6 red
+    Color(0xFFE87BA4), // s7 pink
+    Color(0xFFEB6834), // s8 orange
+)
+
+// Dark: the web's `prefers-color-scheme: dark` slots.
 val ChartSeries = listOf(
     Color(0xFF3987E5), // s1 blue
     Color(0xFF199E70), // s2 green

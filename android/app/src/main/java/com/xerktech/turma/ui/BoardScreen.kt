@@ -566,6 +566,27 @@ fun BoardScreen(
  * wasn't clear, and a `+` collided with the "New session" `+` the Sessions and
  * Dashboard headers carry — so the label carries the meaning on its own).
  */
+/**
+ * The card's triage verdict chip (XERK-486). [Pill] takes the FILL and inks amber
+ * itself ([pillInk]) — pass the fill, never the amber TEXT colour, or "held" is
+ * tinted a muddy brown. Tests: `ColourCallSiteTest`.
+ */
+@Composable
+internal fun TriageVerdictPill(action: String) {
+    Pill(
+        when (action) {
+            "approve" -> "✓ approved"
+            "hold" -> "⏸ held"
+            else -> "✕ rejected"
+        },
+        color = when (action) {
+            "approve" -> TurmaColors.good
+            "hold" -> TurmaColors.warning
+            else -> TurmaColors.critical
+        },
+    )
+}
+
 @Composable
 fun NewTicketAction(vm: BoardViewModel = viewModel()) {
     val fleet by vm.fleet.collectAsStateWithLifecycle()
@@ -671,7 +692,7 @@ private fun KanbanColumn(
                 else null
                 TicketCard(
                     t,
-                    TurmaColors.series[(colorMap[site.siteKey] ?: 0) % TurmaColors.series.size],
+                    TurmaColors.series().let { it[(colorMap[site.siteKey] ?: 0) % it.size] },
                     now = now,
                     sessions = ticketSessionsOf(sessionIndex, site.siteKey, t.key),
                     start = starts[moveKey],
@@ -775,20 +796,7 @@ private fun TicketCard(
                 RepoChip(t)
                 // The operator's triage verdict (XERK-486) — "no verdict" is the
                 // default and renders nothing, matching the web card.
-                triageAction?.let { action ->
-                    Pill(
-                        when (action) {
-                            "approve" -> "✓ approved"
-                            "hold" -> "⏸ held"
-                            else -> "✕ rejected"
-                        },
-                        color = when (action) {
-                            "approve" -> TurmaColors.good
-                            "hold" -> TurmaColors.warning
-                            else -> TurmaColors.critical
-                        },
-                    )
-                }
+                triageAction?.let { TriageVerdictPill(it) }
                 // Distinguish an epic (an organizer) from work tickets (XERK-638),
                 // and mark a work ticket that belongs to one.
                 if (isEpicTicket(t)) {

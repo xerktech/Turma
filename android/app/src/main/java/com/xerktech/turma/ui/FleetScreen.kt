@@ -264,8 +264,9 @@ fun codingAgentLabel(a: AgentInfo): String {
 /** The org tint for a host card (XERK-142): its org's palette colour, or null for a
  *  host with no tracker creds (no org → stays plain surface). colorMap is built over
  *  the whole fleet so the colour is stable regardless of the header's org filter. */
+@Composable
 private fun orgTintOf(agent: AgentInfo, colorMap: Map<String, Int>): Color? {
-    val series = com.xerktech.turma.ui.theme.TurmaColors.series
+    val series = com.xerktech.turma.ui.theme.TurmaColors.series()
     val slot = colorMap[siteKeyOf(agent)] ?: return null
     return series[slot % series.size]
 }

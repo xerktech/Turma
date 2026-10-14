@@ -188,12 +188,13 @@ private fun OrgSwatchRow(pinned: Int?, onPick: (Int?) -> Unit) {
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
     ) {
-        for (n in 1..TurmaColors.series.size) {
+        val series = TurmaColors.series()
+        for (n in 1..series.size) {
             Box(
                 Modifier
                     .size(20.dp)
                     .clip(CircleShape)
-                    .background(TurmaColors.series[n - 1])
+                    .background(series[n - 1])
                     .border(
                         width = if (pinned == n) 2.dp else 1.dp,
                         color = if (pinned == n) MaterialTheme.colorScheme.primary
@@ -335,5 +336,6 @@ private fun OrgDot(color: Color) {
     Box(Modifier.size(9.dp).clip(CircleShape).background(color))
 }
 
+@Composable
 private fun orgColor(colorMap: Map<String, Int>, siteKey: String): Color =
-    TurmaColors.series[(colorMap[siteKey] ?: 0) % TurmaColors.series.size]
+    TurmaColors.series().let { it[(colorMap[siteKey] ?: 0) % it.size] }

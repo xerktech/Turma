@@ -23,7 +23,10 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.isImeVisible
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -73,6 +76,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -99,7 +103,7 @@ import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.vm.ChatViewModel
 import com.xerktech.turma.vm.MicState
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun ChatScreen(
     host: String,
@@ -178,16 +182,39 @@ fun ChatScreen(
     // edge-to-edge, so without this the IME simply overlays the compose box
     // and you can't see what you're typing. imePadding consumes the inset,
     // so the bottomBar (footer + question sheet) lands right on the keyboard.
-    BoxWithConstraints(Modifier.imePadding()) {
+    // The navigation bar likewise: on the full-screen phone route nothing else
+    // reserves it, and the gesture handle drew over the compose box. (In the
+    // two-pane layout MainScaffold has already consumed it, so this pads 0 there.)
+    BoxWithConstraints(Modifier.navigationBarsPadding().imePadding()) {
     val sheetMax = with(density) { waitingSheetCap(maxHeight, topBarPx.toDp(), footerPx.toDp()) }
+    // The header's two lines must FIT its bar (rollup XERK-1701 #64.1): a fixed 64dp
+    // bar clipped the host · repo · tunnel line at a large font scale and let it spill
+    // in landscape. So a short window takes the smaller title style, the bar grows to
+    // the lines' real height at this font scale, and with the keyboard up in a short
+    // window the meta line folds away so the composer keeps the room (#66).
+    val shortWindow = maxHeight < CHAT_SHORT_WINDOW
+    val showMeta = state.session != null && !(shortWindow && WindowInsets.isImeVisible)
+    val titleStyle = if (shortWindow) MaterialTheme.typography.titleMedium else MaterialTheme.typography.titleLarge
+    val metaStyle = MaterialTheme.typography.bodySmall
+    val barHeight = with(density) {
+        chatTopBarHeight(titleStyle.lineHeight.toDp(), if (showMeta) metaStyle.lineHeight.toDp() else 0.dp)
+    }
+    // The footer never grows past the room under the top bar: taller (landscape with
+    // the keyboard up, or a large font scale) it scrolls, pinned to its BOTTOM so the
+    // compose box stays in view and the chips scroll away, instead of drawing over
+    // the top bar (rollup XERK-1701 #66).
+    val footerMax = with(density) { (maxHeight - topBarPx.toDp()).coerceAtLeast(0.dp) }
+    val footerScroll = rememberScrollState()
     Scaffold(
         topBar = {
             TopAppBar(
-                modifier = Modifier.onSizeChanged { topBarPx = it.height },
+                modifier = Modifier.onSizeChanged { topBarPx = it.height }.testTag(CHAT_TOP_BAR_TAG),
+                expandedHeight = barHeight,
                 title = {
                     Column {
-                        Text(state.session?.let { sessionName(it) } ?: "Session", maxLines = 1)
-                        state.session?.let {
+                        Text(state.session?.let { sessionName(it) } ?: "Session", maxLines = 1,
+                            overflow = TextOverflow.Ellipsis, style = titleStyle)
+                        state.session?.takeIf { showMeta }?.let {
                             // Host · repo · branch (XERK-121), then whether
                             // anything is reaching us (core `liveMarker`, the
                             // web's tunnel chip). The marker is its OWN Text and
@@ -199,7 +226,7 @@ fun ChatScreen(
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
                                     sessionHeaderMeta(hostLabel, it),
-                                    style = MaterialTheme.typography.bodySmall,
+                                    style = metaStyle,
                                     fontFamily = FontFamily.Monospace,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
@@ -208,7 +235,7 @@ fun ChatScreen(
                                 if (mark.isNotEmpty()) {
                                     Text(
                                         " · " + mark,
-                                        style = MaterialTheme.typography.bodySmall,
+                                        style = metaStyle,
                                         fontFamily = FontFamily.Monospace,
                                         maxLines = 1,
                                         color = if (state.tunnelOnline) Color.Unspecified
@@ -252,7 +279,11 @@ fun ChatScreen(
         },
         snackbarHost = { SnackbarHost(snackbar) },
         bottomBar = {
-            Column {
+            Column(
+                Modifier.heightIn(max = footerMax)
+                    .verticalScroll(footerScroll, reverseScrolling = true)
+                    .testTag(CHAT_FOOTER_TAG),
+            ) {
                 // The live working-status bar (web chat.js updateLiveStatus): spinner
                 // + gerund verb + ↑/↓ token counters + elapsed, Claude Code's rotating
                 // tip / active-task hint lines, and the live agent-manager list. Shown
@@ -550,7 +581,10 @@ private fun QuestionSheet(
     onAnswerMulti: (List<Int>) -> Unit,
 ) {
     val picks = remember(question) { mutableStateListOf<Int>() }
-    Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), modifier = Modifier.fillMaxWidth()) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+        modifier = Modifier.fillMaxWidth().testTag(WAITING_SHEET_TAG),
+    ) {
         Column(
             Modifier.heightIn(max = maxHeight).verticalScroll(rememberScrollState()).padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -593,6 +627,23 @@ internal fun waitingSheetCap(window: Dp, topBar: Dp, footer: Dp): Dp =
 
 internal val CHAT_SHEET_GAP = 24.dp
 
+// Test handles for the header / footer / sheet bounds checks.
+internal const val CHAT_TOP_BAR_TAG = "chatTopBar"
+internal const val CHAT_FOOTER_TAG = "chatFooter"
+internal const val WAITING_SHEET_TAG = "waitingSheet"
+
+/** Below this the chat is a short window (a landscape phone): smaller title, and the
+ *  meta line yields to the composer while the keyboard is up. */
+internal val CHAT_SHORT_WINDOW = 480.dp
+
+/**
+ * The chat top bar's height for a title line and a meta line of these heights (0 when
+ * the meta line is hidden): Material's 64dp, or taller when the lines at this font
+ * scale need it — a fixed 64dp clipped the meta line at font scale 2.0.
+ */
+internal fun chatTopBarHeight(titleLine: Dp, metaLine: Dp): Dp =
+    maxOf(64.dp, titleLine + metaLine + 16.dp)
+
 /**
  * The TUI's blocking dialog — a tool-permission request or a plan approval —
  * in the same place as the question sheet (web chat.js panePromptHtml): the
@@ -605,7 +656,10 @@ private fun PanePromptSheet(
     maxHeight: androidx.compose.ui.unit.Dp,
     onPick: (Int) -> Unit,
 ) {
-    Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), modifier = Modifier.fillMaxWidth()) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+        modifier = Modifier.fillMaxWidth().testTag(WAITING_SHEET_TAG),
+    ) {
         Column(
             Modifier.heightIn(max = maxHeight).verticalScroll(rememberScrollState()).padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -700,7 +754,7 @@ private fun QuestionOptionCard(
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun ChatFooter(
+internal fun ChatFooter(
     session: com.xerktech.turma.model.SessionInfo?,
     draft: String,
     mic: MicState,

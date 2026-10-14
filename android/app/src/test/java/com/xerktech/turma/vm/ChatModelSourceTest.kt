@@ -139,12 +139,20 @@ class ChatModelSourceTest {
         runBlocking { vm.setModelSource(ModelSource.LOCAL).join() }
         assertNotNull(memo())
 
-        // The host's next beat reports the switch as landed.
+        // The host's next beat reports the switch as landed — with a FRESHER
+        // `lastSeen`, as a real later beat has. That is load-bearing: the successful
+        // POST `nudge()`s a fleet poll, and on a loaded runner that poll could be
+        // answered with the FIRST beat (served before the route below changed) yet
+        // land AFTER this one. With equal stamps it overwrote the agreeing record;
+        // the conflated StateFlow could skip the agreeing state entirely, so the
+        // memo never retired and the wait timed out (rollup #56). The freshness
+        // guard keeps the newer record, as it does in production.
         hub.seedFleet(
             HubHarness.fleetJson(
                 host = host,
                 localModel = """{"available":true,"model":"qwen3-coder"}""",
                 sessions = """{ "id": "$session", "repo": "Turma", "modelSource": "local" }""",
+                lastSeen = 2,
             )
         )
 
@@ -154,9 +162,7 @@ class ChatModelSourceTest {
         // (and returning at once when it has already happened, since a
         // StateFlow replays its value) is deterministic where a 10s timed poll
         // reddened on a loaded runner.
-        // 30 s, as the Compose tests' WAIT_MS: the default 10 s timed out once on a
-        // loaded android-ci runner (run 38102453547, rollup #56). A pass returns at once.
-        hub.awaitFlow(hub.container.modelSwitches.of(host, session), timeoutMs = 30_000) { it == null }
+        hub.awaitFlow(hub.container.modelSwitches.of(host, session)) { it == null }
         vm.onLeave()
     }
 

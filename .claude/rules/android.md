@@ -64,6 +64,9 @@ Mirrors the glasses pure-core/adapter-shell split:
 - Org filter/board pins/tinting: `data/OrgFilter.kt` + `ui/OrgControl.kt` + `core/Board.kt`
   (`orgColorMap`, `FleetState.orgColors`, `TurmaCard(tint=)`), tested in `BoardTest.kt` alongside
   `hostOptions`/`agentPinOf`/`modelPinOf`/`statusChangeable`/`autoStartOn`.
+- Org tints and chart lines read `TurmaColors.series()` — composable, the web's light `--s1..--s8`
+  on a light surface and the dark set on dark. Never hold a palette list outside composition (a
+  theme switch would keep the old one). Tests: `StatusTextColorsTest`.
 - Permission policy editor (XERK-1566): `PermissionPolicySheet` in `ui/BoardScreen.kt` (a labelled
   item in `ScreenHeader`'s ⋮ `menuItems`, never a header icon — one crowded the org filter), state in `BoardViewModel.permission`, its own route — never `/api/agents`.
 - Create-ticket parity: ＋ in `ScreenHeader` → `CreateTicketSheet`; `source` on
@@ -142,6 +145,17 @@ Mirrors the glasses pure-core/adapter-shell split:
   concurrently with setting it". `HubHarness.after()` cancels them BEFORE `server.shutdown()`,
   which aborts in-flight calls and is itself a source of late answers (QA); the rule's
   `finished()` runs after it. `viewModel()` VMs in composables are cleared by the compose rule.
+- **Never let a Compose test take a screen's `viewModel()` default** — pass a VM built on
+  `hub.app`. In a full-suite run the default handed back a VM over an EARLIER test's container
+  (stale fleet, dead MockWebServer): measured in `OrgControlMergeTest` / `BoardTriageTest` flakes.
+- **No wall-clock races in tests**: hold a response on a latch the test releases
+  (`UsagePermissionsViewModelTest.routeByOrg`), never `setHeadersDelay`; bound a perf test on
+  thread CPU time (`ProseTest.cpuMs`), never `System.nanoTime` — both reddened under CPU load.
+- A second beat seeded after a VM action that `nudge()`s the fleet carries a fresher `lastSeen`
+  (`fleetJson(lastSeen=)`): the nudge's poll can land the FIRST beat after it (`ChatModelSourceTest`).
+- Colour call sites are pinned in pixels/text-layout, light theme (`ColourCallSiteTest`); the
+  chat's sheet cap and header/footer fit on the real `ChatScreen` in a short `requiredHeight` box
+  (`WaitingSheetBoundsTest`, `ChatHeaderFooterFitTest`) — a short box, so the MEASURED bars bind.
 - **Assert a model-switch memo on the STORE (`container.modelSwitches`), never `ChatUiState`** — the
   state copy is a VM-rebuilt mirror; asserting it passes on a change that dropped the real thing.
 - **The in-app updater is silenced in tests (XERK-281)** — Robolectric rebuilds the Application per

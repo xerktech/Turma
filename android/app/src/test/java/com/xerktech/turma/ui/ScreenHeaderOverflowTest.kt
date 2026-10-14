@@ -6,7 +6,11 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.harness.HubHarness
+import com.xerktech.turma.vm.OrgViewModel
+import kotlinx.coroutines.cancel
+import org.junit.After
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -46,6 +50,10 @@ class ScreenHeaderOverflowTest {
     @get:Rule(order = 1)
     val compose = createAndroidComposeRule<ComponentActivity>()
 
+    private var vm: OrgViewModel? = null
+
+    @After fun clearVm() { vm?.viewModelScope?.cancel() }
+
     private fun fleet() = """
         {"now": 1, "agents": [{"key": "k8x", "device": "k8x",
           "online": true, "terminalOnline": true,
@@ -61,7 +69,11 @@ class ScreenHeaderOverflowTest {
 
     @Test fun `OrgFilterAction applies the caller's layout modifier to its root`() {
         hub.seedFleet(fleet())
-        compose.setContent { OrgFilterAction(Modifier.testTag("orgControl")) }
+        // Bound to THIS test's Application: in a full-suite run `viewModel()`'s default
+        // handed back a VM over an earlier test's org-less fleet, and the control
+        // rendered as an empty 0x0 node (see OrgControlMergeTest).
+        val vm = OrgViewModel(hub.app).also { vm = it }
+        compose.setContent { OrgFilterAction(Modifier.testTag("orgControl"), vm = vm) }
         compose.waitForIdle()
 
         // The tag rides the same Modifier the header threads its weight through, so

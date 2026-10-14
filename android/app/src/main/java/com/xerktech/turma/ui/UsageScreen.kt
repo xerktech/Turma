@@ -136,8 +136,9 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
     val visible = remember(ordered, hidden) { ordered.filter { it.skey !in hidden } }
     // Paint is assigned by position in the FULL ordered list, not the visible
     // one, so toggling a series never repaints the survivors (web assignPaint).
-    val paint = remember(ordered) {
-        ordered.mapIndexed { i, s -> s.skey to TurmaColors.series[i % TurmaColors.series.size] }.toMap()
+    val palette = TurmaColors.series()
+    val paint = remember(ordered, palette) {
+        ordered.mapIndexed { i, s -> s.skey to palette[i % palette.size] }.toMap()
     }
 
     Column(modifier.fillMaxSize()) {
@@ -418,6 +419,7 @@ private fun UsageChart(visible: List<UsageSeries>, paint: Map<String, androidx.c
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        val fallback = TurmaColors.series()[0]
         Canvas(Modifier.fillMaxWidth().height(180.dp)) {
             val n = dates.size
             val gap = 2.dp.toPx()
@@ -431,7 +433,7 @@ private fun UsageChart(visible: List<UsageSeries>, paint: Map<String, androidx.c
                     val h = (v.toDouble() / yMax * size.height).toFloat()
                     y -= h
                     drawRect(
-                        color = paint[s.skey] ?: TurmaColors.series[0],
+                        color = paint[s.skey] ?: fallback,
                         topLeft = Offset(x, y),
                         size = Size(barW, h),
                     )
@@ -477,7 +479,7 @@ private fun UsageLegend(
             ) {
                 Box(
                     Modifier.size(10.dp).clip(RoundedCornerShape(3.dp)).background(
-                        (paint[s.skey] ?: TurmaColors.series[0]).copy(alpha = if (off) 0.3f else 1f),
+                        (paint[s.skey] ?: TurmaColors.series()[0]).copy(alpha = if (off) 0.3f else 1f),
                     ),
                 )
                 Text(

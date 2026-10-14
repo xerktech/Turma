@@ -323,7 +323,7 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
  *  Mirrors the chat footer's split bar: Send ALWAYS sends (mid-turn it queues),
  *  and a separate warning-coloured ◼ Stop appears beside it while a turn runs. */
 @Composable
-private fun TerminalInputBar(
+internal fun TerminalInputBar(
     text: String,
     busy: Boolean,
     onText: (String) -> Unit,
