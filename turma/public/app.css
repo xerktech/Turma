@@ -282,7 +282,7 @@ h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 .org-row-main:hover { color: var(--ink); }
 .org-row.active .org-row-main { color: var(--accent); font-weight: 600; }
 .org-row-main .chip-n { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-.org-row-main .chip-stale { color: var(--warning); font-size: 11px; }
+.org-row-main .chip-stale { color: var(--warning-text); font-size: 11px; }
 /* The color-chip segment (XERK-145): the org's current dot, opening the swatch
    strip below its row. Divided from the pick like the auto segment. */
 .org-chip-color {
@@ -416,7 +416,7 @@ input:focus, textarea:focus, select:focus {
 .pr-badge .pr-ready { font-weight: 700; font-size: 11px; }
 .pr-badge .pr-ready.ready { color: var(--good); }
 .pr-badge .pr-ready.blocked { color: var(--critical); }
-.pr-badge .pr-ready.pending { color: var(--warning); }
+.pr-badge .pr-ready.pending { color: var(--warning-text); }
 .pr-list { display: flex; flex-wrap: wrap; gap: 6px; }
 
 /* ---- Status "lights" — glowing dots (the Lumen points-of-light motif) ---- */
@@ -691,7 +691,7 @@ button:disabled .spin { border-top-color: var(--ink-2); }
   display: inline-block; vertical-align: middle;
   padding: 1px 7px; border-radius: var(--radius-sm);
   border: 1px solid var(--border); background: var(--page);
-  color: var(--warning); font-family: var(--font-mono); font-size: 10.5px;
+  color: var(--warning-text); font-family: var(--font-mono); font-size: 10.5px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   max-width: 15ch;
 }
@@ -709,7 +709,7 @@ button:disabled .spin { border-top-color: var(--ink-2); }
   max-width: 15ch;
 }
 .kc-triage-approve { color: var(--good); border-color: var(--good); }
-.kc-triage-hold { color: var(--warning); border-color: var(--warning); }
+.kc-triage-hold { color: var(--warning-text); border-color: var(--warning); }
 .kc-triage-reject { color: var(--critical); border-color: var(--critical); }
 /* Epic auto-orchestration (XERK-638). An epic is an organizer, not a work
    ticket: a solid accent "EPIC" badge distinguishes it, and a work ticket that
@@ -750,7 +750,7 @@ button:disabled .spin { border-top-color: var(--ink-2); }
   white-space: nowrap;
 }
 .kc-epic-run.kc-epic-running { color: var(--accent); border-color: var(--accent); }
-.kc-epic-run.kc-epic-blocked { color: var(--warning); border-color: var(--warning); }
+.kc-epic-run.kc-epic-blocked { color: var(--warning-text); border-color: var(--warning); }
 .kc-epic-run.kc-epic-done { color: var(--good); border-color: var(--good); }
 .kc-epic-run.kc-epic-paused { color: var(--muted); border-color: var(--muted); }
 /* Start-a-session-on-this-ticket, and the sessions it started. Both sit in
@@ -781,7 +781,7 @@ button:disabled .spin { border-top-color: var(--ink-2); }
   border: 1px dashed var(--border); background: var(--page);
   color: var(--muted); font-size: 10.5px; line-height: 1.5; white-space: nowrap;
 }
-.kc-queued.kc-queued-blocked { color: var(--warning); border-color: var(--warning); }
+.kc-queued.kc-queued-blocked { color: var(--warning-text); border-color: var(--warning); }
 .kc-unqueue {
   padding: 1px 6px; border-radius: var(--radius-sm);
   border: 1px solid var(--border); background: var(--page);
@@ -834,7 +834,7 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 .kanban-card .kc-org { margin-left: auto; }
 .kc-org::before { content: ""; width: 8px; height: 8px; border-radius: 2px; background: var(--org); flex: none; }
 .kc-note { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
-.kc-note.kc-err { color: var(--warning); }
+.kc-note.kc-err { color: var(--warning-text); }
 
 /* The whole card opens the detail panel (the kc-key link still goes to Jira). */
 .kanban-card[role="button"] { cursor: pointer; }
@@ -954,7 +954,7 @@ body.td-open { overflow: hidden; }
   border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: 11px;
   padding: 3px 4px;
 }
-.td-err-inline { color: var(--warning); font-size: 10.5px; }
+.td-err-inline { color: var(--warning-text); font-size: 10.5px; }
 .td-label {
   display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 10.5px;
   color: var(--ink-2); background: var(--page); border: 1px solid var(--border);
@@ -968,7 +968,7 @@ body.td-open { overflow: hidden; }
 .td-section a { color: var(--accent); }
 .td-none { color: var(--muted); font-size: 13px; font-style: italic; }
 .td-note { color: var(--muted); font-size: 12px; margin: 6px 0; }
-.td-note.td-err { color: var(--warning); }
+.td-note.td-err { color: var(--warning-text); }
 .td-comment { border-top: 1px solid var(--hairline); padding: 10px 0 2px; }
 .td-comment:first-of-type { border-top: 0; padding-top: 0; }
 .td-chead { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
@@ -988,7 +988,7 @@ body.td-open { overflow: hidden; }
   font-size: 10.5px; font-weight: 600; border: 1px solid var(--border);
 }
 .epic-state.epic-running { color: var(--accent); border-color: var(--accent); }
-.epic-state.epic-blocked { color: var(--warning); border-color: var(--warning); }
+.epic-state.epic-blocked { color: var(--warning-text); border-color: var(--warning); }
 .epic-state.epic-done { color: var(--good); border-color: var(--good); }
 .epic-state.epic-paused { color: var(--muted); border-color: var(--muted); }
 .epic-state.epic-idle { color: var(--muted); border-color: var(--muted); }
@@ -1042,7 +1042,7 @@ body.td-open { overflow: hidden; }
 .epic-btn:hover { filter: brightness(1.05); }
 .epic-btn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
 .epic-btn.epic-btn-ghost { background: var(--page); color: var(--accent); }
-.epic-btn.epic-btn-pause { background: var(--page); color: var(--warning); border-color: var(--warning); }
+.epic-btn.epic-btn-pause { background: var(--page); color: var(--warning-text); border-color: var(--warning); }
 .epic-btn.epic-btn-cancel { background: var(--page); color: var(--critical); border-color: var(--critical); }
 .epic-btn.epic-btn-busy { background: var(--page); color: var(--muted); border-color: var(--border); border-style: dashed; cursor: default; }
 /* New-ticket form (XERK-137). Reuses the detail panel's backdrop/panel chrome;
@@ -1069,7 +1069,7 @@ body.td-open { overflow: hidden; }
   outline: none; border-color: var(--accent);
 }
 .cf-note { color: var(--muted); font-size: 12px; }
-.cf-note.cf-err { color: var(--warning); }
+.cf-note.cf-err { color: var(--warning-text); }
 .cf-actions {
   display: flex; justify-content: flex-end; gap: 8px;
   border-top: 1px solid var(--hairline); padding-top: 14px; margin-top: 4px;
@@ -1092,7 +1092,7 @@ body.td-open { overflow: hidden; }
 .cf-done a { color: var(--accent); }
 /* A ticket created but not assigned: still a success, so it sits in the same
    confirmation line rather than the error slot — just marked. */
-.cf-warn { color: var(--warning); }
+.cf-warn { color: var(--warning-text); }
 /* Per-org triage policy panel (XERK-486): narrow modal reusing the detail
    panel's backdrop/padding plus the form-field and action-button styles above. */
 .td-panel.td-narrow { max-width: 520px; }

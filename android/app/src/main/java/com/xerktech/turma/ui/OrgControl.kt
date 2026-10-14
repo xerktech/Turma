@@ -325,7 +325,7 @@ private fun OrgRowLabel(label: String, color: Color?, count: Int, note: String?,
             softWrap = false,
         )
         if (note != null) {
-            Text(note, style = MaterialTheme.typography.labelSmall, color = TurmaColors.waiting, maxLines = 1, softWrap = false)
+            Text(note, style = MaterialTheme.typography.labelSmall, color = TurmaColors.waitingText(), maxLines = 1, softWrap = false)
         }
     }
 }

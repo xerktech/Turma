@@ -312,7 +312,7 @@ private fun BriefBody(
             horizontalArrangement = Arrangement.spacedBy(18.dp),
         ) {
             val c = brief.counts
-            BriefStat("Needs you", c.needsYou, if (c.needsYou > 0) TurmaColors.warning else null)
+            BriefStat("Needs you", c.needsYou, if (c.needsYou > 0) TurmaColors.waitingText() else null)
             BriefStat("Stalled", c.stalled, if (c.stalled > 0) TurmaColors.critical else null)
             BriefStat("Waiting", c.waiting, null)
             BriefStat("Finished", c.finished, null)
@@ -352,7 +352,7 @@ private fun BriefBody(
                 briefSpendWindow("7d", s.sevenDayPct, s.sevenDayResetsAt, now)?.let { bits += it }
                 if (s.paused) bits += "auto-start paused"
                 Text(bits.joinToString(" · "), style = MaterialTheme.typography.bodySmall,
-                    color = if (s.paused) TurmaColors.warning else Color.Unspecified)
+                    color = if (s.paused) TurmaColors.waitingText() else Color.Unspecified)
             }
         }
         if (earlier > 0) {

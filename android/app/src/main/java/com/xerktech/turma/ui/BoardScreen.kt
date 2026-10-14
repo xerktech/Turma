@@ -784,7 +784,7 @@ private fun TicketCard(
                         },
                         color = when (action) {
                             "approve" -> TurmaColors.good
-                            "hold" -> TurmaColors.warning
+                            "hold" -> TurmaColors.waitingText()
                             else -> TurmaColors.critical
                         },
                     )
@@ -1114,7 +1114,7 @@ private fun EpicRunSection(
                         if (view.state != "done") {
                             OutlinedButton(
                                 onClick = { hold(true) },
-                                colors = ButtonDefaults.outlinedButtonColors(contentColor = TurmaColors.warning),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = TurmaColors.waitingText()),
                             ) { Text("⏸ Pause") }
                         }
                     }
@@ -1186,7 +1186,8 @@ private fun EpicWaveGroup(title: String, children: List<EpicChild>, cyclic: Bool
                 Box(Modifier.size(8.dp).clip(CircleShape).background(epicChildColor(c.status)))
                 Text(c.key, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(c.summary, style = MaterialTheme.typography.bodyMedium, maxLines = 1, modifier = Modifier.weight(1f))
-                Text(epicChildLabel(c.status), style = MaterialTheme.typography.labelSmall, color = epicChildColor(c.status))
+                Text(epicChildLabel(c.status), style = MaterialTheme.typography.labelSmall,
+                    color = if (c.status == EpicChildStatus.BLOCKED) TurmaColors.waitingText() else epicChildColor(c.status))
             }
         }
     }
@@ -2199,7 +2200,7 @@ private fun CreateTicketSheet(
                     if (done.warning.isNotBlank()) "Created ${done.key}. \u26a0 ${done.warning}."
                     else "Created ${done.key}. It'll appear on the board on the next poll.",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = if (done.warning.isNotBlank()) TurmaColors.warning
+                    color = if (done.warning.isNotBlank()) TurmaColors.waitingText()
                             else Color.Unspecified,
                 )
                 if (done.url.isNotBlank()) {

@@ -144,7 +144,7 @@ private fun behaviourNote(): AnnotatedString = buildAnnotatedString {
 private fun PermKindChip(kind: String, dialogKind: String?, modifier: Modifier = Modifier) {
     val color = when (Permissions.kindStyle(kind)) {
         "classifier-denied" -> TurmaColors.critical
-        "ask-in-chat" -> TurmaColors.warning
+        "ask-in-chat" -> TurmaColors.waitingText()
         "judged" -> MaterialTheme.colorScheme.primary
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }

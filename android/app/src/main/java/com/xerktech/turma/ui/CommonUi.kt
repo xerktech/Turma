@@ -465,7 +465,13 @@ fun Pill(
     dashed: Boolean = false,
     mono: Boolean = false,
 ) {
-    val fg = color ?: MaterialTheme.colorScheme.onSurfaceVariant
+    // Amber is under 2:1 as text on a light surface: the pill keeps the fill for
+    // its tint and reads in the amber TEXT colour (web --warning-text).
+    val fg = when (color) {
+        null -> MaterialTheme.colorScheme.onSurfaceVariant
+        TurmaColors.warning -> TurmaColors.waitingText()
+        else -> color
+    }
     val border = if (dashed) fg.copy(alpha = 0.5f) else MaterialTheme.colorScheme.outline
     Text(
         text,
@@ -510,7 +516,11 @@ fun ContextMeterBar(session: SessionInfo, modifier: Modifier = Modifier) {
         Text(
             "${m.pct}%${if (m.approx) " ~" else ""} context",
             style = MaterialTheme.typography.bodySmall,
-            color = if (m.level == ContextMeter.Level.OK) MaterialTheme.colorScheme.onSurfaceVariant else color,
+            color = when (m.level) {
+                ContextMeter.Level.OK -> MaterialTheme.colorScheme.onSurfaceVariant
+                ContextMeter.Level.WARN -> TurmaColors.waitingText()
+                ContextMeter.Level.DANGER -> color
+            },
         )
     }
 }

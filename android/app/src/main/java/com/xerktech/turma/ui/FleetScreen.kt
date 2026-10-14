@@ -627,7 +627,7 @@ private fun SessionCard(
                         w.text,
                         style = MaterialTheme.typography.bodySmall,
                         fontWeight = FontWeight.SemiBold,
-                        color = if (w.risk) com.xerktech.turma.ui.theme.TurmaColors.waiting else muted,
+                        color = if (w.risk) com.xerktech.turma.ui.theme.TurmaColors.waitingText() else muted,
                         maxLines = 2,
                     )
                 }
@@ -665,7 +665,7 @@ private fun SessionCard(
                         Text(
                             "queued — " + queuedReasonText(session.queuedReason) + since,
                             style = MaterialTheme.typography.bodySmall,
-                            color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                            color = com.xerktech.turma.ui.theme.TurmaColors.waitingText(),
                             maxLines = 1,
                         )
                     }
@@ -675,7 +675,7 @@ private fun SessionCard(
                     Text(
                         "“$q”",
                         style = MaterialTheme.typography.bodySmall,
-                        color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                        color = com.xerktech.turma.ui.theme.TurmaColors.waitingText(),
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
@@ -687,7 +687,7 @@ private fun SessionCard(
                         Text(
                             ask,
                             style = MaterialTheme.typography.bodySmall,
-                            color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                            color = com.xerktech.turma.ui.theme.TurmaColors.waitingText(),
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
                         )
