@@ -10,6 +10,8 @@ import {
   buildActionsRows,
   buildHomeRows,
   buildNewRepoRows,
+  homeCursor,
+  homeRowKey,
   newOrgRows,
   pickerCursor,
   questionSheetActive,
@@ -81,6 +83,11 @@ export function pendingKeyForSpawn(hostKey: string, repo: string): string {
 
 export interface HomeScreenState {
   cursor: number;
+  // The row the cursor is ON, by identity (`homeRowKey`), so it stays on that
+  // session while the status groups regroup around it (XERK-1913) — by a poll,
+  // or by time alone (a host aging offline) with no poll at all. Absent = the
+  // cursor index alone decides (fresh state, an org-filter change).
+  selected?: string;
 }
 
 export interface SessionScreenState {
@@ -632,10 +639,6 @@ export class App {
       // starts its own fetch here.
       const res = await (prefetched ?? this.client.listAgents());
       const sessionRefs = flattenSessions(res.agents);
-      // The session the home cursor is on, so it can follow that session when
-      // the poll regroups the list (XERK-1913: a status flip moves a session
-      // between groups, and a cursor kept by row index would land on another).
-      const selectedId = this.homeRows()[this.state.home.cursor]?.sessionId;
       // Content length of the focused session *before* this poll's tail merge,
       // so a scrolled-up view can be pinned to the same lines (see
       // preserveScrollOffset) if the poll grows the transcript underneath it.
@@ -676,10 +679,7 @@ export class App {
       // going offline, sessions converging/disappearing) — keep the cursor
       // in range and off non-selectable rows rather than leaving it stranded
       // on a row that no longer exists or never was tappable.
-      const rows = this.homeRows();
-      const followed = selectedId ? rows.findIndex((r) => r.sessionId === selectedId) : -1;
-      const cursor = followed >= 0 ? followed : clampHomeCursor(rows, this.state.home.cursor);
-      this.state = { ...this.state, home: { cursor } };
+      this.state = { ...this.state, home: settleHome(this.homeRows(), this.state.home) };
       // A poll can grow the focused session's transcript too (the 20s
       // heartbeat, or a beat the live stream missed) — keep a scrolled-up view
       // pinned to the same lines when it does. Skipped while paused: a
@@ -827,10 +827,11 @@ export class App {
     // session dies, a host drops offline) — reclamp before acting so a tap
     // never indexes a row that's gone and never lands on a non-selectable
     // row (host headers/offline lines).
-    const cursor = clampHomeCursor(rows, this.state.home.cursor);
-    if (cursor !== this.state.home.cursor) {
-      this.state = { ...this.state, home: { cursor } };
+    const home = settleHome(rows, this.state.home);
+    if (home.cursor !== this.state.home.cursor || home.selected !== this.state.home.selected) {
+      this.state = { ...this.state, home };
     }
+    const cursor = home.cursor;
     if (e.type === "doubleTap") {
       this.display.requestExit();
       return;
@@ -838,7 +839,7 @@ export class App {
     if (e.type === "scrollDown" || e.type === "scrollUp") {
       const dir = e.type === "scrollDown" ? 1 : -1;
       const next = nextSelectableIndex(rows, cursor, dir);
-      this.setState({ home: { cursor: next } });
+      this.setState({ home: { cursor: next, selected: homeRowKey(rows[next]) } });
       return;
     }
     if (e.type === "tap") {
@@ -1539,6 +1540,15 @@ function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
 }
 
+// The home state re-resolved against the current rows: the cursor moved onto
+// the selected row wherever it now sits (`homeCursor`), and the selection
+// re-pinned to whatever row that is — so a session that vanished hands the
+// selection to the row that took its place instead of re-resolving each frame.
+function settleHome(rows: HomeRow[], home: HomeScreenState): HomeScreenState {
+  const cursor = homeCursor(rows, home);
+  return { cursor, selected: homeRowKey(rows[cursor]) };
+}
+
 function nextSelectableIndex(rows: { selectable: boolean }[], from: number, dir: 1 | -1): number {
   let i = from;
   for (let steps = 0; steps < rows.length; steps++) {
@@ -1550,22 +1560,3 @@ function nextSelectableIndex(rows: { selectable: boolean }[], from: number, dir:
   return from;
 }
 
-// Keeps the home cursor in range as the row list shrinks/grows (host
-// offline, sessions converging away) and off non-selectable rows (host
-// headers, offline lines) — including the very first render, where the
-// cursor starts at 0 and row 0 is always a non-selectable host header once
-// any host is known. Searches outward (nearest first, forward on ties) for
-// the closest selectable row; "+ New session"/"Settings" are always present
-// and selectable, so a selectable row always exists once rows is non-empty.
-function clampHomeCursor(rows: { selectable: boolean }[], cursor: number): number {
-  if (rows.length === 0) return 0;
-  const c = clamp(cursor, 0, rows.length - 1);
-  if (rows[c]?.selectable) return c;
-  for (let d = 1; d < rows.length; d++) {
-    const forward = c + d;
-    if (forward < rows.length && rows[forward]?.selectable) return forward;
-    const backward = c - d;
-    if (backward >= 0 && rows[backward]?.selectable) return backward;
-  }
-  return c;
-}

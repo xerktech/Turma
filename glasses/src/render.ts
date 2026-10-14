@@ -276,12 +276,52 @@ export function buildHomeRows(state: AppState): HomeRow[] {
   return rows;
 }
 
+// A home row's identity: a session by host + id (one id can sit on two hosts
+// mid-migration), an action row by its kind. Headers have none.
+export function homeRowKey(row: HomeRow | undefined): string | undefined {
+  if (!row || !row.selectable) return undefined;
+  return row.kind === "session" ? `s:${row.hostKey}:${row.sessionId}` : row.kind;
+}
+
+// Where the home cursor sits in `rows`: on the selected row wherever the
+// status groups moved it (XERK-1913), else the index, kept in range and off
+// headers. Render and input both resolve through this, so the marker and a tap
+// agree even when the list regrouped with no poll (a host aging offline).
+export function homeCursor(rows: HomeRow[], home: { cursor: number; selected?: string }): number {
+  if (home.selected) {
+    const i = rows.findIndex((r) => homeRowKey(r) === home.selected);
+    if (i >= 0) return i;
+  }
+  return clampHomeCursor(rows, home.cursor);
+}
+
+// Keeps the home cursor in range as the row list shrinks/grows (host
+// offline, sessions converging away) and off non-selectable rows (host
+// group headers, offline lines) — including the very first render, where the
+// cursor starts at 0 and row 0 is a non-selectable header once any session is
+// listed. Searches outward (nearest first, forward on ties) for
+// the closest selectable row; "+ New session"/"Settings" are always present
+// and selectable, so a selectable row always exists once rows is non-empty.
+function clampHomeCursor(rows: { selectable: boolean }[], cursor: number): number {
+  if (rows.length === 0) return 0;
+  const c = Math.max(0, Math.min(cursor, rows.length - 1));
+  if (rows[c]?.selectable) return c;
+  for (let d = 1; d < rows.length; d++) {
+    const forward = c + d;
+    if (forward < rows.length && rows[forward]?.selectable) return forward;
+    const backward = c - d;
+    if (backward >= 0 && rows[backward]?.selectable) return backward;
+  }
+  return c;
+}
+
 function renderHome(state: AppState): string[] {
   const header = headerLine(state, homeHeaderText(state));
   const rows = buildHomeRows(state);
-  const { visible, start } = windowRows(rows, state.home.cursor, DISPLAY_LINES - 1);
+  const cursor = homeCursor(rows, state.home);
+  const { visible, start } = windowRows(rows, cursor, DISPLAY_LINES - 1);
   const lines = [header];
-  visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === state.home.cursor)));
+  visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === cursor)));
   return lines;
 }
 

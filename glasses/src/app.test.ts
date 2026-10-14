@@ -383,6 +383,88 @@ describe("App", () => {
     expect(client.spawnSession).not.toHaveBeenCalled();
   });
 
+  it("the home cursor stays on its session when the list regroups with NO poll (a host ages offline)", async () => {
+    const t0 = Date.now();
+    const hA = agent({ key: "hA", lastSeen: t0,
+      sessions: [session({ id: "sA", summary: "Alpha", createdAt: "2026-01-01T00:00:02Z", session: signals({ paneBusy: false, transcriptAgeSec: 999 }) })] });
+    const hB = agent({ key: "hB", lastSeen: t0,
+      sessions: [session({ id: "sB", summary: "Bravo", createdAt: "2026-01-01T00:00:01Z", session: signals({ paneBusy: true, transcriptAgeSec: 1 }) })] });
+    const client = fakeClient({
+      listAgents: vi.fn()
+        .mockResolvedValueOnce({ now: t0, agents: [hA, hB] })
+        .mockRejectedValue(new Error("offline")),
+    });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    // rows = [Active(0), sB(1), Idle(2), sA(3), ...]
+    expect(app.getState().home.cursor).toBe(1);
+    // Every poll now fails; past OFFLINE_AFTER_MS sB reads idle and regroups:
+    // rows = [Idle(0), sA(1), sB(2), ...] with no successful poll to re-pin it.
+    await vi.advanceTimersByTimeAsync(80_000);
+    const screen = display.lines.join("\n");
+    expect(screen).toMatch(/> . myrepo-Bravo/);
+    display.emit({ type: "tap" });
+    expect(app.getState().session?.sessionId).toBe("sB");
+  });
+
+  it("the home cursor stays on '+ New session' when a group header appears above it", async () => {
+    const quiet = session({ id: "s1", summary: "One", session: signals({ paneBusy: false, transcriptAgeSec: 999 }) });
+    const client = fakeClient({
+      listAgents: vi.fn()
+        .mockResolvedValueOnce({ now: Date.now(), agents: [agent({ sessions: [quiet] })] })
+        .mockResolvedValue({ now: Date.now(), agents: [agent({ sessions: [quiet,
+          session({ id: "s2", summary: "Two", createdAt: "2026-01-02T00:00:00Z", session: signals({ paneBusy: true, transcriptAgeSec: 1 }) })] })] }),
+    });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    display.emit({ type: "scrollDown" }); // [Idle, s1, New, Settings] -> New
+    await vi.advanceTimersByTimeAsync(1000); // [Active, s2, Idle, s1, New, Settings]
+    display.emit({ type: "tap" });
+    expect(app.getState().screen).toBe("newOrg");
+  });
+
+  it("the home cursor keeps to its HOST's copy of a session id listed on two hosts", async () => {
+    const dup = (summary: string) => session({ id: "dup", summary, session: signals({ paneBusy: false, transcriptAgeSec: 999 }) });
+    const hA = agent({ key: "hA", sessions: [dup("OnA")] });
+    const hB = agent({ key: "hB", sessions: [dup("OnB")] });
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [hA, hB] })) });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    display.emit({ type: "scrollDown" }); // second copy
+    const host = app.getState().home.selected;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(app.getState().home.selected).toBe(host);
+    display.emit({ type: "tap" });
+    expect(`s:${app.getState().session?.hostKey}:dup`).toBe(host);
+  });
+
+  it("New session pickers: a later org, a scroll past the end, and a tap after the repo list shrank", async () => {
+    const repos = (...names: string[]) => names.map((name) => ({ name, path: "/r/" + name }));
+    const acme = agent({ key: "h1", jira: { siteKey: "acme.atlassian.net", orgName: "Acme" }, repos: repos("a") });
+    const zeta = (r: string[]) => agent({ key: "h3", jira: { siteKey: "zeta.atlassian.net", orgName: "Zeta" }, repos: repos(...r) });
+    const client = fakeClient({
+      listAgents: vi.fn()
+        .mockResolvedValueOnce({ now: Date.now(), agents: [acme, zeta(["x", "y", "z"])] })
+        .mockResolvedValue({ now: Date.now(), agents: [acme, zeta(["x"])] }),
+    });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    openNewSession();
+    for (let i = 0; i < 5; i++) display.emit({ type: "scrollDown" }); // clamped to Zeta, the last
+    expect(app.getState().newOrg?.cursor).toBe(1);
+    display.emit({ type: "tap" });
+    expect(app.getState().newRepo?.orgKey).toBe("zeta.atlassian.net");
+    display.emit({ type: "scrollDown" });
+    display.emit({ type: "scrollDown" }); // on "z"
+    await vi.advanceTimersByTimeAsync(1000); // only "x" left
+    display.emit({ type: "tap" });
+    expect(app.getState().newPrompt).toMatchObject({ hostKey: "h3", repo: "x" });
+  });
+
   // ---- post-mutation refresh: immediate poll + grace window -------------
   // A bare spawn via newOrg -> newRepo -> newPrompt -> "Skip (spawn now)",
   // then flush the spawnSession promise (which triggers nudgePoll's immediate
