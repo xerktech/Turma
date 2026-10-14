@@ -1237,6 +1237,11 @@ export class App {
         // viewOffset/selected) rather than minting a fresh one.
         this.setState({ screen: "session", session: this.returnToSession(hostKey, sessionId) });
         return;
+      case "home":
+        // Same exit as the transcript's doubleTap. A pending question is left
+        // unanswered; the session stays waiting for it.
+        this.goHome();
+        return;
     }
   }
 

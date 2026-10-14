@@ -516,6 +516,20 @@ describe("App", () => {
     expect(app.getState().screen).toBe("actions");
   });
 
+  it("sheet mode: the Options menu's last row, Home, leaves for home with the question still pending (XERK-1914)", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await toSheet(app);
+
+    display.emit({ type: "doubleTap" }); // -> actions
+    for (let i = 0; i < 10; i++) display.emit({ type: "scrollDown" }); // clamps on the last row
+    display.emit({ type: "tap" });
+
+    expect(app.getState().screen).toBe("home");
+    expect(client.answerQuestion).not.toHaveBeenCalled();
+    expect(client.sessionAction).not.toHaveBeenCalled();
+  });
+
   it("sheet mode: tap on the trailing 'Dictate answer…' row starts box dictation and hands the box to input mode; the dictated draft then sends as a free-text answer while the question is pending", async () => {
     const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
     const app = makeApp(client);

@@ -431,7 +431,7 @@ function renderSession(state: AppState): ScreenModel {
 // ---- actions --------------------------------------------------------
 
 export interface ActionRow {
-  action: "send" | "clear" | "dictate" | "start" | "kill" | "back";
+  action: "send" | "clear" | "dictate" | "start" | "kill" | "back" | "home";
   text: string;
 }
 
@@ -449,6 +449,7 @@ export function buildActionsRows(state: AppState, hostKey: string, sessionId: st
     return [
       { action: "back", text: "Back" },
       { action: "start", text: "Start" },
+      { action: "home", text: "Home" },
     ];
   }
   const draft =
@@ -469,6 +470,12 @@ export function buildActionsRows(state: AppState, hostKey: string, sessionId: st
   // conversation, and token history all survive on disk. There is
   // deliberately no "Delete" row — the glasses never remove a worktree.
   rows.push({ action: "kill", text: "End this session" });
+  // "Home" is the session screen's gesture-free way out: a pending question
+  // turns doubleTap into "open Options" and Options' doubleTap returns to the
+  // question, so without this row only answering or ending the session left.
+  // Last, so a long scroll down (the cursor clamps) lands on it and no
+  // existing row moves.
+  rows.push({ action: "home", text: "Home" });
   return rows;
 }
 
