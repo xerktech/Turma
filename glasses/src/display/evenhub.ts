@@ -16,15 +16,19 @@ import type { GlassesDisplay } from "./index.ts";
 import { createInputRouter, type LifecycleEvent, type RawEvenHubEvent } from "../input/router.ts";
 import { capContent, createTrailingDebounce, type Debounced } from "./debounce.ts";
 
-// G2 canvas: 576x288, one full-canvas text container, the sole
-// `isEventCapture: 1` container on the page (SDK rule — exactly one per
-// page). `createStartUpPageContainer` is called exactly once at startup;
-// every subsequent update goes through `textContainerUpgrade`.
+// G2 canvas: 576x288. Every layout's sole `isEventCapture: 1` container (SDK
+// rule — exactly one per page) is a transparent full-canvas overlay with no
+// real content, never a container that shows text: the firmware natively
+// scrolls the capture container — scroll bar and all — when its content
+// overflows, so a swipe would drag the page on top of our own cursor move.
+// `createStartUpPageContainer` is called exactly once at startup; every
+// subsequent update goes through `textContainerUpgrade` or, on a layout
+// change, `rebuildPageContainer`.
 const CANVAS_WIDTH = 576;
 const CANVAS_HEIGHT = 288;
 const CONTAINER_ID = 0;
 const CONTAINER_NAME = "main";
-// The tracked "page shape" value for the single-container `lines` layout.
+// The tracked "page shape" value for the `lines` layout (text + capture overlay).
 // Session layouts use their own `sessionSignature()` string instead; any
 // change between the two (or between two different session signatures)
 // means the containers currently on the page are wrong and the page must be
@@ -54,8 +58,10 @@ const SESSION_BOX_ID = 2;
 const SESSION_BOX_NAME = "bottombox";
 const SESSION_STATUS_ID = 3;
 const SESSION_STATUS_NAME = "status";
-const SESSION_CAPTURE_ID = 4;
-const SESSION_CAPTURE_NAME = "capture";
+// The capture overlay keeps the same id/name in both layouts; each rebuild
+// replaces the whole page, so only uniqueness within one list matters.
+const CAPTURE_ID = 4;
+const CAPTURE_NAME = "capture";
 
 // input-strip.ts's line-height / border conventions.
 const LINE_HEIGHT_PX = 27;
@@ -171,22 +177,43 @@ function sessionContentFrom(model: Extract<ScreenModel, { type: "session" }>, ca
   };
 }
 
-// The single full-canvas text container that backs every `{type:"lines"}`
-// screen — also the sole `isEventCapture:1` container in that layout. Shared
-// by `start()`'s createStartUpPageContainer and the session→lines transition
-// rebuild so both produce an identical container shape.
-function buildLinesContainer(content: string): TextContainerConfig {
+// The transparent full-canvas event-capture overlay — the only
+// `isEventCapture: 1` container in every layout (see the header comment).
+function buildCaptureContainer(): TextContainerConfig {
   return {
     xPosition: 0,
     yPosition: 0,
     width: CANVAS_WIDTH,
     height: CANVAS_HEIGHT,
-    paddingLength: LINES_PADDING,
-    containerID: CONTAINER_ID,
-    containerName: CONTAINER_NAME,
-    content,
+    paddingLength: 0,
+    containerID: CAPTURE_ID,
+    containerName: CAPTURE_NAME,
+    content: " ",
     isEventCapture: 1,
   };
+}
+
+// The full-canvas text container that backs every `{type:"lines"}` screen,
+// plus the capture overlay. The text container is `isEventCapture: 0` so the
+// firmware never scrolls it natively: a home list long enough to overflow
+// (wrapped rows) used to show a scroll bar that moved on every swipe before
+// our cursor did. Shared by `start()`'s createStartUpPageContainer and the
+// session→lines transition rebuild so both produce an identical page shape.
+function buildLinesContainers(content: string): TextContainerConfig[] {
+  return [
+    {
+      xPosition: 0,
+      yPosition: 0,
+      width: CANVAS_WIDTH,
+      height: CANVAS_HEIGHT,
+      paddingLength: LINES_PADDING,
+      containerID: CONTAINER_ID,
+      containerName: CONTAINER_NAME,
+      content,
+      isEventCapture: 0,
+    },
+    buildCaptureContainer(),
+  ];
 }
 
 // Builds the four session containers: transcript (top), bordered bottom box,
@@ -237,17 +264,7 @@ function buildSessionContainers(boxLines: number, content: SessionContent): Text
       content: content.status,
       isEventCapture: 0,
     },
-    {
-      xPosition: 0,
-      yPosition: 0,
-      width: CANVAS_WIDTH,
-      height: CANVAS_HEIGHT,
-      paddingLength: 0,
-      containerID: SESSION_CAPTURE_ID,
-      containerName: SESSION_CAPTURE_NAME,
-      content: " ",
-      isEventCapture: 1,
-    },
+    buildCaptureContainer(),
   ];
 }
 
@@ -282,13 +299,13 @@ export class EvenHubDisplay implements GlassesDisplay {
   async start(): Promise<void> {
     // Startup content can't be empty on some hosts; a single space is the
     // documented placeholder (glasses-ui skill's event-layer example).
-    const textObject = buildLinesContainer(" ");
+    const textObject = buildLinesContainers(" ");
     try {
       await this.bridge.createStartUpPageContainer({
-        containerTotalNum: 1,
-        textObject: [textObject],
+        containerTotalNum: textObject.length,
+        textObject,
       });
-      // The page now holds the single-container `lines` layout.
+      // The page now holds the `lines` layout.
       this.currentPageShape = LINES_SHAPE;
     } catch (err) {
       console.error("[glasses] createStartUpPageContainer failed:", err);
@@ -318,10 +335,10 @@ export class EvenHubDisplay implements GlassesDisplay {
       // container doesn't exist, so a bare textContainerUpgrade would
       // silently no-op and freeze the stale session layout on screen. Cancel
       // any in-flight (session) debounce, then rebuild the page back to the
-      // single full-canvas container with this content directly.
+      // full-canvas text container + capture overlay with this content directly.
       this.cancelPendingUpdates();
       this.currentPageShape = LINES_SHAPE;
-      void this.rebuild([buildLinesContainer(capContent(content, REBUILD_MAX_CONTENT_CHARS))], LINES_SHAPE);
+      void this.rebuild(buildLinesContainers(capContent(content, REBUILD_MAX_CONTENT_CHARS)), LINES_SHAPE);
       return;
     }
     // Single container already current — debounced in-place update (unchanged).

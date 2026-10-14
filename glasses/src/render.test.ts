@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createInitialState, newSessionState, type AppState } from "./app.ts";
-import { buildHomeRows, render, sessionContentLines, sessionTranscriptArea, spawnHostFor, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
+import { buildHomeRows, DISPLAY_LINES, LINE_WIDTH_PX, render, sessionContentLines, sessionTranscriptArea, spawnHostFor, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
 import { setGlyphCoverage } from "./font.ts";
-import { charMeasure, setDefaultMeasure, type Measure } from "./text-wrap.ts";
+import { charMeasure, measureDefault, setDefaultMeasure, wrapText, type Measure } from "./text-wrap.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
 const NOW = 1_700_000_000_000;
@@ -167,6 +167,53 @@ describe("render: home", () => {
     const state3 = base({ agents, home: { cursor: 7 } }); // s6 (rows: header=0, s0=1, ...)
     const lines3 = asLines(render(state3));
     expect(lines3.some((l) => l.startsWith("> "))).toBe(true);
+  });
+
+  // A row that wrapped onto two display lines pushed the window past the
+  // canvas: the rows below the edge never drew, yet the cursor walked onto
+  // them (and a tap selected blind). Every row is clipped to ONE line instead.
+  it("clips a long session row to one display line so the window never overflows the canvas", () => {
+    const longLabel = "a very long session label that would never fit on one glasses line at all";
+    const sessions = Array.from({ length: 12 }, (_, i) =>
+      session({ id: `s${i}`, label: `${longLabel} ${i}`, session: signals({ transcriptAgeSec: 999 }) })
+    );
+    const agents: AgentInfo[] = [agent({ sessions })];
+    for (const cursor of [1, 7, 14]) {
+      const lines = asLines(render(base({ agents, home: { cursor } })));
+      const physical = lines.flatMap((l) => wrapText(l, LINE_WIDTH_PX));
+      expect(physical.length).toBeLessThanOrEqual(DISPLAY_LINES);
+      expect(lines.filter((l) => l.startsWith("> "))).toHaveLength(1);
+    }
+    const row = asLines(render(base({ agents, home: { cursor: 1 } })))[2] ?? "";
+    expect(row.startsWith("> ")).toBe(true);
+    expect(row.endsWith("…")).toBe(true);
+    expect(asLines(render(base({ agents, home: { cursor: 14 } })))).toContain("> Settings");
+  });
+
+  // wrapText breaks only on whitespace, so clipping via its first line reduced a
+  // spaceless name (a slug, CJK) to just its status glyph — every row read "!…".
+  it("clips a spaceless or CJK row by character, keeping the readable start of the name", () => {
+    const labels: string[] = [
+      "very-long-label-number-0-that-definitely-wraps-past-the-glasses-canvas-width-and-then-some",
+      "A".repeat(96),
+      "这是一个非常长的会话标签名称它没有任何空格所以不能在空白处换行".repeat(3),
+      "first paragraph of a label\nsecond paragraph that would otherwise vanish entirely here ok",
+    ];
+    // A spaceless label just a few px too wide — the case a loose fit check misses.
+    let nearMiss = "B";
+    while (measureDefault(`> - ${nearMiss}-s4`) <= LINE_WIDTH_PX) nearMiss += "B";
+    labels.push(nearMiss);
+    const sessions = labels.map((label, i) => session({ id: `s${i}`, label, session: signals({ transcriptAgeSec: 999 }) }));
+    const lines = asLines(render(base({ agents: [agent({ sessions })], home: { cursor: 1 } })));
+    labels.forEach((label, i) => {
+      const row = lines[2 + i] ?? "";
+      // Measured, not wrapText: wrapText never splits a spaceless word, so it
+      // can't see a row a few px too wide.
+      expect(measureDefault(row)).toBeLessThanOrEqual(LINE_WIDTH_PX);
+      expect(row.endsWith("…")).toBe(true);
+      // The name itself is shown, not just "<glyph> …".
+      expect(row).toContain(label.replace(/\s+/g, " ").slice(0, 10));
+    });
   });
 
   it("shows a flash message in place of the header", () => {
@@ -673,6 +720,7 @@ describe("render: actions", () => {
     const box = asSession(render(state)).bottom.lines;
     expect(box).toContain("> Back");
     expect(box).toContain("  Start");
+    expect(box[box.length - 1]).toContain("Home");
     expect(box.some((l) => l.includes("Delete"))).toBe(false);
     expect(box.some((l) => l.includes("Kill"))).toBe(false);
     expect(box.some((l) => l.includes("End this session"))).toBe(false);

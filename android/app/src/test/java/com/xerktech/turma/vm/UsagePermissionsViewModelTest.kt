@@ -83,7 +83,11 @@ class UsagePermissionsViewModelTest {
         assertEquals("acme", first.requestUrl?.queryParameter("org"))
 
         hub.container.org.set(setOf("rival"))
-        // The old org's rows are gone the moment the scope moves — loading, not acme's.
+        // The old org's rows are dropped as soon as the watcher sees the move — loading,
+        // never acme's. Awaited, not read at once: the watcher reacts on its own
+        // dispatcher, which a loaded runner hadn't reached yet (rollup #69). rival
+        // answers 1.2 s late, so this observes the loading state, not rival's rows.
+        hub.awaitFlow(vm.permissions) { it.view == null }
         assertNull("org A's view must not survive under org B's pick", headOf(vm))
         hub.awaitFlow(vm.permissions) { it.view != null }
         assertEquals("rival-cmd", headOf(vm))

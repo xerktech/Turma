@@ -49,6 +49,65 @@ export interface PendingEntry {
 }
 
 export const PENDING_TIMEOUT_MS = 60 * 1000;
+
+// A question the wearer just answered, keyed by sessionId. The hub keeps
+// reporting it until the agent's next beat, so without this the sheet sat on
+// screen re-asking an answered question until a later poll (up to the 6s poll
+// interval plus the beat). It is hidden at once instead: `maskAnswered` blanks
+// it on every poll for as long as the hub still reports that same question
+// (text AND options), and forgets the entry once the question goes or changes,
+// or at `until`. The wire carries no question id, so a re-ask with identical
+// text is indistinguishable from the answered one: `until` is therefore SHORT
+// once the send lands (ANSWER_MASK_MS — the hub pokes the agent, which re-beats
+// within about a second) and only spans PENDING_TIMEOUT_MS while the POST is
+// still in flight. Past it the hub's word shows again, an identical re-ask too.
+export interface AnsweredEntry {
+  hostKey: string;
+  question: string;
+  options: string[];
+  at: number;
+  until: number;
+  seq: number; // which answerQuestion call hid it
+}
+
+export const ANSWER_MASK_MS = 10 * 1000;
+
+function sameOptions(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+export function maskAnswered(
+  agents: AgentInfo[],
+  answered: Record<string, AnsweredEntry>,
+  now: number
+): { agents: AgentInfo[]; answered: Record<string, AnsweredEntry> } {
+  const keep: Record<string, AnsweredEntry> = {};
+  let out = agents;
+  for (const [sessionId, entry] of Object.entries(answered)) {
+    if (now >= entry.until) continue;
+    const ai = out.findIndex((a) => a.key === entry.hostKey);
+    const host = out[ai];
+    const si = host ? host.sessions.findIndex((s) => s.id === sessionId) : -1;
+    const sess = host?.sessions[si];
+    if (!host || !sess) {
+      keep[sessionId] = entry; // missing from this beat; keep hiding it
+      continue;
+    }
+    if (
+      !sess.session ||
+      sess.session.question !== entry.question ||
+      !sameOptions(sess.session.questionOptions ?? [], entry.options)
+    ) {
+      continue; // answered, or a new question
+    }
+    keep[sessionId] = entry;
+    const sessions = host.sessions.slice();
+    sessions[si] = { ...sess, session: { ...sess.session, question: null, questionOptions: [] } };
+    out = out.slice();
+    out[ai] = { ...host, sessions };
+  }
+  return { agents: out, answered: keep };
+}
 // After queuing a session-list mutation (spawn/kill/resume/delete) the poll
 // loop keeps running for this long even if the plugin backgrounds right after
 // — so a session you just launched (or ended) before the HUD closed still
@@ -57,6 +116,9 @@ export const PENDING_TIMEOUT_MS = 60 * 1000;
 export const POLL_GRACE_MS = 60 * 1000;
 export const FLASH_DURATION_MS = 4000;
 export const FLASH_QUEUED = "√ queued — agent picks up in ~20s";
+// The hub pokes the agent the moment an answer is queued, so it is not a ~20s
+// wait like other commands.
+export const FLASH_ANSWERED = "√ answer sent";
 export const FLASH_HUB_UNREACHABLE = "hub unreachable";
 // Dictation that came back blank (silence, or Whisper's filtered non-speech):
 // nothing to send, so it never reaches a Send button or the draft (rollup XERK-1701).
@@ -199,6 +261,7 @@ export interface AppState {
   // like liveTurn; the poll keeps the transcript current underneath it.
   liveRefusal: { sessionId: string; message: string } | null;
   pending: Record<string, PendingEntry>;
+  answered: Record<string, AnsweredEntry>;
   loadingHistory: Record<string, boolean>;
 
   home: HomeScreenState;
@@ -229,6 +292,7 @@ export function createInitialState(now: number): AppState {
     liveTurn: null,
     liveRefusal: null,
     pending: {},
+    answered: {},
     loadingHistory: {},
     home: { cursor: 0 },
     session: null,
@@ -298,6 +362,7 @@ export class App {
   // when paused (backgrounded). Set by nudgePoll() after a list mutation; the
   // loop self-terminates once it elapses. See pause()/schedulePoll().
   private graceUntil = 0;
+  private answerSeq = 0;
 
   constructor(opts: AppOptions) {
     this.client = opts.client;
@@ -638,7 +703,9 @@ export class App {
       // already kicked off in parallel with display.start(); every later poll
       // starts its own fetch here.
       const res = await (prefetched ?? this.client.listAgents());
-      const sessionRefs = flattenSessions(res.agents);
+      const masked = maskAnswered(res.agents, this.state.answered, now);
+      const agentsNow = masked.agents;
+      const sessionRefs = flattenSessions(agentsNow);
       // Content length of the focused session *before* this poll's tail merge,
       // so a scrolled-up view can be pinned to the same lines (see
       // preserveScrollOffset) if the poll grows the transcript underneath it.
@@ -651,7 +718,9 @@ export class App {
         const existing = transcripts[ref.session.id] ?? emptyBuffer();
         transcripts[ref.session.id] = mergeTail(existing, tail);
       }
-      const pending = this.reconcilePending(this.state.pending, res.agents, sessionRefs, now);
+      // Pending converges on the hub's own word, never the mask: an answer is
+      // not applied until the hub stops reporting the question.
+      const pending = this.reconcilePending(this.state.pending, res.agents, flattenSessions(res.agents), now);
       const wasErroring = this.state.pollErrorActive;
       // Snapshot the current session's pending-question view *before* the
       // new agents array lands — used below to detect a question that just
@@ -664,7 +733,8 @@ export class App {
       this.state = {
         ...this.state,
         now,
-        agents: res.agents,
+        agents: agentsNow,
+        answered: masked.answered,
         orgColors: res.orgColors ?? {},
         autoStartOrgs: res.autoStartOrgs ?? {},
         ticketTriageActions: res.ticketTriageActions ?? {},
@@ -773,7 +843,9 @@ export class App {
     const entry: PendingEntry = {
       at: this.now(),
       status: s?.status,
-      question: s?.session?.question ?? null,
+      // An answered question is hidden locally (maskAnswered) but the hub still
+      // reports it; pending converges on the hub's word, so snapshot that.
+      question: this.state.answered[sessionId]?.question ?? s?.session?.question ?? null,
       tailLen: s?.session?.tail.length ?? 0,
     };
     this.state = { ...this.state, pending: { ...this.state.pending, [sessionId]: entry } };
@@ -1002,17 +1074,16 @@ export class App {
     if (e.type === "tap") {
       if (s.selected < options.length) {
         this.markPending(s.sessionId, live);
-        void this.client
-          .answerQuestion(s.hostKey, s.sessionId, { optionIndex: s.selected })
+        void this.answerQuestion(s.hostKey, s.sessionId, { optionIndex: s.selected })
           .then(() => {
-            this.flash(FLASH_QUEUED);
+            this.flash(FLASH_ANSWERED);
             this.repaint();
           })
           .catch((err: unknown) => {
             this.flash(failureFlash(err));
             this.repaint();
           });
-        this.setState({ session: { ...s, focus: "transcript" } });
+        this.setState({ session: { ...this.state.session ?? s, focus: "transcript" } });
         return;
       }
       // Trailing "Dictate answer…" row. Move focus to the box as dictation
@@ -1207,10 +1278,11 @@ export class App {
         const sess = this.state.session;
         const draft = sess && sess.hostKey === hostKey && sess.sessionId === sessionId ? sess.draft : "";
         const s = findSession(this.state, hostKey, sessionId);
+        const answering = !!s?.session?.question;
         this.markPending(sessionId, s);
         void this.submitText(hostKey, sessionId, draft)
           .then(() => {
-            this.flash(FLASH_QUEUED);
+            this.flash(answering ? FLASH_ANSWERED : FLASH_QUEUED);
             this.repaint();
           })
           .catch((err: unknown) => {
@@ -1247,6 +1319,11 @@ export class App {
         // no-op. Preserve the existing session state (draft/focus/mic/
         // viewOffset/selected) rather than minting a fresh one.
         this.setState({ screen: "session", session: this.returnToSession(hostKey, sessionId) });
+        return;
+      case "home":
+        // Same exit as the transcript's doubleTap. A pending question is left
+        // unanswered; the session stays waiting for it.
+        this.goHome();
         return;
     }
   }
@@ -1363,19 +1440,80 @@ export class App {
   private submitText(hostKey: string, sessionId: string, text: string): Promise<QueuedResponse> {
     const s = findSession(this.state, hostKey, sessionId);
     if (s?.session?.question) {
-      return this.client.answerQuestion(hostKey, sessionId, { optionIndex: -1, custom: text });
+      return this.answerQuestion(hostKey, sessionId, { optionIndex: -1, custom: text });
     }
     return this.client.sendInput(hostKey, sessionId, text);
+  }
+
+  // Answers a session's pending question, and takes it off the screen at once
+  // rather than when a later poll finally shows the agent consumed it (see
+  // maskAnswered). The hub pokes the agent on queue, so the answer is applied
+  // within about a second; the immediate re-poll picks up what follows. A
+  // refused or failed send un-hides the question so the wearer can retry.
+  // Public so the phone companion answers through the same path.
+  answerQuestion(
+    hostKey: string,
+    sessionId: string,
+    answer: { optionIndex?: number; custom?: string }
+  ): Promise<QueuedResponse> {
+    const live = findSession(this.state, hostKey, sessionId)?.session;
+    const question = live?.question;
+    const at = this.now();
+    const seq = ++this.answerSeq;
+    // Every answer path (glasses sheet, dictation, phone) shows the pending glyph.
+    this.markPending(sessionId, findSession(this.state, hostKey, sessionId));
+    const myPending = this.state.pending[sessionId];
+    if (question) {
+      const entry = { hostKey, question, options: live?.questionOptions ?? [], at, until: at + PENDING_TIMEOUT_MS, seq };
+      const answered = { ...this.state.answered, [sessionId]: entry };
+      const masked = maskAnswered(this.state.agents, answered, this.now());
+      this.state = {
+        ...this.state,
+        agents: masked.agents,
+        answered: masked.answered,
+        sessionRefs: flattenSessions(masked.agents),
+      };
+      this.repaint();
+    }
+    return this.client.answerQuestion(hostKey, sessionId, answer).then(
+      (res) => {
+        const mine = this.state.answered[sessionId];
+        if (mine && mine.seq === seq) {
+          this.state = {
+            ...this.state,
+            answered: { ...this.state.answered, [sessionId]: { ...mine, until: this.now() + ANSWER_MASK_MS } },
+          };
+        }
+        this.nudgePoll();
+        return res;
+      },
+      (err: unknown) => {
+        // A refused answer changes nothing hub-side, so it is not pending.
+        if (this.state.pending[sessionId] === myPending) {
+          const { [sessionId]: _p, ...pending } = this.state.pending;
+          this.state = { ...this.state, pending };
+        }
+        // Only un-hide what THIS call hid — a second, failed answer must not
+        // bring back a question the first one already got through on.
+        if (this.state.answered[sessionId]?.seq === seq) {
+          const { [sessionId]: _dropped, ...rest } = this.state.answered;
+          this.state = { ...this.state, answered: rest };
+          this.nudgePoll(); // re-read the question that is still waiting
+        }
+        throw err;
+      }
+    );
   }
 
   private sendReply(r: ReplyScreenState): void {
     if (r.target.kind === "session") {
       const { hostKey, sessionId } = r.target;
       const s = findSession(this.state, hostKey, sessionId);
+      const answering = !!s?.session?.question;
       this.markPending(sessionId, s);
       void this.submitText(hostKey, sessionId, r.text)
         .then(() => {
-          this.flash(FLASH_QUEUED);
+          this.flash(answering ? FLASH_ANSWERED : FLASH_QUEUED);
           this.repaint();
         })
         .catch((err: unknown) => {

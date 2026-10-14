@@ -74,3 +74,7 @@ paths:
   `bridge.ts`'s `resolveBridge` also requires `window.flutter_inappwebview.callHandler` (the device
   WebView or the simulator's shim), else it falls back to the DOM backend at `BRIDGE_TIMEOUT_MS`.
   Tests: `src/bridge.test.ts`.
+- **An answered question leaves the screen at once, masked locally** (`maskAnswered`, `App.answerQuestion`
+  — every answer path, phone included). The wire carries NO question id, so the mask matches text +
+  options and lasts only `ANSWER_MASK_MS` (10s) once the POST lands: lengthening it hides an identical
+  re-ask. Pending converges on the hub's UNMASKED word. Tests: the `sheet mode:` answer cases in `app.test.ts`.
