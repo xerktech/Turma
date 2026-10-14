@@ -30,9 +30,14 @@ paths:
   syncs, LEAVE doesn't**: entering on one pulls the other in (`App.onEnterSession`); the org filter
   scopes the list too. Board is Phase 2.
 - **The glasses DISPLAY names no machine (XERK-1913)**, operator's call. The home list uses the
-  Sessions page's status sections (Ready for review / Active / Idle / Queued), never host headers.
-  New session is org → repo, and `spawnHostFor` picks the org's least-busy online host with that
-  repo. The phone companion is out of that scope. Tests: `render.test.ts` "new session by org".
+  Sessions page's status sections (Ready for review / Active / Idle / Queued / Ended), never host
+  headers; an offline host's sessions hide behind one "N hosts offline" count row.
+  - **The home cursor follows its SESSION across a poll** (`poll`, `selectedId`): status flips
+    regroup the list, so a cursor kept by row index silently lands on another session.
+  - New session is org → repo, and `spawnHostFor` picks the org's least-busy online host with that
+    repo. The phone companion is out of that scope.
+  - Tests: `render.test.ts` "home status groups"/"new session by org"/"new session pickers",
+    `app.test.ts` "the home cursor follows its session".
 - CI: `glasses-ci.yml`, path-filtered to `glasses/**`, runs typecheck + Vitest + a production build
   in a throwaway `node:24-alpine` container.
 - **Keep `@evenrealities/even_hub_sdk` >= 0.0.14.** Older SDKs strip long-press eventTypes (9/10),

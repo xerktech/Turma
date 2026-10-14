@@ -180,8 +180,9 @@ function homeHeaderText(state: AppState): string {
   let waiting = 0;
   for (const agent of homeAgents(state)) {
     if (!agent.online) continue;
+    const seen = typeof agent.lastSeen === "number" ? agent.lastSeen : undefined;
     for (const session of agent.sessions ?? []) {
-      const s = liveState(session);
+      const s = liveState(session, seen);
       if (s === "working") working++;
       else if (s === "waiting") waiting++;
     }
@@ -211,36 +212,51 @@ export function orgGroups(agents: AgentInfo[]): { key: string; name: string; age
     .sort((x, y) => Number(!x.key) - Number(!y.key) || x.name.localeCompare(y.name));
 }
 
-// The home list in the Sessions page's status sections (XERK-1913), the same
-// split the phone, the web and Android make: Ready for review (`inReview`),
-// Active (working / waiting / holding), Idle, then Queued. Machines are never
-// named — every online host's sessions share one list. A host that is offline
-// hides its sessions, as before; with none online the list says so once.
+// The home list in the Sessions page's status sections (XERK-1913), the split
+// and order the phone, the web and Android use: Ready for review (`inReview`,
+// oldest-waiting first), Active (working / waiting / holding), Idle, Queued,
+// then Ended (stopped / errored records). Newest first within a group, like
+// the phone. Machines are never named — every online host's sessions share one
+// list; an offline host's sessions stay hidden, as before, and a count row
+// says how many hosts that is.
 export function buildHomeRows(state: AppState): HomeRow[] {
   const rows: HomeRow[] = [];
   const agents = homeAgents(state);
   const online = agents.filter((a) => a.online);
-  if (agents.length && !online.length) rows.push({ kind: "offline", selectable: false, text: "Hosts offline" });
+  const offline = agents.length - online.length;
+  if (offline) {
+    const text = online.length ? `${offline} host${offline === 1 ? "" : "s"} offline` : "Hosts offline";
+    rows.push({ kind: "offline", selectable: false, text });
+  }
   const now = Date.now();
+  const seen = (a: AgentInfo) => (typeof a.lastSeen === "number" ? a.lastSeen : undefined);
   const all = online
     .flatMap((agent) => (agent.sessions ?? []).map((session) => ({ agent, session })))
-    .sort((a, b) => (a.session.createdAt ?? "").localeCompare(b.session.createdAt ?? ""));
-  const seen = (a: AgentInfo) => (typeof a.lastSeen === "number" ? a.lastSeen : undefined);
-  const live = all.filter((x) => x.session.status !== "queued");
-  const review = live.filter((x) => inReview(x.session, seen(x.agent), now));
-  const rest = live.filter((x) => !review.includes(x));
+    .sort((a, b) => (b.session.createdAt ?? "").localeCompare(a.session.createdAt ?? ""));
+  const running = all.filter((x) => x.session.status === "running");
+  const review = running.filter((x) => inReview(x.session, seen(x.agent), now));
+  // Oldest-waiting first by the hub's attention `since` (phone `render.ts`);
+  // a row with none keeps its place after them (the sort is stable).
+  review.sort((a, b) => {
+    const x = a.session.attention?.since, y = b.session.attention?.since;
+    if (typeof x === "number" && typeof y === "number") return x - y;
+    return typeof x === "number" ? -1 : typeof y === "number" ? 1 : 0;
+  });
+  const rest = running.filter((x) => !review.includes(x));
   const ACTIVE = ["working", "waiting", "holding"];
+  const isActive = (x: (typeof all)[number]) => ACTIVE.includes(liveState(x.session, seen(x.agent), now));
   const groups: [string, typeof all][] = [
     ["Ready for review", review],
-    ["Active", rest.filter((x) => ACTIVE.includes(liveState(x.session, seen(x.agent), now)))],
-    ["Idle", rest.filter((x) => !ACTIVE.includes(liveState(x.session, seen(x.agent), now)))],
+    ["Active", rest.filter(isActive)],
+    ["Idle", rest.filter((x) => !isActive(x))],
     ["Queued", all.filter((x) => x.session.status === "queued")],
+    ["Ended", all.filter((x) => x.session.status !== "running" && x.session.status !== "queued")],
   ];
   for (const [title, list] of groups) {
     if (!list.length) continue;
     rows.push({ kind: "groupHeader", selectable: false, text: `${title} (${list.length})` });
     for (const { agent, session } of list) {
-      const display = state.pending[session.id] ? "pending" : liveState(session);
+      const display = state.pending[session.id] ? "pending" : liveState(session, seen(agent), now);
       const g = glyph(display);
       const labelOrRepo = session.label || session.repo;
       const name = glassesName(session);
@@ -587,6 +603,12 @@ function renderConfirm(state: AppState): ScreenModel {
   return sessionOverlay(state, c.action.hostKey, c.action.sessionId, bottom);
 }
 
+// A picker's cursor held inside its list: hosts going offline mid-flow shrink
+// the org/repo lists under a cursor the operator left further down.
+export function pickerCursor(cursor: number, length: number): number {
+  return Math.max(0, Math.min(cursor, length - 1));
+}
+
 // ---- newOrg ---------------------------------------------------------------
 
 // The orgs a session can be started in: those with at least one online host.
@@ -599,9 +621,10 @@ function renderNewOrg(state: AppState): string[] {
   const header = headerLine(state, "New session · Choose org");
   const rows = newOrgRows(state);
   if (!n) return [header];
-  const { visible, start } = windowRows(rows, n.cursor, DISPLAY_LINES - 1);
+  const cursor = pickerCursor(n.cursor, rows.length);
+  const { visible, start } = windowRows(rows, cursor, DISPLAY_LINES - 1);
   const lines = [header];
-  visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === n.cursor)));
+  visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === cursor)));
   return lines;
 }
 
@@ -646,9 +669,10 @@ function renderNewRepo(state: AppState): string[] {
   const header = headerLine(state, `New session · ${org} · Choose repo`);
   if (!n) return [header];
   const rows = buildNewRepoRows(state, n.orgKey);
-  const { visible, start } = windowRows(rows, n.cursor, DISPLAY_LINES - 1);
+  const cursor = pickerCursor(n.cursor, rows.length);
+  const { visible, start } = windowRows(rows, cursor, DISPLAY_LINES - 1);
   const lines = [header];
-  visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === n.cursor)));
+  visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === cursor)));
   return lines;
 }
 

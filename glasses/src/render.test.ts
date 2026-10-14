@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createInitialState, newSessionState, type AppState } from "./app.ts";
-import { render, sessionContentLines, sessionTranscriptArea, spawnHostFor, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
+import { buildHomeRows, render, sessionContentLines, sessionTranscriptArea, spawnHostFor, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
 import { setGlyphCoverage } from "./font.ts";
 import { charMeasure, setDefaultMeasure, type Measure } from "./text-wrap.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
@@ -903,5 +903,80 @@ describe("render: new session by org", () => {
     expect(spawnHostFor(st, "acme.atlassian.net", "web")?.key).toBe("h2");
     expect(spawnHostFor(st, "acme.atlassian.net", "api")?.key).toBe("h3");
     expect(spawnHostFor(st, "zeta.atlassian.net", "api")).toBeUndefined();
+  });
+});
+
+// XERK-1913: the home list's status groups — every group, the offline rows,
+// and the orders the phone's Sessions page uses.
+describe("render: home status groups (XERK-1913)", () => {
+  const T = (m: number) => `2026-01-01T00:${String(m).padStart(2, "0")}:00Z`;
+  it("lists Ready for review, Active, Idle, Queued and Ended, newest first, review by since", () => {
+    const now = Date.now();
+    const agents = [agent({ lastSeen: now, sessions: [
+      session({ id: "rOld", repo: "r", summary: "ROld", createdAt: T(9), attention: { state: "needs-you:review", since: 100 } }),
+      session({ id: "rNew", repo: "r", summary: "RNew", createdAt: T(1), attention: { state: "needs-you:review", since: 50 } }),
+      session({ id: "w1", repo: "r", summary: "W1", createdAt: T(1), session: signals({ paneBusy: true, transcriptAgeSec: 1 }) }),
+      session({ id: "w2", repo: "r", summary: "W2", createdAt: T(5), session: signals({ paneBusy: true, transcriptAgeSec: 1 }) }),
+      session({ id: "i1", repo: "r", summary: "I1", createdAt: T(2), session: signals({ paneBusy: false, transcriptAgeSec: 999 }) }),
+      session({ id: "q1", repo: "r", summary: "Q1", status: "queued" }),
+      session({ id: "e1", repo: "r", summary: "E1", status: "stopped" }),
+      session({ id: "e2", repo: "r", summary: "E2", status: "error" }),
+    ] })];
+    const text = buildHomeRows(base({ agents })).map((r) => r.text);
+    const all = text.join("\n");
+    const order = ["Ready for review (2)", "RNew", "ROld", "Active (2)", "W2", "W1", "Idle (1)", "I1",
+      "Queued (1)", "Q1", "Ended (2)"];
+    const at = order.map((t) => text.findIndex((l) => l.includes(t)));
+    expect(at.every((i) => i >= 0), all).toBe(true);
+    expect([...at].sort((a, b) => a - b)).toEqual(at);
+  });
+
+  it("hides an offline host's sessions behind a count, and says so when every host is offline", () => {
+    const up = agent({ key: "up", sessions: [session({ id: "u1", repo: "r", summary: "Up" })] });
+    const down = (k: string) => agent({ key: k, online: false, sessions: [session({ id: k + "1", repo: "r", summary: "Down" })] });
+    const texts = (agents: AgentInfo[]) => buildHomeRows(base({ agents })).map((r) => r.text);
+    const some = texts([up, down("d1"), down("d2")]);
+    expect(some[0]).toBe("2 hosts offline");
+    expect(some.some((l) => l.includes("Down"))).toBe(false);
+    expect(texts([up, down("d1")])[0]).toBe("1 host offline");
+    const none = texts([down("d1")]);
+    expect(none[0]).toBe("Hosts offline");
+    expect(none.some((l) => l.includes("Down"))).toBe(false);
+  });
+
+  it("draws a dead host's session with the same state the groups judge it by", () => {
+    // Reported online, but last seen past OFFLINE_AFTER_MS by the phone's clock.
+    const stale = agent({ lastSeen: Date.now() - 80_000,
+      sessions: [session({ id: "b1", repo: "r", summary: "B", session: signals({ paneBusy: true, transcriptAgeSec: 1 }) })] });
+    const lines = asLines(render(base({ agents: [stale] })));
+    expect(lines[0]).toContain("TURMA 0 run");
+    expect(lines.some((l) => l.includes("! r-B"))).toBe(false);
+  });
+});
+
+describe("render: new session pickers (XERK-1913)", () => {
+  const box = (key: string, site: string, repos: { name: string; isRoot?: boolean }[], orgName = ""): AgentInfo =>
+    agent({ key, device: key, jira: site ? { siteKey: site, orgName } : null,
+      repos: repos.map((r) => ({ path: "/r/" + r.name, ...r })) });
+
+  it("lists No org last, the repos root first, and org names through fontSafe", () => {
+    setGlyphCoverage((cp) => cp !== 0x1f9e0);
+    try {
+      const agents = [box("h0", "", [{ name: "loose" }]), box("h1", "zeta.atlassian.net", [{ name: "z" }], "Zeta"),
+        box("h2", "acme.atlassian.net", [{ name: "web" }, { name: "(root)", isRoot: true }], `${String.fromCodePoint(0x1f9e0)}Acme`)];
+      const orgs = asLines(render(base({ screen: "newOrg", agents, newOrg: { cursor: 0 } }))).slice(1);
+      expect(orgs).toEqual(["> Acme", "  Zeta", "  No org"]);
+      const repos = asLines(render(base({ screen: "newRepo", agents, newRepo: { orgKey: "acme.atlassian.net", cursor: 0 } })));
+      expect(repos[0]).not.toContain(String.fromCodePoint(0x1f9e0));
+      expect(repos.slice(1)).toEqual(["> Repos root (all repos)", "  web"]);
+    } finally {
+      setGlyphCoverage(null);
+    }
+  });
+
+  it("keeps a picker's cursor on the list when the list shrinks under it", () => {
+    const agents = [box("h1", "acme.atlassian.net", [{ name: "web" }], "Acme")];
+    expect(asLines(render(base({ screen: "newOrg", agents, newOrg: { cursor: 3 } })))).toContain("> Acme");
+    expect(asLines(render(base({ screen: "newRepo", agents, newRepo: { orgKey: "acme.atlassian.net", cursor: 5 } })))).toContain("> web");
   });
 });

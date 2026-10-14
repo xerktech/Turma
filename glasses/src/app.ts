@@ -11,6 +11,7 @@ import {
   buildHomeRows,
   buildNewRepoRows,
   newOrgRows,
+  pickerCursor,
   questionSheetActive,
   render,
   sessionContentLines,
@@ -631,6 +632,10 @@ export class App {
       // starts its own fetch here.
       const res = await (prefetched ?? this.client.listAgents());
       const sessionRefs = flattenSessions(res.agents);
+      // The session the home cursor is on, so it can follow that session when
+      // the poll regroups the list (XERK-1913: a status flip moves a session
+      // between groups, and a cursor kept by row index would land on another).
+      const selectedId = this.homeRows()[this.state.home.cursor]?.sessionId;
       // Content length of the focused session *before* this poll's tail merge,
       // so a scrolled-up view can be pinned to the same lines (see
       // preserveScrollOffset) if the poll grows the transcript underneath it.
@@ -671,7 +676,10 @@ export class App {
       // going offline, sessions converging/disappearing) — keep the cursor
       // in range and off non-selectable rows rather than leaving it stranded
       // on a row that no longer exists or never was tappable.
-      this.state = { ...this.state, home: { cursor: clampHomeCursor(this.homeRows(), this.state.home.cursor) } };
+      const rows = this.homeRows();
+      const followed = selectedId ? rows.findIndex((r) => r.sessionId === selectedId) : -1;
+      const cursor = followed >= 0 ? followed : clampHomeCursor(rows, this.state.home.cursor);
+      this.state = { ...this.state, home: { cursor } };
       // A poll can grow the focused session's transcript too (the 20s
       // heartbeat, or a beat the live stream missed) — keep a scrolled-up view
       // pinned to the same lines when it does. Skipped while paused: a
@@ -1434,13 +1442,14 @@ export class App {
     if (!n) return this.goHome();
     if (e.type === "doubleTap") return this.goHome();
     const orgs = newOrgRows(this.state);
+    const cursor = pickerCursor(n.cursor, orgs.length);
     if (e.type === "scrollDown" || e.type === "scrollUp") {
       const dir = e.type === "scrollDown" ? 1 : -1;
-      this.setState({ newOrg: { cursor: clamp(n.cursor + dir, 0, Math.max(0, orgs.length - 1)) } });
+      this.setState({ newOrg: { cursor: pickerCursor(cursor + dir, orgs.length) } });
       return;
     }
     if (e.type === "tap") {
-      const org = orgs[n.cursor];
+      const org = orgs[cursor];
       if (!org) return;
       this.setState({ screen: "newRepo", newRepo: { orgKey: org.orgKey, cursor: 0 } });
     }
@@ -1454,13 +1463,14 @@ export class App {
       return;
     }
     const rows = buildNewRepoRows(this.state, n.orgKey);
+    const cursor = pickerCursor(n.cursor, rows.length);
     if (e.type === "scrollDown" || e.type === "scrollUp") {
       const dir = e.type === "scrollDown" ? 1 : -1;
-      this.setState({ newRepo: { ...n, cursor: clamp(n.cursor + dir, 0, Math.max(0, rows.length - 1)) } });
+      this.setState({ newRepo: { ...n, cursor: pickerCursor(cursor + dir, rows.length) } });
       return;
     }
     if (e.type === "tap") {
-      const row = rows[n.cursor];
+      const row = rows[cursor];
       if (!row) return;
       const host = spawnHostFor(this.state, n.orgKey, row.repo);
       if (!host) return;
