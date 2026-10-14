@@ -655,6 +655,28 @@ test("reconcile: a torn final line (msgCount above the parsed entries) is re-sen
   } finally { teardown(); }
 });
 
+test("reconcile: a refill record stops masking once the local count moves", () => {
+  // QA (rollup XERK-1701): Postgres holding what the last refill sent only means "done"
+  // while the local count is the one that refill ran at. A later append whose session row
+  // landed but whose entry was dropped untracked must still heal.
+  const { mirror } = setup();
+  try {
+    mirror._refilled.set("t", { local: 4, sent: 3 });
+    const p = { msgCount: 5, n: 3, maxSeq: 2 };
+    assert.equal(mirror._reconcileHeals({ transcriptId: "t", msgCount: 5 }, p, new Map()), true);
+    assert.equal(mirror._reconcileHeals({ transcriptId: "t", msgCount: 4 },
+      { msgCount: 4, n: 3, maxSeq: 2 }, new Map()), false, "unchanged: still masked");
+  } finally { teardown(); }
+});
+
+test("reconcile: the refill record is bounded like the owed set, oldest first", () => {
+  const { mirror } = setup();
+  try {
+    for (const id of ["a", "b", "c", "d", "e"]) mirror._noteRefilled(id, 4, 3);
+    assert.deepEqual([...mirror._refilled.keys()], ["c", "d", "e"]);
+  } finally { teardown(); }
+});
+
 test("reconcile: queues at most one batch of refills, the rest resume next tick", async () => {
   const { store, mirror } = setup();
   try {
