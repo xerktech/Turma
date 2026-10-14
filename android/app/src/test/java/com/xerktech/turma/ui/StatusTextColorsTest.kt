@@ -43,6 +43,25 @@ class StatusTextColorsTest {
         assertEquals(listOf("#4CC94C", "#78AEF2", "#F08080", "#FAB219"), colors(dark = true).map(::hex))
     }
 
+    private fun inks(dark: Boolean): List<String> {
+        var out = emptyList<Color>()
+        compose.setContent {
+            TurmaTheme(darkTheme = dark) { out = listOf(pillInk(TurmaColors.warning), pillInk(TurmaColors.good)) }
+        }
+        compose.waitForIdle()
+        return out.map(::hex)
+    }
+
+    // An amber pill is tinted with the fill but reads in the amber text colour; other
+    // fills are their own ink (rollup XERK-1701, QA batch 29).
+    @Test fun `an amber pill reads in the amber text colour in light`() {
+        assertEquals(listOf("#8A5A00", "#12A312"), inks(dark = false))
+    }
+
+    @Test fun `an amber pill keeps the amber fill as its ink in dark`() {
+        assertEquals(listOf("#FAB219", "#12A312"), inks(dark = true))
+    }
+
     @Test fun `light keeps the fills and steps amber down, as the web's light tokens`() {
         assertEquals(listOf("#12A312", "#2A78D6", "#D03B3B", "#8A5A00"), colors(dark = false).map(::hex))
     }

@@ -439,7 +439,7 @@ fun PrBadge(pr: PrInfo, modifier: Modifier = Modifier) {
     val check = when (prReady(pr).lowercase()) {
         "ready" -> "✓" to TurmaColors.checkPass
         "blocked" -> "✗" to TurmaColors.checkFail
-        "pending" -> "●" to TurmaColors.checkPending
+        "pending" -> "●" to TurmaColors.waitingText()
         else -> "" to Color.Transparent
     }
     Row(
@@ -456,6 +456,18 @@ fun PrBadge(pr: PrInfo, modifier: Modifier = Modifier) {
     }
 }
 
+/**
+ * A pill's text colour for its [color] fill. Amber is under 2:1 as text on a light
+ * surface, so an amber pill keeps the fill for its tint and reads in the amber TEXT
+ * colour (web --warning-text); pass the fill, never the text colour, as [color].
+ */
+@Composable
+internal fun pillInk(color: Color?): Color = when (color) {
+    null -> MaterialTheme.colorScheme.onSurfaceVariant
+    TurmaColors.warning -> TurmaColors.waitingText()
+    else -> color
+}
+
 /** Neutral or colored pill/chip (web `.pill`). Set [dashed] for the "clonable but not present" repo chip. */
 @Composable
 fun Pill(
@@ -465,7 +477,7 @@ fun Pill(
     dashed: Boolean = false,
     mono: Boolean = false,
 ) {
-    val fg = color ?: MaterialTheme.colorScheme.onSurfaceVariant
+    val fg = pillInk(color)
     val border = if (dashed) fg.copy(alpha = 0.5f) else MaterialTheme.colorScheme.outline
     Text(
         text,
@@ -510,7 +522,11 @@ fun ContextMeterBar(session: SessionInfo, modifier: Modifier = Modifier) {
         Text(
             "${m.pct}%${if (m.approx) " ~" else ""} context",
             style = MaterialTheme.typography.bodySmall,
-            color = if (m.level == ContextMeter.Level.OK) MaterialTheme.colorScheme.onSurfaceVariant else color,
+            color = when (m.level) {
+                ContextMeter.Level.OK -> MaterialTheme.colorScheme.onSurfaceVariant
+                ContextMeter.Level.WARN -> TurmaColors.waitingText()
+                ContextMeter.Level.DANGER -> color
+            },
         )
     }
 }

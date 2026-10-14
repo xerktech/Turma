@@ -63,14 +63,14 @@
     border: 1px solid; flex-shrink: 0; }
   .host-auth.req { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, transparent);
     background: color-mix(in srgb, var(--critical) 10%, transparent); }
-  .host-auth.warn { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent);
+  .host-auth.warn { color: var(--warning-text); border-color: color-mix(in srgb, var(--warning) 45%, transparent);
     background: color-mix(in srgb, var(--warning) 10%, transparent); }
   /* "Restart agent" button (XERK-157) sits in the header beside the status chip;
      keep it from being squeezed when the row is tight. */
   .host-restart { flex-shrink: 0; }
   /* Hub-wide "push is off" warning bar (XERK-152), above the tiles. */
   .push-warn { display: flex; gap: 8px; align-items: baseline; margin-bottom: 14px;
-    padding: 9px 13px; border-radius: 8px; font-size: 13px; color: var(--warning);
+    padding: 9px 13px; border-radius: 8px; font-size: 13px; color: var(--warning-text);
     border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
     background: color-mix(in srgb, var(--warning) 10%, transparent); }
   .push-warn b { color: var(--ink); font-weight: 600; }
@@ -310,7 +310,7 @@
 
   /* Per-session work-state line: warning when there's unpushed/uncommitted
      work that a delete/kill would lose, muted when everything is safe. */
-  .work-risk { color: var(--warning); font-weight: 600; }
+  .work-risk { color: var(--warning-text); font-weight: 600; }
   .work-safe { color: var(--muted); }
 
   details.logs { border-top: 1px solid var(--hairline); padding-top: 8px; }

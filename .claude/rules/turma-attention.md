@@ -103,6 +103,8 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   tinted card. "waiting for your answer/permission" (`.sess-wait`, `.state.waiting`) uses it.
   - Android mirrors them as `TurmaColors.workingText()/reviewText()/criticalText()/waitingText()`
     (theme by surface luminance); the Sessions state line uses them. Tests: `StatusTextColorsTest`.
+  - Amber as TEXT anywhere uses them (web `color: var(--warning)` is a fill, never text); an
+    amber `Pill` keeps the fill as its tint and inks via `pillInk` — pass it the fill.
 - **Each review card carries a `.why` line** (`attentionWhy`: the why + the time — "for 12m" on
   every needs-you card, "stalled 31m" on a stall; the why is dropped on a
   question/permission/stalled card, whose label or ask line already says it). The age is glued to

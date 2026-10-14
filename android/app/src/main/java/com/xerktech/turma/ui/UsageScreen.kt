@@ -282,7 +282,7 @@ private fun LimitCardView(card: UsageViewModel.LimitCard, nowSec: Long) {
                 // windows out of Claude Code, not when the screen refreshed.
                 "captured ${UsageViewModel.fmtDuration(ageSec)} ago",
                 style = MaterialTheme.typography.bodySmall,
-                color = if (ageSec > UsageViewModel.LIMIT_STALE_SEC) TurmaColors.warning
+                color = if (ageSec > UsageViewModel.LIMIT_STALE_SEC) TurmaColors.waitingText()
                 else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }

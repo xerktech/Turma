@@ -407,7 +407,7 @@
      stopped moving, and disappears when the tunnel returns. */
   .term-bar .tunnel-off {
     font-size: 11px; padding: 2px 8px; border-radius: 999px; white-space: nowrap;
-    color: var(--warning); border: 1px solid var(--warning); background: transparent;
+    color: var(--warning-text); border: 1px solid var(--warning); background: transparent;
   }
   .term-bar .tunnel-off[hidden] { display: none; }
   /* Shown with the chip: the stage no longer clears itself when a host goes
@@ -527,7 +527,7 @@
   /* Non-operator user turns (chat.js messageOrigin): relayed/injected, so LEFT
      and each in its own colour, never read as operator input (blue, right). */
   .tr-msg.turma { align-self: flex-start; background: color-mix(in srgb, var(--warning) 14%, transparent); border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent); color: var(--ink); }
-  .tr-msg.turma .role { color: color-mix(in srgb, var(--warning) 65%, var(--ink)); }
+  .tr-msg.turma .role { color: color-mix(in srgb, var(--warning-text) 65%, var(--ink)); }
   .tr-msg.peer { align-self: flex-start; background: color-mix(in srgb, var(--s5) 15%, transparent); border: 1px solid color-mix(in srgb, var(--s5) 40%, transparent); color: var(--ink); }
   .tr-msg.peer .role { color: var(--s5); }
   .tr-msg.subagent { align-self: flex-start; background: color-mix(in srgb, var(--s2) 14%, transparent); border: 1px solid color-mix(in srgb, var(--s2) 40%, transparent); color: var(--ink); }

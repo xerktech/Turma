@@ -867,7 +867,7 @@ private fun QueuedSessionCard(r: FlatSession, now: Long, tint: Color?, onCancel:
                 Text(
                     queuedReasonText(r.session.queuedReason) + since,
                     style = MaterialTheme.typography.bodySmall,
-                    color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                    color = com.xerktech.turma.ui.theme.TurmaColors.waitingText(),
                     maxLines = 1,
                 )
             }
