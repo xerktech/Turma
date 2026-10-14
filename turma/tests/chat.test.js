@@ -3042,6 +3042,8 @@ test("buildItems: a framing tag inside an operator's code fence is their text (r
   assert.equal(strip("a\n```js x\n<system-reminder>\n```\nb"), "a\n```js x\n```\nb");
   // A lone CR ends a line, as the renderer reads it: the fence after it holds the tag.
   assert.equal(strip("see:\n```\r\r\n<system-reminder>\n```\nend"), "see:\n```\n\r\n<system-reminder>\n```\nend");
+  // Every lone CR, not just the first (QA).
+  assert.equal(strip("a\rb\n```\r\r\n<system-reminder>\n```\nend"), "a\nb\n```\n\r\n<system-reminder>\n```\nend");
   // A fence indented by a non-breaking space is a fence, as the renderer reads it.
   assert.equal(strip("i\n\u00a0```\n<system-reminder>\nb\n```\ne"), "i\n\u00a0```\n<system-reminder>\nb\n```\ne");
   // Claude Code's own matched paste framing goes even inside the operator's fence.
