@@ -21352,7 +21352,9 @@ _COLUMN_LABEL = {"todo": "To Do", "inprogress": "In Progress",
 # on word boundaries — mirrors board.js REVIEW_STATUS_RE / isReviewStatus exactly.
 # `resolved` is Azure DevOps' own "fixed, not yet verified" state (XERK-250); the
 # rationale for placing it by name lives on board.js's copy.
-_REVIEW_STATUS_RE = re.compile(r"\b(review|reviewing|testing|test|qa|resolved)\b", re.I)
+# re.A: JS's `\b` and non-unicode `/i` are ASCII-only, and Python's are Unicode by
+# default — "Prétest" read In Review on the web but not here (rollup XERK-1701).
+_REVIEW_STATUS_RE = re.compile(r"\b(review|reviewing|testing|test|qa|resolved)\b", re.I | re.A)
 
 
 def _board_column(name, category):

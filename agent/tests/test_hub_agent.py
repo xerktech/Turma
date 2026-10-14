@@ -35050,6 +35050,10 @@ class TestBoardColumn(unittest.TestCase):
         self.assertEqual(ha._board_column("Testing", "inprogress"), "review")
         self.assertEqual(ha._board_column("QA", "inprogress"), "review")
         self.assertEqual(ha._board_column("Attestation", "inprogress"), "inprogress")
+        # board.js's \b and /i are ASCII-only, so this one is too (rollup XERK-1701):
+        # "é" ends a word, and "ſ" is not an "s".
+        self.assertEqual(ha._board_column("Prétest", "inprogress"), "review")
+        self.assertEqual(ha._board_column("teſt", "inprogress"), "inprogress")
         self.assertEqual(ha._board_column("Testing complete", "done"), "done")
         # Azure DevOps' "fixed, not yet verified" state (XERK-250).
         self.assertEqual(ha._board_column("Resolved", "inprogress"), "review")

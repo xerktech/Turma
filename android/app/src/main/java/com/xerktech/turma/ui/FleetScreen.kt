@@ -245,13 +245,19 @@ fun FleetScreen(
     }
 }
 
+// index.html's `/^(\S+)\s+\((.+)\)$/` with JS's `\s` and `.` spelled out (rollup
+// XERK-1701): the JVM's `\s` is ASCII and a device's ICU one is Unicode, neither JS's.
+private val CLAUDE_VERSION_RE = com.xerktech.turma.core.JS_WS.let { ws ->
+    Regex("([^\n$ws]+)[\n$ws]+\\(([^\n\r\u2028\u2029]+)\\)")
+}
+
 /** The coding agent a host runs, for its header — mirrors index.html codingAgent(). */
 fun codingAgentLabel(a: AgentInfo): String {
     val c = a.codingAgent
     if (c != null && c.version.isNotBlank()) return "${c.name.ifBlank { "Claude Code" }} ${c.version}"
-    val raw = a.claudeVersion.trim()
+    val raw = com.xerktech.turma.core.jsTrim(a.claudeVersion)
     if (raw.isEmpty()) return "–"
-    val m = Regex("^(\\S+)\\s+\\((.+)\\)$").find(raw)
+    val m = CLAUDE_VERSION_RE.matchEntire(raw)
     return if (m != null) "${m.groupValues[2]} ${m.groupValues[1]}" else "Claude Code $raw"
 }
 

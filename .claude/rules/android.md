@@ -44,6 +44,14 @@ Mirrors the glasses pure-core/adapter-shell split:
   `fleetTokens`/`mergeModels`), Ready-for-review split (`core/Sessions.kt` `rankRunning` →
   `LiveGroups`), sessions search (`core/Search.kt`, XERK-243 — one box filters live lists AND
   appends archive matches). Port logic there; keep the Compose screen a thin renderer.
+- **A port of a web/hub text rule uses JavaScript's character sets, never Kotlin's or the regex
+  engine's** (rollup XERK-1701): `jsTrim`/`isJsBlank`/`JS_WS` (Prose.kt) for `trim()`/`\s`, and
+  an explicit `[A-Za-z0-9_]` lookaround + ASCII lowercase for `\b` and `/i`.
+  - Kotlin's `trim()`/`isBlank()` keep U+FEFF and cut U+001C..U+001F (JS: the reverse); a device's
+    regex is ICU (Unicode `\s`/`\w`/`\b`, Unicode case folding) while JVM unit tests run
+    `java.util.regex`, so a test can pass on the JVM and the device still disagree with the web.
+  - Tests: `SessionsTest` (wait labels), `BoardTest` (review status, `splitLabels`),
+    `CodingAgentLabelTest`.
 - **Board search/filter/sort** is `core/BoardView.kt` ↔ `board.js` `boardView*` (rule in
   `turma-board.md`). The phone shows active filters as a badge only — never a second chip row.
 - **Match features and structure, not pixels** (platform-idiomatic controls). A justified platform
