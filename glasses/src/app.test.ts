@@ -542,6 +542,7 @@ describe("App", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(app.getState().flash).toBe("x host offline");
     expect(app.getState().answered).toEqual({});
+    expect(app.getState().pending["s1"]).toBeUndefined();
     expect(bottomMode()).toBe("sheet");
   });
 

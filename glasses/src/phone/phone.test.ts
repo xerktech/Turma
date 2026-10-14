@@ -247,6 +247,44 @@ describe("phone controller", () => {
     expect(again.textContent).toContain("host is offline");
   });
 
+  it("a phone send error clears on expiry, on the next good send, and on leaving the session", async () => {
+    vi.useFakeTimers();
+    try {
+      client.answerQuestion = vi.fn(async () => {
+        throw Object.assign(new Error("host is offline"), { name: "HttpError", status: 503 });
+      });
+      const withQ = { ...sessionState("s1", "host-a"),
+        agents: [agent({ key: "host-a", sessions: [session({ id: "s1", session: signals({ question: "Go?", questionOptions: ["Yes", "No"] }) })] })] };
+      const fail = async () => {
+        state = withQ; handle.render(state); handle.enterFromGlasses("host-a", "s1");
+        root.querySelectorAll<HTMLElement>("[data-answer]")[0]!.click();
+        await Promise.resolve(); await Promise.resolve();
+        expect(root.querySelector<HTMLElement>("#ph-senderr")!.hidden).toBe(false);
+      };
+      const shown = () => !root.querySelector<HTMLElement>("#ph-senderr")!.hidden;
+
+      await fail(); // expiry
+      vi.advanceTimersByTime(8001);
+      handle.render({ ...state });
+      expect(shown()).toBe(false);
+
+      await fail(); // the next successful send clears it
+      client.answerQuestion = vi.fn(async () => ({ ok: true, cmdId: "c" }));
+      root.querySelectorAll<HTMLElement>("[data-answer]")[1]!.click();
+      expect(shown()).toBe(false);
+
+      client.answerQuestion = vi.fn(async () => {
+        throw Object.assign(new Error("host is offline"), { name: "HttpError", status: 503 });
+      });
+      await fail(); // leaving the session clears it
+      state = homeState(); handle.render(state);
+      state = withQ; handle.render(state); handle.enterFromGlasses("host-a", "s1");
+      expect(shown()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("enterFromGlasses pulls the phone into the session the glasses entered", () => {
     // Simulate the App entering a session by a glasses gesture: onState pushes the
     // new state, then onEnterSession fires.

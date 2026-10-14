@@ -1446,6 +1446,7 @@ export class App {
     const seq = ++this.answerSeq;
     // Every answer path (glasses sheet, dictation, phone) shows the pending glyph.
     this.markPending(sessionId, findSession(this.state, hostKey, sessionId));
+    const myPending = this.state.pending[sessionId];
     if (question) {
       const entry = { hostKey, question, options: live?.questionOptions ?? [], at, until: at + PENDING_TIMEOUT_MS, seq };
       const answered = { ...this.state.answered, [sessionId]: entry };
@@ -1471,6 +1472,11 @@ export class App {
         return res;
       },
       (err: unknown) => {
+        // A refused answer changes nothing hub-side, so it is not pending.
+        if (this.state.pending[sessionId] === myPending) {
+          const { [sessionId]: _p, ...pending } = this.state.pending;
+          this.state = { ...this.state, pending };
+        }
         // Only un-hide what THIS call hid — a second, failed answer must not
         // bring back a question the first one already got through on.
         if (this.state.answered[sessionId]?.seq === seq) {
