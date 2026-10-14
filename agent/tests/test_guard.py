@@ -16,6 +16,7 @@ import importlib.util
 import io
 import json
 import shlex
+import signal
 import contextlib
 import os
 import subprocess
@@ -52,6 +53,54 @@ guard._hard_exit = _no_hard_exit
 # here, every verdict is load-independent; the deadline tests patch it back.
 # Speed ceilings are CPU time (`time.process_time()`) for the same reason.
 guard._MAX_DECIDE_SECONDS = 10 ** 6
+
+
+# With the deadline off, an exponential regression ran one test until the
+# 15-minute CI job timeout, which names no test (rollup XERK-1701). Each test
+# instead gets a CPU-time watchdog (SIGPROF, so a loaded runner's wall clock
+# never trips it): the slowest test spent 55 CPU s at a load of 24 on 16 cores,
+# and the whole module ~490, so a runaway stops well inside the job's 15 minutes.
+_TEST_CPU_LIMIT = 180
+
+
+class _CpuWatchdog(BaseException):
+    """A test ran past its CPU limit. A BaseException, so no `except Exception`
+    in the guard swallows it; unittest still records it against the test."""
+
+
+@contextlib.contextmanager
+def _cpu_watchdog(seconds, name):
+    """Raise `_CpuWatchdog` in the main thread once this process has spent
+    ``seconds`` of CPU inside the block, and every second after (a subTest
+    records the first and runs on), restoring any outer watchdog on exit."""
+    if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def fire(signum, frame):
+        raise _CpuWatchdog(f"{name} spent over {seconds} CPU s: a runaway (exponential?) "
+                           "regression, stopped by the test watchdog")
+
+    previous = signal.signal(signal.SIGPROF, fire)
+    outer = signal.setitimer(signal.ITIMER_PROF, seconds, 1)
+    started = time.process_time()
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_PROF, 0)
+        signal.signal(signal.SIGPROF, previous)
+        if outer[0]:
+            # The outer block's remaining CPU, less what this one spent.
+            spent = time.process_time() - started
+            signal.setitimer(signal.ITIMER_PROF, max(outer[0] - spent, 0.001), outer[1])
+
+
+class _GuardTestCase(unittest.TestCase):
+    """Every test in this module runs under `_cpu_watchdog`."""
+
+    def run(self, result=None):
+        with _cpu_watchdog(_TEST_CPU_LIMIT, self.id()):
+            return super().run(result)
 
 
 # --- destructive: must be blocked ----------------------------------------
@@ -337,7 +386,7 @@ ORDINARY_OK = [
 ]
 
 
-class TestKnownBypasses(unittest.TestCase):
+class TestKnownBypasses(_GuardTestCase):
     """Every case here shipped as ALLOWED and is now denied."""
 
     def test_destructive_bypasses_are_denied(self):
@@ -963,7 +1012,7 @@ class TestKnownBypasses(unittest.TestCase):
         self.assertIsNotNone(guard.is_destructive("shred /dev/sda"))
 
 
-class TestParserGaps(unittest.TestCase):
+class TestParserGaps(_GuardTestCase):
     """XERK-1256: heredoc, here-string, comment, case-pattern, quoting and
     empty-substitution shapes the parser misread. Every bypass below was
     proved to run its payload under real bash; every false deny runs nothing.
@@ -1305,7 +1354,7 @@ class TestParserGaps(unittest.TestCase):
                 self.assertLess(time.process_time() - start, 15)
 
 
-class TestProducedScripts(unittest.TestCase):
+class TestProducedScripts(_GuardTestCase):
     """XERK-1549: a payload carried into execution by a variable a substitution
     or `printf -v` filled, or a relative `rm` after `cd` into a protected root.
     Each bypass ran its payload under real bash (touch marker)."""
@@ -2119,7 +2168,7 @@ class TestProducedScripts(unittest.TestCase):
         self.assertAllowed("rm -rf ~/tmp*")
 
 
-class TestScriptChannels(unittest.TestCase):
+class TestScriptChannels(_GuardTestCase):
     """XERK-1539: channels that turn a STRING into a script — find -exec/xargs
     running a shell, a pipe/here-string/`<(…)` feeding one, `eval --`, `flock`
     and `env -S`. Each ran its payload under real bash (touch marker)."""
@@ -2506,16 +2555,20 @@ class TestScriptChannels(unittest.TestCase):
                     self.assertEqual(decide("Bash", {"command": cmd}, cwd=cwd)[0], "allow")
             # Relative cds join anchors + the latest, never every cwd: joined to
             # every one, 16 took 100s CPU and the hook denied (QA).
-            for cmd in (" && ".join(f"cd d{i}" for i in range(60)) + " && make",
-                        "; ".join(f"cd p{i} && make && cd .." for i in range(60)),
-                        "cd ~/proj && " + "; ".join(f"(cd p{i} && make)" for i in range(60)),
-                        # Each group's head walked once, not re-read: 240 took 30s (QA).
-                        " && ".join(f"(cd p{i} && cd q{i} && make)" for i in range(240))):
+            # Each ceiling is ~3x its idle CPU (0.3, 0.5, 0.9, 9s): one shared
+            # 10s ceiling sat at the 240-group line's idle cost, so it failed
+            # under load (rollup XERK-1701), and missed a 10x-slower small one.
+            for cmd, limit in (
+                    (" && ".join(f"cd d{i}" for i in range(60)) + " && make", 2.5),
+                    ("; ".join(f"cd p{i} && make && cd .." for i in range(60)), 2.5),
+                    ("cd ~/proj && " + "; ".join(f"(cd p{i} && make)" for i in range(60)), 3),
+                    # Each group's head walked once, not re-read: 240 took 30s (QA).
+                    (" && ".join(f"(cd p{i} && cd q{i} && make)" for i in range(240)), 30)):
                 with self.subTest(cmd=cmd[:40]):
                     t = time.process_time()
                     self.assertEqual(decide("Bash", {"command": cmd},
                                             cwd="/var/tmp/qa7h/home/x/proj")[0], "allow")
-                    self.assertLess(time.process_time() - t, 10)
+                    self.assertLess(time.process_time() - t, limit)
         # A flood of `cd`s fails closed on the decision deadline, checked per `cd`.
         with mock.patch.object(guard, "_budget", {"left": 10 ** 9, "expand": {}, "vals": {},
                                                   "capped": False, "proc": {}, "posread": {},
@@ -4250,7 +4303,7 @@ class TestScriptChannels(unittest.TestCase):
         self.assertDenied(cmd)
 
 
-class TestCommentAndEvalReparse(unittest.TestCase):
+class TestCommentAndEvalReparse(_GuardTestCase):
     """XERK-1585: a `#` inside `${…}` read as a comment, and an `eval` chain or a
     quoted `$(` eval's join makes live skipped a re-parse. Each ran its payload
     under real bash (touch marker) while the guard allowed it."""
@@ -4403,9 +4456,11 @@ class TestCommentAndEvalReparse(unittest.TestCase):
         # Each level's printed text resolves the levels beneath it; unmemoised,
         # and with the group and substitution passes both recursing into the
         # same body, 3000 levels ran 30s — past the hook timeout, failing OPEN.
+        # ~8 CPU s idle; CPU time still rises ~2.2x on shared cores, so the
+        # ceiling is ~3x idle (15 failed under load, rollup XERK-1701).
         started = time.process_time()
         self.assertDenied("echo " + "$(echo " * 3000 + "x" + ")" * 3000)
-        self.assertLess(time.process_time() - started, 15)
+        self.assertLess(time.process_time() - started, 25)
 
     def test_a_trailing_backslash_costs_no_reading_per_level(self):
         # XERK-1646 QA: a second reading of a lone trailing `\` at every
@@ -4549,7 +4604,7 @@ class TestCommentAndEvalReparse(unittest.TestCase):
                 self.assertEqual(got, exp.split("\0")[:-1])
 
 
-class TestClassification(unittest.TestCase):
+class TestClassification(_GuardTestCase):
     def test_a_powershell_c_script_s_remove_targets_are_judged(self):
         # Rollup XERK-1584: what powershell/pwsh/cmd runs is scanned, not
         # parsed (guard-unreadable.md): a remove word, a recursive switch or
@@ -4668,7 +4723,7 @@ class TestClassification(unittest.TestCase):
                 self.assertIsNone(guard.attribution_reason(cmd))
 
 
-class TestWrapperUnwrapping(unittest.TestCase):
+class TestWrapperUnwrapping(_GuardTestCase):
     """A wrapper must not launder a command past the rules.
 
     A QA session destroyed a host's /etc with `bash -lc 'rm -rf /etc'`: the
@@ -4960,7 +5015,7 @@ class TestWrapperUnwrapping(unittest.TestCase):
         self.assertIsNone(guard.is_destructive(cmd))
 
 
-class TestAgentServiceProtection(unittest.TestCase):
+class TestAgentServiceProtection(_GuardTestCase):
     """A session must not stop the manager that supervises it.
 
     Restarting `turma-agent` kills the manager of EVERY session on the host,
@@ -5016,7 +5071,7 @@ class TestAgentServiceProtection(unittest.TestCase):
                 self.assertIsNone(guard.is_destructive(cmd))
 
 
-class TestAgentTmuxProtection(unittest.TestCase):
+class TestAgentTmuxProtection(_GuardTestCase):
     """A session must not kill the tmux server every session runs in (XERK-1077).
 
     Sessions are panes of one tmux server on the default socket and inherit
@@ -5157,7 +5212,7 @@ class TestAgentTmuxProtection(unittest.TestCase):
                 self.assertIsNone(guard.is_destructive(cmd))
 
 
-class TestDecide(unittest.TestCase):
+class TestDecide(_GuardTestCase):
     def test_allows_non_bash(self):
         self.assertEqual(
             guard.decide("Edit", {"file_path": "/etc/passwd"}), ("allow", None, None)
@@ -5215,7 +5270,7 @@ class TestDecide(unittest.TestCase):
         self.assertEqual(guard._parse_overrides(None), [])
 
 
-class TestExpansionBudget(unittest.TestCase):
+class TestExpansionBudget(_GuardTestCase):
     """Inlining a large variable at every use grew the text without bound.
 
     `x='<3000 words>'; echo $x; …` ×1000 took ~19s to classify, and a ~100KB
@@ -5491,23 +5546,25 @@ class TestExpansionBudget(unittest.TestCase):
     def test_find_exec_and_xargs_runs_are_denied_fast(self):
         # Their emitted WORK grew faster than linearly, not their text: 5000
         # `-exec` runs took 30s and 4096 xargs segments 18s (XERK-1589).
-        for cmd in (
-            "find . " + "-exec true {} + " * 5000,
-            'x="-exec true {} +"; find . ' + "$x " * 10000,
+        # Each ceiling is ~3x its idle CPU (find ~2-3s, xargs ~18-21s): CPU
+        # time rises ~2.2x on shared cores, and one shared 50s ceiling was 2.4x
+        # the slowest, so it failed under load (rollup XERK-1701).
+        for cmd, limit in (
+            ("find . " + "-exec true {} + " * 5000, 10),
+            ('x="-exec true {} +"; find . ' + "$x " * 10000, 10),
             # Distinct operands: each xargs carries every one (XERK-1641
             # de-duplicates repeats, which made identical ones linear).
-            " | ".join(f"xargs echo a/b{i}" for i in range(4096)),
-            'x="xargs echo"; ' + " | ".join(f"$x a/b{i}" for i in range(8192)),
+            (" | ".join(f"xargs echo a/b{i}" for i in range(4096)), 65),
+            ('x="xargs echo"; ' + " | ".join(f"$x a/b{i}" for i in range(8192)), 65),
         ):
             t = time.process_time()
             decision, reason = guard.decide("Bash", {"command": cmd})[:2]
             self.assertEqual(decision, "deny", cmd[:80])
             self.assertIn(self.TOO_LARGE, reason, cmd[:80])
             # xargs re-expands each argv (XERK-1539) until the budget is
-            # spent: 8-23s CPU by host and load. The deadline is off (module top),
-            # so the deny above is the budget's; this only catches a slower way to
-            # spend it.
-            self.assertLess(time.process_time() - t, 50, cmd[:80])
+            # spent. The deadline is off (module top), so the deny above is
+            # the budget's; this only catches a slower way to spend it.
+            self.assertLess(time.process_time() - t, limit, cmd[:80])
 
     def test_ordinary_find_exec_and_xargs_stay_allowed(self):
         for cmd in (
@@ -5706,7 +5763,7 @@ class TestExpansionBudget(unittest.TestCase):
         self.assertIsNone(guard._budget)
 
 
-class TestGroupsHoldingOperators(unittest.TestCase):
+class TestGroupsHoldingOperators(_GuardTestCase):
     """A group whose body holds `;`, `|` or `&&` must still be classified.
 
     Operator splitting ran before the substitution regex could see the group,
@@ -6108,6 +6165,23 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                 # ~23 CPU s idle, 35 under load.
                 guard.decide("Bash", {"command": cmd}, cwd="/tmp")
                 self.assertLess(time.process_time() - start, 90)
+
+    def test_the_taint_start_cap_binds_before_the_growth_budget(self):
+        # Rollup XERK-1701: the speed tests above run to the growth budget, so
+        # raising `_MAX_TAINT_STARTS` 8 -> 64 left their CPU unchanged and no
+        # test pinned the cap. Here it binds first, counted in readings.
+        # Eight statements are read per suffix; past eight, only the
+        # every-statement reading and one an unread statement leads.
+        for n, readings in ((6, 8), (7, 2), (40, 2)):
+            with self.subTest(n=n):
+                body = "echo a | sed ''; " * n + "ls /x || echo -rf /etc"
+                self.assertEqual(len(guard._body_tainted(body)), readings)
+        # An assigned 82-statement body is re-expanded once per capped taint
+        # start (72 expansions; 264 at a cap of 64), well inside the budget.
+        cmd = "a=$(" + "true && echo a | sed ''; " * 40 + "ls /x || echo -rf /etc); $a"
+        with mock.patch.object(guard, "_expand_raw_too", wraps=guard._expand_raw_too) as spy:
+            self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        self.assertLessEqual(spy.call_count, 80)
 
     def test_a_large_filtered_body_classifies_without_timing_out(self):
         # XERK-1613 QA: the taint reading must not make the guard quadratic —
@@ -6779,6 +6853,37 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                              ("deny", guard._TOO_LARGE_REASON, "policy"))
         self.assertEqual(guard.decide("Bash", {"command": "ls"}, cwd="/tmp")[0], "allow")
 
+    def test_a_raised_growth_budget_still_stops_at_the_deadline(self):
+        # Rollup XERK-1701: with `_MAX_SUBST_GROWTH` 1024x larger, `find .
+        # -exec true {} +` x5000 ran 68-90s past the deadline in the checker
+        # loops and allowed. End to end, the deadline now ends it. Read off the
+        # CPU clock here, so host load moves neither the verdict nor the cost:
+        # the decision stops at ~3 CPU s; without the loops' checks it ran 140.
+        cmd = "find . " + "-exec true {} + " * 5000
+        cpu_clock = mock.Mock(wraps=time)
+        cpu_clock.monotonic = time.process_time
+        with mock.patch.object(guard, "_MAX_SUBST_GROWTH", guard._MAX_SUBST_GROWTH * 1024), \
+                mock.patch.object(guard, "_MAX_DECIDE_SECONDS", 3), \
+                mock.patch.object(guard, "time", cpu_clock):
+            started = time.process_time()
+            self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp"),
+                             ("deny", guard._TOO_LARGE_REASON, "policy"))
+            self.assertLess(time.process_time() - started, 15)
+
+    def test_the_cpu_watchdog_stops_a_runaway_test(self):
+        # Rollup XERK-1701: a runaway test fails by name, not on the CI job's
+        # timeout, and the outer (per-test) watchdog is re-armed afterwards.
+        with self.assertRaises(_CpuWatchdog) as caught:
+            with _cpu_watchdog(0.3, "runaway"):
+                # Bounded, so a broken watchdog fails here rather than hanging.
+                give_up = time.process_time() + 5
+                while time.process_time() < give_up:
+                    pass
+        self.assertIn("runaway spent over 0.3 CPU s", str(caught.exception))
+        self.assertGreater(signal.getitimer(signal.ITIMER_PROF)[0], 0)
+        self.assertEqual(signal.getsignal(signal.SIGPROF).__qualname__,
+                         "_cpu_watchdog.<locals>.fire")
+
     def test_a_continuation_is_dropped_only_where_bash_drops_it(self):
         # Outside single quotes, a live `\\<newline>` is nothing; an escaped
         # backslash, a single-quoted one and a comment's are kept (XERK-1615).
@@ -6900,7 +7005,7 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
 
-class TestProtectedOverrides(unittest.TestCase):
+class TestProtectedOverrides(_GuardTestCase):
     """XERK-1677: the root-owned guard runs with --protected and must not take
     overrides from its env — a session sets them on a nested claude."""
 
@@ -6952,7 +7057,7 @@ Low — archive write path only.
 """
 
 
-class TestPrSummary(unittest.TestCase):
+class TestPrSummary(_GuardTestCase):
     """The PR summary standard: a PR/MR description missing a required section
     is refused, with the missing sections named; a repo's own template wins."""
 
@@ -7516,7 +7621,7 @@ class TestPrSummary(unittest.TestCase):
                                       pr_summary=False)[0], "allow")
 
 
-class TestHookEntrypoint(unittest.TestCase):
+class TestHookEntrypoint(_GuardTestCase):
     """Invoke guard.py as a subprocess the way Claude Code runs the hook."""
 
     def _run_hook(self, event, env_extra=None):
@@ -7676,7 +7781,7 @@ class TestHookEntrypoint(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "")
 
 
-class TestJudgeGrants(unittest.TestCase):
+class TestJudgeGrants(_GuardTestCase):
     """XERK-1566: the permission judge's one-shot grants. guard.py consults one
     only AFTER decide() allowed the command, consumes it, and emits the only
     `allow` any Turma hook emits. Everything about a grant file is session-
@@ -7813,7 +7918,7 @@ class TestJudgeGrants(unittest.TestCase):
             allow.assert_not_called()
 
 
-class TestUnreadableConstructs(unittest.TestCase):
+class TestUnreadableConstructs(_GuardTestCase):
     """XERK-1749: a shell construct the guard cannot resolve exactly, next to a
     destructive/shell sink, is refused ("write it plainly") instead of modelled.
 
@@ -7907,7 +8012,7 @@ class TestUnreadableConstructs(unittest.TestCase):
             self.assertLess(time.process_time() - t, 3.0, cmd[:20])
 
 
-class TestShadowRun(unittest.TestCase):
+class TestShadowRun(_GuardTestCase):
     """XERK-1847: a shadow run's session (TURMA_SHADOW set) may not publish —
     no push, no PR/MR, no tracker or API write — while ordinary work runs."""
 
@@ -7976,7 +8081,7 @@ class TestShadowRun(unittest.TestCase):
             self.assertEqual(out.stdout.strip(), "", flags)
 
 
-class TestHookSourcesCompileClean(unittest.TestCase):
+class TestHookSourcesCompileClean(_GuardTestCase):
     def test_module_level_names_are_unique(self):
         # A later `_X_RE = …` silently replaces an earlier one for every
         # caller (guard-qa.md); two such pairs sat dead (rollup XERK-1584).
