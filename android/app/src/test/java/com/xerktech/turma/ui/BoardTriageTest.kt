@@ -150,7 +150,12 @@ class BoardTriageTest {
 
         // Open the detail sheet for the held ticket.
         compose.onNodeWithText("XERK-101").performClick()
-        compose.waitForIdle()
+        // waitForIdle doesn't wait for the sheet's ticket-detail fetch (OkHttp, off the
+        // Compose clock), so a slow runner asserted before the sheet drew (rollup #69).
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText("TRIAGE").fetchSemanticsNodes().size == 2 &&
+                compose.onAllNodesWithText("— set by you").fetchSemanticsNodes().isNotEmpty()
+        }
 
         // The Triage section label appears (column header + sheet section = 2 "TRIAGE").
         assertEquals(
