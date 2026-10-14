@@ -31313,11 +31313,16 @@ class SessionManager:
         not running or relaunched; a resend also once the outbox lost it."""
         now = time.monotonic()
         with self._input_lock:
-            due = [h for h in self.input_held if h["next"] <= now]
+            held = list(self.input_held)
         blocked = set()
-        for h in due:
+        for h in held:
             sid = h["sid"]
             if sid in blocked:
+                continue
+            if h["next"] > now:
+                # Not due: nothing of this session's may pass it (the first
+                # one held for a dialog waits out its own backoff).
+                blocked.add(sid)
                 continue
             landed = None
             try:

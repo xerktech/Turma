@@ -49,11 +49,36 @@ composed.**
     it, so a restart never gets the old conversation's Enter. The gate is held for ONE write,
     so a relaunch waits out at most one pane call. Never prune the epochs (see the comment).
     Tests: `TestPaneRelaunchStopsTyping`.
-  - **Nothing is typed into a pane a dialog owns** (`_pane_blocking_dialog`, one read under the
-    lock): a typed digit picks an option and any Enter approves the highlighted one. Covers
-    every caller (input, resend, notify fallback, qwen peer). `_submit_typed` also never presses
-    into a dialog that came up while typing or after its Enter, and stops watching at once.
+  - **Nothing is typed into a pane a dialog owns** (`_pane_blocking_dialog`): a typed digit picks
+    an option and any Enter approves the highlighted one. Covers every caller (input, resend,
+    notify fallback, qwen peer). `_submit_typed` also never presses into a dialog that came up
+    while typing or after its Enter, and stops watching at once.
     Tests: `TestSubmitTypedDialogsAndBaselines`.
+  - **The dialog check runs before EVERY write, not once per message** (`_slice_gate`): before
+    each later slice, send-keys chunk and Enter, on tmux and Windows, whether or not draws are
+    still awaited. QA: a dialog drawn mid-message got the rest, and a last slice "1" approved
+    the tool 3/6. A stop returns `PANE_DIALOG` with nothing more typed (never a ^U either).
+    Tests: `TestDialogMidMessage`.
+  - **No slice after the first is short** (`_input_slices`: the last two share the remainder).
+    A dialog ignores a multi-char slice but takes a lone digit; this closes the check-then-type
+    window, and covers a pane whose composer can't be read. Never go back to a ragged tail.
+  - **A message a dialog kept out is HELD, never dropped** (`_hold`, `_deliver_held`): input,
+    notify fallback (its PR comment is already marked seen), compaction resend, qwen peer, and
+    a trust modal a human must answer. The input worker retries every `INPUT_HOLD_RETRY_SEC`
+    for `INPUT_HOLD_TTL_SEC`, then drops it with a log line.
+    - One session's messages go in order: a later one queues behind a held one, and one
+      waiting out its backoff blocks the rest (live rig: a due resend overtook it).
+    - A held entry stays on `input_held` until typed, so `_input_undelivered` (sleeper pause)
+      sees it; it moves to `input_landed` in one locked step. `_resend_queued` sees held resends.
+    - Pinned to the pane epoch it was typed against: a relaunch drops it (old conversation).
+    - The retry clears what the stopped attempt left (`clear_leftover`: the box shows a piece
+      of this text), else it would be submitted twice, glued. Other composer text is left alone.
+    - Residual: held state is in memory; an agent restart loses it.
+    Tests: `TestHeldForDialog`.
+  - **Clearing an unsent message is 2N-1 Ctrl+U for N lines, ≤10 per write** (`_clear_composer`,
+    measured on 2.1.300): Ctrl+U at a line's start joins it to the line above (one per line left
+    the first line); a bigger burst drops presses; a chip is one line (one press clears it).
+    Tests: `TestClearComposer`.
   - **The cap is judged on the text AS TYPED** (tabs already 4 spaces), on tmux and Windows alike:
     judged before, 4000 tabs became 40 slices, each a pane call.
   - **A pane's lock entry lives only while a writer uses it** (`[lock, users]`): a writer counts

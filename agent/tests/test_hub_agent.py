@@ -9408,15 +9408,36 @@ class TestHeldForDialog(ManagerMixin, unittest.TestCase):
             return True
         with mock.patch.object(ha, "_type_into_pane", side_effect=typ):
             sm.send_input("s1", "first", defer_record=True)
-            sm.send_input("s1", "second", defer_record=True)   # never typed ahead
+            state["dialog"] = False
+            # The dialog is gone, but "first" waits for its retry: "second"
+            # must queue behind it, never be typed ahead of it.
+            sm.send_input("s1", "second", defer_record=True)
+            self.assertEqual(typed, [])
+            state["dialog"] = True
             self._due(sm)
-            sm._deliver_held()                                 # still up: both wait
+            sm._deliver_held()                                 # up again: both wait
             self.assertEqual([h["text"] for h in sm.input_held], ["first", "second"])
             state["dialog"] = False
             self._due(sm)
             sm._deliver_held()
         self.assertEqual(typed, ["first", "second"])
         self.assertEqual([t for _s, _ty, t in sm.input_landed], ["first", "second"])
+
+    def test_a_later_message_never_overtakes_one_waiting_out_its_backoff(self):
+        # Live rig: "1 more" met a new dialog and was re-armed for later, while
+        # the resend held behind it was already due -- and went first.
+        sm = self.make_manager()
+        self._running(sm, pendingInputs=[{"text": "b", "at": time.time()}])
+        with mock.patch.object(ha, "_type_into_pane", return_value=ha.PANE_DIALOG):
+            sm.send_input("s1", "a", defer_record=True)
+            sm.resend_queue = [("s1", "b")]
+            sm._deliver_staged_resends()
+        sm.input_held[0]["next"] = time.monotonic() + 60   # "a": backing off
+        sm.input_held[1]["next"] = 0                       # "b": due
+        with mock.patch.object(ha, "_type_into_pane", return_value=True) as typ:
+            sm._deliver_held()
+        typ.assert_not_called()
+        self.assertEqual([h["text"] for h in sm.input_held], ["a", "b"])
 
     def test_a_held_message_is_dropped_past_its_ttl_or_a_relaunch(self):
         sm = self.make_manager()
