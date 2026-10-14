@@ -54,6 +54,19 @@ function slowStore() {
       s.entries.set(id, new Map(list.map((e, i) => [i, e.text])));
     },
     async deleteTranscript(id) { await s.wait(); s.rows.delete(id); s.entries.delete(id); },
+    // PgIndexStore.transcriptCounts over the maps (the reconcile's Postgres side).
+    async transcriptCounts(ids) {
+      s.countCalls = (s.countCalls || 0) + 1;
+      if (s.countDelay) await new Promise((r) => setTimeout(r, s.countDelay));
+      const out = new Map();
+      for (const id of ids) {
+        const keys = [...(s.entries.get(id) || new Map()).keys()];
+        const row = s.rows.get(id);
+        out.set(id, { msgCount: row ? row.msgCount || 0 : null, n: keys.length,
+          maxSeq: keys.length ? Math.max(...keys) : -1 });
+      }
+      return out;
+    },
     hold() { let r; s.gate = { p: new Promise((res) => { r = res; }) }; s.gate.release = r; },
     release() { const g = s.gate; s.gate = null; g.release(); },
   };
@@ -407,5 +420,161 @@ test("mirrorRefillOf: nothing for a placeholder row with no file yet", () => {
     archive.manifestCursors("nas", [{ transcriptId: "t-ph", remoteKey: "rk", repo: "turma" }], "acme");
     assert.ok(archive.sessionRow("t-ph"), "the placeholder row exists");
     assert.equal(archive.mirrorRefillOf("t-ph"), null);
+  } finally { teardown(); }
+});
+
+// ---- the periodic leader-only reconcile (XERK-1701) --------------------------
+// It closes what the owed set cannot: a drop past its cap, a refill a deposition
+// dropped, a gated replace skipped after a term change.
+
+test("reconcile: a transcript dropped past the owed-set cap heals, ahead of a backlog", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0")]);
+    await settle(mirror);
+    // The owed set is full (cap 3) of other ids, so t's overflow drop is not tracked.
+    for (const id of ["x1", "x2", "x3"]) mirror._refill.set(id, term);
+    mirror._refillAfter = Date.now() + 60000;                  // and held off
+    store.hold();
+    mirror.sink().session({ transcriptId: "other" });          // in flight, blocked
+    for (const a of ["a1", "a2", "a3", "a4"]) push("t", [ent(a, a)]);
+    assert.ok(!mirror._refill.has("t"), "t is not owed: the set was full");
+    store.release();
+    while (mirror._running) await new Promise((r) => setTimeout(r, 1));
+    assert.ok(!store.entries.get("t").has(1), "a seq hole");
+
+    // A backlog is queued; the reconcile's refill goes to the HEAD, not behind it.
+    store.hold();
+    mirror.sink().session({ transcriptId: "other" });          // in flight, blocked
+    mirror.sink().session({ transcriptId: "other" });          // queued
+    const reconciled = mirror.reconcile();
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(mirror._q[0] && mirror._q[0].t, "refill");
+    assert.equal(mirror._q[0].transcriptId, "t");
+    store.release();
+    assert.equal(await reconciled, 1);
+    mirror._refill.clear();
+    await settle(mirror);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "1:a1", "2:a2", "3:a3", "4:a4"]);
+    assert.equal(await mirror.reconcile(), 0, "converged: nothing left to re-send");
+  } finally { teardown(); }
+});
+
+test("reconcile: a refill a deposed replica dropped heals under the new leader", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0"), ent("n1", "n1"), ent("n2", "n2")]);
+    await settle(mirror);
+    store.entries.get("t").delete(1);                          // the dropped op's hole
+    mirror._refill.set("t", term);                             // owed under term 0...
+    leading = false;                                           // ...but deposed first
+    mirror._drain();
+    await settle(mirror);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "2:n2"], "the deposed replica dropped it");
+    assert.equal(await mirror.reconcile(), 0, "a follower never reconciles");
+    assert.equal(store.countCalls || 0, 0, "nor asks Postgres");
+
+    // The new leader (its own mirror, a later term) finds the hole and re-sends.
+    leading = true;
+    term++;
+    const next = new hub.IndexMirror(store, () => leading, () => term);
+    archive.setIndexSink(next.sink());
+    assert.equal(await next.reconcile(), 1);
+    await settle(next);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "1:n1", "2:n2"]);
+  } finally { teardown(); }
+});
+
+test("reconcile: a gated replace skipped after a term change heals", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0"), ent("n1", "n1"), ent("n2", "n2")]);
+    await settle(mirror);
+    store.entries.set("t", new Map([[0, "n0"]]));              // Postgres lost the tail
+    store.hold();
+    mirror.sink().session({ transcriptId: "other" });          // in flight, blocked
+    mirror.sink().replace("t", archive.mirrorRefillOf("t").entries, true);
+    term++;                                                    // lease lost and won back
+    store.release();
+    await settle(mirror);
+    assert.deepEqual(seqs(store, "t"), ["0:n0"], "the heal replace was skipped");
+    assert.equal(await mirror.reconcile(), 1);
+    await settle(mirror);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "1:n1", "2:n2"]);
+  } finally { teardown(); }
+});
+
+test("reconcile: never trims rows past a local copy that is behind, nor races a queued op", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0"), ent("n1", "n1")]);
+    await settle(mirror);
+    // Another leader appended past this copy (and left a hole below it): leave it be.
+    store.entries.set("t", new Map([[0, "n0"], [2, "theirs"]]));
+    assert.equal(await mirror.reconcile(), 0);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "2:theirs"]);
+    // Behind only because an append is still queued: not a heal.
+    store.entries.set("t", new Map([[0, "n0"], [1, "n1"]]));
+    store.hold();
+    mirror.sink().session({ transcriptId: "other" });          // in flight, blocked
+    push("t", [ent("a2", "a2")]);
+    const r = mirror.reconcile();
+    store.release();
+    assert.equal(await r, 0);
+    await settle(mirror);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "1:n1", "2:a2"]);
+  } finally { teardown(); }
+});
+
+test("reconcile: bounded per tick, resuming from its cursor", async () => {
+  const { store, mirror } = setup();
+  try {
+    for (const id of ["a", "b", "c"]) { off = 0; push(id, [ent(`${id}0`, `${id}0`)]); }
+    await settle(mirror);
+    for (const id of ["a", "b", "c"]) store.entries.delete(id);
+    store.countDelay = 40;
+    // One batch of two per tick: the budget runs out during the first round trip.
+    assert.equal(await mirror.reconcile({ batch: 2, budgetMs: 10 }), 2);
+    assert.equal(store.countCalls, 1);
+    assert.equal(mirror._reconcileCursor, "b");
+    await settle(mirror);
+    assert.equal(await mirror.reconcile({ batch: 2, budgetMs: 10 }), 1, "the next tick resumes at c");
+    await settle(mirror);
+    for (const id of ["a", "b", "c"]) assert.deepEqual(seqs(store, id), [`0:${id}0`]);
+    // The end of the pass wraps to the start.
+    store.entries.delete("a");
+    assert.equal(await mirror.reconcile({ batch: 2, budgetMs: 10 }), 1);
+  } finally { teardown(); }
+});
+
+test("reconcile: inert with HA off (sqlite index, no mirror, no timer)", async () => {
+  archive.closeDb();
+  archive.setIndexMode(null);
+  const store = slowStore();
+  const mirror = new hub.IndexMirror(store, () => true, () => 0);
+  try {
+    assert.deepEqual(archive.reconcileCandidates("", 10), []);
+    assert.equal(await mirror.reconcile(), 0);
+    assert.equal(store.countCalls || 0, 0);
+    hub.setIndexMirror(store, false);
+    assert.equal(hub.getIndexMirror(), null);
+  } finally { archive.closeDb(); }
+});
+
+test("reconcile: a seq hole heals even while the transcript still has writes queued", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0"), ent("n1", "n1"), ent("n2", "n2")]);
+    await settle(mirror);
+    store.entries.get("t").delete(1);                          // a dropped append's hole
+    store.hold();
+    mirror.sink().session({ transcriptId: "other" });          // in flight, blocked
+    push("t", [ent("a3", "a3")]);                              // sustained traffic on t
+    const r = mirror.reconcile();
+    await new Promise((res) => setTimeout(res, 5));
+    store.release();
+    assert.equal(await r, 1, "a hole is never just in flight");
+    await settle(mirror);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "1:n1", "2:n2", "3:a3"]);
   } finally { teardown(); }
 });

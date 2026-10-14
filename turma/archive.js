@@ -3093,6 +3093,32 @@ async function reseatIndexFromFiles(rows) {
   return queued;
 }
 
+// The local side of the leader's periodic index reconcile (server.js
+// `IndexMirror.reconcile`, XERK-1701): up to `limit` filed transcripts whose id sorts
+// after `afterId`, with the msgCount this replica's index holds — a resumable cursor
+// over the in-memory session map, no file read. A transcript the duplicate repair
+// still owes (`dedupPendingIds`) or whose rendered download is blocked is left out:
+// the repair owns the first, and the second is not the of-record copy. pg mode only.
+function reconcileCandidates(afterId, limit) {
+  if (!isPgMode() || !sessionsMap) return [];
+  const after = typeof afterId === "string" ? afterId : "";
+  const ids = [];
+  for (const [id, row] of sessionsMap) {
+    if (id > after && row && row.filePath && !dedupPendingIds.has(id)) ids.push(id);
+  }
+  ids.sort();
+  const out = [];
+  for (const id of ids) {
+    if (out.length >= limit) break;
+    const row = sessionsMap.get(id);
+    if (renderedGate) {
+      try { if (renderedGate(filePaths(row.filePath).jsonl)) continue; } catch { continue; }
+    }
+    out.push({ transcriptId: id, msgCount: row.msgCount || 0 });
+  }
+  return out;
+}
+
 // ---- the dsh Trajectory (XERK-498) ------------------------------------------
 // A read-only Trajectory over a dsh session's D3 NATIVE event log — the
 // canonical record the raw layer already keeps at `<id>/dsh/*.jsonl` (XERK-469),
@@ -3763,7 +3789,7 @@ module.exports = {
   // is the sessions-only hydration applier.
   setIndexMode, isPgMode, sessionLoader, backfillPgIndexFromFiles, reindexHeld,
   // The one-time repair of files duplicated before XERK-1364 (XERK-1450).
-  dedupArchive, dedupLines, reseatIndexFromFiles,
+  dedupArchive, dedupLines, reseatIndexFromFiles, reconcileCandidates,
   ingestChunk, manifestCursors, inventoryCursors, rawCursorsForIds,
   archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).

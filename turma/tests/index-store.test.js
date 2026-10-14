@@ -1511,6 +1511,31 @@ test("PgIndexStore.inconsistentTranscripts: one aggregate, rows mapped", async (
   assert.deepEqual(out, [{ transcriptId: "t1", msgCount: 9, n: 6, u: 3 }]);
 });
 
+test("PgIndexStore.transcriptCounts: bound ids, row count + entry count + max seq per id", async () => {
+  const calls = [];
+  const pool = {
+    async query(text, params) {
+      calls.push({ text, params });
+      if (/_sessions WHERE transcript_id IN/.test(text)) return [{ transcript_id: "t1", msg_count: "5" }];
+      if (/GROUP BY transcript_id/.test(text)) return [{ transcript_id: "t1", n: "4", mx: "4" }];
+      return [];
+    },
+    async execute() { return { rows: [], rowCount: 1 }; },
+  };
+  const store = new PgIndexStore(pool, { prefix: DEFAULT_PREFIX });
+  assert.equal((await store.transcriptCounts([])).size, 0);
+  await store.ensureSchema();
+  calls.length = 0;
+  const out = await store.transcriptCounts(["t1", "t'2"]);
+  assert.equal(calls.length, 2);
+  for (const c of calls) {
+    assert.match(c.text, /transcript_id IN \(\$1, \$2\)/);
+    assert.deepEqual(c.params, ["t1", "t'2"], "ids are bound, never spliced");
+  }
+  assert.deepEqual(out.get("t1"), { msgCount: 5, n: 4, maxSeq: 4 });
+  assert.deepEqual(out.get("t'2"), { msgCount: null, n: 0, maxSeq: -1 });
+});
+
 test("XERK-1450: the re-seat skips a pending or rendered-blocked file and catches a distinct-count mismatch alone", async () => {
   const mem = pgSetup();
   try {

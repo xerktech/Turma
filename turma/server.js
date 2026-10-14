@@ -5125,6 +5125,14 @@ let indexMirror = null;
 // A dropped "remove", or duplicate "repair" (its sidecar stays pending), is not.
 const INDEX_MIRROR_QUEUE_MAX = positiveEnv("INDEX_MIRROR_QUEUE_MAX", 100000);
 const INDEX_MIRROR_REFILL_RETRY_MS = positiveEnv("INDEX_MIRROR_REFILL_RETRY_MS", 30000);
+// The leader's periodic reconcile (XERK-1701): every INDEX_RECONCILE_INTERVAL_MS it
+// compares Postgres's per-transcript counts against this replica's index, a batch of
+// INDEX_RECONCILE_BATCH ids per Postgres round trip, for at most INDEX_RECONCILE_BUDGET_MS
+// per tick, resuming where the last tick stopped. It heals what the owed set cannot:
+// a drop past its cap, a refill a deposition forgot, a gated replace that was skipped.
+const INDEX_RECONCILE_INTERVAL_MS = positiveEnv("INDEX_RECONCILE_INTERVAL_MS", 5 * 60 * 1000);
+const INDEX_RECONCILE_BATCH = positiveEnv("INDEX_RECONCILE_BATCH", 500);
+const INDEX_RECONCILE_BUDGET_MS = positiveEnv("INDEX_RECONCILE_BUDGET_MS", 2000);
 // A Postgres error no retry can fix — bad data (class 22), a constraint (23), a
 // statement it refuses (42). A refill failing this way is given up, not retried forever.
 function indexMirrorPermanent(e) {
@@ -5150,6 +5158,10 @@ class IndexMirror {
     this._refill = new Map();
     this._refillAfter = 0;
     this._refillTimer = null;
+    this._inflight = null;
+    // The reconcile's resumable cursor: the last transcript id it compared ("" = start).
+    this._reconcileCursor = "";
+    this._reconciling = null;
   }
   // Owe a dropped op's transcript a refill. Bounded like the queue: past the cap the
   // id is not tracked, and that transcript waits for its next replace. A failed refill
@@ -5213,6 +5225,7 @@ class IndexMirror {
           this._refill.delete(id);
           op = { t: "refill", transcriptId: id, term };
         }
+        this._inflight = op;
         try { await this._apply(op); }
         catch (e) {
           op._tries = (op._tries || 0) + 1;
@@ -5229,8 +5242,10 @@ class IndexMirror {
             if (op.t !== "refill") this._lost(op);
           }
         }
+        this._inflight = null;
       }
     } finally {
+      this._inflight = null;
       this._running = false;
       this._armRefillRetry();
     }
@@ -5289,6 +5304,84 @@ class IndexMirror {
       if (op.done) { try { op.done(); } catch (e) { console.error(`archive index mirror: repair ack failed (${e && e.message})`); } }
     }
   }
+  // Ids with a write still queued or applying: Postgres may lag the local index for
+  // them only because the op has not landed yet.
+  // Map id -> "refill" when a refill for it is among them, else "op".
+  _pendingIds() {
+    const ids = new Map();
+    const add = (op) => {
+      if (!op) return;
+      const id = op.t === "session" ? op.row && op.row.transcriptId : op.transcriptId;
+      if (id && ids.get(id) !== "refill") ids.set(id, op.t === "refill" ? "refill" : "op");
+    };
+    for (const op of this._q) add(op);
+    add(this._inflight);
+    return ids;
+  }
+  // The periodic leader-only reconcile (XERK-1701). Compares, a batch at a time, what
+  // Postgres holds for each local transcript against this replica's index, and puts a
+  // refill at the queue HEAD for each one Postgres is missing rows of — at the head so
+  // a sustained backlog cannot starve it (a refill reads the file when applied; ops
+  // behind it for the same transcript re-write rows it already sent). Healed:
+  //   - a seq gap (n < maxSeq + 1), which only a dropped op leaves;
+  //   - fewer entry rows, or a lower or missing row count, than the local msgCount —
+  //     only when no op for it is still queued (else it is just in flight).
+  // Never when the local copy is BEHIND Postgres (maxSeq >= local msgCount): another
+  // leader appended past it, and a replace from it would trim those rows. Runs only
+  // while leading under ONE term, re-checked after every Postgres round trip; each
+  // refill carries that term, so the drain drops it once deposed. Single-flight.
+  // Returns how many refills it queued.
+  reconcile(opts) {
+    if (!this._reconciling) {
+      this._reconciling = this._reconcileOnce(opts || {}).finally(() => { this._reconciling = null; });
+    }
+    return this._reconciling;
+  }
+  async _reconcileOnce({ batch = INDEX_RECONCILE_BATCH, budgetMs = INDEX_RECONCILE_BUDGET_MS }) {
+    if (!this.store || typeof this.store.transcriptCounts !== "function" || !archive.isPgMode()) return 0;
+    if (archive.isHydrating()) return 0;
+    const term = this.term();
+    const current = () => this.isLeader() && this.term() === term;
+    if (!current()) return 0;
+    const started = Date.now();
+    let queued = 0;
+    let compared = 0;
+    while (Date.now() - started < budgetMs) {
+      const rows = archive.reconcileCandidates(this._reconcileCursor, batch);
+      if (!rows.length) {
+        // End of the pass: the next one starts over. Straight away only when this
+        // tick has compared nothing yet, so no tick compares a transcript twice.
+        const restart = !compared && this._reconcileCursor;
+        this._reconcileCursor = "";
+        if (restart) continue;
+        break;
+      }
+      compared += rows.length;
+      const pg = await this.store.transcriptCounts(rows.map((r) => r.transcriptId));
+      if (!current() || archive.isHydrating()) break;
+      const pending = this._pendingIds();
+      for (const r of rows) {
+        this._reconcileCursor = r.transcriptId;
+        const local = r.msgCount;
+        const p = pg.get(r.transcriptId);
+        if (!p || local <= 0 || p.maxSeq >= local) continue;
+        if (pending.get(r.transcriptId) === "refill") continue; // already on its way
+        const gap = p.n < p.maxSeq + 1;
+        const behind = !pending.has(r.transcriptId) &&
+          (p.n < local || p.msgCount == null || p.msgCount < local);
+        if (!gap && !behind) continue;
+        this._refill.delete(r.transcriptId);
+        this._q.unshift({ t: "refill", transcriptId: r.transcriptId, term });
+        queued++;
+      }
+      if (queued) this._drain();
+    }
+    if (queued) {
+      console.error(`archive index mirror: reconcile re-sent ${queued} transcript(s) Postgres ` +
+        `was missing entries of (XERK-1701)`);
+    }
+    return queued;
+  }
   // Nothing queued and nothing applying.
   idle() { return !this._running && this._q.length === 0; }
   // The sink archive.js calls — each method SYNC (enqueue only), never awaited by the
@@ -5308,13 +5401,23 @@ class IndexMirror {
     };
   }
 }
+let indexReconcileTimer = null;
 function setIndexMirror(store, ha) {
+  if (indexReconcileTimer) { clearInterval(indexReconcileTimer); indexReconcileTimer = null; }
   if (!ha || !store) {
     indexMirror = null; archive.setIndexSink(null); archive.setIndexMode(null);
     return;
   }
   indexMirror = new IndexMirror(store, () => isLeader(), () => leaderTerm);
   archive.setIndexSink(indexMirror.sink());
+  // The periodic reconcile (XERK-1701): HA only, off every hot path (an unref'd timer),
+  // a no-op on a follower or mid-hydrate.
+  const mirror = indexMirror;
+  indexReconcileTimer = setInterval(() => {
+    mirror.reconcile().catch((e) =>
+      console.error(`archive index mirror: reconcile failed: ${e && e.message}`));
+  }, INDEX_RECONCILE_INTERVAL_MS);
+  indexReconcileTimer.unref?.();
   // XERK-793: retire the per-replica local node:sqlite index. The index becomes the
   // in-memory session-row map (beat-safe, hydrated from Postgres) + Postgres-direct
   // full-text search over `store`; there is no local entries_fts to corrupt.

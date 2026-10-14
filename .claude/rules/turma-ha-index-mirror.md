@@ -4,6 +4,7 @@ paths:
   - turma/archive.js
   - turma/tests/index-mirror-refill.test.js
   - turma/tests/index-mirror-order.test.js
+  - turma/index-store.js
 ---
 
 # The archive index mirror's refill (XERK-1834)
@@ -31,6 +32,26 @@ paths:
 - **An unreadable or missing file is skipped**, never replaced with empty (that would wipe the
   of-record for a copy that just isn't here).
 - **Mirrored rows and entries drop NUL** (`mirrorRow`/`mirrorEntry`): Postgres refuses it in text.
-- Known limits (rollup XERK-1701): the owed set is capped at the queue size, and a refill dropped
-  at a deposition is not re-owed.
-- Tests: `index-mirror-refill.test.js` (real `archive.ingestChunk` + a fake slow store).
+- The owed set is capped at the queue size, a refill dropped at a deposition is not re-owed, and a
+  skipped gated replace is not owed at all. The periodic reconcile below closes all three.
+
+## The periodic reconcile (XERK-1701)
+
+- `IndexMirror.reconcile` runs every `INDEX_RECONCILE_INTERVAL_MS` (5 min) from an unref'd timer
+  `setIndexMirror` starts only with HA on — HA off has no timer and `reconcileCandidates` is `[]`.
+- **Bounded per tick:** `INDEX_RECONCILE_BATCH` ids per Postgres round trip
+  (`PgIndexStore.transcriptCounts`), until `INDEX_RECONCILE_BUDGET_MS`, resuming from a cursor
+  over the sorted local ids. Single-flight; skipped mid-hydrate.
+- **Leader only, under ONE term**, re-checked after every round trip; each refill it queues carries
+  that term, so the drain drops it once this replica is deposed.
+- Compares Postgres (row msg_count, entry rows n, max seq) against the LOCAL msgCount — no file read.
+  - A seq hole (n < maxSeq + 1) is healed even with writes for it queued: only a drop leaves one.
+  - Fewer rows, or a lower or missing row count, is healed only with NOTHING queued for that id —
+    otherwise it is an append still in flight, not damage.
+  - **Never when the local copy is behind** (maxSeq >= local msgCount): another leader appended past
+    it, and the refill's replace would trim their rows.
+- **Its refill goes to the queue HEAD**, not the owed set: a refill waiting for an empty queue
+  starves under sustained overflow. Safe out of order because it reads the file when applied, and
+  ops behind it for that id re-write rows it already sent (appends are DO NOTHING).
+- Tests: `index-mirror-refill.test.js` (real `archive.ingestChunk` + a fake slow store; the
+  `reconcile: ...` cases), `index-store.test.js` (`PgIndexStore.transcriptCounts`).

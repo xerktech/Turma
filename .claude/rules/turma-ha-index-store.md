@@ -28,7 +28,8 @@ Split out of `turma-ha-archive.md` (size ceiling); read that file for the byte m
 - **The sink archive.js calls (`archive.setIndexSink`, no-op off HA) is SYNC + never throws** into
   the hot path — it enqueues; server.js's `IndexMirror` drains it to Postgres in a background loop
   (bounded `INDEX_MIRROR_QUEUE_MAX`, drop-oldest on overflow; a dropped op owes its transcript a
-  REFILL, `turma-ha-index-mirror.md`). A SESSION mutation mirrors the FULL
+  REFILL, and the leader's periodic reconcile re-sends what Postgres is missing,
+  `turma-ha-index-mirror.md`). A SESSION mutation mirrors the FULL
   row (re-read from the local index — the in-memory map in `pg` mode, the sqlite table otherwise) so
   the upsert never clobbers untouched metadata; ENTRIES mirror append-only by ordinal, or
   wholesale-replace on a reconcile (XERK-280).
