@@ -49,13 +49,26 @@ export const PENDING_TIMEOUT_MS = 60 * 1000;
 // reporting it until the agent's next beat, so without this the sheet sat on
 // screen re-asking an answered question until a later poll (up to the 6s poll
 // interval plus the beat). It is hidden at once instead: `maskAnswered` blanks
-// it on every poll for as long as the hub still reports that same question,
-// and forgets the entry once the question goes or changes, or after
-// PENDING_TIMEOUT_MS (an answer the agent dropped shows the question again).
+// it on every poll for as long as the hub still reports that same question
+// (text AND options), and forgets the entry once the question goes or changes,
+// or at `until`. The wire carries no question id, so a re-ask with identical
+// text is indistinguishable from the answered one: `until` is therefore SHORT
+// once the send lands (ANSWER_MASK_MS — the hub pokes the agent, which re-beats
+// within about a second) and only spans PENDING_TIMEOUT_MS while the POST is
+// still in flight. Past it the hub's word shows again, an identical re-ask too.
 export interface AnsweredEntry {
   hostKey: string;
   question: string;
+  options: string[];
   at: number;
+  until: number;
+  seq: number; // which answerQuestion call hid it
+}
+
+export const ANSWER_MASK_MS = 10 * 1000;
+
+function sameOptions(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
 export function maskAnswered(
@@ -66,7 +79,7 @@ export function maskAnswered(
   const keep: Record<string, AnsweredEntry> = {};
   let out = agents;
   for (const [sessionId, entry] of Object.entries(answered)) {
-    if (now - entry.at >= PENDING_TIMEOUT_MS) continue;
+    if (now >= entry.until) continue;
     const ai = out.findIndex((a) => a.key === entry.hostKey);
     const host = out[ai];
     const si = host ? host.sessions.findIndex((s) => s.id === sessionId) : -1;
@@ -75,7 +88,13 @@ export function maskAnswered(
       keep[sessionId] = entry; // missing from this beat; keep hiding it
       continue;
     }
-    if (!sess.session || sess.session.question !== entry.question) continue; // answered, or a new question
+    if (
+      !sess.session ||
+      sess.session.question !== entry.question ||
+      !sameOptions(sess.session.questionOptions ?? [], entry.options)
+    ) {
+      continue; // answered, or a new question
+    }
     keep[sessionId] = entry;
     const sessions = host.sessions.slice();
     sessions[si] = { ...sess, session: { ...sess.session, question: null, questionOptions: [] } };
@@ -333,6 +352,7 @@ export class App {
   // when paused (backgrounded). Set by nudgePoll() after a list mutation; the
   // loop self-terminates once it elapses. See pause()/schedulePoll().
   private graceUntil = 0;
+  private answerSeq = 0;
 
   constructor(opts: AppOptions) {
     this.client = opts.client;
@@ -688,7 +708,9 @@ export class App {
         const existing = transcripts[ref.session.id] ?? emptyBuffer();
         transcripts[ref.session.id] = mergeTail(existing, tail);
       }
-      const pending = this.reconcilePending(this.state.pending, agentsNow, sessionRefs, now);
+      // Pending converges on the hub's own word, never the mask: an answer is
+      // not applied until the hub stops reporting the question.
+      const pending = this.reconcilePending(this.state.pending, res.agents, flattenSessions(res.agents), now);
       const wasErroring = this.state.pollErrorActive;
       // Snapshot the current session's pending-question view *before* the
       // new agents array lands — used below to detect a question that just
@@ -1243,10 +1265,11 @@ export class App {
         const sess = this.state.session;
         const draft = sess && sess.hostKey === hostKey && sess.sessionId === sessionId ? sess.draft : "";
         const s = findSession(this.state, hostKey, sessionId);
+        const answering = !!s?.session?.question;
         this.markPending(sessionId, s);
         void this.submitText(hostKey, sessionId, draft)
           .then(() => {
-            this.flash(FLASH_QUEUED);
+            this.flash(answering ? FLASH_ANSWERED : FLASH_QUEUED);
             this.repaint();
           })
           .catch((err: unknown) => {
@@ -1415,9 +1438,13 @@ export class App {
     sessionId: string,
     answer: { optionIndex?: number; custom?: string }
   ): Promise<QueuedResponse> {
-    const question = findSession(this.state, hostKey, sessionId)?.session?.question;
+    const live = findSession(this.state, hostKey, sessionId)?.session;
+    const question = live?.question;
+    const at = this.now();
+    const seq = ++this.answerSeq;
     if (question) {
-      const answered = { ...this.state.answered, [sessionId]: { hostKey, question, at: this.now() } };
+      const entry = { hostKey, question, options: live?.questionOptions ?? [], at, until: at + PENDING_TIMEOUT_MS, seq };
+      const answered = { ...this.state.answered, [sessionId]: entry };
       const masked = maskAnswered(this.state.agents, answered, this.now());
       this.state = {
         ...this.state,
@@ -1429,11 +1456,20 @@ export class App {
     }
     return this.client.answerQuestion(hostKey, sessionId, answer).then(
       (res) => {
+        const mine = this.state.answered[sessionId];
+        if (mine && mine.seq === seq) {
+          this.state = {
+            ...this.state,
+            answered: { ...this.state.answered, [sessionId]: { ...mine, until: this.now() + ANSWER_MASK_MS } },
+          };
+        }
         this.nudgePoll();
         return res;
       },
       (err: unknown) => {
-        if (this.state.answered[sessionId]) {
+        // Only un-hide what THIS call hid — a second, failed answer must not
+        // bring back a question the first one already got through on.
+        if (this.state.answered[sessionId]?.seq === seq) {
           const { [sessionId]: _dropped, ...rest } = this.state.answered;
           this.state = { ...this.state, answered: rest };
           this.nudgePoll(); // re-read the question that is still waiting
@@ -1447,10 +1483,11 @@ export class App {
     if (r.target.kind === "session") {
       const { hostKey, sessionId } = r.target;
       const s = findSession(this.state, hostKey, sessionId);
+      const answering = !!s?.session?.question;
       this.markPending(sessionId, s);
       void this.submitText(hostKey, sessionId, r.text)
         .then(() => {
-          this.flash(FLASH_QUEUED);
+          this.flash(answering ? FLASH_ANSWERED : FLASH_QUEUED);
           this.repaint();
         })
         .catch((err: unknown) => {

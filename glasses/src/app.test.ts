@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { App, FLASH_ANSWERED, FLASH_HUB_UNREACHABLE, FLASH_QUEUED, HEARD_NOTHING, PENDING_TIMEOUT_MS, newSessionState } from "./app.ts";
+import { ANSWER_MASK_MS, App, FLASH_ANSWERED, FLASH_HUB_UNREACHABLE, FLASH_QUEUED, HEARD_NOTHING, newSessionState } from "./app.ts";
 import type { HubClient } from "./hub-client.ts";
 import type { GlassesDisplay } from "./display/index.ts";
 import type { Dictation, DictationResult } from "./dictation.ts";
@@ -545,7 +545,7 @@ describe("App", () => {
     expect(bottomMode()).toBe("sheet");
   });
 
-  it("sheet mode: an answer the agent never applies shows the question again after the pending timeout", async () => {
+  it("sheet mode: a question the hub keeps reporting comes back shortly after the send lands (an identical re-ask, or an answer the agent dropped)", async () => {
     const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
     const app = makeApp(client);
     await toSheet(app);
@@ -553,8 +553,57 @@ describe("App", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(bottomMode()).toBe("input");
 
-    await vi.advanceTimersByTimeAsync(PENDING_TIMEOUT_MS + 6000);
+    // No question id on the wire: past the short mask the hub's word wins,
+    // within one poll interval of it.
+    await vi.advanceTimersByTimeAsync(ANSWER_MASK_MS + 6000);
     expect(bottomMode()).toBe("sheet");
+  });
+
+  it("sheet mode: the same text with different options is a new question and shows at once", async () => {
+    let agents = [questionAgent()];
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents })) });
+    const app = makeApp(client);
+    await toSheet(app);
+    display.emit({ type: "tap" });
+    await vi.advanceTimersByTimeAsync(0);
+
+    agents = [questionAgentWith("pick", ["C", "D"])];
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(bottomMode()).toBe("sheet");
+  });
+
+  it("sheet mode: the session stays pending until the hub itself stops reporting the question", async () => {
+    let agents = [questionAgent()];
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents })) });
+    const app = makeApp(client);
+    await toSheet(app);
+    display.emit({ type: "tap" });
+    await vi.advanceTimersByTimeAsync(0); // send lands + nudged poll (hub still reports it)
+    expect(app.getState().pending["s1"]).toBeDefined();
+
+    agents = [agent({ sessions: [session({ session: signals({ transcriptAgeSec: 1 }) })] })];
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(app.getState().pending["s1"]).toBeUndefined();
+  });
+
+  it("a second answer that fails does not bring back a question the first answer got through on", async () => {
+    const answerQuestion = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, cmdId: "a1" })
+      .mockRejectedValueOnce(Object.assign(new Error("busy"), { status: 503 }));
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })),
+      answerQuestion,
+    });
+    const app = makeApp(client);
+    await toSheet(app);
+    const first = app.answerQuestion("host-a", "s1", { optionIndex: 0 });
+    const second = app.answerQuestion("host-a", "s1", { optionIndex: 1 }).catch(() => {});
+    await first;
+    await second;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bottomMode()).toBe("input");
+    expect(app.getState().answered["s1"]).toBeDefined();
   });
 
   it("sheet mode: tap on option index 0 sends optionIndex 0", async () => {
@@ -636,6 +685,9 @@ describe("App", () => {
       custom: "yes deploy",
     });
     expect(app.getState().screen).toBe("session");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.getState().flash).toBe(FLASH_ANSWERED);
+    expect(bottomMode()).toBe("input"); // the answered sheet does not flash back
   });
 
   it("a question arriving via poll while the box mic is recording (plain input mode) cancels the mic so it can't outlive the switch to the sheet", async () => {

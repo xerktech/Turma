@@ -216,6 +216,32 @@ describe("phone controller", () => {
     expect(client.answerQuestion).toHaveBeenCalledWith("host-a", "s1", { optionIndex: 1 });
   });
 
+  it("a compose-box reply to a pending question answers it through App.answerQuestion", () => {
+    state = { ...sessionState("s1", "host-a"),
+      agents: [agent({ key: "host-a", sessions: [session({ id: "s1", session: signals({ question: "Go?", questionOptions: ["Yes", "No"] }) })] })] };
+    handle.render(state);
+    handle.enterFromGlasses("host-a", "s1");
+    root.querySelector<HTMLTextAreaElement>("#ph-input")!.value = "only staging";
+    root.querySelector<HTMLElement>("[data-send]")!.click();
+    expect(app.answerQuestion).toHaveBeenCalledWith("host-a", "s1", { optionIndex: -1, custom: "only staging" });
+    expect(client.sendInput).not.toHaveBeenCalled();
+  });
+
+  it("a refused option click says so on the phone instead of failing silently", async () => {
+    client.answerQuestion = vi.fn(async () => {
+      throw Object.assign(new Error("host is offline"), { name: "HttpError", status: 503 });
+    });
+    state = { ...sessionState("s1", "host-a"),
+      agents: [agent({ key: "host-a", sessions: [session({ id: "s1", session: signals({ question: "Go?", questionOptions: ["Yes", "No"] }) })] })] };
+    handle.render(state);
+    handle.enterFromGlasses("host-a", "s1");
+    root.querySelectorAll<HTMLElement>("[data-answer]")[0]!.click();
+    await Promise.resolve(); await Promise.resolve();
+    const err = root.querySelector<HTMLElement>("#ph-senderr")!;
+    expect(err.hidden).toBe(false);
+    expect(err.textContent).toContain("host is offline");
+  });
+
   it("enterFromGlasses pulls the phone into the session the glasses entered", () => {
     // Simulate the App entering a session by a glasses gesture: onState pushes the
     // new state, then onEnterSession fires.

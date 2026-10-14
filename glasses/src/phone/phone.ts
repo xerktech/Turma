@@ -423,7 +423,7 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
     const org = t.closest<HTMLElement>("[data-org]");
     if (org) { app.setOrgFilter(org.dataset.org || ""); orgOpen = false; paint(); return; }
     const answer = t.closest<HTMLElement>("[data-answer]");
-    if (answer) { const f = focused(); if (f) void app.answerQuestion(f.host, f.id, { optionIndex: Number(answer.dataset.answer) }).catch(() => {}); return; }
+    if (answer) { const f = focused(); if (f) { clearSendError(); void app.answerQuestion(f.host, f.id, { optionIndex: Number(answer.dataset.answer) }).catch((err: unknown) => sendFailed("", err)); } return; }
     if (t.closest("[data-send]")) { send(); return; }
     if (t.closest("[data-signout]")) { onSignOut?.(); return; }
 
