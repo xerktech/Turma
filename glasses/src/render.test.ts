@@ -670,6 +670,7 @@ describe("render: actions", () => {
     const box = asSession(render(state)).bottom.lines;
     expect(box).toContain("> Back");
     expect(box).toContain("  Start");
+    expect(box[box.length - 1]).toContain("Home");
     expect(box.some((l) => l.includes("Delete"))).toBe(false);
     expect(box.some((l) => l.includes("Kill"))).toBe(false);
     expect(box.some((l) => l.includes("End this session"))).toBe(false);

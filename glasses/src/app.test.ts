@@ -516,6 +516,20 @@ describe("App", () => {
     expect(app.getState().screen).toBe("actions");
   });
 
+  it("sheet mode: the Options menu's last row, Home, leaves for home with the question still pending (XERK-1914)", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await toSheet(app);
+
+    display.emit({ type: "doubleTap" }); // -> actions
+    for (let i = 0; i < 10; i++) display.emit({ type: "scrollDown" }); // clamps on the last row
+    display.emit({ type: "tap" });
+
+    expect(app.getState().screen).toBe("home");
+    expect(client.answerQuestion).not.toHaveBeenCalled();
+    expect(client.sessionAction).not.toHaveBeenCalled();
+  });
+
   it("sheet mode: tap on the trailing 'Dictate answer…' row starts box dictation and hands the box to input mode; the dictated draft then sends as a free-text answer while the question is pending", async () => {
     const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
     const app = makeApp(client);
@@ -974,6 +988,25 @@ describe("App", () => {
     expect(app.getState().loadingHistory["s1"]).toBe(false);
     expect(app.getState().transcripts["s1"]?.entries.map((e) => e.id)).toEqual(["older-1"]);
     expect(display.lines.some((l) => l.includes("earlier msg"))).toBe(true);
+  });
+
+  it("a stopped session's Options menu also ends with Home, which leaves without starting it (XERK-1914)", async () => {
+    const stopped = agent({ sessions: [session({ status: "stopped", session: null })] });
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [stopped] })) });
+    const app = makeApp(client);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    display.emit({ type: "tap" }); // session
+    display.emit({ type: "tap" }); // focus:"bottom"
+    display.emit({ type: "doubleTap" }); // -> actions: Back / Start / Home
+    expect(app.getState().screen).toBe("actions");
+    display.emit({ type: "scrollDown" });
+    display.emit({ type: "scrollDown" }); // Home
+    display.emit({ type: "tap" });
+
+    expect(app.getState().screen).toBe("home");
+    expect(client.sessionAction).not.toHaveBeenCalled();
   });
 
   it("pending overlay clears once a poll shows the session's status changed", async () => {
