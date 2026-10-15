@@ -40,8 +40,9 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
   records usage and `_resume_at_cwd(worktree_ready=True)`. Never put the git back on the beat —
   worktree add/remove/apply are disk-bound and blew the 75s budget.
   - **While an import is in flight its cwd is held** (`_import_holds`): `start`, `resume`,
-    `_resume_at_cwd`, a second import and delete all refuse that path — the thread may be removing
-    an old copy there (QA: a resume launched into a worktree the thread then deleted).
+    `_resume_at_cwd`, a second import and a sleeper job refuse that path, and `delete` drops the
+    record but KEEPS the tree (also when another record shares the path) — the thread may be
+    removing an old copy there (QA: a resume launched into a worktree the thread then deleted).
   - A dir at the cwd with no `.git` of its own is kept aside UNTOUCHED: git there walks up to an
     enclosing repo (a REPOS_ROOT that is a repo) and detached it (QA).
   - Branch: checked out only when absent here (created) or behind (fast-forwarded), else DETACHED.

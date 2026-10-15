@@ -1233,8 +1233,10 @@ USAGE_EVERY = 15
 _GIT_OID_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 # A Git LFS pointer's first line, as bytes in a patch and as a `git log -G`
 # regex over a commit range.
+# An LFS pointer's header as a whole diff line — added, removed or context — so
+# an edited LFS file (whose pointer is context) is caught, a prose mention is not.
 _LFS_POINTER_ADDED_RE = re.compile(
-    rb"^\+version https://git-lfs\.github\.com/spec/v1$", re.M)
+    rb"^[ +-]version https://git-lfs\.github\.com/spec/v1\r?$", re.M)
 _LFS_POINTER_RE_GIT = r"^version https://git-lfs\.github\.com/spec/v1"
 # Header lines a patch from `_worktree_snapshot` never has (renames are off), and
 # that a hostile one could use: `copy from <abs path>` makes `git apply` read any
@@ -30465,6 +30467,10 @@ class SessionManager:
         if not is_root and self._import_holds(norm):
             refuse(f"another migration is already rebuilding {norm}")
             return
+        if not is_root and self._sleeper_job_blocks(cwd=norm):
+            refuse(f"a paused session's worktree at {norm} is still being torn "
+                   f"down or restored; try again in a moment")
+            return
         # Cheap refusals before spending a download.
         if self._slots_used() >= MAX_SESSIONS:
             refuse(f"the host is at MAX_SESSIONS ({MAX_SESSIONS})")
@@ -31603,8 +31609,20 @@ class SessionManager:
         self._kill_tmux(sess)
         self._kill_ttyd(sid)
         # Root has no worktree to remove — REPOS_ROOT and its repos stay put;
-        # delete just tears down the processes and drops the record.
-        if not sess.get("root") and os.path.isdir(sess["worktreePath"]):
+        # delete just tears down the processes and drops the record. Nor is a
+        # worktree removed that something ELSE now owns: another record at the
+        # same path (a migration landed beside a stale error card), or a
+        # migration import rebuilding it right now — the record goes, the tree
+        # stays.
+        wt = sess.get("worktreePath")
+        shared = (isinstance(wt, str) and wt and (self._import_holds(wt) or any(
+            s is not sess and isinstance(s.get("worktreePath"), str)
+            and os.path.normpath(s["worktreePath"]) == os.path.normpath(wt)
+            for s in self.registry)))
+        if shared:
+            log(f"delete {sid}: keeping {wt}, which another session or a "
+                f"migration is using")
+        elif not sess.get("root") and os.path.isdir(sess["worktreePath"]):
             try:
                 gi = git_info_cheap(sess["worktreePath"], strict=True)
             except GitTimeout:

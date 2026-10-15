@@ -12005,6 +12005,43 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         [aside] = glob.glob(sess["worktreePath"] + ".pre-migration-*")
         self.assertEqual(self.read(aside, "leftover.txt"), "half-removed\n")
 
+    def test_an_edited_lfs_file_is_refused(self):
+        # An edit to an LFS-tracked file diffs its pointer with the header as a
+        # CONTEXT line; the content object would stay behind on this host.
+        ptr = ("version https://git-lfs.github.com/spec/v1\n"
+               "oid sha256:" + "a" * 64 + "\nsize 3\n")
+        self.write(self.src_repo, "art.psd", ptr)
+        self.git("-C", self.src_repo, "add", "art.psd")
+        self.git("-C", self.src_repo, "commit", "-qm", "lfs")
+        self.git("-C", self.src_repo, "push", "-q", "origin", "HEAD:refs/heads/lfsb")
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "src-lfs")
+        self.git("-C", self.src_repo, "worktree", "add", "-q", "-b", "lfsw", wt,
+                 "origin/lfsb")
+        self.write(wt, "art.psd", ptr.replace("a" * 64, "b" * 64))
+        with self.assertRaisesRegex(RuntimeError, "Git LFS"):
+            self.make_manager()._capture_worktree_state(wt)
+
+    def test_delete_keeps_a_worktree_an_import_or_another_record_uses(self):
+        sm = self.make_manager()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "shared")
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "--detach", cwd,
+                 "origin/main")
+        stale = {"id": "s1", "repo": "Turma", "repoPath": self.dst_repo,
+                 "worktreePath": cwd, "status": "error", "tmuxName": "agent-s1"}
+        sm.registry = [stale]
+        with sm._imports_lock:
+            sm._imports_inflight["mig1"] = os.path.normpath(cwd)
+        sm.delete("s1")
+        self.assertTrue(os.path.isdir(cwd))
+        with sm._imports_lock:
+            sm._imports_inflight.clear()
+        live = {"id": "s2", "repo": "Turma", "repoPath": self.dst_repo,
+                "worktreePath": cwd, "status": "running", "tmuxName": "agent-s2"}
+        sm.registry = [dict(stale), live]
+        sm.delete("s1")
+        self.assertTrue(os.path.isdir(cwd))
+        self.assertEqual([s["id"] for s in sm.registry], ["s2"])
+
     def test_a_mention_of_the_lfs_spec_is_not_lfs_content(self):
         wt = self.src_worktree()
         self.write(wt, "docs/lfs.md",
