@@ -17,6 +17,9 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.text.TextLayoutResult
@@ -74,6 +77,8 @@ class ChatWindowFitTest {
     private fun open(
         widthDp: Int, heightDp: Int, fontScale: Float = 1f,
         sessionBlock: String = "{}", tunnelOnline: Boolean = true,
+        // The two-pane layout: MainScaffold has already consumed the status bar.
+        statusConsumed: Boolean = false,
     ) {
         hub.json("/api/agents/$host/sessions/$session/history", """{"entries":[],"truncated":false,"pending":false}""")
         hub.json("/api/ws-token", """{"token":"t"}""")
@@ -86,7 +91,8 @@ class ChatWindowFitTest {
         compose.setContent {
             val d = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(d.density, fontScale)) {
-                Box(Modifier.requiredSize(widthDp.dp, heightDp.dp).testTag(root)) {
+                val consumed = if (statusConsumed) Modifier.consumeWindowInsets(WindowInsets.statusBars) else Modifier
+                Box(Modifier.requiredSize(widthDp.dp, heightDp.dp).testTag(root).then(consumed)) {
                     ChatScreen(host = host, sessionId = session, onBack = {}, onTerminal = {})
                 }
             }
@@ -161,19 +167,41 @@ class ChatWindowFitTest {
             footer.bottom <= rootB.bottom - 48.dp + 1.dp)
     }
 
-    /** Landscape phone, keyboard up: 411dp tall, keyboard 262dp (font 2.0 default). The 24dp status
-     *  inset feeds the bar-fit check; Robolectric does not pad the bar by it, so bounds omit it. */
-    private fun landscapeTyping(sessionBlock: String = "{}", fontScale: Float = 2f, imeDp: Int = 262) {
-        open(widthDp = 914, heightDp = 411, fontScale = fontScale, sessionBlock = sessionBlock)
+    /** Landscape phone, keyboard up: 411dp tall, status 24dp, keyboard 262dp (font 2.0 default). */
+    private fun landscapeTyping(
+        sessionBlock: String = "{}", fontScale: Float = 2f, imeDp: Int = 262, statusConsumed: Boolean = false,
+    ) {
+        open(widthDp = 914, heightDp = 411, fontScale = fontScale, sessionBlock = sessionBlock, statusConsumed = statusConsumed)
         insets(statusDp = 24, imeDp = imeDp)
     }
 
-    @Test fun `a landscape phone at font 2 with the keyboard up shows the whole compose box`() {
-        landscapeTyping()
+    @Test fun `a landscape phone at font 2 with the keyboard up shows the whole compose box`() =
+        wholeComposeBox(2f, imeDp = 262)
+
+    // 131dp of room: the bar's 64dp + its 24dp status strip + the box don't fit, so the bar
+    // steps aside; counted without its status strip, it stayed and covered the box.
+    @Test fun `a taller keyboard at font 1 shows the whole compose box`() =
+        wholeComposeBox(1f, imeDp = 280)
+
+    // Same room in the two-pane layout, whose scaffold consumed the status bar: the bar is
+    // 64dp there and fits beside the box, so it stays (the raw inset over-counted it away).
+    @Test fun `a two-pane chat keeps its bar while typing when bar and box fit`() {
+        landscapeTyping(fontScale = 1f, imeDp = 280, statusConsumed = true)
+        val barH = unclipped(compose.onNodeWithTag(CHAT_TOP_BAR_TAG).fetchSemanticsNode()).height
+        assertTrue("the bar stepped aside (height $barH) though it fits beside the box", barH >= 56.dp)
+        assertComposeBoxWhole(280)
+    }
+
+    private fun wholeComposeBox(fontScale: Float, imeDp: Int) {
+        landscapeTyping(fontScale = fontScale, imeDp = imeDp)
+        assertComposeBoxWhole(imeDp)
+    }
+
+    private fun assertComposeBoxWhole(imeDp: Int) {
         val rootB = compose.onNodeWithTag(root).getBoundsInRoot()
         val bar = compose.onNodeWithTag(CHAT_TOP_BAR_TAG).getBoundsInRoot()
         val box = unclipped(compose.onNode(hasSetTextAction()).fetchSemanticsNode())
-        val keyboardTop = rootB.bottom - 262.dp
+        val keyboardTop = rootB.bottom - imeDp.dp
         assertTrue("compose box top ${box.top} hidden under the top bar (bottom ${bar.bottom})", box.top >= bar.bottom - 0.5.dp)
         assertTrue("compose box bottom ${box.bottom} under the keyboard ($keyboardTop)", box.bottom <= keyboardTop + 0.5.dp)
     }
@@ -186,10 +214,10 @@ class ChatWindowFitTest {
     @Test fun `a landscape phone at font 1 with the keyboard up keeps a question reachable`() =
         questionReachable(1f)
 
-    // A taller keyboard leaves the cap next to nothing even with the bar aside (91dp of room):
+    // A taller keyboard leaves the cap next to nothing even with the bar aside (111dp of room):
     // the typing floor is what keeps the sheet there at all.
     @Test fun `a taller keyboard still leaves a question reachable`() =
-        questionReachable(1f, imeDp = 320)
+        questionReachable(1f, imeDp = 300)
 
     private fun questionReachable(fontScale: Float, imeDp: Int = 262) {
         landscapeTyping("""{ "question": "Which one?", "questionOptions": [ $options ] }""", fontScale, imeDp)

@@ -223,7 +223,15 @@ fun ChatScreen(
     }
     // The compose box's own row, measured: the one thing that must stay whole.
     var inputRowPx by remember { mutableIntStateOf(0) }
-    val statusBarTop = with(density) { TopAppBarDefaults.windowInsets.getTop(this).toDp() }
+    // The status-bar strip the bar pads itself by, MEASURED where the bar sits: the raw
+    // inset over-counts in the two-pane layout, whose scaffold has already consumed it.
+    var statusStripPx by remember { mutableIntStateOf(0) }
+    Box(
+        // Measured OUTSIDE the padding, so the size is the padding itself.
+        Modifier.onSizeChanged { statusStripPx = it.height }
+            .windowInsetsPadding(TopAppBarDefaults.windowInsets.only(WindowInsetsSides.Top)),
+    )
+    val statusBarTop = with(density) { statusStripPx.toDp() }
     val sheetUp = state.question.isNotBlank() || state.panePrompt != null
     // Typing in a short window, the top bar steps aside (until the keyboard goes) when
     // there is no room for both it and the compose box (a landscape phone at a large font
@@ -251,9 +259,9 @@ fun ChatScreen(
                 // Just the status-bar strip (the bar's own inset), measured like the bar.
                 Box(
                     Modifier.fillMaxWidth()
-                        .windowInsetsPadding(TopAppBarDefaults.windowInsets.only(WindowInsetsSides.Top))
                         .onSizeChanged { topBarPx = it.height }
-                        .testTag(CHAT_TOP_BAR_TAG),
+                        .testTag(CHAT_TOP_BAR_TAG)
+                        .windowInsetsPadding(TopAppBarDefaults.windowInsets.only(WindowInsetsSides.Top)),
                 )
             } else TopAppBar(
                 modifier = Modifier.onSizeChanged { topBarPx = it.height }.testTag(CHAT_TOP_BAR_TAG),
