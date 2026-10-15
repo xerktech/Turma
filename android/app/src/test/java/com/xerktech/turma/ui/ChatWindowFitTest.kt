@@ -3,8 +3,10 @@ package com.xerktech.turma.ui
 import android.view.ViewGroup
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
@@ -74,6 +76,9 @@ class ChatWindowFitTest {
     private val root = "root"
     private val options = (1..6).joinToString(",") { "\"Option number $it\"" }
 
+    // Lets a test take the chat out of composition and bring it back (its VM is kept).
+    private val chatShown = mutableStateOf(true)
+
     private fun open(
         widthDp: Int, heightDp: Int, fontScale: Float = 1f,
         sessionBlock: String = "{}", tunnelOnline: Boolean = true,
@@ -93,7 +98,10 @@ class ChatWindowFitTest {
             CompositionLocalProvider(LocalDensity provides Density(d.density, fontScale)) {
                 val consumed = if (statusConsumed) Modifier.consumeWindowInsets(WindowInsets.statusBars) else Modifier
                 Box(Modifier.requiredSize(widthDp.dp, heightDp.dp).testTag(root).then(consumed)) {
-                    ChatScreen(host = host, sessionId = session, onBack = {}, onTerminal = {})
+                    // The app's scaffold reads the insets too, keeping them current while the chat
+                    // itself is out of composition; this stands in for it.
+                    Box(Modifier.imePadding())
+                    if (chatShown.value) ChatScreen(host = host, sessionId = session, onBack = {}, onTerminal = {})
                 }
             }
         }
@@ -288,6 +296,76 @@ class ChatWindowFitTest {
     @Test fun `a two-pane chat with its tunnel up keeps only the title above a pending question`() =
         twoPaneSheet("""{ "question": "Which one?", "questionOptions": [ $options ] }""", "Option number 1",
             tunnelOnline = true)
+
+    /** A node's unclipped extent must lie between the bar's bottom and the compose box's top. */
+    private fun assertOpenAndWhole(text: String) {
+        val bar = unclipped(compose.onNodeWithTag(CHAT_TOP_BAR_TAG).fetchSemanticsNode())
+        val box = unclipped(compose.onNode(hasSetTextAction()).fetchSemanticsNode())
+        val t = unclipped(compose.onNodeWithText(text, useUnmergedTree = true).fetchSemanticsNode())
+        assertTrue("\"$text\" top ${t.top} hidden under the bar (bottom ${bar.bottom})", t.top >= bar.bottom - 0.5.dp)
+        assertTrue("\"$text\" bottom ${t.bottom} under the compose box (top ${box.top})", t.bottom <= box.top + 0.5.dp)
+    }
+
+    /**
+     * A pending sheet's question / prompt shows on OPEN, keyboard down, unclipped and without
+     * any scrolling, in every short window: a sheet floor as tall as the whole footer overflowed
+     * it by the compose row, and the overflow hid the question under the bar (rollup XERK-1701).
+     * Two-pane: 600x283dp, status consumed by the scaffold. Single-pane: a short 686x308dp phone.
+     */
+    private fun sheetOnOpen(fontScale: Float, twoPane: Boolean, permissionPrompt: Boolean) {
+        val block = if (permissionPrompt) permission else """{ "question": "Which one?", "questionOptions": [ $options ] }"""
+        if (twoPane) {
+            open(widthDp = 600, heightDp = 283, fontScale = fontScale, sessionBlock = block,
+                tunnelOnline = false, statusConsumed = true)
+        } else {
+            open(widthDp = 686, heightDp = 308, fontScale = fontScale, sessionBlock = block, tunnelOnline = false)
+            insets(statusDp = 24, navDp = 0)
+        }
+        assertOpenAndWhole(if (permissionPrompt) "Do you want to proceed?" else "Which one?")
+    }
+
+    @Test fun `a question shows on open in a two-pane chat at font 1`() = sheetOnOpen(1f, twoPane = true, permissionPrompt = false)
+    @Test fun `a question shows on open in a two-pane chat at font 1_3`() = sheetOnOpen(1.3f, twoPane = true, permissionPrompt = false)
+    @Test fun `a question shows on open in a two-pane chat at font 2`() = sheetOnOpen(2f, twoPane = true, permissionPrompt = false)
+    @Test fun `a permission prompt shows on open in a two-pane chat at font 1`() = sheetOnOpen(1f, twoPane = true, permissionPrompt = true)
+    @Test fun `a permission prompt shows on open in a two-pane chat at font 1_3`() = sheetOnOpen(1.3f, twoPane = true, permissionPrompt = true)
+    @Test fun `a permission prompt shows on open in a two-pane chat at font 2`() = sheetOnOpen(2f, twoPane = true, permissionPrompt = true)
+    @Test fun `a question shows on open in a single-pane short chat at font 1`() = sheetOnOpen(1f, twoPane = false, permissionPrompt = false)
+    @Test fun `a question shows on open in a single-pane short chat at font 1_3`() = sheetOnOpen(1.3f, twoPane = false, permissionPrompt = false)
+    @Test fun `a question shows on open in a single-pane short chat at font 2`() = sheetOnOpen(2f, twoPane = false, permissionPrompt = false)
+    @Test fun `a permission prompt shows on open in a single-pane short chat at font 1`() = sheetOnOpen(1f, twoPane = false, permissionPrompt = true)
+    @Test fun `a permission prompt shows on open in a single-pane short chat at font 1_3`() = sheetOnOpen(1.3f, twoPane = false, permissionPrompt = true)
+    @Test fun `a permission prompt shows on open in a single-pane short chat at font 2`() = sheetOnOpen(2f, twoPane = false, permissionPrompt = true)
+
+    // Typing too: the sheet sits whole above the box, its question unclipped.
+    @Test fun `a question shows unclipped while typing in a landscape phone`() {
+        landscapeTyping("""{ "question": "Which one?", "questionOptions": [ $options ] }""", fontScale = 1f)
+        assertOpenAndWhole("Which one?")
+    }
+
+    /**
+     * The chat composed FRESH with the keyboard already up and a sheet pending (back from the
+     * terminal, a rotation): its very first frame already has the bar aside. A guard keeping the
+     * bar until the compose row was measured flashed it for a frame.
+     */
+    @Test fun `a chat composed with the keyboard up and a sheet pending never flashes its bar`() {
+        landscapeTyping("""{ "question": "Which one?", "questionOptions": [ $options ] }""", fontScale = 1f)
+        compose.runOnIdle { chatShown.value = false }
+        compose.waitForIdle()
+        compose.mainClock.autoAdvance = false
+        compose.runOnIdle { chatShown.value = true }
+        // Step frame by frame to the first one in which the chat is on screen.
+        var titles = 0
+        var frames = 0
+        while (frames < 30 && compose.onAllNodes(hasSetTextAction()).fetchSemanticsNodes().isEmpty()) {
+            compose.mainClock.advanceTimeByFrame()
+            frames++
+        }
+        titles = compose.onAllNodesWithTag(CHAT_TITLE_TAG, useUnmergedTree = true).fetchSemanticsNodes().size
+        compose.mainClock.autoAdvance = true
+        assertTrue("the chat never composed", frames < 30)
+        assertEquals("the bar flashed on the chat's first frame", 0, titles)
+    }
 
     @Test fun `the tunnel-offline marker stays whole and host-repo stays readable at font 2`() {
         open(widthDp = 411, heightDp = 800, fontScale = 2f, tunnelOnline = false)

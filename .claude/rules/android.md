@@ -181,9 +181,13 @@ Mirrors the glasses pure-core/adapter-shell split:
   being typed into always stays whole — and while a sheet is pending. It returns with no keyboard.
 - A question / permission sheet pending in a short window comes first (`sheetFirst`), keyboard up
   OR down: the header keeps the title (plus the tunnel warning alone when the tunnel is down), the
-  chip row yields, and the sheet may take the footer's whole height (the footer scrolls to it).
+  chip row yields, and the sheet's floor is the room ABOVE the compose footer (`aboveBox`).
   - Never a 0-height sheet: the cap alone gave 0 in the landscape two-pane chat at font 2.0
     (283dp tall) once the tunnel marker took its own line, and while typing.
+  - Never more than `aboveBox`: a floor of the whole footer overflowed it by the compose row, and
+    (pinned to the bottom) hid the question's first lines under the bar on open.
+  - Tests must read UNCLIPPED bounds and never scroll first: `getBoundsInRoot` is clipped and
+    `performScrollTo` hides exactly this (`ChatWindowFitTest.sheetOnOpen`).
 - The bar's height comes from MEASURED line heights (`TextMeasurer`), not the style's `lineHeight`,
   which undershoots the drawn line at a non-linear font scale.
 - The tunnel marker never shares a line it can't fit beside a half-width host · repo

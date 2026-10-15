@@ -251,10 +251,12 @@ fun ChatScreen(
     // the top bar (rollup XERK-1701 #66).
     val footerMax = with(density) { (maxHeight - topBarPx.toDp()).coerceAtLeast(0.dp) }
     // A question / permission sheet never collapses to nothing in a short window: it may
-    // take the footer's whole height, so scrolling the footer reaches all of it, and its
-    // foot shows above the compose box (the chip row gives way to it).
+    // take ALL the room above the compose footer (the chip row gives way to it). Never
+    // more: a sheet as tall as the whole footer overflowed it by the compose row, and,
+    // pinned to the bottom, that overflow hid the question's own first lines under the bar.
     val sheetMax = with(density) {
-        waitingSheetCap(maxHeight, topBarPx.toDp(), footerPx.toDp()).let { if (sheetFirst) maxOf(it, footerMax) else it }
+        val aboveBox = (footerMax - footerPx.toDp()).coerceAtLeast(0.dp)
+        waitingSheetCap(maxHeight, topBarPx.toDp(), footerPx.toDp()).let { if (sheetFirst) maxOf(it, aboveBox) else it }
     }
     val footerScroll = rememberScrollState()
     Scaffold(
