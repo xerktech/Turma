@@ -47,7 +47,8 @@ composed.**
   - **A relaunch stops a message mid-typing** (`_PANE_EPOCHS`, rollup #70.1): `_launch_tmux`
     bumps the pane name's epoch under its write gate; every pane write (`_pane_write`) checks
     it, so a restart never gets the old conversation's Enter. The gate is held for ONE write,
-    so a relaunch waits out at most one pane call. Never prune the epochs (see the comment).
+    so a relaunch waits out at most one pane call. Epochs are pruned ONLY once the pane is gone
+    for good (`_forget_pane` in `_kill_tmux`, see the comment) — never on a live pane.
     Tests: `TestPaneRelaunchStopsTyping`.
   - **Nothing is typed into a pane a dialog owns** (`_pane_blocking_dialog`): a typed digit picks
     an option and any Enter approves the highlighted one. Covers every caller (input, resend,
@@ -76,9 +77,14 @@ composed.**
     - What a stopped message typed is RECORDED per pane (`_PANE_LEFTOVERS`, `_note_leftover`:
       the typed prefix, or "a paste" for the bracketed path). The next write into that pane
       clears it first (`_clear_leftover`), else the retry submits it twice, glued.
-    - Only while the composer shows exactly that (`_leftover_shown`, strict: all of it, or its
-      tail/start on a short pane), or its chip. Never "any piece of the message": that erased an
-      operator's own draft "yes" (QA). Keyed to the pane epoch; a relaunch drops the record.
+    - Only while the composer shows ONLY ours (`_leftover_view`: "head"/"piece"/"chip", at least
+      `COMPOSER_MIN_SHOWN_CHARS` of it before the first press). Never "any piece of the message":
+      that erased an operator's own draft "yes" (QA).
+    - Ours WITH other text ("mixed"), an unreadable composer ("unknown"), or a clear past its
+      bounds → `PANE_HOLD`: press nothing, type nothing, the message stays held (`_must_hold`)
+      until the composer no longer shows ours (the operator submitted or cleared it; "gone"),
+      which drops the record. Typing after a failed clear submitted the message twice (QA).
+    - Keyed to the pane epoch; a relaunch, and `_kill_tmux` (`_forget_pane`), drop the record.
     - Residual: held state is in memory; an agent restart loses it.
     Tests: `TestHeldForDialog`.
   - **Clearing an unsent message CONVERGES on the composer read back** (`_clear_composer`):
@@ -88,8 +94,14 @@ composed.**
     start, clears a `[Pasted text #n ...]` chip in one press, and does nothing on an empty box.
     - Presses go ≤`CLEAR_KEYS_PER_WRITE` per write (a bigger burst drops presses; past ~800
       bytes it is a paste chip of literal ^U), re-reading after each, until none of ours is
-      left; bounded by `CLEAR_MAX_PRESSES`/`CLEAR_DEADLINE_SEC`. A dialog stops it at once.
-    - An unreadable composer gets one bounded blind write.
+      left. A dialog stops it at once.
+    - Each batch is also ≤ rows drawn − 1: a press removes at most one row, so the top drawn
+      row is never pressed until it is all there is. A composer taller than the pane draws only
+      its last rows, ❯ on the first drawn, with no "more above" marker — text above ours scrolls
+      in before any press can reach it, reads "mixed", and holds.
+    - Bounds sized to the TYPED worst case (`CLEAR_MAX_PRESSES` = 2×`PASTE_SLICED_MAX_CHARS`+2;
+      300 lines needed >400), and `CLEAR_DEADLINE_SEC` is part of `PANE_TYPE_LOCK_WAIT_SEC`.
+    - Never a blind press: an unreadable composer holds.
     Tests: `TestClearComposer` (`_FakeComposer` models visual-row deletion).
   - **The cap is judged on the text AS TYPED** (tabs already 4 spaces), on tmux and Windows alike:
     judged before, 4000 tabs became 40 slices, each a pane call.

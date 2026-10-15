@@ -105,7 +105,8 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
     the composer draws it (`_await_slice_drawn`).
   - On a final failure the typed part is cleared (`_clear_composer`: Ctrl+U in small injects,
     reading the composer back until none of it is left, `agent-input.md`), else the NEXT
-    message submits it — never while a dialog is up. Measured on Claude Code 2.1.300 in tmux.
+    message submits it — never while a dialog is up. One it can't clear (unreadable, mixed) is
+    recorded, so the next write clears it or holds. Measured on Claude Code 2.1.300 in tmux.
     **Host-unverified on Windows**: that ConPTY delivers the `\x15` bytes as the same key.
     Tests: the `_pty_inject` lost/clear cases, `TestClearComposer`.
   - A dialog stops `_pty_inject` before any later slice or Enter (`PANE_DIALOG`), as on tmux,
