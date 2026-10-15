@@ -51,4 +51,11 @@ class SvgGuardTest {
         assertTrue(opensMarkup("\uFEFF\n <svg/>".toByteArray()))
         assertEquals(SvgVerdict.NOT_SVG, v("<svgx/>"))
     }
+
+    @Test fun `an encoding the walk cannot read as Latin-1 is refused`() {
+        assertEquals(SvgVerdict.UNSAFE, v("<?xml version=\"1.0\" encoding=\"UTF-7\"?><!--+ACQ---><svg/>"))
+        assertEquals(SvgVerdict.UNSAFE, v("<?xml version='1.0' encoding='ISO-2022-JP'?><svg/>"))
+        assertEquals(SvgVerdict.SAFE, v("<?xml version=\"1.0\" encoding=\"UTF-8\"?><svg/>"))
+        assertEquals(SvgVerdict.SAFE, v("<?xml version=\"1.0\" encoding=\"iso-8859-1\"?><svg/>"))
+    }
 }

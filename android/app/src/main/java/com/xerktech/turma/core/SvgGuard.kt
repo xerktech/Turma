@@ -50,7 +50,15 @@ fun svgVerdict(head: ByteArray, declaredSvg: Boolean): SvgVerdict {
         if (i >= text.length) return SvgVerdict.UNSAFE // root beyond the window: can't vouch for it
         if (text[i] != '<') return unknown
         when {
-            text.startsWith("<?", i) -> i = after(text, "?>", i + 2) ?: return SvgVerdict.UNSAFE
+            text.startsWith("<?", i) -> {
+                val end = after(text, "?>", i + 2) ?: return SvgVerdict.UNSAFE
+                // The walk reads Latin-1, but the parser honours a declared encoding:
+                // under UTF-7 or ISO-2022-JP the bytes it parses are not the ones read
+                // here, so a hidden DOCTYPE or a decoy root could get past.
+                val enc = ENCODING_RE.find(text.substring(i, end))?.groupValues?.get(1)
+                if (enc != null && enc.lowercase() !in SAFE_ENCODINGS) return SvgVerdict.UNSAFE
+                i = end
+            }
             text.startsWith("<!--", i) -> i = after(text, "-->", i + 4) ?: return SvgVerdict.UNSAFE
             text.startsWith("<!", i) -> return SvgVerdict.UNSAFE // DOCTYPE / CDATA / anything declarative
             else -> {
@@ -63,6 +71,9 @@ fun svgVerdict(head: ByteArray, declaredSvg: Boolean): SvgVerdict {
         }
     }
 }
+
+private val ENCODING_RE = Regex("""encoding\s*=\s*["']([^"']*)["']""", RegexOption.IGNORE_CASE)
+private val SAFE_ENCODINGS = setOf("utf-8", "utf8", "us-ascii", "ascii", "iso-8859-1", "latin1")
 
 private fun after(s: String, end: String, from: Int): Int? {
     val k = s.indexOf(end, from)
