@@ -7,6 +7,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -254,9 +255,12 @@ fun ChatScreen(
     // take ALL the room above the compose footer (the chip row gives way to it). Never
     // more: a sheet as tall as the whole footer overflowed it by the compose row, and,
     // pinned to the bottom, that overflow hid the question's own first lines under the bar.
+    // Typing on a short phone can leave next to no room above the box at all: then the
+    // sheet takes the whole footer and is reached by scrolling it, never squeezed to 0.
     val sheetMax = with(density) {
         val aboveBox = (footerMax - footerPx.toDp()).coerceAtLeast(0.dp)
-        waitingSheetCap(maxHeight, topBarPx.toDp(), footerPx.toDp()).let { if (sheetFirst) maxOf(it, aboveBox) else it }
+        val floor = if (aboveBox >= CHAT_SHEET_MIN) aboveBox else footerMax
+        waitingSheetCap(maxHeight, topBarPx.toDp(), footerPx.toDp()).let { if (sheetFirst) maxOf(it, floor) else it }
     }
     val footerScroll = rememberScrollState()
     Scaffold(
@@ -672,6 +676,9 @@ private fun AgentsList(
     }
 }
 
+/** The least room a pending sheet may show in above the compose box before it falls back to scrolling. */
+internal val CHAT_SHEET_MIN = 40.dp
+
 @Composable
 private fun QuestionSheet(
     maxHeight: androidx.compose.ui.unit.Dp,
@@ -690,7 +697,7 @@ private fun QuestionSheet(
         modifier = Modifier.fillMaxWidth().testTag(WAITING_SHEET_TAG),
     ) {
         Column(
-            Modifier.heightIn(max = maxHeight).verticalScroll(rememberScrollState()).padding(12.dp),
+            Modifier.heightIn(max = maxHeight).verticalScroll(remember(question) { ScrollState(0) }).padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             if (header.isNotBlank() || (total != null && total > 1)) {
@@ -797,7 +804,7 @@ private fun PanePromptSheet(
         modifier = Modifier.fillMaxWidth().testTag(WAITING_SHEET_TAG),
     ) {
         Column(
-            Modifier.heightIn(max = maxHeight).verticalScroll(rememberScrollState()).padding(12.dp),
+            Modifier.heightIn(max = maxHeight).verticalScroll(remember(prompt) { ScrollState(0) }).padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             // The pill shares the prompt's line: stacked, it alone filled a short window's

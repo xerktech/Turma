@@ -186,6 +186,9 @@ Mirrors the glasses pure-core/adapter-shell split:
     (283dp tall) once the tunnel marker took its own line, and while typing.
   - Never more than `aboveBox`: a floor of the whole footer overflowed it by the compose row, and
     (pinned to the bottom) hid the question's first lines under the bar on open.
+  - Except typing on a short phone, where `aboveBox` drops under `CHAT_SHEET_MIN` (40dp; ~0 at
+    font 2.0 on a 308dp-tall phone): then the floor is the whole footer, reached by scrolling it.
+  - Each sheet's scroll state is keyed on its question / prompt, so a new one opens at its top.
   - Tests must read UNCLIPPED bounds and never scroll first: `getBoundsInRoot` is clipped and
     `performScrollTo` hides exactly this (`ChatWindowFitTest.sheetOnOpen`).
 - The bar's height comes from MEASURED line heights (`TextMeasurer`), not the style's `lineHeight`,

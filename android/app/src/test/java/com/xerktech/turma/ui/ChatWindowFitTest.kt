@@ -244,6 +244,55 @@ class ChatWindowFitTest {
         assertTrue("option ${opt.top} under the top bar (${bar.bottom})", opt.top >= bar.bottom - 0.5.dp)
     }
 
+    /**
+     * Typing on a short single-pane phone (686x308dp, keyboard 200dp) leaves next to no room
+     * above the compose box: the sheet must fall back to the whole footer and stay reachable by
+     * scrolling it, never be squeezed to nothing (QA, rollup XERK-1701).
+     */
+    private fun shortPhoneTypingReachable(fontScale: Float) {
+        open(widthDp = 686, heightDp = 308, fontScale = fontScale,
+            sessionBlock = """{ "question": "Which one?", "questionOptions": [ $options ] }""", tunnelOnline = false)
+        insets(statusDp = 24, navDp = 24, imeDp = 200)
+        val sheet = unclipped(compose.onNodeWithTag(WAITING_SHEET_TAG).fetchSemanticsNode())
+        assertTrue("sheet squeezed to ${sheet.height}", sheet.height >= CHAT_SHEET_MIN)
+        // Scrolling the footer brings the sheet's top (the question) into view, below the bar.
+        // (Vertical checks on unclipped bounds: the 686dp box is wider than Robolectric's window.)
+        compose.onNodeWithTag(WAITING_SHEET_TAG).performScrollTo()
+        val bar = unclipped(compose.onNodeWithTag(CHAT_TOP_BAR_TAG).fetchSemanticsNode())
+        val q = unclipped(compose.onNodeWithText("Which one?", useUnmergedTree = true).fetchSemanticsNode())
+        assertTrue("question top ${q.top} under the bar (${bar.bottom})", q.top >= bar.bottom - 0.5.dp)
+        compose.onNodeWithText("Option number 1").performScrollTo()
+        val opt = unclipped(compose.onNodeWithText("Option number 1", useUnmergedTree = true).fetchSemanticsNode())
+        val shown = compose.onNodeWithText("Option number 1", useUnmergedTree = true).getBoundsInRoot()
+        assertTrue("option ${opt.top} under the bar (${bar.bottom})", opt.top >= bar.bottom - 0.5.dp)
+        assertEquals("option cut by its sheet", opt.height.value, shown.height.value, 0.5f)
+    }
+
+    @Test fun `a short phone keeps a question reachable while typing at font 1`() = shortPhoneTypingReachable(1f)
+    @Test fun `a short phone keeps a question reachable while typing at font 1_3`() = shortPhoneTypingReachable(1.3f)
+    @Test fun `a short phone keeps a question reachable while typing at font 2`() = shortPhoneTypingReachable(2f)
+
+    // A new question opens at its top, not where the last one's sheet was left scrolled
+    // (question 2 of a multi-question ask, after an option of question 1 was tapped).
+    @Test fun `a new question opens scrolled to its top`() {
+        open(widthDp = 600, heightDp = 283, fontScale = 1f, tunnelOnline = false, statusConsumed = true,
+            sessionBlock = """{ "question": "Which one?", "questionOptions": [ $options ] }""")
+        compose.onNodeWithText("Option number 6").performScrollTo()
+        compose.waitForIdle()
+        val fleet = HubHarness.fleetJson(
+            host = host,
+            sessions = """{ "id": "$session", "repo": "Turma", "status": "running", "worktree": "wt",
+                            "model": "opus", "permissionMode": "auto",
+                            "session": { "question": "Which two?", "questionOptions": [ $options ] } }""",
+        ).replace("\"terminalOnline\": true", "\"terminalOnline\": false")
+        hub.seedFleet(fleet)
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText("Which two?", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.waitForIdle()
+        assertOpenAndWhole("Which two?")
+    }
+
     // The boundary of the bar-fit check, full-screen at font 1.0: bar 64 + status 24, box row
     // 56 + the compact footer's 4dp padding = 148dp. Exactly that much room keeps the bar...
     @Test fun `the bar stays when bar and box fit exactly`() {
