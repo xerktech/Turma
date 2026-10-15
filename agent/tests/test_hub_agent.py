@@ -10792,7 +10792,7 @@ class TestUsageAcrossAMigration(ManagerMixin, unittest.TestCase):
             sm._migration_download = lambda mid: blob
             with mock.patch.object(ha, "resolve_base_ref",
                                    return_value="origin/main"):
-                sm.import_session({"type": "importSession", "cmdId": "c1",
+                _run_import(sm, {"type": "importSession", "cmdId": "c1",
                                    "migrationId": "mig1", "transcriptId": self.TID,
                                    "cwd": self.wt, "repo": "Turma"})
             self.assertTrue(os.path.isfile(self._path()))
@@ -11571,6 +11571,19 @@ class TestResumeTranscript(ManagerMixin, unittest.TestCase):
         sm._launch_tmux.assert_not_called()
 
 
+def _run_import(sm, cmd):
+    """import_session, then wait for its import thread and finish it the way the
+    beat does (`_apply_imports_landed`)."""
+    sm.import_session(cmd)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        with sm._imports_lock:
+            if len(sm._imports_landed) >= len(sm._imports_inflight):
+                break
+        time.sleep(0.01)
+    sm._apply_imports_landed()
+
+
 class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
     """A migration carries the session's WORKTREE, not just its conversation:
     unpushed commits ride a git bundle, uncommitted + untracked changes a binary
@@ -11646,7 +11659,9 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         """A session worktree on the source, on branch `feat`, with one unpushed
         commit, a tracked edit, a binary edit, a deletion, an untracked file and
         an ignored one."""
-        wt = os.path.join(self.tmp, "srcgit", ".turma", "worktrees", "Turma", name)
+        # Under this module's WORKTREES_ROOT, as a real source's would be (only a
+        # Turma worktree's state is captured); the target lands at another name.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "src-" + name)
         self.git("-C", self.src_repo, "worktree", "add", "-q", "-b", "feat", wt,
                  "origin/main")
         self.write(wt, "feature.txt", "committed but never pushed\n")
@@ -11779,6 +11794,173 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
             sm._restore_worktree_state(sess, files)
         self.assertFalse(os.path.exists(sess["worktreePath"]))
 
+    def test_a_copy_from_patch_is_refused_before_anything_is_touched(self):
+        # `git apply` reads a `copy from` path as-is, absolute included: a
+        # hostile bundle could copy any file this host can read into the tree.
+        secret = os.path.join(self.tmp, "secret.env")
+        self.write(self.tmp, "secret.env", "TOKEN=hunter2\n")
+        sm = self.make_manager()
+        head = self.git("-C", self.dst_repo, "rev-parse", "origin/main")
+        files = {"state.json": json.dumps({"head": head, "branch": "feat"}).encode(),
+                 "changes.patch": (f"diff --git a{secret} b/.cache/env\n"
+                                   f"similarity index 100%\ncopy from {secret}\n"
+                                   f"copy to .cache/env\n").encode()}
+        sess = self.dst_sess()
+        with self.assertRaisesRegex(RuntimeError, "copy/rename"):
+            sm._restore_worktree_state(sess, files)
+        self.assertFalse(os.path.exists(sess["worktreePath"]))
+        self.assertEqual(self.git("-C", self.dst_repo, "branch", "--list", "feat"), "")
+
+    def test_a_failed_apply_undoes_the_branch_and_the_older_copy(self):
+        src_wt = self.src_worktree()
+        sm = self.make_manager()
+        files = sm._capture_worktree_state(src_wt)
+        files["changes.patch"] = b"diff --git a/nope b/nope\ngarbage\n"
+        sess = self.dst_sess()
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "--detach",
+                 sess["worktreePath"], "origin/main")
+        self.write(sess["worktreePath"], "local-only.txt", "keep\n")
+        with self.assertRaises(RuntimeError):
+            sm._restore_worktree_state(sess, files)
+        self.assertEqual(self.git("-C", self.dst_repo, "branch", "--list", "feat"), "")
+        self.assertEqual(self.read(sess["worktreePath"], "local-only.txt"), "keep\n")
+        self.assertEqual(glob.glob(sess["worktreePath"] + ".pre-migration-*"), [])
+
+    def test_oversize_members_are_refused_unread(self):
+        sm = self.make_manager()
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            data = b"\0" * 4096   # compresses to almost nothing
+            ti = tarfile.TarInfo(".worktree/changes.patch")
+            ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
+        with mock.patch.object(ha, "MIGRATION_BLOB_MAX", 1024):
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                sm._read_worktree_members(buf.getvalue())
+
+    def test_lfs_content_is_refused_rather_than_left_behind(self):
+        pointer = ("version https://git-lfs.github.com/spec/v1\n"
+                   "oid sha256:" + "a" * 64 + "\nsize 3\n")
+        sm = self.make_manager()
+        wt = self.src_worktree()
+        self.write(wt, "big.psd", pointer)               # dirty LFS pointer
+        with self.assertRaisesRegex(RuntimeError, "Git LFS"):
+            sm._capture_worktree_state(wt)
+        self.git("-C", wt, "add", "big.psd")
+        self.git("-C", wt, "commit", "-qm", "lfs")       # unpushed LFS commit
+        with self.assertRaisesRegex(RuntimeError, "Git LFS"):
+            sm._capture_worktree_state(wt)
+
+    def test_a_nested_repo_is_refused_rather_than_dropped(self):
+        wt = self.src_worktree()
+        nested = os.path.join(wt, "vendor", "lib")
+        self.git("init", "-q", nested)
+        self.write(nested, "a.c", "int x;\n")
+        self.git("-C", nested, "add", "a.c")
+        self.git("-C", nested, "commit", "-qm", "inner")
+        with self.assertRaisesRegex(RuntimeError, "nested git repo"):
+            self.make_manager()._capture_worktree_state(wt)
+
+    def test_untracked_bytes_over_the_limit_refuse_before_git_add(self):
+        wt = self.src_worktree()
+        self.write(wt, "huge.bin", b"x" * 4096)
+        before = sum(len(fs) for _d, _s, fs in os.walk(
+            os.path.join(self.src_repo, ".git", "objects")))
+        with mock.patch.object(ha, "MIGRATION_BLOB_MAX", 1024):
+            with self.assertRaisesRegex(RuntimeError, "untracked files total"):
+                self.make_manager()._capture_worktree_state(wt)
+        after = sum(len(fs) for _d, _s, fs in os.walk(
+            os.path.join(self.src_repo, ".git", "objects")))
+        self.assertEqual(before, after)
+
+    def test_a_round_trip_recognises_its_own_leftover_copy(self):
+        # A -> B: A's worktree (dirty) is exported and stays behind on A.
+        sm = self.make_manager()
+        a = self.dst_sess(name="rt")
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "-b", "feat",
+                 a["worktreePath"], "origin/main")
+        self.write(a["worktreePath"], "wip.txt", "started on A\n")
+        to_b = sm._capture_worktree_state(a["worktreePath"])
+        # B (the source clone stands in for host B) keeps working.
+        b = {"id": "b", "repo": "Turma", "repoPath": self.src_repo,
+             "worktreePath": os.path.join(self.tmp, "hostB", "Turma", "rt")}
+        sm._restore_worktree_state(b, to_b)
+        self.write(b["worktreePath"], "wip.txt", "started on A\ncontinued on B\n")
+        self.git("-C", b["worktreePath"], "add", "wip.txt")
+        self.git("-C", b["worktreePath"], "commit", "-qm", "B's work")
+        to_a = sm._capture_worktree_state(b["worktreePath"])
+        # B -> A: A's untouched leftover held nothing new, so it is replaced and
+        # the session gets its branch back instead of landing detached.
+        sm._restore_worktree_state(a, to_a)
+        self.assertEqual(glob.glob(a["worktreePath"] + ".pre-migration-*"), [])
+        self.assertEqual(self.git("-C", a["worktreePath"], "symbolic-ref", "--short",
+                                  "HEAD"), "feat")
+        self.assertEqual(self.read(a["worktreePath"], "wip.txt"),
+                         "started on A\ncontinued on B\n")
+
+    def test_a_leftover_touched_after_export_is_kept_aside_and_frees_the_branch(self):
+        sm = self.make_manager()
+        a = self.dst_sess(name="rt2")
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "-b", "feat",
+                 a["worktreePath"], "origin/main")
+        self.write(a["worktreePath"], "wip.txt", "v1\n")
+        files = sm._capture_worktree_state(a["worktreePath"])
+        self.write(a["worktreePath"], "late.txt", "written after the export\n")
+        sm._restore_worktree_state(a, files)
+        [aside] = glob.glob(a["worktreePath"] + ".pre-migration-*")
+        self.assertEqual(self.read(aside, "late.txt"), "written after the export\n")
+        self.assertEqual(self.git("-C", a["worktreePath"], "symbolic-ref", "--short",
+                                  "HEAD"), "feat")
+
+    def test_a_diverged_free_branch_is_not_rewound(self):
+        src_wt = self.src_worktree()
+        self.git("-C", self.dst_repo, "branch", "feat", "origin/main")
+        tmp = os.path.join(self.tmp, "tmpwt")
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", tmp, "feat")
+        self.write(tmp, "mine.txt", "target-only\n")
+        self.git("-C", tmp, "add", "mine.txt")
+        self.git("-C", tmp, "commit", "-qm", "target-only")
+        self.git("-C", self.dst_repo, "worktree", "remove", tmp)   # branch now free
+        mine = self.git("-C", self.dst_repo, "rev-parse", "feat")
+        sm = self.make_manager()
+        sess = self.dst_sess()
+        sm._restore_worktree_state(sess, sm._capture_worktree_state(src_wt))
+        self.assertEqual(self.git("-C", self.dst_repo, "rev-parse", "feat"), mine)
+        self.assertEqual(self.git("-C", sess["worktreePath"], "rev-parse",
+                                  "--abbrev-ref", "HEAD"), "HEAD")
+
+    def test_a_bundle_on_an_unfetched_base_fetches_origin_once(self):
+        # The source pushed `base` (the target has never fetched it), then
+        # committed on top: the bundle presupposes `base`.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "src-fb")
+        self.git("-C", self.src_repo, "worktree", "add", "-q", "-b", "base", wt,
+                 "origin/main")
+        self.write(wt, "b.txt", "pushed\n")
+        self.git("-C", wt, "add", "b.txt")
+        self.git("-C", wt, "commit", "-qm", "pushed base")
+        self.git("-C", wt, "push", "-q", "origin", "base")
+        self.write(wt, "c.txt", "unpushed\n")
+        self.git("-C", wt, "add", "c.txt")
+        self.git("-C", wt, "commit", "-qm", "on top")
+        sm = self.make_manager()
+        sess = self.dst_sess(name="fb")
+        sm._restore_worktree_state(sess, sm._capture_worktree_state(wt))
+        self.assertEqual(self.read(sess["worktreePath"], "c.txt"), "unpushed\n")
+        self.assertEqual(self.read(sess["worktreePath"], "b.txt"), "pushed\n")
+
+    def test_a_repo_dir_session_carries_no_worktree_state(self):
+        self.assertFalse(ha._is_turma_worktree_path(self.dst_repo))
+        self.assertFalse(ha._is_turma_worktree_path(ha.REPOS_ROOT))
+        self.assertTrue(ha._is_turma_worktree_path(
+            os.path.join(ha.WORKTREES_ROOT, "Turma", "abc")))
+        self.assertFalse(ha._is_turma_worktree_path(
+            os.path.join(ha.WORKTREES_ROOT, "Turma", "abc", "sub")))
+
+    def test_only_plain_branch_names_are_checked_out(self):
+        for bad in ("refs/heads/main", "HEAD", "--orphan", "a b", None, 7):
+            self.assertFalse(ha._migratable_branch(bad), bad)
+        self.assertTrue(ha._migratable_branch("XERK-1-fix"))
+
     def test_a_bad_state_refuses(self):
         sm = self.make_manager()
         for bad in (b"", b"{}", b'{"head": "main"}', b'{"head": "zz"}', b"\xff"):
@@ -11809,10 +11991,9 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
                 tar.addfile(ti, io.BytesIO(data))
         dest = os.path.join(self.tmp, "slug")
         os.makedirs(dest)
-        got = {}
-        sm._unpack_transcript(buf.getvalue(), dest, worktree_out=got)
-        self.assertEqual(got, {"state.json": b"{}"})
-        sm._unpack_transcript(buf.getvalue(), dest)   # no dict: skipped whole
+        self.assertEqual(sm._read_worktree_members(buf.getvalue()),
+                         {"state.json": b"{}"})
+        sm._unpack_transcript(buf.getvalue(), dest)   # never extracted
         self.assertEqual(sorted(os.listdir(dest)), ["t1.jsonl"])
 
     def test_export_then_import_moves_the_work(self):
@@ -11835,7 +12016,7 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         dst._launch_tmux = mock.Mock()
         dst._launch_ttyd = mock.Mock()
         dst._migration_download = lambda mid: sent["blob"]
-        dst.import_session({"type": "importSession", "cmdId": "c1",
+        _run_import(dst, {"type": "importSession", "cmdId": "c1",
                             "migrationId": "mig1", "transcriptId": tid,
                             "cwd": dst_wt, "repo": "Turma"})
         self.assertEqual(len(dst.registry), 1, dst.registry)
@@ -11847,7 +12028,7 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.read(src_wt, "README"), "one\nedited, not committed\n")
 
     def test_export_refuses_when_the_worktree_cannot_be_captured(self):
-        wt = os.path.join(self.tmp, "not-a-repo")
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "not-a-repo")
         os.makedirs(wt)
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
         os.makedirs(proj, exist_ok=True)
@@ -12209,7 +12390,7 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
             "migratedFrom": {"host": "hostA", "sessionId": "orig"},
         }
         with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
-            sm.import_session(cmd)
+            _run_import(sm, cmd)
         # The transcript landed at the origin cwd's slug so claude --resume finds it.
         self.assertTrue(os.path.isfile(os.path.join(
             ha.PROJECTS_ROOT, ha._project_slug(wt), "transI.jsonl")))
@@ -12241,7 +12422,7 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "orig2")
         sm = self._manager()
         sm._migration_download = lambda mid: None
-        sm.import_session({"migrationId": "m", "transcriptId": "t",
+        _run_import(sm, {"migrationId": "m", "transcriptId": "t",
                            "cwd": wt, "repo": "Turma"})
         self.assertEqual(sm.registry, [])
         sm._launch_tmux.assert_not_called()
@@ -12250,7 +12431,7 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         sm = self._manager()
         got = []
         sm._migration_download = lambda mid: got.append(mid)
-        sm.import_session({"migrationId": "m", "transcriptId": "t",
+        _run_import(sm, {"migrationId": "m", "transcriptId": "t",
                            "cwd": "/home/me/elsewhere", "repo": "Turma"})
         self.assertEqual(sm.registry, [])
         self.assertEqual(got, [])   # bailed before spending a download
@@ -12291,7 +12472,7 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         cmd = {"type": "importSession", "cmdId": "cR", "migrationId": "migR",
                "transcriptId": "transR", "cwd": foreign, "repo": "Turma"}
         with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
-            sm.import_session(cmd)
+            _run_import(sm, cmd)
         self.assertEqual(len(sm.registry), 1)
         # Resumed at the LOCAL worktree path, not the foreign one.
         self.assertEqual(sm.registry[0]["worktreePath"], local)
@@ -12337,7 +12518,7 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         cmd = {"type": "importSession", "cmdId": "cP", "migrationId": "migP",
                "transcriptId": "transP", "cwd": wt, "repo": "Turma"}
         with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
-            sm.import_session(cmd)
+            _run_import(sm, cmd)
         sess = sm.registry[0]
         # The chip is on the record, in session_pr_urls, and in the durable
         # ledger (keyed by the preserved transcript id) — all three channels the
@@ -12427,7 +12608,7 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
                    "transcriptId": "transX", "cwd": foreign, "repo": "Turma",
                    "agentType": "dsh"}
             with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
-                sm.import_session(cmd)
+                _run_import(sm, cmd)
             # The store landed at the LOCAL cwd's key (not the foreign one)...
             placed = os.path.join(ha._dsh_store_dir(local, "transX"),
                                   "session.jsonl")
@@ -12463,7 +12644,7 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
                    "transcriptId": "transN", "cwd": wt, "repo": "Turma",
                    "agentType": "dsh"}
             with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
-                sm.import_session(cmd)
+                _run_import(sm, cmd)
             self.assertFalse(os.path.exists(sessions_root))
         self.assertEqual(sm.registry[0]["agentType"], "claude")
 
@@ -12554,7 +12735,7 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
                    "transcriptId": "transQX", "cwd": foreign, "repo": "Turma",
                    "agentType": "qwen"}
             with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
-                sm.import_session(cmd)
+                _run_import(sm, cmd)
             # The native log landed at the LOCAL cwd's slug (not the foreign one).
             placed = sm._qwen_store_dest(local, "transQX")
             self.assertTrue(os.path.isfile(placed))
@@ -12588,7 +12769,7 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
                    "transcriptId": "transQN", "cwd": wt, "repo": "Turma",
                    "agentType": "qwen"}
             with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
-                sm.import_session(cmd)
+                _run_import(sm, cmd)
             self.assertFalse(os.path.exists(projects_root))
         self.assertEqual(sm.registry[0]["agentType"], "claude")
 
@@ -12871,7 +13052,7 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
         the migrationId to fail that move now instead of at its timeout."""
         sm = self._manager()
         sm._migration_download = lambda mid: None   # relay fetch fails
-        sm.import_session({"migrationId": "mig9", "cmdId": "c9",
+        _run_import(sm, {"migrationId": "mig9", "cmdId": "c9",
                            "transcriptId": "0" * 8 + "-0000-4000-8000-" + "0" * 12,
                            "cwd": os.path.join(ha.WORKTREES_ROOT, "Turma", "w2"),
                            "repo": "Turma"})
@@ -12982,7 +13163,7 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
         """Nothing to report it against: the migration id IS the handle, and a
         malformed one is what's being rejected."""
         sm = self._manager()
-        sm.import_session({"migrationId": "bad id!", "transcriptId": "t"})
+        _run_import(sm, {"migrationId": "bad id!", "transcriptId": "t"})
         self.assertEqual(sm.spawn_failures, [])
 
     def test_staged_failures_ride_the_next_beat_and_clear_on_delivery(self):
@@ -20259,7 +20440,7 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
              mock.patch.object(sm, "_resumable_cwd_class", return_value="worktree"), \
              mock.patch.object(sm, "_localize_migrated_cwd",
                                return_value=os.path.join(ha.WORKTREES_ROOT, "Turma", "iiiii")):
-            sm.import_session({
+            _run_import(sm, {
                 "migrationId": "aaaaaaaaaaaaaaaa", "repo": "Turma",
                 "transcriptId": "33333333-3333-4333-8333-333333333333",
                 "cwd": "/other/host/.turma/worktrees/Turma/iiiii",

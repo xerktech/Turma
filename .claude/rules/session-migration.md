@@ -23,21 +23,30 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
 
 - **Moves a running session to another agent in the SAME org — conversation AND worktree.** The
   source stays on disk (KILLED, so resumable) as the fallback.
-- **The worktree's git state rides the bundle under `.worktree/`** (`_capture_worktree_state`):
-  `state.json` {head, branch}, `commits.bundle` (HEAD `--not --remotes`, only when ahead), and
-  `changes.patch` (a binary diff vs HEAD built in a THROWAWAY `GIT_INDEX_FILE`, so untracked files
-  ride, ignored ones don't, and the session's real index is untouched). Never droppable: a capture
-  failure or an over-`MIGRATION_BLOB_MAX` bundle REFUSES the move, never ships it without the work.
-  - The target (`_restore_worktree_state`) fetches the bundle into a temp ref (one bounded origin
-    fetch for missing prerequisites/pushed heads), adds the worktree on the same branch only when
-    that rewrites nothing here (absent → create, behind → fast-forward), else DETACHED at the
-    commit, then `git apply`s the patch. A failed apply removes the worktree and refuses.
-  - A move BACK finds the old copy at the same path: clean + an ancestor of the moved HEAD is
-    removed; anything else is `git worktree move`d to `<cwd>.pre-migration-<ts>`, never deleted.
-  - `_unpack_transcript` reads only the three known names into memory, never onto disk. A bundle
-    without `.worktree/` (older source, hub restore-pack) keeps the old fork-from-default path.
-  - Restore runs inside `import_session` ON THE BEAT: local git plus at most one
-    `FETCH_TIMEOUT_SEC` fetch — keep it that way (XERK-395). Tests: `TestMigrateWorktreeState`.
+- **The worktree's git state rides the bundle under `.worktree/`** (`_capture_worktree_state`, only
+  for a `WORKTREES_ROOT/<repo>/<dir>` cwd): `state.json` {head, branch}, `commits.bundle` (HEAD
+  `--not --remotes`, only when ahead), `changes.patch` (binary diff vs HEAD via a THROWAWAY
+  `GIT_INDEX_FILE`: untracked files ride, ignored don't, the real index is untouched).
+  - **What it cannot carry, it REFUSES — never ships the move without it**: Git LFS content (only
+    pointers would arrive), a nested repo / dirty submodule, untracked bytes over
+    `MIGRATION_BLOB_MAX` (checked BEFORE `git add -A` writes them to `.git/objects`).
+- **The patch is untrusted: any copy/rename header or gitlink is refused before anything is
+  touched** (`_unsafe_patch_reason`). `git apply` reads a `copy from` path as-is, absolute included
+  — an arbitrary-file read (QA-proven). Capture uses `--no-renames`, so a real patch never has one.
+  `_read_worktree_members` bounds every member (gzip bomb); `_unpack_transcript` never extracts them.
+- **Import is STAGE / WORK / FINISH** (XERK-395): `import_session` (beat) validates and reserves a
+  slot + shields the cwd from prune (`_imports_inflight`); an import thread downloads and runs
+  `_restore_worktree_state`; `_apply_imports_landed` (full beats only) unpacks the transcript,
+  records usage and `_resume_at_cwd(worktree_ready=True)`. Never put the git back on the beat —
+  worktree add/remove/apply are disk-bound and blew the 75s budget.
+  - Branch: checked out only when absent here (created) or behind (fast-forwarded), else DETACHED.
+    Any failure undoes what restore did (worktree, created branch, older copy moved aside).
+  - A move BACK finds the old copy at the same path. Export writes the state's digest into the
+    source's gitdir (`MIGRATION_EXPORT_MARK`); an old copy still matching it (or clean at an ancestor)
+    is removed, anything else detached and renamed to `<cwd>.pre-migration-<ts>`, never deleted.
+  - A bundle without `.worktree/` (older source, hub restore-pack) forks fresh from the default.
+    Residual: an OLDER target extracts `.worktree/` into its slug dir and drops the work (source
+    keeps it). Tests: `TestMigrateWorktreeState` (real git, two clones).
 - The hub can't touch a worktree and agents are outbound-only, so a migration is composed hub-side
   from agent commands + a hub-brokered relay of the **RAW transcript bytes** (what `claude --resume`
   needs and the archive lacks): `exportSession` packs the transcript (+ `subagents/`, truncated to its
