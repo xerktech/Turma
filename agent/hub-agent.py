@@ -30933,7 +30933,7 @@ class SessionManager:
     # with the move, so it can be removed instead of kept aside.
     MIGRATION_EXPORT_MARK = "turma-migrated-out"
 
-    def _worktree_snapshot(self, wt, tmp, t):
+    def _worktree_snapshot(self, wt, tmp, t, lfs_check=False):
         """(head, patch_path) for a worktree: HEAD's commit, and a binary diff of
         the working tree against it built through a THROWAWAY index (`git add
         -A` into a temp GIT_INDEX_FILE) — untracked files included, ignored ones
@@ -30945,7 +30945,11 @@ class SessionManager:
                            timeout=t)
         if rc != 0 or not _GIT_OID_RE.fullmatch(head):
             raise RuntimeError("the worktree has no readable HEAD commit")
-        env = {**os.environ, "GIT_INDEX_FILE": os.path.join(tmp, "index")}
+        # GIT_DIFF_OPTS outranks -U3 and GIT_EXTERNAL_DIFF swaps the diff out;
+        # neither may shape a patch the target applies.
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("GIT_DIFF_OPTS", "GIT_EXTERNAL_DIFF")}
+        env["GIT_INDEX_FILE"] = os.path.join(tmp, "index")
         for cmd in (["read-tree", "HEAD"], ["add", "-A"]):
             rc, err = run_ok(["git", "-C", wt, *cmd], timeout=t, env=env)
             if rc != 0:
@@ -30960,7 +30964,32 @@ class SessionManager:
                           f"--output={ppath}", "HEAD"], timeout=t, env=env)
         if rc != 0:
             raise RuntimeError(f"git diff failed: {git_error_text(err)}")
+        if lfs_check:
+            self._refuse_lfs_paths(wt, env, t)
         return head, ppath
+
+    def _refuse_lfs_paths(self, wt, env, t):
+        """Raise if any path the snapshot changes is LFS-filtered: its content
+        lives in this host's `.git/lfs`, and only the pointer would move. Read
+        from git's own attributes, so no diff setting can hide it."""
+        out = subprocess.run(["git", "-C", wt, "diff", "--cached", "--name-only",
+                              "-z", "--no-renames", "--no-relative", "HEAD"],
+                             env=env, capture_output=True, timeout=t)
+        if out.returncode != 0:
+            raise RuntimeError("could not list the worktree's changed paths")
+        if not out.stdout:
+            return
+        attr = subprocess.run(["git", "-C", wt, "check-attr", "-z", "--stdin",
+                               "filter"], input=out.stdout, env=env,
+                              capture_output=True, timeout=t)
+        if attr.returncode != 0:
+            raise RuntimeError("could not read the worktree's git attributes")
+        f = attr.stdout.split(b"\0")
+        for i in range(0, len(f) - 2, 3):
+            if f[i + 2] == b"lfs":
+                raise RuntimeError("its uncommitted changes touch Git LFS files, "
+                                   "which a move cannot take yet; commit and push "
+                                   "them first")
 
     def _worktree_digest(self, wt):
         """sha256 over HEAD + the working-tree patch, or None if unreadable."""
@@ -31058,7 +31087,7 @@ class SessionManager:
                 if rc != 0:
                     raise RuntimeError(f"git bundle failed: {git_error_text(err)}")
                 out["commits.bundle"] = take(bpath, "unpushed commits' bundle")
-            head, ppath = self._worktree_snapshot(wt, tmp, t)
+            head, ppath = self._worktree_snapshot(wt, tmp, t, lfs_check=True)
             patch = take(ppath, "uncommitted changes' patch")
             if _patch_has_gitlink(patch):
                 raise RuntimeError("it holds a nested git repo or a moved submodule, "

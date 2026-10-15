@@ -28,7 +28,9 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
   `--not --remotes`, only when ahead), `changes.patch` (binary diff vs HEAD via a THROWAWAY
   `GIT_INDEX_FILE`: untracked files ride, ignored don't, the real index is untouched).
   - **What it cannot carry, it REFUSES — never ships the move without it**: Git LFS content (only
-    pointers would arrive), a nested repo / dirty submodule, untracked bytes over
+    pointers would arrive; judged by `git check-attr filter` on the changed paths, plus pointer text
+    in the patch and `git log -G` over unpushed commits — never by patch text alone, which
+    `diff.context`/`GIT_DIFF_OPTS` reshape), a nested repo / dirty submodule, untracked bytes over
     `MIGRATION_BLOB_MAX` (checked BEFORE `git add -A` writes them to `.git/objects`).
 - **The patch is untrusted: any copy/rename header or gitlink is refused before anything is
   touched** (`_unsafe_patch_reason`). `git apply` reads a `copy from` path as-is, absolute included

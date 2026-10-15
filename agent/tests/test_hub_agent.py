@@ -12059,6 +12059,31 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         self.assertTrue(ha._LFS_POINTER_ADDED_RE.search(
             b" version https://git-lfs.github.com/spec/v1\r\n"))
 
+    def test_git_diff_env_cannot_reshape_the_patch(self):
+        wt = self.src_worktree()
+        self.write(wt, "long.txt", "".join(f"line {i}\n" for i in range(20)))
+        self.git("-C", wt, "add", "long.txt")
+        self.git("-C", wt, "commit", "-qm", "long")
+        self.write(wt, "long.txt", "".join(
+            f"line {i}{' edited' if i == 10 else ''}\n" for i in range(20)))
+        sm = self.make_manager()
+        with mock.patch.dict(os.environ, {"GIT_DIFF_OPTS": "--unified=0",
+                                          "GIT_EXTERNAL_DIFF": "/bin/false"}):
+            files = sm._capture_worktree_state(wt)
+        sess = self.dst_sess()
+        sm._restore_worktree_state(sess, files)
+        self.assertIn("line 10 edited", self.read(sess["worktreePath"], "long.txt"))
+
+    def test_an_lfs_filtered_path_is_refused_by_attribute(self):
+        # Whatever the patch text looks like, git's own attributes decide.
+        wt = self.src_worktree()
+        self.write(wt, ".gitattributes", "*.psd filter=lfs diff=lfs merge=lfs -text\n")
+        self.git("-C", wt, "add", ".gitattributes")
+        self.git("-C", wt, "commit", "-qm", "attrs")
+        self.write(wt, "art.psd", "not even a pointer\n")
+        with self.assertRaisesRegex(RuntimeError, "Git LFS"):
+            self.make_manager()._capture_worktree_state(wt)
+
     def test_import_admission_waits_out_a_sleeper_job(self):
         sm = self.make_manager()
         cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "slp")
