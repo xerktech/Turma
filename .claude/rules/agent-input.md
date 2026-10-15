@@ -67,6 +67,10 @@ composed.**
     notify fallback (its PR comment is already marked seen), compaction resend, qwen peer, and
     a trust modal a human must answer. The input worker retries every `INPUT_HOLD_RETRY_SEC`
     for `INPUT_HOLD_TTL_SEC`, then drops it with a log line.
+    - A TTL drop also forgets the pane's leftover record (else it holds the NEXT message too),
+      and a dropped OPERATOR message logs `OPERATOR MESSAGE NOT DELIVERED`. No agent→hub
+      channel carries it yet (spawnFailures is keyed to spawn cmdIds), so that log line is the
+      operator's only trace.
     - One session's messages go in order: a later one queues behind a held one, and one
       waiting out its backoff blocks the rest (live rig: a due resend overtook it).
     - The worker sleeps to the earliest due time among each session's FIRST held message
@@ -100,9 +104,19 @@ composed.**
       its last rows, ❯ on the first drawn, with no "more above" marker — text above ours scrolls
       in before any press can reach it, reads "mixed", and holds.
     - Bounds sized to the TYPED worst case (`CLEAR_MAX_PRESSES` = 2×`PASTE_SLICED_MAX_CHARS`+2;
-      300 lines needed >400), and `CLEAR_DEADLINE_SEC` is part of `PANE_TYPE_LOCK_WAIT_SEC`.
+      300 lines needed >400) and `CLEAR_DEADLINE_SEC`, both counted across retries on the
+      leftover record (`budget`).
+    - **One attempt presses for at most `CLEAR_ATTEMPT_SEC`, then the next retry resumes**: the
+      ONE input worker delivers every session's messages, so a slow clear in one pane must not
+      stall the rest. `CLEAR_ATTEMPT_SEC` (not the whole budget) is in `PANE_TYPE_LOCK_WAIT_SEC`.
+    - **A batch that changes nothing (re-read once) = a DEAF composer** (tmux copy-mode: QA saw
+      7830 presses in 90s, every retry): hold, and remember the view (`stuck`). A retry that
+      reads the same view holds after that one read, until `CLEAR_STUCK_PROBE_SEC`, when one
+      batch probes again (leaving copy-mode need not change the view).
     - Never a blind press: an unreadable composer holds.
-    Tests: `TestClearComposer` (`_FakeComposer` models visual-row deletion).
+    Tests: `TestClearComposer` (`_FakeComposer` models visual-row deletion and FAILS past
+    `MAX_READS` — keep its harness plain functions: a recording mock grew to 14.5 GiB under a
+    non-terminating mutant instead of failing).
   - **The cap is judged on the text AS TYPED** (tabs already 4 spaces), on tmux and Windows alike:
     judged before, 4000 tabs became 40 slices, each a pane call.
   - **A pane's lock entry lives only while a writer uses it** (`[lock, users]`): a writer counts
