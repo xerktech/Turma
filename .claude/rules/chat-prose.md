@@ -64,6 +64,11 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
   - **Android splits a paragraph around an image at RENDER time** (`splitImages`), not in the parse:
     the web's `<img>` is `display: block` inside inline content, so the tree keeps `Span.Image` inline
     and `ProseInline` breaks the line there, dropping the newline either side as other constructs do.
+  - **Every SVG Android decodes passes `SafeSvgDecoder` (`core/SvgGuard.kt`), registered INSTEAD of
+    Coil's `SvgDecoder.Factory`.** AndroidSVG expands DOCTYPE entities unbounded and a Coil decode is
+    not cancelled on leaving the screen, so one agent-sent entity bomb pinned the CPU for the app's
+    life. A DOCTYPE/ENTITY before the root `<svg` is refused (alt text shows). It also sniffs past
+    Coil's 1 KB / first-byte-`<` limit. Tests: `SvgGuardTest`.
   - **A rule line is a SCAN (`isRuleLine`), never `/(?:-[ \t]*){3,}/`.** That regex is linear in V8
     but `java.util.regex` recurses once per iteration of a quantified GROUP, so the Android port of
     it threw an **uncatchable `StackOverflowError`** out of `parseProse` inside a Composable (an
