@@ -21,8 +21,40 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
 
 ## Migrating a session to another agent (XERK-101)
 
-- **Moves a running session to another agent in the SAME org.** The conversation moves; committed
-  work rides git; uncommitted work stays on the source (KILLED, so resumable).
+- **Moves a running session to another agent in the SAME org — conversation AND worktree.** The
+  source stays on disk (KILLED, so resumable) as the fallback.
+- **The worktree's git state rides the bundle under `.worktree/`** (`_capture_worktree_state`, only
+  for a `WORKTREES_ROOT/<repo>/<dir>` cwd): `state.json` {head, branch}, `commits.bundle` (HEAD
+  `--not --remotes`, only when ahead), `changes.patch` (binary diff vs HEAD via a THROWAWAY
+  `GIT_INDEX_FILE`: untracked files ride, ignored don't, the real index is untouched).
+  - **What it cannot carry, it REFUSES — never ships the move without it**: Git LFS content (only
+    pointers would arrive; judged by `git check-attr filter` on the changed paths, plus pointer text
+    in the patch and `git log -G` over unpushed commits — never by patch text alone, which
+    `diff.context`/`GIT_DIFF_OPTS` reshape), a nested repo / dirty submodule, untracked bytes over
+    `MIGRATION_BLOB_MAX` (checked BEFORE `git add -A` writes them to `.git/objects`).
+- **The patch is untrusted: any copy/rename header or gitlink is refused before anything is
+  touched** (`_unsafe_patch_reason`). `git apply` reads a `copy from` path as-is, absolute included
+  — an arbitrary-file read (QA-proven). Capture uses `--no-renames`, so a real patch never has one.
+  `_read_worktree_members` bounds every member (gzip bomb); `_unpack_transcript` never extracts them.
+- **Import is STAGE / WORK / FINISH** (XERK-395): `import_session` (beat) validates and reserves a
+  slot + shields the cwd from prune (`_imports_inflight`); an import thread downloads and runs
+  `_restore_worktree_state`; `_apply_imports_landed` (full beats only) unpacks the transcript,
+  records usage and `_resume_at_cwd(worktree_ready=True)`. Never put the git back on the beat —
+  worktree add/remove/apply are disk-bound and blew the 75s budget.
+  - **While an import is in flight its cwd is held** (`_import_holds`): `start`, `resume`,
+    `_resume_at_cwd`, a second import and a sleeper job refuse that path, and `delete` drops the
+    record but KEEPS the tree (also when another record shares the path) — the thread may be
+    removing an old copy there (QA: a resume launched into a worktree the thread then deleted).
+  - A dir at the cwd with no `.git` of its own is kept aside UNTOUCHED: git there walks up to an
+    enclosing repo (a REPOS_ROOT that is a repo) and detached it (QA).
+  - Branch: checked out only when absent here (created) or behind (fast-forwarded), else DETACHED.
+    Any failure undoes what restore did (worktree, created branch, older copy moved aside).
+  - A move BACK finds the old copy at the same path. Export writes the state's digest into the
+    source's gitdir (`MIGRATION_EXPORT_MARK`); an old copy still matching it (or clean at an ancestor)
+    is removed, anything else detached and renamed to `<cwd>.pre-migration-<ts>`, never deleted.
+  - A bundle without `.worktree/` (older source, hub restore-pack) forks fresh from the default.
+    Residual: an OLDER target extracts `.worktree/` into its slug dir and drops the work (source
+    keeps it). Tests: `TestMigrateWorktreeState` (real git, two clones).
 - The hub can't touch a worktree and agents are outbound-only, so a migration is composed hub-side
   from agent commands + a hub-brokered relay of the **RAW transcript bytes** (what `claude --resume`
   needs and the archive lacks): `exportSession` packs the transcript (+ `subagents/`, truncated to its

@@ -1229,6 +1229,54 @@ HISTORY_USER_MSGS = _env_int("SESSION_HISTORY_USER_MSGS", 200)
 USAGE_EVERY = 15
 
 
+
+_GIT_OID_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+# A Git LFS pointer's first line, as bytes in a patch and as a `git log -G`
+# regex over a commit range.
+# An LFS pointer's header as a whole diff line — added, removed or context — so
+# an edited LFS file (whose pointer is context) is caught, a prose mention is not.
+_LFS_POINTER_ADDED_RE = re.compile(
+    rb"^[ +-]version https://git-lfs\.github\.com/spec/v1\r?$", re.M)
+_LFS_POINTER_RE_GIT = r"^version https://git-lfs\.github\.com/spec/v1"
+# Header lines a patch from `_worktree_snapshot` never has (renames are off), and
+# that a hostile one could use: `copy from <abs path>` makes `git apply` read any
+# file this host can.
+_PATCH_FORBIDDEN_HEADER_RE = re.compile(
+    rb"^(?:copy from|copy to|rename from|rename to|rename old|rename new) ", re.M)
+
+
+def _unsafe_patch_reason(patch):
+    """Why a migration patch must not be applied, or None."""
+    if _PATCH_FORBIDDEN_HEADER_RE.search(patch):
+        return "it carries a copy/rename header"
+    if _patch_has_gitlink(patch):
+        return "it carries a gitlink"
+    return None
+
+
+def _patch_has_gitlink(patch):
+    """A gitlink (mode 160000) in a diff: a nested repo or submodule pointer."""
+    return re.search(rb"^(?:(?:new file|deleted file|old|new) mode 160000|"
+                     rb"index [0-9a-f]+\.\.[0-9a-f]+ 160000)$", patch, re.M) is not None
+
+
+def _migratable_branch(name):
+    """A branch name a migration may check out: our ref allowlist, and a plain
+    short name (not `HEAD`, not a full `refs/...` that would nest)."""
+    return (isinstance(name, str) and valid_ref_name(name) and name != "HEAD"
+            and not name.startswith("refs/"))
+
+
+def _is_turma_worktree_path(path):
+    """`path` is `WORKTREES_ROOT/<repo>/<dir>` — a Turma session worktree, not a
+    repo dir or the repos root."""
+    if not isinstance(path, str) or not path:
+        return False
+    rel = os.path.relpath(os.path.normpath(path), os.path.normpath(WORKTREES_ROOT))
+    parts = rel.split(os.sep)
+    return len(parts) == 2 and all(p and p not in (".", "..") for p in parts)
+
+
 def _usage_slot(sid):
     """Stable per-session beat-slot in [0, USAGE_EVERY): the session refreshes
     its usage on beats where `beat % USAGE_EVERY == _usage_slot(sid)`, spreading
@@ -2664,6 +2712,17 @@ QWEN_STORE_ARCNAME = ".qwen-store"
 # migration must place exactly this session's <id>.jsonl, never unpack a dir into
 # it.
 QWEN_STORE_MEMBER = "chat.jsonl"
+# Reserved tar arcname carrying the session's WORKTREE STATE into a migration
+# bundle, so the move takes the work with it instead of leaving it on the source:
+# `state.json` ({head, branch}), `commits.bundle` (a git bundle of every commit
+# HEAD has that no remote-tracking ref does) and `changes.patch` (a binary diff of
+# the working tree — tracked edits AND untracked, non-ignored files — against
+# HEAD). `_unpack_transcript` reads these into memory, never onto disk, and only
+# these three names; the target rebuilds the worktree from them
+# (`_restore_worktree_state`). Absent (an older source, a hub restore-pack) = the
+# old behaviour: a fresh worktree at the default branch.
+WORKTREE_STATE_ARCNAME = ".worktree"
+WORKTREE_STATE_MEMBERS = ("state.json", "commits.bundle", "changes.patch")
 # qwen persists its per-server MCP connection-trust decisions here, keyed by the
 # workdir's realpath (XERK-507 D1). We PRE-AUTHORIZE our own registered servers
 # in it at launch so a session never wedges at the trust dialog. Same resolution
@@ -24068,6 +24127,12 @@ class SessionManager:
         # the beat (add) and the export thread (discard), under its own lock.
         self._exporting = set()
         self._exporting_lock = threading.Lock()
+        # Migrations being imported off the beat: migrationId -> cwd while the
+        # import thread downloads + rebuilds the worktree (it holds a slot and
+        # shields the path from prune), then the finished jobs for the beat.
+        self._imports_lock = threading.Lock()
+        self._imports_inflight = {}
+        self._imports_landed = []
         # The sleeper lifecycle worker (XERK-1575): the SLOW halves of a hub-sent
         # pause (the tmux/ttyd teardown) and of a wake resume (re-adding a
         # vanished worktree) run here, never on the beat (XERK-395). The beat owns
@@ -25775,7 +25840,7 @@ class SessionManager:
         return sum(1 for s in self.registry
                    if s.get("status") in SLOT_HOLDING_STATUSES
                    and not (exclude_id is not None and s.get("id") == exclude_id)
-                   ) + self._restores_in_flight()
+                   ) + self._restores_in_flight() + self._imports_reserved()
 
     def _queued_count(self):
         return sum(1 for s in self.registry if s.get("status") == "queued")
@@ -29623,6 +29688,9 @@ class SessionManager:
         if self._slots_used(exclude_id=sid) >= MAX_SESSIONS:
             log(f"start refused: at MAX_SESSIONS ({MAX_SESSIONS})")
             return
+        if not sess.get("root") and self._import_holds(sess.get("worktreePath")):
+            log(f"start refused: a migration is rebuilding {sess.get('worktreePath')}")
+            return
         try:
             # Root runs in REPOS_ROOT (always present) — no worktree to re-add.
             # Normally the worktree persists (kill keeps it), so this is skipped.
@@ -29686,6 +29754,11 @@ class SessionManager:
             self._unpause_closed(rec)
             self._refuse_start(f"a session is already running in "
                                f"{holder.get('worktreePath')}", cmd_id=cmd_id)
+            return
+        if not rec.get("root") and self._import_holds(rec.get("worktreePath")):
+            self._refuse_start(f"a migration is rebuilding the worktree at "
+                               f"{rec.get('worktreePath')}; try again in a moment",
+                               cmd_id=cmd_id)
             return
         # A paused sleeper's kept worktree is gone (a prune swept it while it
         # slept): `git worktree add` can take tens of seconds, so it runs on the
@@ -30021,7 +30094,8 @@ class SessionManager:
         return {"rcName": self._unique_rc_name(slug), "rcRenamedFor": None}
 
     def _resume_at_cwd(self, transcript_id, cwd, *, cmd_id=None, extra=None,
-                       migration_id=None):
+                       migration_id=None, worktree_ready=False,
+                       import_reserved=False):
         """Launch `claude --resume <transcript_id>` cwd'd at `cwd`, the shared
         core of resume_transcript (host-local resume-any) and import_session
         (a session migrated in from another agent). The transcript file must
@@ -30038,7 +30112,11 @@ class SessionManager:
         and every such refusal is staged for the hub by `_refuse_start`, since
         both callers discard the return value and the command is ACKed anyway.
         `migration_id` is passed by import_session so the hub can fail THAT
-        migration now instead of waiting out its timeout."""
+        migration now instead of waiting out its timeout. `worktree_ready` says
+        the import thread already rebuilt the worktree from the source's carried
+        git state, so it is used as-is rather than forked fresh;
+        `import_reserved` that the import's own slot reservation is still
+        counted and must not refuse it."""
         def refuse(reason):
             self._refuse_start(reason, cmd_id=cmd_id, migration_id=migration_id)
 
@@ -30056,7 +30134,7 @@ class SessionManager:
             return None
         repo, _origin, is_root = cls
         cwd = os.path.normpath(cwd)
-        if self._slots_used() >= MAX_SESSIONS:
+        if self._slots_used() - (1 if import_reserved else 0) >= MAX_SESSIONS:
             refuse(f"the host is at MAX_SESSIONS ({MAX_SESSIONS})")
             return None
         # One live session per NON-ROOT cwd: two claudes in the same repo dir
@@ -30069,6 +30147,12 @@ class SessionManager:
                and os.path.normpath(s.get("worktreePath") or "") == cwd
                for s in self.registry):
             refuse(f"a session is already running in {cwd}")
+            return None
+        # A migration import rebuilding this path (unless this IS that import
+        # finishing).
+        if not is_root and not import_reserved and self._import_holds(cwd):
+            refuse(f"a migration is rebuilding the worktree at {cwd}; try again "
+                   f"in a moment")
             return None
         # A paused sleeper's teardown or worktree restore still in flight there,
         # or on this conversation (XERK-1575).
@@ -30165,7 +30249,17 @@ class SessionManager:
             # one at the exact origin path so its slug matches the transcript and
             # claude resolves the id. Repo-dir / repos-root cwds always exist, so
             # this is skipped.
-            if not is_root and not os.path.isdir(cwd):
+            # A migration whose worktree the import thread rebuilt from the
+            # source's git state uses it as-is; its base for ahead/behind is the
+            # default branch, read locally (the thread already fetched).
+            if not is_root and worktree_ready:
+                if not os.path.isdir(cwd):
+                    raise RuntimeError(f"the rebuilt worktree at {cwd} is gone")
+                name = default_branch_name(repo_path)
+                if name and valid_ref_name(name) and branch_exists(
+                        repo_path, f"refs/remotes/origin/{name}"):
+                    sess["baseRef"] = f"origin/{name}"
+            elif not is_root and not os.path.isdir(cwd):
                 sess["baseRef"] = resolve_base_ref(repo_path, None)
                 self._worktree_add(sess, base_ref=sess["baseRef"])
             self._remember_usage(sess)
@@ -30292,14 +30386,31 @@ class SessionManager:
         qwen_store = None
         if sess.get("agentType") == "qwen":
             qwen_store = self._qwen_native_log(sess.get("claudeSessionId") or "")
+        # The worktree's own state rides the bundle too, so the work moves with
+        # the conversation instead of being stranded on this host. A capture that
+        # fails REFUSES the move: the session keeps running here untouched, which
+        # beats a target that resumes the conversation over a tree missing its
+        # work. A repos-root session has no worktree of its own (the hub refuses
+        # to move one anyway).
+        worktree = None
+        wt = sess.get("worktreePath") or ""
+        if (not sess.get("root") and _is_turma_worktree_path(wt)
+                and os.path.lexists(os.path.join(wt, ".git"))):
+            try:
+                worktree = self._capture_worktree_state(wt)
+            except Exception as e:
+                refuse(f"capturing the worktree's changes failed: {e}")
+                return
         try:
             blob = self._pack_transcript(path, dsh_store=dsh_store,
-                                         qwen_store=qwen_store)
+                                         qwen_store=qwen_store,
+                                         worktree=worktree)
         except Exception as e:
             refuse(f"packing the transcript failed: {e}")
             return
         if len(blob) > MIGRATION_BLOB_MAX:
-            refuse(f"the transcript bundle is {len(blob)} bytes, over the "
+            what = ("transcript + worktree changes" if worktree else "transcript")
+            refuse(f"the {what} bundle is {len(blob)} bytes, over the "
                    f"{MIGRATION_BLOB_MAX} limit")
             return
         if not self._migration_upload(migration_id, blob):
@@ -30310,7 +30421,14 @@ class SessionManager:
         shipped, unpack it under this host's PROJECTS_ROOT at the origin cwd's
         slug, then resume it here carrying the moved session's identity. A NEW
         Turma id/rcName/port is minted like a resume; the transcript id (hence
-        the conversation) is preserved, so the target continues in place."""
+        the conversation) is preserved, so the target continues in place.
+
+        Runs on the beat, so it only VALIDATES and stages: the download and the
+        worktree rebuild (git, disk-bound worst cases far past the beat budget,
+        XERK-395) run on an import thread (`_import_prepare`), and the beat
+        finishes the move in `_apply_imports_landed` (`_finish_import`) — the
+        registry write and launch stay the beat's. The cwd holds a slot and is
+        shielded from prune while the thread runs."""
         migration_id = cmd.get("migrationId")
         transcript_id = cmd.get("transcriptId")
         # The source ships its OWN absolute worktree path; remap it onto this
@@ -30340,10 +30458,132 @@ class SessionManager:
         if not cls:
             refuse(f"cwd {cwd!r} is not resumable on this host")
             return
+        repo = cls[0]
+        is_root = cls[2]
+        norm = os.path.normpath(cwd)
+        with self._imports_lock:
+            if migration_id in self._imports_inflight:
+                return  # a re-delivered command for a move already under way
+        if not is_root and self._import_holds(norm):
+            refuse(f"another migration is already rebuilding {norm}")
+            return
+        if self._sleeper_job_blocks(cwd=norm, transcript=transcript_id,
+                                    root=is_root):
+            refuse(f"a paused session in {norm} (or this conversation) is still "
+                   f"being torn down or restored; try again in a moment")
+            return
+        # Cheap refusals before spending a download.
+        if self._slots_used() >= MAX_SESSIONS:
+            refuse(f"the host is at MAX_SESSIONS ({MAX_SESSIONS})")
+            return
+        if not is_root and any(s.get("status") == "running"
+               and os.path.normpath(s.get("worktreePath") or "") == norm
+               for s in self.registry):
+            refuse(f"a session is already running in {norm}")
+            return
+        with self._prune_lock:
+            if norm in self._prune_removing:
+                refuse(f"a prune is removing the worktree at {norm}")
+                return
+            with self._imports_lock:
+                self._imports_inflight[migration_id] = norm
+        job = {"cmd": cmd, "cwd": cwd, "repo": repo, "isRoot": is_root}
+        try:
+            threading.Thread(target=self._import_prepare_tracked, args=(job,),
+                             name="migration-import", daemon=True).start()
+        except Exception as e:
+            with self._imports_lock:
+                self._imports_inflight.pop(migration_id, None)
+            refuse(f"could not start the import worker: {e}")
+
+    def _import_prepare_tracked(self, job):
+        try:
+            self._import_prepare(job)
+        except Exception as e:
+            job["error"] = f"preparing the import failed: {e}"
+        with self._imports_lock:
+            self._imports_landed.append(job)
+
+    def _import_prepare(self, job):
+        """Import thread: download the bundle and, when it carries the source's
+        worktree state and the cwd is a Turma worktree, rebuild that worktree.
+        Touches git and disk only — never the registry. Its outcome rides `job`
+        back to the beat."""
+        cmd = job["cmd"]
+        migration_id = cmd.get("migrationId")
         blob = self._migration_download(migration_id)
         if blob is None:
-            refuse("fetching the transcript bundle from the hub failed")
+            job["error"] = "fetching the transcript bundle from the hub failed"
             return
+        job["blob"] = blob
+        try:
+            state = self._read_worktree_members(blob)
+        except tarfile.TarError:
+            return   # not a bundle at all: the beat's unpack says so
+        except Exception as e:
+            job["error"] = f"the moved worktree state is unreadable: {e}"
+            return
+        if "state.json" not in state or job["isRoot"] \
+                or not _is_turma_worktree_path(job["cwd"]):
+            return
+        sess = {"id": migration_id, "repo": job["repo"],
+                "repoPath": os.path.join(REPOS_ROOT, job["repo"]),
+                "worktreePath": os.path.normpath(job["cwd"])}
+        try:
+            self._restore_worktree_state(sess, state)
+        except Exception as e:
+            job["error"] = f"rebuilding the worktree failed: {e}"
+            return
+        job["restored"] = True
+
+    def _apply_imports_landed(self):
+        """Beat: finish every import whose thread is done. Never raises."""
+        with self._imports_lock:
+            landed, self._imports_landed = self._imports_landed, []
+        for job in landed:
+            mid = job["cmd"].get("migrationId")
+            try:
+                self._finish_import(job)
+            except Exception as e:
+                log(f"importSession {mid}: finishing failed: {e}")
+                self._refuse_start(f"finishing the import failed: {e}",
+                                   cmd_id=job["cmd"].get("cmdId"),
+                                   migration_id=mid, context="importSession")
+            finally:
+                with self._imports_lock:
+                    self._imports_inflight.pop(mid, None)
+
+    def _imports_reserved(self):
+        with self._imports_lock:
+            return len(self._imports_inflight)
+
+    def _import_holds(self, path):
+        """Is a migration import thread rebuilding the worktree at `path`? Until
+        it lands, nothing else may launch into, remove, or rebuild that path —
+        the thread may be removing an old copy there or adding the new one."""
+        if not isinstance(path, str) or not path:
+            return False
+        path = os.path.normpath(path)
+        with self._imports_lock:
+            return path in self._imports_inflight.values()
+
+    def _finish_import(self, job):
+        """Beat half of import_session: unpack the transcript, record the usage
+        window, and resume — over the worktree the import thread rebuilt."""
+        cmd = job["cmd"]
+        cwd = job["cwd"]
+        migration_id = cmd.get("migrationId")
+        transcript_id = cmd.get("transcriptId")
+
+        def refuse(reason):
+            self._refuse_start(reason, cmd_id=cmd.get("cmdId"),
+                               migration_id=migration_id,
+                               context="importSession")
+        if job.get("error"):
+            refuse(job["error"])
+            return
+        blob = job["blob"]
+
         slug_dir = os.path.join(PROJECTS_ROOT,
                                 _project_slug(os.path.normpath(cwd)))
         # A dsh session carries its durable store under `.dsh-store/`; unpack it
@@ -30405,9 +30645,12 @@ class SessionManager:
             "migratedFrom": cmd.get("migratedFrom"),
         }
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd.get("cmdId"),
-                            extra=extra, migration_id=migration_id)
+                            extra=extra, migration_id=migration_id,
+                            worktree_ready=bool(job.get("restored")),
+                            import_reserved=True)
 
-    def _pack_bytes(self, path, runs, dsh_store=None, qwen_store=None):
+    def _pack_bytes(self, path, runs, dsh_store=None, qwen_store=None,
+                    worktree=None):
         """The bundle itself: `<id>.jsonl` (truncated to its last complete line),
         plus `<id>/subagents/...` when present, plus the `runs` dir as
         `<id>/workflows/...` when one is given, plus a dsh session's durable
@@ -30449,9 +30692,14 @@ class SessionManager:
                     name=QWEN_STORE_ARCNAME + "/" + QWEN_STORE_MEMBER)
                 qti.size = len(qcomplete)
                 tar.addfile(qti, io.BytesIO(qcomplete))
+            for name, data in (worktree or {}).items():
+                wti = tarfile.TarInfo(name=WORKTREE_STATE_ARCNAME + "/" + name)
+                wti.size = len(data)
+                tar.addfile(wti, io.BytesIO(data))
         return buf.getvalue()
 
-    def _pack_transcript(self, path, dsh_store=None, qwen_store=None):
+    def _pack_transcript(self, path, dsh_store=None, qwen_store=None,
+                         worktree=None):
         """Bundle a transcript file (+ its subagents/ and workflows/ dirs, if
         any) into gzipped tar bytes, laid out relative to the project-slug dir so
         the target unpacks straight into PROJECTS_ROOT/<slug>/: `<id>.jsonl` and,
@@ -30485,7 +30733,8 @@ class SessionManager:
             else:
                 try:
                     blob = self._pack_bytes(path, runs, dsh_store=dsh_store,
-                                            qwen_store=qwen_store)
+                                            qwen_store=qwen_store,
+                                            worktree=worktree)
                 except OSError as e:
                     # An unreadable file in the RECORDS tree (a leftover
                     # root-owned one after a PUID change, say) must not refuse
@@ -30514,7 +30763,7 @@ class SessionManager:
                     log(f"migration: workflow records for {tid} would put the "
                         f"bundle over {MIGRATION_BLOB_MAX} bytes; not carrying them")
         return self._pack_bytes(path, None, dsh_store=dsh_store,
-                                qwen_store=qwen_store)
+                                qwen_store=qwen_store, worktree=worktree)
 
     def _unpack_transcript(self, blob, dest_dir, dsh_store_dest=None,
                            qwen_store_dest=None):
@@ -30535,17 +30784,24 @@ class SessionManager:
         the shared chats/ dir holds every cwd-cohabiting session's log, so a
         migration writes exactly this session's file, never a tree into it. It is
         likewise skipped without a `qwen_store_dest` (a qwen session falling back
-        to claude on a host without qwen)."""
+        to claude on a host without qwen).
+
+        Members under `.worktree/` (the session's git state) are never written
+        anywhere; `_read_worktree_members` reads them."""
         root = os.path.realpath(dest_dir)
         store_root = os.path.realpath(dsh_store_dest) if dsh_store_dest else None
         store_prefix = DSH_STORE_ARCNAME + "/"
         qwen_prefix = QWEN_STORE_ARCNAME + "/"
+        wt_prefix = WORKTREE_STATE_ARCNAME + "/"
         buf = io.BytesIO(blob)
         with tarfile.open(fileobj=buf, mode="r:gz") as tar:
             for m in tar.getmembers():
                 parts = m.name.split("/")
                 if m.name.startswith("/") or os.path.isabs(m.name) or ".." in parts:
                     raise ValueError(f"unsafe tar member {m.name!r}")
+                # .worktree/* is never extracted (_read_worktree_members).
+                if m.name == WORKTREE_STATE_ARCNAME or m.name.startswith(wt_prefix):
+                    continue
                 # Route .dsh-store/* to the dsh store dest; drop it if none.
                 if m.name == DSH_STORE_ARCNAME or m.name.startswith(store_prefix):
                     if store_root is None:
@@ -30665,6 +30921,425 @@ class SessionManager:
         except OSError as e:
             log(f"migration: could not re-key qwen native log cwd for "
                 f"{store_path}: {e}")
+
+    # Bounds for the git work a migration does on a worktree. Both capture (the
+    # export thread) and restore (the import thread) run OFF the beat, so they
+    # may take their time on a slow pool — but never forever.
+    MIGRATION_CAPTURE_GIT_TIMEOUT_SEC = 300
+    MIGRATION_RESTORE_GIT_TIMEOUT_SEC = 300
+    # Written in the SOURCE worktree's own gitdir (never the tree) when it is
+    # exported: the digest of the state that left. A later move BACK compares the
+    # old copy against it — unchanged since it left means everything in it went
+    # with the move, so it can be removed instead of kept aside.
+    MIGRATION_EXPORT_MARK = "turma-migrated-out"
+
+    def _worktree_snapshot(self, wt, tmp, t, lfs_check=False):
+        """(head, patch_path) for a worktree: HEAD's commit, and a binary diff of
+        the working tree against it built through a THROWAWAY index (`git add
+        -A` into a temp GIT_INDEX_FILE) — untracked files included, ignored ones
+        not, the session's real index untouched. Prefixes and diff drivers are
+        pinned so a user's diff config can't produce a patch `git apply`
+        refuses, and renames are off, so a patch from here never carries a
+        copy/rename header (the target refuses any that does)."""
+        rc, head = run_out(["git", "-C", wt, "rev-parse", "--verify", "HEAD^{commit}"],
+                           timeout=t)
+        if rc != 0 or not _GIT_OID_RE.fullmatch(head):
+            raise RuntimeError("the worktree has no readable HEAD commit")
+        # GIT_DIFF_OPTS outranks -U3 and GIT_EXTERNAL_DIFF swaps the diff out;
+        # neither may shape a patch the target applies.
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("GIT_DIFF_OPTS", "GIT_EXTERNAL_DIFF")}
+        env["GIT_INDEX_FILE"] = os.path.join(tmp, "index")
+        for cmd in (["read-tree", "HEAD"], ["add", "-A"]):
+            rc, err = run_ok(["git", "-C", wt, *cmd], timeout=t, env=env)
+            if rc != 0:
+                raise RuntimeError(f"git {cmd[0]} failed: {git_error_text(err)}")
+        ppath = os.path.join(tmp, "changes.patch")
+        # -U3 too: `diff.context=0` makes a patch git apply can't place
+        # mid-file, and drops the LFS pointer header the LFS refusal looks for.
+        rc, err = run_ok(["git", "-C", wt, "diff", "--cached", "--binary",
+                          "--no-color", "--no-ext-diff", "--no-textconv",
+                          "--no-renames", "--no-relative", "-U3",
+                          "--src-prefix=a/", "--dst-prefix=b/",
+                          f"--output={ppath}", "HEAD"], timeout=t, env=env)
+        if rc != 0:
+            raise RuntimeError(f"git diff failed: {git_error_text(err)}")
+        if lfs_check:
+            self._refuse_lfs_paths(wt, env, t)
+        return head, ppath
+
+    def _refuse_lfs_paths(self, wt, env, t):
+        """Raise if any path the snapshot changes is LFS-filtered: its content
+        lives in this host's `.git/lfs`, and only the pointer would move. Read
+        from git's own attributes, so no diff setting can hide it."""
+        out = subprocess.run(["git", "-C", wt, "diff", "--cached", "--name-only",
+                              "-z", "--no-renames", "--no-relative", "HEAD"],
+                             env=env, capture_output=True, timeout=t)
+        if out.returncode != 0:
+            raise RuntimeError("could not list the worktree's changed paths")
+        if not out.stdout:
+            return
+        attr = subprocess.run(["git", "-C", wt, "check-attr", "-z", "--stdin",
+                               "filter"], input=out.stdout, env=env,
+                              capture_output=True, timeout=t)
+        if attr.returncode != 0:
+            raise RuntimeError("could not read the worktree's git attributes")
+        f = attr.stdout.split(b"\0")
+        for i in range(0, len(f) - 2, 3):
+            if f[i + 2] == b"lfs":
+                raise RuntimeError("its uncommitted changes touch Git LFS files, "
+                                   "which a move cannot take yet; commit and push "
+                                   "them first")
+
+    def _worktree_digest(self, wt):
+        """sha256 over HEAD + the working-tree patch, or None if unreadable."""
+        try:
+            with tempfile.TemporaryDirectory(prefix="turma-migrate-") as tmp:
+                head, ppath = self._worktree_snapshot(
+                    wt, tmp, self.MIGRATION_RESTORE_GIT_TIMEOUT_SEC)
+                h = hashlib.sha256(head.encode() + b"\0")
+                with open(ppath, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+                return h.hexdigest()
+        except Exception:
+            return None
+
+    def _worktree_gitdir(self, wt):
+        # Only a dir that IS a checkout: without its own `.git`, git walks up to
+        # whatever repo encloses it (a REPOS_ROOT that is itself a repo).
+        if not os.path.lexists(os.path.join(wt, ".git")):
+            return None
+        rc, gd = run_out(["git", "-C", wt, "rev-parse", "--absolute-git-dir"],
+                         timeout=self.MIGRATION_CAPTURE_GIT_TIMEOUT_SEC)
+        return gd if rc == 0 and gd and os.path.isdir(gd) else None
+
+    def _capture_worktree_state(self, wt):
+        """Snapshot a worktree's git state for a migration bundle: the
+        WORKTREE_STATE_MEMBERS dict (name -> bytes) `_pack_bytes` writes under
+        `.worktree/`. Raises with an operator-facing reason on any failure, and
+        REFUSES what it cannot carry rather than shipping the move without it:
+        Git LFS content (only pointers would arrive; the objects live in this
+        host's `.git/lfs`), nested repos and dirty submodules (their files and
+        commits are not in this repo's diff), and anything over the size limit
+        (checked BEFORE `git add -A` writes it into the object store).
+
+        - `state.json`: HEAD's commit and the checked-out branch (None detached).
+        - `commits.bundle`: only when HEAD has commits no remote-tracking ref
+          has, so pushed history is never shipped twice.
+        - `changes.patch`: `_worktree_snapshot`'s diff, when there is one."""
+        t = self.MIGRATION_CAPTURE_GIT_TIMEOUT_SEC
+        rc, branch = run_out(["git", "-C", wt, "symbolic-ref", "-q", "--short", "HEAD"],
+                             timeout=t)
+        branch = branch if rc == 0 and _migratable_branch(branch) else None
+        rc, ahead = run_out(["git", "-C", wt, "rev-list", "--count", "HEAD",
+                             "--not", "--remotes"], timeout=t)
+        if rc != 0 or not ahead.isdigit():
+            raise RuntimeError("the worktree has no readable HEAD commit")
+        # Dirty submodules: porcelain v2 marks a submodule entry `S<c><m><u>`;
+        # any letter there (not '.') is a change inside it this diff can't carry.
+        rc, st = run_out(["git", "-C", wt, "status", "--porcelain=v2",
+                          "--ignore-submodules=none"], timeout=t)
+        if rc != 0:
+            raise RuntimeError("could not read the worktree's status")
+        for line in st.splitlines():
+            f = line.split(" ")
+            if line[:2] in ("1 ", "2 ") and len(f) > 2 and f[2].startswith("S") \
+                    and f[2] != "S...":
+                raise RuntimeError(f"submodule {f[-1]!r} has changes a move cannot "
+                                   f"carry; commit and push them first")
+        # Untracked bytes, before `git add -A` copies them into .git/objects.
+        rc, untracked = run_out(["git", "-C", wt, "ls-files", "-o",
+                                 "--exclude-standard", "-z"], timeout=t)
+        if rc != 0:
+            raise RuntimeError("could not list the worktree's untracked files")
+        size = 0
+        for rel in filter(None, untracked.split("\0")):
+            try:
+                size += os.lstat(os.path.join(wt, rel)).st_size
+            except OSError:
+                pass
+        if size > MIGRATION_BLOB_MAX:
+            raise RuntimeError(f"its untracked files total {size} bytes, over the "
+                               f"{MIGRATION_BLOB_MAX}-byte migration limit")
+
+        def take(path, what):
+            n = os.path.getsize(path)
+            if n > MIGRATION_BLOB_MAX:
+                raise RuntimeError(f"the {what} is {n} bytes, over the "
+                                   f"{MIGRATION_BLOB_MAX}-byte migration limit")
+            with open(path, "rb") as f:
+                return f.read()
+
+        out = {}
+        with tempfile.TemporaryDirectory(prefix="turma-migrate-") as tmp:
+            if int(ahead) > 0:
+                rc, lfs = run_out(["git", "-C", wt, "log", "--format=%H", "-1",
+                                   "--no-textconv", "--no-ext-diff",
+                                   f"-G{_LFS_POINTER_RE_GIT}", "HEAD", "--not",
+                                   "--remotes"], timeout=t)
+                if rc != 0 or lfs:
+                    raise RuntimeError("its unpushed commits carry Git LFS files, "
+                                       "which a move cannot take yet; push first")
+                bpath = os.path.join(tmp, "commits.bundle")
+                rc, err = run_ok(["git", "-C", wt, "bundle", "create", "--quiet",
+                                  bpath, "HEAD", "--not", "--remotes"], timeout=t)
+                if rc != 0:
+                    raise RuntimeError(f"git bundle failed: {git_error_text(err)}")
+                out["commits.bundle"] = take(bpath, "unpushed commits' bundle")
+            head, ppath = self._worktree_snapshot(wt, tmp, t, lfs_check=True)
+            patch = take(ppath, "uncommitted changes' patch")
+            if _patch_has_gitlink(patch):
+                raise RuntimeError("it holds a nested git repo or a moved submodule, "
+                                   "whose contents a move cannot carry")
+            if _LFS_POINTER_ADDED_RE.search(patch):
+                raise RuntimeError("its uncommitted changes touch Git LFS files, "
+                                   "which a move cannot take yet; commit and push "
+                                   "them first")
+            if patch:
+                out["changes.patch"] = patch
+            digest = hashlib.sha256(head.encode() + b"\0" + patch).hexdigest()
+        out["state.json"] = json.dumps({"v": 1, "head": head,
+                                        "branch": branch}).encode()
+        gd = self._worktree_gitdir(wt)
+        if gd:
+            try:
+                with open(os.path.join(gd, self.MIGRATION_EXPORT_MARK), "w") as f:
+                    f.write(digest)
+            except OSError:
+                pass   # costs only a kept-aside copy on a later move back
+        return out
+
+    def _read_worktree_members(self, blob):
+        """The `.worktree/` members of a migration bundle, name -> bytes. Only
+        the known names; each bounded by MIGRATION_BLOB_MAX (a gzip bomb must
+        not balloon the agent) and the whole set too."""
+        out, total = {}, 0
+        prefix = WORKTREE_STATE_ARCNAME + "/"
+        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+            for m in tar:
+                if not m.name.startswith(prefix):
+                    continue
+                rel = m.name[len(prefix):]
+                if rel not in WORKTREE_STATE_MEMBERS or not m.isreg():
+                    continue
+                if m.size > MIGRATION_BLOB_MAX - total:
+                    raise ValueError(f"{rel} is over the migration size limit")
+                src = tar.extractfile(m)
+                if src is None:
+                    continue
+                with src:
+                    data = src.read(MIGRATION_BLOB_MAX - total + 1)
+                total += len(data)
+                if total > MIGRATION_BLOB_MAX:
+                    raise ValueError(f"{rel} is over the migration size limit")
+                out[rel] = data
+        return out
+
+    def _restore_worktree_state(self, sess, files):
+        """Re-create a migrated session's worktree at sess["worktreePath"] from
+        `_capture_worktree_state`'s output: the moved commits, the same branch
+        (when that is safe here), then the uncommitted changes on top. Runs on
+        the import thread. Raises with an operator-facing reason, undoing what it
+        did first: the added worktree, a branch it created, an older copy it
+        moved aside.
+
+        The bundle crossed a host boundary. The patch is refused outright if it
+        carries a copy/rename header (`git apply` reads a `copy from` path
+        as-is, absolute included — an arbitrary-file read) or a gitlink;
+        `git apply` itself refuses `..`, `.git` and writes through a symlink.
+
+        The branch is checked out only where that loses nothing on this host —
+        created when absent, or fast-forwarded when this host's copy is behind;
+        otherwise (diverged, or checked out by another worktree) the session
+        lands DETACHED at the moved commit and the branch is left as it was."""
+        repo, cwd = sess["repoPath"], sess["worktreePath"]
+        t = self.MIGRATION_RESTORE_GIT_TIMEOUT_SEC
+        try:
+            meta = json.loads((files.get("state.json") or b"").decode())
+        except (ValueError, UnicodeDecodeError):
+            meta = None
+        head = meta.get("head") if isinstance(meta, dict) else None
+        if not isinstance(head, str) or not _GIT_OID_RE.fullmatch(head):
+            raise RuntimeError("the moved worktree state names no valid commit")
+        branch = meta.get("branch")
+        if not _migratable_branch(branch):
+            branch = None
+        patch = files.get("changes.patch") or b""
+        bad = _unsafe_patch_reason(patch)
+        if bad:
+            raise RuntimeError(f"the moved changes were refused: {bad}")
+        fetched = []
+
+        def fetch_origin():
+            if not fetched:
+                fetched.append(True)
+                run_ok(["git", "-C", repo, "fetch", "--quiet", "origin"],
+                       timeout=FETCH_TIMEOUT_SEC * 4)
+
+        def has_commit():
+            return run_out(["git", "-C", repo, "cat-file", "-e", f"{head}^{{commit}}"],
+                           timeout=t)[0] == 0
+
+        env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+        tmp_ref = f"refs/turma/migrate/{sess['id']}"
+        aside = created_branch = None
+        added = False
+        with tempfile.TemporaryDirectory(prefix="turma-migrate-") as tmp:
+            bundle = files.get("commits.bundle")
+            try:
+                if bundle:
+                    bpath = os.path.join(tmp, "commits.bundle")
+                    with open(bpath, "wb") as f:
+                        f.write(bundle)
+                    fetch = ["git", "-C", repo, "fetch", "--quiet", "--no-tags",
+                             bpath, f"+HEAD:{tmp_ref}"]
+                    rc, err = run_ok(fetch, timeout=t)
+                    if rc != 0:
+                        # The bundle presupposes commits from the source's remote
+                        # that this host has not fetched yet.
+                        fetch_origin()
+                        rc, err = run_ok(fetch, timeout=t)
+                    if rc != 0:
+                        raise RuntimeError(f"unpacking the moved commits failed: "
+                                           f"{git_error_text(err)}")
+                if not has_commit():
+                    fetch_origin()
+                if not has_commit():
+                    raise RuntimeError(f"commit {head[:12]} is neither in the moved "
+                                       f"bundle nor on this host's remote")
+                aside = self._clear_stale_migration_worktree(repo, cwd, head)
+                os.makedirs(os.path.dirname(cwd), exist_ok=True)
+                run(["git", "-C", repo, "worktree", "prune"])
+                rc, err = None, ""
+                if branch:
+                    rc, err, created_branch = self._add_migrated_branch_worktree(
+                        repo, cwd, branch, head, env, t)
+                if rc != 0:
+                    if branch:
+                        log(f"migration: branch {branch} is not free to check out "
+                            f"here ({git_error_text(err)}); landing detached at "
+                            f"{head[:12]}")
+                    rc, err = run_ok(["git", "-C", repo, "worktree", "add",
+                                      "--detach", cwd, head], timeout=t, env=env)
+                    if rc != 0:
+                        raise RuntimeError(f"git worktree add failed: "
+                                           f"{git_error_text(err)}")
+                added = True
+                if patch:
+                    ppath = os.path.join(tmp, "changes.patch")
+                    with open(ppath, "wb") as f:
+                        f.write(patch)
+                    rc, err = run_ok(["git", "-C", cwd, "apply", "--binary",
+                                      "--whitespace=nowarn", ppath], timeout=t, env=env)
+                    if rc != 0:
+                        raise RuntimeError(f"re-applying the uncommitted changes "
+                                           f"failed: {git_error_text(err)}")
+            except Exception:
+                if added:
+                    self._worktree_remove(sess)
+                if created_branch:
+                    run(["git", "-C", repo, "branch", "-D", created_branch])
+                if aside and not os.path.exists(cwd):
+                    try:
+                        os.rename(aside, cwd)
+                        run(["git", "-C", repo, "worktree", "repair", cwd])
+                    except OSError as e:
+                        log(f"migration: could not put {aside} back at {cwd}: {e}")
+                raise
+            finally:
+                if bundle:
+                    run(["git", "-C", repo, "update-ref", "-d", tmp_ref])
+
+    def _add_migrated_branch_worktree(self, repo, cwd, branch, head, env, t):
+        """`git worktree add` on `branch` at `head`, only when that rewrites no
+        history here. Returns (rc, stderr, branch-if-created); a nonzero rc means
+        the caller falls back to a detached checkout."""
+        rc, tip = run_out(["git", "-C", repo, "rev-parse", "--verify", "-q",
+                           f"refs/heads/{branch}^{{commit}}"], timeout=t)
+        created = None
+        if rc == 1:
+            add, created = ["-b", branch, cwd, head], branch
+        elif rc != 0:
+            return 1, f"could not read branch {branch}", None
+        else:
+            if tip != head:
+                if run_out(["git", "-C", repo, "merge-base", "--is-ancestor", tip,
+                            head], timeout=t)[0] != 0:
+                    return 1, f"{branch} here has commits the moved one lacks", None
+                # Fails on its own when another worktree has it checked out.
+                rc, err = run_ok(["git", "-C", repo, "branch", "-f", branch, head],
+                                 timeout=t)
+                if rc != 0:
+                    return rc, err, None
+            add = [cwd, branch]
+        rc, err = run_ok(["git", "-C", repo, "worktree", "add", *add],
+                         timeout=t, env=env)
+        if rc != 0:
+            return rc, err, None
+        if run_out(["git", "-C", repo, "rev-parse", "--verify", "-q",
+                    f"refs/remotes/origin/{branch}"], timeout=t)[0] == 0:
+            run_ok(["git", "-C", cwd, "branch", f"--set-upstream-to=origin/{branch}"],
+                   timeout=t)
+        return rc, err, created
+
+    def _clear_stale_migration_worktree(self, repo, cwd, head):
+        """A move BACK to a host still holding the worktree it left (A->B->A: the
+        killed source keeps it so it stays resumable) finds the old copy at the
+        very path the moved state must land on. It is REMOVED when it provably
+        holds nothing the move lacks — unchanged since it was exported (its
+        digest equals MIGRATION_EXPORT_MARK), or clean at an ancestor of the
+        moved HEAD. Anything else is moved aside to `<cwd>.pre-migration-<ts>`
+        (detached first, so its branch is free for the moved session), never
+        deleted. Returns the aside path, or None."""
+        if not os.path.lexists(cwd):
+            return None
+        t = self.MIGRATION_RESTORE_GIT_TIMEOUT_SEC
+        redundant = False
+        # No `.git` of its own (a half-removed copy): every git command below
+        # would walk up to an enclosing repo and act on THAT. It is kept aside
+        # as a plain dir, untouched.
+        own = os.path.lexists(os.path.join(cwd, ".git"))
+        gd = self._worktree_gitdir(cwd)
+        mark = None
+        if own and gd:
+            try:
+                with open(os.path.join(gd, self.MIGRATION_EXPORT_MARK)) as f:
+                    mark = f.read(128).strip()
+            except OSError:
+                pass
+        if mark and self._worktree_digest(cwd) == mark:
+            redundant = True
+        elif own:
+            rc_s, dirty = run_out(["git", "-C", cwd, "status", "--porcelain"], timeout=t)
+            rc_h, old = run_out(["git", "-C", cwd, "rev-parse", "--verify",
+                                 "HEAD^{commit}"], timeout=t)
+            redundant = rc_s == 0 and not dirty and rc_h == 0 and (
+                old == head or run_out(["git", "-C", repo, "merge-base",
+                                        "--is-ancestor", old, head], timeout=t)[0] == 0)
+        if redundant:
+            run_ok(["git", "-C", repo, "worktree", "remove", "--force", cwd], timeout=t)
+            if os.path.lexists(cwd):
+                # A removal cut short leaves a half-deleted dir git no longer
+                # knows; it was judged redundant, so finish it by hand.
+                shutil.rmtree(cwd, ignore_errors=True)
+            run(["git", "-C", repo, "worktree", "prune"])
+            if not os.path.lexists(cwd):
+                log(f"migration: removed the older copy at {cwd} (nothing in it "
+                    f"the move lacks)")
+                return None
+        if own:
+            run_ok(["git", "-C", cwd, "checkout", "-q", "--detach"], timeout=t)
+        aside = f"{cwd}.pre-migration-{int(time.time())}"
+        try:
+            os.rename(cwd, aside)
+        except OSError as e:
+            raise RuntimeError(f"an older worktree is in the way at {cwd} and could "
+                               f"not be moved aside: {e}")
+        if own:
+            run(["git", "-C", repo, "worktree", "repair", aside])
+        log(f"migration: kept the older worktree at {cwd} as {aside}")
+        return aside
 
     # A bundle is the largest thing an agent ever sends, so it is the body most
     # likely to meet the hub's in-flight budget (XERK-258) and be told 503 "busy,
@@ -30967,8 +31642,20 @@ class SessionManager:
         self._kill_tmux(sess)
         self._kill_ttyd(sid)
         # Root has no worktree to remove — REPOS_ROOT and its repos stay put;
-        # delete just tears down the processes and drops the record.
-        if not sess.get("root") and os.path.isdir(sess["worktreePath"]):
+        # delete just tears down the processes and drops the record. Nor is a
+        # worktree removed that something ELSE now owns: another record at the
+        # same path (a migration landed beside a stale error card), or a
+        # migration import rebuilding it right now — the record goes, the tree
+        # stays.
+        wt = sess.get("worktreePath")
+        shared = (isinstance(wt, str) and wt and (self._import_holds(wt) or any(
+            s is not sess and isinstance(s.get("worktreePath"), str)
+            and os.path.normpath(s["worktreePath"]) == os.path.normpath(wt)
+            for s in self.registry)))
+        if shared:
+            log(f"delete {sid}: keeping {wt}, which another session or a "
+                f"migration is using")
+        elif not sess.get("root") and os.path.isdir(sess["worktreePath"]):
             try:
                 gi = git_info_cheap(sess["worktreePath"], strict=True)
             except GitTimeout:
@@ -31003,7 +31690,7 @@ class SessionManager:
             # The lifecycle worker re-adding it for this record's wake: removing
             # it now would race that `git worktree add`; the landed resume then
             # finds no record and leaves the worktree to a later prune.
-            or self._sleeper_job_blocks(cwd=wt))
+            or self._sleeper_job_blocks(cwd=wt) or self._import_holds(wt))
         if wt is not None and not held and os.path.isdir(wt) \
                 and isinstance(rec.get("repoPath"), str):
             self._worktree_remove(rec)
@@ -40725,6 +41412,9 @@ class SessionManager:
         # not in the registry yet, but must never be swept from under it.
         with self._sleeper_lock:
             live.update(self._sleeper_restoring)
+        # Nor a migrated-in worktree the import thread is rebuilding.
+        with self._imports_lock:
+            live.update(self._imports_inflight.values())
         return live
 
     def _claim_for_removal(self, path):
@@ -42535,6 +43225,11 @@ class SessionManager:
             self._apply_sleeper_landed(light=light)
         except Exception as e:
             log(f"sleeper resume apply failed: {e}")
+        # Finish migrations whose import thread is done: transcript unpack and
+        # launch are the beat's. Full beats only, like the sleeper relaunch, so
+        # a light beat never carries a second launch (XERK-395).
+        if not light:
+            self._apply_imports_landed()
         # Deliver session-CLI wake-ups that have come due (XERK-1564): a time
         # compare per record, then a STAGE onto the off-beat input worker.
         try:
