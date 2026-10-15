@@ -171,6 +171,10 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   the flow layout does not map. A later ticket can lay its repo rows out multi-column if a need
   appears.
 
+- **Dark categorical slot s4 is `#2E9E2E` on Android, `#008300` on the web (operator call).** Every
+  other dark slot (`ChartSeries`, `ui/theme/Color.kt`) equals the web's dark `--s1..--s8`
+  (`app.css`); s4 is kept at Android's lighter green on purpose, so do not "fix" either side.
+
 ## Done (this pass — first installment)
 
 - **Repo on the Sessions-tab session card (XERK-125).** The live card's meta row read

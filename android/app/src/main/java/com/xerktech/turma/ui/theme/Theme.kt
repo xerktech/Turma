@@ -79,7 +79,15 @@ object TurmaColors {
     val checkPass = Good
     val checkFail = Critical
     val checkPending = Warning
-    val series = ChartSeries
+
+    /**
+     * The categorical slots (org tints, chart lines) for the current theme, as the
+     * web's `--s1..--s8` are redefined for dark: the dark set on a light page tinted
+     * every org card a shade off the web's. Composable so no call site can keep one
+     * theme's palette across a theme switch.
+     */
+    @Composable
+    fun series(): List<Color> = if (isLight()) ChartSeriesLight else ChartSeries
 
     /**
      * Amber as TEXT (web `--warning-text`): the fill is under 2:1 on a light card,

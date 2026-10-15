@@ -462,6 +462,18 @@ class ChatItemsTest {
         // A fence indented by a non-breaking space is a fence, as on the web.
         assertEquals("i\n\u00A0```\n<system-reminder>\nb\n```\ne",
             stripFraming("i\n\u00A0```\n<system-reminder>\nb\n```\ne"))
+        // A tag line's ending, as the renderer reads it (rollup XERK-1701, in step with
+        // chat.test.js): each lone CR ends a line, so the tag goes whole and the blank
+        // line the second CR makes stays.
+        assertEquals("a\n\nb\nc", stripFraming("a\n<system-reminder>\r\rb\n</system-reminder>\nc"))
+        assertEquals("a\n\r\nb\nc", stripFraming("a\n<system-reminder>\r\r\nb\n</system-reminder>\nc"))
+        // U+2028/U+2029/NEL end no line for the renderer, so a tag line carrying one is
+        // text, kept whole. Java's `$` matches before a final line terminator, which is
+        // why the tag regex runs as matchEntire, never find.
+        for (w in listOf("\u2028", "\u2029", "\u0085")) {
+            assertEquals("a\n<system-reminder>${w}\nb\nc", stripFraming("a\n<system-reminder>${w}\nb\nc"))
+            assertEquals("a\n<system-reminder>${w}b\nc", stripFraming("a\n<system-reminder>${w}b\nc"))
+        }
         // Claude Code's matched paste framing goes even inside the operator's fence (QA).
         assertEquals("look at this log:\n```\n\n\nE1 boom\nE2 boom\n\n```\nwhy does it fail?",
             stripFraming("look at this log:\n```\n\n\n<pasted_content id=\"6550\">\nE1 boom\nE2 boom\n" +

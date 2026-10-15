@@ -2014,6 +2014,15 @@ test("renderProse/stripFraming: a fence line full of blanks reads in linear time
   assert.match(renderProse("```js  \t\ncode\n```  "), /<code>code<\/code>/);
 });
 
+test("renderProse: a line of unclosed backtick runs of distinct lengths renders in linear time", () => {
+  // One line of unclosed runs of lengths 1, 2, … 1414 (1M chars): each opener used to
+  // scan to the line end, N^1.5 (~3.5 s of CPU); indexed runs take ~10 ms (rollup XERK-1701).
+  const t = process.cpuUsage();
+  renderProse("x" + Array.from({ length: 1414 }, (_, k) => "`".repeat(k + 1)).join(" "));
+  const used = process.cpuUsage(t);
+  assert.ok((used.user + used.system) / 1000 < 1000, "took too long");
+});
+
 test("renderProse: a URL's dot run, a [ run and a backtick run render in linear time", () => {
   // Rollup XERK-1701: each was quadratic (a URL + 64k dots took ~46 s on Android).
   const t = process.cpuUsage();  // CPU time, not wall: a loaded runner must not flake it
@@ -2022,11 +2031,9 @@ test("renderProse: a URL's dot run, a [ run and a backtick run render in linear 
   renderProse("x``" + " `".repeat(1000000));
   renderProse("`a` ".repeat(500000));
   renderProse("![".repeat(200000) + "x");
-  // One line of unclosed runs of distinct lengths (1, 2, … 1414): each used to scan
-  // to the line end, N^1.5 (4.2 s at this 1M-char size).
-  renderProse("x" + Array.from({ length: 1414 }, (_, k) => "`".repeat(k + 1)).join(" "));
   const used = process.cpuUsage(t);
-  assert.ok((used.user + used.system) / 1000 < 1500, "took too long");
+  // ~0.8 s of CPU idle, more on a loaded host; each quadratic form took tens of seconds.
+  assert.ok((used.user + used.system) / 1000 < 6000, "took too long");
   // Behaviour kept: trailing punctuation still peels out of a bare URL...
   assert.match(renderProse("see https://x.io/a."), /href="https:\/\/x\.io\/a"[^>]*>https:\/\/x\.io\/a<\/a>\./);
   // ...a span on a later line of the paragraph still closes (the cached line end is re-found)...
@@ -3065,6 +3072,18 @@ test("buildItems: a framing tag inside an operator's code fence is their text (r
   assert.equal(strip("a\rb\n```\r\r\n<system-reminder>\n```\nend"), "a\nb\n```\n\r\n<system-reminder>\n```\nend");
   // A fence indented by a non-breaking space is a fence, as the renderer reads it.
   assert.equal(strip("i\n\u00a0```\n<system-reminder>\nb\n```\ne"), "i\n\u00a0```\n<system-reminder>\nb\n```\ne");
+  // A tag line's ending, as the renderer reads it (rollup XERK-1701, in step with
+  // ChatItemsTest.kt). Each lone CR ends a line: the tag goes whole, and the blank
+  // line the second CR makes stays, with no CR left on the tag's line.
+  assert.equal(strip("a\n<system-reminder>\r\rb\n</system-reminder>\nc"), "a\n\nb\nc");
+  assert.equal(strip("a\n<system-reminder>\r\r\nb\n</system-reminder>\nc"), "a\n\r\nb\nc");
+  // U+2028/U+2029 (and NEL) end no line for the renderer ("## H\u2028" is no heading),
+  // so a tag line carrying one is the operator's text, kept whole — never the tag
+  // dropped with the separator left behind.
+  for (const w of ["\u2028", "\u2029", "\u0085"]) {
+    assert.equal(strip("a\n<system-reminder>" + w + "\nb\nc"), "a\n<system-reminder>" + w + "\nb\nc", JSON.stringify(w));
+    assert.equal(strip("a\n<system-reminder>" + w + "b\nc"), "a\n<system-reminder>" + w + "b\nc", JSON.stringify(w));
+  }
   // Claude Code's own matched paste framing goes even inside the operator's fence.
   assert.equal(byId.i.text, "look at this log:\n```\n\n\nE1 boom\nE2 boom\n\n```\nwhy does it fail?");
 });

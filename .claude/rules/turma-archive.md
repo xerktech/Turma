@@ -241,6 +241,11 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     counts differ from their FILE — so lines differing only in `blocks` don't loop forever.
   - Lines are split and written as raw bytes; `bytesStored` is untouched; `dedupChecked` (the size
     covered) skips unchanged files.
+  - **The skip also needs `dedupKeying === DEDUP_KEYING`**: a stamp made under an older keying kept
+    pairs the current one calls duplicates, while first-copy readers counted them once (XERK-1701).
+    Bump `DEDUP_KEYING` whenever `dedupLines`' keying changes; each file is then re-read once.
+  - **EVERY stamp carries `dedupKeying`, the clean-file one included** — without it each boot's
+    pass re-read the whole archive. Tests: `a CLEAN file re-checked under the current keying…`.
   - Tests: the `XERK-1450` cases in `index-store.test.js` and `archive-landed-wiring.test.js`.
 - **`meta` is COERCED before it is bound** (`normalizeMeta`) — every field is agent-supplied and goes
   straight into sqlite (scalars only); a non-scalar stores as nothing rather than poisoning every

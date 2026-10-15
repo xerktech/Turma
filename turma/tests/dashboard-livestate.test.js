@@ -160,6 +160,13 @@ test("dashboard liveState: a wait with no ETA says how long it has waited", () =
     "stalled on 1 background shell");
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 12 * 60, agents: [blank] }), onlineHost, NOW).label,
     "⏳ waiting on 1 background shell\u00a0·\u00a012m");
+  // JS's trim set, which Android's jsTrim mirrors (rollup XERK-1701): U+FEFF is blank,
+  // U+001C is not — Kotlin's own trim/isBlank say the reverse.
+  const bom = { ...ci, label: "\ufeff" }, fs1c = { ...ci, label: "\u001c" };
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [bom] }), onlineHost, NOW).label,
+    "stalled on 1 background shell");
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [fs1c] }), onlineHost, NOW).label,
+    "stalled · \u001c");
 });
 
 // XERK-1571 screenshot defect: a stalled card showed a second age (its last

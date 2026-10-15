@@ -99,6 +99,11 @@ byte-identical + no-work-on-the-beat invariants. This file is the operative rule
   archive hydrate for 3 days (ingest 503 "still syncing" the whole time). An idle death logs one
   `postgres pool: idle connection … died` line, since no query fails to announce it.
   Tests: `live: idle connections the server closed never wedge the pool` in `pgclient.test.js`.
+- **`PgConnection.query` encodes the statement BEFORE claiming the connection (`_q`)** and refuses
+  more than `MAX_BIND_PARAMS` (32767, Bind's int16 count). Encoding after the claim threw with `_q`
+  set, so the connection answered "already has a query in flight" until the query timeout.
+  Callers binding a list per statement must cap it (the index reconcile clamps its batch to 10000).
+  Tests: `live: too many bind parameters is refused cleanly…` in `pgclient.test.js`.
 - **`upsertGreatest({table, keys, values, greatest})`** builds the `INSERT … ON CONFLICT (keys) DO
   UPDATE SET col = GREATEST(table.col, EXCLUDED.col)` the ledger's per-host high-water needs — a
   low/partial writer can NEVER lower a recorded total, the SAME max-merge semantics the Valkey ledger

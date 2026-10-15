@@ -303,9 +303,15 @@ class HubHarness : ExternalResource() {
             // JSON objects, null for fixtures predating the feature.
             triageActions: String? = null,
             triagePolicies: String? = null,
+            // The host's `lastSeen` stamp. A later beat carries a fresher one, and
+            // `FleetRepository.refresh` keeps the fresher record when an older poll
+            // answer lands after it (XERK-812) — set it on a SECOND beat whenever a
+            // `nudge()` poll may still be in flight with the first one's payload.
+            lastSeen: Long = 0,
         ): String = buildString {
             append("""{"now": $now, "agents": [{"key": "$host", "device": "$host", """)
             append("\"online\": true, \"terminalOnline\": true, ")
+            if (lastSeen != 0L) append("\"lastSeen\": $lastSeen, ")
             append("\"repos\": [{\"name\": \"$repo\", \"lastActivity\": \"2026-08-12T00:00:00Z\"}],")
             if (localModel != null) append(" \"localModel\": $localModel,")
             if (dsh != null) append(" \"dsh\": $dsh,")

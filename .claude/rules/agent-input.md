@@ -25,6 +25,11 @@ composed.**
     (`_deliver_staged_resends`), skipping one the session no longer holds on its outbox (delivered,
     or cleared by a clear-context restart) so a new conversation never gets the old one's text.
     Typing on the beat cost ~36s per message with a wedged tmux (rollup XERK-1701 #70.1).
+  - **A waiting resend still expires at `PENDING_INPUT_TTL_SEC`**: a worker killed by a
+    BaseException never types its batch. `_deliver_staged_resends` empties `resend_inflight`
+    however its batch ends, and staging work revives a dead worker (`_revive_input_worker`).
+  - The worker reads the pane epoch BEFORE the outbox check, and `restart` pops the outbox
+    before it relaunches — so a resend either sees its message gone or stops at the relaunch.
   - Outbox is internal (not heartbeated), cleared on restart-clear-context; text typed directly into
     the raw ttyd terminal bypasses `send_input` and isn't covered.
   - Tests: `TestPendingScan`, `TestPollPendingInputs`, `TestSendInput`.
@@ -39,6 +44,84 @@ composed.**
     compaction resend, qwen peer). Those keep one bracketed paste; `chat.js` `stripFraming`
     hides the tags.
   - A typed TAB is autocomplete, so tabs go as 4 spaces. One writer per pane (`_PANE_TYPE_LOCKS`).
+  - **A relaunch stops a message mid-typing** (`_PANE_EPOCHS`, rollup #70.1): `_launch_tmux`
+    bumps the pane name's epoch under its write gate; every pane write (`_pane_write`) checks
+    it, so a restart never gets the old conversation's Enter. The gate is held for ONE write,
+    so a relaunch waits out at most one pane call. Epochs are pruned ONLY once the pane is gone
+    for good (`_forget_pane` in `_kill_tmux`, see the comment) — never on a live pane.
+    Tests: `TestPaneRelaunchStopsTyping`.
+  - **Nothing is typed into a pane a dialog owns** (`_pane_blocking_dialog`): a typed digit picks
+    an option and any Enter approves the highlighted one. Covers every caller (input, resend,
+    notify fallback, qwen peer). `_submit_typed` also never presses into a dialog that came up
+    while typing or after its Enter, and stops watching at once.
+    Tests: `TestSubmitTypedDialogsAndBaselines`.
+  - **The dialog check runs before EVERY write, not once per message** (`_slice_gate`): before
+    each later slice, send-keys chunk and Enter, on tmux and Windows, whether or not draws are
+    still awaited. QA: a dialog drawn mid-message got the rest, and a last slice "1" approved
+    the tool 3/6. A stop returns `PANE_DIALOG` with nothing more typed (never a ^U either).
+    Tests: `TestDialogMidMessage`.
+  - **No slice after the first is short** (`_input_slices`: the last two share the remainder).
+    A dialog ignores a multi-char slice but takes a lone digit; this closes the check-then-type
+    window, and covers a pane whose composer can't be read. Never go back to a ragged tail.
+  - **A message a dialog kept out is HELD, never dropped** (`_hold`, `_deliver_held`): input,
+    notify fallback (its PR comment is already marked seen), compaction resend, qwen peer, and
+    a trust modal a human must answer. The input worker retries every `INPUT_HOLD_RETRY_SEC`
+    for `INPUT_HOLD_TTL_SEC`, then drops it with a log line.
+    - A TTL drop also forgets the leftover record that held it (else it holds the NEXT message
+      too) — that record object only (`h["leftover"]`), never a newer one stored since — and a
+      dropped OPERATOR message logs `OPERATOR MESSAGE NOT DELIVERED`. No agent→hub channel
+      carries it yet (spawnFailures is keyed to spawn cmdIds), so that log line is the
+      operator's only trace.
+    - Accepted residual: after that drop, the composer may still hold our stale fragment plus
+      the operator's text, and the NEXT message is typed into it and submitted glued to both.
+    - One session's messages go in order: a later one queues behind a held one, and one
+      waiting out its backoff blocks the rest (live rig: a due resend overtook it).
+    - The worker sleeps to the earliest due time among each session's FIRST held message
+      (`_held_wait`): a blocked later one's past due time spun it at 20 Hz.
+    - A held entry stays on `input_held` until typed, so `_input_undelivered` (sleeper pause)
+      sees it; it moves to `input_landed` in one locked step. `_resend_queued` sees held resends.
+    - Pinned to the pane epoch it was typed against: a relaunch drops it (old conversation).
+    - What a stopped message typed is RECORDED per pane (`_PANE_LEFTOVERS`, `_note_leftover`:
+      the typed prefix, or "a paste" for the bracketed path). The next write into that pane
+      clears it first (`_clear_leftover`), else the retry submits it twice, glued.
+    - Only while the composer shows ONLY ours (`_leftover_view`: "head"/"piece"/"chip", at least
+      `COMPOSER_MIN_SHOWN_CHARS` of it before the first press). Never "any piece of the message":
+      that erased an operator's own draft "yes" (QA).
+    - Ours WITH other text ("mixed"), an unreadable composer ("unknown"), or a clear past its
+      bounds → `PANE_HOLD`: press nothing, type nothing, the message stays held (`_must_hold`)
+      until the composer no longer shows ours (the operator submitted or cleared it; "gone"),
+      which drops the record. Typing after a failed clear submitted the message twice (QA).
+    - Keyed to the pane epoch; a relaunch, and `_kill_tmux` (`_forget_pane`), drop the record.
+    - Residual: held state is in memory; an agent restart loses it.
+    Tests: `TestHeldForDialog`.
+  - **Clearing an unsent message CONVERGES on the composer read back** (`_clear_composer`):
+    never a press count from the text. Measured on 2.1.300: Ctrl+U deletes to the start of the
+    VISUAL row (a wrapped 400-char line at 120 cols lost ~65 chars a press; counting logical
+    lines left 301 and the retry sent 3977 chars for 3201), joins a row to the one above at its
+    start, clears a `[Pasted text #n ...]` chip in one press, and does nothing on an empty box.
+    - Presses go ≤`CLEAR_KEYS_PER_WRITE` per write (a bigger burst drops presses; past ~800
+      bytes it is a paste chip of literal ^U), re-reading after each, until none of ours is
+      left. A dialog stops it at once.
+    - Each batch is also ≤ rows drawn − 1: a press removes at most one row, so the top drawn
+      row is never pressed until it is all there is. A composer taller than the pane draws only
+      its last rows, ❯ on the first drawn, with no "more above" marker — text above ours scrolls
+      in before any press can reach it, reads "mixed", and holds.
+    - Bounds sized to the TYPED worst case (`CLEAR_MAX_PRESSES` = 2×`PASTE_SLICED_MAX_CHARS`+2;
+      300 lines needed >400) and `CLEAR_DEADLINE_SEC`, both counted across retries on the
+      leftover record (`budget`). A record written after a clear already ran (Windows'
+      inline clear) carries that budget (`_note_leftover(budget=)`): a fresh one read a
+      short remnant as maybe the operator's and typed the next message onto it (QA).
+    - **One attempt presses for at most `CLEAR_ATTEMPT_SEC`, then the next retry resumes**: the
+      ONE input worker delivers every session's messages, so a slow clear in one pane must not
+      stall the rest. `CLEAR_ATTEMPT_SEC` (not the whole budget) is in `PANE_TYPE_LOCK_WAIT_SEC`.
+    - **A batch that changes nothing (re-read once) = a DEAF composer** (tmux copy-mode: QA saw
+      7830 presses in 90s, every retry): hold, and remember the view (`stuck`). A retry that
+      reads the same view holds after that one read, until `CLEAR_STUCK_PROBE_SEC`, when one
+      batch probes again (leaving copy-mode need not change the view).
+    - Never a blind press: an unreadable composer holds.
+    Tests: `TestClearComposer` (`_FakeComposer` models visual-row deletion and FAILS past
+    `MAX_READS` — keep its harness plain functions: a recording mock grew to 14.5 GiB under a
+    non-terminating mutant instead of failing).
   - **The cap is judged on the text AS TYPED** (tabs already 4 spaces), on tmux and Windows alike:
     judged before, 4000 tabs became 40 slices, each a pane call.
   - **A pane's lock entry lives only while a writer uses it** (`[lock, users]`): a writer counts
@@ -68,6 +151,10 @@ composed.**
   - **"Sent" is the text's count ABOVE the box RISING past a pre-Enter baseline** (`_sent_count`),
     never "the text is above the box": an identical earlier message (a resend, a resumed session)
     or a short text inside a reply is already there, and QA stranded a message that way.
+  - **A frame whose box still holds the text re-baselines that count**: any copy above it then
+    is an earlier one drawn late (#72). And a FRAGMENT of the text left in the box is never
+    "sent", whatever the count. Residual: a late copy and an undrawn box in ONE frame.
+  - The box is between the LAST two rules: a reply can carry a rule of its own (#70.2).
   - **Never read one empty composer as "sent"** — a loaded TUI draws typed text seconds late, and
     stopping there left 7/12 stuck in QA. A FRESH session swallows its first Enter whatever the
     gap, so the re-press, not the settle, is the fix. Never Enter on a busy pane (it may be a
@@ -106,9 +193,10 @@ composed.**
     `trustCheckUntil` (a benign key pop, never saved; `save()`'s C `json.dump` holds the GIL over the
     JSON-native records, so a concurrent pop cannot tear it) — do NOT grow the worker to write
     records or `save()`, and do NOT add a beat-side full-`sess`-dict iteration that a pop could race.
-    Direct callers (`notify_session`'s pane fallback, tests) leave `defer_record` False and record
-    inline, on the beat. **Off-beat pane typing is the established qwen-peer pattern** (`_type_into_pane`
-    on `_qwen_peer_worker_loop`), so no new pane-serialization lock is added.
+    Direct callers (tests) leave `defer_record` False and record inline. `notify_session`'s pane
+    fallback STAGES onto this worker too: no message is typed on the beat.
+  - **Off-beat pane typing is the established qwen-peer pattern** (`_type_into_pane` on
+    `_qwen_peer_worker_loop`); all writers share the pane's `_PANE_TYPE_LOCKS` entry.
   - The compaction outbox (`pendingInputs`) still covers delivery — it is written a beat after the
     pane got the message, a tiny window narrower callers already tolerated.
   - The Windows `_pty_inject` retry loop is ALSO wall-clock bounded (`PTY_SUBMIT_DEADLINE_SEC`,
@@ -168,7 +256,8 @@ composed.**
   - Claude Code reads these at LAUNCH, this reads them at post time — a repo that changes the value
     mid-session disagrees with its own running claude until restart.
 - Anything else — no inbox bound, an older claude, a dead socket, a listener that isn't the
-  registered pid — falls back to `send_input`, outbox and all.
+  registered pid — falls back to `send_input`, outbox and all, STAGED on the input worker
+  (`_stage_input`): this runs on the beat. Tests: `TestNotifySession`'s fallback cases.
 - **An inbox message is never put on the outbox** — it never becomes the user turn `_pending_scan`
   reaps on, so it would sit until a compaction re-typed it into the pane as a duplicate.
 - **`INBOX_PREFIX` corrects attribution; it must not grant authority.** It holds quoted PR-comment

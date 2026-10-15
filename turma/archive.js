@@ -455,7 +455,7 @@ function mirrorEntry(e) {
 }
 // What the mirror re-sends to REFILL a transcript whose queued write it had to drop
 // (XERK-1834): the full current session row and every entry the local `.jsonl`
-// holds. The local file is complete for what this replica ingested, so a wholesale
+// holds, first copies only. The local file is complete for what this replica ingested, so a wholesale
 // replace from it closes any seq gap. null when there is no filed row or the file
 // can't be read — never an empty list from a missing file, which would wipe the
 // of-record's entries for a copy that just isn't here.
@@ -463,7 +463,11 @@ function mirrorRefillOf(transcriptId) {
   const row = idxGetSession(transcriptId);
   if (!row || !row.filePath) return null;
   let raw;
-  try { raw = fs.readFileSync(filePaths(row.filePath).jsonl, "utf8"); } catch { return null; }
+  // The FIRST copy of each line, as dedupArchive leaves the file and the msgCount counts
+  // it: a duplicate line not yet repaired would otherwise land in Postgres as an extra
+  // row, which the reconcile's behind guard (maxSeq >= msgCount) then never corrects.
+  try { raw = dedupLines(fs.readFileSync(filePaths(row.filePath).jsonl)).out.toString("utf8"); }
+  catch { return null; }
   return { row: mirrorRow(row), entries: parseEntries(raw).map(mirrorEntry) };
 }
 // Mirror newly-appended entries at ordinals [startSeq, startSeq+n). `list` is the
@@ -2894,7 +2898,8 @@ function backfillPgIndexFromFiles() {
 // The sidecar carries `dedupPending` from before the file shrinks until the index
 // is re-seated — in pg mode, until Postgres confirms the repair op — so a crash or
 // a dropped mirror op is redone by the next publishing pass rather than skipped.
-// `dedupChecked` (the size a pass covered) lets later passes skip unchanged files.
+// `dedupChecked` (the size a pass covered) lets later passes skip unchanged files —
+// only when `dedupKeying` says the current keying made it.
 // The agent cursor (`bytesStored`) is untouched: it counts the agent's raw bytes,
 // not the lines we kept. Synchronous, like the other whole-store boot passes.
 // Returns the number of files rewritten or re-seated.
@@ -2925,6 +2930,12 @@ function blankTailStart(line) {
     return e;
   }
 }
+// The version of dedupLines' line keying a `dedupChecked` stamp was made under. A file
+// stamped by an older keying is re-checked once (rollup XERK-1701): keyed before
+// trailing Unicode blanks were, a pair differing only by one stayed under a stamp the
+// pass then skipped, while the first-copy readers counted it once. Bump it whenever
+// the keying changes what counts as a duplicate.
+const DEDUP_KEYING = 2;
 function dedupLines(buf) {
   const seen = new Set();
   const parts = [];
@@ -2982,14 +2993,14 @@ async function dedupPass(opts) {
     const redo = publish && !!meta.dedupPending;
     let size;
     try { size = fs.statSync(jsonl).size; } catch { continue; }
-    if (meta.dedupChecked === size && !redo) continue;
+    if (meta.dedupChecked === size && meta.dedupKeying === DEDUP_KEYING && !redo) continue;
     let buf;
     try { buf = fs.readFileSync(jsonl); } catch { continue; }
     const { out, dropped } = dedupLines(buf);
     if (!dropped && !redo) {
       // Only the publisher stamps: a local-only stamp would differ from the
       // bucket's sidecar and just be refetched over.
-      if (publish) writeSidecar(metaPath, { ...meta, dedupChecked: buf.length });
+      if (publish) writeSidecar(metaPath, { ...meta, dedupChecked: buf.length, dedupKeying: DEDUP_KEYING });
       continue;
     }
     if (dropped) {
@@ -3005,7 +3016,8 @@ async function dedupPass(opts) {
     const archiveBytes = out.length;
     const entries = heldEntries(jsonl).entries;
     const msgCount = entries.length;
-    const fixed = { ...meta, msgCount, archiveBytes, dedupChecked: archiveBytes, dedupPending: true };
+    const fixed = { ...meta, msgCount, archiveBytes, dedupChecked: archiveBytes,
+      dedupKeying: DEDUP_KEYING, dedupPending: true };
     if (!publish) { writeSidecar(metaPath, fixed, true); continue; }
     noteWrite(jsonl);
     const id = meta.transcriptId;
@@ -3091,6 +3103,32 @@ async function reseatIndexFromFiles(rows) {
       `disagreed with their file (XERK-1450)`);
   }
   return queued;
+}
+
+// The local side of the leader's periodic index reconcile (server.js
+// `IndexMirror.reconcile`, XERK-1701): up to `limit` filed transcripts whose id sorts
+// after `afterId`, with the msgCount this replica's index holds — a resumable cursor
+// over the in-memory session map, no file read. A transcript the duplicate repair
+// still owes (`dedupPendingIds`) or whose rendered download is blocked is left out:
+// the repair owns the first, and the second is not the of-record copy. pg mode only.
+function reconcileCandidates(afterId, limit) {
+  if (!isPgMode() || !sessionsMap) return [];
+  const after = typeof afterId === "string" ? afterId : "";
+  const ids = [];
+  for (const [id, row] of sessionsMap) {
+    if (id > after && row && row.filePath && !dedupPendingIds.has(id)) ids.push(id);
+  }
+  ids.sort();
+  const out = [];
+  for (const id of ids) {
+    if (out.length >= limit) break;
+    const row = sessionsMap.get(id);
+    if (renderedGate) {
+      try { if (renderedGate(filePaths(row.filePath).jsonl)) continue; } catch { continue; }
+    }
+    out.push({ transcriptId: id, msgCount: row.msgCount || 0 });
+  }
+  return out;
 }
 
 // ---- the dsh Trajectory (XERK-498) ------------------------------------------
@@ -3763,7 +3801,7 @@ module.exports = {
   // is the sessions-only hydration applier.
   setIndexMode, isPgMode, sessionLoader, backfillPgIndexFromFiles, reindexHeld,
   // The one-time repair of files duplicated before XERK-1364 (XERK-1450).
-  dedupArchive, dedupLines, reseatIndexFromFiles,
+  dedupArchive, dedupLines, reseatIndexFromFiles, reconcileCandidates,
   ingestChunk, manifestCursors, inventoryCursors, rawCursorsForIds,
   archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).

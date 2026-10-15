@@ -91,6 +91,11 @@ class BoardTest {
         // Word-boundary: "Attestation"/"Contest" must not leak in.
         assertEquals("inprogress", categoryOf(ticket("A", "inprogress", status = "Attestation")))
         assertEquals("inprogress", categoryOf(ticket("A", "inprogress", status = "Contest")))
+        // JS's word boundary and /i are ASCII-only, and so is this port, on a device's ICU
+        // regex too (rollup XERK-1701): "é"/"İ" end a word, "ſ" is not an "s".
+        assertEquals("review", categoryOf(ticket("A", "inprogress", status = "Prétest")))
+        assertEquals("review", categoryOf(ticket("A", "inprogress", status = "TESTİNG")))
+        assertEquals("inprogress", categoryOf(ticket("A", "inprogress", status = "teſt")))
         // A Done or To Do ticket keeps its category whatever its name says.
         assertEquals("done", categoryOf(ticket("A", "done", status = "Testing complete")))
         assertEquals("todo", categoryOf(ticket("A", "todo", status = "Ready for review")))
@@ -1246,6 +1251,10 @@ class BoardTest {
         assertEquals(listOf("turma", "e2e test"), splitLabels("turma, e2e test", "azure"))
         // Deduped, trimmed, blanks dropped.
         assertEquals(listOf("a", "b"), splitLabels(" a , a ,, b ", "azure"))
+        // JS's `\s` and trim(), not Kotlin's or ICU's (rollup XERK-1701): NBSP and BOM
+        // split and trim, U+001C does not.
+        assertEquals(listOf("a", "b", "c\u001C"), splitLabels("a\u00A0b,\uFEFFc\u001C", "jira"))
+        assertEquals(listOf("a", "c\u001C"), splitLabels("\uFEFFa\uFEFF,c\u001C", "azure"))
     }
 
     @Test fun `createDirty guards a close only while un-created text would be lost`() {

@@ -1240,6 +1240,11 @@ test("XERK-1571: sessionAttention derives every state in precedence order", () =
   assert.deepEqual(att(s({ agents: [{ ...ci, label: "  Watch CI \t" }], transcriptAgeSec: 46 * 60 })),
     { state: "needs-you:stalled", why: "Watch CI" });
   assert.equal(att(s({ agents: [{ ...ci, label: "   " }], transcriptAgeSec: 46 * 60 })).why, "1 background shell");
+  // JS's trim set, which Android's jsTrim mirrors (rollup XERK-1701): U+FEFF is cut,
+  // U+001C..U+001F are not — Kotlin's own trim does the reverse.
+  assert.equal(att(s({ agents: [{ ...ci, label: "\ufeff" }], transcriptAgeSec: 46 * 60 })).why, "1 background shell");
+  assert.equal(att(s({ agents: [{ ...ci, label: "\u001c" }], transcriptAgeSec: 46 * 60 })).why, "\u001c");
+  assert.equal(att(s({ wakeAt: now + 20 * WMIN, wakeReason: "\ufeffcheck CI\u001f" })).why, "check CI\u001f");
   // Every why is trimmed, and a blank one is dropped.
   assert.equal(att(s({ question: "  Which DB?  " })).why, "Which DB?");
   assert.equal(att(s({ wakeAt: now + 20 * WMIN, wakeReason: "   " })).why, undefined);

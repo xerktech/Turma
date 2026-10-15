@@ -36,6 +36,15 @@ paths:
     the deadline off at module top; only the deadline tests patch it back. Keep it off.
   - Keep wall time only where a HANG is the defect (a FIFO read), since a blocked process spends
     no CPU.
+  - A ceiling is PER CASE, ~3x that case's idle CPU (rollup XERK-1701): one shared ceiling sat
+    at the slowest case's idle cost (flaky) and far above the cheap ones (a 10x slowdown passed).
+  - A test of the deadline itself reads it off the CPU clock (patch `guard.time` so `monotonic`
+    is `process_time`): load then moves neither the verdict nor the cost.
+- **Every `test_guard.py` class derives from `_GuardTestCase`** (rollup XERK-1701): a SIGPROF
+  watchdog fails a test past `_TEST_CPU_LIMIT` CPU s by name; without it an exponential
+  regression ran to the 15-minute CI job timeout, which names nothing.
+- **`_MAX_TAINT_STARTS` is pinned by readings, not time**: the taint speed tests run to the
+  growth budget, which binds first. Test: `test_the_taint_start_cap_binds_before_the_growth_budget`.
 - **A new module-level name in guard.py must be unique**: the file is ~13k lines, and a later
   `_X_RE = …` silently replaces an earlier one for every caller. XERK-1769 reused
   `_SHELL_WORD_RE` and `_REDIRECT_WORD_RE`; heredoc data turned into scripts (15 suite failures).

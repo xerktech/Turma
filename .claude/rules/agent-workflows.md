@@ -48,6 +48,10 @@ a nested agent dir.
   An empty label matches every launch, so an unlabelled row prefers an unlabelled launch and only
   then the newest labelled one; an unlabelled LAUNCH never claims a labelled row. Without the rank
   a newer labelled launch opened in place of the row's own (rollup XERK-1701).
+- **The rank holds across index AND window**: when the index can answer an unlabelled row only
+  with a labelled launch (rank 0), the window scan goes first — the row's own unlabelled launch
+  may predate a manager restart, so be missing from the index yet in the window. Tests:
+  `test_an_unlabelled_row_finds_its_launch_from_before_a_restart`.
 - **The run dir is named after the launch record's `runId`, NOT its `taskId`** — different handles
   on the same launch (`wf_86e01141-7bc` vs `we1gtmfyd`), and `_async_launch` keys the ROW on taskId
   (XERK-304's bug). The record's absolute `transcriptDir` is ignored too: untrusted input on a path

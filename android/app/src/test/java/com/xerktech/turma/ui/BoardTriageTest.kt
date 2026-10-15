@@ -11,6 +11,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performSemanticsAction
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
+import com.xerktech.turma.vm.BoardViewModel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -83,7 +84,12 @@ class BoardTriageTest {
                 triagePolicies = triagePolicies,
             )
         )
-        compose.setContent { BoardScreen() }
+        // A VM bound to THIS test's Application, never `viewModel()`'s default: under
+        // Robolectric that can hand back an EARLIER test's BoardViewModel — the same
+        // fixture's cards, but a client aimed at that test's shut-down MockWebServer,
+        // so the detail sheet's ticket fetch never answered (rollup #69, this flake).
+        val vm = main.track(BoardViewModel(hub.app))
+        compose.setContent { BoardScreen(vm = vm) }
         compose.waitForIdle()
         // On a slow CI runner the first idle frame can still be the empty board
         // (it renders off the fleet StateFlow), so a test that clicks a card
@@ -189,9 +195,12 @@ class BoardTriageTest {
         // No triage actions — XERK-100 has no verdict (picker shows "Auto").
         openBoard(triageActions = null)
 
-        // Open the detail sheet for the untriaged ticket.
+        // Open the detail sheet for the untriaged ticket, and wait for it to draw: its
+        // ticket-detail fetch runs on OkHttp, off the Compose clock waitForIdle covers.
         compose.onNodeWithText("XERK-100").performClick()
-        compose.waitForIdle()
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText("Auto", substring = false).fetchSemanticsNodes().isNotEmpty()
+        }
 
         // The Triage picker shows "Auto" (exact match, not the agent's "Auto — most available agent").
         compose.onNodeWithText("Auto", substring = false).assertIsDisplayed()

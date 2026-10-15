@@ -151,6 +151,10 @@ internal fun isJsSpace(ch: Char): Boolean {
 /** JS `s.trim() === ""`, for the same reason as [isJsSpace]. */
 internal fun isJsBlank(s: String): Boolean = s.all { isJsSpace(it) }
 
+/** JS `s.trim()`, for the same reason as [isJsSpace]: Kotlin's `trim()` keeps U+FEFF and
+ * cuts U+001C..U+001F, so a label of those read differently on the two clients. */
+internal fun jsTrim(s: String): String = s.trim(::isJsSpace)
+
 private fun isSpaceAt(s: String, i: Int): Boolean = i < 0 || i >= s.length || isJsSpace(s[i])
 
 // Linearity rests on the per-line `noClose` memo below and on EMPH_MAX_DEPTH.

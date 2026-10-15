@@ -44,6 +44,14 @@ Mirrors the glasses pure-core/adapter-shell split:
   `fleetTokens`/`mergeModels`), Ready-for-review split (`core/Sessions.kt` `rankRunning` →
   `LiveGroups`), sessions search (`core/Search.kt`, XERK-243 — one box filters live lists AND
   appends archive matches). Port logic there; keep the Compose screen a thin renderer.
+- **A port of a web/hub text rule uses JavaScript's character sets, never Kotlin's or the regex
+  engine's** (rollup XERK-1701): `jsTrim`/`isJsBlank`/`JS_WS` (Prose.kt) for `trim()`/`\s`, and
+  an explicit `[A-Za-z0-9_]` lookaround + ASCII lowercase for `\b` and `/i`.
+  - Kotlin's `trim()`/`isBlank()` keep U+FEFF and cut U+001C..U+001F (JS: the reverse); a device's
+    regex is ICU (Unicode `\s`/`\w`/`\b`, Unicode case folding) while JVM unit tests run
+    `java.util.regex`, so a test can pass on the JVM and the device still disagree with the web.
+  - Tests: `SessionsTest` (wait labels), `BoardTest` (review status, `splitLabels`),
+    `CodingAgentLabelTest`.
 - **Board search/filter/sort** is `core/BoardView.kt` ↔ `board.js` `boardView*` (rule in
   `turma-board.md`). The phone shows active filters as a badge only — never a second chip row.
 - **Match features and structure, not pixels** (platform-idiomatic controls). A justified platform
@@ -56,6 +64,9 @@ Mirrors the glasses pure-core/adapter-shell split:
 - Org filter/board pins/tinting: `data/OrgFilter.kt` + `ui/OrgControl.kt` + `core/Board.kt`
   (`orgColorMap`, `FleetState.orgColors`, `TurmaCard(tint=)`), tested in `BoardTest.kt` alongside
   `hostOptions`/`agentPinOf`/`modelPinOf`/`statusChangeable`/`autoStartOn`.
+- Org tints and chart lines read `TurmaColors.series()` — composable, the web's light `--s1..--s8`
+  on a light surface and the dark set on dark. Never hold a palette list outside composition (a
+  theme switch would keep the old one). Tests: `StatusTextColorsTest`.
 - Permission policy editor (XERK-1566): `PermissionPolicySheet` in `ui/BoardScreen.kt` (a labelled
   item in `ScreenHeader`'s ⋮ `menuItems`, never a header icon — one crowded the org filter), state in `BoardViewModel.permission`, its own route — never `/api/agents`.
 - Create-ticket parity: ＋ in `ScreenHeader` → `CreateTicketSheet`; `source` on
@@ -134,6 +145,23 @@ Mirrors the glasses pure-core/adapter-shell split:
   concurrently with setting it". `HubHarness.after()` cancels them BEFORE `server.shutdown()`,
   which aborts in-flight calls and is itself a source of late answers (QA); the rule's
   `finished()` runs after it. `viewModel()` VMs in composables are cleared by the compose rule.
+- **Never let a Compose test take a screen's `viewModel()` default** — pass a VM built on
+  `hub.app`. In a full-suite run the default handed back a VM over an EARLIER test's container
+  (stale fleet, dead MockWebServer): measured in `OrgControlMergeTest` / `BoardTriageTest` flakes.
+- **No wall-clock races in tests**: hold a response on a latch the test releases
+  (`UsagePermissionsViewModelTest.routeByOrg`), never `setHeadersDelay`; bound a perf test on
+  thread CPU time (`ProseTest.cpuMs`), never `System.nanoTime` — both reddened under CPU load.
+- A second beat seeded after a VM action that `nudge()`s the fleet carries a fresher `lastSeen`
+  (`fleetJson(lastSeen=)`): the nudge's poll can land the FIRST beat after it (`ChatModelSourceTest`).
+- Colour call sites are pinned in pixels/text-layout, light theme (`ColourCallSiteTest`); the
+  chat's sheet cap and header/footer fit on the real `ChatScreen` in a short `requiredHeight` box
+  (`WaitingSheetBoundsTest`, `ChatHeaderFooterFitTest`) — a short box, so the MEASURED bars bind.
+- Chat window/inset behaviour is tested by DISPATCHING real insets (status, navigation, ime with
+  `setVisible`) to the content view (`ChatWindowFitTest.insets`); Robolectric gives none otherwise.
+  - Measure text widths only under `@GraphicsMode(NATIVE)`: legacy mode's `TextMeasurer` returns
+    ~1px per character, so width-driven layout (the meta row) reads wrong.
+- Org-tint call sites (`TurmaColors.series()`, never `ChartSeries*` outside `ui/theme`) are pinned
+  at the source by `SeriesCallSiteTest`: no render test reaches every screen's tint.
 - **Assert a model-switch memo on the STORE (`container.modelSwitches`), never `ChatUiState`** — the
   state copy is a VM-rebuilt mirror; asserting it passes on a change that dropped the real thing.
 - **The in-app updater is silenced in tests (XERK-281)** — Robolectric rebuilds the Application per
@@ -143,6 +171,32 @@ Mirrors the glasses pure-core/adapter-shell split:
   `net/UpdaterTestSeamTest`.
 - Tests: `vm/ChatModelSourceTest`, `vm/FleetOutcomeTest`, `ui/SpawnComposerTest`,
   `ui/ChatModelChipsTest`, `ui/SessionsPaneSpawnTest`, `ui/FleetSpawnLocalModelTest`.
+
+## Chat header and footer fit (rollup XERK-1701)
+
+- "Short window" (`chatHeaderFit`) reads the chat's height WITHOUT the keyboard (a
+  `BoxWithConstraints` outside `imePadding`): measured inside, a tablet's keyboard read as a phone.
+- Typing in a short window (`compact`): the meta line folds, the footer pads less, and the top bar
+  steps aside (status strip only) when bar + compose box can't both fit (`chatBarFits`) — the box
+  being typed into always stays whole — and while a sheet is pending. It returns with no keyboard.
+- A question / permission sheet pending in a short window comes first (`sheetFirst`), keyboard up
+  OR down: the header keeps the title (plus the tunnel warning alone when the tunnel is down), the
+  chip row yields, and the sheet's floor is the room ABOVE the compose footer (`aboveBox`).
+  - Never a 0-height sheet: the cap alone gave 0 in the landscape two-pane chat at font 2.0
+    (283dp tall) once the tunnel marker took its own line, and while typing.
+  - Never more than `aboveBox`: a floor of the whole footer overflowed it by the compose row, and
+    (pinned to the bottom) hid the question's first lines under the bar on open.
+  - Except typing on a short phone, where `aboveBox` drops under `CHAT_SHEET_MIN` (40dp; ~0 at
+    font 2.0 on a 308dp-tall phone): then the floor is the whole footer, reached by scrolling it.
+    Keyboard down it stays `aboveBox`, however small, so the question's first line shows on open.
+  - Each sheet's scroll state is keyed on its question / prompt (`promptKey`: minus the TUI
+    cursor's row), so a new one opens at its top and a cursor move doesn't jump it.
+  - Tests must read UNCLIPPED bounds and never scroll first: `getBoundsInRoot` is clipped and
+    `performScrollTo` hides exactly this (`ChatWindowFitTest.sheetOnOpen`).
+- The bar's height comes from MEASURED line heights (`TextMeasurer`), not the style's `lineHeight`,
+  which undershoots the drawn line at a non-linear font scale.
+- The tunnel marker never shares a line it can't fit beside a half-width host · repo
+  (`chatMetaOneLine`); on its own line it wraps at a word (2 lines max) and the bar grows to hold it.
 
 ## Building
 

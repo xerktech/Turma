@@ -376,6 +376,35 @@ class PgIndexStore {
     }));
   }
 
+  // What Postgres holds for each of `ids` (the leader's periodic reconcile, XERK-1701):
+  // Map transcriptId -> { msgCount, n, maxSeq } — the row's msg_count (null when the
+  // row is missing), the entry-row count and the highest seq (-1 for none). n below
+  // maxSeq + 1 is a seq gap. Two keyed aggregates over the primary keys, one batch of
+  // ids at a time (the caller bounds it).
+  async transcriptCounts(ids) {
+    const out = new Map();
+    const list = (ids || []).filter((id) => typeof id === "string" && id);
+    if (!list.length) return out;
+    await this.ensureSchema();
+    const p = this.prefix;
+    const marks = list.map((_, i) => `$${i + 1}`).join(", ");
+    const rows = await this.pool.query(
+      `SELECT transcript_id, msg_count FROM ${p}_sessions WHERE transcript_id IN (${marks})`, list);
+    const ents = await this.pool.query(
+      `SELECT transcript_id, count(*) AS n, max(seq) AS mx FROM ${p}_entries ` +
+      `WHERE transcript_id IN (${marks}) GROUP BY transcript_id`, list);
+    for (const id of list) out.set(id, { msgCount: null, n: 0, maxSeq: -1 });
+    for (const r of rows || []) {
+      const o = out.get(r.transcript_id);
+      if (o) o.msgCount = intParam(r.msg_count);
+    }
+    for (const r of ents || []) {
+      const o = out.get(r.transcript_id);
+      if (o) { o.n = intParam(r.n); o.maxSeq = r.mx == null ? -1 : intParam(r.mx); }
+    }
+    return out;
+  }
+
   // Set a transcript's msgCount/archiveBytes EXACTLY — the one write that may lower
   // them, for the duplicate repair (XERK-1450); upsertSession only ever raises.
   async setCounts(transcriptId, msgCount, archiveBytes) {

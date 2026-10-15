@@ -292,7 +292,7 @@ fun liveStateLabel(state: LiveState, live: LiveSignals?, now: Long = System.curr
         // Asleep until a session-CLI wake (XERK-1571) — web "💤 sleeping until 14:05 ·
         // <reason>": what it will check when it wakes, when the session said.
         live?.wakeAt?.takeIf { it > now }?.let {
-            val why = live?.wakeReason?.trim().orEmpty()
+            val why = com.xerktech.turma.core.jsTrim(live?.wakeReason.orEmpty())
             return "💤 sleeping until ${com.xerktech.turma.core.clockTime(it, now)}" + if (why.isEmpty()) "" else " · $why"
         }
         val waits = live?.agents.orEmpty().filter(::isWaitAgent)
@@ -300,7 +300,10 @@ fun liveStateLabel(state: LiveState, live: LiveSignals?, now: Long = System.curr
         // One named wait keeps its subject on every branch (XERK-1571), a timed one too.
         // Trimmed, as the web's backgroundWaitLabel (rollup XERK-1701): a padded label
         // drew its stray spaces around the "·".
-        val what = if (waits.size == 1 && waits[0].label.isNotBlank()) " · ${waits[0].label.trim()}" else ""
+        // JS's trim, not Kotlin's (rollup XERK-1701): the two disagree on U+FEFF and
+        // U+001C..U+001F, so a label of those read differently on the two clients.
+        val named = if (waits.size == 1) com.xerktech.turma.core.jsTrim(waits[0].label) else ""
+        val what = if (named.isNotEmpty()) " · $named" else ""
         if (eta != null && eta > now) return "⏳ waiting$what\u00A0·\u00A0${waitLeftText(eta - now)} left"
         // No ETA: how long it has waited, off the oldest row's startedAt (XERK-1571).
         val started = waits.mapNotNull { it.startedAt }.filter { it <= now }.minOrNull()
@@ -360,7 +363,8 @@ private fun sessionLiveState(session: SessionInfo, agentLastSeen: Long, now: Lon
             // hub's `since` carries that on the why line).
             if (com.xerktech.turma.core.sessionWait(session, agentLastSeen, now)?.stalled == true) {
                 val waits = s.agents.filter(::isWaitAgent)
-                val label = if (waits.size == 1 && waits[0].label.isNotBlank()) "stalled · ${waits[0].label.trim()}"
+                val named = if (waits.size == 1) com.xerktech.turma.core.jsTrim(waits[0].label) else ""
+                val label = if (named.isNotEmpty()) "stalled · $named"
                     else "stalled on ${waits.size} background shell" + if (waits.size == 1) "" else "s"
                 CardState(label, CardTone.STALLED)
             } else CardState("idle", CardTone.IDLE)
@@ -371,7 +375,7 @@ private fun sessionLiveState(session: SessionInfo, agentLastSeen: Long, now: Lon
 private fun reviewCardState(session: SessionInfo, live: CardState): CardState {
     val att = session.attention
     val hubStalled = com.xerktech.turma.core.attentionStalled(att)
-    val stalledLabel = listOf("stalled", att?.why.orEmpty()).filter { it.isNotBlank() }.joinToString(" · ")
+    val stalledLabel = listOf("stalled", att?.why.orEmpty()).filterNot { com.xerktech.turma.core.isJsBlank(it) }.joinToString(" · ")
     // A LOOPING session is busy, so it reads working — but the hub says it is stuck
     // repeating one failing call (XERK-1572): the hub's read, in the danger tone.
     if (live.tone == CardTone.WORKING && hubStalled) return CardState(stalledLabel, CardTone.STALLED)

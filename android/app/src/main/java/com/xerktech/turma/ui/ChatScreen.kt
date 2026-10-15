@@ -7,6 +7,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -23,7 +24,17 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.isImeVisible
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.SideEffect
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -73,6 +84,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -99,7 +111,7 @@ import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.vm.ChatViewModel
 import com.xerktech.turma.vm.MicState
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun ChatScreen(
     host: String,
@@ -178,42 +190,162 @@ fun ChatScreen(
     // edge-to-edge, so without this the IME simply overlays the compose box
     // and you can't see what you're typing. imePadding consumes the inset,
     // so the bottomBar (footer + question sheet) lands right on the keyboard.
+    // The navigation bar likewise: on the full-screen phone route nothing else
+    // reserves it, and the gesture handle drew over the compose box. (In the
+    // two-pane layout MainScaffold has already consumed it, so this pads 0 there.)
+    BoxWithConstraints(Modifier.navigationBarsPadding()) {
+    // The chat's height WITHOUT the keyboard: whether this is a short window is a
+    // property of the window, not of the room the keyboard leaves — measured inside
+    // imePadding, a tablet's keyboard read as a landscape phone (rollup XERK-1701).
+    val windowHeight = maxHeight
     BoxWithConstraints(Modifier.imePadding()) {
-    val sheetMax = with(density) { waitingSheetCap(maxHeight, topBarPx.toDp(), footerPx.toDp()) }
+    val imeUp = WindowInsets.isImeVisible
+    val fit = chatHeaderFit(windowHeight, imeUp)
+    // Typing in a short window: the compose box outranks everything else (#66).
+    val compact = fit.shortWindow && imeUp
+    // The header's two lines must FIT its bar (rollup XERK-1701 #64.1): a fixed 64dp
+    // bar clipped the host · repo · tunnel line at a large font scale and let it spill
+    // in landscape. So a short window takes the smaller title style, the bar grows to
+    // the lines' real height at this font scale, and with the keyboard up in a short
+    // window the meta line folds away so the composer keeps the room (#66).
+    val sheetUp = state.question.isNotBlank() || state.panePrompt != null
+    // A question / permission pending in a short window comes first, keyboard up or down:
+    // the header keeps only the title (plus the tunnel warning, alone, when the tunnel is
+    // down), the chip row yields, and the sheet gets a floor — else a landscape two-pane
+    // chat at a large font left the sheet 0dp (rollup XERK-1701).
+    val sheetFirst = sheetUp && fit.shortWindow
+    val showMeta = state.session != null && fit.showMeta && (!sheetFirst || !state.tunnelOnline)
+    val titleStyle = if (fit.shortWindow) MaterialTheme.typography.titleMedium else MaterialTheme.typography.titleLarge
+    val metaStyle = MaterialTheme.typography.bodySmall
+    // The meta line takes a second line for the tunnel marker when one line can't hold
+    // both (set by the title slot, which is where the width is known).
+    var metaLines by remember { mutableIntStateOf(1) }
+    // Each line's RENDERED height at this font scale, measured: the style's lineHeight
+    // undershoots the drawn line at a large (non-linear) font scale.
+    val lineMeasurer = rememberTextMeasurer()
+    val barHeight = with(density) {
+        val titleLine = lineMeasurer.measure("Ag", titleStyle, maxLines = 1).size.height.toDp()
+        val metaLine = lineMeasurer.measure("Ag", metaStyle.copy(fontFamily = FontFamily.Monospace), maxLines = 1).size.height.toDp()
+        chatTopBarHeight(titleLine, if (showMeta) metaLine * metaLines else 0.dp)
+    }
+    // The compose box's own row, measured: the one thing that must stay whole.
+    var inputRowPx by remember { mutableIntStateOf(0) }
+    // The status-bar strip the bar pads itself by, MEASURED where the bar sits: the raw
+    // inset over-counts in the two-pane layout, whose scaffold has already consumed it.
+    var statusStripPx by remember { mutableIntStateOf(0) }
+    Box(
+        // Measured OUTSIDE the padding, so the size is the padding itself.
+        Modifier.onSizeChanged { statusStripPx = it.height }
+            .windowInsetsPadding(TopAppBarDefaults.windowInsets.only(WindowInsetsSides.Top)),
+    )
+    val statusBarTop = with(density) { statusStripPx.toDp() }
+    // Typing in a short window, the top bar steps aside (until the keyboard goes) when
+    // there is no room for both it and the compose box (a landscape phone at a large font
+    // scale) — rather than cover the box being typed into — and while a question or
+    // permission sheet is pending, so the sheet shows above the box instead of only
+    // being reachable by scrolling an off-screen footer.
+    val showBar = !compact || (!sheetUp &&
+        chatBarFits(maxHeight, statusBarTop + barHeight, with(density) { inputRowPx.toDp() } + CHAT_FOOTER_COMPACT_PAD))
+    // The footer never grows past the room under the top bar: taller (landscape with
+    // the keyboard up, or a large font scale) it scrolls, pinned to its BOTTOM so the
+    // compose box stays in view and the chips scroll away, instead of drawing over
+    // the top bar (rollup XERK-1701 #66).
+    val footerMax = with(density) { (maxHeight - topBarPx.toDp()).coerceAtLeast(0.dp) }
+    // A question / permission sheet never collapses to nothing in a short window: it may
+    // take ALL the room above the compose footer (the chip row gives way to it). Never
+    // more: a sheet as tall as the whole footer overflowed it by the compose row, and,
+    // pinned to the bottom, that overflow hid the question's own first lines under the bar.
+    // Typing on a short phone can leave next to no room above the box at all: then the
+    // sheet takes the whole footer and is reached by scrolling it, never squeezed to 0. Only
+    // while typing: keyboard down, the room above the box shows the question's first line.
+    val sheetMax = with(density) {
+        val aboveBox = (footerMax - footerPx.toDp()).coerceAtLeast(0.dp)
+        val floor = if (aboveBox >= CHAT_SHEET_MIN || !imeUp) aboveBox else footerMax
+        waitingSheetCap(maxHeight, topBarPx.toDp(), footerPx.toDp()).let { if (sheetFirst) maxOf(it, floor) else it }
+    }
+    val footerScroll = rememberScrollState()
     Scaffold(
         topBar = {
-            TopAppBar(
-                modifier = Modifier.onSizeChanged { topBarPx = it.height },
+            if (!showBar) {
+                // Just the status-bar strip (the bar's own inset), measured like the bar.
+                Box(
+                    Modifier.fillMaxWidth()
+                        .onSizeChanged { topBarPx = it.height }
+                        .testTag(CHAT_TOP_BAR_TAG)
+                        .windowInsetsPadding(TopAppBarDefaults.windowInsets.only(WindowInsetsSides.Top)),
+                )
+            } else TopAppBar(
+                modifier = Modifier.onSizeChanged { topBarPx = it.height }.testTag(CHAT_TOP_BAR_TAG),
+                expandedHeight = barHeight,
                 title = {
                     Column {
-                        Text(state.session?.let { sessionName(it) } ?: "Session", maxLines = 1)
-                        state.session?.let {
+                        Text(state.session?.let { sessionName(it) } ?: "Session", maxLines = 1,
+                            overflow = TextOverflow.Ellipsis, style = titleStyle,
+                            modifier = Modifier.testTag(CHAT_TITLE_TAG))
+                        state.session?.takeIf { showMeta }?.let {
                             // Host · repo · branch (XERK-121), then whether
                             // anything is reaching us (core `liveMarker`, the
                             // web's tunnel chip). The marker is its OWN Text and
                             // the meta line is what gives way: appended to that
                             // ellipsized line, a warning nobody can read is
-                            // worse than a truncated branch name.
+                            // worse than a truncated branch name. When one line
+                            // can't hold the whole marker beside a readable meta
+                            // ([chatMetaOneLine]), the marker takes its own line.
                             val hostLabel = state.hostLabel.ifBlank { host }
                             val mark = liveMarker(state.tunnelOnline, state.connected)
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    sessionHeaderMeta(hostLabel, it),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    fontFamily = FontFamily.Monospace,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f, fill = false),
-                                )
-                                if (mark.isNotEmpty()) {
+                            val markColor = if (state.tunnelOnline) Color.Unspecified else MaterialTheme.colorScheme.error
+                            val meta = sessionHeaderMeta(hostLabel, it)
+                            BoxWithConstraints {
+                                val measurer = rememberTextMeasurer()
+                                val mono = metaStyle.copy(fontFamily = FontFamily.Monospace)
+                                if (sheetFirst) {
+                                    // Only the warning (showMeta is false otherwise), on as few lines as fit.
+                                    val lines = measurer.measure(
+                                        mark, mono, maxLines = 2, constraints = Constraints(maxWidth = constraints.maxWidth),
+                                    ).lineCount
+                                    SideEffect { metaLines = lines }
                                     Text(
-                                        " · " + mark,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        fontFamily = FontFamily.Monospace,
-                                        maxLines = 1,
-                                        color = if (state.tunnelOnline) Color.Unspecified
-                                                else MaterialTheme.colorScheme.error,
+                                        mark, style = mono, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                                        color = markColor, modifier = Modifier.testTag(CHAT_MARKER_TAG),
                                     )
+                                    return@BoxWithConstraints
+                                }
+                                val oneLine = mark.isEmpty() || chatMetaOneLine(
+                                    metaWidth = measurer.measure(meta, mono, maxLines = 1).size.width,
+                                    markWidth = measurer.measure(" · $mark", mono, maxLines = 1).size.width,
+                                    available = constraints.maxWidth,
+                                )
+                                // On its own line the marker wraps at a word (two lines at most)
+                                // rather than lose its end: "⚠ tunnel" / "offline" at a large font.
+                                val markLines = if (oneLine) 0 else measurer.measure(
+                                    mark, mono, maxLines = 2, constraints = Constraints(maxWidth = constraints.maxWidth),
+                                ).lineCount
+                                SideEffect { metaLines = 1 + markLines }
+                                if (oneLine) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            meta, style = mono, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f, fill = false).testTag(CHAT_META_TAG),
+                                        )
+                                        if (mark.isNotEmpty()) {
+                                            Text(
+                                                " · $mark", style = mono, maxLines = 1, color = markColor,
+                                                modifier = Modifier.testTag(CHAT_MARKER_TAG),
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    Column {
+                                        Text(
+                                            meta, style = mono, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.testTag(CHAT_META_TAG),
+                                        )
+                                        // Ellipsized only when even two lines of its own are too narrow.
+                                        Text(
+                                            mark, style = mono, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                                            color = markColor, modifier = Modifier.testTag(CHAT_MARKER_TAG),
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -252,7 +384,11 @@ fun ChatScreen(
         },
         snackbarHost = { SnackbarHost(snackbar) },
         bottomBar = {
-            Column {
+            Column(
+                Modifier.heightIn(max = footerMax)
+                    .verticalScroll(footerScroll, reverseScrolling = true)
+                    .testTag(CHAT_FOOTER_TAG),
+            ) {
                 // The live working-status bar (web chat.js updateLiveStatus): spinner
                 // + gerund verb + ↑/↓ token counters + elapsed, Claude Code's rotating
                 // tip / active-task hint lines, and the live agent-manager list. Shown
@@ -290,6 +426,9 @@ fun ChatScreen(
                 state.panePrompt?.let { p -> PanePromptSheet(p, sheetMax, onPick = vm::answerPanePrompt) }
                 Box(Modifier.onSizeChanged { footerPx = it.height }) {
                 ChatFooter(
+                    compact = compact,
+                    showChips = !sheetFirst,
+                    inputRowModifier = Modifier.onSizeChanged { inputRowPx = it.height },
                     session = state.session,
                     draft = state.draft,
                     mic = state.mic,
@@ -363,6 +502,7 @@ fun ChatScreen(
                 }
             }
         }
+    }
     }
     }
 }
@@ -537,6 +677,9 @@ private fun AgentsList(
     }
 }
 
+/** The least room a pending sheet may show in above the compose box before it falls back to scrolling. */
+internal val CHAT_SHEET_MIN = 40.dp
+
 @Composable
 private fun QuestionSheet(
     maxHeight: androidx.compose.ui.unit.Dp,
@@ -550,9 +693,12 @@ private fun QuestionSheet(
     onAnswerMulti: (List<Int>) -> Unit,
 ) {
     val picks = remember(question) { mutableStateListOf<Int>() }
-    Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), modifier = Modifier.fillMaxWidth()) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+        modifier = Modifier.fillMaxWidth().testTag(WAITING_SHEET_TAG),
+    ) {
         Column(
-            Modifier.heightIn(max = maxHeight).verticalScroll(rememberScrollState()).padding(12.dp),
+            Modifier.heightIn(max = maxHeight).verticalScroll(remember(question) { ScrollState(0) }).padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             if (header.isNotBlank() || (total != null && total > 1)) {
@@ -584,14 +730,63 @@ private fun QuestionSheet(
  * than what is left between the top bar and the compose footer draws OVER the
  * top bar (landscape, or a large font scale: Kill and Terminal untappable).
  * Both are MEASURED, since they grow with the font scale; [CHAT_SHEET_GAP] keeps
- * a strip of transcript visible. Never more than half the window. No floor:
- * when nothing is left (landscape with the keyboard up) the sheet collapses
- * until the keyboard goes, rather than covering the top bar.
+ * a strip of transcript visible. Never more than half the window. Typing in a
+ * short window leaves nothing, so the chat raises the cap there to the footer's
+ * own height: the footer scrolls, and the sheet stays reachable inside it.
  */
 internal fun waitingSheetCap(window: Dp, topBar: Dp, footer: Dp): Dp =
     minOf(window / 2, window - topBar - footer - CHAT_SHEET_GAP).coerceAtLeast(0.dp)
 
 internal val CHAT_SHEET_GAP = 24.dp
+
+// Test handles for the header / footer / sheet bounds checks.
+internal const val CHAT_TOP_BAR_TAG = "chatTopBar"
+internal const val CHAT_FOOTER_TAG = "chatFooter"
+internal const val WAITING_SHEET_TAG = "waitingSheet"
+internal const val CHAT_TITLE_TAG = "chatTitle"
+internal const val CHAT_META_TAG = "chatMeta"
+internal const val CHAT_MARKER_TAG = "chatLiveMarker"
+
+/** Below this the chat is a short window (a landscape phone): smaller title, and the
+ *  meta line yields to the composer while the keyboard is up. */
+internal val CHAT_SHORT_WINDOW = 480.dp
+
+/** The compose footer's vertical padding while typing in a short window. */
+internal val CHAT_FOOTER_COMPACT_PAD = 4.dp
+
+/** How the chat header fits a window of [window] height (WITHOUT the keyboard). */
+internal data class ChatHeaderFit(val shortWindow: Boolean, val showMeta: Boolean)
+
+/**
+ * A short window takes the smaller title; with the keyboard up there, the meta line
+ * folds away. [window] is the chat's height without the keyboard: a tablet with its
+ * keyboard up is still a tall window and keeps both header lines.
+ */
+internal fun chatHeaderFit(window: Dp, imeVisible: Boolean): ChatHeaderFit {
+    val short = window < CHAT_SHORT_WINDOW
+    return ChatHeaderFit(shortWindow = short, showMeta = !(short && imeVisible))
+}
+
+/** Whether a top bar of [bar] (status strip included) and the compose box's [input]
+ *  both fit the [room] left above the keyboard. When not, the bar steps aside. */
+internal fun chatBarFits(room: Dp, bar: Dp, input: Dp): Boolean = bar + input <= room
+
+/**
+ * Whether the header's meta line and its tunnel marker share one line: when the whole
+ * line fits, or the marker (separator included) takes at most half the width, leaving
+ * host · repo at least the other half to ellipsize in. Otherwise the marker takes its
+ * own line, so it is never cut and host · repo never shrinks to nothing.
+ */
+internal fun chatMetaOneLine(metaWidth: Int, markWidth: Int, available: Int): Boolean =
+    metaWidth + markWidth <= available || markWidth * 2 <= available
+
+/**
+ * The chat top bar's height for a title line and a meta line of these heights (0 when
+ * the meta line is hidden): Material's 64dp, or taller when the lines at this font
+ * scale need it — a fixed 64dp clipped the meta line at font scale 2.0.
+ */
+internal fun chatTopBarHeight(titleLine: Dp, metaLine: Dp): Dp =
+    maxOf(64.dp, titleLine + metaLine + 16.dp)
 
 /**
  * The TUI's blocking dialog — a tool-permission request or a plan approval —
@@ -599,19 +794,33 @@ internal val CHAT_SHEET_GAP = 24.dp
  * dialog's question, the context it asks about, and one card per numbered
  * option, the TUI cursor's row outlined. Tapping a card answers by its number.
  */
+/**
+ * What makes a permission prompt a NEW one, for resetting its sheet's scroll: everything but the
+ * TUI cursor's row, which moves within the same dialog and must not jump the sheet to its top.
+ */
+internal fun promptKey(p: com.xerktech.turma.model.PanePrompt) =
+    p.copy(options = p.options.map { it.copy(selected = false) })
+
 @Composable
 private fun PanePromptSheet(
     prompt: com.xerktech.turma.model.PanePrompt,
     maxHeight: androidx.compose.ui.unit.Dp,
     onPick: (Int) -> Unit,
 ) {
-    Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), modifier = Modifier.fillMaxWidth()) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+        modifier = Modifier.fillMaxWidth().testTag(WAITING_SHEET_TAG),
+    ) {
         Column(
-            Modifier.heightIn(max = maxHeight).verticalScroll(rememberScrollState()).padding(12.dp),
+            Modifier.heightIn(max = maxHeight).verticalScroll(remember(promptKey(prompt)) { ScrollState(0) }).padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Pill("waiting", color = MaterialTheme.colorScheme.primary)
-            Text(prompt.prompt, fontWeight = FontWeight.Medium)
+            // The pill shares the prompt's line: stacked, it alone filled a short window's
+            // sheet and pushed the prompt itself out of view (rollup XERK-1701).
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Pill("waiting", color = MaterialTheme.colorScheme.primary)
+                Text(prompt.prompt, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+            }
             if (prompt.detail.isNotBlank()) {
                 Text(
                     prompt.detail,
@@ -700,8 +909,13 @@ private fun QuestionOptionCard(
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun ChatFooter(
+internal fun ChatFooter(
     session: com.xerktech.turma.model.SessionInfo?,
+    // Typing in a short window: tighter vertical padding, so the box fits (#66).
+    compact: Boolean = false,
+    // False while a question / permission sheet needs the room above the box.
+    showChips: Boolean = true,
+    inputRowModifier: Modifier = Modifier,
     draft: String,
     mic: MicState,
     busy: Boolean,
@@ -731,11 +945,14 @@ private fun ChatFooter(
     val filePicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris -> onAttach(uris) }
-    Column(Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+    Column(
+        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = if (compact) CHAT_FOOTER_COMPACT_PAD else 8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
         // Model / mode / PR sit ABOVE the input box. Every PR the session opened
         // shows (newest first — the freshest link leads), matching the web footer
         // chip (chat.js prFooterChip); FlowRow wraps them on a narrow phone.
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        if (showChips) FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
           // A dsh session runs a DIFFERENT runtime, not the Claude subscription/
           // local split (XERK-504): a read-only "⚙ dsh" runtime chip (a dsh
           // conversation can't switch to a Claude runtime live) + a live dropdown
@@ -825,7 +1042,7 @@ private fun ChatFooter(
                 attachments.forEach { a -> AttachmentChip(a, onRemoveAttachment) }
             }
         }
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(inputRowModifier, verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = draft, onValueChange = onDraft,
                 placeholder = { Text("Message…") },

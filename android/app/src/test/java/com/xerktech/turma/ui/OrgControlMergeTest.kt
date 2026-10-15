@@ -7,7 +7,11 @@ import androidx.compose.ui.test.isToggleable
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.harness.HubHarness
+import com.xerktech.turma.vm.OrgViewModel
+import kotlinx.coroutines.cancel
+import org.junit.After
 import okhttp3.mockwebserver.MockResponse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -57,9 +61,19 @@ class OrgControlMergeTest {
           "autoStartOrgs": {"acme": true}, "autoMergeOrgs": $autoMerge}
     """.trimIndent()
 
+    // Built on THIS test's Application, never `viewModel()`'s default: under
+    // Robolectric, in a full-suite run, that handed back an OrgViewModel over an
+    // EARLIER test's container (measured: vm.fleet !== hub.container.fleet.state) —
+    // its fleet held no org, the control rendered nothing, and "All orgs" was not
+    // found. Same trap as BoardPermissionPolicyTest's BoardViewModel.
+    private var vm: OrgViewModel? = null
+
+    @After fun clearVm() { vm?.viewModelScope?.cancel() }
+
     private fun open(autoMerge: String = "{}") {
         hub.seedFleet(fleet(autoMerge))
-        compose.setContent { OrgFilterAction() }
+        val vm = OrgViewModel(hub.app).also { vm = it }
+        compose.setContent { OrgFilterAction(vm = vm) }
         compose.waitForIdle()
         // The header button reads "All orgs" (nothing scoped) — open the menu.
         compose.onNodeWithText("All orgs").performClick()

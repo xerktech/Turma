@@ -38,10 +38,18 @@ val BOARD_CATEGORIES = listOf(
  * "Resolved" is Azure DevOps' own "fixed, not yet verified" state (XERK-250),
  * which reaches the client as `inprogress`; board.js's copy carries the why.
  */
+// JS's `\b` and non-unicode `/i` are ASCII-only, so both are spelled out here
+// (rollup XERK-1701): a device's ICU regex reads `\b` and IGNORE_CASE over all of
+// Unicode, so "Prétest" or "teſt" landed in a different column there than on the
+// web — and than in the JVM unit tests, which are ASCII like JS.
 private val REVIEW_STATUS_RE =
-    Regex("\\b(review|reviewing|testing|test|qa|resolved)\\b", RegexOption.IGNORE_CASE)
+    Regex("(?<![A-Za-z0-9_])(review|reviewing|testing|test|qa|resolved)(?![A-Za-z0-9_])")
 
-fun isReviewStatus(t: JiraTicket): Boolean = REVIEW_STATUS_RE.containsMatchIn(t.status)
+/** ASCII-only lowercase: JS's non-unicode `/i` folds no other character onto these words. */
+private fun asciiLower(s: String): String =
+    buildString(s.length) { for (c in s) append(if (c in 'A'..'Z') c + 32 else c) }
+
+fun isReviewStatus(t: JiraTicket): Boolean = REVIEW_STATUS_RE.containsMatchIn(asciiLower(t.status))
 
 /**
  * An unknown/missing statusCategory lands in To Do rather than vanishing. An
@@ -1562,10 +1570,15 @@ fun createLabelWord(source: String, cap: Boolean = false): String {
  * can, so split on commas only. Deduped, trimmed, capped — a port of board.html
  * `splitLabels`, matching the hub's own cap.
  */
+private val LABEL_SPLIT = Regex("[,\n$JS_WS]+")
+
 fun splitLabels(raw: String, source: String): List<String> {
-    val parts = if (source == "azure") raw.split(",") else raw.split(Regex("[,\\s]+"))
+    // JS's `\s` and trim() spelled out (rollup XERK-1701): Kotlin's and the device's
+    // ICU sets differ from JS's (NBSP, BOM, U+001C..U+001F), so the same text made
+    // different labels on the two clients.
+    val parts = if (source == "azure") raw.split(",") else raw.split(LABEL_SPLIT)
     val out = LinkedHashSet<String>()
-    for (p in parts) p.trim().takeIf { it.isNotEmpty() }?.let { out.add(it) }
+    for (p in parts) jsTrim(p).takeIf { it.isNotEmpty() }?.let { out.add(it) }
     return out.toList().take(20)
 }
 

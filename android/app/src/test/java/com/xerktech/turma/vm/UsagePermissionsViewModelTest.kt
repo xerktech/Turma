@@ -6,6 +6,7 @@ import com.xerktech.turma.harness.MainDispatcherRule
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.TurmaJson
 import kotlinx.serialization.decodeFromString
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -51,13 +52,23 @@ class UsagePermissionsViewModelTest {
     private fun summary(head: String) =
         """{"days":7,"top":[{"kind":"dialog","head":"$head","count":1,"allowed":1,"denied":0,"open":0}],"recent":[]}"""
 
+    /**
+     * Released by the test to let [routeByOrg]'s held org answer — a GATE, not a
+     * timed delay. A 1.2 s headers delay raced the watcher on a loaded runner: when
+     * the watcher took longer than that to react, the late org's rows had already
+     * replaced the loading state before the test looked for it (rollup #69 flake).
+     */
+    private val release = CountDownLatch(1)
+
+    @After fun openGate() { release.countDown() }   // never strand the server thread
+
     /** Answer each org with its own rows, so a row names the scope it was fetched for. */
-    private fun routeByOrg(delayFor: String? = null) = hub.route("/api/permissions") { req ->
+    private fun routeByOrg(holdFor: String? = null) = hub.route("/api/permissions") { req ->
         val org = req.requestUrl?.queryParameter("org") ?: "all"
+        if (org == holdFor) release.await(30, TimeUnit.SECONDS)
         MockResponse().setResponseCode(200)
             .setHeader("Content-Type", "application/json")
             .setBody(summary("$org-cmd"))
-            .apply { if (org == delayFor) setHeadersDelay(1_200, TimeUnit.MILLISECONDS) }
     }
 
     private fun startWatching(vm: UsageViewModel) {
@@ -68,9 +79,9 @@ class UsagePermissionsViewModelTest {
 
     @Test
     fun `fetches the current org's seven days and refetches on an org change, never showing the old org`() {
-        // rival answers late, so the check below sees the moment after the pick
-        // rather than racing a fast rival answer (a flake under full-suite load).
-        routeByOrg(delayFor = "rival")
+        // rival's answer is HELD until released, so the check below sees the moment
+        // after the pick rather than racing rival's answer.
+        routeByOrg(holdFor = "rival")
         hub.container.org.set(setOf("acme"))
         hub.seedFleet(fleet)
         val vm = main.track(UsageViewModel(hub.app))
@@ -85,10 +96,11 @@ class UsagePermissionsViewModelTest {
         hub.container.org.set(setOf("rival"))
         // The old org's rows are dropped as soon as the watcher sees the move — loading,
         // never acme's. Awaited, not read at once: the watcher reacts on its own
-        // dispatcher, which a loaded runner hadn't reached yet (rollup #69). rival
-        // answers 1.2 s late, so this observes the loading state, not rival's rows.
+        // dispatcher. rival's answer is held, so nothing can replace the loading state
+        // before this looks at it.
         hub.awaitFlow(vm.permissions) { it.view == null }
         assertNull("org A's view must not survive under org B's pick", headOf(vm))
+        release.countDown()
         hub.awaitFlow(vm.permissions) { it.view != null }
         assertEquals("rival-cmd", headOf(vm))
 
@@ -99,15 +111,19 @@ class UsagePermissionsViewModelTest {
 
     @Test
     fun `an answer for an org the operator has since left is discarded`() {
-        routeByOrg(delayFor = "acme")
+        routeByOrg(holdFor = "acme")
         hub.container.org.set(setOf("acme"))
         hub.seedFleet(fleet)
         val vm = main.track(UsageViewModel(hub.app))
-        startWatching(vm)               // acme's read is now in flight, slow
+        startWatching(vm)               // acme's read is now in flight, held
+        assertEquals("acme", hub.findRequest("/api/permissions").requestUrl?.queryParameter("org"))
         hub.container.org.set(setOf("rival"))
         hub.awaitFlow(vm.permissions) { it.view != null }
         assertEquals("rival-cmd", headOf(vm))
-        Thread.sleep(1_800)             // acme's late answer lands now
+        release.countDown()             // acme's late answer lands now
+        // A negative check: the wait can only let a broken discard show, never fail a
+        // working one.
+        Thread.sleep(800)
         assertEquals("a stale org's answer must not replace the current one", "rival-cmd", headOf(vm))
     }
 

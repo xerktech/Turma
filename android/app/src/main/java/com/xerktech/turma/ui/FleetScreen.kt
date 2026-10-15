@@ -245,21 +245,30 @@ fun FleetScreen(
     }
 }
 
+// index.html's `/^(\S+)\s+\((.+)\)$/` with JS's `\s` and `.` spelled out (rollup
+// XERK-1701): the JVM's `\s` is ASCII and a device's ICU one is Unicode, neither JS's.
+private val CLAUDE_VERSION_RE = com.xerktech.turma.core.JS_WS.let { ws ->
+    Regex("([^\n$ws]+)[\n$ws]+\\(([^\n\r\u2028\u2029]+)\\)")
+}
+
 /** The coding agent a host runs, for its header — mirrors index.html codingAgent(). */
 fun codingAgentLabel(a: AgentInfo): String {
     val c = a.codingAgent
-    if (c != null && c.version.isNotBlank()) return "${c.name.ifBlank { "Claude Code" }} ${c.version}"
-    val raw = a.claudeVersion.trim()
+    // JS truthiness (index.html `c && c.version`, `c.name || "Claude Code"`): only an EMPTY
+    // string is falsy, so a whitespace-only version or name is used as it is.
+    if (c != null && c.version.isNotEmpty()) return "${c.name.ifEmpty { "Claude Code" }} ${c.version}"
+    val raw = com.xerktech.turma.core.jsTrim(a.claudeVersion)
     if (raw.isEmpty()) return "–"
-    val m = Regex("^(\\S+)\\s+\\((.+)\\)$").find(raw)
+    val m = CLAUDE_VERSION_RE.matchEntire(raw)
     return if (m != null) "${m.groupValues[2]} ${m.groupValues[1]}" else "Claude Code $raw"
 }
 
 /** The org tint for a host card (XERK-142): its org's palette colour, or null for a
  *  host with no tracker creds (no org → stays plain surface). colorMap is built over
  *  the whole fleet so the colour is stable regardless of the header's org filter. */
+@Composable
 private fun orgTintOf(agent: AgentInfo, colorMap: Map<String, Int>): Color? {
-    val series = com.xerktech.turma.ui.theme.TurmaColors.series
+    val series = com.xerktech.turma.ui.theme.TurmaColors.series()
     val slot = colorMap[siteKeyOf(agent)] ?: return null
     return series[slot % series.size]
 }

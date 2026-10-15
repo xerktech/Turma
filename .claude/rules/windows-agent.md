@@ -99,9 +99,32 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
   - **Host-unverified** (no Windows host in the fleet when it shipped). Verify on the first one:
     a typed two-line message must land as ONE turn with no `<pasted_content>` in the transcript.
     If LF submits there, revert `_pty_inject` to bracketing multi-line text.
-  - A failed slice returns False with no Enter; a failed LATER slice is retried once first,
-    since the earlier ones already sit in the composer. Residuals: a second failure leaves them
-    there for the NEXT message to submit; a lost reply on a slice that DID land types it twice.
+  - **Nothing undelivered is ever reported delivered**: a failed slice, or Enters that all
+    failed before going out (dead control channel), return `PANE_HOLD` with no Enter — held
+    and retried whole (`agent-input.md`), any landed text recorded for the next write to
+    clear, dropped with `OPERATOR MESSAGE NOT DELIVERED` at the TTL. It used to return False,
+    which `send_input` recorded as delivered: the message was lost with no retry.
+    `_ws_control_rpc(sent=)` tells a request that
+    never went out ("unsent", retried once for a LATER slice) from one whose reply was lost
+    ("lost", never retried: it typed 514 chars as 628).
+  - **A lost slice counts as typed only when the WHOLE composer is exactly the text so far**
+    (`_lost_slice_landed`), never on a tail match: periodic text ("y" × 440) ends the same
+    either way, and QA saw a message submitted cut at 222 chars as if whole. Anything else —
+    not drawn, or a composer taller than the pane — is cleared (or recorded) and the message
+    returns `PANE_HOLD`: retried whole later, never submitted cut, never typed twice.
+  - On a final failure the typed part is cleared (`_clear_composer`: Ctrl+U in small injects,
+    reading the composer back until none of it is left, `agent-input.md`), else the NEXT
+    message submits it — never while a dialog is up. One it can't clear (unreadable, mixed) is
+    recorded, so the next write clears it or holds. Measured on Claude Code 2.1.300 in tmux.
+    **Host-unverified on Windows**: that ConPTY delivers the `\x15` bytes as the same key.
+    Tests: the `_pty_inject` lost/clear cases, `TestClearComposer`.
+  - A dialog stops `_pty_inject` before any later slice or Enter (`PANE_DIALOG`), as on tmux,
+    and records what was typed for the next write to clear — the paste (chip or text) when it
+    drew during the bracketed path's settle. The chip-retry loop never Enters into a dialog.
+  - **No message is typed on the beat** (input, compaction resend and `notify_session`'s pane
+    fallback all go through the input worker). The beat still drives KEYS through
+    `_pane_send_keys` — set_model's picker, the `/rename` reconcile, interrupt, a prompt
+    answer, the trust modal — each a bounded control op, never a typed message.
   - `_type_into_pane` holds `_PANE_TYPE_LOCKS` on Windows too: N injects from two writers (input
     worker, qwen peer) would otherwise splice into one turn.
 - **The multi-line retry loop is bounded by a WALL CLOCK, not just the iteration count** (XERK-867,

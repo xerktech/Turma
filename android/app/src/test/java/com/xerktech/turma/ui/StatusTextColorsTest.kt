@@ -65,4 +65,27 @@ class StatusTextColorsTest {
     @Test fun `light keeps the fills and steps amber down, as the web's light tokens`() {
         assertEquals(listOf("#12A312", "#2A78D6", "#D03B3B", "#8A5A00"), colors(dark = false).map(::hex))
     }
+
+    private fun series(dark: Boolean): List<String> {
+        var out = emptyList<Color>()
+        compose.setContent { TurmaTheme(darkTheme = dark) { out = TurmaColors.series() } }
+        compose.waitForIdle()
+        return out.map(::hex)
+    }
+
+    // Org tints and chart lines read the web's --s1..--s8 for the theme (rollup
+    // XERK-1701): light used the dark-stepped set, a shade off every web org card.
+    @Test fun `light org and chart slots are the web's light --s1 to --s8`() {
+        assertEquals(
+            listOf("#2A78D6", "#1BAF7A", "#EDA100", "#008300", "#4A3AA7", "#E34948", "#E87BA4", "#EB6834"),
+            series(dark = false),
+        )
+    }
+
+    @Test fun `dark org and chart slots keep the dark-stepped set`() {
+        assertEquals(
+            listOf("#3987E5", "#199E70", "#C98500", "#2E9E2E", "#9085E9", "#E66767", "#D55181", "#D95926"),
+            series(dark = true),
+        )
+    }
 }

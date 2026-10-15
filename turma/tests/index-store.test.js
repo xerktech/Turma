@@ -1293,6 +1293,51 @@ test("a CRLF copy torn before a \\r still de-dups to a prefix of the repaired fi
   assert.equal(archive.dedupLines(Buffer.from('{"a":1}\u200b\n{"a":1}\n', "utf8")).dropped, 0);
 });
 
+test("a file stamped checked under an older de-dup keying is re-checked (rollup XERK-1701)", async () => {
+  const mem = pgSetup();
+  try {
+    const b = [ent("w0", "user", "first"), ent("w1", "assistant", "second")];
+    archive.ingestChunk("nas", "t-skew", META, 0, Buffer.byteLength(JSON.stringify(b)), b, "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-skew").filePath);
+    const once = fs.readFileSync(jsonl, "utf8");
+    const first = once.split("\n")[0];
+    // A re-sent copy of the first line that differs only by a trailing U+3000: the
+    // keying before blankTailStart kept both, and stamped the file checked.
+    fs.appendFileSync(jsonl, `${first}　\n`);
+    const size = fs.statSync(jsonl).size;
+    const meta = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    fs.writeFileSync(jsonl + ".meta", JSON.stringify({ ...meta, dedupChecked: size }));
+    assert.equal(await archive.dedupArchive({ publish: true }), 1, "the old stamp is not trusted");
+    assert.equal(fs.readFileSync(jsonl, "utf8"), once);
+    assert.equal(mem.sessions.get("t-skew").msgCount, 2);
+    // Re-stamped under the current keying: the next pass skips it (idempotent).
+    assert.equal(await archive.dedupArchive({ publish: true }), 0);
+    const stamp = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    assert.equal(stamp.dedupChecked, Buffer.byteLength(once));
+    assert.ok(stamp.dedupKeying >= 2);
+  } finally { pgTeardown(); }
+});
+
+test("a CLEAN file re-checked under the current keying is stamped with it, so no later pass reads it", async () => {
+  pgSetup();
+  const orig = fs.readFileSync;
+  try {
+    const b = [ent("c0", "user", "first"), ent("c1", "assistant", "second")];
+    archive.ingestChunk("nas", "t-clean", META, 0, Buffer.byteLength(JSON.stringify(b)), b, "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-clean").filePath);
+    const meta = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    // Stamped checked by a pass before the keying was recorded.
+    fs.writeFileSync(jsonl + ".meta", JSON.stringify({ ...meta, dedupChecked: fs.statSync(jsonl).size }));
+    let reads = 0;
+    fs.readFileSync = function (p, ...a) { if (p === jsonl) reads++; return orig.call(this, p, ...a); };
+    assert.equal(await archive.dedupArchive({ publish: true }), 0);
+    assert.equal(reads, 1, "the old stamp is re-checked once");
+    reads = 0;
+    assert.equal(await archive.dedupArchive({ publish: true }), 0);
+    assert.equal(reads, 0, "the new stamp is trusted: not read again");
+  } finally { fs.readFileSync = orig; pgTeardown(); }
+});
+
 test("XERK-1450 pg mode: a lost Postgres repair stays pending and the next leader redoes it", async () => {
   const mem = pgSetup();
   try {
@@ -1509,6 +1554,31 @@ test("PgIndexStore.inconsistentTranscripts: one aggregate, rows mapped", async (
   assert.match(q.text, /LEFT JOIN e ON e\.transcript_id = s\.transcript_id/);
   assert.match(q.text, /WHERE COALESCE\(e\.n, 0\) <> COALESCE\(e\.u, 0\) OR s\.msg_count <> COALESCE\(e\.n, 0\)$/);
   assert.deepEqual(out, [{ transcriptId: "t1", msgCount: 9, n: 6, u: 3 }]);
+});
+
+test("PgIndexStore.transcriptCounts: bound ids, row count + entry count + max seq per id", async () => {
+  const calls = [];
+  const pool = {
+    async query(text, params) {
+      calls.push({ text, params });
+      if (/_sessions WHERE transcript_id IN/.test(text)) return [{ transcript_id: "t1", msg_count: "5" }];
+      if (/GROUP BY transcript_id/.test(text)) return [{ transcript_id: "t1", n: "4", mx: "4" }];
+      return [];
+    },
+    async execute() { return { rows: [], rowCount: 1 }; },
+  };
+  const store = new PgIndexStore(pool, { prefix: DEFAULT_PREFIX });
+  assert.equal((await store.transcriptCounts([])).size, 0);
+  await store.ensureSchema();
+  calls.length = 0;
+  const out = await store.transcriptCounts(["t1", "t'2"]);
+  assert.equal(calls.length, 2);
+  for (const c of calls) {
+    assert.match(c.text, /transcript_id IN \(\$1, \$2\)/);
+    assert.deepEqual(c.params, ["t1", "t'2"], "ids are bound, never spliced");
+  }
+  assert.deepEqual(out.get("t1"), { msgCount: 5, n: 4, maxSeq: 4 });
+  assert.deepEqual(out.get("t'2"), { msgCount: null, n: 0, maxSeq: -1 });
 });
 
 test("XERK-1450: the re-seat skips a pending or rendered-blocked file and catches a distinct-count mismatch alone", async () => {
