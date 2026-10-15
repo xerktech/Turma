@@ -12042,6 +12042,51 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         self.assertTrue(os.path.isdir(cwd))
         self.assertEqual([s["id"] for s in sm.registry], ["s2"])
 
+    def test_a_zero_context_diff_config_cannot_hide_an_edit(self):
+        # diff.context=0 drops the pointer header from an edited LFS file's diff
+        # and makes a mid-file edit unplaceable; the snapshot pins -U3.
+        self.git("-C", self.src_repo, "config", "diff.context", "0")
+        wt = self.src_worktree()
+        self.write(wt, "long.txt", "".join(f"line {i}\n" for i in range(20)))
+        self.git("-C", wt, "add", "long.txt")
+        self.git("-C", wt, "commit", "-qm", "long")
+        self.write(wt, "long.txt", "".join(
+            f"line {i}{' edited' if i == 10 else ''}\n" for i in range(20)))
+        sm = self.make_manager()
+        sess = self.dst_sess()
+        sm._restore_worktree_state(sess, sm._capture_worktree_state(wt))
+        self.assertIn("line 10 edited", self.read(sess["worktreePath"], "long.txt"))
+        self.assertTrue(ha._LFS_POINTER_ADDED_RE.search(
+            b" version https://git-lfs.github.com/spec/v1\r\n"))
+
+    def test_import_admission_waits_out_a_sleeper_job(self):
+        sm = self.make_manager()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "slp")
+        got = []
+        sm._migration_download = lambda mid: got.append(mid)
+        for busy in ({"kind": "restore", "worktreePath": cwd, "root": False},
+                     {"kind": "teardown", "worktreePath": "/elsewhere",
+                      "root": False, "claudeSessionId": "tS"}):
+            with sm._sleeper_lock:
+                sm._sleeper_busy = {"x": busy}
+            sm.import_session({"type": "importSession", "cmdId": "c", "migrationId":
+                               "m1", "transcriptId": "tS", "cwd": cwd, "repo": "Turma"})
+            self.assertIn("paused session", sm.spawn_failures[-1]["error"])
+        self.assertEqual(got, [])
+        self.assertEqual(sm._imports_reserved(), 0)
+
+    def test_deleting_a_paused_record_keeps_a_worktree_an_import_rebuilds(self):
+        sm = self.make_manager()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "pz")
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "--detach", cwd,
+                 "origin/main")
+        sm.closed = [{"id": "p1", "repo": "Turma", "repoPath": self.dst_repo,
+                      "worktreePath": cwd, "paused": {"wakeAt": 1}}]
+        with sm._imports_lock:
+            sm._imports_inflight["mig1"] = os.path.normpath(cwd)
+        sm.delete("p1")
+        self.assertTrue(os.path.isdir(cwd))
+
     def test_a_mention_of_the_lfs_spec_is_not_lfs_content(self):
         wt = self.src_worktree()
         self.write(wt, "docs/lfs.md",

@@ -30467,9 +30467,10 @@ class SessionManager:
         if not is_root and self._import_holds(norm):
             refuse(f"another migration is already rebuilding {norm}")
             return
-        if not is_root and self._sleeper_job_blocks(cwd=norm):
-            refuse(f"a paused session's worktree at {norm} is still being torn "
-                   f"down or restored; try again in a moment")
+        if self._sleeper_job_blocks(cwd=norm, transcript=transcript_id,
+                                    root=is_root):
+            refuse(f"a paused session in {norm} (or this conversation) is still "
+                   f"being torn down or restored; try again in a moment")
             return
         # Cheap refusals before spending a download.
         if self._slots_used() >= MAX_SESSIONS:
@@ -30950,9 +30951,12 @@ class SessionManager:
             if rc != 0:
                 raise RuntimeError(f"git {cmd[0]} failed: {git_error_text(err)}")
         ppath = os.path.join(tmp, "changes.patch")
+        # -U3 too: `diff.context=0` makes a patch git apply can't place
+        # mid-file, and drops the LFS pointer header the LFS refusal looks for.
         rc, err = run_ok(["git", "-C", wt, "diff", "--cached", "--binary",
                           "--no-color", "--no-ext-diff", "--no-textconv",
-                          "--no-renames", "--src-prefix=a/", "--dst-prefix=b/",
+                          "--no-renames", "--no-relative", "-U3",
+                          "--src-prefix=a/", "--dst-prefix=b/",
                           f"--output={ppath}", "HEAD"], timeout=t, env=env)
         if rc != 0:
             raise RuntimeError(f"git diff failed: {git_error_text(err)}")
