@@ -194,6 +194,10 @@ class ChatWindowFitTest {
 
     private fun wholeComposeBox(fontScale: Float, imeDp: Int) {
         landscapeTyping(fontScale = fontScale, imeDp = imeDp)
+        // The bar stepped aside: what is left in its slot is exactly the status strip,
+        // measured with its padding (the footer's room is the window less that).
+        val strip = unclipped(compose.onNodeWithTag(CHAT_TOP_BAR_TAG).fetchSemanticsNode())
+        assertEquals("status strip in the bar's place", 24f, strip.height.value, 0.5f)
         assertComposeBoxWhole(imeDp)
     }
 
