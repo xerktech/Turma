@@ -67,10 +67,13 @@ composed.**
     notify fallback (its PR comment is already marked seen), compaction resend, qwen peer, and
     a trust modal a human must answer. The input worker retries every `INPUT_HOLD_RETRY_SEC`
     for `INPUT_HOLD_TTL_SEC`, then drops it with a log line.
-    - A TTL drop also forgets the pane's leftover record (else it holds the NEXT message too),
-      and a dropped OPERATOR message logs `OPERATOR MESSAGE NOT DELIVERED`. No agent→hub
-      channel carries it yet (spawnFailures is keyed to spawn cmdIds), so that log line is the
+    - A TTL drop also forgets the leftover record that held it (else it holds the NEXT message
+      too) — that record object only (`h["leftover"]`), never a newer one stored since — and a
+      dropped OPERATOR message logs `OPERATOR MESSAGE NOT DELIVERED`. No agent→hub channel
+      carries it yet (spawnFailures is keyed to spawn cmdIds), so that log line is the
       operator's only trace.
+    - Accepted residual: after that drop, the composer may still hold our stale fragment plus
+      the operator's text, and the NEXT message is typed into it and submitted glued to both.
     - One session's messages go in order: a later one queues behind a held one, and one
       waiting out its backoff blocks the rest (live rig: a due resend overtook it).
     - The worker sleeps to the earliest due time among each session's FIRST held message
@@ -105,7 +108,9 @@ composed.**
       in before any press can reach it, reads "mixed", and holds.
     - Bounds sized to the TYPED worst case (`CLEAR_MAX_PRESSES` = 2×`PASTE_SLICED_MAX_CHARS`+2;
       300 lines needed >400) and `CLEAR_DEADLINE_SEC`, both counted across retries on the
-      leftover record (`budget`).
+      leftover record (`budget`). A record written after a clear already ran (Windows'
+      inline clear) carries that budget (`_note_leftover(budget=)`): a fresh one read a
+      short remnant as maybe the operator's and typed the next message onto it (QA).
     - **One attempt presses for at most `CLEAR_ATTEMPT_SEC`, then the next retry resumes**: the
       ONE input worker delivers every session's messages, so a slow clear in one pane must not
       stall the rest. `CLEAR_ATTEMPT_SEC` (not the whole budget) is in `PANE_TYPE_LOCK_WAIT_SEC`.

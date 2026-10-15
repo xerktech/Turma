@@ -8993,6 +8993,20 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
         self.assertEqual(sent.count("\r"), 2)
 
 
+class _FakeClock:
+    """monotonic/sleep for `ha.time`: time moves only when the code sleeps (or a
+    test advances it), so time bounds are exercised without waiting."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, d):
+        self.t += d
+
+
 class _Runaway(BaseException):
     """A fake read past its cap: a loop that never ends. BaseException, so the
     code under test's `except Exception` can't swallow it into a pass."""
@@ -9010,10 +9024,13 @@ class _FakeComposer:
     MAX_READS = 20000
 
     def __init__(self, text="", width=40, chip=None, deaf=False, visible=None,
-                 on_press=None):
+                 on_press=None, lag=0):
         self.text, self.width, self.chip, self.deaf = text, width, chip, deaf
         self.on_press = on_press
         self.reads = 0
+        # Reads after a press that still show the frame from before it (a
+        # loaded Claude Code redraws late).
+        self.lag, self._stale, self._stale_reads = lag, None, 0
         # Claude Code draws at most this many composer rows (the LAST ones),
         # the prompt glyph on the first drawn, with no "more above" marker.
         self.visible = visible
@@ -9021,6 +9038,8 @@ class _FakeComposer:
         self.dialog = False
 
     def press(self, n=1):
+        if self.lag:
+            self._stale, self._stale_reads = self._render(), self.lag
         if self.on_press:
             self.on_press(n)
         for _ in range(n):
@@ -9055,6 +9074,12 @@ class _FakeComposer:
         self.reads += 1
         if self.reads > self.MAX_READS:
             raise _Runaway(f"{self.reads} composer reads: a loop that never ends")
+        if self._stale_reads:
+            self._stale_reads -= 1
+            return self._stale
+        return self._render()
+
+    def _render(self):
         if self.dialog:
             return PANE_PERMISSION_DIALOG
         rule = "─" * 60 + "\n"
@@ -9514,6 +9539,88 @@ class TestClearComposer(ManagerMixin, unittest.TestCase):
         self.assertIs(self._clear(comp, "x" * 800, budget=budget), True)
         self.assertEqual(comp.text, "")
 
+    def test_a_late_redraw_is_not_read_as_deaf(self):
+        # QA (delta 5) mutant Y1: a batch read back before Claude Code redrew
+        # looks unchanged; re-read once before calling the composer deaf.
+        typed = "x" * 800
+        comp = _FakeComposer(typed, lag=1)
+        self.assertIs(self._clear(comp, typed), True)
+        self.assertEqual(comp.text, "")
+
+    def test_the_time_budget_counts_across_retries(self):
+        # QA (delta 5) mutant Y3: each attempt is short, but together they stop
+        # at CLEAR_DEADLINE_SEC -- the time spent is carried on the budget.
+        typed = "\n".join(f"item {i:03d} ok" for i in range(300))
+        comp = _FakeComposer(typed, width=120, visible=15)
+        clock, budget = _FakeClock(), {}
+
+        def press(_t, n):
+            clock.t += 0.1                        # a slow pane
+            comp.press(n)
+        calls = 0
+        with mock.patch.object(ha, "_capture_pane", new=comp.frame), \
+                mock.patch.object(ha, "_press_clear", new=press), \
+                mock.patch.object(ha.time, "sleep", new=clock.sleep), \
+                mock.patch.object(ha.time, "monotonic", new=clock.monotonic), \
+                mock.patch.object(ha, "CLEAR_DEADLINE_SEC", 2.0), \
+                mock.patch.object(ha, "CLEAR_ATTEMPT_SEC", 0.3):
+            while calls < 200:
+                calls += 1
+                r = ha._clear_composer("agent-c", typed, budget=budget, draw_wait=0)
+                clock.t += 3                          # the retry interval
+                if r is not ha.PANE_HOLD or "stuck" in budget:
+                    break
+        self.assertEqual(r, ha.PANE_HOLD)
+        self.assertIn("stuck", budget)
+        self.assertGreaterEqual(budget["spent"], 2.0)
+        self.assertNotEqual(comp.text, "")
+
+    def test_a_probe_never_presses_into_operator_text(self):
+        # QA (delta 5) mutant Y5: after a deaf hold the operator typed more; the
+        # probe must read it as mixed and press nothing, at any age.
+        typed = "x" * 800
+        comp = _FakeComposer(typed, deaf=True)
+        budget = {}
+        self.assertEqual(self._clear(comp, typed, budget=budget), ha.PANE_HOLD)
+        pressed = comp.presses
+        comp.deaf = False
+        comp.text += " OPERATOR TYPED THIS"
+        budget["stuck"] = (budget["stuck"][0], budget["stuck"][1] - ha.CLEAR_STUCK_PROBE_SEC)
+        self.assertEqual(self._clear(comp, typed, budget=budget), ha.PANE_HOLD)
+        self.assertEqual(comp.presses, pressed)
+
+    def test_a_probe_never_spends_past_an_exhausted_budget(self):
+        # QA (delta 5) mutant Y6.
+        typed = "\n".join(f"item {i:03d} ok" for i in range(300))
+        comp = _FakeComposer(typed, width=120, visible=15)
+        budget = {}
+        with mock.patch.object(ha, "CLEAR_MAX_PRESSES", 20):
+            self.assertEqual(self._clear(comp, typed, budget=budget), ha.PANE_HOLD)
+            pressed = comp.presses
+            budget["stuck"] = (budget["stuck"][0],
+                               budget["stuck"][1] - ha.CLEAR_STUCK_PROBE_SEC)
+            self.assertEqual(self._clear(comp, typed, budget=budget), ha.PANE_HOLD)
+        self.assertEqual(comp.presses, pressed)
+
+    def test_a_record_carries_a_started_clear_into_the_next(self):
+        # QA (delta 5, hunt E): an inline clear (Windows) ran out with only
+        # "ok" left. A FRESH record read that short remnant as maybe the
+        # operator's ("gone") and the next message was typed glued onto it.
+        self.make_manager()
+        typed = "ok\n" + "y" * 240
+        comp = _FakeComposer(typed, width=40)
+        budget = {}
+        with mock.patch.object(ha, "CLEAR_ATTEMPT_SEC", 0):
+            while comp.text not in ("ok", "ok\n"):
+                self.assertEqual(self._clear(comp, typed, budget=budget), ha.PANE_HOLD)
+        ha._note_leftover("agent-c", typed, budget=budget)
+        epoch = ha._PANE_LEFTOVERS["agent-c"]["epoch"]
+        with mock.patch.object(ha, "_capture_pane", new=comp.frame), \
+                mock.patch.object(ha, "_press_clear", new=lambda _t, n: comp.press(n)), \
+                mock.patch.object(ha.time, "sleep", new=lambda _s: None):
+            self.assertIsNone(ha._clear_leftover("agent-c", epoch))
+        self.assertEqual(comp.text, "")
+
     def test_one_attempt_is_bounded_and_the_next_resumes(self):
         # QA (delta 4): one pane's clear must not hold the single input worker
         # for the whole budget; each retry continues where the last stopped.
@@ -9898,6 +10005,40 @@ class TestHeldForDialog(ManagerMixin, unittest.TestCase):
         self.assertNotIn(sess["tmuxName"], ha._PANE_LEFTOVERS)
         self.assertTrue(any("OPERATOR MESSAGE NOT DELIVERED" in m and "the operator" in m
                             for m in logs))
+
+    def test_a_ttl_drop_forgets_a_leftover_its_own_retry_left(self):
+        # The record is the one that held it at its LAST try: a retry stopped by
+        # a dialog mid-message wrote it after the message was first held.
+        sm = self.make_manager()
+        sess = self._running(sm)
+        sm._hold("input", sess, "msg")                      # no record yet
+
+        def stopped(name, text, epoch=None):
+            ha._note_leftover(name, text[:2])
+            return ha.PANE_DIALOG
+        self._due(sm)
+        with mock.patch.object(ha, "_type_into_pane", new=stopped):
+            sm._deliver_held()
+        self.assertIn(sess["tmuxName"], ha._PANE_LEFTOVERS)
+        sm.input_held[0]["since"] -= ha.INPUT_HOLD_TTL_SEC + 1
+        self._due(sm)
+        with mock.patch.object(ha, "_type_into_pane", new=lambda *a, **k: True):
+            sm._deliver_held()
+        self.assertNotIn(sess["tmuxName"], ha._PANE_LEFTOVERS)
+
+    def test_a_ttl_drop_keeps_a_newer_leftover_record(self):
+        # QA (delta 5, suspected): the drop popped whatever record the pane had,
+        # including one another writer stored after this message was held.
+        sm = self.make_manager()
+        sess = self._running(sm)
+        ha._note_leftover(sess["tmuxName"], "the leftover that held it")
+        sm._hold("input", sess, "old")
+        ha._note_leftover(sess["tmuxName"], "a newer leftover")
+        sm.input_held[0]["since"] -= ha.INPUT_HOLD_TTL_SEC + 1
+        self._due(sm)
+        with mock.patch.object(ha, "_type_into_pane", new=lambda *a, **k: True):
+            sm._deliver_held()
+        self.assertEqual(ha._PANE_LEFTOVERS[sess["tmuxName"]]["typed"], "a newer leftover")
 
     def test_a_resend_is_held_on_a_not_ready_pane(self):
         # QA (delta 4) mutant X1: PANE_HOLD must hold the resend path too.
@@ -41420,6 +41561,17 @@ class TestWindowsTerminalBackend(unittest.TestCase):
             self.assertFalse(ha._pty_inject("agent-x", a + b))
         self.assertEqual(sent, [a, b, b])                 # no blind ^U
         self.assertEqual(ha._PANE_LEFTOVERS["agent-x"]["typed"], a + b)
+
+    def test_pty_inject_records_the_clear_it_started(self):
+        # QA (delta 5): the inline clear's one attempt ran out; the record must
+        # say it started (presses), so the next clear finishes a short remnant.
+        a, b = ha._input_slices("a" * ha.PASTE_CHUNK_CHARS + "b" * 5)
+        comp = _FakeComposer(width=20)
+        with mock.patch.object(ha, "CLEAR_ATTEMPT_SEC", 0):
+            ok, sent = self._inject_with(["ok", "unsent", "unsent"], a + b, composer=comp)
+        self.assertFalse(ok)
+        self.assertNotEqual(comp.text, "")                 # one attempt: not all of it
+        self.assertGreater(ha._PANE_LEFTOVERS["agent-x"].get("presses", 0), 0)
 
     def test_pty_inject_a_refused_first_slice_needs_no_clearing(self):
         ok, sent = self._inject_with(["unsent"], "hello")

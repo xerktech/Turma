@@ -16965,22 +16965,36 @@ def _slice_gate(tmux_name, typed, deadline, await_drawn):
     return PANE_DIALOG if _dialog_up(tmux_name) else False
 
 
-def _stopped_for_dialog(tmux_name, where, typed="", chip=False):
+def _stopped_for_dialog(tmux_name, where, typed="", chip=False, budget=None):
     log(f"typing into {tmux_name}: a dialog came up mid-message; stopped {where} "
         f"and pressed nothing")
     if typed:
-        _note_leftover(tmux_name, typed, chip)
+        _note_leftover(tmux_name, typed, chip, budget)
     return PANE_DIALOG
 
 
-def _note_leftover(tmux_name, typed, chip=False):
+def _note_leftover(tmux_name, typed, chip=False, budget=None):
     """Remember what a message stopped by a dialog typed into this pane, for the
     next write to clear (`_clear_leftover`). Keyed to the writer's epoch: a
-    relaunch's fresh composer holds none of it."""
+    relaunch's fresh composer holds none of it.
+
+    `budget` is what a clear of it already did (`_clear_composer`'s presses,
+    time, stuck view -- Windows' inline clear): carried over, so the next clear
+    knows it STARTED. A fresh record read a short remnant ('ok' of a pressed
+    'ok\n' + 240 chars) as maybe-the-operator's ("gone") and the next message
+    was typed glued onto it (QA)."""
     ctx = getattr(_PANE_WRITER, "ctx", None)
     epoch = ctx[2] if ctx and ctx[0] == tmux_name else _pane_epoch(tmux_name)
+    rec = {k: v for k, v in (budget or {}).items() if k in ("presses", "spent", "stuck")}
+    rec.update(typed=typed, chip=chip, epoch=epoch)
     with _PANE_TYPE_LOCKS_GUARD:
-        _PANE_LEFTOVERS[tmux_name] = {"typed": typed, "chip": chip, "epoch": epoch}
+        _PANE_LEFTOVERS[tmux_name] = rec
+
+
+def _leftover_record(tmux_name):
+    """The pane's current leftover record (the object itself), or None."""
+    with _PANE_TYPE_LOCKS_GUARD:
+        return _PANE_LEFTOVERS.get(tmux_name)
 
 
 def _forget_pane(tmux_name):
@@ -17156,7 +17170,6 @@ def _clear_composer(tmux_name, typed, chip=False, draw_wait=CLEAR_DRAW_WAIT_SEC,
                 return PANE_HOLD
             if presses_now and time.monotonic() >= attempt_end:
                 return PANE_HOLD                       # resumed on the next retry
-            budget.pop("stuck", None)
             n = 1 if state == "chip" else max(1, min(CLEAR_KEYS_PER_WRITE, rows - 1))
             _press_clear(tmux_name, n)
             budget["presses"] = budget.get("presses", 0) + n
@@ -17669,14 +17682,17 @@ def _pty_inject(tmux_name, text):
                 log(f"typing into {tmux_name}: slice {n + 1}/{len(slices)} "
                     f"failed; clearing what was typed from the composer")
                 typed_so_far = "".join(slices[:n + 1]) if sliced else clean
-                cleared = _clear_composer(tmux_name, typed_so_far, chip=not sliced)
+                budget = {}
+                cleared = _clear_composer(tmux_name, typed_so_far, chip=not sliced,
+                                          budget=budget)
                 if cleared == PANE_DIALOG:
                     return _stopped_for_dialog(tmux_name, f"after slice {n + 1}/{len(slices)}",
-                                               typed_so_far, chip=not sliced)
+                                               typed_so_far, chip=not sliced, budget=budget)
                 if cleared is not True:
                     # Not cleared (unreadable, mixed, bounds): the next write
-                    # into this pane deals with it, or holds.
-                    _note_leftover(tmux_name, typed_so_far, chip=not sliced)
+                    # into this pane deals with it, or holds -- resuming this
+                    # clear's budget, not starting over.
+                    _note_leftover(tmux_name, typed_so_far, chip=not sliced, budget=budget)
             return False
     if sliced:
         # Typed text: settle, Enter, and Enter again if it was read as a line
@@ -31507,6 +31523,9 @@ class SessionManager:
                 "kind": kind, "sid": sid, "tmux": tmux, "text": text,
                 "typed": text if typed is None else typed,
                 "epoch": _pane_epoch(tmux) if epoch is None else epoch,
+                # The leftover record (if any) that held it: a TTL drop forgets
+                # THAT record, never a newer one another writer stored.
+                "leftover": _leftover_record(tmux),
                 "since": now, "next": now + INPUT_HOLD_RETRY_SEC})
             over = len(self.input_held) - INPUT_QUEUE_MAX
             if over > 0:
@@ -31565,9 +31584,12 @@ class SessionManager:
                     why = f"the pane was still not ready after {INPUT_HOLD_TTL_SEC:g}s"
                     # Whatever held it (most often our leftover mixed with the
                     # operator's text, never touched) must not hold the NEXT
-                    # message too: forget the leftover record with it.
+                    # message too: forget the leftover record with it -- that
+                    # record only, not a newer one stored since.
                     with _PANE_TYPE_LOCKS_GUARD:
-                        _PANE_LEFTOVERS.pop(h["tmux"], None)
+                        if (h.get("leftover") is not None
+                                and _PANE_LEFTOVERS.get(h["tmux"]) is h["leftover"]):
+                            del _PANE_LEFTOVERS[h["tmux"]]
                 elif h["kind"] == "resend" and not any(
                         p.get("text") == h["text"]
                         for p in sess.get("pendingInputs") or []):
@@ -31585,6 +31607,7 @@ class SessionManager:
                     if _must_hold(r):
                         with self._input_lock:
                             h["next"] = time.monotonic() + INPUT_HOLD_RETRY_SEC
+                            h["leftover"] = _leftover_record(h["tmux"])
                         blocked.add(sid)
                         continue
                     if r is None:
