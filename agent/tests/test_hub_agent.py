@@ -41695,6 +41695,16 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         self.assertEqual(ok, ha.PANE_HOLD)
         self.assertTrue(ha._PANE_LEFTOVERS["agent-x"]["chip"])
 
+    def test_pty_inject_an_unsent_enter_then_a_good_one_is_submitted_once(self):
+        # QA (rollup XERK-1701): only ALL unsent Enters mean nothing went out. A
+        # transient unsent Enter followed by one that lands is a send -- holding it
+        # (and recording a leftover) made the retry submit the message twice.
+        comp = _FakeComposer()
+        ok, sent = self._inject_with(["ok", "unsent", "ok"], "hello there", composer=comp)
+        self.assertIs(ok, True)
+        self.assertEqual(comp.submitted, ["hello there"])
+        self.assertNotIn("agent-x", ha._PANE_LEFTOVERS)
+
     def test_pty_inject_an_enter_whose_reply_was_lost_still_counts(self):
         # An Enter that went out may have submitted: _submit_typed's read-back
         # decides, and a composer that emptied is a send.
