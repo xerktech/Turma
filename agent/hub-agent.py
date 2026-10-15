@@ -16965,6 +16965,26 @@ def _slice_gate(tmux_name, typed, deadline, await_drawn):
     return PANE_DIALOG if _dialog_up(tmux_name) else False
 
 
+def _lost_slice_landed(tmux_name, so_far, deadline):
+    """After a slice whose reply was lost: True once the composer holds EXACTLY
+    `so_far` (all of it, nothing else), PANE_DIALOG if a dialog drew, False
+    past `deadline` -- including a composer taller than the pane, whose start
+    can't be seen: "can't tell" is never read as typed."""
+    want = _composer_norm(so_far)
+    while True:
+        cap = _capture_pane(tmux_name)
+        if _pane_blocking_dialog(cap):
+            return PANE_DIALOG
+        split = _composer_split(cap)
+        if split is not None:
+            box = split[1]
+            if (box[1:] if box.startswith("\u276f") else box) == want:
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(PASTE_SLICE_DRAWN_POLL_SEC)
+
+
 def _stopped_for_dialog(tmux_name, where, typed="", chip=False, budget=None):
     log(f"typing into {tmux_name}: a dialog came up mid-message; stopped {where} "
         f"and pressed nothing")
@@ -17663,8 +17683,12 @@ def _pty_inject(tmux_name, text):
         if state == "lost":
             # Typed or not? Ask the composer, never type it again (a retry of
             # a slice that did land typed it twice: 514 chars arrived as 628).
+            # It counts as typed only on POSITIVE evidence: the whole composer
+            # is exactly the text so far (`_lost_slice_landed`). A tail match
+            # can't tell -- periodic text ("y" * 440) ends the same either way,
+            # and the message went out cut as if whole (QA).
             so_far = "".join(slices[:n + 1])
-            drawn = sliced and _await_slice_drawn(
+            drawn = sliced and _lost_slice_landed(
                 tmux_name, so_far,
                 max(drawn_deadline, time.monotonic() + PTY_SUBMIT_SETTLE_SEC))
             if drawn == PANE_DIALOG:
@@ -17693,7 +17717,10 @@ def _pty_inject(tmux_name, text):
                     # into this pane deals with it, or holds -- resuming this
                     # clear's budget, not starting over.
                     _note_leftover(tmux_name, typed_so_far, chip=not sliced, budget=budget)
-            return False
+            # A lost slice may or may not have typed: hold, and the retry types
+            # the WHOLE message once the leftover is cleared -- never submitted
+            # cut, never typed twice.
+            return PANE_HOLD if state == "lost" else False
     if sliced:
         # Typed text: settle, Enter, and Enter again if it was read as a line
         # break (TYPED_SUBMIT_SETTLE_SEC — measured on the tmux path).

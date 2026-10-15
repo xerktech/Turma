@@ -101,8 +101,12 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
     If LF submits there, revert `_pty_inject` to bracketing multi-line text.
   - A failed slice returns False with no Enter. `_ws_control_rpc(sent=)` tells a request that
     never went out ("unsent", retried once for a LATER slice) from one whose reply was lost
-    ("lost", never retried: it typed 514 chars as 628). A lost slice counts as typed only once
-    the composer draws it (`_await_slice_drawn`).
+    ("lost", never retried: it typed 514 chars as 628).
+  - **A lost slice counts as typed only when the WHOLE composer is exactly the text so far**
+    (`_lost_slice_landed`), never on a tail match: periodic text ("y" × 440) ends the same
+    either way, and QA saw a message submitted cut at 222 chars as if whole. Anything else —
+    not drawn, or a composer taller than the pane — is cleared (or recorded) and the message
+    returns `PANE_HOLD`: retried whole later, never submitted cut, never typed twice.
   - On a final failure the typed part is cleared (`_clear_composer`: Ctrl+U in small injects,
     reading the composer back until none of it is left, `agent-input.md`), else the NEXT
     message submits it — never while a dialog is up. One it can't clear (unreadable, mixed) is

@@ -9036,6 +9036,7 @@ class _FakeComposer:
         self.visible = visible
         self.presses = 0
         self.dialog = False
+        self.submitted = []
 
     def press(self, n=1):
         if self.lag:
@@ -9059,7 +9060,11 @@ class _FakeComposer:
     def type(self, data):
         if data and set(data) == {"\x15"}:
             self.press(len(data))
-        elif data != "\r":
+        elif data == "\r":
+            if self.text:                            # Enter submits the composer
+                self.submitted.append(self.text)
+                self.text = ""
+        else:
             self.text += data
 
     def rows(self):
@@ -41493,8 +41498,9 @@ class TestWindowsTerminalBackend(unittest.TestCase):
 
     def _inject_with(self, outcomes, text, drawn=True, composer=None):
         """_pty_inject over a control channel whose inject calls go per
-        `outcomes`: "ok", "unsent" (refused before the request went out) or
-        "lost" (the request went out, the reply did not come back)."""
+        `outcomes`: "ok", "unsent" (refused before the request went out),
+        "lost" (the request went out and was applied, the reply did not come
+        back) or "refused" (went out, read, never applied, no reply)."""
         outcomes, sent = iter(outcomes), []
 
         def fake_control(name, op, **kw):
@@ -41502,14 +41508,16 @@ class TestWindowsTerminalBackend(unittest.TestCase):
             how = next(outcomes, "ok")
             if how != "unsent" and kw.get("sent") is not None:
                 kw["sent"].append(True)
-            if how != "unsent" and composer is not None:
+            if how in ("ok", "lost") and composer is not None:
                 composer.type(kw.get("data"))
             return {"ok": True} if how == "ok" else None
 
         capture = composer.frame if composer is not None else (lambda _t: COMPOSER_BUSY)
+        clock = _FakeClock()           # waits pass without spinning on the wall clock
         with mock.patch.object(ha, "IS_WINDOWS", True), \
              mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
-             mock.patch.object(ha.time, "sleep"), \
+             mock.patch.object(ha.time, "sleep", new=clock.sleep), \
+             mock.patch.object(ha.time, "monotonic", new=clock.monotonic), \
              mock.patch.object(ha, "_await_slice_drawn", return_value=drawn), \
              mock.patch.object(ha, "_capture_pane", side_effect=capture):
             return ha._pty_inject("agent-x", text), sent
@@ -41519,22 +41527,84 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         # and the retry typed it again (514 chars arrived as 628). The composer
         # shows it, so it landed: carry on, once.
         a, b = ha._input_slices("a" * ha.PASTE_CHUNK_CHARS + "b" * 5)
-        ok, sent = self._inject_with(["ok", "lost"], a + b)
-        self.assertTrue(ok)
+        comp = _FakeComposer()
+        ok, sent = self._inject_with(["ok", "lost"], a + b, composer=comp)
+        self.assertIs(ok, True)
         self.assertEqual(sent, [a, b, "\r"])
+        self.assertEqual(comp.submitted, [a + b])       # whole, once
 
     def test_pty_inject_a_lost_slice_the_composer_never_shows_is_cleared(self):
         # The lost slice never drew, but the first did: that is cleared (a
-        # wrapped row at a time), and nothing is ever typed twice.
+        # wrapped row at a time), nothing is ever typed twice, and the message
+        # is held for a whole retry.
         a, b = ha._input_slices("a" * ha.PASTE_CHUNK_CHARS + "b\nc")
         comp = _FakeComposer()
-        ok, sent = self._inject_with(["ok", "unsent", "lost"], a + b, drawn=False,
+        ok, sent = self._inject_with(["ok", "unsent", "refused"], a + b, drawn=False,
                                      composer=comp)
-        self.assertFalse(ok)
+        self.assertEqual(ok, ha.PANE_HOLD)
         self.assertEqual(sent[:3], [a, b, b])      # the unsent retry; never a third
         self.assertTrue(all(set(d) == {"\x15"} for d in sent[3:]))
         self.assertEqual(comp.text, "")
         self.assertNotIn("\r", sent)
+
+    def test_pty_inject_a_lost_slice_of_periodic_text_is_never_sent_cut(self):
+        # QA (round 6, rige Eper): "ok\n" + "y" * 440 with slice 2 read but never
+        # applied. The composer's TAIL matched the text so far either way, so
+        # the message was submitted at 222 chars as if whole. Only the WHOLE
+        # composer being the text so far counts as typed; else hold and clear.
+        text = "ok\n" + "y" * 440
+        a, b = ha._input_slices(text)
+        comp = _FakeComposer()
+        ok, sent = self._inject_with(["ok", "refused"], text, composer=comp)
+        self.assertEqual(ok, ha.PANE_HOLD)
+        self.assertNotIn("\r", sent)
+        self.assertEqual(sent.count(b), 1)              # never typed twice
+        self.assertEqual(comp.text, "")                 # cleared for the retry
+        # ...and when that slice DID land, the same text goes out whole.
+        comp = _FakeComposer()
+        ok, sent = self._inject_with(["ok", "lost"], text, composer=comp)
+        self.assertIs(ok, True)
+        self.assertEqual((sent.count(b), comp.submitted), (1, [text]))
+
+    def test_pty_inject_a_lost_slice_it_cannot_see_whole_holds(self):
+        # A composer taller than the pane shows only its last rows: whether the
+        # lost slice landed can't be told, so it is never read as typed.
+        text = "\n".join(f"line {i:02d}" for i in range(80))
+        comp = _FakeComposer(visible=5)
+        ok, sent = self._inject_with(["ok", "lost"], text, composer=comp)
+        self.assertEqual(ok, ha.PANE_HOLD)
+        self.assertNotIn("\r", sent)
+
+    def test_a_lost_slice_check_stops_at_a_dialog(self):
+        # A dialog drawn while waiting to see whether the lost slice landed ends
+        # the wait at once (no keystroke may follow; the dialog stop records it).
+        reads = []
+        clock = _FakeClock()
+        with mock.patch.object(ha, "_capture_pane",
+                               new=lambda _t: reads.append(1) or PANE_PERMISSION_DIALOG), \
+                mock.patch.object(ha.time, "sleep", new=clock.sleep), \
+                mock.patch.object(ha.time, "monotonic", new=clock.monotonic):
+            self.assertEqual(ha._lost_slice_landed("agent-x", "abc", clock.t + 5), ha.PANE_DIALOG)
+        self.assertEqual(len(reads), 1)
+
+    def test_pty_inject_a_dialog_during_its_clear_keeps_the_clear_budget(self):
+        # QA (round 6) mutants E4/E5: the record written when a dialog stops the
+        # inline clear must say what that clear already pressed.
+        a, b = ha._input_slices("a" * ha.PASTE_CHUNK_CHARS + "b" * 5)
+        comp = _FakeComposer()
+        comp.on_press = lambda n: setattr(comp, "dialog", True)
+        ok, sent = self._inject_with(["ok", "unsent", "unsent"], a + b, composer=comp)
+        self.assertEqual(ok, ha.PANE_DIALOG)
+        self.assertGreater(ha._PANE_LEFTOVERS["agent-x"].get("presses", 0), 0)
+
+    def test_pty_inject_a_deaf_composer_is_remembered_in_the_record(self):
+        # QA (round 6) mutant E6: the stuck view goes into the record, so the
+        # next write holds after one read instead of pressing a deaf pane again.
+        a, b = ha._input_slices("a" * ha.PASTE_CHUNK_CHARS + "b" * 5)
+        comp = _FakeComposer(deaf=True)
+        ok, sent = self._inject_with(["ok", "unsent", "unsent"], a + b, composer=comp)
+        self.assertFalse(ok)
+        self.assertIn("stuck", ha._PANE_LEFTOVERS["agent-x"])
 
     def test_pty_inject_clears_the_composer_when_the_retry_fails_too(self):
         # Slices already typed would otherwise be submitted by the NEXT message.
