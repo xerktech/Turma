@@ -103,13 +103,14 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
     never went out ("unsent", retried once for a LATER slice) from one whose reply was lost
     ("lost", never retried: it typed 514 chars as 628). A lost slice counts as typed only once
     the composer draws it (`_await_slice_drawn`).
-  - On a final failure the typed part is cleared (`_clear_composer`: 2N-1 Ctrl+U for N typed
-    lines, ≤10 per inject), else the NEXT message submits it — never while a dialog is up.
-    Measured on Claude Code 2.1.300 in tmux (`agent-input.md`): Ctrl+U at a line's start joins
-    it to the line above, and a `[Pasted text #n +N lines]` chip is one line that one press
-    clears whole. **Host-unverified on Windows**: that ConPTY delivers the `\x15` bytes as the
-    same key. Tests: the `_pty_inject` lost/clear cases, `TestClearComposer`.
-  - A dialog stops `_pty_inject` before any later slice or Enter (`PANE_DIALOG`), as on tmux.
+  - On a final failure the typed part is cleared (`_clear_composer`: Ctrl+U in small injects,
+    reading the composer back until none of it is left, `agent-input.md`), else the NEXT
+    message submits it — never while a dialog is up. Measured on Claude Code 2.1.300 in tmux.
+    **Host-unverified on Windows**: that ConPTY delivers the `\x15` bytes as the same key.
+    Tests: the `_pty_inject` lost/clear cases, `TestClearComposer`.
+  - A dialog stops `_pty_inject` before any later slice or Enter (`PANE_DIALOG`), as on tmux,
+    and records what was typed for the next write to clear — the paste (chip or text) when it
+    drew during the bracketed path's settle. The chip-retry loop never Enters into a dialog.
   - **No message is typed on the beat** (input, compaction resend and `notify_session`'s pane
     fallback all go through the input worker). The beat still drives KEYS through
     `_pane_send_keys` — set_model's picker, the `/rename` reconcile, interrupt, a prompt

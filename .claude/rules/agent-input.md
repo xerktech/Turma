@@ -68,17 +68,29 @@ composed.**
     for `INPUT_HOLD_TTL_SEC`, then drops it with a log line.
     - One session's messages go in order: a later one queues behind a held one, and one
       waiting out its backoff blocks the rest (live rig: a due resend overtook it).
+    - The worker sleeps to the earliest due time among each session's FIRST held message
+      (`_held_wait`): a blocked later one's past due time spun it at 20 Hz.
     - A held entry stays on `input_held` until typed, so `_input_undelivered` (sleeper pause)
       sees it; it moves to `input_landed` in one locked step. `_resend_queued` sees held resends.
     - Pinned to the pane epoch it was typed against: a relaunch drops it (old conversation).
-    - The retry clears what the stopped attempt left (`clear_leftover`: the box shows a piece
-      of this text), else it would be submitted twice, glued. Other composer text is left alone.
+    - What a stopped message typed is RECORDED per pane (`_PANE_LEFTOVERS`, `_note_leftover`:
+      the typed prefix, or "a paste" for the bracketed path). The next write into that pane
+      clears it first (`_clear_leftover`), else the retry submits it twice, glued.
+    - Only while the composer shows exactly that (`_leftover_shown`, strict: all of it, or its
+      tail/start on a short pane), or its chip. Never "any piece of the message": that erased an
+      operator's own draft "yes" (QA). Keyed to the pane epoch; a relaunch drops the record.
     - Residual: held state is in memory; an agent restart loses it.
     Tests: `TestHeldForDialog`.
-  - **Clearing an unsent message is 2N-1 Ctrl+U for N lines, ≤10 per write** (`_clear_composer`,
-    measured on 2.1.300): Ctrl+U at a line's start joins it to the line above (one per line left
-    the first line); a bigger burst drops presses; a chip is one line (one press clears it).
-    Tests: `TestClearComposer`.
+  - **Clearing an unsent message CONVERGES on the composer read back** (`_clear_composer`):
+    never a press count from the text. Measured on 2.1.300: Ctrl+U deletes to the start of the
+    VISUAL row (a wrapped 400-char line at 120 cols lost ~65 chars a press; counting logical
+    lines left 301 and the retry sent 3977 chars for 3201), joins a row to the one above at its
+    start, clears a `[Pasted text #n ...]` chip in one press, and does nothing on an empty box.
+    - Presses go ≤`CLEAR_KEYS_PER_WRITE` per write (a bigger burst drops presses; past ~800
+      bytes it is a paste chip of literal ^U), re-reading after each, until none of ours is
+      left; bounded by `CLEAR_MAX_PRESSES`/`CLEAR_DEADLINE_SEC`. A dialog stops it at once.
+    - An unreadable composer gets one bounded blind write.
+    Tests: `TestClearComposer` (`_FakeComposer` models visual-row deletion).
   - **The cap is judged on the text AS TYPED** (tabs already 4 spaces), on tmux and Windows alike:
     judged before, 4000 tabs became 40 slices, each a pane call.
   - **A pane's lock entry lives only while a writer uses it** (`[lock, users]`): a writer counts

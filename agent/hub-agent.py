@@ -16408,6 +16408,7 @@ def _retire_pane_writers(tmux_name):
         with _PANE_TYPE_LOCKS_GUARD:
             _PANE_EPOCH_SEQ[0] += 1
             _PANE_EPOCHS[tmux_name] = _PANE_EPOCH_SEQ[0]
+            _PANE_LEFTOVERS.pop(tmux_name, None)
     finally:
         if gated:
             entry[2].release()
@@ -16539,7 +16540,22 @@ def _composer_holds(cap, text):
 # 50-100ms gap cleared 60 lines; 20 with no gap, or 119 at once, did not.
 CLEAR_KEYS_PER_WRITE = 10
 CLEAR_WRITE_GAP_SEC = 0.05
-CLEAR_MAX_LINES = 100
+# Ctrl+U deletes to the start of the VISUAL (wrapped) row, so how many presses
+# a leftover takes depends on the pane width: the clear reads the composer back
+# after each batch until our text is gone, bounded by these.
+CLEAR_MAX_PRESSES = 400
+CLEAR_DEADLINE_SEC = _env_float("CLEAR_DEADLINE_SEC", 8.0, minimum=0.5)
+# How long a clear waits for a just-typed leftover to DRAW before it decides
+# there is nothing of ours in the composer.
+CLEAR_DRAW_WAIT_SEC = 1.0
+# The chip Claude Code collapses a paste into: '[Pasted text #3 +30 lines]', or
+# '[Pasted text #3]' for a long single line, as the composer read sees it
+# (whitespace dropped, `_composer_norm`). One Ctrl+U clears it whole.
+_PASTE_CHIP_NORM_RE = re.compile(r"\[Pastedtext#\d+(?:\+\d+lines?)?\]")
+# What a message stopped by a dialog left in its pane's composer, per tmux name:
+# {"typed", "chip", "epoch"}. The next write into that pane clears it, but only
+# while the composer shows exactly that -- never an operator's own draft.
+_PANE_LEFTOVERS = {}
 
 # What _type_into_pane (and its tmux/Windows halves) return when a DIALOG owns
 # the pane: nothing more was typed and no Enter was pressed. It is truthy, so a
@@ -16725,7 +16741,7 @@ def attachment_message(paths, failed, text):
     return "\n".join(lines)
 
 
-def _type_into_pane(tmux_name, text, epoch=None, clear_leftover=False):
+def _type_into_pane(tmux_name, text, epoch=None):
     """Put `text` into a session pane's input line and submit it with Enter.
 
     The text is delivered as a tmux PASTE — `load-buffer` it into a per-session
@@ -16770,8 +16786,9 @@ def _type_into_pane(tmux_name, text, epoch=None, clear_leftover=False):
     Returns PANE_DIALOG when a dialog owns the pane -- before the first slice,
     before ANY later slice or chunk, or before the Enter: typing stops at once
     and no Enter follows (a slice "1" picks option 1 of a permission prompt).
-    What was typed before it drew stays in the composer; `clear_leftover` (the
-    held-message retry) clears it before typing the message again. Returns
+    What was typed before it drew stays in the composer and is recorded
+    (`_PANE_LEFTOVERS`); the next write into the pane clears it first, while the
+    composer still shows exactly that (`_clear_leftover`). Returns
     None when the pane was relaunched mid-message (`_PANE_EPOCHS`: what was
     typed went to the old conversation, and no Enter follows)."""
     if not tmux_name:
@@ -16799,8 +16816,8 @@ def _type_into_pane(tmux_name, text, epoch=None, clear_leftover=False):
         if _pane_blocking_dialog(cap):
             log(f"typing into {tmux_name}: a dialog owns the pane; typed nothing")
             return PANE_DIALOG
-        if clear_leftover:
-            _clear_leftover(tmux_name, cap, text)
+        if _clear_leftover(tmux_name, epoch) == PANE_DIALOG:
+            return PANE_DIALOG
         # A Windows message is N slice injects too, so it takes the same lock.
         if IS_WINDOWS:
             return _pty_inject(tmux_name, text)
@@ -16841,7 +16858,8 @@ def _type_into_tmux_pane(tmux_name, text):
             time.sleep(PASTE_CHUNK_GAP_SEC)   # keep each burst under the paste threshold
             await_drawn = _slice_gate(tmux_name, text[:sent], drawn_deadline, await_drawn)
             if await_drawn == PANE_DIALOG:
-                return _stopped_for_dialog(tmux_name, f"before slice {n + 1}/{len(slices)}")
+                return _stopped_for_dialog(tmux_name, f"before slice {n + 1}/{len(slices)}",
+                                           text[:sent])
         # The buffer is per-SERVER, so load and paste must address the same one.
         if not _pane_write(run_stdin, _tmux("load-buffer", "-b", buf, "-", name=tmux_name),
                            piece):
@@ -16869,7 +16887,8 @@ def _type_into_tmux_pane(tmux_name, text):
             # Something may already be typed (earlier slices, or chunks): a
             # dialog that drew since must get nothing more.
             if (sent or n) and _dialog_up(tmux_name):
-                return _stopped_for_dialog(tmux_name, f"before chunk {n + 1}/{len(chunks)}")
+                return _stopped_for_dialog(tmux_name, f"before chunk {n + 1}/{len(chunks)}",
+                                           text[:sent] + "".join(chunks[:n]))
             # `--` ends tmux's own option parsing before the literal text, so a
             # message starting with '-' isn't misread as more send-keys flags.
             # Each chunk appends to the input line; only the Enter below submits.
@@ -16883,10 +16902,12 @@ def _type_into_tmux_pane(tmux_name, text):
     if sliced or not pasted:
         # Typed, not bracketed: an immediate Enter can be read as a line break.
         if _submit_typed(tmux_name, text, press_enter) == PANE_DIALOG:
+            _note_leftover(tmux_name, text)
             return PANE_DIALOG
     else:
         if _dialog_up(tmux_name):
-            return _stopped_for_dialog(tmux_name, "before the Enter")
+            # Pasted in one go: Claude Code shows it as a chip, not the text.
+            return _stopped_for_dialog(tmux_name, "before the Enter", text, chip=True)
         press_enter()
     return pasted
 
@@ -16908,59 +16929,137 @@ def _slice_gate(tmux_name, typed, deadline, await_drawn):
     return PANE_DIALOG if _dialog_up(tmux_name) else False
 
 
-def _stopped_for_dialog(tmux_name, where):
+def _stopped_for_dialog(tmux_name, where, typed="", chip=False):
     log(f"typing into {tmux_name}: a dialog came up mid-message; stopped {where} "
         f"and pressed nothing")
+    if typed:
+        _note_leftover(tmux_name, typed, chip)
     return PANE_DIALOG
 
 
-def _clear_composer(tmux_name, typed):
-    """Best-effort: erase a message that was typed but never submitted, so the
-    NEXT message does not submit it glued to its own text.
+def _note_leftover(tmux_name, typed, chip=False):
+    """Remember what a message stopped by a dialog typed into this pane, for the
+    next write to clear (`_clear_leftover`). Keyed to the writer's epoch: a
+    relaunch's fresh composer holds none of it."""
+    ctx = getattr(_PANE_WRITER, "ctx", None)
+    epoch = ctx[2] if ctx and ctx[0] == tmux_name else _pane_epoch(tmux_name)
+    with _PANE_TYPE_LOCKS_GUARD:
+        _PANE_LEFTOVERS[tmux_name] = {"typed": typed, "chip": chip, "epoch": epoch}
 
-    Ctrl+U deletes to the line's start, and at a line's start it deletes the
-    line break -- joining the line to the one above -- so N typed lines take
-    2N-1 presses (one per line, as before, left 'line one' behind). A '[Pasted
-    text #n +N lines]' chip is ONE line to it: one press clears it whole, so the
-    count from the text overshoots there, and a press on an empty composer does
-    nothing. Sent CLEAR_KEYS_PER_WRITE at a time with a gap: Claude Code drops
-    presses from a bigger burst (119 at once cleared ~15 of 60 lines), and a
-    burst past ~800 bytes is a paste chip of literal ^U. All measured on Claude
-    Code 2.1.300 in tmux; host-unverified on Windows (the pty-host writes the
-    same bytes into ConPTY). Bounded at CLEAR_MAX_LINES lines: a longer
-    leftover keeps its top lines."""
-    presses = 2 * min(typed.count("\n"), CLEAR_MAX_LINES) + 1
+
+def _clear_leftover(tmux_name, epoch):
+    """Before typing into a pane: clear what an earlier message stopped by a
+    dialog left in its composer, else the next Enter submits it glued to this
+    message (a held retry: the same text twice). Only while the composer shows
+    exactly that leftover (`_leftover_shown`): an operator's own draft, even one
+    that is a piece of the message, is never touched. PANE_DIALOG when a dialog
+    came up while clearing (the record is kept for the next write)."""
+    with _PANE_TYPE_LOCKS_GUARD:
+        rec = _PANE_LEFTOVERS.pop(tmux_name, None)
+    if not rec or rec["epoch"] != epoch:
+        return None
+    log(f"typing into {tmux_name}: clearing what a message stopped by a dialog "
+        f"left in the composer")
+    r = _clear_composer(tmux_name, rec["typed"], chip=rec["chip"], draw_wait=0)
+    if r == PANE_DIALOG:
+        with _PANE_TYPE_LOCKS_GUARD:
+            _PANE_LEFTOVERS.setdefault(tmux_name, rec)
+    return r
+
+
+def _leftover_shown(cap, typed, chip, strict):
+    """Does the composer in `cap` show what we typed (and nothing else)?
+
+    `strict` (before the first press): the box is all of `typed`, or -- a short
+    pane shows only the composer's last rows -- its tail, or its start (the
+    last piece may not have landed), at least COMPOSER_MIN_SHOWN_CHARS long.
+    Not strict (between presses): any non-empty piece of it, since Ctrl+U eats
+    it a visual row at a time from the end. A pasted leftover (`chip`) may also
+    be the chip alone: Claude Code collapses a long or multi-line paste into
+    one, but may draw a short one as text."""
+    split = _composer_split(cap)
+    if split is None:
+        return False
+    box = split[1]
+    shown = box[1:] if box.startswith("\u276f") else box
+    if not shown:
+        return False
+    if chip and _PASTE_CHIP_NORM_RE.fullmatch(shown):
+        return True
+    want = _composer_norm(typed)
+    if not strict:
+        return shown in want
+    if len(shown) < min(len(want), COMPOSER_MIN_SHOWN_CHARS):
+        return False
+    return shown == want or want.endswith(shown) or want.startswith(shown)
+
+
+def _press_clear(tmux_name, n):
+    if IS_WINDOWS:
+        _pane_write(_pty_control, tmux_name, "inject", data="\x15" * n)
+    else:
+        _pane_write(run, _tmux("send-keys", "-t", _tmux_pane(tmux_name),
+                               *(["C-u"] * n), name=tmux_name))
+
+
+def _clear_composer(tmux_name, typed, chip=False, draw_wait=CLEAR_DRAW_WAIT_SEC):
+    """Best-effort: erase a message (or a chip) that was typed but never
+    submitted, so the NEXT message does not submit it glued to its own text.
+
+    Converges on what the composer SHOWS rather than counting from the text:
+    Ctrl+U deletes to the start of the VISUAL row (a wrapped 400-char line at
+    120 cols lost ~65 chars a press), at a row's start it joins the row to the
+    one above, a chip goes in one press, and a press on an empty composer does
+    nothing (all measured on Claude Code 2.1.300). So: confirm the composer
+    shows exactly our leftover (`_leftover_shown`, strict), then press
+    CLEAR_KEYS_PER_WRITE at a time -- Claude Code drops presses from a bigger
+    burst, and past ~800 bytes it is a paste chip of literal ^U -- re-reading
+    after each batch until none of it is left, bounded by CLEAR_MAX_PRESSES and
+    CLEAR_DEADLINE_SEC. Stops at once if a dialog draws (^U is a keystroke to
+    it): returns PANE_DIALOG; True once cleared, False otherwise.
+
+    An unreadable composer (a dead control channel on Windows) gets one blind
+    estimate instead. Host-unverified on Windows (the pty-host writes the same
+    bytes into ConPTY)."""
     try:
-        while presses > 0:
-            n = min(presses, CLEAR_KEYS_PER_WRITE)
-            if IS_WINDOWS:
-                _pane_write(_pty_control, tmux_name, "inject", data="\x15" * n)
-            else:
-                _pane_write(run, _tmux("send-keys", "-t", _tmux_pane(tmux_name),
-                                       *(["C-u"] * n), name=tmux_name))
-            presses -= n
-            if presses:
-                time.sleep(CLEAR_WRITE_GAP_SEC)
+        deadline = time.monotonic() + CLEAR_DEADLINE_SEC
+        draw_by = time.monotonic() + draw_wait
+        cap = _capture_pane(tmux_name)
+        while True:
+            if cap is None:
+                # Can't look: one bounded blind estimate (rows of >= 40 chars).
+                _press_clear(tmux_name, min(CLEAR_KEYS_PER_WRITE, 2 * typed.count("\n")
+                                            + len(typed) // 40 + 1))
+                return False
+            if _pane_blocking_dialog(cap):
+                return PANE_DIALOG
+            if _leftover_shown(cap, typed, chip, strict=True):
+                break
+            if time.monotonic() >= draw_by:
+                return False                       # nothing of ours to clear
+            time.sleep(PASTE_SLICE_DRAWN_POLL_SEC)
+            cap = _capture_pane(tmux_name)
+        presses = 0
+        while presses < CLEAR_MAX_PRESSES and time.monotonic() < deadline:
+            n = 1 if chip else CLEAR_KEYS_PER_WRITE
+            _press_clear(tmux_name, n)
+            presses += n
+            time.sleep(CLEAR_WRITE_GAP_SEC)
+            cap = _capture_pane(tmux_name)
+            if cap is None:
+                return False
+            if _pane_blocking_dialog(cap):
+                return PANE_DIALOG
+            if not _leftover_shown(cap, typed, chip, strict=False):
+                return True
+        log(f"typing into {tmux_name}: the composer still shows the leftover after "
+            f"{presses} presses; leaving it")
+        return False
     except _PaneRelaunched:
         raise
     except Exception as e:
         log(f"typing into {tmux_name}: could not clear the composer: {e}")
-
-
-def _clear_leftover(tmux_name, cap, text):
-    """Before a HELD message is typed again: clear the part of it an earlier
-    attempt typed before a dialog stopped it (the composer still shows a piece
-    of this text), else the retry would submit it twice, glued. A composer
-    holding anything else is left alone."""
-    split = _composer_split(cap)
-    if split is None:
-        return
-    box = split[1]
-    shown = box[1:] if box.startswith("\u276f") else box
-    if shown and shown in _composer_norm(text):
-        log(f"typing into {tmux_name}: clearing what an attempt stopped by a "
-            f"dialog left in the composer")
-        _clear_composer(tmux_name, text)
+        return False
 
 
 # --- Windows terminal backend: the ConPTY pty-host (XERK-697, ADR D5) ----------
@@ -17428,7 +17527,8 @@ def _pty_inject(tmux_name, text):
             await_drawn = _slice_gate(tmux_name, "".join(slices[:n]), drawn_deadline,
                                       await_drawn)
             if await_drawn == PANE_DIALOG:
-                return _stopped_for_dialog(tmux_name, f"before slice {n + 1}/{len(slices)}")
+                return _stopped_for_dialog(tmux_name, f"before slice {n + 1}/{len(slices)}",
+                                           "".join(slices[:n]))
         state = _pty_inject_piece(tmux_name, piece)
         if state == "unsent" and n:
             # Earlier slices already sit in the composer, where the NEXT
@@ -17445,9 +17545,10 @@ def _pty_inject(tmux_name, text):
                 tmux_name, so_far,
                 max(drawn_deadline, time.monotonic() + PTY_SUBMIT_SETTLE_SEC))
             if drawn == PANE_DIALOG:
-                # Never clear into a dialog (^U is a keystroke to it): the held
-                # retry clears the leftover once the dialog is gone.
-                return _stopped_for_dialog(tmux_name, f"after slice {n + 1}/{len(slices)}")
+                # Never clear into a dialog (^U is a keystroke to it): the next
+                # write clears the leftover once the dialog is gone.
+                return _stopped_for_dialog(tmux_name, f"after slice {n + 1}/{len(slices)}",
+                                           so_far if sliced else clean, chip=not sliced)
             if drawn is True:
                 state = "ok"
         if state != "ok":
@@ -17457,22 +17558,26 @@ def _pty_inject(tmux_name, text):
             if n or state == "lost":
                 log(f"typing into {tmux_name}: slice {n + 1}/{len(slices)} "
                     f"failed; clearing what was typed from the composer")
-                if _dialog_up(tmux_name):
-                    return _stopped_for_dialog(tmux_name, f"after slice {n + 1}/{len(slices)}")
-                _clear_composer(tmux_name, "".join(slices[:n + 1]))
+                typed_so_far = "".join(slices[:n + 1]) if sliced else clean
+                if _clear_composer(tmux_name, typed_so_far, chip=not sliced) == PANE_DIALOG:
+                    return _stopped_for_dialog(tmux_name, f"after slice {n + 1}/{len(slices)}",
+                                               typed_so_far, chip=not sliced)
             return False
     if sliced:
         # Typed text: settle, Enter, and Enter again if it was read as a line
         # break (TYPED_SUBMIT_SETTLE_SEC — measured on the tmux path).
         if _submit_typed(tmux_name, clean, lambda: _pane_write(
                 _pty_control, tmux_name, "inject", data="\r")) == PANE_DIALOG:
+            _note_leftover(tmux_name, clean)
             return PANE_DIALOG
         return True
     chip = "\n" in clean
     if chip:
         time.sleep(PTY_SUBMIT_SETTLE_SEC)          # let the paste chip settle
     if _dialog_up(tmux_name):
-        return _stopped_for_dialog(tmux_name, "before the Enter")
+        # Drew during the chip's settle (PTY_SUBMIT_SETTLE_SEC): the paste sits
+        # in the composer, as a chip or as text.
+        return _stopped_for_dialog(tmux_name, "before the Enter", clean, chip=chip)
     _pane_write(_pty_control, tmux_name, "inject", data="\r")   # submit with Enter
     # Safety net: while a not-yet-submitted paste chip is still on screen and no
     # turn has started, Enter again. Never fires for typed text (no chip).
@@ -31301,7 +31406,13 @@ class SessionManager:
         with self._input_lock:
             if not self.input_held:
                 return None
-            due = min(h["next"] for h in self.input_held)
+            # Only each session's FIRST held message is actionable (the rest
+            # wait behind it, `_deliver_held`): a later one's past due time
+            # would wake the worker at the floor rate for nothing.
+            firsts = {}
+            for h in self.input_held:
+                firsts.setdefault(h["sid"], h["next"])
+            due = min(firsts.values())
         return max(0.05, due - time.monotonic())
 
     def _deliver_held(self):
@@ -31341,8 +31452,7 @@ class SessionManager:
                 if why:
                     log(f"held {h['kind']} for session {sid} dropped: {why}")
                 else:
-                    r = _type_into_pane(h["tmux"], h["text"], epoch=h["epoch"],
-                                        clear_leftover=True)
+                    r = _type_into_pane(h["tmux"], h["text"], epoch=h["epoch"])
                     if r == PANE_DIALOG:
                         with self._input_lock:
                             h["next"] = time.monotonic() + INPUT_HOLD_RETRY_SEC
