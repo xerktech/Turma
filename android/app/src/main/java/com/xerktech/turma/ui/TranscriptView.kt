@@ -420,7 +420,6 @@ private fun ProseImage(model: Any, alt: String, svg: Boolean) {
     var ratio by remember(model) { mutableStateOf<Float?>(null) }
     var natural by remember(model) { mutableStateOf(0.dp) }
     var failed by remember(model) { mutableStateOf(false) }
-    var empty by remember(model) { mutableStateOf(false) }
     var showFull by remember(model) { mutableStateOf(false) }
     if (failed) {
         Text(
@@ -431,7 +430,6 @@ private fun ProseImage(model: Any, alt: String, svg: Boolean) {
         )
         return
     }
-    if (empty) return
     val shape = RoundedCornerShape(6.dp)
     val r = ratio
     val size = if (r == null) Modifier.fillMaxWidth().height(120.dp)
@@ -442,10 +440,7 @@ private fun ProseImage(model: Any, alt: String, svg: Boolean) {
         contentScale = ContentScale.Fit,
         onSuccess = { st ->
             val sz = st.painter.intrinsicSize
-            // A zero-area image (an SVG with width="0") draws nothing on the web;
-            // collapse rather than leave the placeholder box standing.
-            if (sz.isSpecified && (sz.width <= 0f || sz.height <= 0f)) empty = true
-            else if (sz.isSpecified) {
+            if (sz.isSpecified && sz.width > 0f && sz.height > 0f) {
                 ratio = sz.width / sz.height
                 // Only ever widened: a re-decode at the new, smaller box must not
                 // shrink the cap it was sized from.

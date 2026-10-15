@@ -67,8 +67,9 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
   - **Every SVG Android decodes passes `SafeSvgDecoder` (`core/SvgGuard.kt`), registered INSTEAD of
     Coil's `SvgDecoder.Factory`.** AndroidSVG expands DOCTYPE entities unbounded and a Coil decode is
     not cancelled on leaving the screen, so one agent-sent entity bomb pinned the CPU for the app's
-    life. A DOCTYPE/ENTITY before the root `<svg` is refused (alt text shows). It also sniffs past
-    Coil's 1 KB / first-byte-`<` limit. Tests: `SvgGuardTest`.
+    life. Any DOCTYPE/ENTITY is refused (alt text shows), and the root is found by WALKING the
+    prolog (comments, PIs), never by searching for `<svg` — a `<svg` in a comment hid a DOCTYPE
+    after it. It also sniffs past Coil's 1 KB / first-byte-`<` limit. Tests: `SvgGuardTest`.
   - **A rule line is a SCAN (`isRuleLine`), never `/(?:-[ \t]*){3,}/`.** That regex is linear in V8
     but `java.util.regex` recurses once per iteration of a quantified GROUP, so the Android port of
     it threw an **uncatchable `StackOverflowError`** out of `parseProse` inside a Composable (an

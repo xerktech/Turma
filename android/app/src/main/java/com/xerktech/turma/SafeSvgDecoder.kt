@@ -7,6 +7,7 @@ import coil.fetch.SourceResult
 import coil.request.Options
 import com.xerktech.turma.core.SVG_PROLOG_MAX
 import com.xerktech.turma.core.SvgVerdict
+import com.xerktech.turma.core.opensMarkup
 import com.xerktech.turma.core.svgVerdict
 import okio.Buffer
 
@@ -25,7 +26,7 @@ class SafeSvgDecoder private constructor() {
             val buf = Buffer()
             // A short look first, so a bitmap costs no more than it did before.
             peek.read(buf, 64)
-            if (!declared && !looksLikeMarkupStart(buf.snapshot().toByteArray())) return null
+            if (!declared && !opensMarkup(buf.snapshot().toByteArray())) return null
             while (buf.size < SVG_PROLOG_MAX) {
                 if (peek.read(buf, SVG_PROLOG_MAX - buf.size) < 0) break
             }
@@ -34,15 +35,6 @@ class SafeSvgDecoder private constructor() {
                 SvgVerdict.SAFE -> SvgDecoder(result.source, options)
                 SvgVerdict.UNSAFE -> Decoder { throw IllegalStateException("refused SVG with a DOCTYPE") }
             }
-        }
-
-        // The first 64 bytes open markup (`<`, after whitespace/BOM) whose `<svg` may
-        // simply lie further in; worth reading the rest of the prolog for.
-        private fun looksLikeMarkupStart(b: ByteArray): Boolean {
-            var i = 0
-            while (i < b.size && (b[i] == ' '.code.toByte() || b[i] in 9..13)) i++
-            if (i < b.size && b[i] == 0xEF.toByte()) i += 3
-            return i < b.size && b[i] == '<'.code.toByte()
         }
 
         override fun equals(other: Any?) = other is Factory

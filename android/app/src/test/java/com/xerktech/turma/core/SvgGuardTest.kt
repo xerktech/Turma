@@ -1,6 +1,7 @@
 package com.xerktech.turma.core
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SvgGuardTest {
@@ -29,5 +30,25 @@ class SvgGuardTest {
         assertEquals(SvgVerdict.NOT_SVG, v("<svgfoo/>"))
         // Declared svg whose root can't be found within the window: refused, not guessed.
         assertEquals(SvgVerdict.UNSAFE, v("<?xml?><!--" + "x".repeat(SVG_PROLOG_MAX) + "-->", declared = true))
+    }
+
+    @Test fun `a svg hidden in a comment or PI cannot smuggle a DOCTYPE past the check`() {
+        val bomb = "<!DOCTYPE svg [<!ENTITY a \"x\">]><svg>&a;</svg>"
+        assertEquals(SvgVerdict.UNSAFE, v("<!-- <svg > -->$bomb"))
+        assertEquals(SvgVerdict.UNSAFE, v("<?x-a <svg/?>$bomb"))
+        assertEquals(SvgVerdict.UNSAFE, v("<!-- <svg > -->$bomb", declared = true))
+        // A DOCTYPE past the window's root is still refused, as the second line.
+        assertEquals(SvgVerdict.UNSAFE, v("<svg/><!DOCTYPE x>"))
+        // A real comment/PI before a clean root is fine.
+        assertEquals(SvgVerdict.SAFE, v("<?xml version=\"1.0\"?>\n<!-- made by x -->\n<svg/>"))
+        // A prolog that runs past the window: can't vouch for the root.
+        assertEquals(SvgVerdict.UNSAFE, v("<!--" + "x".repeat(SVG_PROLOG_MAX)))
+    }
+
+    @Test fun `a BOM then whitespace, and a namespaced root, are svg`() {
+        assertEquals(SvgVerdict.SAFE, v("\uFEFF\n <svg/>"))
+        assertEquals(SvgVerdict.SAFE, v("<svg:svg xmlns:svg=\"http://www.w3.org/2000/svg\"/>"))
+        assertTrue(opensMarkup("\uFEFF\n <svg/>".toByteArray()))
+        assertEquals(SvgVerdict.NOT_SVG, v("<svgx/>"))
     }
 }
