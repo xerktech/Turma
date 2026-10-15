@@ -188,7 +188,9 @@ Mirrors the glasses pure-core/adapter-shell split:
     (pinned to the bottom) hid the question's first lines under the bar on open.
   - Except typing on a short phone, where `aboveBox` drops under `CHAT_SHEET_MIN` (40dp; ~0 at
     font 2.0 on a 308dp-tall phone): then the floor is the whole footer, reached by scrolling it.
-  - Each sheet's scroll state is keyed on its question / prompt, so a new one opens at its top.
+    Keyboard down it stays `aboveBox`, however small, so the question's first line shows on open.
+  - Each sheet's scroll state is keyed on its question / prompt (`promptKey`: minus the TUI
+    cursor's row), so a new one opens at its top and a cursor move doesn't jump it.
   - Tests must read UNCLIPPED bounds and never scroll first: `getBoundsInRoot` is clipped and
     `performScrollTo` hides exactly this (`ChatWindowFitTest.sheetOnOpen`).
 - The bar's height comes from MEASURED line heights (`TextMeasurer`), not the style's `lineHeight`,

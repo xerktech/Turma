@@ -256,10 +256,11 @@ fun ChatScreen(
     // more: a sheet as tall as the whole footer overflowed it by the compose row, and,
     // pinned to the bottom, that overflow hid the question's own first lines under the bar.
     // Typing on a short phone can leave next to no room above the box at all: then the
-    // sheet takes the whole footer and is reached by scrolling it, never squeezed to 0.
+    // sheet takes the whole footer and is reached by scrolling it, never squeezed to 0. Only
+    // while typing: keyboard down, the room above the box shows the question's first line.
     val sheetMax = with(density) {
         val aboveBox = (footerMax - footerPx.toDp()).coerceAtLeast(0.dp)
-        val floor = if (aboveBox >= CHAT_SHEET_MIN) aboveBox else footerMax
+        val floor = if (aboveBox >= CHAT_SHEET_MIN || !imeUp) aboveBox else footerMax
         waitingSheetCap(maxHeight, topBarPx.toDp(), footerPx.toDp()).let { if (sheetFirst) maxOf(it, floor) else it }
     }
     val footerScroll = rememberScrollState()
@@ -793,6 +794,13 @@ internal fun chatTopBarHeight(titleLine: Dp, metaLine: Dp): Dp =
  * dialog's question, the context it asks about, and one card per numbered
  * option, the TUI cursor's row outlined. Tapping a card answers by its number.
  */
+/**
+ * What makes a permission prompt a NEW one, for resetting its sheet's scroll: everything but the
+ * TUI cursor's row, which moves within the same dialog and must not jump the sheet to its top.
+ */
+internal fun promptKey(p: com.xerktech.turma.model.PanePrompt) =
+    p.copy(options = p.options.map { it.copy(selected = false) })
+
 @Composable
 private fun PanePromptSheet(
     prompt: com.xerktech.turma.model.PanePrompt,
@@ -804,7 +812,7 @@ private fun PanePromptSheet(
         modifier = Modifier.fillMaxWidth().testTag(WAITING_SHEET_TAG),
     ) {
         Column(
-            Modifier.heightIn(max = maxHeight).verticalScroll(remember(prompt) { ScrollState(0) }).padding(12.dp),
+            Modifier.heightIn(max = maxHeight).verticalScroll(remember(promptKey(prompt)) { ScrollState(0) }).padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             // The pill shares the prompt's line: stacked, it alone filled a short window's

@@ -293,6 +293,42 @@ class ChatWindowFitTest {
         assertOpenAndWhole("Which two?")
     }
 
+    // Keyboard DOWN, a very short window keeps the floor at the room above the box: the
+    // question's first line shows on open, not a sliver from the middle of a whole-footer sheet.
+    @Test fun `a very short window with the keyboard down shows the question's first line`() {
+        open(widthDp = 686, heightDp = 240, fontScale = 2f, tunnelOnline = false,
+            sessionBlock = """{ "question": "Which one?", "questionOptions": [ $options ] }""")
+        insets(statusDp = 24, navDp = 24)
+        val bar = unclipped(compose.onNodeWithTag(CHAT_TOP_BAR_TAG).fetchSemanticsNode())
+        val box = unclipped(compose.onNode(hasSetTextAction()).fetchSemanticsNode())
+        val q = unclipped(compose.onNodeWithText("Which one?", useUnmergedTree = true).fetchSemanticsNode())
+        assertTrue("question top ${q.top} under the bar (${bar.bottom})", q.top >= bar.bottom - 0.5.dp)
+        assertTrue("question top ${q.top} not above the box (${box.top})", q.top < box.top)
+    }
+
+    // The TUI cursor moving within the same permission dialog keeps the sheet where it was read.
+    @Test fun `a permission prompt's cursor move keeps its scroll`() {
+        open(widthDp = 600, heightDp = 283, fontScale = 2f, tunnelOnline = false, statusConsumed = true,
+            sessionBlock = permission)
+        compose.onNodeWithText("Choice 4", substring = true).performScrollTo()
+        compose.waitForIdle()
+        val before = unclipped(compose.onNodeWithText("Choice 4", substring = true, useUnmergedTree = true).fetchSemanticsNode()).top
+        val moved = permission.replace(""""number":2,"label":"Choice 2"""", """"number":2,"label":"Choice 2","selected":true""")
+        assertTrue(moved != permission)
+        // The label rides the same beat, so its title marks the cursor move as applied.
+        hub.seedFleet(HubHarness.fleetJson(
+            host = host,
+            sessions = """{ "id": "$session", "repo": "Turma", "status": "running", "worktree": "wt",
+                            "label": "Cursor moved", "model": "opus", "permissionMode": "auto", "session": $moved }""",
+        ).replace("\"terminalOnline\": true", "\"terminalOnline\": false"))
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText("Cursor moved", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.waitForIdle()
+        val after = unclipped(compose.onNodeWithText("Choice 4", substring = true, useUnmergedTree = true).fetchSemanticsNode()).top
+        assertEquals("sheet jumped on a cursor move", before.value, after.value, 0.5f)
+    }
+
     // The boundary of the bar-fit check, full-screen at font 1.0: bar 64 + status 24, box row
     // 56 + the compact footer's 4dp padding = 148dp. Exactly that much room keeps the bar...
     @Test fun `the bar stays when bar and box fit exactly`() {
