@@ -261,15 +261,18 @@ class ChatWindowFitTest {
      * font 2.0, keyboard DOWN, tunnel offline: the header's three lines plus the chips and the
      * box left the cap nothing, so the sheet was 0dp. A pending sheet comes first.
      */
-    private fun twoPaneSheet(sessionBlock: String, firstOption: String) {
+    private fun twoPaneSheet(sessionBlock: String, firstOption: String, tunnelOnline: Boolean = false) {
         open(widthDp = 600, heightDp = 283, fontScale = 2f, sessionBlock = sessionBlock,
-            tunnelOnline = false, statusConsumed = true)
+            tunnelOnline = tunnelOnline, statusConsumed = true)
         val bar = compose.onNodeWithTag(CHAT_TOP_BAR_TAG).getBoundsInRoot()
         val sheet = compose.onNodeWithTag(WAITING_SHEET_TAG).getBoundsInRoot()
         assertTrue("sheet visible height ${sheet.height}", sheet.height >= 64.dp)
         assertTrue("sheet top ${sheet.top} over the top bar (${bar.bottom})", sheet.top >= bar.bottom - 0.5.dp)
-        // The tunnel warning stays, alone; host · repo yields to the sheet.
-        assertTrue("tunnel marker hidden", shown(CHAT_MARKER_TAG))
+        // The sheet takes ALL the room between the bar and the box (the floor): the cap
+        // alone kept a strip of transcript above it and left the sheet less.
+        assertTrue("sheet top ${sheet.top} leaves a gap under the bar (${bar.bottom})", sheet.top <= bar.bottom + 1.dp)
+        // host · repo yields to the sheet; the tunnel warning stays, alone, only when down.
+        assertEquals("tunnel marker", !tunnelOnline, shown(CHAT_MARKER_TAG))
         assertFalse("host · repo still takes a line", shown(CHAT_META_TAG))
         compose.onNodeWithText(firstOption).performScrollTo().assertIsDisplayed()
         assertComposeBoxWhole(0)
@@ -280,6 +283,11 @@ class ChatWindowFitTest {
 
     @Test fun `a two-pane chat at font 2 keeps a pending permission prompt visible`() =
         twoPaneSheet(permission, "1. Choice 1")
+
+    // Tunnel up: the header is the title alone (no blank meta line, no "live" marker).
+    @Test fun `a two-pane chat with its tunnel up keeps only the title above a pending question`() =
+        twoPaneSheet("""{ "question": "Which one?", "questionOptions": [ $options ] }""", "Option number 1",
+            tunnelOnline = true)
 
     @Test fun `the tunnel-offline marker stays whole and host-repo stays readable at font 2`() {
         open(widthDp = 411, heightDp = 800, fontScale = 2f, tunnelOnline = false)
