@@ -1233,7 +1233,8 @@ USAGE_EVERY = 15
 _GIT_OID_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 # A Git LFS pointer's first line, as bytes in a patch and as a `git log -G`
 # regex over a commit range.
-_LFS_POINTER_BYTES = b"version https://git-lfs.github.com/spec/v1"
+_LFS_POINTER_ADDED_RE = re.compile(
+    rb"^\+version https://git-lfs\.github\.com/spec/v1$", re.M)
 _LFS_POINTER_RE_GIT = r"^version https://git-lfs\.github\.com/spec/v1"
 # Header lines a patch from `_worktree_snapshot` never has (renames are off), and
 # that a hostile one could use: `copy from <abs path>` makes `git apply` read any
@@ -29685,6 +29686,9 @@ class SessionManager:
         if self._slots_used(exclude_id=sid) >= MAX_SESSIONS:
             log(f"start refused: at MAX_SESSIONS ({MAX_SESSIONS})")
             return
+        if not sess.get("root") and self._import_holds(sess.get("worktreePath")):
+            log(f"start refused: a migration is rebuilding {sess.get('worktreePath')}")
+            return
         try:
             # Root runs in REPOS_ROOT (always present) — no worktree to re-add.
             # Normally the worktree persists (kill keeps it), so this is skipped.
@@ -29748,6 +29752,11 @@ class SessionManager:
             self._unpause_closed(rec)
             self._refuse_start(f"a session is already running in "
                                f"{holder.get('worktreePath')}", cmd_id=cmd_id)
+            return
+        if not rec.get("root") and self._import_holds(rec.get("worktreePath")):
+            self._refuse_start(f"a migration is rebuilding the worktree at "
+                               f"{rec.get('worktreePath')}; try again in a moment",
+                               cmd_id=cmd_id)
             return
         # A paused sleeper's kept worktree is gone (a prune swept it while it
         # slept): `git worktree add` can take tens of seconds, so it runs on the
@@ -30137,6 +30146,12 @@ class SessionManager:
                for s in self.registry):
             refuse(f"a session is already running in {cwd}")
             return None
+        # A migration import rebuilding this path (unless this IS that import
+        # finishing).
+        if not is_root and not import_reserved and self._import_holds(cwd):
+            refuse(f"a migration is rebuilding the worktree at {cwd}; try again "
+                   f"in a moment")
+            return None
         # A paused sleeper's teardown or worktree restore still in flight there,
         # or on this conversation (XERK-1575).
         if self._sleeper_job_blocks(cwd=cwd, transcript=transcript_id, root=is_root):
@@ -30377,7 +30392,8 @@ class SessionManager:
         # to move one anyway).
         worktree = None
         wt = sess.get("worktreePath") or ""
-        if not sess.get("root") and _is_turma_worktree_path(wt) and os.path.isdir(wt):
+        if (not sess.get("root") and _is_turma_worktree_path(wt)
+                and os.path.lexists(os.path.join(wt, ".git"))):
             try:
                 worktree = self._capture_worktree_state(wt)
             except Exception as e:
@@ -30446,6 +30462,9 @@ class SessionManager:
         with self._imports_lock:
             if migration_id in self._imports_inflight:
                 return  # a re-delivered command for a move already under way
+        if not is_root and self._import_holds(norm):
+            refuse(f"another migration is already rebuilding {norm}")
+            return
         # Cheap refusals before spending a download.
         if self._slots_used() >= MAX_SESSIONS:
             refuse(f"the host is at MAX_SESSIONS ({MAX_SESSIONS})")
@@ -30530,6 +30549,16 @@ class SessionManager:
     def _imports_reserved(self):
         with self._imports_lock:
             return len(self._imports_inflight)
+
+    def _import_holds(self, path):
+        """Is a migration import thread rebuilding the worktree at `path`? Until
+        it lands, nothing else may launch into, remove, or rebuild that path —
+        the thread may be removing an old copy there or adding the new one."""
+        if not isinstance(path, str) or not path:
+            return False
+        path = os.path.normpath(path)
+        with self._imports_lock:
+            return path in self._imports_inflight.values()
 
     def _finish_import(self, job):
         """Beat half of import_session: unpack the transcript, record the usage
@@ -30938,6 +30967,10 @@ class SessionManager:
             return None
 
     def _worktree_gitdir(self, wt):
+        # Only a dir that IS a checkout: without its own `.git`, git walks up to
+        # whatever repo encloses it (a REPOS_ROOT that is itself a repo).
+        if not os.path.lexists(os.path.join(wt, ".git")):
+            return None
         rc, gd = run_out(["git", "-C", wt, "rev-parse", "--absolute-git-dir"],
                          timeout=self.MIGRATION_CAPTURE_GIT_TIMEOUT_SEC)
         return gd if rc == 0 and gd and os.path.isdir(gd) else None
@@ -31020,7 +31053,7 @@ class SessionManager:
             if _patch_has_gitlink(patch):
                 raise RuntimeError("it holds a nested git repo or a moved submodule, "
                                    "whose contents a move cannot carry")
-            if _LFS_POINTER_BYTES in patch:
+            if _LFS_POINTER_ADDED_RE.search(patch):
                 raise RuntimeError("its uncommitted changes touch Git LFS files, "
                                    "which a move cannot take yet; commit and push "
                                    "them first")
@@ -31224,9 +31257,13 @@ class SessionManager:
             return None
         t = self.MIGRATION_RESTORE_GIT_TIMEOUT_SEC
         redundant = False
+        # No `.git` of its own (a half-removed copy): every git command below
+        # would walk up to an enclosing repo and act on THAT. It is kept aside
+        # as a plain dir, untouched.
+        own = os.path.lexists(os.path.join(cwd, ".git"))
         gd = self._worktree_gitdir(cwd)
         mark = None
-        if gd:
+        if own and gd:
             try:
                 with open(os.path.join(gd, self.MIGRATION_EXPORT_MARK)) as f:
                     mark = f.read(128).strip()
@@ -31234,7 +31271,7 @@ class SessionManager:
                 pass
         if mark and self._worktree_digest(cwd) == mark:
             redundant = True
-        else:
+        elif own:
             rc_s, dirty = run_out(["git", "-C", cwd, "status", "--porcelain"], timeout=t)
             rc_h, old = run_out(["git", "-C", cwd, "rev-parse", "--verify",
                                  "HEAD^{commit}"], timeout=t)
@@ -31252,14 +31289,16 @@ class SessionManager:
                 log(f"migration: removed the older copy at {cwd} (nothing in it "
                     f"the move lacks)")
                 return None
-        run_ok(["git", "-C", cwd, "checkout", "-q", "--detach"], timeout=t)
+        if own:
+            run_ok(["git", "-C", cwd, "checkout", "-q", "--detach"], timeout=t)
         aside = f"{cwd}.pre-migration-{int(time.time())}"
         try:
             os.rename(cwd, aside)
         except OSError as e:
             raise RuntimeError(f"an older worktree is in the way at {cwd} and could "
                                f"not be moved aside: {e}")
-        run(["git", "-C", repo, "worktree", "repair", aside])
+        if own:
+            run(["git", "-C", repo, "worktree", "repair", aside])
         log(f"migration: kept the older worktree at {cwd} as {aside}")
         return aside
 
@@ -31600,7 +31639,7 @@ class SessionManager:
             # The lifecycle worker re-adding it for this record's wake: removing
             # it now would race that `git worktree add`; the landed resume then
             # finds no record and leaves the worktree to a later prune.
-            or self._sleeper_job_blocks(cwd=wt))
+            or self._sleeper_job_blocks(cwd=wt) or self._import_holds(wt))
         if wt is not None and not held and os.path.isdir(wt) \
                 and isinstance(rec.get("repoPath"), str):
             self._worktree_remove(rec)

@@ -11956,6 +11956,76 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         self.assertFalse(ha._is_turma_worktree_path(
             os.path.join(ha.WORKTREES_ROOT, "Turma", "abc", "sub")))
 
+    def test_an_in_flight_import_holds_its_slot_its_path_and_its_cwd(self):
+        sm = self.make_manager()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "held")
+        gate = threading.Event()
+        sm._migration_download = lambda mid: (gate.wait(30), None)[1]
+        base = sm._slots_used()
+        sm.import_session({"type": "importSession", "cmdId": "c1",
+                           "migrationId": "mig1", "transcriptId": "tH",
+                           "cwd": cwd, "repo": "Turma"})
+        try:
+            self.assertEqual(sm._slots_used(), base + 1)          # slot reserved
+            self.assertIn(cwd, sm._live_worktree_paths())         # prune shield
+            # Nothing else may launch into or rebuild that path meanwhile.
+            sm._resume_at_cwd("tH", cwd, cmd_id="c2")
+            self.assertIn("rebuilding", sm.spawn_failures[-1]["error"])
+            sm.import_session({"type": "importSession", "cmdId": "c3",
+                               "migrationId": "mig2", "transcriptId": "tH",
+                               "cwd": cwd, "repo": "Turma"})
+            self.assertIn("already rebuilding", sm.spawn_failures[-1]["error"])
+            sm.closed = [{"id": "s9", "repo": "Turma", "repoPath": self.dst_repo,
+                          "worktreePath": cwd, "claudeSessionId": "tOther"}]
+            sm.resume("s9", cmd_id="c4")
+            self.assertIn("rebuilding", sm.spawn_failures[-1]["error"])
+            self.assertEqual(sm.registry, [])
+        finally:
+            gate.set()
+        deadline = time.time() + 30
+        while time.time() < deadline and len(sm._imports_landed) < 1:
+            time.sleep(0.01)
+        sm._apply_imports_landed()
+        self.assertEqual(sm._slots_used(), base)
+        self.assertNotIn(cwd, sm._live_worktree_paths())
+
+    def test_a_half_removed_old_copy_is_kept_aside_without_touching_an_enclosing_repo(self):
+        # REPOS_ROOT itself a repo: git in a dir with no `.git` of its own would
+        # walk up and act on it.
+        self.git("init", "-q", "-b", "rootbr", ha.REPOS_ROOT)
+        self.git("-C", ha.REPOS_ROOT, "commit", "-q", "--allow-empty", "-m", "root")
+        src_wt = self.src_worktree()
+        sess = self.dst_sess()
+        self.write(sess["worktreePath"], "leftover.txt", "half-removed\n")
+        sm = self.make_manager()
+        sm._restore_worktree_state(sess, sm._capture_worktree_state(src_wt))
+        self.assert_rebuilt(sess["worktreePath"], src_wt)
+        self.assertEqual(self.git("-C", ha.REPOS_ROOT, "symbolic-ref", "--short",
+                                  "HEAD"), "rootbr")
+        [aside] = glob.glob(sess["worktreePath"] + ".pre-migration-*")
+        self.assertEqual(self.read(aside, "leftover.txt"), "half-removed\n")
+
+    def test_a_mention_of_the_lfs_spec_is_not_lfs_content(self):
+        wt = self.src_worktree()
+        self.write(wt, "docs/lfs.md",
+                   "Pointers start with: version https://git-lfs.github.com/spec/v1\n")
+        files = self.make_manager()._capture_worktree_state(wt)
+        self.assertIn(b"git-lfs.github.com", files["changes.patch"])
+
+    def test_restore_ignores_a_branch_name_it_may_not_check_out(self):
+        src_wt = self.src_worktree()
+        sm = self.make_manager()
+        files = sm._capture_worktree_state(src_wt)
+        meta = json.loads(files["state.json"])
+        meta["branch"] = "refs/heads/feat"
+        files["state.json"] = json.dumps(meta).encode()
+        sess = self.dst_sess()
+        sm._restore_worktree_state(sess, files)
+        self.assertEqual(self.git("-C", sess["worktreePath"], "rev-parse",
+                                  "--abbrev-ref", "HEAD"), "HEAD")
+        self.assertEqual(self.git("-C", self.dst_repo, "for-each-ref",
+                                  "refs/heads/refs/"), "")
+
     def test_only_plain_branch_names_are_checked_out(self):
         for bad in ("refs/heads/main", "HEAD", "--orphan", "a b", None, 7):
             self.assertFalse(ha._migratable_branch(bad), bad)
@@ -12030,6 +12100,7 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
     def test_export_refuses_when_the_worktree_cannot_be_captured(self):
         wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "not-a-repo")
         os.makedirs(wt)
+        self.write(wt, ".git", "gitdir: /nonexistent/gitdir\n")   # a broken checkout
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
         os.makedirs(proj, exist_ok=True)
         with open(os.path.join(proj, "tX.jsonl"), "w") as f:
