@@ -17628,8 +17628,10 @@ def _pty_inject(tmux_name, text):
     SAME rule decides typed vs bracketed (XERK-1727). Control bytes are stripped
     first (an ESC inside the body would close a paste early and have the rest
     read as keystrokes -- the hazard INPUT_CTRL_RE guards on the tmux path), and
-    CR/CRLF normalize to LF. Returns True when the text was accepted, False
-    when it was not, PANE_DIALOG when a dialog stopped it (see _type_into_pane).
+    CR/CRLF normalize to LF. Returns True when the text was submitted,
+    PANE_DIALOG when a dialog stopped it, PANE_HOLD when it was NOT delivered
+    (a slice or every Enter failed: dead control channel, lost reply) -- held
+    and retried whole, never counted as delivered (see _type_into_pane).
 
     Chat-sized text (<= PASTE_SLICED_MAX_CHARS, nothing in _SLICE_UNSAFE_RE) is
     TYPED, unbracketed, in PASTE_CHUNK_CHARS slices: bracketing -- or one burst
@@ -17717,18 +17719,33 @@ def _pty_inject(tmux_name, text):
                     # into this pane deals with it, or holds -- resuming this
                     # clear's budget, not starting over.
                     _note_leftover(tmux_name, typed_so_far, chip=not sliced, budget=budget)
-            # A lost slice may or may not have typed: hold, and the retry types
-            # the WHOLE message once the leftover is cleared -- never submitted
-            # cut, never typed twice.
-            return PANE_HOLD if state == "lost" else False
+            # Not delivered -- a lost slice may or may not have typed, an
+            # unsent one (dead control channel) typed nothing more: HOLD, and
+            # the retry types the WHOLE message once any leftover is cleared.
+            # Never False: send_input records anything but None/hold as
+            # delivered, and the message would be lost with no retry.
+            return PANE_HOLD
+    enters = []
+
+    def press_enter():
+        enters.append(_pty_inject_piece(tmux_name, "\r"))
+
+    def enter_never_went_out():
+        """Every Enter's request failed before it went out: nothing was
+        submitted, the whole message sits in the composer. Held, recorded."""
+        if enters and all(e == "unsent" for e in enters):
+            log(f"typing into {tmux_name}: the Enter never reached the pane; holding the "
+                f"message (its text stays recorded for the next write to clear)")
+            _note_leftover(tmux_name, clean, chip=not sliced)
+            return True
+        return False
     if sliced:
         # Typed text: settle, Enter, and Enter again if it was read as a line
         # break (TYPED_SUBMIT_SETTLE_SEC — measured on the tmux path).
-        if _submit_typed(tmux_name, clean, lambda: _pane_write(
-                _pty_control, tmux_name, "inject", data="\r")) == PANE_DIALOG:
+        if _submit_typed(tmux_name, clean, press_enter) == PANE_DIALOG:
             _note_leftover(tmux_name, clean)
             return PANE_DIALOG
-        return True
+        return PANE_HOLD if enter_never_went_out() else True
     chip = "\n" in clean
     if chip:
         time.sleep(PTY_SUBMIT_SETTLE_SEC)          # let the paste chip settle
@@ -17736,7 +17753,7 @@ def _pty_inject(tmux_name, text):
         # Drew during the chip's settle (PTY_SUBMIT_SETTLE_SEC): the paste sits
         # in the composer, as a chip or as text.
         return _stopped_for_dialog(tmux_name, "before the Enter", clean, chip=chip)
-    _pane_write(_pty_control, tmux_name, "inject", data="\r")   # submit with Enter
+    press_enter()                                  # submit with Enter
     # Safety net: while a not-yet-submitted paste chip is still on screen and no
     # turn has started, Enter again. Never fires for typed text (no chip).
     # Bounded by PTY_SUBMIT_MAX_RETRIES *and* a wall-clock deadline
@@ -17752,8 +17769,8 @@ def _pty_inject(tmux_name, text):
                 or _pane_blocking_dialog(cap)):
             break
         time.sleep(PTY_SUBMIT_SETTLE_SEC)
-        _pane_write(_pty_control, tmux_name, "inject", data="\r")
-    return True
+        press_enter()
+    return PANE_HOLD if enter_never_went_out() else True
 
 
 def _pty_inject_piece(tmux_name, piece):

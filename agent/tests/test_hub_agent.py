@@ -10063,6 +10063,41 @@ class TestHeldForDialog(ManagerMixin, unittest.TestCase):
             sm._deliver_qwen_peer_inbound("s1", "peer-a", "hello")
         self.assertEqual([h["kind"] for h in sm.input_held], ["peer"])
 
+    def test_a_dead_control_channel_holds_then_delivers_once_it_answers(self):
+        # Coordinator decision: an "unsent" Windows message was returned False,
+        # which send_input recorded as DELIVERED -- lost with no retry. It is
+        # held, never recorded, and delivered whole once the channel answers.
+        sm = self.make_manager()
+        sess = self._running(sm)
+        comp, state = _FakeComposer(), {"dead": True}
+
+        def control(name, op, **kw):
+            if state["dead"]:
+                return None                           # refused before it went out
+            if kw.get("sent") is not None:
+                kw["sent"].append(True)
+            comp.type(kw.get("data"))
+            return {"ok": True}
+        clock = _FakeClock()
+        text = ("hello over a dead channel " + "words " * 80).rstrip()   # two slices
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+                mock.patch.object(ha, "_pty_control", new=control), \
+                mock.patch.object(ha, "_capture_pane", new=comp.frame), \
+                mock.patch.object(ha.time, "sleep", new=clock.sleep), \
+                mock.patch.object(ha.time, "monotonic", new=clock.monotonic):
+            sm.send_input("s1", text, defer_record=True)
+            self.assertEqual([h["text"] for h in sm.input_held], [text])
+            self.assertEqual((sm.input_landed, sess.get("pendingInputs") or []), ([], []))
+            self._due(sm)
+            sm._deliver_held()                        # still dead: still held
+            self.assertEqual(len(sm.input_held), 1)
+            state["dead"] = False
+            self._due(sm)
+            sm._deliver_held()
+        self.assertEqual(comp.submitted, [text])
+        self.assertEqual(sm.input_held, [])
+        self.assertEqual([t for _s, _ty, t in sm.input_landed], [text])
+
     def test_kill_forgets_the_panes_leftover_and_epoch(self):
         # QA (delta 3): a killed session's 200K leftover lived on forever.
         sm = self.make_manager()
@@ -41481,7 +41516,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
     def test_pty_inject_failed_slice_submits_nothing(self):
         # A dead control channel mid-message must never submit a cut message.
         ok, order, _ = self._inject("a" * (ha.PASTE_CHUNK_CHARS + 5), ok=False)
-        self.assertFalse(ok)
+        self.assertEqual(ok, ha.PANE_HOLD)     # held, never "delivered"
         self.assertEqual([d for k, d in order if k == "inject"],
                          ha._input_slices("a" * (ha.PASTE_CHUNK_CHARS + 5))[:1])
         results = iter([{"ok": True}, None, None])
@@ -41493,7 +41528,8 @@ class TestWindowsTerminalBackend(unittest.TestCase):
 
         with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
              mock.patch.object(ha.time, "sleep"):
-            self.assertFalse(ha._pty_inject("agent-x", "a" * ha.PASTE_CHUNK_CHARS + "bb"))
+            self.assertEqual(ha._pty_inject("agent-x", "a" * ha.PASTE_CHUNK_CHARS + "bb"),
+                             ha.PANE_HOLD)
         self.assertNotIn("\r", sent)   # retried once, then gave up: no Enter
 
     def _inject_with(self, outcomes, text, drawn=True, composer=None):
@@ -41603,7 +41639,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         a, b = ha._input_slices("a" * ha.PASTE_CHUNK_CHARS + "b" * 5)
         comp = _FakeComposer(deaf=True)
         ok, sent = self._inject_with(["ok", "unsent", "unsent"], a + b, composer=comp)
-        self.assertFalse(ok)
+        self.assertEqual(ok, ha.PANE_HOLD)     # held, never "delivered"
         self.assertIn("stuck", ha._PANE_LEFTOVERS["agent-x"])
 
     def test_pty_inject_clears_the_composer_when_the_retry_fails_too(self):
@@ -41611,7 +41647,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         a, b = ha._input_slices("a" * ha.PASTE_CHUNK_CHARS + "b" * 5)
         comp = _FakeComposer()
         ok, sent = self._inject_with(["ok", "unsent", "unsent"], a + b, composer=comp)
-        self.assertFalse(ok)
+        self.assertEqual(ok, ha.PANE_HOLD)     # held, never "delivered"
         self.assertEqual(sent[:3], [a, b, b])
         self.assertTrue(sent[3:] and all(set(d) == {"\x15"} for d in sent[3:]))
         self.assertEqual(comp.text, "")
@@ -41628,7 +41664,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
              mock.patch.object(ha.time, "sleep"), \
              mock.patch.object(ha, "_await_slice_drawn", return_value=True), \
              mock.patch.object(ha, "_capture_pane", return_value=None):
-            self.assertFalse(ha._pty_inject("agent-x", a + b))
+            self.assertEqual(ha._pty_inject("agent-x", a + b), ha.PANE_HOLD)
         self.assertEqual(sent, [a, b, b])                 # no blind ^U
         self.assertEqual(ha._PANE_LEFTOVERS["agent-x"]["typed"], a + b)
 
@@ -41639,13 +41675,37 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         comp = _FakeComposer(width=20)
         with mock.patch.object(ha, "CLEAR_ATTEMPT_SEC", 0):
             ok, sent = self._inject_with(["ok", "unsent", "unsent"], a + b, composer=comp)
-        self.assertFalse(ok)
+        self.assertEqual(ok, ha.PANE_HOLD)     # held, never "delivered"
         self.assertNotEqual(comp.text, "")                 # one attempt: not all of it
         self.assertGreater(ha._PANE_LEFTOVERS["agent-x"].get("presses", 0), 0)
 
+    def test_pty_inject_an_enter_that_never_went_out_holds_the_message(self):
+        # Typed whole, but no Enter reached the pane (dead control channel):
+        # nothing was submitted -- hold, and record the text for the next
+        # write to clear, never count it delivered.
+        comp = _FakeComposer()
+        ok, sent = self._inject_with(["ok"] + ["unsent"] * 8, "hello there", composer=comp)
+        self.assertEqual(ok, ha.PANE_HOLD)
+        self.assertEqual(comp.submitted, [])
+        self.assertEqual(ha._PANE_LEFTOVERS["agent-x"]["typed"], "hello there")
+        # A bracketed paste's Enter, too (recorded as a paste).
+        comp = _FakeComposer()
+        text = "x" * (ha.PASTE_SLICED_MAX_CHARS + 1) + "\ny"
+        ok, sent = self._inject_with(["ok"] + ["unsent"] * 8, text, composer=comp)
+        self.assertEqual(ok, ha.PANE_HOLD)
+        self.assertTrue(ha._PANE_LEFTOVERS["agent-x"]["chip"])
+
+    def test_pty_inject_an_enter_whose_reply_was_lost_still_counts(self):
+        # An Enter that went out may have submitted: _submit_typed's read-back
+        # decides, and a composer that emptied is a send.
+        comp = _FakeComposer()
+        ok, sent = self._inject_with(["ok", "lost"], "hello there", composer=comp)
+        self.assertIs(ok, True)
+        self.assertEqual(comp.submitted, ["hello there"])
+
     def test_pty_inject_a_refused_first_slice_needs_no_clearing(self):
         ok, sent = self._inject_with(["unsent"], "hello")
-        self.assertFalse(ok)
+        self.assertEqual(ok, ha.PANE_HOLD)     # held, never "delivered"
         self.assertEqual(sent, ["hello"])
 
     def test_ws_control_rpc_says_whether_the_request_went_out(self):

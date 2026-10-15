@@ -99,7 +99,12 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
   - **Host-unverified** (no Windows host in the fleet when it shipped). Verify on the first one:
     a typed two-line message must land as ONE turn with no `<pasted_content>` in the transcript.
     If LF submits there, revert `_pty_inject` to bracketing multi-line text.
-  - A failed slice returns False with no Enter. `_ws_control_rpc(sent=)` tells a request that
+  - **Nothing undelivered is ever reported delivered**: a failed slice, or Enters that all
+    failed before going out (dead control channel), return `PANE_HOLD` with no Enter — held
+    and retried whole (`agent-input.md`), any landed text recorded for the next write to
+    clear, dropped with `OPERATOR MESSAGE NOT DELIVERED` at the TTL. It used to return False,
+    which `send_input` recorded as delivered: the message was lost with no retry.
+    `_ws_control_rpc(sent=)` tells a request that
     never went out ("unsent", retried once for a LATER slice) from one whose reply was lost
     ("lost", never retried: it typed 514 chars as 628).
   - **A lost slice counts as typed only when the WHOLE composer is exactly the text so far**
