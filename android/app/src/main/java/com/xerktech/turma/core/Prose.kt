@@ -27,6 +27,13 @@ sealed interface Span {
     /** A link: [label] shown, [url] opened. A bare URL has label == url. */
     data class Link(val label: String, val url: String) : Span
     /**
+     * A markdown image `![alt](url)` (chat.js linkify → imgTag). [url] is only ever
+     * http(s) or `data:image/…` — the parse admits nothing else. A paragraph holding
+     * one is split around it at render time ([splitImages]), as the web's
+     * `display: block` <img> breaks the line.
+     */
+    data class Image(val alt: String, val url: String) : Span
+    /**
      * An emphasised run (`**bold**`, `*italic*`, `***both***`, `~~strike~~`).
      * Nests: the inner [spans] are the re-parsed raw text, so bold-inside-italic
      * and a link inside emphasis both work, exactly as on the web.
@@ -66,6 +73,13 @@ sealed interface ProseBlock {
      * the same reading, one representation simpler.
      */
     data class ListBlock(val items: List<ProseListItem>) : ProseBlock
+    /**
+     * A raw `<svg>…</svg>` block at a line start, or a fence whose whole body is
+     * one SVG document (chat.js renderSvgAndText / SVG_FENCE → svgToImg). [source]
+     * is the trimmed markup; it is only ever DECODED as an image, never parsed into
+     * a view, so a script/onload/foreignObject in it can never run.
+     */
+    data class Svg(val source: String) : ProseBlock
 }
 
 // ---- links (chat.js linkify) ----------------------------------------------
@@ -74,7 +88,14 @@ sealed interface ProseBlock {
 // punctuation / emphasis markers / typographic quotes are peeled back out, and a
 // trailing ')' is kept only when it balances an opening one (…/Foo_(bar)).
 // A label never holds a `[`, as chat.js: `[^\]]` re-scanned the rest of a "[[[[…" run.
-private val LINK_RE = Regex("""\[([^\[\]]+)]\((https?://[^)\s]+)\)|(https?://[^\s<]+)""")
+// A markdown image ![alt](url) is tried first (XERK-221), so its `!` is never left as
+// stray text; its src is http(s) or data:image/* only. Whitespace is JS `\s` spelled
+// out (JS_WS + "\n"): Java's `\s` is ASCII-only, so an NBSP ended a URL on the web
+// and not here.
+private val LINK_RE = Regex(
+    """!\[([^\[\]]*)]\((https?://[^)$JS_WS_NL]+|data:image/[^)$JS_WS_NL]+)\)""" +
+        """|\[([^\[\]]+)]\((https?://[^)$JS_WS_NL]+)\)|(https?://[^$JS_WS_NL<]+)"""
+)
 // Peeled by a backward scan (as chat.js): `[…]+$` was quadratic on a long dot run.
 private const val TRAIL_CHARS = ".,;:!?'\"*_‘’“”"
 
@@ -85,11 +106,14 @@ private fun linkify(text: String): List<Span> {
     fun pushText(s: String) { if (s.isNotEmpty()) out.add(Span.Text(s)) }
     for (m in LINK_RE.findAll(text)) {
         pushText(text.substring(last, m.range.first))
-        val mdUrl = m.groups[2]?.value
-        if (mdUrl != null) {
-            out.add(Span.Link(m.groupValues[1], mdUrl)) // [label](url)
+        val imgUrl = m.groups[2]?.value
+        val mdUrl = m.groups[4]?.value
+        if (imgUrl != null) {
+            out.add(Span.Image(m.groupValues[1], imgUrl)) // ![alt](url)
+        } else if (mdUrl != null) {
+            out.add(Span.Link(m.groupValues[3], mdUrl)) // [label](url)
         } else {
-            var url = m.groupValues[3]
+            var url = m.groupValues[5]
             var trail = ""
             var e = url.length
             while (e > 0 && url[e - 1] in TRAIL_CHARS) e--
@@ -532,6 +556,8 @@ private fun paragraphOf(text: String): ProseBlock.Paragraph? {
 // and ICU's set on a device, which differs from JS on U+FEFF and U+0085: a fence
 // indented by either rendered as code on one platform and as prose on the other.
 internal const val JS_WS = "\t\u000B\u000C\r \u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF"
+/** JS `\s` in full: [JS_WS] plus the line feed it leaves out for the line patterns. */
+internal const val JS_WS_NL = "$JS_WS\n"
 // Matched on the line with trailing blanks cut (fenceLine): the trailing `[ \t]*` after
 // the optional info backtracked quadratically on ``` + 40k spaces + a backtick (3 s).
 private val FENCE_OPEN = Regex("^[$JS_WS]*(`{3,})[ \t]*([^$JS_WS`]*)$")
@@ -553,14 +579,127 @@ private val EOL_RE = Regex("""\r\n?""")
 private fun normalizeEol(s: String): String =
     if (!s.contains('\r')) s else EOL_RE.replace(s, "\n")
 
+// ---- raw SVG blocks (chat.js renderSvgAndText / SVG_FENCE) ----------------
+// A standalone <svg>…</svg> whose opener starts a line is lifted out of prose as an
+// image (XERK-221); one mid-line (an inline code span, a sentence) stays text, and
+// an unterminated one (a live turn mid-block) stays text until its closer lands.
+private val SVG_HINT = Regex("<svg[$JS_WS_NL>]", RegexOption.IGNORE_CASE)
+private val SVG_OPEN = Regex("(^|\n)[ \t]*<svg[$JS_WS_NL>]", RegexOption.IGNORE_CASE)
+private val SVG_CLOSE = Regex("</svg[$JS_WS_NL]*>", RegexOption.IGNORE_CASE)
+
+private fun parseSvgAndText(s: String): List<ProseBlock> {
+    if (SVG_HINT.find(s) == null) return parseTables(s)
+    val out = ArrayList<ProseBlock>()
+    var last = 0
+    var pos = 0
+    while (true) {
+        val open = SVG_OPEN.find(s, pos) ?: break
+        // The block runs to the NEAREST closer after `<svg` + its one delimiter (the
+        // web's lazy `[\s\S]*?`). No closer means no later opener can close either,
+        // so stop: retrying each opener to the end of the text was quadratic.
+        val close = SVG_CLOSE.find(s, open.range.last + 1) ?: break
+        val lt = open.range.last - 4  // the `<` of `<svg`
+        // The boundary newline the web keeps is dropped here: Compose's block spacing
+        // replaces it, and kept it would print a blank line above the image.
+        out.addAll(parseTables(afterBlock(s.substring(last, open.range.first), last)))
+        out.add(ProseBlock.Svg(s.substring(lt, close.range.last + 1).trim { isJsSpace(it) }))
+        last = close.range.last + 1
+        pos = last
+    }
+    out.addAll(parseTables(afterBlock(s.substring(last), last)))
+    return out
+}
+
+/** Text that follows an SVG block at [start] loses the newline ending the closer's line. */
+private fun afterBlock(text: String, start: Int): String =
+    if (start > 0 && text.startsWith("\n")) text.substring(1) else text
+
+/**
+ * chat.js SVG_FENCE, `^\s*<svg[\s>][\s\S]*<\/svg\s*>\s*$`i, as a scan: the body,
+ * trimmed, opens `<svg` + whitespace or `>` and ends `</svg` + whitespace + `>`. The
+ * opener and closer cannot overlap (a closer starts `</`, which no opener char is).
+ */
+private fun isSvgDocument(body: String): Boolean {
+    val t = body.trim { isJsSpace(it) }
+    if (t.length < 5 || !t.regionMatches(0, "<svg", 0, 4, ignoreCase = true)) return false
+    val d = t[4]
+    if (d != '>' && !isJsSpace(d)) return false
+    if (!t.endsWith(">")) return false
+    var e = t.length - 1
+    while (e > 0 && isJsSpace(t[e - 1])) e--
+    return e >= 5 && t.regionMatches(e - 5, "</svg", 0, 5, ignoreCase = true)
+}
+
+/** One piece of a run of inline spans once its images are split out ([splitImages]). */
+sealed interface InlinePiece {
+    data class Text(val spans: List<Span>) : InlinePiece
+    data class Image(val image: Span.Image) : InlinePiece
+}
+
+/**
+ * Split inline [spans] around every [Span.Image], at any emphasis depth — the web's
+ * <img> is `display: block`, so it breaks the line wherever it sits. An image inside
+ * `**…**` splits the emphasis into a styled run either side. Text around an image
+ * loses the one newline that separated it from the image, and a run of nothing but
+ * whitespace between two images is dropped, as block spacing replaces both.
+ */
+fun splitImages(spans: List<Span>): List<InlinePiece> {
+    if (!hasImage(spans)) return listOf(InlinePiece.Text(spans))
+    val raw = ArrayList<InlinePiece>()
+    val buf = ArrayList<Span>()
+    fun flush() { if (buf.isNotEmpty()) { raw.add(InlinePiece.Text(ArrayList(buf))); buf.clear() } }
+    for (span in spans) when {
+        span is Span.Image -> { flush(); raw.add(InlinePiece.Image(span)) }
+        span is Span.Styled && hasImage(span.spans) -> for (p in splitImages(span.spans)) when (p) {
+            is InlinePiece.Image -> { flush(); raw.add(p) }
+            is InlinePiece.Text -> buf.add(span.copy(spans = p.spans))
+        }
+        else -> buf.add(span)
+    }
+    flush()
+    val out = ArrayList<InlinePiece>()
+    for ((i, p) in raw.withIndex()) {
+        if (p !is InlinePiece.Text) { out.add(p); continue }
+        var sp = p.spans
+        if (i > 0) sp = trimEdgeNewline(sp, leading = true)
+        if (i < raw.size - 1) sp = trimEdgeNewline(sp, leading = false)
+        if (sp.isNotEmpty() && !isJsBlank(plainText(sp))) out.add(InlinePiece.Text(sp))
+    }
+    return out
+}
+
+private fun hasImage(spans: List<Span>): Boolean =
+    spans.any { it is Span.Image || (it is Span.Styled && hasImage(it.spans)) }
+
+private fun plainText(spans: List<Span>): String = spans.joinToString("") {
+    when (it) {
+        is Span.Text -> it.text
+        is Span.Code -> it.text
+        is Span.Link -> it.label
+        is Span.Image -> it.alt
+        is Span.Styled -> plainText(it.spans)
+    }
+}
+
+/** Drop one newline from the [leading] (else trailing) edge, when a plain Text holds it. */
+private fun trimEdgeNewline(spans: List<Span>, leading: Boolean): List<Span> {
+    val idx = if (leading) 0 else spans.size - 1
+    val edge = spans.getOrNull(idx) as? Span.Text ?: return spans
+    val t = if (leading) edge.text.removePrefix("\n") else edge.text.removeSuffix("\n")
+    if (t == edge.text) return spans
+    val out = spans.toMutableList()
+    if (t.isEmpty()) out.removeAt(idx) else out[idx] = Span.Text(t)
+    return out
+}
+
 /** Parse [raw] into an ordered list of prose blocks. */
 fun parseProse(raw: String): List<ProseBlock> {
     val text = normalizeEol(raw)
-    if (!text.contains("```")) return parseTables(text)
+    if (!text.contains("```")) return parseSvgAndText(text)
     val lines = text.split("\n")
     val out = ArrayList<ProseBlock>()
     val buf = ArrayList<String>()
-    fun flush() { if (buf.isNotEmpty()) { out.addAll(parseTables(buf.joinToString("\n"))); buf.clear() } }
+    fun flush() { if (buf.isNotEmpty()) { out.addAll(parseSvgAndText(buf.joinToString("\n"))); buf.clear() } }
     var i = 0
     while (i < lines.size) {
         val open = FENCE_OPEN.matchEntire(fenceLine(lines[i]))
@@ -571,7 +710,10 @@ fun parseProse(raw: String): List<ProseBlock> {
             val openLen = open.groupValues[1].length
             while (i < lines.size && !fenceCloses(lines[i], openLen)) { body.add(lines[i]); i++ }
             i++ // consume the closer; past the end already for an unterminated block
-            out.add(ProseBlock.Code(open.groupValues[2], body.joinToString("\n")))
+            val bodyStr = body.joinToString("\n")
+            // A fence whose whole body is one SVG document is a picture, not code.
+            out.add(if (isSvgDocument(bodyStr)) ProseBlock.Svg(bodyStr.trim { isJsSpace(it) })
+                else ProseBlock.Code(open.groupValues[2], bodyStr))
             continue
         }
         buf.add(lines[i]); i++

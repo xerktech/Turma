@@ -58,6 +58,12 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
     - **An inline code span's closer comes from the line's runs indexed BY LENGTH** (`renderInline`,
       `parseInline`), built once per line with a forward cursor per length. Scanning to the closer per
       opener was N^1.5 on a line of unclosed runs of distinct lengths (3.5 s at 1M chars).
+  - **The raw-SVG pass scans only up to the LAST `</svg>`** (`renderSvgAndText`; Android stops at
+    the first opener with no closer after it). Past it every line-start `<svg` retried its lazy body
+    to the end of the text and failed — quadratic on a run of unclosed openers. Same matches.
+  - **Android splits a paragraph around an image at RENDER time** (`splitImages`), not in the parse:
+    the web's `<img>` is `display: block` inside inline content, so the tree keeps `Span.Image` inline
+    and `ProseInline` breaks the line there, dropping the newline either side as other constructs do.
   - **A rule line is a SCAN (`isRuleLine`), never `/(?:-[ \t]*){3,}/`.** That regex is linear in V8
     but `java.util.regex` recurses once per iteration of a quantified GROUP, so the Android port of
     it threw an **uncatchable `StackOverflowError`** out of `parseProse` inside a Composable (an

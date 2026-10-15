@@ -675,8 +675,15 @@
     const s = String(text == null ? "" : text);
     if (!/<svg[\s>]/i.test(s)) return renderTables(s); // no <svg → nothing to lift out
     const re = /(^|\n)[ \t]*(<svg[\s>][\s\S]*?<\/svg\s*>)/gi;
+    // Every block ends at a closer, so scan only up to the LAST one: past it each
+    // `<svg` opener would retry its lazy body to the end of the text and fail —
+    // quadratic on a run of unclosed openers (~0.7 s at 140k chars). Same matches.
+    const closers = /<\/svg\s*>/gi;
+    let end = 0, c;
+    while ((c = closers.exec(s))) end = c.index + c[0].length;
+    const head = s.slice(0, end);
     let out = "", last = 0, m;
-    while ((m = re.exec(s))) {
+    while ((m = re.exec(head))) {
       out += renderTables(s.slice(last, m.index) + m[1]); // keep the boundary newline
       out += svgToImg(m[2]);
       last = m.index + m[0].length;
