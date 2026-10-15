@@ -13,6 +13,7 @@ import base64
 import contextlib
 import datetime
 import errno
+import glob
 import gzip
 import hashlib
 import http.server
@@ -31,6 +32,7 @@ import shutil
 import signal
 import socket
 import struct
+import tarfile
 import sys
 import tempfile
 import types
@@ -11567,6 +11569,298 @@ class TestResumeTranscript(ManagerMixin, unittest.TestCase):
         sm.resume_transcript("../etc/passwd", "/x")
         self.assertEqual(sm.registry, [])
         sm._launch_tmux.assert_not_called()
+
+
+class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
+    """A migration carries the session's WORKTREE, not just its conversation:
+    unpushed commits ride a git bundle, uncommitted + untracked changes a binary
+    patch, and the target rebuilds the tree on the same branch. Driven over REAL
+    git: a bare origin, a source clone and a separate target clone."""
+
+    GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x",
+               "GIT_CONFIG_NOSYSTEM": "1"}
+    # ManagerMixin fakes these; this class needs real git. Bound at import,
+    # before any patch.
+    REAL_RUNNERS = {"run": ha.run, "run_ok": ha.run_ok, "run_out": ha.run_out}
+
+    def setUp(self):
+        super().setUp()
+        for name, fn in self.REAL_RUNNERS.items():
+            p = mock.patch.object(ha, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(ha, "WORKTREES_ROOT",
+                              os.path.join(ha.REPOS_ROOT, ".turma", "worktrees"))
+        p.start()
+        self.addCleanup(p.stop)
+        self.env = {**os.environ, **self.GIT_ENV,
+                    "HOME": os.path.join(self.tmp, "home")}
+        os.makedirs(self.env["HOME"], exist_ok=True)
+        p = mock.patch.dict(os.environ, self.env)
+        p.start()
+        self.addCleanup(p.stop)
+        self.origin = os.path.join(self.tmp, "origin.git")
+        self.git("init", "-q", "--bare", "-b", "main", self.origin)
+        seed = os.path.join(self.tmp, "seed")
+        self.git("clone", "-q", self.origin, seed)
+        self.write(seed, "README", "one\n")
+        self.write(seed, ".gitignore", "build/\n")
+        self.write(seed, "logo.bin", b"\x00\x01binary\xff")
+        self.git("-C", seed, "add", "-A")
+        self.git("-C", seed, "commit", "-qm", "seed")
+        self.git("-C", seed, "push", "-q", "origin", "HEAD:main")
+        # The source host's clone, and the target's — at REPOS_ROOT/Turma.
+        self.src_repo = os.path.join(self.tmp, "srcgit", "Turma")
+        self.git("clone", "-q", self.origin, self.src_repo)
+        self.dst_repo = os.path.join(ha.REPOS_ROOT, "Turma")
+        self.git("clone", "-q", self.origin, self.dst_repo)
+        self.repo = {"name": "Turma", "path": self.dst_repo}
+        p = mock.patch.object(ha, "scan_repos", lambda: [self.repo])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def git(self, *args, cwd=None):
+        out = subprocess.run(["git", *args], cwd=cwd, env=self.env,
+                             capture_output=True, text=True)
+        if out.returncode:
+            raise AssertionError(f"git {args}: {out.stderr}")
+        return out.stdout.strip()
+
+    @staticmethod
+    def write(root, rel, data):
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb" if isinstance(data, bytes) else "w") as f:
+            f.write(data)
+
+    @staticmethod
+    def read(root, rel):
+        with open(os.path.join(root, rel)) as f:
+            return f.read()
+
+    def src_worktree(self, name="wt1"):
+        """A session worktree on the source, on branch `feat`, with one unpushed
+        commit, a tracked edit, a binary edit, a deletion, an untracked file and
+        an ignored one."""
+        wt = os.path.join(self.tmp, "srcgit", ".turma", "worktrees", "Turma", name)
+        self.git("-C", self.src_repo, "worktree", "add", "-q", "-b", "feat", wt,
+                 "origin/main")
+        self.write(wt, "feature.txt", "committed but never pushed\n")
+        self.git("-C", wt, "add", "feature.txt")
+        self.git("-C", wt, "commit", "-qm", "unpushed work")
+        self.write(wt, "README", "one\nedited, not committed\n")
+        self.write(wt, "logo.bin", b"\x00\x02changed\xfe")
+        self.write(wt, "notes/new.md", "untracked file\n")
+        self.write(wt, "build/out.o", "ignored build output\n")
+        self.git("-C", wt, "rm", "-q", ".gitignore")       # a staged deletion
+        self.write(wt, ".gitignore", "build/\n")            # …back as untracked
+        return wt
+
+    def dst_sess(self, sid="newid", name="wt1"):
+        return {"id": sid, "repo": "Turma", "repoPath": self.dst_repo,
+                "worktreePath": os.path.join(ha.WORKTREES_ROOT, "Turma", name)}
+
+    def assert_rebuilt(self, wt, src_wt):
+        self.assertEqual(self.git("-C", wt, "rev-parse", "HEAD"),
+                         self.git("-C", src_wt, "rev-parse", "HEAD"))
+        self.assertEqual(self.read(wt, "feature.txt"), "committed but never pushed\n")
+        self.assertEqual(self.read(wt, "README"), "one\nedited, not committed\n")
+        with open(os.path.join(wt, "logo.bin"), "rb") as f:
+            self.assertEqual(f.read(), b"\x00\x02changed\xfe")
+        self.assertEqual(self.read(wt, "notes/new.md"), "untracked file\n")
+        self.assertFalse(os.path.exists(os.path.join(wt, "build", "out.o")))
+
+    def test_capture_and_restore_round_trip(self):
+        src_wt = self.src_worktree()
+        sm = self.make_manager()
+        files = sm._capture_worktree_state(src_wt)
+        self.assertEqual(set(files), {"state.json", "commits.bundle", "changes.patch"})
+        meta = json.loads(files["state.json"])
+        self.assertEqual(meta["branch"], "feat")
+        sess = self.dst_sess()
+        sm._restore_worktree_state(sess, files)
+        wt = sess["worktreePath"]
+        self.assert_rebuilt(wt, src_wt)
+        self.assertEqual(self.git("-C", wt, "symbolic-ref", "--short", "HEAD"), "feat")
+        # The temporary fetch ref is gone; the commit is held by the branch.
+        self.assertEqual(self.git("-C", self.dst_repo, "for-each-ref",
+                                  "refs/turma/"), "")
+
+    def test_capture_leaves_the_session_index_alone(self):
+        src_wt = self.src_worktree()
+        self.git("-C", src_wt, "add", "notes/new.md")
+        before = self.git("-C", src_wt, "status", "--porcelain")
+        self.make_manager()._capture_worktree_state(src_wt)
+        self.assertEqual(self.git("-C", src_wt, "status", "--porcelain"), before)
+
+    def test_a_pushed_clean_branch_ships_no_bundle_or_patch(self):
+        src_wt = os.path.join(self.tmp, "srcgit", "wt-pushed")
+        self.git("-C", self.src_repo, "worktree", "add", "-q", "-b", "pushed",
+                 src_wt, "origin/main")
+        self.write(src_wt, "f.txt", "x\n")
+        self.git("-C", src_wt, "add", "f.txt")
+        self.git("-C", src_wt, "commit", "-qm", "pushed")
+        self.git("-C", src_wt, "push", "-q", "origin", "pushed")
+        sm = self.make_manager()
+        files = sm._capture_worktree_state(src_wt)
+        self.assertEqual(set(files), {"state.json"})
+        # The target has never fetched `pushed`: it fetches origin once and
+        # lands on the same branch, tracking it.
+        sess = self.dst_sess(name="wtp")
+        sm._restore_worktree_state(sess, files)
+        wt = sess["worktreePath"]
+        self.assertEqual(self.read(wt, "f.txt"), "x\n")
+        self.assertEqual(self.git("-C", wt, "symbolic-ref", "--short", "HEAD"), "pushed")
+        self.assertEqual(self.git("-C", wt, "rev-parse", "--abbrev-ref", "@{u}"),
+                         "origin/pushed")
+
+    def test_a_diverged_branch_on_the_target_lands_detached_and_is_kept(self):
+        src_wt = self.src_worktree()
+        # The target already has its own `feat` with a commit the moved one lacks.
+        self.git("-C", self.dst_repo, "branch", "feat", "origin/main")
+        other = os.path.join(self.tmp, "other")
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", other, "feat")
+        self.write(other, "mine.txt", "target-only\n")
+        self.git("-C", other, "add", "mine.txt")
+        self.git("-C", other, "commit", "-qm", "target-only")
+        mine = self.git("-C", self.dst_repo, "rev-parse", "feat")
+        sm = self.make_manager()
+        sess = self.dst_sess()
+        sm._restore_worktree_state(sess, sm._capture_worktree_state(src_wt))
+        wt = sess["worktreePath"]
+        self.assert_rebuilt(wt, src_wt)
+        self.assertEqual(self.git("-C", wt, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD")
+        self.assertEqual(self.git("-C", self.dst_repo, "rev-parse", "feat"), mine)
+
+    def test_a_behind_branch_on_the_target_is_fast_forwarded(self):
+        src_wt = self.src_worktree()
+        self.git("-C", self.dst_repo, "branch", "feat", "origin/main")
+        sm = self.make_manager()
+        sess = self.dst_sess()
+        sm._restore_worktree_state(sess, sm._capture_worktree_state(src_wt))
+        self.assertEqual(self.git("-C", sess["worktreePath"], "symbolic-ref",
+                                  "--short", "HEAD"), "feat")
+        self.assert_rebuilt(sess["worktreePath"], src_wt)
+
+    def test_a_move_back_replaces_a_clean_older_copy(self):
+        src_wt = self.src_worktree()
+        sess = self.dst_sess()
+        # The copy left behind by an earlier move away: clean, at origin/main.
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "--detach",
+                 sess["worktreePath"], "origin/main")
+        sm = self.make_manager()
+        sm._restore_worktree_state(sess, sm._capture_worktree_state(src_wt))
+        self.assert_rebuilt(sess["worktreePath"], src_wt)
+        self.assertEqual(glob.glob(sess["worktreePath"] + ".pre-migration-*"), [])
+
+    def test_a_move_back_keeps_a_dirty_older_copy_aside(self):
+        src_wt = self.src_worktree()
+        sess = self.dst_sess()
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "--detach",
+                 sess["worktreePath"], "origin/main")
+        self.write(sess["worktreePath"], "local-only.txt", "do not lose me\n")
+        sm = self.make_manager()
+        sm._restore_worktree_state(sess, sm._capture_worktree_state(src_wt))
+        self.assert_rebuilt(sess["worktreePath"], src_wt)
+        [aside] = glob.glob(sess["worktreePath"] + ".pre-migration-*")
+        self.assertEqual(self.read(aside, "local-only.txt"), "do not lose me\n")
+
+    def test_a_patch_that_does_not_apply_refuses_and_leaves_no_worktree(self):
+        src_wt = self.src_worktree()
+        sm = self.make_manager()
+        files = sm._capture_worktree_state(src_wt)
+        files["changes.patch"] = b"diff --git a/nope b/nope\ngarbage\n"
+        sess = self.dst_sess()
+        with self.assertRaisesRegex(RuntimeError, "re-applying"):
+            sm._restore_worktree_state(sess, files)
+        self.assertFalse(os.path.exists(sess["worktreePath"]))
+
+    def test_a_bad_state_refuses(self):
+        sm = self.make_manager()
+        for bad in (b"", b"{}", b'{"head": "main"}', b'{"head": "zz"}', b"\xff"):
+            with self.assertRaisesRegex(RuntimeError, "no valid commit"):
+                sm._restore_worktree_state(self.dst_sess(), {"state.json": bad})
+
+    def test_a_hostile_branch_name_is_not_used(self):
+        src_wt = self.src_worktree()
+        sm = self.make_manager()
+        files = sm._capture_worktree_state(src_wt)
+        meta = json.loads(files["state.json"])
+        meta["branch"] = "--upload-pack=touch /tmp/x"
+        files["state.json"] = json.dumps(meta).encode()
+        sess = self.dst_sess()
+        sm._restore_worktree_state(sess, files)
+        self.assertEqual(self.git("-C", sess["worktreePath"], "rev-parse",
+                                  "--abbrev-ref", "HEAD"), "HEAD")
+
+    def test_unpack_reads_worktree_members_into_memory_only(self):
+        sm = self.make_manager()
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for name, data in ((".worktree/state.json", b"{}"),
+                               (".worktree/evil.sh", b"x"),
+                               ("t1.jsonl", b"{}\n")):
+                ti = tarfile.TarInfo(name)
+                ti.size = len(data)
+                tar.addfile(ti, io.BytesIO(data))
+        dest = os.path.join(self.tmp, "slug")
+        os.makedirs(dest)
+        got = {}
+        sm._unpack_transcript(buf.getvalue(), dest, worktree_out=got)
+        self.assertEqual(got, {"state.json": b"{}"})
+        sm._unpack_transcript(buf.getvalue(), dest)   # no dict: skipped whole
+        self.assertEqual(sorted(os.listdir(dest)), ["t1.jsonl"])
+
+    def test_export_then_import_moves_the_work(self):
+        src_wt = self.src_worktree()
+        tid = "transW"
+        dst_wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wt1")
+        # The source's transcript sits at the source cwd's slug.
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(src_wt))
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, tid + ".jsonl"), "w") as f:
+            f.write(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+        src = self.make_manager()
+        src.registry = [{"id": "s1", "worktreePath": src_wt, "status": "running",
+                         "repo": "Turma", "claudeSessionId": tid}]
+        sent = {}
+        src._migration_upload = lambda mid, blob: sent.update(blob=blob) or True
+        src.export_session("s1", "mig1")
+        self.assertIn("blob", sent)
+        dst = self.make_manager()
+        dst._launch_tmux = mock.Mock()
+        dst._launch_ttyd = mock.Mock()
+        dst._migration_download = lambda mid: sent["blob"]
+        dst.import_session({"type": "importSession", "cmdId": "c1",
+                            "migrationId": "mig1", "transcriptId": tid,
+                            "cwd": dst_wt, "repo": "Turma"})
+        self.assertEqual(len(dst.registry), 1, dst.registry)
+        self.assertEqual(dst.registry[0]["status"], "running")
+        self.assert_rebuilt(dst_wt, src_wt)
+        self.assertEqual(self.git("-C", dst_wt, "symbolic-ref", "--short", "HEAD"),
+                         "feat")
+        # The source's tree is untouched — it stays resumable there.
+        self.assertEqual(self.read(src_wt, "README"), "one\nedited, not committed\n")
+
+    def test_export_refuses_when_the_worktree_cannot_be_captured(self):
+        wt = os.path.join(self.tmp, "not-a-repo")
+        os.makedirs(wt)
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, "tX.jsonl"), "w") as f:
+            f.write("{}\n")
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "worktreePath": wt, "status": "running",
+                        "repo": "Turma", "claudeSessionId": "tX"}]
+        called = []
+        sm._migration_upload = lambda *a: called.append(a)
+        sm.export_session("s1", "mig1")
+        self.assertEqual(called, [])
+        self.assertIn("capturing the worktree", sm.spawn_failures[-1]["error"])
 
 
 class TestMigrateSession(ManagerMixin, unittest.TestCase):

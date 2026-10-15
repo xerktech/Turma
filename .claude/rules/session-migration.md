@@ -21,8 +21,23 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
 
 ## Migrating a session to another agent (XERK-101)
 
-- **Moves a running session to another agent in the SAME org.** The conversation moves; committed
-  work rides git; uncommitted work stays on the source (KILLED, so resumable).
+- **Moves a running session to another agent in the SAME org — conversation AND worktree.** The
+  source stays on disk (KILLED, so resumable) as the fallback.
+- **The worktree's git state rides the bundle under `.worktree/`** (`_capture_worktree_state`):
+  `state.json` {head, branch}, `commits.bundle` (HEAD `--not --remotes`, only when ahead), and
+  `changes.patch` (a binary diff vs HEAD built in a THROWAWAY `GIT_INDEX_FILE`, so untracked files
+  ride, ignored ones don't, and the session's real index is untouched). Never droppable: a capture
+  failure or an over-`MIGRATION_BLOB_MAX` bundle REFUSES the move, never ships it without the work.
+  - The target (`_restore_worktree_state`) fetches the bundle into a temp ref (one bounded origin
+    fetch for missing prerequisites/pushed heads), adds the worktree on the same branch only when
+    that rewrites nothing here (absent → create, behind → fast-forward), else DETACHED at the
+    commit, then `git apply`s the patch. A failed apply removes the worktree and refuses.
+  - A move BACK finds the old copy at the same path: clean + an ancestor of the moved HEAD is
+    removed; anything else is `git worktree move`d to `<cwd>.pre-migration-<ts>`, never deleted.
+  - `_unpack_transcript` reads only the three known names into memory, never onto disk. A bundle
+    without `.worktree/` (older source, hub restore-pack) keeps the old fork-from-default path.
+  - Restore runs inside `import_session` ON THE BEAT: local git plus at most one
+    `FETCH_TIMEOUT_SEC` fetch — keep it that way (XERK-395). Tests: `TestMigrateWorktreeState`.
 - The hub can't touch a worktree and agents are outbound-only, so a migration is composed hub-side
   from agent commands + a hub-brokered relay of the **RAW transcript bytes** (what `claude --resume`
   needs and the archive lacks): `exportSession` packs the transcript (+ `subagents/`, truncated to its

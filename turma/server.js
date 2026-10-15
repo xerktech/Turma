@@ -4165,11 +4165,13 @@ function fleetRepoNames() {
 // from agent commands + a hub-brokered relay of the one thing `claude --resume`
 // needs and the archive doesn't keep — the RAW transcript bytes:
 //   1. exportSession -> source host packs its transcript and POSTs it here;
+//      The bundle also carries the worktree's git state (unpushed commits +
+//      uncommitted/untracked changes) under `.worktree/`; the hub never opens it.
 //   2. the blob lands -> importSession queued on the target, which pulls it,
-//      unpacks it, recreates the worktree off the repo's default branch, and
-//      resumes the same conversation there;
+//      unpacks it, rebuilds the worktree from that state (or, from an older
+//      source, forks one off the default branch), and resumes the conversation;
 //   3. target session comes up -> the source session is KILLED (kept, so its
-//      worktree/uncommitted work stays resumable on the origin as a fallback).
+//      worktree stays resumable on the origin as a fallback).
 // State is in-memory and short-lived; a hub restart mid-migration aborts it,
 // leaving the source session intact.
 const migrations = new Map(); // migrationId -> record (see startMigration)
