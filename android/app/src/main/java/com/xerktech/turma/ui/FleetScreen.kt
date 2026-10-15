@@ -254,7 +254,9 @@ private val CLAUDE_VERSION_RE = com.xerktech.turma.core.JS_WS.let { ws ->
 /** The coding agent a host runs, for its header — mirrors index.html codingAgent(). */
 fun codingAgentLabel(a: AgentInfo): String {
     val c = a.codingAgent
-    if (c != null && c.version.isNotBlank()) return "${c.name.ifBlank { "Claude Code" }} ${c.version}"
+    // JS truthiness (index.html `c && c.version`, `c.name || "Claude Code"`): only an EMPTY
+    // string is falsy, so a whitespace-only version or name is used as it is.
+    if (c != null && c.version.isNotEmpty()) return "${c.name.ifEmpty { "Claude Code" }} ${c.version}"
     val raw = com.xerktech.turma.core.jsTrim(a.claudeVersion)
     if (raw.isEmpty()) return "–"
     val m = CLAUDE_VERSION_RE.matchEntire(raw)

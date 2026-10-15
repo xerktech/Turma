@@ -156,6 +156,27 @@ Mirrors the glasses pure-core/adapter-shell split:
 - Colour call sites are pinned in pixels/text-layout, light theme (`ColourCallSiteTest`); the
   chat's sheet cap and header/footer fit on the real `ChatScreen` in a short `requiredHeight` box
   (`WaitingSheetBoundsTest`, `ChatHeaderFooterFitTest`) — a short box, so the MEASURED bars bind.
+- Chat window/inset behaviour is tested by DISPATCHING real insets (status, navigation, ime with
+  `setVisible`) to the content view (`ChatWindowFitTest.insets`); Robolectric gives none otherwise.
+  - Measure text widths only under `@GraphicsMode(NATIVE)`: legacy mode's `TextMeasurer` returns
+    ~1px per character, so width-driven layout (the meta row) reads wrong.
+- Org-tint call sites (`TurmaColors.series()`, never `ChartSeries*` outside `ui/theme`) are pinned
+  at the source by `SeriesCallSiteTest`: no render test reaches every screen's tint.
+
+## Chat header and footer fit (rollup XERK-1701)
+
+- "Short window" (`chatHeaderFit`) reads the chat's height WITHOUT the keyboard (a
+  `BoxWithConstraints` outside `imePadding`): measured inside, a tablet's keyboard read as a phone.
+- Typing in a short window (`compact`): the meta line folds, the footer pads less, and the top bar
+  steps aside (status strip only) when bar + compose box can't both fit (`chatBarFits`) — the box
+  being typed into always stays whole — and while a sheet is pending. It returns with no keyboard.
+- While typing in a short window a question / permission sheet may take the footer's whole height
+  (the footer scrolls to it) and the chip row yields to it — its foot shows above the box, never a
+  0-height sheet (the old cap alone gave 0 there, and 3dp with a taller keyboard).
+- The bar's height comes from MEASURED line heights (`TextMeasurer`), not the style's `lineHeight`,
+  which undershoots the drawn line at a non-linear font scale.
+- The tunnel marker never shares a line it can't fit beside a half-width host · repo
+  (`chatMetaOneLine`); on its own line it wraps at a word (2 lines max) and the bar grows to hold it.
 - **Assert a model-switch memo on the STORE (`container.modelSwitches`), never `ChatUiState`** — the
   state copy is a VM-rebuilt mirror; asserting it passes on a change that dropped the real thing.
 - **The in-app updater is silenced in tests (XERK-281)** — Robolectric rebuilds the Application per

@@ -57,7 +57,8 @@ val ChartSeriesLight = listOf(
     Color(0xFFEB6834), // s8 orange
 )
 
-// Dark: the web's `prefers-color-scheme: dark` slots.
+// Dark: the web's `prefers-color-scheme: dark` slots, except s4, which is deliberately
+// lighter than the web's #008300 (operator call; recorded in android/PARITY.md).
 val ChartSeries = listOf(
     Color(0xFF3987E5), // s1 blue
     Color(0xFF199E70), // s2 green

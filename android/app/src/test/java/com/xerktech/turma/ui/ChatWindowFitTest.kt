@@ -1,0 +1,232 @@
+package com.xerktech.turma.ui
+
+import android.view.ViewGroup
+import androidx.activity.ComponentActivity
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.requiredSize
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsNode
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.getBoundsInRoot
+import androidx.compose.ui.test.hasSetTextAction
+import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.DpRect
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.height
+import androidx.compose.ui.unit.width
+import androidx.core.graphics.Insets
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import com.xerktech.turma.harness.HubHarness
+import com.xerktech.turma.harness.MainDispatcherRule
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
+
+/**
+ * The chat's header and footer against the WINDOW and its insets (rollup XERK-1701), on
+ * the real [ChatScreen] with real system-bar / keyboard insets dispatched to the view:
+ *  - the short-window decision reads the window, not the room the keyboard leaves (a
+ *    tablet with its keyboard up keeps the large title and the host · repo line);
+ *  - a short window takes the smaller title, and its meta line folds while typing;
+ *  - the footer stays above the navigation bar;
+ *  - a landscape phone at font 2.0 with the keyboard up keeps the whole compose box
+ *    below the bar, and a pending question stays reachable in the footer;
+ *  - the tunnel-offline marker is never cut, and host · repo never vanishes beside it.
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35])
+@GraphicsMode(GraphicsMode.Mode.NATIVE)   // real text measurement: the meta row is laid out by width
+class ChatWindowFitTest {
+
+    @get:Rule(order = 0)
+    val main = MainDispatcherRule()
+
+    @get:Rule(order = 1)
+    val hub = HubHarness()
+
+    @get:Rule(order = 2)
+    val compose = createAndroidComposeRule<ComponentActivity>()
+
+    private val host = "nas01"
+    private val session = "s1"
+    private val root = "root"
+    private val options = (1..6).joinToString(",") { "\"Option number $it\"" }
+
+    private fun open(
+        widthDp: Int, heightDp: Int, fontScale: Float = 1f,
+        sessionBlock: String = "{}", tunnelOnline: Boolean = true,
+    ) {
+        hub.json("/api/agents/$host/sessions/$session/history", """{"entries":[],"truncated":false,"pending":false}""")
+        hub.json("/api/ws-token", """{"token":"t"}""")
+        val fleet = HubHarness.fleetJson(
+            host = host,
+            sessions = """{ "id": "$session", "repo": "Turma", "status": "running", "worktree": "wt",
+                            "model": "opus", "permissionMode": "auto", "session": $sessionBlock }""",
+        )
+        hub.seedFleet(if (tunnelOnline) fleet else fleet.replace("\"terminalOnline\": true", "\"terminalOnline\": false"))
+        compose.setContent {
+            val d = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(d.density, fontScale)) {
+                Box(Modifier.requiredSize(widthDp.dp, heightDp.dp).testTag(root)) {
+                    ChatScreen(host = host, sessionId = session, onBack = {}, onTerminal = {})
+                }
+            }
+        }
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText("Message…", substring = true).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.waitForIdle()
+    }
+
+    /** Dispatch system-bar / keyboard insets (dp) to the composition, as the OS would. */
+    private fun insets(statusDp: Int = 0, navDp: Int = 0, imeDp: Int = 0) {
+        compose.runOnUiThread {
+            val px = { dp: Int -> (dp * compose.activity.resources.displayMetrics.density).toInt() }
+            val insets = WindowInsetsCompat.Builder()
+                .setInsets(WindowInsetsCompat.Type.statusBars(), Insets.of(0, px(statusDp), 0, 0))
+                .setInsets(WindowInsetsCompat.Type.navigationBars(), Insets.of(0, 0, 0, px(navDp)))
+                .setInsets(WindowInsetsCompat.Type.ime(), Insets.of(0, 0, 0, px(imeDp)))
+                .setVisible(WindowInsetsCompat.Type.ime(), imeDp > 0)
+                .build()
+            val content = compose.activity.findViewById<ViewGroup>(android.R.id.content)
+            ViewCompat.dispatchApplyWindowInsets(content.getChildAt(0), insets)
+        }
+        compose.waitForIdle()
+    }
+
+    private fun shown(tag: String) =
+        compose.onAllNodesWithTag(tag, useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
+
+    /** A node's extent in root dp from its position and MEASURED size — never clipped. */
+    private fun unclipped(n: SemanticsNode): DpRect = with(compose.density) {
+        val top = n.positionInRoot.y.toDp()
+        val left = n.positionInRoot.x.toDp()
+        DpRect(left, top, left + n.size.width.toDp(), top + n.size.height.toDp())
+    }
+
+    private fun titleHeight(): Dp =
+        unclipped(compose.onNodeWithTag(CHAT_TITLE_TAG, useUnmergedTree = true).fetchSemanticsNode()).height
+
+    private fun layout(tag: String): TextLayoutResult {
+        val out = mutableListOf<TextLayoutResult>()
+        val node = compose.onNodeWithTag(tag, useUnmergedTree = true).fetchSemanticsNode()
+        node.config[SemanticsActions.GetTextLayoutResult].action!!.invoke(out)
+        return out.single()
+    }
+
+    @Test fun `a tablet with its keyboard up keeps the large title and the meta line`() {
+        // 1280x800dp landscape; a keyboard leaving 400dp above it is still a tall WINDOW.
+        open(widthDp = 1280, heightDp = 800)
+        val before = titleHeight()
+        insets(imeDp = 400)
+        assertTrue("host · repo line hidden with the keyboard up on a tablet", shown(CHAT_META_TAG))
+        assertEquals("the title shrank with the keyboard up on a tablet", before, titleHeight())
+    }
+
+    @Test fun `a landscape phone takes the small title and folds the meta line while typing`() {
+        open(widthDp = 914, heightDp = 411)
+        // titleMedium's 24sp line, not titleLarge's 28sp.
+        assertEquals(24.dp, titleHeight())
+        assertTrue("meta line shown with no keyboard", shown(CHAT_META_TAG))
+        insets(imeDp = 250)
+        assertFalse("meta line still shown with the keyboard up in a short window", shown(CHAT_META_TAG))
+        assertEquals(24.dp, titleHeight())
+    }
+
+    @Test fun `the footer stays above the navigation bar`() {
+        open(widthDp = 411, heightDp = 800)
+        insets(navDp = 48)
+        val rootB = compose.onNodeWithTag(root).getBoundsInRoot()
+        val footer = compose.onNodeWithTag(CHAT_FOOTER_TAG).getBoundsInRoot()
+        assertTrue("footer bottom ${footer.bottom} under the navigation bar (from ${rootB.bottom - 48.dp})",
+            footer.bottom <= rootB.bottom - 48.dp + 1.dp)
+    }
+
+    /** Landscape phone, keyboard up: 411dp tall, keyboard 262dp (font 2.0 default). The 24dp status
+     *  inset feeds the bar-fit check; Robolectric does not pad the bar by it, so bounds omit it. */
+    private fun landscapeTyping(sessionBlock: String = "{}", fontScale: Float = 2f, imeDp: Int = 262) {
+        open(widthDp = 914, heightDp = 411, fontScale = fontScale, sessionBlock = sessionBlock)
+        insets(statusDp = 24, imeDp = imeDp)
+    }
+
+    @Test fun `a landscape phone at font 2 with the keyboard up shows the whole compose box`() {
+        landscapeTyping()
+        val rootB = compose.onNodeWithTag(root).getBoundsInRoot()
+        val bar = compose.onNodeWithTag(CHAT_TOP_BAR_TAG).getBoundsInRoot()
+        val box = unclipped(compose.onNode(hasSetTextAction()).fetchSemanticsNode())
+        val keyboardTop = rootB.bottom - 262.dp
+        assertTrue("compose box top ${box.top} hidden under the top bar (bottom ${bar.bottom})", box.top >= bar.bottom - 0.5.dp)
+        assertTrue("compose box bottom ${box.bottom} under the keyboard ($keyboardTop)", box.bottom <= keyboardTop + 0.5.dp)
+    }
+
+    @Test fun `a landscape phone at font 2 with the keyboard up keeps a question reachable`() =
+        questionReachable(2f)
+
+    // At font 1.0 the bar and the compose box both fit, so the bar stepping aside is the
+    // sheet's doing; and the cap alone leaves the sheet nothing: the typing floor holds it.
+    @Test fun `a landscape phone at font 1 with the keyboard up keeps a question reachable`() =
+        questionReachable(1f)
+
+    // A taller keyboard leaves the cap next to nothing even with the bar aside (91dp of room):
+    // the typing floor is what keeps the sheet there at all.
+    @Test fun `a taller keyboard still leaves a question reachable`() =
+        questionReachable(1f, imeDp = 320)
+
+    private fun questionReachable(fontScale: Float, imeDp: Int = 262) {
+        landscapeTyping("""{ "question": "Which one?", "questionOptions": [ $options ] }""", fontScale, imeDp)
+        val bar = compose.onNodeWithTag(CHAT_TOP_BAR_TAG).getBoundsInRoot()
+        // The bar stepped aside, the chips yielded: the sheet's foot shows above the box...
+        val sheet = compose.onNodeWithTag(WAITING_SHEET_TAG).getBoundsInRoot()
+        assertTrue("sheet visible height ${sheet.height}", sheet.height >= 16.dp)
+        assertTrue("sheet top ${sheet.top} over the top bar (${bar.bottom})", sheet.top >= bar.bottom - 0.5.dp)
+        // ...and scrolling brings its first option into view.
+        compose.onNodeWithText("Option number 1").performScrollTo().assertIsDisplayed()
+        val opt = compose.onNodeWithText("Option number 1").getBoundsInRoot()
+        assertTrue("option ${opt.top} under the top bar (${bar.bottom})", opt.top >= bar.bottom - 0.5.dp)
+    }
+
+    @Test fun `the tunnel-offline marker stays whole and host-repo stays readable at font 2`() {
+        open(widthDp = 411, heightDp = 800, fontScale = 2f, tunnelOnline = false)
+        val bar = compose.onNodeWithTag(CHAT_TOP_BAR_TAG).getBoundsInRoot()
+        val mark = layout(CHAT_MARKER_TAG)
+        assertTrue("marker cut: \"${mark.layoutInput.text}\" lines=${mark.lineCount} ow=${mark.didOverflowWidth} oh=${mark.didOverflowHeight} size=${mark.size} c=${mark.layoutInput.constraints} bar=${bar} title=${titleHeight()}", !mark.hasVisualOverflow && !mark.isLineEllipsized(mark.lineCount - 1))
+        assertTrue("marker text", mark.layoutInput.text.text.contains("⚠ tunnel offline"))
+        val meta = unclipped(compose.onNodeWithTag(CHAT_META_TAG, useUnmergedTree = true).fetchSemanticsNode())
+        val markB = unclipped(compose.onNodeWithTag(CHAT_MARKER_TAG, useUnmergedTree = true).fetchSemanticsNode())
+        assertTrue("host · repo squeezed to ${meta.width}", meta.width >= 48.dp)
+        assertTrue("host · repo height ${meta.height}", meta.height >= 31.dp)
+        assertTrue("marker bottom ${markB.bottom} spills past the bar (${bar.bottom})", markB.bottom <= bar.bottom + 1.dp)
+        // host · repo either fits or ends in an ellipsis — never cut mid-word.
+        val m = layout(CHAT_META_TAG)
+        assertFalse("host · repo clipped without an ellipsis", m.hasVisualOverflow && !m.isLineEllipsized(0))
+    }
+
+    @Test fun `the marker shares the line when it fits`() {
+        open(widthDp = 914, heightDp = 800, tunnelOnline = false)
+        val meta = unclipped(compose.onNodeWithTag(CHAT_META_TAG, useUnmergedTree = true).fetchSemanticsNode())
+        val markB = unclipped(compose.onNodeWithTag(CHAT_MARKER_TAG, useUnmergedTree = true).fetchSemanticsNode())
+        assertEquals("one line", meta.top.value, markB.top.value, 1.5f)
+        assertTrue(chatMetaOneLine(metaWidth = 300, markWidth = 50, available = 200))
+        assertFalse(chatMetaOneLine(metaWidth = 300, markWidth = 120, available = 200))
+        assertTrue(chatMetaOneLine(metaWidth = 80, markWidth = 120, available = 200))
+    }
+}

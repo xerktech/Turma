@@ -23,4 +23,18 @@ class CodingAgentLabelTest {
         // U+001C is not JS whitespace: not trimmed, so the version is not "(...)"-final.
         assertEquals("Claude Code 2.1 (x)\u001C", label("2.1 (x)\u001C"))
     }
+
+    private fun structured(name: String, version: String) = codingAgentLabel(
+        AgentInfo(key = "h", claudeVersion = "9.9 (Fallback)", codingAgent = com.xerktech.turma.model.CodingAgent(name, version))
+    )
+
+    /** index.html: `c && c.version` and `c.name || "Claude Code"` — JS truthiness, where only
+     *  "" is falsy, so a whitespace-only field is used as given, never treated as absent. */
+    @Test fun `the structured fields follow JS truthiness`() {
+        assertEquals("Codex 1.2", structured("Codex", "1.2"))
+        assertEquals("Claude Code 1.2", structured("", "1.2"))
+        assertEquals("Fallback 9.9", structured("Codex", ""))
+        assertEquals("Claude Code  ", structured("", " "))
+        assertEquals("  1.2", structured(" ", "1.2"))
+    }
 }
