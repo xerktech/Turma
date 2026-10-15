@@ -800,8 +800,12 @@ private fun PanePromptSheet(
             Modifier.heightIn(max = maxHeight).verticalScroll(rememberScrollState()).padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Pill("waiting", color = MaterialTheme.colorScheme.primary)
-            Text(prompt.prompt, fontWeight = FontWeight.Medium)
+            // The pill shares the prompt's line: stacked, it alone filled a short window's
+            // sheet and pushed the prompt itself out of view (rollup XERK-1701).
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Pill("waiting", color = MaterialTheme.colorScheme.primary)
+                Text(prompt.prompt, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+            }
             if (prompt.detail.isNotBlank()) {
                 Text(
                     prompt.detail,

@@ -304,6 +304,9 @@ class ChatWindowFitTest {
         val t = unclipped(compose.onNodeWithText(text, useUnmergedTree = true).fetchSemanticsNode())
         assertTrue("\"$text\" top ${t.top} hidden under the bar (bottom ${bar.bottom})", t.top >= bar.bottom - 0.5.dp)
         assertTrue("\"$text\" bottom ${t.bottom} under the compose box (top ${box.top})", t.bottom <= box.top + 0.5.dp)
+        // ...and not cut by its own sheet's viewport: the clipped bounds are the whole text.
+        val seen = compose.onNodeWithText(text, useUnmergedTree = true).getBoundsInRoot()
+        assertEquals("\"$text\" cut by its sheet ($seen vs $t)", t.height.value, seen.height.value, 0.5f)
     }
 
     /**
@@ -319,7 +322,7 @@ class ChatWindowFitTest {
                 tunnelOnline = false, statusConsumed = true)
         } else {
             open(widthDp = 686, heightDp = 308, fontScale = fontScale, sessionBlock = block, tunnelOnline = false)
-            insets(statusDp = 24, navDp = 0)
+            insets(statusDp = 24, navDp = 24)
         }
         assertOpenAndWhole(if (permissionPrompt) "Do you want to proceed?" else "Which one?")
     }
