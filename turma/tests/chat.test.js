@@ -2170,6 +2170,20 @@ test("renderProse: an unterminated <svg> (mid-stream) stays escaped text, not an
   assert.match(html, /&lt;svg/); // shown as escaped text until its </svg> lands
 });
 
+test("renderProse: a run of unclosed <svg> openers renders in linear time (XERK-1932)", () => {
+  // Each opener past the last closer retried its lazy body to the end of the text:
+  // ~0.7 s at 140k chars, inside the wire's own block cap.
+  const t = process.cpuUsage();
+  renderProse("\n<svg a".repeat(40000));
+  renderProse("<svg></svg>" + "\n<svg a".repeat(40000));
+  const used = process.cpuUsage(t);
+  assert.ok((used.user + used.system) / 1000 < 1500, "took too long");
+  // Matches before the last closer are unchanged; openers after it stay text.
+  const html = renderProse("<svg><rect/></svg>\nmid\n<svg><circle/></svg>\n<svg a");
+  assert.equal((html.match(/md-svg/g) || []).length, 2);
+  assert.match(html, /&lt;svg a/);
+});
+
 // ---- renderInline (inline `code` spans in prose) -------------------------
 test("renderInline: a backtick span becomes a <code> chip", () => {
   assert.equal(renderInline("run `npm ci` first"),

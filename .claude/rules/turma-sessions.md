@@ -157,7 +157,8 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
   - **Images/SVGs render inline (XERK-221)**: `![alt](url)` → `<img>`; a raw `<svg>`/all-SVG fence →
     a sandboxed `data:image/svg+xml` `<img>` — **never DOM-injected**, so an embedded `<script>` can't
     run. SendUserFile deliveries render the same way (images inline, HTML in a sandboxed iframe).
-    Android deferred (`android/PARITY.md`). Tests: `linkify`/`renderProse` in `chat.test.js`.
+    Android mirrors it (`Span.Image`/`ProseBlock.Svg`, XERK-1932). Tests: `linkify`/`renderProse` in
+    `chat.test.js`, the image/svg cases in `ProseTest.kt`.
 - A per-session **verbosity control** (Concise/Normal/Verbose + per-type toggles, `localStorage`)
   filters which `blocks[]` show client-side.
 - Typed prompts → `POST .../input`; pending `AskUserQuestion`s answer via option chips/custom text →

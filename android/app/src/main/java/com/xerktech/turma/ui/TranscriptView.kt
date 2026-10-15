@@ -12,8 +12,10 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -41,6 +43,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.isSpecified
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -57,14 +60,17 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xerktech.turma.core.CellAlign
 import com.xerktech.turma.core.ChatItem
+import com.xerktech.turma.core.InlinePiece
 import com.xerktech.turma.core.ProseBlock
 import com.xerktech.turma.core.Span
 import com.xerktech.turma.core.parseProse
+import com.xerktech.turma.core.splitImages
 import com.xerktech.turma.model.SendFile
 import android.graphics.Color as AndroidColor
 import android.util.Base64
@@ -282,8 +288,8 @@ private fun ProseBlocks(
 ) {
     Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
         for (block in blocks) when (block) {
-            is ProseBlock.Paragraph -> Text(
-                spansToAnnotated(block.spans, codeBg = color.copy(alpha = 0.10f), linkColor = MaterialTheme.colorScheme.primary, codeSize = fontSize * 0.88f),
+            is ProseBlock.Paragraph -> ProseInline(
+                block.spans,
                 fontSize = fontSize,
                 lineHeight = lineHeight,
                 color = color,
@@ -294,8 +300,8 @@ private fun ProseBlocks(
             // ATX heading. Scaled off the bubble's own size (a fixed sp would be
             // enormous in a thinking trace and tiny in a plan card) and kept
             // tight, like the web's ~8px/3px margins.
-            is ProseBlock.Heading -> Text(
-                spansToAnnotated(block.spans, codeBg = color.copy(alpha = 0.10f), linkColor = MaterialTheme.colorScheme.primary, codeSize = fontSize * 0.88f),
+            is ProseBlock.Heading -> ProseInline(
+                block.spans,
                 modifier = Modifier.padding(top = 4.dp),
                 fontSize = fontSize * headingScale(block.level),
                 lineHeight = lineHeight * headingScale(block.level),
@@ -305,6 +311,7 @@ private fun ProseBlocks(
                 fontStyle = if (italic) FontStyle.Italic else FontStyle.Normal,
                 fontWeight = FontWeight.SemiBold,
             )
+            is ProseBlock.Svg -> ProseImage(remember(block.source) { ByteBuffer.wrap(block.source.toByteArray()) }, "", svg = true)
             is ProseBlock.Rule -> Box(
                 Modifier.fillMaxWidth().padding(vertical = 3.dp).height(1.dp).background(color.copy(alpha = 0.25f))
             )
@@ -336,8 +343,8 @@ private fun ProseBlocks(
                             lineHeight = lineHeight,
                             color = color.copy(alpha = 0.72f),
                         )
-                        Text(
-                            spansToAnnotated(row.spans, codeBg = color.copy(alpha = 0.10f), linkColor = MaterialTheme.colorScheme.primary, codeSize = fontSize * 0.88f),
+                        ProseInline(
+                            row.spans,
                             fontSize = fontSize,
                             lineHeight = lineHeight,
                             color = color,
@@ -348,6 +355,121 @@ private fun ProseBlocks(
             }
         }
     }
+}
+
+/**
+ * A run of inline spans: one Text, or — when it holds a markdown image — a column
+ * of Text runs and images, split where each image sits (the web's <img> is
+ * `display: block`, so it breaks the line). Used by every surface that renders
+ * spans (paragraph, heading, list row, table cell), so an image works in each.
+ */
+@Composable
+private fun ProseInline(
+    spans: List<Span>,
+    modifier: Modifier = Modifier,
+    fontSize: TextUnit,
+    lineHeight: TextUnit,
+    color: Color,
+    codeSize: TextUnit = fontSize * 0.88f,
+    fontStyle: FontStyle = FontStyle.Normal,
+    fontWeight: FontWeight? = null,
+    textAlign: TextAlign? = null,
+) {
+    val pieces = remember(spans) { splitImages(spans) }
+    val codeBg = color.copy(alpha = 0.10f)
+    val linkColor = MaterialTheme.colorScheme.primary
+    @Composable
+    fun run(sp: List<Span>, mod: Modifier) = Text(
+        spansToAnnotated(sp, codeBg = codeBg, linkColor = linkColor, codeSize = codeSize),
+        mod,
+        fontSize = fontSize,
+        lineHeight = lineHeight,
+        color = color,
+        fontStyle = fontStyle,
+        fontWeight = fontWeight,
+        textAlign = textAlign,
+    )
+    val only = pieces.singleOrNull()
+    if (only is InlinePiece.Text) { run(only.spans, modifier); return }
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        for (p in pieces) when (p) {
+            is InlinePiece.Text -> run(p.spans, if (textAlign != null) Modifier.fillMaxWidth() else Modifier)
+            is InlinePiece.Image -> {
+                val model = remember(p.image.url) { imageModel(p.image.url) }
+                if (model == null) run(listOf(Span.Text(p.image.alt)), Modifier)
+                else ProseImage(model, p.image.alt, svg = p.image.url.startsWith("data:image/svg", ignoreCase = true))
+            }
+        }
+    }
+}
+
+/**
+ * An image in agent prose — a markdown `![alt](url)` or a raw/fenced SVG (web parity:
+ * chat.js imgTag/svgToImg + sessions.html's `.md-img`/`.md-svg`). Sized off the
+ * decoded image's own aspect ratio, capped at its natural width (image px read as
+ * dp, as CSS reads them as px) and a max height; an SVG sits on the same white
+ * backdrop the web gives it, so a dark-stroked drawing reads on either theme. A tap
+ * opens the same full-screen [ImageLightbox] as a SendUserFile preview; a source
+ * that fails to load degrades to its alt text.
+ */
+@Composable
+private fun ProseImage(model: Any, alt: String, svg: Boolean) {
+    // Until the image decodes its size is unknown, so it takes a placeholder box:
+    // AsyncImage under a max-only constraint measures 0 and never appears (see
+    // SendFileView). The ratio and natural width replace it on success.
+    var ratio by remember(model) { mutableStateOf<Float?>(null) }
+    var natural by remember(model) { mutableStateOf(0.dp) }
+    var failed by remember(model) { mutableStateOf(false) }
+    var showFull by remember(model) { mutableStateOf(false) }
+    if (failed) {
+        Text(
+            "🖼 " + alt.ifBlank { "image" },
+            fontSize = scaledSp(12f),
+            fontStyle = FontStyle.Italic,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        return
+    }
+    val shape = RoundedCornerShape(6.dp)
+    val r = ratio
+    val size = if (r == null) Modifier.fillMaxWidth().height(120.dp)
+        else Modifier.widthIn(max = natural).heightIn(max = PROSE_IMAGE_MAX_HEIGHT).aspectRatio(r)
+    AsyncImage(
+        model = model,
+        contentDescription = alt.ifBlank { "image" },
+        contentScale = ContentScale.Fit,
+        onSuccess = { st ->
+            val sz = st.painter.intrinsicSize
+            if (sz.isSpecified && sz.width > 0f && sz.height > 0f) {
+                ratio = sz.width / sz.height
+                // Only ever widened: a re-decode at the new, smaller box must not
+                // shrink the cap it was sized from.
+                if (sz.width.dp > natural) natural = sz.width.dp
+            }
+        },
+        onError = { failed = true },
+        modifier = Modifier.padding(vertical = 2.dp).then(size)
+            .clip(shape)
+            .then(if (svg) Modifier.background(Color.White) else Modifier)
+            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f), shape)
+            .clickable { showFull = true }
+            .then(if (svg) Modifier.padding(6.dp) else Modifier),
+    )
+    if (showFull) ImageLightbox(model, alt) { showFull = false }
+}
+
+/** sessions.html caps `.md-img` at 420px; scaled to a phone's shorter screen. */
+private val PROSE_IMAGE_MAX_HEIGHT: Dp = 320.dp
+
+/**
+ * An image src → a Coil model. Coil 2.x doesn't load data: URIs itself, so they
+ * are decoded to bytes (a ByteBuffer the SVG/bitmap decoders both accept); a remote
+ * http(s) URL passes straight through. Anything else, or a bad data: URI, is null.
+ */
+private fun imageModel(src: String): Any? = when {
+    src.startsWith("data:", ignoreCase = true) -> dataUriToBytes(src)?.let { ByteBuffer.wrap(it) }
+    src.startsWith("http", ignoreCase = true) -> src
+    else -> null
 }
 
 /** Heading level → a multiplier on the surrounding text size (web: 1.22em … 1em). */
@@ -373,6 +495,9 @@ private fun spansToAnnotated(spans: List<Span>, codeBg: Color, linkColor: Color,
             is Span.Link -> withLink(
                 LinkAnnotation.Url(span.url, TextLinkStyles(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline)))
             ) { append(span.label) }
+            // Never reached from a renderer — ProseInline splits images out first —
+            // but an exhaustive `when` needs an answer, and the alt is the honest one.
+            is Span.Image -> append(span.alt)
             is Span.Styled -> withStyle(
                 SpanStyle(
                     fontWeight = if (span.bold) FontWeight.SemiBold else null,
@@ -489,9 +614,10 @@ private fun ProseTableRow(
                     .padding(horizontal = 6.dp, vertical = 4.dp),
             ) {
                 val align = aligns.getOrElse(i) { CellAlign.NONE }
-                Text(
-                    spansToAnnotated(cells.getOrElse(i) { emptyList() }, codeBg = color.copy(alpha = 0.10f), linkColor = MaterialTheme.colorScheme.primary, codeSize = fontSize * 0.82f),
+                ProseInline(
+                    cells.getOrElse(i) { emptyList() },
                     Modifier.fillMaxWidth(),
+                    codeSize = fontSize * 0.82f,
                     fontSize = fontSize * 0.9f,
                     lineHeight = fontSize * 1.2f,
                     color = color,
@@ -550,16 +676,8 @@ private fun TranscriptTool(t: ChatItem.Tool) {
 private fun SendFileView(f: SendFile) {
     when (f.kind) {
         "image" -> {
-            // Coil 2.x doesn't load data: URIs itself, so decode them to bytes (a
-            // ByteBuffer the SVG/bitmap decoders both accept); pass remote URLs
-            // straight through. A bad/empty src degrades to a chip.
-            val model = remember(f.src) {
-                when {
-                    f.src.startsWith("data:", ignoreCase = true) -> dataUriToBytes(f.src)?.let { ByteBuffer.wrap(it) }
-                    f.src.startsWith("http", ignoreCase = true) -> f.src
-                    else -> null
-                }
-            }
+            // A bad/empty src degrades to a chip.
+            val model = remember(f.src) { imageModel(f.src) }
             if (model == null) { FileChip(f.name, f.shed); return }
             // Tapping the thumbnail opens a full-screen viewer (web parity: the
             // click-to-zoom lightbox in sessions.html); back / the ✕ closes it.

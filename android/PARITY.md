@@ -904,15 +904,14 @@ those are marked `[MODEL]`.
   WebView** (the `sandbox` iframe's analogue), else a name chip — open by default, caption below, matching
   the web's `renderToolFiles`. **Click-to-zoom (XERK-221 lightbox):** tapping an image preview opens a
   full-screen viewer (`ImageLightbox`, pinch-zoom + pan, ✕ / back to close) — the analogue of
-  `sessions.html`'s `#imgLightbox`. On Android this covers SendUserFile image previews only, since inline
-  prose images are still deferred (next bullet); on the web it also covers inline `![](…)` images.
-- P1 Inline images in **PROSE** (the OTHER half of XERK-221) — still deferred. A markdown `![alt](url)`
-  and a raw/fenced `<svg>` in an agent's *text* render as pictures on the web (`chat.js`
-  `linkify`/`svgToImg`/`renderSvgAndText`); Android still shows `![alt](url)` as a link (stray `!`) and
-  SVG source as text/code. Needs a `Span.Image`/`ProseBlock.Image` node in `core/Prose.kt` mirroring the
-  web parse, plus splitting a paragraph around an inline image in `ProseBlocks`. The image renderer
-  (Coil `AsyncImage`) is already in place from the SendUserFile work above, so this is parser + layout
-  only.
+  `sessions.html`'s `#imgLightbox`. It covers inline prose images too (next bullet), as on the web.
+- ~~P1 Inline images in **PROSE** (the OTHER half of XERK-221).~~ **Done (XERK-1932)**: a markdown
+  `![alt](url)` (http(s) or `data:image/*`) parses to `Span.Image` and a line-start raw `<svg>…</svg>`
+  or an all-SVG fence to `ProseBlock.Svg` (`core/Prose.kt`, mirroring `chat.js`
+  `linkify`/`renderSvgAndText`/`SVG_FENCE`). `ProseInline` splits a paragraph / heading / list row /
+  table cell around each image (`splitImages`) and renders it via Coil `AsyncImage` at its own aspect
+  ratio, capped at its natural width and 320dp tall; SVGs sit on a white backdrop, and a tap opens the
+  same `ImageLightbox` as SendUserFile previews. A source that fails to load shows its alt text.
 - P2 **Share INTO the app as an attachment (XERK-234 follow-up).** Attaching from the picker is done
   (see "Done" above); the phone-idiomatic counterpart of the web's drag-and-drop is the system share
   sheet, which needs an `ACTION_SEND`/`ACTION_SEND_MULTIPLE` intent filter routing the Uri(s) into the

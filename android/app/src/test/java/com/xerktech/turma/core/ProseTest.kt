@@ -24,6 +24,7 @@ class ProseTest {
             is Span.Text -> it.text
             is Span.Code -> it.text
             is Span.Link -> it.label
+            is Span.Image -> it.alt
             is Span.Styled -> plain(it.spans)
         }
     }
@@ -501,6 +502,134 @@ class ProseTest {
             assertEquals(t, plain(paras(t).single().spans))
             assertEquals(1, parseProse(t).size)
         }
+    }
+
+    // ---- inline images + SVGs (XERK-1932; chat.test.js linkify / renderProse XERK-221) ----
+    private fun svgs(text: String) = parseProse(text).filterIsInstance<ProseBlock.Svg>()
+
+    @Test fun `a markdown image becomes an Image span, not a stray bang and a link`() {
+        val spans = parseInlineOnly("see ![a diagram](https://ex.com/x.png) here")
+        assertEquals(
+            listOf(Span.Text("see "), Span.Image("a diagram", "https://ex.com/x.png"), Span.Text(" here")),
+            spans,
+        )
+        assertTrue(spans.none { it is Span.Link })
+    }
+
+    @Test fun `an image with an empty alt still renders`() {
+        assertEquals(listOf(Span.Image("", "https://ex.com/x.png")), parseInlineOnly("![](https://ex.com/x.png)"))
+    }
+
+    @Test fun `a data image URI is an allowed image src and a non-image data URI is not`() {
+        assertEquals(
+            listOf(Span.Image("i", "data:image/png;base64,AAAA")),
+            parseInlineOnly("![i](data:image/png;base64,AAAA)"),
+        )
+        val bad = parseInlineOnly("![x](data:text/html,<script>alert(1)</script>)")
+        assertTrue(bad.none { it is Span.Image })
+        // A javascript: src is neither an image nor a link.
+        val js = parseInlineOnly("![x](javascript:alert(1))")
+        assertTrue(js.none { it is Span.Image || it is Span.Link })
+    }
+
+    @Test fun `an image alt and src are kept verbatim, as data`() {
+        val img = parseInlineOnly("![\" onerror=alert(1) x](https://ex.com/a\".png)").filterIsInstance<Span.Image>().single()
+        assertEquals("\" onerror=alert(1) x", img.alt)
+        assertEquals("https://ex.com/a\".png", img.url)
+    }
+
+    @Test fun `an image link markdown and a bare URL still coexist`() {
+        val spans = parseInlineOnly("![i](https://a.io/i.png) [docs](https://b.io) https://c.io")
+        assertEquals(1, spans.count { it is Span.Image })
+        assertEquals(listOf("https://b.io", "https://c.io"), spans.filterIsInstance<Span.Link>().map { it.url })
+    }
+
+    @Test fun `an image inside a code span stays code`() {
+        val spans = parseInlineOnly("the `![i](https://a.io/i.png)` syntax")
+        assertTrue(spans.none { it is Span.Image })
+    }
+
+    @Test fun `a non-breaking space ends a bare URL, as JS whitespace does`() {
+        val links = parseInlineOnly("go https://a.io/x\u00A0now").filterIsInstance<Span.Link>()
+        assertEquals("https://a.io/x", links.single().url)
+    }
+
+    @Test fun `a standalone svg block is lifted out as an Svg block, not text`() {
+        val blocks = parseProse("Here it is:\n<svg viewBox=\"0 0 2 2\"><rect width=\"2\" height=\"2\"/></svg>\ndone")
+        assertEquals(3, blocks.size)
+        assertEquals("Here it is:", plain((blocks[0] as ProseBlock.Paragraph).spans))
+        assertEquals("<svg viewBox=\"0 0 2 2\"><rect width=\"2\" height=\"2\"/></svg>", (blocks[1] as ProseBlock.Svg).source)
+        // The newline around the block is consumed, so no blank line prints beside it.
+        assertEquals("done", plain((blocks[2] as ProseBlock.Paragraph).spans))
+    }
+
+    @Test fun `an indented and upper-case svg opener still lifts out`() {
+        assertEquals(1, svgs("  <SVG>\n<rect/>\n</SVG >").size)
+    }
+
+    @Test fun `two svg blocks with prose between them`() {
+        val blocks = parseProse("<svg><rect/></svg>\nmid\n<svg><circle/></svg>")
+        assertEquals(listOf("Svg", "Paragraph", "Svg"), blocks.map { it::class.simpleName })
+        assertEquals("mid", plain((blocks[1] as ProseBlock.Paragraph).spans))
+    }
+
+    @Test fun `a fenced svg document renders as an image, not a code block`() {
+        val blocks = parseProse("```svg\n<svg><circle r=\"1\"/></svg>\n```")
+        assertEquals(listOf(ProseBlock.Svg("<svg><circle r=\"1\"/></svg>")), blocks)
+        // Any fence label, or none, as on the web.
+        assertEquals(1, svgs("```\n  <svg>\n</svg>  \n```").size)
+    }
+
+    @Test fun `a fence that merely mentions svg among other content stays code`() {
+        assertTrue(svgs("```html\n<div><svg></svg></div>\n<p>hi</p>\n```").isEmpty())
+        assertEquals(1, codes("```html\n<div><svg></svg></div>\n<p>hi</p>\n```").size)
+        // `<svgfoo>` is not an svg element.
+        assertTrue(svgs("```\n<svgfoo></svg>\n```").isEmpty())
+    }
+
+    @Test fun `an svg inside an inline code span or mid-sentence is not an image`() {
+        assertTrue(svgs("the `<svg><rect/></svg>` element").isEmpty())
+        assertTrue(svgs("draw <svg><rect/></svg> here").isEmpty())
+    }
+
+    @Test fun `an unterminated svg stays text until its closer lands`() {
+        val blocks = parseProse("<svg viewBox=\"0 0 2 2\"><rect")
+        assertTrue(blocks.none { it is ProseBlock.Svg })
+        assertEquals("<svg viewBox=\"0 0 2 2\"><rect", plain((blocks.single() as ProseBlock.Paragraph).spans))
+    }
+
+    @Test fun `a run of unclosed svg openers parses in linear time`() {
+        // Each opener used to retry its body to the end of the text (chat.js, ~0.7 s at 140k).
+        val t = System.nanoTime()
+        parseProse("\n<svg a".repeat(200_000))
+        parseProse("<svg></svg>" + "\n<svg a".repeat(200_000))
+        parseProse("```\n<svg " + " ".repeat(200_000) + "\n```")
+        assertTrue("took too long", (System.nanoTime() - t) / 1_000_000 < 10_000)
+    }
+
+    @Test fun `splitImages splits a paragraph around each image`() {
+        val pieces = splitImages(parseInlineOnly("before\n![a](https://a.io/1.png)\nafter"))
+        assertEquals(3, pieces.size)
+        assertEquals(listOf(Span.Text("before")), (pieces[0] as InlinePiece.Text).spans)
+        assertEquals(Span.Image("a", "https://a.io/1.png"), (pieces[1] as InlinePiece.Image).image)
+        assertEquals(listOf(Span.Text("after")), (pieces[2] as InlinePiece.Text).spans)
+    }
+
+    @Test fun `splitImages leaves image-free spans whole and drops blank runs between images`() {
+        val plainSpans = parseInlineOnly("just **text** here")
+        assertEquals(listOf(InlinePiece.Text(plainSpans)), splitImages(plainSpans))
+        val two = splitImages(parseInlineOnly("![a](https://a.io/1.png)\n![b](https://a.io/2.png)"))
+        assertEquals(listOf("a", "b"), two.map { (it as InlinePiece.Image).image.alt })
+    }
+
+    @Test fun `splitImages splits emphasis around a nested image and keeps its style`() {
+        val pieces = splitImages(parseInlineOnly("**x ![a](https://a.io/1.png) y**"))
+        assertEquals(3, pieces.size)
+        val before = (pieces[0] as InlinePiece.Text).spans.single() as Span.Styled
+        val after = (pieces[2] as InlinePiece.Text).spans.single() as Span.Styled
+        assertTrue(before.bold && after.bold)
+        assertEquals("x ", plain(before.spans))
+        assertEquals(" y", plain(after.spans))
     }
 
     // Expose parseInline for the linkify/inline-code cases (it's file-private).
