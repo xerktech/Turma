@@ -162,21 +162,6 @@ Mirrors the glasses pure-core/adapter-shell split:
     ~1px per character, so width-driven layout (the meta row) reads wrong.
 - Org-tint call sites (`TurmaColors.series()`, never `ChartSeries*` outside `ui/theme`) are pinned
   at the source by `SeriesCallSiteTest`: no render test reaches every screen's tint.
-
-## Chat header and footer fit (rollup XERK-1701)
-
-- "Short window" (`chatHeaderFit`) reads the chat's height WITHOUT the keyboard (a
-  `BoxWithConstraints` outside `imePadding`): measured inside, a tablet's keyboard read as a phone.
-- Typing in a short window (`compact`): the meta line folds, the footer pads less, and the top bar
-  steps aside (status strip only) when bar + compose box can't both fit (`chatBarFits`) — the box
-  being typed into always stays whole — and while a sheet is pending. It returns with no keyboard.
-- While typing in a short window a question / permission sheet may take the footer's whole height
-  (the footer scrolls to it) and the chip row yields to it — its foot shows above the box, never a
-  0-height sheet (the old cap alone gave 0 there, and 3dp with a taller keyboard).
-- The bar's height comes from MEASURED line heights (`TextMeasurer`), not the style's `lineHeight`,
-  which undershoots the drawn line at a non-linear font scale.
-- The tunnel marker never shares a line it can't fit beside a half-width host · repo
-  (`chatMetaOneLine`); on its own line it wraps at a word (2 lines max) and the bar grows to hold it.
 - **Assert a model-switch memo on the STORE (`container.modelSwitches`), never `ChatUiState`** — the
   state copy is a VM-rebuilt mirror; asserting it passes on a change that dropped the real thing.
 - **The in-app updater is silenced in tests (XERK-281)** — Robolectric rebuilds the Application per
@@ -186,6 +171,23 @@ Mirrors the glasses pure-core/adapter-shell split:
   `net/UpdaterTestSeamTest`.
 - Tests: `vm/ChatModelSourceTest`, `vm/FleetOutcomeTest`, `ui/SpawnComposerTest`,
   `ui/ChatModelChipsTest`, `ui/SessionsPaneSpawnTest`, `ui/FleetSpawnLocalModelTest`.
+
+## Chat header and footer fit (rollup XERK-1701)
+
+- "Short window" (`chatHeaderFit`) reads the chat's height WITHOUT the keyboard (a
+  `BoxWithConstraints` outside `imePadding`): measured inside, a tablet's keyboard read as a phone.
+- Typing in a short window (`compact`): the meta line folds, the footer pads less, and the top bar
+  steps aside (status strip only) when bar + compose box can't both fit (`chatBarFits`) — the box
+  being typed into always stays whole — and while a sheet is pending. It returns with no keyboard.
+- A question / permission sheet pending in a short window comes first (`sheetFirst`), keyboard up
+  OR down: the header keeps the title (plus the tunnel warning alone when the tunnel is down), the
+  chip row yields, and the sheet may take the footer's whole height (the footer scrolls to it).
+  - Never a 0-height sheet: the cap alone gave 0 in the landscape two-pane chat at font 2.0
+    (283dp tall) once the tunnel marker took its own line, and while typing.
+- The bar's height comes from MEASURED line heights (`TextMeasurer`), not the style's `lineHeight`,
+  which undershoots the drawn line at a non-linear font scale.
+- The tunnel marker never shares a line it can't fit beside a half-width host · repo
+  (`chatMetaOneLine`); on its own line it wraps at a word (2 lines max) and the bar grows to hold it.
 
 ## Building
 

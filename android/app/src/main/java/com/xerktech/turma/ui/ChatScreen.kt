@@ -207,7 +207,13 @@ fun ChatScreen(
     // in landscape. So a short window takes the smaller title style, the bar grows to
     // the lines' real height at this font scale, and with the keyboard up in a short
     // window the meta line folds away so the composer keeps the room (#66).
-    val showMeta = state.session != null && fit.showMeta
+    val sheetUp = state.question.isNotBlank() || state.panePrompt != null
+    // A question / permission pending in a short window comes first, keyboard up or down:
+    // the header keeps only the title (plus the tunnel warning, alone, when the tunnel is
+    // down), the chip row yields, and the sheet gets a floor — else a landscape two-pane
+    // chat at a large font left the sheet 0dp (rollup XERK-1701).
+    val sheetFirst = sheetUp && fit.shortWindow
+    val showMeta = state.session != null && fit.showMeta && (!sheetFirst || !state.tunnelOnline)
     val titleStyle = if (fit.shortWindow) MaterialTheme.typography.titleMedium else MaterialTheme.typography.titleLarge
     val metaStyle = MaterialTheme.typography.bodySmall
     // The meta line takes a second line for the tunnel marker when one line can't hold
@@ -232,25 +238,23 @@ fun ChatScreen(
             .windowInsetsPadding(TopAppBarDefaults.windowInsets.only(WindowInsetsSides.Top)),
     )
     val statusBarTop = with(density) { statusStripPx.toDp() }
-    val sheetUp = state.question.isNotBlank() || state.panePrompt != null
     // Typing in a short window, the top bar steps aside (until the keyboard goes) when
     // there is no room for both it and the compose box (a landscape phone at a large font
     // scale) — rather than cover the box being typed into — and while a question or
     // permission sheet is pending, so the sheet shows above the box instead of only
     // being reachable by scrolling an off-screen footer.
-    val showBar = !compact || inputRowPx == 0 || (!sheetUp &&
+    val showBar = !compact || (!sheetUp &&
         chatBarFits(maxHeight, statusBarTop + barHeight, with(density) { inputRowPx.toDp() } + CHAT_FOOTER_COMPACT_PAD))
     // The footer never grows past the room under the top bar: taller (landscape with
     // the keyboard up, or a large font scale) it scrolls, pinned to its BOTTOM so the
     // compose box stays in view and the chips scroll away, instead of drawing over
     // the top bar (rollup XERK-1701 #66).
     val footerMax = with(density) { (maxHeight - topBarPx.toDp()).coerceAtLeast(0.dp) }
-    // A question / permission sheet never collapses to nothing while typing: in a short
-    // window with the keyboard up it may take the footer's whole height, so scrolling the
-    // footer reaches all of it, and its foot shows above the compose box (the chip row
-    // gives way to it).
+    // A question / permission sheet never collapses to nothing in a short window: it may
+    // take the footer's whole height, so scrolling the footer reaches all of it, and its
+    // foot shows above the compose box (the chip row gives way to it).
     val sheetMax = with(density) {
-        waitingSheetCap(maxHeight, topBarPx.toDp(), footerPx.toDp()).let { if (compact) maxOf(it, footerMax) else it }
+        waitingSheetCap(maxHeight, topBarPx.toDp(), footerPx.toDp()).let { if (sheetFirst) maxOf(it, footerMax) else it }
     }
     val footerScroll = rememberScrollState()
     Scaffold(
@@ -287,6 +291,18 @@ fun ChatScreen(
                             BoxWithConstraints {
                                 val measurer = rememberTextMeasurer()
                                 val mono = metaStyle.copy(fontFamily = FontFamily.Monospace)
+                                if (sheetFirst) {
+                                    // Only the warning (showMeta is false otherwise), on as few lines as fit.
+                                    val lines = measurer.measure(
+                                        mark, mono, maxLines = 2, constraints = Constraints(maxWidth = constraints.maxWidth),
+                                    ).lineCount
+                                    SideEffect { metaLines = lines }
+                                    Text(
+                                        mark, style = mono, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                                        color = markColor, modifier = Modifier.testTag(CHAT_MARKER_TAG),
+                                    )
+                                    return@BoxWithConstraints
+                                }
                                 val oneLine = mark.isEmpty() || chatMetaOneLine(
                                     metaWidth = measurer.measure(meta, mono, maxLines = 1).size.width,
                                     markWidth = measurer.measure(" · $mark", mono, maxLines = 1).size.width,
@@ -404,7 +420,7 @@ fun ChatScreen(
                 Box(Modifier.onSizeChanged { footerPx = it.height }) {
                 ChatFooter(
                     compact = compact,
-                    showChips = !(compact && sheetUp),
+                    showChips = !sheetFirst,
                     inputRowModifier = Modifier.onSizeChanged { inputRowPx = it.height },
                     session = state.session,
                     draft = state.draft,

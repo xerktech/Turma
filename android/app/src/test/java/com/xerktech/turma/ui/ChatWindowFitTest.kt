@@ -236,6 +236,51 @@ class ChatWindowFitTest {
         assertTrue("option ${opt.top} under the top bar (${bar.bottom})", opt.top >= bar.bottom - 0.5.dp)
     }
 
+    // The boundary of the bar-fit check, full-screen at font 1.0: bar 64 + status 24, box row
+    // 56 + the compact footer's 4dp padding = 148dp. Exactly that much room keeps the bar...
+    @Test fun `the bar stays when bar and box fit exactly`() {
+        assertTrue(chatBarFits(room = 148.dp, bar = 88.dp, input = 60.dp))
+        assertFalse(chatBarFits(room = 147.dp, bar = 88.dp, input = 60.dp))
+        landscapeTyping(fontScale = 1f, imeDp = 411 - 148)
+        val barH = unclipped(compose.onNodeWithTag(CHAT_TOP_BAR_TAG).fetchSemanticsNode()).height
+        assertTrue("the bar stepped aside (height $barH) with room for both", barH >= 56.dp)
+        assertComposeBoxWhole(411 - 148)
+    }
+
+    // ...and 2dp less, which only the footer's padding overflows, steps it aside.
+    @Test fun `the bar fit counts the compose footer's padding`() =
+        wholeComposeBox(1f, imeDp = 411 - 146)
+
+    private val permission = (1..4).joinToString(",") { """{"number":$it,"label":"Choice $it"}""" }.let {
+        """{ "panePrompt": { "prompt": "Do you want to proceed?", "detail": "Bash command",
+             "id": "0123456789abcdef0123456789abcdef", "options": [ $it ] } }"""
+    }
+
+    /**
+     * The landscape two-pane chat (283dp tall under the scaffold's bars, status consumed) at
+     * font 2.0, keyboard DOWN, tunnel offline: the header's three lines plus the chips and the
+     * box left the cap nothing, so the sheet was 0dp. A pending sheet comes first.
+     */
+    private fun twoPaneSheet(sessionBlock: String, firstOption: String) {
+        open(widthDp = 600, heightDp = 283, fontScale = 2f, sessionBlock = sessionBlock,
+            tunnelOnline = false, statusConsumed = true)
+        val bar = compose.onNodeWithTag(CHAT_TOP_BAR_TAG).getBoundsInRoot()
+        val sheet = compose.onNodeWithTag(WAITING_SHEET_TAG).getBoundsInRoot()
+        assertTrue("sheet visible height ${sheet.height}", sheet.height >= 64.dp)
+        assertTrue("sheet top ${sheet.top} over the top bar (${bar.bottom})", sheet.top >= bar.bottom - 0.5.dp)
+        // The tunnel warning stays, alone; host · repo yields to the sheet.
+        assertTrue("tunnel marker hidden", shown(CHAT_MARKER_TAG))
+        assertFalse("host · repo still takes a line", shown(CHAT_META_TAG))
+        compose.onNodeWithText(firstOption).performScrollTo().assertIsDisplayed()
+        assertComposeBoxWhole(0)
+    }
+
+    @Test fun `a two-pane chat at font 2 keeps a pending question visible`() =
+        twoPaneSheet("""{ "question": "Which one?", "questionOptions": [ $options ] }""", "Option number 1")
+
+    @Test fun `a two-pane chat at font 2 keeps a pending permission prompt visible`() =
+        twoPaneSheet(permission, "1. Choice 1")
+
     @Test fun `the tunnel-offline marker stays whole and host-repo stays readable at font 2`() {
         open(widthDp = 411, heightDp = 800, fontScale = 2f, tunnelOnline = false)
         val bar = compose.onNodeWithTag(CHAT_TOP_BAR_TAG).getBoundsInRoot()
