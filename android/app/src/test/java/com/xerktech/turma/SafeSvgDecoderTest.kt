@@ -273,6 +273,11 @@ class SafeSvgDecoderTest {
             "<pattern id=\"p\" width=\"2\" height=\"2\" patternUnits=\"userSpaceOnUse\"><rect width=\"2\" height=\"2\" clip-path=\"url(#c)\"/></pattern></defs>" +
             "<rect width=\"10\" height=\"10\" fill=\"url(#p)\"/></svg>"
         assertEquals("refused SVG: a clip-path inside a pattern", refusedFor(pattern))
+        // The same pattern applied by a stylesheet rule, not an attribute.
+        val cssFill = pattern.replace("<rect width=\"10\" height=\"10\" fill=\"url(#p)\"/>",
+            "<style>rect.f { fill: url(#p) }</style><rect class=\"f\" width=\"10\" height=\"10\"/>")
+        assertTrue(cssFill != pattern)
+        assertEquals("refused SVG: a clip-path inside a pattern", refusedFor(cssFill))
         // A stylesheet that only paints is fine.
         assertEquals(10 to 10, intrinsic("<svg $ns width=\"10\" height=\"10\"><style>rect { fill: red }</style><rect width=\"5\" height=\"5\"/></svg>"))
     }

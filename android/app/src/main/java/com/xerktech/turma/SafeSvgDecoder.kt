@@ -274,11 +274,22 @@ internal object SvgRenderGuard : SVGExternalFileResolver() {
                     markerFields.all { it.get(style) == null }) {
                     "refused SVG: a stylesheet sets clip-path, mask or a marker"
                 }
+                // A stylesheet's pattern fill could land on any element: its clips are refused
+                // here, as the walk below only sees fills set on the element itself.
+                for (f in paintFields) patternRef(f.get(style), false)
             }
             return node(rootField.get(svg), false).cost
         }
 
         private fun resolve(iri: String?): Any? = iri?.let { resolveIri.invoke(svg, it) }
+
+        /** The pattern [paint] fills with, if any; refused if its content clips. */
+        private fun patternRef(paint: Any?, inClip: Boolean): Node? {
+            if (!paintRefClass.isInstance(paint)) return null
+            val target = resolve(paintHrefField.get(paint) as String?)
+            if (!patternClass.isInstance(target)) return null
+            return node(target, inClip).also { check(!it.clips) { "refused SVG: a clip-path inside a pattern" } }
+        }
 
         private fun node(n: Any?, inClip: Boolean): Node {
             val c = if (inClip) 1 else 0
@@ -315,15 +326,7 @@ internal object SvgRenderGuard : SVGExternalFileResolver() {
                     }
                     add(node(resolve(maskField.get(style) as String?), inClip))
                     for (f in markerFields) add(node(resolve(f.get(style) as String?), inClip), maxOf(1L, vertices))
-                    for (f in paintFields) {
-                        val paint = f.get(style)
-                        if (!paintRefClass.isInstance(paint)) continue
-                        val target = resolve(paintHrefField.get(paint) as String?)
-                        if (!patternClass.isInstance(target)) continue
-                        val pattern = node(target, inClip)
-                        check(!pattern.clips) { "refused SVG: a clip-path inside a pattern" }
-                        add(pattern)
-                    }
+                    for (f in paintFields) patternRef(f.get(style), inClip)?.let { add(it) }
                 }
             }
             if (containerClass.isInstance(n)) {
