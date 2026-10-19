@@ -31122,14 +31122,24 @@ class SessionManager:
                 pass   # costs only a kept-aside copy on a later move back
         return out
 
+    # The most a bundle may unpack to, headers included. The beat's
+    # _unpack_transcript decompresses through EVERY member (~0.5 s/GiB), so the
+    # import thread refuses a bundle past this before the beat ever sees it.
+    MIGRATION_UNPACK_MAX = 1 << 30
+
     def _read_worktree_members(self, blob):
         """The `.worktree/` members of a migration bundle, name -> bytes. Only
         the known names; each bounded by MIGRATION_BLOB_MAX (a gzip bomb must
-        not balloon the agent) and the whole set too."""
+        not balloon the agent) and the whole set too. The whole bundle is
+        bounded by MIGRATION_UNPACK_MAX, judged from each header before its data
+        is read."""
         out, total = {}, 0
         prefix = WORKTREE_STATE_ARCNAME + "/"
         with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
             for m in tar:
+                if m.offset_data + m.size > self.MIGRATION_UNPACK_MAX:
+                    raise ValueError(f"the bundle unpacks to over "
+                                     f"{self.MIGRATION_UNPACK_MAX >> 20} MiB")
                 if not m.name.startswith(prefix):
                     continue
                 rel = m.name[len(prefix):]

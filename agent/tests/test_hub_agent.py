@@ -11888,6 +11888,32 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "size limit"):
                 sm._read_worktree_members(buf.getvalue())
 
+    def test_a_bundle_unpacking_past_the_cap_is_refused_off_the_beat(self):
+        # XERK-1858: the beat's unpack decompresses every member, so a gzip
+        # bomb is refused on the import thread, by header, before the beat.
+        sm = self.make_manager()
+
+        def bundle(*members):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                for name, size in members:
+                    ti = tarfile.TarInfo(name)
+                    ti.size = size
+                    tar.addfile(ti, io.BytesIO(b"\0" * size))
+            return buf.getvalue()
+        with mock.patch.object(sm, "MIGRATION_UNPACK_MAX", 64 << 10):
+            for big in (bundle((".worktree/x", 100 << 10)), bundle(("t1.jsonl", 100 << 10)),
+                        bundle(*((f"e/{i}", 0) for i in range(200)))):   # headers count too
+                with self.assertRaisesRegex(ValueError, "unpacks to over"):
+                    sm._read_worktree_members(big)
+            self.assertEqual(sm._read_worktree_members(bundle(("t1.jsonl", 32 << 10))), {})
+        job = {"cmd": {"migrationId": "m1"}, "cwd": "/x", "isRoot": False, "repo": "r"}
+        with mock.patch.object(sm, "MIGRATION_UNPACK_MAX", 64 << 10), \
+                mock.patch.object(sm, "_migration_download",
+                                  return_value=bundle(("t1.jsonl", 100 << 10))):
+            sm._import_prepare(job)
+        self.assertIn("unpacks to over", job["error"])
+
     def test_lfs_content_is_refused_rather_than_left_behind(self):
         pointer = ("version https://git-lfs.github.com/spec/v1\n"
                    "oid sha256:" + "a" * 64 + "\nsize 3\n")

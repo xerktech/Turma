@@ -36,6 +36,9 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
   touched** (`_unsafe_patch_reason`). `git apply` reads a `copy from` path as-is, absolute included
   — an arbitrary-file read (QA-proven). Capture uses `--no-renames`, so a real patch never has one.
   `_read_worktree_members` bounds every member (gzip bomb); `_unpack_transcript` never extracts them.
+- **The import thread bounds the WHOLE bundle's unpacked size** (`MIGRATION_UNPACK_MAX`, from each
+  header before its data): the beat's `_unpack_transcript` still decompresses through every member,
+  `.worktree/` ones included, at ~0.5 s/GiB, so an unbounded bomb would stall the beat.
 - **Import is STAGE / WORK / FINISH** (XERK-395): `import_session` (beat) validates and reserves a
   slot + shields the cwd from prune (`_imports_inflight`); an import thread downloads and runs
   `_restore_worktree_state`; `_apply_imports_landed` (full beats only) unpacks the transcript,
