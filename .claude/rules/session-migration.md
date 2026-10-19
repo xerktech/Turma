@@ -42,8 +42,11 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
   - Never bound it from tar headers' `size`: a sparse member's is its attacker-chosen original size.
   - `_BundleTarInfo` refuses from the header, before tarfile reads the body: every sparse member
     (GNU `S` and pax `GNU.sparse.*` — its extracted bytes come from the map, which no stream bound
-    sees; a 131 B bundle wrote 3 GiB) and any pax/long-name header over `MIGRATION_EXT_HEADER_MAX`
-    (tarfile reads those whole into RAM). `_unpack_transcript` also counts bytes WRITTEN.
+    sees; a 131 B bundle wrote 3 GiB), any global pax header (`g`: tarfile copies it into every
+    member), pax/long-name headers past `MIGRATION_EXT_HEADER_MAX` in TOTAL (each read whole into
+    RAM), and over `MIGRATION_MEMBERS_MAX` headers (120k empty dirs held the beat 23 s). The import
+    thread walks every header first, so the beat only meets them as a backstop.
+    `_unpack_transcript` also counts bytes WRITTEN.
 - **Import is STAGE / WORK / FINISH** (XERK-395): `import_session` (beat) validates and reserves a
   slot + shields the cwd from prune (`_imports_inflight`); an import thread downloads and runs
   `_restore_worktree_state`; `_apply_imports_landed` (full beats only) unpacks the transcript,
@@ -62,7 +65,7 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
     is removed, anything else detached and renamed to `<cwd>.pre-migration-<ts>`, never deleted.
   - Ignored files never ride the bundle and neither the digest nor `status` sees them, so the old
     copy holds the ONLY one: it is kept aside unless every `--ignored=matching` entry is itself an
-    ignored `MIGRATION_REGENERABLE_DIRS` dir (`!! a/node_modules/`) or a file directly in
+    ignored `MIGRATION_REGENERABLE_DIRS` dir (`!! a/node_modules/`) or a `.pyc`/`.pyo` directly in
     `__pycache__/` (`_holds_unregenerable_ignored`; git failing reads "keep").
     - Never by an ancestor's name (`!! dist/prod.key` with dist/ not ignored was deleted, QA), never
       by mtime (pre-export files, mtime-preserving edits), never a walk. Keep the allowlist narrow.

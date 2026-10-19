@@ -951,26 +951,45 @@ class _BundleRefused(ValueError):
     reason, never prefixed as if one part of it were unreadable."""
 
 
-# The largest pax / GNU long-name header a bundle may carry. tarfile reads one
-# whole into memory before anything can judge it; a real one is a path.
+# The most pax / GNU long-name header bytes a WHOLE bundle may carry. tarfile
+# reads each one whole into memory, and copies its values into every member it
+# keeps listed; a real one is a path.
 MIGRATION_EXT_HEADER_MAX = 1 << 20
+# The most tar headers a bundle may hold. The beat unpacks every member and
+# tarfile lists them all; 120k empty dirs held the beat 23 s (QA). A real bundle
+# is a transcript, its subagent/workflow records and a few `.worktree/` blobs —
+# untracked files ride INSIDE changes.patch, never as members.
+MIGRATION_MEMBERS_MAX = 20000
 
 
 class _BundleTarInfo(tarfile.TarInfo):
     """TarInfo that refuses, from the header alone and before tarfile reads the
-    body: an extended (pax / GNU long-name) header over MIGRATION_EXT_HEADER_MAX,
+    body: a global pax header ('g': tarfile copies it into every later member,
+    and a bundle never writes one), extended (pax / GNU long-name) headers past
+    MIGRATION_EXT_HEADER_MAX in TOTAL, more than MIGRATION_MEMBERS_MAX headers,
     and every sparse member (GNU 'S' and the pax GNU.sparse.* forms). A sparse
     member's extracted bytes come from its map, not the stream, so no stream
-    bound covers them, and a transcript bundle never needs one."""
+    bound covers them, and a transcript bundle never needs one. The running
+    totals ride on the TarFile, one per bundle read."""
 
-    _EXTENDED = (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE,
+    _EXTENDED = (tarfile.XHDTYPE, tarfile.SOLARIS_XHDTYPE,
                  tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK)
 
     def _proc_member(self, tarfile_):
         if self.type == tarfile.GNUTYPE_SPARSE:
             raise _BundleRefused("the migration bundle holds a sparse file")
-        if self.type in self._EXTENDED and self.size > MIGRATION_EXT_HEADER_MAX:
-            raise _BundleRefused("the migration bundle holds an oversized tar header")
+        if self.type == tarfile.XGLTYPE:
+            raise _BundleRefused("the migration bundle holds a global tar header")
+        seen = getattr(tarfile_, "_turma_headers", 0) + 1
+        tarfile_._turma_headers = seen
+        if seen > MIGRATION_MEMBERS_MAX:
+            raise _BundleRefused(f"the migration bundle holds over "
+                                 f"{MIGRATION_MEMBERS_MAX} files")
+        if self.type in self._EXTENDED:
+            ext = getattr(tarfile_, "_turma_ext_bytes", 0) + self.size
+            tarfile_._turma_ext_bytes = ext
+            if ext > MIGRATION_EXT_HEADER_MAX:
+                raise _BundleRefused("the migration bundle holds oversized tar headers")
         return super()._proc_member(tarfile_)
 
     def _refuse_sparse(self, *a, **kw):
@@ -30713,7 +30732,8 @@ class SessionManager:
             # A partial unpack may already have written the transcript, whose
             # pre-move turns the source still reports.
             self._mark_imported_usage(transcript_id, slug, own_until)
-            refuse(f"unpacking the transcript bundle failed: {e}")
+            refuse(str(e) if isinstance(e, _BundleRefused)
+                   else f"unpacking the transcript bundle failed: {e}")
             return
         self._mark_imported_usage(transcript_id, slug, own_until)
         extra = {
@@ -31473,7 +31493,7 @@ class SessionManager:
     def _holds_unregenerable_ignored(self, cwd, timeout):
         """True when `git status --ignored=matching` lists an ignored entry that
         is not regenerable. Regenerable is only an entry that IS an ignored dir
-        named in MIGRATION_REGENERABLE_DIRS (`!! a/node_modules/`), or a file
+        named in MIGRATION_REGENERABLE_DIRS (`!! a/node_modules/`), or a .pyc/.pyo
         directly in a `__pycache__/` — never a file merely under such a name
         (`!! dist/prod.key`, where dist/ itself is not ignored).
         `matching`, never `traditional`: that one reports an untracked dir holding
@@ -31493,7 +31513,8 @@ class SessionManager:
             parts = e[3:].rstrip("/").split("/")
             if e.endswith("/") and parts[-1] in self.MIGRATION_REGENERABLE_DIRS:
                 continue
-            if not e.endswith("/") and len(parts) > 1 and parts[-2] == "__pycache__":
+            if not e.endswith("/") and len(parts) > 1 and parts[-2] == "__pycache__" \
+                    and parts[-1].endswith((".pyc", ".pyo")):
                 continue
             return True
         return False

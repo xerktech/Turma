@@ -11845,6 +11845,18 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         # Git failing (not a repo): keep the copy.
         self.assertTrue(sm._holds_unregenerable_ignored(tempfile.mkdtemp(dir=self.tmp), 15))
 
+    def test_only_compiled_python_in_pycache_is_regenerable(self):
+        # XERK-1858 QA: any file directly in __pycache__/ counted, so an
+        # ignored pkg/__pycache__/x.env went with the copy.
+        sm = self.make_manager()
+        for rel, keeps in (("pkg/__pycache__/m.pyc", False), ("pkg/__pycache__/m.pyo", False),
+                           ("pkg/__pycache__/x.env", True)):
+            d = tempfile.mkdtemp(dir=self.tmp)
+            self.git("init", "-q", d)
+            self.write(d, ".gitignore", "*.pyc\n*.pyo\n*.env\n")
+            self.write(d, rel, "x\n")
+            self.assertIs(sm._holds_unregenerable_ignored(d, 15), keeps, rel)
+
     def test_a_patch_that_does_not_apply_refuses_and_leaves_no_worktree(self):
         src_wt = self.src_worktree()
         sm = self.make_manager()
@@ -11985,6 +11997,73 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
             sm._import_prepare(job)
         # Its own reason, not "the moved worktree state is unreadable: …".
         self.assertTrue(job["error"].startswith("the migration bundle "), job["error"])
+
+    @staticmethod
+    def _tgz(members, fmt=tarfile.PAX_FORMAT, pax_headers=None):
+        """A gzipped tar of (name, size, type) members, zero-filled."""
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz", format=fmt,
+                          pax_headers=pax_headers) as tar:
+            for name, size, kind in members:
+                ti = tarfile.TarInfo(name)
+                ti.type, ti.size = kind, size
+                tar.addfile(ti, io.BytesIO(b"\0" * size) if size else None)
+        return buf.getvalue()
+
+    def _both_refuse(self, sm, blob, reason):
+        """The import thread AND the beat refuse `blob`, the beat writing nothing."""
+        with self.assertRaisesRegex(ValueError, reason):
+            sm._read_worktree_members(blob)
+        dest = tempfile.mkdtemp(dir=self.tmp)
+        with self.assertRaisesRegex(ValueError, reason):
+            sm._unpack_transcript(blob, dest)
+        self.assertEqual(os.listdir(dest), [])
+
+    def test_a_global_pax_header_is_refused(self):
+        # XERK-1858 QA: tarfile copies a 'g' header's values into EVERY later
+        # member it keeps listed — ~1 MiB of 'g' and 500 empty files was a
+        # MemoryError. A bundle never writes one.
+        sm = self.make_manager()
+        blob = self._tgz([("t1.jsonl", 0, tarfile.REGTYPE)], pax_headers={"comment": "x"})
+        self._both_refuse(sm, blob, "global tar header")
+        sm._read_worktree_members(self._tgz([("t1.jsonl", 0, tarfile.REGTYPE)]))
+
+    def test_extended_headers_are_capped_per_bundle_not_per_header(self):
+        # XERK-1858 QA: 60 chained ~1 MiB 'x' headers, each under a per-header
+        # cap, held 265 MiB. The cap is the bundle's TOTAL.
+        sm = self.make_manager()
+        with mock.patch.object(ha, "MIGRATION_EXT_HEADER_MAX", 4096):
+            for fmt in (tarfile.PAX_FORMAT, tarfile.GNU_FORMAT):
+                many = self._tgz([(f"{i}" + "n" * 1000, 0, tarfile.REGTYPE)
+                                  for i in range(10)], fmt=fmt)
+                self._both_refuse(sm, many, "oversized tar headers")
+                sm._read_worktree_members(self._tgz(
+                    [(f"{i}" + "n" * 1000, 0, tarfile.REGTYPE) for i in range(3)], fmt=fmt))
+
+    def test_a_bundle_with_too_many_members_is_refused_off_the_beat(self):
+        # XERK-1858 QA: 120k empty dirs (an 840 KB blob) held the beat 23 s.
+        sm = self.make_manager()
+        with mock.patch.object(ha, "MIGRATION_MEMBERS_MAX", 50):
+            blob = self._tgz([(f"d{i}", 0, tarfile.DIRTYPE) for i in range(60)])
+            self._both_refuse(sm, blob, "over 50 files")
+            job = {"cmd": {"migrationId": "m1"}, "cwd": "/x", "isRoot": False, "repo": "r"}
+            with mock.patch.object(sm, "_migration_download", return_value=blob):
+                sm._import_prepare(job)
+            self.assertEqual(job["error"], "the migration bundle holds over 50 files")
+            sm._read_worktree_members(self._tgz([(f"d{i}", 0, tarfile.DIRTYPE)
+                                                 for i in range(40)]))
+
+    def test_a_beat_side_refusal_is_reported_in_its_own_words(self):
+        # XERK-1858 QA: not "unpacking the transcript bundle failed: the
+        # migration bundle …" — the refusal IS the reason.
+        sm = self.make_manager()
+        with mock.patch.object(ha, "MIGRATION_MEMBERS_MAX", 5):
+            blob = self._tgz([(f"d{i}", 0, tarfile.DIRTYPE) for i in range(10)])
+            job = {"cmd": {"migrationId": "m1", "transcriptId": "t1", "cmdId": "c1"},
+                   "cwd": os.path.join(self.tmp, "wt"), "blob": blob}
+            with mock.patch.object(sm, "_refuse_start") as refuse:
+                sm._finish_import(job)
+        self.assertEqual(refuse.call_args[0][0], "the migration bundle holds over 5 files")
 
     def test_lfs_content_is_refused_rather_than_left_behind(self):
         pointer = ("version https://git-lfs.github.com/spec/v1\n"
