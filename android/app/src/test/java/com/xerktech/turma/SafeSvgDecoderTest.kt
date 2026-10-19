@@ -225,4 +225,72 @@ class SafeSvgDecoderTest {
         val cancelled = timed(50)
         assertTrue("full ${full}ms, cancelled ${cancelled}ms", cancelled * 2 < full)
     }
+
+    private val xl = "$ns xmlns:xlink=\"http://www.w3.org/1999/xlink\""
+
+    /** Clip paths [depth] deep, each holding ten `<use>`s of a rect clipped by the last. */
+    private fun clipFan(depth: Int): String {
+        val sb = StringBuilder("<svg $xl width=\"100\" height=\"100\"><defs><rect id=\"r0\" width=\"100\" height=\"100\"/>")
+        for (i in 1..depth) {
+            sb.append("<clipPath id=\"c$i\">")
+            repeat(10) { sb.append("<use xlink:href=\"#r${i - 1}\"/>") }
+            sb.append("</clipPath><rect id=\"r$i\" width=\"100\" height=\"100\" clip-path=\"url(#c$i)\"/>")
+        }
+        return sb.append("</defs><use xlink:href=\"#r$depth\"/></svg>").toString()
+    }
+
+    private fun refusedFor(svg: String) = runCatching { decode(svg.toByteArray()) }.exceptionOrNull()?.message
+
+    @Test fun `clip-path fan-out is refused before it renders`() {
+        // Depth 7 is 2.5 KB and never calls save(): on the emulator it pinned a core for
+        // 4+ minutes past Back with the save() guard alone (QA on XERK-2108).
+        val start = System.nanoTime()
+        assertEquals("refused SVG: too costly to draw", refusedFor(clipFan(7)))
+        assertEquals("refused SVG: too costly to draw", refusedFor(clipFan(3)))
+        val ms = (System.nanoTime() - start) / 1_000_000
+        assertTrue("took ${ms}ms", ms < 2_000)
+    }
+
+    @Test fun `costly single draws are refused - a long clip text, a long self-crossing clip outline, a huge path`() {
+        fun clipped(clip: String) = "<svg $ns width=\"100\" height=\"100\"><defs><clipPath id=\"c\">$clip</clipPath></defs>" +
+            "<rect width=\"100\" height=\"100\" clip-path=\"url(#c)\"/></svg>"
+        fun star(n: Int) = "M0 0 " + (0 until n).joinToString(" ") { "L${(it * 37) % 100} ${(it * 61) % 100}" }
+        val text = "<text y=\"50\" font-size=\"10\">${"W".repeat(5000)}</text>"
+        assertEquals("refused SVG: too costly to draw", refusedFor(clipped(text)))
+        assertEquals("refused SVG: too costly to draw", refusedFor(clipped("<path d=\"${star(1000)}\"/>")))
+        val stroke = "<svg $ns width=\"100\" height=\"100\"><path fill=\"none\" stroke=\"black\" stroke-width=\"500\" d=\"${star(40_000)}\"/></svg>"
+        assertEquals("refused SVG: too costly to draw", refusedFor(stroke))
+        // Within the budget each still draws.
+        assertEquals(100 to 100, intrinsic(clipped("<path d=\"${star(100)}\"/>")))
+        assertEquals(100 to 100, intrinsic(clipped("<text y=\"50\">${"W".repeat(100)}</text>")))
+    }
+
+    @Test fun `what the cost walk can't price is refused - stylesheet clips, a clip inside a pattern`() {
+        val css = "<svg $ns width=\"10\" height=\"10\"><style>rect { clip-path: url(#c) }</style>" +
+            "<clipPath id=\"c\"><rect width=\"5\" height=\"5\"/></clipPath><rect width=\"10\" height=\"10\"/></svg>"
+        assertEquals("refused SVG: a stylesheet sets clip-path, mask or a marker", refusedFor(css))
+        val pattern = "<svg $ns width=\"10\" height=\"10\"><defs><clipPath id=\"c\"><rect width=\"1\" height=\"1\"/></clipPath>" +
+            "<pattern id=\"p\" width=\"2\" height=\"2\" patternUnits=\"userSpaceOnUse\"><rect width=\"2\" height=\"2\" clip-path=\"url(#c)\"/></pattern></defs>" +
+            "<rect width=\"10\" height=\"10\" fill=\"url(#p)\"/></svg>"
+        assertEquals("refused SVG: a clip-path inside a pattern", refusedFor(pattern))
+        // A stylesheet that only paints is fine.
+        assertEquals(10 to 10, intrinsic("<svg $ns width=\"10\" height=\"10\"><style>rect { fill: red }</style><rect width=\"5\" height=\"5\"/></svg>"))
+    }
+
+    @Test fun `an ordinary clipped diagram still draws`() {
+        val bars = (0 until 50).joinToString("") { "<rect x=\"${it * 2}\" width=\"1\" height=\"${it + 10}\" clip-path=\"url(#c)\"/>" }
+        val svg = "<svg $xl width=\"100\" height=\"100\"><defs><clipPath id=\"c\"><rect width=\"100\" height=\"60\" rx=\"4\"/></clipPath>" +
+            "<g id=\"g\">$bars</g></defs><use xlink:href=\"#g\"/><use xlink:href=\"#g\" y=\"40\"/></svg>"
+        assertEquals(100 to 100, intrinsic(svg))
+    }
+
+    @Test fun `a render past the deadline is refused`() {
+        val saved = SvgRenderGuard.renderDeadlineMs
+        SvgRenderGuard.renderDeadlineMs = 0
+        try {
+            assertEquals("refused SVG: render too slow", refusedFor(tiles("10")))
+        } finally {
+            SvgRenderGuard.renderDeadlineMs = saved
+        }
+    }
 }

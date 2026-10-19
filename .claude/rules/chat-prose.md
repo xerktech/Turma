@@ -87,6 +87,15 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
       AndroidSVG offers per element and per pattern tile.** It checks the thread's interrupt (Coil
       cancels via `runInterruptible`), a 5 s deadline and a step budget. Without it an image-free
       `<pattern>` of 0.01-unit tiles pinned a core for 11+ min past Back (XERK-2108).
+    - **`save()` doesn't see clip work or a single native draw, so a cost walk over the PARSED tree
+      runs first** (`SvgRenderGuard.Cost`): it follows every reference AndroidSVG does (`<use>`,
+      clip-path, mask, markers, pattern fill/href, tref/textPath), memoised so it stays linear on
+      an exponential fan-out. A 2.5 KB clip-path `<use>` fan-out never called `save()` and ran 4+ min.
+      - Budgets are MEASURED, not guessed: native cost grows faster than size (a self-crossing clip
+        outline is ~n², a wide stroke too), so the weights hold the worst accepted shape near 2 s.
+        Re-measure before changing them.
+      - What it can't price is refused: a stylesheet setting clip-path/mask/marker, and a clip-path
+        inside pattern content (paid per tile, and the tile count is only known at render time).
     - **Embedded raster images go only through `SvgRenderGuard`.** AndroidSVG 1.4 decodes a base64
       `data:` `<image>` itself, at full size, on every draw, and asks the external resolver only
       when that check returns null — so the guard rewrites each PARSED `<image>` href (reflection)
