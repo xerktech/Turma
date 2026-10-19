@@ -1021,6 +1021,15 @@ describe("render: home status groups (XERK-1913)", () => {
     expect(after[c]).toMatchObject({ hostKey: "B", sessionId: "x" });
   });
 
+  it("matches a moved session by its exact id, never a suffix of an id with ':' (XERK-1858)", () => {
+    const idle = (id: string, m: number) =>
+      session({ id, repo: "r", summary: id.toUpperCase(), createdAt: T(m), session: signals({ paneBusy: false, transcriptAgeSec: 999 }) });
+    const gone = homeRowKey({ kind: "session", hostKey: "A", sessionId: "x:y", selectable: true, text: "" });
+    const after = buildHomeRows(base({ agents: [agent({ key: "A", sessions: [idle("y", 3), idle("w", 1)] })] }));
+    const at = after.findIndex((r) => r.sessionId === "w");
+    expect(after[homeCursor(after, { cursor: at, selected: gone })]?.sessionId).toBe("w");
+  });
+
   it("draws a dead host's session with the same state the groups judge it by", () => {
     // Reported online, but last seen past OFFLINE_AFTER_MS by the phone's clock.
     const stale = agent({ lastSeen: Date.now() - 80_000,

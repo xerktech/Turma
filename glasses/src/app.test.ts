@@ -438,7 +438,7 @@ describe("App", () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(app.getState().home.selected).toBe(host);
     display.emit({ type: "tap" });
-    expect(`s:${app.getState().session?.hostKey}:dup`).toBe(host);
+    expect(`s:${JSON.stringify([app.getState().session?.hostKey, "dup"])}`).toBe(host);
   });
 
   it("New session pickers: a later org, a scroll past the end, and a tap after the repo list shrank", async () => {
@@ -990,6 +990,104 @@ describe("App", () => {
     display.emit({ type: "tap" }); // recording -> finalising
     dictation.resolve({ text: "and redeploy" });
     expect(app.getState().session?.draft).toBe("deploy the fix and redeploy");
+  });
+
+  describe("kept drafts (XERK-1858)", () => {
+    let fleet: AgentInfo[] = [];
+    const POLL = 1000;
+    const poll = () => vi.advanceTimersByTimeAsync(POLL);
+    async function boot(): Promise<App> {
+      const app = makeApp(fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: fleet })) }), POLL);
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      return app;
+    }
+    // From the session screen's transcript: focus the box and dictate `text`.
+    function dictate(text: string): void {
+      display.emit({ type: "tap" }); // -> bottom
+      display.emit({ type: "tap" }); // -> recording
+      display.emit({ type: "tap" }); // -> finalising
+      dictation.resolve({ text });
+    }
+    const draftOf = (app: App) => app.getState().session?.draft;
+
+    it("a phone switch stashes the left session's draft, and a phone entry restores it", async () => {
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
+      const app = await boot();
+      app.enterSession("s1");
+      dictate("one");
+      app.enterSession("s2");
+      expect(draftOf(app)).toBe("");
+      app.enterSession("s1");
+      expect(draftOf(app)).toBe("one");
+    });
+
+    it("a phone switch mid-recording cancels the mic", async () => {
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
+      const app = await boot();
+      app.enterSession("s1");
+      display.emit({ type: "tap" }); // -> bottom
+      display.emit({ type: "tap" }); // -> recording
+      expect(app.getState().session?.mic).toBe("recording");
+      app.enterSession("s2");
+      expect(dictation.cancelled).toBe(1);
+      expect(app.getState().session?.mic).toBe("idle");
+    });
+
+    it("never hands one host's draft to another host's copy of the same id; the phone's hint picks the copy", async () => {
+      fleet = [
+        agent({ key: "A", sessions: [session({ id: "dup" }), session({ id: "other" })] }),
+        agent({ key: "B", sessions: [session({ id: "dup" })] }),
+      ];
+      const app = await boot();
+      app.enterSession("dup", "A");
+      dictate("for A");
+      app.enterSession("other");
+      app.enterSession("dup", "B");
+      expect(app.getState().session?.hostKey).toBe("B");
+      expect(draftOf(app)).toBe("");
+      app.enterSession("other");
+      app.enterSession("dup", "A");
+      expect(draftOf(app)).toBe("for A");
+    });
+
+    it("follows its session to a new host, and is dropped once no host lists the session", async () => {
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] }), agent({ key: "B" })];
+      const app = await boot();
+      app.enterSession("s1");
+      dictate("moving");
+      app.enterSession("s2");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s2" })] }), agent({ key: "B", sessions: [session({ id: "s1" })] })];
+      await poll();
+      app.enterSession("s1");
+      expect(app.getState().session?.hostKey).toBe("B");
+      expect(draftOf(app)).toBe("moving");
+
+      app.enterSession("s2"); // stash it again, under B
+      fleet = [agent({ key: "A", sessions: [session({ id: "s2" })] }), agent({ key: "B" })];
+      await poll();
+      expect(app.getState().drafts).toEqual({});
+    });
+
+    it("stays stashed while a question is pending, so the sheet shows and Send can't answer with it", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
+      const app = await boot();
+      app.enterSession("s1");
+      dictate("unrelated note");
+      app.enterSession("s2");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking }), session({ id: "s2" })] })];
+      await poll();
+      app.enterSession("s1");
+      expect(draftOf(app)).toBe("");
+      const model = app.getState();
+      expect(model.screen).toBe("session");
+      expect(display.lines.some((l) => l.includes("Ship it?"))).toBe(true);
+      // The question clears: the draft comes back on the next poll.
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
+      await poll();
+      expect(draftOf(app)).toBe("unrelated note");
+    });
   });
 
   it("leaving a session keeps its unsent draft for the next entry; Send still clears it (XERK-1858)", async () => {

@@ -60,19 +60,25 @@ function fits(s: string, maxWidthPx: number, measure: Measure): boolean {
 
 // Hard-splits a single word wider than maxWidthPx into width-fitting chunks.
 // Always makes progress (splits at least one character) even if a single
-// character alone exceeds maxWidthPx, so it never infinite-loops.
+// character alone exceeds maxWidthPx, so it never infinite-loops. Splits on
+// code points, so an emoji's surrogate pair never lands across two lines, and
+// binary-searches each split (the measure is monotone in prefix length): a
+// linear walk back from the end measured O(n) prefixes of O(n) each per chunk.
 function splitLongWord(word: string, maxWidthPx: number, measure: Measure): string[] {
   const chunks: string[] = [];
-  let remainder = word;
-  while (remainder.length > 0 && !fits(remainder, maxWidthPx, measure)) {
-    let splitAt = remainder.length;
-    while (splitAt > 1 && !fits(remainder.slice(0, splitAt), maxWidthPx, measure)) {
-      splitAt--;
+  let rest = Array.from(word);
+  while (rest.length > 0 && !fits(rest.join(""), maxWidthPx, measure)) {
+    let lo = 1;
+    let hi = rest.length - 1;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (fits(rest.slice(0, mid).join(""), maxWidthPx, measure)) lo = mid;
+      else hi = mid - 1;
     }
-    chunks.push(remainder.slice(0, splitAt));
-    remainder = remainder.slice(splitAt);
+    chunks.push(rest.slice(0, lo).join(""));
+    rest = rest.slice(lo);
   }
-  if (remainder.length > 0) chunks.push(remainder);
+  if (rest.length > 0) chunks.push(rest.join(""));
   return chunks;
 }
 

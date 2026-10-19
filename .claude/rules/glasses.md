@@ -38,6 +38,7 @@ paths:
     an index silently lands a tap on another session.
   - A selected session no longer at its host + id resolves by id on any host (a landed
     migration), then to the nearest session ABOVE the index, never onto "+ New session".
+  - Session home keys are `s:` + JSON `[host, id]`, so the id parses back exactly (ids may hold ':').
   - New session is org → repo, and `spawnHostFor` picks the org's least-busy online host with that
     repo. The phone companion is out of that scope.
   - Tests: `render.test.ts` "home status groups"/"new session by org"/"new session pickers",
@@ -80,3 +81,8 @@ paths:
   — every answer path, phone included). The wire carries NO question id, so the mask matches text +
   options and lasts only `ANSWER_MASK_MS` (10s) once the POST lands: lengthening it hides an identical
   re-ask. Pending converges on the hub's UNMASKED word. Tests: the `sheet mode:` answer cases in `app.test.ts`.
+- **Leaving a session keeps its unsent draft** (`App.drafts`, XERK-1858); entering it again restores it.
+  - Never restored while a question is pending there: a draft hides the sheet, and Send would post
+    it as an answer to a question the wearer never saw. The poll restores it once the question clears.
+  - Keyed by host + id; a migrated session takes a draft only from a host that no longer lists it.
+  - Tests: `app.test.ts` "kept drafts (XERK-1858)".

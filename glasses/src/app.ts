@@ -263,9 +263,10 @@ export interface AppState {
   pending: Record<string, PendingEntry>;
   answered: Record<string, AnsweredEntry>;
   loadingHistory: Record<string, boolean>;
-  // Unsent dictated drafts of sessions the wearer left ("<host>:<id>" -> text),
+  // Unsent dictated drafts of sessions the wearer left (keyed by `draftKey`),
   // put back when that session is entered again. Leaving is not a Clear.
-  drafts: Record<string, string>;
+  // Pruned on poll once no host lists the session.
+  drafts: Record<string, { hostKey: string; sessionId: string; text: string }>;
 
   home: HomeScreenState;
   session: SessionScreenState | null;
@@ -314,6 +315,11 @@ export function createInitialState(now: number): AppState {
 
 export function findAgent(state: AppState, hostKey: string): AgentInfo | undefined {
   return state.agents.find((a) => a.key === hostKey);
+}
+
+// JSON, not "<host>:<id>": either part may itself contain a ':'.
+function draftKey(hostKey: string, sessionId: string): string {
+  return JSON.stringify([hostKey, sessionId]);
 }
 
 export function findSession(state: AppState, hostKey: string, sessionId: string): SessionInfo | undefined {
@@ -522,10 +528,18 @@ export class App {
   enterSession(sessionId: string, hostKeyHint?: string): void {
     if (!sessionId) return;
     if (this.currentSessionId() === sessionId) return;
+    // The hint names the copy the phone opened when two hosts list one id
+    // (mid-migration); otherwise the first host listing it.
+    const lists = (a: AgentInfo) => (a.sessions ?? []).some((s) => s.id === sessionId);
     const host =
-      this.state.agents.find((a) => (a.sessions ?? []).some((s) => s.id === sessionId))?.key ??
+      (hostKeyHint && this.state.agents.find((a) => a.key === hostKeyHint && lists(a))?.key) ||
+      this.state.agents.find(lists)?.key ||
       hostKeyHint;
     if (!host) return;
+    // The session being left must not keep the mic: its result would land in
+    // (or answer) the wrong session.
+    if (this.state.session) this.cancelBoxDictation(this.state.session);
+    if (this.state.screen === "reply" && this.state.reply?.phase === "listening") this.dictation.cancel();
     this.setState({ screen: "session", session: this.reenterSession(host, sessionId) });
   }
 
@@ -534,20 +548,40 @@ export class App {
   // own draft is stashed first, so switching straight across loses nothing.
   private reenterSession(hostKey: string, sessionId: string): SessionScreenState {
     this.stashDraft();
-    const key = `${hostKey}:${sessionId}`;
-    const draft = this.state.drafts[key] ?? "";
-    if (key in this.state.drafts) {
-      const { [key]: _taken, ...drafts } = this.state.drafts;
-      this.state = { ...this.state, drafts };
-    }
-    return { ...newSessionState(hostKey, sessionId), draft };
+    return this.takeDraft(newSessionState(hostKey, sessionId));
+  }
+
+  // Puts `s`'s stashed draft back into it, unless a question is pending there:
+  // the sheet must show (a draft hides it), and Send must never post that draft
+  // as an answer to a question the wearer never saw. It then stays stashed
+  // until the question clears (the poll calls this again).
+  private takeDraft(s: SessionScreenState): SessionScreenState {
+    const key = this.draftKeyFor(s.hostKey, s.sessionId);
+    if (key === undefined || s.draft) return s;
+    if (findSession(this.state, s.hostKey, s.sessionId)?.session?.question) return s;
+    const { [key]: entry, ...drafts } = this.state.drafts;
+    this.state = { ...this.state, drafts };
+    return { ...s, draft: entry!.text };
+  }
+
+  // The stash entry for a session: its own, else (a migration landed) one
+  // stashed under a host that no longer lists that id. Never another host's
+  // live copy of the same id.
+  private draftKeyFor(hostKey: string, sessionId: string): string | undefined {
+    const own = draftKey(hostKey, sessionId);
+    if (own in this.state.drafts) return own;
+    return Object.keys(this.state.drafts).find((k) => {
+      const d = this.state.drafts[k]!;
+      return d.sessionId === sessionId && !findSession(this.state, d.hostKey, sessionId);
+    });
   }
 
   // Keeps the on-screen session's unsent draft for its next entry.
   private stashDraft(): void {
     const s = this.state.session;
     if (!s?.draft) return;
-    this.state = { ...this.state, drafts: { ...this.state.drafts, [`${s.hostKey}:${s.sessionId}`]: s.draft } };
+    const entry = { hostKey: s.hostKey, sessionId: s.sessionId, text: s.draft };
+    this.state = { ...this.state, drafts: { ...this.state.drafts, [draftKey(s.hostKey, s.sessionId)]: entry } };
   }
 
   private schedulePoll(delayMs: number, prefetched?: Promise<AgentsResponse>): void {
@@ -807,6 +841,18 @@ export class App {
           // until the user scrolls. Reset it, edge-triggered like the arrival.
           this.state = { ...this.state, session: { ...sess, selected: 0 } };
         }
+      }
+      // A draft held back while a question was pending comes back once it clears.
+      if (this.state.screen === "session" && this.state.session?.mic === "idle") {
+        this.state = { ...this.state, session: this.takeDraft(this.state.session) };
+      }
+      // Forget the drafts of sessions no host lists any more.
+      const listed = new Set(sessionRefs.map((r) => r.session.id));
+      const stale = Object.keys(this.state.drafts).filter((k) => !listed.has(this.state.drafts[k]!.sessionId));
+      if (stale.length) {
+        const drafts = { ...this.state.drafts };
+        for (const k of stale) delete drafts[k];
+        this.state = { ...this.state, drafts };
       }
       this.repaint();
     } catch (err: unknown) {

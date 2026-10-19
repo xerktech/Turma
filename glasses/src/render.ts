@@ -305,10 +305,21 @@ export function buildHomeRows(state: AppState): HomeRow[] {
 }
 
 // A home row's identity: a session by host + id (one id can sit on two hosts
-// mid-migration), an action row by its kind. Headers have none.
+// mid-migration), an action row by its kind. Headers have none. The session
+// key is JSON so its id parses back exactly (either part may contain ':').
 export function homeRowKey(row: HomeRow | undefined): string | undefined {
   if (!row || !row.selectable) return undefined;
-  return row.kind === "session" ? `s:${row.hostKey}:${row.sessionId}` : row.kind;
+  return row.kind === "session" ? `s:${JSON.stringify([row.hostKey, row.sessionId])}` : row.kind;
+}
+
+function homeKeySessionId(key: string | undefined): string | undefined {
+  if (!key?.startsWith("s:")) return undefined;
+  try {
+    const id: unknown = (JSON.parse(key.slice(2)) as unknown[])[1];
+    return typeof id === "string" ? id : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // Where the home cursor sits in `rows`: on the selected row wherever the
@@ -321,11 +332,12 @@ export function homeCursor(rows: HomeRow[], home: { cursor: number; selected?: s
     const i = rows.findIndex((r) => homeRowKey(r) === selected);
     if (i >= 0) return i;
   }
-  const wasSession = selected?.startsWith("s:") ?? false;
+  const selectedId = homeKeySessionId(selected);
+  const wasSession = selectedId !== undefined;
   if (wasSession) {
     // The selected session moved host (a migration landed): the same id on its
     // new host is still the wearer's session, wherever the regroup put it.
-    const moved = rows.findIndex((r) => r.kind === "session" && selected!.endsWith(`:${r.sessionId}`));
+    const moved = rows.findIndex((r) => r.kind === "session" && r.sessionId === selectedId);
     if (moved >= 0) return moved;
   }
   const c = clampHomeCursor(rows, home.cursor);
