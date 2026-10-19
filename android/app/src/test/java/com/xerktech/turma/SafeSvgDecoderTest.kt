@@ -109,21 +109,64 @@ class SafeSvgDecoderTest {
         return out.toByteArray()
     }
 
-    private fun withImage(w: Int, h: Int, stray: String = ""): String {
-        val b64 = stray + Base64.encodeToString(pngHeader(w, h), Base64.NO_WRAP)
-        return "<svg $ns xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"10\" height=\"10\">" +
-            "<image width=\"10\" height=\"10\" xlink:href=\"data:image/png;base64,$b64\"/></svg>"
+    private fun b64(bytes: ByteArray) = Base64.encodeToString(bytes, Base64.NO_WRAP)
+
+    /** A REAL 1500 × 1500 PNG (2.25 M px): decodable, so every draw of it counts. */
+    private val realPng: String by lazy {
+        val bmp = android.graphics.Bitmap.createBitmap(1500, 1500, android.graphics.Bitmap.Config.ARGB_8888)
+        b64(ByteArrayOutputStream().also { bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }.toByteArray())
     }
 
-    @Test fun `an svg embedding a huge raster image is refused before AndroidSVG decodes it`() {
-        // 20000 x 20000 is a 1.6 GB bitmap AndroidSVG would allocate in full.
-        for (stray in listOf("", "!", "&quot;", "&#10;")) {
-            val result = runCatching { decode(withImage(20000, 20000, stray).toByteArray()) }
-            assertTrue("must refuse with '$stray': $result", result.exceptionOrNull() is IllegalStateException)
-        }
+    private val open = "<svg $ns xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"10\" height=\"10\">"
+
+    /** One `<image>` whose href attribute is [attr] verbatim (quotes included). */
+    private fun withHref(attr: String) = "$open<image width=\"10\" height=\"10\" xlink:href=$attr/></svg>"
+
+    private fun refused(svg: String): Boolean =
+        runCatching { decode(svg.toByteArray()) }.exceptionOrNull() is IllegalStateException
+
+    @Test fun `a huge embedded image is refused before AndroidSVG decodes it, however the href is spelled`() {
+        // 20000 x 20000 is a 1.6 GB bitmap AndroidSVG 1.4 would allocate in full.
+        val p = b64(pngHeader(20000, 20000))
+        for (attr in listOf(
+            "\"data:image/png;base64,$p\"",
+            // QA bypasses of the text pre-scan this replaced: a mime past 256 chars,
+            // and a raw quote of the other kind inside the payload (Base64 skips it).
+            "\"data:image/png;" + "x=y;".repeat(80) + "base64,$p\"",
+            "\"data:image/png;base64,'$p\"",
+            "'data:image/png;base64,\"$p'",
+            "\"data:image/png;base64,!$p\"",
+            "\"&#100;ata:image/png;base64,&quot;$p\"",
+        )) assertTrue("must refuse $attr".take(120), refused(withHref(attr)))
     }
 
-    @Test fun `an svg embedding a modest raster image still decodes`() {
-        assertEquals(10 to 10, intrinsic(withImage(640, 480)))
+    @Test fun `the size budget's boundary is 2896 squared`() {
+        assertEquals(false, refused(withHref("\"data:image/png;base64,${b64(pngHeader(2896, 2896))}\"")))
+        assertTrue(refused(withHref("\"data:image/png;base64,${b64(pngHeader(2900, 2900))}\"")))
+    }
+
+    @Test fun `a modest embedded image still decodes`() {
+        assertEquals(10 to 10, intrinsic(withHref("\"data:image/png;base64,${b64(pngHeader(640, 480))}\"")))
+        assertEquals(10 to 10, intrinsic(withHref("\"data:image/png;base64,$realPng\"")))
+    }
+
+    @Test fun `every draw counts - use repeats past the budget are refused, within it drawn`() {
+        val img = "<defs><image id=\"i\" width=\"10\" height=\"10\" xlink:href=\"data:image/png;base64,$realPng\"/></defs>"
+        val use = "<use xlink:href=\"#i\"/>"
+        assertEquals(10 to 10, intrinsic("$open$img${use.repeat(3)}</svg>"))
+        assertTrue(refused("$open$img${use.repeat(4)}</svg>"))
+    }
+
+    @Test fun `a pattern of tiny tiles over a big image is refused fast, not decoded per tile`() {
+        // 1 x 1 tiles over 100 x 100: 10000 draws of a 2.25 M px image. Before the guard
+        // AndroidSVG re-decoded it on every tile (minutes of a core, past Back).
+        val svg = "<svg $ns xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"100\" height=\"100\">" +
+            "<defs><pattern id=\"p\" width=\"1\" height=\"1\" patternUnits=\"userSpaceOnUse\">" +
+            "<image width=\"1\" height=\"1\" xlink:href=\"data:image/png;base64,$realPng\"/></pattern></defs>" +
+            "<rect width=\"100\" height=\"100\" fill=\"url(#p)\"/></svg>"
+        val start = System.nanoTime()
+        assertTrue(refused(svg))
+        val ms = (System.nanoTime() - start) / 1_000_000
+        assertTrue("took ${ms}ms", ms < 5_000)
     }
 }

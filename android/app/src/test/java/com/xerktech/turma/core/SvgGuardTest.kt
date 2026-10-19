@@ -1,6 +1,7 @@
 package com.xerktech.turma.core
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -111,24 +112,16 @@ class SvgGuardTest {
         assertEquals(1000 to 1, svgBitmapSize(100000f, 1f, 1000, 2.75f))
     }
 
-    @Test fun `every base64 data URI is found, character references decoded first`() {
-        assertEquals(listOf("QUJD"), svgEmbeddedImages("<svg><image href=\"data:image/png;base64,QUJD\"/></svg>"))
-        assertEquals(listOf("QU\nJD"), svgEmbeddedImages("<x:image xlink:href='data:image/png;base64,QU\nJD'/>"))
-        // A reference-spelled `data:` is what the parser hands AndroidSVG, so it counts.
-        assertEquals(listOf("QUJD"), svgEmbeddedImages("<image href=\"&#100;ata:image/png&#x3B;base64,QUJD\"/>"))
-        assertEquals(listOf("QUJD", "RUZH -->"), svgEmbeddedImages(
-            "<image href=\"data:;base64,QUJD\"/><!-- data:image/gif;base64,RUZH -->"))
-        // The payload runs to the value's end: Base64.decode skips a stray char, so
-        // stopping at one would hide the image behind it; a referenced quote is value text.
-        assertEquals(listOf("i!VBOR"), svgEmbeddedImages("<image href=\"data:;base64,i!VBOR\"/>"))
-        assertEquals(listOf("i\u0000VBOR"), svgEmbeddedImages("<image href=\"data:;base64,i&quot;VBOR\"/>"))
-        // Not base64: AndroidSVG decodes nothing from it, so neither is it counted.
-        assertEquals(emptyList<String>(), svgEmbeddedImages("<image href=\"data:image/svg+xml,%3Csvg/%3E\"/>"))
-    }
-
-    @Test fun `a data URI scan stays linear on a run of mime-less openers`() {
-        val start = System.nanoTime()
-        svgEmbeddedImages("data:".repeat(200_000))
-        assertTrue("took ${(System.nanoTime() - start) / 1_000_000}ms", System.nanoTime() - start < 5_000_000_000L)
+    @Test fun `a data URL payload is read by AndroidSVG 1·4's own rule`() {
+        assertEquals("QUJD", dataUrlPayload("data:image/png;base64,QUJD"))
+        // No limit on the mime part; the payload is everything after the FIRST comma.
+        assertEquals("QUJD", dataUrlPayload("data:" + "x".repeat(300) + ";base64,QUJD"))
+        assertEquals("'QU\"JD,x", dataUrlPayload("data:image/png;base64,'QU\"JD,x"))
+        assertEquals("", dataUrlPayload("data:image/png;base64,"))
+        // What 1.4 does not decode: wrong case, not base64, a comma before index 12.
+        assertNull(dataUrlPayload("DATA:image/png;base64,QUJD"))
+        assertNull(dataUrlPayload("data:image/svg+xml,%3Csvg/%3E"))
+        assertNull(dataUrlPayload("data:,;base64,QUJDQUJD"))
+        assertNull(dataUrlPayload("https://example.com/a.png"))
     }
 }

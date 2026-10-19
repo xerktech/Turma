@@ -17,13 +17,14 @@ import coil.fetch.SourceResult
 import coil.request.Options
 import coil.size.Dimension
 import com.caverock.androidsvg.SVG
+import com.caverock.androidsvg.SVGExternalFileResolver
 import com.xerktech.turma.core.SVG_EMBEDDED_MAX_PIXELS
 import com.xerktech.turma.core.SVG_PROLOG_MAX
 import com.xerktech.turma.core.SvgVerdict
 import com.xerktech.turma.core.blankSoFar
+import com.xerktech.turma.core.dataUrlPayload
 import com.xerktech.turma.core.opensMarkup
 import com.xerktech.turma.core.svgBitmapSize
-import com.xerktech.turma.core.svgEmbeddedImages
 import com.xerktech.turma.core.svgNaturalSize
 import com.xerktech.turma.core.svgVerdict
 import com.xerktech.turma.core.svgZeroArea
@@ -75,9 +76,7 @@ class SafeSvgDecoder private constructor() {
  * drawable the caller lays out as nothing. Coil's own decoder reported the bitmap it
  * had scaled UP to the placeholder box, so every SVG filled the bubble width.
  *
- * An SVG whose embedded raster images ([svgEmbeddedImages]) would decode past
- * [SVG_EMBEDDED_MAX_PIXELS] is refused (alt text): AndroidSVG decodes them at full
- * size with no bound of its own.
+ * Embedded `<image>`s are drawn only through [SvgImageGuard], which bounds them.
  */
 private class SizedSvgDecoder(
     private val source: ImageSource,
@@ -86,11 +85,7 @@ private class SizedSvgDecoder(
 ) : Decoder {
     override suspend fun decode(): DecodeResult = runInterruptible {
         if (zeroArea) return@runInterruptible DecodeResult(ShapeDrawable(), isSampled = false)
-        val bytes = source.source().use { it.readByteArray() }
-        check(embeddedPixels(String(bytes, Charsets.ISO_8859_1)) <= SVG_EMBEDDED_MAX_PIXELS) {
-            "refused SVG with an oversized embedded image"
-        }
-        val svg = SVG.getFromInputStream(bytes.inputStream())
+        val svg = source.source().use { SVG.getFromInputStream(it.inputStream()) }
         val viewBox = svg.documentViewBox
         val (w, h) = svgNaturalSize(svg.documentWidth, svg.documentHeight, viewBox?.width(), viewBox?.height())
         val (bw, bh) = svgBitmapSize(
@@ -105,21 +100,98 @@ private class SizedSvgDecoder(
         svg.setDocumentHeight("100%")
         val config = options.config.takeIf { it != Bitmap.Config.HARDWARE } ?: Bitmap.Config.ARGB_8888
         val bitmap = Bitmap.createBitmap(bw, bh, config)
-        svg.renderToCanvas(Canvas(bitmap))
+        SvgImageGuard.render(svg, Canvas(bitmap))
         DecodeResult(SvgDrawable(bitmap, maxOf(1, Math.round(w)), maxOf(1, Math.round(h))), isSampled = true)
     }
+}
 
-    /** The pixels [svg]'s embedded images decode to, read from their headers alone. */
-    private fun embeddedPixels(svg: String): Long {
-        var total = 0L
-        for (payload in svgEmbeddedImages(svg)) {
-            // The decode AndroidSVG does: a payload that fails here fails there too.
-            val data = runCatching { Base64.decode(payload, Base64.DEFAULT) }.getOrNull() ?: continue
-            val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            runCatching { BitmapFactory.decodeByteArray(data, 0, data.size, o) }
-            if (o.outWidth > 0 && o.outHeight > 0) total += o.outWidth.toLong() * o.outHeight
+/**
+ * Bounds the raster images an SVG embeds. AndroidSVG decodes a `data:…;base64,` href
+ * itself, at full size, on EVERY draw — a 20000 × 20000 PNG data URI allocated
+ * ~1.6 GB, and a `<pattern>` of 1 × 1 tiles over a 2000² image re-decoded it per tile
+ * for minutes after the screen was left. It consults the external resolver only when
+ * that check returns null (javap of 1.4's `render(Image)`: `checkForImageDataURL`
+ * first), so a resolver alone can't intercept it, and a text pre-scan kept losing to
+ * its parser (a long mime type, a quote inside the payload).
+ *
+ * So the PARSED tree is rewritten: every `<image>` href AndroidSVG will use is swapped
+ * for a sentinel no data-URL check accepts, and the original goes to this resolver,
+ * which decodes it the way 1.4 does ([dataUrlPayload]) — size read first, each href
+ * decoded once, every draw counted against [SVG_EMBEDDED_MAX_PIXELS], the render's
+ * deadline and cancellation checked. Past any of them the render throws (alt text).
+ * A non-data href resolves to nothing, as with no resolver: nothing is ever fetched.
+ */
+private object SvgImageGuard : SVGExternalFileResolver() {
+    private const val SENTINEL = "turma-image:"
+    private const val RENDER_DEADLINE_MS = 5_000L
+
+    private class Render(val hrefs: List<String>) {
+        val started = System.nanoTime()
+        val cache = HashMap<String, Bitmap?>()
+        var drawn = 0L
+    }
+
+    private val current = ThreadLocal<Render?>()
+
+    // AndroidSVG 1.4's tree is package-private, so it is reached by reflection. A
+    // rename in a later version fails loudly here (every SVG shows alt text and
+    // SafeSvgDecoderTest goes red) rather than rendering images unbounded.
+    private val rootField = SVG::class.java.getDeclaredField("rootElement").apply { isAccessible = true }
+    private val containerClass = Class.forName("com.caverock.androidsvg.SVG\$SvgContainer")
+    private val getChildren = containerClass.getMethod("getChildren").apply { isAccessible = true }
+    private val imageClass = Class.forName("com.caverock.androidsvg.SVG\$Image")
+    private val hrefField = imageClass.getDeclaredField("href").apply { isAccessible = true }
+
+    init { SVG.registerExternalFileResolver(this) }
+
+    fun render(svg: SVG, canvas: Canvas) {
+        val hrefs = ArrayList<String>()
+        rewrite(rootField.get(svg), hrefs)
+        current.set(Render(hrefs))
+        try {
+            svg.renderToCanvas(canvas)
+        } finally {
+            current.remove()
         }
-        return total
+    }
+
+    /** Swap every `<image>` href under [node] for a sentinel indexing [hrefs]. */
+    private fun rewrite(node: Any?, hrefs: MutableList<String>) {
+        if (node == null) return
+        if (imageClass.isInstance(node)) {
+            (hrefField.get(node) as String?)?.let {
+                hrefField.set(node, SENTINEL + hrefs.size)
+                hrefs.add(it)
+            }
+        }
+        if (containerClass.isInstance(node)) {
+            @Suppress("UNCHECKED_CAST")
+            for (child in getChildren.invoke(node) as List<Any?>) rewrite(child, hrefs)
+        }
+    }
+
+    override fun resolveImage(filename: String?): Bitmap? {
+        val r = current.get() ?: return null
+        val href = filename?.removePrefix(SENTINEL)?.toIntOrNull()?.let { r.hrefs.getOrNull(it) } ?: return null
+        check(!Thread.currentThread().isInterrupted) { "SVG render cancelled" }
+        check(System.nanoTime() - r.started < RENDER_DEADLINE_MS * 1_000_000) { "refused SVG: render too slow" }
+        val bitmap = r.cache.getOrPut(href) { decode(href, r) } ?: return null
+        r.drawn += bitmap.width.toLong() * bitmap.height
+        check(r.drawn <= SVG_EMBEDDED_MAX_PIXELS) { "refused SVG: embedded images draw too many pixels" }
+        return bitmap
+    }
+
+    /** 1.4's `checkForImageDataURL`, with the size read (and budgeted) before the decode. */
+    private fun decode(href: String, r: Render): Bitmap? {
+        val payload = dataUrlPayload(href) ?: return null
+        val data = runCatching { Base64.decode(payload, Base64.DEFAULT) }.getOrNull() ?: return null
+        val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        runCatching { BitmapFactory.decodeByteArray(data, 0, data.size, o) }
+        if (o.outWidth <= 0 || o.outHeight <= 0) return null
+        check(r.drawn + o.outWidth.toLong() * o.outHeight <= SVG_EMBEDDED_MAX_PIXELS) {
+            "refused SVG: embedded image too large"
+        }
+        return runCatching { BitmapFactory.decodeByteArray(data, 0, data.size) }.getOrNull()
     }
 }
 

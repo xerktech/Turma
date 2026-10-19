@@ -191,43 +191,22 @@ fun svgBitmapSize(w: Float, h: Float, dstW: Int?, density: Float): Pair<Int, Int
     return maxOf(1, (w * m).roundToInt()) to maxOf(1, (h * m).roundToInt())
 }
 
-/** The most pixels an SVG's embedded raster images may decode to, all together. */
+/**
+ * The most pixels one SVG render may draw from embedded raster images, every draw
+ * counted (a pattern tile or `<use>` repeat draws again) — 2896², ~32 MB of ARGB.
+ */
 const val SVG_EMBEDDED_MAX_PIXELS = 8L * 1024 * 1024
 
 /**
- * The base64 payload of every `data:…;base64,` URI in [svg] — a superset of the
- * `<image>` hrefs AndroidSVG decodes itself, at full size, with no bound: a 20000 ×
- * 20000 PNG of zeros is a small data URI and a 1.6 GB bitmap. The caller reads each
- * one's dimensions and refuses the SVG past [SVG_EMBEDDED_MAX_PIXELS].
- *
- * Deliberately not an element/attribute parse: it over-matches (a data URI anywhere,
- * comments too) rather than miss one, and character references are decoded first, as
- * the XML parser will (DOCTYPE entities never get this far: [svgVerdict] refuses them).
+ * The base64 payload of an `<image>` href, by AndroidSVG 1.4's own rule
+ * (`SVGAndroidRenderer.checkForImageDataURL`, read with javap): case-sensitive
+ * `data:`, at least 14 chars, the FIRST comma at index ≥ 12, and `;base64` just before
+ * it — no limit on the mime part. Null for anything else, which 1.4 does not decode.
  */
-fun svgEmbeddedImages(svg: String): List<String> =
-    DATA_URI_RE.findAll(xmlUnescape(svg)).map { it.groupValues[1] }.toList()
-
-/**
- * The payload runs to the end of the attribute value — a raw quote or `<` — exactly
- * what AndroidSVG hands `Base64.decode`, which skips any character outside the
- * alphabet: stopping at the first non-base64 character would let one stray `!` hide
- * the image behind it. The mime part is bounded, so a `data:` with no `;base64,`
- * near it costs O(1).
- */
-private val DATA_URI_RE = Regex("""data:[^,]{0,256}?;base64,([^"'<]*)""", RegexOption.IGNORE_CASE)
-private val XML_REF_RE = Regex("""&(#[0-9]+|#[xX][0-9a-fA-F]+|amp|lt|gt|quot|apos);""")
-
-/**
- * XML character references decoded as the parser decodes them — except that a
- * referenced quote or `<` becomes U+0000: it is value text to the parser, so it must
- * not end a payload here, and `Base64.decode` skips it like any non-alphabet char.
- */
-private fun xmlUnescape(s: String): String = if ('&' !in s) s else XML_REF_RE.replace(s) {
-    val cp = when (val r = it.groupValues[1]) {
-        "amp" -> '&'.code; "lt" -> '<'.code; "gt" -> '>'.code; "quot" -> '"'.code; "apos" -> '\''.code
-        else -> (if (r[1] == 'x' || r[1] == 'X') r.substring(2).toIntOrNull(16) else r.substring(1).toIntOrNull())
-            ?.takeIf { c -> c <= 0x10FFFF } ?: return@replace it.value
-    }
-    if (cp == '"'.code || cp == '\''.code || cp == '<'.code) "\u0000" else String(Character.toChars(cp))
+fun dataUrlPayload(href: String): String? {
+    if (!href.startsWith("data:") || href.length < 14) return null
+    val comma = href.indexOf(',')
+    if (comma < 12 || href.substring(comma - 7, comma) != ";base64") return null
+    return href.substring(comma + 1)
 }
 
