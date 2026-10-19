@@ -308,6 +308,32 @@ test("buildItems: a bash `!` passthrough pairs its output like a slash command",
   assert.equal(items[0].result.text, "pushed");
 });
 
+test("render: a `!` command is a red operator bubble with its output open beneath (XERK-2112)", () => {
+  const items = buildItems([
+    { id: "b1", role: "user", blocks: [{ t: "command", name: "!", args: "ls -la\n! git status" }] },
+    { id: "b2", role: "user", blocks: [{ t: "command_output", text: "total <0>" }] },
+    { id: "b3", role: "user", blocks: [{ t: "command", name: "!", args: "false" }] },
+    { id: "b4", role: "user", blocks: [{ t: "command_output", text: "boom", isError: true }] },
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact", args: "" }] },
+  ]);
+  // Shown in EVERY verbosity, Concise included: it is the operator's own input.
+  const html = withVerbosity("concise", () => itemsToHtml(items));
+  assert.equal((html.match(/class="bash-card"/g) || []).length, 2);
+  assert.match(html, /<div class="tr-msg bash"><span class="bash-prompt">!<\/span> ls -la\n! git status<\/div>/);
+  // Output is visible, not folded behind a <details>, and escaped.
+  assert.match(html, /<pre class="bash-out">total &lt;0&gt;<\/pre>/);
+  assert.match(html, /<pre class="bash-out err">boom<\/pre>/);
+  // A slash command keeps its chip.
+  assert.match(html, /class="cmd-card"[^>]*>.*\/compact/);
+  assert.doesNotMatch(html, /cmd-name">!</);
+  // A command whose output has not landed yet still shows the bubble.
+  const pending = withVerbosity("concise", () => itemsToHtml(buildItems([
+    { id: "p1", role: "user", blocks: [{ t: "command", name: "!", args: "sleep 5" }] },
+  ])));
+  assert.match(pending, /tr-msg bash/);
+  assert.doesNotMatch(pending, /bash-out/);
+});
+
 test("buildItems: a task_notification block -> an action card, not a user bubble", () => {
   const items = buildItems([{
     id: "n1", role: "user", blocks: [{

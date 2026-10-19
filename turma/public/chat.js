@@ -2033,6 +2033,20 @@
       clipMark(it.result.truncated) + "</div></details>";
   }
 
+  // A `!` shell command the operator ran from the composer/TUI (XERK-2112). It
+  // IS operator input, so it sits on the operator's side as a bubble — red,
+  // like Claude Code's own bash mode, so it never reads as a typed message —
+  // with its output shown open beneath it. A collapsed chip hid both, and left
+  // no way to tell where in the conversation the command ran or what followed.
+  function renderBashCard(it) {
+    const bubble = '<div class="tr-msg bash"><span class="bash-prompt">!</span> ' + esc(it.args) +
+      clipMark(it.argsTrunc) + "</div>";
+    const out = !it.result ? "" :
+      '<pre class="bash-out' + (it.result.isError ? " err" : "") + '">' +
+      esc(it.result.text || "(no output)") + "</pre>" + clipMark(it.result.truncated);
+    return '<div class="bash-card" data-uuid="' + esc(it.id) + '">' + bubble + out + "</div>";
+  }
+
   // The summary Claude writes when the context is compacted. The transcript
   // stores it as a user turn, but the model wrote it — so it renders on the
   // assistant's side, collapsed, rather than as a wall of text the operator
@@ -2129,7 +2143,12 @@
         i = j;
         continue;
       }
-      if (it.kind === "command") { push("cmd", it, () => renderCommandCard(it)); i++; continue; }
+      if (it.kind === "command") {
+        if (it.name === "!") push("bash", it, () => renderBashCard(it));
+        else push("cmd", it, () => renderCommandCard(it));
+        i++;
+        continue;
+      }
       if (it.kind === "compact") { push("cmp", it, () => renderCompactCard(it)); i++; continue; }
       if (it.kind === "interrupt") { push("int", it, () => renderInterrupt(it)); i++; continue; }
       if (it.kind === "compact_boundary") { push("cb", it, () => renderCompactBoundary(it)); i++; continue; }

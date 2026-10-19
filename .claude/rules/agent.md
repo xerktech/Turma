@@ -118,6 +118,7 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   `HISTORY_MAX_MSGS`, capped in `_history_entries` — callers must not re-slice), but every
   user-authored turn folds back in ahead of the window on any cut (id-deduped,
   `HISTORY_USER_MSGS` backstop); tool traffic otherwise evicts. Tests: `TestHistoryCommand`.
+  - A `!` shell command counts as operator input there, its output row kept beside it (XERK-2112).
 
 ### `setModelSource` — failover to the self-hosted model (XERK-246)
 

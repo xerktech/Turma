@@ -23512,6 +23512,35 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
         self.assertEqual([e["id"] for e in result["entries"]], ["old-op", "a1"])
         self.assertTrue(result["truncated"])
 
+    def test_entry_cap_keeps_bang_commands_and_their_output(self):
+        # XERK-2112: a `!` shell command is operator input, so it survives
+        # the entry cap like a typed message — WITH its output beside it, so
+        # the chat still shows what it printed. An output with no `!` command
+        # ahead of it (a slash command's) is still evictable tool traffic.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        lines = [
+            {"uuid": "b1", "type": "user", "message": {"content": "<bash-input>git status</bash-input>"}},
+            {"uuid": "b2", "type": "user", "message": {
+                "content": "<bash-stdout>clean</bash-stdout><bash-stderr></bash-stderr>"}},
+            {"uuid": "s1", "type": "user", "message": {"content": "<command-name>/cost</command-name>"}},
+            {"uuid": "s2", "type": "user", "message": {
+                "content": "<local-command-stdout>$0.01</local-command-stdout>"}},
+            {"uuid": "b3", "type": "user", "message": {"content": "<bash-input>ls</bash-input>"}},
+            {"uuid": "x1", "type": "assistant",
+             "message": {"content": [{"type": "text", "text": "between"}]}},
+            {"uuid": "b4", "type": "user", "message": {"content": "<bash-stdout>stray</bash-stdout>"}},
+        ]
+        for i in range(6):
+            lines.append({"uuid": f"a{i}", "type": "assistant",
+                          "message": {"content": [{"type": "text", "text": f"t{i}"}]}})
+        write_jsonl(os.path.join(proj, "t.jsonl"), lines)
+        with mock.patch.object(ha, "HISTORY_MAX_MSGS", 2):
+            sm._stage_history(sess["id"])
+        ids = [e["id"] for e in sm.history_results[0]["entries"]]
+        self.assertEqual(ids, ["b1", "b2", "b3", "a4", "a5"])
+
     def test_operator_exempt_set_is_capped_newest_first(self):
         # HISTORY_USER_MSGS bounds the folded-back set, keeping the newest.
         sm = self.make_manager()

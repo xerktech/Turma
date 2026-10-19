@@ -935,9 +935,8 @@ those are marked `[MODEL]`.
   uses "this session only". Port: decode `models`/`modelActual`, populate the chip from the real list,
   show the actual model.
 - P1 **Classify bookkeeping turns + queued prompts (#256, chat-view-classification).** The chat should
-  render, as the web now does: `[Request interrupted by user]` as a centred status marker; `!` shell
-  passthrough (`<bash-input>`/`<bash-stdout>`/`<bash-stderr>`) as command/command_output cards (name
-  "!", stderr wins only when non-empty); the `system/away_summary` recap as a collapsed assistant
+  render, as the web now does: `[Request interrupted by user]` as a centred status marker; the
+  `system/away_summary` recap as a collapsed assistant
   card; and queued (not-yet-sent) prompts as dimmed bubbles. Logic belongs in `core/ChatItems.kt`
   (JVM-tested against the web shapes) — the biggest new chat gap.
 - P1 **Rich tool-call payloads + transcript markers (chat-transcript-fidelity).** The web chat now

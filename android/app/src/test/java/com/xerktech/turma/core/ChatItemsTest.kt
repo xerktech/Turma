@@ -1,11 +1,14 @@
 package com.xerktech.turma.core
 
+import com.xerktech.turma.model.CommandBlock
+import com.xerktech.turma.model.CommandOutputBlock
 import com.xerktech.turma.model.SendFile
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TextBlock
 import com.xerktech.turma.model.ThinkingBlock
 import com.xerktech.turma.model.ToolResultBlock
 import com.xerktech.turma.model.ToolUseBlock
+import com.xerktech.turma.model.TurmaJson
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
@@ -23,6 +26,52 @@ class ChatItemsTest {
             ToolResultBlock(forId = "t1", text = "a\nb\nc"),
         ),
     )
+
+    // ---- XERK-2112: `!` shell commands and their output ------------------------
+
+    @Test fun `a bang command pairs with the output in the NEXT entry, in every verbosity`() {
+        val entries = listOf(
+            TailEntry(id = "b1", role = "user", blocks = listOf(CommandBlock(name = "!", args = "git status"))),
+            TailEntry(id = "b2", role = "user", blocks = listOf(CommandOutputBlock(text = "clean"))),
+            TailEntry(id = "a1", role = "assistant", blocks = listOf(TextBlock("ok"))),
+        )
+        for (v in Verbosity.values()) {
+            val items = buildItems(entries, VerbosityPrefs.forPreset(v))
+            assertEquals(2, items.size)
+            val cmd = items[0] as ChatItem.Command
+            assertEquals("!", cmd.name)
+            assertEquals("git status", cmd.args)
+            assertEquals("clean", cmd.result)
+            assertTrue(items[1] is ChatItem.Bubble)
+        }
+    }
+
+    @Test fun `a command output with no invocation ahead of it stands alone`() {
+        val items = buildItems(
+            listOf(
+                TailEntry(id = "b1", role = "user", blocks = listOf(CommandBlock(name = "!", args = "false"))),
+                TailEntry(id = "x", role = "user", blocks = listOf(TextBlock("hi"))),
+                TailEntry(id = "b2", role = "user", blocks = listOf(CommandOutputBlock(text = "boom", isError = true))),
+            ),
+            VerbosityPrefs.forPreset(Verbosity.CONCISE),
+        )
+        assertEquals(3, items.size)
+        assertEquals(null, (items[0] as ChatItem.Command).result)
+        val orphan = items[2] as ChatItem.Command
+        assertEquals("output", orphan.name)
+        assertEquals("boom", orphan.result)
+        assertTrue(orphan.isError)
+    }
+
+    @Test fun `command blocks decode off the wire instead of dropping as unknown`() {
+        val e = TurmaJson.decodeFromString(
+            TailEntry.serializer(),
+            """{"id":"b1","role":"user","blocks":[{"t":"command","name":"!","args":"ls"},""" +
+                """{"t":"command_output","text":"x","isError":true}]}""",
+        )
+        assertEquals(CommandBlock(name = "!", args = "ls"), e.blocks[0])
+        assertEquals(CommandOutputBlock(text = "x", isError = true), e.blocks[1])
+    }
 
     // ---- XERK-235: the wire shape the hub actually sends --------------------
     //
