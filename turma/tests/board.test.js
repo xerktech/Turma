@@ -2880,7 +2880,8 @@ function loadBoardPage(opts = {}) {
   const fn = new Function(...names, "window",
     BOARD_SCRIPT + "\n;return { mergeSnapshot, applyAgent, sseClock: () => sseClock,"
       + " setCache: (c) => { cache = c; }, getCache: () => cache,"
-      + " permState, openPermissionPanel, savePermissionPolicy, setSites: (v) => { lastSites = v; } };");
+      + " permState, openPermissionPanel, savePermissionPolicy, setSites: (v) => { lastSites = v; },"
+      + " paintDetail, refreshOpenTicket, epicOps, startKey, setOpen: (v) => { openTicketState = v; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   return { ...api, sse, els: document.getElementById };
 }
@@ -3636,4 +3637,23 @@ test("XERK-1840: board.html repaints the open Model row when the hedge's runtime
   const m = html.match(/const modelPickSig = \(p\) => ([^\n]*)/);
   assert.ok(m && /p\.elsewhere/.test(m[1]) && /p\.model/.test(m[1]),
     "modelPickSig must key on the model and elsewhere or a promotion / qwen host never repaints");
+});
+
+test("board.html: a refused epic-run POST paints the open panel's inline error (XERK-1858)", () => {
+  const p = loadBoardPage();
+  const site = epicSite([ticket("C-1", { epicKey: "E-1" })]);
+  p.setCache({ now: Date.now(), agents: [], epicRuns: {} });
+  p.setSites([site]);
+  p.setOpen({ siteKey: site.siteKey, key: "E-1", ticket: site.tickets[0], detail: null });
+  p.paintDetail();
+  const panel = p.els("detailPanel");
+  assert.doesNotMatch(panel.innerHTML, /no free host/);
+  // postEpicRun's refusal: the overlay changes, nothing else does.
+  p.epicOps.set(p.startKey(site.siteKey, "E-1"), { error: "no free host" });
+  p.refreshOpenTicket();
+  assert.match(panel.innerHTML, /td-err">no free host/, "the refusal repaints the open panel");
+  // Clearing it (a later 200) repaints again.
+  p.epicOps.delete(p.startKey(site.siteKey, "E-1"));
+  p.refreshOpenTicket();
+  assert.doesNotMatch(panel.innerHTML, /no free host/);
 });

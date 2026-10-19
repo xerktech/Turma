@@ -8425,7 +8425,8 @@ test("XERK-1848: a promotion is never tripped by work started in its own millise
   resetPolicy();
   hub.__setModelPolicy("on");
   try {
-    const N = Date.now() + 10000;
+    // Mid-second: a whole-second start reads as the end of its second (XERK-1858).
+    const N = Math.floor(Date.now() / 1000) * 1000 + 10437;
     seedPairs("bug", "sonnet", 40, { at: N - 1000 });
     for (let i = 0; i < 3; i++) seedLive("bug", "sonnet", "bad", N);   // same ms as the promotion
     hub.modelPolicySweep(N);
@@ -8434,6 +8435,22 @@ test("XERK-1848: a promotion is never tripped by work started in its own millise
     assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
     seedLive("bug", "sonnet", "bad", N + 1);
     hub.modelPolicySweep(N + 2);
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "demoted");
+  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
+});
+
+test("XERK-1858: work the agent stamped in the promotion's own second still counts", () => {
+  resetPolicy();
+  hub.__setModelPolicy("on");
+  try {
+    // The agent's createdAt is whole seconds: work started at xx.700 after a promotion
+    // at xx.400 arrives stamped xx.000, and is still the promotion's routed work.
+    const N = Math.floor(Date.now() / 1000) * 1000 + 10400;
+    seedPairs("bug", "sonnet", 40, { at: N - 1000 });
+    hub.modelPolicySweep(N);
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
+    for (let i = 0; i < 3; i++) seedLive("bug", "sonnet", "bad", N - 400);
+    hub.modelPolicySweep(N + 1000);
     assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "demoted");
   } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
 });
@@ -14260,6 +14277,54 @@ test("XERK-636: a child's spawn that is acked but leaves no session backs off, i
   epicDriveRound();
   assert.equal(epicChildAttempts.has(k), false, "a session clears the child's backoff");
   assert.equal((agents.edLoop.commands || []).length, 0);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-1858: a child that waited in line past its backoff is not re-queued the beat its spawn is acked", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  await asBeat("edWait", "ed18.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+      tickets: driveTickets() });
+  armEpicRun("ed18.atlassian.net", "E-1");
+  epicRunDriveSweep();                                      // queued, not yet dispatched
+  const k = "ed18.atlassian.net\x00C-1";
+  // It sat in the hub queue longer than its first retry step.
+  epicChildAttempts.set(k, { ...epicChildAttempts.get(k), nextAt: Date.now() - 1, at: Date.now() - 5 * 60_000 });
+  drainTicketQueue();
+  assert.deepEqual(spawnedKeys("edWait"), ["C-1"]);
+  const rec = epicChildAttempts.get(k);
+  assert.ok(rec.nextAt > Date.now(), "the backoff restarts at the hand-over");
+  assert.ok(Date.now() - rec.at < 5000, "the launch grace runs from the hand-over");
+  assert.equal(rec.attempts, 1);
+  // The agent acks with no session yet: the next sweep holds rather than re-queuing.
+  agents.edWait.commands = [];
+  epicDriveRound();
+  assert.equal((agents.edWait.commands || []).length, 0);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-1858: a run-queued child a human Started is still re-stamped at dispatch", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  await asBeat("edClaim", "ed19.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+      tickets: driveTickets() });
+  armEpicRun("ed19.atlassian.net", "E-1");
+  epicRunDriveSweep();                                      // the run queues C-1
+  const k = "ed19.atlassian.net\x00C-1";
+  // It waited in line past its first retry step ...
+  epicChildAttempts.set(k, { ...epicChildAttempts.get(k), nextAt: Date.now() - 1 });
+  // ... then a human's Start claims the entry (dropping its epicRun tag) and dispatches it.
+  const click = await startTicket("ed19.atlassian.net", "C-1");
+  assert.equal(click.status, 200);
+  assert.equal(queuedTicket("ed19.atlassian.net", "C-1"), null, "the click dispatched it");
+  assert.ok(epicChildAttempts.get(k).nextAt > Date.now(), "the backoff restarts at the hand-over");
+  agents.edClaim.commands = [];                             // acked, no session yet
+  epicDriveRound();
+  assert.equal((agents.edClaim.commands || []).length, 0, "not re-dispatched the beat it was acked");
   ticketQueue.length = 0;
   resetEpicRuns();
 });
@@ -21670,8 +21735,11 @@ test("budget: under pressure, a body making REAL progress is never reclaimed",
         `Content-Type: application/json\r\nContent-Length: ${33 << 20}\r\n\r\n` +
         '{"device":"steady","pad":"'
     );
+    // Pump often: this is a real-timer SURVIVAL check, so an event-loop stall longer
+    // than what is left of the window reclaims the body. At half-window pumping that
+    // took a ~200ms stall on a loaded host; at a tenth it takes most of a window.
     pump = setInterval(() => { try { sock.write("s".repeat(chunk)); } catch {} },
-      Math.max(20, Math.floor(hub.BODY_IDLE_TIMEOUT_MS / 2)));
+      Math.max(10, Math.floor(hub.BODY_IDLE_TIMEOUT_MS / 10)));
     await new Promise((r) => setTimeout(r, hub.BODY_IDLE_TIMEOUT_MS * 3));
     assert.ok(hub.bodyInflightHeld() > held0,
       "a body meeting the progress floor must not be reclaimed");

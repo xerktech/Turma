@@ -3879,8 +3879,8 @@ function epicRunActiveCount(run, rows, now, exclude) {
     const q = liveQueuedTicket(run.siteKey, childKey);
     if (live.has(k)) n++;
     // A child still in line is judged by its entry alone: the launch grace is
-    // stamped at QUEUE time, so applying it here made two cap-held siblings hold
-    // each other at the cap for up to the grace with a host free.
+    // stamped at QUEUE time (and again at dispatch), so applying it here made two
+    // cap-held siblings hold each other at the cap for up to the grace with a host free.
     else if (q) { if (q.reason !== "blocked" && q.reason !== "epic-cap") n++; }
     else if (spawnTicketInFlight(run.siteKey, childKey)
       || committedTicketSpawn(run.siteKey, childKey)
@@ -4886,7 +4886,7 @@ function modelShadowSweep(now = Date.now(),
       now, maxAgeMs: MODEL_SHADOW_MAX_AGE_DAYS * 86400000,
     });
     if (!candidates.length) return;
-    let used = outcomeLedger.shadowsDispatchedSince(now - 86400000);
+    let used = outcomeLedger.shadowsDispatchedSince(now - 86400000, now);
     const pairs = outcomeLedger.aggregate({ now }).pairs;
     const hostsUsed = new Set();
     for (const c of candidates) {
@@ -14000,6 +14000,18 @@ function rememberDispatch(siteKey, issueKey, cmdId) {
   const tk = ticketQueueKey(siteKey, issueKey);
   ticketDispatchedAt.set(tk, { at: now, cmdId });
   guardStoreSet("dispatch", tk, { at: now, cmdId }, TICKET_DISPATCH_MEMO_MS);
+  // An epic child's backoff was stamped when the driver QUEUED it; a child that
+  // waited longer than its retry step would be re-queued on the very beat that acks
+  // this spawn, before its session first heartbeats. Re-stamp it from the hand-over,
+  // keeping the attempt count (XERK-1858) — on EVERY dispatch path (drain, a direct
+  // Start, a reused spawn) and keyed on the entry, not the queue entry's `epicRun`
+  // tag, which a human's Start on a run-queued child drops.
+  const prior = epicChildAttempts.get(tk);
+  if (prior) {
+    const rec = { ...prior, nextAt: autoStartRetryAt(now, prior.attempts), at: now };
+    epicChildAttempts.set(tk, rec);
+    guardStoreSet("epicChildAttempts", tk, rec);
+  }
 }
 
 function dispatchedRecently(siteKey, issueKey) {

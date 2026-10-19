@@ -51,6 +51,17 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   `OUTCOME_LEDGER_HOST_MAX_ROWS` (a quarter), and past `MAX_ROWS` the org holding the most rows
   loses its oldest first — plain oldest-first let one host evict every other org's evidence.
   Evicted keys are DELETEd from Postgres too, so the table is as bounded as the model.
+- **A host's shadow rows and live rows are capped apart** (XERK-1858): counted together, a busy
+  shadow host evicted the live evidence its shadows pair against.
+- **Past `MAX_ROWS` the org pass evicts a live row and its paired shadows as ONE unit** (XERK-1858),
+  ranked and aged by the live row (XERK-1855 order); an orphaned shadow is its own unit and goes first.
+  - Shadows alone first churned: at the cap a new shadow was evicted and re-created every tick and
+    never graded. Rows alone, oldest-first, orphaned shadows. Tests: the `XERK-1858:` evict cases.
+- **A rescan that reads a full page DELETEs every table row below the last one it loaded**
+  (XERK-1858): rows past `MAX_ROWS` never enter the model, so `evict()` never deleted them.
+  - The page is ordered `updated_at DESC, key DESC` and the DELETE compares the
+    `(updated_at, key)` tuple: a sweep stamps all its rows with one `now`, so a bare
+    `updated_at <` bound never converged on a tie at the page edge.
 - **A host reporting more sessions than its cap only fills the rows it has room for** (XERK-1853):
   past it a new row evicted one the host still reports, re-created next sweep — new `firstSeen`
   and Postgres upserts + deletes every 15s. Its newest sessions go unrecorded instead.
@@ -149,6 +160,8 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     Sampling is a deterministic hash of the row key (`MODEL_SHADOW_RATE`, 0.25) and the decision
     is persisted on the row (`shadow`), so nothing is asked twice. `MODEL_SHADOW_DAILY_MAX` (10,
     rolling 24h) leaves the rest undecided for a later day.
+    A sampled dispatch its host never reports within an hour (removed before acking) stops counting
+    toward that cap (`shadowsDispatchedSince(since, now)`, XERK-1858).
   - Model: of `MODEL_SHADOW_MODELS` (sonnet,haiku), never the live family, fewest pairs for the
     class. Host: online, DECIDED into the org, `modelShadow.available`, repo cloned (a shadow
     never clones), a free slot, claude default runtime, subscription not paused.

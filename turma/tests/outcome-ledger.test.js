@@ -693,7 +693,7 @@ test("XERK-1847: only a hub-dispatched shadow's report lands, paired with its li
   const live = only();
   L.decideShadow(live.key, { sampled: true, at: T0 + 2 * DAY, id: "sh-00112233aabb",
     model: "haiku", host: "h2" }, T0 + 2 * DAY);
-  assert.equal(L.shadowsDispatchedSince(T0), 1);
+  assert.equal(L.shadowsDispatchedSince(T0, T0 + 2 * DAY), 1);
   // Wrong host, wrong org, unknown id: all dropped.
   L.observeShadows([
     { site: "acme.atlassian.net", host: "h3", id: "sh-00112233aabb", state: "running" },
@@ -848,4 +848,197 @@ test("XERK-1855: an upsert queued behind an in-flight DELETE drains in the same 
   release();
   await pass;
   assert.ok(table.has(row("new").key));
+});
+
+test("XERK-1858: a family named past the label's 80th char still reads as that family", () => {
+  assert.equal(L.modelFamily(`${"x".repeat(90)} Sonnet 5`), "sonnet");
+  assert.equal(L.modelFamily("claude-opus-4-8"), "opus");
+  assert.ok(L.modelFamily("y".repeat(300)).length <= 40);
+});
+
+test("XERK-1858: a sampled shadow its host never reported stops counting toward the daily cap", () => {
+  L._internals.reset();
+  mergedLive();
+  const live = only();
+  const at = T0 + 2 * DAY;
+  L.decideShadow(live.key, { sampled: true, at, id: "sh-00112233aabb", model: "haiku", host: "h2" }, at);
+  assert.equal(L.shadowsDispatchedSince(T0, at + 60000), 1, "just dispatched: counts");
+  assert.equal(L.shadowsDispatchedSince(T0, at + 2 * 3600000), 0, "never reported: lost");
+  // Once its host reports it, it counts for the whole day.
+  L.observeShadows([{ site: "acme.atlassian.net", host: "h2", id: "sh-00112233aabb", state: "running" }], at + 1000);
+  assert.equal(L.shadowsDispatchedSince(T0, at + 2 * 3600000), 1);
+  L._internals.reset();
+});
+
+test("XERK-1858: a host's shadow rows never evict its live rows", () => {
+  L._internals.reset();
+  recording();
+  const per = Math.floor(L.MAX_ROWS / 4);
+  const rows = L._internals.rows();
+  // A host at its live cap, plus shadow rows it ran.
+  L.observe(Array.from({ length: per }, (_, i) => obs({ host: "h2", sid: `b${i}` })), T0);
+  for (let i = 0; i < 5; i++) {
+    const sh = L.sanitizeRow({ site: "acme.atlassian.net", issue: "ACME-1", host: "h2",
+      sid: `sh-0011223344${i}0`, cls: "bug", model: "haiku", kind: "shadow", pairOf: "k",
+      firstSeen: T0 + 1, updatedAt: T0 + 1 });
+    rows.set(sh.key, sh);
+  }
+  L._internals.evict(T0 + 2);
+  const left = [...rows.values()];
+  assert.equal(left.filter((r) => r.kind !== "shadow").length, per);
+  assert.equal(left.filter((r) => r.kind === "shadow").length, 5);
+  L._internals.reset();
+});
+
+test("XERK-1858: a pair's grade time, which the agent stamps, decides the evidence window", () => {
+  L._internals.reset();
+  mergedLive();
+  const live = only();
+  L.decideShadow(live.key, { sampled: true, at: T0 + 2 * DAY, id: "sh-00112233aabb",
+    model: "haiku", host: "h2" }, T0 + 2 * DAY);
+  // Graded at day 3, but the row last changed at day 6.
+  L.observeShadows([{ site: "acme.atlassian.net", host: "h2", id: "sh-00112233aabb",
+    grade: { verdict: "good", at: new Date(T0 + 3 * DAY).toISOString() } }], T0 + 6 * DAY);
+  assert.deepEqual(L.pairEvidence("bug", "haiku", { since: T0 + 4 * DAY, now: T0 + 7 * DAY }),
+    { graded: 0, mOnlyFail: 0 });
+  assert.deepEqual(L.pairEvidence("bug", "haiku", { since: T0 + 3 * DAY, now: T0 + 7 * DAY }),
+    { graded: 1, mOnlyFail: 0 });
+  L._internals.reset();
+});
+
+// A fake pool honouring the rescan's SQL: a total (updated_at DESC, key DESC) order
+// and the tuple DELETE below the last loaded row.
+function orderedPool(table) {
+  const cmp = (a, b) => (Number(a.updated_at) - Number(b.updated_at)) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+  return {
+    health: "ready",
+    async query(sql, params = []) {
+      if (/^CREATE TABLE/.test(sql)) return [];
+      if (/^SELECT doc, key, updated_at .* ORDER BY updated_at DESC, key DESC LIMIT \$1$/.test(sql)) {
+        return [...table.values()].sort((a, b) => cmp(b, a)).slice(0, Number(params[0]));
+      }
+      if (/^INSERT/.test(sql)) {
+        for (let i = 0; i < params.length; i += 3) {
+          table.set(params[i], { key: params[i], updated_at: params[i + 1], doc: params[i + 2] });
+        }
+        return [];
+      }
+      if (/^DELETE .* WHERE \(updated_at, key\) < \(\$1::bigint, \$2::text\)$/.test(sql)) {
+        const bound = { updated_at: params[0], key: params[1] };
+        for (const [k, v] of table) if (cmp(v, bound) < 0) table.delete(k);
+        return [];
+      }
+      if (/^DELETE/.test(sql)) { for (const k of params) table.delete(k); return []; }
+      throw new Error(sql);
+    },
+  };
+}
+
+async function rescanOver(stampOf, extra = 5) {
+  const table = new Map();
+  for (let i = 0; i < L.MAX_ROWS + extra; i++) {
+    const at = stampOf(i);
+    const r = L.sanitizeRow({ site: `o${i % 8}.atlassian.net`, issue: "A-1", host: `h${i % 8}`,
+      sid: `s${i}`, cls: "bug", model: "opus", firstSeen: at, updatedAt: at });
+    table.set(r.key, { key: r.key, updated_at: String(r.updatedAt), doc: JSON.stringify(r) });
+  }
+  L._internals.reset();
+  const store = new L.OutcomeLedgerPgStore(orderedPool(table));
+  L._internals.setBackend(store);
+  await store.rescan(T0 + 1000);
+  await store._drain();
+  const model = new Set(L._internals.rows().keys());
+  await store.close();
+  L._internals.reset();
+  return { table, model };
+}
+
+test("XERK-1858: a rescan deletes table rows past MAX_ROWS the model never loads", async () => {
+  const { table, model } = await rescanOver((i) => T0 + i);
+  assert.equal(model.size, L.MAX_ROWS);
+  assert.equal(table.size, L.MAX_ROWS);
+  for (let i = 0; i < 5; i++) {
+    assert.ok(!table.has(JSON.stringify([`o${i % 8}.atlassian.net`, "A-1", `h${i % 8}`, `s${i}`])));
+  }
+  assert.deepEqual(new Set(table.keys()), model, "the table holds exactly what the model loaded");
+});
+
+test("XERK-1858: the rescan's delete converges when updated_at ties at the page boundary", async () => {
+  // The 20 oldest share one stamp (a sweep commits with one `now`) and straddle the page edge.
+  const { table, model } = await rescanOver((i) => (i < 20 ? T0 : T0 + i));
+  assert.equal(table.size, L.MAX_ROWS);
+  assert.deepEqual(new Set(table.keys()), model);
+});
+
+test("XERK-1858: the rescan's delete converges when every row shares one updated_at", async () => {
+  const { table, model } = await rescanOver(() => T0);
+  assert.equal(table.size, L.MAX_ROWS);
+  assert.deepEqual(new Set(table.keys()), model);
+});
+
+test("XERK-1858: past MAX_ROWS an org drops orphaned shadows first, then a live row WITH its shadows", () => {
+  L._internals.reset();
+  recording();
+  const rows = L._internals.rows();
+  const liveKeys = [];
+  // Live rows two short of the cap, oldest first.
+  const live = L.MAX_ROWS - 2;
+  for (let i = 0; i < live; i++) {
+    const r = L.sanitizeRow({ site: "acme.atlassian.net", issue: `A-${i}`, host: `h${i % 8}`,
+      sid: `s${i}`, cls: "bug", model: "opus", firstSeen: T0 + i, updatedAt: T0 + i });
+    rows.set(r.key, r);
+    liveKeys.push(r.key);
+  }
+  const shadow = (i, pairOf) => {
+    const sh = L.sanitizeRow({ site: "acme.atlassian.net", issue: `A-${i}`, host: `h${i % 8}`,
+      sid: `sh-00112233${String(i).padStart(4, "0")}`, cls: "bug", model: "haiku", kind: "shadow",
+      pairOf, firstSeen: T0 + 100000, updatedAt: T0 + 100000 });
+    rows.set(sh.key, sh);
+    return sh.key;
+  };
+  const oldestPaired = shadow(0, liveKeys[0]);
+  const paired = shadow(5, liveKeys[5]);
+  const orphan = shadow(3, "gone");
+  L._internals.evict(T0 + 200000);
+  assert.ok(!rows.has(orphan), "the orphaned shadow goes first");
+  assert.ok(rows.has(oldestPaired) && rows.has(liveKeys[0]), "one over: nothing paired goes");
+  assert.equal(rows.size, L.MAX_ROWS);
+  // Two over: the OLDEST live row goes, and its shadow with it — never a shadow alone.
+  shadow(6, liveKeys[6]); shadow(7, liveKeys[7]);
+  L._internals.evict(T0 + 200000);
+  assert.ok(!rows.has(liveKeys[0]) && !rows.has(oldestPaired), "the oldest pair goes together");
+  assert.ok(rows.has(paired), "a younger pair stays");
+  assert.equal(rows.size, L.MAX_ROWS, "a two-row unit pays off two rows over: no more is dropped");
+  const left = [...rows.values()];
+  const liveLeft = new Set(left.filter((r) => r.kind !== "shadow").map((r) => r.key));
+  assert.ok(left.filter((r) => r.kind === "shadow").every((r) => liveLeft.has(r.pairOf)), "no orphan left");
+  L._internals.reset();
+});
+
+test("XERK-1858: at the cap a new shadow survives and grades; the oldest live row makes room", () => {
+  L._internals.reset();
+  const log = recording();
+  const rows = L._internals.rows();
+  let newest = null;
+  // Old ended live rows fill MAX_ROWS; the newest is the one sampled for a shadow.
+  for (let i = 0; i < L.MAX_ROWS; i++) {
+    const t = T0 - (L.MAX_ROWS - 1 - i) * 60000;      // a minute apart, the last at T0
+    const r = L.sanitizeRow({ site: "acme.atlassian.net", issue: `I-${i}`, host: `h${i % 8}`, sid: `s${i}`,
+      cls: "bug", model: "opus", firstSeen: t, updatedAt: t, endedAt: t });
+    rows.set(r.key, r);
+    if (i === L.MAX_ROWS - 1) newest = r.key;
+  }
+  const oldest = [...rows.values()].reduce((a, b) => (a.updatedAt <= b.updatedAt ? a : b)).key;
+  L.decideShadow(newest, { sampled: true, at: T0, id: "sh-00112233aabb", model: "haiku", host: "h2" }, T0);
+  for (let tick = 1; tick <= 5; tick++) {
+    L.observeShadows([{ site: "acme.atlassian.net", host: "h2", id: "sh-00112233aabb", state: "running",
+      ...(tick >= 3 ? { grade: { verdict: "good" } } : {}) }], T0 + tick * 15000);
+  }
+  const sh = [...rows.values()].filter((r) => r.kind === "shadow");
+  assert.equal(sh.length, 1, "the shadow is not evicted and re-created each tick");
+  assert.ok(sh[0].grade, "its grade lands");
+  assert.ok(!rows.has(oldest), "the oldest live row made room");
+  assert.deepEqual(L.pairEvidence("bug", "haiku", { now: T0 + 6 * 15000 }), { graded: 1, mOnlyFail: 0 });
+  assert.equal(log.deleted, 1, "one eviction, not one per tick");
+  L._internals.reset();
 });
