@@ -12053,6 +12053,30 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
             sm._read_worktree_members(self._tgz([(f"d{i}", 0, tarfile.DIRTYPE)
                                                  for i in range(40)]))
 
+    def test_the_member_cap_counts_real_members_at_5000(self):
+        # XERK-1858 QA: every `tar.add` member carries its own pax header, so
+        # counting headers refused ~2500 files. Each member here has one (a
+        # float mtime), and only the real members count.
+        sm = self.make_manager()
+        self.assertEqual(ha.MIGRATION_MEMBERS_MAX, 5000)
+
+        def dirs(n):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.PAX_FORMAT) as tar:
+                for i in range(n):
+                    ti = tarfile.TarInfo(f"d{i}")
+                    ti.type, ti.mtime = tarfile.DIRTYPE, 1.5
+                    tar.addfile(ti)
+            return buf.getvalue()
+        at = dirs(5000)
+        with tarfile.open(fileobj=io.BytesIO(at), mode="r:gz") as t:
+            self.assertEqual(t.getmembers()[0].pax_headers.get("mtime"), "1.5")
+        self.assertEqual(sm._read_worktree_members(at), {})
+        dest = tempfile.mkdtemp(dir=self.tmp)
+        sm._unpack_transcript(at, dest)
+        self.assertEqual(len(os.listdir(dest)), 5000)
+        self._both_refuse(sm, dirs(5001), "over 5000 files")
+
     def test_a_beat_side_refusal_is_reported_in_its_own_words(self):
         # XERK-1858 QA: not "unpacking the transcript bundle failed: the
         # migration bundle …" — the refusal IS the reason.

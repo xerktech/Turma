@@ -44,7 +44,8 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
     (GNU `S` and pax `GNU.sparse.*` — its extracted bytes come from the map, which no stream bound
     sees; a 131 B bundle wrote 3 GiB), any global pax header (`g`: tarfile copies it into every
     member), pax/long-name headers past `MIGRATION_EXT_HEADER_MAX` in TOTAL (each read whole into
-    RAM), and over `MIGRATION_MEMBERS_MAX` headers (120k empty dirs held the beat 23 s). The import
+    RAM), and over `MIGRATION_MEMBERS_MAX` (5000) REAL members — extended headers don't count
+    (real bundles hold ≤ ~160; 120k empty dirs held the beat 23 s, 19999 still ~6 s). The import
     thread walks every header first, so the beat only meets them as a backstop.
     `_unpack_transcript` also counts bytes WRITTEN.
 - **Import is STAGE / WORK / FINISH** (XERK-395): `import_session` (beat) validates and reserves a

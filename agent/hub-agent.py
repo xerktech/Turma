@@ -955,11 +955,12 @@ class _BundleRefused(ValueError):
 # reads each one whole into memory, and copies its values into every member it
 # keeps listed; a real one is a path.
 MIGRATION_EXT_HEADER_MAX = 1 << 20
-# The most tar headers a bundle may hold. The beat unpacks every member and
-# tarfile lists them all; 120k empty dirs held the beat 23 s (QA). A real bundle
-# is a transcript, its subagent/workflow records and a few `.worktree/` blobs —
-# untracked files ride INSIDE changes.patch, never as members.
-MIGRATION_MEMBERS_MAX = 20000
+# The most real members (extended headers not counted) a bundle may hold. The
+# beat unpacks every member and tarfile lists them all; 120k empty dirs held the
+# beat 23 s and 19999 still ~6 s (QA). A real bundle is a transcript, its
+# subagent/workflow records and a few `.worktree/` blobs — ~160 members at the
+# most seen; untracked files ride INSIDE changes.patch, never as members.
+MIGRATION_MEMBERS_MAX = 5000
 
 
 class _BundleTarInfo(tarfile.TarInfo):
@@ -967,7 +968,9 @@ class _BundleTarInfo(tarfile.TarInfo):
     body: a global pax header ('g': tarfile copies it into every later member,
     and a bundle never writes one), extended (pax / GNU long-name) headers past
     MIGRATION_EXT_HEADER_MAX in TOTAL, more than MIGRATION_MEMBERS_MAX headers,
-    and every sparse member (GNU 'S' and the pax GNU.sparse.* forms). A sparse
+    and every sparse member (GNU 'S' and the pax GNU.sparse.* forms). Only real
+    members count toward MIGRATION_MEMBERS_MAX: `tar.add` gives most a pax
+    header of their own. A sparse
     member's extracted bytes come from its map, not the stream, so no stream
     bound covers them, and a transcript bundle never needs one. The running
     totals ride on the TarFile, one per bundle read."""
@@ -980,16 +983,17 @@ class _BundleTarInfo(tarfile.TarInfo):
             raise _BundleRefused("the migration bundle holds a sparse file")
         if self.type == tarfile.XGLTYPE:
             raise _BundleRefused("the migration bundle holds a global tar header")
-        seen = getattr(tarfile_, "_turma_headers", 0) + 1
-        tarfile_._turma_headers = seen
-        if seen > MIGRATION_MEMBERS_MAX:
-            raise _BundleRefused(f"the migration bundle holds over "
-                                 f"{MIGRATION_MEMBERS_MAX} files")
         if self.type in self._EXTENDED:
             ext = getattr(tarfile_, "_turma_ext_bytes", 0) + self.size
             tarfile_._turma_ext_bytes = ext
             if ext > MIGRATION_EXT_HEADER_MAX:
                 raise _BundleRefused("the migration bundle holds oversized tar headers")
+        else:
+            seen = getattr(tarfile_, "_turma_members", 0) + 1
+            tarfile_._turma_members = seen
+            if seen > MIGRATION_MEMBERS_MAX:
+                raise _BundleRefused(f"the migration bundle holds over "
+                                     f"{MIGRATION_MEMBERS_MAX} files")
         return super()._proc_member(tarfile_)
 
     def _refuse_sparse(self, *a, **kw):
