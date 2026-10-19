@@ -145,15 +145,15 @@ def body_of(script):
     return re.sub(r"^[;\s]*\n", "", script[len(META):], count=1)
 
 
-def run_body(body):
+def run_body(body, stub="async (p, o) => `${p}:${o && o.model || '-'}`"):
     """Run a script body as Claude Code's Workflow runtime does (2.1.296):
     `async () => {'use strict'; body}` in a vm context with `agent` a context
     global, here one echoing the model it was handed."""
     js = ("const vm = require('vm');"
-          "const ctx = vm.createContext({agent: async (p, o) => `${p}:${o && o.model || '-'}`});"
+          "const ctx = vm.createContext({agent: eval(process.argv[2])});"
           "vm.runInContext(\"(async () => {'use strict';\" + process.argv[1] + \"\\n})()\", ctx)"
           ".then(r => console.log(JSON.stringify(r)), e => { console.error(String(e)); process.exit(1) })")
-    r = subprocess.run(["node", "-e", js, body], capture_output=True, text=True, timeout=30)
+    r = subprocess.run(["node", "-e", js, body, stub], capture_output=True, text=True, timeout=30)
     if r.returncode:
         raise AssertionError(r.stderr)
     return json.loads(r.stdout)
@@ -187,6 +187,17 @@ class TestWorkflowPin(unittest.TestCase):
                 "return [await agent('x', { agentType: 'qa' })]\n")
         _, out = run_main(workflow_call(script=META + body))
         self.assertEqual(run_body(body_of(self.pinned(out, META + body))), ["x:opus"])
+
+    def test_an_inherited_or_getter_agent_type_survives_the_pin(self):
+        # A spread copies only own enumerable props (XERK-1858): the pinned
+        # call must still run as qa, not as the default sub-agent.
+        body = ("\nclass O { get agentType() { return 'qa' } }\n"
+                "return [await agent('a', Object.create({ agentType: 'qa' })),"
+                " await agent('b', new O())]\n")
+        _, out = run_main(workflow_call(script=META + body))
+        stub = "async (p, o) => `${p}:${o.agentType}:${o.model}`"
+        self.assertEqual(run_body(body_of(self.pinned(out, META + body)), stub),
+                         ["a:qa:opus", "b:qa:opus"])
 
     def test_a_non_writable_agent_global_lapses_the_pin_not_the_run(self):
         _, out = run_main(workflow_call(script=SCRIPT))

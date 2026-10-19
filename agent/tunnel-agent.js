@@ -1021,7 +1021,8 @@ const SHELL_DURATION_RE = /^(\d+(?:\.\d+)?|\.\d+)([smhd]?)$/;
 const SHELL_DURATION_UNIT = { "": 1, s: 1, m: 60, h: 3600, d: 86400 };
 const SHELL_DURATION_MAX = 1e9;   // ~31 years: past it, "no literal"
 const SHELL_ENV_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
-const SHELL_REDIR_RE = /^(\d+|&)?(>>?|<<?<?)(&?)(.*)$/;
+// [^\n], never `.`: JS `.` also stops at \r/\u2028/\u2029, where the py twin's does not.
+const SHELL_REDIR_RE = /^(\d+|&)?(>>?|<<?<?)(&?)([^\n]*)$/;
 // Bounded INPUT, like _SHELL_KIND_MAX_CHARS/_WORD: past either it is `work`.
 const SHELL_KIND_MAX_CHARS = 4096;
 const SHELL_KIND_MAX_WORD = 256;
@@ -1144,7 +1145,7 @@ function shellSegments(command) {
       else if ((word.length && "<>".includes(word[word.length - 1])) || (i + 1 < n && s[i + 1] === ">")) {
         word.push(c); inWord = true;   // 2>&1, &>file: a redirection, not a separator
       } else endSeg();
-    } else if (c === " " || c === "\t" || c === "\r") endWord();
+    } else if (c === " " || c === "\t") endWord();   // never \r: bash keeps a CR inside the word
     else { word.push(c); inWord = true; }
   }
   endSeg();

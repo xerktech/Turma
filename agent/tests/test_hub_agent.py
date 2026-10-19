@@ -2477,7 +2477,9 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         ha._gitlab_api_mr_create(('u = "projects/42/merge_requests"\n' + "f(u, 1) " * 300) * 20)
         ha._gitlab_api_mr_create("x = 1\n" + "y " * 300000 + "/projects/x/merge_requests")
         ha._gitlab_api_mr_create(("requests.post(projects/x/merge_requests " + "(" * 500) * 200)
-        self.assertLess(time.thread_time() - t0, 2.0)
+        # Even CPU time stretches on a contended host (2.06s at loadavg 30);
+        # the quadratic version took minutes, so 5s still tells them apart.
+        self.assertLess(time.thread_time() - t0, 5.0)
 
     def test_http_self_hosted_mr_is_attributed(self):
         """XERK-741: a self-hosted GitLab served over plain http on a LAN prints
@@ -11784,6 +11786,77 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         [aside] = glob.glob(sess["worktreePath"] + ".pre-migration-*")
         self.assertEqual(self.read(aside, "local-only.txt"), "do not lose me\n")
 
+    def test_a_move_back_keeps_an_older_copy_holding_ignored_files_aside(self):
+        # XERK-1858: ignored files never ride the bundle, so an older copy that
+        # matches its export digest still holds the only copy of one — from
+        # before the export too, and whatever its mtime.
+        src_wt = self.src_worktree()
+        sess = self.dst_sess()
+        wt = sess["worktreePath"]
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "--detach", wt, "origin/main")
+        self.write(wt, "build/secret.env", "TOKEN=only-here\n")
+        sm = self.make_manager()
+        sm._capture_worktree_state(wt)       # the export mark, as a move away writes it
+        sm._restore_worktree_state(sess, sm._capture_worktree_state(src_wt))
+        self.assert_rebuilt(wt, src_wt)
+        [aside] = glob.glob(wt + ".pre-migration-*")
+        self.assertEqual(self.read(aside, "build/secret.env"), "TOKEN=only-here\n")
+
+    def test_a_move_back_removes_a_copy_holding_only_regenerable_ignored_dirs(self):
+        src_wt = self.src_worktree()
+        sess = self.dst_sess()
+        wt = sess["worktreePath"]
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "--detach", wt, "origin/main")
+        with open(os.path.join(self.git("-C", self.dst_repo, "rev-parse", "--absolute-git-dir"),
+                               "info", "exclude"), "a") as f:
+            f.write("node_modules/\n__pycache__/\n")
+        self.write(wt, "node_modules/x/index.js", "x\n")
+        self.write(wt, "pkg/__pycache__/m.pyc", "x\n")
+        sm = self.make_manager()
+        sm._capture_worktree_state(wt)
+        sm._restore_worktree_state(sess, sm._capture_worktree_state(src_wt))
+        self.assert_rebuilt(wt, src_wt)
+        self.assertEqual(glob.glob(wt + ".pre-migration-*"), [])
+
+    def test_which_ignored_paths_keep_a_copy(self):
+        sm = self.make_manager()
+        rules = "node_modules/\n.venv/\napp/dist/\nbuild/\n*.pyc\n.env*\n/target\n*.key\n*.json\n"
+        for rel, keeps in ((None, False), ("node_modules/a/b.js", False),
+                           ("p/.venv/bin/py", False), ("app/dist/x.js", False),
+                           ("pkg/__pycache__/m.pyc", False),
+                           ("build/out.o", True), ("x.pyc", True), (".env", True),
+                           ("cfg/.env.local", True), ("target", True),
+                           # Only the entry ITSELF being an ignored regenerable dir
+                           # counts, never an ancestor's name (XERK-1858 QA D2).
+                           ("dist/prod.key", True), ("src/target/creds.json", True)):
+            d = tempfile.mkdtemp(dir=self.tmp)
+            self.git("init", "-q", d)
+            self.write(d, ".gitignore", rules)
+            if rel:
+                self.write(d, rel, "x\n")
+            self.assertIs(sm._holds_unregenerable_ignored(d, 15), keeps, rel)
+        # status.showUntrackedFiles=no makes a bare `--ignored` fail (QA D5).
+        d = tempfile.mkdtemp(dir=self.tmp)
+        self.git("init", "-q", d)
+        self.git("-C", d, "config", "status.showUntrackedFiles", "no")
+        self.write(d, ".gitignore", "node_modules/\n")
+        self.write(d, "node_modules/a.js", "x\n")
+        self.assertFalse(sm._holds_unregenerable_ignored(d, 15))
+        # Git failing (not a repo): keep the copy.
+        self.assertTrue(sm._holds_unregenerable_ignored(tempfile.mkdtemp(dir=self.tmp), 15))
+
+    def test_only_compiled_python_in_pycache_is_regenerable(self):
+        # XERK-1858 QA: any file directly in __pycache__/ counted, so an
+        # ignored pkg/__pycache__/x.env went with the copy.
+        sm = self.make_manager()
+        for rel, keeps in (("pkg/__pycache__/m.pyc", False), ("pkg/__pycache__/m.pyo", False),
+                           ("pkg/__pycache__/x.env", True)):
+            d = tempfile.mkdtemp(dir=self.tmp)
+            self.git("init", "-q", d)
+            self.write(d, ".gitignore", "*.pyc\n*.pyo\n*.env\n")
+            self.write(d, rel, "x\n")
+            self.assertIs(sm._holds_unregenerable_ignored(d, 15), keeps, rel)
+
     def test_a_patch_that_does_not_apply_refuses_and_leaves_no_worktree(self):
         src_wt = self.src_worktree()
         sm = self.make_manager()
@@ -11837,6 +11910,184 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "MIGRATION_BLOB_MAX", 1024):
             with self.assertRaisesRegex(ValueError, "size limit"):
                 sm._read_worktree_members(buf.getvalue())
+
+    def test_a_bundle_unpacking_past_the_cap_is_refused_off_the_beat(self):
+        # XERK-1858: the beat's unpack decompresses every member, so a gzip
+        # bomb is refused on the import thread, and the beat's own read stops
+        # at the same cap. Bounded on the DECOMPRESSED stream, never by headers.
+        sm = self.make_manager()
+
+        def bundle(*members, fmt=tarfile.GNU_FORMAT):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz", format=fmt) as tar:
+                for name, size in members:
+                    ti = tarfile.TarInfo(name)
+                    ti.size = size
+                    tar.addfile(ti, io.BytesIO(b"\0" * size))
+            return buf.getvalue()
+
+        def sparse(stored, origsize=10):
+            # A GNU sparse member: tarfile reports `size` as the header's
+            # original size, while skipping it decompresses `stored` bytes.
+            ti = tarfile.TarInfo("t1.jsonl")
+            ti.type, ti.size = tarfile.GNUTYPE_SPARSE, stored
+            hdr = bytearray(ti.tobuf(tarfile.GNU_FORMAT))
+            hdr[483:495] = b"%011o\0" % origsize
+            hdr[148:156] = b" " * 8
+            hdr[148:156] = b"%06o\0 " % sum(hdr)
+            raw = bytes(hdr) + b"\0" * (-(-stored // 512) * 512) + b"\0" * 1024
+            return gzip.compress(raw)
+        with mock.patch.object(sm, "MIGRATION_UNPACK_MAX", 64 << 10):
+            # The sparse member reads as 10 bytes, so a header sum never sees it.
+            with tarfile.open(fileobj=io.BytesIO(sparse(100 << 10)), mode="r:gz") as t:
+                self.assertEqual(t.getmembers()[0].size, 10)
+            dest = os.path.join(self.tmp, "slug")
+            os.makedirs(dest)
+            for big in (bundle((".worktree/x", 100 << 10)), bundle(("t1.jsonl", 100 << 10)),
+                        bundle(*((f"e/{i}", 0) for i in range(200))),   # headers count too
+                        sparse(100 << 10),
+                        bundle(("n" * (100 << 10), 0), fmt=tarfile.PAX_FORMAT)):  # pax header
+                with self.assertRaisesRegex(ValueError, "unpacks to over|sparse"):
+                    sm._read_worktree_members(big)
+                with self.assertRaisesRegex(ValueError, "unpacks to over|sparse"):
+                    sm._unpack_transcript(big, dest)        # the beat's read too
+            self.assertEqual(sm._read_worktree_members(bundle(("t1.jsonl", 32 << 10))), {})
+            sm._unpack_transcript(bundle(("t1.jsonl", 32 << 10)), dest)
+            self.assertEqual(os.path.getsize(os.path.join(dest, "t1.jsonl")), 32 << 10)
+        # Sparse members are refused from the header: their extracted bytes come
+        # from the sparse map, which no stream bound sees (QA D1). GNU 'S'...
+        with self.assertRaisesRegex(ValueError, "sparse"):
+            sm._unpack_transcript(sparse(512, origsize=1 << 20), dest)
+        with self.assertRaisesRegex(ValueError, "sparse"):
+            sm._read_worktree_members(sparse(512, origsize=1 << 20))
+        # ...and the pax GNU.sparse.* forms.
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.PAX_FORMAT) as tar:
+            ti = tarfile.TarInfo("t2.jsonl")
+            ti.size = 10
+            ti.pax_headers = {"GNU.sparse.size": str(1 << 20), "GNU.sparse.map": "0,10"}
+            tar.addfile(ti, io.BytesIO(b"x" * 10))
+        for read in (sm._read_worktree_members, lambda b: sm._unpack_transcript(b, dest)):
+            with self.assertRaisesRegex(ValueError, "sparse"):
+                read(buf.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(dest, "t2.jsonl")))
+        # An extended header past its cap is refused before tarfile reads it
+        # into memory (QA D3) — under the stream cap, so only that check fires.
+        with mock.patch.object(ha, "MIGRATION_EXT_HEADER_MAX", 4096):
+            for fmt in (tarfile.GNU_FORMAT, tarfile.PAX_FORMAT):
+                long_name = bundle(("n" * 8192, 0), fmt=fmt)
+                for read in (sm._read_worktree_members,
+                             lambda b: sm._unpack_transcript(b, dest)):
+                    with self.assertRaisesRegex(ValueError, "oversized tar header"):
+                        read(long_name)
+            sm._read_worktree_members(bundle(("n" * 2048, 0)))   # under it: fine
+        # Bytes WRITTEN are counted too, whatever the stream bound let through.
+        with mock.patch.object(sm, "MIGRATION_UNPACK_MAX", 64 << 10), \
+                mock.patch.object(sm, "_open_bundle", lambda b: tarfile.open(
+                    fileobj=io.BytesIO(b), mode="r:gz")):
+            with self.assertRaisesRegex(ValueError, "unpacks to over"):
+                sm._unpack_transcript(bundle(("t3.jsonl", 100 << 10)), dest)
+        # Not a gzip at all: still tarfile's own error, as r:gz raised it.
+        with self.assertRaises(tarfile.ReadError):
+            sm._read_worktree_members(b"not a bundle")
+        job = {"cmd": {"migrationId": "m1"}, "cwd": "/x", "isRoot": False, "repo": "r"}
+        with mock.patch.object(sm, "MIGRATION_UNPACK_MAX", 64 << 10), \
+                mock.patch.object(sm, "_migration_download",
+                                  return_value=sparse(100 << 10)):
+            sm._import_prepare(job)
+        # Its own reason, not "the moved worktree state is unreadable: …".
+        self.assertTrue(job["error"].startswith("the migration bundle "), job["error"])
+
+    @staticmethod
+    def _tgz(members, fmt=tarfile.PAX_FORMAT, pax_headers=None):
+        """A gzipped tar of (name, size, type) members, zero-filled."""
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz", format=fmt,
+                          pax_headers=pax_headers) as tar:
+            for name, size, kind in members:
+                ti = tarfile.TarInfo(name)
+                ti.type, ti.size = kind, size
+                tar.addfile(ti, io.BytesIO(b"\0" * size) if size else None)
+        return buf.getvalue()
+
+    def _both_refuse(self, sm, blob, reason):
+        """The import thread AND the beat refuse `blob`, the beat writing nothing."""
+        with self.assertRaisesRegex(ValueError, reason):
+            sm._read_worktree_members(blob)
+        dest = tempfile.mkdtemp(dir=self.tmp)
+        with self.assertRaisesRegex(ValueError, reason):
+            sm._unpack_transcript(blob, dest)
+        self.assertEqual(os.listdir(dest), [])
+
+    def test_a_global_pax_header_is_refused(self):
+        # XERK-1858 QA: tarfile copies a 'g' header's values into EVERY later
+        # member it keeps listed — ~1 MiB of 'g' and 500 empty files was a
+        # MemoryError. A bundle never writes one.
+        sm = self.make_manager()
+        blob = self._tgz([("t1.jsonl", 0, tarfile.REGTYPE)], pax_headers={"comment": "x"})
+        self._both_refuse(sm, blob, "global tar header")
+        sm._read_worktree_members(self._tgz([("t1.jsonl", 0, tarfile.REGTYPE)]))
+
+    def test_extended_headers_are_capped_per_bundle_not_per_header(self):
+        # XERK-1858 QA: 60 chained ~1 MiB 'x' headers, each under a per-header
+        # cap, held 265 MiB. The cap is the bundle's TOTAL.
+        sm = self.make_manager()
+        with mock.patch.object(ha, "MIGRATION_EXT_HEADER_MAX", 4096):
+            for fmt in (tarfile.PAX_FORMAT, tarfile.GNU_FORMAT):
+                many = self._tgz([(f"{i}" + "n" * 1000, 0, tarfile.REGTYPE)
+                                  for i in range(10)], fmt=fmt)
+                self._both_refuse(sm, many, "oversized tar headers")
+                sm._read_worktree_members(self._tgz(
+                    [(f"{i}" + "n" * 1000, 0, tarfile.REGTYPE) for i in range(3)], fmt=fmt))
+
+    def test_a_bundle_with_too_many_members_is_refused_off_the_beat(self):
+        # XERK-1858 QA: 120k empty dirs (an 840 KB blob) held the beat 23 s.
+        sm = self.make_manager()
+        with mock.patch.object(ha, "MIGRATION_MEMBERS_MAX", 50):
+            blob = self._tgz([(f"d{i}", 0, tarfile.DIRTYPE) for i in range(60)])
+            self._both_refuse(sm, blob, "over 50 files")
+            job = {"cmd": {"migrationId": "m1"}, "cwd": "/x", "isRoot": False, "repo": "r"}
+            with mock.patch.object(sm, "_migration_download", return_value=blob):
+                sm._import_prepare(job)
+            self.assertEqual(job["error"], "the migration bundle holds over 50 files")
+            sm._read_worktree_members(self._tgz([(f"d{i}", 0, tarfile.DIRTYPE)
+                                                 for i in range(40)]))
+
+    def test_the_member_cap_counts_real_members_at_5000(self):
+        # XERK-1858 QA: every `tar.add` member carries its own pax header, so
+        # counting headers refused ~2500 files. Each member here has one (a
+        # float mtime), and only the real members count.
+        sm = self.make_manager()
+        self.assertEqual(ha.MIGRATION_MEMBERS_MAX, 5000)
+
+        def dirs(n):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.PAX_FORMAT) as tar:
+                for i in range(n):
+                    ti = tarfile.TarInfo(f"d{i}")
+                    ti.type, ti.mtime = tarfile.DIRTYPE, 1.5
+                    tar.addfile(ti)
+            return buf.getvalue()
+        at = dirs(5000)
+        with tarfile.open(fileobj=io.BytesIO(at), mode="r:gz") as t:
+            self.assertEqual(t.getmembers()[0].pax_headers.get("mtime"), "1.5")
+        self.assertEqual(sm._read_worktree_members(at), {})
+        dest = tempfile.mkdtemp(dir=self.tmp)
+        sm._unpack_transcript(at, dest)
+        self.assertEqual(len(os.listdir(dest)), 5000)
+        self._both_refuse(sm, dirs(5001), "over 5000 files")
+
+    def test_a_beat_side_refusal_is_reported_in_its_own_words(self):
+        # XERK-1858 QA: not "unpacking the transcript bundle failed: the
+        # migration bundle …" — the refusal IS the reason.
+        sm = self.make_manager()
+        with mock.patch.object(ha, "MIGRATION_MEMBERS_MAX", 5):
+            blob = self._tgz([(f"d{i}", 0, tarfile.DIRTYPE) for i in range(10)])
+            job = {"cmd": {"migrationId": "m1", "transcriptId": "t1", "cmdId": "c1"},
+                   "cwd": os.path.join(self.tmp, "wt"), "blob": blob}
+            with mock.patch.object(sm, "_refuse_start") as refuse:
+                sm._finish_import(job)
+        self.assertEqual(refuse.call_args[0][0], "the migration bundle holds over 5 files")
 
     def test_lfs_content_is_refused_rather_than_left_behind(self):
         pointer = ("version https://git-lfs.github.com/spec/v1\n"
@@ -13407,9 +13658,12 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
         a hub cache that counts against that host's record ceiling — an 8 MiB
         one would wedge the host's control plane."""
         sm = self._manager()
-        sm._refuse_start("x" * 100000, cmd_id="c1")
+        with mock.patch.object(ha, "log") as log:
+            sm._refuse_start("x" * 100000, cmd_id="c1")
         self.assertEqual(len(sm.spawn_failures[0]["error"]),
                          ha.SPAWN_FAILURE_REASON_MAX)
+        # The log line too (XERK-1858): a bundle member's name can be 60 MB.
+        self.assertLess(len(log.call_args[0][0]), ha.SPAWN_FAILURE_REASON_MAX + 100)
 
     def test_the_staged_list_is_bounded(self):
         sm = self._manager()
@@ -28825,6 +29079,24 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
             with self.assertRaises(ha.GitTimeout):
                 ha.repo_cheap_facts(d, strict=True)
 
+    def test_a_worktree_removed_mid_read_is_no_answer(self):
+        """XERK-1858: a dir removed between `status` and the branch read must
+        not publish a "" branch beside the real dirty count."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        real = subprocess.run
+        real(["git", "init", "-q", d], check=True)
+
+        def vanish(cmd, **kw):
+            if "--abbrev-ref" in cmd:
+                shutil.rmtree(d)
+            return real(cmd, **kw)
+        with mock.patch.object(ha.subprocess, "run", side_effect=vanish):
+            with self.assertRaises(ha.GitTimeout):
+                ha.git_info_cheap(d, strict=True)
+        # The next read finds it gone.
+        self.assertIsNone(ha.git_info_cheap(d, strict=True))
+
     def test_a_fast_failure_still_reports_the_worktree_gone(self):
         """Only a TIMEOUT is kept: a worktree whose directory is gone answers at
         once, and that must read as gone — a marker of its own since XERK-1887
@@ -43154,12 +43426,19 @@ class TestTtydUnixSocket(unittest.TestCase):
         old.poll.side_effect = [None, None, None, 0, 0, 0]  # exits after 3 looks
         sm.ttyd["s1"] = old
         sess = self._sess(ttydPid=4242)
+        # time.sleep is the process-wide one: count only THIS thread's naps,
+        # or another thread's loop under load inflates the count.
+        me, naps = threading.get_ident(), []
+
+        def nap(s):
+            if threading.get_ident() == me:
+                naps.append(s)
         with mock.patch.object(sm, "_kill_ttyd"), \
              mock.patch.object(ha, "_port_open", return_value=False), \
-             mock.patch.object(ha.time, "sleep") as sleep, \
+             mock.patch.object(ha.time, "sleep", side_effect=nap), \
              mock.patch.object(ha.os, "kill") as kill:
             sm._kill_and_await_ttyd(sess)
-        self.assertEqual(sleep.call_count, 3)
+        self.assertEqual(len(naps), 3)
         kill.assert_not_called()
 
     def test_a_ttyd_that_will_not_exit_is_sigkilled(self):
@@ -47480,6 +47759,20 @@ class TestReworkSignalsReachTheWire(ManagerMixin, unittest.TestCase):
         self.assertTrue(ha.session_report(self.tmp, st, session_id="s1",
                                           claude_sid=sid).get("qaPartial"))
 
+    def test_a_raise_over_an_empty_transcript_is_still_qa_complete(self):
+        # XERK-1858: nothing was skipped, so the scan reads from byte 0 and the
+        # raise must not latch qaPartial on every later beat.
+        sid = "abababab-abab-4bab-8bab-abababababab"
+        self._pinned(sid, [])
+        st = {}
+        with mock.patch.object(ha, "transcript_tail", side_effect=TypeError("x")):
+            with self.assertRaises(TypeError):
+                ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        self.assertIs(st.get("qaComplete"), True)
+        self._pinned(sid, [_qa_call("t1"), _qa_launched("t1", "a1")])
+        self.assertFalse(ha.session_report(self.tmp, st, session_id="s1",
+                                           claude_sid=sid).get("qaPartial"))
+
     def test_a_pinned_transcript_not_written_yet_beside_neighbours_is_qa_complete(self):
         self._pinned("99999999-9999-4999-8999-999999999999", [_qa_call("t9")])
         st = {}
@@ -48421,6 +48714,7 @@ class TestDefectAttribution(unittest.TestCase):
             self.assertFalse(ha._defect_is_test_path(p), p)
         self.assertEqual(ha._defect_ticket_keys("XERK-12: fix AB#34 and XERK-12"),
                          ["XERK-12", "34"])
+        self.assertEqual(ha._defect_ticket_keys("XERK-7: patch CVE-2013-4476"), ["XERK-7"])
 
 
 class TestDefectReportsWire(ManagerMixin, unittest.TestCase):
@@ -48508,6 +48802,8 @@ class TestDefectForgeAndTracker(unittest.TestCase):
                 raise ha.BoardHttpError("HTTP 404: Issue does not exist", 404)
             if path.endswith("/BAD-1"):
                 raise ha.BoardHttpError("HTTP 400: bad key", 400)
+            if path.endswith("/HIDE-1"):
+                raise ha.BoardHttpError("HTTP 403: forbidden", 403)
             if path.endswith("/DOWN-1"):
                 raise ha.BoardHttpError("HTTP 503: down", 503)
             if path.endswith("/AUTH-1"):
@@ -48520,6 +48816,13 @@ class TestDefectForgeAndTracker(unittest.TestCase):
                 mock.patch.object(ha, "jira_get", side_effect=get):
             self.assertEqual(ha._defect_tracker_classes(["XERK-1", "NOPE-1", "BAD-1"]),
                              {"XERK-1": "bug", "NOPE-1": "other", "BAD-1": "other"})
+            # A 403 reads "other" for this commit but is never cached
+            # (XERK-1858): a transient permission fault must not stick.
+            classes = {}
+            mgr = mock.Mock(jira={"tickets": []})
+            out = ha.SessionManager._defect_classify(mgr, ["XERK-1", "HIDE-1", "NOPE-1"], classes)
+            self.assertEqual(out, {"XERK-1": "bug", "HIDE-1": "other", "NOPE-1": "other"})
+            self.assertEqual(classes, {"XERK-1": "bug", "NOPE-1": "other"})
             # A server or auth failure, or a timeout, says nothing about the
             # ticket: it raises so the scan retries that commit.
             for key in ("DOWN-1", "AUTH-1"):

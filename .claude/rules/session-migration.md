@@ -36,6 +36,18 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
   touched** (`_unsafe_patch_reason`). `git apply` reads a `copy from` path as-is, absolute included
   — an arbitrary-file read (QA-proven). Capture uses `--no-renames`, so a real patch never has one.
   `_read_worktree_members` bounds every member (gzip bomb); `_unpack_transcript` never extracts them.
+- **Every bundle read goes through `_open_bundle`**, whose DECOMPRESSED stream stops at
+  `MIGRATION_UNPACK_MAX` (`_BoundedGzip`): the beat's `_unpack_transcript` decompresses through every
+  member, `.worktree/` ones included, at ~0.5 s/GiB, so the import thread refuses a bomb first.
+  - Never bound it from tar headers' `size`: a sparse member's is its attacker-chosen original size.
+  - `_BundleTarInfo` refuses from the header, before tarfile reads the body: every sparse member
+    (GNU `S` and pax `GNU.sparse.*` — its extracted bytes come from the map, which no stream bound
+    sees; a 131 B bundle wrote 3 GiB), any global pax header (`g`: tarfile copies it into every
+    member), pax/long-name headers past `MIGRATION_EXT_HEADER_MAX` in TOTAL (each read whole into
+    RAM), and over `MIGRATION_MEMBERS_MAX` (5000) REAL members — extended headers don't count
+    (real bundles hold ≤ ~160; 120k empty dirs held the beat 23 s, 19999 still ~6 s). The import
+    thread walks every header first, so the beat only meets them as a backstop.
+    `_unpack_transcript` also counts bytes WRITTEN.
 - **Import is STAGE / WORK / FINISH** (XERK-395): `import_session` (beat) validates and reserves a
   slot + shields the cwd from prune (`_imports_inflight`); an import thread downloads and runs
   `_restore_worktree_state`; `_apply_imports_landed` (full beats only) unpacks the transcript,
@@ -52,6 +64,14 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
   - A move BACK finds the old copy at the same path. Export writes the state's digest into the
     source's gitdir (`MIGRATION_EXPORT_MARK`); an old copy still matching it (or clean at an ancestor)
     is removed, anything else detached and renamed to `<cwd>.pre-migration-<ts>`, never deleted.
+  - Ignored files never ride the bundle and neither the digest nor `status` sees them, so the old
+    copy holds the ONLY one: it is kept aside unless every `--ignored=matching` entry is itself an
+    ignored `MIGRATION_REGENERABLE_DIRS` dir (`!! a/node_modules/`) or a `.pyc`/`.pyo` directly in
+    `__pycache__/` (`_holds_unregenerable_ignored`; git failing reads "keep").
+    - Never by an ancestor's name (`!! dist/prod.key` with dist/ not ignored was deleted, QA), never
+      by mtime (pre-export files, mtime-preserving edits), never a walk. Keep the allowlist narrow.
+    - Accepted gap: what sits INSIDE an ignored regenerable dir (`dist/.env.production` under an
+      ignored `dist/`) is one collapsed entry, so it goes with the copy.
   - A bundle without `.worktree/` (older source, hub restore-pack) forks fresh from the default.
     Residual: an OLDER target extracts `.worktree/` into its slug dir and drops the work (source
     keeps it). Tests: `TestMigrateWorktreeState` (real git, two clones).

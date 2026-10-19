@@ -945,6 +945,94 @@ ARCHIVE_PAYLOAD_MAX = _byte_ceiling(
 # large sessions; the guard is a backstop, not an expected limit (XERK-101).
 MIGRATION_BLOB_MAX = _env_int("TURMA_MIGRATION_BLOB_MAX", 1 << 26)  # 64 MiB
 
+
+class _BundleRefused(ValueError):
+    """A migration bundle this agent will not unpack — its own operator-facing
+    reason, never prefixed as if one part of it were unreadable."""
+
+
+# The most pax / GNU long-name header bytes a WHOLE bundle may carry. tarfile
+# reads each one whole into memory, and copies its values into every member it
+# keeps listed; a real one is a path.
+MIGRATION_EXT_HEADER_MAX = 1 << 20
+# The most real members (extended headers not counted) a bundle may hold. The
+# beat unpacks every member and tarfile lists them all; 120k empty dirs held the
+# beat 23 s and 19999 still ~6 s (QA). A real bundle is a transcript, its
+# subagent/workflow records and a few `.worktree/` blobs — ~160 members at the
+# most seen; untracked files ride INSIDE changes.patch, never as members.
+MIGRATION_MEMBERS_MAX = 5000
+
+
+class _BundleTarInfo(tarfile.TarInfo):
+    """TarInfo that refuses, from the header alone and before tarfile reads the
+    body: a global pax header ('g': tarfile copies it into every later member,
+    and a bundle never writes one), extended (pax / GNU long-name) headers past
+    MIGRATION_EXT_HEADER_MAX in TOTAL, more than MIGRATION_MEMBERS_MAX headers,
+    and every sparse member (GNU 'S' and the pax GNU.sparse.* forms). Only real
+    members count toward MIGRATION_MEMBERS_MAX: `tar.add` gives most a pax
+    header of their own. A sparse
+    member's extracted bytes come from its map, not the stream, so no stream
+    bound covers them, and a transcript bundle never needs one. The running
+    totals ride on the TarFile, one per bundle read."""
+
+    _EXTENDED = (tarfile.XHDTYPE, tarfile.SOLARIS_XHDTYPE,
+                 tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK)
+
+    def _proc_member(self, tarfile_):
+        if self.type == tarfile.GNUTYPE_SPARSE:
+            raise _BundleRefused("the migration bundle holds a sparse file")
+        if self.type == tarfile.XGLTYPE:
+            raise _BundleRefused("the migration bundle holds a global tar header")
+        if self.type in self._EXTENDED:
+            ext = getattr(tarfile_, "_turma_ext_bytes", 0) + self.size
+            tarfile_._turma_ext_bytes = ext
+            if ext > MIGRATION_EXT_HEADER_MAX:
+                raise _BundleRefused("the migration bundle holds oversized tar headers")
+        else:
+            seen = getattr(tarfile_, "_turma_members", 0) + 1
+            tarfile_._turma_members = seen
+            if seen > MIGRATION_MEMBERS_MAX:
+                raise _BundleRefused(f"the migration bundle holds over "
+                                     f"{MIGRATION_MEMBERS_MAX} files")
+        return super()._proc_member(tarfile_)
+
+    def _refuse_sparse(self, *a, **kw):
+        raise _BundleRefused("the migration bundle holds a sparse file")
+
+    _proc_gnusparse_00 = _proc_gnusparse_01 = _proc_gnusparse_10 = _refuse_sparse
+
+
+class _BoundedGzip(gzip.GzipFile):
+    """A read-only GzipFile that raises ValueError rather than decompress past
+    `cap` bytes — checked BEFORE a read or a forward seek does the work, so a
+    huge request (a pax header's length) never allocates either."""
+
+    def __init__(self, cap, **kw):
+        super().__init__(**kw)
+        self._cap = cap
+
+    def _over(self):
+        raise _BundleRefused(f"the migration bundle unpacks to over {self._cap >> 20} MiB")
+
+    def read(self, size=-1):
+        room = self._cap - self.tell()
+        if size is None or size < 0:
+            data = super().read(room + 1)
+            if len(data) > room:
+                self._over()
+            return data
+        if size > room:
+            self._over()
+        return super().read(size)
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        # Never self.tell() here: IOBase.tell IS seek(0, SEEK_CUR).
+        target = offset if whence == io.SEEK_SET else (
+            super().seek(0, io.SEEK_CUR) + offset if whence == io.SEEK_CUR else None)
+        if target is not None and target > self._cap:
+            self._over()
+        return super().seek(offset, whence)
+
 # How many staged session-start refusals (XERK-265) a beat may carry, and how
 # long one reason may be. Neither is a normal limit — a refusal only exists where
 # a command was declined, and the reasons are one line. They are here because the
@@ -6842,17 +6930,21 @@ def git_info_cheap(cwd, strict=False):
     read timed out — what the heartbeat's cache (_cheap_read) needs to keep its
     last real answer through a disk stall — and GitUnreadable when git answered
     with a failure in a directory that still exists (XERK-1887). None then
-    means only that `cwd` is gone."""
+    means only that `cwd` is gone. A `cwd` removed between the status and
+    branch reads also raises GitTimeout — no answer this beat; the next read
+    reports it gone — never a "" branch beside a real dirty count."""
     if strict:
         if not _strict_git(["git", "rev-parse", "--git-dir"], cwd,
                            fail_is_unknown=True, missing_is_gone=True):
             return None
         dirty = _strict_git(["git", "status", "--porcelain"], cwd,
                             fail_is_unknown=True)
-        return {
-            "branch": _strict_git(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd),
-            "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
-        }
+        branch = _strict_git(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd)
+        if not branch and cwd and not os.path.isdir(cwd):
+            # Removed between `status` and this read: no answer, never a
+            # one-beat "" branch beside a real dirty count (XERK-1858).
+            raise GitTimeout("rev-parse --abbrev-ref")
+        return {"branch": branch, "dirtyFiles": len(dirty.splitlines()) if dirty else 0}
     if not run(["git", "rev-parse", "--git-dir"], cwd=cwd):
         return None
     dirty = run(["git", "status", "--porcelain"], cwd=cwd)
@@ -8627,7 +8719,9 @@ def _defect_is_test_path(path):
 def _defect_ticket_keys(subject):
     """Ticket keys a commit subject names: Jira-style keys and ADO `AB#<n>`."""
     s = subject or ""
-    keys = _JIRA_KEY_RE.findall(s) + _ADO_KEY_RE.findall(s)
+    # A CVE id ("CVE-2013-4476") reads as key CVE-2013: never a ticket.
+    keys = [k for k in _JIRA_KEY_RE.findall(s) if not k.startswith("CVE-")]
+    keys += _ADO_KEY_RE.findall(s)
     return list(dict.fromkeys(keys))[:5]
 
 
@@ -8857,11 +8951,12 @@ def _defect_landing(repo, sha, tip, first_parents):
     return None
 
 
-def _defect_tracker_classes(keys):
+def _defect_tracker_classes(keys, uncached=None):
     """{key: work class} from the configured tracker for ticket keys the board
     cache did not answer. A key the tracker does not know reads "other"; any
     other failure RAISES, so the scan retries that commit rather than skipping a
-    fix it could not classify."""
+    fix it could not classify. A 403 key also lands in `uncached`: a transient
+    permission fault must not pin it to "other" for good."""
     out = {}
     jira_keys = [k for k in keys if _JIRA_KEY_RE.fullmatch(k)]
     ado_ids = [k for k in keys if k.isdigit()]
@@ -8876,6 +8971,8 @@ def _defect_tracker_classes(keys):
                 # ticket; retrying it would stall the repo's scan for good.
                 if getattr(e, "code", None) in (400, 403, 404):
                     out[k] = "other"
+                    if e.code == 403 and uncached is not None:
+                        uncached.add(k)
                     continue
                 raise
             t = ((data or {}).get("fields") or {}).get("issuetype") or {}
@@ -11010,6 +11107,7 @@ _SHELL_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?|\.\d+)([smhd]?)\Z", re.ASCII)
 _SHELL_DURATION_UNIT = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 _SHELL_DURATION_MAX = 10 ** 9   # ~31 years: past it, "no literal"
 _SHELL_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=", re.ASCII)
+# `.` stops only at \n; the JS mirror spells it [^\n] (its `.` also stops at \r).
 _SHELL_REDIR_RE = re.compile(r"^(\d+|&)?(>>?|<<?<?)(&?)(.*)\Z", re.ASCII)
 # The classifier runs on the BEAT (XERK-395), so its INPUT is bounded, not just
 # guarded against raising: a command longer than this, or with any word longer
@@ -11181,7 +11279,7 @@ def _shell_segments(command):
                 in_word = True
             else:
                 end_seg()
-        elif c in (" ", "\t", "\r"):
+        elif c in (" ", "\t"):   # never \r: bash keeps a CR inside the word
             end_word()
         else:
             word.append(c)
@@ -19136,6 +19234,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
             # Not written yet: it will be scanned from its first byte.
             state["qaComplete"] = True
         return _finish()
+    if not primed and not offsets.get(newest, 0):
+        # Nothing before the prime to skip: it is read from byte 0 whatever
+        # raises below, so a raise must not latch a false qaPartial (XERK-1858).
+        state["qaComplete"] = True
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
     report["tail"] = transcript_tail(newest)
     if not primed:
@@ -30050,6 +30152,9 @@ class SessionManager:
         A refusal with neither handle is logged only: `cmdId`/`migrationId` are
         the correlation, and a malformed migration id (the very field being
         rejected) has nothing to report against."""
+        # Bounded before the log too: a reason can carry a bundle's member name
+        # (an OSError's path), and a hostile one is megabytes long.
+        reason = str(reason)[:SPAWN_FAILURE_REASON_MAX]
         log(f"{context} refused: {reason}")
         if not cmd_id and not migration_id:
             return
@@ -30520,6 +30625,9 @@ class SessionManager:
             state = self._read_worktree_members(blob)
         except tarfile.TarError:
             return   # not a bundle at all: the beat's unpack says so
+        except _BundleRefused as e:
+            job["error"] = str(e)
+            return
         except Exception as e:
             job["error"] = f"the moved worktree state is unreadable: {e}"
             return
@@ -30628,7 +30736,8 @@ class SessionManager:
             # A partial unpack may already have written the transcript, whose
             # pre-move turns the source still reports.
             self._mark_imported_usage(transcript_id, slug, own_until)
-            refuse(f"unpacking the transcript bundle failed: {e}")
+            refuse(str(e) if isinstance(e, _BundleRefused)
+                   else f"unpacking the transcript bundle failed: {e}")
             return
         self._mark_imported_usage(transcript_id, slug, own_until)
         extra = {
@@ -30793,9 +30902,11 @@ class SessionManager:
         store_prefix = DSH_STORE_ARCNAME + "/"
         qwen_prefix = QWEN_STORE_ARCNAME + "/"
         wt_prefix = WORKTREE_STATE_ARCNAME + "/"
-        buf = io.BytesIO(blob)
-        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+        written = 0
+        with self._open_bundle(blob) as tar:
             for m in tar.getmembers():
+                if m.issparse():
+                    raise _BundleRefused("the migration bundle holds a sparse file")
                 parts = m.name.split("/")
                 if m.name.startswith("/") or os.path.isabs(m.name) or ".." in parts:
                     raise ValueError(f"unsafe tar member {m.name!r}")
@@ -30828,8 +30939,15 @@ class SessionManager:
                     src = tar.extractfile(m)
                     if src is None:
                         continue
+                    # Counted as WRITTEN, not as read: belt to the stream bound.
                     with src, open(out, "wb") as f:
-                        shutil.copyfileobj(src, f)
+                        while chunk := src.read(1 << 20):
+                            written += len(chunk)
+                            if written > self.MIGRATION_UNPACK_MAX:
+                                raise _BundleRefused(
+                                    f"the migration bundle unpacks to over "
+                                    f"{self.MIGRATION_UNPACK_MAX >> 20} MiB")
+                            f.write(chunk)
                 # anything else (symlink/device/fifo) is silently skipped
 
     def _reconcile_dsh_store_cwd(self, store_dir, cwd):
@@ -31110,14 +31228,38 @@ class SessionManager:
                 pass   # costs only a kept-aside copy on a later move back
         return out
 
+    # The most a bundle may unpack to. The beat's _unpack_transcript
+    # decompresses through EVERY member (~0.5 s/GiB), so the import thread
+    # refuses a bundle past this before the beat ever sees it, and the beat's
+    # own read stops there too.
+    MIGRATION_UNPACK_MAX = 1 << 31   # 2 GiB: ~1 s on the beat, 32x the 64 MiB blob cap
+
+    def _open_bundle(self, blob):
+        """tarfile over a migration bundle whose DECOMPRESSED stream is bounded
+        by MIGRATION_UNPACK_MAX (_BoundedGzip) and whose sparse members and
+        oversized extended headers are refused from their header
+        (_BundleTarInfo). Never judge the size from tar headers' `size`: a
+        sparse member's is its attacker-chosen original size."""
+        f = _BoundedGzip(self.MIGRATION_UNPACK_MAX, fileobj=io.BytesIO(blob), mode="rb")
+        try:
+            tar = tarfile.open(fileobj=f, mode="r:", tarinfo=_BundleTarInfo)
+        except (OSError, EOFError) as e:   # as tarfile's own r:gz says it
+            f.close()
+            raise tarfile.ReadError("not a gzip file") from e
+        tar._extfileobj = False   # close() closes the GzipFile, as r:gz does
+        return tar
+
     def _read_worktree_members(self, blob):
         """The `.worktree/` members of a migration bundle, name -> bytes. Only
         the known names; each bounded by MIGRATION_BLOB_MAX (a gzip bomb must
-        not balloon the agent) and the whole set too."""
+        not balloon the agent) and the whole set too. Walking it also bounds
+        the whole bundle (_open_bundle), off the beat."""
         out, total = {}, 0
         prefix = WORKTREE_STATE_ARCNAME + "/"
-        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+        with self._open_bundle(blob) as tar:
             for m in tar:
+                if m.issparse():
+                    raise _BundleRefused("the migration bundle holds a sparse file")
                 if not m.name.startswith(prefix):
                     continue
                 rel = m.name[len(prefix):]
@@ -31317,6 +31459,10 @@ class SessionManager:
             redundant = rc_s == 0 and not dirty and rc_h == 0 and (
                 old == head or run_out(["git", "-C", repo, "merge-base",
                                         "--is-ancestor", old, head], timeout=t)[0] == 0)
+        if redundant and self._holds_unregenerable_ignored(cwd, t):
+            # Ignored files never ride the bundle and neither the digest nor
+            # `status` sees them: this copy holds the only one (a local .env).
+            redundant = False
         if redundant:
             run_ok(["git", "-C", repo, "worktree", "remove", "--force", cwd], timeout=t)
             if os.path.lexists(cwd):
@@ -31340,6 +31486,42 @@ class SessionManager:
             run(["git", "-C", repo, "worktree", "repair", aside])
         log(f"migration: kept the older worktree at {cwd} as {aside}")
         return aside
+
+    # Ignored dirs a build or install re-creates: the only ignored paths an
+    # older copy may hold and still be removed. Narrow on purpose — anything
+    # else (a .env, a local config, a `build/` with who knows what) keeps it.
+    MIGRATION_REGENERABLE_DIRS = frozenset((
+        "node_modules", "__pycache__", ".venv", "venv", "target", "dist", ".gradle",
+        ".next", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"))
+
+    def _holds_unregenerable_ignored(self, cwd, timeout):
+        """True when `git status --ignored=matching` lists an ignored entry that
+        is not regenerable. Regenerable is only an entry that IS an ignored dir
+        named in MIGRATION_REGENERABLE_DIRS (`!! a/node_modules/`), or a .pyc/.pyo
+        directly in a `__pycache__/` — never a file merely under such a name
+        (`!! dist/prod.key`, where dist/ itself is not ignored).
+        `matching`, never `traditional`: that one reports an untracked dir holding
+        only ignored files (`pkg/` for `pkg/__pycache__/`) as itself ignored. A
+        matched dir is one entry, never walked — so what sits INSIDE an ignored
+        regenerable dir (a `dist/.env.production` under an ignored `dist/`) is
+        not seen and goes with it. `-unormal` overrides a status.showUntrackedFiles
+        =no config, which makes `--ignored` fail. Git failing reads True, which
+        only keeps a copy aside."""
+        rc, out = run_out(["git", "-C", cwd, "status", "--porcelain", "--ignored=matching",
+                           "-unormal", "-z"], timeout=timeout)
+        if rc != 0:
+            return True
+        for e in out.split("\0"):
+            if not e.startswith("!! "):
+                continue
+            parts = e[3:].rstrip("/").split("/")
+            if e.endswith("/") and parts[-1] in self.MIGRATION_REGENERABLE_DIRS:
+                continue
+            if not e.endswith("/") and len(parts) > 1 and parts[-2] == "__pycache__" \
+                    and parts[-1].endswith((".pyc", ".pyo")):
+                continue
+            return True
+        return False
 
     # A bundle is the largest thing an agent ever sends, so it is the body most
     # likely to meet the hub's in-flight budget (XERK-258) and be told 503 "busy,
@@ -35539,10 +35721,11 @@ class SessionManager:
                 if k in board:
                     out[k] = str(board[k]).strip().lower()
                     missing.remove(k)
+        uncached = set()
         if missing:
-            out.update(_defect_tracker_classes(missing))
+            out.update(_defect_tracker_classes(missing, uncached))
         for k in keys:
-            if k in out:
+            if k in out and k not in uncached:
                 classes[k] = out[k]
         return out
 
