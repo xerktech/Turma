@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ANSWER_MASK_MS, App, FLASH_ANSWERED, FLASH_HUB_UNREACHABLE, FLASH_QUEUED, HEARD_NOTHING, newSessionState } from "./app.ts";
+import { ANSWER_MASK_MS, App, FLASH_ANSWERED, FLASH_HUB_UNREACHABLE, FLASH_QUEUED, HEARD_NOTHING, MAX_DRAFTS, newSessionState } from "./app.ts";
 import type { HubClient } from "./hub-client.ts";
 import type { GlassesDisplay } from "./display/index.ts";
 import type { Dictation, DictationResult } from "./dictation.ts";
@@ -1051,7 +1051,7 @@ describe("App", () => {
       expect(draftOf(app)).toBe("for A");
     });
 
-    it("follows its session to a new host, and is dropped once no host lists the session", async () => {
+    it("follows its session to a new host, and outlives a poll that lists the session nowhere", async () => {
       fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] }), agent({ key: "B" })];
       const app = await boot();
       app.enterSession("s1");
@@ -1066,7 +1066,7 @@ describe("App", () => {
       app.enterSession("s2"); // stash it again, under B
       fleet = [agent({ key: "A", sessions: [session({ id: "s2" })] }), agent({ key: "B" })];
       await poll();
-      expect(app.getState().drafts).toEqual({});
+      expect(Object.values(app.getState().drafts).map((d) => d.text)).toEqual(["moving"]);
     });
 
     it("stays stashed while a question is pending, so the sheet shows and Send can't answer with it", async () => {
@@ -1185,21 +1185,67 @@ describe("App", () => {
       expect(app.getState().session?.hostKey).toBe("A");
     });
 
-    it("keeps drafts through an empty fleet or an offline host; drops them once their online host stops listing them", async () => {
+    it("absence from a poll never deletes a draft: empty fleet, offline host, online host omitting it", async () => {
       fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
       const app = await boot();
       app.enterSession("s1");
       dictate("keep me");
-      app.enterSession("s2");
-      fleet = []; // a hub that just restarted
+      app.enterSession("s2"); // s1's draft stashed, s1 not on screen
+      for (const gap of [
+        [], // a hub that just restarted
+        [agent({ key: "A", online: false, sessions: [] })],
+        [agent({ key: "A", sessions: [session({ id: "s2" })] })], // an online host's short beat
+      ]) {
+        fleet = gap;
+        await poll();
+        expect(Object.values(app.getState().drafts).map((d) => d.text)).toEqual(["keep me"]);
+      }
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
+      await poll();
+      app.enterSession("s1");
+      expect(draftOf(app)).toBe("keep me");
+    });
+
+    it("an online host omitting the held session, then a migration gap, keeps the held draft", async () => {
+      const { app } = await heldBehindQuestion();
+      const ask = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      fleet = [agent({ key: "A", sessions: [session({ id: "s2" })] })]; // A omits s1 one poll
       await poll();
       expect(Object.keys(app.getState().drafts)).toHaveLength(1);
-      fleet = [agent({ key: "A", online: false, sessions: [] })];
+      expect(draftOf(app)).toBe("");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s2" })] }), agent({ key: "B" })]; // moving, B not yet
       await poll();
       expect(Object.keys(app.getState().drafts)).toHaveLength(1);
-      fleet = [agent({ key: "A", sessions: [session({ id: "s2" })] })];
+      fleet = [agent({ key: "A", sessions: [session({ id: "s2" })] }), agent({ key: "B", sessions: [session({ id: "s1", session: ask })] })];
       await poll();
-      expect(app.getState().drafts).toEqual({});
+      expect(Object.keys(app.getState().drafts)).toHaveLength(1);
+      app.enterSession("s1", "B");
+      expect(draftOf(app)).toBe(""); // question still pending on B: sheet first
+      fleet = [agent({ key: "A", sessions: [session({ id: "s2" })] }), agent({ key: "B", sessions: [session({ id: "s1" })] })];
+      await poll();
+      expect(draftOf(app)).toBe("held note");
+    });
+
+    it(`keeps at most ${MAX_DRAFTS} drafts, evicting the least recently stashed, never the session being entered`, async () => {
+      const ids = Array.from({ length: MAX_DRAFTS + 2 }, (_, i) => `d${i}`);
+      fleet = [agent({ key: "A", sessions: ids.map((id) => session({ id })) })];
+      const app = await boot();
+      for (const id of ids.slice(0, MAX_DRAFTS + 1)) {
+        app.enterSession(id);
+        dictate(`text ${id}`);
+      }
+      const texts = () => Object.values(app.getState().drafts).map((d) => d.text);
+      expect(texts()).toHaveLength(MAX_DRAFTS); // d0..d31; d32 on screen
+      // Leaving d32 for d0 puts the stash one past the bound: d0 is the oldest
+      // but the one being entered, so d1 goes instead.
+      app.enterSession("d0");
+      expect(draftOf(app)).toBe("text d0");
+      expect(texts()).not.toContain("text d1");
+      expect(texts()).toContain("text d2");
+      expect(texts()).toContain(`text d${MAX_DRAFTS}`);
+      app.enterSession(ids[MAX_DRAFTS + 1]!); // d0 back in: now the newest
+      expect(texts()).toHaveLength(MAX_DRAFTS);
+      expect(texts().at(-1)).toBe("text d0");
     });
 
     it("a new draft left beside a held one joins it, never replaces it, and is never doubled", async () => {
@@ -1209,9 +1255,12 @@ describe("App", () => {
       app.enterSession("s1");
       dictate("held note");
       app.enterSession("s2");
+      dictate("s2 note");
       fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking }), session({ id: "s2" })] })];
       await poll();
       app.enterSession("s1"); // sheet shows; "held note" stays held
+      const order = () => Object.values(app.getState().drafts).map((d) => d.sessionId);
+      expect(order()).toEqual(["s1", "s2"]);
       // Dictate a fresh draft through the sheet's last row, then leave twice
       // over (home, then another session) without sending.
       for (let i = 0; i < 5; i++) display.emit({ type: "scrollDown" });
@@ -1223,6 +1272,7 @@ describe("App", () => {
       for (let i = 0; i < 10; i++) display.emit({ type: "scrollDown" });
       display.emit({ type: "tap" }); // Home
       expect(app.getState().screen).toBe("home");
+      expect(order()).toEqual(["s2", "s1"]); // the join is the newest stash: last to be evicted
       app.enterSession("s2");
       fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
       await poll();

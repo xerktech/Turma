@@ -89,5 +89,7 @@ paths:
     so a second stash of the same left session neither replaces nor doubles it.
   - `takeDraft`/`stashDraft` rewrite `state.drafts`: call them BEFORE spreading `this.state`, or
     the stale stash survives and a sent draft returns on every poll.
-  - Pruned only by an ONLINE host that no longer lists the id; an empty fleet keeps them all.
+  - Bounded by COUNT only (`MAX_DRAFTS`, least recently stashed out, never the session being
+    entered). A poll not listing a session (hub restart, migration gap, short beat) is no proof
+    it's gone, so absence never deletes or releases a draft.
   - Tests: `app.test.ts` "kept drafts (XERK-1858)".

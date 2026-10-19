@@ -265,7 +265,7 @@ export interface AppState {
   loadingHistory: Record<string, boolean>;
   // Unsent dictated drafts of sessions the wearer left (keyed by `draftKey`),
   // put back when that session is entered again. Leaving is not a Clear.
-  // Pruned on poll once no host lists the session.
+  // At most MAX_DRAFTS, least recently stashed evicted first.
   drafts: Record<string, { hostKey: string; sessionId: string; text: string }>;
 
   home: HomeScreenState;
@@ -316,6 +316,9 @@ export function createInitialState(now: number): AppState {
 export function findAgent(state: AppState, hostKey: string): AgentInfo | undefined {
   return state.agents.find((a) => a.key === hostKey);
 }
+
+// How many left sessions' drafts the stash keeps (see App.stashDraft).
+export const MAX_DRAFTS = 32;
 
 // JSON, not "<host>:<id>": either part may itself contain a ':'.
 function draftKey(hostKey: string, sessionId: string): string {
@@ -549,7 +552,7 @@ export class App {
   // state, carrying the draft the wearer left it with. The current session's
   // own draft is stashed first, so switching straight across loses nothing.
   private reenterSession(hostKey: string, sessionId: string): SessionScreenState {
-    this.stashDraft();
+    this.stashDraft(this.draftKeyFor(hostKey, sessionId));
     return this.takeDraft(newSessionState(hostKey, sessionId));
   }
 
@@ -583,19 +586,28 @@ export class App {
 
   // Keeps the on-screen session's unsent draft for its next entry. A draft
   // still held back for a question is kept too: the new one joins after it.
-  private stashDraft(): void {
+  // The stash is bounded by count alone, least recently stashed out first:
+  // a session missing from a poll (a hub restart, a migration gap, a host's
+  // short beat) is no proof it's gone, so absence never deletes a draft.
+  // `keep` (the session being entered) is never the one evicted.
+  private stashDraft(keep?: string): void {
     const s = this.state.session;
     if (!s?.draft) return;
-    const held = this.state.drafts[draftKey(s.hostKey, s.sessionId)]?.text;
+    const key = draftKey(s.hostKey, s.sessionId);
+    const held = this.state.drafts[key]?.text;
     const text = held ? `${held} ${s.draft}` : s.draft;
-    const entry = { hostKey: s.hostKey, sessionId: s.sessionId, text };
+    // Re-inserted last: key order is stash order.
+    const { [key]: _old, ...drafts } = this.state.drafts;
+    drafts[key] = { hostKey: s.hostKey, sessionId: s.sessionId, text };
+    const keys = Object.keys(drafts);
+    for (let i = 0, n = keys.length; n > MAX_DRAFTS && i < keys.length; i++) {
+      if (keys[i] === keep || keys[i] === key) continue;
+      delete drafts[keys[i]!];
+      n--;
+    }
     // Moved, not copied: a second stash of the same left session (home, then
     // entering another) must not join the draft to itself.
-    this.state = {
-      ...this.state,
-      session: { ...s, draft: "" },
-      drafts: { ...this.state.drafts, [draftKey(s.hostKey, s.sessionId)]: entry },
-    };
+    this.state = { ...this.state, session: { ...s, draft: "" }, drafts };
   }
 
   private schedulePoll(delayMs: number, prefetched?: Promise<AgentsResponse>): void {
@@ -861,20 +873,6 @@ export class App {
         // takeDraft rewrites state.drafts: read state only after it returns.
         const session = this.takeDraft(this.state.session);
         this.state = { ...this.state, session };
-      }
-      // Forget the drafts of sessions no host lists any more, judged only by
-      // hosts this poll listed online: an empty fleet (a hub restart) or an
-      // offline host is no evidence the session is gone.
-      const listed = new Set(sessionRefs.map((r) => r.session.id));
-      const seen = new Set(agentsNow.filter((a) => a.online).map((a) => a.key));
-      const stale = Object.keys(this.state.drafts).filter((k) => {
-        const d = this.state.drafts[k]!;
-        return seen.has(d.hostKey) && !listed.has(d.sessionId);
-      });
-      if (stale.length) {
-        const drafts = { ...this.state.drafts };
-        for (const k of stale) delete drafts[k];
-        this.state = { ...this.state, drafts };
       }
       this.repaint();
     } catch (err: unknown) {
