@@ -98,10 +98,12 @@ export HOME="$WORK/home"
 export REPOS_ROOT="$WORK/home/git"
 mkdir -p "$REPOS_ROOT"
 
-# Wait (up to ~5s) for a condition rather than sleeping a fixed guess: run the
+# Wait (up to ~15s) for a condition rather than sleeping a fixed guess: run the
 # given command until it succeeds. The predicates below are invoked through it.
+# Every caller waits for something that SHOULD happen, so the budget costs only
+# a failing run; 5s missed a manager start on a loaded hosted runner.
 wait_for() {  # <command> [args...]
-  for _ in $(seq 1 50); do
+  for _ in $(seq 1 150); do
     if "$@" 2>/dev/null; then return 0; fi
     sleep 0.1
   done

@@ -19142,6 +19142,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
             # Not written yet: it will be scanned from its first byte.
             state["qaComplete"] = True
         return _finish()
+    if not primed and not offsets.get(newest, 0):
+        # Nothing before the prime to skip: it is read from byte 0 whatever
+        # raises below, so a raise must not latch a false qaPartial (XERK-1858).
+        state["qaComplete"] = True
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
     report["tail"] = transcript_tail(newest)
     if not primed:

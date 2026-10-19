@@ -47480,6 +47480,20 @@ class TestReworkSignalsReachTheWire(ManagerMixin, unittest.TestCase):
         self.assertTrue(ha.session_report(self.tmp, st, session_id="s1",
                                           claude_sid=sid).get("qaPartial"))
 
+    def test_a_raise_over_an_empty_transcript_is_still_qa_complete(self):
+        # XERK-1858: nothing was skipped, so the scan reads from byte 0 and the
+        # raise must not latch qaPartial on every later beat.
+        sid = "abababab-abab-4bab-8bab-abababababab"
+        self._pinned(sid, [])
+        st = {}
+        with mock.patch.object(ha, "transcript_tail", side_effect=TypeError("x")):
+            with self.assertRaises(TypeError):
+                ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        self.assertIs(st.get("qaComplete"), True)
+        self._pinned(sid, [_qa_call("t1"), _qa_launched("t1", "a1")])
+        self.assertFalse(ha.session_report(self.tmp, st, session_id="s1",
+                                           claude_sid=sid).get("qaPartial"))
+
     def test_a_pinned_transcript_not_written_yet_beside_neighbours_is_qa_complete(self):
         self._pinned("99999999-9999-4999-8999-999999999999", [_qa_call("t9")])
         st = {}
