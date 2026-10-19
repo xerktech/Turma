@@ -161,6 +161,11 @@ export interface SessionScreenState {
   mic: MicState;
   viewOffset: number; // scroll within a tall bottom box
   selected: number; // highlighted sheet option (AskUserQuestion)
+  // The question the draft is a free-text answer to ("Dictate answer…"),
+  // absent for an ordinary draft. Decides what a question arriving does to it.
+  // Cleared by the first poll listing the session with no question, so an
+  // abandoned "Dictate answer…" can't tag a later ordinary draft.
+  answerFor?: string;
 }
 
 // Every transition into the session screen builds its SessionScreenState
@@ -608,6 +613,31 @@ export class App {
     this.state = { ...this.state, session: { ...s, draft: "" }, drafts };
   }
 
+  // A question just arrived on (or replaced the one on) the open session.
+  // Its box draft must not hide the sheet, nor go out as an answer the wearer
+  // never chose to give (XERK-2095):
+  // - an answer dictated for this very question (it re-arrived after a poll
+  //   that didn't list it) stays, so Send still answers with it;
+  // - an answer dictated for another question is dropped: it answers nothing
+  //   now, and held or restored it would go out as an ordinary prompt;
+  // - an ordinary draft is held back like a re-entry one, and the poll's
+  //   takeDraft returns it once the question clears.
+  // An actions menu open over the draft goes back to the session, where the
+  // sheet now shows: its Send/Clear rows just vanished from under the cursor.
+  private holdDraftFrom(question: string): void {
+    const s = this.state.session;
+    if (!s?.draft || s.answerFor === question) return;
+    if (s.answerFor !== undefined) {
+      this.state = { ...this.state, session: { ...s, draft: "", answerFor: undefined, viewOffset: 0 } };
+    } else {
+      this.stashDraft(draftKey(s.hostKey, s.sessionId));
+    }
+    const a = this.state.actions;
+    if (this.state.screen === "actions" && a?.hostKey === s.hostKey && a.sessionId === s.sessionId) {
+      this.state = { ...this.state, screen: "session" };
+    }
+  }
+
   private schedulePoll(delayMs: number, prefetched?: Promise<AgentsResponse>): void {
     // While paused, only keep polling inside a post-mutation grace window.
     if (this.paused && this.now() >= this.graceUntil) return;
@@ -856,6 +886,7 @@ export class App {
           if (sess.mic === "recording" || sess.mic === "finalising") this.dictation.cancel();
           const mic = sess.mic === "recording" || sess.mic === "finalising" ? "idle" : sess.mic;
           this.state = { ...this.state, session: { ...sess, mic, selected: 0 } };
+          this.holdDraftFrom(nowQuestion);
         } else if (nowQuestion && prevQuestion && nowQuestion !== prevQuestion) {
           // A *different* question replaced the one already pending on this
           // session — the highlight must not carry over onto the new
@@ -864,6 +895,13 @@ export class App {
           // digit, but the highlight itself would still point at the wrong row
           // until the user scrolls. Reset it, edge-triggered like the arrival.
           this.state = { ...this.state, session: { ...sess, selected: 0 } };
+          this.holdDraftFrom(nowQuestion);
+        } else if (live && !nowQuestion && this.state.session.answerFor !== undefined) {
+          // Listed with no question: it was answered (here, the phone, the
+          // web) or withdrawn, so what's in the box answers nothing now — an
+          // ordinary draft from here on, and so is the next one dictated. A
+          // poll not listing the session is no proof, so `live` gates it.
+          this.state = { ...this.state, session: { ...this.state.session, answerFor: undefined } };
         }
       }
       // A draft held back while a question was pending comes back once it clears.
@@ -1180,7 +1218,7 @@ export class App {
       // starts: the sheet can now be reached from transcript focus (onSession
       // delegates here on a pending question), and the input-mode box that
       // takes over once a draft lands only receives gestures at focus "bottom".
-      this.toggleBoxDictation({ ...s, focus: "bottom" });
+      this.toggleBoxDictation({ ...s, focus: "bottom", answerFor: live?.session?.question ?? undefined });
     }
   }
 
