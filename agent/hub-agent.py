@@ -946,6 +946,39 @@ ARCHIVE_PAYLOAD_MAX = _byte_ceiling(
 MIGRATION_BLOB_MAX = _env_int("TURMA_MIGRATION_BLOB_MAX", 1 << 26)  # 64 MiB
 
 
+class _BundleRefused(ValueError):
+    """A migration bundle this agent will not unpack — its own operator-facing
+    reason, never prefixed as if one part of it were unreadable."""
+
+
+# The largest pax / GNU long-name header a bundle may carry. tarfile reads one
+# whole into memory before anything can judge it; a real one is a path.
+MIGRATION_EXT_HEADER_MAX = 1 << 20
+
+
+class _BundleTarInfo(tarfile.TarInfo):
+    """TarInfo that refuses, from the header alone and before tarfile reads the
+    body: an extended (pax / GNU long-name) header over MIGRATION_EXT_HEADER_MAX,
+    and every sparse member (GNU 'S' and the pax GNU.sparse.* forms). A sparse
+    member's extracted bytes come from its map, not the stream, so no stream
+    bound covers them, and a transcript bundle never needs one."""
+
+    _EXTENDED = (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE,
+                 tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK)
+
+    def _proc_member(self, tarfile_):
+        if self.type == tarfile.GNUTYPE_SPARSE:
+            raise _BundleRefused("the migration bundle holds a sparse file")
+        if self.type in self._EXTENDED and self.size > MIGRATION_EXT_HEADER_MAX:
+            raise _BundleRefused("the migration bundle holds an oversized tar header")
+        return super()._proc_member(tarfile_)
+
+    def _refuse_sparse(self, *a, **kw):
+        raise _BundleRefused("the migration bundle holds a sparse file")
+
+    _proc_gnusparse_00 = _proc_gnusparse_01 = _proc_gnusparse_10 = _refuse_sparse
+
+
 class _BoundedGzip(gzip.GzipFile):
     """A read-only GzipFile that raises ValueError rather than decompress past
     `cap` bytes — checked BEFORE a read or a forward seek does the work, so a
@@ -956,7 +989,7 @@ class _BoundedGzip(gzip.GzipFile):
         self._cap = cap
 
     def _over(self):
-        raise ValueError(f"the bundle unpacks to over {self._cap >> 20} MiB")
+        raise _BundleRefused(f"the migration bundle unpacks to over {self._cap >> 20} MiB")
 
     def read(self, size=-1):
         room = self._cap - self.tell()
@@ -30096,6 +30129,9 @@ class SessionManager:
         A refusal with neither handle is logged only: `cmdId`/`migrationId` are
         the correlation, and a malformed migration id (the very field being
         rejected) has nothing to report against."""
+        # Bounded before the log too: a reason can carry a bundle's member name
+        # (an OSError's path), and a hostile one is megabytes long.
+        reason = str(reason)[:SPAWN_FAILURE_REASON_MAX]
         log(f"{context} refused: {reason}")
         if not cmd_id and not migration_id:
             return
@@ -30566,6 +30602,9 @@ class SessionManager:
             state = self._read_worktree_members(blob)
         except tarfile.TarError:
             return   # not a bundle at all: the beat's unpack says so
+        except _BundleRefused as e:
+            job["error"] = str(e)
+            return
         except Exception as e:
             job["error"] = f"the moved worktree state is unreadable: {e}"
             return
@@ -30839,8 +30878,11 @@ class SessionManager:
         store_prefix = DSH_STORE_ARCNAME + "/"
         qwen_prefix = QWEN_STORE_ARCNAME + "/"
         wt_prefix = WORKTREE_STATE_ARCNAME + "/"
+        written = 0
         with self._open_bundle(blob) as tar:
             for m in tar.getmembers():
+                if m.issparse():
+                    raise _BundleRefused("the migration bundle holds a sparse file")
                 parts = m.name.split("/")
                 if m.name.startswith("/") or os.path.isabs(m.name) or ".." in parts:
                     raise ValueError(f"unsafe tar member {m.name!r}")
@@ -30873,8 +30915,15 @@ class SessionManager:
                     src = tar.extractfile(m)
                     if src is None:
                         continue
+                    # Counted as WRITTEN, not as read: belt to the stream bound.
                     with src, open(out, "wb") as f:
-                        shutil.copyfileobj(src, f)
+                        while chunk := src.read(1 << 20):
+                            written += len(chunk)
+                            if written > self.MIGRATION_UNPACK_MAX:
+                                raise _BundleRefused(
+                                    f"the migration bundle unpacks to over "
+                                    f"{self.MIGRATION_UNPACK_MAX >> 20} MiB")
+                            f.write(chunk)
                 # anything else (symlink/device/fifo) is silently skipped
 
     def _reconcile_dsh_store_cwd(self, store_dir, cwd):
@@ -31163,13 +31212,13 @@ class SessionManager:
 
     def _open_bundle(self, blob):
         """tarfile over a migration bundle whose DECOMPRESSED stream is bounded
-        by MIGRATION_UNPACK_MAX (_BoundedGzip). Never judge the size from tar
-        headers: a GNU sparse member's `size` is its attacker-chosen original
-        size, not the bytes skipping it decompresses, and a long-name/pax header
-        is read whole into memory."""
+        by MIGRATION_UNPACK_MAX (_BoundedGzip) and whose sparse members and
+        oversized extended headers are refused from their header
+        (_BundleTarInfo). Never judge the size from tar headers' `size`: a
+        sparse member's is its attacker-chosen original size."""
         f = _BoundedGzip(self.MIGRATION_UNPACK_MAX, fileobj=io.BytesIO(blob), mode="rb")
         try:
-            tar = tarfile.open(fileobj=f, mode="r:")
+            tar = tarfile.open(fileobj=f, mode="r:", tarinfo=_BundleTarInfo)
         except (OSError, EOFError) as e:   # as tarfile's own r:gz says it
             f.close()
             raise tarfile.ReadError("not a gzip file") from e
@@ -31185,6 +31234,8 @@ class SessionManager:
         prefix = WORKTREE_STATE_ARCNAME + "/"
         with self._open_bundle(blob) as tar:
             for m in tar:
+                if m.issparse():
+                    raise _BundleRefused("the migration bundle holds a sparse file")
                 if not m.name.startswith(prefix):
                     continue
                 rel = m.name[len(prefix):]
@@ -31420,25 +31471,31 @@ class SessionManager:
         ".next", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"))
 
     def _holds_unregenerable_ignored(self, cwd, timeout):
-        """True when `git status --ignored=matching` lists an ignored path that is
-        not inside MIGRATION_REGENERABLE_DIRS, or names a `.env*` anywhere.
+        """True when `git status --ignored=matching` lists an ignored entry that
+        is not regenerable. Regenerable is only an entry that IS an ignored dir
+        named in MIGRATION_REGENERABLE_DIRS (`!! a/node_modules/`), or a file
+        directly in a `__pycache__/` — never a file merely under such a name
+        (`!! dist/prod.key`, where dist/ itself is not ignored).
         `matching`, never `traditional`: that one reports an untracked dir holding
         only ignored files (`pkg/` for `pkg/__pycache__/`) as itself ignored. A
-        matched dir is one entry, never walked. Git failing reads True, which
+        matched dir is one entry, never walked — so what sits INSIDE an ignored
+        regenerable dir (a `dist/.env.production` under an ignored `dist/`) is
+        not seen and goes with it. `-unormal` overrides a status.showUntrackedFiles
+        =no config, which makes `--ignored` fail. Git failing reads True, which
         only keeps a copy aside."""
         rc, out = run_out(["git", "-C", cwd, "status", "--porcelain", "--ignored=matching",
-                           "-z"], timeout=timeout)
+                           "-unormal", "-z"], timeout=timeout)
         if rc != 0:
             return True
         for e in out.split("\0"):
             if not e.startswith("!! "):
                 continue
             parts = e[3:].rstrip("/").split("/")
-            if any(p.startswith(".env") for p in parts):
-                return True
-            if not any(p in self.MIGRATION_REGENERABLE_DIRS for p in parts[:-1]) and \
-                    not (e.endswith("/") and parts[-1] in self.MIGRATION_REGENERABLE_DIRS):
-                return True
+            if e.endswith("/") and parts[-1] in self.MIGRATION_REGENERABLE_DIRS:
+                continue
+            if not e.endswith("/") and len(parts) > 1 and parts[-2] == "__pycache__":
+                continue
+            return True
         return False
 
     # A bundle is the largest thing an agent ever sends, so it is the body most

@@ -11820,17 +11820,28 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
 
     def test_which_ignored_paths_keep_a_copy(self):
         sm = self.make_manager()
-        rules = "node_modules/\n.venv/\ndist/\nbuild/\n*.pyc\n.env*\ntarget\n"
+        rules = "node_modules/\n.venv/\napp/dist/\nbuild/\n*.pyc\n.env*\n/target\n*.key\n*.json\n"
         for rel, keeps in ((None, False), ("node_modules/a/b.js", False),
                            ("p/.venv/bin/py", False), ("app/dist/x.js", False),
+                           ("pkg/__pycache__/m.pyc", False),
                            ("build/out.o", True), ("x.pyc", True), (".env", True),
-                           ("cfg/.env.local", True), ("target", True)):
+                           ("cfg/.env.local", True), ("target", True),
+                           # Only the entry ITSELF being an ignored regenerable dir
+                           # counts, never an ancestor's name (XERK-1858 QA D2).
+                           ("dist/prod.key", True), ("src/target/creds.json", True)):
             d = tempfile.mkdtemp(dir=self.tmp)
             self.git("init", "-q", d)
             self.write(d, ".gitignore", rules)
             if rel:
                 self.write(d, rel, "x\n")
             self.assertIs(sm._holds_unregenerable_ignored(d, 15), keeps, rel)
+        # status.showUntrackedFiles=no makes a bare `--ignored` fail (QA D5).
+        d = tempfile.mkdtemp(dir=self.tmp)
+        self.git("init", "-q", d)
+        self.git("-C", d, "config", "status.showUntrackedFiles", "no")
+        self.write(d, ".gitignore", "node_modules/\n")
+        self.write(d, "node_modules/a.js", "x\n")
+        self.assertFalse(sm._holds_unregenerable_ignored(d, 15))
         # Git failing (not a repo): keep the copy.
         self.assertTrue(sm._holds_unregenerable_ignored(tempfile.mkdtemp(dir=self.tmp), 15))
 
@@ -11924,13 +11935,46 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
                         bundle(*((f"e/{i}", 0) for i in range(200))),   # headers count too
                         sparse(100 << 10),
                         bundle(("n" * (100 << 10), 0), fmt=tarfile.PAX_FORMAT)):  # pax header
-                with self.assertRaisesRegex(ValueError, "unpacks to over"):
+                with self.assertRaisesRegex(ValueError, "unpacks to over|sparse"):
                     sm._read_worktree_members(big)
-                with self.assertRaisesRegex(ValueError, "unpacks to over"):
+                with self.assertRaisesRegex(ValueError, "unpacks to over|sparse"):
                     sm._unpack_transcript(big, dest)        # the beat's read too
             self.assertEqual(sm._read_worktree_members(bundle(("t1.jsonl", 32 << 10))), {})
             sm._unpack_transcript(bundle(("t1.jsonl", 32 << 10)), dest)
             self.assertEqual(os.path.getsize(os.path.join(dest, "t1.jsonl")), 32 << 10)
+        # Sparse members are refused from the header: their extracted bytes come
+        # from the sparse map, which no stream bound sees (QA D1). GNU 'S'...
+        with self.assertRaisesRegex(ValueError, "sparse"):
+            sm._unpack_transcript(sparse(512, origsize=1 << 20), dest)
+        with self.assertRaisesRegex(ValueError, "sparse"):
+            sm._read_worktree_members(sparse(512, origsize=1 << 20))
+        # ...and the pax GNU.sparse.* forms.
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.PAX_FORMAT) as tar:
+            ti = tarfile.TarInfo("t2.jsonl")
+            ti.size = 10
+            ti.pax_headers = {"GNU.sparse.size": str(1 << 20), "GNU.sparse.map": "0,10"}
+            tar.addfile(ti, io.BytesIO(b"x" * 10))
+        for read in (sm._read_worktree_members, lambda b: sm._unpack_transcript(b, dest)):
+            with self.assertRaisesRegex(ValueError, "sparse"):
+                read(buf.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(dest, "t2.jsonl")))
+        # An extended header past its cap is refused before tarfile reads it
+        # into memory (QA D3) — under the stream cap, so only that check fires.
+        with mock.patch.object(ha, "MIGRATION_EXT_HEADER_MAX", 4096):
+            for fmt in (tarfile.GNU_FORMAT, tarfile.PAX_FORMAT):
+                long_name = bundle(("n" * 8192, 0), fmt=fmt)
+                for read in (sm._read_worktree_members,
+                             lambda b: sm._unpack_transcript(b, dest)):
+                    with self.assertRaisesRegex(ValueError, "oversized tar header"):
+                        read(long_name)
+            sm._read_worktree_members(bundle(("n" * 2048, 0)))   # under it: fine
+        # Bytes WRITTEN are counted too, whatever the stream bound let through.
+        with mock.patch.object(sm, "MIGRATION_UNPACK_MAX", 64 << 10), \
+                mock.patch.object(sm, "_open_bundle", lambda b: tarfile.open(
+                    fileobj=io.BytesIO(b), mode="r:gz")):
+            with self.assertRaisesRegex(ValueError, "unpacks to over"):
+                sm._unpack_transcript(bundle(("t3.jsonl", 100 << 10)), dest)
         # Not a gzip at all: still tarfile's own error, as r:gz raised it.
         with self.assertRaises(tarfile.ReadError):
             sm._read_worktree_members(b"not a bundle")
@@ -11939,7 +11983,8 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
                 mock.patch.object(sm, "_migration_download",
                                   return_value=sparse(100 << 10)):
             sm._import_prepare(job)
-        self.assertIn("unpacks to over", job["error"])
+        # Its own reason, not "the moved worktree state is unreadable: …".
+        self.assertTrue(job["error"].startswith("the migration bundle "), job["error"])
 
     def test_lfs_content_is_refused_rather_than_left_behind(self):
         pointer = ("version https://git-lfs.github.com/spec/v1\n"
@@ -13510,9 +13555,12 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
         a hub cache that counts against that host's record ceiling — an 8 MiB
         one would wedge the host's control plane."""
         sm = self._manager()
-        sm._refuse_start("x" * 100000, cmd_id="c1")
+        with mock.patch.object(ha, "log") as log:
+            sm._refuse_start("x" * 100000, cmd_id="c1")
         self.assertEqual(len(sm.spawn_failures[0]["error"]),
                          ha.SPAWN_FAILURE_REASON_MAX)
+        # The log line too (XERK-1858): a bundle member's name can be 60 MB.
+        self.assertLess(len(log.call_args[0][0]), ha.SPAWN_FAILURE_REASON_MAX + 100)
 
     def test_the_staged_list_is_bounded(self):
         sm = self._manager()
