@@ -28825,6 +28825,24 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
             with self.assertRaises(ha.GitTimeout):
                 ha.repo_cheap_facts(d, strict=True)
 
+    def test_a_worktree_removed_mid_read_is_no_answer(self):
+        """XERK-1858: a dir removed between `status` and the branch read must
+        not publish a "" branch beside the real dirty count."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        real = subprocess.run
+        real(["git", "init", "-q", d], check=True)
+
+        def vanish(cmd, **kw):
+            if "--abbrev-ref" in cmd:
+                shutil.rmtree(d)
+            return real(cmd, **kw)
+        with mock.patch.object(ha.subprocess, "run", side_effect=vanish):
+            with self.assertRaises(ha.GitTimeout):
+                ha.git_info_cheap(d, strict=True)
+        # The next read finds it gone.
+        self.assertIsNone(ha.git_info_cheap(d, strict=True))
+
     def test_a_fast_failure_still_reports_the_worktree_gone(self):
         """Only a TIMEOUT is kept: a worktree whose directory is gone answers at
         once, and that must read as gone — a marker of its own since XERK-1887

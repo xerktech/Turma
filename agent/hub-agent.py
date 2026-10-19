@@ -6849,10 +6849,12 @@ def git_info_cheap(cwd, strict=False):
             return None
         dirty = _strict_git(["git", "status", "--porcelain"], cwd,
                             fail_is_unknown=True)
-        return {
-            "branch": _strict_git(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd),
-            "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
-        }
+        branch = _strict_git(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd)
+        if not branch and cwd and not os.path.isdir(cwd):
+            # Removed between `status` and this read: no answer, never a
+            # one-beat "" branch beside a real dirty count (XERK-1858).
+            raise GitTimeout("rev-parse --abbrev-ref")
+        return {"branch": branch, "dirtyFiles": len(dirty.splitlines()) if dirty else 0}
     if not run(["git", "rev-parse", "--git-dir"], cwd=cwd):
         return None
     dirty = run(["git", "status", "--porcelain"], cwd=cwd)
