@@ -656,6 +656,27 @@ class ProseTest {
         assertEquals(" y", plain(after.spans))
     }
 
+    // XERK-1858: the table pass trims with JS's whitespace, as chat.js splitRow does.
+    // Kotlin's trim() kept a leading U+FEFF, so the row read "﻿|1|2" as three
+    // cells and dropped "2" (web: cells 1, 2), and a FEFF-led header was no table.
+    @Test fun `a table row or header led by U+FEFF keeps every cell, as on the web`() {
+        val row = tables("| a | b |\n|---|---|\n﻿| 1 | 2 |").single()
+        assertEquals(listOf("1", "2"), row.rows.single().map { plain(it) })
+        val head = tables("﻿| a | b |\n|---|---|\n| 1 | 2 |").single()
+        assertEquals(listOf("a", "b"), head.header.map { plain(it) })
+        // A cell padded with U+FEFF trims to its content.
+        val cell = tables("| a | b |\n|---|---|\n| ﻿1﻿ | 2 |").single()
+        assertEquals("1", plain(cell.rows.single()[0]))
+    }
+
+    // chat.js renders a bare `>` line as an EMPTY blockquote (not text): same here.
+    @Test fun `a line that is only a quote marker is an empty quote, not text`() {
+        assertEquals(listOf(ProseBlock.Quote(emptyList())), parseProse(">"))
+        val mid = parseProse("a\n>\nb")
+        assertEquals(ProseBlock.Quote(emptyList()), mid[1])
+        assertEquals(3, mid.size)
+    }
+
     // Expose parseInline for the linkify/inline-code cases (it's file-private).
     private fun parseInlineOnly(text: String): List<Span> = paras(text).single().spans
 }

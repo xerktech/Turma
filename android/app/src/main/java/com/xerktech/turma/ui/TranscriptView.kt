@@ -12,10 +12,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -60,7 +58,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.constrainHeight
+import androidx.compose.ui.unit.constrainWidth
+import kotlin.math.roundToInt
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -319,9 +322,11 @@ private fun ProseBlocks(
             // block-parsed in turn (so a list inside a quote is still a list).
             is ProseBlock.Quote -> Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
                 Box(Modifier.fillMaxHeight().width(2.dp).background(color.copy(alpha = 0.30f)))
+                // The web's 1px top/bottom padding too, so a bare `>` line still
+                // draws its (short) rule, as the web's empty blockquote does.
                 ProseBlocks(
                     blocks = block.blocks,
-                    modifier = Modifier.padding(start = 8.dp),
+                    modifier = Modifier.padding(start = 8.dp, top = 1.dp, bottom = 1.dp),
                     fontSize = fontSize,
                     lineHeight = lineHeight,
                     color = color.copy(alpha = 0.85f),
@@ -420,7 +425,11 @@ private fun ProseImage(model: Any, alt: String, svg: Boolean) {
     var ratio by remember(model) { mutableStateOf<Float?>(null) }
     var natural by remember(model) { mutableStateOf(0.dp) }
     var failed by remember(model) { mutableStateOf(false) }
+    var empty by remember(model) { mutableStateOf(false) }
     var showFull by remember(model) { mutableStateOf(false) }
+    // A zero-area image (an SVG declaring width="0", see SafeSvgDecoder) draws
+    // nothing on the web, so it takes no room here either.
+    if (empty) return
     if (failed) {
         Text(
             "🖼 " + alt.ifBlank { "image" },
@@ -433,14 +442,15 @@ private fun ProseImage(model: Any, alt: String, svg: Boolean) {
     val shape = RoundedCornerShape(6.dp)
     val r = ratio
     val size = if (r == null) Modifier.fillMaxWidth().height(120.dp)
-        else Modifier.widthIn(max = natural).heightIn(max = PROSE_IMAGE_MAX_HEIGHT).aspectRatio(r)
+        else Modifier.proseImageSize(r, natural, PROSE_IMAGE_MAX_HEIGHT)
     AsyncImage(
         model = model,
         contentDescription = alt.ifBlank { "image" },
         contentScale = ContentScale.Fit,
         onSuccess = { st ->
             val sz = st.painter.intrinsicSize
-            if (sz.isSpecified && sz.width > 0f && sz.height > 0f) {
+            if (sz.isSpecified && (sz.width == 0f || sz.height == 0f)) empty = true
+            else if (sz.isSpecified && sz.width > 0f && sz.height > 0f) {
                 ratio = sz.width / sz.height
                 // Only ever widened: a re-decode at the new, smaller box must not
                 // shrink the cap it was sized from.
@@ -457,6 +467,27 @@ private fun ProseImage(model: Any, alt: String, svg: Boolean) {
     )
     if (showFull) ImageLightbox(model, alt) { showFull = false }
 }
+
+/**
+ * A [ratio] box no wider than [natural] or the space offered, and no taller than
+ * [maxHeight] (narrowing to keep the ratio) — `widthIn(max).heightIn(max)
+ * .aspectRatio()` as one layout, so its intrinsic height is the height it will
+ * really take. The chained form answered an intrinsic query from the full offered
+ * width, ignoring the natural-width cap: a 40×20 image in a table cell (whose row is
+ * `height(IntrinsicSize.Min)`) made the row ~100dp tall instead of ~20dp.
+ */
+internal fun Modifier.proseImageSize(ratio: Float, natural: Dp, maxHeight: Dp): Modifier =
+    layout { measurable, constraints ->
+        val cap = natural.roundToPx()
+        var w = (if (constraints.hasBoundedWidth) minOf(constraints.maxWidth, cap) else cap).toFloat()
+        var h = w / ratio
+        val maxH = minOf(maxHeight.roundToPx(), constraints.maxHeight)
+        if (h > maxH) { h = maxH.toFloat(); w = h * ratio }
+        val width = constraints.constrainWidth(w.roundToInt())
+        val height = constraints.constrainHeight(h.roundToInt())
+        val placeable = measurable.measure(Constraints.fixed(width, height))
+        layout(width, height) { placeable.place(0, 0) }
+    }
 
 /** sessions.html caps `.md-img` at 420px; scaled to a phone's shorter screen. */
 private val PROSE_IMAGE_MAX_HEIGHT: Dp = 320.dp
