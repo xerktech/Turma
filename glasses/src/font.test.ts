@@ -87,11 +87,26 @@ describe("fontSafe", () => {
     expect(has!(0x221a)).toBe(true);
   });
 
+  // Linearity by RATIO, not a wall-clock cap: a loaded host slows both sizes
+  // alike, so a 4x input must stay well under the 16x a quadratic scan costs.
+  // Sizes are interleaved and each takes the median of five runs; the small
+  // absolute slack absorbs timer noise on the fast side.
   it("is linear on a long run of drops", () => {
     setGlyphCoverage(pretext);
-    const t0 = performance.now();
-    expect(fontSafe(`${s(0x1f9e0)} `.repeat(100_000))).toBe("?");
-    expect(performance.now() - t0).toBeLessThan(2000);
+    const run = (n: number): number => {
+      const text = `${s(0x1f9e0)} `.repeat(n);
+      const t0 = performance.now();
+      expect(fontSafe(text)).toBe("?");
+      return performance.now() - t0;
+    };
+    const small: number[] = [];
+    const big: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      small.push(run(5_000));
+      big.push(run(20_000));
+    }
+    const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[2]!;
+    expect(median(big)).toBeLessThan(8 * median(small) + 20);
   });
 });
 

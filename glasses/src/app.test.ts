@@ -1088,6 +1088,34 @@ describe("App", () => {
       await poll();
       expect(draftOf(app)).toBe("unrelated note");
     });
+
+    it("a new draft left beside a held one joins it, never replaces it, and is never doubled", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
+      const app = await boot();
+      app.enterSession("s1");
+      dictate("held note");
+      app.enterSession("s2");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking }), session({ id: "s2" })] })];
+      await poll();
+      app.enterSession("s1"); // sheet shows; "held note" stays held
+      // Dictate a fresh draft through the sheet's last row, then leave twice
+      // over (home, then another session) without sending.
+      for (let i = 0; i < 5; i++) display.emit({ type: "scrollDown" });
+      display.emit({ type: "tap" }); // Dictate answer -> recording
+      display.emit({ type: "tap" }); // -> finalising
+      dictation.resolve({ text: "new note" });
+      expect(draftOf(app)).toBe("new note");
+      display.emit({ type: "doubleTap" }); // -> actions
+      for (let i = 0; i < 10; i++) display.emit({ type: "scrollDown" });
+      display.emit({ type: "tap" }); // Home
+      expect(app.getState().screen).toBe("home");
+      app.enterSession("s2");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
+      await poll();
+      app.enterSession("s1");
+      expect(draftOf(app)).toBe("held note new note");
+    });
   });
 
   it("leaving a session keeps its unsent draft for the next entry; Send still clears it (XERK-1858)", async () => {

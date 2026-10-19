@@ -85,4 +85,6 @@ paths:
   - Never restored while a question is pending there: a draft hides the sheet, and Send would post
     it as an answer to a question the wearer never saw. The poll restores it once the question clears.
   - Keyed by host + id; a migrated session takes a draft only from a host that no longer lists it.
+  - A stash MOVES the draft out of `state.session` (home keeps a stale one) and joins any held one,
+    so a second stash of the same left session neither replaces nor doubles it.
   - Tests: `app.test.ts` "kept drafts (XERK-1858)".

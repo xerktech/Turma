@@ -576,12 +576,21 @@ export class App {
     });
   }
 
-  // Keeps the on-screen session's unsent draft for its next entry.
+  // Keeps the on-screen session's unsent draft for its next entry. A draft
+  // still held back for a question is kept too: the new one joins after it.
   private stashDraft(): void {
     const s = this.state.session;
     if (!s?.draft) return;
-    const entry = { hostKey: s.hostKey, sessionId: s.sessionId, text: s.draft };
-    this.state = { ...this.state, drafts: { ...this.state.drafts, [draftKey(s.hostKey, s.sessionId)]: entry } };
+    const held = this.state.drafts[draftKey(s.hostKey, s.sessionId)]?.text;
+    const text = held ? `${held} ${s.draft}` : s.draft;
+    const entry = { hostKey: s.hostKey, sessionId: s.sessionId, text };
+    // Moved, not copied: a second stash of the same left session (home, then
+    // entering another) must not join the draft to itself.
+    this.state = {
+      ...this.state,
+      session: { ...s, draft: "" },
+      drafts: { ...this.state.drafts, [draftKey(s.hostKey, s.sessionId)]: entry },
+    };
   }
 
   private schedulePoll(delayMs: number, prefetched?: Promise<AgentsResponse>): void {
