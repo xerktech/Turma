@@ -556,11 +556,14 @@ export class App {
   // Puts `s`'s stashed draft back into it, unless a question is pending there:
   // the sheet must show (a draft hides it), and Send must never post that draft
   // as an answer to a question the wearer never saw. It then stays stashed
-  // until the question clears (the poll calls this again).
+  // until the question clears (the poll calls this again). A session the fleet
+  // doesn't list right now (an empty poll after a hub restart) is unknown, not
+  // cleared: its question may still be pending, so the draft stays stashed.
   private takeDraft(s: SessionScreenState): SessionScreenState {
     const key = this.draftKeyFor(s.hostKey, s.sessionId);
     if (key === undefined || s.draft) return s;
-    if (findSession(this.state, s.hostKey, s.sessionId)?.session?.question) return s;
+    const live = findSession(this.state, s.hostKey, s.sessionId);
+    if (!live || live.session?.question) return s;
     const { [key]: entry, ...drafts } = this.state.drafts;
     this.state = { ...this.state, drafts };
     return { ...s, draft: entry!.text };

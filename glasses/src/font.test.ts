@@ -87,27 +87,30 @@ describe("fontSafe", () => {
     expect(has!(0x221a)).toBe(true);
   });
 
-  // Linearity by RATIO, not a wall-clock cap: a loaded host slows both sizes
-  // alike, so a 4x input must stay well under the 16x a quadratic scan costs.
-  // Sizes are interleaved and each takes the median of five runs; the small
+  // Linearity by RATIO of this process's CPU time, not a wall-clock cap: a 4x
+  // input must stay well under the 16x a quadratic scan costs. Wall time on a
+  // loaded host (load ~110) swung the ratio past 9x and blew the 5s test
+  // timeout; CPU time excludes time spent preempted. Sizes are interleaved and
+  // each takes its fastest of seven runs (contention only adds); the small
   // absolute slack absorbs timer noise on the fast side.
   it("is linear on a long run of drops", () => {
     setGlyphCoverage(pretext);
     const run = (n: number): number => {
       const text = `${s(0x1f9e0)} `.repeat(n);
-      const t0 = performance.now();
+      const t0 = process.cpuUsage();
       expect(fontSafe(text)).toBe("?");
-      return performance.now() - t0;
+      const t = process.cpuUsage(t0);
+      return (t.user + t.system) / 1000;
     };
     const small: number[] = [];
     const big: number[] = [];
-    for (let i = 0; i < 5; i++) {
-      small.push(run(5_000));
-      big.push(run(20_000));
+    for (let i = 0; i < 7; i++) {
+      small.push(run(2_000));
+      big.push(run(8_000));
     }
-    const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[2]!;
-    expect(median(big)).toBeLessThan(8 * median(small) + 20);
-  });
+    const ms = (xs: number[]) => xs.map(Math.round).join(",");
+    expect(Math.min(...big), `big ${ms(big)} small ${ms(small)}`).toBeLessThan(8 * Math.min(...small) + 20);
+  }, 60_000);
 });
 
 describe("fontSafe wiring", () => {

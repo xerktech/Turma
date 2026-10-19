@@ -1141,6 +1141,29 @@ describe("App", () => {
       expect(draftOf(app)).toBe("held note");
     });
 
+    it("an empty poll is not a cleared question: the held draft stays stashed until the session is listed without one", async () => {
+      const { app, client } = await heldBehindQuestion();
+      const asked = fleet;
+      fleet = []; // a hub that just restarted
+      await poll();
+      expect(draftOf(app)).toBe("");
+      expect(Object.keys(app.getState().drafts)).toHaveLength(1);
+      fleet = asked; // back, question still pending
+      await poll();
+      expect(draftOf(app)).toBe("");
+      expect(display.lines.some((l) => l.includes("Ship it?"))).toBe(true);
+      // The wearer's tap answers the sheet with an option, never the draft.
+      display.emit({ type: "tap" });
+      await vi.waitFor(() => expect(client.answerQuestion).toHaveBeenCalledTimes(1));
+      expect(JSON.stringify(client.answerQuestion.mock.calls)).not.toContain("held note");
+      cleared();
+      await poll();
+      expect(draftOf(app)).toBe("held note");
+      expect(app.getState().drafts).toEqual({});
+      await poll();
+      expect(draftOf(app)).toBe("held note");
+    });
+
     it("a restored held draft is not doubled by leaving and coming back", async () => {
       const { app } = await heldBehindQuestion();
       cleared();
