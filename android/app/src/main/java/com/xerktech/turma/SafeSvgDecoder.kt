@@ -76,7 +76,8 @@ class SafeSvgDecoder private constructor() {
  * drawable the caller lays out as nothing. Coil's own decoder reported the bitmap it
  * had scaled UP to the placeholder box, so every SVG filled the bubble width.
  *
- * Embedded `<image>`s are drawn only through [SvgImageGuard], which bounds them.
+ * Every render goes through [SvgRenderGuard], which bounds its time, its steps and the
+ * images it embeds, and stops it when the decode is cancelled.
  */
 private class SizedSvgDecoder(
     private val source: ImageSource,
@@ -100,13 +101,22 @@ private class SizedSvgDecoder(
         svg.setDocumentHeight("100%")
         val config = options.config.takeIf { it != Bitmap.Config.HARDWARE } ?: Bitmap.Config.ARGB_8888
         val bitmap = Bitmap.createBitmap(bw, bh, config)
-        SvgImageGuard.render(svg, Canvas(bitmap))
+        SvgRenderGuard.render(svg, bitmap)
         DecodeResult(SvgDrawable(bitmap, maxOf(1, Math.round(w)), maxOf(1, Math.round(h))), isSampled = true)
     }
 }
 
 /**
- * Bounds the raster images an SVG embeds. AndroidSVG decodes a `data:…;base64,` href
+ * Bounds an SVG render (XERK-2108). AndroidSVG has no hook for an ordinary draw, and a
+ * `<pattern>` of 0.01-unit tiles over a 100 × 100 rect draws 10⁸ tiles: one core pinned
+ * for 11+ minutes, still running after Back. But it calls `Canvas.save()` for every
+ * element it renders and every pattern tile, so it renders onto a [GuardedCanvas] whose
+ * `save()` counts the step against [RENDER_MAX_STEPS], checks the [RENDER_DEADLINE_MS]
+ * deadline, and checks the thread's interrupt — which Coil's `runInterruptible` sets when
+ * the request is cancelled (the image leaves the screen). Past any of them it throws (alt
+ * text). The same checks guard every embedded image draw.
+ *
+ * It also bounds the raster images an SVG embeds. AndroidSVG decodes a `data:…;base64,` href
  * itself, at full size, on EVERY draw — a 20000 × 20000 PNG data URI allocated
  * ~1.6 GB, and a `<pattern>` of 1 × 1 tiles over a 2000² image re-decoded it per tile
  * for minutes after the screen was left. It consults the external resolver only when
@@ -121,14 +131,34 @@ private class SizedSvgDecoder(
  * deadline and cancellation checked. Past any of them the render throws (alt text).
  * A non-data href resolves to nothing, as with no resolver: nothing is ever fetched.
  */
-private object SvgImageGuard : SVGExternalFileResolver() {
+private object SvgRenderGuard : SVGExternalFileResolver() {
     private const val SENTINEL = "turma-image:"
     private const val RENDER_DEADLINE_MS = 5_000L
+
+    // A step is one element or one pattern tile. A dense diagram takes a few thousand;
+    // this is far past any SVG worth drawing, and reached in well under a second.
+    const val RENDER_MAX_STEPS = 200_000
 
     private class Render(val hrefs: List<String>) {
         val started = System.nanoTime()
         val cache = HashMap<String, Bitmap?>()
         var drawn = 0L
+        var steps = 0
+
+        /** Throws once the render is cancelled, too slow, or too many steps long. */
+        fun step() {
+            check(!Thread.currentThread().isInterrupted) { "SVG render cancelled" }
+            check(System.nanoTime() - started < RENDER_DEADLINE_MS * 1_000_000) { "refused SVG: render too slow" }
+            check(++steps <= RENDER_MAX_STEPS) { "refused SVG: too many steps to draw" }
+        }
+    }
+
+    /** A canvas that runs [Render.step] at every `save()` AndroidSVG makes. */
+    private class GuardedCanvas(bitmap: Bitmap, private val r: Render) : Canvas(bitmap) {
+        override fun save(): Int {
+            r.step()
+            return super.save()
+        }
     }
 
     private val current = ThreadLocal<Render?>()
@@ -144,12 +174,13 @@ private object SvgImageGuard : SVGExternalFileResolver() {
 
     init { SVG.registerExternalFileResolver(this) }
 
-    fun render(svg: SVG, canvas: Canvas) {
+    fun render(svg: SVG, bitmap: Bitmap) {
         val hrefs = ArrayList<String>()
         rewrite(rootField.get(svg), hrefs)
-        current.set(Render(hrefs))
+        val r = Render(hrefs)
+        current.set(r)
         try {
-            svg.renderToCanvas(canvas)
+            svg.renderToCanvas(GuardedCanvas(bitmap, r))
         } finally {
             current.remove()
         }
@@ -173,8 +204,7 @@ private object SvgImageGuard : SVGExternalFileResolver() {
     override fun resolveImage(filename: String?): Bitmap? {
         val r = current.get() ?: return null
         val href = filename?.removePrefix(SENTINEL)?.toIntOrNull()?.let { r.hrefs.getOrNull(it) } ?: return null
-        check(!Thread.currentThread().isInterrupted) { "SVG render cancelled" }
-        check(System.nanoTime() - r.started < RENDER_DEADLINE_MS * 1_000_000) { "refused SVG: render too slow" }
+        r.step()
         val bitmap = r.cache.getOrPut(href) { decode(href, r) } ?: return null
         r.drawn += bitmap.width.toLong() * bitmap.height
         check(r.drawn <= SVG_EMBEDDED_MAX_PIXELS) { "refused SVG: embedded images draw too many pixels" }

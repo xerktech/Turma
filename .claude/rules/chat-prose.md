@@ -83,7 +83,11 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
     - **The drawable's intrinsic size is the SVG's own (CSS px), never its bitmap's.** `ProseImage`
       caps the box at it; a bitmap scaled up to the full-width placeholder made every SVG fill the
       bubble. The bitmap is device-density, bounded by the box width and a pixel ceiling.
-    - **Embedded raster images go only through `SvgImageGuard`.** AndroidSVG 1.4 decodes a base64
+    - **Every render goes through `SvgRenderGuard`'s `GuardedCanvas`, whose `save()` is the only hook
+      AndroidSVG offers per element and per pattern tile.** It checks the thread's interrupt (Coil
+      cancels via `runInterruptible`), a 5 s deadline and a step budget. Without it an image-free
+      `<pattern>` of 0.01-unit tiles pinned a core for 11+ min past Back (XERK-2108).
+    - **Embedded raster images go only through `SvgRenderGuard`.** AndroidSVG 1.4 decodes a base64
       `data:` `<image>` itself, at full size, on every draw, and asks the external resolver only
       when that check returns null — so the guard rewrites each PARSED `<image>` href (reflection)
       to a sentinel and resolves it: size read first, decoded once, every draw (pattern tile, `<use>`)

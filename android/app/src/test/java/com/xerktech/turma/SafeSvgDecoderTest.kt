@@ -6,6 +6,7 @@ import android.util.Base64
 import androidx.test.core.app.ApplicationProvider
 import coil.ImageLoader
 import coil.decode.DataSource
+import coil.decode.Decoder
 import coil.decode.ImageSource
 import coil.fetch.SourceResult
 import coil.request.Options
@@ -14,6 +15,10 @@ import coil.size.Size
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.util.zip.CRC32
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import okio.Buffer
 import org.junit.Assert.assertEquals
@@ -43,10 +48,14 @@ class SafeSvgDecoderTest {
 
     /** Decode for a phone-wide prose placeholder: 1000 × 320 px, fitted. Null: not an SVG. */
     private fun decode(bytes: ByteArray, mime: String? = null): Drawable? {
+        val decoder = decoder(bytes, mime) ?: return null
+        return runBlocking { decoder.decode() }!!.drawable
+    }
+
+    private fun decoder(bytes: ByteArray, mime: String? = null): Decoder? {
         val result = SourceResult(ImageSource(Buffer().write(bytes), context), mime, DataSource.MEMORY)
         val options = Options(context, size = Size(1000, 320), scale = Scale.FIT)
-        val decoder = SafeSvgDecoder.Factory().create(result, options, loader) ?: return null
-        return runBlocking { decoder.decode() }!!.drawable
+        return SafeSvgDecoder.Factory().create(result, options, loader)
     }
 
     private fun intrinsic(s: String) = decode(s.toByteArray())!!.let { it.intrinsicWidth to it.intrinsicHeight }
@@ -168,5 +177,52 @@ class SafeSvgDecoderTest {
         assertTrue(refused(svg))
         val ms = (System.nanoTime() - start) / 1_000_000
         assertTrue("took ${ms}ms", ms < 5_000)
+    }
+
+    /** A 100 x 100 rect filled with a pattern of [tile]-unit tiles, each a plain rect. */
+    private fun tiles(tile: String) = "<svg $ns width=\"100\" height=\"100\">" +
+        "<defs><pattern id=\"p\" width=\"$tile\" height=\"$tile\" patternUnits=\"userSpaceOnUse\">" +
+        "<rect width=\"0.5\" height=\"0.5\"/></pattern></defs>" +
+        "<rect width=\"100\" height=\"100\" fill=\"url(#p)\"/></svg>"
+
+    @Test fun `an image-free pattern of tiny tiles is refused fast (XERK-2108)`() {
+        // 0.01-unit tiles: 10^8 of them. Before the guard this pinned a core for
+        // 11+ minutes on the emulator and kept running after Back.
+        val start = System.nanoTime()
+        val e = runCatching { decode(tiles("0.01").toByteArray()) }.exceptionOrNull()
+        val ms = (System.nanoTime() - start) / 1_000_000
+        assertEquals("refused SVG: too many steps to draw", e?.message)
+        assertTrue("took ${ms}ms", ms < 2_000)
+    }
+
+    @Test fun `a pattern of a sane number of tiles still draws`() {
+        // 1-unit tiles: 10000 of them, well inside the step budget.
+        assertEquals(100 to 100, intrinsic(tiles("1")))
+    }
+
+    @Test fun `a cancelled decode stops at the next step`() {
+        // Coil cancels a decode by interrupting its thread (runInterruptible); the render
+        // must notice at its next step rather than draw on. 0.45-unit tiles: ~50000 of
+        // them, inside the budget, so only cancellation can cut the render short.
+        val bytes = tiles("0.45").toByteArray()
+        fun timed(cancelAfterMs: Long?): Long = runBlocking {
+            val start = System.nanoTime()
+            val decoding = CompletableDeferred<Unit>()
+            // Not decode(): its own runBlocking would shield the render from the cancel.
+            val job = launch(Dispatchers.IO) {
+                val d = decoder(bytes)!!
+                decoding.complete(Unit)
+                runCatching { d.decode() }
+            }
+            // Cancel mid-render, never before it starts (that would pass with no guard).
+            decoding.await()
+            if (cancelAfterMs != null) { delay(cancelAfterMs); job.cancel() }
+            job.join()
+            (System.nanoTime() - start) / 1_000_000
+        }
+        timed(null) // warm-up
+        val full = timed(null)
+        val cancelled = timed(50)
+        assertTrue("full ${full}ms, cancelled ${cancelled}ms", cancelled * 2 < full)
     }
 }
