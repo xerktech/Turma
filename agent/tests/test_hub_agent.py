@@ -48421,6 +48421,7 @@ class TestDefectAttribution(unittest.TestCase):
             self.assertFalse(ha._defect_is_test_path(p), p)
         self.assertEqual(ha._defect_ticket_keys("XERK-12: fix AB#34 and XERK-12"),
                          ["XERK-12", "34"])
+        self.assertEqual(ha._defect_ticket_keys("XERK-7: patch CVE-2013-4476"), ["XERK-7"])
 
 
 class TestDefectReportsWire(ManagerMixin, unittest.TestCase):
@@ -48508,6 +48509,8 @@ class TestDefectForgeAndTracker(unittest.TestCase):
                 raise ha.BoardHttpError("HTTP 404: Issue does not exist", 404)
             if path.endswith("/BAD-1"):
                 raise ha.BoardHttpError("HTTP 400: bad key", 400)
+            if path.endswith("/HIDE-1"):
+                raise ha.BoardHttpError("HTTP 403: forbidden", 403)
             if path.endswith("/DOWN-1"):
                 raise ha.BoardHttpError("HTTP 503: down", 503)
             if path.endswith("/AUTH-1"):
@@ -48520,6 +48523,13 @@ class TestDefectForgeAndTracker(unittest.TestCase):
                 mock.patch.object(ha, "jira_get", side_effect=get):
             self.assertEqual(ha._defect_tracker_classes(["XERK-1", "NOPE-1", "BAD-1"]),
                              {"XERK-1": "bug", "NOPE-1": "other", "BAD-1": "other"})
+            # A 403 reads "other" for this commit but is never cached
+            # (XERK-1858): a transient permission fault must not stick.
+            classes = {}
+            mgr = mock.Mock(jira={"tickets": []})
+            out = ha.SessionManager._defect_classify(mgr, ["XERK-1", "HIDE-1", "NOPE-1"], classes)
+            self.assertEqual(out, {"XERK-1": "bug", "HIDE-1": "other", "NOPE-1": "other"})
+            self.assertEqual(classes, {"XERK-1": "bug", "NOPE-1": "other"})
             # A server or auth failure, or a timeout, says nothing about the
             # ticket: it raises so the scan retries that commit.
             for key in ("DOWN-1", "AUTH-1"):

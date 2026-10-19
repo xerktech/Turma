@@ -150,7 +150,8 @@ def pin_workflow_script(script: str, model: str):
         " const t = o && typeof o === 'object' && typeof o.agentType === 'string'"
         " ? o.agentType.trim().toLowerCase() : '';"
         f" return a(p, t && ({json.dumps(sorted(PINNED_NAMES))}.includes(t)"
-        f" || /(?<!p)review/.test(t)) ? {{...o, model: {json.dumps(model)}}} : o);"
+        # agentType is copied by name: a spread drops an inherited/getter one.
+        f" || /(?<!p)review/.test(t)) ? {{...o, agentType: o.agentType, model: {json.dumps(model)}}} : o);"
         " })(globalThis.agent); } catch (e) {}"
     )
     pinned = script[:at] + pin + script[at:]

@@ -8627,7 +8627,9 @@ def _defect_is_test_path(path):
 def _defect_ticket_keys(subject):
     """Ticket keys a commit subject names: Jira-style keys and ADO `AB#<n>`."""
     s = subject or ""
-    keys = _JIRA_KEY_RE.findall(s) + _ADO_KEY_RE.findall(s)
+    # A CVE id ("CVE-2013-4476") reads as key CVE-2013: never a ticket.
+    keys = [k for k in _JIRA_KEY_RE.findall(s) if not k.startswith("CVE-")]
+    keys += _ADO_KEY_RE.findall(s)
     return list(dict.fromkeys(keys))[:5]
 
 
@@ -8857,11 +8859,12 @@ def _defect_landing(repo, sha, tip, first_parents):
     return None
 
 
-def _defect_tracker_classes(keys):
+def _defect_tracker_classes(keys, uncached=None):
     """{key: work class} from the configured tracker for ticket keys the board
     cache did not answer. A key the tracker does not know reads "other"; any
     other failure RAISES, so the scan retries that commit rather than skipping a
-    fix it could not classify."""
+    fix it could not classify. A 403 key also lands in `uncached`: a transient
+    permission fault must not pin it to "other" for good."""
     out = {}
     jira_keys = [k for k in keys if _JIRA_KEY_RE.fullmatch(k)]
     ado_ids = [k for k in keys if k.isdigit()]
@@ -8876,6 +8879,8 @@ def _defect_tracker_classes(keys):
                 # ticket; retrying it would stall the repo's scan for good.
                 if getattr(e, "code", None) in (400, 403, 404):
                     out[k] = "other"
+                    if e.code == 403 and uncached is not None:
+                        uncached.add(k)
                     continue
                 raise
             t = ((data or {}).get("fields") or {}).get("issuetype") or {}
@@ -35540,10 +35545,11 @@ class SessionManager:
                 if k in board:
                     out[k] = str(board[k]).strip().lower()
                     missing.remove(k)
+        uncached = set()
         if missing:
-            out.update(_defect_tracker_classes(missing))
+            out.update(_defect_tracker_classes(missing, uncached))
         for k in keys:
-            if k in out:
+            if k in out and k not in uncached:
                 classes[k] = out[k]
         return out
 
