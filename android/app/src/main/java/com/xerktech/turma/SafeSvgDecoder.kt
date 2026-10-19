@@ -9,6 +9,7 @@ import android.graphics.PixelFormat
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.ShapeDrawable
 import android.util.Base64
+import androidx.annotation.VisibleForTesting
 import coil.ImageLoader
 import coil.decode.DecodeResult
 import coil.decode.Decoder
@@ -76,7 +77,8 @@ class SafeSvgDecoder private constructor() {
  * drawable the caller lays out as nothing. Coil's own decoder reported the bitmap it
  * had scaled UP to the placeholder box, so every SVG filled the bubble width.
  *
- * Embedded `<image>`s are drawn only through [SvgImageGuard], which bounds them.
+ * Every render goes through [SvgRenderGuard], which bounds its time, its steps and the
+ * images it embeds, and stops it when the decode is cancelled.
  */
 private class SizedSvgDecoder(
     private val source: ImageSource,
@@ -100,13 +102,33 @@ private class SizedSvgDecoder(
         svg.setDocumentHeight("100%")
         val config = options.config.takeIf { it != Bitmap.Config.HARDWARE } ?: Bitmap.Config.ARGB_8888
         val bitmap = Bitmap.createBitmap(bw, bh, config)
-        SvgImageGuard.render(svg, Canvas(bitmap))
+        SvgRenderGuard.render(svg, bitmap)
         DecodeResult(SvgDrawable(bitmap, maxOf(1, Math.round(w)), maxOf(1, Math.round(h))), isSampled = true)
     }
 }
 
 /**
- * Bounds the raster images an SVG embeds. AndroidSVG decodes a `data:…;base64,` href
+ * Bounds an SVG render (XERK-2108). AndroidSVG has no hook for an ordinary draw, and a
+ * `<pattern>` of 0.01-unit tiles over a 100 × 100 rect draws 10⁸ tiles: one core pinned
+ * for 11+ minutes, still running after Back. But it calls `Canvas.save()` for every
+ * element it renders and every pattern tile, so it renders onto a [GuardedCanvas] whose
+ * `save()` counts the step against [RENDER_MAX_STEPS], checks the [renderDeadlineMs]
+ * deadline, and checks the thread's interrupt — which Coil's `runInterruptible` sets when
+ * the request is cancelled (the image leaves the screen). Past any of them it throws (alt
+ * text). The same checks guard every embedded image draw.
+ *
+ * Not everything reaches `save()`: computing a clip path (`<use>` and nested clip-paths
+ * inside it, text turned into glyph outlines, `Path.op` per element) runs in one call,
+ * and a 2.5 KB SVG of clip-paths that each `<use>` the last one ten times pinned a core
+ * past Back. So before rendering, [cost] walks the parsed tree once, following every
+ * reference AndroidSVG will (`<use>`, `<tref>`, `<textPath>`, a pattern's `href`, a
+ * pattern fill, clip-path, mask, markers), and refuses an SVG whose total passes
+ * [RENDER_MAX_COST]. References are memoised, so the walk is linear in the file even when
+ * what it measures is exponential. Two things it can't measure are refused outright: a
+ * stylesheet rule setting clip-path, mask or a marker (it could apply to any element),
+ * and a clip-path inside pattern content (paid once per tile).
+ *
+ * It also bounds the raster images an SVG embeds. AndroidSVG decodes a `data:…;base64,` href
  * itself, at full size, on EVERY draw — a 20000 × 20000 PNG data URI allocated
  * ~1.6 GB, and a `<pattern>` of 1 × 1 tiles over a 2000² image re-decoded it per tile
  * for minutes after the screen was left. It consults the external resolver only when
@@ -121,14 +143,43 @@ private class SizedSvgDecoder(
  * deadline and cancellation checked. Past any of them the render throws (alt text).
  * A non-data href resolves to nothing, as with no resolver: nothing is ever fetched.
  */
-private object SvgImageGuard : SVGExternalFileResolver() {
+internal object SvgRenderGuard : SVGExternalFileResolver() {
     private const val SENTINEL = "turma-image:"
-    private const val RENDER_DEADLINE_MS = 5_000L
+    @VisibleForTesting internal var renderDeadlineMs = 5_000L
+
+    // A step is one element or one pattern tile. A dense diagram takes a few thousand;
+    // this is far past any SVG worth drawing, and reached in well under a second.
+    const val RENDER_MAX_STEPS = 200_000
+
+    // A unit of [cost] is one element, path command, polyline point or text character;
+    // inside a clip path each counts [CLIP_WEIGHT], as clipping runs Path.op on its outline,
+    // and a path or polyline of n points counts n² / 4 there (a self-crossing outline of
+    // 300 points clipped in 53 ms, of 950 in 8 s). The budget is set from the worst shapes
+    // measured (Robolectric, real Skia), each about 2 s at most: a 29 000-segment stroke
+    // 500 wide, a 950-character clip-path text, a 340-point self-crossing clip path.
+    const val RENDER_MAX_COST = 30_000L
+    private const val CLIP_WEIGHT = 30L
 
     private class Render(val hrefs: List<String>) {
         val started = System.nanoTime()
         val cache = HashMap<String, Bitmap?>()
         var drawn = 0L
+        var steps = 0
+
+        /** Throws once the render is cancelled, too slow, or too many steps long. */
+        fun step() {
+            check(!Thread.currentThread().isInterrupted) { "SVG render cancelled" }
+            check(System.nanoTime() - started < renderDeadlineMs * 1_000_000) { "refused SVG: render too slow" }
+            check(++steps <= RENDER_MAX_STEPS) { "refused SVG: too many steps to draw" }
+        }
+    }
+
+    /** A canvas that runs [Render.step] at every `save()` AndroidSVG makes. */
+    private class GuardedCanvas(bitmap: Bitmap, private val r: Render) : Canvas(bitmap) {
+        override fun save(): Int {
+            r.step()
+            return super.save()
+        }
     }
 
     private val current = ThreadLocal<Render?>()
@@ -142,14 +193,47 @@ private object SvgImageGuard : SVGExternalFileResolver() {
     private val imageClass = Class.forName("com.caverock.androidsvg.SVG\$Image")
     private val hrefField = imageClass.getDeclaredField("href").apply { isAccessible = true }
 
+    private fun svgClass(name: String) = Class.forName("com.caverock.androidsvg.SVG\$$name")
+    private fun field(c: Class<*>, name: String) = c.getDeclaredField(name).apply { isAccessible = true }
+    private val resolveIri = SVG::class.java.getDeclaredMethod("resolveIRI", String::class.java)
+        .apply { isAccessible = true }
+    private val cssRulesField = field(SVG::class.java, "cssRules")
+    private val rulesField = field(Class.forName("com.caverock.androidsvg.CSSParser\$Ruleset"), "rules")
+    private val ruleStyleField = field(Class.forName("com.caverock.androidsvg.CSSParser\$Rule"), "style")
+    private val elementBaseClass = svgClass("SvgElementBase")
+    private val baseStyleField = field(elementBaseClass, "baseStyle")
+    private val styleField = field(elementBaseClass, "style")
+    private val styleClass = svgClass("Style")
+    private val clipPathField = field(styleClass, "clipPath")
+    private val maskField = field(styleClass, "mask")
+    private val markerFields = listOf("markerStart", "markerMid", "markerEnd").map { field(styleClass, it) }
+    private val paintFields = listOf("fill", "stroke").map { field(styleClass, it) }
+    private val paintRefClass = svgClass("PaintReference")
+    private val paintHrefField = field(paintRefClass, "href")
+    private val patternClass = svgClass("Pattern")
+    private val clipPathClass = svgClass("ClipPath")
+    // Elements that reference another by href: AndroidSVG renders (or, for a pattern,
+    // inherits the children of) the target.
+    private val hrefFields = listOf("Use", "TRef", "TextPath", "Pattern").map { field(svgClass(it), "href") }
+    private val hrefClasses = hrefFields.map { it.declaringClass }
+    private val pathClass = svgClass("Path")
+    private val pathDField = field(pathClass, "d")
+    private val commandsLengthField = field(svgClass("PathDefinition"), "commandsLength")
+    private val polyLineClass = svgClass("PolyLine")
+    private val pointsField = field(polyLineClass, "points")
+    private val textSequenceClass = svgClass("TextSequence")
+    private val textField = field(textSequenceClass, "text")
+
     init { SVG.registerExternalFileResolver(this) }
 
-    fun render(svg: SVG, canvas: Canvas) {
+    fun render(svg: SVG, bitmap: Bitmap) {
+        check(Cost(svg).total() <= RENDER_MAX_COST) { "refused SVG: too costly to draw" }
         val hrefs = ArrayList<String>()
         rewrite(rootField.get(svg), hrefs)
-        current.set(Render(hrefs))
+        val r = Render(hrefs)
+        current.set(r)
         try {
-            svg.renderToCanvas(canvas)
+            svg.renderToCanvas(GuardedCanvas(bitmap, r))
         } finally {
             current.remove()
         }
@@ -170,11 +254,99 @@ private object SvgImageGuard : SVGExternalFileResolver() {
         }
     }
 
+    /**
+     * The work a render of [svg] does that `save()` can't see, as an upper bound. Each
+     * node's cost is memoised by identity, so a node referenced N times is walked once
+     * and costs N times; a reference cycle counts 0 (AndroidSVG overflows its stack on
+     * one, which shows alt text).
+     */
+    private class Cost(private val svg: SVG) {
+        private class Node(val cost: Long, val clips: Boolean)
+        // Indexed by whether the walk is inside a clip path, which prices a node differently.
+        private val memo = Array(2) { java.util.IdentityHashMap<Any, Node>() }
+        private val walking = Array(2) { java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>()) }
+
+        fun total(): Long {
+            val rules = cssRulesField.get(svg)?.let { rulesField.get(it) as List<*>? }.orEmpty()
+            for (rule in rules) {
+                val style = ruleStyleField.get(rule) ?: continue
+                check(clipPathField.get(style) == null && maskField.get(style) == null &&
+                    markerFields.all { it.get(style) == null }) {
+                    "refused SVG: a stylesheet sets clip-path, mask or a marker"
+                }
+                // A stylesheet's pattern fill could land on any element: its clips are refused
+                // here, as the walk below only sees fills set on the element itself.
+                for (f in paintFields) patternRef(f.get(style), false)
+            }
+            return node(rootField.get(svg), false).cost
+        }
+
+        private fun resolve(iri: String?): Any? = iri?.let { resolveIri.invoke(svg, it) }
+
+        /** The pattern [paint] fills with, if any; refused if its content clips. */
+        private fun patternRef(paint: Any?, inClip: Boolean): Node? {
+            if (!paintRefClass.isInstance(paint)) return null
+            val target = resolve(paintHrefField.get(paint) as String?)
+            if (!patternClass.isInstance(target)) return null
+            return node(target, inClip).also { check(!it.clips) { "refused SVG: a clip-path inside a pattern" } }
+        }
+
+        private fun node(n: Any?, inClip: Boolean): Node {
+            val c = if (inClip) 1 else 0
+            if (n == null || n in walking[c]) return Node(0, false)
+            memo[c][n]?.let { return it }
+            walking[c].add(n)
+            val weight = if (inClip) CLIP_WEIGHT else 1L
+            var cost = weight
+            var clips = false
+            fun add(other: Node, times: Long = 1) {
+                cost = saturatedAdd(cost, saturatedTimes(other.cost, times))
+                clips = clips || other.clips
+            }
+            // Points (or text characters) this element draws, priced for where it is drawn.
+            fun points(k: Long) {
+                cost = saturatedAdd(cost, if (inClip) maxOf(k * weight, saturatedTimes(k, k) / 4) else k)
+            }
+            val vertices = when {
+                pathClass.isInstance(n) -> pathDField.get(n)?.let { commandsLengthField.getInt(it).toLong() } ?: 0
+                polyLineClass.isInstance(n) -> ((pointsField.get(n) as FloatArray?)?.size ?: 0) / 2L
+                else -> 0
+            }
+            points(vertices)
+            if (textSequenceClass.isInstance(n)) cost += weight * ((textField.get(n) as String?)?.length ?: 0)
+            hrefClasses.forEachIndexed { i, cls ->
+                if (cls.isInstance(n)) add(node(resolve(hrefFields[i].get(n) as String?), inClip))
+            }
+            if (elementBaseClass.isInstance(n)) {
+                for (style in listOf(baseStyleField.get(n), styleField.get(n))) {
+                    if (style == null) continue
+                    resolve(clipPathField.get(style) as String?)?.let {
+                        add(node(it, true))
+                        clips = true
+                    }
+                    add(node(resolve(maskField.get(style) as String?), inClip))
+                    for (f in markerFields) add(node(resolve(f.get(style) as String?), inClip), maxOf(1L, vertices))
+                    for (f in paintFields) patternRef(f.get(style), inClip)?.let { add(it) }
+                }
+            }
+            if (containerClass.isInstance(n)) {
+                @Suppress("UNCHECKED_CAST")
+                for (child in getChildren.invoke(n) as List<Any?>) add(node(child, inClip))
+            }
+            // A clipPath's own content is a clip: counted, and flagged, wherever it is used.
+            if (clipPathClass.isInstance(n)) clips = true
+            walking[c].remove(n)
+            return Node(cost, clips).also { memo[c][n] = it }
+        }
+
+        private fun saturatedAdd(a: Long, b: Long) = if (Long.MAX_VALUE - a < b) Long.MAX_VALUE else a + b
+        private fun saturatedTimes(a: Long, b: Long) = if (a != 0L && b > Long.MAX_VALUE / a) Long.MAX_VALUE else a * b
+    }
+
     override fun resolveImage(filename: String?): Bitmap? {
         val r = current.get() ?: return null
         val href = filename?.removePrefix(SENTINEL)?.toIntOrNull()?.let { r.hrefs.getOrNull(it) } ?: return null
-        check(!Thread.currentThread().isInterrupted) { "SVG render cancelled" }
-        check(System.nanoTime() - r.started < RENDER_DEADLINE_MS * 1_000_000) { "refused SVG: render too slow" }
+        r.step()
         val bitmap = r.cache.getOrPut(href) { decode(href, r) } ?: return null
         r.drawn += bitmap.width.toLong() * bitmap.height
         check(r.drawn <= SVG_EMBEDDED_MAX_PIXELS) { "refused SVG: embedded images draw too many pixels" }
