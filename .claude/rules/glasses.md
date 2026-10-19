@@ -87,4 +87,7 @@ paths:
   - Keyed by host + id; a migrated session takes a draft only from a host that no longer lists it.
   - A stash MOVES the draft out of `state.session` (home keeps a stale one) and joins any held one,
     so a second stash of the same left session neither replaces nor doubles it.
+  - `takeDraft`/`stashDraft` rewrite `state.drafts`: call them BEFORE spreading `this.state`, or
+    the stale stash survives and a sent draft returns on every poll.
+  - Pruned only by an ONLINE host that no longer lists the id; an empty fleet keeps them all.
   - Tests: `app.test.ts` "kept drafts (XERK-1858)".

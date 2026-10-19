@@ -527,7 +527,8 @@ export class App {
   // screen. Leaving is never signalled here — only the phone tells us to enter.
   enterSession(sessionId: string, hostKeyHint?: string): void {
     if (!sessionId) return;
-    if (this.currentSessionId() === sessionId) return;
+    const here = this.currentSessionId() === sessionId;
+    if (here && !hostKeyHint) return;
     // The hint names the copy the phone opened when two hosts list one id
     // (mid-migration); otherwise the first host listing it.
     const lists = (a: AgentInfo) => (a.sessions ?? []).some((s) => s.id === sessionId);
@@ -536,6 +537,7 @@ export class App {
       this.state.agents.find(lists)?.key ||
       hostKeyHint;
     if (!host) return;
+    if (here && this.state.session?.hostKey === host) return;
     // The session being left must not keep the mic: its result would land in
     // (or answer) the wrong session.
     if (this.state.session) this.cancelBoxDictation(this.state.session);
@@ -853,11 +855,19 @@ export class App {
       }
       // A draft held back while a question was pending comes back once it clears.
       if (this.state.screen === "session" && this.state.session?.mic === "idle") {
-        this.state = { ...this.state, session: this.takeDraft(this.state.session) };
+        // takeDraft rewrites state.drafts: read state only after it returns.
+        const session = this.takeDraft(this.state.session);
+        this.state = { ...this.state, session };
       }
-      // Forget the drafts of sessions no host lists any more.
+      // Forget the drafts of sessions no host lists any more, judged only by
+      // hosts this poll listed online: an empty fleet (a hub restart) or an
+      // offline host is no evidence the session is gone.
       const listed = new Set(sessionRefs.map((r) => r.session.id));
-      const stale = Object.keys(this.state.drafts).filter((k) => !listed.has(this.state.drafts[k]!.sessionId));
+      const seen = new Set(agentsNow.filter((a) => a.online).map((a) => a.key));
+      const stale = Object.keys(this.state.drafts).filter((k) => {
+        const d = this.state.drafts[k]!;
+        return seen.has(d.hostKey) && !listed.has(d.sessionId);
+      });
       if (stale.length) {
         const drafts = { ...this.state.drafts };
         for (const k of stale) delete drafts[k];

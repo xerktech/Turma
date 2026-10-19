@@ -1089,6 +1089,96 @@ describe("App", () => {
       expect(draftOf(app)).toBe("unrelated note");
     });
 
+    // Holds "held note" back on s1 behind a pending question, with the wearer
+    // now on s1's sheet. `client` is the fake hub.
+    async function heldBehindQuestion() {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
+      const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: fleet })) });
+      const app = makeApp(client, POLL);
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictate("held note");
+      app.enterSession("s2");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking }), session({ id: "s2" })] })];
+      await poll();
+      app.enterSession("s1");
+      expect(draftOf(app)).toBe("");
+      expect(Object.keys(app.getState().drafts)).toHaveLength(1);
+      return { app, client };
+    }
+    const cleared = () => {
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
+    };
+
+    it("a held draft restored by the poll leaves the stash: sent once, never back", async () => {
+      const { app, client } = await heldBehindQuestion();
+      cleared();
+      await poll();
+      expect(draftOf(app)).toBe("held note");
+      expect(app.getState().drafts).toEqual({});
+      display.emit({ type: "tap" }); // -> bottom
+      display.emit({ type: "tap" }); // draft present -> actions
+      display.emit({ type: "scrollDown" }); // Back(0) -> Send(1)
+      display.emit({ type: "tap" });
+      await vi.waitFor(() => expect(client.sendInput).toHaveBeenCalledTimes(1));
+      await poll();
+      await poll();
+      expect(draftOf(app)).toBe("");
+      expect(app.getState().drafts).toEqual({});
+      expect(client.sendInput).toHaveBeenCalledTimes(1);
+    });
+
+    it("answering the sheet brings the held draft back once, out of the stash", async () => {
+      const { app, client } = await heldBehindQuestion();
+      display.emit({ type: "tap" }); // answer option 1 on the sheet
+      await vi.waitFor(() => expect(client.answerQuestion).toHaveBeenCalledTimes(1));
+      await poll();
+      expect(draftOf(app)).toBe("held note");
+      expect(app.getState().drafts).toEqual({});
+      await poll();
+      expect(draftOf(app)).toBe("held note");
+    });
+
+    it("a restored held draft is not doubled by leaving and coming back", async () => {
+      const { app } = await heldBehindQuestion();
+      cleared();
+      await poll();
+      app.enterSession("s2");
+      expect(Object.values(app.getState().drafts).map((d) => d.text)).toEqual(["held note"]);
+      app.enterSession("s1");
+      expect(draftOf(app)).toBe("held note");
+      expect(app.getState().drafts).toEqual({});
+    });
+
+    it("the phone's hint switches between two hosts' copies of the id on screen", async () => {
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" })] }), agent({ key: "B", sessions: [session({ id: "s1" })] })];
+      const app = await boot();
+      app.enterSession("s1", "B");
+      app.enterSession("s1", "A");
+      expect(app.getState().session?.hostKey).toBe("A");
+      app.enterSession("s1"); // no hint: already here, stays
+      expect(app.getState().session?.hostKey).toBe("A");
+    });
+
+    it("keeps drafts through an empty fleet or an offline host; drops them once their online host stops listing them", async () => {
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
+      const app = await boot();
+      app.enterSession("s1");
+      dictate("keep me");
+      app.enterSession("s2");
+      fleet = []; // a hub that just restarted
+      await poll();
+      expect(Object.keys(app.getState().drafts)).toHaveLength(1);
+      fleet = [agent({ key: "A", online: false, sessions: [] })];
+      await poll();
+      expect(Object.keys(app.getState().drafts)).toHaveLength(1);
+      fleet = [agent({ key: "A", sessions: [session({ id: "s2" })] })];
+      await poll();
+      expect(app.getState().drafts).toEqual({});
+    });
+
     it("a new draft left beside a held one joins it, never replaces it, and is never doubled", async () => {
       const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
       fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
