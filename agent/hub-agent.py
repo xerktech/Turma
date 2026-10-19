@@ -9939,6 +9939,19 @@ COMMAND_STDERR_RE = re.compile(
 BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
 BASH_STDOUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>", re.DOTALL)
 BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
+# Claude Code HTML-escapes the `!` command's OUTPUT (not its input) inside the
+# tags, so a traceback's `<string>` arrives as `&lt;string&gt;`. Undo exactly
+# the escapes it writes — the renderers escape again on the way out. `&amp;`
+# last, so `&amp;lt;` stays the literal text `&lt;`. Mirror: tunnel-agent.js
+# bashUnescape (XERK-2112).
+_BASH_ENTITIES = (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&#39;", "'"),
+                  ("&#x27;", "'"), ("&amp;", "&"))
+
+
+def _bash_unescape(text):
+    for ent, ch in _BASH_ENTITIES:
+        text = text.replace(ent, ch)
+    return text
 
 
 def _parse_local_command(text):
@@ -9975,11 +9988,10 @@ def _parse_local_command(text):
                             (COMMAND_STDOUT_RE, False), (BASH_STDOUT_RE, False)):
         m = regex.search(text)
         if m:
-            out = {
-                "kind": "output",
-                "text": _edge_trim(ANSI_RE.sub("", m.group(1))),
-                "isError": is_error,
-            }
+            body = _edge_trim(ANSI_RE.sub("", m.group(1)))
+            if regex in (BASH_STDERR_RE, BASH_STDOUT_RE):
+                body = _bash_unescape(body)
+            out = {"kind": "output", "text": body, "isError": is_error}
             # stderr wins over stdout ONLY when it carries text — a bash turn
             # routinely ships both tags with one of them empty, and an empty
             # stderr must not swallow the stdout beside it (or vice versa).
@@ -12844,10 +12856,20 @@ def _is_operator_row(row):
     chat: user role with at least one text block. This is the same test the
     web/android/glasses builders apply (a text block on a user entry becomes a
     user message bubble), so what this keeps is exactly what the operator sees
-    as "a message I sent"."""
+    as "a message I sent". A `!` shell command counts too (XERK-2112): it is
+    operator input, rendered on the operator's side."""
     if row.get("role") != "user":
         return False
-    return any(b.get("t") == "text" for b in row.get("blocks") or [])
+    return any(b.get("t") == "text" or _is_bang_block(b) for b in row.get("blocks") or [])
+
+
+def _is_bang_block(block):
+    """The `!` shell command block _parse_local_command produces."""
+    return block.get("t") == "command" and block.get("name") == "!"
+
+
+def _is_command_output_row(row):
+    return any(b.get("t") == "command_output" for b in row.get("blocks") or [])
 
 
 # Cheap byte prefilter for the operator-message scan: only `user` entries can
@@ -12870,20 +12892,29 @@ def _operator_entries(path):
     affordable for an on-demand call: the byte prefilter skips every
     non-user line without parsing it (~17ms for an 8 MB transcript)."""
     rows = []
+    last_row = None
     try:
         with open(path, "rb") as f:
             for raw in f:
-                if not any(m in raw for m in _USER_LINE_MARKERS):
+                row = None
+                if any(m in raw for m in _USER_LINE_MARKERS):
+                    try:
+                        entry = json.loads(raw)
+                    except ValueError:
+                        entry = None
+                    if isinstance(entry, dict) and entry.get("type") == "user":
+                        row = _history_row(entry)
+                if row is None:
+                    last_row = None
                     continue
-                try:
-                    entry = json.loads(raw)
-                except ValueError:
-                    continue
-                if not isinstance(entry, dict) or entry.get("type") != "user":
-                    continue
-                row = _history_row(entry)
-                if row is not None and _is_operator_row(row):
+                if _is_operator_row(row):
                     rows.append(row)
+                # A `!` command's output is the NEXT user entry; keep it beside
+                # its command so the rescued card still shows what it printed.
+                elif (_is_command_output_row(row) and rows and rows[-1] is last_row
+                      and any(_is_bang_block(b) for b in last_row["blocks"])):
+                    rows.append(row)
+                last_row = row
     except OSError:
         return []
     return rows

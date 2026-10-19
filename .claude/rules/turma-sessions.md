@@ -144,6 +144,10 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
     mid-turn, so every frame is classified by `applyTurn` before reaching the bubble: an
     empty/tool-use frame CLEARS it, the same prose block keeps the LONGER text (a shorter re-capture is
     a mid-frame redraw), a different one replaces wholesale. Tests: `chat-selection.test.js`.
+- **A `!` shell command is a RED operator bubble with its output open beneath it** (XERK-2112,
+  `renderBashCard`; Android `TranscriptCommand`), in every verbosity — a collapsed chip hid where it
+  ran and what it printed. `/slash` commands keep the chip. Tests: the `XERK-2112` cases in
+  `chat.test.js`, `ChatItemsTest.kt`.
 - **Bubble prose is rendered by `renderProse`** — the markdown-to-HTML engine (fences, tables,
   headings/lists/quotes/rules, emphasis, inline code, links, inline images/SVGs), its LINEARITY
   and JS↔Kotlin port-parity invariants → `.claude/rules/chat-prose.md`.

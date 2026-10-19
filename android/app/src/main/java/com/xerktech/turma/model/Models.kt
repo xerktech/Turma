@@ -1509,6 +1509,28 @@ data class TaskNotificationBlock(
     val truncated: Boolean = false,
 ) : Block()
 
+/**
+ * A `/slash` command or a `!` shell command the operator ran (agent
+ * `_parse_local_command`): [name] is "/compact"-style or "!" for a shell
+ * command, [args] the rest of the line (a `!` command's whole text).
+ */
+@Serializable
+@SerialName("command")
+data class CommandBlock(
+    val name: String = "",
+    val args: String = "",
+    val truncated: Boolean = false,
+) : Block()
+
+/** The output of the [CommandBlock] just before it — its own transcript entry. */
+@Serializable
+@SerialName("command_output")
+data class CommandOutputBlock(
+    val text: String = "",
+    val isError: Boolean = false,
+    val truncated: Boolean = false,
+) : Block()
+
 @Serializable
 @SerialName("__unknown")
 data class UnknownBlock(val ignored: String = "") : Block()

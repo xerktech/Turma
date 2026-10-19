@@ -14,11 +14,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
@@ -98,6 +100,7 @@ fun ChatItemView(item: ChatItem) {
         is ChatItem.FoldedThoughts -> TranscriptFoldedThoughts(item)
         is ChatItem.Tool -> TranscriptTool(item)
         is ChatItem.TaskNote -> Pill("⚑ ${item.summary} (${item.status})")
+        is ChatItem.Command -> TranscriptCommand(item)
     }
 }
 
@@ -212,6 +215,67 @@ private fun TranscriptBubble(b: ChatItem.Bubble) {
                 // Plain agent text: no Surface, no background, no border.
                 Box(Modifier.widthIn(max = cap)) { body() }
             }
+        }
+    }
+}
+
+// The web's --critical, the colour Claude Code's own bash mode draws `!` in.
+private const val BASH_RED = 0xFFD03B3BL
+
+/**
+ * A command the operator ran (web parity: chat.js renderBashCard /
+ * renderCommandCard). A `!` shell command (XERK-2112) is operator input, so it
+ * sits right like the operator's bubble, but red so it never reads as a typed
+ * message, with its output open beneath it. A `/slash` command stays a chip.
+ */
+@Composable
+private fun TranscriptCommand(c: ChatItem.Command) {
+    val mono = FontFamily.Monospace
+    val output: @Composable () -> Unit = {
+        val r = c.result
+        if (r != null) {
+            val shape = RoundedCornerShape(8.dp)
+            val edge = if (c.isError) Color(BASH_RED) else MaterialTheme.colorScheme.outline
+            Text(
+                r.ifEmpty { "(no output)" },
+                Modifier.fillMaxWidth().heightIn(max = 240.dp).border(1.dp, edge, shape)
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), shape)
+                    .verticalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 6.dp),
+                fontSize = scaledSp(11f), lineHeight = scaledSp(15f), fontFamily = mono,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            if (c.resultClipped) ClippedMark()
+        }
+    }
+    if (c.name != "!") {
+        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Pill("› " + listOf(c.name, c.args.substringBefore('\n')).filter { it.isNotEmpty() }.joinToString(" "), dashed = true, mono = true)
+            output()
+        }
+        return
+    }
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val cap = (maxWidth + BASE_BUBBLE_MAX) / 2
+        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            val red = Color(BASH_RED)
+            val shape = RoundedCornerShape(12.dp)
+            Surface(
+                color = red.copy(alpha = 0.14f), shape = shape,
+                modifier = Modifier.widthIn(max = cap).border(1.dp, red.copy(alpha = 0.45f), shape).testTag("bash-command"),
+            ) {
+                Column(Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+                    Text(
+                        buildAnnotatedString {
+                            withStyle(SpanStyle(color = red, fontWeight = FontWeight.Bold)) { append("! ") }
+                            append(c.args)
+                        },
+                        fontSize = scaledSp(12.5f), lineHeight = scaledSp(17f), fontFamily = mono,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    if (c.argsClipped) ClippedMark(Modifier.padding(top = 2.dp))
+                }
+            }
+            output()
         }
     }
 }

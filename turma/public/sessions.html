@@ -915,6 +915,20 @@
     font-size: 11.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere;
     max-height: 240px; overflow: auto; }
   .cmd-card.err pre { border-color: var(--critical); }
+  /* A `!` shell command (chat.js renderBashCard, XERK-2112): operator input, so
+     right-aligned like a user bubble, but red like Claude Code's bash mode, with
+     its output open beneath it. */
+  .bash-card { align-self: flex-end; max-width: 760px; display: flex; flex-direction: column;
+    align-items: flex-end; gap: 4px; min-width: 0; }
+  .tr-msg.bash { background: color-mix(in srgb, var(--critical) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--critical) 45%, transparent); color: var(--ink);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .tr-msg.bash .bash-prompt { color: var(--critical-text, var(--critical)); font-weight: 700; }
+  .bash-card .bash-out { align-self: stretch; margin: 0; padding: 7px 9px; background: var(--page);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; line-height: 1.45;
+    white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; }
+  .bash-card .bash-out.err { border-color: var(--critical); }
 
   /* The model's own post-compaction summary. Stored as a user turn, shown on the
      assistant's side (it's the model's writing) and collapsed — it's long, and

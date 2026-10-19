@@ -1,6 +1,8 @@
 package com.xerktech.turma.core
 
 import com.xerktech.turma.model.Block
+import com.xerktech.turma.model.CommandBlock
+import com.xerktech.turma.model.CommandOutputBlock
 import com.xerktech.turma.model.SendFile
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TaskNotificationBlock
@@ -121,6 +123,25 @@ sealed interface ChatItem {
         val caption: String = "",
     ) : ChatItem
 
+    /**
+     * A command the operator ran, with its output folded in once it lands (web
+     * parity: chat.js buildItems' `command` item). [name] "!" is a shell command
+     * (XERK-2112) — drawn as a red operator bubble with its output open beneath,
+     * so the chat shows where it ran and what came after; anything else is a
+     * `/slash` command, drawn as a chip. [name] "output" is an output whose
+     * invocation scrolled off. [result] null = no output yet. Never hidden by a
+     * verbosity: it is the operator's own input.
+     */
+    data class Command(
+        override val entryKey: String,
+        val name: String,
+        val args: String,
+        val result: String? = null,
+        val isError: Boolean = false,
+        val argsClipped: Boolean = false,
+        val resultClipped: Boolean = false,
+    ) : ChatItem
+
     data class TaskNote(
         override val entryKey: String,
         val summary: String,
@@ -180,6 +201,10 @@ fun buildItems(
             foldKey = null
         }
     }
+    // The command item still waiting for its output, as an index into [out]. An
+    // output arrives as the NEXT entry, so this spans entries, and any other
+    // block between the two drops it (chat.js `openCmd`).
+    var openCmd = -1
     for (entry in entries) {
         // Older agents / the text-only heartbeat seed carry no blocks: synthesize
         // them, splitting a trailing run of tool markers off into name-only
@@ -212,6 +237,7 @@ fun buildItems(
             }
         }
         for (block in blocks) {
+            if (block !is CommandBlock && block !is CommandOutputBlock) openCmd = -1
             when (block) {
                 is TextBlock -> {
                     (pending ?: StringBuilder().also { pending = it }).append(block.text)
@@ -264,6 +290,35 @@ fun buildItems(
                             )
                         )
                     }
+                }
+                is CommandBlock -> {
+                    flushText()
+                    flushFold()
+                    out.add(
+                        ChatItem.Command(
+                            entry.key, block.name.ifEmpty { "/command" }, block.args,
+                            argsClipped = block.truncated,
+                        )
+                    )
+                    openCmd = out.size - 1
+                }
+                is CommandOutputBlock -> {
+                    flushText()
+                    flushFold()
+                    val open = (out.getOrNull(openCmd) as? ChatItem.Command)?.takeIf { it.result == null }
+                    if (open != null) {
+                        out[openCmd] = open.copy(result = block.text, isError = block.isError, resultClipped = block.truncated)
+                    } else {
+                        // No invocation ahead of it (scrolled off, or a window that
+                        // starts mid-sequence): show the output on its own.
+                        out.add(
+                            ChatItem.Command(
+                                entry.key, "output", "", block.text, block.isError,
+                                resultClipped = block.truncated,
+                            )
+                        )
+                    }
+                    openCmd = -1
                 }
                 is TaskNotificationBlock -> {
                     flushText()
