@@ -169,6 +169,9 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   concern, not the agent's). Also closes the ack-before-session-visible double-start window — a
   just-dispatched child is backoff-held for the beat or two before its session first heartbeats.
   Bounded by `EPIC_CHILD_ATTEMPTS_MAX` (oldest-first eviction, a re-stamp on next attempt).
+- **`drainTicketQueue` re-stamps a child's `epicChildAttempts` at dispatch** (XERK-1858), keeping its
+  attempt count: stamped only at enqueue, a child that waited in line past its step was re-queued on
+  the very beat its spawn was acked. The launch grace (`att.at`) runs from the hand-over too.
 - **Readiness = all-blockers-Done** (`epicChildBlockersDone`): an in-epic blocker (a key in
   `run.children`) is AUTHORITATIVE and must be a confirmed Done row — a poll gap hiding it HOLDS the
   child, never races ahead. A VISIBLE external blocker holds only while it's not Done; an unresolvable

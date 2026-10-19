@@ -118,10 +118,12 @@ function workClass(type) {
  * sanitized id, else "". "claude-opus-4-8", "opus", "Opus 4.8" all read "opus".
  */
 function modelFamily(v) {
-  const s = capStr(v, 80).toLowerCase();
+  // The family check reads a generous prefix, not the 40-char id cap: a probe label
+  // can name its family past char 80 (XERK-1858).
+  const s = capStr(v, 500).toLowerCase();
   if (!s) return "";
   for (const f of MODEL_FAMILIES) if (s.includes(f)) return f;
-  return s.replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  return s.slice(0, 80).replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
 }
 
 // What an unpinned session runs on when its host never probed a default: Opus, the
@@ -588,10 +590,20 @@ function decideShadow(key, decision, now = Date.now()) {
   return changed.size > 0;
 }
 
+// A dispatched shadow whose host has reported no row for it this long never ran
+// (the host went away before acking): it stops counting toward the daily cap.
+const SHADOW_LOST_MS = 60 * 60 * 1000;
+
 /** Shadows dispatched at or after `since` (the daily cap's count). */
-function shadowsDispatchedSince(since) {
+function shadowsDispatchedSince(since, now = Date.now()) {
+  const reported = new Set();
+  for (const r of rows.values()) if (r.kind === "shadow") reported.add(r.sid);
   let n = 0;
-  for (const r of rows.values()) if (r.shadow && r.shadow.sampled && r.shadow.at >= since) n += 1;
+  for (const r of rows.values()) {
+    if (!r.shadow || !r.shadow.sampled || r.shadow.at < since) continue;
+    if (!reported.has(r.shadow.id) && now - r.shadow.at > SHADOW_LOST_MS) continue;
+    n += 1;
+  }
   return n;
 }
 
@@ -692,6 +704,8 @@ function commit(prev, next, now, changed) {
 // reports re-creates it next sweep with a new firstSeen and rewrites the backend,
 // while a row created this sweep was never persisted, so dropping it churns nothing.
 // A shadow row is made by observeShadows, never reported here, so it ranks as reported.
+// A host's shadow rows and live rows are capped apart (XERK-1858), so a busy shadow
+// host never evicts the live evidence its shadows are paired against.
 function evict(now = Date.now(), sweep = null) {
   const cutoff = now - RETAIN_DAYS * DAY_MS;
   const dropped = [];
@@ -705,8 +719,9 @@ function evict(now = Date.now(), sweep = null) {
   const byHost = new Map();
   for (const r of rows.values()) {
     if (r.updatedAt < cutoff) { drop(r); continue; }
-    if (!byHost.has(r.host)) byHost.set(r.host, []);
-    byHost.get(r.host).push(r);
+    const hk = `${r.kind === "shadow" ? "s" : "l"}\u0000${r.host}`;
+    if (!byHost.has(hk)) byHost.set(hk, []);
+    byHost.get(hk).push(r);
   }
   for (const list of byHost.values()) {
     if (list.length <= HOST_MAX_ROWS) continue;
@@ -948,8 +963,11 @@ function liveRate(cls, model, { since = 0, now = Date.now(), windowDays = WINDOW
   for (const r of rows.values()) {
     if (r.kind === "shadow" || r.cls !== cls || r.model !== model) continue;
     // Strictly after: work started in the promotion's own millisecond was not
-    // routed by it.
-    if (since && (r.startedAt || r.firstSeen) <= since) continue;
+    // routed by it. The agent stamps createdAt in whole seconds, so a whole-second
+    // start reads as the end of its second — else work started later in the
+    // promotion's second is dropped (XERK-1858).
+    const t = r.startedAt || r.firstSeen;
+    if (since && (t % 1000 === 0 ? t + 999 : t) <= since) continue;
     const { outcome, reason } = outcomeOf(r, now, windowDays);
     if (outcome === "bad") { bad += 1; n += 1; }
     else if (outcome === "good" || reason === "merged, in window") n += 1;
@@ -1122,15 +1140,24 @@ class OutcomeLedgerPgStore {
       `SELECT doc FROM ${this.table} ORDER BY updated_at DESC LIMIT $1`, [String(MAX_ROWS)])) || [];
     const held = new Set();
     const stale = [];
+    let oldest = Infinity;
     for (const g of got) {
       let doc = null;
       try { doc = JSON.parse(g.doc); } catch { continue; }
       const r = sanitizeRow(doc);
       if (!r) continue;
       held.add(r.key);
+      if (r.updatedAt < oldest) oldest = r.updatedAt;
       const hot = rows.get(r.key);
       if (hot && hot.updatedAt > r.updatedAt) { stale.push(hot); continue; }
       rows.set(r.key, r);
+    }
+    // A full page means the table may hold rows past MAX_ROWS (deletes lost to an
+    // outage, or the limit lowered): the model never loads them, so evict() never
+    // deletes them — drop them here or the table grows past the cap for good.
+    // Hot rows the table lacks are re-queued below, after this delete.
+    if (got.length >= MAX_ROWS && Number.isFinite(oldest)) {
+      await this.pool.query(`DELETE FROM ${this.table} WHERE updated_at < $1`, [String(oldest)]);
     }
     const dropped = evict(now);
     for (const r of rows.values()) if (!held.has(r.key)) stale.push(r);
@@ -1250,7 +1277,7 @@ module.exports = {
   LEDGER_FILE, MAX_ROWS, WINDOW_DAYS, RETAIN_DAYS, T_ROW, OutcomeLedgerPgStore,
   _internals: {
     rows: () => rows,
-    load, writeNow,
+    load, writeNow, evict,
     reset() {
       rows = new Map();
       if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }

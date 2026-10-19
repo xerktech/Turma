@@ -27,6 +27,11 @@ const { FileLiveStore } = require("../store.js");
 
 const tick = () => new Promise((r) => setImmediate(r));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Poll until `pred()` holds (or `ms` elapse) — a fixed sleep flakes on a loaded host.
+async function until(pred, ms = 3000) {
+  const end = Date.now() + ms;
+  while (!pred() && Date.now() < end) await sleep(10);
+}
 const req = (url, headers = {}, method = "GET") => ({ url, headers, method });
 
 function listen(server) {
@@ -667,11 +672,13 @@ test("XERK-919 QA2: with the store down, a leader counts as fresh ONLY while dia
   const leader = net.createServer((s) => s.end()); const lport = await listen(leader);
   let healthy = true;
   const store = new FileLiveStore();
-  const f = makeForwarder(store, "me", { isLeader: () => false, ttlMs: 60, storeHealthy: () => healthy, cooldownMs: 1000 });
+  // A TTL well above a loaded host's follower round trip, so the dial proof below is
+  // read inside it (60ms flaked under load, XERK-1858).
+  const f = makeForwarder(store, "me", { isLeader: () => false, ttlMs: 400, storeHealthy: () => healthy, cooldownMs: 1000 });
   await f.start();
   await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: `127.0.0.1:${lport}`, at: Date.now() });
   assert.equal(f.remoteLeaderFresh(), true, "fresh entry");
-  await sleep(80);
+  await sleep(450);
   healthy = false;
   assert.equal(f.remoteLeaderFresh(), false, "store down + entry aged + never dialed -> NOT proof the leader lives");
   // A successful forward (dial) proves it.
@@ -679,7 +686,7 @@ test("XERK-919 QA2: with the store down, a leader counts as fresh ONLY while dia
   await request(port, { path: "/api/x" }).catch(() => {});
   assert.equal(f.remoteLeaderFresh(), true, "a recent successful dial keeps it fresh while the store is down");
   // The leader dies: the next dial fails and the claim lapses.
-  leader.close(); await sleep(80);
+  leader.close(); await sleep(450);
   await request(port, { path: "/api/y" }).catch(() => {});
   assert.equal(f.remoteLeaderFresh(), false, "a failed dial / stale dial proof -> never hand tunnels to it");
   srv.close(); f.close();
@@ -1594,7 +1601,7 @@ test("XERK-1090: an early 2xx (a stream) is never lingered — only a refusal is
   const closed = new Promise((r) => s.on("close", r));
   await new Promise((r) => s.on("connect", r));
   s.write("POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 999999\r\n\r\nabc");
-  await sleep(50);
+  await until(() => / 200 /.test(got));
   assert.match(got, / 200 /);
   assert.doesNotMatch(got, /connection: close/i);
   assert.equal(await Promise.race([closed.then(() => "cut"), sleep(400).then(() => "open")]), "open",

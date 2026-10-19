@@ -863,7 +863,7 @@ function paintDetail() {
   const epicChildren = B.isEpicTicket(s.ticket) && site ? B.epicChildrenOf(site, s.key) : null;
   const epicOp = epicOps.get(startKey(s.siteKey, s.key)) || null;
   s.epicRunShown = B.epicPanelSig(epicRun || epicPreview, !!epicRun)
-    + (epicChildren ? "#" + B.epicChildrenSig(epicChildren) : "");
+    + (epicChildren ? "#" + B.epicChildrenSig(epicChildren) + epicOpSig(epicOp) : "");
   // The ticket's sessions, for the "Closed by" row (XERK-1569): a session that
   // closed this ticket itself, why, and when.
   const ticketSessions = B.ticketSessionsOf(
@@ -1038,7 +1038,8 @@ function refreshOpenTicket() {
     epicSig = B.epicPanelSig(B.epicRunView(run || B.epicPreviewRun(site, s.key), site,
       { sessionIndex: B.ticketSessionIndex((cache && cache.agents) || []),
         ticketQueue: queueView(cache && cache.ticketQueue) }), !!run);
-    epicSig += "#" + B.epicChildrenSig(B.epicChildrenOf(site, s.key));
+    epicSig += "#" + B.epicChildrenSig(B.epicChildrenOf(site, s.key))
+      + epicOpSig(epicOps.get(startKey(s.siteKey, s.key)));
   }
   const changed = shown(fresh.repoGuess) !== shown(s.ticket.repoGuess) ||
     (pin ? pin.host : "") !== (s.agentPinShown || "") ||
@@ -1260,6 +1261,9 @@ async function saveTriage(value) {
 // keyed like `starts` — a busy marker while the POST is in flight, a reason
 // inline (and a toast, XERK-264) if the hub refuses.
 const epicOps = new Map();   // "<siteKey>\x00<epicKey>" -> {pending, at} | {error}
+// The click overlay is part of what the open panel draws, so it is in the repaint
+// check: else a refused Start/Pause/Resume/Cancel never paints its inline error.
+const epicOpSig = (op) => (!op ? "" : op.pending ? "|busy" : `|err:${op.error}`);
 
 async function postEpicRun(epicKey, siteKey, body, verb) {
   const k = startKey(siteKey, epicKey);

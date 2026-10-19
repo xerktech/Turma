@@ -48,7 +48,7 @@ function loadDashboard() {
   const fn = new Function(
     "localStorage", "document", "window", "EventSource", "fetch",
     "setInterval", "clearInterval", "setTimeout", "clearTimeout", "location", "matchMedia", "TurmaOrg", "globalThis",
-    src + "\n;globalThis.__dash = { liveState, prBadgeHtml, fmtTokens, stateAge, sessCard, attentionHintHtml };\n;globalThis.__setRender = (f) => { render = f; };"
+    src + "\n;globalThis.__dash = { liveState, prBadgeHtml, fmtTokens, stateAge, sessCard, attentionHintHtml, confirming };\n;globalThis.__setRender = (f) => { render = f; };"
   );
   fn(g.localStorage, g.document, g.window, g.EventSource, g.fetch,
      g.setInterval, g.clearInterval, g.setTimeout, g.clearTimeout, g.location, g.matchMedia, g.TurmaOrg, g);
@@ -477,4 +477,20 @@ test("dashboard card: the Branch row names a git problem instead of an endless �
     /<dt>Branch<\/dt><dd><b>worktree gone<\/b><\/dd>/);
   assert.match(card({ gitProblem: { unreadable: "dubious <ownership>" } }),
     /<dt>Branch<\/dt><dd><b title="dubious &lt;ownership&gt;">git unreadable<\/b><\/dd>/);
+});
+
+// XERK-1858: the armed Delete button's copy follows what is left to lose — a
+// worktree the agent found gone has nothing, one never read may have changes.
+test("dashboard card: an armed Delete names a gone worktree instead of warning of lost changes", () => {
+  const { sessCard, confirming } = loadDashboard();
+  const host = { key: "h1", online: true, lastSeen: NOW, terminalOnline: true };
+  const card = (extra) => sessCard(host, { id: "s1", status: "stopped", repo: "r", git: null,
+    session: { paneBusy: false }, ...extra }, NOW);
+  confirming.set("sd::h1::s1", 0);
+  assert.match(card({ gitProblem: { missing: true } }), />Confirm delete — worktree already gone</);
+  assert.match(card({}), />Confirm delete — may have uncommitted changes</);
+  assert.match(card({ gitProblem: { unreadable: "x" } }), />Confirm delete — may have uncommitted changes</);
+  assert.match(card({ git: { dirtyFiles: 2 }, gitProblem: { missing: true } }),
+    />Confirm delete — uncommitted changes will be lost</);
+  confirming.clear();
 });

@@ -33,6 +33,8 @@ Never restore a ladder or route from bench solve rates (`bench/run_policy.py` is
   above the Opus baseline for the class is demoted, logged, and the operator notified
   (`model-demoted:<class>/<model>`). Same-millisecond work was not routed by the promotion; the
   release gate caught a test that re-demoted in the promoting sweep on a fast runner.
+  - The agent's `createdAt` is whole seconds, so a whole-second start reads as the END of its
+    second (XERK-1858): else work started later in the promotion's own second was dropped.
   - The rate's denominator is bad + good + merged-still-in-window, on BOTH sides: `good` needs the
     90-day window, so bad ÷ (good + bad) would read every new model as all-bad and trip at once.
   - No Opus evidence for the class → baseline 0, so one bad demotes. Conservative on purpose:

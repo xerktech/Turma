@@ -3879,8 +3879,8 @@ function epicRunActiveCount(run, rows, now, exclude) {
     const q = liveQueuedTicket(run.siteKey, childKey);
     if (live.has(k)) n++;
     // A child still in line is judged by its entry alone: the launch grace is
-    // stamped at QUEUE time, so applying it here made two cap-held siblings hold
-    // each other at the cap for up to the grace with a host free.
+    // stamped at QUEUE time (and again at dispatch), so applying it here made two
+    // cap-held siblings hold each other at the cap for up to the grace with a host free.
     else if (q) { if (q.reason !== "blocked" && q.reason !== "epic-cap") n++; }
     else if (spawnTicketInFlight(run.siteKey, childKey)
       || committedTicketSpawn(run.siteKey, childKey)
@@ -4886,7 +4886,7 @@ function modelShadowSweep(now = Date.now(),
       now, maxAgeMs: MODEL_SHADOW_MAX_AGE_DAYS * 86400000,
     });
     if (!candidates.length) return;
-    let used = outcomeLedger.shadowsDispatchedSince(now - 86400000);
+    let used = outcomeLedger.shadowsDispatchedSince(now - 86400000, now);
     const pairs = outcomeLedger.aggregate({ now }).pairs;
     const hostsUsed = new Set();
     for (const c of candidates) {
@@ -14504,6 +14504,18 @@ function drainTicketQueue() {
         console.log(`auto-start: retrying ${logName(e.issueKey)} on ${logName(host)} — the previous `
           + "spawnTicket was acked but left no session (backing off, but the hub "
           + "keeps trying so it recovers once the block clears)");
+      }
+    }
+    // An epic child's backoff was stamped when the driver QUEUED it; a child that
+    // waited longer than its retry step in line would be re-queued on the very beat
+    // that acks this spawn, before its session first heartbeats. Re-stamp it from
+    // the hand-over, keeping the attempt count (XERK-1858).
+    if (e.epicRun) {
+      const prior = epicChildAttempts.get(k);
+      if (prior) {
+        const rec = { ...prior, nextAt: autoStartRetryAt(now, prior.attempts), at: now };
+        epicChildAttempts.set(k, rec);
+        guardStoreSet("epicChildAttempts", k, rec);
       }
     }
     drop(null);

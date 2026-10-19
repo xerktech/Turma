@@ -693,7 +693,7 @@ test("XERK-1847: only a hub-dispatched shadow's report lands, paired with its li
   const live = only();
   L.decideShadow(live.key, { sampled: true, at: T0 + 2 * DAY, id: "sh-00112233aabb",
     model: "haiku", host: "h2" }, T0 + 2 * DAY);
-  assert.equal(L.shadowsDispatchedSince(T0), 1);
+  assert.equal(L.shadowsDispatchedSince(T0, T0 + 2 * DAY), 1);
   // Wrong host, wrong org, unknown id: all dropped.
   L.observeShadows([
     { site: "acme.atlassian.net", host: "h3", id: "sh-00112233aabb", state: "running" },
@@ -848,4 +848,99 @@ test("XERK-1855: an upsert queued behind an in-flight DELETE drains in the same 
   release();
   await pass;
   assert.ok(table.has(row("new").key));
+});
+
+test("XERK-1858: a family named past the label's 80th char still reads as that family", () => {
+  assert.equal(L.modelFamily(`${"x".repeat(90)} Sonnet 5`), "sonnet");
+  assert.equal(L.modelFamily("claude-opus-4-8"), "opus");
+  assert.ok(L.modelFamily("y".repeat(300)).length <= 40);
+});
+
+test("XERK-1858: a sampled shadow its host never reported stops counting toward the daily cap", () => {
+  L._internals.reset();
+  mergedLive();
+  const live = only();
+  const at = T0 + 2 * DAY;
+  L.decideShadow(live.key, { sampled: true, at, id: "sh-00112233aabb", model: "haiku", host: "h2" }, at);
+  assert.equal(L.shadowsDispatchedSince(T0, at + 60000), 1, "just dispatched: counts");
+  assert.equal(L.shadowsDispatchedSince(T0, at + 2 * 3600000), 0, "never reported: lost");
+  // Once its host reports it, it counts for the whole day.
+  L.observeShadows([{ site: "acme.atlassian.net", host: "h2", id: "sh-00112233aabb", state: "running" }], at + 1000);
+  assert.equal(L.shadowsDispatchedSince(T0, at + 2 * 3600000), 1);
+  L._internals.reset();
+});
+
+test("XERK-1858: a host's shadow rows never evict its live rows", () => {
+  L._internals.reset();
+  recording();
+  const per = Math.floor(L.MAX_ROWS / 4);
+  const rows = L._internals.rows();
+  // A host at its live cap, plus shadow rows it ran.
+  L.observe(Array.from({ length: per }, (_, i) => obs({ host: "h2", sid: `b${i}` })), T0);
+  for (let i = 0; i < 5; i++) {
+    const sh = L.sanitizeRow({ site: "acme.atlassian.net", issue: "ACME-1", host: "h2",
+      sid: `sh-0011223344${i}0`, cls: "bug", model: "haiku", kind: "shadow", pairOf: "k",
+      firstSeen: T0 + 1, updatedAt: T0 + 1 });
+    rows.set(sh.key, sh);
+  }
+  L._internals.evict(T0 + 2);
+  const left = [...rows.values()];
+  assert.equal(left.filter((r) => r.kind !== "shadow").length, per);
+  assert.equal(left.filter((r) => r.kind === "shadow").length, 5);
+  L._internals.reset();
+});
+
+test("XERK-1858: a pair's grade time, which the agent stamps, decides the evidence window", () => {
+  L._internals.reset();
+  mergedLive();
+  const live = only();
+  L.decideShadow(live.key, { sampled: true, at: T0 + 2 * DAY, id: "sh-00112233aabb",
+    model: "haiku", host: "h2" }, T0 + 2 * DAY);
+  // Graded at day 3, but the row last changed at day 6.
+  L.observeShadows([{ site: "acme.atlassian.net", host: "h2", id: "sh-00112233aabb",
+    grade: { verdict: "good", at: new Date(T0 + 3 * DAY).toISOString() } }], T0 + 6 * DAY);
+  assert.deepEqual(L.pairEvidence("bug", "haiku", { since: T0 + 4 * DAY, now: T0 + 7 * DAY }),
+    { graded: 0, mOnlyFail: 0 });
+  assert.deepEqual(L.pairEvidence("bug", "haiku", { since: T0 + 3 * DAY, now: T0 + 7 * DAY }),
+    { graded: 1, mOnlyFail: 0 });
+  L._internals.reset();
+});
+
+test("XERK-1858: a rescan deletes table rows past MAX_ROWS the model never loads", async () => {
+  const table = new Map();
+  const pool = {
+    health: "ready",
+    async query(sql, params = []) {
+      if (/^CREATE TABLE/.test(sql)) return [];
+      if (/^SELECT doc/.test(sql)) {
+        return [...table.values()].sort((a, b) => b.updated_at - a.updated_at).slice(0, Number(params[0]));
+      }
+      if (/^INSERT/.test(sql)) {
+        for (let i = 0; i < params.length; i += 3) table.set(params[i], { updated_at: params[i + 1], doc: params[i + 2] });
+        return [];
+      }
+      if (/^DELETE .* WHERE updated_at < \$1$/.test(sql)) {
+        for (const [k, v] of table) if (Number(v.updated_at) < Number(params[0])) table.delete(k);
+        return [];
+      }
+      if (/^DELETE/.test(sql)) { for (const k of params) table.delete(k); return []; }
+      throw new Error(sql);
+    },
+  };
+  L._internals.reset();
+  const extra = 5;
+  for (let i = 0; i < L.MAX_ROWS + extra; i++) {
+    const r = L.sanitizeRow({ site: `o${i % 8}.atlassian.net`, issue: "A-1", host: `h${i % 8}`,
+      sid: `s${i}`, cls: "bug", model: "opus", firstSeen: T0 + i, updatedAt: T0 + i });
+    table.set(r.key, { updated_at: String(r.updatedAt), doc: JSON.stringify(r) });
+  }
+  const store = new L.OutcomeLedgerPgStore(pool);
+  L._internals.setBackend(store);
+  await store.rescan(T0 + L.MAX_ROWS + extra);
+  await store._drain();
+  assert.equal(L._internals.rows().size, L.MAX_ROWS);
+  assert.equal(table.size, L.MAX_ROWS);
+  for (let i = 0; i < extra; i++) assert.ok(!table.has(JSON.stringify([`o${i % 8}.atlassian.net`, "A-1", `h${i % 8}`, `s${i}`])));
+  await store.close();
+  L._internals.reset();
 });
