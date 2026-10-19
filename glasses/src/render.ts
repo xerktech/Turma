@@ -316,11 +316,25 @@ export function homeRowKey(row: HomeRow | undefined): string | undefined {
 // headers. Render and input both resolve through this, so the marker and a tap
 // agree even when the list regrouped with no poll (a host aging offline).
 export function homeCursor(rows: HomeRow[], home: { cursor: number; selected?: string }): number {
-  if (home.selected) {
-    const i = rows.findIndex((r) => homeRowKey(r) === home.selected);
+  const selected = home.selected;
+  if (selected) {
+    const i = rows.findIndex((r) => homeRowKey(r) === selected);
     if (i >= 0) return i;
   }
-  return clampHomeCursor(rows, home.cursor);
+  const wasSession = selected?.startsWith("s:") ?? false;
+  if (wasSession) {
+    // The selected session moved host (a migration landed): the same id on its
+    // new host is still the wearer's session, wherever the regroup put it.
+    const moved = rows.findIndex((r) => r.kind === "session" && selected!.endsWith(`:${r.sessionId}`));
+    if (moved >= 0) return moved;
+  }
+  const c = clampHomeCursor(rows, home.cursor);
+  if (wasSession && rows[c]?.kind !== "session") {
+    // The selected session is gone and its index slid onto an action row
+    // ("+ New session"): stay among the sessions, on the nearest one above.
+    for (let i = c - 1; i >= 0; i--) if (rows[i]?.kind === "session") return i;
+  }
+  return c;
 }
 
 // Keeps the home cursor in range as the row list shrinks/grows (host

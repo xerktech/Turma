@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { BOTTOM_MAX_LINES, bottomBoxLines, inputBoxBody, MENU_MAX_LINES, menuBox, sheetBody, statusLabel } from "./input-box.ts";
+import { LINE_WIDTH_PX } from "./layout.ts";
+import { measureDefault } from "./text-wrap.ts";
 
 describe("bottomBoxLines", () => {
   it("clamps to a minimum of 1 line when content is empty", () => {
@@ -107,6 +109,22 @@ describe("sheetBody", () => {
   it("clamps an out-of-range selected so a row is still marked", () => {
     const lines = sheetBody({ question: "Pick one?", options: ["Red", "Green"], selected: 99 });
     expect(lines).toEqual(["Pick one?", "  1. Red", "  2. Green", "> 3. Dictate answer…"]);
+  });
+
+  it("windows by wrapped line, so a long option never pushes the selected row out of the box (XERK-1858)", () => {
+    const options = ["x".repeat(400), "Green", "Blue"];
+    for (let selected = 0; selected <= options.length; selected++) {
+      const lines = sheetBody({ question: "Pick one?", options, selected });
+      expect(lines.length).toBeLessThanOrEqual(BOTTOM_MAX_LINES);
+      for (const line of lines) expect(measureDefault(line)).toBeLessThanOrEqual(LINE_WIDTH_PX);
+      const marked = lines.filter((l) => l.startsWith("> "));
+      expect(marked).toHaveLength(1);
+      expect(marked[0]).toMatch(new RegExp(`^> ${selected + 1}\\.`));
+    }
+    // The long option itself wraps, its continuation indented under it.
+    const top = sheetBody({ question: "Pick one?", options, selected: 0 });
+    expect(top[1]).toBe("> 1.");
+    expect(top[2]).toMatch(/^  x+$/);
   });
 
   it("windows a long option list so the selected row stays visible", () => {

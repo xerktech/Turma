@@ -263,6 +263,9 @@ export interface AppState {
   pending: Record<string, PendingEntry>;
   answered: Record<string, AnsweredEntry>;
   loadingHistory: Record<string, boolean>;
+  // Unsent dictated drafts of sessions the wearer left ("<host>:<id>" -> text),
+  // put back when that session is entered again. Leaving is not a Clear.
+  drafts: Record<string, string>;
 
   home: HomeScreenState;
   session: SessionScreenState | null;
@@ -294,6 +297,7 @@ export function createInitialState(now: number): AppState {
     pending: {},
     answered: {},
     loadingHistory: {},
+    drafts: {},
     home: { cursor: 0 },
     session: null,
     actions: null,
@@ -522,7 +526,28 @@ export class App {
       this.state.agents.find((a) => (a.sessions ?? []).some((s) => s.id === sessionId))?.key ??
       hostKeyHint;
     if (!host) return;
-    this.setState({ screen: "session", session: newSessionState(host, sessionId) });
+    this.setState({ screen: "session", session: this.reenterSession(host, sessionId) });
+  }
+
+  // Entering a session from outside it (home, the phone): a fresh screen
+  // state, carrying the draft the wearer left it with. The current session's
+  // own draft is stashed first, so switching straight across loses nothing.
+  private reenterSession(hostKey: string, sessionId: string): SessionScreenState {
+    this.stashDraft();
+    const key = `${hostKey}:${sessionId}`;
+    const draft = this.state.drafts[key] ?? "";
+    if (key in this.state.drafts) {
+      const { [key]: _taken, ...drafts } = this.state.drafts;
+      this.state = { ...this.state, drafts };
+    }
+    return { ...newSessionState(hostKey, sessionId), draft };
+  }
+
+  // Keeps the on-screen session's unsent draft for its next entry.
+  private stashDraft(): void {
+    const s = this.state.session;
+    if (!s?.draft) return;
+    this.state = { ...this.state, drafts: { ...this.state.drafts, [`${s.hostKey}:${s.sessionId}`]: s.draft } };
   }
 
   private schedulePoll(delayMs: number, prefetched?: Promise<AgentsResponse>): void {
@@ -884,6 +909,7 @@ export class App {
   }
 
   private goHome(): void {
+    this.stashDraft();
     this.setState({ screen: "home" });
   }
 
@@ -920,7 +946,7 @@ export class App {
       if (row.kind === "session" && row.hostKey && row.sessionId) {
         this.setState({
           screen: "session",
-          session: newSessionState(row.hostKey, row.sessionId),
+          session: this.reenterSession(row.hostKey, row.sessionId),
         });
       } else if (row.kind === "newSession") {
         this.setState({ screen: "newOrg", newOrg: { cursor: 0 } });

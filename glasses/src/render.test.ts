@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createInitialState, newSessionState, type AppState } from "./app.ts";
-import { buildHomeRows, DISPLAY_LINES, LINE_WIDTH_PX, render, sessionContentLines, sessionTranscriptArea, spawnHostFor, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
+import { buildHomeRows, DISPLAY_LINES, homeCursor, homeRowKey, LINE_WIDTH_PX, render, sessionContentLines, sessionTranscriptArea, spawnHostFor, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
 import { setGlyphCoverage } from "./font.ts";
 import { charMeasure, measureDefault, setDefaultMeasure, wrapText, type Measure } from "./text-wrap.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
@@ -990,6 +990,35 @@ describe("render: home status groups (XERK-1913)", () => {
     const none = texts([down("d1")]);
     expect(none[0]).toBe("Hosts offline");
     expect(none.some((l) => l.includes("Down"))).toBe(false);
+  });
+
+  it("a killed last session leaves the cursor on the session above it, not on '+ New session' (XERK-1858)", () => {
+    const idle = (id: string, m: number) =>
+      session({ id, repo: "r", summary: id.toUpperCase(), createdAt: T(m), session: signals({ paneBusy: false, transcriptAgeSec: 999 }) });
+    const before = buildHomeRows(base({ agents: [agent({ sessions: [idle("s1", 2), idle("s3", 1)] })] }));
+    const at = before.findIndex((r) => r.sessionId === "s3");
+    const after = buildHomeRows(base({ agents: [agent({ sessions: [idle("s1", 2)] })] }));
+    const c = homeCursor(after, { cursor: at, selected: homeRowKey(before[at]) });
+    expect(after[c]?.sessionId).toBe("s1");
+    // No session left at all: the clamp's own answer stands.
+    const empty = buildHomeRows(base({ agents: [agent({ sessions: [] })] }));
+    expect(homeCursor(empty, { cursor: at, selected: homeRowKey(before[at]) })).toBe(Math.min(at, empty.length - 1));
+    // An action row's selection is untouched by the session fallback.
+    expect(homeCursor(after, { cursor: 2, selected: "newSession" })).toBe(after.findIndex((r) => r.kind === "newSession"));
+  });
+
+  it("follows a selected session that moved to another host, even when the regroup shifts its row (XERK-1858)", () => {
+    const idle = (id: string, m: number) =>
+      session({ id, repo: "r", summary: id.toUpperCase(), createdAt: T(m), session: signals({ paneBusy: false, transcriptAgeSec: 999 }) });
+    const before = buildHomeRows(base({ agents: [agent({ key: "A", sessions: [idle("x", 1), idle("y", 2)] })] }));
+    const at = before.findIndex((r) => r.sessionId === "x");
+    // x lands on host B, and a new session z sorts above it: index `at` is now y.
+    const after = buildHomeRows(base({ agents: [
+      agent({ key: "A", sessions: [idle("y", 2), idle("z", 3)] }),
+      agent({ key: "B", sessions: [idle("x", 1)] }),
+    ] }));
+    const c = homeCursor(after, { cursor: at, selected: homeRowKey(before[at]) });
+    expect(after[c]).toMatchObject({ hostKey: "B", sessionId: "x" });
   });
 
   it("draws a dead host's session with the same state the groups judge it by", () => {

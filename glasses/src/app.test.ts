@@ -992,6 +992,41 @@ describe("App", () => {
     expect(app.getState().session?.draft).toBe("deploy the fix and redeploy");
   });
 
+  it("leaving a session keeps its unsent draft for the next entry; Send still clears it (XERK-1858)", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await toSessionBottom(app);
+    display.emit({ type: "tap" }); // idle -> recording
+    display.emit({ type: "tap" }); // recording -> finalising
+    dictation.resolve({ text: "deploy the fix" });
+
+    // Leave by the Options menu's Home row (the last row).
+    display.emit({ type: "tap" }); // draft present -> actions menu
+    for (let i = 0; i < 10; i++) display.emit({ type: "scrollDown" });
+    display.emit({ type: "tap" });
+    expect(app.getState().screen).toBe("home");
+
+    display.emit({ type: "tap" }); // home -> the same session
+    expect(app.getState().screen).toBe("session");
+    expect(app.getState().session?.draft).toBe("deploy the fix");
+
+    // Sending it zeroes the draft, and the next entry starts empty.
+    display.emit({ type: "doubleTap" }); // transcript -> home
+    expect(app.getState().screen).toBe("home");
+    display.emit({ type: "tap" });
+    expect(app.getState().session?.draft).toBe("deploy the fix");
+    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom"
+    display.emit({ type: "tap" }); // draft present -> actions menu
+    display.emit({ type: "scrollDown" }); // Back(0) -> Send(1)
+    display.emit({ type: "tap" });
+    await vi.waitFor(() => expect(client.sendInput).toHaveBeenCalled());
+    display.emit({ type: "doubleTap" }); // transcript -> home
+    display.emit({ type: "tap" });
+    expect(app.getState().session?.draft).toBe("");
+  });
+
   it("input mode: tap is ignored while finalising or in error", async () => {
     const client = fakeClient({
       listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),

@@ -36,6 +36,8 @@ paths:
     session id, or the action row's kind), resolved by `homeCursor` in render AND input. The
     groups regroup on a poll and on time alone (a host aging past offline with polls failing), so
     an index silently lands a tap on another session.
+  - A selected session no longer at its host + id resolves by id on any host (a landed
+    migration), then to the nearest session ABOVE the index, never onto "+ New session".
   - New session is org → repo, and `spawnHostFor` picks the org's least-busy online host with that
     repo. The phone companion is out of that scope.
   - Tests: `render.test.ts` "home status groups"/"new session by org"/"new session pickers",
