@@ -303,10 +303,10 @@ private val DELIM_CELL = Regex("""^:?-+:?$""")
 private fun hasPipe(line: String) = line.contains('|')
 
 private fun splitRow(line: String): List<String> {
-    var s = line.trim()
+    var s = jsTrim(line)
     if (s.startsWith("|")) s = s.substring(1)
     if (s.endsWith("|")) s = s.dropLast(1)
-    return s.split(PIPE_SPLIT).map { it.trim().replace("\\|", "|") }
+    return s.split(PIPE_SPLIT).map { jsTrim(it).replace("\\|", "|") }
 }
 
 private fun isDelimiterRow(line: String): Boolean {
@@ -343,7 +343,7 @@ private fun parseTables(text: String): List<ProseBlock> {
             val aligns = splitRow(lines[i + 1]).map { cellAlign(it) }
             i += 2
             val rows = ArrayList<List<List<Span>>>()
-            while (i < lines.size && lines[i].trim().isNotEmpty() && hasPipe(lines[i])) {
+            while (i < lines.size && !isJsBlank(lines[i]) && hasPipe(lines[i])) {
                 val cells = splitRow(lines[i])
                 rows.add(headerCells.indices.map { idx -> parseInline(cells.getOrElse(idx) { "" }) })
                 i++
@@ -522,7 +522,7 @@ private fun parseBlocks(text: String, depth: Int): List<ProseBlock> {
                     HEADING_RE.matchEntire(cur) == null && !isRuleLine(cur) && !QUOTE_RE.matches(cur) &&
                     indentWidth(LEADING_WS_RE.find(cur)!!.value) > items.last().indent
                 ) {
-                    items.last().text += "\n" + cur.trim()
+                    items.last().text += "\n" + jsTrim(cur)
                     i++
                     continue
                 }

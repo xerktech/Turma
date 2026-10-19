@@ -7,6 +7,10 @@ paths:
   - "android/app/src/test/java/com/xerktech/turma/core/ProseTest.kt"
   - "android/app/src/main/java/com/xerktech/turma/core/ChatItems.kt"
   - "android/app/src/test/java/com/xerktech/turma/core/ChatItemsTest.kt"
+  - "android/app/src/main/java/com/xerktech/turma/SafeSvgDecoder.kt"
+  - "android/app/src/main/java/com/xerktech/turma/core/SvgGuard.kt"
+  - "android/app/src/test/java/com/xerktech/turma/core/SvgGuardTest.kt"
+  - "android/app/src/test/java/com/xerktech/turma/SafeSvgDecoderTest.kt"
 ---
 
 # Chat bubble prose — the `renderProse` markdown engine
@@ -72,6 +76,20 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
     life. Any DOCTYPE/ENTITY is refused (alt text shows), and the root is found by WALKING the
     prolog (comments, PIs), never by searching for `<svg` — a `<svg` in a comment hid a DOCTYPE
     after it. It also sniffs past Coil's 1 KB / first-byte-`<` limit. Tests: `SvgGuardTest`.
+  - **Android renders SVG with its own decoder (`SizedSvgDecoder`), never coil-svg's `SvgDecoder`**,
+    to size it as a browser sizes an SVG `<img>`: no size → 300 × 150, each bitmap side ≥ 1 px (an
+    extreme aspect rounded to 0 and failed), a declared zero width/height → an empty 0 × 0 drawable
+    `ProseImage` lays out as nothing. Tests: `SafeSvgDecoderTest`.
+    - **The drawable's intrinsic size is the SVG's own (CSS px), never its bitmap's.** `ProseImage`
+      caps the box at it; a bitmap scaled up to the full-width placeholder made every SVG fill the
+      bubble. The bitmap is device-density, bounded by the box width and a pixel ceiling.
+    - **Embedded raster images go only through `SvgImageGuard`.** AndroidSVG 1.4 decodes a base64
+      `data:` `<image>` itself, at full size, on every draw, and asks the external resolver only
+      when that check returns null — so the guard rewrites each PARSED `<image>` href (reflection)
+      to a sentinel and resolves it: size read first, decoded once, every draw (pattern tile, `<use>`)
+      counted against `SVG_EMBEDDED_MAX_PIXELS`, plus a render deadline; past it → alt text.
+    - **Never go back to a text pre-scan of the SVG for data URIs**: each one lost to the parser (a
+      mime past the scan's cap, a raw quote inside the payload that `Base64.decode` skips).
   - **A rule line is a SCAN (`isRuleLine`), never `/(?:-[ \t]*){3,}/`.** That regex is linear in V8
     but `java.util.regex` recurses once per iteration of a quantified GROUP, so the Android port of
     it threw an **uncatchable `StackOverflowError`** out of `parseProse` inside a Composable (an
