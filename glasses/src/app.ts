@@ -572,16 +572,14 @@ export class App {
     return { ...s, draft: entry!.text };
   }
 
-  // The stash entry for a session: its own, else (a migration landed) one
-  // stashed under a host that no longer lists that id. Never another host's
-  // live copy of the same id.
+  // The stash entry for a session: its own host + id, only. A draft never
+  // follows an id to another host: ids are unique per host alone, and the
+  // fleet carries no migration marker, so "A stopped listing s1" can't tell a
+  // move from an unrelated B:s1. An orphaned draft after a real move is the
+  // accepted cost; text typed for one agent landing in another's box is not.
   private draftKeyFor(hostKey: string, sessionId: string): string | undefined {
     const own = draftKey(hostKey, sessionId);
-    if (own in this.state.drafts) return own;
-    return Object.keys(this.state.drafts).find((k) => {
-      const d = this.state.drafts[k]!;
-      return d.sessionId === sessionId && !findSession(this.state, d.hostKey, sessionId);
-    });
+    return own in this.state.drafts ? own : undefined;
   }
 
   // Keeps the on-screen session's unsent draft for its next entry. A draft

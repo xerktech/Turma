@@ -1051,22 +1051,39 @@ describe("App", () => {
       expect(draftOf(app)).toBe("for A");
     });
 
-    it("follows its session to a new host, and outlives a poll that lists the session nowhere", async () => {
+    it("never hands a draft to another host's copy of the id, even once its own host stops listing it (M8)", async () => {
       fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] }), agent({ key: "B" })];
       const app = await boot();
       app.enterSession("s1");
-      dictate("moving");
+      dictate("for A");
       app.enterSession("s2");
+      // A's s1 is gone (killed, or moved); an unrelated B:s1 appears.
       fleet = [agent({ key: "A", sessions: [session({ id: "s2" })] }), agent({ key: "B", sessions: [session({ id: "s1" })] })];
       await poll();
       app.enterSession("s1");
       expect(app.getState().session?.hostKey).toBe("B");
-      expect(draftOf(app)).toBe("moving");
-
-      app.enterSession("s2"); // stash it again, under B
-      fleet = [agent({ key: "A", sessions: [session({ id: "s2" })] }), agent({ key: "B" })];
+      expect(draftOf(app)).toBe("");
       await poll();
-      expect(Object.values(app.getState().drafts).map((d) => d.text)).toEqual(["moving"]);
+      expect(draftOf(app)).toBe("");
+      // Orphaned, not lost: it is still A:s1's if that comes back.
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "A", sessionId: "s1", text: "for A" }]);
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] }), agent({ key: "B", sessions: [session({ id: "s1" })] })];
+      await poll();
+      app.enterSession("s1", "A");
+      expect(draftOf(app)).toBe("for A");
+    });
+
+    it("a wearer on B:s1 never gets A:s1's draft when A omits s1 for a poll (M7)", async () => {
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" })] }), agent({ key: "B", sessions: [session({ id: "s1" })] })];
+      const app = await boot();
+      app.enterSession("s1", "A");
+      dictate("for A");
+      app.enterSession("s1", "B");
+      expect(draftOf(app)).toBe("");
+      fleet = [agent({ key: "A", sessions: [] }), agent({ key: "B", sessions: [session({ id: "s1" })] })];
+      await poll();
+      expect(draftOf(app)).toBe("");
+      expect(Object.keys(app.getState().drafts)).toHaveLength(1);
     });
 
     it("stays stashed while a question is pending, so the sheet shows and Send can't answer with it", async () => {
@@ -1206,7 +1223,7 @@ describe("App", () => {
       expect(draftOf(app)).toBe("keep me");
     });
 
-    it("an online host omitting the held session, then a migration gap, keeps the held draft", async () => {
+    it("an online host omitting the held session, then the id on another host, keeps the held draft as A's", async () => {
       const { app } = await heldBehindQuestion();
       const ask = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
       fleet = [agent({ key: "A", sessions: [session({ id: "s2" })] })]; // A omits s1 one poll
@@ -1220,10 +1237,13 @@ describe("App", () => {
       await poll();
       expect(Object.keys(app.getState().drafts)).toHaveLength(1);
       app.enterSession("s1", "B");
-      expect(draftOf(app)).toBe(""); // question still pending on B: sheet first
+      expect(draftOf(app)).toBe("");
       fleet = [agent({ key: "A", sessions: [session({ id: "s2" })] }), agent({ key: "B", sessions: [session({ id: "s1" })] })];
       await poll();
-      expect(draftOf(app)).toBe("held note");
+      // No migration marker reaches the fleet, so B:s1 is not A:s1: the draft
+      // stays A's and never lands in B's box.
+      expect(draftOf(app)).toBe("");
+      expect(Object.values(app.getState().drafts).map((d) => d.hostKey)).toEqual(["A"]);
     });
 
     it(`keeps at most ${MAX_DRAFTS} drafts, evicting the least recently stashed, never the session being entered`, async () => {
