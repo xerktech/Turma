@@ -48,9 +48,9 @@ const SAVE_DEBOUNCE_MS = positiveEnv("OUTCOME_LEDGER_SAVE_MS", 5000);
 const DAY_MS = 86400000;
 const PRS_MAX = 10;
 // One host may hold at most this many live rows (and as many shadow rows), and past
-// MAX_ROWS the org holding the most rows loses its shadow rows, then its oldest live
-// rows — so one host or org churning session ids cannot push the rest of the fleet's
-// evidence out.
+// MAX_ROWS the org holding the most rows loses its orphaned shadows, then its oldest
+// live rows together with their shadows — so one host or org churning session ids
+// cannot push the rest of the fleet's evidence out.
 const HOST_MAX_ROWS = positiveEnv("OUTCOME_LEDGER_HOST_MAX_ROWS", Math.max(1, Math.floor(MAX_ROWS / 4)));
 // /metrics labels a model outside these families "other": a model id is
 // agent-supplied, and every distinct one would add series to an unauthenticated route.
@@ -731,29 +731,47 @@ function evict(now = Date.now(), sweep = null) {
   }
   let over = rows.size - MAX_ROWS;
   if (over <= 0) return dropped;
-  const bySite = new Map();
+  // The org pass evicts UNITS, not rows (XERK-1858): a live row and the shadows paired
+  // with it go together, ranked and aged by the live row — evicting a shadow alone
+  // re-created it next tick (its host still reports it) and orphaned its evidence,
+  // and evicting the live row alone orphaned its shadows. An orphaned shadow (its
+  // live row already gone) is a unit of its own and goes first: it pairs with nothing.
+  const units = new Map();          // live key | orphan shadow key -> {head, rows, orphan}
   for (const r of rows.values()) {
-    if (!bySite.has(r.site)) bySite.set(r.site, []);
-    bySite.get(r.site).push(r);
+    if (r.kind !== "shadow") {
+      const u = units.get(r.key);
+      if (u) { u.head = r; u.rows.push(r); } else units.set(r.key, { head: r, rows: [r], orphan: false });
+    } else if (rows.has(r.pairOf) && rows.get(r.pairOf).kind !== "shadow") {
+      const u = units.get(r.pairOf);
+      if (u) u.rows.push(r); else units.set(r.pairOf, { head: null, rows: [r], orphan: false });
+    } else {
+      units.set(r.key, { head: r, rows: [r], orphan: true });
+    }
   }
-  // Within an org, shadow rows go before live rows, orphaned ones first (XERK-1858):
-  // a shadow is evidence only beside its live row, and oldest-first across both kinds
-  // dropped the live rows and orphaned their shadows. A shadow its host still reports
-  // comes back next tick — the churn is accepted, and only at the fleet-wide cap.
-  const kindRank = (r) => (r.kind !== "shadow" ? 2 : rows.has(r.pairOf) ? 1 : 0);
-  const orgVictimFirst = (a, b) => kindRank(a) - kindRank(b) || victimFirst(a, b);
-  for (const list of bySite.values()) list.sort((a, b) => orgVictimFirst(b, a)); // next victim last
+  const bySite = new Map();         // site -> {units (next victim last), n rows}
+  for (const u of units.values()) {
+    const site = u.head.site;
+    if (!bySite.has(site)) bySite.set(site, { units: [], n: 0 });
+    const org = bySite.get(site);
+    org.units.push(u);
+    org.n += u.rows.length;
+  }
+  const unitVictimFirst = (a, b) => (b.orphan - a.orphan) || victimFirst(a.head, b.head);
+  for (const org of bySite.values()) org.units.sort((a, b) => unitVictimFirst(b, a));
+  const next = (org) => org.units[org.units.length - 1];
   while (over > 0) {
     let big = null;
     // Tied orgs: the one whose next victim churns least loses, or tied orgs rotate a
     // reported row between them every sweep.
-    for (const list of bySite.values()) {
-      if (!list.length) continue;
-      if (!big || list.length > big.length
-        || (list.length === big.length && keep(list[list.length - 1]) < keep(big[big.length - 1]))) big = list;
+    for (const org of bySite.values()) {
+      if (!org.units.length) continue;
+      if (!big || org.n > big.n
+        || (org.n === big.n && keep(next(org).head) < keep(next(big).head))) big = org;
     }
-    drop(big.pop());
-    over -= 1;
+    const u = big.units.pop();
+    for (const r of u.rows) drop(r);
+    big.n -= u.rows.length;
+    over -= u.rows.length;
   }
   return dropped;
 }

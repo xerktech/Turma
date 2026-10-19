@@ -53,8 +53,10 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   Evicted keys are DELETEd from Postgres too, so the table is as bounded as the model.
 - **A host's shadow rows and live rows are capped apart** (XERK-1858): counted together, a busy
   shadow host evicted the live evidence its shadows pair against.
-- **Past `MAX_ROWS` the biggest org loses shadow rows (orphans first) before live rows**
-  (XERK-1858): oldest-first across both kinds dropped live rows and orphaned their shadows.
+- **Past `MAX_ROWS` the org pass evicts a live row and its paired shadows as ONE unit** (XERK-1858),
+  ranked and aged by the live row (XERK-1855 order); an orphaned shadow is its own unit and goes first.
+  - Shadows alone first churned: at the cap a new shadow was evicted and re-created every tick and
+    never graded. Rows alone, oldest-first, orphaned shadows. Tests: the `XERK-1858:` evict cases.
 - **A rescan that reads a full page DELETEs every table row below the last one it loaded**
   (XERK-1858): rows past `MAX_ROWS` never enter the model, so `evict()` never deleted them.
   - The page is ordered `updated_at DESC, key DESC` and the DELETE compares the

@@ -976,36 +976,67 @@ test("XERK-1858: the rescan's delete converges when every row shares one updated
   assert.deepEqual(new Set(table.keys()), model);
 });
 
-test("XERK-1858: past MAX_ROWS an org loses its shadow rows, orphans first, before its live rows", () => {
+test("XERK-1858: past MAX_ROWS an org drops orphaned shadows first, then a live row WITH its shadows", () => {
   L._internals.reset();
   recording();
   const rows = L._internals.rows();
   const liveKeys = [];
-  // Live rows two short of the cap; every one older than the shadows paired with it.
+  // Live rows two short of the cap, oldest first.
   const live = L.MAX_ROWS - 2;
   for (let i = 0; i < live; i++) {
     const r = L.sanitizeRow({ site: "acme.atlassian.net", issue: `A-${i}`, host: `h${i % 8}`,
-      sid: `s${i}`, cls: "bug", model: "opus", firstSeen: T0, updatedAt: T0 });
+      sid: `s${i}`, cls: "bug", model: "opus", firstSeen: T0 + i, updatedAt: T0 + i });
     rows.set(r.key, r);
     liveKeys.push(r.key);
   }
   const shadow = (i, pairOf) => {
     const sh = L.sanitizeRow({ site: "acme.atlassian.net", issue: `A-${i}`, host: `h${i % 8}`,
       sid: `sh-00112233${String(i).padStart(4, "0")}`, cls: "bug", model: "haiku", kind: "shadow",
-      pairOf, firstSeen: T0 + 10, updatedAt: T0 + 10 });
+      pairOf, firstSeen: T0 + 100000, updatedAt: T0 + 100000 });
     rows.set(sh.key, sh);
     return sh.key;
   };
-  const paired = [shadow(1, liveKeys[1]), shadow(2, liveKeys[2])];
+  const oldestPaired = shadow(0, liveKeys[0]);
+  const paired = shadow(5, liveKeys[5]);
   const orphan = shadow(3, "gone");
-  L._internals.evict(T0 + 20);
+  L._internals.evict(T0 + 200000);
   assert.ok(!rows.has(orphan), "the orphaned shadow goes first");
-  assert.ok(paired.every((k) => rows.has(k)), "paired shadows survive while an orphan can go");
-  assert.ok(liveKeys.every((k) => rows.has(k)), "no live row is dropped");
-  // Two more over: paired shadows go, still before any live row.
-  shadow(4, liveKeys[4]); shadow(5, liveKeys[5]);
-  L._internals.evict(T0 + 30);
-  assert.equal([...rows.values()].filter((r) => r.kind !== "shadow").length, live);
-  assert.equal([...rows.values()].filter((r) => r.kind === "shadow").length, 2);
+  assert.ok(rows.has(oldestPaired) && rows.has(liveKeys[0]), "one over: nothing paired goes");
+  // Two over: the OLDEST live row goes, and its shadow with it — never a shadow alone.
+  shadow(6, liveKeys[6]); shadow(7, liveKeys[7]);
+  L._internals.evict(T0 + 200000);
+  assert.ok(!rows.has(liveKeys[0]) && !rows.has(oldestPaired), "the oldest pair goes together");
+  assert.ok(rows.has(paired), "a younger pair stays");
+  const left = [...rows.values()];
+  const liveLeft = new Set(left.filter((r) => r.kind !== "shadow").map((r) => r.key));
+  assert.ok(left.filter((r) => r.kind === "shadow").every((r) => liveLeft.has(r.pairOf)), "no orphan left");
+  L._internals.reset();
+});
+
+test("XERK-1858: at the cap a new shadow survives and grades; the oldest live row makes room", () => {
+  L._internals.reset();
+  const log = recording();
+  const rows = L._internals.rows();
+  let newest = null;
+  // Old ended live rows fill MAX_ROWS; the newest is the one sampled for a shadow.
+  for (let i = 0; i < L.MAX_ROWS; i++) {
+    const t = T0 - (L.MAX_ROWS - 1 - i) * 60000;      // a minute apart, the last at T0
+    const r = L.sanitizeRow({ site: "acme.atlassian.net", issue: `I-${i}`, host: `h${i % 8}`, sid: `s${i}`,
+      cls: "bug", model: "opus", firstSeen: t, updatedAt: t, endedAt: t });
+    rows.set(r.key, r);
+    if (i === L.MAX_ROWS - 1) newest = r.key;
+  }
+  const oldest = [...rows.values()].reduce((a, b) => (a.updatedAt <= b.updatedAt ? a : b)).key;
+  L.decideShadow(newest, { sampled: true, at: T0, id: "sh-00112233aabb", model: "haiku", host: "h2" }, T0);
+  for (let tick = 1; tick <= 5; tick++) {
+    L.observeShadows([{ site: "acme.atlassian.net", host: "h2", id: "sh-00112233aabb", state: "running",
+      ...(tick >= 3 ? { grade: { verdict: "good" } } : {}) }], T0 + tick * 15000);
+  }
+  const sh = [...rows.values()].filter((r) => r.kind === "shadow");
+  assert.equal(sh.length, 1, "the shadow is not evicted and re-created each tick");
+  assert.ok(sh[0].grade, "its grade lands");
+  assert.ok(!rows.has(oldest), "the oldest live row made room");
+  assert.deepEqual(L.pairEvidence("bug", "haiku", { now: T0 + 6 * 15000 }), { graded: 1, mOnlyFail: 0 });
+  assert.equal(log.deleted, 1, "one eviction, not one per tick");
   L._internals.reset();
 });
