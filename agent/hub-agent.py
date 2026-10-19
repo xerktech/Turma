@@ -31125,7 +31125,7 @@ class SessionManager:
     # The most a bundle may unpack to, headers included. The beat's
     # _unpack_transcript decompresses through EVERY member (~0.5 s/GiB), so the
     # import thread refuses a bundle past this before the beat ever sees it.
-    MIGRATION_UNPACK_MAX = 1 << 30
+    MIGRATION_UNPACK_MAX = 1 << 31   # 2 GiB: ~1 s on the beat, 32x the 64 MiB blob cap
 
     def _read_worktree_members(self, blob):
         """The `.worktree/` members of a migration bundle, name -> bytes. Only
