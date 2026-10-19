@@ -31323,12 +31323,11 @@ class SessionManager:
         # as a plain dir, untouched.
         own = os.path.lexists(os.path.join(cwd, ".git"))
         gd = self._worktree_gitdir(cwd)
-        mark, marked_at = None, None
+        mark = None
         if own and gd:
             try:
                 with open(os.path.join(gd, self.MIGRATION_EXPORT_MARK)) as f:
                     mark = f.read(128).strip()
-                    marked_at = os.fstat(f.fileno()).st_mtime
             except OSError:
                 pass
         if mark and self._worktree_digest(cwd) == mark:
@@ -31340,9 +31339,9 @@ class SessionManager:
             redundant = rc_s == 0 and not dirty and rc_h == 0 and (
                 old == head or run_out(["git", "-C", repo, "merge-base",
                                         "--is-ancestor", old, head], timeout=t)[0] == 0)
-        if redundant and self._ignored_files_since(cwd, marked_at, t):
-            # Neither the digest nor `status` sees ignored files (a local .env,
-            # a build): one written after the export is the move's to lack.
+        if redundant and self._holds_unregenerable_ignored(cwd, t):
+            # Ignored files never ride the bundle and neither the digest nor
+            # `status` sees them: this copy holds the only one (a local .env).
             redundant = False
         if redundant:
             run_ok(["git", "-C", repo, "worktree", "remove", "--force", cwd], timeout=t)
@@ -31368,39 +31367,33 @@ class SessionManager:
         log(f"migration: kept the older worktree at {cwd} as {aside}")
         return aside
 
-    # Entries one ignored-file check walks before it gives up and reads "yes".
-    MIGRATION_IGNORED_WALK_MAX = 20000
+    # Ignored dirs a build or install re-creates: the only ignored paths an
+    # older copy may hold and still be removed. Narrow on purpose — anything
+    # else (a .env, a local config, a `build/` with who knows what) keeps it.
+    MIGRATION_REGENERABLE_DIRS = frozenset((
+        "node_modules", "__pycache__", ".venv", "venv", "target", "dist", ".gradle",
+        ".next", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"))
 
-    def _ignored_files_since(self, cwd, since, timeout):
-        """True when a gitignored file or dir in `cwd` changed after `since` (the
-        export mark's mtime), or there are any and `since` is unknown. Anything
-        it cannot tell — git failing, a walk past MIGRATION_IGNORED_WALK_MAX —
-        reads True, which only keeps a copy aside."""
-        rc, out = run_out(["git", "-C", cwd, "status", "--porcelain", "--ignored", "-z"],
-                          timeout=timeout)
+    def _holds_unregenerable_ignored(self, cwd, timeout):
+        """True when `git status --ignored=matching` lists an ignored path that is
+        not inside MIGRATION_REGENERABLE_DIRS, or names a `.env*` anywhere.
+        `matching`, never `traditional`: that one reports an untracked dir holding
+        only ignored files (`pkg/` for `pkg/__pycache__/`) as itself ignored. A
+        matched dir is one entry, never walked. Git failing reads True, which
+        only keeps a copy aside."""
+        rc, out = run_out(["git", "-C", cwd, "status", "--porcelain", "--ignored=matching",
+                           "-z"], timeout=timeout)
         if rc != 0:
             return True
-        paths = [e[3:] for e in out.split("\0") if e.startswith("!! ")]
-        if paths and since is None:
-            return True
-        budget = self.MIGRATION_IGNORED_WALK_MAX
-        stack = [os.path.join(cwd, p.rstrip("/")) for p in paths]
-        while stack:
-            budget -= 1
-            if budget < 0:
-                return True
-            p = stack.pop()
-            try:
-                st = os.lstat(p)
-            except OSError:
+        for e in out.split("\0"):
+            if not e.startswith("!! "):
                 continue
-            if st.st_mtime > since:
+            parts = e[3:].rstrip("/").split("/")
+            if any(p.startswith(".env") for p in parts):
                 return True
-            if stat.S_ISDIR(st.st_mode):
-                try:
-                    stack.extend(os.path.join(p, n) for n in os.listdir(p))
-                except OSError:
-                    return True
+            if not any(p in self.MIGRATION_REGENERABLE_DIRS for p in parts[:-1]) and \
+                    not (e.endswith("/") and parts[-1] in self.MIGRATION_REGENERABLE_DIRS):
+                return True
         return False
 
     # A bundle is the largest thing an agent ever sends, so it is the body most
