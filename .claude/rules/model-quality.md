@@ -53,8 +53,13 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   Evicted keys are DELETEd from Postgres too, so the table is as bounded as the model.
 - **A host's shadow rows and live rows are capped apart** (XERK-1858): counted together, a busy
   shadow host evicted the live evidence its shadows pair against.
-- **A rescan that reads a full page DELETEs every older table row** (XERK-1858): rows past
-  `MAX_ROWS` never enter the model, so `evict()` never deleted them and the table grew for good.
+- **Past `MAX_ROWS` the biggest org loses shadow rows (orphans first) before live rows**
+  (XERK-1858): oldest-first across both kinds dropped live rows and orphaned their shadows.
+- **A rescan that reads a full page DELETEs every table row below the last one it loaded**
+  (XERK-1858): rows past `MAX_ROWS` never enter the model, so `evict()` never deleted them.
+  - The page is ordered `updated_at DESC, key DESC` and the DELETE compares the
+    `(updated_at, key)` tuple: a sweep stamps all its rows with one `now`, so a bare
+    `updated_at <` bound never converged on a tie at the page edge.
 - **A host reporting more sessions than its cap only fills the rows it has room for** (XERK-1853):
   past it a new row evicted one the host still reports, re-created next sweep — new `firstSeen`
   and Postgres upserts + deletes every 15s. Its newest sessions go unrecorded instead.

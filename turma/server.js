@@ -14000,6 +14000,18 @@ function rememberDispatch(siteKey, issueKey, cmdId) {
   const tk = ticketQueueKey(siteKey, issueKey);
   ticketDispatchedAt.set(tk, { at: now, cmdId });
   guardStoreSet("dispatch", tk, { at: now, cmdId }, TICKET_DISPATCH_MEMO_MS);
+  // An epic child's backoff was stamped when the driver QUEUED it; a child that
+  // waited longer than its retry step would be re-queued on the very beat that acks
+  // this spawn, before its session first heartbeats. Re-stamp it from the hand-over,
+  // keeping the attempt count (XERK-1858) — on EVERY dispatch path (drain, a direct
+  // Start, a reused spawn) and keyed on the entry, not the queue entry's `epicRun`
+  // tag, which a human's Start on a run-queued child drops.
+  const prior = epicChildAttempts.get(tk);
+  if (prior) {
+    const rec = { ...prior, nextAt: autoStartRetryAt(now, prior.attempts), at: now };
+    epicChildAttempts.set(tk, rec);
+    guardStoreSet("epicChildAttempts", tk, rec);
+  }
 }
 
 function dispatchedRecently(siteKey, issueKey) {
@@ -14504,18 +14516,6 @@ function drainTicketQueue() {
         console.log(`auto-start: retrying ${logName(e.issueKey)} on ${logName(host)} — the previous `
           + "spawnTicket was acked but left no session (backing off, but the hub "
           + "keeps trying so it recovers once the block clears)");
-      }
-    }
-    // An epic child's backoff was stamped when the driver QUEUED it; a child that
-    // waited longer than its retry step in line would be re-queued on the very beat
-    // that acks this spawn, before its session first heartbeats. Re-stamp it from
-    // the hand-over, keeping the attempt count (XERK-1858).
-    if (e.epicRun) {
-      const prior = epicChildAttempts.get(k);
-      if (prior) {
-        const rec = { ...prior, nextAt: autoStartRetryAt(now, prior.attempts), at: now };
-        epicChildAttempts.set(k, rec);
-        guardStoreSet("epicChildAttempts", k, rec);
       }
     }
     drop(null);

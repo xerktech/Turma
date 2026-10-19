@@ -14306,6 +14306,29 @@ test("XERK-1858: a child that waited in line past its backoff is not re-queued t
   resetEpicRuns();
 });
 
+test("XERK-1858: a run-queued child a human Started is still re-stamped at dispatch", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  await asBeat("edClaim", "ed19.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+      tickets: driveTickets() });
+  armEpicRun("ed19.atlassian.net", "E-1");
+  epicRunDriveSweep();                                      // the run queues C-1
+  const k = "ed19.atlassian.net\x00C-1";
+  // It waited in line past its first retry step ...
+  epicChildAttempts.set(k, { ...epicChildAttempts.get(k), nextAt: Date.now() - 1 });
+  // ... then a human's Start claims the entry (dropping its epicRun tag) and dispatches it.
+  const click = await startTicket("ed19.atlassian.net", "C-1");
+  assert.equal(click.status, 200);
+  assert.equal(queuedTicket("ed19.atlassian.net", "C-1"), null, "the click dispatched it");
+  assert.ok(epicChildAttempts.get(k).nextAt > Date.now(), "the backoff restarts at the hand-over");
+  agents.edClaim.commands = [];                             // acked, no session yet
+  epicDriveRound();
+  assert.equal((agents.edClaim.commands || []).length, 0, "not re-dispatched the beat it was acked");
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
 test("XERK-636: the run advances to done once every child is Done, and drives nothing more", async () => {
   resetAutoStart();
   resetEpicRuns();

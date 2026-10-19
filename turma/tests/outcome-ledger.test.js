@@ -906,41 +906,106 @@ test("XERK-1858: a pair's grade time, which the agent stamps, decides the eviden
   L._internals.reset();
 });
 
-test("XERK-1858: a rescan deletes table rows past MAX_ROWS the model never loads", async () => {
-  const table = new Map();
-  const pool = {
+// A fake pool honouring the rescan's SQL: a total (updated_at DESC, key DESC) order
+// and the tuple DELETE below the last loaded row.
+function orderedPool(table) {
+  const cmp = (a, b) => (Number(a.updated_at) - Number(b.updated_at)) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+  return {
     health: "ready",
     async query(sql, params = []) {
       if (/^CREATE TABLE/.test(sql)) return [];
-      if (/^SELECT doc/.test(sql)) {
-        return [...table.values()].sort((a, b) => b.updated_at - a.updated_at).slice(0, Number(params[0]));
+      if (/^SELECT doc, key, updated_at .* ORDER BY updated_at DESC, key DESC LIMIT \$1$/.test(sql)) {
+        return [...table.values()].sort((a, b) => cmp(b, a)).slice(0, Number(params[0]));
       }
       if (/^INSERT/.test(sql)) {
-        for (let i = 0; i < params.length; i += 3) table.set(params[i], { updated_at: params[i + 1], doc: params[i + 2] });
+        for (let i = 0; i < params.length; i += 3) {
+          table.set(params[i], { key: params[i], updated_at: params[i + 1], doc: params[i + 2] });
+        }
         return [];
       }
-      if (/^DELETE .* WHERE updated_at < \$1$/.test(sql)) {
-        for (const [k, v] of table) if (Number(v.updated_at) < Number(params[0])) table.delete(k);
+      if (/^DELETE .* WHERE \(updated_at, key\) < \(\$1::bigint, \$2::text\)$/.test(sql)) {
+        const bound = { updated_at: params[0], key: params[1] };
+        for (const [k, v] of table) if (cmp(v, bound) < 0) table.delete(k);
         return [];
       }
       if (/^DELETE/.test(sql)) { for (const k of params) table.delete(k); return []; }
       throw new Error(sql);
     },
   };
-  L._internals.reset();
-  const extra = 5;
+}
+
+async function rescanOver(stampOf, extra = 5) {
+  const table = new Map();
   for (let i = 0; i < L.MAX_ROWS + extra; i++) {
+    const at = stampOf(i);
     const r = L.sanitizeRow({ site: `o${i % 8}.atlassian.net`, issue: "A-1", host: `h${i % 8}`,
-      sid: `s${i}`, cls: "bug", model: "opus", firstSeen: T0 + i, updatedAt: T0 + i });
-    table.set(r.key, { updated_at: String(r.updatedAt), doc: JSON.stringify(r) });
+      sid: `s${i}`, cls: "bug", model: "opus", firstSeen: at, updatedAt: at });
+    table.set(r.key, { key: r.key, updated_at: String(r.updatedAt), doc: JSON.stringify(r) });
   }
-  const store = new L.OutcomeLedgerPgStore(pool);
+  L._internals.reset();
+  const store = new L.OutcomeLedgerPgStore(orderedPool(table));
   L._internals.setBackend(store);
-  await store.rescan(T0 + L.MAX_ROWS + extra);
+  await store.rescan(T0 + 1000);
   await store._drain();
-  assert.equal(L._internals.rows().size, L.MAX_ROWS);
-  assert.equal(table.size, L.MAX_ROWS);
-  for (let i = 0; i < extra; i++) assert.ok(!table.has(JSON.stringify([`o${i % 8}.atlassian.net`, "A-1", `h${i % 8}`, `s${i}`])));
+  const model = new Set(L._internals.rows().keys());
   await store.close();
+  L._internals.reset();
+  return { table, model };
+}
+
+test("XERK-1858: a rescan deletes table rows past MAX_ROWS the model never loads", async () => {
+  const { table, model } = await rescanOver((i) => T0 + i);
+  assert.equal(model.size, L.MAX_ROWS);
+  assert.equal(table.size, L.MAX_ROWS);
+  for (let i = 0; i < 5; i++) {
+    assert.ok(!table.has(JSON.stringify([`o${i % 8}.atlassian.net`, "A-1", `h${i % 8}`, `s${i}`])));
+  }
+  assert.deepEqual(new Set(table.keys()), model, "the table holds exactly what the model loaded");
+});
+
+test("XERK-1858: the rescan's delete converges when updated_at ties at the page boundary", async () => {
+  // The 20 oldest share one stamp (a sweep commits with one `now`) and straddle the page edge.
+  const { table, model } = await rescanOver((i) => (i < 20 ? T0 : T0 + i));
+  assert.equal(table.size, L.MAX_ROWS);
+  assert.deepEqual(new Set(table.keys()), model);
+});
+
+test("XERK-1858: the rescan's delete converges when every row shares one updated_at", async () => {
+  const { table, model } = await rescanOver(() => T0);
+  assert.equal(table.size, L.MAX_ROWS);
+  assert.deepEqual(new Set(table.keys()), model);
+});
+
+test("XERK-1858: past MAX_ROWS an org loses its shadow rows, orphans first, before its live rows", () => {
+  L._internals.reset();
+  recording();
+  const rows = L._internals.rows();
+  const liveKeys = [];
+  // Live rows two short of the cap; every one older than the shadows paired with it.
+  const live = L.MAX_ROWS - 2;
+  for (let i = 0; i < live; i++) {
+    const r = L.sanitizeRow({ site: "acme.atlassian.net", issue: `A-${i}`, host: `h${i % 8}`,
+      sid: `s${i}`, cls: "bug", model: "opus", firstSeen: T0, updatedAt: T0 });
+    rows.set(r.key, r);
+    liveKeys.push(r.key);
+  }
+  const shadow = (i, pairOf) => {
+    const sh = L.sanitizeRow({ site: "acme.atlassian.net", issue: `A-${i}`, host: `h${i % 8}`,
+      sid: `sh-00112233${String(i).padStart(4, "0")}`, cls: "bug", model: "haiku", kind: "shadow",
+      pairOf, firstSeen: T0 + 10, updatedAt: T0 + 10 });
+    rows.set(sh.key, sh);
+    return sh.key;
+  };
+  const paired = [shadow(1, liveKeys[1]), shadow(2, liveKeys[2])];
+  const orphan = shadow(3, "gone");
+  L._internals.evict(T0 + 20);
+  assert.ok(!rows.has(orphan), "the orphaned shadow goes first");
+  assert.ok(paired.every((k) => rows.has(k)), "paired shadows survive while an orphan can go");
+  assert.ok(liveKeys.every((k) => rows.has(k)), "no live row is dropped");
+  // Two more over: paired shadows go, still before any live row.
+  shadow(4, liveKeys[4]); shadow(5, liveKeys[5]);
+  L._internals.evict(T0 + 30);
+  assert.equal([...rows.values()].filter((r) => r.kind !== "shadow").length, live);
+  assert.equal([...rows.values()].filter((r) => r.kind === "shadow").length, 2);
   L._internals.reset();
 });

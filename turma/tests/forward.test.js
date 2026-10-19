@@ -1195,8 +1195,10 @@ test("XERK-1051: a cut refusal lingers — FIN after the 413, slot held while dr
 
 test("XERK-936 QA2: a refusal that keeps making progress is never cut idle; a 1-byte trickle is", async () => {
   const { leader, port: lport } = await countingLeader();
+  // Windows wide enough that a loaded host's timer stalls never starve one of the
+  // steady writer's bytes (150ms windows failed under CPU burn, XERK-1858).
   const { f } = await follower(`127.0.0.1:${lport}`, {
-    bodyRoute: () => "hb", drainIdleMs: 150, drainMinProgress: 1000,
+    bodyRoute: () => "hb", drainIdleMs: 500, drainMinProgress: 1000,
   }, { bodyCaps: { hb: 100 }, drainSlack: 1 << 20 });
   const { srv, port } = await followerServer(f);
   const open = (chunk, every) => {
@@ -1209,11 +1211,11 @@ test("XERK-936 QA2: a refusal that keeps making progress is never cut idle; a 1-
     });
     return s;
   };
-  const steady = open(2000, 40); // well past drainMinProgress per window
-  const trickle = open(1, 40); // ~4 bytes per window: idle
-  const race = (s) => Promise.race([s.closed2.then(() => "cut"), sleep(600).then(() => "open")]);
-  assert.equal(await race(trickle), "cut", "a trickle is cut idle");
-  assert.equal(await race(steady), "open", "steady progress keeps the refusal alive past drainIdleMs");
+  const steady = open(2000, 20); // ~50000 bytes per window, far past drainMinProgress
+  const trickle = open(1, 40); // ~12 bytes per window: idle
+  const race = (s, ms) => Promise.race([s.closed2.then(() => "cut"), sleep(ms).then(() => "open")]);
+  assert.equal(await race(trickle, 3000), "cut", "a trickle is cut idle");
+  assert.equal(await race(steady, 1500), "open", "steady progress keeps the refusal alive past drainIdleMs");
   for (const s of [steady, trickle]) { clearInterval(s.timer); s.destroy(); }
   srv.close(); leader.close(); f.close();
 });
@@ -1318,7 +1320,9 @@ test("XERK-936 QA4: an UPGRADE looping back teaches the alias too; a learned ali
   const store = new FileLiveStore();
   const f = makeForwarder(store, "me", {
     isLeader: () => false, authToken: "sekret", holdMs: 100, holdPollMs: 10, ttlMs: 60000,
-    endpoint: "10.9.9.9:1", aliasTtlMs: 300,
+    // An alias TTL well past a loaded host's upgrade round trips (300ms expired
+    // between two upgrades under CPU burn, XERK-1858).
+    endpoint: "10.9.9.9:1", aliasTtlMs: 2000,
   });
   const { srv, port } = await followerServer(f);
   await f.start();
@@ -1326,10 +1330,10 @@ test("XERK-936 QA4: an UPGRADE looping back teaches the alias too; a learned ali
   const addr = `127.0.0.1:${prox.port}`;
   await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr, at: Date.now(), stripsForward: true });
   assert.match(await upgradeTo(port), / 508 /, "the looped upgrade is refused");
-  await sleep(20);
+  await until(() => !!f.decide(req("/a")).hold);
   assert.deepEqual(f.decide(req("/a")), { hold: "this replica is taking over" }, "...and its 508 taught the alias");
   assert.match(await upgradeTo(port), / 418 /, "later upgrades hold, then serve locally");
-  await sleep(350);
+  await sleep(2100);
   assert.deepEqual(f.decide(req("/a")), { forward: addr }, "past aliasTtlMs the address is re-proved, never kept forever");
   srv.close(); prox.p.close(); f.close();
 });

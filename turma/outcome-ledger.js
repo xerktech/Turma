@@ -47,9 +47,10 @@ const FILE_MAX_BYTES = positiveEnv("OUTCOME_LEDGER_FILE_MAX", 16 << 20);
 const SAVE_DEBOUNCE_MS = positiveEnv("OUTCOME_LEDGER_SAVE_MS", 5000);
 const DAY_MS = 86400000;
 const PRS_MAX = 10;
-// One host may hold at most this many rows, and past MAX_ROWS the org holding the
-// most rows loses its oldest first — so one host or org churning session ids
-// cannot push the rest of the fleet's evidence out.
+// One host may hold at most this many live rows (and as many shadow rows), and past
+// MAX_ROWS the org holding the most rows loses its shadow rows, then its oldest live
+// rows — so one host or org churning session ids cannot push the rest of the fleet's
+// evidence out.
 const HOST_MAX_ROWS = positiveEnv("OUTCOME_LEDGER_HOST_MAX_ROWS", Math.max(1, Math.floor(MAX_ROWS / 4)));
 // /metrics labels a model outside these families "other": a model id is
 // agent-supplied, and every distinct one would add series to an unauthenticated route.
@@ -735,7 +736,13 @@ function evict(now = Date.now(), sweep = null) {
     if (!bySite.has(r.site)) bySite.set(r.site, []);
     bySite.get(r.site).push(r);
   }
-  for (const list of bySite.values()) list.sort((a, b) => victimFirst(b, a)); // next victim last
+  // Within an org, shadow rows go before live rows, orphaned ones first (XERK-1858):
+  // a shadow is evidence only beside its live row, and oldest-first across both kinds
+  // dropped the live rows and orphaned their shadows. A shadow its host still reports
+  // comes back next tick — the churn is accepted, and only at the fleet-wide cap.
+  const kindRank = (r) => (r.kind !== "shadow" ? 2 : rows.has(r.pairOf) ? 1 : 0);
+  const orgVictimFirst = (a, b) => kindRank(a) - kindRank(b) || victimFirst(a, b);
+  for (const list of bySite.values()) list.sort((a, b) => orgVictimFirst(b, a)); // next victim last
   while (over > 0) {
     let big = null;
     // Tied orgs: the one whose next victim churns least loses, or tied orgs rotate a
@@ -1137,17 +1144,16 @@ class OutcomeLedgerPgStore {
     this.loaded = false;
     await this._ensureSchema();
     const got = (await this.pool.query(
-      `SELECT doc FROM ${this.table} ORDER BY updated_at DESC LIMIT $1`, [String(MAX_ROWS)])) || [];
+      `SELECT doc, key, updated_at FROM ${this.table} ORDER BY updated_at DESC, key DESC LIMIT $1`,
+      [String(MAX_ROWS)])) || [];
     const held = new Set();
     const stale = [];
-    let oldest = Infinity;
     for (const g of got) {
       let doc = null;
       try { doc = JSON.parse(g.doc); } catch { continue; }
       const r = sanitizeRow(doc);
       if (!r) continue;
       held.add(r.key);
-      if (r.updatedAt < oldest) oldest = r.updatedAt;
       const hot = rows.get(r.key);
       if (hot && hot.updatedAt > r.updatedAt) { stale.push(hot); continue; }
       rows.set(r.key, r);
@@ -1155,9 +1161,15 @@ class OutcomeLedgerPgStore {
     // A full page means the table may hold rows past MAX_ROWS (deletes lost to an
     // outage, or the limit lowered): the model never loads them, so evict() never
     // deletes them — drop them here or the table grows past the cap for good.
-    // Hot rows the table lacks are re-queued below, after this delete.
-    if (got.length >= MAX_ROWS && Number.isFinite(oldest)) {
-      await this.pool.query(`DELETE FROM ${this.table} WHERE updated_at < $1`, [String(oldest)]);
+    // Hot rows the table lacks are re-queued below, after this delete. The page's
+    // order is total (key breaks an updated_at tie — a sweep stamps every row it
+    // changes with one `now`), so "below the last loaded row" is exact and a tie at
+    // the boundary still converges to MAX_ROWS.
+    const last = got.length >= MAX_ROWS ? got[got.length - 1] : null;
+    if (last && last.key != null && last.updated_at != null) {
+      await this.pool.query(
+        `DELETE FROM ${this.table} WHERE (updated_at, key) < ($1::bigint, $2::text)`,
+        [String(last.updated_at), String(last.key)]);
     }
     const dropped = evict(now);
     for (const r of rows.values()) if (!held.has(r.key)) stale.push(r);
