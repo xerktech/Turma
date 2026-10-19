@@ -87,12 +87,30 @@ describe("fontSafe", () => {
     expect(has!(0x221a)).toBe(true);
   });
 
+  // Linearity by RATIO of this process's CPU time, not a wall-clock cap: a 4x
+  // input must stay well under the 16x a quadratic scan costs. Wall time on a
+  // loaded host (load ~110) swung the ratio past 9x and blew the 5s test
+  // timeout; CPU time excludes time spent preempted. Sizes are interleaved and
+  // each takes its fastest of seven runs (contention only adds); the small
+  // absolute slack absorbs timer noise on the fast side.
   it("is linear on a long run of drops", () => {
     setGlyphCoverage(pretext);
-    const t0 = performance.now();
-    expect(fontSafe(`${s(0x1f9e0)} `.repeat(100_000))).toBe("?");
-    expect(performance.now() - t0).toBeLessThan(2000);
-  });
+    const run = (n: number): number => {
+      const text = `${s(0x1f9e0)} `.repeat(n);
+      const t0 = process.cpuUsage();
+      expect(fontSafe(text)).toBe("?");
+      const t = process.cpuUsage(t0);
+      return (t.user + t.system) / 1000;
+    };
+    const small: number[] = [];
+    const big: number[] = [];
+    for (let i = 0; i < 7; i++) {
+      small.push(run(2_000));
+      big.push(run(8_000));
+    }
+    const ms = (xs: number[]) => xs.map(Math.round).join(",");
+    expect(Math.min(...big), `big ${ms(big)} small ${ms(small)}`).toBeLessThan(8 * Math.min(...small) + 20);
+  }, 60_000);
 });
 
 describe("fontSafe wiring", () => {

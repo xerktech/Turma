@@ -22,6 +22,20 @@ describe("wrapText", () => {
     expect(lines).toEqual(["hi", "super", "calif", "ragil", "istic", "bye"]);
   });
 
+  it("hard-splits on code points, never through an emoji's surrogate pair (XERK-1858)", () => {
+    const utf16 = (s: string) => s.length; // a pair is 2 units wide
+    const lines = wrapText("😀".repeat(5), 3, utf16);
+    expect(lines).toEqual(["😀", "😀", "😀", "😀", "😀"]);
+  });
+
+  it("hard-splits a long word in O(log n) measures per line, not O(n) (XERK-1858)", () => {
+    let calls = 0;
+    const counting = (s: string) => (calls++, s.length);
+    const lines = wrapText("x".repeat(400), 10, counting);
+    expect(lines).toHaveLength(40);
+    expect(calls).toBeLessThan(1000); // the linear walk-back took ~8000
+  });
+
   it("returns an empty array for empty text", () => {
     expect(wrapText("", 100, perChar)).toEqual([]);
   });

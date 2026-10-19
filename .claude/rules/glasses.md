@@ -36,6 +36,9 @@ paths:
     session id, or the action row's kind), resolved by `homeCursor` in render AND input. The
     groups regroup on a poll and on time alone (a host aging past offline with polls failing), so
     an index silently lands a tap on another session.
+  - A selected session no longer at its host + id resolves by id on any host (a landed
+    migration), then to the nearest session ABOVE the index, never onto "+ New session".
+  - Session home keys are `s:` + JSON `[host, id]`, so the id parses back exactly (ids may hold ':').
   - New session is org → repo, and `spawnHostFor` picks the org's least-busy online host with that
     repo. The phone companion is out of that scope.
   - Tests: `render.test.ts` "home status groups"/"new session by org"/"new session pickers",
@@ -78,3 +81,17 @@ paths:
   — every answer path, phone included). The wire carries NO question id, so the mask matches text +
   options and lasts only `ANSWER_MASK_MS` (10s) once the POST lands: lengthening it hides an identical
   re-ask. Pending converges on the hub's UNMASKED word. Tests: the `sheet mode:` answer cases in `app.test.ts`.
+- **Leaving a session keeps its unsent draft** (`App.drafts`, XERK-1858); entering it again restores it.
+  - Never restored while a question is pending there: a draft hides the sheet, and Send would post
+    it as an answer to a question the wearer never saw. The poll restores it once the question clears.
+  - Keyed by host + id, and NEVER followed to another host: ids are unique per host only, and the
+    fleet carries no migration marker (`migratedFrom` stays agent-side), so a draft after a real
+    move is orphaned rather than risk landing in an unrelated session's box.
+  - A stash MOVES the draft out of `state.session` (home keeps a stale one) and joins any held one,
+    so a second stash of the same left session neither replaces nor doubles it.
+  - `takeDraft`/`stashDraft` rewrite `state.drafts`: call them BEFORE spreading `this.state`, or
+    the stale stash survives and a sent draft returns on every poll.
+  - Bounded by COUNT only (`MAX_DRAFTS`, least recently stashed out, never the session being
+    entered). A poll not listing a session (hub restart, migration gap, short beat) is no proof
+    it's gone, so absence never deletes or releases a draft.
+  - Tests: `app.test.ts` "kept drafts (XERK-1858)".

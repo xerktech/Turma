@@ -4,7 +4,7 @@
 // status label. No SDK, no state machine, no Date.now: everything here is
 // data in, strings out.
 import { DISPLAY_LINES, LINE_WIDTH_PX } from "./layout.ts";
-import { wrapText } from "./text-wrap.ts";
+import { measureDefault, measureGeneration, wrapText } from "./text-wrap.ts";
 
 export type MicState = "idle" | "recording" | "finalising" | "error";
 
@@ -68,34 +68,72 @@ export function inputBoxBody(opts: {
   return [`${prefix}${windowed[0]}`, ...windowed.slice(1)];
 }
 
+// The sheet's numbered rows, wrapped. Memoized on the labels (and the measure
+// generation): every repaint and every scroll re-renders the sheet, and a
+// long spaceless label costs a hard-split under the font measure each time.
+let sheetRowCache: { key: string; rows: string[][] } | null = null;
+function sheetRowLines(labels: string[]): string[][] {
+  const key = JSON.stringify([measureGeneration(), labels]);
+  if (sheetRowCache?.key === key) return sheetRowCache.rows;
+  const width = LINE_WIDTH_PX - Math.max(measureDefault("> "), measureDefault("  "));
+  const rows = labels.map((label, r) => {
+    const num = `${r + 1}.`;
+    const wrapped = wrapText(label, width - measureDefault(`${num} `));
+    return wrapped.length ? [`${num} ${wrapped[0]}`, ...wrapped.slice(1)] : [num];
+  });
+  sheetRowCache = { key, rows };
+  return rows;
+}
+
 // Sheet-mode body: wrapped question title lines + numbered option rows +
 // a trailing "Dictate answer…" row, windowed around `selected` so it stays
 // visible even when the option list overflows BOTTOM_MAX_LINES.
+// Options are wrapped here and windowed by DISPLAY line, not by option: an
+// over-wide row handed to the display wraps there, uncounted, and pushes the
+// selected row out of the box while a tap still picks it.
 export function sheetBody(opts: { question: string; options: string[]; selected: number }): string[] {
   const { question, options } = opts;
-  const rows = [...options.map((opt, i) => `${i + 1}. ${opt}`), `${options.length + 1}. Dictate answer…`];
-  const total = rows.length;
+  const labels = [...options, "Dictate answer…"];
+  const total = labels.length;
   // Clamp `selected` once so the window math and the row marking agree even
   // if a caller passes an out-of-range index.
   const selected = Math.max(0, Math.min(opts.selected, total - 1));
 
-  // Reserve at least one option row: cap the question portion so it never
+  // Reserve at least one option line: cap the question portion so it never
   // eats the whole box, then the option area is whatever's left. This keeps
   // the combined output within BOTTOM_MAX_LINES even for a question that
   // wraps to many lines.
   const questionLines = wrapText(question, LINE_WIDTH_PX).slice(0, BOTTOM_MAX_LINES - 1);
   const area = BOTTOM_MAX_LINES - questionLines.length;
 
-  let start = 0;
-  if (total > area) {
-    start = Math.max(0, selected - Math.floor(area / 2));
-    start = Math.min(start, total - area);
-  }
-  const visibleRows = rows
-    .slice(start, start + area)
-    .map((row, i) => (start + i === selected ? `> ${row}` : `  ${row}`));
+  // Each row's wrapped lines: the number leads the label's first line (the
+  // label wraps in the width left after it), the row is marked there, and its
+  // continuation lines are indented under it.
+  const lines: string[] = [];
+  const rowStarts: number[] = [];
+  sheetRowLines(labels).forEach((rowLines, r) => {
+    rowStarts.push(lines.length);
+    rowLines.forEach((line, i) => lines.push(i === 0 && r === selected ? `> ${line}` : `  ${line}`));
+  });
+  rowStarts.push(lines.length);
+  const first = rowStarts[selected]!;
+  const count = rowStarts[selected + 1]! - first;
 
-  return [...questionLines, ...visibleRows];
+  // Centre the selected row's lines (the same placement the one-line-per-row
+  // window had), clamped at both ends; a row taller than the area shows its head.
+  let start = 0;
+  if (lines.length > area) {
+    start = count >= area ? first : Math.max(0, first - Math.ceil((area - count) / 2));
+    start = Math.min(start, lines.length - area);
+    // Never open the window mid-row, where a continuation line has no number:
+    // back up to that row's first line if the selected row still fits, else
+    // skip ahead to the next row's.
+    if (!rowStarts.includes(start)) {
+      const owner = rowStarts.filter((s) => s < start).pop()!;
+      start = owner + area >= first + count ? owner : rowStarts.find((s) => s > start)!;
+    }
+  }
+  return [...questionLines, ...lines.slice(start, start + area)];
 }
 
 // Short right-corner status label from live state + mic. Mic state wins

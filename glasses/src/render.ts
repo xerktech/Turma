@@ -305,10 +305,21 @@ export function buildHomeRows(state: AppState): HomeRow[] {
 }
 
 // A home row's identity: a session by host + id (one id can sit on two hosts
-// mid-migration), an action row by its kind. Headers have none.
+// mid-migration), an action row by its kind. Headers have none. The session
+// key is JSON so its id parses back exactly (either part may contain ':').
 export function homeRowKey(row: HomeRow | undefined): string | undefined {
   if (!row || !row.selectable) return undefined;
-  return row.kind === "session" ? `s:${row.hostKey}:${row.sessionId}` : row.kind;
+  return row.kind === "session" ? `s:${JSON.stringify([row.hostKey, row.sessionId])}` : row.kind;
+}
+
+function homeKeySessionId(key: string | undefined): string | undefined {
+  if (!key?.startsWith("s:")) return undefined;
+  try {
+    const id: unknown = (JSON.parse(key.slice(2)) as unknown[])[1];
+    return typeof id === "string" ? id : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // Where the home cursor sits in `rows`: on the selected row wherever the
@@ -316,11 +327,26 @@ export function homeRowKey(row: HomeRow | undefined): string | undefined {
 // headers. Render and input both resolve through this, so the marker and a tap
 // agree even when the list regrouped with no poll (a host aging offline).
 export function homeCursor(rows: HomeRow[], home: { cursor: number; selected?: string }): number {
-  if (home.selected) {
-    const i = rows.findIndex((r) => homeRowKey(r) === home.selected);
+  const selected = home.selected;
+  if (selected) {
+    const i = rows.findIndex((r) => homeRowKey(r) === selected);
     if (i >= 0) return i;
   }
-  return clampHomeCursor(rows, home.cursor);
+  const selectedId = homeKeySessionId(selected);
+  const wasSession = selectedId !== undefined;
+  if (wasSession) {
+    // The selected session moved host (a migration landed): the same id on its
+    // new host is still the wearer's session, wherever the regroup put it.
+    const moved = rows.findIndex((r) => r.kind === "session" && r.sessionId === selectedId);
+    if (moved >= 0) return moved;
+  }
+  const c = clampHomeCursor(rows, home.cursor);
+  if (wasSession && rows[c]?.kind !== "session") {
+    // The selected session is gone and its index slid onto an action row
+    // ("+ New session"): stay among the sessions, on the nearest one above.
+    for (let i = c - 1; i >= 0; i--) if (rows[i]?.kind === "session") return i;
+  }
+  return c;
 }
 
 // Keeps the home cursor in range as the row list shrinks/grows (host
