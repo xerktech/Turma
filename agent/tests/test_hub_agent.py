@@ -5247,6 +5247,14 @@ class TestBashPassthrough(unittest.TestCase):
             "! ls")
 
     def test_prose_quoting_a_bash_tag_stays_prose(self):
+        # XERK-2112: Claude Code escapes bash OUTPUT; slash-command output is untouched.
+        self.assertEqual(
+            ha._parse_local_command('<bash-stdout>File "&lt;string&gt;" a &amp;&amp; b &amp;lt;'
+                                    '</bash-stdout><bash-stderr></bash-stderr>'),
+            {"kind": "output", "text": 'File "<string>" a && b &lt;', "isError": False})
+        self.assertEqual(
+            ha._parse_local_command("<local-command-stdout>&lt;x&gt;</local-command-stdout>"),
+            {"kind": "output", "text": "&lt;x&gt;", "isError": False})
         self.assertIsNone(ha._parse_local_command("talk about <bash-input> inline"))
 
 

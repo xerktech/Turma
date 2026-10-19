@@ -266,6 +266,14 @@ const COMMAND_STDERR_RE = /<local-command-stderr>([\s\S]*?)<\/local-command-stde
 const BASH_INPUT_RE = /<bash-input>([\s\S]*?)<\/bash-input>/;
 const BASH_STDOUT_RE = /<bash-stdout>([\s\S]*?)<\/bash-stdout>/;
 const BASH_STDERR_RE = /<bash-stderr>([\s\S]*?)<\/bash-stderr>/;
+// Claude Code HTML-escapes a `!` command's OUTPUT inside the tags; undo exactly
+// those escapes, `&amp;` last. Mirror of hub-agent.py _bash_unescape (XERK-2112).
+const BASH_ENTITIES = [["&lt;", "<"], ["&gt;", ">"], ["&quot;", '"'], ["&#39;", "'"],
+  ["&#x27;", "'"], ["&amp;", "&"]];
+function bashUnescape(text) {
+  for (const [ent, ch] of BASH_ENTITIES) text = text.split(ent).join(ch);
+  return text;
+}
 function parseLocalCommand(text) {
   if (!text) return null;
   if (LOCAL_COMMAND_CAVEAT_RE.test(text)) return { kind: "caveat" };
@@ -290,7 +298,9 @@ function parseLocalCommand(text) {
     [COMMAND_STDOUT_RE, false], [BASH_STDOUT_RE, false]]) {
     const m = re.exec(text);
     if (m) {
-      const out = { kind: "output", text: edgeTrim(m[1].replace(ANSI_RE, "")), isError };
+      let body = edgeTrim(m[1].replace(ANSI_RE, ""));
+      if (re === BASH_STDERR_RE || re === BASH_STDOUT_RE) body = bashUnescape(body);
+      const out = { kind: "output", text: body, isError };
       if (out.text) return out;
       if (!first) first = out;
     }

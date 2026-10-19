@@ -9939,6 +9939,19 @@ COMMAND_STDERR_RE = re.compile(
 BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
 BASH_STDOUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>", re.DOTALL)
 BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
+# Claude Code HTML-escapes the `!` command's OUTPUT (not its input) inside the
+# tags, so a traceback's `<string>` arrives as `&lt;string&gt;`. Undo exactly
+# the escapes it writes — the renderers escape again on the way out. `&amp;`
+# last, so `&amp;lt;` stays the literal text `&lt;`. Mirror: tunnel-agent.js
+# bashUnescape (XERK-2112).
+_BASH_ENTITIES = (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&#39;", "'"),
+                  ("&#x27;", "'"), ("&amp;", "&"))
+
+
+def _bash_unescape(text):
+    for ent, ch in _BASH_ENTITIES:
+        text = text.replace(ent, ch)
+    return text
 
 
 def _parse_local_command(text):
@@ -9975,11 +9988,10 @@ def _parse_local_command(text):
                             (COMMAND_STDOUT_RE, False), (BASH_STDOUT_RE, False)):
         m = regex.search(text)
         if m:
-            out = {
-                "kind": "output",
-                "text": _edge_trim(ANSI_RE.sub("", m.group(1))),
-                "isError": is_error,
-            }
+            body = _edge_trim(ANSI_RE.sub("", m.group(1)))
+            if regex in (BASH_STDERR_RE, BASH_STDOUT_RE):
+                body = _bash_unescape(body)
+            out = {"kind": "output", "text": body, "isError": is_error}
             # stderr wins over stdout ONLY when it carries text — a bash turn
             # routinely ships both tags with one of them empty, and an empty
             # stderr must not swallow the stdout beside it (or vice versa).

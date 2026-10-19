@@ -298,6 +298,11 @@ test("parseLocalCommand: `!` bash passthrough turns -> command / output shapes",
     { kind: "output", text: "ok", isError: false });
   assert.deepEqual(parseLocalCommand("<bash-stdout></bash-stdout><bash-stderr>boom</bash-stderr>"),
     { kind: "output", text: "boom", isError: true });
+  // XERK-2112: Claude Code escapes bash OUTPUT; slash-command output is untouched.
+  assert.deepEqual(parseLocalCommand('<bash-stdout>File "&lt;string&gt;" a &amp;&amp; b &amp;lt;</bash-stdout><bash-stderr></bash-stderr>'),
+    { kind: "output", text: 'File "<string>" a && b &lt;', isError: false });
+  assert.deepEqual(parseLocalCommand("<local-command-stdout>&lt;x&gt;</local-command-stdout>"),
+    { kind: "output", text: "&lt;x&gt;", isError: false });
   assert.equal(parseLocalCommand("talk about <bash-input> inline"), null);
   // The blocks + text feeds treat it exactly like a slash command.
   assert.deepEqual(

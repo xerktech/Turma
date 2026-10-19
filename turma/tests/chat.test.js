@@ -323,6 +323,12 @@ test("render: a `!` command is a red operator bubble with its output open beneat
   // Output is visible, not folded behind a <details>, and escaped.
   assert.match(html, /<pre class="bash-out">total &lt;0&gt;<\/pre>/);
   assert.match(html, /<pre class="bash-out err">boom<\/pre>/);
+  // The command text is escaped too, not only the output.
+  const xss = withVerbosity("concise", () => itemsToHtml(buildItems([
+    { id: "x1", role: "user", blocks: [{ t: "command", name: "!", args: "echo <script>x</script>" }] },
+  ])));
+  assert.match(xss, /echo &lt;script&gt;x&lt;\/script&gt;/);
+  assert.doesNotMatch(xss, /<script>/);
   // A slash command keeps its chip.
   assert.match(html, /class="cmd-card"[^>]*>.*\/compact/);
   assert.doesNotMatch(html, /cmd-name">!</);
