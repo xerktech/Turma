@@ -59,6 +59,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.layout.layout
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.constrainHeight
@@ -320,7 +321,7 @@ private fun ProseBlocks(
             )
             // A blockquote: the web's 2px left rule, with the quoted content
             // block-parsed in turn (so a list inside a quote is still a list).
-            is ProseBlock.Quote -> Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
+            is ProseBlock.Quote -> Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min).testTag("md-quote")) {
                 Box(Modifier.fillMaxHeight().width(2.dp).background(color.copy(alpha = 0.30f)))
                 // The web's 1px top/bottom padding too, so a bare `>` line still
                 // draws its (short) rule, as the web's empty blockquote does.
@@ -483,8 +484,8 @@ internal fun Modifier.proseImageSize(ratio: Float, natural: Dp, maxHeight: Dp): 
         var h = w / ratio
         val maxH = minOf(maxHeight.roundToPx(), constraints.maxHeight)
         if (h > maxH) { h = maxH.toFloat(); w = h * ratio }
-        val width = constraints.constrainWidth(w.roundToInt())
-        val height = constraints.constrainHeight(h.roundToInt())
+        val width = constraints.constrainWidth(maxOf(1, w.roundToInt())) // a hairline, never gone
+        val height = constraints.constrainHeight(maxOf(1, h.roundToInt()))
         val placeable = measurable.measure(Constraints.fixed(width, height))
         layout(width, height) { placeable.place(0, 0) }
     }

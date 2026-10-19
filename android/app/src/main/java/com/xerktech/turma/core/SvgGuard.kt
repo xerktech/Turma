@@ -160,33 +160,74 @@ private fun skipBlank(s: String, from: Int): Int {
 private fun isNameChar(c: Char) = c.isLetterOrDigit() || c == ':' || c == '_' || c == '-' || c == '.'
 
 /**
- * The size an SVG is drawn at before it is fitted to its box: its viewBox, else its
- * declared width × height, else CSS's default replaced-element size of 300 × 150 —
- * what a browser gives an SVG `<img>` with none of them (Coil drew a 512 square, and
- * the box filled the bubble width). [docW]/[docH] are AndroidSVG's document size,
- * -1 when absent or relative.
+ * An SVG's intrinsic size in CSS px, as a browser sizes an SVG `<img>`: its declared
+ * width × height, else its viewBox, else CSS's default replaced-element size of
+ * 300 × 150 (Coil drew a 512 square, and the box filled the bubble width). [docW]/[docH]
+ * are AndroidSVG's document size, -1 when absent or relative.
  */
 fun svgNaturalSize(docW: Float, docH: Float, viewBoxW: Float?, viewBoxH: Float?): Pair<Float, Float> = when {
-    viewBoxW != null && viewBoxH != null && viewBoxW > 0f && viewBoxH > 0f -> viewBoxW to viewBoxH
     docW > 0f && docH > 0f -> docW to docH
+    viewBoxW != null && viewBoxH != null && viewBoxW > 0f && viewBoxH > 0f -> viewBoxW to viewBoxH
     else -> 300f to 150f
 }
 
+/** The most pixels one SVG is rasterised into, whatever its size or target. */
+const val SVG_BITMAP_MAX_PIXELS = 4L * 1024 * 1024
+
 /**
- * The bitmap a [w] × [h] SVG is rendered into for a [dstW] × [dstH] target (null:
- * unbounded), scaled to fit inside it ([fill]: to cover it). Each side is at least
- * one pixel: a 1 × 100000 SVG fitted to a phone-wide box rounded its width to 0 and
- * failed to decode, where the web draws a hairline.
+ * The bitmap a [w] × [h] (CSS px) SVG is rasterised into: the device's own resolution
+ * of its intrinsic size ([density] px per CSS px), narrowed to fit [dstW] (null:
+ * unbounded) and to [SVG_BITMAP_MAX_PIXELS]. Only the width bounds it: the box's
+ * height is a placeholder until the intrinsic size is known, and an unbounded side
+ * takes the SVG's own size rather than a fit to the other. Each side is at least one
+ * pixel: a 1 × 100000 SVG rounded its width to 0 and failed to decode, where the web
+ * draws a hairline. The intrinsic size the box is laid out by is carried separately.
  */
-fun svgBitmapSize(w: Float, h: Float, dstW: Int?, dstH: Int?, fill: Boolean): Pair<Int, Int> {
-    val sx = dstW?.let { it / w }
-    val sy = dstH?.let { it / h }
-    val m = when {
-        sx == null && sy == null -> 1f
-        sx == null -> sy!!
-        sy == null -> sx
-        fill -> maxOf(sx, sy)
-        else -> minOf(sx, sy)
-    }
+fun svgBitmapSize(w: Float, h: Float, dstW: Int?, density: Float): Pair<Int, Int> {
+    var m = density
+    if (dstW != null) m = minOf(m, dstW / w)
+    val px = w * m * (h * m)
+    if (px > SVG_BITMAP_MAX_PIXELS) m *= kotlin.math.sqrt(SVG_BITMAP_MAX_PIXELS / px)
     return maxOf(1, (w * m).roundToInt()) to maxOf(1, (h * m).roundToInt())
 }
+
+/** The most pixels an SVG's embedded raster images may decode to, all together. */
+const val SVG_EMBEDDED_MAX_PIXELS = 8L * 1024 * 1024
+
+/**
+ * The base64 payload of every `data:…;base64,` URI in [svg] — a superset of the
+ * `<image>` hrefs AndroidSVG decodes itself, at full size, with no bound: a 20000 ×
+ * 20000 PNG of zeros is a small data URI and a 1.6 GB bitmap. The caller reads each
+ * one's dimensions and refuses the SVG past [SVG_EMBEDDED_MAX_PIXELS].
+ *
+ * Deliberately not an element/attribute parse: it over-matches (a data URI anywhere,
+ * comments too) rather than miss one, and character references are decoded first, as
+ * the XML parser will (DOCTYPE entities never get this far: [svgVerdict] refuses them).
+ */
+fun svgEmbeddedImages(svg: String): List<String> =
+    DATA_URI_RE.findAll(xmlUnescape(svg)).map { it.groupValues[1] }.toList()
+
+/**
+ * The payload runs to the end of the attribute value — a raw quote or `<` — exactly
+ * what AndroidSVG hands `Base64.decode`, which skips any character outside the
+ * alphabet: stopping at the first non-base64 character would let one stray `!` hide
+ * the image behind it. The mime part is bounded, so a `data:` with no `;base64,`
+ * near it costs O(1).
+ */
+private val DATA_URI_RE = Regex("""data:[^,]{0,256}?;base64,([^"'<]*)""", RegexOption.IGNORE_CASE)
+private val XML_REF_RE = Regex("""&(#[0-9]+|#[xX][0-9a-fA-F]+|amp|lt|gt|quot|apos);""")
+
+/**
+ * XML character references decoded as the parser decodes them — except that a
+ * referenced quote or `<` becomes U+0000: it is value text to the parser, so it must
+ * not end a payload here, and `Base64.decode` skips it like any non-alphabet char.
+ */
+private fun xmlUnescape(s: String): String = if ('&' !in s) s else XML_REF_RE.replace(s) {
+    val cp = when (val r = it.groupValues[1]) {
+        "amp" -> '&'.code; "lt" -> '<'.code; "gt" -> '>'.code; "quot" -> '"'.code; "apos" -> '\''.code
+        else -> (if (r[1] == 'x' || r[1] == 'X') r.substring(2).toIntOrNull(16) else r.substring(1).toIntOrNull())
+            ?.takeIf { c -> c <= 0x10FFFF } ?: return@replace it.value
+    }
+    if (cp == '"'.code || cp == '\''.code || cp == '<'.code) "\u0000" else String(Character.toChars(cp))
+}
+

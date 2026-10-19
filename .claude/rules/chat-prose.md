@@ -80,6 +80,13 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
     to size it as a browser sizes an SVG `<img>`: no size → 300 × 150, each bitmap side ≥ 1 px (an
     extreme aspect rounded to 0 and failed), a declared zero width/height → an empty 0 × 0 drawable
     `ProseImage` lays out as nothing. Tests: `SafeSvgDecoderTest`.
+    - **The drawable's intrinsic size is the SVG's own (CSS px), never its bitmap's.** `ProseImage`
+      caps the box at it; a bitmap scaled up to the full-width placeholder made every SVG fill the
+      bubble. The bitmap is device-density, bounded by the box width and a pixel ceiling.
+    - **Embedded raster images are bounded before AndroidSVG sees them**: it decodes every
+      `data:…;base64,` `<image>` at full size, so the decoder reads each payload's header and refuses
+      the SVG past `SVG_EMBEDDED_MAX_PIXELS`. The payload runs to the value's raw end — Android's
+      `Base64.decode` skips stray characters, so a stop at the first one would hide the image.
   - **A rule line is a SCAN (`isRuleLine`), never `/(?:-[ \t]*){3,}/`.** That regex is linear in V8
     but `java.util.regex` recurses once per iteration of a quantified GROUP, so the Android port of
     it threw an **uncatchable `StackOverflowError`** out of `parseProse` inside a Composable (an

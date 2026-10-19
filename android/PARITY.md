@@ -901,7 +901,8 @@ those are marked `[MODEL]`.
   Ready-for-review card spells out why it qualified ("PR awaiting review" / "finished · awaiting
   review" / "awaiting your test").
 - ~~P1 SendUserFile inline previews (XERK-221).~~ **Done**: the app now has an image pipeline (Coil +
-  `SvgDecoder`, wired via `TurmaApplication : ImageLoaderFactory`). `SendFile`/`files[]`/`caption` are on
+  `SafeSvgDecoder` over AndroidSVG, sized like a browser's SVG `<img>`, wired via
+  `TurmaApplication : ImageLoaderFactory`). `SendFile`/`files[]`/`caption` are on
   `ToolUseBlock` (decoded) → `ChatItem.Tool` (`ChatItemsTest`), and `TranscriptView` renders each file:
   an image/SVG via Coil `AsyncImage` (data: URIs decoded to a `ByteBuffer` the SVG/bitmap decoders
   accept; remote URLs pass through), an HTML page in a **JS-disabled, navigation-blocked, null-origin

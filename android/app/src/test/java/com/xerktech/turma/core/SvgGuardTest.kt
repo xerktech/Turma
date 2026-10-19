@@ -84,19 +84,51 @@ class SvgGuardTest {
         assertEquals(false, z("<!-- <svg width=\"0\"> --><svg width=\"4\" height=\"4\"><rect width=\"0\"/></svg>"))
     }
 
-    @Test fun `natural size is the viewBox, else width x height, else the CSS 300 x 150 default`() {
-        assertEquals(10f to 5f, svgNaturalSize(40f, 20f, 10f, 5f))
+    @Test fun `natural size is width x height, else the viewBox, else the CSS 300 x 150 default`() {
+        // A browser sizes an SVG <img> by its width/height; the viewBox only scales the drawing.
+        assertEquals(40f to 20f, svgNaturalSize(40f, 20f, 400f, 200f))
         assertEquals(40f to 20f, svgNaturalSize(40f, 20f, null, null))
+        assertEquals(10f to 5f, svgNaturalSize(-1f, -1f, 10f, 5f))
         assertEquals(300f to 150f, svgNaturalSize(-1f, -1f, null, null))
         assertEquals(300f to 150f, svgNaturalSize(40f, -1f, null, null))
     }
 
+    @Test fun `the bitmap is the intrinsic size at device density, never scaled up to the box`() {
+        // An 80 x 40 SVG in a 1080px-wide box: 80 x 40 CSS px at 2.75x, not 1080 wide.
+        assertEquals(220 to 110, svgBitmapSize(80f, 40f, 1080, 2.75f))
+        // Unbounded: the SVG's own size, never a fit to the other side.
+        assertEquals(825 to 413, svgBitmapSize(300f, 150f, null, 2.75f))
+        // Wider than the box: narrowed to it.
+        assertEquals(1000 to 5, svgBitmapSize(2000f, 10f, 1000, 2f))
+        // A huge SVG is held to the pixel ceiling.
+        val (w, h) = svgBitmapSize(4000f, 4000f, null, 3f)
+        assertTrue(w.toLong() * h <= SVG_BITMAP_MAX_PIXELS + 2 * w)
+        assertEquals(2048, w)
+    }
+
     @Test fun `an extreme aspect still gets a one-pixel side, never zero`() {
-        assertEquals(1 to 320, svgBitmapSize(1f, 100000f, 1000, 320, fill = false))
-        assertEquals(1000 to 1, svgBitmapSize(100000f, 1f, 1000, 320, fill = false))
-        assertEquals(1000 to 500, svgBitmapSize(2f, 1f, 1000, 800, fill = false))
-        assertEquals(1600 to 800, svgBitmapSize(2f, 1f, 1000, 800, fill = true))
-        assertEquals(300 to 150, svgBitmapSize(300f, 150f, null, null, fill = false))
-        assertEquals(640 to 320, svgBitmapSize(300f, 150f, null, 320, fill = false))
+        assertEquals(3 to 275000, svgBitmapSize(1f, 100000f, 1000, 2.75f))
+        assertEquals(1000 to 1, svgBitmapSize(100000f, 1f, 1000, 2.75f))
+    }
+
+    @Test fun `every base64 data URI is found, character references decoded first`() {
+        assertEquals(listOf("QUJD"), svgEmbeddedImages("<svg><image href=\"data:image/png;base64,QUJD\"/></svg>"))
+        assertEquals(listOf("QU\nJD"), svgEmbeddedImages("<x:image xlink:href='data:image/png;base64,QU\nJD'/>"))
+        // A reference-spelled `data:` is what the parser hands AndroidSVG, so it counts.
+        assertEquals(listOf("QUJD"), svgEmbeddedImages("<image href=\"&#100;ata:image/png&#x3B;base64,QUJD\"/>"))
+        assertEquals(listOf("QUJD", "RUZH -->"), svgEmbeddedImages(
+            "<image href=\"data:;base64,QUJD\"/><!-- data:image/gif;base64,RUZH -->"))
+        // The payload runs to the value's end: Base64.decode skips a stray char, so
+        // stopping at one would hide the image behind it; a referenced quote is value text.
+        assertEquals(listOf("i!VBOR"), svgEmbeddedImages("<image href=\"data:;base64,i!VBOR\"/>"))
+        assertEquals(listOf("i\u0000VBOR"), svgEmbeddedImages("<image href=\"data:;base64,i&quot;VBOR\"/>"))
+        // Not base64: AndroidSVG decodes nothing from it, so neither is it counted.
+        assertEquals(emptyList<String>(), svgEmbeddedImages("<image href=\"data:image/svg+xml,%3Csvg/%3E\"/>"))
+    }
+
+    @Test fun `a data URI scan stays linear on a run of mime-less openers`() {
+        val start = System.nanoTime()
+        svgEmbeddedImages("data:".repeat(200_000))
+        assertTrue("took ${(System.nanoTime() - start) / 1_000_000}ms", System.nanoTime() - start < 5_000_000_000L)
     }
 }
