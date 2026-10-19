@@ -1002,11 +1002,13 @@ test("XERK-1858: past MAX_ROWS an org drops orphaned shadows first, then a live 
   L._internals.evict(T0 + 200000);
   assert.ok(!rows.has(orphan), "the orphaned shadow goes first");
   assert.ok(rows.has(oldestPaired) && rows.has(liveKeys[0]), "one over: nothing paired goes");
+  assert.equal(rows.size, L.MAX_ROWS);
   // Two over: the OLDEST live row goes, and its shadow with it — never a shadow alone.
   shadow(6, liveKeys[6]); shadow(7, liveKeys[7]);
   L._internals.evict(T0 + 200000);
   assert.ok(!rows.has(liveKeys[0]) && !rows.has(oldestPaired), "the oldest pair goes together");
   assert.ok(rows.has(paired), "a younger pair stays");
+  assert.equal(rows.size, L.MAX_ROWS, "a two-row unit pays off two rows over: no more is dropped");
   const left = [...rows.values()];
   const liveLeft = new Set(left.filter((r) => r.kind !== "shadow").map((r) => r.key));
   assert.ok(left.filter((r) => r.kind === "shadow").every((r) => liveLeft.has(r.pairOf)), "no orphan left");
