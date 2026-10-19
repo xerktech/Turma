@@ -1106,6 +1106,156 @@ describe("App", () => {
       expect(draftOf(app)).toBe("unrelated note");
     });
 
+    // XERK-2095: the draft the wearer never left. A question that arrives over
+    // it must still show, and a tap answers with the option, not the draft.
+    it("a question arriving over the open session's draft holds the draft back until it clears", async () => {
+      const asking = signals({ question: "Delete prod DB?", questionOptions: ["No", "Yes"] });
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" })] })];
+      const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: fleet })) });
+      const app = makeApp(client, POLL);
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictate("please refactor x");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking })] })];
+      await poll();
+      expect(draftOf(app)).toBe("");
+      expect(display.lines.some((l) => l.includes("Delete prod DB?"))).toBe(true);
+      display.emit({ type: "tap" }); // the highlighted first option, "No"
+      expect(client.answerQuestion).toHaveBeenCalledWith("A", "s1", { optionIndex: 0 });
+      expect(client.sendInput).not.toHaveBeenCalled();
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" })] })];
+      await poll();
+      expect(draftOf(app)).toBe("please refactor x");
+    });
+
+    // On s1's sheet for `asking`: picks "Dictate answer…" and dictates `text`.
+    function dictateAnswer(text: string): void {
+      display.emit({ type: "scrollDown" });
+      display.emit({ type: "scrollDown" }); // -> "Dictate answer…"
+      display.emit({ type: "tap" }); // -> recording
+      display.emit({ type: "tap" }); // -> finalising
+      dictation.resolve({ text });
+    }
+    // From the box with a draft: open actions, move to Send, tap it.
+    function send(): void {
+      display.emit({ type: "tap" }); // -> actions
+      display.emit({ type: "scrollDown" }); // -> Send
+      display.emit({ type: "tap" });
+    }
+    function asker(...sessions: ReturnType<typeof session>[]) {
+      fleet = [agent({ key: "A", sessions })];
+      const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: fleet })) });
+      return { client, app: makeApp(client, POLL) };
+    }
+
+    it("an answer dictated on the sheet survives later polls and Send answers with it", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const { client, app } = asker(session({ id: "s1", session: asking }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictateAnswer("friday");
+      await poll();
+      await poll();
+      expect(draftOf(app)).toBe("friday");
+      send();
+      expect(client.answerQuestion).toHaveBeenCalledWith("A", "s1", { optionIndex: -1, custom: "friday" });
+      expect(client.sendInput).not.toHaveBeenCalled();
+    });
+
+    it("the same question re-listed after a poll that missed it keeps its dictated answer apart from the held draft", async () => {
+      const asking = signals({ question: "Delete prod DB?", questionOptions: ["No", "Yes"] });
+      const { client, app } = asker(session({ id: "s1" }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictate("note one");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking })] })];
+      await poll();
+      dictateAnswer("yes delete it");
+      fleet = []; // a hub restart: one empty poll
+      await poll();
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking })] })];
+      await poll();
+      expect(draftOf(app)).toBe("yes delete it");
+      send();
+      expect(client.answerQuestion).toHaveBeenCalledWith("A", "s1", { optionIndex: -1, custom: "yes delete it" });
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" })] })];
+      await vi.advanceTimersByTimeAsync(11_000); // past the answer mask
+      expect(draftOf(app)).toBe("note one");
+      expect(client.sendInput).not.toHaveBeenCalled();
+    });
+
+    it("a different question replacing the pending one drops the answer dictated for the old one", async () => {
+      const first = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const second = signals({ question: "Delete prod DB?", questionOptions: ["No", "Yes"] });
+      const { client, app } = asker(session({ id: "s1" }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictate("note one");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: first })] })];
+      await poll();
+      dictateAnswer("ship on friday");
+      expect(draftOf(app)).toBe("ship on friday");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: second })] })];
+      await poll();
+      expect(draftOf(app)).toBe("");
+      expect(display.lines.some((l) => l.includes("Delete prod DB?"))).toBe(true);
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" })] })];
+      await poll();
+      expect(draftOf(app)).toBe("note one");
+      expect(client.answerQuestion).not.toHaveBeenCalled();
+    });
+
+    it("an abandoned answer dictation tags no later draft once its question clears", async () => {
+      const asking = signals({ question: "Delete prod DB?", questionOptions: ["No", "Yes"] });
+      const other = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const { client, app } = asker(session({ id: "s1", session: asking }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictateAnswer(""); // heard nothing
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" })] })]; // answered on the phone
+      await poll();
+      display.emit({ type: "tap" }); // box -> recording
+      display.emit({ type: "tap" }); // -> finalising
+      dictation.resolve({ text: "deploy staging next" });
+      expect(draftOf(app)).toBe("deploy staging next");
+      // The same question asked again: the prompt is held back, not its answer.
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking })] })];
+      await poll();
+      expect(draftOf(app)).toBe("");
+      // ...and a different one after that clears doesn't drop it either.
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" })] })];
+      await poll();
+      expect(draftOf(app)).toBe("deploy staging next");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: other })] })];
+      await poll();
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" })] })];
+      await poll();
+      expect(draftOf(app)).toBe("deploy staging next");
+      expect(client.answerQuestion).not.toHaveBeenCalled();
+    });
+
+    it("a question arriving under an open actions menu returns to the session's sheet", async () => {
+      const asking = signals({ question: "Delete prod DB?", questionOptions: ["No", "Yes"] });
+      const { client, app } = asker(session({ id: "s1" }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictate("please refactor x");
+      display.emit({ type: "tap" }); // -> actions
+      display.emit({ type: "scrollDown" }); // -> Send
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking })] })];
+      await poll();
+      expect(app.getState().screen).toBe("session");
+      expect(display.lines.some((l) => l.includes("Delete prod DB?"))).toBe(true);
+      expect(client.answerQuestion).not.toHaveBeenCalled();
+      expect(client.sendInput).not.toHaveBeenCalled();
+    });
+
     // Holds "held note" back on s1 behind a pending question, with the wearer
     // now on s1's sheet. `client` is the fake hub.
     async function heldBehindQuestion() {

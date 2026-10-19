@@ -84,6 +84,14 @@ paths:
 - **Leaving a session keeps its unsent draft** (`App.drafts`, XERK-1858); entering it again restores it.
   - Never restored while a question is pending there: a draft hides the sheet, and Send would post
     it as an answer to a question the wearer never saw. The poll restores it once the question clears.
+  - A question ARRIVING on the open session (or replacing its pending one) stashes the box's
+    ordinary draft the same way (XERK-2095, `holdDraftFrom`): typed before the question, never its answer.
+  - A "Dictate answer…" draft carries `answerFor` (its question): it stays when that same question
+    re-arrives, and is DROPPED for any other — held, it would come back as an ordinary prompt.
+  - `answerFor` clears on the first poll LISTING the session with no question (an empty poll is no
+    proof), so an abandoned "Dictate answer…" never tags a later ordinary draft.
+    The local answer mask counts as "no question": a re-ask after it expires holds the box answer back.
+  - Tests: `app.test.ts` "kept drafts" cases naming an arriving/replacing/re-listed question.
   - Keyed by host + id, and NEVER followed to another host: ids are unique per host only, and the
     fleet carries no migration marker (`migratedFrom` stays agent-side), so a draft after a real
     move is orphaned rather than risk landing in an unrelated session's box.
