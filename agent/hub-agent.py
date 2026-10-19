@@ -6874,7 +6874,9 @@ def git_info_cheap(cwd, strict=False):
     read timed out — what the heartbeat's cache (_cheap_read) needs to keep its
     last real answer through a disk stall — and GitUnreadable when git answered
     with a failure in a directory that still exists (XERK-1887). None then
-    means only that `cwd` is gone."""
+    means only that `cwd` is gone. A `cwd` removed between the status and
+    branch reads also raises GitTimeout — no answer this beat; the next read
+    reports it gone — never a "" branch beside a real dirty count."""
     if strict:
         if not _strict_git(["git", "rev-parse", "--git-dir"], cwd,
                            fail_is_unknown=True, missing_is_gone=True):

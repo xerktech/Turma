@@ -2477,7 +2477,9 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         ha._gitlab_api_mr_create(('u = "projects/42/merge_requests"\n' + "f(u, 1) " * 300) * 20)
         ha._gitlab_api_mr_create("x = 1\n" + "y " * 300000 + "/projects/x/merge_requests")
         ha._gitlab_api_mr_create(("requests.post(projects/x/merge_requests " + "(" * 500) * 200)
-        self.assertLess(time.thread_time() - t0, 2.0)
+        # Even CPU time stretches on a contended host (2.06s at loadavg 30);
+        # the quadratic version took minutes, so 5s still tells them apart.
+        self.assertLess(time.thread_time() - t0, 5.0)
 
     def test_http_self_hosted_mr_is_attributed(self):
         """XERK-741: a self-hosted GitLab served over plain http on a LAN prints
@@ -43273,12 +43275,19 @@ class TestTtydUnixSocket(unittest.TestCase):
         old.poll.side_effect = [None, None, None, 0, 0, 0]  # exits after 3 looks
         sm.ttyd["s1"] = old
         sess = self._sess(ttydPid=4242)
+        # time.sleep is the process-wide one: count only THIS thread's naps,
+        # or another thread's loop under load inflates the count.
+        me, naps = threading.get_ident(), []
+
+        def nap(s):
+            if threading.get_ident() == me:
+                naps.append(s)
         with mock.patch.object(sm, "_kill_ttyd"), \
              mock.patch.object(ha, "_port_open", return_value=False), \
-             mock.patch.object(ha.time, "sleep") as sleep, \
+             mock.patch.object(ha.time, "sleep", side_effect=nap), \
              mock.patch.object(ha.os, "kill") as kill:
             sm._kill_and_await_ttyd(sess)
-        self.assertEqual(sleep.call_count, 3)
+        self.assertEqual(len(naps), 3)
         kill.assert_not_called()
 
     def test_a_ttyd_that_will_not_exit_is_sigkilled(self):
