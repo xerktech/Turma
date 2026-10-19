@@ -945,6 +945,38 @@ ARCHIVE_PAYLOAD_MAX = _byte_ceiling(
 # large sessions; the guard is a backstop, not an expected limit (XERK-101).
 MIGRATION_BLOB_MAX = _env_int("TURMA_MIGRATION_BLOB_MAX", 1 << 26)  # 64 MiB
 
+
+class _BoundedGzip(gzip.GzipFile):
+    """A read-only GzipFile that raises ValueError rather than decompress past
+    `cap` bytes — checked BEFORE a read or a forward seek does the work, so a
+    huge request (a pax header's length) never allocates either."""
+
+    def __init__(self, cap, **kw):
+        super().__init__(**kw)
+        self._cap = cap
+
+    def _over(self):
+        raise ValueError(f"the bundle unpacks to over {self._cap >> 20} MiB")
+
+    def read(self, size=-1):
+        room = self._cap - self.tell()
+        if size is None or size < 0:
+            data = super().read(room + 1)
+            if len(data) > room:
+                self._over()
+            return data
+        if size > room:
+            self._over()
+        return super().read(size)
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        # Never self.tell() here: IOBase.tell IS seek(0, SEEK_CUR).
+        target = offset if whence == io.SEEK_SET else (
+            super().seek(0, io.SEEK_CUR) + offset if whence == io.SEEK_CUR else None)
+        if target is not None and target > self._cap:
+            self._over()
+        return super().seek(offset, whence)
+
 # How many staged session-start refusals (XERK-265) a beat may carry, and how
 # long one reason may be. Neither is a normal limit — a refusal only exists where
 # a command was declined, and the reasons are one line. They are here because the
@@ -30805,8 +30837,7 @@ class SessionManager:
         store_prefix = DSH_STORE_ARCNAME + "/"
         qwen_prefix = QWEN_STORE_ARCNAME + "/"
         wt_prefix = WORKTREE_STATE_ARCNAME + "/"
-        buf = io.BytesIO(blob)
-        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+        with self._open_bundle(blob) as tar:
             for m in tar.getmembers():
                 parts = m.name.split("/")
                 if m.name.startswith("/") or os.path.isabs(m.name) or ".." in parts:
@@ -31122,24 +31153,36 @@ class SessionManager:
                 pass   # costs only a kept-aside copy on a later move back
         return out
 
-    # The most a bundle may unpack to, headers included. The beat's
-    # _unpack_transcript decompresses through EVERY member (~0.5 s/GiB), so the
-    # import thread refuses a bundle past this before the beat ever sees it.
+    # The most a bundle may unpack to. The beat's _unpack_transcript
+    # decompresses through EVERY member (~0.5 s/GiB), so the import thread
+    # refuses a bundle past this before the beat ever sees it, and the beat's
+    # own read stops there too.
     MIGRATION_UNPACK_MAX = 1 << 31   # 2 GiB: ~1 s on the beat, 32x the 64 MiB blob cap
+
+    def _open_bundle(self, blob):
+        """tarfile over a migration bundle whose DECOMPRESSED stream is bounded
+        by MIGRATION_UNPACK_MAX (_BoundedGzip). Never judge the size from tar
+        headers: a GNU sparse member's `size` is its attacker-chosen original
+        size, not the bytes skipping it decompresses, and a long-name/pax header
+        is read whole into memory."""
+        f = _BoundedGzip(self.MIGRATION_UNPACK_MAX, fileobj=io.BytesIO(blob), mode="rb")
+        try:
+            tar = tarfile.open(fileobj=f, mode="r:")
+        except (OSError, EOFError) as e:   # as tarfile's own r:gz says it
+            f.close()
+            raise tarfile.ReadError("not a gzip file") from e
+        tar._extfileobj = False   # close() closes the GzipFile, as r:gz does
+        return tar
 
     def _read_worktree_members(self, blob):
         """The `.worktree/` members of a migration bundle, name -> bytes. Only
         the known names; each bounded by MIGRATION_BLOB_MAX (a gzip bomb must
-        not balloon the agent) and the whole set too. The whole bundle is
-        bounded by MIGRATION_UNPACK_MAX, judged from each header before its data
-        is read."""
+        not balloon the agent) and the whole set too. Walking it also bounds
+        the whole bundle (_open_bundle), off the beat."""
         out, total = {}, 0
         prefix = WORKTREE_STATE_ARCNAME + "/"
-        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+        with self._open_bundle(blob) as tar:
             for m in tar:
-                if m.offset_data + m.size > self.MIGRATION_UNPACK_MAX:
-                    raise ValueError(f"the bundle unpacks to over "
-                                     f"{self.MIGRATION_UNPACK_MAX >> 20} MiB")
                 if not m.name.startswith(prefix):
                     continue
                 rel = m.name[len(prefix):]

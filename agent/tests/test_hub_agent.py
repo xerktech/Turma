@@ -11888,27 +11888,54 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
 
     def test_a_bundle_unpacking_past_the_cap_is_refused_off_the_beat(self):
         # XERK-1858: the beat's unpack decompresses every member, so a gzip
-        # bomb is refused on the import thread, by header, before the beat.
+        # bomb is refused on the import thread, and the beat's own read stops
+        # at the same cap. Bounded on the DECOMPRESSED stream, never by headers.
         sm = self.make_manager()
 
-        def bundle(*members):
+        def bundle(*members, fmt=tarfile.GNU_FORMAT):
             buf = io.BytesIO()
-            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            with tarfile.open(fileobj=buf, mode="w:gz", format=fmt) as tar:
                 for name, size in members:
                     ti = tarfile.TarInfo(name)
                     ti.size = size
                     tar.addfile(ti, io.BytesIO(b"\0" * size))
             return buf.getvalue()
+
+        def sparse(stored, origsize=10):
+            # A GNU sparse member: tarfile reports `size` as the header's
+            # original size, while skipping it decompresses `stored` bytes.
+            ti = tarfile.TarInfo("t1.jsonl")
+            ti.type, ti.size = tarfile.GNUTYPE_SPARSE, stored
+            hdr = bytearray(ti.tobuf(tarfile.GNU_FORMAT))
+            hdr[483:495] = b"%011o\0" % origsize
+            hdr[148:156] = b" " * 8
+            hdr[148:156] = b"%06o\0 " % sum(hdr)
+            raw = bytes(hdr) + b"\0" * (-(-stored // 512) * 512) + b"\0" * 1024
+            return gzip.compress(raw)
         with mock.patch.object(sm, "MIGRATION_UNPACK_MAX", 64 << 10):
+            # The sparse member reads as 10 bytes, so a header sum never sees it.
+            with tarfile.open(fileobj=io.BytesIO(sparse(100 << 10)), mode="r:gz") as t:
+                self.assertEqual(t.getmembers()[0].size, 10)
+            dest = os.path.join(self.tmp, "slug")
+            os.makedirs(dest)
             for big in (bundle((".worktree/x", 100 << 10)), bundle(("t1.jsonl", 100 << 10)),
-                        bundle(*((f"e/{i}", 0) for i in range(200)))):   # headers count too
+                        bundle(*((f"e/{i}", 0) for i in range(200))),   # headers count too
+                        sparse(100 << 10),
+                        bundle(("n" * (100 << 10), 0), fmt=tarfile.PAX_FORMAT)):  # pax header
                 with self.assertRaisesRegex(ValueError, "unpacks to over"):
                     sm._read_worktree_members(big)
+                with self.assertRaisesRegex(ValueError, "unpacks to over"):
+                    sm._unpack_transcript(big, dest)        # the beat's read too
             self.assertEqual(sm._read_worktree_members(bundle(("t1.jsonl", 32 << 10))), {})
+            sm._unpack_transcript(bundle(("t1.jsonl", 32 << 10)), dest)
+            self.assertEqual(os.path.getsize(os.path.join(dest, "t1.jsonl")), 32 << 10)
+        # Not a gzip at all: still tarfile's own error, as r:gz raised it.
+        with self.assertRaises(tarfile.ReadError):
+            sm._read_worktree_members(b"not a bundle")
         job = {"cmd": {"migrationId": "m1"}, "cwd": "/x", "isRoot": False, "repo": "r"}
         with mock.patch.object(sm, "MIGRATION_UNPACK_MAX", 64 << 10), \
                 mock.patch.object(sm, "_migration_download",
-                                  return_value=bundle(("t1.jsonl", 100 << 10))):
+                                  return_value=sparse(100 << 10)):
             sm._import_prepare(job)
         self.assertIn("unpacks to over", job["error"])
 
