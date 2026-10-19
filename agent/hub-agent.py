@@ -11010,6 +11010,7 @@ _SHELL_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?|\.\d+)([smhd]?)\Z", re.ASCII)
 _SHELL_DURATION_UNIT = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 _SHELL_DURATION_MAX = 10 ** 9   # ~31 years: past it, "no literal"
 _SHELL_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=", re.ASCII)
+# `.` stops only at \n; the JS mirror spells it [^\n] (its `.` also stops at \r).
 _SHELL_REDIR_RE = re.compile(r"^(\d+|&)?(>>?|<<?<?)(&?)(.*)\Z", re.ASCII)
 # The classifier runs on the BEAT (XERK-395), so its INPUT is bounded, not just
 # guarded against raising: a command longer than this, or with any word longer
@@ -11181,7 +11182,7 @@ def _shell_segments(command):
                 in_word = True
             else:
                 end_seg()
-        elif c in (" ", "\t", "\r"):
+        elif c in (" ", "\t"):   # never \r: bash keeps a CR inside the word
             end_word()
         else:
             word.append(c)
