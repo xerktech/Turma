@@ -52,6 +52,9 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
   - A move BACK finds the old copy at the same path. Export writes the state's digest into the
     source's gitdir (`MIGRATION_EXPORT_MARK`); an old copy still matching it (or clean at an ancestor)
     is removed, anything else detached and renamed to `<cwd>.pre-migration-<ts>`, never deleted.
+  - Neither the digest nor `status` sees ignored files, so an otherwise redundant copy holding an
+    ignored file newer than the mark (a local `.env`, a build) is kept aside too
+    (`_ignored_files_since`; no mark, git failing, or a walk past its budget all read "keep").
   - A bundle without `.worktree/` (older source, hub restore-pack) forks fresh from the default.
     Residual: an OLDER target extracts `.worktree/` into its slug dir and drops the work (source
     keeps it). Tests: `TestMigrateWorktreeState` (real git, two clones).

@@ -31313,11 +31313,12 @@ class SessionManager:
         # as a plain dir, untouched.
         own = os.path.lexists(os.path.join(cwd, ".git"))
         gd = self._worktree_gitdir(cwd)
-        mark = None
+        mark, marked_at = None, None
         if own and gd:
             try:
                 with open(os.path.join(gd, self.MIGRATION_EXPORT_MARK)) as f:
                     mark = f.read(128).strip()
+                    marked_at = os.fstat(f.fileno()).st_mtime
             except OSError:
                 pass
         if mark and self._worktree_digest(cwd) == mark:
@@ -31329,6 +31330,10 @@ class SessionManager:
             redundant = rc_s == 0 and not dirty and rc_h == 0 and (
                 old == head or run_out(["git", "-C", repo, "merge-base",
                                         "--is-ancestor", old, head], timeout=t)[0] == 0)
+        if redundant and self._ignored_files_since(cwd, marked_at, t):
+            # Neither the digest nor `status` sees ignored files (a local .env,
+            # a build): one written after the export is the move's to lack.
+            redundant = False
         if redundant:
             run_ok(["git", "-C", repo, "worktree", "remove", "--force", cwd], timeout=t)
             if os.path.lexists(cwd):
@@ -31352,6 +31357,41 @@ class SessionManager:
             run(["git", "-C", repo, "worktree", "repair", aside])
         log(f"migration: kept the older worktree at {cwd} as {aside}")
         return aside
+
+    # Entries one ignored-file check walks before it gives up and reads "yes".
+    MIGRATION_IGNORED_WALK_MAX = 20000
+
+    def _ignored_files_since(self, cwd, since, timeout):
+        """True when a gitignored file or dir in `cwd` changed after `since` (the
+        export mark's mtime), or there are any and `since` is unknown. Anything
+        it cannot tell — git failing, a walk past MIGRATION_IGNORED_WALK_MAX —
+        reads True, which only keeps a copy aside."""
+        rc, out = run_out(["git", "-C", cwd, "status", "--porcelain", "--ignored", "-z"],
+                          timeout=timeout)
+        if rc != 0:
+            return True
+        paths = [e[3:] for e in out.split("\0") if e.startswith("!! ")]
+        if paths and since is None:
+            return True
+        budget = self.MIGRATION_IGNORED_WALK_MAX
+        stack = [os.path.join(cwd, p.rstrip("/")) for p in paths]
+        while stack:
+            budget -= 1
+            if budget < 0:
+                return True
+            p = stack.pop()
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if st.st_mtime > since:
+                return True
+            if stat.S_ISDIR(st.st_mode):
+                try:
+                    stack.extend(os.path.join(p, n) for n in os.listdir(p))
+                except OSError:
+                    return True
+        return False
 
     # A bundle is the largest thing an agent ever sends, so it is the body most
     # likely to meet the hub's in-flight budget (XERK-258) and be told 503 "busy,

@@ -11784,6 +11784,56 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         [aside] = glob.glob(sess["worktreePath"] + ".pre-migration-*")
         self.assertEqual(self.read(aside, "local-only.txt"), "do not lose me\n")
 
+    def test_a_move_back_keeps_an_older_copy_with_new_ignored_files_aside(self):
+        # XERK-1858: the copy matches its export digest, but an ignored file
+        # written after the export is something the move lacks.
+        src_wt = self.src_worktree()
+        sess = self.dst_sess()
+        wt = sess["worktreePath"]
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "--detach", wt, "origin/main")
+        sm = self.make_manager()
+        sm._capture_worktree_state(wt)       # the export mark, as a move away writes it
+        mark = os.path.join(self.git("-C", wt, "rev-parse", "--absolute-git-dir"),
+                            sm.MIGRATION_EXPORT_MARK)
+        past = time.time() - 60
+        os.utime(mark, (past, past))
+        self.write(wt, "build/deep/out.bin", "built after the export\n")
+        for p in ("build", "build/deep"):
+            os.utime(os.path.join(wt, p), (past - 60, past - 60))
+        sm._restore_worktree_state(sess, sm._capture_worktree_state(src_wt))
+        self.assert_rebuilt(wt, src_wt)
+        [aside] = glob.glob(wt + ".pre-migration-*")
+        self.assertEqual(self.read(aside, "build/deep/out.bin"), "built after the export\n")
+
+    def test_ignored_files_from_before_the_export_do_not_keep_a_copy(self):
+        d = tempfile.mkdtemp(dir=self.tmp)
+        self.git("init", "-q", d)
+        with open(os.path.join(d, ".gitignore"), "w") as f:
+            f.write("*.env\nbuild/\n")
+        os.makedirs(os.path.join(d, "build", "deep"))
+        self.write(d, "a.env", "x\n")
+        self.write(os.path.join(d, "build", "deep"), "o.bin", "x\n")
+        sm = self.make_manager()
+        now = time.time()
+        self.assertFalse(sm._ignored_files_since(d, now + 60, 15))
+        self.assertTrue(sm._ignored_files_since(d, now - 60, 15))
+        # Unknown export time: any ignored file keeps the copy.
+        self.assertTrue(sm._ignored_files_since(d, None, 15))
+        # A deep file alone (its dirs older) is still seen.
+        old = now - 120
+        for p in ("a.env", "build", "build/deep"):
+            os.utime(os.path.join(d, p), (old, old))
+        self.assertTrue(sm._ignored_files_since(d, now - 60, 15))
+        os.utime(os.path.join(d, "build/deep/o.bin"), (old, old))
+        self.assertFalse(sm._ignored_files_since(d, now - 60, 15))
+        # Past the walk budget, it cannot tell: keep the copy.
+        with mock.patch.object(sm, "MIGRATION_IGNORED_WALK_MAX", 2):
+            self.assertTrue(sm._ignored_files_since(d, now - 60, 15))
+        # Nothing ignored at all: nothing to lose, mark or not.
+        e = tempfile.mkdtemp(dir=self.tmp)
+        self.git("init", "-q", e)
+        self.assertFalse(sm._ignored_files_since(e, None, 15))
+
     def test_a_patch_that_does_not_apply_refuses_and_leaves_no_worktree(self):
         src_wt = self.src_worktree()
         sm = self.make_manager()
