@@ -30,6 +30,31 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
   over an idle pane AND an unreadable one (None): a lost `turn.complete` must not hold a
   finished session busy (out of review, out of auto-merge), even where every capture fails.
 
+## `/rename` through the mod (XERK-2131 task 2)
+
+- `_reconcile_rc_names` hands the rename to the mod (`_rename_via_mod`) while its turn state
+  reads bound to the pinned conversation: `rename.json` `{v, name, at}` in
+  `TURMA_MOD_REQUESTS` (`~/.turma/mod-requests/<sid>/`); the mod runs `$.command.run`
+  (`rename`), which Claude Code queues until the session is idle, so it can never land in a
+  dialog or the trust modal (XERK-868); it answers `rename.done.json` `{v, at, name, ok}`.
+- **rcName moves on the mod's ok answer only** (matched by `at`), never on the request, so
+  peers.tsv never names a name the live registry does not answer to (verified on 2.1.304:
+  the registry `name` changes).
+- While a request is out, a changed summary re-asks with a newer `at` — even back to the
+  current name, since the older request may already be running. A pending request is never
+  typed beside, even if the mod's turn state goes unreadable.
+- ok:false → `rcRenameVia: "pane"` for the rest of that process; no mod → the pane path.
+- **The mod runs `rename` and nothing else**: the request is session-writable, so it carries
+  a name, never a command (pinned by `bridge-mod.test.js`). The mod strips control chars and
+  refuses a name over 200 chars.
+- Request dir and `rcRenamePending`/`rcRenameVia` are dropped on every launch/teardown.
+- **Operator messages stay on the pane**: a `$.prompt.submit` lands as `origin: plugin`,
+  framed "The <plugin> plugin sent a message", and the model attributes it to the plugin,
+  not the user (measured on 2.1.304). A wake or hub nudge could move there, but the chat
+  view would first need to parse that frame (py + js entry blocks).
+- Residual: a session can plant a rename request for a sibling, renaming its live name until
+  the agent's next request; the same-uid class as typing into a sibling's pane.
+
 ## Invariants
 
 - **The mod draws nothing.** A band, pane or status entry changes the screen the pane
@@ -68,6 +93,8 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 
 ## Tests
 
+- `TestReconcileRcNamesViaMod` (mod-routed rename: request, ack, failure fallback, re-ask,
+  stale answer, FIFO answer).
 - `TestBridgeMod` (gate, shipped files, reader incl. FIFO, the fold, report claude-only),
   `test_a_claude_that_reads_mods_launches_the_bridge_mod` /
   `test_an_older_claude_launches_without_the_bridge_mod` (`TestSessionLifecycle`),

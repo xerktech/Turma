@@ -18656,6 +18656,11 @@ TURN_STATE_MAX_BYTES = 4096
 # transcript is still being written: a turn.complete the mod never delivered
 # must not hold a finished session busy (out of review, out of auto-merge).
 TURN_STATE_QUIET_SEC = _env_int("TURMA_TURN_STATE_QUIET_SEC", 300, minimum=30)
+# Requests the manager hands the mod, one dir per session (TURMA_MOD_REQUESTS):
+# `rename.json` asks for `/rename <name>`, which the mod runs through the engine
+# and answers in `rename.done.json`. Both files are session-writable.
+MOD_REQUESTS_DIR = os.path.join(REGISTRY_DIR, "mod-requests")
+MOD_REQUEST_MAX_BYTES = 4096
 
 
 def bridge_mod_dir():
@@ -18706,6 +18711,61 @@ def turn_state_path(session_id):
     if not isinstance(session_id, str) or not SESSION_REQUEST_SID_RE.fullmatch(session_id):
         return None
     return os.path.join(TURN_STATE_DIR, f"{session_id}.json")
+
+
+def mod_request_dir(session_id):
+    """MOD_REQUESTS_DIR/<session_id>, or None for an id that is not a plain name."""
+    if not isinstance(session_id, str) or not SESSION_REQUEST_SID_RE.fullmatch(session_id):
+        return None
+    return os.path.join(MOD_REQUESTS_DIR, session_id)
+
+
+def write_mod_rename(session_id, name, at):
+    """Ask the session's bridge mod for `/rename <name>`, stamped `at` (epoch ms,
+    the request's id). Atomic, so the mod never reads half a request. True once
+    written."""
+    folder = mod_request_dir(session_id)
+    if not folder:
+        return False
+    try:
+        os.makedirs(folder, exist_ok=True)
+        tmp = os.path.join(folder, f".rename.{os.getpid()}.tmp")
+        with open(tmp, "w") as f:
+            json.dump({"v": 1, "name": name, "at": at}, f)
+        os.replace(tmp, os.path.join(folder, "rename.json"))
+        return True
+    except OSError as e:
+        log(f"mod rename request for {session_id} not written ({e})")
+        return False
+
+
+def read_mod_rename_done(session_id):
+    """The mod's answer to a rename request, {at, name, ok, error}, or None."""
+    folder = mod_request_dir(session_id)
+    if not folder:
+        return None
+    data = _read_untrusted_json(os.path.join(folder, "rename.done.json"), MOD_REQUEST_MAX_BYTES)
+    if data is None or data.get("v") != 1:
+        return None
+    at = data.get("at")
+    if isinstance(at, bool) or not isinstance(at, int):
+        return None
+    error = data.get("error")
+    return {"at": at, "name": data.get("name") if isinstance(data.get("name"), str) else None,
+            "ok": data.get("ok") is True,
+            "error": error[:300] if isinstance(error, str) else None}
+
+
+def clear_mod_requests(session_id):
+    """Drop the session's request dir: a request belongs to the process it was
+    made for. Never follows a link planted at the dir."""
+    folder = mod_request_dir(session_id)
+    if not folder:
+        return
+    if os.path.islink(folder):
+        unlink_quietly([folder])
+    else:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def read_turn_state(session_id, claude_sid):
@@ -28025,6 +28085,10 @@ class SessionManager:
         mod_dir = (None if isinstance(sess.get("shadow"), dict)
                    else bridge_mod_launch_dir(self.claude_version))
         turn_state = turn_state_path(sess["id"]) if mod_dir else None
+        # A rename request belongs to the process it was made for, and a fresh
+        # process gets a fresh mod (its request dir is cleared above).
+        sess.pop("rcRenamePending", None)
+        sess.pop("rcRenameVia", None)
         if turn_state:
             parts.append(f"--plugin-dir {shlex.quote(mod_dir)}")
         # Tell the agent to fork new work off the LATEST default branch rather
@@ -28074,6 +28138,7 @@ class SessionManager:
         )
         if turn_state:
             env_prefix += f"TURMA_TURN_STATE={shlex.quote(turn_state)} "
+            env_prefix += f"TURMA_MOD_REQUESTS={shlex.quote(mod_request_dir(sess['id']))} "
         # glab reads its default host from GITLAB_HOST — never the agent's own
         # GITLAB_URL — so on a self-hosted GitLab a session's `glab mr create`
         # can't auth without this, falls back to a raw API call, and the MR
@@ -28149,6 +28214,7 @@ class SessionManager:
             }
             if turn_state:
                 extra_env["TURMA_TURN_STATE"] = turn_state
+                extra_env["TURMA_MOD_REQUESTS"] = mod_request_dir(sess["id"])
             if gitlab_configured() and not os.environ.get("GITLAB_HOST"):
                 extra_env["GITLAB_HOST"] = gitlab_base()
             if subagent_model:
@@ -28579,6 +28645,7 @@ class SessionManager:
         turn_state = turn_state_path(sid)
         if turn_state:
             unlink_quietly([turn_state])
+        clear_mod_requests(sid)
 
     def _forget_session_caches(self, sid):
         # Safety net for any teardown path that reaches here without the explicit
@@ -33775,7 +33842,10 @@ class SessionManager:
             summary = (sess.get("summary") or "").strip()
             # Nothing to sync to (unnamed yet, or a blank manual rename), or the
             # live name already reflects this summary.
-            if not summary or summary == sess.get("rcRenamedFor"):
+            if not summary or (summary == sess.get("rcRenamedFor")
+                               and not sess.get("rcRenamePending")):
+                continue
+            if self._rename_via_mod(sess, summary):
                 continue
             tmux = sess.get("tmuxName")
             if not tmux:
@@ -33827,6 +33897,63 @@ class SessionManager:
             sess["rcRenamedFor"] = summary
             self.save()
             log(f"renamed session {sess['id']} RC/peer name -> {name!r}")
+
+    def _rename_via_mod(self, sess, summary):
+        """Hand the `/rename` to the session's bridge mod instead of the pane
+        (XERK-2131). True when the mod owns it this beat, False to type it.
+
+        The mod runs it through Claude Code's own command queue, once the session
+        is idle, so it can never land in a dialog or the trust modal — the hazards
+        the pane path guards against (XERK-868). Used only while the mod is
+        provably live in THIS conversation (its turn state reads bound to the
+        pinned id); a request it answers ok:false, or a session without the mod,
+        takes the pane.
+
+        rcName moves only on the mod's ok answer, never on the request, so the
+        roster never names a name the live registry does not answer to. While a
+        request is out, a changed summary re-asks (a newer `at` supersedes; the
+        mod runs the latest) — even back to the current name, since the older
+        request may already be running."""
+        sid = sess.get("id")
+        if sess.get("rcRenameVia") == "pane":
+            return False
+        pending = sess.get("rcRenamePending")
+        if not isinstance(pending, dict):
+            pending = None
+        if pending:
+            done = read_mod_rename_done(sid)
+            if done and done["at"] == pending.get("at"):
+                sess.pop("rcRenamePending", None)
+                clear_mod_requests(sid)
+                if not done["ok"]:
+                    sess["rcRenameVia"] = "pane"
+                    self.save()
+                    log(f"mod rename of {sid} failed ({done['error']}); the pane takes it")
+                    return False
+                sess["rcName"] = pending.get("name")
+                sess["rcRenamedFor"] = pending.get("summary")
+                self.save()
+                log(f"renamed session {sid} RC/peer name -> {sess['rcName']!r} (mod)")
+                pending = None
+            elif pending.get("summary") == summary:
+                return True                   # asked; waiting for the idle session
+        if summary == sess.get("rcRenamedFor") and not pending:
+            return True
+        if read_turn_state(sid, sess.get("claudeSessionId")) is None:
+            return pending is not None        # a request is out: never type beside it
+        name = self._unique_rc_name(summary, exclude_id=sid)
+        if name == sess.get("rcName") and not pending:
+            sess["rcRenamedFor"] = summary
+            self.save()
+            return True
+        at = int(time.time() * 1000)
+        if pending and at <= pending.get("at", 0):
+            at = pending["at"] + 1
+        if not write_mod_rename(sid, name, at):
+            return pending is not None
+        sess["rcRenamePending"] = {"name": name, "summary": summary, "at": at}
+        self.save()
+        return True
 
     def set_mode(self, sid, mode):
         """Switch a running session's permission mode live as a CLOSED LOOP:

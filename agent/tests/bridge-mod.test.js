@@ -45,10 +45,19 @@ test("the bridge mod's hooks module parses and loads as an ES module", async () 
   assert.match(src, /export const register\b/);
 });
 
-test("the mod reads the env var hub-agent.py exports", () => {
+test("the mod reads the env vars hub-agent.py exports", () => {
   const src = fs.readFileSync(path.join(MOD, "hooks", "register.ts"), "utf8");
   const agent = fs.readFileSync(path.join(__dirname, "..", "hub-agent.py"), "utf8");
   assert.match(src, /\$\.env\.get\('TURMA_TURN_STATE'\)/);
   assert.match(agent, /TURMA_TURN_STATE=\{shlex\.quote\(turn_state\)\}/);
   assert.match(agent, /extra_env\["TURMA_TURN_STATE"\] = turn_state/);
+  assert.match(src, /\$\.env\.get\('TURMA_MOD_REQUESTS'\)/);
+  assert.match(agent, /TURMA_MOD_REQUESTS=\{shlex\.quote\(mod_request_dir/);
+  assert.match(agent, /extra_env\["TURMA_MOD_REQUESTS"\] = mod_request_dir/);
+});
+
+test("the mod runs /rename only, never a command a request names", () => {
+  const src = fs.readFileSync(path.join(MOD, "hooks", "register.ts"), "utf8");
+  const runs = [...src.matchAll(/\$\.command\.run\(\{\s*command:\s*([^,}]+)/g)].map(m => m[1].trim());
+  assert.deepEqual(runs, ["'rename'"]);
 });
