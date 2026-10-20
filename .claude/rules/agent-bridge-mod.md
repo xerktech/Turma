@@ -26,9 +26,9 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
   mode, dialogs and everything else. No new wire field: the five working mirrors are unchanged.
 - **Skipped while a `panePrompt` dialog is up**: the turn is running, but every consumer reads
   a dialog as the session waiting on a person.
-- **Distrusted over a pane reading idle once the transcript is quiet** for
-  `TURN_STATE_QUIET_SEC` (300s): a lost `turn.complete` must not hold a finished session busy
-  (out of review, out of auto-merge). A pane read of None (failed capture) trusts it fully.
+- **Distrusted once the transcript is quiet** for `TURN_STATE_QUIET_SEC` (300s) or absent,
+  over an idle pane AND an unreadable one (None): a lost `turn.complete` must not hold a
+  finished session busy (out of review, out of auto-merge), even where every capture fails.
 
 ## Invariants
 
@@ -51,6 +51,14 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 - **Packaging**: `mods/` ships beside `hooks/` in every build — `install.sh` + `do_verify`,
   `turma-agent-update`, both release stagings, the Windows `$RuntimeDirs` + `$VerifyFiles`.
   `agent/mods/` matches no `AGENT_RULES` prefix, so it builds both agents.
+- **Claude writes `tsconfig.json` + `.claude-plugin/types/` into the mod folder** on every
+  interactive load; the folder's `.gitignore` keeps them out of git (types ignores itself).
+  On a host they land in `$PREFIX/mods`, harmlessly — a failed write still loads the mod.
+- **Loading also rides a server-side flag** (`tengu_plugin_hooks_modules`, seen in
+  `~/.claude.json`) the version gate cannot see. Off → no file → the pane alone, as before.
+- **After a `/clear` the signal is off for that process** (new session id ≠ pinned id).
+- **Pre-existing gap it exposes**: a dialog `parse_pane_prompt` misses (an MCP elicitation?)
+  reads busy for up to the quiet bound instead of idle.
 - Verified headless on 2.1.304: `claude -p --plugin-dir` loads it with no prompt and writes
   idle → running → idle (seq 3).
 
@@ -60,4 +68,10 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
   `test_a_claude_that_reads_mods_launches_the_bridge_mod` /
   `test_an_older_claude_launches_without_the_bridge_mod` (`TestSessionLifecycle`),
   `test_a_launch_drops_the_turn_state` (`TestLocalModelFailover`).
-- `claude plugin validate agent/mods/turma-bridge` must pass after any edit to the module.
+- `agent/tests/bridge-mod.test.js` (CI's node step): strips the module's types, parses it as
+  an ES module, pins the env-var contract with hub-agent.py.
+- Shadow exclusion: `test_a_shadow_never_loads_the_bridge_mod`; Windows argv/env:
+  `test_windows_launch_loads_the_bridge_mod`.
+- Also run `claude plugin validate agent/mods/turma-bridge` after any edit to the module.
+- The interactive load is HOST proof only: run `_launch_tmux`'s exact command in a scratch
+  `tmux -L <name>` server (`TMUX` unset first) and watch the state file beside the pane.

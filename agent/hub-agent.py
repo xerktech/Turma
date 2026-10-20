@@ -18724,13 +18724,14 @@ def fold_turn_state(report, turn):
     blocking dialog is up (`panePrompt`) — the turn is technically running then,
     but every consumer reads that dialog as the session waiting on a person — and
     over a pane that reads idle once the transcript has been quiet for
-    TURN_STATE_QUIET_SEC, so a lost turn.complete cannot hold a session busy."""
+    TURN_STATE_QUIET_SEC, so a lost turn.complete cannot hold a session busy.
+    That bound holds over a pane that could not be read (None) too: a capture
+    failing every beat must not make a stale "running" permanent."""
     if turn is not True or report.get("paneBusy") is True or report.get("panePrompt"):
         return
-    if report.get("paneBusy") is False:
-        age = report.get("transcriptAgeSec")
-        if age is None or age >= TURN_STATE_QUIET_SEC:
-            return
+    age = report.get("transcriptAgeSec")
+    if age is None or age >= TURN_STATE_QUIET_SEC:
+        return
     report["paneBusy"] = True
 
 

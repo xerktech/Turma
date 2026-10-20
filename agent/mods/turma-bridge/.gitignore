@@ -1,0 +1,3 @@
+# Written by Claude Code itself on every interactive load of this folder
+# (--plugin-dir): its editor scaffolding, never part of the mod (XERK-2131).
+tsconfig.json
