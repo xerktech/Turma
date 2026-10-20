@@ -136,7 +136,8 @@ const DATA_NOTE =
 // hands a command's output to the model unescaped inside <local-command-stdout>,
 // so a cell holding that closing tag ended the wrapper and its tail read as
 // instructions the operator never saw (QA, 2.1.304): angle brackets become
-// look-alikes. Every pane busy marker (hub-agent.py's PANE_BUSY_MARKERS,
+// look-alikes, and so does `&` — the model reads `&lt;/…&gt;` as the tag (5/5)
+// while the pane decodes it for the person. Every pane busy marker (hub-agent.py's PANE_BUSY_MARKERS,
 // QWEN_PANE_BUSY_MARKERS and the ⏵/⏸ footer glyphs) is broken up too, or a
 // peer's text on screen would read an idle session busy. A non-string is no
 // text.
@@ -144,12 +145,19 @@ function cell(v: unknown): string {
   const t = typeof v === 'string' ? v : typeof v === 'number' && Number.isFinite(v) ? String(v) : ''
   const flat = t
     .replace(/[\p{Cc}\p{Cf}]+/gu, ' ')
+    .replace(/&/g, '＆')
     .replace(/</g, '‹')
     .replace(/>/g, '›')
     .replace(/(esc|enter) to (interrupt|steer|cancel)/gi, '$1-to-$2')
     .replace(/[⏵⏸]/g, '▹')
     .trim()
   return flat.length > CELL_MAX ? `${flat.slice(0, CELL_MAX - 1)}…` : flat
+}
+
+// Free text someone else wrote, quoted so it reads as quoted data.
+function quoted(v: unknown): string {
+  const c = cell(v).replace(/"/g, '”')
+  return c ? `“${c}”` : ''
 }
 
 async function peersText($: EngineInterface): Promise<string> {
@@ -173,7 +181,7 @@ async function peersText($: EngineInterface): Promise<string> {
     const mark = mine(r) ? ' (you)' : ''
     const where = [cell(h), cell(repo)].filter(Boolean).join('/')
     const br = cell(branch) ? ` [${cell(branch)}]` : ''
-    const what = cell(task) ? ` — ${cell(task)}` : ''
+    const what = quoted(task) ? ` — ${quoted(task)}` : ''
     return `  ${cell(name)}${mark}  ${where}${br}${what}`
   })
   const head = [`${rows.length} session(s); message one by its name with SendMessage.`, DATA_NOTE]
@@ -185,7 +193,8 @@ async function peersText($: EngineInterface): Promise<string> {
     kept.push(line)
     size += line.length + 1
   }
-  if (kept.length < ordered.length) kept.push(`  …and ${ordered.length - kept.length} more in ${cell(path)}`)
+  // The path is the agent's own (TURMA_PEERS_FILE), not file text: never cut.
+  if (kept.length < ordered.length) kept.push(`  …and ${ordered.length - kept.length} more in ${path}`)
   return [...head, ...kept].join('\n')
 }
 
@@ -207,9 +216,9 @@ async function statusText($: EngineInterface): Promise<string> {
   }
   if (st.v !== 1) return 'The status file is not one this mod reads.'
   const out = [`Session ${cell(st.id)}: ${cell(st.name)}`, DATA_NOTE]
-  if (cell(st.summary)) out.push(`  task:    ${cell(st.summary)}`)
+  if (cell(st.summary)) out.push(`  task:    ${quoted(st.summary)}`)
   if (st.ticket && cell(st.ticket.key)) {
-    out.push(`  ticket:  ${cell(st.ticket.key)} ${cell(st.ticket.summary)}`.trimEnd())
+    out.push(`  ticket:  ${cell(st.ticket.key)} ${quoted(st.ticket.summary)}`.trimEnd())
   }
   out.push(`  branch:  ${cell(st.branch) || '(detached)'}`)
   const prs = Array.isArray(st.prs) ? st.prs.filter(p => p && typeof p === 'object').slice(0, 10) : []
