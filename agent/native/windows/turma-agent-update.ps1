@@ -473,7 +473,7 @@ function Get-ManifestField([string]$ManifestFile, [string]$Field) {
 $RuntimeFiles = @('hub-agent.py', 'tunnel-agent.js',
   'runtime_projection.py', 'runtime_tail.py',
   'qwen_session.py', 'qwen_transcript.py')
-$RuntimeDirs  = @('qwen')                          # recursive; hooks + win handled explicitly
+$RuntimeDirs  = @('qwen', 'mods')                          # recursive; hooks + win handled explicitly
 $BinScripts   = @('turma-agent.ps1', 'turma-agentctl.ps1', 'turma-agent-update.ps1')
 
 # Re-lay $SrcDir onto $DstDir, preserving named subdirs across the wipe (used to carry a built

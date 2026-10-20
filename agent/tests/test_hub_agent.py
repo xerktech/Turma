@@ -893,6 +893,10 @@ class ProjectDirMixin:
         lpatcher = mock.patch.object(ha, "LIVE_AGENTS_DIR", os.path.join(self.tmp, "live-agents"))
         lpatcher.start()
         self.addCleanup(lpatcher.stop)
+        # A report given a session id reads the bridge mod's turn state (XERK-2131).
+        tpatcher = mock.patch.object(ha, "TURN_STATE_DIR", os.path.join(self.tmp, "turn-state"))
+        tpatcher.start()
+        self.addCleanup(tpatcher.stop)
         self.proj = os.path.join(self.tmp, ha._project_slug(self.WORKDIR))
         os.makedirs(self.proj)
 
@@ -5720,6 +5724,8 @@ class ManagerMixin:
             ("SHADOW_RUNS_PATH", os.path.join(self.tmp, "shadow-runs.json")),
             # XERK-1587: every launch/teardown unlinks the session's snapshot.
             ("LIVE_AGENTS_DIR", os.path.join(self.tmp, "live-agents")),
+            # XERK-2131: every launch/teardown unlinks the session's turn state.
+            ("TURN_STATE_DIR", os.path.join(self.tmp, "turn-state")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("RESUMABLE_CACHE_PATH", os.path.join(self.tmp, "resumable-cache.json")),
             ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
@@ -14844,6 +14850,28 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(matchers, ["Bash", "Write|Edit|MultiEdit|NotebookEdit",
                                     "AskUserQuestion", "Agent|Task|Workflow"])
 
+    def test_a_claude_that_reads_mods_launches_the_bridge_mod(self):
+        """XERK-2131: on a Claude Code new enough for mods, every launch loads
+        the bridge mod and tells it where the session's turn state lives."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.claude_version = "2.1.304 (Claude Code)"
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        cmd = self._claude_cmd()
+        self.assertIn(f"--plugin-dir {shlex.quote(ha.bridge_mod_dir())} ", cmd)
+        self.assertIn(
+            f"TURMA_TURN_STATE={shlex.quote(ha.turn_state_path(sess['id']))} ", cmd)
+
+    def test_an_older_claude_launches_without_the_bridge_mod(self):
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.claude_version = "2.1.303 (Claude Code)"
+        sm.spawn("Turma")
+        cmd = self._claude_cmd()
+        self.assertNotIn("--plugin-dir", cmd)
+        self.assertNotIn("TURMA_TURN_STATE", cmd)
+
     def test_spawn_exports_gitlab_host_for_glab(self):
         """A GitLab-configured host tells every session's glab WHERE to auth:
         glab reads GITLAB_HOST, never the agent's GITLAB_URL, so without this a
@@ -14908,6 +14936,30 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
                     self.assertEqual(env.get("TURMA_PIN_SUBAGENT_MODEL"), "opus")
                 else:
                     self.assertNotIn("TURMA_PIN_SUBAGENT_MODEL", env)
+
+    def test_windows_launch_loads_the_bridge_mod(self):
+        # XERK-2131: no shell on Windows, so the mod rides argv and the turn
+        # state path rides extra_env.
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[-1]
+        for version, loaded in (("2.1.304 (Claude Code)", True), ("2.1.303 (Claude Code)", False)):
+            sm.claude_version = version
+            spawned = []
+            with mock.patch.object(ha, "IS_WINDOWS", True), \
+                    mock.patch.object(sm, "_spawn_pty_host",
+                                      side_effect=lambda s_, argv, env: spawned.append((argv, env))), \
+                    mock.patch.object(sm, "_trust_watch"):
+                sm._launch_tmux(sess)
+            (argv, env), = spawned
+            if loaded:
+                i = argv.index("--plugin-dir")
+                self.assertEqual(argv[i + 1], ha.bridge_mod_dir())
+                self.assertEqual(env["TURMA_TURN_STATE"], ha.turn_state_path(sess["id"]))
+            else:
+                self.assertNotIn("--plugin-dir", argv)
+                self.assertNotIn("TURMA_TURN_STATE", env)
 
     def test_spawn_onto_local_refused_without_configuration(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
@@ -20344,6 +20396,18 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         self.assertFalse(os.path.exists(snap))
         self.assertNotIn("liveAgents", sm.sess_state[sess["id"]])
 
+    def test_a_launch_drops_the_turn_state(self):
+        # XERK-2131: a claude killed mid-turn never wrote its idle, so the
+        # relaunch must not read the old process's "running".
+        sm = self.make_manager()
+        sess = self._session(sm)
+        path = ha.turn_state_path(sess["id"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("{}")
+        sm._launch_tmux(sess)
+        self.assertFalse(os.path.exists(path))
+
     def test_teardown_drops_the_live_agent_snapshot(self):
         sm = self.make_manager()
         sess = self._session(sm)
@@ -21431,6 +21495,102 @@ class TestSessionDirective(ManagerMixin, unittest.TestCase):
         for rt in ("dsh", "qwen"):
             self.assertNotIn(" wake <N>m", sm._session_directive(self._sess(agentType=rt), "X"))
             self.assertTrue(sm._session_directive(self._sess(agentType=rt), "X").endswith("X"))
+
+
+class TestBridgeMod(ProjectDirMixin, unittest.TestCase):
+    """XERK-2131: the bridge mod's turn state, read on the beat as an extra
+    paneBusy source that can only turn an idle read busy."""
+
+    SID = "s1"
+    CSID = "11111111-2222-3333-4444-555555555555"
+
+    def _state(self, **over):
+        body = {"v": 1, "claudeSessionId": self.CSID, "turn": "running",
+                "turnId": "t1", "seq": 2, "at": 1}
+        body.update(over)
+        path = ha.turn_state_path(self.SID)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(body, f)
+        return path
+
+    def test_the_launch_dir_needs_a_new_enough_claude_and_the_files(self):
+        here = "2.1.304 (Claude Code)"
+        self.assertEqual(ha.bridge_mod_launch_dir(here), ha.bridge_mod_dir())
+        self.assertEqual(ha.bridge_mod_launch_dir("2.2.0 (Claude Code)"), ha.bridge_mod_dir())
+        self.assertIsNone(ha.bridge_mod_launch_dir("2.1.303 (Claude Code)"))
+        self.assertIsNone(ha.bridge_mod_launch_dir(""))
+        self.assertIsNone(ha.bridge_mod_launch_dir(None))
+        with mock.patch.object(ha, "BRIDGE_MOD", False):
+            self.assertIsNone(ha.bridge_mod_launch_dir(here))
+        with mock.patch.object(ha, "bridge_mod_dir", lambda: os.path.join(self.tmp, "none")):
+            self.assertIsNone(ha.bridge_mod_launch_dir(here))
+
+    def test_the_shipped_mod_is_well_formed(self):
+        folder = ha.bridge_mod_dir()
+        manifest = json.load(open(os.path.join(folder, ".claude-plugin", "plugin.json")))
+        self.assertEqual(manifest["name"], "turma-bridge")
+        hooks = json.load(open(os.path.join(folder, "hooks", "hooks.json")))
+        self.assertEqual(hooks, {"modules": ["./register.ts"]})
+        src = open(os.path.join(folder, "hooks", "register.ts")).read()
+        # The env var the agent exports is the one the module reads.
+        self.assertIn("'TURMA_TURN_STATE'", src)
+
+    def test_read_turn_state(self):
+        self._state()
+        self.assertIs(ha.read_turn_state(self.SID, self.CSID), True)
+        self._state(turn="idle")
+        self.assertIs(ha.read_turn_state(self.SID, self.CSID), False)
+        # Another conversation's file (a /clear, a nested claude) says nothing.
+        self.assertIsNone(ha.read_turn_state(self.SID, "other"))
+        self.assertIsNone(ha.read_turn_state(self.SID, None))
+        for bad in ({"v": 2}, {"turn": "busy"}, {"turn": None}):
+            self._state(**bad)
+            self.assertIsNone(ha.read_turn_state(self.SID, self.CSID))
+        self.assertIsNone(ha.read_turn_state("../x", self.CSID))
+        self.assertIsNone(ha.read_turn_state("absent", self.CSID))
+
+    def test_a_fifo_at_the_turn_state_is_no_state(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs here")
+        path = ha.turn_state_path(self.SID)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.mkfifo(path)
+        self.assertIsNone(ha.read_turn_state(self.SID, self.CSID))
+
+    def test_the_fold_only_ever_raises_busy(self):
+        def fold(turn, **report):
+            ha.fold_turn_state(report, turn)
+            return report.get("paneBusy")
+        # A failed capture (None) and a fresh idle read both rise to busy.
+        self.assertIs(fold(True, paneBusy=None, transcriptAgeSec=5), True)
+        self.assertIs(fold(True, paneBusy=False, transcriptAgeSec=5), True)
+        # Never lowered: a compaction or a `!` command is busy with no turn.
+        self.assertIs(fold(False, paneBusy=True), True)
+        self.assertIs(fold(None, paneBusy=True), True)
+        self.assertIs(fold(False, paneBusy=False), False)
+        self.assertIsNone(fold(None, paneBusy=None))
+        # Nor over a pane that never reads: a capture failing every beat.
+        self.assertIsNone(fold(True, paneBusy=None, transcriptAgeSec=ha.TURN_STATE_QUIET_SEC))
+        self.assertIsNone(fold(True, paneBusy=None))
+        # A dialog is the session waiting on a person, whatever the turn says.
+        self.assertIs(fold(True, paneBusy=False, transcriptAgeSec=5,
+                           panePrompt={"prompt": "Proceed?"}), False)
+        # A lost turn.complete: the pane reads idle and the transcript went quiet.
+        quiet = ha.TURN_STATE_QUIET_SEC
+        self.assertIs(fold(True, paneBusy=False, transcriptAgeSec=quiet), False)
+        self.assertIs(fold(True, paneBusy=False, transcriptAgeSec=None), False)
+        self.assertIs(fold(True, paneBusy=False, transcriptAgeSec=quiet - 1), True)
+
+    def test_the_report_folds_it_for_claude_only(self):
+        write_jsonl(os.path.join(self.proj, f"{self.CSID}.jsonl"),
+                    [{"type": "user", "message": {"content": "go"}}])
+        self._state()
+        for agent_type, want in ((None, True), ("claude", True), ("qwen", False)):
+            with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None)):
+                rep = ha.session_report(self.WORKDIR, {}, "agent-abc", session_id=self.SID,
+                                        claude_sid=self.CSID, agent_type=agent_type)
+            self.assertIs(rep["paneBusy"], want, agent_type)
 
 
 class TestWakeRequest(ManagerMixin, unittest.TestCase):
@@ -47965,6 +48125,18 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, f"{name}.json"), "w") as f:
             json.dump(data, f)
+
+    def test_a_shadow_never_loads_the_bridge_mod(self):
+        # XERK-2131: a shadow's launch is its sandbox; even on a Claude Code
+        # that reads mods, it gets no --plugin-dir and no turn-state path.
+        sm = self.spawned()
+        sm.claude_version = "2.1.304 (Claude Code)"
+        [sess] = sm.registry
+        sm._launch_tmux(sess)
+        cmd = self.launches()[-1][-1]
+        self.assertIn("TURMA_SHADOW=run", cmd)
+        self.assertNotIn("--plugin-dir", cmd)
+        self.assertNotIn("TURMA_TURN_STATE", cmd)
 
     def test_a_shadow_spawns_blind_from_the_parent_commit_and_cannot_publish(self):
         sm = self.spawned()

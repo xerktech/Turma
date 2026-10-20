@@ -1,0 +1,5 @@
+{
+  "name": "turma-bridge",
+  "version": "0.1.0",
+  "description": "Tells the Turma agent whether this session's own turn is running."
+}
