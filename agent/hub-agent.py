@@ -18699,7 +18699,16 @@ def mod_rename_name(text):
         out.append(ch)
     if gap:
         out.append(" ")
-    return _JS_TRIM_RE.sub("", _JS_TRIM_RE.sub("", "".join(out))[:MOD_NAME_MAX - 8])
+    name = _JS_TRIM_RE.sub("", "".join(out))
+    # The mod counts JS string length (UTF-16 units: an emoji is two), so the
+    # cut does too, and never splits a character.
+    room, cut = MOD_NAME_MAX - 8, []
+    for ch in name:
+        room -= 2 if ord(ch) > 0xFFFF else 1
+        if room < 0:
+            break
+        cut.append(ch)
+    return _JS_TRIM_RE.sub("", "".join(cut))
 
 
 def bridge_mod_dir():

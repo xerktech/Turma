@@ -27527,8 +27527,14 @@ class TestReconcileRcNamesViaMod(ManagerMixin, unittest.TestCase):
             self.assertEqual(ha.mod_rename_name(raw), want, repr(raw))
 
     def test_a_long_name_is_cut_to_fit_the_mod(self):
-        name = ha.mod_rename_name("x" * 500)
-        self.assertLessEqual(len(name) + len("-99"), ha.MOD_NAME_MAX)
+        def js_len(t):
+            return len(t.encode("utf-16-le")) // 2
+        for raw in ("x" * 500, "😀" * 120, "x" * 191 + " " + "y" * 20):
+            name = ha.mod_rename_name(raw)
+            # Measured as the mod measures it, with room for the dedupe's -N.
+            self.assertLessEqual(js_len(name) + len("-99"), ha.MOD_NAME_MAX, repr(raw))
+            self.assertEqual(name, name.strip(), "a cut never leaves padding the mod refuses")
+        self.assertEqual(ha.mod_rename_name("x" * 191 + " " + "y" * 20), "x" * 191)
 
     def test_a_summary_with_nothing_nameable_is_never_typed(self):
         sm = self.make_manager()
