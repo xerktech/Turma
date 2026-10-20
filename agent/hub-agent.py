@@ -18768,19 +18768,30 @@ def mod_request_dir(session_id):
     return os.path.join(MOD_REQUESTS_DIR, session_id)
 
 
+def _write_mod_file(folder, name, text):
+    """Atomically write `folder/name`, a session-writable dir: a fresh temp from
+    mkstemp (O_EXCL, never a planted link) renamed over the target, which
+    replaces a link planted there rather than following it."""
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, os.path.join(folder, name))
+    except BaseException:
+        unlink_quietly([tmp])
+        raise
+
+
 def write_mod_rename(session_id, name, at):
     """Ask the session's bridge mod for `/rename <name>`, stamped `at` (epoch ms,
     the request's id). Atomic, so the mod never reads half a request. True once
     written."""
     folder = mod_request_dir(session_id)
-    if not folder:
-        return False
+    if not folder or os.path.islink(folder):
+        return False                          # never write through a planted link
     try:
-        os.makedirs(folder, exist_ok=True)
-        tmp = os.path.join(folder, f".rename.{os.getpid()}.tmp")
-        with open(tmp, "w") as f:
-            json.dump({"v": 1, "name": name, "at": at}, f)
-        os.replace(tmp, os.path.join(folder, "rename.json"))
+        _write_mod_file(folder, "rename.json", json.dumps({"v": 1, "name": name, "at": at}))
         return True
     except OSError as e:
         log(f"mod rename request for {session_id} not written ({e})")
@@ -18802,6 +18813,38 @@ def read_mod_rename_done(session_id):
     return {"at": at, "name": data.get("name") if isinstance(data.get("name"), str) else None,
             "ok": data.get("ok") is True,
             "error": error[:300] if isinstance(error, str) else None}
+
+
+def clear_mod_rename(session_id):
+    """Drop the answered rename request and its answer, leaving the rest of the
+    session's request dir (status.json) in place."""
+    folder = mod_request_dir(session_id)
+    if folder and not os.path.islink(folder):
+        unlink_quietly([os.path.join(folder, "rename.json"),
+                        os.path.join(folder, "rename.done.json")])
+
+
+def mod_status(sess, payload):
+    """What `/turma status` shows (the mod reads it as `status.json`): this
+    session's name, task, ticket, live branch, PRs and pending wake, all off the
+    payload the beat already built. Small and bounded."""
+    ticket = payload.get("ticket") if isinstance(payload.get("ticket"), dict) else None
+    git = payload.get("git") if isinstance(payload.get("git"), dict) else {}
+    prs = []
+    for pr in (payload.get("prs") or [])[:10]:
+        if isinstance(pr, dict):
+            prs.append({k: pr.get(k) for k in ("url", "number", "title", "state", "checks", "ready")})
+    return {
+        "v": 1,
+        "id": payload.get("id"),
+        "name": payload.get("rcName"),
+        "summary": payload.get("summary"),
+        "ticket": ({k: ticket.get(k) for k in ("key", "url", "summary")} if ticket else None),
+        "branch": git.get("branch") or None,
+        "prs": prs,
+        "wakeAt": sess.get("wakeAt"),
+        "wakeReason": sess.get("wakeReason"),
+    }
 
 
 def clear_mod_requests(session_id):
@@ -23900,6 +23943,8 @@ class SessionManager:
         # `codingAgent` — the two update independently, so a new agent must not
         # blank an old hub's header.
         self.claude_version = run(["claude", "--version"])
+        # The last status.json written per session, so the beat writes only on change.
+        self._mod_status_last = {}
         off = bridge_mod_off_reason(self.claude_version)
         log(f"bridge mod: off ({off})" if off else f"bridge mod: on ({bridge_mod_dir()})")
         self.coding_agent = coding_agent()
@@ -28137,6 +28182,11 @@ class SessionManager:
         # process gets a fresh mod (its request dir is cleared above).
         sess.pop("rcRenamePending", None)
         sess.pop("rcRenameVia", None)
+        # Whether this process carries the mod: the beat publishes its status file.
+        if turn_state:
+            sess["bridgeMod"] = True
+        else:
+            sess.pop("bridgeMod", None)
         if turn_state:
             parts.append(f"--plugin-dir {shlex.quote(mod_dir)}")
         # Tell the agent to fork new work off the LATEST default branch rather
@@ -28187,6 +28237,8 @@ class SessionManager:
         if turn_state:
             env_prefix += f"TURMA_TURN_STATE={shlex.quote(turn_state)} "
             env_prefix += f"TURMA_MOD_REQUESTS={shlex.quote(mod_request_dir(sess['id']))} "
+            env_prefix += f"TURMA_PEERS_FILE={shlex.quote(PEERS_FILE)} "
+            env_prefix += f"TURMA_DEVICE={shlex.quote(self.device or '')} "
         # glab reads its default host from GITLAB_HOST — never the agent's own
         # GITLAB_URL — so on a self-hosted GitLab a session's `glab mr create`
         # can't auth without this, falls back to a raw API call, and the MR
@@ -28263,6 +28315,8 @@ class SessionManager:
             if turn_state:
                 extra_env["TURMA_TURN_STATE"] = turn_state
                 extra_env["TURMA_MOD_REQUESTS"] = mod_request_dir(sess["id"])
+                extra_env["TURMA_PEERS_FILE"] = PEERS_FILE
+                extra_env["TURMA_DEVICE"] = self.device or ""
             if gitlab_configured() and not os.environ.get("GITLAB_HOST"):
                 extra_env["GITLAB_HOST"] = gitlab_base()
             if subagent_model:
@@ -28694,6 +28748,7 @@ class SessionManager:
         if turn_state:
             unlink_quietly([turn_state])
         clear_mod_requests(sid)
+        getattr(self, "_mod_status_last", {}).pop(sid, None)
 
     def _forget_session_caches(self, sid):
         # Safety net for any teardown path that reaches here without the explicit
@@ -33946,6 +34001,30 @@ class SessionManager:
             self.save()
             log(f"renamed session {sess['id']} RC/peer name -> {name!r}")
 
+    def _publish_mod_status(self, payloads):
+        """Write each bridge-mod session's `status.json` (what `/turma status`
+        shows) when it changed or went missing, and hand the payloads back
+        unchanged. On the beat, so best-effort and never raising, one session's
+        failure never costing another's; a few hundred bytes per session."""
+        for sess, payload in zip(self.registry, payloads):
+            sid = sess.get("id")
+            try:
+                if (not sess.get("bridgeMod") or sess.get("status") != "running"
+                        or not isinstance(payload, dict) or payload.get("id") != sid):
+                    continue
+                folder = mod_request_dir(sid)
+                if not folder or os.path.islink(folder):
+                    continue                  # never write through a planted link
+                text = json.dumps(mod_status(sess, payload), sort_keys=True)
+                if (self._mod_status_last.get(sid) == text
+                        and os.path.isfile(os.path.join(folder, "status.json"))):
+                    continue
+                _write_mod_file(folder, "status.json", text)
+                self._mod_status_last[sid] = text
+            except Exception as e:
+                log(f"mod status for {sid} not written ({e})")
+        return payloads
+
     def _rename_via_mod(self, sess, summary):
         """Hand the `/rename` to the session's bridge mod instead of the pane
         (XERK-2131). True when the mod owns it this beat, False to type it.
@@ -33974,7 +34053,7 @@ class SessionManager:
             done = read_mod_rename_done(sid)
             if done and done["at"] == pending.get("at"):
                 sess.pop("rcRenamePending", None)
-                clear_mod_requests(sid)
+                clear_mod_rename(sid)
                 if done["ok"]:
                     sess["rcName"] = pending.get("name")
                     sess["rcRenamedFor"] = pending.get("summary")
@@ -43938,8 +44017,8 @@ class SessionManager:
             # that goes stale fastest.
             "capacity": self._capacity_payload(),
             "repos": self._sorted_repo_entries(refresh, light),
-            "sessions": [self._session_payload(s, refresh, light)
-                         for s in self.registry],
+            "sessions": self._publish_mod_status(
+                [self._session_payload(s, refresh, light) for s in self.registry]),
             "closedSessions": self._closed_payload(),
             # Persistent usage, independent of active sessions: per-repo (keyed by
             # normalized origin so the hub can unify a repo across hosts) plus this
