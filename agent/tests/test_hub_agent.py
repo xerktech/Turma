@@ -5726,6 +5726,7 @@ class ManagerMixin:
             ("LIVE_AGENTS_DIR", os.path.join(self.tmp, "live-agents")),
             # XERK-2131: every launch/teardown unlinks the session's turn state.
             ("TURN_STATE_DIR", os.path.join(self.tmp, "turn-state")),
+            ("MOD_REQUESTS_DIR", os.path.join(self.tmp, "mod-requests")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("RESUMABLE_CACHE_PATH", os.path.join(self.tmp, "resumable-cache.json")),
             ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
@@ -14862,6 +14863,8 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertIn(f"--plugin-dir {shlex.quote(ha.bridge_mod_dir())} ", cmd)
         self.assertIn(
             f"TURMA_TURN_STATE={shlex.quote(ha.turn_state_path(sess['id']))} ", cmd)
+        self.assertIn(
+            f"TURMA_MOD_REQUESTS={shlex.quote(ha.mod_request_dir(sess['id']))} ", cmd)
 
     def test_the_manager_logs_at_start_whether_sessions_get_the_bridge_mod(self):
         # 2.3.49 reached hosts through an updater that skipped mods/, and nothing
@@ -14896,6 +14899,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         cmd = self._claude_cmd()
         self.assertNotIn("--plugin-dir", cmd)
         self.assertNotIn("TURMA_TURN_STATE", cmd)
+        self.assertNotIn("TURMA_MOD_REQUESTS", cmd)
 
     def test_spawn_exports_gitlab_host_for_glab(self):
         """A GitLab-configured host tells every session's glab WHERE to auth:
@@ -14982,6 +14986,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
                 i = argv.index("--plugin-dir")
                 self.assertEqual(argv[i + 1], ha.bridge_mod_dir())
                 self.assertEqual(env["TURMA_TURN_STATE"], ha.turn_state_path(sess["id"]))
+                self.assertEqual(env["TURMA_MOD_REQUESTS"], ha.mod_request_dir(sess["id"]))
             else:
                 self.assertNotIn("--plugin-dir", argv)
                 self.assertNotIn("TURMA_TURN_STATE", env)
@@ -27341,6 +27346,279 @@ class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["rcName"], "Fix the retry loop-2")
         self.assertIn(("agent-s1", ("/rename Fix the retry loop-2",), True),
                       self.keys)
+
+
+class TestReconcileRcNamesViaMod(ManagerMixin, unittest.TestCase):
+    """XERK-2131: while the bridge mod is live in the session's conversation the
+    `/rename` goes to the mod (Claude Code's own command queue, idle-only), and
+    rcName moves only on the mod's ok answer."""
+
+    CSID = "11111111-2222-3333-4444-555555555555"
+
+    def make_manager(self):
+        sm = super().make_manager()
+        sm.save = mock.Mock()
+        self.keys = []
+
+        def fake_send(tmux, *tokens, literal=False):
+            self.keys.append((tmux, tuple(tokens), literal))
+
+        for name, value in [("_capture_pane", lambda t: "idle pane"),
+                            ("_busy_from_capture", lambda c: False),
+                            ("parse_pane_prompt", lambda c: None),
+                            ("_pane_send_keys", fake_send)]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        return sm
+
+    def _sess(self, **kw):
+        s = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+             "rcName": "h-r-s1", "summary": "Fix the retry loop",
+             "claudeSessionId": self.CSID}
+        s.update(kw)
+        return s
+
+    def _mod_live(self, csid=None):
+        path = ha.turn_state_path("s1")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"v": 1, "claudeSessionId": csid or self.CSID, "turn": "idle"}, f)
+
+    def _request(self):
+        with open(os.path.join(ha.mod_request_dir("s1"), "rename.json")) as f:
+            return json.load(f)
+
+    def _answer(self, ok=True, at=None, error=None):
+        req = self._request()
+        with open(os.path.join(ha.mod_request_dir("s1"), "rename.done.json"), "w") as f:
+            json.dump({"v": 1, "at": at or req["at"], "name": req["name"], "ok": ok,
+                       "error": error}, f)
+
+    def test_a_live_mod_gets_the_request_and_the_pane_gets_nothing(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+        self.assertEqual(self._request()["name"], "Fix the retry loop")
+        # Not yet: the live name moves only when the mod says it ran.
+        self.assertEqual(sess["rcName"], "h-r-s1")
+        sm._reconcile_rc_names()              # still waiting: no second request
+        self.assertEqual(sess["rcRenamePending"]["at"], self._request()["at"])
+        self._answer()
+        sm._reconcile_rc_names()
+        self.assertEqual((sess["rcName"], sess["rcRenamedFor"]),
+                         ("Fix the retry loop", "Fix the retry loop"))
+        self.assertNotIn("rcRenamePending", sess)
+        self.assertFalse(os.path.exists(ha.mod_request_dir("s1")))
+        self.assertEqual(self.keys, [])
+
+    def test_a_failed_mod_rename_is_asked_again_then_stops_never_the_pane(self):
+        # QA: an Esc dropped the mod's queued /rename, the pane fallback then typed
+        # it onto the prompt Claude Code had just restored. A failure is retried
+        # through the mod, then renaming stops; the pane never takes it.
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        for attempt in range(1, ha.MOD_RENAME_ATTEMPTS + 1):
+            self.assertEqual(sess["rcRenamePending"]["attempts"], attempt)
+            self._answer(ok=False, error="removed from the queue")
+            sm._reconcile_rc_names()
+        self.assertEqual(sess["rcRenameVia"], "off")
+        self.assertNotIn("rcRenamePending", sess)
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+        self.assertEqual(sess["rcName"], "h-r-s1")
+
+    def test_a_retry_that_succeeds_moves_the_name(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self._answer(ok=False, error="removed from the queue")
+        sm._reconcile_rc_names()
+        self._answer()
+        sm._reconcile_rc_names()
+        self.assertEqual(sess["rcName"], "Fix the retry loop")
+        self.assertEqual(self.keys, [])
+
+    def test_a_pending_request_is_never_typed_beside(self):
+        # The mod's turn state goes unreadable while a request is out: the pane
+        # must not type a second /rename next to the one that may still run.
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        os.unlink(ha.turn_state_path("s1"))
+        sess["summary"] = "Another name"
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+
+    def test_a_failed_attempt_is_never_followed_by_the_pane(self):
+        # ok:false answered, then the mod's turn state goes unreadable before the
+        # re-ask: the pane must not take it (it types beside the failure's cause).
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self._answer(ok=False, error="removed from the queue")
+        os.unlink(ha.turn_state_path("s1"))
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+
+    def test_a_request_that_cannot_be_written_is_never_typed_beside(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        sess["summary"] = "Another name"
+        with mock.patch.object(ha, "write_mod_rename", lambda *a: False):
+            sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+
+    def test_a_changed_summary_keeps_the_attempt_count(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self._answer(ok=False, error="x")
+        sm._reconcile_rc_names()
+        self.assertEqual(sess["rcRenamePending"]["attempts"], 2)
+        sess["summary"] = "Another name"
+        sm._reconcile_rc_names()
+        self.assertEqual(sess["rcRenamePending"]["attempts"], 2)
+
+    def test_names_are_cleaned_before_the_dedupe(self):
+        # QA: cleaned after it, "QA\x07x" passed the dedupe then became "QA x",
+        # a name another live session already held: both unaddressable.
+        sm = self.make_manager()
+        self._mod_live()
+        other = {"id": "s2", "status": "running", "rcName": "QA x"}
+        sess = self._sess(summary="QA\x07x")
+        sm.registry = [sess, other]
+        sm._reconcile_rc_names()
+        self.assertEqual(self._request()["name"], "QA x-2")
+
+    def test_the_name_is_trimmed_as_the_mod_sees_it(self):
+        self.assertEqual(ha.mod_rename_name("\ufeff QA bom \u3000\ufeff"), "QA bom")
+        self.assertEqual(ha.mod_rename_name("  a\tb  "), "a b")
+        self.assertEqual(ha.mod_rename_name("\x07"), "")
+        # What /rename itself rewrites (2.1.304): C1 controls, U+200B, U+2028.
+        for raw, want in (("QA\x9bcsi", "QA csi"), ("QA\x80pad", "QA pad"),
+                          ("QA \u200bzw\u200b", "QA  zw"), ("QA\u2028ls mid", "QA ls mid"),
+                          ("QA \u00a0nbsp 🚀", "QA \u00a0nbsp 🚀"),
+                          ("QA\u2029para", "QA para"),
+                          # Unicode Cf, each run one space (QA, 2.1.304).
+                          ("QA\u200c\u200drun", "QA run"), ("QA \U0001F468\u200d\U0001F469 fam",
+                                                          "QA \U0001F468 \U0001F469 fam"),
+                          ("QA\u202eRLO", "QA RLO"), ("QA\u00adsoft", "QA soft"),
+                          ("QA\ufeffmid", "QA mid"), ("QA\U000E0041tag", "QA tag"),
+                          # Kept: combining marks, Lo ignorables, private use.
+                          ("QA e\u0301 \u3164 \ue000", "QA e\u0301 \u3164 \ue000")):
+            self.assertEqual(ha.mod_rename_name(raw), want, repr(raw))
+
+    def test_a_long_name_is_cut_to_fit_the_mod(self):
+        def js_len(t):
+            return len(t.encode("utf-16-le")) // 2
+        for raw in ("x" * 500, "😀" * 120, "x" * 191 + " " + "y" * 20):
+            name = ha.mod_rename_name(raw)
+            # Measured as the mod measures it, with room for the dedupe's -N.
+            self.assertLessEqual(js_len(name) + len("-99"), ha.MOD_NAME_MAX, repr(raw))
+            self.assertEqual(name, name.strip(), "a cut never leaves padding the mod refuses")
+        self.assertEqual(ha.mod_rename_name("x" * 191 + " " + "y" * 20), "x" * 191)
+
+    def test_a_summary_with_nothing_nameable_is_never_typed(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess(summary="\x07\u200b")
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+        self.assertNotIn("rcRenamePending", sess)
+
+    def test_the_request_name_follows_the_mods_own_rule(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess(summary="Bell\x07 and\x1b[31m red")
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self.assertEqual(self._request()["name"], "Bell  and [31m red")
+
+    def test_a_stale_answer_is_ignored_and_a_new_summary_re_asks(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        first = self._request()["at"]
+        sess["summary"] = "Second name"
+        sm._reconcile_rc_names()
+        req = self._request()
+        self.assertEqual(req["name"], "Second name")
+        self.assertGreater(req["at"], first)
+        # The first request's answer arrives late: it names no pending request.
+        self._answer(at=first)
+        sm._reconcile_rc_names()
+        self.assertEqual(sess["rcName"], "h-r-s1")
+        self.assertEqual(sess["rcRenamePending"]["name"], "Second name")
+        self.assertEqual(self.keys, [])
+
+    def test_back_to_the_current_name_still_re_asks_while_a_request_is_out(self):
+        # The older request may already be running; leaving it would move the
+        # live name away from rcName with nothing to bring it back.
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess(rcName="Old", rcRenamedFor="Old", summary="New")
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        sess["summary"] = "Old"
+        sm._reconcile_rc_names()
+        self.assertEqual(self._request()["name"], "Old")
+        self._answer()
+        sm._reconcile_rc_names()
+        self.assertEqual((sess["rcName"], sess["rcRenamedFor"]), ("Old", "Old"))
+
+    def test_no_mod_or_another_conversation_takes_the_pane(self):
+        for live in (False, True):
+            sm = self.make_manager()
+            if live:
+                self._mod_live(csid="other-conversation")
+            sess = self._sess()
+            sm.registry = [sess]
+            sm._reconcile_rc_names()
+            self.assertIn(("agent-s1", ("/rename Fix the retry loop",), True), self.keys)
+            self.assertFalse(os.path.exists(
+                os.path.join(ha.mod_request_dir("s1"), "rename.json")))
+
+    def test_a_relaunch_drops_the_request(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        sm._forget_live_agents("s1")
+        self.assertFalse(os.path.exists(ha.mod_request_dir("s1")))
+
+    def test_a_planted_answer_file_cannot_wedge_the_beat(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs here")
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        os.mkfifo(os.path.join(ha.mod_request_dir("s1"), "rename.done.json"))
+        sm._reconcile_rc_names()              # returns: the FIFO is no answer
+        self.assertEqual(sess["rcName"], "h-r-s1")
 
 
 class TestReconcileRcNamesTrustModal(ManagerMixin, unittest.TestCase):

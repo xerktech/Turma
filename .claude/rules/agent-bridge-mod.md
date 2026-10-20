@@ -30,6 +30,48 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
   over an idle pane AND an unreadable one (None): a lost `turn.complete` must not hold a
   finished session busy (out of review, out of auto-merge), even where every capture fails.
 
+## `/rename` through the mod (XERK-2131 task 2)
+
+- `_reconcile_rc_names` hands the rename to the mod (`_rename_via_mod`) while its turn state
+  reads bound to the pinned conversation: `rename.json` `{v, name, at}` in
+  `TURMA_MOD_REQUESTS` (`~/.turma/mod-requests/<sid>/`); the mod runs `$.command.run`
+  (`rename`) and answers `rename.done.json` `{v, at, name, ok}`.
+- **The mod runs it only while the main turn is IDLE** (its own turn state). Claude Code then
+  runs it at once. Queued mid-turn, an Esc drops it, and Turma's chat fold shows it as a queued
+  operator prompt (the queue-operation entry carries no origin, and Claude Code dequeues a
+  human prompt ahead of it, breaking the FIFO fold) — QA on 2.1.304. Never drop the gate.
+- **rcName moves on the mod's ok answer only** (matched by `at`), never on the request, so
+  peers.tsv never names a name the live registry does not answer to (verified on 2.1.304:
+  the registry `name` changes).
+- While a request is out, a changed summary re-asks with a newer `at` — even back to the
+  current name, since the older request may already be running. A pending request is never
+  typed beside, even if the mod's turn state goes unreadable.
+- **ok:false is asked again (`MOD_RENAME_ATTEMPTS`), then renaming stops for that process
+  (`rcRenameVia: "off"`) — NEVER the pane.** The pane fallback typed `/rename` + Enter onto
+  the prompt an Esc had just restored to the composer, submitting both glued (QA).
+- **After an interrupted turn Claude Code refuses a plugin command until the person sends
+  input** ("the session was stopped…", 2.1.304). The mod treats an aborted `turn.complete` or
+  that refusal as "wait for the next turn" and does NOT answer, so the agent spends no attempt
+  (spending them turned renaming off after one Esc — QA).
+- **The agent cleans the name; the mod refuses an unclean one, never rewrites it.**
+  `/rename` turns each run of Unicode Cc/Cf characters and U+2028/9 into one space and trims
+  (measured on 2.1.304: joiners, bidi marks, tags, soft hyphen, mid-string U+FEFF; its binary
+  carries that regex). `mod_rename_name` applies the same rule (via `unicodedata`), trims by
+  JS's `trim` set (incl. U+FEFF) and caps the length; the mod's `NAME_UNCLEAN` is the same
+  rule in JS. Python's and node's Unicode versions can classify a new character differently:
+  that surfaces as a refusal (retry, then off), never as rcName unlike the registry.
+  Cleaned BEFORE `_unique_rc_name`, or two summaries that clean alike would leave two live
+  sessions on one name. No mod → the pane path, as before.
+- **The mod runs `rename` and nothing else**: the request is session-writable, so it carries
+  a name, never a command. It refuses a name over 200 chars.
+- Request dir and `rcRenamePending`/`rcRenameVia` are dropped on every launch/teardown.
+- **Operator messages stay on the pane**: a `$.prompt.submit` lands as `origin: plugin`,
+  framed "The <plugin> plugin sent a message", and the model attributes it to the plugin,
+  not the user (measured on 2.1.304). A wake or hub nudge could move there, but the chat
+  view would first need to parse that frame (py + js entry blocks).
+- Residual: a session can plant a rename request for a sibling, renaming its live name until
+  the agent's next request; the same-uid class as typing into a sibling's pane.
+
 ## Invariants
 
 - **The mod draws nothing.** A band, pane or status entry changes the screen the pane
@@ -68,12 +110,15 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 
 ## Tests
 
+- `TestReconcileRcNamesViaMod` (mod-routed rename: request, ack, retry-then-stop, re-ask,
+  stale answer, never typed beside, name rule, FIFO answer).
 - `TestBridgeMod` (gate, shipped files, reader incl. FIFO, the fold, report claude-only),
   `test_a_claude_that_reads_mods_launches_the_bridge_mod` /
   `test_an_older_claude_launches_without_the_bridge_mod` (`TestSessionLifecycle`),
   `test_a_launch_drops_the_turn_state` (`TestLocalModelFailover`).
-- `agent/tests/bridge-mod.test.js` (CI's node step): strips the module's types, parses it as
-  an ES module, pins the env-var contract with hub-agent.py.
+- `agent/tests/bridge-mod.test.js` (CI's node step): parses and LOADS the module, pins the
+  env-var contract, and drives the real module against a fake engine (turn state, idle gate,
+  the post-interrupt wait, refusal of unclean names).
 - Shadow exclusion: `test_a_shadow_never_loads_the_bridge_mod`; Windows argv/env:
   `test_windows_launch_loads_the_bridge_mod`.
 - Also run `claude plugin validate agent/mods/turma-bridge` after any edit to the module.
