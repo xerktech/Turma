@@ -1,14 +1,15 @@
 // The Claude bridge mod (agent/mods/turma-bridge, XERK-2131) is a TypeScript
 // hooks module nothing else in CI parses: a syntax error would ship silently,
 // switch the turn signal off fleet-wide and put a load-error line in every
-// session's pane. This strips its types the way Node does and parses the result
-// as an ES module, and pins the contract hub-agent.py launches it with.
+// session's pane. This strips its types the way Node does, parses the result
+// and loads it as an ES module, and pins the contract hub-agent.py launches it with.
 "use strict";
 
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const { pathToFileURL } = require("url");
 const { stripTypeScriptTypes } = require("node:module");
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -22,7 +23,7 @@ test("the bridge mod's manifest and hooks file are what the engine loads", () =>
   assert.deepEqual(hooks, { modules: ["./register.ts"] });
 });
 
-test("the bridge mod's hooks module parses as an ES module", () => {
+test("the bridge mod's hooks module parses and loads as an ES module", async () => {
   const src = fs.readFileSync(path.join(MOD, "hooks", "register.ts"), "utf8");
   const js = stripTypeScriptTypes(src); // throws ERR_INVALID_TYPESCRIPT_SYNTAX
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-mod-"));
@@ -31,6 +32,11 @@ test("the bridge mod's hooks module parses as an ES module", () => {
     fs.writeFileSync(out, js);
     const r = spawnSync(process.execPath, ["--check", out], { encoding: "utf8" });
     assert.equal(r.status, 0, r.stderr);
+    // Loading it too: a bad import or a top-level throw parses fine yet keeps
+    // Claude from loading the mod. register.ts imports types only, which the
+    // strip removes, so it needs no stub of the engine.
+    const mod = await import(pathToFileURL(out).href);
+    assert.equal(typeof mod.register, "function");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
