@@ -14863,6 +14863,31 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertIn(
             f"TURMA_TURN_STATE={shlex.quote(ha.turn_state_path(sess['id']))} ", cmd)
 
+    def test_the_manager_logs_at_start_whether_sessions_get_the_bridge_mod(self):
+        # 2.3.49 reached hosts through an updater that skipped mods/, and nothing
+        # said so: the start log names the state and the reason (XERK-2131).
+        real_run = ha.run
+
+        def run(cmd, *a, **kw):
+            if cmd == ["claude", "--version"]:
+                return "2.1.304 (Claude Code)"
+            return real_run(cmd, *a, **kw)
+
+        empty = os.path.join(self.tmp, "no-mod")
+        for patch_dir, want in ((False, f"bridge mod: on ({ha.bridge_mod_dir()})"),
+                                (True, "bridge mod: off (")):
+            lines = []
+            with mock.patch.object(ha, "run", run), \
+                    mock.patch.object(ha, "log", lines.append), \
+                    mock.patch.object(ha, "bridge_mod_dir",
+                                      (lambda: empty) if patch_dir else ha.bridge_mod_dir):
+                ha.SessionManager()
+            mod = [ln for ln in lines if ln.startswith("bridge mod:")]
+            self.assertEqual(len(mod), 1, lines)
+            self.assertTrue(mod[0].startswith(want), mod[0])
+            if patch_dir:
+                self.assertIn("plugin.json is missing", mod[0])
+
     def test_an_older_claude_launches_without_the_bridge_mod(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
