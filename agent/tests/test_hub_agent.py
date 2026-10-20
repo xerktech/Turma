@@ -27460,6 +27460,59 @@ class TestReconcileRcNamesViaMod(ManagerMixin, unittest.TestCase):
         sm._reconcile_rc_names()
         self.assertEqual(self.keys, [])
 
+    def test_a_failed_attempt_is_never_followed_by_the_pane(self):
+        # ok:false answered, then the mod's turn state goes unreadable before the
+        # re-ask: the pane must not take it (it types beside the failure's cause).
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self._answer(ok=False, error="removed from the queue")
+        os.unlink(ha.turn_state_path("s1"))
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+
+    def test_a_request_that_cannot_be_written_is_never_typed_beside(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        sess["summary"] = "Another name"
+        with mock.patch.object(ha, "write_mod_rename", lambda *a: False):
+            sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+
+    def test_a_changed_summary_keeps_the_attempt_count(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self._answer(ok=False, error="x")
+        sm._reconcile_rc_names()
+        self.assertEqual(sess["rcRenamePending"]["attempts"], 2)
+        sess["summary"] = "Another name"
+        sm._reconcile_rc_names()
+        self.assertEqual(sess["rcRenamePending"]["attempts"], 2)
+
+    def test_names_are_cleaned_before_the_dedupe(self):
+        # QA: cleaned after it, "QA\x07x" passed the dedupe then became "QA x",
+        # a name another live session already held: both unaddressable.
+        sm = self.make_manager()
+        self._mod_live()
+        other = {"id": "s2", "status": "running", "rcName": "QA x"}
+        sess = self._sess(summary="QA\x07x")
+        sm.registry = [sess, other]
+        sm._reconcile_rc_names()
+        self.assertEqual(self._request()["name"], "QA x-2")
+
+    def test_the_name_is_trimmed_as_the_mod_sees_it(self):
+        self.assertEqual(ha.mod_rename_name("\ufeff QA bom \u3000\ufeff"), "QA bom")
+        self.assertEqual(ha.mod_rename_name("  a\tb  "), "a b")
+        self.assertEqual(ha.mod_rename_name("\x07"), "")
+
     def test_the_request_name_follows_the_mods_own_rule(self):
         sm = self.make_manager()
         self._mod_live()

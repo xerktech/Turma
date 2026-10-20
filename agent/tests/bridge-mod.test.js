@@ -62,13 +62,126 @@ test("the mod runs /rename only, never a command a request names", () => {
   assert.deepEqual(runs, ["'rename'"]);
 });
 
-test("the mod renames only while the main turn is idle, and cleans the name", async () => {
+// Load the real module (types stripped) and drive it against a fake engine:
+// the events Claude Code would raise, and every `$` call the module makes.
+async function loadMod() {
   const src = fs.readFileSync(path.join(MOD, "hooks", "register.ts"), "utf8");
-  // Run mid-turn the command waits in Claude Code's queue, where an Esc drops it
-  // and Turma's chat shows it as a queued operator prompt (QA, 2.1.304).
-  assert.match(src, /if \(w\.renaming \|\| w\.turn !== 'idle'\) return/);
-  assert.match(src, /\.replace\(\/\[\\u0000-\\u001f\\u007f\]\+\/g, ' '\)/);
-  assert.match(src, /name\.length > NAME_MAX/);
-  assert.match(src, /const NAME_MAX = 200\b/);
-  assert.match(src, /command: 'rename', args: name \}/);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-mod-run-"));
+  const out = path.join(dir, "register.mjs");
+  fs.writeFileSync(out, stripTypeScriptTypes(src));
+  const mod = await import(pathToFileURL(out).href);
+  fs.rmSync(dir, { recursive: true, force: true });
+  return mod;
+}
+
+async function harness({ runRejects } = {}) {
+  const { register } = await loadMod();
+  const files = new Map();
+  const runs = [];
+  const timers = [];
+  const hooks = {};
+  const $ = {
+    env: { get: async name => ({ TURMA_TURN_STATE: "/s/turn.json", TURMA_MOD_REQUESTS: "/r" })[name] },
+    session: { id: async () => "conv-1" },
+    fs: {
+      read: async p => { if (!files.has(p)) throw new Error("ENOENT"); return files.get(p); },
+      write: async (p, t) => { files.set(p, t); },
+    },
+    clock: { every: (ms, fn) => { timers.push(fn); return () => {}; } },
+    command: {
+      run: async e => {
+        runs.push(e);
+        const why = runRejects && runRejects.shift();
+        if (why) throw new Error(why);
+        return { text: "" };
+      },
+    },
+  };
+  register((name, hook) => { hooks[name] = hook; }, {});
+  const settle = () => new Promise(r => setTimeout(r, 5));
+  const h = {
+    files, runs,
+    async event(name, e) { await hooks[name]($, e, async x => x); await settle(); },
+    async tick() { for (const fn of timers) fn(); await settle(); await settle(); },
+    turn() { return JSON.parse(files.get("/s/turn.json")).turn; },
+    ask(name, at) { files.set("/r/rename.json", JSON.stringify({ v: 1, name, at })); },
+    done() { return files.has("/r/rename.done.json") ? JSON.parse(files.get("/r/rename.done.json")) : null; },
+  };
+  await h.event("session.start", { cwd: "/", surface: "terminal", isInteractive: true });
+  return h;
+}
+
+test("the turn state follows the main loop only", async () => {
+  const h = await harness();
+  assert.equal(h.turn(), "idle");
+  await h.event("turn.start", { text: "go", turnId: "t1" });
+  assert.equal(h.turn(), "running");
+  // A subagent's turns never move it.
+  await h.event("turn.start", { text: "", turnId: "a1", agentId: "sub" });
+  await h.event("turn.complete", { turnId: "a1", agentId: "sub", isAborted: false, reason: "answer" });
+  assert.equal(h.turn(), "running");
+  await h.event("turn.complete", { turnId: "t1", isAborted: false, reason: "answer" });
+  assert.equal(h.turn(), "idle");
+  // A background agent working after the main turn ended leaves it idle.
+  await h.event("turn.start", { text: "", turnId: "a2", agentId: "bg" });
+  assert.equal(h.turn(), "idle");
+});
+
+test("a rename runs only while the main turn is idle", async () => {
+  const h = await harness();
+  await h.event("turn.start", { text: "go", turnId: "t1" });
+  h.ask("New name", 10);
+  await h.tick();
+  assert.deepEqual(h.runs, [], "mid-turn it would wait in Claude Code's queue");
+  await h.event("turn.complete", { turnId: "t1", isAborted: false, reason: "answer" });
+  await h.tick();
+  assert.deepEqual(h.runs.map(r => [r.command, r.args]), [["rename", "New name"]]);
+  assert.deepEqual(h.done(), { v: 1, at: 10, name: "New name", ok: true });
+  await h.tick();
+  assert.equal(h.runs.length, 1, "one run per request");
+});
+
+test("after an interrupted turn it waits for the person's next turn", async () => {
+  const h = await harness();
+  await h.event("turn.start", { text: "go", turnId: "t1" });
+  await h.event("turn.complete", { turnId: "t1", isAborted: true, reason: "aborted" });
+  h.ask("After esc", 20);
+  await h.tick();
+  assert.deepEqual(h.runs, []);
+  assert.equal(h.done(), null, "no answer: the agent must not spend an attempt");
+  await h.event("turn.start", { text: "next", turnId: "t2" });
+  await h.event("turn.complete", { turnId: "t2", isAborted: false, reason: "answer" });
+  await h.tick();
+  assert.equal(h.done().ok, true);
+});
+
+test("a 'stopped' refusal is not an answer; the next turn retries it", async () => {
+  const h = await harness({
+    runRejects: ["HooksError: the session was stopped and nobody has sent input since"],
+  });
+  h.ask("Retry me", 30);
+  await h.tick();
+  assert.equal(h.done(), null);
+  await h.tick();
+  assert.equal(h.runs.length, 1, "it waits; it does not hammer the refusal");
+  await h.event("turn.start", { text: "hi", turnId: "t3" });
+  await h.event("turn.complete", { turnId: "t3", isAborted: false, reason: "answer" });
+  await h.tick();
+  assert.equal(h.done().ok, true);
+  assert.equal(h.runs.length, 2);
+});
+
+test("an unclean or oversized name is refused, never rewritten", async () => {
+  for (const [name, at] of [["bad\nname", 41], [" padded", 42], ["x".repeat(201), 43], ["", 44],
+                            ["bell\u0007", 45], ["﻿bom", 46]]) {
+    const h = await harness();
+    h.ask(name, at);
+    await h.tick();
+    assert.deepEqual(h.runs, [], JSON.stringify(name));
+    assert.equal(h.done().ok, false);
+  }
+  const h = await harness();
+  h.ask("x".repeat(200), 47);
+  await h.tick();
+  assert.equal(h.done().ok, true);
 });

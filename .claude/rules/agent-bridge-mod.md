@@ -49,11 +49,17 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 - **ok:false is asked again (`MOD_RENAME_ATTEMPTS`), then renaming stops for that process
   (`rcRenameVia: "off"`) — NEVER the pane.** The pane fallback typed `/rename` + Enter onto
   the prompt an Esc had just restored to the composer, submitting both glued (QA).
-- The request name follows the mod's rule (control runs → one space, trimmed), so rcName
-  equals the name the registry ends up with. No mod → the pane path, as before.
+- **After an interrupted turn Claude Code refuses a plugin command until the person sends
+  input** ("the session was stopped…", 2.1.304). The mod treats an aborted `turn.complete` or
+  that refusal as "wait for the next turn" and does NOT answer, so the agent spends no attempt
+  (spending them turned renaming off after one Esc — QA).
+- **The agent cleans the name; the mod refuses an unclean one, never rewrites it**
+  (`mod_rename_name`: control runs → a space, ends trimmed by JS's `trim` set, which includes
+  U+FEFF). Cleaned BEFORE `_unique_rc_name`, or two summaries that clean alike would leave
+  two live sessions on one name. A mismatch therefore surfaces as a refusal, never as an
+  rcName that differs from the registry. No mod → the pane path, as before.
 - **The mod runs `rename` and nothing else**: the request is session-writable, so it carries
-  a name, never a command (pinned by `bridge-mod.test.js`). The mod strips control chars and
-  refuses a name over 200 chars.
+  a name, never a command. It refuses a name over 200 chars.
 - Request dir and `rcRenamePending`/`rcRenameVia` are dropped on every launch/teardown.
 - **Operator messages stay on the pane**: a `$.prompt.submit` lands as `origin: plugin`,
   framed "The <plugin> plugin sent a message", and the model attributes it to the plugin,
@@ -106,8 +112,9 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
   `test_a_claude_that_reads_mods_launches_the_bridge_mod` /
   `test_an_older_claude_launches_without_the_bridge_mod` (`TestSessionLifecycle`),
   `test_a_launch_drops_the_turn_state` (`TestLocalModelFailover`).
-- `agent/tests/bridge-mod.test.js` (CI's node step): strips the module's types, parses it as
-  an ES module, pins the env-var contract with hub-agent.py.
+- `agent/tests/bridge-mod.test.js` (CI's node step): parses and LOADS the module, pins the
+  env-var contract, and drives the real module against a fake engine (turn state, idle gate,
+  the post-interrupt wait, refusal of unclean names).
 - Shadow exclusion: `test_a_shadow_never_loads_the_bridge_mod`; Windows argv/env:
   `test_windows_launch_loads_the_bridge_mod`.
 - Also run `claude plugin validate agent/mods/turma-bridge` after any edit to the module.

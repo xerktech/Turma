@@ -18666,8 +18666,18 @@ MOD_REQUEST_MAX_BYTES = 4096
 # failure there (an Esc dropped the command) left the operator's restored prompt
 # in the composer, which the pane's `/rename` + Enter submitted glued (QA).
 MOD_RENAME_ATTEMPTS = 3
-# The mod's own name rule: control characters become a space, then trimmed.
+# A name the mod accepts has no control character and no padding as JS's
+# String.prototype.trim sees it (which also trims U+FEFF, unlike str.strip).
 _MOD_NAME_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]+")
+_JS_TRIM_RE = re.compile("^[\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f"
+                         "\u205f\u3000\ufeff]+|[\t\n\v\f\r \u00a0\u1680\u2000-\u200a"
+                         "\u2028\u2029\u202f\u205f\u3000\ufeff]+$")
+
+
+def mod_rename_name(text):
+    """`text` as a name the bridge mod accepts unchanged: control runs become one
+    space, then the ends are trimmed by JS's rule."""
+    return _JS_TRIM_RE.sub("", _MOD_NAME_CTRL_RE.sub(" ", text or ""))
 
 
 def bridge_mod_dir():
@@ -33958,7 +33968,12 @@ class SessionManager:
             return True
         if read_turn_state(sid, sess.get("claudeSessionId")) is None:
             return pending is not None or attempts > 0   # never type beside a request
-        name = _MOD_NAME_CTRL_RE.sub(" ", self._unique_rc_name(summary, exclude_id=sid)).strip()
+        # Cleaned BEFORE the dedupe, or two summaries that clean to one name
+        # would leave two live sessions answering to it (QA).
+        clean = mod_rename_name(summary)
+        if not clean:
+            return True                       # nothing nameable; the pane would type it
+        name = self._unique_rc_name(clean, exclude_id=sid)
         if name == sess.get("rcName") and not pending and not attempts:
             sess["rcRenamedFor"] = summary
             self.save()
