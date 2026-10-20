@@ -19,6 +19,11 @@ import type { Register, EngineInterface } from 'claude-code'
 //    characters, padding, over NAME_MAX) is refused, never rewritten, so the
 //    name the agent records is the name the session ends up with.
 //
+// 3. It serves `/turma` (peers | status | wake <dur> <why>), run on demand:
+//    the roster the agent writes (TURMA_PEERS_FILE), the session's status the
+//    agent writes beside its requests (`status.json`), and a wake through the
+//    session CLI (TURMA_SESSION_CLI), which validates it.
+//
 // It draws nothing: a band or status entry would change the pane the agent's
 // parsers read. Writes are chained so they land in event order, and never
 // awaited by a hook, so a slow disk cannot hold a turn.
@@ -107,6 +112,106 @@ async function pollRename($: EngineInterface, w: Writer) {
   w.renaming = false
 }
 
+const CELL_MAX = 80
+const OUT_MAX = 4000
+
+const HELP = [
+  'Turma (bridge mod):',
+  '  /turma peers                  sessions you can message, from the roster',
+  '  /turma status                 this session: ticket, branch, PRs, pending wake',
+  '  /turma wake <30m|2h> <why>    re-prompt this session later',
+].join('\n')
+
+// Text from files sessions can write: one line, capped.
+function cell(v: unknown): string {
+  const t = typeof v === 'string' ? v : v == null ? '' : String(v)
+  const flat = t.replace(/[\p{Cc}\p{Cf}]+/gu, ' ').trim()
+  return flat.length > CELL_MAX ? `${flat.slice(0, CELL_MAX - 1)}…` : flat
+}
+
+async function peersText($: EngineInterface): Promise<string> {
+  const path = await $.env.get('TURMA_PEERS_FILE')
+  if (!path) return 'No roster: this session was not launched by Turma.'
+  let raw: string
+  try {
+    raw = await $.fs.read(path)
+  } catch {
+    return 'The roster is missing; Turma rewrites it every heartbeat.'
+  }
+  const me = await $.env.get('TURMA_SESSION_ID')
+  const rows = raw.split('\n').filter(l => l.trim() && !l.startsWith('#')).map(l => l.split('\t'))
+  if (!rows.length) return 'No other sessions in your organisation right now.'
+  const lines = rows.map(([id, name, host, repo, branch, task]) => {
+    const mark = id === me ? ' (you)' : ''
+    const where = [cell(host), cell(repo)].filter(Boolean).join('/')
+    const br = cell(branch) ? ` [${cell(branch)}]` : ''
+    const what = cell(task) ? ` — ${cell(task)}` : ''
+    return `  ${cell(name)}${mark}  ${where}${br}${what}`
+  })
+  return [`${rows.length} session(s); message one by its name with SendMessage:`, ...lines].join('\n')
+}
+
+type Pr = { url?: unknown; number?: unknown; title?: unknown; state?: unknown; checks?: unknown; ready?: unknown }
+type Status = {
+  v?: unknown; id?: unknown; name?: unknown; summary?: unknown; branch?: unknown
+  ticket?: { key?: unknown; url?: unknown; summary?: unknown } | null
+  prs?: Pr[] | null; wakeAt?: unknown; wakeReason?: unknown
+}
+
+async function statusText($: EngineInterface): Promise<string> {
+  const dir = await $.env.get('TURMA_MOD_REQUESTS')
+  if (!dir) return 'No status: this session was not launched by Turma.'
+  let st: Status
+  try {
+    st = JSON.parse(await $.fs.read(`${dir}/status.json`))
+  } catch {
+    return 'No status yet; Turma writes it on its next heartbeat.'
+  }
+  if (st.v !== 1) return 'The status file is not one this mod reads.'
+  const out = [`Session ${cell(st.id)}: ${cell(st.name)}`]
+  if (cell(st.summary)) out.push(`  task:    ${cell(st.summary)}`)
+  if (st.ticket && cell(st.ticket.key)) {
+    out.push(`  ticket:  ${cell(st.ticket.key)} ${cell(st.ticket.summary)}`.trimEnd())
+  }
+  out.push(`  branch:  ${cell(st.branch) || '(detached)'}`)
+  const prs = Array.isArray(st.prs) ? st.prs.slice(0, 10) : []
+  if (!prs.length) out.push('  PRs:     none')
+  for (const pr of prs) {
+    // Readiness means something only while the PR is open.
+    const open = cell(pr.state).toUpperCase() === 'OPEN' || cell(pr.state).toLowerCase() === 'opened'
+    const ready = !open ? '' : pr.ready === 'ready' ? 'ready to merge' : cell(pr.ready)
+    const bits = [cell(pr.state), cell(pr.checks) && `CI ${cell(pr.checks)}`, ready].filter(Boolean)
+    out.push(`  PR:      ${cell(pr.url)} (${bits.join(', ')})`)
+  }
+  if (typeof st.wakeAt === 'number') {
+    out.push(`  wake:    ${new Date(st.wakeAt).toISOString()} ${cell(st.wakeReason)}`.trimEnd())
+  }
+  return out.join('\n')
+}
+
+async function wakeText($: EngineInterface, args: string[]): Promise<string> {
+  const cli = await $.env.get('TURMA_SESSION_CLI')
+  if (!cli) return 'No session CLI: this session was not launched by Turma.'
+  if (args.length < 2) return 'Usage: /turma wake <30m|2h|1h30m> <what to check>'
+  try {
+    const r = await $.process.run(['python3', '-SsE', cli, 'wake', ...args], { timeoutMs: 10000 })
+    return cell((r.stdout || r.stderr || `exit ${r.exitCode}`).trim()) || `exit ${r.exitCode}`
+  } catch (err) {
+    return `Wake not set: ${cell(String(err))}`
+  }
+}
+
+async function turmaText($: EngineInterface, args: string): Promise<string> {
+  const words = args.trim().split(/\s+/).filter(Boolean)
+  const sub = (words[0] || '').toLowerCase()
+  let text: string
+  if (sub === 'peers') text = await peersText($)
+  else if (sub === 'status') text = await statusText($)
+  else if (sub === 'wake') text = await wakeText($, words.slice(1))
+  else text = HELP
+  return text.length > OUT_MAX ? `${text.slice(0, OUT_MAX - 1)}…` : text
+}
+
 export const register: Register = on => {
   const w: Writer = {
     chain: Promise.resolve(), seq: 0, turn: 'idle', stopped: false, renaming: false, lastRename: 0,
@@ -116,8 +221,18 @@ export const register: Register = on => {
     const result = await next(e)
     publish($, w, 'idle', null)
     $.clock.every(POLL_MS, () => void pollRename($, w).catch(() => { w.renaming = false }))
+    void $.command
+      .register({
+        name: 'turma',
+        description: 'Turma: peers you can message, this session status, wake later',
+        argumentHint: 'peers | status | wake <dur> <why>',
+        immediate: true,
+      })
+      .catch(() => undefined)
     return result
   })
+
+  on('command.run', { command: 'turma' }, async ($, e) => ({ text: await turmaText($, e.args) }))
 
   on('turn.start', async ($, e, next) => {
     const result = await next(e)

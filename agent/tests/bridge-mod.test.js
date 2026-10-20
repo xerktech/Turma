@@ -74,14 +74,23 @@ async function loadMod() {
   return mod;
 }
 
-async function harness({ runRejects } = {}) {
+async function harness({ runRejects, env = {}, procResult } = {}) {
   const { register } = await loadMod();
   const files = new Map();
   const runs = [];
+  const procs = [];
+  const registered = [];
   const timers = [];
   const hooks = {};
   const $ = {
-    env: { get: async name => ({ TURMA_TURN_STATE: "/s/turn.json", TURMA_MOD_REQUESTS: "/r" })[name] },
+    env: {
+      get: async name => ({ TURMA_TURN_STATE: "/s/turn.json", TURMA_MOD_REQUESTS: "/r",
+                            TURMA_PEERS_FILE: "/t/peers.tsv", TURMA_SESSION_ID: "me1",
+                            TURMA_SESSION_CLI: "/cli/session_cli.py", ...env })[name],
+    },
+    process: {
+      run: async (argv, init) => { procs.push({ argv, init }); return procResult || { exitCode: 0, stdout: "wake requested in 30m", stderr: "" }; },
+    },
     session: { id: async () => "conv-1" },
     fs: {
       read: async p => { if (!files.has(p)) throw new Error("ENOENT"); return files.get(p); },
@@ -89,6 +98,7 @@ async function harness({ runRejects } = {}) {
     },
     clock: { every: (ms, fn) => { timers.push(fn); return () => {}; } },
     command: {
+      register: async spec => { registered.push(spec); return { command: spec.name }; },
       run: async e => {
         runs.push(e);
         const why = runRejects && runRejects.shift();
@@ -97,10 +107,11 @@ async function harness({ runRejects } = {}) {
       },
     },
   };
-  register((name, hook) => { hooks[name] = hook; }, {});
+  register((name, matcher, hook) => { hooks[name] = hook || matcher; }, {});
   const settle = () => new Promise(r => setTimeout(r, 5));
   const h = {
-    files, runs,
+    files, runs, procs, registered,
+    async turma(args) { return (await hooks["command.run"]($, { command: "turma", args }, async x => x)).text; },
     async event(name, e) { await hooks[name]($, e, async x => x); await settle(); },
     hooks, $,
     async tick() { for (const fn of timers) fn(); await settle(); await settle(); },
@@ -213,4 +224,72 @@ test("a turn that starts while the request is being read stops the run", async (
   await h.tick();
   assert.deepEqual(h.runs, []);
   assert.equal(h.done(), null);
+});
+
+test("/turma is registered, immediate, and answers help by default", async () => {
+  const h = await harness();
+  assert.equal(h.registered.length, 1);
+  assert.equal(h.registered[0].name, "turma");
+  assert.equal(h.registered[0].immediate, true);
+  assert.match(await h.turma(""), /\/turma peers/);
+  assert.match(await h.turma("nonsense"), /\/turma status/);
+});
+
+test("/turma peers lists the roster, marks you, and flattens what sessions wrote", async () => {
+  const h = await harness();
+  h.files.set("/t/peers.tsv", [
+    "# header", "# id\tname\thost\trepo\tbranch\ttask",
+    "me1\tMy session\tk8x-02\tTurma\tXERK-1\tMine",
+    "ab2\tOther‮ one\thost2\tTenir\t\t" + "x".repeat(300),
+  ].join("\n"));
+  const out = await h.turma("peers");
+  assert.match(out, /^2 session\(s\)/);
+  assert.match(out, /My session \(you\)  k8x-02\/Turma \[XERK-1\] — Mine/);
+  assert.match(out, /Other  one  host2\/Tenir — x+…/);
+  assert.doesNotMatch(out, /‮/);
+  assert.ok(out.split("\n").every(l => l.length < 200));
+});
+
+test("/turma peers and status say why when there is nothing to read", async () => {
+  const h = await harness();
+  assert.match(await h.turma("peers"), /roster is missing/);
+  assert.match(await h.turma("status"), /No status yet/);
+  h.files.set("/r/status.json", "{not json");
+  assert.match(await h.turma("status"), /No status yet/);
+  h.files.set("/r/status.json", JSON.stringify({ v: 2 }));
+  assert.match(await h.turma("status"), /not one this mod reads/);
+  const bare = await harness({ env: { TURMA_PEERS_FILE: undefined, TURMA_MOD_REQUESTS: undefined } });
+  assert.match(await bare.turma("peers"), /not launched by Turma/);
+  assert.match(await bare.turma("status"), /not launched by Turma/);
+});
+
+test("/turma status renders the agent's status file", async () => {
+  const h = await harness();
+  h.files.set("/r/status.json", JSON.stringify({
+    v: 1, id: "me1", name: "Fix retry", summary: "Fix the retry loop", branch: "XERK-9-retry",
+    ticket: { key: "XERK-9", url: "u", summary: "Retry" },
+    prs: [{ url: "https://gh/pr/1", state: "OPEN", checks: "SUCCESS", ready: "ready" }],
+    wakeAt: 1792500000000, wakeReason: "check CI",
+  }));
+  const out = await h.turma("status");
+  assert.match(out, /^Session me1: Fix retry/);
+  assert.match(out, /ticket:  XERK-9 Retry/);
+  assert.match(out, /branch:  XERK-9-retry/);
+  assert.match(out, /PR:      https:\/\/gh\/pr\/1 \(OPEN, CI SUCCESS, ready to merge\)/);
+  assert.match(out, /wake:    2026-\S+ check CI/);
+  h.files.set("/r/status.json", JSON.stringify({
+    v: 1, id: "me1", name: "n", prs: [{ url: "p", state: "MERGED", checks: "SUCCESS", ready: "ready" }],
+  }));
+  assert.match(await h.turma("status"), /PR:      p \(MERGED, CI SUCCESS\)$/m);
+});
+
+test("/turma wake runs the session CLI, which validates it", async () => {
+  const h = await harness();
+  assert.match(await h.turma("wake 30m"), /Usage/);
+  assert.equal(h.procs.length, 0);
+  assert.equal(await h.turma("wake 30m check the CI run"), "wake requested in 30m");
+  assert.deepEqual(h.procs[0].argv,
+    ["python3", "-SsE", "/cli/session_cli.py", "wake", "30m", "check", "the", "CI", "run"]);
+  const bad = await harness({ procResult: { exitCode: 2, stdout: "", stderr: "refused: duration too long" } });
+  assert.equal(await bad.turma("wake 99d x"), "refused: duration too long");
 });

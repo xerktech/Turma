@@ -72,6 +72,20 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 - Residual: a session can plant a rename request for a sibling, renaming its live name until
   the agent's next request; the same-uid class as typing into a sibling's pane.
 
+## `/turma` commands (XERK-2131 task 3)
+
+- The mod registers `/turma` (`immediate`, so it answers mid-turn): `peers` (the roster at
+  `TURMA_PEERS_FILE`), `status` (`status.json` in `TURMA_MOD_REQUESTS`), `wake <dur> <why>`
+  (runs the session CLI at `TURMA_SESSION_CLI`, which validates it), else help.
+- **Commands only, nothing drawn** (operator decision, 2026-10-20): a pane or band would change
+  the screen the pane parsers read (busy, dialogs, the composer). Fleet views stay in the web UI
+  and the app.
+- The beat writes `status.json` (`_publish_mod_status`, `mod_status`) for running sessions
+  launched with the mod (`bridgeMod` on the record), only when it changed (`_mod_status_last`),
+  never through a planted link, never raising. The rename ack removes only the rename files.
+- Every cell the mod prints went through a session-writable file, so `cell()` flattens Cc/Cf
+  and caps it; whole output capped at 4000 chars.
+
 ## Invariants
 
 - **The mod draws nothing.** A band, pane or status entry changes the screen the pane
@@ -110,6 +124,7 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 
 ## Tests
 
+- `TestModStatus` (status.json: content, only-on-change, link refusal, never raises).
 - `TestReconcileRcNamesViaMod` (mod-routed rename: request, ack, retry-then-stop, re-ask,
   stale answer, never typed beside, name rule, FIFO answer).
 - `TestBridgeMod` (gate, shipped files, reader incl. FIFO, the fold, report claude-only),

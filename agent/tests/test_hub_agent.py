@@ -14865,6 +14865,8 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             f"TURMA_TURN_STATE={shlex.quote(ha.turn_state_path(sess['id']))} ", cmd)
         self.assertIn(
             f"TURMA_MOD_REQUESTS={shlex.quote(ha.mod_request_dir(sess['id']))} ", cmd)
+        self.assertIn(f"TURMA_PEERS_FILE={shlex.quote(ha.PEERS_FILE)} ", cmd)
+        self.assertTrue(sess["bridgeMod"])
 
     def test_the_manager_logs_at_start_whether_sessions_get_the_bridge_mod(self):
         # 2.3.49 reached hosts through an updater that skipped mods/, and nothing
@@ -14900,6 +14902,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertNotIn("--plugin-dir", cmd)
         self.assertNotIn("TURMA_TURN_STATE", cmd)
         self.assertNotIn("TURMA_MOD_REQUESTS", cmd)
+        self.assertNotIn("bridgeMod", sm.registry[0])
 
     def test_spawn_exports_gitlab_host_for_glab(self):
         """A GitLab-configured host tells every session's glab WHERE to auth:
@@ -14987,6 +14990,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
                 self.assertEqual(argv[i + 1], ha.bridge_mod_dir())
                 self.assertEqual(env["TURMA_TURN_STATE"], ha.turn_state_path(sess["id"]))
                 self.assertEqual(env["TURMA_MOD_REQUESTS"], ha.mod_request_dir(sess["id"]))
+                self.assertEqual(env["TURMA_PEERS_FILE"], ha.PEERS_FILE)
             else:
                 self.assertNotIn("--plugin-dir", argv)
                 self.assertNotIn("TURMA_TURN_STATE", env)
@@ -27412,7 +27416,9 @@ class TestReconcileRcNamesViaMod(ManagerMixin, unittest.TestCase):
         self.assertEqual((sess["rcName"], sess["rcRenamedFor"]),
                          ("Fix the retry loop", "Fix the retry loop"))
         self.assertNotIn("rcRenamePending", sess)
-        self.assertFalse(os.path.exists(ha.mod_request_dir("s1")))
+        # The answered request goes; the dir (and the status file in it) stays.
+        for f in ("rename.json", "rename.done.json"):
+            self.assertFalse(os.path.exists(os.path.join(ha.mod_request_dir("s1"), f)))
         self.assertEqual(self.keys, [])
 
     def test_a_failed_mod_rename_is_asked_again_then_stops_never_the_pane(self):
@@ -27619,6 +27625,87 @@ class TestReconcileRcNamesViaMod(ManagerMixin, unittest.TestCase):
         os.mkfifo(os.path.join(ha.mod_request_dir("s1"), "rename.done.json"))
         sm._reconcile_rc_names()              # returns: the FIFO is no answer
         self.assertEqual(sess["rcName"], "h-r-s1")
+
+
+class TestModStatus(ManagerMixin, unittest.TestCase):
+    """XERK-2131 task 3: the beat publishes each bridge-mod session's
+    status.json (what `/turma status` shows), only when it changed."""
+
+    def _status_path(self):
+        return os.path.join(ha.mod_request_dir("s1"), "status.json")
+
+    def _payload(self, **kw):
+        p = {"id": "s1", "rcName": "Fix retry", "summary": "Fix the retry loop",
+             "ticket": {"key": "XERK-9", "url": "https://x/XERK-9", "summary": "Retry",
+                        "siteKey": "x", "branch": "XERK-9"},
+             "git": {"branch": "XERK-9-retry", "dirtyFiles": 2},
+             "prs": [{"url": "https://gh/pr/1", "number": 1, "title": "t", "state": "OPEN",
+                      "checks": "SUCCESS", "ready": "ready", "checkCounts": {"pass": 3}}]}
+        p.update(kw)
+        return p
+
+    def _sess(self, **kw):
+        s = {"id": "s1", "status": "running", "bridgeMod": True,
+             "wakeAt": 1792500000000, "wakeReason": "check CI"}
+        s.update(kw)
+        return s
+
+    def test_the_status_is_published_trimmed_and_only_on_change(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess()]
+        sm._publish_mod_status([self._payload()])
+        with open(self._status_path()) as f:
+            st = json.load(f)
+        self.assertEqual(st, {
+            "v": 1, "id": "s1", "name": "Fix retry", "summary": "Fix the retry loop",
+            "ticket": {"key": "XERK-9", "url": "https://x/XERK-9", "summary": "Retry"},
+            "branch": "XERK-9-retry",
+            "prs": [{"url": "https://gh/pr/1", "number": 1, "title": "t", "state": "OPEN",
+                     "checks": "SUCCESS", "ready": "ready"}],
+            "wakeAt": 1792500000000, "wakeReason": "check CI"})
+        before = os.stat(self._status_path()).st_mtime_ns
+        os.utime(self._status_path(), ns=(1, 1))
+        sm._publish_mod_status([self._payload()])
+        self.assertEqual(os.stat(self._status_path()).st_mtime_ns, 1, "unchanged: not rewritten")
+        sm._publish_mod_status([self._payload(summary="New task")])
+        with open(self._status_path()) as f:
+            self.assertEqual(json.load(f)["summary"], "New task")
+        self.assertNotEqual(before, 0)
+
+    def test_only_running_bridge_mod_sessions_get_one(self):
+        sm = self.make_manager()
+        for sess in (self._sess(bridgeMod=None), self._sess(status="stopped")):
+            sm.registry = [sess]
+            sm._publish_mod_status([self._payload()])
+            self.assertFalse(os.path.exists(self._status_path()))
+
+    def test_a_planted_link_is_never_written_through(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess()]
+        target = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(target)
+        os.makedirs(ha.MOD_REQUESTS_DIR, exist_ok=True)
+        os.symlink(target, ha.mod_request_dir("s1"))
+        sm._publish_mod_status([self._payload()])
+        self.assertEqual(os.listdir(target), [])
+        self.assertFalse(ha.write_mod_rename("s1", "x", 1))
+        self.assertEqual(os.listdir(target), [])
+
+    def test_publishing_never_raises_onto_the_beat(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess()]
+        payloads = [self._payload()]
+        with mock.patch.object(ha.os, "replace", side_effect=OSError("disk full")):
+            self.assertIs(sm._publish_mod_status(payloads), payloads)
+
+    def test_a_relaunch_drops_the_status_and_its_memo(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess()]
+        sm._publish_mod_status([self._payload()])
+        sm._forget_live_agents("s1")
+        self.assertFalse(os.path.exists(self._status_path()))
+        sm._publish_mod_status([self._payload()])
+        self.assertTrue(os.path.exists(self._status_path()), "the memo went with it")
 
 
 class TestReconcileRcNamesTrustModal(ManagerMixin, unittest.TestCase):
