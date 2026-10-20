@@ -187,7 +187,8 @@ async function peersText($: EngineInterface): Promise<string> {
   const head = [`${rows.length} session(s); message one by its name with SendMessage.`, DATA_NOTE]
   // Rows fit under OUT_MAX with the pointer to the whole roster kept.
   const kept: string[] = []
-  let size = head.join('\n').length + 200
+  // Room for the pointer line as it will print (its count is at most 3 digits).
+  let size = head.join('\n').length + `\n  …and 999 more in ${path}`.length
   for (const line of lines) {
     if (size + line.length + 1 > OUT_MAX) break
     kept.push(line)

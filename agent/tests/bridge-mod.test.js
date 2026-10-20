@@ -276,6 +276,9 @@ test("/turma status renders the agent's status file", async () => {
   const out = await h.turma("status");
   assert.match(out, /^Session me1: Fix retry/);
   assert.match(out, /ticket:  XERK-9 “Retry”/);
+  assert.match(out, /task:    “Fix the retry loop”/);
+  h.files.set("/t/peers.tsv", 'zz\tP\th\tR\t\tsay "hi" now\n');
+  assert.match(await h.turma("peers"), /— “say ”hi” now”/, "a quote inside cannot end the quoted text");
   assert.match(out, /branch:  XERK-9-retry/);
   assert.match(out, /PR:      https:\/\/gh\/pr\/1 \(OPEN, CI SUCCESS, ready to merge\)/);
   assert.match(out, /wake:    2026-\S+ check CI/);
@@ -345,7 +348,7 @@ test("peers: you first (matched on host AND id), capped by rows", async () => {
   assert.ok(out.length <= 4000, String(out.length));
   assert.match(out.split("\n").at(-1), /more in \/t\/peers\.tsv$/);
   // Under the row cap but over the size cap still keeps the pointer, whole.
-  const long = "/" + "d".repeat(150) + "/peers.tsv";
+  const long = "/" + "d".repeat(400) + "/peers.tsv";
   const k = await harness({ env: { TURMA_PEERS_FILE: long } });
   k.files.set(long, wide.slice(0, 30).join("\n"));
   const kout = await k.turma("peers");
