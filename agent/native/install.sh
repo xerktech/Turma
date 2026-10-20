@@ -302,6 +302,9 @@ install_files() {
   cp "$SRC_DIR/qwen_session.py"    "$PREFIX/qwen_session.py"
   cp "$SRC_DIR/qwen_transcript.py" "$PREFIX/qwen_transcript.py"
   rm -rf "$PREFIX/qwen"; cp -a "$SRC_DIR/qwen" "$PREFIX/qwen"
+  # The Claude bridge mod (XERK-2131): hub-agent.py passes <dir>/mods/turma-bridge
+  # to every Claude launch as --plugin-dir. Absent = sessions launch without it.
+  rm -rf "$PREFIX/mods"; cp -a "$SRC_DIR/mods" "$PREFIX/mods"
   cp "$SELF_DIR/turma-agent"        "$PREFIX/bin/turma-agent"
   cp "$SELF_DIR/turma-agentctl"     "$PREFIX/bin/turma-agentctl"
   cp "$SELF_DIR/turma-agent-update" "$PREFIX/bin/turma-agent-update"
@@ -499,6 +502,7 @@ do_verify() {
            runtime_projection.py runtime_tail.py \
            qwen_session.py qwen_transcript.py \
            qwen/ask_mcp.py qwen/peer_mcp.py qwen/peer_inbox.py qwen/guard/shim.py \
+           mods/turma-bridge/hooks/register.ts \
            bin/turma-agent bin/turma-agentctl bin/turma-agent-update; do
     if [ -e "$PREFIX/$f" ]; then echo "  file $f: ok"; else echo "  file $f: MISSING"; ok=1; fi
   done

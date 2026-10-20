@@ -800,6 +800,9 @@ install_payload() {  # <tgz> <version>
   [ -f "$src/qwen_session.py" ] && mv -f "$src/qwen_session.py" "$PREFIX/qwen_session.py"
   [ -f "$src/qwen_transcript.py" ] && mv -f "$src/qwen_transcript.py" "$PREFIX/qwen_transcript.py"
   [ -d "$src/qwen" ] && { rm -rf "$PREFIX/qwen"; mv -f "$src/qwen" "$PREFIX/qwen"; }
+  # The Claude bridge mod (XERK-2131), swapped like qwen/: a payload without it
+  # launches sessions without the mod, never a broken launch.
+  [ -d "$src/mods" ] && { rm -rf "$PREFIX/mods"; mv -f "$src/mods" "$PREFIX/mods"; }
   local b
   for b in turma-agent turma-agentctl turma-agent-update; do
     [ -f "$src/$b" ] && { mv -f "$src/$b" "$PREFIX/bin/$b"; chmod +x "$PREFIX/bin/$b"; }

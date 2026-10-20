@@ -18634,6 +18634,106 @@ def read_wake_request(session_id):
     return {"wakeAt": at, "wakeReason": reason or None}
 
 
+# ---- the Turma bridge mod (XERK-2131) ---------------------------------------------
+#
+# A Claude Code mod (agent/mods/turma-bridge) every Claude launch loads with
+# `--plugin-dir`. It writes `TURMA_TURN_STATE` (TURN_STATE_DIR/<sessionId>.json)
+# on the engine's own turn.start / turn.complete events, so the beat knows the
+# session's turn is running even when the pane scrape missed the interrupt hint.
+# The file is written by the session's own process, so it is SESSION-WRITTEN
+# like every file under ~/.turma: read through _read_untrusted_json, bound to the
+# pinned conversation, and only ever able to turn an idle read busy.
+# See .claude/rules/agent-bridge-mod.md.
+
+BRIDGE_MOD = os.environ.get("TURMA_BRIDGE_MOD", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+# The first Claude Code release the mod was verified on. An older one may not
+# read a hooks module at all, so it gets no --plugin-dir.
+BRIDGE_MOD_MIN_CLAUDE = (2, 1, 304)
+TURN_STATE_DIR = os.path.join(REGISTRY_DIR, "turn-state")
+TURN_STATE_MAX_BYTES = 4096
+# A "running" turn is trusted over a pane that reads idle only while the
+# transcript is still being written: a turn.complete the mod never delivered
+# must not hold a finished session busy (out of review, out of auto-merge).
+TURN_STATE_QUIET_SEC = _env_int("TURMA_TURN_STATE_QUIET_SEC", 300, minimum=30)
+
+
+def bridge_mod_dir():
+    """The bridge mod's folder, beside this file in the repo (agent/mods/) and in
+    the native install ($PREFIX/mods/), as hooks/ is."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "mods", "turma-bridge")
+
+
+def _claude_version_tuple(raw):
+    """(major, minor, patch) out of `claude --version` ("2.1.304 (Claude Code)"),
+    or None when it names no version."""
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", raw or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def bridge_mod_launch_dir(claude_version):
+    """The folder to pass as `--plugin-dir`, or None: the mod is off
+    (TURMA_BRIDGE_MOD=0), the installed Claude Code is older than
+    BRIDGE_MOD_MIN_CLAUDE or unreadable, or the files were not laid down (an
+    install predating it). None launches exactly as before."""
+    if not BRIDGE_MOD:
+        return None
+    version = _claude_version_tuple(claude_version)
+    if version is None or version < BRIDGE_MOD_MIN_CLAUDE:
+        return None
+    folder = bridge_mod_dir()
+    for rel in ((".claude-plugin", "plugin.json"), ("hooks", "hooks.json"),
+                ("hooks", "register.ts")):
+        if not os.path.isfile(os.path.join(folder, *rel)):
+            return None
+    return folder
+
+
+def turn_state_path(session_id):
+    """TURN_STATE_DIR/<session_id>.json, or None for an id that is not a plain
+    name (it is joined onto a path)."""
+    if not isinstance(session_id, str) or not SESSION_REQUEST_SID_RE.fullmatch(session_id):
+        return None
+    return os.path.join(TURN_STATE_DIR, f"{session_id}.json")
+
+
+def read_turn_state(session_id, claude_sid):
+    """The bridge mod's word on the session's own turn: True running, False idle,
+    None can't tell (no file, a malformed one, or one written by another
+    conversation — a /clear, or a nested claude sharing the env)."""
+    path = turn_state_path(session_id)
+    if not path or not isinstance(claude_sid, str) or not claude_sid:
+        return None
+    data = _read_untrusted_json(path, TURN_STATE_MAX_BYTES)
+    if data is None or data.get("v") != 1 or data.get("claudeSessionId") != claude_sid:
+        return None
+    turn = data.get("turn")
+    if turn == "running":
+        return True
+    if turn == "idle":
+        return False
+    return None
+
+
+def fold_turn_state(report, turn):
+    """Fold the bridge mod's turn signal into `report["paneBusy"]`, in place.
+
+    It only ever RAISES the read to busy, never lowers it: the pane also shows
+    busy for work that is no model turn (a compaction, a `!` command), and the
+    pane stays the source for everything else it reads. It is skipped while a
+    blocking dialog is up (`panePrompt`) — the turn is technically running then,
+    but every consumer reads that dialog as the session waiting on a person — and
+    over a pane that reads idle once the transcript has been quiet for
+    TURN_STATE_QUIET_SEC, so a lost turn.complete cannot hold a session busy."""
+    if turn is not True or report.get("paneBusy") is True or report.get("panePrompt"):
+        return
+    if report.get("paneBusy") is False:
+        age = report.get("transcriptAgeSec")
+        if age is None or age >= TURN_STATE_QUIET_SEC:
+            return
+    report["paneBusy"] = True
+
+
 # ---- shadow runs (XERK-1847) ------------------------------------------------------
 #
 # After a live ticket's PR merges, the hub samples it and sends `spawnShadow`: re-do
@@ -19193,6 +19293,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # never reach a transcript this beat), so a session with agents still in
         # flight keeps reporting them on a beat that appended nothing.
         report["agents"] = live_agents_report(state)
+        # The bridge mod's turn signal (XERK-2131): Claude sessions only — dsh
+        # and qwen load no Claude mod, and dsh's paneBusy is its socket's.
+        if agent_type in (None, "", "claude"):
+            fold_turn_state(report, read_turn_state(session_id, claude_sid))
         # Every beat, not just the one that judged it: if that beat raised,
         # the record would otherwise never latch qaPartial (XERK-1857).
         if state.get("qaComplete") is False:
@@ -27902,6 +28006,13 @@ class SessionManager:
             settings = self._shadow_settings(sess)
         if settings:
             parts.append(f"--settings {shlex.quote(settings)}")
+        # The bridge mod (XERK-2131): the session's turn edges, written to
+        # TURMA_TURN_STATE. Never on a shadow run, whose launch is its sandbox.
+        mod_dir = (None if isinstance(sess.get("shadow"), dict)
+                   else bridge_mod_launch_dir(self.claude_version))
+        turn_state = turn_state_path(sess["id"]) if mod_dir else None
+        if turn_state:
+            parts.append(f"--plugin-dir {shlex.quote(mod_dir)}")
         # Tell the agent to fork new work off the LATEST default branch rather
         # than this (possibly stale) checkout (NEW_WORK_SYSTEM_PROMPT), extend that
         # with a ticket-backed session's reserved branch name (TICKET_BRANCH_PROMPT)
@@ -27947,6 +28058,8 @@ class SessionManager:
             f"TURMA_QUESTIONS_DIR={shlex.quote(QUESTIONS_DIR)} "
             f"TURMA_SESSION_CLI={shlex.quote(session_cli_path())} "
         )
+        if turn_state:
+            env_prefix += f"TURMA_TURN_STATE={shlex.quote(turn_state)} "
         # glab reads its default host from GITLAB_HOST — never the agent's own
         # GITLAB_URL — so on a self-hosted GitLab a session's `glab mr create`
         # can't auth without this, falls back to a raw API call, and the MR
@@ -28008,6 +28121,8 @@ class SessionManager:
                 claude_argv += ["--permission-mode", perm]
             if settings:
                 claude_argv += ["--settings", settings]
+            if turn_state:
+                claude_argv += ["--plugin-dir", mod_dir]
             if is_shadow:
                 claude_argv += ["--strict-mcp-config"]
             claude_argv += ["--append-system-prompt", policy]
@@ -28018,6 +28133,8 @@ class SessionManager:
                 "TURMA_QUESTIONS_DIR": QUESTIONS_DIR,
                 "TURMA_SESSION_CLI": session_cli_path(),
             }
+            if turn_state:
+                extra_env["TURMA_TURN_STATE"] = turn_state
             if gitlab_configured() and not os.environ.get("GITLAB_HOST"):
                 extra_env["GITLAB_HOST"] = gitlab_base()
             if subagent_model:
@@ -28443,6 +28560,11 @@ class SessionManager:
         target = _live_snapshot_path(sid)
         if target:
             unlink_quietly([target])
+        # The bridge mod's turn state is the previous process's word too: a
+        # claude killed mid-turn never wrote its idle (XERK-2131).
+        turn_state = turn_state_path(sid)
+        if turn_state:
+            unlink_quietly([turn_state])
 
     def _forget_session_caches(self, sid):
         # Safety net for any teardown path that reaches here without the explicit

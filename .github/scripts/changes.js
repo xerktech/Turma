@@ -9,7 +9,7 @@
 // The release components. `agent/**` no longer ships a container image; the agent
 // is distributed as two native builds off ONE shared runtime: `agent-native` (the
 // WSL/Linux tarball) and `agent-windows` (the no-WSL Windows zip, XERK-666). A
-// change to the shared runtime (hub-agent.py, tunnel-agent.js, hooks/, qwen/,
+// change to the shared runtime (hub-agent.py, tunnel-agent.js, hooks/, mods/, qwen/,
 // runtime_*) ships to BOTH; the platform-specific shells build only their own.
 const COMPONENTS = ["turma", "agent-native", "agent-windows", "glasses", "android"];
 

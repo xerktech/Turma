@@ -587,6 +587,7 @@ jobs:
           # UNCONDITIONALLY like hub-agent.py/hooks — no --with-qwen, no marker.
           cp agent/qwen_session.py agent/qwen_transcript.py "$STAGE/"
           cp -a agent/qwen "$STAGE/qwen"
+          cp -a agent/mods "$STAGE/mods"   # the Claude bridge mod (XERK-2131)
           echo "$VERSION" > "$STAGE/VERSION"
           ASSET="turma-agent-native-v${VERSION}.tar.gz"
           tar czf "$GITHUB_WORKSPACE/$ASSET" -C "$STAGE" .
@@ -636,6 +637,7 @@ jobs:
           cp agent/runtime_projection.py agent/runtime_tail.py "$STAGE/"
           cp agent/qwen_session.py agent/qwen_transcript.py "$STAGE/"
           cp -a agent/qwen "$STAGE/qwen"
+          cp -a agent/mods "$STAGE/mods"   # the Claude bridge mod (XERK-2131)
           cp agent/hooks/*.py "$STAGE/hooks/"
           # The Windows terminal layer (ADR D1): agent/win/ minus its test dir.
           # node_modules is git-ignored (absent in a checkout) and rebuilt by

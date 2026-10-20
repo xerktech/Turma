@@ -134,7 +134,7 @@ else {
 $RuntimeFiles = @('hub-agent.py', 'tunnel-agent.js',
   'runtime_projection.py', 'runtime_tail.py',
   'qwen_session.py', 'qwen_transcript.py')
-$RuntimeDirs  = @('qwen')   # recursive; hooks and win are handled explicitly below
+$RuntimeDirs  = @('qwen', 'mods')   # recursive; hooks and win are handled explicitly below
 
 # The -Verify presence list -- the exact siblings/hooks/tree whose absence runs a runtime
 # dark, plus the Windows terminal layer and the launcher/controller. Keep in lockstep with
@@ -145,6 +145,7 @@ $VerifyFiles = @(
   'runtime_projection.py', 'runtime_tail.py',
   'qwen_session.py', 'qwen_transcript.py',
   'qwen\ask_mcp.py', 'qwen\peer_mcp.py', 'qwen\peer_inbox.py', 'qwen\guard\shim.py',
+  'mods\turma-bridge\hooks\register.ts',
   'win\pty-host.mjs', 'win\tty-protocol.mjs',
   'bin\turma-agent.ps1', 'bin\turma-agentctl.ps1', 'bin\turma-agent-update.ps1'
 )
