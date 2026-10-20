@@ -18666,9 +18666,11 @@ MOD_REQUEST_MAX_BYTES = 4096
 # failure there (an Esc dropped the command) left the operator's restored prompt
 # in the composer, which the pane's `/rename` + Enter submitted glued (QA).
 MOD_RENAME_ATTEMPTS = 3
-# A name the mod accepts has no control character and no padding as JS's
-# String.prototype.trim sees it (which also trims U+FEFF, unlike str.strip).
-_MOD_NAME_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]+")
+# A name the mod accepts has no character Claude Code's /rename would rewrite
+# (C0/C1 controls, U+200B, U+2028/9 each become a space there — measured on
+# 2.1.304) and no padding as JS's String.prototype.trim sees it (which also trims
+# U+FEFF, unlike str.strip). Keep in step with the mod's NAME_UNCLEAN.
+_MOD_NAME_CTRL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b\u2028\u2029]+")
 _JS_TRIM_RE = re.compile("^[\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f"
                          "\u205f\u3000\ufeff]+|[\t\n\v\f\r \u00a0\u1680\u2000-\u200a"
                          "\u2028\u2029\u202f\u205f\u3000\ufeff]+$")

@@ -54,10 +54,12 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
   that refusal as "wait for the next turn" and does NOT answer, so the agent spends no attempt
   (spending them turned renaming off after one Esc — QA).
 - **The agent cleans the name; the mod refuses an unclean one, never rewrites it**
-  (`mod_rename_name`: control runs → a space, ends trimmed by JS's `trim` set, which includes
-  U+FEFF). Cleaned BEFORE `_unique_rc_name`, or two summaries that clean alike would leave
-  two live sessions on one name. A mismatch therefore surfaces as a refusal, never as an
-  rcName that differs from the registry. No mod → the pane path, as before.
+  (`mod_rename_name`: runs of what `/rename` itself rewrites — C0/C1 controls, U+200B,
+  U+2028/9, measured on 2.1.304 — become a space; ends trimmed by JS's `trim` set, which
+  includes U+FEFF). The two sets (`_MOD_NAME_CTRL_RE`, the mod's `NAME_UNCLEAN`) must agree.
+  Cleaned BEFORE `_unique_rc_name`, or two summaries that clean alike would leave two live
+  sessions on one name. Residual: a character `/rename` rewrites that nobody has measured
+  yet would still leave rcName unlike the registry. No mod → the pane path, as before.
 - **The mod runs `rename` and nothing else**: the request is session-writable, so it carries
   a name, never a command. It refuses a name over 200 chars.
 - Request dir and `rcRenamePending`/`rcRenameVia` are dropped on every launch/teardown.

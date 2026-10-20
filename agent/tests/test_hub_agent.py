@@ -27512,6 +27512,20 @@ class TestReconcileRcNamesViaMod(ManagerMixin, unittest.TestCase):
         self.assertEqual(ha.mod_rename_name("\ufeff QA bom \u3000\ufeff"), "QA bom")
         self.assertEqual(ha.mod_rename_name("  a\tb  "), "a b")
         self.assertEqual(ha.mod_rename_name("\x07"), "")
+        # What /rename itself rewrites (2.1.304): C1 controls, U+200B, U+2028.
+        for raw, want in (("QA\x9bcsi", "QA csi"), ("QA\x80pad", "QA pad"),
+                          ("QA \u200bzw\u200b", "QA  zw"), ("QA\u2028ls mid", "QA ls mid"),
+                          ("QA \u00a0nbsp 🚀", "QA \u00a0nbsp 🚀")):
+            self.assertEqual(ha.mod_rename_name(raw), want, repr(raw))
+
+    def test_a_summary_with_nothing_nameable_is_never_typed(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess(summary="\x07\u200b")
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+        self.assertNotIn("rcRenamePending", sess)
 
     def test_the_request_name_follows_the_mods_own_rule(self):
         sm = self.make_manager()

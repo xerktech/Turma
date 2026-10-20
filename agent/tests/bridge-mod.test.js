@@ -102,6 +102,7 @@ async function harness({ runRejects } = {}) {
   const h = {
     files, runs,
     async event(name, e) { await hooks[name]($, e, async x => x); await settle(); },
+    hooks, $,
     async tick() { for (const fn of timers) fn(); await settle(); await settle(); },
     turn() { return JSON.parse(files.get("/s/turn.json")).turn; },
     ask(name, at) { files.set("/r/rename.json", JSON.stringify({ v: 1, name, at })); },
@@ -173,7 +174,8 @@ test("a 'stopped' refusal is not an answer; the next turn retries it", async () 
 
 test("an unclean or oversized name is refused, never rewritten", async () => {
   for (const [name, at] of [["bad\nname", 41], [" padded", 42], ["x".repeat(201), 43], ["", 44],
-                            ["bell\u0007", 45], ["﻿bom", 46]]) {
+                            ["bell\u0007", 45], ["\ufeffbom", 46], ["c1\u009bcsi", 48],
+                            ["zero\u200bwidth", 49], ["line\u2028sep", 50]]) {
     const h = await harness();
     h.ask(name, at);
     await h.tick();
@@ -184,4 +186,23 @@ test("an unclean or oversized name is refused, never rewritten", async () => {
   h.ask("x".repeat(200), 47);
   await h.tick();
   assert.equal(h.done().ok, true);
+});
+
+test("a turn that starts while the request is being read stops the run", async () => {
+  // The idle check before the reads is not enough on its own: the reads await,
+  // and a prompt submitted meanwhile would queue the command (QA).
+  const h = await harness();
+  h.ask("Racy", 60);
+  const read = h.$.fs.read;
+  let fired = false;
+  h.$.fs.read = async p => {
+    if (!fired && p.endsWith("rename.json")) {
+      fired = true;
+      await h.hooks["turn.start"](h.$, { text: "typed", turnId: "t9" }, async x => x);
+    }
+    return read(p);
+  };
+  await h.tick();
+  assert.deepEqual(h.runs, []);
+  assert.equal(h.done(), null);
 });
