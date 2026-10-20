@@ -61,3 +61,14 @@ test("the mod runs /rename only, never a command a request names", () => {
   const runs = [...src.matchAll(/\$\.command\.run\(\{\s*command:\s*([^,}]+)/g)].map(m => m[1].trim());
   assert.deepEqual(runs, ["'rename'"]);
 });
+
+test("the mod renames only while the main turn is idle, and cleans the name", async () => {
+  const src = fs.readFileSync(path.join(MOD, "hooks", "register.ts"), "utf8");
+  // Run mid-turn the command waits in Claude Code's queue, where an Esc drops it
+  // and Turma's chat shows it as a queued operator prompt (QA, 2.1.304).
+  assert.match(src, /if \(w\.renaming \|\| w\.turn !== 'idle'\) return/);
+  assert.match(src, /\.replace\(\/\[\\u0000-\\u001f\\u007f\]\+\/g, ' '\)/);
+  assert.match(src, /name\.length > NAME_MAX/);
+  assert.match(src, /const NAME_MAX = 200\b/);
+  assert.match(src, /command: 'rename', args: name \}/);
+});

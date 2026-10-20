@@ -18661,6 +18661,13 @@ TURN_STATE_QUIET_SEC = _env_int("TURMA_TURN_STATE_QUIET_SEC", 300, minimum=30)
 # and answers in `rename.done.json`. Both files are session-writable.
 MOD_REQUESTS_DIR = os.path.join(REGISTRY_DIR, "mod-requests")
 MOD_REQUEST_MAX_BYTES = 4096
+# A rename the mod answers ok:false is asked again this many times (one beat
+# apart), then the session stops renaming. It never falls back to the pane: a
+# failure there (an Esc dropped the command) left the operator's restored prompt
+# in the composer, which the pane's `/rename` + Enter submitted glued (QA).
+MOD_RENAME_ATTEMPTS = 3
+# The mod's own name rule: control characters become a space, then trimmed.
+_MOD_NAME_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 def bridge_mod_dir():
@@ -33902,47 +33909,57 @@ class SessionManager:
         """Hand the `/rename` to the session's bridge mod instead of the pane
         (XERK-2131). True when the mod owns it this beat, False to type it.
 
-        The mod runs it through Claude Code's own command queue, once the session
-        is idle, so it can never land in a dialog or the trust modal — the hazards
-        the pane path guards against (XERK-868). Used only while the mod is
-        provably live in THIS conversation (its turn state reads bound to the
-        pinned id); a request it answers ok:false, or a session without the mod,
-        takes the pane.
+        The mod runs it through Claude Code's own command path, and only while
+        the session's turn is idle, so it can never land in a dialog, the trust
+        modal (XERK-868) or a composer draft. Used only while the mod is provably
+        live in THIS conversation (its turn state reads bound to the pinned id);
+        a session without the mod takes the pane.
 
         rcName moves only on the mod's ok answer, never on the request, so the
         roster never names a name the live registry does not answer to. While a
         request is out, a changed summary re-asks (a newer `at` supersedes; the
         mod runs the latest) — even back to the current name, since the older
-        request may already be running."""
+        request may already be running. An ok:false answer is asked again, up to
+        MOD_RENAME_ATTEMPTS, then renaming stops for that process: never the pane,
+        which would type beside whatever made the mod's run fail."""
         sid = sess.get("id")
-        if sess.get("rcRenameVia") == "pane":
-            return False
+        if sess.get("rcRenameVia") == "off":
+            return True
         pending = sess.get("rcRenamePending")
         if not isinstance(pending, dict):
             pending = None
+        attempts = 0
         if pending:
             done = read_mod_rename_done(sid)
             if done and done["at"] == pending.get("at"):
                 sess.pop("rcRenamePending", None)
                 clear_mod_requests(sid)
-                if not done["ok"]:
-                    sess["rcRenameVia"] = "pane"
+                if done["ok"]:
+                    sess["rcName"] = pending.get("name")
+                    sess["rcRenamedFor"] = pending.get("summary")
                     self.save()
-                    log(f"mod rename of {sid} failed ({done['error']}); the pane takes it")
-                    return False
-                sess["rcName"] = pending.get("name")
-                sess["rcRenamedFor"] = pending.get("summary")
-                self.save()
-                log(f"renamed session {sid} RC/peer name -> {sess['rcName']!r} (mod)")
-                pending = None
+                    log(f"renamed session {sid} RC/peer name -> {sess['rcName']!r} (mod)")
+                    pending = None
+                else:
+                    attempts = int(pending.get("attempts") or 1)
+                    log(f"mod rename of {sid} failed ({done['error']}), attempt {attempts}")
+                    if attempts >= MOD_RENAME_ATTEMPTS:
+                        sess["rcRenameVia"] = "off"
+                        self.save()
+                        log(f"renaming {sid} stopped after {attempts} failed mod attempts")
+                        return True
+                    pending = None
+                    self.save()
             elif pending.get("summary") == summary:
                 return True                   # asked; waiting for the idle session
+            else:
+                attempts = int(pending.get("attempts") or 1) - 1
         if summary == sess.get("rcRenamedFor") and not pending:
             return True
         if read_turn_state(sid, sess.get("claudeSessionId")) is None:
-            return pending is not None        # a request is out: never type beside it
-        name = self._unique_rc_name(summary, exclude_id=sid)
-        if name == sess.get("rcName") and not pending:
+            return pending is not None or attempts > 0   # never type beside a request
+        name = _MOD_NAME_CTRL_RE.sub(" ", self._unique_rc_name(summary, exclude_id=sid)).strip()
+        if name == sess.get("rcName") and not pending and not attempts:
             sess["rcRenamedFor"] = summary
             self.save()
             return True
@@ -33950,8 +33967,9 @@ class SessionManager:
         if pending and at <= pending.get("at", 0):
             at = pending["at"] + 1
         if not write_mod_rename(sid, name, at):
-            return pending is not None
-        sess["rcRenamePending"] = {"name": name, "summary": summary, "at": at}
+            return pending is not None or attempts > 0
+        sess["rcRenamePending"] = {"name": name, "summary": summary, "at": at,
+                                   "attempts": attempts + 1}
         self.save()
         return True
 

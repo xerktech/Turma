@@ -9,9 +9,11 @@ import type { Register, EngineInterface } from 'claude-code'
 //    extra paneBusy source, so a pane scrape that missed the "esc to interrupt"
 //    hint (a redraw gap, a failed capture) no longer reads a working session idle.
 // 2. It runs the agent's `rename.json` request as `/rename <name>` through the
-//    engine (queued until the session is idle, so never into a dialog), then
-//    answers in `rename.done.json`. Rename only: the file is session-writable, so
-//    it never names the command to run.
+//    engine, then answers in `rename.done.json`. Only while the main turn is
+//    IDLE: Claude Code then runs it at once, so it never waits in the queue,
+//    where an Esc drops it and Turma's chat would show it as a queued operator
+//    prompt (QA, 2.1.304). Rename only: the file is session-writable, so it never
+//    names the command to run.
 //
 // It draws nothing: a band or status entry would change the pane the agent's
 // parsers read. Writes are chained so they land in event order, and never
@@ -21,7 +23,13 @@ type Turn = 'idle' | 'running'
 
 // One per module load: the write chain and the order stamp it hands out, and the
 // rename poller's state.
-type Writer = { chain: Promise<unknown>; seq: number; renaming: boolean; lastRename: number }
+type Writer = {
+  chain: Promise<unknown>
+  seq: number
+  turn: Turn
+  renaming: boolean
+  lastRename: number
+}
 
 const NAME_MAX = 200
 const POLL_MS = 2000
@@ -29,6 +37,7 @@ const POLL_MS = 2000
 function publish($: EngineInterface, w: Writer, turn: Turn, turnId: string | null) {
   const seq = ++w.seq
   const at = Date.now()
+  w.turn = turn
   w.chain = w.chain
     .then(async () => {
       const path = await $.env.get('TURMA_TURN_STATE')
@@ -40,7 +49,7 @@ function publish($: EngineInterface, w: Writer, turn: Turn, turnId: string | nul
 }
 
 async function pollRename($: EngineInterface, w: Writer) {
-  if (w.renaming) return
+  if (w.renaming || w.turn !== 'idle') return
   const dir = await $.env.get('TURMA_MOD_REQUESTS')
   if (!dir) return
   let raw: string
@@ -81,7 +90,7 @@ async function pollRename($: EngineInterface, w: Writer) {
 }
 
 export const register: Register = on => {
-  const w: Writer = { chain: Promise.resolve(), seq: 0, renaming: false, lastRename: 0 }
+  const w: Writer = { chain: Promise.resolve(), seq: 0, turn: 'idle', renaming: false, lastRename: 0 }
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)

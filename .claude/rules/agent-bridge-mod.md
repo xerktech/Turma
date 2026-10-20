@@ -35,15 +35,22 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 - `_reconcile_rc_names` hands the rename to the mod (`_rename_via_mod`) while its turn state
   reads bound to the pinned conversation: `rename.json` `{v, name, at}` in
   `TURMA_MOD_REQUESTS` (`~/.turma/mod-requests/<sid>/`); the mod runs `$.command.run`
-  (`rename`), which Claude Code queues until the session is idle, so it can never land in a
-  dialog or the trust modal (XERK-868); it answers `rename.done.json` `{v, at, name, ok}`.
+  (`rename`) and answers `rename.done.json` `{v, at, name, ok}`.
+- **The mod runs it only while the main turn is IDLE** (its own turn state). Claude Code then
+  runs it at once. Queued mid-turn, an Esc drops it, and Turma's chat fold shows it as a queued
+  operator prompt (the queue-operation entry carries no origin, and Claude Code dequeues a
+  human prompt ahead of it, breaking the FIFO fold) — QA on 2.1.304. Never drop the gate.
 - **rcName moves on the mod's ok answer only** (matched by `at`), never on the request, so
   peers.tsv never names a name the live registry does not answer to (verified on 2.1.304:
   the registry `name` changes).
 - While a request is out, a changed summary re-asks with a newer `at` — even back to the
   current name, since the older request may already be running. A pending request is never
   typed beside, even if the mod's turn state goes unreadable.
-- ok:false → `rcRenameVia: "pane"` for the rest of that process; no mod → the pane path.
+- **ok:false is asked again (`MOD_RENAME_ATTEMPTS`), then renaming stops for that process
+  (`rcRenameVia: "off"`) — NEVER the pane.** The pane fallback typed `/rename` + Enter onto
+  the prompt an Esc had just restored to the composer, submitting both glued (QA).
+- The request name follows the mod's rule (control runs → one space, trimmed), so rcName
+  equals the name the registry ends up with. No mod → the pane path, as before.
 - **The mod runs `rename` and nothing else**: the request is session-writable, so it carries
   a name, never a command (pinned by `bridge-mod.test.js`). The mod strips control chars and
   refuses a name over 200 chars.
@@ -93,8 +100,8 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 
 ## Tests
 
-- `TestReconcileRcNamesViaMod` (mod-routed rename: request, ack, failure fallback, re-ask,
-  stale answer, FIFO answer).
+- `TestReconcileRcNamesViaMod` (mod-routed rename: request, ack, retry-then-stop, re-ask,
+  stale answer, never typed beside, name rule, FIFO answer).
 - `TestBridgeMod` (gate, shipped files, reader incl. FIFO, the fold, report claude-only),
   `test_a_claude_that_reads_mods_launches_the_bridge_mod` /
   `test_an_older_claude_launches_without_the_bridge_mod` (`TestSessionLifecycle`),

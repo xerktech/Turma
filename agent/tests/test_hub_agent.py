@@ -27415,17 +27415,58 @@ class TestReconcileRcNamesViaMod(ManagerMixin, unittest.TestCase):
         self.assertFalse(os.path.exists(ha.mod_request_dir("s1")))
         self.assertEqual(self.keys, [])
 
-    def test_a_failed_mod_rename_falls_back_to_the_pane(self):
+    def test_a_failed_mod_rename_is_asked_again_then_stops_never_the_pane(self):
+        # QA: an Esc dropped the mod's queued /rename, the pane fallback then typed
+        # it onto the prompt Claude Code had just restored. A failure is retried
+        # through the mod, then renaming stops; the pane never takes it.
         sm = self.make_manager()
         self._mod_live()
         sess = self._sess()
         sm.registry = [sess]
         sm._reconcile_rc_names()
-        self._answer(ok=False, error="Unknown command")
+        for attempt in range(1, ha.MOD_RENAME_ATTEMPTS + 1):
+            self.assertEqual(sess["rcRenamePending"]["attempts"], attempt)
+            self._answer(ok=False, error="removed from the queue")
+            sm._reconcile_rc_names()
+        self.assertEqual(sess["rcRenameVia"], "off")
+        self.assertNotIn("rcRenamePending", sess)
         sm._reconcile_rc_names()
-        self.assertEqual(sess["rcRenameVia"], "pane")
-        self.assertIn(("agent-s1", ("/rename Fix the retry loop",), True), self.keys)
+        self.assertEqual(self.keys, [])
+        self.assertEqual(sess["rcName"], "h-r-s1")
+
+    def test_a_retry_that_succeeds_moves_the_name(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self._answer(ok=False, error="removed from the queue")
+        sm._reconcile_rc_names()
+        self._answer()
+        sm._reconcile_rc_names()
         self.assertEqual(sess["rcName"], "Fix the retry loop")
+        self.assertEqual(self.keys, [])
+
+    def test_a_pending_request_is_never_typed_beside(self):
+        # The mod's turn state goes unreadable while a request is out: the pane
+        # must not type a second /rename next to the one that may still run.
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        os.unlink(ha.turn_state_path("s1"))
+        sess["summary"] = "Another name"
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+
+    def test_the_request_name_follows_the_mods_own_rule(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess(summary="Bell\x07 and\x1b[31m red")
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self.assertEqual(self._request()["name"], "Bell  and [31m red")
 
     def test_a_stale_answer_is_ignored_and_a_new_summary_re_asks(self):
         sm = self.make_manager()
