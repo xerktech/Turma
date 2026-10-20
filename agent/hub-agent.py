@@ -18671,22 +18671,33 @@ def _claude_version_tuple(raw):
     return tuple(int(x) for x in m.groups()) if m else None
 
 
+def bridge_mod_off_reason(claude_version):
+    """Why sessions launch WITHOUT the bridge mod, or None when they load it.
+    Logged once at manager start, so a host missing it says so."""
+    if not BRIDGE_MOD:
+        return "TURMA_BRIDGE_MOD=0"
+    version = _claude_version_tuple(claude_version)
+    if version is None:
+        return "claude --version unreadable"
+    if version < BRIDGE_MOD_MIN_CLAUDE:
+        need = ".".join(map(str, BRIDGE_MOD_MIN_CLAUDE))
+        return f"Claude Code {'.'.join(map(str, version))} is older than {need}"
+    folder = bridge_mod_dir()
+    for rel in ((".claude-plugin", "plugin.json"), ("hooks", "hooks.json"),
+                ("hooks", "register.ts")):
+        if not os.path.isfile(os.path.join(folder, *rel)):
+            # An updater older than the mod swaps in a payload without laying
+            # mods/ down; the next update, by the new updater, does.
+            return f"{os.path.join(folder, *rel)} is missing"
+    return None
+
+
 def bridge_mod_launch_dir(claude_version):
     """The folder to pass as `--plugin-dir`, or None: the mod is off
     (TURMA_BRIDGE_MOD=0), the installed Claude Code is older than
     BRIDGE_MOD_MIN_CLAUDE or unreadable, or the files were not laid down (an
     install predating it). None launches exactly as before."""
-    if not BRIDGE_MOD:
-        return None
-    version = _claude_version_tuple(claude_version)
-    if version is None or version < BRIDGE_MOD_MIN_CLAUDE:
-        return None
-    folder = bridge_mod_dir()
-    for rel in ((".claude-plugin", "plugin.json"), ("hooks", "hooks.json"),
-                ("hooks", "register.ts")):
-        if not os.path.isfile(os.path.join(folder, *rel)):
-            return None
-    return folder
+    return None if bridge_mod_off_reason(claude_version) else bridge_mod_dir()
 
 
 def turn_state_path(session_id):
@@ -23781,6 +23792,8 @@ class SessionManager:
         # `codingAgent` — the two update independently, so a new agent must not
         # blank an old hub's header.
         self.claude_version = run(["claude", "--version"])
+        off = bridge_mod_off_reason(self.claude_version)
+        log(f"bridge mod: off ({off})" if off else f"bridge mod: on ({bridge_mod_dir()})")
         self.coding_agent = coding_agent()
         # This build's own version (baked env / installed VERSION file), read once
         # — it can't change without the process being replaced.

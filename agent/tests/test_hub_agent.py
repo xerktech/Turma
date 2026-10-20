@@ -21526,6 +21526,16 @@ class TestBridgeMod(ProjectDirMixin, unittest.TestCase):
         with mock.patch.object(ha, "bridge_mod_dir", lambda: os.path.join(self.tmp, "none")):
             self.assertIsNone(ha.bridge_mod_launch_dir(here))
 
+    def test_the_off_reason_names_why(self):
+        self.assertIsNone(ha.bridge_mod_off_reason("2.1.304 (Claude Code)"))
+        self.assertIn("older than 2.1.304",
+                      ha.bridge_mod_off_reason("2.1.303 (Claude Code)"))
+        self.assertIn("unreadable", ha.bridge_mod_off_reason(""))
+        with mock.patch.object(ha, "BRIDGE_MOD", False):
+            self.assertEqual(ha.bridge_mod_off_reason("2.1.304"), "TURMA_BRIDGE_MOD=0")
+        with mock.patch.object(ha, "bridge_mod_dir", lambda: os.path.join(self.tmp, "none")):
+            self.assertIn("plugin.json is missing", ha.bridge_mod_off_reason("2.1.304"))
+
     def test_the_shipped_mod_is_well_formed(self):
         folder = ha.bridge_mod_dir()
         manifest = json.load(open(os.path.join(folder, ".claude-plugin", "plugin.json")))

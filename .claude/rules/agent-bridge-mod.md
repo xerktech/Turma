@@ -48,6 +48,10 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 - **Gated** by `bridge_mod_launch_dir`: `TURMA_BRIDGE_MOD=0` off, Claude Code below
   `BRIDGE_MOD_MIN_CLAUDE` (2.1.304, the first verified) or unreadable, or the files missing
   (an install predating it) → launch exactly as before. Never on a shadow run.
+- **A new top-level payload dir takes TWO releases to reach a host**: the release that adds
+  it is swapped in by the host's OLD updater (already running), which skips dirs it does not
+  know; the next agent release, swapped by the new updater, lays it down (seen on 2.3.49,
+  the XERK-523 class). The manager logs `bridge mod: on|off (<reason>)` at start.
 - **Packaging**: `mods/` ships beside `hooks/` in every build — `install.sh` + `do_verify`,
   `turma-agent-update`, both release stagings, the Windows `$RuntimeDirs` + `$VerifyFiles`.
   `agent/mods/` matches no `AGENT_RULES` prefix, so it builds both agents.
