@@ -27742,8 +27742,10 @@ class TestModStatus(ManagerMixin, unittest.TestCase):
         victim = os.path.join(self.tmp, "victim")
         with open(victim, "w") as f:
             f.write("keep")
-        for pid in (os.getpid(), 1, 2):
-            os.symlink(victim, os.path.join(ha.mod_request_dir("s1"), f".status.{pid}.tmp"))
+        names = [f".status.{pid}.tmp" for pid in (os.getpid(), 1, 2)]
+        names += [".status.json.tmp", ".status.tmp", "status.json.tmp"]
+        for name in names:
+            os.symlink(victim, os.path.join(ha.mod_request_dir("s1"), name))
         os.symlink(victim, self._status_path())
         sm._publish_mod_status([self._payload()])
         with open(victim) as f:
