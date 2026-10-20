@@ -175,12 +175,20 @@ test("a 'stopped' refusal is not an answer; the next turn retries it", async () 
 test("an unclean or oversized name is refused, never rewritten", async () => {
   for (const [name, at] of [["bad\nname", 41], [" padded", 42], ["x".repeat(201), 43], ["", 44],
                             ["bell\u0007", 45], ["\ufeffbom", 46], ["c1\u009bcsi", 48],
-                            ["zero\u200bwidth", 49], ["line\u2028sep", 50]]) {
+                            ["zero\u200bwidth", 49], ["line\u2028sep", 50], ["para\u2029sep", 51],
+                            ["zwj\u200djoin", 52], ["bidi\u202emark", 53], ["soft\u00adhy", 54],
+                            ["tag\u{E0041}x", 55], ["bom\ufeffmid", 56]]) {
     const h = await harness();
     h.ask(name, at);
     await h.tick();
     assert.deepEqual(h.runs, [], JSON.stringify(name));
     assert.equal(h.done().ok, false);
+  }
+  for (const [name, at] of [["e\u0301 combining", 57], ["\u3164 filler", 58], ["\ue000 private", 59]]) {
+    const k = await harness();
+    k.ask(name, at);
+    await k.tick();
+    assert.equal(k.done().ok, true, JSON.stringify(name));
   }
   const h = await harness();
   h.ask("x".repeat(200), 47);

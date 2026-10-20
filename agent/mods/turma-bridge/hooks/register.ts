@@ -37,9 +37,10 @@ type Writer = {
 }
 
 const NAME_MAX = 200
-// What Claude Code's /rename rewrites to a space (measured on 2.1.304): C0/C1
-// controls, U+200B, U+2028/9. Keep in step with hub-agent.py's _MOD_NAME_CTRL_RE.
-const NAME_UNCLEAN = /[\u0000-\u001f\u007f-\u009f\u200b\u2028\u2029]/
+// What Claude Code's /rename rewrites (each run to one space, measured on
+// 2.1.304): Unicode Cc and Cf, and U+2028/9. Same rule as hub-agent.py's
+// mod_rename_name, which cleans the name before asking.
+const NAME_UNCLEAN = /[\p{Cc}\p{Cf}\u2028\u2029]/u
 const POLL_MS = 2000
 
 function publish($: EngineInterface, w: Writer, turn: Turn, turnId: string | null) {

@@ -53,13 +53,15 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
   input** ("the session was stopped…", 2.1.304). The mod treats an aborted `turn.complete` or
   that refusal as "wait for the next turn" and does NOT answer, so the agent spends no attempt
   (spending them turned renaming off after one Esc — QA).
-- **The agent cleans the name; the mod refuses an unclean one, never rewrites it**
-  (`mod_rename_name`: runs of what `/rename` itself rewrites — C0/C1 controls, U+200B,
-  U+2028/9, measured on 2.1.304 — become a space; ends trimmed by JS's `trim` set, which
-  includes U+FEFF). The two sets (`_MOD_NAME_CTRL_RE`, the mod's `NAME_UNCLEAN`) must agree.
+- **The agent cleans the name; the mod refuses an unclean one, never rewrites it.**
+  `/rename` turns each run of Unicode Cc/Cf characters and U+2028/9 into one space and trims
+  (measured on 2.1.304: joiners, bidi marks, tags, soft hyphen, mid-string U+FEFF; its binary
+  carries that regex). `mod_rename_name` applies the same rule (via `unicodedata`), trims by
+  JS's `trim` set (incl. U+FEFF) and caps the length; the mod's `NAME_UNCLEAN` is the same
+  rule in JS. Python's and node's Unicode versions can classify a new character differently:
+  that surfaces as a refusal (retry, then off), never as rcName unlike the registry.
   Cleaned BEFORE `_unique_rc_name`, or two summaries that clean alike would leave two live
-  sessions on one name. Residual: a character `/rename` rewrites that nobody has measured
-  yet would still leave rcName unlike the registry. No mod → the pane path, as before.
+  sessions on one name. No mod → the pane path, as before.
 - **The mod runs `rename` and nothing else**: the request is session-writable, so it carries
   a name, never a command. It refuses a name over 200 chars.
 - Request dir and `rcRenamePending`/`rcRenameVia` are dropped on every launch/teardown.

@@ -18666,20 +18666,40 @@ MOD_REQUEST_MAX_BYTES = 4096
 # failure there (an Esc dropped the command) left the operator's restored prompt
 # in the composer, which the pane's `/rename` + Enter submitted glued (QA).
 MOD_RENAME_ATTEMPTS = 3
-# A name the mod accepts has no character Claude Code's /rename would rewrite
-# (C0/C1 controls, U+200B, U+2028/9 each become a space there — measured on
-# 2.1.304) and no padding as JS's String.prototype.trim sees it (which also trims
-# U+FEFF, unlike str.strip). Keep in step with the mod's NAME_UNCLEAN.
-_MOD_NAME_CTRL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b\u2028\u2029]+")
+# A name the mod accepts has nothing Claude Code's /rename rewrites — it turns
+# each run of Unicode Cc/Cf characters and U+2028/9 into one space, then trims
+# (measured on 2.1.304, the regex its binary carries) — and no padding as JS's
+# String.prototype.trim sees it (which also trims U+FEFF, unlike str.strip).
+# Python's re has no \p{Cf}, so the class is unicodedata's; the mod's
+# NAME_UNCLEAN is the same rule in JS. A character the two Unicode versions
+# classify differently is refused by the mod, never silently renamed.
 _JS_TRIM_RE = re.compile("^[\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f"
                          "\u205f\u3000\ufeff]+|[\t\n\v\f\r \u00a0\u1680\u2000-\u200a"
                          "\u2028\u2029\u202f\u205f\u3000\ufeff]+$")
+MOD_NAME_MAX = 200                    # the mod's NAME_MAX
+
+
+def _rename_rewrites(ch):
+    return ch in "\u2028\u2029" or unicodedata.category(ch) in ("Cc", "Cf")
 
 
 def mod_rename_name(text):
-    """`text` as a name the bridge mod accepts unchanged: control runs become one
-    space, then the ends are trimmed by JS's rule."""
-    return _JS_TRIM_RE.sub("", _MOD_NAME_CTRL_RE.sub(" ", text or ""))
+    """`text` as a name the bridge mod accepts unchanged and `/rename` applies
+    as-is: runs of what `/rename` rewrites become one space, the ends are trimmed
+    by JS's rule, and it is cut to MOD_NAME_MAX (the dedupe's `-N` then fits:
+    summaries are far shorter)."""
+    out, gap = [], False
+    for ch in text or "":
+        if _rename_rewrites(ch):
+            gap = True
+            continue
+        if gap:
+            out.append(" ")
+            gap = False
+        out.append(ch)
+    if gap:
+        out.append(" ")
+    return _JS_TRIM_RE.sub("", _JS_TRIM_RE.sub("", "".join(out))[:MOD_NAME_MAX - 8])
 
 
 def bridge_mod_dir():

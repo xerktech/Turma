@@ -27515,8 +27515,20 @@ class TestReconcileRcNamesViaMod(ManagerMixin, unittest.TestCase):
         # What /rename itself rewrites (2.1.304): C1 controls, U+200B, U+2028.
         for raw, want in (("QA\x9bcsi", "QA csi"), ("QA\x80pad", "QA pad"),
                           ("QA \u200bzw\u200b", "QA  zw"), ("QA\u2028ls mid", "QA ls mid"),
-                          ("QA \u00a0nbsp 🚀", "QA \u00a0nbsp 🚀")):
+                          ("QA \u00a0nbsp 🚀", "QA \u00a0nbsp 🚀"),
+                          ("QA\u2029para", "QA para"),
+                          # Unicode Cf, each run one space (QA, 2.1.304).
+                          ("QA\u200c\u200drun", "QA run"), ("QA \U0001F468\u200d\U0001F469 fam",
+                                                          "QA \U0001F468 \U0001F469 fam"),
+                          ("QA\u202eRLO", "QA RLO"), ("QA\u00adsoft", "QA soft"),
+                          ("QA\ufeffmid", "QA mid"), ("QA\U000E0041tag", "QA tag"),
+                          # Kept: combining marks, Lo ignorables, private use.
+                          ("QA e\u0301 \u3164 \ue000", "QA e\u0301 \u3164 \ue000")):
             self.assertEqual(ha.mod_rename_name(raw), want, repr(raw))
+
+    def test_a_long_name_is_cut_to_fit_the_mod(self):
+        name = ha.mod_rename_name("x" * 500)
+        self.assertLessEqual(len(name) + len("-99"), ha.MOD_NAME_MAX)
 
     def test_a_summary_with_nothing_nameable_is_never_typed(self):
         sm = self.make_manager()
