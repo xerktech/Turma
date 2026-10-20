@@ -122,10 +122,23 @@ const HELP = [
   '  /turma wake <30m|2h> <why>    re-prompt this session later',
 ].join('\n')
 
-// Text from files sessions can write: one line, capped.
+const PEER_ROWS_MAX = 40
+
+// Text from files sessions (or a tracker) can write, about to be printed into the
+// conversation: one line, capped, and unable to pose as structure. Claude Code
+// hands a command's output to the model unescaped inside <local-command-stdout>,
+// so a cell holding that closing tag ended the wrapper and its tail read as
+// instructions the operator never saw (QA, 2.1.304): angle brackets become
+// look-alikes. The pane's busy marker is broken up too, or a peer's text on
+// screen would read an idle session busy. A non-string is no text.
 function cell(v: unknown): string {
-  const t = typeof v === 'string' ? v : v == null ? '' : String(v)
-  const flat = t.replace(/[\p{Cc}\p{Cf}]+/gu, ' ').trim()
+  const t = typeof v === 'string' ? v : typeof v === 'number' && Number.isFinite(v) ? String(v) : ''
+  const flat = t
+    .replace(/[\p{Cc}\p{Cf}]+/gu, ' ')
+    .replace(/</g, '‹')
+    .replace(/>/g, '›')
+    .replace(/esc to interrupt/gi, 'esc-to-interrupt')
+    .trim()
   return flat.length > CELL_MAX ? `${flat.slice(0, CELL_MAX - 1)}…` : flat
 }
 
@@ -139,15 +152,21 @@ async function peersText($: EngineInterface): Promise<string> {
     return 'The roster is missing; Turma rewrites it every heartbeat.'
   }
   const me = await $.env.get('TURMA_SESSION_ID')
+  const host = await $.env.get('TURMA_DEVICE')
   const rows = raw.split('\n').filter(l => l.trim() && !l.startsWith('#')).map(l => l.split('\t'))
   if (!rows.length) return 'No other sessions in your organisation right now.'
-  const lines = rows.map(([id, name, host, repo, branch, task]) => {
-    const mark = id === me ? ' (you)' : ''
-    const where = [cell(host), cell(repo)].filter(Boolean).join('/')
+  // Ids are unique per host only: "you" is the row matching both.
+  const mine = (r: string[]) => r[0] === me && r[2] === host
+  const ordered = [...rows.filter(mine), ...rows.filter(r => !mine(r))]
+  const lines = ordered.slice(0, PEER_ROWS_MAX).map(r => {
+    const [, name, h, repo, branch, task] = r
+    const mark = mine(r) ? ' (you)' : ''
+    const where = [cell(h), cell(repo)].filter(Boolean).join('/')
     const br = cell(branch) ? ` [${cell(branch)}]` : ''
     const what = cell(task) ? ` — ${cell(task)}` : ''
     return `  ${cell(name)}${mark}  ${where}${br}${what}`
   })
+  if (ordered.length > PEER_ROWS_MAX) lines.push(`  …and ${ordered.length - PEER_ROWS_MAX} more in ${path}`)
   return [`${rows.length} session(s); message one by its name with SendMessage:`, ...lines].join('\n')
 }
 
@@ -174,16 +193,16 @@ async function statusText($: EngineInterface): Promise<string> {
     out.push(`  ticket:  ${cell(st.ticket.key)} ${cell(st.ticket.summary)}`.trimEnd())
   }
   out.push(`  branch:  ${cell(st.branch) || '(detached)'}`)
-  const prs = Array.isArray(st.prs) ? st.prs.slice(0, 10) : []
+  const prs = Array.isArray(st.prs) ? st.prs.filter(p => p && typeof p === 'object').slice(0, 10) : []
   if (!prs.length) out.push('  PRs:     none')
   for (const pr of prs) {
     // Readiness means something only while the PR is open.
     const open = cell(pr.state).toUpperCase() === 'OPEN' || cell(pr.state).toLowerCase() === 'opened'
     const ready = !open ? '' : pr.ready === 'ready' ? 'ready to merge' : cell(pr.ready)
     const bits = [cell(pr.state), cell(pr.checks) && `CI ${cell(pr.checks)}`, ready].filter(Boolean)
-    out.push(`  PR:      ${cell(pr.url)} (${bits.join(', ')})`)
+    out.push(`  PR:      ${cell(pr.url)}${bits.length ? ` (${bits.join(', ')})` : ''}`)
   }
-  if (typeof st.wakeAt === 'number') {
+  if (typeof st.wakeAt === 'number' && st.wakeAt > 0 && st.wakeAt < 8.64e15) {
     out.push(`  wake:    ${new Date(st.wakeAt).toISOString()} ${cell(st.wakeReason)}`.trimEnd())
   }
   return out.join('\n')
@@ -194,8 +213,11 @@ async function wakeText($: EngineInterface, args: string[]): Promise<string> {
   if (!cli) return 'No session CLI: this session was not launched by Turma.'
   if (args.length < 2) return 'Usage: /turma wake <30m|2h|1h30m> <what to check>'
   try {
-    const r = await $.process.run(['python3', '-SsE', cli, 'wake', ...args], { timeoutMs: 10000 })
-    return cell((r.stdout || r.stderr || `exit ${r.exitCode}`).trim()) || `exit ${r.exitCode}`
+    // `--`: a reason word starting with `-` is text, never an option.
+    const r = await $.process.run(['python3', '-SsE', cli, 'wake', '--', ...args], { timeoutMs: 10000 })
+    const said = (r.exitCode === 0 ? r.stdout : r.stderr || r.stdout) || `exit ${r.exitCode}`
+    const last = said.trim().split('\n').pop() || ''
+    return cell(last) || `exit ${r.exitCode}`
   } catch (err) {
     return `Wake not set: ${cell(String(err))}`
   }
@@ -205,10 +227,14 @@ async function turmaText($: EngineInterface, args: string): Promise<string> {
   const words = args.trim().split(/\s+/).filter(Boolean)
   const sub = (words[0] || '').toLowerCase()
   let text: string
-  if (sub === 'peers') text = await peersText($)
-  else if (sub === 'status') text = await statusText($)
-  else if (sub === 'wake') text = await wakeText($, words.slice(1))
-  else text = HELP
+  try {
+    if (sub === 'peers') text = await peersText($)
+    else if (sub === 'status') text = await statusText($)
+    else if (sub === 'wake') text = await wakeText($, words.slice(1))
+    else text = HELP
+  } catch (err) {
+    text = `/turma ${cell(sub)} failed: ${cell(String(err))}`
+  }
   return text.length > OUT_MAX ? `${text.slice(0, OUT_MAX - 1)}…` : text
 }
 

@@ -14866,6 +14866,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertIn(
             f"TURMA_MOD_REQUESTS={shlex.quote(ha.mod_request_dir(sess['id']))} ", cmd)
         self.assertIn(f"TURMA_PEERS_FILE={shlex.quote(ha.PEERS_FILE)} ", cmd)
+        self.assertIn(f"TURMA_DEVICE={shlex.quote(sm.device)} ", cmd)
         self.assertTrue(sess["bridgeMod"])
 
     def test_the_manager_logs_at_start_whether_sessions_get_the_bridge_mod(self):
@@ -14991,6 +14992,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
                 self.assertEqual(env["TURMA_TURN_STATE"], ha.turn_state_path(sess["id"]))
                 self.assertEqual(env["TURMA_MOD_REQUESTS"], ha.mod_request_dir(sess["id"]))
                 self.assertEqual(env["TURMA_PEERS_FILE"], ha.PEERS_FILE)
+                self.assertEqual(env["TURMA_DEVICE"], sm.device)
             else:
                 self.assertNotIn("--plugin-dir", argv)
                 self.assertNotIn("TURMA_TURN_STATE", env)
@@ -27416,10 +27418,23 @@ class TestReconcileRcNamesViaMod(ManagerMixin, unittest.TestCase):
         self.assertEqual((sess["rcName"], sess["rcRenamedFor"]),
                          ("Fix the retry loop", "Fix the retry loop"))
         self.assertNotIn("rcRenamePending", sess)
-        # The answered request goes; the dir (and the status file in it) stays.
+        # The answered request goes; the dir and the status file in it stay.
         for f in ("rename.json", "rename.done.json"):
             self.assertFalse(os.path.exists(os.path.join(ha.mod_request_dir("s1"), f)))
         self.assertEqual(self.keys, [])
+
+    def test_the_rename_answer_leaves_the_status_file(self):
+        sm = self.make_manager()
+        self._mod_live()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        status = os.path.join(ha.mod_request_dir("s1"), "status.json")
+        with open(status, "w") as f:
+            f.write("{}")
+        self._answer()
+        sm._reconcile_rc_names()
+        self.assertTrue(os.path.exists(status))
 
     def test_a_failed_mod_rename_is_asked_again_then_stops_never_the_pane(self):
         # QA: an Esc dropped the mod's queued /rename, the pane fallback then typed
@@ -27690,6 +27705,50 @@ class TestModStatus(ManagerMixin, unittest.TestCase):
         self.assertEqual(os.listdir(target), [])
         self.assertFalse(ha.write_mod_rename("s1", "x", 1))
         self.assertEqual(os.listdir(target), [])
+
+    def test_prs_are_capped_and_a_mismatched_payload_is_skipped(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess()]
+        many = [{"url": f"u{i}", "state": "OPEN"} for i in range(25)]
+        sm._publish_mod_status([self._payload(prs=many)])
+        with open(self._status_path()) as f:
+            self.assertEqual(len(json.load(f)["prs"]), 10)
+        os.unlink(self._status_path())
+        sm._mod_status_last.clear()
+        sm._publish_mod_status([self._payload(id="other")])
+        self.assertFalse(os.path.exists(self._status_path()))
+
+    def test_one_bad_dir_never_costs_another_sessions_status(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess(id="s0"), self._sess(id="s1")]
+        os.makedirs(ha.MOD_REQUESTS_DIR, exist_ok=True)
+        with open(ha.mod_request_dir("s0"), "w") as f:
+            f.write("a file where the dir goes")
+        sm._publish_mod_status([self._payload(id="s0"), self._payload()])
+        self.assertTrue(os.path.exists(self._status_path()))
+
+    def test_a_deleted_status_is_rewritten(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess()]
+        sm._publish_mod_status([self._payload()])
+        os.unlink(self._status_path())
+        sm._publish_mod_status([self._payload()])
+        self.assertTrue(os.path.exists(self._status_path()))
+
+    def test_a_planted_temp_link_is_never_followed(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess()]
+        os.makedirs(ha.mod_request_dir("s1"))
+        victim = os.path.join(self.tmp, "victim")
+        with open(victim, "w") as f:
+            f.write("keep")
+        for pid in (os.getpid(), 1, 2):
+            os.symlink(victim, os.path.join(ha.mod_request_dir("s1"), f".status.{pid}.tmp"))
+        os.symlink(victim, self._status_path())
+        sm._publish_mod_status([self._payload()])
+        with open(victim) as f:
+            self.assertEqual(f.read(), "keep")
+        self.assertFalse(os.path.islink(self._status_path()))
 
     def test_publishing_never_raises_onto_the_beat(self):
         sm = self.make_manager()

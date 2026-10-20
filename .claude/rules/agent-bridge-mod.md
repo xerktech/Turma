@@ -83,8 +83,17 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 - The beat writes `status.json` (`_publish_mod_status`, `mod_status`) for running sessions
   launched with the mod (`bridgeMod` on the record), only when it changed (`_mod_status_last`),
   never through a planted link, never raising. The rename ack removes only the rename files.
-- Every cell the mod prints went through a session-writable file, so `cell()` flattens Cc/Cf
-  and caps it; whole output capped at 4000 chars.
+- **Printed text cannot pose as structure** (`cell()`). Claude Code hands a command's output
+  to the model UNESCAPED inside `<local-command-stdout>`: a peer task or ticket summary holding
+  that closing tag ended the wrapper, the pane showed only the text before it, and the model
+  followed the tail (QA, 3/3 on 2.1.304). So `<`/`>` become `‹`/`›`, Cc/Cf flatten, cells cap
+  at 80, peers at 40 rows (you first), output at 4000. Never print file text without `cell()`.
+- `cell()` also breaks up "esc to interrupt": `_busy_from_capture` matches it anywhere on
+  screen, so a peer's text in the pane would read an idle session busy.
+- "(you)" is the row matching BOTH `TURMA_SESSION_ID` and `TURMA_DEVICE` (ids are unique per
+  host only). `wake` passes `--` so a reason word starting with `-` is text.
+- Request-dir writes go through `_write_mod_file` (mkstemp + rename: never a planted link);
+  `_publish_mod_status` guards each session on its own and rewrites a deleted `status.json`.
 
 ## Invariants
 

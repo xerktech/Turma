@@ -18768,6 +18768,21 @@ def mod_request_dir(session_id):
     return os.path.join(MOD_REQUESTS_DIR, session_id)
 
 
+def _write_mod_file(folder, name, text):
+    """Atomically write `folder/name`, a session-writable dir: a fresh temp from
+    mkstemp (O_EXCL, never a planted link) renamed over the target, which
+    replaces a link planted there rather than following it."""
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, os.path.join(folder, name))
+    except BaseException:
+        unlink_quietly([tmp])
+        raise
+
+
 def write_mod_rename(session_id, name, at):
     """Ask the session's bridge mod for `/rename <name>`, stamped `at` (epoch ms,
     the request's id). Atomic, so the mod never reads half a request. True once
@@ -18776,11 +18791,7 @@ def write_mod_rename(session_id, name, at):
     if not folder or os.path.islink(folder):
         return False                          # never write through a planted link
     try:
-        os.makedirs(folder, exist_ok=True)
-        tmp = os.path.join(folder, f".rename.{os.getpid()}.tmp")
-        with open(tmp, "w") as f:
-            json.dump({"v": 1, "name": name, "at": at}, f)
-        os.replace(tmp, os.path.join(folder, "rename.json"))
+        _write_mod_file(folder, "rename.json", json.dumps({"v": 1, "name": name, "at": at}))
         return True
     except OSError as e:
         log(f"mod rename request for {session_id} not written ({e})")
@@ -28227,6 +28238,7 @@ class SessionManager:
             env_prefix += f"TURMA_TURN_STATE={shlex.quote(turn_state)} "
             env_prefix += f"TURMA_MOD_REQUESTS={shlex.quote(mod_request_dir(sess['id']))} "
             env_prefix += f"TURMA_PEERS_FILE={shlex.quote(PEERS_FILE)} "
+            env_prefix += f"TURMA_DEVICE={shlex.quote(self.device or '')} "
         # glab reads its default host from GITLAB_HOST — never the agent's own
         # GITLAB_URL — so on a self-hosted GitLab a session's `glab mr create`
         # can't auth without this, falls back to a raw API call, and the MR
@@ -28304,6 +28316,7 @@ class SessionManager:
                 extra_env["TURMA_TURN_STATE"] = turn_state
                 extra_env["TURMA_MOD_REQUESTS"] = mod_request_dir(sess["id"])
                 extra_env["TURMA_PEERS_FILE"] = PEERS_FILE
+                extra_env["TURMA_DEVICE"] = self.device or ""
             if gitlab_configured() and not os.environ.get("GITLAB_HOST"):
                 extra_env["GITLAB_HOST"] = gitlab_base()
             if subagent_model:
@@ -33990,12 +34003,12 @@ class SessionManager:
 
     def _publish_mod_status(self, payloads):
         """Write each bridge-mod session's `status.json` (what `/turma status`
-        shows) when it changed, and hand the payloads back unchanged. On the
-        beat, so best-effort and never raising; a few hundred bytes per session,
-        written only on change."""
-        try:
-            for sess, payload in zip(self.registry, payloads):
-                sid = sess.get("id")
+        shows) when it changed or went missing, and hand the payloads back
+        unchanged. On the beat, so best-effort and never raising, one session's
+        failure never costing another's; a few hundred bytes per session."""
+        for sess, payload in zip(self.registry, payloads):
+            sid = sess.get("id")
+            try:
                 if (not sess.get("bridgeMod") or sess.get("status") != "running"
                         or not isinstance(payload, dict) or payload.get("id") != sid):
                     continue
@@ -34003,16 +34016,13 @@ class SessionManager:
                 if not folder or os.path.islink(folder):
                     continue                  # never write through a planted link
                 text = json.dumps(mod_status(sess, payload), sort_keys=True)
-                if self._mod_status_last.get(sid) == text:
+                if (self._mod_status_last.get(sid) == text
+                        and os.path.isfile(os.path.join(folder, "status.json"))):
                     continue
-                os.makedirs(folder, exist_ok=True)
-                tmp = os.path.join(folder, f".status.{os.getpid()}.tmp")
-                with open(tmp, "w") as f:
-                    f.write(text)
-                os.replace(tmp, os.path.join(folder, "status.json"))
+                _write_mod_file(folder, "status.json", text)
                 self._mod_status_last[sid] = text
-        except Exception as e:
-            log(f"mod status not written ({e})")
+            except Exception as e:
+                log(f"mod status for {sid} not written ({e})")
         return payloads
 
     def _rename_via_mod(self, sess, summary):
