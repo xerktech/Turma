@@ -22,10 +22,20 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
 ## The states
 
 - `attention: {state, since, eta?, why?}` on each SERVED session. `state` is one of
-  `needs-you:question | needs-you:permission | needs-you:review | needs-you:test |
-  needs-you:stalled | working | waiting | sleeping | idle` (`ATTENTION_STATES`).
+  `needs-you:question | needs-you:permission | needs-you:dialog | needs-you:review |
+  needs-you:test | needs-you:stalled | working | waiting | sleeping | idle` (`ATTENTION_STATES`).
 - **Precedence, highest first** (`sessionAttention`): question > permission (a blocking pane dialog)
-  > looping > working > sleeping > waiting > stalled > review > idle. A stopped session is `idle`.
+  > dialog > looping > working > sleeping > waiting > stalled > review > idle. A stopped session
+  is `idle`.
+- **`needs-you:dialog`** (XERK-2152) is the agent's `paneDialog: true` with no `panePrompt`: a dialog
+  with nothing for a client to click (the AskUserQuestion picker, an MCP elicitation or server
+  approval, the /model picker). The agent HOLDS every message aimed at that pane (`agent-input.md`)
+  and drops it after `INPUT_HOLD_TTL_SEC`, so this state is the operator's only sign to open the
+  terminal. `why` is "a dialog in the terminal"; every surface reads "waiting on a dialog in the
+  terminal" (web `attentionLabel`/`liveState`, Android `attentionLabel`/`attentionDialog`).
+  - `paneDialog` is a strict boolean in `coerceLiveSignals`; Android does not type it (clients key
+    on the attention state). It also counts for `readyForReview`, `sleeperPausable` and the
+    auto-merge idle gate, like `panePrompt`.
 - **Looping** (XERK-1572) is the agent's `loop` signal and reads `needs-you:stalled` with `why`
   "repeating <tool> ×N" and an internal `cause:"loop"` (picks the nudge; never served). It
   outranks working on purpose: a looping session is BUSY, which is exactly how it hid.

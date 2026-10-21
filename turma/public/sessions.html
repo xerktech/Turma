@@ -2254,6 +2254,11 @@ function liveState(sess, host, now) {
   // pending command), else the dialog's question from an older hub.
   if (s && s.panePrompt && s.panePrompt.prompt)
     return { kind: "waiting", label: "waiting for your permission", ask: permissionAsk(sess) };
+  // A dialog that is no panePrompt (XERK-2152: the AskUserQuestion picker, an MCP
+  // elicitation or server approval): the agent holds every message aimed at the
+  // pane until the operator answers it in the terminal. Only the hub can say so.
+  if (sess.attention?.state === "needs-you:dialog")
+    return { kind: "waiting", label: "waiting on a dialog in the terminal" };
   if (!s || s.transcriptAgeSec == null) return { kind: "idle", label: "no transcript yet" };
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   // Background agents are the other thing paneBusy cannot see (XERK-245): a

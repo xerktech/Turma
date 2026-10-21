@@ -19882,6 +19882,13 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # suppresses the busy hint — so without this read the session looks idle
         # while it waits on a human. See parse_pane_prompt.
         "panePrompt": pane_prompt,
+        # Whether ANY dialog owns the pane's keyboard (`_pane_status` leaves it on
+        # `state["paneDialog"]`), including the ones that never become a
+        # panePrompt: the AskUserQuestion picker, an MCP elicitation or server
+        # approval, the /model picker (XERK-2142). Input aimed at the pane is HELD
+        # while one is up, so the hub reads it as the session waiting on the
+        # operator in the terminal (XERK-2152). False when it can't tell.
+        "paneDialog": state.get("paneDialog") is True,
         # The background agents this session has in flight, [{type, label}]
         # (empty when none), derived from the transcript's own launch/stop edges
         # — see _scan_agent_entry. The OTHER thing paneBusy cannot see: a session

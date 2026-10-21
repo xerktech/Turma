@@ -23,6 +23,7 @@ val BRIEF_SECTIONS: List<Pair<String, String>> = listOf(
 
 private val BRIEF_STATE_LABEL = mapOf(
     "needs-you:question" to "question", "needs-you:permission" to "permission",
+    "needs-you:dialog" to "dialog",
     "needs-you:review" to "review", "needs-you:test" to "test", "needs-you:stalled" to "stalled",
     "waiting" to "waiting", "sleeping" to "sleeping",
 )
