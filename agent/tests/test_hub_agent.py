@@ -50150,11 +50150,98 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         c.update(over)
         return c
 
+    def shadow(self, sm, cmd):
+        """spawn_shadow, then wait out its placement worker and apply it the way
+        the beat does (XERK-2167)."""
+        sm.spawn_shadow(cmd)
+        deadline = time.time() + 10
+        while time.time() < deadline and any(
+                "result" not in j for j in sm._shadow_placing.values()):
+            time.sleep(0.01)
+        for _ in range(len(sm._shadow_placing)):
+            sm._apply_shadow_placements()
+        self.assertEqual(sm._shadow_placing, {}, "a placement never landed")
+
+    def test_placement_runs_off_the_beat(self):
+        # XERK-2167: the base placement (a fetch + forge reads) and the issue
+        # read run on a worker, so a slow forge never holds handle_commands.
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        gate = threading.Event()
+
+        def slow_base(*a):
+            gate.wait(10)
+            return self.BASE, None
+        with mock.patch.object(ha, "shadow_base_commit", slow_base), \
+                mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
+            t0 = time.monotonic()
+            sm.handle_commands([dict(self.cmd(), cmdId="c1")])
+            self.assertLess(time.monotonic() - t0, 2, "the placement ran on the beat")
+            self.assertEqual((sm.registry, sm.shadow_runs), ([], {}))
+            # A re-delivery while it is placed is a no-op, as is a beat before it lands.
+            sm.spawn_shadow(self.cmd())
+            sm._apply_shadow_placements()
+            self.assertEqual(len(sm._shadow_placing), 1)
+            gate.set()
+            self.shadow(sm, self.cmd())
+        [sess] = sm.registry
+        self.assertEqual(sess["baseRef"], self.BASE)
+        self.assertEqual(sm.shadow_runs[self.RID]["state"], "running")
+
+    def test_full_beats_launch_one_placed_run_each_and_light_beats_none(self):
+        # XERK-2167: the beat wiring — a placed run launches only on a FULL
+        # beat, one per beat; a re-delivery places nothing twice; a placing
+        # run holds its slot so the hub does not hand it out again.
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        calls = []
+
+        def base(*a):
+            calls.append(a[3])
+            return self.BASE, None
+        rids = ["sh-00000000000000a1", "sh-00000000000000a2"]
+        # At the capacity edge: a run gives up its placing slot before it spawns,
+        # so it launches running, never queued behind itself.
+        with mock.patch.object(ha, "shadow_base_commit", base), \
+                mock.patch.object(ha, "MAX_SESSIONS", 2), \
+                mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
+            sm.handle_commands([dict(self.cmd(shadowId=r), cmdId=f"c{i}")
+                                for i, r in enumerate(rids + rids[:1])])
+            self.assertEqual(sm._slots_used(), 2, "a placing shadow holds its slot")
+            deadline = time.time() + 10
+            while time.time() < deadline and any(
+                    "result" not in j for j in sm._shadow_placing.values()):
+                time.sleep(0.01)
+            self.assertEqual(sorted(calls), rids, "a re-delivery placed twice")
+            sm.build_payload(1, light=True)
+            self.assertEqual(sm.registry, [], "a light beat launched")
+            sm.build_payload(2)
+            self.assertEqual(len(sm.registry), 1, "one launch per full beat")
+            sm.build_payload(3)
+        self.assertEqual([x["status"] for x in sm.registry], ["running", "running"])
+        self.assertEqual(sorted(sm.shadow_runs), rids)
+        self.assertEqual(sm._shadows_placing(), 0)
+
+    def test_a_placement_that_raises_is_a_failed_run(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "shadow_base_commit", mock.Mock(side_effect=OSError("boom"))):
+            self.shadow(sm, self.cmd())
+        self.assertEqual(sm.registry, [])
+        self.assertIn("boom", sm.shadow_runs[self.RID]["error"])
+
+    def test_a_worker_that_cannot_start_fails_the_run_on_the_beat(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.threading.Thread, "start",
+                               mock.Mock(side_effect=RuntimeError("pids"))):
+            sm.spawn_shadow(self.cmd())
+        self.assertEqual(sm._shadow_placing, {})
+        self.assertIn("could not start", sm.shadow_runs[self.RID]["error"])
+
     def spawned(self):
         sm = self.make_manager()
         sm._launch_ttyd = mock.Mock()
         with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
-            sm.spawn_shadow(self.cmd())
+            self.shadow(sm, self.cmd())
         for sess in sm.registry:   # the faked worktree add creates no directory
             os.makedirs(sess["worktreePath"], exist_ok=True)
         return sm
@@ -50236,7 +50323,7 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         # Reported to the hub, and a re-delivered command is a no-op.
         self.assertEqual(sm.shadow_runs_report()[0]["state"], "running")
         with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
-            sm.spawn_shadow(self.cmd())
+            self.shadow(sm, self.cmd())
         self.assertEqual(len(sm.registry), 1)
 
     def test_refusals_are_reported_as_failed_runs(self):
@@ -50250,14 +50337,14 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
                     os.remove(ha.SHADOW_RUNS_PATH)
                 sm = self.make_manager()
                 with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
-                    sm.spawn_shadow(self.cmd(**over))
+                    self.shadow(sm, self.cmd(**over))
                 self.assertEqual(sm.registry, [])
                 r = sm.shadow_runs[self.RID]
                 self.assertEqual(r["state"], "failed")
                 self.assertIn(why, r["error"])
         os.remove(ha.SHADOW_RUNS_PATH)
         sm = self.make_manager()
-        sm.spawn_shadow(self.cmd(shadowId="../x"))
+        self.shadow(sm, self.cmd(shadowId="../x"))
         self.assertEqual(sm.shadow_runs, {})
 
     def test_done_hands_the_commit_to_an_opus_grader_then_reports_the_grade(self):
@@ -50449,7 +50536,7 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         def spawn(n):
             rid = f"sh-{n:016x}"
             with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
-                sm.spawn_shadow(self.cmd(shadowId=rid))
+                self.shadow(sm, self.cmd(shadowId=rid))
             return sm.shadow_runs[rid]
         for n, (files, why) in enumerate(cases, 1):
             with self.subTest(why=why):
@@ -50477,7 +50564,7 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "run_out", lambda cmd, **k: (None, "") if "ls-tree" in cmd
                                else real(cmd, **k)), \
                 mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
-            sm.spawn_shadow(self.cmd())
+            self.shadow(sm, self.cmd())
         self.assertEqual(sm.registry, [])
         self.assertIn("could not read the base commit", sm.shadow_runs[self.RID]["error"])
 

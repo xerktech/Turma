@@ -25497,6 +25497,12 @@ class SessionManager:
         # Shadow runs (XERK-1847): id -> run record, persisted so a manager restart
         # keeps advancing (and reporting) a run whose sessions survive it.
         self.shadow_runs = self._load_shadow_runs()
+        # spawnShadows whose base is being placed off the beat (XERK-2167):
+        # id -> job; the worker adds `result`, the beat pops and launches it.
+        # In memory: a restart mid-placement loses the run, which the hub stops
+        # counting once it goes unreported (shadowsDispatchedSince).
+        self._shadow_placing = {}
+        self._shadow_place_lock = threading.Lock()
         self._epic_builders_lock = threading.Lock()
         # Staged {type:"mergePr"} outcomes (XERK-550: PR auto-merge) — each
         # {cmdId, url, ok, error}. Its writer is an OFF-BEAT worker thread
@@ -27121,7 +27127,8 @@ class SessionManager:
         Start back into. This is the count every capacity gate uses, so a crashed
         session no longer reads as free capacity the hub fills with fresh work.
         A paused sleeper's wake resume waiting on its worktree re-add (XERK-1575)
-        holds one too: that slot is the sleeper's.
+        holds one too: that slot is the sleeper's. So does a shadow run whose base
+        is being placed off the beat (XERK-2167): the hub sent it for a free slot.
 
         `exclude_id` drops one record from the tally — for `start()`, whose target
         is ALREADY an `error` record in this set: it is transitioning to `running`
@@ -27129,7 +27136,12 @@ class SessionManager:
         return sum(1 for s in self.registry
                    if s.get("status") in SLOT_HOLDING_STATUSES
                    and not (exclude_id is not None and s.get("id") == exclude_id)
-                   ) + self._restores_in_flight() + self._imports_reserved()
+                   ) + self._restores_in_flight() + self._imports_reserved() \
+            + self._shadows_placing()
+
+    def _shadows_placing(self):
+        with self._shadow_place_lock:
+            return len(self._shadow_placing)
 
     def _queued_count(self):
         return sum(1 for s in self.registry if s.get("status") == "queued")
@@ -30366,15 +30378,19 @@ class SessionManager:
         candidate model from the commit before the merged PR. Everything the hub
         names is re-checked here: this host's own org, a cloned repo, a commit
         that resolves. A refusal is a `failed` run on the report, never silence.
-        Runs on the beat like spawn_ticket: one bounded fetch, one issue read and,
-        for a GitLab MR or ADO PR, two forge API reads — over the beat budget on a
-        slow forge (XERK-2167)."""
+
+        Only the cheap checks run here, on the beat. Placing the base (one
+        bounded fetch and, for a GitLab MR or ADO PR, two forge API reads), the
+        tree check and the issue read run on a worker (XERK-2167): together they
+        could hold the beat past OFFLINE_AFTER_MS on a slow forge. A later full
+        beat applies the result and launches (`_apply_shadow_placements`)."""
         rid = str(cmd.get("shadowId") or "")
         if not SHADOW_ID_RE.fullmatch(rid):
             log(f"spawnShadow with a bad id {rid[:40]!r} — ignored")
             return
-        if rid in self.shadow_runs:
-            return   # a re-delivered command
+        with self._shadow_place_lock:
+            if rid in self.shadow_runs or rid in self._shadow_placing:
+                return   # a re-delivered command
         if not MODEL_SHADOW:
             return self._fail_shadow(rid, cmd, "shadow runs are off on this host")
         sandbox = shadow_sandbox_reason()
@@ -30397,27 +30413,75 @@ class SessionManager:
         repo = next((r for r in scan_repos() if r["name"] == cmd.get("repo")), None)
         if not repo or not repo_forkable(repo["path"]):
             return self._fail_shadow(rid, cmd, "the repo is not cloned on this host")
-        # The code as it was before the PR landed: the merge's first parent, or
-        # merge~N for a rebase-merge of N commits (XERK-2136).
-        base, why = shadow_base_commit(repo["path"], merge, str(cmd.get("prUrl") or ""), rid)
-        if why:
-            return self._fail_shadow(rid, cmd, why)
-        tree = shadow_tree_reason(repo["path"], base)
-        if tree:
-            return self._fail_shadow(rid, cmd, f"shadow runs cannot sandbox this repo: {tree}")
+        job = {"rid": rid, "cmd": cmd, "key": key, "model": model, "merge": merge,
+               "repo": repo}
+        # Marked BEFORE the thread starts, so a re-delivery in this same batch
+        # is already a no-op.
+        with self._shadow_place_lock:
+            self._shadow_placing[rid] = job
         try:
-            detail = fetch_board_issue(key)
+            threading.Thread(target=self._place_shadow, args=(job,),
+                             name="shadow-place", daemon=True).start()
         except Exception as e:
-            return self._fail_shadow(rid, cmd, f"could not read the ticket: {e}")
+            with self._shadow_place_lock:
+                self._shadow_placing.pop(rid, None)
+            self._fail_shadow(rid, cmd, f"could not start the shadow worker: {e}")
+
+    def _place_shadow(self, job):
+        """Worker half of spawn_shadow (XERK-2167): the network and git reads.
+        Writes nothing but its own result, staged for the beat; never raises."""
+        res = {}
+        try:
+            repo, cmd = job["repo"], job["cmd"]
+            # The code as it was before the PR landed: the merge's first parent,
+            # or merge~N for a rebase-merge of N commits (XERK-2136).
+            base, why = shadow_base_commit(repo["path"], job["merge"],
+                                           str(cmd.get("prUrl") or ""), job["rid"])
+            if why:
+                res["error"] = why
+            else:
+                tree = shadow_tree_reason(repo["path"], base)
+                if tree:
+                    res["error"] = f"shadow runs cannot sandbox this repo: {tree}"
+                else:
+                    try:
+                        res.update(base=base, detail=fetch_board_issue(job["key"]))
+                    except Exception as e:
+                        res["error"] = f"could not read the ticket: {e}"
+        except Exception as e:
+            res = {"error": f"could not place the shadow's base: {e}"}
+        with self._shadow_place_lock:
+            job["result"] = res
+
+    def _apply_shadow_placements(self):
+        """Beat half of spawn_shadow (XERK-2167): launch ONE placed run per
+        beat — a launch is the same inline cost as a spawnTicket, so two would
+        stack on one beat. Full beats only. Never raises."""
+        try:
+            with self._shadow_place_lock:
+                job = next((j for j in self._shadow_placing.values()
+                            if "result" in j), None)
+                if job is None:
+                    return
+                self._shadow_placing.pop(job["rid"], None)
+            self._launch_shadow(job)
+        except Exception as e:
+            log(f"shadow placement failed: {e}")
+
+    def _launch_shadow(self, job):
+        rid, cmd, res = job["rid"], job["cmd"], job["result"]
+        if res.get("error"):
+            return self._fail_shadow(rid, cmd, res["error"])
+        key, model, base, repo = job["key"], job["model"], res["base"], job["repo"]
         not_before = cmd.get("notBefore")
         detail = _shadow_ticket_detail(
-            detail, not_before if isinstance(not_before, int) and not isinstance(not_before, bool)
-            else None)
+            res["detail"], not_before if isinstance(not_before, int)
+            and not isinstance(not_before, bool) else None)
         prompt = build_ticket_prompt(detail, [], session_cli=False)
         now = time.time()
         self.shadow_runs[rid] = {
             "id": rid, "siteKey": cmd["siteKey"], "issueKey": key, "repo": repo["name"],
-            "model": model, "mergeSha": merge, "baseSha": base,
+            "model": model, "mergeSha": job["merge"], "baseSha": base,
             "prUrl": str(cmd.get("prUrl") or "")[:500] or None, "state": "running",
             "startedAt": now, "phaseAt": now, "ticketText": prompt[:20000],
         }
@@ -45106,7 +45170,10 @@ class SessionManager:
         # wrote and, once valid, materialize the epic on a worker thread. Guarded
         # so it never raises onto the beat; the Jira writes are off-beat.
         self._advance_epic_builders()
-        # Move each shadow run on (XERK-1847): run -> grade -> report. Guarded.
+        # Launch a shadow run whose base a worker placed (XERK-2167), then move
+        # each run on (XERK-1847): run -> grade -> report. Both guarded.
+        if not light:
+            self._apply_shadow_placements()
         self._advance_shadow_runs()
         # Apply the outbox records the off-beat input worker staged (XERK-867):
         # the worker did the pane delivery, the beat owns the registry mutation.

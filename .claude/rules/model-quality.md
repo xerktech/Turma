@@ -181,6 +181,10 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     dropped, no attachments, no fetch directive); `shadow-done` (or its end/timeout) commits leftovers and hands the HEAD to an
     Opus GRADE session; `shadow-grade` makes it terminal. A run with no change is graded bad
     without a grader. One session teardown per beat; the `turma-shadow/<id>` branch is dropped.
+  - **`spawn_shadow` runs only its cheap checks on the beat** (XERK-2167): the base placement
+    (fetch + forge reads, ~53s worst case), tree check and issue read run on a worker
+    (`_place_shadow`); a later FULL beat launches one placed run (`_apply_shadow_placements`).
+    In memory: a restart mid-placement loses the run, which the hub stops counting unreported.
   - **Never a `ticket` block on either session** (and `_maybe_adopt_ticket` refuses a shadow), so
     no ticket sweep — auto-stop on Done, auto-merge, close-ticket, routing — acts on it. The
     hub raises no alert for a `shadow` session and lists it in no peer roster.
