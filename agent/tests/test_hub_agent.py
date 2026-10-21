@@ -20626,13 +20626,16 @@ class _DraftPane(_PickerPane):
     Ctrl+U behaves as 2.1.306's (measured by XERK-2157 QA): a press empties
     the last row, the next removes the emptied row."""
 
-    def __init__(self, draft, deaf=False, **kw):
+    def __init__(self, draft, deaf=False, stuck=False, **kw):
         super().__init__(**kw)
         self.draft = list(draft)
         self.deaf = deaf                # a placeholder: Ctrl+U changes nothing
+        self.stuck = stuck              # the cursor at the draft's start: same
 
     def key(self, key):
-        if key == "C-u" and not self.deaf and not (self.open or self.asking):
+        if key == "C-u" and (self.deaf or self.stuck):
+            return
+        if key == "C-u" and not (self.open or self.asking):
             if self.draft and self.draft[-1]:
                 self.draft[-1] = ""
             elif self.draft:
@@ -20650,6 +20653,14 @@ class _DraftPane(_PickerPane):
         rows = self.draft or [""]
         body = "".join(("❯ " if i == 0 else "  ") + r + "\n" for i, r in enumerate(rows))
         return self.history + rule + body + rule + "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+
+    def styled(self):
+        # The placeholder is drawn dim (SGR 2); typed text is not.
+        cap = self.capture()
+        if self.deaf and not (self.open or self.asking or self.confirmed):
+            for row in self.draft:
+                cap = cap.replace(row, f"\x1b[2m{row}\x1b[0m")
+        return cap
 
 
 class _ModePane:
@@ -20712,6 +20723,8 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         for name, value in [("run", fake_run),
                             ("_pane_busy", lambda t: busy),
                             ("_capture_pane", fake_capture),
+                            ("_capture_pane_styled",
+                             lambda t: self.pane.styled() if hasattr(self.pane, "styled") else None),
                             ("MODEL_PICKER_WAIT_SEC", 0),
                             ("MODEL_STEP_WAIT_SEC", 0),
                             ("MODEL_CONFIRM_WAIT_SEC", 0),
@@ -20923,6 +20936,60 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self._session(sm, model=None)
         sm.set_model("abcde", "sonnet")
         self.assertEqual(self._keys()[:3], ["C-u", "C-u", "/model"])
+
+    def test_set_model_clears_a_draft_that_takes_more_than_twenty_presses(self):
+        pane = _DraftPane([f"row {i}" for i in range(15)])     # 29 presses
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertFalse(any(pane.draft))
+        self.assertEqual(sess["model"], "sonnet")
+
+    def test_set_model_clears_blank_rows_too(self):
+        pane = _DraftPane(["", "", ""])
+        sm = self.make_manager(pane=pane)
+        self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertLessEqual(len(pane.draft), 1)    # one empty row is the empty box
+
+    def test_set_model_defers_a_draft_ctrl_u_cannot_reach(self):
+        # XERK-2157 QA: Ctrl+U kills only what is BEFORE the cursor, so with the
+        # cursor inside a draft the presses stop changing it and the rest was
+        # submitted as "/model <rest>". Text left that is not the dim
+        # placeholder defers the switch; the draft stays.
+        pane = _DraftPane(["QADRAFT c1", "QADRAFT c2 tail"], stuck=True)
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertNotIn("/model", self._keys())
+        self.assertEqual(pane.draft, ["QADRAFT c1", "QADRAFT c2 tail"])
+        self.assertEqual(sess["pendingModel"], "sonnet")
+        # ...and so does a composer whose styling can't be read.
+        self.run_calls.clear()
+        pane = _DraftPane(['Try "fix the lint errors"'], deaf=True)
+        pane.styled = lambda: None
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertNotIn("/model", self._keys())
+
+    def test_composer_holds_text_reads_the_dim_placeholder_as_empty(self):
+        rule = "─" * 30 + "\n"
+        placeholder = (rule + '\x1b[39m❯\xa0\x1b[2mTry "how does <filepath> work?"\x1b[0m\n'
+                       + rule)
+        self.assertIs(ha._composer_holds_text(placeholder), False)
+        self.assertIs(ha._composer_holds_text(rule + "\x1b[39m❯\xa0 tail\n" + rule), True)
+        self.assertIsNone(ha._composer_holds_text("no composer\n"))
+        self.assertIsNone(ha._composer_holds_text(None))
+
+    def test_set_model_stops_clearing_at_the_deadline(self):
+        pane = _DraftPane([f"row {i}" for i in range(15)])
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model=None)
+        with mock.patch.object(ha, "MODEL_CLEAR_DEADLINE_SEC", -1):
+            sm.set_model("abcde", "sonnet")
+        self.assertNotIn("/model", self._keys())
+        self.assertEqual(sess["pendingModel"], "sonnet")
 
     def test_set_model_defers_a_draft_that_will_not_clear(self):
         pane = _DraftPane([f"row {i}" for i in range(ha.MODEL_CLEAR_MAX_PRESSES + 5)])

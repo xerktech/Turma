@@ -158,6 +158,9 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   - The landed line must name the row AND be new vs the pane before `/model`
     (`_model_switch_landed`): a higher count, or one settled at the bottom (a full screen scrolls
     the old one off). Under ~23 cols both lines wrap mid-name. Tests: `TestModelSwitchConfirm`.
+  - The draft is cleared first, by drawn rows (two Ctrl+U a line). Ctrl+U kills only before the
+    cursor, so real (non-dim) text left once presses stop changing it DEFERS the switch — typed
+    on, it was submitted as `/model <rest>`. The dim placeholder is empty (`capture-pane -e`).
 
 ### `setMode` — live permission-mode switch
 

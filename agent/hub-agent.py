@@ -17481,6 +17481,43 @@ def _clear_leftover(tmux_name, epoch):
     return None
 
 
+def _capture_pane_styled(tmux_name):
+    """The pane with its SGR escapes kept (`capture-pane -e`), or None when
+    it can't be captured — or on Windows, whose grid capture carries no
+    attributes."""
+    if IS_WINDOWS or not tmux_name:
+        return None
+    try:
+        out = subprocess.run(
+            _tmux("capture-pane", "-p", "-e", "-t", _tmux_pane(tmux_name),
+                  name=tmux_name),
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+# A dim span (SGR 2) up to the next reset — how Claude Code draws the empty
+# composer's placeholder ('Try "how does <filepath> work?"', 2.1.306).
+_DIM_SPAN_RE = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)")
+
+
+def _composer_holds_text(styled):
+    """Whether a styled capture's composer holds typed text, not just the
+    dim placeholder; None when there is no composer to read."""
+    if styled is None:
+        return None
+    lines = styled.splitlines()
+    plain = [_ANSI_RE.sub("", line) for line in lines]
+    rules = [i for i, line in enumerate(plain) if _COMPOSER_RULE_RE.match(line)]
+    if len(rules) < 2:
+        return None
+    rows = lines[rules[-2] + 1:rules[-1]]
+    text = "".join(_ANSI_RE.sub("", _DIM_SPAN_RE.sub("", row)) for row in rows)
+    return bool(text.replace("❯", "").replace("\xa0", "").strip())
+
+
 def _composer_rows(cap):
     """The composer's rows as drawn (between the last two rules), or None."""
     if not cap:
@@ -24401,6 +24438,9 @@ MODEL_CONFIRM_TRIES = 15
 # Ctrl+U empties a composer row, then removes it: two presses a draft line;
 # set_model presses until the composer stops changing, at most this many.
 MODEL_CLEAR_MAX_PRESSES = 40
+# ...and within this wall clock: each press is re-read, and set_model runs on
+# the beat, where a wedged tmux's 5s captures must not add up (XERK-395).
+MODEL_CLEAR_DEADLINE_SEC = 6.0
 MODEL_CONFIRM_WAIT_SEC = 0.2
 # What the TUI prints once a picker selection lands (session-only or saved
 # default) or is dismissed on the current model: "Set model to Sonnet 5.5 for
@@ -34448,13 +34488,24 @@ class SessionManager:
         changing. Each draft line takes TWO presses on 2.1.306 (one empties the
         row, the next removes it), so one press left the rest to be submitted
         with "/model" glued on. Compared as drawn ROWS, never as joined text:
-        "L1" over an empty row and "L1" alone join alike. A press that changes
-        nothing means it is empty (or shows only a placeholder); an unreadable
-        composer keeps the old single press. False when it is still changing
-        after MODEL_CLEAR_MAX_PRESSES."""
+        "L1" over an empty row and "L1" alone join alike.
+
+        Ctrl+U only kills text BEFORE the cursor, so with the cursor inside a
+        draft the presses stop changing it while text is still there — that
+        text would be submitted as "/model <rest>" (XERK-2157 QA). So a
+        composer that stopped changing is clear only if what is left is the
+        dim placeholder; real text left there is False (defer), and so is a
+        composer whose styling can't be read. No key reliably moves the
+        cursor to the draft's end (Ctrl+End does nothing; Down can walk the
+        prompt history). An unreadable composer keeps the old single press.
+        False when it is still changing after MODEL_CLEAR_MAX_PRESSES or
+        MODEL_CLEAR_DEADLINE_SEC."""
         _pane_send_keys(tmux_name, "C-u")
         prev = None
+        deadline = time.monotonic() + MODEL_CLEAR_DEADLINE_SEC
         for _ in range(MODEL_CLEAR_MAX_PRESSES):
+            if time.monotonic() > deadline:
+                return False
             time.sleep(MODEL_STEP_WAIT_SEC)
             rows = _composer_rows(_capture_pane(tmux_name))
             if rows is None:
@@ -34464,7 +34515,7 @@ class SessionManager:
             if not text and len(rows) <= 1:
                 return True
             if rows == prev:
-                return True
+                return _composer_holds_text(_capture_pane_styled(tmux_name)) is False
             prev = rows
             _pane_send_keys(tmux_name, "C-u")
         return False
