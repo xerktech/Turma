@@ -86,9 +86,11 @@ function publish($: EngineInterface, w: Writer, turn: Turn, turnId: string | nul
 // background shell finishing) clears `w.stopped` on its turn.start while Claude
 // Code stays stopped, and the agent reads the turn state to wait rather than
 // type the message into the pane past the person's Esc (QA, 2.1.305).
+// It keeps the turn as it stands: a refusal arriving after a turn.start must
+// not publish that running turn as idle (its own end publishes the stop).
 function markStopped($: EngineInterface, w: Writer) {
   w.stopped = true
-  publish($, w, 'idle', null)
+  publish($, w, w.turn, null)
 }
 
 async function pollRename($: EngineInterface, w: Writer) {

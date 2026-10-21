@@ -308,6 +308,22 @@ test("a 'stopped' drop is published, and again after a turn the person did not s
   assert.equal(h.submitted(), null);
 });
 
+test("a 'stopped' refusal landing mid-turn keeps the turn running, and its end says stopped", async () => {
+  const h = await harness();
+  let release;
+  h.$.prompt.submit = (input) => { h.submits.push(input); return new Promise(r => { release = r; }); };
+  h.submit("slow", 170);
+  await h.tick();
+  await h.event("turn.start", { text: "", turnId: "bg2" });
+  release({ drop: "the session was stopped and nobody has sent input since" });
+  await new Promise(r => setTimeout(r, 10));
+  assert.equal(h.turn(), "running");
+  assert.equal(h.stopped(), true);
+  await h.event("turn.complete", { turnId: "bg2", isAborted: false, reason: "answer" });
+  assert.equal(h.turn(), "idle");
+  assert.equal(h.stopped(), true);
+});
+
 test("a 'stopped' rename refusal is published too", async () => {
   const h = await harness({ runRejects: ["HooksError: the session was stopped and nobody has sent input since"] });
   h.ask("Later", 160);
