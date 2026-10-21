@@ -481,6 +481,16 @@ test("an operator's custom busy markers are broken up too", async () => {
   const ho = await hd.turma("peers");
   assert.doesNotMatch(ho, /session\(s\)|more in|ct/i);
   assert.match(ho, /…and \d+ more-in \/t\/peers\.tsv$/);
+  // A pointer whose count itself breaks (`116` → `1-16`) is longer than the
+  // reserve: rows are dropped until it fits (QA: 4001 chars without that).
+  const pp = await harness({ env: { TURMA_BUSY_MARKERS: "11" } });
+  // Sized so the kept rows end exactly at the reserve (found by search: without
+  // the pop loop this prints 4001 chars).
+  pp.files.set("/t/peers.tsv", Array.from({ length: 151 }, (_, i) =>
+    `z${i}\t${"n".repeat(i === 1 ? 72 : 14)}\th\tr\t\t${"t".repeat(66)}\n`).join(""));
+  const po = await pp.turma("peers");
+  assert.ok(po.length <= 4000, String(po.length));
+  assert.match(po, /…and [\d-]+ more in \/t\/peers\.tsv$/);
   // Breaking never pushes the roster pointer out, nor rewrites its path.
   const big = await harness({ env: { TURMA_BUSY_MARKERS: "ab|peers.tsv" } });
   big.files.set("/t/peers.tsv", Array.from({ length: 300 }, (_, i) =>
