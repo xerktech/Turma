@@ -19858,6 +19858,22 @@ PANE_WRAPPED_PATH_DIALOG = """\
  Esc to cancel · Tab to amend
 """
 
+# A wrapped label line that fills the pane exactly: Claude Code 2.1.306 draws an
+# empty row under that option (real 70-column frame).
+PANE_FULL_WIDTH_WRAP_DIALOG = """\
+──────────────────────────────────────────────────────────────────────
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, allow reading from /home/truenas_admin/git/.turma/worktrees
+      /Turma/2019f/agent/native from this project
+
+   3. Yes, and switch to auto mode · auto mode handles these prompts
+      for you
+   4. No
+
+ Esc to cancel · Tab to amend
+"""
+
 PANE_PLAN_DIALOG = """\
   ────────────────────────────────────────────────────────────────────
    Ready to code?
@@ -21473,6 +21489,16 @@ class TestParsePanePrompt(unittest.TestCase):
                          "access to tmp/ from this")
         self.assertEqual(ha._pane_join_wrap("reading from", "/home/x"),
                          "reading from /home/x")
+
+    def test_a_full_width_wrap_keeps_the_options_below_its_gap(self):
+        p = ha.parse_pane_prompt(PANE_FULL_WIDTH_WRAP_DIALOG)
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3, 4])
+        self.assertEqual(p["options"][3]["label"], "No")
+        # The gap is stepped over only under a line that fills the pane: a blank
+        # between ordinary options still ends the run (two lists, not one).
+        p = ha.parse_pane_prompt(
+            "─" * 40 + "\n Proceed?\n ❯ 1. Yes\n\n   2. Maybe\n   3. No\n")
+        self.assertIsNone(p)
 
     def test_wrap_needs_label_column_and_cells(self):
         # A line off the label column is not part of the label, however full

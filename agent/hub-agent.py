@@ -14270,6 +14270,11 @@ def parse_pane_prompt(cap, face=False):
         last = _pane_option_wrap_end(lines, i, width)
         want = int(m.group(2))
         while want > 0:
+            # Claude Code draws an empty row under an option whose line fills
+            # the pane exactly (2.1.306); step over one, but only for that.
+            gap = rows and nxt >= 0 and not lines[nxt].strip()
+            if gap:
+                last = nxt = nxt - 1
             start = nxt
             while (start >= 0 and lines[start].strip()
                    and not PANE_PROMPT_OPTION_RE.match(lines[start])):
@@ -14277,6 +14282,9 @@ def parse_pane_prompt(cap, face=False):
             om = start >= 0 and PANE_PROMPT_OPTION_RE.match(lines[start])
             if (not om or int(om.group(2)) != want
                     or _pane_option_wrap_end(lines, start, width) != last):
+                break
+            if gap and not any(_pane_cells(lines[k].rstrip()) == width
+                               for k in range(start, last + 1)):
                 break
             rows.append((start, last))
             last = nxt = start - 1

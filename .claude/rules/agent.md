@@ -350,7 +350,10 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
       that shape too, and a None there lets the pane-typing guards type into a live dialog.
     - A line is a wrap only if its first word would not have fit after the line above (width =
       widest captured line). Joined with no space only when both sides of the break hold a "/".
+    - One blank row between options is stepped over only when the option above has a line that
+      fills the pane exactly — Claude Code 2.1.306 draws one there. Any other blank ends the run.
     - Tests: `TestParsePanePrompt.test_wrapped_option_label`, `test_wrapped_path_label`,
+      `test_a_full_width_wrap_keeps_the_options_below_its_gap`,
       `test_picker_descriptions_not_options`, `test_wrap_needs_label_column_and_cells`.
   - `answer_pane_prompt` **re-reads the pane first** and drops the answer unless that number is on
     screen NOW. Both `liveState`s check the prompt ahead of the busy read. Tests:
