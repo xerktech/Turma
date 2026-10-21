@@ -268,6 +268,20 @@ class SessionsTest {
         assertEquals("", attentionFor(null, now))
     }
 
+    // XERK-2148: the fleet card read a bare "waiting · for 11m" for a question.
+    @Test fun `waitingRow names a question or permission with its own age`() {
+        val q = SessionInfo(status = "running", session = LiveSignals(question = "Ship it?"),
+            attention = att("needs-you:question", now - 20 * 60_000L))
+        assertEquals("waiting for your answer\u00A0·\u00A0for\u00A020m", waitingRow(q, now))
+        // Another state's age is never borrowed (the hub has not caught up).
+        assertEquals("waiting for your answer", waitingRow(q.copy(attention = att("needs-you:review", now - 60_000L)), now))
+        val p = SessionInfo(status = "running",
+            session = LiveSignals(panePrompt = com.xerktech.turma.model.PanePrompt(prompt = "Proceed?")),
+            attention = att("needs-you:permission", now - 3 * 60_000L))
+        assertEquals("waiting for your permission\u00A0·\u00A0for\u00A03m", waitingRow(p, now))
+        assertEquals(null, waitingRow(SessionInfo(status = "running", session = LiveSignals()), now))
+    }
+
     @Test fun `attentionLabel names a needs-you state, never idle`() {
         assertEquals("review · PR open · CI passing", attentionLabel(att("needs-you:review", now, "PR open · CI passing")))
         assertEquals("stalled · Watch CI", attentionLabel(att("needs-you:stalled", now, "Watch CI")))

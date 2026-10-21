@@ -271,6 +271,24 @@ fun attentionLabel(att: Attention?): String? {
 }
 
 /**
+ * A WAITING fleet card's State row (web index.html `liveState`): "waiting for your
+ * answer · for 20m" / "waiting for your permission · for 3m". The age is only that
+ * wait's own needs-you `since` (web `attentionFor(att, now, state)`), never a
+ * review's the hub has not caught up from. Null when neither a question nor a
+ * permission dialog is up — a terminal-only dialog speaks through [attentionLabel].
+ */
+fun waitingRow(session: SessionInfo, now: Long): String? {
+    val s = session.session
+    val (label, own) = when {
+        (s?.question ?: "").isNotEmpty() -> "waiting for your answer" to "needs-you:question"
+        !s?.panePrompt?.prompt.isNullOrEmpty() -> "waiting for your permission" to "needs-you:permission"
+        else -> return null
+    }
+    val age = if (session.attention?.state == own) attentionFor(session.attention, now) else ""
+    return if (age.isEmpty()) label else "$label\u00A0·\u00A0$age"
+}
+
+/**
  * Does the hub say this session sits in a terminal-only dialog (XERK-2152: the
  * AskUserQuestion picker, an MCP elicitation or server approval)? The agent holds
  * every message aimed at the pane until the operator answers it in the terminal.

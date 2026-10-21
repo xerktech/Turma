@@ -656,16 +656,16 @@ private fun SessionCard(
                         val needs = if (state == LiveState.IDLE || com.xerktech.turma.core.attentionStalled(session.attention) ||
                             com.xerktech.turma.core.attentionDialog(session.attention)) com.xerktech.turma.core.attentionLabel(session.attention) else null
                         val needsFor = com.xerktech.turma.core.attentionFor(session.attention, now)
-                        // A question card carries its age too (web "waiting for your
-                        // answer · for 22m"), but only the question's own — never a
-                        // review's the hub has not caught up from.
-                        val askedFor = if (state == LiveState.WAITING && session.attention?.state == "needs-you:question") needsFor else ""
-                        val stateFor = if (needs != null) needsFor else askedFor
+                        val stateFor = if (needs != null) needsFor else ""
                         val stateLabel = needs ?: liveStateLabel(state, session.session)
+                        // A question / permission card says which, with only its own age
+                        // (web "waiting for your answer · for 22m"), never a bare "waiting".
+                        val waiting = if (needs == null && state == LiveState.WAITING)
+                            com.xerktech.turma.core.waitingRow(session, now) else null
                         // The age's "·" is glued by no-break spaces (web index.html
                         // stateAge), so a line never ends on a dangling "·".
                         Text(
-                            if (stateFor.isEmpty()) stateLabel else "$stateLabel\u00A0·\u00A0$stateFor",
+                            waiting ?: if (stateFor.isEmpty()) stateLabel else "$stateLabel\u00A0·\u00A0$stateFor",
                             style = MaterialTheme.typography.bodySmall,
                             color = if (needs != null && com.xerktech.turma.core.attentionStalled(session.attention)) MaterialTheme.colorScheme.error else muted,
                             maxLines = 1,
