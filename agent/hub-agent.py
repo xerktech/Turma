@@ -24404,16 +24404,20 @@ MODEL_CONFIRM_WAIT_SEC = 0.2
 # this session only" / "Kept model as …". The name is the picker row's label,
 # or "Opus 5.5 (default)" for the Default row (2.1.306). A narrow pane wraps
 # the line, the name included, so `_model_set_names` joins it back up.
-MODEL_SET_LINE_RE = re.compile(r"(?:Set model to|Kept model as)\s+(.*)$")
+MODEL_SET_LINE_RE = re.compile(r"(?:Set model to|Kept model as)(?:\s+(.*))?$")
 _MODEL_SET_TAIL_RE = re.compile(
     r"\s+(?:for this session only|and saved as your default)\b")
 # Claude Code's "Switch model?" confirm, drawn after `s` when the conversation
 # is cached for the current model (2.1.306, XERK-2157): a cost warning, then
 # "❯ 1. Yes, switch to <name>" and "2. No, go back" as the pane's last lines.
 # It has no "Esc to cancel" footer and no question line right above its
-# options, so no other pane read sees it. Esc goes back to the picker.
-MODEL_SWITCH_YES_RE = re.compile(r"^(?:❯\s*)?1\.\s+Yes, switch to\b\s*(.*)$")
-MODEL_SWITCH_BACK_RE = re.compile(r"^(?:❯\s*)?2\.\s+No, go back$")
+# options, so no other pane read sees it. Esc goes back to the picker. Under
+# ~23 columns option 1 wraps after "switch" and at 20 drops the space after
+# "1." ("❯ 1.Yes, switch" / "to Haiku 5.5"), so its lines are joined first.
+MODEL_SWITCH_YES_START_RE = re.compile(r"^(?:❯\s*)?1\.\s*Yes\b")
+MODEL_SWITCH_YES_RE = re.compile(
+    r"^(?:❯\s*)?1\.\s*Yes,\s*switch\s+to\b\s*(.*)$")
+MODEL_SWITCH_BACK_RE = re.compile(r"^(?:❯\s*)?2\.\s*No, go back$")
 # How set_mode's closed loop is bounded: more presses than any real cycle has
 # modes (a wrap back to the start stops it earlier), each press's readback
 # polled STEP_TRIES × STEP_WAIT.
@@ -24506,45 +24510,76 @@ def parse_model_switch_confirm(text):
         return None
     back = filled[-1]
     for yes in range(back - 1, max(-1, back - 5), -1):
-        m = MODEL_SWITCH_YES_RE.match(lines[yes])
-        if m:
+        if MODEL_SWITCH_YES_START_RE.match(lines[yes]):
             break
     else:
         return None
+    m = MODEL_SWITCH_YES_RE.match(" ".join(lines[yes:back]))
+    if not m:
+        return None
     for i in range(yes - 1, -1, -1):
         if lines[i] == "Switch model?":
-            name = " ".join([m.group(1)] + lines[yes + 1:back])
-            return " ".join(name.split())
+            return " ".join(m.group(1).split())
         if lines[i] and PANE_PROMPT_RULE_RE.match(lines[i]):
             return None
     return None
 
 
-def _model_set_names(text):
-    """The model named by each "Set model to …"/"Kept model as …" line on the
-    pane, top to bottom, with a wrapped line's continuation joined back on."""
+def _model_set_lines(text):
+    """Each "Set model to …"/"Kept model as …" line on the pane, top to bottom,
+    as (name, settled): its wrapped continuation joined back on, and whether no
+    conversation row follows it — nothing but the composer and its chrome, as
+    right after the switch that printed it."""
     lines = _pane_lines(text)
-    names = []
+    found = []
     for i, line in enumerate(lines):
         m = MODEL_SET_LINE_RE.search(line)
         if not m:
             continue
-        rest = m.group(1).strip()
-        # Only "Set model to" ends in a known tail; "Kept model as" ends at
-        # the name, so it is never joined to the line below.
-        wraps = m.group(0).startswith("Set")
-        for nxt in lines[i + 1:i + 4] if wraps else ():
-            if _MODEL_SET_TAIL_RE.search(rest):
+        rest = (m.group(1) or "").strip()
+        for nxt in lines[i + 1:i + 6]:
+            if _MODEL_SET_TAIL_RE.search(" " + rest):
                 break
-            # A continuation is indented text; a blank line, a rule or the
-            # next row's glyph ("❯", "⎿", "●") ends the line.
+            # A continuation is indented text; a blank line, a rule, the next
+            # row's glyph ("❯", "⎿", "●") or the right-aligned effort line
+            # ("◐ medium · /effort") ends the line.
             more = nxt.strip()
-            if not more or not nxt[:1].isspace() or more[0] in "❯⎿●✻─":
+            if (not more or not nxt[:1].isspace() or more[0] in "❯⎿●✻─"
+                    or "/effort" in more):
                 break
             rest += " " + more
-        tail = _MODEL_SET_TAIL_RE.search(rest)
-        names.append(" ".join((rest[:tail.start()] if tail else rest).split()))
-    return names
+        tail = _MODEL_SET_TAIL_RE.search(" " + rest)
+        name = " ".join((" " + rest)[:tail.start()].split() if tail else rest.split())
+        # A row after it: an assistant/turn line ("●", "✻" at column 0 — the
+        # right-aligned effort line is indented), a tool result ("⎿"), or a
+        # prompt with text. The composer's own "❯" is empty after a switch.
+        settled = not any(
+            nxt[:1] in ("●", "✻") or nxt.strip().startswith("⎿")
+            or (nxt[:1] == "❯" and nxt[1:].strip())
+            for nxt in lines[i + 1:])
+        found.append((name, settled))
+    return found
+
+
+def _model_set_names(text):
+    """The model named by each "Set model to …"/"Kept model as …" line."""
+    return [name for name, _ in _model_set_lines(text)]
+
+
+def _model_switch_landed(before, after, label):
+    """Whether `after` shows a NEW line naming the picker row `label`, against
+    the pane `before` the picker opened: more such lines than before, or one
+    settled at the bottom where `before` had none. The second rule covers a
+    full screen, where the new line scrolls an older one off the top and the
+    count stays put (XERK-2157 QA); a line already settled there before is
+    the earlier switch's, so only a higher count proves a new one then."""
+    was, now = _model_set_lines(before), _model_set_lines(after)
+    count = lambda found: sum(_model_names_row(n, label) for n, _ in found)
+    if count(now) > count(was):
+        return True
+    if not now or not now[-1][1] or not _model_names_row(now[-1][0], label):
+        return False
+    return not (was and was[-1][1] and _model_names_row(was[-1][0], label))
 
 
 def _model_names_row(name, label):
@@ -34375,16 +34410,14 @@ class SessionManager:
                 return
         label = rows[cur]
         # The confirmation must be NEW: a line from an earlier switch to the
-        # same model can still be on screen (XERK-2157 QA matched one), so the
-        # lines already naming the target are counted on the pane as it was
-        # before the picker opened.
-        seen = sum(_model_names_row(n, label) for n in _model_set_names(before))
+        # same model can still be on screen (XERK-2157 QA matched one), so it
+        # is judged against the pane as it was before the picker opened.
         _pane_send_keys(tmux_name, "s", literal=True)
         # The record updates only on the TUI's own confirmation — "Set model
         # to X for this session only" (or "Kept model as X" when the row was
         # already current). Unconfirmed, the record keeps the old value and the
         # transcript scan's modelActual settles what the chip shows either way.
-        if self._await_model_confirmation(tmux_name, label, seen):
+        if self._await_model_confirmation(tmux_name, label, before):
             sess["model"] = resolved
             self.save()
             log(f"set model of {sid} -> {arg} (session only, confirmed)")
@@ -34407,10 +34440,10 @@ class SessionManager:
                 return rows, cur
         return rows, cur
 
-    def _await_model_confirmation(self, tmux_name, label, seen):
+    def _await_model_confirmation(self, tmux_name, label, before):
         """Whether the picker's selection of row `label` visibly landed: poll
-        for a "Set model to…"/"Kept model as…" line naming that row, beyond the
-        `seen` such lines the pane already showed before the picker opened.
+        for a NEW "Set model to…"/"Kept model as…" line naming that row
+        (`_model_switch_landed` against the pane `before` the picker opened).
 
         On a session with history Claude Code first asks "Switch model?" (the
         cache re-read warning). It is answered Yes here: the operator's pick in
@@ -34435,8 +34468,7 @@ class SessionManager:
                     _pane_send_keys(tmux_name, "1", literal=True)
                     answered = True
                 continue
-            names = _model_set_names(cap)
-            if sum(_model_names_row(n, label) for n in names) > seen:
+            if _model_switch_landed(before, cap, label):
                 return True
         self._back_out_of_model_picker(tmux_name)
         return False

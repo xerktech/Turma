@@ -10686,6 +10686,39 @@ class TestModelSwitchConfirm(unittest.TestCase):
         self.assertIsNone(ha.parse_model_switch_confirm(""))
         self.assertIsNone(ha.parse_model_switch_confirm(None))
 
+    def test_reads_the_narrowest_frames(self):
+        # Under ~23 columns option 1 wraps after "switch", and at 20 the TUI
+        # drops the space after "1." (2.1.306, XERK-2157 QA).
+        w22 = ("▔" * 22 + "\n   Switch model?\n   Your next response\n\n"
+               "   ❯ 1. Yes, switch\n        to Sonnet 5.5\n     2. No, go back\n\n")
+        w20 = ("▔" * 20 + "\n   Switch model?\n   Your next\n\n"
+               "   ❯ 1.Yes, switch\n       to Haiku 5.5\n     2. No, go back\n")
+        self.assertEqual(ha.parse_model_switch_confirm(w22), "Sonnet 5.5")
+        self.assertEqual(ha.parse_model_switch_confirm(w20), "Haiku 5.5")
+        self.assertTrue(ha._pane_blocking_dialog(w20))
+        self.assertEqual(ha._model_set_names(
+            "  ⎿ Set model to\n    Haiku 5.5 for\n    this session\n    only\n\n"
+            "  ⎿ Kept model as\n    Haiku 5.5\n\n"), ["Haiku 5.5", "Haiku 5.5"])
+
+    def test_a_new_line_is_one_that_settled_or_raised_the_count(self):
+        landed = ha._model_switch_landed
+        stale = "  ⎿  Set model to Sonnet 5.5 for this session only\n"
+        turn = "❯ hi\n\n● hi\n\n✻ Baked for 1s\n"
+        composer = "─" * 20 + "\n❯ \n" + "─" * 20 + "\n  ⏵⏵ auto mode on\n"
+        new = "❯ /model\n" + stale + "        ◐ medium · /effort\n"
+        # Scrolled off: the old line is gone, the new one settled at the bottom.
+        self.assertTrue(landed(stale + turn + composer, turn + new + composer,
+                               "Sonnet 5.5"))
+        # Nothing new: the old line is still the last, with turns after it.
+        self.assertFalse(landed(stale + turn + composer, stale + turn + composer,
+                                "Sonnet 5.5"))
+        # The old line was ALREADY settled at the bottom: only a higher count.
+        self.assertFalse(landed(stale + composer, stale + composer, "Sonnet 5.5"))
+        self.assertTrue(landed(stale + composer, stale + new + composer,
+                               "Sonnet 5.5"))
+        # A settled line naming another model is not this switch.
+        self.assertFalse(landed(turn + composer, turn + new + composer, "Haiku 5.5"))
+
     def test_set_lines_are_joined_across_a_wrap(self):
         self.assertEqual(ha._model_set_names(_2157_LANDED_24),
                          ["Opus 5.5 (default)", "Sonnet 5.5"])
@@ -20517,7 +20550,7 @@ class _PickerPane:
     ROWS = ("Default (recommended)", "Opus", "Fable", "Sonnet", "Haiku")
 
     def __init__(self, cur=2, drop_arrows=0, confirm=True, opens=True,
-                 ask=False, ask_name=None, answers=True, history=""):
+                 ask=False, ask_name=None, answers=True, history="", scrolls=0):
         self.cur = cur                  # ❯ starts on Fable, like the real pane
         self.drop_arrows = drop_arrows  # swallow this many arrow presses
         self.confirm = confirm          # print "Set model to…" after `s`
@@ -20526,6 +20559,7 @@ class _PickerPane:
         self.ask_name = ask_name        # the name the confirm shows, if not the row's
         self.answers = answers          # whether a "1" answers the confirm
         self.history = history          # conversation text above the composer
+        self.scrolls = scrolls          # history lines the new line pushes off the top
         self.open = False
         self.asking = False
         self.confirmed = False
@@ -20577,7 +20611,8 @@ class _PickerPane:
                     "   the full history gets re-read on your next message.\n\n"
                     f"   ❯ 1. Yes, switch to {name}\n     2. No, go back\n\n")
         if self.confirmed:
-            return (self.history +
+            history = "".join(self.history.splitlines(True)[self.scrolls:])
+            return (history +
                     f"  ⎿  Set model to {self.name()} for this session only\n❯ ")
         return self.history + "❯ \n  ? for shortcuts"  # idle; deliberately no mode marker
 
@@ -20820,6 +20855,17 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         # ...and a NEW line naming the target still confirms beside it.
         self.run_calls.clear()
         sm = self.make_manager(pane=_PickerPane(history=old))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(sess["model"], "sonnet")
+
+    def test_set_model_records_a_switch_whose_line_scrolled_an_old_one_off(self):
+        # XERK-2157 QA: on a full screen the new line pushes the top rows out
+        # of view, taking an earlier line for the same model with it — the
+        # count stays put, yet the switch landed.
+        old = ("❯ /model\n  ⎿  Set model to Sonnet for this session only\n"
+               "❯ hi\n● hi\n")
+        sm = self.make_manager(pane=_PickerPane(ask=True, history=old, scrolls=2))
         sess = self._session(sm, model="opus")
         sm.set_model("abcde", "sonnet")
         self.assertEqual(sess["model"], "sonnet")
