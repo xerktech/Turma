@@ -311,6 +311,36 @@ test("parseLocalCommand: `!` bash passthrough turns -> command / output shapes",
   assert.equal(entryText({ type: "user", message: { content: "<bash-input> ls</bash-input>" } }), "! ls");
 });
 
+// Mirror of test_hub_agent.py TestPluginMessage — keep in lockstep (XERK-2135).
+// The entry is the one Claude Code 2.1.305 wrote for a bridge-mod
+// $.prompt.submit, trimmed to the fields the mapper reads.
+const PLUGIN_ENTRY = {
+  type: "user", uuid: "31f44d86", promptSource: "system",
+  origin: { kind: "plugin", name: "turma-bridge" },
+  message: { role: "user", content: "The turma-bridge plugin sent a message:\nWake-up: check CI on PR 12. Check it and continue.\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above." },
+};
+test("entryBlocks/entryText: a plugin's prompt is tagged and unframed, never an operator bubble", () => {
+  assert.deepEqual(entryBlocks(PLUGIN_ENTRY, BLOCK_CAPS),
+    [{ t: "text", text: "Wake-up: check CI on PR 12. Check it and continue.", origin: "turma" }]);
+  assert.equal(entryText(PLUGIN_ENTRY), "Wake-up: check CI on PR 12. Check it and continue.");
+  // Another plugin's prompt is a system turn; list content is joined.
+  const other = { ...PLUGIN_ENTRY, origin: { kind: "plugin", name: "acme" },
+    message: { content: [{ type: "text", text: "The acme plugin sent a message:\nhi\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns." }] } };
+  assert.deepEqual(entryBlocks(other, BLOCK_CAPS), [{ t: "text", text: "hi", origin: "system" }]);
+  // A frame worded otherwise stays; the origin still tags it.
+  const reworded = { ...PLUGIN_ENTRY, message: { content: "Plugin says: hi" } };
+  assert.deepEqual(entryBlocks(reworded, BLOCK_CAPS), [{ t: "text", text: "Plugin says: hi", origin: "turma" }]);
+  // Its text is never re-read as a notification or a command.
+  const cmd = { ...PLUGIN_ENTRY, message: { content: "<bash-input>ls</bash-input>" } };
+  assert.deepEqual(entryBlocks(cmd, BLOCK_CAPS), [{ t: "text", text: "<bash-input>ls</bash-input>", origin: "turma" }]);
+  // The operator typing the frame's words is still the operator: origin decides.
+  const typed = { type: "user", message: { content: PLUGIN_ENTRY.message.content } };
+  assert.deepEqual(entryBlocks(typed, BLOCK_CAPS), [{ t: "text", text: PLUGIN_ENTRY.message.content }]);
+  // An empty prompt renders nothing.
+  assert.deepEqual(entryBlocks({ ...PLUGIN_ENTRY, message: { content: "  " } }, BLOCK_CAPS), []);
+  assert.equal(entryText({ ...PLUGIN_ENTRY, message: { content: "  " } }), null);
+});
+
 // Mirror of test_hub_agent.py TestInterruptMarker — keep in lockstep.
 test("entryBlocks: an interrupt marker is a status block, not a user bubble", () => {
   for (const text of ["[Request interrupted by user]", "[Request interrupted by user for tool use]"]) {

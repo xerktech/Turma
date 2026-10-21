@@ -19,7 +19,17 @@ import type { Register, EngineInterface } from 'claude-code'
 //    characters, padding, over NAME_MAX) is refused, never rewritten, so the
 //    name the agent records is the name the session ends up with.
 //
-// 3. It serves `/turma` (peers | status | wake <dur> <why>), run on demand:
+// 3. It submits the agent's `submit.json` request — one of Turma's own machine
+//    messages: a wake-up, a hub nudge (XERK-2135) — with `$.prompt.submit`,
+//    answering in `submit.done.json`. Idle only, for the reason the rename is:
+//    the prompt then starts a turn at once and never waits in the queue. The
+//    model reads it framed as this plugin's ("The turma-bridge plugin sent a
+//    message"), which is right for a machine message and why the operator's
+//    messages never come this way. After an interrupted turn Claude Code drops a
+//    plugin's prompt until the person sends input; the mod waits for that turn
+//    rather than answering, so the stop is respected.
+//
+// 4. It serves `/turma` (peers | status | wake <dur> <why>), run on demand:
 //    the roster the agent writes (TURMA_PEERS_FILE), the session's status the
 //    agent writes beside its requests (`status.json`), and a wake through the
 //    session CLI (TURMA_SESSION_CLI), which validates it.
@@ -39,6 +49,8 @@ type Writer = {
   stopped: boolean
   renaming: boolean
   lastRename: number
+  submitting: boolean
+  lastSubmit: number
 }
 
 const NAME_MAX = 200
@@ -47,6 +59,9 @@ const NAME_MAX = 200
 // mod_rename_name, which cleans the name before asking.
 const NAME_UNCLEAN = /[\p{Cc}\p{Cf}\u2028\u2029]/u
 const POLL_MS = 2000
+// The longest machine message the mod submits: Turma's are a few hundred
+// characters; this bounds what a session-writable file can put in a turn.
+const SUBMIT_MAX = 20000
 
 function publish($: EngineInterface, w: Writer, turn: Turn, turnId: string | null) {
   const seq = ++w.seq
@@ -57,13 +72,29 @@ function publish($: EngineInterface, w: Writer, turn: Turn, turnId: string | nul
       const path = await $.env.get('TURMA_TURN_STATE')
       if (!path) return
       const claudeSessionId = await $.session.id()
-      await $.fs.write(path, JSON.stringify({ v: 1, claudeSessionId, turn, turnId, seq, at }))
+      // `stopped`: an interrupted turn, after which Claude Code refuses this
+      // plugin's prompts and commands until the person sends input. The agent
+      // reads it to wait, not type into the pane past the person's stop.
+      const stopped = w.stopped || undefined
+      await $.fs.write(path, JSON.stringify({ v: 1, claudeSessionId, turn, turnId, seq, at, stopped }))
     })
     .catch(() => undefined)
 }
 
+// Claude Code says the session is stopped (it refused a command or dropped a
+// prompt). Published, not just remembered: a turn the person did not start (a
+// background shell finishing) clears `w.stopped` on its turn.start while Claude
+// Code stays stopped, and the agent reads the turn state to wait rather than
+// type the message into the pane past the person's Esc (QA, 2.1.305).
+// It keeps the turn as it stands: a refusal arriving after a turn.start must
+// not publish that running turn as idle (its own end publishes the stop).
+function markStopped($: EngineInterface, w: Writer) {
+  w.stopped = true
+  publish($, w, w.turn, null)
+}
+
 async function pollRename($: EngineInterface, w: Writer) {
-  if (w.renaming || w.turn !== 'idle' || w.stopped) return
+  if (w.renaming || w.submitting || w.turn !== 'idle' || w.stopped) return
   const dir = await $.env.get('TURMA_MOD_REQUESTS')
   if (!dir) return
   let raw: string
@@ -81,8 +112,8 @@ async function pollRename($: EngineInterface, w: Writer) {
   const at = typeof req.at === 'number' ? req.at : 0
   const name = typeof req.name === 'string' ? req.name : ''
   if (req.v !== 1 || at <= 0 || at === w.lastRename) return
-  // The reads above awaited: a turn may have started meanwhile.
-  if (w.turn !== 'idle' || w.stopped) return
+  // The reads above awaited: a turn (or a submit) may have started meanwhile.
+  if (w.turn !== 'idle' || w.stopped || w.submitting) return
   w.renaming = true
   w.lastRename = at
   let ok = false
@@ -97,7 +128,7 @@ async function pollRename($: EngineInterface, w: Writer) {
       error = String(err).slice(0, 300)
       if (/stopped/.test(error)) {
         // Refused until the person sends input: not an answer, try after.
-        w.stopped = true
+        markStopped($, w)
         w.lastRename = 0
         w.renaming = false
         return
@@ -110,6 +141,68 @@ async function pollRename($: EngineInterface, w: Writer) {
     // The agent sees no answer and keeps the request; nothing to retry here.
   }
   w.renaming = false
+}
+
+// The session was stopped and nobody has sent input since: Claude Code's words
+// when it drops a plugin's prompt or refuses its command (2.1.305).
+const STOPPED_RE = /stopped/
+
+async function pollSubmit($: EngineInterface, w: Writer) {
+  if (w.submitting || w.renaming || w.turn !== 'idle' || w.stopped) return
+  const dir = await $.env.get('TURMA_MOD_REQUESTS')
+  if (!dir) return
+  let raw: string
+  try {
+    raw = await $.fs.read(`${dir}/submit.json`)
+  } catch {
+    return
+  }
+  let req: { v?: unknown; text?: unknown; at?: unknown }
+  try {
+    req = JSON.parse(raw)
+  } catch {
+    return
+  }
+  const at = typeof req.at === 'number' ? req.at : 0
+  const text = typeof req.text === 'string' ? req.text : ''
+  if (req.v !== 1 || at <= 0 || at === w.lastSubmit) return
+  // The reads above awaited: a turn (or a rename) may have started meanwhile.
+  if (w.turn !== 'idle' || w.stopped || w.renaming) return
+  w.submitting = true
+  w.lastSubmit = at
+  let ok = false
+  let error: string | undefined
+  if (!text.trim() || text.length > SUBMIT_MAX) {
+    error = 'unusable text'
+  } else {
+    try {
+      const r = await $.prompt.submit({ text })
+      const drop = r && typeof r === 'object' && 'drop' in r ? String((r as { drop?: unknown }).drop) : ''
+      if (drop && STOPPED_RE.test(drop)) {
+        // Dropped until the person sends input: not an answer, try after.
+        markStopped($, w)
+        w.lastSubmit = 0
+        w.submitting = false
+        return
+      }
+      if (drop) error = drop.slice(0, 300)
+      else ok = true
+    } catch (err) {
+      error = String(err).slice(0, 300)
+      if (STOPPED_RE.test(error)) {
+        markStopped($, w)
+        w.lastSubmit = 0
+        w.submitting = false
+        return
+      }
+    }
+  }
+  try {
+    await $.fs.write(`${dir}/submit.done.json`, JSON.stringify({ v: 1, at, ok, error }))
+  } catch {
+    // The agent sees no answer and keeps the request; nothing to retry here.
+  }
+  w.submitting = false
 }
 
 const CELL_MAX = 80
@@ -274,12 +367,14 @@ async function turmaText($: EngineInterface, args: string): Promise<string> {
 export const register: Register = on => {
   const w: Writer = {
     chain: Promise.resolve(), seq: 0, turn: 'idle', stopped: false, renaming: false, lastRename: 0,
+    submitting: false, lastSubmit: 0,
   }
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     publish($, w, 'idle', null)
     $.clock.every(POLL_MS, () => void pollRename($, w).catch(() => { w.renaming = false }))
+    $.clock.every(POLL_MS, () => void pollSubmit($, w).catch(() => { w.submitting = false }))
     void $.command
       .register({
         name: 'turma',

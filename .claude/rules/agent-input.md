@@ -210,6 +210,12 @@ composed.**
   cap AND the capability flag**: an agent reporting none drops uploads untold, so the hub refuses and
   composers hide the 📎. Tests: `TestStoreUploads`, `TestSendInputUploads`, `UploadsTest`.
 
+## Machine messages through the bridge mod (XERK-2135)
+
+- A wake-up and the hub's `source: "nudge"` inputs go to the session's bridge mod
+  (`$.prompt.submit`, idle-only) while it is live, and this pane path otherwise or as their
+  fallback. Never an operator's message. Rules: `agent-bridge-mod.md`.
+
 ## `notify_session` — the session inbox (XERK-340)
 
 - **Machine-generated messages go to the session's own INBOX, not its pane**: PR review activity

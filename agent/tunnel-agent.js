@@ -325,6 +325,39 @@ function entryToolSource(entry) {
   return entry.sourceToolUseID || null;
 }
 
+// A prompt a Claude Code plugin submitted ($.prompt.submit): a user entry
+// stamped `origin: {kind: "plugin", name}`, its text inside Claude Code's
+// "The <name> plugin sent a message:" frame. Mirror of hub-agent.py
+// _plugin_message, where the reasoning lives (XERK-2135): [text, origin] with
+// the frame stripped, origin "turma" for the bridge mod and "system" for any
+// other plugin, or null when the entry is not one.
+const PLUGIN_FRAME_TAIL = "\n\nThis is how Claude Code surfaces a prompt a plugin submits";
+const BRIDGE_MOD_NAME = "turma-bridge";
+function pluginMessage(entry) {
+  if (entry.type !== "user") return null;
+  const origin = entry.origin;
+  if (!origin || typeof origin !== "object" || origin.kind !== "plugin") return null;
+  const name = typeof origin.name === "string" ? origin.name : "";
+  const msg = entry.message;
+  const content = msg && typeof msg === "object" ? msg.content : undefined;
+  let text;
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    text = content.filter((b) => b && typeof b === "object" && b.type === "text")
+      .map((b) => String(b.text || "")).join("");
+  } else {
+    return null;
+  }
+  const head = `The ${name} plugin sent a message:\n`;
+  if (name && text.startsWith(head)) {
+    text = text.slice(head.length);
+    const cut = text.lastIndexOf(PLUGIN_FRAME_TAIL);
+    if (cut !== -1) text = text.slice(0, cut);
+  }
+  return [text, name === BRIDGE_MOD_NAME ? "turma" : "system"];
+}
+
 // The entry's first raw text payload (string content, or the first `text` block
 // of list content), or "" — mirror of hub-agent.py _entry_first_text.
 function entryFirstText(entry) {
@@ -390,6 +423,8 @@ function entryText(entry) {
   if (!msg || typeof msg !== "object") return null;
   // Tool-authored: a tool_result by another name, and this feed drops those.
   if (entryToolSource(entry)) return null;
+  const plugin = pluginMessage(entry);
+  if (plugin) return edgeTrim(plugin[0].replace(ANSI_RE, "")) || null;
   const content = msg.content;
   let text;
   if (typeof content === "string") {
@@ -648,6 +683,18 @@ function entryBlocks(entry, caps) {
     const text = edgeTrim(entryFirstText(entry).replace(ANSI_RE, ""));
     const [clipped, trunc] = clip(text, caps.result);
     const block = { t: "tool_result", text: clipped, forId: toolSrc };
+    if (trunc) block.truncated = true;
+    return [block];
+  }
+
+  // A plugin's prompt (a Turma wake-up or nudge through the bridge mod): one
+  // text block, frame stripped, carrying who sent it. Mirror of _entry_blocks.
+  const plugin = pluginMessage(entry);
+  if (plugin) {
+    const text = edgeTrim(plugin[0].replace(ANSI_RE, ""));
+    if (!text) return [];
+    const [clipped, trunc] = clip(text, caps.text);
+    const block = { t: "text", text: clipped, origin: plugin[1] };
     if (trunc) block.truncated = true;
     return [block];
   }

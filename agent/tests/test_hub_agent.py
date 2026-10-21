@@ -4219,6 +4219,76 @@ class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
         self.assertEqual([e["id"] for e in tail], ["u7", "u8", "u9"])
 
 
+class TestPluginMessage(unittest.TestCase):
+    """A plugin-submitted prompt (XERK-2135): the bridge mod's wake-ups and hub
+    nudges. Mirror of the `a plugin's prompt is tagged and unframed` case in
+    tunnel-agent.test.js — keep in lockstep. The entry is what Claude Code
+    2.1.305 wrote for a $.prompt.submit, trimmed."""
+
+    ENTRY = {
+        "type": "user", "uuid": "31f44d86", "promptSource": "system",
+        "origin": {"kind": "plugin", "name": "turma-bridge"},
+        "message": {"role": "user", "content": (
+            "The turma-bridge plugin sent a message:\n"
+            "Wake-up: check CI on PR 12. Check it and continue.\n\n"
+            "This is how Claude Code surfaces a prompt a plugin submits between turns "
+            "— it starts this turn in the user's place. Address the message above.")},
+    }
+
+    def _with(self, **kw):
+        e = dict(self.ENTRY)
+        e.update(kw)
+        return e
+
+    def test_bridge_prompt_is_tagged_and_unframed(self):
+        want = "Wake-up: check CI on PR 12. Check it and continue."
+        self.assertEqual(ha._entry_blocks(self.ENTRY, ha.BLOCK_CAPS),
+                         [{"t": "text", "text": want, "origin": "turma"}])
+        self.assertEqual(ha._entry_text(self.ENTRY), want)
+
+    def test_another_plugin_is_a_system_turn(self):
+        e = self._with(origin={"kind": "plugin", "name": "acme"}, message={"content": [
+            {"type": "text", "text": "The acme plugin sent a message:\nhi\n\nThis is how "
+             "Claude Code surfaces a prompt a plugin submits between turns."}]})
+        self.assertEqual(ha._entry_blocks(e, ha.BLOCK_CAPS),
+                         [{"t": "text", "text": "hi", "origin": "system"}])
+
+    def test_a_reworded_frame_stays_but_is_still_tagged(self):
+        e = self._with(message={"content": "Plugin says: hi"})
+        self.assertEqual(ha._entry_blocks(e, ha.BLOCK_CAPS),
+                         [{"t": "text", "text": "Plugin says: hi", "origin": "turma"}])
+
+    def test_its_text_is_never_reparsed(self):
+        e = self._with(message={"content": "<bash-input>ls</bash-input>"})
+        self.assertEqual(ha._entry_blocks(e, ha.BLOCK_CAPS),
+                         [{"t": "text", "text": "<bash-input>ls</bash-input>", "origin": "turma"}])
+
+    def test_the_operator_typing_the_frame_is_still_the_operator(self):
+        e = {"type": "user", "message": {"content": self.ENTRY["message"]["content"]}}
+        self.assertEqual(ha._entry_blocks(e, ha.BLOCK_CAPS),
+                         [{"t": "text", "text": self.ENTRY["message"]["content"]}])
+
+    def test_an_empty_prompt_renders_nothing(self):
+        e = self._with(message={"content": "  "})
+        self.assertEqual(ha._entry_blocks(e, ha.BLOCK_CAPS), [])
+        self.assertIsNone(ha._entry_text(e))
+
+    def test_it_is_not_an_operator_row(self):
+        row = {"role": "user", "blocks": ha._entry_blocks(self.ENTRY, ha.BLOCK_CAPS)}
+        self.assertFalse(ha._is_operator_row(row))
+        self.assertTrue(ha._is_operator_row({"role": "user", "blocks": [{"t": "text", "text": "x"}]}))
+
+    def test_it_never_names_the_session(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+            f.write(json.dumps(self.ENTRY) + "\n")
+            f.write(json.dumps({"type": "user", "message": {"content": "fix the bug"}}) + "\n")
+        try:
+            self.assertEqual(ha._first_user_text(f.name), "fix the bug")
+        finally:
+            os.unlink(f.name)
+
+
 class TestEntryBlocks(unittest.TestCase):
     """The rich block mapper for the native chat UI. Kept in lockstep with
     tunnel-agent.js entryBlocks (agent/tests/tunnel-agent.test.js has the mirror
@@ -27352,6 +27422,231 @@ class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["rcName"], "Fix the retry loop-2")
         self.assertIn(("agent-s1", ("/rename Fix the retry loop-2",), True),
                       self.keys)
+
+
+class TestMachineInputViaMod(ManagerMixin, unittest.TestCase):
+    """XERK-2135: Turma's own messages (wake-ups, the hub's nudges) go to the
+    session's bridge mod as `submit.json` while it is live, and the pane only
+    when it is not, it answers ok:false, or it never answers while idle."""
+
+    CSID = "11111111-2222-3333-4444-555555555555"
+
+    def make_manager(self):
+        sm = super().make_manager()
+        sm.save = mock.Mock()
+        return sm
+
+    def _sess(self, **kw):
+        s = {"id": "s1", "status": "running", "tmuxName": "agent-s1", "bridgeMod": True,
+             "claudeSessionId": self.CSID}
+        s.update(kw)
+        return s
+
+    def _turn(self, turn="idle", stopped=False, csid=None):
+        path = ha.turn_state_path("s1")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        body = {"v": 1, "claudeSessionId": csid or self.CSID, "turn": turn}
+        if stopped:
+            body["stopped"] = True
+        with open(path, "w") as f:
+            json.dump(body, f)
+
+    def _req_path(self, name="submit.json"):
+        return os.path.join(ha.mod_request_dir("s1"), name)
+
+    def _request(self):
+        with open(self._req_path()) as f:
+            return json.load(f)
+
+    def _answer(self, ok=True, at=None, error=None):
+        with open(self._req_path("submit.done.json"), "w") as f:
+            json.dump({"v": 1, "at": at or self._request()["at"], "ok": ok, "error": error}, f)
+
+    def _setup(self, **kw):
+        sm = self.make_manager()
+        self._turn()
+        sess = self._sess(**kw)
+        sm.registry = [sess]
+        return sm, sess
+
+    def test_a_live_mod_gets_the_message_and_the_pane_gets_nothing(self):
+        sm, sess = self._setup()
+        self.assertEqual(sm._stage_machine_input("s1", "Wake-up: x. Check it and continue."), "mod")
+        self.assertEqual(sm.input_queue, [])
+        req = self._request()
+        self.assertEqual((req["v"], req["text"]), (1, "Wake-up: x. Check it and continue."))
+        self.assertTrue(sm._input_undelivered("s1"), "a sleeper pause must wait for it")
+        sm._advance_all_mod_submits()          # unanswered: still out, nothing typed
+        self.assertEqual(self._request()["at"], req["at"])
+        self._answer()
+        sm._advance_all_mod_submits()
+        self.assertNotIn("modSubmits", sess)
+        self.assertFalse(os.path.exists(self._req_path()))
+        self.assertFalse(os.path.exists(self._req_path("submit.done.json")))
+        self.assertEqual(sm.input_queue, [])
+        self.assertFalse(sm._input_undelivered("s1"))
+
+    def test_without_a_live_mod_it_takes_the_pane(self):
+        cases = [
+            ("no mod at launch", {"bridgeMod": False}, True),
+            ("dsh", {"agentType": "dsh"}, True),
+            ("qwen", {"agentType": "qwen"}, True),
+            ("no turn state", {}, False),
+        ]
+        for label, kw, turn in cases:
+            sm = self.make_manager()
+            path = ha.turn_state_path("s1")
+            if turn:
+                self._turn()
+            elif os.path.exists(path):
+                os.unlink(path)
+            sm.registry = [self._sess(**kw)]
+            self.assertEqual(sm._stage_machine_input("s1", "hi"), "pane", label)
+            self.assertEqual(sm.input_queue, [("s1", "hi", None)], label)
+        # Another conversation's turn state (a /clear, a nested claude) says nothing.
+        sm = self.make_manager()
+        self._turn(csid="other")
+        sm.registry = [self._sess()]
+        self.assertEqual(sm._stage_machine_input("s1", "hi"), "pane")
+
+    def test_a_text_the_mod_would_refuse_takes_the_pane(self):
+        sm, _ = self._setup()
+        # The mod counts UTF-16 units: an astral char is two.
+        self.assertEqual(sm._stage_machine_input("s1", "\U0001F600" * (ha.MOD_SUBMIT_MAX // 2 + 1)), "pane")
+        self.assertEqual(sm._stage_machine_input("s1", "   "), "pane")
+        self.assertEqual(sm._stage_machine_input("s1", "x" * ha.MOD_SUBMIT_MAX), "mod")
+
+    def test_a_failed_submit_falls_back_to_the_pane(self):
+        sm, sess = self._setup()
+        sm._stage_machine_input("s1", "nudge")
+        self._answer(ok=False, error="a hook said no")
+        sm._advance_all_mod_submits()
+        self.assertEqual(sm.input_queue, [("s1", "nudge", None)])
+        self.assertNotIn("modSubmits", sess)
+
+    def test_messages_go_one_at_a_time_in_order_each_with_its_own_id(self):
+        sm, sess = self._setup()
+        sm._stage_machine_input("s1", "first")
+        sm._stage_machine_input("s1", "second")
+        first = self._request()
+        self.assertEqual(first["text"], "first")
+        self._answer()
+        sm._advance_all_mod_submits()
+        second = self._request()
+        self.assertEqual(second["text"], "second", "written in the same pass")
+        self.assertGreater(second["at"], first["at"], "the mod runs each id once")
+        self._answer()
+        sm._advance_all_mod_submits()
+        self.assertNotIn("modSubmits", sess)
+        self.assertEqual(sm.input_queue, [])
+
+    def test_a_stale_answer_is_not_this_requests(self):
+        sm, sess = self._setup()
+        sm._stage_machine_input("s1", "m")
+        self._answer(at=self._request()["at"] - 5)
+        sm._advance_all_mod_submits()
+        self.assertEqual(len(sess["modSubmits"]), 1)
+        self.assertEqual(sm.input_queue, [])
+
+    def test_an_unanswered_request_moves_to_the_pane_only_while_idle(self):
+        sm, sess = self._setup()
+        t0 = 1_000_000_000_000
+        sm._stage_machine_input("s1", "m")
+        limit = ha.MOD_SUBMIT_TIMEOUT_SEC * 1000
+        # A running turn waits however long it runs: the mod submits once idle.
+        self._turn("running")
+        sm._advance_all_mod_submits(now_ms=t0)
+        sm._advance_all_mod_submits(now_ms=t0 + 10 * limit)
+        # So does an interrupted one: the mod waits for the person's next input.
+        self._turn("idle", stopped=True)
+        sm._advance_all_mod_submits(now_ms=t0 + 20 * limit)
+        self.assertEqual(sm.input_queue, [])
+        # Idle and not stopped: the clock starts now, not at the request.
+        self._turn("idle")
+        sm._advance_all_mod_submits(now_ms=t0 + 30 * limit)
+        sm._advance_all_mod_submits(now_ms=t0 + 31 * limit - 1)
+        self.assertEqual(sm.input_queue, [])
+        sm._advance_all_mod_submits(now_ms=t0 + 31 * limit)
+        self.assertEqual(sm.input_queue, [("s1", "m", None)])
+        self.assertFalse(os.path.exists(self._req_path()), "withdrawn, so the mod cannot run it too")
+        self.assertNotIn("modSubmits", sess)
+
+    def test_a_mod_that_stops_answering_hands_over_to_the_pane(self):
+        sm, sess = self._setup()
+        sm._stage_machine_input("s1", "m")
+        os.unlink(ha.turn_state_path("s1"))    # the process no longer carries the mod
+        t0 = 2_000_000_000_000
+        sm._advance_all_mod_submits(now_ms=t0)
+        sm._advance_all_mod_submits(now_ms=t0 + ha.MOD_SUBMIT_TIMEOUT_SEC * 1000)
+        self.assertEqual(sm.input_queue, [("s1", "m", None)])
+
+    def test_a_relaunch_of_the_same_conversation_keeps_the_message(self):
+        sm, sess = self._setup()
+        sm._stage_machine_input("s1", "m")
+        at = self._request()["at"]
+        ha.clear_mod_requests("s1")            # what every launch does
+        sm._advance_all_mod_submits()
+        self.assertEqual(self._request(), {"v": 1, "text": "m", "at": at})
+        self.assertEqual(sm.input_queue, [])
+
+    def test_a_request_that_cannot_be_rewritten_after_a_launch_takes_the_pane(self):
+        # QA: a rewrite failing (ENOSPC, a session-planted dir or link) held the
+        # message forever and blocked a sleeper pause.
+        sm, sess = self._setup()
+        sm._stage_machine_input("s1", "m")
+        ha.clear_mod_requests("s1")
+        os.makedirs(self._req_path())              # submit.json is now a directory
+        sm._advance_all_mod_submits()
+        self.assertEqual(sm.input_queue, [("s1", "m", None)])
+        self.assertNotIn("modSubmits", sess)
+
+    def test_a_new_conversation_drops_the_old_ones_messages(self):
+        sm, sess = self._setup()
+        sm._stage_machine_input("s1", "m")
+        sess["claudeSessionId"] = "new-conversation"   # a clear-context restart
+        sm._advance_all_mod_submits()
+        self.assertNotIn("modSubmits", sess)
+        self.assertEqual(sm.input_queue, [])
+
+    def test_an_ended_session_drops_them(self):
+        sm, sess = self._setup()
+        sm._stage_machine_input("s1", "m")
+        sess["status"] = "stopped"
+        sm._advance_all_mod_submits()
+        self.assertNotIn("modSubmits", sess)
+
+    def test_the_hubs_nudge_goes_to_the_mod_and_the_operators_message_never_does(self):
+        sm, sess = self._setup()
+        sm._permission_close_ask = mock.Mock()
+        self.assertTrue(sm.handle_commands([
+            {"cmdId": "n1", "type": "input", "sessionId": "s1", "text": "you look stuck",
+             "source": "nudge"},
+            {"cmdId": "o1", "type": "input", "sessionId": "s1", "text": "operator words"},
+        ]))
+        self.assertEqual(self._request()["text"], "you look stuck")
+        self.assertEqual(sm.input_queue, [("s1", "operator words", None)])
+        sm._permission_close_ask.assert_called_once_with("s1")   # the operator's only
+
+    def test_a_due_wake_goes_to_the_mod(self):
+        sm, sess = self._setup(wakeAt=1000, wakeReason="check CI")
+        sm._drop_wake_file = mock.Mock()
+        sm._deliver_due_wakes(now_ms=2000)
+        self.assertEqual(self._request()["text"], ha.wake_text("check CI"))
+        self.assertEqual(sm.input_queue, [])
+        self.assertNotIn("wakeAt", sess)
+
+    def test_a_planted_link_at_the_request_dir_is_never_written_through(self):
+        sm, sess = self._setup()
+        folder = ha.mod_request_dir("s1")
+        shutil.rmtree(folder, ignore_errors=True)
+        target = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, target, True)
+        os.makedirs(os.path.dirname(folder), exist_ok=True)
+        os.symlink(target, folder)
+        self.addCleanup(lambda: os.path.islink(folder) and os.unlink(folder))
+        self.assertEqual(sm._stage_machine_input("s1", "m"), "mod")
+        self.assertEqual(os.listdir(target), [])
+        self.assertEqual(sm.input_queue, [("s1", "m", None)], "unwritable: the pane")
 
 
 class TestReconcileRcNamesViaMod(ManagerMixin, unittest.TestCase):

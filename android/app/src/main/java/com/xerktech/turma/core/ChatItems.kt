@@ -219,11 +219,16 @@ fun buildItems(
         // a turn split across blocks must not render as several bubbles.
         var pending: StringBuilder? = null
         var pendingClipped = false
+        // An origin the agent tagged a text block with (hub-agent.py
+        // _plugin_message: a bridge-mod prompt, XERK-2135), as chat.js `tagged`.
+        var pendingTagged: String? = null
         fun flushText() {
             val text = pending?.toString()
             val clipped = pendingClipped
+            val tagged = pendingTagged
             pending = null
             pendingClipped = false
+            pendingTagged = null
             // Any thoughts already folded come BEFORE this bubble in the stream
             // (the web pushes the msg item after the thinking items it followed),
             // so drain the fold first.
@@ -232,7 +237,7 @@ fun buildItems(
             val shown = if (entry.role == "user" && text != null) stripFraming(text) else text
             if (!shown.isNullOrBlank()) {
                 flushFold()
-                val origin = if (entry.role == "user") messageOrigin(text!!) else "operator"
+                val origin = if (entry.role == "user") tagged ?: messageOrigin(text!!) else "operator"
                 out.add(ChatItem.Bubble(entry.key, entry.role, shown, clipped, origin))
             }
         }
@@ -242,6 +247,7 @@ fun buildItems(
                 is TextBlock -> {
                     (pending ?: StringBuilder().also { pending = it }).append(block.text)
                     if (block.truncated) pendingClipped = true
+                    if (block.origin in MSG_ORIGIN_TAGS) pendingTagged = block.origin
                 }
                 is ThinkingBlock -> when (thoughtDisp) {
                     ThoughtDisplay.SHOW -> if (block.text.isNotBlank()) {
@@ -383,6 +389,9 @@ private fun isMarkerNameChar(c: Char): Boolean = isMarkerAlpha(c) || c in '0'..'
  * subagent markers are checked before the generic "Another Claude session"
  * wrapper they sit inside. Keep in step with chat.js.
  */
+/** The origins an agent may tag a text block with — chat.js `MSG_ORIGIN_TAGS`. */
+val MSG_ORIGIN_TAGS = setOf("turma", "system")
+
 fun messageOrigin(text: String): String {
     val t = text
     if (t.contains("[Relayed by Turma")) return "turma"
