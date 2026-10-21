@@ -17504,26 +17504,21 @@ _DIM_SPAN_RE = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)")
 
 
 def _composer_holds_text(styled):
-    """Whether a styled capture's composer holds typed text, not just the
-    dim placeholder; None when there is no composer to read."""
+    """Whether a styled capture's composer may hold typed text: False only
+    when an EMPTY box (or one showing just the dim placeholder) is seen
+    between its two rules; True for a draft, and also whenever the box can't
+    be read whole — a short pane draws only the top rule and the draft's last
+    rows (≤ ~11 rows), the rule alone (≤ 5) or no rule at all (≤ 3), and an
+    empty box looks the same as a draft there (XERK-2157 QA). None only when
+    there is no capture."""
     if styled is None:
         return None
     lines = styled.splitlines()
     plain = [_ANSI_RE.sub("", line) for line in lines]
     rules = [i for i, line in enumerate(plain) if _COMPOSER_RULE_RE.match(line)]
-    if not rules:
-        return None
-    if len(rules) >= 2:
-        rows = lines[rules[-2] + 1:rules[-1]]
-    else:
-        # A short pane (≤ ~11 rows) under a multi-line draft draws the
-        # composer's TOP rule and the draft's last rows, but no bottom rule or
-        # mode footer (XERK-2157 QA). A lone rule over only the mode footer is
-        # a bottom rule whose box is off the top: can't tell.
-        rows = [line for line, bare in zip(lines[rules[0] + 1:], plain[rules[0] + 1:])
-                if not PANE_MODE_RE.search(bare)]
-        if not "".join(_ANSI_RE.sub("", row) for row in rows).strip():
-            return None
+    if len(rules) < 2:
+        return True
+    rows = lines[rules[-2] + 1:rules[-1]]
     text = "".join(_ANSI_RE.sub("", _DIM_SPAN_RE.sub("", row)) for row in rows)
     return bool(text.replace("❯", "").replace("\xa0", "").strip())
 
@@ -34415,7 +34410,10 @@ class SessionManager:
             self.save()
             log(f"set model of {sid} -> {arg}: a dialog is up; deferred until it closes")
             return
-        if _composer_holds_text(_capture_pane_styled(tmux_name)):
+        holds = _composer_holds_text(_capture_pane_styled(tmux_name))
+        # Windows' grid capture carries no styling to read (None): it keeps the
+        # old behaviour. On tmux no capture is "can't tell", which waits too.
+        if holds or (holds is None and not IS_WINDOWS):
             # The operator has a draft in the composer. "/model" + Enter would
             # submit it as a prompt with "/model" glued on, and clearing it
             # first is no better: Ctrl+U kills only what is before the cursor
@@ -34423,7 +34421,8 @@ class SessionManager:
             # retried each beat, ate the operator's edits (XERK-2157 QA). The
             # draft is never touched — as `_type_into_pane` holds rather than
             # clear one; the switch waits until the composer is empty. The dim
-            # placeholder is not a draft (`_composer_holds_text`).
+            # placeholder is not a draft, but a box it can't read whole (a
+            # short pane) is treated as one (`_composer_holds_text`).
             sess["pendingModel"] = arg
             self.save()
             log(f"set model of {sid} -> {arg}: a draft is in the composer; deferred")

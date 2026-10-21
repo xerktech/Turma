@@ -161,6 +161,7 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   - **A draft in the composer defers the switch, untouched** (`_composer_holds_text` over
     `capture-pane -e`; the dim placeholder is no draft). Typed onto, it went out as a prompt;
     never clear it either: Ctrl+U kills only before the cursor and, retried, ate the edits.
+    It goes ahead only on a box SEEN empty: a short pane (≤ ~11 rows) can't show one whole.
 
 ### `setMode` — live permission-mode switch
 

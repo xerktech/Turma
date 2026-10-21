@@ -20618,7 +20618,9 @@ class _PickerPane:
             history = "".join(self.history.splitlines(True)[self.scrolls:])
             return (history +
                     f"  ⎿  Set model to {self.name()} for this session only\n❯ ")
-        return self.history + "❯ \n  ? for shortcuts"  # idle; deliberately no mode marker
+        # Idle: an empty composer box, deliberately with no mode marker.
+        return (self.history + "─" * 40 + "\n❯ \n" + "─" * 40 + "\n"
+                "  ? for shortcuts")
 
 
 class _DraftPane(_PickerPane):
@@ -20723,7 +20725,8 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
                             ("_pane_busy", lambda t: busy),
                             ("_capture_pane", fake_capture),
                             ("_capture_pane_styled",
-                             lambda t: self.pane.styled() if hasattr(self.pane, "styled") else None),
+                             lambda t: self.pane.styled() if hasattr(self.pane, "styled")
+                             else fake_capture(t)),
                             ("MODEL_PICKER_WAIT_SEC", 0),
                             ("MODEL_STEP_WAIT_SEC", 0),
                             ("MODEL_CONFIRM_WAIT_SEC", 0),
@@ -20954,6 +20957,20 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self.assertEqual(self._keys()[:2], ["C-u", "/model"])
         self.assertEqual(sess["model"], "sonnet")
 
+    def test_set_model_defers_when_the_composer_cannot_be_seen(self):
+        # A pane 5 rows or shorter draws no readable box (XERK-2157 QA: a
+        # draft there was submitted), and a failed styled capture is
+        # "can't tell": both wait rather than type onto what might be a draft.
+        for styled in ("● ok\n\n" + "─" * 40 + "\n", None):
+            self.run_calls.clear()
+            pane = _PickerPane()
+            pane.styled = lambda styled=styled: styled
+            sm = self.make_manager(pane=pane)
+            sess = self._session(sm, model=None)
+            sm.set_model("abcde", "sonnet")
+            self.assertEqual(self.run_calls, [])
+            self.assertEqual(sess["pendingModel"], "sonnet")
+
     def test_composer_holds_text_reads_the_dim_placeholder_as_empty(self):
         rule = "─" * 30 + "\n"
         box = lambda row: rule + row + "\n" + rule
@@ -20970,10 +20987,12 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self.assertIs(ha._composer_holds_text(
             "  ⎿  Set model to Sonnet 5.5 for this session only\n\n" + rule
             + "❯\xa0QATALL line 44\n  QATALL line 45\n  QATALL last\n"), True)
-        # A lone rule over only the mode footer: its box is off the top.
-        self.assertIsNone(ha._composer_holds_text(
-            "  QATALL last\n" + rule + "  ⏵⏵ auto mode on (shift+tab to cycle)\n"))
-        self.assertIsNone(ha._composer_holds_text("no composer\n"))
+        # At 5 rows or fewer an empty box and a draft look alike (a lone rule,
+        # or none): not proven empty, so it holds.
+        self.assertIs(ha._composer_holds_text("● ok\n\n" + rule), True)
+        self.assertIs(ha._composer_holds_text(
+            "  QATALL last\n" + rule + "  ⏵⏵ auto mode on (shift+tab to cycle)\n"), True)
+        self.assertIs(ha._composer_holds_text("no composer\n"), True)
         self.assertIsNone(ha._composer_holds_text(None))
 
     def test_set_model_never_confirms_off_a_picker_still_drawn(self):
