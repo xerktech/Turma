@@ -2221,6 +2221,34 @@ test("renderProse: a standalone <svg> block renders as a data-URI <img>, not tex
   assert.match(html, /%3Csvg/); // encodeURIComponent turned "<svg" into "%3Csvg"
 });
 
+test("XERK-2161: a viewBox-only SVG is sized to fill the bubble at its ratio", () => {
+  const sizeOf = (html) => (/<img [^>]*width="(\d+)" height="(\d+)"/.exec(html) || []).slice(1).map(Number);
+  // A raw block: width = the width at the 420px max-height, so max-width narrows it.
+  assert.deepEqual(sizeOf(renderProse('<svg viewBox="0 0 200 100"><rect/></svg>')), [840, 420]);
+  // Commas as separators, a percentage size (still no intrinsic size).
+  assert.deepEqual(sizeOf(renderProse('<svg width="100%" viewBox="0,0,24,48"><rect/></svg>')), [210, 420]);
+  // A markdown data: image, percent-encoded or base64, gets the same.
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 5"/>';
+  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml," + encodeURIComponent(svg) + ")")), [840, 420]);
+  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml;base64," + Buffer.from(svg).toString("base64") + ")")), [840, 420]);
+  // A declared size, a zero size, no viewBox, a bad viewBox, a bitmap, a bad URI: untouched.
+  for (const t of [
+    '<svg width="80" height="40" viewBox="0 0 200 100"><rect/></svg>',
+    '<svg width="0" viewBox="0 0 200 100"><rect/></svg>',
+    '<svg height="30"  viewBox="0 0 200 100"><rect/></svg>',
+    '<svg><rect/></svg>',
+    '<svg viewBox="0 0 0 100"><rect/></svg>',
+    '<svg viewBox="0 0 abc 100"><rect/></svg>',
+  ]) assert.deepEqual(sizeOf(renderProse(t)), [], t);
+  assert.deepEqual(sizeOf(linkify("![a](data:image/png;base64,iVBORw0KGgo=)")), []);
+  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml,%E0%A4%A)")), []);
+  // SendUserFile previews too.
+  const file = withVerbosity("normal", () => itemsToHtml(suItems([
+    { name: "c.svg", kind: "image", src: "data:image/svg+xml," + encodeURIComponent(svg) },
+  ])));
+  assert.deepEqual(sizeOf(file), [840, 420]);
+});
+
 test("renderProse: a fenced SVG document renders as an image, not a code block", () => {
   const html = renderProse("```svg\n<svg><circle r=\"1\"/></svg>\n```");
   assert.match(html, /<img class="md-img md-svg"/);
