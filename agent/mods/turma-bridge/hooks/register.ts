@@ -176,8 +176,10 @@ async function peersText($: EngineInterface): Promise<string> {
   // Ids are unique per host only: "you" is the row matching both.
   const mine = (r: string[]) => r[0] === me && r[2] === host
   const ordered = [...rows.filter(mine), ...rows.filter(r => !mine(r))]
+  // The roster writes "-" for an empty cell (hub-agent.py _peer_cell).
+  const val = (v: string | undefined) => (v === '-' ? '' : v)
   const lines = ordered.slice(0, PEER_ROWS_MAX).map(r => {
-    const [, name, h, repo, branch, task] = r
+    const [name, h, repo, branch, task] = r.slice(1).map(val)
     const mark = mine(r) ? ' (you)' : ''
     const where = [cell(h), cell(repo)].filter(Boolean).join('/')
     const br = cell(branch) ? ` [${cell(branch)}]` : ''

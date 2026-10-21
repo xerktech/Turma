@@ -18840,7 +18840,8 @@ def mod_status(sess, payload):
         "name": payload.get("rcName"),
         "summary": payload.get("summary"),
         "ticket": ({k: ticket.get(k) for k in ("key", "url", "summary")} if ticket else None),
-        "branch": git.get("branch") or None,
+        # A detached worktree reads "HEAD": no branch, not one named HEAD.
+        "branch": (git.get("branch") if git.get("branch") not in (None, "", "HEAD") else None),
         "prs": prs,
         "wakeAt": sess.get("wakeAt"),
         "wakeReason": sess.get("wakeReason"),
