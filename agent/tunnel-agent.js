@@ -253,7 +253,7 @@ function tnPreview(tn) {
 // stdout/stderr) also land as user-role turns of raw XML. Parse them into
 // {kind:"caveat"|"command"|"output"} so entryBlocks can render a chip / output
 // card and drop the caveat. Mirror of hub-agent.py _parse_local_command.
-const LOCAL_COMMAND_CAVEAT_RE = /^\s*<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*$/;
+const LOCAL_COMMAND_CAVEAT_RE = /^[ \t\r\n]*<local-command-caveat>[\s\S]*?<\/local-command-caveat>[ \t\r\n]*$/;
 const COMMAND_NAME_RE = /<command-name>([\s\S]*?)<\/command-name>/;
 const COMMAND_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
 // GREEDY, to the LAST closing tag (the output is written unescaped), and a turn

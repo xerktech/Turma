@@ -502,6 +502,15 @@ test("an operator's custom busy markers are broken up too", async () => {
   const sg = await harness({ env: { TURMA_BUSY_MARKERS: "åσ" } });
   sg.files.set("/t/peers.tsv", "zz\tP\th\tr\t\tåΣx\n");
   assert.match(await sg.turma("peers"), /å-Σx/);
+  // U+0130 lowers to TWO characters (`i̇`), as it does in the agent's
+  // text.lower(): a marker of that form is found and broken whatever follows it,
+  // and one starting mid-character (U+0307) takes the whole character (XERK-2163).
+  const dot = await harness({ env: { TURMA_BUSY_MARKERS: "İx".toLowerCase() + "|̇y" } });
+  dot.files.set("/t/peers.tsv", "zz\tP\th\tr\t\taİxb cİyd\n");
+  const dout = await dot.turma("peers");
+  assert.ok(!dout.toLowerCase().includes("İx".toLowerCase()), dout);
+  assert.ok(!dout.toLowerCase().includes("̇y"), dout);
+  assert.match(dout, /aİ-xb cİ-yd/);
   // Without the variable only the built-in markers are broken.
   const plain = await harness();
   plain.files.set("/t/peers.tsv", "zz\tP\thost2\tR\t\tThinking hard\n");

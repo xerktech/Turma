@@ -260,6 +260,13 @@ test("parseLocalCommand: caveat / invocation / stdout / stderr, ignores non-comm
   assert.equal(parseLocalCommand("just a normal prompt"), null);
   assert.equal(parseLocalCommand("talk about <command-name> inline"), null);
   assert.equal(parseLocalCommand("why does <local-command-caveat>x</local-command-caveat> show up?"), null);
+  // Only ASCII whitespace may surround a caveat: JS's \s takes U+FEFF and
+  // Python's takes U+001C, so neither class is used (XERK-2163).
+  for (const lead of ["\ufeff", "\x1c"]) {
+    assert.equal(parseLocalCommand(lead + COMMAND_CAVEAT), null);
+    assert.equal(parseLocalCommand(COMMAND_CAVEAT + lead), null);
+  }
+  assert.deepEqual(parseLocalCommand(" \t\r\n" + COMMAND_CAVEAT + "\n"), { kind: "caveat" });
   assert.equal(parseLocalCommand(""), null);
 });
 

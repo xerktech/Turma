@@ -5119,6 +5119,15 @@ class TestLocalCommand(unittest.TestCase):
         text = "why does <local-command-caveat>x</local-command-caveat> show up?"
         self.assertIsNone(ha._parse_local_command(text))
 
+    def test_caveat_lead_is_ascii_whitespace_only(self):
+        # Python's \s takes U+001C and U+FEFF and JS's does not; the explicit
+        # class keeps tunnel-agent.js's parseLocalCommand in step (XERK-2163).
+        for lead in ("\ufeff", "\x1c"):
+            self.assertIsNone(ha._parse_local_command(lead + COMMAND_CAVEAT))
+            self.assertIsNone(ha._parse_local_command(COMMAND_CAVEAT + lead))
+        self.assertEqual(ha._parse_local_command(" \t\r\n" + COMMAND_CAVEAT + "\n"),
+                         {"kind": "caveat"})
+
     def test_blocks_drop_the_caveat_entirely(self):
         entry = {"type": "user", "isMeta": True, "message": {"content": COMMAND_CAVEAT}}
         self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [])
@@ -24135,6 +24144,45 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
             sm._stage_history(sess["id"])
         ids = [e["id"] for e in sm.history_results[0]["entries"]]
         self.assertEqual(ids, ["b1", "o1", "b2", "o2", "a0", "a1"])
+
+    def test_a_window_starting_at_a_bang_output_keeps_its_command(self):
+        # XERK-2163: the entry window can start exactly at a `!` command's
+        # output; the operator rescue puts the command right back ahead of it.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        write_jsonl(os.path.join(proj, "t.jsonl"), [
+            {"uuid": "a0", "type": "assistant",
+             "message": {"content": [{"type": "text", "text": "t0"}]}},
+            {"uuid": "b0", "type": "user", "message": {"content": "<bash-input>ls</bash-input>"}},
+            {"uuid": "o0", "type": "user", "message": {"content": "<bash-stdout>x</bash-stdout>"}},
+            {"uuid": "a1", "type": "assistant",
+             "message": {"content": [{"type": "text", "text": "t1"}]}},
+        ])
+        with mock.patch.object(ha, "HISTORY_MAX_MSGS", 2):
+            sm._stage_history(sess["id"])
+        ids = [e["id"] for e in sm.history_results[0]["entries"]]
+        self.assertEqual(ids, ["b0", "o0", "a1"])
+
+    def test_the_byte_trim_never_keeps_a_bang_output_without_its_command(self):
+        # XERK-2163: the byte budget cuts oldest-first; a cut landing between a
+        # `!` command and its output drops the orphaned output too. The newest
+        # row still survives alone.
+        def row(rid, blocks, pad=0):
+            return {"id": rid, "role": "user", "text": "x" * pad, "blocks": blocks}
+        bang = [{"t": "command", "name": "!", "args": "ls"}]
+        out = [{"t": "command_output", "text": "x"}]
+        rows = [row("b0", bang, pad=400), row("o0", out), row("a0", [{"t": "text", "text": "t"}])]
+        budget = ha._json_bytes(rows[1]) + ha._json_bytes(rows[2]) + 10
+        with mock.patch.object(ha, "HISTORY_MAX_BYTES", budget):
+            kept, cut = ha._fit_history_budget([dict(r) for r in rows])
+            self.assertEqual([r["id"] for r in kept], ["a0"])
+            self.assertTrue(cut)
+            kept, _ = ha._fit_history_budget([dict(r) for r in rows[1:]])
+            self.assertEqual([r["id"] for r in kept], ["o0", "a0"])
+        with mock.patch.object(ha, "HISTORY_MAX_BYTES", 1):
+            kept, _ = ha._fit_history_budget([dict(r) for r in rows[:2]])
+            self.assertEqual([r["id"] for r in kept], ["o0"])
 
     def test_empty_transcript_file(self):
         sm = self.make_manager()

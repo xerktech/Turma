@@ -35,7 +35,7 @@ Split out of `agent.md` (size ceiling).
   (renderers say "(no output)") and flat text `NO_OUTPUT_TEXT`; without it `! true` read like a
   pending command. A slash command's empty stdout still drops (most print none), and so does
   prose QUOTING empty bash tags: the flag needs the turn to OPEN with the tag.
-- The tag-lead regexes take `[ \t\r\n]`, never `\s`: python's and JS's `\s` differ (parity).
+- The tag-lead and caveat regexes take `[ \t\r\n]`, never `\s`: python's and JS's `\s` differ.
 - **Slash output is read to its LAST closing tag**: Claude Code writes it UNESCAPED, so output
   printing `</local-command-stdout>` lost its tail. A turn OPENING with an output tag is output: a
   `<command-name>`/`<bash-*>`/other-stream tag inside its body is text.
