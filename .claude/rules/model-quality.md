@@ -176,9 +176,9 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     shadow bad while the live row is not bad (the promotion rule's numerator, XERK-1848). The
     same evidence rides each group as `shadow: {pairs, candidateOnlyBad, …}` (what the XERK-1849
     card reads); a candidate with no live sessions gets a zero-session group carrying it.
-  - Agent (`spawn_shadow` → `_advance_shadow_runs`): RUN session on the candidate from the merge's
-    first parent, blind (comments after the live session started are dropped, no attachments, no
-    fetch directive); `shadow-done` (or its end/timeout) commits leftovers and hands the HEAD to an
+  - Agent (`spawn_shadow` → `_advance_shadow_runs`): RUN session on the candidate from the code
+    before the PR (`shadow_base_commit`), blind (comments after the live session started are
+    dropped, no attachments, no fetch directive); `shadow-done` (or its end/timeout) commits leftovers and hands the HEAD to an
     Opus GRADE session; `shadow-grade` makes it terminal. A run with no change is graded bad
     without a grader. One session teardown per beat; the `turma-shadow/<id>` branch is dropped.
   - **Never a `ticket` block on either session** (and `_maybe_adopt_ticket` refuses a shadow), so
@@ -228,6 +228,12 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   - **Kept as the ACCIDENT layer**: `SHADOW_ENV` (empty `pushInsteadOf`, blanked tokens,
     `--strict-mcp-config`) and the guard's `shadow_reason` (`agent-hooks.md`) turn an
     accidental push into a readable refusal instead of a network error. Never drop them.
+  - **The base is the merge's first parent, EXCEPT a GitHub rebase-merge** (XERK-2136): its
+    `mergeCommit` is the last of N rewritten commits, so `^1` already holds the rest. The one
+    fetch also pulls `refs/pull/<n>/head` (into `refs/turma-shadow-pr/<id>`, deleted after);
+    when the N first-parent commits carry the PR's N messages in order, the base is `merge~N`.
+    A squash or merge commit keeps `^1`. Can't read the head, N=0, or N over
+    `SHADOW_PR_COMMITS_MAX` → the run fails, never a guessed base. GitLab/ADO keep `^1`.
   - The request-dir allowance is per session, so a run can no longer write its grader's
     `shadow-grade.json`.
   - Residuals: no repo skills in a shadow (parity cost); enforcement itself is HOST-PROOF — CI and the k8x pods have no unprivileged user
