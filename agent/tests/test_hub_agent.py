@@ -50671,6 +50671,32 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm._shadow_placing, {})
         self.assertIn("could not start", sm.shadow_runs[self.RID]["error"])
 
+    def test_a_restart_mid_placement_reports_a_failed_run(self):
+        # XERK-2148: the placement is saved before the command is acked, so a
+        # manager restart mid-placement reports the run failed instead of
+        # leaving it unreported (counted against the hub's daily cap).
+        sm = self.make_manager()
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+
+        def slow_base(*a):
+            gate.wait(10)
+            return self.BASE, None
+        with mock.patch.object(ha, "shadow_base_commit", slow_base):
+            sm.handle_commands([dict(self.cmd(), cmdId="c1")])
+            restarted = self.make_manager()
+        r = restarted.shadow_runs[self.RID]
+        self.assertEqual((r["state"], r["error"], r["issueKey"], r["model"]),
+                         ("failed", ha.SHADOW_PLACING_LOST, "PROJ-7", "sonnet"))
+        self.assertEqual(restarted.shadow_runs_report()[0]["state"], "failed")
+        # A re-delivered command (it was never acked) may still place it.
+        restarted._launch_ttyd = mock.Mock()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
+            self.shadow(restarted, self.cmd())
+        self.assertEqual(restarted.shadow_runs[self.RID]["state"], "running")
+        # Launched, it no longer reads as lost on the next restart.
+        self.assertEqual(self.make_manager().shadow_runs[self.RID]["state"], "running")
+
     def spawned(self):
         sm = self.make_manager()
         sm._launch_ttyd = mock.Mock()

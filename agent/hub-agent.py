@@ -19652,6 +19652,9 @@ SHADOW_GRADE_TIMEOUT_SEC = _env_int("TURMA_SHADOW_GRADE_TIMEOUT_SEC", 2 * 3600, 
 # A terminal record is reported for this long (the hub's ledger is durable), then dropped.
 SHADOW_KEEP_SEC = 3 * 86400
 SHADOW_ID_RE = re.compile(r"sh-[0-9a-f]{8,32}")
+# The failure a run still being placed when the manager stopped is loaded as
+# (XERK-2148). A re-delivery of its spawnShadow may place it again.
+SHADOW_PLACING_LOST = "the manager restarted before the shadow was launched"
 SHADOW_SHA_RE = re.compile(r"[0-9a-f]{40}")
 SHADOW_GRADER_MODEL = "opus"
 SHADOW_NOTE_MAX = 2000
@@ -25813,8 +25816,8 @@ class SessionManager:
         self.shadow_runs = self._load_shadow_runs()
         # spawnShadows whose base is being placed off the beat (XERK-2167):
         # id -> job; the worker adds `result`, the beat pops and launches it.
-        # In memory: a restart mid-placement loses the run, which the hub stops
-        # counting once it goes unreported (shadowsDispatchedSince).
+        # Each is also saved as a `_placing` marker in shadow-runs.json before
+        # the command is acked, which a restart loads as a failed run.
         self._shadow_placing = {}
         self._shadow_place_lock = threading.Lock()
         self._epic_builders_lock = threading.Lock()
@@ -30645,6 +30648,24 @@ class SessionManager:
                 "error", "startedAt", "phaseAt", "endedAt", "modelActual", "ticketText",
                 "branchDropped")
                 if r.get(k) is not None}
+        # A run still being placed when the manager stopped (XERK-2148): its
+        # placement died with the process, so it is reported failed rather than
+        # left unreported, counting toward the hub's daily cap until it is lost.
+        placing = (data or {}).get("_placing")
+        now = time.time()
+        for rid, m in (placing.items() if isinstance(placing, dict) else ()):
+            if not (isinstance(rid, str) and SHADOW_ID_RE.fullmatch(rid)
+                    and isinstance(m, dict)) or rid in out:
+                continue
+            at = m.get("startedAt")
+            if not isinstance(at, (int, float)) or isinstance(at, bool):
+                at = now
+            out[rid] = {"id": rid, "siteKey": str(m.get("siteKey") or "")[:200],
+                        "issueKey": str(m.get("issueKey") or "")[:64],
+                        "model": str(m.get("model") or "")[:40], "startedAt": at,
+                        "state": "failed", "error": SHADOW_PLACING_LOST,
+                        "endedAt": now, "phaseAt": now}
+            log(f"shadow run {rid} failed: {SHADOW_PLACING_LOST}")
         return out
 
     def _save_shadow_runs(self):
@@ -30654,6 +30675,11 @@ class SessionManager:
             data = dict(self.shadow_runs)
             data["_sessions"] = {"sids": self.shadow_sids[-SHADOW_SESSIONS_KEEP:],
                                  "tids": self.shadow_tids[-SHADOW_SESSIONS_KEEP:]}
+            with self._shadow_place_lock:
+                data["_placing"] = {
+                    rid: {"siteKey": j["cmd"].get("siteKey"), "issueKey": j["key"],
+                          "model": j["model"], "startedAt": j["at"]}
+                    for rid, j in self._shadow_placing.items()}
             with open(tmp, "w") as f:
                 json.dump(data, f)
             os.replace(tmp, SHADOW_RUNS_PATH)
@@ -30707,7 +30733,9 @@ class SessionManager:
             log(f"spawnShadow with a bad id {rid[:40]!r} — ignored")
             return
         with self._shadow_place_lock:
-            if rid in self.shadow_runs or rid in self._shadow_placing:
+            prev = self.shadow_runs.get(rid)
+            if rid in self._shadow_placing or (
+                    prev and prev.get("error") != SHADOW_PLACING_LOST):
                 return   # a re-delivered command
         if not MODEL_SHADOW:
             return self._fail_shadow(rid, cmd, "shadow runs are off on this host")
@@ -30732,11 +30760,13 @@ class SessionManager:
         if not repo or not repo_forkable(repo["path"]):
             return self._fail_shadow(rid, cmd, "the repo is not cloned on this host")
         job = {"rid": rid, "cmd": cmd, "key": key, "model": model, "merge": merge,
-               "repo": repo}
+               "repo": repo, "at": time.time()}
         # Marked BEFORE the thread starts, so a re-delivery in this same batch
-        # is already a no-op.
+        # is already a no-op; saved before the command is acked (the next
+        # heartbeat), so a restart mid-placement reports a failed run.
         with self._shadow_place_lock:
             self._shadow_placing[rid] = job
+        self._save_shadow_runs()
         try:
             threading.Thread(target=self._place_shadow, args=(job,),
                              name="shadow-place", daemon=True).start()
