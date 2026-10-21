@@ -4943,6 +4943,9 @@ _GUARD_ALLOW_PATH_RULES = [
 # and prints a warning per rule, so each session's pane opened with seven lines
 # of noise — the first thing the operator sees, in the same pane the agent
 # scrapes for its busy/mode signals. Do not add `Write(...)` twins back.
+# Also dropped from a shadow's copy (build_shadow_settings).
+SESSION_REQUESTS_DENY_RULE = "Edit(~/.turma/session-requests/**)"
+
 _GUARD_DENY_PATH_RULES = [
     "Edit(~/.ssh/**)",
     "Edit(~/.aws/**)",
@@ -5080,7 +5083,7 @@ _GUARD_DENY_PATH_RULES = [
     # File-edit tools only, like its neighbours — Bash still writes it (that is
     # how the CLI works), which is why the manager reads every file in it as
     # untrusted (_read_untrusted_json).
-    "Edit(~/.turma/session-requests/**)",
+    SESSION_REQUESTS_DENY_RULE,
     # The shadow-run ledger (XERK-1847): a session must not rewrite the record
     # of its own (or another) run — the manager re-validates it on load anyway.
     "Edit(~/.turma/shadow-runs.json)",
@@ -6014,8 +6017,11 @@ def shadow_sandbox_reason():
             reason = "bubblewrap and socat are needed for the shadow sandbox"
         else:
             try:
+                # --unshare-user as Claude Code's own sandbox passes it: bwrap run as
+                # root creates no user namespace unless asked, and without
+                # CAP_SYS_ADMIN (a container's root) every other namespace then fails.
                 p = subprocess.run(
-                    [bwrap, "--ro-bind", "/", "/", "--dev", "/dev", "--unshare-net",
+                    [bwrap, "--unshare-user", "--ro-bind", "/", "/", "--dev", "/dev", "--unshare-net",
                      "--unshare-pid", "--proc", "/proc", "--", "true"],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE, timeout=SHADOW_SANDBOX_PROBE_TIMEOUT_SEC)
@@ -6230,6 +6236,13 @@ def build_shadow_settings(guard, worktree, request_dir, git_dirs,
     }
     perms = s.setdefault("permissions", {})
     deny = perms.setdefault("deny", [])
+    # Claude Code merges Edit() deny rules into the sandbox's denyWrite, and a
+    # deny beats allowWrite: the guard's session-requests rule made the shadow's
+    # OWN request dir read-only, so `shadow-done` could never land (XERK-1864,
+    # driven on k8x). Dropped here only: the sandbox writes nothing outside cwd
+    # and allowWrite (no sibling's dir), and fileguard's shadow root keeps the
+    # file tools inside the worktree.
+    deny[:] = [r for r in deny if r != SESSION_REQUESTS_DENY_RULE]
     for rule in ["WebFetch", "WebSearch"] + [f"Edit({p})" for p in deny_write] \
             + [f"Edit({p}/**)" for p in deny_write]:
         if rule not in deny:

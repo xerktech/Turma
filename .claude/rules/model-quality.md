@@ -239,6 +239,9 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     it via `shadow_sandbox_available` (probe on its own thread, a failure re-probed hourly). Never add
     bubblewrap to a host just for this without checking the operator's own `sandbox.enabled`:
     it switches every session's Bash onto the sandbox there.
+  - **The probe passes `--unshare-user`**, as Claude Code's sandbox does: bwrap as root makes no
+    user namespace unless asked, and a container's root (no CAP_SYS_ADMIN) then fails every other
+    namespace ("Creating new namespace failed") — what kept the k8x pods reporting no sandbox.
   - **Kept as the ACCIDENT layer**: `SHADOW_ENV` (empty `pushInsteadOf`, blanked tokens,
     `--strict-mcp-config`) and the guard's `shadow_reason` (`agent-hooks.md`) turn an
     accidental push into a readable refusal instead of a network error. Never drop them.
@@ -276,9 +279,15 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     dropped as already applied) reads as a squash and keeps `^1` — the residual.
   - The request-dir allowance is per session, so a run can no longer write its grader's
     `shadow-grade.json`.
-  - Residuals: no repo skills in a shadow (parity cost); enforcement itself is HOST-PROOF — CI and the k8x pods have no unprivileged user
-    namespaces. On the first host with bwrap check: no network, `.git`/gitdir unwritable, the
-    seccomp helper present (Claude Code's `/sandbox` Dependencies tab), tmux socket unreachable.
+  - Residuals: no repo skills in a shadow (parity cost); enforcement is HOST-PROOF (CI has no
+    unprivileged user namespaces). Driven by hand on k8x-02 (XERK-1864, claude 2.1.306): network
+    denied (github, raw IP, kubectl), `.git`/`.claude`/gitdir and `/tmp/claude-0` unwritable,
+    tmux/cc-socks dirs empty, AF_UNIX connect EPERM (seccomp); worktree, TMPDIR and the request dir
+    writable. Reads are open (`~/.claude` creds readable): the boundary is publish, not read.
+  - **Claude Code merges `Edit()` deny rules into the sandbox's denyWrite, and deny beats
+    allowWrite**: the guard's `Edit(~/.turma/session-requests/**)` made the shadow's own request
+    dir read-only, so `shadow-done` failed. `build_shadow_settings` drops that one rule
+    (`SESSION_REQUESTS_DENY_RULE`); a new guard Edit deny over an allowWrite path needs the same.
   - **A shadow is never resumed, migrated or paused** (`resume`, `_resume_at_cwd`,
     `export_session`, `_sleeper_unpausable`, hub `sleeperPausable`): relaunched it would carry none
     of its launch protections. The closed record keeps `shadow`, and every shadow session and
