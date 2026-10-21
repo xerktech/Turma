@@ -24398,9 +24398,9 @@ MODEL_PICKER_MAX_STEPS = 12
 MODEL_STEP_TRIES = 8
 MODEL_STEP_WAIT_SEC = 0.12
 MODEL_CONFIRM_TRIES = 15
-# Ctrl+U clears one composer row a press, so a multi-line draft takes several;
+# Ctrl+U empties a composer row, then removes it: two presses a draft line;
 # set_model presses until the composer stops changing, at most this many.
-MODEL_CLEAR_MAX_PRESSES = 20
+MODEL_CLEAR_MAX_PRESSES = 40
 MODEL_CONFIRM_WAIT_SEC = 0.2
 # What the TUI prints once a picker selection lands (session-only or saved
 # default) or is dismissed on the current model: "Set model to Sonnet 5.5 for
@@ -34445,11 +34445,13 @@ class SessionManager:
 
     def _clear_model_composer(self, tmux_name):
         """Clear the composer before typing "/model": Ctrl+U until it stops
-        changing. One press clears only the last row of a multi-line draft, so
-        one press left the rest to be submitted with "/model" glued on. A press
-        that changes nothing means it is empty (or shows only a placeholder);
-        an unreadable composer keeps the old single press. False when it is
-        still changing after MODEL_CLEAR_MAX_PRESSES."""
+        changing. Each draft line takes TWO presses on 2.1.306 (one empties the
+        row, the next removes it), so one press left the rest to be submitted
+        with "/model" glued on. Compared as drawn ROWS, never as joined text:
+        "L1" over an empty row and "L1" alone join alike. A press that changes
+        nothing means it is empty (or shows only a placeholder); an unreadable
+        composer keeps the old single press. False when it is still changing
+        after MODEL_CLEAR_MAX_PRESSES."""
         _pane_send_keys(tmux_name, "C-u")
         prev = None
         for _ in range(MODEL_CLEAR_MAX_PRESSES):
@@ -34457,10 +34459,13 @@ class SessionManager:
             rows = _composer_rows(_capture_pane(tmux_name))
             if rows is None:
                 return True
+            rows = [row.rstrip() for row in rows]
             text = " ".join(" ".join(rows).split()).lstrip("❯").strip()
-            if not text or text == prev:
+            if not text and len(rows) <= 1:
                 return True
-            prev = text
+            if rows == prev:
+                return True
+            prev = rows
             _pane_send_keys(tmux_name, "C-u")
         return False
 

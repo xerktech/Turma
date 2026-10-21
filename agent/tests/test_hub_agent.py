@@ -20622,8 +20622,9 @@ class _PickerPane:
 
 
 class _DraftPane(_PickerPane):
-    """A picker pane whose idle composer is boxed in rules and holds a draft;
-    each Ctrl+U clears its last row, as Claude Code's does (XERK-2157 QA)."""
+    """A picker pane whose idle composer is boxed in rules and holds a draft.
+    Ctrl+U behaves as 2.1.306's (measured by XERK-2157 QA): a press empties
+    the last row, the next removes the emptied row."""
 
     def __init__(self, draft, deaf=False, **kw):
         super().__init__(**kw)
@@ -20632,10 +20633,12 @@ class _DraftPane(_PickerPane):
 
     def key(self, key):
         if key == "C-u" and not self.deaf and not (self.open or self.asking):
-            if self.draft:
+            if self.draft and self.draft[-1]:
+                self.draft[-1] = ""
+            elif self.draft:
                 self.draft.pop()
             return
-        if key == "Enter" and not self.open and self.draft and not self.deaf:
+        if key == "Enter" and not self.open and any(self.draft) and not self.deaf:
             self.submitted = list(self.draft)   # "/model" sent glued to it
             return
         super().key(key)
@@ -20909,9 +20912,9 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         sm = self.make_manager(pane=pane)
         sess = self._session(sm, model=None)
         sm.set_model("abcde", "sonnet")
-        self.assertEqual(pane.draft, [])
+        self.assertFalse(any(pane.draft))
         self.assertFalse(hasattr(pane, "submitted"))
-        self.assertEqual(self._keys()[:4], ["C-u", "C-u", "C-u", "/model"])
+        self.assertGreaterEqual(self._keys().index("/model"), 5)
         self.assertEqual(sess["model"], "sonnet")
 
     def test_set_model_goes_on_past_a_placeholder_ctrl_u_cannot_change(self):
