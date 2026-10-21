@@ -49060,6 +49060,20 @@ class TestShadowBase(unittest.TestCase):
         merge = self.land()
         self.assertEqual(self.base(merge, 12), (before, None))
 
+    def test_a_slow_fetch_failure_is_not_retried(self):
+        # A dead origin (the fetch ran to its timeout) costs one fetch, not two.
+        fetches = []
+        ticks = [0.0]
+        def clock():                     # every read moves a whole timeout on
+            ticks[0] += ha.FETCH_TIMEOUT_SEC
+            return ticks[0]
+        with mock.patch.object(ha, "run_ok", lambda cmd, **k: (fetches.append(cmd), (1, ""))[1]
+                               if "fetch" in cmd else (0, "")), \
+                mock.patch.object(ha.time, "monotonic", clock):
+            base, why = self.base("f" * 40, 16)
+        self.assertEqual(len(fetches), 1)
+        self.assertEqual(why, "the merge commit is not in this clone")
+
     def test_a_pr_already_on_the_default_branch_or_too_long_fails_closed(self):
         self.commit("h1")                       # the PR's commits landed as themselves
         merge = self.commit("h2")
