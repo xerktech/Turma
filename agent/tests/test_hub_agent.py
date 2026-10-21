@@ -10533,6 +10533,13 @@ class TestHintDialogIsABlockingDialog(unittest.TestCase):
                + "─" * 140 + "\n  ⏸ manual mode on\n")
         self.assertFalse(ha._hint_dialog_up(cap))
 
+    def test_a_toast_over_the_mode_footer_does_not_reach_the_reply(self):
+        # QA delta: "Press Ctrl-C again to exit" replaces the mode marker for a
+        # second or two; the reply above the composer quotes the footer.
+        cap = ("● ok\n  Esc to cancel\n\n" + "─" * 60 + "\n❯\n" + "─" * 60
+               + "\n  Press Ctrl-C again to exit\n")
+        self.assertFalse(ha._hint_dialog_up(cap))
+
     def test_a_footer_wrapped_onto_five_lines_is_read(self):
         # The elicitation footer at 20 columns (QA capture).
         cap = ("    Accept\n           Decline\n\n  Esc to cancel ·\n"

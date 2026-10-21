@@ -18246,7 +18246,13 @@ def _hint_dialog_up(cap):
         return False
     lines = [_PANE_SCROLLBAR_RE.sub("", line).strip()
              for line in _ANSI_RE.sub("", cap).splitlines()]
-    tail = [line for line in lines if line][-_DIALOG_HINT_LINES:]
+    # Only what sits below the last rule: a dialog's footer is never split by
+    # one, while the composer is boxed in rules — so a footer-replacing toast
+    # ("Press Ctrl-C again to exit", which hides the mode marker) cannot reach
+    # back past the composer to a reply line that quotes the footer.
+    last_rule = max((i for i, line in enumerate(lines)
+                     if line and PANE_PROMPT_RULE_RE.match(line)), default=-1)
+    tail = [line for line in lines[last_rule + 1:] if line][-_DIALOG_HINT_LINES:]
     joined = " ".join(tail)
     if not tail or PANE_MODE_RE.search(joined) or QWEN_PANE_FOOTER_RE.search(joined):
         return False
