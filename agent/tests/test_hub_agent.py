@@ -10525,6 +10525,20 @@ class TestHintDialogIsABlockingDialog(unittest.TestCase):
         self.assertTrue(ha._hint_dialog_up(_2142_PICKER_40))
         self.assertFalse(ha._hint_dialog_up("x · Esc\nto\ncancel\n"))
 
+    def test_a_composer_draft_ending_in_the_footer_is_not_one(self):
+        # A real 2.1.306 frame (QA): the operator's two-line draft ends on
+        # "Esc to cancel", so only the mode footer among the tail lines tells
+        # it from a dialog.
+        cap = ("─" * 140 + "\n❯ operator note line one\n  Esc to cancel\n"
+               + "─" * 140 + "\n  ⏸ manual mode on\n")
+        self.assertFalse(ha._hint_dialog_up(cap))
+
+    def test_a_footer_wrapped_onto_five_lines_is_read(self):
+        # The elicitation footer at 20 columns (QA capture).
+        cap = ("    Accept\n           Decline\n\n  Esc to cancel ·\n"
+               "  ↑/↓ to navigate\n  · Backspace to\n  unset · → to\n  expand\n")
+        self.assertTrue(ha._hint_dialog_up(cap))
+
     def test_a_composer_is_never_one(self):
         for cap in (_2142_COMPOSER_QUOTING, LINUX_COMPOSER_PANE):
             self.assertFalse(ha._hint_dialog_up(cap))
@@ -19572,6 +19586,19 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
             self._poll(sm)
         self.assertEqual(self._typed(), [])
 
+    def test_an_unnumbered_dialog_is_not_nudged(self):
+        # XERK-2142: an MCP elicitation or the native picker is no panePrompt;
+        # _pane_status says so on the scan state instead.
+        sm = self.make_manager()
+        self._session(sm)
+
+        def status(_tmux, state):
+            state["paneDialog"] = True
+            return False, "auto", None
+        with mock.patch.object(ha, "_pane_status", side_effect=status):
+            self._poll(sm)
+        self.assertEqual(self._typed(), [])
+
     def test_clean_worktree_is_not_nudged(self):
         sm = self.make_manager()
         sess = self._session(sm, dirty=0, pushed=True, ahead_remote=0)
@@ -20398,6 +20425,20 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.run_calls, [])
         self.assertEqual(sess["pendingModel"], "sonnet")
         self.assertIsNone(sess["model"])
+
+    def test_set_model_defers_while_a_dialog_is_up(self):
+        # XERK-2142 QA: "/model" + Enter into a permission dialog approved its
+        # "1. Yes". A dialog defers the pick like a busy pane does.
+        dialog = ("Bash command\n  touch x\n" + "─" * 40 + "\n"
+                  "Do you want to proceed?\n ❯ 1. Yes\n   2. No\n"
+                  " Esc to cancel · Tab to amend\n")
+        for cap in (dialog, _2142_ELICIT):
+            self.run_calls.clear()
+            sm = self.make_manager(pane=cap)
+            sess = self._session(sm, model=None)
+            sm.set_model("abcde", "sonnet")
+            self.assertEqual(self.run_calls, [])
+            self.assertEqual(sess["pendingModel"], "sonnet")
 
     def test_apply_pending_switches_lands_the_deferred_pick(self):
         sm = self.make_manager(busy=False)

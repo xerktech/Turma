@@ -18211,9 +18211,9 @@ def _trust_dialog_up(cap):
 
 
 # How many trailing non-blank lines `_hint_dialog_up` reads: the key-hint footer
-# itself, wrapped onto a second line on a narrow pane (the AskUserQuestion picker
-# at 40 columns: "… · Esc" / "to cancel"), plus one more for a third wrap.
-_DIALOG_HINT_LINES = 3
+# wrapped on a narrow pane — the picker at 40 columns ("… · Esc" / "to cancel"),
+# the elicitation's four-item footer onto five lines at 20 — plus one spare.
+_DIALOG_HINT_LINES = 6
 
 
 def _hint_dialog_up(cap):
@@ -33922,6 +33922,14 @@ class SessionManager:
             sess["pendingModel"] = arg
             self.save()
             log(f"set model of {sid} -> {arg}: turn in flight; deferred until idle")
+            return
+        if _dialog_up(tmux_name):
+            # A dialog owns the keyboard: "/model" + Enter would answer it — an
+            # Enter on a permission dialog approves "1. Yes" (XERK-2142 QA).
+            # Deferred the same way; _apply_pending_switches waits it out too.
+            sess["pendingModel"] = arg
+            self.save()
+            log(f"set model of {sid} -> {arg}: a dialog is up; deferred until it closes")
             return
         sess.pop("pendingModel", None)
         _pane_send_keys(tmux_name, "C-u")
