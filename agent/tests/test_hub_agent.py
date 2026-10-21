@@ -19752,6 +19752,49 @@ PANE_PERMISSION_DIALOG = """\
  Esc to cancel · Tab to amend · ctrl+e to explain
 """
 
+# Real 60-column Claude Code 2.1.306 frames (XERK-2150). Option 3's label wraps
+# onto a line indented to the label column...
+PANE_WRAPPED_OPTION_DIALOG = """\
+────────────────────────────────────────────────────────────
+ Bash command
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ touch /tmp/marker.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to
+      /tmp/build/long-dir-name/cap/work from this project
+   3. Yes, and switch to auto mode · auto mode handles these
+      prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
+"""
+
+# ...and so does every description in the native AskUserQuestion picker, whose
+# first word WOULD have fit after its option's label.
+PANE_ASK_PICKER = """\
+────────────────────────────────────────────────────────────
+ ☐ Color
+
+Which color?
+
+❯ 1. Red
+     A warm, bold color often associated with energy,
+     passion, urgency, and drawing strong attention.
+  2. Green
+     A calm, natural color commonly linked with growth,
+     balance, health, and positive go-ahead signals.
+  3. Blue
+     A cool, steady color typically associated with trust,
+     calm, reliability, and clear open skies.
+  4. Type something.
+────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
 PANE_PLAN_DIALOG = """\
   ────────────────────────────────────────────────────────────────────
    Ready to code?
@@ -21315,6 +21358,34 @@ class TestParsePanePrompt(unittest.TestCase):
         self.assertEqual(
             p["detail"],
             "Bash command\ntouch /tmp/permtest-marker\nCreate marker file in /tmp")
+
+    def test_wrapped_option_label(self):
+        # A label too long for the pane wraps; the run must not stop at the wrap
+        # (XERK-2150: options 3 and 4 — the only way to decline — were dropped).
+        p = ha.parse_pane_prompt(PANE_WRAPPED_OPTION_DIALOG)
+        self.assertEqual(
+            [o["label"] for o in p["options"]],
+            ["Yes",
+             "Yes, and always allow access to /tmp/build/long-dir-name/cap/work"
+             " from this project",
+             "Yes, and switch to auto mode · auto mode handles these prompts for you",
+             "No"])
+        # The rejoined label is the dialog's identity at any width.
+        wide = ha.parse_pane_prompt(PANE_WRAPPED_OPTION_DIALOG.replace(
+            "these\n      prompts", "these prompts").replace(
+            "to\n      /tmp", "to /tmp").replace("─" * 60, "─" * 140))
+        self.assertEqual(wide["id"], p["id"])
+
+    def test_picker_descriptions_not_options(self):
+        # A description sits on the same indent as a wrap, but its first word
+        # would have fit beside the label: the picker is not a panePrompt, so
+        # "Type something." never becomes a digit to send.
+        self.assertIsNone(ha.parse_pane_prompt(PANE_ASK_PICKER))
+        # The width test is what decides: with the pane narrowed to the label,
+        # the same line WOULD be a wrap.
+        self.assertIsNotNone(ha.parse_pane_prompt(
+            " Proceed?\n ❯ 1. Yes\n   2. No, and tell Claude what to\n"
+            "      instead\n" + "─" * 30))
 
     def test_plan_dialog(self):
         p = ha.parse_pane_prompt(PANE_PLAN_DIALOG)
