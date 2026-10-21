@@ -349,6 +349,8 @@ private fun sessionLiveState(session: SessionInfo, agentLastSeen: Long, now: Lon
     if (!s?.question.isNullOrEmpty()) return CardState("waiting for your answer", CardTone.WAITING)
     if (session.attention?.state == "needs-you:permission")
         return CardState("waiting for your permission", CardTone.WAITING)
+    if (com.xerktech.turma.core.attentionDialog(session.attention))
+        return CardState("waiting on a dialog in the terminal", CardTone.WAITING)
     if (s?.transcriptAgeSec == null) return CardState("no transcript yet", CardTone.IDLE)
     val state = com.xerktech.turma.core.liveState(session, agentLastSeen, now)
     return when (state) {

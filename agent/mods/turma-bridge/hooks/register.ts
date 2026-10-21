@@ -19,7 +19,17 @@ import type { Register, EngineInterface } from 'claude-code'
 //    characters, padding, over NAME_MAX) is refused, never rewritten, so the
 //    name the agent records is the name the session ends up with.
 //
-// 3. It serves `/turma` (peers | status | wake <dur> <why>), run on demand:
+// 3. It submits the agent's `submit.json` request — one of Turma's own machine
+//    messages: a wake-up, a hub nudge (XERK-2135) — with `$.prompt.submit`,
+//    answering in `submit.done.json`. Idle only, for the reason the rename is:
+//    the prompt then starts a turn at once and never waits in the queue. The
+//    model reads it framed as this plugin's ("The turma-bridge plugin sent a
+//    message"), which is right for a machine message and why the operator's
+//    messages never come this way. After an interrupted turn Claude Code drops a
+//    plugin's prompt until the person sends input; the mod waits for that turn
+//    rather than answering, so the stop is respected.
+//
+// 4. It serves `/turma` (peers | status | wake <dur> <why>), run on demand:
 //    the roster the agent writes (TURMA_PEERS_FILE), the session's status the
 //    agent writes beside its requests (`status.json`), and a wake through the
 //    session CLI (TURMA_SESSION_CLI), which validates it.
@@ -39,6 +49,8 @@ type Writer = {
   stopped: boolean
   renaming: boolean
   lastRename: number
+  submitting: boolean
+  lastSubmit: number
 }
 
 const NAME_MAX = 200
@@ -47,6 +59,9 @@ const NAME_MAX = 200
 // mod_rename_name, which cleans the name before asking.
 const NAME_UNCLEAN = /[\p{Cc}\p{Cf}\u2028\u2029]/u
 const POLL_MS = 2000
+// The longest machine message the mod submits: Turma's are a few hundred
+// characters; this bounds what a session-writable file can put in a turn.
+const SUBMIT_MAX = 20000
 
 function publish($: EngineInterface, w: Writer, turn: Turn, turnId: string | null) {
   const seq = ++w.seq
@@ -57,13 +72,29 @@ function publish($: EngineInterface, w: Writer, turn: Turn, turnId: string | nul
       const path = await $.env.get('TURMA_TURN_STATE')
       if (!path) return
       const claudeSessionId = await $.session.id()
-      await $.fs.write(path, JSON.stringify({ v: 1, claudeSessionId, turn, turnId, seq, at }))
+      // `stopped`: an interrupted turn, after which Claude Code refuses this
+      // plugin's prompts and commands until the person sends input. The agent
+      // reads it to wait, not type into the pane past the person's stop.
+      const stopped = w.stopped || undefined
+      await $.fs.write(path, JSON.stringify({ v: 1, claudeSessionId, turn, turnId, seq, at, stopped }))
     })
     .catch(() => undefined)
 }
 
+// Claude Code says the session is stopped (it refused a command or dropped a
+// prompt). Published, not just remembered: a turn the person did not start (a
+// background shell finishing) clears `w.stopped` on its turn.start while Claude
+// Code stays stopped, and the agent reads the turn state to wait rather than
+// type the message into the pane past the person's Esc (QA, 2.1.305).
+// It keeps the turn as it stands: a refusal arriving after a turn.start must
+// not publish that running turn as idle (its own end publishes the stop).
+function markStopped($: EngineInterface, w: Writer) {
+  w.stopped = true
+  publish($, w, w.turn, null)
+}
+
 async function pollRename($: EngineInterface, w: Writer) {
-  if (w.renaming || w.turn !== 'idle' || w.stopped) return
+  if (w.renaming || w.submitting || w.turn !== 'idle' || w.stopped) return
   const dir = await $.env.get('TURMA_MOD_REQUESTS')
   if (!dir) return
   let raw: string
@@ -81,8 +112,8 @@ async function pollRename($: EngineInterface, w: Writer) {
   const at = typeof req.at === 'number' ? req.at : 0
   const name = typeof req.name === 'string' ? req.name : ''
   if (req.v !== 1 || at <= 0 || at === w.lastRename) return
-  // The reads above awaited: a turn may have started meanwhile.
-  if (w.turn !== 'idle' || w.stopped) return
+  // The reads above awaited: a turn (or a submit) may have started meanwhile.
+  if (w.turn !== 'idle' || w.stopped || w.submitting) return
   w.renaming = true
   w.lastRename = at
   let ok = false
@@ -97,7 +128,7 @@ async function pollRename($: EngineInterface, w: Writer) {
       error = String(err).slice(0, 300)
       if (/stopped/.test(error)) {
         // Refused until the person sends input: not an answer, try after.
-        w.stopped = true
+        markStopped($, w)
         w.lastRename = 0
         w.renaming = false
         return
@@ -110,6 +141,68 @@ async function pollRename($: EngineInterface, w: Writer) {
     // The agent sees no answer and keeps the request; nothing to retry here.
   }
   w.renaming = false
+}
+
+// The session was stopped and nobody has sent input since: Claude Code's words
+// when it drops a plugin's prompt or refuses its command (2.1.305).
+const STOPPED_RE = /stopped/
+
+async function pollSubmit($: EngineInterface, w: Writer) {
+  if (w.submitting || w.renaming || w.turn !== 'idle' || w.stopped) return
+  const dir = await $.env.get('TURMA_MOD_REQUESTS')
+  if (!dir) return
+  let raw: string
+  try {
+    raw = await $.fs.read(`${dir}/submit.json`)
+  } catch {
+    return
+  }
+  let req: { v?: unknown; text?: unknown; at?: unknown }
+  try {
+    req = JSON.parse(raw)
+  } catch {
+    return
+  }
+  const at = typeof req.at === 'number' ? req.at : 0
+  const text = typeof req.text === 'string' ? req.text : ''
+  if (req.v !== 1 || at <= 0 || at === w.lastSubmit) return
+  // The reads above awaited: a turn (or a rename) may have started meanwhile.
+  if (w.turn !== 'idle' || w.stopped || w.renaming) return
+  w.submitting = true
+  w.lastSubmit = at
+  let ok = false
+  let error: string | undefined
+  if (!text.trim() || text.length > SUBMIT_MAX) {
+    error = 'unusable text'
+  } else {
+    try {
+      const r = await $.prompt.submit({ text })
+      const drop = r && typeof r === 'object' && 'drop' in r ? String((r as { drop?: unknown }).drop) : ''
+      if (drop && STOPPED_RE.test(drop)) {
+        // Dropped until the person sends input: not an answer, try after.
+        markStopped($, w)
+        w.lastSubmit = 0
+        w.submitting = false
+        return
+      }
+      if (drop) error = drop.slice(0, 300)
+      else ok = true
+    } catch (err) {
+      error = String(err).slice(0, 300)
+      if (STOPPED_RE.test(error)) {
+        markStopped($, w)
+        w.lastSubmit = 0
+        w.submitting = false
+        return
+      }
+    }
+  }
+  try {
+    await $.fs.write(`${dir}/submit.done.json`, JSON.stringify({ v: 1, at, ok, error }))
+  } catch {
+    // The agent sees no answer and keeps the request; nothing to retry here.
+  }
+  w.submitting = false
 }
 
 const CELL_MAX = 80
@@ -139,19 +232,88 @@ const DATA_NOTE =
 // look-alikes, and so does `&` — the model reads `&lt;/…&gt;` as the tag (5/5)
 // while the pane decodes it for the person. Every pane busy marker (hub-agent.py's PANE_BUSY_MARKERS,
 // QWEN_PANE_BUSY_MARKERS and the ⏵/⏸ footer glyphs) is broken up too, or a
-// peer's text on screen would read an idle session busy. A non-string is no
-// text.
+// peer's text on screen would read an idle session busy (an operator's custom
+// markers are broken over the whole output: unmarked()). A non-string is no text.
 function cell(v: unknown): string {
   const t = typeof v === 'string' ? v : typeof v === 'number' && Number.isFinite(v) ? String(v) : ''
-  const flat = t
+  let flat = t
     .replace(/[\p{Cc}\p{Cf}]+/gu, ' ')
     .replace(/&/g, '＆')
     .replace(/</g, '‹')
     .replace(/>/g, '›')
     .replace(/(esc|enter) to (interrupt|steer|cancel)/gi, '$1-to-$2')
     .replace(/[⏵⏸]/g, '▹')
-    .trim()
+  flat = flat.trim()
   return flat.length > CELL_MAX ? `${flat.slice(0, CELL_MAX - 1)}…` : flat
+}
+
+// The agent's effective pane busy markers (hub-agent.py PANE_BUSY_MARKERS, an
+// operator's TURMA_PANE_BUSY_MARKERS override included), which the launch
+// exports as TURMA_BUSY_MARKERS: `|`-separated, matched case-insensitively
+// anywhere on screen. Read at each /turma run; empty without the variable.
+// Kept as lowercased literals and matched by a plain scan, never a RegExp built
+// from them (Semgrep's detect-non-literal-regexp; the text is the operator's).
+function markerRes(raw: string | undefined): string[] {
+  return (raw || '')
+    .split('|')
+    .map(m => fold(m.trim().replace(/[\p{Cc}\p{Cf}]+/gu, ' ')))
+    // One character cannot be broken up, and would read every pane busy anyway.
+    .filter(m => [...m].length >= 2)
+}
+
+// Lowercased with the final sigma folded to σ: JS lowers a SLICE's last Σ to ς,
+// while the agent lowers the whole capture (`åΣx` → `åσx`) and reads it busy.
+// Folding both sides over-matches, the safe direction (QA).
+function fold(t: string): string {
+  return t.toLowerCase().replace(/ς/g, 'σ')
+}
+
+// Is `m` (folded) at `text[i]`, compared case-insensitively?
+function markerAt(text: string, i: number, m: string): boolean {
+  return fold(text.slice(i, i + m.length)) === m
+}
+
+function hasMarker(text: string, m: string): boolean {
+  for (let i = 0; i + m.length <= text.length; i++) if (markerAt(text, i, m)) return true
+  return false
+}
+
+// Every non-overlapping occurrence of `m`, left to right, replaced by `f(it)`.
+function replaceMarker(text: string, m: string, f: (hit: string) => string): string {
+  let out = ''
+  let i = 0
+  while (i + m.length <= text.length) {
+    if (markerAt(text, i, m)) {
+      out += f(text.slice(i, i + m.length))
+      i += m.length
+    } else {
+      out += text[i]
+      i += 1
+    }
+  }
+  return out + text.slice(i)
+}
+
+// Text with no custom marker left in it. Run over whole output LINES, so a
+// marker spanning two cells (`host/repo`) is caught, and to a fixed point, since
+// breaking one (`ab` → `a-b`) can make another. Breaking passes are bounded by
+// the marker count (+1); what still matches after them (`-a` stays `-a`-shaped)
+// is deleted until nothing matches, which ends, as every deletion shortens it.
+function unmarked(text: string, res: string[]): string {
+  const left = () => res.some(m => hasMarker(text, m))
+  for (let pass = 0; pass <= res.length && left(); pass++) {
+    for (const m of res) text = replaceMarker(text, m, broken)
+  }
+  while (left()) for (const m of res) text = replaceMarker(text, m, () => '')
+  return text
+}
+
+// A marker occurrence no longer read as one: its spaces become `-` (as for the
+// defaults above), or, with none, a `-` after its first character.
+function broken(m: string): string {
+  if (/\s/.test(m)) return m.replace(/\s/g, '-')
+  const [first, ...rest] = [...m]
+  return `${first}-${rest.join('')}`
 }
 
 // Free text someone else wrote, quoted so it reads as quoted data.
@@ -160,7 +322,7 @@ function quoted(v: unknown): string {
   return c ? `“${c}”` : ''
 }
 
-async function peersText($: EngineInterface): Promise<string> {
+async function peersText($: EngineInterface, res: string[]): Promise<string> {
   const path = await $.env.get('TURMA_PEERS_FILE')
   if (!path) return 'No roster: this session was not launched by Turma.'
   let raw: string
@@ -186,20 +348,31 @@ async function peersText($: EngineInterface): Promise<string> {
     const what = quoted(task) ? ` — ${quoted(task)}` : ''
     // A nameless row (the local fallback roster) must not read as a
     // continuation of the row above.
-    return `  ${cell(name) || '(no name)'}${mark}  ${where}${br}${what}`
+    // Markers broken BEFORE the rows are sized, so breaking can never push the
+    // pointer line past OUT_MAX.
+    return unmarked(`  ${cell(name) || '(no name)'}${mark}  ${where}${br}${what}`, res)
   })
   const head = [`${rows.length} session(s); message one by its name with SendMessage.`, DATA_NOTE]
-  // Rows fit under OUT_MAX with the pointer to the whole roster kept.
+    .map(l => unmarked(l, res))
+  // The path is the agent's own (TURMA_PEERS_FILE), not file text: never cut,
+  // and never rewritten by a marker break (its fixed words are broken).
+  const pointer = (n: number) => `${unmarked(`  …and ${n} more in`, res)} ${path}`
+  // Rows fit under OUT_MAX with the pointer to the whole roster kept: room is
+  // reserved for the longest count it can print, then rows are dropped while
+  // the actual pointer (its count, its broken words) would not fit.
   const kept: string[] = []
-  // Room for the pointer line as it will print (its count is at most 3 digits).
-  let size = head.join('\n').length + `\n  …and 999 more in ${path}`.length
+  let size = head.join('\n').length
+  const reserve = pointer(ordered.length).length + 1
   for (const line of lines) {
-    if (size + line.length + 1 > OUT_MAX) break
+    if (size + reserve + line.length + 1 > OUT_MAX) break
     kept.push(line)
     size += line.length + 1
   }
-  // The path is the agent's own (TURMA_PEERS_FILE), not file text: never cut.
-  if (kept.length < ordered.length) kept.push(`  …and ${ordered.length - kept.length} more in ${path}`)
+  while (kept.length && kept.length < ordered.length
+         && size + pointer(ordered.length - kept.length).length + 1 > OUT_MAX) {
+    size -= kept.pop()!.length + 1
+  }
+  if (kept.length < ordered.length) kept.push(pointer(ordered.length - kept.length))
   return [...head, ...kept].join('\n')
 }
 
@@ -259,27 +432,37 @@ async function wakeText($: EngineInterface, args: string[]): Promise<string> {
 async function turmaText($: EngineInterface, args: string): Promise<string> {
   const words = args.trim().split(/\s+/).filter(Boolean)
   const sub = (words[0] || '').toLowerCase()
+  let res: string[] = []
+  try {
+    res = markerRes(await $.env.get('TURMA_BUSY_MARKERS'))
+  } catch {
+    // no override readable: the built-in markers are still broken by cell()
+  }
   let text: string
   try {
-    if (sub === 'peers') text = await peersText($)
-    else if (sub === 'status') text = await statusText($)
+    if (sub === 'peers') return await peersText($, res)
+    if (sub === 'status') text = await statusText($)
     else if (sub === 'wake') text = await wakeText($, words.slice(1))
     else text = HELP
   } catch (err) {
     text = `/turma ${cell(sub)} failed: ${cell(String(err))}`
   }
+  text = unmarked(text, res)
+  // The cut can only shorten a marker, never make one.
   return text.length > OUT_MAX ? `${text.slice(0, OUT_MAX - 1)}…` : text
 }
 
 export const register: Register = on => {
   const w: Writer = {
     chain: Promise.resolve(), seq: 0, turn: 'idle', stopped: false, renaming: false, lastRename: 0,
+    submitting: false, lastSubmit: 0,
   }
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     publish($, w, 'idle', null)
     $.clock.every(POLL_MS, () => void pollRename($, w).catch(() => { w.renaming = false }))
+    $.clock.every(POLL_MS, () => void pollSubmit($, w).catch(() => { w.submitting = false }))
     void $.command
       .register({
         name: 'turma',

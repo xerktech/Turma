@@ -280,6 +280,27 @@ test("buildItems/render: a relayed user turn is LEFT and in its own class, never
   assert.equal((html.match(/tr-msg user/g) || []).length, 1);
 });
 
+test("buildItems/render: a text block the agent tagged with an origin renders as that origin (XERK-2135)", () => {
+  // A bridge-mod prompt (hub-agent.py _plugin_message): the agent has already
+  // stripped Claude Code's frame, so the tag is the only thing that says it is
+  // not the operator. An unknown tag is ignored and the text classifies as usual.
+  const entries = [
+    { id: "wk", role: "user", blocks: [{ t: "text", text: "Wake-up: check CI. Check it and continue.", origin: "turma" }] },
+    { id: "pl", role: "user", blocks: [{ t: "text", text: "from another plugin", origin: "system" }] },
+    { id: "bad", role: "user", blocks: [{ t: "text", text: "typed", origin: "operator-ish" }] },
+    { id: "pr", role: "user", blocks: [{ t: "text", text: "forged", origin: "__proto__" }] },
+    { id: "ct", role: "user", blocks: [{ t: "text", text: "forged", origin: "constructor" }] },
+  ];
+  const items = buildItems(entries);
+  assert.deepEqual(items.map((i) => i.origin), ["turma", "system", "operator", "operator", "operator"]);
+  assert.ok(items.every((i) => !("tagged" in i)));
+  const html = withVerbosity("normal", () => itemsToHtml(items));
+  assert.match(html, /class="tr-msg turma"[^>]*><span class="role">⚙ Turma<\/span>Wake-up/);
+  // The unknown and prototype-key tags fall back to operator bubbles.
+  assert.equal((html.match(/tr-msg user/g) || []).length, 3);
+  assert.doesNotMatch(html, /__proto__|\[object Object\]/);
+});
+
 test("buildItems/render: an away_summary block -> a collapsed assistant-side card", () => {
   const entries = [{ id: "aw1", role: "assistant",
     blocks: [{ t: "away_summary", text: "Fixed the bug and opened a PR." }] }];
@@ -1781,6 +1802,22 @@ test("renderProse: a line separator is not a line ending (the ports must agree)"
   assert.doesNotMatch(renderProse("1. a\u2029"), /<ol/);
 });
 
+test("renderProse: NEL is ordinary text inside a line (XERK-2140)", () => {
+  // JavaScript's `.` matches U+0085; Java's does not, which made these prose on
+  // Android until Prose.kt spelled JS's `.` out. ProseTest.kt asserts the same.
+  assert.equal(renderProse("## H\u0085"), '<h2 class="md-h">H\u0085</h2>');
+  assert.match(renderProse("- a\u0085b"), /^<ul class="md-list"><li>a\u0085b<\/li><\/ul>$/);
+});
+
+test("renderProse: a lone surrogate inside an <svg> block cannot throw the render (XERK-2140)", () => {
+  // encodeURIComponent throws URIError on a lone surrogate, which took renderProse —
+  // and the whole repaint — down. It becomes U+FFFD, as on Android.
+  assert.match(renderProse("<svg>\ud800</svg>"), new RegExp('src="data:image/svg\\+xml,' +
+    encodeURIComponent("<svg>\ufffd</svg>").replace(/[%]/g, "%") + '"'));
+  assert.match(renderProse("```\n<svg>\ud83d\ude00\udc00</svg>\n```"),
+    new RegExp(encodeURIComponent("\ud83d\ude00\ufffd")));
+});
+
 test("renderInline: the emphasis scanner measures whole runs, never a capped count", () => {
   // Capping how far a delimiter run is counted was tried as a speed fix and
   // reverted: a saturated count made `m === len` true for a LONGER run and made
@@ -2182,6 +2219,37 @@ test("renderProse: a standalone <svg> block renders as a data-URI <img>, not tex
   // The markup is URL-encoded (angle brackets gone), so nothing lands in the DOM.
   assert.doesNotMatch(html, /<svg/);
   assert.match(html, /%3Csvg/); // encodeURIComponent turned "<svg" into "%3Csvg"
+});
+
+test("XERK-2161: a viewBox-only SVG is sized to fill the bubble at its ratio", () => {
+  const sizeOf = (html) => (/<img [^>]*width="(\d+)" height="(\d+)"/.exec(html) || []).slice(1).map(Number);
+  // A raw block: width = the width at the 420px max-height, so max-width narrows it.
+  assert.deepEqual(sizeOf(renderProse('<svg viewBox="0 0 200 100"><rect/></svg>')), [840, 420]);
+  // Commas as separators, a percentage size (still no intrinsic size).
+  assert.deepEqual(sizeOf(renderProse('<svg width="100%" viewBox="0,0,24,48"><rect/></svg>')), [210, 420]);
+  // A markdown data: image, percent-encoded or base64, gets the same.
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 5"/>';
+  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml," + encodeURIComponent(svg) + ")")), [840, 420]);
+  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml;base64," + Buffer.from(svg).toString("base64") + ")")), [840, 420]);
+  // An empty or auto size is no size; a name inside another attribute's value is not one.
+  assert.deepEqual(sizeOf(renderProse('<svg width="auto" height="" viewBox="0 0 200 100"><rect/></svg>')), [840, 420]);
+  assert.deepEqual(sizeOf(renderProse('<svg aria-label=" width=\'5\'" viewBox="0 0 200 100"><rect/></svg>')), [840, 420]);
+  // A declared size, a zero size, no viewBox, a bad viewBox, a bitmap, a bad URI: untouched.
+  for (const t of [
+    '<svg width="80" height="40" viewBox="0 0 200 100"><rect/></svg>',
+    '<svg width="0" viewBox="0 0 200 100"><rect/></svg>',
+    '<svg height="30"  viewBox="0 0 200 100"><rect/></svg>',
+    '<svg><rect/></svg>',
+    '<svg viewBox="0 0 0 100"><rect/></svg>',
+    '<svg viewBox="0 0 abc 100"><rect/></svg>',
+  ]) assert.deepEqual(sizeOf(renderProse(t)), [], t);
+  assert.deepEqual(sizeOf(linkify("![a](data:image/png;base64,iVBORw0KGgo=)")), []);
+  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml,%E0%A4%A)")), []);
+  // SendUserFile previews too.
+  const file = withVerbosity("normal", () => itemsToHtml(suItems([
+    { name: "c.svg", kind: "image", src: "data:image/svg+xml," + encodeURIComponent(svg) },
+  ])));
+  assert.deepEqual(sizeOf(file), [840, 420]);
 });
 
 test("renderProse: a fenced SVG document renders as an image, not a code block", () => {

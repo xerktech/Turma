@@ -69,9 +69,10 @@ composed.**
     for `INPUT_HOLD_TTL_SEC`, then drops it with a log line.
     - A TTL drop also forgets the leftover record that held it (else it holds the NEXT message
       too) — that record object only (`h["leftover"]`), never a newer one stored since — and a
-      dropped OPERATOR message logs `OPERATOR MESSAGE NOT DELIVERED`. No agent→hub channel
-      carries it yet (spawnFailures is keyed to spawn cmdIds), so that log line is the
-      operator's only trace.
+      dropped OPERATOR message logs `OPERATOR MESSAGE NOT DELIVERED`. The drop itself rides no
+      agent→hub channel (spawnFailures is keyed to spawn cmdIds), but the HOLD is visible: the
+      report's `paneDialog` makes the hub serve `needs-you:dialog` (XERK-2152,
+      `turma-attention.md`), so every client says to open the terminal.
     - Accepted residual: after that drop, the composer may still hold our stale fragment plus
       the operator's text, and the NEXT message is typed into it and submitted glued to both.
     - One session's messages go in order: a later one queues behind a held one, and one
@@ -209,6 +210,12 @@ composed.**
   sides (joined onto a path); a transfer failure is NAMED, never dropped. **`uploadMaxBytes` is the
   cap AND the capability flag**: an agent reporting none drops uploads untold, so the hub refuses and
   composers hide the 📎. Tests: `TestStoreUploads`, `TestSendInputUploads`, `UploadsTest`.
+
+## Machine messages through the bridge mod (XERK-2135)
+
+- A wake-up and the hub's `source: "nudge"` inputs go to the session's bridge mod
+  (`$.prompt.submit`, idle-only) while it is live, and this pane path otherwise or as their
+  fallback. Never an operator's message. Rules: `agent-bridge-mod.md`.
 
 ## `notify_session` — the session inbox (XERK-340)
 

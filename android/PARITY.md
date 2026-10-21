@@ -904,8 +904,9 @@ those are marked `[MODEL]`.
   `SafeSvgDecoder` over AndroidSVG, sized like a browser's SVG `<img>`, wired via
   `TurmaApplication : ImageLoaderFactory`). `SendFile`/`files[]`/`caption` are on
   `ToolUseBlock` (decoded) → `ChatItem.Tool` (`ChatItemsTest`), and `TranscriptView` renders each file:
-  an image/SVG via Coil `AsyncImage` (data: URIs decoded to a `ByteBuffer` the SVG/bitmap decoders
-  accept; remote URLs pass through), an HTML page in a **JS-disabled, navigation-blocked, null-origin
+  an image/SVG via Coil `AsyncImage` (data: URIs decoded to a `DataImage` that keeps their declared
+  type, so a `data:image/png` holding SVG markup is broken as on the web, XERK-2161; remote URLs
+  pass through), an HTML page in a **JS-disabled, navigation-blocked, null-origin
   WebView** (the `sandbox` iframe's analogue), else a name chip — open by default, caption below, matching
   the web's `renderToolFiles`. **Click-to-zoom (XERK-221 lightbox):** tapping an image preview opens a
   full-screen viewer (`ImageLightbox`, pinch-zoom + pan, ✕ / back to close) — the analogue of

@@ -309,6 +309,61 @@ test("parseLocalCommand: `!` bash passthrough turns -> command / output shapes",
     entryBlocks({ type: "user", message: { content: "<bash-input> ls -la</bash-input>" } }, BLOCK_CAPS),
     [{ t: "command", name: "!", args: "ls -la" }]);
   assert.equal(entryText({ type: "user", message: { content: "<bash-input> ls</bash-input>" } }), "! ls");
+  // Mirror of test_a_command_that_printed_nothing_keeps_its_output_row.
+  const empty = { type: "user", message: { content: "<bash-stdout></bash-stdout><bash-stderr></bash-stderr>" } };
+  assert.deepEqual(entryBlocks(empty, BLOCK_CAPS), [{ t: "command_output", text: "" }]);
+  assert.equal(entryText(empty), "(no output)");
+  const slash = { type: "user", message: { content: "<local-command-stdout></local-command-stdout>" } };
+  assert.deepEqual(entryBlocks(slash, BLOCK_CAPS), []);
+  assert.equal(entryText(slash), null);
+  const prose = { type: "user", message: { content: "see <bash-stdout></bash-stdout><bash-stderr></bash-stderr> here" } };
+  assert.deepEqual(entryBlocks(prose, BLOCK_CAPS), []);
+  assert.equal(entryText(prose), null);
+  assert.deepEqual(parseLocalCommand("<bash-stdout></bash-stdout><bash-stderr>boom</bash-stderr>"),
+    { kind: "output", text: "boom", isError: true });
+});
+
+// Mirror of test_slash_output_printing_its_own_tags_is_kept_whole — keep in lockstep.
+test("parseLocalCommand: slash output printing its own tags is kept whole", () => {
+  for (const [text, want] of [
+    ["<local-command-stdout>head x</local-command-stdout>tail y</local-command-stdout>", {"kind": "output", "text": "head x</local-command-stdout>tail y", "isError": false}],
+    ["<local-command-stdout>a <local-command-stderr>b</local-command-stderr> c</local-command-stdout>", {"kind": "output", "text": "a <local-command-stderr>b</local-command-stderr> c", "isError": false}],
+    ["<local-command-stdout>see <command-name>/x</command-name></local-command-stdout>", {"kind": "output", "text": "see <command-name>/x</command-name>", "isError": false}],
+    ["<local-command-stdout>p <bash-stderr>q</bash-stderr></local-command-stdout>", {"kind": "output", "text": "p <bash-stderr>q</bash-stderr>", "isError": false}],
+    ["<local-command-stdout>a</local-command-stdout><local-command-stderr>boom</local-command-stderr>", {"kind": "output", "text": "boom", "isError": true}],
+    ["\ufeff<local-command-stdout>a <command-name>/x</command-name></local-command-stdout>", { kind: "command", name: "/x", args: "" }],
+    ["\x1c<local-command-stdout>a <command-name>/x</command-name></local-command-stdout>", { kind: "command", name: "/x", args: "" }],
+  ]) assert.deepEqual(parseLocalCommand(text), want, text);
+});
+
+// Mirror of test_hub_agent.py TestPluginMessage — keep in lockstep (XERK-2135).
+// The entry is the one Claude Code 2.1.305 wrote for a bridge-mod
+// $.prompt.submit, trimmed to the fields the mapper reads.
+const PLUGIN_ENTRY = {
+  type: "user", uuid: "31f44d86", promptSource: "system",
+  origin: { kind: "plugin", name: "turma-bridge" },
+  message: { role: "user", content: "The turma-bridge plugin sent a message:\nWake-up: check CI on PR 12. Check it and continue.\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above." },
+};
+test("entryBlocks/entryText: a plugin's prompt is tagged and unframed, never an operator bubble", () => {
+  assert.deepEqual(entryBlocks(PLUGIN_ENTRY, BLOCK_CAPS),
+    [{ t: "text", text: "Wake-up: check CI on PR 12. Check it and continue.", origin: "turma" }]);
+  assert.equal(entryText(PLUGIN_ENTRY), "Wake-up: check CI on PR 12. Check it and continue.");
+  // Another plugin's prompt is a system turn; list content is joined.
+  const other = { ...PLUGIN_ENTRY, origin: { kind: "plugin", name: "acme" },
+    message: { content: [{ type: "text", text: "The acme plugin sent a message:\nhi\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns." }] } };
+  assert.deepEqual(entryBlocks(other, BLOCK_CAPS), [{ t: "text", text: "hi", origin: "system" }]);
+  // A frame worded otherwise stays; the origin still tags it.
+  const reworded = { ...PLUGIN_ENTRY, message: { content: "Plugin says: hi" } };
+  assert.deepEqual(entryBlocks(reworded, BLOCK_CAPS), [{ t: "text", text: "Plugin says: hi", origin: "turma" }]);
+  // Its text is never re-read as a notification or a command.
+  const cmd = { ...PLUGIN_ENTRY, message: { content: "<bash-input>ls</bash-input>" } };
+  assert.deepEqual(entryBlocks(cmd, BLOCK_CAPS), [{ t: "text", text: "<bash-input>ls</bash-input>", origin: "turma" }]);
+  // The operator typing the frame's words is still the operator: origin decides.
+  const typed = { type: "user", message: { content: PLUGIN_ENTRY.message.content } };
+  assert.deepEqual(entryBlocks(typed, BLOCK_CAPS), [{ t: "text", text: PLUGIN_ENTRY.message.content }]);
+  // An empty prompt renders nothing.
+  assert.deepEqual(entryBlocks({ ...PLUGIN_ENTRY, message: { content: "  " } }, BLOCK_CAPS), []);
+  assert.equal(entryText({ ...PLUGIN_ENTRY, message: { content: "  " } }), null);
 });
 
 // Mirror of test_hub_agent.py TestInterruptMarker — keep in lockstep.
@@ -2921,6 +2976,50 @@ test("watch start back-scans: a shell launched beyond the tail window is still l
       "the shell launched beyond the tail window is listed");
   } finally {
     mod.stopWatch("sess-backscan");
+    mod.__setControlSink(null);
+  }
+});
+
+// A restart-clear-context re-points the watch at a NEW transcript, and the
+// relaunch ended every background task the old conversation had (XERK-1888).
+test("live tail: a re-arm onto a moved transcript drops the old one's live agents", async () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "moved-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const proj = path.join(PROJECTS_ROOT, mod.projectSlug(work));
+  fs.mkdirSync(proj, { recursive: true });
+  const oldTid = "33333333-3333-4444-5555-666666666666";
+  const newTid = "44444444-3333-4444-5555-666666666666";
+  const lines = (...entries) => entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
+  fs.writeFileSync(path.join(proj, `${oldTid}.jsonl`), lines(
+    { type: "assistant", message: { content: [
+      { type: "tool_use", id: "tm1", name: "Bash",
+        input: { command: "make build", description: "Build", run_in_background: true } }] } },
+    { type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "tm1", content: "started" }] },
+      toolUseResult: { stdout: "", backgroundTaskId: "msh1" } }));
+  fs.writeFileSync(path.join(proj, `${newTid}.jsonl`), lines(
+    { uuid: "n1", type: "user", message: { content: "fresh start" } }));
+
+  const frames = [];
+  mod.__setControlSink((o) => { if (o.turn === "sess-moved") frames.push(o); });
+  try {
+    mod.startWatch("sess-moved", work, oldTid);
+    await waitForCond(() => frames.some((f) => (f.agents || []).length === 1));
+    // A SAME-transcript re-arm (a second viewer) keeps what the scan knows.
+    frames.length = 0;
+    mod.startWatch("sess-moved", work, oldTid);
+    await waitForCond(() => frames.length >= 1);
+    assert.deepEqual(frames[frames.length - 1].agents.map((a) => a.label), ["Build"],
+      "a plain re-arm keeps the live agents");
+    frames.length = 0;
+    mod.startWatch("sess-moved", work, newTid);
+    await waitForCond(() => frames.length >= 1);
+    assert.deepEqual(frames[frames.length - 1].agents, [],
+      "the old conversation's shell is not carried onto the new one");
+  } finally {
+    mod.stopWatch("sess-moved");
     mod.__setControlSink(null);
   }
 });

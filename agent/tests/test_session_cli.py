@@ -81,6 +81,20 @@ class SessionCliTest(unittest.TestCase):
             got = ha.read_wake_request("abcde")
         self.assertEqual(got, {"wakeAt": req["wakeAt"], "wakeReason": "check the CI run"})
 
+    def test_a_later_double_dash_in_the_reason_is_kept(self):
+        # argparse takes only the first `--` as the separator and drops later
+        # ones; the bridge mod runs `wake -- <dur> <why>`, so a reason's own
+        # `--` must reach the request verbatim.
+        for argv, reason in ((["wake", "--", "2h", "check", "--", "foo"], "check -- foo"),
+                             # The FIRST `--` is the separator wherever it sits.
+                             (["wake", "2h", "check", "--", "foo", "--", "b"], "check foo -- b"),
+                             (["wake", "2h", "--", "-x", "--", "--"], "-x -- --"),
+                             (["wake", "--", "2h", "--", "check"], "-- check")):
+            with self.subTest(argv=argv):
+                rc, _, err = self.run_main(argv)
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(self.read("wake")["reason"], reason)
+
     def test_durations(self):
         for text, secs in (("20m", 1200), ("2h", 7200), ("1h30m", 5400),
                            ("45s", 45), ("1d", 86400), ("7d", 7 * 86400)):

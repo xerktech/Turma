@@ -75,11 +75,11 @@ import com.xerktech.turma.core.ChatItem
 import com.xerktech.turma.core.InlinePiece
 import com.xerktech.turma.core.ProseBlock
 import com.xerktech.turma.core.Span
+import com.xerktech.turma.DataImage
 import com.xerktech.turma.core.parseProse
 import com.xerktech.turma.core.splitImages
 import com.xerktech.turma.model.SendFile
 import android.graphics.Color as AndroidColor
-import android.util.Base64
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.layout.fillMaxSize
@@ -571,11 +571,12 @@ private val PROSE_IMAGE_MAX_HEIGHT: Dp = 320.dp
 
 /**
  * An image src → a Coil model. Coil 2.x doesn't load data: URIs itself, so they
- * are decoded to bytes (a ByteBuffer the SVG/bitmap decoders both accept); a remote
- * http(s) URL passes straight through. Anything else, or a bad data: URI, is null.
+ * are decoded to a [DataImage] carrying their declared type (decoded by that type,
+ * as on the web); a remote http(s) URL passes straight through. Anything else, or
+ * a bad data: URI, is null.
  */
 private fun imageModel(src: String): Any? = when {
-    src.startsWith("data:", ignoreCase = true) -> dataUriToBytes(src)?.let { ByteBuffer.wrap(it) }
+    src.startsWith("data:", ignoreCase = true) -> DataImage.parse(src)
     src.startsWith("http", ignoreCase = true) -> src
     else -> null
 }
@@ -900,15 +901,3 @@ private fun HtmlPreview(html: String, modifier: Modifier) {
         modifier = modifier,
     )
 }
-
-// Decode a data: URI to raw bytes. Handles ;base64 payloads and percent-encoded
-// ones (the `+` guard keeps a literal plus in an SVG from decoding to a space).
-private fun dataUriToBytes(src: String): ByteArray? = try {
-    val comma = src.indexOf(',')
-    if (comma < 0) null else {
-        val meta = src.substring(0, comma)
-        val payload = src.substring(comma + 1)
-        if (meta.contains(";base64", ignoreCase = true)) Base64.decode(payload, Base64.DEFAULT)
-        else java.net.URLDecoder.decode(payload.replace("+", "%2B"), "UTF-8").toByteArray(Charsets.UTF_8)
-    }
-} catch (e: Exception) { null }

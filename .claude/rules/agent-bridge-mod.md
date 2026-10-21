@@ -65,12 +65,47 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 - **The mod runs `rename` and nothing else**: the request is session-writable, so it carries
   a name, never a command. It refuses a name over 200 chars.
 - Request dir and `rcRenamePending`/`rcRenameVia` are dropped on every launch/teardown.
-- **Operator messages stay on the pane**: a `$.prompt.submit` lands as `origin: plugin`,
-  framed "The <plugin> plugin sent a message", and the model attributes it to the plugin,
-  not the user (measured on 2.1.304). A wake or hub nudge could move there, but the chat
-  view would first need to parse that frame (py + js entry blocks).
 - Residual: a session can plant a rename request for a sibling, renaming its live name until
   the agent's next request; the same-uid class as typing into a sibling's pane.
+
+## Machine messages through the mod (XERK-2135)
+
+- Turma's own words — a session-CLI wake (`_deliver_due_wakes`), the hub's stall/loop nudge and
+  its merged-PR auto-close message (both `input` with `source: "nudge"`) — go through
+  `_stage_machine_input`: to the mod while it is live (`bridgeMod` on the record, turn state bound
+  to the pinned conversation, text ≤ `MOD_SUBMIT_MAX` UTF-16 units), else the pane as before.
+- **Operator messages never come this way**: a `$.prompt.submit` lands as `origin: plugin`,
+  framed "The <plugin> plugin sent a message: …", and the model attributes it to the plugin, not
+  the person (measured on 2.1.304/305). Right for a machine message, wrong for an operator's.
+- Protocol: `modSubmits` on the record is a FIFO; its head is `submit.json` `{v, text, at}`, the
+  mod answers `submit.done.json` `{v, at, ok, error}`. One out at a time; each `at` strictly
+  larger (`_mod_submit_at`), since the mod runs an `at` once. `_advance_all_mod_submits` (beat,
+  file I/O only) pops on the answer and writes the next in the same pass.
+- **The mod submits only while the main turn is idle**, as rename does: the prompt then starts a
+  turn at once (verified 2.1.305), never queues, and an operator's half-typed draft stays in the
+  composer untouched (verified). Never drop the gate.
+- **After an interrupted turn Claude Code DROPS a plugin prompt** — it resolves
+  `{drop: "the session was stopped and nobody has sent input since"}`, it does not reject
+  (2.1.305). The mod treats that as "wait for the next turn", answers nothing, and publishes
+  `stopped` in its turn state (`markStopped`, on EVERY drop); the agent then waits too. Typing it
+  into the pane instead would talk past the person's Esc.
+  - A turn the person did not start (a background shell finishing) clears the mod's flag while
+    Claude Code stays stopped (QA, 2.1.305), so the mod retries, is dropped again and re-publishes.
+    Never set the flag without publishing it: unpublished, the agent timed out to the pane.
+- **Never dropped**: ok:false, an unwritable request (a planted link, a failed rewrite after a
+  launch), or no answer for
+  `MOD_SUBMIT_TIMEOUT_SEC` of turn-state-idle (or unreadable: the mod is gone) withdraws the
+  request and types it into the pane. The clock runs only while idle and not stopped, so a long
+  turn never trips it. Residual: a mod that read the request just before the withdrawal could
+  still submit it — one duplicate machine message, never a lost one.
+- A launch clears the request dir; the beat re-writes the head (same `at`) for the new process.
+  An entry for an earlier conversation (`csid` ≠ the pinned id: a clear-context restart) or a
+  session no longer running is dropped, with a log line. A pending submit counts as undelivered input, so a
+  sleeper is never paused over it (`_input_undelivered`).
+- No compaction outbox: the message is submitted only while idle, so it starts its own turn and
+  is a normal transcript entry before any compaction can run (`_pending_scan` has nothing to
+  resend). The mod's text cap is `SUBMIT_MAX` (20000), matching `MOD_SUBMIT_MAX`.
+- The chat shows it as a Turma message, frame stripped (`_plugin_message`, `agent-entry-blocks.md`).
 
 ## `/turma` commands (XERK-2131 task 3)
 
@@ -100,12 +135,31 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
     describe this as closing prompt injection.
 - `cell()` also breaks up every pane busy marker (`PANE_BUSY_MARKERS`,
   `QWEN_PANE_BUSY_MARKERS`, the ⏵/⏸ footer glyphs): `_busy_from_capture` matches them
-  anywhere on screen, so a peer's text in the pane would read an idle session busy. An
-  operator's `TURMA_PANE_BUSY_MARKERS` override is not covered (the mod cannot see it).
+  anywhere on screen, so a peer's text in the pane would read an idle session busy.
+- **An operator's `TURMA_PANE_BUSY_MARKERS` override reaches the mod as `TURMA_BUSY_MARKERS`**
+  (`bridge_busy_markers`, launch env on both OSes): the mod cannot see the agent's env.
+  `unmarked()` breaks each literal marker of 2+ chars over whole output LINES (a marker can span
+  cells) to a fixed point (a break can make another marker): spaces → `-`, else `-` after char 1;
+  what still matches is deleted. Peer rows are broken BEFORE sizing and the pointer line is sized
+  as printed, so it is never cut; its words are broken, its path (the agent's own) never.
 - "(you)" is the row matching BOTH `TURMA_SESSION_ID` and `TURMA_DEVICE` (ids are unique per
   host only). `wake` passes `--` so a reason word starting with `-` is text.
 - Request-dir writes go through `_write_mod_file` (mkstemp + rename: never a planted link);
   `_publish_mod_status` guards each session on its own and rewrites a deleted `status.json`.
+- A non-file `status.json` (a session-made dir) is skipped quietly, and any other standing
+  failure logs once per session and cause: the beat retries every few seconds.
+
+## Evaluated and not adopted (XERK-2131, operator decision 2026-10-20)
+
+- **Model tools** (`$.tool.register`): they work (no prompt under `auto`; a result must be a
+  string, an object fails the call), but would duplicate the session CLI and the roster file,
+  giving the model two paths for one action. Re-propose only with a need the CLI cannot meet.
+- **Policy via `prompt.compose`**: the launch-time `--append-system-prompt` already works; a
+  section that changes mid-session invalidates the prompt cache on every change, fleet-wide.
+- **Usage from `session.usage`**: transcripts are the counted source (`agent-usage.md`); a
+  second source covering only mod sessions adds double-count risk for no new fact.
+- **Wake-ups and hub nudges through `$.prompt.submit`**: worth doing, not done — XERK-2135
+  (the chat view must first render plugin-origin prompts).
 
 ## Invariants
 
@@ -138,14 +192,17 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 - **Loading also rides a server-side flag** (`tengu_plugin_hooks_modules`, seen in
   `~/.claude.json`) the version gate cannot see. Off → no file → the pane alone, as before.
 - **After a `/clear` the signal is off for that process** (new session id ≠ pinned id).
-- **Pre-existing gap it exposes**: a dialog `parse_pane_prompt` misses (an MCP elicitation?)
-  reads busy for up to the quiet bound instead of idle.
+- **Skipped under ANY blocking dialog too** (XERK-2142): `_pane_status` leaves
+  `_pane_blocking_dialog` on `state["paneDialog"]`, and the fold skips it, so an MCP elicitation
+  or the native picker (no `panePrompt`) reads waiting, not busy for the quiet bound.
 - Verified headless on 2.1.304: `claude -p --plugin-dir` loads it with no prompt and writes
   idle → running → idle (seq 3).
 
 ## Tests
 
 - `TestModStatus` (status.json: content, only-on-change, link refusal, never raises).
+- `TestMachineInputViaMod` (mod-routed machine messages: request, FIFO + ids, fallback, the
+  idle-only timeout, relaunch, conversation change, nudge vs operator, wake), `TestPluginMessage`.
 - `TestReconcileRcNamesViaMod` (mod-routed rename: request, ack, retry-then-stop, re-ask,
   stale answer, never typed beside, name rule, FIFO answer).
 - `TestBridgeMod` (gate, shipped files, reader incl. FIFO, the fold, report claude-only),

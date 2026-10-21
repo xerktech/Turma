@@ -24,6 +24,21 @@ Split out of `agent.md` (size ceiling).
   - **SendUserFile → `files[]`+`caption`** (XERK-221, oversize past `SEND_FILE_MAX_BYTES` → name-only
     chip): image/SVG as base64 data URI, a `render` page
     as raw markup, else a name chip (never opened). Only image/html paths are read and bounded.
+- **A plugin's prompt is not the operator's** (XERK-2135, `_plugin_message`/`pluginMessage`): a
+  user entry with `origin.kind == "plugin"` becomes ONE `text` block with Claude Code's
+  "The <name> plugin sent a message:" frame stripped and `origin` set — `"turma"` for the bridge
+  mod, `"system"` for another plugin. Keyed on the structured origin, never the text; its text
+  is never re-read as a notification or command. Clients take a tagged origin over
+  `messageOrigin` (`chat.js` `MSG_ORIGIN_TAGS`, Android `TextBlock.origin`), and
+  `_is_operator_row` does not count it. Tests: `TestPluginMessage` ↔ its `tunnel-agent.test.js` twin.
+- **A `!` command that printed nothing keeps its output row**: an empty `command_output` block
+  (renderers say "(no output)") and flat text `NO_OUTPUT_TEXT`; without it `! true` read like a
+  pending command. A slash command's empty stdout still drops (most print none), and so does
+  prose QUOTING empty bash tags: the flag needs the turn to OPEN with the tag.
+- The tag-lead regexes take `[ \t\r\n]`, never `\s`: python's and JS's `\s` differ (parity).
+- **Slash output is read to its LAST closing tag**: Claude Code writes it UNESCAPED, so output
+  printing `</local-command-stdout>` lost its tail. A turn OPENING with an output tag is output: a
+  `<command-name>`/`<bash-*>`/other-stream tag inside its body is text.
 - `compact_boundary` and `pr-link` markers; pr-link entries carry no uuid so the feeds synthesize a
   stable id from the URL alone, deduped over the whole conversation (Claude re-stamps pr-links atop
   every user turn, so one PR yields ~6 entries — folding only consecutive repeats is not enough).

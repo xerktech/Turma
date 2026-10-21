@@ -500,6 +500,21 @@ test("attention: Ready for review lists every hub needs-you session, oldest firs
   assert.ok(!els4.review.innerHTML.includes("Hub Says Working"), els4.review.innerHTML);
 });
 
+// XERK-2152: a session held on a terminal-only dialog is Ready for review and says
+// where to answer it.
+test("attention: a terminal-only dialog is listed and says to open the terminal", () => {
+  const { render, els } = loadPage();
+  const t = Date.now();
+  const { now, host: h } = host([
+    { ...running("64444", "Mcp Gate", { paneBusy: false, transcriptAgeSec: 30 }),
+      attention: { state: "needs-you:dialog", since: t - 2 * 60 * 1000, why: "a dialog in the terminal" } },
+  ]);
+  render({ now, agents: [h] });
+  const r = els.review.innerHTML;
+  assert.ok(r.includes('<div class="state waiting">waiting on a dialog in the terminal</div>'), r);
+  assert.match(r, /<div class="why">for\s2m<\/div>/);
+});
+
 // XERK-1571 screenshot pass. A permission card says it waits for PERMISSION and
 // names the pending command (the hub's why), never the dialog's generic
 // question; a stalled card carries ONE age (the stall's), not the wait's start
@@ -2773,7 +2788,7 @@ test("ended pane: closed ingest and failed loads are not worded as 'not synced y
   const since = Date.now() - 3 * 86400e3;
   let html = await open(() => ({ ok: false, status: 404,
     json: async () => ({ error: "unknown transcript", ingestClosed: { since } }) }));
-  assert.match(html, /has not been accepting archive pushes since/);
+  assert.match(html, /has been reloading its archive index since/);
   assert.match(html, /3d ago/);
   assert.doesNotMatch(html, /within a few minutes/);
   assert.match(html, /Resume still works/);
@@ -2782,7 +2797,7 @@ test("ended pane: closed ingest and failed loads are not worded as 'not synced y
   html = await open(() => ({ ok: false, status: 404, json: async () => ({
     refused: { host: "nas", error: "too big" }, ingestClosed: { since } }) }));
   assert.match(html, /nas&rsquo;s last push/);
-  assert.match(html, /not been accepting archive pushes/);
+  assert.match(html, /reloading its archive index/);
 
   // A garbage `since` is not a date to print — fall back to plain not-here-yet.
   html = await open(() => ({ ok: false, status: 404,
@@ -3704,7 +3719,7 @@ test("trajectory pane: closed ingest and a refused push are not worded as 'syncs
   };
   const since = Date.now() - 3 * 86400e3;
   let html = await open({ error: "no trajectory for this session", ingestClosed: { since } });
-  assert.match(html, /has not been accepting archive pushes since/);
+  assert.match(html, /has been reloading its archive index since/);
   assert.doesNotMatch(html, /within a few beats/);
   page.els.trajScroll.dataset.loaded = "";
   html = await open({ error: "no trajectory for this session", refused: { host: "nas", error: "too big" } });

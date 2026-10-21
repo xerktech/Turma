@@ -26,6 +26,8 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
 - Stdlib only, run with `-SsE`. Not a gate, so it keeps that spelling, not the hooks' `-SI`
   (`agent-hooks.md`, XERK-1681): its allow rule and taught commands match it.
 - Subcommands, each writing `~/.turma/session-requests/<TURMA_SESSION_ID>/<subcommand>.json`:
+  - Every token after `wake`'s FIRST `--` is reason text, a later `--` included
+    (`_wake_words_verbatim`): argparse drops later ones, and the bridge mod runs `wake -- …`.
   - `wake <duration> <reason…>` → `{wakeAt (epoch ms), reason, requestedAt}`. Durations are
     `20m`/`2h`/`1h30m`-style (`s`/`m`/`h`/`d`), above zero, at most 7 days; reason ≤200 chars.
   - `close-ticket <done|not-reproducible|already-fixed> --note "<evidence>"` →
@@ -90,10 +92,11 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   (`wakeAt` a positive safe integer, `wakeReason` a string capped at 200). A `wakeAt` still ahead
   is the session SLEEPING (`turma-attention.md`, XERK-1571).
 - **On the beat, a time compare only** (`_deliver_due_wakes`): a RUNNING session whose
-  `now ≥ wakeAt` gets `_stage_input(sid, "Wake-up: <reason>. Check it and continue.")` — the
-  operator path, delivered off the beat by the input worker and kept through a compaction by the
-  `pendingInputs` outbox. Then the fields are cleared and `wake.json` removed — unless the session
-  has since written a DIFFERENT request, which stands. `_wake_fired` stops a file that could not be
+  `now ≥ wakeAt` gets "Wake-up: <reason>. Check it and continue." through `_stage_machine_input`
+  — the bridge mod while it is live (`agent-bridge-mod.md`, XERK-2135), else the operator path,
+  delivered off the beat by the input worker and kept through a compaction by `pendingInputs`.
+  Then the fields are cleared and `wake.json` removed — unless the session has since written a
+  DIFFERENT request, which stands. `_wake_fired` stops a file that could not be
   removed from firing twice.
 - **After ingest the RECORD is authoritative, not the file.** A beat with no `wake.json` keeps the
   record's `wakeAt`, so deleting the file does not cancel. A newer `wake` supersedes; nothing

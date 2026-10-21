@@ -74,13 +74,14 @@ async function loadMod() {
   return mod;
 }
 
-async function harness({ runRejects, env = {}, procResult } = {}) {
+async function harness({ runRejects, env = {}, procResult, submitResults } = {}) {
   const { register } = await loadMod();
   const files = new Map();
   const runs = [];
   const procs = [];
   const registered = [];
   const timers = [];
+  const submits = [];
   const hooks = {};
   const $ = {
     env: {
@@ -98,6 +99,14 @@ async function harness({ runRejects, env = {}, procResult } = {}) {
       write: async (p, t) => { files.set(p, t); },
     },
     clock: { every: (ms, fn) => { timers.push(fn); return () => {}; } },
+    prompt: {
+      submit: async input => {
+        submits.push(input);
+        const r = submitResults && submitResults.shift();
+        if (r instanceof Error) throw r;
+        return r || { text: input.text, origin: { kind: "plugin", name: "turma-bridge" } };
+      },
+    },
     command: {
       register: async spec => { registered.push(spec); return { command: spec.name }; },
       run: async e => {
@@ -111,7 +120,7 @@ async function harness({ runRejects, env = {}, procResult } = {}) {
   register((name, matcher, hook) => { hooks[name] = hook || matcher; }, {});
   const settle = () => new Promise(r => setTimeout(r, 5));
   const h = {
-    files, runs, procs, registered,
+    files, runs, procs, registered, submits,
     async turma(args) { return (await hooks["command.run"]($, { command: "turma", args }, async x => x)).text; },
     async event(name, e) { await hooks[name]($, e, async x => x); await settle(); },
     hooks, $,
@@ -119,6 +128,9 @@ async function harness({ runRejects, env = {}, procResult } = {}) {
     turn() { return JSON.parse(files.get("/s/turn.json")).turn; },
     ask(name, at) { files.set("/r/rename.json", JSON.stringify({ v: 1, name, at })); },
     done() { return files.has("/r/rename.done.json") ? JSON.parse(files.get("/r/rename.done.json")) : null; },
+    submit(text, at) { files.set("/r/submit.json", JSON.stringify({ v: 1, text, at })); },
+    submitted() { return files.has("/r/submit.done.json") ? JSON.parse(files.get("/r/submit.done.json")) : null; },
+    stopped() { return JSON.parse(files.get("/s/turn.json")).stopped === true; },
   };
   await h.event("session.start", { cwd: "/", surface: "terminal", isInteractive: true });
   return h;
@@ -227,6 +239,134 @@ test("a turn that starts while the request is being read stops the run", async (
   assert.equal(h.done(), null);
 });
 
+// XERK-2135: Turma's machine messages through $.prompt.submit.
+test("a submit runs only while the main turn is idle, once per request", async () => {
+  const h = await harness();
+  await h.event("turn.start", { text: "go", turnId: "t1" });
+  h.submit("Wake-up: check CI. Check it and continue.", 100);
+  await h.tick();
+  assert.deepEqual(h.submits, [], "mid-turn it would wait in Claude Code's queue");
+  await h.event("turn.complete", { turnId: "t1", isAborted: false, reason: "answer" });
+  await h.tick();
+  assert.deepEqual(h.submits, [{ text: "Wake-up: check CI. Check it and continue." }]);
+  assert.equal("asUser" in h.submits[0], false, "framed as the plugin's, never the person's");
+  assert.deepEqual(h.submitted(), { v: 1, at: 100, ok: true });
+  await h.tick();
+  assert.equal(h.submits.length, 1, "one submit per request");
+  h.submit("next", 101);
+  await h.tick();
+  assert.equal(h.submits.length, 2, "a newer request runs");
+});
+
+test("after an interrupted turn a submit waits for the person's next turn", async () => {
+  const h = await harness();
+  await h.event("turn.start", { text: "go", turnId: "t1" });
+  await h.event("turn.complete", { turnId: "t1", isAborted: true, reason: "aborted" });
+  assert.equal(h.stopped(), true, "the turn state says so, so the agent waits too");
+  h.submit("After esc", 110);
+  await h.tick();
+  assert.deepEqual(h.submits, []);
+  assert.equal(h.submitted(), null);
+  await h.event("turn.start", { text: "next", turnId: "t2" });
+  assert.equal(h.stopped(), false);
+  await h.event("turn.complete", { turnId: "t2", isAborted: false, reason: "answer" });
+  await h.tick();
+  assert.equal(h.submitted().ok, true);
+});
+
+test("a 'stopped' drop is not an answer; the next turn retries it", async () => {
+  // Measured on 2.1.305: the prompt resolves { drop } rather than rejecting.
+  const h = await harness({ submitResults: [{ drop: "the session was stopped and nobody has sent input since" }] });
+  h.submit("Retry me", 120);
+  await h.tick();
+  assert.equal(h.submitted(), null);
+  await h.tick();
+  assert.equal(h.submits.length, 1, "it waits; it does not hammer the drop");
+  await h.event("turn.start", { text: "hi", turnId: "t3" });
+  await h.event("turn.complete", { turnId: "t3", isAborted: false, reason: "answer" });
+  await h.tick();
+  assert.equal(h.submitted().ok, true);
+  assert.equal(h.submits.length, 2);
+});
+
+test("a 'stopped' drop is published, and again after a turn the person did not start", async () => {
+  // QA on 2.1.305: Esc, then a background shell finishing starts and ends a turn.
+  // That clears the mod's flag while Claude Code stays stopped; the next submit
+  // is dropped again, and the turn state must say so, or the agent times out
+  // and types the message into the pane past the person's stop.
+  const stop = { drop: "the session was stopped and nobody has sent input since" };
+  const h = await harness({ submitResults: [stop, stop] });
+  h.submit("Wait for the person", 150);
+  await h.tick();
+  assert.equal(h.stopped(), true, "the drop is published");
+  await h.event("turn.start", { text: "", turnId: "bg1" });   // a background completion
+  await h.event("turn.complete", { turnId: "bg1", isAborted: false, reason: "answer" });
+  assert.equal(h.stopped(), false);
+  await h.tick();
+  assert.equal(h.submits.length, 2, "retried once idle");
+  assert.equal(h.stopped(), true, "dropped again, and published again");
+  assert.equal(h.submitted(), null);
+});
+
+test("a 'stopped' refusal landing mid-turn keeps the turn running, and its end says stopped", async () => {
+  const h = await harness();
+  let release;
+  h.$.prompt.submit = (input) => { h.submits.push(input); return new Promise(r => { release = r; }); };
+  h.submit("slow", 170);
+  await h.tick();
+  await h.event("turn.start", { text: "", turnId: "bg2" });
+  release({ drop: "the session was stopped and nobody has sent input since" });
+  await new Promise(r => setTimeout(r, 10));
+  assert.equal(h.turn(), "running");
+  assert.equal(h.stopped(), true);
+  await h.event("turn.complete", { turnId: "bg2", isAborted: false, reason: "answer" });
+  assert.equal(h.turn(), "idle");
+  assert.equal(h.stopped(), true);
+});
+
+test("a 'stopped' rename refusal is published too", async () => {
+  const h = await harness({ runRejects: ["HooksError: the session was stopped and nobody has sent input since"] });
+  h.ask("Later", 160);
+  await h.tick();
+  assert.equal(h.stopped(), true);
+});
+
+test("another drop or a rejection is answered ok:false; an unusable text is refused", async () => {
+  const d = await harness({ submitResults: [{ drop: "a hook said no" }] });
+  d.submit("x", 130);
+  await d.tick();
+  assert.deepEqual(d.submitted(), { v: 1, at: 130, ok: false, error: "a hook said no" });
+  const r = await harness({ submitResults: [new Error("boom")] });
+  r.submit("x", 131);
+  await r.tick();
+  assert.equal(r.submitted().ok, false);
+  assert.match(r.submitted().error, /boom/);
+  for (const [text, at] of [["   ", 132], ["x".repeat(20001), 133], [42, 134]]) {
+    const u = await harness();
+    u.files.set("/r/submit.json", JSON.stringify({ v: 1, text, at }));
+    await u.tick();
+    assert.deepEqual(u.submits, [], JSON.stringify(text).slice(0, 20));
+    assert.equal(u.submitted().ok, false);
+  }
+});
+
+test("a turn that starts while the submit request is being read stops it", async () => {
+  const h = await harness();
+  h.submit("Racy", 140);
+  const read = h.$.fs.read;
+  let fired = false;
+  h.$.fs.read = async p => {
+    if (!fired && p.endsWith("submit.json")) {
+      fired = true;
+      await h.hooks["turn.start"](h.$, { text: "typed", turnId: "t9" }, async x => x);
+    }
+    return read(p);
+  };
+  await h.tick();
+  assert.deepEqual(h.submits, []);
+  assert.equal(h.submitted(), null);
+});
+
 test("/turma is registered, immediate, and answers help by default", async () => {
   const h = await harness();
   assert.equal(h.registered.length, 1);
@@ -309,6 +449,63 @@ test("/turma wake runs the session CLI, which validates it", async () => {
   assert.equal(await h.turma("WAKE 1m caps"), "wake requested in 30m", "subcommands ignore case");
   const bad = await harness({ procResult: { exitCode: 2, stdout: "", stderr: "usage: x\nrefused: duration too long" } });
   assert.equal(await bad.turma("wake 99d x"), "refused: duration too long", "the reason line, not usage");
+});
+
+test("an operator's custom busy markers are broken up too", async () => {
+  // TURMA_PANE_BUSY_MARKERS is the agent's: the launch exports the effective
+  // list as TURMA_BUSY_MARKERS, and a peer's text holding one must not make
+  // the idle pane read busy (_busy_from_capture matches it anywhere).
+  const h = await harness({ env: { TURMA_BUSY_MARKERS: "esc to interrupt|Thinking hard|working…|x|a.b" } });
+  h.files.set("/t/peers.tsv", "zz\tP\thost2\tR\t\tTHINKING hard; still Working… on aXb and a.b\n");
+  const out = await h.turma("peers");
+  assert.doesNotMatch(out, /thinking hard|working…|a\.b/i);
+  assert.match(out, /THINKING-hard/);
+  assert.match(out, /W-orking…/);
+  assert.match(out, /aXb/, "a marker is literal text (a.b), and one character (x) is ignored");
+  // Past 20 markers, a marker a break makes (ab → a-b), and one spanning
+  // two cells (host/repo) are all broken too (QA).
+  const many = Array.from({ length: 25 }, (_, i) => `mk${i}x`).join("|");
+  const m = await harness({ env: { TURMA_BUSY_MARKERS: `${many}|a-b|ab|h1/r1` } });
+  m.files.set("/t/peers.tsv", "zz\tP\th1\tr1\t\tmk24x and ab\n");
+  const mo = await m.turma("peers");
+  assert.doesNotMatch(mo, /mk24x|a-b|ab|h1\/r1/i);
+  assert.match(mo, /a--b/, "broken to a fixed point, not deleted");
+  // A marker a break cannot undo (`-a`) is deleted; none is ever left.
+  const d = await harness({ env: { TURMA_BUSY_MARKERS: "-a" } });
+  d.files.set("/t/peers.tsv", "zz\tP\th\tr\t\tAA--A -a --aa ---aaa\n");
+  assert.doesNotMatch(await d.turma("peers"), /-a/i);
+  // The head lines and the pointer's own words are broken too; the path is exact.
+  const hd = await harness({ env: { TURMA_BUSY_MARKERS: "session(s)|more in|ct" } });
+  hd.files.set("/t/peers.tsv", Array.from({ length: 300 }, (_, i) =>
+    `z${i}\tP${i}\th\tr\t\t${"x ".repeat(30)}\n`).join(""));
+  const ho = await hd.turma("peers");
+  assert.doesNotMatch(ho, /session\(s\)|more in|ct/i);
+  assert.match(ho, /…and \d+ more-in \/t\/peers\.tsv$/);
+  // A pointer whose count itself breaks (`116` → `1-16`) is longer than the
+  // reserve: rows are dropped until it fits (QA: 4001 chars without that).
+  const pp = await harness({ env: { TURMA_BUSY_MARKERS: "11" } });
+  // Sized so the kept rows end exactly at the reserve (found by search: without
+  // the pop loop this prints 4001 chars).
+  pp.files.set("/t/peers.tsv", Array.from({ length: 151 }, (_, i) =>
+    `z${i}\t${"n".repeat(i === 1 ? 72 : 14)}\th\tr\t\t${"t".repeat(66)}\n`).join(""));
+  const po = await pp.turma("peers");
+  assert.ok(po.length <= 4000, String(po.length));
+  assert.match(po, /…and [\d-]+ more in \/t\/peers\.tsv$/);
+  // Breaking never pushes the roster pointer out, nor rewrites its path.
+  const big = await harness({ env: { TURMA_BUSY_MARKERS: "ab|peers.tsv" } });
+  big.files.set("/t/peers.tsv", Array.from({ length: 300 }, (_, i) =>
+    `z${i}\tP${i}\th\tr\t\t${"ab ".repeat(20)}\n`).join(""));
+  const bo = await big.turma("peers");
+  assert.ok(bo.length <= 4000, String(bo.length));
+  assert.match(bo, /…and \d+ more in \/t\/peers\.tsv$/);
+  // A capital sigma reads as σ to the agent mid-word (`åΣx`): broken too.
+  const sg = await harness({ env: { TURMA_BUSY_MARKERS: "åσ" } });
+  sg.files.set("/t/peers.tsv", "zz\tP\th\tr\t\tåΣx\n");
+  assert.match(await sg.turma("peers"), /å-Σx/);
+  // Without the variable only the built-in markers are broken.
+  const plain = await harness();
+  plain.files.set("/t/peers.tsv", "zz\tP\thost2\tR\t\tThinking hard\n");
+  assert.match(await plain.turma("peers"), /Thinking hard/);
 });
 
 test("printed text cannot close Claude Code's output wrapper or fake a busy pane", async () => {

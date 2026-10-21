@@ -469,6 +469,20 @@ export function questionSheetActive(
   return !!question && sess.mic === "idle" && sess.draft === "";
 }
 
+// The box status over a draft that Send would post as an ordinary prompt
+// although it was dictated as an answer (draftSendsAsPrompt).
+export const STALE_ANSWER_STATUS = "question gone: sends as prompt";
+
+// Whether the box's draft was dictated as an answer ("Dictate answer…") but
+// the session shows no question now — answered elsewhere, withdrawn, or hidden
+// by the wearer's own answer mask. Send posts it as an ordinary prompt then
+// (app.ts submitText), so the box and the Send row must say so first.
+export function draftSendsAsPrompt(state: AppState, sess: SessionScreenState): boolean {
+  if (!sess.draft) return false;
+  if (sess.staleAnswer) return true;
+  return sess.answerFor !== undefined && !findSessionLocal(state, sess.hostKey, sess.sessionId)?.session?.question;
+}
+
 // Builds the session screen's bottom bar — an AskUserQuestion sheet when the
 // session has a pending question, otherwise the free-text dictation input —
 // from the session's live signals plus its focus/draft/mic/selected fields
@@ -500,7 +514,9 @@ function renderSessionBottom(state: AppState, sess: SessionScreenState): BottomM
   // Once there's a typed/dictated draft, hide the background status so it
   // doesn't crowd the text. Mic indicators ([REC]/[…]/[!]) are the user's own
   // action, so keep those — only the idle live status is suppressed.
-  const boxStatus = mic === "idle" && draft.length > 0 ? "" : status;
+  // A stale answer is the exception: the wearer must see it before Send.
+  const stale = mic === "idle" && draftSendsAsPrompt(state, sess);
+  const boxStatus = stale ? STALE_ANSWER_STATUS : mic === "idle" && draft.length > 0 ? "" : status;
   return { mode: "input", lines: inputBoxBody({ text: draft, focused, mic, viewOffset }), status: boxStatus, focused };
 }
 
@@ -601,16 +617,17 @@ export function buildActionsRows(state: AppState, hostKey: string, sessionId: st
       { action: "home", text: "Home" },
     ];
   }
-  const draft =
-    state.session && state.session.hostKey === hostKey && state.session.sessionId === sessionId
-      ? state.session.draft
-      : "";
+  const own = state.session && state.session.hostKey === hostKey && state.session.sessionId === sessionId
+    ? state.session
+    : null;
+  const draft = own?.draft ?? "";
   const rows: ActionRow[] = [{ action: "back", text: "Back" }];
   if (draft) {
     // Send acts on the dictated draft, Clear discards it, "Dictate more"
     // appends another dictation (the append a bare tap used to do in place —
     // now an explicit choice so a tap doesn't record over text).
-    rows.push({ action: "send", text: "Send" });
+    // Said outright when that draft was an answer whose question is gone.
+    rows.push({ action: "send", text: own && draftSendsAsPrompt(state, own) ? "Send as prompt" : "Send" });
     rows.push({ action: "clear", text: "Clear" });
     rows.push({ action: "dictate", text: "Dictate more" });
   }

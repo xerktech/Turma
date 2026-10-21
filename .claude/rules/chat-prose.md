@@ -3,6 +3,9 @@ paths:
   - "turma/public/chat.js"
   - "glasses/src/vendor/chat.cjs"
   - "turma/tests/chat.test.js"
+  - "turma/tests/prose-parity.js"
+  - "turma/tests/prose-parity.test.js"
+  - "android/app/src/test/java/com/xerktech/turma/core/ProseParityTest.kt"
   - "android/app/src/main/java/com/xerktech/turma/core/Prose.kt"
   - "android/app/src/test/java/com/xerktech/turma/core/ProseTest.kt"
   - "android/app/src/main/java/com/xerktech/turma/core/ChatItems.kt"
@@ -103,6 +106,15 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
       counted against `SVG_EMBEDDED_MAX_PIXELS`, plus a render deadline; past it → alt text.
     - **Never go back to a text pre-scan of the SVG for data URIs**: each one lost to the parser (a
       mime past the scan's cap, a raw quote inside the payload that `Base64.decode` skips).
+  - **A viewBox-only SVG `<img>` carries `width`/`height` attributes on the web** (`svgSizeAttrs`,
+    XERK-2161): with no intrinsic size it laid out at 0 × 0 in a shrink-to-fit bubble or table cell.
+    The width is the one reaching `.md-img`'s 420px max-height, so it fills the bubble at its ratio
+    like Android's `svgFilledSize`. Never put `width: auto` back on `.md-svg` — it overrides them.
+  - **Android decodes a `data:` URI by its DECLARED type** (`DataImage` + `DeclaredBitmapDecoder`,
+    XERK-2161), as the browser does: SVG bytes behind `data:image/png` are broken, never sniffed.
+    - **Never `runBlocking { loader.execute(…) }` in a Robolectric test**: Coil resumes on the
+      paused main looper and it hangs forever (the Android CI job then times out). Drive the fetcher
+      and decoder factories of `turmaImageComponents()` directly (`DataImageTest`).
   - **A rule line is a SCAN (`isRuleLine`), never `/(?:-[ \t]*){3,}/`.** That regex is linear in V8
     but `java.util.regex` recurses once per iteration of a quantified GROUP, so the Android port of
     it threw an **uncatchable `StackOverflowError`** out of `parseProse` inside a Composable (an
@@ -114,12 +126,26 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
     not `find`, on the fully-anchored line patterns: **Java's `$` also matches BEFORE a final line
     terminator and JavaScript's does not.** Pinned by the U+2028/U+2029 cases in `chat.test.js` +
     `ProseTest.kt` — CR alone cannot pin it, because the normalisation below already handles CR.
-    - **One exotic-whitespace class still differs and is knowingly left.** U+0085 NEL is a Java
-      line terminator that JavaScript's `.` matches, so `## H<NEL>` is a heading on the web and
-      prose on Android. It appears nowhere in the real corpus. Don't assert either answer in a
-      test — that codifies the disagreement.
+    - **Kotlin spells JS's `.` out (`JS_DOT`)**: Java's `.` also refuses U+0085 NEL, so
+      `## H<NEL>` was a heading on the web and prose on Android (XERK-2140).
+    - **No `\d`, no `IGNORE_CASE` in a port**: a device's ICU reads `\d` as any Unicode digit,
+      and Kotlin's IGNORE_CASE folds Unicode, so `<ſvg>` (U+017F) was an image on Android. Use
+      `[0-9]` and spelled-out `[sS][vV][gG]`; the JVM unit tests cannot see the ICU half.
     - `FENCE_OPEN`'s `\s` is JavaScript's on both (Prose.kt / ChatItems.kt spell it as `JS_WS`):
       the JVM's `\s` is ASCII and a device's ICU one is Unicode, so neither runtime's own will do.
+  - **Web ⇄ Android parity is CI-gated over one shared corpus** (XERK-2140). `prose-parity.js`
+    generates a seeded corpus, reads each `renderProse` HTML back into a canonical tree, and
+    writes `android/app/src/test/resources/prose-parity.json`; `ProseParityTest.kt` holds
+    `parseProse` to it. `prose-parity.test.js` fails while the fixture is stale.
+    - **After ANY `renderProse` change, run `node turma/tests/prose-parity.js` and commit the
+      fixture** — then the Android test says whether `Prose.kt` still agrees.
+    - The canonical tree folds ONLY the deliberate differences named in this file (list grouping,
+      whitespace-only paragraphs, the SVG boundary newline). A new fold declares a difference
+      deliberate: document it here or don't add it.
+    - Widen the hunt locally with `PROSE_PARITY_CASES` / `PROSE_PARITY_SEED` / `PROSE_PARITY_LEN`
+      (then regenerate at the defaults before committing).
+  - **A lone UTF-16 surrogate inside an SVG block becomes U+FFFD on both** — `encodeURIComponent`
+    throws on one, which took `renderProse` and the whole repaint down (XERK-2140).
   - **Line endings are normalised at EVERY entry point** — `renderProse` AND `renderInline` on the
     web, `parseProse` on Android (its only one). Every block rule ends
     `[ \t]*$`, so the `\r` that `split("\n")` leaves behind defeated all of them and a CRLF message
@@ -144,6 +170,8 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
     agree (verified against 3,000 real transcript blocks), but a marker switch at one depth opens a
     second list on the web and stays one flat block on Android. That grouping difference is
     deliberate and cosmetic — don't "fix" it by making the web stop distinguishing `<ul>` from `<ol>`.
+    - Android's bullet markers are the browser's `<ul>` defaults — `•`, `◦`, then `▪` from depth 2
+      down (`.md-list` sets no `list-style-type`); change both or neither.
   - **The live bubble uses `renderInline`, never `renderProse`** — `parsePaneLiveTurn` reflows the
     pane's hard-wrapped lines into ONE line, so a block pass has no line structure to read.
   - Every prose surface is styled as the same complete set — `.tr-msg`, `.thought-body`,

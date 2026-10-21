@@ -167,7 +167,47 @@
   // static mode (no scripts, no external fetches). Both attrs are esc()'d.
   function imgTag(url, alt, cls) {
     return '<img class="md-img' + (cls ? " " + cls : "") + '" src="' + esc(url) +
-      '" alt="' + esc(alt || "") + '" loading="lazy">';
+      '" alt="' + esc(alt || "") + '"' + svgSizeAttrs(url) + ' loading="lazy">';
+  }
+  // An SVG with a viewBox but no width/height has NO intrinsic size in an <img>,
+  // only a ratio, so in a shrink-to-fit bubble or table cell it laid out at 0 × 0
+  // (XERK-2161). Android fills the width offered at the viewBox's ratio, capped in
+  // height (svgFilledSize, XERK-2109, + ProseImage). The <img> gets the same: its
+  // width attribute is the width at which it reaches the .md-img max-height, so
+  // max-width:100% narrows it to the bubble and height:auto keeps the ratio.
+  // Anything else gets nothing: an SVG declaring a size, or with no viewBox,
+  // already sizes itself.
+  const SVG_FILL_MAX_H = 420;      // sessions.html .md-img max-height
+  function svgSizeAttrs(url) {
+    const u = String(url);
+    if (!/^data:image\/svg\+xml/i.test(u)) return "";
+    const comma = u.indexOf(",");
+    if (comma < 0) return "";
+    let svg;
+    try {
+      const payload = u.slice(comma + 1);
+      svg = /;base64/i.test(u.slice(0, comma)) ? atob(payload) : decodeURIComponent(payload);
+    } catch (e) { return ""; }
+    const open = svg.search(/<svg[\s>/]/i);
+    if (open < 0) return "";
+    const close = svg.indexOf(">", open);
+    const tag = svg.slice(open + 4, close < 0 ? svg.length : close);
+    // Walk the attributes in order, so a name inside another's quoted value
+    // (aria-label=" width='5'") is never read as one.
+    const attrs = {};
+    const ATTR = /([^\s=/>]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'>]+))?/g;
+    for (let m; (m = ATTR.exec(tag));) {
+      const name = m[1].toLowerCase();
+      if (!(name in attrs)) attrs[name] = m[2] == null ? "" : m[2].replace(/^["']|["']$/g, "");
+    }
+    const attr = (name) => (Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null);
+    // Absent, empty, auto or a percentage (100% is the default): no intrinsic size.
+    const unsized = (v) => v == null || /^\s*(?:auto)?\s*$|%\s*$/i.test(v);
+    if (!unsized(attr("width")) || !unsized(attr("height"))) return "";
+    const vb = (attr("viewbox") || "").trim().split(/[\s,]+/).map(Number);
+    if (vb.length !== 4 || !(vb[2] > 0 && vb[2] < Infinity) || !(vb[3] > 0 && vb[3] < Infinity)) return "";
+    const w = Math.min(1e6, Math.max(1, Math.round(SVG_FILL_MAX_H * vb[2] / vb[3])));
+    return ' width="' + w + '" height="' + SVG_FILL_MAX_H + '"';
   }
   // Render raw SVG source as an image (XERK-221). The markup is URL-encoded into a
   // data:image/svg+xml URI and shown through <img>, NOT injected into the DOM: an
@@ -175,8 +215,13 @@
   // in agent- or tool-emitted SVG can never execute or fetch. encodeURIComponent
   // leaves the result free of <, >, ", & (all percent-encoded), so it's inert in
   // the attribute; esc() is applied for uniformity with every other src above.
+  // A lone UTF-16 surrogate makes encodeURIComponent THROW (URIError), so one
+  // inside an agent's <svg> block took renderProse — and the whole repaint — down
+  // with it (XERK-2140). It becomes U+FFFD; Prose.kt's svgSource does the same.
+  const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
   function svgToImg(svg) {
-    return imgTag("data:image/svg+xml," + encodeURIComponent(String(svg).trim()), "", "md-svg");
+    const src = String(svg).trim().replace(LONE_SURROGATE, "\ufffd");
+    return imgTag("data:image/svg+xml," + encodeURIComponent(src), "", "md-svg");
   }
   function linkify(text) {
     const s = String(text == null ? "" : text);
@@ -1392,6 +1437,9 @@
   // already-archived transcripts uniformly with no re-store. Turma and subagent
   // markers are checked before the generic "Another Claude session" wrapper they
   // sit inside. Anything unrecognised stays "operator".
+  // The origins an agent may tag a text block with (hub-agent.py
+  // _plugin_message): anything else is ignored and the text classifies as usual.
+  const MSG_ORIGIN_TAGS = { turma: 1, system: 1 };
   function messageOrigin(text) {
     const t = String(text == null ? "" : text);
     if (t.indexOf("[Relayed by Turma") !== -1) return "turma";
@@ -1524,7 +1572,10 @@
           // Classify by their delivery framing so the renderer can set them
           // apart from real operator input (blue, right) — see messageOrigin.
           if (msg.role === "user") {
-            msg.origin = messageOrigin(msg.text);
+            // A plugin's prompt (a Turma wake-up or nudge through the bridge
+            // mod, XERK-2135) arrives tagged by the agent, frame already gone.
+            msg.origin = msg.tagged || messageOrigin(msg.text);
+            delete msg.tagged;
             msg.text = stripFraming(msg.text);
           }
           // A turn that was nothing but framing tags has nothing to show.
@@ -1538,6 +1589,7 @@
         if (b.t !== "command" && b.t !== "command_output") openCmd = null;
         if (b.t === "text") {
           if (!msg) msg = { kind: "msg", role, id: eid, text: "", truncated: false };
+          if (typeof b.origin === "string" && Object.prototype.hasOwnProperty.call(MSG_ORIGIN_TAGS, b.origin)) msg.tagged = b.origin;
           msg.text += b.text || "";
           if (b.truncated) msg.truncated = true;
         } else if (b.t === "thinking") {
@@ -1766,7 +1818,7 @@
       if (f.kind === "image" && typeof f.src === "string" && /^(data:image\/|https?:)/i.test(f.src)) {
         const svg = /^data:image\/svg\+xml/i.test(f.src);
         out += '<figure class="tool-file"><img class="md-img' + (svg ? " md-svg" : "") +
-          '" src="' + esc(f.src) + '" alt="' + name + '" loading="lazy">' +
+          '" src="' + esc(f.src) + '" alt="' + name + '"' + svgSizeAttrs(f.src) + ' loading="lazy">' +
           '<figcaption>' + name + "</figcaption></figure>";
       } else if (f.kind === "html" && typeof f.html === "string") {
         out += '<figure class="tool-file"><iframe class="md-embed" sandbox referrerpolicy="no-referrer"' +

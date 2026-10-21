@@ -1160,7 +1160,7 @@ data class SessionInfo(
 
 /**
  * One session's attention (XERK-1571). [state] is `needs-you:question` |
- * `needs-you:permission` | `needs-you:review` | `needs-you:test` |
+ * `needs-you:permission` | `needs-you:dialog` | `needs-you:review` | `needs-you:test` |
  * `needs-you:stalled` | `working` | `waiting` | `sleeping` | `idle`; [since] the
  * epoch ms it last changed; [eta] epoch ms for a wait/sleep with a known end;
  * [why] the one-line reason; [hint] the wait classifier's verdict (XERK-1572).
@@ -1456,7 +1456,13 @@ abstract class Block
 
 @Serializable
 @SerialName("text")
-data class TextBlock(val text: String = "", val truncated: Boolean = false) : Block()
+data class TextBlock(
+    val text: String = "",
+    val truncated: Boolean = false,
+    // Who sent a user turn the agent could attest (a bridge-mod prompt, XERK-2135):
+    // "turma" / "system", else empty and the text classifies by its framing.
+    val origin: String = "",
+) : Block()
 
 @Serializable
 @SerialName("thinking")

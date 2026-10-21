@@ -1102,7 +1102,8 @@ private fun SessionListCard(
                 ((dotState == com.xerktech.turma.core.LiveState.IDLE ||
                     dotState == com.xerktech.turma.core.LiveState.WORKING) &&
                     com.xerktech.turma.core.attentionStalled(r.session.attention))
-            if (r.session.status == "running" && r.session.attention?.state == "needs-you:permission") {
+            if (r.session.status == "running" && (r.session.attention?.state == "needs-you:permission" ||
+                    com.xerktech.turma.core.attentionDialog(r.session.attention))) {
                 // Blocked on a permission dialog: the waiting amber its state line has,
                 // whatever else is running (web liveState reads it `waiting` first).
                 StateDot(com.xerktech.turma.core.LiveState.WAITING)

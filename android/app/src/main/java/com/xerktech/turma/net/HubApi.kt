@@ -566,8 +566,9 @@ fun archiveMissingMessage(e: Throwable, nowMs: Long = System.currentTimeMillis()
         val at = java.text.DateFormat.getDateTimeInstance(
             java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT,
         ).format(java.util.Date(since))
-        "The hub has not been accepting archive pushes since $at (${agoText(nowMs - since)}), " +
-            "so this conversation can\u2019t reach the archive until it does."
+        "The hub has been reloading its archive index since $at (${agoText(nowMs - since)}). " +
+            "Until that finishes it can\u2019t find archived conversations or take new pushes, " +
+            "so this conversation may already be archived."
     }
     return listOfNotNull(refused, closed).joinToString(" ").ifEmpty { null }
 }

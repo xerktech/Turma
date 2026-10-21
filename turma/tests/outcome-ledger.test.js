@@ -907,8 +907,9 @@ test("XERK-1858: a pair's grade time, which the agent stamps, decides the eviden
 });
 
 // A fake pool honouring the rescan's SQL: a total (updated_at DESC, key DESC) order
-// and the tuple DELETE below the last loaded row.
-function orderedPool(table) {
+// and the tuple DELETE below the last loaded row, sparing rows within the grace of the
+// database clock `dbNow`.
+function orderedPool(table, dbNow = T0 + 30 * DAY) {
   const cmp = (a, b) => (Number(a.updated_at) - Number(b.updated_at)) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
   return {
     health: "ready",
@@ -923,9 +924,10 @@ function orderedPool(table) {
         }
         return [];
       }
-      if (/^DELETE .* WHERE \(updated_at, key\) < \(\$1::bigint, \$2::text\)$/.test(sql)) {
+      if (/^DELETE .* WHERE \(updated_at, key\) < \(\$1::bigint, \$2::text\) AND updated_at < \(extract\(epoch from clock_timestamp\(\)\) \* 1000\)::bigint - \$3::bigint$/.test(sql)) {
         const bound = { updated_at: params[0], key: params[1] };
-        for (const [k, v] of table) if (cmp(v, bound) < 0) table.delete(k);
+        const fresh = dbNow - Number(params[2]);
+        for (const [k, v] of table) if (cmp(v, bound) < 0 && Number(v.updated_at) < fresh) table.delete(k);
         return [];
       }
       if (/^DELETE/.test(sql)) { for (const k of params) table.delete(k); return []; }
@@ -934,16 +936,20 @@ function orderedPool(table) {
   };
 }
 
-async function rescanOver(stampOf, extra = 5) {
+function tableRow(i, at) {
+  const r = L.sanitizeRow({ site: `o${i % 8}.atlassian.net`, issue: "A-1", host: `h${i % 8}`,
+    sid: `s${i}`, cls: "bug", model: "opus", firstSeen: at, updatedAt: at });
+  return { key: r.key, updated_at: String(r.updatedAt), doc: JSON.stringify(r) };
+}
+
+async function rescanOver(stampOf, extra = 5, dbNow = undefined) {
   const table = new Map();
   for (let i = 0; i < L.MAX_ROWS + extra; i++) {
-    const at = stampOf(i);
-    const r = L.sanitizeRow({ site: `o${i % 8}.atlassian.net`, issue: "A-1", host: `h${i % 8}`,
-      sid: `s${i}`, cls: "bug", model: "opus", firstSeen: at, updatedAt: at });
-    table.set(r.key, { key: r.key, updated_at: String(r.updatedAt), doc: JSON.stringify(r) });
+    const row = tableRow(i, stampOf(i));
+    table.set(row.key, row);
   }
   L._internals.reset();
-  const store = new L.OutcomeLedgerPgStore(orderedPool(table));
+  const store = new L.OutcomeLedgerPgStore(orderedPool(table, dbNow));
   L._internals.setBackend(store);
   await store.rescan(T0 + 1000);
   await store._drain();
@@ -974,6 +980,19 @@ test("XERK-1858: the rescan's delete converges when every row shares one updated
   const { table, model } = await rescanOver(() => T0);
   assert.equal(table.size, L.MAX_ROWS);
   assert.deepEqual(new Set(table.keys()), model);
+});
+
+test("XERK-2137: the rescan's delete spares a fresh row a clock-behind replica stamped below the page edge", async () => {
+  // MAX_ROWS rows written in the last seconds; s0 is just as fresh but its replica's clock
+  // runs a minute behind, so it sorts below the page edge. s1 is genuinely old; s2 is just
+  // past the 10-minute grace.
+  const dbNow = T0 + L.MAX_ROWS + 1000;
+  const stamp = (i) => (i === 0 ? T0 - 60000 : i === 1 ? T0 - DAY : i === 2 ? dbNow - 11 * 60000 : T0 + i);
+  const { table } = await rescanOver(stamp, 3, dbNow);
+  assert.ok(table.has(tableRow(0, stamp(0)).key), "the skewed fresh row survives");
+  assert.ok(!table.has(tableRow(1, stamp(1)).key), "an old row past the page is still deleted");
+  assert.ok(!table.has(tableRow(2, stamp(2)).key), "a row past the grace is still deleted");
+  assert.equal(table.size, L.MAX_ROWS + 1);
 });
 
 test("XERK-1858: past MAX_ROWS an org drops orphaned shadows first, then a live row WITH its shadows", () => {
@@ -1040,5 +1059,124 @@ test("XERK-1858: at the cap a new shadow survives and grades; the oldest live ro
   assert.ok(!rows.has(oldest), "the oldest live row made room");
   assert.deepEqual(L.pairEvidence("bug", "haiku", { now: T0 + 6 * 15000 }), { graded: 1, mOnlyFail: 0 });
   assert.equal(log.deleted, 1, "one eviction, not one per tick");
+  L._internals.reset();
+});
+
+test("XERK-2109: a label naming two families reads as the one it names first", () => {
+  assert.equal(L.modelFamily("Sonnet 5 (successor to Opus 4)"), "sonnet");
+  assert.equal(L.modelFamily("Haiku 5, distilled from Sonnet 5 and Opus 5"), "haiku");
+  assert.equal(L.modelFamily("`Opus 5.5` (sonnet-priced)"), "opus");
+  L._internals.reset();
+  L.observe([obs({ model: null, modelDefault: "Sonnet 5 (successor to Opus 4)" })], T0);
+  assert.equal(only().model, "sonnet");
+  L._internals.reset();
+});
+
+test("XERK-2109: a model that is only the fallback is revised by a later probe", () => {
+  // No alias, no probe: the fleet fallback. A later probe names the real default.
+  L._internals.reset();
+  L.observe([obs({ model: null })], T0);
+  assert.equal(only().model, "opus");
+  assert.equal(only().modelGuess, true);
+  L.observe([obs({ model: null, modelDefault: "Sonnet 5" })], T0 + 1);
+  assert.equal(only().model, "sonnet");
+  assert.equal(only().modelGuess, undefined, "a probed model is no longer a guess");
+  // Once probed, a later beat with no probe (a closed record) never reverts it.
+  L.observe([obs({ model: null, running: false })], T0 + 2);
+  assert.equal(only().model, "sonnet");
+  // "default" with no probe yet is the fallback too, revised the same way.
+  L._internals.reset();
+  L.observe([obs({ model: "default" })], T0);
+  assert.equal(only().model, "opus");
+  L.observe([obs({ model: "default", modelDefault: "Haiku 5" })], T0 + 1);
+  assert.equal(only().model, "haiku");
+  L.observe([obs({ model: "default", running: false })], T0 + 2);
+  assert.equal(only().model, "haiku", "a beat with no probe never downgrades it to the fallback");
+  // A pinned alias is a claim, not a guess: a probe never overrides it.
+  L._internals.reset();
+  L.observe([obs({ model: "haiku" })], T0);
+  L.observe([obs({ model: null, modelDefault: "Sonnet 5" })], T0 + 1);
+  assert.equal(only().model, "haiku");
+  // A real model (modelKnown) is never revised by a probe or an alias.
+  L._internals.reset();
+  L.observe([obs({ model: null, modelActual: "claude-haiku-5" })], T0);
+  L.observe([obs({ model: "default", modelDefault: "Sonnet 5" })], T0 + 1);
+  assert.equal(only().model, "haiku");
+  assert.equal(only().modelGuess, undefined);
+  // The guess survives a file load / rescan, so a probe after a restart still revises it.
+  const stored = L.sanitizeRow({ site: "s.atlassian.net", issue: "ENG-1", host: "h", sid: "abc",
+    model: "opus", modelGuess: true, firstSeen: T0, updatedAt: T0 });
+  assert.equal(stored.modelGuess, true);
+  assert.equal(L.sanitizeRow({ ...stored, modelKnown: true }).modelGuess, undefined);
+  L._internals.reset();
+});
+
+// One host one live row over its cap, below MAX_ROWS overall, so only the host pass runs.
+function overHost(host = "busy") {
+  const per = Math.floor(L.MAX_ROWS / 4);
+  const rows = L._internals.rows();
+  const live = [];
+  for (let i = 0; i <= per; i++) {
+    const r = L.sanitizeRow({ site: "acme.atlassian.net", issue: `A-${i}`, host,
+      sid: `s${i}`, cls: "bug", model: "opus", firstSeen: T0 + i, updatedAt: T0 + i });
+    rows.set(r.key, r);
+    live.push(r.key);
+  }
+  const shadow = (i, pairOf, shHost, at = T0 + 100000) => {
+    const sh = L.sanitizeRow({ site: "acme.atlassian.net", issue: `A-${i}`, host: shHost,
+      sid: `sh-00112233${String(i).padStart(4, "0")}`, cls: "bug", model: "haiku", kind: "shadow",
+      pairOf, firstSeen: at, updatedAt: at });
+    rows.set(sh.key, sh);
+    return sh.key;
+  };
+  return { per, rows, live, shadow };
+}
+
+test("XERK-2109: a host over its cap evicts a live row together with its paired shadows", () => {
+  L._internals.reset();
+  recording();
+  const { rows, live, shadow } = overHost();
+  const doomed = shadow(0, live[0], "other");
+  const kept = shadow(1, live[1], "other");
+  const dropped = L._internals.evict(T0 + 200000);
+  assert.ok(!rows.has(live[0]), "the host's oldest live row goes");
+  assert.ok(!rows.has(doomed), "and its shadow goes with it, though on another host");
+  assert.ok(rows.has(kept) && rows.has(live[1]), "a younger pair stays whole");
+  assert.deepEqual(new Set(dropped), new Set([live[0], doomed]), "every dropped key is DELETEd");
+  const left = [...rows.values()];
+  const liveLeft = new Set(left.filter((r) => r.kind !== "shadow").map((r) => r.key));
+  assert.ok(left.filter((r) => r.kind === "shadow").every((r) => liveLeft.has(r.pairOf)), "no orphan left");
+  L._internals.reset();
+});
+
+test("XERK-2109: a live row dropped by retention takes its fresh shadow with it", () => {
+  L._internals.reset();
+  recording();
+  const rows = L._internals.rows();
+  const old = L.sanitizeRow({ site: "acme.atlassian.net", issue: "A-1", host: "h1", sid: "s1",
+    cls: "bug", model: "opus", firstSeen: T0, updatedAt: T0 });
+  rows.set(old.key, old);
+  const now = T0 + (L.RETAIN_DAYS + 1) * DAY;
+  const sh = L.sanitizeRow({ site: "acme.atlassian.net", issue: "A-1", host: "h2",
+    sid: "sh-001122330001", cls: "bug", model: "haiku", kind: "shadow", pairOf: old.key,
+    firstSeen: now - 1, updatedAt: now - 1 });
+  rows.set(sh.key, sh);
+  const dropped = L._internals.evict(now);
+  assert.equal(rows.size, 0, "the fresh shadow does not outlive its expired live row");
+  assert.deepEqual(new Set(dropped), new Set([old.key, sh.key]));
+  L._internals.reset();
+});
+
+test("XERK-2109: a shadow host's cap does not count the shadows a live eviction took", () => {
+  L._internals.reset();
+  recording();
+  const { per, rows, live, shadow } = overHost();
+  // "sh" holds its shadow cap PLUS the shadow of busy's doomed row, which is its NEWEST:
+  // once that pair goes "sh" is at its cap, so none of its older shadows may go.
+  const shadows = [];
+  for (let i = 0; i <= per; i++) shadows.push(shadow(i, live[i], "sh", T0 + 1000 + (per - i)));
+  L._internals.evict(T0 + 200000);
+  assert.ok(!rows.has(live[0]) && !rows.has(shadows[0]), "the doomed pair goes");
+  assert.equal(shadows.filter((k) => rows.has(k)).length, per, "no other shadow is dropped");
   L._internals.reset();
 });

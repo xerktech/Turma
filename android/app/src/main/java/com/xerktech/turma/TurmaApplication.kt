@@ -28,7 +28,7 @@ class TurmaApplication : Application(), ImageLoaderFactory {
                 cacheDir.resolve("image_cache").deleteRecursively()
                 DiskCache.Builder().directory(cacheDir.resolve("image_cache_served_type")).build()
             }
-            .components { add(SafeSvgDecoder.Factory()) }
+            .components(turmaImageComponents())
             .crossfade(true)
             .build()
 
