@@ -51532,6 +51532,43 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.shadow_runs[self.RID]["state"], "grading")
         self.assertEqual(sm.shadow_runs[self.RID]["note"], "(timed out)")
 
+    def reload_without_phase_at(self, sm):
+        """A restart onto a shadow-runs.json whose phaseAt is out of range, so
+        the load drops it (XERK-2148 QA)."""
+        with open(ha.SHADOW_RUNS_PATH) as f:
+            data = json.load(f)
+        data[self.RID]["phaseAt"] = float("inf")
+        with open(ha.SHADOW_RUNS_PATH, "w") as f:
+            json.dump(data, f)
+        sm2 = self.make_manager()
+        sm2._launch_ttyd = mock.Mock()
+        self.assertNotIn("phaseAt", sm2.shadow_runs[self.RID])
+        return sm2
+
+    def test_a_live_run_with_a_dropped_phase_time_times_out(self):
+        # A missing phaseAt read as `now` kept a live run from ever timing out.
+        sm = self.reload_without_phase_at(self.spawned())
+        self.assertTrue(sm._shadow_session_live(sm.shadow_runs[self.RID]["runSid"]))
+        sm._advance_shadow_runs()
+        self.assertEqual(sm.shadow_runs[self.RID]["state"], "grading")
+        self.assertEqual(sm.shadow_runs[self.RID]["note"], "(timed out)")
+
+    def test_a_live_grader_with_a_dropped_phase_time_times_out(self):
+        sm = self.spawned()
+        self.dirty = " M x.py"
+        self.request(sm.registry[0]["id"], "shadow-done", {"note": "fixed"})
+        sm._advance_shadow_runs()
+        self.assertEqual(sm.shadow_runs[self.RID]["state"], "grading")
+        sm = self.reload_without_phase_at(sm)
+        self.assertTrue(sm._shadow_session_live(sm.shadow_runs[self.RID]["gradeSid"]))
+        sm._advance_shadow_runs()        # this beat reaps the run session
+        self.assertEqual(sm.shadow_runs[self.RID]["state"], "grading")
+        self.assertTrue(sm._shadow_session_live(sm.shadow_runs[self.RID]["gradeSid"]))
+        sm._advance_shadow_runs()
+        r = sm.shadow_runs[self.RID]
+        self.assertEqual((r["state"], r["error"]),
+                         ("failed", "the grader ended without a grade"))
+
     def test_a_killed_shadow_is_never_resumed_or_moved_and_its_worktree_is_reaped(self):
         sm = self.spawned()
         sess = sm.registry[0]
