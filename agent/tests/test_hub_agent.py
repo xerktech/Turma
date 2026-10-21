@@ -35363,6 +35363,71 @@ class TestMrStatus(unittest.TestCase):
         self.assertIn("projects/grp%2Fsub%2Fapp/merge_requests/12",
                       gl.call_args[0][0])
 
+    def test_a_fast_forward_head_counts_only_on_its_target_branch(self):
+        # XERK-2156: GitLab rebases a fork MR at merge and keeps reporting the
+        # fork's head, on no branch here (real inkscape MRs): never a mergeCommit.
+        head = "ab" * 20
+        mr = {"iid": 12, "state": "merged", "web_url": self.MR, "sha": head,
+              "merge_commit_sha": None, "squash_commit_sha": None,
+              "target_branch": "main"}
+        calls = []
+
+        def answer(branches):
+            def get(path):
+                calls.append(path)
+                if "/refs?" in path:
+                    return branches if branches is None else [
+                        {"type": "branch", "name": b} for b in branches]
+                return dict(mr)
+            return get
+        p = mock.patch.dict(ha._MR_HEAD_LANDED, {}, clear=True)
+        p.start()
+        self.addCleanup(p.stop)
+        with self._configured():
+            for branches, landed in ((None, False), ([], False), (["1.6"], False),
+                                     (["x"] * 100, False), (["main", "1.6"], True)):
+                calls.clear()
+                ha._MR_HEAD_LANDED.clear()
+                with mock.patch.object(ha, "_gitlab_get", answer(branches)):
+                    got = ha.mr_status(self.MR).get("mergeCommit")
+                self.assertEqual(got, head if landed else None, branches)
+                self.assertIn(f"projects/grp%2Fsub%2Fapp/repository/commits/{head}"
+                              "/refs?type=branch&per_page=100", calls)
+            # A merged MR's answer never changes: asked once, then remembered.
+            calls.clear()
+            with mock.patch.object(ha, "_gitlab_get", answer([])):
+                self.assertEqual(ha.mr_status(self.MR)["mergeCommit"], head)
+            self.assertEqual(len(calls), 1)
+            # "Can't tell" (a failed call, a full page without the target) is asked again.
+            for unsure in (None, ["x"] * 100):
+                ha._MR_HEAD_LANDED.clear()
+                with mock.patch.object(ha, "_gitlab_get", answer(unsure)):
+                    self.assertNotIn("mergeCommit", ha.mr_status(self.MR))
+                with mock.patch.object(ha, "_gitlab_get", answer(["main"])):
+                    self.assertEqual(ha.mr_status(self.MR)["mergeCommit"], head, unsure)
+            # A malformed branch entry is no branch, never a raise.
+            ha._MR_HEAD_LANDED.clear()
+            with mock.patch.object(ha, "_gitlab_get",
+                                   lambda p: [{"name": ["main"]}, {"name": {}}, "main"]
+                                   if "/refs?" in p else dict(mr)):
+                self.assertNotIn("mergeCommit", ha.mr_status(self.MR))
+            # The memory is bounded: the oldest answer goes first.
+            ha._MR_HEAD_LANDED.clear()
+            with mock.patch.object(ha, "_MR_HEAD_LANDED_MAX", 2):
+                for i in range(3):
+                    mr["sha"] = f"{i:040x}"
+                    with mock.patch.object(ha, "_gitlab_get", answer(["main"])):
+                        ha.mr_status(self.MR)
+                self.assertEqual([k[1] for k in ha._MR_HEAD_LANDED],
+                                 [f"{1:040x}", f"{2:040x}"])
+            mr["sha"] = head
+            # A merge or squash commit is GitLab's own record: no branch read.
+            calls.clear()
+            mr["squash_commit_sha"] = "cd" * 20
+            with mock.patch.object(ha, "_gitlab_get", answer(None)):
+                self.assertEqual(ha.mr_status(self.MR)["mergeCommit"], "cd" * 20)
+            self.assertEqual(len(calls), 1)
+
     def test_mr_status_none_when_unreachable(self):
         with mock.patch.multiple(ha, GITLAB_URL="", GITLAB_TOKEN=""):
             self.assertIsNone(ha.pr_status(self.MR))
@@ -50081,7 +50146,8 @@ class TestForgeShadowBase(TestShadowBase):
             return self.api.get("ado" if path.endswith("/commits") else "adopr")
         for name, fn in (("_mr_url_parts", lambda u: ("g/r", "3")),
                          ("_azdo_pr_id", lambda u: "4"),
-                         ("_gitlab_get", lambda p: self.api.get("gitlab")),
+                         ("_gitlab_get", lambda p: self.api.get(
+                             "gitlab" if "/commits" in p else "gitlabmr")),
                          ("_azure_get", azure_get)):
             p = mock.patch.object(ha, name, fn)
             p.start()
@@ -50102,10 +50168,11 @@ class TestForgeShadowBase(TestShadowBase):
         return [dict(zip(("sha", "name", "email", "date", "msg"), c.split("\n", 4)))
                 for c in out.split("\0") if c.strip()]
 
-    def gitlab(self, commits):
+    def gitlab(self, commits, start=None):
         self.api["gitlab"] = [{"id": c["sha"], "author_name": c["name"],
                                "author_email": c["email"], "authored_date": c["date"],
                                "message": c["msg"]} for c in commits]
+        self.api["gitlabmr"] = {"iid": 3, "diff_refs": {"start_sha": start}}
 
     def ado(self, commits, target, cut=0):
         self.api["adopr"] = {"pullRequestId": 4,
@@ -50132,7 +50199,7 @@ class TestForgeShadowBase(TestShadowBase):
         commits = self.log("main..pr3")
         for c in commits:
             c["msg"] = "edited on the forge"                # only the shas can match
-        self.gitlab(commits)
+        self.gitlab(commits, start=self.git(self.dev, "rev-parse", "main"))
         self.git(self.dev, "switch", "-q", "main")
         self.git(self.dev, "merge", "-q", "--ff-only", "pr3")
         merge = self.land()
@@ -50146,13 +50213,13 @@ class TestForgeShadowBase(TestShadowBase):
         before = self.open_pr(5, ["w1", "w2", "w3"])
         commits = self.log("main..pr5")
         merge = self.rebase_land(5, GIT_COMMITTER_NAME="GitLab")
-        self.gitlab(commits)
+        self.gitlab(commits, start=before)
         self.assertEqual(self.base_of(merge, self.MR), (before, None))
         commits[1]["name"] = "someone else"
-        self.gitlab(commits)
-        self.assertEqual(self.base_of(merge, self.MR)[0],
-                         self.git(self.host, "rev-parse", f"{merge}^1"),
-                         "another author is not the MR's commit: read as a squash")
+        self.gitlab(commits, start=before)
+        self.assertEqual(self.base_of(merge, self.MR),
+                         (None, "the PR's commits do not reach the base its forge names"),
+                         "another author is not the MR's commit, and GitLab did not squash")
 
     def test_an_ado_rebase_bases_before_the_prs_first_commit_in_either_order(self):
         before = self.open_pr(4, ["r1", "r2", "r3"])
@@ -50181,6 +50248,48 @@ class TestForgeShadowBase(TestShadowBase):
         self.ado(commits, before.upper())                   # the forge's casing is not ours
         self.assertEqual(self.base_of(merge, self.ADO), (before, None))
 
+    def test_a_gitlab_list_must_reach_the_start_its_diff_names(self):
+        # XERK-2156: a list short of the MR's commits matched mid-MR (QA); the
+        # MR's diff_refs.start_sha, merge~N on every real fast-forward, catches it.
+        before = self.open_pr(9, ["g1", "g2", "g3"])
+        self.git(self.dev, "rebase", "-q", "main", "pr9")
+        start = self.git(self.dev, "rev-parse", "main")
+        commits = self.log("main..pr9")
+        self.git(self.dev, "switch", "-q", "main")
+        self.git(self.dev, "merge", "-q", "--ff-only", "pr9")
+        merge = self.land()
+        self.gitlab(commits, start=start)
+        self.assertEqual(self.base_of(merge, self.MR), (before, None))
+        self.gitlab(commits, start=start.upper())       # the forge's casing is not ours
+        self.assertEqual(self.base_of(merge, self.MR), (before, None))
+        for short in (commits[:2], commits[1:]):
+            self.gitlab(short, start=start)
+            base, why = self.base_of(merge, self.MR)
+            self.assertIsNone(base)
+            self.assertIn("base its forge names", why)
+        for bad in (None, "", "not-a-sha", self.git(self.host, "rev-parse", f"{merge}~1")):
+            self.gitlab(commits, start=bad)
+            self.assertIn("base its forge names", self.base_of(merge, self.MR)[1])
+        self.gitlab(commits)
+        self.api["gitlabmr"] = None                     # the MR itself did not read
+        self.assertIn("base its forge names", self.base_of(merge, self.MR)[1])
+
+    def test_a_gitlab_squash_keeps_its_parent_whatever_start_it_names(self):
+        # A squash GitLab rebased at merge keeps an older start_sha (real
+        # inkscape MRs): the list did not set the depth, so it is not checked.
+        stale = self.git(self.dev, "rev-parse", "main")
+        before = self.open_pr(10, ["q1", "q2"])
+        commits = self.log("main..pr10")
+        self.git(self.dev, "merge", "-q", "--squash", "pr10")
+        self.git(self.dev, "commit", "-q", "-m", "Squashed MR !10")
+        merge = self.land()
+        for start in (stale, None):
+            self.gitlab(commits, start=start)
+            self.api["gitlabmr"]["squash_commit_sha"] = merge
+            self.assertEqual(self.base_of(merge, self.MR), (before, None))
+        self.gitlab(commits, start=stale)               # no squash: a fast-forward's start
+        self.assertIn("base its forge names", self.base_of(merge, self.MR)[1])
+
     def test_a_squash_keeps_the_first_parent(self):
         before = self.open_pr(7, ["s1", "s2"])
         commits = self.log("main..pr7")
@@ -50188,6 +50297,7 @@ class TestForgeShadowBase(TestShadowBase):
         self.git(self.dev, "commit", "-q", "-m", "Squashed MR !7")
         merge = self.land()
         self.gitlab(commits)
+        self.api["gitlabmr"]["squash_commit_sha"] = merge
         self.ado(commits, before)
         for url in (self.MR, self.ADO):
             self.assertEqual(self.base_of(merge, url), (before, None))
