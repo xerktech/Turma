@@ -63,15 +63,22 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
     Any failure undoes what restore did (worktree, created branch, older copy moved aside).
   - A move BACK finds the old copy at the same path. Export writes the state's digest into the
     source's gitdir (`MIGRATION_EXPORT_MARK`); an old copy still matching it (or clean at an ancestor)
-    is removed, anything else detached and renamed to `<cwd>.pre-migration-<ts>`, never deleted.
+    is removed, anything else detached and renamed to `<cwd>.pre-migration-<ts>`.
+  - An aside is reaped by the usage worker once `<ts>` is past `MIGRATION_ASIDE_RETENTION_SEC`
+    (30 days, env `TURMA_MIGRATION_ASIDE_RETENTION_SEC`, 0 = never), then its worktree entry
+    pruned (`_sweep_migration_asides`, XERK-2138). A symlinked aside or repo dir is skipped;
+    read-only dirs inside are made writable (a Go module cache stranded it otherwise).
   - Ignored files never ride the bundle and neither the digest nor `status` sees them, so the old
     copy holds the ONLY one: it is kept aside unless every `--ignored=matching` entry is itself an
     ignored `MIGRATION_REGENERABLE_DIRS` dir (`!! a/node_modules/`) or a `.pyc`/`.pyo` directly in
     `__pycache__/` (`_holds_unregenerable_ignored`; git failing reads "keep").
     - Never by an ancestor's name (`!! dist/prod.key` with dist/ not ignored was deleted, QA), never
       by mtime (pre-export files, mtime-preserving edits), never a walk. Keep the allowlist narrow.
-    - Accepted gap: what sits INSIDE an ignored regenerable dir (`dist/.env.production` under an
-      ignored `dist/`) is one collapsed entry, so it goes with the copy.
+    - status lists an ignored regenerable dir as ONE entry, even with `-uall`, so when one was let
+      through `git ls-files --others --ignored` looks for a `.env*`/`*.env` file or dir at any
+      depth, case-folded (`dist/.env.production`, XERK-2138); one found keeps the copy. Matched
+      in Python, never a `:(glob)` pathspec (`GIT_LITERAL_PATHSPECS` turns that off). Other files in such a dir
+      still go with it.
   - A bundle without `.worktree/` (older source, hub restore-pack) forks fresh from the default.
     Residual: an OLDER target extracts `.worktree/` into its slug dir and drops the work (source
     keeps it). Tests: `TestMigrateWorktreeState` (real git, two clones).
