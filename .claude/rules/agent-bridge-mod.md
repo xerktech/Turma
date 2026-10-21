@@ -137,8 +137,9 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
   `QWEN_PANE_BUSY_MARKERS`, the ⏵/⏸ footer glyphs): `_busy_from_capture` matches them
   anywhere on screen, so a peer's text in the pane would read an idle session busy.
 - **An operator's `TURMA_PANE_BUSY_MARKERS` override reaches the mod as `TURMA_BUSY_MARKERS`**
-  (`bridge_busy_markers`, launch env on both OSes): the mod cannot see the agent's env. `cell()`
-  breaks each literal marker of 2+ chars (spaces → `-`, else `-` after the first char).
+  (`bridge_busy_markers`, launch env on both OSes): the mod cannot see the agent's env.
+  `unmarked()` breaks each literal marker of 2+ chars over the WHOLE output (a marker can span
+  cells) to a fixed point (a break can make another marker): spaces → `-`, else `-` after char 1.
 - "(you)" is the row matching BOTH `TURMA_SESSION_ID` and `TURMA_DEVICE` (ids are unique per
   host only). `wake` passes `--` so a reason word starting with `-` is text.
 - Request-dir writes go through `_write_mod_file` (mkstemp + rename: never a planted link);

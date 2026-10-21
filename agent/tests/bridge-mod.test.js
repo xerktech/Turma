@@ -462,6 +462,13 @@ test("an operator's custom busy markers are broken up too", async () => {
   assert.match(out, /THINKING-hard/);
   assert.match(out, /W-orking…/);
   assert.match(out, /aXb/, "a marker is literal text (a.b), and one character (x) is ignored");
+  // Past 20 markers, a marker a break makes (ab → a-b), and one spanning
+  // two cells (host/repo) are all broken too (QA).
+  const many = Array.from({ length: 25 }, (_, i) => `mk${i}x`).join("|");
+  const m = await harness({ env: { TURMA_BUSY_MARKERS: `${many}|a-b|ab|h1/r1` } });
+  m.files.set("/t/peers.tsv", "zz\tP\th1\tr1\t\tmk24x and ab\n");
+  const mo = await m.turma("peers");
+  assert.doesNotMatch(mo, /mk24x|a-b|ab|h1\/r1/i);
   // Without the variable only the built-in markers are broken.
   const plain = await harness();
   plain.files.set("/t/peers.tsv", "zz\tP\thost2\tR\t\tThinking hard\n");

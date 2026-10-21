@@ -232,9 +232,8 @@ const DATA_NOTE =
 // look-alikes, and so does `&` — the model reads `&lt;/…&gt;` as the tag (5/5)
 // while the pane decodes it for the person. Every pane busy marker (hub-agent.py's PANE_BUSY_MARKERS,
 // QWEN_PANE_BUSY_MARKERS and the ⏵/⏸ footer glyphs) is broken up too, or a
-// peer's text on screen would read an idle session busy, and so is every marker
-// of an operator's TURMA_PANE_BUSY_MARKERS override (busyMarkers). A non-string
-// is no text.
+// peer's text on screen would read an idle session busy (an operator's custom
+// markers are broken over the whole output: unmarked()). A non-string is no text.
 function cell(v: unknown): string {
   const t = typeof v === 'string' ? v : typeof v === 'number' && Number.isFinite(v) ? String(v) : ''
   let flat = t
@@ -244,7 +243,6 @@ function cell(v: unknown): string {
     .replace(/>/g, '›')
     .replace(/(esc|enter) to (interrupt|steer|cancel)/gi, '$1-to-$2')
     .replace(/[⏵⏸]/g, '▹')
-  for (const re of busyMarkers) flat = flat.replace(re, broken)
   flat = flat.trim()
   return flat.length > CELL_MAX ? `${flat.slice(0, CELL_MAX - 1)}…` : flat
 }
@@ -253,8 +251,6 @@ function cell(v: unknown): string {
 // operator's TURMA_PANE_BUSY_MARKERS override included), which the launch
 // exports as TURMA_BUSY_MARKERS: `|`-separated, matched case-insensitively
 // anywhere on screen. Read at each /turma run; empty without the variable.
-let busyMarkers: RegExp[] = []
-const MARKERS_MAX = 20
 
 function markerRes(raw: string | undefined): RegExp[] {
   return (raw || '')
@@ -262,8 +258,20 @@ function markerRes(raw: string | undefined): RegExp[] {
     .map(m => m.trim().replace(/[\p{Cc}\p{Cf}]+/gu, ' '))
     // One character cannot be broken up, and would read every pane busy anyway.
     .filter(m => [...m].length >= 2)
-    .slice(0, MARKERS_MAX)
     .map(m => new RegExp(m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu'))
+}
+
+// The WHOLE output with no custom marker left in it: over the joined text, so a
+// marker spanning two cells (`host/repo`) is caught, and to a fixed point, since
+// breaking one (`ab` → `a-b`) can make another. Each pass grows the text, so it
+// is bounded by the marker count (+1), then the remaining matches are dropped.
+function unmarked(text: string, res: RegExp[]): string {
+  for (let pass = 0; pass <= res.length; pass++) {
+    if (!res.some(re => text.search(re) >= 0)) return text
+    for (const re of res) text = text.replace(re, broken)
+  }
+  for (const re of res) text = text.replace(re, '')
+  return text
 }
 
 // A marker occurrence no longer read as one: its spaces become `-` (as for the
@@ -381,7 +389,6 @@ async function turmaText($: EngineInterface, args: string): Promise<string> {
   const sub = (words[0] || '').toLowerCase()
   let text: string
   try {
-    busyMarkers = markerRes(await $.env.get('TURMA_BUSY_MARKERS'))
     if (sub === 'peers') text = await peersText($)
     else if (sub === 'status') text = await statusText($)
     else if (sub === 'wake') text = await wakeText($, words.slice(1))
@@ -389,6 +396,14 @@ async function turmaText($: EngineInterface, args: string): Promise<string> {
   } catch (err) {
     text = `/turma ${cell(sub)} failed: ${cell(String(err))}`
   }
+  let res: RegExp[] = []
+  try {
+    res = markerRes(await $.env.get('TURMA_BUSY_MARKERS'))
+  } catch {
+    // no override readable: the built-in markers are still broken by cell()
+  }
+  text = unmarked(text, res)
+  // The cut can only shorten a marker, never make one.
   return text.length > OUT_MAX ? `${text.slice(0, OUT_MAX - 1)}…` : text
 }
 

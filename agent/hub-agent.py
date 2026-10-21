@@ -8736,7 +8736,7 @@ _DEFECT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REVERT_RE = re.compile(r"(?m)^This reverts commit ([0-9a-f]{40})(?:\.|, reversing)?[ \t]*$")
 _JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d{1,7})\b")
 _ADO_KEY_RE = re.compile(r"\bAB#(\d{1,9})\b")
-_CVE_ID_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b")
+_CVE_ID_RE = re.compile(r"\bCVE-\d{4}-\d+")
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
 _BLAME_LINE_RE = re.compile(r"^([0-9a-f]{40}) \d+ \d+")
 # Test code is excluded from blame (ADR "Known noise"): a fix that only touches
@@ -9968,7 +9968,10 @@ COMMAND_STDOUT_RE = re.compile(
     r"<local-command-stdout>(.*)</local-command-stdout>", re.DOTALL)
 COMMAND_STDERR_RE = re.compile(
     r"<local-command-stderr>(.*)</local-command-stderr>", re.DOTALL)
-COMMAND_OUTPUT_LEAD_RE = re.compile(r"\s*<local-command-std(?:out|err)>")
+# `[ \t\r\n]`, never `\s`: python's and JS's `\s` cover different characters,
+# and the two parsers must agree (contract-mirrors.md).
+COMMAND_OUTPUT_LEAD_RE = re.compile(r"[ \t\r\n]*<local-command-std(?:out|err)>")
+BASH_OUTPUT_LEAD_RE = re.compile(r"[ \t\r\n]*<bash-std(?:out|err)>")
 
 # The `!` prefix runs a shell command straight from the composer/TUI, and
 # Claude Code records it as two more XML-ish user turns: the command
@@ -10062,7 +10065,9 @@ def _parse_local_command(text):
             # command: flagged so its output row survives and the card reads
             # "(no output)" instead of looking like one still running.
             # Not an error: an empty stderr says nothing failed.
-            if regex in (BASH_STDERR_RE, BASH_STDOUT_RE):
+            # Only a turn OPENING with the tag: prose quoting empty bash tags
+            # stays dropped, never a "(no output)" card (QA).
+            if regex in (BASH_STDERR_RE, BASH_STDOUT_RE) and BASH_OUTPUT_LEAD_RE.match(text):
                 out.update(isError=False, shell=True)
             if first is None:
                 first = out
@@ -17412,11 +17417,64 @@ def _composer_rows(cap):
 _COMPOSER_PLACEHOLDER_NORM_RE = re.compile(r'Try"[^"]*"')
 
 
-def _composer_draft(cap):
+def _capture_pane_styled(tmux_name):
+    """The pane with its SGR attributes (`capture-pane -e`), or None: on
+    Windows (the pty-host grid is plain text) or when it can't be captured."""
+    if IS_WINDOWS or not tmux_name:
+        return None
+    try:
+        out = subprocess.run(
+            _tmux("capture-pane", "-e", "-p", "-t", _tmux_pane(tmux_name), name=tmux_name),
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+_SGR_RE = re.compile(r"\x1b\[([0-9;:]*)m")
+_OTHER_ESC_RE = re.compile(r"\x1b\[[0-9;:?<=>]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b.")
+
+
+def _undimmed(styled):
+    """`styled` with every DIM (SGR 2) run dropped and all escapes removed."""
+    out, dim, pos = [], False, 0
+    for m in _SGR_RE.finditer(styled):
+        if not dim:
+            out.append(styled[pos:m.start()])
+        pos = m.end()
+        params = m.group(1).replace(":", ";").split(";")
+        i = 0
+        while i < len(params):
+            p = params[i]
+            if p in ("", "0", "22"):
+                dim = False
+            elif p == "2":
+                dim = True
+            elif p in ("38", "48", "58"):
+                # An extended colour's own numbers (`38;5;2`) are no attributes.
+                i += 2 if i + 1 < len(params) and params[i + 1] == "5" else 4
+            i += 1
+    if not dim:
+        out.append(styled[pos:])
+    return _OTHER_ESC_RE.sub("", "".join(out))
+
+
+def _composer_draft(cap, styled=False):
     """What the composer in `cap` holds, prompt glyph and whitespace dropped:
     "" for an empty box (or one showing only the placeholder), None when there
-    is no composer to read."""
-    rows = _composer_rows(cap)
+    is no composer to read. `styled`: `cap` carries SGR attributes, and DIM
+    text in the box (Claude Code's prompt suggestion, its placeholder) is
+    ghost text, not a draft."""
+    if styled:
+        plain = _OTHER_ESC_RE.sub("", _SGR_RE.sub("", cap or ""))
+        lines, ghostless = plain.splitlines(), _undimmed(cap or "").splitlines()
+        rows = _composer_rows(plain)
+        if rows is None or len(lines) != len(ghostless):
+            return None
+        rules = [i for i, line in enumerate(lines) if _COMPOSER_RULE_RE.match(line)]
+        rows = ghostless[rules[-2] + 1:rules[-1]]
+    else:
+        rows = _composer_rows(cap)
     if rows is None:
         return None
     box = _composer_norm("".join(rows))
@@ -34480,7 +34538,13 @@ class SessionManager:
             # `/rename` + Enter, and rcName would move to a name the session does
             # not answer to (2.1.304). Defer while the composer holds any text,
             # or cannot be read (never type blind); the draft is never cleared.
-            if _composer_draft(cap) != "":
+            # Read WITH attributes where tmux can: after a turn Claude Code draws
+            # a DIM prompt suggestion in the empty composer (2.1.305), which is
+            # no draft and must not block the rename (QA). Windows' grid has no
+            # attributes, so a suggestion there defers it (never types blind).
+            styled = _capture_pane_styled(tmux)
+            draft = _composer_draft(styled, styled=True) if styled else _composer_draft(cap)
+            if draft != "":
                 continue
             name = self._unique_rc_name(summary, exclude_id=sess.get("id"))
             # The live name already matches the target, so there is nothing to
@@ -34539,7 +34603,7 @@ class SessionManager:
             except Exception as e:
                 # Logged once per session and cause: the beat retries every few
                 # seconds, and a standing failure must not flood the log.
-                err = ("error", str(e))
+                err = ("error", type(e).__name__, getattr(e, "errno", None))
                 if self._mod_status_last.get(sid) != err:
                     log(f"mod status for {sid} not written ({e})")
                 self._mod_status_last[sid] = err

@@ -316,6 +316,9 @@ test("parseLocalCommand: `!` bash passthrough turns -> command / output shapes",
   const slash = { type: "user", message: { content: "<local-command-stdout></local-command-stdout>" } };
   assert.deepEqual(entryBlocks(slash, BLOCK_CAPS), []);
   assert.equal(entryText(slash), null);
+  const prose = { type: "user", message: { content: "see <bash-stdout></bash-stdout><bash-stderr></bash-stderr> here" } };
+  assert.deepEqual(entryBlocks(prose, BLOCK_CAPS), []);
+  assert.equal(entryText(prose), null);
   assert.deepEqual(parseLocalCommand("<bash-stdout></bash-stdout><bash-stderr>boom</bash-stderr>"),
     { kind: "output", text: "boom", isError: true });
 });
@@ -328,6 +331,8 @@ test("parseLocalCommand: slash output printing its own tags is kept whole", () =
     ["<local-command-stdout>see <command-name>/x</command-name></local-command-stdout>", {"kind": "output", "text": "see <command-name>/x</command-name>", "isError": false}],
     ["<local-command-stdout>p <bash-stderr>q</bash-stderr></local-command-stdout>", {"kind": "output", "text": "p <bash-stderr>q</bash-stderr>", "isError": false}],
     ["<local-command-stdout>a</local-command-stdout><local-command-stderr>boom</local-command-stderr>", {"kind": "output", "text": "boom", "isError": true}],
+    ["\ufeff<local-command-stdout>a <command-name>/x</command-name></local-command-stdout>", { kind: "command", name: "/x", args: "" }],
+    ["\x1c<local-command-stdout>a <command-name>/x</command-name></local-command-stdout>", { kind: "command", name: "/x", args: "" }],
   ]) assert.deepEqual(parseLocalCommand(text), want, text);
 });
 

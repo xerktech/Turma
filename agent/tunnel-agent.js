@@ -260,7 +260,9 @@ const COMMAND_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
 // opening with an output tag is output. Mirror of hub-agent.py COMMAND_STDOUT_RE.
 const COMMAND_STDOUT_RE = /<local-command-stdout>([\s\S]*)<\/local-command-stdout>/;
 const COMMAND_STDERR_RE = /<local-command-stderr>([\s\S]*)<\/local-command-stderr>/;
-const COMMAND_OUTPUT_LEAD_RE = /^\s*<local-command-std(?:out|err)>/;
+// `[ \t\r\n]`, never `\s`: JS's and python's `\s` differ. Mirror of hub-agent.py.
+const COMMAND_OUTPUT_LEAD_RE = /^[ \t\r\n]*<local-command-std(?:out|err)>/;
+const BASH_OUTPUT_LEAD_RE = /^[ \t\r\n]*<bash-std(?:out|err)>/;
 // The `!` prefix runs a shell command straight from the composer/TUI; Claude
 // Code records the command as <bash-input> and its output as
 // <bash-stdout>/<bash-stderr> user turns. Parsed into the same
@@ -322,7 +324,9 @@ function parseLocalCommand(text) {
       // A `!` command that printed nothing is still finished: flagged so its
       // output row survives ("(no output)"). Mirror of _parse_local_command.
       // Not an error: an empty stderr says nothing failed.
-      if (re === BASH_STDERR_RE || re === BASH_STDOUT_RE) Object.assign(out, { isError: false, shell: true });
+      if ((re === BASH_STDERR_RE || re === BASH_STDOUT_RE) && BASH_OUTPUT_LEAD_RE.test(text)) {
+        Object.assign(out, { isError: false, shell: true });
+      }
       if (!first) first = out;
     }
   }

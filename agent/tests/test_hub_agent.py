@@ -5328,6 +5328,11 @@ class TestBashPassthrough(unittest.TestCase):
             "content": "<local-command-stdout></local-command-stdout>"}}
         self.assertEqual(ha._entry_blocks(slash, ha.BLOCK_CAPS), [])
         self.assertIsNone(ha._entry_text(slash))
+        # Prose QUOTING empty bash tags stays dropped, never a "(no output)" card.
+        prose = {"type": "user", "message": {
+            "content": "see <bash-stdout></bash-stdout><bash-stderr></bash-stderr> here"}}
+        self.assertEqual(ha._entry_blocks(prose, ha.BLOCK_CAPS), [])
+        self.assertIsNone(ha._entry_text(prose))
         # A non-empty stream wins over an empty one, as before (no flag).
         self.assertEqual(
             ha._parse_local_command("<bash-stdout></bash-stdout><bash-stderr>boom</bash-stderr>"),
@@ -5348,6 +5353,11 @@ class TestBashPassthrough(unittest.TestCase):
              {'kind': 'output', 'text': 'p <bash-stderr>q</bash-stderr>', 'isError': False}),
             ("<local-command-stdout>a</local-command-stdout><local-command-stderr>boom</local-command-stderr>",
              {'kind': 'output', 'text': 'boom', 'isError': True}),
+            # Only space/tab/CR/LF lead the tag, in both parsers (py and js `\s` differ).
+            ("\ufeff<local-command-stdout>a <command-name>/x</command-name></local-command-stdout>",
+             {'kind': 'command', 'name': '/x', 'args': ''}),
+            ("\x1c<local-command-stdout>a <command-name>/x</command-name></local-command-stdout>",
+             {'kind': 'command', 'name': '/x', 'args': ''}),
         ):
             with self.subTest(text=text):
                 self.assertEqual(ha._parse_local_command(text), want)
@@ -27564,7 +27574,7 @@ class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
     up to its display summary on the first idle beat via `/rename`, with rcName
     kept in step so peers.tsv keeps resolving the live name."""
 
-    def make_manager(self, busy=False, dialog=False, cap=None):
+    def make_manager(self, busy=False, dialog=False, cap=None, styled=None):
         cap = _idle_claude_pane() if cap is None else cap
         sm = super().make_manager()
         sm.save = mock.Mock()
@@ -27575,6 +27585,7 @@ class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
 
         for name, value in [
                 ("_capture_pane", lambda t: cap),
+                ("_capture_pane_styled", lambda t: styled),
                 ("_busy_from_capture", lambda c: busy),
                 ("parse_pane_prompt", lambda c: {"prompt": "?"} if dialog else None),
                 ("_pane_send_keys", fake_send)]:
@@ -27632,6 +27643,29 @@ class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
             self.assertTrue(ha._composer_draft(_idle_claude_pane(draft)), draft)
         self.assertEqual(ha._composer_draft(LINUX_COMPOSER_PANE), "")
         self.assertIsNone(ha._composer_draft("no rules here"))
+
+    def test_a_dim_prompt_suggestion_is_no_draft(self):
+        # After a turn Claude Code 2.1.305 draws a DIM suggestion in the empty
+        # composer (`capture-pane -e`: `\e[2mrun it\e[0m`); main renamed over
+        # it (the suggestion is replaced, not submitted), and so must this.
+        rule = "\x1b[38;5;244m" + "\u2500" * 50 + "\x1b[39m"
+        styled = (f"done\n{rule}\n\u276f \x1b[2mrun it\x1b[0m\n{rule}\n"
+                  "  \x1b[38;5;2m\u23f5\u23f5 auto mode on\x1b[39m\n")
+        sm = self.make_manager(cap=_idle_claude_pane("run it"), styled=styled)
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys[0], ("agent-s1", ("/rename Fix the retry loop",), True))
+        self.assertEqual(sess["rcName"], "Fix the retry loop")
+        # Typed (undimmed) text is a draft, also after an extended colour
+        # whose own numbers hold a 2 (`38;5;2` is green, not dim).
+        for box in ("\x1b[2mrun it\x1b[0m half typed", "\x1b[38;5;2mhalf typed\x1b[39m",
+                    "\x1b[2mx\x1b[22mtyped"):
+            st = f"{rule}\n\u276f {box}\n{rule}\n"
+            self.assertTrue(ha._composer_draft(st, styled=True), box)
+        self.assertEqual(ha._composer_draft(f"{rule}\n\u276f \x1b[2mghost\x1b[0m\n{rule}\n",
+                                            styled=True), "")
+        self.assertIsNone(ha._composer_draft("\x1b[2mno rules\x1b[0m", styled=True))
 
     def test_an_unreadable_composer_defers_the_rename(self):
         sm = self.make_manager(cap="a pane with no composer rules")
@@ -27992,6 +28026,7 @@ class TestReconcileRcNamesViaMod(ManagerMixin, unittest.TestCase):
             self.keys.append((tmux, tuple(tokens), literal))
 
         for name, value in [("_capture_pane", lambda t: _idle_claude_pane()),
+                            ("_capture_pane_styled", lambda t: None),
                             ("_busy_from_capture", lambda c: False),
                             ("parse_pane_prompt", lambda c: None),
                             ("_pane_send_keys", fake_send)]:
@@ -28366,6 +28401,22 @@ class TestModStatus(ManagerMixin, unittest.TestCase):
         self.assertEqual(log.call_args_list, [])
         self.assertTrue(os.path.isdir(self._status_path()))
 
+    def test_a_read_only_folder_is_logged_once(self):
+        # mkstemp's error names its random temp file: keyed on the error's
+        # kind, not its text, or every beat logs again (QA).
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the mode")
+        sm = self.make_manager()
+        sm.registry = [self._sess()]
+        folder = ha.mod_request_dir("s1")
+        os.makedirs(folder)
+        os.chmod(folder, 0o555)
+        self.addCleanup(os.chmod, folder, 0o755)
+        with mock.patch.object(ha, "log") as log:
+            for _ in range(4):
+                sm._publish_mod_status([self._payload()])
+        self.assertEqual(len(log.call_args_list), 1, log.call_args_list)
+
     def test_a_standing_failure_is_logged_once(self):
         sm = self.make_manager()
         sm.registry = [self._sess()]
@@ -28443,6 +28494,7 @@ class TestReconcileRcNamesTrustModal(ManagerMixin, unittest.TestCase):
                 "rcName": "truenas-ryujinx-s1", "summary": "Port the shader cache"}
         sm.registry = [sess]
         with mock.patch.object(ha, "_capture_pane", lambda t: capture), \
+                mock.patch.object(ha, "_capture_pane_styled", lambda t: None), \
                 mock.patch.object(
                     ha, "_pane_send_keys",
                     side_effect=lambda n, *k, **kw: keys.append(k)):
@@ -50204,6 +50256,8 @@ class TestDefectAttribution(unittest.TestCase):
         # A Jira project keyed CVE is a ticket; only a real CVE id (YYYY-NNNN+) is not.
         self.assertEqual(ha._defect_ticket_keys("CVE-12: patch CVE-2024-123456"), ["CVE-12"])
         self.assertEqual(ha._defect_ticket_keys("CVE-2013-4476 and CVE-2024-12345"), [])
+        # A malformed CVE id is still no ticket (never the bogus key CVE-2013).
+        self.assertEqual(ha._defect_ticket_keys("CVE-2013-447, CVE-2013-4476a"), [])
 
 
 class TestDefectReportsWire(ManagerMixin, unittest.TestCase):
