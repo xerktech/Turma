@@ -348,8 +348,23 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   alone reads **idle**. `parse_pane_prompt` reads `{prompt, options:[{number,label,selected}],
   detail}` off the mode marker's capture.
   - **Nothing keys on wording.** A dialog needs ALL of: options 1..N (N≥2), exactly one `❯`, a `?`
-    line directly above, **no mode footer below** (the footer rides the composer a dialog
-    replaces). `detail` closes on a rule, not on blanks.
+    line directly above (or above a subtitle, next bullet), **no mode footer below** (the footer
+    rides the composer a dialog replaces). `detail` closes on a rule, not on blanks.
+  - **One subtitle paragraph may sit between the `?` line and the run** (XERK-2162): Claude
+    Code 2.1.306's "Exit plan mode?" draws "Claude wants to exit plan mode" there, and requiring
+    the question directly above made that live dialog read as an idle composer.
+    - Blank-fenced on both sides, ≤ `PANE_PROMPT_SUBTITLE_LINES`, no `?`/rule/option line; it
+      joins `detail` and the id as one line (its wrap moves with the width).
+    - Only under the ▔ edge (`_pane_under_edge`: the question sits right below it, rules
+      between): a reply shaped question/note/options is above the edge, and the Ctrl-C toast
+      hides the footer that would veto it.
+    - That dialog's box ends 2 cells in from the pane, and its labels wrap there: wrap width is
+      the nearest box rule within `PANE_DIALOG_MARGIN` of the pane (`_pane_dialog_width`), else
+      the widest line. Below ~30 columns the TUI's own wrap drifts further; not covered.
+    - `detail` stops at the ▔ edge (`PANE_PROMPT_EDGE_RE`, column 0 only — replies are indented):
+      above it is conversation, and its effort badge (first seconds only) changed the id, so an
+      answer stamped early was dropped.
+    - Tests: the `subtitle`/`effort_badge`/`short_rule` cases in `TestParsePanePrompt`.
   - **A wrapped label is rejoined; the AskUserQuestion picker is refused** (XERK-2150).
     - A wrap and a picker description sit on the same label-column indent, and a label that fills
       the pane makes them identical row by row — no per-line rule can split them.
