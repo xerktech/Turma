@@ -51241,6 +51241,19 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         sm.shadow_runs[rid2]["endedAt"] = float("inf")
         self.assertNotIn("endedAt", {r["id"]: r for r in sm.shadow_runs_report()}[rid2])
 
+    def test_a_record_with_a_dropped_time_still_ages_out(self):
+        # XERK-2148 QA: an invalid endedAt is dropped on load, and a missing
+        # time read as `now` kept the record (and its report row) forever.
+        rid2 = "sh-00000000000000b3"
+        with open(ha.SHADOW_RUNS_PATH, "w") as f:
+            f.write('{"%s": {"id": "%s", "state": "failed", "branchDropped": true,'
+                    ' "endedAt": Infinity},'
+                    ' "%s": {"id": "%s", "state": "failed", "branchDropped": true,'
+                    ' "endedAt": %r}}' % (self.RID, self.RID, rid2, rid2, time.time()))
+        sm = self.make_manager()
+        sm._advance_shadow_runs()
+        self.assertEqual(list(sm.shadow_runs), [rid2])
+
     def test_a_restart_mid_placement_reports_a_failed_run(self):
         # XERK-2148: the placement is saved before the command is acked, so a
         # manager restart mid-placement reports the run failed instead of

@@ -31021,7 +31021,10 @@ class SessionManager:
                     if self._advance_shadow_grade(rid, r, now):
                         return
                 elif st in ("graded", "failed"):
-                    if now - (r.get("endedAt") or now) > SHADOW_KEEP_SEC:
+                    # Every record this agent writes carries its times; one
+                    # missing (dropped as invalid on load) reads as long past,
+                    # never as now, which would keep it forever (XERK-2148).
+                    if now - (r.get("endedAt") or 0) > SHADOW_KEEP_SEC:
                         self.shadow_runs.pop(rid, None)
                         self._save_shadow_runs()
         except Exception as e:
@@ -31034,7 +31037,7 @@ class SessionManager:
         if self._shadow_session_live(sid):
             if sess and sess.get("modelActual"):
                 r["modelActual"] = sess["modelActual"]
-            if note is None and now - (r.get("phaseAt") or now) < SHADOW_RUN_TIMEOUT_SEC:
+            if note is None and now - (r.get("phaseAt") or 0) < SHADOW_RUN_TIMEOUT_SEC:
                 return False
         if sess is None:
             self._set_shadow(rid, state="failed", error="the shadow session is gone",
@@ -31109,7 +31112,7 @@ class SessionManager:
         grade = read_shadow_grade(gsid) if gsid else None
         if grade is None:
             if self._shadow_session_live(gsid) and \
-                    now - (r.get("phaseAt") or now) < SHADOW_GRADE_TIMEOUT_SEC:
+                    now - (r.get("phaseAt") or 0) < SHADOW_GRADE_TIMEOUT_SEC:
                 return False
             self._set_shadow(rid, state="failed", endedAt=now, phaseAt=now,
                              error="the grader ended without a grade")
