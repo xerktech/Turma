@@ -62,6 +62,10 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   - The page is ordered `updated_at DESC, key DESC` and the DELETE compares the
     `(updated_at, key)` tuple: a sweep stamps all its rows with one `now`, so a bare
     `updated_at <` bound never converged on a tie at the page edge.
+  - **It spares a row stamped within 10 minutes of the DATABASE clock** (XERK-2137): `updated_at`
+    is the writing replica's clock, so a replica running behind stamps a fresh write below the
+    edge. The table can sit over `MAX_ROWS` until a later rescan; never judge by a replica clock.
+    Tests: the `XERK-2137:` case in `outcome-ledger.test.js`.
 - **A host reporting more sessions than its cap only fills the rows it has room for** (XERK-1853):
   past it a new row evicted one the host still reports, re-created next sweep — new `firstSeen`
   and Postgres upserts + deletes every 15s. Its newest sessions go unrecorded instead.
