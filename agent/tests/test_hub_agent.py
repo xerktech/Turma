@@ -12612,6 +12612,28 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
             sm._sweep_migration_asides()
         self.assertTrue(os.path.isdir(fresh))
 
+    def test_the_root_pseudo_repo_prunes_in_repos_root(self):
+        # XERK-2148: WORKTREES_ROOT/(root) maps to REPOS_ROOT's own repo (there
+        # is no REPOS_ROOT/(root)); a repo dir that is no git repo is never
+        # pruned, since git would walk up and prune the enclosing one.
+        sm = self.make_manager()
+        self.git("init", "-q", ha.REPOS_ROOT)
+        self.git("-C", ha.REPOS_ROOT, "commit", "-q", "--allow-empty", "-m", "root")
+        old = int(time.time()) - 31 * 86400
+        stale = os.path.join(self.tmp, "stale-wt")
+        self.git("-C", ha.REPOS_ROOT, "worktree", "add", "-q", "--detach", stale)
+        shutil.rmtree(stale)
+        os.makedirs(os.path.join(ha.REPOS_ROOT, "Plain"))
+        os.makedirs(os.path.join(ha.WORKTREES_ROOT, "Plain", f"x.pre-migration-{old}"))
+        sm._sweep_migration_asides()
+        self.assertIn(stale, self.git("-C", ha.REPOS_ROOT, "worktree", "list", "--porcelain"))
+        aside = os.path.join(ha.WORKTREES_ROOT, ha.ROOT_REPO_NAME, f"wt.pre-migration-{old}")
+        self.git("-C", ha.REPOS_ROOT, "worktree", "add", "-q", "--detach", aside)
+        sm._sweep_migration_asides()
+        self.assertFalse(os.path.lexists(aside))
+        listed = self.git("-C", ha.REPOS_ROOT, "worktree", "list", "--porcelain")
+        self.assertNotIn(aside, listed)
+
     def test_an_aside_left_locked_is_still_pruned(self):
         # XERK-2148: a move cut short between _rename_worktree's lock and unlock
         # leaves the entry locked, which a plain prune keeps forever.

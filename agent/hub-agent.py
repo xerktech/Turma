@@ -33871,7 +33871,13 @@ class SessionManager:
                 names = os.listdir(rd)
             except OSError:
                 continue
-            repo_path = os.path.join(REPOS_ROOT, repo)
+            # The root pseudo-repo's git dir is REPOS_ROOT itself (XERK-2148).
+            # A dir that is no repo is never pruned: git would walk up to an
+            # enclosing repo and prune THAT.
+            repo_path = REPOS_ROOT if repo == ROOT_REPO_NAME \
+                else os.path.join(REPOS_ROOT, repo)
+            if not os.path.lexists(os.path.join(repo_path, ".git")):
+                repo_path = None
             removed = False
             for name in names:
                 m = MIGRATION_ASIDE_RE.fullmatch(name)
@@ -33881,7 +33887,7 @@ class SessionManager:
                 try:
                     if not stat.S_ISDIR(os.lstat(path).st_mode):
                         continue
-                    if os.path.isdir(repo_path):
+                    if repo_path:
                         # A move cut short between its lock and unlock
                         # (_rename_worktree) left the entry locked, and the
                         # prune below would keep a locked entry forever.
@@ -33892,7 +33898,7 @@ class SessionManager:
                     log(f"migration: removed {path}, kept aside past retention")
                 except Exception as e:
                     log(f"migration: removing {path} failed: {e}")
-            if removed and os.path.isdir(repo_path):
+            if removed and repo_path:
                 run(["git", "-C", repo_path, "worktree", "prune"])
 
     def _sweep_claude_sockets(self):
