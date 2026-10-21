@@ -59,6 +59,17 @@ describe("liveState", () => {
     expect(inReview(dialog, now - 10_000, now)).toBe(true);
   });
 
+  // The order the web reads them in: a permission dialog wins over both the
+  // no-transcript-yet read (a first-turn dialog) and a pushed busy read.
+  it("reads a panePrompt as 'waiting' ahead of no transcript and of paneBusy", () => {
+    const now = 1_000_000;
+    const panePrompt = { prompt: "Do you want to proceed?" };
+    const first = session({ session: signals({ panePrompt, transcriptAgeSec: null }) });
+    expect(liveState(first, now - 10_000, now)).toBe("waiting");
+    const busy = session({ session: signals({ panePrompt, paneBusy: true, transcriptAgeSec: 5 }) });
+    expect(liveState(busy, now - 10_000, now)).toBe("waiting");
+  });
+
   it("keeps the old behaviour when no host is supplied", () => {
     const s = session({ session: signals({ paneBusy: true, transcriptAgeSec: 5 }) });
     expect(liveState(s)).toBe("working");
