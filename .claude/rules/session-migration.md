@@ -95,8 +95,10 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
       depth, case-folded (`dist/.env.production`, XERK-2138); one found keeps the copy. Matched
       in Python, never a `:(glob)` pathspec (`GIT_LITERAL_PATHSPECS` turns that off). Other files in such a dir
       still go with it.
-    - A template FILE (`.env.example`, `.sample`, `.dist`, … `MIGRATION_ENV_TEMPLATE_WORDS`) does
-      not keep it: every node_modules has one, so every copy was kept (XERK-2148).
+    - A template FILE (`.env.example`, `.sample`, `.template`, `.dist`) does not keep it: every
+      node_modules has one, so every copy was kept (XERK-2148).
+    - Only as the LAST suffix or the whole stem (`example.env`): `.env.example.local` is a
+      filled-in copy and `.env.defaults` holds real values, so both still keep it (QA).
     - A nested repo there is listed as `dir/` and never walked, so it keeps the copy (XERK-2148).
   - A bundle without `.worktree/` (older source, hub restore-pack) forks fresh from the default.
     Residual: an OLDER target extracts `.worktree/` into its slug dir and drops the work (source

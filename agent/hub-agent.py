@@ -19675,6 +19675,15 @@ SHADOW_ID_RE = re.compile(r"sh-[0-9a-f]{8,32}")
 # The failure a run still being placed when the manager stopped is loaded as
 # (XERK-2148). A re-delivery of its spawnShadow may place it again.
 SHADOW_PLACING_LOST = "the manager restarted before the shadow was launched"
+
+
+def _shadow_ts(v):
+    """`v` as a shadow-run epoch-seconds time, or None. shadow-runs.json is
+    session-writable, and an inf/1e300 there made fromtimestamp raise inside
+    every heartbeat (XERK-2148 QA): only a finite, positive time before 9999."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return v if 0 < v < 253402300800 else None
 SHADOW_SHA_RE = re.compile(r"[0-9a-f]{40}")
 SHADOW_GRADER_MODEL = "opus"
 SHADOW_NOTE_MAX = 2000
@@ -30732,6 +30741,9 @@ class SessionManager:
                 "error", "startedAt", "phaseAt", "endedAt", "modelActual", "ticketText",
                 "branchDropped")
                 if r.get(k) is not None}
+            for k in ("startedAt", "phaseAt", "endedAt"):
+                if k in out[rid] and _shadow_ts(out[rid][k]) is None:
+                    del out[rid][k]
         # A run still being placed when the manager stopped (XERK-2148): its
         # placement died with the process, so it is reported failed rather than
         # left unreported, counting toward the hub's daily cap until it is lost.
@@ -30741,9 +30753,7 @@ class SessionManager:
             if not (isinstance(rid, str) and SHADOW_ID_RE.fullmatch(rid)
                     and isinstance(m, dict)) or rid in out:
                 continue
-            at = m.get("startedAt")
-            if not isinstance(at, (int, float)) or isinstance(at, bool):
-                at = now
+            at = _shadow_ts(m.get("startedAt")) or now
             out[rid] = {"id": rid, "siteKey": str(m.get("siteKey") or "")[:200],
                         "issueKey": str(m.get("issueKey") or "")[:64],
                         "model": str(m.get("model") or "")[:40], "startedAt": at,
@@ -31104,7 +31114,9 @@ class SessionManager:
                 if isinstance(r.get(k), str):
                     row[k] = r[k]
             for k in ("startedAt", "endedAt"):
-                if isinstance(r.get(k), (int, float)):
+                # Validated on load too; checked here as well so no record can
+                # raise out of build_payload and fail every heartbeat.
+                if _shadow_ts(r.get(k)) is not None:
                     row[k] = datetime.datetime.fromtimestamp(
                         r[k], datetime.timezone.utc).isoformat()
             if isinstance(r.get("grade"), dict):
@@ -33387,15 +33399,21 @@ class SessionManager:
             if any(p.startswith(".env") or p.endswith(".env") for p in parts[:-1]):
                 return True
             name = parts[-1]
-            if (name.startswith(".env") or name.endswith(".env")) and \
-                    not self.MIGRATION_ENV_TEMPLATE_WORDS & set(name.split(".")):
+            words = name.split(".")
+            template = (name.startswith(".env") and words[-1]
+                        in self.MIGRATION_ENV_TEMPLATE_WORDS) or (
+                len(words) == 2 and words[1] == "env"
+                and words[0] in self.MIGRATION_ENV_TEMPLATE_WORDS)
+            if (name.startswith(".env") or name.endswith(".env")) and not template:
                 return True
         return False
 
     # A `.env.example`-style FILE is a template, never a secret: a package in
     # node_modules ships one, and counting it kept every such copy (XERK-2148).
-    MIGRATION_ENV_TEMPLATE_WORDS = frozenset((
-        "example", "sample", "template", "dist", "defaults", "tpl", "tmpl"))
+    # Only as the LAST suffix (`.env.local.example`) or the whole stem
+    # (`example.env`): `.env.example.local` is a filled-in copy, and a
+    # `.env.defaults` holds real values, so both keep the copy.
+    MIGRATION_ENV_TEMPLATE_WORDS = frozenset(("example", "sample", "template", "dist"))
 
     # A bundle is the largest thing an agent ever sends, so it is the body most
     # likely to meet the hub's in-flight budget (XERK-258) and be told 503 "busy,

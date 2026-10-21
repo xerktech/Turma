@@ -12653,7 +12653,17 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
                            ("app/dist/.env.local.template", False),
                            ("node_modules/p/.env.dist", False),
                            ("node_modules/p/example.env", False),
+                           ("node_modules/p/sample.env", False),
+                           ("app/dist/template.env", False),
                            ("node_modules/p/.env", True),
+                           # Only as the LAST suffix or the whole stem (QA):
+                           # these are filled-in copies or real defaults.
+                           ("node_modules/p/.env.example.local", True),
+                           ("app/dist/.env.dist.local", True),
+                           ("p/.venv/.env.tpl.prod", True),
+                           ("node_modules/p/prod.dist.env", True),
+                           ("node_modules/p/defaults.env", True),
+                           ("node_modules/p/.env.defaults", True),
                            ("node_modules/p/.env.example/secret", True)):
             d = tempfile.mkdtemp(dir=self.tmp)
             self.git("init", "-q", d)
@@ -12810,6 +12820,33 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.git("-C", self.dst_repo, "branch", "--list", "feat"), "")
         self.assertEqual(self.read(sess["worktreePath"], "local-only.txt"), "keep\n")
         self.assertEqual(glob.glob(sess["worktreePath"] + ".pre-migration-*"), [])
+
+    def test_a_prune_during_the_move_back_keeps_the_copy_a_worktree(self):
+        # XERK-2148 QA: the rollback's rename back is locked like the move aside;
+        # a prune right after it must not strip the restored copy's HEAD/index.
+        src_wt = self.src_worktree()
+        sm = self.make_manager()
+        files = sm._capture_worktree_state(src_wt)
+        files["changes.patch"] = b"diff --git a/nope b/nope\ngarbage\n"
+        sess = self.dst_sess()
+        wt = sess["worktreePath"]
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "--detach", wt, "origin/main")
+        self.write(wt, "README", "edited\n")
+        real_rename = os.rename
+
+        def rename_then_prune(src, dst):
+            real_rename(src, dst)
+            if dst == wt:
+                self.git("-C", self.dst_repo, "worktree", "prune")
+        with mock.patch.object(ha.os, "rename", rename_then_prune), \
+                self.assertRaises(RuntimeError):
+            sm._restore_worktree_state(sess, files)
+        self.assertEqual(self.git("-C", wt, "rev-parse", "HEAD"),
+                         self.git("-C", self.dst_repo, "rev-parse", "origin/main"))
+        self.assertEqual(self.git("-C", wt, "status", "--porcelain"), "M README")
+        listed = self.git("-C", self.dst_repo, "worktree", "list", "--porcelain")
+        self.assertIn(f"worktree {wt}\n", listed + "\n")
+        self.assertNotIn("locked", listed)
 
     def test_oversize_members_are_refused_unread(self):
         sm = self.make_manager()
@@ -51054,6 +51091,26 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
             sm.spawn_shadow(self.cmd())
         self.assertEqual(sm._shadow_placing, {})
         self.assertIn("could not start", sm.shadow_runs[self.RID]["error"])
+
+    def test_out_of_range_times_never_break_the_report(self):
+        # XERK-2148 QA: shadow-runs.json is session-writable, and a 1e300 or
+        # Infinity time made fromtimestamp raise in every heartbeat.
+        rid2 = "sh-00000000000000b2"
+        with open(ha.SHADOW_RUNS_PATH, "w") as f:
+            f.write('{"%s": {"id": "%s", "state": "failed", "startedAt": 1e300,'
+                    ' "endedAt": Infinity, "phaseAt": NaN},'
+                    ' "_placing": {"%s": {"startedAt": -Infinity}}}'
+                    % (self.RID, self.RID, rid2))
+        sm = self.make_manager()
+        self.assertNotIn("startedAt", sm.shadow_runs[self.RID])
+        self.assertNotIn("phaseAt", sm.shadow_runs[self.RID])
+        self.assertAlmostEqual(sm.shadow_runs[rid2]["startedAt"], time.time(), delta=60)
+        rows = {r["id"]: r for r in sm.shadow_runs_report()}
+        self.assertEqual(set(rows), {self.RID, rid2})
+        self.assertNotIn("startedAt", rows[self.RID])
+        # One set in memory after load is skipped by the report, never raised.
+        sm.shadow_runs[rid2]["endedAt"] = float("inf")
+        self.assertNotIn("endedAt", {r["id"]: r for r in sm.shadow_runs_report()}[rid2])
 
     def test_a_restart_mid_placement_reports_a_failed_run(self):
         # XERK-2148: the placement is saved before the command is acked, so a
