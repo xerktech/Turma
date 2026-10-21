@@ -447,8 +447,9 @@ object ServedContentType : Interceptor {
         val response = chain.proceed(chain.request())
         // Coil guesses when the type is text/plain or none — and an empty or unparseable
         // header IS none to it (OkHttp gives the body no type).
-        val type = response.header("Content-Type")?.toMediaTypeOrNull()
-        val guessed = type == null || (type.type == "text" && type.subtype == "plain")
+        // Coil's text/plain test is a prefix of the raw string ("text/plainx" too), so is this one.
+        val raw = response.header("Content-Type")
+        val guessed = raw?.toMediaTypeOrNull() == null || raw.trim().startsWith("text/plain", ignoreCase = true)
         val body = response.body
         if (!guessed || body == null) return response
         // Coil reads the BODY's type on a fetch and the header on a disk-cache hit: both change.

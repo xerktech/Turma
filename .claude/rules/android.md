@@ -92,6 +92,7 @@ Mirrors the glasses pure-core/adapter-shell split:
   Coil would otherwise replace with the URL extension's guess; it must change the BODY's type (read
   on a fetch) and the header (read on a disk-cache hit). Tests: `ServedContentTypeTest`.
   - It relabels an empty or unparseable type too: OkHttp gives such a body no type, so Coil guesses.
+  - Its text/plain test is a raw-string PREFIX, as Coil's is: `text/plainx` is guessed from too.
   - The loader's disk cache is its own directory (the old `image_cache` is deleted): entries cached
     before the relabel would otherwise keep rendering a text/plain `.svg`.
 

@@ -91,6 +91,11 @@ class ServedContentTypeTest {
         assertTrue(svgAs(null) is ErrorResult)
         // Empty or unparseable: OkHttp gives the body no type, so Coil guessed from the URL.
         for (bad in listOf("", "bogus", "svg")) assertTrue("[$bad]", svgAs(bad) is ErrorResult)
+        // Coil guesses for any raw "text/plain…" prefix.
+        for (bad in listOf("text/plainx", "text/plain-utf8")) {
+            assertTrue("[$bad]", svgAs(bad) is ErrorResult)
+            assertTrue("[$bad] no-store", svgAs(bad, noStore = true) is ErrorResult)
+        }
         assertTrue(svgAs("application/xml") is ErrorResult)
     }
 
@@ -109,6 +114,8 @@ class ServedContentTypeTest {
         val url = server.url("/old.svg").toString()
         assertTrue(fetch(old, url) is SuccessResult) // the bug, as it was cached
         assertTrue(fetch(app.newImageLoader(), url) is ErrorResult)
+        // ...and the old cache is cleared, not left orphaned on disk.
+        assertTrue(!app.cacheDir.resolve("image_cache").exists())
     }
 
     @Test fun `a png served as text plain still renders`() {
