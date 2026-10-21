@@ -25181,10 +25181,12 @@ def _model_picker_open(cap):
     # Footers are looked for below the heading only: a composer's footer sits
     # there whenever one is drawn, while a conversation line above the picker
     # that merely reads like one ("! for shell mode") must not hide it.
+    # The toast / a cut footer is read below the pane's LAST rule, as
+    # everywhere (`_pane_composer_tail_up`).
     text = "\n".join(region)
     return not (PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
                 or PANE_SHELL_FOOTER_RE.search(text)
-                or _pane_composer_tail_up(_pane_lines(text)))
+                or _pane_composer_tail_up(_pane_lines(cap)))
 
 
 def _model_names_row(name, label):

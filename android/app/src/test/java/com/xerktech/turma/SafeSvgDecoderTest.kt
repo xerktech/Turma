@@ -264,8 +264,9 @@ class SafeSvgDecoderTest {
     }
 
     @Test fun `a pattern of a sane number of tiles still draws`() {
-        // 1-unit tiles: 10000 of them, well inside the step budget.
-        assertEquals(100 to 100, intrinsic(tiles("1")))
+        // 1-unit tiles: 10000 of them, well inside the step budget. The wall-clock
+        // deadline is lifted: on a busy host this draw took 5.6s and hit the 5s one.
+        assertEquals(100 to 100, withDeadline(LIFTED_DEADLINE_MS) { intrinsic(tiles("1")) })
     }
 
     @Test fun `a cancelled decode stops at the next step`() {
