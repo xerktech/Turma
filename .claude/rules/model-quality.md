@@ -231,9 +231,12 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   - **The base is the merge's first parent, EXCEPT a GitHub rebase-merge** (XERK-2136): its
     `mergeCommit` is the last of N rewritten commits, so `^1` already holds the rest. The one
     fetch also pulls `refs/pull/<n>/head` (into `refs/turma-shadow-pr/<id>`, deleted after);
-    when the N first-parent commits carry the PR's N messages in order, the base is `merge~N`.
-    A squash or merge commit keeps `^1`. Can't read the head, N=0, or N over
-    `SHADOW_PR_COMMITS_MAX` → the run fails, never a guessed base. GitLab/ADO keep `^1`.
+    when the N first-parent commits carry the PR's N authors, author times and messages in
+    order, the base is `merge~N`. A squash or merge commit keeps `^1`. Can't read the head,
+    N=0, or N over `SHADOW_PR_COMMITS_MAX` → the run fails. GitLab/ADO keep `^1` (XERK-2146).
+  - That fetch is all-or-nothing: a quick failure (origin lacks the PR head) re-fetches the
+    branch alone, so a merge-commit PR still places. A rebase that does not line up (a commit
+    dropped as already applied) reads as a squash and keeps `^1` — the residual.
   - The request-dir allowance is per session, so a run can no longer write its grader's
     `shadow-grade.json`.
   - Residuals: no repo skills in a shadow (parity cost); enforcement itself is HOST-PROOF — CI and the k8x pods have no unprivileged user

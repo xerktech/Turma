@@ -49045,14 +49045,46 @@ class TestShadowBase(unittest.TestCase):
         self.git(self.dev, "merge", "-q", "--squash", "pr11")
         self.git(self.dev, "commit", "-q", "-m", "Squashed PR (#11)")
         merge = self.land()
-        self.git(self.host, "fetch", "-q", "origin", "main")
         base, why = self.base(merge, 99)          # no such PR head on the forge
         self.assertIsNone(base)
-        self.assertIn("PR's head", why)
+        self.assertIn("PR's head", why, "the branch was still fetched on its own")
         self.assertEqual(self.base("f" * 40, 11)[1], "the merge commit is not in this clone")
         # Not a GitHub PR: no head to read, the first parent as before.
         parent = self.git(self.host, "rev-parse", f"{merge}^1")
         self.assertEqual(ha.shadow_base_commit(self.host, merge, "", self.RID), (parent, None))
+
+    def test_a_merge_commit_bases_even_when_the_origin_lacks_the_pr_head(self):
+        before = self.open_pr(12, ["g1", "g2"])
+        self.git(self.origin, "update-ref", "-d", "refs/pull/12/head")   # a mirror origin
+        self.git(self.dev, "merge", "-q", "--no-ff", "-m", "Merge pull request #12", "pr12")
+        merge = self.land()
+        self.assertEqual(self.base(merge, 12), (before, None))
+
+    def test_a_pr_already_on_the_default_branch_or_too_long_fails_closed(self):
+        self.commit("h1")                       # the PR's commits landed as themselves
+        merge = self.commit("h2")
+        self.git(self.dev, "push", "-q", "origin", "HEAD:refs/pull/13/head")
+        self.land()
+        self.assertIn("landed unchanged", self.base(merge, 13)[1])
+        self.git(self.dev, "switch", "-q", "-c", "pr14", "main")
+        for i in range(ha.SHADOW_PR_COMMITS_MAX + 1):
+            self.git(self.dev, "commit", "-q", "--allow-empty", "-m", f"k{i}")
+        self.git(self.dev, "push", "-q", "origin", "HEAD:refs/pull/14/head")
+        self.git(self.dev, "switch", "-q", "main")
+        self.git(self.dev, "merge", "-q", "--squash", "pr14")
+        self.git(self.dev, "commit", "-q", "--allow-empty", "-m", "Squashed PR (#14)")
+        merge = self.land()
+        self.assertIn("over", self.base(merge, 14)[1])
+
+    def test_a_squash_after_a_commit_repeating_a_pr_message_stays_a_squash(self):
+        before = self.open_pr(15, ["x1", "x2"])
+        self.git(self.dev, "commit", "-q", "--allow-empty", "-m", "x1", "-m", "body of x1",
+                 env={"GIT_AUTHOR_DATE": "2030-01-01T00:00:00Z"})   # a later, unrelated x1
+        before = self.git(self.dev, "rev-parse", "HEAD")
+        self.git(self.dev, "merge", "-q", "--squash", "pr15")
+        self.git(self.dev, "commit", "-q", "-m", "x2", "-m", "body of x2")
+        merge = self.land()
+        self.assertEqual(self.base(merge, 15), (before, None))
 
 
 class TestShadowSandbox(ManagerMixin, unittest.TestCase):

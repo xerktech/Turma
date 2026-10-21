@@ -18958,10 +18958,12 @@ SHADOW_PR_COMMITS_MAX = 100
 
 
 def _commit_messages(repo, shas):
-    """The full messages of `shas`, in order, or None if git cannot list them
-    one per commit (a forged NUL in a message reads as a mismatch, never a match)."""
+    """Each of `shas` as its author, author time and full message, in order, or
+    None if git cannot list them one per commit. A rebase keeps all three; a
+    squash, or an unrelated commit that merely repeats a message, does not.
+    (git cuts a message at a NUL, so a forged NUL only truncates the text.)"""
     rc, out = run_out(["git", "-C", repo, "log", "--no-walk=unsorted", "-z",
-                       "--format=%B", *shas])
+                       "--format=%an <%ae> %at%n%B", *shas])
     if rc != 0:
         return None
     parts = [p.strip() for p in out.split("\0")]
@@ -18972,7 +18974,7 @@ def _commit_messages(repo, shas):
 
 def shadow_base_commit(repo, merge, pr_url, shadow_id):
     """Fetch, then find the code as it was before the PR landed: `(base, None)`,
-    or `(None, why)` when it cannot be placed (XERK-2136). Fails closed.
+    or `(None, why)` when it cannot be placed (XERK-2136).
 
     A merge commit's first parent is that. A squash's only parent is too. A
     GitHub rebase-merge lands the PR's N commits rewritten one by one, so the
@@ -18980,18 +18982,28 @@ def shadow_base_commit(repo, merge, pr_url, shadow_id):
     rest: the base is merge~N. The two single-parent cases are told apart by the
     PR's own head (`refs/pull/<n>/head`, kept by GitHub after the branch is
     deleted): rebased, the N commits on the default branch carry the PR's N
-    commit messages in order; a squash's one commit (and the PR before it) do not.
+    authors, author times and messages in order; a squash's one commit does not.
+    No readable head, no PR commits off the default branch, or too many → fails.
+    Residual: a rebase that does not line up (a commit dropped as already
+    applied) reads as a squash and keeps the first parent, as before this.
     A non-GitHub URL keeps the first parent."""
     git = ["git", "-C", repo]
     num = PR_URL_PARTS_RE.search(pr_url) if PR_URL_RE.fullmatch(pr_url or "") else None
     pr_ref = f"refs/turma-shadow-pr/{shadow_id}" if num else None
     name = default_branch_name(repo)
-    specs = [name] if name and valid_ref_name(name) else []
-    if pr_ref:
-        specs.append(f"+refs/pull/{num.group(3)}/head:{pr_ref}")
-    if specs:    # one bounded fetch, as before; the merge commit is on the default branch
-        run_ok(git + ["fetch", "origin", *specs], timeout=FETCH_TIMEOUT_SEC)
+    branch = [name] if name and valid_ref_name(name) else []
     try:
+        # One bounded fetch, as before; the merge commit is on the default branch.
+        # A fetch is all-or-nothing, so a PR head the origin lacks (a fork or
+        # mirror origin) would also lose the branch: a quick failure retries the
+        # branch alone. A slow one (an origin that is down) does not try twice.
+        specs = branch + ([f"+refs/pull/{num.group(3)}/head:{pr_ref}"] if pr_ref else [])
+        if specs:
+            t0 = time.monotonic()
+            rc, _ = run_ok(git + ["fetch", "origin", *specs], timeout=FETCH_TIMEOUT_SEC)
+            if (rc != 0 and pr_ref and branch
+                    and time.monotonic() - t0 < FETCH_TIMEOUT_SEC / 2):
+                run_ok(git + ["fetch", "origin", *branch], timeout=FETCH_TIMEOUT_SEC)
         line = run(git + ["rev-list", "--parents", "-n", "1", merge, "--"]).lower().split()
         if not line or line[0] != merge:
             return None, "the merge commit is not in this clone"
