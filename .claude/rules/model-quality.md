@@ -62,7 +62,7 @@ This file is the operative rules for what has shipped; the routing policy is `mo
 - **A live row dropped by retention or its host's cap takes its paired shadows with it**
   (XERK-2109), on whatever host they ran: below `MAX_ROWS` the orphan lingered until retention.
   - Live hosts are capped first, so a shadow host's count excludes the shadows already taken.
-  - Tests: the `XERK-2109:` host-cap cases in `outcome-ledger.test.js`.
+  - Tests: the `XERK-2109:` retention and host-cap cases in `outcome-ledger.test.js`.
 - **Past `MAX_ROWS` the org pass evicts a live row and its paired shadows as ONE unit** (XERK-1858),
   ranked and aged by the live row (XERK-1855 order); an orphaned shadow is its own unit and goes first.
   - Shadows alone first churned: at the cap a new shadow was evicted and re-created every tick and

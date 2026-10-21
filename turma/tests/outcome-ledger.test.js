@@ -1130,6 +1130,24 @@ test("XERK-2109: a host over its cap evicts a live row together with its paired 
   L._internals.reset();
 });
 
+test("XERK-2109: a live row dropped by retention takes its fresh shadow with it", () => {
+  L._internals.reset();
+  recording();
+  const rows = L._internals.rows();
+  const old = L.sanitizeRow({ site: "acme.atlassian.net", issue: "A-1", host: "h1", sid: "s1",
+    cls: "bug", model: "opus", firstSeen: T0, updatedAt: T0 });
+  rows.set(old.key, old);
+  const now = T0 + (L.RETAIN_DAYS + 1) * DAY;
+  const sh = L.sanitizeRow({ site: "acme.atlassian.net", issue: "A-1", host: "h2",
+    sid: "sh-001122330001", cls: "bug", model: "haiku", kind: "shadow", pairOf: old.key,
+    firstSeen: now - 1, updatedAt: now - 1 });
+  rows.set(sh.key, sh);
+  const dropped = L._internals.evict(now);
+  assert.equal(rows.size, 0, "the fresh shadow does not outlive its expired live row");
+  assert.deepEqual(new Set(dropped), new Set([old.key, sh.key]));
+  L._internals.reset();
+});
+
 test("XERK-2109: a shadow host's cap does not count the shadows a live eviction took", () => {
   L._internals.reset();
   recording();
