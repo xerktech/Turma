@@ -203,7 +203,8 @@ h5.md-h, h6.md-h { color: var(--ink-2); }
 /* Keep each message/tool card at its natural size: in a flex column, children
    default to flex-shrink:1, so a growing transcript would squash the existing
    cards to fit instead of scrolling. Pin them so the container scrolls. */
-.chat-scroll > *, .tr-scroll > * { flex-shrink: 0; }
+.chat-scroll > *, .tr-scroll > *,
+.chat-scroll > * > *, .tr-scroll > * > * { flex-shrink: 0; }
 /* Text bubbles reuse the transcript bubble system: user right, agent left.
    In the live chat, agent output is borderless/background-free and tighter
    so it reads as flat prose; user input keeps its bubble. The archived
