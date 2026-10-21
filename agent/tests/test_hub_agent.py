@@ -21499,6 +21499,10 @@ class TestParsePanePrompt(unittest.TestCase):
         p = ha.parse_pane_prompt(
             "─" * 40 + "\n Proceed?\n ❯ 1. Yes\n\n   2. Maybe\n   3. No\n")
         self.assertIsNone(p)
+        # Nor under a line one cell short of the pane: only an exact fill.
+        short = " ❯ 1. " + "y" * 33       # 39 cells in a 40-cell pane
+        self.assertIsNone(ha.parse_pane_prompt(
+            "─" * 40 + "\n Proceed?\n" + short + "\n\n   2. No\n"))
 
     def test_wrap_needs_label_column_and_cells(self):
         # A line off the label column is not part of the label, however full
