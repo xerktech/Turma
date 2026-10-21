@@ -10412,6 +10412,19 @@ class TestTrustDialogIsABlockingDialog(unittest.TestCase):
         self.assertIsNotNone(ha.parse_pane_prompt(numbered))
         self.assertTrue(ha._pane_blocking_dialog(numbered))
 
+    def test_the_exit_toast_or_a_cut_footer_is_not_the_modal(self):
+        # XERK-2171: a reply shaped like the modal, read while the Ctrl-C toast
+        # (or a width-cut footer) stands in for the mode footer. Read as the
+        # modal, the trust sweep would press Down + Enter into an idle composer.
+        reply = ("● The modal asks: Do you trust the files in this folder?\n"
+                 "  Yes, I trust this folder\n  No, exit\n\n"
+                 + "─" * 80 + "\n❯ \n" + "─" * 80 + "\n")
+        for tail in ("  Press Ctrl-C again to exit\n",
+                     "  Press Ctrl-C again to\n  exit\n", "  ⏸ manual  ·\n"):
+            self.assertFalse(ha._trust_dialog_up(reply + tail), tail)
+        # The real modal is still the modal.
+        self.assertTrue(ha._trust_dialog_up(LINUX_TRUST_MODAL))
+
     def test_a_live_permission_dialog_is_never_the_trust_modal(self):
         # QA finding (HIGH), and the one real regression this change introduced:
         # a tool-permission dialog shows NO mode footer either (that is exactly
@@ -20675,6 +20688,17 @@ MODEL_PICKER_PANE = """
 """
 
 
+class TestModelPickerOpen(unittest.TestCase):
+    def test_the_picker_is_open_only_without_a_composer_footer(self):
+        # XERK-2171: picker-shaped rows above the composer, read while the
+        # Ctrl-C toast or a width-cut footer stands in for the mode footer.
+        self.assertTrue(ha._model_picker_open(MODEL_PICKER_PANE))
+        composer = MODEL_PICKER_PANE + "─" * 80 + "\n❯ \n" + "─" * 80 + "\n"
+        for tail in ("  ⏸ manual mode on\n", "  Press Ctrl-C again to exit\n",
+                     "  ⏸ manual  ·\n"):
+            self.assertFalse(ha._model_picker_open(composer + tail), tail)
+
+
 class _PickerPane:
     """A /model-picker pane simulator for set_model's closed loop: send-keys
     move its ❯ cursor, `s` closes it and prints the confirmation — and it can
@@ -22375,6 +22399,35 @@ class TestParsePanePrompt(unittest.TestCase):
             self.assertIsNone(ha.parse_pane_prompt(cap.replace(
                 "Press Ctrl-C again to exit", wrapped)), wrapped)
         # A real dialog is still read; the toast is never below one.
+        self.assertIsNotNone(ha.parse_pane_prompt(PANE_EXIT_PLAN_SUBTITLE_DIALOG))
+
+    def test_a_width_cut_mode_footer_vetoes_like_the_whole_one(self):
+        # XERK-2171: at 16 columns the footer reads "  ⏸ manual  ·", which
+        # PANE_MODE_RE misses, so a reply shaped question / options read as a
+        # live dialog with no toast involved.
+        cap = ("● Pick one?\n❯ 1. Alpha\n  2. Beta\n\n" + "─" * 16
+               + "\n❯ \n" + "─" * 16 + "\n  ⏸ manual  ·\n")
+        self.assertIsNone(ha.parse_pane_prompt(cap))
+        for cut in ("  ⏵⏵ accept", "  ⏸ plan", "  ⏵⏵ auto mode", "  ⏵⏵ bypass",
+                    "  ⏵⏵", "  ⏸"):
+            self.assertIsNone(ha.parse_pane_prompt(
+                cap.replace("  ⏸ manual  ·", cut)), cut)
+        # Only the composer's own tail: the glyph quoted in the reply, or a
+        # bare mode word below the rule, leaves the reply parsing as before.
+        self.assertIsNotNone(ha.parse_pane_prompt(
+            cap.replace("  ⏸ manual  ·", "  manual  ·")))
+        self.assertIsNotNone(ha.parse_pane_prompt(
+            "  ⏸ manual  ·\n" + cap.replace("  ⏸ manual  ·", "  x")))
+        # Only the BOTTOM line: one above it, under the rule, is not a footer.
+        self.assertIsNotNone(ha.parse_pane_prompt(
+            cap.replace("  ⏸ manual  ·", "  ⏸ manual  ·\n  x")))
+        # A rule-less pane (a qwen approval dialog) is never vetoed by a
+        # transcript line that merely starts like a footer (QA, HIGH).
+        qwen = ("◆ Sure.\n    ⏸ plan mode first, then run it\n\n"
+                "? WriteFile made.txt\n\nApply this change?\n\n"
+                "› 1. Yes, allow once\n  2. No\n\n    ⏵⏵ auto mode\n")
+        self.assertIsNotNone(ha.parse_pane_prompt(qwen))
+        # A real dialog is still read.
         self.assertIsNotNone(ha.parse_pane_prompt(PANE_EXIT_PLAN_SUBTITLE_DIALOG))
 
     def test_a_subtitle_needs_blank_fences_and_a_question(self):

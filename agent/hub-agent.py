@@ -14283,23 +14283,37 @@ QWEN_PANE_FOOTER_RE = re.compile(r"Ask permissions \(shift \+ tab to cycle\)")
 # exit"). It rides the composer like the footer it hides, so it vetoes a dialog
 # the same way — else a reply shaped question / options reads as a live dialog
 # while it is up (XERK-2169). Matched against EVERYTHING below the pane's last
-# rule (`_pane_exit_toast_up`), so a reply merely quoting it never counts, and a
+# rule (`_pane_composer_tail_up`), so a reply merely quoting it never counts, and a
 # live dialog, whose options sit below that rule, never matches.
 PANE_EXIT_TOAST_RE = re.compile(r"^\s*Press Ctrl-[CD] again to exit\s*$")
+# The mode footer cut short by a narrow pane: at 16 columns 2.1.306 draws
+# "  ⏸ manual  ·", at 10-12 the bare glyph ("  ⏵⏵"), both of which PANE_MODE_RE
+# (it needs "<mode> on") misses, so an idle pane whose last reply is shaped
+# question / options read as a live dialog (XERK-2171). Glyph plus the mode's
+# first word, or the glyph alone, read ONLY on the pane's bottom line below a
+# rule (`_pane_composer_tail_up`): a qwen dialog has no rule, so its whole
+# screen is "below" one, and a transcript line there would veto it (QA).
+PANE_MODE_CUT_RE = re.compile(
+    r"^\s*[⏸⏵]+(?:\s+(?:bypass|accept|plan|auto|manual)\b|\s*$)")
 
 
-def _pane_exit_toast_up(lines):
-    """Whether the lines below the pane's last rule are the exit toast, read
-    with its wraps joined: at 28 columns or less it wraps ("Press Ctrl-C again
-    to" / "exit"), which the per-line match misses (XERK-2169 QA)."""
-    tail = []
+def _pane_composer_tail_up(lines):
+    """Whether the lines below the pane's last rule are the composer's own
+    footer — the exit toast, read with its wraps joined (at 28 columns or less
+    it wraps "Press Ctrl-C again to" / "exit", XERK-2169 QA), or a mode marker
+    cut short by the width as the bottom line under a rule (XERK-2171). Either says no dialog owns the
+    composer, the same as a footer `PANE_MODE_RE` finds."""
+    tail, ruled = [], False
     for line in reversed(lines):
         if line.strip() and PANE_PROMPT_RULE_RE.match(line):
+            ruled = True
             break
         if line.strip():
             tail.append(line.strip())
-    return bool(tail) and bool(
-        PANE_EXIT_TOAST_RE.match(" ".join(reversed(tail))))
+    if not tail:
+        return False
+    return (bool(PANE_EXIT_TOAST_RE.match(" ".join(reversed(tail))))
+            or (ruled and bool(PANE_MODE_CUT_RE.match(tail[0]))))
 # A trailing right-edge SCROLLBAR column + its padding (XERK-509 [Qwen C]): the
 # block-element family (█ and eighths/shades, U+2588-258F / U+2591-2593), the
 # right-block glyphs (▐ ▕) and light/heavy vertical bars (│ ┃), any run of them
@@ -14472,8 +14486,8 @@ def parse_pane_prompt(cap, face=False):
     # legitimate rule/detail line is made of.
     lines = [_PANE_SCROLLBAR_RE.sub("", l) for l in cap.splitlines()]
     widest = None                    # the pane's width, measured on first need
-    if _pane_exit_toast_up(lines):
-        return None                  # the exit toast (wraps joined): composer is live
+    if _pane_composer_tail_up(lines):
+        return None                  # the toast or a cut footer: composer is live
     # A mode footer anywhere below means the composer is live -> no dialog.
     for i in range(len(lines) - 1, -1, -1):
         line = lines[i]
@@ -18650,6 +18664,8 @@ def _trust_dialog_up(cap):
         return False
     if PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text):
         return False           # the composer footer is live: no modal is up
+    if _pane_composer_tail_up(_pane_lines(text)):
+        return False           # the exit toast / a cut footer hides it (XERK-2171)
     # A NUMBERED dialog is never the trust modal — the two are mutually exclusive
     # by construction (the modal's options carry no `N.`), and a pane can only
     # show one dialog at a time. This check is load-bearing, not belt-and-braces:
@@ -25003,10 +25019,13 @@ def _model_switch_landed(before, after, label):
 
 def _model_picker_open(cap):
     """Whether the /model picker is drawn: its rows parse and the composer's
-    mode footer, which the picker hides, is not on screen. Its own key-hint
+    mode footer, which the picker hides, is not on screen — nor the exit toast
+    or a width-cut footer standing in for it (XERK-2171). Its own key-hint
     footer is not required — a narrow pane pushes it off-screen."""
+    text = _ANSI_RE.sub("", cap or "")
     return bool(parse_model_picker(cap)[0]
-                and not PANE_MODE_RE.search(_ANSI_RE.sub("", cap or "")))
+                and not PANE_MODE_RE.search(text)
+                and not _pane_composer_tail_up(_pane_lines(text)))
 
 
 def _model_names_row(name, label):
