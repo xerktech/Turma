@@ -10925,9 +10925,40 @@ class TestPanePromptUnderTheEdge(unittest.TestCase):
         self.assertFalse(ha._pane_cut_dialog_up(
             "▔" * 40 + "\n❯ Exit plan mode?\n    ❯ 1. Yes\n"))
         self.assertFalse(ha._pane_cut_dialog_up(
-            "▔" * 40 + "\n   Exit plan mode?\n      1. Yes\n"))
+            "▔" * 40 + "\n   Bash command\n   Proceed?\n      1. Yes\n"))
         self.assertFalse(ha._pane_cut_dialog_up(
             "▔" * 40 + "\n   A note, no question\n    ❯ 1. Yes\n"))
+        # An idle composer under an edge always draws its column-0 rule.
+        self.assertFalse(ha._pane_cut_dialog_up(
+            "▔" * 40 + "\n   Exit plan mode?\n" + "─" * 40 + "\n  hi\n"))
+
+    def test_a_dialog_cut_above_its_options_blocks(self):
+        # QA (120x8, 2.1.307): only the question and subtitle are drawn; a
+        # queued message's Enter approved leaving plan mode.
+        cap = ("❯ Plan: create an empty file named ep_probe.txt.\n"
+               + "▔" * 20 + " tmux detected · scroll with PgUp/PgDn · or add 'set -g mouse on'"
+               " to ~/.tmux.conf for wheel scroll ▔\n\n"
+               "  " + "─" * 116 + "\n   Exit plan mode?\n\n    Claude wants to exit plan mode\n")
+        self.assertIsNone(ha.parse_pane_prompt(cap))
+        self.assertTrue(ha._pane_cut_dialog_up(cap))
+        self.assertTrue(ha._pane_blocking_dialog(cap))
+
+    def test_a_tip_edge_must_reach_the_right_edge(self):
+        lines = ["x" * 40, "● a reply ending in the glyph ▔", " tmux detected · tip " + " " * 18 + "▔"]
+        self.assertEqual(ha._pane_prompt_edges(lines), {2})
+
+    def test_the_cut_run_must_be_option_one(self):
+        cap = ("▔" * 40 + "\n   Bash command\n   touch x\n   Proceed?\n"
+               "    ❯ 2. No\n")
+        self.assertFalse(ha._pane_cut_dialog_up(cap))
+        self.assertTrue(ha._pane_cut_dialog_up(cap.replace("❯ 2. No", "❯ 1. Yes")))
+
+    def test_the_cut_option_may_wrap_only_a_few_lines(self):
+        head = "▔" * 40 + "\n   Bash command\n   Proceed?\n    ❯ 1. Yes, and\n"
+        wraps = "".join(f"         word{n}\n" for n in range(ha._PANE_CUT_OPTION_WRAP_LINES + 1))
+        self.assertFalse(ha._pane_cut_dialog_up(head + wraps))
+        self.assertTrue(ha._pane_cut_dialog_up(
+            head + "".join(wraps.splitlines(True)[:ha._PANE_CUT_OPTION_WRAP_LINES])))
 
 
 # The /model picker on a 40x45 pane (2.1.306, trimmed): wrapped descriptions

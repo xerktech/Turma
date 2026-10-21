@@ -18881,48 +18881,58 @@ def _pane_blocking_dialog(cap):
             or _pane_cut_dialog_up(cap))
 
 
+# An idle composer's rule, drawn from column 0 (a dialog's box rule is indented).
+_COMPOSER_EDGE_RULE_RE = re.compile(r"^─{10,}")
 # How many wrapped label lines may follow the cut-off dialog's "❯ 1." row.
 _PANE_CUT_OPTION_WRAP_LINES = 4
 
 
 def _pane_cut_dialog_up(cap):
-    """Whether the pane's bottom is a choice dialog cut off after its first
-    option: a pane ~10 rows high draws "Exit plan mode?" / "Ready to code?"
-    down to "❯ 1. Yes, …" and no further (2.1.306, XERK-2148), so the 1..N run
-    `parse_pane_prompt` needs is never drawn — and a typed digit or Enter
-    still answers it. No panePrompt is offered: the other options are unseen.
+    """Whether the pane's bottom is a choice dialog cut off before its option
+    run is drawn: a pane ~10 rows high draws "Exit plan mode?" / "Ready to
+    code?" down to "❯ 1. Yes, …" and no further, one 8 rows high down to its
+    subtitle (2.1.306, XERK-2148). The 1..N run `parse_pane_prompt` needs is
+    never drawn — and a typed digit or Enter still answers it (QA: a queued
+    message's Enter approved leaving plan mode). No panePrompt is offered.
 
-    Read by position: the last lines are "❯ 1." (the cursor on option 1) and
-    at most a few indented wraps of its label; above them, inside the bottom
-    area that starts at its ▔ top edge (`_pane_prompt_edges`, which a dialog
-    draws and a composer never does), a question line ending in "?"; and
-    nothing in that area is the composer's (its "❯" prompt at column 0, or
-    any composer footer)."""
+    Read inside the bottom area that starts at its ▔ top edge
+    (`_pane_prompt_edges`, which a dialog draws and an idle composer never
+    does), and only when nothing there is the composer's: no "❯" prompt and
+    no "─" rule at column 0 (an idle composer always draws its rule there,
+    a dialog's box rule is indented), no mode/shell/qwen footer and no exit
+    toast. Then either the area's first line is a question ending in "?", or
+    the last lines are "❯ 1." (the cursor on option 1) plus at most a few
+    indented wraps of its label, with a question above them."""
     if not cap:
         return False
     lines = [_PANE_SCROLLBAR_RE.sub("", line).rstrip()
              for line in _ANSI_RE.sub("", cap).splitlines()]
-    filled = [k for k, line in enumerate(lines) if line.strip()]
+    edge = max(_pane_prompt_edges(lines), default=None)
+    if edge is None:
+        return False
+    area = lines[edge + 1:]
+    text = "\n".join(area)
+    if (any(line.startswith("❯") or _COMPOSER_EDGE_RULE_RE.match(line) for line in area)
+            or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
+            or PANE_SHELL_FOOTER_RE.search(text) or _pane_composer_tail_up(lines)):
+        return False
+    asks = lambda line: line.strip().rstrip("↓ ").endswith("?")
+    content = [line for line in area
+               if line.strip() and not PANE_PROMPT_RULE_RE.match(line)]
+    if content and asks(content[0]):
+        return True
+    filled = [k for k, line in enumerate(area) if line.strip()]
     for n, k in enumerate(reversed(filled)):
-        m = PANE_PROMPT_OPTION_RE.match(lines[k])
+        m = PANE_PROMPT_OPTION_RE.match(area[k])
         if m:
             break
-        if n >= _PANE_CUT_OPTION_WRAP_LINES or not lines[k][:1].isspace():
+        if n >= _PANE_CUT_OPTION_WRAP_LINES or not area[k][:1].isspace():
             return False
     else:
         return False
-    if not (m.group(1) and m.group(2) == "1" and lines[k][:1].isspace()):
+    if not (m.group(1) and m.group(2) == "1" and area[k][:1].isspace()):
         return False
-    edge = max((e for e in _pane_prompt_edges(lines) if e < k), default=None)
-    if edge is None:
-        return False
-    area = lines[edge + 1:k]
-    text = "\n".join(area)
-    if (any(line.startswith("❯") for line in area)
-            or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
-            or PANE_SHELL_FOOTER_RE.search(text)):
-        return False
-    return any(line.strip().rstrip("↓ ").endswith("?") for line in area)
+    return any(asks(line) for line in area[:k])
 
 
 def _answer_trust_dialog(tmux_name, cap=None):
