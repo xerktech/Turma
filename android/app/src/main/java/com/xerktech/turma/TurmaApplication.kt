@@ -16,13 +16,7 @@ class TurmaApplication : Application(), ImageLoaderFactory {
     // only past SafeSvgDecoder's DOCTYPE check (an entity bomb never reaches it).
     override fun newImageLoader(): ImageLoader =
         ImageLoader.Builder(this)
-            .components {
-                // data: URIs carry their declared type, and a declared bitmap is
-                // never sniffed for SVG (XERK-2161) — so DeclaredBitmapDecoder first.
-                add(DataImage.Fetcher.Factory())
-                add(DeclaredBitmapDecoder.Factory())
-                add(SafeSvgDecoder.Factory())
-            }
+            .components(turmaImageComponents())
             .crossfade(true)
             .build()
 

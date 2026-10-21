@@ -5118,14 +5118,9 @@ setInterval(() => { if (!sseOk) refresh(); }, 15000);
     zoomTo(scale * factor, px == null ? window.innerWidth / 2 : px,
                            py == null ? window.innerHeight / 2 : py);
   }
-  function open(src, alt, size) {
+  function open(src, alt) {
     img.src = src;
     img.alt = alt || "";
-    // A viewBox-only SVG's size rides its <img>'s width/height (chat.js
-    // svgSizeAttrs, XERK-2161); without it the flex-centred image is 0 × 0.
-    for (const k of ["width", "height"]) {
-      if (size && size[k]) img.setAttribute(k, size[k]); else img.removeAttribute(k);
-    }
     reset();
     box.classList.add("open");
   }
@@ -5141,7 +5136,7 @@ setInterval(() => { if (!sseOk) refresh(); }, 15000);
     const hit = e.target.closest && e.target.closest("img.md-img");
     if (!hit || !hit.src) return;
     e.preventDefault();
-    open(hit.src, hit.alt, { width: hit.getAttribute("width"), height: hit.getAttribute("height") });
+    open(hit.src, hit.alt);
   });
   closeBtn.addEventListener("click", close);
   if (inBtn) inBtn.addEventListener("click", () => zoomStep(1.4));

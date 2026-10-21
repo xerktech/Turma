@@ -112,6 +112,9 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
     like Android's `svgFilledSize`. Never put `width: auto` back on `.md-svg` — it overrides them.
   - **Android decodes a `data:` URI by its DECLARED type** (`DataImage` + `DeclaredBitmapDecoder`,
     XERK-2161), as the browser does: SVG bytes behind `data:image/png` are broken, never sniffed.
+    - **Never `runBlocking { loader.execute(…) }` in a Robolectric test**: Coil resumes on the
+      paused main looper and it hangs forever (the Android CI job then times out). Drive the fetcher
+      and decoder factories of `turmaImageComponents()` directly (`DataImageTest`).
   - **A rule line is a SCAN (`isRuleLine`), never `/(?:-[ \t]*){3,}/`.** That regex is linear in V8
     but `java.util.regex` recurses once per iteration of a quantified GROUP, so the Android port of
     it threw an **uncatchable `StackOverflowError`** out of `parseProse` inside a Composable (an

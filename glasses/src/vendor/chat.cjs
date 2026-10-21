@@ -172,7 +172,7 @@
   // An SVG with a viewBox but no width/height has NO intrinsic size in an <img>,
   // only a ratio, so in a shrink-to-fit bubble or table cell it laid out at 0 × 0
   // (XERK-2161). Android fills the width offered at the viewBox's ratio, capped in
-  // height (SvgGuard.kt svgFilledSize + ProseImage). The <img> gets the same: its
+  // height (svgFilledSize, XERK-2109, + ProseImage). The <img> gets the same: its
   // width attribute is the width at which it reaches the .md-img max-height, so
   // max-width:100% narrows it to the bubble and height:auto keeps the ratio.
   // Anything else gets nothing: an SVG declaring a size, or with no viewBox,
@@ -191,15 +191,20 @@
     const open = svg.search(/<svg[\s>/]/i);
     if (open < 0) return "";
     const close = svg.indexOf(">", open);
-    const tag = svg.slice(open, close < 0 ? svg.length : close);
-    const attr = (name) => {
-      const m = new RegExp("\\s" + name + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)')", "i").exec(tag);
-      return m ? (m[1] != null ? m[1] : m[2]) : null;
-    };
-    // A percentage is the default (100%): still no intrinsic size.
-    const unsized = (v) => v == null || /%\s*$/.test(v);
+    const tag = svg.slice(open + 4, close < 0 ? svg.length : close);
+    // Walk the attributes in order, so a name inside another's quoted value
+    // (aria-label=" width='5'") is never read as one.
+    const attrs = {};
+    const ATTR = /([^\s=/>]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'>]+))?/g;
+    for (let m; (m = ATTR.exec(tag));) {
+      const name = m[1].toLowerCase();
+      if (!(name in attrs)) attrs[name] = m[2] == null ? "" : m[2].replace(/^["']|["']$/g, "");
+    }
+    const attr = (name) => (Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null);
+    // Absent, empty, auto or a percentage (100% is the default): no intrinsic size.
+    const unsized = (v) => v == null || /^\s*(?:auto)?\s*$|%\s*$/i.test(v);
     if (!unsized(attr("width")) || !unsized(attr("height"))) return "";
-    const vb = (attr("viewBox") || "").trim().split(/[\s,]+/).map(Number);
+    const vb = (attr("viewbox") || "").trim().split(/[\s,]+/).map(Number);
     if (vb.length !== 4 || !(vb[2] > 0 && vb[2] < Infinity) || !(vb[3] > 0 && vb[3] < Infinity)) return "";
     const w = Math.min(1e6, Math.max(1, Math.round(SVG_FILL_MAX_H * vb[2] / vb[3])));
     return ' width="' + w + '" height="' + SVG_FILL_MAX_H + '"';

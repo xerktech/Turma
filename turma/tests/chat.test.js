@@ -2231,6 +2231,9 @@ test("XERK-2161: a viewBox-only SVG is sized to fill the bubble at its ratio", (
   const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 5"/>';
   assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml," + encodeURIComponent(svg) + ")")), [840, 420]);
   assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml;base64," + Buffer.from(svg).toString("base64") + ")")), [840, 420]);
+  // An empty or auto size is no size; a name inside another attribute's value is not one.
+  assert.deepEqual(sizeOf(renderProse('<svg width="auto" height="" viewBox="0 0 200 100"><rect/></svg>')), [840, 420]);
+  assert.deepEqual(sizeOf(renderProse('<svg aria-label=" width=\'5\'" viewBox="0 0 200 100"><rect/></svg>')), [840, 420]);
   // A declared size, a zero size, no viewBox, a bad viewBox, a bitmap, a bad URI: untouched.
   for (const t of [
     '<svg width="80" height="40" viewBox="0 0 200 100"><rect/></svg>',

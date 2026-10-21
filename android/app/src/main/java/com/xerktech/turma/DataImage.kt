@@ -1,6 +1,7 @@
 package com.xerktech.turma
 
 import android.util.Base64
+import coil.ComponentRegistry
 import coil.ImageLoader
 import coil.decode.BitmapFactoryDecoder
 import coil.decode.DataSource
@@ -59,13 +60,27 @@ class DataImage(val mimeType: String, val bytes: ByteArray) {
  */
 class DeclaredBitmapDecoder private constructor() {
     class Factory : Decoder.Factory {
+        // Coil's own factory, so its cap on parallel bitmap decodes still holds.
+        private val bitmaps = BitmapFactoryDecoder.Factory()
+
         override fun create(result: SourceResult, options: Options, imageLoader: ImageLoader): Decoder? {
             val type = result.mimeType?.substringBefore(';')?.trim()?.lowercase() ?: return null
             if (!type.startsWith("image/") || type == "image/svg+xml") return null
-            return BitmapFactoryDecoder(result.source, options)
+            return bitmaps.create(result, options, imageLoader)
         }
 
         override fun equals(other: Any?) = other is Factory
         override fun hashCode() = javaClass.hashCode()
     }
 }
+
+/**
+ * The app loader's components, in order: data: URIs carry their declared type, and
+ * a declared bitmap is never sniffed for SVG (XERK-2161) — so [DeclaredBitmapDecoder]
+ * before [SafeSvgDecoder]. Shared with the tests, so they check the app's own list.
+ */
+fun turmaImageComponents(): ComponentRegistry = ComponentRegistry.Builder()
+    .add(DataImage.Fetcher.Factory())
+    .add(DeclaredBitmapDecoder.Factory())
+    .add(SafeSvgDecoder.Factory())
+    .build()
