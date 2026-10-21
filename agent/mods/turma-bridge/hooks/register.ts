@@ -184,7 +184,9 @@ async function peersText($: EngineInterface): Promise<string> {
     const where = [cell(h), cell(repo)].filter(Boolean).join('/')
     const br = cell(branch) ? ` [${cell(branch)}]` : ''
     const what = quoted(task) ? ` — ${quoted(task)}` : ''
-    return `  ${cell(name)}${mark}  ${where}${br}${what}`
+    // A nameless row (the local fallback roster) must not read as a
+    // continuation of the row above.
+    return `  ${cell(name) || '(no name)'}${mark}  ${where}${br}${what}`
   })
   const head = [`${rows.length} session(s); message one by its name with SendMessage.`, DATA_NOTE]
   // Rows fit under OUT_MAX with the pointer to the whole roster kept.

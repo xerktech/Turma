@@ -254,10 +254,13 @@ test("/turma peers lists the roster, marks you, and flattens what sessions wrote
 
 test("/turma peers reads the roster's '-' as an empty cell", async () => {
   const h = await harness();
-  h.files.set("/t/peers.tsv", "zz\tPeer\thost2\tTenir\t-\t-\n");
+  h.files.set("/t/peers.tsv", "zz\tPeer\thost2\tTenir\t-\t-\nzy\t-\t-\t-\t-\tonly a task\n" +
+    "me1\t-\tk8x-02\tR\t-\t-\n");
   const out = await h.turma("peers");
-  assert.match(out, /  Peer  host2\/Tenir$/m);
-  assert.doesNotMatch(out, /“-”|\[-\]/);
+  assert.match(out, /^  \(no name\) \(you\)  k8x-02\/R$/m, "you: matched on the raw id + host");
+  assert.match(out, /^  Peer  host2\/Tenir$/m);
+  assert.match(out, /^  \(no name\)   — “only a task”$/m);
+  assert.doesNotMatch(out, /“-”|\[-\]|\/-|-\//);
 });
 
 test("/turma peers and status say why when there is nothing to read", async () => {
