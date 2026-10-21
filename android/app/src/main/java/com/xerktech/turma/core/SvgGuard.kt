@@ -160,15 +160,47 @@ private fun skipBlank(s: String, from: Int): Int {
 private fun isNameChar(c: Char) = c.isLetterOrDigit() || c == ':' || c == '_' || c == '-' || c == '.'
 
 /**
- * An SVG's intrinsic size in CSS px, as a browser sizes an SVG `<img>`: its declared
- * width × height, else its viewBox, else CSS's default replaced-element size of
- * 300 × 150 (Coil drew a 512 square, and the box filled the bubble width). [docW]/[docH]
- * are AndroidSVG's document size, -1 when absent or relative.
+ * An SVG `<img>`'s size in CSS px ([w] × [h]). [fill]: the SVG has a viewBox but neither
+ * a width nor a height, and is laid out as wide as the space offered at the [w]:[h]
+ * ratio — [w] × [h] is then only its size where no width is offered.
  */
-fun svgNaturalSize(docW: Float, docH: Float, viewBoxW: Float?, viewBoxH: Float?): Pair<Float, Float> = when {
-    docW > 0f && docH > 0f -> docW to docH
-    viewBoxW != null && viewBoxH != null && viewBoxW > 0f && viewBoxH > 0f -> viewBoxW to viewBoxH
-    else -> 300f to 150f
+data class SvgSize(val w: Float, val h: Float, val fill: Boolean = false)
+
+/**
+ * An SVG's size as Chrome sizes it in an `<img>` (measured in chrome-headless-shell,
+ * rollup XERK-2109), from the root's [width] / [height] in CSS px — null when absent
+ * or a percentage — and its viewBox:
+ * - both declared: that size; one of them: the other from the viewBox ratio, else
+ *   CSS's default replaced size (width 300, height 150). AndroidSVG's own document
+ *   size made a width-only `<svg width="100">` 100 × 100 (height = width); Chrome
+ *   draws 100 × 150.
+ * - neither, with a viewBox: it fills the width offered at the viewBox ratio ([fill];
+ *   sessions.html's `.md-img` then caps its height). Its natural size, the viewBox
+ *   fitted inside 300 × 150, is what it takes where no width is offered.
+ * - neither, and no viewBox: 300 × 150.
+ */
+fun svgNaturalSize(width: Float?, height: Float?, viewBoxW: Float?, viewBoxH: Float?): SvgSize {
+    val w = width?.takeIf { it > 0f }
+    val h = height?.takeIf { it > 0f }
+    val ratio = if (viewBoxW != null && viewBoxH != null && viewBoxW > 0f && viewBoxH > 0f) viewBoxW / viewBoxH else null
+    return when {
+        w != null && h != null -> SvgSize(w, h)
+        w != null -> SvgSize(w, ratio?.let { w / it } ?: 150f)
+        h != null -> SvgSize(ratio?.let { h * it } ?: 300f, h)
+        ratio != null -> if (ratio >= 2f) SvgSize(300f, 300f / ratio, fill = true) else SvgSize(150f * ratio, 150f, fill = true)
+        else -> SvgSize(300f, 150f)
+    }
+}
+
+/**
+ * The size a [SvgSize.fill] SVG takes in a box [dstW] px wide at [density] px per CSS
+ * px: the box's width, at its own ratio. Any other size — or no box width — is
+ * returned as it is.
+ */
+fun svgFilledSize(size: SvgSize, dstW: Int?, density: Float): SvgSize {
+    if (!size.fill || dstW == null || dstW <= 0 || density <= 0f) return size
+    val w = dstW / density
+    return SvgSize(w, w * size.h / size.w, fill = true)
 }
 
 /** The most pixels one SVG is rasterised into, whatever its size or target. */

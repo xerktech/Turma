@@ -5,6 +5,7 @@ import coil.ImageLoader
 import coil.ImageLoaderFactory
 import com.xerktech.turma.push.Notifications
 import com.xerktech.turma.push.PushRegistrar
+import okhttp3.OkHttpClient
 
 class TurmaApplication : Application(), ImageLoaderFactory {
     lateinit var container: AppContainer
@@ -13,9 +14,12 @@ class TurmaApplication : Application(), ImageLoaderFactory {
     // Coil's app-wide loader, taught to decode SVG (data:image/svg+xml) so chat
     // image previews (XERK-221) render inline. AsyncImage picks this up via the
     // ImageLoaderFactory. SVG is rasterized statically — no script execution — and
-    // only past SafeSvgDecoder's DOCTYPE check (an entity bomb never reaches it).
+    // only past SafeSvgDecoder's DOCTYPE check (an entity bomb never reaches it). Its
+    // HTTP client keeps the type a server sent (ServedContentType): a remote SVG
+    // renders only when served as image/svg+xml, as in a browser.
     override fun newImageLoader(): ImageLoader =
         ImageLoader.Builder(this)
+            .okHttpClient { OkHttpClient.Builder().addInterceptor(ServedContentType).build() }
             .components { add(SafeSvgDecoder.Factory()) }
             .crossfade(true)
             .build()

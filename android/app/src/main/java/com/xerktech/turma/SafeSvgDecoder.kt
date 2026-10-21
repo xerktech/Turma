@@ -11,6 +11,7 @@ import android.graphics.drawable.ShapeDrawable
 import android.util.Base64
 import androidx.annotation.VisibleForTesting
 import coil.ImageLoader
+import coil.decode.DataSource
 import coil.decode.DecodeResult
 import coil.decode.Decoder
 import coil.decode.ImageSource
@@ -26,10 +27,15 @@ import com.xerktech.turma.core.blankSoFar
 import com.xerktech.turma.core.dataUrlPayload
 import com.xerktech.turma.core.opensMarkup
 import com.xerktech.turma.core.svgBitmapSize
+import com.xerktech.turma.core.svgFilledSize
 import com.xerktech.turma.core.svgNaturalSize
 import com.xerktech.turma.core.svgVerdict
 import com.xerktech.turma.core.svgZeroArea
 import kotlinx.coroutines.runInterruptible
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.asResponseBody
 import okio.Buffer
 
 /**
@@ -37,11 +43,20 @@ import okio.Buffer
  * one carrying a DOCTYPE fails to decode (the caller shows its alt text), and
  * anything that isn't an SVG is left to the bitmap decoder. Registered INSTEAD of
  * Coil's `SvgDecoder.Factory`, so no path reaches AndroidSVG without the check.
+ *
+ * An SVG fetched over the network renders only when it was SERVED as image/svg+xml,
+ * as in a browser, which never sniffs an SVG (Chrome shows one served as text/plain,
+ * application/xml, octet-stream or with no type broken, while it sniffs a bitmap
+ * whatever its type). Coil guesses an `.svg` URL's type from its extension when the
+ * server says text/plain or nothing, so [ServedContentType] keeps that guess from
+ * reaching here. Data URIs and in-memory bytes are sniffed as before.
  */
 class SafeSvgDecoder private constructor() {
     class Factory : Decoder.Factory {
         override fun create(result: SourceResult, options: Options, imageLoader: ImageLoader): Decoder? {
-            val declared = result.mimeType.equals("image/svg+xml", ignoreCase = true)
+            val declared = result.mimeType?.trim().equals("image/svg+xml", ignoreCase = true)
+            // DISK is Coil's disk cache of an http fetch: this app loads no files.
+            val remote = result.dataSource == DataSource.NETWORK || result.dataSource == DataSource.DISK
             // Peek, never consume: the chosen decoder reads the same source after.
             val peek = result.source.source().peek()
             val buf = Buffer()
@@ -56,7 +71,11 @@ class SafeSvgDecoder private constructor() {
                 if (peek.read(buf, SVG_PROLOG_MAX - buf.size) < 0) break
             }
             val head = buf.readByteArray()
-            return when (svgVerdict(head, declared)) {
+            val verdict = svgVerdict(head, declared)
+            if (verdict != SvgVerdict.NOT_SVG && remote && !declared) {
+                return Decoder { throw IllegalStateException("refused SVG not served as image/svg+xml") }
+            }
+            return when (verdict) {
                 SvgVerdict.NOT_SVG -> null
                 SvgVerdict.SAFE -> SizedSvgDecoder(result.source, options, svgZeroArea(head))
                 SvgVerdict.UNSAFE -> Decoder { throw IllegalStateException("refused SVG with a DOCTYPE") }
@@ -71,7 +90,8 @@ class SafeSvgDecoder private constructor() {
 /**
  * An SVG decoder sized the way a browser sizes an SVG `<img>` (web parity with chat.js
  * svgToImg). The drawable's intrinsic size is the SVG's own in CSS px ([svgNaturalSize]:
- * no size at all is 300 × 150), which `ProseImage` reads as dp and caps the box at —
+ * no size at all is 300 × 150; a viewBox alone is the width of the box it is decoded
+ * for, [svgFilledSize]), which `ProseImage` reads as dp and caps the box at —
  * never the bitmap's, which is rasterised at device resolution ([svgBitmapSize], each
  * side ≥ 1 px). A declared zero width or height ([zeroArea]) decodes to an empty 0 × 0
  * drawable the caller lays out as nothing. Coil's own decoder reported the bitmap it
@@ -89,12 +109,11 @@ private class SizedSvgDecoder(
         if (zeroArea) return@runInterruptible DecodeResult(ShapeDrawable(), isSampled = false)
         val svg = source.source().use { SVG.getFromInputStream(it.inputStream()) }
         val viewBox = svg.documentViewBox
-        val (w, h) = svgNaturalSize(svg.documentWidth, svg.documentHeight, viewBox?.width(), viewBox?.height())
-        val (bw, bh) = svgBitmapSize(
-            w, h,
-            (options.size.width as? Dimension.Pixels)?.px,
-            options.context.resources.displayMetrics.density,
-        )
+        val (rootW, rootH) = SvgRenderGuard.rootSize(svg)
+        val dstW = (options.size.width as? Dimension.Pixels)?.px
+        val density = options.context.resources.displayMetrics.density
+        val (w, h) = svgFilledSize(svgNaturalSize(rootW, rootH, viewBox?.width(), viewBox?.height()), dstW, density)
+        val (bw, bh) = svgBitmapSize(w, h, dstW, density)
         // Without a viewBox AndroidSVG draws 1:1 in user units; give it one so the
         // drawing scales to the bitmap (a browser's 300 × 150 viewport for none).
         if (viewBox == null) svg.setDocumentViewBox(0f, 0f, w, h)
@@ -224,7 +243,38 @@ internal object SvgRenderGuard : SVGExternalFileResolver() {
     private val textSequenceClass = svgClass("TextSequence")
     private val textField = field(textSequenceClass, "text")
 
+    // The root <svg>'s own width and height, which SVG.getDocumentWidth/Height don't
+    // give: they invent a height from the width, and drop both when either is relative.
+    private val rootClass = svgClass("Svg")
+    private val rootWidthField = field(rootClass, "width")
+    private val rootHeightField = field(rootClass, "height")
+    private val lengthClass = svgClass("Length")
+    private val lengthValueField = field(lengthClass, "value")
+    private val lengthUnitField = field(lengthClass, "unit")
+    private val lengthToPx = lengthClass.getDeclaredMethod("floatValue", Float::class.javaPrimitiveType)
+        .apply { isAccessible = true }
+
     init { SVG.registerExternalFileResolver(this) }
+
+    /**
+     * The root's width and height in CSS px, each null when absent or a percentage
+     * (a browser's `<img>` has no box for a percentage to resolve against). An `em` is
+     * the browser default 16 px and an `ex` half that; absolute units at [SVG.getRenderDPI].
+     */
+    fun rootSize(svg: SVG): Pair<Float?, Float?> {
+        val root = rootField.get(svg)
+        fun px(f: java.lang.reflect.Field): Float? {
+            val len = root?.let { f.get(it) } ?: return null
+            val value = lengthValueField.getFloat(len)
+            return when ((lengthUnitField.get(len) as Enum<*>?)?.name) {
+                "percent" -> null
+                "em" -> value * 16f
+                "ex" -> value * 8f
+                else -> lengthToPx.invoke(len, svg.renderDPI) as Float
+            }
+        }
+        return px(rootWidthField) to px(rootHeightField)
+    }
 
     fun render(svg: SVG, bitmap: Bitmap) {
         check(Cost(svg).total() <= RENDER_MAX_COST) { "refused SVG: too costly to draw" }
@@ -380,4 +430,29 @@ private class SvgDrawable(private val bitmap: Bitmap, private val w: Int, privat
     override fun setColorFilter(colorFilter: ColorFilter?) { paint.colorFilter = colorFilter }
     @Deprecated("Deprecated in Java")
     override fun getOpacity() = PixelFormat.TRANSLUCENT
+}
+
+/**
+ * Keeps Coil from guessing an image's type from its URL (XERK-2109). Coil's
+ * `HttpUriFetcher` takes a response served as text/plain, or with no Content-Type, to
+ * be whatever its extension says — an `.svg` URL then reads as image/svg+xml and
+ * renders, where a browser shows it broken. Such a response is relabelled
+ * application/octet-stream, which Coil passes through as it is, so [SafeSvgDecoder]
+ * sees what the server really said. A bitmap is sniffed from its bytes either way.
+ */
+object ServedContentType : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val response = chain.proceed(chain.request())
+        val type = response.header("Content-Type")
+        val guessed = type == null || type.trim().startsWith("text/plain", ignoreCase = true)
+        val body = response.body
+        if (!guessed || body == null) return response
+        // Coil reads the BODY's type on a fetch and the header on a disk-cache hit: both change.
+        return response.newBuilder()
+            .header("Content-Type", OCTET_STREAM.toString())
+            .body(body.source().asResponseBody(OCTET_STREAM, body.contentLength()))
+            .build()
+    }
+
+    private val OCTET_STREAM = "application/octet-stream".toMediaType()
 }

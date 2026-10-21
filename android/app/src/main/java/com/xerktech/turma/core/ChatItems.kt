@@ -128,8 +128,8 @@ sealed interface ChatItem {
      * parity: chat.js buildItems' `command` item). [name] "!" is a shell command
      * (XERK-2112) — drawn as a red operator bubble with its output open beneath,
      * so the chat shows where it ran and what came after; anything else is a
-     * `/slash` command, drawn as a chip. [name] "output" is an output whose
-     * invocation scrolled off. [result] null = no output yet. Never hidden by a
+     * `/slash` command, drawn as a chip with its output collapsed behind it. [name]
+     * "output" is an output whose invocation scrolled off, drawn the same way. [result] null = no output yet. Never hidden by a
      * verbosity: it is the operator's own input.
      */
     data class Command(

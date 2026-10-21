@@ -226,7 +226,8 @@ private const val BASH_RED = 0xFFD03B3BL
  * A command the operator ran (web parity: chat.js renderBashCard /
  * renderCommandCard). A `!` shell command (XERK-2112) is operator input, so it
  * sits right like the operator's bubble, but red so it never reads as a typed
- * message, with its output open beneath it. A `/slash` command stays a chip.
+ * message, with its output open beneath it. A `/slash` command stays a chip, its
+ * output collapsed behind it until tapped.
  */
 @Composable
 private fun TranscriptCommand(c: ChatItem.Command) {
@@ -248,9 +249,20 @@ private fun TranscriptCommand(c: ChatItem.Command) {
         }
     }
     if (c.name != "!") {
+        // A `/slash` command's output — and an output whose command is outside the
+        // window ("› output") — starts COLLAPSED behind its chip, a tap toggling it
+        // (web parity: renderCommandCard's `<details>` with openAttr(key, false)).
+        var open by remember(c.entryKey) { mutableStateOf(false) }
         Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Pill("› " + listOf(c.name, c.args.substringBefore('\n')).filter { it.isNotEmpty() }.joinToString(" "), dashed = true, mono = true)
-            output()
+            val label = "› " + listOf(c.name, c.args.substringBefore('\n')).filter { it.isNotEmpty() }.joinToString(" ")
+            Pill(
+                label,
+                modifier = if (c.result == null) Modifier
+                    else Modifier.clip(RoundedCornerShape(7.dp)).clickable { open = !open },
+                color = if (c.isError && c.result != null) Color(BASH_RED) else null,
+                dashed = true, mono = true,
+            )
+            if (open) output()
         }
         return
     }
