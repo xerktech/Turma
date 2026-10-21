@@ -5752,6 +5752,9 @@ class ManagerMixin:
             # Derived from REGISTRY_DIR at import, so it needs redirecting too —
             # delete() rmtree's a session's attachment dir (XERK-234).
             ("UPLOADS_DIR", os.path.join(self.tmp, "uploads")),
+            # Also derived from REGISTRY_DIR: a migration import unpacks here
+            # and boot rmtree's it (XERK-2139).
+            ("IMPORT_STAGING_ROOT", os.path.join(self.tmp, "import-staging")),
             # Also derived at import. Redirected so a dev box that has a REAL
             # limits snapshot in ~/.turma can't make the heartbeat tests depend
             # on its subscription (XERK-247).
@@ -10844,17 +10847,39 @@ class TestUsageAcrossAMigration(ManagerMixin, unittest.TestCase):
         self._move("A", "B")
         self.assertEqual(self._count("B"), 0)
 
-    def test_a_refused_unpack_still_excludes_what_it_wrote(self):
+    def test_a_failed_commit_still_excludes_what_it_moved(self):
         with self.on("A"):
             self._turn(1)
+        real = ha.SessionManager._commit_import_stage
+
+        def half(sm, job):
+            real(sm, job)
+            raise OSError("disk full")
+        with mock.patch.object(ha.SessionManager, "_commit_import_stage", half):
+            self._move("A", "B")
+        self.assertEqual(self._count("B"), 0)
+
+    def test_a_refused_unpack_writes_nothing_into_the_project(self):
+        # XERK-2139: the unpack runs into a staging dir on the import thread,
+        # so a refusal mid-unpack leaves the project slug untouched.
+        with self.on("A"):
+            self._turn(1)
+            blob = self.hosts["A"]._pack_transcript(self._path())
         real = ha.SessionManager._unpack_transcript
 
         def half(sm, blob, dest, **kw):
             real(sm, blob, dest, **kw)
             raise OSError("disk full")
-        with mock.patch.object(ha.SessionManager, "_unpack_transcript", half):
-            self._move("A", "B")
-        self.assertEqual(self._count("B"), 0)
+        with self.on("B"):
+            sm = self.hosts["B"]
+            sm._migration_download = lambda mid: blob
+            with mock.patch.object(ha.SessionManager, "_unpack_transcript", half), \
+                    mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
+                _run_import(sm, {"type": "importSession", "cmdId": "c1",
+                                 "migrationId": "mig1", "transcriptId": self.TID,
+                                 "cwd": self.wt, "repo": "Turma"})
+            self.assertFalse(os.path.exists(self._path()))
+            self.assertEqual(os.listdir(ha.IMPORT_STAGING_ROOT), [])
 
 class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
     """Usage counts EVERY transcript on disk, not only ledger-known slugs: an
@@ -11601,6 +11626,75 @@ def _run_import(sm, cmd):
     sm._apply_imports_landed()
 
 
+class TestImportStaging(ManagerMixin, unittest.TestCase):
+    """XERK-2139: an import's bundle is unpacked on the import thread into a
+    staging dir; the beat only renames the staged files into place."""
+
+    TID = "44444444-4444-4444-8444-444444444444"
+
+    def _job(self, sm, blob):
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "wtstg")
+        job = {"cmd": {"migrationId": "aaaaaaaaaaaaaaaa", "transcriptId": self.TID,
+                       "cmdId": "c1"}, "cwd": cwd, "isRoot": False, "repo": "Turma"}
+        with mock.patch.object(sm, "_migration_download", return_value=blob):
+            sm._import_prepare_tracked(job)
+        return job
+
+    def _bundle(self, sm):
+        src = os.path.join(self.tmp, "src")
+        os.makedirs(os.path.join(src, self.TID, "subagents"))
+        path = os.path.join(src, f"{self.TID}.jsonl")
+        write_jsonl(path, [{"type": "user", "message": {"role": "user", "content": "hi"}}])
+        write_jsonl(os.path.join(src, self.TID, "subagents", "agent-a.jsonl"),
+                    [{"type": "user", "message": {"role": "user", "content": "sub"}}])
+        return sm._pack_transcript(path)
+
+    def test_the_thread_stages_and_the_beat_only_renames(self):
+        sm = self.make_manager()
+        job = self._job(sm, self._bundle(sm))
+        self.assertNotIn("error", job)
+        slug_dir = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(job["cwd"]))
+        self.assertFalse(os.path.exists(slug_dir))     # nothing lands off the beat
+        staged = os.path.join(job["stage"], "slug", f"{self.TID}.jsonl")
+        self.assertTrue(os.path.isfile(staged))
+        with mock.patch.object(sm, "_unpack_transcript") as unpack, \
+                mock.patch.object(sm, "_resume_at_cwd"):
+            sm._apply_imports_landed()
+        unpack.assert_not_called()                     # the beat decompresses nothing
+        self.assertTrue(os.path.isfile(os.path.join(slug_dir, f"{self.TID}.jsonl")))
+        self.assertTrue(os.path.isfile(os.path.join(
+            slug_dir, self.TID, "subagents", "agent-a.jsonl")))
+        self.assertEqual(os.listdir(ha.IMPORT_STAGING_ROOT), [])
+
+    def test_a_link_planted_in_the_stage_is_never_moved(self):
+        sm = self.make_manager()
+        job = self._job(sm, self._bundle(sm))
+        secret = os.path.join(self.tmp, "secret")
+        with open(secret, "w") as f:
+            f.write("x")
+        os.symlink(secret, os.path.join(job["stage"], "slug", "planted.jsonl"))
+        sm._commit_import_stage(job)
+        slug_dir = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(job["cwd"]))
+        self.assertFalse(os.path.lexists(os.path.join(slug_dir, "planted.jsonl")))
+        self.assertTrue(os.path.isfile(os.path.join(slug_dir, f"{self.TID}.jsonl")))
+
+    def test_a_stage_swapped_for_a_link_is_refused(self):
+        sm = self.make_manager()
+        job = self._job(sm, self._bundle(sm))
+        slug_stage = os.path.join(job["stage"], "slug")
+        shutil.rmtree(slug_stage)
+        os.symlink(self.tmp, slug_stage)
+        with self.assertRaisesRegex(ValueError, "is gone"):
+            sm._commit_import_stage(job)
+
+    def test_boot_clears_a_crashed_imports_stage(self):
+        sm = self.make_manager()
+        os.makedirs(os.path.join(ha.IMPORT_STAGING_ROOT, "m-old", "slug"))
+        sm._sweep_import_staging()
+        self.assertFalse(os.path.exists(ha.IMPORT_STAGING_ROOT))
+        sm._sweep_import_staging()                     # absent: a no-op
+
+
 class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
     """A migration carries the session's WORKTREE, not just its conversation:
     unpushed commits ride a git bundle, uncommitted + untracked changes a binary
@@ -12092,14 +12186,19 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(os.listdir(dest)), 5000)
         self._both_refuse(sm, dirs(5001), "over 5000 files")
 
-    def test_a_beat_side_refusal_is_reported_in_its_own_words(self):
+    def test_an_unpack_refusal_is_reported_in_its_own_words(self):
         # XERK-1858 QA: not "unpacking the transcript bundle failed: the
-        # migration bundle …" — the refusal IS the reason.
+        # migration bundle …" — the refusal IS the reason. The unpack runs on
+        # the import thread (XERK-2139), so that is where it is refused.
         sm = self.make_manager()
         with mock.patch.object(ha, "MIGRATION_MEMBERS_MAX", 5):
             blob = self._tgz([(f"d{i}", 0, tarfile.DIRTYPE) for i in range(10)])
             job = {"cmd": {"migrationId": "m1", "transcriptId": "t1", "cmdId": "c1"},
-                   "cwd": os.path.join(self.tmp, "wt"), "blob": blob}
+                   "cwd": os.path.join(self.tmp, "wt"), "isRoot": False, "repo": "r"}
+            with mock.patch.object(sm, "_migration_download", return_value=blob), \
+                    mock.patch.object(sm, "_read_worktree_members", return_value={}):
+                sm._import_prepare_tracked(job)
+            self.assertNotIn("stage", job)
             with mock.patch.object(sm, "_refuse_start") as refuse:
                 sm._finish_import(job)
         self.assertEqual(refuse.call_args[0][0], "the migration bundle holds over 5 files")
@@ -30448,6 +30547,7 @@ class TestPruneRepo(unittest.TestCase):
             # host's ~/.turma and every beat would overwrite it.
             ("ARCHIVE_OFFERED_PATH", os.path.join(self.tmp, "archive-offered.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
+            ("IMPORT_STAGING_ROOT", os.path.join(self.tmp, "import-staging")),
             ("WORKTREES_ROOT", self.wt_root),
             ("REPOS_ROOT", self.tmp),
             ("device_name", lambda: "test-host"),

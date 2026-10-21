@@ -42,6 +42,7 @@ stdlib only — no pip installs in the image.
 
 import base64
 import datetime
+import errno
 import getpass
 import glob
 import gzip
@@ -366,6 +367,11 @@ CLONES_TMP_ROOT = os.path.join(REPOS_ROOT, ".turma", "clones")
 # Persisted session registry (survives container restart).
 REGISTRY_DIR = os.path.expanduser("~/.turma")
 REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
+# A migration import unpacks its bundle HERE on the import thread, then the beat
+# only renames the files into place (XERK-2139). Outside PROJECTS_ROOT so no
+# usage/archive walk sees a half-unpacked transcript; nothing survives a restart
+# (imports are in-memory), so boot clears it (_sweep_import_staging).
+IMPORT_STAGING_ROOT = os.path.join(REGISTRY_DIR, "import-staging")
 # Loopback "beat now" poke for Windows (XERK-678 successor). On POSIX the tunnel
 # pokes the manager with SIGUSR1; Windows Python has no SIGUSR1, so the manager
 # publishes an ephemeral loopback port here and wakes on a connection instead —
@@ -956,8 +962,9 @@ class _BundleRefused(ValueError):
 # keeps listed; a real one is a path.
 MIGRATION_EXT_HEADER_MAX = 1 << 20
 # The most real members (extended headers not counted) a bundle may hold. The
-# beat unpacks every member and tarfile lists them all; 120k empty dirs held the
-# beat 23 s and 19999 still ~6 s (QA). A real bundle is a transcript, its
+# import thread unpacks every member and the beat then renames each one into
+# place; 120k empty dirs held the beat 23 s and 19999 still ~6 s (QA), back when
+# the beat did the unpack. A real bundle is a transcript, its
 # subagent/workflow records and a few `.worktree/` blobs — ~160 members at the
 # most seen; untracked files ride INSIDE changes.patch, never as members.
 MIGRATION_MEMBERS_MAX = 5000
@@ -30865,11 +30872,12 @@ class SessionManager:
         Turma id/rcName/port is minted like a resume; the transcript id (hence
         the conversation) is preserved, so the target continues in place.
 
-        Runs on the beat, so it only VALIDATES and stages: the download and the
-        worktree rebuild (git, disk-bound worst cases far past the beat budget,
-        XERK-395) run on an import thread (`_import_prepare`), and the beat
-        finishes the move in `_apply_imports_landed` (`_finish_import`) — the
-        registry write and launch stay the beat's. The cwd holds a slot and is
+        Runs on the beat, so it only VALIDATES and stages: the download, the
+        bundle unpack into a staging dir and the worktree rebuild (git and
+        disk-bound worst cases far past the beat budget, XERK-395/XERK-2139) run
+        on an import thread (`_import_prepare`), and the beat finishes the move
+        in `_apply_imports_landed` (`_finish_import`) — renaming the staged files
+        into place, the registry write and launch stay the beat's. The cwd holds a slot and is
         shielded from prune while the thread runs."""
         migration_id = cmd.get("migrationId")
         transcript_id = cmd.get("transcriptId")
@@ -30943,13 +30951,19 @@ class SessionManager:
             self._import_prepare(job)
         except Exception as e:
             job["error"] = f"preparing the import failed: {e}"
+        if job.get("error"):
+            # A refused import's staged bytes (up to MIGRATION_UNPACK_MAX) are
+            # removed here, never on the beat.
+            self._drop_import_stage(job)
         with self._imports_lock:
             self._imports_landed.append(job)
 
     def _import_prepare(self, job):
-        """Import thread: download the bundle and, when it carries the source's
-        worktree state and the cwd is a Turma worktree, rebuild that worktree.
-        Touches git and disk only — never the registry. Its outcome rides `job`
+        """Import thread: download the bundle, unpack it into a staging dir
+        (`_stage_import`) and, when it carries the source's worktree state and
+        the cwd is a Turma worktree, rebuild that worktree. Touches git and disk
+        only — never the registry, and nothing under PROJECTS_ROOT or a runtime
+        store (the beat moves the staged files there). Its outcome rides `job`
         back to the beat."""
         cmd = job["cmd"]
         migration_id = cmd.get("migrationId")
@@ -30957,16 +30971,21 @@ class SessionManager:
         if blob is None:
             job["error"] = "fetching the transcript bundle from the hub failed"
             return
-        job["blob"] = blob
         try:
             state = self._read_worktree_members(blob)
         except tarfile.TarError:
-            return   # not a bundle at all: the beat's unpack says so
+            state = {}   # not a bundle at all: the unpack below says so
         except _BundleRefused as e:
             job["error"] = str(e)
             return
         except Exception as e:
             job["error"] = f"the moved worktree state is unreadable: {e}"
+            return
+        try:
+            self._stage_import(job, blob)
+        except Exception as e:
+            job["error"] = (str(e) if isinstance(e, _BundleRefused)
+                            else f"unpacking the transcript bundle failed: {e}")
             return
         if "state.json" not in state or job["isRoot"] \
                 or not _is_turma_worktree_path(job["cwd"]):
@@ -30995,6 +31014,7 @@ class SessionManager:
                                    cmd_id=job["cmd"].get("cmdId"),
                                    migration_id=mid, context="importSession")
             finally:
+                self._drop_import_stage(job)
                 with self._imports_lock:
                     self._imports_inflight.pop(mid, None)
 
@@ -31012,9 +31032,124 @@ class SessionManager:
         with self._imports_lock:
             return path in self._imports_inflight.values()
 
+    def _stage_import(self, job, blob):
+        """Import thread: unpack `blob` into a fresh dir under
+        IMPORT_STAGING_ROOT, laid out as its three destinations (`slug/` for the
+        project-slug tree, `dsh/` for a dsh store, `qwen/<id>.jsonl` for a qwen
+        log), and re-key the runtime stores' cwd there. Records the real
+        destinations and the transcript's pre-move high-water (`ownUntil`) on
+        `job`; the beat only renames (`_commit_import_stage`). Raises on a
+        refused or failed unpack, leaving the stage for the caller to drop."""
+        cmd = job["cmd"]
+        cwd = os.path.normpath(job["cwd"])
+        transcript_id = cmd.get("transcriptId")
+        slug_dir = os.path.join(PROJECTS_ROOT, _project_slug(cwd))
+        # A dsh session carries its durable store under `.dsh-store/`; it lands
+        # in THIS host's DSH_SESSIONS_ROOT at the LOCALIZED cwd's project key so
+        # `ctx.agents.resume` finds it (XERK-475). Only when the target will
+        # actually launch dsh — a dsh session falling back to claude here (no
+        # dsh) has no resume to consume it, so the store is dropped. Its header
+        # cwd is re-pointed to match, since dsh refuses a store whose path
+        # disagrees with its header.
+        want_dsh = cmd.get("agentType") == "dsh" and dsh_configured()
+        dsh_dest = _dsh_store_dir(cwd, transcript_id) if want_dsh else None
+        # A qwen session carries its NATIVE LOG under `.qwen-store/` ([Qwen K],
+        # XERK-516); it lands in THIS host's QWEN_PROJECTS_ROOT at the LOCALIZED
+        # cwd's slug so `qwen --resume <id>` (run in the new worktree) finds it.
+        # Only when the target will actually launch qwen — a qwen session falling
+        # back to claude here (no qwen, via agent_type_configured in _resume_at_cwd)
+        # has no resume to consume the log, so it is dropped, exactly as a stray
+        # dsh store is. The per-row cwd is re-pointed to the localized worktree so
+        # a cross-mount move stays self-consistent (issue #2373: qwen keys on cwd).
+        want_qwen = cmd.get("agentType") == "qwen" and qwen_configured()
+        qwen_dest = (self._qwen_store_dest(cwd, transcript_id)
+                     if want_qwen else None)
+        # The newest entry this host ALREADY had, read before anything of the
+        # bundle can land (agent-usage.md): nothing writes that transcript while
+        # the import holds its cwd.
+        job["ownUntil"] = _transcript_tree_max_ms(slug_dir, transcript_id)
+        os.makedirs(IMPORT_STAGING_ROOT, exist_ok=True)
+        if os.path.islink(IMPORT_STAGING_ROOT):
+            raise ValueError(f"{IMPORT_STAGING_ROOT} is a link")
+        root = tempfile.mkdtemp(prefix=f"{cmd.get('migrationId')}-",
+                                dir=IMPORT_STAGING_ROOT)
+        job["stage"] = root
+        stage_slug = os.path.join(root, "slug")
+        stage_dsh = os.path.join(root, "dsh") if dsh_dest else None
+        stage_qwen = (os.path.join(root, "qwen", os.path.basename(qwen_dest))
+                      if qwen_dest else None)
+        os.makedirs(stage_slug)
+        if stage_dsh:
+            os.makedirs(stage_dsh)
+        if stage_qwen:
+            os.makedirs(os.path.dirname(stage_qwen))
+        self._unpack_transcript(blob, stage_slug, dsh_store_dest=stage_dsh,
+                                qwen_store_dest=stage_qwen)
+        if stage_dsh:
+            self._reconcile_dsh_store_cwd(stage_dsh, cwd)
+        if stage_qwen:
+            self._reconcile_qwen_store_cwd(stage_qwen, cwd)
+        job["moves"] = [(stage_slug, slug_dir)]
+        if stage_dsh:
+            job["moves"].append((stage_dsh, dsh_dest))
+        if stage_qwen:
+            job["moves"].append((os.path.dirname(stage_qwen),
+                                 os.path.dirname(qwen_dest)))
+
+    def _commit_import_stage(self, job):
+        """Beat: move every staged REGULAR file to the same relative path under
+        its destination — renames only, the unpack already ran on the import
+        thread (XERK-2139). The stage is session-writable (`~/.turma`), so a
+        link planted there is skipped, never moved or followed, and each
+        destination dir is re-checked to stay inside its root as the unpack
+        checks its members. A rename across filesystems (a PROJECTS_ROOT not
+        beside ~/.turma) falls back to a copy."""
+        for src_root, dest_root in job.get("moves") or ():
+            if os.path.islink(src_root) or not os.path.isdir(src_root):
+                raise ValueError(f"the staged import at {src_root} is gone")
+            os.makedirs(dest_root, exist_ok=True)
+            check = os.path.realpath(dest_root)
+            for dirpath, dirnames, filenames in os.walk(src_root):
+                rel = os.path.relpath(dirpath, src_root)
+                out_dir = dest_root if rel == "." else os.path.join(dest_root, rel)
+                os.makedirs(out_dir, exist_ok=True)
+                real = os.path.realpath(out_dir)
+                if real != check and not real.startswith(check + os.sep):
+                    raise ValueError(f"staged import escapes {dest_root}: {rel!r}")
+                for name in filenames:
+                    src = os.path.join(dirpath, name)
+                    if not stat.S_ISREG(os.lstat(src).st_mode):
+                        continue
+                    dst = os.path.join(out_dir, name)
+                    try:
+                        os.replace(src, dst)
+                    except OSError as e:
+                        if e.errno != errno.EXDEV:
+                            raise
+                        shutil.move(src, dst)
+
+    def _drop_import_stage(self, job):
+        """Remove an import's staging dir. Never raises."""
+        root = job.pop("stage", None)
+        if root:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def _sweep_import_staging(self):
+        """Boot: no import survives a restart (they are in-memory), so every
+        staging dir left under IMPORT_STAGING_ROOT is a crashed one's. A link
+        at the root is unlinked, never followed. Never raises."""
+        try:
+            if os.path.islink(IMPORT_STAGING_ROOT):
+                os.unlink(IMPORT_STAGING_ROOT)
+            elif os.path.isdir(IMPORT_STAGING_ROOT):
+                shutil.rmtree(IMPORT_STAGING_ROOT, ignore_errors=True)
+        except OSError as e:
+            log(f"import staging: could not clear {IMPORT_STAGING_ROOT}: {e}")
+
     def _finish_import(self, job):
-        """Beat half of import_session: unpack the transcript, record the usage
-        window, and resume — over the worktree the import thread rebuilt."""
+        """Beat half of import_session: rename the staged transcript into place,
+        record the usage window, and resume — over the worktree the import
+        thread rebuilt."""
         cmd = job["cmd"]
         cwd = job["cwd"]
         migration_id = cmd.get("migrationId")
@@ -31027,54 +31162,15 @@ class SessionManager:
         if job.get("error"):
             refuse(job["error"])
             return
-        blob = job["blob"]
-
-        slug_dir = os.path.join(PROJECTS_ROOT,
-                                _project_slug(os.path.normpath(cwd)))
-        # A dsh session carries its durable store under `.dsh-store/`; unpack it
-        # into THIS host's DSH_SESSIONS_ROOT at the LOCALIZED cwd's project key
-        # so `ctx.agents.resume` finds it (XERK-475). Only when the target will
-        # actually launch dsh — a dsh session falling back to claude here (no
-        # dsh) has no resume to consume it, so the store is dropped. The store
-        # dir is keyed on the localized cwd; its header cwd is re-pointed to
-        # match, since dsh refuses a store whose path disagrees with its header.
-        want_dsh = cmd.get("agentType") == "dsh" and dsh_configured()
-        dsh_store_dest = (_dsh_store_dir(os.path.normpath(cwd), transcript_id)
-                          if want_dsh else None)
-        # A qwen session carries its NATIVE LOG under `.qwen-store/` ([Qwen K],
-        # XERK-516); unpack it into THIS host's QWEN_PROJECTS_ROOT at the LOCALIZED
-        # cwd's slug so `qwen --resume <id>` (run in the new worktree) finds it.
-        # Only when the target will actually launch qwen — a qwen session falling
-        # back to claude here (no qwen, via agent_type_configured in _resume_at_cwd)
-        # has no resume to consume the log, so it is dropped, exactly as a stray
-        # dsh store is. The per-row cwd is re-pointed to the localized worktree so
-        # a cross-mount move stays self-consistent (issue #2373: qwen keys on cwd).
-        want_qwen = cmd.get("agentType") == "qwen" and qwen_configured()
-        qwen_store_dest = (self._qwen_store_dest(os.path.normpath(cwd),
-                                                 transcript_id)
-                           if want_qwen else None)
         slug = _project_slug(os.path.normpath(cwd))
-        own_until = _transcript_tree_max_ms(slug_dir, transcript_id)
+        own_until = job.get("ownUntil")
         try:
-            os.makedirs(slug_dir, exist_ok=True)
-            if dsh_store_dest:
-                os.makedirs(dsh_store_dest, exist_ok=True)
-            if qwen_store_dest:
-                os.makedirs(os.path.dirname(qwen_store_dest), exist_ok=True)
-            self._unpack_transcript(blob, slug_dir, dsh_store_dest=dsh_store_dest,
-                                    qwen_store_dest=qwen_store_dest)
-            if dsh_store_dest:
-                self._reconcile_dsh_store_cwd(dsh_store_dest,
-                                              os.path.normpath(cwd))
-            if qwen_store_dest:
-                self._reconcile_qwen_store_cwd(qwen_store_dest,
-                                               os.path.normpath(cwd))
+            self._commit_import_stage(job)
         except Exception as e:
-            # A partial unpack may already have written the transcript, whose
+            # A partial commit may already have moved the transcript, whose
             # pre-move turns the source still reports.
             self._mark_imported_usage(transcript_id, slug, own_until)
-            refuse(str(e) if isinstance(e, _BundleRefused)
-                   else f"unpacking the transcript bundle failed: {e}")
+            refuse(f"moving the unpacked transcript into place failed: {e}")
             return
         self._mark_imported_usage(transcript_id, slug, own_until)
         extra = {
@@ -31565,11 +31661,10 @@ class SessionManager:
                 pass   # costs only a kept-aside copy on a later move back
         return out
 
-    # The most a bundle may unpack to. The beat's _unpack_transcript
-    # decompresses through EVERY member (~0.5 s/GiB), so the import thread
-    # refuses a bundle past this before the beat ever sees it, and the beat's
-    # own read stops there too.
-    MIGRATION_UNPACK_MAX = 1 << 31   # 2 GiB: ~1 s on the beat, 32x the 64 MiB blob cap
+    # The most a bundle may unpack to. _unpack_transcript decompresses through
+    # EVERY member (~0.5 s/GiB); it runs on the import thread (XERK-2139), and
+    # both it and _read_worktree_members stop here.
+    MIGRATION_UNPACK_MAX = 1 << 31   # 2 GiB, 32x the 64 MiB blob cap
 
     def _open_bundle(self, blob):
         """tarfile over a migration bundle whose DECOMPRESSED stream is bounded
@@ -42329,6 +42424,8 @@ class SessionManager:
         # whole point of staging: the drain re-clones cleanly instead of
         # dead-ending. Guarded against a still-writing orphan by mtime.
         self._sweep_clone_tmp()
+        # An import's staging dir dies with the manager that staged it (XERK-2139).
+        self._sweep_import_staging()
         # Every running session's ttyd is on its socket by now (the loop above
         # relaunched the old ones), so any ttyd still carrying a `-c` credential
         # is an orphan from before XERK-1588 with the host token on its argv.

@@ -37,22 +37,31 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
   — an arbitrary-file read (QA-proven). Capture uses `--no-renames`, so a real patch never has one.
   `_read_worktree_members` bounds every member (gzip bomb); `_unpack_transcript` never extracts them.
 - **Every bundle read goes through `_open_bundle`**, whose DECOMPRESSED stream stops at
-  `MIGRATION_UNPACK_MAX` (`_BoundedGzip`): the beat's `_unpack_transcript` decompresses through every
-  member, `.worktree/` ones included, at ~0.5 s/GiB, so the import thread refuses a bomb first.
+  `MIGRATION_UNPACK_MAX` (`_BoundedGzip`): `_unpack_transcript` decompresses through every member,
+  `.worktree/` ones included, at ~0.5 s/GiB.
   - Never bound it from tar headers' `size`: a sparse member's is its attacker-chosen original size.
   - `_BundleTarInfo` refuses from the header, before tarfile reads the body: every sparse member
     (GNU `S` and pax `GNU.sparse.*` — its extracted bytes come from the map, which no stream bound
     sees; a 131 B bundle wrote 3 GiB), any global pax header (`g`: tarfile copies it into every
     member), pax/long-name headers past `MIGRATION_EXT_HEADER_MAX` in TOTAL (each read whole into
     RAM), and over `MIGRATION_MEMBERS_MAX` (5000) REAL members — extended headers don't count
-    (real bundles hold ≤ ~160; 120k empty dirs held the beat 23 s, 19999 still ~6 s). The import
-    thread walks every header first, so the beat only meets them as a backstop.
-    `_unpack_transcript` also counts bytes WRITTEN.
+    (real bundles hold ≤ ~160; 120k empty dirs held the beat 23 s, 19999 still ~6 s, when the beat
+    unpacked). It still bounds the beat's per-file rename loop. `_unpack_transcript` also counts
+    bytes WRITTEN.
 - **Import is STAGE / WORK / FINISH** (XERK-395): `import_session` (beat) validates and reserves a
-  slot + shields the cwd from prune (`_imports_inflight`); an import thread downloads and runs
-  `_restore_worktree_state`; `_apply_imports_landed` (full beats only) unpacks the transcript,
-  records usage and `_resume_at_cwd(worktree_ready=True)`. Never put the git back on the beat —
-  worktree add/remove/apply are disk-bound and blew the 75s budget.
+  slot + shields the cwd from prune (`_imports_inflight`); an import thread downloads, unpacks the
+  bundle into `IMPORT_STAGING_ROOT/<mid>-*/` (`_stage_import`, XERK-2139) and runs
+  `_restore_worktree_state`; `_apply_imports_landed` (full beats only) renames the staged files into
+  place (`_commit_import_stage`), records usage and `_resume_at_cwd(worktree_ready=True)`. Never put
+  the git or the unpack back on the beat — both are disk-bound (the unpack cost ~1.5 s at the member
+  cap; worktree add/remove/apply blew the 75s budget).
+  - The stage is under `~/.turma`, outside `PROJECTS_ROOT`, so no usage/archive walk sees a
+    half-unpacked transcript; the usage window is still recorded on the beat right after the
+    rename. `ownUntil` (the host's own pre-move high-water) is read on the thread before staging.
+  - `~/.turma` is session-writable: the commit moves REGULAR files only (a planted link is skipped),
+    refuses a stage root that became a link, and re-checks each destination dir stays in its root.
+  - A refused import's stage is dropped on the thread; boot clears the whole root
+    (`_sweep_import_staging`), since no import survives a restart. Tests: `TestImportStaging`.
   - **While an import is in flight its cwd is held** (`_import_holds`): `start`, `resume`,
     `_resume_at_cwd`, a second import and a sleeper job refuse that path, and `delete` drops the
     record but KEEPS the tree (also when another record shares the path) — the thread may be
