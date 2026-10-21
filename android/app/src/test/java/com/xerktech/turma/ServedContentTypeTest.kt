@@ -87,8 +87,21 @@ class ServedContentTypeTest {
         // and at one with no extension for Coil to guess from.
         assertTrue(svgAs("image/svg+xml ; charset=utf-8") is SuccessResult)
         assertTrue(svgAs("image/svg+xml ; charset=utf-8", noStore = true) is SuccessResult)
-        assertTrue(svgAs("image/svg+xml x") is SuccessResult) // Chrome stops at whitespace
-        assertTrue(svgAs("image/svg+xmlx ; a=b") is ErrorResult)
+    }
+
+    // Chrome's reading of a malformed or multi-valued header: of a comma list the last
+    // entry wins, and a type ends at `;`, whitespace or `(`.
+    @Test fun `the type is the one Chrome reads from the header`() {
+        for (ok in listOf("image/svg+xml x", "text/plain, image/svg+xml", "text/plain , image/svg+xml",
+            "image/svg+xml(x)", "image/svg+xml ,", "image/svg+xml x;a=b")) {
+            assertTrue("[$ok]", svgAs(ok) is SuccessResult)
+            assertTrue("[$ok] no-store", svgAs(ok, noStore = true) is SuccessResult)
+        }
+        for (bad in listOf("image/svg+xml , text/plain", "image/svg+xml x, text/plain",
+            "image/svg+xml,text/plain", "image/svg+xmlx ; a=b", "image/svg ; a=b")) {
+            assertTrue("[$bad]", svgAs(bad) is ErrorResult)
+            assertTrue("[$bad] no-store", svgAs(bad, noStore = true) is ErrorResult)
+        }
         assertTrue(load(Buffer().writeUtf8(svg), "IMAGE/SVG+XML ; charset=utf-8", "noext${++n}") is SuccessResult)
     }
 

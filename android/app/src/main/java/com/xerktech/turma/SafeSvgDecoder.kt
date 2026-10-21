@@ -434,29 +434,43 @@ private class SvgDrawable(private val bitmap: Bitmap, private val w: Int, privat
 }
 
 /**
- * Keeps Coil from guessing an image's type from its URL (XERK-2109). Coil's
- * `HttpUriFetcher` takes a response served as text/plain, or with no (or an
- * unparseable) Content-Type, to
- * be whatever its extension says — an `.svg` URL then reads as image/svg+xml and
- * renders, where a browser shows it broken. Such a response is relabelled
- * application/octet-stream, which Coil passes through as it is, so [SafeSvgDecoder]
- * sees what the server really said. A bitmap is sniffed from its bytes either way.
+ * The type a browser reads from a Content-Type header [raw], lowercased, or null for
+ * none (rollup XERK-2109; measured against chrome-headless-shell): of a comma list the
+ * LAST entry naming a type/subtype wins, and each entry's type ends at its first `;`,
+ * whitespace or `(`. So `image/svg+xml , text/plain` is text/plain to Chrome, and
+ * `text/plain, image/svg+xml` and `image/svg+xml x` are image/svg+xml.
+ */
+internal fun browserEssence(raw: String?): String? =
+    raw?.split(',')
+        ?.map { it.trim().split(';', ' ', '\t', '(').first().lowercase() }
+        ?.lastOrNull { it.indexOf('/') in 1 until it.length - 1 }
+
+/**
+ * Makes the type Coil sees the type a browser reads (XERK-2109). A remote SVG must be
+ * SERVED as image/svg+xml to render, and Coil's `HttpUriFetcher` doesn't read the
+ * header as a browser does: for text/plain (any raw `text/plain…` prefix) or a header
+ * OkHttp can't parse (empty, `bogus`, a space before `;`, a comma list), it takes the
+ * URL extension's guess, so an `.svg` URL served as text/plain rendered here and
+ * showed broken on the web. So a response whose [browserEssence] is image/svg+xml is
+ * labelled exactly that, and one that is not, but which Coil would take for SVG or
+ * guess for, is labelled application/octet-stream, which [SafeSvgDecoder] refuses for
+ * an SVG. Any other type is left alone: a bitmap is sniffed from its bytes either way.
  */
 object ServedContentType : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
         val response = chain.proceed(chain.request())
-        // Coil guesses when the type is text/plain or none — and an empty or unparseable
-        // header IS none to it (OkHttp gives the body no type).
-        // Coil's text/plain test is a prefix of the raw string ("text/plainx" too), so is this one.
+        val body = response.body ?: return response
         val raw = response.header("Content-Type")
-        val guessed = raw?.toMediaTypeOrNull() == null || raw.trim().startsWith("text/plain", ignoreCase = true)
-        val body = response.body
-        if (!guessed || body == null) return response
-        // OkHttp can't parse "image/svg+xml ; charset=utf-8" (a space before the `;`, which
-        // HTTP allows and Chrome renders): it is relabelled to its clean self, not refused.
-        // Chrome ends the type at the first `;` or whitespace ("image/svg+xml x" renders).
-        val essence = raw?.trim()?.split(';', ' ', '\t')?.first()
-        val label = if (essence.equals(SVG_TYPE.toString(), ignoreCase = true)) SVG_TYPE else OCTET_STREAM
+        val parsed = raw?.toMediaTypeOrNull()
+        val coilSvg = parsed != null && parsed.type == "image" && parsed.subtype == "svg+xml"
+        val guessed = parsed == null || raw.trim().startsWith("text/plain", ignoreCase = true)
+        val label = if (browserEssence(raw) == SVG_TYPE.toString()) {
+            if (coilSvg && !guessed) return response
+            SVG_TYPE
+        } else {
+            if (!coilSvg && !guessed) return response
+            OCTET_STREAM
+        }
         // Coil reads the BODY's type on a fetch and the header on a disk-cache hit: both change.
         return response.newBuilder()
             .header("Content-Type", label.toString())
