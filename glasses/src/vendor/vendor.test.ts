@@ -98,7 +98,7 @@ describe("vendored chat.css", () => {
       .trim();
 
   it("every non-override rule is a verbatim copy of a web rule", () => {
-    const vendored = read("chat.css").split("/* ---- phone overrides")[0];
+    const vendored = read("chat.css").split("/* ---- phone overrides")[0] ?? "";
     const web = norm(read("../../../turma/public/sessions.html") + read("../../../turma/public/app.css"))
       .replace(/var\(--warning-text\)/g, "var(--warning)");
     const rules = norm(vendored).split("}").filter((r) => r.trim()).map((r) => r + "}");
