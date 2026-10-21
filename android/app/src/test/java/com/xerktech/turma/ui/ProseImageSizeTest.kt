@@ -33,11 +33,11 @@ class ProseImageSizeTest {
     @get:Rule
     val compose = createComposeRule()
 
-    private fun inRow(ratio: Float, natural: Dp, rowWidth: Dp = 300.dp) {
+    private fun inRow(ratio: Float, natural: Dp, rowWidth: Dp = 300.dp, inset: Dp = 0.dp) {
         compose.setContent {
             Row(Modifier.width(rowWidth).height(IntrinsicSize.Min).testTag("row")) {
                 Box(Modifier.weight(1f).fillMaxHeight()) {
-                    Box(Modifier.testTag("img").proseImageSize(ratio, natural, 320.dp))
+                    Box(Modifier.testTag("img").proseImageSize(ratio, natural, 320.dp, inset))
                 }
             }
         }
@@ -53,6 +53,18 @@ class ProseImageSizeTest {
         inRow(ratio = 2f, natural = 1000.dp)
         compose.onNodeWithTag("img").assertWidthIsEqualTo(300.dp).assertHeightIsEqualTo(150.dp)
         compose.onNodeWithTag("row").assertHeightIsEqualTo(150.dp)
+    }
+
+    // Rollup XERK-2148: an SVG's 12dp of padding sits inside the box. Sized by the box's
+    // ratio, a 1:10 SVG got a 32 x 320 box whose 20 x 308 content drew it 200dp tall.
+    @Test fun `a padded image keeps its ratio inside the padding and still reaches the cap`() {
+        inRow(ratio = 0.1f, natural = 1000.dp, inset = 12.dp)
+        compose.onNodeWithTag("img").assertWidthIsEqualTo(43.dp).assertHeightIsEqualTo(320.dp)
+    }
+
+    @Test fun `a padded image narrowed by the row keeps its content's ratio`() {
+        inRow(ratio = 2f, natural = 1000.dp, inset = 12.dp)
+        compose.onNodeWithTag("img").assertWidthIsEqualTo(300.dp).assertHeightIsEqualTo(156.dp)
     }
 
     @Test fun `a tall image is capped at the max height and narrowed to match`() {

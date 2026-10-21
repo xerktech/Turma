@@ -91,9 +91,11 @@ sealed interface ProseBlock {
 // A markdown image ![alt](url) is tried first (XERK-221), so its `!` is never left as
 // stray text; its src is http(s) or data:image/* only. Whitespace is JS `\s` spelled
 // out (JS_WS + "\n"): Java's `\s` is ASCII-only, so an NBSP ended a URL on the web
-// and not here.
+// and not here. A URL scheme is case-insensitive, so DATA:IMAGE/PNG is an image too
+// (rollup XERK-2148) — spelled out per ASCII letter as chat.js does, never
+// IGNORE_CASE (Unicode folding on the device, android.md).
 private val LINK_RE = Regex(
-    """!\[([^\[\]]*)]\((https?://[^)$JS_WS_NL]+|data:image/[^)$JS_WS_NL]+)\)""" +
+    """!\[([^\[\]]*)]\((https?://[^)$JS_WS_NL]+|[dD][aA][tT][aA]:[iI][mM][aA][gG][eE]/[^)$JS_WS_NL]+)\)""" +
         """|\[([^\[\]]+)]\((https?://[^)$JS_WS_NL]+)\)|(https?://[^$JS_WS_NL<]+)"""
 )
 // Peeled by a backward scan (as chat.js): `[…]+$` was quadratic on a long dot run.
@@ -664,6 +666,15 @@ private fun isSvgDocument(body: String): Boolean {
     while (e > 0 && isJsSpace(t[e - 1])) e--
     return e >= 5 && asciiRegionMatches(t, e - 5, "</svg")
 }
+
+/**
+ * Is [src] a SendUserFile image the web previews (chat.js `renderToolFiles`:
+ * `/^(data:image\/|https?:)/i`)? Anything else — a `data:,<svg…>` included — is a
+ * name chip, never sniffed into an image (rollup XERK-2148).
+ */
+fun isPreviewImageSrc(src: String): Boolean =
+    asciiRegionMatches(src, 0, "data:image/") || asciiRegionMatches(src, 0, "http:") ||
+        asciiRegionMatches(src, 0, "https:")
 
 /** [s] holds lower-case ASCII [lit] at [at], ASCII-case-insensitively (JS `/i`; see [SVG_NAME]). */
 private fun asciiRegionMatches(s: String, at: Int, lit: String): Boolean {

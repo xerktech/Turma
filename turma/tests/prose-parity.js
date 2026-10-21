@@ -115,6 +115,12 @@ function mutate(r, s) {
   return out.join("");
 }
 
+// Cases added after the corpus was fixed: appended, unmutated, so the seeded random
+// corpus above stays exactly as it was.
+const LATE_CASES = [
+  "![up](DATA:IMAGE/PNG;base64,AA) and ![mixed](Data:Image/svg+xml,%3Csvg%2F%3E) not ![t](DATA:TEXT/PLAIN,AA)",
+];
+
 const RANDOM_CASES = Number(process.env.PROSE_PARITY_CASES) || 4000;
 const SEED_MUTATIONS = 60;
 
@@ -128,7 +134,7 @@ function corpus() {
     for (let j = 0; j < n; j++) s += pick(r);
     out.push(s);
   }
-  return out;
+  return out.concat(LATE_CASES);
 }
 
 // ---- web HTML → canonical tree --------------------------------------------

@@ -167,7 +167,7 @@
   // static mode (no scripts, no external fetches). Both attrs are esc()'d.
   function imgTag(url, alt, cls) {
     return '<img class="md-img' + (cls ? " " + cls : "") + '" src="' + esc(url) +
-      '" alt="' + esc(alt || "") + '"' + svgSizeAttrs(url) + ' loading="lazy">';
+      '" alt="' + esc(alt || "") + '"' + svgSizeAttrs(url, cls) + ' loading="lazy">';
   }
   // An SVG with a viewBox but no width/height has NO intrinsic size in an <img>,
   // only a ratio, so in a shrink-to-fit bubble or table cell it laid out at 0 × 0
@@ -177,8 +177,12 @@
   // max-width:100% narrows it to the bubble and height:auto keeps the ratio.
   // Anything else gets nothing: an SVG declaring a size, or with no viewBox,
   // already sizes itself.
+  // The box is border-box (app.css), so its border — and an .md-svg's padding —
+  // sit INSIDE both the width and the max-height: the ratio is the content's, and
+  // they are added on top (rollup XERK-2148: a 1:10 SVG reached only 294px).
   const SVG_FILL_MAX_H = 420;      // sessions.html .md-img max-height
-  function svgSizeAttrs(url) {
+  const MD_IMG_BORDER = 1, MD_SVG_PAD = 6;   // sessions.html .md-img border, .md-svg padding
+  function svgSizeAttrs(url, cls) {
     const u = String(url);
     if (!/^data:image\/svg\+xml/i.test(u)) return "";
     const comma = u.indexOf(",");
@@ -206,8 +210,10 @@
     if (!unsized(attr("width")) || !unsized(attr("height"))) return "";
     const vb = (attr("viewbox") || "").trim().split(/[\s,]+/).map(Number);
     if (vb.length !== 4 || !(vb[2] > 0 && vb[2] < Infinity) || !(vb[3] > 0 && vb[3] < Infinity)) return "";
-    const w = Math.min(1e6, Math.max(1, Math.round(SVG_FILL_MAX_H * vb[2] / vb[3])));
-    return ' width="' + w + '" height="' + SVG_FILL_MAX_H + '"';
+    const inset = 2 * (MD_IMG_BORDER + (/(^|\s)md-svg(\s|$)/.test(cls || "") ? MD_SVG_PAD : 0));
+    // Rounded UP, so the box always reaches the cap; max-height takes the fraction.
+    const w = Math.min(1e6, Math.max(1, Math.ceil((SVG_FILL_MAX_H - inset) * vb[2] / vb[3])));
+    return ' width="' + (w + inset) + '" height="' + SVG_FILL_MAX_H + '"';
   }
   // Render raw SVG source as an image (XERK-221). The markup is URL-encoded into a
   // data:image/svg+xml URI and shown through <img>, NOT injected into the DOM: an
@@ -227,10 +233,13 @@
     const s = String(text == null ? "" : text);
     // Markdown image (http(s) or data:image/* src), a markdown link, OR a bare
     // http(s) URL — image tried first so its leading `!` isn't left as stray text.
+    // A URL scheme is case-insensitive, so DATA:IMAGE/PNG is an image too (rollup
+    // XERK-2148); spelled out per letter, not /i, which would also widen the links
+    // (Prose.kt LINK_RE spells it the same way).
     // A label never holds a `[` (rollup XERK-1701): with `[^\]]` every `[` of a long
     // "[[[[…" run re-scanned the rest of the text, quadratic (2 s at 64k).
     const TRAIL_CHARS = ".,;:!?'\"*_‘’“”";
-    const re = /!\[([^[\]]*)\]\((https?:\/\/[^)\s]+|data:image\/[^)\s]+)\)|\[([^[\]]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<]+)/g;
+    const re = /!\[([^[\]]*)\]\((https?:\/\/[^)\s]+|[dD][aA][tT][aA]:[iI][mM][aA][gG][eE]\/[^)\s]+)\)|\[([^[\]]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<]+)/g;
     let out = "", last = 0, m;
     while ((m = re.exec(s))) {
       out += esc(s.slice(last, m.index));
@@ -1818,7 +1827,7 @@
       if (f.kind === "image" && typeof f.src === "string" && /^(data:image\/|https?:)/i.test(f.src)) {
         const svg = /^data:image\/svg\+xml/i.test(f.src);
         out += '<figure class="tool-file"><img class="md-img' + (svg ? " md-svg" : "") +
-          '" src="' + esc(f.src) + '" alt="' + name + '"' + svgSizeAttrs(f.src) + ' loading="lazy">' +
+          '" src="' + esc(f.src) + '" alt="' + name + '"' + svgSizeAttrs(f.src, svg ? "md-svg" : "") + ' loading="lazy">' +
           '<figcaption>' + name + "</figcaption></figure>";
       } else if (f.kind === "html" && typeof f.html === "string") {
         out += '<figure class="tool-file"><iframe class="md-embed" sandbox referrerpolicy="no-referrer"' +

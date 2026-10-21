@@ -558,6 +558,12 @@ class ProseTest {
         )
         val bad = parseInlineOnly("![x](data:text/html,<script>alert(1)</script>)")
         assertTrue(bad.none { it is Span.Image })
+        // A URL scheme is case-insensitive, as chat.js now reads it (rollup XERK-2148).
+        assertEquals(listOf(Span.Image("u", "DATA:IMAGE/PNG;base64,AA")), parseInlineOnly("![u](DATA:IMAGE/PNG;base64,AA)"))
+        assertEquals(listOf(Span.Image("m", "Data:Image/png;base64,AA")), parseInlineOnly("![m](Data:Image/png;base64,AA)"))
+        assertTrue(parseInlineOnly("![x](DATA:TEXT/HTML,AA)").none { it is Span.Image })
+        // ASCII only: a dotted capital I (U+0130) folds to "i" under Unicode case folding, never in JS.
+        assertTrue(parseInlineOnly("![x](DATA:\u0130MAGE/PNG,AA)").none { it is Span.Image })
         // A javascript: src is neither an image nor a link.
         val js = parseInlineOnly("![x](javascript:alert(1))")
         assertTrue(js.none { it is Span.Image || it is Span.Link })
@@ -682,6 +688,15 @@ class ProseTest {
         val mid = parseProse("a\n>\nb")
         assertEquals(ProseBlock.Quote(emptyList()), mid[1])
         assertEquals(3, mid.size)
+    }
+
+    // Rollup XERK-2148: web renderToolFiles previews only data:image/ or http(s).
+    @Test fun `a SendUserFile preview src is data image or http(s), in any ASCII case`() {
+        for (src in listOf("data:image/png;base64,AA", "DATA:IMAGE/PNG;base64,AA", "https://x.y/a.png", "HTTP://x.y/a.png"))
+            assertTrue(src, isPreviewImageSrc(src))
+        for (src in listOf("data:,<svg/>", "data:text/plain,AA", "javascript:alert(1)", "httpx://y", "",
+            "data:\u0130mage/png,AA", "http\u017f://x"))
+            assertTrue(src, !isPreviewImageSrc(src))
     }
 
     // Expose parseInline for the linkify/inline-code cases (it's file-private).

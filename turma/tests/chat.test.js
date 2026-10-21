@@ -2224,16 +2224,17 @@ test("renderProse: a standalone <svg> block renders as a data-URI <img>, not tex
 test("XERK-2161: a viewBox-only SVG is sized to fill the bubble at its ratio", () => {
   const sizeOf = (html) => (/<img [^>]*width="(\d+)" height="(\d+)"/.exec(html) || []).slice(1).map(Number);
   // A raw block: width = the width at the 420px max-height, so max-width narrows it.
-  assert.deepEqual(sizeOf(renderProse('<svg viewBox="0 0 200 100"><rect/></svg>')), [840, 420]);
+  // Border-box: the .md-svg's 6px padding + 1px border (14px a side pair) ride on top.
+  assert.deepEqual(sizeOf(renderProse('<svg viewBox="0 0 200 100"><rect/></svg>')), [826, 420]);
   // Commas as separators, a percentage size (still no intrinsic size).
-  assert.deepEqual(sizeOf(renderProse('<svg width="100%" viewBox="0,0,24,48"><rect/></svg>')), [210, 420]);
-  // A markdown data: image, percent-encoded or base64, gets the same.
+  assert.deepEqual(sizeOf(renderProse('<svg width="100%" viewBox="0,0,24,48"><rect/></svg>')), [217, 420]);
+  // A markdown data: image, percent-encoded or base64, gets the same (border only).
   const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 5"/>';
-  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml," + encodeURIComponent(svg) + ")")), [840, 420]);
-  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml;base64," + Buffer.from(svg).toString("base64") + ")")), [840, 420]);
+  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml," + encodeURIComponent(svg) + ")")), [838, 420]);
+  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml;base64," + Buffer.from(svg).toString("base64") + ")")), [838, 420]);
   // An empty or auto size is no size; a name inside another attribute's value is not one.
-  assert.deepEqual(sizeOf(renderProse('<svg width="auto" height="" viewBox="0 0 200 100"><rect/></svg>')), [840, 420]);
-  assert.deepEqual(sizeOf(renderProse('<svg aria-label=" width=\'5\'" viewBox="0 0 200 100"><rect/></svg>')), [840, 420]);
+  assert.deepEqual(sizeOf(renderProse('<svg width="auto" height="" viewBox="0 0 200 100"><rect/></svg>')), [826, 420]);
+  assert.deepEqual(sizeOf(renderProse('<svg aria-label=" width=\'5\'" viewBox="0 0 200 100"><rect/></svg>')), [826, 420]);
   // A declared size, a zero size, no viewBox, a bad viewBox, a bitmap, a bad URI: untouched.
   for (const t of [
     '<svg width="80" height="40" viewBox="0 0 200 100"><rect/></svg>',
@@ -2249,7 +2250,30 @@ test("XERK-2161: a viewBox-only SVG is sized to fill the bubble at its ratio", (
   const file = withVerbosity("normal", () => itemsToHtml(suItems([
     { name: "c.svg", kind: "image", src: "data:image/svg+xml," + encodeURIComponent(svg) },
   ])));
-  assert.deepEqual(sizeOf(file), [840, 420]);
+  assert.deepEqual(sizeOf(file), [826, 420]);
+});
+
+// Rollup XERK-2148: the box is border-box, so the padding + border sit inside the
+// width attribute; sized without them a 1:10 SVG laid out 42 x 294, not 420 tall.
+test("XERK-2148: a viewBox-only SVG reaches the 420px cap, padding and border included", () => {
+  const widthOf = (html) => Number((/<img [^>]*width="(\d+)"/.exec(html) || [])[1]);
+  // Lay the <img> out as Chrome does: width attr = border-box width; the content
+  // keeps the SVG's ratio; max-height 420 caps the border box.
+  const laidOutH = (w, inset, ratio) => Math.min(420, (w - inset) / ratio + inset);
+  for (const [vw, vh] of [[1, 10], [1, 3], [3, 4], [1, 1]]) {
+    const raw = widthOf(renderProse(`<svg viewBox="0 0 ${vw} ${vh}"><rect/></svg>`));
+    assert.equal(laidOutH(raw, 14, vw / vh), 420, `raw ${vw}:${vh} width ${raw}`);
+    const md = widthOf(linkify("![a](data:image/svg+xml," + encodeURIComponent(`<svg viewBox="0 0 ${vw} ${vh}"/>`) + ")"));
+    assert.equal(laidOutH(md, 2, vw / vh), 420, `markdown ${vw}:${vh} width ${md}`);
+  }
+});
+
+// Rollup XERK-2148: a URL scheme is case-insensitive; DATA:IMAGE/PNG is an image.
+test("XERK-2148: a markdown image's data: scheme matches in any case", () => {
+  assert.match(linkify("![x](DATA:IMAGE/PNG;base64,AA)"), /<img class="md-img" src="DATA:IMAGE\/PNG;base64,AA" alt="x"/);
+  assert.match(linkify("![x](Data:Image/png;base64,AA)"), /<img class="md-img"/);
+  // Still only data:image — another data: type stays text.
+  assert.doesNotMatch(linkify("![x](DATA:TEXT/HTML,AA)"), /<img/);
 });
 
 test("renderProse: a fenced SVG document renders as an image, not a code block", () => {
