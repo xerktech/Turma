@@ -123,7 +123,14 @@ function modelFamily(v) {
   // can name its family past char 80 (XERK-1858).
   const s = capStr(v, 500).toLowerCase();
   if (!s) return "";
-  for (const f of MODEL_FAMILIES) if (s.includes(f)) return f;
+  // A label naming two families reads as the one it names FIRST: "Sonnet 5 (successor to
+  // Opus 4)" is Sonnet, whatever order MODEL_FAMILIES lists them in.
+  let first = "", at = Infinity;
+  for (const f of MODEL_FAMILIES) {
+    const i = s.indexOf(f);
+    if (i !== -1 && i < at) { first = f; at = i; }
+  }
+  if (first) return first;
   return s.slice(0, 80).replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
 }
 
@@ -149,8 +156,13 @@ function aliasFamily(alias, defaultLabel) {
  * named anywhere in it counts — never a parenthesised fragment.
  */
 function defaultFamily(label) {
+  return probedFamily(label) || DEFAULT_MODEL;
+}
+
+/** The family a probed default label names, or "" — never the DEFAULT_MODEL fallback. */
+function probedFamily(label) {
   const m = modelFamily(label);
-  return MODEL_FAMILIES.includes(m) ? m : DEFAULT_MODEL;
+  return MODEL_FAMILIES.includes(m) ? m : "";
 }
 
 function sanitizePr(p) {
@@ -267,6 +279,7 @@ function sanitizeRow(r) {
     firstSeen, updatedAt,
   };
   if (r.modelKnown === true) out.modelKnown = true;
+  else if (r.modelGuess === true) out.modelGuess = true;
   const repo = capStr(r.repo, 200);
   if (repo) out.repo = repo;
   const runtime = capStr(r.runtime, 20).toLowerCase();
@@ -414,17 +427,27 @@ function observe(observations, now = Date.now()) {
     }
     const next = prev ? { ...prev, prs: prev.prs ? prev.prs.map((p) => ({ ...p })) : undefined }
       : { ...base, model: defaultFamily(o.modelDefault) };
-    if (!prev) created.add(base.key);
+    if (!prev) {
+      created.add(base.key);
+      // No probe yet: the model is the fleet fallback, a guess a later claim revises.
+      if (!probedFamily(o.modelDefault)) next.modelGuess = true;
+    }
     if (!next.prs) delete next.prs;
     // The class can be learned late (the board row arrives after the session).
     if (o.type && workClass(o.type) !== "other") next.cls = workClass(o.type);
     // The model: the one the transcript says answered wins over the alias it was
-    // spawned on; once known it is never overwritten by an alias.
+    // spawned on; once known it is never overwritten by an alias. A model that is
+    // only the fallback guess (no alias, no probe) is revised by a later probe.
     const actual = modelFamily(o.modelActual);
-    if (actual) { next.model = actual; next.modelKnown = true; }
+    if (actual) { next.model = actual; next.modelKnown = true; delete next.modelGuess; }
     else if (!next.modelKnown) {
-      const alias = aliasFamily(o.model, o.modelDefault);
-      if (alias) next.model = alias;
+      const alias = modelFamily(o.model);
+      const probed = probedFamily(o.modelDefault);
+      if (alias && alias !== "default") { next.model = alias; delete next.modelGuess; }
+      else if (probed && (alias === "default" || next.modelGuess)) {
+        next.model = probed;
+        delete next.modelGuess;
+      }
     }
     const repo = capStr(o.repo, 200);
     if (repo) next.repo = repo;
@@ -724,10 +747,22 @@ function evict(now = Date.now(), sweep = null) {
     if (!byHost.has(hk)) byHost.set(hk, []);
     byHost.get(hk).push(r);
   }
-  for (const list of byHost.values()) {
+  // A live row dropped by retention or its host's cap takes its paired shadows with it:
+  // an orphaned shadow pairs with nothing, yet lingered until retention below MAX_ROWS.
+  // Live hosts go first, so a shadow host's count no longer includes the shadows they took.
+  const goneLive = new Set(dropped);
+  const lists = [...byHost.entries()].sort(([a], [b]) => (a[0] === "s") - (b[0] === "s"));
+  for (const [hk, all] of lists) {
+    if (hk[0] === "s" && goneLive.size) {
+      for (const r of all) if (rows.has(r.key) && goneLive.has(r.pairOf)) drop(r);
+    }
+    const list = all.filter((r) => rows.has(r.key));
     if (list.length <= HOST_MAX_ROWS) continue;
     list.sort(victimFirst);
-    for (const r of list.slice(0, list.length - HOST_MAX_ROWS)) drop(r);
+    for (const r of list.slice(0, list.length - HOST_MAX_ROWS)) {
+      drop(r);
+      if (r.kind !== "shadow") goneLive.add(r.key);
+    }
   }
   let over = rows.size - MAX_ROWS;
   if (over <= 0) return dropped;

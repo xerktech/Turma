@@ -17062,12 +17062,13 @@ const CONTROL_DEAD_AFTER_MS = Number(process.env.CONTROL_DEAD_AFTER_MS);
 // faked, so real socket I/O still pumps and the pongs round-trip between ticks,
 // while no real stall can advance the mocked `idle`.
 //
-// This MUST stay the only mock-timers test in the suite: node:test's mock timers
+// This MUST stay the only test here that mocks setInterval: node:test's mock timers
 // do not re-capture an interval created inside a pre-existing server's
 // connection handler on a SECOND consecutive mock-timers test (the hub's ping
 // interval then never fires on ticks). It is the sole such test here on purpose;
 // the two liveness tests above deliberately stay on real timers because their
-// assertions are robust without it.
+// assertions are robust without it. (The budget REAL-progress test mocks only
+// setTimeout, for a timer its own request arms, so it does not trip this.)
 test("control WS: a channel that pongs is kept past the dead-after window", async (t) => {
   t.mock.timers.enable({ apis: ["setInterval", "Date"] });
   const { socket, leftover } = await wsConnect(CONTROL_PATH);
@@ -21643,14 +21644,14 @@ test("drain: only so many refused bodies may drain at once", async () => {
 // The suite does not run in a container, where the ceilings are container-sized;
 // here they are host-RAM-sized, so pressure has to be staged rather than assumed.
 function withBudgetPressure(fn) {
-  return async () => {
+  return async (t) => {
     // Contend the SHARED budget, since the lanes are accounted separately now:
     // occupying the big lane no longer pressures shared-lane reads (that
     // separation is what stopped one big body from refusing every tiny one).
     // Just over half, so the body under test is still admitted.
     const stage = Math.floor(hub.BODY_INFLIGHT_TOTAL_MAX / 2) + 1;
     hub.chargeBody(stage, "shared");
-    try { await fn(); } finally { hub.releaseBody(stage, "shared"); }
+    try { await fn(t); } finally { hub.releaseBody(stage, "shared"); }
   };
 }
 
@@ -21721,30 +21722,57 @@ test("budget: under pressure, a DRIBBLE cannot hold its charge open", withBudget
 }));
 
 test("budget: under pressure, a body making REAL progress is never reclaimed",
-  withBudgetPressure(async () => {
+  withBudgetPressure(async (t) => {
   // The other half: the rule is a minimum RATE, and anything clearing it must be
   // left alone however long it takes. A real slow migration lives here.
+  //
+  // Driven by a MOCKED setTimeout (the hub's idle window is one), so no real
+  // event-loop stall can expire a window the body was in fact feeding: each step
+  // waits on REAL I/O until the hub has read every byte sent, then advances the
+  // mocked clock by all but 1ms of a window. Only setTimeout is mocked, and the
+  // timer under test is armed inside this test's own request, so the XERK-450
+  // caveat (an interval a PRE-EXISTING connection created) does not apply. Date,
+  // setImmediate and process.hrtime stay real, so I/O still pumps between ticks.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const untilReal = async (predicate, ms = 5000) => {
+    const start = process.hrtime.bigint();
+    while (!predicate()) {
+      if (Number(process.hrtime.bigint() - start) / 1e6 > ms) return false;
+      await new Promise((r) => setImmediate(r));
+    }
+    return true;
+  };
   const held0 = hub.bodyInflightHeld();
   const chunk = Math.max(hub.BODY_MIN_PROGRESS_BYTES * 2, 128 * 1024);
   const sock = net.connect(server.address().port, "127.0.0.1");
-  let pump = null;
   try {
     await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    sock.on("error", () => {});     // the control step below has the hub destroy it
+    const prefix = '{"device":"steady","pad":"';
     sock.write(
       "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agenttok\r\n" +
-        `Content-Type: application/json\r\nContent-Length: ${33 << 20}\r\n\r\n` +
-        '{"device":"steady","pad":"'
+        `Content-Type: application/json\r\nContent-Length: ${33 << 20}\r\n\r\n` + prefix
     );
-    // Pump often: this is a real-timer SURVIVAL check, so an event-loop stall longer
-    // than what is left of the window reclaims the body. At half-window pumping that
-    // took a ~200ms stall on a loaded host; at a tenth it takes most of a window.
-    pump = setInterval(() => { try { sock.write("s".repeat(chunk)); } catch {} },
-      Math.max(10, Math.floor(hub.BODY_IDLE_TIMEOUT_MS / 10)));
-    await new Promise((r) => setTimeout(r, hub.BODY_IDLE_TIMEOUT_MS * 3));
-    assert.ok(hub.bodyInflightHeld() > held0,
-      "a body meeting the progress floor must not be reclaimed");
+    assert.ok(await untilReal(() => hub.bodyInflightHeld() > held0), "the body is charged");
+    // The charge is linear in bytes read, so "the hub has read all we sent" is exact.
+    const perByte = (hub.bodyInflightHeld() - held0) / prefix.length;
+    let sent = prefix.length;
+    for (let i = 0; i < 6; i++) {
+      sock.write("s".repeat(chunk));
+      sent += chunk;
+      assert.ok(await untilReal(() => hub.bodyInflightHeld() - held0 >= perByte * sent),
+        `step ${i}: the hub never read the chunk (driving bug, not a hub bug)`);
+      t.mock.timers.tick(hub.BODY_IDLE_TIMEOUT_MS - 1);
+      assert.ok(hub.bodyInflightHeld() > held0,
+        `step ${i}: a body meeting the progress floor must not be reclaimed`);
+    }
+    // Control: the mocked clock really drives the hub's window. The same body,
+    // silent for one window, IS taken back; without this the survival above could
+    // pass on a timer the mock never captured.
+    t.mock.timers.tick(hub.BODY_IDLE_TIMEOUT_MS);
+    assert.ok(await untilReal(() => hub.bodyInflightHeld() === held0),
+      "the same body, once silent for a window, is reclaimed");
   } finally {
-    if (pump) clearInterval(pump);
     sock.destroy();
   }
 }));

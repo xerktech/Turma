@@ -36,6 +36,12 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   legacy "default" row folds into Opus on load (`sanitizeRow`). The probe's label reads
   "`Opus 5.5 (1M context)` (effort: medium)", so only a known family named in it counts — never a
   parenthesised fragment. Tests: "an unpinned or 'default' session…" in `outcome-ledger.test.js`.
+- **A label naming two families reads as the one named FIRST** in it (XERK-2109), never by
+  `MODEL_FAMILIES` order: "Sonnet 5 (successor to Opus 4)" is Sonnet.
+- **A model that is only the Opus fallback (no alias, no probe) is a guess** (`modelGuess`,
+  XERK-2109): a later probe revises it; a pinned alias or `modelActual` clears it.
+  - A beat with no probe never downgrades a probed family back to the fallback.
+  - Tests: the `XERK-2109:` model cases in `outcome-ledger.test.js`.
 - **Outcome is DERIVED at read time** (`outcomeOf`), never stored: reopened → bad; merged →
   pending until `MODEL_QUALITY_WINDOW_DAYS` (90) passes, then good; every PR closed unmerged → bad;
   a stale close (not-reproducible / already-fixed) → no-change; ended with nothing → undelivered.
@@ -53,6 +59,10 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   Evicted keys are DELETEd from Postgres too, so the table is as bounded as the model.
 - **A host's shadow rows and live rows are capped apart** (XERK-1858): counted together, a busy
   shadow host evicted the live evidence its shadows pair against.
+- **A live row dropped by retention or its host's cap takes its paired shadows with it**
+  (XERK-2109), on whatever host they ran: below `MAX_ROWS` the orphan lingered until retention.
+  - Live hosts are capped first, so a shadow host's count excludes the shadows already taken.
+  - Tests: the `XERK-2109:` host-cap cases in `outcome-ledger.test.js`.
 - **Past `MAX_ROWS` the org pass evicts a live row and its paired shadows as ONE unit** (XERK-1858),
   ranked and aged by the live row (XERK-1855 order); an orphaned shadow is its own unit and goes first.
   - Shadows alone first churned: at the cap a new shadow was evicted and re-created every tick and
