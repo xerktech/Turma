@@ -99,6 +99,7 @@ const SEEDS = [
   "1\u0663. arabic digit\n\uff11. fullwidth digit",
   "<\u017fvg></\u017fvg>\n<svg>\ud800</svg>\n```\n<svg>\udc00a</svg>\n```",
   "`` \u001c `` `` \u1680 `` ``\u00a0x\u00a0``",
+  "- a\n  - b\n    - c\n      - d\n#### h4\n##### h5\n<svg>\ud83d\ude00</svg>\n```\n<svg></\u017fvg>\n```",
 ];
 
 function mutate(r, s) {
@@ -227,6 +228,9 @@ function canonWeb(html) {
     return false;
   }
 
+  // What the browser draws for a <ul> at each depth (no list-style-type is set on
+  // .md-list): disc, circle, then square from depth 2 down.
+  const BULLETS = ["\u2022", "\u25e6", "\u25aa"];
   // A web list nests <ul>/<ol> inside the open <li>; Android flattens it to
   // depth-tagged rows with the marker resolved (ordered numbering continues from
   // `start`, as the browser derives it).
@@ -238,7 +242,7 @@ function canonWeb(html) {
       if (n && n.close && n.tag === t.tag) { p++; break; }
       if (!n || n.close || n.tag !== "li") throw new Error("expected <li> in " + html);
       p++;
-      rows.push([depth, t.tag === "ol" ? num + "." : depth > 0 ? "\u25e6" : "\u2022", inline("li", true)]);
+      rows.push([depth, t.tag === "ol" ? num + "." : BULLETS[Math.min(depth, 2)], inline("li", true)]);
       while (peek() && !peek().close && (peek().tag === "ul" || peek().tag === "ol")) listItems(rows, depth + 1);
       expectClose("li");
       if (t.tag === "ol") num++;

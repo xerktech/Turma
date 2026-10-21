@@ -161,6 +161,8 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
     agree (verified against 3,000 real transcript blocks), but a marker switch at one depth opens a
     second list on the web and stays one flat block on Android. That grouping difference is
     deliberate and cosmetic — don't "fix" it by making the web stop distinguishing `<ul>` from `<ol>`.
+    - Android's bullet markers are the browser's `<ul>` defaults — `•`, `◦`, then `▪` from depth 2
+      down (`.md-list` sets no `list-style-type`); change both or neither.
   - **The live bubble uses `renderInline`, never `renderProse`** — `parsePaneLiveTurn` reflows the
     pane's hard-wrapped lines into ONE line, so a block pass has no line structure to read.
   - Every prose surface is styled as the same complete set — `.tr-msg`, `.thought-body`,

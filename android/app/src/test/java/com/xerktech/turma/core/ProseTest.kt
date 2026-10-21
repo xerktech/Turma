@@ -424,6 +424,7 @@ class ProseTest {
         assertTrue(svgs("<\u017fvg></\u017fvg>").isEmpty())
         assertTrue(svgs("<svg></\u017fvg>").isEmpty())
         assertTrue(svgs("```\n<\u017fvg></svg>\n```").isEmpty())
+        assertTrue(svgs("```\n<svg></\u017fvg>\n```").isEmpty())
         // Kotlin's isBlank() counts U+001F as blank; JS trim() does not, so the
         // code span still sheds its one padding space each side.
         val code = parseInlineOnly("`` \u001f ``").filterIsInstance<Span.Code>().single()
@@ -502,6 +503,9 @@ class ProseTest {
         val nested = lists("- a\n  - b\n- c").single().items
         assertEquals(listOf(0, 1, 0), nested.map { it.depth })
         assertEquals("◦", nested[1].marker)
+        // The browser's disc, circle, square — square from depth 2 down (XERK-2140).
+        assertEquals(listOf("•", "◦", "▪", "▪"),
+            lists("- a\n  - b\n    - c\n      - d").single().items.map { it.marker })
         // A marker switch at the same depth restarts the numbering.
         assertEquals(listOf("•", "1."), lists("- a\n1. b").single().items.map { it.marker })
         // Item content goes through the inline pass, not verbatim.

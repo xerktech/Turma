@@ -437,6 +437,8 @@ private fun listItemAt(line: String): RawListItem? {
  * indent width exactly as the web's <ul>/<ol> stack does, and the ordered
  * numbering the browser would have derived from `start`.
  */
+private val BULLETS = listOf("\u2022", "\u25E6", "\u25AA")
+
 private fun listBlockOf(items: List<RawListItem>): ProseBlock.ListBlock {
     val indents = ArrayList<Int>()
     val counters = ArrayList<Int>()   // >0 = ordered counter, 0 = bullets
@@ -457,7 +459,8 @@ private fun listBlockOf(items: List<RawListItem>): ProseBlock.ListBlock {
             }
         }
         val depth = indents.size - 1
-        val marker = if (it.ordered) "${counters.last()}." else if (depth > 0) "◦" else "•"
+        // The browser's default <ul> markers: disc, circle, then square from depth 2 down.
+        val marker = if (it.ordered) "${counters.last()}." else BULLETS[minOf(depth, BULLETS.size - 1)]
         rows.add(ProseListItem(depth, marker, parseInline(it.text)))
     }
     return ProseBlock.ListBlock(rows)
