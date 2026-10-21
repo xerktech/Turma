@@ -19698,8 +19698,9 @@ def _forge_pr_commits(pr_url):
     is caught by the named base, not here.
 
     ADO names `lastMergeTargetCommit`, the target's head the completion rebased
-    onto: a real squash's parent and merge's first parent both equal it, so it
-    holds on every path. GitLab names `diff_refs.start_sha`, the target's head
+    onto, re-read at completion: a real squash's parent, merge's first parent and
+    rebase's merge~N all equal it, also after the target moved, so it holds on
+    every path. GitLab names `diff_refs.start_sha`, the target's head
     when the MR's diff was last taken: after a fast-forward it equals merge~N
     (78 of 78 real fast-forwarded MRs, XERK-2156), but a squash GitLab rebased
     at merge keeps an older one, so a squash's is not held to it. A GitLab MR
