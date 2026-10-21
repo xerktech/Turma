@@ -9295,7 +9295,8 @@ def _mr_head_landed(proj, sha, branch):
                        f"{sha}/refs?type=branch&per_page=100")
     if not isinstance(data, list):
         return False
-    names = {r.get("name") for r in data if isinstance(r, dict)}
+    names = {r.get("name") for r in data
+             if isinstance(r, dict) and isinstance(r.get("name"), str)}
     if branch not in names and len(data) >= 100:
         return False
     if len(_MR_HEAD_LANDED) >= _MR_HEAD_LANDED_MAX:
@@ -30009,7 +30010,9 @@ class SessionManager:
         candidate model from the commit before the merged PR. Everything the hub
         names is re-checked here: this host's own org, a cloned repo, a commit
         that resolves. A refusal is a `failed` run on the report, never silence.
-        Runs on the beat like spawn_ticket (one bounded fetch + one issue read)."""
+        Runs on the beat like spawn_ticket: one bounded fetch, one issue read and,
+        for a GitLab MR or ADO PR, two forge API reads — over the beat budget on a
+        slow forge (XERK-2167)."""
         rid = str(cmd.get("shadowId") or "")
         if not SHADOW_ID_RE.fullmatch(rid):
             log(f"spawnShadow with a bad id {rid[:40]!r} — ignored")

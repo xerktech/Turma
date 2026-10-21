@@ -35187,6 +35187,29 @@ class TestMrStatus(unittest.TestCase):
             with mock.patch.object(ha, "_gitlab_get", answer([])):
                 self.assertEqual(ha.mr_status(self.MR)["mergeCommit"], head)
             self.assertEqual(len(calls), 1)
+            # "Can't tell" (a failed call, a full page without the target) is asked again.
+            for unsure in (None, ["x"] * 100):
+                ha._MR_HEAD_LANDED.clear()
+                with mock.patch.object(ha, "_gitlab_get", answer(unsure)):
+                    self.assertNotIn("mergeCommit", ha.mr_status(self.MR))
+                with mock.patch.object(ha, "_gitlab_get", answer(["main"])):
+                    self.assertEqual(ha.mr_status(self.MR)["mergeCommit"], head, unsure)
+            # A malformed branch entry is no branch, never a raise.
+            ha._MR_HEAD_LANDED.clear()
+            with mock.patch.object(ha, "_gitlab_get",
+                                   lambda p: [{"name": ["main"]}, {"name": {}}, "main"]
+                                   if "/refs?" in p else dict(mr)):
+                self.assertNotIn("mergeCommit", ha.mr_status(self.MR))
+            # The memory is bounded: the oldest answer goes first.
+            ha._MR_HEAD_LANDED.clear()
+            with mock.patch.object(ha, "_MR_HEAD_LANDED_MAX", 2):
+                for i in range(3):
+                    mr["sha"] = f"{i:040x}"
+                    with mock.patch.object(ha, "_gitlab_get", answer(["main"])):
+                        ha.mr_status(self.MR)
+                self.assertEqual([k[1] for k in ha._MR_HEAD_LANDED],
+                                 [f"{1:040x}", f"{2:040x}"])
+            mr["sha"] = head
             # A merge or squash commit is GitLab's own record: no branch read.
             calls.clear()
             mr["squash_commit_sha"] = "cd" * 20
