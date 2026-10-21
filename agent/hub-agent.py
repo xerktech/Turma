@@ -9241,8 +9241,9 @@ def _summarize_mr(data):
         "changesRequestedNow": detailed == "requested_changes",
     }
     # A fast-forward merge makes no merge or squash commit: the MR's head is
-    # what landed (GitLab rebases it first when it must), so it stands in —
-    # else such an MR never names the commit that landed it (XERK-2146).
+    # what landed, so it stands in — else such an MR never names the commit
+    # that landed it (XERK-2146). Not always: mr_status checks it is on the
+    # target branch (XERK-2156).
     _pr_merge_fields(out, state,
                      data.get("merge_commit_sha") or data.get("squash_commit_sha")
                      or data.get("sha"),
@@ -9266,7 +9267,41 @@ def mr_status(url):
         return None
     out = _summarize_mr(data)
     out["url"] = out["url"] or url
+    head = out.get("mergeCommit")
+    if head and not (data.get("merge_commit_sha") or data.get("squash_commit_sha")) \
+            and not _mr_head_landed(proj, head, data.get("target_branch")):
+        del out["mergeCommit"]
     return out
+
+
+# (project, sha, branch) -> whether that MR head is on its target branch. A
+# merged MR's answer never changes, so it is asked once; "can't tell" is not kept.
+_MR_HEAD_LANDED = {}
+_MR_HEAD_LANDED_MAX = 500
+
+
+def _mr_head_landed(proj, sha, branch):
+    """Whether a merged MR's head `sha` is on its target branch. A fork MR that
+    GitLab rebases at merge lands copies and keeps reporting the fork's head
+    (real inkscape MRs, XERK-2156): that sha is on no branch of the project and
+    names nothing that landed. False also when GitLab cannot say (the call
+    failed, or a full page of branches without the target)."""
+    if not isinstance(branch, str) or not branch:
+        return False
+    key = (proj, sha, branch)
+    if key in _MR_HEAD_LANDED:
+        return _MR_HEAD_LANDED[key]
+    data = _gitlab_get(f"projects/{urllib.parse.quote(proj, safe='')}/repository/commits/"
+                       f"{sha}/refs?type=branch&per_page=100")
+    if not isinstance(data, list):
+        return False
+    names = {r.get("name") for r in data if isinstance(r, dict)}
+    if branch not in names and len(data) >= 100:
+        return False
+    if len(_MR_HEAD_LANDED) >= _MR_HEAD_LANDED_MAX:
+        _MR_HEAD_LANDED.pop(next(iter(_MR_HEAD_LANDED)))
+    _MR_HEAD_LANDED[key] = branch in names
+    return _MR_HEAD_LANDED[key]
 
 
 # --- Azure DevOps pull requests (XERK-226) ---------------------------------
@@ -19235,14 +19270,21 @@ def _forge_commit(sha, name, email, date, message, cut=False):
 
 def _forge_pr_commits(pr_url):
     """A GitLab MR's or Azure DevOps PR's commits from its forge's API, in the
-    forge's order, plus the base the forge itself names (ADO's
-    `lastMergeTargetCommit`, the target's head the completion rebased onto;
-    None for GitLab) — or None when this host cannot read them (not this host's
+    forge's order, the base the forge itself names, and whether that base holds
+    on every path — or None when this host cannot read them (not this host's
     GitLab/ADO, an API failure, a malformed entry). Asks for one past the cap
     where the API allows; GitLab pages at 100, so a full page reads as over.
     ADO pages by a continuation header this reader never sees, so a short page
-    is caught by the named base, not here."""
-    target = None
+    is caught by the named base, not here.
+
+    ADO names `lastMergeTargetCommit`, the target's head the completion rebased
+    onto: a real squash's parent and merge's first parent both equal it, so it
+    holds on every path. GitLab names `diff_refs.start_sha`, the target's head
+    when the MR's diff was last taken: after a fast-forward it equals merge~N
+    (78 of 78 real fast-forwarded MRs, XERK-2156), but a squash GitLab rebased
+    at merge keeps an older one, so a squash's is not held to it. A GitLab MR
+    that does not read (or names no start) is held to a None target: it fails."""
+    target, every_path = None, False
     if MR_URL_RE.fullmatch(pr_url):
         parts = _mr_url_parts(pr_url)
         if not parts:
@@ -19257,6 +19299,12 @@ def _forge_pr_commits(pr_url):
                if isinstance(c, dict) else None for c in data]
         if len(data) >= 100 and None not in out:
             out.append({})               # a full page may not be all: read as over the cap
+        mr = _gitlab_get(f"projects/{urllib.parse.quote(proj, safe='')}/merge_requests/{iid}")
+        refs = mr.get("diff_refs") if isinstance(mr, dict) else None
+        start = refs.get("start_sha") if isinstance(refs, dict) else None
+        if isinstance(start, str) and SHADOW_SHA_RE.fullmatch(start.lower()):
+            target = start.lower()
+        every_path = not (isinstance(mr, dict) and mr.get("squash_commit_sha"))
     elif AZDO_PR_URL_RE.fullmatch(pr_url):
         pr_id = _azdo_pr_id(pr_url)
         info = _azdo_fetch_pr(pr_url) if pr_id else None
@@ -19265,7 +19313,7 @@ def _forge_pr_commits(pr_url):
         target = tgt.get("commitId") if isinstance(tgt, dict) else None
         if not ref or not isinstance(target, str) or not SHADOW_SHA_RE.fullmatch(target.lower()):
             return None
-        target = target.lower()
+        target, every_path = target.lower(), True
         proj, rid = ref
         data = _azure_get(
             f"/{urllib.parse.quote(proj, safe='')}/_apis/git/repositories/"
@@ -19284,7 +19332,7 @@ def _forge_pr_commits(pr_url):
                        if isinstance(c, dict) else None)
     else:
         return None
-    return None if None in out else (out, target)
+    return None if None in out else (out, target, every_path)
 
 
 def _forge_commits_landed(pr, landed, landed_msgs):
@@ -19313,9 +19361,10 @@ def _forge_rebase_base(repo, merge, parent, pr_url):
     the N first-parent commits ending at the single-parent merge are the PR's N
     commits — the same shas (GitLab fast-forward) or the same authors, author
     times and messages (a rebase that rewrote them) — the base is merge~N; a
-    squash or a one-commit PR keeps the first parent. Where the forge names the
-    base itself (ADO), any other answer fails: a short page or a rebase that
-    does not line up is caught there instead of guessed."""
+    squash or a one-commit PR keeps the first parent. The base the forge names
+    must agree — on every path but a GitLab squash, whose named base is stale —
+    so a short or stale list that does not line up is caught there instead of
+    guessed."""
     try:
         got = _forge_pr_commits(pr_url)
     except Exception as e:               # on the beat: a refusal, never a raise
@@ -19323,13 +19372,13 @@ def _forge_rebase_base(repo, merge, parent, pr_url):
         got = None
     if got is None:
         return None, "could not list the PR's commits from its forge to find its base"
-    pr, target = got
+    pr, target, every_path = got
     if len(pr) > SHADOW_PR_COMMITS_MAX:
         return None, f"the PR has over {SHADOW_PR_COMMITS_MAX} commits"
     if not pr:
         return None, "the forge lists no commits for the PR"
     base, why = _forge_placed_base(repo, merge, parent, pr)
-    if base and target and base != target:
+    if base and every_path and base != target:
         return None, "the PR's commits do not reach the base its forge names"
     return base, why
 

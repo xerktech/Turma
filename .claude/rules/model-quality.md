@@ -240,10 +240,20 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     as a prefix), in either listing order. Unreadable API → the run fails; a full GitLab page
     (100) reads as over the cap. A fast-forward MR has no merge/squash sha, so `_summarize_mr`
     reports its head `sha` as `mergeCommit` — without it such an MR never reached a shadow.
+  - **That `sha` counts only once GitLab says it is on the target branch** (XERK-2156,
+    `_mr_head_landed`, one refs call per merged MR, remembered). GitLab rebases a FORK MR at
+    merge and keeps reporting the fork's head: on real inkscape MRs that sha was on no branch,
+    and the landed copies are never named. Such an MR carries no `mergeCommit` at all.
   - **ADO's answer must equal its `lastMergeTargetCommit`** (the target head the completion
     rebased onto), on every path: the commits API pages by a header this reader never sees,
     and a short page matched as a whole PR based mid-PR (QA-reproduced). Never drop that check.
-    GitLab has no such cross-check yet (a stale MR commit list could base too far back).
+    Real ADO (XERK-2156): a squash's parent and a merge's first parent both equal it; a cut
+    `comment` ends with no `...` and is a prefix of the full message. Not seen on a real
+    forge: an ADO rebase completion, or one after the target moved past the last evaluation.
+  - **A GitLab fast-forward's answer must equal `diff_refs.start_sha`** (XERK-2156), on every
+    path; an MR that does not read or names none fails. On 78 of 78 real fast-forwarded MRs
+    (wayland, pipewire) start == base_sha == merge~N. A SQUASH is exempt: GitLab squashes and
+    rebases at merge without a new diff, so its start_sha is stale (real inkscape MRs).
   - That fetch is all-or-nothing: a quick failure (origin lacks the PR head) re-fetches the
     branch alone, so a merge-commit PR still places. A rebase that does not line up (a commit
     dropped as already applied) reads as a squash and keeps `^1` — the residual.
