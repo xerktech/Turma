@@ -20626,14 +20626,13 @@ class _DraftPane(_PickerPane):
     Ctrl+U behaves as 2.1.306's (measured by XERK-2157 QA): a press empties
     the last row, the next removes the emptied row."""
 
-    def __init__(self, draft, deaf=False, stuck=False, **kw):
+    def __init__(self, draft, deaf=False, **kw):
         super().__init__(**kw)
         self.draft = list(draft)
         self.deaf = deaf                # a placeholder: Ctrl+U changes nothing
-        self.stuck = stuck              # the cursor at the draft's start: same
 
     def key(self, key):
-        if key == "C-u" and (self.deaf or self.stuck):
+        if key == "C-u" and self.deaf:
             return
         if key == "C-u" and not (self.open or self.asking):
             if self.draft and self.draft[-1]:
@@ -20918,86 +20917,56 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         sm.set_model("abcde", "sonnet")
         self.assertEqual(sess["model"], "sonnet")
 
-    def test_set_model_clears_every_row_of_a_multi_line_draft(self):
-        # XERK-2157 QA: one Ctrl+U cleared only the last row, and "/model" +
-        # Enter then submitted the rest of the draft as a prompt.
-        pane = _DraftPane(["my draft line one\\", "second line", "third"])
+    def test_set_model_defers_while_the_operator_has_a_draft(self):
+        # XERK-2157 QA: "/model" + Enter typed onto a draft submitted it as a
+        # prompt, and clearing it first only ever cleared what was before the
+        # cursor, then ate the operator's edits on every retry. The draft is
+        # never touched: no key at all, the pick waits.
+        for draft in (["my draft line one\\", "second line"], ["one line"],
+                      [f"row {i}" for i in range(25)]):
+            self.run_calls.clear()
+            pane = _DraftPane(draft)
+            sm = self.make_manager(pane=pane)
+            sess = self._session(sm, model=None)
+            sm.set_model("abcde", "sonnet")
+            self.assertEqual(self.run_calls, [], draft)
+            self.assertEqual(pane.draft, draft)
+            self.assertEqual(sess["pendingModel"], "sonnet")
+            self.assertIsNone(sess["model"])
+
+    def test_a_deferred_pick_lands_once_the_draft_is_gone(self):
+        pane = _DraftPane(["half a thought"])
         sm = self.make_manager(pane=pane)
         sess = self._session(sm, model=None)
         sm.set_model("abcde", "sonnet")
-        self.assertFalse(any(pane.draft))
-        self.assertFalse(hasattr(pane, "submitted"))
-        self.assertGreaterEqual(self._keys().index("/model"), 5)
+        sm._apply_pending_switches()                 # draft still there: waits
+        self.assertEqual(self.run_calls, [])
+        pane.draft = []                              # the operator sent or cleared it
+        sm._apply_pending_switches()
+        self.assertNotIn("pendingModel", sess)
         self.assertEqual(sess["model"], "sonnet")
 
-    def test_set_model_goes_on_past_a_placeholder_ctrl_u_cannot_change(self):
+    def test_set_model_goes_on_past_the_dim_placeholder(self):
         pane = _DraftPane(['Try "fix the lint errors"'], deaf=True)
-        sm = self.make_manager(pane=pane)
-        self._session(sm, model=None)
-        sm.set_model("abcde", "sonnet")
-        self.assertEqual(self._keys()[:3], ["C-u", "C-u", "/model"])
-
-    def test_set_model_clears_a_draft_that_takes_more_than_twenty_presses(self):
-        pane = _DraftPane([f"row {i}" for i in range(15)])     # 29 presses
         sm = self.make_manager(pane=pane)
         sess = self._session(sm, model=None)
         sm.set_model("abcde", "sonnet")
-        self.assertFalse(any(pane.draft))
+        self.assertEqual(self._keys()[:2], ["C-u", "/model"])
         self.assertEqual(sess["model"], "sonnet")
-
-    def test_set_model_clears_blank_rows_too(self):
-        pane = _DraftPane(["", "", ""])
-        sm = self.make_manager(pane=pane)
-        self._session(sm, model=None)
-        sm.set_model("abcde", "sonnet")
-        self.assertLessEqual(len(pane.draft), 1)    # one empty row is the empty box
-
-    def test_set_model_defers_a_draft_ctrl_u_cannot_reach(self):
-        # XERK-2157 QA: Ctrl+U kills only what is BEFORE the cursor, so with the
-        # cursor inside a draft the presses stop changing it and the rest was
-        # submitted as "/model <rest>". Text left that is not the dim
-        # placeholder defers the switch; the draft stays.
-        pane = _DraftPane(["QADRAFT c1", "QADRAFT c2 tail"], stuck=True)
-        sm = self.make_manager(pane=pane)
-        sess = self._session(sm, model=None)
-        sm.set_model("abcde", "sonnet")
-        self.assertNotIn("/model", self._keys())
-        self.assertEqual(pane.draft, ["QADRAFT c1", "QADRAFT c2 tail"])
-        self.assertEqual(sess["pendingModel"], "sonnet")
-        # ...and so does a composer whose styling can't be read.
-        self.run_calls.clear()
-        pane = _DraftPane(['Try "fix the lint errors"'], deaf=True)
-        pane.styled = lambda: None
-        sm = self.make_manager(pane=pane)
-        sess = self._session(sm, model=None)
-        sm.set_model("abcde", "sonnet")
-        self.assertNotIn("/model", self._keys())
 
     def test_composer_holds_text_reads_the_dim_placeholder_as_empty(self):
         rule = "─" * 30 + "\n"
-        placeholder = (rule + '\x1b[39m❯\xa0\x1b[2mTry "how does <filepath> work?"\x1b[0m\n'
-                       + rule)
-        self.assertIs(ha._composer_holds_text(placeholder), False)
-        self.assertIs(ha._composer_holds_text(rule + "\x1b[39m❯\xa0 tail\n" + rule), True)
+        box = lambda row: rule + row + "\n" + rule
+        self.assertIs(ha._composer_holds_text(
+            box('\x1b[39m❯\xa0\x1b[2mTry "how does <filepath> work?"\x1b[0m')), False)
+        self.assertIs(ha._composer_holds_text(box("\x1b[39m❯\xa0 tail")), True)
+        # Dim text, a reset, then real text on the same row is a draft.
+        self.assertIs(ha._composer_holds_text(
+            box("\x1b[39m❯\xa0\x1b[2mTry\x1b[0m tail\x1b[2m x\x1b[0m")), True)
+        self.assertIs(ha._composer_holds_text(box("❯ ") + ""), False)
+        self.assertIs(ha._composer_holds_text(rule + "❯ \n\n\n" + rule), False)
         self.assertIsNone(ha._composer_holds_text("no composer\n"))
         self.assertIsNone(ha._composer_holds_text(None))
-
-    def test_set_model_stops_clearing_at_the_deadline(self):
-        pane = _DraftPane([f"row {i}" for i in range(15)])
-        sm = self.make_manager(pane=pane)
-        sess = self._session(sm, model=None)
-        with mock.patch.object(ha, "MODEL_CLEAR_DEADLINE_SEC", -1):
-            sm.set_model("abcde", "sonnet")
-        self.assertNotIn("/model", self._keys())
-        self.assertEqual(sess["pendingModel"], "sonnet")
-
-    def test_set_model_defers_a_draft_that_will_not_clear(self):
-        pane = _DraftPane([f"row {i}" for i in range(ha.MODEL_CLEAR_MAX_PRESSES + 5)])
-        sm = self.make_manager(pane=pane)
-        sess = self._session(sm, model=None)
-        sm.set_model("abcde", "sonnet")
-        self.assertNotIn("/model", self._keys())
-        self.assertEqual(sess["pendingModel"], "sonnet")
 
     def test_set_model_never_confirms_off_a_picker_still_drawn(self):
         # XERK-2157 QA: with the pane scrolled up beforehand, a line above the

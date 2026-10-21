@@ -24435,12 +24435,6 @@ MODEL_PICKER_MAX_STEPS = 12
 MODEL_STEP_TRIES = 8
 MODEL_STEP_WAIT_SEC = 0.12
 MODEL_CONFIRM_TRIES = 15
-# Ctrl+U empties a composer row, then removes it: two presses a draft line;
-# set_model presses until the composer stops changing, at most this many.
-MODEL_CLEAR_MAX_PRESSES = 40
-# ...and within this wall clock: each press is re-read, and set_model runs on
-# the beat, where a wedged tmux's 5s captures must not add up (XERK-395).
-MODEL_CLEAR_DEADLINE_SEC = 6.0
 MODEL_CONFIRM_WAIT_SEC = 0.2
 # What the TUI prints once a picker selection lands (session-only or saved
 # default) or is dismissed on the current model: "Set model to Sonnet 5.5 for
@@ -34356,9 +34350,11 @@ class SessionManager:
         Escaped out of and logged — the record keeps the real model, and the
         heartbeat corrects the UI's optimistic guess.
 
-        Two reliability fixes ride along: the input line is cleared (C-u)
-        first, so a half-typed operator prompt can't fuse with the command into
-        garbage; and a FRESH busy read gates the whole thing — typed into a
+        Two reliability fixes ride along: a draft in the composer defers the
+        switch (XERK-2157) — typed onto, it would fuse with the command into a
+        submitted prompt, and it is the operator's, so it is never cleared —
+        while an empty composer still gets a C-u first; and a FRESH busy read
+        gates the whole thing — typed into a
         mid-turn pane the command would only be queued as a prompt, so it is
         refused (log-only) rather than misfired. Unlike interrupt(), which
         tolerates a stale idle read because Escape is harmless, this path types
@@ -34409,14 +34405,21 @@ class SessionManager:
             self.save()
             log(f"set model of {sid} -> {arg}: a dialog is up; deferred until it closes")
             return
-        sess.pop("pendingModel", None)
-        if not self._clear_model_composer(tmux_name):
-            # A draft that would not clear: "/model" + Enter would submit it
-            # with "/model" glued on, as a prompt (XERK-2157 QA). Retry later.
+        if _composer_holds_text(_capture_pane_styled(tmux_name)):
+            # The operator has a draft in the composer. "/model" + Enter would
+            # submit it as a prompt with "/model" glued on, and clearing it
+            # first is no better: Ctrl+U kills only what is before the cursor
+            # (one row per two presses), so it either left text to submit or,
+            # retried each beat, ate the operator's edits (XERK-2157 QA). The
+            # draft is never touched — as `_type_into_pane` holds rather than
+            # clear one; the switch waits until the composer is empty. The dim
+            # placeholder is not a draft (`_composer_holds_text`).
             sess["pendingModel"] = arg
             self.save()
-            log(f"set model of {sid} -> {arg}: the composer would not clear; deferred")
+            log(f"set model of {sid} -> {arg}: a draft is in the composer; deferred")
             return
+        sess.pop("pendingModel", None)
+        _pane_send_keys(tmux_name, "C-u")
         _pane_send_keys(tmux_name, "/model", literal=True)
         _pane_send_keys(tmux_name, "Enter")
         rows, cur = [], None
@@ -34482,43 +34485,6 @@ class SessionManager:
             self.save()
             log(f"set model of {sid} -> {arg}: selection sent but no "
                 f"confirmation read; record unchanged (modelActual will settle it)")
-
-    def _clear_model_composer(self, tmux_name):
-        """Clear the composer before typing "/model": Ctrl+U until it stops
-        changing. Each draft line takes TWO presses on 2.1.306 (one empties the
-        row, the next removes it), so one press left the rest to be submitted
-        with "/model" glued on. Compared as drawn ROWS, never as joined text:
-        "L1" over an empty row and "L1" alone join alike.
-
-        Ctrl+U only kills text BEFORE the cursor, so with the cursor inside a
-        draft the presses stop changing it while text is still there — that
-        text would be submitted as "/model <rest>" (XERK-2157 QA). So a
-        composer that stopped changing is clear only if what is left is the
-        dim placeholder; real text left there is False (defer), and so is a
-        composer whose styling can't be read. No key reliably moves the
-        cursor to the draft's end (Ctrl+End does nothing; Down can walk the
-        prompt history). An unreadable composer keeps the old single press.
-        False when it is still changing after MODEL_CLEAR_MAX_PRESSES or
-        MODEL_CLEAR_DEADLINE_SEC."""
-        _pane_send_keys(tmux_name, "C-u")
-        prev = None
-        deadline = time.monotonic() + MODEL_CLEAR_DEADLINE_SEC
-        for _ in range(MODEL_CLEAR_MAX_PRESSES):
-            if time.monotonic() > deadline:
-                return False
-            time.sleep(MODEL_STEP_WAIT_SEC)
-            rows = _composer_rows(_capture_pane(tmux_name))
-            if rows is None:
-                return True
-            rows = [row.rstrip() for row in rows]
-            text = " ".join(" ".join(rows).split()).lstrip("❯").strip()
-            if not text and len(rows) <= 1:
-                return True
-            if rows == prev:
-                return _composer_holds_text(_capture_pane_styled(tmux_name)) is False
-            prev = rows
-            _pane_send_keys(tmux_name, "C-u")
-        return False
 
     def _await_picker_step(self, tmux_name, rows, prev_cur):
         """Poll the picker after an arrow press until the ❯ moves off prev_cur,
