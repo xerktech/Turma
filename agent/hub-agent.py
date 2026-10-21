@@ -19119,6 +19119,97 @@ def shadow_branch(shadow_id):
     return f"turma-shadow/{shadow_id}"
 
 
+# A rebase-merged PR longer than this is refused rather than placed: matching its
+# commits costs local git work on the beat.
+SHADOW_PR_COMMITS_MAX = 100
+
+
+def _commit_messages(repo, shas):
+    """Each of `shas` as its author, author time and full message, in order, or
+    None if git cannot list them one per commit. A rebase keeps all three; a
+    squash, or an unrelated commit that merely repeats a message, does not.
+    (git cuts a message at a NUL, so a forged NUL only truncates the text.)"""
+    rc, out = run_out(["git", "-C", repo, "log", "--no-walk=unsorted", "-z",
+                       "--format=%an <%ae> %at%n%B", *shas])
+    if rc != 0:
+        return None
+    parts = [p.strip() for p in out.split("\0")]
+    if parts and parts[-1] == "":
+        parts.pop()                      # -z ends the last commit with a NUL too
+    return parts if len(parts) == len(shas) else None
+
+
+def shadow_base_commit(repo, merge, pr_url, shadow_id):
+    """Fetch, then find the code as it was before the PR landed: `(base, None)`,
+    or `(None, why)` when it cannot be placed (XERK-2136).
+
+    A merge commit's first parent is that. A squash's only parent is too. A
+    GitHub rebase-merge lands the PR's N commits rewritten one by one, so the
+    reported merge commit is the LAST of them and its parent already holds the
+    rest: the base is merge~N. The two single-parent cases are told apart by the
+    PR's own head (`refs/pull/<n>/head`, kept by GitHub after the branch is
+    deleted): rebased, the N commits on the default branch carry the PR's N
+    authors, author times and messages in order; a squash's one commit does not.
+    No readable head, no PR commits off the default branch, or too many → fails.
+    Residual: a rebase that does not line up (a commit dropped as already
+    applied) reads as a squash and keeps the first parent, as before this.
+    A non-GitHub URL keeps the first parent."""
+    git = ["git", "-C", repo]
+    num = PR_URL_PARTS_RE.search(pr_url) if PR_URL_RE.fullmatch(pr_url or "") else None
+    pr_ref = f"refs/turma-shadow-pr/{shadow_id}" if num else None
+    name = default_branch_name(repo)
+    branch = [name] if name and valid_ref_name(name) else []
+    try:
+        # One bounded fetch, as before; the merge commit is on the default branch.
+        # A fetch is all-or-nothing, so a PR head the origin lacks (a fork or
+        # mirror origin) would also lose the branch: a quick failure retries the
+        # branch alone. A slow one (an origin that is down) does not try twice.
+        specs = branch + ([f"+refs/pull/{num.group(3)}/head:{pr_ref}"] if pr_ref else [])
+        if specs:
+            t0 = time.monotonic()
+            rc, _ = run_ok(git + ["fetch", "origin", *specs], timeout=FETCH_TIMEOUT_SEC)
+            if (rc != 0 and pr_ref and branch
+                    and time.monotonic() - t0 < FETCH_TIMEOUT_SEC / 2):
+                run_ok(git + ["fetch", "origin", *branch], timeout=FETCH_TIMEOUT_SEC)
+        line = run(git + ["rev-list", "--parents", "-n", "1", merge, "--"]).lower().split()
+        if not line or line[0] != merge:
+            return None, "the merge commit is not in this clone"
+        parents = line[1:]
+        if not parents:
+            return None, "the merge commit has no parent"
+        if len(parents) > 1 or not pr_ref:
+            return parents[0], None
+        head = run(git + ["rev-parse", "--verify", "--quiet", f"{pr_ref}^{{commit}}"]).lower()
+        if not SHADOW_SHA_RE.fullmatch(head):
+            return None, "could not fetch the PR's head to find its base"
+        rc, out = run_out(git + ["rev-list", "--topo-order", "--no-merges",
+                                 f"--max-count={SHADOW_PR_COMMITS_MAX + 1}",
+                                 head, "--not", merge, "--"])
+        if rc != 0:
+            return None, "could not list the PR's commits"
+        pr = out.lower().split()
+        if not pr:
+            return None, "the PR's commits landed unchanged, so its base cannot be placed"
+        if len(pr) == 1:
+            return parents[0], None
+        if len(pr) > SHADOW_PR_COMMITS_MAX:
+            return None, f"the PR has over {SHADOW_PR_COMMITS_MAX} commits"
+        rc, out = run_out(git + ["rev-list", "--first-parent", f"--max-count={len(pr)}",
+                                 merge, "--"])
+        landed = out.lower().split() if rc == 0 else []
+        msgs = _commit_messages(repo, pr) if len(landed) == len(pr) else None
+        if msgs is None or msgs != _commit_messages(repo, landed):
+            return parents[0], None          # a squash (or not a clean rebase)
+        base = run(git + ["rev-parse", "--verify", "--quiet",
+                          f"{merge}~{len(pr)}^{{commit}}"]).lower()
+        if not SHADOW_SHA_RE.fullmatch(base):
+            return None, "the rebase-merged PR's base is not in this clone"
+        return base, None
+    finally:
+        if pr_ref:
+            run_ok(git + ["update-ref", "-d", pr_ref])
+
+
 def _session_cli_spelling():
     """The session CLI as a taught command: the absolute path when shell-safe
     (what the allow rule matches), else the exported variable."""
@@ -29647,7 +29738,7 @@ class SessionManager:
 
     def spawn_shadow(self, cmd):
         """Handle the hub's `spawnShadow` (XERK-1847): re-do a merged ticket on a
-        candidate model from the merged PR's parent commit. Everything the hub
+        candidate model from the commit before the merged PR. Everything the hub
         names is re-checked here: this host's own org, a cloned repo, a commit
         that resolves. A refusal is a `failed` run on the report, never silence.
         Runs on the beat like spawn_ticket (one bounded fetch + one issue read)."""
@@ -29679,16 +29770,11 @@ class SessionManager:
         repo = next((r for r in scan_repos() if r["name"] == cmd.get("repo")), None)
         if not repo or not repo_forkable(repo["path"]):
             return self._fail_shadow(rid, cmd, "the repo is not cloned on this host")
-        # The merge commit is on the default branch; fetch it (bounded), then base
-        # the shadow on its FIRST parent — the code as it was before the merge.
-        name = default_branch_name(repo["path"])
-        if name and valid_ref_name(name):
-            run_ok(["git", "-C", repo["path"], "fetch", "origin", name],
-                   timeout=FETCH_TIMEOUT_SEC)
-        base = run(["git", "-C", repo["path"], "rev-parse", "--verify", "--quiet",
-                    f"{merge}^1^{{commit}}"]).strip().lower()
-        if not SHADOW_SHA_RE.fullmatch(base):
-            return self._fail_shadow(rid, cmd, "the merge commit is not in this clone")
+        # The code as it was before the PR landed: the merge's first parent, or
+        # merge~N for a rebase-merge of N commits (XERK-2136).
+        base, why = shadow_base_commit(repo["path"], merge, str(cmd.get("prUrl") or ""), rid)
+        if why:
+            return self._fail_shadow(rid, cmd, why)
         tree = shadow_tree_reason(repo["path"], base)
         if tree:
             return self._fail_shadow(rid, cmd, f"shadow runs cannot sandbox this repo: {tree}")

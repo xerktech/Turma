@@ -49031,6 +49031,7 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
     MERGE = "a" * 40
     BASE = "b" * 40
     HEAD = "c" * 40
+    PR_HEAD = "e" * 40
     RID = "sh-0123456789abcdef"
 
     def setUp(self):
@@ -49051,8 +49052,10 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
 
     def fake_git(self, cmd, cwd=None, timeout=None):
         self.run_calls.append(cmd)
-        if "rev-parse" in cmd and cmd[-1] == f"{self.MERGE}^1^{{commit}}":
-            return self.BASE
+        if "rev-list" in cmd and "--parents" in cmd and self.MERGE in cmd:
+            return f"{self.MERGE} {self.BASE}"
+        if "rev-parse" in cmd and cmd[-1].startswith("refs/turma-shadow-pr/sh-"):
+            return self.PR_HEAD
         if "rev-parse" in cmd and cmd[-1] == "HEAD":
             return self.head
         if "rev-parse" in cmd and cmd[-1] in (self.BASE, self.HEAD):
@@ -49068,6 +49071,8 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
             rows += self.tree_extra + ([("160000", "sub")] if self.gitlink else [])
             return 0, "\0".join(f"{m} {'commit' if m == '160000' else 'blob'} "
                                  f"{'d' * 40}\t{p}" for m, p in rows)
+        if "rev-list" in cmd and "--not" in cmd:
+            return 0, self.PR_HEAD     # a one-commit PR: its base is the first parent
         if "show" in cmd:
             name = cmd[-1].split(":", 1)[1]
             return (0, self.claude_files[name]) if name in self.claude_files else (128, "")
@@ -49127,6 +49132,11 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.assertIsNone(sess["ticket"], "a shadow never carries a ticket")
         self.assertEqual(sess["model"], "sonnet")
         self.assertEqual(sess["baseRef"], self.BASE)
+        # XERK-2136: the PR's own head rides the one fetch, into a ref dropped after.
+        pr_ref = f"refs/turma-shadow-pr/{self.RID}"
+        self.assertTrue(any("fetch" in c and f"+refs/pull/9/head:{pr_ref}" in c
+                            for c in self.run_ok_calls))
+        self.assertTrue(any(c[-2:] == ["-d", pr_ref] for c in self.run_ok_calls))
         run = sm.shadow_runs[self.RID]
         self.assertEqual((run["state"], run["runSid"], run["baseSha"]), ("running", sess["id"], self.BASE))
         cmd = self.launches()[-1][-1]
@@ -49407,7 +49417,9 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
 
     def test_an_unreadable_tree_is_refused(self):
         sm = self.make_manager()
-        with mock.patch.object(ha, "run_out", lambda *a, **k: (None, "")), \
+        real = self.fake_git_out
+        with mock.patch.object(ha, "run_out", lambda cmd, **k: (None, "") if "ls-tree" in cmd
+                               else real(cmd, **k)), \
                 mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
             sm.spawn_shadow(self.cmd())
         self.assertEqual(sm.registry, [])
@@ -49451,6 +49463,156 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
 # The real probe, kept before ManagerMixin stubs it for the suite (XERK-1859).
 REAL_SHADOW_SANDBOX_REASON = ha.shadow_sandbox_reason
 REAL_SHADOW_SANDBOX_AVAILABLE = ha.shadow_sandbox_available
+
+
+class TestShadowBase(unittest.TestCase):
+    """XERK-2136: a shadow starts from the code as it was before the PR landed,
+    over REAL git: a bare origin standing in for GitHub (with `refs/pull/<n>/head`),
+    the PR merged three ways, and a host clone that fetches."""
+
+    GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x",
+               "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+    RID = "sh-0123456789abcdef"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        p = mock.patch.dict(os.environ, self.GIT_ENV)
+        p.start()
+        self.addCleanup(p.stop)
+        self.origin = os.path.join(self.tmp, "origin.git")
+        self.dev = os.path.join(self.tmp, "dev")
+        self.host = os.path.join(self.tmp, "host")
+        self.git(self.tmp, "init", "-q", "--bare", "-b", "main", self.origin)
+        self.git(self.tmp, "clone", "-q", self.origin, self.dev)
+        self.commit("c0")
+        self.git(self.dev, "push", "-q", "origin", "HEAD:main")
+        self.git(self.tmp, "clone", "-q", self.origin, self.host)   # before any merge
+
+    def git(self, cwd, *args, env=None):
+        return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                              text=True, env={**os.environ, **(env or {})}).stdout.strip()
+
+    def commit(self, msg):
+        name = msg.replace(" ", "-")      # one file per commit: no conflicts
+        with open(os.path.join(self.dev, name), "w") as f:
+            f.write(msg + "\n")
+        self.git(self.dev, "add", name)
+        self.git(self.dev, "commit", "-q", "-m", msg, "-m", f"body of {msg}")
+        return self.git(self.dev, "rev-parse", "HEAD")
+
+    def open_pr(self, n, msgs):
+        """A PR branch off main with `msgs` commits, published as refs/pull/<n>/head;
+        then main moves on under it. Returns main's tip before the PR lands."""
+        self.git(self.dev, "switch", "-q", "-c", f"pr{n}", "main")
+        for m in msgs:
+            self.commit(m)
+        self.git(self.dev, "push", "-q", "origin", f"HEAD:refs/pull/{n}/head")
+        self.git(self.dev, "switch", "-q", "main")
+        tip = self.commit(f"main moves under {n}")
+        self.git(self.dev, "push", "-q", "origin", "HEAD:main")
+        return tip
+
+    def land(self):
+        self.git(self.dev, "push", "-q", "origin", "HEAD:main")
+        return self.git(self.dev, "rev-parse", "HEAD")
+
+    def base(self, merge, n):
+        return ha.shadow_base_commit(self.host, merge, f"https://github.com/o/r/pull/{n}",
+                                     self.RID)
+
+    def test_a_rebase_merge_bases_on_the_commit_before_the_prs_first(self):
+        before = self.open_pr(7, ["a1", "a2", "a3"])
+        # GitHub's rebase-merge: every commit rewritten, GitHub the committer.
+        self.git(self.dev, "rebase", "-q", "main", "pr7", env={"GIT_COMMITTER_NAME": "GitHub"})
+        self.git(self.dev, "switch", "-q", "main")
+        self.git(self.dev, "merge", "-q", "--ff-only", "pr7")
+        merge = self.land()
+        self.assertNotEqual(self.git(self.dev, "rev-parse", f"{merge}^1"), before,
+                            "the first parent already holds a1 and a2")
+        self.assertEqual(self.base(merge, 7), (before, None))
+        self.assertEqual(self.git(self.host, "for-each-ref", "refs/turma-shadow-pr"), "",
+                         "the PR head ref is not left behind")
+
+    def test_a_squash_bases_on_the_first_parent(self):
+        before = self.open_pr(8, ["b1", "b2"])
+        self.git(self.dev, "merge", "-q", "--squash", "pr8")
+        self.git(self.dev, "commit", "-q", "-m", "Squashed PR (#8)")
+        merge = self.land()
+        self.assertEqual(self.base(merge, 8), (before, None))
+
+    def test_a_merge_commit_and_a_one_commit_rebase_base_on_the_first_parent(self):
+        before = self.open_pr(9, ["c1", "c2"])
+        self.git(self.dev, "merge", "-q", "--no-ff", "-m", "Merge pull request #9", "pr9")
+        merge = self.land()
+        self.assertEqual(self.base(merge, 9), (before, None))
+        before = self.open_pr(10, ["d1"])
+        self.git(self.dev, "rebase", "-q", "main", "pr10")
+        self.git(self.dev, "switch", "-q", "main")
+        self.git(self.dev, "merge", "-q", "--ff-only", "pr10")
+        merge = self.land()
+        self.assertEqual(self.base(merge, 10), (before, None))
+
+    def test_an_unplaceable_pr_fails_closed(self):
+        self.open_pr(11, ["e1", "e2"])
+        self.git(self.dev, "merge", "-q", "--squash", "pr11")
+        self.git(self.dev, "commit", "-q", "-m", "Squashed PR (#11)")
+        merge = self.land()
+        base, why = self.base(merge, 99)          # no such PR head on the forge
+        self.assertIsNone(base)
+        self.assertIn("PR's head", why, "the branch was still fetched on its own")
+        self.assertEqual(self.base("f" * 40, 11)[1], "the merge commit is not in this clone")
+        # Not a GitHub PR: no head to read, the first parent as before.
+        parent = self.git(self.host, "rev-parse", f"{merge}^1")
+        self.assertEqual(ha.shadow_base_commit(self.host, merge, "", self.RID), (parent, None))
+
+    def test_a_merge_commit_bases_even_when_the_origin_lacks_the_pr_head(self):
+        before = self.open_pr(12, ["g1", "g2"])
+        self.git(self.origin, "update-ref", "-d", "refs/pull/12/head")   # a mirror origin
+        self.git(self.dev, "merge", "-q", "--no-ff", "-m", "Merge pull request #12", "pr12")
+        merge = self.land()
+        self.assertEqual(self.base(merge, 12), (before, None))
+
+    def test_a_slow_fetch_failure_is_not_retried(self):
+        # A dead origin (the fetch ran to its timeout) costs one fetch, not two.
+        fetches = []
+        ticks = [0.0]
+        def clock():                     # every read moves a whole timeout on
+            ticks[0] += ha.FETCH_TIMEOUT_SEC
+            return ticks[0]
+        with mock.patch.object(ha, "run_ok", lambda cmd, **k: (fetches.append(cmd), (1, ""))[1]
+                               if "fetch" in cmd else (0, "")), \
+                mock.patch.object(ha.time, "monotonic", clock):
+            base, why = self.base("f" * 40, 16)
+        self.assertEqual(len(fetches), 1)
+        self.assertEqual(why, "the merge commit is not in this clone")
+
+    def test_a_pr_already_on_the_default_branch_or_too_long_fails_closed(self):
+        self.commit("h1")                       # the PR's commits landed as themselves
+        merge = self.commit("h2")
+        self.git(self.dev, "push", "-q", "origin", "HEAD:refs/pull/13/head")
+        self.land()
+        self.assertIn("landed unchanged", self.base(merge, 13)[1])
+        self.git(self.dev, "switch", "-q", "-c", "pr14", "main")
+        for i in range(ha.SHADOW_PR_COMMITS_MAX + 1):
+            self.git(self.dev, "commit", "-q", "--allow-empty", "-m", f"k{i}")
+        self.git(self.dev, "push", "-q", "origin", "HEAD:refs/pull/14/head")
+        self.git(self.dev, "switch", "-q", "main")
+        self.git(self.dev, "merge", "-q", "--squash", "pr14")
+        self.git(self.dev, "commit", "-q", "--allow-empty", "-m", "Squashed PR (#14)")
+        merge = self.land()
+        self.assertIn("over", self.base(merge, 14)[1])
+
+    def test_a_squash_after_a_commit_repeating_a_pr_message_stays_a_squash(self):
+        before = self.open_pr(15, ["x1", "x2"])
+        self.git(self.dev, "commit", "-q", "--allow-empty", "-m", "x1", "-m", "body of x1",
+                 env={"GIT_AUTHOR_DATE": "2030-01-01T00:00:00Z"})   # a later, unrelated x1
+        before = self.git(self.dev, "rev-parse", "HEAD")
+        self.git(self.dev, "merge", "-q", "--squash", "pr15")
+        self.git(self.dev, "commit", "-q", "-m", "x2", "-m", "body of x2")
+        merge = self.land()
+        self.assertEqual(self.base(merge, 15), (before, None))
 
 
 class TestShadowSandbox(ManagerMixin, unittest.TestCase):
