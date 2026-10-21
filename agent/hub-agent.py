@@ -9242,8 +9242,13 @@ def _summarize_mr(data):
         # review is observed as the merge status it puts the MR in (XERK-1845).
         "changesRequestedNow": detailed == "requested_changes",
     }
+    # A fast-forward merge makes no merge or squash commit: the MR's head is
+    # what landed, so it stands in — else such an MR never names the commit
+    # that landed it (XERK-2146). Not always: mr_status checks it is on the
+    # target branch (XERK-2156).
     _pr_merge_fields(out, state,
-                     data.get("merge_commit_sha") or data.get("squash_commit_sha"),
+                     data.get("merge_commit_sha") or data.get("squash_commit_sha")
+                     or data.get("sha"),
                      data.get("merged_at"))
     return out
 
@@ -9264,7 +9269,42 @@ def mr_status(url):
         return None
     out = _summarize_mr(data)
     out["url"] = out["url"] or url
+    head = out.get("mergeCommit")
+    if head and not (data.get("merge_commit_sha") or data.get("squash_commit_sha")) \
+            and not _mr_head_landed(proj, head, data.get("target_branch")):
+        del out["mergeCommit"]
     return out
+
+
+# (project, sha, branch) -> whether that MR head is on its target branch. A
+# merged MR's answer never changes, so it is asked once; "can't tell" is not kept.
+_MR_HEAD_LANDED = {}
+_MR_HEAD_LANDED_MAX = 500
+
+
+def _mr_head_landed(proj, sha, branch):
+    """Whether a merged MR's head `sha` is on its target branch. A fork MR that
+    GitLab rebases at merge lands copies and keeps reporting the fork's head
+    (real inkscape MRs, XERK-2156): that sha is on no branch of the project and
+    names nothing that landed. False also when GitLab cannot say (the call
+    failed, or a full page of branches without the target)."""
+    if not isinstance(branch, str) or not branch:
+        return False
+    key = (proj, sha, branch)
+    if key in _MR_HEAD_LANDED:
+        return _MR_HEAD_LANDED[key]
+    data = _gitlab_get(f"projects/{urllib.parse.quote(proj, safe='')}/repository/commits/"
+                       f"{sha}/refs?type=branch&per_page=100")
+    if not isinstance(data, list):
+        return False
+    names = {r.get("name") for r in data
+             if isinstance(r, dict) and isinstance(r.get("name"), str)}
+    if branch not in names and len(data) >= 100:
+        return False
+    if len(_MR_HEAD_LANDED) >= _MR_HEAD_LANDED_MAX:
+        _MR_HEAD_LANDED.pop(next(iter(_MR_HEAD_LANDED)))
+    _MR_HEAD_LANDED[key] = branch in names
+    return _MR_HEAD_LANDED[key]
 
 
 # --- Azure DevOps pull requests (XERK-226) ---------------------------------
@@ -9471,8 +9511,11 @@ def _azdo_fetch_pr(url):
     data = _azure_get(f"/_apis/git/pullrequests/{pr_id}")
     if not isinstance(data, dict) or data.get("pullRequestId") is None:
         return None
-    repo = data.get("repository") or {}
-    proj = (repo.get("project") or {}).get("id") or (repo.get("project") or {}).get("name")
+    repo = data.get("repository")
+    repo = repo if isinstance(repo, dict) else {}
+    project = repo.get("project")
+    project = project if isinstance(project, dict) else {}
+    proj = project.get("id") or project.get("name")
     rid = repo.get("id") or repo.get("name")
     if proj and rid:
         if len(_AZDO_PR_REF) >= _AZDO_PR_REF_MAX:
@@ -13166,6 +13209,20 @@ def _operator_units(rows):
     return units
 
 
+def _operator_units(rows):
+    """_operator_entries rows grouped into operator messages: a `!` command and
+    the output row(s) _operator_entries kept beside it are ONE message, so the
+    HISTORY_USER_MSGS cap counts what the operator sent and never cuts a
+    command from what it printed."""
+    units = []
+    for row in rows:
+        if units and not _is_operator_row(row) and _is_command_output_row(row):
+            units[-1].append(row)
+        else:
+            units.append([row])
+    return units
+
+
 def _history_entries(path):
     """On-demand `history` read of a transcript: bounded to the last 4 MiB
     (1 << 22, same cap the PR-URL scan uses) rather than transcript_tail's
@@ -14191,10 +14248,12 @@ def parse_pane_mode(cap):
 # ordinary numbered list in conversation text does not, is all four of:
 #   1. a contiguous run of >= 2 options numbered 1..N in order;
 #   2. exactly one carrying the TUI's "❯" selection cursor;
-#   3. a question line (ends in "?") directly above the run;
+#   3. a question line (ends in "?") directly above the run, or above one
+#      blank-fenced subtitle paragraph (XERK-2162);
 #   4. NO mode footer below it — the footer marker rides the composer, which a
 #      dialog replaces, so its absence is what says "this is a live dialog"
-#      rather than transcript text that happens to look like one.
+#      rather than transcript text that happens to look like one. The Ctrl-C
+#      exit toast that briefly replaces the footer counts as one (XERK-2169).
 # The selection cursor is "❯" in Claude Code and "›" in Qwen Code (XERK-509
 # [Qwen C], G0 pane/03-tool-approval.txt: "› 1. Yes, allow once"). Both are
 # accepted — neither glyph occurs in ordinary conversation text, so the cursor
@@ -14206,6 +14265,28 @@ PANE_PROMPT_OPTION_RE = re.compile(r"^\s*([❯›]\s+)?(\d+)\.\s+(\S.*?)\s*$")
 # run says "not a blocking dialog" — a qwen approval dialog REPLACES the footer
 # with "Waiting for user confirmation…" (G0), so a real dialog shows none.
 QWEN_PANE_FOOTER_RE = re.compile(r"Ask permissions \(shift \+ tab to cycle\)")
+# Claude Code's exit toast, which REPLACES the mode footer for ~0.5-1s after a
+# Ctrl-C (or Ctrl-D) on an idle composer (2.1.306: "  Press Ctrl-C again to
+# exit"). It rides the composer like the footer it hides, so it vetoes a dialog
+# the same way — else a reply shaped question / options reads as a live dialog
+# while it is up (XERK-2169). Matched against EVERYTHING below the pane's last
+# rule (`_pane_exit_toast_up`), so a reply merely quoting it never counts, and a
+# live dialog, whose options sit below that rule, never matches.
+PANE_EXIT_TOAST_RE = re.compile(r"^\s*Press Ctrl-[CD] again to exit\s*$")
+
+
+def _pane_exit_toast_up(lines):
+    """Whether the lines below the pane's last rule are the exit toast, read
+    with its wraps joined: at 28 columns or less it wraps ("Press Ctrl-C again
+    to" / "exit"), which the per-line match misses (XERK-2169 QA)."""
+    tail = []
+    for line in reversed(lines):
+        if line.strip() and PANE_PROMPT_RULE_RE.match(line):
+            break
+        if line.strip():
+            tail.append(line.strip())
+    return bool(tail) and bool(
+        PANE_EXIT_TOAST_RE.match(" ".join(reversed(tail))))
 # A trailing right-edge SCROLLBAR column + its padding (XERK-509 [Qwen C]): the
 # block-element family (█ and eighths/shades, U+2588-258F / U+2591-2593), the
 # right-block glyphs (▐ ▕) and light/heavy vertical bars (│ ┃), any run of them
@@ -14229,6 +14310,121 @@ PANE_PROMPT_DETAIL_CHARS = 800
 # only so a pathological pane can't grow the in-memory key. 14 lines of a wide pane.
 PANE_PROMPT_FACE_CHARS = 8000
 PANE_PROMPT_MAX_OPTIONS = 9   # answered by typing the digit; 10+ isn't one key
+# A subtitle between the question and the options ("Claude wants to exit plan
+# mode"), at most this many lines — room for one sentence wrapped on a narrow pane.
+PANE_PROMPT_SUBTITLE_LINES = 3
+# The top edge of Claude Code's bottom area (2.1.306), which a dialog replaces
+# the composer inside: a ▔ run, sometimes ending in an effort badge. Everything
+# above it is conversation, never the dialog's detail (XERK-2162). Always at
+# column 0: conversation and tool output are indented, so an indented ▔ line
+# quoted in a reply can never pose as it.
+PANE_PROMPT_EDGE_RE = re.compile(r"^▔{3}")
+# How far in from the pane's edge a dialog's box may end (XERK-2162: 2 cells).
+PANE_DIALOG_MARGIN = 4
+
+
+def _pane_cells(text):
+    """Terminal cells `text` occupies: wide (CJK/emoji) glyphs take two."""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def _pane_numbering_continues(lines, idx):
+    """Whether a numbered option follows a rule below line `idx`, before any
+    blank (XERK-2150).
+
+    The native AskUserQuestion picker splits its list with a rule — "4. Type
+    something." / ──── / "5. Chat about this" — while a permission or plan
+    dialog's last option is followed by a blank line. So a run (or the start of
+    one an option's description cut short) whose list carries on past a rule is
+    part of the picker, whose answer comes from ask.py
+    and whose rows are not digits to send. Its descriptions can't be told from
+    wrapped labels line by line: a label that fills the pane makes the
+    description's first word look like it overflowed. Without a rule this is
+    never refused: a dialog cut short by an unjoined wrap still reads as one,
+    which keeps the pane-typing guards off it."""
+    ruled = False
+    for line in lines[idx:]:
+        if not line.strip():
+            return False
+        if PANE_PROMPT_RULE_RE.match(line):
+            ruled = True
+            continue
+        om = PANE_PROMPT_OPTION_RE.match(line)
+        if ruled and om:
+            return True
+    return False
+
+
+def _pane_dialog_width(lines, idx, widest):
+    """The cells a dialog's text wraps at, for the option on line `idx`
+    (XERK-2162): the right edge of the nearest box rule above it.
+
+    Some dialogs ("Exit plan mode?", 2.1.306) draw their box two columns in
+    from the pane's edge and wrap there, so measuring against the widest line
+    (the pane) read a wrap whose next word fit the margin as a description and
+    broke the run. Only a rule within `PANE_DIALOG_MARGIN` of the pane counts:
+    a short rule in a diff or plan body is content, not the box."""
+    for k in range(idx - 1, -1, -1):
+        if PANE_PROMPT_EDGE_RE.match(lines[k]):
+            break
+        if PANE_PROMPT_RULE_RE.match(lines[k]) and lines[k].strip():
+            edge = _pane_cells(lines[k].rstrip())
+            if edge >= widest - PANE_DIALOG_MARGIN:
+                return edge
+    return widest
+
+
+def _pane_under_edge(lines, idx):
+    """Whether the question above line `idx` sits in Claude Code's bottom area:
+    above it only blanks, the question itself and box rules up to the ▔ edge
+    (XERK-2162). A subtitle is accepted only there — a reply in the
+    conversation shaped question / note / options is above the edge, and a
+    mode footer is not always drawn to veto it."""
+    seen_q = False
+    for k in range(idx - 1, -1, -1):
+        line = lines[k]
+        if PANE_PROMPT_EDGE_RE.match(line):
+            return seen_q
+        if not line.strip() or PANE_PROMPT_RULE_RE.match(line):
+            continue
+        if seen_q:
+            return False
+        seen_q = True
+    return False
+
+
+def _pane_join_wrap(label, text):
+    """`label` with a wrapped screen line `text` appended. A path the TUI broke
+    mid-token ("…/.turma" / "/worktrees/…", "…/wor" / "ktrees/…") had no space
+    there; any other break replaced one."""
+    tail = label.rsplit(None, 1)[-1]
+    head = text.split(None, 1)[0]
+    return label + ("" if "/" in tail and "/" in head else " ") + text
+
+
+def _pane_option_wrap_end(lines, idx, width):
+    """Index of the last screen line of option `idx`'s label (XERK-2150).
+
+    The TUI word-wraps a long label onto lines indented to the label column
+    ("2. Yes, and always allow access to" / "   /long/cwd from this project").
+    A line on that indent is a wrap only when its first word would NOT have fit
+    after the line above it, so a description line under a short option ends
+    the run (the picker is also refused whole: _pane_numbering_continues).
+    `width` is the widest line in the capture (the dialog's top rule spans the
+    pane); 0 disables joining."""
+    m = PANE_PROMPT_OPTION_RE.match(lines[idx])
+    col = m.start(3)
+    j = idx
+    while width and j + 1 < len(lines):
+        nxt = lines[j + 1]
+        text = nxt.strip()
+        if (not text or PANE_PROMPT_OPTION_RE.match(nxt)
+                or len(nxt) - len(nxt.lstrip()) != col):
+            break
+        if _pane_cells(lines[j].rstrip()) + 1 + _pane_cells(text.split()[0]) <= width:
+            break                    # it would have fit: a description, not a wrap
+        j += 1
+    return j
 
 
 def parse_pane_prompt(cap, face=False):
@@ -14262,6 +14458,9 @@ def parse_pane_prompt(cap, face=False):
     # below already .strip()s). NOT the horizontal rule glyphs (─━ etc), which a
     # legitimate rule/detail line is made of.
     lines = [_PANE_SCROLLBAR_RE.sub("", l) for l in cap.splitlines()]
+    widest = None                    # the pane's width, measured on first need
+    if _pane_exit_toast_up(lines):
+        return None                  # the exit toast (wraps joined): composer is live
     # A mode footer anywhere below means the composer is live -> no dialog.
     for i in range(len(lines) - 1, -1, -1):
         line = lines[i]
@@ -14271,33 +14470,76 @@ def parse_pane_prompt(cap, face=False):
                 return None          # composer footer (Claude or Qwen): nothing
                                      # is blocking
             continue
-        # Walk up while the numbers keep descending to 1.
-        end = i
-        start = i
+        # Walk up while the numbers keep descending to 1, stepping over each
+        # option's wrapped label lines (never a picker's description line).
+        if widest is None:
+            widest = max(_pane_cells(l.rstrip()) for l in lines)
+        width = _pane_dialog_width(lines, i, widest)
+        rows = []                    # (first, last) screen line of each option
+        nxt = i                      # where the scan for the next option up starts
+        last = _pane_option_wrap_end(lines, i, width)
         want = int(m.group(2))
-        while start >= 0:
-            om = PANE_PROMPT_OPTION_RE.match(lines[start])
-            if not om or int(om.group(2)) != want:
+        while want > 0:
+            # Claude Code draws an empty row under an option whose line fills
+            # the pane exactly (2.1.306); step over one, but only for that.
+            gap = rows and nxt >= 0 and not lines[nxt].strip()
+            if gap:
+                last = nxt = nxt - 1
+            start = nxt
+            while (start >= 0 and lines[start].strip()
+                   and not PANE_PROMPT_OPTION_RE.match(lines[start])):
+                start -= 1           # back over the option's wrapped lines
+            om = start >= 0 and PANE_PROMPT_OPTION_RE.match(lines[start])
+            if (not om or int(om.group(2)) != want
+                    or _pane_option_wrap_end(lines, start, width) != last):
                 break
-            start -= 1
+            if gap and not any(_pane_cells(lines[k].rstrip()) == widest
+                               for k in range(start, last + 1)):
+                break
+            rows.append((start, last))
+            last = nxt = start - 1
             want -= 1
-        if want != 0 or end - start < 2:
+        if want != 0 or len(rows) < 2:
             continue                 # not 1..N, or fewer than two options
-        start += 1
+        if _pane_numbering_continues(lines, rows[0][1] + 1):
+            continue                 # only part of a longer list (the picker)
+        rows.reverse()
+        start = rows[0][0]
         opts = []
-        for line_no in range(start, end + 1):
-            om = PANE_PROMPT_OPTION_RE.match(lines[line_no])
+        for first, last in rows:
+            om = PANE_PROMPT_OPTION_RE.match(lines[first])
+            label = om.group(3)
+            for k in range(first + 1, last + 1):
+                label = _pane_join_wrap(label, lines[k].strip())
             opts.append({"number": int(om.group(2)),
-                         "label": om.group(3)[:200],
+                         "label": label[:200],
                          "selected": bool(om.group(1))})
         if sum(1 for o in opts if o["selected"]) != 1:
             continue                 # no cursor (or several): not a live picker
         if len(opts) > PANE_PROMPT_MAX_OPTIONS:
             continue
-        # The question sits directly above, skipping blanks.
+        # The question sits directly above, skipping blanks — or above one
+        # subtitle paragraph fenced by blanks on both sides (XERK-2162: "Exit
+        # plan mode?" / "Claude wants to exit plan mode" / the run).
         q = start - 1
         while q >= 0 and not lines[q].strip():
             q -= 1
+        subtitle = []
+        if q >= 0 and not lines[q].strip().endswith("?") and q < start - 1:
+            k = q
+            while (k >= 0 and lines[k].strip()
+                   and not lines[k].strip().endswith("?")
+                   and not PANE_PROMPT_RULE_RE.match(lines[k])
+                   and not PANE_PROMPT_OPTION_RE.match(lines[k])):
+                k -= 1
+            if (0 <= k and not lines[k].strip()
+                    and q - k <= PANE_PROMPT_SUBTITLE_LINES
+                    and _pane_under_edge(lines, k)):
+                # Joined into one line: its wrap moves with the pane's width.
+                subtitle = [" ".join(l.strip() for l in lines[k + 1:q + 1])]
+                q = k
+                while q >= 0 and not lines[q].strip():
+                    q -= 1
         if q < 0 or not lines[q].strip().endswith("?"):
             continue
         prompt = lines[q].strip()
@@ -14311,6 +14553,8 @@ def parse_pane_prompt(cap, face=False):
             if not text:
                 continue         # a blank never closes the block (the TUI puts
                                  # one between a dialog's title and its body)
+            if PANE_PROMPT_EDGE_RE.match(line):
+                break            # the bottom area's top edge: transcript above
             if PANE_PROMPT_RULE_RE.match(line):
                 if block:
                     break        # the rule fencing the block we just collected
@@ -14319,6 +14563,9 @@ def parse_pane_prompt(cap, face=False):
         detail = block[:PANE_PROMPT_DETAIL_LINES]
         detail.reverse()
         block.reverse()
+        # The subtitle is the dialog's own context, read after the block.
+        detail += subtitle
+        block += subtitle
         # The dialog's identity (XERK-1831): a digest of everything uncut — the
         # question, the whole block above it and the option labels (never the
         # ❯ cursor, which arrow keys move). `detail` is a capped window, so two
@@ -14349,11 +14596,18 @@ def _pane_status(tmux_name, state):
     mode/prompt then read THAT fresher one.
 
     Live background agents are deliberately NOT read here — see
-    _scan_agent_entry for why the pane cannot answer that question."""
+    _scan_agent_entry for why the pane cannot answer that question.
+
+    Whether ANY dialog owns the pane (`_pane_blocking_dialog`, which also covers
+    the ones that never become a `panePrompt`) is left on `state["paneDialog"]`,
+    so the tuple every caller (and test double) unpacks keeps its shape."""
     if not tmux_name:
+        state["paneDialog"] = False
         return None, None, None
     busy, cap = _stable_pane_busy_from(tmux_name, state, _capture_pane(tmux_name))
-    return busy, parse_pane_mode(cap), parse_pane_prompt(cap, face=True)
+    prompt = parse_pane_prompt(cap, face=True)
+    state["paneDialog"] = bool(prompt) or _pane_blocking_dialog(cap)
+    return busy, parse_pane_mode(cap), prompt
 
 
 # --- the permission ledger (XERK-1563) ---------------------------------------
@@ -17417,6 +17671,56 @@ def _clear_leftover(tmux_name, epoch):
     return None
 
 
+def _capture_pane_styled(tmux_name):
+    """The pane with its SGR escapes kept (`capture-pane -e`), or None when
+    it can't be captured — or on Windows, whose grid capture carries no
+    attributes."""
+    if IS_WINDOWS or not tmux_name:
+        return None
+    try:
+        out = subprocess.run(
+            _tmux("capture-pane", "-p", "-e", "-t", _tmux_pane(tmux_name),
+                  name=tmux_name),
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+# A dim span (SGR 2) up to the next reset — how Claude Code draws the empty
+# composer's placeholder ('Try "how does <filepath> work?"', 2.1.306).
+_DIM_SPAN_RE = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)")
+
+
+def _composer_holds_text(styled):
+    """Whether a styled capture's composer may hold typed text: False only
+    when an EMPTY box (or one showing just the dim placeholder) is seen
+    between its two rules; True for a draft, and also whenever the box can't
+    be read whole — a short pane draws only the top rule and the draft's last
+    rows (≤ ~11 rows), the rule alone (≤ 5) or no rule at all (≤ 3), and an
+    empty box looks the same as a draft there (XERK-2157 QA). None only when
+    there is no capture."""
+    if styled is None:
+        return None
+    lines = styled.splitlines()
+    plain = [_ANSI_RE.sub("", line) for line in lines]
+    rules = [i for i, line in enumerate(plain) if _COMPOSER_RULE_RE.match(line)]
+    if len(rules) < 2:
+        return True
+    rows = lines[rules[-2] + 1:rules[-1]]
+    text = "".join(_ANSI_RE.sub("", _DIM_SPAN_RE.sub("", row)) for row in rows)
+    return bool(text.replace("❯", "").replace("\xa0", "").strip())
+
+
+def _composer_blocks_switch(styled):
+    """Whether set_model must wait for the composer: it may hold a draft, or
+    (on tmux) it could not be captured at all. Windows' grid capture carries no
+    styling to read (None), so there it keeps the old behaviour and goes on."""
+    holds = _composer_holds_text(styled)
+    return bool(holds) or (holds is None and not IS_WINDOWS)
+
+
 def _composer_rows(cap):
     """The composer's rows as drawn (between the last two rules), or None."""
     if not cap:
@@ -18356,19 +18660,87 @@ def _trust_dialog_up(cap):
     return False
 
 
+# How many trailing non-blank lines `_hint_dialog_up` reads: the key-hint footer
+# wrapped on a narrow pane — the picker at 40 columns ("… · Esc" / "to cancel"),
+# the elicitation's four-item footer onto five lines at 20 — plus one spare.
+_DIALOG_HINT_LINES = 6
+
+
+def _hint_dialog_up(cap):
+    """Whether the pane's bottom is an overlay dialog's key-hint footer.
+
+    Claude Code draws a set of dialogs that `parse_pane_prompt` and
+    `_trust_dialog_up` both miss, and every other read calls an idle composer
+    (no interrupt hint, no mode footer, no 1..N run). Captured on 2.1.306:
+      * the native AskUserQuestion picker — a description line sits under each
+        option, so there is no contiguous numbered run. ask.py keeps it off the
+        pane until its wait times out; then a typed digit picks an option and
+        an Enter answers with the highlighted one;
+      * an MCP elicitation form ("MCP server "x" requests your input") — fields,
+        Accept/Decline buttons, nothing numbered;
+      * the "New MCP server found in this project" approval — bare options whose
+        default disables the server on Enter;
+      * the /model picker (rows numbered, but with no question line above).
+    What they share is their LAST line: a `·`-separated key-hint list carrying
+    "Esc to cancel" ("Enter to select · ↑/↓ to navigate · Esc to cancel"). The
+    numbered permission dialog ends the same way ("Esc to cancel · Tab to
+    amend"), as does the trust modal.
+
+    Never wording alone (agent.md): the item must be the bottom of the screen,
+    where only the TUI's own chrome lives while it runs — conversation text,
+    tool output and `!` output all draw ABOVE the composer — and no composer
+    footer (Claude's mode marker, qwen's) may be among those lines. A whole
+    `·`-item must read "Esc to cancel", so qwen's busy spinner "(… · esc to
+    cancel)" is not one."""
+    if not cap:
+        return False
+    lines = [_PANE_SCROLLBAR_RE.sub("", line).strip()
+             for line in _ANSI_RE.sub("", cap).splitlines()]
+    # Only what sits below the last rule: a dialog's footer is never split by
+    # one, while the composer is boxed in rules — so a footer-replacing toast
+    # ("Press Ctrl-C again to exit", which hides the mode marker) cannot reach
+    # back past the composer to a reply line that quotes the footer.
+    last_rule = max((i for i, line in enumerate(lines)
+                     if line and PANE_PROMPT_RULE_RE.match(line)), default=-1)
+    tail = [line for line in lines[last_rule + 1:] if line][-_DIALOG_HINT_LINES:]
+    joined = " ".join(tail)
+    if not tail or PANE_MODE_RE.search(joined) or QWEN_PANE_FOOTER_RE.search(joined):
+        return False
+    # Each line's own items, plus the seam a wrap makes: the last item of one
+    # line run on into the first of the next. Joining the lines whole would glue
+    # the text above the footer ("Accept  Decline") onto its first item.
+    items, prev = [], None
+    for line in tail:
+        parts = line.split("·")
+        items.extend(parts)
+        if prev is not None:
+            items.append(prev + " " + parts[0])
+        prev = parts[-1]
+    return any(" ".join(item.split()).lower() == "esc to cancel" for item in items)
+
+
 def _pane_blocking_dialog(cap):
     """Whether ANY dialog owns this pane's keyboard, so nothing may type into it.
 
-    ONE predicate for the two shapes, rather than each caller re-deriving it:
+    ONE predicate for the three shapes, rather than each caller re-deriving it:
       * the numbered choice dialog `parse_pane_prompt` reads (tool permission,
         plan approval) — answered by typing a digit;
       * the trust-folder modal `_trust_dialog_up` reads — arrow-driven, invisible
-        to every other pane read, and fatal to the session if Entered (XERK-868).
-    Keeping the second OUT of `parse_pane_prompt` is deliberate: `panePrompt` is
-    a wire contract whose options the chat page renders as clickable digits, and
-    the trust modal has no digit to click — surfacing it there would offer the
-    operator a button that does nothing."""
-    return bool(parse_pane_prompt(cap)) or _trust_dialog_up(cap)
+        to every other pane read, and fatal to the session if Entered (XERK-868);
+      * any other overlay dialog, read off its key-hint footer
+        (`_hint_dialog_up`: the native AskUserQuestion picker, an MCP
+        elicitation, the project MCP-server approval — XERK-2142);
+      * the /model picker's "Switch model?" confirm, which has no footer at
+        all (`parse_model_switch_confirm`, XERK-2157): an Enter or a typed
+        "1" answers Yes.
+    Keeping the last two OUT of `parse_pane_prompt` is deliberate: `panePrompt`
+    is a wire contract whose options the chat page renders as clickable digits,
+    and these have no digit to click (or, for the picker, digits that a
+    free-text row and a multi-question tab bar make unsafe to offer) —
+    surfacing them there would offer the operator a button that does nothing."""
+    return (bool(parse_pane_prompt(cap)) or _trust_dialog_up(cap)
+            or _hint_dialog_up(cap)
+            or parse_model_switch_confirm(cap) is not None)
 
 
 def _answer_trust_dialog(tmux_name, cap=None):
@@ -19205,19 +19577,22 @@ def turn_state_stopped(session_id, claude_sid):
     return bool(data) and data.get("stopped") is True
 
 
-def fold_turn_state(report, turn):
+def fold_turn_state(report, turn, dialog=False):
     """Fold the bridge mod's turn signal into `report["paneBusy"]`, in place.
 
     It only ever RAISES the read to busy, never lowers it: the pane also shows
     busy for work that is no model turn (a compaction, a `!` command), and the
     pane stays the source for everything else it reads. It is skipped while a
-    blocking dialog is up (`panePrompt`) — the turn is technically running then,
-    but every consumer reads that dialog as the session waiting on a person — and
+    blocking dialog is up (`panePrompt`, or `dialog`: one that never becomes a
+    panePrompt, like an MCP elicitation, XERK-2142) — the turn is technically
+    running then, but every consumer reads that dialog as the session waiting on
+    a person — and
     over a pane that reads idle once the transcript has been quiet for
     TURN_STATE_QUIET_SEC, so a lost turn.complete cannot hold a session busy.
     That bound holds over a pane that could not be read (None) too: a capture
     failing every beat must not make a stale "running" permanent."""
-    if turn is not True or report.get("paneBusy") is True or report.get("panePrompt"):
+    if (turn is not True or report.get("paneBusy") is True
+            or report.get("panePrompt") or dialog):
         return
     age = report.get("transcriptAgeSec")
     if age is None or age >= TURN_STATE_QUIET_SEC:
@@ -19300,6 +19675,152 @@ def _commit_messages(repo, shas):
     return parts if len(parts) == len(shas) else None
 
 
+def _forge_commit(sha, name, email, date, message, cut=False):
+    """One PR commit as the forge lists it, shaped like `_commit_messages`: the
+    sha, `"<name> <<email>> <epoch>"` (lowercased) and the stripped message.
+    `cut` = the forge truncated the message (ADO's `commentTruncated`), so it
+    can only be compared as a prefix. None for an entry missing a field."""
+    ms = _ts_ms(date)
+    if not (isinstance(sha, str) and isinstance(name, str) and isinstance(email, str)
+            and isinstance(message, str) and ms is not None):
+        return None
+    return {"sha": sha.lower(), "head": f"{name} <{email}> {ms // 1000}".lower(),
+            "msg": message.replace("\r\n", "\n").strip(), "cut": bool(cut)}
+
+
+def _forge_pr_commits(pr_url):
+    """A GitLab MR's or Azure DevOps PR's commits from its forge's API, in the
+    forge's order, the base the forge itself names, and whether that base holds
+    on every path — or None when this host cannot read them (not this host's
+    GitLab/ADO, an API failure, a malformed entry). Asks for one past the cap
+    where the API allows; GitLab pages at 100, so a full page reads as over.
+    ADO pages by a continuation header this reader never sees, so a short page
+    is caught by the named base, not here.
+
+    ADO names `lastMergeTargetCommit`, the target's head the completion rebased
+    onto: a real squash's parent and merge's first parent both equal it, so it
+    holds on every path. GitLab names `diff_refs.start_sha`, the target's head
+    when the MR's diff was last taken: after a fast-forward it equals merge~N
+    (78 of 78 real fast-forwarded MRs, XERK-2156), but a squash GitLab rebased
+    at merge keeps an older one, so a squash's is not held to it. A GitLab MR
+    that does not read (or names no start) is held to a None target: it fails."""
+    target, every_path = None, False
+    if MR_URL_RE.fullmatch(pr_url):
+        parts = _mr_url_parts(pr_url)
+        if not parts:
+            return None
+        proj, iid = parts
+        data = _gitlab_get(f"projects/{urllib.parse.quote(proj, safe='')}/merge_requests/"
+                           f"{iid}/commits?per_page=100")
+        if not isinstance(data, list):
+            return None
+        out = [_forge_commit(c.get("id"), c.get("author_name"), c.get("author_email"),
+                             c.get("authored_date"), c.get("message"))
+               if isinstance(c, dict) else None for c in data]
+        if len(data) >= 100 and None not in out:
+            out.append({})               # a full page may not be all: read as over the cap
+        mr = _gitlab_get(f"projects/{urllib.parse.quote(proj, safe='')}/merge_requests/{iid}")
+        refs = mr.get("diff_refs") if isinstance(mr, dict) else None
+        start = refs.get("start_sha") if isinstance(refs, dict) else None
+        if isinstance(start, str) and SHADOW_SHA_RE.fullmatch(start.lower()):
+            target = start.lower()
+        every_path = not (isinstance(mr, dict) and mr.get("squash_commit_sha"))
+    elif AZDO_PR_URL_RE.fullmatch(pr_url):
+        pr_id = _azdo_pr_id(pr_url)
+        info = _azdo_fetch_pr(pr_url) if pr_id else None
+        ref = _AZDO_PR_REF.get(pr_url) if info is not None else None
+        tgt = info.get("lastMergeTargetCommit") if info is not None else None
+        target = tgt.get("commitId") if isinstance(tgt, dict) else None
+        if not ref or not isinstance(target, str) or not SHADOW_SHA_RE.fullmatch(target.lower()):
+            return None
+        target, every_path = target.lower(), True
+        proj, rid = ref
+        data = _azure_get(
+            f"/{urllib.parse.quote(proj, safe='')}/_apis/git/repositories/"
+            f"{urllib.parse.quote(rid, safe='')}/pullRequests/{pr_id}/commits",
+            {"$top": SHADOW_PR_COMMITS_MAX + 1})
+        data = data.get("value") if isinstance(data, dict) else None
+        if not isinstance(data, list):
+            return None
+        out = []
+        for c in data:
+            a = c.get("author") if isinstance(c, dict) else None
+            a = a if isinstance(a, dict) else {}
+            out.append(_forge_commit(c.get("commitId"), a.get("name"), a.get("email"),
+                                     a.get("date"), c.get("comment"),
+                                     c.get("commentTruncated") is True)
+                       if isinstance(c, dict) else None)
+    else:
+        return None
+    return None if None in out else (out, target, every_path)
+
+
+def _forge_commits_landed(pr, landed, landed_msgs):
+    """Whether the forge's PR commits ARE the `landed` first-parent commits
+    (newest first), in either listing order: by sha (a fast-forward), else by
+    author, author time and message (a rebase that rewrote them)."""
+    for seq in (pr, pr[::-1]):
+        if [c["sha"] for c in seq] == landed:
+            return True
+        if landed_msgs and all(_forge_commit_matches(c, m) for c, m in zip(seq, landed_msgs)):
+            return True
+    return False
+
+
+def _forge_commit_matches(c, landed_msg):
+    head, _, msg = landed_msg.partition("\n")
+    msg = msg.strip()
+    if head.lower() != c["head"]:
+        return False
+    return msg.startswith(c["msg"]) if c["cut"] else msg == c["msg"]
+
+
+def _forge_rebase_base(repo, merge, parent, pr_url):
+    """`shadow_base_commit` for a GitLab MR or ADO PR (XERK-2146): their head
+    refs are not GitHub's, so the PR's commits come from the forge's API. When
+    the N first-parent commits ending at the single-parent merge are the PR's N
+    commits — the same shas (GitLab fast-forward) or the same authors, author
+    times and messages (a rebase that rewrote them) — the base is merge~N; a
+    squash or a one-commit PR keeps the first parent. The base the forge names
+    must agree — on every path but a GitLab squash, whose named base is stale —
+    so a short or stale list that does not line up is caught there instead of
+    guessed."""
+    try:
+        got = _forge_pr_commits(pr_url)
+    except Exception as e:               # on the beat: a refusal, never a raise
+        log(f"shadow base: reading {pr_url[:200]} failed: {e}")
+        got = None
+    if got is None:
+        return None, "could not list the PR's commits from its forge to find its base"
+    pr, target, every_path = got
+    if len(pr) > SHADOW_PR_COMMITS_MAX:
+        return None, f"the PR has over {SHADOW_PR_COMMITS_MAX} commits"
+    if not pr:
+        return None, "the forge lists no commits for the PR"
+    base, why = _forge_placed_base(repo, merge, parent, pr)
+    if base and every_path and base != target:
+        return None, "the PR's commits do not reach the base its forge names"
+    return base, why
+
+
+def _forge_placed_base(repo, merge, parent, pr):
+    git = ["git", "-C", repo]
+    if len(pr) == 1:
+        return parent, None
+    rc, out = run_out(git + ["rev-list", "--first-parent", f"--max-count={len(pr)}",
+                             merge, "--"])
+    landed = out.lower().split() if rc == 0 else []
+    if len(landed) != len(pr):
+        return parent, None
+    if not _forge_commits_landed(pr, landed, _commit_messages(repo, landed)):
+        return parent, None              # a squash (or not a clean rebase)
+    base = run(git + ["rev-parse", "--verify", "--quiet",
+                      f"{merge}~{len(pr)}^{{commit}}"]).lower()
+    if not SHADOW_SHA_RE.fullmatch(base):
+        return None, "the rebase-merged PR's base is not in this clone"
+    return base, None
+
+
 def shadow_base_commit(repo, merge, pr_url, shadow_id):
     """Fetch, then find the code as it was before the PR landed: `(base, None)`,
     or `(None, why)` when it cannot be placed (XERK-2136).
@@ -19314,7 +19835,8 @@ def shadow_base_commit(repo, merge, pr_url, shadow_id):
     No readable head, no PR commits off the default branch, or too many → fails.
     Residual: a rebase that does not line up (a commit dropped as already
     applied) reads as a squash and keeps the first parent, as before this.
-    A non-GitHub URL keeps the first parent."""
+    A GitLab MR or ADO PR is placed from its forge's commit list instead
+    (`_forge_rebase_base`, XERK-2146); any other URL keeps the first parent."""
     git = ["git", "-C", repo]
     num = PR_URL_PARTS_RE.search(pr_url) if PR_URL_RE.fullmatch(pr_url or "") else None
     pr_ref = f"refs/turma-shadow-pr/{shadow_id}" if num else None
@@ -19338,7 +19860,11 @@ def shadow_base_commit(repo, merge, pr_url, shadow_id):
         parents = line[1:]
         if not parents:
             return None, "the merge commit has no parent"
-        if len(parents) > 1 or not pr_ref:
+        if len(parents) > 1:
+            return parents[0], None
+        if not pr_ref:
+            if MR_URL_RE.fullmatch(pr_url) or AZDO_PR_URL_RE.fullmatch(pr_url):
+                return _forge_rebase_base(repo, merge, parents[0], pr_url)
             return parents[0], None
         head = run(git + ["rev-parse", "--verify", "--quiet", f"{pr_ref}^{{commit}}"]).lower()
         if not SHADOW_SHA_RE.fullmatch(head):
@@ -19825,6 +20351,13 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # suppresses the busy hint — so without this read the session looks idle
         # while it waits on a human. See parse_pane_prompt.
         "panePrompt": pane_prompt,
+        # Whether ANY dialog owns the pane's keyboard (`_pane_status` leaves it on
+        # `state["paneDialog"]`), including the ones that never become a
+        # panePrompt: the AskUserQuestion picker, an MCP elicitation or server
+        # approval, the /model picker (XERK-2142). Input aimed at the pane is HELD
+        # while one is up, so the hub reads it as the session waiting on the
+        # operator in the terminal (XERK-2152). False when it can't tell.
+        "paneDialog": state.get("paneDialog") is True,
         # The background agents this session has in flight, [{type, label}]
         # (empty when none), derived from the transcript's own launch/stop edges
         # — see _scan_agent_entry. The OTHER thing paneBusy cannot see: a session
@@ -19878,7 +20411,8 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # The bridge mod's turn signal (XERK-2131): Claude sessions only — dsh
         # and qwen load no Claude mod, and dsh's paneBusy is its socket's.
         if agent_type in (None, "", "claude"):
-            fold_turn_state(report, read_turn_state(session_id, claude_sid))
+            fold_turn_state(report, read_turn_state(session_id, claude_sid),
+                            dialog=state.get("paneDialog") is True)
         # Every beat, not just the one that judged it: if that beat raised,
         # the record would otherwise never latch qaPartial (XERK-1857).
         if state.get("qaComplete") is False:
@@ -21855,14 +22389,76 @@ def _azure_item_url(base, project, wid):
 # ADO's portfolio (organizer) levels: Epic and Feature sit above the backlog
 # items (User Story / PBI / Bug / Task) the way a Jira Epic does, so both map to
 # XERK-634's `isEpic` — an organizer, never a work session (XERK-1444). Matched
-# by name, case-insensitively; a custom portfolio level with another name is
-# not recognised.
+# by name, case-insensitively. The English names are only the FLOOR: a localized
+# process names them otherwise and a custom portfolio level ("Initiative") is
+# named by its operator, so each project's own portfolio types are read from its
+# process configuration and added (XERK-1888). A miss fails OPEN onto the
+# auto-start/auto-merge stream, so the two are unioned, never one instead.
 _AZDO_EPIC_TYPES = frozenset({"epic", "feature"})
 
+# (siteKey, project) -> (frozenset of lowercased portfolio type names, expiry).
+# Filled by the board poll's worker (`_azure_note_portfolio`), only READ by the
+# shaper, so the on-demand detail on the beat never adds a request. An empty or
+# failed read is held AZDO_META_RETRY_SEC and adds nothing.
+_AZDO_PORTFOLIO_CACHE = {}
+_AZDO_PORTFOLIO_CACHE_MAX = 500
 
-def _azure_is_epic_type(wtype):
+
+def _azure_note_portfolio(site_key, projects):
+    """Read each project's portfolio work-item types (process configuration)
+    into _AZDO_PORTFOLIO_CACHE. Best-effort per project, never raises; a failed
+    read keeps a still-good earlier answer rather than forgetting it."""
+    now = time.time()
+    for project in sorted({p for p in projects if isinstance(p, str) and p}):
+        ck = (site_key, project)
+        hit = _AZDO_PORTFOLIO_CACHE.get(ck)
+        if hit is not None and now < hit[1]:
+            continue
+        names = frozenset()
+        try:
+            data = azure_req(
+                f"/{urllib.parse.quote(project)}/_apis/work/processconfiguration", {})
+            names = frozenset(
+                wt["name"].strip().lower()
+                for b in (data.get("portfolioBacklogs") or []) if isinstance(b, dict)
+                for wt in (b.get("workItemTypes") or [])
+                if isinstance(wt, dict) and isinstance(wt.get("name"), str)
+                and wt["name"].strip())
+        except Exception as e:
+            if hit is None or hit[0]:
+                log(f"azure portfolio levels fetch failed for {project}: {e}")
+        if not names and hit is not None and hit[0]:
+            names = hit[0]      # keep the last good answer through a blip
+        if len(_AZDO_PORTFOLIO_CACHE) >= _AZDO_PORTFOLIO_CACHE_MAX and ck not in _AZDO_PORTFOLIO_CACHE:
+            _AZDO_PORTFOLIO_CACHE.clear()
+        _AZDO_PORTFOLIO_CACHE[ck] = (
+            names, now + (AZDO_META_TTL_SEC if names else AZDO_META_RETRY_SEC))
+
+
+def _azure_portfolio_names(site_key, project=None):
+    """The portfolio type names for one project (its process may differ from a
+    sibling's, so a name that is a level THERE is not one HERE). With no project
+    to judge by, or one whose levels have not been read, every project of the
+    org is unioned — erring toward organizer, the safe side of the auto-merge
+    gate."""
+    if project is not None and not (_AZDO_PORTFOLIO_CACHE.get((site_key, project))
+                                    or (frozenset(),))[0]:
+        project = None      # its levels are not read (yet): the union, not the floor
+    out = set(_AZDO_EPIC_TYPES)
+    for (sk, pr), (names, _exp) in list(_AZDO_PORTFOLIO_CACHE.items()):
+        if sk == site_key and (project is None or pr == project):
+            out |= names
+    return out
+
+
+def _azure_is_epic_type(wtype, site_key=None, project=None):
     """True when a System.WorkItemType names an ADO portfolio level. Total."""
-    return isinstance(wtype, str) and wtype.strip().lower() in _AZDO_EPIC_TYPES
+    if not isinstance(wtype, str):
+        return False
+    names = (_azure_portfolio_names(site_key, project if isinstance(project, str)
+                                    and project else None)
+             if site_key else _AZDO_EPIC_TYPES)
+    return wtype.strip().lower() in names
 
 
 def _shape_azure_item(wi, site_key, base, parent_types=None):
@@ -21886,9 +22482,10 @@ def _shape_azure_item(wi, site_key, base, parent_types=None):
     labels = [t.strip() for t in str(tags).split(";") if t.strip()] if tags else []
     parent = f.get("System.Parent")
     parent_key = str(parent) if parent is not None else None
-    is_epic = _azure_is_epic_type(wtype)
+    is_epic = _azure_is_epic_type(wtype, site_key, project)
     parent_is_epic = bool(parent_key) and _azure_is_epic_type(
-        (parent_types or {}).get(parent_key))
+        (parent_types or {}).get(parent_key), site_key,
+        _AZDO_PARENT_PROJECT_CACHE.get(parent_key))
     return {
         "key": key,
         "url": _azure_item_url(base, project, key),
@@ -21942,27 +22539,38 @@ def _azure_batch_get(ids, fields):
 # be enough to do that (XERK-1444). Bounded: cleared when it outgrows the cap.
 _AZDO_PARENT_TYPE_CACHE = {}
 _AZDO_PARENT_TYPE_CACHE_MAX = 5000
+# work item key -> System.TeamProject, for the items above, so a parent is judged
+# by ITS project's portfolio levels (XERK-1888); unknown = the org-wide union.
+_AZDO_PARENT_PROJECT_CACHE = {}
 
 
-def _remember_azure_types(types):
+def _remember_azure_types(types, projects=None):
     fresh = {k: v for k, v in types.items() if isinstance(v, str)}
     if len(_AZDO_PARENT_TYPE_CACHE.keys() | fresh.keys()) > _AZDO_PARENT_TYPE_CACHE_MAX:
         _AZDO_PARENT_TYPE_CACHE.clear()
     _AZDO_PARENT_TYPE_CACHE.update(fresh)
+    fresh_p = {k: v for k, v in (projects or {}).items() if isinstance(v, str) and v}
+    if len(_AZDO_PARENT_PROJECT_CACHE.keys() | fresh_p.keys()) > _AZDO_PARENT_TYPE_CACHE_MAX:
+        _AZDO_PARENT_PROJECT_CACHE.clear()
+    _AZDO_PARENT_PROJECT_CACHE.update(fresh_p)
 
 
-def _azure_parent_types(parent_ids, known=None):
+def _azure_parent_types(parent_ids, known=None, known_projects=None):
     """{parent key: System.WorkItemType} for `parent_ids`, GETting only the ones
     not already in `known` (the caller's own batch). Best-effort per chunk: a
     failed chunk falls back to the last-known types, else leaves those parents
     unknown (-> no epicKey) rather than losing the board."""
     types = dict(known or {})
+    projects = dict(known_projects or {})
     missing = sorted({str(p) for p in parent_ids if p is not None} - set(types))
     for i in range(0, len(missing), AZDO_BATCH):
         chunk = missing[i:i + AZDO_BATCH]
         try:
-            for wi in _azure_batch_get(chunk, ["System.Id", "System.WorkItemType"]):
-                types[str(wi["id"])] = (wi.get("fields") or {}).get("System.WorkItemType")
+            for wi in _azure_batch_get(
+                    chunk, ["System.Id", "System.WorkItemType", "System.TeamProject"]):
+                f = wi.get("fields") or {}
+                types[str(wi["id"])] = f.get("System.WorkItemType")
+                projects[str(wi["id"])] = f.get("System.TeamProject")
         except Exception as e:
             log(f"azure parent-type fetch failed: {e}")
     # Fall back BEFORE remembering: a cap-overflow clear must not empty the
@@ -21970,18 +22578,25 @@ def _azure_parent_types(parent_ids, known=None):
     for k in missing:
         if types.get(k) is None and k in _AZDO_PARENT_TYPE_CACHE:
             types[k] = _AZDO_PARENT_TYPE_CACHE[k]
-    _remember_azure_types(types)
+    _remember_azure_types(types, projects)
     return types
 
 
 def fetch_azure_items(ids, site_key, base):
     """Batch-GET work items by id, shaped. Parents outside the batch get one
-    extra type-only GET so an Epic/Feature parent sets `epicKey` (XERK-1444)."""
+    extra type-only GET so an Epic/Feature parent sets `epicKey` (XERK-1444),
+    and each project's portfolio levels are read (cached) first (XERK-1888)."""
     raw = _azure_batch_get(ids, _AZDO_LIST_FIELDS)
     known = {str(wi["id"]): (wi.get("fields") or {}).get("System.WorkItemType")
              for wi in raw}
-    parent_types = _azure_parent_types(
-        [(wi.get("fields") or {}).get("System.Parent") for wi in raw], known)
+    known_projects = {str(wi["id"]): (wi.get("fields") or {}).get("System.TeamProject")
+                      for wi in raw}
+    parent_ids = [(wi.get("fields") or {}).get("System.Parent") for wi in raw]
+    parent_types = _azure_parent_types(parent_ids, known, known_projects)
+    # Every project an item OR its parent lives in: a parent in a project no
+    # assigned item lives in has its own process, read too.
+    _azure_note_portfolio(site_key, list(known_projects.values()) + [
+        _AZDO_PARENT_PROJECT_CACHE.get(str(p)) for p in parent_ids if p is not None])
     return [_shape_azure_item(wi, site_key, base, parent_types) for wi in raw]
 
 
@@ -24187,12 +24802,27 @@ MODEL_PICKER_WAIT_SEC = 0.3
 MODEL_PICKER_MAX_STEPS = 12
 MODEL_STEP_TRIES = 8
 MODEL_STEP_WAIT_SEC = 0.12
-MODEL_CONFIRM_TRIES = 10
+MODEL_CONFIRM_TRIES = 15
 MODEL_CONFIRM_WAIT_SEC = 0.2
 # What the TUI prints once a picker selection lands (session-only or saved
-# default) or is dismissed on the current model. Either wording proves the
-# picker acted and closed.
-MODEL_CONFIRM_RE = re.compile(r"Set model to\s+.+|Kept model as\s+.+")
+# default) or is dismissed on the current model: "Set model to Sonnet 5.5 for
+# this session only" / "Kept model as …". The name is the picker row's label,
+# or "Opus 5.5 (default)" for the Default row (2.1.306). A narrow pane wraps
+# the line, the name included, so `_model_set_names` joins it back up.
+MODEL_SET_LINE_RE = re.compile(r"(?:Set model to|Kept model as)(?:\s+(.*))?$")
+_MODEL_SET_TAIL_RE = re.compile(
+    r"\s+(?:for this session only|and saved as your default)\b")
+# Claude Code's "Switch model?" confirm, drawn after `s` when the conversation
+# is cached for the current model (2.1.306, XERK-2157): a cost warning, then
+# "❯ 1. Yes, switch to <name>" and "2. No, go back" as the pane's last lines.
+# It has no "Esc to cancel" footer and no question line right above its
+# options, so no other pane read sees it. Esc goes back to the picker. Under
+# ~23 columns option 1 wraps after "switch" and at 20 drops the space after
+# "1." ("❯ 1.Yes, switch" / "to Haiku 5.5"), so its lines are joined first.
+MODEL_SWITCH_YES_START_RE = re.compile(r"^(?:❯\s*)?1\.\s*Yes\b")
+MODEL_SWITCH_YES_RE = re.compile(
+    r"^(?:❯\s*)?1\.\s*Yes,\s*switch\s+to\b\s*(.*)$")
+MODEL_SWITCH_BACK_RE = re.compile(r"^(?:❯\s*)?2\.\s*No, go back$")
 # How set_mode's closed loop is bounded: more presses than any real cycle has
 # modes (a wrap back to the start stops it earlier), each press's readback
 # polled STEP_TRIES × STEP_WAIT.
@@ -24262,6 +24892,121 @@ def _picker_index_for(rows, resolved):
         if head == want:
             return i
     return None
+
+
+def _pane_lines(text):
+    """A capture's lines, ANSI and qwen's scrollbar column stripped."""
+    return [_PANE_SCROLLBAR_RE.sub("", line).rstrip()
+            for line in _ANSI_RE.sub("", text or "").splitlines()]
+
+
+def parse_model_switch_confirm(text):
+    """The model a "Switch model?" confirm offers to switch to, or None when
+    the capture shows no such confirm ("" when its name can't be read).
+
+    Read by position, like the other overlay dialogs: the "2. No, go back"
+    option must be the pane's LAST non-blank line (nothing a conversation
+    prints sits below the composer), "1. Yes, switch to …" above it (its name
+    wrapped onto the lines between on a narrow pane), and the "Switch model?"
+    heading above that, with no rule in between."""
+    lines = [line.strip() for line in _pane_lines(text)]
+    filled = [i for i, line in enumerate(lines) if line]
+    if not filled or not MODEL_SWITCH_BACK_RE.match(lines[filled[-1]]):
+        return None
+    back = filled[-1]
+    for yes in range(back - 1, max(-1, back - 5), -1):
+        if MODEL_SWITCH_YES_START_RE.match(lines[yes]):
+            break
+    else:
+        return None
+    m = MODEL_SWITCH_YES_RE.match(" ".join(lines[yes:back]))
+    if not m:
+        return None
+    for i in range(yes - 1, -1, -1):
+        if lines[i] == "Switch model?":
+            return " ".join(m.group(1).split())
+        if lines[i] and PANE_PROMPT_RULE_RE.match(lines[i]):
+            return None
+    return None
+
+
+def _model_set_lines(text):
+    """Each "Set model to …"/"Kept model as …" line on the pane, top to bottom,
+    as (name, settled): its wrapped continuation joined back on, and whether no
+    conversation row follows it — nothing but the composer and its chrome, as
+    right after the switch that printed it."""
+    lines = _pane_lines(text)
+    found = []
+    for i, line in enumerate(lines):
+        m = MODEL_SET_LINE_RE.search(line)
+        if not m:
+            continue
+        rest = (m.group(1) or "").strip()
+        for nxt in lines[i + 1:i + 6]:
+            if _MODEL_SET_TAIL_RE.search(" " + rest):
+                break
+            # A continuation is indented text; a blank line, a rule, the next
+            # row's glyph ("❯", "⎿", "●") or the right-aligned effort line
+            # ("◐ medium · /effort") ends the line.
+            more = nxt.strip()
+            if (not more or not nxt[:1].isspace() or more[0] in "❯⎿●✻─"
+                    or "/effort" in more):
+                break
+            rest += " " + more
+        tail = _MODEL_SET_TAIL_RE.search(" " + rest)
+        name = " ".join((" " + rest)[:tail.start()].split() if tail else rest.split())
+        # A row after it: an assistant/turn line ("●", "✻" at column 0 — the
+        # right-aligned effort line is indented), a tool result ("⎿"), or a
+        # prompt with text. The composer's own "❯" is empty after a switch.
+        settled = not any(
+            nxt[:1] in ("●", "✻") or nxt.strip().startswith("⎿")
+            or (nxt[:1] == "❯" and nxt[1:].strip())
+            for nxt in lines[i + 1:])
+        found.append((name, settled))
+    return found
+
+
+def _model_set_names(text):
+    """The model named by each "Set model to …"/"Kept model as …" line."""
+    return [name for name, _ in _model_set_lines(text)]
+
+
+def _model_switch_landed(before, after, label):
+    """Whether `after` shows a NEW line naming the picker row `label`, against
+    the pane `before` the picker opened: more such lines than before, or one
+    settled at the bottom where `before` had none. The second rule covers a
+    full screen, where the new line scrolls an older one off the top and the
+    count stays put (XERK-2157 QA); a line already settled there before is
+    the earlier switch's, so only a higher count proves a new one then."""
+    was, now = _model_set_lines(before), _model_set_lines(after)
+    count = lambda found: sum(_model_names_row(n, label) for n, _ in found)
+    if count(now) > count(was):
+        return True
+    if not now or not now[-1][1] or not _model_names_row(now[-1][0], label):
+        return False
+    return not (was and was[-1][1] and _model_names_row(was[-1][0], label))
+
+
+def _model_picker_open(cap):
+    """Whether the /model picker is drawn: its rows parse and the composer's
+    mode footer, which the picker hides, is not on screen. Its own key-hint
+    footer is not required — a narrow pane pushes it off-screen."""
+    return bool(parse_model_picker(cap)[0]
+                and not PANE_MODE_RE.search(_ANSI_RE.sub("", cap or "")))
+
+
+def _model_names_row(name, label):
+    """Whether a model name the TUI printed is the picker row `label`: the same
+    first word, as `_picker_index_for` picks rows, except that the Default row
+    is printed as "<model> (default)" and only it may be."""
+    words = (name or "").replace("✔", "").lower().split()
+    row = label.replace("✔", "").lower().split()
+    if not words or not row:
+        return False
+    is_default = words[-1] == "(default)"
+    if row[0] == "default":
+        return is_default or words[0] == "default"
+    return not is_default and words[0] == row[0]
 
 
 def clean_summary(raw):
@@ -25033,6 +25778,12 @@ class SessionManager:
         # Shadow runs (XERK-1847): id -> run record, persisted so a manager restart
         # keeps advancing (and reporting) a run whose sessions survive it.
         self.shadow_runs = self._load_shadow_runs()
+        # spawnShadows whose base is being placed off the beat (XERK-2167):
+        # id -> job; the worker adds `result`, the beat pops and launches it.
+        # In memory: a restart mid-placement loses the run, which the hub stops
+        # counting once it goes unreported (shadowsDispatchedSince).
+        self._shadow_placing = {}
+        self._shadow_place_lock = threading.Lock()
         self._epic_builders_lock = threading.Lock()
         # Staged {type:"mergePr"} outcomes (XERK-550: PR auto-merge) — each
         # {cmdId, url, ok, error}. Its writer is an OFF-BEAT worker thread
@@ -26657,7 +27408,8 @@ class SessionManager:
         Start back into. This is the count every capacity gate uses, so a crashed
         session no longer reads as free capacity the hub fills with fresh work.
         A paused sleeper's wake resume waiting on its worktree re-add (XERK-1575)
-        holds one too: that slot is the sleeper's.
+        holds one too: that slot is the sleeper's. So does a shadow run whose base
+        is being placed off the beat (XERK-2167): the hub sent it for a free slot.
 
         `exclude_id` drops one record from the tally — for `start()`, whose target
         is ALREADY an `error` record in this set: it is transitioning to `running`
@@ -26665,7 +27417,12 @@ class SessionManager:
         return sum(1 for s in self.registry
                    if s.get("status") in SLOT_HOLDING_STATUSES
                    and not (exclude_id is not None and s.get("id") == exclude_id)
-                   ) + self._restores_in_flight() + self._imports_reserved()
+                   ) + self._restores_in_flight() + self._imports_reserved() \
+            + self._shadows_placing()
+
+    def _shadows_placing(self):
+        with self._shadow_place_lock:
+            return len(self._shadow_placing)
 
     def _queued_count(self):
         return sum(1 for s in self.registry if s.get("status") == "queued")
@@ -29906,13 +30663,19 @@ class SessionManager:
         candidate model from the commit before the merged PR. Everything the hub
         names is re-checked here: this host's own org, a cloned repo, a commit
         that resolves. A refusal is a `failed` run on the report, never silence.
-        Runs on the beat like spawn_ticket (one bounded fetch + one issue read)."""
+
+        Only the cheap checks run here, on the beat. Placing the base (one
+        bounded fetch and, for a GitLab MR or ADO PR, two forge API reads), the
+        tree check and the issue read run on a worker (XERK-2167): together they
+        could hold the beat past OFFLINE_AFTER_MS on a slow forge. A later full
+        beat applies the result and launches (`_apply_shadow_placements`)."""
         rid = str(cmd.get("shadowId") or "")
         if not SHADOW_ID_RE.fullmatch(rid):
             log(f"spawnShadow with a bad id {rid[:40]!r} — ignored")
             return
-        if rid in self.shadow_runs:
-            return   # a re-delivered command
+        with self._shadow_place_lock:
+            if rid in self.shadow_runs or rid in self._shadow_placing:
+                return   # a re-delivered command
         if not MODEL_SHADOW:
             return self._fail_shadow(rid, cmd, "shadow runs are off on this host")
         sandbox = shadow_sandbox_reason()
@@ -29935,27 +30698,75 @@ class SessionManager:
         repo = next((r for r in scan_repos() if r["name"] == cmd.get("repo")), None)
         if not repo or not repo_forkable(repo["path"]):
             return self._fail_shadow(rid, cmd, "the repo is not cloned on this host")
-        # The code as it was before the PR landed: the merge's first parent, or
-        # merge~N for a rebase-merge of N commits (XERK-2136).
-        base, why = shadow_base_commit(repo["path"], merge, str(cmd.get("prUrl") or ""), rid)
-        if why:
-            return self._fail_shadow(rid, cmd, why)
-        tree = shadow_tree_reason(repo["path"], base)
-        if tree:
-            return self._fail_shadow(rid, cmd, f"shadow runs cannot sandbox this repo: {tree}")
+        job = {"rid": rid, "cmd": cmd, "key": key, "model": model, "merge": merge,
+               "repo": repo}
+        # Marked BEFORE the thread starts, so a re-delivery in this same batch
+        # is already a no-op.
+        with self._shadow_place_lock:
+            self._shadow_placing[rid] = job
         try:
-            detail = fetch_board_issue(key)
+            threading.Thread(target=self._place_shadow, args=(job,),
+                             name="shadow-place", daemon=True).start()
         except Exception as e:
-            return self._fail_shadow(rid, cmd, f"could not read the ticket: {e}")
+            with self._shadow_place_lock:
+                self._shadow_placing.pop(rid, None)
+            self._fail_shadow(rid, cmd, f"could not start the shadow worker: {e}")
+
+    def _place_shadow(self, job):
+        """Worker half of spawn_shadow (XERK-2167): the network and git reads.
+        Writes nothing but its own result, staged for the beat; never raises."""
+        res = {}
+        try:
+            repo, cmd = job["repo"], job["cmd"]
+            # The code as it was before the PR landed: the merge's first parent,
+            # or merge~N for a rebase-merge of N commits (XERK-2136).
+            base, why = shadow_base_commit(repo["path"], job["merge"],
+                                           str(cmd.get("prUrl") or ""), job["rid"])
+            if why:
+                res["error"] = why
+            else:
+                tree = shadow_tree_reason(repo["path"], base)
+                if tree:
+                    res["error"] = f"shadow runs cannot sandbox this repo: {tree}"
+                else:
+                    try:
+                        res.update(base=base, detail=fetch_board_issue(job["key"]))
+                    except Exception as e:
+                        res["error"] = f"could not read the ticket: {e}"
+        except Exception as e:
+            res = {"error": f"could not place the shadow's base: {e}"}
+        with self._shadow_place_lock:
+            job["result"] = res
+
+    def _apply_shadow_placements(self):
+        """Beat half of spawn_shadow (XERK-2167): launch ONE placed run per
+        beat — a launch is the same inline cost as a spawnTicket, so two would
+        stack on one beat. Full beats only. Never raises."""
+        try:
+            with self._shadow_place_lock:
+                job = next((j for j in self._shadow_placing.values()
+                            if "result" in j), None)
+                if job is None:
+                    return
+                self._shadow_placing.pop(job["rid"], None)
+            self._launch_shadow(job)
+        except Exception as e:
+            log(f"shadow placement failed: {e}")
+
+    def _launch_shadow(self, job):
+        rid, cmd, res = job["rid"], job["cmd"], job["result"]
+        if res.get("error"):
+            return self._fail_shadow(rid, cmd, res["error"])
+        key, model, base, repo = job["key"], job["model"], res["base"], job["repo"]
         not_before = cmd.get("notBefore")
         detail = _shadow_ticket_detail(
-            detail, not_before if isinstance(not_before, int) and not isinstance(not_before, bool)
-            else None)
+            res["detail"], not_before if isinstance(not_before, int)
+            and not isinstance(not_before, bool) else None)
         prompt = build_ticket_prompt(detail, [], session_cli=False)
         now = time.time()
         self.shadow_runs[rid] = {
             "id": rid, "siteKey": cmd["siteKey"], "issueKey": key, "repo": repo["name"],
-            "model": model, "mergeSha": merge, "baseSha": base,
+            "model": model, "mergeSha": job["merge"], "baseSha": base,
             "prUrl": str(cmd.get("prUrl") or "")[:500] or None, "state": "running",
             "startedAt": now, "phaseAt": now, "ticketText": prompt[:20000],
         }
@@ -33975,9 +34786,11 @@ class SessionManager:
         Escaped out of and logged — the record keeps the real model, and the
         heartbeat corrects the UI's optimistic guess.
 
-        Two reliability fixes ride along: the input line is cleared (C-u)
-        first, so a half-typed operator prompt can't fuse with the command into
-        garbage; and a FRESH busy read gates the whole thing — typed into a
+        Two reliability fixes ride along: a draft in the composer defers the
+        switch (XERK-2157) — typed onto, it would fuse with the command into a
+        submitted prompt, and it is the operator's, so it is never cleared —
+        while an empty composer still gets a C-u first; and a FRESH busy read
+        gates the whole thing — typed into a
         mid-turn pane the command would only be queued as a prompt, so it is
         refused (log-only) rather than misfired. Unlike interrupt(), which
         tolerates a stale idle read because Escape is harmless, this path types
@@ -34018,6 +34831,29 @@ class SessionManager:
             sess["pendingModel"] = arg
             self.save()
             log(f"set model of {sid} -> {arg}: turn in flight; deferred until idle")
+            return
+        before = _capture_pane(tmux_name)
+        if _pane_blocking_dialog(before):
+            # A dialog owns the keyboard: "/model" + Enter would answer it — an
+            # Enter on a permission dialog approves "1. Yes" (XERK-2142 QA).
+            # Deferred the same way; _apply_pending_switches waits it out too.
+            sess["pendingModel"] = arg
+            self.save()
+            log(f"set model of {sid} -> {arg}: a dialog is up; deferred until it closes")
+            return
+        if _composer_blocks_switch(_capture_pane_styled(tmux_name)):
+            # The operator has a draft in the composer. "/model" + Enter would
+            # submit it as a prompt with "/model" glued on, and clearing it
+            # first is no better: Ctrl+U kills only what is before the cursor
+            # (one row per two presses), so it either left text to submit or,
+            # retried each beat, ate the operator's edits (XERK-2157 QA). The
+            # draft is never touched — as `_type_into_pane` holds rather than
+            # clear one; the switch waits until the composer is empty. The dim
+            # placeholder is not a draft, but a box it can't read whole (a
+            # short pane) is treated as one (`_composer_holds_text`).
+            sess["pendingModel"] = arg
+            self.save()
+            log(f"set model of {sid} -> {arg}: a draft is in the composer; deferred")
             return
         sess.pop("pendingModel", None)
         _pane_send_keys(tmux_name, "C-u")
@@ -34069,12 +34905,16 @@ class SessionManager:
                 log(f"set model of {sid} -> {arg}: picker vanished mid-navigation")
                 self.save()
                 return
+        label = rows[cur]
+        # The confirmation must be NEW: a line from an earlier switch to the
+        # same model can still be on screen (XERK-2157 QA matched one), so it
+        # is judged against the pane as it was before the picker opened.
         _pane_send_keys(tmux_name, "s", literal=True)
         # The record updates only on the TUI's own confirmation — "Set model
         # to X for this session only" (or "Kept model as X" when the row was
         # already current). Unconfirmed, the record keeps the old value and the
         # transcript scan's modelActual settles what the chip shows either way.
-        if self._await_model_confirmation(tmux_name):
+        if self._await_model_confirmation(tmux_name, label, before):
             sess["model"] = resolved
             self.save()
             log(f"set model of {sid} -> {arg} (session only, confirmed)")
@@ -34097,15 +34937,56 @@ class SessionManager:
                 return rows, cur
         return rows, cur
 
-    def _await_model_confirmation(self, tmux_name):
-        """Whether the picker's selection visibly landed: poll for the TUI's
-        own "Set model to…"/"Kept model as…" line (MODEL_CONFIRM_RE)."""
+    def _await_model_confirmation(self, tmux_name, label, before):
+        """Whether the picker's selection of row `label` visibly landed: poll
+        for a NEW "Set model to…"/"Kept model as…" line naming that row
+        (`_model_switch_landed` against the pane `before` the picker opened).
+
+        On a session with history Claude Code first asks "Switch model?" (the
+        cache re-read warning). It is answered Yes here: the operator's pick in
+        the UI already chose the switch, and left open the confirm would take
+        the next typed message and Enter as its answer (XERK-2157). Only a
+        confirm naming the picked row is answered; one naming any other model,
+        or one still up when the wait ends, is backed out of."""
+        answered = False
         for _ in range(MODEL_CONFIRM_TRIES):
             time.sleep(MODEL_CONFIRM_WAIT_SEC)
             cap = _capture_pane(tmux_name)
-            if cap and MODEL_CONFIRM_RE.search(cap):
+            if not cap:
+                continue
+            ask = parse_model_switch_confirm(cap)
+            if ask is not None:
+                if not _model_names_row(ask, label):
+                    log(f"model switch confirm names {ask!r}, not the picked "
+                        f"row {label!r}; backing out")
+                    break
+                if not answered:
+                    # "1" picks the option outright, wherever the ❯ is.
+                    _pane_send_keys(tmux_name, "1", literal=True)
+                    answered = True
+                continue
+            # Not while the picker is still drawn: it sits at the bottom, so
+            # against a pane scrolled up (PgUp) beforehand a line above it can
+            # read as new although `s` never landed (XERK-2157 QA).
+            if _model_picker_open(cap):
+                continue
+            if _model_switch_landed(before, cap, label):
                 return True
+        self._back_out_of_model_picker(tmux_name)
         return False
+
+    def _back_out_of_model_picker(self, tmux_name):
+        """Escape out of a "Switch model?" confirm and the picker under it,
+        one Escape per one SEEN — never blind: two Escapes on an idle
+        composer open the rewind menu."""
+        for _ in range(2):
+            cap = _capture_pane(tmux_name)
+            if not cap:
+                return
+            if parse_model_switch_confirm(cap) is None and not _model_picker_open(cap):
+                return
+            _pane_send_keys(tmux_name, "Escape")
+            time.sleep(MODEL_STEP_WAIT_SEC)
 
     # --- the trust-folder modal (XERK-868) ---------------------------------
 
@@ -41284,9 +42165,11 @@ class SessionManager:
                     self._cheap_forget("nudge_reads", lambda k: k != sid)
                     continue
             else:
-                busy, _mode, prompt = _pane_status(
-                    sess.get("tmuxName"), self.sess_state.setdefault(sid, {}))
-                if busy is not False or prompt is not None:
+                pstate = self.sess_state.setdefault(sid, {})
+                busy, _mode, prompt = _pane_status(sess.get("tmuxName"), pstate)
+                # Any dialog, not only a panePrompt: an MCP elicitation or the
+                # native picker is the session waiting on a person (XERK-2142).
+                if busy is not False or prompt is not None or pstate.get("paneDialog"):
                     self._cheap_forget("nudge_reads", lambda k: k != sid)
                     continue
             # "Working" is paneBusy OR live background agents (XERK-245): a
@@ -44124,6 +45007,12 @@ class SessionManager:
             # url, summary, branch} — or None. The board reverse-indexes it to
             # link a ticket to its sessions; the session card links back out.
             "ticket": _served_ticket(sess),
+            # Where a migrated session came from ({host, sessionId, at} as the
+            # hub's importSession / archive restore stamped it), or None. The one
+            # proof a new (host, id) IS a moved conversation: the glasses follow
+            # a stashed draft by it (XERK-2109). The hub coerces it; .get() keeps
+            # a record without it (every non-migrated one) beat-safe.
+            "migratedFrom": sess.get("migratedFrom"),
             # The hub command that created this session (spawn / resumeTranscript),
             # so the UI that issued it can find the id the agent minted and open
             # the session. None for sessions predating the echo, or restored ones.
@@ -44595,7 +45484,10 @@ class SessionManager:
         # wrote and, once valid, materialize the epic on a worker thread. Guarded
         # so it never raises onto the beat; the Jira writes are off-beat.
         self._advance_epic_builders()
-        # Move each shadow run on (XERK-1847): run -> grade -> report. Guarded.
+        # Launch a shadow run whose base a worker placed (XERK-2167), then move
+        # each run on (XERK-1847): run -> grade -> report. Both guarded.
+        if not light:
+            self._apply_shadow_placements()
         self._advance_shadow_runs()
         # Apply the outbox records the off-beat input worker staged (XERK-867):
         # the worker did the pane delivery, the beat owns the registry mutation.

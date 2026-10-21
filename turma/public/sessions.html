@@ -637,7 +637,7 @@
   .tr-msg .md-svg, .thought-body .md-svg, .compact-body .md-svg, .away-body .md-svg,
   .tool-plan .md-svg,
   .tool-file .md-svg {
-    width: auto; background: #fff; padding: 6px; }
+    background: #fff; padding: 6px; }
   /* SendUserFile inline previews inside a tool card (chat.js renderToolFiles,
      XERK-221): a stacked list of image/SVG/HTML previews + name chips. The HTML
      preview is a fully sandboxed iframe with a fixed viewport that scrolls. */
@@ -2254,6 +2254,11 @@ function liveState(sess, host, now) {
   // pending command), else the dialog's question from an older hub.
   if (s && s.panePrompt && s.panePrompt.prompt)
     return { kind: "waiting", label: "waiting for your permission", ask: permissionAsk(sess) };
+  // A dialog that is no panePrompt (XERK-2152: the AskUserQuestion picker, an MCP
+  // elicitation or server approval): the agent holds every message aimed at the
+  // pane until the operator answers it in the terminal. Only the hub can say so.
+  if (sess.attention?.state === "needs-you:dialog")
+    return { kind: "waiting", label: "waiting on a dialog in the terminal" };
   if (!s || s.transcriptAgeSec == null) return { kind: "idle", label: "no transcript yet" };
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   // Background agents are the other thing paneBusy cannot see (XERK-245): a
@@ -4429,9 +4434,13 @@ function archiveIngestNote(body) {
   // A real epoch-ms stamp, not one Date can't print (8.64e15 is its range);
   // the Android twin draws the same line.
   if (typeof since !== "number" || !(since > 0 && since < 8.64e15)) return "";
-  return `The hub has not been accepting archive pushes since ` +
-    `${esc(new Date(since).toLocaleString())} (${ago(Date.now() - since)}), so this ` +
-    `conversation can&rsquo;t reach the archive until it does.`;
+  // The gate is only closed while the archive index loads (XERK-1283), and an
+  // archived conversation reads as missing until it has: never say it cannot
+  // have reached the archive (XERK-1888).
+  return `The hub has been reloading its archive index since ` +
+    `${esc(new Date(since).toLocaleString())} (${ago(Date.now() - since)}). Until that ` +
+    `finishes it can&rsquo;t find archived conversations or take new pushes, so this ` +
+    `conversation may already be archived.`;
 }
 
 // Why the archive answered without a transcript, or "" for the ordinary 404

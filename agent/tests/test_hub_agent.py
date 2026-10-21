@@ -3059,6 +3059,19 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(ps.call_args[0][0], "agent-abc")
         self.assertIsInstance(ps.call_args[0][1], dict)
 
+    def test_a_dialog_the_pane_status_saw_rides_the_report(self):
+        # XERK-2152: _pane_status leaves "any dialog owns the pane" on state; the
+        # report carries it as a strict boolean so the hub can tell the operator.
+        def status(_name, state):
+            state["paneDialog"] = True
+            return False, None, None
+        with mock.patch.object(ha, "_pane_status", side_effect=status):
+            rep = ha.session_report("/absent/worktree", {}, "agent-abc")
+        self.assertIs(rep["paneDialog"], True)
+        with mock.patch.object(ha, "_pane_status", return_value=(False, None, None)):
+            rep = ha.session_report("/absent/worktree", {}, "agent-abc")
+        self.assertIs(rep["paneDialog"], False)
+
     def test_pane_reads_reported_without_transcript(self):
         # No transcript yet — the pane reads must still ride the early-return
         # path.
@@ -10453,6 +10466,338 @@ class TestTrustDialogIsABlockingDialog(unittest.TestCase):
             self.assertFalse(ha._pane_blocking_dialog(cap))
 
 
+# Real Claude Code 2.1.306 frames (XERK-2142), captured in a scratch tmux server
+# (the dialog region from its top rule down; blank-line runs collapsed, the
+# scratch path shortened). Each is a dialog every older read called an idle
+# composer: no interrupt hint, no mode footer, no contiguous 1..N run.
+_2142_PICKER = (
+    "─" * 140 + "\n"
+    " ☐ Color\n"
+    "\n"
+    "Which color do you prefer?\n"
+    "\n"
+    "❯ 1. Red\n"
+    "     Bold, warm, high-energy.\n"
+    "  2. Green\n"
+    "     Calm, natural, balanced.\n"
+    "  3. Blue\n"
+    "     Cool, steady, professional.\n"
+    "  4. Type something.\n"
+    + "─" * 140 + "\n"
+    "  5. Chat about this\n"
+    "\n"
+    "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+)
+_2142_PICKER_40 = (
+    "Pick a size?\n"
+    "\n"
+    "❯ 1. Small\n"
+    "     Smaller size option.\n"
+    "  2. Large\n"
+    "     Larger size option.\n"
+    "  3. Type something.\n"
+    + "─" * 40 + "\n"
+    "  4. Chat about this\n"
+    "\n"
+    "Enter to select · ↑/↓ to navigate · Esc\n"
+    "to cancel\n"
+)
+_2142_ELICIT = (
+    "─" * 140 + "\n"
+    "  MCP server “elicit” requests your input\n"
+    "\n"
+    "  Which environment should I deploy to?\n"
+    "\n"
+    "  ❯ * env: ▸ not set\n"
+    "        Target\n"
+    "\n"
+    "      confirm: not set\n"
+    "        Really deploy?\n"
+    "\n"
+    "    Accept    Decline\n"
+    "\n"
+    "  Esc to cancel · ↑/↓ to navigate · Backspace to unset · → to expand\n"
+)
+_2142_ELICIT_BUTTONS = (
+    "─" * 140 + "\n"
+    "  MCP server “elicit” requests your input\n"
+    "\n"
+    "  Which environment should I deploy to?\n"
+    "\n"
+    "    * env: not set\n"
+    "        Target\n"
+    "\n"
+    "      confirm: not set\n"
+    "        Really deploy?\n"
+    "\n"
+    "    Accept  ❯ Decline\n"
+    "\n"
+    "  Esc to cancel · ↑/↓ to navigate\n"
+)
+_2142_MCP_APPROVAL = (
+    "─" * 140 + "\n"
+    "  New MCP server found in this project: elicit\n"
+    "\n"
+    "  MCP servers may execute code or access system resources. All tool calls"
+    " require approval. Learn more in the MCP documentation.\n"
+    "\n"
+    "    Use this MCP server\n"
+    "    Use this and all future MCP servers in this project\n"
+    "  ❯ Continue without using this MCP server\n"
+    "\n"
+    "  Enter to confirm · Esc to cancel\n"
+)
+# A live composer under a reply that QUOTES a dialog footer: the footer text is
+# conversation, above the composer, so it is not the pane's bottom.
+_2142_COMPOSER_QUOTING = (
+    "❯ Reply with exactly this one line and nothing else: Enter to select · ↑/↓"
+    " to navigate · Esc to cancel\n"
+    "\n"
+    "● Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+    "\n"
+    "✻ Sautéed for 1s · done 12:01 AM\n"
+    "\n"
+    + "─" * 140 + "\n"
+    "❯\n"
+    + "─" * 140 + "\n"
+    "  ⏸ manual mode on · ? for shortcuts\n"
+)
+
+
+class TestHintDialogIsABlockingDialog(unittest.TestCase):
+    """XERK-2142. The dialogs `parse_pane_prompt` and `_trust_dialog_up` both
+    miss — the native AskUserQuestion picker, an MCP elicitation form, the
+    project MCP-server approval — read as an idle composer, so the input path
+    typed into them (a digit picks a picker option, an Enter answers it) and the
+    bridge mod's turn signal held them busy. They are read off the key-hint
+    footer that is the pane's last line."""
+
+    DIALOGS = {"picker": _2142_PICKER, "picker@40": _2142_PICKER_40,
+               "elicitation": _2142_ELICIT, "elicitation@buttons": _2142_ELICIT_BUTTONS,
+               "mcp-approval": _2142_MCP_APPROVAL}
+
+    def test_every_older_read_called_them_an_idle_composer(self):
+        for name, cap in self.DIALOGS.items():
+            self.assertIsNone(ha.parse_pane_prompt(cap), name)
+            self.assertFalse(ha._busy_from_capture(cap), name)
+            self.assertIsNone(ha.parse_pane_mode(cap), name)
+            self.assertFalse(ha._trust_dialog_up(cap), name)
+
+    def test_they_are_blocking_dialogs(self):
+        for name, cap in self.DIALOGS.items():
+            self.assertTrue(ha._hint_dialog_up(cap), name)
+            self.assertTrue(ha._pane_blocking_dialog(cap), name)
+
+    def test_a_wrapped_footer_is_read_across_the_seam_only(self):
+        # The picker at 40 columns wraps "Esc" / "to cancel" (above). Joining the
+        # lines whole instead glued "Accept  Decline" onto the elicitation's
+        # first item and missed it; the seam alone must not invent a match.
+        self.assertTrue(ha._hint_dialog_up(_2142_PICKER_40))
+        self.assertFalse(ha._hint_dialog_up("x · Esc\nto\ncancel\n"))
+
+    def test_a_composer_draft_ending_in_the_footer_is_not_one(self):
+        # A real 2.1.306 frame (QA): the operator's two-line draft ends on
+        # "Esc to cancel", so only the mode footer among the tail lines tells
+        # it from a dialog.
+        cap = ("─" * 140 + "\n❯ operator note line one\n  Esc to cancel\n"
+               + "─" * 140 + "\n  ⏸ manual mode on\n")
+        self.assertFalse(ha._hint_dialog_up(cap))
+
+    def test_a_toast_over_the_mode_footer_does_not_reach_the_reply(self):
+        # QA delta: "Press Ctrl-C again to exit" replaces the mode marker for a
+        # second or two; the reply above the composer quotes the footer.
+        cap = ("● ok\n  Esc to cancel\n\n" + "─" * 60 + "\n❯\n" + "─" * 60
+               + "\n  Press Ctrl-C again to exit\n")
+        self.assertFalse(ha._hint_dialog_up(cap))
+
+    def test_a_footer_wrapped_onto_five_lines_is_read(self):
+        # The elicitation footer at 20 columns (QA capture).
+        cap = ("    Accept\n           Decline\n\n  Esc to cancel ·\n"
+               "  ↑/↓ to navigate\n  · Backspace to\n  unset · → to\n  expand\n")
+        self.assertTrue(ha._hint_dialog_up(cap))
+
+    def test_a_composer_is_never_one(self):
+        for cap in (_2142_COMPOSER_QUOTING, LINUX_COMPOSER_PANE):
+            self.assertFalse(ha._hint_dialog_up(cap))
+            self.assertFalse(ha._pane_blocking_dialog(cap))
+        self.assertFalse(ha._hint_dialog_up(""))
+        self.assertFalse(ha._hint_dialog_up(None))
+
+    def test_the_footer_must_be_the_bottom_of_the_pane(self):
+        # The same footer with a composer drawn under it is conversation text.
+        cap = _2142_ELICIT + "─" * 40 + "\n❯\n" + "─" * 40 + "\n  ⏵⏵ auto mode on\n"
+        self.assertFalse(ha._hint_dialog_up(cap))
+
+    def test_a_whole_item_must_read_esc_to_cancel(self):
+        self.assertFalse(ha._hint_dialog_up("press Esc to cancel the run\n"))
+        # qwen's busy spinner ends "(… · esc to cancel)", above its own footer.
+        qwen = ("⠋ Thinking (3s · esc to cancel)\n"
+                "Enter to steer · Ctrl+Q to queue · ⏸ Ask permissions (shift + tab to cycle)\n")
+        self.assertFalse(ha._hint_dialog_up(qwen))
+        self.assertFalse(ha._hint_dialog_up("⠋ Thinking (3s · esc to cancel)\n"))
+
+    def test_the_panePrompt_contract_is_untouched(self):
+        # None of these becomes a panePrompt (no digit the chat could offer),
+        # and the numbered dialog still is one.
+        numbered = ("Bash command\n  touch x\n" + "─" * 40 + "\n"
+                    "Do you want to proceed?\n ❯ 1. Yes\n   2. No\n"
+                    " Esc to cancel · Tab to amend\n")
+        self.assertIsNotNone(ha.parse_pane_prompt(numbered))
+        self.assertTrue(ha._pane_blocking_dialog(numbered))
+
+    def test_pane_status_leaves_the_dialog_flag_on_the_state(self):
+        for cap, want in ((_2142_ELICIT, True), (LINUX_COMPOSER_PANE, False)):
+            state = {}
+            with mock.patch.object(ha, "_capture_pane", return_value=cap):
+                busy, _mode, prompt = ha._pane_status("agent-x", state)
+            self.assertIsNone(prompt)
+            self.assertIs(state["paneDialog"], want)
+        state = {"paneDialog": True}
+        ha._pane_status(None, state)
+        self.assertIs(state["paneDialog"], False)
+
+
+# The /model picker's "Switch model?" confirm, captured on Claude Code 2.1.306
+# (XERK-2157): drawn after `s` on a session whose conversation is cached for the
+# current model. No "Esc to cancel" footer, no question line above the options.
+_2157_CONFIRM_140 = (
+    "❯ Reply with exactly the word ok and nothing else\n"
+    "\n"
+    "● ok\n"
+    "\n"
+    "✻ Cogitated for 1s · done 1:21 AM\n"
+    "\n"
+    + "▔" * 140 + "\n"
+    "   Switch model?\n"
+    "   Your next response will be slower and use more tokens\n"
+    "\n"
+    "   This conversation is cached for the current model. Switching to Sonnet 5.5"
+    " means the full history gets re-read on your next message.\n"
+    "\n"
+    "   ❯ 1. Yes, switch to Sonnet 5.5\n"
+    "     2. No, go back\n"
+    "\n"
+    "\n"
+)
+_2157_CONFIRM_24 = (
+    "▔" * 24 + "\n"
+    "   Switch model?\n"
+    "   Your next response\n"
+    "   will be slower\n"
+    "   and use more\n"
+    "   tokens\n"
+    "\n"
+    "   This conversation\n"
+    "   is cached for the\n"
+    "   current model.\n"
+    "   Switching to\n"
+    "   Sonnet 5.5 means\n"
+    "   the full history\n"
+    "   gets re-read on\n"
+    "   your next message.\n"
+    "\n"
+    "   ❯ 1. Yes, switch to\n"
+    "        Sonnet 5.5\n"
+    "     2. No, go back\n"
+    "\n"
+)
+# What the pane shows once it lands, at 24 columns: the line wraps mid-name.
+_2157_LANDED_24 = (
+    "❯ /model\n"
+    "  ⎿ Set model to Opus 5.5\n"
+    "    (default) for this\n"
+    "    session only\n"
+    "❯ /model\n"
+    "  ⎿ Set model to Sonnet\n"
+    "    5.5 for this session\n"
+    "    only\n"
+    "    ◐ medium · /effort\n"
+    + "─" * 24 + "\n"
+    "❯ \n"
+    + "─" * 24 + "\n"
+    "  ⏵⏵ auto mode on\n"
+)
+
+
+class TestModelSwitchConfirm(unittest.TestCase):
+    """XERK-2157: the "Switch model?" confirm is a dialog no other pane read
+    saw, so the next typed message landed in it and its Enter answered it."""
+
+    def test_reads_the_target_off_the_real_frames(self):
+        self.assertEqual(ha.parse_model_switch_confirm(_2157_CONFIRM_140), "Sonnet 5.5")
+        self.assertEqual(ha.parse_model_switch_confirm(_2157_CONFIRM_24), "Sonnet 5.5")
+
+    def test_it_is_a_blocking_dialog(self):
+        for cap in (_2157_CONFIRM_140, _2157_CONFIRM_24):
+            self.assertFalse(ha.parse_pane_prompt(cap))
+            self.assertFalse(ha._hint_dialog_up(cap))   # why it was invisible
+            self.assertTrue(ha._pane_blocking_dialog(cap))
+
+    def test_a_quoted_confirm_above_the_composer_is_not_one(self):
+        quoted = (_2157_CONFIRM_140 + "─" * 140 + "\n❯ \n" + "─" * 140 + "\n"
+                  "  ⏵⏵ auto mode on (shift+tab to cycle)\n")
+        self.assertIsNone(ha.parse_model_switch_confirm(quoted))
+        self.assertFalse(ha._pane_blocking_dialog(quoted))
+        self.assertIsNone(ha.parse_model_switch_confirm(
+            "     2. No, go back\n"))                  # no heading, no Yes
+        self.assertIsNone(ha.parse_model_switch_confirm(""))
+        self.assertIsNone(ha.parse_model_switch_confirm(None))
+
+    def test_reads_the_narrowest_frames(self):
+        # Under ~23 columns option 1 wraps after "switch", and at 20 the TUI
+        # drops the space after "1." (2.1.306, XERK-2157 QA).
+        w22 = ("▔" * 22 + "\n   Switch model?\n   Your next response\n\n"
+               "   ❯ 1. Yes, switch\n        to Sonnet 5.5\n     2. No, go back\n\n")
+        w20 = ("▔" * 20 + "\n   Switch model?\n   Your next\n\n"
+               "   ❯ 1.Yes, switch\n       to Haiku 5.5\n     2. No, go back\n")
+        self.assertEqual(ha.parse_model_switch_confirm(w22), "Sonnet 5.5")
+        self.assertEqual(ha.parse_model_switch_confirm(w20), "Haiku 5.5")
+        self.assertTrue(ha._pane_blocking_dialog(w20))
+        self.assertEqual(ha._model_set_names(
+            "  ⎿ Set model to\n    Haiku 5.5 for\n    this session\n    only\n\n"
+            "  ⎿ Kept model as\n    Haiku 5.5\n\n"), ["Haiku 5.5", "Haiku 5.5"])
+
+    def test_a_new_line_is_one_that_settled_or_raised_the_count(self):
+        landed = ha._model_switch_landed
+        stale = "  ⎿  Set model to Sonnet 5.5 for this session only\n"
+        turn = "❯ hi\n\n● hi\n\n✻ Baked for 1s\n"
+        composer = "─" * 20 + "\n❯ \n" + "─" * 20 + "\n  ⏵⏵ auto mode on\n"
+        new = "❯ /model\n" + stale + "        ◐ medium · /effort\n"
+        # Scrolled off: the old line is gone, the new one settled at the bottom.
+        self.assertTrue(landed(stale + turn + composer, turn + new + composer,
+                               "Sonnet 5.5"))
+        # Nothing new: the old line is still the last, with turns after it.
+        self.assertFalse(landed(stale + turn + composer, stale + turn + composer,
+                                "Sonnet 5.5"))
+        # The old line was ALREADY settled at the bottom: only a higher count.
+        self.assertFalse(landed(stale + composer, stale + composer, "Sonnet 5.5"))
+        self.assertTrue(landed(stale + composer, stale + new + composer,
+                               "Sonnet 5.5"))
+        # A prompt with text, or a tool result, after it: not settled.
+        self.assertFalse(ha._model_set_lines(stale + "❯ do the thing\n")[-1][1])
+        self.assertFalse(ha._model_set_lines(stale + "  ⎿  Read 3 files\n")[-1][1])
+        self.assertTrue(ha._model_set_lines(stale + composer)[-1][1])
+        # A settled line naming another model is not this switch.
+        self.assertFalse(landed(turn + composer, turn + new + composer, "Haiku 5.5"))
+
+    def test_set_lines_are_joined_across_a_wrap(self):
+        self.assertEqual(ha._model_set_names(_2157_LANDED_24),
+                         ["Opus 5.5 (default)", "Sonnet 5.5"])
+        self.assertEqual(ha._model_set_names(
+            "  ⎿  Kept model as Sonnet 5.5\n    ◐ medium · /effort\n"),
+            ["Sonnet 5.5"])
+
+    def test_a_name_matches_its_row_only(self):
+        names_row = ha._model_names_row
+        self.assertTrue(names_row("Sonnet 5.5", "Sonnet 5.5"))
+        self.assertTrue(names_row("Opus 5.5 (default)", "Default (recommended)"))
+        self.assertTrue(names_row("Opus 5.5 (default)", "Default (rec… ✔"))
+        self.assertFalse(names_row("Opus 5.5 (default)", "Opus 5.5"))
+        self.assertFalse(names_row("Opus 5.5", "Default (recommended)"))
+        self.assertFalse(names_row("Haiku 5.5", "Sonnet 5.5"))
+        self.assertFalse(names_row("", "Sonnet 5.5"))
+
+
 class TestWindowsManagerBoot(ManagerMixin, unittest.TestCase):
     """run_forever installs a POSIX-only SIGUSR1 handler (the tunnel's heartbeat
     poke) that MUST be gated on IS_WINDOWS, or the manager crashes at boot on
@@ -10558,6 +10903,17 @@ class TestSessionPayloadNeverRaises(ManagerMixin, unittest.TestCase):
                 sess = {"id": "s", "status": status, "worktreePath": wt}
                 payload = sm._session_payload(sess, refresh=True)  # must not raise
                 self.assertIsNone(payload["transcriptId"], (wt, status))
+
+    def test_migrated_from_rides_the_payload_and_is_none_without_one(self):
+        # XERK-2109: the record kept `migratedFrom` but the beat never sent it,
+        # so no client could tell a moved session from an unrelated one.
+        sm = self.make_manager()
+        mf = {"host": "hostA", "sessionId": "orig", "at": 1}
+        payload = sm._session_payload(
+            {"id": "s", "status": "stopped", "migratedFrom": mf}, refresh=True)
+        self.assertEqual(payload["migratedFrom"], mf)
+        self.assertIsNone(sm._session_payload({"id": "s", "status": "stopped"},
+                                              refresh=True)["migratedFrom"])
 
     def test_an_unhashable_id_does_not_crash_the_cache_lookups(self):
         # A record whose id is a list/dict is unhashable, so the sid-keyed cache
@@ -19464,6 +19820,19 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
             self._poll(sm)
         self.assertEqual(self._typed(), [])
 
+    def test_an_unnumbered_dialog_is_not_nudged(self):
+        # XERK-2142: an MCP elicitation or the native picker is no panePrompt;
+        # _pane_status says so on the scan state instead.
+        sm = self.make_manager()
+        self._session(sm)
+
+        def status(_tmux, state):
+            state["paneDialog"] = True
+            return False, "auto", None
+        with mock.patch.object(ha, "_pane_status", side_effect=status):
+            self._poll(sm)
+        self.assertEqual(self._typed(), [])
+
     def test_clean_worktree_is_not_nudged(self):
         sm = self.make_manager()
         sess = self._session(sm, dirty=0, pushed=True, ahead_remote=0)
@@ -19814,6 +20183,184 @@ PANE_PERMISSION_DIALOG = """\
  Esc to cancel · Tab to amend · ctrl+e to explain
 """
 
+# Real 60-column Claude Code 2.1.306 frames (XERK-2150). Option 3's label wraps
+# onto a line indented to the label column...
+PANE_WRAPPED_OPTION_DIALOG = """\
+────────────────────────────────────────────────────────────
+ Bash command
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ touch /tmp/marker.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to
+      /tmp/build/long-dir-name/cap/work from this project
+   3. Yes, and switch to auto mode · auto mode handles these
+      prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
+"""
+
+# ...and so does every description in the native AskUserQuestion picker, whose
+# first word WOULD have fit after its option's label.
+PANE_ASK_PICKER = """\
+────────────────────────────────────────────────────────────
+ ☐ Color
+
+Which color?
+
+❯ 1. Red
+     A warm, bold color often associated with energy,
+     passion, urgency, and drawing strong attention.
+  2. Green
+     A calm, natural color commonly linked with growth,
+     balance, health, and positive go-ahead signals.
+  3. Blue
+     A cool, steady color typically associated with trust,
+     calm, reliability, and clear open skies.
+  4. Type something.
+────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+# The same picker with labels that fill a 45-column pane, so every
+# description's first word looks like a wrap (real frame) — and a multiSelect one.
+PANE_ASK_PICKER_FULL_LABELS = """\
+─────────────────────────────────────────────
+ ☐ Deploy
+
+Which deployment strategy?
+
+❯ 1. Deploy everything at once via blue-green
+     Stand up a full parallel environment,
+     then switch traffic all at once.
+  2. Roll instances forward in small batches.
+     Update instances in small groups,
+     checking health before continuing each
+     batch.
+  3. Canary release to a small slice of users
+     Send a small share of users to the new
+     version first, then widen gradually.
+  4. Type something.
+─────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to
+"""
+
+PANE_ASK_PICKER_MULTI = """\
+──────────────────────────────────────────────────
+←  ☐ Toppings  ✔ Submit  →
+
+Which toppings do you want?
+
+❯ 1. [ ] Cheese
+         Melted mozzarella and cheddar blend, a
+         classic gooey topping everyone expects.
+  2. [ ] Mushrooms
+         Sliced cremini mushrooms, earthy and
+         savory, sautéed briefly before baking.
+  3. [ ] Peppers
+         Crisp green and red bell pepper strips,
+         adding sweetness, crunch and mild color.
+  4. [ ] Type something
+     Submit
+──────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+# A path the TUI broke after a "/" (real 50-column frame).
+PANE_WRAPPED_PATH_DIALOG = """\
+──────────────────────────────────────────────────
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, allow reading from /home/truenas_admin/
+      git/.turma/worktrees/Turma/2019f/agent/tests
+      from this project
+   3. Yes, and switch to auto mode · auto mode
+      handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
+"""
+
+# A wrapped label line that fills the pane exactly: Claude Code 2.1.306 draws an
+# empty row under that option (real 70-column frame).
+PANE_FULL_WIDTH_WRAP_DIALOG = """\
+──────────────────────────────────────────────────────────────────────
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, allow reading from /home/truenas_admin/git/.turma/worktrees
+      /Turma/2019f/agent/native from this project
+
+   3. Yes, and switch to auto mode · auto mode handles these prompts
+      for you
+   4. No
+
+ Esc to cancel · Tab to amend
+"""
+
+# XERK-2162: Claude Code 2.1.306 in plan mode, asking to exit plan mode with no
+# plan file written — a subtitle line between question and options, and a box
+# drawn two columns in from the pane's edge. Real captures (44, 60, 36 columns),
+# trailing blanks trimmed; the conversation above the ▔ edge is kept.
+PANE_EXIT_PLAN_SUBTITLE_DIALOG = """\
+● Since the plan file location is blocked by
+  a hook, I'll share the plan here.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+  ────────────────────────────────────────
+   Exit plan mode?
+
+    Claude wants to exit plan mode
+
+    ❯ 1. Yes, and switch to default (ask
+         each time) for this session
+      2. No
+"""
+
+# At 60 columns "this" would fit the pane after line 1, but not the box.
+PANE_EXIT_PLAN_SUBTITLE_DIALOG_60 = """\
+● Since the plan file location is blocked by a hook, I'll
+  share the plan here.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+  ────────────────────────────────────────────────────────
+   Exit plan mode?
+
+    Claude wants to exit plan mode
+
+    ❯ 1. Yes, and switch to default (ask each time) for
+         this session
+      2. No
+"""
+
+PANE_EXIT_PLAN_SUBTITLE_DIALOG_36 = """\
+● Since the plan file location is
+  blocked by a hook, I'll share the
+  plan here.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+  ────────────────────────────────
+   Exit plan mode?
+
+    Claude wants to exit plan
+    mode
+
+    ❯ 1. Yes, and switch to
+         default (ask each time)
+         for this session
+      2. No
+"""
+
 PANE_PLAN_DIALOG = """\
   ────────────────────────────────────────────────────────────────────
    Ready to code?
@@ -20135,15 +20682,35 @@ class _PickerPane:
     flakiness the verified loop exists to survive."""
     ROWS = ("Default (recommended)", "Opus", "Fable", "Sonnet", "Haiku")
 
-    def __init__(self, cur=2, drop_arrows=0, confirm=True, opens=True):
+    def __init__(self, cur=2, drop_arrows=0, confirm=True, opens=True,
+                 ask=False, ask_name=None, answers=True, history="", scrolls=0):
         self.cur = cur                  # ❯ starts on Fable, like the real pane
         self.drop_arrows = drop_arrows  # swallow this many arrow presses
         self.confirm = confirm          # print "Set model to…" after `s`
         self.opens = opens              # whether /model paints a picker at all
+        self.ask = ask                  # draw "Switch model?" after `s` (XERK-2157)
+        self.ask_name = ask_name        # the name the confirm shows, if not the row's
+        self.answers = answers          # whether a "1" answers the confirm
+        self.history = history          # conversation text above the composer
+        self.scrolls = scrolls          # history lines the new line pushes off the top
         self.open = False
+        self.asking = False
         self.confirmed = False
 
+    def name(self):
+        if self.cur == 0:
+            return "Opus 5.5 (default)"
+        return self.ROWS[self.cur]
+
     def key(self, key):
+        if self.asking:
+            if key == "1" and self.answers:
+                self.asking = False
+                self.confirmed = self.confirm
+            elif key == "Escape":    # back to the picker, as on 2.1.306
+                self.asking = False
+                self.open = True
+            return
         if key == "Enter" and not self.open:
             self.open = self.opens
         elif key in ("Down", "Up") and self.open:
@@ -20154,7 +20721,10 @@ class _PickerPane:
             self.cur = min(len(self.ROWS) - 1, max(0, self.cur + step))
         elif key == "s" and self.open:
             self.open = False
-            self.confirmed = self.confirm
+            if self.ask:
+                self.asking = True
+            else:
+                self.confirmed = self.confirm
         elif key == "Escape":
             self.open = False
 
@@ -20164,10 +20734,63 @@ class _PickerPane:
             for i, label in enumerate(self.ROWS):
                 mark = "❯ " if i == self.cur else "  "
                 lines.append(f"   {mark}{i + 1}. {label}    a description")
-            return "\n".join(lines)
+            lines.append("   Enter to set as default · s to use this session only · Esc to cancel")
+            return self.history + "\n".join(lines)
+        if self.asking:
+            name = self.ask_name or self.name()
+            return (self.history + "▔" * 40 + "\n   Switch model?\n"
+                    "   Your next response will be slower and use more tokens\n\n"
+                    f"   This conversation is cached for the current model. Switching to {name} means\n"
+                    "   the full history gets re-read on your next message.\n\n"
+                    f"   ❯ 1. Yes, switch to {name}\n     2. No, go back\n\n")
         if self.confirmed:
-            return "  ⎿  Set model to Sonnet 5 for this session only\n❯ "
-        return "❯ \n  ? for shortcuts"  # idle; deliberately no mode marker
+            history = "".join(self.history.splitlines(True)[self.scrolls:])
+            return (history +
+                    f"  ⎿  Set model to {self.name()} for this session only\n❯ ")
+        # Idle: an empty composer box, deliberately with no mode marker.
+        return (self.history + "─" * 40 + "\n❯ \n" + "─" * 40 + "\n"
+                "  ? for shortcuts")
+
+
+class _DraftPane(_PickerPane):
+    """A picker pane whose idle composer is boxed in rules and holds a draft.
+    Ctrl+U behaves as 2.1.306's (measured by XERK-2157 QA): a press empties
+    the last row, the next removes the emptied row."""
+
+    def __init__(self, draft, deaf=False, **kw):
+        super().__init__(**kw)
+        self.draft = list(draft)
+        self.deaf = deaf                # a placeholder: Ctrl+U changes nothing
+
+    def key(self, key):
+        if key == "C-u" and self.deaf:
+            return
+        if key == "C-u" and not (self.open or self.asking):
+            if self.draft and self.draft[-1]:
+                self.draft[-1] = ""
+            elif self.draft:
+                self.draft.pop()
+            return
+        if key == "Enter" and not self.open and any(self.draft) and not self.deaf:
+            self.submitted = list(self.draft)   # "/model" sent glued to it
+            return
+        super().key(key)
+
+    def capture(self):
+        if self.open or self.asking or self.confirmed:
+            return super().capture()
+        rule = "─" * 40 + "\n"
+        rows = self.draft or [""]
+        body = "".join(("❯ " if i == 0 else "  ") + r + "\n" for i, r in enumerate(rows))
+        return self.history + rule + body + rule + "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+
+    def styled(self):
+        # The placeholder is drawn dim (SGR 2); typed text is not.
+        cap = self.capture()
+        if self.deaf and not (self.open or self.asking or self.confirmed):
+            for row in self.draft:
+                cap = cap.replace(row, f"\x1b[2m{row}\x1b[0m")
+        return cap
 
 
 class _ModePane:
@@ -20230,6 +20853,9 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         for name, value in [("run", fake_run),
                             ("_pane_busy", lambda t: busy),
                             ("_capture_pane", fake_capture),
+                            ("_capture_pane_styled",
+                             lambda t: self.pane.styled() if hasattr(self.pane, "styled")
+                             else fake_capture(t)),
                             ("MODEL_PICKER_WAIT_SEC", 0),
                             ("MODEL_STEP_WAIT_SEC", 0),
                             ("MODEL_CONFIRM_WAIT_SEC", 0),
@@ -20291,6 +20917,20 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["pendingModel"], "sonnet")
         self.assertIsNone(sess["model"])
 
+    def test_set_model_defers_while_a_dialog_is_up(self):
+        # XERK-2142 QA: "/model" + Enter into a permission dialog approved its
+        # "1. Yes". A dialog defers the pick like a busy pane does.
+        dialog = ("Bash command\n  touch x\n" + "─" * 40 + "\n"
+                  "Do you want to proceed?\n ❯ 1. Yes\n   2. No\n"
+                  " Esc to cancel · Tab to amend\n")
+        for cap in (dialog, _2142_ELICIT):
+            self.run_calls.clear()
+            sm = self.make_manager(pane=cap)
+            sess = self._session(sm, model=None)
+            sm.set_model("abcde", "sonnet")
+            self.assertEqual(self.run_calls, [])
+            self.assertEqual(sess["pendingModel"], "sonnet")
+
     def test_apply_pending_switches_lands_the_deferred_pick(self):
         sm = self.make_manager(busy=False)
         sess = self._session(sm, model=None)
@@ -20345,6 +20985,191 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         sm.set_model("abcde", "sonnet")
         self.assertEqual(self._keys()[-1], "s")
         self.assertEqual(sess["model"], "opus")
+
+    def test_set_model_answers_the_switch_confirm_and_records_the_switch(self):
+        # XERK-2157: on a session with history `s` opens "Switch model?". The
+        # operator's pick already chose the switch, so set_model answers Yes;
+        # left open, the next operator message would answer it instead.
+        sm = self.make_manager(pane=_PickerPane(ask=True))
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys(), ["C-u", "/model", "Enter", "Down", "s", "1"])
+        self.assertEqual(sess["model"], "sonnet")
+
+    def test_set_model_answers_the_default_rows_confirm(self):
+        # The Default row's confirm names "Opus 5.5 (default)", not "Default".
+        sm = self.make_manager(pane=_PickerPane(ask=True))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "default")
+        self.assertEqual(self._keys()[-2:], ["s", "1"])
+        self.assertIsNone(sess["model"])
+
+    def test_set_model_backs_out_of_a_confirm_naming_another_model(self):
+        sm = self.make_manager(pane=_PickerPane(ask=True, ask_name="Haiku 5.5"))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertNotIn("1", self._keys())
+        self.assertEqual(self._keys()[-2:], ["Escape", "Escape"])  # confirm, picker
+        self.assertFalse(self.pane.asking or self.pane.open)
+        self.assertEqual(sess["model"], "opus")
+
+    def test_set_model_backs_out_of_a_confirm_that_stays_up(self):
+        sm = self.make_manager(pane=_PickerPane(ask=True, answers=False))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys().count("1"), 1)   # answered once, not spammed
+        self.assertEqual(self._keys()[-2:], ["Escape", "Escape"])
+        self.assertFalse(self.pane.asking or self.pane.open)
+        self.assertEqual(sess["model"], "opus")
+
+    def test_set_model_ignores_an_earlier_switch_line_still_on_screen(self):
+        # XERK-2157 QA: the old check accepted ANY "Set model to … for this
+        # session only" on the pane, so a line left by an earlier switch
+        # "confirmed" one that never landed.
+        old = "❯ /model\n  ⎿  Set model to Sonnet for this session only\n"
+        sm = self.make_manager(pane=_PickerPane(confirm=False, history=old))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(sess["model"], "opus")
+        # ...and a NEW line naming the target still confirms beside it.
+        self.run_calls.clear()
+        sm = self.make_manager(pane=_PickerPane(history=old))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(sess["model"], "sonnet")
+
+    def test_set_model_records_a_switch_whose_line_scrolled_an_old_one_off(self):
+        # XERK-2157 QA: on a full screen the new line pushes the top rows out
+        # of view, taking an earlier line for the same model with it — the
+        # count stays put, yet the switch landed.
+        old = ("❯ /model\n  ⎿  Set model to Sonnet for this session only\n"
+               "❯ hi\n● hi\n")
+        sm = self.make_manager(pane=_PickerPane(ask=True, history=old, scrolls=2))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(sess["model"], "sonnet")
+
+    def test_set_model_defers_while_the_operator_has_a_draft(self):
+        # XERK-2157 QA: "/model" + Enter typed onto a draft submitted it as a
+        # prompt, and clearing it first only ever cleared what was before the
+        # cursor, then ate the operator's edits on every retry. The draft is
+        # never touched: no key at all, the pick waits.
+        for draft in (["my draft line one\\", "second line"], ["one line"],
+                      [f"row {i}" for i in range(25)]):
+            self.run_calls.clear()
+            pane = _DraftPane(draft)
+            sm = self.make_manager(pane=pane)
+            sess = self._session(sm, model=None)
+            sm.set_model("abcde", "sonnet")
+            self.assertEqual(self.run_calls, [], draft)
+            self.assertEqual(pane.draft, draft)
+            self.assertEqual(sess["pendingModel"], "sonnet")
+            self.assertIsNone(sess["model"])
+
+    def test_a_deferred_pick_lands_once_the_draft_is_gone(self):
+        pane = _DraftPane(["half a thought"])
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        sm._apply_pending_switches()                 # draft still there: waits
+        self.assertEqual(self.run_calls, [])
+        pane.draft = []                              # the operator sent or cleared it
+        sm._apply_pending_switches()
+        self.assertNotIn("pendingModel", sess)
+        self.assertEqual(sess["model"], "sonnet")
+
+    def test_set_model_goes_on_past_the_dim_placeholder(self):
+        pane = _DraftPane(['Try "fix the lint errors"'], deaf=True)
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys()[:2], ["C-u", "/model"])
+        self.assertEqual(sess["model"], "sonnet")
+
+    def test_set_model_defers_when_the_composer_cannot_be_seen(self):
+        # A pane 5 rows or shorter draws no readable box (XERK-2157 QA: a
+        # draft there was submitted), and a failed styled capture is
+        # "can't tell": both wait rather than type onto what might be a draft.
+        for styled in ("● ok\n\n" + "─" * 40 + "\n", None):
+            self.run_calls.clear()
+            pane = _PickerPane()
+            pane.styled = lambda styled=styled: styled
+            sm = self.make_manager(pane=pane)
+            sess = self._session(sm, model=None)
+            sm.set_model("abcde", "sonnet")
+            self.assertEqual(self.run_calls, [])
+            self.assertEqual(sess["pendingModel"], "sonnet")
+
+    def test_composer_holds_text_reads_the_dim_placeholder_as_empty(self):
+        rule = "─" * 30 + "\n"
+        box = lambda row: rule + row + "\n" + rule
+        self.assertIs(ha._composer_holds_text(
+            box('\x1b[39m❯\xa0\x1b[2mTry "how does <filepath> work?"\x1b[0m')), False)
+        self.assertIs(ha._composer_holds_text(box("\x1b[39m❯\xa0 tail")), True)
+        # Dim text, a reset, then real text on the same row is a draft.
+        self.assertIs(ha._composer_holds_text(
+            box("\x1b[39m❯\xa0\x1b[2mTry\x1b[0m tail\x1b[2m x\x1b[0m")), True)
+        self.assertIs(ha._composer_holds_text(box("❯ ") + ""), False)
+        self.assertIs(ha._composer_holds_text(rule + "❯ \n\n\n" + rule), False)
+        # A short pane under a tall draft: the top rule and the draft's last
+        # rows, no bottom rule (captured on 2.1.306 at 140x10).
+        self.assertIs(ha._composer_holds_text(
+            "  ⎿  Set model to Sonnet 5.5 for this session only\n\n" + rule
+            + "❯\xa0QATALL line 44\n  QATALL line 45\n  QATALL last\n"), True)
+        # At 5 rows or fewer an empty box and a draft look alike (a lone rule,
+        # or none): not proven empty, so it holds.
+        self.assertIs(ha._composer_holds_text("● ok\n\n" + rule), True)
+        self.assertIs(ha._composer_holds_text(
+            "  QATALL last\n" + rule + "  ⏵⏵ auto mode on (shift+tab to cycle)\n"), True)
+        self.assertIs(ha._composer_holds_text("no composer\n"), True)
+        # The box is the LAST two rules: one in the conversation above it (a
+        # reply can draw its own) is not the composer's.
+        self.assertIs(ha._composer_holds_text(
+            rule + "● a reply\n" + rule + "✻ Churned\n" + box("❯ ")), False)
+
+    def test_only_windows_goes_on_without_a_styled_capture(self):
+        self.assertTrue(ha._composer_blocks_switch(None))
+        with mock.patch.object(ha, "IS_WINDOWS", True):
+            self.assertFalse(ha._composer_blocks_switch(None))
+            self.assertTrue(ha._composer_blocks_switch("no composer\n"))
+        rule = "─" * 30 + "\n"
+        self.assertFalse(ha._composer_blocks_switch(rule + "❯ \n" + rule))
+        self.assertIsNone(ha._composer_holds_text(None))
+
+    def test_set_model_never_confirms_off_a_picker_still_drawn(self):
+        # XERK-2157 QA: with the pane scrolled up beforehand, a line above the
+        # still-open picker read as new although `s` never landed.
+        class Dropped(_PickerPane):
+            def key(self, key):
+                if key != "s":
+                    super().key(key)
+
+            def capture(self):
+                cap = super().capture()
+                if self.open:
+                    return ("  ⎿  Set model to Sonnet for this session only\n" + cap)
+                return cap
+        sm = self.make_manager(pane=Dropped())
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(sess["model"], "opus")
+        self.assertEqual(self._keys()[-1], "Escape")    # backed out of the picker
+        self.assertFalse(self.pane.open)
+
+    def test_set_model_needs_the_line_to_name_the_target(self):
+        pane = _PickerPane()
+        pane.name = lambda: "Haiku"
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(sess["model"], "opus")
+
+    def test_set_model_defers_while_a_switch_confirm_is_up(self):
+        sm = self.make_manager(pane=_2157_CONFIRM_140)
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(sess["pendingModel"], "sonnet")
 
     def test_set_model_row_not_offered_escapes(self):
         # A probed alias with no picker row (the bracketed 1M variants) backs
@@ -21378,6 +22203,82 @@ class TestParsePanePrompt(unittest.TestCase):
             p["detail"],
             "Bash command\ntouch /tmp/permtest-marker\nCreate marker file in /tmp")
 
+    def test_wrapped_option_label(self):
+        # A label too long for the pane wraps; the run must not stop at the wrap
+        # (XERK-2150: options 3 and 4 — the only way to decline — were dropped).
+        p = ha.parse_pane_prompt(PANE_WRAPPED_OPTION_DIALOG)
+        self.assertEqual(
+            [o["label"] for o in p["options"]],
+            ["Yes",
+             "Yes, and always allow access to /tmp/build/long-dir-name/cap/work"
+             " from this project",
+             "Yes, and switch to auto mode · auto mode handles these prompts for you",
+             "No"])
+        # The rejoined label is the dialog's identity at any width.
+        wide = ha.parse_pane_prompt(PANE_WRAPPED_OPTION_DIALOG.replace(
+            "these\n      prompts", "these prompts").replace(
+            "to\n      /tmp", "to /tmp").replace("─" * 60, "─" * 140))
+        self.assertEqual(wide["id"], p["id"])
+
+    def test_picker_descriptions_not_options(self):
+        # A description sits on the same indent as a wrap, but its first word
+        # would have fit beside the label: the picker is not a panePrompt, so
+        # "Type something." never becomes a digit to send.
+        self.assertIsNone(ha.parse_pane_prompt(PANE_ASK_PICKER))
+        # Even with the rule and "5. Chat about this" gone, the width test alone
+        # keeps a description under a short label out of the run.
+        self.assertIsNone(ha.parse_pane_prompt(
+            PANE_ASK_PICKER.split("  4. Type")[0] + "  4. Type something.\n"))
+        # Labels that fill the pane make descriptions indistinguishable from
+        # wraps; the numbering carrying on past the run is what refuses these.
+        self.assertIsNone(ha.parse_pane_prompt(PANE_ASK_PICKER_FULL_LABELS))
+        self.assertIsNone(ha.parse_pane_prompt(PANE_ASK_PICKER_MULTI))
+        # The width test is what decides: with the pane narrowed to the label,
+        # the same line WOULD be a wrap.
+        self.assertIsNotNone(ha.parse_pane_prompt(
+            " Proceed?\n ❯ 1. Yes\n   2. No, and tell Claude what to\n"
+            "      instead\n" + "─" * 30))
+
+    def test_wrapped_path_label(self):
+        # The TUI breaks a path inside the token, where there was no space;
+        # an ordinary word break dropped one.
+        p = ha.parse_pane_prompt(PANE_WRAPPED_PATH_DIALOG)
+        self.assertEqual(
+            [o["label"] for o in p["options"]][1:3],
+            ["Yes, allow reading from /home/truenas_admin/git/.turma/worktrees/"
+             "Turma/2019f/agent/tests from this project",
+             "Yes, and switch to auto mode · auto mode handles these prompts for you"])
+        self.assertEqual(ha._pane_join_wrap("…/.turma/wor", "ktrees/x from"),
+                         "…/.turma/worktrees/x from")
+        self.assertEqual(ha._pane_join_wrap("access to tmp/", "from this"),
+                         "access to tmp/ from this")
+        self.assertEqual(ha._pane_join_wrap("reading from", "/home/x"),
+                         "reading from /home/x")
+
+    def test_a_full_width_wrap_keeps_the_options_below_its_gap(self):
+        p = ha.parse_pane_prompt(PANE_FULL_WIDTH_WRAP_DIALOG)
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3, 4])
+        self.assertEqual(p["options"][3]["label"], "No")
+        # The gap is stepped over only under a line that fills the pane: a blank
+        # between ordinary options still ends the run (two lists, not one).
+        p = ha.parse_pane_prompt(
+            "─" * 40 + "\n Proceed?\n ❯ 1. Yes\n\n   2. Maybe\n   3. No\n")
+        self.assertIsNone(p)
+        # Nor under a line one cell short of the pane: only an exact fill.
+        short = " ❯ 1. " + "y" * 33       # 39 cells in a 40-cell pane
+        self.assertIsNone(ha.parse_pane_prompt(
+            "─" * 40 + "\n Proceed?\n" + short + "\n\n   2. No\n"))
+
+    def test_wrap_needs_label_column_and_cells(self):
+        # A line off the label column is not part of the label, however full
+        # the line above it.
+        p = ha.parse_pane_prompt(
+            " Proceed?\n ❯ 1. Yes\n   2. No, and tell Claude what to\n"
+            "    instead\n" + "─" * 30)
+        self.assertEqual(p["options"][1]["label"], "No, and tell Claude what to")
+        # Wide glyphs take two cells, so a CJK label fills the pane sooner.
+        self.assertEqual(ha._pane_cells("中文 ok"), 7)
+
     def test_plan_dialog(self):
         p = ha.parse_pane_prompt(PANE_PLAN_DIALOG)
         self.assertEqual(
@@ -21389,6 +22290,113 @@ class TestParsePanePrompt(unittest.TestCase):
         # The plan body sits one rule further up than a permission dialog's
         # block; the same walk has to reach it.
         self.assertEqual(p["detail"], "Plan\nI will add one test.")
+
+    def test_a_subtitle_between_question_and_options(self):
+        # XERK-2162: Claude Code 2.1.306's exit-plan-mode dialog draws a line
+        # between the question and the run, inside a box narrower than the pane.
+        want = [(1, "Yes, and switch to default (ask each time) for this session",
+                 True),
+                (2, "No", False)]
+        ids = set()
+        for frame in (PANE_EXIT_PLAN_SUBTITLE_DIALOG,
+                      PANE_EXIT_PLAN_SUBTITLE_DIALOG_60,
+                      PANE_EXIT_PLAN_SUBTITLE_DIALOG_36):
+            p = ha.parse_pane_prompt(frame)
+            self.assertEqual(p["prompt"], "Exit plan mode?")
+            self.assertEqual(
+                [(o["number"], o["label"], o["selected"]) for o in p["options"]],
+                want)
+            # The conversation above the ▔ edge is not the dialog's detail; a
+            # wrapped subtitle reads as one line.
+            self.assertEqual(p["detail"], "Claude wants to exit plan mode")
+            self.assertTrue(ha._pane_blocking_dialog(frame))
+            ids.add(p["id"])
+        # The same dialog at three widths is one dialog.
+        self.assertEqual(len(ids), 1)
+        # The subtitle is part of the dialog's identity.
+        other = ha.parse_pane_prompt(PANE_EXIT_PLAN_SUBTITLE_DIALOG.replace(
+            "wants to exit", "would like to leave"))
+        self.assertNotEqual(other["id"], ids.pop())
+
+    def test_the_edges_effort_badge_is_not_part_of_the_dialog(self):
+        # For a few seconds the ▔ edge carries an effort badge; the id must not
+        # change when it goes, or an answer stamped with the first id is dropped.
+        edge = "▔" * 60
+        badged = PANE_EXIT_PLAN_SUBTITLE_DIALOG_60.replace(
+            edge, "▔" * 39 + " ◐ medium · /effort ▔")
+        self.assertNotEqual(badged, PANE_EXIT_PLAN_SUBTITLE_DIALOG_60)
+        self.assertEqual(ha.parse_pane_prompt(badged)["id"],
+                         ha.parse_pane_prompt(PANE_EXIT_PLAN_SUBTITLE_DIALOG_60)["id"])
+
+    def test_a_short_rule_is_not_the_dialogs_box(self):
+        # A rule far narrower than the pane is content (a diff, a plan), so the
+        # wrap is still judged against the pane.
+        frame = PANE_EXIT_PLAN_SUBTITLE_DIALOG_60.replace(
+            "─" * 56, "─" * 20)
+        self.assertIsNone(ha.parse_pane_prompt(frame))
+
+    def test_a_subtitle_only_under_the_edge(self):
+        # A reply shaped question / note / options in the conversation, read
+        # while the Ctrl-C toast hides the footer (real 2.1.306 frame, trimmed).
+        toast = (
+            "● Which option should I take?\n\n  This is a note.\n\n"
+            "  ❯ 1. Alpha\n    2. Beta\n\n✻ Cooked for 2s · done 2:18 AM\n\n"
+            + "─" * 80 + "\n❯ \n" + "─" * 80 + "\n  Press Ctrl-C again to exit\n")
+        self.assertIsNone(ha.parse_pane_prompt(toast))
+        # A ▔ line quoted in the reply is indented, so it is not the edge.
+        self.assertIsNone(ha.parse_pane_prompt(toast.replace(
+            "● Which", "● Heads up\n  ▔▔▔▔▔▔▔▔▔▔\n  Which")))
+        # Only the question sits between the edge and the subtitle.
+        self.assertIsNone(ha.parse_pane_prompt(
+            "▔▔▔▔▔\nHeading\nProceed?\n\nnote\n\n ❯ 1. Yes\n   2. No\n"))
+        self.assertIsNotNone(ha.parse_pane_prompt(
+            "▔▔▔▔▔\n  ────\nProceed?\n\nnote\n\n ❯ 1. Yes\n   2. No\n"))
+        # The dialog without its edge on screen is not read as one either.
+        self.assertIsNone(ha.parse_pane_prompt(
+            PANE_EXIT_PLAN_SUBTITLE_DIALOG.split("▔" * 44 + "\n")[1]))
+
+    def test_the_exit_toast_vetoes_like_the_footer(self):
+        # XERK-2169: a reply shaped question / options, read while the Ctrl-C
+        # toast replaces the mode footer (real 2.1.306 frame, trimmed).
+        cap = ("● Which option should I take?\n\n"
+               "  ❯ 1. Alpha\n    2. Beta\n\n✻ Cooked for 2s · done 2:18 AM\n\n"
+               + "─" * 80 + "\n❯ \n" + "─" * 80 + "\n  Press Ctrl-C again to exit\n")
+        self.assertIsNone(ha.parse_pane_prompt(cap))
+        self.assertIsNone(ha.parse_pane_prompt(
+            cap.replace("Ctrl-C", "Ctrl-D")))
+        # Only the toast line itself vetoes: the same text quoted inside a line
+        # leaves the reply parsing as it always did without a footer.
+        self.assertIsNotNone(ha.parse_pane_prompt(cap.replace(
+            "  Press Ctrl-C again to exit", "  Tip: Press Ctrl-C again to exit")))
+        # A narrow pane wraps the toast (QA: 28 and 24 columns, 3 lines at 16).
+        for wrapped in ("Press Ctrl-C again to\n  exit",
+                        "Press Ctrl-C again\n  to exit",
+                        "Press Ctrl-C\n  again to\n  exit"):
+            self.assertIsNone(ha.parse_pane_prompt(cap.replace(
+                "Press Ctrl-C again to exit", wrapped)), wrapped)
+        # A real dialog is still read; the toast is never below one.
+        self.assertIsNotNone(ha.parse_pane_prompt(PANE_EXIT_PLAN_SUBTITLE_DIALOG))
+
+    def test_a_subtitle_needs_blank_fences_and_a_question(self):
+        # Prose glued to the question or to the run is not a subtitle.
+        self.assertIsNone(ha.parse_pane_prompt(
+            "▔▔▔\nProceed?\nsome prose\n\n ❯ 1. Yes\n   2. No\n"))
+        self.assertIsNone(ha.parse_pane_prompt(
+            "▔▔▔\nProceed?\n\nsome prose\n ❯ 1. Yes\n   2. No\n"))
+        # No question above the subtitle.
+        self.assertIsNone(ha.parse_pane_prompt(
+            "▔▔▔\nHeading\n\nsome prose\n\n ❯ 1. Yes\n   2. No\n"))
+        # Two paragraphs, or one longer than a wrapped sentence, are not one.
+        self.assertIsNone(ha.parse_pane_prompt(
+            "▔▔▔\nProceed?\n\na\n\nb\n\n ❯ 1. Yes\n   2. No\n"))
+        self.assertIsNone(ha.parse_pane_prompt(
+            "▔▔▔\nProceed?\n\na\nb\nc\nd\n\n ❯ 1. Yes\n   2. No\n"))
+        # A subtitle holds no question, rule or numbered line of its own.
+        for inner in ("Why not?\nbecause", "────\nnote", "0. note"):
+            self.assertIsNone(ha.parse_pane_prompt(
+                "▔▔▔\nProceed?\n\n" + inner + "\n\n ❯ 1. Yes\n   2. No\n"), inner)
+        # The /model picker's description line still has no question above.
+        self.assertIsNone(ha.parse_pane_prompt(MODEL_PICKER_PANE))
 
     def test_idle_composer_is_never_a_dialog(self):
         # A numbered list in the conversation, a "?" line above it, and the
@@ -21987,6 +22995,22 @@ class TestBridgeMod(ProjectDirMixin, unittest.TestCase):
                 rep = ha.session_report(self.WORKDIR, {}, "agent-abc", session_id=self.SID,
                                         claude_sid=self.CSID, agent_type=agent_type)
             self.assertIs(rep["paneBusy"], want, agent_type)
+
+    def test_an_unnumbered_dialog_stops_the_fold(self):
+        # XERK-2142: an MCP elicitation is no panePrompt, but the session is
+        # waiting on a person all the same — a running turn must not read busy.
+        write_jsonl(os.path.join(self.proj, f"{self.CSID}.jsonl"),
+                    [{"type": "user", "message": {"content": "go"}}])
+        self._state()
+        for cap, want in ((_2142_ELICIT, False), (LINUX_COMPOSER_PANE, True)):
+            with mock.patch.object(ha, "_capture_pane", return_value=cap):
+                rep = ha.session_report(self.WORKDIR, {}, "agent-abc", session_id=self.SID,
+                                        claude_sid=self.CSID, agent_type="claude")
+            self.assertIsNone(rep["panePrompt"])
+            self.assertIs(rep["paneBusy"], want)
+        report = {"paneBusy": False, "transcriptAgeSec": 5}
+        ha.fold_turn_state(report, True, dialog=True)
+        self.assertIs(report["paneBusy"], False)
 
 
 class TestWakeRequest(ManagerMixin, unittest.TestCase):
@@ -35159,6 +36183,71 @@ class TestMrStatus(unittest.TestCase):
         self.assertIn("projects/grp%2Fsub%2Fapp/merge_requests/12",
                       gl.call_args[0][0])
 
+    def test_a_fast_forward_head_counts_only_on_its_target_branch(self):
+        # XERK-2156: GitLab rebases a fork MR at merge and keeps reporting the
+        # fork's head, on no branch here (real inkscape MRs): never a mergeCommit.
+        head = "ab" * 20
+        mr = {"iid": 12, "state": "merged", "web_url": self.MR, "sha": head,
+              "merge_commit_sha": None, "squash_commit_sha": None,
+              "target_branch": "main"}
+        calls = []
+
+        def answer(branches):
+            def get(path):
+                calls.append(path)
+                if "/refs?" in path:
+                    return branches if branches is None else [
+                        {"type": "branch", "name": b} for b in branches]
+                return dict(mr)
+            return get
+        p = mock.patch.dict(ha._MR_HEAD_LANDED, {}, clear=True)
+        p.start()
+        self.addCleanup(p.stop)
+        with self._configured():
+            for branches, landed in ((None, False), ([], False), (["1.6"], False),
+                                     (["x"] * 100, False), (["main", "1.6"], True)):
+                calls.clear()
+                ha._MR_HEAD_LANDED.clear()
+                with mock.patch.object(ha, "_gitlab_get", answer(branches)):
+                    got = ha.mr_status(self.MR).get("mergeCommit")
+                self.assertEqual(got, head if landed else None, branches)
+                self.assertIn(f"projects/grp%2Fsub%2Fapp/repository/commits/{head}"
+                              "/refs?type=branch&per_page=100", calls)
+            # A merged MR's answer never changes: asked once, then remembered.
+            calls.clear()
+            with mock.patch.object(ha, "_gitlab_get", answer([])):
+                self.assertEqual(ha.mr_status(self.MR)["mergeCommit"], head)
+            self.assertEqual(len(calls), 1)
+            # "Can't tell" (a failed call, a full page without the target) is asked again.
+            for unsure in (None, ["x"] * 100):
+                ha._MR_HEAD_LANDED.clear()
+                with mock.patch.object(ha, "_gitlab_get", answer(unsure)):
+                    self.assertNotIn("mergeCommit", ha.mr_status(self.MR))
+                with mock.patch.object(ha, "_gitlab_get", answer(["main"])):
+                    self.assertEqual(ha.mr_status(self.MR)["mergeCommit"], head, unsure)
+            # A malformed branch entry is no branch, never a raise.
+            ha._MR_HEAD_LANDED.clear()
+            with mock.patch.object(ha, "_gitlab_get",
+                                   lambda p: [{"name": ["main"]}, {"name": {}}, "main"]
+                                   if "/refs?" in p else dict(mr)):
+                self.assertNotIn("mergeCommit", ha.mr_status(self.MR))
+            # The memory is bounded: the oldest answer goes first.
+            ha._MR_HEAD_LANDED.clear()
+            with mock.patch.object(ha, "_MR_HEAD_LANDED_MAX", 2):
+                for i in range(3):
+                    mr["sha"] = f"{i:040x}"
+                    with mock.patch.object(ha, "_gitlab_get", answer(["main"])):
+                        ha.mr_status(self.MR)
+                self.assertEqual([k[1] for k in ha._MR_HEAD_LANDED],
+                                 [f"{1:040x}", f"{2:040x}"])
+            mr["sha"] = head
+            # A merge or squash commit is GitLab's own record: no branch read.
+            calls.clear()
+            mr["squash_commit_sha"] = "cd" * 20
+            with mock.patch.object(ha, "_gitlab_get", answer(None)):
+                self.assertEqual(ha.mr_status(self.MR)["mergeCommit"], "cd" * 20)
+            self.assertEqual(len(calls), 1)
+
     def test_mr_status_none_when_unreachable(self):
         with mock.patch.multiple(ha, GITLAB_URL="", GITLAB_TOKEN=""):
             self.assertIsNone(ha.pr_status(self.MR))
@@ -36659,7 +37748,7 @@ class TestCollectAzure(unittest.TestCase):
         self.assertEqual(by["2"]["epicKey"], "5")
         self.assertTrue(by["5"]["isEpic"])
         self.assertIsNone(by["5"]["epicKey"])
-        self.assertEqual(fetched[-1], ("100", "System.Id,System.WorkItemType"))
+        self.assertEqual(fetched[-1], ("100", "System.Id,System.WorkItemType,System.TeamProject"))
         self.assertEqual(len(fetched), 2)
 
     def test_parent_type_fetch_failure_degrades_xerk1444(self):
@@ -36691,6 +37780,113 @@ class TestCollectAzure(unittest.TestCase):
             fail["on"] = True
             by = {t["key"]: t for t in ha.collect_azure()["tickets"]}
             self.assertEqual(by["2"]["epicKey"], "100")
+
+    def _portfolio_req(self, items, levels, calls, fail=None):
+        base = self._fake_req(items)
+
+        def req(path, params, body=None):
+            if path.endswith("/_apis/work/processconfiguration"):
+                calls.append(path)
+                if fail and fail["on"]:
+                    raise OSError("boom")
+                return {"portfolioBacklogs": [
+                    {"name": n, "workItemTypes": [{"name": t}]} for n, t in levels]}
+            return base(path, params, body)
+        return req
+
+    def test_localized_and_custom_portfolio_levels_are_epics_xerk1888(self):
+        # A localized process names Epic otherwise, and an operator-added
+        # portfolio level has its own name: both come from the project's
+        # process configuration, not the English name list.
+        items = [
+            _azure_wi(1, "Active", wtype="Initiative"),
+            _azure_wi(2, "Active", wtype="Récit utilisateur", **{"System.Parent": 3}),
+            _azure_wi(3, "New", wtype="Épopée"),
+            _azure_wi(4, "Active", wtype="Tâche", **{"System.Parent": 1}),
+        ]
+        calls = []
+        req = self._portfolio_req(
+            items, [("Initiatives", "Initiative"), ("Épopées", "Épopée")], calls)
+        with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PARENT_TYPE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PARENT_PROJECT_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PORTFOLIO_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            by = {t["key"]: t for t in ha.collect_azure()["tickets"]}
+            ha.collect_azure()
+        self.assertTrue(by["1"]["isEpic"])
+        self.assertTrue(by["3"]["isEpic"])
+        self.assertFalse(by["2"]["isEpic"])
+        self.assertEqual(by["2"]["epicKey"], "3")
+        self.assertEqual(by["4"]["epicKey"], "1")
+        self.assertEqual(calls, ["/Proj/_apis/work/processconfiguration"],
+                         "read once per project, then cached")
+
+    def test_portfolio_levels_are_judged_per_project_xerk1888(self):
+        # X has a custom "Initiative" level; Y's ordinary "Initiative" type is
+        # not one there. A parent in a third project Z (no assigned item) is
+        # judged by Z's own process, which is read too.
+        items = [
+            _azure_wi(1, "Active", wtype="Initiative", project="X"),
+            _azure_wi(2, "Active", wtype="Initiative", project="Y"),
+            _azure_wi(3, "Active", wtype="Task", project="Y", **{"System.Parent": 2}),
+            _azure_wi(4, "Active", wtype="Task", project="X", **{"System.Parent": 900}),
+        ]
+        levels = {"X": ["Initiative", "Epic"], "Y": ["Epic", "Feature"],
+                  "Z": ["Thème"]}
+        base = self._fake_req(items)
+
+        def req(path, params, body=None):
+            if path.endswith("/_apis/work/processconfiguration"):
+                proj = urllib.parse.unquote(path.split("/")[1])
+                return {"portfolioBacklogs": [
+                    {"workItemTypes": [{"name": n}]} for n in levels[proj]]}
+            if path == "/_apis/wit/workitems" and params["ids"] == "900":
+                return {"value": [_azure_wi(900, "New", wtype="Thème", project="Z")]}
+            return base(path, params, body)
+        with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PARENT_TYPE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PARENT_PROJECT_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PORTFOLIO_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            by = {t["key"]: t for t in ha.collect_azure()["tickets"]}
+        self.assertTrue(by["1"]["isEpic"])
+        self.assertFalse(by["2"]["isEpic"], "not a portfolio level in its own project")
+        self.assertIsNone(by["3"]["epicKey"])
+        self.assertEqual(by["4"]["epicKey"], "900")
+
+    def test_an_unread_project_takes_the_org_union_xerk1888(self):
+        with mock.patch.object(ha, "_AZDO_PORTFOLIO_CACHE", {
+                ("s", "X"): (frozenset({"initiative"}), 9e12),
+                ("s", "B"): (frozenset(), 9e12)}):
+            self.assertTrue(ha._azure_is_epic_type("Initiative", "s", "B"))   # read failed
+            self.assertTrue(ha._azure_is_epic_type("Initiative", "s", "Z"))   # never read
+            self.assertTrue(ha._azure_is_epic_type("Epic", "s", "Y"))
+            self.assertFalse(ha._azure_is_epic_type("Task", "s", "B"))
+
+    def test_portfolio_read_failure_keeps_the_english_floor_xerk1888(self):
+        items = [_azure_wi(1, "Active", wtype="Initiative"),
+                 _azure_wi(2, "Active", wtype="Epic")]
+        calls, fail = [], {"on": True}
+        req = self._portfolio_req(items, [("Initiatives", "Initiative")], calls, fail)
+        with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PARENT_TYPE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PORTFOLIO_CACHE", {}) as cache, \
+             mock.patch.object(ha, "azure_req", req):
+            block = ha.collect_azure()
+            self.assertTrue(block["available"])
+            by = {t["key"]: t for t in block["tickets"]}
+            self.assertTrue(by["2"]["isEpic"])      # the name floor still holds
+            self.assertFalse(by["1"]["isEpic"])     # unknown until it is read
+            # Read once, then a failed refresh keeps the last good answer.
+            fail["on"] = False
+            cache.clear()
+            ha.collect_azure()
+            fail["on"] = True
+            for ck, (names, _exp) in list(cache.items()):
+                cache[ck] = (names, 0)              # expired: re-read and fail
+            by = {t["key"]: t for t in ha.collect_azure()["tickets"]}
+            self.assertTrue(by["1"]["isEpic"])
 
     def test_parent_type_chunks_fail_independently_xerk1444(self):
         # A failed 2nd chunk keeps the 1st chunk's types; and a cap-overflow clear
@@ -49335,11 +50531,98 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         c.update(over)
         return c
 
+    def shadow(self, sm, cmd):
+        """spawn_shadow, then wait out its placement worker and apply it the way
+        the beat does (XERK-2167)."""
+        sm.spawn_shadow(cmd)
+        deadline = time.time() + 10
+        while time.time() < deadline and any(
+                "result" not in j for j in sm._shadow_placing.values()):
+            time.sleep(0.01)
+        for _ in range(len(sm._shadow_placing)):
+            sm._apply_shadow_placements()
+        self.assertEqual(sm._shadow_placing, {}, "a placement never landed")
+
+    def test_placement_runs_off_the_beat(self):
+        # XERK-2167: the base placement (a fetch + forge reads) and the issue
+        # read run on a worker, so a slow forge never holds handle_commands.
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        gate = threading.Event()
+
+        def slow_base(*a):
+            gate.wait(10)
+            return self.BASE, None
+        with mock.patch.object(ha, "shadow_base_commit", slow_base), \
+                mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
+            t0 = time.monotonic()
+            sm.handle_commands([dict(self.cmd(), cmdId="c1")])
+            self.assertLess(time.monotonic() - t0, 2, "the placement ran on the beat")
+            self.assertEqual((sm.registry, sm.shadow_runs), ([], {}))
+            # A re-delivery while it is placed is a no-op, as is a beat before it lands.
+            sm.spawn_shadow(self.cmd())
+            sm._apply_shadow_placements()
+            self.assertEqual(len(sm._shadow_placing), 1)
+            gate.set()
+            self.shadow(sm, self.cmd())
+        [sess] = sm.registry
+        self.assertEqual(sess["baseRef"], self.BASE)
+        self.assertEqual(sm.shadow_runs[self.RID]["state"], "running")
+
+    def test_full_beats_launch_one_placed_run_each_and_light_beats_none(self):
+        # XERK-2167: the beat wiring — a placed run launches only on a FULL
+        # beat, one per beat; a re-delivery places nothing twice; a placing
+        # run holds its slot so the hub does not hand it out again.
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        calls = []
+
+        def base(*a):
+            calls.append(a[3])
+            return self.BASE, None
+        rids = ["sh-00000000000000a1", "sh-00000000000000a2"]
+        # At the capacity edge: a run gives up its placing slot before it spawns,
+        # so it launches running, never queued behind itself.
+        with mock.patch.object(ha, "shadow_base_commit", base), \
+                mock.patch.object(ha, "MAX_SESSIONS", 2), \
+                mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
+            sm.handle_commands([dict(self.cmd(shadowId=r), cmdId=f"c{i}")
+                                for i, r in enumerate(rids + rids[:1])])
+            self.assertEqual(sm._slots_used(), 2, "a placing shadow holds its slot")
+            deadline = time.time() + 10
+            while time.time() < deadline and any(
+                    "result" not in j for j in sm._shadow_placing.values()):
+                time.sleep(0.01)
+            self.assertEqual(sorted(calls), rids, "a re-delivery placed twice")
+            sm.build_payload(1, light=True)
+            self.assertEqual(sm.registry, [], "a light beat launched")
+            sm.build_payload(2)
+            self.assertEqual(len(sm.registry), 1, "one launch per full beat")
+            sm.build_payload(3)
+        self.assertEqual([x["status"] for x in sm.registry], ["running", "running"])
+        self.assertEqual(sorted(sm.shadow_runs), rids)
+        self.assertEqual(sm._shadows_placing(), 0)
+
+    def test_a_placement_that_raises_is_a_failed_run(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "shadow_base_commit", mock.Mock(side_effect=OSError("boom"))):
+            self.shadow(sm, self.cmd())
+        self.assertEqual(sm.registry, [])
+        self.assertIn("boom", sm.shadow_runs[self.RID]["error"])
+
+    def test_a_worker_that_cannot_start_fails_the_run_on_the_beat(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.threading.Thread, "start",
+                               mock.Mock(side_effect=RuntimeError("pids"))):
+            sm.spawn_shadow(self.cmd())
+        self.assertEqual(sm._shadow_placing, {})
+        self.assertIn("could not start", sm.shadow_runs[self.RID]["error"])
+
     def spawned(self):
         sm = self.make_manager()
         sm._launch_ttyd = mock.Mock()
         with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
-            sm.spawn_shadow(self.cmd())
+            self.shadow(sm, self.cmd())
         for sess in sm.registry:   # the faked worktree add creates no directory
             os.makedirs(sess["worktreePath"], exist_ok=True)
         return sm
@@ -49421,7 +50704,7 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         # Reported to the hub, and a re-delivered command is a no-op.
         self.assertEqual(sm.shadow_runs_report()[0]["state"], "running")
         with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
-            sm.spawn_shadow(self.cmd())
+            self.shadow(sm, self.cmd())
         self.assertEqual(len(sm.registry), 1)
 
     def test_refusals_are_reported_as_failed_runs(self):
@@ -49435,14 +50718,14 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
                     os.remove(ha.SHADOW_RUNS_PATH)
                 sm = self.make_manager()
                 with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
-                    sm.spawn_shadow(self.cmd(**over))
+                    self.shadow(sm, self.cmd(**over))
                 self.assertEqual(sm.registry, [])
                 r = sm.shadow_runs[self.RID]
                 self.assertEqual(r["state"], "failed")
                 self.assertIn(why, r["error"])
         os.remove(ha.SHADOW_RUNS_PATH)
         sm = self.make_manager()
-        sm.spawn_shadow(self.cmd(shadowId="../x"))
+        self.shadow(sm, self.cmd(shadowId="../x"))
         self.assertEqual(sm.shadow_runs, {})
 
     def test_done_hands_the_commit_to_an_opus_grader_then_reports_the_grade(self):
@@ -49634,7 +50917,7 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         def spawn(n):
             rid = f"sh-{n:016x}"
             with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
-                sm.spawn_shadow(self.cmd(shadowId=rid))
+                self.shadow(sm, self.cmd(shadowId=rid))
             return sm.shadow_runs[rid]
         for n, (files, why) in enumerate(cases, 1):
             with self.subTest(why=why):
@@ -49662,7 +50945,7 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "run_out", lambda cmd, **k: (None, "") if "ls-tree" in cmd
                                else real(cmd, **k)), \
                 mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
-            sm.spawn_shadow(self.cmd())
+            self.shadow(sm, self.cmd())
         self.assertEqual(sm.registry, [])
         self.assertIn("could not read the base commit", sm.shadow_runs[self.RID]["error"])
 
@@ -49854,6 +51137,213 @@ class TestShadowBase(unittest.TestCase):
         self.git(self.dev, "commit", "-q", "-m", "x2", "-m", "body of x2")
         merge = self.land()
         self.assertEqual(self.base(merge, 15), (before, None))
+
+
+class TestForgeShadowBase(TestShadowBase):
+    """XERK-2146: a GitLab MR or Azure DevOps PR has no `refs/pull/<n>/head`, so
+    its commits come from the forge's API, matched against the same real git.
+    Every commit gets its own author and author second, so a listing read in
+    the wrong order, or matched without its author, cannot pass by accident."""
+
+    MR = "https://gitlab.example/g/r/-/merge_requests/3"
+    ADO = "https://dev.azure.com/o/p/_git/r/pullrequest/4"
+
+    tick = 0
+
+    def setUp(self):
+        super().setUp()
+        self.api = {}       # what each forge answers; None = the call failed
+        self.ado_calls = []
+
+        def azure_get(path, params=None):
+            self.ado_calls.append((path, params))
+            return self.api.get("ado" if path.endswith("/commits") else "adopr")
+        for name, fn in (("_mr_url_parts", lambda u: ("g/r", "3")),
+                         ("_azdo_pr_id", lambda u: "4"),
+                         ("_gitlab_get", lambda p: self.api.get(
+                             "gitlab" if "/commits" in p else "gitlabmr")),
+                         ("_azure_get", azure_get)):
+            p = mock.patch.object(ha, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.dict(ha._AZDO_PR_REF, {})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def commit(self, msg):
+        self.tick += 1
+        os.environ["GIT_AUTHOR_NAME"] = f"dev{self.tick % 3}"
+        os.environ["GIT_AUTHOR_DATE"] = f"2026-10-01T00:00:{self.tick:02d}Z"
+        return super().commit(msg)
+
+    def log(self, rev_range):
+        """The range's commits newest first, as both forges list them."""
+        out = self.git(self.dev, "log", "-z", "--format=%H%n%an%n%ae%n%aI%n%B", rev_range)
+        return [dict(zip(("sha", "name", "email", "date", "msg"), c.split("\n", 4)))
+                for c in out.split("\0") if c.strip()]
+
+    def gitlab(self, commits, start=None):
+        self.api["gitlab"] = [{"id": c["sha"], "author_name": c["name"],
+                               "author_email": c["email"], "authored_date": c["date"],
+                               "message": c["msg"]} for c in commits]
+        self.api["gitlabmr"] = {"iid": 3, "diff_refs": {"start_sha": start}}
+
+    def ado(self, commits, target, cut=0):
+        self.api["adopr"] = {"pullRequestId": 4,
+                             "repository": {"id": "r", "project": {"id": "p"}},
+                             "lastMergeTargetCommit": {"commitId": target}}
+        self.api["ado"] = {"value": [
+            {"commitId": c["sha"], "author": {"name": c["name"], "email": c["email"],
+                                              "date": c["date"]},
+             "comment": c["msg"][:cut] if cut else c["msg"],
+             "commentTruncated": bool(cut)} for c in commits]}
+
+    def rebase_land(self, n, **env):
+        self.git(self.dev, "rebase", "-q", "main", f"pr{n}", env=env)
+        self.git(self.dev, "switch", "-q", "main")
+        self.git(self.dev, "merge", "-q", "--ff-only", f"pr{n}")
+        return self.land()
+
+    def base_of(self, merge, url):
+        return ha.shadow_base_commit(self.host, merge, url, self.RID)
+
+    def test_a_gitlab_fast_forward_is_matched_by_sha(self):
+        before = self.open_pr(3, ["f1", "f2", "f3"])
+        self.git(self.dev, "rebase", "-q", "main", "pr3")   # GitLab rebases, then fast-forwards
+        commits = self.log("main..pr3")
+        for c in commits:
+            c["msg"] = "edited on the forge"                # only the shas can match
+        self.gitlab(commits, start=self.git(self.dev, "rev-parse", "main"))
+        self.git(self.dev, "switch", "-q", "main")
+        self.git(self.dev, "merge", "-q", "--ff-only", "pr3")
+        merge = self.land()
+        self.assertEqual(self.base_of(merge, self.MR), (before, None))
+        # The MR's head is what landed: it stands in for the absent merge commit.
+        st = ha._summarize_mr({"state": "merged", "merge_commit_sha": None,
+                               "squash_commit_sha": None, "sha": merge})
+        self.assertEqual(st["mergeCommit"], merge)
+
+    def test_a_rewritten_rebase_needs_the_same_authors(self):
+        before = self.open_pr(5, ["w1", "w2", "w3"])
+        commits = self.log("main..pr5")
+        merge = self.rebase_land(5, GIT_COMMITTER_NAME="GitLab")
+        self.gitlab(commits, start=before)
+        self.assertEqual(self.base_of(merge, self.MR), (before, None))
+        commits[1]["name"] = "someone else"
+        self.gitlab(commits, start=before)
+        self.assertEqual(self.base_of(merge, self.MR),
+                         (None, "the PR's commits do not reach the base its forge names"),
+                         "another author is not the MR's commit, and GitLab did not squash")
+
+    def test_an_ado_rebase_bases_before_the_prs_first_commit_in_either_order(self):
+        before = self.open_pr(4, ["r1", "r2", "r3"])
+        commits = self.log("main..pr4")                     # pre-rebase shas
+        merge = self.rebase_land(4, GIT_COMMITTER_NAME="Azure DevOps")
+        self.ado(commits, before, cut=2)                    # cut messages: a prefix
+        self.assertEqual(self.base_of(merge, self.ADO), (before, None))
+        self.assertIn(("/p/_apis/git/repositories/r/pullRequests/4/commits",
+                       {"$top": ha.SHADOW_PR_COMMITS_MAX + 1}), self.ado_calls)
+        self.ado(commits[::-1], before)                     # oldest first
+        self.assertEqual(self.base_of(merge, self.ADO), (before, None))
+
+    def test_an_ado_short_page_fails_rather_than_basing_mid_pr(self):
+        before = self.open_pr(6, ["p1", "p2", "p3", "p4"])
+        commits = self.log("main..pr6")
+        merge = self.rebase_land(6)
+        self.ado(commits[:2], before)                       # only the newest page
+        base, why = self.base_of(merge, self.ADO)
+        self.assertIsNone(base)
+        self.assertIn("base its forge names", why)
+        for target in (None, ""):                           # no named base: unreadable
+            self.ado(commits, target)
+            self.assertIn("could not list", self.base_of(merge, self.ADO)[1])
+        del self.api["adopr"]["lastMergeTargetCommit"]
+        self.assertIn("could not list", self.base_of(merge, self.ADO)[1])
+        self.ado(commits, before.upper())                   # the forge's casing is not ours
+        self.assertEqual(self.base_of(merge, self.ADO), (before, None))
+
+    def test_a_gitlab_list_must_reach_the_start_its_diff_names(self):
+        # XERK-2156: a list short of the MR's commits matched mid-MR (QA); the
+        # MR's diff_refs.start_sha, merge~N on every real fast-forward, catches it.
+        before = self.open_pr(9, ["g1", "g2", "g3"])
+        self.git(self.dev, "rebase", "-q", "main", "pr9")
+        start = self.git(self.dev, "rev-parse", "main")
+        commits = self.log("main..pr9")
+        self.git(self.dev, "switch", "-q", "main")
+        self.git(self.dev, "merge", "-q", "--ff-only", "pr9")
+        merge = self.land()
+        self.gitlab(commits, start=start)
+        self.assertEqual(self.base_of(merge, self.MR), (before, None))
+        self.gitlab(commits, start=start.upper())       # the forge's casing is not ours
+        self.assertEqual(self.base_of(merge, self.MR), (before, None))
+        for short in (commits[:2], commits[1:]):
+            self.gitlab(short, start=start)
+            base, why = self.base_of(merge, self.MR)
+            self.assertIsNone(base)
+            self.assertIn("base its forge names", why)
+        for bad in (None, "", "not-a-sha", self.git(self.host, "rev-parse", f"{merge}~1")):
+            self.gitlab(commits, start=bad)
+            self.assertIn("base its forge names", self.base_of(merge, self.MR)[1])
+        self.gitlab(commits)
+        self.api["gitlabmr"] = None                     # the MR itself did not read
+        self.assertIn("base its forge names", self.base_of(merge, self.MR)[1])
+
+    def test_a_gitlab_squash_keeps_its_parent_whatever_start_it_names(self):
+        # A squash GitLab rebased at merge keeps an older start_sha (real
+        # inkscape MRs): the list did not set the depth, so it is not checked.
+        stale = self.git(self.dev, "rev-parse", "main")
+        before = self.open_pr(10, ["q1", "q2"])
+        commits = self.log("main..pr10")
+        self.git(self.dev, "merge", "-q", "--squash", "pr10")
+        self.git(self.dev, "commit", "-q", "-m", "Squashed MR !10")
+        merge = self.land()
+        for start in (stale, None):
+            self.gitlab(commits, start=start)
+            self.api["gitlabmr"]["squash_commit_sha"] = merge
+            self.assertEqual(self.base_of(merge, self.MR), (before, None))
+        self.gitlab(commits, start=stale)               # no squash: a fast-forward's start
+        self.assertIn("base its forge names", self.base_of(merge, self.MR)[1])
+
+    def test_a_squash_keeps_the_first_parent(self):
+        before = self.open_pr(7, ["s1", "s2"])
+        commits = self.log("main..pr7")
+        self.git(self.dev, "merge", "-q", "--squash", "pr7")
+        self.git(self.dev, "commit", "-q", "-m", "Squashed MR !7")
+        merge = self.land()
+        self.gitlab(commits)
+        self.api["gitlabmr"]["squash_commit_sha"] = merge
+        self.ado(commits, before)
+        for url in (self.MR, self.ADO):
+            self.assertEqual(self.base_of(merge, url), (before, None))
+
+    def test_an_unreadable_or_oversized_commit_list_fails_closed(self):
+        self.open_pr(8, ["u1", "u2"])
+        self.git(self.dev, "merge", "-q", "--squash", "pr8")
+        self.git(self.dev, "commit", "-q", "-m", "Squashed MR !8")
+        merge = self.land()
+        unreadable = "could not list the PR's commits from its forge to find its base"
+        self.assertEqual(self.base_of(merge, self.MR), (None, unreadable))
+        self.gitlab([{"sha": "a" * 40, "name": "t", "email": "t@x", "msg": "m",
+                      "date": "2026-10-01T00:00:00.000+02:00"}] * 100)  # a full page
+        self.assertIn("over", self.base_of(merge, self.MR)[1])
+        self.api["gitlab"] = [{"id": "a" * 40}, {"id": "b" * 40, "author_name": "t",
+                                                 "author_email": "t@x", "message": "m",
+                                                 "authored_date": "2026-10-01T00:00:00Z"}]
+        self.assertEqual(self.base_of(merge, self.MR), (None, unreadable),
+                         "a malformed entry is never dropped from the list")
+        self.ado([], "c" * 40)
+        self.assertIn("no commits", self.base_of(merge, self.ADO)[1])
+        # A PR payload of the wrong shape is a refusal, never a raise on the beat.
+        self.api["adopr"] = {"pullRequestId": 4, "repository": "r"}
+        self.assertEqual(self.base_of(merge, self.ADO), (None, unreadable))
+        self.api["adopr"] = {"pullRequestId": 4, "repository": {"id": "r", "project": "p"}}
+        self.assertEqual(self.base_of(merge, self.ADO), (None, unreadable))
+        # The PR status poller reads the same payload: a wrong shape is no raise there either.
+        for repo in ("r", {"id": "r", "project": ["p"]}):
+            self.api["adopr"] = {"pullRequestId": 4, "repository": repo}
+            self.assertEqual(ha._azdo_fetch_pr(self.ADO), self.api["adopr"])
+        with mock.patch.object(ha, "_azdo_fetch_pr", side_effect=AttributeError("x")):
+            self.assertEqual(self.base_of(merge, self.ADO), (None, unreadable))
 
 
 class TestShadowSandbox(ManagerMixin, unittest.TestCase):

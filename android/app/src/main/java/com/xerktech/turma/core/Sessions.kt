@@ -120,6 +120,8 @@ fun liveState(session: SessionInfo, agentLastSeen: Long, now: Long): LiveState =
     (session.session?.question ?: "").isNotEmpty() -> LiveState.WAITING
     // A blocking TUI dialog (permission / plan approval) — web liveState's panePrompt.
     !session.session?.panePrompt?.prompt.isNullOrEmpty() -> LiveState.WAITING
+    // A dialog that is no panePrompt (XERK-2152) — only the hub's attention says so.
+    attentionDialog(session.attention) -> LiveState.WAITING
     sessionWorking(session, agentLastSeen, now) -> LiveState.WORKING
     // Asleep until a session-CLI wake (XERK-1571): holding, never Ready for review.
     sessionSleeping(session, now) -> LiveState.HOLDING
@@ -187,6 +189,7 @@ private fun localMidnight(ms: Long): Long = java.util.Calendar.getInstance().app
 fun needsYouChip(state: String): String? = when (state) {
     "needs-you:question" -> "question"
     "needs-you:permission" -> "permission"
+    "needs-you:dialog" -> "dialog"
     "needs-you:review" -> "review"
     "needs-you:test" -> "test"
     "needs-you:stalled" -> "stalled"
@@ -260,11 +263,19 @@ fun attentionLabel(att: Attention?): String? {
     val chip = needsYouChip(att.state) ?: return null
     if (chip == "question") return "waiting for your answer"
     if (chip == "permission") return "waiting for your permission"
+    if (chip == "dialog") return "waiting on a dialog in the terminal"
     // A review the classifier says needs a human TEST (XERK-1572) reads as one,
     // not as a bare "test" chip word — the web dashboard and Sessions headline.
     val word = if (chip == "test") "awaiting your test" else chip
     return listOf(word, att.why.orEmpty()).filterNot(::isJsBlank).joinToString(" · ")
 }
+
+/**
+ * Does the hub say this session sits in a terminal-only dialog (XERK-2152: the
+ * AskUserQuestion picker, an MCP elicitation or server approval)? The agent holds
+ * every message aimed at the pane until the operator answers it in the terminal.
+ */
+fun attentionDialog(att: Attention?): Boolean = att?.state == "needs-you:dialog"
 
 /** Does the hub say this session has STALLED on a background wait (XERK-1571)? */
 fun attentionStalled(att: Attention?): Boolean = att?.state == "needs-you:stalled"

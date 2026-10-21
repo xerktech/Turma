@@ -36,6 +36,12 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   legacy "default" row folds into Opus on load (`sanitizeRow`). The probe's label reads
   "`Opus 5.5 (1M context)` (effort: medium)", so only a known family named in it counts — never a
   parenthesised fragment. Tests: "an unpinned or 'default' session…" in `outcome-ledger.test.js`.
+- **A label naming two families reads as the one named FIRST** in it (XERK-2109), never by
+  `MODEL_FAMILIES` order: "Sonnet 5 (successor to Opus 4)" is Sonnet.
+- **A model that is only the Opus fallback (no alias, no probe) is a guess** (`modelGuess`,
+  XERK-2109): a later probe revises it; a pinned alias or `modelActual` clears it.
+  - A beat with no probe never downgrades a probed family back to the fallback.
+  - Tests: the `XERK-2109:` model cases in `outcome-ledger.test.js`.
 - **Outcome is DERIVED at read time** (`outcomeOf`), never stored: reopened → bad; merged →
   pending until `MODEL_QUALITY_WINDOW_DAYS` (90) passes, then good; every PR closed unmerged → bad;
   a stale close (not-reproducible / already-fixed) → no-change; ended with nothing → undelivered.
@@ -53,6 +59,10 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   Evicted keys are DELETEd from Postgres too, so the table is as bounded as the model.
 - **A host's shadow rows and live rows are capped apart** (XERK-1858): counted together, a busy
   shadow host evicted the live evidence its shadows pair against.
+- **A live row dropped by retention or its host's cap takes its paired shadows with it**
+  (XERK-2109), on whatever host they ran: below `MAX_ROWS` the orphan lingered until retention.
+  - Live hosts are capped first, so a shadow host's count excludes the shadows already taken.
+  - Tests: the `XERK-2109:` retention and host-cap cases in `outcome-ledger.test.js`.
 - **Past `MAX_ROWS` the org pass evicts a live row and its paired shadows as ONE unit** (XERK-1858),
   ranked and aged by the live row (XERK-1855 order); an orphaned shadow is its own unit and goes first.
   - Shadows alone first churned: at the cap a new shadow was evicted and re-created every tick and
@@ -181,6 +191,10 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     dropped, no attachments, no fetch directive); `shadow-done` (or its end/timeout) commits leftovers and hands the HEAD to an
     Opus GRADE session; `shadow-grade` makes it terminal. A run with no change is graded bad
     without a grader. One session teardown per beat; the `turma-shadow/<id>` branch is dropped.
+  - **`spawn_shadow` runs only its cheap checks on the beat** (XERK-2167): the base placement
+    (fetch + forge reads, ~53s worst case), tree check and issue read run on a worker
+    (`_place_shadow`); a later FULL beat launches one placed run (`_apply_shadow_placements`).
+    In memory: a restart mid-placement loses the run, which the hub stops counting unreported.
   - **Never a `ticket` block on either session** (and `_maybe_adopt_ticket` refuses a shadow), so
     no ticket sweep — auto-stop on Done, auto-merge, close-ticket, routing — acts on it. The
     hub raises no alert for a `shadow` session and lists it in no peer roster.
@@ -233,7 +247,27 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     fetch also pulls `refs/pull/<n>/head` (into `refs/turma-shadow-pr/<id>`, deleted after);
     when the N first-parent commits carry the PR's N authors, author times and messages in
     order, the base is `merge~N`. A squash or merge commit keeps `^1`. Can't read the head,
-    N=0, or N over `SHADOW_PR_COMMITS_MAX` → the run fails. GitLab/ADO keep `^1` (XERK-2146).
+    N=0, or N over `SHADOW_PR_COMMITS_MAX` → the run fails.
+  - **A GitLab MR / ADO PR is placed from its forge's commit list** (XERK-2146,
+    `_forge_rebase_base`): no `refs/pull` head there. The N first-parent commits must be the
+    MR's by sha (GitLab fast-forward) or by author/time/message (a rewrite; ADO's cut `comment`
+    as a prefix), in either listing order. Unreadable API → the run fails; a full GitLab page
+    (100) reads as over the cap. A fast-forward MR has no merge/squash sha, so `_summarize_mr`
+    reports its head `sha` as `mergeCommit` — without it such an MR never reached a shadow.
+  - **That `sha` counts only once GitLab says it is on the target branch** (XERK-2156,
+    `_mr_head_landed`, one refs call per merged MR, remembered). GitLab rebases a FORK MR at
+    merge and keeps reporting the fork's head: on real inkscape MRs that sha was on no branch,
+    and the landed copies are never named. Such an MR carries no `mergeCommit` at all.
+  - **ADO's answer must equal its `lastMergeTargetCommit`** (the target head the completion
+    rebased onto), on every path: the commits API pages by a header this reader never sees,
+    and a short page matched as a whole PR based mid-PR (QA-reproduced). Never drop that check.
+    Real ADO (XERK-2156): a squash's parent and a merge's first parent both equal it; a cut
+    `comment` ends with no `...` and is a prefix of the full message. Not seen on a real
+    forge: an ADO rebase completion, or one after the target moved past the last evaluation.
+  - **A GitLab fast-forward's answer must equal `diff_refs.start_sha`** (XERK-2156), on every
+    path; an MR that does not read or names none fails. On 78 of 78 real fast-forwarded MRs
+    (wayland, pipewire) start == base_sha == merge~N. A SQUASH is exempt: GitLab squashes and
+    rebases at merge without a new diff, so its start_sha is stale (real inkscape MRs).
   - That fetch is all-or-nothing: a quick failure (origin lacks the PR head) re-fetches the
     branch alone, so a merge-commit PR still places. A rebase that does not line up (a commit
     dropped as already applied) reads as a squash and keeps `^1` — the residual.

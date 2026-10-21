@@ -67,6 +67,15 @@ Split out of `agent.md` (size ceiling).
     - A zero `input` cap means "this feed ships no argument summary", which the empty `input`
       already says, so it is not marked `truncated` — else every seeded tool card wears a clip mark.
     - Tests: `TestTranscriptTail`, `buildItems` preview cases in `chat.test.js`.
+  - **`history`: operator messages are exempt from the window** (XERK-186): bounded read (last
+    4 MiB + `HISTORY_MAX_MSGS`, capped in `_history_entries` — callers must not re-slice), but
+    every user-authored turn folds back in ahead of the window on any cut (id-deduped,
+    `HISTORY_USER_MSGS` backstop); tool traffic otherwise evicts. Tests: `TestHistoryCommand`.
+    - A `!` shell command counts as operator input there, its output row kept beside it (XERK-2112).
+    - The cap counts a command + its output as ONE message (`_operator_units`), never cutting them
+      apart.
+    - The byte trim (`_fit_history_budget`) never keeps an output without its command either
+      (`_splits_operator_unit`); the entry window needs no check, the rescue re-adds the command.
   - **`history` is bounded in WIRE BYTES, never chars** (`HISTORY_MAX_BYTES`/
     `HISTORY_STAGED_MAX_BYTES`, dropping the OLDEST) — `json.dumps` is ensure_ascii, so a CJK char
     is six bytes and a char budget under-states it 6x.

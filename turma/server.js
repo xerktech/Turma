@@ -10185,7 +10185,7 @@ function coerceBlockElem(b) {
 // lists are fatal if non-array or holding a non-object element.
 function coerceLiveSignals(live) {
   if (!objectish(live)) return;
-  for (const k of ["lastHasToolUse", "bridgeAttached", "questionMulti", "paneBusy"]) {
+  for (const k of ["lastHasToolUse", "bridgeAttached", "questionMulti", "paneBusy", "paneDialog"]) {
     if (k in live && typeof live[k] !== "boolean") delete live[k];
   }
   for (const k of ["questionIndex", "questionTotal"]) {
@@ -10414,6 +10414,28 @@ function coerceGitProblem(o) {
   } else {
     delete o.gitProblem;
   }
+}
+
+// `migratedFrom` (XERK-2109) — where a moved session came from, as this hub's
+// importSession / archive restore stamped it and the agent echoes it on every
+// beat. The glasses move a stashed draft by {host, sessionId}; Android does not
+// type it today. Rebuilt from its known leaves (a whitelist: anything else an
+// agent adds is dropped) or deleted when not an object, so whichever client
+// types it next gets a decode-safe shape. `host`/`sessionId` are a string or
+// null (null = "can't tell", e.g. an archive restore has no source id); the
+// 200-char cap is an inline literal for the same TDZ reason as coerceGitProblem.
+function coerceMigratedFrom(o) {
+  if (!("migratedFrom" in o)) return;
+  const m = o.migratedFrom;
+  if (!objectish(m)) {
+    delete o.migratedFrom;
+    return;
+  }
+  const str = (v) => (typeof v === "string" && v && v.length <= 200 ? v : null);
+  const out = { host: str(m.host), sessionId: str(m.sessionId) };
+  if (typeof m.at === "number" && Number.isSafeInteger(m.at) && m.at >= 0) out.at = m.at;
+  if (m.fromArchive === true) out.fromArchive = true;
+  o.migratedFrom = out;
 }
 
 // `ticket.outcome` (XERK-1569) — how a session closed its own ticket, stamped by
@@ -10905,6 +10927,7 @@ function normalizeSessions(payload) {
       delete s.git.dirtyFiles;
     }
     coerceGitProblem(s);
+    coerceMigratedFrom(s);
     if (objectish(s.work)) {
       for (const k of ["aheadOfBase", "aheadOfRemote"]) {
         if (k in s.work && !wireInt32(s.work[k])) delete s.work[k];
@@ -12873,7 +12896,7 @@ function prLanded(p) {
 function readyForReview(session, working, wait, now = Date.now()) {
   if (session.status !== "running") return false;
   const s = session.session || {};
-  if (s.question || (s.panePrompt && s.panePrompt.prompt)) return true;
+  if (s.question || (s.panePrompt && s.panePrompt.prompt) || s.paneDialog === true) return true;
   if (working) return false;
   if (wait && wait.state === "waiting") return false;
   if (sessionSleeping(s, now)) return false;
@@ -12898,8 +12921,8 @@ function sessionSleeping(live, now) {
 // `needs-you:*` ones are the operator's; `needs-you:test` is a review the wait
 // classifier (XERK-1572) says asks a person to test something by hand.
 const ATTENTION_STATES = new Set([
-  "needs-you:question", "needs-you:permission", "needs-you:review", "needs-you:test",
-  "needs-you:stalled", "working", "waiting", "sleeping", "idle",
+  "needs-you:question", "needs-you:permission", "needs-you:dialog", "needs-you:review",
+  "needs-you:test", "needs-you:stalled", "working", "waiting", "sleeping", "idle",
 ]);
 const ATTENTION_WHY_MAX = 200;
 
@@ -12971,6 +12994,10 @@ function sessionAttention(session, working, wait, now) {
   const eta = (t) => (Number.isSafeInteger(t) && t > 0 ? { eta: t } : {});
   if (s.question) return { state: "needs-you:question", ...why(s.question) };
   if (s.panePrompt && s.panePrompt.prompt) return { state: "needs-you:permission", ...why(permissionWhy(s.panePrompt)) };
+  // A dialog that is no panePrompt (XERK-2152: the AskUserQuestion picker, an MCP
+  // elicitation or server approval): the agent holds every message aimed at the
+  // pane while it is up, so only the operator, in the terminal, can move it on.
+  if (s.paneDialog === true) return { state: "needs-you:dialog", why: "a dialog in the terminal" };
   const loop = s.loop;
   if (loop && Number.isSafeInteger(loop.repeats) && typeof loop.tool === "string" && loop.tool) {
     return { state: "needs-you:stalled", cause: "loop", ...why(`repeating ${loop.tool} ×${loop.repeats}`) };
@@ -14594,7 +14621,7 @@ function sleeperPausable(s, now) {
   const live = s.session;
   if (!objectish(live) || !sessionSleeping(live, now)) return false;
   if (live.wakeAt - now < SLEEPER_PAUSE_MIN_AHEAD_MS) return false;
-  if (live.question || live.panePrompt || live.loop) return false;
+  if (live.question || live.panePrompt || live.paneDialog === true || live.loop) return false;
   if (live.paneBusy !== false) return false;
   return Array.isArray(live.agents) && live.agents.length === 0;
 }
@@ -15938,7 +15965,7 @@ function autoMergeSweep() {
       // Asleep until a session-CLI wake (XERK-1571) — it means to come back to it.
       if (sessionSleeping(s.session, now)) continue;
       const ss = s.session || {};
-      if (ss.question || (ss.panePrompt && ss.panePrompt.prompt)) continue;
+      if (ss.question || (ss.panePrompt && ss.panePrompt.prompt) || ss.paneDialog === true) continue;
       // The agent has to be new enough to run the command; an older one would
       // ack-and-ignore it and this PR would retry to give-up for nothing.
       if (agentGapError(a, "mergePr", "merge a pull request")) continue;
@@ -19880,6 +19907,15 @@ const server = http.createServer(async (req, res) => {
         // 413 and 503 mean opposite things and must not be collapsed: on a 503
         // the agent retries, on a 413 it must not. `budgetExceeded` is the flag
         // the reader actually sets — `overloaded` was never set by anything.
+        //
+        // Unlike the rendered route, this 413 is deliberately NOT recorded with
+        // noteArchiveRefusal (XERK-1888): an agent reads at most 4 MiB
+        // (hub-agent's ARCHIVE_RAW_CHUNK_BYTES = ARCHIVE_RAW_CHUNK_MAX here)
+        // before gzipping, which can't outgrow the 64 KiB slack, so only a
+        // non-conforming client reaches it; under HA a follower refuses a
+        // declared-length one itself (stateless, forward.js), so a leader-side
+        // record would miss those; and the record is keyed like the rendered
+        // row's, whose next stored chunk wipes it.
         if (e && e.tooLarge) return refuseArchiveBody(req, res, 413, { error: e.message }, refusedPaused(e));
         if (e && e.budgetExceeded) return refuseArchiveBody(req, res, 503, { error: e.message }, true);
         return json(res, 400, { error: "could not read body" });

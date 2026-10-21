@@ -1215,6 +1215,12 @@ test("XERK-1571: sessionAttention derives every state in precedence order", () =
   const timed = { type: "shell", label: "Sleep", kind: "wait-timed", eta: now + 10 * WMIN };
   assert.deepEqual(att(s({ question: "Ship it?" })), { state: "needs-you:question", why: "Ship it?" });
   assert.deepEqual(att(s({ panePrompt: { prompt: "Allow rm?" } })), { state: "needs-you:permission", why: "Allow rm?" });
+  // XERK-2152: a dialog that is no panePrompt (the picker, an MCP elicitation) needs
+  // the operator in the terminal; a numbered panePrompt still reads as a permission.
+  assert.deepEqual(att(s({ paneDialog: true })), { state: "needs-you:dialog", why: "a dialog in the terminal" });
+  assert.equal(att(s({ paneDialog: true, panePrompt: { prompt: "Allow rm?" } })).state, "needs-you:permission");
+  assert.equal(att(s({ paneDialog: true, question: "Q" })).state, "needs-you:question");
+  assert.equal(att(s({ paneDialog: false })).state, "needs-you:review");
   // The dialog's question is a generic "Do you want to proceed?", so the why names
   // the pending command off the block above it (the real Claude Code dialog shape).
   const perm = (detail) => att(s({ panePrompt: { prompt: "Do you want to proceed?", detail } })).why;
@@ -3729,6 +3735,29 @@ test("XERK-1564: a session's wake request is coerced by name, absent = none", ()
   const none = live({ paneBusy: false });
   assert.equal("wakeAt" in none, false);
   assert.equal("wakeReason" in none, false);
+});
+
+test("XERK-2109: a session's migratedFrom is kept, rebuilt from its known leaves, or dropped", () => {
+  const sess = (migratedFrom) => {
+    const r = { device: "xerk2109-mf", sessions: [{ id: "s", migratedFrom }] };
+    hub.normalizeRecord(r);
+    return r.sessions[0];
+  };
+  assert.deepEqual(sess({ host: "hostA", sessionId: "orig", at: 1700000000000 }).migratedFrom,
+    { host: "hostA", sessionId: "orig", at: 1700000000000 });
+  assert.deepEqual(sess({ host: "hostA", sessionId: null, at: 5, fromArchive: true, x: 1 }).migratedFrom,
+    { host: "hostA", sessionId: null, at: 5, fromArchive: true });
+  // Wrong-typed leaves degrade to "can't tell"; an unknown leaf is dropped.
+  assert.deepEqual(sess({ host: 7, sessionId: ["s"], at: "now", fromArchive: "yes", evil: {} }).migratedFrom,
+    { host: null, sessionId: null });
+  assert.deepEqual(sess({ host: "h".repeat(201), sessionId: "" }).migratedFrom, { host: null, sessionId: null });
+  for (const bad of [null, "hostA:orig", 5, true, []]) {
+    assert.equal("migratedFrom" in sess(bad), false, `kept ${JSON.stringify(bad)}`);
+  }
+  // A session that never moved carries none.
+  const r = { device: "xerk2109-none", sessions: [{ id: "s" }] };
+  hub.normalizeRecord(r);
+  assert.equal("migratedFrom" in r.sessions[0], false);
 });
 
 test("XERK-1887: gitProblem is rebuilt from its two shapes or dropped, on sessions and repos", () => {
@@ -13692,6 +13721,56 @@ test("XERK-637: an armed run's child auto-merges even with NO org opt-in and a n
   assert.equal(c.sessionId, "s-c1");
 });
 
+// XERK-2152: a session held on a terminal-only dialog (paneDialog, no panePrompt)
+// is waiting on the operator in the terminal — every hub read that skips a
+// panePrompt skips it too, and the served attention says so.
+test("XERK-2152: a terminal-only dialog is served as needs-you:dialog and blocks like a panePrompt", async () => {
+  const now = Date.now();
+  // The wire: a boolean rides, anything else is dropped (Android-safe), and the
+  // served attention is needs-you:dialog through wireAttention.
+  const host = "dlg-host";
+  const beat = (paneDialog) => request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [{ id: "s1", status: "running",
+      session: { paneBusy: false, transcriptAgeSec: 30, lastRole: "user", paneDialog } }] },
+  });
+  assert.equal((await beat(true)).status, 200);
+  assert.equal(agents[host].sessions[0].session.paneDialog, true);
+  assert.deepEqual(hub.serializeAgent(host, agents[host], Date.now()).sessions[0].attention.state, "needs-you:dialog");
+  for (const bad of ["true", 1, { x: 1 }, "<img src=x onerror=alert(1)>"]) {
+    assert.equal((await beat(bad)).status, 200);
+    assert.equal("paneDialog" in agents[host].sessions[0].session, false, JSON.stringify(bad));
+    assert.notEqual(hub.serializeAgent(host, agents[host], Date.now()).sessions[0].attention.state, "needs-you:dialog");
+  }
+  delete agents[host];
+  // Ready for review even mid-turn, like a panePrompt.
+  const sess = (live) => ({ id: "s1", status: "running", session: { paneBusy: false, transcriptAgeSec: 5, lastRole: "user", ...live } });
+  assert.equal(readyForReview(sess({}), false), false);
+  assert.equal(readyForReview(sess({ paneDialog: true }), true), true);
+  // A sleeper in a dialog is never paused.
+  const sleeper = (live) => ({ status: "running", session: { wakeAt: now + 3600000, paneBusy: false, agents: [], ...live } });
+  assert.equal(hub.sleeperPausable(sleeper({}), now), true);
+  assert.equal(hub.sleeperPausable(sleeper({ paneDialog: true }), now), false);
+});
+
+test("XERK-2152: auto-merge holds while a terminal-only dialog is up", async () => {
+  for (const [paneDialog, merges] of [[true, false], [false, true]]) {
+    resetEpicD();
+    const host = `edDlg${merges}`;
+    const site = `ddlg${merges}.atlassian.net`;
+    const url = `https://github.com/ep/dlg${merges}/pull/1`;
+    const sess = dChildSession("s-c1", "C-1", site, "OPEN", url);
+    sess.session.paneDialog = paneDialog;
+    await asBeat(host, site, { autoStart: false,
+      tickets: [dEpic(), dChild("C-1", [], "inprogress")], sessions: [sess] });
+    armEpicRun(site, "E-1");
+    autoMergeSweep();
+    const merged = (agents[host].commands || []).some((c) => c.type === "mergePr" && c.url === url);
+    assert.equal(merged, merges, `paneDialog=${paneDialog}`);
+    delete agents[host];
+  }
+});
+
 test("auto-merge holds for a timed wait ahead of its ETA, never for an external watch", async () => {
   // A session watching CI or polling for its own merge would otherwise hold the
   // merge it is waiting on — the two wait on each other forever.
@@ -17066,12 +17145,13 @@ const CONTROL_DEAD_AFTER_MS = Number(process.env.CONTROL_DEAD_AFTER_MS);
 // faked, so real socket I/O still pumps and the pongs round-trip between ticks,
 // while no real stall can advance the mocked `idle`.
 //
-// This MUST stay the only mock-timers test in the suite: node:test's mock timers
+// This MUST stay the only test here that mocks setInterval: node:test's mock timers
 // do not re-capture an interval created inside a pre-existing server's
 // connection handler on a SECOND consecutive mock-timers test (the hub's ping
 // interval then never fires on ticks). It is the sole such test here on purpose;
 // the two liveness tests above deliberately stay on real timers because their
-// assertions are robust without it.
+// assertions are robust without it. (The budget REAL-progress test mocks only
+// setTimeout, for a timer its own request arms, so it does not trip this.)
 test("control WS: a channel that pongs is kept past the dead-after window", async (t) => {
   t.mock.timers.enable({ apis: ["setInterval", "Date"] });
   const { socket, leftover } = await wsConnect(CONTROL_PATH);
@@ -21647,14 +21727,14 @@ test("drain: only so many refused bodies may drain at once", async () => {
 // The suite does not run in a container, where the ceilings are container-sized;
 // here they are host-RAM-sized, so pressure has to be staged rather than assumed.
 function withBudgetPressure(fn) {
-  return async () => {
+  return async (t) => {
     // Contend the SHARED budget, since the lanes are accounted separately now:
     // occupying the big lane no longer pressures shared-lane reads (that
     // separation is what stopped one big body from refusing every tiny one).
     // Just over half, so the body under test is still admitted.
     const stage = Math.floor(hub.BODY_INFLIGHT_TOTAL_MAX / 2) + 1;
     hub.chargeBody(stage, "shared");
-    try { await fn(); } finally { hub.releaseBody(stage, "shared"); }
+    try { await fn(t); } finally { hub.releaseBody(stage, "shared"); }
   };
 }
 
@@ -21725,30 +21805,57 @@ test("budget: under pressure, a DRIBBLE cannot hold its charge open", withBudget
 }));
 
 test("budget: under pressure, a body making REAL progress is never reclaimed",
-  withBudgetPressure(async () => {
+  withBudgetPressure(async (t) => {
   // The other half: the rule is a minimum RATE, and anything clearing it must be
   // left alone however long it takes. A real slow migration lives here.
+  //
+  // Driven by a MOCKED setTimeout (the hub's idle window is one), so no real
+  // event-loop stall can expire a window the body was in fact feeding: each step
+  // waits on REAL I/O until the hub has read every byte sent, then advances the
+  // mocked clock by all but 1ms of a window. Only setTimeout is mocked, and the
+  // timer under test is armed inside this test's own request, so the XERK-450
+  // caveat (an interval a PRE-EXISTING connection created) does not apply. Date,
+  // setImmediate and process.hrtime stay real, so I/O still pumps between ticks.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const untilReal = async (predicate, ms = 5000) => {
+    const start = process.hrtime.bigint();
+    while (!predicate()) {
+      if (Number(process.hrtime.bigint() - start) / 1e6 > ms) return false;
+      await new Promise((r) => setImmediate(r));
+    }
+    return true;
+  };
   const held0 = hub.bodyInflightHeld();
   const chunk = Math.max(hub.BODY_MIN_PROGRESS_BYTES * 2, 128 * 1024);
   const sock = net.connect(server.address().port, "127.0.0.1");
-  let pump = null;
   try {
     await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    sock.on("error", () => {});     // the control step below has the hub destroy it
+    const prefix = '{"device":"steady","pad":"';
     sock.write(
       "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agenttok\r\n" +
-        `Content-Type: application/json\r\nContent-Length: ${33 << 20}\r\n\r\n` +
-        '{"device":"steady","pad":"'
+        `Content-Type: application/json\r\nContent-Length: ${33 << 20}\r\n\r\n` + prefix
     );
-    // Pump often: this is a real-timer SURVIVAL check, so an event-loop stall longer
-    // than what is left of the window reclaims the body. At half-window pumping that
-    // took a ~200ms stall on a loaded host; at a tenth it takes most of a window.
-    pump = setInterval(() => { try { sock.write("s".repeat(chunk)); } catch {} },
-      Math.max(10, Math.floor(hub.BODY_IDLE_TIMEOUT_MS / 10)));
-    await new Promise((r) => setTimeout(r, hub.BODY_IDLE_TIMEOUT_MS * 3));
-    assert.ok(hub.bodyInflightHeld() > held0,
-      "a body meeting the progress floor must not be reclaimed");
+    assert.ok(await untilReal(() => hub.bodyInflightHeld() > held0), "the body is charged");
+    // The charge is linear in bytes read, so "the hub has read all we sent" is exact.
+    const perByte = (hub.bodyInflightHeld() - held0) / prefix.length;
+    let sent = prefix.length;
+    for (let i = 0; i < 6; i++) {
+      sock.write("s".repeat(chunk));
+      sent += chunk;
+      assert.ok(await untilReal(() => hub.bodyInflightHeld() - held0 >= perByte * sent),
+        `step ${i}: the hub never read the chunk (driving bug, not a hub bug)`);
+      t.mock.timers.tick(hub.BODY_IDLE_TIMEOUT_MS - 1);
+      assert.ok(hub.bodyInflightHeld() > held0,
+        `step ${i}: a body meeting the progress floor must not be reclaimed`);
+    }
+    // Control: the mocked clock really drives the hub's window. The same body,
+    // silent for one window, IS taken back; without this the survival above could
+    // pass on a timer the mock never captured.
+    t.mock.timers.tick(hub.BODY_IDLE_TIMEOUT_MS);
+    assert.ok(await untilReal(() => hub.bodyInflightHeld() === held0),
+      "the same body, once silent for a window, is reclaimed");
   } finally {
-    if (pump) clearInterval(pump);
     sock.destroy();
   }
 }));

@@ -114,14 +114,7 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
 
 ### `history`
 
-- **Operator messages are exempt from the window** (XERK-186): bounded read (last 4 MiB +
-  `HISTORY_MAX_MSGS`, capped in `_history_entries` — callers must not re-slice), but every
-  user-authored turn folds back in ahead of the window on any cut (id-deduped,
-  `HISTORY_USER_MSGS` backstop); tool traffic otherwise evicts. Tests: `TestHistoryCommand`.
-  - A `!` shell command counts as operator input there, its output row kept beside it (XERK-2112).
-  - The cap counts a command + its output as ONE message (`_operator_units`), never cutting them apart.
-  - The byte trim (`_fit_history_budget`) never keeps an output without its command either
-    (`_splits_operator_unit`); the entry window needs no check, the rescue re-adds the command.
+- Window, operator rescue and byte trim: `agent-entry-blocks.md`.
 
 ### `setModelSource` — failover to the self-hosted model (XERK-246)
 
@@ -155,6 +148,16 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
 - A busy pane **defers, never drops**: lands as `pendingModel`, applied on the first idle beat by
   `_apply_pending_switches`. Backs out with Escape if the picker has no row for the target. Tests:
   `TestSetModelMode`, `TestParseModelPicker`.
+- **`s` on a session with history opens "Switch model?"** (XERK-2157, 2.1.306), unseen by every
+  other pane read: set_model answers `1` only if it names the picked row, else Escapes out (one
+  per dialog SEEN: two on an idle composer open rewind). In `_pane_blocking_dialog` too.
+  - The landed line must name the row AND be new vs the pane before `/model`
+    (`_model_switch_landed`): a higher count, or one settled at the bottom (a full screen scrolls
+    the old one off). Under ~23 cols both lines wrap mid-name. Tests: `TestModelSwitchConfirm`.
+  - **A draft in the composer defers the switch, untouched** (`_composer_holds_text` over
+    `capture-pane -e`; the dim placeholder is no draft). Typed onto, it went out as a prompt;
+    never clear it either: Ctrl+U kills only before the cursor and, retried, ate the edits.
+    It goes ahead only on a box SEEN empty: a short pane (≤ ~11 rows) can't show one whole.
 
 ### `setMode` — live permission-mode switch
 
@@ -341,8 +344,39 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   alone reads **idle**. `parse_pane_prompt` reads `{prompt, options:[{number,label,selected}],
   detail}` off the mode marker's capture.
   - **Nothing keys on wording.** A dialog needs ALL of: options 1..N (N≥2), exactly one `❯`, a `?`
-    line directly above, **no mode footer below** (the footer rides the composer a dialog
-    replaces). `detail` closes on a rule, not on blanks.
+    line directly above (or above a subtitle, next bullet), **no mode footer below** (the footer
+    rides the composer a dialog replaces). `detail` closes on a rule, not on blanks.
+  - The Ctrl-C exit toast vetoes like the footer it hides (XERK-2169, `PANE_EXIT_TOAST_RE`).
+  - **One subtitle paragraph may sit between the `?` line and the run** (XERK-2162): Claude
+    Code 2.1.306's "Exit plan mode?" draws "Claude wants to exit plan mode" there, and requiring
+    the question directly above made that live dialog read as an idle composer.
+    - Blank-fenced on both sides, ≤ `PANE_PROMPT_SUBTITLE_LINES`, no `?`/rule/option line; it
+      joins `detail` and the id as one line (its wrap moves with the width).
+    - Only under the ▔ edge (`_pane_under_edge`: the question sits right below it, rules
+      between): a reply shaped question/note/options is above the edge, and the Ctrl-C toast
+      hides the footer that would veto it.
+    - That dialog's box ends 2 cells in from the pane, and its labels wrap there: wrap width is
+      the nearest box rule within `PANE_DIALOG_MARGIN` of the pane (`_pane_dialog_width`), else
+      the widest line. Below ~30 columns the TUI's own wrap drifts further; not covered.
+    - `detail` stops at the ▔ edge (`PANE_PROMPT_EDGE_RE`, column 0 only — replies are indented):
+      above it is conversation, and its effort badge (first seconds only) changed the id, so an
+      answer stamped early was dropped.
+    - Tests: the `subtitle`/`effort_badge`/`short_rule` cases in `TestParsePanePrompt`.
+  - **A wrapped label is rejoined; the AskUserQuestion picker is refused** (XERK-2150).
+    - A wrap and a picker description sit on the same label-column indent, and a label that fills
+      the pane makes them identical row by row — no per-line rule can split them.
+    - The picker is refused whole: below the run, before a blank, a numbered option follows a rule
+      ("4. Type something." / rule / "5. Chat about this"). Its answer comes from `ask.py`; its rows
+      are no digits to send.
+    - Never refuse on "N+1 below the run" without the rule: a dialog an unjoined wrap cut short has
+      that shape too, and a None there lets the pane-typing guards type into a live dialog.
+    - A line is a wrap only if its first word would not have fit after the line above (width =
+      widest captured line). Joined with no space only when both sides of the break hold a "/".
+    - One blank row between options is stepped over only when the option above has a line that
+      fills the pane exactly — Claude Code 2.1.306 draws one there. Any other blank ends the run.
+    - Tests: `TestParsePanePrompt.test_wrapped_option_label`, `test_wrapped_path_label`,
+      `test_a_full_width_wrap_keeps_the_options_below_its_gap`,
+      `test_picker_descriptions_not_options`, `test_wrap_needs_label_column_and_cells`.
   - `answer_pane_prompt` **re-reads the pane first** and drops the answer unless that number is on
     screen NOW. Both `liveState`s check the prompt ahead of the busy read. Tests:
     `TestAnswerPanePrompt`.
@@ -359,6 +393,13 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     ended the session (XERK-868). **`_pane_blocking_dialog` is the predicate a typing guard uses**
     (`parse_pane_prompt` OR `_trust_dialog_up`); `parse_pane_prompt`'s four conditions are unchanged
     and the modal deliberately never becomes a `panePrompt`. Full rule: `agent-sessions.md`.
+  - **Nor are the dialogs read off their key-hint footer** (`_hint_dialog_up`, XERK-2142): the
+    native AskUserQuestion picker (a description under each option breaks the 1..N run), an MCP
+    elicitation form, the project MCP-server approval. Each ends with a `·`-list holding the item
+    "Esc to cancel" as the pane's LAST lines, below the last rule, with no composer footer there.
+    Position + whole item, never the wording alone: conversation text draws above the composer, and
+    the rule cut keeps a footer-hiding toast ("Press Ctrl-C again to exit") from reaching past it. Frames: 2.1.306, in
+    `TestHintDialogIsABlockingDialog`. They stay out of `panePrompt` (no digit to offer).
 
 ## PR status, comment delivery and conflict nudges
 

@@ -70,16 +70,16 @@ class ArchiveMissingMessageTest {
         val msg = archiveMissingMessage(
             missing(404, """{"error":"unknown transcript","ingestClosed":{"since":$since}}"""), now,
         )!!
-        assertTrue(msg, msg.startsWith("The hub has not been accepting archive pushes since "))
+        assertTrue(msg, msg.startsWith("The hub has been reloading its archive index since "))
         assertTrue(msg, msg.contains("(3d ago)"))
-        assertTrue(msg, msg.endsWith("can\u2019t reach the archive until it does."))
+        assertTrue(msg, msg.endsWith("so this conversation may already be archived."))
     }
 
     @Test fun `a refusal and closed ingest are both said`() {
         val msg = archiveMissingMessage(missing(404,
             """{"refused":{"host":"nas","error":"too big"},"ingestClosed":{"since":1}}"""), 2_000L)!!
         assertTrue(msg, msg.startsWith("nas\u2019s last push"))
-        assertTrue(msg, msg.contains("not been accepting archive pushes"))
+        assertTrue(msg, msg.contains("reloading its archive index"))
     }
 
     @Test fun `a garbage since is the plain not-yet`() {

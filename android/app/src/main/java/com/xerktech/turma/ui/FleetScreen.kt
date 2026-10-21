@@ -651,7 +651,10 @@ private fun SessionCard(
                         // A stall takes the danger colour it has on every surface.
                         // A stall the hub reads where this read does not — a LOOPING
                         // session is busy (XERK-1572) — speaks over "working" too.
-                        val needs = if (state == LiveState.IDLE || com.xerktech.turma.core.attentionStalled(session.attention)) com.xerktech.turma.core.attentionLabel(session.attention) else null
+                        // A terminal-only dialog (XERK-2152) reads WAITING, but only the hub's
+                        // label says where to answer it.
+                        val needs = if (state == LiveState.IDLE || com.xerktech.turma.core.attentionStalled(session.attention) ||
+                            com.xerktech.turma.core.attentionDialog(session.attention)) com.xerktech.turma.core.attentionLabel(session.attention) else null
                         val needsFor = com.xerktech.turma.core.attentionFor(session.attention, now)
                         // A question card carries its age too (web "waiting for your
                         // answer · for 22m"), but only the question's own — never a

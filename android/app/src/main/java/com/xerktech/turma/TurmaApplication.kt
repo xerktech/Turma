@@ -16,7 +16,7 @@ class TurmaApplication : Application(), ImageLoaderFactory {
     // only past SafeSvgDecoder's DOCTYPE check (an entity bomb never reaches it).
     override fun newImageLoader(): ImageLoader =
         ImageLoader.Builder(this)
-            .components { add(SafeSvgDecoder.Factory()) }
+            .components(turmaImageComponents())
             .crossfade(true)
             .build()
 

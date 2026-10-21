@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ANSWER_MASK_MS, App, FLASH_ANSWERED, FLASH_HUB_UNREACHABLE, FLASH_QUEUED, HEARD_NOTHING, MAX_DRAFTS, newSessionState } from "./app.ts";
+import { ANSWER_MASK_MS, App, FLASH_ANSWERED, QUESTION_TAP_GUARD_MS, FLASH_HUB_UNREACHABLE, FLASH_QUEUED, HEARD_NOTHING, MAX_DRAFTS, newSessionState } from "./app.ts";
 import type { HubClient } from "./hub-client.ts";
 import type { GlassesDisplay } from "./display/index.ts";
 import type { Dictation, DictationResult } from "./dictation.ts";
-import type { ScreenModel } from "./render.ts";
+import { STALE_ANSWER_STATUS, type ScreenModel } from "./render.ts";
 import type { AgentInfo, InputEvent, LiveSignals, SessionInfo } from "./types.ts";
 
 function signals(overrides: Partial<LiveSignals> = {}): LiveSignals {
@@ -1121,6 +1121,7 @@ describe("App", () => {
       await poll();
       expect(draftOf(app)).toBe("");
       expect(display.lines.some((l) => l.includes("Delete prod DB?"))).toBe(true);
+      await vi.advanceTimersByTimeAsync(QUESTION_TAP_GUARD_MS); // a deliberate tap, past the guard
       display.emit({ type: "tap" }); // the highlighted first option, "No"
       expect(client.answerQuestion).toHaveBeenCalledWith("A", "s1", { optionIndex: 0 });
       expect(client.sendInput).not.toHaveBeenCalled();
@@ -1256,6 +1257,354 @@ describe("App", () => {
       expect(client.sendInput).not.toHaveBeenCalled();
     });
 
+    // XERK-2109 item 2: the tap meant for the menu's Send lands on the sheet.
+    it("swallows the first sheet tap just after a question arrives under the actions menu", async () => {
+      const asking = signals({ question: "Delete prod DB?", questionOptions: ["No", "Yes"] });
+      const { client, app } = asker(session({ id: "s1" }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictate("please refactor x");
+      display.emit({ type: "tap" }); // -> actions
+      display.emit({ type: "scrollDown" }); // -> Send
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking })] })];
+      await poll();
+      display.emit({ type: "tap" }); // meant for Send
+      expect(client.answerQuestion).not.toHaveBeenCalled();
+      expect(client.sendInput).not.toHaveBeenCalled();
+      display.emit({ type: "tap" }); // a second tap is meant
+      expect(client.answerQuestion).toHaveBeenCalledWith("A", "s1", { optionIndex: 0 });
+    });
+
+    it("swallows the first sheet tap just after a question arrives on the session screen, never a later one", async () => {
+      const asking = signals({ question: "Delete prod DB?", questionOptions: ["No", "Yes"] });
+      const { client, app } = asker(session({ id: "s1" }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking })] })];
+      await poll();
+      display.emit({ type: "tap" }); // meant to focus the box
+      expect(client.answerQuestion).not.toHaveBeenCalled();
+      // A different question replacing it re-arms; past the window a tap answers.
+      const other = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: other })] })];
+      await poll();
+      await vi.advanceTimersByTimeAsync(QUESTION_TAP_GUARD_MS);
+      display.emit({ type: "tap" });
+      expect(client.answerQuestion).toHaveBeenCalledWith("A", "s1", { optionIndex: 0 });
+    });
+
+    // XERK-2109 item 3: a "Dictate answer…" draft left behind keeps its question.
+    it("an answer draft left while its question is pending comes back as that answer on re-entry", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const { client, app } = asker(session({ id: "s1", session: asking }), session({ id: "s2" }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictateAnswer("friday");
+      app.enterSession("s2");
+      app.enterSession("s1");
+      expect(draftOf(app)).toBe("friday");
+      expect(app.getState().session?.answerFor).toBe("Ship it?");
+      display.emit({ type: "tap" }); // -> bottom
+      send();
+      expect(client.answerQuestion).toHaveBeenCalledWith("A", "s1", { optionIndex: -1, custom: "friday" });
+      expect(client.sendInput).not.toHaveBeenCalled();
+    });
+
+    it("a left answer draft whose question cleared comes back marked as a prompt, not silently", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const { app } = asker(session({ id: "s1", session: asking }), session({ id: "s2" }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictateAnswer("friday");
+      app.enterSession("s2");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })]; // answered on the web
+      await poll();
+      app.enterSession("s1");
+      expect(draftOf(app)).toBe("friday");
+      expect(app.getState().session?.staleAnswer).toBe(true);
+      expect(display.model?.type === "session" && display.model.bottom.status).toBe(STALE_ANSWER_STATUS);
+      display.emit({ type: "tap" }); // -> bottom
+      display.emit({ type: "tap" }); // -> actions
+      expect(display.lines.map((l) => l.trim())).toContain("Send as prompt");
+    });
+
+    it("a left answer draft for a question since replaced is dropped; the ordinary part waits", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const other = signals({ question: "Delete prod DB?", questionOptions: ["No", "Yes"] });
+      const { client, app } = asker(session({ id: "s1" }), session({ id: "s2" }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictate("note one");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking }), session({ id: "s2" })] })];
+      await poll();
+      dictateAnswer("friday");
+      app.enterSession("s2");
+      expect(Object.values(app.getState().drafts)).toEqual([
+        { hostKey: "A", sessionId: "s1", text: "note one", answer: { text: "friday", for: "Ship it?" } },
+      ]);
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: other }), session({ id: "s2" })] })];
+      await poll();
+      app.enterSession("s1");
+      expect(draftOf(app)).toBe("");
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "A", sessionId: "s1", text: "note one" }]);
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
+      await poll();
+      expect(draftOf(app)).toBe("note one");
+      expect(app.getState().session?.staleAnswer).toBeUndefined();
+      expect(client.answerQuestion).not.toHaveBeenCalled();
+    });
+
+    // XERK-2109 item 4: answered elsewhere while the answer sits in the box.
+    it("an answer still in the box after its question clears says Send posts it as a prompt", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const { client, app } = asker(session({ id: "s1", session: asking }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictateAnswer("friday");
+      expect(display.model?.type === "session" && display.model.bottom.status).not.toBe(STALE_ANSWER_STATUS);
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" })] })]; // answered on the web
+      await poll();
+      expect(draftOf(app)).toBe("friday");
+      expect(display.model?.type === "session" && display.model.bottom.status).toBe(STALE_ANSWER_STATUS);
+      display.emit({ type: "tap" }); // -> actions
+      expect(display.lines.map((l) => l.trim())).toContain("Send as prompt");
+      expect(display.lines.map((l) => l.trim())).not.toContain("Send");
+      display.emit({ type: "scrollDown" });
+      display.emit({ type: "tap" });
+      expect(client.sendInput).toHaveBeenCalledWith("A", "s1", "friday");
+      expect(client.answerQuestion).not.toHaveBeenCalled();
+    });
+
+    // XERK-2109 item 5: the phone's answer masks the question; the hub re-asks.
+    it("an answer draft survives the phone's answer mask and still answers a re-ask", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const { client, app } = asker(session({ id: "s1", session: asking }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictateAnswer("friday");
+      await app.answerQuestion("A", "s1", { optionIndex: 0 }); // the phone
+      await poll();
+      expect(app.getState().session?.answerFor).toBe("Ship it?");
+      // The hub keeps (re-)asking past the mask: the box answer stays the answer.
+      await vi.advanceTimersByTimeAsync(ANSWER_MASK_MS + POLL);
+      expect(draftOf(app)).toBe("friday");
+      expect(app.getState().session?.answerFor).toBe("Ship it?");
+      send();
+      expect(client.answerQuestion).toHaveBeenLastCalledWith("A", "s1", { optionIndex: -1, custom: "friday" });
+      expect(client.sendInput).not.toHaveBeenCalled();
+    });
+
+    // XERK-2109 item 6: the moved record's marker carries a stashed draft along.
+    it("a stashed draft follows its session's migratedFrom marker to the new host and id", async () => {
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] }), agent({ key: "B" })];
+      const app = await boot();
+      app.enterSession("s1");
+      dictate("for the moved one");
+      app.enterSession("s2");
+      fleet = [
+        agent({ key: "A", sessions: [session({ id: "s2" })] }),
+        agent({ key: "B", sessions: [session({ id: "s9", migratedFrom: { host: "A", sessionId: "s1", at: 1 } })] }),
+      ];
+      await poll();
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "B", sessionId: "s9", text: "for the moved one" }]);
+      app.enterSession("s9");
+      expect(draftOf(app)).toBe("for the moved one");
+    });
+
+    it("a draft for a source session running again is its own: the old marker never moves it", async () => {
+      // The source stays listed after a move and can be started again.
+      fleet = [
+        agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] }),
+        agent({ key: "B", sessions: [session({ id: "s9", migratedFrom: { host: "A", sessionId: "s1" } })] }),
+      ];
+      const app = await boot();
+      app.enterSession("s1", "A");
+      dictate("typed for A only");
+      app.enterSession("s2");
+      await poll();
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "A", sessionId: "s1", text: "typed for A only" }]);
+      // Once the source is stopped (the move's kill) it follows; never to a stopped target.
+      fleet = [
+        agent({ key: "A", sessions: [session({ id: "s1", status: "stopped" }), session({ id: "s2" })] }),
+        agent({ key: "B", sessions: [session({ id: "s9", status: "stopped", migratedFrom: { host: "A", sessionId: "s1" } })] }),
+      ];
+      await poll();
+      expect(Object.keys(app.getState().drafts)).toEqual([JSON.stringify(["A", "s1"])]);
+      fleet[1] = agent({ key: "B", sessions: [session({ id: "s9", migratedFrom: { host: "A", sessionId: "s1" } })] });
+      await poll();
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "B", sessionId: "s9", text: "typed for A only" }]);
+    });
+
+    it("a draft follows a whole chain of moves to its running end, and a cycle never spins", async () => {
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
+      const app = await boot();
+      app.enterSession("s1", "A");
+      dictate("travel");
+      app.enterSession("s2");
+      // A -> B -> C, with B already moved on before the glasses saw it run.
+      fleet = [
+        agent({ key: "A", sessions: [session({ id: "s1", status: "stopped" }), session({ id: "s2" })] }),
+        agent({ key: "B", sessions: [session({ id: "s9", status: "stopped", migratedFrom: { host: "A", sessionId: "s1" } })] }),
+        agent({ key: "C", sessions: [session({ id: "s5", migratedFrom: { host: "B", sessionId: "s9" } })] }),
+      ];
+      await poll();
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "C", sessionId: "s5", text: "travel" }]);
+      // Broken records pointing at each other: the walk stops, the draft stays put.
+      fleet = [
+        agent({ key: "C", sessions: [session({ id: "s5", migratedFrom: { host: "D", sessionId: "s6" } })] }),
+        agent({ key: "D", sessions: [session({ id: "s6", status: "stopped", migratedFrom: { host: "C", sessionId: "s5" } })] }),
+      ];
+      await poll();
+      await poll();
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "C", sessionId: "s5", text: "travel" }]);
+    });
+
+    it("a stopped-hop cycle behind a running target ends, and a move survives a later empty hop", async () => {
+      fleet = [agent({ key: "B", sessions: [session({ id: "s9" }), session({ id: "s2" })] })];
+      const app = await boot();
+      app.enterSession("s9", "B");
+      dictate("fromB");
+      app.enterSession("s2");
+      // C runs, from B (stopped, holding the draft), from A (stopped, none), from B again.
+      fleet = [
+        agent({ key: "A", sessions: [session({ id: "s1", status: "stopped", migratedFrom: { host: "B", sessionId: "s9" } })] }),
+        agent({ key: "B", sessions: [session({ id: "s9", status: "stopped", migratedFrom: { host: "A", sessionId: "s1" } }), session({ id: "s2" })] }),
+        agent({ key: "C", sessions: [session({ id: "s5", migratedFrom: { host: "B", sessionId: "s9" } })] }),
+      ];
+      await poll(); // without the walk's `seen` bound this never returns
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "C", sessionId: "s5", text: "fromB" }]);
+    });
+
+    it("a moved answer meeting one already at the target joins it, or is kept as a stale prompt", async () => {
+      const ask = (q: string) => signals({ question: q, questionOptions: ["Yes", "No"] });
+      const moveWith = async (srcFor: string) => {
+        fleet = [
+          agent({ key: "A", sessions: [session({ id: "s1", session: ask(srcFor) }), session({ id: "s2" })] }),
+          agent({ key: "B", sessions: [session({ id: "s9", session: ask("Q") })] }),
+        ];
+        const app = await boot();
+        app.enterSession("s9", "B");
+        dictateAnswer("DSTANS");
+        app.enterSession("s1", "A");
+        dictateAnswer("SRCANS");
+        app.enterSession("s2");
+        fleet = [
+          agent({ key: "A", sessions: [session({ id: "s2" })] }),
+          agent({ key: "B", sessions: [session({ id: "s9", session: ask("Q"), migratedFrom: { host: "A", sessionId: "s1" } })] }),
+        ];
+        await poll();
+        return Object.values(app.getState().drafts);
+      };
+      expect(await moveWith("Q")).toEqual([
+        { hostKey: "B", sessionId: "s9", text: "", answer: { text: "DSTANS SRCANS", for: "Q" } },
+      ]);
+      expect(await moveWith("Other?")).toEqual([
+        { hostKey: "B", sessionId: "s9", text: "SRCANS", stale: true, answer: { text: "DSTANS", for: "Q" } },
+      ]);
+    });
+
+    it("a stale part of a stash comes back marked even beside an ordinary part", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const { app } = asker(session({ id: "s1", session: asking }), session({ id: "s2" }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictateAnswer("friday");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })]; // answered elsewhere
+      await poll();
+      app.enterSession("s2"); // stashes the stale answer as the ordinary part
+      app.enterSession("s1");
+      expect(draftOf(app)).toBe("friday");
+      expect(app.getState().session?.staleAnswer).toBe(true);
+    });
+
+    it("a stashed answer waits out the wearer's own answer mask, then comes back as that answer", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const { client, app } = asker(session({ id: "s1", session: asking }), session({ id: "s2" }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictateAnswer("friday");
+      app.enterSession("s2");
+      await app.answerQuestion("A", "s1", { optionIndex: 0 }); // the phone
+      app.enterSession("s1");
+      expect(draftOf(app)).toBe(""); // masked: no question shown, but not proof it's gone
+      await poll();
+      expect(draftOf(app)).toBe("");
+      await vi.advanceTimersByTimeAsync(ANSWER_MASK_MS + POLL); // the hub re-asks
+      expect(draftOf(app)).toBe("friday");
+      expect(app.getState().session?.answerFor).toBe("Ship it?");
+      expect(client.sendInput).not.toHaveBeenCalled();
+    });
+
+    it("the tap guard arms on a replacing question too", async () => {
+      const first = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const second = signals({ question: "Delete prod DB?", questionOptions: ["No", "Yes"] });
+      const { client, app } = asker(session({ id: "s1", session: first }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: second })] })];
+      await poll();
+      display.emit({ type: "tap" });
+      expect(client.answerQuestion).not.toHaveBeenCalled();
+    });
+
+    it("the tap guard never re-arms for the question re-listed after a missed poll, nor arms off-screen", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const { client, app } = asker(session({ id: "s1", session: asking }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      await poll();
+      fleet = []; // a hub restart
+      await poll();
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking })] })];
+      await poll();
+      display.emit({ type: "tap" }); // the wearer was already reading it
+      expect(client.answerQuestion).toHaveBeenCalledTimes(1);
+      // Home while a new question lands: entering then tapping is deliberate.
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" })] })];
+      await vi.advanceTimersByTimeAsync(ANSWER_MASK_MS + POLL);
+      display.emit({ type: "doubleTap" }); // -> home
+      expect(app.getState().screen).toBe("home");
+      const other = signals({ question: "Delete prod DB?", questionOptions: ["No", "Yes"] });
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: other })] })];
+      await poll();
+      app.enterSession("s1");
+      display.emit({ type: "tap" });
+      expect(client.answerQuestion).toHaveBeenCalledTimes(2);
+    });
+
+    it("no marker, an archive restore's null id, or a malformed marker moves nothing", async () => {
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] }), agent({ key: "B" })];
+      const app = await boot();
+      app.enterSession("s1");
+      dictate("for A");
+      app.enterSession("s2");
+      fleet = [
+        agent({ key: "A", sessions: [session({ id: "s2" })] }),
+        agent({
+          key: "B",
+          sessions: [
+            session({ id: "s1" }),
+            session({ id: "s7", migratedFrom: { host: "A", sessionId: null, fromArchive: true } }),
+            session({ id: "s8", migratedFrom: "A:s1" as unknown as SessionInfo["migratedFrom"] }),
+            session({ id: "s9", migratedFrom: { host: "C", sessionId: "s1" } }),
+          ],
+        }),
+      ];
+      await poll();
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "A", sessionId: "s1", text: "for A" }]);
+    });
+
     // Holds "held note" back on s1 behind a pending question, with the wearer
     // now on s1's sheet. `client` is the fake hub.
     async function heldBehindQuestion() {
@@ -1320,6 +1669,7 @@ describe("App", () => {
       expect(draftOf(app)).toBe("");
       expect(display.lines.some((l) => l.includes("Ship it?"))).toBe(true);
       // The wearer's tap answers the sheet with an option, never the draft.
+      await vi.advanceTimersByTimeAsync(QUESTION_TAP_GUARD_MS);
       display.emit({ type: "tap" });
       await vi.waitFor(() => expect(client.answerQuestion).toHaveBeenCalledTimes(1));
       expect(JSON.stringify(client.answerQuestion.mock.calls)).not.toContain("held note");

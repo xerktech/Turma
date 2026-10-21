@@ -194,8 +194,9 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 - **Loading also rides a server-side flag** (`tengu_plugin_hooks_modules`, seen in
   `~/.claude.json`) the version gate cannot see. Off → no file → the pane alone, as before.
 - **After a `/clear` the signal is off for that process** (new session id ≠ pinned id).
-- **Pre-existing gap it exposes**: a dialog `parse_pane_prompt` misses (an MCP elicitation?)
-  reads busy for up to the quiet bound instead of idle.
+- **Skipped under ANY blocking dialog too** (XERK-2142): `_pane_status` leaves
+  `_pane_blocking_dialog` on `state["paneDialog"]`, and the fold skips it, so an MCP elicitation
+  or the native picker (no `panePrompt`) reads waiting, not busy for the quiet bound.
 - Verified headless on 2.1.304: `claude -p --plugin-dir` loads it with no prompt and writes
   idle → running → idle (seq 3).
 
