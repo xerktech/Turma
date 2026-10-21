@@ -35937,6 +35937,70 @@ class TestCollectAzure(unittest.TestCase):
             by = {t["key"]: t for t in ha.collect_azure()["tickets"]}
             self.assertEqual(by["2"]["epicKey"], "100")
 
+    def _portfolio_req(self, items, levels, calls, fail=None):
+        base = self._fake_req(items)
+
+        def req(path, params, body=None):
+            if path.endswith("/_apis/work/processconfiguration"):
+                calls.append(path)
+                if fail and fail["on"]:
+                    raise OSError("boom")
+                return {"portfolioBacklogs": [
+                    {"name": n, "workItemTypes": [{"name": t}]} for n, t in levels]}
+            return base(path, params, body)
+        return req
+
+    def test_localized_and_custom_portfolio_levels_are_epics_xerk1888(self):
+        # A localized process names Epic otherwise, and an operator-added
+        # portfolio level has its own name: both come from the project's
+        # process configuration, not the English name list.
+        items = [
+            _azure_wi(1, "Active", wtype="Initiative"),
+            _azure_wi(2, "Active", wtype="Récit utilisateur", **{"System.Parent": 3}),
+            _azure_wi(3, "New", wtype="Épopée"),
+            _azure_wi(4, "Active", wtype="Tâche", **{"System.Parent": 1}),
+        ]
+        calls = []
+        req = self._portfolio_req(
+            items, [("Initiatives", "Initiative"), ("Épopées", "Épopée")], calls)
+        with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PARENT_TYPE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PORTFOLIO_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            by = {t["key"]: t for t in ha.collect_azure()["tickets"]}
+            ha.collect_azure()
+        self.assertTrue(by["1"]["isEpic"])
+        self.assertTrue(by["3"]["isEpic"])
+        self.assertFalse(by["2"]["isEpic"])
+        self.assertEqual(by["2"]["epicKey"], "3")
+        self.assertEqual(by["4"]["epicKey"], "1")
+        self.assertEqual(calls, ["/Proj/_apis/work/processconfiguration"],
+                         "read once per project, then cached")
+
+    def test_portfolio_read_failure_keeps_the_english_floor_xerk1888(self):
+        items = [_azure_wi(1, "Active", wtype="Initiative"),
+                 _azure_wi(2, "Active", wtype="Epic")]
+        calls, fail = [], {"on": True}
+        req = self._portfolio_req(items, [("Initiatives", "Initiative")], calls, fail)
+        with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PARENT_TYPE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PORTFOLIO_CACHE", {}) as cache, \
+             mock.patch.object(ha, "azure_req", req):
+            block = ha.collect_azure()
+            self.assertTrue(block["available"])
+            by = {t["key"]: t for t in block["tickets"]}
+            self.assertTrue(by["2"]["isEpic"])      # the name floor still holds
+            self.assertFalse(by["1"]["isEpic"])     # unknown until it is read
+            # Read once, then a failed refresh keeps the last good answer.
+            fail["on"] = False
+            cache.clear()
+            ha.collect_azure()
+            fail["on"] = True
+            for ck, (names, _exp) in list(cache.items()):
+                cache[ck] = (names, 0)              # expired: re-read and fail
+            by = {t["key"]: t for t in ha.collect_azure()["tickets"]}
+            self.assertTrue(by["1"]["isEpic"])
+
     def test_parent_type_chunks_fail_independently_xerk1444(self):
         # A failed 2nd chunk keeps the 1st chunk's types; and a cap-overflow clear
         # on the failing poll still falls back to the last-known types first.

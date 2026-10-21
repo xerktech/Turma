@@ -2925,6 +2925,44 @@ test("watch start back-scans: a shell launched beyond the tail window is still l
   }
 });
 
+// A restart-clear-context re-points the watch at a NEW transcript, and the
+// relaunch ended every background task the old conversation had (XERK-1888).
+test("live tail: a re-arm onto a moved transcript drops the old one's live agents", async () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "moved-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const proj = path.join(PROJECTS_ROOT, mod.projectSlug(work));
+  fs.mkdirSync(proj, { recursive: true });
+  const oldTid = "33333333-3333-4444-5555-666666666666";
+  const newTid = "44444444-3333-4444-5555-666666666666";
+  const lines = (...entries) => entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
+  fs.writeFileSync(path.join(proj, `${oldTid}.jsonl`), lines(
+    { type: "assistant", message: { content: [
+      { type: "tool_use", id: "tm1", name: "Bash",
+        input: { command: "make build", description: "Build", run_in_background: true } }] } },
+    { type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "tm1", content: "started" }] },
+      toolUseResult: { stdout: "", backgroundTaskId: "msh1" } }));
+  fs.writeFileSync(path.join(proj, `${newTid}.jsonl`), lines(
+    { uuid: "n1", type: "user", message: { content: "fresh start" } }));
+
+  const frames = [];
+  mod.__setControlSink((o) => { if (o.turn === "sess-moved") frames.push(o); });
+  try {
+    mod.startWatch("sess-moved", work, oldTid);
+    await waitForCond(() => frames.some((f) => (f.agents || []).length === 1));
+    frames.length = 0;
+    mod.startWatch("sess-moved", work, newTid);
+    await waitForCond(() => frames.length >= 1);
+    assert.deepEqual(frames[frames.length - 1].agents, [],
+      "the old conversation's shell is not carried onto the new one");
+  } finally {
+    mod.stopWatch("sess-moved");
+    mod.__setControlSink(null);
+  }
+});
+
 test("backscanLiveAgents: a stop in the lead-in before the window still wins", () => {
   const mod = require("../tunnel-agent.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backscan-lead-"));

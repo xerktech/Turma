@@ -19877,6 +19877,14 @@ const server = http.createServer(async (req, res) => {
         // 413 and 503 mean opposite things and must not be collapsed: on a 503
         // the agent retries, on a 413 it must not. `budgetExceeded` is the flag
         // the reader actually sets — `overloaded` was never set by anything.
+        //
+        // Unlike the rendered route, this 413 is deliberately NOT recorded with
+        // noteArchiveRefusal (XERK-1888): an agent reads at most
+        // ARCHIVE_RAW_CHUNK_MAX before gzipping, which can't outgrow the 64 KiB
+        // slack, so only a non-conforming client reaches it; under HA a follower
+        // refuses it itself (stateless, forward.js), so a leader-side record
+        // would miss most; and the record is read only by 404s the rendered row
+        // answers, and is wiped by that row's next stored chunk.
         if (e && e.tooLarge) return refuseArchiveBody(req, res, 413, { error: e.message }, refusedPaused(e));
         if (e && e.budgetExceeded) return refuseArchiveBody(req, res, 503, { error: e.message }, true);
         return json(res, 400, { error: "could not read body" });

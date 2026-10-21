@@ -31,6 +31,11 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   work item's type is a portfolio level, `Epic` OR `Feature` (`_AZDO_EPIC_TYPES`, by name) — so the
   hub keeps both off the org auto-start/auto-merge stream. Do not narrow it back to `Epic` only: a
   Feature is ADO's Jira-Epic level, and leaving it out lets its stories auto-merge unreviewed.
+  - **The English names are a FLOOR, unioned with each project's own portfolio types** (XERK-1888,
+    `_azure_note_portfolio`: `{project}/_apis/work/processconfiguration` → `portfolioBacklogs`),
+    so a localized process ("Épopée") or a custom level ("Initiative") is an organizer too. Read on
+    the poll's worker, cached like the type meta; the shaper only reads the cache (the beat's
+    detail fetch adds no request). Never replace the floor with the read: a miss fails OPEN.
   - `epicKey` = `parentKey` ONLY when the parent's type is a portfolio level, and never on an
     organizer itself (a Feature under an Epic keeps `epicKey` None, so an epic run's children are
     only work items — arm the Feature, not the Epic, to run its stories).

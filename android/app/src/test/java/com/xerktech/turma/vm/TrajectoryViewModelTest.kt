@@ -83,7 +83,7 @@ class TrajectoryViewModelTest {
         val vm = main.track(TrajectoryViewModel(hub.app))
         vm.load(tid)
         val err = hub.awaitFlow(vm.state) { it.error != null }.error!!
-        assertTrue(err, err.contains("has not been accepting archive pushes"))
+        assertTrue(err, err.contains("has been reloading its archive index"))
         assertTrue(!vm.state.value.notSynced)
     }
 

@@ -21436,14 +21436,68 @@ def _azure_item_url(base, project, wid):
 # ADO's portfolio (organizer) levels: Epic and Feature sit above the backlog
 # items (User Story / PBI / Bug / Task) the way a Jira Epic does, so both map to
 # XERK-634's `isEpic` — an organizer, never a work session (XERK-1444). Matched
-# by name, case-insensitively; a custom portfolio level with another name is
-# not recognised.
+# by name, case-insensitively. The English names are only the FLOOR: a localized
+# process names them otherwise and a custom portfolio level ("Initiative") is
+# named by its operator, so each project's own portfolio types are read from its
+# process configuration and added (XERK-1888). A miss fails OPEN onto the
+# auto-start/auto-merge stream, so the two are unioned, never one instead.
 _AZDO_EPIC_TYPES = frozenset({"epic", "feature"})
 
+# (siteKey, project) -> (frozenset of lowercased portfolio type names, expiry).
+# Filled by the board poll's worker (`_azure_note_portfolio`), only READ by the
+# shaper, so the on-demand detail on the beat never adds a request. An empty or
+# failed read is held AZDO_META_RETRY_SEC and adds nothing.
+_AZDO_PORTFOLIO_CACHE = {}
+_AZDO_PORTFOLIO_CACHE_MAX = 500
 
-def _azure_is_epic_type(wtype):
+
+def _azure_note_portfolio(site_key, projects):
+    """Read each project's portfolio work-item types (process configuration)
+    into _AZDO_PORTFOLIO_CACHE. Best-effort per project, never raises; a failed
+    read keeps a still-good earlier answer rather than forgetting it."""
+    now = time.time()
+    for project in sorted({p for p in projects if isinstance(p, str) and p}):
+        ck = (site_key, project)
+        hit = _AZDO_PORTFOLIO_CACHE.get(ck)
+        if hit is not None and now < hit[1]:
+            continue
+        names = frozenset()
+        try:
+            data = azure_req(
+                f"/{urllib.parse.quote(project)}/_apis/work/processconfiguration", {})
+            names = frozenset(
+                wt["name"].strip().lower()
+                for b in (data.get("portfolioBacklogs") or []) if isinstance(b, dict)
+                for wt in (b.get("workItemTypes") or [])
+                if isinstance(wt, dict) and isinstance(wt.get("name"), str)
+                and wt["name"].strip())
+        except Exception as e:
+            if hit is None or hit[0]:
+                log(f"azure portfolio levels fetch failed for {project}: {e}")
+        if not names and hit is not None and hit[0]:
+            names = hit[0]      # keep the last good answer through a blip
+        if len(_AZDO_PORTFOLIO_CACHE) >= _AZDO_PORTFOLIO_CACHE_MAX and ck not in _AZDO_PORTFOLIO_CACHE:
+            _AZDO_PORTFOLIO_CACHE.clear()
+        _AZDO_PORTFOLIO_CACHE[ck] = (
+            names, now + (AZDO_META_TTL_SEC if names else AZDO_META_RETRY_SEC))
+
+
+def _azure_portfolio_names(site_key):
+    """Every portfolio type name known for this org, across its projects —
+    unioned so a parent in another project of the org still reads as one."""
+    out = set(_AZDO_EPIC_TYPES)
+    for (sk, _project), (names, _exp) in list(_AZDO_PORTFOLIO_CACHE.items()):
+        if sk == site_key:
+            out |= names
+    return out
+
+
+def _azure_is_epic_type(wtype, site_key=None):
     """True when a System.WorkItemType names an ADO portfolio level. Total."""
-    return isinstance(wtype, str) and wtype.strip().lower() in _AZDO_EPIC_TYPES
+    if not isinstance(wtype, str):
+        return False
+    names = _azure_portfolio_names(site_key) if site_key else _AZDO_EPIC_TYPES
+    return wtype.strip().lower() in names
 
 
 def _shape_azure_item(wi, site_key, base, parent_types=None):
@@ -21467,9 +21521,9 @@ def _shape_azure_item(wi, site_key, base, parent_types=None):
     labels = [t.strip() for t in str(tags).split(";") if t.strip()] if tags else []
     parent = f.get("System.Parent")
     parent_key = str(parent) if parent is not None else None
-    is_epic = _azure_is_epic_type(wtype)
+    is_epic = _azure_is_epic_type(wtype, site_key)
     parent_is_epic = bool(parent_key) and _azure_is_epic_type(
-        (parent_types or {}).get(parent_key))
+        (parent_types or {}).get(parent_key), site_key)
     return {
         "key": key,
         "url": _azure_item_url(base, project, key),
@@ -21557,8 +21611,11 @@ def _azure_parent_types(parent_ids, known=None):
 
 def fetch_azure_items(ids, site_key, base):
     """Batch-GET work items by id, shaped. Parents outside the batch get one
-    extra type-only GET so an Epic/Feature parent sets `epicKey` (XERK-1444)."""
+    extra type-only GET so an Epic/Feature parent sets `epicKey` (XERK-1444),
+    and each project's portfolio levels are read (cached) first (XERK-1888)."""
     raw = _azure_batch_get(ids, _AZDO_LIST_FIELDS)
+    _azure_note_portfolio(
+        site_key, [(wi.get("fields") or {}).get("System.TeamProject") for wi in raw])
     known = {str(wi["id"]): (wi.get("fields") or {}).get("System.WorkItemType")
              for wi in raw}
     parent_types = _azure_parent_types(
