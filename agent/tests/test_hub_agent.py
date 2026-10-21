@@ -11719,6 +11719,25 @@ class TestImportStaging(ManagerMixin, unittest.TestCase):
             slug_dir, self.TID, "subagents", "agent-a.jsonl")))
         self.assertEqual([n for n in os.listdir(slug_dir) if n.startswith(".import-")], [])
 
+    def test_a_failed_cross_device_copy_leaves_no_temp_behind(self):
+        # QA: the temp lives in PROJECTS_ROOT, which no staging sweep clears.
+        sm = self.make_manager()
+        job = self._job(sm, self._bundle(sm))
+        slug_dir = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(job["cwd"]))
+        stage = job["stage"]
+        real = os.replace
+
+        def replace(a, b):
+            if str(a).startswith(stage):
+                raise OSError(errno.EXDEV, "cross-device")
+            return real(a, b)
+        with mock.patch.object(ha.os, "replace", replace), \
+                mock.patch.object(ha.shutil, "copyfileobj",
+                                  side_effect=OSError(errno.ENOSPC, "disk full")):
+            with self.assertRaises(OSError):
+                sm._commit_import_stage(job)
+        self.assertEqual([n for n in os.listdir(slug_dir) if n.startswith(".import-")], [])
+
     def test_a_destination_dir_linked_outside_its_root_is_refused(self):
         sm = self.make_manager()
         job = self._job(sm, self._bundle(sm))
