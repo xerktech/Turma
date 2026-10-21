@@ -511,6 +511,12 @@ test("an operator's custom busy markers are broken up too", async () => {
   assert.ok(!dout.toLowerCase().includes("İx".toLowerCase()), dout);
   assert.ok(!dout.toLowerCase().includes("̇y"), dout);
   assert.match(dout, /aİ-xb cİ-yd/);
+  // A hit ends where its last folded character does, never m.length later; a
+  // literal ς is found by a σ marker (else unmarked() never ends); overlapping
+  // hits are taken left to right, one at a time.
+  const sp = await harness({ env: { TURMA_BUSY_MARKERS: "İx".toLowerCase() + "|aσ|aa" } });
+  sp.files.set("/t/peers.tsv", "zz\tP\th\tr\t\taİx z xaςy aaa\n");
+  assert.match(await sp.turma("peers"), /aİ-x z xa-ςy a-a-a(?!-)/);
   // Without the variable only the built-in markers are broken.
   const plain = await harness();
   plain.files.set("/t/peers.tsv", "zz\tP\thost2\tR\t\tThinking hard\n");

@@ -1323,7 +1323,7 @@ ATTACH_CHUNK_BYTES = 1 << 16
 # folds every operator text turn in the WHOLE transcript back into its reply,
 # so the chat always shows every message the operator sent. This cap bounds
 # only that exempt set (newest first), a payload backstop, not a window.
-HISTORY_USER_MSGS = _env_int("SESSION_HISTORY_USER_MSGS", 200)
+HISTORY_USER_MSGS = _env_int("SESSION_HISTORY_USER_MSGS", 200, minimum=1)
 
 # Transcript parsing is the expensive part; refresh each session's usage every N
 # heartbeats — but staggered (see _usage_slot) so they don't all reparse on the
