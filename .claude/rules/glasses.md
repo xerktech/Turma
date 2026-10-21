@@ -103,10 +103,14 @@ paths:
   - The first sheet tap within `QUESTION_TAP_GUARD_MS` (1s) of a question arriving on the open
     session is swallowed (`armQuestionTapGuard`): a tap already under way (meant for the box, its
     menu's Send, the transcript) would answer with the option just highlighted. A scroll disarms it.
+    It arms only while the wearer is ON that session, and never for the question last listed there
+    (`questionSeen`): a hub restart's empty poll re-listing it is no arrival.
   - Tests: `app.test.ts` "kept drafts" cases naming an arriving/replacing/re-listed question.
   - Keyed by host + id, and never followed by a bare id to another host: ids are unique per host
     only. A draft moves ONLY by the moved record's `migratedFrom` {host, sessionId}
     (`followMigratedDrafts`, XERK-2109, `session-migration.md`); a null source id moves nothing.
+  - The marker is permanent and the source stays listed (and can be started again), so a draft
+    moves only from a NON-running source to a RUNNING target: a restarted source's draft is its own.
   - A stash MOVES the draft out of `state.session` (home keeps a stale one) and joins any held one,
     so a second stash of the same left session neither replaces nor doubles it.
   - `takeDraft`/`stashDraft` rewrite `state.drafts`: call them BEFORE spreading `this.state`, or
