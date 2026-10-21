@@ -27672,6 +27672,8 @@ class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
             f"\x1b[2mhint to the last column\n\x1b[0m{rule}\n\u276f \n{rule}\n", styled=True), "")
         self.assertEqual(ha._composer_draft(
             f"{rule}\n\u276f \x1b[4:2mreal\x1b[0m\n{rule}\n", styled=True), "real")
+        # ...and a dim run still open at the END of the capture keeps its lines.
+        self.assertEqual(ha._undimmed("a\x1b[2mb\nc\nd"), "a\n\n")
 
     def test_an_unreadable_composer_defers_the_rename(self):
         sm = self.make_manager(cap="a pane with no composer rules")

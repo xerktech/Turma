@@ -472,8 +472,15 @@ test("an operator's custom busy markers are broken up too", async () => {
   assert.match(mo, /a--b/, "broken to a fixed point, not deleted");
   // A marker a break cannot undo (`-a`) is deleted; none is ever left.
   const d = await harness({ env: { TURMA_BUSY_MARKERS: "-a" } });
-  d.files.set("/t/peers.tsv", "zz\tP\th\tr\t\tAA--A -a\n");
+  d.files.set("/t/peers.tsv", "zz\tP\th\tr\t\tAA--A -a --aa ---aaa\n");
   assert.doesNotMatch(await d.turma("peers"), /-a/i);
+  // The head lines and the pointer's own words are broken too; the path is exact.
+  const hd = await harness({ env: { TURMA_BUSY_MARKERS: "session(s)|more in|ct" } });
+  hd.files.set("/t/peers.tsv", Array.from({ length: 300 }, (_, i) =>
+    `z${i}\tP${i}\th\tr\t\t${"x ".repeat(30)}\n`).join(""));
+  const ho = await hd.turma("peers");
+  assert.doesNotMatch(ho, /session\(s\)|more in|ct/i);
+  assert.match(ho, /…and \d+ more-in \/t\/peers\.tsv$/);
   // Breaking never pushes the roster pointer out, nor rewrites its path.
   const big = await harness({ env: { TURMA_BUSY_MARKERS: "ab|peers.tsv" } });
   big.files.set("/t/peers.tsv", Array.from({ length: 300 }, (_, i) =>

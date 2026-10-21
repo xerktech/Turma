@@ -140,8 +140,8 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
   (`bridge_busy_markers`, launch env on both OSes): the mod cannot see the agent's env.
   `unmarked()` breaks each literal marker of 2+ chars over whole output LINES (a marker can span
   cells) to a fixed point (a break can make another marker): spaces → `-`, else `-` after char 1;
-  what still matches is deleted. Peer rows are broken BEFORE sizing, and the roster pointer line
-  is never broken, so it is never cut and its path stays exact.
+  what still matches is deleted. Peer rows are broken BEFORE sizing and the pointer line is sized
+  as printed, so it is never cut; its words are broken, its path (the agent's own) never.
 - "(you)" is the row matching BOTH `TURMA_SESSION_ID` and `TURMA_DEVICE` (ids are unique per
   host only). `wake` passes `--` so a reason word starting with `-` is text.
 - Request-dir writes go through `_write_mod_file` (mkstemp + rename: never a planted link);

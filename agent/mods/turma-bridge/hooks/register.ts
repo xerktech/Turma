@@ -321,18 +321,25 @@ async function peersText($: EngineInterface, res: RegExp[]): Promise<string> {
   })
   const head = [`${rows.length} session(s); message one by its name with SendMessage.`, DATA_NOTE]
     .map(l => unmarked(l, res))
-  // Rows fit under OUT_MAX with the pointer to the whole roster kept.
+  // The path is the agent's own (TURMA_PEERS_FILE), not file text: never cut,
+  // and never rewritten by a marker break (its fixed words are broken).
+  const pointer = (n: number) => `${unmarked(`  …and ${n} more in`, res)} ${path}`
+  // Rows fit under OUT_MAX with the pointer to the whole roster kept: room is
+  // reserved for the longest count it can print, then rows are dropped while
+  // the actual pointer (its count, its broken words) would not fit.
   const kept: string[] = []
-  // Room for the pointer line as it will print (its count is at most 3 digits).
-  let size = head.join('\n').length + `\n  …and 999 more in ${path}`.length
+  let size = head.join('\n').length
+  const reserve = pointer(ordered.length).length + 1
   for (const line of lines) {
-    if (size + line.length + 1 > OUT_MAX) break
+    if (size + reserve + line.length + 1 > OUT_MAX) break
     kept.push(line)
     size += line.length + 1
   }
-  // The path is the agent's own (TURMA_PEERS_FILE), not file text: never cut,
-  // and never rewritten by a marker break.
-  if (kept.length < ordered.length) kept.push(`  …and ${ordered.length - kept.length} more in ${path}`)
+  while (kept.length && kept.length < ordered.length
+         && size + pointer(ordered.length - kept.length).length + 1 > OUT_MAX) {
+    size -= kept.pop()!.length + 1
+  }
+  if (kept.length < ordered.length) kept.push(pointer(ordered.length - kept.length))
   return [...head, ...kept].join('\n')
 }
 
