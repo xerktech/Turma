@@ -10706,6 +10706,10 @@ _2148_OVERLAYS = {
                    "   ╰" + "─" * 60 + "╯\n"
                    "   ❯ ✔ docs               claude.ai sync · ~340 tok\n"
                    "     ✔ xlsx               claude.ai sync · ~320 tok\n"),
+    # /plugin while it loads: its edge, tab bar and spinner, nothing else.
+    "/plugin loading": ("● started\n✻ Crunched for 9s · done 4:57 PM\n" + "▔" * 100 + "\n"
+                        "   Plugins  Discover   Installed   Marketplaces   Errors   Stats\n\n"
+                        "   ✶  Loading…\n"),
 }
 # Composer states whose footer must never read as an overlay's.
 _2148_COMPOSERS = {
@@ -10796,9 +10800,14 @@ class TestModelPickerBodyIsABlockingDialog(unittest.TestCase):
     read as an idle composer; its body is what says it is up."""
 
     def test_footerless_picker_blocks(self):
-        self.assertFalse(ha._hint_dialog_up(_2148_PICKER_40))
         self.assertTrue(ha._model_picker_open(_2148_PICKER_40))
         self.assertTrue(ha._pane_blocking_dialog(_2148_PICKER_40))
+        # Its "▔" edge says so too; without one (a tmux tip can be inset into
+        # it: "tmux detected · … ▔") the body alone still does.
+        self.assertTrue(ha._hint_dialog_up(_2148_PICKER_40))
+        edgeless = _2148_PICKER_40.replace("▔" * 40, " tmux detected · scroll with PgUp ▔")
+        self.assertFalse(ha._hint_dialog_up(edgeless))
+        self.assertTrue(ha._pane_blocking_dialog(edgeless))
 
     def test_a_picker_quoted_above_the_composer_does_not(self):
         quoted = "● Select model\n  1. Opus\n❯ 2. Sonnet\n"
@@ -10882,7 +10891,9 @@ class TestModelSwitchConfirm(unittest.TestCase):
     def test_it_is_a_blocking_dialog(self):
         for cap in (_2157_CONFIRM_140, _2157_CONFIRM_24):
             self.assertFalse(ha.parse_pane_prompt(cap))
-            self.assertFalse(ha._hint_dialog_up(cap))   # why it was invisible
+            self.assertTrue(ha.parse_model_switch_confirm(cap))
+            # Its "▔" edge now reads too (`_overlay_edge_up`, XERK-2148).
+            self.assertTrue(ha._hint_dialog_up(cap))
             self.assertTrue(ha._pane_blocking_dialog(cap))
 
     def test_a_quoted_confirm_above_the_composer_is_not_one(self):
@@ -21317,6 +21328,45 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         sm.set_model("abcde", "sonnet")
         self.assertEqual(self._keys()[-1], "Escape")
         self.assertEqual(sess["model"], "opus")
+        # One Escape only: two on an idle composer open the rewind menu.
+        self.assertEqual(self._keys().count("Escape"), 1)
+
+    def test_set_model_closes_a_picker_that_paints_late(self):
+        # XERK-2148 QA: on a cold session the picker painted after the wait,
+        # the early Escape did not cancel it, and it stayed open.
+        class Late(_PickerPane):
+            def __init__(self, delay, **kw):
+                super().__init__(**kw)
+                self.delay = None
+                self.wait = delay
+
+            def key(self, key):
+                if key == "Enter" and not self.open and self.delay is None:
+                    self.delay = self.wait    # /model is loading
+                    return
+                if key == "Escape" and self.delay:
+                    return                    # does not cancel the pending picker
+                super().key(key)
+
+            def capture(self):
+                if self.delay:
+                    self.delay -= 1
+                    if not self.delay:
+                        self.open = True
+                return super().capture()
+
+        for delay, why, opened in ((ha.MODEL_PICKER_TRIES + 3, "appeared too late", True),
+                                   (10 ** 6, "did not appear", False)):
+            pane = Late(delay)
+            sm = self.make_manager(pane=pane)
+            sess = self._session(sm, model="opus")
+            with mock.patch.object(ha, "log") as logged:
+                sm.set_model("abcde", "sonnet")
+            self.assertIn(why, logged.call_args[0][0])
+            self.assertFalse(pane.open)
+            self.assertNotIn("s", self._keys())
+            self.assertEqual(self._keys().count("Escape"), 2 if opened else 1)
+            self.assertEqual(sess["model"], "opus")
 
     def test_set_model_unconfirmed_selection_leaves_the_record(self):
         # `s` was sent but the TUI never printed its confirmation: the record

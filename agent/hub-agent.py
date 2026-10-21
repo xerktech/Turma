@@ -18715,25 +18715,28 @@ _DIALOG_HINT_ITEMS = frozenset((
 _OVERLAY_EDGE_RE = re.compile(r"^\s*▔{3,}(?:.*▔)?\s*$")
 
 
-def _overlay_header_up(lines):
-    """Whether the pane's bottom is an overlay whose key hints sit in its
-    HEADER rather than a footer — a long /skills list scrolls its footer off a
-    40-row pane but keeps "9 skills · enter/space to cycle, / to search, t to
-    sort, Esc to close" under its title (XERK-2148). Read below the last "▔"
-    edge only, and only with no composer rule or composer footer there: a
-    hint item (`_DIALOG_HINT_ITEMS`, here also split on ",") must be in it."""
+def _overlay_edge_up(lines):
+    """Whether the pane's bottom is a full-screen overlay read off its "▔"
+    top edge, for an overlay showing no footer: a long /skills list scrolls
+    its footer off a 40-row pane (its hints ride the header), and /plugin
+    draws only its tab bar and "✶ Loading…" while it loads (XERK-2148).
+
+    Read below the LAST edge only, and only when nothing there is the
+    composer's: no composer rule (the composer is boxed in "─" rules, so a
+    reply quoting an edge is followed by one), no composer footer (mode
+    marker, shell mode, qwen's) and no exit toast. The edge is TUI chrome
+    drawn only over an overlay; with no composer under it the overlay is
+    what owns the keyboard."""
     edge = max((i for i, line in enumerate(lines) if _OVERLAY_EDGE_RE.match(line)),
                default=None)
     if edge is None:
         return False
     body = [line for line in lines[edge + 1:] if line.strip()]
     text = "\n".join(body)
-    if (any(_COMPOSER_RULE_RE.match(line) for line in body)
-            or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
-            or PANE_SHELL_FOOTER_RE.search(text)):
-        return False
-    return any(" ".join(item.split()).lower() in _DIALOG_HINT_ITEMS
-               for line in body for item in re.split(r"[·,]", line))
+    return bool(body) and not (
+        any(_COMPOSER_RULE_RE.match(line) or PANE_SHELL_FOOTER_RE.match(line)
+            or PANE_EXIT_TOAST_RE.match(line) for line in body)
+        or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text))
 
 
 def _pane_footer_lines(lines):
@@ -18800,7 +18803,7 @@ def _hint_dialog_up(cap):
             items.append(prev + " " + parts[0])
         prev = parts[-1]
     return (any(" ".join(item.split()).lower() in _DIALOG_HINT_ITEMS for item in items)
-            or _overlay_header_up(lines))
+            or _overlay_edge_up(lines))
 
 
 def _pane_blocking_dialog(cap):
@@ -24895,6 +24898,9 @@ MODELS_PROBE_TIMEOUT_SEC = _env_int("TURMA_MODELS_PROBE_TIMEOUT_SEC", 90)
 # fetch.
 MODEL_PICKER_TRIES = 10
 MODEL_PICKER_WAIT_SEC = 0.3
+# After giving up on the picker, how many more polls (WAIT_SEC apart) watch
+# for one painting late on a cold session, to close it (XERK-2148).
+MODEL_PICKER_LATE_TRIES = 15
 # The arrow loop: one press at a time, each verified by re-reading the ❯
 # before the next (MAX_STEPS bounds a cursor that never converges). STEP_*
 # pace the per-press readback; CONFIRM_* pace the wait for the "Set model to…"
@@ -35128,9 +35134,22 @@ class SessionManager:
             # closes a half-painted picker) and destroys nothing. A picker too
             # short to draw its ❯ row (24x15 shows only row 1) did appear, and
             # the log says so rather than "did not appear" (XERK-2148).
+            #
+            # On a cold session (just launched, 2.1.306) the picker can paint
+            # after the wait above, and the early Escape doesn't cancel it: it
+            # was then left open over the composer (XERK-2148). So the pane is
+            # watched a bounded while longer, and a picker that turns up late
+            # is Escaped too — the switch itself is not attempted that late.
             _pane_send_keys(tmux_name, "Escape")
             why = ("/model picker did not appear" if not rows else
                    "/model picker's cursor row is not drawn (pane too small)")
+            if not rows:
+                for _ in range(MODEL_PICKER_LATE_TRIES):
+                    time.sleep(MODEL_PICKER_WAIT_SEC)
+                    if _model_picker_open(_capture_pane(tmux_name) or ""):
+                        self._back_out_of_model_picker(tmux_name)
+                        why = "/model picker appeared too late; closed it"
+                        break
             log(f"set model of {sid} -> {arg}: {why}")
             self.save()
             return
