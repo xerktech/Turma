@@ -76,6 +76,10 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
   - A move BACK finds the old copy at the same path. Export writes the state's digest into the
     source's gitdir (`MIGRATION_EXPORT_MARK`); an old copy still matching it (or clean at an ancestor)
     is removed, anything else detached and renamed to `<cwd>.pre-migration-<ts>`.
+  - Every rename of a worktree dir goes through `_rename_worktree`: `worktree lock` across the
+    rename + `repair` (XERK-2148). A prune between them (any process's) deleted the admin dir and
+    the aside lost HEAD/index; an in-process lock would not cover a session's own prune.
+    Test: `test_a_prune_during_the_move_aside_*`.
   - An aside is reaped by the usage worker once `<ts>` is past `MIGRATION_ASIDE_RETENTION_SEC`
     (30 days, env `TURMA_MIGRATION_ASIDE_RETENTION_SEC`, 0 = never), then its worktree entry
     pruned (`_sweep_migration_asides`, XERK-2138). A symlinked aside or repo dir is skipped;

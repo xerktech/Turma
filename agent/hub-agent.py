@@ -33125,8 +33125,7 @@ class SessionManager:
                     run(["git", "-C", repo, "branch", "-D", created_branch])
                 if aside and not os.path.exists(cwd):
                     try:
-                        os.rename(aside, cwd)
-                        run(["git", "-C", repo, "worktree", "repair", cwd])
+                        self._rename_worktree(repo, aside, cwd, t)
                     except OSError as e:
                         log(f"migration: could not put {aside} back at {cwd}: {e}")
                 raise
@@ -33219,14 +33218,35 @@ class SessionManager:
             run_ok(["git", "-C", cwd, "checkout", "-q", "--detach"], timeout=t)
         aside = f"{cwd}.pre-migration-{int(time.time())}"
         try:
-            os.rename(cwd, aside)
+            self._rename_worktree(repo, cwd, aside, t)
         except OSError as e:
             raise RuntimeError(f"an older worktree is in the way at {cwd} and could "
                                f"not be moved aside: {e}")
-        if own:
-            run(["git", "-C", repo, "worktree", "repair", aside])
         log(f"migration: kept the older worktree at {cwd} as {aside}")
         return aside
+
+    def _rename_worktree(self, repo, src, dst, timeout):
+        """Rename a worktree dir and repair git's entry for it, LOCKED across the
+        two (XERK-2148): a `git worktree prune` — any caller's, this agent's or a
+        session's own — landing between them reads the entry's path as gone and
+        deletes its admin dir, so the moved copy loses its HEAD and index. A
+        prune skips a locked entry. A dir with no `.git` is only renamed. A lock
+        already held (the operator's) is left in place. Raises the rename's
+        OSError."""
+        own = os.path.lexists(os.path.join(src, ".git"))
+        locked = own and run_ok(["git", "-C", repo, "worktree", "lock", "--reason",
+                                 "turma: moving a migrated copy", src],
+                                timeout=timeout)[0] == 0
+        try:
+            os.rename(src, dst)
+        except OSError:
+            if locked:
+                run(["git", "-C", repo, "worktree", "unlock", src])
+            raise
+        if own:
+            run(["git", "-C", repo, "worktree", "repair", dst])
+        if locked:
+            run(["git", "-C", repo, "worktree", "unlock", dst])
 
     # Ignored dirs a build or install re-creates: the only ignored paths an
     # older copy may hold and still be removed. Narrow on purpose — anything
@@ -33834,6 +33854,7 @@ class SessionManager:
                 names = os.listdir(rd)
             except OSError:
                 continue
+            repo_path = os.path.join(REPOS_ROOT, repo)
             removed = False
             for name in names:
                 m = MIGRATION_ASIDE_RE.fullmatch(name)
@@ -33843,12 +33864,17 @@ class SessionManager:
                 try:
                     if not stat.S_ISDIR(os.lstat(path).st_mode):
                         continue
+                    if os.path.isdir(repo_path):
+                        # A move cut short between its lock and unlock
+                        # (_rename_worktree) left the entry locked, and the
+                        # prune below would keep a locked entry forever.
+                        run_ok(["git", "-C", repo_path, "worktree", "unlock", path],
+                               timeout=self.MIGRATION_RESTORE_GIT_TIMEOUT_SEC)
                     shutil.rmtree(path, onerror=_rmtree_writable)
                     removed = True
                     log(f"migration: removed {path}, kept aside past retention")
                 except Exception as e:
                     log(f"migration: removing {path} failed: {e}")
-            repo_path = os.path.join(REPOS_ROOT, repo)
             if removed and os.path.isdir(repo_path):
                 run(["git", "-C", repo_path, "worktree", "prune"])
 

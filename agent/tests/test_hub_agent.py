@@ -12461,6 +12461,32 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         [aside] = glob.glob(sess["worktreePath"] + ".pre-migration-*")
         self.assertEqual(self.read(aside, "local-only.txt"), "do not lose me\n")
 
+    def test_a_prune_during_the_move_aside_keeps_the_copy_a_worktree(self):
+        # XERK-2148: a `worktree prune` between the rename and the repair read
+        # the entry as gone and deleted its admin dir: the aside lost HEAD/index.
+        src_wt = self.src_worktree()
+        sess = self.dst_sess()
+        wt = sess["worktreePath"]
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "--detach", wt, "origin/main")
+        self.write(wt, "README", "edited\n")
+        real_rename = os.rename
+
+        def rename_then_prune(src, dst):
+            real_rename(src, dst)
+            if src == wt:
+                self.git("-C", self.dst_repo, "worktree", "prune")
+        sm = self.make_manager()
+        with mock.patch.object(ha.os, "rename", rename_then_prune):
+            sm._restore_worktree_state(sess, sm._capture_worktree_state(src_wt))
+        self.assert_rebuilt(wt, src_wt)
+        [aside] = glob.glob(wt + ".pre-migration-*")
+        self.assertEqual(self.git("-C", aside, "rev-parse", "HEAD"),
+                         self.git("-C", self.dst_repo, "rev-parse", "origin/main"))
+        self.assertEqual(self.git("-C", aside, "status", "--porcelain"), "M README")
+        listed = self.git("-C", self.dst_repo, "worktree", "list", "--porcelain")
+        self.assertIn(f"worktree {aside}\n", listed + "\n")
+        self.assertNotIn("locked", listed)
+
     def test_a_move_back_keeps_an_older_copy_holding_ignored_files_aside(self):
         # XERK-1858: ignored files never ride the bundle, so an older copy that
         # matches its export digest still holds the only copy of one — from
@@ -12568,6 +12594,18 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "MIGRATION_ASIDE_RETENTION_SEC", 0):
             sm._sweep_migration_asides()
         self.assertTrue(os.path.isdir(fresh))
+
+    def test_an_aside_left_locked_is_still_pruned(self):
+        # XERK-2148: a move cut short between _rename_worktree's lock and unlock
+        # leaves the entry locked, which a plain prune keeps forever.
+        sm = self.make_manager()
+        old = os.path.join(ha.WORKTREES_ROOT, "Turma",
+                           f"wt.pre-migration-{int(time.time()) - 31 * 86400}")
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "--detach", old, "origin/main")
+        self.git("-C", self.dst_repo, "worktree", "lock", old)
+        sm._sweep_migration_asides()
+        self.assertFalse(os.path.lexists(old))
+        self.assertNotIn(old, self.git("-C", self.dst_repo, "worktree", "list", "--porcelain"))
 
     def test_only_compiled_python_in_pycache_is_regenerable(self):
         # XERK-1858 QA: any file directly in __pycache__/ counted, so an
