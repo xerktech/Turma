@@ -14159,17 +14159,44 @@ def _pane_cells(text):
     return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
 
 
+def _pane_numbering_continues(lines, idx, number):
+    """Whether option `number` sits below line `idx` in the same block (XERK-2150).
+
+    The native AskUserQuestion picker splits its list with a rule — "4. Type
+    something." / ──── / "5. Chat about this" — while a permission or plan
+    dialog's last option is followed by a blank line. So a run whose numbering
+    carries on past it, before any blank, is part of the picker, whose answer
+    comes from ask.py and whose rows are not digits to send. Its descriptions
+    can't be told from wrapped labels line by line: a label that fills the pane
+    makes the description's first word look like it overflowed."""
+    for line in lines[idx:]:
+        if not line.strip():
+            return False
+        om = PANE_PROMPT_OPTION_RE.match(line)
+        if om and int(om.group(2)) == number:
+            return True
+    return False
+
+
+def _pane_join_wrap(label, text):
+    """`label` with a wrapped screen line `text` appended. A path the TUI broke
+    mid-token ("…/.turma" / "/worktrees/…", "…/wor" / "ktrees/…") had no space
+    there; any other break replaced one."""
+    tail = label.rsplit(None, 1)[-1]
+    head = text.split(None, 1)[0]
+    return label + ("" if "/" in tail and "/" in head else " ") + text
+
+
 def _pane_option_wrap_end(lines, idx, width):
     """Index of the last screen line of option `idx`'s label (XERK-2150).
 
     The TUI word-wraps a long label onto lines indented to the label column
     ("2. Yes, and always allow access to" / "   /long/cwd from this project").
-    The native AskUserQuestion picker puts a description on exactly such a line
-    under every option, and its rows (Type something., Chat about this) must not
-    become clickable digits — so indent can't tell the two apart. Width can: a
-    line is a wrap only when its first word would NOT have fit after the line
-    above it. `width` is the widest line in the capture (the dialog's top rule
-    spans the pane); 0 disables joining."""
+    A line on that indent is a wrap only when its first word would NOT have fit
+    after the line above it, so a description line under a short option ends
+    the run (the picker is also refused whole: _pane_numbering_continues).
+    `width` is the widest line in the capture (the dialog's top rule spans the
+    pane); 0 disables joining."""
     m = PANE_PROMPT_OPTION_RE.match(lines[idx])
     col = m.start(3)
     j = idx
@@ -14248,13 +14275,16 @@ def parse_pane_prompt(cap, face=False):
             want -= 1
         if want != 0 or len(rows) < 2:
             continue                 # not 1..N, or fewer than two options
+        if _pane_numbering_continues(lines, rows[0][1] + 1, int(m.group(2)) + 1):
+            continue                 # only part of a longer list (the picker)
         rows.reverse()
         start = rows[0][0]
         opts = []
         for first, last in rows:
             om = PANE_PROMPT_OPTION_RE.match(lines[first])
-            label = " ".join([om.group(3)] + [lines[k].strip()
-                                              for k in range(first + 1, last + 1)])
+            label = om.group(3)
+            for k in range(first + 1, last + 1):
+                label = _pane_join_wrap(label, lines[k].strip())
             opts.append({"number": int(om.group(2)),
                          "label": label[:200],
                          "selected": bool(om.group(1))})

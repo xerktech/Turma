@@ -340,12 +340,16 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   - **Nothing keys on wording.** A dialog needs ALL of: options 1..N (N≥2), exactly one `❯`, a `?`
     line directly above, **no mode footer below** (the footer rides the composer a dialog
     replaces). `detail` closes on a rule, not on blanks.
-  - **A wrapped label is rejoined; a picker description is not** (XERK-2150). Both sit on a line
-    indented to the label column, so indent can't tell them apart: a line is a wrap only when its
-    first word would not have fit after the line above (width = widest captured line, the
-    dialog's top rule). Loosening this turns the AskUserQuestion picker — whose answer comes from
-    `ask.py`, and whose "Type something." row is not a digit to send — into a `panePrompt`.
-    Tests: `TestParsePanePrompt.test_wrapped_option_label`, `test_picker_descriptions_not_options`.
+  - **A wrapped label is rejoined; the AskUserQuestion picker is refused** (XERK-2150).
+    - A wrap and a picker description sit on the same label-column indent, and a label that fills
+      the pane makes them identical row by row — no per-line rule can split them.
+    - The picker is refused whole: its numbering continues past the run before a blank ("4. Type
+      something." / rule / "5. Chat about this"). Its answer comes from `ask.py`; its rows are no
+      digits to send.
+    - A line is a wrap only if its first word would not have fit after the line above (width =
+      widest captured line). Joined with no space only when both sides of the break hold a "/".
+    - Tests: `TestParsePanePrompt.test_wrapped_option_label`, `test_wrapped_path_label`,
+      `test_picker_descriptions_not_options`, `test_wrap_needs_label_column_and_cells`.
   - `answer_pane_prompt` **re-reads the pane first** and drops the answer unless that number is on
     screen NOW. Both `liveState`s check the prompt ahead of the busy read. Tests:
     `TestAnswerPanePrompt`.
