@@ -262,8 +262,11 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     rebased onto), on every path: the commits API pages by a header this reader never sees,
     and a short page matched as a whole PR based mid-PR (QA-reproduced). Never drop that check.
     Real ADO (XERK-2156): a squash's parent and a merge's first parent both equal it; a cut
-    `comment` ends with no `...` and is a prefix of the full message. Not seen on a real
-    forge: an ADO rebase completion, or one after the target moved past the last evaluation.
+    `comment` ends with no `...` and is a prefix of the full message.
+  - **ADO re-evaluates `lastMergeTargetCommit` AT completion** (XERK-2164, a scratch repo):
+    still stale just before the complete call, it equals the moved target after it. A rebase
+    completion's merge~N, and a rebaseMerge/merge/squash's first parent, equal it, target
+    moved or not; `shadow_base_commit` placed all six cases.
   - **A GitLab fast-forward's answer must equal `diff_refs.start_sha`** (XERK-2156), on every
     path; an MR that does not read or names none fails. On 78 of 78 real fast-forwarded MRs
     (wayland, pipewire) start == base_sha == merge~N. A SQUASH is exempt: GitLab squashes and
