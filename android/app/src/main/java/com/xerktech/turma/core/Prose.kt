@@ -253,8 +253,9 @@ private class RunList { val at = ArrayList<Int>(); var k = 0 }
 private fun runLen(s: String, i: Int): Int { var n = 0; while (i + n < s.length && s[i + n] == '`') n++; return n }
 
 private fun codeSpanBody(body: String): String {
-    // GFM strips one leading + trailing space, so `` ` `` can hold a backtick.
-    if (body.length > 2 && body.startsWith(" ") && body.endsWith(" ") && body.isNotBlank()) {
+    // GFM strips one leading + trailing space, so `` ` `` can hold a backtick. JS blank,
+    // not Kotlin's: `isBlank()` counts U+001C..U+001F, so `` `` <US> `` `` kept its spaces here.
+    if (body.length > 2 && body.startsWith(" ") && body.endsWith(" ") && !isJsBlank(body)) {
         return body.substring(1, body.length - 1)
     }
     return body
@@ -363,14 +364,18 @@ private fun parseTables(text: String): List<ProseBlock> {
 // while a bare `---` has no pipe and correctly lands on one) and ABOVE the
 // inline pass (so each construct's content still gets code spans, links and
 // emphasis). Keep in step with chat.js renderBlocks().
-private val HEADING_RE = Regex("""^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*$""")
+// JavaScript's `.`, spelled out: Java's also refuses U+0085 NEL (a Java line
+// terminator, not a JS one), so `## H<NEL>` was a heading on the web and prose here.
+private const val JS_DOT = """[^\n\r\u2028\u2029]"""
+private val HEADING_RE = Regex("""^ {0,3}(#{1,6})[ \t]+($JS_DOT*?)[ \t]*$""")
 private val HEADING_CLOSE_RE = Regex("""[ \t]+#+[ \t]*$""")
-private val QUOTE_RE = Regex("""^ {0,3}> ?(.*)$""")
-private val UL_RE = Regex("""^([ \t]*)[-*+][ \t]+(.*)$""")
-private val OL_RE = Regex("""^([ \t]*)(\d{1,9})[.)][ \t]+(.*)$""")
+private val QUOTE_RE = Regex("""^ {0,3}> ?($JS_DOT*)$""")
+private val UL_RE = Regex("""^([ \t]*)[-*+][ \t]+($JS_DOT*)$""")
+// `[0-9]`, not `\d`: a device's ICU regex reads `\d` as any Unicode digit, JS as ASCII.
+private val OL_RE = Regex("""^([ \t]*)([0-9]{1,9})[.)][ \t]+($JS_DOT*)$""")
 // Cheap pre-filter. Deliberately loose: being wrong only costs the fast path,
 // never correctness, since a non-matching line still falls through to the buffer.
-private val BLOCK_HINT = Regex("""^[ \t]{0,8}(?:#|>|[-*+_]|\d{1,9}[.)])""", RegexOption.MULTILINE)
+private val BLOCK_HINT = Regex("""^[ \t]{0,8}(?:#|>|[-*+_]|[0-9]{1,9}[.)])""", RegexOption.MULTILINE)
 private const val MAX_QUOTE_DEPTH = 4
 
 // `text` is var so a lazy-continuation line can be appended to the item above it.
@@ -432,6 +437,8 @@ private fun listItemAt(line: String): RawListItem? {
  * indent width exactly as the web's <ul>/<ol> stack does, and the ordered
  * numbering the browser would have derived from `start`.
  */
+private val BULLETS = listOf("\u2022", "\u25E6", "\u25AA")
+
 private fun listBlockOf(items: List<RawListItem>): ProseBlock.ListBlock {
     val indents = ArrayList<Int>()
     val counters = ArrayList<Int>()   // >0 = ordered counter, 0 = bullets
@@ -452,7 +459,8 @@ private fun listBlockOf(items: List<RawListItem>): ProseBlock.ListBlock {
             }
         }
         val depth = indents.size - 1
-        val marker = if (it.ordered) "${counters.last()}." else if (depth > 0) "◦" else "•"
+        // The browser's default <ul> markers: disc, circle, then square from depth 2 down.
+        val marker = if (it.ordered) "${counters.last()}." else BULLETS[minOf(depth, BULLETS.size - 1)]
         rows.add(ProseListItem(depth, marker, parseInline(it.text)))
     }
     return ProseBlock.ListBlock(rows)
@@ -587,9 +595,13 @@ private fun normalizeEol(s: String): String =
 // A standalone <svg>…</svg> whose opener starts a line is lifted out of prose as an
 // image (XERK-221); one mid-line (an inline code span, a sentence) stays text, and
 // an unterminated one (a live turn mid-block) stays text until its closer lands.
-private val SVG_HINT = Regex("<svg[$JS_WS_NL>]", RegexOption.IGNORE_CASE)
-private val SVG_OPEN = Regex("(^|\n)[ \t]*<svg[$JS_WS_NL>]", RegexOption.IGNORE_CASE)
-private val SVG_CLOSE = Regex("</svg[$JS_WS_NL]*>", RegexOption.IGNORE_CASE)
+// JavaScript's `/i` on these letters is ASCII: Kotlin's IGNORE_CASE is Unicode case
+// folding, under which U+017F `ſ` matches `s`, so `<ſvg>` was an image here and text on
+// the web. The case-insensitive tag name is spelled out instead.
+private const val SVG_NAME = "[sS][vV][gG]"
+private val SVG_HINT = Regex("<$SVG_NAME[$JS_WS_NL>]")
+private val SVG_OPEN = Regex("(^|\n)[ \t]*<$SVG_NAME[$JS_WS_NL>]")
+private val SVG_CLOSE = Regex("</$SVG_NAME[$JS_WS_NL]*>")
 
 private fun parseSvgAndText(s: String): List<ProseBlock> {
     if (SVG_HINT.find(s) == null) return parseTables(s)
@@ -606,12 +618,31 @@ private fun parseSvgAndText(s: String): List<ProseBlock> {
         // The boundary newline the web keeps is dropped here: Compose's block spacing
         // replaces it, and kept it would print a blank line above the image.
         out.addAll(parseTables(afterBlock(s.substring(last, open.range.first), last)))
-        out.add(ProseBlock.Svg(s.substring(lt, close.range.last + 1).trim { isJsSpace(it) }))
+        out.add(ProseBlock.Svg(svgSource(s.substring(lt, close.range.last + 1))))
         last = close.range.last + 1
         pos = last
     }
     out.addAll(parseTables(afterBlock(s.substring(last), last)))
     return out
+}
+
+/**
+ * An SVG block's markup: trimmed, and with any lone UTF-16 surrogate made U+FFFD, as
+ * chat.js svgToImg must (encodeURIComponent throws on one) — so both decode the same.
+ */
+private fun svgSource(raw: String): String {
+    val t = raw.trim { isJsSpace(it) }
+    val sb = StringBuilder(t.length)
+    var i = 0
+    while (i < t.length) {
+        val c = t[i]
+        if (c.isHighSurrogate() && i + 1 < t.length && t[i + 1].isLowSurrogate()) {
+            sb.append(c).append(t[i + 1]); i += 2; continue
+        }
+        sb.append(if (c.isSurrogate()) '\uFFFD' else c)
+        i++
+    }
+    return sb.toString()
 }
 
 /** Text that follows an SVG block at [start] loses the newline ending the closer's line. */
@@ -625,13 +656,23 @@ private fun afterBlock(text: String, start: Int): String =
  */
 private fun isSvgDocument(body: String): Boolean {
     val t = body.trim { isJsSpace(it) }
-    if (t.length < 5 || !t.regionMatches(0, "<svg", 0, 4, ignoreCase = true)) return false
+    if (t.length < 5 || !asciiRegionMatches(t, 0, "<svg")) return false
     val d = t[4]
     if (d != '>' && !isJsSpace(d)) return false
     if (!t.endsWith(">")) return false
     var e = t.length - 1
     while (e > 0 && isJsSpace(t[e - 1])) e--
-    return e >= 5 && t.regionMatches(e - 5, "</svg", 0, 5, ignoreCase = true)
+    return e >= 5 && asciiRegionMatches(t, e - 5, "</svg")
+}
+
+/** [s] holds lower-case ASCII [lit] at [at], ASCII-case-insensitively (JS `/i`; see [SVG_NAME]). */
+private fun asciiRegionMatches(s: String, at: Int, lit: String): Boolean {
+    if (at < 0 || at + lit.length > s.length) return false
+    for (k in lit.indices) {
+        val c = s[at + k]
+        if ((if (c in 'A'..'Z') c + 32 else c) != lit[k]) return false
+    }
+    return true
 }
 
 /** One piece of a run of inline spans once its images are split out ([splitImages]). */
@@ -716,7 +757,7 @@ fun parseProse(raw: String): List<ProseBlock> {
             i++ // consume the closer; past the end already for an unterminated block
             val bodyStr = body.joinToString("\n")
             // A fence whose whole body is one SVG document is a picture, not code.
-            out.add(if (isSvgDocument(bodyStr)) ProseBlock.Svg(bodyStr.trim { isJsSpace(it) })
+            out.add(if (isSvgDocument(bodyStr)) ProseBlock.Svg(svgSource(bodyStr))
                 else ProseBlock.Code(open.groupValues[2], bodyStr))
             continue
         }

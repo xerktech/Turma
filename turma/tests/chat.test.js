@@ -1802,6 +1802,22 @@ test("renderProse: a line separator is not a line ending (the ports must agree)"
   assert.doesNotMatch(renderProse("1. a\u2029"), /<ol/);
 });
 
+test("renderProse: NEL is ordinary text inside a line (XERK-2140)", () => {
+  // JavaScript's `.` matches U+0085; Java's does not, which made these prose on
+  // Android until Prose.kt spelled JS's `.` out. ProseTest.kt asserts the same.
+  assert.equal(renderProse("## H\u0085"), '<h2 class="md-h">H\u0085</h2>');
+  assert.match(renderProse("- a\u0085b"), /^<ul class="md-list"><li>a\u0085b<\/li><\/ul>$/);
+});
+
+test("renderProse: a lone surrogate inside an <svg> block cannot throw the render (XERK-2140)", () => {
+  // encodeURIComponent throws URIError on a lone surrogate, which took renderProse —
+  // and the whole repaint — down. It becomes U+FFFD, as on Android.
+  assert.match(renderProse("<svg>\ud800</svg>"), new RegExp('src="data:image/svg\\+xml,' +
+    encodeURIComponent("<svg>\ufffd</svg>").replace(/[%]/g, "%") + '"'));
+  assert.match(renderProse("```\n<svg>\ud83d\ude00\udc00</svg>\n```"),
+    new RegExp(encodeURIComponent("\ud83d\ude00\ufffd")));
+});
+
 test("renderInline: the emphasis scanner measures whole runs, never a capped count", () => {
   // Capping how far a delimiter run is counted was tried as a speed fix and
   // reverted: a saturated count made `m === len` true for a LONGER run and made
