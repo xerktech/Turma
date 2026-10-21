@@ -107,6 +107,18 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 - Request-dir writes go through `_write_mod_file` (mkstemp + rename: never a planted link);
   `_publish_mod_status` guards each session on its own and rewrites a deleted `status.json`.
 
+## Evaluated and not adopted (XERK-2131, operator decision 2026-10-20)
+
+- **Model tools** (`$.tool.register`): they work (no prompt under `auto`; a result must be a
+  string, an object fails the call), but would duplicate the session CLI and the roster file,
+  giving the model two paths for one action. Re-propose only with a need the CLI cannot meet.
+- **Policy via `prompt.compose`**: the launch-time `--append-system-prompt` already works; a
+  section that changes mid-session invalidates the prompt cache on every change, fleet-wide.
+- **Usage from `session.usage`**: transcripts are the counted source (`agent-usage.md`); a
+  second source covering only mod sessions adds double-count risk for no new fact.
+- **Wake-ups and hub nudges through `$.prompt.submit`**: worth doing, not done — XERK-2135
+  (the chat view must first render plugin-origin prompts).
+
 ## Invariants
 
 - **The mod draws nothing.** A band, pane or status entry changes the screen the pane
