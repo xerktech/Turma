@@ -60,7 +60,10 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
     rename. `ownUntil` (the host's own pre-move high-water) is read on the thread before staging.
   - `~/.turma` is session-writable: the commit moves REGULAR files only (a planted link is skipped),
     refuses a stage root that became a link, and re-checks each destination dir stays in its root.
-  - A refused import's stage is dropped on the thread; boot clears the whole root
+  - A cross-filesystem commit copies to a temp file in the destination dir and `os.replace`s it,
+    so a link planted at the destination is replaced, never written through (QA).
+  - A thread-side refusal drops its stage on the thread; a commit that fails on the beat drops
+    its (rarely full) stage there. Boot clears the whole root
     (`_sweep_import_staging`), since no import survives a restart. Tests: `TestImportStaging`.
   - **While an import is in flight its cwd is held** (`_import_holds`): `start`, `resume`,
     `_resume_at_cwd`, a second import and a sleeper job refuse that path, and `delete` drops the

@@ -31103,7 +31103,8 @@ class SessionManager:
         link planted there is skipped, never moved or followed, and each
         destination dir is re-checked to stay inside its root as the unpack
         checks its members. A rename across filesystems (a PROJECTS_ROOT not
-        beside ~/.turma) falls back to a copy."""
+        beside ~/.turma) falls back to a copy (`_copy_across_devices`), which
+        costs the beat the bytes — the rename is the common case."""
         for src_root, dest_root in job.get("moves") or ():
             if os.path.islink(src_root) or not os.path.isdir(src_root):
                 raise ValueError(f"the staged import at {src_root} is gone")
@@ -31126,7 +31127,28 @@ class SessionManager:
                     except OSError as e:
                         if e.errno != errno.EXDEV:
                             raise
-                        shutil.move(src, dst)
+                        self._copy_across_devices(src, dst, out_dir)
+
+    @staticmethod
+    def _copy_across_devices(src, dst, out_dir):
+        """The EXDEV half of `_commit_import_stage`: copy into a temp file IN
+        `out_dir`, then `os.replace` it over `dst` — which replaces a link
+        planted at `dst` rather than writing through it (a plain copy follows
+        it, QA). The source is opened `O_NOFOLLOW`."""
+        fd, tmp = tempfile.mkstemp(prefix=".import-", dir=out_dir)
+        try:
+            with os.fdopen(fd, "wb") as out, \
+                    os.fdopen(os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                                      | getattr(os, "O_BINARY", 0)), "rb") as inp:
+                shutil.copyfileobj(inp, out, 1 << 20)
+            os.replace(tmp, dst)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        os.unlink(src)
 
     def _drop_import_stage(self, job):
         """Remove an import's staging dir. Never raises."""

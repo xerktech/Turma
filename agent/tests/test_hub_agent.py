@@ -11687,6 +11687,57 @@ class TestImportStaging(ManagerMixin, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "is gone"):
             sm._commit_import_stage(job)
 
+    def test_a_cross_device_commit_never_writes_through_a_planted_link(self):
+        # QA (D1): on EXDEV a plain copy followed a link planted at the
+        # destination and overwrote the file it named.
+        sm = self.make_manager()
+        job = self._job(sm, self._bundle(sm))
+        slug_dir = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(job["cwd"]))
+        os.makedirs(slug_dir)
+        victim = os.path.join(self.tmp, "victim")
+        with open(victim, "w") as f:
+            f.write("ORIGINAL")
+        dst = os.path.join(slug_dir, f"{self.TID}.jsonl")
+        os.symlink(victim, dst)
+        stage = job["stage"]
+
+        def cross(real):
+            def move(a, b, *args, **kw):
+                if str(a).startswith(stage):
+                    raise OSError(errno.EXDEV, "cross-device")
+                return real(a, b, *args, **kw)
+            return move
+        with mock.patch.object(ha.os, "replace", cross(os.replace)), \
+                mock.patch.object(ha.os, "rename", cross(os.rename)):
+            sm._commit_import_stage(job)
+        with open(victim) as f:
+            self.assertEqual(f.read(), "ORIGINAL")
+        self.assertFalse(os.path.islink(dst))
+        with open(dst) as f:
+            self.assertIn("hi", f.read())
+        self.assertTrue(os.path.isfile(os.path.join(
+            slug_dir, self.TID, "subagents", "agent-a.jsonl")))
+        self.assertEqual([n for n in os.listdir(slug_dir) if n.startswith(".import-")], [])
+
+    def test_a_destination_dir_linked_outside_its_root_is_refused(self):
+        sm = self.make_manager()
+        job = self._job(sm, self._bundle(sm))
+        slug_dir = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(job["cwd"]))
+        os.makedirs(slug_dir)
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(slug_dir, self.TID))
+        with self.assertRaisesRegex(ValueError, "escapes"):
+            sm._commit_import_stage(job)
+        self.assertEqual(os.listdir(outside), [])
+
+    def test_boot_runs_the_staging_sweep(self):
+        sm = self.make_manager()
+        sm.registry = []
+        with mock.patch.object(sm, "_sweep_import_staging") as sweep:
+            sm.resume_on_boot()
+        sweep.assert_called_once_with()
+
     def test_boot_clears_a_crashed_imports_stage(self):
         sm = self.make_manager()
         os.makedirs(os.path.join(ha.IMPORT_STAGING_ROOT, "m-old", "slug"))
