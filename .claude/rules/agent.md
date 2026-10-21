@@ -119,6 +119,7 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   user-authored turn folds back in ahead of the window on any cut (id-deduped,
   `HISTORY_USER_MSGS` backstop); tool traffic otherwise evicts. Tests: `TestHistoryCommand`.
   - A `!` shell command counts as operator input there, its output row kept beside it (XERK-2112).
+  - The cap counts a command + its output as ONE message (`_operator_units`), never cutting them apart.
 
 ### `setModelSource` — failover to the self-hosted model (XERK-246)
 

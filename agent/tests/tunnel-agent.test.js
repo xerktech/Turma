@@ -309,6 +309,26 @@ test("parseLocalCommand: `!` bash passthrough turns -> command / output shapes",
     entryBlocks({ type: "user", message: { content: "<bash-input> ls -la</bash-input>" } }, BLOCK_CAPS),
     [{ t: "command", name: "!", args: "ls -la" }]);
   assert.equal(entryText({ type: "user", message: { content: "<bash-input> ls</bash-input>" } }), "! ls");
+  // Mirror of test_a_command_that_printed_nothing_keeps_its_output_row.
+  const empty = { type: "user", message: { content: "<bash-stdout></bash-stdout><bash-stderr></bash-stderr>" } };
+  assert.deepEqual(entryBlocks(empty, BLOCK_CAPS), [{ t: "command_output", text: "" }]);
+  assert.equal(entryText(empty), "(no output)");
+  const slash = { type: "user", message: { content: "<local-command-stdout></local-command-stdout>" } };
+  assert.deepEqual(entryBlocks(slash, BLOCK_CAPS), []);
+  assert.equal(entryText(slash), null);
+  assert.deepEqual(parseLocalCommand("<bash-stdout></bash-stdout><bash-stderr>boom</bash-stderr>"),
+    { kind: "output", text: "boom", isError: true });
+});
+
+// Mirror of test_slash_output_printing_its_own_tags_is_kept_whole — keep in lockstep.
+test("parseLocalCommand: slash output printing its own tags is kept whole", () => {
+  for (const [text, want] of [
+    ["<local-command-stdout>head x</local-command-stdout>tail y</local-command-stdout>", {"kind": "output", "text": "head x</local-command-stdout>tail y", "isError": false}],
+    ["<local-command-stdout>a <local-command-stderr>b</local-command-stderr> c</local-command-stdout>", {"kind": "output", "text": "a <local-command-stderr>b</local-command-stderr> c", "isError": false}],
+    ["<local-command-stdout>see <command-name>/x</command-name></local-command-stdout>", {"kind": "output", "text": "see <command-name>/x</command-name>", "isError": false}],
+    ["<local-command-stdout>p <bash-stderr>q</bash-stderr></local-command-stdout>", {"kind": "output", "text": "p <bash-stderr>q</bash-stderr>", "isError": false}],
+    ["<local-command-stdout>a</local-command-stdout><local-command-stderr>boom</local-command-stderr>", {"kind": "output", "text": "boom", "isError": true}],
+  ]) assert.deepEqual(parseLocalCommand(text), want, text);
 });
 
 // Mirror of test_hub_agent.py TestPluginMessage — keep in lockstep (XERK-2135).

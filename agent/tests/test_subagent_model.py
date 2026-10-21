@@ -199,6 +199,17 @@ class TestWorkflowPin(unittest.TestCase):
         self.assertEqual(run_body(body_of(self.pinned(out, META + body)), stub),
                          ["a:qa:opus", "b:qa:opus"])
 
+    def test_inherited_opts_survive_the_pin(self):
+        # Opts built on a prototype keep every inherited field, not only
+        # agentType; own fields still win over inherited ones.
+        body = ("\nconst base = { agentType: 'qa', prompt: 'p0', label: 'base' }\n"
+                "const o = Object.create(base); o.label = 'own'\n"
+                "return [await agent('a', o)]\n")
+        _, out = run_main(workflow_call(script=META + body))
+        stub = "async (p, o) => `${p}:${o.agentType}:${o.prompt}:${o.label}:${o.model}`"
+        self.assertEqual(run_body(body_of(self.pinned(out, META + body)), stub),
+                         ["a:qa:p0:own:opus"])
+
     def test_a_non_writable_agent_global_lapses_the_pin_not_the_run(self):
         _, out = run_main(workflow_call(script=SCRIPT))
         body = ("Object.defineProperty(globalThis, 'agent', {value: globalThis.agent, writable: false});"

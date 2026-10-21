@@ -149,9 +149,13 @@ def pin_workflow_script(script: str, model: str):
         f";{PIN_MARKER} try {{ globalThis.agent = ((a) => (p, o) => {{"
         " const t = o && typeof o === 'object' && typeof o.agentType === 'string'"
         " ? o.agentType.trim().toLowerCase() : '';"
-        f" return a(p, t && ({json.dumps(sorted(PINNED_NAMES))}.includes(t)"
-        # agentType is copied by name: a spread drops an inherited/getter one.
-        f" || /(?<!p)review/.test(t)) ? {{...o, agentType: o.agentType, model: {json.dumps(model)}}} : o);"
+        f" if (!(t && ({json.dumps(sorted(PINNED_NAMES))}.includes(t)"
+        " || /(?<!p)review/.test(t)))) return a(p, o);"
+        # A spread copies own enumerable props only: for…in adds the inherited
+        # ones (a `prompt` on a prototype), and agentType is copied by name, as
+        # a getter on a class prototype is not enumerable.
+        " const c = {...o}; for (const k in o) if (!Object.prototype.hasOwnProperty.call(c, k)) c[k] = o[k];"
+        f" c.agentType = o.agentType; c.model = {json.dumps(model)}; return a(p, c);"
         " })(globalThis.agent); } catch (e) {}"
     )
     pinned = script[:at] + pin + script[at:]

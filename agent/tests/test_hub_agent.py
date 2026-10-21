@@ -5314,6 +5314,44 @@ class TestBashPassthrough(unittest.TestCase):
                 "content": "<bash-stderr>boom</bash-stderr>"}}, ha.BLOCK_CAPS),
             [{"t": "command_output", "text": "boom", "isError": True}])
 
+    def test_a_command_that_printed_nothing_keeps_its_output_row(self):
+        # `! true`: without its output row the card reads like a pending
+        # `! sleep 30`. The empty block lets the renderers say "(no output)".
+        empty = {"type": "user", "message": {
+            "content": "<bash-stdout></bash-stdout><bash-stderr></bash-stderr>"}}
+        self.assertEqual(ha._entry_blocks(empty, ha.BLOCK_CAPS),
+                         [{"t": "command_output", "text": ""}])
+        self.assertEqual(ha._entry_text(empty), "(no output)")
+        self.assertEqual(ha._history_row(empty)["blocks"], [{"t": "command_output", "text": ""}])
+        # A slash command's empty stdout is still dropped (most commands print none).
+        slash = {"type": "user", "message": {
+            "content": "<local-command-stdout></local-command-stdout>"}}
+        self.assertEqual(ha._entry_blocks(slash, ha.BLOCK_CAPS), [])
+        self.assertIsNone(ha._entry_text(slash))
+        # A non-empty stream wins over an empty one, as before (no flag).
+        self.assertEqual(
+            ha._parse_local_command("<bash-stdout></bash-stdout><bash-stderr>boom</bash-stderr>"),
+            {"kind": "output", "text": "boom", "isError": True})
+
+    def test_slash_output_printing_its_own_tags_is_kept_whole(self):
+        # Claude Code writes a slash command's output UNESCAPED inside
+        # <local-command-stdout>: a closing tag in the output ended a lazy match
+        # and lost the rest. Mirror cases in tunnel-agent.test.js.
+        for text, want in (
+            ("<local-command-stdout>head x</local-command-stdout>tail y</local-command-stdout>",
+             {'kind': 'output', 'text': 'head x</local-command-stdout>tail y', 'isError': False}),
+            ("<local-command-stdout>a <local-command-stderr>b</local-command-stderr> c</local-command-stdout>",
+             {'kind': 'output', 'text': 'a <local-command-stderr>b</local-command-stderr> c', 'isError': False}),
+            ("<local-command-stdout>see <command-name>/x</command-name></local-command-stdout>",
+             {'kind': 'output', 'text': 'see <command-name>/x</command-name>', 'isError': False}),
+            ("<local-command-stdout>p <bash-stderr>q</bash-stderr></local-command-stdout>",
+             {'kind': 'output', 'text': 'p <bash-stderr>q</bash-stderr>', 'isError': False}),
+            ("<local-command-stdout>a</local-command-stdout><local-command-stderr>boom</local-command-stderr>",
+             {'kind': 'output', 'text': 'boom', 'isError': True}),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(ha._parse_local_command(text), want)
+
     def test_text_feed_flattens_like_a_slash_command(self):
         self.assertEqual(
             ha._entry_text({"type": "user", "message": {
@@ -15155,7 +15193,11 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             f"TURMA_MOD_REQUESTS={shlex.quote(ha.mod_request_dir(sess['id']))} ", cmd)
         self.assertIn(f"TURMA_PEERS_FILE={shlex.quote(ha.PEERS_FILE)} ", cmd)
         self.assertIn(f"TURMA_DEVICE={shlex.quote(sm.device)} ", cmd)
+        # The effective busy markers, so `/turma` breaks up an operator override.
+        self.assertIn(f"TURMA_BUSY_MARKERS={shlex.quote('esc to interrupt')} ", cmd)
         self.assertTrue(sess["bridgeMod"])
+        with mock.patch.object(ha, "PANE_BUSY_MARKERS", ("working…", "hold on")):
+            self.assertEqual(ha.bridge_busy_markers(), "working…|hold on")
 
     def test_the_manager_logs_at_start_whether_sessions_get_the_bridge_mod(self):
         # 2.3.49 reached hosts through an updater that skipped mods/, and nothing
@@ -15281,6 +15323,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
                 self.assertEqual(env["TURMA_MOD_REQUESTS"], ha.mod_request_dir(sess["id"]))
                 self.assertEqual(env["TURMA_PEERS_FILE"], ha.PEERS_FILE)
                 self.assertEqual(env["TURMA_DEVICE"], sm.device)
+                self.assertEqual(env["TURMA_BUSY_MARKERS"], ha.bridge_busy_markers())
             else:
                 self.assertNotIn("--plugin-dir", argv)
                 self.assertNotIn("TURMA_TURN_STATE", env)
@@ -24060,6 +24103,29 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
         self.assertEqual([e["id"] for e in result["entries"]],
                          ["u1", "u2", "u3", "u4", "u5"])
 
+    def test_a_bang_command_and_its_output_count_as_one_operator_message(self):
+        # The HISTORY_USER_MSGS cap counts messages the operator sent: a `!`
+        # command's output row takes no slot, and the cut never lands between
+        # a command and what it printed (an empty output row included).
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        lines = [{"uuid": "u0", "type": "user", "message": {"content": "msg 0"}}]
+        for i in range(3):
+            lines += [
+                {"uuid": f"b{i}", "type": "user", "message": {"content": f"<bash-input>c{i}</bash-input>"}},
+                {"uuid": f"o{i}", "type": "user", "message": {
+                    "content": "<bash-stdout></bash-stdout><bash-stderr></bash-stderr>"
+                    if i == 1 else f"<bash-stdout>out {i}</bash-stdout>"}}]
+        lines += [{"uuid": f"a{i}", "type": "assistant",
+                   "message": {"content": [{"type": "text", "text": f"t{i}"}]}} for i in range(2)]
+        write_jsonl(os.path.join(proj, "t.jsonl"), lines)
+        with mock.patch.object(ha, "HISTORY_MAX_MSGS", 2), \
+             mock.patch.object(ha, "HISTORY_USER_MSGS", 2):
+            sm._stage_history(sess["id"])
+        ids = [e["id"] for e in sm.history_results[0]["entries"]]
+        self.assertEqual(ids, ["b1", "o1", "b2", "o2", "a0", "a1"])
+
     def test_empty_transcript_file(self):
         sm = self.make_manager()
         sess = self._running_session(sm)
@@ -27487,12 +27553,19 @@ class TestSetSummary(ManagerMixin, unittest.TestCase):
         self.assertEqual(resumed_agent_type(True), "dsh")      # dsh offered -> preserved
 
 
+def _idle_claude_pane(draft=""):
+    """An idle Claude Code pane whose composer holds `draft`."""
+    rule = "──────────────────────────────────────────────────"
+    return f"✻ Crunched for 45s\n{rule}\n\u276f {draft}\n{rule}\n  ⏵⏵ auto mode on\n"
+
+
 class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
     """XERK-815: a running Claude session's Remote-Control + peer name is brought
     up to its display summary on the first idle beat via `/rename`, with rcName
     kept in step so peers.tsv keeps resolving the live name."""
 
-    def make_manager(self, busy=False, dialog=False, cap="idle pane"):
+    def make_manager(self, busy=False, dialog=False, cap=None):
+        cap = _idle_claude_pane() if cap is None else cap
         sm = super().make_manager()
         sm.save = mock.Mock()
         self.keys = []
@@ -27531,6 +27604,42 @@ class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["rcName"], "Fix the retry loop")
         self.assertEqual(sess["rcRenamedFor"], "Fix the retry loop")
         sm.save.assert_called_once()
+
+    def test_an_operator_draft_defers_the_rename_and_is_never_cleared(self):
+        # The draft would be submitted WITH "/rename <name>" + Enter (2.1.304),
+        # and rcName would name a name the session does not answer to.
+        pane = {"cap": _idle_claude_pane("half a messa")}
+        sm = self.make_manager()
+        p = mock.patch.object(ha, "_capture_pane", lambda t: pane["cap"])
+        p.start()
+        self.addCleanup(p.stop)
+        sess = self._sess()
+        sm.registry = [sess]
+        for _ in range(3):
+            sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [], "nothing typed, nothing cleared")
+        self.assertEqual(sess["rcName"], "h-r-s1")
+        self.assertNotIn("rcRenamedFor", sess)
+        pane["cap"] = _idle_claude_pane()           # the operator sent or cleared it
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys[0], ("agent-s1", ("/rename Fix the retry loop",), True))
+        self.assertEqual(sess["rcName"], "Fix the retry loop")
+
+    def test_the_fresh_session_placeholder_is_an_empty_composer(self):
+        for draft in ('Try "refactor <filepath>"', 'Try "how does src/a.py work?"'):
+            self.assertEqual(ha._composer_draft(_idle_claude_pane(draft)), "", draft)
+        for draft in ('Try "x" and more', 'Try this'):
+            self.assertTrue(ha._composer_draft(_idle_claude_pane(draft)), draft)
+        self.assertEqual(ha._composer_draft(LINUX_COMPOSER_PANE), "")
+        self.assertIsNone(ha._composer_draft("no rules here"))
+
+    def test_an_unreadable_composer_defers_the_rename(self):
+        sm = self.make_manager(cap="a pane with no composer rules")
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+        self.assertEqual(sess["rcName"], "h-r-s1")
 
     def test_second_beat_is_a_no_op(self):
         sm = self.make_manager()
@@ -27882,7 +27991,7 @@ class TestReconcileRcNamesViaMod(ManagerMixin, unittest.TestCase):
         def fake_send(tmux, *tokens, literal=False):
             self.keys.append((tmux, tuple(tokens), literal))
 
-        for name, value in [("_capture_pane", lambda t: "idle pane"),
+        for name, value in [("_capture_pane", lambda t: _idle_claude_pane()),
                             ("_busy_from_capture", lambda c: False),
                             ("parse_pane_prompt", lambda c: None),
                             ("_pane_send_keys", fake_send)]:
@@ -28246,6 +28355,30 @@ class TestModStatus(ManagerMixin, unittest.TestCase):
             f.write("a file where the dir goes")
         sm._publish_mod_status([self._payload(id="s0"), self._payload()])
         self.assertTrue(os.path.exists(self._status_path()))
+
+    def test_a_dir_named_status_json_is_skipped_quietly(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess()]
+        os.makedirs(self._status_path())
+        with mock.patch.object(ha, "log") as log:
+            for _ in range(3):
+                sm._publish_mod_status([self._payload()])
+        self.assertEqual(log.call_args_list, [])
+        self.assertTrue(os.path.isdir(self._status_path()))
+
+    def test_a_standing_failure_is_logged_once(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess()]
+        os.makedirs(ha.MOD_REQUESTS_DIR, exist_ok=True)
+        with open(ha.mod_request_dir("s1"), "w") as f:
+            f.write("a file where the dir goes")
+        with mock.patch.object(ha, "log") as log:
+            for _ in range(3):
+                sm._publish_mod_status([self._payload()])
+        self.assertEqual(len(log.call_args_list), 1, log.call_args_list)
+        os.unlink(ha.mod_request_dir("s1"))
+        sm._publish_mod_status([self._payload()])
+        self.assertTrue(os.path.isfile(self._status_path()), "recovers once the dir is back")
 
     def test_a_deleted_status_is_rewritten(self):
         sm = self.make_manager()
@@ -50068,6 +50201,9 @@ class TestDefectAttribution(unittest.TestCase):
         self.assertEqual(ha._defect_ticket_keys("XERK-12: fix AB#34 and XERK-12"),
                          ["XERK-12", "34"])
         self.assertEqual(ha._defect_ticket_keys("XERK-7: patch CVE-2013-4476"), ["XERK-7"])
+        # A Jira project keyed CVE is a ticket; only a real CVE id (YYYY-NNNN+) is not.
+        self.assertEqual(ha._defect_ticket_keys("CVE-12: patch CVE-2024-123456"), ["CVE-12"])
+        self.assertEqual(ha._defect_ticket_keys("CVE-2013-4476 and CVE-2024-12345"), [])
 
 
 class TestDefectReportsWire(ManagerMixin, unittest.TestCase):

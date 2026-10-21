@@ -451,6 +451,23 @@ test("/turma wake runs the session CLI, which validates it", async () => {
   assert.equal(await bad.turma("wake 99d x"), "refused: duration too long", "the reason line, not usage");
 });
 
+test("an operator's custom busy markers are broken up too", async () => {
+  // TURMA_PANE_BUSY_MARKERS is the agent's: the launch exports the effective
+  // list as TURMA_BUSY_MARKERS, and a peer's text holding one must not make
+  // the idle pane read busy (_busy_from_capture matches it anywhere).
+  const h = await harness({ env: { TURMA_BUSY_MARKERS: "esc to interrupt|Thinking hard|working…|x|a.b" } });
+  h.files.set("/t/peers.tsv", "zz\tP\thost2\tR\t\tTHINKING hard; still Working… on aXb and a.b\n");
+  const out = await h.turma("peers");
+  assert.doesNotMatch(out, /thinking hard|working…|a\.b/i);
+  assert.match(out, /THINKING-hard/);
+  assert.match(out, /W-orking…/);
+  assert.match(out, /aXb/, "a marker is literal text (a.b), and one character (x) is ignored");
+  // Without the variable only the built-in markers are broken.
+  const plain = await harness();
+  plain.files.set("/t/peers.tsv", "zz\tP\thost2\tR\t\tThinking hard\n");
+  assert.match(await plain.turma("peers"), /Thinking hard/);
+});
+
 test("printed text cannot close Claude Code's output wrapper or fake a busy pane", async () => {
   // QA: a peer task holding </local-command-stdout> ended the wrapper the model
   // reads command output in; its tail became hidden instructions (3/3).

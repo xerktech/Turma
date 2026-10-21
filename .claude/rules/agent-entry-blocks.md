@@ -31,6 +31,12 @@ Split out of `agent.md` (size ceiling).
   is never re-read as a notification or command. Clients take a tagged origin over
   `messageOrigin` (`chat.js` `MSG_ORIGIN_TAGS`, Android `TextBlock.origin`), and
   `_is_operator_row` does not count it. Tests: `TestPluginMessage` ↔ its `tunnel-agent.test.js` twin.
+- **A `!` command that printed nothing keeps its output row**: an empty `command_output` block
+  (renderers say "(no output)") and flat text `NO_OUTPUT_TEXT`; without it `! true` read like a
+  pending command. A slash command's empty stdout still drops (most print none).
+- **Slash output is read to its LAST closing tag**: Claude Code writes it UNESCAPED, so output
+  printing `</local-command-stdout>` lost its tail. A turn OPENING with an output tag is output: a
+  `<command-name>`/`<bash-*>`/other-stream tag inside its body is text.
 - `compact_boundary` and `pr-link` markers; pr-link entries carry no uuid so the feeds synthesize a
   stable id from the URL alone, deduped over the whole conversation (Claude re-stamps pr-links atop
   every user turn, so one PR yields ~6 entries — folding only consecutive repeats is not enough).

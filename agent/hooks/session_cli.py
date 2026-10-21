@@ -178,8 +178,24 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _wake_words_verbatim(argv, args):
+    """Re-read `wake`'s duration and reason from the raw argv when it holds a
+    `--`: argparse treats only the first `--` as the separator and drops later
+    ones (Python <3.13), so `check -- foo` came back as `check foo`. Every token
+    after the first `--` is text, kept as written; `wake` takes no options, so
+    every token before it is a positional too."""
+    if args.cmd != "wake" or "--" not in argv[1:]:
+        return
+    i = argv.index("--", 1)
+    words = argv[1:i] + argv[i + 1:]
+    if len(words) >= 2:
+        args.duration, args.reason = words[0], words[1:]
+
+
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = _parser().parse_args(argv)   # a usage error exits 2 on its own
+    _wake_words_verbatim(argv, args)
     sid = os.environ.get("TURMA_SESSION_ID", "")
     if not sid:
         print("session_cli: TURMA_SESSION_ID is not set, so this is not a "
