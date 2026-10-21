@@ -10396,6 +10396,176 @@ class TestTrustDialogIsABlockingDialog(unittest.TestCase):
             self.assertFalse(ha._pane_blocking_dialog(cap))
 
 
+# Real Claude Code 2.1.306 frames (XERK-2142), captured in a scratch tmux server
+# (the dialog region from its top rule down; blank-line runs collapsed, the
+# scratch path shortened). Each is a dialog every older read called an idle
+# composer: no interrupt hint, no mode footer, no contiguous 1..N run.
+_2142_PICKER = (
+    "─" * 140 + "\n"
+    " ☐ Color\n"
+    "\n"
+    "Which color do you prefer?\n"
+    "\n"
+    "❯ 1. Red\n"
+    "     Bold, warm, high-energy.\n"
+    "  2. Green\n"
+    "     Calm, natural, balanced.\n"
+    "  3. Blue\n"
+    "     Cool, steady, professional.\n"
+    "  4. Type something.\n"
+    + "─" * 140 + "\n"
+    "  5. Chat about this\n"
+    "\n"
+    "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+)
+_2142_PICKER_40 = (
+    "Pick a size?\n"
+    "\n"
+    "❯ 1. Small\n"
+    "     Smaller size option.\n"
+    "  2. Large\n"
+    "     Larger size option.\n"
+    "  3. Type something.\n"
+    + "─" * 40 + "\n"
+    "  4. Chat about this\n"
+    "\n"
+    "Enter to select · ↑/↓ to navigate · Esc\n"
+    "to cancel\n"
+)
+_2142_ELICIT = (
+    "─" * 140 + "\n"
+    "  MCP server “elicit” requests your input\n"
+    "\n"
+    "  Which environment should I deploy to?\n"
+    "\n"
+    "  ❯ * env: ▸ not set\n"
+    "        Target\n"
+    "\n"
+    "      confirm: not set\n"
+    "        Really deploy?\n"
+    "\n"
+    "    Accept    Decline\n"
+    "\n"
+    "  Esc to cancel · ↑/↓ to navigate · Backspace to unset · → to expand\n"
+)
+_2142_ELICIT_BUTTONS = (
+    "─" * 140 + "\n"
+    "  MCP server “elicit” requests your input\n"
+    "\n"
+    "  Which environment should I deploy to?\n"
+    "\n"
+    "    * env: not set\n"
+    "        Target\n"
+    "\n"
+    "      confirm: not set\n"
+    "        Really deploy?\n"
+    "\n"
+    "    Accept  ❯ Decline\n"
+    "\n"
+    "  Esc to cancel · ↑/↓ to navigate\n"
+)
+_2142_MCP_APPROVAL = (
+    "─" * 140 + "\n"
+    "  New MCP server found in this project: elicit\n"
+    "\n"
+    "  MCP servers may execute code or access system resources. All tool calls"
+    " require approval. Learn more in the MCP documentation.\n"
+    "\n"
+    "    Use this MCP server\n"
+    "    Use this and all future MCP servers in this project\n"
+    "  ❯ Continue without using this MCP server\n"
+    "\n"
+    "  Enter to confirm · Esc to cancel\n"
+)
+# A live composer under a reply that QUOTES a dialog footer: the footer text is
+# conversation, above the composer, so it is not the pane's bottom.
+_2142_COMPOSER_QUOTING = (
+    "❯ Reply with exactly this one line and nothing else: Enter to select · ↑/↓"
+    " to navigate · Esc to cancel\n"
+    "\n"
+    "● Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+    "\n"
+    "✻ Sautéed for 1s · done 12:01 AM\n"
+    "\n"
+    + "─" * 140 + "\n"
+    "❯\n"
+    + "─" * 140 + "\n"
+    "  ⏸ manual mode on · ? for shortcuts\n"
+)
+
+
+class TestHintDialogIsABlockingDialog(unittest.TestCase):
+    """XERK-2142. The dialogs `parse_pane_prompt` and `_trust_dialog_up` both
+    miss — the native AskUserQuestion picker, an MCP elicitation form, the
+    project MCP-server approval — read as an idle composer, so the input path
+    typed into them (a digit picks a picker option, an Enter answers it) and the
+    bridge mod's turn signal held them busy. They are read off the key-hint
+    footer that is the pane's last line."""
+
+    DIALOGS = {"picker": _2142_PICKER, "picker@40": _2142_PICKER_40,
+               "elicitation": _2142_ELICIT, "elicitation@buttons": _2142_ELICIT_BUTTONS,
+               "mcp-approval": _2142_MCP_APPROVAL}
+
+    def test_every_older_read_called_them_an_idle_composer(self):
+        for name, cap in self.DIALOGS.items():
+            self.assertIsNone(ha.parse_pane_prompt(cap), name)
+            self.assertFalse(ha._busy_from_capture(cap), name)
+            self.assertIsNone(ha.parse_pane_mode(cap), name)
+            self.assertFalse(ha._trust_dialog_up(cap), name)
+
+    def test_they_are_blocking_dialogs(self):
+        for name, cap in self.DIALOGS.items():
+            self.assertTrue(ha._hint_dialog_up(cap), name)
+            self.assertTrue(ha._pane_blocking_dialog(cap), name)
+
+    def test_a_wrapped_footer_is_read_across_the_seam_only(self):
+        # The picker at 40 columns wraps "Esc" / "to cancel" (above). Joining the
+        # lines whole instead glued "Accept  Decline" onto the elicitation's
+        # first item and missed it; the seam alone must not invent a match.
+        self.assertTrue(ha._hint_dialog_up(_2142_PICKER_40))
+        self.assertFalse(ha._hint_dialog_up("x · Esc\nto\ncancel\n"))
+
+    def test_a_composer_is_never_one(self):
+        for cap in (_2142_COMPOSER_QUOTING, LINUX_COMPOSER_PANE):
+            self.assertFalse(ha._hint_dialog_up(cap))
+            self.assertFalse(ha._pane_blocking_dialog(cap))
+        self.assertFalse(ha._hint_dialog_up(""))
+        self.assertFalse(ha._hint_dialog_up(None))
+
+    def test_the_footer_must_be_the_bottom_of_the_pane(self):
+        # The same footer with a composer drawn under it is conversation text.
+        cap = _2142_ELICIT + "─" * 40 + "\n❯\n" + "─" * 40 + "\n  ⏵⏵ auto mode on\n"
+        self.assertFalse(ha._hint_dialog_up(cap))
+
+    def test_a_whole_item_must_read_esc_to_cancel(self):
+        self.assertFalse(ha._hint_dialog_up("press Esc to cancel the run\n"))
+        # qwen's busy spinner ends "(… · esc to cancel)", above its own footer.
+        qwen = ("⠋ Thinking (3s · esc to cancel)\n"
+                "Enter to steer · Ctrl+Q to queue · ⏸ Ask permissions (shift + tab to cycle)\n")
+        self.assertFalse(ha._hint_dialog_up(qwen))
+        self.assertFalse(ha._hint_dialog_up("⠋ Thinking (3s · esc to cancel)\n"))
+
+    def test_the_panePrompt_contract_is_untouched(self):
+        # None of these becomes a panePrompt (no digit the chat could offer),
+        # and the numbered dialog still is one.
+        numbered = ("Bash command\n  touch x\n" + "─" * 40 + "\n"
+                    "Do you want to proceed?\n ❯ 1. Yes\n   2. No\n"
+                    " Esc to cancel · Tab to amend\n")
+        self.assertIsNotNone(ha.parse_pane_prompt(numbered))
+        self.assertTrue(ha._pane_blocking_dialog(numbered))
+
+    def test_pane_status_leaves_the_dialog_flag_on_the_state(self):
+        for cap, want in ((_2142_ELICIT, True), (LINUX_COMPOSER_PANE, False)):
+            state = {}
+            with mock.patch.object(ha, "_capture_pane", return_value=cap):
+                busy, _mode, prompt = ha._pane_status("agent-x", state)
+            self.assertIsNone(prompt)
+            self.assertIs(state["paneDialog"], want)
+        state = {"paneDialog": True}
+        ha._pane_status(None, state)
+        self.assertIs(state["paneDialog"], False)
+
+
 class TestWindowsManagerBoot(ManagerMixin, unittest.TestCase):
     """run_forever installs a POSIX-only SIGUSR1 handler (the tunnel's heartbeat
     poke) that MUST be gated on IS_WINDOWS, or the manager crashes at boot on
@@ -21925,6 +22095,22 @@ class TestBridgeMod(ProjectDirMixin, unittest.TestCase):
                 rep = ha.session_report(self.WORKDIR, {}, "agent-abc", session_id=self.SID,
                                         claude_sid=self.CSID, agent_type=agent_type)
             self.assertIs(rep["paneBusy"], want, agent_type)
+
+    def test_an_unnumbered_dialog_stops_the_fold(self):
+        # XERK-2142: an MCP elicitation is no panePrompt, but the session is
+        # waiting on a person all the same — a running turn must not read busy.
+        write_jsonl(os.path.join(self.proj, f"{self.CSID}.jsonl"),
+                    [{"type": "user", "message": {"content": "go"}}])
+        self._state()
+        for cap, want in ((_2142_ELICIT, False), (LINUX_COMPOSER_PANE, True)):
+            with mock.patch.object(ha, "_capture_pane", return_value=cap):
+                rep = ha.session_report(self.WORKDIR, {}, "agent-abc", session_id=self.SID,
+                                        claude_sid=self.CSID, agent_type="claude")
+            self.assertIsNone(rep["panePrompt"])
+            self.assertIs(rep["paneBusy"], want)
+        report = {"paneBusy": False, "transcriptAgeSec": 5}
+        ha.fold_turn_state(report, True, dialog=True)
+        self.assertIs(report["paneBusy"], False)
 
 
 class TestWakeRequest(ManagerMixin, unittest.TestCase):
