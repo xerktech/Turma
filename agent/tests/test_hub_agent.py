@@ -49617,24 +49617,39 @@ class TestShadowBase(unittest.TestCase):
 
 class TestForgeShadowBase(TestShadowBase):
     """XERK-2146: a GitLab MR or Azure DevOps PR has no `refs/pull/<n>/head`, so
-    its commits come from the forge's API, matched against the same real git."""
+    its commits come from the forge's API, matched against the same real git.
+    Every commit gets its own author and author second, so a listing read in
+    the wrong order, or matched without its author, cannot pass by accident."""
 
     MR = "https://gitlab.example/g/r/-/merge_requests/3"
     ADO = "https://dev.azure.com/o/p/_git/r/pullrequest/4"
 
+    tick = 0
+
     def setUp(self):
         super().setUp()
         self.api = {}       # what each forge answers; None = the call failed
+        self.ado_calls = []
+
+        def azure_get(path, params=None):
+            self.ado_calls.append((path, params))
+            return self.api.get("ado" if path.endswith("/commits") else "adopr")
         for name, fn in (("_mr_url_parts", lambda u: ("g/r", "3")),
                          ("_azdo_pr_id", lambda u: "4"),
                          ("_gitlab_get", lambda p: self.api.get("gitlab")),
-                         ("_azure_get", lambda p, q=None: self.api.get("ado"))):
+                         ("_azure_get", azure_get)):
             p = mock.patch.object(ha, name, fn)
             p.start()
             self.addCleanup(p.stop)
-        p = mock.patch.dict(ha._AZDO_PR_REF, {self.ADO: ("p", "r")})
+        p = mock.patch.dict(ha._AZDO_PR_REF, {})
         p.start()
         self.addCleanup(p.stop)
+
+    def commit(self, msg):
+        self.tick += 1
+        os.environ["GIT_AUTHOR_NAME"] = f"dev{self.tick % 3}"
+        os.environ["GIT_AUTHOR_DATE"] = f"2026-10-01T00:00:{self.tick:02d}Z"
+        return super().commit(msg)
 
     def log(self, rev_range):
         """The range's commits newest first, as both forges list them."""
@@ -49647,68 +49662,110 @@ class TestForgeShadowBase(TestShadowBase):
                                "author_email": c["email"], "authored_date": c["date"],
                                "message": c["msg"]} for c in commits]
 
-    def ado(self, commits, cut=0):
+    def ado(self, commits, target, cut=0):
+        self.api["adopr"] = {"pullRequestId": 4,
+                             "repository": {"id": "r", "project": {"id": "p"}},
+                             "lastMergeTargetCommit": {"commitId": target}}
         self.api["ado"] = {"value": [
             {"commitId": c["sha"], "author": {"name": c["name"], "email": c["email"],
                                               "date": c["date"]},
              "comment": c["msg"][:cut] if cut else c["msg"],
              "commentTruncated": bool(cut)} for c in commits]}
 
-    def test_a_gitlab_fast_forward_bases_before_the_mrs_first_commit(self):
+    def rebase_land(self, n, **env):
+        self.git(self.dev, "rebase", "-q", "main", f"pr{n}", env=env)
+        self.git(self.dev, "switch", "-q", "main")
+        self.git(self.dev, "merge", "-q", "--ff-only", f"pr{n}")
+        return self.land()
+
+    def base_of(self, merge, url):
+        return ha.shadow_base_commit(self.host, merge, url, self.RID)
+
+    def test_a_gitlab_fast_forward_is_matched_by_sha(self):
         before = self.open_pr(3, ["f1", "f2", "f3"])
         self.git(self.dev, "rebase", "-q", "main", "pr3")   # GitLab rebases, then fast-forwards
-        self.gitlab(self.log("main..pr3"))
+        commits = self.log("main..pr3")
+        for c in commits:
+            c["msg"] = "edited on the forge"                # only the shas can match
+        self.gitlab(commits)
         self.git(self.dev, "switch", "-q", "main")
         self.git(self.dev, "merge", "-q", "--ff-only", "pr3")
         merge = self.land()
-        self.assertEqual(ha.shadow_base_commit(self.host, merge, self.MR, self.RID),
-                         (before, None))
+        self.assertEqual(self.base_of(merge, self.MR), (before, None))
         # The MR's head is what landed: it stands in for the absent merge commit.
         st = ha._summarize_mr({"state": "merged", "merge_commit_sha": None,
                                "squash_commit_sha": None, "sha": merge})
         self.assertEqual(st["mergeCommit"], merge)
 
-    def test_an_ado_rebase_bases_before_the_prs_first_commit(self):
-        before = self.open_pr(4, ["r1", "r2", "r3"])
-        self.ado(self.log("main..pr4"), cut=1)              # pre-rebase shas, cut messages
-        self.git(self.dev, "rebase", "-q", "main", "pr4",
-                 env={"GIT_COMMITTER_NAME": "Azure DevOps"})
-        self.git(self.dev, "switch", "-q", "main")
-        self.git(self.dev, "merge", "-q", "--ff-only", "pr4")
-        merge = self.land()
-        self.assertEqual(ha.shadow_base_commit(self.host, merge, self.ADO, self.RID),
-                         (before, None))
-        self.api["ado"]["value"].reverse()                  # either listing order
-        self.assertEqual(ha.shadow_base_commit(self.host, merge, self.ADO, self.RID),
-                         (before, None))
+    def test_a_rewritten_rebase_needs_the_same_authors(self):
+        before = self.open_pr(5, ["w1", "w2", "w3"])
+        commits = self.log("main..pr5")
+        merge = self.rebase_land(5, GIT_COMMITTER_NAME="GitLab")
+        self.gitlab(commits)
+        self.assertEqual(self.base_of(merge, self.MR), (before, None))
+        commits[1]["name"] = "someone else"
+        self.gitlab(commits)
+        self.assertEqual(self.base_of(merge, self.MR)[0],
+                         self.git(self.host, "rev-parse", f"{merge}^1"),
+                         "another author is not the MR's commit: read as a squash")
 
-    def test_a_squash_keeps_the_first_parent_and_a_message_mismatch_is_no_rebase(self):
-        before = self.open_pr(5, ["s1", "s2"])
-        self.gitlab(self.log("main..pr5"))
-        self.ado(self.log("main..pr5"))
-        self.git(self.dev, "merge", "-q", "--squash", "pr5")
-        self.git(self.dev, "commit", "-q", "-m", "Squashed MR !5")
+    def test_an_ado_rebase_bases_before_the_prs_first_commit_in_either_order(self):
+        before = self.open_pr(4, ["r1", "r2", "r3"])
+        commits = self.log("main..pr4")                     # pre-rebase shas
+        merge = self.rebase_land(4, GIT_COMMITTER_NAME="Azure DevOps")
+        self.ado(commits, before, cut=2)                    # cut messages: a prefix
+        self.assertEqual(self.base_of(merge, self.ADO), (before, None))
+        self.assertIn(("/p/_apis/git/repositories/r/pullRequests/4/commits",
+                       {"$top": ha.SHADOW_PR_COMMITS_MAX + 1}), self.ado_calls)
+        self.ado(commits[::-1], before)                     # oldest first
+        self.assertEqual(self.base_of(merge, self.ADO), (before, None))
+
+    def test_an_ado_short_page_fails_rather_than_basing_mid_pr(self):
+        before = self.open_pr(6, ["p1", "p2", "p3", "p4"])
+        commits = self.log("main..pr6")
+        merge = self.rebase_land(6)
+        self.ado(commits[:2], before)                       # only the newest page
+        base, why = self.base_of(merge, self.ADO)
+        self.assertIsNone(base)
+        self.assertIn("base its forge names", why)
+        self.ado(commits, None)                             # no named base: unreadable
+        self.assertIn("could not list", self.base_of(merge, self.ADO)[1])
+
+    def test_a_squash_keeps_the_first_parent(self):
+        before = self.open_pr(7, ["s1", "s2"])
+        commits = self.log("main..pr7")
+        self.git(self.dev, "merge", "-q", "--squash", "pr7")
+        self.git(self.dev, "commit", "-q", "-m", "Squashed MR !7")
         merge = self.land()
+        self.gitlab(commits)
+        self.ado(commits, before)
         for url in (self.MR, self.ADO):
-            self.assertEqual(ha.shadow_base_commit(self.host, merge, url, self.RID),
-                             (before, None))
+            self.assertEqual(self.base_of(merge, url), (before, None))
 
     def test_an_unreadable_or_oversized_commit_list_fails_closed(self):
-        self.open_pr(6, ["u1", "u2"])
-        self.git(self.dev, "merge", "-q", "--squash", "pr6")
-        self.git(self.dev, "commit", "-q", "-m", "Squashed MR !6")
+        self.open_pr(8, ["u1", "u2"])
+        self.git(self.dev, "merge", "-q", "--squash", "pr8")
+        self.git(self.dev, "commit", "-q", "-m", "Squashed MR !8")
         merge = self.land()
-        base, why = ha.shadow_base_commit(self.host, merge, self.MR, self.RID)
-        self.assertIsNone(base)
-        self.assertIn("forge", why)
+        unreadable = "could not list the PR's commits from its forge to find its base"
+        self.assertEqual(self.base_of(merge, self.MR), (None, unreadable))
         self.gitlab([{"sha": "a" * 40, "name": "t", "email": "t@x", "msg": "m",
                       "date": "2026-10-01T00:00:00.000+02:00"}] * 100)  # a full page
-        self.assertIn("over", ha.shadow_base_commit(self.host, merge, self.MR, self.RID)[1])
-        self.api["gitlab"] = [{"id": "a" * 40}]                          # malformed
-        self.assertIn("forge", ha.shadow_base_commit(self.host, merge, self.MR, self.RID)[1])
-        self.ado([])
-        self.assertIn("no commits", ha.shadow_base_commit(self.host, merge, self.ADO,
-                                                          self.RID)[1])
+        self.assertIn("over", self.base_of(merge, self.MR)[1])
+        self.api["gitlab"] = [{"id": "a" * 40}, {"id": "b" * 40, "author_name": "t",
+                                                 "author_email": "t@x", "message": "m",
+                                                 "authored_date": "2026-10-01T00:00:00Z"}]
+        self.assertEqual(self.base_of(merge, self.MR), (None, unreadable),
+                         "a malformed entry is never dropped from the list")
+        self.ado([], "c" * 40)
+        self.assertIn("no commits", self.base_of(merge, self.ADO)[1])
+        # A PR payload of the wrong shape is a refusal, never a raise on the beat.
+        self.api["adopr"] = {"pullRequestId": 4, "repository": "r"}
+        self.assertEqual(self.base_of(merge, self.ADO), (None, unreadable))
+        self.api["adopr"] = {"pullRequestId": 4, "repository": {"id": "r", "project": "p"}}
+        self.assertEqual(self.base_of(merge, self.ADO), (None, unreadable))
+        with mock.patch.object(ha, "_azdo_fetch_pr", side_effect=AttributeError("x")):
+            self.assertEqual(self.base_of(merge, self.ADO), (None, unreadable))
 
 
 class TestShadowSandbox(ManagerMixin, unittest.TestCase):

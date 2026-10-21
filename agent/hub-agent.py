@@ -9473,8 +9473,11 @@ def _azdo_fetch_pr(url):
     data = _azure_get(f"/_apis/git/pullrequests/{pr_id}")
     if not isinstance(data, dict) or data.get("pullRequestId") is None:
         return None
-    repo = data.get("repository") or {}
-    proj = (repo.get("project") or {}).get("id") or (repo.get("project") or {}).get("name")
+    repo = data.get("repository")
+    repo = repo if isinstance(repo, dict) else {}
+    project = repo.get("project")
+    project = project if isinstance(project, dict) else {}
+    proj = project.get("id") or project.get("name")
     rid = repo.get("id") or repo.get("name")
     if proj and rid:
         if len(_AZDO_PR_REF) >= _AZDO_PR_REF_MAX:
@@ -19158,9 +19161,14 @@ def _forge_commit(sha, name, email, date, message, cut=False):
 
 def _forge_pr_commits(pr_url):
     """A GitLab MR's or Azure DevOps PR's commits from its forge's API, in the
-    forge's order, or None when this host cannot read them (not this host's
+    forge's order, plus the base the forge itself names (ADO's
+    `lastMergeTargetCommit`, the target's head the completion rebased onto;
+    None for GitLab) — or None when this host cannot read them (not this host's
     GitLab/ADO, an API failure, a malformed entry). Asks for one past the cap
-    where the API allows; GitLab pages at 100, so a full page reads as over."""
+    where the API allows; GitLab pages at 100, so a full page reads as over.
+    ADO pages by a continuation header this reader never sees, so a short page
+    is caught by the named base, not here."""
+    target = None
     if MR_URL_RE.fullmatch(pr_url):
         parts = _mr_url_parts(pr_url)
         if not parts:
@@ -19177,11 +19185,13 @@ def _forge_pr_commits(pr_url):
             out.append({})               # a full page may not be all: read as over the cap
     elif AZDO_PR_URL_RE.fullmatch(pr_url):
         pr_id = _azdo_pr_id(pr_url)
-        ref = _AZDO_PR_REF.get(pr_url) if pr_id else None
-        if pr_id and not ref and _azdo_fetch_pr(pr_url) is not None:
-            ref = _AZDO_PR_REF.get(pr_url)
-        if not ref:
+        info = _azdo_fetch_pr(pr_url) if pr_id else None
+        ref = _AZDO_PR_REF.get(pr_url) if info is not None else None
+        tgt = info.get("lastMergeTargetCommit") if info is not None else None
+        target = tgt.get("commitId") if isinstance(tgt, dict) else None
+        if not ref or not isinstance(target, str) or not SHADOW_SHA_RE.fullmatch(target.lower()):
             return None
+        target = target.lower()
         proj, rid = ref
         data = _azure_get(
             f"/{urllib.parse.quote(proj, safe='')}/_apis/git/repositories/"
@@ -19200,7 +19210,7 @@ def _forge_pr_commits(pr_url):
                        if isinstance(c, dict) else None)
     else:
         return None
-    return None if None in out else out
+    return None if None in out else (out, target)
 
 
 def _forge_commits_landed(pr, landed, landed_msgs):
@@ -19229,15 +19239,29 @@ def _forge_rebase_base(repo, merge, parent, pr_url):
     the N first-parent commits ending at the single-parent merge are the PR's N
     commits — the same shas (GitLab fast-forward) or the same authors, author
     times and messages (a rebase that rewrote them) — the base is merge~N; a
-    squash or a one-commit PR keeps the first parent."""
-    git = ["git", "-C", repo]
-    pr = _forge_pr_commits(pr_url)
-    if pr is None:
+    squash or a one-commit PR keeps the first parent. Where the forge names the
+    base itself (ADO), any other answer fails: a short page or a rebase that
+    does not line up is caught there instead of guessed."""
+    try:
+        got = _forge_pr_commits(pr_url)
+    except Exception as e:               # on the beat: a refusal, never a raise
+        log(f"shadow base: reading {pr_url[:200]} failed: {e}")
+        got = None
+    if got is None:
         return None, "could not list the PR's commits from its forge to find its base"
+    pr, target = got
     if len(pr) > SHADOW_PR_COMMITS_MAX:
         return None, f"the PR has over {SHADOW_PR_COMMITS_MAX} commits"
     if not pr:
         return None, "the forge lists no commits for the PR"
+    base, why = _forge_placed_base(repo, merge, parent, pr)
+    if base and target and base != target:
+        return None, "the PR's commits do not reach the base its forge names"
+    return base, why
+
+
+def _forge_placed_base(repo, merge, parent, pr):
+    git = ["git", "-C", repo]
     if len(pr) == 1:
         return parent, None
     rc, out = run_out(git + ["rev-list", "--first-parent", f"--max-count={len(pr)}",
