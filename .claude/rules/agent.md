@@ -114,12 +114,7 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
 
 ### `history`
 
-- **Operator messages are exempt from the window** (XERK-186): bounded read (last 4 MiB +
-  `HISTORY_MAX_MSGS`, capped in `_history_entries` — callers must not re-slice), but every
-  user-authored turn folds back in ahead of the window on any cut (id-deduped,
-  `HISTORY_USER_MSGS` backstop); tool traffic otherwise evicts. Tests: `TestHistoryCommand`.
-  - A `!` shell command counts as operator input there, its output row kept beside it (XERK-2112).
-  - The cap counts a command + its output as ONE message (`_operator_units`), never cutting them apart.
+- Window, operator rescue and byte trim: `agent-entry-blocks.md`.
 
 ### `setModelSource` — failover to the self-hosted model (XERK-246)
 

@@ -1159,7 +1159,7 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 # bytes. Keep this at or below the hub's own INPUT_MAX_CHARS, which rejects an
 # over-long message with an error the composer shows rather than truncating it.
 INPUT_MAX_CHARS = _env_int("SESSION_INPUT_MAX_CHARS", 100000)
-HISTORY_MAX_MSGS = _env_int("SESSION_HISTORY_MSGS", 200)
+HISTORY_MAX_MSGS = _env_int("SESSION_HISTORY_MSGS", 200, minimum=1)
 # Ceiling on ONE `history` delivery, in the BYTES it will occupy on the wire.
 # The per-block caps bound a BLOCK, never the reply: the window is
 # HISTORY_MAX_MSGS entries and the operator-message fold below scans the WHOLE
@@ -1323,7 +1323,7 @@ ATTACH_CHUNK_BYTES = 1 << 16
 # folds every operator text turn in the WHOLE transcript back into its reply,
 # so the chat always shows every message the operator sent. This cap bounds
 # only that exempt set (newest first), a payload backstop, not a window.
-HISTORY_USER_MSGS = _env_int("SESSION_HISTORY_USER_MSGS", 200)
+HISTORY_USER_MSGS = _env_int("SESSION_HISTORY_USER_MSGS", 200, minimum=1)
 
 # Transcript parsing is the expensive part; refresh each session's usage every N
 # heartbeats — but staggered (see _usage_slot) so they don't all reparse on the
@@ -9999,7 +9999,8 @@ def _tn_preview(tn):
 # and sometimes with sibling text, so anchoring to the whole string would miss
 # them. The caveat, by contrast, is the ENTIRE entry when present, hence fullmatch.
 LOCAL_COMMAND_CAVEAT_RE = re.compile(
-    r"\s*<local-command-caveat>.*?</local-command-caveat>\s*", re.DOTALL)
+    r"[ \t\r\n]*<local-command-caveat>.*?</local-command-caveat>[ \t\r\n]*",
+    re.DOTALL)
 COMMAND_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.DOTALL)
 COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
 # GREEDY, to the LAST closing tag: Claude Code writes a command's output
@@ -13178,7 +13179,34 @@ def _fit_history_budget(rows):
         keep += 1
     if keep >= len(rows):
         return rows, False
-    return rows[len(rows) - keep:], True
+    start = len(rows) - keep
+    # Never keep a `!` command's output without the command (XERK-2163); the
+    # newest row still survives alone.
+    if keep > 1 and _splits_operator_unit(rows, start):
+        start += 1
+    return rows[start:], True
+
+
+def _splits_operator_unit(rows, i):
+    """Does a cut before rows[i] separate a `!` command from its output? The
+    _operator_units rule, applied where a history window or byte trim cuts."""
+    return (0 < i < len(rows) and _is_command_output_row(rows[i])
+            and not _is_operator_row(rows[i])
+            and any(_is_bang_block(b) for b in rows[i - 1].get("blocks") or []))
+
+
+def _operator_units(rows):
+    """_operator_entries rows grouped into operator messages: a `!` command and
+    the output row(s) _operator_entries kept beside it are ONE message, so the
+    HISTORY_USER_MSGS cap counts what the operator sent and never cuts a
+    command from what it printed."""
+    units = []
+    for row in rows:
+        if units and not _is_operator_row(row) and _is_command_output_row(row):
+            units[-1].append(row)
+        else:
+            units.append([row])
+    return units
 
 
 def _operator_units(rows):
@@ -13233,6 +13261,8 @@ def _history_entries(path):
         if row is not None:
             entries.append(row)
     truncated = byte_capped or len(entries) > HISTORY_MAX_MSGS
+    # A window starting at a `!` command's output needs no care here: the
+    # command is an operator row, rescued just ahead of it below.
     window = entries[-HISTORY_MAX_MSGS:]
     if truncated:
         shown = {row["id"] for row in window if row.get("id")}

@@ -268,30 +268,37 @@ function fold(t: string): string {
   return t.toLowerCase().replace(/ς/g, 'σ')
 }
 
-// Is `m` (folded) at `text[i]`, compared case-insensitively?
-function markerAt(text: string, i: number, m: string): boolean {
-  return fold(text.slice(i, i + m.length)) === m
-}
-
+// Is `m` (folded) anywhere in `text`, as the agent's `m in text.lower()` reads it?
 function hasMarker(text: string, m: string): boolean {
-  for (let i = 0; i + m.length <= text.length; i++) if (markerAt(text, i, m)) return true
-  return false
+  return fold(text).includes(m)
 }
 
 // Every non-overlapping occurrence of `m`, left to right, replaced by `f(it)`.
+// Matched in the FOLDED text and mapped back per code point, never by slicing
+// `m.length` of the original: lowering can lengthen a character (U+0130 → `i̇`,
+// two), so an original slice of the folded length overruns the hit (XERK-2163).
+// A hit starting inside a lengthened character takes that whole character.
 function replaceMarker(text: string, m: string, f: (hit: string) => string): string {
-  let out = ''
-  let i = 0
-  while (i + m.length <= text.length) {
-    if (markerAt(text, i, m)) {
-      out += f(text.slice(i, i + m.length))
-      i += m.length
-    } else {
-      out += text[i]
-      i += 1
-    }
+  let folded = ''
+  const from: number[] = []   // folded code unit → its code point's start in `text`
+  const to: number[] = []     // … and end
+  for (let i = 0; i < text.length;) {
+    const c = String.fromCodePoint(text.codePointAt(i)!)
+    const lc = fold(c)
+    for (let k = 0; k < lc.length; k++) { from.push(i); to.push(i + c.length) }
+    folded += lc
+    i += c.length
   }
-  return out + text.slice(i)
+  let out = ''
+  let done = 0
+  for (let at = folded.indexOf(m); at >= 0; at = folded.indexOf(m, at + 1)) {
+    const start = from[at]
+    if (start < done) continue
+    const end = to[at + m.length - 1]
+    out += text.slice(done, start) + f(text.slice(start, end))
+    done = end
+  }
+  return out + text.slice(done)
 }
 
 // Text with no custom marker left in it. Run over whole output LINES, so a
