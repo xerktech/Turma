@@ -338,8 +338,8 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   alone reads **idle**. `parse_pane_prompt` reads `{prompt, options:[{number,label,selected}],
   detail}` off the mode marker's capture.
   - **Nothing keys on wording.** A dialog needs ALL of: options 1..N (N≥2), exactly one `❯`, a `?`
-    line directly above (or a subtitle above, below), **no mode footer below** (the footer rides the composer a dialog
-    replaces). `detail` closes on a rule, not on blanks.
+    line directly above (or above a subtitle, next bullet), **no mode footer below** (the footer
+    rides the composer a dialog replaces). `detail` closes on a rule, not on blanks.
   - **One subtitle paragraph may sit between the `?` line and the run** (XERK-2162): Claude
     Code 2.1.306's "Exit plan mode?" draws "Claude wants to exit plan mode" there, and requiring
     the question directly above made that live dialog read as an idle composer.
