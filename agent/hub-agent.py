@@ -14214,6 +14214,14 @@ _PANE_MODE_NAMES = {
     "auto mode": "auto",
     "manual mode": "default",
 }
+# Shell mode (a `!` typed into an empty composer) REPLACES the mode marker with
+# "! for shell mode" (2.1.306), yet the composer is as live as ever — so every
+# "is a dialog up?" read counts it as a composer footer too (XERK-2148), else a
+# `!` draft shaped like a dialog reads as one. Whole line from its start: the
+# `?` help overlay's "! for shell mode   double tap esc …" row matches as well,
+# and it too sits over a live composer. Kept out of PANE_MODE_RE: it names no
+# permission mode, so parse_pane_mode / set_mode must never read one off it.
+PANE_SHELL_FOOTER_RE = re.compile(r"^\s*! for shell mode\b", re.M)
 
 
 def parse_pane_mode(cap):
@@ -14493,7 +14501,8 @@ def parse_pane_prompt(cap, face=False):
         line = lines[i]
         m = PANE_PROMPT_OPTION_RE.match(line)
         if not m or m.group(2) == "0":
-            if PANE_MODE_RE.search(line) or QWEN_PANE_FOOTER_RE.search(line):
+            if (PANE_MODE_RE.search(line) or QWEN_PANE_FOOTER_RE.search(line)
+                    or PANE_SHELL_FOOTER_RE.match(line)):
                 return None          # composer footer (Claude or Qwen): nothing
                                      # is blocking
             continue
@@ -17698,23 +17707,6 @@ def _clear_leftover(tmux_name, epoch):
     return None
 
 
-def _capture_pane_styled(tmux_name):
-    """The pane with its SGR escapes kept (`capture-pane -e`), or None when
-    it can't be captured — or on Windows, whose grid capture carries no
-    attributes."""
-    if IS_WINDOWS or not tmux_name:
-        return None
-    try:
-        out = subprocess.run(
-            _tmux("capture-pane", "-p", "-e", "-t", _tmux_pane(tmux_name),
-                  name=tmux_name),
-            capture_output=True, text=True, timeout=5,
-        )
-    except Exception:
-        return None
-    return out.stdout if out.returncode == 0 else None
-
-
 # A dim span (SGR 2) up to the next reset — how Claude Code draws the empty
 # composer's placeholder ('Try "how does <filepath> work?"', 2.1.306).
 _DIM_SPAN_RE = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)")
@@ -17737,7 +17729,17 @@ def _composer_holds_text(styled):
         return True
     rows = lines[rules[-2] + 1:rules[-1]]
     text = "".join(_ANSI_RE.sub("", _DIM_SPAN_RE.sub("", row)) for row in rows)
-    return bool(text.replace("❯", "").replace("\xa0", "").strip())
+    text = text.replace("❯", "").replace("\xa0", "").strip()
+    # Under NO_COLOR the whole pane carries no SGR at all, so the placeholder
+    # is not dim and reads like a draft — then the switch waited for a first
+    # turn that clears it (XERK-2148). Only on such a pane is its `Try "…"`
+    # text taken for the placeholder, as `_composer_draft` takes it: a draft
+    # typed to that exact shape is indistinguishable there. A styled pane
+    # keeps the dim test alone, so it never mistakes such a draft for empty.
+    if "\x1b[" not in styled and _COMPOSER_PLACEHOLDER_NORM_RE.fullmatch(
+            _composer_norm(text)):
+        return False
+    return bool(text)
 
 
 def _composer_blocks_switch(styled):
@@ -18662,7 +18664,8 @@ def _trust_dialog_up(cap):
     text = _ANSI_RE.sub("", cap)
     if not _TRUST_DIALOG_RE.search(text):
         return False
-    if PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text):
+    if (PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
+            or PANE_SHELL_FOOTER_RE.search(text)):
         return False           # the composer footer is live: no modal is up
     if _pane_composer_tail_up(_pane_lines(text)):
         return False           # the exit toast / a cut footer hides it (XERK-2171)
@@ -18693,6 +18696,17 @@ def _trust_dialog_up(cap):
 # wrapped on a narrow pane — the picker at 40 columns ("… · Esc" / "to cancel"),
 # the elicitation's four-item footer onto five lines at 20 — plus one spare.
 _DIALOG_HINT_LINES = 6
+# The footer items that say an overlay owns the keyboard, each a whole
+# `·`-item, case-folded (2.1.306): "Esc to cancel" (pickers, elicitations,
+# /permissions, the permission dialog), "Esc to clear" (/config's filter),
+# "Esc to close" (/hooks, /tasks), "ctrl+o to toggle" (the Ctrl-O detailed
+# transcript view) and "enter to return" (the ← agents panel, whose own box
+# would take a typed message as a NEW session's task). None is ever a whole
+# item of a composer footer: those carry the mode marker, "? for shortcuts",
+# "← for agents", "esc to interrupt" or "! for shell mode" (XERK-2148).
+_DIALOG_HINT_ITEMS = frozenset((
+    "esc to cancel", "esc to clear", "esc to close", "ctrl+o to toggle",
+    "enter to return"))
 
 
 def _hint_dialog_up(cap):
@@ -18713,14 +18727,16 @@ def _hint_dialog_up(cap):
     What they share is their LAST line: a `·`-separated key-hint list carrying
     "Esc to cancel" ("Enter to select · ↑/↓ to navigate · Esc to cancel"). The
     numbered permission dialog ends the same way ("Esc to cancel · Tab to
-    amend"), as does the trust modal.
+    amend"), as does the trust modal. The settings overlays, the Ctrl-O
+    transcript view and the ← agents panel end in another item of
+    `_DIALOG_HINT_ITEMS` instead (XERK-2148).
 
     Never wording alone (agent.md): the item must be the bottom of the screen,
     where only the TUI's own chrome lives while it runs — conversation text,
     tool output and `!` output all draw ABOVE the composer — and no composer
-    footer (Claude's mode marker, qwen's) may be among those lines. A whole
-    `·`-item must read "Esc to cancel", so qwen's busy spinner "(… · esc to
-    cancel)" is not one."""
+    footer (Claude's mode marker, its shell-mode footer, qwen's) may be among
+    those lines. A whole `·`-item must read as one of `_DIALOG_HINT_ITEMS`, so
+    qwen's busy spinner "(… · esc to cancel)" is not one."""
     if not cap:
         return False
     lines = [_PANE_SCROLLBAR_RE.sub("", line).strip()
@@ -18733,7 +18749,8 @@ def _hint_dialog_up(cap):
                      if line and PANE_PROMPT_RULE_RE.match(line)), default=-1)
     tail = [line for line in lines[last_rule + 1:] if line][-_DIALOG_HINT_LINES:]
     joined = " ".join(tail)
-    if not tail or PANE_MODE_RE.search(joined) or QWEN_PANE_FOOTER_RE.search(joined):
+    if (not tail or PANE_MODE_RE.search(joined) or QWEN_PANE_FOOTER_RE.search(joined)
+            or any(PANE_SHELL_FOOTER_RE.match(line) for line in tail)):
         return False
     # Each line's own items, plus the seam a wrap makes: the last item of one
     # line run on into the first of the next. Joining the lines whole would glue
@@ -18745,7 +18762,7 @@ def _hint_dialog_up(cap):
         if prev is not None:
             items.append(prev + " " + parts[0])
         prev = parts[-1]
-    return any(" ".join(item.split()).lower() == "esc to cancel" for item in items)
+    return any(" ".join(item.split()).lower() in _DIALOG_HINT_ITEMS for item in items)
 
 
 def _pane_blocking_dialog(cap):
@@ -18761,15 +18778,18 @@ def _pane_blocking_dialog(cap):
         elicitation, the project MCP-server approval — XERK-2142);
       * the /model picker's "Switch model?" confirm, which has no footer at
         all (`parse_model_switch_confirm`, XERK-2157): an Enter or a typed
-        "1" answers Yes.
-    Keeping the last two OUT of `parse_pane_prompt` is deliberate: `panePrompt`
+        "1" answers Yes;
+      * the /model picker itself read off its body (`_model_picker_open`), for
+        a pane too short to draw its footer (XERK-2148: 40x45 wraps it off).
+    Keeping the last three OUT of `parse_pane_prompt` is deliberate: `panePrompt`
     is a wire contract whose options the chat page renders as clickable digits,
     and these have no digit to click (or, for the picker, digits that a
     free-text row and a multi-question tab bar make unsafe to offer) —
     surfacing them there would offer the operator a button that does nothing."""
     return (bool(parse_pane_prompt(cap)) or _trust_dialog_up(cap)
             or _hint_dialog_up(cap)
-            or parse_model_switch_confirm(cap) is not None)
+            or parse_model_switch_confirm(cap) is not None
+            or _model_picker_open(cap))
 
 
 def _answer_trust_dialog(tmux_name, cap=None):
@@ -24833,6 +24853,10 @@ MODEL_PICKER_WAIT_SEC = 0.3
 # pace the per-press readback; CONFIRM_* pace the wait for the "Set model to…"
 # confirmation after `s`.
 MODEL_PICKER_MAX_STEPS = 12
+# Presses set_model may spend scrolling a long picker to bring its target row
+# into view (XERK-2148): up to the top, then down — 2.1.306 lists 13 rows, and
+# the window shows ~10 of them.
+MODEL_PICKER_SCROLL_MAX = 40
 MODEL_STEP_TRIES = 8
 MODEL_STEP_WAIT_SEC = 0.12
 MODEL_CONFIRM_TRIES = 15
@@ -24895,34 +24919,87 @@ def parse_model_picker(text):
     stripped — it sits 2+ spaces right of the label; the ✔ current-model mark
     dropped) and the index the ❯ cursor is on, or ([], None) when the capture
     holds no picker. Only the region from the last "Select model" heading down
-    is read, so numbered lines in the conversation above can't parse as rows."""
+    is read, so numbered lines in the conversation above can't parse as rows.
+    Only the DRAWN rows are returned: a long list scrolls, marking its first
+    drawn row "↑ 4." and its last "↓ 10." (`_model_picker_scroll`). A narrow
+    pane truncates a label ("Sonne…" at 24 columns); it is kept as drawn and
+    `_picker_index_for` judges it."""
+    rows, cur = [], None
+    for marks, label in _model_picker_rows(text):
+        rows.append(label)
+        if "❯" in marks:
+            cur = len(rows) - 1
+    return rows, cur
+
+
+# A /model picker row: the ❯ cursor and/or a scroll arrow ("↑" on the first
+# drawn row of a list scrolled down, "↓" on the last when more follow), then
+# "N." and the label (2.1.306).
+_MODEL_PICKER_ROW_RE = re.compile(r"^\s*((?:[❯↑↓]\s+)*)(\d+)\.\s+(.+?)\s*$")
+# The line under a scrolled list saying how many rows follow ("… +3 models").
+_MODEL_PICKER_MORE_RE = re.compile(r"^\s*…\s*\+\d+\s+models?\b")
+
+
+def _model_picker_region(text):
+    """The capture's lines from the last "Select model" heading down, or None."""
     text = ANSI_RE.sub("", text or "")
     pos = text.rfind("Select model")
-    if pos < 0:
-        return [], None
-    rows, cur = [], None
-    for line in text[pos:].splitlines():
-        m = re.match(r"^\s*(❯\s+)?(\d+)\.\s+(.+?)\s*$", line)
+    return None if pos < 0 else text[pos:].splitlines()
+
+
+def _model_picker_rows(text):
+    """Each drawn picker row as (marks, label): its ❯/↑/↓ glyphs, and its
+    label with the description column and the ✔ dropped."""
+    out = []
+    for line in _model_picker_region(text) or ():
+        m = _MODEL_PICKER_ROW_RE.match(line)
         if not m:
             continue
         label = re.split(r"\s{2,}", m.group(3))[0].replace("✔", "").strip()
-        if not label:
-            continue
-        rows.append(label)
-        if m.group(1):
-            cur = len(rows) - 1
-    return rows, cur
+        if label:
+            out.append((m.group(1), label))
+    return out
+
+
+def _model_picker_scroll(text):
+    """(more_above, more_below): whether a scrolled picker has rows it does not
+    draw above its first drawn row ("↑") or below its last ("↓", "… +N
+    models", or a narrow pane's "↓" ending the last drawn line, which a
+    wrapped description pushed the rest past). set_model scrolls to reach a
+    row it can't see (XERK-2148)."""
+    rows = _model_picker_rows(text)
+    region = [line.rstrip() for line in _model_picker_region(text) or () if line.strip()]
+    above = bool(rows) and "↑" in rows[0][0]
+    below = (any("↓" in marks for marks, _ in rows)
+             or any(_MODEL_PICKER_MORE_RE.match(line) for line in region)
+             or bool(region) and region[-1].endswith(" ↓"))
+    return above, below
+
+
+def _picker_head_is(head, word):
+    """Whether a picker row's first word `head` (case-folded) names `word`:
+    the same word, or one a narrow pane truncated ("sonne…", "defau…" at 24
+    columns) to a stem that `word` starts with and no other model family does.
+    A bare "…" (20 columns) or a stem two families share names nothing."""
+    if head == word:
+        return True
+    if not head.endswith("…"):
+        return False
+    stem = head[:-1]
+    names = {"default", word, *MODEL_ALIASES}
+    return word.startswith(stem) and sum(n.startswith(stem) for n in names) == 1
 
 
 def _picker_index_for(rows, resolved):
     """The picker row a resolved model alias (None = default) selects, or None
     when the picker doesn't offer it. Rows lead with the alias as a word —
     "Default (recommended)", "Opus", "Fable ✔" — so the match is on the first
-    word, case-folded."""
+    word, case-folded; a truncated one counts when unambiguous
+    (`_picker_head_is`)."""
     want = (resolved or "default").lower()
     for i, label in enumerate(rows):
         head = label.split()[0].lower() if label.split() else ""
-        if head == want:
+        if _picker_head_is(head, want):
             return i
     return None
 
@@ -25021,14 +25098,21 @@ def _model_switch_landed(before, after, label):
 
 
 def _model_picker_open(cap):
-    """Whether the /model picker is drawn: its rows parse and the composer's
-    mode footer, which the picker hides, is not on screen — nor the exit toast
-    or a width-cut footer standing in for it (XERK-2171). Its own key-hint
-    footer is not required — a narrow pane pushes it off-screen."""
+    """Whether the /model picker is drawn: its rows parse, no rule follows its
+    heading (the composer, which the picker replaces, is boxed in rules), and
+    no composer footer is on screen — nor the exit toast or a width-cut
+    footer standing in for it (XERK-2171). Its own key-hint footer is not
+    required — a narrow pane pushes it off-screen (40x45 wraps it off,
+    XERK-2148)."""
+    region = _model_picker_region(cap)
+    if not region or not parse_model_picker(cap)[0]:
+        return False
+    if any(line.strip() and PANE_PROMPT_RULE_RE.match(line) for line in region):
+        return False
     text = _ANSI_RE.sub("", cap or "")
-    return bool(parse_model_picker(cap)[0]
-                and not PANE_MODE_RE.search(text)
-                and not _pane_composer_tail_up(_pane_lines(text)))
+    return not (PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
+                or PANE_SHELL_FOOTER_RE.search(text)
+                or _pane_composer_tail_up(_pane_lines(text)))
 
 
 def _model_names_row(name, label):
@@ -25040,9 +25124,9 @@ def _model_names_row(name, label):
     if not words or not row:
         return False
     is_default = words[-1] == "(default)"
-    if row[0] == "default":
+    if _picker_head_is(row[0], "default"):
         return is_default or words[0] == "default"
-    return not is_default and words[0] == row[0]
+    return not is_default and _picker_head_is(row[0], words[0])
 
 
 def clean_summary(raw):
@@ -34971,18 +35055,23 @@ class SessionManager:
         _pane_send_keys(tmux_name, "C-u")
         _pane_send_keys(tmux_name, "/model", literal=True)
         _pane_send_keys(tmux_name, "Enter")
-        rows, cur = [], None
+        rows, cur, cap = [], None, ""
         for _ in range(MODEL_PICKER_TRIES):
             time.sleep(MODEL_PICKER_WAIT_SEC)
-            rows, cur = parse_model_picker(_capture_pane(tmux_name) or "")
+            cap = _capture_pane(tmux_name) or ""
+            rows, cur = parse_model_picker(cap)
             if rows:
                 break
         if not rows or cur is None:
             # No picker appeared (or no cursor to navigate from): back out.
             # The pane was idle a moment ago, so Escape lands on the prompt (or
-            # closes a half-painted picker) and destroys nothing.
+            # closes a half-painted picker) and destroys nothing. A picker too
+            # short to draw its ❯ row (24x15 shows only row 1) did appear, and
+            # the log says so rather than "did not appear" (XERK-2148).
             _pane_send_keys(tmux_name, "Escape")
-            log(f"set model of {sid} -> {arg}: /model picker did not appear")
+            why = ("/model picker did not appear" if not rows else
+                   "/model picker's cursor row is not drawn (pane too small)")
+            log(f"set model of {sid} -> {arg}: {why}")
             self.save()
             return
         # Arrow toward the target ONE press at a time, re-reading the ❯ before
@@ -34992,13 +35081,41 @@ class SessionManager:
         # dropped key just means the next read still shows the gap (press
         # again), and a doubled one flips the press direction; MAX_STEPS bounds
         # a cursor that never converges.
-        steps = 0
+        #
+        # A long list draws only a window of its rows (XERK-2148: opened with
+        # the ❯ on row 13 it shows "↑ 4." to "❯ 13."; 22 rows end "↓ 10." and
+        # "… +8 models"), so the target may not be drawn. Rows match by their
+        # FIRST word and the first match wins, so the window is first scrolled
+        # to the top (Up while "↑" shows) — else "opus" would take a lower
+        # "Opus 5" over an "Opus 5.5" scrolled off above — and then down
+        # (while "↓" shows) until the row is drawn, bounded by SCROLL_MAX.
+        steps = scrolls = 0
+        seen_top = False
         while True:
-            target = _picker_index_for(rows, resolved)
+            above, below = _model_picker_scroll(cap)
+            seen_top = seen_top or not above
+            looking_up = above and not seen_top
+            target = None if looking_up else _picker_index_for(rows, resolved)
             if target is None:
+                way = "Up" if looking_up else "Down" if below else None
+                if way and scrolls < MODEL_PICKER_SCROLL_MAX:
+                    _pane_send_keys(tmux_name, way)
+                    scrolls += 1
+                    rows, cur, cap = self._await_picker_step(tmux_name, rows, cur)
+                    if not rows or cur is None:
+                        _pane_send_keys(tmux_name, "Escape")
+                        log(f"set model of {sid} -> {arg}: picker vanished mid-scroll")
+                        self.save()
+                        return
+                    continue
                 _pane_send_keys(tmux_name, "Escape")
-                log(f"set model of {sid} -> {arg}: picker offers no such row "
-                    f"({', '.join(rows)})")
+                if way:
+                    why = f"row not reached after {scrolls} scroll presses"
+                elif any("…" in label for label in rows):
+                    why = "picker rows are truncated past recognition (pane too narrow)"
+                else:
+                    why = "picker offers no such row"
+                log(f"set model of {sid} -> {arg}: {why} ({', '.join(rows)})")
                 self.save()
                 return
             if cur == target:
@@ -35011,7 +35128,7 @@ class SessionManager:
                 return
             _pane_send_keys(tmux_name, "Down" if target > cur else "Up")
             steps += 1
-            rows, cur = self._await_picker_step(tmux_name, rows, cur)
+            rows, cur, cap = self._await_picker_step(tmux_name, rows, cur)
             if not rows or cur is None:
                 _pane_send_keys(tmux_name, "Escape")
                 log(f"set model of {sid} -> {arg}: picker vanished mid-navigation")
@@ -35035,19 +35152,22 @@ class SessionManager:
             log(f"set model of {sid} -> {arg}: selection sent but no "
                 f"confirmation read; record unchanged (modelActual will settle it)")
 
-    def _await_picker_step(self, tmux_name, rows, prev_cur):
-        """Poll the picker after an arrow press until the ❯ moves off prev_cur,
-        returning the fresh (rows, cur). On timeout returns the LAST read even
-        if unmoved — the caller's loop just presses again, bounded by
-        MAX_STEPS — and ([], None) when the picker is gone entirely."""
+    def _await_picker_step(self, tmux_name, prev_rows, prev_cur):
+        """Poll the picker after an arrow press until the ❯ moves off prev_cur
+        or the drawn rows scroll (the ❯ then stays on the edge row), returning
+        the fresh (rows, cur, cap). On timeout returns the LAST read even if
+        unmoved — the caller's loop just presses again, bounded by MAX_STEPS —
+        and ([], None, cap) when the picker is gone entirely."""
+        rows, cur, cap = prev_rows, prev_cur, ""
         for _ in range(MODEL_STEP_TRIES):
             time.sleep(MODEL_STEP_WAIT_SEC)
-            rows, cur = parse_model_picker(_capture_pane(tmux_name) or "")
+            cap = _capture_pane(tmux_name) or ""
+            rows, cur = parse_model_picker(cap)
             if not rows:
-                return [], None
-            if cur is not None and cur != prev_cur:
-                return rows, cur
-        return rows, cur
+                return [], None, cap
+            if cur is not None and (cur != prev_cur or rows != prev_rows):
+                return rows, cur, cap
+        return rows, cur, cap
 
     def _await_model_confirmation(self, tmux_name, label, before):
         """Whether the picker's selection of row `label` visibly landed: poll

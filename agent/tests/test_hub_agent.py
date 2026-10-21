@@ -10670,6 +10670,117 @@ class TestHintDialogIsABlockingDialog(unittest.TestCase):
         self.assertIs(state["paneDialog"], False)
 
 
+# Overlays whose footer is not "Esc to cancel", trimmed from real Claude Code
+# 2.1.306 frames at 100 columns (XERK-2148).
+_2148_RULE = "─" * 100 + "\n"
+_2148_OVERLAYS = {
+    "/config": ("   Settings  Status  Config  Usage\n\n"
+                "     Auto-scroll                                 true\n"
+                "     ↓ 20 more\n\n"
+                "   Type to filter · Enter/↓ to select · ↑ to tabs · Esc to clear\n"),
+    "/hooks": ("     Stop  right before Claude concludes its response\n"
+               "     [User] python3 ~/.claude/bin/ticket-blocker-guard.py   command\n"
+               "     All events\n\n"
+               "   Enter to view · Esc to close\n"),
+    "/tasks": ("▔" * 79 + " ◐ medium · /effort ▔\n   Background\n\n"
+               "   No tasks currently running\n\n"
+               "   ↑/↓ to select · Enter to view · Esc to close\n"),
+    "ctrl+o": ("● earlier reply\n" + _2148_RULE
+               + "  Showing detailed transcript · ctrl+o to toggle · ? for shortcuts"
+               "                          verbose\n"),
+    "agents": ("Completed\n Finished sessions wait here for you to review\n"
+               + _2148_RULE + "❯ describe a task for a new session\n" + _2148_RULE
+               + "  ⏵⏵ auto mode · enter to return · space to reply · ctrl+x to delete"
+               " · ? for shortcuts\n"),
+}
+# Composer states whose footer must never read as an overlay's.
+_2148_COMPOSERS = {
+    "idle": _2148_RULE + "❯ Try \"fix lint errors\"\n" + _2148_RULE
+    + "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n",
+    "busy": _2148_RULE + "❯ \n" + _2148_RULE
+    + "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt\n",
+    "shortcuts": _2148_RULE + "❯ \n" + _2148_RULE + "  ? for shortcuts\n",
+    "help": (_2148_RULE + "❯ Try \"fix lint errors\"\n" + _2148_RULE
+             + "  ! for shell mode        double tap esc to clear input      ctrl + shift + _ to undo\n"
+             "  / for commands          shift + tab to auto-accept edits   ctrl + v to paste images\n"
+             "                          newline                            ctrl + g to edit in $EDITOR\n"
+             "                                                             /keybindings to customize\n"),
+    "shell": _2148_RULE + "! echo hi\n" + _2148_RULE + "  ! for shell mode\n",
+    "draft": (_2148_RULE + "❯ notes\n  Esc to close\n  ctrl+o to toggle\n" + _2148_RULE
+              + "  ⏸ manual mode on\n"),
+}
+
+
+class TestOverlayFootersAndShellMode(unittest.TestCase):
+    """XERK-2148. /config, /hooks, /tasks, the Ctrl-O transcript view and the
+    ← agents panel end in a footer other than "Esc to cancel", so they read as
+    an idle composer and typed input landed in them; shell mode's footer
+    replaces the mode marker, so a `!` draft could read as a dialog."""
+
+    def test_each_overlay_footer_is_a_blocking_dialog(self):
+        for name, cap in _2148_OVERLAYS.items():
+            self.assertTrue(ha._hint_dialog_up(cap), name)
+            self.assertTrue(ha._pane_blocking_dialog(cap), name)
+
+    def test_no_composer_state_is_one(self):
+        for name, cap in _2148_COMPOSERS.items():
+            self.assertFalse(ha._hint_dialog_up(cap), name)
+            self.assertFalse(ha._pane_blocking_dialog(cap), name)
+
+    def test_an_item_must_be_whole(self):
+        self.assertFalse(ha._hint_dialog_up("double tap esc to clear input\n"))
+        self.assertFalse(ha._hint_dialog_up("press ctrl+o to toggle it\n"))
+        self.assertTrue(ha._hint_dialog_up("Enter to view · Esc\nto close\n"))
+
+    def test_a_shell_draft_shaped_like_a_dialog_is_not_one(self):
+        cap = (_2148_RULE + "! Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n"
+               + _2148_RULE + "  ! for shell mode\n")
+        self.assertIsNone(ha.parse_pane_prompt(cap))
+        self.assertFalse(ha._pane_blocking_dialog(cap))
+        # No rule to stop at (a short pane): the draft's own last line is the
+        # footer item, and only the shell footer under it says composer.
+        self.assertFalse(ha._hint_dialog_up("! note\nEsc to cancel\n  ! for shell mode\n"))
+
+    def test_the_shell_footer_names_no_permission_mode(self):
+        self.assertIsNone(ha.parse_pane_mode(_2148_COMPOSERS["shell"]))
+        self.assertFalse(ha._trust_dialog_up(
+            "Yes, I trust this folder\nNo, exit\n  ! for shell mode\n"))
+
+
+# The /model picker on a 40x45 pane (2.1.306, trimmed): wrapped descriptions
+# push its key-hint footer off the bottom (XERK-2148).
+_2148_PICKER_40 = (
+    "  ⎿  Kept model as Opus 5.5 (1M context)\n" + "▔" * 40 + "\n"
+    "   Select model\n"
+    "   Switch between Claude models. Your\n"
+    "     1.  Default (recom…  Opus 5.5 ·\n"
+    "                          Best for\n"
+    "   ❯ 2.  Opus 5.5 ✔       For complex\n"
+    "                          work and\n"
+    "     3.  Fable 5.1        For your\n"
+    "     4.  Sonnet 5.5       Most\n"
+    "   ↓ 10. Opus 4.8         Best for    ↓\n"
+)
+
+
+class TestModelPickerBodyIsABlockingDialog(unittest.TestCase):
+    """XERK-2148: a picker too tall for its pane draws no footer, so it was
+    read as an idle composer; its body is what says it is up."""
+
+    def test_footerless_picker_blocks(self):
+        self.assertFalse(ha._hint_dialog_up(_2148_PICKER_40))
+        self.assertTrue(ha._model_picker_open(_2148_PICKER_40))
+        self.assertTrue(ha._pane_blocking_dialog(_2148_PICKER_40))
+
+    def test_a_picker_quoted_above_the_composer_does_not(self):
+        quoted = "● Select model\n  1. Opus\n❯ 2. Sonnet\n"
+        for footer in ("  ⏵⏵ auto mode on (shift+tab to cycle)\n", "  ? for shortcuts\n",
+                       "  ! for shell mode\n"):
+            cap = quoted + "─" * 40 + "\n❯ \n" + "─" * 40 + "\n" + footer
+            self.assertFalse(ha._model_picker_open(cap), footer)
+            self.assertFalse(ha._pane_blocking_dialog(cap), footer)
+
+
 # The /model picker's "Switch model?" confirm, captured on Claude Code 2.1.306
 # (XERK-2157): drawn after `s` on a session whose conversation is cached for the
 # current model. No "Esc to cancel" footer, no question line above the options.
@@ -20894,6 +21005,57 @@ class _DraftPane(_PickerPane):
         return cap
 
 
+class _ScrollPickerPane(_PickerPane):
+    """A long /model list drawn through a window of `height` rows that follows
+    the ❯, as 2.1.306 draws its 13 (XERK-2148): "↑" on the first drawn row when
+    rows are above, "↓" on the last and "… +N models" under it when rows are
+    below. Opened with the ❯ on row 13 it shows "↑ 4." to "❯ 13."; moving, it
+    scrolls before the ❯ reaches an edge row while more rows lie past it, so
+    an arrow row never carries the ❯ (both as captured)."""
+    ROWS = ("Default (recommended)", "Opus 5.5", "Fable 5.1", "Sonnet 5.5",
+            "Haiku 5.5", "Haiku 4.5", "Sonnet 5", "Opus 5", "Fable 5",
+            "Opus 4.8", "Opus 4.7", "Opus 4.6", "Sonnet 4.6")
+
+    def __init__(self, rows=None, height=10, **kw):
+        super().__init__(**kw)
+        if rows is not None:
+            self.ROWS = rows
+        self.height = height
+        self.top = max(0, min(len(self.ROWS) - height, self.cur - height + 2))
+
+    def key(self, key):
+        super().key(key)
+        n = len(self.ROWS)
+        if self.cur <= self.top and self.top > 0:
+            self.top = max(0, self.cur - 1)
+        elif self.cur >= self.top + self.height - 1 and self.top + self.height < n:
+            self.top = min(n - self.height, self.cur - self.height + 2)
+
+    def capture(self):
+        if not self.open:
+            return super().capture()
+        end = min(len(self.ROWS), self.top + self.height)
+        lines = ["   Select model"]
+        for i in range(self.top, end):
+            glyph = ("❯" if i == self.cur else "↑" if i == self.top and i > 0
+                     else "↓" if i == end - 1 and end < len(self.ROWS) else " ")
+            lines.append(f"   {glyph} {i + 1}. {self.ROWS[i]}    a description")
+        if end < len(self.ROWS):
+            lines.append(f"      … +{len(self.ROWS) - end} models")
+        lines.append("   Enter to set as default · s to use this session only · Esc to cancel")
+        return self.history + "\n".join(lines)
+
+
+class _TruncatedPickerPane(_PickerPane):
+    """The picker at 24 columns (2.1.306): every label cut to "Sonne…", while
+    the confirmation still prints the full name (XERK-2148)."""
+    FULL = ("Default (recommended)", "Opus 5.5", "Fable 5.1", "Sonnet 5.5", "Haiku 5.5")
+    ROWS = ("Defau…", "Opu…", "Fable…", "Sonne…", "Haiku…")
+
+    def name(self):
+        return "Opus 5.5 (default)" if self.cur == 0 else self.FULL[self.cur]
+
+
 class _ModePane:
     """A footer-mode pane simulator for set_mode's closed loop: BTab advances
     through `cycle`, capture() shows the current mode's real footer marker."""
@@ -21227,6 +21389,130 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         # reply can draw its own) is not the composer's.
         self.assertIs(ha._composer_holds_text(
             rule + "● a reply\n" + rule + "✻ Churned\n" + box("❯ ")), False)
+
+    def test_composer_holds_text_reads_an_unstyled_placeholder_as_empty(self):
+        # NO_COLOR=1 (2.1.306): the pane carries no SGR at all, so the
+        # placeholder is not dim — its `Try "…"` text says it (XERK-2148).
+        rule = "─" * 30 + "\n"
+        box = lambda row: rule + row + "\n" + rule + "  ⏵⏵ auto mode on\n"
+        self.assertIs(ha._composer_holds_text(box('❯\xa0Try "how do I log an error?"')), False)
+        self.assertIs(ha._composer_holds_text(box('❯ Try "fix lint')), True)
+        self.assertIs(ha._composer_holds_text(box("❯\xa0hello")), True)
+        # Shell mode's placeholder sits after "!", which is a mode, not empty.
+        self.assertIs(ha._composer_holds_text(box('! Try "fix lint errors"')), True)
+        # On a styled pane only dim is the placeholder: the same text typed is a draft.
+        self.assertIs(ha._composer_holds_text(
+            box('\x1b[39m❯\xa0Try "how do I log an error?"')), True)
+
+    def test_set_model_goes_on_under_no_color(self):
+        pane = _PickerPane()
+        rule = "─" * 30 + "\n"
+        pane.styled = lambda: rule + '❯\xa0Try "fix lint errors"\n' + rule
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys(), ["C-u", "/model", "Enter", "Down", "s"])
+        self.assertEqual(sess["model"], "sonnet")
+        self.assertNotIn("pendingModel", sess)
+
+    def test_set_model_scrolls_up_to_the_first_matching_row(self):
+        # XERK-2148: opened with the ❯ on row 13 the picker draws rows 4..13,
+        # so "opus" matched none but "Opus 5" (row 8) — or, before the scroll
+        # arrows parsed, nothing ("picker offers no such row"). The first Opus
+        # row (Opus 5.5) is above: scroll to the top, then pick it.
+        pane = _ScrollPickerPane(cur=12)
+        pane.open = True
+        self.assertIn("↑ 4. Sonnet 5.5", pane.capture())
+        pane.open = False
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "opus")
+        self.assertEqual(pane.cur, 1)
+        self.assertTrue(pane.confirmed)
+        self.assertEqual(sess["model"], "opus")
+        # The "↑" leaves once row 1 is drawn — the ❯ is then on row 2, Opus 5.5.
+        self.assertEqual(self._keys(), ["C-u", "/model", "Enter"] + ["Up"] * 11 + ["s"])
+        sm2 = self.make_manager(pane=_ScrollPickerPane(cur=12))
+        self._session(sm2, model="sonnet")
+        sm2.set_model("abcde", "default")
+        self.assertEqual(self.pane.cur, 0)
+        self.assertTrue(self.pane.confirmed)
+
+    def test_set_model_scrolls_down_to_a_row_below_the_window(self):
+        rows = (("Default (recommended)",) + tuple(f"Opus {i}" for i in range(15))
+                + ("Haiku 4.5",) + tuple(f"Sonnet {i}" for i in range(6)))
+        pane = _ScrollPickerPane(rows=rows, cur=1)
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "haiku")
+        self.assertEqual(pane.ROWS[pane.cur], "Haiku 4.5")
+        self.assertTrue(pane.confirmed)
+        self.assertEqual(sess["model"], "haiku")
+        self.assertNotIn("Up", self._keys())
+
+    def test_set_model_scroll_is_bounded_and_backs_out(self):
+        rows = ("Default (recommended)",) + tuple(f"Opus {i}" for i in range(20))
+        pane = _ScrollPickerPane(rows=rows, cur=20)
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model="opus")
+        with mock.patch.object(ha, "log") as logged:
+            sm.set_model("abcde", "sonnet")
+        keys = self._keys()
+        self.assertNotIn("s", keys)
+        self.assertEqual(keys[-1], "Escape")
+        self.assertLessEqual(keys.count("Up") + keys.count("Down"),
+                             ha.MODEL_PICKER_SCROLL_MAX)
+        self.assertEqual(sess["model"], "opus")
+        self.assertIn("picker offers no such row", logged.call_args[0][0])
+
+    def test_set_model_reads_truncated_labels(self):
+        # XERK-2148: at 24 columns rows read "Sonne…"; a stem only one model
+        # family starts with still names it, and the confirmation (full name)
+        # is matched to the truncated row.
+        sm = self.make_manager(pane=_TruncatedPickerPane())
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys(), ["C-u", "/model", "Enter", "Down", "s"])
+        self.assertEqual(sess["model"], "sonnet")
+        sm = self.make_manager(pane=_TruncatedPickerPane())
+        sess = self._session(sm, model="fable")
+        sm.set_model("abcde", "default")
+        self.assertEqual(self._keys()[-1], "s")
+        self.assertIsNone(sess["model"])
+
+    def test_truncated_labels_match_only_unambiguously(self):
+        rows = ["Defau…", "Opu…", "Fable…", "Sonne…", "Haiku…"]
+        self.assertEqual(ha._picker_index_for(rows, None), 0)
+        self.assertEqual(ha._picker_index_for(rows, "opus"), 1)
+        self.assertEqual(ha._picker_index_for(rows, "sonnet"), 3)
+        # 20 columns: the ❯ row's label is a bare "…", which names nothing.
+        self.assertIsNone(ha._picker_index_for(["De…", "…", "Fa…"], "opus"))
+        # A stem two candidates share ("opu" for opus and opusplan) names neither.
+        self.assertIsNone(ha._picker_index_for(rows, "opusplan"))
+        self.assertTrue(ha._model_names_row("Sonnet 5.5", "Sonne…"))
+        self.assertTrue(ha._model_names_row("Opus 5.5 (default)", "Defau…"))
+        self.assertFalse(ha._model_names_row("Opus 5.5 (default)", "Opu…"))
+        self.assertFalse(ha._model_names_row("Haiku 5.5", "Sonne…"))
+
+    def test_set_model_logs_why_an_unusable_picker_was_left(self):
+        rule = "▔" * 24 + "\n"
+        for cap, why in (
+                # 24x15: only row 1 drawn, the ❯ row below the bottom.
+                (rule + "   Select model\n     1.  Defau…  Opus ↓\n",
+                 "cursor row is not drawn"),
+                # 20 columns: the ❯ row's label is a bare "…".
+                (rule + "   Select model\n     1.  De…  Opu\n   ❯ 2.  … ✔  For\n"
+                 "     3.  Fa…  For\n", "truncated past recognition")):
+            pane = _PickerPane()
+            pane.capture = lambda cap=cap, pane=pane: cap if pane.open else (
+                "─" * 24 + "\n❯ \n" + "─" * 24 + "\n  ? for shortcuts")
+            sm = self.make_manager(pane=pane)
+            self._session(sm, model=None)
+            with mock.patch.object(ha, "log") as logged:
+                sm.set_model("abcde", "opus")
+            self.assertIn(why, logged.call_args[0][0])
+            self.assertNotIn("did not appear", logged.call_args[0][0])
+            self.assertNotIn("s", self._keys())
 
     def test_only_windows_goes_on_without_a_styled_capture(self):
         self.assertTrue(ha._composer_blocks_switch(None))
@@ -22648,6 +22934,27 @@ class TestParseModelPicker(unittest.TestCase):
             "  1. buy groceries\n  2. do laundry\n" + MODEL_PICKER_PANE)
         self.assertEqual(len(rows), 5)
         self.assertEqual(cur, 2)
+
+    def test_scroll_arrow_rows_parse_and_say_which_way(self):
+        # 2.1.306 (XERK-2148): the arrow rows used to be dropped, so the ❯
+        # index and the rows disagreed and the arrows went unread.
+        top = ("   Select model\n"
+               "     1.  Default (recommended)  Opus 5.5 · Best\n"
+               "   ❯ 2.  Opus 5.5 ✔             For complex work\n"
+               "   ↓ 10. Opus 4.8               Best for everyday\n"
+               "      … +3 models\n")
+        self.assertEqual(ha.parse_model_picker(top),
+                         (["Default (recommended)", "Opus 5.5", "Opus 4.8"], 1))
+        self.assertEqual(ha._model_picker_scroll(top), (False, True))
+        bottom = ("   Select model\n"
+                  "   ↑ 4.  Sonnet 5.5             Most efficient\n"
+                  "   ❯ 13. Sonnet 4.6             Efficient\n")
+        self.assertEqual(ha.parse_model_picker(bottom), (["Sonnet 5.5", "Sonnet 4.6"], 1))
+        self.assertEqual(ha._model_picker_scroll(bottom), (True, False))
+        self.assertEqual(ha._model_picker_scroll(MODEL_PICKER_PANE), (False, False))
+        # A narrow pane: the "↓" ends the last drawn line.
+        self.assertEqual(ha._model_picker_scroll(
+            "   Select model\n   ❯ 2.  Opu… ✔  For\n                 work ↓\n"), (False, True))
 
     def test_picker_index_for(self):
         rows, _ = ha.parse_model_picker(MODEL_PICKER_PANE)
