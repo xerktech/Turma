@@ -109,7 +109,8 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   `can't find session: agent-<id>` while the card still read running.
 - **`_pane_blocking_dialog` is now the ONE predicate every such guard uses** (`_reconcile_rc_names`,
   `_apply_pending_switches`, `_poll_pending_inputs`' resend, `send_input`) — `parse_pane_prompt` OR
-  `_trust_dialog_up`. Add a new pane-typing path → use it, never a bare `parse_pane_prompt`.
+  `_trust_dialog_up` OR `_hint_dialog_up` (XERK-2142, `agent.md`). Add a new pane-typing path →
+  use it, never a bare `parse_pane_prompt`.
 - **A NUMBERED dialog is never the trust modal, and `_trust_dialog_up` MUST keep checking that.**
   A tool-permission dialog shows no mode footer either — that is what makes `parse_pane_prompt`
   work — so with the footer as the only guard, any Write/Bash dialog whose diff, command or

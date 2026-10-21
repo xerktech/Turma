@@ -14279,11 +14279,18 @@ def _pane_status(tmux_name, state):
     mode/prompt then read THAT fresher one.
 
     Live background agents are deliberately NOT read here — see
-    _scan_agent_entry for why the pane cannot answer that question."""
+    _scan_agent_entry for why the pane cannot answer that question.
+
+    Whether ANY dialog owns the pane (`_pane_blocking_dialog`, which also covers
+    the ones that never become a `panePrompt`) is left on `state["paneDialog"]`,
+    so the tuple every caller (and test double) unpacks keeps its shape."""
     if not tmux_name:
+        state["paneDialog"] = False
         return None, None, None
     busy, cap = _stable_pane_busy_from(tmux_name, state, _capture_pane(tmux_name))
-    return busy, parse_pane_mode(cap), parse_pane_prompt(cap, face=True)
+    prompt = parse_pane_prompt(cap, face=True)
+    state["paneDialog"] = bool(prompt) or _pane_blocking_dialog(cap)
+    return busy, parse_pane_mode(cap), prompt
 
 
 # --- the permission ledger (XERK-1563) ---------------------------------------
@@ -18210,19 +18217,83 @@ def _trust_dialog_up(cap):
     return False
 
 
+# How many trailing non-blank lines `_hint_dialog_up` reads: the key-hint footer
+# wrapped on a narrow pane — the picker at 40 columns ("… · Esc" / "to cancel"),
+# the elicitation's four-item footer onto five lines at 20 — plus one spare.
+_DIALOG_HINT_LINES = 6
+
+
+def _hint_dialog_up(cap):
+    """Whether the pane's bottom is an overlay dialog's key-hint footer.
+
+    Claude Code draws a set of dialogs that `parse_pane_prompt` and
+    `_trust_dialog_up` both miss, and every other read calls an idle composer
+    (no interrupt hint, no mode footer, no 1..N run). Captured on 2.1.306:
+      * the native AskUserQuestion picker — a description line sits under each
+        option, so there is no contiguous numbered run. ask.py keeps it off the
+        pane until its wait times out; then a typed digit picks an option and
+        an Enter answers with the highlighted one;
+      * an MCP elicitation form ("MCP server "x" requests your input") — fields,
+        Accept/Decline buttons, nothing numbered;
+      * the "New MCP server found in this project" approval — bare options whose
+        default disables the server on Enter;
+      * the /model picker (rows numbered, but with no question line above).
+    What they share is their LAST line: a `·`-separated key-hint list carrying
+    "Esc to cancel" ("Enter to select · ↑/↓ to navigate · Esc to cancel"). The
+    numbered permission dialog ends the same way ("Esc to cancel · Tab to
+    amend"), as does the trust modal.
+
+    Never wording alone (agent.md): the item must be the bottom of the screen,
+    where only the TUI's own chrome lives while it runs — conversation text,
+    tool output and `!` output all draw ABOVE the composer — and no composer
+    footer (Claude's mode marker, qwen's) may be among those lines. A whole
+    `·`-item must read "Esc to cancel", so qwen's busy spinner "(… · esc to
+    cancel)" is not one."""
+    if not cap:
+        return False
+    lines = [_PANE_SCROLLBAR_RE.sub("", line).strip()
+             for line in _ANSI_RE.sub("", cap).splitlines()]
+    # Only what sits below the last rule: a dialog's footer is never split by
+    # one, while the composer is boxed in rules — so a footer-replacing toast
+    # ("Press Ctrl-C again to exit", which hides the mode marker) cannot reach
+    # back past the composer to a reply line that quotes the footer.
+    last_rule = max((i for i, line in enumerate(lines)
+                     if line and PANE_PROMPT_RULE_RE.match(line)), default=-1)
+    tail = [line for line in lines[last_rule + 1:] if line][-_DIALOG_HINT_LINES:]
+    joined = " ".join(tail)
+    if not tail or PANE_MODE_RE.search(joined) or QWEN_PANE_FOOTER_RE.search(joined):
+        return False
+    # Each line's own items, plus the seam a wrap makes: the last item of one
+    # line run on into the first of the next. Joining the lines whole would glue
+    # the text above the footer ("Accept  Decline") onto its first item.
+    items, prev = [], None
+    for line in tail:
+        parts = line.split("·")
+        items.extend(parts)
+        if prev is not None:
+            items.append(prev + " " + parts[0])
+        prev = parts[-1]
+    return any(" ".join(item.split()).lower() == "esc to cancel" for item in items)
+
+
 def _pane_blocking_dialog(cap):
     """Whether ANY dialog owns this pane's keyboard, so nothing may type into it.
 
-    ONE predicate for the two shapes, rather than each caller re-deriving it:
+    ONE predicate for the three shapes, rather than each caller re-deriving it:
       * the numbered choice dialog `parse_pane_prompt` reads (tool permission,
         plan approval) — answered by typing a digit;
       * the trust-folder modal `_trust_dialog_up` reads — arrow-driven, invisible
-        to every other pane read, and fatal to the session if Entered (XERK-868).
-    Keeping the second OUT of `parse_pane_prompt` is deliberate: `panePrompt` is
-    a wire contract whose options the chat page renders as clickable digits, and
-    the trust modal has no digit to click — surfacing it there would offer the
-    operator a button that does nothing."""
-    return bool(parse_pane_prompt(cap)) or _trust_dialog_up(cap)
+        to every other pane read, and fatal to the session if Entered (XERK-868);
+      * any other overlay dialog, read off its key-hint footer
+        (`_hint_dialog_up`: the native AskUserQuestion picker, an MCP
+        elicitation, the project MCP-server approval — XERK-2142).
+    Keeping the last two OUT of `parse_pane_prompt` is deliberate: `panePrompt`
+    is a wire contract whose options the chat page renders as clickable digits,
+    and these have no digit to click (or, for the picker, digits that a
+    free-text row and a multi-question tab bar make unsafe to offer) —
+    surfacing them there would offer the operator a button that does nothing."""
+    return (bool(parse_pane_prompt(cap)) or _trust_dialog_up(cap)
+            or _hint_dialog_up(cap))
 
 
 def _answer_trust_dialog(tmux_name, cap=None):
@@ -19051,19 +19122,22 @@ def turn_state_stopped(session_id, claude_sid):
     return bool(data) and data.get("stopped") is True
 
 
-def fold_turn_state(report, turn):
+def fold_turn_state(report, turn, dialog=False):
     """Fold the bridge mod's turn signal into `report["paneBusy"]`, in place.
 
     It only ever RAISES the read to busy, never lowers it: the pane also shows
     busy for work that is no model turn (a compaction, a `!` command), and the
     pane stays the source for everything else it reads. It is skipped while a
-    blocking dialog is up (`panePrompt`) — the turn is technically running then,
-    but every consumer reads that dialog as the session waiting on a person — and
+    blocking dialog is up (`panePrompt`, or `dialog`: one that never becomes a
+    panePrompt, like an MCP elicitation, XERK-2142) — the turn is technically
+    running then, but every consumer reads that dialog as the session waiting on
+    a person — and
     over a pane that reads idle once the transcript has been quiet for
     TURN_STATE_QUIET_SEC, so a lost turn.complete cannot hold a session busy.
     That bound holds over a pane that could not be read (None) too: a capture
     failing every beat must not make a stale "running" permanent."""
-    if turn is not True or report.get("paneBusy") is True or report.get("panePrompt"):
+    if (turn is not True or report.get("paneBusy") is True
+            or report.get("panePrompt") or dialog):
         return
     age = report.get("transcriptAgeSec")
     if age is None or age >= TURN_STATE_QUIET_SEC:
@@ -19861,7 +19935,8 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # The bridge mod's turn signal (XERK-2131): Claude sessions only — dsh
         # and qwen load no Claude mod, and dsh's paneBusy is its socket's.
         if agent_type in (None, "", "claude"):
-            fold_turn_state(report, read_turn_state(session_id, claude_sid))
+            fold_turn_state(report, read_turn_state(session_id, claude_sid),
+                            dialog=state.get("paneDialog") is True)
         # Every beat, not just the one that judged it: if that beat raised,
         # the record would otherwise never latch qaPartial (XERK-1857).
         if state.get("qaComplete") is False:
@@ -33998,6 +34073,14 @@ class SessionManager:
             self.save()
             log(f"set model of {sid} -> {arg}: turn in flight; deferred until idle")
             return
+        if _dialog_up(tmux_name):
+            # A dialog owns the keyboard: "/model" + Enter would answer it — an
+            # Enter on a permission dialog approves "1. Yes" (XERK-2142 QA).
+            # Deferred the same way; _apply_pending_switches waits it out too.
+            sess["pendingModel"] = arg
+            self.save()
+            log(f"set model of {sid} -> {arg}: a dialog is up; deferred until it closes")
+            return
         sess.pop("pendingModel", None)
         _pane_send_keys(tmux_name, "C-u")
         _pane_send_keys(tmux_name, "/model", literal=True)
@@ -41240,9 +41323,11 @@ class SessionManager:
                     self._cheap_forget("nudge_reads", lambda k: k != sid)
                     continue
             else:
-                busy, _mode, prompt = _pane_status(
-                    sess.get("tmuxName"), self.sess_state.setdefault(sid, {}))
-                if busy is not False or prompt is not None:
+                pstate = self.sess_state.setdefault(sid, {})
+                busy, _mode, prompt = _pane_status(sess.get("tmuxName"), pstate)
+                # Any dialog, not only a panePrompt: an MCP elicitation or the
+                # native picker is the session waiting on a person (XERK-2142).
+                if busy is not False or prompt is not None or pstate.get("paneDialog"):
                     self._cheap_forget("nudge_reads", lambda k: k != sid)
                     continue
             # "Working" is paneBusy OR live background agents (XERK-245): a

@@ -356,6 +356,13 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     ended the session (XERK-868). **`_pane_blocking_dialog` is the predicate a typing guard uses**
     (`parse_pane_prompt` OR `_trust_dialog_up`); `parse_pane_prompt`'s four conditions are unchanged
     and the modal deliberately never becomes a `panePrompt`. Full rule: `agent-sessions.md`.
+  - **Nor are the dialogs read off their key-hint footer** (`_hint_dialog_up`, XERK-2142): the
+    native AskUserQuestion picker (a description under each option breaks the 1..N run), an MCP
+    elicitation form, the project MCP-server approval. Each ends with a `·`-list holding the item
+    "Esc to cancel" as the pane's LAST lines, below the last rule, with no composer footer there.
+    Position + whole item, never the wording alone: conversation text draws above the composer, and
+    the rule cut keeps a footer-hiding toast ("Press Ctrl-C again to exit") from reaching past it. Frames: 2.1.306, in
+    `TestHintDialogIsABlockingDialog`. They stay out of `panePrompt` (no digit to offer).
 
 ## PR status, comment delivery and conflict nudges
 
