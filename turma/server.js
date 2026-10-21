@@ -19879,12 +19879,13 @@ const server = http.createServer(async (req, res) => {
         // the reader actually sets — `overloaded` was never set by anything.
         //
         // Unlike the rendered route, this 413 is deliberately NOT recorded with
-        // noteArchiveRefusal (XERK-1888): an agent reads at most
-        // ARCHIVE_RAW_CHUNK_MAX before gzipping, which can't outgrow the 64 KiB
-        // slack, so only a non-conforming client reaches it; under HA a follower
-        // refuses it itself (stateless, forward.js), so a leader-side record
-        // would miss most; and the record is read only by 404s the rendered row
-        // answers, and is wiped by that row's next stored chunk.
+        // noteArchiveRefusal (XERK-1888): an agent reads at most 4 MiB
+        // (hub-agent's ARCHIVE_RAW_CHUNK_BYTES = ARCHIVE_RAW_CHUNK_MAX here)
+        // before gzipping, which can't outgrow the 64 KiB slack, so only a
+        // non-conforming client reaches it; under HA a follower refuses a
+        // declared-length one itself (stateless, forward.js), so a leader-side
+        // record would miss those; and the record is keyed like the rendered
+        // row's, whose next stored chunk wipes it.
         if (e && e.tooLarge) return refuseArchiveBody(req, res, 413, { error: e.message }, refusedPaused(e));
         if (e && e.budgetExceeded) return refuseArchiveBody(req, res, 503, { error: e.message }, true);
         return json(res, 400, { error: "could not read body" });

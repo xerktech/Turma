@@ -35904,7 +35904,7 @@ class TestCollectAzure(unittest.TestCase):
         self.assertEqual(by["2"]["epicKey"], "5")
         self.assertTrue(by["5"]["isEpic"])
         self.assertIsNone(by["5"]["epicKey"])
-        self.assertEqual(fetched[-1], ("100", "System.Id,System.WorkItemType"))
+        self.assertEqual(fetched[-1], ("100", "System.Id,System.WorkItemType,System.TeamProject"))
         self.assertEqual(len(fetched), 2)
 
     def test_parent_type_fetch_failure_degrades_xerk1444(self):
@@ -35965,6 +35965,7 @@ class TestCollectAzure(unittest.TestCase):
             items, [("Initiatives", "Initiative"), ("Épopées", "Épopée")], calls)
         with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
              mock.patch.object(ha, "_AZDO_PARENT_TYPE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PARENT_PROJECT_CACHE", {}), \
              mock.patch.object(ha, "_AZDO_PORTFOLIO_CACHE", {}), \
              mock.patch.object(ha, "azure_req", req):
             by = {t["key"]: t for t in ha.collect_azure()["tickets"]}
@@ -35976,6 +35977,39 @@ class TestCollectAzure(unittest.TestCase):
         self.assertEqual(by["4"]["epicKey"], "1")
         self.assertEqual(calls, ["/Proj/_apis/work/processconfiguration"],
                          "read once per project, then cached")
+
+    def test_portfolio_levels_are_judged_per_project_xerk1888(self):
+        # X has a custom "Initiative" level; Y's ordinary "Initiative" type is
+        # not one there. A parent in a third project Z (no assigned item) is
+        # judged by Z's own process, which is read too.
+        items = [
+            _azure_wi(1, "Active", wtype="Initiative", project="X"),
+            _azure_wi(2, "Active", wtype="Initiative", project="Y"),
+            _azure_wi(3, "Active", wtype="Task", project="Y", **{"System.Parent": 2}),
+            _azure_wi(4, "Active", wtype="Task", project="X", **{"System.Parent": 900}),
+        ]
+        levels = {"X": ["Initiative", "Epic"], "Y": ["Epic", "Feature"],
+                  "Z": ["Thème"]}
+        base = self._fake_req(items)
+
+        def req(path, params, body=None):
+            if path.endswith("/_apis/work/processconfiguration"):
+                proj = urllib.parse.unquote(path.split("/")[1])
+                return {"portfolioBacklogs": [
+                    {"workItemTypes": [{"name": n}]} for n in levels[proj]]}
+            if path == "/_apis/wit/workitems" and params["ids"] == "900":
+                return {"value": [_azure_wi(900, "New", wtype="Thème", project="Z")]}
+            return base(path, params, body)
+        with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PARENT_TYPE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PARENT_PROJECT_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PORTFOLIO_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            by = {t["key"]: t for t in ha.collect_azure()["tickets"]}
+        self.assertTrue(by["1"]["isEpic"])
+        self.assertFalse(by["2"]["isEpic"], "not a portfolio level in its own project")
+        self.assertIsNone(by["3"]["epicKey"])
+        self.assertEqual(by["4"]["epicKey"], "900")
 
     def test_portfolio_read_failure_keeps_the_english_floor_xerk1888(self):
         items = [_azure_wi(1, "Active", wtype="Initiative"),

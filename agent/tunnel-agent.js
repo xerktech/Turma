@@ -2342,9 +2342,11 @@ function startWatch(sessionId, worktreePath, transcriptId) {
   if (!worktreePath) return nackWatch(sessionId, "no worktree path");
   const existing = watchers.get(sessionId);
   if (existing) {
-    // A re-armed watch (control-channel flap) carries the hub's current view of
-    // where this session's transcript is; a restart-clear-context moves it, so
-    // take the newer answer rather than keeping the one we started with.
+    // A re-armed watch (a second viewer, or the hub's rearmMovedWatches; a
+    // control-channel flap stops every watch, so it starts fresh) carries the
+    // hub's current view of where this session's transcript is; a
+    // restart-clear-context moves it, so take the newer answer rather than
+    // keeping the one we started with.
     const moved = existing.worktreePath !== worktreePath
       || existing.transcriptId !== (transcriptId || null);
     existing.worktreePath = worktreePath;

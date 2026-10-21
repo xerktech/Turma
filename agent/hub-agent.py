@@ -21482,21 +21482,25 @@ def _azure_note_portfolio(site_key, projects):
             names, now + (AZDO_META_TTL_SEC if names else AZDO_META_RETRY_SEC))
 
 
-def _azure_portfolio_names(site_key):
-    """Every portfolio type name known for this org, across its projects —
-    unioned so a parent in another project of the org still reads as one."""
+def _azure_portfolio_names(site_key, project=None):
+    """The portfolio type names for one project (its process may differ from a
+    sibling's, so a name that is a level THERE is not one HERE). With no project
+    to judge by, every project of the org is unioned — erring toward organizer,
+    the safe side of the auto-merge gate."""
     out = set(_AZDO_EPIC_TYPES)
-    for (sk, _project), (names, _exp) in list(_AZDO_PORTFOLIO_CACHE.items()):
-        if sk == site_key:
+    for (sk, pr), (names, _exp) in list(_AZDO_PORTFOLIO_CACHE.items()):
+        if sk == site_key and (project is None or pr == project):
             out |= names
     return out
 
 
-def _azure_is_epic_type(wtype, site_key=None):
+def _azure_is_epic_type(wtype, site_key=None, project=None):
     """True when a System.WorkItemType names an ADO portfolio level. Total."""
     if not isinstance(wtype, str):
         return False
-    names = _azure_portfolio_names(site_key) if site_key else _AZDO_EPIC_TYPES
+    names = (_azure_portfolio_names(site_key, project if isinstance(project, str)
+                                    and project else None)
+             if site_key else _AZDO_EPIC_TYPES)
     return wtype.strip().lower() in names
 
 
@@ -21521,9 +21525,10 @@ def _shape_azure_item(wi, site_key, base, parent_types=None):
     labels = [t.strip() for t in str(tags).split(";") if t.strip()] if tags else []
     parent = f.get("System.Parent")
     parent_key = str(parent) if parent is not None else None
-    is_epic = _azure_is_epic_type(wtype, site_key)
+    is_epic = _azure_is_epic_type(wtype, site_key, project)
     parent_is_epic = bool(parent_key) and _azure_is_epic_type(
-        (parent_types or {}).get(parent_key), site_key)
+        (parent_types or {}).get(parent_key), site_key,
+        _AZDO_PARENT_PROJECT_CACHE.get(parent_key))
     return {
         "key": key,
         "url": _azure_item_url(base, project, key),
@@ -21577,27 +21582,38 @@ def _azure_batch_get(ids, fields):
 # be enough to do that (XERK-1444). Bounded: cleared when it outgrows the cap.
 _AZDO_PARENT_TYPE_CACHE = {}
 _AZDO_PARENT_TYPE_CACHE_MAX = 5000
+# work item key -> System.TeamProject, for the items above, so a parent is judged
+# by ITS project's portfolio levels (XERK-1888); unknown = the org-wide union.
+_AZDO_PARENT_PROJECT_CACHE = {}
 
 
-def _remember_azure_types(types):
+def _remember_azure_types(types, projects=None):
     fresh = {k: v for k, v in types.items() if isinstance(v, str)}
     if len(_AZDO_PARENT_TYPE_CACHE.keys() | fresh.keys()) > _AZDO_PARENT_TYPE_CACHE_MAX:
         _AZDO_PARENT_TYPE_CACHE.clear()
     _AZDO_PARENT_TYPE_CACHE.update(fresh)
+    fresh_p = {k: v for k, v in (projects or {}).items() if isinstance(v, str) and v}
+    if len(_AZDO_PARENT_PROJECT_CACHE.keys() | fresh_p.keys()) > _AZDO_PARENT_TYPE_CACHE_MAX:
+        _AZDO_PARENT_PROJECT_CACHE.clear()
+    _AZDO_PARENT_PROJECT_CACHE.update(fresh_p)
 
 
-def _azure_parent_types(parent_ids, known=None):
+def _azure_parent_types(parent_ids, known=None, known_projects=None):
     """{parent key: System.WorkItemType} for `parent_ids`, GETting only the ones
     not already in `known` (the caller's own batch). Best-effort per chunk: a
     failed chunk falls back to the last-known types, else leaves those parents
     unknown (-> no epicKey) rather than losing the board."""
     types = dict(known or {})
+    projects = dict(known_projects or {})
     missing = sorted({str(p) for p in parent_ids if p is not None} - set(types))
     for i in range(0, len(missing), AZDO_BATCH):
         chunk = missing[i:i + AZDO_BATCH]
         try:
-            for wi in _azure_batch_get(chunk, ["System.Id", "System.WorkItemType"]):
-                types[str(wi["id"])] = (wi.get("fields") or {}).get("System.WorkItemType")
+            for wi in _azure_batch_get(
+                    chunk, ["System.Id", "System.WorkItemType", "System.TeamProject"]):
+                f = wi.get("fields") or {}
+                types[str(wi["id"])] = f.get("System.WorkItemType")
+                projects[str(wi["id"])] = f.get("System.TeamProject")
         except Exception as e:
             log(f"azure parent-type fetch failed: {e}")
     # Fall back BEFORE remembering: a cap-overflow clear must not empty the
@@ -21605,7 +21621,7 @@ def _azure_parent_types(parent_ids, known=None):
     for k in missing:
         if types.get(k) is None and k in _AZDO_PARENT_TYPE_CACHE:
             types[k] = _AZDO_PARENT_TYPE_CACHE[k]
-    _remember_azure_types(types)
+    _remember_azure_types(types, projects)
     return types
 
 
@@ -21614,12 +21630,16 @@ def fetch_azure_items(ids, site_key, base):
     extra type-only GET so an Epic/Feature parent sets `epicKey` (XERK-1444),
     and each project's portfolio levels are read (cached) first (XERK-1888)."""
     raw = _azure_batch_get(ids, _AZDO_LIST_FIELDS)
-    _azure_note_portfolio(
-        site_key, [(wi.get("fields") or {}).get("System.TeamProject") for wi in raw])
     known = {str(wi["id"]): (wi.get("fields") or {}).get("System.WorkItemType")
              for wi in raw}
-    parent_types = _azure_parent_types(
-        [(wi.get("fields") or {}).get("System.Parent") for wi in raw], known)
+    known_projects = {str(wi["id"]): (wi.get("fields") or {}).get("System.TeamProject")
+                      for wi in raw}
+    parent_ids = [(wi.get("fields") or {}).get("System.Parent") for wi in raw]
+    parent_types = _azure_parent_types(parent_ids, known, known_projects)
+    # Every project an item OR its parent lives in: a parent in a project no
+    # assigned item lives in has its own process, read too.
+    _azure_note_portfolio(site_key, list(known_projects.values()) + [
+        _AZDO_PARENT_PROJECT_CACHE.get(str(p)) for p in parent_ids if p is not None])
     return [_shape_azure_item(wi, site_key, base, parent_types) for wi in raw]
 
 

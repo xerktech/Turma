@@ -2952,6 +2952,12 @@ test("live tail: a re-arm onto a moved transcript drops the old one's live agent
   try {
     mod.startWatch("sess-moved", work, oldTid);
     await waitForCond(() => frames.some((f) => (f.agents || []).length === 1));
+    // A SAME-transcript re-arm (a second viewer) keeps what the scan knows.
+    frames.length = 0;
+    mod.startWatch("sess-moved", work, oldTid);
+    await waitForCond(() => frames.length >= 1);
+    assert.deepEqual(frames[frames.length - 1].agents.map((a) => a.label), ["Build"],
+      "a plain re-arm keeps the live agents");
     frames.length = 0;
     mod.startWatch("sess-moved", work, newTid);
     await waitForCond(() => frames.length >= 1);

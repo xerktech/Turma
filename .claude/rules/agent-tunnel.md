@@ -42,7 +42,8 @@ Python side in `.claude/rules/agent.md`.
   silent forever: no delta is ever due while the transcript holds still.
 - **A re-arm onto a MOVED transcript (or worktree) drops the old `agentState` and re-seeds it**
   (XERK-1888): a restart-clear-context relaunch ended every background task, so carried rows are
-  phantoms. A plain re-arm (flap, second viewer) keeps it. Test: `a re-arm onto a moved transcript`.
+  phantoms. A same-transcript re-arm (a second viewer) keeps it; a flap never re-arms
+  (`stopAllWatches`, then a fresh start). Test: `a re-arm onto a moved transcript`.
 - **A watch the agent will not run is NACKed** (`nackWatch` → `{watchFailed, reason}`): no worktree
   path, or at `MAX_WATCHERS`. It used to be a log line on the host alone, so the hub kept reporting
   the session live-watched while the browser held an open, permanently silent socket — the one

@@ -33,7 +33,9 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   Feature is ADO's Jira-Epic level, and leaving it out lets its stories auto-merge unreviewed.
   - **The English names are a FLOOR, unioned with each project's own portfolio types** (XERK-1888,
     `_azure_note_portfolio`: `{project}/_apis/work/processconfiguration` → `portfolioBacklogs`),
-    so a localized process ("Épopée") or a custom level ("Initiative") is an organizer too. Read on
+    so a localized process ("Épopée") or a custom level ("Initiative") is an organizer too. Each
+    item is judged by ITS project's levels, a parent by its own (`_AZDO_PARENT_PROJECT_CACHE`;
+    unknown → the org-wide union, the safe side). Read on
     the poll's worker, cached like the type meta; the shaper only reads the cache (the beat's
     detail fetch adds no request). Never replace the floor with the read: a miss fails OPEN.
   - `epicKey` = `parentKey` ONLY when the parent's type is a portfolio level, and never on an
