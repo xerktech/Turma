@@ -91,10 +91,12 @@ Mirrors the glasses pure-core/adapter-shell split:
   `ServedContentType` (the loader's OkHttp interceptor) relabels text/plain / missing types, which
   Coil would otherwise replace with the URL extension's guess; it must change the BODY's type (read
   on a fetch) and the header (read on a disk-cache hit). Tests: `ServedContentTypeTest`.
-  - It labels by the type a BROWSER reads (`browserEssence`: last comma entry; a type ends at `;`,
-    whitespace or `(`), not OkHttp's parse, which fails on a space before `;` or a comma list —
+  - It labels by the type a BROWSER reads (`browserEssence`: last comma entry outside quotes,
+    `*/*` skipped; a type ends at `;`, whitespace or `(`), not OkHttp's parse, which fails on a space before `;` or a comma list —
     and Coil guesses for an unparseable header and any raw `text/plain…` prefix.
     Patching one header shape at a time broke the next three times; change the rule as a whole.
+  - Parity is claimed only for the header shapes `ServedContentTypeTest` pins (each checked in
+    Chrome); any other malformed header is unmeasured, and a mismatch there fails safe or static.
   - The loader's disk cache is its own directory (the old `image_cache` is deleted): entries cached
     before the relabel would otherwise keep rendering a text/plain `.svg`.
 

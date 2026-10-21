@@ -435,15 +435,30 @@ private class SvgDrawable(private val bitmap: Bitmap, private val w: Int, privat
 
 /**
  * The type a browser reads from a Content-Type header [raw], lowercased, or null for
- * none (rollup XERK-2109; measured against chrome-headless-shell): of a comma list the
- * LAST entry naming a type/subtype wins, and each entry's type ends at its first `;`,
- * whitespace or `(`. So `image/svg+xml , text/plain` is text/plain to Chrome, and
- * `text/plain, image/svg+xml` and `image/svg+xml x` are image/svg+xml.
+ * none (rollup XERK-2109; measured against chrome-headless-shell): of a comma list
+ * (split outside double quotes) the LAST entry holding a `/` wins, `*&#47;*` excepted, and
+ * each entry's type ends at its first `;`, whitespace or `(`. So `image/svg+xml ,
+ * text/plain` is text/plain to Chrome, and `text/plain, image/svg+xml`,
+ * `image/svg+xml x` and `image/svg+xml; a="x,text/plain"` are image/svg+xml.
  */
-internal fun browserEssence(raw: String?): String? =
-    raw?.split(',')
-        ?.map { it.trim().split(';', ' ', '\t', '(').first().lowercase() }
-        ?.lastOrNull { it.indexOf('/') in 1 until it.length - 1 }
+internal fun browserEssence(raw: String?): String? {
+    if (raw == null) return null
+    val entries = ArrayList<String>()
+    var quoted = false
+    var escaped = false
+    var start = 0
+    raw.forEachIndexed { i, c ->
+        when {
+            escaped -> escaped = false
+            quoted && c == '\\' -> escaped = true
+            c == '"' -> quoted = !quoted
+            !quoted && c == ',' -> { entries.add(raw.substring(start, i)); start = i + 1 }
+        }
+    }
+    entries.add(raw.substring(start))
+    return entries.map { it.trim().split(';', ' ', '\t', '(').first().lowercase() }
+        .lastOrNull { '/' in it && it != "*/*" }
+}
 
 /**
  * Makes the type Coil sees the type a browser reads (XERK-2109). A remote SVG must be
