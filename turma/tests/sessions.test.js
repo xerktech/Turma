@@ -2788,7 +2788,7 @@ test("ended pane: closed ingest and failed loads are not worded as 'not synced y
   const since = Date.now() - 3 * 86400e3;
   let html = await open(() => ({ ok: false, status: 404,
     json: async () => ({ error: "unknown transcript", ingestClosed: { since } }) }));
-  assert.match(html, /has not been accepting archive pushes since/);
+  assert.match(html, /has been reloading its archive index since/);
   assert.match(html, /3d ago/);
   assert.doesNotMatch(html, /within a few minutes/);
   assert.match(html, /Resume still works/);
@@ -2797,7 +2797,7 @@ test("ended pane: closed ingest and failed loads are not worded as 'not synced y
   html = await open(() => ({ ok: false, status: 404, json: async () => ({
     refused: { host: "nas", error: "too big" }, ingestClosed: { since } }) }));
   assert.match(html, /nas&rsquo;s last push/);
-  assert.match(html, /not been accepting archive pushes/);
+  assert.match(html, /reloading its archive index/);
 
   // A garbage `since` is not a date to print — fall back to plain not-here-yet.
   html = await open(() => ({ ok: false, status: 404,
@@ -3719,7 +3719,7 @@ test("trajectory pane: closed ingest and a refused push are not worded as 'syncs
   };
   const since = Date.now() - 3 * 86400e3;
   let html = await open({ error: "no trajectory for this session", ingestClosed: { since } });
-  assert.match(html, /has not been accepting archive pushes since/);
+  assert.match(html, /has been reloading its archive index since/);
   assert.doesNotMatch(html, /within a few beats/);
   page.els.trajScroll.dataset.loaded = "";
   html = await open({ error: "no trajectory for this session", refused: { host: "nas", error: "too big" } });

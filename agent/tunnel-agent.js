@@ -2377,16 +2377,34 @@ function nackWatch(sessionId, reason) {
   sendControl({ watchFailed: sessionId, reason });
 }
 
+function seedLiveAgents(sessionId, w) {
+  const seedPath = sessionTranscript(w.worktreePath, w.transcriptId);
+  if (seedPath && !restoreLiveAgents(sessionId, seedPath, w.agentState)) {
+    backscanLiveAgents(seedPath, w.agentState);
+  }
+}
+
 function startWatch(sessionId, worktreePath, transcriptId) {
   if (!sessionId) return;
   if (!worktreePath) return nackWatch(sessionId, "no worktree path");
   const existing = watchers.get(sessionId);
   if (existing) {
-    // A re-armed watch (control-channel flap) carries the hub's current view of
-    // where this session's transcript is; a restart-clear-context moves it, so
-    // take the newer answer rather than keeping the one we started with.
+    // A re-armed watch (a second viewer, or the hub's rearmMovedWatches; a
+    // control-channel flap stops every watch, so it starts fresh) carries the
+    // hub's current view of where this session's transcript is; a
+    // restart-clear-context moves it, so take the newer answer rather than
+    // keeping the one we started with.
+    const moved = existing.worktreePath !== worktreePath
+      || existing.transcriptId !== (transcriptId || null);
     existing.worktreePath = worktreePath;
     existing.transcriptId = transcriptId || null;
+    // A moved transcript is a NEW conversation (restart-clear-context relaunches
+    // claude, which ends every background task it had), so the old one's live
+    // agents are phantoms here: start the scan over from the new file.
+    if (moved) {
+      existing.agentState = { live: new Map(), tasks: new Map() };
+      seedLiveAgents(sessionId, existing);
+    }
     // A restart-clear-context may also have recreated the dsh events log (fresh
     // launch truncates it), so re-detect the runtime; the offset reset in
     // pollDshTurn handles a rewritten file.
@@ -2440,10 +2458,7 @@ function startWatch(sessionId, worktreePath, transcriptId) {
   // Seed the live agents from the manager's published scan (XERK-1587), else
   // from the same window its restart back-scan reads (XERK-1421) — never just
   // the per-poll tail; the tail's re-fold of the same lines is idempotent.
-  const seedPath = sessionTranscript(worktreePath, w.transcriptId);
-  if (seedPath && !restoreLiveAgents(sessionId, seedPath, w.agentState)) {
-    backscanLiveAgents(seedPath, w.agentState);
-  }
+  seedLiveAgents(sessionId, w);
   watchers.set(sessionId, w);
   w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
   armTranscriptWatch(sessionId, w);
