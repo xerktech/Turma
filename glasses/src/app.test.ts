@@ -1466,6 +1466,22 @@ describe("App", () => {
       expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "C", sessionId: "s5", text: "travel" }]);
     });
 
+    it("a stopped-hop cycle behind a running target ends, and a move survives a later empty hop", async () => {
+      fleet = [agent({ key: "B", sessions: [session({ id: "s9" }), session({ id: "s2" })] })];
+      const app = await boot();
+      app.enterSession("s9", "B");
+      dictate("fromB");
+      app.enterSession("s2");
+      // C runs, from B (stopped, holding the draft), from A (stopped, none), from B again.
+      fleet = [
+        agent({ key: "A", sessions: [session({ id: "s1", status: "stopped", migratedFrom: { host: "B", sessionId: "s9" } })] }),
+        agent({ key: "B", sessions: [session({ id: "s9", status: "stopped", migratedFrom: { host: "A", sessionId: "s1" } }), session({ id: "s2" })] }),
+        agent({ key: "C", sessions: [session({ id: "s5", migratedFrom: { host: "B", sessionId: "s9" } })] }),
+      ];
+      await poll(); // without the walk's `seen` bound this never returns
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "C", sessionId: "s5", text: "fromB" }]);
+    });
+
     it("a moved answer meeting one already at the target joins it, or is kept as a stale prompt", async () => {
       const ask = (q: string) => signals({ question: q, questionOptions: ["Yes", "No"] });
       const moveWith = async (srcFor: string) => {
