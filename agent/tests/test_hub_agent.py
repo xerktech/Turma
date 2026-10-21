@@ -10716,6 +10716,10 @@ class TestModelSwitchConfirm(unittest.TestCase):
         self.assertFalse(landed(stale + composer, stale + composer, "Sonnet 5.5"))
         self.assertTrue(landed(stale + composer, stale + new + composer,
                                "Sonnet 5.5"))
+        # A prompt with text, or a tool result, after it: not settled.
+        self.assertFalse(ha._model_set_lines(stale + "❯ do the thing\n")[-1][1])
+        self.assertFalse(ha._model_set_lines(stale + "  ⎿  Read 3 files\n")[-1][1])
+        self.assertTrue(ha._model_set_lines(stale + composer)[-1][1])
         # A settled line naming another model is not this switch.
         self.assertFalse(landed(turn + composer, turn + new + composer, "Haiku 5.5"))
 
@@ -20617,6 +20621,34 @@ class _PickerPane:
         return self.history + "❯ \n  ? for shortcuts"  # idle; deliberately no mode marker
 
 
+class _DraftPane(_PickerPane):
+    """A picker pane whose idle composer is boxed in rules and holds a draft;
+    each Ctrl+U clears its last row, as Claude Code's does (XERK-2157 QA)."""
+
+    def __init__(self, draft, deaf=False, **kw):
+        super().__init__(**kw)
+        self.draft = list(draft)
+        self.deaf = deaf                # a placeholder: Ctrl+U changes nothing
+
+    def key(self, key):
+        if key == "C-u" and not self.deaf and not (self.open or self.asking):
+            if self.draft:
+                self.draft.pop()
+            return
+        if key == "Enter" and not self.open and self.draft and not self.deaf:
+            self.submitted = list(self.draft)   # "/model" sent glued to it
+            return
+        super().key(key)
+
+    def capture(self):
+        if self.open or self.asking or self.confirmed:
+            return super().capture()
+        rule = "─" * 40 + "\n"
+        rows = self.draft or [""]
+        body = "".join(("❯ " if i == 0 else "  ") + r + "\n" for i, r in enumerate(rows))
+        return self.history + rule + body + rule + "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+
+
 class _ModePane:
     """A footer-mode pane simulator for set_mode's closed loop: BTab advances
     through `cycle`, capture() shows the current mode's real footer marker."""
@@ -20869,6 +20901,53 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         sess = self._session(sm, model="opus")
         sm.set_model("abcde", "sonnet")
         self.assertEqual(sess["model"], "sonnet")
+
+    def test_set_model_clears_every_row_of_a_multi_line_draft(self):
+        # XERK-2157 QA: one Ctrl+U cleared only the last row, and "/model" +
+        # Enter then submitted the rest of the draft as a prompt.
+        pane = _DraftPane(["my draft line one\\", "second line", "third"])
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(pane.draft, [])
+        self.assertFalse(hasattr(pane, "submitted"))
+        self.assertEqual(self._keys()[:4], ["C-u", "C-u", "C-u", "/model"])
+        self.assertEqual(sess["model"], "sonnet")
+
+    def test_set_model_goes_on_past_a_placeholder_ctrl_u_cannot_change(self):
+        pane = _DraftPane(['Try "fix the lint errors"'], deaf=True)
+        sm = self.make_manager(pane=pane)
+        self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys()[:3], ["C-u", "C-u", "/model"])
+
+    def test_set_model_defers_a_draft_that_will_not_clear(self):
+        pane = _DraftPane([f"row {i}" for i in range(ha.MODEL_CLEAR_MAX_PRESSES + 5)])
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertNotIn("/model", self._keys())
+        self.assertEqual(sess["pendingModel"], "sonnet")
+
+    def test_set_model_never_confirms_off_a_picker_still_drawn(self):
+        # XERK-2157 QA: with the pane scrolled up beforehand, a line above the
+        # still-open picker read as new although `s` never landed.
+        class Dropped(_PickerPane):
+            def key(self, key):
+                if key != "s":
+                    super().key(key)
+
+            def capture(self):
+                cap = super().capture()
+                if self.open:
+                    return ("  ⎿  Set model to Sonnet for this session only\n" + cap)
+                return cap
+        sm = self.make_manager(pane=Dropped())
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(sess["model"], "opus")
+        self.assertEqual(self._keys()[-1], "Escape")    # backed out of the picker
+        self.assertFalse(self.pane.open)
 
     def test_set_model_needs_the_line_to_name_the_target(self):
         pane = _PickerPane()

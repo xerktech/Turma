@@ -24398,6 +24398,9 @@ MODEL_PICKER_MAX_STEPS = 12
 MODEL_STEP_TRIES = 8
 MODEL_STEP_WAIT_SEC = 0.12
 MODEL_CONFIRM_TRIES = 15
+# Ctrl+U clears one composer row a press, so a multi-line draft takes several;
+# set_model presses until the composer stops changing, at most this many.
+MODEL_CLEAR_MAX_PRESSES = 20
 MODEL_CONFIRM_WAIT_SEC = 0.2
 # What the TUI prints once a picker selection lands (session-only or saved
 # default) or is dismissed on the current model: "Set model to Sonnet 5.5 for
@@ -24580,6 +24583,14 @@ def _model_switch_landed(before, after, label):
     if not now or not now[-1][1] or not _model_names_row(now[-1][0], label):
         return False
     return not (was and was[-1][1] and _model_names_row(was[-1][0], label))
+
+
+def _model_picker_open(cap):
+    """Whether the /model picker is drawn: its rows parse and the composer's
+    mode footer, which the picker hides, is not on screen. Its own key-hint
+    footer is not required — a narrow pane pushes it off-screen."""
+    return bool(parse_model_picker(cap)[0]
+                and not PANE_MODE_RE.search(_ANSI_RE.sub("", cap or "")))
 
 
 def _model_names_row(name, label):
@@ -34359,7 +34370,13 @@ class SessionManager:
             log(f"set model of {sid} -> {arg}: a dialog is up; deferred until it closes")
             return
         sess.pop("pendingModel", None)
-        _pane_send_keys(tmux_name, "C-u")
+        if not self._clear_model_composer(tmux_name):
+            # A draft that would not clear: "/model" + Enter would submit it
+            # with "/model" glued on, as a prompt (XERK-2157 QA). Retry later.
+            sess["pendingModel"] = arg
+            self.save()
+            log(f"set model of {sid} -> {arg}: the composer would not clear; deferred")
+            return
         _pane_send_keys(tmux_name, "/model", literal=True)
         _pane_send_keys(tmux_name, "Enter")
         rows, cur = [], None
@@ -34426,6 +34443,27 @@ class SessionManager:
             log(f"set model of {sid} -> {arg}: selection sent but no "
                 f"confirmation read; record unchanged (modelActual will settle it)")
 
+    def _clear_model_composer(self, tmux_name):
+        """Clear the composer before typing "/model": Ctrl+U until it stops
+        changing. One press clears only the last row of a multi-line draft, so
+        one press left the rest to be submitted with "/model" glued on. A press
+        that changes nothing means it is empty (or shows only a placeholder);
+        an unreadable composer keeps the old single press. False when it is
+        still changing after MODEL_CLEAR_MAX_PRESSES."""
+        _pane_send_keys(tmux_name, "C-u")
+        prev = None
+        for _ in range(MODEL_CLEAR_MAX_PRESSES):
+            time.sleep(MODEL_STEP_WAIT_SEC)
+            rows = _composer_rows(_capture_pane(tmux_name))
+            if rows is None:
+                return True
+            text = " ".join(" ".join(rows).split()).lstrip("❯").strip()
+            if not text or text == prev:
+                return True
+            prev = text
+            _pane_send_keys(tmux_name, "C-u")
+        return False
+
     def _await_picker_step(self, tmux_name, rows, prev_cur):
         """Poll the picker after an arrow press until the ❯ moves off prev_cur,
         returning the fresh (rows, cur). On timeout returns the LAST read even
@@ -34468,6 +34506,11 @@ class SessionManager:
                     _pane_send_keys(tmux_name, "1", literal=True)
                     answered = True
                 continue
+            # Not while the picker is still drawn: it sits at the bottom, so
+            # against a pane scrolled up (PgUp) beforehand a line above it can
+            # read as new although `s` never landed (XERK-2157 QA).
+            if _model_picker_open(cap):
+                continue
             if _model_switch_landed(before, cap, label):
                 return True
         self._back_out_of_model_picker(tmux_name)
@@ -34481,12 +34524,7 @@ class SessionManager:
             cap = _capture_pane(tmux_name)
             if not cap:
                 return
-            # The picker hides the composer and its mode footer; a narrow pane
-            # can push the picker's own footer off-screen, so that is not
-            # required.
-            picker = (parse_model_picker(cap)[0]
-                      and not PANE_MODE_RE.search(_ANSI_RE.sub("", cap)))
-            if parse_model_switch_confirm(cap) is None and not picker:
+            if parse_model_switch_confirm(cap) is None and not _model_picker_open(cap):
                 return
             _pane_send_keys(tmux_name, "Escape")
             time.sleep(MODEL_STEP_WAIT_SEC)
