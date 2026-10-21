@@ -10842,6 +10842,94 @@ class TestOverlayFootersAndShellMode(unittest.TestCase):
             "Yes, I trust this folder\nNo, exit\n  ! for shell mode\n"))
 
 
+# Live 2.1.307 frames (XERK-2148 delta QA). A permission dialog at 24 columns
+# whose option 2 wraps into rows of bare "▔" (the command's own text).
+_2148_PW_24 = (
+    "  ⎿  $ ./▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n     ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n\n"
+    + "─" * 24 + "\n"
+    " Bash command\n Run the user-specified\n command verbatim\n"
+    + "╌" * 24 + "\n"
+    " │ ./▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n │ ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
+    + "╌" * 24 + "\n"
+    " This command requires\n approval\n\n"
+    " Do you want to\n proceed?\n"
+    " ❯ 1. Yes\n"
+    "   2. Yes, and don’t ask\n      again for:\n"
+    "      ./▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n      ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
+    "   3. Yes, and switch to\n      auto mode · auto\n"
+    "      mode handles these\n      prompts for you\n"
+    "   4. No\n\n"
+    " Esc to cancel · Tab to\n amend\n"
+)
+# "Exit plan mode?" at 36 columns with a tmux tip inset into the ▔ edge row.
+_2148_EP_36 = (
+    "❯ Plan: create an empty file named\n  ep_probe.txt.\n\n"
+    " tmux detected · scroll with PgUp… ▔\n\n"
+    "  " + "─" * 32 + "\n"
+    "   Exit plan mode?\n\n"
+    "    Claude wants to exit plan\n    mode\n\n"
+    "    ❯ 1. Yes, and switch to\n         default (ask each time)\n"
+    "         for this session\n"
+    "      2. No\n"
+)
+# A 120x10 pane: the plan dialogs drawn down to option 1 only.
+_2148_EP_120x10 = (
+    "❯ Plan: create an empty file named ep_probe.txt.\n"
+    + "▔" * 20 + " tmux detected · scroll with PgUp/PgDn · or add 'set -g mouse\n\n"
+    "  " + "─" * 116 + "\n"
+    "   Exit plan mode?\n\n"
+    "    Claude wants to exit plan mode\n\n"
+    "    ❯ 1. Yes, and switch to default (ask each time) for this session\n"
+)
+_2148_PLAN_120x10 = (
+    "▔" * 17 + " tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf a\n\n"
+    "  " + "─" * 116 + "\n"
+    "   Ready to code?" + " " * 98 + "↓\n"
+    "  " + "─" * 116 + "\n"
+    "   Claude has written up a plan and is ready to execute. Would you like to proceed?\n\n"
+    "   ❯ 1. Yes, and use auto mode\n"
+)
+
+
+class TestPanePromptUnderTheEdge(unittest.TestCase):
+    """XERK-2148 delta QA: the ▔-edge reads that keep a dialog's digits out of
+    an overlay must neither veto a live dialog's own ▔ text nor miss an edge
+    row a tmux tip took over, and a dialog cut off below option 1 blocks."""
+
+    def test_a_wrapped_option_of_bare_edge_glyphs_still_reads(self):
+        p = ha.parse_pane_prompt(_2148_PW_24)
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3, 4])
+        self.assertTrue(ha._pane_blocking_dialog(_2148_PW_24))
+
+    def test_an_edge_row_a_tmux_tip_took_over_bounds_the_dialog(self):
+        p = ha.parse_pane_prompt(_2148_EP_36)
+        self.assertEqual(p["prompt"], "Exit plan mode?")
+        self.assertEqual(len(p["options"]), 2)
+        self.assertNotIn("ep_probe", p.get("detail", ""))   # transcript above the edge
+        self.assertTrue(ha._pane_blocking_dialog(_2148_EP_36))
+
+    def test_a_dialog_cut_after_option_one_blocks_without_a_panePrompt(self):
+        for cap in (_2148_EP_120x10, _2148_PLAN_120x10):
+            self.assertIsNone(ha.parse_pane_prompt(cap))
+            self.assertTrue(ha._pane_cut_dialog_up(cap))
+            self.assertTrue(ha._pane_blocking_dialog(cap))
+
+    def test_the_cut_read_needs_the_bottom_area(self):
+        # The same lines as a reply above a composer (no ▔ edge, the composer
+        # below), quoted under an edge with the composer's prompt, or an
+        # option the cursor is not on: none is a cut dialog.
+        reply = ("● Exit plan mode?\n\n    ❯ 1. Yes, and switch to default\n"
+                 + "─" * 40 + "\n❯ \n" + "─" * 40 + "\n  ⏸ manual mode on\n")
+        self.assertFalse(ha._pane_cut_dialog_up(reply))
+        self.assertFalse(ha._pane_blocking_dialog(reply))
+        self.assertFalse(ha._pane_cut_dialog_up(
+            "▔" * 40 + "\n❯ Exit plan mode?\n    ❯ 1. Yes\n"))
+        self.assertFalse(ha._pane_cut_dialog_up(
+            "▔" * 40 + "\n   Exit plan mode?\n      1. Yes\n"))
+        self.assertFalse(ha._pane_cut_dialog_up(
+            "▔" * 40 + "\n   A note, no question\n    ❯ 1. Yes\n"))
+
+
 # The /model picker on a 40x45 pane (2.1.306, trimmed): wrapped descriptions
 # push its key-hint footer off the bottom (XERK-2148).
 _2148_PICKER_40 = (

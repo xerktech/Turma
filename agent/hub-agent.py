@@ -14354,6 +14354,21 @@ PANE_PROMPT_SUBTITLE_LINES = 3
 # column 0: conversation and tool output are indented, so an indented ▔ line
 # quoted in a reply can never pose as it.
 PANE_PROMPT_EDGE_RE = re.compile(r"^▔{3}")
+# The same edge row once a tmux tip has taken it over, leaving only its last
+# "▔" at the pane's right edge (" tmux detected · scroll with PgUp… ▔", seen
+# after a fresh session's first turn, XERK-2148): counted only when the row
+# reaches the right edge (the widest line), as `_overlay_edge_rows` does.
+PANE_PROMPT_TIP_EDGE_RE = re.compile(r"^\s*\S.*\s▔\s*$")
+
+
+def _pane_prompt_edges(lines):
+    """The indexes of the bottom area's top-edge rows: a column-0 ▔ run, or a
+    row a tmux tip took over (`PANE_PROMPT_TIP_EDGE_RE`) at full width."""
+    widest = max((_pane_cells(line.rstrip()) for line in lines), default=0)
+    return {k for k, line in enumerate(lines)
+            if PANE_PROMPT_EDGE_RE.match(line)
+            or (PANE_PROMPT_TIP_EDGE_RE.match(line)
+                and _pane_cells(line.rstrip()) == widest)}
 # How far in from the pane's edge a dialog's box may end (XERK-2162: 2 cells).
 PANE_DIALOG_MARGIN = 4
 
@@ -14390,7 +14405,7 @@ def _pane_numbering_continues(lines, idx):
     return False
 
 
-def _pane_dialog_width(lines, idx, widest):
+def _pane_dialog_width(lines, idx, widest, edges=()):
     """The cells a dialog's text wraps at, for the option on line `idx`
     (XERK-2162): the right edge of the nearest box rule above it.
 
@@ -14400,7 +14415,7 @@ def _pane_dialog_width(lines, idx, widest):
     broke the run. Only a rule within `PANE_DIALOG_MARGIN` of the pane counts:
     a short rule in a diff or plan body is content, not the box."""
     for k in range(idx - 1, -1, -1):
-        if PANE_PROMPT_EDGE_RE.match(lines[k]):
+        if PANE_PROMPT_EDGE_RE.match(lines[k]) or k in edges:
             break
         if PANE_PROMPT_RULE_RE.match(lines[k]) and lines[k].strip():
             edge = _pane_cells(lines[k].rstrip())
@@ -14409,7 +14424,7 @@ def _pane_dialog_width(lines, idx, widest):
     return widest
 
 
-def _pane_under_edge(lines, idx):
+def _pane_under_edge(lines, idx, edges=()):
     """Whether the question above line `idx` sits in Claude Code's bottom area:
     above it only blanks, the question itself and box rules up to the ▔ edge
     (XERK-2162). A subtitle is accepted only there — a reply in the
@@ -14418,7 +14433,7 @@ def _pane_under_edge(lines, idx):
     seen_q = False
     for k in range(idx - 1, -1, -1):
         line = lines[k]
-        if PANE_PROMPT_EDGE_RE.match(line):
+        if PANE_PROMPT_EDGE_RE.match(line) or k in edges:
             return seen_q
         if not line.strip() or PANE_PROMPT_RULE_RE.match(line):
             continue
@@ -14495,6 +14510,7 @@ def parse_pane_prompt(cap, face=False):
     lines = [_PANE_SCROLLBAR_RE.sub("", l) for l in cap.splitlines()]
     widest = None                    # the pane's width, measured on first need
     edges = None                     # overlay edge rows, read on first need
+    area = _pane_prompt_edges(lines)  # the bottom area's top edge (tip rows too)
     if _pane_composer_tail_up(lines):
         return None                  # the toast or a cut footer: composer is live
     # A mode footer anywhere below means the composer is live -> no dialog.
@@ -14511,7 +14527,7 @@ def parse_pane_prompt(cap, face=False):
         # option's wrapped label lines (never a picker's description line).
         if widest is None:
             widest = max(_pane_cells(l.rstrip()) for l in lines)
-        width = _pane_dialog_width(lines, i, widest)
+        width = _pane_dialog_width(lines, i, widest, area)
         rows = []                    # (first, last) screen line of each option
         nxt = i                      # where the scan for the next option up starts
         last = _pane_option_wrap_end(lines, i, width)
@@ -14571,7 +14587,7 @@ def parse_pane_prompt(cap, face=False):
                 k -= 1
             if (0 <= k and not lines[k].strip()
                     and q - k <= PANE_PROMPT_SUBTITLE_LINES
-                    and _pane_under_edge(lines, k)):
+                    and _pane_under_edge(lines, k, area)):
                 # Joined into one line: its wrap moves with the pane's width.
                 subtitle = [" ".join(l.strip() for l in lines[k + 1:q + 1])]
                 q = k
@@ -14579,12 +14595,14 @@ def parse_pane_prompt(cap, face=False):
                     q -= 1
         if q < 0 or not lines[q].strip().endswith("?"):
             continue
-        # An overlay's "▔" top edge BELOW the question puts it in the
-        # conversation behind a footerless overlay (/model, /skills, /plugin):
-        # its digits would be typed into the overlay (XERK-2148 QA).
+        # An overlay's "▔" top edge BELOW the run puts it in the conversation
+        # behind a footerless overlay (/model, /skills, /plugin): its digits
+        # would be typed into the overlay (XERK-2148 QA). Below the LAST
+        # option row only: an option label wrapped at 12-24 columns can leave
+        # a row of bare "▔" inside the run (a path ending "./▔▔…").
         if edges is None:
             edges = _overlay_edge_rows(lines)
-        if any(e > q for e in edges):
+        if any(e > rows[-1][1] for e in edges):
             continue
         prompt = lines[q].strip()
         # Walk up for the fenced block above the question: skip blanks and rules
@@ -14592,12 +14610,13 @@ def parse_pane_prompt(cap, face=False):
         # `block` is the same walk with no line cap: the dialog's whole visible
         # body, hashed into `id` below.
         block = []
-        for line in reversed(lines[:q]):
+        for k in range(q - 1, -1, -1):
+            line = lines[k]
             text = line.strip()
             if not text:
                 continue         # a blank never closes the block (the TUI puts
                                  # one between a dialog's title and its body)
-            if PANE_PROMPT_EDGE_RE.match(line):
+            if PANE_PROMPT_EDGE_RE.match(line) or k in area:
                 break            # the bottom area's top edge: transcript above
             if PANE_PROMPT_RULE_RE.match(line):
                 if block:
@@ -18847,8 +18866,10 @@ def _pane_blocking_dialog(cap):
         all (`parse_model_switch_confirm`, XERK-2157): an Enter or a typed
         "1" answers Yes;
       * the /model picker itself read off its body (`_model_picker_open`), for
-        a pane too short to draw its footer (XERK-2148: 40x45 wraps it off).
-    Keeping the last three OUT of `parse_pane_prompt` is deliberate: `panePrompt`
+        a pane too short to draw its footer (XERK-2148: 40x45 wraps it off);
+      * a choice dialog cut off below its first option (`_pane_cut_dialog_up`:
+        a 10-row pane draws "Exit plan mode?" down to "❯ 1." only).
+    Keeping the last four OUT of `parse_pane_prompt` is deliberate: `panePrompt`
     is a wire contract whose options the chat page renders as clickable digits,
     and these have no digit to click (or, for the picker, digits that a
     free-text row and a multi-question tab bar make unsafe to offer) —
@@ -18856,7 +18877,52 @@ def _pane_blocking_dialog(cap):
     return (bool(parse_pane_prompt(cap)) or _trust_dialog_up(cap)
             or _hint_dialog_up(cap)
             or parse_model_switch_confirm(cap) is not None
-            or _model_picker_open(cap))
+            or _model_picker_open(cap)
+            or _pane_cut_dialog_up(cap))
+
+
+# How many wrapped label lines may follow the cut-off dialog's "❯ 1." row.
+_PANE_CUT_OPTION_WRAP_LINES = 4
+
+
+def _pane_cut_dialog_up(cap):
+    """Whether the pane's bottom is a choice dialog cut off after its first
+    option: a pane ~10 rows high draws "Exit plan mode?" / "Ready to code?"
+    down to "❯ 1. Yes, …" and no further (2.1.306, XERK-2148), so the 1..N run
+    `parse_pane_prompt` needs is never drawn — and a typed digit or Enter
+    still answers it. No panePrompt is offered: the other options are unseen.
+
+    Read by position: the last lines are "❯ 1." (the cursor on option 1) and
+    at most a few indented wraps of its label; above them, inside the bottom
+    area that starts at its ▔ top edge (`_pane_prompt_edges`, which a dialog
+    draws and a composer never does), a question line ending in "?"; and
+    nothing in that area is the composer's (its "❯" prompt at column 0, or
+    any composer footer)."""
+    if not cap:
+        return False
+    lines = [_PANE_SCROLLBAR_RE.sub("", line).rstrip()
+             for line in _ANSI_RE.sub("", cap).splitlines()]
+    filled = [k for k, line in enumerate(lines) if line.strip()]
+    for n, k in enumerate(reversed(filled)):
+        m = PANE_PROMPT_OPTION_RE.match(lines[k])
+        if m:
+            break
+        if n >= _PANE_CUT_OPTION_WRAP_LINES or not lines[k][:1].isspace():
+            return False
+    else:
+        return False
+    if not (m.group(1) and m.group(2) == "1" and lines[k][:1].isspace()):
+        return False
+    edge = max((e for e in _pane_prompt_edges(lines) if e < k), default=None)
+    if edge is None:
+        return False
+    area = lines[edge + 1:k]
+    text = "\n".join(area)
+    if (any(line.startswith("❯") for line in area)
+            or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
+            or PANE_SHELL_FOOTER_RE.search(text)):
+        return False
+    return any(line.strip().rstrip("↓ ").endswith("?") for line in area)
 
 
 def _answer_trust_dialog(tmux_name, cap=None):
