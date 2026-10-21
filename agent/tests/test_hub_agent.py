@@ -10750,6 +10750,31 @@ class TestOverlayFootersAndShellMode(unittest.TestCase):
             self.assertFalse(ha._hint_dialog_up(cap), name)
             self.assertFalse(ha._pane_blocking_dialog(cap), name)
 
+    def test_a_narrow_composer_under_an_edge_line_is_not_an_overlay(self):
+        # 9 columns (2.1.307): the composer rule is 9 cells, under the rule
+        # regex's 10, and the footer is cut to a bare "⏵⏵" — a reply line of
+        # "▔" above it is no overlay edge.
+        rule = "─" * 9 + "\n"
+        cap = ("● ▔▔▔▔▔▔▔\n  ▔▔▔▔▔\n✻ Cooked\n  for 1s\n"
+               + rule + "❯ \n" + rule + "  ⏵⏵\n")
+        self.assertFalse(ha._overlay_edge_up(cap.splitlines()))
+        self.assertFalse(ha._pane_blocking_dialog(cap))
+
+    def test_a_question_behind_a_footerless_overlay_is_no_pane_prompt(self):
+        # A reply shaped like a dialog, then /model drawn over the composer
+        # with its footer scrolled off: the reply's digits are not a dialog.
+        cap = ("● ▔▔▔▔▔▔▔▔▔▔▔▔\n  Pick one?\n  ❯ 1. Alpha\n    2. Beta\n\n"
+               + "▔" * 60 + "\n   Select model\n\n"
+               "     1.  Default (recommended)  Opus 5.5\n"
+               "   ❯ 2.  Opus 5.5 ✔             For complex work\n"
+               "     3.  Sonnet 5.5             Most efficient\n")
+        self.assertIsNone(ha.parse_pane_prompt(cap))
+        self.assertTrue(ha._pane_blocking_dialog(cap))
+        # The same reply above a live composer was never a dialog either.
+        self.assertIsNone(ha.parse_pane_prompt(
+            cap.split("▔" * 60)[0] + _2148_RULE + "❯ \n" + _2148_RULE
+            + "  ⏵⏵ auto mode on (shift+tab to cycle)\n"))
+
     def test_an_item_must_be_whole(self):
         self.assertFalse(ha._hint_dialog_up("double tap esc to clear input\n"))
         self.assertFalse(ha._hint_dialog_up("press ctrl+o to toggle it\n"))

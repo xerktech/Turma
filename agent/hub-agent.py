@@ -14494,6 +14494,7 @@ def parse_pane_prompt(cap, face=False):
     # legitimate rule/detail line is made of.
     lines = [_PANE_SCROLLBAR_RE.sub("", l) for l in cap.splitlines()]
     widest = None                    # the pane's width, measured on first need
+    edges = None                     # overlay edge rows, read on first need
     if _pane_composer_tail_up(lines):
         return None                  # the toast or a cut footer: composer is live
     # A mode footer anywhere below means the composer is live -> no dialog.
@@ -14577,6 +14578,13 @@ def parse_pane_prompt(cap, face=False):
                 while q >= 0 and not lines[q].strip():
                     q -= 1
         if q < 0 or not lines[q].strip().endswith("?"):
+            continue
+        # An overlay's "▔" top edge BELOW the question puts it in the
+        # conversation behind a footerless overlay (/model, /skills, /plugin):
+        # its digits would be typed into the overlay (XERK-2148 QA).
+        if edges is None:
+            edges = _overlay_edge_rows(lines)
+        if any(e > q for e in edges):
             continue
         prompt = lines[q].strip()
         # Walk up for the fenced block above the question: skip blanks and rules
@@ -18750,7 +18758,11 @@ def _overlay_edge_up(lines):
     return bool(body) and not (
         any(_COMPOSER_RULE_RE.match(line) or PANE_SHELL_FOOTER_RE.match(line)
             or PANE_EXIT_TOAST_RE.match(line) for line in body)
-        or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text))
+        or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
+        # A pane narrower than the rule regex's 10 cells draws a shorter
+        # composer rule and a width-cut footer (a bare "⏵⏵"): the composer
+        # all the same (XERK-2171's read).
+        or _pane_composer_tail_up(lines))
 
 
 def _pane_footer_lines(lines):
