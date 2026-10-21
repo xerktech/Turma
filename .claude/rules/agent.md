@@ -344,8 +344,13 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     Code 2.1.306's "Exit plan mode?" draws "Claude wants to exit plan mode" there, and requiring
     the question directly above made that live dialog read as an idle composer.
     - Blank-fenced on both sides, ≤ `PANE_PROMPT_SUBTITLE_LINES`, no `?`/rule/option line; it
-      joins `detail` and the id. Tests: `test_a_subtitle_between_question_and_options`,
-      `test_a_subtitle_needs_blank_fences_and_a_question`.
+      joins `detail` and the id as one line (its wrap moves with the width).
+    - That dialog's box ends 2 cells in from the pane, and its labels wrap there: wrap width is
+      the nearest box rule within `PANE_DIALOG_MARGIN` of the pane (`_pane_dialog_width`), else
+      the widest line. Below ~30 columns the TUI's own wrap drifts further; not covered.
+    - `detail` stops at the ▔ edge (`PANE_PROMPT_EDGE_RE`): above it is conversation, and its
+      effort badge (first seconds only) changed the id, so an answer stamped early was dropped.
+    - Tests: the `subtitle`/`effort_badge`/`short_rule` cases in `TestParsePanePrompt`.
   - **A wrapped label is rejoined; the AskUserQuestion picker is refused** (XERK-2150).
     - A wrap and a picker description sit on the same label-column indent, and a label that fills
       the pane makes them identical row by row — no per-line rule can split them.

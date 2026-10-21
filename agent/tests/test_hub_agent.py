@@ -20091,9 +20091,14 @@ PANE_FULL_WIDTH_WRAP_DIALOG = """\
  Esc to cancel · Tab to amend
 """
 
-# XERK-2162: Claude Code 2.1.306 at 44 columns, plan mode, asking to exit plan
-# mode with no plan file written — a subtitle line between question and options.
+# XERK-2162: Claude Code 2.1.306 in plan mode, asking to exit plan mode with no
+# plan file written — a subtitle line between question and options, and a box
+# drawn two columns in from the pane's edge. Real captures (44, 60, 36 columns),
+# trailing blanks trimmed; the conversation above the ▔ edge is kept.
 PANE_EXIT_PLAN_SUBTITLE_DIALOG = """\
+● Since the plan file location is blocked by
+  a hook, I'll share the plan here.
+
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
 
   ────────────────────────────────────────
@@ -20103,6 +20108,42 @@ PANE_EXIT_PLAN_SUBTITLE_DIALOG = """\
 
     ❯ 1. Yes, and switch to default (ask
          each time) for this session
+      2. No
+"""
+
+# At 60 columns "this" would fit the pane after line 1, but not the box.
+PANE_EXIT_PLAN_SUBTITLE_DIALOG_60 = """\
+● Since the plan file location is blocked by a hook, I'll
+  share the plan here.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+  ────────────────────────────────────────────────────────
+   Exit plan mode?
+
+    Claude wants to exit plan mode
+
+    ❯ 1. Yes, and switch to default (ask each time) for
+         this session
+      2. No
+"""
+
+PANE_EXIT_PLAN_SUBTITLE_DIALOG_36 = """\
+● Since the plan file location is
+  blocked by a hook, I'll share the
+  plan here.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+  ────────────────────────────────
+   Exit plan mode?
+
+    Claude wants to exit plan
+    mode
+
+    ❯ 1. Yes, and switch to
+         default (ask each time)
+         for this session
       2. No
 """
 
@@ -21774,20 +21815,47 @@ class TestParsePanePrompt(unittest.TestCase):
 
     def test_a_subtitle_between_question_and_options(self):
         # XERK-2162: Claude Code 2.1.306's exit-plan-mode dialog draws a line
-        # between the question and the run. Real 44-column capture.
-        p = ha.parse_pane_prompt(PANE_EXIT_PLAN_SUBTITLE_DIALOG)
-        self.assertEqual(p["prompt"], "Exit plan mode?")
-        self.assertEqual(
-            [(o["number"], o["label"], o["selected"]) for o in p["options"]],
-            [(1, "Yes, and switch to default (ask each time) for this session",
-              True),
-             (2, "No", False)])
-        self.assertEqual(p["detail"], "Claude wants to exit plan mode")
-        self.assertTrue(ha._pane_blocking_dialog(PANE_EXIT_PLAN_SUBTITLE_DIALOG))
+        # between the question and the run, inside a box narrower than the pane.
+        want = [(1, "Yes, and switch to default (ask each time) for this session",
+                 True),
+                (2, "No", False)]
+        ids = set()
+        for frame in (PANE_EXIT_PLAN_SUBTITLE_DIALOG,
+                      PANE_EXIT_PLAN_SUBTITLE_DIALOG_60,
+                      PANE_EXIT_PLAN_SUBTITLE_DIALOG_36):
+            p = ha.parse_pane_prompt(frame)
+            self.assertEqual(p["prompt"], "Exit plan mode?")
+            self.assertEqual(
+                [(o["number"], o["label"], o["selected"]) for o in p["options"]],
+                want)
+            # The conversation above the ▔ edge is not the dialog's detail; a
+            # wrapped subtitle reads as one line.
+            self.assertEqual(p["detail"], "Claude wants to exit plan mode")
+            self.assertTrue(ha._pane_blocking_dialog(frame))
+            ids.add(p["id"])
+        # The same dialog at three widths is one dialog.
+        self.assertEqual(len(ids), 1)
         # The subtitle is part of the dialog's identity.
         other = ha.parse_pane_prompt(PANE_EXIT_PLAN_SUBTITLE_DIALOG.replace(
             "wants to exit", "would like to leave"))
-        self.assertNotEqual(other["id"], p["id"])
+        self.assertNotEqual(other["id"], ids.pop())
+
+    def test_the_edges_effort_badge_is_not_part_of_the_dialog(self):
+        # For a few seconds the ▔ edge carries an effort badge; the id must not
+        # change when it goes, or an answer stamped with the first id is dropped.
+        edge = "▔" * 60
+        badged = PANE_EXIT_PLAN_SUBTITLE_DIALOG_60.replace(
+            edge, "▔" * 39 + " ◐ medium · /effort ▔")
+        self.assertNotEqual(badged, PANE_EXIT_PLAN_SUBTITLE_DIALOG_60)
+        self.assertEqual(ha.parse_pane_prompt(badged)["id"],
+                         ha.parse_pane_prompt(PANE_EXIT_PLAN_SUBTITLE_DIALOG_60)["id"])
+
+    def test_a_short_rule_is_not_the_dialogs_box(self):
+        # A rule far narrower than the pane is content (a diff, a plan), so the
+        # wrap is still judged against the pane.
+        frame = PANE_EXIT_PLAN_SUBTITLE_DIALOG_60.replace(
+            "─" * 56, "─" * 20)
+        self.assertIsNone(ha.parse_pane_prompt(frame))
 
     def test_a_subtitle_needs_blank_fences_and_a_question(self):
         # Prose glued to the question or to the run is not a subtitle.
@@ -21803,6 +21871,10 @@ class TestParsePanePrompt(unittest.TestCase):
             "Proceed?\n\na\n\nb\n\n ❯ 1. Yes\n   2. No\n"))
         self.assertIsNone(ha.parse_pane_prompt(
             "Proceed?\n\na\nb\nc\nd\n\n ❯ 1. Yes\n   2. No\n"))
+        # A subtitle holds no question, rule or numbered line of its own.
+        for inner in ("Why not?\nbecause", "────\nnote", "0. note"):
+            self.assertIsNone(ha.parse_pane_prompt(
+                "Proceed?\n\n" + inner + "\n\n ❯ 1. Yes\n   2. No\n"), inner)
         # The /model picker's description line still has no question above.
         self.assertIsNone(ha.parse_pane_prompt(MODEL_PICKER_PANE))
 
