@@ -179,6 +179,12 @@ class SafeSvgDecoderTest {
 
     private fun refusedFor(svg: String) = runCatching { decode(svg.toByteArray()) }.exceptionOrNull()?.message
 
+    /**
+     * A deadline no busy host reaches before a guard refuses, yet one that still
+     * stops the render (a red test, not a hang) if that guard is removed.
+     */
+    private val LIFTED_DEADLINE_MS = 60_000L
+
     /** Runs [block] with the render deadline set to [ms], restoring it after. */
     private fun <T> withDeadline(ms: Long, block: () -> T): T {
         val saved = SvgRenderGuard.renderDeadlineMs
@@ -232,7 +238,10 @@ class SafeSvgDecoderTest {
             "<defs><pattern id=\"p\" width=\"1\" height=\"1\" patternUnits=\"userSpaceOnUse\">" +
             "<image width=\"1\" height=\"1\" xlink:href=\"data:image/png;base64,$realPng\"/></pattern></defs>" +
             "<rect width=\"100\" height=\"100\" fill=\"url(#p)\"/></svg>"
-        val ms = cpuMs { assertTrue(refused(svg)) }
+        // The deadline is lifted (not removed) so only the pixel budget can refuse it.
+        var message: String? = null
+        val ms = withDeadline(LIFTED_DEADLINE_MS) { cpuMs { message = refusedFor(svg) } }
+        assertEquals("refused SVG: embedded images draw too many pixels", message)
         assertTrue("took ${ms}ms of CPU", ms < 5_000)
     }
 
@@ -247,7 +256,7 @@ class SafeSvgDecoderTest {
         // 11+ minutes on the emulator and kept running after Back.
         // The wall-clock deadline is lifted so only the step budget can refuse it.
         var message: String? = null
-        val ms = withDeadline(Long.MAX_VALUE / 1_000_000) {
+        val ms = withDeadline(LIFTED_DEADLINE_MS) {
             cpuMs { message = refusedFor(tiles("0.01")) }
         }
         assertEquals("refused SVG: too many steps to draw", message)
