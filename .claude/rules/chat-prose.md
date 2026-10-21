@@ -110,10 +110,13 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
     XERK-2161): with no intrinsic size it laid out at 0 × 0 in a shrink-to-fit bubble or table cell.
     The width is the one reaching `.md-img`'s 420px max-height, so it fills the bubble at its ratio
     like Android's `svgFilledSize`. Never put `width: auto` back on `.md-svg` — it overrides them.
-  - **That `<img>` is border-box, so the width attribute adds the border (+ an `.md-svg`'s padding)
+  - **That `<img>` is border-box, so the width attribute adds the border + padding
     on top of the content's width** (rollup XERK-2148): sized without them a 1:10 SVG stopped at
     294px. Android's `proseImageSize(inset =)` adds an SVG's 6dp padding the same way. Tests:
     `chat.test.js` "XERK-2148: a viewBox-only SVG reaches the 420px cap…", `ProseImageSizeTest`.
+  - **Every data: SVG `<img>` is padded on a white backdrop, a markdown `![](data:image/svg+xml…)`
+    too** (`.md-img[src^="data:image/svg+xml" i]`, rollup XERK-2148), as Android's `ProseImage`
+    pads it; `svgSizeAttrs` assumes that padding. Tests: `chat.test.js` "…padded on a white backdrop…".
   - **Android decodes a `data:` URI by its DECLARED type** (`DataImage` + `DeclaredBitmapDecoder`,
     XERK-2161), as the browser does: SVG bytes behind `data:image/png` are broken, never sniffed.
     - **Never `runBlocking { loader.execute(…) }` in a Robolectric test**: Coil resumes on the

@@ -2228,10 +2228,10 @@ test("XERK-2161: a viewBox-only SVG is sized to fill the bubble at its ratio", (
   assert.deepEqual(sizeOf(renderProse('<svg viewBox="0 0 200 100"><rect/></svg>')), [826, 420]);
   // Commas as separators, a percentage size (still no intrinsic size).
   assert.deepEqual(sizeOf(renderProse('<svg width="100%" viewBox="0,0,24,48"><rect/></svg>')), [217, 420]);
-  // A markdown data: image, percent-encoded or base64, gets the same (border only).
+  // A markdown data: image, percent-encoded or base64, gets the same (padded too).
   const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 5"/>';
-  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml," + encodeURIComponent(svg) + ")")), [838, 420]);
-  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml;base64," + Buffer.from(svg).toString("base64") + ")")), [838, 420]);
+  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml," + encodeURIComponent(svg) + ")")), [826, 420]);
+  assert.deepEqual(sizeOf(linkify("![a](data:image/svg+xml;base64," + Buffer.from(svg).toString("base64") + ")")), [826, 420]);
   // An empty or auto size is no size; a name inside another attribute's value is not one.
   assert.deepEqual(sizeOf(renderProse('<svg width="auto" height="" viewBox="0 0 200 100"><rect/></svg>')), [826, 420]);
   assert.deepEqual(sizeOf(renderProse('<svg aria-label=" width=\'5\'" viewBox="0 0 200 100"><rect/></svg>')), [826, 420]);
@@ -2264,8 +2264,22 @@ test("XERK-2148: a viewBox-only SVG reaches the 420px cap, padding and border in
     const raw = widthOf(renderProse(`<svg viewBox="0 0 ${vw} ${vh}"><rect/></svg>`));
     assert.equal(laidOutH(raw, 14, vw / vh), 420, `raw ${vw}:${vh} width ${raw}`);
     const md = widthOf(linkify("![a](data:image/svg+xml," + encodeURIComponent(`<svg viewBox="0 0 ${vw} ${vh}"/>`) + ")"));
-    assert.equal(laidOutH(md, 2, vw / vh), 420, `markdown ${vw}:${vh} width ${md}`);
+    assert.equal(laidOutH(md, 14, vw / vh), 420, `markdown ${vw}:${vh} width ${md}`);
   }
+});
+
+// Rollup XERK-2148: a markdown data: SVG gets the raw block's white backdrop and
+// padding, as Android's ProseImage gives it — in every prose surface .md-svg covers.
+test("XERK-2148: a markdown data: SVG is padded on a white backdrop like a raw block", () => {
+  const css = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "public", "sessions.html"), "utf8");
+  const rule = /([^{}]*)\{\s*background: #fff; padding: 6px; \}/.exec(css);
+  assert.ok(rule, "the SVG backdrop rule");
+  for (const scope of [".tr-msg", ".thought-body", ".compact-body", ".away-body", ".tool-plan"]) {
+    assert.ok(rule[1].includes(`${scope} .md-svg`), scope);
+    assert.ok(rule[1].includes(`${scope} .md-img[src^="data:image/svg+xml" i]`), scope);
+  }
+  // The selector's prefix is what linkify emits for a markdown SVG, in any case.
+  assert.match(linkify("![a](DATA:IMAGE/SVG+XML,%3Csvg%2F%3E)"), /<img class="md-img" src="DATA:IMAGE\/SVG\+XML,/);
 });
 
 // Rollup XERK-2148: a URL scheme is case-insensitive; DATA:IMAGE/PNG is an image.
