@@ -18711,8 +18711,23 @@ _DIALOG_HINT_ITEMS = frozenset((
     "enter to return", "esc/enter/space to close", "x to stop"))
 # The top edge Claude Code draws over a full-screen overlay (/model, /skills,
 # /tasks, /config …): a row of "▔", the effort hint maybe inset ("▔▔▔ ◐ medium
-# · /effort ▔"). A composer is never drawn under one.
+# · /effort ▔"). A composer is never drawn under one. After a fresh session's
+# first turn a tmux tip can take the row over, leaving only its last cell
+# (" tmux focus-events off · add … ▔"): `_OVERLAY_TIP_EDGE_RE`, which counts
+# only when it reaches the pane's right edge (`_overlay_edge_rows`).
 _OVERLAY_EDGE_RE = re.compile(r"^\s*▔{3,}(?:.*▔)?\s*$")
+_OVERLAY_TIP_EDGE_RE = re.compile(r"^\s*\S.*\s▔\s*$")
+
+
+def _overlay_edge_rows(lines):
+    """Indexes of the lines that are an overlay's "▔" top edge: a run of "▔"
+    (the effort hint maybe inset), or a row a tmux tip took over that still
+    ends in the edge's last "▔" at the pane's right edge — the widest line, so
+    a reply that merely ends in " ▔" short of the edge is not one (XERK-2148)."""
+    widest = max((_pane_cells(line.rstrip()) for line in lines), default=0)
+    return [i for i, line in enumerate(lines)
+            if _OVERLAY_EDGE_RE.match(line)
+            or (_OVERLAY_TIP_EDGE_RE.match(line) and _pane_cells(line.rstrip()) == widest)]
 
 
 def _overlay_edge_up(lines):
@@ -18727,8 +18742,7 @@ def _overlay_edge_up(lines):
     marker, shell mode, qwen's) and no exit toast. The edge is TUI chrome
     drawn only over an overlay; with no composer under it the overlay is
     what owns the keyboard."""
-    edge = max((i for i, line in enumerate(lines) if _OVERLAY_EDGE_RE.match(line)),
-               default=None)
+    edge = max(_overlay_edge_rows(lines), default=None)
     if edge is None:
         return False
     body = [line for line in lines[edge + 1:] if line.strip()]
@@ -18803,7 +18817,7 @@ def _hint_dialog_up(cap):
             items.append(prev + " " + parts[0])
         prev = parts[-1]
     return (any(" ".join(item.split()).lower() in _DIALOG_HINT_ITEMS for item in items)
-            or _overlay_edge_up(lines))
+            or _overlay_edge_up(_ANSI_RE.sub("", cap).splitlines()))
 
 
 def _pane_blocking_dialog(cap):
@@ -24974,7 +24988,7 @@ def parse_model_picker(text):
     holds no picker. Only the region from the last "Select model" heading down
     is read, so numbered lines in the conversation above can't parse as rows.
     Only the DRAWN rows are returned: a long list scrolls, marking its first
-    drawn row "↑ 4." and its last "↓ 10." (`_model_picker_scroll`). A narrow
+    drawn row "↑ 4." and its last "↓ 10." (`_model_picker_more_below`). A narrow
     pane truncates a label ("Sonne…" at 24 columns); it is kept as drawn and
     `_picker_index_for` judges it."""
     rows, cur = [], None
@@ -25014,20 +25028,17 @@ def _model_picker_rows(text):
     return out
 
 
-def _model_picker_scroll(text):
-    """(more_above, more_below): whether a scrolled picker has rows it does not
-    draw above its first drawn row ("↑", or a first row numbered past 1: a
-    pane too short for more than one row draws no "↑") or below its last
-    ("↓", "… +N models", or a narrow pane's "↓" ending the last drawn line, which a
-    wrapped description pushed the rest past). set_model scrolls to reach a
-    row it can't see (XERK-2148)."""
-    rows = _model_picker_rows(text)
+def _model_picker_more_below(text):
+    """Whether a scrolled picker has rows it does not draw below its last
+    drawn row: "↓" on that row, "… +N models", or a narrow pane's "↓" ending
+    the last drawn line, which a wrapped description pushed the rest past.
+    set_model scrolls down to reach a row it can't see (XERK-2148); rows
+    ABOVE it judges by row number, since a pane too short for more than one
+    row draws no "↑"."""
     region = [line.rstrip() for line in _model_picker_region(text) or () if line.strip()]
-    above = bool(rows) and ("↑" in rows[0][0] or rows[0][1] > 1)
-    below = (any("↓" in marks for marks, _, _ in rows)
-             or any(_MODEL_PICKER_MORE_RE.match(line) for line in region)
-             or bool(region) and region[-1].endswith(" ↓"))
-    return above, below
+    return (any("↓" in marks for marks, _, _ in _model_picker_rows(text))
+            or any(_MODEL_PICKER_MORE_RE.match(line) for line in region)
+            or bool(region) and region[-1].endswith(" ↓"))
 
 
 def _picker_head_is(head, word):
@@ -25072,12 +25083,16 @@ def parse_model_switch_confirm(text):
     option must be the pane's LAST non-blank line (nothing a conversation
     prints sits below the composer), "1. Yes, switch to …" above it (its name
     wrapped onto the lines between on a narrow pane), and the "Switch model?"
-    heading above that, with no rule in between."""
+    heading above that, with no rule in between. A pane ~14 rows high draws
+    the confirm down to the Yes row only, "2. No, go back" below the bottom
+    (2.1.306, XERK-2148): then the Yes row (and its wrap) is the last line."""
     lines = [line.strip() for line in _pane_lines(text)]
     filled = [i for i, line in enumerate(lines) if line]
-    if not filled or not MODEL_SWITCH_BACK_RE.match(lines[filled[-1]]):
+    if not filled:
         return None
-    back = filled[-1]
+    # `back` is where the Yes row's text ends: at the No row, or past the
+    # last line when the No row is not drawn.
+    back = filled[-1] if MODEL_SWITCH_BACK_RE.match(lines[filled[-1]]) else filled[-1] + 1
     for yes in range(back - 1, max(-1, back - 5), -1):
         if MODEL_SWITCH_YES_START_RE.match(lines[yes]):
             break
@@ -35190,7 +35205,7 @@ class SessionManager:
                 elif known + 1 < nums[0]:
                     way = "Up"
                 else:
-                    way = "Down" if _model_picker_scroll(cap)[1] else None
+                    way = "Down" if _model_picker_more_below(cap) else None
                 if way and scrolls < MODEL_PICKER_SCROLL_MAX:
                     _pane_send_keys(tmux_name, way)
                     scrolls += 1

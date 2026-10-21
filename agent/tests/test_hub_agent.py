@@ -10764,6 +10764,44 @@ class TestOverlayFootersAndShellMode(unittest.TestCase):
         # footer item, and only the shell footer under it says composer.
         self.assertFalse(ha._hint_dialog_up("! note\nEsc to cancel\n  ! for shell mode\n"))
 
+    def test_an_edge_a_tmux_tip_took_over_still_reads(self):
+        # QA (XERK-2148, 2.1.306): after a fresh session's first turn the tmux
+        # tip is drawn INTO the overlay's edge row, leaving only its last "▔"
+        # at the right edge. Trimmed from /plugin Discover at 40 columns and
+        # a footerless /skills at 24 (NO_COLOR).
+        plugin40 = ("❯ /plugin\n"
+                    " tmux focus-events off · add 'set -g … ▔\n"
+                    "   Plugins  Discover   Installed\n"
+                    "    Marketplaces   Errors   Stats\n\n"
+                    "   Discover plugins (1/3693)\n"
+                    "   ╭" + "─" * 32 + "╮\n"
+                    "   │ ⌕ Search…                      │\n"
+                    "   ╰" + "─" * 32 + "╯\n"
+                    "    All 3693 · Anthropic Directory\n"
+                    "       requests using multiple spec…\n"
+                    "                                      ↓\n")
+        skills24 = ("✻ Churned for 1s · done\n  5:51 PM\n"
+                    " tmux focus-events of… ▔\n"
+                    "   Skills\n   9 skills ·\n   enter/space to\n   cycle, / to\n"
+                    "   ❯ ✔ docs\n     ✔ pdf\n     ✔ xlsx\n")
+        for cap in (plugin40, skills24):
+            self.assertTrue(ha._hint_dialog_up(cap))
+            self.assertTrue(ha._pane_blocking_dialog(cap))
+        # A reply line ending " ▔" short of the right edge is no edge, and one
+        # that reaches it still has the composer under it.
+        reply = ("● the edge glyph is ▔\n" + "x" * 60 + "\n"
+                 + "─" * 60 + "\n❯ \n" + "─" * 60 + "\n  ⏸ manual mode on\n")
+        self.assertFalse(ha._pane_blocking_dialog(reply))
+        self.assertFalse(ha._pane_blocking_dialog(
+            "● a reply that ends at the very edge ▔\n" + "─" * 38 + "\n❯ \n" + "─" * 38 + "\n"))
+
+    def test_a_composer_rule_under_an_edge_says_composer(self):
+        # Footer cut off (a short pane) but the composer's rules are drawn: a
+        # quoted edge above them is conversation, not an overlay.
+        cap = "▔" * 40 + "\n   Skills\n   Esc to close\n" + "─" * 40 + "\n❯ hi\n"
+        self.assertFalse(ha._overlay_edge_up(cap.splitlines()))
+        self.assertTrue(ha._overlay_edge_up(cap.splitlines()[:3]))
+
     def test_a_quoted_shell_footer_hides_no_dialog(self):
         # QA (XERK-2148): the shell footer was searched over the whole capture,
         # so a conversation line reading "! for shell mode" vetoed a real
@@ -10895,6 +10933,17 @@ class TestModelSwitchConfirm(unittest.TestCase):
             # Its "▔" edge now reads too (`_overlay_edge_up`, XERK-2148).
             self.assertTrue(ha._hint_dialog_up(cap))
             self.assertTrue(ha._pane_blocking_dialog(cap))
+
+    def test_reads_a_confirm_whose_no_row_is_below_the_bottom(self):
+        # QA (XERK-2148): a 14-row pane draws down to the Yes row only.
+        for cap in (_2157_CONFIRM_140.split("     2. No")[0],
+                    _2157_CONFIRM_24.split("     2. No")[0]):
+            self.assertEqual(ha.parse_model_switch_confirm(cap), "Sonnet 5.5")
+            self.assertTrue(ha._pane_blocking_dialog(cap))
+        # The heading must still be above it, with no rule between.
+        self.assertIsNone(ha.parse_model_switch_confirm("   ❯ 1. Yes, switch to Sonnet 5.5\n"))
+        self.assertIsNone(ha.parse_model_switch_confirm(
+            "   Switch model?\n" + "─" * 30 + "\n   ❯ 1. Yes, switch to Sonnet 5.5\n"))
 
     def test_a_quoted_confirm_above_the_composer_is_not_one(self):
         quoted = (_2157_CONFIRM_140 + "─" * 140 + "\n❯ \n" + "─" * 140 + "\n"
@@ -21625,6 +21674,19 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self.assertEqual(self._keys()[-1], "Escape")
         self.assertNotIn("s", self._keys())
 
+    def test_set_model_answers_a_confirm_with_its_no_row_off_screen(self):
+        # QA (XERK-2148): on a 14-row pane "2. No, go back" is below the
+        # bottom; the confirm went unread and was left open over the composer.
+        pane = _PickerPane(ask=True)
+        drawn = pane.capture
+        pane.capture = lambda: drawn().split("     2. No")[0] if pane.asking else drawn()
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys(), ["C-u", "/model", "Enter", "Down", "s", "1"])
+        self.assertFalse(pane.asking)
+        self.assertEqual(sess["model"], "sonnet")
+
     def test_set_model_reads_truncated_labels(self):
         # XERK-2148: at 24 columns rows read "Sonne…"; a stem only one model
         # family starts with still names it, and the confirmation (full name)
@@ -23105,22 +23167,20 @@ class TestParseModelPicker(unittest.TestCase):
                "      … +3 models\n")
         self.assertEqual(ha.parse_model_picker(top),
                          (["Default (recommended)", "Opus 5.5", "Opus 4.8"], 1))
-        self.assertEqual(ha._model_picker_scroll(top), (False, True))
+        self.assertTrue(ha._model_picker_more_below(top))
         bottom = ("   Select model\n"
                   "   ↑ 4.  Sonnet 5.5             Most efficient\n"
                   "   ❯ 13. Sonnet 4.6             Efficient\n")
         self.assertEqual(ha.parse_model_picker(bottom), (["Sonnet 5.5", "Sonnet 4.6"], 1))
-        self.assertEqual(ha._model_picker_scroll(bottom), (True, False))
-        self.assertEqual(ha._model_picker_scroll(MODEL_PICKER_PANE), (False, False))
-        # A narrow pane: the "↓" ends the last drawn line. Row 1 is not drawn,
-        # so rows lie above too.
-        self.assertEqual(ha._model_picker_scroll(
-            "   Select model\n   ❯ 2.  Opu… ✔  For\n                 work ↓\n"), (True, True))
-        # A pane ~12 rows high draws ONE row and no "↑" (QA, 60x12): a first
-        # row numbered past 1 still says rows lie above.
-        self.assertEqual(ha._model_picker_scroll(
+        self.assertFalse(ha._model_picker_more_below(bottom))
+        self.assertFalse(ha._model_picker_more_below(MODEL_PICKER_PANE))
+        # A narrow pane: the "↓" ends the last drawn line.
+        self.assertTrue(ha._model_picker_more_below(
+            "   Select model\n   ❯ 2.  Opu… ✔  For\n                 work ↓\n"))
+        # A pane ~12 rows high draws ONE row and "… +10 models" under it.
+        self.assertTrue(ha._model_picker_more_below(
             "   Select model\n   ❯ 3.  Fable 5.1 ✔            For your toughest\n"
-            "      … +10 models\n"), (True, True))
+            "      … +10 models\n"))
 
     def test_picker_index_for(self):
         rows, _ = ha.parse_model_picker(MODEL_PICKER_PANE)
