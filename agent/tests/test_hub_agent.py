@@ -51378,6 +51378,9 @@ class TestShadowSandbox(ManagerMixin, unittest.TestCase):
         # one made the shadow's own request dir read-only (XERK-1864).
         self.assertIn(ha.SESSION_REQUESTS_DENY_RULE, guard["permissions"]["deny"])
         self.assertNotIn(ha.SESSION_REQUESTS_DENY_RULE, deny)
+        # Only that one: every other guard deny survives into the shadow's copy.
+        kept = [r for r in guard["permissions"]["deny"] if r != ha.SESSION_REQUESTS_DENY_RULE]
+        self.assertEqual(deny[:len(kept)], kept)
         # The managed guard dropped fileguard from --settings; a shadow wires its
         # own copy (the root-owned one may predate the shadow-root check).
         hooks = [h["command"] for e in s["hooks"]["PreToolUse"]
