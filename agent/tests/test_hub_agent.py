@@ -51374,6 +51374,13 @@ class TestShadowSandbox(ManagerMixin, unittest.TestCase):
         for rule in ("WebFetch", "Edit(//r/x/.git/**)",
                      "Edit(//r/.turma/worktrees/x/ab/.claude/**)"):
             self.assertIn(rule, deny)
+        # Claude Code merges Edit() denies into the sandbox's denyWrite, so this
+        # one made the shadow's own request dir read-only (XERK-1864).
+        self.assertIn(ha.SESSION_REQUESTS_DENY_RULE, guard["permissions"]["deny"])
+        self.assertNotIn(ha.SESSION_REQUESTS_DENY_RULE, deny)
+        # Only that one: every other guard deny survives into the shadow's copy.
+        kept = [r for r in guard["permissions"]["deny"] if r != ha.SESSION_REQUESTS_DENY_RULE]
+        self.assertEqual(deny[:len(kept)], kept)
         # The managed guard dropped fileguard from --settings; a shadow wires its
         # own copy (the root-owned one may predate the shadow-root check).
         hooks = [h["command"] for e in s["hooks"]["PreToolUse"]
@@ -51410,6 +51417,8 @@ class TestShadowSandbox(ManagerMixin, unittest.TestCase):
         self.assertIsNone(reason)
         self.assertEqual(len(calls), 1, "probed once, then cached")
         self.assertIn("--unshare-net", calls[0])
+        # bwrap as a container's root makes no user namespace unless asked (k8x pods).
+        self.assertIn("--unshare-user", calls[0])
         reason, _ = self.probe(lambda n: None if n == "bwrap" else "/usr/bin/socat")
         self.assertIn("bubblewrap", reason)
         bad = mock.Mock(returncode=1, stderr=b"bwrap: Creating new namespace failed")
