@@ -498,6 +498,10 @@ test("an operator's custom busy markers are broken up too", async () => {
   const bo = await big.turma("peers");
   assert.ok(bo.length <= 4000, String(bo.length));
   assert.match(bo, /…and \d+ more in \/t\/peers\.tsv$/);
+  // A capital sigma reads as σ to the agent mid-word (`åΣx`): broken too.
+  const sg = await harness({ env: { TURMA_BUSY_MARKERS: "åσ" } });
+  sg.files.set("/t/peers.tsv", "zz\tP\th\tr\t\tåΣx\n");
+  assert.match(await sg.turma("peers"), /å-Σx/);
   // Without the variable only the built-in markers are broken.
   const plain = await harness();
   plain.files.set("/t/peers.tsv", "zz\tP\thost2\tR\t\tThinking hard\n");

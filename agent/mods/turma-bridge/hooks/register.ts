@@ -256,14 +256,21 @@ function cell(v: unknown): string {
 function markerRes(raw: string | undefined): string[] {
   return (raw || '')
     .split('|')
-    .map(m => m.trim().replace(/[\p{Cc}\p{Cf}]+/gu, ' ').toLowerCase())
+    .map(m => fold(m.trim().replace(/[\p{Cc}\p{Cf}]+/gu, ' ')))
     // One character cannot be broken up, and would read every pane busy anyway.
     .filter(m => [...m].length >= 2)
 }
 
-// Is `m` (lowercased) at `text[i]`, compared case-insensitively?
+// Lowercased with the final sigma folded to σ: JS lowers a SLICE's last Σ to ς,
+// while the agent lowers the whole capture (`åΣx` → `åσx`) and reads it busy.
+// Folding both sides over-matches, the safe direction (QA).
+function fold(t: string): string {
+  return t.toLowerCase().replace(/ς/g, 'σ')
+}
+
+// Is `m` (folded) at `text[i]`, compared case-insensitively?
 function markerAt(text: string, i: number, m: string): boolean {
-  return text.slice(i, i + m.length).toLowerCase() === m
+  return fold(text.slice(i, i + m.length)) === m
 }
 
 function hasMarker(text: string, m: string): boolean {
