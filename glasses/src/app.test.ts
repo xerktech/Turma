@@ -1442,6 +1442,30 @@ describe("App", () => {
       expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "B", sessionId: "s9", text: "typed for A only" }]);
     });
 
+    it("a draft follows a whole chain of moves to its running end, and a cycle never spins", async () => {
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })];
+      const app = await boot();
+      app.enterSession("s1", "A");
+      dictate("travel");
+      app.enterSession("s2");
+      // A -> B -> C, with B already moved on before the glasses saw it run.
+      fleet = [
+        agent({ key: "A", sessions: [session({ id: "s1", status: "stopped" }), session({ id: "s2" })] }),
+        agent({ key: "B", sessions: [session({ id: "s9", status: "stopped", migratedFrom: { host: "A", sessionId: "s1" } })] }),
+        agent({ key: "C", sessions: [session({ id: "s5", migratedFrom: { host: "B", sessionId: "s9" } })] }),
+      ];
+      await poll();
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "C", sessionId: "s5", text: "travel" }]);
+      // Broken records pointing at each other: the walk stops, the draft stays put.
+      fleet = [
+        agent({ key: "C", sessions: [session({ id: "s5", migratedFrom: { host: "D", sessionId: "s6" } })] }),
+        agent({ key: "D", sessions: [session({ id: "s6", status: "stopped", migratedFrom: { host: "C", sessionId: "s5" } })] }),
+      ];
+      await poll();
+      await poll();
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "C", sessionId: "s5", text: "travel" }]);
+    });
+
     it("a moved answer meeting one already at the target joins it, or is kept as a stale prompt", async () => {
       const ask = (q: string) => signals({ question: q, questionOptions: ["Yes", "No"] });
       const moveWith = async (srcFor: string) => {

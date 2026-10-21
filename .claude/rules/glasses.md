@@ -111,6 +111,7 @@ paths:
     (`followMigratedDrafts`, XERK-2109, `session-migration.md`); a null source id moves nothing.
   - The marker is permanent and the source stays listed (and can be started again), so a draft
     moves only from a NON-running source to a RUNNING target: a restarted source's draft is its own.
+    The chain is walked back through non-running hops (A -> B -> C), cycle-bounded.
   - A stash MOVES the draft out of `state.session` (home keeps a stale one) and joins any held one,
     so a second stash of the same left session neither replaces nor doubles it.
   - `takeDraft`/`stashDraft` rewrite `state.drafts`: call them BEFORE spreading `this.state`, or

@@ -650,46 +650,69 @@ export class App {
   // The marker stays on the record for good, and the source copy stays listed
   // (killed, resumable — and startable again). So a draft moves only while the
   // TARGET runs and the source does NOT: a source the wearer restarted is a
-  // live session of its own, and its draft is never another's.
+  // live session of its own, and its draft is never another's. The chain is
+  // walked back through every non-running hop (A -> B -> C with B since moved
+  // on, unseen while the glasses were off), to the first running one or a hop
+  // with no marker; `seen` bounds it, cycles included.
   private followMigratedDrafts(): void {
-    const running = (hostKey: string, id: string) =>
-      findSession(this.state, hostKey, id)?.status === "running";
+    const marker = (sess: SessionInfo | undefined): [string, string] | null => {
+      const from = sess?.migratedFrom;
+      return from && typeof from.host === "string" && typeof from.sessionId === "string"
+        ? [from.host, from.sessionId]
+        : null;
+    };
     let drafts: Record<string, DraftEntry> | null = null;
     for (const a of this.state.agents) {
       for (const sess of a.sessions ?? []) {
-        const from = sess.migratedFrom;
-        if (!from || typeof from.host !== "string" || typeof from.sessionId !== "string") continue;
-        if (sess.status !== "running" || running(from.host, from.sessionId)) continue;
-        const oldKey = draftKey(from.host, from.sessionId);
+        if (sess.status !== "running") continue;
         const newKey = draftKey(a.key, sess.id);
-        const cur: Record<string, DraftEntry> = drafts ?? this.state.drafts;
-        const moved = cur[oldKey];
-        if (!moved || oldKey === newKey) continue;
-        const { [oldKey]: _gone, ...rest } = cur;
-        const there = rest[newKey];
-        const parts = [there?.text ?? "", moved.text];
-        const entry: DraftEntry = { hostKey: a.key, sessionId: sess.id, text: "" };
-        let stale = !!(there?.stale || moved.stale);
-        // Two answers for one question join; for different ones the target's
-        // stays the answer and the moved one's text is kept, as a stale prompt.
-        let answer = there?.answer ?? moved.answer;
-        if (there?.answer && moved.answer) {
-          if (there.answer.for === moved.answer.for) {
-            answer = { text: `${there.answer.text} ${moved.answer.text}`, for: there.answer.for };
-          } else {
-            parts.push(moved.answer.text);
-            stale = true;
-          }
+        const seen = new Set([newKey]);
+        for (let hop = marker(sess); hop; ) {
+          const oldKey = draftKey(hop[0], hop[1]);
+          const src = findSession(this.state, hop[0], hop[1]);
+          if (seen.has(oldKey) || src?.status === "running") break;
+          seen.add(oldKey);
+          hop = marker(src);
+          drafts = this.moveDraft(drafts ?? this.state.drafts, oldKey, a.key, sess.id) ?? drafts;
         }
-        entry.text = parts.filter(Boolean).join(" ");
-        if (answer) entry.answer = answer;
-        if (stale) entry.stale = true;
-        delete rest[newKey];
-        rest[newKey] = entry;
-        drafts = rest;
       }
     }
     if (drafts) this.state = { ...this.state, drafts };
+  }
+
+  // followMigratedDrafts' one move: `oldKey`'s entry into (hostKey, sessionId),
+  // joining one already there. Returns the new map, or null if nothing moved.
+  private moveDraft(
+    cur: Record<string, DraftEntry>,
+    oldKey: string,
+    hostKey: string,
+    sessionId: string
+  ): Record<string, DraftEntry> | null {
+    const newKey = draftKey(hostKey, sessionId);
+    const moved = cur[oldKey];
+    if (!moved || oldKey === newKey) return null;
+    const { [oldKey]: _gone, ...rest } = cur;
+    const there = rest[newKey];
+    const parts = [there?.text ?? "", moved.text];
+    const entry: DraftEntry = { hostKey, sessionId, text: "" };
+    let stale = !!(there?.stale || moved.stale);
+    // Two answers for one question join; for different ones the target's
+    // stays the answer and the moved one's text is kept, as a stale prompt.
+    let answer = there?.answer ?? moved.answer;
+    if (there?.answer && moved.answer) {
+      if (there.answer.for === moved.answer.for) {
+        answer = { text: `${there.answer.text} ${moved.answer.text}`, for: there.answer.for };
+      } else {
+        parts.push(moved.answer.text);
+        stale = true;
+      }
+    }
+    entry.text = parts.filter(Boolean).join(" ");
+    if (answer) entry.answer = answer;
+    if (stale) entry.stale = true;
+    delete rest[newKey];
+    rest[newKey] = entry;
+    return rest;
   }
 
   // Keeps the on-screen session's unsent draft for its next entry. A draft
