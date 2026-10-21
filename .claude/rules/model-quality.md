@@ -238,11 +238,12 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     `_forge_rebase_base`): no `refs/pull` head there. The N first-parent commits must be the
     MR's by sha (GitLab fast-forward) or by author/time/message (a rewrite; ADO's cut `comment`
     as a prefix), in either listing order. Unreadable API → the run fails; a full GitLab page
-    (100) reads as over the cap.
+    (100) reads as over the cap. A fast-forward MR has no merge/squash sha, so `_summarize_mr`
+    reports its head `sha` as `mergeCommit` — without it such an MR never reached a shadow.
   - **ADO's answer must equal its `lastMergeTargetCommit`** (the target head the completion
     rebased onto), on every path: the commits API pages by a header this reader never sees,
-    and a short page matched as a whole PR based mid-PR (QA-reproduced). Never drop that check. A fast-forward MR has no merge/squash sha, so `_summarize_mr`
-    reports its head `sha` as `mergeCommit` — without it such an MR never reached a shadow.
+    and a short page matched as a whole PR based mid-PR (QA-reproduced). Never drop that check.
+    GitLab has no such cross-check yet (a stale MR commit list could base too far back).
   - That fetch is all-or-nothing: a quick failure (origin lacks the PR head) re-fetches the
     branch alone, so a merge-commit PR still places. A rebase that does not line up (a commit
     dropped as already applied) reads as a squash and keeps `^1` — the residual.

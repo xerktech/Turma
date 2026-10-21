@@ -49728,8 +49728,13 @@ class TestForgeShadowBase(TestShadowBase):
         base, why = self.base_of(merge, self.ADO)
         self.assertIsNone(base)
         self.assertIn("base its forge names", why)
-        self.ado(commits, None)                             # no named base: unreadable
+        for target in (None, ""):                           # no named base: unreadable
+            self.ado(commits, target)
+            self.assertIn("could not list", self.base_of(merge, self.ADO)[1])
+        del self.api["adopr"]["lastMergeTargetCommit"]
         self.assertIn("could not list", self.base_of(merge, self.ADO)[1])
+        self.ado(commits, before.upper())                   # the forge's casing is not ours
+        self.assertEqual(self.base_of(merge, self.ADO), (before, None))
 
     def test_a_squash_keeps_the_first_parent(self):
         before = self.open_pr(7, ["s1", "s2"])
@@ -49764,6 +49769,10 @@ class TestForgeShadowBase(TestShadowBase):
         self.assertEqual(self.base_of(merge, self.ADO), (None, unreadable))
         self.api["adopr"] = {"pullRequestId": 4, "repository": {"id": "r", "project": "p"}}
         self.assertEqual(self.base_of(merge, self.ADO), (None, unreadable))
+        # The PR status poller reads the same payload: a wrong shape is no raise there either.
+        for repo in ("r", {"id": "r", "project": ["p"]}):
+            self.api["adopr"] = {"pullRequestId": 4, "repository": repo}
+            self.assertEqual(ha._azdo_fetch_pr(self.ADO), self.api["adopr"])
         with mock.patch.object(ha, "_azdo_fetch_pr", side_effect=AttributeError("x")):
             self.assertEqual(self.base_of(merge, self.ADO), (None, unreadable))
 
