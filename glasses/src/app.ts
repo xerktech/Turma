@@ -407,6 +407,7 @@ export class App {
   // See armQuestionTapGuard: the open session's just-arrived question, whose
   // first sheet tap is swallowed until `until`.
   private questionTapGuard: { hostKey: string; sessionId: string; until: number } | null = null;
+  private questionSeen: { hostKey: string; sessionId: string; question: string } | null = null;
 
   constructor(opts: AppOptions) {
     this.client = opts.client;
@@ -645,12 +646,20 @@ export class App {
   // never follows an id across hosts (draftKeyFor). An archive restore has no
   // source id (sessionId null), so nothing moves for it. A draft already at the
   // destination keeps its place; the moved one joins after it.
+  //
+  // The marker stays on the record for good, and the source copy stays listed
+  // (killed, resumable — and startable again). So a draft moves only while the
+  // TARGET runs and the source does NOT: a source the wearer restarted is a
+  // live session of its own, and its draft is never another's.
   private followMigratedDrafts(): void {
+    const running = (hostKey: string, id: string) =>
+      findSession(this.state, hostKey, id)?.status === "running";
     let drafts: Record<string, DraftEntry> | null = null;
     for (const a of this.state.agents) {
       for (const sess of a.sessions ?? []) {
         const from = sess.migratedFrom;
         if (!from || typeof from.host !== "string" || typeof from.sessionId !== "string") continue;
+        if (sess.status !== "running" || running(from.host, from.sessionId)) continue;
         const oldKey = draftKey(from.host, from.sessionId);
         const newKey = draftKey(a.key, sess.id);
         const cur: Record<string, DraftEntry> = drafts ?? this.state.drafts;
@@ -658,11 +667,23 @@ export class App {
         if (!moved || oldKey === newKey) continue;
         const { [oldKey]: _gone, ...rest } = cur;
         const there = rest[newKey];
-        const entry: DraftEntry = { hostKey: a.key, sessionId: sess.id, text: moved.text };
-        if (there) entry.text = [there.text, moved.text].filter(Boolean).join(" ");
-        const answer = there?.answer ?? moved.answer;
+        const parts = [there?.text ?? "", moved.text];
+        const entry: DraftEntry = { hostKey: a.key, sessionId: sess.id, text: "" };
+        let stale = !!(there?.stale || moved.stale);
+        // Two answers for one question join; for different ones the target's
+        // stays the answer and the moved one's text is kept, as a stale prompt.
+        let answer = there?.answer ?? moved.answer;
+        if (there?.answer && moved.answer) {
+          if (there.answer.for === moved.answer.for) {
+            answer = { text: `${there.answer.text} ${moved.answer.text}`, for: there.answer.for };
+          } else {
+            parts.push(moved.answer.text);
+            stale = true;
+          }
+        }
+        entry.text = parts.filter(Boolean).join(" ");
         if (answer) entry.answer = answer;
-        if (there?.stale || moved.stale) entry.stale = true;
+        if (stale) entry.stale = true;
         delete rest[newKey];
         rest[newKey] = entry;
         drafts = rest;
@@ -738,7 +759,17 @@ export class App {
   // menu's Send/Dictate more, or the transcript) would answer with the option
   // just highlighted, unseen. So the first sheet tap within
   // QUESTION_TAP_GUARD_MS of the arrival is swallowed (onSheetBottom).
+  //
+  // Armed only while the wearer is ON that session (its screen or its menu;
+  // state.session outlives going home) and only for a question new to them: a
+  // poll that missed the session (a hub restart) then re-lists the question
+  // they were already reading is no arrival (the poll checks `questionSeen`).
   private armQuestionTapGuard(s: SessionScreenState): void {
+    const a = this.state.actions;
+    const onIt =
+      this.state.screen === "session" ||
+      (this.state.screen === "actions" && a?.hostKey === s.hostKey && a.sessionId === s.sessionId);
+    if (!onIt) return;
     this.questionTapGuard = { hostKey: s.hostKey, sessionId: s.sessionId, until: this.now() + QUESTION_TAP_GUARD_MS };
   }
 
@@ -983,6 +1014,13 @@ export class App {
         const sess = this.state.session;
         const live = findSession(this.state, sess.hostKey, sess.sessionId);
         const nowQuestion = live?.session?.question ?? null;
+        // The question last listed on this session, kept across a poll that
+        // missed it (see armQuestionTapGuard), dropped once listed without one.
+        const seen = this.questionSeen;
+        const seenHere = seen?.hostKey === sess.hostKey && seen.sessionId === sess.sessionId ? seen.question : null;
+        if (live) {
+          this.questionSeen = nowQuestion ? { hostKey: sess.hostKey, sessionId: sess.sessionId, question: nowQuestion } : null;
+        }
         if (nowQuestion && !prevQuestion) {
           // A question just arrived. If the box mic was hot (the user was
           // dictating a free-text reply in plain input mode), cancel it so it
@@ -991,7 +1029,7 @@ export class App {
           if (sess.mic === "recording" || sess.mic === "finalising") this.dictation.cancel();
           const mic = sess.mic === "recording" || sess.mic === "finalising" ? "idle" : sess.mic;
           this.state = { ...this.state, session: { ...sess, mic, selected: 0 } };
-          this.armQuestionTapGuard(sess);
+          if (nowQuestion !== seenHere) this.armQuestionTapGuard(sess);
           this.holdDraftFrom(nowQuestion);
         } else if (nowQuestion && prevQuestion && nowQuestion !== prevQuestion) {
           // A *different* question replaced the one already pending on this
@@ -1001,7 +1039,7 @@ export class App {
           // digit, but the highlight itself would still point at the wrong row
           // until the user scrolls. Reset it, edge-triggered like the arrival.
           this.state = { ...this.state, session: { ...sess, selected: 0 } };
-          this.armQuestionTapGuard(sess);
+          if (nowQuestion !== seenHere) this.armQuestionTapGuard(sess);
           this.holdDraftFrom(nowQuestion);
         } else if (
           live &&

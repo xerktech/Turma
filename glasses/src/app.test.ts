@@ -1418,6 +1418,131 @@ describe("App", () => {
       expect(draftOf(app)).toBe("for the moved one");
     });
 
+    it("a draft for a source session running again is its own: the old marker never moves it", async () => {
+      // The source stays listed after a move and can be started again.
+      fleet = [
+        agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] }),
+        agent({ key: "B", sessions: [session({ id: "s9", migratedFrom: { host: "A", sessionId: "s1" } })] }),
+      ];
+      const app = await boot();
+      app.enterSession("s1", "A");
+      dictate("typed for A only");
+      app.enterSession("s2");
+      await poll();
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "A", sessionId: "s1", text: "typed for A only" }]);
+      // Once the source is stopped (the move's kill) it follows; never to a stopped target.
+      fleet = [
+        agent({ key: "A", sessions: [session({ id: "s1", status: "stopped" }), session({ id: "s2" })] }),
+        agent({ key: "B", sessions: [session({ id: "s9", status: "stopped", migratedFrom: { host: "A", sessionId: "s1" } })] }),
+      ];
+      await poll();
+      expect(Object.keys(app.getState().drafts)).toEqual([JSON.stringify(["A", "s1"])]);
+      fleet[1] = agent({ key: "B", sessions: [session({ id: "s9", migratedFrom: { host: "A", sessionId: "s1" } })] });
+      await poll();
+      expect(Object.values(app.getState().drafts)).toEqual([{ hostKey: "B", sessionId: "s9", text: "typed for A only" }]);
+    });
+
+    it("a moved answer meeting one already at the target joins it, or is kept as a stale prompt", async () => {
+      const ask = (q: string) => signals({ question: q, questionOptions: ["Yes", "No"] });
+      const moveWith = async (srcFor: string) => {
+        fleet = [
+          agent({ key: "A", sessions: [session({ id: "s1", session: ask(srcFor) }), session({ id: "s2" })] }),
+          agent({ key: "B", sessions: [session({ id: "s9", session: ask("Q") })] }),
+        ];
+        const app = await boot();
+        app.enterSession("s9", "B");
+        dictateAnswer("DSTANS");
+        app.enterSession("s1", "A");
+        dictateAnswer("SRCANS");
+        app.enterSession("s2");
+        fleet = [
+          agent({ key: "A", sessions: [session({ id: "s2" })] }),
+          agent({ key: "B", sessions: [session({ id: "s9", session: ask("Q"), migratedFrom: { host: "A", sessionId: "s1" } })] }),
+        ];
+        await poll();
+        return Object.values(app.getState().drafts);
+      };
+      expect(await moveWith("Q")).toEqual([
+        { hostKey: "B", sessionId: "s9", text: "", answer: { text: "DSTANS SRCANS", for: "Q" } },
+      ]);
+      expect(await moveWith("Other?")).toEqual([
+        { hostKey: "B", sessionId: "s9", text: "SRCANS", stale: true, answer: { text: "DSTANS", for: "Q" } },
+      ]);
+    });
+
+    it("a stale part of a stash comes back marked even beside an ordinary part", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const { app } = asker(session({ id: "s1", session: asking }), session({ id: "s2" }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictateAnswer("friday");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] })]; // answered elsewhere
+      await poll();
+      app.enterSession("s2"); // stashes the stale answer as the ordinary part
+      app.enterSession("s1");
+      expect(draftOf(app)).toBe("friday");
+      expect(app.getState().session?.staleAnswer).toBe(true);
+    });
+
+    it("a stashed answer waits out the wearer's own answer mask, then comes back as that answer", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const { client, app } = asker(session({ id: "s1", session: asking }), session({ id: "s2" }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      dictateAnswer("friday");
+      app.enterSession("s2");
+      await app.answerQuestion("A", "s1", { optionIndex: 0 }); // the phone
+      app.enterSession("s1");
+      expect(draftOf(app)).toBe(""); // masked: no question shown, but not proof it's gone
+      await poll();
+      expect(draftOf(app)).toBe("");
+      await vi.advanceTimersByTimeAsync(ANSWER_MASK_MS + POLL); // the hub re-asks
+      expect(draftOf(app)).toBe("friday");
+      expect(app.getState().session?.answerFor).toBe("Ship it?");
+      expect(client.sendInput).not.toHaveBeenCalled();
+    });
+
+    it("the tap guard arms on a replacing question too", async () => {
+      const first = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const second = signals({ question: "Delete prod DB?", questionOptions: ["No", "Yes"] });
+      const { client, app } = asker(session({ id: "s1", session: first }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: second })] })];
+      await poll();
+      display.emit({ type: "tap" });
+      expect(client.answerQuestion).not.toHaveBeenCalled();
+    });
+
+    it("the tap guard never re-arms for the question re-listed after a missed poll, nor arms off-screen", async () => {
+      const asking = signals({ question: "Ship it?", questionOptions: ["Yes", "No"] });
+      const { client, app } = asker(session({ id: "s1", session: asking }));
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("s1");
+      await poll();
+      fleet = []; // a hub restart
+      await poll();
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: asking })] })];
+      await poll();
+      display.emit({ type: "tap" }); // the wearer was already reading it
+      expect(client.answerQuestion).toHaveBeenCalledTimes(1);
+      // Home while a new question lands: entering then tapping is deliberate.
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1" })] })];
+      await vi.advanceTimersByTimeAsync(ANSWER_MASK_MS + POLL);
+      display.emit({ type: "doubleTap" }); // -> home
+      expect(app.getState().screen).toBe("home");
+      const other = signals({ question: "Delete prod DB?", questionOptions: ["No", "Yes"] });
+      fleet = [agent({ key: "A", sessions: [session({ id: "s1", session: other })] })];
+      await poll();
+      app.enterSession("s1");
+      display.emit({ type: "tap" });
+      expect(client.answerQuestion).toHaveBeenCalledTimes(2);
+    });
+
     it("no marker, an archive restore's null id, or a malformed marker moves nothing", async () => {
       fleet = [agent({ key: "A", sessions: [session({ id: "s1" }), session({ id: "s2" })] }), agent({ key: "B" })];
       const app = await boot();
