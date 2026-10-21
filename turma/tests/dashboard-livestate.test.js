@@ -207,6 +207,17 @@ test("dashboard liveState: a permission names what it asks for", () => {
   assert.equal(liveState({ session: pp }, onlineHost, NOW).ask, "Do you want to proceed?");
 });
 
+// XERK-2152: a dialog that is no panePrompt (the picker, an MCP approval) reads
+// as waiting on the terminal, never "idle", with the hub's age.
+test("dashboard liveState: a terminal-only dialog says where to answer it", () => {
+  const { liveState } = loadDashboard();
+  const s = liveState({ session: { paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant" },
+    attention: { state: "needs-you:dialog", since: NOW - 3 * 60 * 1000, why: "a dialog in the terminal" } }, onlineHost, NOW);
+  assert.equal(s.label, "waiting on a dialog in the terminal");
+  assert.equal(s.cls, "sess-wait");
+  assert.equal(s.detail, "for\u00a03m");
+});
+
 // XERK-1571 screenshot defect: a question card's State row carries how long it
 // has waited, like every other needs-you card and the Sessions page's "for 22m".
 test("dashboard liveState: a question card says how long it has waited", () => {

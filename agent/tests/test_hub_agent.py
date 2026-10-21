@@ -3059,6 +3059,19 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(ps.call_args[0][0], "agent-abc")
         self.assertIsInstance(ps.call_args[0][1], dict)
 
+    def test_a_dialog_the_pane_status_saw_rides_the_report(self):
+        # XERK-2152: _pane_status leaves "any dialog owns the pane" on state; the
+        # report carries it as a strict boolean so the hub can tell the operator.
+        def status(_name, state):
+            state["paneDialog"] = True
+            return False, None, None
+        with mock.patch.object(ha, "_pane_status", side_effect=status):
+            rep = ha.session_report("/absent/worktree", {}, "agent-abc")
+        self.assertIs(rep["paneDialog"], True)
+        with mock.patch.object(ha, "_pane_status", return_value=(False, None, None)):
+            rep = ha.session_report("/absent/worktree", {}, "agent-abc")
+        self.assertIs(rep["paneDialog"], False)
+
     def test_pane_reads_reported_without_transcript(self):
         # No transcript yet — the pane reads must still ride the early-return
         # path.

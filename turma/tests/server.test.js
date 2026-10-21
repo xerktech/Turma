@@ -1215,6 +1215,12 @@ test("XERK-1571: sessionAttention derives every state in precedence order", () =
   const timed = { type: "shell", label: "Sleep", kind: "wait-timed", eta: now + 10 * WMIN };
   assert.deepEqual(att(s({ question: "Ship it?" })), { state: "needs-you:question", why: "Ship it?" });
   assert.deepEqual(att(s({ panePrompt: { prompt: "Allow rm?" } })), { state: "needs-you:permission", why: "Allow rm?" });
+  // XERK-2152: a dialog that is no panePrompt (the picker, an MCP elicitation) needs
+  // the operator in the terminal; a numbered panePrompt still reads as a permission.
+  assert.deepEqual(att(s({ paneDialog: true })), { state: "needs-you:dialog", why: "a dialog in the terminal" });
+  assert.equal(att(s({ paneDialog: true, panePrompt: { prompt: "Allow rm?" } })).state, "needs-you:permission");
+  assert.equal(att(s({ paneDialog: true, question: "Q" })).state, "needs-you:question");
+  assert.equal(att(s({ paneDialog: false })).state, "needs-you:review");
   // The dialog's question is a generic "Do you want to proceed?", so the why names
   // the pending command off the block above it (the real Claude Code dialog shape).
   const perm = (detail) => att(s({ panePrompt: { prompt: "Do you want to proceed?", detail } })).why;

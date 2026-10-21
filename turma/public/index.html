@@ -1156,6 +1156,7 @@ function clockTime(ms, now = Date.now()) {
 const NEEDS_YOU_CHIP = {
   "needs-you:question": ["question", "question"],
   "needs-you:permission": ["permission", "permission"],
+  "needs-you:dialog": ["dialog", "dialog"],
   "needs-you:review": ["review", "review"],
   "needs-you:test": ["review", "awaiting your test"],
   "needs-you:stalled": ["stalled", "stalled"],
@@ -1171,6 +1172,7 @@ function attentionLabel(att) {
   const [cls, word] = chip;
   if (cls === "question") return { label: "waiting for your answer", cls: "sess-wait" };
   if (cls === "permission") return { label: "waiting for your permission", cls: "sess-wait" };
+  if (cls === "dialog") return { label: "waiting on a dialog in the terminal", cls: "sess-wait" };
   return { label: [word, att.why].filter(Boolean).join(" · "),
            cls: cls === "stalled" ? "sess-stalled" : "sess-review" };
 }
@@ -1313,6 +1315,14 @@ function liveState(sess, host, now) {
     return { label: "waiting for your permission", cls: "sess-wait",
              ask: permissionAsk(sess), busy: true,
              detail: attentionFor(sess.attention, now, "needs-you:permission") };
+  // A dialog that is no panePrompt (XERK-2152: the AskUserQuestion picker, an MCP
+  // elicitation or server approval): the agent holds every message aimed at the
+  // pane until the operator answers it in the terminal. Only the hub can say so
+  // (attention), and like a permission it must read ahead of the working read.
+  // Same as sessions.html.
+  if (sess.attention?.state === "needs-you:dialog")
+    return { label: "waiting on a dialog in the terminal", cls: "sess-wait", busy: true,
+             detail: attentionFor(sess.attention, now, "needs-you:dialog") };
   // LOOPING (XERK-1572): busy, but the hub says it is stuck repeating one failing
   // call — "stalled · repeating Bash ×5", never "working". Same as sessions.html.
   if (s && s.loop && sess.attention?.state === "needs-you:stalled")

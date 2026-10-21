@@ -69,9 +69,10 @@ composed.**
     for `INPUT_HOLD_TTL_SEC`, then drops it with a log line.
     - A TTL drop also forgets the leftover record that held it (else it holds the NEXT message
       too) — that record object only (`h["leftover"]`), never a newer one stored since — and a
-      dropped OPERATOR message logs `OPERATOR MESSAGE NOT DELIVERED`. No agent→hub channel
-      carries it yet (spawnFailures is keyed to spawn cmdIds), so that log line is the
-      operator's only trace.
+      dropped OPERATOR message logs `OPERATOR MESSAGE NOT DELIVERED`. The drop itself rides no
+      agent→hub channel (spawnFailures is keyed to spawn cmdIds), but the HOLD is visible: the
+      report's `paneDialog` makes the hub serve `needs-you:dialog` (XERK-2152,
+      `turma-attention.md`), so every client says to open the terminal.
     - Accepted residual: after that drop, the composer may still hold our stale fragment plus
       the operator's text, and the NEXT message is typed into it and submitted glued to both.
     - One session's messages go in order: a later one queues behind a held one, and one

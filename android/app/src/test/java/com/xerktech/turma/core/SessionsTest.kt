@@ -273,6 +273,7 @@ class SessionsTest {
         assertEquals("stalled · Watch CI", attentionLabel(att("needs-you:stalled", now, "Watch CI")))
         assertEquals("waiting for your answer", attentionLabel(att("needs-you:question", now, "Ship it?")))
         assertEquals("waiting for your permission", attentionLabel(att("needs-you:permission", now, "Bash: ls")))
+        assertEquals("waiting on a dialog in the terminal", attentionLabel(att("needs-you:dialog", now, "a dialog in the terminal")))
         assertEquals("review", attentionLabel(att("needs-you:review", now)))
         assertEquals("awaiting your test · PR open", attentionLabel(att("needs-you:test", now, "PR open")))
         assertEquals(null, attentionLabel(att("working", now)))
@@ -609,6 +610,12 @@ class SessionsTest {
         assertEquals(st("waiting for your permission", com.xerktech.turma.ui.CardTone.WAITING), card(SessionInfo(
             status = "running", attention = att("needs-you:permission", now, "Bash: ls"),
             session = LiveSignals(paneBusy = false, transcriptAgeSec = 1.0))))
+        // XERK-2152: a terminal-only dialog says where to answer it.
+        assertEquals(st("waiting on a dialog in the terminal", com.xerktech.turma.ui.CardTone.WAITING), card(SessionInfo(
+            status = "running", attention = att("needs-you:dialog", now),
+            session = LiveSignals(paneBusy = false, transcriptAgeSec = 1.0))))
+        assertEquals(LiveState.WAITING, liveState(SessionInfo(status = "running", attention = att("needs-you:dialog", now),
+            session = LiveSignals(paneBusy = false, transcriptAgeSec = 1.0)), now, now))
         assertEquals(st("⏳ waiting · Watch CI", com.xerktech.turma.ui.CardTone.HOLDING),
             card(waitingOn(shell("wait-external", "Watch CI"))))
         // A stalled wait names what it stalled on, in the danger tone, with no age.
