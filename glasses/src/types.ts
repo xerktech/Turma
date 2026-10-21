@@ -114,6 +114,10 @@ export interface SessionInfo {
     state: string; since: number; eta?: number; why?: string;
     hint?: { label: string; why: string; suggestedAnswer?: string };
   } | null;
+  // Where a migrated session came from (XERK-2109): the source's host key and
+  // session id (null for an archive restore). Coerced hub-side
+  // (`coerceMigratedFrom`); still read defensively (App.followMigratedDrafts).
+  migratedFrom?: { host?: string | null; sessionId?: string | null; at?: number | null; fromArchive?: boolean } | null;
   [key: string]: unknown;
 }
 

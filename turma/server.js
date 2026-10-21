@@ -10416,6 +10416,28 @@ function coerceGitProblem(o) {
   }
 }
 
+// `migratedFrom` (XERK-2109) — where a moved session came from, as this hub's
+// importSession / archive restore stamped it and the agent echoes it on every
+// beat. The glasses move a stashed draft by {host, sessionId}; Android does not
+// type it today. Rebuilt from its known leaves (a whitelist: anything else an
+// agent adds is dropped) or deleted when not an object, so whichever client
+// types it next gets a decode-safe shape. `host`/`sessionId` are a string or
+// null (null = "can't tell", e.g. an archive restore has no source id); the
+// 200-char cap is an inline literal for the same TDZ reason as coerceGitProblem.
+function coerceMigratedFrom(o) {
+  if (!("migratedFrom" in o)) return;
+  const m = o.migratedFrom;
+  if (!objectish(m)) {
+    delete o.migratedFrom;
+    return;
+  }
+  const str = (v) => (typeof v === "string" && v && v.length <= 200 ? v : null);
+  const out = { host: str(m.host), sessionId: str(m.sessionId) };
+  if (typeof m.at === "number" && Number.isSafeInteger(m.at) && m.at >= 0) out.at = m.at;
+  if (m.fromArchive === true) out.fromArchive = true;
+  o.migratedFrom = out;
+}
+
 // `ticket.outcome` (XERK-1569) — how a session closed its own ticket, stamped by
 // the agent's close-ticket reader on the session's ticket block and its ticket
 // ledger (so it rides sessions, closedSessions AND repos[].resumable). Android
@@ -10905,6 +10927,7 @@ function normalizeSessions(payload) {
       delete s.git.dirtyFiles;
     }
     coerceGitProblem(s);
+    coerceMigratedFrom(s);
     if (objectish(s.work)) {
       for (const k of ["aheadOfBase", "aheadOfRemote"]) {
         if (k in s.work && !wireInt32(s.work[k])) delete s.work[k];

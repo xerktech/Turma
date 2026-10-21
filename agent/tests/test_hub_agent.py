@@ -10895,6 +10895,17 @@ class TestSessionPayloadNeverRaises(ManagerMixin, unittest.TestCase):
                 payload = sm._session_payload(sess, refresh=True)  # must not raise
                 self.assertIsNone(payload["transcriptId"], (wt, status))
 
+    def test_migrated_from_rides_the_payload_and_is_none_without_one(self):
+        # XERK-2109: the record kept `migratedFrom` but the beat never sent it,
+        # so no client could tell a moved session from an unrelated one.
+        sm = self.make_manager()
+        mf = {"host": "hostA", "sessionId": "orig", "at": 1}
+        payload = sm._session_payload(
+            {"id": "s", "status": "stopped", "migratedFrom": mf}, refresh=True)
+        self.assertEqual(payload["migratedFrom"], mf)
+        self.assertIsNone(sm._session_payload({"id": "s", "status": "stopped"},
+                                              refresh=True)["migratedFrom"])
+
     def test_an_unhashable_id_does_not_crash_the_cache_lookups(self):
         # A record whose id is a list/dict is unhashable, so the sid-keyed cache
         # lookups in the return dict (usage_cache.get(sid) / _session_prs(sid),

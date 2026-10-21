@@ -44977,6 +44977,12 @@ class SessionManager:
             # url, summary, branch} — or None. The board reverse-indexes it to
             # link a ticket to its sessions; the session card links back out.
             "ticket": _served_ticket(sess),
+            # Where a migrated session came from ({host, sessionId, at} as the
+            # hub's importSession / archive restore stamped it), or None. The one
+            # proof a new (host, id) IS a moved conversation: the glasses follow
+            # a stashed draft by it (XERK-2109). The hub coerces it; .get() keeps
+            # a record without it (every non-migrated one) beat-safe.
+            "migratedFrom": sess.get("migratedFrom"),
             # The hub command that created this session (spawn / resumeTranscript),
             # so the UI that issued it can find the id the agent minted and open
             # the session. None for sessions predating the echo, or restored ones.

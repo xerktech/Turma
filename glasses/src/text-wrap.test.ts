@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { charMeasure, PX_PER_CHAR, pretextMeasure, setDefaultMeasure, wrapText } from "./text-wrap.ts";
+import { charMeasure, PX_PER_CHAR, pretextMeasure, setDefaultMeasure, splitLongWord, wrapText } from "./text-wrap.ts";
 
 // A trivial 1px-per-char measure makes wrap-point math exact and easy to
 // reason about in assertions.
@@ -34,6 +34,53 @@ describe("wrapText", () => {
     const lines = wrapText("x".repeat(400), 10, counting);
     expect(lines).toHaveLength(40);
     expect(calls).toBeLessThan(1000); // the linear walk-back took ~8000
+  });
+
+  // The XERK-1858 binary search, kept verbatim as the reference the galloping
+  // split must reproduce exactly (XERK-2109).
+  function oldSplitLongWord(word: string, maxWidthPx: number, measure: (s: string) => number): string[] {
+    const fits = (s: string) => measure(s) <= maxWidthPx + 1e-6;
+    const chunks: string[] = [];
+    let rest = Array.from(word);
+    while (rest.length > 0 && !fits(rest.join(""))) {
+      let lo = 1;
+      let hi = rest.length - 1;
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (fits(rest.slice(0, mid).join(""))) lo = mid;
+        else hi = mid - 1;
+      }
+      chunks.push(rest.slice(0, lo).join(""));
+      rest = rest.slice(lo);
+    }
+    if (rest.length > 0) chunks.push(rest.join(""));
+    return chunks;
+  }
+
+  it("splits a long word exactly as the old binary search did, on varied inputs (XERK-2109)", () => {
+    // Uneven per-code-point widths, zero-width ones included (still monotone).
+    const uneven = (s: string) => Array.from(s).reduce((w, c) => w + ((c.codePointAt(0)! * 7) % 5), 0);
+    const utf16 = (s: string) => s.length;
+    const measures = [perChar, charMeasure, uneven, utf16];
+    let seed = 12345;
+    const rand = (n: number) => ((seed = (seed * 1103515245 + 12345) % 2 ** 31), seed % n);
+    const alphabet = Array.from("abcdefghijXYZ0123456789😀é漢​");
+    for (let trial = 0; trial < 300; trial++) {
+      const len = rand(400);
+      const word = Array.from({ length: len }, () => alphabet[rand(alphabet.length)]).join("");
+      const width = [0, 0.5, 1, 2, 3, 7, 40, 560][rand(8)]!;
+      for (const m of measures) {
+        expect(splitLongWord(word, width, m), `trial ${trial} width ${width}`).toEqual(oldSplitLongWord(word, width, m));
+      }
+    }
+  });
+
+  it("wraps a 200k-char unbroken word in well under a second (XERK-2109)", () => {
+    const t0 = performance.now();
+    const lines = wrapText("x".repeat(200_000), 560);
+    expect(lines).toHaveLength(Math.ceil(200_000 / 55));
+    // Was ~9.6s here (quadratic); now ~25ms. The bound leaves room for slow CI.
+    expect(performance.now() - t0).toBeLessThan(1000);
   });
 
   it("returns an empty array for empty text", () => {

@@ -3737,6 +3737,29 @@ test("XERK-1564: a session's wake request is coerced by name, absent = none", ()
   assert.equal("wakeReason" in none, false);
 });
 
+test("XERK-2109: a session's migratedFrom is kept, rebuilt from its known leaves, or dropped", () => {
+  const sess = (migratedFrom) => {
+    const r = { device: "xerk2109-mf", sessions: [{ id: "s", migratedFrom }] };
+    hub.normalizeRecord(r);
+    return r.sessions[0];
+  };
+  assert.deepEqual(sess({ host: "hostA", sessionId: "orig", at: 1700000000000 }).migratedFrom,
+    { host: "hostA", sessionId: "orig", at: 1700000000000 });
+  assert.deepEqual(sess({ host: "hostA", sessionId: null, at: 5, fromArchive: true, x: 1 }).migratedFrom,
+    { host: "hostA", sessionId: null, at: 5, fromArchive: true });
+  // Wrong-typed leaves degrade to "can't tell"; an unknown leaf is dropped.
+  assert.deepEqual(sess({ host: 7, sessionId: ["s"], at: "now", fromArchive: "yes", evil: {} }).migratedFrom,
+    { host: null, sessionId: null });
+  assert.deepEqual(sess({ host: "h".repeat(201), sessionId: "" }).migratedFrom, { host: null, sessionId: null });
+  for (const bad of [null, "hostA:orig", 5, true, []]) {
+    assert.equal("migratedFrom" in sess(bad), false, `kept ${JSON.stringify(bad)}`);
+  }
+  // A session that never moved carries none.
+  const r = { device: "xerk2109-none", sessions: [{ id: "s" }] };
+  hub.normalizeRecord(r);
+  assert.equal("migratedFrom" in r.sessions[0], false);
+});
+
 test("XERK-1887: gitProblem is rebuilt from its two shapes or dropped, on sessions and repos", () => {
   const rec = (gitProblem) => {
     const r = {

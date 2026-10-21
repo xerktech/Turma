@@ -61,24 +61,45 @@ function fits(s: string, maxWidthPx: number, measure: Measure): boolean {
 // Hard-splits a single word wider than maxWidthPx into width-fitting chunks.
 // Always makes progress (splits at least one character) even if a single
 // character alone exceeds maxWidthPx, so it never infinite-loops. Splits on
-// code points, so an emoji's surrogate pair never lands across two lines, and
-// binary-searches each split (the measure is monotone in prefix length): a
-// linear walk back from the end measured O(n) prefixes of O(n) each per chunk.
-function splitLongWord(word: string, maxWidthPx: number, measure: Measure): string[] {
+// code points, so an emoji's surrogate pair never lands across two lines.
+// Each split is the longest fitting prefix (the measure is monotone in prefix
+// length), found by galloping from the chunk's start and then binary-searching
+// the last doubling: O(k log k) work for a chunk of k code points, so a whole
+// word is near-linear. Measuring or slicing the whole REST per chunk (as the
+// first binary search did) is O(n) per line, quadratic over an unbroken word.
+export function splitLongWord(word: string, maxWidthPx: number, measure: Measure): string[] {
+  const cps = Array.from(word);
   const chunks: string[] = [];
-  let rest = Array.from(word);
-  while (rest.length > 0 && !fits(rest.join(""), maxWidthPx, measure)) {
-    let lo = 1;
-    let hi = rest.length - 1;
+  const piece = (from: number, len: number) => cps.slice(from, from + len).join("");
+  for (let at = 0; at < cps.length; ) {
+    const left = cps.length - at;
+    // Double the prefix until it overflows (`bad`) or the rest fits whole.
+    let good = 0;
+    let bad = 0;
+    for (let k = 1; ; k = Math.min(k * 2, left)) {
+      if (!fits(piece(at, k), maxWidthPx, measure)) {
+        bad = k;
+        break;
+      }
+      good = k;
+      if (k === left) break;
+    }
+    if (good === left) {
+      chunks.push(piece(at, left));
+      break;
+    }
+    // The longest fitting prefix lies in [good, bad), and is at least one code
+    // point even when that alone overflows, so the loop always progresses.
+    let lo = Math.max(1, good);
+    let hi = Math.max(lo, bad - 1);
     while (lo < hi) {
       const mid = Math.ceil((lo + hi) / 2);
-      if (fits(rest.slice(0, mid).join(""), maxWidthPx, measure)) lo = mid;
+      if (fits(piece(at, mid), maxWidthPx, measure)) lo = mid;
       else hi = mid - 1;
     }
-    chunks.push(rest.slice(0, lo).join(""));
-    rest = rest.slice(lo);
+    chunks.push(piece(at, lo));
+    at += lo;
   }
-  if (rest.length > 0) chunks.push(rest.join(""));
   return chunks;
 }
 
