@@ -216,6 +216,10 @@ test("dashboard liveState: a terminal-only dialog says where to answer it", () =
   assert.equal(s.label, "waiting on a dialog in the terminal");
   assert.equal(s.cls, "sess-wait");
   assert.equal(s.detail, "for\u00a03m");
+  // Busy under the dialog (the pane can read busy) still says where to answer it.
+  const busy = liveState({ session: { paneBusy: true, transcriptAgeSec: 1 },
+    attention: { state: "needs-you:dialog", since: NOW, why: "a dialog in the terminal" } }, onlineHost, NOW);
+  assert.equal(busy.label, "waiting on a dialog in the terminal");
 });
 
 // XERK-1571 screenshot defect: a question card's State row carries how long it

@@ -13698,6 +13698,56 @@ test("XERK-637: an armed run's child auto-merges even with NO org opt-in and a n
   assert.equal(c.sessionId, "s-c1");
 });
 
+// XERK-2152: a session held on a terminal-only dialog (paneDialog, no panePrompt)
+// is waiting on the operator in the terminal — every hub read that skips a
+// panePrompt skips it too, and the served attention says so.
+test("XERK-2152: a terminal-only dialog is served as needs-you:dialog and blocks like a panePrompt", async () => {
+  const now = Date.now();
+  // The wire: a boolean rides, anything else is dropped (Android-safe), and the
+  // served attention is needs-you:dialog through wireAttention.
+  const host = "dlg-host";
+  const beat = (paneDialog) => request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [{ id: "s1", status: "running",
+      session: { paneBusy: false, transcriptAgeSec: 30, lastRole: "user", paneDialog } }] },
+  });
+  assert.equal((await beat(true)).status, 200);
+  assert.equal(agents[host].sessions[0].session.paneDialog, true);
+  assert.deepEqual(hub.serializeAgent(host, agents[host], Date.now()).sessions[0].attention.state, "needs-you:dialog");
+  for (const bad of ["true", 1, { x: 1 }, "<img src=x onerror=alert(1)>"]) {
+    assert.equal((await beat(bad)).status, 200);
+    assert.equal("paneDialog" in agents[host].sessions[0].session, false, JSON.stringify(bad));
+    assert.notEqual(hub.serializeAgent(host, agents[host], Date.now()).sessions[0].attention.state, "needs-you:dialog");
+  }
+  delete agents[host];
+  // Ready for review even mid-turn, like a panePrompt.
+  const sess = (live) => ({ id: "s1", status: "running", session: { paneBusy: false, transcriptAgeSec: 5, lastRole: "user", ...live } });
+  assert.equal(readyForReview(sess({}), false), false);
+  assert.equal(readyForReview(sess({ paneDialog: true }), true), true);
+  // A sleeper in a dialog is never paused.
+  const sleeper = (live) => ({ status: "running", session: { wakeAt: now + 3600000, paneBusy: false, agents: [], ...live } });
+  assert.equal(hub.sleeperPausable(sleeper({}), now), true);
+  assert.equal(hub.sleeperPausable(sleeper({ paneDialog: true }), now), false);
+});
+
+test("XERK-2152: auto-merge holds while a terminal-only dialog is up", async () => {
+  for (const [paneDialog, merges] of [[true, false], [false, true]]) {
+    resetEpicD();
+    const host = `edDlg${merges}`;
+    const site = `ddlg${merges}.atlassian.net`;
+    const url = `https://github.com/ep/dlg${merges}/pull/1`;
+    const sess = dChildSession("s-c1", "C-1", site, "OPEN", url);
+    sess.session.paneDialog = paneDialog;
+    await asBeat(host, site, { autoStart: false,
+      tickets: [dEpic(), dChild("C-1", [], "inprogress")], sessions: [sess] });
+    armEpicRun(site, "E-1");
+    autoMergeSweep();
+    const merged = (agents[host].commands || []).some((c) => c.type === "mergePr" && c.url === url);
+    assert.equal(merged, merges, `paneDialog=${paneDialog}`);
+    delete agents[host];
+  }
+});
+
 test("auto-merge holds for a timed wait ahead of its ETA, never for an external watch", async () => {
   // A session watching CI or polling for its own merge would otherwise hold the
   // merge it is waiting on — the two wait on each other forever.
