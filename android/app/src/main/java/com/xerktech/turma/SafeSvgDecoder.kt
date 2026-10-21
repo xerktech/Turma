@@ -452,12 +452,17 @@ object ServedContentType : Interceptor {
         val guessed = raw?.toMediaTypeOrNull() == null || raw.trim().startsWith("text/plain", ignoreCase = true)
         val body = response.body
         if (!guessed || body == null) return response
+        // OkHttp can't parse "image/svg+xml ; charset=utf-8" (a space before the `;`, which
+        // HTTP allows and Chrome renders): it is relabelled to its clean self, not refused.
+        val essence = raw?.substringBefore(';')?.trim()
+        val label = if (essence.equals(SVG_TYPE.toString(), ignoreCase = true)) SVG_TYPE else OCTET_STREAM
         // Coil reads the BODY's type on a fetch and the header on a disk-cache hit: both change.
         return response.newBuilder()
-            .header("Content-Type", OCTET_STREAM.toString())
-            .body(body.source().asResponseBody(OCTET_STREAM, body.contentLength()))
+            .header("Content-Type", label.toString())
+            .body(body.source().asResponseBody(label, body.contentLength()))
             .build()
     }
 
     private val OCTET_STREAM = "application/octet-stream".toMediaType()
+    private val SVG_TYPE = "image/svg+xml".toMediaType()
 }

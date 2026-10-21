@@ -83,6 +83,11 @@ class ServedContentTypeTest {
     @Test fun `an svg served as image svg+xml renders`() {
         assertTrue(svgAs("image/svg+xml") is SuccessResult)
         assertTrue(svgAs("image/svg+xml; charset=utf-8") is SuccessResult)
+        // A space before the `;` (OkHttp can't parse it; Chrome renders it), at an .svg URL
+        // and at one with no extension for Coil to guess from.
+        assertTrue(svgAs("image/svg+xml ; charset=utf-8") is SuccessResult)
+        assertTrue(svgAs("image/svg+xml ; charset=utf-8", noStore = true) is SuccessResult)
+        assertTrue(load(Buffer().writeUtf8(svg), "IMAGE/SVG+XML ; charset=utf-8", "noext${++n}") is SuccessResult)
     }
 
     @Test fun `an svg served as text plain or with no type is broken`() {
