@@ -20993,6 +20993,18 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self.assertIs(ha._composer_holds_text(
             "  QATALL last\n" + rule + "  ⏵⏵ auto mode on (shift+tab to cycle)\n"), True)
         self.assertIs(ha._composer_holds_text("no composer\n"), True)
+        # The box is the LAST two rules: one in the conversation above it (a
+        # reply can draw its own) is not the composer's.
+        self.assertIs(ha._composer_holds_text(
+            rule + "● a reply\n" + rule + "✻ Churned\n" + box("❯ ")), False)
+
+    def test_only_windows_goes_on_without_a_styled_capture(self):
+        self.assertTrue(ha._composer_blocks_switch(None))
+        with mock.patch.object(ha, "IS_WINDOWS", True):
+            self.assertFalse(ha._composer_blocks_switch(None))
+            self.assertTrue(ha._composer_blocks_switch("no composer\n"))
+        rule = "─" * 30 + "\n"
+        self.assertFalse(ha._composer_blocks_switch(rule + "❯ \n" + rule))
         self.assertIsNone(ha._composer_holds_text(None))
 
     def test_set_model_never_confirms_off_a_picker_still_drawn(self):

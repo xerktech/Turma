@@ -17523,6 +17523,14 @@ def _composer_holds_text(styled):
     return bool(text.replace("❯", "").replace("\xa0", "").strip())
 
 
+def _composer_blocks_switch(styled):
+    """Whether set_model must wait for the composer: it may hold a draft, or
+    (on tmux) it could not be captured at all. Windows' grid capture carries no
+    styling to read (None), so there it keeps the old behaviour and goes on."""
+    holds = _composer_holds_text(styled)
+    return bool(holds) or (holds is None and not IS_WINDOWS)
+
+
 def _composer_rows(cap):
     """The composer's rows as drawn (between the last two rules), or None."""
     if not cap:
@@ -34410,10 +34418,7 @@ class SessionManager:
             self.save()
             log(f"set model of {sid} -> {arg}: a dialog is up; deferred until it closes")
             return
-        holds = _composer_holds_text(_capture_pane_styled(tmux_name))
-        # Windows' grid capture carries no styling to read (None): it keeps the
-        # old behaviour. On tmux no capture is "can't tell", which waits too.
-        if holds or (holds is None and not IS_WINDOWS):
+        if _composer_blocks_switch(_capture_pane_styled(tmux_name)):
             # The operator has a draft in the composer. "/model" + Enter would
             # submit it as a prompt with "/model" glued on, and clearing it
             # first is no better: Ctrl+U kills only what is before the cursor
