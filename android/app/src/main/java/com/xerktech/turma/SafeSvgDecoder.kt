@@ -454,7 +454,8 @@ object ServedContentType : Interceptor {
         if (!guessed || body == null) return response
         // OkHttp can't parse "image/svg+xml ; charset=utf-8" (a space before the `;`, which
         // HTTP allows and Chrome renders): it is relabelled to its clean self, not refused.
-        val essence = raw?.substringBefore(';')?.trim()
+        // Chrome ends the type at the first `;` or whitespace ("image/svg+xml x" renders).
+        val essence = raw?.trim()?.split(';', ' ', '\t')?.first()
         val label = if (essence.equals(SVG_TYPE.toString(), ignoreCase = true)) SVG_TYPE else OCTET_STREAM
         // Coil reads the BODY's type on a fetch and the header on a disk-cache hit: both change.
         return response.newBuilder()

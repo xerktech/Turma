@@ -87,6 +87,8 @@ class ServedContentTypeTest {
         // and at one with no extension for Coil to guess from.
         assertTrue(svgAs("image/svg+xml ; charset=utf-8") is SuccessResult)
         assertTrue(svgAs("image/svg+xml ; charset=utf-8", noStore = true) is SuccessResult)
+        assertTrue(svgAs("image/svg+xml x") is SuccessResult) // Chrome stops at whitespace
+        assertTrue(svgAs("image/svg+xmlx ; a=b") is ErrorResult)
         assertTrue(load(Buffer().writeUtf8(svg), "IMAGE/SVG+XML ; charset=utf-8", "noext${++n}") is SuccessResult)
     }
 
