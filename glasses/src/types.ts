@@ -55,6 +55,10 @@ export interface LiveSignals {
   lastHasToolUse: boolean;
   question: string | null;
   questionOptions: string[];
+  // A blocking TUI dialog (tool permission / plan approval) the agent read off
+  // the pane. Only `prompt` is read here: non-empty means the session waits on
+  // the operator (web liveState). Absent from an older agent.
+  panePrompt?: { prompt?: string | null; [key: string]: unknown } | null;
   tail: TailEntry[];
   newPrUrls: string[];
 }

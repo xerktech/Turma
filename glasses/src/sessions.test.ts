@@ -43,6 +43,22 @@ describe("liveState", () => {
     expect(liveState(s, Date.now(), Date.now())).toBe("idle");
   });
 
+  // XERK-2148: listed in Ready for review (needs-you:*) but read "idle" here,
+  // while web/Android say it waits for permission / on a dialog.
+  it("is 'waiting' on a permission panePrompt or a needs-you:dialog, ahead of working", () => {
+    const now = 1_000_000;
+    const perm = session({ session: signals({ paneBusy: false, transcriptAgeSec: 5,
+      panePrompt: { prompt: "Do you want to proceed?" } }) });
+    expect(liveState(perm, now - 10_000, now)).toBe("waiting");
+    const empty = session({ session: signals({ paneBusy: false, transcriptAgeSec: 5,
+      panePrompt: { prompt: "" } }) });
+    expect(liveState(empty, now - 10_000, now)).toBe("idle");
+    const dialog = session({ attention: { state: "needs-you:dialog", since: now },
+      session: signals({ paneBusy: true, transcriptAgeSec: null }) });
+    expect(liveState(dialog, now - 10_000, now)).toBe("waiting");
+    expect(inReview(dialog, now - 10_000, now)).toBe(true);
+  });
+
   it("keeps the old behaviour when no host is supplied", () => {
     const s = session({ session: signals({ paneBusy: true, transcriptAgeSec: 5 }) });
     expect(liveState(s)).toBe("working");
