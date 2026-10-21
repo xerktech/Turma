@@ -14157,7 +14157,8 @@ def parse_pane_mode(cap):
 # ordinary numbered list in conversation text does not, is all four of:
 #   1. a contiguous run of >= 2 options numbered 1..N in order;
 #   2. exactly one carrying the TUI's "❯" selection cursor;
-#   3. a question line (ends in "?") directly above the run;
+#   3. a question line (ends in "?") directly above the run, or above one
+#      blank-fenced subtitle paragraph (XERK-2162);
 #   4. NO mode footer below it — the footer marker rides the composer, which a
 #      dialog replaces, so its absence is what says "this is a live dialog"
 #      rather than transcript text that happens to look like one.
@@ -14195,6 +14196,9 @@ PANE_PROMPT_DETAIL_CHARS = 800
 # only so a pathological pane can't grow the in-memory key. 14 lines of a wide pane.
 PANE_PROMPT_FACE_CHARS = 8000
 PANE_PROMPT_MAX_OPTIONS = 9   # answered by typing the digit; 10+ isn't one key
+# A subtitle between the question and the options ("Claude wants to exit plan
+# mode"), at most this many lines — room for one sentence wrapped on a narrow pane.
+PANE_PROMPT_SUBTITLE_LINES = 3
 
 
 def _pane_cells(text):
@@ -14351,10 +14355,26 @@ def parse_pane_prompt(cap, face=False):
             continue                 # no cursor (or several): not a live picker
         if len(opts) > PANE_PROMPT_MAX_OPTIONS:
             continue
-        # The question sits directly above, skipping blanks.
+        # The question sits directly above, skipping blanks — or above one
+        # subtitle paragraph fenced by blanks on both sides (XERK-2162: "Exit
+        # plan mode?" / "Claude wants to exit plan mode" / the run).
         q = start - 1
         while q >= 0 and not lines[q].strip():
             q -= 1
+        subtitle = []
+        if q >= 0 and not lines[q].strip().endswith("?") and q < start - 1:
+            k = q
+            while (k >= 0 and lines[k].strip()
+                   and not lines[k].strip().endswith("?")
+                   and not PANE_PROMPT_RULE_RE.match(lines[k])
+                   and not PANE_PROMPT_OPTION_RE.match(lines[k])):
+                k -= 1
+            if (0 <= k and not lines[k].strip()
+                    and q - k <= PANE_PROMPT_SUBTITLE_LINES):
+                subtitle = [l.strip() for l in lines[k + 1:q + 1]]
+                q = k
+                while q >= 0 and not lines[q].strip():
+                    q -= 1
         if q < 0 or not lines[q].strip().endswith("?"):
             continue
         prompt = lines[q].strip()
@@ -14376,6 +14396,9 @@ def parse_pane_prompt(cap, face=False):
         detail = block[:PANE_PROMPT_DETAIL_LINES]
         detail.reverse()
         block.reverse()
+        # The subtitle is the dialog's own context, read after the block.
+        detail += subtitle
+        block += subtitle
         # The dialog's identity (XERK-1831): a digest of everything uncut — the
         # question, the whole block above it and the option labels (never the
         # ❯ cursor, which arrow keys move). `detail` is a capped window, so two

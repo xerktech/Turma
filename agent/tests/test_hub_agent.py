@@ -20091,6 +20091,21 @@ PANE_FULL_WIDTH_WRAP_DIALOG = """\
  Esc to cancel · Tab to amend
 """
 
+# XERK-2162: Claude Code 2.1.306 at 44 columns, plan mode, asking to exit plan
+# mode with no plan file written — a subtitle line between question and options.
+PANE_EXIT_PLAN_SUBTITLE_DIALOG = """\
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+  ────────────────────────────────────────
+   Exit plan mode?
+
+    Claude wants to exit plan mode
+
+    ❯ 1. Yes, and switch to default (ask
+         each time) for this session
+      2. No
+"""
+
 PANE_PLAN_DIALOG = """\
   ────────────────────────────────────────────────────────────────────
    Ready to code?
@@ -21756,6 +21771,40 @@ class TestParsePanePrompt(unittest.TestCase):
         # The plan body sits one rule further up than a permission dialog's
         # block; the same walk has to reach it.
         self.assertEqual(p["detail"], "Plan\nI will add one test.")
+
+    def test_a_subtitle_between_question_and_options(self):
+        # XERK-2162: Claude Code 2.1.306's exit-plan-mode dialog draws a line
+        # between the question and the run. Real 44-column capture.
+        p = ha.parse_pane_prompt(PANE_EXIT_PLAN_SUBTITLE_DIALOG)
+        self.assertEqual(p["prompt"], "Exit plan mode?")
+        self.assertEqual(
+            [(o["number"], o["label"], o["selected"]) for o in p["options"]],
+            [(1, "Yes, and switch to default (ask each time) for this session",
+              True),
+             (2, "No", False)])
+        self.assertEqual(p["detail"], "Claude wants to exit plan mode")
+        self.assertTrue(ha._pane_blocking_dialog(PANE_EXIT_PLAN_SUBTITLE_DIALOG))
+        # The subtitle is part of the dialog's identity.
+        other = ha.parse_pane_prompt(PANE_EXIT_PLAN_SUBTITLE_DIALOG.replace(
+            "wants to exit", "would like to leave"))
+        self.assertNotEqual(other["id"], p["id"])
+
+    def test_a_subtitle_needs_blank_fences_and_a_question(self):
+        # Prose glued to the question or to the run is not a subtitle.
+        self.assertIsNone(ha.parse_pane_prompt(
+            "Proceed?\nsome prose\n\n ❯ 1. Yes\n   2. No\n"))
+        self.assertIsNone(ha.parse_pane_prompt(
+            "Proceed?\n\nsome prose\n ❯ 1. Yes\n   2. No\n"))
+        # No question above the subtitle.
+        self.assertIsNone(ha.parse_pane_prompt(
+            "Heading\n\nsome prose\n\n ❯ 1. Yes\n   2. No\n"))
+        # Two paragraphs, or one longer than a wrapped sentence, are not one.
+        self.assertIsNone(ha.parse_pane_prompt(
+            "Proceed?\n\na\n\nb\n\n ❯ 1. Yes\n   2. No\n"))
+        self.assertIsNone(ha.parse_pane_prompt(
+            "Proceed?\n\na\nb\nc\nd\n\n ❯ 1. Yes\n   2. No\n"))
+        # The /model picker's description line still has no question above.
+        self.assertIsNone(ha.parse_pane_prompt(MODEL_PICKER_PANE))
 
     def test_idle_composer_is_never_a_dialog(self):
         # A numbered list in the conversation, a "?" line above it, and the

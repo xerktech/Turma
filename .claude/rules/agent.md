@@ -338,8 +338,14 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   alone reads **idle**. `parse_pane_prompt` reads `{prompt, options:[{number,label,selected}],
   detail}` off the mode marker's capture.
   - **Nothing keys on wording.** A dialog needs ALL of: options 1..N (N≥2), exactly one `❯`, a `?`
-    line directly above, **no mode footer below** (the footer rides the composer a dialog
+    line directly above (or a subtitle above, below), **no mode footer below** (the footer rides the composer a dialog
     replaces). `detail` closes on a rule, not on blanks.
+  - **One subtitle paragraph may sit between the `?` line and the run** (XERK-2162): Claude
+    Code 2.1.306's "Exit plan mode?" draws "Claude wants to exit plan mode" there, and requiring
+    the question directly above made that live dialog read as an idle composer.
+    - Blank-fenced on both sides, ≤ `PANE_PROMPT_SUBTITLE_LINES`, no `?`/rule/option line; it
+      joins `detail` and the id. Tests: `test_a_subtitle_between_question_and_options`,
+      `test_a_subtitle_needs_blank_fences_and_a_question`.
   - **A wrapped label is rejoined; the AskUserQuestion picker is refused** (XERK-2150).
     - A wrap and a picker description sit on the same label-column indent, and a label that fills
       the pane makes them identical row by row — no per-line rule can split them.
