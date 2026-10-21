@@ -14161,6 +14161,72 @@ PANE_PROMPT_FACE_CHARS = 8000
 PANE_PROMPT_MAX_OPTIONS = 9   # answered by typing the digit; 10+ isn't one key
 
 
+def _pane_cells(text):
+    """Terminal cells `text` occupies: wide (CJK/emoji) glyphs take two."""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def _pane_numbering_continues(lines, idx):
+    """Whether a numbered option follows a rule below line `idx`, before any
+    blank (XERK-2150).
+
+    The native AskUserQuestion picker splits its list with a rule — "4. Type
+    something." / ──── / "5. Chat about this" — while a permission or plan
+    dialog's last option is followed by a blank line. So a run (or the start of
+    one an option's description cut short) whose list carries on past a rule is
+    part of the picker, whose answer comes from ask.py
+    and whose rows are not digits to send. Its descriptions can't be told from
+    wrapped labels line by line: a label that fills the pane makes the
+    description's first word look like it overflowed. Without a rule this is
+    never refused: a dialog cut short by an unjoined wrap still reads as one,
+    which keeps the pane-typing guards off it."""
+    ruled = False
+    for line in lines[idx:]:
+        if not line.strip():
+            return False
+        if PANE_PROMPT_RULE_RE.match(line):
+            ruled = True
+            continue
+        om = PANE_PROMPT_OPTION_RE.match(line)
+        if ruled and om:
+            return True
+    return False
+
+
+def _pane_join_wrap(label, text):
+    """`label` with a wrapped screen line `text` appended. A path the TUI broke
+    mid-token ("…/.turma" / "/worktrees/…", "…/wor" / "ktrees/…") had no space
+    there; any other break replaced one."""
+    tail = label.rsplit(None, 1)[-1]
+    head = text.split(None, 1)[0]
+    return label + ("" if "/" in tail and "/" in head else " ") + text
+
+
+def _pane_option_wrap_end(lines, idx, width):
+    """Index of the last screen line of option `idx`'s label (XERK-2150).
+
+    The TUI word-wraps a long label onto lines indented to the label column
+    ("2. Yes, and always allow access to" / "   /long/cwd from this project").
+    A line on that indent is a wrap only when its first word would NOT have fit
+    after the line above it, so a description line under a short option ends
+    the run (the picker is also refused whole: _pane_numbering_continues).
+    `width` is the widest line in the capture (the dialog's top rule spans the
+    pane); 0 disables joining."""
+    m = PANE_PROMPT_OPTION_RE.match(lines[idx])
+    col = m.start(3)
+    j = idx
+    while width and j + 1 < len(lines):
+        nxt = lines[j + 1]
+        text = nxt.strip()
+        if (not text or PANE_PROMPT_OPTION_RE.match(nxt)
+                or len(nxt) - len(nxt.lstrip()) != col):
+            break
+        if _pane_cells(lines[j].rstrip()) + 1 + _pane_cells(text.split()[0]) <= width:
+            break                    # it would have fit: a description, not a wrap
+        j += 1
+    return j
+
+
 def parse_pane_prompt(cap, face=False):
     """The blocking choice dialog the session's TUI is showing, or None.
 
@@ -14192,6 +14258,7 @@ def parse_pane_prompt(cap, face=False):
     # below already .strip()s). NOT the horizontal rule glyphs (─━ etc), which a
     # legitimate rule/detail line is made of.
     lines = [_PANE_SCROLLBAR_RE.sub("", l) for l in cap.splitlines()]
+    width = None                     # the pane's width, measured on first need
     # A mode footer anywhere below means the composer is live -> no dialog.
     for i in range(len(lines) - 1, -1, -1):
         line = lines[i]
@@ -14201,24 +14268,48 @@ def parse_pane_prompt(cap, face=False):
                 return None          # composer footer (Claude or Qwen): nothing
                                      # is blocking
             continue
-        # Walk up while the numbers keep descending to 1.
-        end = i
-        start = i
+        # Walk up while the numbers keep descending to 1, stepping over each
+        # option's wrapped label lines (never a picker's description line).
+        if width is None:
+            width = max(_pane_cells(l.rstrip()) for l in lines)
+        rows = []                    # (first, last) screen line of each option
+        nxt = i                      # where the scan for the next option up starts
+        last = _pane_option_wrap_end(lines, i, width)
         want = int(m.group(2))
-        while start >= 0:
-            om = PANE_PROMPT_OPTION_RE.match(lines[start])
-            if not om or int(om.group(2)) != want:
+        while want > 0:
+            # Claude Code draws an empty row under an option whose line fills
+            # the pane exactly (2.1.306); step over one, but only for that.
+            gap = rows and nxt >= 0 and not lines[nxt].strip()
+            if gap:
+                last = nxt = nxt - 1
+            start = nxt
+            while (start >= 0 and lines[start].strip()
+                   and not PANE_PROMPT_OPTION_RE.match(lines[start])):
+                start -= 1           # back over the option's wrapped lines
+            om = start >= 0 and PANE_PROMPT_OPTION_RE.match(lines[start])
+            if (not om or int(om.group(2)) != want
+                    or _pane_option_wrap_end(lines, start, width) != last):
                 break
-            start -= 1
+            if gap and not any(_pane_cells(lines[k].rstrip()) == width
+                               for k in range(start, last + 1)):
+                break
+            rows.append((start, last))
+            last = nxt = start - 1
             want -= 1
-        if want != 0 or end - start < 2:
+        if want != 0 or len(rows) < 2:
             continue                 # not 1..N, or fewer than two options
-        start += 1
+        if _pane_numbering_continues(lines, rows[0][1] + 1):
+            continue                 # only part of a longer list (the picker)
+        rows.reverse()
+        start = rows[0][0]
         opts = []
-        for line_no in range(start, end + 1):
-            om = PANE_PROMPT_OPTION_RE.match(lines[line_no])
+        for first, last in rows:
+            om = PANE_PROMPT_OPTION_RE.match(lines[first])
+            label = om.group(3)
+            for k in range(first + 1, last + 1):
+                label = _pane_join_wrap(label, lines[k].strip())
             opts.append({"number": int(om.group(2)),
-                         "label": om.group(3)[:200],
+                         "label": label[:200],
                          "selected": bool(om.group(1))})
         if sum(1 for o in opts if o["selected"]) != 1:
             continue                 # no cursor (or several): not a live picker

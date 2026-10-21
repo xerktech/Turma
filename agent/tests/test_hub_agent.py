@@ -19969,6 +19969,128 @@ PANE_PERMISSION_DIALOG = """\
  Esc to cancel · Tab to amend · ctrl+e to explain
 """
 
+# Real 60-column Claude Code 2.1.306 frames (XERK-2150). Option 3's label wraps
+# onto a line indented to the label column...
+PANE_WRAPPED_OPTION_DIALOG = """\
+────────────────────────────────────────────────────────────
+ Bash command
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ touch /tmp/marker.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to
+      /tmp/build/long-dir-name/cap/work from this project
+   3. Yes, and switch to auto mode · auto mode handles these
+      prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
+"""
+
+# ...and so does every description in the native AskUserQuestion picker, whose
+# first word WOULD have fit after its option's label.
+PANE_ASK_PICKER = """\
+────────────────────────────────────────────────────────────
+ ☐ Color
+
+Which color?
+
+❯ 1. Red
+     A warm, bold color often associated with energy,
+     passion, urgency, and drawing strong attention.
+  2. Green
+     A calm, natural color commonly linked with growth,
+     balance, health, and positive go-ahead signals.
+  3. Blue
+     A cool, steady color typically associated with trust,
+     calm, reliability, and clear open skies.
+  4. Type something.
+────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+# The same picker with labels that fill a 45-column pane, so every
+# description's first word looks like a wrap (real frame) — and a multiSelect one.
+PANE_ASK_PICKER_FULL_LABELS = """\
+─────────────────────────────────────────────
+ ☐ Deploy
+
+Which deployment strategy?
+
+❯ 1. Deploy everything at once via blue-green
+     Stand up a full parallel environment,
+     then switch traffic all at once.
+  2. Roll instances forward in small batches.
+     Update instances in small groups,
+     checking health before continuing each
+     batch.
+  3. Canary release to a small slice of users
+     Send a small share of users to the new
+     version first, then widen gradually.
+  4. Type something.
+─────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to
+"""
+
+PANE_ASK_PICKER_MULTI = """\
+──────────────────────────────────────────────────
+←  ☐ Toppings  ✔ Submit  →
+
+Which toppings do you want?
+
+❯ 1. [ ] Cheese
+         Melted mozzarella and cheddar blend, a
+         classic gooey topping everyone expects.
+  2. [ ] Mushrooms
+         Sliced cremini mushrooms, earthy and
+         savory, sautéed briefly before baking.
+  3. [ ] Peppers
+         Crisp green and red bell pepper strips,
+         adding sweetness, crunch and mild color.
+  4. [ ] Type something
+     Submit
+──────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+# A path the TUI broke after a "/" (real 50-column frame).
+PANE_WRAPPED_PATH_DIALOG = """\
+──────────────────────────────────────────────────
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, allow reading from /home/truenas_admin/
+      git/.turma/worktrees/Turma/2019f/agent/tests
+      from this project
+   3. Yes, and switch to auto mode · auto mode
+      handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
+"""
+
+# A wrapped label line that fills the pane exactly: Claude Code 2.1.306 draws an
+# empty row under that option (real 70-column frame).
+PANE_FULL_WIDTH_WRAP_DIALOG = """\
+──────────────────────────────────────────────────────────────────────
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, allow reading from /home/truenas_admin/git/.turma/worktrees
+      /Turma/2019f/agent/native from this project
+
+   3. Yes, and switch to auto mode · auto mode handles these prompts
+      for you
+   4. No
+
+ Esc to cancel · Tab to amend
+"""
+
 PANE_PLAN_DIALOG = """\
   ────────────────────────────────────────────────────────────────────
    Ready to code?
@@ -21546,6 +21668,82 @@ class TestParsePanePrompt(unittest.TestCase):
         self.assertEqual(
             p["detail"],
             "Bash command\ntouch /tmp/permtest-marker\nCreate marker file in /tmp")
+
+    def test_wrapped_option_label(self):
+        # A label too long for the pane wraps; the run must not stop at the wrap
+        # (XERK-2150: options 3 and 4 — the only way to decline — were dropped).
+        p = ha.parse_pane_prompt(PANE_WRAPPED_OPTION_DIALOG)
+        self.assertEqual(
+            [o["label"] for o in p["options"]],
+            ["Yes",
+             "Yes, and always allow access to /tmp/build/long-dir-name/cap/work"
+             " from this project",
+             "Yes, and switch to auto mode · auto mode handles these prompts for you",
+             "No"])
+        # The rejoined label is the dialog's identity at any width.
+        wide = ha.parse_pane_prompt(PANE_WRAPPED_OPTION_DIALOG.replace(
+            "these\n      prompts", "these prompts").replace(
+            "to\n      /tmp", "to /tmp").replace("─" * 60, "─" * 140))
+        self.assertEqual(wide["id"], p["id"])
+
+    def test_picker_descriptions_not_options(self):
+        # A description sits on the same indent as a wrap, but its first word
+        # would have fit beside the label: the picker is not a panePrompt, so
+        # "Type something." never becomes a digit to send.
+        self.assertIsNone(ha.parse_pane_prompt(PANE_ASK_PICKER))
+        # Even with the rule and "5. Chat about this" gone, the width test alone
+        # keeps a description under a short label out of the run.
+        self.assertIsNone(ha.parse_pane_prompt(
+            PANE_ASK_PICKER.split("  4. Type")[0] + "  4. Type something.\n"))
+        # Labels that fill the pane make descriptions indistinguishable from
+        # wraps; the numbering carrying on past the run is what refuses these.
+        self.assertIsNone(ha.parse_pane_prompt(PANE_ASK_PICKER_FULL_LABELS))
+        self.assertIsNone(ha.parse_pane_prompt(PANE_ASK_PICKER_MULTI))
+        # The width test is what decides: with the pane narrowed to the label,
+        # the same line WOULD be a wrap.
+        self.assertIsNotNone(ha.parse_pane_prompt(
+            " Proceed?\n ❯ 1. Yes\n   2. No, and tell Claude what to\n"
+            "      instead\n" + "─" * 30))
+
+    def test_wrapped_path_label(self):
+        # The TUI breaks a path inside the token, where there was no space;
+        # an ordinary word break dropped one.
+        p = ha.parse_pane_prompt(PANE_WRAPPED_PATH_DIALOG)
+        self.assertEqual(
+            [o["label"] for o in p["options"]][1:3],
+            ["Yes, allow reading from /home/truenas_admin/git/.turma/worktrees/"
+             "Turma/2019f/agent/tests from this project",
+             "Yes, and switch to auto mode · auto mode handles these prompts for you"])
+        self.assertEqual(ha._pane_join_wrap("…/.turma/wor", "ktrees/x from"),
+                         "…/.turma/worktrees/x from")
+        self.assertEqual(ha._pane_join_wrap("access to tmp/", "from this"),
+                         "access to tmp/ from this")
+        self.assertEqual(ha._pane_join_wrap("reading from", "/home/x"),
+                         "reading from /home/x")
+
+    def test_a_full_width_wrap_keeps_the_options_below_its_gap(self):
+        p = ha.parse_pane_prompt(PANE_FULL_WIDTH_WRAP_DIALOG)
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3, 4])
+        self.assertEqual(p["options"][3]["label"], "No")
+        # The gap is stepped over only under a line that fills the pane: a blank
+        # between ordinary options still ends the run (two lists, not one).
+        p = ha.parse_pane_prompt(
+            "─" * 40 + "\n Proceed?\n ❯ 1. Yes\n\n   2. Maybe\n   3. No\n")
+        self.assertIsNone(p)
+        # Nor under a line one cell short of the pane: only an exact fill.
+        short = " ❯ 1. " + "y" * 33       # 39 cells in a 40-cell pane
+        self.assertIsNone(ha.parse_pane_prompt(
+            "─" * 40 + "\n Proceed?\n" + short + "\n\n   2. No\n"))
+
+    def test_wrap_needs_label_column_and_cells(self):
+        # A line off the label column is not part of the label, however full
+        # the line above it.
+        p = ha.parse_pane_prompt(
+            " Proceed?\n ❯ 1. Yes\n   2. No, and tell Claude what to\n"
+            "    instead\n" + "─" * 30)
+        self.assertEqual(p["options"][1]["label"], "No, and tell Claude what to")
+        # Wide glyphs take two cells, so a CJK label fills the pane sooner.
+        self.assertEqual(ha._pane_cells("中文 ok"), 7)
 
     def test_plan_dialog(self):
         p = ha.parse_pane_prompt(PANE_PLAN_DIALOG)
