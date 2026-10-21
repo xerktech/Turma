@@ -1159,7 +1159,7 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 # bytes. Keep this at or below the hub's own INPUT_MAX_CHARS, which rejects an
 # over-long message with an error the composer shows rather than truncating it.
 INPUT_MAX_CHARS = _env_int("SESSION_INPUT_MAX_CHARS", 100000)
-HISTORY_MAX_MSGS = _env_int("SESSION_HISTORY_MSGS", 200)
+HISTORY_MAX_MSGS = _env_int("SESSION_HISTORY_MSGS", 200, minimum=1)
 # Ceiling on ONE `history` delivery, in the BYTES it will occupy on the wire.
 # The per-block caps bound a BLOCK, never the reply: the window is
 # HISTORY_MAX_MSGS entries and the operator-message fold below scans the WHOLE
