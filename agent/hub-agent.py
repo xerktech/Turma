@@ -8736,6 +8736,7 @@ _DEFECT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REVERT_RE = re.compile(r"(?m)^This reverts commit ([0-9a-f]{40})(?:\.|, reversing)?[ \t]*$")
 _JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d{1,7})\b")
 _ADO_KEY_RE = re.compile(r"\bAB#(\d{1,9})\b")
+_CVE_ID_RE = re.compile(r"\bCVE-\d{4}-\d+")
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
 _BLAME_LINE_RE = re.compile(r"^([0-9a-f]{40}) \d+ \d+")
 # Test code is excluded from blame (ADR "Known noise"): a fix that only touches
@@ -8751,9 +8752,10 @@ def _defect_is_test_path(path):
 
 def _defect_ticket_keys(subject):
     """Ticket keys a commit subject names: Jira-style keys and ADO `AB#<n>`."""
-    s = subject or ""
-    # A CVE id ("CVE-2013-4476") reads as key CVE-2013: never a ticket.
-    keys = [k for k in _JIRA_KEY_RE.findall(s) if not k.startswith("CVE-")]
+    # A CVE id ("CVE-2013-4476") reads as key CVE-2013: never a ticket. Only a
+    # real CVE id is dropped, so a Jira project keyed CVE ("CVE-12") still counts.
+    s = _CVE_ID_RE.sub(" ", subject or "")
+    keys = _JIRA_KEY_RE.findall(s)
     keys += _ADO_KEY_RE.findall(s)
     return list(dict.fromkeys(keys))[:5]
 
@@ -10000,10 +10002,19 @@ LOCAL_COMMAND_CAVEAT_RE = re.compile(
     r"\s*<local-command-caveat>.*?</local-command-caveat>\s*", re.DOTALL)
 COMMAND_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.DOTALL)
 COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
+# GREEDY, to the LAST closing tag: Claude Code writes a command's output
+# UNESCAPED inside the tags (unlike `!` output), so output that itself prints
+# `</local-command-stdout>` (a file, a peer's text) would end a lazy match there
+# and lose the rest. And a turn that OPENS with an output tag is output, even
+# when that output prints a `<command-name>` tag of its own.
 COMMAND_STDOUT_RE = re.compile(
-    r"<local-command-stdout>(.*?)</local-command-stdout>", re.DOTALL)
+    r"<local-command-stdout>(.*)</local-command-stdout>", re.DOTALL)
 COMMAND_STDERR_RE = re.compile(
-    r"<local-command-stderr>(.*?)</local-command-stderr>", re.DOTALL)
+    r"<local-command-stderr>(.*)</local-command-stderr>", re.DOTALL)
+# `[ \t\r\n]`, never `\s`: python's and JS's `\s` cover different characters,
+# and the two parsers must agree (contract-mirrors.md).
+COMMAND_OUTPUT_LEAD_RE = re.compile(r"[ \t\r\n]*<local-command-std(?:out|err)>")
+BASH_OUTPUT_LEAD_RE = re.compile(r"[ \t\r\n]*<bash-std(?:out|err)>")
 
 # The `!` prefix runs a shell command straight from the composer/TUI, and
 # Claude Code records it as two more XML-ish user turns: the command
@@ -10044,7 +10055,9 @@ def _parse_local_command(text):
         return None
     if LOCAL_COMMAND_CAVEAT_RE.fullmatch(text):
         return {"kind": "caveat"}
-    m = COMMAND_NAME_RE.search(text)
+    lead_tag = COMMAND_OUTPUT_LEAD_RE.match(text)
+    is_output = bool(lead_tag)
+    m = None if is_output else COMMAND_NAME_RE.search(text)
     if m:
         name = _edge_trim(ANSI_RE.sub("", m.group(1)))
         args = COMMAND_ARGS_RE.search(text)
@@ -10054,15 +10067,33 @@ def _parse_local_command(text):
                 "name": name,
                 "args": _edge_trim(ANSI_RE.sub("", args.group(1))) if args else "",
             }
-    m = BASH_INPUT_RE.search(text)
+    m = None if is_output else BASH_INPUT_RE.search(text)
     if m:
         cmd = _edge_trim(ANSI_RE.sub("", m.group(1)))
         if cmd:
             return {"kind": "command", "name": "!", "args": cmd}
+    # A turn opening with an output tag: that tag's body runs to its LAST
+    # closing tag, and only text AFTER it can carry the other stream, so a tag
+    # the output merely prints (`<local-command-stderr>`, `<bash-stdout>`) is
+    # never read as one.
+    lead = None
+    if is_output:
+        lead = (COMMAND_STDOUT_RE if lead_tag.group(0).endswith("stdout>")
+                else COMMAND_STDERR_RE).search(text)
+
+    def find(regex):
+        if lead is None:
+            return regex.search(text)
+        if regex is lead.re:
+            return lead
+        if regex in (COMMAND_STDOUT_RE, COMMAND_STDERR_RE):
+            return regex.search(text, lead.end())
+        return None
+
     first = None
     for regex, is_error in ((COMMAND_STDERR_RE, True), (BASH_STDERR_RE, True),
                             (COMMAND_STDOUT_RE, False), (BASH_STDOUT_RE, False)):
-        m = regex.search(text)
+        m = find(regex)
         if m:
             body = _edge_trim(ANSI_RE.sub("", m.group(1)))
             if regex in (BASH_STDERR_RE, BASH_STDOUT_RE):
@@ -10073,9 +10104,22 @@ def _parse_local_command(text):
             # stderr must not swallow the stdout beside it (or vice versa).
             if out["text"]:
                 return out
+            # A `!` command that printed nothing (`! true`) is still a finished
+            # command: flagged so its output row survives and the card reads
+            # "(no output)" instead of looking like one still running.
+            # Not an error: an empty stderr says nothing failed.
+            # Only a turn OPENING with the tag: prose quoting empty bash tags
+            # stays dropped, never a "(no output)" card (QA).
+            if regex in (BASH_STDERR_RE, BASH_STDOUT_RE) and BASH_OUTPUT_LEAD_RE.match(text):
+                out.update(isError=False, shell=True)
             if first is None:
                 first = out
     return first
+
+
+# The flat text of a `!` command's output turn that printed nothing; the
+# renderers draw the same words for an empty command_output block.
+NO_OUTPUT_TEXT = "(no output)"
 
 
 def _lc_preview(lc):
@@ -10086,7 +10130,7 @@ def _lc_preview(lc):
         return None
     if lc["kind"] == "command":
         return " ".join(p for p in (lc["name"], lc["args"]) if p)
-    return lc["text"] or None
+    return lc["text"] or (NO_OUTPUT_TEXT if lc.get("shell") else None)
 
 
 def _entry_first_text(entry):
@@ -12455,7 +12499,9 @@ def _entry_blocks(entry, caps, preview=False):
             if atrunc:
                 block["truncated"] = True
             blocks.append(block)
-        elif lc["kind"] == "output" and lc["text"]:
+        elif lc["kind"] == "output" and (lc["text"] or lc.get("shell")):
+            # An empty `!` output keeps its (empty) block: the renderers show
+            # "(no output)" on the card, which otherwise reads still running.
             text, trunc = _clip(lc["text"], caps["result"])
             block = {"t": "command_output", "text": text}
             if lc["isError"]:
@@ -13135,6 +13181,20 @@ def _fit_history_budget(rows):
     return rows[len(rows) - keep:], True
 
 
+def _operator_units(rows):
+    """_operator_entries rows grouped into operator messages: a `!` command and
+    the output row(s) _operator_entries kept beside it are ONE message, so the
+    HISTORY_USER_MSGS cap counts what the operator sent and never cuts a
+    command from what it printed."""
+    units = []
+    for row in rows:
+        if units and not _is_operator_row(row) and _is_command_output_row(row):
+            units[-1].append(row)
+        else:
+            units.append([row])
+    return units
+
+
 def _history_entries(path):
     """On-demand `history` read of a transcript: bounded to the last 4 MiB
     (1 << 22, same cap the PR-URL scan uses) rather than transcript_tail's
@@ -13178,7 +13238,8 @@ def _history_entries(path):
         shown = {row["id"] for row in window if row.get("id")}
         older = [row for row in _operator_entries(path)
                  if row.get("id") and row["id"] not in shown]
-        window = older[-HISTORY_USER_MSGS:] + window
+        window = [row for unit in _operator_units(older)[-HISTORY_USER_MSGS:]
+                  for row in unit] + window
     window, over_budget = _fit_history_budget(window)
     return window, truncated or over_budget, _queued_display(queued)
 
@@ -17641,6 +17702,82 @@ def _composer_rows(cap):
     return lines[rules[-2] + 1:rules[-1]]
 
 
+# The empty composer's placeholder on a fresh session: `Try "<example>"` (the
+# examples, from 2.1.305's binary, hold no double quote). Read whitespace-dropped.
+_COMPOSER_PLACEHOLDER_NORM_RE = re.compile(r'Try"[^"]*"')
+
+
+def _capture_pane_styled(tmux_name):
+    """The pane with its SGR attributes (`capture-pane -e`), or None: on
+    Windows (the pty-host grid is plain text) or when it can't be captured."""
+    if IS_WINDOWS or not tmux_name:
+        return None
+    try:
+        out = subprocess.run(
+            _tmux("capture-pane", "-e", "-p", "-t", _tmux_pane(tmux_name), name=tmux_name),
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+_SGR_RE = re.compile(r"\x1b\[([0-9;:]*)m")
+_OTHER_ESC_RE = re.compile(r"\x1b\[[0-9;:?<=>]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b.")
+
+
+def _undimmed(styled):
+    """`styled` with every DIM (SGR 2) run dropped and all escapes removed."""
+    out, dim, pos = [], False, 0
+    for m in _SGR_RE.finditer(styled):
+        # A dropped run keeps its line breaks: tmux does not reset SGR at a line
+        # end, so a dim run reaching the last column closes on the next row (QA).
+        seg = styled[pos:m.start()]
+        out.append("\n" * seg.count("\n") if dim else seg)
+        pos = m.end()
+        # `;` separates attributes; a `:` group is ONE attribute with its own
+        # sub-parameters (`4:2` is double underline, never dim).
+        params = m.group(1).split(";")
+        i = 0
+        while i < len(params):
+            p = params[i]
+            if ":" in p:
+                pass
+            elif p in ("", "0", "22"):
+                dim = False
+            elif p == "2":
+                dim = True
+            elif p in ("38", "48", "58"):
+                # An extended colour's own numbers (`38;5;2`) are no attributes.
+                i += 2 if i + 1 < len(params) and params[i + 1] == "5" else 4
+            i += 1
+    seg = styled[pos:]
+    out.append("\n" * seg.count("\n") if dim else seg)
+    return _OTHER_ESC_RE.sub("", "".join(out))
+
+
+def _composer_draft(cap, styled=False):
+    """What the composer in `cap` holds, prompt glyph and whitespace dropped:
+    "" for an empty box (or one showing only the placeholder), None when there
+    is no composer to read. `styled`: `cap` carries SGR attributes, and DIM
+    text in the box (Claude Code's prompt suggestion, its placeholder) is
+    ghost text, not a draft."""
+    if styled:
+        plain = _OTHER_ESC_RE.sub("", _SGR_RE.sub("", cap or ""))
+        lines, ghostless = plain.splitlines(), _undimmed(cap or "").splitlines()
+        rows = _composer_rows(plain)
+        if rows is None or len(lines) != len(ghostless):
+            return None
+        rules = [i for i, line in enumerate(lines) if _COMPOSER_RULE_RE.match(line)]
+        rows = ghostless[rules[-2] + 1:rules[-1]]
+    else:
+        rows = _composer_rows(cap)
+    if rows is None:
+        return None
+    box = _composer_norm("".join(rows))
+    shown = box[1:] if box.startswith("\u276f") else box
+    return "" if _COMPOSER_PLACEHOLDER_NORM_RE.fullmatch(shown) else shown
+
+
 def _leftover_view(cap, typed, chip, started):
     """How the composer in `cap` stands to our leftover `typed`, and how many of
     its rows are drawn:
@@ -19231,6 +19368,14 @@ def mod_request_dir(session_id):
     if not isinstance(session_id, str) or not SESSION_REQUEST_SID_RE.fullmatch(session_id):
         return None
     return os.path.join(MOD_REQUESTS_DIR, session_id)
+
+
+def bridge_busy_markers():
+    """PANE_BUSY_MARKERS as the bridge mod reads them (TURMA_BUSY_MARKERS,
+    `|`-joined): `/turma` output breaks each up, or a peer's text holding an
+    operator's custom marker would read the idle pane busy (the mod cannot see
+    the agent's TURMA_PANE_BUSY_MARKERS)."""
+    return "|".join(PANE_BUSY_MARKERS)
 
 
 def _write_mod_file(folder, name, text):
@@ -29242,6 +29387,9 @@ class SessionManager:
             env_prefix += f"TURMA_MOD_REQUESTS={shlex.quote(mod_request_dir(sess['id']))} "
             env_prefix += f"TURMA_PEERS_FILE={shlex.quote(PEERS_FILE)} "
             env_prefix += f"TURMA_DEVICE={shlex.quote(self.device or '')} "
+            # The mod's `/turma` output breaks these up (an operator override
+            # included): the pane reads any of them on screen as busy.
+            env_prefix += f"TURMA_BUSY_MARKERS={shlex.quote(bridge_busy_markers())} "
         # glab reads its default host from GITLAB_HOST — never the agent's own
         # GITLAB_URL — so on a self-hosted GitLab a session's `glab mr create`
         # can't auth without this, falls back to a raw API call, and the MR
@@ -29320,6 +29468,7 @@ class SessionManager:
                 extra_env["TURMA_MOD_REQUESTS"] = mod_request_dir(sess["id"])
                 extra_env["TURMA_PEERS_FILE"] = PEERS_FILE
                 extra_env["TURMA_DEVICE"] = self.device or ""
+                extra_env["TURMA_BUSY_MARKERS"] = bridge_busy_markers()
             if gitlab_configured() and not os.environ.get("GITLAB_HOST"):
                 extra_env["GITLAB_HOST"] = gitlab_base()
             if subagent_model:
@@ -35258,6 +35407,18 @@ class SessionManager:
             # own `can't find session: agent-<id>` while the card read running.
             if _pane_blocking_dialog(cap):
                 continue
+            # An operator's half-typed draft would be submitted WITH the
+            # `/rename` + Enter, and rcName would move to a name the session does
+            # not answer to (2.1.304). Defer while the composer holds any text,
+            # or cannot be read (never type blind); the draft is never cleared.
+            # Read WITH attributes where tmux can: after a turn Claude Code draws
+            # a DIM prompt suggestion in the empty composer (2.1.305), which is
+            # no draft and must not block the rename (QA). Windows' grid has no
+            # attributes, so a suggestion there defers it (never types blind).
+            styled = _capture_pane_styled(tmux)
+            draft = _composer_draft(styled, styled=True) if styled else _composer_draft(cap)
+            if draft != "":
+                continue
             name = self._unique_rc_name(summary, exclude_id=sess.get("id"))
             # The live name already matches the target, so there is nothing to
             # rename — a resume/restart relaunches --remote-control/--name with the
@@ -35300,14 +35461,25 @@ class SessionManager:
                 folder = mod_request_dir(sid)
                 if not folder or os.path.islink(folder):
                     continue                  # never write through a planted link
+                target = os.path.join(folder, "status.json")
+                try:
+                    mode = os.lstat(target).st_mode
+                except FileNotFoundError:
+                    mode = None
+                if mode is not None and not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                    continue                  # a session-made dir there: nothing to say each beat
                 text = json.dumps(mod_status(sess, payload), sort_keys=True)
-                if (self._mod_status_last.get(sid) == text
-                        and os.path.isfile(os.path.join(folder, "status.json"))):
+                if self._mod_status_last.get(sid) == text and mode is not None and stat.S_ISREG(mode):
                     continue
                 _write_mod_file(folder, "status.json", text)
                 self._mod_status_last[sid] = text
             except Exception as e:
-                log(f"mod status for {sid} not written ({e})")
+                # Logged once per session and cause: the beat retries every few
+                # seconds, and a standing failure must not flood the log.
+                err = ("error", type(e).__name__, getattr(e, "errno", None))
+                if self._mod_status_last.get(sid) != err:
+                    log(f"mod status for {sid} not written ({e})")
+                self._mod_status_last[sid] = err
         return payloads
 
     def _rename_via_mod(self, sess, summary):

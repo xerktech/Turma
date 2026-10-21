@@ -49,6 +49,13 @@ Split out of `agent-sessions.md` (size ceiling). The org-boundary contract is in
   (dsh is headless; qwen's TUI has no `/rename`). Consequence: `--remote-control`/`--name` now carry
   arbitrary summary text, so both `shlex.quote` at launch (an apostrophe in a name once broke the
   single-quoted `--remote-control`). Tests: `TestReconcileRcNames`.
+  - **The pane `/rename` waits for an EMPTY composer** (`_composer_draft`; the fresh-session
+    `Try "…"` placeholder counts as empty, an unreadable composer does not): an operator's draft was
+    submitted glued to `/rename <name>` + Enter and rcName moved to a name the session did not
+    answer to (2.1.304). It defers, and never clears the draft.
+  - **DIM text in the box is ghost text, not a draft** (`capture-pane -e`, `_undimmed`): after a
+    turn 2.1.305 draws a dim prompt suggestion that `/rename` replaces; reading it as a draft
+    stopped every pane rename after the first turn (QA). Windows' grid has no attributes: defers.
   - **A resume/migration must come back ALREADY answering to its name, or it re-`/rename`s on every
     relaunch** (XERK-815 follow-up). `--name <rcName>` on relaunch sets the LIVE registry name to
     whatever `rcName` we pass — it OVERRIDES Claude Code's own per-session-id name restore (verified on

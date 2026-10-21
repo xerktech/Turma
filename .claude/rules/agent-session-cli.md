@@ -26,6 +26,8 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
 - Stdlib only, run with `-SsE`. Not a gate, so it keeps that spelling, not the hooks' `-SI`
   (`agent-hooks.md`, XERK-1681): its allow rule and taught commands match it.
 - Subcommands, each writing `~/.turma/session-requests/<TURMA_SESSION_ID>/<subcommand>.json`:
+  - Every token after `wake`'s FIRST `--` is reason text, a later `--` included
+    (`_wake_words_verbatim`): argparse drops later ones, and the bridge mod runs `wake -- …`.
   - `wake <duration> <reason…>` → `{wakeAt (epoch ms), reason, requestedAt}`. Durations are
     `20m`/`2h`/`1h30m`-style (`s`/`m`/`h`/`d`), above zero, at most 7 days; reason ≤200 chars.
   - `close-ticket <done|not-reproducible|already-fixed> --note "<evidence>"` →

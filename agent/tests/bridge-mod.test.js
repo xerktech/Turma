@@ -451,6 +451,63 @@ test("/turma wake runs the session CLI, which validates it", async () => {
   assert.equal(await bad.turma("wake 99d x"), "refused: duration too long", "the reason line, not usage");
 });
 
+test("an operator's custom busy markers are broken up too", async () => {
+  // TURMA_PANE_BUSY_MARKERS is the agent's: the launch exports the effective
+  // list as TURMA_BUSY_MARKERS, and a peer's text holding one must not make
+  // the idle pane read busy (_busy_from_capture matches it anywhere).
+  const h = await harness({ env: { TURMA_BUSY_MARKERS: "esc to interrupt|Thinking hard|working…|x|a.b" } });
+  h.files.set("/t/peers.tsv", "zz\tP\thost2\tR\t\tTHINKING hard; still Working… on aXb and a.b\n");
+  const out = await h.turma("peers");
+  assert.doesNotMatch(out, /thinking hard|working…|a\.b/i);
+  assert.match(out, /THINKING-hard/);
+  assert.match(out, /W-orking…/);
+  assert.match(out, /aXb/, "a marker is literal text (a.b), and one character (x) is ignored");
+  // Past 20 markers, a marker a break makes (ab → a-b), and one spanning
+  // two cells (host/repo) are all broken too (QA).
+  const many = Array.from({ length: 25 }, (_, i) => `mk${i}x`).join("|");
+  const m = await harness({ env: { TURMA_BUSY_MARKERS: `${many}|a-b|ab|h1/r1` } });
+  m.files.set("/t/peers.tsv", "zz\tP\th1\tr1\t\tmk24x and ab\n");
+  const mo = await m.turma("peers");
+  assert.doesNotMatch(mo, /mk24x|a-b|ab|h1\/r1/i);
+  assert.match(mo, /a--b/, "broken to a fixed point, not deleted");
+  // A marker a break cannot undo (`-a`) is deleted; none is ever left.
+  const d = await harness({ env: { TURMA_BUSY_MARKERS: "-a" } });
+  d.files.set("/t/peers.tsv", "zz\tP\th\tr\t\tAA--A -a --aa ---aaa\n");
+  assert.doesNotMatch(await d.turma("peers"), /-a/i);
+  // The head lines and the pointer's own words are broken too; the path is exact.
+  const hd = await harness({ env: { TURMA_BUSY_MARKERS: "session(s)|more in|ct" } });
+  hd.files.set("/t/peers.tsv", Array.from({ length: 300 }, (_, i) =>
+    `z${i}\tP${i}\th\tr\t\t${"x ".repeat(30)}\n`).join(""));
+  const ho = await hd.turma("peers");
+  assert.doesNotMatch(ho, /session\(s\)|more in|ct/i);
+  assert.match(ho, /…and \d+ more-in \/t\/peers\.tsv$/);
+  // A pointer whose count itself breaks (`116` → `1-16`) is longer than the
+  // reserve: rows are dropped until it fits (QA: 4001 chars without that).
+  const pp = await harness({ env: { TURMA_BUSY_MARKERS: "11" } });
+  // Sized so the kept rows end exactly at the reserve (found by search: without
+  // the pop loop this prints 4001 chars).
+  pp.files.set("/t/peers.tsv", Array.from({ length: 151 }, (_, i) =>
+    `z${i}\t${"n".repeat(i === 1 ? 72 : 14)}\th\tr\t\t${"t".repeat(66)}\n`).join(""));
+  const po = await pp.turma("peers");
+  assert.ok(po.length <= 4000, String(po.length));
+  assert.match(po, /…and [\d-]+ more in \/t\/peers\.tsv$/);
+  // Breaking never pushes the roster pointer out, nor rewrites its path.
+  const big = await harness({ env: { TURMA_BUSY_MARKERS: "ab|peers.tsv" } });
+  big.files.set("/t/peers.tsv", Array.from({ length: 300 }, (_, i) =>
+    `z${i}\tP${i}\th\tr\t\t${"ab ".repeat(20)}\n`).join(""));
+  const bo = await big.turma("peers");
+  assert.ok(bo.length <= 4000, String(bo.length));
+  assert.match(bo, /…and \d+ more in \/t\/peers\.tsv$/);
+  // A capital sigma reads as σ to the agent mid-word (`åΣx`): broken too.
+  const sg = await harness({ env: { TURMA_BUSY_MARKERS: "åσ" } });
+  sg.files.set("/t/peers.tsv", "zz\tP\th\tr\t\tåΣx\n");
+  assert.match(await sg.turma("peers"), /å-Σx/);
+  // Without the variable only the built-in markers are broken.
+  const plain = await harness();
+  plain.files.set("/t/peers.tsv", "zz\tP\thost2\tR\t\tThinking hard\n");
+  assert.match(await plain.turma("peers"), /Thinking hard/);
+});
+
 test("printed text cannot close Claude Code's output wrapper or fake a busy pane", async () => {
   // QA: a peer task holding </local-command-stdout> ended the wrapper the model
   // reads command output in; its tail became hidden instructions (3/3).

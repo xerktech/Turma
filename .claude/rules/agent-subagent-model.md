@@ -34,6 +34,8 @@ for `qa`, `qa-delta` and any `subagent_type` containing `review` not after a `p`
     Accepted cost: an error ON that first line reports a column off by the pin's length.
   - `meta` must be the first statement (after comments/hashbang), as the runtime requires; a
     decoy `export const meta = {` in a leading comment must not be matched.
+  - Grader opts are copied with a `for…in` over a spread, so INHERITED fields (a `prompt` on a
+    prototype) survive the pin; `agentType` is still copied by name (a class getter is not enumerable).
   - Any doubt passes through: unfound/odd meta, already-pinned marker, past the 524288-byte cap.
   - `scriptPath` is inlined and dropped (it beats `script`). Residual: a saved workflow run by
     `name`, and a nested `workflow()` child, are not pinned.

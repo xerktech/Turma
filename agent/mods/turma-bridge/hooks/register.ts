@@ -232,19 +232,88 @@ const DATA_NOTE =
 // look-alikes, and so does `&` — the model reads `&lt;/…&gt;` as the tag (5/5)
 // while the pane decodes it for the person. Every pane busy marker (hub-agent.py's PANE_BUSY_MARKERS,
 // QWEN_PANE_BUSY_MARKERS and the ⏵/⏸ footer glyphs) is broken up too, or a
-// peer's text on screen would read an idle session busy. A non-string is no
-// text.
+// peer's text on screen would read an idle session busy (an operator's custom
+// markers are broken over the whole output: unmarked()). A non-string is no text.
 function cell(v: unknown): string {
   const t = typeof v === 'string' ? v : typeof v === 'number' && Number.isFinite(v) ? String(v) : ''
-  const flat = t
+  let flat = t
     .replace(/[\p{Cc}\p{Cf}]+/gu, ' ')
     .replace(/&/g, '＆')
     .replace(/</g, '‹')
     .replace(/>/g, '›')
     .replace(/(esc|enter) to (interrupt|steer|cancel)/gi, '$1-to-$2')
     .replace(/[⏵⏸]/g, '▹')
-    .trim()
+  flat = flat.trim()
   return flat.length > CELL_MAX ? `${flat.slice(0, CELL_MAX - 1)}…` : flat
+}
+
+// The agent's effective pane busy markers (hub-agent.py PANE_BUSY_MARKERS, an
+// operator's TURMA_PANE_BUSY_MARKERS override included), which the launch
+// exports as TURMA_BUSY_MARKERS: `|`-separated, matched case-insensitively
+// anywhere on screen. Read at each /turma run; empty without the variable.
+// Kept as lowercased literals and matched by a plain scan, never a RegExp built
+// from them (Semgrep's detect-non-literal-regexp; the text is the operator's).
+function markerRes(raw: string | undefined): string[] {
+  return (raw || '')
+    .split('|')
+    .map(m => fold(m.trim().replace(/[\p{Cc}\p{Cf}]+/gu, ' ')))
+    // One character cannot be broken up, and would read every pane busy anyway.
+    .filter(m => [...m].length >= 2)
+}
+
+// Lowercased with the final sigma folded to σ: JS lowers a SLICE's last Σ to ς,
+// while the agent lowers the whole capture (`åΣx` → `åσx`) and reads it busy.
+// Folding both sides over-matches, the safe direction (QA).
+function fold(t: string): string {
+  return t.toLowerCase().replace(/ς/g, 'σ')
+}
+
+// Is `m` (folded) at `text[i]`, compared case-insensitively?
+function markerAt(text: string, i: number, m: string): boolean {
+  return fold(text.slice(i, i + m.length)) === m
+}
+
+function hasMarker(text: string, m: string): boolean {
+  for (let i = 0; i + m.length <= text.length; i++) if (markerAt(text, i, m)) return true
+  return false
+}
+
+// Every non-overlapping occurrence of `m`, left to right, replaced by `f(it)`.
+function replaceMarker(text: string, m: string, f: (hit: string) => string): string {
+  let out = ''
+  let i = 0
+  while (i + m.length <= text.length) {
+    if (markerAt(text, i, m)) {
+      out += f(text.slice(i, i + m.length))
+      i += m.length
+    } else {
+      out += text[i]
+      i += 1
+    }
+  }
+  return out + text.slice(i)
+}
+
+// Text with no custom marker left in it. Run over whole output LINES, so a
+// marker spanning two cells (`host/repo`) is caught, and to a fixed point, since
+// breaking one (`ab` → `a-b`) can make another. Breaking passes are bounded by
+// the marker count (+1); what still matches after them (`-a` stays `-a`-shaped)
+// is deleted until nothing matches, which ends, as every deletion shortens it.
+function unmarked(text: string, res: string[]): string {
+  const left = () => res.some(m => hasMarker(text, m))
+  for (let pass = 0; pass <= res.length && left(); pass++) {
+    for (const m of res) text = replaceMarker(text, m, broken)
+  }
+  while (left()) for (const m of res) text = replaceMarker(text, m, () => '')
+  return text
+}
+
+// A marker occurrence no longer read as one: its spaces become `-` (as for the
+// defaults above), or, with none, a `-` after its first character.
+function broken(m: string): string {
+  if (/\s/.test(m)) return m.replace(/\s/g, '-')
+  const [first, ...rest] = [...m]
+  return `${first}-${rest.join('')}`
 }
 
 // Free text someone else wrote, quoted so it reads as quoted data.
@@ -253,7 +322,7 @@ function quoted(v: unknown): string {
   return c ? `“${c}”` : ''
 }
 
-async function peersText($: EngineInterface): Promise<string> {
+async function peersText($: EngineInterface, res: string[]): Promise<string> {
   const path = await $.env.get('TURMA_PEERS_FILE')
   if (!path) return 'No roster: this session was not launched by Turma.'
   let raw: string
@@ -279,20 +348,31 @@ async function peersText($: EngineInterface): Promise<string> {
     const what = quoted(task) ? ` — ${quoted(task)}` : ''
     // A nameless row (the local fallback roster) must not read as a
     // continuation of the row above.
-    return `  ${cell(name) || '(no name)'}${mark}  ${where}${br}${what}`
+    // Markers broken BEFORE the rows are sized, so breaking can never push the
+    // pointer line past OUT_MAX.
+    return unmarked(`  ${cell(name) || '(no name)'}${mark}  ${where}${br}${what}`, res)
   })
   const head = [`${rows.length} session(s); message one by its name with SendMessage.`, DATA_NOTE]
-  // Rows fit under OUT_MAX with the pointer to the whole roster kept.
+    .map(l => unmarked(l, res))
+  // The path is the agent's own (TURMA_PEERS_FILE), not file text: never cut,
+  // and never rewritten by a marker break (its fixed words are broken).
+  const pointer = (n: number) => `${unmarked(`  …and ${n} more in`, res)} ${path}`
+  // Rows fit under OUT_MAX with the pointer to the whole roster kept: room is
+  // reserved for the longest count it can print, then rows are dropped while
+  // the actual pointer (its count, its broken words) would not fit.
   const kept: string[] = []
-  // Room for the pointer line as it will print (its count is at most 3 digits).
-  let size = head.join('\n').length + `\n  …and 999 more in ${path}`.length
+  let size = head.join('\n').length
+  const reserve = pointer(ordered.length).length + 1
   for (const line of lines) {
-    if (size + line.length + 1 > OUT_MAX) break
+    if (size + reserve + line.length + 1 > OUT_MAX) break
     kept.push(line)
     size += line.length + 1
   }
-  // The path is the agent's own (TURMA_PEERS_FILE), not file text: never cut.
-  if (kept.length < ordered.length) kept.push(`  …and ${ordered.length - kept.length} more in ${path}`)
+  while (kept.length && kept.length < ordered.length
+         && size + pointer(ordered.length - kept.length).length + 1 > OUT_MAX) {
+    size -= kept.pop()!.length + 1
+  }
+  if (kept.length < ordered.length) kept.push(pointer(ordered.length - kept.length))
   return [...head, ...kept].join('\n')
 }
 
@@ -352,15 +432,23 @@ async function wakeText($: EngineInterface, args: string[]): Promise<string> {
 async function turmaText($: EngineInterface, args: string): Promise<string> {
   const words = args.trim().split(/\s+/).filter(Boolean)
   const sub = (words[0] || '').toLowerCase()
+  let res: string[] = []
+  try {
+    res = markerRes(await $.env.get('TURMA_BUSY_MARKERS'))
+  } catch {
+    // no override readable: the built-in markers are still broken by cell()
+  }
   let text: string
   try {
-    if (sub === 'peers') text = await peersText($)
-    else if (sub === 'status') text = await statusText($)
+    if (sub === 'peers') return await peersText($, res)
+    if (sub === 'status') text = await statusText($)
     else if (sub === 'wake') text = await wakeText($, words.slice(1))
     else text = HELP
   } catch (err) {
     text = `/turma ${cell(sub)} failed: ${cell(String(err))}`
   }
+  text = unmarked(text, res)
+  // The cut can only shorten a marker, never make one.
   return text.length > OUT_MAX ? `${text.slice(0, OUT_MAX - 1)}…` : text
 }
 

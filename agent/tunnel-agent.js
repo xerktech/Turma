@@ -256,8 +256,13 @@ function tnPreview(tn) {
 const LOCAL_COMMAND_CAVEAT_RE = /^\s*<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*$/;
 const COMMAND_NAME_RE = /<command-name>([\s\S]*?)<\/command-name>/;
 const COMMAND_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
-const COMMAND_STDOUT_RE = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/;
-const COMMAND_STDERR_RE = /<local-command-stderr>([\s\S]*?)<\/local-command-stderr>/;
+// GREEDY, to the LAST closing tag (the output is written unescaped), and a turn
+// opening with an output tag is output. Mirror of hub-agent.py COMMAND_STDOUT_RE.
+const COMMAND_STDOUT_RE = /<local-command-stdout>([\s\S]*)<\/local-command-stdout>/;
+const COMMAND_STDERR_RE = /<local-command-stderr>([\s\S]*)<\/local-command-stderr>/;
+// `[ \t\r\n]`, never `\s`: JS's and python's `\s` differ. Mirror of hub-agent.py.
+const COMMAND_OUTPUT_LEAD_RE = /^[ \t\r\n]*<local-command-std(?:out|err)>/;
+const BASH_OUTPUT_LEAD_RE = /^[ \t\r\n]*<bash-std(?:out|err)>/;
 // The `!` prefix runs a shell command straight from the composer/TUI; Claude
 // Code records the command as <bash-input> and its output as
 // <bash-stdout>/<bash-stderr> user turns. Parsed into the same
@@ -277,7 +282,9 @@ function bashUnescape(text) {
 function parseLocalCommand(text) {
   if (!text) return null;
   if (LOCAL_COMMAND_CAVEAT_RE.test(text)) return { kind: "caveat" };
-  const nameM = COMMAND_NAME_RE.exec(text);
+  const leadTag = COMMAND_OUTPUT_LEAD_RE.exec(text);
+  const isOutput = !!leadTag;
+  const nameM = isOutput ? null : COMMAND_NAME_RE.exec(text);
   if (nameM) {
     const name = edgeTrim(nameM[1].replace(ANSI_RE, ""));
     if (name) {
@@ -285,7 +292,7 @@ function parseLocalCommand(text) {
       return { kind: "command", name, args: argsM ? edgeTrim(argsM[1].replace(ANSI_RE, "")) : "" };
     }
   }
-  const bashM = BASH_INPUT_RE.exec(text);
+  const bashM = isOutput ? null : BASH_INPUT_RE.exec(text);
   if (bashM) {
     const cmd = edgeTrim(bashM[1].replace(ANSI_RE, ""));
     if (cmd) return { kind: "command", name: "!", args: cmd };
@@ -293,15 +300,33 @@ function parseLocalCommand(text) {
   // stderr wins over stdout when a turn carries both — but ONLY when it
   // carries text: a bash turn routinely ships both tags with one empty, and an
   // empty stderr must not swallow the stdout beside it (or vice versa).
+  // A turn opening with an output tag: its body runs to the LAST closing tag,
+  // and only text after it can carry the other stream. Mirror of hub-agent.py.
+  const leadRe = !leadTag ? null : leadTag[0].endsWith("stdout>") ? COMMAND_STDOUT_RE : COMMAND_STDERR_RE;
+  const lead = leadRe ? leadRe.exec(text) : null;
+  const find = re => {
+    if (!lead) return re.exec(text);
+    if (re === leadRe) return lead;
+    if (re === COMMAND_STDOUT_RE || re === COMMAND_STDERR_RE) {
+      return re.exec(text.slice(lead.index + lead[0].length));
+    }
+    return null;
+  };
   let first = null;
   for (const [re, isError] of [[COMMAND_STDERR_RE, true], [BASH_STDERR_RE, true],
     [COMMAND_STDOUT_RE, false], [BASH_STDOUT_RE, false]]) {
-    const m = re.exec(text);
+    const m = find(re);
     if (m) {
       let body = edgeTrim(m[1].replace(ANSI_RE, ""));
       if (re === BASH_STDERR_RE || re === BASH_STDOUT_RE) body = bashUnescape(body);
       const out = { kind: "output", text: body, isError };
       if (out.text) return out;
+      // A `!` command that printed nothing is still finished: flagged so its
+      // output row survives ("(no output)"). Mirror of _parse_local_command.
+      // Not an error: an empty stderr says nothing failed.
+      if ((re === BASH_STDERR_RE || re === BASH_STDOUT_RE) && BASH_OUTPUT_LEAD_RE.test(text)) {
+        Object.assign(out, { isError: false, shell: true });
+      }
       if (!first) first = out;
     }
   }
@@ -309,10 +334,12 @@ function parseLocalCommand(text) {
 }
 // Flatten a parsed local-command turn to text-feed form, or null to drop it —
 // mirror of hub-agent.py _lc_preview.
+// Mirror of hub-agent.py NO_OUTPUT_TEXT.
+const NO_OUTPUT_TEXT = "(no output)";
 function lcPreview(lc) {
   if (lc.kind === "caveat") return null;
   if (lc.kind === "command") return [lc.name, lc.args].filter(Boolean).join(" ");
-  return lc.text || null;
+  return lc.text || (lc.shell ? NO_OUTPUT_TEXT : null);
 }
 
 // The tool_use id this user turn was PRODUCED BY, or null — mirror of
@@ -726,7 +753,9 @@ function entryBlocks(entry, caps) {
       if (args) block.args = args;
       if (atrunc) block.truncated = true;
       blocks.push(block);
-    } else if (lc.kind === "output" && lc.text) {
+    } else if (lc.kind === "output" && (lc.text || lc.shell)) {
+      // An empty `!` output keeps its (empty) block: the renderers show
+      // "(no output)". Mirror of hub-agent.py add_local_command.
       const [text, trunc] = clip(lc.text, caps.result);
       const block = { t: "command_output", text };
       if (lc.isError) block.isError = true;

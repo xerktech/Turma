@@ -572,7 +572,9 @@ do_uninstall() {
     rm -f "$SYS_UNIT_DIR/turma-agent.service" "$SYS_UNIT_DIR/turma-agent-update.service" "$SYS_UNIT_DIR/turma-agent-update.timer"
     systemctl daemon-reload 2>/dev/null || true
   else
-    [ -x "$PREFIX/bin/turma-agentctl" ] && "$PREFIX/bin/turma-agentctl" stop 2>/dev/null || true
+    if [ -x "$PREFIX/bin/turma-agentctl" ]; then
+      "$PREFIX/bin/turma-agentctl" stop 2>/dev/null || true
+    fi
   fi
   rm -rf "$PREFIX"
   info "removed $PREFIX. Preserved: config ($CFG_DIR), ~/.turma, ~/.claude, /etc/tmux.conf."
