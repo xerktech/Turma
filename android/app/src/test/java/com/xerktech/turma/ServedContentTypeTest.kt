@@ -95,13 +95,16 @@ class ServedContentTypeTest {
         for (ok in listOf("image/svg+xml x", "text/plain, image/svg+xml", "text/plain , image/svg+xml",
             "image/svg+xml(x)", "image/svg+xml ,", "image/svg+xml x;a=b",
             // A comma inside quotes splits nothing; a */* entry is skipped.
-            "image/svg+xml; a=\"x,text/plain\"", "image/svg+xml, */*")) {
+            "image/svg+xml; a=\"x,text/plain\"", "image/svg+xml, */*",
+            // An escaped quote does not end the quoted string.
+            "image/svg+xml; a=\"x\\\",text/plain\"")) {
             assertTrue("[$ok]", svgAs(ok) is SuccessResult)
             assertTrue("[$ok] no-store", svgAs(ok, noStore = true) is SuccessResult)
         }
         for (bad in listOf("image/svg+xml , text/plain", "image/svg+xml x, text/plain",
             "image/svg+xml,text/plain", "image/svg+xmlx ; a=b", "image/svg ; a=b",
-            "text/plain; a=\"y, image/svg+xml;\"", "image/svg+xml, image/")) {
+            "text/plain; a=\"y, image/svg+xml;\"", "image/svg+xml, image/",
+            "text/plain; a=\"x\\\",image/svg+xml\"")) {
             assertTrue("[$bad]", svgAs(bad) is ErrorResult)
             assertTrue("[$bad] no-store", svgAs(bad, noStore = true) is ErrorResult)
         }
