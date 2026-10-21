@@ -152,6 +152,16 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
 - A busy pane **defers, never drops**: lands as `pendingModel`, applied on the first idle beat by
   `_apply_pending_switches`. Backs out with Escape if the picker has no row for the target. Tests:
   `TestSetModelMode`, `TestParseModelPicker`.
+- **`s` on a session with history opens "Switch model?"** (XERK-2157, 2.1.306), unseen by every
+  other pane read: set_model answers `1` only if it names the picked row, else Escapes out (one
+  per dialog SEEN: two on an idle composer open rewind). In `_pane_blocking_dialog` too.
+  - The landed line must name the row AND be new vs the pane before `/model`
+    (`_model_switch_landed`): a higher count, or one settled at the bottom (a full screen scrolls
+    the old one off). Under ~23 cols both lines wrap mid-name. Tests: `TestModelSwitchConfirm`.
+  - **A draft in the composer defers the switch, untouched** (`_composer_holds_text` over
+    `capture-pane -e`; the dim placeholder is no draft). Typed onto, it went out as a prompt;
+    never clear it either: Ctrl+U kills only before the cursor and, retried, ate the edits.
+    It goes ahead only on a box SEEN empty: a short pane (≤ ~11 rows) can't show one whole.
 
 ### `setMode` — live permission-mode switch
 

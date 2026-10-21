@@ -17481,6 +17481,56 @@ def _clear_leftover(tmux_name, epoch):
     return None
 
 
+def _capture_pane_styled(tmux_name):
+    """The pane with its SGR escapes kept (`capture-pane -e`), or None when
+    it can't be captured — or on Windows, whose grid capture carries no
+    attributes."""
+    if IS_WINDOWS or not tmux_name:
+        return None
+    try:
+        out = subprocess.run(
+            _tmux("capture-pane", "-p", "-e", "-t", _tmux_pane(tmux_name),
+                  name=tmux_name),
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+# A dim span (SGR 2) up to the next reset — how Claude Code draws the empty
+# composer's placeholder ('Try "how does <filepath> work?"', 2.1.306).
+_DIM_SPAN_RE = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)")
+
+
+def _composer_holds_text(styled):
+    """Whether a styled capture's composer may hold typed text: False only
+    when an EMPTY box (or one showing just the dim placeholder) is seen
+    between its two rules; True for a draft, and also whenever the box can't
+    be read whole — a short pane draws only the top rule and the draft's last
+    rows (≤ ~11 rows), the rule alone (≤ 5) or no rule at all (≤ 3), and an
+    empty box looks the same as a draft there (XERK-2157 QA). None only when
+    there is no capture."""
+    if styled is None:
+        return None
+    lines = styled.splitlines()
+    plain = [_ANSI_RE.sub("", line) for line in lines]
+    rules = [i for i, line in enumerate(plain) if _COMPOSER_RULE_RE.match(line)]
+    if len(rules) < 2:
+        return True
+    rows = lines[rules[-2] + 1:rules[-1]]
+    text = "".join(_ANSI_RE.sub("", _DIM_SPAN_RE.sub("", row)) for row in rows)
+    return bool(text.replace("❯", "").replace("\xa0", "").strip())
+
+
+def _composer_blocks_switch(styled):
+    """Whether set_model must wait for the composer: it may hold a draft, or
+    (on tmux) it could not be captured at all. Windows' grid capture carries no
+    styling to read (None), so there it keeps the old behaviour and goes on."""
+    holds = _composer_holds_text(styled)
+    return bool(holds) or (holds is None and not IS_WINDOWS)
+
+
 def _composer_rows(cap):
     """The composer's rows as drawn (between the last two rules), or None."""
     if not cap:
@@ -18413,14 +18463,18 @@ def _pane_blocking_dialog(cap):
         to every other pane read, and fatal to the session if Entered (XERK-868);
       * any other overlay dialog, read off its key-hint footer
         (`_hint_dialog_up`: the native AskUserQuestion picker, an MCP
-        elicitation, the project MCP-server approval — XERK-2142).
+        elicitation, the project MCP-server approval — XERK-2142);
+      * the /model picker's "Switch model?" confirm, which has no footer at
+        all (`parse_model_switch_confirm`, XERK-2157): an Enter or a typed
+        "1" answers Yes.
     Keeping the last two OUT of `parse_pane_prompt` is deliberate: `panePrompt`
     is a wire contract whose options the chat page renders as clickable digits,
     and these have no digit to click (or, for the picker, digits that a
     free-text row and a multi-question tab bar make unsafe to offer) —
     surfacing them there would offer the operator a button that does nothing."""
     return (bool(parse_pane_prompt(cap)) or _trust_dialog_up(cap)
-            or _hint_dialog_up(cap))
+            or _hint_dialog_up(cap)
+            or parse_model_switch_confirm(cap) is not None)
 
 
 def _answer_trust_dialog(tmux_name, cap=None):
@@ -24393,12 +24447,27 @@ MODEL_PICKER_WAIT_SEC = 0.3
 MODEL_PICKER_MAX_STEPS = 12
 MODEL_STEP_TRIES = 8
 MODEL_STEP_WAIT_SEC = 0.12
-MODEL_CONFIRM_TRIES = 10
+MODEL_CONFIRM_TRIES = 15
 MODEL_CONFIRM_WAIT_SEC = 0.2
 # What the TUI prints once a picker selection lands (session-only or saved
-# default) or is dismissed on the current model. Either wording proves the
-# picker acted and closed.
-MODEL_CONFIRM_RE = re.compile(r"Set model to\s+.+|Kept model as\s+.+")
+# default) or is dismissed on the current model: "Set model to Sonnet 5.5 for
+# this session only" / "Kept model as …". The name is the picker row's label,
+# or "Opus 5.5 (default)" for the Default row (2.1.306). A narrow pane wraps
+# the line, the name included, so `_model_set_names` joins it back up.
+MODEL_SET_LINE_RE = re.compile(r"(?:Set model to|Kept model as)(?:\s+(.*))?$")
+_MODEL_SET_TAIL_RE = re.compile(
+    r"\s+(?:for this session only|and saved as your default)\b")
+# Claude Code's "Switch model?" confirm, drawn after `s` when the conversation
+# is cached for the current model (2.1.306, XERK-2157): a cost warning, then
+# "❯ 1. Yes, switch to <name>" and "2. No, go back" as the pane's last lines.
+# It has no "Esc to cancel" footer and no question line right above its
+# options, so no other pane read sees it. Esc goes back to the picker. Under
+# ~23 columns option 1 wraps after "switch" and at 20 drops the space after
+# "1." ("❯ 1.Yes, switch" / "to Haiku 5.5"), so its lines are joined first.
+MODEL_SWITCH_YES_START_RE = re.compile(r"^(?:❯\s*)?1\.\s*Yes\b")
+MODEL_SWITCH_YES_RE = re.compile(
+    r"^(?:❯\s*)?1\.\s*Yes,\s*switch\s+to\b\s*(.*)$")
+MODEL_SWITCH_BACK_RE = re.compile(r"^(?:❯\s*)?2\.\s*No, go back$")
 # How set_mode's closed loop is bounded: more presses than any real cycle has
 # modes (a wrap back to the start stops it earlier), each press's readback
 # polled STEP_TRIES × STEP_WAIT.
@@ -24468,6 +24537,121 @@ def _picker_index_for(rows, resolved):
         if head == want:
             return i
     return None
+
+
+def _pane_lines(text):
+    """A capture's lines, ANSI and qwen's scrollbar column stripped."""
+    return [_PANE_SCROLLBAR_RE.sub("", line).rstrip()
+            for line in _ANSI_RE.sub("", text or "").splitlines()]
+
+
+def parse_model_switch_confirm(text):
+    """The model a "Switch model?" confirm offers to switch to, or None when
+    the capture shows no such confirm ("" when its name can't be read).
+
+    Read by position, like the other overlay dialogs: the "2. No, go back"
+    option must be the pane's LAST non-blank line (nothing a conversation
+    prints sits below the composer), "1. Yes, switch to …" above it (its name
+    wrapped onto the lines between on a narrow pane), and the "Switch model?"
+    heading above that, with no rule in between."""
+    lines = [line.strip() for line in _pane_lines(text)]
+    filled = [i for i, line in enumerate(lines) if line]
+    if not filled or not MODEL_SWITCH_BACK_RE.match(lines[filled[-1]]):
+        return None
+    back = filled[-1]
+    for yes in range(back - 1, max(-1, back - 5), -1):
+        if MODEL_SWITCH_YES_START_RE.match(lines[yes]):
+            break
+    else:
+        return None
+    m = MODEL_SWITCH_YES_RE.match(" ".join(lines[yes:back]))
+    if not m:
+        return None
+    for i in range(yes - 1, -1, -1):
+        if lines[i] == "Switch model?":
+            return " ".join(m.group(1).split())
+        if lines[i] and PANE_PROMPT_RULE_RE.match(lines[i]):
+            return None
+    return None
+
+
+def _model_set_lines(text):
+    """Each "Set model to …"/"Kept model as …" line on the pane, top to bottom,
+    as (name, settled): its wrapped continuation joined back on, and whether no
+    conversation row follows it — nothing but the composer and its chrome, as
+    right after the switch that printed it."""
+    lines = _pane_lines(text)
+    found = []
+    for i, line in enumerate(lines):
+        m = MODEL_SET_LINE_RE.search(line)
+        if not m:
+            continue
+        rest = (m.group(1) or "").strip()
+        for nxt in lines[i + 1:i + 6]:
+            if _MODEL_SET_TAIL_RE.search(" " + rest):
+                break
+            # A continuation is indented text; a blank line, a rule, the next
+            # row's glyph ("❯", "⎿", "●") or the right-aligned effort line
+            # ("◐ medium · /effort") ends the line.
+            more = nxt.strip()
+            if (not more or not nxt[:1].isspace() or more[0] in "❯⎿●✻─"
+                    or "/effort" in more):
+                break
+            rest += " " + more
+        tail = _MODEL_SET_TAIL_RE.search(" " + rest)
+        name = " ".join((" " + rest)[:tail.start()].split() if tail else rest.split())
+        # A row after it: an assistant/turn line ("●", "✻" at column 0 — the
+        # right-aligned effort line is indented), a tool result ("⎿"), or a
+        # prompt with text. The composer's own "❯" is empty after a switch.
+        settled = not any(
+            nxt[:1] in ("●", "✻") or nxt.strip().startswith("⎿")
+            or (nxt[:1] == "❯" and nxt[1:].strip())
+            for nxt in lines[i + 1:])
+        found.append((name, settled))
+    return found
+
+
+def _model_set_names(text):
+    """The model named by each "Set model to …"/"Kept model as …" line."""
+    return [name for name, _ in _model_set_lines(text)]
+
+
+def _model_switch_landed(before, after, label):
+    """Whether `after` shows a NEW line naming the picker row `label`, against
+    the pane `before` the picker opened: more such lines than before, or one
+    settled at the bottom where `before` had none. The second rule covers a
+    full screen, where the new line scrolls an older one off the top and the
+    count stays put (XERK-2157 QA); a line already settled there before is
+    the earlier switch's, so only a higher count proves a new one then."""
+    was, now = _model_set_lines(before), _model_set_lines(after)
+    count = lambda found: sum(_model_names_row(n, label) for n, _ in found)
+    if count(now) > count(was):
+        return True
+    if not now or not now[-1][1] or not _model_names_row(now[-1][0], label):
+        return False
+    return not (was and was[-1][1] and _model_names_row(was[-1][0], label))
+
+
+def _model_picker_open(cap):
+    """Whether the /model picker is drawn: its rows parse and the composer's
+    mode footer, which the picker hides, is not on screen. Its own key-hint
+    footer is not required — a narrow pane pushes it off-screen."""
+    return bool(parse_model_picker(cap)[0]
+                and not PANE_MODE_RE.search(_ANSI_RE.sub("", cap or "")))
+
+
+def _model_names_row(name, label):
+    """Whether a model name the TUI printed is the picker row `label`: the same
+    first word, as `_picker_index_for` picks rows, except that the Default row
+    is printed as "<model> (default)" and only it may be."""
+    words = (name or "").replace("✔", "").lower().split()
+    row = label.replace("✔", "").lower().split()
+    if not words or not row:
+        return False
+    is_default = words[-1] == "(default)"
+    if row[0] == "default":
+        return is_default or words[0] == "default"
+    return not is_default and words[0] == row[0]
 
 
 def clean_summary(raw):
@@ -34179,9 +34363,11 @@ class SessionManager:
         Escaped out of and logged — the record keeps the real model, and the
         heartbeat corrects the UI's optimistic guess.
 
-        Two reliability fixes ride along: the input line is cleared (C-u)
-        first, so a half-typed operator prompt can't fuse with the command into
-        garbage; and a FRESH busy read gates the whole thing — typed into a
+        Two reliability fixes ride along: a draft in the composer defers the
+        switch (XERK-2157) — typed onto, it would fuse with the command into a
+        submitted prompt, and it is the operator's, so it is never cleared —
+        while an empty composer still gets a C-u first; and a FRESH busy read
+        gates the whole thing — typed into a
         mid-turn pane the command would only be queued as a prompt, so it is
         refused (log-only) rather than misfired. Unlike interrupt(), which
         tolerates a stale idle read because Escape is harmless, this path types
@@ -34223,13 +34409,28 @@ class SessionManager:
             self.save()
             log(f"set model of {sid} -> {arg}: turn in flight; deferred until idle")
             return
-        if _dialog_up(tmux_name):
+        before = _capture_pane(tmux_name)
+        if _pane_blocking_dialog(before):
             # A dialog owns the keyboard: "/model" + Enter would answer it — an
             # Enter on a permission dialog approves "1. Yes" (XERK-2142 QA).
             # Deferred the same way; _apply_pending_switches waits it out too.
             sess["pendingModel"] = arg
             self.save()
             log(f"set model of {sid} -> {arg}: a dialog is up; deferred until it closes")
+            return
+        if _composer_blocks_switch(_capture_pane_styled(tmux_name)):
+            # The operator has a draft in the composer. "/model" + Enter would
+            # submit it as a prompt with "/model" glued on, and clearing it
+            # first is no better: Ctrl+U kills only what is before the cursor
+            # (one row per two presses), so it either left text to submit or,
+            # retried each beat, ate the operator's edits (XERK-2157 QA). The
+            # draft is never touched — as `_type_into_pane` holds rather than
+            # clear one; the switch waits until the composer is empty. The dim
+            # placeholder is not a draft, but a box it can't read whole (a
+            # short pane) is treated as one (`_composer_holds_text`).
+            sess["pendingModel"] = arg
+            self.save()
+            log(f"set model of {sid} -> {arg}: a draft is in the composer; deferred")
             return
         sess.pop("pendingModel", None)
         _pane_send_keys(tmux_name, "C-u")
@@ -34281,12 +34482,16 @@ class SessionManager:
                 log(f"set model of {sid} -> {arg}: picker vanished mid-navigation")
                 self.save()
                 return
+        label = rows[cur]
+        # The confirmation must be NEW: a line from an earlier switch to the
+        # same model can still be on screen (XERK-2157 QA matched one), so it
+        # is judged against the pane as it was before the picker opened.
         _pane_send_keys(tmux_name, "s", literal=True)
         # The record updates only on the TUI's own confirmation — "Set model
         # to X for this session only" (or "Kept model as X" when the row was
         # already current). Unconfirmed, the record keeps the old value and the
         # transcript scan's modelActual settles what the chip shows either way.
-        if self._await_model_confirmation(tmux_name):
+        if self._await_model_confirmation(tmux_name, label, before):
             sess["model"] = resolved
             self.save()
             log(f"set model of {sid} -> {arg} (session only, confirmed)")
@@ -34309,15 +34514,56 @@ class SessionManager:
                 return rows, cur
         return rows, cur
 
-    def _await_model_confirmation(self, tmux_name):
-        """Whether the picker's selection visibly landed: poll for the TUI's
-        own "Set model to…"/"Kept model as…" line (MODEL_CONFIRM_RE)."""
+    def _await_model_confirmation(self, tmux_name, label, before):
+        """Whether the picker's selection of row `label` visibly landed: poll
+        for a NEW "Set model to…"/"Kept model as…" line naming that row
+        (`_model_switch_landed` against the pane `before` the picker opened).
+
+        On a session with history Claude Code first asks "Switch model?" (the
+        cache re-read warning). It is answered Yes here: the operator's pick in
+        the UI already chose the switch, and left open the confirm would take
+        the next typed message and Enter as its answer (XERK-2157). Only a
+        confirm naming the picked row is answered; one naming any other model,
+        or one still up when the wait ends, is backed out of."""
+        answered = False
         for _ in range(MODEL_CONFIRM_TRIES):
             time.sleep(MODEL_CONFIRM_WAIT_SEC)
             cap = _capture_pane(tmux_name)
-            if cap and MODEL_CONFIRM_RE.search(cap):
+            if not cap:
+                continue
+            ask = parse_model_switch_confirm(cap)
+            if ask is not None:
+                if not _model_names_row(ask, label):
+                    log(f"model switch confirm names {ask!r}, not the picked "
+                        f"row {label!r}; backing out")
+                    break
+                if not answered:
+                    # "1" picks the option outright, wherever the ❯ is.
+                    _pane_send_keys(tmux_name, "1", literal=True)
+                    answered = True
+                continue
+            # Not while the picker is still drawn: it sits at the bottom, so
+            # against a pane scrolled up (PgUp) beforehand a line above it can
+            # read as new although `s` never landed (XERK-2157 QA).
+            if _model_picker_open(cap):
+                continue
+            if _model_switch_landed(before, cap, label):
                 return True
+        self._back_out_of_model_picker(tmux_name)
         return False
+
+    def _back_out_of_model_picker(self, tmux_name):
+        """Escape out of a "Switch model?" confirm and the picker under it,
+        one Escape per one SEEN — never blind: two Escapes on an idle
+        composer open the rewind menu."""
+        for _ in range(2):
+            cap = _capture_pane(tmux_name)
+            if not cap:
+                return
+            if parse_model_switch_confirm(cap) is None and not _model_picker_open(cap):
+                return
+            _pane_send_keys(tmux_name, "Escape")
+            time.sleep(MODEL_STEP_WAIT_SEC)
 
     # --- the trust-folder modal (XERK-868) ---------------------------------
 
