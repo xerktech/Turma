@@ -251,14 +251,40 @@ function cell(v: unknown): string {
 // operator's TURMA_PANE_BUSY_MARKERS override included), which the launch
 // exports as TURMA_BUSY_MARKERS: `|`-separated, matched case-insensitively
 // anywhere on screen. Read at each /turma run; empty without the variable.
-
-function markerRes(raw: string | undefined): RegExp[] {
+// Kept as lowercased literals and matched by a plain scan, never a RegExp built
+// from them (Semgrep's detect-non-literal-regexp; the text is the operator's).
+function markerRes(raw: string | undefined): string[] {
   return (raw || '')
     .split('|')
-    .map(m => m.trim().replace(/[\p{Cc}\p{Cf}]+/gu, ' '))
+    .map(m => m.trim().replace(/[\p{Cc}\p{Cf}]+/gu, ' ').toLowerCase())
     // One character cannot be broken up, and would read every pane busy anyway.
     .filter(m => [...m].length >= 2)
-    .map(m => new RegExp(m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu'))
+}
+
+// Is `m` (lowercased) at `text[i]`, compared case-insensitively?
+function markerAt(text: string, i: number, m: string): boolean {
+  return text.slice(i, i + m.length).toLowerCase() === m
+}
+
+function hasMarker(text: string, m: string): boolean {
+  for (let i = 0; i + m.length <= text.length; i++) if (markerAt(text, i, m)) return true
+  return false
+}
+
+// Every non-overlapping occurrence of `m`, left to right, replaced by `f(it)`.
+function replaceMarker(text: string, m: string, f: (hit: string) => string): string {
+  let out = ''
+  let i = 0
+  while (i + m.length <= text.length) {
+    if (markerAt(text, i, m)) {
+      out += f(text.slice(i, i + m.length))
+      i += m.length
+    } else {
+      out += text[i]
+      i += 1
+    }
+  }
+  return out + text.slice(i)
 }
 
 // Text with no custom marker left in it. Run over whole output LINES, so a
@@ -266,12 +292,12 @@ function markerRes(raw: string | undefined): RegExp[] {
 // breaking one (`ab` → `a-b`) can make another. Breaking passes are bounded by
 // the marker count (+1); what still matches after them (`-a` stays `-a`-shaped)
 // is deleted until nothing matches, which ends, as every deletion shortens it.
-function unmarked(text: string, res: RegExp[]): string {
-  const left = () => res.some(re => text.search(re) >= 0)
+function unmarked(text: string, res: string[]): string {
+  const left = () => res.some(m => hasMarker(text, m))
   for (let pass = 0; pass <= res.length && left(); pass++) {
-    for (const re of res) text = text.replace(re, broken)
+    for (const m of res) text = replaceMarker(text, m, broken)
   }
-  while (left()) for (const re of res) text = text.replace(re, '')
+  while (left()) for (const m of res) text = replaceMarker(text, m, () => '')
   return text
 }
 
@@ -289,7 +315,7 @@ function quoted(v: unknown): string {
   return c ? `“${c}”` : ''
 }
 
-async function peersText($: EngineInterface, res: RegExp[]): Promise<string> {
+async function peersText($: EngineInterface, res: string[]): Promise<string> {
   const path = await $.env.get('TURMA_PEERS_FILE')
   if (!path) return 'No roster: this session was not launched by Turma.'
   let raw: string
@@ -399,7 +425,7 @@ async function wakeText($: EngineInterface, args: string[]): Promise<string> {
 async function turmaText($: EngineInterface, args: string): Promise<string> {
   const words = args.trim().split(/\s+/).filter(Boolean)
   const sub = (words[0] || '').toLowerCase()
-  let res: RegExp[] = []
+  let res: string[] = []
   try {
     res = markerRes(await $.env.get('TURMA_BUSY_MARKERS'))
   } catch {
