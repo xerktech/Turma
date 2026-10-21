@@ -175,8 +175,13 @@
   // in agent- or tool-emitted SVG can never execute or fetch. encodeURIComponent
   // leaves the result free of <, >, ", & (all percent-encoded), so it's inert in
   // the attribute; esc() is applied for uniformity with every other src above.
+  // A lone UTF-16 surrogate makes encodeURIComponent THROW (URIError), so one
+  // inside an agent's <svg> block took renderProse — and the whole repaint — down
+  // with it (XERK-2140). It becomes U+FFFD; Prose.kt's svgSource does the same.
+  const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
   function svgToImg(svg) {
-    return imgTag("data:image/svg+xml," + encodeURIComponent(String(svg).trim()), "", "md-svg");
+    const src = String(svg).trim().replace(LONE_SURROGATE, "\ufffd");
+    return imgTag("data:image/svg+xml," + encodeURIComponent(src), "", "md-svg");
   }
   function linkify(text) {
     const s = String(text == null ? "" : text);

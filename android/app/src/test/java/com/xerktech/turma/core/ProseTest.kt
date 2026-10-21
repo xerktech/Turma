@@ -403,16 +403,36 @@ class ProseTest {
         // survive normalisation, are Java line terminators, and are ALSO excluded
         // from JavaScript's `.` — so the web reads these as prose too, and this
         // pins the two ports to the same answer.
-        //
-        // U+0085 NEL is deliberately NOT here: it is a Java line terminator that
-        // JavaScript's `.` happily matches, so the ports genuinely disagree on it
-        // and asserting either answer would codify that. See turma-sessions.md.
         for (t in listOf("## H\u2028", "## H\u2029")) {
             assertTrue("should not be a heading: " + t.map { it.code }, headings(t).isEmpty())
         }
         for (t in listOf("- a\u2028", "1. a\u2029")) {
             assertTrue("should not be a list: " + t.map { it.code }, lists(t).isEmpty())
         }
+    }
+
+    @Test fun `NEL is ordinary text inside a line, as JavaScript's dot reads it`() {
+        // U+0085 is a Java line terminator that JavaScript's `.` matches, so Java's
+        // own `.` made `## H<NEL>` prose here and a heading on the web (XERK-2140).
+        assertEquals("H\u0085", plain(headings("## H\u0085").single().spans))
+        assertEquals(1, lists("- a\u0085b").single().items.size)
+        assertEquals(1, parseProse("> a\u0085").filterIsInstance<ProseBlock.Quote>().size)
+    }
+
+    @Test fun `JS character classes, not the platform's, in the remaining rules (XERK-2140)`() {
+        // Unicode case folding matched `ſ` (U+017F) as `s`; JavaScript's /i does not.
+        assertTrue(svgs("<\u017fvg></\u017fvg>").isEmpty())
+        assertTrue(svgs("<svg></\u017fvg>").isEmpty())
+        assertTrue(svgs("```\n<\u017fvg></svg>\n```").isEmpty())
+        // Kotlin's isBlank() counts U+001F as blank; JS trim() does not, so the
+        // code span still sheds its one padding space each side.
+        val code = parseInlineOnly("`` \u001f ``").filterIsInstance<Span.Code>().single()
+        assertEquals("\u001f", code.text)
+    }
+
+    @Test fun `a lone surrogate inside an svg block becomes U+FFFD, as the web's must`() {
+        assertEquals("<svg>\uFFFD</svg>", svgs("<svg>\uD800</svg>").single().source)
+        assertEquals("<svg>\uD83D\uDE00\uFFFD</svg>", svgs("```\n<svg>\uD83D\uDE00\uDC00</svg>\n```").single().source)
     }
 
     @Test fun `a wrapped bullet's continuation line stays in its item`() {
