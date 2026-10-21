@@ -10600,6 +10600,110 @@ class TestHintDialogIsABlockingDialog(unittest.TestCase):
         self.assertIs(state["paneDialog"], False)
 
 
+# The /model picker's "Switch model?" confirm, captured on Claude Code 2.1.306
+# (XERK-2157): drawn after `s` on a session whose conversation is cached for the
+# current model. No "Esc to cancel" footer, no question line above the options.
+_2157_CONFIRM_140 = (
+    "❯ Reply with exactly the word ok and nothing else\n"
+    "\n"
+    "● ok\n"
+    "\n"
+    "✻ Cogitated for 1s · done 1:21 AM\n"
+    "\n"
+    + "▔" * 140 + "\n"
+    "   Switch model?\n"
+    "   Your next response will be slower and use more tokens\n"
+    "\n"
+    "   This conversation is cached for the current model. Switching to Sonnet 5.5"
+    " means the full history gets re-read on your next message.\n"
+    "\n"
+    "   ❯ 1. Yes, switch to Sonnet 5.5\n"
+    "     2. No, go back\n"
+    "\n"
+    "\n"
+)
+_2157_CONFIRM_24 = (
+    "▔" * 24 + "\n"
+    "   Switch model?\n"
+    "   Your next response\n"
+    "   will be slower\n"
+    "   and use more\n"
+    "   tokens\n"
+    "\n"
+    "   This conversation\n"
+    "   is cached for the\n"
+    "   current model.\n"
+    "   Switching to\n"
+    "   Sonnet 5.5 means\n"
+    "   the full history\n"
+    "   gets re-read on\n"
+    "   your next message.\n"
+    "\n"
+    "   ❯ 1. Yes, switch to\n"
+    "        Sonnet 5.5\n"
+    "     2. No, go back\n"
+    "\n"
+)
+# What the pane shows once it lands, at 24 columns: the line wraps mid-name.
+_2157_LANDED_24 = (
+    "❯ /model\n"
+    "  ⎿ Set model to Opus 5.5\n"
+    "    (default) for this\n"
+    "    session only\n"
+    "❯ /model\n"
+    "  ⎿ Set model to Sonnet\n"
+    "    5.5 for this session\n"
+    "    only\n"
+    "    ◐ medium · /effort\n"
+    + "─" * 24 + "\n"
+    "❯ \n"
+    + "─" * 24 + "\n"
+    "  ⏵⏵ auto mode on\n"
+)
+
+
+class TestModelSwitchConfirm(unittest.TestCase):
+    """XERK-2157: the "Switch model?" confirm is a dialog no other pane read
+    saw, so the next typed message landed in it and its Enter answered it."""
+
+    def test_reads_the_target_off_the_real_frames(self):
+        self.assertEqual(ha.parse_model_switch_confirm(_2157_CONFIRM_140), "Sonnet 5.5")
+        self.assertEqual(ha.parse_model_switch_confirm(_2157_CONFIRM_24), "Sonnet 5.5")
+
+    def test_it_is_a_blocking_dialog(self):
+        for cap in (_2157_CONFIRM_140, _2157_CONFIRM_24):
+            self.assertFalse(ha.parse_pane_prompt(cap))
+            self.assertFalse(ha._hint_dialog_up(cap))   # why it was invisible
+            self.assertTrue(ha._pane_blocking_dialog(cap))
+
+    def test_a_quoted_confirm_above_the_composer_is_not_one(self):
+        quoted = (_2157_CONFIRM_140 + "─" * 140 + "\n❯ \n" + "─" * 140 + "\n"
+                  "  ⏵⏵ auto mode on (shift+tab to cycle)\n")
+        self.assertIsNone(ha.parse_model_switch_confirm(quoted))
+        self.assertFalse(ha._pane_blocking_dialog(quoted))
+        self.assertIsNone(ha.parse_model_switch_confirm(
+            "     2. No, go back\n"))                  # no heading, no Yes
+        self.assertIsNone(ha.parse_model_switch_confirm(""))
+        self.assertIsNone(ha.parse_model_switch_confirm(None))
+
+    def test_set_lines_are_joined_across_a_wrap(self):
+        self.assertEqual(ha._model_set_names(_2157_LANDED_24),
+                         ["Opus 5.5 (default)", "Sonnet 5.5"])
+        self.assertEqual(ha._model_set_names(
+            "  ⎿  Kept model as Sonnet 5.5\n    ◐ medium · /effort\n"),
+            ["Sonnet 5.5"])
+
+    def test_a_name_matches_its_row_only(self):
+        names_row = ha._model_names_row
+        self.assertTrue(names_row("Sonnet 5.5", "Sonnet 5.5"))
+        self.assertTrue(names_row("Opus 5.5 (default)", "Default (recommended)"))
+        self.assertTrue(names_row("Opus 5.5 (default)", "Default (rec… ✔"))
+        self.assertFalse(names_row("Opus 5.5 (default)", "Opus 5.5"))
+        self.assertFalse(names_row("Opus 5.5", "Default (recommended)"))
+        self.assertFalse(names_row("Haiku 5.5", "Sonnet 5.5"))
+        self.assertFalse(names_row("", "Sonnet 5.5"))
+
+
 class TestWindowsManagerBoot(ManagerMixin, unittest.TestCase):
     """run_forever installs a POSIX-only SIGUSR1 handler (the tunnel's heartbeat
     poke) that MUST be gated on IS_WINDOWS, or the manager crashes at boot on
@@ -20412,15 +20516,34 @@ class _PickerPane:
     flakiness the verified loop exists to survive."""
     ROWS = ("Default (recommended)", "Opus", "Fable", "Sonnet", "Haiku")
 
-    def __init__(self, cur=2, drop_arrows=0, confirm=True, opens=True):
+    def __init__(self, cur=2, drop_arrows=0, confirm=True, opens=True,
+                 ask=False, ask_name=None, answers=True, history=""):
         self.cur = cur                  # ❯ starts on Fable, like the real pane
         self.drop_arrows = drop_arrows  # swallow this many arrow presses
         self.confirm = confirm          # print "Set model to…" after `s`
         self.opens = opens              # whether /model paints a picker at all
+        self.ask = ask                  # draw "Switch model?" after `s` (XERK-2157)
+        self.ask_name = ask_name        # the name the confirm shows, if not the row's
+        self.answers = answers          # whether a "1" answers the confirm
+        self.history = history          # conversation text above the composer
         self.open = False
+        self.asking = False
         self.confirmed = False
 
+    def name(self):
+        if self.cur == 0:
+            return "Opus 5.5 (default)"
+        return self.ROWS[self.cur]
+
     def key(self, key):
+        if self.asking:
+            if key == "1" and self.answers:
+                self.asking = False
+                self.confirmed = self.confirm
+            elif key == "Escape":    # back to the picker, as on 2.1.306
+                self.asking = False
+                self.open = True
+            return
         if key == "Enter" and not self.open:
             self.open = self.opens
         elif key in ("Down", "Up") and self.open:
@@ -20431,7 +20554,10 @@ class _PickerPane:
             self.cur = min(len(self.ROWS) - 1, max(0, self.cur + step))
         elif key == "s" and self.open:
             self.open = False
-            self.confirmed = self.confirm
+            if self.ask:
+                self.asking = True
+            else:
+                self.confirmed = self.confirm
         elif key == "Escape":
             self.open = False
 
@@ -20441,10 +20567,19 @@ class _PickerPane:
             for i, label in enumerate(self.ROWS):
                 mark = "❯ " if i == self.cur else "  "
                 lines.append(f"   {mark}{i + 1}. {label}    a description")
-            return "\n".join(lines)
+            lines.append("   Enter to set as default · s to use this session only · Esc to cancel")
+            return self.history + "\n".join(lines)
+        if self.asking:
+            name = self.ask_name or self.name()
+            return (self.history + "▔" * 40 + "\n   Switch model?\n"
+                    "   Your next response will be slower and use more tokens\n\n"
+                    f"   This conversation is cached for the current model. Switching to {name} means\n"
+                    "   the full history gets re-read on your next message.\n\n"
+                    f"   ❯ 1. Yes, switch to {name}\n     2. No, go back\n\n")
         if self.confirmed:
-            return "  ⎿  Set model to Sonnet 5 for this session only\n❯ "
-        return "❯ \n  ? for shortcuts"  # idle; deliberately no mode marker
+            return (self.history +
+                    f"  ⎿  Set model to {self.name()} for this session only\n❯ ")
+        return self.history + "❯ \n  ? for shortcuts"  # idle; deliberately no mode marker
 
 
 class _ModePane:
@@ -20636,6 +20771,73 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         sm.set_model("abcde", "sonnet")
         self.assertEqual(self._keys()[-1], "s")
         self.assertEqual(sess["model"], "opus")
+
+    def test_set_model_answers_the_switch_confirm_and_records_the_switch(self):
+        # XERK-2157: on a session with history `s` opens "Switch model?". The
+        # operator's pick already chose the switch, so set_model answers Yes;
+        # left open, the next operator message would answer it instead.
+        sm = self.make_manager(pane=_PickerPane(ask=True))
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys(), ["C-u", "/model", "Enter", "Down", "s", "1"])
+        self.assertEqual(sess["model"], "sonnet")
+
+    def test_set_model_answers_the_default_rows_confirm(self):
+        # The Default row's confirm names "Opus 5.5 (default)", not "Default".
+        sm = self.make_manager(pane=_PickerPane(ask=True))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "default")
+        self.assertEqual(self._keys()[-2:], ["s", "1"])
+        self.assertIsNone(sess["model"])
+
+    def test_set_model_backs_out_of_a_confirm_naming_another_model(self):
+        sm = self.make_manager(pane=_PickerPane(ask=True, ask_name="Haiku 5.5"))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertNotIn("1", self._keys())
+        self.assertEqual(self._keys()[-2:], ["Escape", "Escape"])  # confirm, picker
+        self.assertFalse(self.pane.asking or self.pane.open)
+        self.assertEqual(sess["model"], "opus")
+
+    def test_set_model_backs_out_of_a_confirm_that_stays_up(self):
+        sm = self.make_manager(pane=_PickerPane(ask=True, answers=False))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys().count("1"), 1)   # answered once, not spammed
+        self.assertEqual(self._keys()[-2:], ["Escape", "Escape"])
+        self.assertFalse(self.pane.asking or self.pane.open)
+        self.assertEqual(sess["model"], "opus")
+
+    def test_set_model_ignores_an_earlier_switch_line_still_on_screen(self):
+        # XERK-2157 QA: the old check accepted ANY "Set model to … for this
+        # session only" on the pane, so a line left by an earlier switch
+        # "confirmed" one that never landed.
+        old = "❯ /model\n  ⎿  Set model to Sonnet for this session only\n"
+        sm = self.make_manager(pane=_PickerPane(confirm=False, history=old))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(sess["model"], "opus")
+        # ...and a NEW line naming the target still confirms beside it.
+        self.run_calls.clear()
+        sm = self.make_manager(pane=_PickerPane(history=old))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(sess["model"], "sonnet")
+
+    def test_set_model_needs_the_line_to_name_the_target(self):
+        pane = _PickerPane()
+        pane.name = lambda: "Haiku"
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(sess["model"], "opus")
+
+    def test_set_model_defers_while_a_switch_confirm_is_up(self):
+        sm = self.make_manager(pane=_2157_CONFIRM_140)
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(sess["pendingModel"], "sonnet")
 
     def test_set_model_row_not_offered_escapes(self):
         # A probed alias with no picker row (the bracketed 1M variants) backs

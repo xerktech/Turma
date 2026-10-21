@@ -152,6 +152,15 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
 - A busy pane **defers, never drops**: lands as `pendingModel`, applied on the first idle beat by
   `_apply_pending_switches`. Backs out with Escape if the picker has no row for the target. Tests:
   `TestSetModelMode`, `TestParseModelPicker`.
+- **`s` on a session with history opens "Switch model?"** (cache re-read warning, 2.1.306,
+  XERK-2157), which no other pane read sees. set_model answers it with `1` ONLY when it names
+  the picked row, else Escapes out (one Escape per dialog seen: two on an idle composer open
+  rewind). It is in `_pane_blocking_dialog` too (`parse_model_switch_confirm`).
+  - **The confirmation must name the row AND be new**: lines naming it are counted on the pane
+    before `/model`, and only a higher count after `s` confirms — a stale line from an earlier
+    switch once "confirmed" one that never landed. The Default row prints `<model> (default)`;
+    a narrow pane wraps the line mid-name (`_model_set_names` joins it). Tests:
+    `TestModelSwitchConfirm`.
 
 ### `setMode` — live permission-mode switch
 
