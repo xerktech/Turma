@@ -21865,6 +21865,14 @@ class TestParsePanePrompt(unittest.TestCase):
             "  ❯ 1. Alpha\n    2. Beta\n\n✻ Cooked for 2s · done 2:18 AM\n\n"
             + "─" * 80 + "\n❯ \n" + "─" * 80 + "\n  Press Ctrl-C again to exit\n")
         self.assertIsNone(ha.parse_pane_prompt(toast))
+        # A ▔ line quoted in the reply is indented, so it is not the edge.
+        self.assertIsNone(ha.parse_pane_prompt(toast.replace(
+            "● Which", "● Heads up\n  ▔▔▔▔▔▔▔▔▔▔\n  Which")))
+        # Only the question sits between the edge and the subtitle.
+        self.assertIsNone(ha.parse_pane_prompt(
+            "▔▔▔▔▔\nHeading\nProceed?\n\nnote\n\n ❯ 1. Yes\n   2. No\n"))
+        self.assertIsNotNone(ha.parse_pane_prompt(
+            "▔▔▔▔▔\n  ────\nProceed?\n\nnote\n\n ❯ 1. Yes\n   2. No\n"))
         # The dialog without its edge on screen is not read as one either.
         self.assertIsNone(ha.parse_pane_prompt(
             PANE_EXIT_PLAN_SUBTITLE_DIALOG.split("▔" * 44 + "\n")[1]))

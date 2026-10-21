@@ -14201,8 +14201,10 @@ PANE_PROMPT_MAX_OPTIONS = 9   # answered by typing the digit; 10+ isn't one key
 PANE_PROMPT_SUBTITLE_LINES = 3
 # The top edge of Claude Code's bottom area (2.1.306), which a dialog replaces
 # the composer inside: a ▔ run, sometimes ending in an effort badge. Everything
-# above it is conversation, never the dialog's detail (XERK-2162).
-PANE_PROMPT_EDGE_RE = re.compile(r"^\s*▔{3}")
+# above it is conversation, never the dialog's detail (XERK-2162). Always at
+# column 0: conversation and tool output are indented, so an indented ▔ line
+# quoted in a reply can never pose as it.
+PANE_PROMPT_EDGE_RE = re.compile(r"^▔{3}")
 # How far in from the pane's edge a dialog's box may end (XERK-2162: 2 cells).
 PANE_DIALOG_MARGIN = 4
 

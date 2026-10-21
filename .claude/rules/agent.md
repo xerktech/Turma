@@ -351,7 +351,8 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     - That dialog's box ends 2 cells in from the pane, and its labels wrap there: wrap width is
       the nearest box rule within `PANE_DIALOG_MARGIN` of the pane (`_pane_dialog_width`), else
       the widest line. Below ~30 columns the TUI's own wrap drifts further; not covered.
-    - `detail` stops at the ▔ edge (`PANE_PROMPT_EDGE_RE`): above it is conversation, and its
+    - `detail` stops at the ▔ edge (`PANE_PROMPT_EDGE_RE`, column 0 only — replies are indented):
+      above it is conversation, and its
       effort badge (first seconds only) changed the id, so an answer stamped early was dropped.
     - Tests: the `subtitle`/`effort_badge`/`short_rule` cases in `TestParsePanePrompt`.
   - **A wrapped label is rejoined; the AskUserQuestion picker is refused** (XERK-2150).
