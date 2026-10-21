@@ -289,6 +289,32 @@ test("a 'stopped' drop is not an answer; the next turn retries it", async () => 
   assert.equal(h.submits.length, 2);
 });
 
+test("a 'stopped' drop is published, and again after a turn the person did not start", async () => {
+  // QA on 2.1.305: Esc, then a background shell finishing starts and ends a turn.
+  // That clears the mod's flag while Claude Code stays stopped; the next submit
+  // is dropped again, and the turn state must say so, or the agent times out
+  // and types the message into the pane past the person's stop.
+  const stop = { drop: "the session was stopped and nobody has sent input since" };
+  const h = await harness({ submitResults: [stop, stop] });
+  h.submit("Wait for the person", 150);
+  await h.tick();
+  assert.equal(h.stopped(), true, "the drop is published");
+  await h.event("turn.start", { text: "", turnId: "bg1" });   // a background completion
+  await h.event("turn.complete", { turnId: "bg1", isAborted: false, reason: "answer" });
+  assert.equal(h.stopped(), false);
+  await h.tick();
+  assert.equal(h.submits.length, 2, "retried once idle");
+  assert.equal(h.stopped(), true, "dropped again, and published again");
+  assert.equal(h.submitted(), null);
+});
+
+test("a 'stopped' rename refusal is published too", async () => {
+  const h = await harness({ runRejects: ["HooksError: the session was stopped and nobody has sent input since"] });
+  h.ask("Later", 160);
+  await h.tick();
+  assert.equal(h.stopped(), true);
+});
+
 test("another drop or a rejection is answered ok:false; an unusable text is refused", async () => {
   const d = await harness({ submitResults: [{ drop: "a hook said no" }] });
   d.submit("x", 130);

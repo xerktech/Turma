@@ -87,16 +87,20 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
 - **After an interrupted turn Claude Code DROPS a plugin prompt** — it resolves
   `{drop: "the session was stopped and nobody has sent input since"}`, it does not reject
   (2.1.305). The mod treats that as "wait for the next turn", answers nothing, and publishes
-  `stopped` in its turn state; the agent then waits too. Typing it into the pane instead would
-  talk past the person's Esc.
-- **Never dropped**: ok:false, an unwritable request (a planted link), or no answer for
+  `stopped` in its turn state (`markStopped`, on EVERY drop); the agent then waits too. Typing it
+  into the pane instead would talk past the person's Esc.
+  - A turn the person did not start (a background shell finishing) clears the mod's flag while
+    Claude Code stays stopped (QA, 2.1.305), so the mod retries, is dropped again and re-publishes.
+    Never set the flag without publishing it: unpublished, the agent timed out to the pane.
+- **Never dropped**: ok:false, an unwritable request (a planted link, a failed rewrite after a
+  launch), or no answer for
   `MOD_SUBMIT_TIMEOUT_SEC` of turn-state-idle (or unreadable: the mod is gone) withdraws the
   request and types it into the pane. The clock runs only while idle and not stopped, so a long
   turn never trips it. Residual: a mod that read the request just before the withdrawal could
   still submit it — one duplicate machine message, never a lost one.
 - A launch clears the request dir; the beat re-writes the head (same `at`) for the new process.
   An entry for an earlier conversation (`csid` ≠ the pinned id: a clear-context restart) or a
-  session no longer running is dropped. A pending submit counts as undelivered input, so a
+  session no longer running is dropped, with a log line. A pending submit counts as undelivered input, so a
   sleeper is never paused over it (`_input_undelivered`).
 - No compaction outbox: the message is submitted only while idle, so it starts its own turn and
   is a normal transcript entry before any compaction can run (`_pending_scan` has nothing to

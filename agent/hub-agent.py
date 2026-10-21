@@ -18903,6 +18903,7 @@ def write_mod_submit(session_id, text, at):
     stamped `at` (epoch ms, the request's id). Atomic. True once written."""
     folder = mod_request_dir(session_id)
     if not folder or os.path.islink(folder):
+        log(f"mod submit request for {session_id} not written (request dir is a link)")
         return False                          # never write through a planted link
     try:
         _write_mod_file(folder, "submit.json", json.dumps({"v": 1, "text": text, "at": at}))
@@ -34480,6 +34481,8 @@ class SessionManager:
         sid = sess.get("id")
         if not isinstance(q, list) or sess.get("status") != "running":
             sess.pop("modSubmits", None)
+            if isinstance(q, list) and q:
+                log(f"session {sid}: {len(q)} machine message(s) dropped (session not running)")
             return True
         now_ms = int(time.time() * 1000) if now_ms is None else now_ms
         csid = sess.get("claudeSessionId")
@@ -34494,6 +34497,7 @@ class SessionManager:
             if (not isinstance(head, dict) or not isinstance(head.get("text"), str)
                     or head.get("csid") != csid):
                 q.pop(0)
+                log(f"session {sid}: machine message dropped (made for an earlier conversation)")
                 changed = True
                 continue
             at = head.get("at")
@@ -34523,7 +34527,12 @@ class SessionManager:
                 continue
             if not mod_submit_out(sid):
                 # A launch cleared the request dir; the new process's mod reads it.
-                write_mod_submit(sid, head["text"], at)
+                # One that cannot be written again goes to the pane, never held.
+                if not write_mod_submit(sid, head["text"], at):
+                    q.pop(0)
+                    to_pane(head, "request not rewritten")
+                    changed = True
+                    continue
                 head.pop("idleSince", None)
                 changed = True
                 break

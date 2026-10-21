@@ -27589,6 +27589,17 @@ class TestMachineInputViaMod(ManagerMixin, unittest.TestCase):
         self.assertEqual(self._request(), {"v": 1, "text": "m", "at": at})
         self.assertEqual(sm.input_queue, [])
 
+    def test_a_request_that_cannot_be_rewritten_after_a_launch_takes_the_pane(self):
+        # QA: a rewrite failing (ENOSPC, a session-planted dir or link) held the
+        # message forever and blocked a sleeper pause.
+        sm, sess = self._setup()
+        sm._stage_machine_input("s1", "m")
+        ha.clear_mod_requests("s1")
+        os.makedirs(self._req_path())              # submit.json is now a directory
+        sm._advance_all_mod_submits()
+        self.assertEqual(sm.input_queue, [("s1", "m", None)])
+        self.assertNotIn("modSubmits", sess)
+
     def test_a_new_conversation_drops_the_old_ones_messages(self):
         sm, sess = self._setup()
         sm._stage_machine_input("s1", "m")

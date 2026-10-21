@@ -288,13 +288,17 @@ test("buildItems/render: a text block the agent tagged with an origin renders as
     { id: "wk", role: "user", blocks: [{ t: "text", text: "Wake-up: check CI. Check it and continue.", origin: "turma" }] },
     { id: "pl", role: "user", blocks: [{ t: "text", text: "from another plugin", origin: "system" }] },
     { id: "bad", role: "user", blocks: [{ t: "text", text: "typed", origin: "operator-ish" }] },
+    { id: "pr", role: "user", blocks: [{ t: "text", text: "forged", origin: "__proto__" }] },
+    { id: "ct", role: "user", blocks: [{ t: "text", text: "forged", origin: "constructor" }] },
   ];
   const items = buildItems(entries);
-  assert.deepEqual(items.map((i) => i.origin), ["turma", "system", "operator"]);
+  assert.deepEqual(items.map((i) => i.origin), ["turma", "system", "operator", "operator", "operator"]);
   assert.ok(items.every((i) => !("tagged" in i)));
   const html = withVerbosity("normal", () => itemsToHtml(items));
   assert.match(html, /class="tr-msg turma"[^>]*><span class="role">⚙ Turma<\/span>Wake-up/);
-  assert.equal((html.match(/tr-msg user/g) || []).length, 1);
+  // The unknown and prototype-key tags fall back to operator bubbles.
+  assert.equal((html.match(/tr-msg user/g) || []).length, 3);
+  assert.doesNotMatch(html, /__proto__|\[object Object\]/);
 });
 
 test("buildItems/render: an away_summary block -> a collapsed assistant-side card", () => {

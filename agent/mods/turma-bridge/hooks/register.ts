@@ -81,6 +81,16 @@ function publish($: EngineInterface, w: Writer, turn: Turn, turnId: string | nul
     .catch(() => undefined)
 }
 
+// Claude Code says the session is stopped (it refused a command or dropped a
+// prompt). Published, not just remembered: a turn the person did not start (a
+// background shell finishing) clears `w.stopped` on its turn.start while Claude
+// Code stays stopped, and the agent reads the turn state to wait rather than
+// type the message into the pane past the person's Esc (QA, 2.1.305).
+function markStopped($: EngineInterface, w: Writer) {
+  w.stopped = true
+  publish($, w, 'idle', null)
+}
+
 async function pollRename($: EngineInterface, w: Writer) {
   if (w.renaming || w.submitting || w.turn !== 'idle' || w.stopped) return
   const dir = await $.env.get('TURMA_MOD_REQUESTS')
@@ -116,7 +126,7 @@ async function pollRename($: EngineInterface, w: Writer) {
       error = String(err).slice(0, 300)
       if (/stopped/.test(error)) {
         // Refused until the person sends input: not an answer, try after.
-        w.stopped = true
+        markStopped($, w)
         w.lastRename = 0
         w.renaming = false
         return
@@ -168,7 +178,7 @@ async function pollSubmit($: EngineInterface, w: Writer) {
       const drop = r && typeof r === 'object' && 'drop' in r ? String((r as { drop?: unknown }).drop) : ''
       if (drop && STOPPED_RE.test(drop)) {
         // Dropped until the person sends input: not an answer, try after.
-        w.stopped = true
+        markStopped($, w)
         w.lastSubmit = 0
         w.submitting = false
         return
@@ -178,7 +188,7 @@ async function pollSubmit($: EngineInterface, w: Writer) {
     } catch (err) {
       error = String(err).slice(0, 300)
       if (STOPPED_RE.test(error)) {
-        w.stopped = true
+        markStopped($, w)
         w.lastSubmit = 0
         w.submitting = false
         return

@@ -1544,7 +1544,7 @@
         if (b.t !== "command" && b.t !== "command_output") openCmd = null;
         if (b.t === "text") {
           if (!msg) msg = { kind: "msg", role, id: eid, text: "", truncated: false };
-          if (typeof b.origin === "string" && MSG_ORIGIN_TAGS[b.origin]) msg.tagged = b.origin;
+          if (typeof b.origin === "string" && Object.prototype.hasOwnProperty.call(MSG_ORIGIN_TAGS, b.origin)) msg.tagged = b.origin;
           msg.text += b.text || "";
           if (b.truncated) msg.truncated = true;
         } else if (b.t === "thinking") {
