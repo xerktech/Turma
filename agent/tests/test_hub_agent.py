@@ -22282,6 +22282,28 @@ class TestParsePanePrompt(unittest.TestCase):
         self.assertIsNone(ha.parse_pane_prompt(
             PANE_EXIT_PLAN_SUBTITLE_DIALOG.split("▔" * 44 + "\n")[1]))
 
+    def test_the_exit_toast_vetoes_like_the_footer(self):
+        # XERK-2169: a reply shaped question / options, read while the Ctrl-C
+        # toast replaces the mode footer (real 2.1.306 frame, trimmed).
+        cap = ("● Which option should I take?\n\n"
+               "  ❯ 1. Alpha\n    2. Beta\n\n✻ Cooked for 2s · done 2:18 AM\n\n"
+               + "─" * 80 + "\n❯ \n" + "─" * 80 + "\n  Press Ctrl-C again to exit\n")
+        self.assertIsNone(ha.parse_pane_prompt(cap))
+        self.assertIsNone(ha.parse_pane_prompt(
+            cap.replace("Ctrl-C", "Ctrl-D")))
+        # Only the toast line itself vetoes: the same text quoted inside a line
+        # leaves the reply parsing as it always did without a footer.
+        self.assertIsNotNone(ha.parse_pane_prompt(cap.replace(
+            "  Press Ctrl-C again to exit", "  Tip: Press Ctrl-C again to exit")))
+        # A narrow pane wraps the toast (QA: 28 and 24 columns, 3 lines at 16).
+        for wrapped in ("Press Ctrl-C again to\n  exit",
+                        "Press Ctrl-C again\n  to exit",
+                        "Press Ctrl-C\n  again to\n  exit"):
+            self.assertIsNone(ha.parse_pane_prompt(cap.replace(
+                "Press Ctrl-C again to exit", wrapped)), wrapped)
+        # A real dialog is still read; the toast is never below one.
+        self.assertIsNotNone(ha.parse_pane_prompt(PANE_EXIT_PLAN_SUBTITLE_DIALOG))
+
     def test_a_subtitle_needs_blank_fences_and_a_question(self):
         # Prose glued to the question or to the run is not a subtitle.
         self.assertIsNone(ha.parse_pane_prompt(
