@@ -280,6 +280,23 @@ test("buildItems/render: a relayed user turn is LEFT and in its own class, never
   assert.equal((html.match(/tr-msg user/g) || []).length, 1);
 });
 
+test("buildItems/render: a text block the agent tagged with an origin renders as that origin (XERK-2135)", () => {
+  // A bridge-mod prompt (hub-agent.py _plugin_message): the agent has already
+  // stripped Claude Code's frame, so the tag is the only thing that says it is
+  // not the operator. An unknown tag is ignored and the text classifies as usual.
+  const entries = [
+    { id: "wk", role: "user", blocks: [{ t: "text", text: "Wake-up: check CI. Check it and continue.", origin: "turma" }] },
+    { id: "pl", role: "user", blocks: [{ t: "text", text: "from another plugin", origin: "system" }] },
+    { id: "bad", role: "user", blocks: [{ t: "text", text: "typed", origin: "operator-ish" }] },
+  ];
+  const items = buildItems(entries);
+  assert.deepEqual(items.map((i) => i.origin), ["turma", "system", "operator"]);
+  assert.ok(items.every((i) => !("tagged" in i)));
+  const html = withVerbosity("normal", () => itemsToHtml(items));
+  assert.match(html, /class="tr-msg turma"[^>]*><span class="role">⚙ Turma<\/span>Wake-up/);
+  assert.equal((html.match(/tr-msg user/g) || []).length, 1);
+});
+
 test("buildItems/render: an away_summary block -> a collapsed assistant-side card", () => {
   const entries = [{ id: "aw1", role: "assistant",
     blocks: [{ t: "away_summary", text: "Fixed the bug and opened a PR." }] }];

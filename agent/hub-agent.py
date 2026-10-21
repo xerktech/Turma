@@ -10091,6 +10091,49 @@ def _entry_tool_source(entry):
     return entry.get("sourceToolUseID") or None
 
 
+# A prompt a Claude Code plugin submitted (`$.prompt.submit`) is a user-role
+# entry stamped `origin: {kind: "plugin", name}`, its text wrapped in Claude
+# Code's frame (measured on 2.1.305):
+#   "The <name> plugin sent a message:\n<text>\n\nThis is how Claude Code
+#    surfaces a prompt a plugin submits between turns — …"
+# The bridge mod delivers Turma's own machine messages that way (wake-ups, hub
+# nudges, XERK-2135), so it is not the operator talking. The chat shows the text
+# with the frame stripped, tagged with the origin the clients already render
+# apart (chat.js messageOrigin's vocabulary): "turma" for our mod, "system" for
+# any other plugin. Keyed on the structured `origin`, never the text, so an
+# operator typing the frame's words is still an operator. Mirror of
+# tunnel-agent.js pluginMessage.
+PLUGIN_FRAME_TAIL = "\n\nThis is how Claude Code surfaces a prompt a plugin submits"
+BRIDGE_MOD_NAME = "turma-bridge"
+
+
+def _plugin_message(entry):
+    """(text, origin) for a plugin-submitted user entry, frame stripped, or
+    None when `entry` is not one. A frame worded otherwise is left in place."""
+    if entry.get("type") != "user":
+        return None
+    origin = entry.get("origin")
+    if not isinstance(origin, dict) or origin.get("kind") != "plugin":
+        return None
+    name = origin.get("name") if isinstance(origin.get("name"), str) else ""
+    msg = entry.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(str(b.get("text") or "") for b in content
+                       if isinstance(b, dict) and b.get("type") == "text")
+    else:
+        return None
+    head = f"The {name} plugin sent a message:\n"
+    if name and text.startswith(head):
+        text = text[len(head):]
+        cut = text.rfind(PLUGIN_FRAME_TAIL)
+        if cut != -1:
+            text = text[:cut]
+    return text, ("turma" if name == BRIDGE_MOD_NAME else "system")
+
+
 def _entry_id(entry):
     """The entry's own uuid, or a synthesized stable id for the entry types
     Claude Code writes WITHOUT one (pr-link): the client's tail merge dedups on
@@ -10157,6 +10200,9 @@ def _entry_text(entry):
     # preview and the archive's search index.
     if _entry_tool_source(entry):
         return None
+    plugin = _plugin_message(entry)
+    if plugin is not None:
+        return _edge_trim(ANSI_RE.sub("", plugin[0])) or None
     msg = entry.get("message")
     if not isinstance(msg, dict):
         return None
@@ -12199,7 +12245,7 @@ def _entry_blocks(entry, caps, preview=False):
     for every session on every beat. Nothing else differs, so the preview is a
     strictly poorer copy of the same shape and the clients' grow-only merge
     always prefers the live/history copy. Blocks:
-      {t:"text",           text}
+      {t:"text",           text, origin?}   (origin: a plugin's prompt, _plugin_message)
       {t:"thinking",       text, truncated?}
       {t:"tool_use",       id, name, input, truncated?}
       {t:"tool_result",    forId, text, isError?, truncated?}
@@ -12280,6 +12326,20 @@ def _entry_blocks(entry, caps, preview=False):
         text = _edge_trim(ANSI_RE.sub("", _entry_first_text(entry)))
         clipped, trunc = _clip(text, caps["result"])
         block = {"t": "tool_result", "text": clipped, "forId": tool_src}
+        if trunc:
+            block["truncated"] = True
+        return [block]
+
+    # A plugin's prompt (a Turma wake-up or nudge through the bridge mod): one
+    # text block, frame stripped, carrying who sent it so no client paints it
+    # as the operator's. Its text is never re-read as a notification or command.
+    plugin = _plugin_message(entry)
+    if plugin is not None:
+        text = _edge_trim(ANSI_RE.sub("", plugin[0]))
+        if not text:
+            return []
+        clipped, trunc = _clip(text, caps["text"])
+        block = {"t": "text", "text": clipped, "origin": plugin[1]}
         if trunc:
             block["truncated"] = True
         return [block]
@@ -12857,10 +12917,12 @@ def _is_operator_row(row):
     web/android/glasses builders apply (a text block on a user entry becomes a
     user message bubble), so what this keeps is exactly what the operator sees
     as "a message I sent". A `!` shell command counts too (XERK-2112): it is
-    operator input, rendered on the operator's side."""
+    operator input, rendered on the operator's side. A plugin's prompt (a text
+    block carrying `origin`, XERK-2135) is not."""
     if row.get("role") != "user":
         return False
-    return any(b.get("t") == "text" or _is_bang_block(b) for b in row.get("blocks") or [])
+    return any((b.get("t") == "text" and not b.get("origin")) or _is_bang_block(b)
+               for b in row.get("blocks") or [])
 
 
 def _is_bang_block(block):
@@ -18666,6 +18728,18 @@ MOD_REQUEST_MAX_BYTES = 4096
 # failure there (an Esc dropped the command) left the operator's restored prompt
 # in the composer, which the pane's `/rename` + Enter submitted glued (QA).
 MOD_RENAME_ATTEMPTS = 3
+# Turma's own machine messages (a wake-up, the hub's stall/loop and merged-PR
+# nudges) ride `submit.json` (XERK-2135): the mod submits it with
+# `$.prompt.submit` while the session is idle, so it can never land in a dialog,
+# the trust modal or the operator's draft. One request is out per session at a
+# time (`modSubmits`, FIFO). Past MOD_SUBMIT_MAX characters (the mod's
+# SUBMIT_MAX), or with no live mod, a message takes the pane as before.
+MOD_SUBMIT_MAX = 20000
+# A request the mod has not answered this long, while its turn state reads idle
+# and not stopped (it polls every 2s), is withdrawn and typed into the pane. A
+# running turn or an interrupted one waits: the mod submits once idle, and after
+# an Esc only once the person has sent input.
+MOD_SUBMIT_TIMEOUT_SEC = _env_int("TURMA_MOD_SUBMIT_TIMEOUT_SEC", 120, minimum=10)
 # A name the mod accepts has nothing Claude Code's /rename rewrites — it turns
 # each run of Unicode Cc/Cf characters and U+2028/9 into one space, then trims
 # (measured on 2.1.304, the regex its binary carries) — and no padding as JS's
@@ -18824,6 +18898,51 @@ def clear_mod_rename(session_id):
                         os.path.join(folder, "rename.done.json")])
 
 
+def write_mod_submit(session_id, text, at):
+    """Ask the session's bridge mod to submit `text` as a prompt (XERK-2135),
+    stamped `at` (epoch ms, the request's id). Atomic. True once written."""
+    folder = mod_request_dir(session_id)
+    if not folder or os.path.islink(folder):
+        return False                          # never write through a planted link
+    try:
+        _write_mod_file(folder, "submit.json", json.dumps({"v": 1, "text": text, "at": at}))
+        return True
+    except OSError as e:
+        log(f"mod submit request for {session_id} not written ({e})")
+        return False
+
+
+def mod_submit_out(session_id):
+    """Whether a submit request file is on disk for the mod to read. A launch
+    drops the request dir, so the beat re-writes one it still owes."""
+    folder = mod_request_dir(session_id)
+    return bool(folder) and os.path.isfile(os.path.join(folder, "submit.json"))
+
+
+def read_mod_submit_done(session_id):
+    """The mod's answer to a submit request, {at, ok, error}, or None."""
+    folder = mod_request_dir(session_id)
+    if not folder:
+        return None
+    data = _read_untrusted_json(os.path.join(folder, "submit.done.json"), MOD_REQUEST_MAX_BYTES)
+    if data is None or data.get("v") != 1:
+        return None
+    at = data.get("at")
+    if isinstance(at, bool) or not isinstance(at, int):
+        return None
+    error = data.get("error")
+    return {"at": at, "ok": data.get("ok") is True,
+            "error": error[:300] if isinstance(error, str) else None}
+
+
+def clear_mod_submit(session_id):
+    """Drop the submit request and its answer, leaving the rest of the dir."""
+    folder = mod_request_dir(session_id)
+    if folder and not os.path.islink(folder):
+        unlink_quietly([os.path.join(folder, "submit.json"),
+                        os.path.join(folder, "submit.done.json")])
+
+
 def mod_status(sess, payload):
     """What `/turma status` shows (the mod reads it as `status.json`): this
     session's name, task, ticket, live branch, PRs and pending wake, all off the
@@ -18863,18 +18982,32 @@ def read_turn_state(session_id, claude_sid):
     """The bridge mod's word on the session's own turn: True running, False idle,
     None can't tell (no file, a malformed one, or one written by another
     conversation — a /clear, or a nested claude sharing the env)."""
+    data = _turn_state_record(session_id, claude_sid)
+    turn = data.get("turn") if data else None
+    if turn == "running":
+        return True
+    if turn == "idle":
+        return False
+    return None
+
+
+def _turn_state_record(session_id, claude_sid):
+    """The turn-state file's body, bound to `claude_sid`, or None."""
     path = turn_state_path(session_id)
     if not path or not isinstance(claude_sid, str) or not claude_sid:
         return None
     data = _read_untrusted_json(path, TURN_STATE_MAX_BYTES)
     if data is None or data.get("v") != 1 or data.get("claudeSessionId") != claude_sid:
         return None
-    turn = data.get("turn")
-    if turn == "running":
-        return True
-    if turn == "idle":
-        return False
-    return None
+    return data
+
+
+def turn_state_stopped(session_id, claude_sid):
+    """Whether the mod says the session's last turn was interrupted and nobody
+    has sent input since (XERK-2135): Claude Code then drops a plugin's prompt,
+    and the agent waits rather than type past the person's stop."""
+    data = _turn_state_record(session_id, claude_sid)
+    return bool(data) and data.get("stopped") is True
 
 
 def fold_turn_state(report, turn):
@@ -23945,6 +24078,8 @@ class SessionManager:
         self.claude_version = run(["claude", "--version"])
         # The last status.json written per session, so the beat writes only on change.
         self._mod_status_last = {}
+        # The last `at` each session's submit request used (XERK-2135).
+        self._mod_submit_at = {}
         off = bridge_mod_off_reason(self.claude_version)
         log(f"bridge mod: off ({off})" if off else f"bridge mod: on ({bridge_mod_dir()})")
         self.coding_agent = coding_agent()
@@ -32906,10 +33041,12 @@ class SessionManager:
         """Is an operator message for `sid` staged but not yet recorded: still
         queued, being typed by the worker, or landed awaiting the beat?"""
         with self._input_lock:
-            return (any(q[0] == sid for q in self.input_queue)
-                    or sid in self.input_inflight
-                    or any(h["sid"] == sid for h in self.input_held)
-                    or any(item[0] == sid for item in self.input_landed))
+            staged = (any(q[0] == sid for q in self.input_queue)
+                      or sid in self.input_inflight
+                      or any(h["sid"] == sid for h in self.input_held)
+                      or any(item[0] == sid for item in self.input_landed))
+        # A machine message the bridge mod has yet to submit (XERK-2135).
+        return staged or bool((self._find(sid) or {}).get("modSubmits"))
 
     def _apply_landed_inputs(self):
         """Apply the outbox records the input worker staged (XERK-867). Runs on the
@@ -34257,8 +34394,10 @@ class SessionManager:
         """Stage a wake-up into every running session whose `wakeAt` has come.
 
         A time compare only — no pane RPC — so it fits the beat (XERK-395): the
-        input rides `_stage_input`, the operator path, which the input worker
-        delivers off the beat and the compaction outbox keeps. The request file
+        text goes to the session's bridge mod when it is live
+        (`_stage_machine_input`, XERK-2135), else rides `_stage_input`, the
+        operator path, which the input worker delivers off the beat and the
+        compaction outbox keeps. The request file
         and the record's fields are cleared as it fires, so one request wakes
         the session once."""
         now_ms = int(time.time() * 1000) if now_ms is None else now_ms
@@ -34278,7 +34417,7 @@ class SessionManager:
                 quiet = self._quiet.get(sid)
                 if now_ms - resumed < WAKE_RESUME_SETTLE_MS or not (quiet and quiet[0]):
                     continue
-            self._stage_input(sid, wake_text(sess.get("wakeReason")))
+            self._stage_machine_input(sid, wake_text(sess.get("wakeReason")))
             self._wake_fired[sid] = at
             sess.pop("wakeAt", None)
             sess.pop("wakeReason", None)
@@ -34287,6 +34426,139 @@ class SessionManager:
             fired = True
             log(f"session {sid}: wake-up delivered")
         if fired:
+            self.save()
+
+    # ---- Turma's machine messages through the bridge mod (XERK-2135) -------------
+
+    def _mod_can_submit(self, sess, text):
+        """Whether `text` for this session goes to its bridge mod: a running Claude
+        session launched with the mod whose turn state reads bound to its
+        conversation (the mod is live in it), and a text the mod will take
+        (non-blank, at most MOD_SUBMIT_MAX UTF-16 units, as JS counts)."""
+        if (sess is None or sess.get("status") != "running" or not sess.get("bridgeMod")
+                or sess.get("agentType") in ("dsh", "qwen")):
+            return False
+        if not isinstance(text, str) or not text.strip():
+            return False
+        if len(text.encode("utf-16-le")) // 2 > MOD_SUBMIT_MAX:
+            return False
+        return read_turn_state(sess.get("id"), sess.get("claudeSessionId")) is not None
+
+    def _stage_machine_input(self, sid, text):
+        """Deliver one of Turma's own messages — a wake-up, the hub's stall/loop or
+        merged-PR nudge — to a session: through its bridge mod's `$.prompt.submit`
+        while the mod is live (queued on `modSubmits`, the head written as
+        `submit.json`), else the pane path as before. Never an operator message:
+        the model reads a plugin's prompt as the plugin's, not the person's.
+        Returns "mod" or "pane". On the beat: file writes only."""
+        sess = self._find(sid)
+        if self._mod_can_submit(sess, text):
+            q = sess.get("modSubmits")
+            if not isinstance(q, list):
+                q = []
+            q.append({"text": text, "csid": sess.get("claudeSessionId")})
+            sess["modSubmits"] = q
+            self._advance_mod_submits(sess)
+            self.save()
+            return "mod"
+        self._stage_input(sid, text)
+        return "pane"
+
+    def _advance_mod_submits(self, sess, now_ms=None):
+        """Move one session's `modSubmits` queue along; True when the record
+        changed. The head is written as `submit.json` (stamped a fresh `at`); the
+        mod's ok answer pops it and the next is written at once. An ok:false
+        answer, an unwritable request, or one left unanswered for
+        MOD_SUBMIT_TIMEOUT_SEC while the turn state reads idle and not stopped
+        (or cannot be read) takes the pane instead — the message is never
+        dropped. A running or interrupted turn waits. A request a launch dropped
+        (the dir is cleared on every launch) is written again; an entry for an
+        earlier conversation (a clear-context restart) is dropped with it."""
+        q = sess.get("modSubmits")
+        if q is None:
+            return False
+        sid = sess.get("id")
+        if not isinstance(q, list) or sess.get("status") != "running":
+            sess.pop("modSubmits", None)
+            return True
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        csid = sess.get("claudeSessionId")
+        changed = False
+
+        def to_pane(head, why):
+            log(f"session {sid}: machine message via the pane ({why})")
+            self._stage_input(sid, head["text"])
+
+        while q:
+            head = q[0]
+            if (not isinstance(head, dict) or not isinstance(head.get("text"), str)
+                    or head.get("csid") != csid):
+                q.pop(0)
+                changed = True
+                continue
+            at = head.get("at")
+            if isinstance(at, bool) or not isinstance(at, int):
+                # Strictly after the last id this session used: the mod runs a
+                # request once per `at`, so two in one beat must differ.
+                at = max(now_ms, self._mod_submit_at.get(sid, 0) + 1)
+                self._mod_submit_at[sid] = at
+                if not write_mod_submit(sid, head["text"], at):
+                    q.pop(0)
+                    to_pane(head, "request not written")
+                    changed = True
+                    continue
+                head["at"] = at
+                head.pop("idleSince", None)
+                changed = True
+                break
+            done = read_mod_submit_done(sid)
+            if done and done["at"] == at:
+                q.pop(0)
+                clear_mod_submit(sid)
+                changed = True
+                if done["ok"]:
+                    log(f"session {sid}: machine message delivered (mod)")
+                else:
+                    to_pane(head, f"mod: {done['error']}")
+                continue
+            if not mod_submit_out(sid):
+                # A launch cleared the request dir; the new process's mod reads it.
+                write_mod_submit(sid, head["text"], at)
+                head.pop("idleSince", None)
+                changed = True
+                break
+            turn = read_turn_state(sid, csid)
+            if turn is True or turn_state_stopped(sid, csid):
+                if head.pop("idleSince", None) is not None:
+                    changed = True
+                break
+            since = head.get("idleSince")
+            if isinstance(since, bool) or not isinstance(since, int):
+                head["idleSince"] = now_ms
+                changed = True
+                break
+            if now_ms - since < MOD_SUBMIT_TIMEOUT_SEC * 1000:
+                break
+            clear_mod_submit(sid)
+            q.pop(0)
+            to_pane(head, "mod did not answer")
+            changed = True
+        if not q:
+            sess.pop("modSubmits", None)
+        return changed
+
+    def _advance_all_mod_submits(self, now_ms=None):
+        """The beat's pass over every session with machine messages owed to its
+        mod. File reads and writes only; one session never costs another."""
+        changed = False
+        for sess in list(self.registry):
+            if not sess.get("modSubmits"):
+                continue
+            try:
+                changed = self._advance_mod_submits(sess, now_ms) or changed
+            except Exception as e:
+                log(f"mod submit for {sess.get('id')} failed ({e})")
+        if changed:
             self.save()
 
     def _note_quiet(self, sid, signals):
@@ -42421,8 +42693,14 @@ class SessionManager:
                     # settle+retry loop worst) that would blow the XERK-395 budget
                     # inline. _input_worker_loop delivers; _apply_landed_inputs
                     # records the outbox on the beat.
-                    self._stage_input(cmd.get("sessionId"), cmd.get("text") or "",
-                                      uploads=cmd.get("uploads"))
+                    # The hub's own words (a stall/loop or merged-PR nudge,
+                    # `source: "nudge"`) go through the bridge mod when it is
+                    # live (XERK-2135); an operator's always take the pane.
+                    if cmd.get("source") == "nudge" and not cmd.get("uploads"):
+                        self._stage_machine_input(cmd.get("sessionId"), cmd.get("text") or "")
+                    else:
+                        self._stage_input(cmd.get("sessionId"), cmd.get("text") or "",
+                                          uploads=cmd.get("uploads"))
                     # The operator answered: an open ask-in-chat row closes on
                     # it (XERK-1563). Never worth failing the input over. The
                     # hub's own stall nudge (XERK-1572, `source: "nudge"`) is
@@ -43856,6 +44134,13 @@ class SessionManager:
             self._deliver_due_wakes()
         except Exception as e:
             log(f"wake delivery failed: {e}")
+        # Machine messages owed to a session's bridge mod (XERK-2135): its
+        # answers read, the next request written, an unanswered one moved to
+        # the pane. File I/O only.
+        try:
+            self._advance_all_mod_submits()
+        except Exception as e:
+            log(f"mod submit pass failed: {e}")
         # Close-ticket requests (XERK-1569): apply what the worker finished, then
         # wake it for the next pass — its tracker HTTP never runs on the beat.
         try:

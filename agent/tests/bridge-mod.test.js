@@ -74,13 +74,14 @@ async function loadMod() {
   return mod;
 }
 
-async function harness({ runRejects, env = {}, procResult } = {}) {
+async function harness({ runRejects, env = {}, procResult, submitResults } = {}) {
   const { register } = await loadMod();
   const files = new Map();
   const runs = [];
   const procs = [];
   const registered = [];
   const timers = [];
+  const submits = [];
   const hooks = {};
   const $ = {
     env: {
@@ -98,6 +99,14 @@ async function harness({ runRejects, env = {}, procResult } = {}) {
       write: async (p, t) => { files.set(p, t); },
     },
     clock: { every: (ms, fn) => { timers.push(fn); return () => {}; } },
+    prompt: {
+      submit: async input => {
+        submits.push(input);
+        const r = submitResults && submitResults.shift();
+        if (r instanceof Error) throw r;
+        return r || { text: input.text, origin: { kind: "plugin", name: "turma-bridge" } };
+      },
+    },
     command: {
       register: async spec => { registered.push(spec); return { command: spec.name }; },
       run: async e => {
@@ -111,7 +120,7 @@ async function harness({ runRejects, env = {}, procResult } = {}) {
   register((name, matcher, hook) => { hooks[name] = hook || matcher; }, {});
   const settle = () => new Promise(r => setTimeout(r, 5));
   const h = {
-    files, runs, procs, registered,
+    files, runs, procs, registered, submits,
     async turma(args) { return (await hooks["command.run"]($, { command: "turma", args }, async x => x)).text; },
     async event(name, e) { await hooks[name]($, e, async x => x); await settle(); },
     hooks, $,
@@ -119,6 +128,9 @@ async function harness({ runRejects, env = {}, procResult } = {}) {
     turn() { return JSON.parse(files.get("/s/turn.json")).turn; },
     ask(name, at) { files.set("/r/rename.json", JSON.stringify({ v: 1, name, at })); },
     done() { return files.has("/r/rename.done.json") ? JSON.parse(files.get("/r/rename.done.json")) : null; },
+    submit(text, at) { files.set("/r/submit.json", JSON.stringify({ v: 1, text, at })); },
+    submitted() { return files.has("/r/submit.done.json") ? JSON.parse(files.get("/r/submit.done.json")) : null; },
+    stopped() { return JSON.parse(files.get("/s/turn.json")).stopped === true; },
   };
   await h.event("session.start", { cwd: "/", surface: "terminal", isInteractive: true });
   return h;
@@ -225,6 +237,92 @@ test("a turn that starts while the request is being read stops the run", async (
   await h.tick();
   assert.deepEqual(h.runs, []);
   assert.equal(h.done(), null);
+});
+
+// XERK-2135: Turma's machine messages through $.prompt.submit.
+test("a submit runs only while the main turn is idle, once per request", async () => {
+  const h = await harness();
+  await h.event("turn.start", { text: "go", turnId: "t1" });
+  h.submit("Wake-up: check CI. Check it and continue.", 100);
+  await h.tick();
+  assert.deepEqual(h.submits, [], "mid-turn it would wait in Claude Code's queue");
+  await h.event("turn.complete", { turnId: "t1", isAborted: false, reason: "answer" });
+  await h.tick();
+  assert.deepEqual(h.submits, [{ text: "Wake-up: check CI. Check it and continue." }]);
+  assert.equal("asUser" in h.submits[0], false, "framed as the plugin's, never the person's");
+  assert.deepEqual(h.submitted(), { v: 1, at: 100, ok: true });
+  await h.tick();
+  assert.equal(h.submits.length, 1, "one submit per request");
+  h.submit("next", 101);
+  await h.tick();
+  assert.equal(h.submits.length, 2, "a newer request runs");
+});
+
+test("after an interrupted turn a submit waits for the person's next turn", async () => {
+  const h = await harness();
+  await h.event("turn.start", { text: "go", turnId: "t1" });
+  await h.event("turn.complete", { turnId: "t1", isAborted: true, reason: "aborted" });
+  assert.equal(h.stopped(), true, "the turn state says so, so the agent waits too");
+  h.submit("After esc", 110);
+  await h.tick();
+  assert.deepEqual(h.submits, []);
+  assert.equal(h.submitted(), null);
+  await h.event("turn.start", { text: "next", turnId: "t2" });
+  assert.equal(h.stopped(), false);
+  await h.event("turn.complete", { turnId: "t2", isAborted: false, reason: "answer" });
+  await h.tick();
+  assert.equal(h.submitted().ok, true);
+});
+
+test("a 'stopped' drop is not an answer; the next turn retries it", async () => {
+  // Measured on 2.1.305: the prompt resolves { drop } rather than rejecting.
+  const h = await harness({ submitResults: [{ drop: "the session was stopped and nobody has sent input since" }] });
+  h.submit("Retry me", 120);
+  await h.tick();
+  assert.equal(h.submitted(), null);
+  await h.tick();
+  assert.equal(h.submits.length, 1, "it waits; it does not hammer the drop");
+  await h.event("turn.start", { text: "hi", turnId: "t3" });
+  await h.event("turn.complete", { turnId: "t3", isAborted: false, reason: "answer" });
+  await h.tick();
+  assert.equal(h.submitted().ok, true);
+  assert.equal(h.submits.length, 2);
+});
+
+test("another drop or a rejection is answered ok:false; an unusable text is refused", async () => {
+  const d = await harness({ submitResults: [{ drop: "a hook said no" }] });
+  d.submit("x", 130);
+  await d.tick();
+  assert.deepEqual(d.submitted(), { v: 1, at: 130, ok: false, error: "a hook said no" });
+  const r = await harness({ submitResults: [new Error("boom")] });
+  r.submit("x", 131);
+  await r.tick();
+  assert.equal(r.submitted().ok, false);
+  assert.match(r.submitted().error, /boom/);
+  for (const [text, at] of [["   ", 132], ["x".repeat(20001), 133], [42, 134]]) {
+    const u = await harness();
+    u.files.set("/r/submit.json", JSON.stringify({ v: 1, text, at }));
+    await u.tick();
+    assert.deepEqual(u.submits, [], JSON.stringify(text).slice(0, 20));
+    assert.equal(u.submitted().ok, false);
+  }
+});
+
+test("a turn that starts while the submit request is being read stops it", async () => {
+  const h = await harness();
+  h.submit("Racy", 140);
+  const read = h.$.fs.read;
+  let fired = false;
+  h.$.fs.read = async p => {
+    if (!fired && p.endsWith("submit.json")) {
+      fired = true;
+      await h.hooks["turn.start"](h.$, { text: "typed", turnId: "t9" }, async x => x);
+    }
+    return read(p);
+  };
+  await h.tick();
+  assert.deepEqual(h.submits, []);
+  assert.equal(h.submitted(), null);
 });
 
 test("/turma is registered, immediate, and answers help by default", async () => {

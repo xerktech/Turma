@@ -15535,6 +15535,10 @@ test("auto-close: the merged message asks the session to verify the DEPLOY befor
   assert.ok(msg.includes('python3 -SsE "$TURMA_SESSION_CLI" close-ticket done --note'),
     "names the session CLI's close-ticket");
   assert.match(msg, /else the tracker CLI\/MCP this host gives you/);
+  // XERK-2135: the hub's own words, so the agent can route them through the
+  // session's bridge mod and its permission ledger never reads them as an answer.
+  const cmd = agents.amV1.commands.find((c) => c.type === "input");
+  assert.equal(cmd.source, "nudge");
 });
 
 test("XERK-1569: a dsh/qwen session is told to close with its tracker tool, never the session CLI", async () => {

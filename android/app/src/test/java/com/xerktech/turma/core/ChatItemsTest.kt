@@ -562,4 +562,28 @@ class ChatItemsTest {
         // An assistant turn is never reclassified — it stays the default.
         assertEquals("operator", byKey["as"])
     }
+
+    @Test fun `a text block the agent tagged renders as that origin (XERK-2135)`() {
+        // chat.js twin: "a text block the agent tagged with an origin renders as that origin".
+        val items = buildItems(
+            listOf(
+                TailEntry(id = "wk", role = "user", blocks = listOf(TextBlock("Wake-up: check CI.", origin = "turma"))),
+                TailEntry(id = "pl", role = "user", blocks = listOf(TextBlock("from another plugin", origin = "system"))),
+                TailEntry(id = "bad", role = "user", blocks = listOf(TextBlock("typed", origin = "operator-ish"))),
+            ),
+            VerbosityPrefs.forPreset(Verbosity.NORMAL),
+        )
+        val byKey = items.filterIsInstance<ChatItem.Bubble>().associate { it.entryKey to it.origin }
+        assertEquals("turma", byKey["wk"])
+        assertEquals("system", byKey["pl"])
+        assertEquals("operator", byKey["bad"])
+    }
+
+    @Test fun `the agent's origin tag decodes off the wire`() {
+        val e = TurmaJson.decodeFromString(
+            TailEntry.serializer(),
+            """{"id":"x","role":"user","blocks":[{"t":"text","text":"hi","origin":"turma"}]}""",
+        )
+        assertEquals("turma", (e.blocks.single() as TextBlock).origin)
+    }
 }

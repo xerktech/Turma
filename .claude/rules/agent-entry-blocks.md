@@ -24,6 +24,13 @@ Split out of `agent.md` (size ceiling).
   - **SendUserFile → `files[]`+`caption`** (XERK-221, oversize past `SEND_FILE_MAX_BYTES` → name-only
     chip): image/SVG as base64 data URI, a `render` page
     as raw markup, else a name chip (never opened). Only image/html paths are read and bounded.
+- **A plugin's prompt is not the operator's** (XERK-2135, `_plugin_message`/`pluginMessage`): a
+  user entry with `origin.kind == "plugin"` becomes ONE `text` block with Claude Code's
+  "The <name> plugin sent a message:" frame stripped and `origin` set — `"turma"` for the bridge
+  mod, `"system"` for another plugin. Keyed on the structured origin, never the text; its text
+  is never re-read as a notification or command. Clients take a tagged origin over
+  `messageOrigin` (`chat.js` `MSG_ORIGIN_TAGS`, Android `TextBlock.origin`), and
+  `_is_operator_row` does not count it. Tests: `TestPluginMessage` ↔ its `tunnel-agent.test.js` twin.
 - `compact_boundary` and `pr-link` markers; pr-link entries carry no uuid so the feeds synthesize a
   stable id from the URL alone, deduped over the whole conversation (Claude re-stamps pr-links atop
   every user turn, so one PR yields ~6 entries — folding only consecutive repeats is not enough).

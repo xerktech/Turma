@@ -1456,7 +1456,13 @@ abstract class Block
 
 @Serializable
 @SerialName("text")
-data class TextBlock(val text: String = "", val truncated: Boolean = false) : Block()
+data class TextBlock(
+    val text: String = "",
+    val truncated: Boolean = false,
+    // Who sent a user turn the agent could attest (a bridge-mod prompt, XERK-2135):
+    // "turma" / "system", else empty and the text classifies by its framing.
+    val origin: String = "",
+) : Block()
 
 @Serializable
 @SerialName("thinking")

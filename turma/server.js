@@ -16084,7 +16084,10 @@ function autoCloseSweep() {
       const fresh = seen ? mergedUrls.some((u) => !seen.has(u)) : mergedUrls.length > 0;
       if (fresh) {
         const newly = seen ? mergedUrls.filter((u) => !seen.has(u)) : mergedUrls;
-        queueCommand(host, { type: "input", sessionId: s.id,
+        // `source: "nudge"`: the hub's own words, not the operator's — the agent
+        // delivers them through the session's bridge mod when it is live
+        // (XERK-2135) and its permission ledger never reads them as an answer.
+        queueCommand(host, { type: "input", sessionId: s.id, source: "nudge",
           text: autoCloseMergedMessage(newly, s.agentType, !!(a.closeTicket && a.closeTicket.available === true)) });
         const at = Date.now();
         autoCloseNotified.set(nk, { at, urls: new Set(mergedUrls) });

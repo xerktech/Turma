@@ -1392,6 +1392,9 @@
   // already-archived transcripts uniformly with no re-store. Turma and subagent
   // markers are checked before the generic "Another Claude session" wrapper they
   // sit inside. Anything unrecognised stays "operator".
+  // The origins an agent may tag a text block with (hub-agent.py
+  // _plugin_message): anything else is ignored and the text classifies as usual.
+  const MSG_ORIGIN_TAGS = { turma: 1, system: 1 };
   function messageOrigin(text) {
     const t = String(text == null ? "" : text);
     if (t.indexOf("[Relayed by Turma") !== -1) return "turma";
@@ -1524,7 +1527,10 @@
           // Classify by their delivery framing so the renderer can set them
           // apart from real operator input (blue, right) — see messageOrigin.
           if (msg.role === "user") {
-            msg.origin = messageOrigin(msg.text);
+            // A plugin's prompt (a Turma wake-up or nudge through the bridge
+            // mod, XERK-2135) arrives tagged by the agent, frame already gone.
+            msg.origin = msg.tagged || messageOrigin(msg.text);
+            delete msg.tagged;
             msg.text = stripFraming(msg.text);
           }
           // A turn that was nothing but framing tags has nothing to show.
@@ -1538,6 +1544,7 @@
         if (b.t !== "command" && b.t !== "command_output") openCmd = null;
         if (b.t === "text") {
           if (!msg) msg = { kind: "msg", role, id: eid, text: "", truncated: false };
+          if (typeof b.origin === "string" && MSG_ORIGIN_TAGS[b.origin]) msg.tagged = b.origin;
           msg.text += b.text || "";
           if (b.truncated) msg.truncated = true;
         } else if (b.t === "thinking") {
