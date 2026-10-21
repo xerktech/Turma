@@ -176,13 +176,17 @@ async function peersText($: EngineInterface): Promise<string> {
   // Ids are unique per host only: "you" is the row matching both.
   const mine = (r: string[]) => r[0] === me && r[2] === host
   const ordered = [...rows.filter(mine), ...rows.filter(r => !mine(r))]
+  // The roster writes "-" for an empty cell (hub-agent.py _peer_cell).
+  const val = (v: string | undefined) => (v === '-' ? '' : v)
   const lines = ordered.slice(0, PEER_ROWS_MAX).map(r => {
-    const [, name, h, repo, branch, task] = r
+    const [name, h, repo, branch, task] = r.slice(1).map(val)
     const mark = mine(r) ? ' (you)' : ''
     const where = [cell(h), cell(repo)].filter(Boolean).join('/')
     const br = cell(branch) ? ` [${cell(branch)}]` : ''
     const what = quoted(task) ? ` — ${quoted(task)}` : ''
-    return `  ${cell(name)}${mark}  ${where}${br}${what}`
+    // A nameless row (the local fallback roster) must not read as a
+    // continuation of the row above.
+    return `  ${cell(name) || '(no name)'}${mark}  ${where}${br}${what}`
   })
   const head = [`${rows.length} session(s); message one by its name with SendMessage.`, DATA_NOTE]
   // Rows fit under OUT_MAX with the pointer to the whole roster kept.

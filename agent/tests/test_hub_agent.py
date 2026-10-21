@@ -27687,6 +27687,13 @@ class TestModStatus(ManagerMixin, unittest.TestCase):
             self.assertEqual(json.load(f)["summary"], "New task")
         self.assertNotEqual(before, 0)
 
+    def test_a_detached_worktree_has_no_branch(self):
+        sess = self._sess()
+        for raw in ("HEAD", "", None):
+            st = ha.mod_status(sess, self._payload(git={"branch": raw}))
+            self.assertIsNone(st["branch"], repr(raw))
+        self.assertEqual(ha.mod_status(sess, self._payload())["branch"], "XERK-9-retry")
+
     def test_only_running_bridge_mod_sessions_get_one(self):
         sm = self.make_manager()
         for sess in (self._sess(bridgeMod=None), self._sess(status="stopped")):
