@@ -35159,9 +35159,15 @@ class SessionManager:
             # watched a bounded while longer, and a picker that turns up late
             # is Escaped too — the switch itself is not attempted that late.
             _pane_send_keys(tmux_name, "Escape")
-            why = ("/model picker did not appear" if not rows else
-                   "/model picker's cursor row is not drawn (pane too small)")
-            if not rows:
+            # A pane too short for any row (24x14, 30x12) draws the heading and
+            # its description alone: the picker is up, and that Escape closed it.
+            region = _model_picker_region(cap)
+            headed = bool(region) and not any(
+                line.strip() and PANE_PROMPT_RULE_RE.match(line) for line in region)
+            why = ("/model picker's cursor row is not drawn (pane too small)" if rows
+                   else "/model picker shows no rows (pane too small)" if headed
+                   else "/model picker did not appear")
+            if not rows and not headed:
                 for _ in range(MODEL_PICKER_LATE_TRIES):
                     time.sleep(MODEL_PICKER_WAIT_SEC)
                     if _model_picker_open(_capture_pane(tmux_name) or ""):

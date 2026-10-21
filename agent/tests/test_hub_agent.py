@@ -21724,7 +21724,10 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
                  "cursor row is not drawn"),
                 # 20 columns: the ❯ row's label is a bare "…".
                 (rule + "   Select model\n     1.  De…  Opu\n   ❯ 2.  … ✔  For\n"
-                 "     3.  Fa…  For\n", "truncated past recognition")):
+                 "     3.  Fa…  For\n", "truncated past recognition"),
+                # 24x14 / 30x12: the heading and its description, no rows.
+                (rule + "   Select model\n   Switch between\n   Claude models.\n"
+                 "   Your pick becomes\n", "shows no rows (pane too small)")):
             pane = _PickerPane()
             pane.capture = lambda cap=cap, pane=pane: cap if pane.open else (
                 "─" * 24 + "\n❯ \n" + "─" * 24 + "\n  ? for shortcuts")
@@ -21735,6 +21738,7 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
             self.assertIn(why, logged.call_args[0][0])
             self.assertNotIn("did not appear", logged.call_args[0][0])
             self.assertNotIn("s", self._keys())
+            self.assertEqual(self._keys().count("Escape"), 1)
 
     def test_only_windows_goes_on_without_a_styled_capture(self):
         self.assertTrue(ha._composer_blocks_switch(None))
