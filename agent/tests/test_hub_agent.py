@@ -21857,24 +21857,36 @@ class TestParsePanePrompt(unittest.TestCase):
             "─" * 56, "─" * 20)
         self.assertIsNone(ha.parse_pane_prompt(frame))
 
+    def test_a_subtitle_only_under_the_edge(self):
+        # A reply shaped question / note / options in the conversation, read
+        # while the Ctrl-C toast hides the footer (real 2.1.306 frame, trimmed).
+        toast = (
+            "● Which option should I take?\n\n  This is a note.\n\n"
+            "  ❯ 1. Alpha\n    2. Beta\n\n✻ Cooked for 2s · done 2:18 AM\n\n"
+            + "─" * 80 + "\n❯ \n" + "─" * 80 + "\n  Press Ctrl-C again to exit\n")
+        self.assertIsNone(ha.parse_pane_prompt(toast))
+        # The dialog without its edge on screen is not read as one either.
+        self.assertIsNone(ha.parse_pane_prompt(
+            PANE_EXIT_PLAN_SUBTITLE_DIALOG.split("▔" * 44 + "\n")[1]))
+
     def test_a_subtitle_needs_blank_fences_and_a_question(self):
         # Prose glued to the question or to the run is not a subtitle.
         self.assertIsNone(ha.parse_pane_prompt(
-            "Proceed?\nsome prose\n\n ❯ 1. Yes\n   2. No\n"))
+            "▔▔▔\nProceed?\nsome prose\n\n ❯ 1. Yes\n   2. No\n"))
         self.assertIsNone(ha.parse_pane_prompt(
-            "Proceed?\n\nsome prose\n ❯ 1. Yes\n   2. No\n"))
+            "▔▔▔\nProceed?\n\nsome prose\n ❯ 1. Yes\n   2. No\n"))
         # No question above the subtitle.
         self.assertIsNone(ha.parse_pane_prompt(
-            "Heading\n\nsome prose\n\n ❯ 1. Yes\n   2. No\n"))
+            "▔▔▔\nHeading\n\nsome prose\n\n ❯ 1. Yes\n   2. No\n"))
         # Two paragraphs, or one longer than a wrapped sentence, are not one.
         self.assertIsNone(ha.parse_pane_prompt(
-            "Proceed?\n\na\n\nb\n\n ❯ 1. Yes\n   2. No\n"))
+            "▔▔▔\nProceed?\n\na\n\nb\n\n ❯ 1. Yes\n   2. No\n"))
         self.assertIsNone(ha.parse_pane_prompt(
-            "Proceed?\n\na\nb\nc\nd\n\n ❯ 1. Yes\n   2. No\n"))
+            "▔▔▔\nProceed?\n\na\nb\nc\nd\n\n ❯ 1. Yes\n   2. No\n"))
         # A subtitle holds no question, rule or numbered line of its own.
         for inner in ("Why not?\nbecause", "────\nnote", "0. note"):
             self.assertIsNone(ha.parse_pane_prompt(
-                "Proceed?\n\n" + inner + "\n\n ❯ 1. Yes\n   2. No\n"), inner)
+                "▔▔▔\nProceed?\n\n" + inner + "\n\n ❯ 1. Yes\n   2. No\n"), inner)
         # The /model picker's description line still has no question above.
         self.assertIsNone(ha.parse_pane_prompt(MODEL_PICKER_PANE))
 

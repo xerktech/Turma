@@ -345,6 +345,9 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     the question directly above made that live dialog read as an idle composer.
     - Blank-fenced on both sides, ≤ `PANE_PROMPT_SUBTITLE_LINES`, no `?`/rule/option line; it
       joins `detail` and the id as one line (its wrap moves with the width).
+    - Only under the ▔ edge (`_pane_under_edge`: the question sits right below it, rules
+      between): a reply shaped question/note/options is above the edge, and the Ctrl-C toast
+      hides the footer that would veto it.
     - That dialog's box ends 2 cells in from the pane, and its labels wrap there: wrap width is
       the nearest box rule within `PANE_DIALOG_MARGIN` of the pane (`_pane_dialog_width`), else
       the widest line. Below ~30 columns the TUI's own wrap drifts further; not covered.

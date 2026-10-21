@@ -14258,6 +14258,25 @@ def _pane_dialog_width(lines, idx, widest):
     return widest
 
 
+def _pane_under_edge(lines, idx):
+    """Whether the question above line `idx` sits in Claude Code's bottom area:
+    above it only blanks, the question itself and box rules up to the ▔ edge
+    (XERK-2162). A subtitle is accepted only there — a reply in the
+    conversation shaped question / note / options is above the edge, and the
+    Ctrl-C toast hides the footer that would otherwise veto it."""
+    seen_q = False
+    for k in range(idx - 1, -1, -1):
+        line = lines[k]
+        if PANE_PROMPT_EDGE_RE.match(line):
+            return seen_q
+        if not line.strip() or PANE_PROMPT_RULE_RE.match(line):
+            continue
+        if seen_q:
+            return False
+        seen_q = True
+    return False
+
+
 def _pane_join_wrap(label, text):
     """`label` with a wrapped screen line `text` appended. A path the TUI broke
     mid-token ("…/.turma" / "/worktrees/…", "…/wor" / "ktrees/…") had no space
@@ -14396,7 +14415,8 @@ def parse_pane_prompt(cap, face=False):
                    and not PANE_PROMPT_OPTION_RE.match(lines[k])):
                 k -= 1
             if (0 <= k and not lines[k].strip()
-                    and q - k <= PANE_PROMPT_SUBTITLE_LINES):
+                    and q - k <= PANE_PROMPT_SUBTITLE_LINES
+                    and _pane_under_edge(lines, k)):
                 # Joined into one line: its wrap moves with the pane's width.
                 subtitle = [" ".join(l.strip() for l in lines[k + 1:q + 1])]
                 q = k
