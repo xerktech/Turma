@@ -12,12 +12,12 @@ import coil.fetch.SourceResult
 import coil.request.Options
 import coil.size.Scale
 import coil.size.Size
+import com.xerktech.turma.core.cpuMs
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.util.zip.CRC32
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import okio.Buffer
@@ -177,6 +177,19 @@ class SafeSvgDecoderTest {
     /** One `<image>` whose href attribute is [attr] verbatim (quotes included). */
     private fun withHref(attr: String) = "$open<image width=\"10\" height=\"10\" xlink:href=$attr/></svg>"
 
+    private fun refusedFor(svg: String) = runCatching { decode(svg.toByteArray()) }.exceptionOrNull()?.message
+
+    /** Runs [block] with the render deadline set to [ms], restoring it after. */
+    private fun <T> withDeadline(ms: Long, block: () -> T): T {
+        val saved = SvgRenderGuard.renderDeadlineMs
+        SvgRenderGuard.renderDeadlineMs = ms
+        try {
+            return block()
+        } finally {
+            SvgRenderGuard.renderDeadlineMs = saved
+        }
+    }
+
     private fun refused(svg: String): Boolean =
         runCatching { decode(svg.toByteArray()) }.exceptionOrNull() is IllegalStateException
 
@@ -219,10 +232,8 @@ class SafeSvgDecoderTest {
             "<defs><pattern id=\"p\" width=\"1\" height=\"1\" patternUnits=\"userSpaceOnUse\">" +
             "<image width=\"1\" height=\"1\" xlink:href=\"data:image/png;base64,$realPng\"/></pattern></defs>" +
             "<rect width=\"100\" height=\"100\" fill=\"url(#p)\"/></svg>"
-        val start = System.nanoTime()
-        assertTrue(refused(svg))
-        val ms = (System.nanoTime() - start) / 1_000_000
-        assertTrue("took ${ms}ms", ms < 5_000)
+        val ms = cpuMs { assertTrue(refused(svg)) }
+        assertTrue("took ${ms}ms of CPU", ms < 5_000)
     }
 
     /** A 100 x 100 rect filled with a pattern of [tile]-unit tiles, each a plain rect. */
@@ -234,11 +245,13 @@ class SafeSvgDecoderTest {
     @Test fun `an image-free pattern of tiny tiles is refused fast (XERK-2108)`() {
         // 0.01-unit tiles: 10^8 of them. Before the guard this pinned a core for
         // 11+ minutes on the emulator and kept running after Back.
-        val start = System.nanoTime()
-        val e = runCatching { decode(tiles("0.01").toByteArray()) }.exceptionOrNull()
-        val ms = (System.nanoTime() - start) / 1_000_000
-        assertEquals("refused SVG: too many steps to draw", e?.message)
-        assertTrue("took ${ms}ms", ms < 2_000)
+        // The wall-clock deadline is lifted so only the step budget can refuse it.
+        var message: String? = null
+        val ms = withDeadline(Long.MAX_VALUE / 1_000_000) {
+            cpuMs { message = refusedFor(tiles("0.01")) }
+        }
+        assertEquals("refused SVG: too many steps to draw", message)
+        assertTrue("took ${ms}ms of CPU", ms < 2_000)
     }
 
     @Test fun `a pattern of a sane number of tiles still draws`() {
@@ -249,27 +262,28 @@ class SafeSvgDecoderTest {
     @Test fun `a cancelled decode stops at the next step`() {
         // Coil cancels a decode by interrupting its thread (runInterruptible); the render
         // must notice at its next step rather than draw on. 0.45-unit tiles: ~50000 of
-        // them, inside the budget, so only cancellation can cut the render short.
+        // them, inside the budget, so only cancellation can cut the render short. The job
+        // is cancelled from the render's own 10th step, so no clock decides the outcome.
         val bytes = tiles("0.45").toByteArray()
-        fun timed(cancelAfterMs: Long?): Long = runBlocking {
-            val start = System.nanoTime()
-            val decoding = CompletableDeferred<Unit>()
+        var last = -1
+        var error: Throwable? = null
+        runBlocking {
             // Not decode(): its own runBlocking would shield the render from the cancel.
-            val job = launch(Dispatchers.IO) {
-                val d = decoder(bytes)!!
-                decoding.complete(Unit)
-                runCatching { d.decode() }
-            }
-            // Cancel mid-render, never before it starts (that would pass with no guard).
-            decoding.await()
-            if (cancelAfterMs != null) { delay(cancelAfterMs); job.cancel() }
-            job.join()
-            (System.nanoTime() - start) / 1_000_000
+            launch(Dispatchers.IO) {
+                val job = coroutineContext.job
+                SvgRenderGuard.onStep = { taken ->
+                    last = taken
+                    if (taken == 10) job.cancel()
+                }
+                try {
+                    error = runCatching { decoder(bytes)!!.decode() }.exceptionOrNull()
+                } finally {
+                    SvgRenderGuard.onStep = null
+                }
+            }.join()
         }
-        timed(null) // warm-up
-        val full = timed(null)
-        val cancelled = timed(50)
-        assertTrue("full ${full}ms, cancelled ${cancelled}ms", cancelled * 2 < full)
+        assertEquals("SVG render cancelled", error?.message)
+        assertEquals(10, last)
     }
 
     private val xl = "$ns xmlns:xlink=\"http://www.w3.org/1999/xlink\""
@@ -285,16 +299,15 @@ class SafeSvgDecoderTest {
         return sb.append("</defs><use xlink:href=\"#r$depth\"/></svg>").toString()
     }
 
-    private fun refusedFor(svg: String) = runCatching { decode(svg.toByteArray()) }.exceptionOrNull()?.message
 
     @Test fun `clip-path fan-out is refused before it renders`() {
         // Depth 7 is 2.5 KB and never calls save(): on the emulator it pinned a core for
         // 4+ minutes past Back with the save() guard alone (QA on XERK-2108).
-        val start = System.nanoTime()
-        assertEquals("refused SVG: too costly to draw", refusedFor(clipFan(7)))
-        assertEquals("refused SVG: too costly to draw", refusedFor(clipFan(3)))
-        val ms = (System.nanoTime() - start) / 1_000_000
-        assertTrue("took ${ms}ms", ms < 2_000)
+        val ms = cpuMs {
+            assertEquals("refused SVG: too costly to draw", refusedFor(clipFan(7)))
+            assertEquals("refused SVG: too costly to draw", refusedFor(clipFan(3)))
+        }
+        assertTrue("took ${ms}ms of CPU", ms < 2_000)
     }
 
     @Test fun `costly single draws are refused - a long clip text, a long self-crossing clip outline, a huge path`() {
@@ -336,12 +349,6 @@ class SafeSvgDecoderTest {
     }
 
     @Test fun `a render past the deadline is refused`() {
-        val saved = SvgRenderGuard.renderDeadlineMs
-        SvgRenderGuard.renderDeadlineMs = 0
-        try {
-            assertEquals("refused SVG: render too slow", refusedFor(tiles("10")))
-        } finally {
-            SvgRenderGuard.renderDeadlineMs = saved
-        }
+        withDeadline(0) { assertEquals("refused SVG: render too slow", refusedFor(tiles("10"))) }
     }
 }
