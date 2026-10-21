@@ -17511,9 +17511,19 @@ def _composer_holds_text(styled):
     lines = styled.splitlines()
     plain = [_ANSI_RE.sub("", line) for line in lines]
     rules = [i for i, line in enumerate(plain) if _COMPOSER_RULE_RE.match(line)]
-    if len(rules) < 2:
+    if not rules:
         return None
-    rows = lines[rules[-2] + 1:rules[-1]]
+    if len(rules) >= 2:
+        rows = lines[rules[-2] + 1:rules[-1]]
+    else:
+        # A short pane (≤ ~11 rows) under a multi-line draft draws the
+        # composer's TOP rule and the draft's last rows, but no bottom rule or
+        # mode footer (XERK-2157 QA). A lone rule over only the mode footer is
+        # a bottom rule whose box is off the top: can't tell.
+        rows = [line for line, bare in zip(lines[rules[0] + 1:], plain[rules[0] + 1:])
+                if not PANE_MODE_RE.search(bare)]
+        if not "".join(_ANSI_RE.sub("", row) for row in rows).strip():
+            return None
     text = "".join(_ANSI_RE.sub("", _DIM_SPAN_RE.sub("", row)) for row in rows)
     return bool(text.replace("❯", "").replace("\xa0", "").strip())
 

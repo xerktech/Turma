@@ -20965,6 +20965,14 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
             box("\x1b[39m❯\xa0\x1b[2mTry\x1b[0m tail\x1b[2m x\x1b[0m")), True)
         self.assertIs(ha._composer_holds_text(box("❯ ") + ""), False)
         self.assertIs(ha._composer_holds_text(rule + "❯ \n\n\n" + rule), False)
+        # A short pane under a tall draft: the top rule and the draft's last
+        # rows, no bottom rule (captured on 2.1.306 at 140x10).
+        self.assertIs(ha._composer_holds_text(
+            "  ⎿  Set model to Sonnet 5.5 for this session only\n\n" + rule
+            + "❯\xa0QATALL line 44\n  QATALL line 45\n  QATALL last\n"), True)
+        # A lone rule over only the mode footer: its box is off the top.
+        self.assertIsNone(ha._composer_holds_text(
+            "  QATALL last\n" + rule + "  ⏵⏵ auto mode on (shift+tab to cycle)\n"))
         self.assertIsNone(ha._composer_holds_text("no composer\n"))
         self.assertIsNone(ha._composer_holds_text(None))
 
