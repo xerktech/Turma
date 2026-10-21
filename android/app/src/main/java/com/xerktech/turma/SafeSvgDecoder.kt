@@ -166,6 +166,9 @@ private class SizedSvgDecoder(
 internal object SvgRenderGuard : SVGExternalFileResolver() {
     private const val SENTINEL = "turma-image:"
     @VisibleForTesting internal var renderDeadlineMs = 5_000L
+    // Runs at every step with the steps taken so far, before the checks: lets a test
+    // cancel at a known step instead of racing the render on the wall clock.
+    @VisibleForTesting internal var onStep: ((Int) -> Unit)? = null
 
     // A step is one element or one pattern tile. A dense diagram takes a few thousand;
     // this is far past any SVG worth drawing, and reached in well under a second.
@@ -188,6 +191,7 @@ internal object SvgRenderGuard : SVGExternalFileResolver() {
 
         /** Throws once the render is cancelled, too slow, or too many steps long. */
         fun step() {
+            onStep?.invoke(steps)
             check(!Thread.currentThread().isInterrupted) { "SVG render cancelled" }
             check(System.nanoTime() - started < renderDeadlineMs * 1_000_000) { "refused SVG: render too slow" }
             check(++steps <= RENDER_MAX_STEPS) { "refused SVG: too many steps to draw" }

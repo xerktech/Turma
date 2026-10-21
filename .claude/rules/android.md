@@ -169,7 +169,8 @@ Mirrors the glasses pure-core/adapter-shell split:
   (stale fleet, dead MockWebServer): measured in `OrgControlMergeTest` / `BoardTriageTest` flakes.
 - **No wall-clock races in tests**: hold a response on a latch the test releases
   (`UsagePermissionsViewModelTest.routeByOrg`), never `setHeadersDelay`; bound a perf test on
-  thread CPU time (`ProseTest.cpuMs`), never `System.nanoTime` — both reddened under CPU load.
+  thread CPU time (`cpuMs`, `core/CpuTime.kt`), never `System.nanoTime` — both reddened under CPU load.
+  - Cancel at a known step through a test hook, never after a `delay` (`SvgRenderGuard.onStep`).
 - A second beat seeded after a VM action that `nudge()`s the fleet carries a fresher `lastSeen`
   (`fleetJson(lastSeen=)`): the nudge's poll can land the FIRST beat after it (`ChatModelSourceTest`).
 - Colour call sites are pinned in pixels/text-layout, light theme (`ColourCallSiteTest`); the
