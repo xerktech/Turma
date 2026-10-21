@@ -14161,7 +14161,8 @@ def parse_pane_mode(cap):
 #      blank-fenced subtitle paragraph (XERK-2162);
 #   4. NO mode footer below it — the footer marker rides the composer, which a
 #      dialog replaces, so its absence is what says "this is a live dialog"
-#      rather than transcript text that happens to look like one.
+#      rather than transcript text that happens to look like one. The Ctrl-C
+#      exit toast that briefly replaces the footer counts as one (XERK-2169).
 # The selection cursor is "❯" in Claude Code and "›" in Qwen Code (XERK-509
 # [Qwen C], G0 pane/03-tool-approval.txt: "› 1. Yes, allow once"). Both are
 # accepted — neither glyph occurs in ordinary conversation text, so the cursor
@@ -14173,6 +14174,28 @@ PANE_PROMPT_OPTION_RE = re.compile(r"^\s*([❯›]\s+)?(\d+)\.\s+(\S.*?)\s*$")
 # run says "not a blocking dialog" — a qwen approval dialog REPLACES the footer
 # with "Waiting for user confirmation…" (G0), so a real dialog shows none.
 QWEN_PANE_FOOTER_RE = re.compile(r"Ask permissions \(shift \+ tab to cycle\)")
+# Claude Code's exit toast, which REPLACES the mode footer for ~0.5-1s after a
+# Ctrl-C (or Ctrl-D) on an idle composer (2.1.306: "  Press Ctrl-C again to
+# exit"). It rides the composer like the footer it hides, so it vetoes a dialog
+# the same way — else a reply shaped question / options reads as a live dialog
+# while it is up (XERK-2169). Matched against EVERYTHING below the pane's last
+# rule (`_pane_exit_toast_up`), so a reply merely quoting it never counts, and a
+# live dialog, whose options sit below that rule, never matches.
+PANE_EXIT_TOAST_RE = re.compile(r"^\s*Press Ctrl-[CD] again to exit\s*$")
+
+
+def _pane_exit_toast_up(lines):
+    """Whether the lines below the pane's last rule are the exit toast, read
+    with its wraps joined: at 28 columns or less it wraps ("Press Ctrl-C again
+    to" / "exit"), which the per-line match misses (XERK-2169 QA)."""
+    tail = []
+    for line in reversed(lines):
+        if line.strip() and PANE_PROMPT_RULE_RE.match(line):
+            break
+        if line.strip():
+            tail.append(line.strip())
+    return bool(tail) and bool(
+        PANE_EXIT_TOAST_RE.match(" ".join(reversed(tail))))
 # A trailing right-edge SCROLLBAR column + its padding (XERK-509 [Qwen C]): the
 # block-element family (█ and eighths/shades, U+2588-258F / U+2591-2593), the
 # right-block glyphs (▐ ▕) and light/heavy vertical bars (│ ┃), any run of them
@@ -14264,8 +14287,8 @@ def _pane_under_edge(lines, idx):
     """Whether the question above line `idx` sits in Claude Code's bottom area:
     above it only blanks, the question itself and box rules up to the ▔ edge
     (XERK-2162). A subtitle is accepted only there — a reply in the
-    conversation shaped question / note / options is above the edge, and the
-    Ctrl-C toast hides the footer that would otherwise veto it."""
+    conversation shaped question / note / options is above the edge, and a
+    mode footer is not always drawn to veto it."""
     seen_q = False
     for k in range(idx - 1, -1, -1):
         line = lines[k]
@@ -14345,6 +14368,8 @@ def parse_pane_prompt(cap, face=False):
     # legitimate rule/detail line is made of.
     lines = [_PANE_SCROLLBAR_RE.sub("", l) for l in cap.splitlines()]
     widest = None                    # the pane's width, measured on first need
+    if _pane_exit_toast_up(lines):
+        return None                  # the exit toast (wraps joined): composer is live
     # A mode footer anywhere below means the composer is live -> no dialog.
     for i in range(len(lines) - 1, -1, -1):
         line = lines[i]
