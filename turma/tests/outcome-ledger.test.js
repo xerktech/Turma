@@ -907,8 +907,9 @@ test("XERK-1858: a pair's grade time, which the agent stamps, decides the eviden
 });
 
 // A fake pool honouring the rescan's SQL: a total (updated_at DESC, key DESC) order
-// and the tuple DELETE below the last loaded row.
-function orderedPool(table) {
+// and the tuple DELETE below the last loaded row, sparing rows within the grace of the
+// database clock `dbNow`.
+function orderedPool(table, dbNow = T0 + 30 * DAY) {
   const cmp = (a, b) => (Number(a.updated_at) - Number(b.updated_at)) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
   return {
     health: "ready",
@@ -923,9 +924,10 @@ function orderedPool(table) {
         }
         return [];
       }
-      if (/^DELETE .* WHERE \(updated_at, key\) < \(\$1::bigint, \$2::text\)$/.test(sql)) {
+      if (/^DELETE .* WHERE \(updated_at, key\) < \(\$1::bigint, \$2::text\) AND updated_at < \(extract\(epoch from clock_timestamp\(\)\) \* 1000\)::bigint - \$3::bigint$/.test(sql)) {
         const bound = { updated_at: params[0], key: params[1] };
-        for (const [k, v] of table) if (cmp(v, bound) < 0) table.delete(k);
+        const fresh = dbNow - Number(params[2]);
+        for (const [k, v] of table) if (cmp(v, bound) < 0 && Number(v.updated_at) < fresh) table.delete(k);
         return [];
       }
       if (/^DELETE/.test(sql)) { for (const k of params) table.delete(k); return []; }
@@ -934,16 +936,20 @@ function orderedPool(table) {
   };
 }
 
-async function rescanOver(stampOf, extra = 5) {
+function tableRow(i, at) {
+  const r = L.sanitizeRow({ site: `o${i % 8}.atlassian.net`, issue: "A-1", host: `h${i % 8}`,
+    sid: `s${i}`, cls: "bug", model: "opus", firstSeen: at, updatedAt: at });
+  return { key: r.key, updated_at: String(r.updatedAt), doc: JSON.stringify(r) };
+}
+
+async function rescanOver(stampOf, extra = 5, dbNow = undefined) {
   const table = new Map();
   for (let i = 0; i < L.MAX_ROWS + extra; i++) {
-    const at = stampOf(i);
-    const r = L.sanitizeRow({ site: `o${i % 8}.atlassian.net`, issue: "A-1", host: `h${i % 8}`,
-      sid: `s${i}`, cls: "bug", model: "opus", firstSeen: at, updatedAt: at });
-    table.set(r.key, { key: r.key, updated_at: String(r.updatedAt), doc: JSON.stringify(r) });
+    const row = tableRow(i, stampOf(i));
+    table.set(row.key, row);
   }
   L._internals.reset();
-  const store = new L.OutcomeLedgerPgStore(orderedPool(table));
+  const store = new L.OutcomeLedgerPgStore(orderedPool(table, dbNow));
   L._internals.setBackend(store);
   await store.rescan(T0 + 1000);
   await store._drain();
@@ -974,6 +980,19 @@ test("XERK-1858: the rescan's delete converges when every row shares one updated
   const { table, model } = await rescanOver(() => T0);
   assert.equal(table.size, L.MAX_ROWS);
   assert.deepEqual(new Set(table.keys()), model);
+});
+
+test("XERK-2137: the rescan's delete spares a fresh row a clock-behind replica stamped below the page edge", async () => {
+  // MAX_ROWS rows written in the last seconds; s0 is just as fresh but its replica's clock
+  // runs a minute behind, so it sorts below the page edge. s1 is genuinely old; s2 is just
+  // past the 10-minute grace.
+  const dbNow = T0 + L.MAX_ROWS + 1000;
+  const stamp = (i) => (i === 0 ? T0 - 60000 : i === 1 ? T0 - DAY : i === 2 ? dbNow - 11 * 60000 : T0 + i);
+  const { table } = await rescanOver(stamp, 3, dbNow);
+  assert.ok(table.has(tableRow(0, stamp(0)).key), "the skewed fresh row survives");
+  assert.ok(!table.has(tableRow(1, stamp(1)).key), "an old row past the page is still deleted");
+  assert.ok(!table.has(tableRow(2, stamp(2)).key), "a row past the grace is still deleted");
+  assert.equal(table.size, L.MAX_ROWS + 1);
 });
 
 test("XERK-1858: past MAX_ROWS an org drops orphaned shadows first, then a live row WITH its shadows", () => {

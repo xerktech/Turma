@@ -1090,6 +1090,10 @@ const T_ROW = "outcome_session";
 const PG_QUEUE_MAX = 5000;
 const PG_ROWS_PER_INSERT = 500;           // 3 params a row
 const RESCAN_RETRY_MS = 60000;
+// The rescan's delete spares a row stamped this recently by the DATABASE's clock: the
+// stamp is the writing replica's clock, so a replica running behind writes a fresh row
+// that sorts below the page edge (XERK-2137).
+const RESCAN_DELETE_GRACE_MS = 10 * 60000;
 
 class OutcomeLedgerPgStore {
   constructor(pool, cfg = {}) {
@@ -1182,12 +1186,15 @@ class OutcomeLedgerPgStore {
     // Hot rows the table lacks are re-queued below, after this delete. The page's
     // order is total (key breaks an updated_at tie — a sweep stamps every row it
     // changes with one `now`), so "below the last loaded row" is exact and a tie at
-    // the boundary still converges to MAX_ROWS.
+    // the boundary still converges to MAX_ROWS. A row stamped within the grace of the
+    // database's clock survives — a fresh write from a replica whose clock runs behind —
+    // so the table can sit over the cap until a later rescan.
     const last = got.length >= MAX_ROWS ? got[got.length - 1] : null;
     if (last && last.key != null && last.updated_at != null) {
       await this.pool.query(
-        `DELETE FROM ${this.table} WHERE (updated_at, key) < ($1::bigint, $2::text)`,
-        [String(last.updated_at), String(last.key)]);
+        `DELETE FROM ${this.table} WHERE (updated_at, key) < ($1::bigint, $2::text) ` +
+        `AND updated_at < (extract(epoch from clock_timestamp()) * 1000)::bigint - $3::bigint`,
+        [String(last.updated_at), String(last.key), String(RESCAN_DELETE_GRACE_MS)]);
     }
     const dropped = evict(now);
     for (const r of rows.values()) if (!held.has(r.key)) stale.push(r);
