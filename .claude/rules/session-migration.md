@@ -90,6 +90,14 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
   command: the per-beat scan PRIMES a resumed transcript's byte offset to EOF, so `gh pr create`
   events sit past it. `_resume_at_cwd` calls `_seed_prs` once at launch to scan the whole transcript,
   keyed by the PRESERVED transcript id. Idempotent.
+- **A moved session's record carries `migratedFrom` {host, sessionId, at[, fromArchive]} on the
+  wire** (XERK-2109): stamped by the hub's `importSession` / archive restore, kept on the agent's
+  record, sent by `_session_payload`, rebuilt by the hub's `coerceMigratedFrom` (whitelisted leaves).
+  - It is the ONLY proof a new (host, id) is the old conversation — the glasses move a stashed
+    draft by it. Android does not type it; typing it there needs no new coercion.
+  - An archive restore's `sessionId` is null: it names no live session, so nothing follows it.
+  - Tests: `test_migrated_from_rides_the_payload_and_is_none_without_one`, server.test.js
+    "XERK-2109: a session's migratedFrom ...".
 - Blob relay is agent-authed; `POST .../sessions/<id>/migrate {host}` validates same-org + online +
   repo-cloned + running/non-root/has-conversation, single-flight per session. State is in-memory; a
   hub restart mid-move aborts it, leaving the source intact. **The target must already have the repo

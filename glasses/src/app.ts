@@ -72,6 +72,10 @@ export interface AnsweredEntry {
 
 export const ANSWER_MASK_MS = 10 * 1000;
 
+// How long after a question lands on the open session its sheet's first tap is
+// swallowed (App.armQuestionTapGuard): long enough for a tap already under way.
+export const QUESTION_TAP_GUARD_MS = 1000;
+
 function sameOptions(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i]);
 }
@@ -164,8 +168,14 @@ export interface SessionScreenState {
   // The question the draft is a free-text answer to ("Dictate answer…"),
   // absent for an ordinary draft. Decides what a question arriving does to it.
   // Cleared by the first poll listing the session with no question, so an
-  // abandoned "Dictate answer…" can't tag a later ordinary draft.
+  // abandoned "Dictate answer…" can't tag a later ordinary draft. A session
+  // the wearer's answer mask hides the question of (answered elsewhere, the
+  // hub not yet caught up) is not "no question": the hub may re-ask.
   answerFor?: string;
+  // The draft was dictated as an answer whose question has since cleared
+  // (answered elsewhere, or withdrawn). Send now posts it as an ordinary
+  // prompt, so the box and the Send row say so (`draftSendsAsPrompt`).
+  staleAnswer?: boolean;
 }
 
 // Every transition into the session screen builds its SessionScreenState
@@ -271,7 +281,7 @@ export interface AppState {
   // Unsent dictated drafts of sessions the wearer left (keyed by `draftKey`),
   // put back when that session is entered again. Leaving is not a Clear.
   // At most MAX_DRAFTS, least recently stashed evicted first.
-  drafts: Record<string, { hostKey: string; sessionId: string; text: string }>;
+  drafts: Record<string, DraftEntry>;
 
   home: HomeScreenState;
   session: SessionScreenState | null;
@@ -320,6 +330,19 @@ export function createInitialState(now: number): AppState {
 
 export function findAgent(state: AppState, hostKey: string): AgentInfo | undefined {
   return state.agents.find((a) => a.key === hostKey);
+}
+
+// A left session's unsent draft (App.stashDraft). `text` is the ordinary part:
+// typed for the session, or an answer whose question is gone (`stale`, which
+// takeDraft carries back to `staleAnswer`). `answer` is a "Dictate answer…"
+// draft still tagged with its question: kept apart, because it goes back into
+// the box only while that question is pending, and the ordinary part never does.
+export interface DraftEntry {
+  hostKey: string;
+  sessionId: string;
+  text: string;
+  stale?: true;
+  answer?: { text: string; for: string };
 }
 
 // How many left sessions' drafts the stash keeps (see App.stashDraft).
@@ -381,6 +404,9 @@ export class App {
   // loop self-terminates once it elapses. See pause()/schedulePoll().
   private graceUntil = 0;
   private answerSeq = 0;
+  // See armQuestionTapGuard: the open session's just-arrived question, whose
+  // first sheet tap is swallowed until `until`.
+  private questionTapGuard: { hostKey: string; sessionId: string; until: number } | null = null;
 
   constructor(opts: AppOptions) {
     this.client = opts.client;
@@ -567,24 +593,82 @@ export class App {
   // until the question clears (the poll calls this again). A session the fleet
   // doesn't list right now (an empty poll after a hub restart) is unknown, not
   // cleared: its question may still be pending, so the draft stays stashed.
+  //
+  // A stashed answer (`DraftEntry.answer`) is the exception: it goes back while
+  // ITS question is pending, so Send still answers with it, and is dropped for
+  // any other question. While the wearer's own answer mask hides the question
+  // it waits (a re-ask after the mask still finds it); once the question is
+  // gone it comes back with the ordinary part, marked `staleAnswer`.
   private takeDraft(s: SessionScreenState): SessionScreenState {
     const key = this.draftKeyFor(s.hostKey, s.sessionId);
     if (key === undefined || s.draft) return s;
     const live = findSession(this.state, s.hostKey, s.sessionId);
-    if (!live || live.session?.question) return s;
+    if (!live) return s;
     const { [key]: entry, ...drafts } = this.state.drafts;
+    const { answer, ...rest } = entry!;
+    const question = live.session?.question;
+    if (question) {
+      if (!answer) return s;
+      // The ordinary part stays stashed behind the question either way.
+      if (rest.text) drafts[key] = rest;
+      this.state = { ...this.state, drafts };
+      if (answer.for !== question) return s;
+      return { ...s, draft: answer.text, answerFor: answer.for, staleAnswer: undefined, viewOffset: 0 };
+    }
+    if (answer && this.answerMasked(s.hostKey, s.sessionId)) return s;
     this.state = { ...this.state, drafts };
-    return { ...s, draft: entry!.text };
+    const text = [rest.text, answer?.text ?? ""].filter(Boolean).join(" ");
+    const staleAnswer = rest.stale || answer ? true : undefined;
+    return { ...s, draft: text, answerFor: undefined, staleAnswer };
+  }
+
+  // Whether the wearer's own answer mask (maskAnswered) is what hides this
+  // session's question right now: answered here or on the phone, with the hub
+  // still to catch up. Not proof the question is gone — the hub may re-ask.
+  private answerMasked(hostKey: string, sessionId: string): boolean {
+    return this.state.answered[sessionId]?.hostKey === hostKey;
   }
 
   // The stash entry for a session: its own host + id, only. A draft never
-  // follows an id to another host: ids are unique per host alone, and the
-  // fleet carries no migration marker, so "A stopped listing s1" can't tell a
-  // move from an unrelated B:s1. An orphaned draft after a real move is the
-  // accepted cost; text typed for one agent landing in another's box is not.
+  // follows a bare id to another host: ids are unique per host alone, so "A
+  // stopped listing s1" can't tell a move from an unrelated B:s1. Only the
+  // moved record's `migratedFrom` marker moves a draft (followMigratedDrafts);
+  // text typed for one agent landing in another's box is never the cost.
   private draftKeyFor(hostKey: string, sessionId: string): string | undefined {
     const own = draftKey(hostKey, sessionId);
     return own in this.state.drafts ? own : undefined;
+  }
+
+  // Moves a stashed draft to where its session migrated (XERK-2109): the moved
+  // session's record carries `migratedFrom` {host, sessionId} on the wire, the
+  // one proof that a new (host, id) IS the old conversation. Without it a draft
+  // never follows an id across hosts (draftKeyFor). An archive restore has no
+  // source id (sessionId null), so nothing moves for it. A draft already at the
+  // destination keeps its place; the moved one joins after it.
+  private followMigratedDrafts(): void {
+    let drafts: Record<string, DraftEntry> | null = null;
+    for (const a of this.state.agents) {
+      for (const sess of a.sessions ?? []) {
+        const from = sess.migratedFrom;
+        if (!from || typeof from.host !== "string" || typeof from.sessionId !== "string") continue;
+        const oldKey = draftKey(from.host, from.sessionId);
+        const newKey = draftKey(a.key, sess.id);
+        const cur: Record<string, DraftEntry> = drafts ?? this.state.drafts;
+        const moved = cur[oldKey];
+        if (!moved || oldKey === newKey) continue;
+        const { [oldKey]: _gone, ...rest } = cur;
+        const there = rest[newKey];
+        const entry: DraftEntry = { hostKey: a.key, sessionId: sess.id, text: moved.text };
+        if (there) entry.text = [there.text, moved.text].filter(Boolean).join(" ");
+        const answer = there?.answer ?? moved.answer;
+        if (answer) entry.answer = answer;
+        if (there?.stale || moved.stale) entry.stale = true;
+        delete rest[newKey];
+        rest[newKey] = entry;
+        drafts = rest;
+      }
+    }
+    if (drafts) this.state = { ...this.state, drafts };
   }
 
   // Keeps the on-screen session's unsent draft for its next entry. A draft
@@ -597,11 +681,22 @@ export class App {
     const s = this.state.session;
     if (!s?.draft) return;
     const key = draftKey(s.hostKey, s.sessionId);
-    const held = this.state.drafts[key]?.text;
-    const text = held ? `${held} ${s.draft}` : s.draft;
+    const held = this.state.drafts[key];
+    const join = (a: string | undefined, b: string) => (a ? `${a} ${b}` : b);
+    const entry: DraftEntry = { hostKey: s.hostKey, sessionId: s.sessionId, text: held?.text ?? "" };
+    if (s.answerFor !== undefined) {
+      // A held answer for another question answers nothing now: replaced.
+      const prior = held?.answer?.for === s.answerFor ? held.answer.text : undefined;
+      entry.answer = { text: join(prior, s.draft), for: s.answerFor };
+      if (held?.stale) entry.stale = true;
+    } else {
+      entry.text = join(held?.text, s.draft);
+      if (held?.answer) entry.answer = held.answer;
+      if (held?.stale || s.staleAnswer) entry.stale = true;
+    }
     // Re-inserted last: key order is stash order.
     const { [key]: _old, ...drafts } = this.state.drafts;
-    drafts[key] = { hostKey: s.hostKey, sessionId: s.sessionId, text };
+    drafts[key] = entry;
     const keys = Object.keys(drafts);
     for (let i = 0, n = keys.length; n > MAX_DRAFTS && i < keys.length; i++) {
       if (keys[i] === keep || keys[i] === key) continue;
@@ -610,7 +705,7 @@ export class App {
     }
     // Moved, not copied: a second stash of the same left session (home, then
     // entering another) must not join the draft to itself.
-    this.state = { ...this.state, session: { ...s, draft: "" }, drafts };
+    this.state = { ...this.state, session: { ...s, draft: "", answerFor: undefined, staleAnswer: undefined }, drafts };
   }
 
   // A question just arrived on (or replaced the one on) the open session.
@@ -628,7 +723,7 @@ export class App {
     const s = this.state.session;
     if (!s?.draft || s.answerFor === question) return;
     if (s.answerFor !== undefined) {
-      this.state = { ...this.state, session: { ...s, draft: "", answerFor: undefined, viewOffset: 0 } };
+      this.state = { ...this.state, session: { ...s, draft: "", answerFor: undefined, staleAnswer: undefined, viewOffset: 0 } };
     } else {
       this.stashDraft(draftKey(s.hostKey, s.sessionId));
     }
@@ -636,6 +731,15 @@ export class App {
     if (this.state.screen === "actions" && a?.hostKey === s.hostKey && a.sessionId === s.sessionId) {
       this.state = { ...this.state, screen: "session" };
     }
+  }
+
+  // A question that lands on the open session takes over the screen under the
+  // wearer's finger: a tap already on its way (meant for the draft's menu, the
+  // menu's Send/Dictate more, or the transcript) would answer with the option
+  // just highlighted, unseen. So the first sheet tap within
+  // QUESTION_TAP_GUARD_MS of the arrival is swallowed (onSheetBottom).
+  private armQuestionTapGuard(s: SessionScreenState): void {
+    this.questionTapGuard = { hostKey: s.hostKey, sessionId: s.sessionId, until: this.now() + QUESTION_TAP_GUARD_MS };
   }
 
   private schedulePoll(delayMs: number, prefetched?: Promise<AgentsResponse>): void {
@@ -858,6 +962,7 @@ export class App {
         flash: wasErroring ? null : this.state.flash,
         flashUntil: wasErroring ? 0 : this.state.flashUntil,
       };
+      this.followMigratedDrafts();
       // The row list a fresh home.cursor indexes into just changed (hosts
       // going offline, sessions converging/disappearing) — keep the cursor
       // in range and off non-selectable rows rather than leaving it stranded
@@ -886,6 +991,7 @@ export class App {
           if (sess.mic === "recording" || sess.mic === "finalising") this.dictation.cancel();
           const mic = sess.mic === "recording" || sess.mic === "finalising" ? "idle" : sess.mic;
           this.state = { ...this.state, session: { ...sess, mic, selected: 0 } };
+          this.armQuestionTapGuard(sess);
           this.holdDraftFrom(nowQuestion);
         } else if (nowQuestion && prevQuestion && nowQuestion !== prevQuestion) {
           // A *different* question replaced the one already pending on this
@@ -895,13 +1001,25 @@ export class App {
           // digit, but the highlight itself would still point at the wrong row
           // until the user scrolls. Reset it, edge-triggered like the arrival.
           this.state = { ...this.state, session: { ...sess, selected: 0 } };
+          this.armQuestionTapGuard(sess);
           this.holdDraftFrom(nowQuestion);
-        } else if (live && !nowQuestion && this.state.session.answerFor !== undefined) {
-          // Listed with no question: it was answered (here, the phone, the
-          // web) or withdrawn, so what's in the box answers nothing now — an
-          // ordinary draft from here on, and so is the next one dictated. A
-          // poll not listing the session is no proof, so `live` gates it.
-          this.state = { ...this.state, session: { ...this.state.session, answerFor: undefined } };
+        } else if (
+          live &&
+          !nowQuestion &&
+          this.state.session.answerFor !== undefined &&
+          !this.answerMasked(sess.hostKey, sess.sessionId)
+        ) {
+          // Listed with no question: it was answered (the phone, the web) or
+          // withdrawn, so what's in the box answers nothing now — an ordinary
+          // draft from here on, marked so the wearer sees that before Send,
+          // and so is the next one dictated. A poll not listing the session is
+          // no proof, so `live` gates it; nor is the wearer's own answer mask,
+          // which hides a question the hub may still ask again.
+          const cur = this.state.session;
+          this.state = {
+            ...this.state,
+            session: { ...cur, answerFor: undefined, staleAnswer: cur.draft ? true : cur.staleAnswer },
+          };
         }
       }
       // A draft held back while a question was pending comes back once it clears.
@@ -1193,6 +1311,10 @@ export class App {
       });
       return;
     }
+    // The guard spans only the first gesture after the arrival: a scroll is
+    // the wearer reading the sheet, so their next tap is meant.
+    const guard = this.questionTapGuard;
+    this.questionTapGuard = null;
     if (e.type === "scrollUp" || e.type === "scrollDown") {
       const dir = e.type === "scrollDown" ? 1 : -1;
       const selected = clamp(s.selected + dir, 0, options.length);
@@ -1200,6 +1322,7 @@ export class App {
       return;
     }
     if (e.type === "tap") {
+      if (guard && guard.hostKey === s.hostKey && guard.sessionId === s.sessionId && this.now() < guard.until) return;
       if (s.selected < options.length) {
         this.markPending(s.sessionId, live);
         void this.answerQuestion(s.hostKey, s.sessionId, { optionIndex: s.selected })

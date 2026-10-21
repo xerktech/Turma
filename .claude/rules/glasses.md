@@ -19,8 +19,10 @@ paths:
   socket; since `App.poll()` re-arms only in its `finally`, a hub that sends headers then stalls
   freezes the display on stale content forever. A bare `res.json()` on a new endpoint reopens it.
 - **The hub's refusal text is clamped in `refusalText`, at the point it becomes ours** (300 chars).
-  It reaches `render.ts`'s `wrapText`, which is quadratic in an unbroken word — 200k chars measured
-  at 4s — so an unclamped refusal stalls the render loop rather than the socket.
+  It reaches `render.ts`'s `wrapText`; the clamp keeps a hostile refusal's wrap cost bounded.
+- **`splitLongWord` stays near-linear in an unbroken word** (XERK-2109): it gallops from each
+  chunk's start. Measuring or slicing the whole REST per chunk is quadratic (200k chars took ~10s).
+  Tests: `text-wrap.test.ts` "exactly as the old binary search did" / "200k-char unbroken word".
 - The glasses client has **no board creds and no picker TUI**: pending `AskUserQuestion`s reach it
   only through the agent's `hooks/ask.py` req/ans bridge, and it renders the backward-compat flat
   `questionOptions` list rather than the rich cards the web chat uses.
@@ -90,11 +92,21 @@ paths:
     re-arrives, and is DROPPED for any other — held, it would come back as an ordinary prompt.
   - `answerFor` clears on the first poll LISTING the session with no question (an empty poll is no
     proof), so an abandoned "Dictate answer…" never tags a later ordinary draft.
-    The local answer mask counts as "no question": a re-ask after it expires holds the box answer back.
+  - The local answer mask is NOT "no question" for `answerFor`: the hub may re-ask after it expires,
+    and the box answer must still be that answer, not a held-back prompt.
+  - An answer whose question cleared stays in the box as `staleAnswer`: the box status says
+    `STALE_ANSWER_STATUS` and the menu row reads "Send as prompt" (`draftSendsAsPrompt`), since
+    Send then posts it as an ordinary prompt. Never let it read as a plain "Send".
+  - A stash keeps an answer apart (`DraftEntry.answer` + its question): it comes back only while
+    THAT question is pending, is dropped for another, waits out the mask, and once the question is
+    gone returns with the ordinary part, marked `staleAnswer`.
+  - The first sheet tap within `QUESTION_TAP_GUARD_MS` (1s) of a question arriving on the open
+    session is swallowed (`armQuestionTapGuard`): a tap already under way (meant for the box, its
+    menu's Send, the transcript) would answer with the option just highlighted. A scroll disarms it.
   - Tests: `app.test.ts` "kept drafts" cases naming an arriving/replacing/re-listed question.
-  - Keyed by host + id, and NEVER followed to another host: ids are unique per host only, and the
-    fleet carries no migration marker (`migratedFrom` stays agent-side), so a draft after a real
-    move is orphaned rather than risk landing in an unrelated session's box.
+  - Keyed by host + id, and never followed by a bare id to another host: ids are unique per host
+    only. A draft moves ONLY by the moved record's `migratedFrom` {host, sessionId}
+    (`followMigratedDrafts`, XERK-2109, `session-migration.md`); a null source id moves nothing.
   - A stash MOVES the draft out of `state.session` (home keeps a stale one) and joins any held one,
     so a second stash of the same left session neither replaces nor doubles it.
   - `takeDraft`/`stashDraft` rewrite `state.drafts`: call them BEFORE spreading `this.state`, or
