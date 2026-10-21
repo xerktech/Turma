@@ -36011,6 +36011,15 @@ class TestCollectAzure(unittest.TestCase):
         self.assertIsNone(by["3"]["epicKey"])
         self.assertEqual(by["4"]["epicKey"], "900")
 
+    def test_an_unread_project_takes_the_org_union_xerk1888(self):
+        with mock.patch.object(ha, "_AZDO_PORTFOLIO_CACHE", {
+                ("s", "X"): (frozenset({"initiative"}), 9e12),
+                ("s", "B"): (frozenset(), 9e12)}):
+            self.assertTrue(ha._azure_is_epic_type("Initiative", "s", "B"))   # read failed
+            self.assertTrue(ha._azure_is_epic_type("Initiative", "s", "Z"))   # never read
+            self.assertTrue(ha._azure_is_epic_type("Epic", "s", "Y"))
+            self.assertFalse(ha._azure_is_epic_type("Task", "s", "B"))
+
     def test_portfolio_read_failure_keeps_the_english_floor_xerk1888(self):
         items = [_azure_wi(1, "Active", wtype="Initiative"),
                  _azure_wi(2, "Active", wtype="Epic")]

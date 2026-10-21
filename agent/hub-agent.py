@@ -21485,8 +21485,12 @@ def _azure_note_portfolio(site_key, projects):
 def _azure_portfolio_names(site_key, project=None):
     """The portfolio type names for one project (its process may differ from a
     sibling's, so a name that is a level THERE is not one HERE). With no project
-    to judge by, every project of the org is unioned — erring toward organizer,
-    the safe side of the auto-merge gate."""
+    to judge by, or one whose levels have not been read, every project of the
+    org is unioned — erring toward organizer, the safe side of the auto-merge
+    gate."""
+    if project is not None and not (_AZDO_PORTFOLIO_CACHE.get((site_key, project))
+                                    or (frozenset(),))[0]:
+        project = None      # its levels are not read (yet): the union, not the floor
     out = set(_AZDO_EPIC_TYPES)
     for (sk, pr), (names, _exp) in list(_AZDO_PORTFOLIO_CACHE.items()):
         if sk == site_key and (project is None or pr == project):
