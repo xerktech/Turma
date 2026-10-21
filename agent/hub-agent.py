@@ -1281,6 +1281,13 @@ SPAWN_ATTACH_DEADLINE_SEC = _env_int("TURMA_SPAWN_ATTACH_DEADLINE_SEC", 40)
 # they outlive the session by a good margin; only a session DELETE drops them at
 # once. Swept on the slow usage cadence.
 UPLOAD_RETENTION_SEC = _env_int("TURMA_UPLOAD_RETENTION_SEC", 30 * 86400)
+# How long an older worktree copy a migration moved aside
+# (`<worktree>.pre-migration-<ts>`) stays on disk before the usage worker reaps
+# it (XERK-2138). It was kept because it might hold work the move lacked, so the
+# margin is generous; 0 keeps them forever.
+MIGRATION_ASIDE_RETENTION_SEC = _env_int("TURMA_MIGRATION_ASIDE_RETENTION_SEC",
+                                         30 * 86400, minimum=0)
+MIGRATION_ASIDE_RE = re.compile(r".+\.pre-migration-([0-9]{1,12})")
 # Filename charset, mirrored from the hub's safeUploadName. The hub sanitizes
 # first so the operator's chip shows the landing name; this repeats it because a
 # name arriving over the wire must never be able to escape UPLOADS_DIR.
@@ -1484,6 +1491,25 @@ def _is_pane_id(s):
     """True for a tmux pane id (`%<digits>`)."""
     return (isinstance(s, str) and s[:1] == "%" and s[1:].isascii()
             and s[1:].isdigit())
+
+
+def _rmtree_writable(func, path, _exc):
+    """shutil.rmtree onerror: a read-only dir (a Go module cache) or a Windows
+    read-only file refuses removal, so make it and its parent writable and retry
+    once; a second failure raises as before."""
+    for p in (os.path.dirname(path), path):
+        try:
+            st = os.lstat(p)
+            if not stat.S_ISLNK(st.st_mode):
+                os.chmod(p, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
+        except OSError:
+            pass
+    if func in (os.open, os.scandir, os.listdir):
+        # Opening the dir failed (mode 000): its contents are still to remove,
+        # and os.open has no flags here to retry with.
+        shutil.rmtree(path, onerror=_rmtree_writable)
+    else:
+        func(path)
 
 
 def run_out(cmd, cwd=None, timeout=15):
@@ -32092,26 +32118,38 @@ class SessionManager:
         (`!! dist/prod.key`, where dist/ itself is not ignored).
         `matching`, never `traditional`: that one reports an untracked dir holding
         only ignored files (`pkg/` for `pkg/__pycache__/`) as itself ignored. A
-        matched dir is one entry, never walked — so what sits INSIDE an ignored
-        regenerable dir (a `dist/.env.production` under an ignored `dist/`) is
-        not seen and goes with it. `-unormal` overrides a status.showUntrackedFiles
-        =no config, which makes `--ignored` fail. Git failing reads True, which
-        only keeps a copy aside."""
+        matched dir is one entry, never walked (`-uall` does not change that),
+        so when one was let through, `ls-files` walks the ignored files for a
+        `.env*`/`*.env` file or dir at any depth (a `dist/.env.production` under
+        an ignored `dist/`, XERK-2138). `-unormal` overrides a status.showUntrackedFiles=no config,
+        which makes `--ignored` fail. Git failing reads True, which only keeps a
+        copy aside."""
         rc, out = run_out(["git", "-C", cwd, "status", "--porcelain", "--ignored=matching",
                            "-unormal", "-z"], timeout=timeout)
         if rc != 0:
             return True
+        regen_dirs = False
         for e in out.split("\0"):
             if not e.startswith("!! "):
                 continue
             parts = e[3:].rstrip("/").split("/")
             if e.endswith("/") and parts[-1] in self.MIGRATION_REGENERABLE_DIRS:
+                regen_dirs = True
                 continue
             if not e.endswith("/") and len(parts) > 1 and parts[-2] == "__pycache__" \
                     and parts[-1].endswith((".pyc", ".pyo")):
                 continue
             return True
-        return False
+        if not regen_dirs:
+            return False
+        # Matched here, not by a `:(glob)` pathspec, which GIT_LITERAL_PATHSPECS
+        # in the environment would silently disable.
+        rc, out = run_out(["git", "-C", cwd, "ls-files", "-z", "--others", "--ignored",
+                           "--exclude-standard"], timeout=timeout)
+        if rc != 0:
+            return True
+        return any(part.startswith(".env") or part.endswith(".env")
+                   for e in out.split("\0") for part in e.casefold().split("/"))
 
     # A bundle is the largest thing an agent ever sends, so it is the body most
     # likely to meet the hub's in-flight budget (XERK-258) and be told 503 "busy,
@@ -32649,6 +32687,45 @@ class SessionManager:
                 log(f"uploads: swept {path} (no such session, past retention)")
             except Exception as e:
                 log(f"uploads: sweep of {path} failed: {e}")
+
+    def _sweep_migration_asides(self):
+        """Remove the `<worktree>.pre-migration-<ts>` copies a move back kept
+        aside (`_clear_stale_migration_worktree`) once their <ts> — when they
+        were moved aside — is past MIGRATION_ASIDE_RETENTION_SEC. Nothing else
+        ever removes them. A symlink or a non-directory is left alone; the
+        repo's stale worktree entry is pruned after."""
+        if MIGRATION_ASIDE_RETENTION_SEC <= 0:
+            return
+        try:
+            repos = os.listdir(WORKTREES_ROOT)
+        except OSError:
+            return
+        now = time.time()
+        for repo in repos:
+            rd = os.path.join(WORKTREES_ROOT, repo)
+            if os.path.islink(rd):
+                continue
+            try:
+                names = os.listdir(rd)
+            except OSError:
+                continue
+            removed = False
+            for name in names:
+                m = MIGRATION_ASIDE_RE.fullmatch(name)
+                if not m or now - int(m.group(1)) < MIGRATION_ASIDE_RETENTION_SEC:
+                    continue
+                path = os.path.join(rd, name)
+                try:
+                    if not stat.S_ISDIR(os.lstat(path).st_mode):
+                        continue
+                    shutil.rmtree(path, onerror=_rmtree_writable)
+                    removed = True
+                    log(f"migration: removed {path}, kept aside past retention")
+                except Exception as e:
+                    log(f"migration: removing {path} failed: {e}")
+            repo_path = os.path.join(REPOS_ROOT, repo)
+            if removed and os.path.isdir(repo_path):
+                run(["git", "-C", repo_path, "worktree", "prune"])
 
     def _sweep_claude_sockets(self):
         """Unlink Claude Code inbox sockets whose owning process is gone
@@ -43361,6 +43438,11 @@ class SessionManager:
             self._sweep_claude_sockets()
         except Exception as e:
             log(f"cc-socks sweep failed: {e}")
+        # Older worktree copies a migration moved aside, past retention (XERK-2138).
+        try:
+            self._sweep_migration_asides()
+        except Exception as e:
+            log(f"migration aside sweep failed: {e}")
         return out
 
     def _apply_usage_scan(self, result):

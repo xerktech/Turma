@@ -12077,7 +12077,12 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
                            ("cfg/.env.local", True), ("target", True),
                            # Only the entry ITSELF being an ignored regenerable dir
                            # counts, never an ancestor's name (XERK-1858 QA D2).
-                           ("dist/prod.key", True), ("src/target/creds.json", True)):
+                           ("dist/prod.key", True), ("src/target/creds.json", True),
+                           # A .env inside an ignored regenerable dir is one
+                           # collapsed `!! app/dist/` entry to status (XERK-2138).
+                           ("app/dist/.env.production", True),
+                           ("app/dist/sub/.env", True), ("app/dist/.ENV.local", True),
+                           ("app/dist/.env/secret", True), ("app/dist/prod.env", True)):
             d = tempfile.mkdtemp(dir=self.tmp)
             self.git("init", "-q", d)
             self.write(d, ".gitignore", rules)
@@ -12093,6 +12098,50 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         self.assertFalse(sm._holds_unregenerable_ignored(d, 15))
         # Git failing (not a repo): keep the copy.
         self.assertTrue(sm._holds_unregenerable_ignored(tempfile.mkdtemp(dir=self.tmp), 15))
+
+    def test_asides_past_retention_are_removed(self):
+        # XERK-2138: a kept-aside copy is removed once its aside time is past
+        # MIGRATION_ASIDE_RETENTION_SEC, and its worktree entry pruned.
+        sm = self.make_manager()
+        root = os.path.join(ha.WORKTREES_ROOT, "Turma")
+        now = int(time.time())
+        old = os.path.join(root, f"wt1.pre-migration-{now - 31 * 86400}")
+        fresh = os.path.join(root, f"wt2.pre-migration-{now - 86400}")
+        plain = os.path.join(root, f"wt3.pre-migration-{now - 40 * 86400}")
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "--detach", old, "origin/main")
+        self.git("-C", self.dst_repo, "worktree", "add", "-q", "--detach", fresh, "origin/main")
+        os.makedirs(plain)
+        target = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(target)
+        link = os.path.join(root, f"wt4.pre-migration-{now - 40 * 86400}")
+        os.symlink(target, link)
+        live = os.path.join(root, "wt5")
+        os.makedirs(live)
+        sm._sweep_migration_asides()
+        self.assertFalse(os.path.lexists(old))
+        self.assertFalse(os.path.lexists(plain))
+        self.assertTrue(os.path.isdir(fresh))
+        self.assertTrue(os.path.islink(link) and os.path.isdir(target))
+        self.assertTrue(os.path.isdir(live))
+        listed = self.git("-C", self.dst_repo, "worktree", "list", "--porcelain")
+        self.assertNotIn(old, listed)
+        self.assertIn(fresh, listed)
+        # A read-only dir inside (a Go module cache) is still removed.
+        ro = os.path.join(root, f"wt6.pre-migration-{now - 40 * 86400}")
+        self.write(ro, "gomod/pkg/m.go", "x\n")
+        os.chmod(os.path.join(ro, "gomod", "pkg"), 0o555)
+        os.chmod(os.path.join(ro, "gomod"), 0o555)
+        # A symlinked repo dir is not walked.
+        other = os.path.join(self.tmp, "otherdisk")
+        stale = os.path.join(other, f"x.pre-migration-{now - 40 * 86400}")
+        os.makedirs(stale)
+        os.symlink(other, os.path.join(ha.WORKTREES_ROOT, "Linked"))
+        sm._sweep_migration_asides()
+        self.assertFalse(os.path.lexists(ro))
+        self.assertTrue(os.path.isdir(stale))
+        with mock.patch.object(ha, "MIGRATION_ASIDE_RETENTION_SEC", 0):
+            sm._sweep_migration_asides()
+        self.assertTrue(os.path.isdir(fresh))
 
     def test_only_compiled_python_in_pycache_is_regenerable(self):
         # XERK-1858 QA: any file directly in __pycache__/ counted, so an
