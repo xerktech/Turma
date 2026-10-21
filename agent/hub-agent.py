@@ -18665,7 +18665,7 @@ def _trust_dialog_up(cap):
     if not _TRUST_DIALOG_RE.search(text):
         return False
     if (PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
-            or PANE_SHELL_FOOTER_RE.search(text)):
+            or any(PANE_SHELL_FOOTER_RE.match(line) for line in _pane_footer_lines(text))):
         return False           # the composer footer is live: no modal is up
     if _pane_composer_tail_up(_pane_lines(text)):
         return False           # the exit toast / a cut footer hides it (XERK-2171)
@@ -18701,12 +18701,51 @@ _DIALOG_HINT_LINES = 6
 # /permissions, the permission dialog), "Esc to clear" (/config's filter),
 # "Esc to close" (/hooks, /tasks), "ctrl+o to toggle" (the Ctrl-O detailed
 # transcript view) and "enter to return" (the ← agents panel, whose own box
-# would take a typed message as a NEW session's task). None is ever a whole
-# item of a composer footer: those carry the mode marker, "? for shortcuts",
-# "← for agents", "esc to interrupt" or "! for shell mode" (XERK-2148).
+# would take a typed message as a NEW session's task), and the background
+# shell's detail view ("← to go back · Esc/Enter/Space to close · x to stop",
+# where a relayed "x" stops the shell). None is ever a whole item of a
+# composer footer: those carry the mode marker, "? for shortcuts", "← for
+# agents", "esc to interrupt" or "! for shell mode" (XERK-2148).
 _DIALOG_HINT_ITEMS = frozenset((
     "esc to cancel", "esc to clear", "esc to close", "ctrl+o to toggle",
-    "enter to return"))
+    "enter to return", "esc/enter/space to close", "x to stop"))
+# The top edge Claude Code draws over a full-screen overlay (/model, /skills,
+# /tasks, /config …): a row of "▔", the effort hint maybe inset ("▔▔▔ ◐ medium
+# · /effort ▔"). A composer is never drawn under one.
+_OVERLAY_EDGE_RE = re.compile(r"^\s*▔{3,}(?:.*▔)?\s*$")
+
+
+def _overlay_header_up(lines):
+    """Whether the pane's bottom is an overlay whose key hints sit in its
+    HEADER rather than a footer — a long /skills list scrolls its footer off a
+    40-row pane but keeps "9 skills · enter/space to cycle, / to search, t to
+    sort, Esc to close" under its title (XERK-2148). Read below the last "▔"
+    edge only, and only with no composer rule or composer footer there: a
+    hint item (`_DIALOG_HINT_ITEMS`, here also split on ",") must be in it."""
+    edge = max((i for i, line in enumerate(lines) if _OVERLAY_EDGE_RE.match(line)),
+               default=None)
+    if edge is None:
+        return False
+    body = [line for line in lines[edge + 1:] if line.strip()]
+    text = "\n".join(body)
+    if (any(_COMPOSER_RULE_RE.match(line) for line in body)
+            or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
+            or PANE_SHELL_FOOTER_RE.search(text)):
+        return False
+    return any(" ".join(item.split()).lower() in _DIALOG_HINT_ITEMS
+               for line in body for item in re.split(r"[·,]", line))
+
+
+def _pane_footer_lines(lines):
+    """The pane's last non-blank lines below its last rule (at most
+    `_DIALOG_HINT_LINES`, stripped): where a footer sits. `lines` is a capture
+    or its ANSI-free lines."""
+    if isinstance(lines, str):
+        lines = _ANSI_RE.sub("", lines).splitlines()
+    lines = [_PANE_SCROLLBAR_RE.sub("", line).strip() for line in lines]
+    last_rule = max((i for i, line in enumerate(lines)
+                     if line and PANE_PROMPT_RULE_RE.match(line)), default=-1)
+    return [line for line in lines[last_rule + 1:] if line][-_DIALOG_HINT_LINES:]
 
 
 def _hint_dialog_up(cap):
@@ -18745,9 +18784,7 @@ def _hint_dialog_up(cap):
     # one, while the composer is boxed in rules — so a footer-replacing toast
     # ("Press Ctrl-C again to exit", which hides the mode marker) cannot reach
     # back past the composer to a reply line that quotes the footer.
-    last_rule = max((i for i, line in enumerate(lines)
-                     if line and PANE_PROMPT_RULE_RE.match(line)), default=-1)
-    tail = [line for line in lines[last_rule + 1:] if line][-_DIALOG_HINT_LINES:]
+    tail = _pane_footer_lines(lines)
     joined = " ".join(tail)
     if (not tail or PANE_MODE_RE.search(joined) or QWEN_PANE_FOOTER_RE.search(joined)
             or any(PANE_SHELL_FOOTER_RE.match(line) for line in tail)):
@@ -18762,7 +18799,8 @@ def _hint_dialog_up(cap):
         if prev is not None:
             items.append(prev + " " + parts[0])
         prev = parts[-1]
-    return any(" ".join(item.split()).lower() in _DIALOG_HINT_ITEMS for item in items)
+    return (any(" ".join(item.split()).lower() in _DIALOG_HINT_ITEMS for item in items)
+            or _overlay_header_up(lines))
 
 
 def _pane_blocking_dialog(cap):
@@ -24934,7 +24972,7 @@ def parse_model_picker(text):
     pane truncates a label ("Sonne…" at 24 columns); it is kept as drawn and
     `_picker_index_for` judges it."""
     rows, cur = [], None
-    for marks, label in _model_picker_rows(text):
+    for marks, _num, label in _model_picker_rows(text):
         rows.append(label)
         if "❯" in marks:
             cur = len(rows) - 1
@@ -24957,8 +24995,8 @@ def _model_picker_region(text):
 
 
 def _model_picker_rows(text):
-    """Each drawn picker row as (marks, label): its ❯/↑/↓ glyphs, and its
-    label with the description column and the ✔ dropped."""
+    """Each drawn picker row as (marks, number, label): its ❯/↑/↓ glyphs, its
+    row number, and its label with the description column and the ✔ dropped."""
     out = []
     for line in _model_picker_region(text) or ():
         m = _MODEL_PICKER_ROW_RE.match(line)
@@ -24966,20 +25004,21 @@ def _model_picker_rows(text):
             continue
         label = re.split(r"\s{2,}", m.group(3))[0].replace("✔", "").strip()
         if label:
-            out.append((m.group(1), label))
+            out.append((m.group(1), int(m.group(2)), label))
     return out
 
 
 def _model_picker_scroll(text):
     """(more_above, more_below): whether a scrolled picker has rows it does not
-    draw above its first drawn row ("↑") or below its last ("↓", "… +N
-    models", or a narrow pane's "↓" ending the last drawn line, which a
+    draw above its first drawn row ("↑", or a first row numbered past 1: a
+    pane too short for more than one row draws no "↑") or below its last
+    ("↓", "… +N models", or a narrow pane's "↓" ending the last drawn line, which a
     wrapped description pushed the rest past). set_model scrolls to reach a
     row it can't see (XERK-2148)."""
     rows = _model_picker_rows(text)
     region = [line.rstrip() for line in _model_picker_region(text) or () if line.strip()]
-    above = bool(rows) and "↑" in rows[0][0]
-    below = (any("↓" in marks for marks, _ in rows)
+    above = bool(rows) and ("↑" in rows[0][0] or rows[0][1] > 1)
+    below = (any("↓" in marks for marks, _, _ in rows)
              or any(_MODEL_PICKER_MORE_RE.match(line) for line in region)
              or bool(region) and region[-1].endswith(" ↓"))
     return above, below
@@ -25118,7 +25157,10 @@ def _model_picker_open(cap):
         return False
     if any(line.strip() and PANE_PROMPT_RULE_RE.match(line) for line in region):
         return False
-    text = _ANSI_RE.sub("", cap or "")
+    # Footers are looked for below the heading only: a composer's footer sits
+    # there whenever one is drawn, while a conversation line above the picker
+    # that merely reads like one ("! for shell mode") must not hide it.
+    text = "\n".join(region)
     return not (PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
                 or PANE_SHELL_FOOTER_RE.search(text)
                 or _pane_composer_tail_up(_pane_lines(text)))
@@ -35102,28 +35144,37 @@ class SessionManager:
         #
         # A long list draws only a window of its rows (XERK-2148: opened with
         # the ❯ on row 13 it shows "↑ 4." to "❯ 13."; 22 rows end "↓ 10." and
-        # "… +8 models"), so the target may not be drawn. Rows match by their
-        # FIRST word and the first match wins, so the window is first scrolled
-        # to the top (Up while "↑" shows) — else "opus" would take a lower
-        # "Opus 5" over an "Opus 5.5" scrolled off above — and then down
-        # (while "↓" shows) until the row is drawn, bounded by SCROLL_MAX.
+        # "… +8 models"; a pane ~14 rows high draws ONE row and no "↑"), so
+        # the target may not be drawn. Rows match by their FIRST word and the
+        # first match in the WHOLE list wins, so a match only counts once every
+        # row above it has been drawn (`seen`, by row number): else "opus"
+        # would take a lower "Opus 5" over an "Opus 5.5" scrolled off above.
+        # Until then the window scrolls toward the first row not yet seen,
+        # bounded by SCROLL_MAX.
         steps = scrolls = 0
-        seen_top = False
+        seen = {}                       # row number -> label, every row drawn
         while True:
-            above, below = _model_picker_scroll(cap)
-            seen_top = seen_top or not above
-            looking_up = above and not seen_top
-            target = None if looking_up else _picker_index_for(rows, resolved)
+            nums = [num for _, num, _ in _model_picker_rows(cap)]
+            seen.update(zip(nums, rows))
+            known = 0                   # rows 1..known have all been drawn
+            while known + 1 in seen:
+                known += 1
+            want = next((n for n in range(1, known + 1)
+                         if _picker_index_for([seen[n]], resolved) == 0), None)
+            target = nums.index(want) if want in nums else None
             if target is None:
-                way = "Up" if looking_up else "Down" if below else None
+                if want is not None:
+                    way = "Up" if want < nums[0] else "Down"
+                elif known + 1 < nums[0]:
+                    way = "Up"
+                else:
+                    way = "Down" if _model_picker_scroll(cap)[1] else None
                 if way and scrolls < MODEL_PICKER_SCROLL_MAX:
                     _pane_send_keys(tmux_name, way)
                     scrolls += 1
                     rows, cur, cap = self._await_picker_step(tmux_name, rows, cur)
                     if not rows or cur is None:
-                        _pane_send_keys(tmux_name, "Escape")
-                        log(f"set model of {sid} -> {arg}: picker vanished mid-scroll")
-                        self.save()
+                        self._picker_lost(sid, arg, tmux_name, rows, "mid-scroll")
                         return
                     continue
                 _pane_send_keys(tmux_name, "Escape")
@@ -35148,9 +35199,7 @@ class SessionManager:
             steps += 1
             rows, cur, cap = self._await_picker_step(tmux_name, rows, cur)
             if not rows or cur is None:
-                _pane_send_keys(tmux_name, "Escape")
-                log(f"set model of {sid} -> {arg}: picker vanished mid-navigation")
-                self.save()
+                self._picker_lost(sid, arg, tmux_name, rows, "mid-navigation")
                 return
         label = rows[cur]
         # The confirmation must be NEW: a line from an earlier switch to the
@@ -35169,6 +35218,16 @@ class SessionManager:
             self.save()
             log(f"set model of {sid} -> {arg}: selection sent but no "
                 f"confirmation read; record unchanged (modelActual will settle it)")
+
+    def _picker_lost(self, sid, arg, tmux_name, rows, when):
+        """Back out of a picker whose ❯ row can no longer be read, logging why:
+        gone entirely, or still drawn with its ❯ row pushed off a short or
+        narrow pane (24x45 wraps it below the bottom, XERK-2148)."""
+        _pane_send_keys(tmux_name, "Escape")
+        why = ("picker's cursor row went off-screen (pane too small)" if rows
+               else "picker vanished")
+        log(f"set model of {sid} -> {arg}: {why} {when}")
+        self.save()
 
     def _await_picker_step(self, tmux_name, prev_rows, prev_cur):
         """Poll the picker after an arrow press until the ❯ moves off prev_cur

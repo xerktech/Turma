@@ -10692,6 +10692,20 @@ _2148_OVERLAYS = {
                + _2148_RULE + "❯ describe a task for a new session\n" + _2148_RULE
                + "  ⏵⏵ auto mode · enter to return · space to reply · ctrl+x to delete"
                " · ? for shortcuts\n"),
+    # The background shell's detail view: a relayed "x" would stop the shell.
+    "shell details": ("● started\n" + _2148_RULE + "  Shell details\n\n"
+                      "  Status:   running\n  Command:  sleep 45\n  Output:\n"
+                      "  No output available\n\n"
+                      "  ← to go back · Esc/Enter/Space to close · x to stop\n"),
+    # A long /skills list on a 40-row pane: its footer is scrolled off, the
+    # hints ride the header, and its search box draws ╭─╮ rules below them.
+    "/skills@40": ("❯ /privacy-settings\n  ctrl+x ctrl+s to send now\n" + "▔" * 100 + "\n"
+                   "   Skills\n"
+                   "   9 skills · enter/space to cycle, / to search, t to sort, Esc to close\n"
+                   "   ╭" + "─" * 60 + "╮\n   │ ⌕ Search skills…" + " " * 44 + "│\n"
+                   "   ╰" + "─" * 60 + "╯\n"
+                   "   ❯ ✔ docs               claude.ai sync · ~340 tok\n"
+                   "     ✔ xlsx               claude.ai sync · ~320 tok\n"),
 }
 # Composer states whose footer must never read as an overlay's.
 _2148_COMPOSERS = {
@@ -10708,6 +10722,11 @@ _2148_COMPOSERS = {
     "shell": _2148_RULE + "! echo hi\n" + _2148_RULE + "  ! for shell mode\n",
     "draft": (_2148_RULE + "❯ notes\n  Esc to close\n  ctrl+o to toggle\n" + _2148_RULE
               + "  ⏸ manual mode on\n"),
+    "shell running": _2148_RULE + "❯ \n" + _2148_RULE
+    + "  ⏸ manual mode on · 1 shell · ↓ to manage\n",
+    # A reply quoting an overlay's edge and header sits above the composer.
+    "quoted overlay": ("▔" * 40 + "\n   Skills\n   9 skills · Esc to close\n"
+                       + _2148_RULE + "❯ x to stop\n" + _2148_RULE + "  ⏸ manual mode on\n"),
 }
 
 
@@ -10740,6 +10759,15 @@ class TestOverlayFootersAndShellMode(unittest.TestCase):
         # No rule to stop at (a short pane): the draft's own last line is the
         # footer item, and only the shell footer under it says composer.
         self.assertFalse(ha._hint_dialog_up("! note\nEsc to cancel\n  ! for shell mode\n"))
+
+    def test_a_quoted_shell_footer_hides_no_dialog(self):
+        # QA (XERK-2148): the shell footer was searched over the whole capture,
+        # so a conversation line reading "! for shell mode" vetoed a real
+        # footerless picker and the trust modal. Only the footer region counts.
+        said = "! for shell mode\n● noted\n"
+        self.assertTrue(ha._model_picker_open(said + _2148_PICKER_40))
+        self.assertTrue(ha._pane_blocking_dialog(said + _2148_PICKER_40))
+        self.assertTrue(ha._trust_dialog_up(said + LINUX_TRUST_MODAL))
 
     def test_the_shell_footer_names_no_permission_mode(self):
         self.assertIsNone(ha.parse_pane_mode(_2148_COMPOSERS["shell"]))
@@ -21083,6 +21111,20 @@ class _ScrollPickerPane(_PickerPane):
         return self.history + "\n".join(lines)
 
 
+class _OneRowPickerPane(_ScrollPickerPane):
+    """The picker on a pane ~12-14 rows high (QA, 60x12 / 120x14, 2.1.306):
+    ONE row drawn — the ❯ row — with NO "↑" though rows lie above, "… +N
+    models" under it, and no footer."""
+
+    def capture(self):
+        if not self.open:
+            return _PickerPane.capture(self)
+        more = len(self.ROWS) - self.cur - 1
+        return (self.history + "   Select model\n"
+                f"   ❯ {self.cur + 1}.  {self.ROWS[self.cur]}    a description\n"
+                + (f"      … +{more} models\n" if more else ""))
+
+
 class _TruncatedPickerPane(_PickerPane):
     """The picker at 24 columns (2.1.306): every label cut to "Sonne…", while
     the confirmation still prints the full name (XERK-2148)."""
@@ -21501,6 +21543,37 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
                              ha.MODEL_PICKER_SCROLL_MAX)
         self.assertEqual(sess["model"], "opus")
         self.assertIn("picker offers no such row", logged.call_args[0][0])
+
+    def test_set_model_on_a_one_row_picker_takes_the_first_match(self):
+        # QA (XERK-2148): a short pane draws only the ❯ row and no "↑", so the
+        # up phase was skipped and `opus` from Haiku 5.5 pressed Down to
+        # "Opus 5" and confirmed it. Rows above must be seen first.
+        for model, start, want in (("opus", 4, "Opus 5.5"), ("fable", 4, "Fable 5.1"),
+                                   ("opus", 9, "Opus 5.5"), ("default", 12, "Default (recommended)"),
+                                   ("sonnet", 0, "Sonnet 5.5")):
+            pane = _OneRowPickerPane(cur=start, height=1)
+            sm = self.make_manager(pane=pane)
+            self._session(sm, model="haiku")
+            sm.set_model("abcde", model)
+            self.assertEqual(pane.ROWS[pane.cur], want, (model, start))
+            self.assertTrue(pane.confirmed, (model, start))
+
+    def test_set_model_logs_a_cursor_row_pushed_off_mid_scroll(self):
+        # QA, 24x45: after a Down the ❯ row wraps below the bottom while rows
+        # 1-4 stay drawn. That is no vanished picker.
+        pane = _ScrollPickerPane(cur=1)
+        drawn = pane.capture
+        pane.capture = lambda: (drawn().replace("❯", " ") if pane.open and pane.cur > 1
+                                else drawn())
+        sm = self.make_manager(pane=pane)
+        self._session(sm, model="opus")
+        with mock.patch.object(ha, "log") as logged:
+            sm.set_model("abcde", "haiku")
+        msg = logged.call_args[0][0]
+        self.assertIn("cursor row went off-screen", msg)
+        self.assertNotIn("vanished", msg)
+        self.assertEqual(self._keys()[-1], "Escape")
+        self.assertNotIn("s", self._keys())
 
     def test_set_model_reads_truncated_labels(self):
         # XERK-2148: at 24 columns rows read "Sonne…"; a stem only one model
@@ -22989,9 +23062,15 @@ class TestParseModelPicker(unittest.TestCase):
         self.assertEqual(ha.parse_model_picker(bottom), (["Sonnet 5.5", "Sonnet 4.6"], 1))
         self.assertEqual(ha._model_picker_scroll(bottom), (True, False))
         self.assertEqual(ha._model_picker_scroll(MODEL_PICKER_PANE), (False, False))
-        # A narrow pane: the "↓" ends the last drawn line.
+        # A narrow pane: the "↓" ends the last drawn line. Row 1 is not drawn,
+        # so rows lie above too.
         self.assertEqual(ha._model_picker_scroll(
-            "   Select model\n   ❯ 2.  Opu… ✔  For\n                 work ↓\n"), (False, True))
+            "   Select model\n   ❯ 2.  Opu… ✔  For\n                 work ↓\n"), (True, True))
+        # A pane ~12 rows high draws ONE row and no "↑" (QA, 60x12): a first
+        # row numbered past 1 still says rows lie above.
+        self.assertEqual(ha._model_picker_scroll(
+            "   Select model\n   ❯ 3.  Fable 5.1 ✔            For your toughest\n"
+            "      … +10 models\n"), (True, True))
 
     def test_picker_index_for(self):
         rows, _ = ha.parse_model_picker(MODEL_PICKER_PANE)
