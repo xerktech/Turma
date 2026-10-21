@@ -106,6 +106,15 @@ byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt`
       counted against `SVG_EMBEDDED_MAX_PIXELS`, plus a render deadline; past it → alt text.
     - **Never go back to a text pre-scan of the SVG for data URIs**: each one lost to the parser (a
       mime past the scan's cap, a raw quote inside the payload that `Base64.decode` skips).
+  - **A viewBox-only SVG `<img>` carries `width`/`height` attributes on the web** (`svgSizeAttrs`,
+    XERK-2161): with no intrinsic size it laid out at 0 × 0 in a shrink-to-fit bubble or table cell.
+    The width is the one reaching `.md-img`'s 420px max-height, so it fills the bubble at its ratio
+    like Android's `svgFilledSize`. Never put `width: auto` back on `.md-svg` — it overrides them.
+  - **Android decodes a `data:` URI by its DECLARED type** (`DataImage` + `DeclaredBitmapDecoder`,
+    XERK-2161), as the browser does: SVG bytes behind `data:image/png` are broken, never sniffed.
+    - **Never `runBlocking { loader.execute(…) }` in a Robolectric test**: Coil resumes on the
+      paused main looper and it hangs forever (the Android CI job then times out). Drive the fetcher
+      and decoder factories of `turmaImageComponents()` directly (`DataImageTest`).
   - **A rule line is a SCAN (`isRuleLine`), never `/(?:-[ \t]*){3,}/`.** That regex is linear in V8
     but `java.util.regex` recurses once per iteration of a quantified GROUP, so the Android port of
     it threw an **uncatchable `StackOverflowError`** out of `parseProse` inside a Composable (an
