@@ -33266,7 +33266,8 @@ class SessionManager:
         matched dir is one entry, never walked (`-uall` does not change that),
         so when one was let through, `ls-files` walks the ignored files for a
         `.env*`/`*.env` file or dir at any depth (a `dist/.env.production` under
-        an ignored `dist/`, XERK-2138). `-unormal` overrides a status.showUntrackedFiles=no config,
+        an ignored `dist/`, XERK-2138) — a `.env.example`-style template file
+        aside — or a nested repository it cannot walk. `-unormal` overrides a status.showUntrackedFiles=no config,
         which makes `--ignored` fail. Git failing reads True, which only keeps a
         copy aside."""
         rc, out = run_out(["git", "-C", cwd, "status", "--porcelain", "--ignored=matching",
@@ -33293,8 +33294,24 @@ class SessionManager:
                            "--exclude-standard"], timeout=timeout)
         if rc != 0:
             return True
-        return any(part.startswith(".env") or part.endswith(".env")
-                   for e in out.split("\0") for part in e.casefold().split("/"))
+        for e in out.split("\0"):
+            if e.endswith("/"):
+                # A nested repository: ls-files never walks into one, so its
+                # own `.env` (or unpushed commits) would go unseen (XERK-2148).
+                return True
+            parts = e.casefold().split("/")
+            if any(p.startswith(".env") or p.endswith(".env") for p in parts[:-1]):
+                return True
+            name = parts[-1]
+            if (name.startswith(".env") or name.endswith(".env")) and \
+                    not self.MIGRATION_ENV_TEMPLATE_WORDS & set(name.split(".")):
+                return True
+        return False
+
+    # A `.env.example`-style FILE is a template, never a secret: a package in
+    # node_modules ships one, and counting it kept every such copy (XERK-2148).
+    MIGRATION_ENV_TEMPLATE_WORDS = frozenset((
+        "example", "sample", "template", "dist", "defaults", "tpl", "tmpl"))
 
     # A bundle is the largest thing an agent ever sends, so it is the body most
     # likely to meet the hub's in-flight budget (XERK-258) and be told 503 "busy,

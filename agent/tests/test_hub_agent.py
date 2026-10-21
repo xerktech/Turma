@@ -12534,13 +12534,30 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
                            # collapsed `!! app/dist/` entry to status (XERK-2138).
                            ("app/dist/.env.production", True),
                            ("app/dist/sub/.env", True), ("app/dist/.ENV.local", True),
-                           ("app/dist/.env/secret", True), ("app/dist/prod.env", True)):
+                           ("app/dist/.env/secret", True), ("app/dist/prod.env", True),
+                           # A package-shipped template is no secret (XERK-2148);
+                           # a real .env in node_modules still keeps the copy.
+                           ("node_modules/p/.env.example", False),
+                           ("node_modules/p/.ENV.Sample", False),
+                           ("app/dist/.env.local.template", False),
+                           ("node_modules/p/.env.dist", False),
+                           ("node_modules/p/example.env", False),
+                           ("node_modules/p/.env", True),
+                           ("node_modules/p/.env.example/secret", True)):
             d = tempfile.mkdtemp(dir=self.tmp)
             self.git("init", "-q", d)
             self.write(d, ".gitignore", rules)
             if rel:
                 self.write(d, rel, "x\n")
             self.assertIs(sm._holds_unregenerable_ignored(d, 15), keeps, rel)
+        # A nested repo inside an ignored regenerable dir: ls-files never walks
+        # into it, so its .env went with the copy (XERK-2148).
+        d = tempfile.mkdtemp(dir=self.tmp)
+        self.git("init", "-q", d)
+        self.write(d, ".gitignore", rules)
+        self.git("init", "-q", os.path.join(d, "app", "dist", "sub"))
+        self.write(d, "app/dist/sub/.env", "TOKEN=x\n")
+        self.assertTrue(sm._holds_unregenerable_ignored(d, 15))
         # status.showUntrackedFiles=no makes a bare `--ignored` fail (QA D5).
         d = tempfile.mkdtemp(dir=self.tmp)
         self.git("init", "-q", d)
