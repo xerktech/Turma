@@ -17439,14 +17439,20 @@ def _undimmed(styled):
     """`styled` with every DIM (SGR 2) run dropped and all escapes removed."""
     out, dim, pos = [], False, 0
     for m in _SGR_RE.finditer(styled):
-        if not dim:
-            out.append(styled[pos:m.start()])
+        # A dropped run keeps its line breaks: tmux does not reset SGR at a line
+        # end, so a dim run reaching the last column closes on the next row (QA).
+        seg = styled[pos:m.start()]
+        out.append("\n" * seg.count("\n") if dim else seg)
         pos = m.end()
-        params = m.group(1).replace(":", ";").split(";")
+        # `;` separates attributes; a `:` group is ONE attribute with its own
+        # sub-parameters (`4:2` is double underline, never dim).
+        params = m.group(1).split(";")
         i = 0
         while i < len(params):
             p = params[i]
-            if p in ("", "0", "22"):
+            if ":" in p:
+                pass
+            elif p in ("", "0", "22"):
                 dim = False
             elif p == "2":
                 dim = True
@@ -17454,8 +17460,8 @@ def _undimmed(styled):
                 # An extended colour's own numbers (`38;5;2`) are no attributes.
                 i += 2 if i + 1 < len(params) and params[i + 1] == "5" else 4
             i += 1
-    if not dim:
-        out.append(styled[pos:])
+    seg = styled[pos:]
+    out.append("\n" * seg.count("\n") if dim else seg)
     return _OTHER_ESC_RE.sub("", "".join(out))
 
 

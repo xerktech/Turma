@@ -261,16 +261,17 @@ function markerRes(raw: string | undefined): RegExp[] {
     .map(m => new RegExp(m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu'))
 }
 
-// The WHOLE output with no custom marker left in it: over the joined text, so a
+// Text with no custom marker left in it. Run over whole output LINES, so a
 // marker spanning two cells (`host/repo`) is caught, and to a fixed point, since
-// breaking one (`ab` → `a-b`) can make another. Each pass grows the text, so it
-// is bounded by the marker count (+1), then the remaining matches are dropped.
+// breaking one (`ab` → `a-b`) can make another. Breaking passes are bounded by
+// the marker count (+1); what still matches after them (`-a` stays `-a`-shaped)
+// is deleted until nothing matches, which ends, as every deletion shortens it.
 function unmarked(text: string, res: RegExp[]): string {
-  for (let pass = 0; pass <= res.length; pass++) {
-    if (!res.some(re => text.search(re) >= 0)) return text
+  const left = () => res.some(re => text.search(re) >= 0)
+  for (let pass = 0; pass <= res.length && left(); pass++) {
     for (const re of res) text = text.replace(re, broken)
   }
-  for (const re of res) text = text.replace(re, '')
+  while (left()) for (const re of res) text = text.replace(re, '')
   return text
 }
 
@@ -288,7 +289,7 @@ function quoted(v: unknown): string {
   return c ? `“${c}”` : ''
 }
 
-async function peersText($: EngineInterface): Promise<string> {
+async function peersText($: EngineInterface, res: RegExp[]): Promise<string> {
   const path = await $.env.get('TURMA_PEERS_FILE')
   if (!path) return 'No roster: this session was not launched by Turma.'
   let raw: string
@@ -314,9 +315,12 @@ async function peersText($: EngineInterface): Promise<string> {
     const what = quoted(task) ? ` — ${quoted(task)}` : ''
     // A nameless row (the local fallback roster) must not read as a
     // continuation of the row above.
-    return `  ${cell(name) || '(no name)'}${mark}  ${where}${br}${what}`
+    // Markers broken BEFORE the rows are sized, so breaking can never push the
+    // pointer line past OUT_MAX.
+    return unmarked(`  ${cell(name) || '(no name)'}${mark}  ${where}${br}${what}`, res)
   })
   const head = [`${rows.length} session(s); message one by its name with SendMessage.`, DATA_NOTE]
+    .map(l => unmarked(l, res))
   // Rows fit under OUT_MAX with the pointer to the whole roster kept.
   const kept: string[] = []
   // Room for the pointer line as it will print (its count is at most 3 digits).
@@ -326,7 +330,8 @@ async function peersText($: EngineInterface): Promise<string> {
     kept.push(line)
     size += line.length + 1
   }
-  // The path is the agent's own (TURMA_PEERS_FILE), not file text: never cut.
+  // The path is the agent's own (TURMA_PEERS_FILE), not file text: never cut,
+  // and never rewritten by a marker break.
   if (kept.length < ordered.length) kept.push(`  …and ${ordered.length - kept.length} more in ${path}`)
   return [...head, ...kept].join('\n')
 }
@@ -387,20 +392,20 @@ async function wakeText($: EngineInterface, args: string[]): Promise<string> {
 async function turmaText($: EngineInterface, args: string): Promise<string> {
   const words = args.trim().split(/\s+/).filter(Boolean)
   const sub = (words[0] || '').toLowerCase()
-  let text: string
-  try {
-    if (sub === 'peers') text = await peersText($)
-    else if (sub === 'status') text = await statusText($)
-    else if (sub === 'wake') text = await wakeText($, words.slice(1))
-    else text = HELP
-  } catch (err) {
-    text = `/turma ${cell(sub)} failed: ${cell(String(err))}`
-  }
   let res: RegExp[] = []
   try {
     res = markerRes(await $.env.get('TURMA_BUSY_MARKERS'))
   } catch {
     // no override readable: the built-in markers are still broken by cell()
+  }
+  let text: string
+  try {
+    if (sub === 'peers') return await peersText($, res)
+    if (sub === 'status') text = await statusText($)
+    else if (sub === 'wake') text = await wakeText($, words.slice(1))
+    else text = HELP
+  } catch (err) {
+    text = `/turma ${cell(sub)} failed: ${cell(String(err))}`
   }
   text = unmarked(text, res)
   // The cut can only shorten a marker, never make one.

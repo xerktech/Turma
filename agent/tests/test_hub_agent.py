@@ -27666,6 +27666,12 @@ class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
         self.assertEqual(ha._composer_draft(f"{rule}\n\u276f \x1b[2mghost\x1b[0m\n{rule}\n",
                                             styled=True), "")
         self.assertIsNone(ha._composer_draft("\x1b[2mno rules\x1b[0m", styled=True))
+        # A dim run left open at a line end (tmux does not reset there) keeps
+        # the line count; a `4:2` double underline is no dim.
+        self.assertEqual(ha._composer_draft(
+            f"\x1b[2mhint to the last column\n\x1b[0m{rule}\n\u276f \n{rule}\n", styled=True), "")
+        self.assertEqual(ha._composer_draft(
+            f"{rule}\n\u276f \x1b[4:2mreal\x1b[0m\n{rule}\n", styled=True), "real")
 
     def test_an_unreadable_composer_defers_the_rename(self):
         sm = self.make_manager(cap="a pane with no composer rules")
