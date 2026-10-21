@@ -81,6 +81,25 @@ Mirrors the glasses pure-core/adapter-shell split:
 - Usage's model-quality card (XERK-1849) is likewise its OWN `GET /api/model-quality` call
   (`model/ModelQuality.kt`, `UsageViewModel.watchModelQuality`); rules in `model-quality.md`.
 
+## Images (rollup XERK-2109)
+
+- **An SVG is sized as Chrome sizes an `<img>`** (`core/SvgGuard.kt` `svgNaturalSize`, expectations
+  measured in chrome-headless-shell): read the parsed root's width/height (`SvgRenderGuard.rootSize`),
+  never `SVG.getDocumentWidth/Height`, which make a width-only SVG square and drop a lone height.
+  - A viewBox alone FILLS the box's width (`svgFilledSize`), as Chrome lays it out; it is not 24dp.
+- **A remote SVG renders only when served as image/svg+xml** — a browser never sniffs SVG.
+  `ServedContentType` (the loader's OkHttp interceptor) relabels text/plain / missing types, which
+  Coil would otherwise replace with the URL extension's guess; it must change the BODY's type (read
+  on a fetch) and the header (read on a disk-cache hit). Tests: `ServedContentTypeTest`.
+  - It labels by the type a BROWSER reads (`browserEssence`: last comma entry outside quotes,
+    `*/*` skipped; a type ends at `;`, whitespace or `(`), not OkHttp's parse, which fails on a space before `;` or a comma list —
+    and Coil guesses for an unparseable header and any raw `text/plain…` prefix.
+    Patching one header shape at a time broke the next three times; change the rule as a whole.
+  - Parity is claimed only for the header shapes `ServedContentTypeTest` pins (each checked in
+    Chrome); any other malformed header is unmeasured, and a mismatch there fails safe or static.
+  - The loader's disk cache is its own directory (the old `image_cache` is deleted): entries cached
+    before the relabel would otherwise keep rendering a text/plain `.svg`.
+
 ## Push delivery
 
 - Android owns the delivery half: `POST_NOTIFICATIONS` runtime request (API 13+, `MainActivity`),
@@ -169,6 +188,9 @@ Mirrors the glasses pure-core/adapter-shell split:
   otherwise. `Updater.check()` no-ops when `turma.updater.disabled` is `true` (checked BEFORE
   throttle/force), set JVM-wide by `testOptions.unitTests.all`. Nothing in production sets it. Tests:
   `net/UpdaterTestSeamTest`.
+- **Coil's `ImageLoader.execute()` hops to the main thread** — in Robolectric that is the test's
+  own, so `runBlocking { execute() }` there deadlocks. Run it on another thread and pump
+  `shadowOf(Looper.getMainLooper()).idle()` (`ServedContentTypeTest.load`).
 - Tests: `vm/ChatModelSourceTest`, `vm/FleetOutcomeTest`, `ui/SpawnComposerTest`,
   `ui/ChatModelChipsTest`, `ui/SessionsPaneSpawnTest`, `ui/FleetSpawnLocalModelTest`.
 
@@ -203,5 +225,7 @@ Mirrors the glasses pure-core/adapter-shell split:
 - Gradle (wrapper generated in CI, not committed); PR-gated by `android-ci.yml` on `ubuntu-latest`,
   JDK 17, Gradle pinned in-job to match `app/build.gradle.kts`. Setup + FCM wiring:
   `android/README.md`.
+- Locally on a host whose `/tmp` is noexec, Robolectric's native runtime and Conscrypt fail to
+  load ("failed to map segment"): set `JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=<an exec dir>`.
 - **Don't copy `code-scan.yml`'s runner-toolchain reclaim into `android-ci.yml`** — that job builds
   against the runner's own preinstalled Android SDK, which the reclaim deletes.

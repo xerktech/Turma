@@ -918,6 +918,17 @@ those are marked `[MODEL]`.
   table cell around each image (`splitImages`) and renders it via Coil `AsyncImage` at its own aspect
   ratio, capped at its natural width and 320dp tall; SVGs sit on a white backdrop, and a tap opens the
   same `ImageLightbox` as SendUserFile previews. A source that fails to load shows its alt text.
+- ~~SVG sizing and remote SVG types (rollup XERK-2109).~~ **Done**: an SVG is sized as Chrome sizes
+  an `<img>` (`core/SvgGuard.kt` `svgNaturalSize`/`svgFilledSize`, from the parsed root's own width
+  and height): one side alone takes the other from the viewBox, else 300 wide / 150 tall; a viewBox
+  alone fills the width offered. A remote SVG renders only when served as image/svg+xml
+  (`ServedContentType` stops Coil guessing the type from an `.svg` extension); bitmaps are sniffed.
+  - Remaining gap (P3): a `data:image/png` (or any non-SVG `data:image/*`) URI whose bytes are SVG
+    markup renders here (the bytes are sniffed) and is broken on the web, which trusts the declared
+    type. `ex` is taken as 8px; Chrome's depends on the font (9px in headless Chrome).
+- ~~Command output collapsed (rollup XERK-2109).~~ **Done**: a `/slash` command's output and an
+  output whose command is outside the window ("› output") start collapsed behind their chip, a tap
+  toggling it (chat.js `renderCommandCard`); a `!` command's output stays open (`renderBashCard`).
 - P2 **Share INTO the app as an attachment (XERK-234 follow-up).** Attaching from the picker is done
   (see "Done" above); the phone-idiomatic counterpart of the web's drag-and-drop is the system share
   sheet, which needs an `ACTION_SEND`/`ACTION_SEND_MULTIPLE` intent filter routing the Uri(s) into the

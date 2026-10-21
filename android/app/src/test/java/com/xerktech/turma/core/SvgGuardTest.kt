@@ -85,13 +85,47 @@ class SvgGuardTest {
         assertEquals(false, z("<!-- <svg width=\"0\"> --><svg width=\"4\" height=\"4\"><rect width=\"0\"/></svg>"))
     }
 
-    @Test fun `natural size is width x height, else the viewBox, else the CSS 300 x 150 default`() {
-        // A browser sizes an SVG <img> by its width/height; the viewBox only scales the drawing.
-        assertEquals(40f to 20f, svgNaturalSize(40f, 20f, 400f, 200f))
-        assertEquals(40f to 20f, svgNaturalSize(40f, 20f, null, null))
-        assertEquals(10f to 5f, svgNaturalSize(-1f, -1f, 10f, 5f))
-        assertEquals(300f to 150f, svgNaturalSize(-1f, -1f, null, null))
-        assertEquals(300f to 150f, svgNaturalSize(40f, -1f, null, null))
+    // Each expectation is Chrome's own (chrome-headless-shell, an <img> of the SVG as a
+    // data URI, rollup XERK-2109): naturalWidth x naturalHeight, and for a viewBox
+    // alone, the box it was laid out in.
+    @Test fun `width and height are the size, whatever the viewBox`() {
+        assertEquals(SvgSize(80f, 40f), svgNaturalSize(80f, 40f, 800f, 400f))
+        assertEquals(SvgSize(40f, 20f), svgNaturalSize(40f, 20f, null, null))
+    }
+
+    @Test fun `a width alone takes its height from the viewBox, else the default 150`() {
+        // AndroidSVG's document size made this 100 x 100 (height = width).
+        assertEquals(SvgSize(100f, 150f), svgNaturalSize(100f, null, null, null))
+        assertEquals(SvgSize(100f, 50f), svgNaturalSize(100f, null, 10f, 5f))
+    }
+
+    @Test fun `a height alone takes its width from the viewBox, else the default 300`() {
+        assertEquals(SvgSize(300f, 100f), svgNaturalSize(null, 100f, null, null))
+        assertEquals(SvgSize(200f, 100f), svgNaturalSize(null, 100f, 10f, 5f))
+    }
+
+    @Test fun `a viewBox alone fills the width offered, its natural size fitted in 300 x 150`() {
+        assertEquals(SvgSize(150f, 150f, fill = true), svgNaturalSize(null, null, 24f, 24f))
+        assertEquals(SvgSize(300f, 150f, fill = true), svgNaturalSize(null, null, 800f, 400f))
+        assertEquals(SvgSize(300f, 150f, fill = true), svgNaturalSize(null, null, 80f, 40f))
+        assertEquals(SvgSize(37.5f, 150f, fill = true), svgNaturalSize(null, null, 10f, 40f))
+        assertEquals(SvgSize(300f, 100f, fill = true), svgNaturalSize(null, null, 30f, 10f))
+        // Chrome laid a square one out 600 wide in a 600px box (.md-img's max-height then caps it).
+        assertEquals(SvgSize(600f, 600f, fill = true), svgFilledSize(svgNaturalSize(null, null, 24f, 24f), 1200, 2f))
+        assertEquals(SvgSize(600f, 2400f, fill = true), svgFilledSize(svgNaturalSize(null, null, 10f, 40f), 1200, 2f))
+        // No box width: the natural size.
+        assertEquals(SvgSize(150f, 150f, fill = true), svgFilledSize(svgNaturalSize(null, null, 24f, 24f), null, 2f))
+    }
+
+    @Test fun `a declared size never fills`() {
+        val s = svgNaturalSize(100f, null, 10f, 5f)
+        assertEquals(s, svgFilledSize(s, 1200, 2f))
+    }
+
+    @Test fun `no size and no usable viewBox is the CSS 300 x 150 default`() {
+        assertEquals(SvgSize(300f, 150f), svgNaturalSize(null, null, null, null))
+        assertEquals(SvgSize(300f, 150f), svgNaturalSize(null, null, 0f, 10f))
+        assertEquals(SvgSize(300f, 150f), svgNaturalSize(-1f, -1f, null, null))
     }
 
     @Test fun `the bitmap is the intrinsic size at device density, never scaled up to the box`() {

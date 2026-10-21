@@ -47,13 +47,13 @@ class SafeSvgDecoderTest {
     private val ns = "xmlns=\"http://www.w3.org/2000/svg\""
 
     /** Decode for a phone-wide prose placeholder: 1000 × 320 px, fitted. Null: not an SVG. */
-    private fun decode(bytes: ByteArray, mime: String? = null): Drawable? {
-        val decoder = decoder(bytes, mime) ?: return null
+    private fun decode(bytes: ByteArray, mime: String? = null, source: DataSource = DataSource.MEMORY): Drawable? {
+        val decoder = decoder(bytes, mime, source) ?: return null
         return runBlocking { decoder.decode() }!!.drawable
     }
 
-    private fun decoder(bytes: ByteArray, mime: String? = null): Decoder? {
-        val result = SourceResult(ImageSource(Buffer().write(bytes), context), mime, DataSource.MEMORY)
+    private fun decoder(bytes: ByteArray, mime: String? = null, source: DataSource = DataSource.MEMORY): Decoder? {
+        val result = SourceResult(ImageSource(Buffer().write(bytes), context), mime, source)
         val options = Options(context, size = Size(1000, 320), scale = Scale.FIT)
         return SafeSvgDecoder.Factory().create(result, options, loader)
     }
@@ -65,7 +65,53 @@ class SafeSvgDecoderTest {
         // 80 x 40 SVG laid out at the full bubble width (web: 80px).
         assertEquals(80 to 40, intrinsic("<svg $ns width=\"80\" height=\"40\"/>"))
         assertEquals(80 to 40, intrinsic("<svg $ns width=\"80\" height=\"40\" viewBox=\"0 0 800 400\"/>"))
-        assertEquals(24 to 24, intrinsic("<svg $ns viewBox=\"0 0 24 24\"/>"))
+    }
+
+    // Chrome's sizes (rollup XERK-2109), read off the parsed root rather than AndroidSVG's
+    // document size, which made a width-only SVG square and dropped a lone height.
+    @Test fun `one side alone takes the other from the viewBox, else the CSS default`() {
+        assertEquals(100 to 150, intrinsic("<svg $ns width=\"100\"/>"))
+        assertEquals(100 to 50, intrinsic("<svg $ns width=\"100\" viewBox=\"0 0 10 5\"/>"))
+        assertEquals(300 to 100, intrinsic("<svg $ns height=\"100\"/>"))
+        assertEquals(200 to 100, intrinsic("<svg $ns height=\"100\" viewBox=\"0 0 10 5\"/>"))
+        // A percentage has no box to resolve against in an <img>: Chrome drops it.
+        assertEquals(300 to 30, intrinsic("<svg $ns width=\"50%\" height=\"30\"/>"))
+        // Chrome: 10em 160, 10mm 38, 1in 96.
+        assertEquals(160 to 150, intrinsic("<svg $ns width=\"10em\"/>"))
+        // ex: half an em (Chrome's follows the font's x-height, 9px headless).
+        assertEquals(80 to 150, intrinsic("<svg $ns width=\"10ex\"/>"))
+        assertEquals(38 to 96, intrinsic("<svg $ns width=\"10mm\" height=\"1in\"/>"))
+    }
+
+    @Test fun `a viewBox alone fills the box it is decoded for, at its own ratio`() {
+        // Chrome lays it out as wide as its container; the box here is 1000 px.
+        val w = Math.round(1000 / context.resources.displayMetrics.density)
+        assertEquals(w to w, intrinsic("<svg $ns viewBox=\"0 0 24 24\"/>"))
+        assertEquals(w to w / 2, intrinsic("<svg $ns viewBox=\"0 0 800 400\"/>"))
+        assertEquals(w to w / 2, intrinsic("<svg $ns width=\"50%\" viewBox=\"0 0 10 5\"/>"))
+    }
+
+    private val tiny = "<svg $ns width=\"20\" height=\"10\"/>".toByteArray()
+
+    private fun refusedFrom(bytes: ByteArray, mime: String?, source: DataSource): Boolean =
+        runCatching { decode(bytes, mime, source) }.exceptionOrNull() is IllegalStateException
+
+    @Test fun `a remote svg renders only when served as image svg+xml`() {
+        // Chrome shows each of these broken (an <img> never sniffs an SVG).
+        for (mime in listOf(null, "application/octet-stream", "text/html", "text/xml", "application/xml")) {
+            for (source in listOf(DataSource.NETWORK, DataSource.DISK)) {
+                assertTrue("$mime from $source", refusedFrom(tiny, mime, source))
+            }
+        }
+        assertEquals(20, decode(tiny, "image/svg+xml", DataSource.NETWORK)!!.intrinsicWidth)
+        assertEquals(20, decode(tiny, "Image/SVG+XML", DataSource.DISK)!!.intrinsicWidth)
+        // In-memory bytes (a data: URI) are sniffed, as before.
+        assertEquals(20, decode(tiny, null, DataSource.MEMORY)!!.intrinsicWidth)
+    }
+
+    @Test fun `a remote bitmap of any type is left to the bitmap decoder`() {
+        val png = byteArrayOf(0x89.toByte(), 'P'.code.toByte(), 'N'.code.toByte(), 'G'.code.toByte(), 13, 10, 26, 10)
+        assertNull(decoder(png, "application/octet-stream", DataSource.NETWORK))
     }
 
     @Test fun `an svg with no size at all is the browser's 300 x 150`() {
