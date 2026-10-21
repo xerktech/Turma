@@ -49615,6 +49615,102 @@ class TestShadowBase(unittest.TestCase):
         self.assertEqual(self.base(merge, 15), (before, None))
 
 
+class TestForgeShadowBase(TestShadowBase):
+    """XERK-2146: a GitLab MR or Azure DevOps PR has no `refs/pull/<n>/head`, so
+    its commits come from the forge's API, matched against the same real git."""
+
+    MR = "https://gitlab.example/g/r/-/merge_requests/3"
+    ADO = "https://dev.azure.com/o/p/_git/r/pullrequest/4"
+
+    def setUp(self):
+        super().setUp()
+        self.api = {}       # what each forge answers; None = the call failed
+        for name, fn in (("_mr_url_parts", lambda u: ("g/r", "3")),
+                         ("_azdo_pr_id", lambda u: "4"),
+                         ("_gitlab_get", lambda p: self.api.get("gitlab")),
+                         ("_azure_get", lambda p, q=None: self.api.get("ado"))):
+            p = mock.patch.object(ha, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.dict(ha._AZDO_PR_REF, {self.ADO: ("p", "r")})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def log(self, rev_range):
+        """The range's commits newest first, as both forges list them."""
+        out = self.git(self.dev, "log", "-z", "--format=%H%n%an%n%ae%n%aI%n%B", rev_range)
+        return [dict(zip(("sha", "name", "email", "date", "msg"), c.split("\n", 4)))
+                for c in out.split("\0") if c.strip()]
+
+    def gitlab(self, commits):
+        self.api["gitlab"] = [{"id": c["sha"], "author_name": c["name"],
+                               "author_email": c["email"], "authored_date": c["date"],
+                               "message": c["msg"]} for c in commits]
+
+    def ado(self, commits, cut=0):
+        self.api["ado"] = {"value": [
+            {"commitId": c["sha"], "author": {"name": c["name"], "email": c["email"],
+                                              "date": c["date"]},
+             "comment": c["msg"][:cut] if cut else c["msg"],
+             "commentTruncated": bool(cut)} for c in commits]}
+
+    def test_a_gitlab_fast_forward_bases_before_the_mrs_first_commit(self):
+        before = self.open_pr(3, ["f1", "f2", "f3"])
+        self.git(self.dev, "rebase", "-q", "main", "pr3")   # GitLab rebases, then fast-forwards
+        self.gitlab(self.log("main..pr3"))
+        self.git(self.dev, "switch", "-q", "main")
+        self.git(self.dev, "merge", "-q", "--ff-only", "pr3")
+        merge = self.land()
+        self.assertEqual(ha.shadow_base_commit(self.host, merge, self.MR, self.RID),
+                         (before, None))
+        # The MR's head is what landed: it stands in for the absent merge commit.
+        st = ha._summarize_mr({"state": "merged", "merge_commit_sha": None,
+                               "squash_commit_sha": None, "sha": merge})
+        self.assertEqual(st["mergeCommit"], merge)
+
+    def test_an_ado_rebase_bases_before_the_prs_first_commit(self):
+        before = self.open_pr(4, ["r1", "r2", "r3"])
+        self.ado(self.log("main..pr4"), cut=1)              # pre-rebase shas, cut messages
+        self.git(self.dev, "rebase", "-q", "main", "pr4",
+                 env={"GIT_COMMITTER_NAME": "Azure DevOps"})
+        self.git(self.dev, "switch", "-q", "main")
+        self.git(self.dev, "merge", "-q", "--ff-only", "pr4")
+        merge = self.land()
+        self.assertEqual(ha.shadow_base_commit(self.host, merge, self.ADO, self.RID),
+                         (before, None))
+        self.api["ado"]["value"].reverse()                  # either listing order
+        self.assertEqual(ha.shadow_base_commit(self.host, merge, self.ADO, self.RID),
+                         (before, None))
+
+    def test_a_squash_keeps_the_first_parent_and_a_message_mismatch_is_no_rebase(self):
+        before = self.open_pr(5, ["s1", "s2"])
+        self.gitlab(self.log("main..pr5"))
+        self.ado(self.log("main..pr5"))
+        self.git(self.dev, "merge", "-q", "--squash", "pr5")
+        self.git(self.dev, "commit", "-q", "-m", "Squashed MR !5")
+        merge = self.land()
+        for url in (self.MR, self.ADO):
+            self.assertEqual(ha.shadow_base_commit(self.host, merge, url, self.RID),
+                             (before, None))
+
+    def test_an_unreadable_or_oversized_commit_list_fails_closed(self):
+        self.open_pr(6, ["u1", "u2"])
+        self.git(self.dev, "merge", "-q", "--squash", "pr6")
+        self.git(self.dev, "commit", "-q", "-m", "Squashed MR !6")
+        merge = self.land()
+        base, why = ha.shadow_base_commit(self.host, merge, self.MR, self.RID)
+        self.assertIsNone(base)
+        self.assertIn("forge", why)
+        self.gitlab([{"sha": "a" * 40, "name": "t", "email": "t@x", "msg": "m",
+                      "date": "2026-10-01T00:00:00.000+02:00"}] * 100)  # a full page
+        self.assertIn("over", ha.shadow_base_commit(self.host, merge, self.MR, self.RID)[1])
+        self.api["gitlab"] = [{"id": "a" * 40}]                          # malformed
+        self.assertIn("forge", ha.shadow_base_commit(self.host, merge, self.MR, self.RID)[1])
+        self.ado([])
+        self.assertIn("no commits", ha.shadow_base_commit(self.host, merge, self.ADO,
+                                                          self.RID)[1])
+
+
 class TestShadowSandbox(ManagerMixin, unittest.TestCase):
     """XERK-1859: a shadow session's no-publish boundary is the OS sandbox
     (no network, read-only gitdir) plus restricted mode, not text or env."""

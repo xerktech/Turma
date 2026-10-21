@@ -9240,8 +9240,12 @@ def _summarize_mr(data):
         # review is observed as the merge status it puts the MR in (XERK-1845).
         "changesRequestedNow": detailed == "requested_changes",
     }
+    # A fast-forward merge makes no merge or squash commit: the MR's head is
+    # what landed (GitLab rebases it first when it must), so it stands in —
+    # else such an MR never names the commit that landed it (XERK-2146).
     _pr_merge_fields(out, state,
-                     data.get("merge_commit_sha") or data.get("squash_commit_sha"),
+                     data.get("merge_commit_sha") or data.get("squash_commit_sha")
+                     or data.get("sha"),
                      data.get("merged_at"))
     return out
 
@@ -19139,6 +19143,117 @@ def _commit_messages(repo, shas):
     return parts if len(parts) == len(shas) else None
 
 
+def _forge_commit(sha, name, email, date, message, cut=False):
+    """One PR commit as the forge lists it, shaped like `_commit_messages`: the
+    sha, `"<name> <<email>> <epoch>"` (lowercased) and the stripped message.
+    `cut` = the forge truncated the message (ADO's `commentTruncated`), so it
+    can only be compared as a prefix. None for an entry missing a field."""
+    ms = _ts_ms(date)
+    if not (isinstance(sha, str) and isinstance(name, str) and isinstance(email, str)
+            and isinstance(message, str) and ms is not None):
+        return None
+    return {"sha": sha.lower(), "head": f"{name} <{email}> {ms // 1000}".lower(),
+            "msg": message.replace("\r\n", "\n").strip(), "cut": bool(cut)}
+
+
+def _forge_pr_commits(pr_url):
+    """A GitLab MR's or Azure DevOps PR's commits from its forge's API, in the
+    forge's order, or None when this host cannot read them (not this host's
+    GitLab/ADO, an API failure, a malformed entry). Asks for one past the cap
+    where the API allows; GitLab pages at 100, so a full page reads as over."""
+    if MR_URL_RE.fullmatch(pr_url):
+        parts = _mr_url_parts(pr_url)
+        if not parts:
+            return None
+        proj, iid = parts
+        data = _gitlab_get(f"projects/{urllib.parse.quote(proj, safe='')}/merge_requests/"
+                           f"{iid}/commits?per_page=100")
+        if not isinstance(data, list):
+            return None
+        out = [_forge_commit(c.get("id"), c.get("author_name"), c.get("author_email"),
+                             c.get("authored_date"), c.get("message"))
+               if isinstance(c, dict) else None for c in data]
+        if len(data) >= 100 and None not in out:
+            out.append({})               # a full page may not be all: read as over the cap
+    elif AZDO_PR_URL_RE.fullmatch(pr_url):
+        pr_id = _azdo_pr_id(pr_url)
+        ref = _AZDO_PR_REF.get(pr_url) if pr_id else None
+        if pr_id and not ref and _azdo_fetch_pr(pr_url) is not None:
+            ref = _AZDO_PR_REF.get(pr_url)
+        if not ref:
+            return None
+        proj, rid = ref
+        data = _azure_get(
+            f"/{urllib.parse.quote(proj, safe='')}/_apis/git/repositories/"
+            f"{urllib.parse.quote(rid, safe='')}/pullRequests/{pr_id}/commits",
+            {"$top": SHADOW_PR_COMMITS_MAX + 1})
+        data = data.get("value") if isinstance(data, dict) else None
+        if not isinstance(data, list):
+            return None
+        out = []
+        for c in data:
+            a = c.get("author") if isinstance(c, dict) else None
+            a = a if isinstance(a, dict) else {}
+            out.append(_forge_commit(c.get("commitId"), a.get("name"), a.get("email"),
+                                     a.get("date"), c.get("comment"),
+                                     c.get("commentTruncated") is True)
+                       if isinstance(c, dict) else None)
+    else:
+        return None
+    return None if None in out else out
+
+
+def _forge_commits_landed(pr, landed, landed_msgs):
+    """Whether the forge's PR commits ARE the `landed` first-parent commits
+    (newest first), in either listing order: by sha (a fast-forward), else by
+    author, author time and message (a rebase that rewrote them)."""
+    for seq in (pr, pr[::-1]):
+        if [c["sha"] for c in seq] == landed:
+            return True
+        if landed_msgs and all(_forge_commit_matches(c, m) for c, m in zip(seq, landed_msgs)):
+            return True
+    return False
+
+
+def _forge_commit_matches(c, landed_msg):
+    head, _, msg = landed_msg.partition("\n")
+    msg = msg.strip()
+    if head.lower() != c["head"]:
+        return False
+    return msg.startswith(c["msg"]) if c["cut"] else msg == c["msg"]
+
+
+def _forge_rebase_base(repo, merge, parent, pr_url):
+    """`shadow_base_commit` for a GitLab MR or ADO PR (XERK-2146): their head
+    refs are not GitHub's, so the PR's commits come from the forge's API. When
+    the N first-parent commits ending at the single-parent merge are the PR's N
+    commits — the same shas (GitLab fast-forward) or the same authors, author
+    times and messages (a rebase that rewrote them) — the base is merge~N; a
+    squash or a one-commit PR keeps the first parent."""
+    git = ["git", "-C", repo]
+    pr = _forge_pr_commits(pr_url)
+    if pr is None:
+        return None, "could not list the PR's commits from its forge to find its base"
+    if len(pr) > SHADOW_PR_COMMITS_MAX:
+        return None, f"the PR has over {SHADOW_PR_COMMITS_MAX} commits"
+    if not pr:
+        return None, "the forge lists no commits for the PR"
+    if len(pr) == 1:
+        return parent, None
+    rc, out = run_out(git + ["rev-list", "--first-parent", f"--max-count={len(pr)}",
+                             merge, "--"])
+    landed = out.lower().split() if rc == 0 else []
+    if len(landed) != len(pr):
+        return parent, None
+    if not _forge_commits_landed(pr, landed, _commit_messages(repo, landed)):
+        return parent, None              # a squash (or not a clean rebase)
+    base = run(git + ["rev-parse", "--verify", "--quiet",
+                      f"{merge}~{len(pr)}^{{commit}}"]).lower()
+    if not SHADOW_SHA_RE.fullmatch(base):
+        return None, "the rebase-merged PR's base is not in this clone"
+    return base, None
+
+
 def shadow_base_commit(repo, merge, pr_url, shadow_id):
     """Fetch, then find the code as it was before the PR landed: `(base, None)`,
     or `(None, why)` when it cannot be placed (XERK-2136).
@@ -19153,7 +19268,8 @@ def shadow_base_commit(repo, merge, pr_url, shadow_id):
     No readable head, no PR commits off the default branch, or too many → fails.
     Residual: a rebase that does not line up (a commit dropped as already
     applied) reads as a squash and keeps the first parent, as before this.
-    A non-GitHub URL keeps the first parent."""
+    A GitLab MR or ADO PR is placed from its forge's commit list instead
+    (`_forge_rebase_base`, XERK-2146); any other URL keeps the first parent."""
     git = ["git", "-C", repo]
     num = PR_URL_PARTS_RE.search(pr_url) if PR_URL_RE.fullmatch(pr_url or "") else None
     pr_ref = f"refs/turma-shadow-pr/{shadow_id}" if num else None
@@ -19177,7 +19293,11 @@ def shadow_base_commit(repo, merge, pr_url, shadow_id):
         parents = line[1:]
         if not parents:
             return None, "the merge commit has no parent"
-        if len(parents) > 1 or not pr_ref:
+        if len(parents) > 1:
+            return parents[0], None
+        if not pr_ref:
+            if MR_URL_RE.fullmatch(pr_url) or AZDO_PR_URL_RE.fullmatch(pr_url):
+                return _forge_rebase_base(repo, merge, parents[0], pr_url)
             return parents[0], None
         head = run(git + ["rev-parse", "--verify", "--quiet", f"{pr_ref}^{{commit}}"]).lower()
         if not SHADOW_SHA_RE.fullmatch(head):
