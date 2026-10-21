@@ -343,9 +343,11 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   - **A wrapped label is rejoined; the AskUserQuestion picker is refused** (XERK-2150).
     - A wrap and a picker description sit on the same label-column indent, and a label that fills
       the pane makes them identical row by row — no per-line rule can split them.
-    - The picker is refused whole: its numbering continues past the run before a blank ("4. Type
-      something." / rule / "5. Chat about this"). Its answer comes from `ask.py`; its rows are no
-      digits to send.
+    - The picker is refused whole: below the run, before a blank, a numbered option follows a rule
+      ("4. Type something." / rule / "5. Chat about this"). Its answer comes from `ask.py`; its rows
+      are no digits to send.
+    - Never refuse on "N+1 below the run" without the rule: a dialog an unjoined wrap cut short has
+      that shape too, and a None there lets the pane-typing guards type into a live dialog.
     - A line is a wrap only if its first word would not have fit after the line above (width =
       widest captured line). Joined with no space only when both sides of the break hold a "/".
     - Tests: `TestParsePanePrompt.test_wrapped_option_label`, `test_wrapped_path_label`,

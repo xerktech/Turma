@@ -14159,21 +14159,29 @@ def _pane_cells(text):
     return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
 
 
-def _pane_numbering_continues(lines, idx, number):
-    """Whether option `number` sits below line `idx` in the same block (XERK-2150).
+def _pane_numbering_continues(lines, idx):
+    """Whether a numbered option follows a rule below line `idx`, before any
+    blank (XERK-2150).
 
     The native AskUserQuestion picker splits its list with a rule — "4. Type
     something." / ──── / "5. Chat about this" — while a permission or plan
-    dialog's last option is followed by a blank line. So a run whose numbering
-    carries on past it, before any blank, is part of the picker, whose answer
-    comes from ask.py and whose rows are not digits to send. Its descriptions
-    can't be told from wrapped labels line by line: a label that fills the pane
-    makes the description's first word look like it overflowed."""
+    dialog's last option is followed by a blank line. So a run (or the start of
+    one an option's description cut short) whose list carries on past a rule is
+    part of the picker, whose answer comes from ask.py
+    and whose rows are not digits to send. Its descriptions can't be told from
+    wrapped labels line by line: a label that fills the pane makes the
+    description's first word look like it overflowed. Without a rule this is
+    never refused: a dialog cut short by an unjoined wrap still reads as one,
+    which keeps the pane-typing guards off it."""
+    ruled = False
     for line in lines[idx:]:
         if not line.strip():
             return False
+        if PANE_PROMPT_RULE_RE.match(line):
+            ruled = True
+            continue
         om = PANE_PROMPT_OPTION_RE.match(line)
-        if om and int(om.group(2)) == number:
+        if ruled and om:
             return True
     return False
 
@@ -14275,7 +14283,7 @@ def parse_pane_prompt(cap, face=False):
             want -= 1
         if want != 0 or len(rows) < 2:
             continue                 # not 1..N, or fewer than two options
-        if _pane_numbering_continues(lines, rows[0][1] + 1, int(m.group(2)) + 1):
+        if _pane_numbering_continues(lines, rows[0][1] + 1):
             continue                 # only part of a longer list (the picker)
         rows.reverse()
         start = rows[0][0]
