@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.os.Looper
 import android.webkit.MimeTypeMap
 import androidx.test.core.app.ApplicationProvider
+import coil.ImageLoader
 import coil.request.ErrorResult
 import coil.request.ImageRequest
 import coil.request.ImageResult
@@ -50,10 +51,17 @@ class ServedContentTypeTest {
 
     @After fun tearDown() = server.shutdown()
 
-    private fun load(body: Buffer, type: String?, name: String): ImageResult {
-        server.enqueue(MockResponse().setBody(body).apply { if (type != null) setHeader("Content-Type", type) })
-        val loader = app.newImageLoader()
-        val request = ImageRequest.Builder(app).data(server.url("/$name").toString()).size(100, 100).build()
+    private fun load(body: Buffer, type: String?, name: String, noStore: Boolean = false): ImageResult {
+        server.enqueue(MockResponse().setBody(body).apply {
+            if (type != null) setHeader("Content-Type", type)
+            // no-store: Coil skips its disk cache and reads the BODY's type, not the header.
+            if (noStore) setHeader("Cache-Control", "no-store")
+        })
+        return fetch(app.newImageLoader(), server.url("/$name").toString())
+    }
+
+    private fun fetch(loader: ImageLoader, url: String): ImageResult {
+        val request = ImageRequest.Builder(app).data(url).size(100, 100).build()
         // Coil's execute() hops to the main thread, which is this test's: run it on
         // another and pump the main looper until it answers.
         val result = CompletableFuture<ImageResult>()
@@ -69,7 +77,8 @@ class ServedContentTypeTest {
     private var n = 0
 
     // A fresh URL per load: the disk cache outlives a loader.
-    private fun svgAs(type: String?) = load(Buffer().writeUtf8(svg), type, "x${++n}.svg")
+    private fun svgAs(type: String?, noStore: Boolean = false) =
+        load(Buffer().writeUtf8(svg), type, "x${++n}.svg", noStore)
 
     @Test fun `an svg served as image svg+xml renders`() {
         assertTrue(svgAs("image/svg+xml") is SuccessResult)
@@ -80,7 +89,26 @@ class ServedContentTypeTest {
         assertTrue(svgAs("text/plain") is ErrorResult)
         assertTrue(svgAs("text/plain; charset=utf-8") is ErrorResult)
         assertTrue(svgAs(null) is ErrorResult)
+        // Empty or unparseable: OkHttp gives the body no type, so Coil guessed from the URL.
+        for (bad in listOf("", "bogus", "svg")) assertTrue("[$bad]", svgAs(bad) is ErrorResult)
         assertTrue(svgAs("application/xml") is ErrorResult)
+    }
+
+    @Test fun `an uncached svg served as text plain or with no type is broken too`() {
+        assertTrue(svgAs("text/plain", noStore = true) is ErrorResult)
+        assertTrue(svgAs(null, noStore = true) is ErrorResult)
+        assertTrue(svgAs("image/svg+xml", noStore = true) is SuccessResult)
+    }
+
+    @Test fun `an svg the old loader cached as text plain is not served from that cache`() {
+        // The pre-fix loader: Coil's default disk cache, no interceptor.
+        val old = ImageLoader.Builder(app).components { add(SafeSvgDecoder.Factory()) }.build()
+        val cached = { MockResponse().setBody(svg).setHeader("Content-Type", "text/plain").setHeader("Cache-Control", "max-age=3600") }
+        server.enqueue(cached())
+        server.enqueue(cached())
+        val url = server.url("/old.svg").toString()
+        assertTrue(fetch(old, url) is SuccessResult) // the bug, as it was cached
+        assertTrue(fetch(app.newImageLoader(), url) is ErrorResult)
     }
 
     @Test fun `a png served as text plain still renders`() {

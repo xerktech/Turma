@@ -34,6 +34,7 @@ import com.xerktech.turma.core.svgZeroArea
 import kotlinx.coroutines.runInterruptible
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.asResponseBody
 import okio.Buffer
@@ -434,7 +435,8 @@ private class SvgDrawable(private val bitmap: Bitmap, private val w: Int, privat
 
 /**
  * Keeps Coil from guessing an image's type from its URL (XERK-2109). Coil's
- * `HttpUriFetcher` takes a response served as text/plain, or with no Content-Type, to
+ * `HttpUriFetcher` takes a response served as text/plain, or with no (or an
+ * unparseable) Content-Type, to
  * be whatever its extension says — an `.svg` URL then reads as image/svg+xml and
  * renders, where a browser shows it broken. Such a response is relabelled
  * application/octet-stream, which Coil passes through as it is, so [SafeSvgDecoder]
@@ -443,8 +445,10 @@ private class SvgDrawable(private val bitmap: Bitmap, private val w: Int, privat
 object ServedContentType : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
         val response = chain.proceed(chain.request())
-        val type = response.header("Content-Type")
-        val guessed = type == null || type.trim().startsWith("text/plain", ignoreCase = true)
+        // Coil guesses when the type is text/plain or none — and an empty or unparseable
+        // header IS none to it (OkHttp gives the body no type).
+        val type = response.header("Content-Type")?.toMediaTypeOrNull()
+        val guessed = type == null || (type.type == "text" && type.subtype == "plain")
         val body = response.body
         if (!guessed || body == null) return response
         // Coil reads the BODY's type on a fetch and the header on a disk-cache hit: both change.

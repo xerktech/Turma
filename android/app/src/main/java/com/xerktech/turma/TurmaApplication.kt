@@ -3,6 +3,7 @@ package com.xerktech.turma
 import android.app.Application
 import coil.ImageLoader
 import coil.ImageLoaderFactory
+import coil.disk.DiskCache
 import com.xerktech.turma.push.Notifications
 import com.xerktech.turma.push.PushRegistrar
 import okhttp3.OkHttpClient
@@ -20,6 +21,13 @@ class TurmaApplication : Application(), ImageLoaderFactory {
     override fun newImageLoader(): ImageLoader =
         ImageLoader.Builder(this)
             .okHttpClient { OkHttpClient.Builder().addInterceptor(ServedContentType).build() }
+            // A cache of its own: entries the old loader stored keep the type it didn't
+            // relabel, so a text/plain .svg would still render from them. Built lazily on
+            // the first fetch (off the main thread), which is where the old one is dropped.
+            .diskCache {
+                cacheDir.resolve("image_cache").deleteRecursively()
+                DiskCache.Builder().directory(cacheDir.resolve("image_cache_served_type")).build()
+            }
             .components { add(SafeSvgDecoder.Factory()) }
             .crossfade(true)
             .build()

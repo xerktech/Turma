@@ -78,6 +78,8 @@ class SafeSvgDecoderTest {
         assertEquals(300 to 30, intrinsic("<svg $ns width=\"50%\" height=\"30\"/>"))
         // Chrome: 10em 160, 10mm 38, 1in 96.
         assertEquals(160 to 150, intrinsic("<svg $ns width=\"10em\"/>"))
+        // ex: half an em (Chrome's follows the font's x-height, 9px headless).
+        assertEquals(80 to 150, intrinsic("<svg $ns width=\"10ex\"/>"))
         assertEquals(38 to 96, intrinsic("<svg $ns width=\"10mm\" height=\"1in\"/>"))
     }
 
