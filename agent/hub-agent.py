@@ -14376,14 +14376,11 @@ def _pane_unglue_options(lines):
 # with "Waiting for user confirmation…" (G0), so a real dialog shows none.
 # Every qwen mode names itself before it ("Ask permissions", "Auto mode" in
 # 0.22.3, XERK-2200), so the spaced hint alone is the footer: Claude Code
-# writes "shift+tab" unspaced. Under ~40 columns qwen cuts it with "…"
-# ("Auto mode (s…" at 17 columns), so any start of it ending its line in "…"
-# counts — at line end only, as the footer always is, since "(s…" alone is short.
-_QWEN_FOOTER_HINT = "shift + tab to cycle"
-QWEN_PANE_FOOTER_RE = re.compile(
-    r"(?m)\S \((?:" + re.escape(_QWEN_FOOTER_HINT) + r"\)|(?:"
-    + "|".join(re.escape(_QWEN_FOOTER_HINT[:n]) for n in range(len(_QWEN_FOOTER_HINT), 0, -1))
-    + r")[ \t]*…[ \t]*$)")
+# writes "shift+tab" unspaced. A footer qwen CUTS on a narrow pane ("Auto mode
+# (s…", or behind a task pill) is not read: a dialog row ellipsized the same
+# way would then hide a live dialog (QA) — a follow-up needs the footer's
+# position, not its text.
+QWEN_PANE_FOOTER_RE = re.compile(r"\S \(shift \+ tab to cycle\)")
 # Claude Code's exit toast, which REPLACES the mode footer for ~0.5-1s after a
 # Ctrl-C (or Ctrl-D) on an idle composer (2.1.306: "  Press Ctrl-C again to
 # exit"). It rides the composer like the footer it hides, so it vetoes a dialog

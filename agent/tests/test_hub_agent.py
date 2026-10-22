@@ -23507,15 +23507,10 @@ class TestParsePanePrompt(unittest.TestCase):
         self.assertIsNone(ha.parse_pane_prompt(cap))
         self.assertIsNotNone(ha.parse_pane_prompt(cap.replace("Auto mode (shift + tab to cycle)", "")))
         self.assertFalse(ha.QWEN_PANE_FOOTER_RE.search("⏵⏵ auto mode on (shift+tab to cycle)"))
-        # Under ~40 columns qwen cuts it with an ellipsis (real 0.22.3 frames).
-        for cut in ("Auto mode (s…", "Auto mode (sh…", "Auto mode (shift + …",
-                    "Auto mode (shift + tab to…"):
-            self.assertIsNone(ha.parse_pane_prompt(
-                cap.replace("Auto mode (shift + tab to cycle)", cut)), cut)
-        self.assertFalse(ha.QWEN_PANE_FOOTER_RE.search("⏵⏵ auto (shift+tab…"))
-        self.assertTrue(ha.QWEN_PANE_FOOTER_RE.search("  Auto mode (s…"))
-        # A cut hint is a footer only at the end of its line.
-        self.assertFalse(ha.QWEN_PANE_FOOTER_RE.search("see (s… more"))
+        # A dialog row qwen ellipsized ("Allow execution of: 'go (s…") is no
+        # footer: reading cut hints hid a live approval dialog (QA).
+        self.assertFalse(ha.QWEN_PANE_FOOTER_RE.search("   Allow execution of: 'go (s…"))
+        self.assertFalse(ha.QWEN_PANE_FOOTER_RE.search("   Allow execution of: 'go (shift + …"))
 
     def test_an_8_column_footer_cut_to_its_first_letters_vetoes(self):
         # XERK-2200: at 8 columns the footer reads "⏸ ma"; the composer rule is
