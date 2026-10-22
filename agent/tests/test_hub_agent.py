@@ -42093,17 +42093,41 @@ class TestParseTicketTriage(unittest.TestCase):
 
 
 class TestTicketTriagePrompt(unittest.TestCase):
-    """XERK-1568: a rollup ticket (`[Rollup] <repo>: low-severity findings`,
-    labelled `rollup`) is a findings list, never work. The hub gates it out of the
-    auto stream on its own; the classifier marks it not actionable too (belt and
-    braces), so the instruction must say so and the ticket line must carry what
-    it keys on."""
+    """A rollup ticket (`[Rollup] <repo>: low-severity findings`, labelled
+    `rollup`) is work the auto stream starts like any other, so the classifier
+    must judge it on its findings, never mark it not actionable by rule."""
 
-    def test_the_instruction_marks_a_rollup_ticket_not_actionable(self):
+    def test_the_instruction_judges_a_rollup_ticket_as_work(self):
         text = ha.TICKET_TRIAGE_INSTRUCTION
         self.assertIn("[Rollup]", text)
         self.assertIn("labelled 'rollup'", text)
-        self.assertRegex(text, r"ROLLUP ticket[^\n]*\n?[^\n]*actionable is always false")
+        self.assertNotIn("actionable is always false", text)
+        self.assertRegex(text, r"ROLLUP ticket[^\n]*\n?[^\n]*\n?[^\n]*actionable is true unless it is blocked")
+
+    def test_a_rollup_triaged_under_the_old_rule_re_triages(self):
+        # Its fingerprint carries the rule version; a plain ticket's does not.
+        roll = {"key": "ENG-7", "summary": "[Rollup] Turma: low-severity findings",
+                "labels": ["rollup"]}
+        old = ha._triage_fingerprint([roll["summary"], "", "", "rollup"])
+        self.assertNotEqual(ha._ticket_fingerprint(roll), old)
+        plain = {"key": "ENG-8", "summary": "Fix it", "labels": ["Turma"]}
+        self.assertEqual(ha._ticket_fingerprint(plain),
+                         ha._triage_fingerprint(["Fix it", "", "", "Turma"]))
+
+    def test_is_rollup_ticket_mirrors_the_hub(self):
+        self.assertTrue(ha._is_rollup_ticket({"labels": ["Turma", "Rollup"]}))
+        self.assertTrue(ha._is_rollup_ticket({"summary": "  [rollup] x"}))
+        self.assertTrue(ha._is_rollup_ticket({"summary": "[ROLLUP] x"}))
+        # JS's whitespace set, not Python's: a BOM trims, U+001C/U+0085 do not.
+        self.assertTrue(ha._is_rollup_ticket({"summary": "\ufeff[Rollup] x"}))
+        self.assertTrue(ha._is_rollup_ticket({"labels": ["\u3000rollup "]}))
+        self.assertFalse(ha._is_rollup_ticket({"summary": "\x1c[Rollup] x"}))
+        self.assertFalse(ha._is_rollup_ticket({"summary": "\x85[Rollup] x"}))
+        self.assertFalse(ha._is_rollup_ticket({"labels": ["\x1frollup"]}))
+        self.assertFalse(ha._is_rollup_ticket({"labels": ["rollups"], "summary": "Fix"}))
+        self.assertFalse(ha._is_rollup_ticket({"summary": "Track the [Rollup] ticket"}))
+        self.assertFalse(ha._is_rollup_ticket({"summary": "[Rollups] x"}))
+        self.assertFalse(ha._is_rollup_ticket(None))
 
     def test_the_prompt_carries_the_rule_and_the_rollup_markers(self):
         t = {"key": "ENG-7", "summary": "[Rollup] Turma: low-severity findings",

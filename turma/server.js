@@ -3075,12 +3075,12 @@ function isEpicOrEpicChild(t) {
     || (typeof t.epicKey === "string" && t.epicKey)));
 }
 // A ROLLUP ticket (XERK-1568) is one per repo collecting low-severity findings
-// (`[Rollup] <repo>: low-severity findings`, labelled `rollup`): a list, never
-// work, so nothing hands-off may start a session on it or merge for it. Either
+// (`[Rollup] <repo>: low-severity findings`, labelled `rollup`). The org auto
+// stream starts and auto-merges it like any ticket, under the triage policy;
+// only an armed EPIC RUN skips a rollup child (its start and its merge). Either
 // marker is enough — the label (case-insensitive; `labels` is coerced to strings
 // by normalizeJira) or the `[Rollup]` summary prefix — so a ticket that lost one
-// of them is still caught. Consulted wherever isEpicOrEpicChild is, plus the
-// drain's auto branch and the epic run's child start.
+// of them is still caught.
 function isRollupTicket(t) {
   if (!t) return false;
   if (Array.isArray(t.labels) && t.labels.some(
@@ -14422,13 +14422,6 @@ function drainTicketQueue() {
       drop("its repo is now ignore-tier");
       continue;
     }
-    // XERK-1568: the ticket became a rollup (labelled `rollup` / retitled
-    // `[Rollup] …`) while this AUTO entry waited. The sweep won't re-queue it, so
-    // drop with no churn, like a retiered repo above. A MANUAL entry drains.
-    if (e.source === "auto" && isRollupTicket(row)) {
-      drop("it is a rollup ticket");
-      continue;
-    }
     // XERK-485 [E]: the model re-triaged this ticket while it waited and the new
     // assessment says held/rejected (actionable !== true) or names a duplicate.
     // An AUTO entry drops without churn (the sweep's gate won't re-queue it —
@@ -15177,7 +15170,8 @@ function ticketQueueOrder(rows) {
 // order, not here. Dropped silently at the filter (spending no attempt) exactly
 // like a repo-less ticket; the shared content gate rejects the same set, so the
 // two stay in agreement (XERK-550 cross-check). A rollup ticket (XERK-1568) is
-// dropped the same way: a list, not work.
+// ordinary work here: it rides the same triage gates and org policy as any
+// ticket (only an armed epic run still skips a rollup child).
 function autoStartCandidates(siteKey, rows) {
   return ticketRowsForSite(rows, siteKey)
     .map((r) => {
@@ -15185,8 +15179,7 @@ function autoStartCandidates(siteKey, rows) {
       return { t: r.row, repo, key: triageSortKey(r.row, repo) };
     })
     .filter((c) => c.t && c.t.key && c.t.statusCategory === "todo"
-      && c.repo && !isRepoIgnored(c.repo) && !isEpicOrEpicChild(c.t)
-      && !isRollupTicket(c.t))
+      && c.repo && !isRepoIgnored(c.repo) && !isEpicOrEpicChild(c.t))
     .sort((a, b) => {
       for (let i = 0; i < a.key.length; i++) {
         if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
@@ -15641,10 +15634,6 @@ function autoStartContentGate(siteKey, t, repo) {
   // the epic run drives its children in dependency order. Kept in lock-step with
   // the autoStartSweep candidate filter above (the XERK-550 cross-check pins it).
   if (isEpicOrEpicChild(t)) return { kind: "epic", reason: "epic or epic child (driven by the epic run)" };
-  // XERK-1568: a rollup ticket is a list of findings, never work. Checked BEFORE
-  // the operator verdict so an `approve` cannot force it into the auto stream or
-  // into auto-merge/auto-close (both read this gate through autoMergeSession).
-  if (isRollupTicket(t)) return { kind: "rollup", reason: "rollup ticket (a findings list, not work)" };
   const action = ticketTriageAction(siteKey, t.key);
   if (action === "hold" || action === "reject") {
     return { kind: "triaged", reason: `${action} by triage` };
