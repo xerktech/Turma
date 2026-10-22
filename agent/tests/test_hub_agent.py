@@ -23414,7 +23414,8 @@ class TestParsePanePrompt(unittest.TestCase):
                             # with a space mid-line and trims it at line end.
                             ("❤️", 2), ("❤️ X", 3), ("done ✔️", 7),
                             ("1️ ⃣", 2),
-                            ("☝🏽", 2), ("☝🏽 x", 4), ("✔︎ x", 3)):
+                            ("☝🏽", 2), ("☝🏽 x", 4), ("✔︎ x", 3),
+                            ("🕵🏽\u200d♂️ x", 4)):
             self.assertEqual(ha._pane_cells(text), cells, text)
 
     def test_the_exit_toast_vetoes_like_the_footer(self):
