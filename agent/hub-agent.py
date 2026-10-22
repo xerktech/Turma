@@ -9854,7 +9854,7 @@ def _open_pr_message(branch, work_desc, again=False):
         f"and there is no open pull request for it. {retry}Deliver it now: "
         f"commit any uncommitted changes, push the branch, and open a PR "
         f"(title: ticket + one-line summary; body: what changed, why, and how "
-        f"to verify). Then watch that check goes green before you stop. If "
+        f"to verify). Don't watch its CI: Turma messages you with the result. If "
         f"this work is not deliverable as a PR — it is a question, a doc note, "
         f"or it belongs in another session's change — say so in one sentence "
         f"instead of opening a PR."
