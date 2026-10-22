@@ -11226,6 +11226,13 @@ class TestExtremePaneSizes(unittest.TestCase):
         self.assertFalse(ha._pane_cut_dialog_up(cap))
         self.assertTrue(ha._pane_cut_dialog_up(cap.replace(rule, "  " + rule)))
 
+    def test_the_opening_rule_read_needs_the_edge(self):
+        # Edgeless, the area already starts below the dialog's box rule, so a
+        # second rule there says nothing; only the "❯ 1." read decides.
+        rule = "  " + "─" * 18
+        cap = "   Plan text here\n" + rule + "\n" + rule + "\n   Claude has\n   written a plan\n"
+        self.assertFalse(ha._pane_cut_dialog_up(cap))
+
     def test_the_waiting_line_counts_only_at_the_bottom(self):
         cap = "  ⠏ Waiting for user confirmation...\n  more reply\n  text\n"
         self.assertFalse(ha._qwen_waiting_up(cap))

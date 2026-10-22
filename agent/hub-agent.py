@@ -19205,7 +19205,7 @@ def _qwen_waiting_up(cap):
         return False
     last = [line for line in lines if line.strip()][-2:]
     # At 14 columns the line wraps mid-word ("⠏ Waiting fo" / "r…"): read the
-    # last two rows joined as well (that form needs "Waiting for" whole).
+    # last two rows joined as well.
     return any(_QWEN_WAITING_RE.match(line) for line in last + ["".join(last)])
 
 
