@@ -10862,9 +10862,18 @@ function normalizeSessions(payload) {
   // A session's `id` keys everything the hub does with it (alerts, attention,
   // the roster, routes); one that is not a string/number made every later
   // /api/agents build throw, freezing the fleet for every client, and it
-  // survived a restart via state.json (XERK-2195). Such a session is dropped.
+  // survived a restart via state.json (XERK-2195). Such a session is dropped. Runs
+  // BEFORE the prototype-name filter below, whose Object.hasOwn would throw on it.
   const idOk = (s) => !("id" in s) || typeof s.id === "string" || typeof s.id === "number";
   if (!payload.sessions.every(idOk)) payload.sessions = payload.sessions.filter(idOk);
+  // DROP a session whose id names an Object.prototype member (XERK-2193). The
+  // hub keys plain-object maps by session id (heartbeatAlerts' alerts.sessions),
+  // so an id of "__proto__" resolved to Object.prototype itself and every
+  // per-session write after it polluted every object in the hub. No real
+  // session is named "__proto__" or "toString", so dropping loses nothing.
+  if (payload.sessions.some((s) => Object.hasOwn(Object.prototype, s.id))) {
+    payload.sessions = payload.sessions.filter((s) => !Object.hasOwn(Object.prototype, s.id));
+  }
   for (const s of payload.sessions) {
     // SessionInfo's String fields (and TicketRef's below): an object/array/
     // boolean is decode-fatal on Android, and the hub `String()`s or templates

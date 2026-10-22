@@ -14280,6 +14280,53 @@ def parse_pane_mode(cap):
 # accepted — neither glyph occurs in ordinary conversation text, so the cursor
 # requirement stays the strong guard against a false positive on a numbered list.
 PANE_PROMPT_OPTION_RE = re.compile(r"^\s*([❯›]\s+)?(\d+)\.\s+(\S.*?)\s*$")
+# At 12-22 columns Claude Code drops the space after the number ("3.Yes,",
+# XERK-2180). A row shaped so is taken as an option only in the cursor's own
+# run, at the cursor row's number column (`_pane_unglue_options`), never by its
+# text and never by a column some other row on screen uses: a label wrapped
+# mid-path puts "3.b/…" or "3.Final from this" at a row start, and a numbered
+# list in a reply can share that row's column — read as option 3 it had Turma
+# send a digit that picked a different option (QA, three passes). Never a digit
+# after the dot (a decimal).
+_PANE_GLUED_OPTION_RE = re.compile(r"^(\s*([❯›]\s+)?)(\d+)\.(?=[^\s\d])")
+
+
+def _pane_unglue_options(lines):
+    """`lines` with a space put back after each glued option number
+    (`_PANE_GLUED_OPTION_RE`) in a cursor's option run, so
+    `PANE_PROMPT_OPTION_RE` reads it.
+
+    The run is walked out from each row carrying the ❯/› cursor and a number,
+    over rows indented at least to that number's column (options sit at it,
+    their wrapped label rows deeper), stopping at a blank or a shallower row —
+    the question and the detail above it are never touched. Only a glued row
+    whose number sits at the cursor's column is unglued; one leading space
+    goes for the one added, so the label keeps the column its wrapped rows are
+    indented to (`_pane_option_wrap_end`)."""
+    out = None
+    for c, line in enumerate(lines):
+        m, g = PANE_PROMPT_OPTION_RE.match(line), _PANE_GLUED_OPTION_RE.match(line)
+        if m and m.group(1):
+            col = m.start(2)
+        elif g and g.group(2):
+            col = g.start(3)
+        else:
+            continue
+        for step in (-1, 1):
+            k = c
+            while 0 <= k < len(lines):
+                row = lines[k]
+                if k != c and (not row.strip() or len(row) - len(row.lstrip()) < col):
+                    break
+                g = _PANE_GLUED_OPTION_RE.match(row)
+                if g and g.start(3) == col:
+                    out = out or list(lines)
+                    cut = 1 if row[:1] == " " else 0
+                    out[k] = row[cut:g.end()] + " " + row[g.end():]
+                k += step
+    return out or lines
+
+
 # Qwen's composer footer (idle: "⏸ Ask permissions (shift + tab to cycle)";
 # busy adds "Enter to steer · Ctrl+Q to queue ·" ahead of it). Like Claude's
 # PANE_MODE_RE it means the composer is live, so its presence below a numbered
@@ -14507,7 +14554,7 @@ def parse_pane_prompt(cap, face=False):
     # this only ever removes trailing whitespace there (a no-op — every check
     # below already .strip()s). NOT the horizontal rule glyphs (─━ etc), which a
     # legitimate rule/detail line is made of.
-    lines = [_PANE_SCROLLBAR_RE.sub("", l) for l in cap.splitlines()]
+    lines = _pane_unglue_options([_PANE_SCROLLBAR_RE.sub("", l) for l in cap.splitlines()])
     widest = None                    # the pane's width, measured on first need
     edges = None                     # overlay edge rows, read on first need
     area = _pane_prompt_edges(lines)  # the bottom area's top edge (tip rows too)
@@ -18911,6 +18958,7 @@ def _pane_cut_dialog_up(cap):
     if edge is None:
         return False
     area = lines[edge + 1:]
+    options = _pane_unglue_options(area)   # read for "❯ 1." only
     text = "\n".join(area)
     if (any(line.startswith("❯") or _COMPOSER_EDGE_RULE_RE.match(line) for line in area)
             or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
@@ -18923,7 +18971,7 @@ def _pane_cut_dialog_up(cap):
         return True
     filled = [k for k, line in enumerate(area) if line.strip()]
     for n, k in enumerate(reversed(filled)):
-        m = PANE_PROMPT_OPTION_RE.match(area[k])
+        m = PANE_PROMPT_OPTION_RE.match(options[k])
         if m:
             break
         if n >= _PANE_CUT_OPTION_WRAP_LINES or not area[k][:1].isspace():
@@ -25287,10 +25335,14 @@ def _model_switch_landed(before, after, label):
 def _model_picker_open(cap):
     """Whether the /model picker is drawn: its rows parse, no rule follows its
     heading (the composer, which the picker replaces, is boxed in rules), and
-    no composer footer is on screen — nor the exit toast or a width-cut
-    footer standing in for it (XERK-2171). Its own key-hint footer is not
-    required — a narrow pane pushes it off-screen (40x45 wraps it off,
-    XERK-2148)."""
+    no composer footer is on screen. Its own key-hint footer is not required —
+    a narrow pane pushes it off-screen (40x45 wraps it off, XERK-2148).
+
+    The exit toast and a width-cut footer (XERK-2171) need no check of their
+    own here: both are read below the pane's LAST rule, and with no rule in the
+    region that rule sits above the heading, so what is below it holds the
+    picker's rows — never the toast alone, and a cut footer drawn under the
+    composer brings the composer's rule into the region (XERK-2180)."""
     region = _model_picker_region(cap)
     if not region or not parse_model_picker(cap)[0]:
         return False
@@ -25299,12 +25351,9 @@ def _model_picker_open(cap):
     # Footers are looked for below the heading only: a composer's footer sits
     # there whenever one is drawn, while a conversation line above the picker
     # that merely reads like one ("! for shell mode") must not hide it.
-    # The toast / a cut footer is read below the pane's LAST rule, as
-    # everywhere (`_pane_composer_tail_up`).
     text = "\n".join(region)
     return not (PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
-                or PANE_SHELL_FOOTER_RE.search(text)
-                or _pane_composer_tail_up(_pane_lines(cap)))
+                or PANE_SHELL_FOOTER_RE.search(text))
 
 
 def _model_names_row(name, label):
@@ -31263,8 +31312,16 @@ class SessionManager:
         then drop the run's local branch. True when it did work this beat — the
         caller stops there, so a beat pays for one worktree removal at most."""
         terminal = r.get("state") in ("graded", "failed")
-        for k in ("runSid", "gradeSid"):
-            sid = r.get(k)
+        # A session the record never learned: the manager stopped inside the
+        # run's spawn(), after the session was saved but before `runSid` was,
+        # so the run reloads as a lost placement (XERK-2180). Its record (live,
+        # or closed by an operator's kill) still names the run (`shadow.id`).
+        known = (r.get("runSid"), r.get("gradeSid"))
+        orphans = [s.get("id") for s in self.registry + self.closed
+                   if isinstance(s.get("shadow"), dict) and s["shadow"].get("id") == rid
+                   and s.get("id") not in known] if terminal else []
+        for k, sid in [("runSid", r.get("runSid")), ("gradeSid", r.get("gradeSid"))] + [
+                ("orphan", sid) for sid in orphans]:
             if k == "gradeSid" and not terminal:
                 continue
             if sid and self._find(sid):

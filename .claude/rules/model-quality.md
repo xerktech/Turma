@@ -197,6 +197,9 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     A placing run is saved as a `_placing` marker in `shadow-runs.json` before the command is
     acked; a restart loads it as a `failed` run (`SHADOW_PLACING_LOST`), which a re-delivered
     `spawnShadow` may still place (XERK-2148). Test: `test_a_restart_mid_placement_*`.
+  - A restart inside the run's `spawn()` leaves a session the record never named: once the run
+    is terminal, `_reap_shadow` also deletes any session whose `shadow.id` is the run's
+    (XERK-2180). The hub drops a shadow row's `endedAt` while it reads running/grading again.
   - **Never a `ticket` block on either session** (and `_maybe_adopt_ticket` refuses a shadow), so
     no ticket sweep — auto-stop on Done, auto-merge, close-ticket, routing — acts on it. The
     hub raises no alert for a `shadow` session and lists it in no peer roster.

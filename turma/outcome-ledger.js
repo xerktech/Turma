@@ -656,10 +656,19 @@ function observeShadows(reports, now = Date.now()) {
     const actual = modelFamily(o.modelActual);
     if (actual) { next.model = actual; next.modelKnown = true; }
     if (SHADOW_STATES.has(o.state) && next.shadowState !== "graded") next.shadowState = o.state;
+    // A run failed by a placement lost to an agent restart can be placed again
+    // on re-delivery (XERK-2180): its times are the new attempt's, not the lost
+    // one's. So a failed row takes a later start, a running one has no end, and
+    // a failed one takes a later end. A graded row's times are final.
     const started = timeOf(o.startedAt);
-    if (started && !next.startedAt) next.startedAt = started;
+    if (started && (!next.startedAt
+        || (prev && prev.shadowState === "failed" && started > next.startedAt))) {
+      next.startedAt = started;
+    }
     const ended = timeOf(o.endedAt);
-    if (ended && !next.endedAt) next.endedAt = ended;
+    if (next.shadowState === "running" || next.shadowState === "grading") delete next.endedAt;
+    else if (ended && (!next.endedAt
+        || (next.shadowState === "failed" && ended > next.endedAt))) next.endedAt = ended;
     if (!next.grade) {
       const grade = sanitizeGrade(o.grade);
       if (grade) { next.grade = grade; next.shadowState = "graded"; }

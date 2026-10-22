@@ -21148,6 +21148,27 @@ test("http: spawn onto local carries localModel + localContext (XERK-489)", asyn
   assert.equal("localContext" in cmd2, false);
 });
 
+test("XERK-2193: a session id naming an Object.prototype member is dropped, so no beat pollutes it", async () => {
+  // A non-string id counts too: ["__proto__"] keys a plain object as "__proto__".
+  const p = { device: "h", sessions: [{ id: "__proto__" }, { id: ["__proto__"] }, { id: "constructor" },
+    { id: "toString" }, { id: "ok" }] };
+  hub.normalizeRecord(p);
+  assert.deepEqual(p.sessions.map((s) => s.id), ["ok"]);
+  // End to end: a real beat with such sessions must leave the shared prototypes untouched.
+  const snap = () => [Object.prototype, Object].map((o) => Object.getOwnPropertyNames(o).sort().join());
+  const before = snap();
+  const r = await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: "proto2193", sessions: [
+      { id: "__proto__", status: "running", session: {} },
+      { id: ["__proto__"], status: "running", session: {} },
+      { id: "constructor", status: "running", session: {} },
+    ],
+  } });
+  assert.equal(r.status, 200);
+  assert.deepEqual(snap(), before, "a session id wrote onto Object.prototype or Object");
+  assert.deepEqual(agents.proto2193.sessions, []);
+});
+
 test("normalizeSessions coerces the per-session local model fields (XERK-489)", () => {
   // localModelName is String? and localModelContext is Int? on Android, which
   // decodes /api/agents atomically — a wrong-typed one from a rogue agent must
