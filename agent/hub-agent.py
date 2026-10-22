@@ -14376,8 +14376,13 @@ def _pane_unglue_options(lines):
 # with "Waiting for user confirmation…" (G0), so a real dialog shows none.
 # Every qwen mode names itself before it ("Ask permissions", "Auto mode" in
 # 0.22.3, XERK-2200), so the spaced hint alone is the footer: Claude Code
-# writes "shift+tab" unspaced.
-QWEN_PANE_FOOTER_RE = re.compile(r"\S \(shift \+ tab to cycle\)")
+# writes "shift+tab" unspaced. Under ~40 columns qwen cuts it with "…"
+# ("Auto mode (sh…"), so any 2+ character start of it ending in "…" counts.
+_QWEN_FOOTER_HINT = "shift + tab to cycle"
+QWEN_PANE_FOOTER_RE = re.compile(
+    r"\S \((?:" + re.escape(_QWEN_FOOTER_HINT) + r"\)|(?:"
+    + "|".join(re.escape(_QWEN_FOOTER_HINT[:n]) for n in range(len(_QWEN_FOOTER_HINT), 1, -1))
+    + r")\s*…)")
 # Claude Code's exit toast, which REPLACES the mode footer for ~0.5-1s after a
 # Ctrl-C (or Ctrl-D) on an idle composer (2.1.306: "  Press Ctrl-C again to
 # exit"). It rides the composer like the footer it hides, so it vetoes a dialog
@@ -14471,6 +14476,12 @@ PANE_DIALOG_MARGIN = 4
 # draws by) makes two cells wide: "☝x" is 3 cells in tmux 3.4 (XERK-2200).
 _PANE_WIDE_MODIFIER_BASES = frozenset(
     "\u261d\u26f9\u270c\u270d\U0001f3cb\U0001f3cc\U0001f574\U0001f575\U0001f590")
+# Format characters tmux still draws one cell wide: the soft hyphen and the
+# prepended concatenation marks (U+0600-0605, U+06DD, U+070F, U+0890-0891,
+# U+08E2, U+110BD, U+110CD; measured, QA).
+_PANE_CF_ONE_CELL = frozenset(
+    "\u00ad\u0600\u0601\u0602\u0603\u0604\u0605\u06dd\u070f\u0890\u0891\u08e2"
+    "\U000110bd\U000110cd")
 # tmux keeps at most this many UTF-8 bytes in one cell (UTF8_SIZE): a longer
 # ZWJ chain or run of regional indicators starts a new cell (XERK-2200).
 _PANE_CELL_BYTES = 21
@@ -14482,8 +14493,9 @@ def _pane_cells(text):
     Measured against real tmux 3.4 (`#{cursor_x}` after printing the text,
     against what capture-pane gave back):
       * wide (CJK/emoji) glyphs take two; a mark (Mn/Me), U+FE00-FE0E, a format
-        character (Cf: ZWSP, word joiner, BOM, tags — the soft hyphen excepted,
-        which takes one) and a Hangul medial/final jamo add none;
+        character (Cf: ZWSP, word joiner, BOM, tags — but not
+        `_PANE_CF_ONE_CELL`, which take one) and a Hangul medial/final jamo add
+        none;
       * a ZWJ joins the NEXT non-ASCII character into the current cell, keeping
         its width ("क्\u200dष" is 1, "👨\u200d👩\u200d👧" 2); an ASCII one after it is
         its own cell ("a\u200db" is 2);
@@ -14532,7 +14544,7 @@ def _pane_cells(text):
                     cells, cur_w, pad = cells + 1, 2, True
             continue
         if (unicodedata.category(c) in ("Mn", "Me")
-                or (unicodedata.category(c) == "Cf" and c != "\u00ad")
+                or (unicodedata.category(c) == "Cf" and c not in _PANE_CF_ONE_CELL)
                 or "\ufe00" <= c <= "\ufe0e" or "\u1160" <= c <= "\u11ff"):
             if fits:
                 cur_bytes += size

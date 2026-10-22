@@ -23493,7 +23493,7 @@ class TestParsePanePrompt(unittest.TestCase):
                             # Format chars and medial/final jamo add none; the
                             # soft hyphen takes one; a cell holds 21 bytes.
                             ("a\u200bbx", 3), ("a\u2060bx", 3), ("a\ufeffbx", 3),
-                            ("a\u00adbx", 4), ("\u1100\u1161\u11a8x", 3), ("가\u11a8x", 3),
+                            ("a\u00adbx", 4), ("a\u0600bx", 4), ("a\U000110bdbx", 4), ("\u1100\u1161\u11a8x", 3), ("가\u11a8x", 3),
                             ("👨\u200d👩\u200d👧\u200d👦x", 5), ("🧑🏽\u200d🤝\u200d🧑🏻x", 5),
                             ("👩\u200d❤️\u200d💋👨x", 5),
                             ("🏴\U000e0067\U000e0062\U000e0065\U000e006ex", 3)):
@@ -23507,6 +23507,12 @@ class TestParsePanePrompt(unittest.TestCase):
         self.assertIsNone(ha.parse_pane_prompt(cap))
         self.assertIsNotNone(ha.parse_pane_prompt(cap.replace("Auto mode (shift + tab to cycle)", "")))
         self.assertFalse(ha.QWEN_PANE_FOOTER_RE.search("⏵⏵ auto mode on (shift+tab to cycle)"))
+        # Under ~40 columns qwen cuts it with an ellipsis (real 0.22.3 frames).
+        for cut in ("Auto mode (sh…", "Auto mode (shift + …", "Auto mode (shift + tab to…"):
+            self.assertIsNone(ha.parse_pane_prompt(
+                cap.replace("Auto mode (shift + tab to cycle)", cut)), cut)
+        self.assertFalse(ha.QWEN_PANE_FOOTER_RE.search("⏵⏵ auto (shift+tab…"))
+        self.assertFalse(ha.QWEN_PANE_FOOTER_RE.search("see (s…"))
 
     def test_an_8_column_footer_cut_to_its_first_letters_vetoes(self):
         # XERK-2200: at 8 columns the footer reads "⏸ ma"; the composer rule is

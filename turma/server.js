@@ -16229,8 +16229,8 @@ function prEventForge(url) {
   // has none: name the non-interactive commands.
   const mr = /\/-\/merge_requests\/(\d+)$/.exec(url);
   if (mr) {
-    return { noun: "MR", checks: `the MR's pipeline (\`glab mr view ${mr[1]}\` in the repo for its `
-      + "branch, then `glab ci get -b <branch>` and `glab ci trace <job-id>`)" };
+    return { noun: "MR", checks: `the MR's pipeline (\`glab ci get --merge-request ${mr[1]} -d\` in `
+      + "the repo for its jobs and their ids, then `glab ci trace <job-id>`)" };
   }
   const ado = /\/_git\/[^/]+\/pullrequest\/(\d+)$/i.exec(url);
   if (ado) {

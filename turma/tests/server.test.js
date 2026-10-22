@@ -25534,7 +25534,7 @@ test("XERK-2200: PR events name a GitLab MR and an ADO PR's own check tool, neve
   a.sessions[0].prs.forEach((p) => { p.checks = "failing"; });
   hub.prEventSweep();
   const [text] = prEventTexts(host);
-  assert.ok(text.includes(`CI failed on MR ${mr}. Read the MR's pipeline (\`glab mr view 12\``), text);
+  assert.ok(text.includes(`CI failed on MR ${mr}. Read the MR's pipeline (\`glab ci get --merge-request 12 -d\``), text);
   assert.ok(text.includes(`CI failed on PR ${ado}. Read the PR's build policies `
     + "(`az repos pr policy list --id 34`)"), text);
   assert.doesNotMatch(text, /gh pr checks|glab ci view/);
