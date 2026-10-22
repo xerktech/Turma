@@ -33,6 +33,9 @@ Safety-guard policy: `agent-hooks.md`.
 - **`ManagerMixin` (tests) cuts every host-real input off** (XERK-1452): `REPOS_ROOT`, `cc_socket_dirs`,
   `JIRA_*`/`AZDO_*` creds, and a real `claude` spawn (Popen guard). A new module-level path or env
   read off the host belongs in its patch list, or the suite runs git/`claude -p` on the dev box.
+- **A test patching a module global (`ha.time.sleep`, `ha.log`) patches it for EVERY thread**
+  (XERK-2197): a worker an earlier test left running eats a scripted `side_effect` or adds calls.
+  Gate the fake on the test's own thread id (`TestMemoryGuard._scripted_sleep`).
 - **No call on the BEAT LOOP may raise** — `run_forever` is the container's MAIN process
   (`entrypoint.sh` execs it with no retry loop of its own, unlike the tunnel's `while :`), so an
   exception reaching it is not a skipped cycle: the container exits and every session on the host
