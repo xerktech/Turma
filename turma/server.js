@@ -5973,7 +5973,18 @@ function buildAgentsCache() {
   const pausedSubs = pausedSubscriptions(now);
   // One live-key set for the whole build (XERK-448 case-twin fold); see serializeAgent.
   const liveKeys = new Set(Object.keys(agents));
-  const list = Object.entries(agents).map(([key, a]) => serializeAgent(key, a, now, pausedSubs, liveKeys));
+  // One host whose record cannot be serialized is left out, never the whole
+  // fleet: a throw here otherwise froze /api/agents for every client on the last
+  // good payload (or an empty fleet after a restart) until that host was pruned
+  // (XERK-2195). Ingest coerces the known causes; this is the backstop.
+  const list = [];
+  for (const [key, a] of Object.entries(agents)) {
+    try {
+      list.push(serializeAgent(key, a, now, pausedSubs, liveKeys));
+    } catch (e) {
+      console.error(`agents payload: host ${logName(key)} left out, its record could not be serialized: ${e.message}`);
+    }
+  }
   list.sort((x, y) => (x.device + x.key).localeCompare(y.device + y.key));
   // ticketAgents (the ticket->host pins) and autoStartOrgs (the per-org
   // auto-start opt-in, XERK-41) ride the same payload: both are tiny,
@@ -10138,8 +10149,18 @@ function coerceStringList(owner, key) {
 // repos[].resumable[].prs). url/state/title/checks/mergeable/ready are Strings
 // (lenient); its one non-string typed leaf is `number` (Int) — and a PR number
 // comes from scraping `gh pr`, so a parse hiccup, not just malice, can flip it.
+//
+// The String leaves drop an object/array/boolean (null kept: `checks:null` is
+// "no CI"). The key list is an inline literal: this runs from loadState, where a
+// module const is still in its TDZ (XERK-301). The hub's own readers `String()` them — prLanded on every beat's
+// alerts — so `{"toString":1}` threw AFTER the record was installed: a 400 whose
+// beat was still stored and served (XERK-2195), and decode-fatal on Android.
 function coercePrElem(p) {
-  if (objectish(p) && "number" in p && !wireInt32(p.number)) delete p.number;
+  if (!objectish(p)) return;
+  if ("number" in p && !wireInt32(p.number)) delete p.number;
+  for (const k of ["url", "state", "title", "checks", "mergeable", "ready"]) {
+    if (k in p && p[k] !== null && typeof p[k] !== "string" && typeof p[k] !== "number") delete p[k];
+  }
 }
 
 // Coerce one transcript block (LiveSignals.tail[].blocks[], polymorphic on `t`,
@@ -10838,6 +10859,13 @@ function normalizeSessions(payload) {
   // as fatal as a wrong-typed field inside one — measured as a host silently
   // missing from the phone while the tile still counted it.
   if (!payload.sessions.every(objectish)) payload.sessions = payload.sessions.filter(objectish);
+  // A session's `id` keys everything the hub does with it (alerts, attention,
+  // the roster, routes); one that is not a string/number made every later
+  // /api/agents build throw, freezing the fleet for every client, and it
+  // survived a restart via state.json (XERK-2195). Such a session is dropped. Runs
+  // BEFORE the prototype-name filter below, whose Object.hasOwn would throw on it.
+  const idOk = (s) => !("id" in s) || typeof s.id === "string" || typeof s.id === "number";
+  if (!payload.sessions.every(idOk)) payload.sessions = payload.sessions.filter(idOk);
   // DROP a session whose id names an Object.prototype member (XERK-2193). The
   // hub keys plain-object maps by session id (heartbeatAlerts' alerts.sessions),
   // so an id of "__proto__" resolved to Object.prototype itself and every
@@ -10847,6 +10875,17 @@ function normalizeSessions(payload) {
     payload.sessions = payload.sessions.filter((s) => !Object.hasOwn(Object.prototype, s.id));
   }
   for (const s of payload.sessions) {
+    // SessionInfo's String fields (and TicketRef's below): an object/array/
+    // boolean is decode-fatal on Android, and the hub `String()`s or templates
+    // several of them (the alert label, the peer roster) — a throw there came
+    // AFTER the record was installed, so the beat answered 400 yet was stored
+    // and served (XERK-2195). Dropped, so each reads as its default. Inline
+    // literal list: this runs from loadState, where a module const is in its TDZ.
+    for (const k of ["status", "repo", "worktreePath", "branch", "label", "rcName", "model",
+      "permissionMode", "spawnCmdId", "transcriptId", "createdAt", "stoppedAt", "errorMsg",
+      "queuedReason", "queuedAt"]) {
+      if (k in s && s[k] !== null && typeof s[k] !== "string" && typeof s[k] !== "number") delete s[k];
+    }
     // Re-bounded here as well as in sanitizeHeartbeat, because the restore path
     // never goes through that: idempotent, so running twice costs nothing.
     //
@@ -10927,7 +10966,13 @@ function normalizeSessions(payload) {
       if (k in s && !objectish(s[k])) s[k] = null;
     }
     // XERK-1569: ticket.outcome (TicketRef.outcome on Android), named coercion.
-    if (objectish(s.ticket)) coerceTicketOutcome(s.ticket);
+    if (objectish(s.ticket)) {
+      coerceTicketOutcome(s.ticket);
+      for (const k of ["key", "siteKey", "url", "summary", "branch"]) {
+        const v = s.ticket[k];
+        if (k in s.ticket && v !== null && typeof v !== "string" && typeof v !== "number") delete s.ticket[k];
+      }
+    }
     // git.dirtyFiles is a non-null Int inside that block; work's aheadOfBase/
     // aheadOfRemote are Int? and pushed a Boolean? — a well-shaped block with a
     // wrong-typed leaf survives the shape check above, so coerce the leaves too.

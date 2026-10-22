@@ -26637,3 +26637,86 @@ test("XERK-1847: a shadow session raises no alert and is in no peer roster", () 
     dropPeerHosts("shA", "shB");
   }
 });
+
+test("XERK-2195: an object PR state/checks is coerced away, never a 400 whose beat is still stored", async () => {
+  const host = "xerk2195";
+  for (const field of ["state", "checks"]) {
+    const bad = await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+      device: host,
+      sessions: [{ id: "s1", status: "running",
+        prs: [{ url: "https://github.com/x/y/pull/1", checks: null, [field]: { toString: 1 } }] }],
+    } });
+    assert.equal(bad.status, 200, `${field}: ${bad.raw}`);
+    const pr = agents[host].sessions.find((s) => s.id === "s1").prs[0];
+    assert.equal(field in pr, false, `${field} must be dropped, not stored as an object`);
+    if (field === "state") assert.equal(pr.checks, null, "a null checks (no CI) is kept");
+  }
+});
+
+test("XERK-2195: an object session string field or ticket field is dropped, never a 400 whose beat is still stored", async () => {
+  const host = "xerk2195b";
+  const O = { toString: 1 };
+  for (const extra of [{ repo: O }, { branch: O }, { rcName: O }, { ticket: { key: O, summary: O } }]) {
+    const r = await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+      device: host, sessions: [{ id: "s1", status: "running", ...extra }] } });
+    assert.equal(r.status, 200, `${JSON.stringify(Object.keys(extra))}: ${r.raw}`);
+    const s = agents[host].sessions[0];
+    for (const [k, v] of Object.entries(extra)) {
+      if (k === "ticket") for (const tk of Object.keys(v)) assert.equal(tk in s.ticket, false, `ticket.${tk}`);
+      else assert.equal(k in s, false, k);
+    }
+  }
+});
+
+test("XERK-2195: a session with an object id is dropped, and the fleet payload keeps serving", async () => {
+  const host = "xerk2195c";
+  const r = await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: host, sessions: [{ id: { toString: 1 }, status: "running" }, { id: "ok", status: "running" }] } });
+  assert.equal(r.status, 200, r.raw);
+  assert.deepEqual(agents[host].sessions.map((s) => s.id), ["ok"]);
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.status, 200);
+  assert.ok(list.body.agents.some((a) => a.key === host), "the host is served");
+  assert.equal(list.body.error, undefined);
+});
+
+test("XERK-2195: one host whose record cannot serialize is left out, not the whole fleet", async () => {
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: "xerk2195good" } });
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: "xerk2195bad" } });
+  // A record poisoned past every ingest coercion (a corrupt restore, say).
+  agents.xerk2195bad.sessions = [{ id: { toString: 1 }, status: "running" }];
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: "xerk2195good" } });
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.body.error, undefined);
+  const keys = list.body.agents.map((a) => a.key);
+  assert.ok(keys.includes("xerk2195good"));
+  assert.ok(!keys.includes("xerk2195bad"));
+  delete agents.xerk2195bad;
+});
+
+test("XERK-2195: the restore coerces closedSessions and resumable PR fields too", () => {
+  const O = { toString: 1 };
+  const rec = {
+    closedSessions: [{ id: "c1", prs: [{ url: "u", state: O, checks: null }] }],
+    repos: [{ name: "r", resumable: [{ id: "t1", prs: [{ url: "u", checks: [1], state: true }] }] }],
+    sessions: [{ id: O }, { id: "s", repo: O, prs: [{ url: "u", mergeable: O }] }],
+  };
+  hub.normalizeRecord(rec, "restore");
+  assert.deepEqual(rec.closedSessions[0].prs[0], { url: "u", checks: null });
+  assert.deepEqual(rec.repos[0].resumable[0].prs[0], { url: "u" });
+  assert.deepEqual(rec.sessions.map((s) => s.id), ["s"]);
+  assert.equal("repo" in rec.sessions[0], false);
+  assert.deepEqual(rec.sessions[0].prs[0], { url: "u" });
+});
+
+test("XERK-2195: the string-field coercion keeps null, numbers and a numeric id", () => {
+  const rec = { sessions: [{ id: 7, repo: 3, branch: null, ticket: { key: 9, summary: null },
+    prs: [{ url: "u", state: 2, checks: null }] }] };
+  hub.normalizeRecord(rec, "restore");
+  const s = rec.sessions[0];
+  assert.equal(s.id, 7);
+  assert.equal(s.repo, 3);
+  assert.equal(s.branch, null);
+  assert.deepEqual(s.ticket, { key: 9, summary: null });
+  assert.deepEqual(s.prs[0], { url: "u", state: 2, checks: null });
+});
