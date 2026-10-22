@@ -14471,7 +14471,10 @@ def _pane_option_wrap_end(lines, idx, width):
         if (not text or PANE_PROMPT_OPTION_RE.match(nxt)
                 or len(nxt) - len(nxt.lstrip()) != col):
             break
-        if _pane_cells(lines[j].rstrip()) + 1 + _pane_cells(text.split()[0]) <= width:
+        # Strictly inside the edge: the TUI also breaks before a word that would
+        # end exactly on it (XERK-2196: "auto" / "mode ·" at 14 columns,
+        # "handles these" / "prompts" at 27).
+        if _pane_cells(lines[j].rstrip()) + 1 + _pane_cells(text.split()[0]) < width:
             break                    # it would have fit: a description, not a wrap
         j += 1
     return j

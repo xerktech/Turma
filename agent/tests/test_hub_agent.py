@@ -20812,6 +20812,42 @@ PANE_EXIT_PLAN_SUBTITLE_DIALOG_60 = """\
       2. No
 """
 
+# XERK-2196: real 2.1.308 frames where the TUI broke a label before a word that
+# would have ended exactly on the box edge ("prompts" at 27 columns, "(ask" at
+# 26), so the fit test read the wrap as a description.
+PANE_EARLY_WRAP_27 = """\
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, allow reading
+      from /home/truenas_ad
+      min/.local/qa-2180/di
+      rs/q/3.Notes/3.Final
+      from this project
+   3. Yes, and switch to
+      auto mode · auto mode
+      handles these
+      prompts for you
+   4. No
+"""
+
+PANE_EXIT_PLAN_EARLY_WRAP_26 = """\
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+  ──────────────────────
+   Exit plan mode?
+
+    Claude wants to
+    exit plan mode
+
+    ❯ 1. Yes, and switch
+         to default
+         (ask each time)
+         for this
+         session
+      2. No
+"""
+
 PANE_EXIT_PLAN_SUBTITLE_DIALOG_36 = """\
 ● Since the plan file location is
   blocked by a hook, I'll share the
@@ -23026,6 +23062,30 @@ class TestParsePanePrompt(unittest.TestCase):
         self.assertIsNone(ha.parse_pane_prompt(
             "─" * 40 + "\n Proceed?\n" + short + "\n\n   2. No\n"))
 
+    def test_a_wrap_before_a_word_ending_on_the_edge(self):
+        # XERK-2196: the TUI also wraps a word that would end exactly on the
+        # edge, so "prompts" under "handles these" is the label, not a
+        # description, and "No" is still offered.
+        p = ha.parse_pane_prompt(PANE_EARLY_WRAP_27)
+        self.assertEqual(
+            [o["label"] for o in p["options"]][2:],
+            ["Yes, and switch to auto mode · auto mode handles these prompts for you",
+             "No"])
+        p = ha.parse_pane_prompt(PANE_EXIT_PLAN_EARLY_WRAP_26)
+        self.assertEqual(
+            [o["label"] for o in p["options"]],
+            ["Yes, and switch to default (ask each time) for this session", "No"])
+        # One cell to spare still reads as a description, not the label.
+        p = ha.parse_pane_prompt(
+            " Proceed?\n ❯ 1. Yes\n   2. No, and tell Claude what to\n"
+            "      do\n" + "─" * 37)
+        self.assertEqual(p["options"][1]["label"], "No, and tell Claude what to")
+        # Ending exactly on the edge, it is the label's wrap.
+        p = ha.parse_pane_prompt(
+            " Proceed?\n ❯ 1. Yes\n   2. No, and tell Claude what to\n"
+            "      do\n" + "─" * 36)
+        self.assertEqual(p["options"][1]["label"], "No, and tell Claude what to do")
+
     def test_wrap_needs_label_column_and_cells(self):
         # A line off the label column is not part of the label, however full
         # the line above it.
@@ -23088,8 +23148,10 @@ class TestParsePanePrompt(unittest.TestCase):
     def test_a_short_rule_is_not_the_dialogs_box(self):
         # A rule far narrower than the pane is content (a diff, a plan), so the
         # wrap is still judged against the pane.
+        # The edge is a cell wider than the pane, so "this" has room left beside
+        # the label, rather than ending exactly on the edge (XERK-2196).
         frame = PANE_EXIT_PLAN_SUBTITLE_DIALOG_60.replace(
-            "─" * 56, "─" * 20)
+            "─" * 56, "─" * 20).replace("▔" * 60, "▔" * 61)
         self.assertIsNone(ha.parse_pane_prompt(frame))
 
     def test_a_subtitle_only_under_the_edge(self):
