@@ -14427,8 +14427,9 @@ def _pane_cells(text):
 
     Wide (CJK/emoji) glyphs take two. What joins onto the glyph before it takes
     none: a mark (Mn/Me: a combining accent, Thai vowels, a keycap), a
-    skin-tone modifier, U+FE0E, and a ZWJ with the wide glyph it joins
-    ("👍🏽", bear+ZWJ+snowflake and a ZWJ family are 2 cells; a+ZWJ+b is not joined). U+FE0F makes a narrow base two
+    skin-tone modifier on a wide glyph, U+FE0E, and a ZWJ with the glyph it
+    joins after a wide one ("👍🏽", bear+ZWJ+snowflake and a ZWJ family are 2
+    cells; a+ZWJ+b is not joined). U+FE0F or a skin tone makes a narrow base two
     cells, and capture-pane writes a padding space after it mid-line but trims
     it at line end, so that space is consumed. Counted per codepoint, one line
     of emoji read wider than the pane and moved every width judged against the
@@ -14448,8 +14449,10 @@ def _pane_cells(text):
         elif c == "\ufe0f":
             if prev == 1:
                 cells, prev, pad = cells + 1, 2, True
-        elif (unicodedata.category(c) in ("Mn", "Me") or "\ufe00" <= c <= "\ufe0e"
-              or "\U0001f3fb" <= c <= "\U0001f3ff"):
+        elif "\U0001f3fb" <= c <= "\U0001f3ff":
+            if prev == 1:        # "☝🏽": a skin tone widens a narrow base too
+                cells, prev = cells + 1, 2
+        elif unicodedata.category(c) in ("Mn", "Me") or "\ufe00" <= c <= "\ufe0e":
             pass
         else:
             prev = 2 if unicodedata.east_asian_width(c) in "WF" else 1
