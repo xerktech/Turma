@@ -91,8 +91,10 @@ DevOps, and what gets typed back because of it.
     http support `_mr_url_parts`/`AZDO_PR_URL_RE` already carried. Client chip renderers key on that
     same path infix, not the scheme, so no client change.
   - **An ADO CI evaluation for an OLDER push reads pending** (`_azdo_eval_stale`, XERK-2200): its
-    `context` says expired / not current, or names another source/merge commit than the PR's.
-    Absent fields = current. Field names are from ADO docs, not yet seen on a real org.
+    `context` says `isExpired`, or names another SOURCE commit than the PR's. Never the merge
+    commit or `buildIsNotCurrent`: both move with the TARGET while a never-expiring policy stays
+    approved, so a passing PR would read pending for good (QA). Absent fields = current; the
+    field names are from ADO docs, not yet seen on a real org.
   - Every launch exports **`GITLAB_HOST`**: glab reads that var, never GITLAB_URL, so self-hosted
     `glab mr create` can't auth without it.
   - Chips label an MR/ADO PR **`!n`, not `#n`** (ADO's `#n` is a WORK ITEM) — every renderer mirrors

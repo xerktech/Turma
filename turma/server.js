@@ -16225,12 +16225,14 @@ function prEventUrl(u) {
 // policies. Mirrors the agent's `_pr_ref` naming. Only the PR number is ever
 // interpolated beyond the already-checked url.
 function prEventForge(url) {
-  const mr = /\/-\/merge_requests\/(\d+)/.exec(url);
+  // `glab ci view` is a TUI that refuses without a TTY, and a session's Bash
+  // has none: name the non-interactive commands.
+  const mr = /\/-\/merge_requests\/(\d+)$/.exec(url);
   if (mr) {
-    return { noun: "MR", checks: `the MR's pipeline (\`glab mr view ${mr[1]}\` in the repo, `
-      + "then `glab ci view` on its branch)" };
+    return { noun: "MR", checks: `the MR's pipeline (\`glab mr view ${mr[1]}\` in the repo for its `
+      + "branch, then `glab ci get -b <branch>` and `glab ci trace <job-id>`)" };
   }
-  const ado = /\/pullrequest\/(\d+)/i.exec(url);
+  const ado = /\/_git\/[^/]+\/pullrequest\/(\d+)$/i.exec(url);
   if (ado) {
     return { noun: "PR", checks: `the PR's build policies (\`az repos pr policy list --id ${ado[1]}\`)` };
   }

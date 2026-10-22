@@ -9432,25 +9432,27 @@ def _azdo_check_class(status):
     return None
 
 
-def _azdo_eval_stale(ev, source_commit, merge_commit):
+def _azdo_eval_stale(ev, source_commit):
     """Whether a CI policy evaluation was judged for an OLDER push than the
     PR's current head (XERK-2200). ADO re-queues build policies asynchronously
     after a push, so for a moment the PR GET already shows the new source commit
     while the evaluation still reads the old run's `approved`; and a build
     policy whose expiration is "Never" stays approved across pushes. Read only
     from fields the evaluation's `context` actually carries — an evaluation
-    without them is taken as current, as before."""
+    without them is taken as current, as before.
+
+    Only the SOURCE commit is compared: ADO recomputes the merge commit (and
+    may flag `buildIsNotCurrent`) whenever the TARGET moves, while a policy
+    that never expires still counts as approved — judged by those, a passing
+    PR would read pending until someone re-queued a build (QA)."""
     ctx = ev.get("context")
     if not isinstance(ctx, dict):
         return False
-    if ctx.get("isExpired") is True or ctx.get("buildIsNotCurrent") is True:
+    if ctx.get("isExpired") is True:
         return True
-    for key, now in (("lastMergeSourceCommitId", source_commit),
-                     ("lastMergeCommitId", merge_commit)):
-        seen = ctx.get(key)
-        if isinstance(seen, str) and seen and isinstance(now, str) and now and seen != now:
-            return True
-    return False
+    seen = ctx.get("lastMergeSourceCommitId")
+    return bool(isinstance(seen, str) and seen and isinstance(source_commit, str)
+                and source_commit and seen != source_commit)
 
 
 def _azdo_is_ci_policy(ev):
@@ -9515,7 +9517,7 @@ def _summarize_azdo_pr(data, evals=None):
             continue
         cls = _azdo_check_class(ev.get("status"))
         # A verdict for an older push is the new head's run still to come.
-        if cls in ("pass", "fail") and _azdo_eval_stale(ev, head, merge_commit):
+        if cls in ("pass", "fail") and _azdo_eval_stale(ev, head):
             cls = "pending"
         if cls:
             counts[cls] += 1
@@ -14372,7 +14374,10 @@ def _pane_unglue_options(lines):
 # PANE_MODE_RE it means the composer is live, so its presence below a numbered
 # run says "not a blocking dialog" — a qwen approval dialog REPLACES the footer
 # with "Waiting for user confirmation…" (G0), so a real dialog shows none.
-QWEN_PANE_FOOTER_RE = re.compile(r"Ask permissions \(shift \+ tab to cycle\)")
+# Every qwen mode names itself before it ("Ask permissions", "Auto mode" in
+# 0.22.3, XERK-2200), so the spaced hint alone is the footer: Claude Code
+# writes "shift+tab" unspaced.
+QWEN_PANE_FOOTER_RE = re.compile(r"\S \(shift \+ tab to cycle\)")
 # Claude Code's exit toast, which REPLACES the mode footer for ~0.5-1s after a
 # Ctrl-C (or Ctrl-D) on an idle composer (2.1.306: "  Press Ctrl-C again to
 # exit"). It rides the composer like the footer it hides, so it vetoes a dialog
@@ -14466,67 +14471,84 @@ PANE_DIALOG_MARGIN = 4
 # draws by) makes two cells wide: "☝x" is 3 cells in tmux 3.4 (XERK-2200).
 _PANE_WIDE_MODIFIER_BASES = frozenset(
     "\u261d\u26f9\u270c\u270d\U0001f3cb\U0001f3cc\U0001f574\U0001f575\U0001f590")
-# tmux keeps at most this many regional indicators in one cell (21 bytes).
-_PANE_RI_PER_CELL = 5
+# tmux keeps at most this many UTF-8 bytes in one cell (UTF8_SIZE): a longer
+# ZWJ chain or run of regional indicators starts a new cell (XERK-2200).
+_PANE_CELL_BYTES = 21
 
 
 def _pane_cells(text):
     """Terminal cells `text` occupies, as tmux 3.4 draws it (XERK-2199, XERK-2200).
 
-    Measured against real tmux 3.4 (`#{cursor_x}` after printing the text):
-      * wide (CJK/emoji) glyphs take two; a mark (Mn/Me), U+FE00-FE0E add none;
+    Measured against real tmux 3.4 (`#{cursor_x}` after printing the text,
+    against what capture-pane gave back):
+      * wide (CJK/emoji) glyphs take two; a mark (Mn/Me), U+FE00-FE0E, a format
+        character (Cf: ZWSP, word joiner, BOM, tags — the soft hyphen excepted,
+        which takes one) and a Hangul medial/final jamo add none;
       * a ZWJ joins the NEXT non-ASCII character into the current cell, keeping
-        its width ("क्‍ष" is 1, "👨‍👩‍👧" 2); an ASCII one after it is
-        its own cell ("a‍b" is 2);
+        its width ("क्\u200dष" is 1, "👨\u200d👩\u200d👧" 2); an ASCII one after it is
+        its own cell ("a\u200db" is 2);
       * a skin tone or regional indicator after a non-ASCII cell combines into
-        it (at most `_PANE_RI_PER_CELL` indicators, so "🇺🇸🇺🇸" is ONE cell);
-        after ASCII, a space or the start it is its own two-cell glyph
-        ("a🏽" is 3);
+        it ("🇺🇸🇺🇸" is ONE cell); after ASCII, a space or the start it is its
+        own two-cell glyph ("a🏽" is 3);
+      * a cell holds at most `_PANE_CELL_BYTES` bytes: what would not fit
+        starts a new cell (a four-person family is 4 cells) or, with no width,
+        is dropped;
       * U+FE0F, or one of those combining into a one-cell glyph, widens that
         cell to two; capture-pane then writes a padding space after it mid-line
         (trimmed at line end), which is consumed — and the glyph after that pad
         never combines ("©️ 🏽" is 4).
-    Counted per codepoint, one line of emoji read wider than the pane and moved
-    every width judged against the widest line; counted short, a label wrapped
-    after "✔️" stopped the option run before "No" (QA)."""
-    cells = cur_w = ris = 0
+    Not covered: glyphs whose glibc width differs from Unicode's beyond
+    `_PANE_WIDE_MODIFIER_BASES`. Counted per codepoint, one line of emoji read
+    wider than the pane and moved every width judged against the widest line;
+    counted short, a label wrapped after "✔️" stopped the option run before
+    "No" (QA)."""
+    cells = cur_w = cur_bytes = 0
     cur_ascii = pad = after_pad = zwj = False
     for c in text:
+        size = len(c.encode("utf-8"))
+        fits = cur_w > 0 and cur_bytes + size <= _PANE_CELL_BYTES
         if pad:
             pad = False
             if c == " ":
                 after_pad = True
                 continue
         if c == "\u200d":
-            zwj = cur_w > 0
+            zwj = fits
+            cur_bytes += size if fits else 0
             continue
         modifier = "\U0001f3fb" <= c <= "\U0001f3ff"
         ri = "\U0001f1e6" <= c <= "\U0001f1ff"
         if zwj:
             zwj = False
-            if ord(c) >= 0x80:
+            if ord(c) >= 0x80 and fits:
+                cur_bytes += size
                 if (modifier or ri) and cur_w == 1:
                     cells, cur_w, pad = cells + 1, 2, True
                 continue
         if c == "\ufe0f":
-            if cur_w == 1:
-                cells, cur_w, pad = cells + 1, 2, True
-            continue
-        if unicodedata.category(c) in ("Mn", "Me") or "\ufe00" <= c <= "\ufe0e":
-            cur_ascii = False    # "e\u0301🏽" combines like "é🏽"
-            continue
-        if modifier or ri:
-            if (cur_w and not cur_ascii and not after_pad
-                    and not (ri and ris >= _PANE_RI_PER_CELL)):
+            if fits:
+                cur_bytes += size
                 if cur_w == 1:
                     cells, cur_w, pad = cells + 1, 2, True
-                ris += ri
+            continue
+        if (unicodedata.category(c) in ("Mn", "Me")
+                or (unicodedata.category(c) == "Cf" and c != "\u00ad")
+                or "\ufe00" <= c <= "\ufe0e" or "\u1160" <= c <= "\u11ff"):
+            if fits:
+                cur_bytes += size
+                cur_ascii = False    # "e\u0301🏽" combines like "é🏽"
+            continue
+        if modifier or ri:
+            if fits and not cur_ascii and not after_pad:
+                if cur_w == 1:
+                    cells, cur_w, pad = cells + 1, 2, True
+                cur_bytes += size
                 continue
-            cells, cur_w, cur_ascii, ris, after_pad = cells + 2, 2, False, int(ri), False
+            cells, cur_w, cur_ascii, cur_bytes, after_pad = cells + 2, 2, False, size, False
             continue
         w = (2 if unicodedata.east_asian_width(c) in "WF"
              or c in _PANE_WIDE_MODIFIER_BASES else 1)
-        cells, cur_w, cur_ascii, ris, after_pad = cells + w, w, ord(c) < 0x80, 0, False
+        cells, cur_w, cur_ascii, cur_bytes, after_pad = cells + w, w, ord(c) < 0x80, size, False
     return cells
 
 

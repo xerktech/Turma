@@ -10982,6 +10982,8 @@ class TestPanePromptUnderTheEdge(unittest.TestCase):
         box = "  " + "─" * 30 + "\n"
         self.assertTrue(ha._pane_cut_dialog_up(box + "   Proceed?\n    ❯ 1. Yes\n"))
         self.assertFalse(ha._pane_cut_dialog_up("   Proceed?\n    ❯ 1. Yes\n" + "x" * 32))
+        # A column-0 rule is the composer's, never the dialog's box.
+        self.assertFalse(ha._pane_cut_dialog_up("─" * 32 + "\n   Proceed?\n    ❯ 1. Yes\n"))
         self.assertFalse(ha._pane_cut_dialog_up("  " + "─" * 10 + "\n   Proceed?\n    ❯ 1. Yes"
                                                 + "x" * 30 + "\n"))
         self.assertFalse(ha._pane_cut_dialog_up(box + "   Exit plan mode?\n\n   Claude wants to\n"))
@@ -19673,10 +19675,14 @@ class TestAzdoPrStatus(AzdoPrMixin, unittest.TestCase):
         self.assertEqual(checks("approved", {"lastMergeSourceCommitId": "b" * 40}), "passing")
         self.assertEqual(checks("approved", {}), "passing")       # nothing to judge by
         self.assertEqual(checks("approved", None), "passing")
-        for ctx in ({"lastMergeSourceCommitId": "a" * 40}, {"lastMergeCommitId": "o" * 40},
-                    {"isExpired": True}, {"buildIsNotCurrent": True}):
+        for ctx in ({"lastMergeSourceCommitId": "a" * 40}, {"isExpired": True}):
             self.assertEqual(checks("approved", ctx), "pending", ctx)
             self.assertEqual(checks("rejected", ctx), "pending", ctx)
+        # A moved TARGET (merge commit recomputed, build "not current") keeps
+        # a never-expiring policy approved: still passing (QA).
+        self.assertEqual(checks("approved", {"lastMergeSourceCommitId": "b" * 40,
+                                             "lastMergeCommitId": "o" * 40,
+                                             "buildIsNotCurrent": True}), "passing")
         # A malformed context field is no evidence either way.
         self.assertEqual(checks("approved", {"lastMergeSourceCommitId": 7,
                                              "isExpired": "yes"}), "passing")
@@ -23483,8 +23489,24 @@ class TestParsePanePrompt(unittest.TestCase):
                             ("a" + T, 3), (T + " x", 4), (" " + T + "x", 4),
                             ("é" + T + " x", 3), ("e\u0301" + T + " x", 3), ("é" + T + " " + T + "x", 5),
                             ("©️ " + T, 4), ("✔️ " + T + " x", 6), ("☹️ \u200dx", 3),
-                            ("☝x", 3), ("🕵x", 3), ("✌x", 3), ("♂x", 2)):
+                            ("☝x", 3), ("🕵x", 3), ("✌x", 3), ("♂x", 2),
+                            # Format chars and medial/final jamo add none; the
+                            # soft hyphen takes one; a cell holds 21 bytes.
+                            ("a\u200bbx", 3), ("a\u2060bx", 3), ("a\ufeffbx", 3),
+                            ("a\u00adbx", 4), ("\u1100\u1161\u11a8x", 3), ("가\u11a8x", 3),
+                            ("👨\u200d👩\u200d👧\u200d👦x", 5), ("🧑🏽\u200d🤝\u200d🧑🏻x", 5),
+                            ("👩\u200d❤️\u200d💋👨x", 5),
+                            ("🏴\U000e0067\U000e0062\U000e0065\U000e006ex", 3)):
             self.assertEqual(ha._pane_cells(text), cells, text)
+
+    def test_qwen_auto_mode_footer_vetoes_a_quoted_option_run(self):
+        # XERK-2200 QA: qwen 0.22.3's auto-mode footer is "Auto mode (shift +
+        # tab to cycle)"; only "Ask permissions" was known, so an idle pane
+        # whose reply held "❯ 1. Alpha" read as a blocking dialog.
+        cap = "Which?\n\n❯ 1. Alpha\n  2. Beta\n\n> \n  Auto mode (shift + tab to cycle)\n"
+        self.assertIsNone(ha.parse_pane_prompt(cap))
+        self.assertIsNotNone(ha.parse_pane_prompt(cap.replace("Auto mode (shift + tab to cycle)", "")))
+        self.assertFalse(ha.QWEN_PANE_FOOTER_RE.search("⏵⏵ auto mode on (shift+tab to cycle)"))
 
     def test_an_8_column_footer_cut_to_its_first_letters_vetoes(self):
         # XERK-2200: at 8 columns the footer reads "⏸ ma"; the composer rule is

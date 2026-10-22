@@ -25537,13 +25537,21 @@ test("XERK-2200: PR events name a GitLab MR and an ADO PR's own check tool, neve
   assert.ok(text.includes(`CI failed on MR ${mr}. Read the MR's pipeline (\`glab mr view 12\``), text);
   assert.ok(text.includes(`CI failed on PR ${ado}. Read the PR's build policies `
     + "(`az repos pr policy list --id 34`)"), text);
-  assert.doesNotMatch(text, /gh pr checks/);
+  assert.doesNotMatch(text, /gh pr checks|glab ci view/);
+  // Only an ADO-shaped path names az: a GitHub url holding "/pullrequest/" stays gh.
+  const gh = "https://github.com/pullrequest/123/pull/4";
+  a.sessions[0].prs.push({ url: gh, state: "OPEN", checks: "pending" });
+  hub.prEventSweep();
+  a.sessions[0].prs[2].checks = "failing";
+  hub.prEventSweep();
+  assert.ok(prEventTexts(host)[1].includes(`(\`gh pr checks ${gh}\`)`), prEventTexts(host)[1]);
+  a.sessions[0].prs.pop();
   a.sessions[0].prs.forEach((p) => { p.checks = "passing"; });
   hub.prEventSweep();
-  assert.match(prEventTexts(host)[1], new RegExp(`^CI passed on MR ${mr.replace(/[.]/g, "\\.")}\\.`));
+  assert.match(prEventTexts(host)[2], new RegExp(`^CI passed on MR ${mr.replace(/[.]/g, "\\.")}\\.`));
   a.sessions[0].prs[0].state = "MERGED";
   hub.prEventSweep();
-  assert.ok(prEventTexts(host)[2].startsWith(`MR ${mr} has been merged.`));
+  assert.ok(prEventTexts(host)[3].startsWith(`MR ${mr} has been merged.`));
   delete agents[host];
 });
 
