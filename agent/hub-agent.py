@@ -14496,6 +14496,35 @@ def _pane_under_edge(lines, idx, edges=()):
     return False
 
 
+def _pane_under_box(lines, idx, widest, end):
+    """The index of the dialog's own box rule when the question above line
+    `idx` sits right under it, with no composer below the run ending on line
+    `end` (XERK-2199); else None.
+
+    Claude Code 2.1.308 can draw "Exit plan mode?" in a pane full of
+    conversation with no ▔ edge above it, so `_pane_under_edge` alone read the
+    live dialog as an idle composer and a typed message approved it. The box
+    rule is the dialog's own: indented, and within `PANE_DIALOG_MARGIN` of the
+    pane's width. A reply shaped question / note / options (XERK-2162) still
+    has the composer below it — its column-0 "─" rule — even while the Ctrl-C
+    toast hides the footer, and a live dialog replaces the composer."""
+    if any(_COMPOSER_EDGE_RULE_RE.match(line) for line in lines[end + 1:]):
+        return None
+    seen_q = False
+    for k in range(idx - 1, -1, -1):
+        line = lines[k]
+        if not line.strip():
+            continue
+        if not seen_q:
+            seen_q = True
+            continue
+        if (PANE_PROMPT_RULE_RE.match(line) and "─" in line and line[:1].isspace()
+                and _pane_cells(line.rstrip()) >= widest - PANE_DIALOG_MARGIN):
+            return k
+        return None
+    return None
+
+
 def _pane_join_wrap(label, text):
     """`label` with a wrapped screen line `text` appended. A path the TUI broke
     mid-token ("…/.turma" / "/worktrees/…", "…/wor" / "ktrees/…") had no space
@@ -14634,6 +14663,7 @@ def parse_pane_prompt(cap, face=False):
         while q >= 0 and not lines[q].strip():
             q -= 1
         subtitle = []
+        box = None                   # the box rule that anchored the subtitle
         if q >= 0 and not lines[q].strip().endswith("?") and q < start - 1:
             k = q
             while (k >= 0 and lines[k].strip()
@@ -14643,7 +14673,9 @@ def parse_pane_prompt(cap, face=False):
                 k -= 1
             if (0 <= k and not lines[k].strip()
                     and q - k <= PANE_PROMPT_SUBTITLE_LINES
-                    and _pane_under_edge(lines, k, area)):
+                    and (_pane_under_edge(lines, k, area)
+                         or (box := _pane_under_box(lines, k, widest,
+                                                    rows[-1][1])) is not None)):
                 # Joined into one line: its wrap moves with the pane's width.
                 subtitle = [" ".join(l.strip() for l in lines[k + 1:q + 1])]
                 q = k
@@ -14672,8 +14704,9 @@ def parse_pane_prompt(cap, face=False):
             if not text:
                 continue         # a blank never closes the block (the TUI puts
                                  # one between a dialog's title and its body)
-            if PANE_PROMPT_EDGE_RE.match(line) or k in area:
-                break            # the bottom area's top edge: transcript above
+            if PANE_PROMPT_EDGE_RE.match(line) or k in area or k == box:
+                break            # the bottom area's top edge (or, with none
+                                 # drawn, the dialog's box): transcript above
             if PANE_PROMPT_RULE_RE.match(line):
                 if block:
                     break        # the rule fencing the block we just collected

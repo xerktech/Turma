@@ -20911,6 +20911,18 @@ PANE_EXIT_PLAN_SUBTITLE_DIALOG = """\
       2. No
 """
 
+# A real 2.1.308 frame at 90 columns (trimmed) with its ▔ edge row removed,
+# the shape XERK-2199's QA saw: conversation runs straight into the box.
+PANE_EXIT_PLAN_NO_EDGE_90 = (
+    "  58\n  59\n  60\n\n"
+    "● The plan file write was denied by permission settings, so I'm including the plan\n"
+    "  directly.\n\n"
+    "  " + "─" * 86 + "\n"
+    "   Exit plan mode?\n\n"
+    "    Claude wants to exit plan mode\n\n"
+    "    ❯ 1. Yes, and switch to default (ask each time) for this session\n"
+    "      2. No\n")
+
 # At 60 columns "this" would fit the pane after line 1, but not the box.
 PANE_EXIT_PLAN_SUBTITLE_DIALOG_60 = """\
 ● Since the plan file location is blocked by a hook, I'll
@@ -23343,9 +23355,25 @@ class TestParsePanePrompt(unittest.TestCase):
             "▔▔▔▔▔\nHeading\nProceed?\n\nnote\n\n ❯ 1. Yes\n   2. No\n"))
         self.assertIsNotNone(ha.parse_pane_prompt(
             "▔▔▔▔▔\n  ────\nProceed?\n\nnote\n\n ❯ 1. Yes\n   2. No\n"))
-        # The dialog without its edge on screen is not read as one either.
-        self.assertIsNone(ha.parse_pane_prompt(
-            PANE_EXIT_PLAN_SUBTITLE_DIALOG.split("▔" * 44 + "\n")[1]))
+        # A reply whose question sits under an indented, pane-wide rule is
+        # still not a dialog: the composer is below it.
+        self.assertIsNone(ha.parse_pane_prompt(toast.replace(
+            "● Which", "  " + "─" * 78 + "\n  Which")))
+
+    def test_a_subtitle_dialog_without_its_edge(self):
+        # XERK-2199: 2.1.308 in a pane full of conversation draws "Exit plan
+        # mode?" with no ▔ edge; its own box rule and no composer below anchor it.
+        for frame in (PANE_EXIT_PLAN_SUBTITLE_DIALOG.replace("▔" * 44 + "\n", ""),
+                      PANE_EXIT_PLAN_SUBTITLE_DIALOG.split("▔" * 44 + "\n")[1],
+                      PANE_EXIT_PLAN_NO_EDGE_90):
+            p = ha.parse_pane_prompt(frame)
+            self.assertEqual(p["prompt"], "Exit plan mode?")
+            self.assertEqual(p["detail"], "Claude wants to exit plan mode")
+            self.assertEqual([o["number"] for o in p["options"]], [1, 2])
+            self.assertTrue(ha._pane_blocking_dialog(frame))
+        # The box rule must span the pane: a short rule is content.
+        self.assertIsNone(ha.parse_pane_prompt(PANE_EXIT_PLAN_NO_EDGE_90.replace(
+            "─" * 86, "─" * 20)))
 
     def test_the_exit_toast_vetoes_like_the_footer(self):
         # XERK-2169: a reply shaped question / options, read while the Ctrl-C

@@ -346,6 +346,10 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     - Only under the ▔ edge (`_pane_under_edge`: the question sits right below it, rules
       between): a reply shaped question/note/options is above the edge, and the Ctrl-C toast
       hides the footer that would veto it.
+    - Or, with no edge drawn (2.1.308 in a full pane, XERK-2199), right under the dialog's own
+      box rule (indented, within `PANE_DIALOG_MARGIN` of the pane) with no column-0 composer
+      rule below the run (`_pane_under_box`); `detail` then stops at that rule. The toast
+      reply still has its composer below, so it stays None.
     - That dialog's box ends 2 cells in from the pane, and its labels wrap there: wrap width is
       the nearest box rule within `PANE_DIALOG_MARGIN` of the pane (`_pane_dialog_width`), else
       the widest line. Below ~30 columns the TUI's own wrap still drifts (a subtitle past three
