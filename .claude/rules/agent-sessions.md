@@ -364,6 +364,8 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   `**Summary:**` line, then Why / What changed / Risk / Testing / Follow-ups; a repo template wins).
   Unlike the branching policy it IS enforced: `hooks/guard.py` refuses a PR/MR missing a section
   (`agent-hooks.md`). Rides `_session_directive`, so qwen/dsh get it too.
+- It also forbids watching a PR's CI or merge (`gh pr checks --watch`, a merge poll): the hub
+  messages the session on CI pass/fail and merge (`prEventSweep`, `turma-automerge.md`).
 
 ## Moved out (size ceiling)
 

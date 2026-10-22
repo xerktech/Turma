@@ -92,6 +92,19 @@ Split out of `.claude/rules/turma-board.md`. Auto-start/auto-stop live there; ep
     - **Multi-PR is the designed loop**: merge sweep skips landed PRs and merges each new one; close
       re-fires per new merged url; a Done ticket stands both down. Tests: `auto-close:`/`auto-merge +
       auto-close run through MULTIPLE PRs` in `server.test.js`.
+- **The hub, not the session, watches a PR's CI and merge** (`prEventSweep`, after
+  `autoCloseSweep` on the leader tick). Sessions are told not to poll either
+  (`PR_SUMMARY_SYSTEM_PROMPT`); the hub types ONE `input` (`source:"nudge"`) when an OPEN PR's
+  `checks` settles `passing`/`failing`, and when a PR reads MERGED.
+  - **A merge `autoCloseSweep` will message is left to it**: an auto-merge/epic-run session whose
+    PRs have ALL landed gets only the verify-then-Done message, never both. A merge short of that
+    still gets the light "merged" one.
+  - **Announced state rides `sa.prEvents`** (url → `{ci, merged}`, persisted with `alerts`, swept
+    with the session), so a restart or failover re-sends nothing. A session with no `prEvents` yet
+    is BASELINED silently — a hub upgrade must not announce every PR already green.
+  - `ci` is the last rollup seen, so pending→settled is announced again after each push; a CI-less
+    PR (`checks:null`) and a non-URL-shaped url say nothing. Running sessions on online hosts only.
+    `PR_EVENT_MESSAGES=0` turns it off. Tests: the `PR events:` cases in `server.test.js`.
 - **GitHub only for now** — the agent's `merge_pr` refuses a GitLab MR / ADO PR (staged `ok:false`)
   so the hub gives up rather than retrying. Merge method is `--squash --delete-branch`,
   env-overridable (`TURMA_AUTOMERGE_METHOD`/`_DELETE_BRANCH`).

@@ -4669,9 +4669,11 @@ Write it for a human reviewer who never saw this session:
   - Pass the description inline (--body/--description or a heredoc) or with
     --body-file; the guard can't check --fill or an editor.
 
-Once a PR's CI is green, do not watch or poll for it to merge (a `gh pr view`
-loop, `until ... MERGED`): end the turn with no such shell left running. The hub
-or the operator merges it; you are re-prompted if anything follows.
+Do not watch or poll a PR's CI or its merge (`gh pr checks --watch`,
+`gh run watch`, a `gh pr view` loop, `until ... MERGED`), even where other
+instructions say to watch CI: push, then end the turn with no such shell left
+running. Turma messages this session when the PR's CI passes or fails and when
+it merges; act on that message when it arrives.
 """
 
 # --- cross-session messaging (XERK-339) --------------------------------------

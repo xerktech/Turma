@@ -25423,6 +25423,98 @@ test("XERK-1839: a malformed record never throws out of the sweep", () => {
   delete agents["ol-bad"];
 });
 
+// ---- PR event messages: the hub, not the session, watches CI and the merge ------
+function prEventHost(host, prs, { status = "running", now = Date.now() } = {}) {
+  agents[host] = { device: host, lastSeen: now, commands: [],
+    sessions: [{ id: "p1", status, prs }], alerts: { sessions: { p1: {} } } };
+  return agents[host];
+}
+const prEventTexts = (host) => (agents[host].commands || [])
+  .filter((c) => c.type === "input").map((c) => c.text);
+
+test("PR events: CI settling and a merge each message the session once; the first look is a baseline", () => {
+  const host = "prev-basic";
+  const url = "https://github.com/x/y/pull/7";
+  const a = prEventHost(host, [{ url, state: "OPEN", checks: "passing" }]);
+  hub.prEventSweep();
+  assert.deepEqual(prEventTexts(host), [], "a PR already green when the hub first looks is not announced");
+  const pr = a.sessions[0].prs[0];
+  pr.checks = "pending";                    // the session pushed again
+  hub.prEventSweep();
+  assert.equal(prEventTexts(host).length, 0, "pending says nothing");
+  pr.checks = "failing";
+  hub.prEventSweep();
+  hub.prEventSweep();                       // a repeat sweep stays quiet
+  let texts = prEventTexts(host);
+  assert.equal(texts.length, 1);
+  assert.ok(texts[0].startsWith(`CI failed on PR ${url}.`), texts[0]);
+  assert.ok(texts[0].includes(`gh pr checks ${url}`));
+  pr.checks = "passing";                    // red -> green between two refreshes
+  hub.prEventSweep();
+  texts = prEventTexts(host);
+  assert.equal(texts.length, 2);
+  assert.match(texts[1], /^CI passed on PR .* The operator merges it — don't watch for the merge/);
+  const cmd = a.commands.find((c) => c.type === "input");
+  assert.equal(cmd.sessionId, "p1");
+  assert.equal(cmd.source, "nudge");
+  pr.state = "MERGED";
+  hub.prEventSweep();
+  hub.prEventSweep();
+  texts = prEventTexts(host);
+  assert.equal(texts.length, 3);
+  assert.equal(texts[2], `PR ${url} has been merged. Carry on with any remaining work for it; `
+    + "if there is none, end the turn.");
+});
+
+test("PR events: a new PR first seen already settled is announced once the session is baselined", () => {
+  const host = "prev-new";
+  const a = prEventHost(host, []);
+  hub.prEventSweep();                       // baseline: no PRs yet
+  a.sessions[0].prs = [{ url: "https://github.com/x/y/pull/8", state: "OPEN", checks: "failing" },
+    { url: "https://github.com/x/y/pull/9", state: "OPEN", checks: null },
+    { url: "javascript:alert(1)", state: "OPEN", checks: "failing" }];
+  hub.prEventSweep();
+  const texts = prEventTexts(host);
+  assert.equal(texts.length, 1, "one message per sweep, no-CI and odd urls say nothing");
+  assert.match(texts[0], /^CI failed on PR https:\/\/github\.com\/x\/y\/pull\/8\./);
+  assert.ok(!texts[0].includes("pull/9") && !texts[0].includes("javascript"));
+});
+
+test("PR events: a stopped session or an offline host is never messaged", () => {
+  const stopped = prEventHost("prev-stopped", [{ url: "https://github.com/x/y/pull/1", state: "OPEN", checks: "pending" }],
+    { status: "stopped" });
+  hub.prEventSweep();
+  stopped.sessions[0].prs[0].checks = "passing";
+  hub.prEventSweep();
+  assert.deepEqual(prEventTexts("prev-stopped"), []);
+  const t0 = Date.now() - 10 * 60 * 1000;      // well past OFFLINE_AFTER_MS
+  const off = prEventHost("prev-off", [{ url: "https://github.com/x/y/pull/1", state: "OPEN", checks: "pending" }],
+    { now: t0 });
+  hub.prEventSweep();
+  off.sessions[0].prs[0].checks = "passing";
+  hub.prEventSweep();
+  assert.deepEqual(prEventTexts("prev-off"), []);
+});
+
+test("PR events: an auto-merge session's merge gets the auto-close message, not the light one", async () => {
+  resetMerge();
+  await mergeBeat("prevAm", "prevam.atlassian.net", { ready: null });
+  const pr = agents.prevAm.sessions[0].prs[0];
+  pr.checks = "pending";
+  hub.prEventSweep();                       // baseline
+  pr.checks = "passing";
+  hub.prEventSweep();
+  let texts = inputTexts("prevAm");
+  assert.equal(texts.length, 1);
+  assert.match(texts[0], /^CI passed on PR .* Auto-merge will merge it/);
+  pr.state = "MERGED";
+  hub.prEventSweep();
+  autoCloseSweep();
+  texts = inputTexts("prevAm");
+  assert.equal(texts.length, 2, "only autoCloseSweep's message follows the merge");
+  assert.match(texts[1], /verify the change is deployed and working/i);
+});
+
 // ---- XERK-1572: wait classifier hints, the loop signal, attention nudges ---------
 
 test("XERK-1572: the loop signal is coerced by name and never repaired", async () => {
