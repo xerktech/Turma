@@ -10838,6 +10838,14 @@ function normalizeSessions(payload) {
   // as fatal as a wrong-typed field inside one — measured as a host silently
   // missing from the phone while the tile still counted it.
   if (!payload.sessions.every(objectish)) payload.sessions = payload.sessions.filter(objectish);
+  // DROP a session whose id names an Object.prototype member (XERK-2193). The
+  // hub keys plain-object maps by session id (heartbeatAlerts' alerts.sessions),
+  // so an id of "__proto__" resolved to Object.prototype itself and every
+  // per-session write after it polluted every object in the hub. No real
+  // session is named "__proto__" or "toString", so dropping loses nothing.
+  if (payload.sessions.some((s) => Object.hasOwn(Object.prototype, s.id))) {
+    payload.sessions = payload.sessions.filter((s) => !Object.hasOwn(Object.prototype, s.id));
+  }
   for (const s of payload.sessions) {
     // Re-bounded here as well as in sanitizeHeartbeat, because the restore path
     // never goes through that: idempotent, so running twice costs nothing.
