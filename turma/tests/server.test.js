@@ -26650,3 +26650,15 @@ test("XERK-2195: the restore coerces closedSessions and resumable PR fields too"
   assert.equal("repo" in rec.sessions[0], false);
   assert.deepEqual(rec.sessions[0].prs[0], { url: "u" });
 });
+
+test("XERK-2195: the string-field coercion keeps null, numbers and a numeric id", () => {
+  const rec = { sessions: [{ id: 7, repo: 3, branch: null, ticket: { key: 9, summary: null },
+    prs: [{ url: "u", state: 2, checks: null }] }] };
+  hub.normalizeRecord(rec, "restore");
+  const s = rec.sessions[0];
+  assert.equal(s.id, 7);
+  assert.equal(s.repo, 3);
+  assert.equal(s.branch, null);
+  assert.deepEqual(s.ticket, { key: 9, summary: null });
+  assert.deepEqual(s.prs[0], { url: "u", state: 2, checks: null });
+});
