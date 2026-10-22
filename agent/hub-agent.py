@@ -24401,7 +24401,8 @@ TICKET_TRIAGE_INSTRUCTION = (
     "session can start on; false for pure discussion, design, meeting, "
     "access-request, or blocked work.\n"
     "- A ROLLUP ticket (summary starting '[Rollup]', or labelled 'rollup') "
-    "is a list of findings, not work: actionable is always false.\n"
+    "collects concrete findings for one session to fix together: judge it "
+    "like any other ticket, and actionable is true unless it is blocked.\n"
     "- dedupeOf: the key of ANOTHER ticket listed below that this one "
     "duplicates, or null.\n"
     "- reason: at most 12 words.\n\n"
@@ -24476,12 +24477,41 @@ def _ticket_fingerprint(t):
     not `updated`, which moves on any field edit (a status transition, an assignee
     change) and would re-triage a ticket whose description never moved."""
     labels = (t or {}).get("labels")
-    return _triage_fingerprint([
+    parts = [
         str((t or {}).get("summary") or ""),
         str((t or {}).get("type") or ""),
         str((t or {}).get("project") or ""),
         ",".join(labels) if isinstance(labels, list) else "",
-    ])
+    ]
+    # A rollup's fingerprint carries the prompt rule it was judged under, so a
+    # rollup triaged when the rule said "never actionable" is re-triaged once
+    # under the current one. Other tickets' fingerprints are unchanged.
+    if _is_rollup_ticket(t):
+        parts.append(ROLLUP_TRIAGE_RULE)
+    return _triage_fingerprint(parts)
+
+
+# Bump when the triage prompt's rollup rule changes, to re-triage every rollup.
+ROLLUP_TRIAGE_RULE = "rollup-is-work-v1"
+
+# JS's `\s` / String.prototype.trim set, spelled out: Python's own whitespace
+# differs (it adds U+001C-001F and U+0085, lacks U+FEFF), and the hub's
+# isRollupTicket decides with JS's.
+_JS_WS = ("\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+          "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+
+
+def _is_rollup_ticket(t):
+    """Mirrors the hub's isRollupTicket: a `rollup` label (any case) or a
+    `[Rollup]` summary prefix, trimmed by JS's whitespace set."""
+    t = t or {}
+    labels = t.get("labels")
+    if isinstance(labels, list) and any(
+            isinstance(l, str) and l.strip(_JS_WS).lower() == "rollup" for l in labels):
+        return True
+    summary = t.get("summary")
+    return (isinstance(summary, str)
+            and summary.lstrip(_JS_WS)[:8].lower() == "[rollup]")
 
 
 def _candidates_fingerprint(cands):

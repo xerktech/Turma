@@ -222,10 +222,12 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   the org's `triagePolicies` override or constrain the sweep. Full gate order, verdict semantics,
   policy knobs and P0 preemption live in `.claude/rules/turma-triage.md` — the agent's contract is
   unchanged: keep stamping the block faithfully, absence means "not assessed".
-- **`TICKET_TRIAGE_INSTRUCTION` marks a ROLLUP ticket `actionable:false`** (XERK-1568: a `[Rollup]`
-  summary or a `rollup` label = a findings list, not work). Belt and braces: the hub excludes it on
-  its own (`isRollupTicket`); labels ride the prompt and `_ticket_fingerprint`, so labelling re-triages.
-  Tests: `TestTicketTriagePrompt`.
+- **`TICKET_TRIAGE_INSTRUCTION` judges a ROLLUP ticket as work** (a `[Rollup]` summary or a
+  `rollup` label): actionable when its findings are concrete, never false by rule — the hub
+  auto-starts rollups like any ticket (`turma-triage.md`). Labels ride the prompt and
+  `_ticket_fingerprint`, so labelling re-triages; a rollup's fingerprint also carries
+  `ROLLUP_TRIAGE_RULE`, so bumping it re-triages every rollup judged under an older rule
+  (`_is_rollup_ticket` mirrors the hub's `isRollupTicket`). Tests: `TestTicketTriagePrompt`.
 
 ### The triage ledger
 

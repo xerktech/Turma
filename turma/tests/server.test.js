@@ -13044,8 +13044,8 @@ test("XERK-550: the auto-merge content gate agrees with what auto-start would sw
     { key: "CHORE-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
       triage: { priority: "P2", type: "chore", actionable: true } },
     { key: "RAW-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
-    // XERK-1568: rollup tickets (by label, and by `[Rollup]` summary prefix — the
-    // latter operator-APPROVED, which must not force it in) gate out of both.
+    // Rollup tickets (by label, and by `[Rollup]` summary prefix) are ordinary
+    // work for both: eligible like any triaged, actionable ticket.
     { key: "ROLL-1", statusCategory: "todo", labels: ["Turma", "rollup"],
       summary: "Findings", repoGuess: { repo: "Turma", cloned: true },
       triage: { priority: "P2", type: "bug", actionable: true } },
@@ -13054,12 +13054,14 @@ test("XERK-550: the auto-merge content gate agrees with what auto-start would sw
       repoGuess: { repo: "Turma", cloned: true },
       triage: { priority: "P2", type: "bug", actionable: true } },
   ];
-  setTicketTriageAction("xcheck.atlassian.net", "ROLL-2", "approve");
   await asBeat("xc", "xcheck.atlassian.net", { autoStart: true, tickets });
   setAutoMergeOrg("xcheck.atlassian.net", true);
   autoStartRound();
-  const queued = new Set((agents.xc.commands || [])
-    .filter((c) => c.type === "spawnTicket").map((c) => c.issueKey));
+  // Dispatched (one per host per pass) or still waiting in the hub queue.
+  const queued = new Set([
+    ...(agents.xc.commands || []).filter((c) => c.type === "spawnTicket").map((c) => c.issueKey),
+    ...ticketQueue.filter((e) => e.siteKey === "xcheck.atlassian.net").map((e) => e.issueKey),
+  ]);
   const rows = new Map(tickets.map((t) => [t.key, t]));
   for (const key of rows.keys()) {
     const t = rows.get(key);
@@ -13067,13 +13069,9 @@ test("XERK-550: the auto-merge content gate agrees with what auto-start would sw
     assert.equal(gate === null, queued.has(key),
       `${key}: gate ${gate ? gate.reason : "null"} vs queued=${queued.has(key)}`);
   }
-  // The eligible bug is the only one that both queued and gates clean.
+  // The eligible bug and both rollups are the ones that queued and gate clean.
   assert.equal(autoStartContentGate("xcheck.atlassian.net", rows.get("BUG-1"), "Turma"), null);
-  assert.deepEqual([...queued], ["BUG-1"]);
-  for (const key of ["ROLL-1", "ROLL-2"]) {
-    assert.equal(autoStartContentGate("xcheck.atlassian.net", rows.get(key), "Turma").kind,
-      "rollup", key);
-  }
+  assert.deepEqual([...queued].sort(), ["BUG-1", "ROLL-1", "ROLL-2"]);
   resetAutoStart();
   delete triagePolicies["xcheck.atlassian.net"];
 });
@@ -13203,16 +13201,20 @@ test("XERK-635: the content gate rejects an epic/child and agrees with the sweep
   // A plain ticket still gates clean.
   assert.equal(autoStartContentGate("ep1.atlassian.net",
     { key: "W-1", triage: { type: "task", actionable: true } }, "Turma"), null);
-  // XERK-1568: a rollup ticket is rejected by the same gate, by either marker.
+  // A rollup ticket gates clean too, by either marker: it is ordinary work.
   const tri = { type: "task", actionable: true };
   assert.equal(autoStartContentGate("ep1.atlassian.net",
-    { key: "R-1", labels: ["rollup"], triage: tri }, "Turma").kind, "rollup");
+    { key: "R-1", labels: ["rollup"], triage: tri }, "Turma"), null);
   assert.equal(autoStartContentGate("ep1.atlassian.net",
-    { key: "R-2", summary: "[Rollup] Turma: low-severity findings", triage: tri }, "Turma").kind,
-    "rollup");
+    { key: "R-2", summary: "[Rollup] Turma: low-severity findings", triage: tri }, "Turma"), null);
+  // ...and still answers to the org's triage policy like any other ticket.
+  setTriagePolicy("ep1.atlassian.net", { excludeTypes: ["task"] });
+  assert.equal(autoStartContentGate("ep1.atlassian.net",
+    { key: "R-1", labels: ["rollup"], triage: tri }, "Turma").kind, "policy");
+  delete triagePolicies["ep1.atlassian.net"];
 });
 
-// ---- rollup tickets never auto-start or auto-merge (XERK-1568) ---------------
+// ---- rollup tickets auto-start and auto-merge like any ticket ---------------
 
 test("XERK-1568: isRollupTicket keys on the `rollup` label OR a `[Rollup]` summary prefix", () => {
   assert.equal(isRollupTicket({ key: "R-1", labels: ["Turma", "rollup"] }), true);
@@ -13225,24 +13227,23 @@ test("XERK-1568: isRollupTicket keys on the `rollup` label OR a `[Rollup]` summa
   assert.equal(isRollupTicket(null), false);
 });
 
-test("XERK-1568: the auto-start sweep never queues a rollup ticket, by label or summary", async () => {
+test("the auto-start sweep queues a rollup ticket, by label or summary, like any ticket", async () => {
   resetAutoStart();
   const triage = { priority: "P2", type: "task", actionable: true };
   const row = (key, extra) => ({ key, summary: "Fix it", statusCategory: "todo",
     repoGuess: { repo: "Turma", cloned: true }, triage, ...extra });
-  // A FULL host, so whatever the sweep admits stays visible in the hub queue
-  // (the drain's own rollup drop can't mask a sweep that let one through).
+  // A FULL host, so whatever the sweep admits stays visible in the hub queue.
   await asBeat("rollS", "roll0.atlassian.net", { capacity: FULL, tickets: [
     row("ENG-1"),
     row("ENG-2", { labels: ["rollup"] }),
     row("ENG-3", { summary: "[Rollup] Turma: low-severity findings" }),
   ] });
   autoStartSweep();
-  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["ENG-1"]);
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey).sort(), ["ENG-1", "ENG-2", "ENG-3"]);
   resetAutoStart();
 });
 
-test("XERK-1568: an auto entry whose ticket became a rollup while it waited drops from the queue", async () => {
+test("an auto entry whose ticket became a rollup while it waited still dispatches", async () => {
   resetAutoStart();
   const site = "roll1.atlassian.net";
   const triage = { priority: "P2", type: "task", actionable: true };
@@ -13256,9 +13257,23 @@ test("XERK-1568: an auto entry whose ticket became a rollup while it waited drop
     tickets: [{ key: "ENG-7", summary: "Fix it", statusCategory: "todo", labels: ["rollup"],
       repoGuess: { repo: "Turma", cloned: true }, triage }] });
   drainTicketQueue();
-  assert.equal(ticketQueue.length, 0, "the auto entry drops, no session");
-  assert.equal((agents.rollQ.commands || []).filter((c) => c.type === "spawnTicket").length, 0);
+  assert.equal(ticketQueue.length, 0, "the auto entry leaves the queue");
+  assert.deepEqual((agents.rollQ.commands || []).filter((c) => c.type === "spawnTicket")
+    .map((c) => c.issueKey), ["ENG-7"], "and starts a session");
   resetAutoStart();
+});
+
+test("auto-merge dispatches mergePr for a rollup ticket's ready PR", async () => {
+  resetMerge();
+  await mergeBeat("amRoll", "amroll.atlassian.net", {
+    tickets: [{ key: "ENG-9", summary: "[Rollup] Turma: low-severity findings",
+      statusCategory: "inprogress", type: "Task", labels: ["rollup"],
+      repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P3", type: "chore", actionable: true } }] });
+  autoMergeSweep();
+  const c = (agents.amRoll.commands || []).find((x) => x.type === "mergePr");
+  assert.ok(c, "expected a mergePr command for the rollup's PR");
+  assert.equal(c.url, PR1);
 });
 
 test("XERK-1568: a manual Start on a rollup ticket is not gated (deliberate intent)", async () => {
