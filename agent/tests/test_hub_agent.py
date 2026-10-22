@@ -19630,6 +19630,17 @@ class TestAzdoPrStatus(AzdoPrMixin, unittest.TestCase):
         self.assertIsNone(ha._azdo_check_class("notApplicable"))
         self.assertIsNone(ha._azdo_check_class(None))
 
+    def test_head_is_the_source_branch_tip(self):
+        """XERK-2198: the hub announces a new CI run on a moved head, so ADO
+        must report the source tip like GitHub's headRefOid."""
+        sha = "a" * 40
+        out = ha._summarize_azdo_pr(
+            self.pr_payload(lastMergeSourceCommit={"commitId": sha}), None)
+        self.assertEqual(out["head"], sha)
+        self.assertIsNone(ha._summarize_azdo_pr(self.pr_payload(), None)["head"])
+        self.assertIsNone(ha._summarize_azdo_pr(
+            self.pr_payload(lastMergeSourceCommit="junk"), None)["head"])
+
     def test_only_ci_policies_are_checks(self):
         """A PR waiting on a human reviewer must not read as "CI pending":
         governance policies are not this PR's CI."""
@@ -37209,6 +37220,31 @@ class TestMrStatus(unittest.TestCase):
             with mock.patch.multiple(ha, GITLAB_URL=base, GITLAB_TOKEN="tok"):
                 self.assertEqual(ha._mr_url_parts(self.MR),
                                  ("grp/sub/app", "12"), base)
+
+    def test_mr_head_is_its_sha(self):
+        # XERK-2198: the MR's tip commit, so a re-run that settles the same
+        # way still reads as new to the hub's PR-event sweep.
+        sha = "b" * 40
+        self.assertEqual(ha._summarize_mr({"state": "opened", "sha": sha})["head"], sha)
+        self.assertIsNone(ha._summarize_mr({"state": "opened"})["head"])
+
+    def test_a_pipeline_for_an_older_head_is_not_this_heads_ci(self):
+        # XERK-2198 QA: after a push GitLab reports the new sha beside the
+        # previous commit's head_pipeline until a new one exists ([skip ci]:
+        # never). Reading it as the new head's CI announced "CI passed" for a
+        # commit no CI ran on.
+        a, b = "a" * 40, "b" * 40
+        stale = ha._summarize_mr({"state": "opened", "sha": b,
+                                  "head_pipeline": {"status": "success", "sha": a}})
+        self.assertIsNone(stale["checks"])
+        self.assertEqual(stale["head"], b)
+        fresh = ha._summarize_mr({"state": "opened", "sha": b,
+                                  "head_pipeline": {"status": "success", "sha": b}})
+        self.assertEqual(fresh["checks"], "passing")
+        # A pipeline or MR naming no sha keeps the old reading.
+        self.assertEqual(ha._summarize_mr(
+            {"state": "opened", "sha": b,
+             "head_pipeline": {"status": "failed"}})["checks"], "failing")
 
     def test_mr_check_class(self):
         self.assertEqual(ha._mr_check_class("success"), "pass")

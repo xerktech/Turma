@@ -110,8 +110,9 @@ Split out of `.claude/rules/turma-board.md`. Auto-start/auto-stop live there; ep
     the agent polls about once a minute, so a short run goes settled -> settled with no pending.
     A DRAFT counts as open. A CI-less PR (`checks:null`) says nothing.
   - A head that moved with no rollup yet resets `ci` (GitHub lists no checks until they register),
-    or the new run settling the same way reads as already announced (QA). GitLab/ADO carry no
-    `head`, so for them only a verdict change is announced.
+    or the new run settling the same way reads as already announced (QA). GitLab sends the MR's
+    `sha` and ADO `lastMergeSourceCommit` as `head` (XERK-2198), so all three forges re-announce.
+    A GitLab `head_pipeline` whose `sha` is not the MR's is the previous commit's: read as no CI.
   - **Every agent-sent field is type-checked** (`prEventDiff`, `prLanded`), and each session runs in
     its own try/catch: an object `state` threw in `String()` on the leader tick and exited the hub
     (QA). Session ids are read with `Object.hasOwn` (`__proto__`).
