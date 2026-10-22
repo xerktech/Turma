@@ -9222,6 +9222,13 @@ def _summarize_mr(data):
     state = "DRAFT" if draft and state == "OPEN" else state
     counts = {"pass": 0, "fail": 0, "pending": 0}
     pipeline = data.get("head_pipeline") or data.get("pipeline")
+    # GitLab moves head_pipeline only once the NEW head has a pipeline, so after
+    # a push it can still be the previous commit's; that verdict is not this
+    # head's CI (GitLab's own diff_head_pipeline drops it the same way). Read
+    # as no CI yet, else the hub announces the old run as the new head's.
+    if (isinstance(pipeline, dict) and pipeline.get("sha") and data.get("sha")
+            and pipeline.get("sha") != data.get("sha")):
+        pipeline = None
     cls = _mr_check_class((pipeline or {}).get("status")) if isinstance(
         pipeline, dict) else None
     if cls:

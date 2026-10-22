@@ -37157,6 +37157,24 @@ class TestMrStatus(unittest.TestCase):
         self.assertEqual(ha._summarize_mr({"state": "opened", "sha": sha})["head"], sha)
         self.assertIsNone(ha._summarize_mr({"state": "opened"})["head"])
 
+    def test_a_pipeline_for_an_older_head_is_not_this_heads_ci(self):
+        # XERK-2198 QA: after a push GitLab reports the new sha beside the
+        # previous commit's head_pipeline until a new one exists ([skip ci]:
+        # never). Reading it as the new head's CI announced "CI passed" for a
+        # commit no CI ran on.
+        a, b = "a" * 40, "b" * 40
+        stale = ha._summarize_mr({"state": "opened", "sha": b,
+                                  "head_pipeline": {"status": "success", "sha": a}})
+        self.assertIsNone(stale["checks"])
+        self.assertEqual(stale["head"], b)
+        fresh = ha._summarize_mr({"state": "opened", "sha": b,
+                                  "head_pipeline": {"status": "success", "sha": b}})
+        self.assertEqual(fresh["checks"], "passing")
+        # A pipeline or MR naming no sha keeps the old reading.
+        self.assertEqual(ha._summarize_mr(
+            {"state": "opened", "sha": b,
+             "head_pipeline": {"status": "failed"}})["checks"], "failing")
+
     def test_mr_check_class(self):
         self.assertEqual(ha._mr_check_class("success"), "pass")
         self.assertEqual(ha._mr_check_class("skipped"), "pass")
