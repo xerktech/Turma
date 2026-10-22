@@ -8449,16 +8449,23 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # the first probe, and forever on a login with no windows — must not
         # narrate itself every 20 seconds. A file that IS there and IS broken is
         # worth saying, but only until it stops changing.
+        # ha.log is patched process-wide, so count only THIS thread's lines: a
+        # worker an earlier test left running logs into the same mock (XERK-2197).
+        me, mine = threading.get_ident(), []
+
+        def record(*a, **k):
+            if threading.get_ident() == me:
+                mine.append(a)
         with mock.patch.object(ha, "_limits_last_problem", None), \
-             mock.patch.object(ha, "log") as logged:
+             mock.patch.object(ha, "log", side_effect=record):
             for _ in range(3):
                 self.assertIsNone(ha.read_limits_snapshot())
-            self.assertEqual(logged.call_count, 0, "a missing snapshot logged")
+            self.assertEqual(mine, [], "a missing snapshot logged")
             with open(ha.LIMITS_PATH, "w", encoding="utf-8") as fh:
                 fh.write("{ not json")
             for _ in range(3):
                 self.assertIsNone(ha.read_limits_snapshot())
-            self.assertEqual(logged.call_count, 1, "a broken snapshot logged per beat")
+            self.assertEqual(len(mine), 1, "a broken snapshot logged per beat")
 
     def test_a_probe_that_captures_nothing_backs_off(self):
         # A login with no subscription windows (API key, Bedrock, Vertex) can
@@ -47393,11 +47400,26 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
     class _Stop(BaseException):
         pass
 
+    def _scripted_sleep(self, polls):
+        """A time.sleep that lets THIS thread through `polls` times, then stops
+        the loop. Patching ha.time.sleep patches it process-wide, so a worker
+        thread an earlier test left running would otherwise consume the
+        script's entries and the loop would run fewer passes (XERK-2197)."""
+        me, real, left = threading.get_ident(), time.sleep, [polls]
+
+        def fake(sec):
+            if threading.get_ident() != me:
+                return real(sec)
+            if left[0] <= 0:
+                raise self._Stop
+            left[0] -= 1
+        return fake
+
     def _one_pass(self, sm, mem, unit, killed=1, polls=1, panes=frozenset(),
                   procs=None):
         """Run _memguard_loop for exactly `polls` polls."""
         with mock.patch.object(ha.time, "sleep",
-                               side_effect=[None] * polls + [self._Stop]), \
+                               side_effect=self._scripted_sleep(polls)), \
                 mock.patch.object(ha, "_memguard_memory", return_value=mem), \
                 mock.patch.object(ha, "_memguard_procs",
                                   return_value=procs or {62: {"start": 1},
@@ -47465,7 +47487,7 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
     def test_loop_refreshes_the_pane_cache_while_healthy(self):
         sm = self.make_manager()
         with mock.patch.object(ha.time, "sleep",
-                               side_effect=[None] * 3 + [self._Stop]), \
+                               side_effect=self._scripted_sleep(3)), \
                 mock.patch.object(ha, "_memguard_memory",
                                   return_value=(100, 1000, 0.0)), \
                 mock.patch.object(sm, "_memguard_panes") as panes:

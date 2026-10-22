@@ -625,7 +625,13 @@ test("live: idle connections the server closed never wedge the pool", async () =
     await Promise.all([pool.query("SELECT $1", ["a"]), pool.query("SELECT $1", ["b"])]);
     assert.equal(fake.connectionCount, 2);
     fake.dropAll();
-    await new Promise((r) => setTimeout(r, 50)); // let both 'close' events land
+    // Let both 'close' events land. Polled, not a fixed sleep: on a loaded
+    // machine 50ms was not always enough, and a query sent onto a connection
+    // still closing fails the test for a reason it does not cover (XERK-2197).
+    for (const until = Date.now() + 2000; pool._conns.length && Date.now() < until;) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(pool._conns.length, 0, "both idle connections left the pool");
     let timer;
     const rows = await Promise.race([
       pool.query("SELECT $1", ["c"]),
