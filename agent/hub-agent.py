@@ -14214,6 +14214,14 @@ _PANE_MODE_NAMES = {
     "auto mode": "auto",
     "manual mode": "default",
 }
+# Shell mode (a `!` typed into an empty composer) REPLACES the mode marker with
+# "! for shell mode" (2.1.306), yet the composer is as live as ever — so every
+# "is a dialog up?" read counts it as a composer footer too (XERK-2148), else a
+# `!` draft shaped like a dialog reads as one. Whole line from its start: the
+# `?` help overlay's "! for shell mode   double tap esc …" row matches as well,
+# and it too sits over a live composer. Kept out of PANE_MODE_RE: it names no
+# permission mode, so parse_pane_mode / set_mode must never read one off it.
+PANE_SHELL_FOOTER_RE = re.compile(r"^\s*! for shell mode\b", re.M)
 
 
 def parse_pane_mode(cap):
@@ -14346,6 +14354,21 @@ PANE_PROMPT_SUBTITLE_LINES = 3
 # column 0: conversation and tool output are indented, so an indented ▔ line
 # quoted in a reply can never pose as it.
 PANE_PROMPT_EDGE_RE = re.compile(r"^▔{3}")
+# The same edge row once a tmux tip has taken it over, leaving only its last
+# "▔" at the pane's right edge (" tmux detected · scroll with PgUp… ▔", seen
+# after a fresh session's first turn, XERK-2148): counted only when the row
+# reaches the right edge (the widest line), as `_overlay_edge_rows` does.
+PANE_PROMPT_TIP_EDGE_RE = re.compile(r"^\s*\S.*\s▔\s*$")
+
+
+def _pane_prompt_edges(lines):
+    """The indexes of the bottom area's top-edge rows: a column-0 ▔ run, or a
+    row a tmux tip took over (`PANE_PROMPT_TIP_EDGE_RE`) at full width."""
+    widest = max((_pane_cells(line.rstrip()) for line in lines), default=0)
+    return {k for k, line in enumerate(lines)
+            if PANE_PROMPT_EDGE_RE.match(line)
+            or (PANE_PROMPT_TIP_EDGE_RE.match(line)
+                and _pane_cells(line.rstrip()) == widest)}
 # How far in from the pane's edge a dialog's box may end (XERK-2162: 2 cells).
 PANE_DIALOG_MARGIN = 4
 
@@ -14382,7 +14405,7 @@ def _pane_numbering_continues(lines, idx):
     return False
 
 
-def _pane_dialog_width(lines, idx, widest):
+def _pane_dialog_width(lines, idx, widest, edges=()):
     """The cells a dialog's text wraps at, for the option on line `idx`
     (XERK-2162): the right edge of the nearest box rule above it.
 
@@ -14392,7 +14415,7 @@ def _pane_dialog_width(lines, idx, widest):
     broke the run. Only a rule within `PANE_DIALOG_MARGIN` of the pane counts:
     a short rule in a diff or plan body is content, not the box."""
     for k in range(idx - 1, -1, -1):
-        if PANE_PROMPT_EDGE_RE.match(lines[k]):
+        if PANE_PROMPT_EDGE_RE.match(lines[k]) or k in edges:
             break
         if PANE_PROMPT_RULE_RE.match(lines[k]) and lines[k].strip():
             edge = _pane_cells(lines[k].rstrip())
@@ -14401,7 +14424,7 @@ def _pane_dialog_width(lines, idx, widest):
     return widest
 
 
-def _pane_under_edge(lines, idx):
+def _pane_under_edge(lines, idx, edges=()):
     """Whether the question above line `idx` sits in Claude Code's bottom area:
     above it only blanks, the question itself and box rules up to the ▔ edge
     (XERK-2162). A subtitle is accepted only there — a reply in the
@@ -14410,7 +14433,7 @@ def _pane_under_edge(lines, idx):
     seen_q = False
     for k in range(idx - 1, -1, -1):
         line = lines[k]
-        if PANE_PROMPT_EDGE_RE.match(line):
+        if PANE_PROMPT_EDGE_RE.match(line) or k in edges:
             return seen_q
         if not line.strip() or PANE_PROMPT_RULE_RE.match(line):
             continue
@@ -14486,6 +14509,8 @@ def parse_pane_prompt(cap, face=False):
     # legitimate rule/detail line is made of.
     lines = [_PANE_SCROLLBAR_RE.sub("", l) for l in cap.splitlines()]
     widest = None                    # the pane's width, measured on first need
+    edges = None                     # overlay edge rows, read on first need
+    area = _pane_prompt_edges(lines)  # the bottom area's top edge (tip rows too)
     if _pane_composer_tail_up(lines):
         return None                  # the toast or a cut footer: composer is live
     # A mode footer anywhere below means the composer is live -> no dialog.
@@ -14493,7 +14518,8 @@ def parse_pane_prompt(cap, face=False):
         line = lines[i]
         m = PANE_PROMPT_OPTION_RE.match(line)
         if not m or m.group(2) == "0":
-            if PANE_MODE_RE.search(line) or QWEN_PANE_FOOTER_RE.search(line):
+            if (PANE_MODE_RE.search(line) or QWEN_PANE_FOOTER_RE.search(line)
+                    or PANE_SHELL_FOOTER_RE.match(line)):
                 return None          # composer footer (Claude or Qwen): nothing
                                      # is blocking
             continue
@@ -14501,7 +14527,7 @@ def parse_pane_prompt(cap, face=False):
         # option's wrapped label lines (never a picker's description line).
         if widest is None:
             widest = max(_pane_cells(l.rstrip()) for l in lines)
-        width = _pane_dialog_width(lines, i, widest)
+        width = _pane_dialog_width(lines, i, widest, area)
         rows = []                    # (first, last) screen line of each option
         nxt = i                      # where the scan for the next option up starts
         last = _pane_option_wrap_end(lines, i, width)
@@ -14561,7 +14587,7 @@ def parse_pane_prompt(cap, face=False):
                 k -= 1
             if (0 <= k and not lines[k].strip()
                     and q - k <= PANE_PROMPT_SUBTITLE_LINES
-                    and _pane_under_edge(lines, k)):
+                    and _pane_under_edge(lines, k, area)):
                 # Joined into one line: its wrap moves with the pane's width.
                 subtitle = [" ".join(l.strip() for l in lines[k + 1:q + 1])]
                 q = k
@@ -14569,18 +14595,28 @@ def parse_pane_prompt(cap, face=False):
                     q -= 1
         if q < 0 or not lines[q].strip().endswith("?"):
             continue
+        # An overlay's "▔" top edge BELOW the run puts it in the conversation
+        # behind a footerless overlay (/model, /skills, /plugin): its digits
+        # would be typed into the overlay (XERK-2148 QA). Below the LAST
+        # option row only: an option label wrapped at 12-24 columns can leave
+        # a row of bare "▔" inside the run (a path ending "./▔▔…").
+        if edges is None:
+            edges = _overlay_edge_rows(lines)
+        if any(e > rows[-1][1] for e in edges):
+            continue
         prompt = lines[q].strip()
         # Walk up for the fenced block above the question: skip blanks and rules
         # until real text starts, then stop at the rule that closes it.
         # `block` is the same walk with no line cap: the dialog's whole visible
         # body, hashed into `id` below.
         block = []
-        for line in reversed(lines[:q]):
+        for k in range(q - 1, -1, -1):
+            line = lines[k]
             text = line.strip()
             if not text:
                 continue         # a blank never closes the block (the TUI puts
                                  # one between a dialog's title and its body)
-            if PANE_PROMPT_EDGE_RE.match(line):
+            if PANE_PROMPT_EDGE_RE.match(line) or k in area:
                 break            # the bottom area's top edge: transcript above
             if PANE_PROMPT_RULE_RE.match(line):
                 if block:
@@ -17698,23 +17734,6 @@ def _clear_leftover(tmux_name, epoch):
     return None
 
 
-def _capture_pane_styled(tmux_name):
-    """The pane with its SGR escapes kept (`capture-pane -e`), or None when
-    it can't be captured — or on Windows, whose grid capture carries no
-    attributes."""
-    if IS_WINDOWS or not tmux_name:
-        return None
-    try:
-        out = subprocess.run(
-            _tmux("capture-pane", "-p", "-e", "-t", _tmux_pane(tmux_name),
-                  name=tmux_name),
-            capture_output=True, text=True, timeout=5,
-        )
-    except Exception:
-        return None
-    return out.stdout if out.returncode == 0 else None
-
-
 # A dim span (SGR 2) up to the next reset — how Claude Code draws the empty
 # composer's placeholder ('Try "how does <filepath> work?"', 2.1.306).
 _DIM_SPAN_RE = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)")
@@ -17737,7 +17756,17 @@ def _composer_holds_text(styled):
         return True
     rows = lines[rules[-2] + 1:rules[-1]]
     text = "".join(_ANSI_RE.sub("", _DIM_SPAN_RE.sub("", row)) for row in rows)
-    return bool(text.replace("❯", "").replace("\xa0", "").strip())
+    text = text.replace("❯", "").replace("\xa0", "").strip()
+    # Under NO_COLOR the whole pane carries no SGR at all, so the placeholder
+    # is not dim and reads like a draft — then the switch waited for a first
+    # turn that clears it (XERK-2148). Only on such a pane is its `Try "…"`
+    # text taken for the placeholder, as `_composer_draft` takes it: a draft
+    # typed to that exact shape is indistinguishable there. A styled pane
+    # keeps the dim test alone, so it never mistakes such a draft for empty.
+    if "\x1b[" not in styled and _COMPOSER_PLACEHOLDER_NORM_RE.fullmatch(
+            _composer_norm(text)):
+        return False
+    return bool(text)
 
 
 def _composer_blocks_switch(styled):
@@ -18662,7 +18691,8 @@ def _trust_dialog_up(cap):
     text = _ANSI_RE.sub("", cap)
     if not _TRUST_DIALOG_RE.search(text):
         return False
-    if PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text):
+    if (PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
+            or any(PANE_SHELL_FOOTER_RE.match(line) for line in _pane_footer_lines(text))):
         return False           # the composer footer is live: no modal is up
     if _pane_composer_tail_up(_pane_lines(text)):
         return False           # the exit toast / a cut footer hides it (XERK-2171)
@@ -18693,6 +18723,77 @@ def _trust_dialog_up(cap):
 # wrapped on a narrow pane — the picker at 40 columns ("… · Esc" / "to cancel"),
 # the elicitation's four-item footer onto five lines at 20 — plus one spare.
 _DIALOG_HINT_LINES = 6
+# The footer items that say an overlay owns the keyboard, each a whole
+# `·`-item, case-folded (2.1.306): "Esc to cancel" (pickers, elicitations,
+# /permissions, the permission dialog), "Esc to clear" (/config's filter),
+# "Esc to close" (/hooks, /tasks), "ctrl+o to toggle" (the Ctrl-O detailed
+# transcript view) and "enter to return" (the ← agents panel, whose own box
+# would take a typed message as a NEW session's task), and the background
+# shell's detail view ("← to go back · Esc/Enter/Space to close · x to stop",
+# where a relayed "x" stops the shell). None is ever a whole item of a
+# composer footer: those carry the mode marker, "? for shortcuts", "← for
+# agents", "esc to interrupt" or "! for shell mode" (XERK-2148).
+_DIALOG_HINT_ITEMS = frozenset((
+    "esc to cancel", "esc to clear", "esc to close", "ctrl+o to toggle",
+    "enter to return", "esc/enter/space to close", "x to stop"))
+# The top edge Claude Code draws over a full-screen overlay (/model, /skills,
+# /tasks, /config …): a row of "▔", the effort hint maybe inset ("▔▔▔ ◐ medium
+# · /effort ▔"). A composer is never drawn under one. After a fresh session's
+# first turn a tmux tip can take the row over, leaving only its last cell
+# (" tmux focus-events off · add … ▔"): `_OVERLAY_TIP_EDGE_RE`, which counts
+# only when it reaches the pane's right edge (`_overlay_edge_rows`).
+_OVERLAY_EDGE_RE = re.compile(r"^\s*▔{3,}(?:.*▔)?\s*$")
+_OVERLAY_TIP_EDGE_RE = re.compile(r"^\s*\S.*\s▔\s*$")
+
+
+def _overlay_edge_rows(lines):
+    """Indexes of the lines that are an overlay's "▔" top edge: a run of "▔"
+    (the effort hint maybe inset), or a row a tmux tip took over that still
+    ends in the edge's last "▔" at the pane's right edge — the widest line, so
+    a reply that merely ends in " ▔" short of the edge is not one (XERK-2148)."""
+    widest = max((_pane_cells(line.rstrip()) for line in lines), default=0)
+    return [i for i, line in enumerate(lines)
+            if _OVERLAY_EDGE_RE.match(line)
+            or (_OVERLAY_TIP_EDGE_RE.match(line) and _pane_cells(line.rstrip()) == widest)]
+
+
+def _overlay_edge_up(lines):
+    """Whether the pane's bottom is a full-screen overlay read off its "▔"
+    top edge, for an overlay showing no footer: a long /skills list scrolls
+    its footer off a 40-row pane (its hints ride the header), and /plugin
+    draws only its tab bar and "✶ Loading…" while it loads (XERK-2148).
+
+    Read below the LAST edge only, and only when nothing there is the
+    composer's: no composer rule (the composer is boxed in "─" rules, so a
+    reply quoting an edge is followed by one), no composer footer (mode
+    marker, shell mode, qwen's) and no exit toast. The edge is TUI chrome
+    drawn only over an overlay; with no composer under it the overlay is
+    what owns the keyboard."""
+    edge = max(_overlay_edge_rows(lines), default=None)
+    if edge is None:
+        return False
+    body = [line for line in lines[edge + 1:] if line.strip()]
+    text = "\n".join(body)
+    return bool(body) and not (
+        any(_COMPOSER_RULE_RE.match(line) or PANE_SHELL_FOOTER_RE.match(line)
+            or PANE_EXIT_TOAST_RE.match(line) for line in body)
+        or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
+        # A pane narrower than the rule regex's 10 cells draws a shorter
+        # composer rule and a width-cut footer (a bare "⏵⏵"): the composer
+        # all the same (XERK-2171's read).
+        or _pane_composer_tail_up(lines))
+
+
+def _pane_footer_lines(lines):
+    """The pane's last non-blank lines below its last rule (at most
+    `_DIALOG_HINT_LINES`, stripped): where a footer sits. `lines` is a capture
+    or its ANSI-free lines."""
+    if isinstance(lines, str):
+        lines = _ANSI_RE.sub("", lines).splitlines()
+    lines = [_PANE_SCROLLBAR_RE.sub("", line).strip() for line in lines]
+    last_rule = max((i for i, line in enumerate(lines)
+                     if line and PANE_PROMPT_RULE_RE.match(line)), default=-1)
+    return [line for line in lines[last_rule + 1:] if line][-_DIALOG_HINT_LINES:]
 
 
 def _hint_dialog_up(cap):
@@ -18713,14 +18814,16 @@ def _hint_dialog_up(cap):
     What they share is their LAST line: a `·`-separated key-hint list carrying
     "Esc to cancel" ("Enter to select · ↑/↓ to navigate · Esc to cancel"). The
     numbered permission dialog ends the same way ("Esc to cancel · Tab to
-    amend"), as does the trust modal.
+    amend"), as does the trust modal. The settings overlays, the Ctrl-O
+    transcript view and the ← agents panel end in another item of
+    `_DIALOG_HINT_ITEMS` instead (XERK-2148).
 
     Never wording alone (agent.md): the item must be the bottom of the screen,
     where only the TUI's own chrome lives while it runs — conversation text,
     tool output and `!` output all draw ABOVE the composer — and no composer
-    footer (Claude's mode marker, qwen's) may be among those lines. A whole
-    `·`-item must read "Esc to cancel", so qwen's busy spinner "(… · esc to
-    cancel)" is not one."""
+    footer (Claude's mode marker, its shell-mode footer, qwen's) may be among
+    those lines. A whole `·`-item must read as one of `_DIALOG_HINT_ITEMS`, so
+    qwen's busy spinner "(… · esc to cancel)" is not one."""
     if not cap:
         return False
     lines = [_PANE_SCROLLBAR_RE.sub("", line).strip()
@@ -18729,11 +18832,10 @@ def _hint_dialog_up(cap):
     # one, while the composer is boxed in rules — so a footer-replacing toast
     # ("Press Ctrl-C again to exit", which hides the mode marker) cannot reach
     # back past the composer to a reply line that quotes the footer.
-    last_rule = max((i for i, line in enumerate(lines)
-                     if line and PANE_PROMPT_RULE_RE.match(line)), default=-1)
-    tail = [line for line in lines[last_rule + 1:] if line][-_DIALOG_HINT_LINES:]
+    tail = _pane_footer_lines(lines)
     joined = " ".join(tail)
-    if not tail or PANE_MODE_RE.search(joined) or QWEN_PANE_FOOTER_RE.search(joined):
+    if (not tail or PANE_MODE_RE.search(joined) or QWEN_PANE_FOOTER_RE.search(joined)
+            or any(PANE_SHELL_FOOTER_RE.match(line) for line in tail)):
         return False
     # Each line's own items, plus the seam a wrap makes: the last item of one
     # line run on into the first of the next. Joining the lines whole would glue
@@ -18745,7 +18847,8 @@ def _hint_dialog_up(cap):
         if prev is not None:
             items.append(prev + " " + parts[0])
         prev = parts[-1]
-    return any(" ".join(item.split()).lower() == "esc to cancel" for item in items)
+    return (any(" ".join(item.split()).lower() in _DIALOG_HINT_ITEMS for item in items)
+            or _overlay_edge_up(_ANSI_RE.sub("", cap).splitlines()))
 
 
 def _pane_blocking_dialog(cap):
@@ -18761,15 +18864,75 @@ def _pane_blocking_dialog(cap):
         elicitation, the project MCP-server approval — XERK-2142);
       * the /model picker's "Switch model?" confirm, which has no footer at
         all (`parse_model_switch_confirm`, XERK-2157): an Enter or a typed
-        "1" answers Yes.
-    Keeping the last two OUT of `parse_pane_prompt` is deliberate: `panePrompt`
+        "1" answers Yes;
+      * the /model picker itself read off its body (`_model_picker_open`), for
+        a pane too short to draw its footer (XERK-2148: 40x45 wraps it off);
+      * a choice dialog cut off below its first option (`_pane_cut_dialog_up`:
+        a 10-row pane draws "Exit plan mode?" down to "❯ 1." only).
+    Keeping the last four OUT of `parse_pane_prompt` is deliberate: `panePrompt`
     is a wire contract whose options the chat page renders as clickable digits,
     and these have no digit to click (or, for the picker, digits that a
     free-text row and a multi-question tab bar make unsafe to offer) —
     surfacing them there would offer the operator a button that does nothing."""
     return (bool(parse_pane_prompt(cap)) or _trust_dialog_up(cap)
             or _hint_dialog_up(cap)
-            or parse_model_switch_confirm(cap) is not None)
+            or parse_model_switch_confirm(cap) is not None
+            or _model_picker_open(cap)
+            or _pane_cut_dialog_up(cap))
+
+
+# An idle composer's rule, drawn from column 0 (a dialog's box rule is indented).
+_COMPOSER_EDGE_RULE_RE = re.compile(r"^─{10,}")
+# How many wrapped label lines may follow the cut-off dialog's "❯ 1." row.
+_PANE_CUT_OPTION_WRAP_LINES = 4
+
+
+def _pane_cut_dialog_up(cap):
+    """Whether the pane's bottom is a choice dialog cut off before its option
+    run is drawn: a pane ~10 rows high draws "Exit plan mode?" / "Ready to
+    code?" down to "❯ 1. Yes, …" and no further, one 8 rows high down to its
+    subtitle (2.1.306, XERK-2148). The 1..N run `parse_pane_prompt` needs is
+    never drawn — and a typed digit or Enter still answers it (QA: a queued
+    message's Enter approved leaving plan mode). No panePrompt is offered.
+
+    Read inside the bottom area that starts at its ▔ top edge
+    (`_pane_prompt_edges`, which a dialog draws and an idle composer never
+    does), and only when nothing there is the composer's: no "❯" prompt and
+    no "─" rule at column 0 (an idle composer always draws its rule there,
+    a dialog's box rule is indented), no mode/shell/qwen footer and no exit
+    toast. Then either the area's first line is a question ending in "?", or
+    the last lines are "❯ 1." (the cursor on option 1) plus at most a few
+    indented wraps of its label, with a question above them."""
+    if not cap:
+        return False
+    lines = [_PANE_SCROLLBAR_RE.sub("", line).rstrip()
+             for line in _ANSI_RE.sub("", cap).splitlines()]
+    edge = max(_pane_prompt_edges(lines), default=None)
+    if edge is None:
+        return False
+    area = lines[edge + 1:]
+    text = "\n".join(area)
+    if (any(line.startswith("❯") or _COMPOSER_EDGE_RULE_RE.match(line) for line in area)
+            or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
+            or PANE_SHELL_FOOTER_RE.search(text) or _pane_composer_tail_up(lines)):
+        return False
+    asks = lambda line: line.strip().rstrip("↓ ").endswith("?")
+    content = [line for line in area
+               if line.strip() and not PANE_PROMPT_RULE_RE.match(line)]
+    if content and asks(content[0]):
+        return True
+    filled = [k for k, line in enumerate(area) if line.strip()]
+    for n, k in enumerate(reversed(filled)):
+        m = PANE_PROMPT_OPTION_RE.match(area[k])
+        if m:
+            break
+        if n >= _PANE_CUT_OPTION_WRAP_LINES or not area[k][:1].isspace():
+            return False
+    else:
+        return False
+    if not (m.group(1) and m.group(2) == "1" and area[k][:1].isspace()):
+        return False
+    return any(asks(line) for line in area[:k])
 
 
 def _answer_trust_dialog(tmux_name, cap=None):
@@ -19652,6 +19815,18 @@ SHADOW_GRADE_TIMEOUT_SEC = _env_int("TURMA_SHADOW_GRADE_TIMEOUT_SEC", 2 * 3600, 
 # A terminal record is reported for this long (the hub's ledger is durable), then dropped.
 SHADOW_KEEP_SEC = 3 * 86400
 SHADOW_ID_RE = re.compile(r"sh-[0-9a-f]{8,32}")
+# The failure a run still being placed when the manager stopped is loaded as
+# (XERK-2148). A re-delivery of its spawnShadow may place it again.
+SHADOW_PLACING_LOST = "the manager restarted before the shadow was launched"
+
+
+def _shadow_ts(v):
+    """`v` as a shadow-run epoch-seconds time, or None. shadow-runs.json is
+    session-writable, and an inf/1e300 there made fromtimestamp raise inside
+    every heartbeat (XERK-2148 QA): only a finite, positive time before 9999."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return v if 0 < v < 253402300800 else None
 SHADOW_SHA_RE = re.compile(r"[0-9a-f]{40}")
 SHADOW_GRADER_MODEL = "opus"
 SHADOW_NOTE_MAX = 2000
@@ -24825,11 +25000,18 @@ MODELS_PROBE_TIMEOUT_SEC = _env_int("TURMA_MODELS_PROBE_TIMEOUT_SEC", 90)
 # fetch.
 MODEL_PICKER_TRIES = 10
 MODEL_PICKER_WAIT_SEC = 0.3
+# After giving up on the picker, how many more polls (WAIT_SEC apart) watch
+# for one painting late on a cold session, to close it (XERK-2148).
+MODEL_PICKER_LATE_TRIES = 15
 # The arrow loop: one press at a time, each verified by re-reading the ❯
 # before the next (MAX_STEPS bounds a cursor that never converges). STEP_*
 # pace the per-press readback; CONFIRM_* pace the wait for the "Set model to…"
 # confirmation after `s`.
 MODEL_PICKER_MAX_STEPS = 12
+# Presses set_model may spend scrolling a long picker to bring its target row
+# into view (XERK-2148): up to the top, then down — 2.1.306 lists 13 rows, and
+# the window shows ~10 of them.
+MODEL_PICKER_SCROLL_MAX = 40
 MODEL_STEP_TRIES = 8
 MODEL_STEP_WAIT_SEC = 0.12
 MODEL_CONFIRM_TRIES = 15
@@ -24892,34 +25074,85 @@ def parse_model_picker(text):
     stripped — it sits 2+ spaces right of the label; the ✔ current-model mark
     dropped) and the index the ❯ cursor is on, or ([], None) when the capture
     holds no picker. Only the region from the last "Select model" heading down
-    is read, so numbered lines in the conversation above can't parse as rows."""
+    is read, so numbered lines in the conversation above can't parse as rows.
+    Only the DRAWN rows are returned: a long list scrolls, marking its first
+    drawn row "↑ 4." and its last "↓ 10." (`_model_picker_more_below`). A narrow
+    pane truncates a label ("Sonne…" at 24 columns); it is kept as drawn and
+    `_picker_index_for` judges it."""
+    rows, cur = [], None
+    for marks, _num, label in _model_picker_rows(text):
+        rows.append(label)
+        if "❯" in marks:
+            cur = len(rows) - 1
+    return rows, cur
+
+
+# A /model picker row: the ❯ cursor and/or a scroll arrow ("↑" on the first
+# drawn row of a list scrolled down, "↓" on the last when more follow), then
+# "N." and the label (2.1.306).
+_MODEL_PICKER_ROW_RE = re.compile(r"^\s*((?:[❯↑↓]\s+)*)(\d+)\.\s+(.+?)\s*$")
+# The line under a scrolled list saying how many rows follow ("… +3 models").
+_MODEL_PICKER_MORE_RE = re.compile(r"^\s*…\s*\+\d+\s+models?\b")
+
+
+def _model_picker_region(text):
+    """The capture's lines from the last "Select model" heading down, or None."""
     text = ANSI_RE.sub("", text or "")
     pos = text.rfind("Select model")
-    if pos < 0:
-        return [], None
-    rows, cur = [], None
-    for line in text[pos:].splitlines():
-        m = re.match(r"^\s*(❯\s+)?(\d+)\.\s+(.+?)\s*$", line)
+    return None if pos < 0 else text[pos:].splitlines()
+
+
+def _model_picker_rows(text):
+    """Each drawn picker row as (marks, number, label): its ❯/↑/↓ glyphs, its
+    row number, and its label with the description column and the ✔ dropped."""
+    out = []
+    for line in _model_picker_region(text) or ():
+        m = _MODEL_PICKER_ROW_RE.match(line)
         if not m:
             continue
         label = re.split(r"\s{2,}", m.group(3))[0].replace("✔", "").strip()
-        if not label:
-            continue
-        rows.append(label)
-        if m.group(1):
-            cur = len(rows) - 1
-    return rows, cur
+        if label:
+            out.append((m.group(1), int(m.group(2)), label))
+    return out
+
+
+def _model_picker_more_below(text):
+    """Whether a scrolled picker has rows it does not draw below its last
+    drawn row: "↓" on that row, "… +N models", or a narrow pane's "↓" ending
+    the last drawn line, which a wrapped description pushed the rest past.
+    set_model scrolls down to reach a row it can't see (XERK-2148); rows
+    ABOVE it judges by row number, since a pane too short for more than one
+    row draws no "↑"."""
+    region = [line.rstrip() for line in _model_picker_region(text) or () if line.strip()]
+    return (any("↓" in marks for marks, _, _ in _model_picker_rows(text))
+            or any(_MODEL_PICKER_MORE_RE.match(line) for line in region)
+            or bool(region) and region[-1].endswith(" ↓"))
+
+
+def _picker_head_is(head, word):
+    """Whether a picker row's first word `head` (case-folded) names `word`:
+    the same word, or one a narrow pane truncated ("sonne…", "defau…" at 24
+    columns) to a stem that `word` starts with and no other model family does.
+    A bare "…" (20 columns) or a stem two families share names nothing."""
+    if head == word:
+        return True
+    if not head.endswith("…"):
+        return False
+    stem = head[:-1]
+    names = {"default", word, *MODEL_ALIASES}
+    return word.startswith(stem) and sum(n.startswith(stem) for n in names) == 1
 
 
 def _picker_index_for(rows, resolved):
     """The picker row a resolved model alias (None = default) selects, or None
     when the picker doesn't offer it. Rows lead with the alias as a word —
     "Default (recommended)", "Opus", "Fable ✔" — so the match is on the first
-    word, case-folded."""
+    word, case-folded; a truncated one counts when unambiguous
+    (`_picker_head_is`)."""
     want = (resolved or "default").lower()
     for i, label in enumerate(rows):
         head = label.split()[0].lower() if label.split() else ""
-        if head == want:
+        if _picker_head_is(head, want):
             return i
     return None
 
@@ -24938,12 +25171,16 @@ def parse_model_switch_confirm(text):
     option must be the pane's LAST non-blank line (nothing a conversation
     prints sits below the composer), "1. Yes, switch to …" above it (its name
     wrapped onto the lines between on a narrow pane), and the "Switch model?"
-    heading above that, with no rule in between."""
+    heading above that, with no rule in between. A pane ~14 rows high draws
+    the confirm down to the Yes row only, "2. No, go back" below the bottom
+    (2.1.306, XERK-2148): then the Yes row (and its wrap) is the last line."""
     lines = [line.strip() for line in _pane_lines(text)]
     filled = [i for i, line in enumerate(lines) if line]
-    if not filled or not MODEL_SWITCH_BACK_RE.match(lines[filled[-1]]):
+    if not filled:
         return None
-    back = filled[-1]
+    # `back` is where the Yes row's text ends: at the No row, or past the
+    # last line when the No row is not drawn.
+    back = filled[-1] if MODEL_SWITCH_BACK_RE.match(lines[filled[-1]]) else filled[-1] + 1
     for yes in range(back - 1, max(-1, back - 5), -1):
         if MODEL_SWITCH_YES_START_RE.match(lines[yes]):
             break
@@ -25018,14 +25255,26 @@ def _model_switch_landed(before, after, label):
 
 
 def _model_picker_open(cap):
-    """Whether the /model picker is drawn: its rows parse and the composer's
-    mode footer, which the picker hides, is not on screen — nor the exit toast
-    or a width-cut footer standing in for it (XERK-2171). Its own key-hint
-    footer is not required — a narrow pane pushes it off-screen."""
-    text = _ANSI_RE.sub("", cap or "")
-    return bool(parse_model_picker(cap)[0]
-                and not PANE_MODE_RE.search(text)
-                and not _pane_composer_tail_up(_pane_lines(text)))
+    """Whether the /model picker is drawn: its rows parse, no rule follows its
+    heading (the composer, which the picker replaces, is boxed in rules), and
+    no composer footer is on screen — nor the exit toast or a width-cut
+    footer standing in for it (XERK-2171). Its own key-hint footer is not
+    required — a narrow pane pushes it off-screen (40x45 wraps it off,
+    XERK-2148)."""
+    region = _model_picker_region(cap)
+    if not region or not parse_model_picker(cap)[0]:
+        return False
+    if any(line.strip() and PANE_PROMPT_RULE_RE.match(line) for line in region):
+        return False
+    # Footers are looked for below the heading only: a composer's footer sits
+    # there whenever one is drawn, while a conversation line above the picker
+    # that merely reads like one ("! for shell mode") must not hide it.
+    # The toast / a cut footer is read below the pane's LAST rule, as
+    # everywhere (`_pane_composer_tail_up`).
+    text = "\n".join(region)
+    return not (PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
+                or PANE_SHELL_FOOTER_RE.search(text)
+                or _pane_composer_tail_up(_pane_lines(cap)))
 
 
 def _model_names_row(name, label):
@@ -25037,9 +25286,9 @@ def _model_names_row(name, label):
     if not words or not row:
         return False
     is_default = words[-1] == "(default)"
-    if row[0] == "default":
+    if _picker_head_is(row[0], "default"):
         return is_default or words[0] == "default"
-    return not is_default and words[0] == row[0]
+    return not is_default and _picker_head_is(row[0], words[0])
 
 
 def clean_summary(raw):
@@ -25813,8 +26062,8 @@ class SessionManager:
         self.shadow_runs = self._load_shadow_runs()
         # spawnShadows whose base is being placed off the beat (XERK-2167):
         # id -> job; the worker adds `result`, the beat pops and launches it.
-        # In memory: a restart mid-placement loses the run, which the hub stops
-        # counting once it goes unreported (shadowsDispatchedSince).
+        # Each is also saved as a `_placing` marker in shadow-runs.json before
+        # the command is acked, which a restart loads as a failed run.
         self._shadow_placing = {}
         self._shadow_place_lock = threading.Lock()
         self._epic_builders_lock = threading.Lock()
@@ -30645,6 +30894,25 @@ class SessionManager:
                 "error", "startedAt", "phaseAt", "endedAt", "modelActual", "ticketText",
                 "branchDropped")
                 if r.get(k) is not None}
+            for k in ("startedAt", "phaseAt", "endedAt"):
+                if k in out[rid] and _shadow_ts(out[rid][k]) is None:
+                    del out[rid][k]
+        # A run still being placed when the manager stopped (XERK-2148): its
+        # placement died with the process, so it is reported failed rather than
+        # left unreported, counting toward the hub's daily cap until it is lost.
+        placing = (data or {}).get("_placing")
+        now = time.time()
+        for rid, m in (placing.items() if isinstance(placing, dict) else ()):
+            if not (isinstance(rid, str) and SHADOW_ID_RE.fullmatch(rid)
+                    and isinstance(m, dict)) or rid in out:
+                continue
+            at = _shadow_ts(m.get("startedAt")) or now
+            out[rid] = {"id": rid, "siteKey": str(m.get("siteKey") or "")[:200],
+                        "issueKey": str(m.get("issueKey") or "")[:64],
+                        "model": str(m.get("model") or "")[:40], "startedAt": at,
+                        "state": "failed", "error": SHADOW_PLACING_LOST,
+                        "endedAt": now, "phaseAt": now}
+            log(f"shadow run {rid} failed: {SHADOW_PLACING_LOST}")
         return out
 
     def _save_shadow_runs(self):
@@ -30654,6 +30922,11 @@ class SessionManager:
             data = dict(self.shadow_runs)
             data["_sessions"] = {"sids": self.shadow_sids[-SHADOW_SESSIONS_KEEP:],
                                  "tids": self.shadow_tids[-SHADOW_SESSIONS_KEEP:]}
+            with self._shadow_place_lock:
+                data["_placing"] = {
+                    rid: {"siteKey": j["cmd"].get("siteKey"), "issueKey": j["key"],
+                          "model": j["model"], "startedAt": j["at"]}
+                    for rid, j in self._shadow_placing.items()}
             with open(tmp, "w") as f:
                 json.dump(data, f)
             os.replace(tmp, SHADOW_RUNS_PATH)
@@ -30707,7 +30980,9 @@ class SessionManager:
             log(f"spawnShadow with a bad id {rid[:40]!r} — ignored")
             return
         with self._shadow_place_lock:
-            if rid in self.shadow_runs or rid in self._shadow_placing:
+            prev = self.shadow_runs.get(rid)
+            if rid in self._shadow_placing or (
+                    prev and prev.get("error") != SHADOW_PLACING_LOST):
                 return   # a re-delivered command
         if not MODEL_SHADOW:
             return self._fail_shadow(rid, cmd, "shadow runs are off on this host")
@@ -30732,11 +31007,13 @@ class SessionManager:
         if not repo or not repo_forkable(repo["path"]):
             return self._fail_shadow(rid, cmd, "the repo is not cloned on this host")
         job = {"rid": rid, "cmd": cmd, "key": key, "model": model, "merge": merge,
-               "repo": repo}
+               "repo": repo, "at": time.time()}
         # Marked BEFORE the thread starts, so a re-delivery in this same batch
-        # is already a no-op.
+        # is already a no-op; saved before the command is acked (the next
+        # heartbeat), so a restart mid-placement reports a failed run.
         with self._shadow_place_lock:
             self._shadow_placing[rid] = job
+        self._save_shadow_runs()
         try:
             threading.Thread(target=self._place_shadow, args=(job,),
                              name="shadow-place", daemon=True).start()
@@ -30849,7 +31126,10 @@ class SessionManager:
                     if self._advance_shadow_grade(rid, r, now):
                         return
                 elif st in ("graded", "failed"):
-                    if now - (r.get("endedAt") or now) > SHADOW_KEEP_SEC:
+                    # Every record this agent writes carries its times; one
+                    # missing (dropped as invalid on load) reads as long past,
+                    # never as now, which would keep it forever (XERK-2148).
+                    if now - (r.get("endedAt") or 0) > SHADOW_KEEP_SEC:
                         self.shadow_runs.pop(rid, None)
                         self._save_shadow_runs()
         except Exception as e:
@@ -30862,7 +31142,7 @@ class SessionManager:
         if self._shadow_session_live(sid):
             if sess and sess.get("modelActual"):
                 r["modelActual"] = sess["modelActual"]
-            if note is None and now - (r.get("phaseAt") or now) < SHADOW_RUN_TIMEOUT_SEC:
+            if note is None and now - (r.get("phaseAt") or 0) < SHADOW_RUN_TIMEOUT_SEC:
                 return False
         if sess is None:
             self._set_shadow(rid, state="failed", error="the shadow session is gone",
@@ -30937,7 +31217,7 @@ class SessionManager:
         grade = read_shadow_grade(gsid) if gsid else None
         if grade is None:
             if self._shadow_session_live(gsid) and \
-                    now - (r.get("phaseAt") or now) < SHADOW_GRADE_TIMEOUT_SEC:
+                    now - (r.get("phaseAt") or 0) < SHADOW_GRADE_TIMEOUT_SEC:
                 return False
             self._set_shadow(rid, state="failed", endedAt=now, phaseAt=now,
                              error="the grader ended without a grade")
@@ -30990,7 +31270,9 @@ class SessionManager:
                 if isinstance(r.get(k), str):
                     row[k] = r[k]
             for k in ("startedAt", "endedAt"):
-                if isinstance(r.get(k), (int, float)):
+                # Validated on load too; checked here as well so no record can
+                # raise out of build_payload and fail every heartbeat.
+                if _shadow_ts(r.get(k)) is not None:
                     row[k] = datetime.datetime.fromtimestamp(
                         r[k], datetime.timezone.utc).isoformat()
             if isinstance(r.get("grade"), dict):
@@ -33095,8 +33377,7 @@ class SessionManager:
                     run(["git", "-C", repo, "branch", "-D", created_branch])
                 if aside and not os.path.exists(cwd):
                     try:
-                        os.rename(aside, cwd)
-                        run(["git", "-C", repo, "worktree", "repair", cwd])
+                        self._rename_worktree(repo, aside, cwd, t)
                     except OSError as e:
                         log(f"migration: could not put {aside} back at {cwd}: {e}")
                 raise
@@ -33189,14 +33470,35 @@ class SessionManager:
             run_ok(["git", "-C", cwd, "checkout", "-q", "--detach"], timeout=t)
         aside = f"{cwd}.pre-migration-{int(time.time())}"
         try:
-            os.rename(cwd, aside)
+            self._rename_worktree(repo, cwd, aside, t)
         except OSError as e:
             raise RuntimeError(f"an older worktree is in the way at {cwd} and could "
                                f"not be moved aside: {e}")
-        if own:
-            run(["git", "-C", repo, "worktree", "repair", aside])
         log(f"migration: kept the older worktree at {cwd} as {aside}")
         return aside
+
+    def _rename_worktree(self, repo, src, dst, timeout):
+        """Rename a worktree dir and repair git's entry for it, LOCKED across the
+        two (XERK-2148): a `git worktree prune` — any caller's, this agent's or a
+        session's own — landing between them reads the entry's path as gone and
+        deletes its admin dir, so the moved copy loses its HEAD and index. A
+        prune skips a locked entry. A dir with no `.git` is only renamed. A lock
+        already held (the operator's) is left in place. Raises the rename's
+        OSError."""
+        own = os.path.lexists(os.path.join(src, ".git"))
+        locked = own and run_ok(["git", "-C", repo, "worktree", "lock", "--reason",
+                                 "turma: moving a migrated copy", src],
+                                timeout=timeout)[0] == 0
+        try:
+            os.rename(src, dst)
+        except OSError:
+            if locked:
+                run(["git", "-C", repo, "worktree", "unlock", src])
+            raise
+        if own:
+            run(["git", "-C", repo, "worktree", "repair", dst])
+        if locked:
+            run(["git", "-C", repo, "worktree", "unlock", dst])
 
     # Ignored dirs a build or install re-creates: the only ignored paths an
     # older copy may hold and still be removed. Narrow on purpose — anything
@@ -33216,7 +33518,8 @@ class SessionManager:
         matched dir is one entry, never walked (`-uall` does not change that),
         so when one was let through, `ls-files` walks the ignored files for a
         `.env*`/`*.env` file or dir at any depth (a `dist/.env.production` under
-        an ignored `dist/`, XERK-2138). `-unormal` overrides a status.showUntrackedFiles=no config,
+        an ignored `dist/`, XERK-2138) — a `.env.example`-style template file
+        aside — or a nested repository it cannot walk. `-unormal` overrides a status.showUntrackedFiles=no config,
         which makes `--ignored` fail. Git failing reads True, which only keeps a
         copy aside."""
         rc, out = run_out(["git", "-C", cwd, "status", "--porcelain", "--ignored=matching",
@@ -33243,8 +33546,30 @@ class SessionManager:
                            "--exclude-standard"], timeout=timeout)
         if rc != 0:
             return True
-        return any(part.startswith(".env") or part.endswith(".env")
-                   for e in out.split("\0") for part in e.casefold().split("/"))
+        for e in out.split("\0"):
+            if e.endswith("/"):
+                # A nested repository: ls-files never walks into one, so its
+                # own `.env` (or unpushed commits) would go unseen (XERK-2148).
+                return True
+            parts = e.casefold().split("/")
+            if any(p.startswith(".env") or p.endswith(".env") for p in parts[:-1]):
+                return True
+            name = parts[-1]
+            words = name.split(".")
+            template = (name.startswith(".env") and words[-1]
+                        in self.MIGRATION_ENV_TEMPLATE_WORDS) or (
+                len(words) == 2 and words[1] == "env"
+                and words[0] in self.MIGRATION_ENV_TEMPLATE_WORDS)
+            if (name.startswith(".env") or name.endswith(".env")) and not template:
+                return True
+        return False
+
+    # A `.env.example`-style FILE is a template, never a secret: a package in
+    # node_modules ships one, and counting it kept every such copy (XERK-2148).
+    # Only as the LAST suffix (`.env.local.example`) or the whole stem
+    # (`example.env`): `.env.example.local` is a filled-in copy, and a
+    # `.env.defaults` holds real values, so both keep the copy.
+    MIGRATION_ENV_TEMPLATE_WORDS = frozenset(("example", "sample", "template", "dist"))
 
     # A bundle is the largest thing an agent ever sends, so it is the body most
     # likely to meet the hub's in-flight budget (XERK-258) and be told 503 "busy,
@@ -33804,6 +34129,13 @@ class SessionManager:
                 names = os.listdir(rd)
             except OSError:
                 continue
+            # The root pseudo-repo's git dir is REPOS_ROOT itself (XERK-2148).
+            # A dir that is no repo is never pruned: git would walk up to an
+            # enclosing repo and prune THAT.
+            repo_path = REPOS_ROOT if repo == ROOT_REPO_NAME \
+                else os.path.join(REPOS_ROOT, repo)
+            if not os.path.lexists(os.path.join(repo_path, ".git")):
+                repo_path = None
             removed = False
             for name in names:
                 m = MIGRATION_ASIDE_RE.fullmatch(name)
@@ -33813,13 +34145,18 @@ class SessionManager:
                 try:
                     if not stat.S_ISDIR(os.lstat(path).st_mode):
                         continue
+                    if repo_path:
+                        # A move cut short between its lock and unlock
+                        # (_rename_worktree) left the entry locked, and the
+                        # prune below would keep a locked entry forever.
+                        run_ok(["git", "-C", repo_path, "worktree", "unlock", path],
+                               timeout=self.MIGRATION_RESTORE_GIT_TIMEOUT_SEC)
                     shutil.rmtree(path, onerror=_rmtree_writable)
                     removed = True
                     log(f"migration: removed {path}, kept aside past retention")
                 except Exception as e:
                     log(f"migration: removing {path} failed: {e}")
-            repo_path = os.path.join(REPOS_ROOT, repo)
-            if removed and os.path.isdir(repo_path):
+            if removed and repo_path:
                 run(["git", "-C", repo_path, "worktree", "prune"])
 
     def _sweep_claude_sockets(self):
@@ -34892,18 +35229,42 @@ class SessionManager:
         _pane_send_keys(tmux_name, "C-u")
         _pane_send_keys(tmux_name, "/model", literal=True)
         _pane_send_keys(tmux_name, "Enter")
-        rows, cur = [], None
+        rows, cur, cap = [], None, ""
         for _ in range(MODEL_PICKER_TRIES):
             time.sleep(MODEL_PICKER_WAIT_SEC)
-            rows, cur = parse_model_picker(_capture_pane(tmux_name) or "")
+            cap = _capture_pane(tmux_name) or ""
+            rows, cur = parse_model_picker(cap)
             if rows:
                 break
         if not rows or cur is None:
             # No picker appeared (or no cursor to navigate from): back out.
             # The pane was idle a moment ago, so Escape lands on the prompt (or
-            # closes a half-painted picker) and destroys nothing.
+            # closes a half-painted picker) and destroys nothing. A picker too
+            # short to draw its ❯ row (24x15 shows only row 1) did appear, and
+            # the log says so rather than "did not appear" (XERK-2148).
+            #
+            # On a cold session (just launched, 2.1.306) the picker can paint
+            # after the wait above, and the early Escape doesn't cancel it: it
+            # was then left open over the composer (XERK-2148). So the pane is
+            # watched a bounded while longer, and a picker that turns up late
+            # is Escaped too — the switch itself is not attempted that late.
             _pane_send_keys(tmux_name, "Escape")
-            log(f"set model of {sid} -> {arg}: /model picker did not appear")
+            # A pane too short for any row (24x14, 30x12) draws the heading and
+            # its description alone: the picker is up, and that Escape closed it.
+            region = _model_picker_region(cap)
+            headed = bool(region) and not any(
+                line.strip() and PANE_PROMPT_RULE_RE.match(line) for line in region)
+            why = ("/model picker's cursor row is not drawn (pane too small)" if rows
+                   else "/model picker shows no rows (pane too small)" if headed
+                   else "/model picker did not appear")
+            if not rows and not headed:
+                for _ in range(MODEL_PICKER_LATE_TRIES):
+                    time.sleep(MODEL_PICKER_WAIT_SEC)
+                    if _model_picker_open(_capture_pane(tmux_name) or ""):
+                        self._back_out_of_model_picker(tmux_name)
+                        why = "/model picker appeared too late; closed it"
+                        break
+            log(f"set model of {sid} -> {arg}: {why}")
             self.save()
             return
         # Arrow toward the target ONE press at a time, re-reading the ❯ before
@@ -34913,13 +35274,50 @@ class SessionManager:
         # dropped key just means the next read still shows the gap (press
         # again), and a doubled one flips the press direction; MAX_STEPS bounds
         # a cursor that never converges.
-        steps = 0
+        #
+        # A long list draws only a window of its rows (XERK-2148: opened with
+        # the ❯ on row 13 it shows "↑ 4." to "❯ 13."; 22 rows end "↓ 10." and
+        # "… +8 models"; a pane ~14 rows high draws ONE row and no "↑"), so
+        # the target may not be drawn. Rows match by their FIRST word and the
+        # first match in the WHOLE list wins, so a match only counts once every
+        # row above it has been drawn (`seen`, by row number): else "opus"
+        # would take a lower "Opus 5" over an "Opus 5.5" scrolled off above.
+        # Until then the window scrolls toward the first row not yet seen,
+        # bounded by SCROLL_MAX.
+        steps = scrolls = 0
+        seen = {}                       # row number -> label, every row drawn
         while True:
-            target = _picker_index_for(rows, resolved)
+            nums = [num for _, num, _ in _model_picker_rows(cap)]
+            seen.update(zip(nums, rows))
+            known = 0                   # rows 1..known have all been drawn
+            while known + 1 in seen:
+                known += 1
+            want = next((n for n in range(1, known + 1)
+                         if _picker_index_for([seen[n]], resolved) == 0), None)
+            target = nums.index(want) if want in nums else None
             if target is None:
+                if want is not None:
+                    way = "Up" if want < nums[0] else "Down"
+                elif known + 1 < nums[0]:
+                    way = "Up"
+                else:
+                    way = "Down" if _model_picker_more_below(cap) else None
+                if way and scrolls < MODEL_PICKER_SCROLL_MAX:
+                    _pane_send_keys(tmux_name, way)
+                    scrolls += 1
+                    rows, cur, cap = self._await_picker_step(tmux_name, rows, cur)
+                    if not rows or cur is None:
+                        self._picker_lost(sid, arg, tmux_name, rows, "mid-scroll")
+                        return
+                    continue
                 _pane_send_keys(tmux_name, "Escape")
-                log(f"set model of {sid} -> {arg}: picker offers no such row "
-                    f"({', '.join(rows)})")
+                if way:
+                    why = f"row not reached after {scrolls} scroll presses"
+                elif any("…" in label for label in rows):
+                    why = "picker rows are truncated past recognition (pane too narrow)"
+                else:
+                    why = "picker offers no such row"
+                log(f"set model of {sid} -> {arg}: {why} ({', '.join(rows)})")
                 self.save()
                 return
             if cur == target:
@@ -34932,11 +35330,9 @@ class SessionManager:
                 return
             _pane_send_keys(tmux_name, "Down" if target > cur else "Up")
             steps += 1
-            rows, cur = self._await_picker_step(tmux_name, rows, cur)
+            rows, cur, cap = self._await_picker_step(tmux_name, rows, cur)
             if not rows or cur is None:
-                _pane_send_keys(tmux_name, "Escape")
-                log(f"set model of {sid} -> {arg}: picker vanished mid-navigation")
-                self.save()
+                self._picker_lost(sid, arg, tmux_name, rows, "mid-navigation")
                 return
         label = rows[cur]
         # The confirmation must be NEW: a line from an earlier switch to the
@@ -34956,19 +35352,32 @@ class SessionManager:
             log(f"set model of {sid} -> {arg}: selection sent but no "
                 f"confirmation read; record unchanged (modelActual will settle it)")
 
-    def _await_picker_step(self, tmux_name, rows, prev_cur):
-        """Poll the picker after an arrow press until the ❯ moves off prev_cur,
-        returning the fresh (rows, cur). On timeout returns the LAST read even
-        if unmoved — the caller's loop just presses again, bounded by
-        MAX_STEPS — and ([], None) when the picker is gone entirely."""
+    def _picker_lost(self, sid, arg, tmux_name, rows, when):
+        """Back out of a picker whose ❯ row can no longer be read, logging why:
+        gone entirely, or still drawn with its ❯ row pushed off a short or
+        narrow pane (24x45 wraps it below the bottom, XERK-2148)."""
+        _pane_send_keys(tmux_name, "Escape")
+        why = ("picker's cursor row went off-screen (pane too small)" if rows
+               else "picker vanished")
+        log(f"set model of {sid} -> {arg}: {why} {when}")
+        self.save()
+
+    def _await_picker_step(self, tmux_name, prev_rows, prev_cur):
+        """Poll the picker after an arrow press until the ❯ moves off prev_cur
+        or the drawn rows scroll (the ❯ then stays on the edge row), returning
+        the fresh (rows, cur, cap). On timeout returns the LAST read even if
+        unmoved — the caller's loop just presses again, bounded by MAX_STEPS —
+        and ([], None, cap) when the picker is gone entirely."""
+        rows, cur, cap = prev_rows, prev_cur, ""
         for _ in range(MODEL_STEP_TRIES):
             time.sleep(MODEL_STEP_WAIT_SEC)
-            rows, cur = parse_model_picker(_capture_pane(tmux_name) or "")
+            cap = _capture_pane(tmux_name) or ""
+            rows, cur = parse_model_picker(cap)
             if not rows:
-                return [], None
-            if cur is not None and cur != prev_cur:
-                return rows, cur
-        return rows, cur
+                return [], None, cap
+            if cur is not None and (cur != prev_cur or rows != prev_rows):
+                return rows, cur, cap
+        return rows, cur, cap
 
     def _await_model_confirmation(self, tmux_name, label, before):
         """Whether the picker's selection of row `label` visibly landed: poll

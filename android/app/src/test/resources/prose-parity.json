@@ -5218,5 +5218,6 @@
 {"input":"- |\r\n    - :<b>`&amp;*[lbl](https://u.v/w)> ","web":[["list",[[0,"•",["|"]],[1,"◦",[":<b>`&amp;*",["a","lbl","https://u.v/w"],"> "]]]]]},
 {"input":"word ![](data:image/png;base64,AA)* \u001f **\n 1. \ude00﻿***:-:#\t|٣ <b>##  ","web":[["p",["word ",["img","","data:image/png;base64,AA"],"* \u001f **"]],["list",[[0,"1.",["\ude00﻿***:-:#\t|٣ <b>##  "]]]]]},
 {"input":" ```盳 ","web":[["code","盳",""]]},
-{"input":"\n## * 😀 \n</svg >- \r\nword ","web":[["h",2,["* 😀"]],["p",["</svg >- \nword "]]]}
+{"input":"\n## * 😀 \n</svg >- \r\nword ","web":[["h",2,["* 😀"]],["p",["</svg >- \nword "]]]},
+{"input":"![up](DATA:IMAGE/PNG;base64,AA) and ![mixed](Data:Image/svg+xml,%3Csvg%2F%3E) not ![t](DATA:TEXT/PLAIN,AA)","web":[["p",[["img","up","DATA:IMAGE/PNG;base64,AA"]," and ",["img","mixed","Data:Image/svg+xml,%3Csvg%2F%3E"]," not ![t](DATA:TEXT/PLAIN,AA)"]]]}
 ]

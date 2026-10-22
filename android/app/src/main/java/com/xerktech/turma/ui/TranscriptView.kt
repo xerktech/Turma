@@ -73,6 +73,7 @@ import androidx.compose.ui.unit.sp
 import com.xerktech.turma.core.CellAlign
 import com.xerktech.turma.core.ChatItem
 import com.xerktech.turma.core.InlinePiece
+import com.xerktech.turma.core.isPreviewImageSrc
 import com.xerktech.turma.core.ProseBlock
 import com.xerktech.turma.core.Span
 import com.xerktech.turma.DataImage
@@ -507,19 +508,13 @@ private fun ProseImage(model: Any, alt: String, svg: Boolean) {
     // A zero-area image (an SVG declaring width="0", see SafeSvgDecoder) draws
     // nothing on the web, so it takes no room here either.
     if (empty) return
-    if (failed) {
-        Text(
-            "🖼 " + alt.ifBlank { "image" },
-            fontSize = scaledSp(12f),
-            fontStyle = FontStyle.Italic,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        return
-    }
+    if (failed) { ImageAltText(alt); return }
     val shape = RoundedCornerShape(6.dp)
     val r = ratio
+    // An SVG's 6dp padding sits inside the box, so the box adds it to the ratio's size
+    // (web: border-box .md-svg, rollup XERK-2148) — else a tall SVG drew short.
     val size = if (r == null) Modifier.fillMaxWidth().height(120.dp)
-        else Modifier.proseImageSize(r, natural, PROSE_IMAGE_MAX_HEIGHT)
+        else Modifier.proseImageSize(r, natural, PROSE_IMAGE_MAX_HEIGHT, inset = if (svg) 12.dp else 0.dp)
     AsyncImage(
         model = model,
         contentDescription = alt.ifBlank { "image" },
@@ -545,6 +540,17 @@ private fun ProseImage(model: Any, alt: String, svg: Boolean) {
     if (showFull) ImageLightbox(model, alt) { showFull = false }
 }
 
+/** What an image that failed to load shows: its alt text (a browser's broken <img>). */
+@Composable
+private fun ImageAltText(alt: String) {
+    Text(
+        "🖼 " + alt.ifBlank { "image" },
+        fontSize = scaledSp(12f),
+        fontStyle = FontStyle.Italic,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
 /**
  * A [ratio] box no wider than [natural] or the space offered, and no taller than
  * [maxHeight] (narrowing to keep the ratio) — `widthIn(max).heightIn(max)
@@ -553,15 +559,18 @@ private fun ProseImage(model: Any, alt: String, svg: Boolean) {
  * width, ignoring the natural-width cap: a 40×20 image in a table cell (whose row is
  * `height(IntrinsicSize.Min)`) made the row ~100dp tall instead of ~20dp.
  */
-internal fun Modifier.proseImageSize(ratio: Float, natural: Dp, maxHeight: Dp): Modifier =
+internal fun Modifier.proseImageSize(ratio: Float, natural: Dp, maxHeight: Dp, inset: Dp = 0.dp): Modifier =
     layout { measurable, constraints ->
-        val cap = natural.roundToPx()
-        var w = (if (constraints.hasBoundedWidth) minOf(constraints.maxWidth, cap) else cap).toFloat()
+        // [inset] (both sides' padding) sits inside the box: [ratio] and [natural] are
+        // the content's, and the cap is the whole box's (rollup XERK-2148).
+        val ins = inset.roundToPx()
+        val cap = natural.roundToPx() + ins
+        var w = maxOf(0, (if (constraints.hasBoundedWidth) minOf(constraints.maxWidth, cap) else cap) - ins).toFloat()
         var h = w / ratio
-        val maxH = minOf(maxHeight.roundToPx(), constraints.maxHeight)
+        val maxH = maxOf(0, minOf(maxHeight.roundToPx(), constraints.maxHeight) - ins)
         if (h > maxH) { h = maxH.toFloat(); w = h * ratio }
-        val width = constraints.constrainWidth(maxOf(1, w.roundToInt())) // a hairline, never gone
-        val height = constraints.constrainHeight(maxOf(1, h.roundToInt()))
+        val width = constraints.constrainWidth(maxOf(1, w.roundToInt() + ins)) // a hairline, never gone
+        val height = constraints.constrainHeight(maxOf(1, h.roundToInt() + ins))
         val placeable = measurable.measure(Constraints.fixed(width, height))
         layout(width, height) { placeable.place(0, 0) }
     }
@@ -785,12 +794,18 @@ private fun TranscriptTool(t: ChatItem.Tool) {
 private fun SendFileView(f: SendFile) {
     when (f.kind) {
         "image" -> {
-            // A bad/empty src degrades to a chip.
-            val model = remember(f.src) { imageModel(f.src) }
+            // A bad/empty src degrades to a chip, and so does any src the web would
+            // not preview — only data:image/ or http(s) (renderToolFiles).
+            val model = remember(f.src) { if (isPreviewImageSrc(f.src)) imageModel(f.src) else null }
             if (model == null) { FileChip(f.name, f.shed); return }
             // Tapping the thumbnail opens a full-screen viewer (web parity: the
             // click-to-zoom lightbox in sessions.html); back / the ✕ closes it.
             var showFull by remember(f.src) { mutableStateOf(false) }
+            // One that fails to decode shows its name as alt text, as the web's broken
+            // <img> does — never a blank white box (rollup XERK-2148).
+            var failed by remember(f.src) { mutableStateOf(false) }
+            // The alt line names the file, so no caption repeats it below.
+            if (failed) { ImageAltText(f.name); return }
             Column {
                 // A DEFINITE height, not heightIn(max): AsyncImage's painter starts
                 // with an unknown intrinsic size, so a max-only height constraint
@@ -809,6 +824,7 @@ private fun SendFileView(f: SendFile) {
                         model = model,
                         contentDescription = f.name,
                         contentScale = ContentScale.Fit,
+                        onError = { failed = true },
                         modifier = Modifier.fillMaxSize().padding(6.dp),
                     )
                 }

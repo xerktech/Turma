@@ -636,7 +636,12 @@
     border: 1px solid var(--border); border-radius: var(--radius-sm); }
   .tr-msg .md-svg, .thought-body .md-svg, .compact-body .md-svg, .away-body .md-svg,
   .tool-plan .md-svg,
-  .tool-file .md-svg {
+  .tool-file .md-svg,
+  /* A markdown ![](data:image/svg+xml,…) is an SVG too: the same backdrop and
+     padding, as Android's ProseImage gives it (rollup XERK-2148). */
+  .tr-msg .md-img[src^="data:image/svg+xml" i], .thought-body .md-img[src^="data:image/svg+xml" i],
+  .compact-body .md-img[src^="data:image/svg+xml" i], .away-body .md-img[src^="data:image/svg+xml" i],
+  .tool-plan .md-img[src^="data:image/svg+xml" i] {
     background: #fff; padding: 6px; }
   /* SendUserFile inline previews inside a tool card (chat.js renderToolFiles,
      XERK-221): a stacked list of image/SVG/HTML previews + name chips. The HTML

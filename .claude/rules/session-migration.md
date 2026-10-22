@@ -76,6 +76,10 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
   - A move BACK finds the old copy at the same path. Export writes the state's digest into the
     source's gitdir (`MIGRATION_EXPORT_MARK`); an old copy still matching it (or clean at an ancestor)
     is removed, anything else detached and renamed to `<cwd>.pre-migration-<ts>`.
+  - Every rename of a worktree dir goes through `_rename_worktree`: `worktree lock` across the
+    rename + `repair` (XERK-2148). A prune between them (any process's) deleted the admin dir and
+    the aside lost HEAD/index; an in-process lock would not cover a session's own prune.
+    Test: `test_a_prune_during_the_move_aside_*`.
   - An aside is reaped by the usage worker once `<ts>` is past `MIGRATION_ASIDE_RETENTION_SEC`
     (30 days, env `TURMA_MIGRATION_ASIDE_RETENTION_SEC`, 0 = never), then its worktree entry
     pruned (`_sweep_migration_asides`, XERK-2138). A symlinked aside or repo dir is skipped;
@@ -91,6 +95,11 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
       depth, case-folded (`dist/.env.production`, XERK-2138); one found keeps the copy. Matched
       in Python, never a `:(glob)` pathspec (`GIT_LITERAL_PATHSPECS` turns that off). Other files in such a dir
       still go with it.
+    - A template FILE (`.env.example`, `.sample`, `.template`, `.dist`) does not keep it: every
+      node_modules has one, so every copy was kept (XERK-2148).
+    - Only as the LAST suffix or the whole stem (`example.env`): `.env.example.local` is a
+      filled-in copy and `.env.defaults` holds real values, so both still keep it (QA).
+    - A nested repo there is listed as `dir/` and never walked, so it keeps the copy (XERK-2148).
   - A bundle without `.worktree/` (older source, hub restore-pack) forks fresh from the default.
     Residual: an OLDER target extracts `.worktree/` into its slug dir and drops the work (source
     keeps it). Tests: `TestMigrateWorktreeState` (real git, two clones).

@@ -128,6 +128,11 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     `capture-pane -e`; the dim placeholder is no draft). Typed onto, it went out as a prompt;
     never clear it either: Ctrl+U kills only before the cursor and, retried, ate the edits.
     It goes ahead only on a box SEEN empty: a short pane (≤ ~11 rows) can't show one whole.
+    Under NO_COLOR (no SGR at all) the `Try "…"` text is the placeholder (XERK-2148).
+- **A long picker scrolls, a narrow one truncates** (XERK-2148). Rows match by first word, first
+  wins, so set_model scrolls Up while "↑" shows, then Down while "↓"/"… +N models" does —
+  never a match mid-list. "Sonne…" names a family only by a unique stem (`_picker_head_is`).
+  A footerless picker still blocks typing (`_model_picker_open`).
 
 ### `setMode` — live permission-mode switch
 
@@ -373,6 +378,10 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     Position + whole item, never the wording alone: conversation text draws above the composer, and
     the rule cut keeps a footer-hiding toast ("Press Ctrl-C again to exit") from reaching past it. Frames: 2.1.306, in
     `TestHintDialogIsABlockingDialog`. They stay out of `panePrompt` (no digit to offer).
+  - The items are `_DIALOG_HINT_ITEMS` (XERK-2148): also "Esc to clear"/"Esc to close" (/config,
+    /hooks, /tasks), "ctrl+o to toggle", "enter to return" (← agents panel). Shell mode's
+    footer (`PANE_SHELL_FOOTER_RE`) is a composer footer in every dialog read.
+    Tests: `TestOverlayFootersAndShellMode`.
 
 ## PR status, comment delivery and conflict nudges
 

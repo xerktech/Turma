@@ -177,7 +177,12 @@
   // max-width:100% narrows it to the bubble and height:auto keeps the ratio.
   // Anything else gets nothing: an SVG declaring a size, or with no viewBox,
   // already sizes itself.
+  // The box is border-box (app.css), so its border and padding — every data: SVG
+  // <img> is padded, an .md-svg or a markdown one (sessions.html) — sit INSIDE both
+  // the width and the max-height: the ratio is the content's, and they are added
+  // on top (rollup XERK-2148: a 1:10 SVG reached only 294px).
   const SVG_FILL_MAX_H = 420;      // sessions.html .md-img max-height
+  const MD_IMG_BORDER = 1, MD_SVG_PAD = 6;   // sessions.html .md-img border, SVG padding
   function svgSizeAttrs(url) {
     const u = String(url);
     if (!/^data:image\/svg\+xml/i.test(u)) return "";
@@ -206,8 +211,10 @@
     if (!unsized(attr("width")) || !unsized(attr("height"))) return "";
     const vb = (attr("viewbox") || "").trim().split(/[\s,]+/).map(Number);
     if (vb.length !== 4 || !(vb[2] > 0 && vb[2] < Infinity) || !(vb[3] > 0 && vb[3] < Infinity)) return "";
-    const w = Math.min(1e6, Math.max(1, Math.round(SVG_FILL_MAX_H * vb[2] / vb[3])));
-    return ' width="' + w + '" height="' + SVG_FILL_MAX_H + '"';
+    const inset = 2 * (MD_IMG_BORDER + MD_SVG_PAD);
+    // Rounded UP, so the box always reaches the cap; max-height takes the fraction.
+    const w = Math.min(1e6, Math.max(1, Math.ceil((SVG_FILL_MAX_H - inset) * vb[2] / vb[3])));
+    return ' width="' + (w + inset) + '" height="' + SVG_FILL_MAX_H + '"';
   }
   // Render raw SVG source as an image (XERK-221). The markup is URL-encoded into a
   // data:image/svg+xml URI and shown through <img>, NOT injected into the DOM: an
@@ -227,10 +234,13 @@
     const s = String(text == null ? "" : text);
     // Markdown image (http(s) or data:image/* src), a markdown link, OR a bare
     // http(s) URL — image tried first so its leading `!` isn't left as stray text.
+    // A URL scheme is case-insensitive, so DATA:IMAGE/PNG is an image too (rollup
+    // XERK-2148); spelled out per letter, not /i, which would also widen the links
+    // (Prose.kt LINK_RE spells it the same way).
     // A label never holds a `[` (rollup XERK-1701): with `[^\]]` every `[` of a long
     // "[[[[…" run re-scanned the rest of the text, quadratic (2 s at 64k).
     const TRAIL_CHARS = ".,;:!?'\"*_‘’“”";
-    const re = /!\[([^[\]]*)\]\((https?:\/\/[^)\s]+|data:image\/[^)\s]+)\)|\[([^[\]]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<]+)/g;
+    const re = /!\[([^[\]]*)\]\((https?:\/\/[^)\s]+|[dD][aA][tT][aA]:[iI][mM][aA][gG][eE]\/[^)\s]+)\)|\[([^[\]]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<]+)/g;
     let out = "", last = 0, m;
     while ((m = re.exec(s))) {
       out += esc(s.slice(last, m.index));

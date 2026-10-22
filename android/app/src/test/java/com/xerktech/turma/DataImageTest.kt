@@ -42,15 +42,21 @@ class DataImageTest {
     private fun pct(s: String) = java.net.URLEncoder.encode(s, "UTF-8").replace("+", "%20")
     private fun b64(bytes: ByteArray) = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
 
-    /** The decoded drawable, or null when decoding fails (the caller shows alt text). */
-    private fun load(src: String): Drawable? = runBlocking {
-        val options = Options(context, size = Size(100, 100), scale = Scale.FIT)
+    private val options = Options(context, size = Size(100, 100), scale = Scale.FIT)
+
+    /** [src] fetched by the app's own fetcher, as the decoders receive it. */
+    private fun fetched(src: String): SourceResult = runBlocking {
         val data = DataImage.parse(src)!!
         val fetcher = components.fetcherFactories.firstNotNullOf { (f, type) ->
             @Suppress("UNCHECKED_CAST")
             if (type.isInstance(data)) (f as coil.fetch.Fetcher.Factory<Any>).create(data, options, loader) else null
         }
-        val result = fetcher.fetch() as SourceResult
+        fetcher.fetch() as SourceResult
+    }
+
+    /** The decoded drawable, or null when decoding fails (the caller shows alt text). */
+    private fun load(src: String): Drawable? = runBlocking {
+        val result = fetched(src)
         val decoder = components.decoderFactories.firstNotNullOfOrNull { it.create(result, options, loader) }
             ?: coil.decode.BitmapFactoryDecoder(result.source, options)
         runCatching { decoder.decode() }.getOrNull()?.drawable
@@ -88,6 +94,18 @@ class DataImageTest {
         // Decoded (Coil scales it to the requested size, so only presence is checked).
         assertNotNull(load("data:image/png;base64,$png"))
         assertNotNull(load("data:image/jpeg;base64,$png"))
+    }
+
+    /**
+     * A declared bitmap goes through Coil's own factory, whose decoders share its
+     * 4-permit lock on parallel bitmap decodes (rollup XERK-2148). A bare
+     * `BitmapFactoryDecoder(source, options)` decodes the same and passes every other
+     * test, but its lock is unbounded: any number of full-size decodes at once.
+     */
+    @Test fun `a declared bitmap keeps Coil's 4-permit parallel decode lock`() {
+        val decoder = DeclaredBitmapDecoder.Factory().create(fetched("data:image/png;base64,QUJD"), options, loader)!!
+        val lock = decoder.javaClass.getDeclaredField("parallelismLock").apply { isAccessible = true }
+        assertEquals(4, (lock.get(decoder) as kotlinx.coroutines.sync.Semaphore).availablePermits)
     }
 
     @Test fun `the app's loader decodes a declared bitmap before the svg sniff`() {

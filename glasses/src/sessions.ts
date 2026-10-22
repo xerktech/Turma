@@ -32,6 +32,12 @@ export function liveState(
   if (s.status === "stopped") return "stopped";
   const live = s.session;
   if (live?.question) return "waiting";
+  // A permission / plan-approval dialog, and a dialog that is no panePrompt
+  // (XERK-2152: only the hub's attention says so), wait on the operator just as
+  // a question does — and ahead of the working read, since a dialog paints no
+  // interrupt hint. Web/Android liveState's order.
+  if (live?.panePrompt?.prompt) return "waiting";
+  if (s.attention?.state === "needs-you:dialog") return "waiting";
   // Two rules the web applies and this did not (XERK-235), in the web's order:
   // no transcript yet is IDLE before paneBusy is consulted, and working requires
   // the HOST to be online — paneBusy is a value on the record the host last

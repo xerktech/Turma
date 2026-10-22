@@ -83,3 +83,26 @@ describe("vendored engines", () => {
     expect(html).toContain("A-1");
   });
 });
+
+// chat.css is hand-copied from the web, so pin it too: every rule above the
+// phone-overrides block must appear (whitespace-insensitively) in
+// sessions.html or app.css. The one alias: phone.css has no --warning-text
+// token, so the copy says --warning where the web says --warning-text.
+describe("vendored chat.css", () => {
+  const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
+  const norm = (css: string) =>
+    css
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\s+/g, " ")
+      .replace(/\s*([{};:,])\s*/g, "$1")
+      .trim();
+
+  it("every non-override rule is a verbatim copy of a web rule", () => {
+    const vendored = read("chat.css").split("/* ---- phone overrides")[0] ?? "";
+    const web = norm(read("../../../turma/public/sessions.html") + read("../../../turma/public/app.css"))
+      .replace(/var\(--warning-text\)/g, "var(--warning)");
+    const rules = norm(vendored).split("}").filter((r) => r.trim()).map((r) => r + "}");
+    expect(rules.length).toBeGreaterThan(100);
+    expect(rules.filter((r) => !web.includes(r))).toEqual([]);
+  });
+});
