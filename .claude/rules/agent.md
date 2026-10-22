@@ -322,9 +322,19 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     line directly above (or above a subtitle, next bullet), **no mode footer below** (the footer
     rides the composer a dialog replaces). `detail` closes on a rule, not on blanks.
   - The Ctrl-C exit toast vetoes like the footer it hides (XERK-2169, `PANE_EXIT_TOAST_RE`).
-  - So does a width-cut footer (`PANE_MODE_CUT_RE`, XERK-2171), in `_trust_dialog_up` and
-    `_model_picker_open` too — only as the BOTTOM line under a rule: a qwen dialog has no
-    rule, and an any-line match let a transcript line veto a live approval (QA).
+  - So does a width-cut footer (`PANE_MODE_CUT_RE`, XERK-2171), in `_trust_dialog_up` too —
+    only as the BOTTOM line under a rule: a qwen dialog has no rule, and an any-line match let a
+    transcript line veto a live approval (QA). `_model_picker_open` needs no such check: a
+    rule-free picker region already keeps the toast and a cut footer out (XERK-2180).
+  - At 12-22 columns the TUI drops the space after a number ("3.Yes,", XERK-2180):
+    `_pane_unglue_options` puts it back ONLY in the cursor's own run (walked out from the ❯/›
+    row over rows indented to its number column) at that column — never by the row's text,
+    never by a column another row on screen uses. A label wrapped mid-path puts "3.b/…" or
+    "3.Final from this" at a row start, and a reply's numbered list can share that column;
+    each read as option 3 made Turma's digit pick another option (QA, three passes).
+    At 14 columns the TUI's wrap still drifts past `_pane_option_wrap_end` and the run stops
+    at 3 (residual). "4. Nor you" at 13/15/40 columns is Claude Code's own drawing.
+    Tests: `TestPaneOptionWithoutASpace`, `TestPaneCutDialogBackstops`.
   - **One subtitle paragraph may sit between the `?` line and the run** (XERK-2162): Claude
     Code 2.1.306's "Exit plan mode?" draws "Claude wants to exit plan mode" there, and requiring
     the question directly above made that live dialog read as an idle composer.

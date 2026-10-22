@@ -687,6 +687,36 @@ test("XERK-1847: a merged live row is a shadow candidate until decided, then nev
   assert.equal(L.decideShadow(only().key, { sampled: true, at: T0 }), false, "no id");
 });
 
+test("XERK-2180: a shadow failed by a lost placement then run again drops the stale end", () => {
+  L._internals.reset();
+  mergedLive();
+  const live = only();
+  L.decideShadow(live.key, { sampled: true, at: T0 + 2 * DAY, id: "sh-00112233aabb",
+    model: "haiku", host: "h2" }, T0 + 2 * DAY);
+  const rep = (o, t) => L.observeShadows([{ site: "acme.atlassian.net", host: "h2",
+    id: "sh-00112233aabb", ...o }], t);
+  const sh = () => [...L._internals.rows().values()].find((r) => r.kind === "shadow");
+  rep({ state: "failed", startedAt: "2026-10-03T00:00:00Z", endedAt: "2026-10-04T00:00:00Z" },
+    T0 + 3 * DAY);
+  assert.ok(sh().endedAt);
+  rep({ state: "running", startedAt: "2026-10-04T01:00:00Z" }, T0 + 3 * DAY + 1000);
+  assert.equal(sh().shadowState, "running");
+  assert.equal(sh().endedAt, undefined);
+  assert.equal(sh().startedAt, Date.parse("2026-10-04T01:00:00Z"));
+  rep({ state: "failed", endedAt: "2026-10-05T00:00:00Z" }, T0 + 4 * DAY);
+  assert.equal(sh().endedAt, Date.parse("2026-10-05T00:00:00Z"));
+  // Failed again with no running report seen in between: the later end wins.
+  rep({ state: "failed", endedAt: "2026-10-06T00:00:00Z" }, T0 + 5 * DAY);
+  assert.equal(sh().endedAt, Date.parse("2026-10-06T00:00:00Z"));
+  // A graded row's times are final.
+  rep({ grade: { verdict: "good" }, endedAt: "2026-10-07T00:00:00Z" }, T0 + 6 * DAY);
+  const final = [sh().startedAt, sh().endedAt];
+  rep({ state: "failed", startedAt: "2026-10-08T00:00:00Z", endedAt: "2026-10-08T01:00:00Z" },
+    T0 + 7 * DAY);
+  assert.equal(sh().shadowState, "graded");
+  assert.deepEqual([sh().startedAt, sh().endedAt], final);
+});
+
 test("XERK-1847: only a hub-dispatched shadow's report lands, paired with its live row", () => {
   L._internals.reset();
   mergedLive();

@@ -10961,6 +10961,115 @@ class TestPanePromptUnderTheEdge(unittest.TestCase):
             head + "".join(wraps.splitlines(True)[:ha._PANE_CUT_OPTION_WRAP_LINES])))
 
 
+class TestPaneCutDialogBackstops(unittest.TestCase):
+    """XERK-2180: each veto in `_pane_cut_dialog_up` pinned by a frame only it
+    decides — the 2.1.306 captures never reach these, so mutants escaped."""
+
+    Q = "▔" * 40 + "\n   Exit plan mode?\n"
+
+    def test_a_composer_tail_below_an_indented_rule_vetoes(self):
+        # No column-0 rule, so only `_pane_composer_tail_up` sees the composer:
+        # the exit toast, or a width-cut footer under a rule.
+        for tail in ("  " + "─" * 30 + "\n  Press Ctrl-C again to exit\n",
+                     "  " + "─" * 30 + "\n  ⏵⏵\n"):
+            self.assertFalse(ha._pane_cut_dialog_up(self.Q + tail), tail)
+        self.assertTrue(ha._pane_cut_dialog_up(self.Q + "  " + "─" * 30 + "\n"))
+
+    def test_each_composer_footer_vetoes(self):
+        for footer in ("  ⏸ manual mode on", "  ⏸ Ask permissions (shift + tab to cycle)",
+                       "  ! for shell mode"):
+            # A line under it, so the bottom-line width-cut read is not what vetoes.
+            self.assertFalse(ha._pane_cut_dialog_up(self.Q + footer + "\n  x\n"), footer)
+
+    def test_the_area_starts_at_the_last_edge(self):
+        # An older question under an earlier edge; the last edge opens an
+        # overlay with no question of its own.
+        cap = self.Q + "▔" * 40 + "\n   Select model\n     1. Default\n"
+        self.assertFalse(ha._pane_cut_dialog_up(cap))
+
+    def test_a_scroll_arrow_after_the_question_is_stripped(self):
+        cap = "▔" * 40 + "\n   Ready to code?" + " " * 10 + "↓\n\n   A plan is written.\n"
+        self.assertTrue(ha._pane_cut_dialog_up(cap))
+
+
+class TestPaneOptionWithoutASpace(unittest.TestCase):
+    """XERK-2180: at 12-16 columns 2.1.306 draws "3.Yes," with no space."""
+
+    def test_a_glued_number_is_unglued_only_in_the_cursors_run(self):
+        lines = ["   1. alpha", " Bash command", "   2.rm -rf build", " Proceed?",
+                 " ❯ 1. Yes", "   2. No", "   3.Yes, and", "     don't",
+                 "      3.Final from this", "   4.5 GB free", "   2.1.306"]
+        out = ha._pane_unglue_options(lines)
+        # At the cursor's column, in its run: unglued, the label kept in place.
+        self.assertEqual(out[6], "  3. Yes, and")
+        self.assertEqual(out[6].index("Yes"), lines[6].index("Yes"))
+        # A wrapped label's row, a decimal, a version, the detail above the
+        # question and a list elsewhere: left exactly as drawn.
+        self.assertEqual(out[:6] + out[7:], lines[:6] + lines[7:])
+        # The cursor's own row may be glued too.
+        self.assertEqual(ha._pane_unglue_options([" ❯ 1.Yes", "   2.No"]),
+                         ["❯ 1. Yes", "  2. No"])
+        # Glued options above a cursor moved down the list are its run too.
+        self.assertEqual(ha._pane_unglue_options(["   1. Yes", "   2.Yes,", "     and", " ❯ 3.Yes"]),
+                         ["   1. Yes", "  2. Yes,", "     and", "❯ 3. Yes"])
+        # No cursor, nothing unglued.
+        self.assertEqual(ha._pane_unglue_options(["   1.Yes", "   2.No"]),
+                         ["   1.Yes", "   2.No"])
+
+    def test_a_cut_dialog_reads_a_glued_cursor_row(self):
+        cap = "▔" * 22 + "\n   Bash command\n   Proceed?\n    ❯ 1.Yes, and\n"
+        self.assertTrue(ha._pane_cut_dialog_up(cap))
+
+    def test_a_list_sharing_the_wrap_column_cannot_open_the_gate(self):
+        # QA pass 3, 2.1.308 at 31 columns: a reply's "    1. alpha" drawn at
+        # the wrap rows' column made "3.Final from this project" option 3.
+        cap = ("●     1. alpha\n\n Do you want to proceed?\n ❯ 1. Yes\n"
+               "   2. Yes, allow reading from\n      l/qa-2180/dirs/q/3.Notes/\n"
+               "      3.Final from this project\n   3. Yes, and switch to auto\n"
+               "      mode · auto mode handles\n   4. No\n")
+        p = ha.parse_pane_prompt(cap)
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3, 4])
+
+    def test_a_narrow_dialog_offers_all_four_options(self):
+        # Claude Code 2.1.308 at 16 columns, the dialog's own lines verbatim.
+        rule = "╌" * 16 + "\n"
+        cap = (rule + " curl -s https:\n //example.com\n -o /dev/null\n" + rule
+               + " This command\n requires\n approval\n\n Do you want to\n proceed?\n"
+               " ❯ 1. Yes\n   2. Yes, and\n      don’t ask\n      again for:\n      curl *\n"
+               "   3.Yes, and\n     switch to\n     auto mode ·\n     auto mode\n"
+               "     handles\n     these\n     prompts for\n     you\n   4. No\n\n"
+               " Esc to cancel\n · Tab to amend\n")
+        p = ha.parse_pane_prompt(cap)
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3, 4])
+        self.assertEqual(p["options"][2]["label"],
+                         "Yes, and switch to auto mode · auto mode handles these prompts for you")
+
+    def test_a_wrapped_path_starting_with_a_number_is_no_option(self):
+        # QA, 2.1.308 at 50 columns: a label wrapped mid-path put "3.b/…" at
+        # the start of a row. Read as option 3, it had Turma send "3" — which
+        # switched the session to auto mode.
+        rule = "╌" * 50 + "\n"
+        cap = (rule + " ls /home/u/.local/qa-2180/dirs/3.a/3\n .b/3.c/3.d/3.e/3.f/3.g/3.h\n"
+               + rule + " Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, allow reading from\n"
+               "      /home/u/.local/qa-2180/dirs/3.a/\n"
+               "      3.b/3.c/3.d/3.e/3.f/3.g/3.h from this\n"
+               "   3. Yes, and switch to auto mode · auto mode\n"
+               "      handles these prompts for you\n   4. No\n\n Esc to cancel · Tab to amend\n")
+        p = ha.parse_pane_prompt(cap)
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3, 4])
+        self.assertTrue(p["options"][2]["label"].startswith("Yes, and switch"))
+        # QA, 2.1.308 at 31 columns: the path's last segment "3.Final" starts a
+        # row at the label's indent; only the options' column is unglued.
+        cap = (" Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, allow reading from\n"
+               "      /home/truenas_admin/.loca\n      l/qa-2180/dirs/q/3.Notes/\n"
+               "      3.Final from this project\n   3. Yes, and switch to auto\n"
+               "      mode · auto mode handles\n      these prompts for you\n   4. No\n\n"
+               " Esc to cancel · Tab to amend\n")
+        p = ha.parse_pane_prompt(cap)
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3, 4])
+        self.assertTrue(p["options"][1]["label"].endswith("3.Final from this project"))
+
+
 # The /model picker on a 40x45 pane (2.1.306, trimmed): wrapped descriptions
 # push its key-hint footer off the bottom (XERK-2148).
 _2148_PICKER_40 = (
@@ -51511,6 +51620,35 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.assertEqual(restarted.shadow_runs[self.RID]["state"], "running")
         # Launched, it no longer reads as lost on the next restart.
         self.assertEqual(self.make_manager().shadow_runs[self.RID]["state"], "running")
+
+    def test_a_run_session_the_record_never_learned_is_reaped(self):
+        # XERK-2180: a manager stopped inside the run's spawn() saved the
+        # session but not its runSid; the run reloads as a lost placement and
+        # its session is found by the run id it carries, then deleted.
+        sm = self.spawned()
+        sid = sm.shadow_runs[self.RID].pop("runSid")
+        sm.shadow_runs[self.RID].update(state="failed", error=ha.SHADOW_PLACING_LOST)
+        other = sm.registry[0]["shadow"]
+        self.assertEqual(other["id"], self.RID)
+        sm._advance_shadow_runs()
+        self.assertIsNone(sm._find(sid))
+        # A grading run's sessions are never touched as orphans (QA: the
+        # running case never reaches the reap at all).
+        sm2 = self.spawned()
+        sid2 = sm2.shadow_runs[self.RID].pop("runSid")
+        sm2.shadow_runs[self.RID]["state"] = "grading"
+        with mock.patch.object(sm2, "_advance_shadow_grade", lambda *a: False):
+            sm2._advance_shadow_runs()
+        self.assertIsNotNone(sm2._find(sid2))
+        # One an operator killed meanwhile is reaped from its closed record.
+        sm3 = self.spawned()
+        sid3 = sm3.shadow_runs[self.RID].pop("runSid")
+        rec = sm3._find(sid3)
+        sm3.registry = [x for x in sm3.registry if x is not rec]
+        sm3.closed.append(rec)
+        sm3.shadow_runs[self.RID]["state"] = "failed"
+        sm3._advance_shadow_runs()
+        self.assertFalse(any(c.get("id") == sid3 for c in sm3.closed))
 
     def spawned(self):
         sm = self.make_manager()
