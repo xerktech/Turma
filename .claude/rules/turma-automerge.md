@@ -113,6 +113,10 @@ Split out of `.claude/rules/turma-board.md`. Auto-start/auto-stop live there; ep
     or the new run settling the same way reads as already announced (QA). GitLab sends the MR's
     `sha` and ADO `lastMergeSourceCommit` as `head` (XERK-2198), so all three forges re-announce.
     A GitLab `head_pipeline` whose `sha` is not the MR's is the previous commit's: read as no CI.
+  - **The message names the forge's own words** (`prEventForge`, XERK-2200): a GitLab MR is an
+    "MR" read with `glab ci get --merge-request N -d` + `ci trace`, an ADO PR's via
+    `az repos pr policy list`; `gh` is GitHub only. Never `glab ci view` (a TUI: it refuses a
+    session's TTY-less Bash), nor `glab mr view` (no branch in its text output) (QA).
   - **Every agent-sent field is type-checked** (`prEventDiff`, `prLanded`), and each session runs in
     its own try/catch: an object `state` threw in `String()` on the leader tick and exited the hub
     (QA). Session ids are read with `Object.hasOwn` (`__proto__`).

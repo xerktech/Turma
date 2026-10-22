@@ -9432,6 +9432,29 @@ def _azdo_check_class(status):
     return None
 
 
+def _azdo_eval_stale(ev, source_commit):
+    """Whether a CI policy evaluation was judged for an OLDER push than the
+    PR's current head (XERK-2200). ADO re-queues build policies asynchronously
+    after a push, so for a moment the PR GET already shows the new source commit
+    while the evaluation still reads the old run's `approved`; and a build
+    policy whose expiration is "Never" stays approved across pushes. Read only
+    from fields the evaluation's `context` actually carries — an evaluation
+    without them is taken as current, as before.
+
+    Only the SOURCE commit is compared: ADO recomputes the merge commit (and
+    may flag `buildIsNotCurrent`) whenever the TARGET moves, while a policy
+    that never expires still counts as approved — judged by those, a passing
+    PR would read pending until someone re-queued a build (QA)."""
+    ctx = ev.get("context")
+    if not isinstance(ctx, dict):
+        return False
+    if ctx.get("isExpired") is True:
+        return True
+    seen = ctx.get("lastMergeSourceCommitId")
+    return bool(isinstance(seen, str) and seen and isinstance(source_commit, str)
+                and source_commit and seen != source_commit)
+
+
 def _azdo_is_ci_policy(ev):
     """Whether one policy-evaluation record is CI rather than governance —
     see AZDO_CI_POLICY_IDS."""
@@ -9484,11 +9507,18 @@ def _summarize_azdo_pr(data, evals=None):
              "abandoned": "CLOSED"}.get(raw, raw.upper())
     if data.get("isDraft") and state == "OPEN":
         state = "DRAFT"
+    lsc = data.get("lastMergeSourceCommit")
+    lmc = data.get("lastMergeCommit")
+    head = lsc.get("commitId") if isinstance(lsc, dict) else None
+    merge_commit = lmc.get("commitId") if isinstance(lmc, dict) else None
     counts = {"pass": 0, "fail": 0, "pending": 0}
     for ev in evals or []:
         if not isinstance(ev, dict) or not _azdo_is_ci_policy(ev):
             continue
         cls = _azdo_check_class(ev.get("status"))
+        # A verdict for an older push is the new head's run still to come.
+        if cls in ("pass", "fail") and _azdo_eval_stale(ev, head):
+            cls = "pending"
         if cls:
             counts[cls] += 1
     total = counts["pass"] + counts["fail"] + counts["pending"]
@@ -9505,7 +9535,6 @@ def _summarize_azdo_pr(data, evals=None):
     # A reviewer voting "waiting for author" (-5) or "rejected" (-10) is ADO's
     # changes-requested, observed per refresh (XERK-1845).
     votes = [r.get("vote") for r in data.get("reviewers") or [] if isinstance(r, dict)]
-    lsc = data.get("lastMergeSourceCommit")
     out = {
         "url": None,
         "number": data.get("pullRequestId"),
@@ -9517,12 +9546,10 @@ def _summarize_azdo_pr(data, evals=None):
         "ready": _merge_ready(state, checks, mergeable),
         "base": base or None,
         # The source branch's tip, as GitHub's headRefOid (XERK-2198).
-        "head": (lsc.get("commitId") if isinstance(lsc, dict) else None) or None,
+        "head": head or None,
         "changesRequestedNow": any(isinstance(v, int) and v < 0 for v in votes),
     }
-    lmc = data.get("lastMergeCommit")
-    _pr_merge_fields(out, state, lmc.get("commitId") if isinstance(lmc, dict) else None,
-                     data.get("closedDate"))
+    _pr_merge_fields(out, state, merge_commit, data.get("closedDate"))
     return out
 
 
@@ -14347,7 +14374,13 @@ def _pane_unglue_options(lines):
 # PANE_MODE_RE it means the composer is live, so its presence below a numbered
 # run says "not a blocking dialog" — a qwen approval dialog REPLACES the footer
 # with "Waiting for user confirmation…" (G0), so a real dialog shows none.
-QWEN_PANE_FOOTER_RE = re.compile(r"Ask permissions \(shift \+ tab to cycle\)")
+# Every qwen mode names itself before it ("Ask permissions", "Auto mode" in
+# 0.22.3, XERK-2200), so the spaced hint alone is the footer: Claude Code
+# writes "shift+tab" unspaced. A footer qwen CUTS on a narrow pane ("Auto mode
+# (s…", or behind a task pill) is not read: a dialog row ellipsized the same
+# way would then hide a live dialog (QA) — a follow-up needs the footer's
+# position, not its text.
+QWEN_PANE_FOOTER_RE = re.compile(r"\S \(shift \+ tab to cycle\)")
 # Claude Code's exit toast, which REPLACES the mode footer for ~0.5-1s after a
 # Ctrl-C (or Ctrl-D) on an idle composer (2.1.306: "  Press Ctrl-C again to
 # exit"). It rides the composer like the footer it hides, so it vetoes a dialog
@@ -14363,8 +14396,10 @@ PANE_EXIT_TOAST_RE = re.compile(r"^\s*Press Ctrl-[CD] again to exit\s*$")
 # first word, or the glyph alone, read ONLY on the pane's bottom line below a
 # rule (`_pane_composer_tail_up`): a qwen dialog has no rule, so its whole
 # screen is "below" one, and a transcript line there would veto it (QA).
+# At 8 columns the word itself is cut ("⏸ ma", "⏵⏵ au"), so any two-letter
+# start of a mode word counts (XERK-2200).
 PANE_MODE_CUT_RE = re.compile(
-    r"^\s*[⏸⏵]+(?:\s+(?:bypass|accept|plan|auto|manual)\b|\s*$)")
+    r"^\s*[⏸⏵]+(?:\s+(?:by|ac|pl|au|ma)[a-z]*|\s*$)")
 
 
 def _pane_composer_tail_up(lines):
@@ -14435,41 +14470,95 @@ def _pane_prompt_edges(lines):
 PANE_DIALOG_MARGIN = 4
 
 
-def _pane_cells(text):
-    """Terminal cells `text` occupies, as tmux 3.4 draws it (XERK-2199).
+# Emoji modifier bases Unicode calls narrow but glibc's wcwidth (which tmux
+# draws by) makes two cells wide: "☝x" is 3 cells in tmux 3.4 (XERK-2200).
+_PANE_WIDE_MODIFIER_BASES = frozenset(
+    "\u261d\u26f9\u270c\u270d\U0001f3cb\U0001f3cc\U0001f574\U0001f575\U0001f590")
+# Format characters tmux still draws one cell wide: the soft hyphen and the
+# prepended concatenation marks (U+0600-0605, U+06DD, U+070F, U+0890-0891,
+# U+08E2, U+110BD, U+110CD; measured, QA).
+_PANE_CF_ONE_CELL = frozenset(
+    "\u00ad\u0600\u0601\u0602\u0603\u0604\u0605\u06dd\u070f\u0890\u0891\u08e2"
+    "\U000110bd\U000110cd")
+# tmux keeps at most this many UTF-8 bytes in one cell (UTF8_SIZE): a longer
+# ZWJ chain or run of regional indicators starts a new cell (XERK-2200).
+_PANE_CELL_BYTES = 21
 
-    Wide (CJK/emoji) glyphs take two. What joins onto the glyph before it takes
-    none: a mark (Mn/Me: a combining accent, Thai vowels, a keycap), a
-    skin-tone modifier on a wide glyph, U+FE0E, and a ZWJ with the glyph it
-    joins after a wide one ("👍🏽", bear+ZWJ+snowflake and a ZWJ family are 2
-    cells; a+ZWJ+b is not joined). U+FE0F or a skin tone makes a narrow base two
-    cells, and capture-pane writes a padding space after it mid-line but trims
-    it at line end, so that space is consumed. Counted per codepoint, one line
-    of emoji read wider than the pane and moved every width judged against the
-    widest line; counted short, a label wrapped after "✔️" stopped the option
-    run before "No" (QA)."""
-    cells, prev, pad, joined = 0, 0, False, False
+
+def _pane_cells(text):
+    """Terminal cells `text` occupies, as tmux 3.4 draws it (XERK-2199, XERK-2200).
+
+    Measured against real tmux 3.4 (`#{cursor_x}` after printing the text,
+    against what capture-pane gave back):
+      * wide (CJK/emoji) glyphs take two; a mark (Mn/Me), U+FE00-FE0E, a format
+        character (Cf: ZWSP, word joiner, BOM, tags — but not
+        `_PANE_CF_ONE_CELL`, which take one) and a Hangul medial/final jamo add
+        none;
+      * a ZWJ joins the NEXT non-ASCII character into the current cell, keeping
+        its width ("क्\u200dष" is 1, "👨\u200d👩\u200d👧" 2); an ASCII one after it is
+        its own cell ("a\u200db" is 2);
+      * a skin tone or regional indicator after a non-ASCII cell combines into
+        it ("🇺🇸🇺🇸" is ONE cell); after ASCII, a space or the start it is its
+        own two-cell glyph ("a🏽" is 3);
+      * a cell holds at most `_PANE_CELL_BYTES` bytes: what would not fit
+        starts a new cell (a four-person family is 4 cells) or, with no width,
+        is dropped;
+      * U+FE0F, or one of those combining into a one-cell glyph, widens that
+        cell to two; capture-pane then writes a padding space after it mid-line
+        (trimmed at line end), which is consumed — and the glyph after that pad
+        never combines ("©️ 🏽" is 4).
+    Not covered: glyphs whose glibc width differs from Unicode's beyond
+    `_PANE_WIDE_MODIFIER_BASES`. Counted per codepoint, one line of emoji read
+    wider than the pane and moved every width judged against the widest line;
+    counted short, a label wrapped after "✔️" stopped the option run before
+    "No" (QA)."""
+    cells = cur_w = cur_bytes = 0
+    cur_ascii = pad = after_pad = zwj = False
     for c in text:
+        size = len(c.encode("utf-8"))
+        fits = cur_w > 0 and cur_bytes + size <= _PANE_CELL_BYTES
         if pad:
             pad = False
             if c == " ":
+                after_pad = True
                 continue
-        if joined:
-            joined = False       # "🐻‍❄️" is one glyph: the joined one adds none
-            continue
         if c == "\u200d":
-            joined = prev == 2
-        elif c == "\ufe0f":
-            if prev == 1:
-                cells, prev, pad = cells + 1, 2, True
-        elif "\U0001f3fb" <= c <= "\U0001f3ff":
-            if prev == 1:        # "☝🏽": a skin tone widens a narrow base too
-                cells, prev = cells + 1, 2
-        elif unicodedata.category(c) in ("Mn", "Me") or "\ufe00" <= c <= "\ufe0e":
-            pass
-        else:
-            prev = 2 if unicodedata.east_asian_width(c) in "WF" else 1
-            cells += prev
+            zwj = fits
+            cur_bytes += size if fits else 0
+            continue
+        modifier = "\U0001f3fb" <= c <= "\U0001f3ff"
+        ri = "\U0001f1e6" <= c <= "\U0001f1ff"
+        if zwj:
+            zwj = False
+            if ord(c) >= 0x80 and fits:
+                cur_bytes += size
+                if (modifier or ri) and cur_w == 1:
+                    cells, cur_w, pad = cells + 1, 2, True
+                continue
+        if c == "\ufe0f":
+            if fits:
+                cur_bytes += size
+                if cur_w == 1:
+                    cells, cur_w, pad = cells + 1, 2, True
+            continue
+        if (unicodedata.category(c) in ("Mn", "Me")
+                or (unicodedata.category(c) == "Cf" and c not in _PANE_CF_ONE_CELL)
+                or "\ufe00" <= c <= "\ufe0e" or "\u1160" <= c <= "\u11ff"):
+            if fits:
+                cur_bytes += size
+                cur_ascii = False    # "e\u0301🏽" combines like "é🏽"
+            continue
+        if modifier or ri:
+            if fits and not cur_ascii and not after_pad:
+                if cur_w == 1:
+                    cells, cur_w, pad = cells + 1, 2, True
+                cur_bytes += size
+                continue
+            cells, cur_w, cur_ascii, cur_bytes, after_pad = cells + 2, 2, False, size, False
+            continue
+        w = (2 if unicodedata.east_asian_width(c) in "WF"
+             or c in _PANE_WIDE_MODIFIER_BASES else 1)
+        cells, cur_w, cur_ascii, cur_bytes, after_pad = cells + w, w, ord(c) < 0x80, size, False
     return cells
 
 
@@ -19017,7 +19106,10 @@ def _pane_blocking_dialog(cap):
 
 
 # An idle composer's rule, drawn from column 0 (a dialog's box rule is indented).
-_COMPOSER_EDGE_RULE_RE = re.compile(r"^─{10,}")
+# A whole line of it counts at any width: an 8-column pane's rule is 8 (XERK-2200).
+_COMPOSER_EDGE_RULE_RE = re.compile(r"^(?:─{10,}|─{3,}\s*$)")
+# A pane at most this high may lose the ▔ edge above a cut-off dialog.
+_PANE_CUT_SHORT_ROWS = 12
 # How many wrapped label lines may follow the cut-off dialog's "❯ 1." row.
 _PANE_CUT_OPTION_WRAP_LINES = 4
 
@@ -19043,8 +19135,22 @@ def _pane_cut_dialog_up(cap):
     lines = [_PANE_SCROLLBAR_RE.sub("", line).rstrip()
              for line in _ANSI_RE.sub("", cap).splitlines()]
     edge = max(_pane_prompt_edges(lines), default=None)
-    if edge is None:
-        return False
+    # A short pane may draw the dialog without its ▔ edge (2.1.308 drops it
+    # on some frames, XERK-2200): there the area starts below the dialog's own
+    # box — the first indented rule spanning the pane, as `_pane_under_box`
+    # reads it — and only the "❯ 1." read below counts: a first line ending
+    # "?" is too often a reply scrolled to the top.
+    edgeless = edge is None
+    if edgeless:
+        if len(lines) > _PANE_CUT_SHORT_ROWS:
+            return False
+        widest = max((_pane_cells(line) for line in lines), default=0)
+        edge = next((k for k, line in enumerate(lines)
+                     if line[:1].isspace() and PANE_PROMPT_RULE_RE.match(line)
+                     and "─" in line
+                     and _pane_cells(line) >= widest - PANE_DIALOG_MARGIN), None)
+        if edge is None:
+            return False
     area = lines[edge + 1:]
     options = _pane_unglue_options(area)   # read for "❯ 1." only
     text = "\n".join(area)
@@ -19055,7 +19161,7 @@ def _pane_cut_dialog_up(cap):
     asks = lambda line: line.strip().rstrip("↓ ").endswith("?")
     content = [line for line in area
                if line.strip() and not PANE_PROMPT_RULE_RE.match(line)]
-    if content and asks(content[0]):
+    if not edgeless and content and asks(content[0]):
         return True
     filled = [k for k, line in enumerate(area) if line.strip()]
     for n, k in enumerate(reversed(filled)):
