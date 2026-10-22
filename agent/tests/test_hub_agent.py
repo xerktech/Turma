@@ -10613,7 +10613,9 @@ class TestHintDialogIsABlockingDialog(unittest.TestCase):
         # lines whole instead glued "Accept  Decline" onto the elicitation's
         # first item and missed it; the seam alone must not invent a match.
         self.assertTrue(ha._hint_dialog_up(_2142_PICKER_40))
-        self.assertFalse(ha._hint_dialog_up("x · Esc\nto\ncancel\n"))
+        # (Wider than `_NARROW_HINT_MAX_CELLS`: a narrow pane reads the hint
+        # stale-cell-tolerant, XERK-2202.)
+        self.assertFalse(ha._hint_dialog_up("x" * 30 + "\nx · Esc\nto\ncancel\n"))
 
     def test_a_composer_draft_ending_in_the_footer_is_not_one(self):
         # A real 2.1.306 frame (QA): the operator's two-line draft ends on
@@ -11114,6 +11116,106 @@ _2148_PICKER_40 = (
     "     4.  Sonnet 5.5       Most\n"
     "   ↓ 10. Opus 4.8         Best for    ↓\n"
 )
+
+
+class TestExtremePaneSizes(unittest.TestCase):
+    """XERK-2202: live frames (Claude Code 2.1.308, qwen 0.26 in tmux 3.4) at
+    pane sizes where every other dialog read missed them, or where qwen's cut
+    footer let a quoted reply pose as one. Verbatim captures, trailing blanks
+    trimmed."""
+
+    # Claude dialogs that read as an idle composer before.
+    EXIT_PLAN_30x10 = ("\n\n" + "▔" * 30 + "\n                            ↓\n  " + "─" * 26 + "\n"
+                       "   Claude has written up a\n   plan and is ready to\n"
+                       "   execute. Would you like\n   to proceed?\n")
+    WRITE_12x10 = ("     file co\n     mmands)\n     for\n     this\n     session\n"
+                   "     (shift\n Esc to b)\n cancel ·\n Tab to\n amend\n")
+    WRITE_8x10 = ("     le\n     com\n     man\n     ds)\n Esc to\n     for\n cancel\n"
+                  " · Tabs\n to  ses\n amendio\n")
+    BASH_8x14 = ("     e h\n     and\n     les\n     th\n     ese\n     pr\n   4. No\n     ts\n"
+                 " Esc tor\n\n cancelu\n · Tab\n to\n amend\n")
+    ASK_8x10 = "  this\n\nEnter to\nselect\n· ↑/↓ to\n\nnavigate\n· Esc\nto\ncancel\n"
+    # qwen dialogs whose question the width cut ("Apply this …").
+    QWEN_DIFF_20x12 = ("                   │\n   ... diff hi…    │\n                   │\n"
+                       "   Apply this …    │\n                   │\n   › 1. Yes, a…    │\n"
+                       "     2. Yes, a…    █\n     3. No, su…    █\n                   █\n\n"
+                       "  ⠏ Waiting for user\n …\n")
+    QWEN_SHELL_14x14 = ("             │\n" * 4 + "   Allow…    │\n             │\n"
+                        "   › 1. …    │\n     2. …    │\n     3. …    █\n     4. …    █\n"
+                        "             █\n\n  ⠏ Waiting fo\nr…\n")
+    # Idle composers, which must stay typeable.
+    IDLE_8x10 = "  for\n  1s ·\n  done\n  5:03\n  PM\n\n────────\n❯\n────────\n  ⏵⏵\n"
+    MANUAL_8x10 = "  for\n  1s ·\n  done\n  5:03\n  PM\n\n────────\n❯\n────────\n  ⏸ ma\n"
+    # qwen idle panes whose reply quotes a numbered list: the footer hint cut
+    # by the width, and cut behind a background-task pill.
+    QWEN_IDLE_24x20 = ("                       │\n    ---                │\n                       │\n"
+                       "    Which one?         │\n                       │\n"
+                       "    ❯ 1. Alpha         █\n       2. Beta         █\n"
+                       "  ●︎ Update             █\n    successful! The    █\n"
+                       "    new version will   █\n    be used on your    █\n"
+                       "    next run.          █\n\n" + "─" * 24 + "\n>   Type your message or\n\n"
+                       "  @path/to/file\n" + "─" * 24 + "\n  ➜ work · fake\n  Auto mode (shift + …\n")
+    QWEN_PILL_20x12 = ("                   │\n    ❯ 1. Alpha     │\n       2. Beta     █\n\n"
+                       + "─" * 20 + "\n>   Type your messag\ne\n   or @path/to/file\n\n"
+                       + "─" * 20 + "\n  ➜ work · fake\n  ⏸ Ask pe ·1 tas…\n")
+
+    def test_dialogs_at_extreme_sizes_block_typing(self):
+        for name in ("EXIT_PLAN_30x10", "WRITE_12x10", "WRITE_8x10", "BASH_8x14",
+                     "ASK_8x10", "QWEN_DIFF_20x12", "QWEN_SHELL_14x14"):
+            self.assertTrue(ha._pane_blocking_dialog(getattr(self, name)), name)
+
+    def test_idle_composers_at_extreme_sizes_stay_typeable(self):
+        for name in ("IDLE_8x10", "MANUAL_8x10", "QWEN_IDLE_24x20", "QWEN_PILL_20x12"):
+            self.assertFalse(ha._pane_blocking_dialog(getattr(self, name)), name)
+            self.assertIsNone(ha.parse_pane_prompt(getattr(self, name)), name)
+
+    def test_the_narrow_hint_needs_claudes_capitalised_esc(self):
+        # qwen's busy spinner and Claude's busy hint are lower-case: a narrow
+        # busy pane is no dialog.
+        tail = ["⠋ Thinking", "(3s · esc", "to", "cancel)"]
+        self.assertFalse(ha._narrow_hint_up(tail, tail))
+        self.assertFalse(ha._narrow_hint_up(["esc to", "interrupt"], ["esc to"]))
+        self.assertTrue(ha._narrow_hint_up(["Esc to", "cancel"], ["Esc to"]))
+
+    def test_the_narrow_hint_is_read_only_on_a_narrow_pane(self):
+        tail = ["Esc to b)", "cancel ·"]
+        self.assertTrue(ha._narrow_hint_up(tail, tail))
+        self.assertFalse(ha._narrow_hint_up(tail, tail + ["x" * 20]))
+
+    def test_a_far_off_word_does_not_complete_the_hint(self):
+        tail = ["Esc to", "a b c", "cancel"]
+        self.assertFalse(ha._narrow_hint_up(tail, tail))
+
+    def test_the_cut_exit_plan_needs_the_box_rule_under_the_edge(self):
+        # The same frame with the box rule at column 0 is the composer's.
+        cap = self.EXIT_PLAN_30x10.replace("  " + "─" * 26, "─" * 30)
+        self.assertFalse(ha._pane_cut_dialog_up(cap))
+        # And with text first, no rule: not this shape.
+        cap = self.EXIT_PLAN_30x10.replace("  " + "─" * 26 + "\n", "")
+        self.assertFalse(ha._pane_cut_dialog_up(cap))
+
+    def test_the_boxed_composer_needs_its_prompt_line_and_a_short_footer(self):
+        rule = "─" * 20
+        box = [rule, ">   Type", rule, "  ➜ work", "  Auto mode…"]
+        self.assertTrue(ha._pane_boxed_composer_up(box))
+        # No prompt glyph after the first rule (the AskUserQuestion picker's
+        # rule sits above "5. Chat about this").
+        self.assertFalse(ha._pane_boxed_composer_up([rule, "  5. Chat", rule, "x"]))
+        # More than a footer below the second rule.
+        self.assertFalse(ha._pane_boxed_composer_up(box + ["a", "b"]))
+        # A rule short of the pane's width, or indented, is a dialog's.
+        self.assertFalse(ha._pane_boxed_composer_up(
+            [rule, ">   Type", "─" * 10, "  ➜ work", "x" * 20]))
+        self.assertFalse(ha._pane_boxed_composer_up(
+            ["  " + rule[2:], ">   Type", rule, "  ➜ work"]))
+
+    def test_the_waiting_line_counts_only_at_the_bottom(self):
+        cap = "  ⠏ Waiting for user confirmation...\n  more reply\n  text\n"
+        self.assertFalse(ha._qwen_waiting_up(cap))
+        # Under a composer box (an idle pane quoting it) it never counts.
+        rule = "─" * 40
+        cap = "\n".join([rule, ">   Type", rule, "  ⠏ Waiting for user"]) + "\n"
+        self.assertFalse(ha._qwen_waiting_up(cap))
 
 
 class TestModelPickerBodyIsABlockingDialog(unittest.TestCase):
@@ -23534,7 +23636,11 @@ class TestParsePanePrompt(unittest.TestCase):
             cap.replace("Ctrl-C", "Ctrl-D")))
         # Only the toast line itself vetoes: the same text quoted inside a line
         # leaves the reply parsing as it always did without a footer.
-        self.assertIsNotNone(ha.parse_pane_prompt(cap.replace(
+        # (Without the prompt line: the whole composer box vetoes on its own
+        # shape, `_pane_boxed_composer_up`, XERK-2202.)
+        self.assertIsNone(ha.parse_pane_prompt(cap.replace(
+            "  Press Ctrl-C again to exit", "  Tip: Press Ctrl-C again to exit")))
+        self.assertIsNotNone(ha.parse_pane_prompt(cap.replace("\n❯ \n", "\n  x\n").replace(
             "  Press Ctrl-C again to exit", "  Tip: Press Ctrl-C again to exit")))
         # A narrow pane wraps the toast (QA: 28 and 24 columns, 3 lines at 16).
         for wrapped in ("Press Ctrl-C again to\n  exit",
@@ -23558,13 +23664,18 @@ class TestParsePanePrompt(unittest.TestCase):
                 cap.replace("  ⏸ manual  ·", cut)), cut)
         # Only the composer's own tail: the glyph quoted in the reply, or a
         # bare mode word below the rule, leaves the reply parsing as before.
+        # (Without the prompt line: a whole composer box vetoes on its own
+        # shape, `_pane_boxed_composer_up`, XERK-2202.)
+        boxless = cap.replace("\n❯ \n", "\n  x\n")
+        self.assertIsNone(ha.parse_pane_prompt(boxless))
+        self.assertIsNone(ha.parse_pane_prompt(cap.replace("  ⏸ manual  ·", "  manual  ·")))
         self.assertIsNotNone(ha.parse_pane_prompt(
-            cap.replace("  ⏸ manual  ·", "  manual  ·")))
+            boxless.replace("  ⏸ manual  ·", "  manual  ·")))
         self.assertIsNotNone(ha.parse_pane_prompt(
-            "  ⏸ manual  ·\n" + cap.replace("  ⏸ manual  ·", "  x")))
+            "  ⏸ manual  ·\n" + boxless.replace("  ⏸ manual  ·", "  x")))
         # Only the BOTTOM line: one above it, under the rule, is not a footer.
         self.assertIsNotNone(ha.parse_pane_prompt(
-            cap.replace("  ⏸ manual  ·", "  ⏸ manual  ·\n  x")))
+            boxless.replace("  ⏸ manual  ·", "  ⏸ manual  ·\n  x")))
         # A rule-less pane (a qwen approval dialog) is never vetoed by a
         # transcript line that merely starts like a footer (QA, HIGH).
         qwen = ("◆ Sure.\n    ⏸ plan mode first, then run it\n\n"

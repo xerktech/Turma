@@ -55,6 +55,14 @@ composed.**
     notify fallback, qwen peer). `_submit_typed` also never presses into a dialog that came up
     while typing or after its Enter, and stops watching at once.
     Tests: `TestSubmitTypedDialogsAndBaselines`.
+  - **Extreme pane sizes are read by POSITION, never by more wording** (XERK-2202, live frames
+    in `TestExtremePaneSizes`): ≤19-cell panes match a stale-cell-tolerant "Esc to cancel"
+    (`_narrow_hint_up`, capital `Esc` only — qwen's spinner and Claude's busy hint are
+    lower-case); a cut Exit-plan dialog opens with an indented box rule under the ▔ edge; a
+    qwen dialog ends in its "⠏ Waiting for user…" line; and an idle composer is its BOX
+    (`_pane_boxed_composer_up`: two full-width column-0 rules, a prompt line, ≤3 footer lines).
+    - Never match qwen's cut footer hint by text: an ellipsized dialog row then hid a live
+      approval (XERK-2200). The box shape is what tells them apart.
   - **The dialog check runs before EVERY write, not once per message** (`_slice_gate`): before
     each later slice, send-keys chunk and Enter, on tmux and Windows, whether or not draws are
     still awaited. QA: a dialog drawn mid-message got the rest, and a last slice "1" approved
