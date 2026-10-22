@@ -16187,9 +16187,13 @@ function prEventDiff(prs, known) {
     const state = typeof p.state === "string" ? p.state.toUpperCase() : "";
     const seen = p.checks === "passing" || p.checks === "failing" || p.checks === "pending"
       ? p.checks : null;
-    const ci = seen || (prev && typeof prev.ci === "string" ? prev.ci : null);
-    const head = typeof p.head === "string" && PR_EVENT_HEAD_RE.test(p.head) ? p.head
-      : (prev && typeof prev.head === "string" ? prev.head : null);
+    const prevHead = prev && typeof prev.head === "string" ? prev.head : null;
+    const head = typeof p.head === "string" && PR_EVENT_HEAD_RE.test(p.head) ? p.head : prevHead;
+    // A moved head with no rollup yet (GitHub lists no checks until they register) is a
+    // new run with no verdict: never carry the old head's verdict onto it, or that run
+    // settling the same way would read as already announced.
+    const moved = !!(head && prevHead && head !== prevHead);
+    const ci = seen || (!moved && prev && typeof prev.ci === "string" ? prev.ci : null);
     const wasMerged = !!(prev && prev.merged === true);
     const isMerged = state === "MERGED";
     next[url] = { ci, head, merged: isMerged || wasMerged };
@@ -16197,7 +16201,7 @@ function prEventDiff(prs, known) {
     if (isMerged) {
       if (!wasMerged) merged.push(url);
     } else if ((state === "OPEN" || state === "DRAFT") && (seen === "passing" || seen === "failing")) {
-      const newRun = !prev || prev.ci !== seen || (head && prev.head && head !== prev.head);
+      const newRun = !prev || prev.ci !== seen || moved;
       if (newRun) (seen === "passing" ? passed : failed).push(url);
     }
   }

@@ -25527,6 +25527,36 @@ test("PR events: a new head with the same verdict is a new CI run; a DRAFT count
   assert.equal(prEventTexts(host).length, 2);
 });
 
+test("PR events: a new head first seen with no checks still announces its result", () => {
+  const host = "prev-nullhead";
+  const url = "https://github.com/x/y/pull/9";
+  const a = prEventHost(host, [{ url, state: "OPEN", checks: "passing", head: "a".repeat(40) }]);
+  hub.prEventSweep();                       // baseline
+  const pr = a.sessions[0].prs[0];
+  pr.head = "b".repeat(40);
+  pr.checks = null;                         // pushed; checks not registered yet
+  hub.prEventSweep();
+  assert.deepEqual(prEventTexts(host), []);
+  pr.checks = "passing";
+  hub.prEventSweep();
+  assert.equal(prEventTexts(host).length, 1, "the new head's green is announced");
+});
+
+test("PR events: a session that throws costs only itself", () => {
+  const host = "prev-throw";
+  const a = prEventHost(host, [{ url: "https://github.com/x/y/pull/1", state: "OPEN", checks: "pending" }]);
+  const bad = { get url() { throw new Error("boom"); } };
+  a.sessions.unshift({ id: "p0", status: "running", prs: [bad] });
+  a.alerts.sessions.p0 = {};
+  hub.prEventSweep();
+  a.sessions[1].prs[0].checks = "failing";
+  hub.prEventSweep();
+  const texts = prEventTexts(host);
+  assert.equal(texts.length, 1, "the next session is still messaged");
+  assert.match(texts[0], /^CI failed on PR/);
+  delete agents[host];                      // a throwing getter poisons the registry's size accounting
+});
+
 test("PR events: a url carrying prose or shell syntax is never interpolated", () => {
   const host = "prev-url";
   const a = prEventHost(host, []);
