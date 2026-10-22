@@ -82,9 +82,13 @@ Split out of `.claude/rules/turma-board.md`. Auto-start/auto-stop live there; ep
       (`<host>\x00<sessionId>` → `{at, urls:Set}`, bounded `AUTO_CLOSE_NOTIFY_MAX` oldest-first)
       remembers which merged urls a session was told about. A repeat sweep over the same merged set
       sends nothing; a FOLLOW-UP PR merging (a new url, all landed again) sends the message again —
-      "until the ticket is marked Done and the session auto-closes." In-memory like `autoStopped`: a
-      restart at worst re-sends one message. The `epicRunCompleteSweep` epic-Done write is unchanged
-      (an epic has no session to message).
+      "until the ticket is marked Done and the session auto-closes." The `epicRunCompleteSweep`
+      epic-Done write is unchanged (an epic has no session to message).
+    - **The notified urls also ride the session's alerts edge** (`sa.closeNotified`, persisted in
+      `state.json`) and are read when the map has none (XERK-2194, the `sa.nudged` pattern): a
+      non-HA restart empties the map, and without it every all-landed session was messaged again.
+      A sweep re-seats the edge from the map when a session-less beat swept it. HA failover is
+      covered by the guard mirror. Test: `XERK-2194:` in `server.test.js`.
     - **The message is "verify it DEPLOYED and WORKS, then Done" (`autoCloseMergedMessage`), never
       "merged, so Done"** — a merge is not the finish line. It names only the NEWLY-merged url(s) and
       tells a failing session to open the follow-up on a FRESH branch off the updated default branch:

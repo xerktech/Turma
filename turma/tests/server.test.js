@@ -15615,6 +15615,43 @@ test("XERK-705: a FOLLOW-UP PR merging re-fires the message", async () => {
   assert.equal(inputTexts("amC2b").length, 2, "a newly-merged follow-up PR re-fires");
 });
 
+test("XERK-2194: a non-HA restart re-sends no merged message: the urls ride the persisted alerts edge", async () => {
+  // `autoCloseNotified` is memory (plus the HA guard store); a restart empties it
+  // while state.json restores the session's alerts edge, which carries the urls.
+  resetMerge();
+  await mergeBeat("amRs", "amrs.atlassian.net", { state: "MERGED" });
+  autoCloseSweep();
+  assert.equal(inputTexts("amRs").length, 1);
+  const sid = agents.amRs.sessions[0].id;
+  assert.deepEqual(agents.amRs.alerts.sessions[sid].closeNotified.urls, [PR1]);
+  autoCloseNotified.clear();                            // the restart
+  autoCloseSweep();
+  assert.equal(inputTexts("amRs").length, 1, "the restart must not re-send the message");
+  // A follow-up PR merging after the restart still messages, naming only the new url.
+  const PR2 = "https://github.com/x/y/pull/2";
+  await mergeBeat("amRs", "amrs.atlassian.net", { prs: [
+    { url: PR1, state: "MERGED" }, { url: PR2, state: "MERGED" }] });
+  autoCloseNotified.clear();
+  autoCloseSweep();
+  const msgs = inputTexts("amRs");
+  assert.equal(msgs.length, 2);
+  assert.ok(msgs[1].includes(PR2) && !msgs[1].includes(PR1), msgs[1]);
+  assert.deepEqual(agents.amRs.alerts.sessions[sid].closeNotified.urls, [PR1, PR2]);
+  // A beat that swept the edge (session omitted) while the map kept it: the next
+  // sweep copies it back, so a later restart still re-sends nothing.
+  delete agents.amRs.alerts.sessions[sid].closeNotified;
+  autoCloseSweep();
+  assert.deepEqual(agents.amRs.alerts.sessions[sid].closeNotified.urls, [PR1, PR2]);
+  autoCloseNotified.clear();
+  autoCloseSweep();
+  assert.equal(inputTexts("amRs").length, 2, "a re-seated edge still suppresses after a restart");
+  // A corrupt edge reads as "no record", never a crash or a suppression.
+  agents.amRs.alerts.sessions[sid].closeNotified = { at: "x", urls: "junk" };
+  autoCloseNotified.clear();
+  autoCloseSweep();
+  assert.equal(inputTexts("amRs").length, 3);
+});
+
 test("auto-close: the merged message asks the session to verify the DEPLOY before Done", async () => {
   resetMerge();
   await mergeBeat("amV1", "amv1.atlassian.net", { state: "MERGED" });

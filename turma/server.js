@@ -15802,8 +15802,9 @@ const autoMergeState = new Map();
 // the epic (XERK-636/637). This map remembers, per session, which merged PR urls it
 // has already been told about, so a FOLLOW-UP PR merging re-fires the message but a
 // repeat sweep over the same set does not. Keyed "<host>\x00<sessionId>" ->
-// {at, urls:Set<string>}; bounded oldest-first. In-memory only (like autoStopped): a
-// hub restart at worst re-sends one message.
+// {at, urls:Set<string>}; bounded oldest-first. HA-mirrored, and the same urls ride
+// the session's alerts edge (`sa.closeNotified`, persisted in state.json) so a
+// non-HA restart re-sends nothing (XERK-2194).
 const autoCloseNotified = new Map();
 const AUTO_CLOSE_NOTIFY_MAX = 500;
 // XERK-763: mirror which merged-PR urls a session was already messaged about, so
@@ -16084,6 +16085,7 @@ function autoCloseSweep() {
   const byKey = autoMergeRowIndex(rows);
   const isMerged = (p) => String((p && p.state) || "").toUpperCase() === "MERGED";
   for (const [host, a] of Object.entries(agents)) {
+    const sas = (a.alerts && a.alerts.sessions) || {};
     for (const s of a.sessions || []) {
       // Either stream makes a session eligible; both react the same way now, so the
       // OR (disjoint by construction — the content gate nulls autoMergeSession on any
@@ -16103,7 +16105,17 @@ function autoCloseSweep() {
       // payload) would read "new" every beat and re-send the message every sweep.
       const mergedUrls = prs.filter(isMerged).map((p) => p.url)
         .filter((u) => typeof u === "string" && u);
-      const rec = autoCloseNotified.get(nk);
+      // The map is memory (plus the HA guard store); the same urls also ride the
+      // session's alerts edge, so a non-HA restart or deploy never re-sends.
+      const sa = typeof s.id === "string" && Object.hasOwn(sas, s.id) ? sas[s.id] : null;
+      const kept = sa && sa.closeNotified;
+      const keptOk = kept && typeof kept.at === "number" && Array.isArray(kept.urls);
+      const mem = autoCloseNotified.get(nk);
+      const rec = mem
+        || (keptOk ? { at: kept.at, urls: new Set(kept.urls.filter((u) => typeof u === "string")) } : undefined);
+      // A beat that omitted the session swept its edge; the map still knows, so
+      // copy it back or the next restart re-sends.
+      if (sa && mem && !keptOk) sa.closeNotified = { at: mem.at, urls: [...mem.urls] };
       const seen = rec ? rec.urls : null;
       const fresh = seen ? mergedUrls.some((u) => !seen.has(u)) : mergedUrls.length > 0;
       if (fresh) {
@@ -16116,6 +16128,7 @@ function autoCloseSweep() {
         const at = Date.now();
         autoCloseNotified.set(nk, { at, urls: new Set(mergedUrls) });
         guardStoreSet("autoCloseNotified", nk, { at, urls: [...mergedUrls] });
+        if (sa) sa.closeNotified = { at, urls: [...mergedUrls] };
       }
     }
   }
