@@ -16220,19 +16220,36 @@ const PR_EVENT_HEAD_RE = /^[A-Za-z0-9]{7,64}$/;
 function prEventUrl(u) {
   return typeof u === "string" && PR_EVENT_URL_RE.test(u) ? u : null;
 }
+// How a message names a forge's PR and where its failing checks are read
+// (XERK-2200): GitLab calls it an MR and has no `gh`, ADO's checks are branch
+// policies. Mirrors the agent's `_pr_ref` naming. Only the PR number is ever
+// interpolated beyond the already-checked url.
+function prEventForge(url) {
+  const mr = /\/-\/merge_requests\/(\d+)/.exec(url);
+  if (mr) {
+    return { noun: "MR", checks: `the MR's pipeline (\`glab mr view ${mr[1]}\` in the repo, `
+      + "then `glab ci view` on its branch)" };
+  }
+  const ado = /\/pullrequest\/(\d+)/i.exec(url);
+  if (ado) {
+    return { noun: "PR", checks: `the PR's build policies (\`az repos pr policy list --id ${ado[1]}\`)` };
+  }
+  return { noun: "PR", checks: `the failing checks (\`gh pr checks ${url}\`)` };
+}
 function prEventMessage(passed, failed, merged, autoMerge) {
   const parts = [];
   for (const u of failed) {
-    parts.push(`CI failed on PR ${u}. Read the failing checks (\`gh pr checks ${u}\`), `
+    const f = prEventForge(u);
+    parts.push(`CI failed on ${f.noun} ${u}. Read ${f.checks}, `
       + "fix the cause and push; you will be messaged with the next result.");
   }
   for (const u of passed) {
-    parts.push(`CI passed on PR ${u}. `
+    parts.push(`CI passed on ${prEventForge(u).noun} ${u}. `
       + (autoMerge ? "Auto-merge will merge it once it is mergeable" : "The operator merges it")
       + " — don't watch for the merge; you will be messaged when it lands.");
   }
   for (const u of merged) {
-    parts.push(`PR ${u} has been merged. Carry on with any remaining work for it; `
+    parts.push(`${prEventForge(u).noun} ${u} has been merged. Carry on with any remaining work for it; `
       + "if there is none, end the turn.");
   }
   return parts.join("\n\n");

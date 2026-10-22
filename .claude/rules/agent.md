@@ -348,7 +348,7 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
       hides the footer that would veto it.
     - Or, edgeless (2.1.308, XERK-2199), right under its own indented pane-wide box rule with
       no column-0 composer rule below the run (`_pane_under_box`); `detail` stops at that rule.
-    - Widths are tmux cells (`_pane_cells`): modifiers, VS, marks and ZWJ-joined glyphs add none.
+    - Widths are tmux 3.4 cells (`_pane_cells`; rules measured on real tmux, in its docstring).
     - That dialog's box ends 2 cells in from the pane, and its labels wrap there: wrap width is
       the nearest box rule within `PANE_DIALOG_MARGIN` of the pane (`_pane_dialog_width`), else
       the widest line. Below ~30 columns the TUI's own wrap still drifts (a subtitle past three

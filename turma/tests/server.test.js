@@ -25524,6 +25524,29 @@ test("PR events: CI settling and a merge each message the session once; the firs
     + "if there is none, end the turn.");
 });
 
+test("XERK-2200: PR events name a GitLab MR and an ADO PR's own check tool, never gh", () => {
+  const host = "prev-forge";
+  const mr = "https://gitlab.example.com/g/r/-/merge_requests/12";
+  const ado = "https://dev.azure.com/o/p/_git/r/pullrequest/34";
+  const a = prEventHost(host, [{ url: mr, state: "OPEN", checks: "pending" },
+    { url: ado, state: "OPEN", checks: "pending" }]);
+  hub.prEventSweep();
+  a.sessions[0].prs.forEach((p) => { p.checks = "failing"; });
+  hub.prEventSweep();
+  const [text] = prEventTexts(host);
+  assert.ok(text.includes(`CI failed on MR ${mr}. Read the MR's pipeline (\`glab mr view 12\``), text);
+  assert.ok(text.includes(`CI failed on PR ${ado}. Read the PR's build policies `
+    + "(`az repos pr policy list --id 34`)"), text);
+  assert.doesNotMatch(text, /gh pr checks/);
+  a.sessions[0].prs.forEach((p) => { p.checks = "passing"; });
+  hub.prEventSweep();
+  assert.match(prEventTexts(host)[1], new RegExp(`^CI passed on MR ${mr.replace(/[.]/g, "\\.")}\\.`));
+  a.sessions[0].prs[0].state = "MERGED";
+  hub.prEventSweep();
+  assert.ok(prEventTexts(host)[2].startsWith(`MR ${mr} has been merged.`));
+  delete agents[host];
+});
+
 test("PR events: a new PR first seen already settled is announced once the session is baselined", () => {
   const host = "prev-new";
   const a = prEventHost(host, []);

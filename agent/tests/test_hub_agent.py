@@ -10967,6 +10967,27 @@ class TestPanePromptUnderTheEdge(unittest.TestCase):
         self.assertTrue(ha._pane_cut_dialog_up(
             head + "".join(wraps.splitlines(True)[:ha._PANE_CUT_OPTION_WRAP_LINES])))
 
+    def test_a_short_pane_without_its_edge_still_blocks_on_option_one(self):
+        # XERK-2200: 2.1.308 can drop the ▔ edge; on a pane of 12 rows or
+        # fewer a dialog cut at "❯ 1." must still read as blocking.
+        for cap in (_2148_EP_120x10, _2148_PLAN_120x10):
+            edgeless = "\n".join(line for line in cap.splitlines()
+                                  if not ha._pane_prompt_edges([line]))
+            self.assertTrue(ha._pane_cut_dialog_up(edgeless))
+            self.assertTrue(ha._pane_blocking_dialog(edgeless))
+            # A taller pane needs its edge: there the shape is too often a reply.
+            self.assertFalse(ha._pane_cut_dialog_up("\n" * 13 + edgeless))
+        # Edgeless, the dialog's own full-width box must be there, only the
+        # "❯ 1." read counts, and an idle composer vetoes.
+        box = "  " + "─" * 30 + "\n"
+        self.assertTrue(ha._pane_cut_dialog_up(box + "   Proceed?\n    ❯ 1. Yes\n"))
+        self.assertFalse(ha._pane_cut_dialog_up("   Proceed?\n    ❯ 1. Yes\n" + "x" * 32))
+        self.assertFalse(ha._pane_cut_dialog_up("  " + "─" * 10 + "\n   Proceed?\n    ❯ 1. Yes"
+                                                + "x" * 30 + "\n"))
+        self.assertFalse(ha._pane_cut_dialog_up(box + "   Exit plan mode?\n\n   Claude wants to\n"))
+        self.assertFalse(ha._pane_cut_dialog_up(
+            box + "   Proceed?\n    ❯ 1. Yes\n" + "─" * 32 + "\n❯ \n"))
+
 
 class TestPaneCutDialogBackstops(unittest.TestCase):
     """XERK-2180: each veto in `_pane_cut_dialog_up` pinned by a frame only it
@@ -19638,6 +19659,27 @@ class TestAzdoPrStatus(AzdoPrMixin, unittest.TestCase):
             self.pr_payload(lastMergeSourceCommit={"commitId": sha}), None)
         self.assertEqual(out["head"], sha)
         self.assertIsNone(ha._summarize_azdo_pr(self.pr_payload(), None)["head"])
+
+    def test_a_verdict_for_an_older_push_reads_pending(self):
+        """XERK-2200: right after a push the PR GET shows the new source commit
+        while the build evaluation still carries the old run's verdict; an
+        expired or not-current build, or one judged for another commit, is the
+        new head's run still to come — never "CI passed" for it."""
+        build = {"configuration": {"type": {"displayName": "Build"}}}
+        pr = self.pr_payload(lastMergeSourceCommit={"commitId": "b" * 40},
+                             lastMergeCommit={"commitId": "m" * 40})
+        def checks(status, ctx):
+            return ha._summarize_azdo_pr(pr, [dict(build, status=status, context=ctx)])["checks"]
+        self.assertEqual(checks("approved", {"lastMergeSourceCommitId": "b" * 40}), "passing")
+        self.assertEqual(checks("approved", {}), "passing")       # nothing to judge by
+        self.assertEqual(checks("approved", None), "passing")
+        for ctx in ({"lastMergeSourceCommitId": "a" * 40}, {"lastMergeCommitId": "o" * 40},
+                    {"isExpired": True}, {"buildIsNotCurrent": True}):
+            self.assertEqual(checks("approved", ctx), "pending", ctx)
+            self.assertEqual(checks("rejected", ctx), "pending", ctx)
+        # A malformed context field is no evidence either way.
+        self.assertEqual(checks("approved", {"lastMergeSourceCommitId": 7,
+                                             "isExpired": "yes"}), "passing")
         self.assertIsNone(ha._summarize_azdo_pr(
             self.pr_payload(lastMergeSourceCommit="junk"), None)["head"])
 
@@ -23428,6 +23470,32 @@ class TestParsePanePrompt(unittest.TestCase):
                             ("☝🏽", 2), ("☝🏽 x", 4), ("✔︎ x", 3),
                             ("🕵🏽\u200d♂️ x", 4)):
             self.assertEqual(ha._pane_cells(text), cells, text)
+
+    def test_pane_cells_follow_tmux_on_rare_sequences(self):
+        # XERK-2200: each measured with real tmux 3.4 (cursor_x after printing
+        # the text, against what capture-pane gave back), and 240 random
+        # strings of these characters all agreed.
+        T, R = "\U0001f3fd", "\U0001f1fa"
+        for text, cells in (("क्\u200dष", 1), ("क\u200dषx", 2), ("│\u200d│x", 2),
+                            ("a\u200d中x", 2), ("x\u200d\u200d中x", 2), ("é\u200dbx", 3),
+                            ("🇺🇸🇺🇸", 2), ("🇺x", 3), (R * 5 + "x", 3), (R * 9 + "x", 5),
+                            ("中🇺x", 3), ("é🇺 x", 3),
+                            ("a" + T, 3), (T + " x", 4), (" " + T + "x", 4),
+                            ("é" + T + " x", 3), ("e\u0301" + T + " x", 3), ("é" + T + " " + T + "x", 5),
+                            ("©️ " + T, 4), ("✔️ " + T + " x", 6), ("☹️ \u200dx", 3),
+                            ("☝x", 3), ("🕵x", 3), ("✌x", 3), ("♂x", 2)):
+            self.assertEqual(ha._pane_cells(text), cells, text)
+
+    def test_an_8_column_footer_cut_to_its_first_letters_vetoes(self):
+        # XERK-2200: at 8 columns the footer reads "⏸ ma"; the composer rule is
+        # 8 cells. A reply shaped question / options above it is no dialog.
+        reply = "Which?\n\n❯ 1. A\n  2. B\n\n"
+        for footer in ("  ⏸ ma", "  ⏸ man", "  ⏵⏵ au", "  ⏸ pl"):
+            cap = reply + "─" * 8 + "\n❯ \n" + "─" * 8 + "\n" + footer + "\n"
+            self.assertIsNone(ha.parse_pane_prompt(cap), footer)
+        self.assertFalse(ha.PANE_MODE_CUT_RE.match("  ⏸ x"))
+        self.assertTrue(ha._COMPOSER_EDGE_RULE_RE.match("─" * 8))
+        self.assertFalse(ha._COMPOSER_EDGE_RULE_RE.match("─" * 8 + " x"))
 
     def test_the_exit_toast_vetoes_like_the_footer(self):
         # XERK-2169: a reply shaped question / options, read while the Ctrl-C
