@@ -23374,6 +23374,28 @@ class TestParsePanePrompt(unittest.TestCase):
         # The box rule must span the pane: a short rule is content.
         self.assertIsNone(ha.parse_pane_prompt(PANE_EXIT_PLAN_NO_EDGE_90.replace(
             "─" * 86, "─" * 20)))
+        # It is the dialog's own: indented, and drawn in "─".
+        self.assertIsNone(ha.parse_pane_prompt(PANE_EXIT_PLAN_NO_EDGE_90.replace(
+            "  " + "─" * 86, "─" * 88)))
+        self.assertIsNone(ha.parse_pane_prompt(PANE_EXIT_PLAN_NO_EDGE_90.replace(
+            "─" * 86, "-" * 86)))
+        # Emoji joined by a modifier or ZWJ take tmux's 2 cells, not their
+        # codepoints' sum, or a full line of them outgrew the box (QA).
+        emoji = ("  Thanks " + "👍🏽 " * 3 + "👨‍👩‍👧 " + "x" * 64 + "END\n")
+        self.assertEqual(ha._pane_cells(emoji.rstrip()), 88)
+        frame = PANE_EXIT_PLAN_NO_EDGE_90.replace("  58\n", emoji)
+        self.assertTrue(ha._pane_blocking_dialog(frame))
+
+    def test_an_edgeless_reply_with_the_composer_below_is_not_a_dialog(self):
+        # XERK-2199: the same shape in the conversation, with the composer's
+        # column-0 rule below it and no footer or toast to veto it.
+        reply = PANE_EXIT_PLAN_NO_EDGE_90 + "\n" + "─" * 90 + "\n❯ \n" + "─" * 90 + "\n"
+        self.assertIsNone(ha.parse_pane_prompt(reply))
+
+    def test_pane_cells_follow_tmux(self):
+        for text, cells in (("ab", 2), ("漢", 2), ("👍🏽", 2), ("👨‍👩‍👧", 2),
+                            ("é", 1), ("❤️", 1)):
+            self.assertEqual(ha._pane_cells(text), cells, text)
 
     def test_the_exit_toast_vetoes_like_the_footer(self):
         # XERK-2169: a reply shaped question / options, read while the Ctrl-C

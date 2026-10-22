@@ -14423,8 +14423,24 @@ PANE_DIALOG_MARGIN = 4
 
 
 def _pane_cells(text):
-    """Terminal cells `text` occupies: wide (CJK/emoji) glyphs take two."""
-    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+    """Terminal cells `text` occupies: wide (CJK/emoji) glyphs take two.
+
+    What joins onto the glyph before it takes none, as tmux 3.4 draws it
+    (XERK-2199): a combining mark, a variation selector, a skin-tone modifier,
+    and a ZWJ with the glyph it joins ("👍🏽" is 2 cells, a ZWJ family too).
+    Counted, one line of such emoji read wider than the pane and moved every
+    width judged against the widest line."""
+    cells, joined = 0, False
+    for c in text:
+        if joined:
+            joined = False
+            continue
+        if c == "\u200d":
+            joined = True
+        elif not (unicodedata.combining(c) or "\ufe00" <= c <= "\ufe0f"
+                  or "\U0001f3fb" <= c <= "\U0001f3ff"):
+            cells += 2 if unicodedata.east_asian_width(c) in "WF" else 1
+    return cells
 
 
 def _pane_numbering_continues(lines, idx):
