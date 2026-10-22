@@ -14377,12 +14377,13 @@ def _pane_unglue_options(lines):
 # Every qwen mode names itself before it ("Ask permissions", "Auto mode" in
 # 0.22.3, XERK-2200), so the spaced hint alone is the footer: Claude Code
 # writes "shift+tab" unspaced. Under ~40 columns qwen cuts it with "…"
-# ("Auto mode (sh…"), so any 2+ character start of it ending in "…" counts.
+# ("Auto mode (s…" at 17 columns), so any start of it ending its line in "…"
+# counts — at line end only, as the footer always is, since "(s…" alone is short.
 _QWEN_FOOTER_HINT = "shift + tab to cycle"
 QWEN_PANE_FOOTER_RE = re.compile(
-    r"\S \((?:" + re.escape(_QWEN_FOOTER_HINT) + r"\)|(?:"
-    + "|".join(re.escape(_QWEN_FOOTER_HINT[:n]) for n in range(len(_QWEN_FOOTER_HINT), 1, -1))
-    + r")\s*…)")
+    r"(?m)\S \((?:" + re.escape(_QWEN_FOOTER_HINT) + r"\)|(?:"
+    + "|".join(re.escape(_QWEN_FOOTER_HINT[:n]) for n in range(len(_QWEN_FOOTER_HINT), 0, -1))
+    + r")[ \t]*…[ \t]*$)")
 # Claude Code's exit toast, which REPLACES the mode footer for ~0.5-1s after a
 # Ctrl-C (or Ctrl-D) on an idle composer (2.1.306: "  Press Ctrl-C again to
 # exit"). It rides the composer like the footer it hides, so it vetoes a dialog
