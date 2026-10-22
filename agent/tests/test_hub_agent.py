@@ -23173,6 +23173,21 @@ class TestParsePanePrompt(unittest.TestCase):
             p["detail"],
             "Bash command\ntouch /tmp/permtest-marker\nCreate marker file in /tmp")
 
+    def test_a_wrap_after_a_vs16_emoji(self):
+        # XERK-2199 QA: "✔️" at a line's end is 2 cells, but capture-pane trims
+        # the padding space it writes after one mid-line; counted 1, the label's
+        # wrap read as a description and "No" was dropped.
+        frame = PANE_WRAPPED_OPTION_DIALOG.replace(
+            "   3. Yes, and switch to auto mode · auto mode handles these\n"
+            "      prompts for you\n",
+            "   3. Yes, and switch to auto mode · it is safe \u2714\ufe0f\n"
+            "      xxxxxxxxx for you\n")
+        self.assertNotEqual(frame, PANE_WRAPPED_OPTION_DIALOG)
+        labels = [o["label"] for o in ha.parse_pane_prompt(frame)["options"]]
+        self.assertEqual(labels[2],
+                         "Yes, and switch to auto mode · it is safe \u2714\ufe0f xxxxxxxxx for you")
+        self.assertEqual(labels[3], "No")
+
     def test_wrapped_option_label(self):
         # A label too long for the pane wraps; the run must not stop at the wrap
         # (XERK-2150: options 3 and 4 — the only way to decline — were dropped).
@@ -23394,7 +23409,11 @@ class TestParsePanePrompt(unittest.TestCase):
 
     def test_pane_cells_follow_tmux(self):
         for text, cells in (("ab", 2), ("漢", 2), ("👍🏽", 2), ("👨‍👩‍👧", 2),
-                            ("é", 1), ("❤️", 1)):
+                            ("e\u0301", 1), ("กั", 1), ("a\u200db", 2), ("🐻\u200d❄️", 2),
+                            # U+FE0F widens a narrow base; capture-pane pads it
+                            # with a space mid-line and trims it at line end.
+                            ("❤️", 2), ("❤️ X", 3), ("done ✔️", 7),
+                            ("1️ ⃣", 2)):
             self.assertEqual(ha._pane_cells(text), cells, text)
 
     def test_the_exit_toast_vetoes_like_the_footer(self):

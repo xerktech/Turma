@@ -14423,23 +14423,37 @@ PANE_DIALOG_MARGIN = 4
 
 
 def _pane_cells(text):
-    """Terminal cells `text` occupies: wide (CJK/emoji) glyphs take two.
+    """Terminal cells `text` occupies, as tmux 3.4 draws it (XERK-2199).
 
-    What joins onto the glyph before it takes none, as tmux 3.4 draws it
-    (XERK-2199): a combining mark, a variation selector, a skin-tone modifier,
-    and a ZWJ with the glyph it joins ("👍🏽" is 2 cells, a ZWJ family too).
-    Counted, one line of such emoji read wider than the pane and moved every
-    width judged against the widest line."""
-    cells, joined = 0, False
+    Wide (CJK/emoji) glyphs take two. What joins onto the glyph before it takes
+    none: a mark (Mn/Me: a combining accent, Thai vowels, a keycap), a
+    skin-tone modifier, U+FE0E, and a ZWJ with the wide glyph it joins
+    ("👍🏽", bear+ZWJ+snowflake and a ZWJ family are 2 cells; a+ZWJ+b is not joined). U+FE0F makes a narrow base two
+    cells, and capture-pane writes a padding space after it mid-line but trims
+    it at line end, so that space is consumed. Counted per codepoint, one line
+    of emoji read wider than the pane and moved every width judged against the
+    widest line; counted short, a label wrapped after "✔️" stopped the option
+    run before "No" (QA)."""
+    cells, prev, pad, joined = 0, 0, False, False
     for c in text:
+        if pad:
+            pad = False
+            if c == " ":
+                continue
         if joined:
-            joined = False
+            joined = False       # "🐻‍❄️" is one glyph: the joined one adds none
             continue
         if c == "\u200d":
-            joined = True
-        elif not (unicodedata.combining(c) or "\ufe00" <= c <= "\ufe0f"
-                  or "\U0001f3fb" <= c <= "\U0001f3ff"):
-            cells += 2 if unicodedata.east_asian_width(c) in "WF" else 1
+            joined = prev == 2
+        elif c == "\ufe0f":
+            if prev == 1:
+                cells, prev, pad = cells + 1, 2, True
+        elif (unicodedata.category(c) in ("Mn", "Me") or "\ufe00" <= c <= "\ufe0e"
+              or "\U0001f3fb" <= c <= "\U0001f3ff"):
+            pass
+        else:
+            prev = 2 if unicodedata.east_asian_width(c) in "WF" else 1
+            cells += prev
     return cells
 
 
