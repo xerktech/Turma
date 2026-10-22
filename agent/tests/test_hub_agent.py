@@ -20848,6 +20848,55 @@ PANE_EXIT_PLAN_EARLY_WRAP_26 = """\
       2. No
 """
 
+# XERK-2196: the native picker at 12 columns (2.1.308) draws a blank row inside
+# a description, above the rule and "4. Chat about this".
+PANE_ASK_PICKER_12 = """\
+prefer?
+
+❯ 1. Apple
+     A
+     crisp,
+     sweet
+     fruit
+     that is
+     easy
+     to
+     carry
+     and eat
+     almost
+     anywhe
+     re,
+     year-ro
+     und.
+  2. Banana
+     A soft,
+     natura
+     lly
+     sweet
+     fruit
+     that is
+     rich
+     in pota
+     ssium
+     and
+     makes a
+     quick,
+
+     filling
+     snack.
+  3. Type
+     somethi
+────────────
+  4. Chat
+  about this
+
+Enter to
+select · ↑/↓
+to navigate
+· Esc to
+cancel
+"""
+
 PANE_EXIT_PLAN_SUBTITLE_DIALOG_36 = """\
 ● Since the plan file location is
   blocked by a hook, I'll share the
@@ -23085,6 +23134,14 @@ class TestParsePanePrompt(unittest.TestCase):
             " Proceed?\n ❯ 1. Yes\n   2. No, and tell Claude what to\n"
             "      do\n" + "─" * 36)
         self.assertEqual(p["options"][1]["label"], "No, and tell Claude what to do")
+
+    def test_a_narrow_picker_with_a_blank_description_row(self):
+        # Its descriptions chain as wraps at this width, so only the numbering
+        # past the rule refuses it, and that walk must step over the blank.
+        self.assertIsNone(ha.parse_pane_prompt(PANE_ASK_PICKER_12))
+        # A live dialog whose footer follows a blank is still a dialog.
+        self.assertIsNotNone(ha.parse_pane_prompt(
+            PANE_EARLY_WRAP_27 + "\n Esc to cancel · Tab to\n amend\n"))
 
     def test_wrap_needs_label_column_and_cells(self):
         # A line off the label column is not part of the label, however full
