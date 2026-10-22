@@ -348,7 +348,8 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
       hides the footer that would veto it.
     - That dialog's box ends 2 cells in from the pane, and its labels wrap there: wrap width is
       the nearest box rule within `PANE_DIALOG_MARGIN` of the pane (`_pane_dialog_width`), else
-      the widest line. Below ~30 columns the TUI's own wrap drifts further; not covered.
+      the widest line. Below ~30 columns the TUI's own wrap still drifts (a subtitle past three
+      lines, overdrawn rows); not covered.
     - `detail` stops at the ▔ edge (`PANE_PROMPT_EDGE_RE`, column 0 only — replies are indented):
       above it is conversation, and its effort badge (first seconds only) changed the id, so an
       answer stamped early was dropped.
@@ -356,13 +357,18 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   - **A wrapped label is rejoined; the AskUserQuestion picker is refused** (XERK-2150).
     - A wrap and a picker description sit on the same label-column indent, and a label that fills
       the pane makes them identical row by row — no per-line rule can split them.
-    - The picker is refused whole: below the run, before a blank, a numbered option follows a rule
+    - The picker is refused whole: below the run a numbered option follows a rule
       ("4. Type something." / rule / "5. Chat about this"). Its answer comes from `ask.py`; its rows
       are no digits to send.
+    - Blank rows are stepped over on the way down: at ~12 columns the picker draws one inside a
+      description (XERK-2196). Test: `test_a_narrow_picker_with_a_blank_description_row`.
     - Never refuse on "N+1 below the run" without the rule: a dialog an unjoined wrap cut short has
       that shape too, and a None there lets the pane-typing guards type into a live dialog.
     - A line is a wrap only if its first word would not have fit after the line above (width =
       widest captured line). Joined with no space only when both sides of the break hold a "/".
+    - "Fit" means ending strictly inside the edge: the TUI also wraps a word that would end exactly
+      on it (XERK-2196, 2.1.308 at 14/26/27 columns).
+      Test: `test_a_wrap_before_a_word_ending_on_the_edge`.
     - One blank row between options is stepped over only when the option above has a line that
       fills the pane exactly — Claude Code 2.1.306 draws one there. Any other blank ends the run.
     - Tests: `TestParsePanePrompt.test_wrapped_option_label`, `test_wrapped_path_label`,

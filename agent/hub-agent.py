@@ -14426,8 +14426,7 @@ def _pane_cells(text):
 
 
 def _pane_numbering_continues(lines, idx):
-    """Whether a numbered option follows a rule below line `idx`, before any
-    blank (XERK-2150).
+    """Whether a numbered option follows a rule below line `idx` (XERK-2150).
 
     The native AskUserQuestion picker splits its list with a rule — "4. Type
     something." / ──── / "5. Chat about this" — while a permission or plan
@@ -14438,11 +14437,16 @@ def _pane_numbering_continues(lines, idx):
     wrapped labels line by line: a label that fills the pane makes the
     description's first word look like it overflowed. Without a rule this is
     never refused: a dialog cut short by an unjoined wrap still reads as one,
-    which keeps the pane-typing guards off it."""
+    which keeps the pane-typing guards off it.
+
+    Blank rows are stepped over: at ~12 columns the picker draws one inside a
+    description (XERK-2196), and stopping there let it become a panePrompt.
+    Below a live dialog's last option there is only its key-hint footer, never
+    a rule and another numbered option."""
     ruled = False
     for line in lines[idx:]:
         if not line.strip():
-            return False
+            continue
         if PANE_PROMPT_RULE_RE.match(line):
             ruled = True
             continue
@@ -14518,7 +14522,10 @@ def _pane_option_wrap_end(lines, idx, width):
         if (not text or PANE_PROMPT_OPTION_RE.match(nxt)
                 or len(nxt) - len(nxt.lstrip()) != col):
             break
-        if _pane_cells(lines[j].rstrip()) + 1 + _pane_cells(text.split()[0]) <= width:
+        # Strictly inside the edge: the TUI also breaks before a word that would
+        # end exactly on it (XERK-2196: "auto" / "mode ·" at 14 columns,
+        # "handles these" / "prompts" at 27).
+        if _pane_cells(lines[j].rstrip()) + 1 + _pane_cells(text.split()[0]) < width:
             break                    # it would have fit: a description, not a wrap
         j += 1
     return j
