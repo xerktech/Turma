@@ -9452,7 +9452,7 @@ def _azdo_eval_stale(ev, source_commit):
         return True
     seen = ctx.get("lastMergeSourceCommitId")
     return bool(isinstance(seen, str) and seen and isinstance(source_commit, str)
-                and source_commit and seen != source_commit)
+                and source_commit and seen.lower() != source_commit.lower())
 
 
 def _azdo_is_ci_policy(ev):
@@ -14418,7 +14418,44 @@ def _pane_composer_tail_up(lines):
     if not tail:
         return False
     return (bool(PANE_EXIT_TOAST_RE.match(" ".join(reversed(tail))))
-            or (ruled and bool(PANE_MODE_CUT_RE.match(tail[0]))))
+            or (ruled and bool(PANE_MODE_CUT_RE.match(tail[0])))
+            or _pane_boxed_composer_up(lines))
+
+
+# The composer's box as both TUIs draw it: a column-0 "─" rule the pane's full
+# width, the prompt line ("❯" Claude, ">"/"*"/"!" qwen) and its wraps, a second
+# such rule, then a short footer to the bottom of the pane.
+_COMPOSER_BOX_FOOTER_LINES = 3
+_COMPOSER_BOX_INPUT_LINES = 12
+_COMPOSER_PROMPT_RE = re.compile(r"^[❯>*!](?:\s|$)")
+
+
+def _pane_boxed_composer_up(lines):
+    """Whether the pane's bottom is a composer read by its POSITION, not its
+    footer's text: qwen 0.26 cuts its "(shift + tab to cycle)" hint at narrow
+    widths ("Auto mode…", "(s…", "auto-accept …") and behind a background-task
+    pill ("⏸ Ask pe ·1 tas…"), so `QWEN_PANE_FOOTER_RE` misses it and an idle
+    pane whose reply quotes "❯ 1. Alpha / 2. Beta" read as a dialog (XERK-2202).
+    Matching cut hints by text hid a live qwen approval whose ellipsized row
+    read like one (XERK-2200), so this reads the box instead: the last two
+    full-width column-0 rules, the first followed by a prompt line, at most
+    `_COMPOSER_BOX_INPUT_LINES` between them and 1..`_COMPOSER_BOX_FOOTER_LINES`
+    non-blank lines below the second. A qwen dialog draws no column-0 rule and
+    a Claude dialog replaces the composer, so neither has this shape."""
+    lines = [_PANE_SCROLLBAR_RE.sub("", line).rstrip() for line in lines]
+    widest = max((_pane_cells(line) for line in lines), default=0)
+    if widest < 4:
+        return False
+    rules = [k for k, line in enumerate(lines)
+             if line[:1] == "─" and set(line) == {"─"} and _pane_cells(line) == widest]
+    if len(rules) < 2:
+        return False
+    top, bottom = rules[-2], rules[-1]
+    footer = [line for line in lines[bottom + 1:] if line.strip()]
+    inside = [line for line in lines[top + 1:bottom] if line.strip()]
+    return (1 <= len(footer) <= _COMPOSER_BOX_FOOTER_LINES
+            and 1 <= len(inside) <= _COMPOSER_BOX_INPUT_LINES
+            and bool(_COMPOSER_PROMPT_RE.match(inside[0])))
 # A trailing right-edge SCROLLBAR column + its padding (XERK-509 [Qwen C]): the
 # block-element family (█ and eighths/shades, U+2588-258F / U+2591-2593), the
 # right-block glyphs (▐ ▕) and light/heavy vertical bars (│ ┃), any run of them
@@ -19072,7 +19109,46 @@ def _hint_dialog_up(cap):
             items.append(prev + " " + parts[0])
         prev = parts[-1]
     return (any(" ".join(item.split()).lower() in _DIALOG_HINT_ITEMS for item in items)
+            or _narrow_hint_up(tail, lines)
             or _overlay_edge_up(_ANSI_RE.sub("", cap).splitlines()))
+
+
+# At or under this many cells a dialog's key-hint footer no longer reads as
+# whole items: Claude Code 2.1.308 wraps "Esc to cancel · Tab to amend" a word
+# a line and leaves STALE cells of the label rows it overdrew on the same
+# lines ("Esc tor", "cancelu", "Esc to b)", "· Tabs"), and a wrapped option
+# label may land between its words ("Esc to" / "for" / "cancel"). Measured
+# live at 8-13 columns (Write/Bash permission, AskUserQuestion), XERK-2202.
+_NARROW_HINT_MAX_CELLS = 19
+# How many foreign words may sit between two of the hint's words there.
+_NARROW_HINT_GAP = 2
+
+
+def _narrow_hint_up(tail, lines):
+    """Whether a NARROW pane's footer lines (`tail`, below its last rule) still
+    spell Claude Code's "Esc to cancel" once the stale cells are allowed for:
+    a word starting "Esc" (capital — Claude's hint; qwen's spinner says
+    "esc to cancel)" and Claude's busy hint "esc to interrupt"), then words
+    starting "to" and "cancel", each within `_NARROW_HINT_GAP` other words.
+    Only for a pane at most `_NARROW_HINT_MAX_CELLS` wide, where the whole-item
+    read cannot work; the caller has already vetoed a composer footer."""
+    widest = max((_pane_cells(line) for line in lines), default=0)
+    if widest > _NARROW_HINT_MAX_CELLS:
+        return False
+    words = " ".join(tail).replace("·", " ").split()
+    for i, word in enumerate(words):
+        if not word.startswith("Esc"):
+            continue
+        at = i
+        for want in ("to", "cancel"):
+            nxt = next((k for k in range(at + 1, min(at + 2 + _NARROW_HINT_GAP, len(words)))
+                        if words[k].lower().startswith(want)), None)
+            if nxt is None:
+                break
+            at = nxt
+        else:
+            return True
+    return False
 
 
 def _pane_blocking_dialog(cap):
@@ -19102,7 +19178,35 @@ def _pane_blocking_dialog(cap):
             or _hint_dialog_up(cap)
             or parse_model_switch_confirm(cap) is not None
             or _model_picker_open(cap)
-            or _pane_cut_dialog_up(cap))
+            or _pane_cut_dialog_up(cap)
+            or _qwen_waiting_up(cap))
+
+
+# qwen's status line while one of its dialogs waits on a person: its spinner
+# glyph then "Waiting for user confirmation…", cut at narrow widths ("⠏ Waiting
+# for user", "⠏ Waiting", at 8 columns "⠏ Wait") and wrapped onto a last
+# "r…"/"f…"/"…" row. The word may stop anywhere after "Wai", but only at a
+# space, the line's end or an ellipsis.
+_QWEN_WAITING_RE = re.compile(r"^\s*[⠀-⣿]\s+Wai(?:t(?:i(?:n(?:g)?)?)?)?(?:\s|$|…)")
+
+
+def _qwen_waiting_up(cap):
+    """Whether the pane's bottom is qwen's "Waiting for user confirmation" line
+    (XERK-2202): below 26-40 columns qwen 0.26 ellipsizes an approval dialog's
+    question ("Apply this …", "Allow execu…"), so `parse_pane_prompt` finds no
+    "?" and the dialog read as an idle composer. Read by POSITION — one of the
+    last two non-blank lines, with no composer box below it — never anywhere
+    in the conversation."""
+    if not cap:
+        return False
+    lines = [_PANE_SCROLLBAR_RE.sub("", line).rstrip()
+             for line in _ANSI_RE.sub("", cap).splitlines()]
+    if _pane_boxed_composer_up(lines):
+        return False
+    last = [line for line in lines if line.strip()][-2:]
+    # At 14 columns the line wraps mid-word ("⠏ Waiting fo" / "r…"): read the
+    # last two rows joined as well.
+    return any(_QWEN_WAITING_RE.match(line) for line in last + ["".join(last)])
 
 
 # An idle composer's rule, drawn from column 0 (a dialog's box rule is indented).
@@ -19162,6 +19266,16 @@ def _pane_cut_dialog_up(cap):
     content = [line for line in area
                if line.strip() and not PANE_PROMPT_RULE_RE.match(line)]
     if not edgeless and content and asks(content[0]):
+        return True
+    # Or the area opens (past a lone "↓" scroll marker) with the dialog's own
+    # indented box rule: a pane 14-40 columns wide and ~10 rows high draws
+    # "Exit plan mode?" as edge / "↓" / box rule / its wrapped subtitle, the
+    # question and options off-screen (2.1.308, XERK-2202). Only a dialog is
+    # drawn under the edge, and the composer vetoes above already ruled out
+    # the composer's own column-0 rule, so this one is the dialog's indented
+    # box. Edgeless, the area already starts below that box.
+    opening = [line for line in area if line.strip() and line.strip() != "↓"]
+    if not edgeless and opening and set(opening[0].strip()) == {"─"}:
         return True
     filled = [k for k, line in enumerate(area) if line.strip()]
     for n, k in enumerate(reversed(filled)):
