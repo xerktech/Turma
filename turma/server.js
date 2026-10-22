@@ -12922,7 +12922,8 @@ function prAlertDecision(w, status, now) {
 // still live. An unreadable state must never be what drops work off the review
 // list. Mirrors sessions.html.
 function prLanded(p) {
-  const st = String((p && p.state) || "").toUpperCase();
+  // `state` is agent-sent: an object here would throw in String() on the leader tick.
+  const st = p && typeof p.state === "string" ? p.state.toUpperCase() : "";
   return st === "MERGED" || st === "CLOSED";
 }
 
@@ -16187,6 +16188,142 @@ function autoCloseSweep() {
   }
 }
 
+// ---- PR event messages --------------------------------------------------------
+// Sessions are told not to watch their own PR's CI or merge (PR_SUMMARY_SYSTEM_PROMPT
+// in hub-agent.py): a poll loop holds a shell for the length of a CI run, and one
+// watching for a merge can wait forever. The hub watches instead — the agent already
+// reports every session PR's state and CI rollup on `session.prs` — and types ONE
+// message (an `input`, like autoCloseMergedMessage) into the running session when
+// an open PR's CI settles passing or failing, and when a PR merges.
+//
+// A merge in a session autoCloseSweep messages (auto-merge org or armed epic run) is
+// left to that sweep's verify-then-Done message, so the session never gets both.
+//
+// What was announced rides the session's alerts edge (`sa.prEvents`, url -> {ci, head,
+// merged}), persisted with `alerts` and swept with the session, so neither a restart
+// nor a failover re-sends. A session the hub has never judged (no `prEvents`) is
+// baselined silently: a hub upgrade must not announce every PR already green.
+// `ci` records the last rollup seen, so a push that goes pending and settles again
+// is announced again; a red->green flip between two PR refreshes is announced too.
+//
+// A new head (`head`, the PR's tip commit) with the same verdict is a new CI run and
+// is announced too: the agent polls PR status about once a minute, so a short run can
+// go settled -> settled with no pending in between. A DRAFT counts as open.
+// Every agent-sent field is type-checked before use: a sweep that throws on the
+// leader tick takes the whole hub down.
+const PR_EVENTS_ON = process.env.PR_EVENT_MESSAGES !== "0";
+const PR_EVENTS_MAX_PER_SESSION = 50;
+// Strict: host, then a path of URL-safe characters only. No `#`, `?`, `;` or quotes, so
+// an agent-sent url cannot carry prose or shell syntax into the message.
+const PR_EVENT_URL_RE = /^https?:\/\/[A-Za-z0-9.-]{1,253}(?::\d{1,5})?\/[A-Za-z0-9._~\/%+-]{1,300}$/;
+const PR_EVENT_HEAD_RE = /^[A-Za-z0-9]{7,64}$/;
+function prEventUrl(u) {
+  return typeof u === "string" && PR_EVENT_URL_RE.test(u) ? u : null;
+}
+function prEventMessage(passed, failed, merged, autoMerge) {
+  const parts = [];
+  for (const u of failed) {
+    parts.push(`CI failed on PR ${u}. Read the failing checks (\`gh pr checks ${u}\`), `
+      + "fix the cause and push; you will be messaged with the next result.");
+  }
+  for (const u of passed) {
+    parts.push(`CI passed on PR ${u}. `
+      + (autoMerge ? "Auto-merge will merge it once it is mergeable" : "The operator merges it")
+      + " — don't watch for the merge; you will be messaged when it lands.");
+  }
+  for (const u of merged) {
+    parts.push(`PR ${u} has been merged. Carry on with any remaining work for it; `
+      + "if there is none, end the turn.");
+  }
+  return parts.join("\n\n");
+}
+// One session's PRs against what it was last told. Returns the new record and the
+// urls to announce; `known` null = first judgement (baseline, announce nothing).
+function prEventDiff(prs, known) {
+  const next = Object.create(null);
+  let n = 0;
+  const passed = [], failed = [], merged = [];
+  for (const p of prs) {
+    if (n >= PR_EVENTS_MAX_PER_SESSION) break;
+    const url = p && typeof p === "object" ? prEventUrl(p.url) : null;
+    if (!url || next[url]) continue;
+    n += 1;
+    const prev = known && Object.hasOwn(known, url) && known[url] && typeof known[url] === "object"
+      ? known[url] : null;
+    const state = typeof p.state === "string" ? p.state.toUpperCase() : "";
+    const seen = p.checks === "passing" || p.checks === "failing" || p.checks === "pending"
+      ? p.checks : null;
+    const prevHead = prev && typeof prev.head === "string" ? prev.head : null;
+    const head = typeof p.head === "string" && PR_EVENT_HEAD_RE.test(p.head) ? p.head : prevHead;
+    // A moved head with no rollup yet (GitHub lists no checks until they register) is a
+    // new run with no verdict: never carry the old head's verdict onto it, or that run
+    // settling the same way would read as already announced.
+    const moved = !!(head && prevHead && head !== prevHead);
+    const ci = seen || (!moved && prev && typeof prev.ci === "string" ? prev.ci : null);
+    const wasMerged = !!(prev && prev.merged === true);
+    const isMerged = state === "MERGED";
+    next[url] = { ci, head, merged: isMerged || wasMerged };
+    if (!known) continue;                         // first judgement: baseline only
+    if (isMerged) {
+      if (!wasMerged) merged.push(url);
+    } else if ((state === "OPEN" || state === "DRAFT") && (seen === "passing" || seen === "failing")) {
+      const newRun = !prev || prev.ci !== seen || moved;
+      if (newRun) (seen === "passing" ? passed : failed).push(url);
+    }
+  }
+  // A PR missing from this beat keeps its record (room permitting), so a list that
+  // flickers never re-announces what was already said.
+  if (known) {
+    for (const url of Object.keys(known)) {
+      if (n >= PR_EVENTS_MAX_PER_SESSION) break;
+      const rec = known[url];
+      if (next[url] || !prEventUrl(url) || !rec || typeof rec !== "object") continue;
+      next[url] = { ci: typeof rec.ci === "string" ? rec.ci : null,
+        head: typeof rec.head === "string" ? rec.head : null, merged: rec.merged === true };
+      n += 1;
+    }
+  }
+  return { next, passed, failed, merged };
+}
+function prEventSweep(now = Date.now()) {
+  if (!PR_EVENTS_ON) return;
+  const autoOn = orgsWithAutoMerge().size > 0 || anyArmedEpicRun();
+  const rows = autoOn ? fleetTicketRows() : null;
+  const byKey = autoOn ? autoMergeRowIndex(rows) : null;
+  for (const [host, a] of Object.entries(agents)) {
+    if (!a || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    const sas = a.alerts && a.alerts.sessions && typeof a.alerts.sessions === "object"
+      ? a.alerts.sessions : null;
+    if (!sas) continue;
+    for (const s of Array.isArray(a.sessions) ? a.sessions : []) {
+      try {
+        if (!s || s.status !== "running" || typeof s.id !== "string" || s.shadow === true) continue;
+        // Own keys only: a session id of "__proto__" must never reach Object.prototype.
+        if (!Object.hasOwn(sas, s.id)) continue;
+        const sa = sas[s.id];
+        if (!sa || typeof sa !== "object") continue;
+        // No list this beat (an odd or older agent) is "can't tell", never "no PRs".
+        if (!Array.isArray(s.prs)) continue;
+        const known = sa.prEvents && typeof sa.prEvents === "object" ? sa.prEvents : null;
+        const { next, passed, failed, merged } = prEventDiff(s.prs, known);
+        sa.prEvents = { ...next };
+        if (!passed.length && !failed.length && !merged.length) continue;
+        const autoMerge = autoOn
+          && !!(autoMergeSession(a, s, byKey, rows) || epicRunChildSession(a, s, byKey, rows));
+        // autoCloseSweep sends its own verify-then-Done message once every PR of an
+        // auto-merge session has landed; a merge short of that still gets this one.
+        const closeSends = autoMerge && s.prs.length > 0 && s.prs.every(prLanded);
+        const text = prEventMessage(passed, failed, closeSends ? [] : merged, autoMerge);
+        if (!text) continue;
+        queueCommand(host, { type: "input", sessionId: s.id, source: "nudge", text });
+      } catch (e) {
+        // One malformed session must cost only itself, never the leader tick.
+        console.error(`prEventSweep: ${logName(host)}: ${(e && e.message) || e}`);
+      }
+    }
+  }
+}
+
 // ---- attention nudges (XERK-1572) ---------------------------------------------
 // A session the hub reads as needs-you:stalled — a background wait gone silent, or
 // the agent's loop signal — is typed ONE message, in the operator's voice (an
@@ -17041,6 +17178,8 @@ function masterOrchestrationTick() {
   // though the close normally waits a beat for the PR poll to read MERGED.
   autoMergeSweep();
   autoCloseSweep();
+  // Tell sessions their PR's CI settled or it merged, so none polls for it.
+  prEventSweep();
   // One nudge for a stalled or looping session (XERK-1572); no-op with none.
   attentionNudgeSweep();
   // Epic completion (XERK-637): after autoCloseSweep has produced any child Done
@@ -23505,6 +23644,8 @@ if (process.env.TURMA_TEST) {
     ingestMergeResults,
     // Attention nudges + the wait classifier's verdict (XERK-1572).
     attentionNudgeSweep,
+    prEventSweep,
+    prLanded,
     attentionNudged,
     attentionNudgeText,
     ATTENTION_NUDGE_BACKOFF_MS,

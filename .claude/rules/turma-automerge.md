@@ -96,6 +96,30 @@ Split out of `.claude/rules/turma-board.md`. Auto-start/auto-stop live there; ep
     - **Multi-PR is the designed loop**: merge sweep skips landed PRs and merges each new one; close
       re-fires per new merged url; a Done ticket stands both down. Tests: `auto-close:`/`auto-merge +
       auto-close run through MULTIPLE PRs` in `server.test.js`.
+- **The hub, not the session, watches a PR's CI and merge** (`prEventSweep`, after
+  `autoCloseSweep` on the leader tick). Sessions are told not to poll either
+  (`PR_SUMMARY_SYSTEM_PROMPT`); the hub types ONE `input` (`source:"nudge"`) when an OPEN PR's
+  `checks` settles `passing`/`failing`, and when a PR reads MERGED.
+  - **A merge `autoCloseSweep` will message is left to it**: an auto-merge/epic-run session whose
+    PRs have ALL landed gets only the verify-then-Done message, never both. A merge short of that
+    still gets the light "merged" one.
+  - **Announced state rides `sa.prEvents`** (url → `{ci, merged}`, persisted with `alerts`, swept
+    with the session), so a restart or failover re-sends nothing. A session with no `prEvents` yet
+    is BASELINED silently — a hub upgrade must not announce every PR already green.
+  - A settled verdict is NEW when it differs from the last rollup seen OR the PR's `head` moved:
+    the agent polls about once a minute, so a short run goes settled -> settled with no pending.
+    A DRAFT counts as open. A CI-less PR (`checks:null`) says nothing.
+  - A head that moved with no rollup yet resets `ci` (GitHub lists no checks until they register),
+    or the new run settling the same way reads as already announced (QA). GitLab/ADO carry no
+    `head`, so for them only a verdict change is announced.
+  - **Every agent-sent field is type-checked** (`prEventDiff`, `prLanded`), and each session runs in
+    its own try/catch: an object `state` threw in `String()` on the leader tick and exited the hub
+    (QA). Session ids are read with `Object.hasOwn` (`__proto__`).
+  - Only a strict URL shape (`PR_EVENT_URL_RE`: no `#`, `?`, `;`, quotes) is interpolated.
+  - A beat with no `prs` array changes nothing, and a PR missing from a beat keeps its record (cap
+    50 per session), so a flickering list never re-announces a merge.
+  - Running sessions on online hosts only, never a shadow run. `PR_EVENT_MESSAGES=0` turns it off.
+    Tests: the `PR events:` cases in `server.test.js`.
 - **GitHub only for now** — the agent's `merge_pr` refuses a GitLab MR / ADO PR (staged `ok:false`)
   so the hub gives up rather than retrying. Merge method is `--squash --delete-branch`,
   env-overridable (`TURMA_AUTOMERGE_METHOD`/`_DELETE_BRANCH`).

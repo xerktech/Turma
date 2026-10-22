@@ -4669,9 +4669,11 @@ Write it for a human reviewer who never saw this session:
   - Pass the description inline (--body/--description or a heredoc) or with
     --body-file; the guard can't check --fill or an editor.
 
-Once a PR's CI is green, do not watch or poll for it to merge (a `gh pr view`
-loop, `until ... MERGED`): end the turn with no such shell left running. The hub
-or the operator merges it; you are re-prompted if anything follows.
+Do not watch or poll a PR's CI or its merge (`gh pr checks --watch`,
+`gh run watch`, a `gh pr view` loop, `until ... MERGED`), even where other
+instructions say to watch CI: push, then end the turn with no such shell left
+running. Turma messages this session when the PR's CI passes or fails and when
+it merges; act on that message when it arrives.
 """
 
 # --- cross-session messaging (XERK-339) --------------------------------------
@@ -9852,7 +9854,7 @@ def _open_pr_message(branch, work_desc, again=False):
         f"and there is no open pull request for it. {retry}Deliver it now: "
         f"commit any uncommitted changes, push the branch, and open a PR "
         f"(title: ticket + one-line summary; body: what changed, why, and how "
-        f"to verify). Then watch that check goes green before you stop. If "
+        f"to verify). Don't watch its CI: Turma messages you with the result. If "
         f"this work is not deliverable as a PR — it is a question, a doc note, "
         f"or it belongs in another session's change — say so in one sentence "
         f"instead of opening a PR."
