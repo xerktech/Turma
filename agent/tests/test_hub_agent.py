@@ -20911,6 +20911,18 @@ PANE_EXIT_PLAN_SUBTITLE_DIALOG = """\
       2. No
 """
 
+# A real 2.1.308 frame at 90 columns (trimmed) with its ▔ edge row removed,
+# the shape XERK-2199's QA saw: conversation runs straight into the box.
+PANE_EXIT_PLAN_NO_EDGE_90 = (
+    "  58\n  59\n  60\n\n"
+    "● The plan file write was denied by permission settings, so I'm including the plan\n"
+    "  directly.\n\n"
+    "  " + "─" * 86 + "\n"
+    "   Exit plan mode?\n\n"
+    "    Claude wants to exit plan mode\n\n"
+    "    ❯ 1. Yes, and switch to default (ask each time) for this session\n"
+    "      2. No\n")
+
 # At 60 columns "this" would fit the pane after line 1, but not the box.
 PANE_EXIT_PLAN_SUBTITLE_DIALOG_60 = """\
 ● Since the plan file location is blocked by a hook, I'll
@@ -23161,6 +23173,21 @@ class TestParsePanePrompt(unittest.TestCase):
             p["detail"],
             "Bash command\ntouch /tmp/permtest-marker\nCreate marker file in /tmp")
 
+    def test_a_wrap_after_a_vs16_emoji(self):
+        # XERK-2199 QA: "✔️" at a line's end is 2 cells, but capture-pane trims
+        # the padding space it writes after one mid-line; counted 1, the label's
+        # wrap read as a description and "No" was dropped.
+        frame = PANE_WRAPPED_OPTION_DIALOG.replace(
+            "   3. Yes, and switch to auto mode · auto mode handles these\n"
+            "      prompts for you\n",
+            "   3. Yes, and switch to auto mode · it is safe \u2714\ufe0f\n"
+            "      xxxxxxxxx for you\n")
+        self.assertNotEqual(frame, PANE_WRAPPED_OPTION_DIALOG)
+        labels = [o["label"] for o in ha.parse_pane_prompt(frame)["options"]]
+        self.assertEqual(labels[2],
+                         "Yes, and switch to auto mode · it is safe \u2714\ufe0f xxxxxxxxx for you")
+        self.assertEqual(labels[3], "No")
+
     def test_wrapped_option_label(self):
         # A label too long for the pane wraps; the run must not stop at the wrap
         # (XERK-2150: options 3 and 4 — the only way to decline — were dropped).
@@ -23343,9 +23370,53 @@ class TestParsePanePrompt(unittest.TestCase):
             "▔▔▔▔▔\nHeading\nProceed?\n\nnote\n\n ❯ 1. Yes\n   2. No\n"))
         self.assertIsNotNone(ha.parse_pane_prompt(
             "▔▔▔▔▔\n  ────\nProceed?\n\nnote\n\n ❯ 1. Yes\n   2. No\n"))
-        # The dialog without its edge on screen is not read as one either.
-        self.assertIsNone(ha.parse_pane_prompt(
-            PANE_EXIT_PLAN_SUBTITLE_DIALOG.split("▔" * 44 + "\n")[1]))
+        # A reply whose question sits under an indented, pane-wide rule is
+        # still not a dialog: the composer is below it.
+        self.assertIsNone(ha.parse_pane_prompt(toast.replace(
+            "● Which", "  " + "─" * 78 + "\n  Which")))
+
+    def test_a_subtitle_dialog_without_its_edge(self):
+        # XERK-2199: 2.1.308 in a pane full of conversation draws "Exit plan
+        # mode?" with no ▔ edge; its own box rule and no composer below anchor it.
+        for frame in (PANE_EXIT_PLAN_SUBTITLE_DIALOG.replace("▔" * 44 + "\n", ""),
+                      PANE_EXIT_PLAN_SUBTITLE_DIALOG.split("▔" * 44 + "\n")[1],
+                      PANE_EXIT_PLAN_NO_EDGE_90):
+            p = ha.parse_pane_prompt(frame)
+            self.assertEqual(p["prompt"], "Exit plan mode?")
+            self.assertEqual(p["detail"], "Claude wants to exit plan mode")
+            self.assertEqual([o["number"] for o in p["options"]], [1, 2])
+            self.assertTrue(ha._pane_blocking_dialog(frame))
+        # The box rule must span the pane: a short rule is content.
+        self.assertIsNone(ha.parse_pane_prompt(PANE_EXIT_PLAN_NO_EDGE_90.replace(
+            "─" * 86, "─" * 20)))
+        # It is the dialog's own: indented, and drawn in "─".
+        self.assertIsNone(ha.parse_pane_prompt(PANE_EXIT_PLAN_NO_EDGE_90.replace(
+            "  " + "─" * 86, "─" * 88)))
+        self.assertIsNone(ha.parse_pane_prompt(PANE_EXIT_PLAN_NO_EDGE_90.replace(
+            "─" * 86, "-" * 86)))
+        # Emoji joined by a modifier or ZWJ take tmux's 2 cells, not their
+        # codepoints' sum, or a full line of them outgrew the box (QA).
+        emoji = ("  Thanks " + "👍🏽 " * 3 + "👨‍👩‍👧 " + "x" * 64 + "END\n")
+        self.assertEqual(ha._pane_cells(emoji.rstrip()), 88)
+        frame = PANE_EXIT_PLAN_NO_EDGE_90.replace("  58\n", emoji)
+        self.assertTrue(ha._pane_blocking_dialog(frame))
+
+    def test_an_edgeless_reply_with_the_composer_below_is_not_a_dialog(self):
+        # XERK-2199: the same shape in the conversation, with the composer's
+        # column-0 rule below it and no footer or toast to veto it.
+        reply = PANE_EXIT_PLAN_NO_EDGE_90 + "\n" + "─" * 90 + "\n❯ \n" + "─" * 90 + "\n"
+        self.assertIsNone(ha.parse_pane_prompt(reply))
+
+    def test_pane_cells_follow_tmux(self):
+        for text, cells in (("ab", 2), ("漢", 2), ("👍🏽", 2), ("👨‍👩‍👧", 2),
+                            ("e\u0301", 1), ("กั", 1), ("a\u200db", 2), ("🐻\u200d❄️", 2),
+                            # U+FE0F widens a narrow base; capture-pane pads it
+                            # with a space mid-line and trims it at line end.
+                            ("❤️", 2), ("❤️ X", 3), ("done ✔️", 7),
+                            ("1️ ⃣", 2),
+                            ("☝🏽", 2), ("☝🏽 x", 4), ("✔︎ x", 3),
+                            ("🕵🏽\u200d♂️ x", 4)):
+            self.assertEqual(ha._pane_cells(text), cells, text)
 
     def test_the_exit_toast_vetoes_like_the_footer(self):
         # XERK-2169: a reply shaped question / options, read while the Ctrl-C
