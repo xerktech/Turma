@@ -9253,6 +9253,9 @@ def _summarize_mr(data):
         "mergeable": mergeable,
         "ready": _merge_ready(state, checks, mergeable),
         "base": data.get("target_branch") or None,
+        # The MR's tip commit, so the hub's PR-event sweep sees a new pipeline
+        # that settles the same way as the last one (XERK-2198).
+        "head": data.get("sha") or None,
         # GitLab lists no per-review states on the MR, so a changes-requested
         # review is observed as the merge status it puts the MR in (XERK-1845).
         "changesRequestedNow": detailed == "requested_changes",
@@ -9495,6 +9498,7 @@ def _summarize_azdo_pr(data, evals=None):
     # A reviewer voting "waiting for author" (-5) or "rejected" (-10) is ADO's
     # changes-requested, observed per refresh (XERK-1845).
     votes = [r.get("vote") for r in data.get("reviewers") or [] if isinstance(r, dict)]
+    lsc = data.get("lastMergeSourceCommit")
     out = {
         "url": None,
         "number": data.get("pullRequestId"),
@@ -9505,6 +9509,8 @@ def _summarize_azdo_pr(data, evals=None):
         "mergeable": mergeable,
         "ready": _merge_ready(state, checks, mergeable),
         "base": base or None,
+        # The source branch's tip, as GitHub's headRefOid (XERK-2198).
+        "head": (lsc.get("commitId") if isinstance(lsc, dict) else None) or None,
         "changesRequestedNow": any(isinstance(v, int) and v < 0 for v in votes),
     }
     lmc = data.get("lastMergeCommit")
