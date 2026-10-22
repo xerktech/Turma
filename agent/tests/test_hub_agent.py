@@ -11209,6 +11209,23 @@ class TestExtremePaneSizes(unittest.TestCase):
         self.assertFalse(ha._pane_boxed_composer_up(
             ["  " + rule[2:], ">   Type", rule, "  ➜ work"]))
 
+    def test_the_waiting_line_cut_at_eight_to_thirteen_columns(self):
+        # QA live frames (qwen 0.26): "⠏ Waiting" / "f…" at 12, "⠏ Wait" / "i…" at 8.
+        for tail in ("  ⠏ Waiting\nf…\n", "  ⠏ Wait\ni…\n", "  ⠏ Wai…\n"):
+            self.assertTrue(ha._qwen_waiting_up("   › 1. Y…\n\n" + tail), tail)
+        # A spinner word that merely starts with it is not the line.
+        for tail in ("  ⠏ Waiter…\n", "  ⠏ Waitlisting (3s · esc to cancel)\n", "  ⠏ Wa\n"):
+            self.assertFalse(ha._qwen_waiting_up("x\n" + tail), tail)
+
+    def test_the_cut_exit_plan_rule_must_be_indented(self):
+        # Under the edge, a column-0 rule is the composer's (vetoed by
+        # `_COMPOSER_EDGE_RULE_RE`, from 3 cells); only the dialog's box rule
+        # is indented.
+        rule = "─" * 8
+        cap = "▔" * 10 + "\n↓\n" + rule + "\n   Claude\n"
+        self.assertFalse(ha._pane_cut_dialog_up(cap))
+        self.assertTrue(ha._pane_cut_dialog_up(cap.replace(rule, "  " + rule)))
+
     def test_the_waiting_line_counts_only_at_the_bottom(self):
         cap = "  ⠏ Waiting for user confirmation...\n  more reply\n  text\n"
         self.assertFalse(ha._qwen_waiting_up(cap))
@@ -19785,6 +19802,8 @@ class TestAzdoPrStatus(AzdoPrMixin, unittest.TestCase):
         self.assertEqual(checks("approved", {"lastMergeSourceCommitId": "b" * 40,
                                              "lastMergeCommitId": "o" * 40,
                                              "buildIsNotCurrent": True}), "passing")
+        # A SHA spelled in another case is the same commit (XERK-2202).
+        self.assertEqual(checks("approved", {"lastMergeSourceCommitId": "B" * 40}), "passing")
         # A malformed context field is no evidence either way.
         self.assertEqual(checks("approved", {"lastMergeSourceCommitId": 7,
                                              "isExpired": "yes"}), "passing")

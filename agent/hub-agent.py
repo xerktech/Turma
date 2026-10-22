@@ -9452,7 +9452,7 @@ def _azdo_eval_stale(ev, source_commit):
         return True
     seen = ctx.get("lastMergeSourceCommitId")
     return bool(isinstance(seen, str) and seen and isinstance(source_commit, str)
-                and source_commit and seen != source_commit)
+                and source_commit and seen.lower() != source_commit.lower())
 
 
 def _azdo_is_ci_policy(ev):
@@ -19184,8 +19184,10 @@ def _pane_blocking_dialog(cap):
 
 # qwen's status line while one of its dialogs waits on a person: its spinner
 # glyph then "Waiting for user confirmation…", cut at narrow widths ("⠏ Waiting
-# for user", "⠏ Waiting for") and wrapped onto a last "r…"/"…" row.
-_QWEN_WAITING_RE = re.compile(r"^\s*[⠀-⣿]\s+Waiting for(?: user(?: confirmation)?)?\b")
+# for user", "⠏ Waiting", at 8 columns "⠏ Wait") and wrapped onto a last
+# "r…"/"f…"/"…" row. The word may stop anywhere after "Wai", but only at a
+# space, the line's end or an ellipsis.
+_QWEN_WAITING_RE = re.compile(r"^\s*[⠀-⣿]\s+Wai(?:t(?:i(?:n(?:g)?)?)?)?(?:\s|$|…)")
 
 
 def _qwen_waiting_up(cap):
@@ -19203,7 +19205,7 @@ def _qwen_waiting_up(cap):
         return False
     last = [line for line in lines if line.strip()][-2:]
     # At 14 columns the line wraps mid-word ("⠏ Waiting fo" / "r…"): read the
-    # last two rows joined as well.
+    # last two rows joined as well (that form needs "Waiting for" whole).
     return any(_QWEN_WAITING_RE.match(line) for line in last + ["".join(last)])
 
 
@@ -19270,9 +19272,10 @@ def _pane_cut_dialog_up(cap):
     # "Exit plan mode?" as edge / "↓" / box rule / its wrapped subtitle, the
     # question and options off-screen (2.1.308, XERK-2202). Only a dialog is
     # drawn under the edge, and the composer vetoes above already ruled out
-    # the composer's own column-0 rule.
+    # the composer's own column-0 rule, so this one is the dialog's indented
+    # box. Edgeless, the area already starts below that box.
     opening = [line for line in area if line.strip() and line.strip() != "↓"]
-    if opening and opening[0][:1].isspace() and set(opening[0].strip()) == {"─"}:
+    if not edgeless and opening and set(opening[0].strip()) == {"─"}:
         return True
     filled = [k for k, line in enumerate(area) if line.strip()]
     for n, k in enumerate(reversed(filled)):
