@@ -10138,8 +10138,18 @@ function coerceStringList(owner, key) {
 // repos[].resumable[].prs). url/state/title/checks/mergeable/ready are Strings
 // (lenient); its one non-string typed leaf is `number` (Int) — and a PR number
 // comes from scraping `gh pr`, so a parse hiccup, not just malice, can flip it.
+//
+// The String leaves drop an object/array/boolean (null kept: `checks:null` is
+// "no CI"). The key list is an inline literal: this runs from loadState, where a
+// module const is still in its TDZ (XERK-301). The hub's own readers `String()` them — prLanded on every beat's
+// alerts — so `{"toString":1}` threw AFTER the record was installed: a 400 whose
+// beat was still stored and served (XERK-2195), and decode-fatal on Android.
 function coercePrElem(p) {
-  if (objectish(p) && "number" in p && !wireInt32(p.number)) delete p.number;
+  if (!objectish(p)) return;
+  if ("number" in p && !wireInt32(p.number)) delete p.number;
+  for (const k of ["url", "state", "title", "checks", "mergeable", "ready"]) {
+    if (k in p && p[k] !== null && typeof p[k] !== "string" && typeof p[k] !== "number") delete p[k];
+  }
 }
 
 // Coerce one transcript block (LiveSignals.tail[].blocks[], polymorphic on `t`,

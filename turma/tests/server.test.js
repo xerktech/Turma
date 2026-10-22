@@ -26579,3 +26579,18 @@ test("XERK-1847: a shadow session raises no alert and is in no peer roster", () 
     dropPeerHosts("shA", "shB");
   }
 });
+
+test("XERK-2195: an object PR state/checks is coerced away, never a 400 whose beat is still stored", async () => {
+  const host = "xerk2195";
+  for (const field of ["state", "checks"]) {
+    const bad = await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+      device: host,
+      sessions: [{ id: "s1", status: "running",
+        prs: [{ url: "https://github.com/x/y/pull/1", checks: null, [field]: { toString: 1 } }] }],
+    } });
+    assert.equal(bad.status, 200, `${field}: ${bad.raw}`);
+    const pr = agents[host].sessions.find((s) => s.id === "s1").prs[0];
+    assert.equal(field in pr, false, `${field} must be dropped, not stored as an object`);
+    if (field === "state") assert.equal(pr.checks, null, "a null checks (no CI) is kept");
+  }
+});
