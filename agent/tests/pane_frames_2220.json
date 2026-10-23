@@ -498,5 +498,37 @@
  "submit_8x10": {
   "blocks": true,
   "frame": "submit\nyour\nanswers?\n\n❯ 1.Subm\n    it\n    answ\n  2. Can\n     cel\n"
+ },
+ "elicit_cut_17x5": {
+  "blocks": true,
+  "frame": "  Calling elicit\n  · 2m 28s…\n\n─────────────────\n  MCP server\n"
+ },
+ "elicit_cut_15x5": {
+  "blocks": true,
+  "frame": "  elicit · 2m\n  15s…\n\n───────────────\n  MCP server\n"
+ },
+ "elicit_cut_11x6": {
+  "blocks": true,
+  "frame": "  elicit ·\n  1m 52s…\n\n───────────\n  MCP\n  server\n"
+ },
+ "elicit_cut_9x6": {
+  "blocks": true,
+  "frame": "  · 1m\n  28s…\n\n─────────\n  MCP s\n  erver\n"
+ },
+ "elicit_cut_8x7": {
+  "blocks": true,
+  "frame": "  · 1m\n  17s…\n\n────────\n  MCP\n  serv\n  er\n"
+ },
+ "elicit_cut_6x9": {
+  "blocks": true,
+  "frame": "  55s…\n\n\n──────\n  MC\n  P\n  se\n  rv\n  er\n"
+ },
+ "elicit_cut_6x5": {
+  "blocks": true,
+  "frame": "  50s…\n\n\n──────\n  MC\n"
+ },
+ "elicit_cut_5x5": {
+  "blocks": true,
+  "frame": "  38s\n  …\n\n─────\n  M\n"
  }
 }

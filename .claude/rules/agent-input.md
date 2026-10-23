@@ -77,6 +77,13 @@ composed.**
       "Review your answers" page has NO footer and its `❯ 1.` at column 0
       (`_pane_cut_choice_up`: told from the composer by the "?" line, not a rule, right above).
       Tests: `TestLiveDialogFramesXerk2220`.
+    - A shorter pane cuts the elicitation title before its quote ("MCP"/"server", "M"): the
+      area must then be NOTHING but a prefix of "MCP server", or prose under a rule would block.
+    - The review page's "?" line is at column 0 and never "❯": a queued message is "❯ <msg>"
+      with indented wraps, and "❯ …?" / "❯ 1. Submit answers" queued must stay typeable.
+    - Accepted: the "Esc again to clear" toast at 8-9x3 ellipsizes to "Esc…" exactly like the
+      cut hint, so it holds a message ~1s until the toast clears. Text cannot tell them apart;
+      don't drop the ellipsis read to "fix" it.
   - **The dialog check runs before EVERY write, not once per message** (`_slice_gate`): before
     each later slice, send-keys chunk and Enter, on tmux and Windows, whether or not draws are
     still awaited. QA: a dialog drawn mid-message got the rest, and a last slice "1" approved

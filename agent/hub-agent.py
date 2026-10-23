@@ -19353,7 +19353,8 @@ def _pane_cut_choice_up(cap):
 
     Read by POSITION: the "❯ 1." row is among the last non-blank lines, every
     line below it is indented (wraps, later options) with no rule or composer
-    footer, and the non-blank line right above it is the question ending "?".
+    footer, and the non-blank line right above it is the question ending "?"
+    at column 0 (not a queued "❯ …" message).
     The composer's own "❯" row always sits right under its column-0 rule — a
     short pane cuts the composer's BOTTOM, never that — so a draft reading
     "1. …" never matches, and conversation text is above that rule."""
@@ -19377,7 +19378,14 @@ def _pane_cut_choice_up(cap):
             or PANE_SHELL_FOOTER_RE.search(text) or _pane_composer_tail_up(lines)):
         return False
     above = [k for k in filled if k < cursor]
-    return bool(above) and lines[above[-1]].strip().endswith("?")
+    if not above:
+        return False
+    question = lines[above[-1]]
+    # The question sits at column 0; a queued message during a busy turn is
+    # "❯ <msg>" with indented wraps, so "❯ Which one?" / "❯ 1. Submit
+    # answers" queued with the spinner cut off is not this page (QA).
+    return (question.endswith("?") and not question[:1].isspace()
+            and not question.startswith("❯") and "to send now" not in text)
 
 
 # A picker's cursor row: an indented "❯" (the composer's own prompt sits at column 0).
@@ -19392,8 +19400,11 @@ _PANE_HISTORY_TITLE_RE = re.compile(r"^\s+Search(?:\s|$)")
 # An MCP elicitation's title ("MCP server “x” requests your input") read with
 # every space dropped: the form is drawn from the TOP, so a pane ≤ ~10 rows
 # cuts its footer and fields off and keeps only this, wrapped mid-word at 8
-# columns ("MCP" / "serv" / "er" / "“…”", 2.1.309, XERK-2220).
-_PANE_ELICIT_TITLE_RE = re.compile(r"^MCPserver[“\"]")
+# columns ("MCP" / "serv" / "er" / "“…”", 2.1.309, XERK-2220). A shorter pane
+# cuts it before the quote too ("MCP" / "server" at 11x6): then the area is
+# nothing BUT a prefix of "MCP server", down to "M" at 5x5 (QA).
+_PANE_ELICIT_TITLE_RE = re.compile(
+    r"^(?:MCPserver[“\"]|M(?:C(?:P(?:s(?:e(?:r(?:v(?:e(?:r)?)?)?)?)?)?)?)?$)")
 
 
 def _pane_overlay_up(cap):

@@ -11320,12 +11320,26 @@ class TestLiveDialogFramesXerk2220(unittest.TestCase):
         # Option 1 only, with the cursor on it.
         self.assertFalse(ha._pane_cut_choice_up(cap.replace("❯ 1.", "❯ 2.")))
         self.assertFalse(ha._pane_cut_choice_up(""))
+        # Queued messages during a busy turn, the spinner and rule cut off (QA):
+        # "❯ <msg>" at column 0, wraps indented, the "send now" hint below.
+        for queued in ("❯ Which option do you want?\n\n❯ 1. Submit answers\n"
+                       "  ctrl+x ctrl+s to send now\n",
+                       "❯ Which option do you want?\n\n❯ 1. Submit answers\n",
+                       "❯ Which option do\n  you want?\n\n❯ 1. Submit answers\n"):
+            self.assertFalse(ha._pane_cut_choice_up(queued), queued)
 
     def test_the_cut_elicitation_is_read_by_its_indented_title(self):
         cap = self.FRAMES["elicit_60x5"]["frame"]
         self.assertTrue(ha._pane_overlay_up(cap))
         # The same words at column 0 under the rule are not the form's title.
         self.assertFalse(ha._pane_overlay_up(cap.replace("  MCP server", "MCP server")))
+        # Cut before the quote, the area is nothing BUT a prefix of the title
+        # ("MCP" / "server" at 11x6, "M" at 5x5, QA).
+        cut = self.FRAMES["elicit_cut_11x6"]["frame"]
+        self.assertTrue(ha._pane_overlay_up(cut))
+        self.assertFalse(ha._pane_overlay_up(cut.replace("server", "servers")))
+        self.assertFalse(ha._pane_overlay_up(cut.replace("  MCP", "  MCQ")))
+        self.assertFalse(ha._pane_overlay_up(cut + "  more\n"))
 
 
 class TestOverlayWithItsFooterCut(unittest.TestCase):
