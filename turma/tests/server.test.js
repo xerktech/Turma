@@ -15220,6 +15220,27 @@ test("XERK-2209: an absent twin keeps gating while the org's board block is trun
   assert.deepEqual(hub.compileBrief(site, Date.now(), "scheduled", []).nextUp.map((i) => i.key), []);
   agents.x2209t.jira.truncated = false;
   assert.equal(triageGateReason(row, site, rows), null);
+  // A current agent says WHICH list was cut: only the active list matters. A
+  // truncated Done window (a busy org, always) with a whole active list lifts it.
+  agents.x2209t.jira.truncated = true;
+  agents.x2209t.jira.activeTruncated = false;
+  assert.equal(triageGateReason(row, site, rows), null);
+  agents.x2209t.jira.activeTruncated = true;
+  assert.equal(triageGateReason(row, site, rows), "duplicate");
+  agents.x2209t.jira.truncated = false;
+  agents.x2209t.jira.activeTruncated = false;
+  // A non-boolean activeTruncated is stripped at ingest (it falls back to truncated).
+  for (const bad of ["false", 0, null]) {
+    const r = await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+      device: "x2209t", repos: [{ name: "Turma", path: "/git/Turma" }],
+      jira: { available: true, configured: true, siteKey: site, user: "x2209t@x.com",
+              fetchedAt: "2026-07-14T12:00:00Z", truncated: true, activeTruncated: bad,
+              tickets: [row] } } });
+    assert.equal(r.status, 200);
+    assert.equal("activeTruncated" in agents.x2209t.jira, false, JSON.stringify(bad));
+    assert.equal(triageGateReason(row, site, fleetTicketRows()), "duplicate");
+  }
+  agents.x2209t.jira.truncated = false;
   assert.deepEqual(hub.compileBrief(site, Date.now(), "scheduled", []).nextUp.map((i) => i.key), ["DT-1"]);
   resetAutoStart();
 });
