@@ -178,7 +178,14 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     toward that cap (`shadowsDispatchedSince(since, now)`, XERK-1858).
   - Model: of `MODEL_SHADOW_MODELS` (sonnet,haiku), never the live family, fewest pairs for the
     class. Host: online, DECIDED into the org, `modelShadow.available`, repo cloned (a shadow
-    never clones), a free slot, claude default runtime, subscription not paused.
+    never clones), a free shadow run (`modelShadow.free`; an older agent without it: a free
+    session slot), claude default runtime, subscription not paused.
+  - **A shadow takes no session slot and is no session on the wire** (XERK-2227): its own cap
+    `TURMA_MAX_SHADOW_RUNS` (1) counts RUNS placing/running/grading (`_shadow_runs_active`),
+    `spawn_shadow` fails a run past it, and `_slots_used`/`capacity` skip shadow records.
+    Neither its live nor closed session is heartbeated, and its transcripts are kept out of
+    the resume picker and the archive; the hub also drops an older agent's `shadow: true`
+    session in `normalizeSessions`. The run reaches the hub only as `shadowRuns`.
   - `spawnShadow` carries a hub-minted `sh-<hex>` id; `observeShadows` takes a host's
     `shadowRuns` report only for an id dispatched to THAT host in THAT org. A grade is final.
   - **Shadow rows never feed the live groups or `/metrics`**; `aggregate().pairs` serves per
@@ -201,8 +208,8 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     is terminal, `_reap_shadow` also deletes any session whose `shadow.id` is the run's
     (XERK-2180). The hub drops a shadow row's `endedAt` while it reads running/grading again.
   - **Never a `ticket` block on either session** (and `_maybe_adopt_ticket` refuses a shadow), so
-    no ticket sweep — auto-stop on Done, auto-merge, close-ticket, routing — acts on it. The
-    hub raises no alert for a `shadow` session and lists it in no peer roster.
+    no ticket sweep — auto-stop on Done, auto-merge, close-ticket, routing — acts on it, and
+    it is in no peer roster.
   - **No-publish is enforced by the OS, not text** (XERK-1859, operator decision 2026-10-12:
     Claude Code's sandbox over a separate OS user). A shadow runs as the manager's uid, so it
     can READ every credential; the boundary is where one would be USED (`build_shadow_settings`,
