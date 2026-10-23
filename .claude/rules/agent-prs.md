@@ -75,6 +75,27 @@ DevOps, and what gets typed back because of it.
       in the same command keeps its non-MR link (`gitlab+cli`).
     - Cost: a URL built from a base var (`base + "/merge_requests"`), a script FILE, a helper
       function, python-gitlab, httpie, `fetch(url, optsVar)` are not seen — narrow on purpose.
+- **A GitLab MR the scan missed is found by its BRANCH** (`_discover_branch_mrs`, after
+  `refresh_pr_status` on the slow-refresh worker; staged, drained into `pend` by the beat).
+  - Why: a push to an `altssh.` URL, `-o mr.create` or a script opens an MR no creating-call
+    rule sees; the chip was missing and the open-PR poller nudged a session that had delivered.
+  - Adopted only when ALL hold: origin is on GITLAB_URL (or its `altssh.` twin), the MR's
+    `source_branch` is the worktree's branch (`--show-current`; not main/master/origin's
+    default), not from a fork, its link is that project's MR on GITLAB_URL, opened after the
+    session's `createdAt`, and its `sha` is an ancestor of the worktree's HEAD. Never loosen one:
+    each stands between a same-named branch and a foreign MR on the card.
+  - **The open-PR poller counts STAGED urls as open** (`_staged_discovered_prs`): it runs before
+    the payload loop drains them, and without it nudged the very beat the MR landed (QA).
+  - An empty lookup is asked again next pass (the MR is usually opened after the
+    push); only a tip that already has its MR is skipped. `MR_DISCOVER_MAX` sessions a pass,
+    least recently asked first. GitLab only. Tests: `TestDiscoverBranchMrs`.
+  - A FAILED lookup backs THAT session off `MR_DISCOVER_FAIL_BACKOFF_SEC`; only a SLOW one
+    (`MR_DISCOVER_SLOW_SEC`, a hang) ends the pass. Never a host-wide pause, and never reorder failed
+    sessions: `_gitlab_get` is None for a 404 too, and each variant starved someone (QA, 3 passes).
+    Accepted: one transient failure can still let the open-PR nudge fire once before the retry.
+  - Residuals: a resumed/migrated session's fresh `createdAt` hides an MR its earlier life
+    opened; an MR head already on the base (a sibling's merged, then rebased in) passes the
+    ancestor gate. Both on the rollup ticket.
 - **A GitLab MR and an ADO PR answer everywhere a GitHub PR does**: dispatch by URL to
   `mr_status`/`azdo_pr_status`, each polled only through the source that can answer it
   (`_pr_source_ok`; unreachable → bare link). ADO reuses the board's PAT, no CI rollup: `checks` is

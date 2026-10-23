@@ -37754,6 +37754,230 @@ class TestMrStatus(unittest.TestCase):
             self.assertEqual(ha.pr_status(self.MR)["url"], self.MR)
 
 
+class TestDiscoverBranchMrs(ManagerMixin, unittest.TestCase):
+    """A GitLab MR the transcript scan missed is found by the session's branch."""
+
+    GL = {"GITLAB_URL": "https://gitlab.com", "GITLAB_TOKEN": "tok"}
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        wt = self.wt = os.path.join(self.tmp, "wt")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@x")
+        def git(*a):
+            return subprocess.run(["git", *a], cwd=wt, env=env, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        os.makedirs(wt)
+        git("init", "-q", "-b", "main")
+        git("commit", "-q", "--allow-empty", "-m", "base")
+        self.base = git("rev-parse", "HEAD")
+        git("switch", "-q", "-c", "CE-8575")
+        git("commit", "-q", "--allow-empty", "-m", "work")
+        self.head = git("rev-parse", "HEAD")
+        git("remote", "add", "origin",
+            "ssh://git@altssh.gitlab.com:443/code_hunter/argocd.git")
+        self.sm = self.make_manager()
+        self.sm.registry = [{"id": "s1", "status": "running", "worktreePath": wt,
+                             "createdAt": "2026-10-23T10:00:00Z"}]
+
+    def mr(self, **kw):
+        d = {"web_url": "https://gitlab.com/code_hunter/argocd/-/merge_requests/1775",
+             "sha": self.head, "created_at": "2026-10-23T11:00:00.000Z",
+             "source_branch": "CE-8575", "source_project_id": 7,
+             "target_project_id": 7}
+        d.update(kw)
+        return d
+
+    def discover(self, mrs):
+        with mock.patch.multiple(ha, run=_ORIG_RUN, **self.GL), \
+                mock.patch.object(ha, "_gitlab_get", return_value=mrs) as get:
+            self.sm._discover_branch_mrs()
+        return get
+
+    def test_an_mr_pushed_over_altssh_is_adopted(self):
+        get = self.discover([self.mr()])
+        path = get.call_args[0][0]
+        self.assertIn("projects/code_hunter%2Fargocd/merge_requests?", path)
+        self.assertIn("source_branch=CE-8575", path)
+        self.assertEqual(self.sm._take_discovered_prs("s1"),
+                         [self.mr()["web_url"]])
+        self.assertEqual(self.sm._take_discovered_prs("s1"), [])
+
+    def test_an_mr_whose_head_is_an_ancestor_counts(self):
+        self.discover([self.mr(sha=self.base)])
+        self.assertEqual(len(self.sm._take_discovered_prs("s1")), 1)
+
+    def test_foreign_mrs_are_left_out(self):
+        self.discover([
+            self.mr(sha="ab" * 20),                          # head not in worktree
+            self.mr(created_at="2026-10-22T09:00:00Z"),      # before the session
+            self.mr(source_project_id=9),                    # from a fork
+            self.mr(source_branch="other"),
+            self.mr(web_url="https://gitlab.com/x/y/pull/3"),
+        ])
+        self.assertEqual(self.sm._take_discovered_prs("s1"), [])
+
+    def test_an_already_known_mr_is_not_restaged(self):
+        self.sm.session_pr_urls["s1"] = [self.mr()["web_url"]]
+        self.discover([self.mr()])
+        self.assertEqual(self.sm._take_discovered_prs("s1"), [])
+
+    def test_an_mr_opened_after_an_empty_lookup_is_found_next_pass(self):
+        self.discover([])
+        self.discover([self.mr()])
+        self.assertEqual(len(self.sm._take_discovered_prs("s1")), 1)
+
+    def _lookup_by_sid(self, answer):
+        """A _gitlab_branch_mr_urls stand-in answering per session (the one just
+        stamped as asked); records the order asked."""
+        order = []
+
+        def lookup(proj, branch, since, holds):
+            sid = max(self.sm._mr_discover_asked, key=self.sm._mr_discover_asked.get)
+            order.append(sid)
+            return answer(sid, len([o for o in order if o == sid]))
+        return order, lookup
+
+    def run_pass(self, lookup):
+        with mock.patch.multiple(ha, run=_ORIG_RUN, **self.GL), \
+                mock.patch.object(ha, "_gitlab_branch_mr_urls", side_effect=lookup):
+            self.sm._discover_branch_mrs()
+
+    def test_a_quick_failure_backs_off_that_session_and_the_pass_goes_on(self):
+        """A 404 for a project the token cannot read fails every time and fast:
+        the other sessions are still asked in the same pass."""
+        self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(3)]
+        order, lookup = self._lookup_by_sid(lambda sid, n: None if sid == "s0" else [])
+        self.run_pass(lookup)
+        self.assertEqual(order, ["s0", "s1", "s2"])
+        order.clear()
+        self.run_pass(lookup)                      # s0 waits out its backoff
+        self.assertEqual(order, ["s1", "s2"])
+        self.sm.registry = self.sm.registry[1:]
+        self.run_pass(lookup)
+        self.assertNotIn("s0", self.sm._mr_discover_retry_at)
+
+    def test_a_slow_failure_ends_the_pass(self):
+        """Timed by the real MR_DISCOVER_SLOW_SEC around the lookup itself: a
+        failure that took 6s (a hang) ends the pass, one that took 4s does not."""
+        for took, want in ((6.0, ["s0"]), (4.0, ["s0", "s1", "s2"])):
+            self.sm._mr_discover_asked.clear()
+            self.sm._mr_discover_retry_at.clear()
+            self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(3)]
+            clock = [1000.0]
+            order, inner = self._lookup_by_sid(lambda sid, n: None)
+
+            def lookup(*a, inner=inner, took=took):
+                clock[0] += took
+                return inner(*a)
+            with mock.patch.object(ha.time, "monotonic", lambda: clock[0]):
+                self.run_pass(lookup)
+            self.assertEqual(order, want, took)
+
+    def test_a_session_that_failed_once_is_not_starved_by_the_cap(self):
+        """Past its backoff a once-failed session takes its turn in the
+        least-recently-asked rotation, however many healthy sessions are due."""
+        self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(7)]
+        url = self.mr()["web_url"]
+        order, lookup = self._lookup_by_sid(
+            lambda sid, n: None if (sid == "s0" and n == 1) else ([url] if sid == "s0" else []))
+        with mock.patch.object(ha, "MR_DISCOVER_FAIL_BACKOFF_SEC", 0):
+            for _ in range(3):
+                self.run_pass(lookup)
+        self.assertEqual(self.sm._take_discovered_prs("s0"), [url])
+
+    def test_a_listing_is_read_no_further_than_twenty(self):
+        mrs = [self.mr(web_url=f"https://gitlab.com/code_hunter/argocd/-/merge_requests/{i}")
+               for i in range(25)]
+        self.discover(mrs)
+        self.assertEqual(len(self.sm._take_discovered_prs("s1")), 20)
+
+    def test_a_tip_that_already_has_its_mr_is_not_asked_again(self):
+        self.discover([self.mr()])
+        self.assertFalse(self.discover([self.mr()]).called)
+
+    def test_no_gitlab_or_a_default_branch_asks_nothing(self):
+        with mock.patch.object(ha, "_gitlab_get") as get:
+            self.sm._discover_branch_mrs()
+        get.assert_not_called()
+        subprocess.run(["git", "switch", "-q", "main"], cwd=self.wt, check=True)
+        self.assertFalse(self.discover([self.mr()]).called)
+
+    def test_the_origin_default_branch_is_not_asked(self):
+        subprocess.run(["git", "update-ref", "refs/remotes/origin/CE-8575", "HEAD"],
+                       cwd=self.wt, check=True)
+        subprocess.run(["git", "symbolic-ref", "refs/remotes/origin/HEAD",
+                        "refs/remotes/origin/CE-8575"], cwd=self.wt, check=True)
+        self.assertFalse(self.discover([self.mr()]).called)
+
+    def test_a_tag_named_like_the_branch_still_matches(self):
+        subprocess.run(["git", "tag", "CE-8575"], cwd=self.wt, check=True)
+        self.discover([self.mr()])
+        self.assertEqual(len(self.sm._take_discovered_prs("s1")), 1)
+
+    def test_an_mr_link_off_the_project_is_left_out(self):
+        self.discover([self.mr(web_url="https://evil.example/code_hunter/argocd/-/merge_requests/9"),
+                       self.mr(web_url="https://gitlab.com/other/repo/-/merge_requests/9"),
+                       self.mr(web_url="https://gitlab.com/code_hunter/argocd/-/merge_requests/9\n")])
+        self.assertEqual(self.sm._take_discovered_prs("s1"), [])
+
+    def test_the_cap_rotates_so_no_session_starves(self):
+        self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(7)]
+        with mock.patch.object(ha, "MR_DISCOVER_MAX", 3):
+            asked = []
+            for _ in range(3):
+                self.discover([])
+                asked.append(set(self.sm._mr_discover_asked))
+        self.assertEqual(len(asked[0]), 3)
+        self.assertEqual(asked[-1], {f"s{i}" for i in range(7)})
+
+    def test_staged_urls_of_a_stopped_session_are_dropped(self):
+        self.discover([self.mr()])
+        self.sm.registry[0]["status"] = "stopped"
+        self.discover([self.mr()])
+        self.assertEqual(self.sm._take_discovered_prs("s1"), [])
+
+    def test_the_beat_suppresses_the_nudge_and_lands_the_chip(self):
+        """Worker → beat seam: refresh_pr_status stages the MR; the open-PR
+        poller, which runs BEFORE the payload loop drains it, already counts it
+        open; the payload then puts it on the record."""
+        url = self.mr()["web_url"]
+        sess = self.sm.registry[0]
+        sess["tmuxName"] = "agent-s1"
+        self.sm.github = {"available": False}
+        with mock.patch.multiple(ha, run=_ORIG_RUN, **self.GL), \
+                mock.patch.object(ha, "_gitlab_get", return_value=[self.mr()]), \
+                mock.patch.object(ha, "pr_status", return_value=None):
+            self.sm.refresh_pr_status()
+        self.sm.nudge_reads["s1"] = {"dirtyFiles": 0, "liveBranch": "CE-8575",
+                                     "work": {"pushed": False}}
+        with mock.patch.object(ha, "_pane_status", return_value=(False, None, None)), \
+                mock.patch.object(self.sm, "notify_session") as notify:
+            self.sm._poll_open_pr_nudges(stage=False)
+        notify.assert_not_called()
+        with mock.patch.object(ha, "session_report",
+                               return_value={"prUrls": []}):
+            try:
+                self.sm._session_payload(sess)
+            except Exception:
+                pass
+        self.assertIn(url, self.sm.session_pr_urls.get("s1") or [])
+        self.assertEqual(sess.get("prUrls"), [url])
+
+    def test_project_from_remote(self):
+        with mock.patch.multiple(ha, **self.GL):
+            f = ha._gitlab_project_from_remote
+            self.assertEqual(f("git@gitlab.com:Grp/Sub/app.git"), "Grp/Sub/app")
+            self.assertEqual(f("ssh://git@altssh.gitlab.com:443/g/app.git"), "g/app")
+            self.assertEqual(f("https://user:pw@gitlab.com/g/app"), "g/app")
+            self.assertIsNone(f("git@github.com:g/app.git"))
+            self.assertIsNone(f("https://evilgitlab.com/g/app"))
+            self.assertIsNone(f("https://gitlab.com/../app"))
+            self.assertIsNone(f(""))
+
+
 class TestRefreshPrStatus(ManagerMixin, unittest.TestCase):
     """The manager's slow-cadence PR status refresh + per-session attachment."""
 
