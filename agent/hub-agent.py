@@ -19184,7 +19184,9 @@ def _pane_blocking_dialog(cap):
       * a choice dialog cut off below its first option (`_pane_cut_dialog_up`:
         a 10-row pane draws "Exit plan mode?" down to "❯ 1." only);
       * an overlay with its footer cut off (`_pane_overlay_up`: the Ctrl-R
-        history search, a short /resume picker).
+        history search, a short /resume picker);
+      * qwen's Ctrl-R history search, whose Enter submits an older matched
+        prompt (`_qwen_history_search_up`).
     Keeping the last five OUT of `parse_pane_prompt` is deliberate: `panePrompt`
     is a wire contract whose options the chat page renders as clickable digits,
     and these have no digit to click (or, for the picker, digits that a
@@ -19196,7 +19198,8 @@ def _pane_blocking_dialog(cap):
             or _model_picker_open(cap)
             or _pane_cut_dialog_up(cap)
             or _pane_overlay_up(cap)
-            or _qwen_waiting_up(cap))
+            or _qwen_waiting_up(cap)
+            or _qwen_history_search_up(cap))
 
 
 # qwen's status line while one of its dialogs waits on a person: its spinner
@@ -19224,6 +19227,72 @@ def _qwen_waiting_up(cap):
     # At 14 columns the line wraps mid-word ("⠏ Waiting fo" / "r…"): read the
     # last two rows joined as well.
     return any(_QWEN_WAITING_RE.match(line) for line in last + ["".join(last)])
+
+
+# qwen's Ctrl-R history search: "(r:)" takes the composer's prompt column.
+_QWEN_HISTORY_SEARCH_RE = re.compile(r"^\(r:\)(?:\s|$)")
+# A row of its match list: the cursor's "  > " or another match's 4-space indent.
+_QWEN_HISTORY_MATCH_RE = re.compile(r"^(?:  > | {4})\s*\S")
+# The list's scroll trailer: "  ▼" (or "  ▲") and "  (k/N)" once it overflows.
+# Under ~11 columns the counter wraps ("  (1/1" / "  2)"), so it is read as
+# the pane's last rows of `_QWEN_HISTORY_COUNT_PART_RE` joined.
+_QWEN_HISTORY_ARROW_RE = re.compile(r"^  [▲▼]$")
+_QWEN_HISTORY_COUNT_PART_RE = re.compile(r"^  [\d()/]+$")
+_QWEN_HISTORY_COUNT_RE = re.compile(r"\(\d+/\d+\)")
+
+
+def _qwen_history_search_up(cap):
+    """Whether qwen's Ctrl-R history search owns the composer (XERK-2215).
+    qwen 0.22.3 / 0.26 draws "(r:)" in place of the ">" prompt, inside the
+    composer box (full-width column-0 rules), with the matches listed below it
+    in place of the footer. Typed text becomes the QUERY, and Enter submits
+    the best MATCH: verified live, "alp" + Enter re-sent an older prompt
+    "first prompt alpha". A short reply ("yes", "ok") usually matches some
+    earlier prompt, so typing into it would send the wrong message.
+
+    Read by position. While the composer's own row is on screen it decides:
+    transcript lines are indented, so the column-0 row of the box is "(r:)"
+    (search) or ">" (composer, even with an "@"/"/" completion popup listed
+    below it in the same shape). In a short pane the match list scrolls the
+    box up and off — "(r:)" first, then the top rule, then all of it — so with
+    no composer row left, a bottom that is all list rows (each indented 4, the
+    cursor's "  > ", maybe a "  ▼" / "  (k/N)" trailer, wrapped when narrow) counts. A popup left
+    open over a draft looks the same there; holding is right for it too,
+    since a typed message would glue onto the draft. An idle qwen box always
+    has its footer ("  ➜ work · git:…", "  Auto mode…") under it, never that."""
+    if not cap:
+        return False
+    lines = [_PANE_SCROLLBAR_RE.sub("", line).rstrip()
+             for line in _ANSI_RE.sub("", cap).splitlines()]
+    widest = max((_pane_cells(line) for line in lines), default=0)
+    if widest < 4:
+        return False
+    rules = [k for k, line in enumerate(lines)
+             if line[:1] == "─" and set(line) == {"─"} and _pane_cells(line) == widest]
+    if len(rules) >= 2:
+        inside = [line for line in lines[rules[-2] + 1:rules[-1]] if line.strip()]
+        return bool(inside) and bool(_QWEN_HISTORY_SEARCH_RE.match(inside[0]))
+    if rules:
+        # The top rule scrolled off: the composer's column-0 row, if still
+        # shown, is the last column-0 line above the bottom rule.
+        col0 = [line for line in lines[:rules[0]] if line[:1] not in ("", " ")]
+        if col0 and _QWEN_HISTORY_SEARCH_RE.match(col0[-1]):
+            return True
+        if col0 and col0[-1].startswith(">"):
+            return False
+    rows = [line for line in lines[rules[0] + 1 if rules else 0:] if line.strip()]
+    count = len(rows)
+    while count and _QWEN_HISTORY_COUNT_PART_RE.match(rows[count - 1]):
+        count -= 1
+    trailer = count < len(rows)
+    if trailer and not _QWEN_HISTORY_COUNT_RE.fullmatch(
+            "".join(line.strip() for line in rows[count:])):
+        return False
+    matches = [line for line in rows[:count] if not _QWEN_HISTORY_ARROW_RE.match(line)]
+    trailer = trailer or len(matches) < count
+    if not all(_QWEN_HISTORY_MATCH_RE.match(line) for line in matches):
+        return False
+    return len(matches) >= 2 or (len(matches) == 1 and trailer)
 
 
 # An idle composer's rule, drawn from column 0 (a dialog's box rule is indented).
