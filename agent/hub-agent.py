@@ -19385,7 +19385,7 @@ def _pane_cut_choice_up(cap):
     # "❯ <msg>" with indented wraps, so "❯ Which one?" / "❯ 1. Submit
     # answers" queued with the spinner cut off is not this page (QA).
     return (question.endswith("?") and not question[:1].isspace()
-            and not question.startswith("❯") and "to send now" not in text)
+            and not question.startswith("❯"))
 
 
 # A picker's cursor row: an indented "❯" (the composer's own prompt sits at column 0).
