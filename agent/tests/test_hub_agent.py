@@ -37829,43 +37829,54 @@ class TestDiscoverBranchMrs(ManagerMixin, unittest.TestCase):
         self.discover([self.mr()])
         self.assertEqual(len(self.sm._take_discovered_prs("s1")), 1)
 
-    def test_a_failed_lookup_ends_the_pass_and_backs_off_that_session_only(self):
-        self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(3)]
-        self.assertEqual(self.discover(None).call_count, 1)
-        failed = set(self.sm._mr_discover_retry_at)
-        self.assertEqual(len(failed), 1)
-        self.discover([self.mr()])
-        staged = {sid for sid in ("s0", "s1", "s2") if self.sm._take_discovered_prs(sid)}
-        self.assertEqual(staged, {"s0", "s1", "s2"} - failed)
-        self.sm._mr_discover_retry_at.clear()
-        self.discover([self.mr()])
-        self.assertEqual(len(self.sm._take_discovered_prs(failed.pop())), 1)
-
-    def test_a_failing_session_never_blocks_the_healthy_ones(self):
-        """A failed lookup ends the pass, so a session that keeps failing (a 404
-        for a project the token cannot read) must be asked AFTER the healthy
-        ones, never ahead of them once its backoff runs out."""
-        self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(3)]
+    def _lookup_by_sid(self, answer):
+        """A _gitlab_branch_mr_urls stand-in answering per session (the one just
+        stamped as asked); records the order asked."""
         order = []
 
         def lookup(proj, branch, since, holds):
             sid = max(self.sm._mr_discover_asked, key=self.sm._mr_discover_asked.get)
             order.append(sid)
-            return None if sid == "s0" else []
+            return answer(sid, len([o for o in order if o == sid]))
+        return order, lookup
+
+    def run_pass(self, lookup):
         with mock.patch.multiple(ha, run=_ORIG_RUN, **self.GL), \
                 mock.patch.object(ha, "_gitlab_branch_mr_urls", side_effect=lookup):
             self.sm._discover_branch_mrs()
-            self.assertEqual(order, ["s0"])              # failed first: pass ends
-            for _ in range(2):
-                order.clear()
-                self.sm._mr_discover_retry_at["s0"] = 0.0   # its backoff ran out
-                self.sm._discover_branch_mrs()
-                self.assertEqual(order, ["s1", "s2", "s0"])
+
+    def test_a_quick_failure_backs_off_that_session_and_the_pass_goes_on(self):
+        """A 404 for a project the token cannot read fails every time and fast:
+        the other sessions are still asked in the same pass."""
+        self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(3)]
+        order, lookup = self._lookup_by_sid(lambda sid, n: None if sid == "s0" else [])
+        self.run_pass(lookup)
+        self.assertEqual(order, ["s0", "s1", "s2"])
+        order.clear()
+        self.run_pass(lookup)                      # s0 waits out its backoff
+        self.assertEqual(order, ["s1", "s2"])
         self.sm.registry = self.sm.registry[1:]
-        with mock.patch.multiple(ha, run=_ORIG_RUN, **self.GL), \
-                mock.patch.object(ha, "_gitlab_branch_mr_urls", return_value=[]):
-            self.sm._discover_branch_mrs()
+        self.run_pass(lookup)
         self.assertNotIn("s0", self.sm._mr_discover_retry_at)
+
+    def test_a_slow_failure_ends_the_pass(self):
+        self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(3)]
+        order, lookup = self._lookup_by_sid(lambda sid, n: None)
+        with mock.patch.object(ha, "MR_DISCOVER_SLOW_SEC", 0):
+            self.run_pass(lookup)
+        self.assertEqual(order, ["s0"])
+
+    def test_a_session_that_failed_once_is_not_starved_by_the_cap(self):
+        """Past its backoff a once-failed session takes its turn in the
+        least-recently-asked rotation, however many healthy sessions are due."""
+        self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(7)]
+        url = self.mr()["web_url"]
+        order, lookup = self._lookup_by_sid(
+            lambda sid, n: None if (sid == "s0" and n == 1) else ([url] if sid == "s0" else []))
+        with mock.patch.object(ha, "MR_DISCOVER_FAIL_BACKOFF_SEC", 0):
+            for _ in range(3):
+                self.run_pass(lookup)
+        self.assertEqual(self.sm._take_discovered_prs("s0"), [url])
 
     def test_a_listing_is_read_no_further_than_twenty(self):
         mrs = [self.mr(web_url=f"https://gitlab.com/code_hunter/argocd/-/merge_requests/{i}")

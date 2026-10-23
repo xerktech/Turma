@@ -89,15 +89,10 @@ DevOps, and what gets typed back because of it.
   - An empty lookup is asked again next pass (the MR is usually opened after the
     push); only a tip that already has its MR is skipped. `MR_DISCOVER_MAX` sessions a pass,
     least recently asked first. GitLab only. Tests: `TestDiscoverBranchMrs`.
-  - A FAILED lookup ends the pass and backs THAT session off `MR_DISCOVER_FAIL_BACKOFF_SEC`: a hung
-    GitLab otherwise held the shared worker a timeout per session every pass. Never a host-wide
-    pause: `_gitlab_get` is None for a 404 too, so one unreadable project stalled every session (QA).
-  - **A session whose last lookup failed is asked LAST** (until one succeeds): first in line, its
-    failure ended every pass before a healthy session was reached (QA). Accepted: one transient
-    failure can still let the open-PR nudge fire once before the retry finds the MR.
-  - Residuals: a resumed/migrated session's fresh `createdAt` hides an MR its earlier life
-    opened; an MR head already on the base (a sibling's merged, then rebased in) passes the
-    ancestor gate.
+  - A FAILED lookup backs THAT session off `MR_DISCOVER_FAIL_BACKOFF_SEC`; only a SLOW one
+    (`MR_DISCOVER_SLOW_SEC`, a hang) ends the pass. Never a host-wide pause, and never reorder failed
+    sessions: `_gitlab_get` is None for a 404 too, and each variant starved someone (QA, 3 passes).
+    Accepted: one transient failure can still let the open-PR nudge fire once before the retry.
 - **A GitLab MR and an ADO PR answer everywhere a GitHub PR does**: dispatch by URL to
   `mr_status`/`azdo_pr_status`, each polled only through the source that can answer it
   (`_pr_source_ok`; unreachable → bare link). ADO reuses the board's PAT, no CI rollup: `checks` is

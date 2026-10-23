@@ -8502,10 +8502,12 @@ PR_STATUS_MAX = 20
 # recently asked first, so none starves behind busier ones.
 MR_DISCOVER_MAX = 5
 # A FAILED lookup (GitLab down or hanging, or a project the token cannot read)
-# ends the pass, so a hung GitLab costs one request timeout a pass, and that
-# session alone is not asked again for this long. Under two PR-refresh passes
-# (~60s each), so it is due again by the second.
+# backs that session alone off for this long — under two PR-refresh passes
+# (~60s each), so it is due again by the second. One that also took this long
+# (a hang, not a quick 404/502) ends the pass, so a hung GitLab costs one
+# request timeout a pass rather than one per session.
 MR_DISCOVER_FAIL_BACKOFF_SEC = 110
+MR_DISCOVER_SLOW_SEC = 5
 
 # PR auto-merge (XERK-550): how long a single `gh pr merge` may block on its
 # worker thread, and how many outcomes stay staged (each is a small dict keyed
@@ -41379,11 +41381,7 @@ class SessionManager:
         with self._discovered_lock:
             for sid in [k for k in self._discovered_prs if k not in live]:
                 del self._discovered_prs[sid]
-        # A session whose last lookup failed goes LAST: its failure ends the
-        # pass, so first in line it would block every healthy session behind it
-        # (a 404 for a project the token cannot read fails every time).
-        due.sort(key=lambda x: (x["id"] in self._mr_discover_retry_at,
-                                self._mr_discover_asked.get(x["id"], 0.0)))
+        due.sort(key=lambda x: self._mr_discover_asked.get(x["id"], 0.0))
         asked = 0
         for sess in due:
             if asked >= MR_DISCOVER_MAX:
@@ -41415,12 +41413,14 @@ class SessionManager:
                 rc, _ = run_out(["git", "merge-base", "--is-ancestor", sha, "HEAD"],
                                 cwd=wt)
                 return rc == 0
+            began = time.monotonic()
             found = _gitlab_branch_mr_urls(proj, branch, since, holds)
             if found is None:
-                self._mr_discover_retry_at[sid] = (time.monotonic()
-                                                   + MR_DISCOVER_FAIL_BACKOFF_SEC)
-                break
-            self._mr_discover_retry_at.pop(sid, None)
+                done = time.monotonic()
+                self._mr_discover_retry_at[sid] = done + MR_DISCOVER_FAIL_BACKOFF_SEC
+                if done - began >= MR_DISCOVER_SLOW_SEC:
+                    break
+                continue
             if not found:
                 continue
             self._mr_discover_found[sid] = (branch, head)
