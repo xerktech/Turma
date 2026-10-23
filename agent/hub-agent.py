@@ -17546,6 +17546,40 @@ def _must_hold(result):
     return result == PANE_DIALOG or result == PANE_HOLD
 
 
+# Below either of these a pane's frame often holds nothing that tells a dialog
+# from an idle composer (XERK-2222, measured on 2.1.309): an MCP-server approval
+# at 8x4 draws only "to"/"canc"/"el", and an idle composer at 8x4 only the logo
+# and a rule, no "❯". Read: ≤4 rows, or ≤9 columns (the multi-question review
+# at 5-9 columns).
+PANE_READABLE_MIN_ROWS = 5
+PANE_READABLE_MIN_COLS = 10
+
+
+def _pane_too_small(tmux_name, cap):
+    """Whether this pane is too small for its text to say whether it is safe to
+    type into (XERK-2222), so a writer holds instead. Only where the frame shows
+    no composer box of its own (`_pane_boxed_composer_up`). Its size is asked of
+    tmux, never measured from `cap`: a short frame is not a small pane. Can't
+    tell (no answer, Windows: the pty-host reports no size) reads False, as
+    before this check."""
+    if IS_WINDOWS or not tmux_name or cap is None:
+        return False
+    try:
+        out = subprocess.run(
+            _tmux("display-message", "-p", "-t", _tmux_pane(tmux_name),
+                  "#{pane_width} #{pane_height}", name=tmux_name),
+            capture_output=True, text=True, timeout=5,
+        )
+        width, height = (int(n) for n in out.stdout.split())
+    except Exception:
+        return False
+    if out.returncode != 0:
+        return False
+    if width >= PANE_READABLE_MIN_COLS and height >= PANE_READABLE_MIN_ROWS:
+        return False
+    return not _pane_boxed_composer_up(_ANSI_RE.sub("", cap).splitlines())
+
+
 def _await_slice_drawn(tmux_name, typed, deadline):
     """Wait until the composer ends with `typed` (the text typed so far), so
     the next slice is not read in one burst with this one. False when the
@@ -17579,6 +17613,9 @@ def _submit_typed(tmux_name, text, press_enter):
     if _pane_blocking_dialog(before):
         # Came up while the text was typed: an Enter would answer it.
         log(f"typing into {tmux_name}: a dialog came up before Enter; not pressing it")
+        return PANE_DIALOG
+    if _pane_too_small(tmux_name, before):
+        log(f"typing into {tmux_name}: the pane shrank too small to read; not pressing Enter")
         return PANE_DIALOG
     sent_before = _sent_count(before, text)
     held = _composer_state(before, text) == "holds"
@@ -17801,6 +17838,10 @@ def _type_into_pane(tmux_name, text, epoch=None):
         if _pane_blocking_dialog(cap):
             log(f"typing into {tmux_name}: a dialog owns the pane; typed nothing")
             return PANE_DIALOG
+        if _pane_too_small(tmux_name, cap):
+            log(f"typing into {tmux_name}: the pane is too small to tell whether a "
+                f"dialog owns it; typed nothing")
+            return PANE_HOLD
         held = _clear_leftover(tmux_name, epoch)
         if held is not None:
             log(f"typing into {tmux_name}: a stopped message's leftover is still in the "
@@ -17893,7 +17934,8 @@ def _type_into_tmux_pane(tmux_name, text):
             _note_leftover(tmux_name, text)
             return PANE_DIALOG
     else:
-        if _dialog_up(tmux_name):
+        cap = _capture_pane(tmux_name)
+        if _pane_blocking_dialog(cap) or _pane_too_small(tmux_name, cap):
             # Pasted in one go: Claude Code shows it as a chip, not the text.
             return _stopped_for_dialog(tmux_name, "before the Enter", text, chip=True)
         press_enter()
@@ -35910,7 +35952,7 @@ class SessionManager:
             log(f"set model of {sid} -> {arg}: turn in flight; deferred until idle")
             return
         before = _capture_pane(tmux_name)
-        if _pane_blocking_dialog(before):
+        if _pane_blocking_dialog(before) or _pane_too_small(tmux_name, before):
             # A dialog owns the keyboard: "/model" + Enter would answer it — an
             # Enter on a permission dialog approves "1. Yes" (XERK-2142 QA).
             # Deferred the same way; _apply_pending_switches waits it out too.
@@ -36506,7 +36548,7 @@ class SessionManager:
             cap = _capture_pane(sess["tmuxName"])
             if cap is None or _busy_from_capture(cap):
                 continue
-            if _pane_blocking_dialog(cap):
+            if _pane_blocking_dialog(cap) or _pane_too_small(sess["tmuxName"], cap):
                 continue
             sess.pop("pendingModel", None)
             try:
@@ -36584,7 +36626,8 @@ class SessionManager:
             # method's Enter confirmed its 'No, exit' default. That exited claude
             # and took its tmux with it, leaving an orphaned ttyd serving tmux's
             # own `can't find session: agent-<id>` while the card read running.
-            if _pane_blocking_dialog(cap):
+            # A pane too small to read is deferred the same way (XERK-2222).
+            if _pane_blocking_dialog(cap) or _pane_too_small(tmux, cap):
                 continue
             # An operator's half-typed draft would be submitted WITH the
             # `/rename` + Enter, and rcName would move to a name the session does

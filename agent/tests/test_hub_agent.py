@@ -11127,6 +11127,88 @@ _2148_PICKER_40 = (
 )
 
 
+# XERK-2222: live Claude Code 2.1.309 frames, tmux resized over them. At these
+# sizes the dialog and the idle composer draw nothing that tells them apart.
+TINY_MCP_APPROVAL_8X4 = "  to\n  canc\n  el\n\n"
+TINY_MCP_APPROVAL_6X8 = "  sc\n\n  to\n\n  ca\n  nc\n  el\n\n"
+TINY_IDLE_8X4 = " ▝▝   ▝▝\n\n  ◐ m…\n────────\n"
+# Constructed: a 4-row pane whose whole frame is the composer's box + footer.
+TINY_BOXED_COMPOSER_40X4 = ("─" * 40 + "\n❯ \n" + "─" * 40
+                            + "\n  ⏵⏵ auto mode on (shift+tab to cycle)\n")
+
+
+class TestTinyPaneHolds(ManagerMixin, unittest.TestCase):
+    """XERK-2222: a pane too small to read is held, never typed into."""
+
+    def _sized(self, width, height, rc=0):
+        real = subprocess.run
+
+        def fake(cmd, *a, **kw):
+            if "display-message" in cmd:
+                return subprocess.CompletedProcess(cmd, rc, f"{width} {height}\n", "")
+            return real(cmd, *a, **kw)
+        return mock.patch.object(ha.subprocess, "run", side_effect=fake)
+
+    def test_a_tiny_pane_is_too_small_to_read(self):
+        for (w, h), cap in (((8, 4), TINY_MCP_APPROVAL_8X4), ((6, 8), TINY_MCP_APPROVAL_6X8),
+                            ((8, 4), TINY_IDLE_8X4), ((100, 4), TINY_IDLE_8X4),
+                            ((9, 40), TINY_IDLE_8X4)):
+            with self.subTest(size=(w, h)), self._sized(w, h):
+                self.assertTrue(ha._pane_too_small("agent-abcde", cap))
+
+    def test_a_readable_pane_is_not(self):
+        # The size comes from tmux, never the frame: a short frame in a big pane.
+        for w, h in ((10, 5), (100, 30)):
+            with self.subTest(size=(w, h)), self._sized(w, h):
+                self.assertFalse(ha._pane_too_small("agent-abcde", TINY_IDLE_8X4))
+
+    def test_a_visible_composer_box_is_readable_at_any_size(self):
+        with self._sized(40, 4):
+            self.assertFalse(ha._pane_too_small("agent-abcde", TINY_BOXED_COMPOSER_40X4))
+
+    def test_cant_tell_reads_as_before(self):
+        with self._sized(8, 4, rc=1):
+            self.assertFalse(ha._pane_too_small("agent-abcde", TINY_IDLE_8X4))
+        with self._sized(8, 4), mock.patch.object(ha, "IS_WINDOWS", True):
+            self.assertFalse(ha._pane_too_small("agent-abcde", TINY_IDLE_8X4))
+        with self._sized(8, 4):
+            self.assertFalse(ha._pane_too_small("agent-abcde", None))
+
+    def test_a_tiny_pane_gets_nothing_typed_and_the_message_holds(self):
+        # The live 8x4 MCP approval reads typeable to _pane_blocking_dialog; an
+        # Enter there picks "Continue without using this MCP server".
+        self.assertFalse(ha._pane_blocking_dialog(TINY_MCP_APPROVAL_8X4))
+        self.make_manager()
+        self.run_calls.clear()
+        self.run_stdin_calls.clear()
+        with self._sized(8, 4), \
+                mock.patch.object(ha, "_capture_pane", return_value=TINY_MCP_APPROVAL_8X4):
+            result = ha._type_into_pane("agent-abcde", "hello there")
+        self.assertEqual(result, ha.PANE_HOLD)
+        self.assertTrue(ha._must_hold(result))
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(self.run_stdin_calls, [])
+
+    def test_a_pane_that_shrank_before_the_enter_is_not_entered(self):
+        self.make_manager()
+        self.run_calls.clear()
+        sizes = iter([(100, 30)] + [(8, 4)] * 50)
+        real = subprocess.run
+
+        def fake(cmd, *a, **kw):
+            if "display-message" in cmd:
+                w, h = next(sizes)
+                return subprocess.CompletedProcess(cmd, 0, f"{w} {h}\n", "")
+            return real(cmd, *a, **kw)
+        with mock.patch.object(ha.subprocess, "run", side_effect=fake), \
+                mock.patch.object(ha, "_capture_pane",
+                                  side_effect=[LINUX_COMPOSER_PANE] + [TINY_IDLE_8X4] * 50), \
+                mock.patch.object(ha, "_await_slice_drawn", return_value=True):
+            result = ha._type_into_pane("agent-abcde", "hello there")
+        self.assertEqual(result, ha.PANE_DIALOG)
+        self.assertEqual([c for c in self.run_calls if c[-1] == "Enter"], [])
+
+
 class TestExtremePaneSizes(unittest.TestCase):
     """XERK-2202: live frames (Claude Code 2.1.308, qwen 0.26 in tmux 3.4) at
     pane sizes where every other dialog read missed them, or where qwen's cut
