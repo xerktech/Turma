@@ -577,7 +577,9 @@ function subscriptionLabelOf(agent) {
 // or maximum. Every host is reading the same server-side counter, so the newest
 // read is simply the most recent truth — and across a window's reset it is the
 // only right answer, where a maximum would keep the pre-reset figure alive.
-// Groups sort freshest-first, as the per-host cards did.
+// The fold runs freshest-first (limitEntries), but the CARDS sort by name
+// (limitSortKey): freshest-first reshuffled them every time another host took
+// a snapshot.
 function limitGroups(agents, nowSec) {
   const now = nowSec ?? Math.floor(Date.now() / 1000);
   const groups = [];
@@ -610,7 +612,37 @@ function limitGroups(agents, nowSec) {
       }
     }
   }
-  return groups.sort((x, y) => y.capturedAt - x.capturedAt);
+  return groups.sort(limitNameOrder);
+}
+
+// A card's host names in alphabetical order — never the freshest-first order
+// the heading lists them in, which moves with every capture.
+function limitHosts(group) {
+  return group.hosts.map(h => h.host).sort();
+}
+
+// What a card sorts by: its subscription name, else its hosts. Mirrored by
+// Android's limitSortKey.
+function limitSortKey(group) {
+  return group.label || limitHosts(group).join(" ");
+}
+
+// Case-insensitive, then exact, then host by host: two Team seats are two
+// subscriptions carrying ONE org name, and left tied the stable sort kept the
+// fold's freshest-first order, swapping them on every beat. The hosts compare
+// as a list, never a joined string, which two different lists can share.
+// Code-unit compares here, String.compareTo on Android, so both agree.
+function limitNameOrder(x, y) {
+  const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  const a = limitSortKey(x), b = limitSortKey(y);
+  const named = cmp(a.toLowerCase(), b.toLowerCase()) || cmp(a, b);
+  if (named) return named;
+  const hx = limitHosts(x), hy = limitHosts(y);
+  for (let i = 0; i < Math.min(hx.length, hy.length); i++) {
+    const c = cmp(hx[i], hy[i]);
+    if (c) return c;
+  }
+  return hx.length - hy.length;
 }
 
 // The state one window renders in. `expired` (the reset stamp has passed) beats

@@ -300,14 +300,55 @@ class UsageViewModelTest {
         assertEquals(listOf("old"), UsageViewModel.compute(fleet, now).limits.map { it.host })
     }
 
-    @Test fun `limit cards lead with the freshest snapshot`() {
+    @Test fun `limit cards sort by name, not by which captured last`() {
+        // Mirrors usage.test.js: freshest-first reshuffled the cards on every
+        // capture. A named card sorts by its name case-insensitively, an
+        // unnamed one by its hosts alphabetically, not freshest-first.
         val fleet = FleetState(agents = listOf(
-            AgentInfo(key = "stale", device = "stale",
-                limits = limits(now - 9000, seven = LimitWindow(usedPct = 1.0))),
-            AgentInfo(key = "fresh", device = "fresh",
-                limits = limits(now - 60, seven = LimitWindow(usedPct = 2.0))),
+            AgentInfo(key = "zeta", device = "zeta", subscription = SubscriptionInfo(key = "k1", label = "beta"),
+                limits = limits(now - 60, seven = LimitWindow(usedPct = 1.0))),
+            AgentInfo(key = "ahost", device = "ahost", subscription = sub("k2"),
+                limits = limits(now - 30, seven = LimitWindow(usedPct = 2.0))),
+            AgentInfo(key = "yhost", device = "yhost", subscription = sub("k2"),
+                limits = limits(now - 10, seven = LimitWindow(usedPct = 2.0))),
+            AgentInfo(key = "omega", device = "omega", subscription = SubscriptionInfo(key = "k3", label = "Alpha"),
+                limits = limits(now - 9000, seven = LimitWindow(usedPct = 3.0))),
+            AgentInfo(key = "psi", device = "psi", subscription = SubscriptionInfo(key = "k4", label = "acme"),
+                limits = limits(now - 5, seven = LimitWindow(usedPct = 3.0))),
         ))
-        assertEquals(listOf("fresh", "stale"), UsageViewModel.compute(fleet, now).limits.map { it.host })
+        assertEquals(listOf("acme", "yhost,ahost", "Alpha", "beta"),
+            UsageViewModel.compute(fleet, now).limits.map { c ->
+                c.label.ifBlank { c.hosts.joinToString(",") { it.host } } })
+    }
+
+    @Test fun `limit cards tied on name order by host, whichever captured last`() {
+        // Two Team seats: two subscription keys, one org name (usage.test.js).
+        fun order(aAge: Long, bAge: Long) = UsageViewModel.compute(FleetState(agents = listOf(
+            AgentInfo(key = "seat-b", device = "seat-b", subscription = SubscriptionInfo(key = "kb", label = "Acme Inc"),
+                limits = limits(now - bAge, seven = LimitWindow(usedPct = 1.0))),
+            AgentInfo(key = "seat-a", device = "seat-a", subscription = SubscriptionInfo(key = "ka", label = "Acme Inc"),
+                limits = limits(now - aAge, seven = LimitWindow(usedPct = 2.0))),
+            AgentInfo(key = "seat-0", device = "seat-0", subscription = SubscriptionInfo(key = "kc", label = "acme inc"),
+                limits = limits(now - 1, seven = LimitWindow(usedPct = 3.0))),
+        )), now).limits.map { it.label + ":" + it.hosts.first().host }
+        val want = listOf("Acme Inc:seat-a", "Acme Inc:seat-b", "acme inc:seat-0")
+        assertEquals(want, order(10, 20))
+        assertEquals(want, order(20, 10))
+        // Several hosts per tied card: the tiebreak reads them alphabetically,
+        // not freshest-first (z1 and b1 are each card's fresher host).
+        fun seat(host: String, key: String, age: Long) = AgentInfo(key = host, device = host,
+            subscription = SubscriptionInfo(key = key, label = "Acme"),
+            limits = limits(now - age, seven = LimitWindow(usedPct = 1.0)))
+        val multi = UsageViewModel.compute(FleetState(agents = listOf(
+            seat("a1", "kx", 50), seat("z1", "kx", 5), seat("m1", "ky", 40), seat("b1", "ky", 4),
+        )), now).limits.map { c -> c.hosts.map { it.host }.sorted().joinToString(",") }
+        assertEquals(listOf("a1,z1", "b1,m1"), multi)
+        // Hosts compare as a list: a joined string reads "nl\nx" for both.
+        fun joined(nlAge: Long, xAge: Long) = UsageViewModel.compute(FleetState(agents = listOf(
+            seat("nl\nx", "k1", nlAge), seat("nl", "k2", xAge), seat("x", "k2", xAge),
+        )), now).limits.map { c -> c.hosts.map { it.host }.sorted().joinToString("+") }
+        assertEquals(listOf("nl+x", "nl\nx"), joined(1, 5))
+        assertEquals(listOf("nl+x", "nl\nx"), joined(5, 1))
     }
 
     // --- the 7-day day markers (XERK-536) -----------------------------------
@@ -422,7 +463,7 @@ class UsageViewModelTest {
             AgentInfo(key = "home", device = "home", subscription = sub("k2"),
                 limits = limits(now - 30, five = LimitWindow(usedPct = 5.0))),
         ))
-        assertEquals(listOf(listOf("work"), listOf("home")),
+        assertEquals(listOf(listOf("home"), listOf("work")),
             UsageViewModel.compute(fleet, now).limits.map { c -> c.hosts.map { it.host } })
     }
 

@@ -675,7 +675,7 @@ test("renderLimits hands the grid its column counts: wide, and narrow (odd count
 
 // --- limitGroups: one card per subscription (XERK-301) ----------------------
 
-const sub = (key) => ({ subscription: { key } });
+const sub = (key, label) => ({ subscription: label ? { key, label } : { key } });
 
 test("limitGroups folds hosts on one subscription into a single card", () => {
   // Both hosts are logged into the same Claude account, so they are reading
@@ -696,7 +696,7 @@ test("limitGroups keeps different subscriptions on their own cards", () => {
     { device: "work", ...sub("k1"), limits: { capturedAt: NOW, fiveHour: { usedPct: 30 } } },
     { device: "home", ...sub("k2"), limits: { capturedAt: NOW - 30, fiveHour: { usedPct: 5 } } },
   ], NOW);
-  assert.deepEqual(groups.map((g) => g.hosts.map((h) => h.host)), [["work"], ["home"]]);
+  assert.deepEqual(groups.map((g) => g.hosts.map((h) => h.host)), [["home"], ["work"]]);
 });
 
 test("limitGroups never folds two hosts that merely both report NO subscription", () => {
@@ -737,12 +737,53 @@ test("limitGroups drops an aged-out snapshot before it can join a group", () => 
   assert.deepEqual(groups[0].hosts.map((h) => h.host), ["live"]);
 });
 
-test("limitGroups leads with the freshest card", () => {
+test("limitGroups sorts cards by name, not by which captured last", () => {
+  // Freshest-first reshuffled the cards every time another host took a
+  // snapshot. A named card sorts by its name case-insensitively ("beta" after
+  // "Alpha" and "acme"), an unnamed one by its hosts alphabetically, not the
+  // freshest-first order its heading lists them in.
   const groups = H.limitGroups([
-    { device: "stale", ...sub("k1"), limits: { capturedAt: NOW - 9000, sevenDay: { usedPct: 1 } } },
-    { device: "fresh", ...sub("k2"), limits: { capturedAt: NOW - 60, sevenDay: { usedPct: 2 } } },
+    { device: "zeta", ...sub("k1", "beta"), limits: { capturedAt: NOW - 60, sevenDay: { usedPct: 1 } } },
+    { device: "ahost", ...sub("k2"), limits: { capturedAt: NOW - 30, sevenDay: { usedPct: 2 } } },
+    { device: "yhost", ...sub("k2"), limits: { capturedAt: NOW - 10, sevenDay: { usedPct: 2 } } },
+    { device: "omega", ...sub("k3", "Alpha"), limits: { capturedAt: NOW - 9000, sevenDay: { usedPct: 3 } } },
+    { device: "psi", ...sub("k4", "acme"), limits: { capturedAt: NOW - 5, sevenDay: { usedPct: 3 } } },
   ], NOW);
-  assert.deepEqual(groups.map((g) => g.hosts[0].host), ["fresh", "stale"]);
+  assert.deepEqual(groups.map((g) => g.label || g.hosts.map((h) => h.host).join(",")),
+    ["acme", "yhost,ahost", "Alpha", "beta"]);
+});
+
+test("limitGroups orders cards tied on name by host, whichever captured last", () => {
+  // Two Team seats: two subscription keys, one org name. Tied, the stable sort
+  // kept freshest-first and swapped them every beat. A case-only difference
+  // breaks on the exact name before the hosts.
+  const order = (fleet) => H.limitGroups(fleet, NOW).map((g) => g.label + ":" + g.hosts[0].host);
+  const fleet = (aAge, bAge) => [
+    { device: "seat-b", ...sub("kb", "Acme Inc"), limits: { capturedAt: NOW - bAge, sevenDay: { usedPct: 1 } } },
+    { device: "seat-a", ...sub("ka", "Acme Inc"), limits: { capturedAt: NOW - aAge, sevenDay: { usedPct: 2 } } },
+    { device: "seat-0", ...sub("kc", "acme inc"), limits: { capturedAt: NOW - 1, sevenDay: { usedPct: 3 } } },
+  ];
+  const want = ["Acme Inc:seat-a", "Acme Inc:seat-b", "acme inc:seat-0"];
+  assert.deepEqual(order(fleet(10, 20)), want);
+  assert.deepEqual(order(fleet(20, 10)), want);
+  // Several hosts per tied card: the tiebreak reads them alphabetically, not
+  // freshest-first (z1 and b1 are each card's fresher host).
+  const multi = H.limitGroups([
+    { device: "a1", ...sub("kx", "Acme"), limits: { capturedAt: NOW - 50, sevenDay: { usedPct: 1 } } },
+    { device: "z1", ...sub("kx", "Acme"), limits: { capturedAt: NOW - 5, sevenDay: { usedPct: 1 } } },
+    { device: "m1", ...sub("ky", "Acme"), limits: { capturedAt: NOW - 40, sevenDay: { usedPct: 2 } } },
+    { device: "b1", ...sub("ky", "Acme"), limits: { capturedAt: NOW - 4, sevenDay: { usedPct: 2 } } },
+  ], NOW);
+  assert.deepEqual(multi.map((g) => g.hosts.map((h) => h.host).sort().join(",")), ["a1,z1", "b1,m1"]);
+  // Hosts compare as a list: a joined string reads "nl\nx" for both of these,
+  // and the tie fell back to freshest-first.
+  const joined = (nlAge, xAge) => H.limitGroups([
+    { device: "nl\nx", ...sub("k1", "Acme"), limits: { capturedAt: NOW - nlAge, sevenDay: { usedPct: 1 } } },
+    { device: "nl", ...sub("k2", "Acme"), limits: { capturedAt: NOW - xAge, sevenDay: { usedPct: 2 } } },
+    { device: "x", ...sub("k2", "Acme"), limits: { capturedAt: NOW - xAge, sevenDay: { usedPct: 2 } } },
+  ], NOW).map((g) => g.hosts.map((h) => h.host).sort().join("+"));
+  assert.deepEqual(joined(1, 5), ["nl+x", "nl\nx"]);
+  assert.deepEqual(joined(5, 1), ["nl+x", "nl\nx"]);
 });
 
 test("limitGroups breaks a capturedAt TIE the same way the Android port does", () => {
