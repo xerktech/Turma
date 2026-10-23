@@ -37754,6 +37754,100 @@ class TestMrStatus(unittest.TestCase):
             self.assertEqual(ha.pr_status(self.MR)["url"], self.MR)
 
 
+class TestDiscoverBranchMrs(ManagerMixin, unittest.TestCase):
+    """A GitLab MR the transcript scan missed is found by the session's branch."""
+
+    GL = {"GITLAB_URL": "https://gitlab.com", "GITLAB_TOKEN": "tok"}
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        wt = self.wt = os.path.join(self.tmp, "wt")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@x")
+        def git(*a):
+            return subprocess.run(["git", *a], cwd=wt, env=env, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        os.makedirs(wt)
+        git("init", "-q", "-b", "main")
+        git("commit", "-q", "--allow-empty", "-m", "base")
+        self.base = git("rev-parse", "HEAD")
+        git("switch", "-q", "-c", "CE-8575")
+        git("commit", "-q", "--allow-empty", "-m", "work")
+        self.head = git("rev-parse", "HEAD")
+        git("remote", "add", "origin",
+            "ssh://git@altssh.gitlab.com:443/code_hunter/argocd.git")
+        self.sm = self.make_manager()
+        self.sm.registry = [{"id": "s1", "status": "running", "worktreePath": wt,
+                             "createdAt": "2026-10-23T10:00:00Z"}]
+
+    def mr(self, **kw):
+        d = {"web_url": "https://gitlab.com/code_hunter/argocd/-/merge_requests/1775",
+             "sha": self.head, "created_at": "2026-10-23T11:00:00.000Z",
+             "source_branch": "CE-8575", "source_project_id": 7,
+             "target_project_id": 7}
+        d.update(kw)
+        return d
+
+    def discover(self, mrs):
+        with mock.patch.multiple(ha, run=_ORIG_RUN, **self.GL), \
+                mock.patch.object(ha, "_gitlab_get", return_value=mrs) as get:
+            self.sm._discover_branch_mrs()
+        return get
+
+    def test_an_mr_pushed_over_altssh_is_adopted(self):
+        get = self.discover([self.mr()])
+        path = get.call_args[0][0]
+        self.assertIn("projects/code_hunter%2Fargocd/merge_requests?", path)
+        self.assertIn("source_branch=CE-8575", path)
+        self.assertEqual(self.sm._take_discovered_prs("s1"),
+                         [self.mr()["web_url"]])
+        self.assertEqual(self.sm._take_discovered_prs("s1"), [])
+
+    def test_an_mr_whose_head_is_an_ancestor_counts(self):
+        self.discover([self.mr(sha=self.base)])
+        self.assertEqual(len(self.sm._take_discovered_prs("s1")), 1)
+
+    def test_foreign_mrs_are_left_out(self):
+        self.discover([
+            self.mr(sha="ab" * 20),                          # head not in worktree
+            self.mr(created_at="2026-10-22T09:00:00Z"),      # before the session
+            self.mr(source_project_id=9),                    # from a fork
+            self.mr(source_branch="other"),
+            self.mr(web_url="https://gitlab.com/x/y/pull/3"),
+        ])
+        self.assertEqual(self.sm._take_discovered_prs("s1"), [])
+
+    def test_an_already_known_mr_is_not_restaged(self):
+        self.sm.session_pr_urls["s1"] = [self.mr()["web_url"]]
+        self.discover([self.mr()])
+        self.assertEqual(self.sm._take_discovered_prs("s1"), [])
+
+    def test_an_unmoved_branch_is_not_asked_again(self):
+        self.discover([])
+        get = self.discover([self.mr()])
+        get.assert_not_called()
+
+    def test_no_gitlab_or_a_default_branch_asks_nothing(self):
+        with mock.patch.object(ha, "_gitlab_get") as get:
+            self.sm._discover_branch_mrs()
+        get.assert_not_called()
+        subprocess.run(["git", "switch", "-q", "main"], cwd=self.wt, check=True)
+        self.assertFalse(self.discover([self.mr()]).called)
+
+    def test_project_from_remote(self):
+        with mock.patch.multiple(ha, **self.GL):
+            f = ha._gitlab_project_from_remote
+            self.assertEqual(f("git@gitlab.com:Grp/Sub/app.git"), "Grp/Sub/app")
+            self.assertEqual(f("ssh://git@altssh.gitlab.com:443/g/app.git"), "g/app")
+            self.assertEqual(f("https://user:pw@gitlab.com/g/app"), "g/app")
+            self.assertIsNone(f("git@github.com:g/app.git"))
+            self.assertIsNone(f("https://evilgitlab.com/g/app"))
+            self.assertIsNone(f("https://gitlab.com/../app"))
+            self.assertIsNone(f(""))
+
+
 class TestRefreshPrStatus(ManagerMixin, unittest.TestCase):
     """The manager's slow-cadence PR status refresh + per-session attachment."""
 
