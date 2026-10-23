@@ -19300,6 +19300,10 @@ _PANE_PICKER_CURSOR_RE = re.compile(r"^\s+❯(?:\s|$)")
 # A picker's search box top: an indented rounded box ("No matching prompts"
 # leaves the history search no cursor row, only its "⌕" box below).
 _PANE_PICKER_BOX_RE = re.compile(r"^\s+╭─+(?:╮)?$")
+# The history search's title as the area's FIRST line ("Search prompts ·
+# everywhere", cut to "Search" at 10 columns): at ≤8 rows a no-match search
+# draws nothing else (QA, 26x8 / 60x6).
+_PANE_HISTORY_TITLE_RE = re.compile(r"^\s+Search(?:\s|$)")
 
 
 def _pane_overlay_up(cap):
@@ -19316,7 +19320,8 @@ def _pane_overlay_up(cap):
     prompt line, "!" in shell mode) and no rule at column 0, no
     mode/shell/qwen footer, no exit toast. Then under a ▔ edge any content is
     an overlay; under a "─" rule (the composer's own top edge too) only a
-    picker's indented "❯" cursor row or rounded search box says so."""
+    picker's indented "❯" cursor row, rounded search box, or the history
+    search's title as the area's first line says so."""
     if not cap:
         return False
     lines = [_PANE_SCROLLBAR_RE.sub("", line).rstrip()
@@ -19341,8 +19346,9 @@ def _pane_overlay_up(cap):
             or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
             or PANE_SHELL_FOOTER_RE.search(text) or _pane_composer_tail_up(lines)):
         return False
-    return edged or any(_PANE_PICKER_CURSOR_RE.match(line) or _PANE_PICKER_BOX_RE.match(line)
-                        for line in area)
+    return (edged or bool(_PANE_HISTORY_TITLE_RE.match(area[0]))
+            or any(_PANE_PICKER_CURSOR_RE.match(line) or _PANE_PICKER_BOX_RE.match(line)
+                   for line in area))
 
 
 def _answer_trust_dialog(tmux_name, cap=None):

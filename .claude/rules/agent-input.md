@@ -66,7 +66,8 @@ composed.**
     - An overlay whose footer is off-screen (Ctrl-R history search below ~120x40, a short
       /resume picker) is read by its area (`_pane_overlay_up`, XERK-2203): under a ▔ edge with
       no composer there, or under the last column-0 rule with an INDENTED `❯` cursor row or
-      rounded search box (a no-match search has no cursor row).
+      rounded search box, or with the history search's "Search" title as its first line (a
+      no-match search at ≤8 rows draws nothing else).
       Tests: `TestOverlayWithItsFooterCut`.
   - **The dialog check runs before EVERY write, not once per message** (`_slice_gate`): before
     each later slice, send-keys chunk and Enter, on tmux and Windows, whether or not draws are

@@ -11341,11 +11341,21 @@ class TestOverlayWithItsFooterCut(unittest.TestCase):
                            "  Search prompts · everywhere\n  No matching prompts\n\n"
                            "  ╭" + "─" * 114 + "╮\n")
 
+    # The same at ≤8 rows: only the title and "No matching prompts" are drawn.
+    HIST_NO_MATCH_26x8 = ("           /…/q2203/proj\n\n\n" + "─" * 26 + "\n"
+                          "  Search prompts ·\n  everywhere\n  No matching prompts\n")
+    HIST_NO_MATCH_60x6 = (" ▝▝   ▝▝   /tmp/claude-0/q2203/proj\n\n\n" + "─" * 60 + "\n"
+                          "  Search prompts · everywhere\n  No matching prompts\n")
+
     def test_a_history_search_with_no_match_blocks(self):
-        self.assertTrue(ha._pane_blocking_dialog(self.HIST_NO_MATCH_120x8))
+        for name in ("HIST_NO_MATCH_120x8", "HIST_NO_MATCH_26x8", "HIST_NO_MATCH_60x6"):
+            self.assertTrue(ha._pane_blocking_dialog(getattr(self, name)), name)
+        # Only as the area's first line: a later "Search …" row says nothing.
+        self.assertFalse(ha._pane_overlay_up(
+            "─" * 26 + "\n  No matching prompts\n  Search prompts\n"))
 
     def test_under_a_rule_only_the_cursor_row_says_overlay(self):
-        cap = self.HIST_26x8.replace("  ❯ limits", "    limits")
+        cap = self.HIST_26x8.replace("  ❯ limits", "    limits").replace("  Search", "  Find")
         self.assertFalse(ha._pane_overlay_up(cap))
 
     def test_a_stale_edge_above_the_composer_is_no_overlay(self):
