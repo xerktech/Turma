@@ -22,8 +22,8 @@ machinery is in `.claude/rules/turma-board.md`.
   (`TRIAGE_ACTIONS_MAX`, 500; oldest `at` evicted). The operator's per-ticket verdict on the
   auto stream.
 - **`triagePolicies`** (`TRIAGE_POLICIES_FILE`, `/data/triage-policies.json`):
-  `siteKey -> {minPriority?, excludeTypes?, repoAllow?, repoDeny?, rateMax?}` — the per-org knobs
-  shaping WHAT an enabled org auto-starts. The `/autostart` on/off switch is still the master
+  `siteKey -> {minPriority?, excludeTypes?, repoAllow?, repoDeny?, rateMax?, includeNotActionable?}`
+  — the per-org knobs shaping WHAT an enabled org auto-starts. The `/autostart` on/off switch is still the master
   gate; the policy only adds constraints (an org with no policy object is unrestricted).
 - Both are hub-owned exactly like the agent/model/runtime pins: **no agent-side flag, no tracker
   write**, so a verdict or policy takes effect with the org's hosts fully offline. Both ride the
@@ -44,11 +44,14 @@ machinery is in `.claude/rules/turma-board.md`.
 
 ## Org triage policy — `POST /api/jira/<site>/triage-policy`
 
-- Body is a patch of the five knobs; `null` clears one. `minPriority` auto-starts that band and
+- Body is a patch of the six knobs; `null` clears one. `minPriority` auto-starts that band and
   higher (P0 > P1 > P2 > P3); `excludeTypes` are triage types never auto-started; `repoDeny`
   beats `repoAllow` (a non-empty allow list restricts to it); `rateMax` (int 1..50) overrides
   `TICKET_QUEUE_RATE_MAX` for that org's window — the window length itself stays shared.
   `sanitizeTriagePolicy` coerces; `400` when a knob is malformed.
+- `includeNotActionable: true` (XERK-2209) is the one knob that LOOSENS: it lifts the "not
+  actionable" half of the retriage gate for that org (untriaged and duplicate still gate). `false`
+  clears it; only `true` is stored.
 
 ## The lane and the chip (board UI)
 
@@ -110,8 +113,15 @@ attempt** (no retry budget burned, exactly like a repo-less ticket):
      triage policy instead.
 1. **Repo present and not ignore-tier** (`repoGuess` or a manual pin; `isRepoIgnored`). Applies
    even to an `approve`.
-2. **Retriage gate** (`triageGateReason`): no `triage` block → "untriaged"; `actionable !== true`
-   → "not actionable"; `dedupeOf` set → "duplicate". An explicit `approve` overrides it.
+2. **Retriage gate** (`triageGateReason(t, siteKey, rows)`): no `triage` block → "untriaged";
+   `actionable !== true` → "not actionable" (unless the org's `includeNotActionable`); `dedupeOf`
+   set → "duplicate". An explicit `approve` overrides it. Sweep, drain, Next-up and
+   `autoStartContentGate` all call this one function — never re-inline the checks.
+   - **A duplicate gates only while its twin is on the board and not Done** (XERK-2209). The verdict
+     is a snapshot and the ledger re-triages only on the ticket's own text, so a closed twin used to
+     gate its duplicate forever. A twin no longer listed counts as closed — unless one of the org's
+     `jira` blocks is `truncated`, where it may just be past the agent's cap (`duplicateTwinOpen`). Without `rows` the
+     verdict is taken as-is.
 3. **Operator verdict**: `hold`/`reject` drops the auto entry with no churn.
 4. **Org policy** (`triagePolicyReason`); the first violated knob is reported. `approve` bypasses.
 5. **Host routing** (`findTicketHost`; capacity clears `blockedSince`, a routing failure HOLDS up

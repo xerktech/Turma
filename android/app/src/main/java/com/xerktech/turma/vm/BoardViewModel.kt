@@ -578,7 +578,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Patch an org's triage policy (XERK-486): the knobs the hub's auto-start
-     * sweep applies after the triage gate. All five knobs are sent (full patch,
+     * sweep applies after the triage gate. All six knobs are sent (full patch,
      * like the web's savePolicy): [minPriority] null = any priority, [rateMax]
      * null = the hub's default cap; empty lists mean unconstrained. Returns the
      * hub's own words on a refusal, null on success (the nudge pulls the merged
@@ -591,6 +591,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         repoAllow: List<String>,
         repoDeny: List<String>,
         rateMax: Int?,
+        includeNotActionable: Boolean,
     ): String? {
         val body = buildJsonObject {
             put("minPriority", minPriority?.let { JsonPrimitive(it) } ?: JsonNull)
@@ -598,6 +599,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
             put("repoAllow", buildJsonArray { repoAllow.forEach { add(JsonPrimitive(it)) } })
             put("repoDeny", buildJsonArray { repoDeny.forEach { add(JsonPrimitive(it)) } })
             put("rateMax", rateMax?.let { JsonPrimitive(it) } ?: JsonNull)
+            put("includeNotActionable", if (includeNotActionable) JsonPrimitive(true) else JsonNull)
         }
         return try {
             val r = container.client.api.setTriagePolicy(siteKey, body)

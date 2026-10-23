@@ -539,11 +539,13 @@ const AUTOSTART_ORGS_FILE = process.env.AUTOSTART_ORGS_FILE || "/data/autostart-
 // Per-org triage policy (XERK-486 [F]): the knobs that govern WHAT an org's
 // auto stream will start, now that the single on/off switch (autoStartOrgs) has
 // become "policy enabled". siteKey -> {minPriority?, excludeTypes?, repoAllow?,
-// repoDeny?, rateMax?}. minPriority: auto-start this band and higher (P0 > P1 >
+// repoDeny?, rateMax?, includeNotActionable?}. minPriority: auto-start this band and higher (P0 > P1 >
 // P2 > P3); excludeTypes: triage types never auto-started; repoAllow: only these
 // repos auto-start (empty = any); repoDeny: these repos never auto-start (wins
 // over allow); rateMax: per-org auto dispatches per rate window (defaults to
-// TICKET_QUEUE_RATE_MAX). Hub-owned durable state like autostart-orgs.json:
+// TICKET_QUEUE_RATE_MAX); includeNotActionable: also auto-start tickets the
+// triage model judged not actionable (XERK-2209 — the one knob that LOOSENS the
+// triage gate rather than adding a constraint). Hub-owned durable state like autostart-orgs.json:
 // per-org, tiny, must survive a hub restart, rides the fleet payload + SSE.
 const TRIAGE_POLICIES_FILE = process.env.TRIAGE_POLICIES_FILE || "/data/triage-policies.json";
 // The routing policy's promotions and demotions (XERK-1848).
@@ -2848,6 +2850,7 @@ const triagePoliciesCoerce = (raw) => {
         if (Array.isArray(v.repoAllow)) p.repoAllow = v.repoAllow.filter(x => typeof x === "string");
         if (Array.isArray(v.repoDeny)) p.repoDeny = v.repoDeny.filter(x => typeof x === "string");
         if (Number.isInteger(v.rateMax) && v.rateMax >= 1 && v.rateMax <= 50) p.rateMax = v.rateMax;
+        if (v.includeNotActionable === true) p.includeNotActionable = true;
       }
       if (Object.keys(p).length) out[k] = p;
     }
@@ -2877,6 +2880,10 @@ function sanitizeTriagePolicy(patch) {
   if ("rateMax" in patch) {
     if (patch.rateMax != null && (!Number.isInteger(patch.rateMax) || patch.rateMax < 1 || patch.rateMax > 50)) return null;
     p.rateMax = patch.rateMax || null;
+  }
+  if ("includeNotActionable" in patch) {
+    if (patch.includeNotActionable != null && typeof patch.includeNotActionable !== "boolean") return null;
+    p.includeNotActionable = patch.includeNotActionable === true ? true : null;
   }
   return p;
 }
@@ -14487,7 +14494,7 @@ function drainTicketQueue() {
       ? ticketTriageAction(e.siteKey, e.issueKey)
       : null;
     if (e.source === "auto" && triageAction !== "approve" && row.triage &&
-        (row.triage.actionable !== true || row.triage.dedupeOf)) {
+        triageGateReason(row, e.siteKey, rows)) {
       drop("its triage no longer says actionable");
       continue;
     }
@@ -15092,19 +15099,41 @@ function reclaimStrandedTicketSpawns() {
 // null when it may. Triage (XERK-481/482) is the hub's only evidence that a
 // ticket is worth a session, so the sweep acts on its verdict:
 //   no triage block at all  -> "untriaged"   (the model hasn't assessed it)
-//   actionable !== true     -> "not actionable" (the model held or rejected it)
-//   dedupeOf set            -> "duplicate"   (a confirmed duplicate of another ticket)
+//   actionable !== true     -> "not actionable" (the model held or rejected it),
+//                              unless the org policy's includeNotActionable is on
+//   dedupeOf set            -> "duplicate"   (a confirmed duplicate of another ticket),
+//                              only while that twin is still OPEN on the board
 // A gated ticket still renders on the board — it simply is never swept, and
 // spends no attempt, exactly like a ticket with no triaged repo. The block was
 // coerced at ingest (sanitizeTicketTriage), so `actionable` is a strict boolean
 // when present and `dedupeOf` a string when present; a host that sent junk has
 // already had it dropped at the door.
-function triageGateReason(t) {
+// XERK-2209: a verdict is a snapshot from when the ticket was triaged, and the
+// ledger only re-triages on a change to the ticket's OWN text — so a twin that
+// was since closed would gate its duplicate forever. With `rows` (the board's
+// fleetTicketRows) the duplicate gate holds only while the twin is listed and
+// not Done; a twin no longer listed has left the board (closed and aged out of
+// the Done window, or reassigned), so it no longer gates either — unless one of
+// the org's blocks was truncated, where an absent twin may simply be past the cap.
+function triageGateReason(t, siteKey, rows) {
   const tri = t && typeof t === "object" ? t.triage : null;
   if (!tri || typeof tri !== "object" || Array.isArray(tri)) return "untriaged";
-  if (tri.actionable !== true) return "not actionable";
-  if (tri.dedupeOf) return "duplicate";
+  const policy = siteKey != null ? triagePolicies[siteKey] : null;
+  if (tri.actionable !== true && !(policy && policy.includeNotActionable === true)) {
+    return "not actionable";
+  }
+  if (tri.dedupeOf && (!rows || duplicateTwinOpen(siteKey, tri.dedupeOf, rows))) {
+    return "duplicate";
+  }
   return null;
+}
+
+// Is the ticket a duplicate verdict points at still open on the board?
+function duplicateTwinOpen(siteKey, twinKey, rows) {
+  const hit = rows.get(ticketQueueKey(siteKey, twinKey));
+  if (hit && hit.row) return hit.row.statusCategory !== "done";
+  return Object.values(agents).some((a) => a && a.jira && a.jira.siteKey === siteKey
+    && decidedOrgOf(a) === siteKey && a.jira.truncated === true);
 }
 
 // XERK-1567: the auto stream's order key, as a comparable array over a ticket
@@ -15279,7 +15308,7 @@ function autoStartSweep() {
       // like a ticket with no triaged repo. An explicit operator approve
       // (XERK-486) overrides it. Throttled: this is a state line, re-derived
       // every 15s.
-      const gated = action === "approve" ? null : triageGateReason(t);
+      const gated = action === "approve" ? null : triageGateReason(t, siteKey, rows);
       if (gated) {
         logQueueState(`held\x00${siteKey}\x00${logName(t.key)}`,
           `auto-start: ${logName(t.key)} is ${gated} — not swept, no attempt spent`);
@@ -15681,7 +15710,7 @@ function markResumedTicketAutoStopExempt(host, sessionId) {
 // human started a session on by hand (it fails the org's triage type/policy).
 // `autoStartSweep` keeps its own inline gates (their per-drop log lines differ);
 // a cross-check test pins that this composition agrees with that one.
-function autoStartContentGate(siteKey, t, repo) {
+function autoStartContentGate(siteKey, t, repo, rows) {
   if (!repo || isRepoIgnored(repo)) return { kind: "repo", reason: "no eligible repo" };
   if (!t || !t.key) return { kind: "repo", reason: "no ticket row" };
   // XERK-635: an epic or an epic child is never eligible for the org auto stream —
@@ -15692,7 +15721,7 @@ function autoStartContentGate(siteKey, t, repo) {
   if (action === "hold" || action === "reject") {
     return { kind: "triaged", reason: `${action} by triage` };
   }
-  const gated = action === "approve" ? null : triageGateReason(t);
+  const gated = action === "approve" ? null : triageGateReason(t, siteKey, rows);
   if (gated) return { kind: "held", reason: gated };
   const policyReason = action === "approve"
     ? null
@@ -15732,7 +15761,7 @@ function autoMergeSession(a, s, byKey, rows) {
   // already-Done ticket either.)
   if (row.statusCategory === "done") return null;
   const repo = ticketRepo(siteKey, t.key, rows);
-  if (autoStartContentGate(siteKey, row, repo)) return null;
+  if (autoStartContentGate(siteKey, row, repo, rows)) return null;
   return { siteKey, key: t.key, row, repo };
 }
 
@@ -16699,7 +16728,7 @@ function compileBrief(siteKey, now, trigger, prevList) {
       const action = ticketTriageAction(siteKey, t.key);
       if (action === "hold" || action === "reject") continue;
       if (action !== "approve"
-        && (triageGateReason(t) || triagePolicyReason(siteKey, t.triage, repo))) continue;
+        && (triageGateReason(t, siteKey, rows) || triagePolicyReason(siteKey, t.triage, repo))) continue;
       if (spawnTicketInFlight(siteKey, t.key)) continue;
       // The sweep holds a ticket in its retry backoff: still in line, but say so.
       const prior = autoStarted.get(siteKey + "\x00" + t.key);
@@ -22605,7 +22634,7 @@ const server = http.createServer(async (req, res) => {
 
     // POST /api/jira/<siteKey>/triage-policy — upsert an org's triage policy
     // (XERK-486 [F]). Body: a patch of {minPriority?, excludeTypes?, repoAllow?,
-    // repoDeny?, rateMax?}; null values clear a knob. Hub-owned durable state
+    // repoDeny?, rateMax?, includeNotActionable?}; null values clear a knob. Hub-owned durable state
     // like /autostart: authoritative on return, the org must be one the fleet
     // reports, the host need not be online. The auto-start switch itself stays
     // the on/off gate; this only shapes WHAT an enabled org auto-starts.
@@ -22616,7 +22645,7 @@ const server = http.createServer(async (req, res) => {
       const p = sanitizeTriagePolicy(body);
       if (p === null) {
         return json(res, 400, {
-          error: "policy knobs must be {minPriority:P0|P1|P2|P3|null, excludeTypes:string[]|null, repoAllow:string[]|null, repoDeny:string[]|null, rateMax:int 1..50|null}",
+          error: "policy knobs must be {minPriority:P0|P1|P2|P3|null, excludeTypes:string[]|null, repoAllow:string[]|null, repoDeny:string[]|null, rateMax:int 1..50|null, includeNotActionable:boolean|null}",
         });
       }
       if (!Object.values(agents).some(
