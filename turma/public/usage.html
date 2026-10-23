@@ -100,9 +100,9 @@
   .lim-row.expired .lim-fill { background: var(--muted); }
   .lim-row.expired .lim-pct { color: var(--muted); }
   /* Even-pace day markers on the 7-day bar (XERK-536): a REFERENCE GRID, not a
-     limit — nothing here is enforced. Seven 1/7 daily boundaries (ticks), a
-     weekday label under each day, and a continuous "pace line" at the fraction
-     of the week elapsed. The gap between the fill and the pace line is how much
+     limit — nothing here is enforced. Local-midnight boundaries (ticks), a
+     weekday label under each day, and a line at NOW, the fraction of the week
+     elapsed. The gap between the fill and the pace line is how much
      of an even 1/7-per-day budget is still available today. */
   .lim-track { position: relative; }
   /* A daily boundary, drawn in the card colour so it reads as a notch across
@@ -121,10 +121,12 @@
     display: flex; margin-top: 3px; font-size: 10px; color: var(--muted);
     font-variant-numeric: tabular-nums; line-height: 1.2;
   }
-  /* Seven equal columns, so each label centres over its own 1/7 slice — the
-     same geometry the ticks divide the bar into. */
-  .lim-day { flex: 1 1 0; min-width: 0; text-align: center; }
-  .lim-day.today { color: var(--accent); font-weight: 600; }
+  /* Each column grows by its day's share of the week (inline flex-grow), so a
+     label centres over the same span the ticks cut; clip rather than crowd a
+     neighbour should a short label still not fit. */
+  .lim-day { flex: 1 1 0; min-width: 0; text-align: center; overflow: hidden; white-space: nowrap; }
+  /* Today never clips: a sliver of a day widens to fit its name. */
+  .lim-day.today { color: var(--accent); font-weight: 600; min-width: max-content; }
   .lim-empty {
     color: var(--muted); font-size: 12.5px; background: var(--surface);
     border: 1px dashed var(--hairline); border-radius: var(--radius-md);
@@ -630,37 +632,39 @@ function limitWindowView(win, nowSec) {
   };
 }
 
-// The even-pace day markers overlaid on the 7-day WEEKLY bar (XERK-536). The
-// window is a fixed 7-day span ending at `resetsAt`, split into seven 1/7 slices
-// measured BACK from it (the boundary anchors to the reset stamp, not local
-// midnight). Returns the geometry a bar draws — the seven day cells (each with
-// its weekday label and whether NOW falls in it) and `paceFrac`, how far through
-// the whole week we are (the continuous "on-pace" line) — or null when the
-// window can't be paced: no reset stamp, no labels, or `now` outside the window
-// (already reset, which the caller also guards via `view.expired`).
-//
-// Everything here is ARITHMETIC on the reset stamp: which slice is "today" and
-// where the pace line sits are timezone-free and computed at RENDER time, so
-// they stay correct as the snapshot ages. Only the WEEKDAY NAMES depend on a
-// timezone, and those are computed by the reporting AGENT in ITS OWN local time
-// (`dayLabels`) — never here — so a viewer in another zone still sees the host's
-// days, and two bars never disagree about which day a boundary is.
-const SEVEN_DAY_SLICES = 7;
+// The day markers overlaid on the 7-day WEEKLY bar (XERK-536). The window is
+// the 7 days ending at `resetsAt`, cut at the VIEWER's local midnights, so each
+// cell is one calendar day and today's cell is today (a 24h slice anchored to
+// the reset stamp straddles two days and named "Thu" until mid-Friday). The
+// first and last cells are partial whenever the reset isn't at midnight (a DST
+// change inside the window shifts the reset off midnight too, adding a sliver),
+// so the bar has 7 to 9 cells. Returns
+// each cell (weekday label, cumulative 0..1 `end`, whether NOW falls in it) and
+// `paceFrac`, how far through the week NOW is — the line marking this moment,
+// which is also where an even pace would have the fill. null when the window
+// can't be paced: no reset stamp, or `now` outside it (already reset).
+const SEVEN_DAY_SECS = 7 * 86400;
+const WEEKDAY_ABBR = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 function sevenDayPacing(win, nowSec) {
   if (!win || typeof win.resetsAt !== "number") return null;
-  const labels = win.dayLabels;
-  if (!Array.isArray(labels) || labels.length !== SEVEN_DAY_SLICES) return null;
-  const windowLen = SEVEN_DAY_SLICES * 86400;
-  const windowStart = win.resetsAt - windowLen;
+  const windowStart = win.resetsAt - SEVEN_DAY_SECS;
   const elapsed = nowSec - windowStart;
-  if (elapsed < 0 || elapsed >= windowLen) return null;
-  const todayIdx = Math.min(SEVEN_DAY_SLICES - 1, Math.floor(elapsed / 86400));
-  const slices = labels.map((label, i) => ({
-    label,
-    end: (i + 1) / SEVEN_DAY_SLICES,   // cumulative 0..1 boundary after this day
-    isToday: i === todayIdx,
-  }));
-  return { slices, paceFrac: elapsed / windowLen };
+  if (elapsed < 0 || elapsed >= SEVEN_DAY_SECS) return null;
+  const slices = [];
+  let start = windowStart;
+  while (start < win.resetsAt) {
+    const d = new Date(start * 1000);
+    const midnight = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime() / 1000;
+    const end = Math.min(midnight, win.resetsAt);
+    slices.push({
+      label: WEEKDAY_ABBR[d.getDay()],
+      width: (end - start) / SEVEN_DAY_SECS,
+      end: (end - windowStart) / SEVEN_DAY_SECS,
+      isToday: nowSec >= start && nowSec < end,
+    });
+    start = end;
+  }
+  return { slices, paceFrac: elapsed / SEVEN_DAY_SECS };
 }
 
 const TOKEN_KEYS = ["input", "output", "cacheWrite", "cacheRead"];
@@ -1116,7 +1120,7 @@ function limitCard(group, nowSec) {
       const pacing = sevenDayPacing(held.win, nowSec);
       if (pacing) {
         for (const s of pacing.slices) {
-          // The 7th boundary is the bar's own right edge — no tick needed.
+          // The last boundary is the bar's own right edge — no tick needed.
           if (s.end < 1) {
             const tick = document.createElement("div");
             tick.className = "lim-tick";
@@ -1127,8 +1131,8 @@ function limitCard(group, nowSec) {
         const pace = document.createElement("div");
         pace.className = "lim-pace";
         pace.style.left = (pacing.paceFrac * 100) + "%";
-        pace.title = "On-pace line — an even 1/7 of the weekly limit per day. "
-          + "Fill ahead of it is faster than even pace; behind it is banked "
+        pace.title = "Now — also the on-pace line for an even 1/7 of the weekly limit "
+          + "per day. Fill ahead of it is faster than even pace; behind it is banked "
           + "headroom. Informational only; nothing is throttled.";
         track.append(pace);
 
@@ -1137,7 +1141,10 @@ function limitCard(group, nowSec) {
         for (const s of pacing.slices) {
           const d = document.createElement("span");
           d.className = "lim-day" + (s.isToday ? " today" : "");
-          d.textContent = s.label;
+          d.style.flexGrow = s.width;
+          // A sliver of a partial day is left unlabelled (clipped it reads "We"),
+          // unless it is today: today always carries its name.
+          d.textContent = s.isToday || s.width * 7 >= 0.5 ? s.label : "";
           days.append(d);
         }
         row.append(days);

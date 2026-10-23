@@ -914,34 +914,107 @@ test("limitWindowView has nothing to draw without a percentage", () => {
   assert.equal(H.limitWindowView(null, NOW), null);
 });
 
-// --- the 7-day even-pace day markers (XERK-536) ------------------------------
-// Seven days ending at `resetsAt`, the labels sent by the agent (its own zone).
+// --- the 7-day day markers (XERK-536) ----------------------------------------
+// Seven days ending at `resetsAt`, cut at the viewer's local midnights. Asserted
+// against local Date arithmetic, so the cases hold in whatever TZ the run uses.
 const DAY = 86400;
-const LABELS = ["Wed", "Thu", "Fri", "Sat", "Sun", "Mon", "Tue"];
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const localMidnight = (sec) => { const d = new Date(sec * 1000); d.setHours(0, 0, 0, 0); return d.getTime() / 1000; };
 
-test("sevenDayPacing places today's slice and the pace line by the reset stamp", () => {
-  // NOW sits 2.5 days into a window that resets in 4.5 days.
-  const resetsAt = NOW + 4.5 * DAY;
-  const p = H.sevenDayPacing({ resetsAt, dayLabels: LABELS }, NOW);
-  assert.equal(p.slices.length, 7);
-  assert.deepEqual(p.slices.map((s) => s.label), LABELS);
-  // Boundaries are the cumulative 1/7 fractions.
-  assert.deepEqual(p.slices.map((s) => Math.round(s.end * 7)), [1, 2, 3, 4, 5, 6, 7]);
-  // 2.5 days elapsed → the current slice is index 2 (the third day).
-  assert.deepEqual(p.slices.map((s) => s.isToday), [false, false, true, false, false, false, false]);
-  // The continuous pace line is the fraction of the whole week elapsed.
-  assert.ok(Math.abs(p.paceFrac - 2.5 / 7) < 1e-9);
+test("sevenDayPacing cuts the week at local midnights and marks today's calendar day", () => {
+  // The reset lands mid-afternoon, so the first and last days are partial.
+  const resetsAt = localMidnight(NOW + 4 * DAY) + 15.5 * 3600;
+  const p = H.sevenDayPacing({ resetsAt }, NOW);
+  const start = resetsAt - 7 * DAY;
+  assert.equal(p.slices.length, 8);
+  // Every internal boundary is a local midnight; the last is the reset itself.
+  for (const s of p.slices.slice(0, -1)) {
+    const at = new Date((start + s.end * 7 * DAY) * 1000);
+    assert.deepEqual([at.getHours(), at.getMinutes()], [0, 0]);
+  }
+  assert.ok(Math.abs(p.slices.at(-1).end - 1) < 1e-9);
+  assert.ok(Math.abs(p.slices.reduce((n, s) => n + s.width, 0) - 1) < 1e-9);
+  // The partial first and last cells are the reset's weekday.
+  const resetDay = WEEKDAYS[new Date(resetsAt * 1000).getDay()];
+  assert.equal(p.slices[0].label, resetDay);
+  assert.equal(p.slices.at(-1).label, resetDay);
+  // Today is the cell named after NOW's own weekday — the one bug this fixes.
+  const today = p.slices.filter((s) => s.isToday);
+  assert.equal(today.length, 1);
+  assert.equal(today[0].label, WEEKDAYS[new Date(NOW * 1000).getDay()]);
+  // The line is NOW: the fraction of the week elapsed.
+  assert.ok(Math.abs(p.paceFrac - (NOW - start) / (7 * DAY)) < 1e-9);
 });
 
-test("sevenDayPacing needs a reset stamp and exactly seven labels", () => {
-  assert.equal(H.sevenDayPacing({ dayLabels: LABELS }, NOW), null);
-  assert.equal(H.sevenDayPacing({ resetsAt: NOW + DAY }, NOW), null);
-  assert.equal(H.sevenDayPacing({ resetsAt: NOW + DAY, dayLabels: ["Mon"] }, NOW), null);
+test("sevenDayPacing draws seven whole days when the reset is at midnight", () => {
+  const p = H.sevenDayPacing({ resetsAt: localMidnight(NOW + 3 * DAY) }, NOW);
+  // NOW is in August, so no DST change falls inside this window.
+  assert.equal(p.slices.length, 7);
+  assert.equal(p.slices.filter((s) => s.isToday).length, 1);
+});
+
+test("sevenDayPacing marks today exactly at a midnight boundary, never twice", () => {
+  const resetsAt = localMidnight(NOW + 3 * DAY) + 12 * 3600;
+  const midnight = localMidnight(NOW);
+  const p = H.sevenDayPacing({ resetsAt }, midnight);
+  const today = p.slices.filter((s) => s.isToday);
+  assert.equal(today.length, 1);
+  assert.equal(today[0].label, WEEKDAYS[new Date(midnight * 1000).getDay()]);
+});
+
+test("sevenDayPacing keeps one today across a DST change inside the window", () => {
+  // US DST ends 2026-11-01 and starts 2027-03-14; Node honours a runtime TZ.
+  const prev = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    for (const iso of ["2026-11-03T00:00:00", "2026-11-04T15:30:00", "2027-03-16T00:00:00"]) {
+      const resetsAt = new Date(iso).getTime() / 1000;
+      for (let now = resetsAt - 7 * DAY; now < resetsAt; now += 1800) {
+        const p = H.sevenDayPacing({ resetsAt }, now);
+        const today = p.slices.filter((s) => s.isToday);
+        assert.equal(today.length, 1, iso + " @ " + now);
+        assert.equal(today[0].label, WEEKDAYS[new Date(now * 1000).getDay()], iso + " @ " + now);
+        assert.ok(Math.abs(p.slices.reduce((n, s) => n + s.width, 0) - 1) < 1e-9);
+      }
+    }
+    // A midnight reset across spring-forward gains a 1h sliver: 8 cells, not 7.
+    assert.equal(H.sevenDayPacing({ resetsAt: new Date("2027-03-16T00:00:00").getTime() / 1000 },
+      new Date("2027-03-12T12:00:00").getTime() / 1000).slices.length, 8);
+  } finally {
+    if (prev === undefined) delete process.env.TZ; else process.env.TZ = prev;
+  }
+});
+
+test("a partial day's label is blank as a sliver but always shown when it is today", () => {
+  const dayCells = (resetsAt, now) => {
+    const card = H.limitCard(H.limitGroups([
+      { device: "h", subscription: { key: "k1" }, limits: {
+        capturedAt: now, sevenDay: { usedPct: 40, resetsAt } } },
+    ], now)[0], now);
+    const walk = (el) => [el, ...(el.children || []).flatMap(walk)];
+    return walk(card).filter((el) => (el.className || "").split(" ").includes("lim-day"));
+  };
+  // Reset 2h after local midnight: the last cell is a 2h sliver.
+  const resetsAt = localMidnight(NOW + 3 * DAY) + 2 * 3600;
+  const far = dayCells(resetsAt, NOW);
+  assert.equal(far.at(-1).textContent, "");
+  // Columns grow by their share of the week, so the sliver is narrow.
+  assert.ok(Math.abs(Number(far.at(-1).style.flexGrow) - 2 / 168) < 1e-9);
+  // An hour into that sliver it is today, and today always carries its name.
+  const inSliver = resetsAt - 3600;
+  const near = dayCells(resetsAt, inSliver);
+  assert.equal(near.at(-1).className, "lim-day today");
+  assert.equal(near.at(-1).textContent, WEEKDAYS[new Date(inSliver * 1000).getDay()]);
+});
+
+test("sevenDayPacing needs a reset stamp", () => {
+  assert.equal(H.sevenDayPacing({}, NOW), null);
+  assert.equal(H.sevenDayPacing(null, NOW), null);
 });
 
 test("sevenDayPacing gives up on a window that has already reset", () => {
   // Past the reset there is no pace to show; the caller also greys the bar.
-  assert.equal(H.sevenDayPacing({ resetsAt: NOW - 60, dayLabels: LABELS }, NOW), null);
+  assert.equal(H.sevenDayPacing({ resetsAt: NOW - 60 }, NOW), null);
 });
 
 test("the 7-day bar draws day markers, a pace line and labels; the 5-hour bar does not", () => {
@@ -949,31 +1022,30 @@ test("the 7-day bar draws day markers, a pace line and labels; the 5-hour bar do
     { device: "h", subscription: { key: "k1" }, limits: {
       capturedAt: NOW,
       fiveHour: { usedPct: 20, resetsAt: NOW + 3600 },
-      sevenDay: { usedPct: 40, resetsAt: NOW + 4.5 * DAY, dayLabels: LABELS },
+      sevenDay: { usedPct: 40, resetsAt: localMidnight(NOW + 4 * DAY) },
     } },
   ], NOW)[0], NOW);
   const walk = (el) => [el, ...(el.children || []).flatMap(walk)];
   const nodes = walk(card);
   const cls = (name) => nodes.filter((el) => (el.className || "").split(" ").includes(name));
-  // Six internal ticks (the 7th boundary is the bar's own right edge), one pace
-  // line, and a seven-cell label row — all belonging to the 7-day window only.
+  // A midnight reset: six internal ticks (the 7th boundary is the bar's own
+  // right edge), one NOW line, and a seven-cell label row — 7-day window only.
   assert.equal(cls("lim-tick").length, 6);
   assert.equal(cls("lim-pace").length, 1);
   assert.equal(cls("lim-day").length, 7);
   assert.equal(cls("lim-day").filter((el) => (el.className || "").includes("today")).length, 1);
-  assert.deepEqual(cls("lim-day").map((el) => el.textContent), LABELS);
+  assert.deepEqual(cls("lim-day").map((el) => el.textContent),
+    H.sevenDayPacing({ resetsAt: localMidnight(NOW + 4 * DAY) }, NOW).slices.map((s) => s.label));
 });
 
 test("the 5-hour bar stays plain even if its window carries day labels", () => {
-  // The guard is the WINDOW, not the hub stripping fiveHour.dayLabels: limitCard
-  // draws markers only for key === "sevenDay", so a fiveHour window fed labels
-  // (a shape normalizeLimits removes, pinned here in case a payload bypasses it)
-  // never sprouts a grid.
+  // The guard is the WINDOW: limitCard draws markers only for key ===
+  // "sevenDay", so a fiveHour window with a multi-day reset never sprouts a grid.
   const card = H.limitCard(H.limitGroups([
     { device: "h", subscription: { key: "k1" }, limits: {
       capturedAt: NOW,
-      fiveHour: { usedPct: 20, resetsAt: NOW + 4.5 * DAY, dayLabels: LABELS },
-      sevenDay: { usedPct: 40, resetsAt: NOW + 4.5 * DAY, dayLabels: LABELS },
+      fiveHour: { usedPct: 20, resetsAt: localMidnight(NOW + 4 * DAY), dayLabels: ["x"] },
+      sevenDay: { usedPct: 40, resetsAt: localMidnight(NOW + 4 * DAY) },
     } },
   ], NOW)[0], NOW);
   const nodes = [card, ...(function w(e){return (e.children||[]).flatMap((c)=>[c,...w(c)]);})(card)];
@@ -988,7 +1060,7 @@ test("an expired 7-day window draws no markers", () => {
   const card = H.limitCard(H.limitGroups([
     { device: "h", subscription: { key: "k1" }, limits: {
       capturedAt: NOW,
-      sevenDay: { usedPct: 40, resetsAt: NOW - 60, dayLabels: LABELS },
+      sevenDay: { usedPct: 40, resetsAt: NOW - 60 },
     } },
   ], NOW)[0], NOW);
   const nodes = [card, ...(function w(e){return (e.children||[]).flatMap((c)=>[c,...w(c)]);})(card)];
