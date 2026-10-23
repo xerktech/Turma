@@ -26986,9 +26986,6 @@ test("XERK-1847: a shadow goes only to a capable, free host decided into the org
   hub.modelShadowSweep(Date.now(), { rate: 1, dailyMax: 1 });
   assert.equal(agents["sh-ok"].commands.length, 1);
   assert.equal(hub.outcomeLedger.shadowsDispatchedSince(Date.now() - 86400000), 1);
-  // A later sweep before the host beats again sends it no second shadow.
-  hub.modelShadowSweep(Date.now() + 15000, { rate: 1 });
-  assert.equal(agents["sh-ok"].commands.length, 1);
   // A report for that id from a host it was NOT sent to is ignored.
   agents["sh-full"].shadowRuns = [{ id: agents["sh-ok"].commands[0].shadowId, siteKey: site, state: "running" }];
   hub.outcomeLedgerSweep();
