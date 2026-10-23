@@ -4867,8 +4867,10 @@ function shadowModelFor(cls, liveModel, pairs) {
 }
 
 // An online host DECIDED into the org, offering shadows, with the repo already
-// cloned (a shadow never clones on demand), a free slot, and a subscription not
-// paused; the most available wins.
+// cloned (a shadow never clones on demand), room for a shadow run, and a
+// subscription not paused; the most available wins. A shadow holds no session
+// slot on an agent reporting `modelShadow.free`, so that is its room; an older
+// agent counts shadows against its slots, so there it is a free slot.
 function shadowHostFor(site, repo, used, now) {
   const paused = pausedSubscriptions(now);
   let best = null, bestAvail = -Infinity;
@@ -4878,7 +4880,9 @@ function shadowHostFor(site, repo, used, now) {
     if (!(a.modelShadow && a.modelShadow.available === true)) continue;
     if ((a.defaultRuntime || "claude") !== "claude") continue;
     if (!(a.repos || []).some((r) => r && r.name === repo)) continue;
-    if (!hostHasFreeSlot(a) || hostAutoPaused(key, a, paused)) continue;
+    const free = a.modelShadow.free;
+    if (!(typeof free === "boolean" ? free : hostHasFreeSlot(a))) continue;
+    if (hostAutoPaused(key, a, paused)) continue;
     const avail = hostAvailability(a);
     if (avail > bestAvail) { best = key; bestAvail = avail; }
   }
@@ -8142,6 +8146,9 @@ function normalizeModelShadow(payload) {
     return;
   }
   payload.modelShadow = { available: t.available === true };
+  // Room for another run. A shadow holds no session slot on an agent that
+  // reports this, so the sampler reads it instead of `capacity`.
+  if (typeof t.free === "boolean") payload.modelShadow.free = t.free;
 }
 
 // The host's shadow-run reports (XERK-1847): [{id, siteKey, issueKey, state,
@@ -10873,6 +10880,12 @@ function normalizeSessions(payload) {
   // BEFORE the prototype-name filter below, whose Object.hasOwn would throw on it.
   const idOk = (s) => !("id" in s) || typeof s.id === "string" || typeof s.id === "number";
   if (!payload.sessions.every(idOk)) payload.sessions = payload.sessions.filter(idOk);
+  // A shadow run's session (XERK-1847) is never served: it is the hub's own
+  // evidence-gathering, reported as `shadowRuns`, and as a card it could be typed
+  // into or stopped. A current agent never sends one; an older agent still does.
+  if (payload.sessions.some((s) => s.shadow === true)) {
+    payload.sessions = payload.sessions.filter((s) => s.shadow !== true);
+  }
   // DROP a session whose id names an Object.prototype member (XERK-2193). The
   // hub keys plain-object maps by session id (heartbeatAlerts' alerts.sessions),
   // so an id of "__proto__" resolved to Object.prototype itself and every

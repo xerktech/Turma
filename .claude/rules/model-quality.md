@@ -178,7 +178,15 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     toward that cap (`shadowsDispatchedSince(since, now)`, XERK-1858).
   - Model: of `MODEL_SHADOW_MODELS` (sonnet,haiku), never the live family, fewest pairs for the
     class. Host: online, DECIDED into the org, `modelShadow.available`, repo cloned (a shadow
-    never clones), a free slot, claude default runtime, subscription not paused.
+    never clones), shadow room (`modelShadow.free`; an older agent: a free slot), claude
+    default runtime, subscription not paused.
+  - **A shadow is no operator session**: it holds NO `MAX_SESSIONS` slot (`_slots_used`,
+    `_running_count`, spawn's capacity gate skip it; `TURMA_MAX_SHADOW_RUNS`, default 1, bounds
+    placing+running+grading runs instead, reported as `modelShadow.free`) and is never on the wire
+    as a session: `sessions`/`closedSessions` drop it, its slug is kept out of the resume picker
+    (`_carded_slugs`) and the archive. `normalizeSessions` drops an older agent's `shadow:true`.
+    It surfaces only as `shadowRuns`. Tests: `test_a_shadow_is_never_reported_as_a_session`,
+    `test_a_host_carries_at_most_its_shadow_runs`.
   - `spawnShadow` carries a hub-minted `sh-<hex>` id; `observeShadows` takes a host's
     `shadowRuns` report only for an id dispatched to THAT host in THAT org. A grade is final.
   - **Shadow rows never feed the live groups or `/metrics`**; `aggregate().pairs` serves per
