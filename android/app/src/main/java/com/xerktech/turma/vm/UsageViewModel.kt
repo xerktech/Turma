@@ -415,7 +415,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val week: Long = 0,
         val total: Long = 0,
         val cache: CacheSummary = CacheSummary(),
-        /** Freshest snapshot first; empty when no host reports any window. */
+        /** Sorted by name; empty when no host reports any window. */
         val limits: List<LimitCard> = emptyList(),
         /** The delegated share of the spend above (XERK-302). */
         val subagent: SubagentSplit = SubagentSplit(),
@@ -663,8 +663,8 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         const val LIMIT_HOSTS_SHOWN = 3
 
         /**
-         * One card per SUBSCRIPTION that reports a usable snapshot, freshest
-         * first (web usage.html `limitGroups`).
+         * One card per SUBSCRIPTION that reports a usable snapshot, sorted by
+         * name (web usage.html `limitGroups`).
          *
          * A host reporting no snapshot is skipped entirely — an agent too old to
          * send the field, a login with no subscription windows, or one that
@@ -699,8 +699,8 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 a to lim
             }.sortedByDescending { (_, lim) -> lim.capturedAt }
 
-            // Insertion-ordered so ungrouped hosts keep their place among the
-            // groups; the sort at the end is what actually orders the cards.
+            // Insertion order is only the fold's; the sort at the end orders
+            // the cards.
             val groups = mutableListOf<MutableLimitGroup>()
             val byKey = mutableMapOf<String, MutableLimitGroup>()
             for ((a, lim) in ranked) {
@@ -738,7 +738,33 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                     fiveHourAt = if (g.fiveHour != null) g.fiveHourAt else g.capturedAt,
                     sevenDayAt = if (g.sevenDay != null) g.sevenDayAt else g.capturedAt,
                 )
-            }.sortedByDescending { it.capturedAt }
+            }.sortedWith(compareBy<LimitCard>({ limitSortKey(it).lowercase() }, { limitSortKey(it) })
+                .thenComparator { x, y -> compareHosts(limitHosts(x), limitHosts(y)) })
+        }
+
+        /**
+         * What a card sorts by (web usage.html `limitSortKey`): its subscription
+         * name, else its hosts. Freshest-first reshuffled the cards every time
+         * another host took a snapshot.
+         */
+        private fun limitSortKey(card: LimitCard): String =
+            card.label.ifBlank { limitHosts(card).joinToString(" ") }
+
+        /** A card's host names in alphabetical order (web `limitHosts`). */
+        private fun limitHosts(card: LimitCard): List<String> = card.hosts.map { it.host }.sorted()
+
+        /**
+         * The last tiebreak, host by host (web `limitNameOrder`): two Team seats
+         * are two subscriptions carrying one org name, and left tied they kept
+         * the fold's freshest-first order and swapped every beat. Compared as a
+         * list, never a joined string, which two different lists can share.
+         */
+        private fun compareHosts(x: List<String>, y: List<String>): Int {
+            for (i in 0 until minOf(x.size, y.size)) {
+                val c = x[i].compareTo(y[i])
+                if (c != 0) return c
+            }
+            return x.size - y.size
         }
 
         /** Accumulator behind [limitCards]; never leaves this file. */

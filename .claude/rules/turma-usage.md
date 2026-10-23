@@ -75,8 +75,14 @@ paths:
     `subscription.key`) — hosts sharing an account read one pool, so several cards would repeat one
     number. A host reporting none keeps its own card, never folded into another silent host.
     - Each window takes its **FRESHEST** reading (not average/max) — across a reset, the newest read
-      is the only right answer. **Both clients sort freshest-first, replacing only on a STRICTLY
+      is the only right answer. **Both clients FOLD freshest-first, replacing only on a STRICTLY
       newer read** — fold order or an equal timestamp resolves differently per client otherwise.
+    - **Cards sort by NAME, never by capture time** (`limitSortKey`, web + Android): the label,
+      else the card's hosts alphabetically. Freshest-first reshuffled them on every snapshot.
+      Freshest-first stays the FOLD order only.
+    - **A name tie breaks on the hosts, never left to the stable sort**: two Team seats are two
+      keys with one org name, and tied they kept fold order and swapped every beat. Tests: the
+      "tied on name" cases in `usage.test.js` / `UsageViewModelTest`.
     - **A card is NAMED by `subscription.label`** when the agent reports one (XERK-541,
       `subscriptionLabelOf`): the name heads the card and the AGENTS on it move into the heading's
       HOVER (a `title`; `.lim-host-named` carries the dotted-underline affordance) — not an inline
