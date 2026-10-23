@@ -28474,8 +28474,11 @@ class SessionManager:
 
     def _new_id(self):
         # Never a remembered shadow run's id (XERK-1847): commands naming one are
-        # refused and its conversation is never resumed or archived.
-        existing = {s.get("id") for s in self.registry} | set(self.shadow_sids)
+        # refused and its conversation is never resumed or archived. Nor a closed
+        # (resumable) record's: a second session under it would overwrite that
+        # record on kill, and a resume of it would start the wrong session.
+        existing = ({s.get("id") for s in self.registry} | set(self.shadow_sids)
+                    | {c.get("id") for c in self.closed})
         while True:
             sid = secrets.token_hex(3)[:5]
             if sid not in existing:

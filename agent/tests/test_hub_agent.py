@@ -52952,8 +52952,10 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         # refused as a shadow's, and its conversation never resumed.
         sm = self.make_manager()
         sm.shadow_sids = ["aaaaa"]
-        with mock.patch.object(ha.secrets, "token_hex", side_effect=["aaaaaa", "bbbbbb"]):
-            self.assertEqual(sm._new_id(), "bbbbb")
+        sm.closed = [{"id": "bbbbb"}]      # nor a killed, resumable record's
+        with mock.patch.object(ha.secrets, "token_hex",
+                               side_effect=["aaaaaa", "bbbbbb", "cccccc"]):
+            self.assertEqual(sm._new_id(), "ccccc")
 
     def test_a_host_carries_at_most_its_shadow_runs(self):
         sm = self.make_manager()
