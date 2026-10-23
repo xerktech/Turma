@@ -10467,6 +10467,9 @@ test("XERK-485: untriaged, non-actionable and duplicate tickets render but are n
       { key: "G-3", statusCategory: "todo",
         repoGuess: { repo: "Turma", cloned: true },
         triage: { priority: "P1", type: "bug", actionable: true, dedupeOf: "G-9" } },
+      { key: "G-9", statusCategory: "inprogress",
+        repoGuess: { repo: "Turma", cloned: true },
+        triage: { priority: "P1", type: "bug", actionable: true } },
       { key: "G-4", statusCategory: "todo",
         repoGuess: { repo: "Turma", cloned: true },
         triage: { priority: "P2", type: "task", actionable: true } },
@@ -11448,6 +11451,76 @@ test("XERK-486 [F]: the triage-policy route rejects bad knobs and a phantom org"
     { body: { minPriority: "P0" }, headers: userHeaders });
   assert.equal(r.status, 404);
   assert.equal("nobody486p.atlassian.net" in triagePolicies, false);
+});
+
+// XERK-2209: XerkTech's "include everything" policy still left non-epic To Do
+// tickets un-started — the triage gate (actionable / duplicate) sat outside the
+// policy's reach, and a duplicate verdict outlived the twin it pointed at.
+test("XERK-2209: a duplicate gates only while its twin is open on the board", async () => {
+  resetAutoStart();
+  resetTriagePolicy();
+  const site = "x2209d.atlassian.net";
+  const dup = (key, twin) => ({ key, statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true },
+    triage: { priority: "P2", type: "task", actionable: true, dedupeOf: twin } });
+  await asBeat("x2209d", site, { capacity: FULL, tickets: [
+    dup("DD-1", "DD-9"),       // twin Done -> no longer a duplicate
+    dup("DD-2", "DD-404"),     // twin gone from the board -> no longer a duplicate
+    dup("DD-3", "DD-8"),       // twin still open -> still a duplicate
+    { key: "DD-8", statusCategory: "inprogress", repoGuess: { repo: "Turma", cloned: true } },
+    { key: "DD-9", statusCategory: "done", repoGuess: { repo: "Turma", cloned: true } },
+  ] });
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  assert.deepEqual(ticketQueue.filter((e) => e.siteKey === site).map((e) => e.issueKey).sort(),
+    ["DD-1", "DD-2"]);
+  const rows = fleetTicketRows();
+  const row = (k) => [...rows.values()].find((r) => r.siteKey === site && r.key === k).row;
+  assert.equal(triageGateReason(row("DD-3"), site, rows), "duplicate");
+  assert.equal(triageGateReason(row("DD-1"), site, rows), null);
+  // The auto-merge content gate agrees with the sweep.
+  assert.equal(autoStartContentGate(site, row("DD-1"), "Turma", rows), null);
+  assert.equal(autoStartContentGate(site, row("DD-3"), "Turma", rows).reason, "duplicate");
+  // Without the board view (no rows) the verdict is taken as-is.
+  assert.equal(triageGateReason(row("DD-1")), "duplicate");
+  ticketQueue.length = 0;
+  resetAutoStart();
+});
+
+test("XERK-2209: includeNotActionable lets the org's auto stream start not-actionable tickets", async () => {
+  resetAutoStart();
+  resetTriagePolicy();
+  const site = "x2209n.atlassian.net";
+  await asBeat("x2209n", site, { capacity: FULL, tickets: [
+    { key: "NA-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: false } },
+    { key: "NA-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+  ] });
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  assert.equal(ticketQueue.filter((e) => e.siteKey === site).length, 0, "off by default");
+  const r = await request("POST", `/api/jira/${site}/triage-policy`,
+    { body: { includeNotActionable: true }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.policy, { includeNotActionable: true });
+  autoStartSweep();
+  // An UNTRIAGED ticket stays out: the knob loosens the verdict, not its absence.
+  assert.deepEqual(ticketQueue.filter((e) => e.siteKey === site).map((e) => e.issueKey), ["NA-1"]);
+  // The drain's re-check reads the same gate, so the entry is not dropped there.
+  drainTicketQueue();
+  assert.ok((agents.x2209n.commands || []).some((c) => c.issueKey === "NA-1")
+    || queuedTicket(site, "NA-1"), "kept through the drain");
+  for (const body of [{ includeNotActionable: "yes" }, { includeNotActionable: 1 }]) {
+    const bad = await request("POST", `/api/jira/${site}/triage-policy`, { body, headers: userHeaders });
+    assert.equal(bad.status, 400, JSON.stringify(body));
+  }
+  // false or null clears it.
+  const off = await request("POST", `/api/jira/${site}/triage-policy`,
+    { body: { includeNotActionable: false }, headers: userHeaders });
+  assert.equal(off.body.policy, null);
+  ticketQueue.length = 0;
+  resetAutoStart();
+  resetTriagePolicy();
 });
 
 test("POST /api/jira/<site>/<key>/triage needs the user login", async () => {

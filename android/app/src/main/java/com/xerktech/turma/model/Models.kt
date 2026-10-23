@@ -318,6 +318,8 @@ data class TriagePolicy(
     // Per-org auto-start rate cap (auto dispatches only, rolling window);
     // overrides the hub-wide default. Valid range 1..50.
     val rateMax: Int? = null,
+    // Also auto-start tickets the triage model judged not actionable (XERK-2209).
+    val includeNotActionable: Boolean = false,
 )
 
 /**

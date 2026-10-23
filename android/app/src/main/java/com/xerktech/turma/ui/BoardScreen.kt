@@ -2501,6 +2501,7 @@ private fun TriagePolicySheet(
     var repoAllow by remember { mutableStateOf("") }
     var repoDeny by remember { mutableStateOf("") }
     var rateMax by remember { mutableStateOf("") }
+    var includeNotActionable by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
 
@@ -2512,6 +2513,7 @@ private fun TriagePolicySheet(
         repoAllow = (p?.repoAllow.orEmpty()).joinToString(", ")
         repoDeny = (p?.repoDeny.orEmpty()).joinToString(", ")
         rateMax = p?.rateMax?.toString() ?: ""
+        includeNotActionable = p?.includeNotActionable == true
         error = ""
     }
 
@@ -2572,6 +2574,10 @@ private fun TriagePolicySheet(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = includeNotActionable, onCheckedChange = { includeNotActionable = it })
+                Text("Also auto-start tickets triage judged not actionable", style = MaterialTheme.typography.bodyMedium)
+            }
             if (error.isNotBlank()) ErrorRow(error)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") }
@@ -2596,6 +2602,7 @@ private fun TriagePolicySheet(
                                     repoAllow = repoAllow.split(",").map { it.trim() }.filter { it.isNotEmpty() },
                                     repoDeny = repoDeny.split(",").map { it.trim() }.filter { it.isNotEmpty() },
                                     rateMax = parsed,
+                                    includeNotActionable = includeNotActionable,
                                 )
                                 busy = false
                                 if (err != null) error = err else onDismiss()

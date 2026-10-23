@@ -1726,6 +1726,8 @@ function policyPanelHtml() {
       <input type="text" data-policy-deny="1" placeholder="acme/scratch" value="${esc(csv(p.repoDeny))}"></label>
     <label class="tp-field"><span>Max auto-starts per 15 min (empty = default)</span>
       <input type="number" min="1" max="50" data-policy-rate="1" value="${p.rateMax != null ? p.rateMax : ""}"></label>
+    <div class="tp-field"><label class="tp-check"><input type="checkbox" data-policy-notactionable="1"${p.includeNotActionable === true ? " checked" : ""}>
+      Also auto-start tickets triage judged not actionable</label></div>
     ${policyErr ? `<div class="tp-err">${esc(policyErr)}</div>` : ""}
     <div class="cf-actions">
       <button type="button" class="cf-btn" data-policy-cancel="1">Cancel</button>
@@ -1776,12 +1778,14 @@ function readPolicyPatch() {
   }
   const allow = csv($policyPanel.querySelector("[data-policy-allow]"));
   const deny = csv($policyPanel.querySelector("[data-policy-deny]"));
+  const notActionable = $policyPanel.querySelector("[data-policy-notactionable]");
   return {
     minPriority: (minP && minP.value) || null,
     excludeTypes: types.length ? types : null,
     repoAllow: allow.length ? allow : null,
     repoDeny: deny.length ? deny : null,
     rateMax: rate,
+    includeNotActionable: notActionable && notActionable.checked ? true : null,
   };
 }
 
