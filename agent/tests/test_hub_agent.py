@@ -46618,6 +46618,11 @@ class TestAgentTmuxSocket(unittest.TestCase):
         ha._probe_legacy_tmux({"agent-l"})
         os.unlink(os.path.join(self.tmp, f"tmux-{os.getuid()}", "default"))
         self._default("new-session", "-d", "-s", "mine", "sleep 30")
+        for _ in range(50):      # `env` may not have exec'd sleep with its id yet
+            held = ha._shadowed_tmux_sessions([["tmux"]])
+            if held and "l" in held[0]:
+                break
+            time.sleep(0.1)
         mgr = types.SimpleNamespace(
             registry=[{"id": "l", "status": "running", "tmuxName": "agent-l",
                        "worktreePath": self.tmp}],
