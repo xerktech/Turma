@@ -17588,7 +17588,7 @@ def _await_slice_drawn(tmux_name, typed, deadline):
     typing at once."""
     while True:
         cap = _capture_pane(tmux_name)
-        if _pane_blocking_dialog(cap):
+        if _pane_blocking_dialog(cap) or _pane_too_small(tmux_name, cap):
             return PANE_DIALOG
         split = _composer_split(cap)
         if split is None:
@@ -17943,8 +17943,10 @@ def _type_into_tmux_pane(tmux_name, text):
 
 
 def _dialog_up(tmux_name):
-    """One fresh read: does a dialog own this pane's keyboard right now?"""
-    return _pane_blocking_dialog(_capture_pane(tmux_name))
+    """One fresh read: does a dialog own this pane's keyboard right now, or is
+    the pane too small to tell (`_pane_too_small`)?"""
+    cap = _capture_pane(tmux_name)
+    return _pane_blocking_dialog(cap) or _pane_too_small(tmux_name, cap)
 
 
 def _slice_gate(tmux_name, typed, deadline, await_drawn):
@@ -17980,8 +17982,8 @@ def _lost_slice_landed(tmux_name, so_far, deadline):
 
 
 def _stopped_for_dialog(tmux_name, where, typed="", chip=False, budget=None):
-    log(f"typing into {tmux_name}: a dialog came up mid-message; stopped {where} "
-        f"and pressed nothing")
+    log(f"typing into {tmux_name}: a dialog came up mid-message (or the pane grew too "
+        f"small to read); stopped {where} and pressed nothing")
     if typed:
         _note_leftover(tmux_name, typed, chip, budget)
     return PANE_DIALOG
@@ -35958,7 +35960,8 @@ class SessionManager:
             # Deferred the same way; _apply_pending_switches waits it out too.
             sess["pendingModel"] = arg
             self.save()
-            log(f"set model of {sid} -> {arg}: a dialog is up; deferred until it closes")
+            log(f"set model of {sid} -> {arg}: a dialog is up (or the pane is too small to "
+                f"read); deferred until it clears")
             return
         if _composer_blocks_switch(_capture_pane_styled(tmux_name)):
             # The operator has a draft in the composer. "/model" + Enter would

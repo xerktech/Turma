@@ -93,13 +93,15 @@ composed.**
       Tests: `TestQwenHistorySearch`.
     - **A pane ≤4 rows or ≤9 columns is HELD, not read** (`_pane_too_small`, XERK-2222): there a
       dialog and an idle composer both draw nothing telling (8x4 MCP approval: "to/canc/el"; 8x4
-      idle: logo + rule, no `❯`). Checked before the first write, before the Enter, and in
-      set_model / deferred switches / pane `/rename`, unless the frame shows a composer box.
+      idle: logo + rule, no `❯`). Checked before every write and the Enter, and in set_model /
+      deferred switches / pane `/rename`, unless the frame shows a composer box.
       - Size is asked of tmux (`display-message`), never measured off the frame: a short frame is
         not a small pane. Can't tell, and Windows (no size from the pty-host), read as before.
       - Never in `paneDialog`: a tiny idle pane must not raise needs-you. Rejected: resizing the
         pane to read it (moves the operator's terminal) and carrying an earlier verdict (misses a
-        dialog that opens while tiny). Tests: `TestTinyPaneHolds`.
+        dialog that opens while tiny). Above the floor the XERK-2220 reads cover every live
+        2.1.309 frame QA swept (10-200 cols x 5-41 rows). Tests: `TestTinyPaneHolds`,
+        `TestSmallDialogShapes`.
   - **The dialog check runs before EVERY write, not once per message** (`_slice_gate`): before
     each later slice, send-keys chunk and Enter, on tmux and Windows, whether or not draws are
     still awaited. QA: a dialog drawn mid-message got the rest, and a last slice "1" approved

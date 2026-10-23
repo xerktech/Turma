@@ -11137,6 +11137,64 @@ TINY_BOXED_COMPOSER_40X4 = ("─" * 40 + "\n❯ \n" + "─" * 40
                             + "\n  ⏵⏵ auto mode on (shift+tab to cycle)\n")
 
 
+# XERK-2222 QA: live 2.1.309 frames of dialogs cut at small sizes, each of
+# which a typed message answered (approved the Bash call, submitted the
+# answers, filled the form's Name field).
+SUBAGENT_PERMISSION_15X5 = " Do you want\n to proceed?\n ❯ 1. Yes\n\n Esc to cance…\n"
+SUBAGENT_PERMISSION_12X20 = (
+    "     a9a88-b\n     ccb-4cb\n     9-a382-\n     c4fb745\n     67bd6/s\n"
+    "     cratchp\n     ad/w4\n   3.Yes,\n     and\n     switch\n     to auto\n"
+    "     mode ·\n     auto\n     mode\n     handles\n     these\n     prompts\n"
+    "   4. No\n     you\n Esc to ca…\n")
+REVIEW_120X9 = ("\n ● Pick a color\n   → Red\n ● Pick a size\n   → Small\n\n"
+                "Ready to submit your answers?\n\n❯ 1. Submit answers\n")
+REVIEW_14X20 = ("← ☒ C ☒   ✔\n olorSizeSubm→\n         it\n\nReview your\nanswers\n\n"
+                " ● Pick a\n   color\n   → Red\n ● Pick a size\n   → Small\n\n"
+                "Ready to\nsubmit your\nanswers?\n\n❯ 1.Submit\n    answers\n  2. Cancel\n")
+REVIEW_10X5 = "your\nanswers?\n\n❯ 1. Submi\n     t ans\n"
+ELICIT_120X7 = ("\n● Calling elicit · 1m 21s…\n\n" + "─" * 120 + "\n"
+                "  MCP server “elicit” requests your input\n  Please provide your name\n\n")
+ELICIT_12X10 = ("  elicit ·\n  1m 43s…\n\n" + "─" * 12 + "\n  MCP\n  server\n  “…”\n"
+                "  requ…\n  Please\n  provide\n")
+ELICIT_10X5 = "  elicit ·\n  51s…\n\n" + "─" * 10 + "\n  MCP\n"
+# ...and idle panes at those sizes that quote them: a draft whose bottom rule
+# is cut, and a reply above the composer.
+IDLE_DRAFT_40X7 = ("\n\n\n✻ Brewed for 1s · done 3:19 PM\n\n" + "─" * 40
+                   + "\n❯\xa01. Submit answers?\n")
+IDLE_QUOTING_120X9 = ("● Ready to submit your answers?\n  MCP server “x” requests your input\n"
+                      "  1. Submit answers\n\n✻ Churned for 1s · done 3:19 PM\n\n" + "─" * 120
+                      + "\n❯\xa0\n" + "─" * 120 + "\n  ⏵⏵ auto mode on (shift+tab to cycle)\n")
+
+
+class TestSmallDialogShapes(unittest.TestCase):
+    """XERK-2222: dialogs cut at sizes above the tiny-pane floor still block
+    (read by the XERK-2220 position reads)."""
+
+    def test_cut_dialogs_are_blocking(self):
+        for name in ("SUBAGENT_PERMISSION_15X5", "SUBAGENT_PERMISSION_12X20", "REVIEW_120X9",
+                     "REVIEW_14X20", "REVIEW_10X5", "ELICIT_120X7", "ELICIT_12X10",
+                     "ELICIT_10X5"):
+            with self.subTest(name):
+                self.assertTrue(ha._pane_blocking_dialog(globals()[name]))
+
+    def test_each_shape_has_its_own_read(self):
+        self.assertTrue(ha._hint_dialog_up(SUBAGENT_PERMISSION_15X5))
+        self.assertTrue(ha._pane_cut_choice_up(REVIEW_120X9))
+        self.assertTrue(ha._pane_cut_choice_up(REVIEW_14X20))
+
+    def test_idle_panes_quoting_them_are_not(self):
+        for name in ("IDLE_DRAFT_40X7", "IDLE_QUOTING_120X9", "LINUX_COMPOSER_PANE"):
+            with self.subTest(name):
+                self.assertFalse(ha._pane_blocking_dialog(globals()[name]))
+
+    def test_a_cut_choice_needs_its_question_and_no_rule_between(self):
+        self.assertFalse(ha._pane_cut_choice_up("Some reply\n\n❯ 1. Submit answers\n"))
+        self.assertFalse(ha._pane_cut_choice_up(
+            "Ready to submit?\n" + "─" * 20 + "\n❯ 1. Submit answers\n"))
+        self.assertFalse(ha._pane_cut_choice_up(
+            "Ready to submit?\n❯ 1. Submit\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"))
+
+
 class TestTinyPaneHolds(ManagerMixin, unittest.TestCase):
     """XERK-2222: a pane too small to read is held, never typed into."""
 
@@ -11188,6 +11246,56 @@ class TestTinyPaneHolds(ManagerMixin, unittest.TestCase):
         self.assertTrue(ha._must_hold(result))
         self.assertEqual(self.run_calls, [])
         self.assertEqual(self.run_stdin_calls, [])
+
+    def _shrinks_after(self, n):
+        sizes = iter([(100, 30)] * n + [(8, 4)] * 200)
+        real = subprocess.run
+
+        def fake(cmd, *a, **kw):
+            if "display-message" in cmd:
+                w, h = next(sizes)
+                return subprocess.CompletedProcess(cmd, 0, f"{w} {h}\n", "")
+            return real(cmd, *a, **kw)
+        return mock.patch.object(ha.subprocess, "run", side_effect=fake)
+
+    def test_a_pasted_message_is_not_entered_once_the_pane_shrank(self):
+        # Bracketed (an emoji forces it): the pre-Enter read checks the size too.
+        self.make_manager()
+        self.run_calls.clear()
+        with self._shrinks_after(1), \
+                mock.patch.object(ha, "_capture_pane",
+                                  side_effect=[LINUX_COMPOSER_PANE] + [TINY_IDLE_8X4] * 50):
+            result = ha._type_into_pane("agent-abcde", "two lines\nwith 😀")
+        self.assertEqual(result, ha.PANE_DIALOG)
+        self.assertEqual([c for c in self.run_calls if c[-1] == "Enter"], [])
+
+    def test_no_later_slice_goes_into_a_pane_that_shrank(self):
+        self.make_manager()
+        self.run_calls.clear()
+        self.run_stdin_calls.clear()
+        text = "word " * 300                               # several slices
+        with self._shrinks_after(1), \
+                mock.patch.object(ha, "_capture_pane",
+                                  side_effect=[LINUX_COMPOSER_PANE] + [TINY_IDLE_8X4] * 200), \
+                mock.patch.object(ha, "_composer_split", return_value=None):
+            result = ha._type_into_pane("agent-abcde", text)
+        self.assertEqual(result, ha.PANE_DIALOG)
+        self.assertEqual(len(self.run_stdin_calls), 1)     # the first slice only
+        self.assertEqual([c for c in self.run_calls if c[-1] == "Enter"], [])
+
+    def test_no_later_slice_goes_in_past_the_draw_deadline_either(self):
+        # Past the draw deadline the slice gate takes one plain read (_dialog_up).
+        self.make_manager()
+        self.run_calls.clear()
+        self.run_stdin_calls.clear()
+        with self._shrinks_after(1), \
+                mock.patch.object(ha, "_capture_pane",
+                                  side_effect=[LINUX_COMPOSER_PANE] + [TINY_IDLE_8X4] * 200), \
+                mock.patch.object(ha, "_await_slice_drawn", return_value=False):
+            result = ha._type_into_pane("agent-abcde", "word " * 300)
+        self.assertEqual(result, ha.PANE_DIALOG)
+        # Slice 2 went in on the (stubbed) draw wait; slice 3 met the plain read.
+        self.assertEqual(len(self.run_stdin_calls), 2)
 
     def test_a_pane_that_shrank_before_the_enter_is_not_entered(self):
         self.make_manager()
@@ -22240,6 +22348,25 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
             self.assertEqual(self.run_calls, [])
             self.assertEqual(sess["pendingModel"], "sonnet")
 
+    def test_set_model_defers_on_a_pane_too_small_to_read(self):
+        # XERK-2222: the pane's text can't say whether a dialog owns it.
+        sm = self.make_manager(busy=False)
+        sess = self._session(sm, model=None)
+        with mock.patch.object(ha, "_pane_too_small", return_value=True):
+            sm.set_model("abcde", "sonnet")
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(sess["pendingModel"], "sonnet")
+
+    def test_apply_pending_switches_waits_out_a_pane_too_small_to_read(self):
+        sm = self.make_manager(busy=False)
+        sess = self._session(sm, model=None)
+        sess["pendingModel"] = "sonnet"
+        with mock.patch.object(ha, "_pane_too_small", return_value=True), \
+                mock.patch.object(sm, "set_model") as set_model:
+            sm._apply_pending_switches()
+        set_model.assert_not_called()
+        self.assertEqual(sess["pendingModel"], "sonnet")
+
     def test_apply_pending_switches_lands_the_deferred_pick(self):
         sm = self.make_manager(busy=False)
         sess = self._session(sm, model=None)
@@ -30547,6 +30674,16 @@ class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
         sess = self._sess()
         sm.registry = [sess]
         sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+        self.assertNotIn("rcRenamedFor", sess)
+
+    def test_a_pane_too_small_to_read_defers(self):
+        # XERK-2222.
+        sm = self.make_manager()
+        sess = self._sess()
+        sm.registry = [sess]
+        with mock.patch.object(ha, "_pane_too_small", return_value=True):
+            sm._reconcile_rc_names()
         self.assertEqual(self.keys, [])
         self.assertNotIn("rcRenamedFor", sess)
 
