@@ -11265,6 +11265,107 @@ class TestModelPickerBodyIsABlockingDialog(unittest.TestCase):
             self.assertFalse(ha._pane_blocking_dialog(cap), footer)
 
 
+class TestOverlayWithItsFooterCut(unittest.TestCase):
+    """XERK-2203: live frames (Claude Code 2.1.309, tmux 3.4) of overlays whose
+    "Esc to cancel" footer is off-screen: the Ctrl-R history search (read
+    typeable at 10-80 columns) and a short /resume picker. Verbatim captures,
+    trailing blanks trimmed."""
+
+    HIST_26x8 = ("           roj\n\n\n" + "─" * 26 + "\n  Search prompts ·\n  everywhere\n"
+                 "  ↑ 5m ago   turma\n  ❯ limits probe:…Jira\n")
+    HIST_12x10 = ("           j\n\n\n" + "─" * 12 + "\n  Search\n  prompts\n  · everyw\n"
+                  "  here\n  ↑ 4m ago\n  ❯    ago\n")
+    HIST_40x12 = (" ▝▝   ▝▝   /…/scratchpad/proj\n\n\n" + "─" * 40 + "\n"
+                  "  Search prompts · everywhere\n  ↑ 5m ago   turma limits probe: repl…\n"
+                  "  ❯ 2m ago   Work Jira ticket XERK-22…\n  ╭" + "─" * 34 + "╮\n"
+                  "  │ Work Jira ticket XERK-2203.      │\n  │ Its full text, as fetched from   │\n"
+                  "  │ Jira when this session           │\n  │ spawned, follows. That is a      │\n")
+    RESUME_26x8 = ("\n❯ /resume\n  ⎿  Resume cancelled\n▔▔▔▔▔ ◐ medium · /effort ▔\n"
+                   "   Resume session\n   ╭" + "─" * 18 + "╮\n   │ ⌕ Search…        │\n"
+                   "   ╰" + "─" * 18 + "╯\n")
+    RESUME_12x10 = ("\n  ⎿ Resume c\n    ancelled\n tmux det… ▔\n   Resume\n   sessi\n   on\n"
+                    "   ╭────╮\n   │ ⌕  │\n   │ Se │\n")
+    IDLE_26x8 = (" ▝▝   ▝▝   Claude Team\n           /…/scratchpad/p\n           roj\n\n"
+                 "  tmux focus-events off…\n" + "─" * 26 + "\n❯\xa0Try \"edit <filepath> to…\n"
+                 + "─" * 26 + "\n")
+    IDLE_12x10 = ("           p\n           r\n           o\n           j\n\n  ◐ mediu…\n"
+                  + "─" * 12 + "\n❯\xa0Try \"edit…\n" + "─" * 12 + "\n  ⏵⏵ auto\n")
+
+    def test_overlays_block_typing(self):
+        for name in ("HIST_26x8", "HIST_12x10", "HIST_40x12", "RESUME_26x8", "RESUME_12x10"):
+            cap = getattr(self, name)
+            self.assertTrue(ha._pane_overlay_up(cap), name)
+            self.assertTrue(ha._pane_blocking_dialog(cap), name)
+
+    def test_idle_composers_stay_typeable(self):
+        for name in ("IDLE_26x8", "IDLE_12x10"):
+            self.assertFalse(ha._pane_overlay_up(getattr(self, name)), name)
+            self.assertFalse(ha._pane_blocking_dialog(getattr(self, name)), name)
+
+    def test_a_picker_quoted_above_the_composer_does_not(self):
+        # A reply drawing an indented "❯" row sits above the composer's rules.
+        cap = "  ❯ quoted row\n" + "─" * 12 + "\n❯ \n" + "─" * 12 + "\n  ⏵⏵ auto\n"
+        self.assertFalse(ha._pane_overlay_up(cap))
+
+    # Drafts whose box bottom the pane cuts off (live, QA): the draft's own
+    # indented "❯ 1. foo" line must not read as a picker cursor.
+    SHELL_DRAFT_40x8 = ("\n\n❯ /skills\n  ⎿  No changes\n\n" + "─" * 40 + "\n"
+                        "!\xa0echo hi\n    ❯ 1. foo\n")
+    DRAFT_120x8 = ("● Which one do you want?\n  ❯ 1. foo\n\n✻ Sautéed for 1s · done 7:14 PM\n\n"
+                   + "─" * 120 + "\n❯\xa0Which one?\n    ❯ 1. foo\n")
+
+    def test_a_draft_cut_below_its_box_stays_typeable(self):
+        for name in ("SHELL_DRAFT_40x8", "DRAFT_120x8"):
+            self.assertFalse(ha._pane_overlay_up(getattr(self, name)), name)
+
+    def test_each_composer_marker_vetoes_on_its_own(self):
+        edge = "▔" * 12 + "\n  old dialog\n"
+        # A column-0 prompt below the area's first line.
+        self.assertFalse(ha._pane_overlay_up(edge + "❯ draft\n    ❯ 1. foo\n"))
+        # A column-0 rule.
+        self.assertFalse(ha._pane_overlay_up(edge + "─" * 12 + "\n  ❯ row\n"))
+        # A mode footer.
+        self.assertFalse(ha._pane_overlay_up(
+            edge + "  ⏵⏵ auto mode on (shift+tab to cycle)\n  ❯ row\n"))
+        # qwen's footer.
+        self.assertFalse(ha._pane_overlay_up(
+            edge + "  ❯ row\n  ? Ask permissions (shift + tab to cycle)\n"))
+        # Shell mode's footer.
+        self.assertFalse(ha._pane_overlay_up(edge + "  ! for shell mode\n"))
+        # The exit toast.
+        self.assertFalse(ha._pane_overlay_up("▔" * 12 + "\n  Press Ctrl-C again to exit\n"))
+        self.assertTrue(ha._pane_overlay_up(edge + "  ❯ row\n"))
+
+    # Ctrl-R over a shell draft, nothing matching: no cursor row, only the box (live, QA).
+    HIST_NO_MATCH_120x8 = (" ▝▝   ▝▝   /tmp/claude-0/q2203/proj\n\n\n" + "─" * 120 + "\n"
+                           "  Search prompts · everywhere\n  No matching prompts\n\n"
+                           "  ╭" + "─" * 114 + "╮\n")
+
+    # The same at ≤8 rows: only the title and "No matching prompts" are drawn.
+    HIST_NO_MATCH_26x8 = ("           /…/q2203/proj\n\n\n" + "─" * 26 + "\n"
+                          "  Search prompts ·\n  everywhere\n  No matching prompts\n")
+    HIST_NO_MATCH_60x6 = (" ▝▝   ▝▝   /tmp/claude-0/q2203/proj\n\n\n" + "─" * 60 + "\n"
+                          "  Search prompts · everywhere\n  No matching prompts\n")
+
+    def test_a_history_search_with_no_match_blocks(self):
+        for name in ("HIST_NO_MATCH_120x8", "HIST_NO_MATCH_26x8", "HIST_NO_MATCH_60x6"):
+            self.assertTrue(ha._pane_blocking_dialog(getattr(self, name)), name)
+        # Only as the area's first line: a later "Search …" row says nothing.
+        self.assertFalse(ha._pane_overlay_up(
+            "─" * 26 + "\n  No matching prompts\n  Search prompts\n"))
+        # Indented only: a column-0 line under the rule is no overlay title.
+        self.assertFalse(ha._pane_overlay_up("─" * 26 + "\nSearch prompts\n"))
+
+    def test_under_a_rule_only_the_cursor_row_says_overlay(self):
+        cap = self.HIST_26x8.replace("  ❯ limits", "    limits").replace("  Search", "  Find")
+        self.assertFalse(ha._pane_overlay_up(cap))
+
+    def test_a_stale_edge_above_the_composer_is_no_overlay(self):
+        cap = "▔" * 12 + "\n  old dialog text\n" + self.IDLE_12x10
+        self.assertFalse(ha._pane_overlay_up(cap))
+        self.assertFalse(ha._pane_overlay_up("▔" * 12 + "\n\n"))
+
+
 # The /model picker's "Switch model?" confirm, captured on Claude Code 2.1.306
 # (XERK-2157): drawn after `s` on a session whose conversation is cached for the
 # current model. No "Esc to cancel" footer, no question line above the options.
@@ -37476,6 +37577,13 @@ class TestMrStatus(unittest.TestCase):
         self.assertEqual(ha._summarize_mr(
             {"state": "opened", "sha": b,
              "head_pipeline": {"status": "failed"}})["checks"], "failing")
+
+    def test_a_pipeline_sha_differing_only_in_case_is_this_heads_ci(self):
+        # XERK-2203: compared case-insensitively, as the ADO source commit is.
+        b = "b" * 40
+        self.assertEqual(ha._summarize_mr(
+            {"state": "opened", "sha": b,
+             "head_pipeline": {"status": "success", "sha": b.upper()}})["checks"], "passing")
 
     def test_mr_check_class(self):
         self.assertEqual(ha._mr_check_class("success"), "pass")
