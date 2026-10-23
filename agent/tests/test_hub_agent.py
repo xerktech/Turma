@@ -37829,13 +37829,17 @@ class TestDiscoverBranchMrs(ManagerMixin, unittest.TestCase):
         self.discover([self.mr()])
         self.assertEqual(len(self.sm._take_discovered_prs("s1")), 1)
 
-    def test_a_failed_lookup_stops_the_pass_and_backs_off(self):
+    def test_a_failed_lookup_ends_the_pass_and_backs_off_that_session_only(self):
         self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(3)]
         self.assertEqual(self.discover(None).call_count, 1)
-        self.assertFalse(self.discover([self.mr()]).called)
-        self.sm._mr_discover_paused_until = 0.0
+        failed = set(self.sm._mr_discover_retry_at)
+        self.assertEqual(len(failed), 1)
         self.discover([self.mr()])
-        self.assertEqual(len(self.sm._take_discovered_prs("s0")), 1)
+        staged = {sid for sid in ("s0", "s1", "s2") if self.sm._take_discovered_prs(sid)}
+        self.assertEqual(staged, {"s0", "s1", "s2"} - failed)
+        self.sm._mr_discover_retry_at.clear()
+        self.discover([self.mr()])
+        self.assertEqual(len(self.sm._take_discovered_prs(failed.pop())), 1)
 
     def test_a_listing_is_read_no_further_than_twenty(self):
         mrs = [self.mr(web_url=f"https://gitlab.com/code_hunter/argocd/-/merge_requests/{i}")

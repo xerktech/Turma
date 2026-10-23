@@ -89,8 +89,9 @@ DevOps, and what gets typed back because of it.
   - An empty lookup is asked again next pass (the MR is usually opened after the
     push); only a tip that already has its MR is skipped. `MR_DISCOVER_MAX` sessions a pass,
     least recently asked first. GitLab only. Tests: `TestDiscoverBranchMrs`.
-  - A FAILED lookup ends the pass and pauses discovery `MR_DISCOVER_FAIL_BACKOFF_SEC`: a hung
-    GitLab otherwise held the shared slow-refresh worker a timeout per session every pass (QA).
+  - A FAILED lookup ends the pass and backs THAT session off `MR_DISCOVER_FAIL_BACKOFF_SEC`: a hung
+    GitLab otherwise held the shared worker a timeout per session every pass. Never a host-wide
+    pause: `_gitlab_get` is None for a 404 too, so one unreadable project stalled every session (QA).
   - Residuals: a resumed/migrated session's fresh `createdAt` hides an MR its earlier life
     opened; an MR head already on the base (a sibling's merged, then rebased in) passes the
     ancestor gate.

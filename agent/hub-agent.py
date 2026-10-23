@@ -8501,10 +8501,10 @@ PR_STATUS_MAX = 20
 # BRANCH: at most this many sessions are looked up per PR refresh, the least
 # recently asked first, so none starves behind busier ones.
 MR_DISCOVER_MAX = 5
-# After a FAILED lookup (GitLab down or hanging) the pass stops and discovery
-# waits this long: each attempt can hold the shared slow-refresh worker for a
-# whole request timeout.
-MR_DISCOVER_FAIL_BACKOFF_SEC = 300
+# A FAILED lookup (GitLab down or hanging, or a project the token cannot read)
+# ends the pass, so a hung GitLab costs one request timeout a pass, and that
+# session alone is not asked again for this long.
+MR_DISCOVER_FAIL_BACKOFF_SEC = 120
 
 # PR auto-merge (XERK-550): how long a single `gh pr merge` may block on its
 # worker thread, and how many outcomes stay staged (each is a small dict keyed
@@ -26339,7 +26339,7 @@ class SessionManager:
         self._discovered_lock = threading.Lock()
         self._mr_discover_asked = {}
         self._mr_discover_found = {}
-        self._mr_discover_paused_until = 0.0
+        self._mr_discover_retry_at = {}
         self._pr_comments_wake = threading.Event()
         self._pr_comments_worker = None
         self._pr_comments_fetched = {}
@@ -41363,7 +41363,7 @@ class SessionManager:
         after the push); a branch tip that already has its MR is not. The MR
         must hold a head commit the worktree contains and be opened after the
         session started (_gitlab_branch_mr_urls)."""
-        if not gitlab_configured() or time.monotonic() < self._mr_discover_paused_until:
+        if not gitlab_configured():
             return
         live, due = set(), []
         for sess in list(self.registry):
@@ -41371,7 +41371,8 @@ class SessionManager:
             if sess.get("status") == "running" and isinstance(sid, str) and wt:
                 live.add(sid)
                 due.append(sess)
-        for d in (self._mr_discover_asked, self._mr_discover_found):
+        for d in (self._mr_discover_asked, self._mr_discover_found,
+                  self._mr_discover_retry_at):
             for sid in [k for k in d if k not in live]:
                 del d[sid]
         with self._discovered_lock:
@@ -41383,6 +41384,8 @@ class SessionManager:
             if asked >= MR_DISCOVER_MAX:
                 break
             sid, wt = sess["id"], sess["worktreePath"]
+            if time.monotonic() < self._mr_discover_retry_at.get(sid, 0.0):
+                continue
             since = _ts_ms(sess.get("createdAt"))
             # --show-current, not rev-parse --abbrev-ref: a tag sharing the
             # branch's name makes the latter answer "heads/<name>".
@@ -41409,8 +41412,8 @@ class SessionManager:
                 return rc == 0
             found = _gitlab_branch_mr_urls(proj, branch, since, holds)
             if found is None:
-                self._mr_discover_paused_until = (time.monotonic()
-                                                  + MR_DISCOVER_FAIL_BACKOFF_SEC)
+                self._mr_discover_retry_at[sid] = (time.monotonic()
+                                                   + MR_DISCOVER_FAIL_BACKOFF_SEC)
                 break
             if not found:
                 continue
