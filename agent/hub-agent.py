@@ -9226,8 +9226,9 @@ def _summarize_mr(data):
     # a push it can still be the previous commit's; that verdict is not this
     # head's CI (GitLab's own diff_head_pipeline drops it the same way). Read
     # as no CI yet, else the hub announces the old run as the new head's.
-    if (isinstance(pipeline, dict) and pipeline.get("sha") and data.get("sha")
-            and pipeline.get("sha") != data.get("sha")):
+    if (isinstance(pipeline, dict) and isinstance(pipeline.get("sha"), str)
+            and isinstance(data.get("sha"), str) and pipeline["sha"] and data["sha"]
+            and pipeline["sha"].lower() != data["sha"].lower()):
         pipeline = None
     cls = _mr_check_class((pipeline or {}).get("status")) if isinstance(
         pipeline, dict) else None
@@ -19168,8 +19169,10 @@ def _pane_blocking_dialog(cap):
       * the /model picker itself read off its body (`_model_picker_open`), for
         a pane too short to draw its footer (XERK-2148: 40x45 wraps it off);
       * a choice dialog cut off below its first option (`_pane_cut_dialog_up`:
-        a 10-row pane draws "Exit plan mode?" down to "❯ 1." only).
-    Keeping the last four OUT of `parse_pane_prompt` is deliberate: `panePrompt`
+        a 10-row pane draws "Exit plan mode?" down to "❯ 1." only);
+      * an overlay with its footer cut off (`_pane_overlay_up`: the Ctrl-R
+        history search, a short /resume picker).
+    Keeping the last five OUT of `parse_pane_prompt` is deliberate: `panePrompt`
     is a wire contract whose options the chat page renders as clickable digits,
     and these have no digit to click (or, for the picker, digits that a
     free-text row and a multi-question tab bar make unsafe to offer) —
@@ -19179,6 +19182,7 @@ def _pane_blocking_dialog(cap):
             or parse_model_switch_confirm(cap) is not None
             or _model_picker_open(cap)
             or _pane_cut_dialog_up(cap)
+            or _pane_overlay_up(cap)
             or _qwen_waiting_up(cap))
 
 
@@ -19289,6 +19293,49 @@ def _pane_cut_dialog_up(cap):
     if not (m.group(1) and m.group(2) == "1" and area[k][:1].isspace()):
         return False
     return any(asks(line) for line in area[:k])
+
+
+# A picker's cursor row: an indented "❯" (the composer's own prompt sits at column 0).
+_PANE_PICKER_CURSOR_RE = re.compile(r"^\s+❯(?:\s|$)")
+
+
+def _pane_overlay_up(cap):
+    """Whether an overlay that takes keys owns the pane's bottom area, read by
+    POSITION (XERK-2203). Claude Code 2.1.309 draws the Ctrl-R history search
+    under a column-0 "─" rule in place of the composer, its footer
+    ("… Esc to cancel …") scrolled off below 120x40; and a short pane draws the
+    /resume picker under its ▔ edge down to its search box only. A message
+    typed into either lands in the search box.
+
+    The area starts at the last ▔ edge row (`_pane_prompt_edges`, which only a
+    dialog draws), else at the last full-width column-0 "─" rule. Nothing in
+    it may be the composer's: no "❯" prompt and no rule at column 0, no
+    mode/shell/qwen footer, no exit toast. Then under a ▔ edge any content is
+    an overlay; under a "─" rule (the composer's own top edge too) only a
+    picker's indented "❯" cursor row says so."""
+    if not cap:
+        return False
+    lines = [_PANE_SCROLLBAR_RE.sub("", line).rstrip()
+             for line in _ANSI_RE.sub("", cap).splitlines()]
+    edge = max(_pane_prompt_edges(lines), default=None)
+    edged = edge is not None
+    if not edged:
+        widest = max((_pane_cells(line) for line in lines), default=0)
+        if widest < 4:
+            return False
+        edge = max((k for k, line in enumerate(lines)
+                    if line[:1] == "─" and set(line) == {"─"}
+                    and _pane_cells(line) == widest), default=None)
+        if edge is None:
+            return False
+    area = [line for line in lines[edge + 1:] if line.strip()]
+    text = "\n".join(area)
+    if (not area
+            or any(line.startswith("❯") or _COMPOSER_EDGE_RULE_RE.match(line) for line in area)
+            or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
+            or PANE_SHELL_FOOTER_RE.search(text) or _pane_composer_tail_up(lines)):
+        return False
+    return edged or any(_PANE_PICKER_CURSOR_RE.match(line) for line in area)
 
 
 def _answer_trust_dialog(tmux_name, cap=None):
