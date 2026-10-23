@@ -8498,10 +8498,9 @@ PR_STATUS_MAX = 20
 
 # A GitLab MR the session opened in a way _scan_pr_line cannot see (a push to a
 # URL instead of a remote, `-o mr.create`, a script) is still found by its
-# BRANCH: at most this many sessions are looked up per PR refresh, and a
-# branch whose tip has not moved is asked again only this often.
+# BRANCH: at most this many sessions are looked up per PR refresh, the least
+# recently asked first, so none starves behind busier ones.
 MR_DISCOVER_MAX = 5
-MR_DISCOVER_RECHECK_SEC = 600
 
 # PR auto-merge (XERK-550): how long a single `gh pr merge` may block on its
 # worker thread, and how many outcomes stay staged (each is a small dict keyed
@@ -21654,21 +21653,23 @@ def _gitlab_branch_mr_urls(proj, branch, since_ms, holds):
     the session's own branch. Every gate is what makes a branch lookup the
     session's MR rather than any MR on a same-named branch: an MR from a fork,
     one opened before the session started (an earlier session on a reused
-    ticket branch), or one whose head the worktree does not contain (someone
-    else's push) is left out. [] on any fetch failure."""
+    ticket branch), one whose head the worktree does not contain (someone
+    else's push), or a link that is not this project's MR on GITLAB_URL is left
+    out. None when the fetch failed (ask again), else the list."""
     data = _gitlab_get(
         f"projects/{urllib.parse.quote(proj, safe='')}/merge_requests?"
         + urllib.parse.urlencode({"source_branch": branch, "state": "all",
                                   "per_page": 20}))
     if not isinstance(data, list):
-        return []
+        return None
     out = []
-    for mr in data:
+    for mr in data[:20]:
         if not isinstance(mr, dict):
             continue
         url, sha = mr.get("web_url"), mr.get("sha")
         made = _ts_ms(mr.get("created_at"))
-        if not (isinstance(url, str) and MR_URL_RE.fullmatch(url)
+        parts = _mr_url_parts(url) if isinstance(url, str) else None
+        if not (parts and parts[0].lower() == proj.lower()
                 and isinstance(sha, str) and re.fullmatch(r"[0-9a-fA-F]{7,64}", sha)
                 and made is not None and made >= since_ms
                 and mr.get("source_branch") == branch
@@ -26326,10 +26327,12 @@ class SessionManager:
         self._pr_comments_lock = threading.Lock()
         # Branch-discovered GitLab MRs (see _discover_branch_mrs): the PR-refresh
         # worker stages {sid: [url]}, the beat drains it into session_pr_urls.
-        # _mr_discover_seen (worker-only) is {sid: (branch, head, monotonic)}.
+        # Worker-only: _mr_discover_asked is {sid: monotonic of the last lookup},
+        # _mr_discover_found {sid: (branch, head)} already answered by an MR.
         self._discovered_prs = {}
         self._discovered_lock = threading.Lock()
-        self._mr_discover_seen = {}
+        self._mr_discover_asked = {}
+        self._mr_discover_found = {}
         self._pr_comments_wake = threading.Event()
         self._pr_comments_worker = None
         self._pr_comments_fetched = {}
@@ -41347,58 +41350,78 @@ class SessionManager:
         worker after refresh_pr_status; stages what it finds for the beat to
         merge (_take_discovered_prs), never writing the registry itself.
 
-        A session is asked only when it sits on a named, non-default branch of a
-        GitLab origin, at most MR_DISCOVER_MAX a pass, and again for the same
-        branch tip only after MR_DISCOVER_RECHECK_SEC. The MR must hold a head
-        commit the worktree contains and be opened after the session started
-        (_gitlab_branch_mr_urls)."""
+        A session is asked when it sits on a named, non-default branch of a
+        GitLab origin, at most MR_DISCOVER_MAX a pass, least recently asked
+        first. An empty answer is asked again next pass (the MR is often opened
+        after the push); a branch tip that already has its MR is not. The MR
+        must hold a head commit the worktree contains and be opened after the
+        session started (_gitlab_branch_mr_urls)."""
         if not gitlab_configured():
             return
-        now = time.monotonic()
-        live = set()
-        asked = 0
+        live, due = set(), []
         for sess in list(self.registry):
             sid, wt = sess.get("id"), sess.get("worktreePath")
-            if sess.get("status") != "running" or not isinstance(sid, str) or not wt:
-                continue
-            live.add(sid)
+            if sess.get("status") == "running" and isinstance(sid, str) and wt:
+                live.add(sid)
+                due.append(sess)
+        for d in (self._mr_discover_asked, self._mr_discover_found):
+            for sid in [k for k in d if k not in live]:
+                del d[sid]
+        with self._discovered_lock:
+            for sid in [k for k in self._discovered_prs if k not in live]:
+                del self._discovered_prs[sid]
+        due.sort(key=lambda x: self._mr_discover_asked.get(x["id"], 0.0))
+        asked = 0
+        for sess in due:
             if asked >= MR_DISCOVER_MAX:
-                continue
+                break
+            sid, wt = sess["id"], sess["worktreePath"]
             since = _ts_ms(sess.get("createdAt"))
-            branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=wt)
-            if since is None or branch in ("", "HEAD", "main", "master"):
+            # --show-current, not rev-parse --abbrev-ref: a tag sharing the
+            # branch's name makes the latter answer "heads/<name>".
+            branch = run(["git", "branch", "--show-current"], cwd=wt)
+            if since is None or not branch:
+                continue
+            default = run(["git", "symbolic-ref", "--short",
+                           "refs/remotes/origin/HEAD"], cwd=wt)
+            if branch in ("main", "master") or (default and default.split("/", 1)[-1] == branch):
                 continue
             head = run(["git", "rev-parse", "HEAD"], cwd=wt)
-            seen = self._mr_discover_seen.get(sid)
-            if (seen and seen[:2] == (branch, head)
-                    and now - seen[2] < MR_DISCOVER_RECHECK_SEC):
+            if self._mr_discover_found.get(sid) == (branch, head):
                 continue
             proj = _gitlab_project_from_remote(
                 run(["git", "remote", "get-url", "origin"], cwd=wt))
             if not proj:
                 continue
             asked += 1
-            self._mr_discover_seen[sid] = (branch, head, now)
+            self._mr_discover_asked[sid] = time.monotonic()
 
             def holds(sha, wt=wt):
                 rc, _ = run_out(["git", "merge-base", "--is-ancestor", sha, "HEAD"],
                                 cwd=wt)
                 return rc == 0
+            found = _gitlab_branch_mr_urls(proj, branch, since, holds)
+            if not found:
+                continue
+            self._mr_discover_found[sid] = (branch, head)
             known = self.session_pr_urls.get(sid) or []
-            urls = [u for u in _gitlab_branch_mr_urls(proj, branch, since, holds)
-                    if u not in known]
+            urls = [u for u in found if u not in known]
             if urls:
                 log(f"pr discovery: {sid} opened {', '.join(urls)} from {branch}")
                 with self._discovered_lock:
                     got = self._discovered_prs.setdefault(sid, [])
                     got.extend(u for u in urls if u not in got)
-        for sid in [k for k in self._mr_discover_seen if k not in live]:
-            del self._mr_discover_seen[sid]
 
     def _take_discovered_prs(self, sid):
         """The branch-discovered MR urls staged for `sid`, removed (beat side)."""
         with self._discovered_lock:
             return self._discovered_prs.pop(sid, None) or []
+
+    def _staged_discovered_prs(self, sid):
+        """The same, left staged: the open-PR poller runs BEFORE the payload loop
+        drains them, and must count an MR found this beat as open."""
+        with self._discovered_lock:
+            return list(self._discovered_prs.get(sid) or [])
 
     def _pr_source_ok(self, url):
         """Whether THIS host can fetch status/comments for a PR/MR url: a
@@ -43174,7 +43197,8 @@ class SessionManager:
             # An open (or not-yet-fetched) PR already covers the work: re-arm any
             # stale episode and skip before paying for a pane capture.
             have_open = False
-            for u in (self.session_pr_urls.get(sid) or []):
+            for u in ((self.session_pr_urls.get(sid) or [])
+                      + self._staged_discovered_prs(sid)):
                 st = (self.pr_status_cache.get(u) or {}).get("state")
                 if st in ("OPEN", "DRAFT") or st is None:
                     have_open = True

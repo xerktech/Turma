@@ -80,11 +80,18 @@ DevOps, and what gets typed back because of it.
   - Why: a push to an `altssh.` URL, `-o mr.create` or a script opens an MR no creating-call
     rule sees; the chip was missing and the open-PR poller nudged a session that had delivered.
   - Adopted only when ALL hold: origin is on GITLAB_URL (or its `altssh.` twin), the MR's
-    `source_branch` is the worktree's named non-default branch, not from a fork, opened after
-    the session's `createdAt`, and its `sha` is an ancestor of the worktree's HEAD. Never loosen
-    one: each stands between a same-named branch and a foreign MR on the card.
-  - Bounded: `MR_DISCOVER_MAX` sessions a pass; an unmoved tip re-asked after
-    `MR_DISCOVER_RECHECK_SEC`. GitLab only. Tests: `TestDiscoverBranchMrs`.
+    `source_branch` is the worktree's branch (`--show-current`; not main/master/origin's
+    default), not from a fork, its link is that project's MR on GITLAB_URL, opened after the
+    session's `createdAt`, and its `sha` is an ancestor of the worktree's HEAD. Never loosen one:
+    each stands between a same-named branch and a foreign MR on the card.
+  - **The open-PR poller counts STAGED urls as open** (`_staged_discovered_prs`): it runs before
+    the payload loop drains them, and without it nudged the very beat the MR landed (QA).
+  - An empty or failed lookup is asked again next pass (the MR is usually opened after the
+    push); only a tip that already has its MR is skipped. `MR_DISCOVER_MAX` sessions a pass,
+    least recently asked first. GitLab only. Tests: `TestDiscoverBranchMrs`.
+  - Residuals: a resumed/migrated session's fresh `createdAt` hides an MR its earlier life
+    opened; an MR head already on the base (a sibling's merged, then rebased in) passes the
+    ancestor gate.
 - **A GitLab MR and an ADO PR answer everywhere a GitHub PR does**: dispatch by URL to
   `mr_status`/`azdo_pr_status`, each polled only through the source that can answer it
   (`_pr_source_ok`; unreachable → bare link). ADO reuses the board's PAT, no CI rollup: `checks` is

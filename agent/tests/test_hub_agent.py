@@ -37824,10 +37824,15 @@ class TestDiscoverBranchMrs(ManagerMixin, unittest.TestCase):
         self.discover([self.mr()])
         self.assertEqual(self.sm._take_discovered_prs("s1"), [])
 
-    def test_an_unmoved_branch_is_not_asked_again(self):
+    def test_an_mr_opened_after_an_empty_or_failed_lookup_is_found_next_pass(self):
         self.discover([])
-        get = self.discover([self.mr()])
-        get.assert_not_called()
+        self.discover(None)
+        self.discover([self.mr()])
+        self.assertEqual(len(self.sm._take_discovered_prs("s1")), 1)
+
+    def test_a_tip_that_already_has_its_mr_is_not_asked_again(self):
+        self.discover([self.mr()])
+        self.assertFalse(self.discover([self.mr()]).called)
 
     def test_no_gitlab_or_a_default_branch_asks_nothing(self):
         with mock.patch.object(ha, "_gitlab_get") as get:
@@ -37835,6 +37840,66 @@ class TestDiscoverBranchMrs(ManagerMixin, unittest.TestCase):
         get.assert_not_called()
         subprocess.run(["git", "switch", "-q", "main"], cwd=self.wt, check=True)
         self.assertFalse(self.discover([self.mr()]).called)
+
+    def test_the_origin_default_branch_is_not_asked(self):
+        subprocess.run(["git", "update-ref", "refs/remotes/origin/CE-8575", "HEAD"],
+                       cwd=self.wt, check=True)
+        subprocess.run(["git", "symbolic-ref", "refs/remotes/origin/HEAD",
+                        "refs/remotes/origin/CE-8575"], cwd=self.wt, check=True)
+        self.assertFalse(self.discover([self.mr()]).called)
+
+    def test_a_tag_named_like_the_branch_still_matches(self):
+        subprocess.run(["git", "tag", "CE-8575"], cwd=self.wt, check=True)
+        self.discover([self.mr()])
+        self.assertEqual(len(self.sm._take_discovered_prs("s1")), 1)
+
+    def test_an_mr_link_off_the_project_is_left_out(self):
+        self.discover([self.mr(web_url="https://evil.example/code_hunter/argocd/-/merge_requests/9"),
+                       self.mr(web_url="https://gitlab.com/other/repo/-/merge_requests/9")])
+        self.assertEqual(self.sm._take_discovered_prs("s1"), [])
+
+    def test_the_cap_rotates_so_no_session_starves(self):
+        self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(7)]
+        with mock.patch.object(ha, "MR_DISCOVER_MAX", 3):
+            asked = []
+            for _ in range(3):
+                self.discover([])
+                asked.append(set(self.sm._mr_discover_asked))
+        self.assertEqual(len(asked[0]), 3)
+        self.assertEqual(asked[-1], {f"s{i}" for i in range(7)})
+
+    def test_staged_urls_of_a_stopped_session_are_dropped(self):
+        self.discover([self.mr()])
+        self.sm.registry[0]["status"] = "stopped"
+        self.discover([self.mr()])
+        self.assertEqual(self.sm._take_discovered_prs("s1"), [])
+
+    def test_the_beat_suppresses_the_nudge_and_lands_the_chip(self):
+        """Worker → beat seam: refresh_pr_status stages the MR; the open-PR
+        poller, which runs BEFORE the payload loop drains it, already counts it
+        open; the payload then puts it on the record."""
+        url = self.mr()["web_url"]
+        sess = self.sm.registry[0]
+        sess["tmuxName"] = "agent-s1"
+        self.sm.github = {"available": False}
+        with mock.patch.multiple(ha, run=_ORIG_RUN, **self.GL), \
+                mock.patch.object(ha, "_gitlab_get", return_value=[self.mr()]), \
+                mock.patch.object(ha, "pr_status", return_value=None):
+            self.sm.refresh_pr_status()
+        self.sm.nudge_reads["s1"] = {"dirtyFiles": 0, "liveBranch": "CE-8575",
+                                     "work": {"pushed": False}}
+        with mock.patch.object(ha, "_pane_status", return_value=(False, None, None)), \
+                mock.patch.object(self.sm, "notify_session") as notify:
+            self.sm._poll_open_pr_nudges(stage=False)
+        notify.assert_not_called()
+        with mock.patch.object(ha, "session_report",
+                               return_value={"prUrls": []}):
+            try:
+                self.sm._session_payload(sess)
+            except Exception:
+                pass
+        self.assertIn(url, self.sm.session_pr_urls.get("s1") or [])
+        self.assertEqual(sess.get("prUrls"), [url])
 
     def test_project_from_remote(self):
         with mock.patch.multiple(ha, **self.GL):
