@@ -9190,6 +9190,27 @@ class _Runaway(BaseException):
     code under test's `except Exception` can't swallow it into a pass."""
 
 
+def _park_input_worker(sm, timeout=10):
+    """Leave a test's live input worker idle with nothing held, BEFORE the test's
+    patches lift. The worker outlives the test, so one still mid-retry types into
+    the NEXT test's fakes (XERK-2231: s1's held "for s1" landed in
+    test_a_dialog_while_clearing_holds_and_keeps_the_record). The worker calls
+    `_held_wait` only at the top of its loop, so once this one runs it has
+    finished any delivery in flight; it then sleeps on an empty hold for good."""
+    parked = threading.Event()
+
+    def held_wait():
+        with sm._input_lock:
+            sm.input_held.clear()      # a retry in flight may have re-held its message
+        parked.set()
+        return None
+    with sm._input_lock:
+        sm.input_held.clear()
+    sm._held_wait = held_wait
+    sm._input_wake.set()
+    assert parked.wait(timeout), "input worker never returned to its idle wait"
+
+
 class _FakeComposer:
     """Claude Code's composer as measured on 2.1.300, for the clear paths: text
     wraps at `width`; Ctrl+U deletes the last VISUAL row (to the row's start),
@@ -10159,10 +10180,9 @@ class TestHeldForDialog(ManagerMixin, unittest.TestCase):
             while time.monotonic() < end and not any(n == "agent-s2" for _t, n in typed):
                 time.sleep(0.05)
             time.sleep(1.0)                     # a few s1 retries
-            # The worker outlives this test: leave it nothing to retry against
-            # the real tmux once the fakes are gone.
-            with sm._input_lock:
-                sm.input_held.clear()
+            # The worker outlives this test: park it idle while the fakes are
+            # still in place, or a retry in flight types into the next test's.
+            _park_input_worker(sm)
         s2_at = [t for t, n in typed if n == "agent-s2"]
         self.assertTrue(s2_at)
         self.assertLess(s2_at[0] - t0, ha.CLEAR_ATTEMPT_SEC)
@@ -31423,6 +31443,34 @@ class TestModStatus(ManagerMixin, unittest.TestCase):
         sm._mod_status_last.clear()
         sm._publish_mod_status([self._payload(id="other")])
         self.assertFalse(os.path.exists(self._status_path()))
+
+    def test_payloads_pair_with_the_snapshot_they_were_built_from(self):
+        # XERK-2231: build_payload passes the registry snapshot it built the
+        # payloads from; a registry rebound in between must not shift the pairs.
+        sm = self.make_manager()
+        snapshot = [self._sess(id="s0", bridgeMod=False), self._sess()]
+        sm.registry = [self._sess()]                    # s0 dropped mid-build
+        sm._publish_mod_status([self._payload(id="s0"), self._payload()], snapshot)
+        self.assertTrue(os.path.exists(self._status_path()))
+
+    def test_build_payload_pairs_each_session_with_its_own_record(self):
+        sm = self.make_manager()
+        seen = []
+        real = ha.SessionManager._publish_mod_status
+
+        def spy(self_, payloads, records=None):
+            seen.append(([p.get("id") for p in payloads],
+                         [s.get("id") for s in records]))
+            return real(self_, payloads, records)
+        wt = tempfile.mkdtemp(dir=self.tmp)
+        sm.registry = [self._sess(id="s0", worktreePath=wt),
+                       self._sess(worktreePath=wt)]
+        with mock.patch.object(ha.SessionManager, "_publish_mod_status", spy), \
+                mock.patch.object(sm, "_session_payload",
+                                  new=lambda s, *a: {"id": s["id"]}), \
+                mock.patch.object(ha, "REPOS_ROOT", wt):
+            sm.build_payload(0, light=True)
+        self.assertEqual(seen, [(["s0", "s1"], ["s0", "s1"])])
 
     def test_one_bad_dir_never_costs_another_sessions_status(self):
         sm = self.make_manager()
