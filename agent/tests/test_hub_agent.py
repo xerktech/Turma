@@ -52910,16 +52910,35 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         # stoppable) and spent session slots. They ride `shadowRuns` only.
         sm = self.make_manager()
         sm._launch_ttyd = mock.Mock()
+        # The host is FULL of operator work: the shadow still runs, unqueued.
+        op = {"id": "op1", "status": "running", "worktreePath": os.path.join(self.tmp, "op1"),
+              "repo": "Turma"}
+        sm.registry.append(op)
         with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()), \
                 mock.patch.object(ha, "MAX_SESSIONS", 1):
             self.shadow(sm, self.cmd())
-        [sess] = sm.registry
-        self.assertEqual(sess["status"], "running")
+            sess = sm.registry[1]
+            self.assertEqual(sess["status"], "running")
+            self.assertEqual(sm._capacity_payload()["free"], 0)
+        sm.registry.append(dict(op, id="op2"))
         sm.usage_ledger[sess["worktreePath"]] = {"repo": "Turma", "slug": "shadow-slug"}
-        with mock.patch.object(sm, "_session_payload", lambda s, *a: {"id": s["id"]}):
+        seen, published = [], []
+        def payload(s, *a):
+            seen.append(s["id"])
+            return {"id": s["id"]}
+        with mock.patch.object(sm, "_session_payload", payload), \
+                mock.patch.object(sm, "_publish_mod_status",
+                                  lambda ps: published.extend(ps) or ps):
             p = sm.build_payload(1)
-        self.assertEqual(p["sessions"], [])
-        self.assertEqual(p["capacity"]["free"], ha.MAX_SESSIONS)
+        self.assertEqual([s["id"] for s in p["sessions"]], ["op1", "op2"])
+        # Still BUILT for the shadow (it folds the run's modelActual), and the
+        # mod-status writer gets one payload per registry record, in order.
+        self.assertEqual(seen, ["op1", sess["id"], "op2"])
+        self.assertEqual([x["id"] for x in published], seen)
+        # A hub command naming it by id is refused, never run.
+        sm.handle_commands([{"type": "kill", "sessionId": sess["id"], "cmdId": "k1"}])
+        self.assertIn(sess["id"], [s["id"] for s in sm.registry])
+        sm.registry[:] = [sess]
         self.assertEqual([r["id"] for r in p["shadowRuns"]], [self.RID])
         # Its conversation is offered neither for resume nor to the archive.
         self.assertIn("shadow-slug", sm._carded_slugs())
@@ -52938,9 +52957,13 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
             self.shadow(sm, self.cmd())
             self.assertFalse(sm.build_payload(2, light=True)["modelShadow"]["free"])
             self.shadow(sm, self.cmd(shadowId=other))
+            self.assertEqual(len(sm.registry), 1)
+            sm.shadow_runs[self.RID]["state"] = "grading"
+            self.assertFalse(sm.build_payload(3, light=True)["modelShadow"]["free"])
+            sm.shadow_runs[self.RID]["state"] = "graded"
+            self.assertTrue(sm.build_payload(4, light=True)["modelShadow"]["free"])
         self.assertEqual(sm.shadow_runs[other]["state"], "failed")
         self.assertIn("already carrying", sm.shadow_runs[other]["error"])
-        self.assertEqual(len(sm.registry), 1)
 
     def test_a_placement_that_raises_is_a_failed_run(self):
         sm = self.make_manager()

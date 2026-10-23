@@ -185,7 +185,11 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     placing+running+grading runs instead, reported as `modelShadow.free`) and is never on the wire
     as a session: `sessions`/`closedSessions` drop it, its slug is kept out of the resume picker
     (`_carded_slugs`) and the archive. `normalizeSessions` drops an older agent's `shadow:true`.
-    It surfaces only as `shadowRuns`. Tests: `test_a_shadow_is_never_reported_as_a_session`,
+    It surfaces only as `shadowRuns`. A hub command naming a shadow id is refused
+    (`_is_shadow_sid`; `resume` keeps its reported refusal). `_session_payload` still RUNS for a
+    shadow and is filtered after: it folds `modelActual`, and `_publish_mod_status` pairs by
+    position. The sampler skips a host with a `spawnShadow` still queued (its `free` predates it;
+    a run past the cap is failed, never deferred). Tests: `test_a_shadow_is_never_reported_as_a_session`,
     `test_a_host_carries_at_most_its_shadow_runs`.
   - `spawnShadow` carries a hub-minted `sh-<hex>` id; `observeShadows` takes a host's
     `shadowRuns` report only for an id dispatched to THAT host in THAT org. A grade is final.

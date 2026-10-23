@@ -31956,6 +31956,14 @@ class SessionManager:
         if isinstance(tid, str) and tid and tid not in self.shadow_tids:
             self.shadow_tids.append(tid)
 
+    def _is_shadow_sid(self, sid):
+        if not isinstance(sid, str) or not sid:
+            return False
+        if sid in self.shadow_sids:
+            return True
+        sess = self._find(sid)
+        return bool(sess and sess.get("shadow"))
+
     def _shadow_session_live(self, sid):
         sess = self._find(sid) if sid else None
         return sess if sess and sess.get("status") in ("running", "queued") else None
@@ -45415,7 +45423,13 @@ class SessionManager:
                 continue
             ctype = cmd.get("type")
             try:
-                if ctype == "spawn":
+                if ctype != "resume" and self._is_shadow_sid(cmd.get("sessionId")):
+                    # A shadow run (XERK-1847) is the manager's own and is never
+                    # on the wire, so a hub command naming one by id (input, kill,
+                    # restart, ...) is refused, never run. `resume` keeps its own
+                    # reported refusal.
+                    log(f"command {ctype} ({cid}) refused: it names a shadow run")
+                elif ctype == "spawn":
                     self.spawn(
                         cmd.get("repo"),
                         prompt=cmd.get("prompt"),
@@ -47097,9 +47111,13 @@ class SessionManager:
             # A shadow run's sessions are never reported (XERK-1847): they are
             # the hub's evidence-gathering, reported as `shadowRuns`, and a card
             # would let an operator type into, stop or count a blind re-run.
-            "sessions": self._publish_mod_status(
-                [self._session_payload(s, refresh, light) for s in self.registry
-                 if not s.get("shadow")]),
+            # Built for every record first: `_session_payload` also folds what a
+            # shadow run reports (`modelActual`), and the mod-status writer
+            # pairs payloads with the registry by position.
+            "sessions": [
+                p for s, p in zip(self.registry, self._publish_mod_status(
+                    [self._session_payload(s, refresh, light) for s in self.registry]))
+                if not s.get("shadow")],
             "closedSessions": self._closed_payload(),
             # Persistent usage, independent of active sessions: per-repo (keyed by
             # normalized origin so the hub can unify a repo across hosts) plus this

@@ -26977,6 +26977,12 @@ test("XERK-1847: a shadow goes only to a capable, free host decided into the org
   agents["sh-full"].modelShadow = { available: true, free: true };
   hub.modelShadowSweep(Date.now(), { rate: 1, dailyMax: 1 });
   assert.equal(agents["sh-full"].commands.length, 1);
+  // A second sweep before the host beats again sends it nothing more: its
+  // `free` predates the queued run.
+  hub.outcomeLedger._internals.reset();
+  hub.outcomeLedgerSweep();
+  hub.modelShadowSweep(Date.now(), { rate: 1 });
+  assert.equal(agents["sh-full"].commands.length, 1);
   agents["sh-full"].commands = [];
   agents["sh-full"].modelShadow = { available: true };
   hub.outcomeLedger._internals.reset();

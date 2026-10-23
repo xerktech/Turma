@@ -4882,6 +4882,9 @@ function shadowHostFor(site, repo, used, now) {
     if (!(a.repos || []).some((r) => r && r.name === repo)) continue;
     const free = a.modelShadow.free;
     if (!(typeof free === "boolean" ? free : hostHasFreeSlot(a))) continue;
+    // `free` is as of the host's last beat: a shadow still queued for it was
+    // not counted there, and one past the agent's cap is failed, not deferred.
+    if ((a.commands || []).some((c) => c && c.type === "spawnShadow")) continue;
     if (hostAutoPaused(key, a, paused)) continue;
     const avail = hostAvailability(a);
     if (avail > bestAvail) { best = key; bestAvail = avail; }
