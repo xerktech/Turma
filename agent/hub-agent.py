@@ -19258,7 +19258,9 @@ def _pane_blocking_dialog(cap):
       * an overlay with its footer cut off (`_pane_overlay_up`: the Ctrl-R
         history search, a short /resume picker);
       * qwen's Ctrl-R history search, whose Enter submits an older matched
-        prompt (`_qwen_history_search_up`).
+        prompt (`_qwen_history_search_up`);
+      * a rounded box drawn as the pane's bottom in place of the composer
+        (`_pane_bottom_box_up`: qwen's Rewind picker).
     Keeping all but the first OUT of `parse_pane_prompt` is deliberate: `panePrompt`
     is a wire contract whose options the chat page renders as clickable digits,
     and these have no digit to click (or, for the picker, digits that a
@@ -19272,7 +19274,8 @@ def _pane_blocking_dialog(cap):
             or _pane_cut_choice_up(cap)
             or _pane_overlay_up(cap)
             or _qwen_waiting_up(cap)
-            or _qwen_history_search_up(cap))
+            or _qwen_history_search_up(cap)
+            or _pane_bottom_box_up(cap))
 
 
 # qwen's status line while one of its dialogs waits on a person: its spinner
@@ -19366,6 +19369,100 @@ def _qwen_history_search_up(cap):
     if not all(_QWEN_HISTORY_MATCH_RE.match(line) for line in matches):
         return False
     return len(matches) >= 2 or (len(matches) == 1 and trailer)
+# A rounded box's rows (text may overdraw the rule between the corners).
+_PANE_BOX_BOTTOM_RE = re.compile(r"^( *)╰.*╯$")
+_PANE_BOX_TOP_RE = re.compile(r"^( *)╭.*╮$")
+_PANE_BOX_SIDE_RE = re.compile(r"^( *)│.*│$")
+# The same box drawn with no right edge: past ~104 columns qwen's Rewind
+# confirm clips its own note line and drops every right corner and side.
+_PANE_OPEN_BOX_BOTTOM_RE = re.compile(r"^( *)╰─")
+_PANE_OPEN_BOX_TOP_RE = re.compile(r"^( *)╭─.*─$")
+_PANE_OPEN_BOX_SIDE_RE = re.compile(r"^( *)│")
+_PANE_OPEN_BOX_MIN_CELLS = 100
+
+
+def _pane_bottom_box_up(cap):
+    """Whether a rounded box is the pane's bottom, where the composer belongs
+    (XERK-2219). qwen 0.22.3 / 0.26's Rewind picker (two Escapes, e.g. two
+    Stop clicks) draws one: a list of earlier turns, then a "Rewind to: …"
+    confirm with "Restore conversation only" preselected. A typed message +
+    Enter picked a turn and the next Enter rewound the session (verified
+    live). Its key hints sit INSIDE the box and are cut or overdrawn by the
+    box rule below ~60 columns, so `_hint_dialog_up` cannot read them; the box
+    is read by position instead.
+
+    From the pane's last row up: maybe its "╰…╯", then "│…│" rows, up to its
+    "╭…╮", all on one column and one right cell. A box taller than the pane
+    loses an end: at ≤6 rows qwen draws only the top ("╭…╮" as the LAST row),
+    and a tall one only the bottom; one visible corner row is enough. Past
+    ~104 columns the confirm draws no right edge at all (`_pane_open_box_up`).
+    An idle
+    composer (Claude's rules, qwen's ─ box with its footer under it) never
+    ends the pane in a box row, and a tool-output box in the transcript always
+    has the composer below it: no frame of the 20k-frame corpus ends so."""
+    if not cap:
+        return False
+    # Not `_PANE_SCROLLBAR_RE`: it would strip the box's own "│" edge.
+    # qwen's scrollbar column sits outside the box, on the transcript rows.
+    shown = [line.rstrip() for line in _ANSI_RE.sub("", cap).splitlines()
+             if line.strip()]
+    if not shown:
+        return False
+    rows = list(reversed(shown))
+    if _pane_open_box_up(rows):
+        return True
+    bottom = _PANE_BOX_BOTTOM_RE.match(rows[0])
+    first = bottom or _PANE_BOX_TOP_RE.match(rows[0]) or _PANE_BOX_SIDE_RE.match(rows[0])
+    if not first:
+        return False
+    col, right = len(first.group(1)), _pane_cells(rows[0])
+
+    def edge(regex, line):
+        m = regex.match(line)
+        return bool(m) and len(m.group(1)) == col and _pane_cells(line) == right
+
+    if edge(_PANE_BOX_TOP_RE, rows[0]):
+        return _pane_lone_box_top(rows)
+    k = 1 if bottom else 0
+    while k < len(rows) and edge(_PANE_BOX_SIDE_RE, rows[k]):
+        k += 1
+    if k < len(rows):
+        return edge(_PANE_BOX_TOP_RE, rows[k])
+    return bool(bottom) and k > 1
+
+
+def _pane_open_box_up(rows):
+    """`_pane_bottom_box_up` for a box drawn with no right edge: a "╭─…─" top
+    and a "╰─…" bottom of one width on one column (the bottom may carry the
+    hint and clipped note text past its rule, as at 10 rows), "│" sides
+    there. Unlike the closed form, the top must show: qwen clips this box at
+    the BOTTOM, never the top. `rows` run from the pane's last row up."""
+    if _PANE_OPEN_BOX_TOP_RE.match(rows[0]):
+        # qwen draws this form only past ~104 columns, its top ~102 cells
+        # wide; a short "╭───" is more likely a draft's line (Claude at 2
+        # rows shows neither its prompt nor its rules).
+        return (_pane_cells(rows[0]) >= _PANE_OPEN_BOX_MIN_CELLS
+                and _pane_lone_box_top(rows))
+    bottom = _PANE_OPEN_BOX_BOTTOM_RE.match(rows[0])
+    if not bottom:
+        return False
+    col, width = len(bottom.group(1)), _pane_cells(rows[0])
+    for line in rows[1:]:
+        top = _PANE_OPEN_BOX_TOP_RE.match(line)
+        if top:
+            return len(top.group(1)) == col and _pane_cells(line) == width
+        side = _PANE_OPEN_BOX_SIDE_RE.match(line)
+        if not side or len(side.group(1)) != col:
+            return False
+    return False
+
+
+def _pane_lone_box_top(rows):
+    """Whether a box top that is the pane's LAST row is an overlay's: at ≤6
+    rows qwen's Rewind picker shows only that. Not while a composer prompt
+    is on screen ("❯" / ">" at column 0): a Claude pane cut to 8 rows ends
+    in its draft's last line, which a typed "╭───" would otherwise match."""
+    return not any(line[:1] in ("❯", ">") for line in rows[1:])
 
 
 # An idle composer's rule, drawn from column 0 (a dialog's box rule is indented).

@@ -91,6 +91,16 @@ composed.**
       the search). Once a short pane's list scrolls it off, a bottom of only list rows (`▼`/
       `(k/N)` trailer allowed) counts: a popup over a draft is held then too, on purpose.
       Tests: `TestQwenHistorySearch`.
+    - A rounded box ending the pane (`╰…╯` / `│…│` rows up to `╭…╮`) is an overlay in place of
+      the composer (`_pane_bottom_box_up`, XERK-2219): qwen's Rewind picker, whose hints the box
+      rule overdraws when narrow; at ≤6 rows only its `╭…╮` shows, as the last row. Typed text
+      + Enter there picked a turn, and the next Enter rewound the session (verified live).
+      - Past ~104 columns it has NO right edge (`_pane_open_box_up`): top and bottom must share
+        column and width, the top must show, and a lone edgeless top must be ≥100 cells.
+      - A lone top never counts under a `❯`/`>` column-0 prompt (a draft's typed `╭───`).
+      - Accepted: a 2-row Claude pane whose draft ends in a typed CLOSED `╭──╮` is held. No
+        geometry cue separates it: real pickers draw no scrollbar there too (9 live frames).
+      Tests: `TestPaneBottomBox`.
     - **A pane ≤4 rows or ≤9 columns is HELD, not read** (`_pane_too_small`, XERK-2222): there a
       dialog and an idle composer both draw nothing telling (8x4 MCP approval: "to/canc/el"; 8x4
       idle: logo + rule, no `❯`). Checked before every write and the Enter, and in set_model /
