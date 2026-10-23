@@ -93,6 +93,9 @@ DevOps, and what gets typed back because of it.
     (`MR_DISCOVER_SLOW_SEC`, a hang) ends the pass. Never a host-wide pause, and never reorder failed
     sessions: `_gitlab_get` is None for a 404 too, and each variant starved someone (QA, 3 passes).
     Accepted: one transient failure can still let the open-PR nudge fire once before the retry.
+  - Residuals: a resumed/migrated session's fresh `createdAt` hides an MR its earlier life
+    opened; an MR head already on the base (a sibling's merged, then rebased in) passes the
+    ancestor gate. Both on the rollup ticket.
 - **A GitLab MR and an ADO PR answer everywhere a GitHub PR does**: dispatch by URL to
   `mr_status`/`azdo_pr_status`, each polled only through the source that can answer it
   (`_pr_source_ok`; unreachable → bare link). ADO reuses the board's PAT, no CI rollup: `checks` is

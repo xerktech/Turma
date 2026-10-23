@@ -37860,11 +37860,21 @@ class TestDiscoverBranchMrs(ManagerMixin, unittest.TestCase):
         self.assertNotIn("s0", self.sm._mr_discover_retry_at)
 
     def test_a_slow_failure_ends_the_pass(self):
-        self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(3)]
-        order, lookup = self._lookup_by_sid(lambda sid, n: None)
-        with mock.patch.object(ha, "MR_DISCOVER_SLOW_SEC", 0):
-            self.run_pass(lookup)
-        self.assertEqual(order, ["s0"])
+        """Timed by the real MR_DISCOVER_SLOW_SEC around the lookup itself: a
+        failure that took 6s (a hang) ends the pass, one that took 4s does not."""
+        for took, want in ((6.0, ["s0"]), (4.0, ["s0", "s1", "s2"])):
+            self.sm._mr_discover_asked.clear()
+            self.sm._mr_discover_retry_at.clear()
+            self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(3)]
+            clock = [1000.0]
+            order, inner = self._lookup_by_sid(lambda sid, n: None)
+
+            def lookup(*a, inner=inner, took=took):
+                clock[0] += took
+                return inner(*a)
+            with mock.patch.object(ha.time, "monotonic", lambda: clock[0]):
+                self.run_pass(lookup)
+            self.assertEqual(order, want, took)
 
     def test_a_session_that_failed_once_is_not_starved_by_the_cap(self):
         """Past its backoff a once-failed session takes its turn in the
