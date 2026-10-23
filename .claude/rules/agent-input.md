@@ -152,6 +152,10 @@ composed.**
     - Keyed to the pane epoch; a relaunch, and `_kill_tmux` (`_forget_pane`), drop the record.
     - Residual: held state is in memory; an agent restart loses it.
     Tests: `TestHeldForDialog`.
+    - A test whose real input worker may still be RETRYING when it ends must
+      `_park_input_worker(sm)` BEFORE its patches lift: the worker outlives the test, and a retry
+      in flight typed into the next test's fakes (XERK-2231). Clearing `input_held` alone does
+      not stop a delivery already under way.
   - **Clearing an unsent message CONVERGES on the composer read back** (`_clear_composer`):
     never a press count from the text. Measured on 2.1.300: Ctrl+U deletes to the start of the
     VISUAL row (a wrapped 400-char line at 120 cols lost ~65 chars a press; counting logical
