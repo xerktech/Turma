@@ -11353,6 +11353,8 @@ class TestOverlayWithItsFooterCut(unittest.TestCase):
         # Only as the area's first line: a later "Search …" row says nothing.
         self.assertFalse(ha._pane_overlay_up(
             "─" * 26 + "\n  No matching prompts\n  Search prompts\n"))
+        # Indented only: a column-0 line under the rule is no overlay title.
+        self.assertFalse(ha._pane_overlay_up("─" * 26 + "\nSearch prompts\n"))
 
     def test_under_a_rule_only_the_cursor_row_says_overlay(self):
         cap = self.HIST_26x8.replace("  ❯ limits", "    limits").replace("  Search", "  Find")
