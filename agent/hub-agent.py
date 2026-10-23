@@ -8503,8 +8503,9 @@ PR_STATUS_MAX = 20
 MR_DISCOVER_MAX = 5
 # A FAILED lookup (GitLab down or hanging, or a project the token cannot read)
 # ends the pass, so a hung GitLab costs one request timeout a pass, and that
-# session alone is not asked again for this long.
-MR_DISCOVER_FAIL_BACKOFF_SEC = 120
+# session alone is not asked again for this long. Under two PR-refresh passes
+# (~60s each), so it is due again by the second.
+MR_DISCOVER_FAIL_BACKOFF_SEC = 110
 
 # PR auto-merge (XERK-550): how long a single `gh pr merge` may block on its
 # worker thread, and how many outcomes stay staged (each is a small dict keyed
@@ -41378,7 +41379,11 @@ class SessionManager:
         with self._discovered_lock:
             for sid in [k for k in self._discovered_prs if k not in live]:
                 del self._discovered_prs[sid]
-        due.sort(key=lambda x: self._mr_discover_asked.get(x["id"], 0.0))
+        # A session whose last lookup failed goes LAST: its failure ends the
+        # pass, so first in line it would block every healthy session behind it
+        # (a 404 for a project the token cannot read fails every time).
+        due.sort(key=lambda x: (x["id"] in self._mr_discover_retry_at,
+                                self._mr_discover_asked.get(x["id"], 0.0)))
         asked = 0
         for sess in due:
             if asked >= MR_DISCOVER_MAX:
@@ -41415,6 +41420,7 @@ class SessionManager:
                 self._mr_discover_retry_at[sid] = (time.monotonic()
                                                    + MR_DISCOVER_FAIL_BACKOFF_SEC)
                 break
+            self._mr_discover_retry_at.pop(sid, None)
             if not found:
                 continue
             self._mr_discover_found[sid] = (branch, head)
