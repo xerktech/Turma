@@ -52947,6 +52947,14 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         sm.closed.append(dict(sess, shadow=sess["shadow"], closedAt=1))
         self.assertEqual(sm._closed_payload(), [])
 
+    def test_a_new_session_never_reuses_a_past_shadow_id(self):
+        # A reused id would have every hub command to the operator's session
+        # refused as a shadow's, and its conversation never resumed.
+        sm = self.make_manager()
+        sm.shadow_sids = ["aaaaa"]
+        with mock.patch.object(ha.secrets, "token_hex", side_effect=["aaaaaa", "bbbbbb"]):
+            self.assertEqual(sm._new_id(), "bbbbb")
+
     def test_a_host_carries_at_most_its_shadow_runs(self):
         sm = self.make_manager()
         sm._launch_ttyd = mock.Mock()

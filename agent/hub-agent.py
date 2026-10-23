@@ -28473,7 +28473,9 @@ class SessionManager:
         return next((s for s in list(self.registry) if s.get("id") == sid), None)
 
     def _new_id(self):
-        existing = {s.get("id") for s in self.registry}
+        # Never a remembered shadow run's id (XERK-1847): commands naming one are
+        # refused and its conversation is never resumed or archived.
+        existing = {s.get("id") for s in self.registry} | set(self.shadow_sids)
         while True:
             sid = secrets.token_hex(3)[:5]
             if sid not in existing:
