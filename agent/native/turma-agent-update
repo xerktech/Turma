@@ -128,6 +128,19 @@ POLL_RETRY_SEC="${TURMA_POLL_RETRY_SEC:-60}"
 # per-USER (not prefix-scoped like the lock/stamps, XERK-551): it is about the one
 # `claude` binary this host runs, which every install shares.
 CLAUDE_UNPARSEABLE="$HOME/.turma/claude-unparseable"
+# XERK-2229. Where a run stages the download when TMPDIR has less than
+# STAGE_MIN_FREE_KIB free: a full /tmp (a tmpfs other sessions' scratch had
+# filled) failed every download and kept the host a release behind. ~/.turma
+# sits on the home filesystem the install lives on. Prefix-scoped by the stage
+# name itself, like the TMPDIR stages.
+STAGE_FALLBACK="$HOME/.turma/stage"
+STAGE_MIN_FREE_KIB=65536
+# What run_once returns when an update was due but could not be fetched or
+# installed: counted by note_agent_check, but NOT retried at the --loop's short
+# backoff (a full disk or a bad asset stays so; hammering the API every minute
+# would only rate-limit the host).
+UPDATE_FAILED_RC=3
+UNREAD_UNIFIED=""
 BOOT_MIN_INTERVAL="${TURMA_BOOT_UPDATE_MIN_INTERVAL:-300}"
 CLAUDE_PKG="@anthropic-ai/claude-code"
 # dsh (DeepSeek Harness) toolchain. The CLI is installed at LATEST and updated on
@@ -945,7 +958,10 @@ try_unified() {  # <cur> <stage>
   [ -n "$utag" ] || return 1
 
   mdir="$stage/manifest"; mkdir -p "$mdir"
-  download_assets "$utag" "$mdir" 'manifest.json' >/dev/null 2>&1 || true
+  # Remembered for try_legacy: a unified release whose manifest we could not
+  # READ (a full disk truncates it) is a failure, not "no release" (XERK-2229).
+  UNREAD_UNIFIED="$utag"
+  fetch_payload "$cur" "$utag's manifest.json" "$utag" "$mdir" 'manifest.json' || true
   [ -f "$mdir/manifest.json" ] || { logmsg "unified release $utag has no manifest.json; trying legacy"; return 1; }
 
   comp_version="$(manifest_native_field "$mdir/manifest.json" version)"
@@ -955,6 +971,7 @@ try_unified() {  # <cur> <stage>
   if [ -z "$comp_version" ] || [ -z "$asset" ] || [ -z "$release_tag" ]; then
     logmsg "manifest.json missing agent-native fields; trying legacy"; return 1
   fi
+  UNREAD_UNIFIED=""
 
   if newer_than "$comp_version" "$cur"; then
     logmsg "update available: $cur -> $comp_version (from $release_tag, release $utag)"
@@ -965,11 +982,11 @@ try_unified() {  # <cur> <stage>
 
   local dl="$stage/payload"; mkdir -p "$dl"
   if [ -n "$sha" ]; then
-    download_assets "$release_tag" "$dl" "$asset" "$sha" || { logmsg "download failed for $asset; keeping $cur"; return 0; }
+    fetch_payload "$cur" "$asset" "$release_tag" "$dl" "$asset" "$sha" || return "$UPDATE_FAILED_RC"
   else
-    download_assets "$release_tag" "$dl" "$asset" || { logmsg "download failed for $asset; keeping $cur"; return 0; }
+    fetch_payload "$cur" "$asset" "$release_tag" "$dl" "$asset" || return "$UPDATE_FAILED_RC"
   fi
-  verify_and_install "$dl" "$comp_version" || true
+  verify_and_install "$dl" "$comp_version" || return "$UPDATE_FAILED_RC"
   return 0
 }
 
@@ -978,6 +995,11 @@ try_legacy() {  # <cur> <stage>
   local cur="$1" stage="$2" latest tag dl
   latest="$(latest_legacy_version || true)"
   if [ -z "$latest" ]; then
+    if [ -n "$UNREAD_UNIFIED" ]; then
+      logmsg "could not read release $UNREAD_UNIFIED's manifest and no legacy release" \
+        "exists; staying at $cur"
+      return "$UPDATE_FAILED_RC"
+    fi
     logmsg "no native release found (or auth unavailable); staying at $cur"
     return 0
   fi
@@ -985,12 +1007,59 @@ try_legacy() {  # <cur> <stage>
   if newer_than "$latest" "$cur"; then
     logmsg "update available (legacy): $cur -> $latest ($tag)"
   elif ! needs_repair "$latest" "$cur"; then
+    if [ -n "$UNREAD_UNIFIED" ]; then
+      logmsg "could not read release $UNREAD_UNIFIED's manifest; legacy $latest is not newer," \
+        "staying at $cur"
+      return "$UPDATE_FAILED_RC"
+    fi
     logmsg "up to date ($cur; latest $latest)"
     return 0
   fi
   dl="$stage/payload"; mkdir -p "$dl"
-  download_assets "$tag" "$dl" '*.tar.gz' '*.sha256' || { logmsg "download failed for $tag; keeping $cur"; return 0; }
-  verify_and_install "$dl" "$latest" || true
+  fetch_payload "$cur" "$tag" "$tag" "$dl" '*.tar.gz' '*.sha256' || return "$UPDATE_FAILED_RC"
+  verify_and_install "$dl" "$latest" || return "$UPDATE_FAILED_RC"
+}
+
+# KiB free on the filesystem holding <path>, or nothing if df can't say.
+free_kib() {  # <path>
+  df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 }' | tr -cd '0-9'
+}
+
+# download_assets for the payload, saying WHY when it fails (XERK-2229): the
+# tool's last error line and the free space where it wrote, since "download
+# failed" alone hid a full disk for a release.
+fetch_payload() {  # <cur> <what> <tag> <destdir> <pattern...>
+  local cur="$1" what="$2" err why
+  shift 2
+  err="$(download_assets "$@" 2>&1 >/dev/null)" && return 0
+  why="$(printf '%s\n' "$err" | sed '/^[[:space:]]*$/d' | tail -n1 | rev | cut -c1-200 | rev)"
+  logmsg "download failed for $what (${why:-no error output}; $(free_kib "$2") KiB free" \
+    "under $2); keeping $cur"
+  return 1
+}
+
+# The dir this run stages in: TMPDIR, unless it has less than
+# STAGE_MIN_FREE_KIB free and STAGE_FALLBACK has more (XERK-2229). The fallback
+# is used only as a real dir we own, never through a link planted in ~/.turma.
+stage_base() {
+  local tmp="${TMPDIR:-/tmp}" free fb_free
+  free="$(free_kib "$tmp")"
+  if [ -n "$free" ] && [ "$free" -lt "$STAGE_MIN_FREE_KIB" ] \
+     && { [ -e "$STAGE_FALLBACK" ] || [ -L "$STAGE_FALLBACK" ] \
+            || mkdir -m 700 "$STAGE_FALLBACK" 2>/dev/null; } \
+     && [ -d "$STAGE_FALLBACK" ] && [ ! -L "$STAGE_FALLBACK" ] && [ -O "$STAGE_FALLBACK" ]; then
+    chmod 700 "$STAGE_FALLBACK" 2>/dev/null || true
+    fb_free="$(free_kib "$STAGE_FALLBACK")"
+    if [ -n "$fb_free" ] && [ "$fb_free" -gt "$free" ]; then
+      logmsg "$tmp has only ${free} KiB free; staging under $STAGE_FALLBACK"
+      printf '%s\n' "$STAGE_FALLBACK"
+      return 0
+    fi
+  elif [ -n "$free" ] && [ "$free" -lt "$STAGE_MIN_FREE_KIB" ]; then
+    logmsg "$tmp has only ${free} KiB free and $STAGE_FALLBACK is not a dir we own;" \
+      "staging in $tmp anyway"
+  fi
+  printf '%s\n' "$tmp"
 }
 
 # Remove the staging dirs earlier runs of this prefix left when they were
@@ -1000,9 +1069,16 @@ try_legacy() {  # <cur> <stage>
 # lock, and a reclaim kills only the holder, not its `( dispatch_locked )`
 # subshell. A glob, not find: find never descends a symlinked TMPDIR. Only real
 # dirs we own are touched — /tmp is shared and a root updater must never delete
-# another user's entry.
+# another user's entry. Both stage bases are swept (XERK-2229).
 sweep_stages() {
-  local base="${TMPDIR:-/tmp}" d pid
+  local base
+  sweep_stages_in "${TMPDIR:-/tmp}"
+  # A link planted at the fallback is never followed (TMPDIR's own link is).
+  [ -L "$STAGE_FALLBACK" ] || sweep_stages_in "$STAGE_FALLBACK"
+}
+
+sweep_stages_in() {  # <base>
+  local base="$1" d pid
   for d in "$base/turma-update.$PREFIX_TAG".*; do
     if [ ! -d "$d" ] || [ -L "$d" ] || [ ! -O "$d" ]; then continue; fi
     pid="${d#"$base/turma-update.$PREFIX_TAG."}"; pid="${pid%%.*}"
@@ -1038,11 +1114,17 @@ run_once() {
   # Read OUTSIDE the $(...): inside it, $BASHPID is the short-lived substitution
   # child, and a stage named for a dead pid is swept from under a live run.
   me="$BASHPID"
-  stage="$(mktemp -d "${TMPDIR:-/tmp}/turma-update.$PREFIX_TAG.$me.XXXXXX")"
+  # Unchecked, a failed mktemp (a missing TMPDIR, no inodes) left $stage empty
+  # and staged every download at the filesystem root.
+  stage="$(mktemp -d "$(stage_base)/turma-update.$PREFIX_TAG.$me.XXXXXX")" \
+    || { logmsg "could not create a staging dir; keeping $cur"; return "$UPDATE_FAILED_RC"; }
   # shellcheck disable=SC2064
   trap "rm -rf '$stage' '$PREFIX.update'" RETURN
 
-  try_unified "$cur" "$stage" && return 0
+  local rc=0
+  try_unified "$cur" "$stage" || rc=$?
+  # 1 = no usable unified release, so the legacy stream decides.
+  [ "$rc" = 1 ] || return "$rc"
   try_legacy "$cur" "$stage"
 }
 
@@ -1326,7 +1408,8 @@ main() {
     [ "$retry" -lt 1 ] && retry=1
     [ "$retry" -gt "$INTERVAL" ] && retry="$INTERVAL"
     while true; do
-      if run_agent_check; then
+      rc=0; run_agent_check || rc=$?
+      if [ "$rc" = 0 ] || [ "$rc" = "$UPDATE_FAILED_RC" ]; then
         sleep "$INTERVAL"
       else
         # A poll SKIPPED or ERRORED — most importantly one lost to lock
@@ -1345,7 +1428,12 @@ main() {
     if throttled "$STAMP" "boot check"; then return 0; fi
     run_agent_check || return 0
   else
-    run_agent_check || return 0
+    # The timer's run: an update that was due and failed fails the unit, so
+    # `systemctl status` shows it rather than SUCCESS (XERK-2229). A skip (lock
+    # contention) stays a success, as before.
+    run_agent_check || rc=$?
+    [ "$rc" = "$UPDATE_FAILED_RC" ] && return "$rc"
+    return 0
   fi
 }
 
