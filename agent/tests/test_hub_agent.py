@@ -11443,6 +11443,109 @@ class TestQwenHistorySearch(unittest.TestCase):
         cap = "  (r:) is qwen's search\n(r:) quoted at column 0\n" + self.IDLE_30x12
         self.assertFalse(ha._qwen_history_search_up(cap))
         self.assertFalse(ha._qwen_history_search_up(""))
+class TestPaneBottomBox(unittest.TestCase):
+    """XERK-2219: qwen 0.22.3's Rewind picker, live frames (tmux 3.4). A
+    rounded box at the pane's bottom in place of the composer; typed text +
+    Enter picked a turn, and the next Enter would rewind the session."""
+
+    LIST_40x12 = ("    (cause: fetch failed)]             │\n                                       │\n"
+                  "  > prompt number 10 a                 │\n  ✕ [API Error: Connection error.      │\n"
+                  "    (cause: fetch failed)]             █\n  ╭" + "─" * 34 + "╮\n  │" + "─" * 34 + "│\n"
+                  "  │ ↑ #2 prompt number 2 a           │\n  │   #3 prompt number 3 a           │\n"
+                  "  │   #4 prompt number 5 a           │\n  │─↑↓ to navigate · Enter to select─│\n"
+                  "  ╰" + "─" * 34 + "╯\n")
+    CONFIRM_20x8 = ("  ✕ [API Error:    │\n    Connection     │\n    error.         │\n"
+                    "    (cause: fetch  │\n     failed)]      █\n  ╭──────────────╮\n"
+                    "  │─Rewind pro..─│\n  ╰─↑↓ to ───────╯\n")
+    CONFIRM_100x8 = ("  > prompt number 10 a" + " " * 77 + "│\n  ╭" + "─" * 94 + "╮\n"
+                     "  │─Rewind to: prompt number 10 a" + "─" * 64 + "│\n"
+                     "  ╰─↑↓ to navigate · Enter to select · Esc to go back" + "─" * 44 + "╯\n")
+    # At <=6 rows the box overflows the pane: only its top is drawn, last.
+    LIST_100x4 = (" " * 99 + "│\n  > please read @fa yes" + " " * 77 + "│\n"
+                  "  ✕ [API Error: Connection error. (cause: fetch failed)] (Press Ctrl+Y to retry)"
+                  + " " * 19 + "█\n  ╭" + "─" * 94 + "╮\n")
+    CONFIRM_10x3 = "    ret  │\n    ry)  █\n  ╭────╮\n"
+    LIST_40x2 = "    Ctrl+Y to retry)                   █\n  ╭" + "─" * 34 + "╮\n"
+    # Past ~104 columns the confirm clips its note line and draws no right
+    # edge at all; the hint overdraws the bottom rule (QA, 140x8, 0.22.3).
+    CONFIRM_140x8 = ("  ╭" + "─" * 99 + "\n  │" + "─" * 99 + "\n  │ Rewind to: prompt number 1 a\n"
+                     "  │ ›︎ Restore conversation only\n  │ File restore is unavailable for this turn "
+                     "(no captured file changes, or this turn predates the cur\n  │" + "─" * 99
+                     + "\n  ╰─↑↓ to navigate · Enter to select · Esc to go back" + "─" * 49 + "\n")
+    # At exactly 10 rows clipped note text is left on the bottom rule (QA).
+    CONFIRM_140x10 = ("  ╭" + "─" * 99 + "\n  │" + "─" * 99 + "\n  │ Rewind to: prompt number 4 a\n"
+                      "  │" + "─" * 99 + "\n  ╰─↑↓ to navigate · Enter to select · Esc to go back"
+                      "tured file changes, or this turn predates the cur\n")
+    # >=105 columns and <=6 rows: only the edgeless top, as the last row.
+    CONFIRM_140x4 = ("  > prompt 3 wide" + " " * 120 + "│\n" + " " * 139 + "│\n  ◆︎ ok noted."
+                     + " " * 126 + "█\n  ╭" + "─" * 99 + "\n")
+    IDLE_100x3 = "─" * 100 + "\n  ➜ work · git:(master) · x\n  Auto mode (shift + tab to cycle)\n"
+    IDLE_10x2 = "   ·\n  Auto …\n"
+    IDLE_QWEN = ("  > prompt number 10 a\n" + "─" * 30 + "\n>   Type your message or\n"
+                 "  @path/to/file\n" + "─" * 30 + "\n  ➜ work · git:(master) · x\n"
+                 "  Auto mode (shift + tab to…\n")
+
+    def test_the_rewind_picker_blocks_typing(self):
+        for name in ("LIST_40x12", "CONFIRM_20x8", "CONFIRM_100x8",
+                     "LIST_100x4", "CONFIRM_10x3", "LIST_40x2", "CONFIRM_140x8",
+                     "CONFIRM_140x10", "CONFIRM_140x4"):
+            with self.subTest(name):
+                cap = getattr(self, name)
+                self.assertTrue(ha._pane_bottom_box_up(cap))
+                self.assertTrue(ha._pane_blocking_dialog(cap))
+
+    def test_a_box_taller_than_the_pane_still_counts(self):
+        self.assertTrue(ha._pane_bottom_box_up("  │ #3 a  │\n  │ #4 b  │\n  ╰───────╯\n"))
+
+    def test_a_lone_top_under_a_composer_prompt_is_a_draft(self):
+        # Claude at 8 rows drops its bottom rule: a draft's typed "╭───" line
+        # is the last row (QA, 160x8). Its "❯" prompt row says composer.
+        draft = "─" * 160 + "\n❯\xa0draft line\\\n    ╭" + "─" * 14 + "\n"
+        self.assertFalse(ha._pane_bottom_box_up(draft))
+        # A wide top still loses to the prompt row, edgeless or closed (QA V3/N5).
+        prompt = "─" * 160 + "\n❯\xa0draft line\\\n    ╭"
+        self.assertFalse(ha._pane_bottom_box_up(prompt + "─" * 110 + "\n"))
+        self.assertFalse(ha._pane_bottom_box_up(prompt + "─" * 110 + "╮\n"))
+        # An edgeless top short of qwen's ~102 cells is no picker's (QA N2).
+        self.assertFalse(ha._pane_bottom_box_up("  draft 5\n  ╭" + "─" * 80 + "\n"))
+        # At 2 rows no prompt shows: a short edgeless top is no picker's.
+        self.assertFalse(ha._pane_bottom_box_up("  draft 5\n  ╭─────\n"))
+        closed = "─" * 40 + "\n> draft\n  ╭" + "─" * 10 + "╮\n"
+        self.assertFalse(ha._pane_bottom_box_up(closed))
+
+    def test_a_box_above_the_composer_is_not_one(self):
+        tool = "  ╭─ Shell ─╮\n  │ ls      │\n  ╰─────────╯\n"
+        self.assertFalse(ha._pane_bottom_box_up(tool + self.IDLE_QWEN))
+        for name in ("IDLE_QWEN", "IDLE_100x3", "IDLE_10x2"):
+            with self.subTest(name):
+                self.assertFalse(ha._pane_blocking_dialog(getattr(self, name)))
+
+    def test_the_box_must_close_on_one_column(self):
+        self.assertFalse(ha._pane_bottom_box_up("  some reply text\n  ╰──────╯\n"))
+        self.assertFalse(ha._pane_bottom_box_up("╭──────╮\n  │ x    │\n  ╰──────╯\n"))
+        self.assertFalse(ha._pane_bottom_box_up("  ╭────────╮\n  │ x    │\n  ╰──────╯\n"))
+        self.assertFalse(ha._pane_bottom_box_up("  ╰──────╯\n"))
+        # Every row on the box's column, and each side row "│"-edged there.
+        self.assertFalse(ha._pane_bottom_box_up("  ╭──────╮\nab│ x    │\n  ╰──────╯\n"))
+        self.assertFalse(ha._pane_bottom_box_up("  ╭──────╮\n  ab x   │\n  ╰──────╯\n"))
+        # A top on another column, or a side row not "│"-edged (QA mutants).
+        self.assertFalse(ha._pane_bottom_box_up("    ╭──╮\n  │ x  │\n  ╰────╯\n"))
+        self.assertFalse(ha._pane_bottom_box_up("  ╭────╮\n  │ x  █\n  ╰────╯\n"))
+        # The open (edgeless) form: one column, and top and bottom one width.
+        self.assertFalse(ha._pane_bottom_box_up("    ╭──────\n  │ x\n  ╰──────\n"))
+        self.assertFalse(ha._pane_bottom_box_up("  ╭────\n  │ x\n  ╰──────\n"))
+        self.assertFalse(ha._pane_bottom_box_up("  some reply\n  ╰──────\n"))
+        rule = "─" * 20
+        self.assertFalse(ha._pane_bottom_box_up("    ╭" + rule + "\n  │ x\n  ╰" + rule + "──\n"))
+        self.assertFalse(ha._pane_bottom_box_up("  ╭" + rule + "\n    │ x\n  ╰" + rule + "\n"))
+        # Its bottom is "╰─", its sides "│" (QA mutants O8/O6).
+        self.assertFalse(ha._pane_bottom_box_up("  ╭" + rule + "\n  │ x\n  ╰x" + rule[1:] + "\n"))
+        self.assertFalse(ha._pane_bottom_box_up("  ╭" + rule + "\n  x side\n  ╰" + rule + "\n"))
+        # The edgeless form needs its top: qwen clips that box at the bottom.
+        self.assertFalse(ha._pane_bottom_box_up("  │ a\n  │ b\n  ╰" + rule + "\n"))
+        # Side rows alone, with neither corner row visible, are no box.
+        self.assertFalse(ha._pane_bottom_box_up("  │ x    │\n  │ y    │\n"))
+        self.assertFalse(ha._pane_bottom_box_up(""))
 
 
 class TestOverlayWithItsFooterCut(unittest.TestCase):
