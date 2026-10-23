@@ -11307,6 +11307,32 @@ class TestOverlayWithItsFooterCut(unittest.TestCase):
         cap = "  ❯ quoted row\n" + "─" * 12 + "\n❯ \n" + "─" * 12 + "\n  ⏵⏵ auto\n"
         self.assertFalse(ha._pane_overlay_up(cap))
 
+    # Drafts whose box bottom the pane cuts off (live, QA): the draft's own
+    # indented "❯ 1. foo" line must not read as a picker cursor.
+    SHELL_DRAFT_40x8 = ("\n\n❯ /skills\n  ⎿  No changes\n\n" + "─" * 40 + "\n"
+                        "!\xa0echo hi\n    ❯ 1. foo\n")
+    DRAFT_120x8 = ("● Which one do you want?\n  ❯ 1. foo\n\n✻ Sautéed for 1s · done 7:14 PM\n\n"
+                   + "─" * 120 + "\n❯\xa0Which one?\n    ❯ 1. foo\n")
+
+    def test_a_draft_cut_below_its_box_stays_typeable(self):
+        for name in ("SHELL_DRAFT_40x8", "DRAFT_120x8"):
+            self.assertFalse(ha._pane_overlay_up(getattr(self, name)), name)
+
+    def test_each_composer_marker_vetoes_on_its_own(self):
+        edge = "▔" * 12 + "\n  old dialog\n"
+        # A column-0 prompt below the area's first line.
+        self.assertFalse(ha._pane_overlay_up(edge + "❯ draft\n    ❯ 1. foo\n"))
+        # A column-0 rule.
+        self.assertFalse(ha._pane_overlay_up(edge + "─" * 12 + "\n  ❯ row\n"))
+        # A mode footer.
+        self.assertFalse(ha._pane_overlay_up(
+            edge + "  ⏵⏵ auto mode on (shift+tab to cycle)\n  ❯ row\n"))
+        # Shell mode's footer.
+        self.assertFalse(ha._pane_overlay_up(edge + "  ! for shell mode\n"))
+        # The exit toast.
+        self.assertFalse(ha._pane_overlay_up("▔" * 12 + "\n  Press Ctrl-C again to exit\n"))
+        self.assertTrue(ha._pane_overlay_up(edge + "  ❯ row\n"))
+
     def test_under_a_rule_only_the_cursor_row_says_overlay(self):
         cap = self.HIST_26x8.replace("  ❯ limits", "    limits")
         self.assertFalse(ha._pane_overlay_up(cap))

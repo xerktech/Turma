@@ -19309,7 +19309,8 @@ def _pane_overlay_up(cap):
 
     The area starts at the last ▔ edge row (`_pane_prompt_edges`, which only a
     dialog draws), else at the last full-width column-0 "─" rule. Nothing in
-    it may be the composer's: no "❯" prompt and no rule at column 0, no
+    it may be the composer's: no "❯" prompt (nor a first line that is a
+    prompt line, "!" in shell mode) and no rule at column 0, no
     mode/shell/qwen footer, no exit toast. Then under a ▔ edge any content is
     an overlay; under a "─" rule (the composer's own top edge too) only a
     picker's indented "❯" cursor row says so."""
@@ -19330,7 +19331,9 @@ def _pane_overlay_up(cap):
             return False
     area = [line for line in lines[edge + 1:] if line.strip()]
     text = "\n".join(area)
-    if (not area
+    # The composer's prompt line opens the area when the box's bottom is cut
+    # off ("! echo hi" over a multi-line shell draft, QA).
+    if (not area or _COMPOSER_PROMPT_RE.match(area[0])
             or any(line.startswith("❯") or _COMPOSER_EDGE_RULE_RE.match(line) for line in area)
             or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
             or PANE_SHELL_FOOTER_RE.search(text) or _pane_composer_tail_up(lines)):
