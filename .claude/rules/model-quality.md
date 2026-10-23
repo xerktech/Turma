@@ -178,19 +178,21 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     toward that cap (`shadowsDispatchedSince(since, now)`, XERK-1858).
   - Model: of `MODEL_SHADOW_MODELS` (sonnet,haiku), never the live family, fewest pairs for the
     class. Host: online, DECIDED into the org, `modelShadow.available`, repo cloned (a shadow
-    never clones), shadow room (`modelShadow.free`; an older agent: a free slot), claude
-    default runtime, subscription not paused.
-  - **A shadow is no operator session**: it holds NO `MAX_SESSIONS` slot (`_slots_used`,
-    `_running_count`, spawn's capacity gate skip it; `TURMA_MAX_SHADOW_RUNS`, default 1, bounds
-    placing+running+grading runs instead, reported as `modelShadow.free`) and is never on the wire
-    as a session: `sessions`/`closedSessions` drop it, its slug is kept out of the resume picker
-    (`_carded_slugs`) and the archive. `normalizeSessions` drops an older agent's `shadow:true`.
-    It surfaces only as `shadowRuns`. A hub command naming a shadow id is refused
-    (`_is_shadow_sid`; `resume` keeps its reported refusal). `_session_payload` still RUNS for a
-    shadow and is filtered after: it folds `modelActual`, and `_publish_mod_status` pairs by
-    position. The sampler skips a host with a `spawnShadow` still queued (its `free` predates it;
-    a run past the cap is failed, never deferred). Tests: `test_a_shadow_is_never_reported_as_a_session`,
-    `test_a_host_carries_at_most_its_shadow_runs`.
+    never clones), a free shadow run (`modelShadow.free`; an older agent without it: a free
+    session slot), claude default runtime, subscription not paused.
+  - **A shadow takes no session slot and is no session on the wire** (XERK-2227): its own cap
+    `TURMA_MAX_SHADOW_RUNS` (1) counts RUNS placing/running/grading (`_shadow_runs_active`),
+    `spawn_shadow` fails a run past it, and `_slots_used`/`capacity` skip shadow records.
+    Neither its live nor closed session is heartbeated, and its transcripts are kept out of
+    the resume picker and the archive; the hub also drops an older agent's `shadow: true`
+    session in `normalizeSessions`. The run reaches the hub only as `shadowRuns`.
+  - **A shadow's payload is still BUILT, then filtered off the wire**: `_session_payload` folds
+    the run's `modelActual` and `_publish_mod_status` pairs payloads with the registry by
+    position, so filtering first lost the model and misaligned `/turma status`. A hub command
+    naming a shadow id is refused (`_is_shadow_sid`; `resume` keeps its reported refusal), and
+    `_new_id` never mints a remembered shadow or closed id.
+    Tests: `test_xerk2227_a_shadow_runs_on_a_full_host_and_is_built_but_not_served`,
+    `test_xerk2227_a_new_session_never_reuses_a_shadow_or_closed_id`.
   - `spawnShadow` carries a hub-minted `sh-<hex>` id; `observeShadows` takes a host's
     `shadowRuns` report only for an id dispatched to THAT host in THAT org. A grade is final.
   - **Shadow rows never feed the live groups or `/metrics`**; `aggregate().pairs` serves per
@@ -213,8 +215,8 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     is terminal, `_reap_shadow` also deletes any session whose `shadow.id` is the run's
     (XERK-2180). The hub drops a shadow row's `endedAt` while it reads running/grading again.
   - **Never a `ticket` block on either session** (and `_maybe_adopt_ticket` refuses a shadow), so
-    no ticket sweep — auto-stop on Done, auto-merge, close-ticket, routing — acts on it. The
-    hub raises no alert for a `shadow` session and lists it in no peer roster.
+    no ticket sweep — auto-stop on Done, auto-merge, close-ticket, routing — acts on it, and
+    it is in no peer roster.
   - **No-publish is enforced by the OS, not text** (XERK-1859, operator decision 2026-10-12:
     Claude Code's sandbox over a separate OS user). A shadow runs as the manager's uid, so it
     can READ every credential; the boundary is where one would be USED (`build_shadow_settings`,

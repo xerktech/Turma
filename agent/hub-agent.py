@@ -20538,9 +20538,9 @@ def fold_turn_state(report, turn, dialog=False):
 MODEL_SHADOW = os.environ.get("TURMA_MODEL_SHADOW", "1") != "0"
 SHADOW_RUNS_PATH = os.path.join(REGISTRY_DIR, "shadow-runs.json")
 SHADOW_RUNS_MAX = 50
-# How many shadow runs this host carries at once. Shadows hold NO session slot
-# (MAX_SESSIONS is the operator's work), so this is their own ceiling; the hub
-# dispatches only to a host reporting `modelShadow.free`.
+# Shadow runs in flight at once on this host (XERK-2227). A shadow takes no
+# session slot (MAX_SESSIONS is the operator's); this is its own ceiling,
+# reported as modelShadow.free so the hub dispatches on it.
 MAX_SHADOW_RUNS = _env_int("TURMA_MAX_SHADOW_RUNS", 1, minimum=1)
 # Session/transcript ids of past shadow sessions, kept so none is ever resumed.
 SHADOW_SESSIONS_KEEP = 2000
@@ -28540,27 +28540,32 @@ class SessionManager:
         Start back into. This is the count every capacity gate uses, so a crashed
         session no longer reads as free capacity the hub fills with fresh work.
         A paused sleeper's wake resume waiting on its worktree re-add (XERK-1575)
-        holds one too: that slot is the sleeper's. A shadow run holds none: it is
-        bounded by MAX_SHADOW_RUNS instead (`_shadow_runs_active`).
+        holds one too: that slot is the sleeper's. A shadow run (XERK-1847) holds
+        none: it has its own cap (MAX_SHADOW_RUNS, `_shadow_runs_active`), so it
+        never takes a slot the operator's work needs (XERK-2227).
 
         `exclude_id` drops one record from the tally — for `start()`, whose target
         is ALREADY an `error` record in this set: it is transitioning to `running`
         (net zero), so it must never be refused for the slot it already holds."""
         return sum(1 for s in self.registry
-                   if s.get("status") in SLOT_HOLDING_STATUSES
-                   and not s.get("shadow")
+                   if s.get("status") in SLOT_HOLDING_STATUSES and not s.get("shadow")
                    and not (exclude_id is not None and s.get("id") == exclude_id)
                    ) + self._restores_in_flight() + self._imports_reserved()
 
-    def _shadow_runs_active(self):
-        """Shadow runs this host is carrying: being placed, running or grading."""
+    def _shadows_placing(self):
         with self._shadow_place_lock:
-            placing = set(self._shadow_placing)
-        return len(placing | {rid for rid, r in self.shadow_runs.items()
-                              if r.get("state") in ("running", "grading")})
+            return len(self._shadow_placing)
+
+    def _shadow_runs_active(self):
+        """Shadow runs held against MAX_SHADOW_RUNS (XERK-2227): one being
+        placed off the beat (XERK-2167) or still running/grading. A RUN, not a
+        session: its grader replaces its run session, so a run never counts twice."""
+        return self._shadows_placing() + sum(
+            1 for r in self.shadow_runs.values() if r.get("state") in ("running", "grading"))
 
     def _queued_count(self):
-        return sum(1 for s in self.registry if s.get("status") == "queued")
+        return sum(1 for s in self.registry
+                   if s.get("status") == "queued" and not s.get("shadow"))
 
     def _capacity_payload(self):
         """This host's session ceiling and what is against it.
@@ -31198,9 +31203,9 @@ class SessionManager:
         # REPOS_ROOT (they share a project slug, but transcripts are per-session
         # and the RC bridge pointer is last-writer-wins), capped only by MAX.
         reason = None
-        # A shadow run holds no slot (MAX_SHADOW_RUNS bounds it), so it never
-        # waits behind the operator's work.
-        if not shadow and self._slots_used() >= MAX_SESSIONS:
+        # A shadow run never waits for a session slot: spawn_shadow already
+        # admitted it against MAX_SHADOW_RUNS (XERK-2227).
+        if self._slots_used() >= MAX_SESSIONS and not shadow:
             reason = "capacity"
         elif awaiting_clone:
             reason = "awaiting-clone"
@@ -31841,6 +31846,9 @@ class SessionManager:
                 return   # a re-delivered command
         if not MODEL_SHADOW:
             return self._fail_shadow(rid, cmd, "shadow runs are off on this host")
+        if self._shadow_runs_active() >= MAX_SHADOW_RUNS:
+            return self._fail_shadow(
+                rid, cmd, f"the host is at TURMA_MAX_SHADOW_RUNS ({MAX_SHADOW_RUNS})")
         sandbox = shadow_sandbox_reason()
         if sandbox:
             return self._fail_shadow(rid, cmd, f"no shadow sandbox on this host: {sandbox}")
@@ -31861,8 +31869,6 @@ class SessionManager:
         repo = next((r for r in scan_repos() if r["name"] == cmd.get("repo")), None)
         if not repo or not repo_forkable(repo["path"]):
             return self._fail_shadow(rid, cmd, "the repo is not cloned on this host")
-        if self._shadow_runs_active() >= MAX_SHADOW_RUNS:
-            return self._fail_shadow(rid, cmd, "this host is already carrying its shadow runs")
         job = {"rid": rid, "cmd": cmd, "key": key, "model": model, "merge": merge,
                "repo": repo, "at": time.time()}
         # Marked BEFORE the thread starts, so a re-delivery in this same batch
@@ -39633,19 +39639,7 @@ class SessionManager:
             wt = s.get("worktreePath") or (REPOS_ROOT if s.get("root") else None)
             if wt:
                 slugs.add(_project_slug(wt))
-        # A shadow run's conversations are never offered either (XERK-1847):
-        # resuming one is refused, and listing it reads as the operator's work.
-        return slugs | self._shadow_slugs()
-
-    def _shadow_slugs(self):
-        """Project slugs of every shadow session's worktree this host remembers
-        (the worktree dir is named for the session id)."""
-        sids = set(self.shadow_sids)
-        if not sids:
-            return set()
-        return {(m or {}).get("slug") or _project_slug(wt)
-                for wt, m in (self.usage_ledger or {}).items()
-                if os.path.basename(os.path.normpath(wt)) in sids}
+        return slugs
 
     def _session_meta_by_slug(self):
         """slug -> {createdAt, summary} drawn from live + closed session records,
@@ -39805,6 +39799,11 @@ class SessionManager:
         # between refreshes, _sorted_repo_entries() re-applies it against
         # registry every beat — see the filter there.
         carded = inputs["carded"]
+        # A shadow run's conversation is never offered (XERK-2227): resume
+        # refuses it anyway (_resume_at_cwd), and it is no session of the
+        # operator's. Its worktree dir is named for its session id.
+        shadow_sids = inputs.get("shadowSids", set(self.shadow_sids))
+        shadow_tids = inputs.get("shadowTids", set(self.shadow_tids))
         repo_names = {r["name"] for r in scan_repos()}
         # slug -> a real worktree path the ledger recorded, so a transcript whose
         # own cwd we can't read still classifies when the ledger keyed its path.
@@ -39831,7 +39830,7 @@ class SessionManager:
             for fname in names:
                 tid = fname[:-len(".jsonl")]
                 # The id is interpolated onto the tmux command line at resume.
-                if not VALID_CLAUDE_SID_RE.fullmatch(tid):
+                if not VALID_CLAUDE_SID_RE.fullmatch(tid) or tid in shadow_tids:
                     continue
                 path = os.path.join(proj, fname)
                 # Stat FIRST: (mtime, size) keys the cwd cache below, and a file
@@ -39847,7 +39846,7 @@ class SessionManager:
                     lp = slug_path.get(slug)
                     cwd = lp if lp and _project_slug(lp) == slug else None
                 cls = self._resumable_cwd_class(cwd, repo_names)
-                if not cls:
+                if not cls or os.path.basename(os.path.normpath(cwd)) in shadow_sids:
                     continue
                 repo, origin, root = cls
                 by_repo.setdefault(repo, []).append({
@@ -40253,16 +40252,16 @@ class SessionManager:
         # running (its Trajectory reads the raw layer back). `offer_raw` skips these.
         defer_raw = self._live_worktree_slugs() - self._live_dsh_slugs()
         sess_meta = self._session_meta_by_slug()
-        shadow = self._shadow_slugs()
         # slug -> {repo, remoteKey, worktree}, from the durable attribution ledger.
         slug_attr = {}
+        shadow_sids = set(self.shadow_sids)
         for wt, m in (self.usage_ledger or {}).items():
             m = m or {}
             if m.get("internal"):
                 continue  # the manager's own claude -p helper, never archived (XERK-27)
+            if os.path.basename(os.path.normpath(wt)) in shadow_sids:
+                continue  # a shadow run's worktree (XERK-2227): never archived
             slug = m.get("slug") or _project_slug(wt)
-            if slug in shadow:
-                continue  # a shadow run is never a session to browse (XERK-1847)
             slug_attr[slug] = {
                 "repo": m.get("repo") or "?",
                 "remoteKey": normalize_remote(m.get("remote")) or (m.get("repo") or "?"),
@@ -45988,6 +45987,8 @@ class SessionManager:
                         | {c.get("id") for c in self.closed}),
             "tickets": dict(self.ticket_ledger),
             "prLedger": dict(self.pr_ledger),
+            "shadowSids": set(self.shadow_sids),
+            "shadowTids": set(self.shadow_tids),
         }
 
     def _usage_scan(self, inputs):
@@ -46526,9 +46527,6 @@ class SessionManager:
             # (XERK-1845), for the hub's model-quality ledger.
             # An empty list is a known zero; absent (an older agent) is "can't tell".
             "qaRuns": qa_runs_wire(sess.get("qaRuns")),
-            # A shadow run's session (XERK-1847): the hub raises no alert for it
-            # and lists it in no peer roster. Absent on every other session.
-            "shadow": True if sess.get("shadow") else None,
             # True once part of the transcript went unscanned (a manager restart,
             # an upgrade, a resume): the list is then a floor, not the count.
             "qaPartial": True if sess.get("qaPartial") else None,
@@ -46632,7 +46630,9 @@ class SessionManager:
                 "paused": _paused_wire(c.get("paused")),
             }
             for c in reversed(self.closed)
-            if not c.get("shadow")     # never a card, live or ended (XERK-1847)
+            # A shadow's closed record is never offered (XERK-2227): it cannot
+            # be resumed, and it is no session of the operator's.
+            if not (c.get("shadow") or c.get("id") in self.shadow_sids)
         ]
 
     def _closed_prs(self, rec):
@@ -47113,12 +47113,11 @@ class SessionManager:
             # that goes stale fastest.
             "capacity": self._capacity_payload(),
             "repos": self._sorted_repo_entries(refresh, light),
-            # A shadow run's sessions are never reported (XERK-1847): they are
-            # the hub's evidence-gathering, reported as `shadowRuns`, and a card
-            # would let an operator type into, stop or count a blind re-run.
-            # Built for every record first: `_session_payload` also folds what a
-            # shadow run reports (`modelActual`), and the mod-status writer
-            # pairs payloads with the registry by position.
+            # A shadow run (XERK-1847) is no session of the operator's: never
+            # reported, so no client shows, types into or stops it (XERK-2227).
+            # Built for every record first and filtered after: `_session_payload`
+            # also folds what a shadow run reports (`modelActual`), and the
+            # mod-status writer pairs payloads with the registry by position.
             "sessions": [
                 p for s, p in zip(self.registry, self._publish_mod_status(
                     [self._session_payload(s, refresh, light) for s in self.registry]))
@@ -47181,10 +47180,9 @@ class SessionManager:
             # hub samples merged tickets only onto a host reporting it;
             # TURMA_MODEL_SHADOW=0 reports false.
             # Only where the shadow sandbox can run (XERK-1859).
-            # `free`: room for another run (MAX_SHADOW_RUNS). Shadows hold no
-            # session slot, so the hub reads this instead of `capacity`.
+            # `free` is its own cap, never a session slot (XERK-2227).
             "modelShadow": {"available": MODEL_SHADOW and shadow_sandbox_available(),
-                            "free": self._shadow_runs_active() < MAX_SHADOW_RUNS},
+                            "free": max(0, MAX_SHADOW_RUNS - self._shadow_runs_active())},
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),

@@ -26968,27 +26968,21 @@ test("XERK-1847: a shadow goes only to a capable, free host decided into the org
   shadowHost("sh-full", site, { closedSessions: [], capacity: { maxSessions: 1, running: 1, queued: 0, free: 0 } });
   hub.modelShadowSweep(Date.now(), { rate: 1 });
   for (const k of ["sh-other", "sh-norepo", "sh-full"]) assert.equal((agents[k].commands || []).length, 0, k);
-  // A host reporting its own shadow room is judged by that, never its session
-  // slots: one with no shadow room is skipped even with every slot free, and a
-  // full host with shadow room is a target (shadows hold no slot there).
-  shadowHost("sh-busy", site, { closedSessions: [], modelShadow: { available: true, free: false } });
+  // XERK-2227: a host reporting its own shadow cap is judged by it, not by
+  // session slots — no free shadow run skips it, a free one with no session
+  // slot left still takes it.
+  shadowHost("sh-capped", site, { closedSessions: [], modelShadow: { available: true, free: 0 } });
   hub.modelShadowSweep(Date.now(), { rate: 1 });
-  assert.equal((agents["sh-busy"].commands || []).length, 0);
-  agents["sh-full"].modelShadow = { available: true, free: true };
-  hub.modelShadowSweep(Date.now(), { rate: 1, dailyMax: 1 });
-  assert.equal(agents["sh-full"].commands.length, 1);
-  // A second sweep before the host beats again sends it nothing more: its
-  // `free` predates the queued run.
-  hub.outcomeLedger._internals.reset();
-  hub.outcomeLedgerSweep();
+  assert.equal((agents["sh-capped"].commands || []).length, 0);
+  delete agents["sh-capped"];
+  // A spawnShadow already queued to it uses that free run until its beat acks.
+  shadowHost("sh-busy", site, { closedSessions: [], modelShadow: { available: true, free: 1 },
+    commands: [{ type: "spawnShadow", shadowId: "sh-00000000000000aa" }] });
   hub.modelShadowSweep(Date.now(), { rate: 1 });
-  assert.equal(agents["sh-full"].commands.length, 1);
-  agents["sh-full"].commands = [];
-  agents["sh-full"].modelShadow = { available: true };
-  hub.outcomeLedger._internals.reset();
-  hub.outcomeLedgerSweep();
-  // A good one takes it; the daily cap then holds the next.
-  shadowHost("sh-ok", site, { closedSessions: [] });
+  assert.equal(agents["sh-busy"].commands.length, 1);
+  delete agents["sh-busy"];
+  shadowHost("sh-ok", site, { closedSessions: [], modelShadow: { available: true, free: 1 },
+    capacity: { maxSessions: 1, running: 1, queued: 0, free: 0 } });
   hub.modelShadowSweep(Date.now(), { rate: 1, dailyMax: 1 });
   assert.equal(agents["sh-ok"].commands.length, 1);
   assert.equal(hub.outcomeLedger.shadowsDispatchedSince(Date.now() - 86400000), 1);
@@ -26998,18 +26992,19 @@ test("XERK-1847: a shadow goes only to a capable, free host decided into the org
   assert.equal([...hub.outcomeLedger._internals.rows().values()].filter((r) => r.kind === "shadow").length, 0);
 }));
 
-test("XERK-1847: a shadow session is never served and its flag is strictly boolean", () => {
+test("XERK-1847: a shadow session raises no operator alert and its flag is strictly boolean", () => {
   const p = { sessions: [{ id: "a", shadow: "yes" }, { id: "b", shadow: true }] };
   hub.normalizeSessions(p);
-  assert.deepEqual(p.sessions.map((s) => s.id), ["a"], "an older agent's shadow session is dropped");
   assert.ok(!("shadow" in p.sessions[0]));
+  // XERK-2227: an older agent's shadow session is dropped, never shown as a card.
+  assert.deepEqual(p.sessions.map((s) => s.id), ["a"]);
   const m = { modelShadow: "on" };
   hub.normalizeModelShadow(m);
   assert.equal(m.modelShadow, null);
-  for (const [free, want] of [[false, false], [true, true], ["no", undefined]]) {
-    const f = { modelShadow: { available: true, free } };
-    hub.normalizeModelShadow(f);
-    assert.equal(f.modelShadow.free, want);
+  for (const [free, want] of [[2, 2], [0, 0], [-1, undefined], [1.5, undefined], ["1", undefined]]) {
+    const x = { modelShadow: { available: true, free, junk: 1 } };
+    hub.normalizeModelShadow(x);
+    assert.deepEqual(x.modelShadow, want === undefined ? { available: true } : { available: true, free: want });
   }
   assert.equal(hub.shadowSampled("k", 0), false);
   assert.equal(hub.shadowSampled("k", 1), true);

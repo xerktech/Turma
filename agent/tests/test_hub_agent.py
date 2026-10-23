@@ -12936,6 +12936,16 @@ class TestResumableReport(ManagerMixin, unittest.TestCase):
         # The foreign dev-machine session is not resumable here.
         self.assertNotIn("Other", rep)
 
+    def test_xerk2227_a_shadow_runs_conversation_is_never_offered(self):
+        # Its worktree dir is its session id, or its transcript id is known.
+        self._write_at(os.path.join(ha.WORKTREES_ROOT, "Turma", "shdw1"), tid="sh1")
+        self._write_at(os.path.join(ha.WORKTREES_ROOT, "Turma", "other"), tid="sh2")
+        self._write_at(os.path.join(ha.WORKTREES_ROOT, "Turma", "plain"), tid="ok1")
+        sm = self.make_manager()
+        sm.shadow_sids, sm.shadow_tids = ["shdw1"], ["sh2"]
+        for rep in (sm._resumable_report(), sm._resumable_report(sm._usage_scan_inputs())):
+            self.assertEqual([e["transcriptId"] for e in rep.get("Turma", [])], ["ok1"])
+
     def test_excludes_carded_running_session(self):
         wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "live1")
         self._write_at(wt, tid="c1")
@@ -52779,9 +52789,7 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         for name, value in [("scan_repos", lambda: [self.repo]),
                             ("JIRA_SITE", self.SITE), ("JIRA_EMAIL", "a@b.c"),
                             ("JIRA_TOKEN", "t"), ("run", self.fake_git),
-                            ("run_out", self.fake_git_out),
-                            # Tests dispatch many runs; the cap has its own test.
-                            ("MAX_SHADOW_RUNS", 100)]:
+                            ("run_out", self.fake_git_out)]:
             p = mock.patch.object(ha, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -52871,8 +52879,8 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
     def test_full_beats_launch_one_placed_run_each_and_light_beats_none(self):
         # XERK-2167: the beat wiring — a placed run launches only on a FULL
         # beat, one per beat; a re-delivery places nothing twice; a placing
-        # run counts against MAX_SHADOW_RUNS so the hub does not hand it out
-        # again, and never against a session slot.
+        # run holds a shadow run (never a session slot, XERK-2227) so the hub
+        # does not hand it out again.
         sm = self.make_manager()
         sm._launch_ttyd = mock.Mock()
         calls = []
@@ -52881,15 +52889,16 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
             calls.append(a[3])
             return self.BASE, None
         rids = ["sh-00000000000000a1", "sh-00000000000000a2"]
-        # At the session ceiling: a shadow holds no slot, so it launches
-        # running, never queued behind the operator's work.
+        # Session slots all taken: a shadow never needs one, so it still
+        # launches running, never queued behind the operator's work.
         with mock.patch.object(ha, "shadow_base_commit", base), \
                 mock.patch.object(ha, "MAX_SESSIONS", 1), \
+                mock.patch.object(ha, "MAX_SHADOW_RUNS", 2), \
+                mock.patch.object(sm, "_slots_used", lambda exclude_id=None: 1), \
                 mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
             sm.handle_commands([dict(self.cmd(shadowId=r), cmdId=f"c{i}")
                                 for i, r in enumerate(rids + rids[:1])])
-            self.assertEqual(sm._slots_used(), 0, "a placing shadow took a slot")
-            self.assertEqual(sm._shadow_runs_active(), 2)
+            self.assertEqual(sm._shadow_runs_active(), 2, "a placing shadow holds its run")
             deadline = time.time() + 10
             while time.time() < deadline and any(
                     "result" not in j for j in sm._shadow_placing.values()):
@@ -52902,78 +52911,9 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
             sm.build_payload(3)
         self.assertEqual([x["status"] for x in sm.registry], ["running", "running"])
         self.assertEqual(sorted(sm.shadow_runs), rids)
-        self.assertEqual(sm._shadow_placing, {})
-        self.assertEqual((sm._slots_used(), sm._capacity_payload()["running"]), (0, 0))
-
-    def test_a_shadow_is_never_reported_as_a_session(self):
-        # Operator report: shadow runs showed as ordinary cards (typeable,
-        # stoppable) and spent session slots. They ride `shadowRuns` only.
-        sm = self.make_manager()
-        sm._launch_ttyd = mock.Mock()
-        # The host is FULL of operator work: the shadow still runs, unqueued.
-        op = {"id": "op1", "status": "running", "worktreePath": os.path.join(self.tmp, "op1"),
-              "repo": "Turma"}
-        sm.registry.append(op)
-        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()), \
-                mock.patch.object(ha, "MAX_SESSIONS", 1):
-            self.shadow(sm, self.cmd())
-            sess = sm.registry[1]
-            self.assertEqual(sess["status"], "running")
-            self.assertEqual(sm._capacity_payload()["free"], 0)
-        sm.registry.append(dict(op, id="op2"))
-        sm.usage_ledger[sess["worktreePath"]] = {"repo": "Turma", "slug": "shadow-slug"}
-        seen, published = [], []
-        def payload(s, *a):
-            seen.append(s["id"])
-            return {"id": s["id"]}
-        with mock.patch.object(sm, "_session_payload", payload), \
-                mock.patch.object(sm, "_publish_mod_status",
-                                  lambda ps: published.extend(ps) or ps):
-            p = sm.build_payload(1)
-        self.assertEqual([s["id"] for s in p["sessions"]], ["op1", "op2"])
-        # Still BUILT for the shadow (it folds the run's modelActual), and the
-        # mod-status writer gets one payload per registry record, in order.
-        self.assertEqual(seen, ["op1", sess["id"], "op2"])
-        self.assertEqual([x["id"] for x in published], seen)
-        # A hub command naming it by id is refused, never run.
-        sm.handle_commands([{"type": "kill", "sessionId": sess["id"], "cmdId": "k1"}])
-        self.assertIn(sess["id"], [s["id"] for s in sm.registry])
-        sm.registry[:] = [sess]
-        self.assertEqual([r["id"] for r in p["shadowRuns"]], [self.RID])
-        # Its conversation is offered neither for resume nor to the archive.
-        self.assertIn("shadow-slug", sm._carded_slugs())
-        self.assertNotIn("shadow-slug", sm._archive_candidate_inputs()[3])
-        # Nor is its record once ended.
-        sm.closed.append(dict(sess, shadow=sess["shadow"], closedAt=1))
-        self.assertEqual(sm._closed_payload(), [])
-
-    def test_a_new_session_never_reuses_a_past_shadow_id(self):
-        # A reused id would have every hub command to the operator's session
-        # refused as a shadow's, and its conversation never resumed.
-        sm = self.make_manager()
-        sm.shadow_sids = ["aaaaa"]
-        sm.closed = [{"id": "bbbbb"}]      # nor a killed, resumable record's
-        with mock.patch.object(ha.secrets, "token_hex",
-                               side_effect=["aaaaaa", "bbbbbb", "cccccc"]):
-            self.assertEqual(sm._new_id(), "ccccc")
-
-    def test_a_host_carries_at_most_its_shadow_runs(self):
-        sm = self.make_manager()
-        sm._launch_ttyd = mock.Mock()
-        other = "sh-00000000000000b2"
-        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()), \
-                mock.patch.object(ha, "MAX_SHADOW_RUNS", 1):
-            self.assertTrue(sm.build_payload(1, light=True)["modelShadow"]["free"])
-            self.shadow(sm, self.cmd())
-            self.assertFalse(sm.build_payload(2, light=True)["modelShadow"]["free"])
-            self.shadow(sm, self.cmd(shadowId=other))
-            self.assertEqual(len(sm.registry), 1)
-            sm.shadow_runs[self.RID]["state"] = "grading"
-            self.assertFalse(sm.build_payload(3, light=True)["modelShadow"]["free"])
-            sm.shadow_runs[self.RID]["state"] = "graded"
-            self.assertTrue(sm.build_payload(4, light=True)["modelShadow"]["free"])
-        self.assertEqual(sm.shadow_runs[other]["state"], "failed")
-        self.assertIn("already carrying", sm.shadow_runs[other]["error"])
+        self.assertEqual(sm._shadows_placing(), 0)
+        self.assertEqual(sm._shadow_runs_active(), 2)
+        self.assertEqual(sm._slots_used(), 0, "a shadow holds no session slot")
 
     def test_a_placement_that_raises_is_a_failed_run(self):
         sm = self.make_manager()
@@ -53160,12 +53100,91 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         # It is in no roster, raises no alert hub-side and cannot be adopted.
         self.assertEqual(sm._peer_rows(sm.registry), [])
         self.assertFalse(sm._maybe_adopt_ticket(sess, "PROJ-7"))
-        self.assertTrue(sm._session_payload(sess, refresh=False)["shadow"])
+        # XERK-2227: never reported as a session, nor held against MAX_SESSIONS.
+        payload = sm.build_payload(1, light=True)
+        self.assertEqual(payload["sessions"], [])
+        self.assertEqual(payload["capacity"]["free"], ha.MAX_SESSIONS)
+        self.assertEqual(payload["capacity"]["running"], 0)
+        self.assertEqual(payload["modelShadow"]["free"], ha.MAX_SHADOW_RUNS - 1)
         # Reported to the hub, and a re-delivered command is a no-op.
         self.assertEqual(sm.shadow_runs_report()[0]["state"], "running")
         with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
             self.shadow(sm, self.cmd())
         self.assertEqual(len(sm.registry), 1)
+
+    def test_xerk2227_a_host_at_its_shadow_cap_fails_the_next_run(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
+            self.shadow(sm, self.cmd())
+            self.shadow(sm, self.cmd(shadowId="sh-00000000000000b2"))
+        self.assertEqual(len(sm.registry), 1)
+        r = sm.shadow_runs["sh-00000000000000b2"]
+        self.assertEqual(r["state"], "failed")
+        self.assertIn("TURMA_MAX_SHADOW_RUNS", r["error"])
+        self.assertEqual(sm.build_payload(1, light=True)["modelShadow"]["free"], 0)
+        # A grading run still holds it (its Opus grader runs); a terminal one frees it.
+        sm.shadow_runs[self.RID]["state"] = "grading"
+        self.assertEqual(sm._shadow_runs_active(), 1)
+        sm.shadow_runs[self.RID]["state"] = "graded"
+        self.assertEqual(sm._shadow_runs_active(), 0)
+
+    def test_xerk2227_a_shadow_runs_on_a_full_host_and_is_built_but_not_served(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        # The host is FULL of operator work: the shadow still runs, unqueued.
+        op = {"id": "op1", "status": "running", "worktreePath": os.path.join(self.tmp, "op1"),
+              "repo": "Turma"}
+        sm.registry.append(op)
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()), \
+                mock.patch.object(ha, "MAX_SESSIONS", 1):
+            self.shadow(sm, self.cmd())
+            sess = sm.registry[1]
+            self.assertEqual(sess["status"], "running")
+            self.assertEqual(sm._capacity_payload()["free"], 0)
+        sm.registry.append(dict(op, id="op2"))
+        seen, published = [], []
+        def payload(s, *a):
+            seen.append(s["id"])
+            return {"id": s["id"]}
+        with mock.patch.object(sm, "_session_payload", payload), \
+                mock.patch.object(sm, "_publish_mod_status",
+                                  lambda ps: published.extend(ps) or ps):
+            p = sm.build_payload(1)
+        self.assertEqual([s["id"] for s in p["sessions"]], ["op1", "op2"])
+        # Still BUILT for the shadow (it folds the run's modelActual), and the
+        # mod-status writer gets one payload per registry record, in order.
+        self.assertEqual(seen, ["op1", sess["id"], "op2"])
+        self.assertEqual([x["id"] for x in published], seen)
+        # A hub command naming it by id is refused, never run.
+        sm.handle_commands([{"type": "kill", "sessionId": sess["id"], "cmdId": "k1"}])
+        self.assertIn(sess["id"], [s["id"] for s in sm.registry])
+
+    def test_xerk2227_a_new_session_never_reuses_a_shadow_or_closed_id(self):
+        # A reused shadow id would have every hub command to the operator's
+        # session refused; a reused closed id overwrites that resumable record.
+        sm = self.make_manager()
+        sm.shadow_sids = ["aaaaa"]
+        sm.closed = [{"id": "bbbbb"}]
+        with mock.patch.object(ha.secrets, "token_hex",
+                               side_effect=["aaaaaa", "bbbbbb", "cccccc"]):
+            self.assertEqual(sm._new_id(), "ccccc")
+
+    def test_xerk2227_a_shadow_is_kept_out_of_the_closed_list_and_the_archive(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
+            self.shadow(sm, self.cmd())
+        [sess] = sm.registry
+        other = os.path.join(ha.WORKTREES_ROOT, "Turma", "plain")
+        sm.closed = [{"id": "plain", "repo": "Turma"},
+                     {"id": "lostflag", "repo": "Turma"},
+                     {"id": "flagged", "repo": "Turma", "shadow": {"id": self.RID}}]
+        sm.shadow_sids.append("lostflag")
+        self.assertEqual([c["id"] for c in sm._closed_payload()], ["plain"])
+        sm.usage_ledger = {sess["worktreePath"]: {"repo": "Turma"}, other: {"repo": "Turma"}}
+        slugs = set(sm._archive_candidate_inputs()[3])
+        self.assertEqual(slugs, {ha._project_slug(other)})
 
     def test_refusals_are_reported_as_failed_runs(self):
         cases = [({"siteKey": "other.atlassian.net"}, "org"),
@@ -53410,6 +53429,9 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
                   "file writes")]
         sm = self.make_manager()
         sm._launch_ttyd = mock.Mock()
+        p = mock.patch.object(ha, "MAX_SHADOW_RUNS", 10)
+        p.start()
+        self.addCleanup(p.stop)
 
         def spawn(n):
             rid = f"sh-{n:016x}"
