@@ -4867,8 +4867,9 @@ function shadowModelFor(cls, liveModel, pairs) {
 }
 
 // An online host DECIDED into the org, offering shadows, with the repo already
-// cloned (a shadow never clones on demand), a free slot, and a subscription not
-// paused; the most available wins.
+// cloned (a shadow never clones on demand), a free shadow run (`modelShadow.free`,
+// XERK-2227; an older agent without it needs a free session slot), and a
+// subscription not paused; the most available wins.
 function shadowHostFor(site, repo, used, now) {
   const paused = pausedSubscriptions(now);
   let best = null, bestAvail = -Infinity;
@@ -4878,7 +4879,9 @@ function shadowHostFor(site, repo, used, now) {
     if (!(a.modelShadow && a.modelShadow.available === true)) continue;
     if ((a.defaultRuntime || "claude") !== "claude") continue;
     if (!(a.repos || []).some((r) => r && r.name === repo)) continue;
-    if (!hostHasFreeSlot(a) || hostAutoPaused(key, a, paused)) continue;
+    const free = a.modelShadow.free;
+    if (!(typeof free === "number" ? free > 0 : hostHasFreeSlot(a))) continue;
+    if (hostAutoPaused(key, a, paused)) continue;
     const avail = hostAvailability(a);
     if (avail > bestAvail) { best = key; bestAvail = avail; }
   }
@@ -8142,6 +8145,9 @@ function normalizeModelShadow(payload) {
     return;
   }
   payload.modelShadow = { available: t.available === true };
+  // Its own run cap (XERK-2227), never a session slot. Absent = an older agent,
+  // which still runs a shadow in a session slot (shadowHostFor falls back).
+  if (Number.isSafeInteger(t.free) && t.free >= 0) payload.modelShadow.free = t.free;
 }
 
 // The host's shadow-run reports (XERK-1847): [{id, siteKey, issueKey, state,
@@ -10880,6 +10886,12 @@ function normalizeSessions(payload) {
   // session is named "__proto__" or "toString", so dropping loses nothing.
   if (payload.sessions.some((s) => Object.hasOwn(Object.prototype, s.id))) {
     payload.sessions = payload.sessions.filter((s) => !Object.hasOwn(Object.prototype, s.id));
+  }
+  // DROP a shadow run's session (XERK-1847): an older agent reported it, and
+  // every client showed it as an ordinary card to type into or stop (XERK-2227).
+  // A current agent never sends one; the run reaches the hub as `shadowRuns`.
+  if (payload.sessions.some((s) => s.shadow === true)) {
+    payload.sessions = payload.sessions.filter((s) => s.shadow !== true);
   }
   for (const s of payload.sessions) {
     // SessionInfo's String fields (and TicketRef's below): an object/array/
