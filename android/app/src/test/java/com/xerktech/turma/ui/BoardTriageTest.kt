@@ -28,7 +28,7 @@ import org.robolectric.annotation.Config
  * these tests gate the COMPOSE wiring — that the lane column actually renders,
  * that the verdict chip reads the fleet's ticketTriageActions, that a pick in
  * the detail picker POSTs the hub's wire shape, and that the policy sheet
- * pre-fills from triagePolicies and POSTs the full five-knob patch.
+ * pre-fills from triagePolicies and POSTs the full six-knob patch.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(
@@ -224,7 +224,7 @@ class BoardTriageTest {
 
     /**
      * The policy sheet pre-fills from the fleet's triagePolicies and POSTs the
-     * full five-knob patch on save.
+     * full six-knob patch on save.
      */
     @Test
     fun `the policy sheet pre-fills from the hub and POSTs the full patch on save`() {
@@ -258,6 +258,26 @@ class BoardTriageTest {
         assertTrue("body should contain repoAllow Turma: $body", body.contains("\"Turma\""))
         assertTrue("body should contain repoDeny bench: $body", body.contains("\"bench\""))
         assertTrue("body should contain rateMax 5: $body", body.contains("\"rateMax\":5"))
+        assertTrue("knob off sends null: $body", body.contains("\"includeNotActionable\":null"))
+    }
+
+    /** XERK-2209: tapping the not-actionable row (label included) sends the knob as true. */
+    @Test
+    fun `the not-actionable row toggles the knob and POSTs it`() {
+        hub.json("/api/jira/$siteKey/triage-policy", """{"ok":true,"policy":{"includeNotActionable":true}}""")
+
+        openBoard()
+        compose.onNodeWithContentDescription("Triage policy").performClick()
+        compose.waitForIdle()
+
+        compose.onNodeWithText("Also auto-start tickets triage judged not actionable")
+            .performSemanticsAction(SemanticsActions.OnClick)
+        compose.waitForIdle()
+        compose.onNodeWithText("Save policy").performSemanticsAction(SemanticsActions.OnClick)
+        compose.waitForIdle()
+
+        val body = hub.findRequest("/acme/triage-policy").body.readUtf8()
+        assertTrue("body should carry the knob: $body", body.contains("\"includeNotActionable\":true"))
     }
 
     // The rateMax validation boundary (1..50, empty = default) is gated by the

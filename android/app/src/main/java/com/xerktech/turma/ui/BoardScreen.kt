@@ -3,6 +3,7 @@ package com.xerktech.turma.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.horizontalScroll
@@ -75,6 +76,7 @@ import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -2480,7 +2482,7 @@ private val POLICY_TYPES = listOf("bug", "task", "feature", "improvement", "chor
  * sweep applies to an org's To Do tickets after the triage gate. Hub-owned and
  * durable like the org color pin — the POST is authoritative (200 carries the
  * merged policy back) and the fleet's triagePolicies reflects it on the next
- * beat. A port of board.html's policy panel: the same five knobs, the same
+ * beat. A port of board.html's policy panel: the same six knobs, the same
  * rateMax validation, and a full patch (empty knobs send null, which clears
  * them). The web's dashed-header "panel" becomes a modal sheet on the phone.
  */
@@ -2574,8 +2576,16 @@ private fun TriagePolicySheet(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(checked = includeNotActionable, onCheckedChange = { includeNotActionable = it })
+            // The whole row toggles (like the web's <label>), not just the 13dp box.
+            Row(
+                Modifier.fillMaxWidth().toggleable(
+                    value = includeNotActionable,
+                    role = Role.Checkbox,
+                    onValueChange = { includeNotActionable = it },
+                ),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Checkbox(checked = includeNotActionable, onCheckedChange = null)
                 Text("Also auto-start tickets triage judged not actionable", style = MaterialTheme.typography.bodyMedium)
             }
             if (error.isNotBlank()) ErrorRow(error)

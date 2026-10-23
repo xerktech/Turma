@@ -651,7 +651,8 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   - **Per-ticket approve/hold/reject** rides the same durable hub state as the pins — works with
     the org's hosts offline; the fleet payload + SSE keep the verdict fresh.
   - **Org triage policy sheet** — `TriagePolicySheet` (header "Triage policy" button, like the web
-    board bar): the five knobs (minPriority / excluded types / repo allow / repo deny / rateMax)
+    board bar): the six knobs (minPriority / excluded types / repo allow / repo deny / rateMax /
+    includeNotActionable, XERK-2209)
     via `vm.saveTriagePolicy` → `POST /api/jira/<site>/triage-policy`; `null` clears a knob.
 - **Glasses + Veiller fork: PASSIVE read only** — both decode `ticketTriageActions` from
   `/api/agents` (new `AppState` field, refreshed by poll) and pass `triageActions` into the

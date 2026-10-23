@@ -15113,7 +15113,8 @@ function reclaimStrandedTicketSpawns() {
 // was since closed would gate its duplicate forever. With `rows` (the board's
 // fleetTicketRows) the duplicate gate holds only while the twin is listed and
 // not Done; a twin no longer listed has left the board (closed and aged out of
-// the Done window, or reassigned), so it no longer gates either.
+// the Done window, or reassigned), so it no longer gates either — unless one of
+// the org's blocks was truncated, where an absent twin may simply be past the cap.
 function triageGateReason(t, siteKey, rows) {
   const tri = t && typeof t === "object" ? t.triage : null;
   if (!tri || typeof tri !== "object" || Array.isArray(tri)) return "untriaged";
@@ -15130,7 +15131,9 @@ function triageGateReason(t, siteKey, rows) {
 // Is the ticket a duplicate verdict points at still open on the board?
 function duplicateTwinOpen(siteKey, twinKey, rows) {
   const hit = rows.get(ticketQueueKey(siteKey, twinKey));
-  return !!(hit && hit.row && hit.row.statusCategory !== "done");
+  if (hit && hit.row) return hit.row.statusCategory !== "done";
+  return Object.values(agents).some((a) => a && a.jira && a.jira.siteKey === siteKey
+    && decidedOrgOf(a) === siteKey && a.jira.truncated === true);
 }
 
 // XERK-1567: the auto stream's order key, as a comparable array over a ticket

@@ -15183,6 +15183,47 @@ test("XERK-550: auto-merge dispatches mergePr for a ready, idle, eligible sessio
   assert.equal(autoMergeState.get(PR1).attempts, 1);
 });
 
+// XERK-2209: auto-merge reads the same duplicate rule as the sweep — through
+// autoMergeSession, which must hand the board rows to the content gate.
+test("XERK-2209: auto-merge treats a duplicate of a Done twin as eligible, of an open twin as not", async () => {
+  for (const [device, twinCat, merges] of [["am2209a", "done", 1], ["am2209b", "inprogress", 0]]) {
+    resetMerge();
+    await mergeBeat(device, `${device}.atlassian.net`, { tickets: [
+      { key: "ENG-9", summary: "A bug", statusCategory: "inprogress", type: "Bug",
+        repoGuess: { repo: "Turma", cloned: true },
+        triage: { priority: "P2", type: "bug", actionable: true, dedupeOf: "ENG-1" } },
+      { key: "ENG-1", summary: "Twin", statusCategory: twinCat, type: "Bug",
+        repoGuess: { repo: "Turma", cloned: true } },
+    ] });
+    autoMergeSweep();
+    assert.equal((agents[device].commands || []).filter((c) => c.type === "mergePr").length,
+      merges, `twin ${twinCat}`);
+  }
+});
+
+// XERK-2209: an absent twin only lifts the gate when the org's board is whole;
+// a truncated block may simply have pushed an open twin past its cap.
+test("XERK-2209: an absent twin keeps gating while the org's board block is truncated", async () => {
+  resetAutoStart();
+  resetTriagePolicy();
+  const site = "x2209t.atlassian.net";
+  await asBeat("x2209t", site, { capacity: FULL, tickets: [
+    { key: "DT-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true, dedupeOf: "DT-404" } },
+  ] });
+  setAutoStartOrg(site, true);
+  agents.x2209t.jira.truncated = true;
+  const rows = fleetTicketRows();
+  const row = [...rows.values()].find((r) => r.siteKey === site && r.key === "DT-1").row;
+  assert.equal(triageGateReason(row, site, rows), "duplicate");
+  // Next-up (the org brief) agrees with the sweep on both sides of the flag.
+  assert.deepEqual(hub.compileBrief(site, Date.now(), "scheduled", []).nextUp.map((i) => i.key), []);
+  agents.x2209t.jira.truncated = false;
+  assert.equal(triageGateReason(row, site, rows), null);
+  assert.deepEqual(hub.compileBrief(site, Date.now(), "scheduled", []).nextUp.map((i) => i.key), ["DT-1"]);
+  resetAutoStart();
+});
+
 test("XERK-1571: auto-merge leaves a SLEEPING session alone until its wake has passed", async () => {
   resetMerge();
   await mergeBeat("amSleep", "amsleep.atlassian.net", {});
