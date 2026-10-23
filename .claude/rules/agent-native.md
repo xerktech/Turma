@@ -163,6 +163,17 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
     descend a symlinked TMPDIR. It only touches our own real dirs.
     - Don't swap the sweep for a TERM trap: bash defers a trapped TERM until its foreground child
       exits, so a TERMed run wedged on a hung child would no longer end. Test: 34b.
+  - **A full TMPDIR must not strand the host (XERK-2229)** — a 100% /tmp tmpfs failed every
+    download while the run logged one reasonless line and exited 0.
+    - Under `STAGE_MIN_FREE_KIB` free in TMPDIR, the stage moves to `~/.turma/stage` (the install's
+      filesystem), only as a real dir we own; `sweep_stages` sweeps both bases.
+    - A due update that fails to download/verify/install returns `UPDATE_FAILED_RC` (3): logged with
+      the tool's error and free space, counted by `note_agent_check`, and fails the timer unit.
+    - At 100% the MANIFEST fails first: a latest unified release whose manifest can't be read, with
+      no NEWER legacy release to fall back to, is rc 3 too — never "no release found" (rc 0).
+    - A failed `mktemp -d` is rc 3: unchecked, an empty `$stage` staged downloads at `/`.
+    - `--loop` sleeps the full `INTERVAL` on rc 3, never the short retry: a persistent failure
+      retried every minute would rate-limit the host's API reads. Test: case 40.
   - `install_payload` **requires `hooks/` in the payload before swapping** — the swap deletes
     installed hooks first, and a missing hook command is a non-blocking hook (guard fails open
     silently while VERSION/restart/log all report clean).

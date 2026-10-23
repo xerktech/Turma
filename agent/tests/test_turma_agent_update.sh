@@ -1883,6 +1883,119 @@ else
   fail "no log line explains the unrepaired newer install: $(cat "$integrity_log")"
 fi
 rm -f "$integrity_log"
+# 40. A full TMPDIR must not strand the host (XERK-2229). The stage moves to
+#     ~/.turma when TMPDIR is short of space, and a download that still fails is
+#     logged with its reason and the free space, counted toward the strand
+#     warning, and fails the plain (timer) run instead of reporting success.
+#     A fake `df` reports TMPDIR full; a fake `gh` refuses a tarball written under
+#     it (or under $FULL_EVERYWHERE, to make the fallback full too); FULL_ALL=1
+#     refuses the manifest too, as a 100% full disk does.
+install_full_tmp_fakes() {  # <bindir> <full dir>
+  install_fake_gh "$1"
+  mv "$1/gh" "$1/gh-real"
+  cat > "$1/gh" <<EOF
+#!/usr/bin/env bash
+case " \$* " in
+  *" --dir $2"*|*" --dir \$FULL_EVERYWHERE"*)
+    case " \$* \${FULL_ALL:-}" in
+      *.tar.gz*|*" 1") echo "write $2/x: no space left on device" >&2; exit 1 ;;
+    esac ;;
+esac
+exec "$1/gh-real" "\$@"
+EOF
+  cat > "$1/df" <<EOF
+#!/bin/sh
+for p; do :; done
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+case "\$p" in
+  $2*) echo "tmpfs 16777216 16777216 0 100% $2" ;;
+  *) echo "disk 100000000 1000 99999000 1% /" ;;
+esac
+EOF
+  chmod +x "$1/gh" "$1/df"
+}
+full_case() {  # <root> [FULL_EVERYWHERE dir] [updater args...] -> echoes "<rc>|<VERSION>"
+  local root="$1" full="${2:-/nonexistent}" prefix="$1/prefix" bin="$1/prefix/bin" rc=0
+  shift; [ $# -gt 0 ] && shift
+  mkdir -p "$bin" "$root/tmp"
+  cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+  echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+  mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+  echo "0.3.0" >"$prefix/VERSION"
+  install_fake_restart "$bin"; install_full_tmp_fakes "$bin" "$root/tmp"
+  FAKE_GH_DIR="$d" FULL_EVERYWHERE="$full" HOME="$root/home" TMPDIR="$root/tmp" \
+    PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" TURMA_CLAUDE_AUTO_UPDATE=0 \
+    "$bin/turma-agent-update" "$@" >/dev/null 2>&1 || rc=$?
+  echo "$rc|$(tr -d '[:space:]' <"$prefix/VERSION")"
+}
+d="$(new_gh_dir)"
+add_unified_release "$d" "v0.3.5" "0.3.5" "v0.3.5"
+root="$(mktemp -d)"
+# A killed run's stage under the fallback is swept like one in TMPDIR.
+mkdir -p "$root/home/.turma/stage/turma-update.$(mkdir -p "$root/prefix"; prefix_tag "$root/prefix").999999.dead"
+got="$(full_case "$root")"
+assert_eq "0|0.3.5" "$got" "a full TMPDIR stages under ~/.turma and installs" \
+  "a full TMPDIR kept the old release ($got): $(tail -n3 "$root/home/.turma/update.log" 2>/dev/null)"
+if [ -z "$(ls -A "$root/home/.turma/stage" 2>/dev/null)" ]; then
+  pass "the fallback stage is removed after the run"
+else
+  fail "the fallback stage was left behind: $(ls -A "$root/home/.turma/stage")"
+fi
+rm -rf "$root"
+root="$(mktemp -d)"
+got="$(full_case "$root" "$root/home")"
+log="$(grep 'download failed' "$root/home/.turma/update.log" 2>/dev/null || true)"
+assert_eq "3|0.3.0" "$got" "a download that fails everywhere fails the timer run (rc 3)" \
+  "a failed download reported ($got) — expected rc 3, still 0.3.0"
+if printf '%s' "$log" | grep -q 'no space left on device' && printf '%s' "$log" | grep -q 'KiB free'; then
+  pass "the download failure is logged with its reason and the free space"
+else
+  fail "the download failure log gives no reason/space: $log"
+fi
+assert_eq "1" "$(cat "$root/home/.turma/update-skip-count."* 2>/dev/null)" \
+  "a download failure counts toward the strand warning" "the skip counter did not move"
+rm -rf "$root"
+# At 100% the manifest is what fails first: no unified manifest + no legacy
+# release must still fail the run, never read as "no release" (rc 0).
+root="$(mktemp -d)"
+got="$(FULL_ALL=1 full_case "$root" "$root/home")"
+assert_eq "3|0.3.0" "$got" "an unreadable manifest on a full disk fails the run (rc 3)" \
+  "an unwritable manifest read as no release ($got)"
+rm -rf "$root"
+# A --loop run that failed an update sleeps the full interval, never the short
+# retry a lock skip gets (the failure would hammer the API every minute).
+root="$(mktemp -d)"
+( FULL_ALL=1 TURMA_POLL_RETRY_SEC=1 full_case "$root" "$root/home" --loop --interval 30 >/dev/null ) &
+loop_pid=$!
+sleep 4
+stop_loop "$loop_pid" "$root/prefix/bin"
+n="$(grep -c 'could not read release' "$root/home/.turma/update.log" 2>/dev/null || true)"
+assert_eq "1" "$n" "--loop waits the full interval after a failed update" \
+  "--loop retried a failed update at the short backoff ($n runs in 4s)"
+rm -rf "$root" "$d"
+# A link planted at ~/.turma/stage is neither staged through nor swept through.
+d="$(new_gh_dir)"
+add_unified_release "$d" "v0.3.5" "0.3.5" "v0.3.5"
+root="$(mktemp -d)"; mkdir -p "$root/elsewhere" "$root/home/.turma" "$root/prefix"
+ln -s "$root/elsewhere" "$root/home/.turma/stage"
+mkdir "$root/elsewhere/turma-update.$(prefix_tag "$root/prefix").999999.dead"
+got="$(full_case "$root")"
+if [ "$got" = "3|0.3.0" ] && [ "$(ls -A "$root/elsewhere")" = "turma-update.$(prefix_tag "$root/prefix").999999.dead" ]; then
+  pass "a symlinked fallback is neither staged nor swept through"
+else
+  fail "a symlinked fallback was used ($got; target holds: $(find "$root/elsewhere" -mindepth 1 -printf '%f '))"
+fi
+rm -rf "$root" "$d"
+# A checksum mismatch is a failed update too: rc 3 and counted.
+d="$(new_gh_dir)"
+add_unified_release "$d" "v0.3.5" "0.3.5" "v0.3.5"
+echo "corruption" >> "$d/assets/v0.3.5/turma-agent-native-v0.3.5.tar.gz"
+root="$(mktemp -d)"
+got="$(full_case "$root")"
+assert_eq "3|0.3.0|1" "$got|$(cat "$root/home/.turma/update-skip-count."* 2>/dev/null)" \
+  "a checksum mismatch fails the run and is counted" "checksum mismatch: $got"
+rm -rf "$root" "$d"
+
 for m in fifo devzero plant basedir; do
   got="$(timeout 120 bash -c "$(declare -f run_integrity_case new_gh_dir add_unified_release make_tarball install_fake_restart install_fake_gh); SCRIPT='$SCRIPT'; run_integrity_case 0.6.0 0.6.0 $m")"
   assert_eq "# guard|yes|baseline-ok" "$got" "$m: repaired by one reinstall, without hanging" \
