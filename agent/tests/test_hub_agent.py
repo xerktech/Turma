@@ -37824,11 +37824,24 @@ class TestDiscoverBranchMrs(ManagerMixin, unittest.TestCase):
         self.discover([self.mr()])
         self.assertEqual(self.sm._take_discovered_prs("s1"), [])
 
-    def test_an_mr_opened_after_an_empty_or_failed_lookup_is_found_next_pass(self):
+    def test_an_mr_opened_after_an_empty_lookup_is_found_next_pass(self):
         self.discover([])
-        self.discover(None)
         self.discover([self.mr()])
         self.assertEqual(len(self.sm._take_discovered_prs("s1")), 1)
+
+    def test_a_failed_lookup_stops_the_pass_and_backs_off(self):
+        self.sm.registry = [dict(self.sm.registry[0], id=f"s{i}") for i in range(3)]
+        self.assertEqual(self.discover(None).call_count, 1)
+        self.assertFalse(self.discover([self.mr()]).called)
+        self.sm._mr_discover_paused_until = 0.0
+        self.discover([self.mr()])
+        self.assertEqual(len(self.sm._take_discovered_prs("s0")), 1)
+
+    def test_a_listing_is_read_no_further_than_twenty(self):
+        mrs = [self.mr(web_url=f"https://gitlab.com/code_hunter/argocd/-/merge_requests/{i}")
+               for i in range(25)]
+        self.discover(mrs)
+        self.assertEqual(len(self.sm._take_discovered_prs("s1")), 20)
 
     def test_a_tip_that_already_has_its_mr_is_not_asked_again(self):
         self.discover([self.mr()])
@@ -37855,7 +37868,8 @@ class TestDiscoverBranchMrs(ManagerMixin, unittest.TestCase):
 
     def test_an_mr_link_off_the_project_is_left_out(self):
         self.discover([self.mr(web_url="https://evil.example/code_hunter/argocd/-/merge_requests/9"),
-                       self.mr(web_url="https://gitlab.com/other/repo/-/merge_requests/9")])
+                       self.mr(web_url="https://gitlab.com/other/repo/-/merge_requests/9"),
+                       self.mr(web_url="https://gitlab.com/code_hunter/argocd/-/merge_requests/9\n")])
         self.assertEqual(self.sm._take_discovered_prs("s1"), [])
 
     def test_the_cap_rotates_so_no_session_starves(self):

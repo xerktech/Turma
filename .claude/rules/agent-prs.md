@@ -86,9 +86,11 @@ DevOps, and what gets typed back because of it.
     each stands between a same-named branch and a foreign MR on the card.
   - **The open-PR poller counts STAGED urls as open** (`_staged_discovered_prs`): it runs before
     the payload loop drains them, and without it nudged the very beat the MR landed (QA).
-  - An empty or failed lookup is asked again next pass (the MR is usually opened after the
+  - An empty lookup is asked again next pass (the MR is usually opened after the
     push); only a tip that already has its MR is skipped. `MR_DISCOVER_MAX` sessions a pass,
     least recently asked first. GitLab only. Tests: `TestDiscoverBranchMrs`.
+  - A FAILED lookup ends the pass and pauses discovery `MR_DISCOVER_FAIL_BACKOFF_SEC`: a hung
+    GitLab otherwise held the shared slow-refresh worker a timeout per session every pass (QA).
   - Residuals: a resumed/migrated session's fresh `createdAt` hides an MR its earlier life
     opened; an MR head already on the base (a sibling's merged, then rebased in) passes the
     ancestor gate.
