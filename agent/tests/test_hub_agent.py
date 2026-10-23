@@ -11274,6 +11274,83 @@ class TestModelPickerBodyIsABlockingDialog(unittest.TestCase):
             self.assertFalse(ha._pane_blocking_dialog(cap), footer)
 
 
+class TestLiveDialogFramesXerk2220(unittest.TestCase):
+    """XERK-2220: verbatim Claude Code 2.1.309 captures (tmux 3.4, trailing
+    blanks trimmed, the scratch path shortened) of the surfaces XERK-2215 had
+    not driven: the project MCP-server approval, an MCP elicitation, a
+    multi-question AskUserQuestion (each question tab and its footerless
+    "Review your answers" page), and a permission dialog raised by a
+    background sub-agent while the main turn had ended — each at sizes from
+    6x10 to 200x4. Beside them, idle composers, composer drafts reading
+    "1. Submit answers" under a reply ending "?", and busy turns, at the
+    same sizes. Name prefix = surface, suffix = pane size."""
+
+    @classmethod
+    def setUpClass(cls):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pane_frames_2220.json")
+        with open(path, encoding="utf-8") as f:
+            cls.FRAMES = json.load(f)
+
+    def test_every_frame_reads_as_captured(self):
+        for name, case in self.FRAMES.items():
+            self.assertIs(ha._pane_blocking_dialog(case["frame"]), case["blocks"], name)
+
+    def test_the_fixture_covers_each_surface_and_its_controls(self):
+        prefixes = {name.split("_")[0] for name in self.FRAMES}
+        self.assertLessEqual({"approval", "elicit", "ask1", "ask2", "submit", "sub",
+                              "idle", "idle2", "draft", "busy"}, prefixes)
+
+    def test_a_footer_wrapped_mid_word_is_rejoined(self):
+        # "canc" / "el" at 8 columns, "E" / "sc" … "el" at 6.
+        self.assertTrue(ha._narrow_hint_up(["Esc", "to", "canc", "el"], ["Esc"]))
+        self.assertTrue(ha._narrow_hint_up(["E", "sc", "to", "ca", "nc", "el"], ["E"]))
+        self.assertEqual(ha._narrow_word_end(["canc", "elu"], 0, "cancel", str.lower), 2)
+        self.assertIsNone(ha._narrow_word_end(["canx", "el"], 0, "cancel", str.lower))
+        # A fragment never completes into another word.
+        self.assertFalse(ha._narrow_hint_up(["Esc", "to", "can", "do"], ["Esc"]))
+
+    def test_an_ellipsized_hint_is_claudes_only(self):
+        for line in ("Esc to canc…", "Esc to …", "Esc t…f", "Esc…T"):
+            self.assertTrue(ha._narrow_hint_up([line], [line]), line)
+        for line in ("esc to …", "esc…", "Escape…"):
+            self.assertFalse(ha._narrow_hint_up([line], [line]), line)
+        # Only on a narrow pane, as the rest of the narrow read.
+        self.assertFalse(ha._narrow_hint_up(["Esc to canc…"], ["x" * 30]))
+
+    def test_the_cut_review_page_needs_its_question_right_above(self):
+        cap = self.FRAMES["submit_200x6"]["frame"]
+        self.assertTrue(ha._pane_cut_choice_up(cap))
+        # The composer's prompt row sits under its rule: a draft is no dialog.
+        draft = cap.replace("Ready to submit your answers?\n\n", "─" * 40 + "\n")
+        self.assertFalse(ha._pane_cut_choice_up(draft))
+        # A non-indented line below the cursor (a spinner, a rule) is not a wrap.
+        self.assertFalse(ha._pane_cut_choice_up(cap + "✻ Thinking…\n"))
+        self.assertFalse(ha._pane_cut_choice_up(cap + "  " + "─" * 20 + "\n"))
+        # Option 1 only, with the cursor on it.
+        self.assertFalse(ha._pane_cut_choice_up(cap.replace("❯ 1.", "❯ 2.")))
+        self.assertFalse(ha._pane_cut_choice_up(""))
+        # Queued messages during a busy turn, the spinner and rule cut off (QA):
+        # "❯ <msg>" at column 0, wraps indented, the "send now" hint below.
+        for queued in ("❯ Which option do you want?\n\n❯ 1. Submit answers\n"
+                       "  ctrl+x ctrl+s to send now\n",
+                       "❯ Which option do you want?\n\n❯ 1. Submit answers\n",
+                       "❯ Which option do\n  you want?\n\n❯ 1. Submit answers\n"):
+            self.assertFalse(ha._pane_cut_choice_up(queued), queued)
+
+    def test_the_cut_elicitation_is_read_by_its_indented_title(self):
+        cap = self.FRAMES["elicit_60x5"]["frame"]
+        self.assertTrue(ha._pane_overlay_up(cap))
+        # The same words at column 0 under the rule are not the form's title.
+        self.assertFalse(ha._pane_overlay_up(cap.replace("  MCP server", "MCP server")))
+        # Cut before the quote, the area is nothing BUT a prefix of the title
+        # ("MCP" / "server" at 11x6, "M" at 5x5, QA).
+        cut = self.FRAMES["elicit_cut_11x6"]["frame"]
+        self.assertTrue(ha._pane_overlay_up(cut))
+        self.assertFalse(ha._pane_overlay_up(cut.replace("server", "servers")))
+        self.assertFalse(ha._pane_overlay_up(cut.replace("  MCP", "  MCQ")))
+        self.assertFalse(ha._pane_overlay_up(cut + "  more\n"))
+
+
 class TestQwenHistorySearch(unittest.TestCase):
     """XERK-2215: qwen 0.22.3's Ctrl-R history search, live frames (tmux 3.4).
     It draws "(r:)" in the composer's prompt column; typed text is the query

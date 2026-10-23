@@ -69,6 +69,21 @@ composed.**
       rounded search box, or with the history search's "Search" title as its first line (a
       no-match search at ≤8 rows draws nothing else).
       Tests: `TestOverlayWithItsFooterCut`.
+    - Live 2.1.309 frames, 6x10 to 200x4 (XERK-2220, `pane_frames_2220.json`): below 10 columns
+      the hint wraps MID-word ("canc"/"el"), rejoined by `_narrow_word_end`; with a background
+      agent running the permission footer is ELLIPSIZED instead ("Esc to canc…", "Esc…T");
+      an MCP elicitation is top-anchored, so a short pane keeps only its indented
+      "MCP server “…” requests" title under the rule; and a multi-question AskUserQuestion's
+      "Review your answers" page has NO footer and its `❯ 1.` at column 0
+      (`_pane_cut_choice_up`: told from the composer by the "?" line, not a rule, right above).
+      Tests: `TestLiveDialogFramesXerk2220`.
+    - A shorter pane cuts the elicitation title before its quote ("MCP"/"server", "M"): the
+      area must then be NOTHING but a prefix of "MCP server", or prose under a rule would block.
+    - The review page's "?" line is at column 0 and never "❯": a queued message is "❯ <msg>"
+      with indented wraps, and "❯ …?" / "❯ 1. Submit answers" queued must stay typeable.
+    - Accepted: the "Esc again to clear" toast at 8-9x3 ellipsizes to "Esc…" exactly like the
+      cut hint, so it holds a message ~1s until the toast clears. Text cannot tell them apart;
+      don't drop the ellipsis read to "fix" it.
     - qwen's Ctrl-R search draws `(r:)` as the first row of its composer box
       (`_qwen_history_search_up`, XERK-2215): Enter submits the best MATCH, so a typed "alp"
       re-sent an older prompt (verified on 0.22.3). Read by position, never anywhere on screen.
