@@ -39118,6 +39118,17 @@ class TestCollectAzure(unittest.TestCase):
         self.assertIn("4", keys)          # active
         self.assertIn("2", keys)          # recent done kept
         self.assertNotIn("3", keys)       # done older than the window dropped
+        self.assertFalse(block["activeTruncated"])
+
+    def test_active_slice_cut_marks_active_truncated_xerk2209(self):
+        # Any ADO cut can drop an OPEN item, so the hub's duplicate gate must hear it.
+        items = [_azure_wi(1, "Active"), _azure_wi(4, "New")]
+        with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "JIRA_MAX_ACTIVE", 1), \
+             mock.patch.object(ha, "azure_req", self._fake_req(items)):
+            block = ha.collect_azure()
+        self.assertTrue(block["truncated"])
+        self.assertTrue(block["activeTruncated"])
 
     def test_epic_fields_with_out_of_batch_parent_xerk1444(self):
         # The epic (100) is not assigned to @Me, so it is not in the batch: one
