@@ -19297,6 +19297,9 @@ def _pane_cut_dialog_up(cap):
 
 # A picker's cursor row: an indented "❯" (the composer's own prompt sits at column 0).
 _PANE_PICKER_CURSOR_RE = re.compile(r"^\s+❯(?:\s|$)")
+# A picker's search box top: an indented rounded box ("No matching prompts"
+# leaves the history search no cursor row, only its "⌕" box below).
+_PANE_PICKER_BOX_RE = re.compile(r"^\s+╭─+(?:╮)?$")
 
 
 def _pane_overlay_up(cap):
@@ -19313,7 +19316,7 @@ def _pane_overlay_up(cap):
     prompt line, "!" in shell mode) and no rule at column 0, no
     mode/shell/qwen footer, no exit toast. Then under a ▔ edge any content is
     an overlay; under a "─" rule (the composer's own top edge too) only a
-    picker's indented "❯" cursor row says so."""
+    picker's indented "❯" cursor row or rounded search box says so."""
     if not cap:
         return False
     lines = [_PANE_SCROLLBAR_RE.sub("", line).rstrip()
@@ -19338,7 +19341,8 @@ def _pane_overlay_up(cap):
             or PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
             or PANE_SHELL_FOOTER_RE.search(text) or _pane_composer_tail_up(lines)):
         return False
-    return edged or any(_PANE_PICKER_CURSOR_RE.match(line) for line in area)
+    return edged or any(_PANE_PICKER_CURSOR_RE.match(line) or _PANE_PICKER_BOX_RE.match(line)
+                        for line in area)
 
 
 def _answer_trust_dialog(tmux_name, cap=None):

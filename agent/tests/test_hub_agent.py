@@ -11327,11 +11327,22 @@ class TestOverlayWithItsFooterCut(unittest.TestCase):
         # A mode footer.
         self.assertFalse(ha._pane_overlay_up(
             edge + "  ⏵⏵ auto mode on (shift+tab to cycle)\n  ❯ row\n"))
+        # qwen's footer.
+        self.assertFalse(ha._pane_overlay_up(
+            edge + "  ❯ row\n  ? Ask permissions (shift + tab to cycle)\n"))
         # Shell mode's footer.
         self.assertFalse(ha._pane_overlay_up(edge + "  ! for shell mode\n"))
         # The exit toast.
         self.assertFalse(ha._pane_overlay_up("▔" * 12 + "\n  Press Ctrl-C again to exit\n"))
         self.assertTrue(ha._pane_overlay_up(edge + "  ❯ row\n"))
+
+    # Ctrl-R over a shell draft, nothing matching: no cursor row, only the box (live, QA).
+    HIST_NO_MATCH_120x8 = (" ▝▝   ▝▝   /tmp/claude-0/q2203/proj\n\n\n" + "─" * 120 + "\n"
+                           "  Search prompts · everywhere\n  No matching prompts\n\n"
+                           "  ╭" + "─" * 114 + "╮\n")
+
+    def test_a_history_search_with_no_match_blocks(self):
+        self.assertTrue(ha._pane_blocking_dialog(self.HIST_NO_MATCH_120x8))
 
     def test_under_a_rule_only_the_cursor_row_says_overlay(self):
         cap = self.HIST_26x8.replace("  ❯ limits", "    limits")
