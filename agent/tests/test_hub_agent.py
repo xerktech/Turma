@@ -53123,7 +53123,9 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.assertEqual(r["state"], "failed")
         self.assertIn("TURMA_MAX_SHADOW_RUNS", r["error"])
         self.assertEqual(sm.build_payload(1, light=True)["modelShadow"]["free"], 0)
-        # A run past running/grading frees it again.
+        # A grading run still holds it (its Opus grader runs); a terminal one frees it.
+        sm.shadow_runs[self.RID]["state"] = "grading"
+        self.assertEqual(sm._shadow_runs_active(), 1)
         sm.shadow_runs[self.RID]["state"] = "graded"
         self.assertEqual(sm._shadow_runs_active(), 0)
 

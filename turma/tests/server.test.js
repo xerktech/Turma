@@ -26975,11 +26975,20 @@ test("XERK-1847: a shadow goes only to a capable, free host decided into the org
   hub.modelShadowSweep(Date.now(), { rate: 1 });
   assert.equal((agents["sh-capped"].commands || []).length, 0);
   delete agents["sh-capped"];
+  // A spawnShadow already queued to it uses that free run until its beat acks.
+  shadowHost("sh-busy", site, { closedSessions: [], modelShadow: { available: true, free: 1 },
+    commands: [{ type: "spawnShadow", shadowId: "sh-00000000000000aa" }] });
+  hub.modelShadowSweep(Date.now(), { rate: 1 });
+  assert.equal(agents["sh-busy"].commands.length, 1);
+  delete agents["sh-busy"];
   shadowHost("sh-ok", site, { closedSessions: [], modelShadow: { available: true, free: 1 },
     capacity: { maxSessions: 1, running: 1, queued: 0, free: 0 } });
   hub.modelShadowSweep(Date.now(), { rate: 1, dailyMax: 1 });
   assert.equal(agents["sh-ok"].commands.length, 1);
   assert.equal(hub.outcomeLedger.shadowsDispatchedSince(Date.now() - 86400000), 1);
+  // A later sweep before the host beats again sends it no second shadow.
+  hub.modelShadowSweep(Date.now() + 15000, { rate: 1 });
+  assert.equal(agents["sh-ok"].commands.length, 1);
   // A report for that id from a host it was NOT sent to is ignored.
   agents["sh-full"].shadowRuns = [{ id: agents["sh-ok"].commands[0].shadowId, siteKey: site, state: "running" }];
   hub.outcomeLedgerSweep();

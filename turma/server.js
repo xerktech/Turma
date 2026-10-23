@@ -4879,8 +4879,13 @@ function shadowHostFor(site, repo, used, now) {
     if (!(a.modelShadow && a.modelShadow.available === true)) continue;
     if ((a.defaultRuntime || "claude") !== "claude") continue;
     if (!(a.repos || []).some((r) => r && r.name === repo)) continue;
+    // `free` is as of the host's last beat: a spawnShadow already queued to it
+    // (it stays in `commands` until the beat that acks it, which also reports
+    // the new `free`) is subtracted, or a later sweep over-dispatches and the
+    // agent fails the extra run for good (XERK-2227).
     const free = a.modelShadow.free;
-    if (!(typeof free === "number" ? free > 0 : hostHasFreeSlot(a))) continue;
+    const queued = (a.commands || []).filter((c) => c && c.type === "spawnShadow").length;
+    if (!(typeof free === "number" ? free - queued > 0 : hostHasFreeSlot(a))) continue;
     if (hostAutoPaused(key, a, paused)) continue;
     const avail = hostAvailability(a);
     if (avail > bestAvail) { best = key; bestAvail = avail; }
