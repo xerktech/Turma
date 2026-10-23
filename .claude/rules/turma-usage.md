@@ -45,15 +45,23 @@ paths:
     "captured" not "updated" (there is deliberately no fleet-wide last-refreshed stamp).
   - **A window whose `resetsAt` has passed renders as `—`**, not its last percentage — that window
     has since rolled over. Bar colours: 75% warn, 90% crit.
-  - **The 7-day bar carries even-pace day markers** (XERK-536): 7 daily 1/7 boundaries, a weekday
-    label under each, today's slice distinguished, and a continuous pace line at the fraction of the
-    week elapsed. Purely informational — nothing is throttled. Only the WEEKDAY NAMES need a
-    timezone, so the reporting AGENT computes them in ITS OWN local time and ships `sevenDay.dayLabels`
-    (7 strings); "today" and the pace line are timezone-free arithmetic done at render, so they stay
-    correct as the snapshot ages. `normalizeLimits` coerces `dayLabels` as a WHITELIST — exactly 7
-    short strings or the field drops (Android TYPES it, so one bad element would fail the whole
-    `/api/agents` decode). `sevenDayPacing` is the one pacing helper, mirrored web (`usage.html`) +
-    Android (`UsageViewModel`). Only the 7-day window has markers; the 5-hour one is left plain.
+  - **The 7-day bar carries day markers** (XERK-536): ticks at the VIEWER's local midnights, a
+    weekday label under each calendar day (column width = that day's share of the week), today's
+    day distinguished, and a line at NOW (the fraction of the week elapsed, = the even-pace point).
+    Purely informational — nothing is throttled. `sevenDayPacing` is the one helper, mirrored web
+    (`usage.html`) + Android (`UsageViewModel`). Only the 7-day window has markers.
+    - **Cut at midnight, never at 24h slices measured back from `resetsAt`**: a reset-anchored
+      slice straddles two days, so with a 15:30 reset "Thu" stayed highlighted until Friday 15:30.
+      7 to 9 cells: first and last partial when the reset is off midnight, and a DST change inside
+      the window shifts a midnight reset off it (an extra sliver). A sliver under half a day is
+      unlabelled UNLESS it is today — a blank today cell highlights nothing — and today's column
+      never shrinks below its label (web `min-width: max-content`, Android drops its weight):
+      a DOM-stub test sees `textContent`, never the CSS clip.
+    - **The viewer's zone, not the host's**: one card can fold hosts in different zones, and
+      "today" means the viewer's today. Tests assert against local `Date` math, so they hold in
+      any `TZ`.
+    - The agent still ships `sevenDay.dayLabels` (`normalizeLimits` whitelists exactly 7 short
+      strings) only for older Android builds; no current client reads it.
     - **The pace line drives auto-start PAUSING hub-side** (XERK-544, `turma-triage.md`): once
       informational, it now has a consumer. `server.js`'s `limitsPastPace`/`pausedSubscriptions`
       re-derive the SAME consumed-vs-elapsed comparison (needing only `resetsAt`+`usedPct`, not

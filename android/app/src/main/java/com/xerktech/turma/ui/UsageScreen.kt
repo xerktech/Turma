@@ -37,6 +37,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -359,7 +360,7 @@ private fun LimitRow(label: String, view: UsageViewModel.LimitView?, readAgeSec:
                     val w = size.width
                     val h = size.height
                     for (s in pacing.slices) {
-                        // The 7th boundary is the bar's own right edge.
+                        // The last boundary is the bar's own right edge.
                         if (s.end < 1.0) {
                             val x = (s.end * w).toFloat()
                             drawRect(tickColor, Offset(x - 0.5f, 0f), Size(1f, h))
@@ -370,16 +371,20 @@ private fun LimitRow(label: String, view: UsageViewModel.LimitView?, readAgeSec:
                 }
             }
         }
-        // The weekday labels: seven equal columns so each centres over its slice,
-        // today's distinguished. Drawn only when the bar carries pacing.
+        // The weekday labels: each column weighted by its day's share of the week
+        // so it centres over the span the ticks cut, today's distinguished. Drawn only when the bar carries pacing.
         if (pacing != null && !view.expired) {
             Row(Modifier.fillMaxWidth().padding(top = 3.dp)) {
                 for (s in pacing.slices) {
                     Text(
-                        s.label,
-                        modifier = Modifier.weight(1f),
+                        s.shownLabel,
+                        // Today never clips: a sliver of a day takes its label's own
+                        // width instead of its share (web: `.today` min-width).
+                        modifier = if (s.isToday && s.isSliver) Modifier else Modifier.weight(s.width.toFloat()),
                         textAlign = TextAlign.Center,
                         maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Clip,
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = if (s.isToday) FontWeight.SemiBold else null,
                         color = if (s.isToday) MaterialTheme.colorScheme.primary else muted,
