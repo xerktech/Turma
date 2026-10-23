@@ -28473,7 +28473,12 @@ class SessionManager:
         return next((s for s in list(self.registry) if s.get("id") == sid), None)
 
     def _new_id(self):
-        existing = {s.get("id") for s in self.registry}
+        # Never a remembered shadow run's id (XERK-1847): commands naming one are
+        # refused and its conversation is never resumed or archived. Nor a closed
+        # (resumable) record's: a second session under it would overwrite that
+        # record on kill, and a resume of it would start the wrong session.
+        existing = ({s.get("id") for s in self.registry} | set(self.shadow_sids)
+                    | {c.get("id") for c in self.closed})
         while True:
             sid = secrets.token_hex(3)[:5]
             if sid not in existing:
@@ -31961,6 +31966,14 @@ class SessionManager:
         tid = sess.get("claudeSessionId") if sess else None
         if isinstance(tid, str) and tid and tid not in self.shadow_tids:
             self.shadow_tids.append(tid)
+
+    def _is_shadow_sid(self, sid):
+        if not isinstance(sid, str) or not sid:
+            return False
+        if sid in self.shadow_sids:
+            return True
+        sess = self._find(sid)
+        return bool(sess and sess.get("shadow"))
 
     def _shadow_session_live(self, sid):
         sess = self._find(sid) if sid else None
@@ -45418,7 +45431,13 @@ class SessionManager:
                 continue
             ctype = cmd.get("type")
             try:
-                if ctype == "spawn":
+                if ctype != "resume" and self._is_shadow_sid(cmd.get("sessionId")):
+                    # A shadow run (XERK-1847) is the manager's own and is never
+                    # on the wire, so a hub command naming one by id (input, kill,
+                    # restart, ...) is refused, never run. `resume` keeps its own
+                    # reported refusal.
+                    log(f"command {ctype} ({cid}) refused: it names a shadow run")
+                elif ctype == "spawn":
                     self.spawn(
                         cmd.get("repo"),
                         prompt=cmd.get("prompt"),
@@ -46999,11 +47018,10 @@ class SessionManager:
         # Defect attribution (XERK-1846): the SZZ pass on its own thread.
         self._defect_scan_tick()
         # One snapshot both the session payloads and the mod-status pairing walk,
-        # so a rebind of self.registry mid-build can never misalign the two, and
-        # shadow runs (XERK-2227) are dropped from both at once — filtered from
-        # the payloads alone, every session after a shadow was paired with the
-        # wrong payload (XERK-2231).
-        live_records = [s for s in self.registry if not s.get("shadow")]
+        # so a rebind of self.registry mid-build can never misalign the two
+        # (XERK-2231). Shadow runs (XERK-2227) are in it: their payload is still
+        # BUILT (it folds the run's `modelActual`) and dropped from the wire after.
+        live_records = list(self.registry)
 
         payload = {
             # `device` (the physical host name) is the hub's identity key; agentId
@@ -47106,9 +47124,12 @@ class SessionManager:
             "repos": self._sorted_repo_entries(refresh, light),
             # A shadow run (XERK-1847) is no session of the operator's: never
             # reported, so no client shows, types into or stops it (XERK-2227).
-            "sessions": self._publish_mod_status(
-                [self._session_payload(s, refresh, light) for s in live_records],
-                live_records),
+            # Built for every record first and filtered after (see live_records).
+            "sessions": [
+                p for s, p in zip(live_records, self._publish_mod_status(
+                    [self._session_payload(s, refresh, light) for s in live_records],
+                    live_records))
+                if not s.get("shadow")],
             "closedSessions": self._closed_payload(),
             # Persistent usage, independent of active sessions: per-repo (keyed by
             # normalized origin so the hub can unify a repo across hosts) plus this

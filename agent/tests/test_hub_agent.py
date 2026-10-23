@@ -53197,6 +53197,47 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         sm.shadow_runs[self.RID]["state"] = "graded"
         self.assertEqual(sm._shadow_runs_active(), 0)
 
+    def test_xerk2227_a_shadow_runs_on_a_full_host_and_is_built_but_not_served(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        # The host is FULL of operator work: the shadow still runs, unqueued.
+        op = {"id": "op1", "status": "running", "worktreePath": os.path.join(self.tmp, "op1"),
+              "repo": "Turma"}
+        sm.registry.append(op)
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()), \
+                mock.patch.object(ha, "MAX_SESSIONS", 1):
+            self.shadow(sm, self.cmd())
+            sess = sm.registry[1]
+            self.assertEqual(sess["status"], "running")
+            self.assertEqual(sm._capacity_payload()["free"], 0)
+        sm.registry.append(dict(op, id="op2"))
+        seen, published = [], []
+        def payload(s, *a):
+            seen.append(s["id"])
+            return {"id": s["id"]}
+        with mock.patch.object(sm, "_session_payload", payload), \
+                mock.patch.object(sm, "_publish_mod_status",
+                                  lambda ps, recs=None: published.extend(ps) or ps):
+            p = sm.build_payload(1)
+        self.assertEqual([s["id"] for s in p["sessions"]], ["op1", "op2"])
+        # Still BUILT for the shadow (it folds the run's modelActual), and the
+        # mod-status writer gets one payload per registry record, in order.
+        self.assertEqual(seen, ["op1", sess["id"], "op2"])
+        self.assertEqual([x["id"] for x in published], seen)
+        # A hub command naming it by id is refused, never run.
+        sm.handle_commands([{"type": "kill", "sessionId": sess["id"], "cmdId": "k1"}])
+        self.assertIn(sess["id"], [s["id"] for s in sm.registry])
+
+    def test_xerk2227_a_new_session_never_reuses_a_shadow_or_closed_id(self):
+        # A reused shadow id would have every hub command to the operator's
+        # session refused; a reused closed id overwrites that resumable record.
+        sm = self.make_manager()
+        sm.shadow_sids = ["aaaaa"]
+        sm.closed = [{"id": "bbbbb"}]
+        with mock.patch.object(ha.secrets, "token_hex",
+                               side_effect=["aaaaaa", "bbbbbb", "cccccc"]):
+            self.assertEqual(sm._new_id(), "ccccc")
+
     def test_xerk2227_a_shadow_is_kept_out_of_the_closed_list_and_the_archive(self):
         sm = self.make_manager()
         sm._launch_ttyd = mock.Mock()
