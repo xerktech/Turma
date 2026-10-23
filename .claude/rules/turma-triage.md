@@ -120,7 +120,9 @@ attempt** (no retry budget burned, exactly like a repo-less ticket):
    - **A duplicate gates only while its twin is on the board and not Done** (XERK-2209). The verdict
      is a snapshot and the ledger re-triages only on the ticket's own text, so a closed twin used to
      gate its duplicate forever. A twin no longer listed counts as closed — unless one of the org's
-     `jira` blocks is `truncated`, where it may just be past the agent's cap (`duplicateTwinOpen`). Without `rows` the
+     `jira` blocks has `activeTruncated` (only a cut ACTIVE list can hide an open twin), where it
+     may just be past the agent's cap (`duplicateTwinOpen`). Never key this on `truncated`: it also
+     counts the Done window, which a busy org always overflows (falls back to it for old agents). Without `rows` the
      verdict is taken as-is.
 3. **Operator verdict**: `hold`/`reject` drops the auto entry with no churn.
 4. **Org policy** (`triagePolicyReason`); the first violated knob is reported. `approve` bypasses.

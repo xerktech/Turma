@@ -15220,6 +15220,15 @@ test("XERK-2209: an absent twin keeps gating while the org's board block is trun
   assert.deepEqual(hub.compileBrief(site, Date.now(), "scheduled", []).nextUp.map((i) => i.key), []);
   agents.x2209t.jira.truncated = false;
   assert.equal(triageGateReason(row, site, rows), null);
+  // A current agent says WHICH list was cut: only the active list matters. A
+  // truncated Done window (a busy org, always) with a whole active list lifts it.
+  agents.x2209t.jira.truncated = true;
+  agents.x2209t.jira.activeTruncated = false;
+  assert.equal(triageGateReason(row, site, rows), null);
+  agents.x2209t.jira.activeTruncated = true;
+  assert.equal(triageGateReason(row, site, rows), "duplicate");
+  agents.x2209t.jira.truncated = false;
+  agents.x2209t.jira.activeTruncated = false;
   assert.deepEqual(hub.compileBrief(site, Date.now(), "scheduled", []).nextUp.map((i) => i.key), ["DT-1"]);
   resetAutoStart();
 });

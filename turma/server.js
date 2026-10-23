@@ -10638,7 +10638,7 @@ function normalizeJira(a) {
   // available/configured/truncated are non-null Boolean on Android — `available`
   // is TIER 2 (built from tracker tool output, so a schema change or an error
   // payload can flip its shape). Drop a non-bool to the client's `false`.
-  for (const k of ["available", "configured", "truncated"]) {
+  for (const k of ["available", "configured", "truncated", "activeTruncated"]) {
     if (k in j && typeof j[k] !== "boolean") delete j[k];
   }
   // Per-ticket triage assessment (XERK-481). `jira` is a KNOWN heartbeat key, so
@@ -15114,7 +15114,10 @@ function reclaimStrandedTicketSpawns() {
 // fleetTicketRows) the duplicate gate holds only while the twin is listed and
 // not Done; a twin no longer listed has left the board (closed and aged out of
 // the Done window, or reassigned), so it no longer gates either — unless one of
-// the org's blocks was truncated, where an absent twin may simply be past the cap.
+// the org's ACTIVE lists was cut at the agent's cap, where an open twin may simply
+// be past it. `activeTruncated` says that; `truncated` also counts the Done
+// window, which a busy org always overflows, so it is only the fallback for an
+// agent that predates `activeTruncated`.
 function triageGateReason(t, siteKey, rows) {
   const tri = t && typeof t === "object" ? t.triage : null;
   if (!tri || typeof tri !== "object" || Array.isArray(tri)) return "untriaged";
@@ -15133,7 +15136,9 @@ function duplicateTwinOpen(siteKey, twinKey, rows) {
   const hit = rows.get(ticketQueueKey(siteKey, twinKey));
   if (hit && hit.row) return hit.row.statusCategory !== "done";
   return Object.values(agents).some((a) => a && a.jira && a.jira.siteKey === siteKey
-    && decidedOrgOf(a) === siteKey && a.jira.truncated === true);
+    && decidedOrgOf(a) === siteKey
+    && (typeof a.jira.activeTruncated === "boolean"
+      ? a.jira.activeTruncated : a.jira.truncated === true));
 }
 
 // XERK-1567: the auto stream's order key, as a comparable array over a ticket

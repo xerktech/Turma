@@ -22273,6 +22273,9 @@ def collect_jira():
         "fetchedAt": now_iso(),
         "error": None,
         "truncated": trunc_active or trunc_done,
+        # Only a cut ACTIVE list can hide an open ticket; the hub's duplicate
+        # gate reads this one (XERK-2209) — a busy Done window is always cut.
+        "activeTruncated": trunc_active,
         "tickets": active + done,
     }
 
@@ -23201,6 +23204,8 @@ def collect_azure():
         "fetchedAt": now_iso(),
         "error": None,
         "truncated": truncated,
+        # Every ADO cut (WIQL id cap, active slice) can drop an open item.
+        "activeTruncated": truncated,
         "tickets": active + done,
     }
 

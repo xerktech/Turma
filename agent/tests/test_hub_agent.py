@@ -38318,7 +38318,21 @@ class TestCollectJira(unittest.TestCase):
              mock.patch.object(ha, "JIRA_TOKEN", "t"), \
              mock.patch.object(ha, "fetch_jira_issues",
                                side_effect=[([], True), ([], False)]):
-            self.assertTrue(ha.collect_jira()["truncated"])
+            block = ha.collect_jira()
+        self.assertTrue(block["truncated"])
+        self.assertTrue(block["activeTruncated"])
+
+    def test_done_truncation_does_not_mark_active_truncated(self):
+        # XERK-2209: a busy Done window is always cut at JIRA_MAX_DONE; that must
+        # not read as "an open ticket may be missing" to the hub's duplicate gate.
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "e"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "t"), \
+             mock.patch.object(ha, "fetch_jira_issues",
+                               side_effect=[([], False), ([], True)]):
+            block = ha.collect_jira()
+        self.assertTrue(block["truncated"])
+        self.assertFalse(block["activeTruncated"])
 
 
 def _adf(*content):
