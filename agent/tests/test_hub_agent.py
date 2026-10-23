@@ -9164,15 +9164,24 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
 
 class _FakeClock:
     """monotonic/sleep for `ha.time`: time moves only when the code sleeps (or a
-    test advances it), so time bounds are exercised without waiting."""
+    test advances it), so time bounds are exercised without waiting. Only the
+    thread that made it sees it: patching `ha.time` is process-wide, and a
+    worker an earlier test left running would otherwise move the test's clock
+    with its own sleeps (XERK-2197, XERK-2215)."""
 
     def __init__(self):
         self.t = 1000.0
+        self._owner = threading.get_ident()
+        self._real_monotonic, self._real_sleep = time.monotonic, time.sleep
 
     def monotonic(self):
+        if threading.get_ident() != self._owner:
+            return self._real_monotonic()
         return self.t
 
     def sleep(self, d):
+        if threading.get_ident() != self._owner:
+            return self._real_sleep(d)
         self.t += d
 
 
@@ -11340,6 +11349,100 @@ class TestLiveDialogFramesXerk2220(unittest.TestCase):
         self.assertFalse(ha._pane_overlay_up(cut.replace("server", "servers")))
         self.assertFalse(ha._pane_overlay_up(cut.replace("  MCP", "  MCQ")))
         self.assertFalse(ha._pane_overlay_up(cut + "  more\n"))
+
+
+class TestQwenHistorySearch(unittest.TestCase):
+    """XERK-2215: qwen 0.22.3's Ctrl-R history search, live frames (tmux 3.4).
+    It draws "(r:)" in the composer's prompt column; typed text is the query
+    and Enter submits the best MATCH, so a short reply would re-send an older
+    prompt (verified: "alp" + Enter re-sent "first prompt alpha")."""
+
+    R_100 = ("  > first prompt alpha\n  ✕ [API Error: Connection error.]\n\n"
+             + "─" * 100 + "\n(r:)  alp \u200b\n" + "─" * 100 + "\n  > first prompt alpha\n\n\n")
+    R_NOMATCH_100 = ("  > first prompt alpha\n\n" + "─" * 100
+                     + "\n(r:)  zzz brand new message \u200b\n" + "─" * 100
+                     + "\n  ➜ work · git:(master) · x\n  Auto mode (shift + tab to cycle)\n")
+    R_30x12 = ("                             │\n  > zzz brand new message    │\n"
+               "    to retry)                █\n\n" + "─" * 30 + "\n(r:)  first \u200b\n"
+               + "─" * 30 + "\n  > first prompt alpha\n\n")
+    IDLE_30x12 = ("  > zzz brand new message\n    to retry)\n\n" + "─" * 30
+                  + "\n>   Type your message or\n  @path/to/file\n" + "─" * 30
+                  + "\n  ➜ work · git:(master) · x\n  Auto mode (shift + tab to…\n")
+
+    # Short panes with 11 history entries: the match list scrolls the box up
+    # ("(r:)" first, then wrapped off at 30 columns), then off entirely.
+    LIST = ("  > prompt number 10 a\n    prompt number 9 a\n    prompt number 8 a\n"
+            "    prompt number 7 a\n    prompt number 5 a\n\n    prompt number 6 a\n"
+            "    prompt number 3 a\n\n    prompt number 4 a\n    prompt number 2 a\n"
+            "    prompt number 1 a\n")
+    R_100x14 = "(r:)    Type your message or @path/to/file\n" + "─" * 100 + "\n" + LIST
+    R_30x14 = "      @path/to/file\n" + "─" * 30 + "\n" + LIST
+    R_100x10 = LIST.split("\n", 3)[3]
+    R_14x4 = "     a\n    prompt\n    number 1\n     a\n"
+    # 9+ matches end the list with a "▼" / "(k/N)" trailer.
+    R_100x10_TRAILER = ("    prompt number 7 a\n    prompt number 5 a\n\n    prompt number 6 a\n"
+                        "    prompt number 3 a\n\n    prompt number 4 a\n    prompt number 2 a\n"
+                        "  ▼\n  (1/9)\n")
+    R_30x6_TRAILER = ("    prompt number 3 a\n\n    prompt number 4 a\n    prompt number 2 a\n"
+                      "  ▼\n  (1/9)\n")
+    # Under ~11 columns the "(k/N)" counter wraps (QA frames, 0.22.3).
+    R_8x10_WRAPPED = ("    pr\n    om\n    pt\n     5\n     a\n    lp\n    ha\n"
+                      "  ▼\n  (1/1\n  2)\n")
+    R_10x6_WRAPPED = "    pt 3\n     alp\n    ha\n  ▼\n  (10/12\n  )\n"
+    # A list scrolled to k>=10 opens with "  ▲" under the rule (QA, 14x20).
+    R_14x20_UP_ARROW = ("─" * 14 + "\n  ▲\n    prompt\n    12 alpha\n    prompt\n    alpha\n"
+                        "    prompt 9\n     alpha\n  > prompt 5\n     alpha\n  ▼\n  (10/14)\n")
+    # An "@" completion popup draws the same list under a ">" composer row.
+    POPUP_100x30 = ("  ✕ [API Error: Connection error.]\n" + "─" * 100 + "\n> please read @fa \u200b\n"
+                    + "─" * 100 + "\n  > fa1.txt\n    fa10.txt\n    fa11.txt\n    fa12.txt\n"
+                    "    fa2.txt\n  ▼\n  (1/12)\n")
+    POPUP_TOP_RULE_OFF = ("> please read @fa \u200b\n" + "─" * 100
+                          + "\n  > fa1.txt\n    fa10.txt\n  ▼\n  (1/12)\n")
+    IDLE_14x6 = "e\n\n" + "─" * 14 + "\n  ➜ work ·\n  git:(maste\n  Auto mode…\n"
+    IDLE_30x4 = "  @path/to/file\n" + "─" * 30 + "\n  ➜ work · git:(master) · x\n  Auto mode (shift + tab to…\n"
+
+    def test_the_history_search_blocks_typing(self):
+        for name in ("R_100", "R_NOMATCH_100", "R_30x12",
+                     "R_100x14", "R_30x14", "R_100x10", "R_14x4",
+                     "R_100x10_TRAILER", "R_30x6_TRAILER",
+                     "R_8x10_WRAPPED", "R_10x6_WRAPPED", "R_14x20_UP_ARROW"):
+            with self.subTest(name):
+                cap = getattr(self, name)
+                self.assertTrue(ha._qwen_history_search_up(cap))
+                self.assertTrue(ha._pane_blocking_dialog(cap))
+
+    def test_an_idle_composer_is_not_the_search(self):
+        for name in ("IDLE_30x12", "IDLE_14x6", "IDLE_30x4",
+                     "POPUP_100x30", "POPUP_TOP_RULE_OFF"):
+            with self.subTest(name):
+                cap = getattr(self, name)
+                self.assertFalse(ha._qwen_history_search_up(cap))
+                self.assertFalse(ha._pane_blocking_dialog(cap))
+
+    def test_the_search_row_above_a_lone_bottom_rule_counts(self):
+        # The top rule scrolled off; the footer under the box is no list.
+        cap = "  > older reply\n(r:)  q \u200b\n" + "─" * 30 + "\n  ➜ work\n  Auto mode\n"
+        self.assertTrue(ha._qwen_history_search_up(cap))
+
+    def test_a_list_needs_two_rows_or_a_trailer(self):
+        self.assertFalse(ha._qwen_history_search_up("    one indented line\n"))
+        self.assertTrue(ha._qwen_history_search_up("    prompt 3 alpha\n  ▼\n  (1/10)\n"))
+        self.assertFalse(ha._qwen_history_search_up("  ▼\n  (1/10)\n"))
+        # Count fragments must join into one "(k/N)".
+        self.assertFalse(ha._qwen_history_search_up("    a\n    b\n  (1/\n  1/2)\n"))
+
+    def test_only_the_last_box_and_its_first_row_count(self):
+        rule = "─" * 30
+        older = rule + "\n(r:)  stale frame\n" + rule + "\n  reply\n"
+        self.assertFalse(ha._qwen_history_search_up(older + self.IDLE_30x12))
+        draft = rule + "\n>   draft\n(r:) second row\n" + rule + "\n  ➜ work\n  Auto mode\n"
+        self.assertFalse(ha._qwen_history_search_up(draft))
+
+    def test_r_in_the_transcript_is_not_the_search(self):
+        # A reply quoting "(r:)" is indented, and above the composer box.
+        cap = "  (r:) is qwen's search\n(r:) quoted at column 0\n" + self.IDLE_30x12
+        self.assertFalse(ha._qwen_history_search_up(cap))
+        self.assertFalse(ha._qwen_history_search_up(""))
 
 
 class TestOverlayWithItsFooterCut(unittest.TestCase):
@@ -46376,6 +46479,20 @@ class TestScrubClaudeSessionEnv(unittest.TestCase):
 
 
 
+def _this_thread_sleeps(record):
+    """A time.sleep fake that hands THIS thread's sleeps to `record` and lets
+    every other thread really sleep. Patching ha.time.sleep patches it
+    process-wide, so a worker an earlier test left running would otherwise
+    record its own sleep into the test's order (XERK-2197, XERK-2215)."""
+    me, real = threading.get_ident(), time.sleep
+
+    def fake(sec):
+        if threading.get_ident() != me:
+            return real(sec)
+        return record(sec)
+    return fake
+
+
 class TestWindowsTerminalBackend(unittest.TestCase):
     """XERK-697 — the manager side of the ConPTY pty-host seam (ADR D5): the
     pure-Python control client + the tmux/ttyd call-site dispatch, all verified
@@ -46688,8 +46805,8 @@ class TestWindowsTerminalBackend(unittest.TestCase):
             return {"ok": True}
 
         with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
-             mock.patch.object(ha.time, "sleep",
-                               side_effect=lambda s: order.append(("sleep", s))), \
+             mock.patch.object(ha.time, "sleep", side_effect=_this_thread_sleeps(
+                 lambda s: order.append(("sleep", s)))), \
              mock.patch.object(ha, "_capture_pane", return_value=""):
             ha._pty_inject("agent-x", "a\nb\U0001F600")
         # paste, THEN a settle sleep, THEN the Enter — never Enter before the sleep.
@@ -46700,20 +46817,21 @@ class TestWindowsTerminalBackend(unittest.TestCase):
     def test_pty_inject_single_line_settles_before_its_enter(self):
         # Typed text makes no paste chip, but an Enter right behind it can be
         # read as a line break (_submit_typed), so it settles first.
-        calls = []
+        calls, slept = [], []
 
         def fake_control(name, op, **kw):
             calls.append(kw.get("data"))
             return {"ok": True}
 
         with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
-             mock.patch.object(ha.time, "sleep") as slept, \
+             mock.patch.object(ha.time, "sleep",
+                               side_effect=_this_thread_sleeps(slept.append)), \
              mock.patch.object(ha, "_capture_pane", return_value=COMPOSER_BUSY) as cap:
             self.assertTrue(ha._pty_inject("agent-x", "just one line"))
         # Typed text: settle, ONE Enter, then one read back, which
         # shows a turn running, so no second Enter.
         self.assertEqual(calls, [calls[0], "\r"])
-        self.assertEqual(slept.call_args_list[0], mock.call(ha.TYPED_SUBMIT_SETTLE_SEC))
+        self.assertEqual(slept[0], ha.TYPED_SUBMIT_SETTLE_SEC)
         self.assertEqual(cap.call_count, 2)   # baseline, then one read
 
     def test_pty_inject_retries_enter_while_the_paste_chip_shows(self):
@@ -46811,8 +46929,8 @@ class TestWindowsTerminalBackend(unittest.TestCase):
             return {"ok": ok}
 
         with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
-             mock.patch.object(ha.time, "sleep",
-                               side_effect=lambda s: order.append(("sleep", s))), \
+             mock.patch.object(ha.time, "sleep", side_effect=_this_thread_sleeps(
+                 lambda s: order.append(("sleep", s)))), \
              mock.patch.object(ha, "_await_slice_drawn", return_value=True), \
              mock.patch.object(ha, "_capture_pane", return_value=COMPOSER_BUSY) as cap:
             result = ha._pty_inject("agent-x", text)

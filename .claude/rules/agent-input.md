@@ -84,6 +84,13 @@ composed.**
     - Accepted: the "Esc again to clear" toast at 8-9x3 ellipsizes to "Esc…" exactly like the
       cut hint, so it holds a message ~1s until the toast clears. Text cannot tell them apart;
       don't drop the ellipsis read to "fix" it.
+    - qwen's Ctrl-R search draws `(r:)` as the first row of its composer box
+      (`_qwen_history_search_up`, XERK-2215): Enter submits the best MATCH, so a typed "alp"
+      re-sent an older prompt (verified on 0.22.3). Read by position, never anywhere on screen.
+      While the box's column-0 row shows, it alone decides (`>` with an `@` popup below is NOT
+      the search). Once a short pane's list scrolls it off, a bottom of only list rows (`▼`/
+      `(k/N)` trailer allowed) counts: a popup over a draft is held then too, on purpose.
+      Tests: `TestQwenHistorySearch`.
   - **The dialog check runs before EVERY write, not once per message** (`_slice_gate`): before
     each later slice, send-keys chunk and Enter, on tmux and Windows, whether or not draws are
     still awaited. QA: a dialog drawn mid-message got the rest, and a last slice "1" approved
