@@ -187,8 +187,8 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     the resume picker and the archive; the hub also drops an older agent's `shadow: true`
     session in `normalizeSessions`. The run reaches the hub only as `shadowRuns`.
   - **A shadow's payload is still BUILT, then filtered off the wire**: `_session_payload` folds
-    the run's `modelActual` and `_publish_mod_status` pairs payloads with the registry by
-    position, so filtering first lost the model and misaligned `/turma status`. A hub command
+    the run's `modelActual` (filtering first lost it); `live_records` is the whole registry
+    snapshot both the payloads and `_publish_mod_status` walk. A hub command
     naming a shadow id is refused (`_is_shadow_sid`; `resume` keeps its reported refusal), and
     `_new_id` never mints a remembered shadow or closed id.
     Tests: `test_xerk2227_a_shadow_runs_on_a_full_host_and_is_built_but_not_served`,

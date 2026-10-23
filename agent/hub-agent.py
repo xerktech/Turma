@@ -36800,12 +36800,16 @@ class SessionManager:
             self.save()
             log(f"renamed session {sess['id']} RC/peer name -> {name!r}")
 
-    def _publish_mod_status(self, payloads):
+    def _publish_mod_status(self, payloads, records=None):
         """Write each bridge-mod session's `status.json` (what `/turma status`
         shows) when it changed or went missing, and hand the payloads back
         unchanged. On the beat, so best-effort and never raising, one session's
-        failure never costing another's; a few hundred bytes per session."""
-        for sess, payload in zip(self.registry, payloads):
+        failure never costing another's; a few hundred bytes per session.
+
+        `records` is the registry snapshot `payloads` was built from, in the same
+        order: pairing against the LIVE `self.registry` would misalign if it were
+        rebound between the two (XERK-2231). None = `self.registry` (tests)."""
+        for sess, payload in zip(self.registry if records is None else records, payloads):
             sid = sess.get("id")
             try:
                 if (not sess.get("bridgeMod") or sess.get("status") != "running"
@@ -47013,6 +47017,11 @@ class SessionManager:
         self._brief_render_tick()
         # Defect attribution (XERK-1846): the SZZ pass on its own thread.
         self._defect_scan_tick()
+        # One snapshot both the session payloads and the mod-status pairing walk,
+        # so a rebind of self.registry mid-build can never misalign the two
+        # (XERK-2231). Shadow runs (XERK-2227) are in it: their payload is still
+        # BUILT (it folds the run's `modelActual`) and dropped from the wire after.
+        live_records = list(self.registry)
 
         payload = {
             # `device` (the physical host name) is the hub's identity key; agentId
@@ -47115,12 +47124,11 @@ class SessionManager:
             "repos": self._sorted_repo_entries(refresh, light),
             # A shadow run (XERK-1847) is no session of the operator's: never
             # reported, so no client shows, types into or stops it (XERK-2227).
-            # Built for every record first and filtered after: `_session_payload`
-            # also folds what a shadow run reports (`modelActual`), and the
-            # mod-status writer pairs payloads with the registry by position.
+            # Built for every record first and filtered after (see live_records).
             "sessions": [
-                p for s, p in zip(self.registry, self._publish_mod_status(
-                    [self._session_payload(s, refresh, light) for s in self.registry]))
+                p for s, p in zip(live_records, self._publish_mod_status(
+                    [self._session_payload(s, refresh, light) for s in live_records],
+                    live_records))
                 if not s.get("shadow")],
             "closedSessions": self._closed_payload(),
             # Persistent usage, independent of active sessions: per-repo (keyed by
