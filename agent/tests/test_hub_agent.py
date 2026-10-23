@@ -9208,7 +9208,8 @@ def _park_input_worker(sm, timeout=10):
         sm.input_held.clear()
     sm._held_wait = held_wait
     sm._input_wake.set()
-    assert parked.wait(timeout), "input worker never returned to its idle wait"
+    if not parked.wait(timeout):
+        raise AssertionError("input worker never returned to its idle wait")
 
 
 class _FakeComposer:
