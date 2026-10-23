@@ -1,0 +1,502 @@
+{
+ "approval_10x10": {
+  "blocks": true,
+  "frame": "    MCP\n    server\n\n  Enter\n  to con\n  firm ·\n  Esc\n  to\n  cancel\n"
+ },
+ "approval_12x10": {
+  "blocks": true,
+  "frame": "    using\n    this MCP\n    server\n\n  Enter to\n  confirm\n  · Esc\n  to\n  cancel\n"
+ },
+ "approval_14x10": {
+  "blocks": true,
+  "frame": "    without\n    using this\n    MCP\n    server\n\n  Enter to\n  confirm ·\n  Esc to\n  cancel\n"
+ },
+ "approval_200x6": {
+  "blocks": true,
+  "frame": "  MCP servers may execute code or access system resources. All tool calls require approval. Learn more in the MCP documentation.\n\n  ❯ Continue without using this MCP server\n\n  Enter to confirm · Esc to cancel\n"
+ },
+ "approval_20x6": {
+  "blocks": true,
+  "frame": "    using this MCP\n    server\n\n  Enter to confirm\n  · Esc to cancel\n"
+ },
+ "approval_26x8": {
+  "blocks": true,
+  "frame": "  documentation.\n\n  ❯ Continue without using\n    this MCP server\n\n  Enter to confirm · Esc\n  to cancel\n"
+ },
+ "approval_26x9": {
+  "blocks": true,
+  "frame": "  in the MCP\n  documentation.\n\n  ❯ Continue without using\n    this MCP server\n\n  Enter to confirm · Esc\n  to cancel\n"
+ },
+ "approval_30x10": {
+  "blocks": true,
+  "frame": "  ↑ Use this and all future\n    MCP servers in this\n    project\n  ❯ Continue without using\n    this MCP server\n\n  Enter to confirm · Esc to\n  cancel\n"
+ },
+ "approval_40x10": {
+  "blocks": true,
+  "frame": "  calls require approval. Learn more\n  in the MCP documentation.\n\n  ↑ Use this and all future MCP servers\n    in this project\n  ❯ Continue without using this MCP\n    server\n\n  Enter to confirm · Esc to cancel\n"
+ },
+ "approval_40x6": {
+  "blocks": true,
+  "frame": "  ❯ Continue without using this MCP\n    server\n\n  Enter to confirm · Esc to cancel\n"
+ },
+ "approval_60x5": {
+  "blocks": true,
+  "frame": "  ❯ Continue without using this MCP server\n\n  Enter to confirm · Esc to cancel\n"
+ },
+ "approval_60x8": {
+  "blocks": true,
+  "frame": "  MCP servers may execute code or access system resources.\n  All tool calls require approval. Learn more in the MCP\n  documentation.\n\n  ❯ Continue without using this MCP server\n\n  Enter to confirm · Esc to cancel\n"
+ },
+ "approval_6x10": {
+  "blocks": true,
+  "frame": "  ·\n  E\n  sc\n\n  to\n\n  ca\n  nc\n  el\n"
+ },
+ "approval_8x10": {
+  "blocks": true,
+  "frame": "  Ente\n  r to\n  con\n  firm\n  ·\n  Esc\n  to\n  canc\n  el\n"
+ },
+ "approval_8x20": {
+  "blocks": true,
+  "frame": "    inue\n    wit\n    hout\n    usi\n    ng\n    this\n    MCP\n    ser\n    ver\n\n  Ente\n  r to\n  con\n  firm\n  ·\n  Esc\n  to\n  canc\n  el\n"
+ },
+ "approval_8x40": {
+  "blocks": true,
+  "frame": "    Use\n    this\n    MCP\n    ser\n    ver\n    Use\n    this\n    and\n    all\n    fut\n    ure\n    MCP\n    serv\n    ers\n    in\n    this\n    pro\n    ject\n  ❯ Cont\n    inue\n    wit\n    hout\n    usi\n    ng\n    this\n    MCP\n    ser\n    ver\n\n  Ente\n  r to\n  con\n  firm\n  ·\n  Esc\n  to\n  canc\n  el\n"
+ },
+ "ask1_10x8": {
+  "blocks": true,
+  "frame": "Enter to\nselect ·\nTab/Arrow\nkeys to\nnavigate ·\nEsc to\ncancel\n"
+ },
+ "ask1_14x10": {
+  "blocks": true,
+  "frame": "──────────────\n  5. Chat\n  about this\n\nEnter to\nselect ·\nTab/Arrow keys\nto navigate ·\nEsc to cancel\n"
+ },
+ "ask1_200x6": {
+  "blocks": true,
+  "frame": "     Pick red\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  5. Chat about this\n\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+ },
+ "ask1_20x6": {
+  "blocks": true,
+  "frame": "Enter to select ·\nTab/Arrow keys to\nnavigate · Esc to\ncancel\n"
+ },
+ "ask1_26x8": {
+  "blocks": true,
+  "frame": "     Pick red\n──────────────────────────\n  5. Chat about this\n\nEnter to select ·\nTab/Arrow keys to navigate\n· Esc to cancel\n"
+ },
+ "ask1_26x9": {
+  "blocks": true,
+  "frame": "❯ 1. Red\n     Pick red\n──────────────────────────\n  5. Chat about this\n\nEnter to select ·\nTab/Arrow keys to navigate\n· Esc to cancel\n"
+ },
+ "ask1_30x10": {
+  "blocks": true,
+  "frame": "❯ 1. Red\n     Pick red\n──────────────────────────────\n  5. Chat about this\n\nEnter to select · Tab/Arrow\nkeys to navigate · Esc to\ncancel\n"
+ },
+ "ask1_40x10": {
+  "blocks": true,
+  "frame": "Which color do you want?\n\n❯ 1. Red\n     Pick red\n────────────────────────────────────────\n  5. Chat about this\n\nEnter to select · Tab/Arrow keys to\nnavigate · Esc to cancel\n"
+ },
+ "ask1_40x6": {
+  "blocks": true,
+  "frame": "────────────────────────────────────────\n  5. Chat about this\n\nEnter to select · Tab/Arrow keys to\nnavigate · Esc to cancel\n"
+ },
+ "ask1_60x5": {
+  "blocks": true,
+  "frame": "────────────────────────────────────────────────────────────\n  5. Chat about this\n\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+ },
+ "ask1_60x8": {
+  "blocks": true,
+  "frame": "❯ 1. Red\n     Pick red\n────────────────────────────────────────────────────────────\n  5. Chat about this\n\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+ },
+ "ask1_6x10": {
+  "blocks": true,
+  "frame": "select\n· Tab\n/Arrow\nkeys\nto nav\nigate\n· Esc\nto\ncancel\n"
+ },
+ "ask1_8x10": {
+  "blocks": true,
+  "frame": "Enter to\nselect\n· Tab/Ar\nrow keys\nto\nnavigate\n· Esc\nto\ncancel\n"
+ },
+ "ask2_120x40": {
+  "blocks": true,
+  "frame": " ▐▛███▛█   Claude Code v2.1.309\n▝▜██████▀  Opus 5.5 with medium effort · Claude Max\n ▝▝   ▝▝   /…/d51c437b-02b6-424f-8223-d06e2eaf8faa/scratchpad/proj\n\n\n❯ Call the mcp__elicit__deploy tool now, nothing else.\n\n  Called elicit\n\n● The deploy was cancelled, so nothing was deployed. The tool asked you to pick a target environment, and that prompt\n  came back cancelled.\n\n✻ Churned for 4s · done 1:25 PM\n\n❯ Use the AskUserQuestion tool ONCE with exactly three questions in one call: 1) pick a color (Red/Green/Blue), 2) pick\n  sizes (Small/Large, multiSelect true), 3) pick a fruit (Apple/Pear). Do nothing else.\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n←  ☒ Color  ☐ Sizes  ☐ Fruit  ✔ Submit  →\n\nWhich sizes do you want?\n\n❯ 1. [ ] Small\n         Pick small\n  2. [ ] Large\n         Pick large\n  3. [ ] Type something\n     Next\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  4. Chat about this\n\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+ },
+ "ask2_14x10": {
+  "blocks": true,
+  "frame": "──────────────\n  4. Chat\n  about this\n\nEnter to\nselect ·\nTab/Arrow keys\nto navigate ·\nEsc to cancel\n"
+ },
+ "ask2_200x6": {
+  "blocks": true,
+  "frame": "     Next\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  4. Chat about this\n\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+ },
+ "ask2_20x6": {
+  "blocks": true,
+  "frame": "Enter to select ·\nTab/Arrow keys to\nnavigate · Esc to\ncancel\n"
+ },
+ "ask2_26x8": {
+  "blocks": true,
+  "frame": "     Next\n──────────────────────────\n  4. Chat about this\n\nEnter to select ·\nTab/Arrow keys to navigate\n· Esc to cancel\n"
+ },
+ "ask2_40x6": {
+  "blocks": true,
+  "frame": "────────────────────────────────────────\n  4. Chat about this\n\nEnter to select · Tab/Arrow keys to\nnavigate · Esc to cancel\n"
+ },
+ "ask2_60x5": {
+  "blocks": true,
+  "frame": "────────────────────────────────────────────────────────────\n  4. Chat about this\n\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+ },
+ "ask2_6x10": {
+  "blocks": true,
+  "frame": "select\n· Tab\n/Arrow\nkeys\nto nav\nigate\n· Esc\nto\ncancel\n"
+ },
+ "ask2_8x10": {
+  "blocks": true,
+  "frame": "Enter to\nselect\n· Tab/Ar\nrow keys\nto\nnavigate\n· Esc\nto\ncancel\n"
+ },
+ "ask_120x40": {
+  "blocks": true,
+  "frame": " ▐▛███▛█   Claude Code v2.1.309\n▝▜██████▀  Opus 5.5 with medium effort · Claude Max\n ▝▝   ▝▝   /…/d51c437b-02b6-424f-8223-d06e2eaf8faa/scratchpad/proj\n\n\n❯ Call the mcp__elicit__deploy tool now, nothing else.\n\n  Called elicit\n\n● The deploy was cancelled, so nothing was deployed. The tool asked you to pick a target environment, and that prompt\n  came back cancelled.\n\n✻ Churned for 4s · done 1:25 PM\n\n❯ Use the AskUserQuestion tool ONCE with exactly three questions in one call: 1) pick a color (Red/Green/Blue), 2) pick\n  sizes (Small/Large, multiSelect true), 3) pick a fruit (Apple/Pear). Do nothing else.\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n←  ☐ Color  ☐ Sizes  ☐ Fruit  ✔ Submit  →\n\nWhich color do you want?\n\n❯ 1. Red\n     Pick red\n  2. Green\n     Pick green\n  3. Blue\n     Pick blue\n  4. Type something.\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  5. Chat about this\n\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+ },
+ "busy_10x8": {
+  "blocks": false,
+  "frame": "  hundred\n  ten\n  one\n  hundred\n\n──────────\n❯\n──────────\n"
+ },
+ "busy_14x10": {
+  "blocks": false,
+  "frame": "  one hundred\n  twenty-nine\n  one hundred\n  thirty\n  one hundred\n\n──────────────\n❯\n──────────────\n  ⏸ manual\n"
+ },
+ "busy_200x4": {
+  "blocks": false,
+  "frame": "✻ Churned for 7s · done 1:32 PM\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n"
+ },
+ "busy_200x6": {
+  "blocks": false,
+  "frame": "✻ Churned for 7s · done 1:32 PM\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n❯\n"
+ },
+ "busy_20x6": {
+  "blocks": false,
+  "frame": "  twenty-nine\n  one hundred thirty\n  one hundred\n\n────────────────────\n❯\n"
+ },
+ "busy_26x8": {
+  "blocks": false,
+  "frame": "✻ Churned for 7s · done\n  1:32 PM\n\n──────────────────────────\n❯\n──────────────────────────\n"
+ },
+ "busy_40x6": {
+  "blocks": false,
+  "frame": "✻ Churned for 7s · done 1:32 PM\n\n────────────────────────────────────────\n❯\n"
+ },
+ "busy_60x5": {
+  "blocks": false,
+  "frame": "✻ Churned for 7s · done 1:32 PM\n\n────────────────────────────────────────────────────────────\n"
+ },
+ "busy_6x10": {
+  "blocks": false,
+  "frame": "  sixt\n  y-fi\n  ve\n  sixt\n  y-si\n\n──────\n❯\n──────\n  ⏸\n"
+ },
+ "busy_8x10": {
+  "blocks": false,
+  "frame": "  -five\n  ninety\n  -six\n  ninety\n  -seven\n\n────────\n❯\n────────\n  ⏸ ma\n"
+ },
+ "draft_14x10": {
+  "blocks": false,
+  "frame": "✻ Crunched for\n  1s · done\n  1:28 PM\n\n──────────────\n❯ answers\n    2.\n  Cancel\n"
+ },
+ "draft_200x3": {
+  "blocks": false,
+  "frame": "✻ Crunched for 1s · done 1:28 PM\n"
+ },
+ "draft_200x4": {
+  "blocks": false,
+  "frame": "✻ Crunched for 1s · done 1:28 PM\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n"
+ },
+ "draft_200x6": {
+  "blocks": false,
+  "frame": "✻ Crunched for 1s · done 1:28 PM\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n❯ 1. Submit answers\n"
+ },
+ "draft_20x6": {
+  "blocks": false,
+  "frame": "✻ Crunched for 1s ·\n  done 1:28 PM\n\n────────────────────\n❯ 1. Submit\n"
+ },
+ "draft_26x8": {
+  "blocks": false,
+  "frame": "✻ Crunched for 1s · done\n  1:28 PM\n\n──────────────────────────\n❯ 1. Submit answers\n    2. Cancel\n"
+ },
+ "draft_40x6": {
+  "blocks": false,
+  "frame": "✻ Crunched for 1s · done 1:28 PM\n\n────────────────────────────────────────\n❯ 1. Submit answers\n"
+ },
+ "draft_60x5": {
+  "blocks": false,
+  "frame": "✻ Crunched for 1s · done 1:28 PM\n\n────────────────────────────────────────────────────────────\n"
+ },
+ "draft_60x8": {
+  "blocks": false,
+  "frame": "● Ready to submit your answers?\n\n✻ Crunched for 1s · done 1:28 PM\n\n────────────────────────────────────────────────────────────\n❯ 1. Submit answers\n    2. Cancel\n"
+ },
+ "draft_6x10": {
+  "blocks": false,
+  "frame": "  ·\n  done\n\n  1:28\n  PM\n\n──────\n❯ Ca\n  nc\n  el\n"
+ },
+ "draft_8x10": {
+  "blocks": false,
+  "frame": "  ed for\n  1s ·\n  done\n  1:28\n  PM\n\n────────\n❯   2.\n  Can\n  cel\n"
+ },
+ "elicit_10x8": {
+  "blocks": true,
+  "frame": "  elicit ·\n  30s…\n\n──────────\n  MCP\n  server\n  “…”\n  requ…\n"
+ },
+ "elicit_120x40": {
+  "blocks": true,
+  "frame": " ▐▛███▛█   Claude Code v2.1.309\n▝▜██████▀  Opus 5.5 with medium effort · Claude Max\n ▝▝   ▝▝   /…/d51c437b-02b6-424f-8223-d06e2eaf8faa/scratchpad/proj\n\n\n❯ Call the mcp__elicit__deploy tool now, nothing else.\n\n  Calling elicit · 25s…\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  MCP server “elicit” requests your input\n\n  Which environment should I deploy to?\n\n  ❯ * env: ▸ not set\n        Target\n\n      confirm: not set\n        Really deploy?\n\n    Accept    Decline\n\n  Esc to cancel · ↑/↓ to navigate · Backspace to unset · → to expand\n"
+ },
+ "elicit_14x10": {
+  "blocks": true,
+  "frame": "  elicit ·\n  32s…\n\n──────────────\n  MCP server\n  “…” requ…\n  Which envi\n  ronment s…\n\n  ❯ *en:▸\n"
+ },
+ "elicit_200x6": {
+  "blocks": true,
+  "frame": "● Calling elicit · 44s…\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  MCP server “elicit” requests your input\n  Which environment should I deploy to?\n"
+ },
+ "elicit_20x6": {
+  "blocks": true,
+  "frame": "  Calling elicit ·\n  33s…\n\n────────────────────\n  MCP server “…”\n  requ…\n"
+ },
+ "elicit_26x8": {
+  "blocks": true,
+  "frame": "  Calling elicit · 35s…\n\n──────────────────────────\n  MCP server “…” requ…\n  Which environment s…\n\n  ❯ * env: ▸ not set\n"
+ },
+ "elicit_30x10": {
+  "blocks": true,
+  "frame": "  Calling elicit · 36s…\n\n──────────────────────────────\n  MCP server “…” requests…\n  Which environment shoul…\n\n  ❯ * env: ▸ not set\n        Target\n"
+ },
+ "elicit_40x10": {
+  "blocks": true,
+  "frame": "  Calling elicit · 38s…\n\n────────────────────────────────────────\n  MCP server “…” requests your input\n  Which environment should I deploy…\n\n  ❯ * env: ▸ not set\n        Target\n"
+ },
+ "elicit_40x6": {
+  "blocks": true,
+  "frame": "● Calling elicit · 40s…\n\n────────────────────────────────────────\n  MCP server “…” requests your input\n  Which environment should I deploy…\n"
+ },
+ "elicit_60x5": {
+  "blocks": true,
+  "frame": "  Calling elicit · 41s…\n\n────────────────────────────────────────────────────────────\n  MCP server “elicit” requests your input\n"
+ },
+ "elicit_60x8": {
+  "blocks": true,
+  "frame": "  Calling elicit · 43s…\n\n────────────────────────────────────────────────────────────\n  MCP server “elicit” requests your input\n  Which environment should I deploy to?\n\n  ❯ * env: ▸ not set\n"
+ },
+ "elicit_6x10": {
+  "blocks": true,
+  "frame": "  27s…\n\n\n──────\n  MC\n  P\n  se\n  rv\n  er\n  “\n"
+ },
+ "elicit_8x10": {
+  "blocks": true,
+  "frame": "  ·\n  28s…\n\n────────\n  MCP\n  serv\n  er\n  “…”\n  requ\n  …\n"
+ },
+ "idle2_10x8": {
+  "blocks": false,
+  "frame": "✻ Churned\n  for 7s ·\n  done\n  1:32 PM\n\n──────────\n❯\n──────────\n"
+ },
+ "idle2_14x10": {
+  "blocks": false,
+  "frame": "✻ Churned for\n  7s · done\n  1:32 PM\n\n──────────────\n❯\n──────────────\n  ⏸ manual\n"
+ },
+ "idle2_200x4": {
+  "blocks": false,
+  "frame": "✻ Churned for 7s · done 1:32 PM\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n"
+ },
+ "idle2_200x6": {
+  "blocks": false,
+  "frame": "✻ Churned for 7s · done 1:32 PM\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n❯\n"
+ },
+ "idle2_20x6": {
+  "blocks": false,
+  "frame": "✻ Churned for 7s ·\n  done 1:32 PM\n\n────────────────────\n❯\n"
+ },
+ "idle2_26x8": {
+  "blocks": false,
+  "frame": "✻ Churned for 7s · done\n  1:32 PM\n\n──────────────────────────\n❯\n──────────────────────────\n"
+ },
+ "idle2_40x6": {
+  "blocks": false,
+  "frame": "✻ Churned for 7s · done 1:32 PM\n\n────────────────────────────────────────\n❯\n"
+ },
+ "idle2_60x5": {
+  "blocks": false,
+  "frame": "✻ Churned for 7s · done 1:32 PM\n\n────────────────────────────────────────────────────────────\n"
+ },
+ "idle2_6x10": {
+  "blocks": false,
+  "frame": "  done\n\n  1:32\n  PM\n\n──────\n❯\n──────\n  ⏸\n"
+ },
+ "idle2_8x10": {
+  "blocks": false,
+  "frame": "  d for\n  7s ·\n  done\n  1:32\n  PM\n\n────────\n❯\n────────\n  ⏸ ma\n"
+ },
+ "idle_10x8": {
+  "blocks": false,
+  "frame": "✻ Churned\n  for 4s ·\n  done\n  1:25 PM\n\n──────────\n❯ call th…\n──────────\n"
+ },
+ "idle_14x10": {
+  "blocks": false,
+  "frame": "✻ Churned for\n  4s · done\n  1:25 PM\n\n──────────────\n❯ call the de…\n──────────────\n  ⏸ manual\n"
+ },
+ "idle_200x6": {
+  "blocks": false,
+  "frame": "✻ Churned for 4s · done 1:25 PM\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n❯ call the deploy tool again\n"
+ },
+ "idle_20x6": {
+  "blocks": false,
+  "frame": "✻ Churned for 4s ·\n  done 1:25 PM\n\n────────────────────\n❯ call the deploy t…\n"
+ },
+ "idle_26x8": {
+  "blocks": false,
+  "frame": "✻ Churned for 4s · done\n  1:25 PM\n\n──────────────────────────\n❯ call the deploy tool ag…\n──────────────────────────\n"
+ },
+ "idle_30x10": {
+  "blocks": false,
+  "frame": "  target environment, and that\n  prompt came back cancelled.\n\n✻ Churned for 4s · done 1:25\n  PM\n\n──────────────────────────────\n❯ call the deploy tool again\n──────────────────────────────\n  ⏸ manual mode on · ? for …\n"
+ },
+ "idle_40x10": {
+  "blocks": false,
+  "frame": "  was deployed. The tool asked you to\n  pick a target environment, and that\n  prompt came back cancelled.\n\n✻ Churned for 4s · done 1:25 PM\n\n────────────────────────────────────────\n❯ call the deploy tool again\n────────────────────────────────────────\n  ⏸ manual mode on · ? for shortcuts\n"
+ },
+ "idle_40x6": {
+  "blocks": false,
+  "frame": "✻ Churned for 4s · done 1:25 PM\n\n────────────────────────────────────────\n❯ call the deploy tool again\n"
+ },
+ "idle_60x5": {
+  "blocks": false,
+  "frame": "✻ Churned for 4s · done 1:25 PM\n\n────────────────────────────────────────────────────────────\n"
+ },
+ "idle_60x8": {
+  "blocks": false,
+  "frame": "  tool asked you to pick a target environment, and that\n  prompt came back cancelled.\n\n✻ Churned for 4s · done 1:25 PM\n\n────────────────────────────────────────────────────────────\n❯ call the deploy tool again\n────────────────────────────────────────────────────────────\n"
+ },
+ "idle_6x10": {
+  "blocks": false,
+  "frame": "  done\n\n  1:25\n  PM\n  ◐…\n──────\n❯ cal…\n──────\n  ⏸\n"
+ },
+ "idle_8x10": {
+  "blocks": false,
+  "frame": "  d for\n  4s ·\n  done\n  1:25\n  PM\n\n────────\n❯ call …\n────────\n  ⏸ ma\n"
+ },
+ "sub_10x8": {
+  "blocks": true,
+  "frame": " txt\n╌╌╌╌╌╌╌╌╌╌\n Do you\n want to\n proceed?\n ❯ 1. Yes\n\n Esc to …\n"
+ },
+ "sub_120x40": {
+  "blocks": true,
+  "frame": "✻ Baked for 2s · done 1:28 PM\n\n❯ Reply with exactly one line: Ready to submit your answers?\n\n● Ready to submit your answers?\n\n✻ Crunched for 1s · done 1:28 PM\n\n❯ Launch ONE background agent (Agent tool, subagent_type general-purpose, run_in_background true) whose only task is to\n  run the Bash command: touch subagent-marker.txt . After launching it, end your turn immediately without waiting.\n\n● Agent(Create marker file)\n  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)\n\n● The background agent is running touch subagent-marker.txt.\n\n✻ Waiting for 1 background agent to finish\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n Bash command · from the general-purpose agent\n Tip: auto mode handles these prompts for you — choose \"switch to auto mode\" below\n Create marker file\n╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n touch subagent-marker.txt\n╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and always allow access to /tmp/claude-950/-home-truenas-admin-git--turma-worktrees-Turma-d9008/d51c437b-02b6\n      -424f-8223-d06e2eaf8faa/scratchpad/proj from this project\n   3. Yes, and switch to auto mode · auto mode handles these prompts for you\n   4. No\n\n Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents\n"
+ },
+ "sub_14x10": {
+  "blocks": true,
+  "frame": "     -d9008/d5\n     1c437b-02\n     b6-424f-8\n     223-d06e2\n     eaf8faa/s\n     cratchpad\n     /proj\n     from this\n     project\n Esc to canc…\n"
+ },
+ "sub_200x4": {
+  "blocks": true,
+  "frame": " Do you want to proceed?\n ❯ 1. Yes\n\n Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents\n"
+ },
+ "sub_200x6": {
+  "blocks": true,
+  "frame": " touch subagent-marker.txt\n╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n Do you want to proceed?\n ❯ 1. Yes\n\n Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents\n"
+ },
+ "sub_20x6": {
+  "blocks": true,
+  "frame": "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n Do you want to\n proceed?\n ❯ 1. Yes\n\n Esc to cancel · T…\n"
+ },
+ "sub_26x8": {
+  "blocks": true,
+  "frame": "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n touch\n subagent-marker.txt\n╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n Do you want to proceed?\n ❯ 1. Yes\n\n Esc to cancel · Tab to …\n"
+ },
+ "sub_26x9": {
+  "blocks": true,
+  "frame": " Create marker file\n╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n touch\n subagent-marker.txt\n╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n Do you want to proceed?\n ❯ 1. Yes\n\n Esc to cancel · Tab to …\n"
+ },
+ "sub_30x10": {
+  "blocks": true,
+  "frame": " ↓ 2. Yes, and always allow\n      access to /tmp/claude-95\n      0/-home-truenas-admin-gi\n      t--turma-worktrees-Turma\n      -d9008/d51c437b-02b6-424\n      f-8223-d06e2eaf8faa/scra\n      tchpad/proj from this\n      project\n\n Esc to cancel · Tab to amen…\n"
+ },
+ "sub_40x10": {
+  "blocks": true,
+  "frame": "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n Do you want to proceed?\n ❯ 1. Yes\n ↓ 2. Yes, and always allow access to\n      /tmp/claude-950/-home-truenas-admi\n      n-git--turma-worktrees-Turma-d9008\n      /d51c437b-02b6-424f-8223-d06e2eaf8\n      faa/scratchpad/proj from this\n      project\n Esc to cancel · Tab to amend · ctrl+x…\n"
+ },
+ "sub_40x6": {
+  "blocks": true,
+  "frame": " touch subagent-marker.txt\n╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n Do you want to proceed?\n ❯ 1. Yes\n\n Esc to cancel · Tab to amend · ctrl+x…\n"
+ },
+ "sub_60x5": {
+  "blocks": true,
+  "frame": "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n Do you want to proceed?\n ❯ 1. Yes\n\n Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to sto…\n"
+ },
+ "sub_60x8": {
+  "blocks": true,
+  "frame": " Create marker file\n╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n touch subagent-marker.txt\n╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n Do you want to proceed?\n ❯ 1. Yes\n\n Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to sto…\n"
+ },
+ "sub_6x10": {
+  "blocks": true,
+  "frame": "     o\n     r\n     k\n     t\n     r\n     e\n     e\n     s\n     -\n Esc…T\n"
+ },
+ "sub_8x10": {
+  "blocks": true,
+  "frame": "     1c4\n     37b\n     -02\n     b6-\n     424\n     f-8\n     223\n     -d0\n     6e2\n Esc t…f\n"
+ },
+ "submit_120x14": {
+  "blocks": true,
+  "frame": "←  ☒ Color  ☐ Sizes  ☐ Fruit  ✔ Submit  →\n\nReview your answers\n\n⚠ You have not answered all questions\n\n ● Which color do you want?\n   → Red\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n  2. Cancel\n"
+ },
+ "submit_120x20": {
+  "blocks": true,
+  "frame": "❯ Use the AskUserQuestion tool ONCE with exactly three questions in one call: 1) pick a color (Red/Green/Blue), 2) pick\n  sizes (Small/Large, multiSelect true), 3) pick a fruit (Apple/Pear). Do nothing else.\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n←  ☒ Color  ☐ Sizes  ☐ Fruit  ✔ Submit  →\n\nReview your answers\n\n⚠ You have not answered all questions\n\n ● Which color do you want?\n   → Red\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n  2. Cancel\n"
+ },
+ "submit_120x40": {
+  "blocks": true,
+  "frame": " ▐▛███▛█   Claude Code v2.1.309\n▝▜██████▀  Opus 5.5 with medium effort · Claude Max\n ▝▝   ▝▝   /…/d51c437b-02b6-424f-8223-d06e2eaf8faa/scratchpad/proj\n\n\n❯ Call the mcp__elicit__deploy tool now, nothing else.\n\n  Called elicit\n\n● The deploy was cancelled, so nothing was deployed. The tool asked you to pick a target environment, and that prompt\n  came back cancelled.\n\n✻ Churned for 4s · done 1:25 PM\n\n❯ Use the AskUserQuestion tool ONCE with exactly three questions in one call: 1) pick a color (Red/Green/Blue), 2) pick\n  sizes (Small/Large, multiSelect true), 3) pick a fruit (Apple/Pear). Do nothing else.\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n←  ☒ Color  ☐ Sizes  ☐ Fruit  ✔ Submit  →\n\nReview your answers\n\n⚠ You have not answered all questions\n\n ● Which color do you want?\n   → Red\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n  2. Cancel\n"
+ },
+ "submit_14x10": {
+  "blocks": true,
+  "frame": "   → Red\n\nReady to\nsubmit your\nanswers?\n\n❯ 1.Submit\n    answers\n  2. Cancel\n"
+ },
+ "submit_200x6": {
+  "blocks": true,
+  "frame": "   → Red\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n"
+ },
+ "submit_20x6": {
+  "blocks": true,
+  "frame": "Ready to submit your\nanswers?\n\n❯ 1. Submit answers\n"
+ },
+ "submit_26x8": {
+  "blocks": true,
+  "frame": "   want?\n   → Red\n\nReady to submit your\nanswers?\n\n❯ 1. Submit answers\n"
+ },
+ "submit_30x10": {
+  "blocks": true,
+  "frame": "  questions\n\n ● Which color do you want?\n   → Red\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n  2. Cancel\n"
+ },
+ "submit_40x10": {
+  "blocks": true,
+  "frame": "⚠ You have not answered all questions\n\n ● Which color do you want?\n   → Red\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n  2. Cancel\n"
+ },
+ "submit_40x6": {
+  "blocks": true,
+  "frame": "   → Red\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n"
+ },
+ "submit_60x5": {
+  "blocks": true,
+  "frame": "Ready to submit your answers?\n\n❯ 1. Submit answers\n"
+ },
+ "submit_60x8": {
+  "blocks": true,
+  "frame": " ● Which color do you want?\n   → Red\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n"
+ },
+ "submit_6x10": {
+  "blocks": true,
+  "frame": "answer\ns?\n\n❯ 1.Su\n    bm\n    it\n    a\n  2.Ca\n    nc\n    el\n"
+ },
+ "submit_80x12": {
+  "blocks": true,
+  "frame": "Review your answers\n\n⚠ You have not answered all questions\n\n ● Which color do you want?\n   → Red\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n  2. Cancel\n"
+ },
+ "submit_8x10": {
+  "blocks": true,
+  "frame": "submit\nyour\nanswers?\n\n❯ 1.Subm\n    it\n    answ\n  2. Can\n     cel\n"
+ }
+}

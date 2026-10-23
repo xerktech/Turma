@@ -69,6 +69,14 @@ composed.**
       rounded search box, or with the history search's "Search" title as its first line (a
       no-match search at ≤8 rows draws nothing else).
       Tests: `TestOverlayWithItsFooterCut`.
+    - Live 2.1.309 frames, 6x10 to 200x4 (XERK-2220, `pane_frames_2220.json`): below 10 columns
+      the hint wraps MID-word ("canc"/"el"), rejoined by `_narrow_word_end`; with a background
+      agent running the permission footer is ELLIPSIZED instead ("Esc to canc…", "Esc…T");
+      an MCP elicitation is top-anchored, so a short pane keeps only its indented
+      "MCP server “…” requests" title under the rule; and a multi-question AskUserQuestion's
+      "Review your answers" page has NO footer and its `❯ 1.` at column 0
+      (`_pane_cut_choice_up`: told from the composer by the "?" line, not a rule, right above).
+      Tests: `TestLiveDialogFramesXerk2220`.
   - **The dialog check runs before EVERY write, not once per message** (`_slice_gate`): before
     each later slice, send-keys chunk and Enter, on tmux and Windows, whether or not draws are
     still awaited. QA: a dialog drawn mid-message got the rest, and a last slice "1" approved

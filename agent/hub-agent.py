@@ -19136,6 +19136,13 @@ def _hint_dialog_up(cap):
 _NARROW_HINT_MAX_CELLS = 19
 # How many foreign words may sit between two of the hint's words there.
 _NARROW_HINT_GAP = 2
+# The hint ELLIPSIZED onto one bottom line, a stale cell maybe after the "…":
+# with a background agent running, the permission footer gains a third item
+# ("… · ctrl+x ctrl+k twice to stop background agents") and 2.1.309 cuts the
+# whole footer to "Esc to canc…" (14 columns), "Esc to …" (10), "Esc t…f" (8),
+# "Esc…T" (6) rather than wrapping it (XERK-2220). Capital "Esc", as below.
+_NARROW_HINT_CUT_RE = re.compile(
+    r"^Esc(?: t(?:o(?: c(?:a(?:n(?:c(?:e(?:l)?)?)?)?)?)?)?)? ?…")
 
 
 def _narrow_hint_up(tail, lines):
@@ -19143,26 +19150,45 @@ def _narrow_hint_up(tail, lines):
     spell Claude Code's "Esc to cancel" once the stale cells are allowed for:
     a word starting "Esc" (capital — Claude's hint; qwen's spinner says
     "esc to cancel)" and Claude's busy hint "esc to interrupt"), then words
-    starting "to" and "cancel", each within `_NARROW_HINT_GAP` other words.
+    starting "to" and "cancel", each within `_NARROW_HINT_GAP` other words —
+    or that hint ellipsized as the bottom line (`_NARROW_HINT_CUT_RE`).
     Only for a pane at most `_NARROW_HINT_MAX_CELLS` wide, where the whole-item
     read cannot work; the caller has already vetoed a composer footer."""
     widest = max((_pane_cells(line) for line in lines), default=0)
     if widest > _NARROW_HINT_MAX_CELLS:
         return False
+    if tail and _NARROW_HINT_CUT_RE.match(tail[-1]):
+        return True
     words = " ".join(tail).replace("·", " ").split()
-    for i, word in enumerate(words):
-        if not word.startswith("Esc"):
+    for i in range(len(words)):
+        end = _narrow_word_end(words, i, "Esc", str)
+        if end is None:
             continue
-        at = i
         for want in ("to", "cancel"):
-            nxt = next((k for k in range(at + 1, min(at + 2 + _NARROW_HINT_GAP, len(words)))
-                        if words[k].lower().startswith(want)), None)
-            if nxt is None:
+            end = next((e for k in range(end, min(end + 1 + _NARROW_HINT_GAP, len(words)))
+                        if (e := _narrow_word_end(words, k, want, str.lower)) is not None),
+                       None)
+            if end is None:
                 break
-            at = nxt
         else:
             return True
     return False
+
+
+def _narrow_word_end(words, k, want, fold):
+    """The index just past the words from `k` that spell `want` (compared
+    after `fold`), or None. Below 10 columns Claude Code 2.1.309 wraps the
+    hint MID-word ("canc" / "el" at 8, "E" / "sc" and "ca" / "nc" / "el" at 6,
+    XERK-2220), so a word that is only a prefix of `want` is joined with the
+    next; trailing stale cells after `want` are allowed, as for a whole word."""
+    got = ""
+    for j in range(k, len(words)):
+        got += fold(words[j])
+        if got.startswith(want):
+            return j + 1
+        if not want.startswith(got):
+            return None
+    return None
 
 
 def _pane_blocking_dialog(cap):
@@ -19182,10 +19208,12 @@ def _pane_blocking_dialog(cap):
       * the /model picker itself read off its body (`_model_picker_open`), for
         a pane too short to draw its footer (XERK-2148: 40x45 wraps it off);
       * a choice dialog cut off below its first option (`_pane_cut_dialog_up`:
-        a 10-row pane draws "Exit plan mode?" down to "❯ 1." only);
+        a 10-row pane draws "Exit plan mode?" down to "❯ 1." only; and
+        `_pane_cut_choice_up`: the footerless column-0 "Review your answers"
+        page of a multi-question AskUserQuestion);
       * an overlay with its footer cut off (`_pane_overlay_up`: the Ctrl-R
         history search, a short /resume picker).
-    Keeping the last five OUT of `parse_pane_prompt` is deliberate: `panePrompt`
+    Keeping all but the first OUT of `parse_pane_prompt` is deliberate: `panePrompt`
     is a wire contract whose options the chat page renders as clickable digits,
     and these have no digit to click (or, for the picker, digits that a
     free-text row and a multi-question tab bar make unsafe to offer) —
@@ -19195,6 +19223,7 @@ def _pane_blocking_dialog(cap):
             or parse_model_switch_confirm(cap) is not None
             or _model_picker_open(cap)
             or _pane_cut_dialog_up(cap)
+            or _pane_cut_choice_up(cap)
             or _pane_overlay_up(cap)
             or _qwen_waiting_up(cap))
 
@@ -19308,6 +19337,49 @@ def _pane_cut_dialog_up(cap):
     return any(asks(line) for line in area[:k])
 
 
+# How many lines may follow a cut-off column-0 "❯ 1." row: its label wrapped and
+# the next option's, "1.Su" / "bm" / "it" / "a" / "2.Ca" / "nc" / "el" at 6 columns.
+_PANE_CUT_CHOICE_TAIL_LINES = 8
+
+
+def _pane_cut_choice_up(cap):
+    """Whether the pane's bottom is a column-0 choice dialog cut off below its
+    "❯ 1." row (XERK-2220): Claude Code 2.1.309 draws a multi-question
+    AskUserQuestion's "Review your answers" page with no key-hint footer, its
+    "Ready to submit your answers?" / "❯ 1. Submit answers" / "2. Cancel" at
+    column 0 like the composer's prompt, and a pane ≤ ~8 rows high (or a
+    narrow one wrapping the labels) cuts it below option 1. A typed "1" or an
+    Enter submits the answers.
+
+    Read by POSITION: the "❯ 1." row is among the last non-blank lines, every
+    line below it is indented (wraps, later options) with no rule or composer
+    footer, and the non-blank line right above it is the question ending "?".
+    The composer's own "❯" row always sits right under its column-0 rule — a
+    short pane cuts the composer's BOTTOM, never that — so a draft reading
+    "1. …" never matches, and conversation text is above that rule."""
+    if not cap:
+        return False
+    lines = [_PANE_SCROLLBAR_RE.sub("", line).rstrip()
+             for line in _ANSI_RE.sub("", cap).splitlines()]
+    filled = [k for k, line in enumerate(lines) if line.strip()]
+    tail = filled[-(_PANE_CUT_CHOICE_TAIL_LINES + 1):]
+    cursor = next((k for k in reversed(tail) if lines[k].startswith("❯")), None)
+    if cursor is None:
+        return False
+    m = PANE_PROMPT_OPTION_RE.match(_pane_unglue_options(lines)[cursor])
+    if not (m and m.group(1) and m.group(2) == "1"):
+        return False
+    below = [lines[k] for k in filled if k > cursor]
+    if any(not line[:1].isspace() or PANE_PROMPT_RULE_RE.match(line) for line in below):
+        return False
+    text = "\n".join(below)
+    if (PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text)
+            or PANE_SHELL_FOOTER_RE.search(text) or _pane_composer_tail_up(lines)):
+        return False
+    above = [k for k in filled if k < cursor]
+    return bool(above) and lines[above[-1]].strip().endswith("?")
+
+
 # A picker's cursor row: an indented "❯" (the composer's own prompt sits at column 0).
 _PANE_PICKER_CURSOR_RE = re.compile(r"^\s+❯(?:\s|$)")
 # A picker's search box top: an indented rounded box ("No matching prompts"
@@ -19317,6 +19389,11 @@ _PANE_PICKER_BOX_RE = re.compile(r"^\s+╭─+(?:╮)?$")
 # everywhere", cut to "Search" at 10 columns): at ≤8 rows a no-match search
 # draws nothing else (QA, 26x8 / 60x6).
 _PANE_HISTORY_TITLE_RE = re.compile(r"^\s+Search(?:\s|$)")
+# An MCP elicitation's title ("MCP server “x” requests your input") read with
+# every space dropped: the form is drawn from the TOP, so a pane ≤ ~10 rows
+# cuts its footer and fields off and keeps only this, wrapped mid-word at 8
+# columns ("MCP" / "serv" / "er" / "“…”", 2.1.309, XERK-2220).
+_PANE_ELICIT_TITLE_RE = re.compile(r"^MCPserver[“\"]")
 
 
 def _pane_overlay_up(cap):
@@ -19333,8 +19410,10 @@ def _pane_overlay_up(cap):
     prompt line, "!" in shell mode) and no rule at column 0, no
     mode/shell/qwen footer, no exit toast. Then under a ▔ edge any content is
     an overlay; under a "─" rule (the composer's own top edge too) only a
-    picker's indented "❯" cursor row, rounded search box, or the history
-    search's title as the area's first line says so."""
+    picker's indented "❯" cursor row, rounded search box, the history
+    search's title as the area's first line, or an MCP elicitation's indented
+    title (`_PANE_ELICIT_TITLE_RE`: the form is top-anchored, so a short pane
+    cuts its footer and fields off, XERK-2220) says so."""
     if not cap:
         return False
     lines = [_PANE_SCROLLBAR_RE.sub("", line).rstrip()
@@ -19360,6 +19439,8 @@ def _pane_overlay_up(cap):
             or PANE_SHELL_FOOTER_RE.search(text) or _pane_composer_tail_up(lines)):
         return False
     return (edged or bool(_PANE_HISTORY_TITLE_RE.match(area[0]))
+            or (area[0][:1].isspace()
+                and bool(_PANE_ELICIT_TITLE_RE.match("".join("".join(area).split()))))
             or any(_PANE_PICKER_CURSOR_RE.match(line) or _PANE_PICKER_BOX_RE.match(line)
                    for line in area))
 
