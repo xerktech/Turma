@@ -32702,8 +32702,7 @@ class SessionManager:
                                f"{sess['worktreePath']}", cmd_id=cmd_id)
             return
         self.closed = [c for c in self.closed if c.get("id") != sid]
-        if rec.get("paused"):
-            self._carry_paused_prs(sess, rec)
+        self._carry_prs(sess, rec)
         prompt = self._carry_paused_wake(sess, rec.get("paused"))
         try:
             # Root has no worktree to re-add; it resumes in place at REPOS_ROOT.
@@ -32712,6 +32711,10 @@ class SessionManager:
                 self._worktree_add(sess, base_ref=sess.get("baseRef"))
             self._launch_tmux(sess, resume=True, prompt=prompt)
             self._launch_ttyd(sess)
+            # A link the closed record didn't snapshot (e.g. an agent restart
+            # emptied the live map) is still in the transcript, past the EOF the
+            # per-beat scan primes to: re-derive, as _resume_transcript does.
+            self._seed_prs(sess)
             log(f"resumed closed session {sid} for {sess['repo']} on :{sess['ttydPort']}")
         except Exception as e:
             self._set_error(sess, e)
@@ -32757,12 +32760,16 @@ class SessionManager:
             return False
         return self._unpause_closed(rec)
 
-    def _carry_paused_prs(self, sess, rec):
-        """Bring a paused sleeper's PRs back onto its resumed record (XERK-1575):
-        its links (the live map kill() dropped, which the comment poller and the
-        chips read) and their seen-comment baseline. A comment posted while it
-        slept is then a NEW key on the first delivery pass, delivered through
-        its inbox like any other, rather than baselined silently as history."""
+    def _carry_prs(self, sess, rec):
+        """Bring a closed session's PRs back onto its resumed record: its links
+        (the live map kill() dropped, which the comment poller and the chips
+        read), on EVERY resume. Without them a plainly resumed session never got
+        another comment or CI note on a PR it opened, because the transcript scan
+        restarts at EOF and never re-reads the create.
+        A paused sleeper (XERK-1575) also carries its seen-comment baseline, so a
+        comment posted while it slept is a NEW key on the first delivery pass.
+        An ordinary kill saves no baseline: the first pass after its resume
+        baselines what it missed silently as history, and delivers what follows."""
         sid = sess["id"]
         urls = [u for u in (rec.get("prUrls") or []) if isinstance(u, str)][-10:]
         if urls:

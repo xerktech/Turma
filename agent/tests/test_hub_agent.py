@@ -25715,6 +25715,44 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         sm.kill(sid)
         self.assertNotIn("prCommentBase", next(c for c in sm.closed if c["id"] == sid))
 
+    def test_a_plain_resume_keeps_its_pr_links_and_gets_new_comments(self):
+        # An ordinary kill + Resume still brings back the PRs the session opened:
+        # the transcript scan restarts at EOF and never re-reads the create, so
+        # without the carry the session got no comment or CI note again. What it
+        # missed while down is baselined as history; what follows is delivered.
+        url = "https://github.com/o/r/pull/560"
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        sm.session_pr_urls[sid] = [url]
+        sess["prCommentBase"] = {url: ["c1"]}
+        sm.kill(sid)
+        self.assertNotIn(sid, sm.session_pr_urls)
+        # Also re-derived from the transcript, for a link the record missed
+        with mock.patch.object(sm, "_seed_prs", wraps=sm._seed_prs) as seed:
+            sm.resume(sid)
+        seed.assert_called_once()
+        self.assertEqual(sm._find(sid)["status"], "running")
+        self.assertEqual(sm.session_pr_urls.get(sid), [url])
+        self.assertEqual(sm._find(sid).get("prUrls"), [url])
+        notes = []
+        sm.notify_session = lambda s, msg, *a, **k: notes.append((s, msg))
+
+        def ev(key, body):
+            return {"key": key, "is_self": False, "author": "rev",
+                    "kind": "comment", "body": body}
+        sm._pr_comments_fetched = {sid: {url: [
+            ev("c1", "old"), ev("c2", "posted while it was down")]}}
+        sm._deliver_pr_comments()
+        self.assertEqual(notes, [])
+        sm._pr_comments_fetched = {sid: {url: [
+            ev("c1", "old"), ev("c2", "posted while it was down"),
+            ev("c3", "why 3700 lines?")]}}
+        sm._deliver_pr_comments()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("why 3700 lines?", notes[0][1])
+        self.assertNotIn("posted while it was down", notes[0][1])
+
     def test_a_failed_export_thread_start_clears_the_mark(self):
         sm = self._manager()
         sess = self._sleeper(sm)
