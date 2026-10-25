@@ -127,8 +127,11 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   - **On Windows the teardown never signals `ttydPid`** — the pty-host `_kill_tmux` ended IS that
     process, so a later signal could hit a reused pid (`_kill_ttyd`'s rule).
 - **A paused record carries its PRs' `prCommentBase`** (`_remember_closed`, paused only), and
-  `resume()` restores it with the PR links (`_carry_paused_prs`). A review comment posted while it
+  `resume()` restores it with the PR links (`_carry_prs`). A review comment posted while it
   slept is then a NEW key, delivered to its inbox; without it the first pass baselines it silently.
+- **Every `resume()` restores the PR links, paused or not** (`_carry_prs`, then `_seed_prs` from the
+  transcript). A plain kill keeps no baseline, so what it missed is history, but later comments and
+  CI notes on its PRs still reach it. Test: `test_a_plain_resume_keeps_its_pr_links_and_gets_new_comments`.
 - **A wake resume whose worktree vanished re-adds it on the same worker** (`_stage_worktree_restore`
   → `_apply_sleeper_landed` on the beat finishes `resume()`). Meanwhile its slot is held
   (`_slots_used` counts `_restores_in_flight`), the path rides `_live_worktree_paths` so no prune

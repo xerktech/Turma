@@ -205,7 +205,8 @@ DevOps, and what gets typed back because of it.
   `send_input`'s PANE path like a Claude session with no inbox — neither carries a new arm ([Qwen C]).
   Neither adds new beat-loop budget; `refresh_pr_status` stays the same inline offender for ALL
   runtimes (XERK-397's scope, not widened here).
-- **Chips survive resume/migration for both** — `_seed_prs` reads the PROJECTED `<tid>.jsonl` (what
+- **Chips survive resume/migration for both** — `_seed_prs` (resume-any, migration and the closed-session
+  `resume()`) reads the PROJECTED `<tid>.jsonl` (what
   migration packs as the top-level transcript), independent of each runtime's raw native-log sidecar
   (dsh's `<tid>/dsh/`, qwen's `<tid>/qwen/`). Tests: `TestDshPrAttribution`, `TestQwenPrAttribution`
   (drives the real qwen projector over `qwen_pr_corpus.json`).
