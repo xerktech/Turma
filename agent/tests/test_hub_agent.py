@@ -25792,6 +25792,28 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
             sm.resume(sid)
             self.assertEqual(sm.session_pr_urls.get(sid), newest)
 
+    def test_a_resume_keeps_held_pr_links_in_their_order(self):
+        # A held link the transcript doesn't name (found another way) stays, and
+        # stays where it was: re-reading must not re-rank it as newest.
+        sm = self._manager()
+        sid = self._with_created_prs(sm, range(1, 10))["id"]
+        held = ["https://github.com/o/other/pull/50"] + [
+            f"https://github.com/o/r/pull/{n}" for n in range(1, 10)]
+        sm.session_pr_urls[sid] = list(held)
+        sm.kill(sid)
+        sm.resume(sid)
+        self.assertEqual(sm.session_pr_urls.get(sid), held)
+
+    def test_a_resume_doesnt_duplicate_pr_links_held_and_in_the_transcript(self):
+        sm = self._manager()
+        sid = self._with_created_prs(sm, [1, 2])["id"]
+        held = ["https://github.com/o/r/pull/1", "https://github.com/o/r/pull/2"]
+        sm.session_pr_urls[sid] = list(held)
+        sm.kill(sid)
+        sm.resume(sid)
+        self.assertEqual(sm.session_pr_urls.get(sid), held)
+        self.assertEqual(sm._find(sid).get("prUrls"), held)
+
     def test_a_failed_pr_reread_leaves_the_resumed_session_running(self):
         sm = self._manager()
         sid = self._with_created_prs(sm, [8])["id"]

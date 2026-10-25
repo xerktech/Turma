@@ -28392,15 +28392,16 @@ class SessionManager:
                 _scan_pr_line(line, state, report)
         if not report["prUrls"]:
             return
-        # The transcript's order is the creation order, so it is the base; links
-        # already held that it doesn't name (a carried record's) go after it.
-        # Newest last, capped at 10: appending the transcript to a carried
-        # newest-10 instead would evict the newest and bring back the oldest.
+        # The held list (carried from the record or seen live) is already newest
+        # last, so it keeps its order; links only the transcript names are ones
+        # the live map lost, which are older, so they go before it. Capped at 10,
+        # the newest kept: appending them after it instead evicted the newest.
         known = self.session_pr_urls.setdefault(sid, [])
         merged = []
-        for url in report["prUrls"] + known:
-            if url not in merged:
+        for url in report["prUrls"]:
+            if url not in known and url not in merged:
                 merged.append(url)
+        merged += known
         del merged[:-10]
         if merged != known:
             known[:] = merged
