@@ -25728,10 +25728,7 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         sess["prCommentBase"] = {url: ["c1"]}
         sm.kill(sid)
         self.assertNotIn(sid, sm.session_pr_urls)
-        # Also re-derived from the transcript, for a link the record missed
-        with mock.patch.object(sm, "_seed_prs", wraps=sm._seed_prs) as seed:
-            sm.resume(sid)
-        seed.assert_called_once()
+        sm.resume(sid)
         self.assertEqual(sm._find(sid)["status"], "running")
         self.assertEqual(sm.session_pr_urls.get(sid), [url])
         self.assertEqual(sm._find(sid).get("prUrls"), [url])
@@ -25752,6 +25749,58 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertIn("why 3700 lines?", notes[0][1])
         self.assertNotIn("posted while it was down", notes[0][1])
+
+    def _with_created_prs(self, sm, numbers):
+        """A sleeper whose transcript holds a `gh pr create` per number."""
+        sess = self._sleeper(sm)
+        entries = [{"type": "user", "uuid": "u0",
+                    "message": {"role": "user", "content": "work"}}]
+        for n in numbers:
+            entries += [
+                {"type": "assistant", "uuid": f"a{n}", "message": {
+                    "role": "assistant", "content": [{
+                        "type": "tool_use", "id": f"tu{n}", "name": "Bash",
+                        "input": {"command": f"gh pr create --title t{n} --body b"}}]}},
+                {"type": "user", "uuid": f"r{n}", "message": {
+                    "role": "user", "content": [{
+                        "type": "tool_result", "tool_use_id": f"tu{n}",
+                        "content": f"https://github.com/o/r/pull/{n}\n"}]}},
+            ]
+        write_jsonl(os.path.join(self.proj, f"{sess['claudeSessionId']}.jsonl"), entries)
+        return sess
+
+    def test_a_plain_resume_rereads_a_pr_link_the_record_missed(self):
+        # An agent restart can empty the live map, so the closed record names no
+        # PR; the create is still in the transcript.
+        sm = self._manager()
+        sid = self._with_created_prs(sm, [7])["id"]
+        sm.kill(sid)
+        self.assertEqual(next(c for c in sm.closed if c["id"] == sid)["prUrls"], [])
+        sm.resume(sid)
+        self.assertEqual(sm.session_pr_urls.get(sid), ["https://github.com/o/r/pull/7"])
+        self.assertEqual(sm._find(sid).get("prUrls"), ["https://github.com/o/r/pull/7"])
+
+    def test_a_resume_keeps_the_newest_ten_pr_links_in_order(self):
+        # 12 creates; the live map held the newest 10. Re-reading the transcript
+        # must not evict those for the two oldest.
+        sm = self._manager()
+        sid = self._with_created_prs(sm, range(1, 13))["id"]
+        newest = [f"https://github.com/o/r/pull/{n}" for n in range(3, 13)]
+        sm.session_pr_urls[sid] = list(newest)
+        for _ in range(2):
+            sm.kill(sid)
+            sm.resume(sid)
+            self.assertEqual(sm.session_pr_urls.get(sid), newest)
+
+    def test_a_failed_pr_reread_leaves_the_resumed_session_running(self):
+        sm = self._manager()
+        sid = self._with_created_prs(sm, [8])["id"]
+        sm.session_pr_urls[sid] = ["https://github.com/o/r/pull/8"]
+        sm.kill(sid)
+        with mock.patch.object(sm, "_seed_prs", side_effect=RuntimeError("seed")):
+            sm.resume(sid)
+        self.assertEqual(sm._find(sid)["status"], "running")
+        self.assertEqual(sm.session_pr_urls.get(sid), ["https://github.com/o/r/pull/8"])
 
     def test_a_failed_export_thread_start_clears_the_mark(self):
         sm = self._manager()
@@ -46944,6 +46993,12 @@ class TestWindowsTerminalBackend(unittest.TestCase):
     def setUp(self):
         ha._PANE_LEFTOVERS.clear()
         self.addCleanup(ha._PANE_LEFTOVERS.clear)
+        # _submit_typed asks real tmux for the pane size; subprocess polls the
+        # child with time.sleep, which the order-recording sleep fake then logs
+        # as an extra step under load. Pane size isn't what these tests are about.
+        patcher = mock.patch.object(ha, "_pane_too_small", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_ws_encode_text_is_a_masked_client_frame(self):
         frame = ha._ws_encode_text("hi")

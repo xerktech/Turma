@@ -28392,14 +28392,18 @@ class SessionManager:
                 _scan_pr_line(line, state, report)
         if not report["prUrls"]:
             return
+        # The transcript's order is the creation order, so it is the base; links
+        # already held that it doesn't name (a carried record's) go after it.
+        # Newest last, capped at 10: appending the transcript to a carried
+        # newest-10 instead would evict the newest and bring back the oldest.
         known = self.session_pr_urls.setdefault(sid, [])
-        grew = False
-        for url in report["prUrls"]:
-            if url not in known:
-                known.append(url)
-                grew = True
-        del known[:-10]
-        if grew:
+        merged = []
+        for url in report["prUrls"] + known:
+            if url not in merged:
+                merged.append(url)
+        del merged[:-10]
+        if merged != known:
+            known[:] = merged
             sess["prUrls"] = list(known)
             self._remember_prs(sess, save=False)
             self.save()
@@ -32714,7 +32718,12 @@ class SessionManager:
             # A link the closed record didn't snapshot (e.g. an agent restart
             # emptied the live map) is still in the transcript, past the EOF the
             # per-beat scan primes to: re-derive, as _resume_transcript does.
-            self._seed_prs(sess)
+            # Claude is already running, so a failed re-read must not flip the
+            # card to error: the carried links stand.
+            try:
+                self._seed_prs(sess)
+            except Exception as e:
+                log(f"resume {sid}: could not re-read its PR links: {type(e).__name__}: {e}")
             log(f"resumed closed session {sid} for {sess['repo']} on :{sess['ttydPort']}")
         except Exception as e:
             self._set_error(sess, e)
