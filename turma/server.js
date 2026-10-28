@@ -23202,6 +23202,17 @@ server.on("upgrade", async (req, socket, head) => {
       },
     });
     socket.on("data", parse);
+    // The HTTP server's sockets are half-open, so a client's FIN arrives as
+    // "end" alone; unhandled, the hub sat in CLOSE-WAIT until the idle timer.
+    // Nothing more can arrive, so discard the audio and close our side — unless
+    // a finalize is already in flight, which ends the socket after its reply.
+    socket.on("end", () => {
+      if (finalized) return;
+      finalized = true;
+      chunks = [];
+      clearTimeout(idleTimer);
+      try { socket.end(); } catch {}
+    });
     socket.on("close", cleanup);
     socket.on("error", cleanup);
     return;

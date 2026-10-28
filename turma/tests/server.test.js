@@ -16496,6 +16496,59 @@ test("audio WS: close before finalize discards buffered audio, never calls Whisp
   restoreFetch();
 });
 
+// The hub's sockets are half-open, so a bare FIN (a client torn down without a
+// close frame) is only an "end" — unhandled, the hub sat in CLOSE-WAIT until the
+// 90s idle timer. It must close its own side at once, discarding the audio.
+test("audio WS: a bare FIN before finalize closes the hub's side and never calls Whisper", async () => {
+  let called = false;
+  globalThis.fetch = async () => { called = true; return { ok: true, json: async () => ({ text: "" }) }; };
+
+  const token = await issueToken();
+  const { socket, statusLine, leftover } = await wsConnect(`/audio?auth=${token}`);
+  assert.match(statusLine, /^HTTP\/1\.1 101/);
+  collectFrames(socket, leftover);
+  const hubClosed = new Promise((r) => {
+    socket.on("end", () => r(true));
+    setTimeout(() => r(false), 2000).unref();
+  });
+
+  socket.write(maskedFrame(0x2, Buffer.alloc(100, 0x33)));
+  socket.end(); // FIN only, no close frame
+  assert.ok(await hubClosed, "the hub must close its side, not sit in CLOSE-WAIT");
+  assert.equal(called, false);
+
+  socket.destroy();
+  restoreFetch();
+});
+
+// ...but a FIN sent right after finalize must not cost the client its result:
+// the in-flight transcription still answers, then ends the socket itself.
+test("audio WS: a FIN right after finalize still delivers the transcript", async () => {
+  // The STT answer is held until well after the FIN, so the hub's "end" handler
+  // runs while the transcription is still in flight — the case its guard covers.
+  globalThis.fetch = async () => {
+    await new Promise((r) => setTimeout(r, 200));
+    return { ok: true, json: async () => ({ text: "kept" }) };
+  };
+
+  const token = await issueToken();
+  const { socket, statusLine, leftover } = await wsConnect(`/audio?auth=${token}`);
+  assert.match(statusLine, /^HTTP\/1\.1 101/);
+  const frames = collectFrames(socket, leftover);
+
+  socket.write(maskedFrame(0x2, Buffer.alloc(320, 0x11)));
+  socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({ type: "finalize" }))));
+  socket.end();
+
+  await waitFor(() => frames.some((f) => f.op === 0x1));
+  const msg = JSON.parse(frames.find((f) => f.op === 0x1).payload.toString("utf8"));
+  assert.equal(msg.type, "audio_result");
+  assert.deepEqual(msg.transcript, { text: "kept" });
+
+  socket.destroy();
+  restoreFetch();
+});
+
 test("audio WS: bytes past the 1920000-byte cap are dropped; capped:true reported", async () => {
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: "" }) });
 
