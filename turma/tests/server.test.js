@@ -17357,6 +17357,9 @@ test("XERK-2378: a control channel whose peer half-closes is gone at once, not a
     console.log = origLog;
     live.socket.destroy();
     ctrl.socket.destroy();
+    // Let the hub disarm its viewers (and clear their pings) before the host
+    // record goes, or a live ping interval outlives the test and the file never exits.
+    await waitFor(() => !hub.liveClients.finhost?.s1);
     delete controlChannels.finhost;
     delete agents.finhost;
   }
