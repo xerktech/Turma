@@ -24,7 +24,11 @@ import kotlin.coroutines.coroutineContext
  * to the /history poll, exactly as the web + glasses clients do.
  */
 sealed interface LiveEvent {
-    data class Tail(val entries: List<TailEntry>) : LiveEvent
+    /**
+     * A committed delta. Emitted for EVERY tail frame, empty ones included: any
+     * frame proves the feed is alive. [seed] marks the hub's own opening replay.
+     */
+    data class Tail(val entries: List<TailEntry>, val seed: Boolean = false) : LiveEvent
     data class Turn(
         val text: String,
         val status: TurnStatus?,
@@ -33,6 +37,11 @@ sealed interface LiveEvent {
     ) : LiveEvent
     /** Emitted on connect/disconnect so the UI can show a live/offline dot. */
     data class Connected(val up: Boolean) : LiveEvent
+    /**
+     * The hub's arm/refusal ack. `armed:false` is an accepted socket the hub
+     * never wired to an agent — open, and carrying nothing, forever.
+     */
+    data class Watch(val armed: Boolean) : LiveEvent
 }
 
 class LiveTail(private val client: HubClient, private val config: Config) {
@@ -43,7 +52,11 @@ class LiveTail(private val client: HubClient, private val config: Config) {
         var attempt = 0
         var socket: WebSocket? = null
 
-        while (coroutineContext.isActive) {
+        // try/finally, not just awaitClose: cancelling the collector throws out of
+        // `closed.await()` below, so an awaitClose after the loop never ran and
+        // every chat left (or socket replaced) kept its socket — and the hub kept
+        // the agent tailing that session for nobody.
+        try { while (coroutineContext.isActive) {
             val token = try {
                 client.api.wsToken().token
             } catch (_: Exception) {
@@ -68,7 +81,8 @@ class LiveTail(private val client: HubClient, private val config: Config) {
                     override fun onMessage(webSocket: WebSocket, text: String) {
                         val frame = try { TurmaJson.decodeFromString<TailFrame>(text) } catch (_: Exception) { return }
                         when (frame.type) {
-                            "tail" -> if (frame.entries.isNotEmpty()) trySend(LiveEvent.Tail(frame.entries))
+                            "tail" -> trySend(LiveEvent.Tail(frame.entries, frame.seed))
+                            "watch" -> trySend(LiveEvent.Watch(frame.armed == true))
                             "turn" -> trySend(LiveEvent.Turn(frame.text, frame.status, frame.agents))
                         }
                     }
@@ -92,7 +106,7 @@ class LiveTail(private val client: HubClient, private val config: Config) {
             trySend(LiveEvent.Connected(false))
             // If it never opened, the token may be bad — the next loop refetches.
             delayBackoff(if (opened) 0 else attempt++)
-        }
+        } } finally { socket?.close(1000, null) }
 
         awaitClose { socket?.close(1000, null) }
     }

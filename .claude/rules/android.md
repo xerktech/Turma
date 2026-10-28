@@ -57,6 +57,14 @@ Mirrors the glasses pure-core/adapter-shell split:
 - **Match features and structure, not pixels** (platform-idiomatic controls). A justified platform
   difference (native chat vs ttyd terminal, Hub-URL login field, voice dictation) goes in
   `android/PARITY.md` — the living gap tracker, updated whenever a gap closes or opens.
+- **The chat's /history poll is gated on the live feed DELIVERING, never on the socket being open**
+  (XERK-2372, `ChatViewModel.liveDelivering` ↔ chat.js `liveDelivering`): open AND the hub's `watch`
+  ack said `armed` (or a non-`seed` delta arrived) AND, while the heartbeat says `paneBusy`, a frame
+  within `LIVE_STALE_MS`. Not delivering → poll, and replace the socket (cooled down). Gating on
+  `connected` left an unarmed or stalled socket on the heartbeat preview: output arrived late.
+  - `LiveTail` closes its socket in a `finally`: an `awaitClose` after the reconnect loop never ran on
+    cancel, so every chat left kept its socket and the hub kept the agent tailing it.
+  - Tests: `vm/ChatLiveFeedTest`.
 - No in-place chat/terminal toggle (terminal is its own screen), so the compose draft lives in
   `data/DraftStore.kt` keyed per (host, session); `ChatViewModel` mirrors it into
   `ChatUiState.draft`, writing every change (dictation, send-clears) back through it. Tests:

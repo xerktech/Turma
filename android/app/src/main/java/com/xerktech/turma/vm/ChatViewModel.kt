@@ -274,12 +274,24 @@ class ChatViewModel(
     private var fleetJob: Job? = null
     private var pollJob: Job? = null
     private var refreshJob: Job? = null
+    // Is the live feed actually DELIVERING (web chat.js `liveDelivering`)? An open
+    // socket alone proves nothing: the hub accepts and holds one it never armed
+    // an agent watch behind (armed:false), and a feed that died mid-turn stays
+    // open too. `connected` was the poll fallback's whole gate, so in both cases
+    // the chat sat on the heartbeat's preview — output reaching the phone late,
+    // or not until the operator left and re-entered.
+    private var liveArmed = false
+    private var lastFrameAt = 0L
+    private var lastForcedReconnect = 0L
+    /** Wall clock for the stall read; a test seam. */
+    internal var now: () -> Long = System::currentTimeMillis
     private var dictation: Dictation? = null
     // Chip ids for staged attachments — a counter, not the Uri, so the same file
     // picked twice is two removable chips.
     private var attachSeq = 0
 
     fun onEnter() {
+        lastForcedReconnect = 0L
         seedFromFleet()
         observeFleet()
         startLive()
@@ -329,11 +341,24 @@ class ChatViewModel(
 
     private fun startLive() {
         liveJob?.cancel()
+        // A cancelled collector never emits its Connected(false), so whatever
+        // the previous socket left here (a re-entry, a forced replacement) is
+        // stale until the new one says otherwise.
+        liveArmed = false
+        _state.update { it.copy(connected = false) }
         liveJob = viewModelScope.launch {
             container.liveTail.stream(host, sessionId).collect { ev ->
+                // ANY frame proves the feed is alive, whatever it carried; an
+                // open counts too, so a fresh socket gets a full stall window.
+                if (ev !is LiveEvent.Connected || ev.up) lastFrameAt = now()
                 when (ev) {
+                    is LiveEvent.Watch -> liveArmed = ev.armed
                     is LiveEvent.Tail -> {
-                        _state.update {
+                        // A delta that arrived proves an agent is tailing — except
+                        // the hub's opening seed, which it sends even on a socket
+                        // it just said it could not arm.
+                        if (!ev.seed) liveArmed = true
+                        if (ev.entries.isNotEmpty()) _state.update {
                             it.copy(entries = mergeTail(it.entries, ev.entries), liveTurn = "")
                         }
                     }
@@ -341,6 +366,7 @@ class ChatViewModel(
                         // Empty text = turn committed; the tail owns it now.
                         // Prefer the frame's agent list; a hub/agent predating it
                         // carries the list only on `status`, scoped to the turn.
+                        liveArmed = true
                         it.copy(
                             liveTurn = ev.text,
                             turnStatus = ev.status,
@@ -353,6 +379,7 @@ class ChatViewModel(
                     // same reasoning the web's Stop button uses — a status it can no
                     // longer see should not be shown). It repopulates on reconnect.
                     is LiveEvent.Connected -> _state.update {
+                        if (!ev.up) liveArmed = false
                         if (ev.up) it.copy(connected = true)
                         else it.copy(connected = false, turnStatus = null, liveAgents = emptyList())
                     }
@@ -399,9 +426,38 @@ class ChatViewModel(
         pollJob = viewModelScope.launch {
             while (isActive) {
                 delay(POLL_MS)
-                if (!_state.value.connected) refreshHistory()
+                pollFallbackTick()
             }
         }
+    }
+
+    private fun pollFallbackTick() {
+        if (liveDelivering()) return
+        refreshHistory()
+        // ...and don't just route around the dead socket: replace it. An open
+        // socket carrying nothing never fails on its own (OkHttp's ping only
+        // catches a dead TCP path, not a hub that never armed a watch). Cooled
+        // down so a genuinely unreachable feed doesn't thrash.
+        if (_state.value.connected && now() - lastForcedReconnect > LIVE_RECONNECT_COOLDOWN_MS) {
+            lastForcedReconnect = now()
+            startLive()
+        }
+    }
+
+    /**
+     * Web `liveDelivering`: the socket is up, the hub armed a watch behind it,
+     * and — while the session reads BUSY — something arrived recently. A quiet
+     * session legitimately sends nothing; a working one cannot (its `turn`
+     * frame's elapsed ticks every second). Busy comes from the HEARTBEAT's
+     * `paneBusy`, never from this socket's own status, which a dead feed would
+     * clear — the failure hiding itself. Live background agents do NOT count:
+     * they tick nothing, and counting them tore down every delegating session's
+     * healthy socket (see chat.js `feedMustBeTicking`).
+     */
+    private fun liveDelivering(): Boolean {
+        if (!_state.value.connected || !liveArmed) return false
+        val busy = _state.value.session?.session?.paneBusy == true
+        return !(busy && now() - lastFrameAt > LIVE_STALE_MS)
     }
 
     /** Silent /history re-fetch + merge (no spinner, no 202 retry loop). */
@@ -807,6 +863,10 @@ class ChatViewModel(
         const val LIVE_TURN_ID = "__live_turn__"
         /** /history fallback cadence while the live WS is down (web chat POLL_MS). */
         const val POLL_MS = 6000L
+        /** How long a WORKING session may deliver nothing over an open, armed socket (web LIVE_STALE_MS). */
+        const val LIVE_STALE_MS = 5000L
+        /** Floor between forced socket replacements (web LIVE_RECONNECT_COOLDOWN_MS). */
+        const val LIVE_RECONNECT_COOLDOWN_MS = 15000L
 
         fun factory(app: Application, host: String, sessionId: String): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
