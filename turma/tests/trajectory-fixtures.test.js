@@ -96,7 +96,7 @@ function coverage(entries) {
 
 test("fixture directory has both runtime fixtures", () => {
   const files = fs.readdirSync(DIR).filter((f) => f.endsWith(".jsonl")).sort();
-  assert.deepEqual(files, ["claude.jsonl", "qwen.jsonl"]);
+  assert.deepEqual(files, ["claude-queued.jsonl", "claude.jsonl", "qwen.jsonl"]);
 });
 
 test("claude fixture: loadable + contract coverage", () => {
@@ -121,9 +121,17 @@ test("qwen fixture: loadable + contract coverage", () => {
   assert.ok(c.usageMsgs >= 1, "has usageMetadata on assistant messages");
 });
 
+// Claude Code records a prompt sent MID-TURN only as a queued_command attachment
+// (XERK-2373); this fixture keeps the real envelope with scrubbed content.
+test("claude-queued fixture: carries both queued_command modes", () => {
+  const qc = load("claude-queued.jsonl")
+    .filter((e) => e.type === "attachment" && e.attachment.type === "queued_command");
+  assert.deepEqual(qc.map((e) => e.attachment.commandMode).sort(), ["prompt", "task-notification"]);
+});
+
 test("fixtures carry no obvious secrets", () => {
   const secret = /sk-[A-Za-z0-9]{16}|ghp_[A-Za-z0-9]{20}|github_pat_[A-Za-z0-9]{20}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.|AKIA[0-9A-Z]{16}/;
-  for (const name of ["claude.jsonl", "qwen.jsonl"]) {
+  for (const name of ["claude-queued.jsonl", "claude.jsonl", "qwen.jsonl"]) {
     const raw = fs.readFileSync(path.join(DIR, name), "utf8");
     assert.ok(!secret.test(raw), `${name} contains a secret-looking token`);
   }

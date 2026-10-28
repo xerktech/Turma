@@ -77,6 +77,11 @@ paths:
 - **Dedupe usage on `message.id`** — Claude splits one assistant message across
   lines that REPEAT the same id and the same `message.usage`, so summing per line
   triples the tokens. Qwen lines carry no repeated id, so they never dedupe.
+- **A mid-turn prompt is a `queued_command` ATTACHMENT, never a user line** (XERK-2373) — the
+  reducer rewrites it to the user entry it stands for (XERK-2372 does the same in the agent's chat
+  parsers); keying on `type === "user"` alone drops it. An array prompt keeps only its text
+  blocks, so a queued prompt can never close a tool call.
+  Tests: `claude-queued.jsonl` + the `XERK-2373` cases in `archive.test.js`.
 - `TRAJ_SNIPPET = 400` bounds every `text` / `args` / `result` (mirror
   `DSH_TRAJ_SNIPPET`).
 - **Fixtures are real, trimmed + scrubbed transcripts** under

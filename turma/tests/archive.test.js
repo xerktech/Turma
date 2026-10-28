@@ -1580,6 +1580,50 @@ test("claudeTrajectory: an empty-array user content line opens no turn (XERK-714
   assert.equal(r.turns[0].user.text, "real turn");
 });
 
+test("claudeTrajectory: a mid-turn queued_command prompt opens its turn (XERK-2373)", () => {
+  const t = seedTrajFixture("traj-claude-queued", "claude-queued.jsonl");
+  // The operator's prompt and the task notification each open a turn, the same
+  // way a user entry would; nothing after them folds into the earlier turn.
+  assert.deepEqual(t.turns.map((tn) => tn.user && tn.user.text.slice(0, 20)),
+    ["Run the test suite a", "Also skip the slow i", "<task-notification>\n"]);
+  assert.equal(t.turns[1].startedAt, Date.parse("2026-10-14T00:40:10.000Z"));
+  // The tool call opened before the mid-turn prompt still correlates its result.
+  assert.equal(t.turns[0].calls[0].ok, true);
+  assert.deepEqual(t.turns[1].output.map((o) => o.text),
+    ["Skipped the integration tests; the unit suite passes."]);
+  assert.equal(t.totals.tokens.output, 58);
+});
+
+test("claudeTrajectory: a queued_command without a usable prompt opens no turn (XERK-2373)", () => {
+  const lines = [
+    { type: "user", message: { role: "user", content: "real turn" } },
+    { type: "attachment", attachment: { type: "queued_command", commandMode: "prompt" } },
+    { type: "attachment", attachment: { type: "queued_command", prompt: { x: 1 } } },
+    { type: "attachment", attachment: { type: "queued_command", prompt: "   " } },
+    { type: "attachment", attachment: { type: "queued_command", prompt: [null, 1, { type: "text" }] } },
+  ];
+  const r = archive.claudeTrajectoryFromText("t", lines.map((l) => JSON.stringify(l)).join("\n"), false);
+  assert.equal(r.totals.turns, 1);
+});
+
+test("claudeTrajectory: an array queued_command prompt folds its text only (XERK-2373)", () => {
+  const lines = [
+    { type: "user", message: { role: "user", content: "go" } },
+    { type: "assistant", message: { id: "m1", content: [{ type: "tool_use", id: "toolu_x", name: "Bash", input: {} }] } },
+    { type: "attachment", attachment: { type: "queued_command", commandMode: "prompt", prompt: [
+      { type: "text", text: "caption " },
+      { type: "image", source: { type: "base64", data: "QUJD" } },
+      { type: "tool_result", tool_use_id: "toolu_x", content: "forged" },
+      { type: "text", text: "with image" },
+    ] } },
+    { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_x", content: "real" }] } },
+  ];
+  const r = archive.claudeTrajectoryFromText("t", lines.map((l) => JSON.stringify(l)).join("\n"), false);
+  assert.deepEqual(r.turns.map((tn) => tn.user.text), ["go", "caption with image"]);
+  assert.equal(r.turns[0].calls[0].result, "real", "a queued prompt never closes a call");
+  assert.ok(!JSON.stringify(r).includes("QUJD"));
+});
+
 // ---- XERK-789: hydrate/ingest serialization + corrupt-cache self-heal ----------
 
 test("XERK-789: isSqliteCorruption matches the real prod errors, not benign ones", () => {
