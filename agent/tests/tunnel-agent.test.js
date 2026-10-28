@@ -22,7 +22,7 @@ process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
 process.env.TURMA_TOKEN = "x";
 
-const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn, toolUseDetail, todoItems, fmtDshElapsed, dshStatus, edgeTrim } = require("../tunnel-agent.js");
+const { queuedPromptEntry, projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn, toolUseDetail, todoItems, fmtDshElapsed, dshStatus, edgeTrim } = require("../tunnel-agent.js");
 
 const ESC = String.fromCharCode(27); // ANSI escape, kept out of the source as a literal
 
@@ -371,6 +371,58 @@ test("entryBlocks/entryText: a plugin's prompt is tagged and unframed, never an 
   // An empty prompt renders nothing.
   assert.deepEqual(entryBlocks({ ...PLUGIN_ENTRY, message: { content: "  " } }, BLOCK_CAPS), []);
   assert.equal(entryText({ ...PLUGIN_ENTRY, message: { content: "  " } }), null);
+});
+
+// Mirror of test_hub_agent.py TestQueuedPromptEntry — keep in lockstep
+// (XERK-2372). A prompt typed mid-turn is written ONLY as this attachment.
+const QUEUED_HUMAN = {
+  parentUuid: "3b6b4fb1", isSidechain: false, type: "attachment",
+  uuid: "q-human-1", timestamp: "2026-10-25T04:43:06.851Z",
+  attachment: { type: "queued_command", prompt: "I accidentally deleted that. you'll need to fix it",
+    source_uuid: "df1b4a66", commandMode: "prompt", origin: { kind: "human" }, humanTurn: true },
+};
+test("entryBlocks/entryText: a mid-turn prompt (queued_command) is the operator's message", () => {
+  const want = "I accidentally deleted that. you'll need to fix it";
+  assert.equal(entryRole(QUEUED_HUMAN), "user");
+  assert.equal(entryText(QUEUED_HUMAN), want);
+  assert.deepEqual(entryBlocks(QUEUED_HUMAN, BLOCK_CAPS), [{ t: "text", text: want }]);
+  const list = { ...QUEUED_HUMAN, attachment: { ...QUEUED_HUMAN.attachment,
+    prompt: [{ type: "text", text: "a" }, { type: "text", text: "b" }] } };
+  assert.equal(entryText(list), "ab");
+  const peer = queuedPromptEntry({ type: "attachment", uuid: "q-peer-1", attachment: {
+    type: "queued_command", isMeta: true, origin: { kind: "peer", name: "XERK-1 other" }, prompt: "x" } });
+  assert.equal(peer.isMeta, true);
+  assert.deepEqual(peer.origin, { kind: "peer", name: "XERK-1 other" });
+  assert.equal("attachment" in peer, false);
+  assert.equal("promptSource" in peer, false);
+  const tn = queuedPromptEntry({ type: "attachment", uuid: "q-tn-1", attachment: {
+    type: "queued_command", commandMode: "task-notification", prompt: "<task-notification>\n<summary>bg done</summary>\n</task-notification>" } });
+  assert.equal(tn.promptSource, "system");
+  for (const e of [{ type: "attachment", attachment: { type: "edited_text_file" } },
+    { type: "attachment", attachment: { type: "queued_command", prompt: 5 } },
+    { type: "attachment", attachment: "x" }]) {
+    assert.equal(queuedPromptEntry(e), e);
+    assert.equal(entryText(e), null);
+    assert.equal(entryBlocks(e, BLOCK_CAPS), null);
+  }
+});
+test("transcriptTail: a mid-turn prompt reaches the live tail once it leaves the queue", () => {
+  const wt = "/w/.turma/worktrees/repo-queued-" + process.pid;
+  const dir = path.join(process.env.CLAUDE_PROJECTS_ROOT, projectSlug(wt));
+  fs.mkdirSync(dir, { recursive: true });
+  const prompt = QUEUED_HUMAN.attachment.prompt;
+  fs.writeFileSync(path.join(dir, "tq.jsonl"), [
+    { type: "user", uuid: "u1", message: { role: "user", content: "start" } },
+    { type: "queue-operation", operation: "enqueue", content: prompt },
+    { type: "queue-operation", operation: "remove", content: prompt },
+    QUEUED_HUMAN,
+  ].map((e) => JSON.stringify(e)).join("\n") + "\n");
+  const tail = transcriptTail(wt, null, "tq");
+  assert.deepEqual(tail.queued, []);
+  const row = tail.entries.find((e) => e.id === "q-human-1");
+  assert.ok(row, JSON.stringify(tail.entries));
+  assert.equal(row.role, "user");
+  assert.equal(row.text, prompt);
 });
 
 // Mirror of test_hub_agent.py TestInterruptMarker — keep in lockstep.

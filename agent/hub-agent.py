@@ -10324,6 +10324,42 @@ def _plugin_message(entry):
     return text, ("turma" if name == BRIDGE_MOD_NAME else "system")
 
 
+def _queued_prompt_entry(entry):
+    """A prompt Claude Code consumed MID-TURN, as the user entry it stands for.
+
+    A message typed while a turn runs is queued (`queue-operation` enqueue),
+    and when Claude Code folds it into the running turn it writes ONLY an
+    `attachment` entry of type `queued_command` (plus the dequeue) — never a
+    `user` entry (verified across 47 such entries on Claude Code 2.1.30x: none
+    had a user twin). Every reader keyed on `type == "user"`, so the operator's
+    message left the chat the moment it stopped being "queued" (XERK-2372),
+    and the compaction outbox never saw it delivered. Rewritten here into the
+    user entry a non-queued delivery writes (same uuid, `isMeta`/`origin` from
+    the attachment, so a peer message still reads as one); anything else is
+    returned unchanged. Mirror of tunnel-agent.js queuedPromptEntry."""
+    if entry.get("type") != "attachment":
+        return entry
+    att = entry.get("attachment")
+    if not isinstance(att, dict) or att.get("type") != "queued_command":
+        return entry
+    prompt = att.get("prompt")
+    if not isinstance(prompt, (str, list)):
+        return entry
+    user = dict(entry)
+    user.pop("attachment", None)
+    user["type"] = "user"
+    user["message"] = {"role": "user", "content": prompt}
+    if att.get("isMeta") is True:
+        user["isMeta"] = True
+    if isinstance(att.get("origin"), dict):
+        user["origin"] = att["origin"]
+    # A typed task-notification turn says promptSource "system"; without it the
+    # compaction outbox would count a task summary as a delivered operator message.
+    if att.get("commandMode") == "task-notification":
+        user["promptSource"] = "system"
+    return user
+
+
 def _entry_id(entry):
     """The entry's own uuid, or a synthesized stable id for the entry types
     Claude Code writes WITHOUT one (pr-link): the client's tail merge dedups on
@@ -10352,6 +10388,7 @@ def _entry_role(entry):
     would) misattributes it, so it reports as the assistant. A system entry
     only ever survives the feeds as an away_summary recap (see
     _away_summary_text), which the model also wrote — same rule."""
+    entry = _queued_prompt_entry(entry)
     if entry.get("isCompactSummary"):
         return "assistant"
     if entry.get("type") == "system":
@@ -10378,6 +10415,7 @@ def _entry_text(entry):
     (_entry_tool_source), a slash-command caveat, or empty after stripping
     ANSI). An away_summary system entry survives as its recap text (role
     "assistant" via _entry_role); every other system subtype stays dropped."""
+    entry = _queued_prompt_entry(entry)
     away = _away_summary_text(entry)
     if away is not None:
         return away
@@ -12473,6 +12511,7 @@ def _entry_blocks(entry, caps, preview=False):
     (_entry_id / entryId).
     Returns [] for a user/assistant message with no renderable blocks. Keep this
     mirrored with tunnel-agent.js entryBlocks()."""
+    entry = _queued_prompt_entry(entry)
     away = _away_summary_text(entry)
     if away is not None:
         clipped, trunc = _clip(away, caps["text"])
@@ -13071,6 +13110,7 @@ def _pending_scan(path):
             continue
         if not isinstance(entry, dict):
             continue
+        entry = _queued_prompt_entry(entry)
         etype = entry.get("type")
         if etype == "queue-operation":
             _fold_queue_op(entry, queued)
@@ -13131,7 +13171,7 @@ def _is_command_output_row(row):
 # and any re-serialized transcript may carry a space, so match both spellings.
 # False positives just cost one json.loads; false negatives would hide a
 # message, so the marker must stay a superset of real user lines.
-_USER_LINE_MARKERS = (b'"type":"user"', b'"type": "user"')
+_USER_LINE_MARKERS = (b'"type":"user"', b'"type": "user"', b'"queued_command"')
 
 
 def _operator_entries(path):
@@ -13156,6 +13196,8 @@ def _operator_entries(path):
                         entry = json.loads(raw)
                     except ValueError:
                         entry = None
+                    if isinstance(entry, dict):
+                        entry = _queued_prompt_entry(entry)
                     if isinstance(entry, dict) and entry.get("type") == "user":
                         row = _history_row(entry)
                 if row is None:

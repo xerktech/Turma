@@ -5402,6 +5402,89 @@ class TestBashPassthrough(unittest.TestCase):
         self.assertIsNone(ha._parse_local_command("talk about <bash-input> inline"))
 
 
+class TestQueuedPromptEntry(ProjectDirMixin, unittest.TestCase):
+    """A prompt typed while a turn runs is written ONLY as an `attachment` /
+    `queued_command` entry once Claude Code folds it into the turn (XERK-2372),
+    so the chat dropped it the moment it stopped reading "queued". Mirror of the
+    `a mid-turn prompt` case in tunnel-agent.test.js — keep in lockstep. The
+    entries are what Claude Code 2.1.30x wrote, trimmed."""
+
+    HUMAN = {
+        "parentUuid": "3b6b4fb1", "isSidechain": False, "type": "attachment",
+        "uuid": "q-human-1", "timestamp": "2026-10-25T04:43:06.851Z",
+        "attachment": {"type": "queued_command",
+                       "prompt": "I accidentally deleted that. you'll need to fix it",
+                       "source_uuid": "df1b4a66", "commandMode": "prompt",
+                       "origin": {"kind": "human"}, "humanTurn": True},
+    }
+    PEER = {
+        "type": "attachment", "uuid": "q-peer-1",
+        "attachment": {"type": "queued_command", "commandMode": "prompt", "isMeta": True,
+                       "origin": {"kind": "peer", "name": "XERK-1 other"},
+                       "prompt": "<cross-session-message from=\"x\">FYI</cross-session-message>"},
+    }
+
+    def test_a_human_prompt_is_an_operator_message(self):
+        want = "I accidentally deleted that. you'll need to fix it"
+        self.assertEqual(ha._entry_role(self.HUMAN), "user")
+        self.assertEqual(ha._entry_text(self.HUMAN), want)
+        self.assertEqual(ha._entry_blocks(self.HUMAN, ha.BLOCK_CAPS), [{"t": "text", "text": want}])
+        row = ha._history_row(self.HUMAN)
+        self.assertEqual(row["id"], "q-human-1")
+        self.assertTrue(ha._is_operator_row(row))
+
+    def test_list_content_and_the_peer_flags_carry_over(self):
+        e = json.loads(json.dumps(self.HUMAN))
+        e["attachment"]["prompt"] = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+        self.assertEqual(ha._entry_text(e), "ab")
+        user = ha._queued_prompt_entry(self.PEER)
+        self.assertIs(user["isMeta"], True)
+        self.assertEqual(user["origin"], {"kind": "peer", "name": "XERK-1 other"})
+        self.assertNotIn("attachment", user)
+        self.assertNotIn("promptSource", user)
+
+    def test_a_queued_task_notification_is_never_a_delivered_operator_message(self):
+        note = ("<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n"
+                "<summary>bg done</summary>\n</task-notification>")
+        e = {"type": "attachment", "uuid": "q-tn-1", "attachment": {
+            "type": "queued_command", "commandMode": "task-notification", "prompt": note}}
+        self.assertEqual(ha._queued_prompt_entry(e)["promptSource"], "system")
+        self.assertEqual([b["t"] for b in ha._entry_blocks(e, ha.BLOCK_CAPS)], ["task_notification"])
+        delivered, _q, _c = ha._pending_scan(self._transcript([e]))
+        self.assertEqual(delivered, [])
+
+    def test_other_attachments_are_untouched(self):
+        for e in ({"type": "attachment", "attachment": {"type": "edited_text_file"}},
+                  {"type": "attachment", "attachment": {"type": "queued_command", "prompt": 5}},
+                  {"type": "attachment", "attachment": "x"}):
+            self.assertIs(ha._queued_prompt_entry(e), e)
+            self.assertIsNone(ha._entry_text(e))
+            self.assertIsNone(ha._entry_blocks(e, ha.BLOCK_CAPS))
+
+    def _transcript(self, lines):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.WORKDIR))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, "t.jsonl")
+        write_jsonl(path, lines)
+        return path
+
+    def test_every_feed_keeps_it(self):
+        path = self._transcript([
+            {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "start"}},
+            {"type": "queue-operation", "operation": "enqueue", "content": self.HUMAN["attachment"]["prompt"]},
+            {"type": "queue-operation", "operation": "remove", "content": self.HUMAN["attachment"]["prompt"]},
+            self.HUMAN,
+        ])
+        # The live/heartbeat tail, the windowed history and the operator rescue.
+        self.assertIn("q-human-1", [r["id"] for r in ha.transcript_tail(path)])
+        self.assertIn("q-human-1", [r["id"] for r in ha._history_entries(path)[0]])
+        self.assertIn("q-human-1", [r["id"] for r in ha._operator_entries(path)])
+        # And the compaction outbox counts it delivered, so it is never re-typed.
+        delivered, queued, _c = ha._pending_scan(path)
+        self.assertIn(self.HUMAN["attachment"]["prompt"], delivered)
+        self.assertEqual(queued, [])
+
+
 class TestInterruptMarker(unittest.TestCase):
     """Esc / the hub's Stop mid-turn writes a user-role "[Request interrupted
     by user…]" marker — a statement ABOUT the turn, not something the operator
