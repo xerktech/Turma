@@ -1557,6 +1557,13 @@ data class TailFrame(
     // keeps going past that. Empty from a hub/agent predating the field, which
     // leaves the `status.agents` behaviour it had before.
     val agents: List<AgentRow> = emptyList(),
+    // The hub's `watch` ack: whether it armed an agent tail behind this socket.
+    // Null on every other frame type (and from a hub predating the ack).
+    val armed: Boolean? = null,
+    // The hub's opening `tail`, replayed from the last HEARTBEAT on upgrade. It
+    // proves nothing about the agent — the hub sends it even on a socket it
+    // just said it could not arm.
+    val seed: Boolean = false,
 )
 
 @Serializable
