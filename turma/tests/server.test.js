@@ -17308,6 +17308,60 @@ test("control WS: a channel that never pongs is dropped, so terminalOnline stops
   }
 });
 
+// XERK-2378: a tunnel-agent that dies (SIGKILL, crash) has its kernel send a FIN.
+// The HTTP server's sockets are half-open, so that FIN is only an "end" event —
+// with no handler the hub sat in CLOSE-WAIT, kept the channel, and acked
+// armed:true to new /live viewers until the idle ping timeout reaped it. The
+// FIN must count as gone at once. Asserted by WHICH path dropped it (no
+// "tunnel silent" log line), not by a timing window, so load cannot flake it.
+test("XERK-2378: a control channel whose peer half-closes is gone at once, not after the ping timeout", async () => {
+  agents.finhost = {
+    device: "finhost", lastSeen: Date.now(), commands: [], history: {},
+    sessions: [{ id: "s1", worktreePath: "/wt/s1", session: { tail: [] } }],
+  };
+  const token = await issueToken();
+  const ctrl = await wsConnect(`/agent/control?name=finhost&token=agenttok`);
+  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+  collectControlFrames(ctrl.socket, ctrl.leftover);
+  const live = await wsConnect(`/live/finhost/s1?auth=${token}`);
+  const liveFrames = collectFrames(live.socket, live.leftover);
+  const logged = [];
+  const origLog = console.log;
+  console.log = (...a) => { logged.push(a.join(" ")); origLog(...a); };
+  try {
+    assert.deepEqual(await nextTextJson(liveFrames, 0), { type: "watch", armed: true });
+    // Bounded, so a regression to "cleanup but never close" fails by name, not by hanging.
+    const hubClosed = new Promise((r) => {
+      ctrl.socket.on("end", () => r(true));
+      setTimeout(() => r(false), 2000).unref();
+    });
+    ctrl.socket.end(); // FIN only — what the kernel sends for a killed process
+    await waitFor(() => !controlChannels.finhost);
+    assert.ok(!logged.some((l) => /tunnel silent.*finhost/.test(l)),
+      "the channel was reaped by the idle ping timeout, not by the peer's FIN");
+    assert.ok(await hubClosed, "the hub must close its own side, not sit in CLOSE-WAIT");
+    // The viewer already on the session hears the tunnel went away...
+    const off = await waitFrame(liveFrames, (f) => {
+      const j = jsonFrame(f);
+      return j && j.type === "watch" && j.armed === false;
+    });
+    assert.ok(off, "no armed:false fan-out to the existing viewer");
+    assert.equal(jsonFrame(off).reason, "this host's tunnel is offline");
+    // ...and a viewer opening now is not told a watch is armed.
+    const late = await wsConnect(`/live/finhost/s1?auth=${token}`);
+    const lateFrames = collectFrames(late.socket, late.leftover);
+    assert.deepEqual(await nextTextJson(lateFrames, 0),
+      { type: "watch", armed: false, reason: "this host's tunnel is offline" });
+    late.socket.destroy();
+  } finally {
+    console.log = origLog;
+    live.socket.destroy();
+    ctrl.socket.destroy();
+    delete controlChannels.finhost;
+    delete agents.finhost;
+  }
+});
+
 // Yield to the REAL event loop so socket bytes queued by the last mocked tick get
 // read/written; setImmediate is deliberately left un-mocked below so this pumps
 // real I/O without advancing the mocked clock.

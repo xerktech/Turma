@@ -23023,6 +23023,12 @@ server.on("upgrade", async (req, socket, head) => {
         publishAgent(name);
       }
     };
+    // A killed tunnel-agent's kernel sends a FIN, and the HTTP server's sockets
+    // are half-open, so that arrives as "end" alone — never "close" (XERK-2378).
+    // Unhandled, the hub sat in CLOSE-WAIT holding the channel and acked
+    // armed:true to new /live viewers until the idle ping timeout reaped it.
+    // The peer can send nothing more, so treat the FIN as gone at once.
+    socket.on("end", () => { cleanup(); try { socket.destroy(); } catch {} });
     socket.on("close", cleanup);
     socket.on("error", cleanup);
     return;
