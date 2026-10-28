@@ -360,6 +360,25 @@ function entryToolSource(entry) {
 // other plugin, or null when the entry is not one.
 const PLUGIN_FRAME_TAIL = "\n\nThis is how Claude Code surfaces a prompt a plugin submits";
 const BRIDGE_MOD_NAME = "turma-bridge";
+// A prompt Claude Code consumed MID-TURN, as the user entry it stands for:
+// such a prompt is written ONLY as an `attachment` of type `queued_command`,
+// never as a `user` entry, so every reader dropped it (XERK-2372). Mirror of
+// hub-agent.py _queued_prompt_entry; anything else is returned unchanged.
+function queuedPromptEntry(entry) {
+  if (!entry || entry.type !== "attachment") return entry;
+  const att = entry.attachment;
+  if (!att || typeof att !== "object" || att.type !== "queued_command") return entry;
+  const prompt = att.prompt;
+  if (typeof prompt !== "string" && !Array.isArray(prompt)) return entry;
+  const user = { ...entry, type: "user", message: { role: "user", content: prompt } };
+  delete user.attachment;
+  if (att.isMeta === true) user.isMeta = true;
+  if (att.origin && typeof att.origin === "object" && !Array.isArray(att.origin)) user.origin = att.origin;
+  // As a typed task-notification turn says (hub-agent.py: the outbox reads it).
+  if (att.commandMode === "task-notification") user.promptSource = "system";
+  return user;
+}
+
 function pluginMessage(entry) {
   if (entry.type !== "user") return null;
   const origin = entry.origin;
@@ -423,6 +442,7 @@ function awaySummaryText(entry) {
 // A system entry only ever survives the feeds as an away_summary recap, which
 // the model also wrote — same rule.
 function entryRole(entry) {
+  entry = queuedPromptEntry(entry);
   if (entry.isCompactSummary) return "assistant";
   if (entry.type === "system") return "assistant";
   return entry.type;
@@ -442,6 +462,7 @@ function flattenText(raw) {
 // type, no message, tool_result-only turn, empty after ANSI strip). Mirrors
 // hub-agent.py _entry_text.
 function entryText(entry) {
+  entry = queuedPromptEntry(entry);
   const away = awaySummaryText(entry);
   if (away !== null) return away;
   const type = entry.type;
@@ -669,6 +690,7 @@ function toolResultText(content) {
 // truncated:true. Returns [] for a user/assistant message with no renderable
 // blocks. Line-for-line mirror of hub-agent.py _entry_blocks — keep in lockstep.
 function entryBlocks(entry, caps) {
+  entry = queuedPromptEntry(entry);
   // The "while you were away" recap becomes its own block (assistant-side
   // card); all other system entries still drop. Mirror of _entry_blocks.
   const away = awaySummaryText(entry);
@@ -2899,7 +2921,7 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, backscanLiveAgents, restoreLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
+  module.exports = { queuedPromptEntry, ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, backscanLiveAgents, restoreLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; },
     __setPaneCapture: (f) => { paneCapture = f || captureLiveTurn; },
     captureLiveTurn,

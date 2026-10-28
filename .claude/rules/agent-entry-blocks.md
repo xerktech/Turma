@@ -42,6 +42,13 @@ Split out of `agent.md` (size ceiling).
 - `compact_boundary` and `pr-link` markers; pr-link entries carry no uuid so the feeds synthesize a
   stable id from the URL alone, deduped over the whole conversation (Claude re-stamps pr-links atop
   every user turn, so one PR yields ~6 entries — folding only consecutive repeats is not enough).
+- **A prompt consumed MID-TURN is an `attachment`/`queued_command`, never a `user` entry**
+  (XERK-2372, `_queued_prompt_entry`/`queuedPromptEntry`): Claude Code 2.1.30x writes no user twin
+  (0 of 47 checked). `_entry_role`/`_entry_text`/`_entry_blocks`, `_pending_scan` and
+  `_operator_entries` rewrite it into that user entry (uuid kept, `isMeta`/`origin` from the
+  attachment). Without it the operator's message vanished from the chat when it left the queue,
+  and the compaction outbox never saw it delivered (a resend would duplicate it). Queued
+  `<task-notification>`s ride the same path. Tests: `TestQueuedPromptEntry` ↔ its js twin.
 - **Still-queued prompts ride beside entries, not inside them**: both feeds fold
   `queue-operation` FIFO (`_fold_queue_op`/`foldQueueOp`) and ship survivors as `queued[]`. Display
   filtering happens at REPORT time (`_queued_display`/`queuedDisplay`), never at fold time.
