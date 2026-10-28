@@ -3519,11 +3519,18 @@ function claudeTrajectoryFromText(transcriptId, text, truncated) {
     if (!e || typeof e !== "object") continue;
     // A prompt the operator sent MID-TURN is recorded only as a `queued_command`
     // attachment, never a user entry (XERK-2373) — fold it as the user entry it
-    // stands for, the same rewrite as the agent's _queued_prompt_entry/queuedPromptEntry.
+    // stands for, the same rewrite XERK-2372 gives the agent's chat parsers. An
+    // array prompt keeps only its TEXT blocks: a prompt is never a tool result,
+    // so one must not close a pending call here.
     const qc = e.type === "attachment" && e.attachment && typeof e.attachment === "object"
       && e.attachment.type === "queued_command" ? e.attachment : null;
-    if (qc && (typeof qc.prompt === "string" || Array.isArray(qc.prompt))) {
-      e = { ...e, type: "user", message: { role: "user", content: qc.prompt },
+    const qText = !qc ? null
+      : typeof qc.prompt === "string" ? qc.prompt
+      : Array.isArray(qc.prompt) ? qc.prompt.filter((b) => b && b.type === "text" && typeof b.text === "string")
+        .map((b) => b.text).join("")
+      : null;
+    if (qText != null && qText.trim()) {
+      e = { ...e, type: "user", message: { role: "user", content: qText },
         isMeta: qc.isMeta != null ? qc.isMeta : e.isMeta,
         origin: qc.origin != null ? qc.origin : e.origin };
       delete e.attachment;

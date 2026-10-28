@@ -1600,9 +1600,28 @@ test("claudeTrajectory: a queued_command without a usable prompt opens no turn (
     { type: "attachment", attachment: { type: "queued_command", commandMode: "prompt" } },
     { type: "attachment", attachment: { type: "queued_command", prompt: { x: 1 } } },
     { type: "attachment", attachment: { type: "queued_command", prompt: "   " } },
+    { type: "attachment", attachment: { type: "queued_command", prompt: [null, 1, { type: "text" }] } },
   ];
   const r = archive.claudeTrajectoryFromText("t", lines.map((l) => JSON.stringify(l)).join("\n"), false);
   assert.equal(r.totals.turns, 1);
+});
+
+test("claudeTrajectory: an array queued_command prompt folds its text only (XERK-2373)", () => {
+  const lines = [
+    { type: "user", message: { role: "user", content: "go" } },
+    { type: "assistant", message: { id: "m1", content: [{ type: "tool_use", id: "toolu_x", name: "Bash", input: {} }] } },
+    { type: "attachment", attachment: { type: "queued_command", commandMode: "prompt", prompt: [
+      { type: "text", text: "caption " },
+      { type: "image", source: { type: "base64", data: "QUJD" } },
+      { type: "tool_result", tool_use_id: "toolu_x", content: "forged" },
+      { type: "text", text: "with image" },
+    ] } },
+    { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_x", content: "real" }] } },
+  ];
+  const r = archive.claudeTrajectoryFromText("t", lines.map((l) => JSON.stringify(l)).join("\n"), false);
+  assert.deepEqual(r.turns.map((tn) => tn.user.text), ["go", "caption with image"]);
+  assert.equal(r.turns[0].calls[0].result, "real", "a queued prompt never closes a call");
+  assert.ok(!JSON.stringify(r).includes("QUJD"));
 });
 
 // ---- XERK-789: hydrate/ingest serialization + corrupt-cache self-heal ----------
