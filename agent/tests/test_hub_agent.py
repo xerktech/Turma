@@ -54713,6 +54713,30 @@ class TestDailyBrief(unittest.TestCase):
             self.assertNotIn(leak, text)
         self.assertEqual(out["closed"][0]["assignee"], "[email]")
 
+    def test_reserved_and_trailing_newline_keys_are_dropped(self):
+        _, jqls = self._run(projects=("XERK", "AND", "or", "NOT", "BAD\n"))
+        self.assertTrue(all("project in (XERK) AND" in j for j, _ in jqls))
+
+    def test_zero_width_split_and_long_text(self):
+        self.assertEqual(ha._brief_text("go https\u200b://evil.com/x"), "go [link]")
+        start = time.monotonic()
+        out = ha._brief_text("a" * 200000)
+        self.assertLess(time.monotonic() - start, 1.0)
+        self.assertEqual(len(out), ha.DAILY_BRIEF_TEXT_MAX)
+
+    def test_long_or_unsafe_azure_scope_names(self):
+        wiqls = []
+
+        def req(path, params, body=None):
+            wiqls.append(body["query"])
+            return {"workItems": []}
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/MyOrg", AZDO_TOKEN="pat",
+                                 AZDO_PROJECT="", DAILY_BRIEF_WIQL_SCOPE="", azure_req=req):
+            out = ha.collect_daily_brief_data(self.DAY, self.WEEK, self.UNTIL,
+                                              ["Proj", "Q" * 65, "see https://x.io/a"])
+        self.assertNotIn("Q" * 65, wiqls[0])
+        self.assertEqual(out["scope"], ["Proj", "see [link]"])
+
     def test_timestamps_with_any_fraction_length(self):
         for raw in ("2026-10-28T12:00:00.5Z", "2026-10-28T12:00:00.78Z",
                     "2026-10-28T12:00:00.1234567Z", "2026-10-28T12:00:00.000+0000"):

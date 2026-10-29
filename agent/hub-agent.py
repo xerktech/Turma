@@ -24202,8 +24202,9 @@ def _brief_text(v):
     """One line, URLs dropped, capped — this text goes to a model."""
     if not isinstance(v, str):
         return None
-    # Zero-width/format chars could split a URL past the regex: drop them first.
-    v = "".join(ch for ch in v if unicodedata.category(ch) != "Cf")
+    # Cut first: the scrub regexes are superlinear on a long separator-free run.
+    # Zero-width/format chars could split a URL past the regex: drop them too.
+    v = "".join(ch for ch in v[:DAILY_BRIEF_TEXT_MAX * 4] if unicodedata.category(ch) != "Cf")
     v = _DAILY_BRIEF_URL_RE.sub("[link]", " ".join(v.split()))
     v = _DAILY_BRIEF_EMAIL_RE.sub("[email]", v)
     return v[:DAILY_BRIEF_TEXT_MAX] or None
@@ -24388,7 +24389,7 @@ def _collect_daily_brief_jira(day_from, week_from, until, projects):
         scope_jql, scope = f"({DAILY_BRIEF_JQL_SCOPE})", "custom"
     else:
         keys = [p for p in projects or [] if isinstance(p, str)
-                and _DAILY_BRIEF_PROJECT_RE.match(p) and p.upper() not in ("AND", "OR", "NOT")]
+                and _DAILY_BRIEF_PROJECT_RE.fullmatch(p) and p.upper() not in ("AND", "OR", "NOT")]
         keys = keys[:DAILY_BRIEF_PROJECTS_MAX]
         if not keys:
             return None
