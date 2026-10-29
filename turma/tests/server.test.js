@@ -25344,6 +25344,19 @@ test("XERK-1574: the decisions store coerces to the typed shape and survives a r
   }
 });
 
+test("XERK-2386: a record restored from an older hub's state.json carries no brief blocks", () => {
+  const f = path.join(scratchDir(), `turma-x2386-restore-${process.pid}.json`);
+  fs.writeFileSync(f, JSON.stringify({
+    oldHost: { device: "oldHost", lastSeen: Date.now(), sessions: [], repos: [],
+      briefRender: { available: true }, briefNarratives: [{ text: "x" }] },
+  }));
+  try {
+    const mod = freshServerModule((env) => { env.STATE_FILE = f; });
+    assert.equal("briefRender" in mod.agents.oldHost, false);
+    assert.equal("briefNarratives" in mod.agents.oldHost, false);
+  } finally { fs.unlinkSync(f); }
+});
+
 test("XERK-2386: the org brief is retired — /brief lands on Insights, an older agent's brief keys are dropped", async () => {
   const page = await request("GET", "/insights", { headers: userHeaders });
   assert.equal(page.status, 200);

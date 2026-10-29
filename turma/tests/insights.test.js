@@ -210,6 +210,21 @@ test("XERK-1574: a note's text is escaped; the draft survives a repaint", () => 
   } finally { H.drafts.delete("a.net"); }
 });
 
+test("XERK-2386: a first visit to a card fetches it once; a return to Model quality refetches", async () => {
+  const reply = (u) => (u.startsWith("/api/agents") ? { agents: [] } : { days: 7, top: [], recent: [], groups: [] });
+  const P = loadHelpers(reply, "");
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  const count = (pre) => P.fetches.filter((u) => u.startsWith(pre)).length;
+  const go = (h) => { P.stubs.location.hash = h; for (const fn of P.winListeners.hashchange) fn(); };
+  go("#permissions");
+  assert.equal(count("/api/permissions"), 1, "the scope sync's fetch, not a second one");
+  go("#model-quality");
+  assert.equal(count("/api/model-quality"), 1);
+  go("#decisions");
+  go("#model-quality");
+  assert.equal(count("/api/model-quality"), 2, "coming back refetches");
+});
+
 // --- Decisions (XERK-1574) -------------------------------------------------------
 
 test("XERK-1574: the decisions tail is newest first, escaped, a composer only for a live org", () => {

@@ -11,7 +11,7 @@ paths:
 ## The page
 
 - `/insights` (nav `insights`, after Usage) holds the fleet's oversight surfaces as SUB-PAGES:
-  Decisions, Permission prompts (`turma-permissions.md`), Model quality (`model-quality.md`).
+  Decisions, Permissions (the permission-prompt card, `turma-permissions.md`), Model quality (`model-quality.md`).
   - One pane shows at a time, named by the URL hash (`#decisions`, `#permissions`,
     `#model-quality`; anything else is Decisions), so a sub-page is linkable and Back works.
   - **Only the shown pane fetches** (`syncPaneScope`, the minute timers check `pane`): the two

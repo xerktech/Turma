@@ -222,6 +222,10 @@
     .mq-card tbody td.mq-na { display: none; }
     .mq-card tbody tr.mq-class-first td { border-top: none; }
   }
+  /* The narrowest phones (320px) still fit all three tabs without a hidden scroll. */
+  @media (max-width: 360px) {
+    .subtabs a { padding: 8px 6px; font-size: 12.5px; }
+  }
   @media (pointer: coarse) {
     th, td { padding: 10px 14px; }
   }
@@ -233,7 +237,7 @@
 <div class="wrap">
   <nav class="subtabs" id="subtabs">
     <a href="#decisions" data-pane="decisions">Decisions</a>
-    <a href="#permissions" data-pane="permissions">Permission prompts</a>
+    <a href="#permissions" data-pane="permissions">Permissions</a>
     <a href="#model-quality" data-pane="model-quality">Model quality</a>
   </nav>
   <section id="pane-decisions" data-pane-body="decisions">
@@ -294,11 +298,13 @@ function syncPaneScope(data) {
   if (pane === "model-quality") syncModelQualityScope(data.agents);
 }
 // Coming back to a card refetches it: its minute timer only runs while it shows.
+// Not when showPane's own scope sync just fetched it (a first visit, a new org).
 addEventListener("hashchange", () => {
   pane = paneOf(location.hash);
+  const permSeq = permFetchSeq, mqSeq = mqFetchSeq;
   showPane();
-  if (pane === "permissions" && permScoped) refreshPermissions();
-  if (pane === "model-quality" && mqScoped) refreshModelQuality();
+  if (pane === "permissions" && permScoped && permFetchSeq === permSeq) refreshPermissions();
+  if (pane === "model-quality" && mqScoped && mqFetchSeq === mqSeq) refreshModelQuality();
 });
 
 // ---- Decisions (XERK-1574) ----------------------------------------------------
