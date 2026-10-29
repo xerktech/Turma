@@ -34,8 +34,9 @@ the first draft's day sections ran 227 words against a 120 budget.
   without saying it lacks an owner (XERK-2404).
   - Haiku once credited unassigned work to a person in QA, and once in 72 runs of the old prompt on
     unassigned-work. That is too rare to show the line fixes it: it is a guard, not a proven fix.
-  - The measured effect is the second half: 57 of 60 old-prompt scripts said "no owner is recorded"
-    aloud, 0 of 60 with the line.
+  - The measured effect is the second half: on unassigned-work, 57 of 60 old-prompt scripts said
+    "no owner is recorded" aloud, 0 of 60 with the line. With an unowned blocking gate added it was
+    20 of 20 against 2 of 20, so the line reduces it rather than removing it.
   - The results table below predates the line; a one-rep Haiku pass over all 14 cases parsed clean.
 
 ## Corpus
