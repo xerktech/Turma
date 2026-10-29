@@ -90,8 +90,9 @@ host/project codenames are replaced through a private term map kept out of the r
 ## Follow-ups
 
 - **An empty `upNext` says nothing aloud.** The judge marked both models down for it on
-  empty-board and nothing-open. The page (XERK-2396) should render a "Nothing queued next" line
-  when `upNext` is `[]`. It stays a list rather than a sentence so the hub can link keys.
+  empty-board and nothing-open. So the worker fills the wire's `next` with "Nothing is queued
+  next." for an empty list (`contract-daily-brief.md`). The keys stay in the parsed brief, so the
+  parser can check them, but the merged wire carries plain text only.
 - **Up-next candidates can be work still waiting on an open gate.** `next` rows carry no
   `blockedBy`, so the model cannot tell. Suspected, not proven, so it goes on the Turma rollup
   ticket.
