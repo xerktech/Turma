@@ -136,6 +136,8 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
         mirror, retried, never a whole-value SET (XERK-2385): two replicas revoking different
         hosts in a handover otherwise lost one after its 200. An undo is a CAS back from exactly
         what it wrote, so it never sweeps away a revoke that landed since.
+      - A watch event is MERGED into the mirror (per-host max), never installed over it: the
+        PUBLISH trails its write, so an older map can arrive last and un-revoke hosts in memory.
       - `--agent-token <host>` must print the CURRENT generation; under HA it reads the shared
         store and refuses to print rather than fall back to gen 0.
       - It revokes no identity token; an explicit identity revoke (XERK-2383) should also call

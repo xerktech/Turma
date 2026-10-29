@@ -20352,6 +20352,42 @@ test("XERK-2385: a revoke racing another replica's revoke of a DIFFERENT host ke
   delete hub.nameTokenGens()[theirs];
 });
 
+test("XERK-2385: a stale watch event never un-revokes a host in memory", () => {
+  const host = "stale2385";
+  const desc = hub.__externalStores.list().find((d) => d.name === "nameTokenGens");
+  hub.__externalStores.applyExternalStoreValue(desc, { [host]: { gen: 2, at: 2 } });
+  assert.equal(hub.nameTokenGen(host), 2);
+  // An older map published late (it lacks this host) must not drop it.
+  hub.__externalStores.applyExternalStoreValue(desc, {});
+  assert.equal(hub.nameTokenGen(host), 2);
+  hub.__externalStores.applyExternalStoreValue(desc, { [host]: { gen: 1, at: 1 } });
+  assert.equal(hub.nameTokenGen(host), 2, "nor lower its generation");
+  delete hub.nameTokenGens()[host];
+});
+
+test("XERK-2385: a remote revoke installed while a revoke is saving survives it", async () => {
+  const mine = "midA2385";
+  const theirs = "midB2385";
+  const store = new FileLiveStore();
+  const cas = store.compareAndSet.bind(store);
+  store.compareAndSet = async (...a) => {
+    const ok = await cas(...a);
+    hub.nameTokenGens()[theirs] = { gen: 1, at: 1 }; // the watch installs another replica's revoke
+    return ok;
+  };
+  hub.__setLiveStore(store, true);
+  try {
+    await hub.bumpNameTokenGen(mine);
+  } finally {
+    hub.__setLiveStore(hub.liveStore, false);
+    store.close();
+  }
+  assert.equal(hub.nameTokenGen(mine), 1);
+  assert.equal(hub.nameTokenGen(theirs), 1, "merged into the mirror, not overwritten");
+  delete hub.nameTokenGens()[mine];
+  delete hub.nameTokenGens()[theirs];
+});
+
 test("XERK-2385: a revoke takes the next generation past one only the store has seen", async () => {
   const host = "ahead2385";
   const store = new FileLiveStore();

@@ -2874,9 +2874,14 @@ function coerceAgentIdentities(raw) {
 // identities: losing an entry silently UN-revokes that host's old name token.
 let nameTokenGens = coerceNameTokenGens(readJsonFile(NAME_TOKEN_GENS_FILE));
 // No persist() kept: bumpNameTokenGen writes and confirms the store itself.
+// A value from the store is MERGED in, never installed over the mirror: a watch
+// event is published after its write, so a replica's older map can arrive after
+// a newer one and would otherwise un-revoke hosts in memory (XERK-2385). The cost
+// is that a revoke answered 503 but already seen here stays revoked here.
 registerExternalStore({
   name: "nameTokenGens", file: NAME_TOKEN_GENS_FILE,
-  coerce: coerceNameTokenGens, read: () => nameTokenGens, install: (v) => { nameTokenGens = v; },
+  coerce: coerceNameTokenGens, read: () => nameTokenGens,
+  install: (v) => { nameTokenGens = mergeNameTokenGens(nameTokenGens, v); },
 });
 // Inline literals: this runs at module init. A malformed entry is dropped, which
 // reads as gen 0 — the only safe reading of a file that cannot say otherwise.
