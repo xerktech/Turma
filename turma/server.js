@@ -8567,7 +8567,9 @@ function normalizeCloseTicket(payload) {
 
 // The Daily Brief (XERK-2391) capability block: whether this host's manager runs a
 // `renderDailyBrief` command. Only a host reporting it is asked — an older agent
-// would ack the command and never answer. Coerced like normalizeCloseTicket.
+// would ack the command and never answer. Coerced like normalizeCloseTicket; the
+// agent's `runtimes`/`models` (XERK-2394) keep only known names, absent when sent none.
+const DAILY_BRIEF_CAP_LISTS = { runtimes: ["claude", "dsh", "qwen"], models: ["haiku", "sonnet"] };
 function normalizeDailyBrief(payload) {
   if (!payload || typeof payload !== "object") return;
   const t = payload.dailyBrief;
@@ -8575,7 +8577,11 @@ function normalizeDailyBrief(payload) {
     if ("dailyBrief" in payload) payload.dailyBrief = null;
     return;
   }
-  payload.dailyBrief = { available: t.available === true };
+  const out = { available: t.available === true };
+  for (const [key, known] of Object.entries(DAILY_BRIEF_CAP_LISTS)) {
+    if (Array.isArray(t[key])) out[key] = known.filter((v) => t[key].includes(v));
+  }
+  payload.dailyBrief = out;
 }
 
 // The sleeper-pause (XERK-1575) capability block: whether this host's manager

@@ -55004,5 +55004,254 @@ class TestDailyBriefPrompt(unittest.TestCase):
         self.assertEqual(ha.DAILY_BRIEF_MODEL, "haiku")
 
 
+class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):
+    """XERK-2394: the `renderDailyBrief` command, its off-beat worker (collector
+    + locked-down model, bounded retries) and the `dailyBriefResults` outbox."""
+
+    SITE = "acme.atlassian.net"
+    DATA = TestDailyBriefPrompt.DATA
+    REAL_RUNTIMES = staticmethod(ha.daily_brief_runtimes)
+
+    def _cmd(self, **over):
+        c = {"type": "renderDailyBrief", "siteKey": self.SITE, "runId": "ab12",
+             "dayFrom": 1_800_000_000_000, "weekFrom": 1_799_500_000_000,
+             "until": 1_800_050_000_000, "meetingAt": 1_800_050_300_000,
+             "model": "haiku", "runtime": "claude"}
+        c.update(over)
+        return c
+
+    def _reply(self, **over):
+        return json.dumps(TestDailyBriefPrompt._brief(TestDailyBriefPrompt(), **over))
+
+    def setUp(self):
+        super().setUp()
+        self.sm = self.make_manager()
+        for name, value in (("daily_brief_runtimes", lambda: ["claude"]),
+                            ("board_configured", lambda: True),
+                            ("board_site_key", lambda: self.SITE),
+                            ("DAILY_BRIEF_RETRY_BACKOFF_SEC", 0)):
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.collected = []
+
+        def collect(day_from, week_from, until, projects):
+            self.collected.append((day_from, week_from, until))
+            return dict(self.DATA)
+        p = mock.patch.object(ha, "collect_daily_brief_data", side_effect=collect)
+        self.collect = p.start()
+        self.addCleanup(p.stop)
+        self.replies = []
+        self.argvs = []
+
+        def oneshot(argv, prefix, timeout, reply_max, what):
+            self.argvs.append(argv)
+            return self.replies.pop(0) if self.replies else None
+        p = mock.patch.object(self.sm, "_run_lockdown_oneshot", side_effect=oneshot)
+        p.start()
+        self.addCleanup(p.stop)
+        # Never start the real worker: the stage is inspected and run inline.
+        p = mock.patch.object(self.sm, "_daily_brief_tick")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _drain(self):
+        """Run the worker's inner loop once, inline."""
+        while self.sm._dbrief_wants:
+            job = self.sm._dbrief_wants.pop(next(iter(self.sm._dbrief_wants)))
+            self.sm._dbrief_push(job, *self.sm._run_daily_brief(job))
+        return self.sm.daily_brief_results
+
+    # ---- validation and staging --------------------------------------------
+
+    def test_validation(self):
+        job, err = ha.validate_daily_brief_command(self._cmd())
+        self.assertIsNone(err)
+        self.assertEqual((job["model"], job["runtime"], job["runId"]), ("haiku", "claude", "ab12"))
+        self.assertEqual(ha.validate_daily_brief_command(self._cmd(model="auto"))[0]["model"], "haiku")
+        for bad in ({"runId": "AB12"}, {"runId": "x" * 33}, {"runId": 7}, {"siteKey": ""},
+                    {"siteKey": "s" * 201}):
+            job, err = ha.validate_daily_brief_command(self._cmd(**bad))
+            self.assertIsNone(job, bad)
+            self.assertTrue(err)
+        for bad in ({"dayFrom": True}, {"until": 1.5}, {"meetingAt": -1}, {"weekFrom": 2 ** 53},
+                    {"dayFrom": 1_800_060_000_000}, {"weekFrom": 1_800_000_000_001},
+                    {"model": "opus"}, {"runtime": "gemini"}):
+            job, err = ha.validate_daily_brief_command(self._cmd(**bad))
+            self.assertTrue(job["reportable"] and err, bad)
+        self.assertEqual(ha.validate_daily_brief_command("x"), (None, "not a command object"))
+
+    def test_handle_commands_stages_without_running(self):
+        self.sm.handle_commands([dict(self._cmd(), cmdId="c1")])
+        self.assertEqual(list(self.sm._dbrief_wants), [self.SITE])
+        self.assertEqual(self.argvs, [])
+        self.assertEqual(self.collected, [])
+
+    def test_a_newer_run_replaces_an_unrun_older_one(self):
+        self.sm._stage_daily_brief(self._cmd(runId="a1"))
+        self.sm._stage_daily_brief(self._cmd(runId="b2"))
+        self.assertEqual(self.sm._dbrief_wants[self.SITE]["runId"], "b2")
+        self.replies = [self._reply()]
+        rows = self._drain()
+        self.assertEqual([r["runId"] for r in rows], ["b2"])
+
+    def test_a_redelivered_command_runs_once(self):
+        self.sm._stage_daily_brief(self._cmd())
+        self.replies = [self._reply()]
+        self._drain()
+        self.sm._stage_daily_brief(self._cmd())
+        self.assertEqual(self.sm._dbrief_wants, {})
+        self.assertEqual(len(self.sm.daily_brief_results), 1)
+
+    def test_an_unusable_but_reportable_command_is_answered_failed(self):
+        self.sm._stage_daily_brief(self._cmd(model="opus"))
+        self.assertEqual(self.sm._dbrief_wants, {})
+        [row] = self.sm.daily_brief_results
+        self.assertEqual((row["status"], row["runId"]), ("failed", "ab12"))
+        self.assertIn("model", row["error"])
+        self.assertNotIn("day", row)
+        self.sm._stage_daily_brief(self._cmd(runId="NOPE"))
+        self.assertEqual(len(self.sm.daily_brief_results), 1)
+
+    # ---- the run ------------------------------------------------------------
+
+    def test_a_good_reply_is_an_ok_row_in_the_contract_shape(self):
+        self.sm._stage_daily_brief(self._cmd(model="sonnet"))
+        self.replies = [self._reply(stillOpen="XERK-3 waits on XERK-9.")]
+        [row] = self._drain()
+        self.assertEqual(row, {
+            "runId": "ab12", "siteKey": self.SITE, "status": "ok", "model": "sonnet",
+            "day": "Ann finished one fix. XERK-3 waits on XERK-9.",
+            "week": "A quiet week.", "next": "Do five next. Then six."})
+        # The windows reach the collector as aware UTC datetimes.
+        day, week, until = self.collected[0]
+        self.assertEqual(int(day.timestamp() * 1000), 1_800_000_000_000)
+        self.assertEqual(week.tzinfo, datetime.timezone.utc)
+        self.assertEqual(int(until.timestamp() * 1000), 1_800_050_000_000)
+        # The locked-down argv: model, no tools / MCP / non-user settings, prompt last.
+        argv = self.argvs[0]
+        self.assertEqual(argv[:4], ["claude", "-p", "--model", "sonnet"])
+        for flag in ha.ATTENTION_HINT_LOCKDOWN:
+            self.assertIn(flag, argv)
+        self.assertTrue(argv[-1].startswith(ha.DAILY_BRIEF_INSTRUCTION))
+        self.assertIn('"counts"', argv[-1])
+
+    def test_an_empty_up_next_says_nothing_is_queued(self):
+        self.DATA = dict(self.DATA, next=[])
+        self.sm._stage_daily_brief(self._cmd())
+        self.replies = [self._reply(upNext=[])]
+        [row] = self._drain()
+        self.assertEqual(row["next"], ha.DAILY_BRIEF_NOTHING_NEXT)
+
+    def test_a_malformed_reply_is_retried_then_ok(self):
+        self.sm._stage_daily_brief(self._cmd())
+        self.replies = ["Sure! Here is your standup: - item", self._reply()]
+        [row] = self._drain()
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(len(self.argvs), 2)
+        self.assertEqual(len(self.collected), 1)  # collected once, not per attempt
+
+    def test_malformed_or_timed_out_every_attempt_is_failed(self):
+        for replies in (["no json", '{"sinceYesterday": "x"}'], [None, None]):
+            self.sm.daily_brief_results.clear()
+            self.sm._dbrief_seen.clear()
+            self.argvs.clear()
+            self.sm._stage_daily_brief(self._cmd())
+            self.replies = list(replies)
+            [row] = self._drain()
+            self.assertEqual(row["status"], "failed")
+            self.assertIn("no usable brief", row["error"])
+            self.assertEqual(len(self.argvs), ha.DAILY_BRIEF_MAX_ATTEMPTS)
+
+    def test_a_runtime_without_a_locked_down_one_shot_fails_clearly(self):
+        for runtime in ("dsh", "qwen"):
+            self.sm._stage_daily_brief(self._cmd(runId={"dsh": "d1", "qwen": "e1"}[runtime], runtime=runtime))
+            [row] = self._drain()[-1:]
+            self.assertEqual(row["status"], "failed")
+            self.assertIn(runtime, row["error"])
+        self.assertEqual(self.argvs, [])
+
+    def test_a_login_needing_renewal_fails_and_hides_the_capability(self):
+        with mock.patch.object(ha, "daily_brief_runtimes", lambda: []):
+            self.sm._stage_daily_brief(self._cmd())
+            [row] = self._drain()
+            self.assertEqual(row["status"], "failed")
+            self.assertIn("claude /login", row["error"])
+            self.assertEqual(self.sm._daily_brief_payload()["available"], False)
+        with mock.patch.object(ha, "claude_auth_status", lambda: {"needsLogin": True}):
+            self.assertEqual(self.REAL_RUNTIMES(), [])
+        with mock.patch.object(ha, "claude_auth_status", lambda: {"needsLogin": False}):
+            self.assertEqual(self.REAL_RUNTIMES(), ["claude"])
+        self.assertEqual(self.sm._daily_brief_payload(),
+                         {"available": True, "runtimes": ["claude"], "models": ["haiku", "sonnet"]})
+        self.assertEqual(self.argvs, [])
+
+    def test_another_orgs_brief_or_a_failed_collect_is_failed(self):
+        self.sm._stage_daily_brief(self._cmd(siteKey="other.atlassian.net"))
+        self.collect.side_effect = urllib.error.URLError("down")
+        self.sm._stage_daily_brief(self._cmd(runId="c2"))
+        rows = self._drain()
+        self.collect.side_effect = None
+        self.collect.return_value = None
+        self.sm._stage_daily_brief(self._cmd(runId="c3"))
+        rows = self._drain()
+        self.assertEqual([r["status"] for r in rows], ["failed"] * 3)
+        self.assertIn("does not serve", rows[0]["error"])
+        self.assertIn("collecting tickets failed", rows[1]["error"])
+        self.assertIn("no ticket scope", rows[2]["error"])
+        self.assertEqual(self.argvs, [])
+
+    def test_a_worker_crash_is_a_failed_row(self):
+        with mock.patch.object(self.sm, "_run_daily_brief", side_effect=RuntimeError("boom")):
+            self.sm._stage_daily_brief(self._cmd())
+            self.sm._dbrief_wake.set()
+            t = threading.Thread(target=self.sm._daily_brief_worker_loop, daemon=True)
+            t.start()
+            deadline = time.time() + 5
+            while not self.sm.daily_brief_results and time.time() < deadline:
+                time.sleep(0.01)
+        [row] = self.sm.daily_brief_results
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("boom", row["error"])
+
+    # ---- the outbox ---------------------------------------------------------
+
+    def test_the_outbox_is_bounded_and_cleared_by_identity(self):
+        for i in range(ha.DAILY_BRIEF_RESULTS_MAX + 2):
+            self.sm._dbrief_push({"runId": f"{i:x}", "siteKey": self.SITE}, error="x")
+        self.assertEqual(len(self.sm.daily_brief_results), ha.DAILY_BRIEF_RESULTS_MAX)
+        self.assertEqual(self.sm.daily_brief_results[0]["runId"], "2")
+        payload = {"dailyBriefResults": list(self.sm.daily_brief_results[:2])}
+        late = self.sm.daily_brief_results[0]
+        self.sm._clear_delivered_staged(payload)
+        self.assertEqual(len(self.sm.daily_brief_results), ha.DAILY_BRIEF_RESULTS_MAX - 2)
+        self.assertNotIn(late, self.sm.daily_brief_results)
+
+    def test_the_heartbeat_carries_the_rows_and_the_capability(self):
+        self.sm._dbrief_push({"runId": "ab", "siteKey": self.SITE, "model": "haiku"},
+                             texts={"day": "d", "week": "w", "next": "n"})
+        payload = self.sm.build_payload(1, light=True)
+        self.assertEqual(payload["dailyBriefResults"][0]["runId"], "ab")
+        self.assertEqual(payload["dailyBrief"]["available"], True)
+
+    # ---- the shared cleaner -------------------------------------------------
+
+    def test_the_cleaner_vectors_and_fixed_point(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "daily_brief_clean_vectors.json")
+        with open(path, encoding="utf-8") as f:
+            spec = json.load(f)
+        self.assertEqual(spec["cap"], ha.DAILY_BRIEF_WIRE_TEXT_MAX)
+        self.assertGreater(len(spec["vectors"]), 15)
+        for raw, want in spec["vectors"]:
+            self.assertEqual(ha.clean_daily_brief_text(raw), want, raw)
+            self.assertEqual(ha.clean_daily_brief_text(want), want, want)
+        long = "word " * 600
+        out = ha.clean_daily_brief_text(long)
+        self.assertLessEqual(len(out), ha.DAILY_BRIEF_WIRE_TEXT_MAX)
+        self.assertTrue(out.endswith("word…"))
+        self.assertEqual(ha.clean_daily_brief_text(out), out)
+
+
 if __name__ == "__main__":
     unittest.main()
