@@ -5578,6 +5578,19 @@ test("XERK-314: /api and /term reads do NOT get Allow-Credentials", async () => 
   }
 });
 
+// XERK-2399: no other site may frame the hub (clickjacking). /term/* is exempt:
+// the glasses WebView frames a session's terminal cross-origin.
+test("XERK-2399: hub pages refuse cross-origin framing; /term stays frameable", async () => {
+  for (const path of ["/", "/login", "/api/agents", "/healthz"]) {
+    const res = await request("GET", path, { headers: userHeaders });
+    assert.equal(res.headers["content-security-policy"], "frame-ancestors 'self'", path);
+    assert.equal(res.headers["x-frame-options"], "SAMEORIGIN", path);
+  }
+  const term = await request("GET", "/term/whatever/", { headers: userHeaders });
+  assert.equal(term.headers["content-security-policy"], undefined);
+  assert.equal(term.headers["x-frame-options"], undefined);
+});
+
 test("XERK-314: login and logout keep Allow-Credentials for the glasses cookie plant", async () => {
   for (const path of ["/api/login", "/api/logout"]) {
     const res = await request("OPTIONS", path, { headers: { origin: "http://glasses.local" } });

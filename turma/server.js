@@ -18666,6 +18666,16 @@ const server = http.createServer(async (req, res) => {
     stripForwardHeaders(req);
     if (dropIfClosing(req)) return;
 
+    // Clickjacking hardening (XERK-2399): no other site may frame the hub.
+    // /term/* is exempt — the glasses WebView frames a session's terminal
+    // cross-origin (hub-client.ts terminalUrl), and the dashboard's own
+    // same-origin iframe would pass 'self' anyway. XFO is for old browsers;
+    // CSP frame-ancestors wins where both are understood.
+    if (parts[0] !== "term") {
+      res.setHeader("Content-Security-Policy", "frame-ancestors 'self'");
+      res.setHeader("X-Frame-Options", "SAMEORIGIN");
+    }
+
     // No GET/HEAD/OPTIONS route reads a body, and several answer one through a raw
     // writeHead (the login redirect, static assets) that json() never sees — so a
     // large body on one is refused here, closing rather than dumped (XERK-1598).

@@ -337,6 +337,14 @@ retraction, `pushEnabled`.
     without credentials. Residual, accepted: the SAME-ORIGIN operator can still read `/token` — not an
     escalation on a single-user hub. Tests: the `XERK-314:` cases in `server.test.js`.
   - Tests: the `XERK-268:` cases in `server.test.js`.
+  - **Every response but `/term/*` carries `frame-ancestors 'self'` + `X-Frame-Options: SAMEORIGIN`**
+    (XERK-2399). `/term` is exempt because the glasses WebView frames a terminal cross-origin;
+    framing it there needs the session id plus a cookie partitioned to the embedding site.
+    Tests: `XERK-2399:` in `server.test.js`.
+  - **The WS upgrades take no Origin allowlist, by decision** (XERK-2399): the glasses WebView
+    opens `/live` + `/audio` cross-origin from a variable origin, and those take a ws-token a
+    cross-origin page cannot read (no `Allow-Credentials`). `/term` WS is cookie-authed, but the
+    HTTPS cookie is `Partitioned`, so another top-level site's socket does not carry it.
 
 ### The agent registry's ceiling (XERK-272)
 
