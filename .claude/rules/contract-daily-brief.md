@@ -57,10 +57,22 @@ ticket builds to this file; change it here first.
 - `{type:"renderDailyBrief", siteKey, runId, dayFrom, weekFrom, until, meetingAt, model, runtime}`.
   - `runId`: hub-minted `^[0-9a-f]{1,32}$`. Times: epoch ms. `model`: concrete (`"haiku"` or
     `"sonnet"`) — the hub resolves `"auto"` before sending. `runtime`: `"claude"|"dsh"|"qwen"`.
+  - **`"auto"` resolves to `"haiku"`, whatever the input size** (XERK-2393 eval: Haiku beat Sonnet
+    overall and on 40+-ticket days at 1/13 the cost; `docs/daily-brief-adr.md`).
   - Sent only to an online host DECIDED into `siteKey` that reports `dailyBrief.available === true`
     (an older agent would ack and never answer). ONE run in flight per org.
 - The agent renders off its beat (XERK-395: never inline), with a locked-down model run, and
   collects its own org-scoped tickets for the windows (XERK-2392); the hub sends no ticket data.
+- The model run is `DAILY_BRIEF_INSTRUCTION + daily_brief_input(data)`, and its reply must pass
+  `parse_daily_brief` (XERK-2393, `agent-daily-brief.md`); retry, else `failed`. That brief maps
+  onto the result row as below, each joined with a single space, in this order:
+  - `day` = `sinceYesterday` + `stillOpen`;
+  - `week` = `thisWeek`;
+  - `next` = each `upNext[].text`, or "Nothing is queued next." when the list is empty.
+  - `parse_daily_brief` refuses a brief whose joined `day` or `next` would pass 2000 chars
+    (`DAILY_BRIEF_WIRE_TEXT_MAX`), so the hub never cuts a script mid-sentence. Chars are
+    Unicode CODE POINTS on both sides: the hub must count `[...s].length`, never `s.length`
+    (UTF-16 units), or an emoji-bearing script passes here and is cut there.
 
 ## Agent → hub: the heartbeat
 
