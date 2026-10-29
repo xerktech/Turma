@@ -770,6 +770,8 @@ those are marked `[MODEL]`.
   the composer's toast today) — P2.
 - P1 `[MODEL]` Host meta (memory, uptime/last-seen, repos-root, session counts), container-log toggle.
 - P1 Host collapse persistence; Jira org label beside hostname; Remove-host for offline hosts.
+- P1 Remove + revoke token (XERK-2383, WEB ONLY): `DELETE /api/agents/<host>?identity=revoke` behind a
+  two-click button on any host card the hub marks `identityBound`, online included; Android has no Remove host at all yet.
 - P1 Token binding (XERK-578, WEB ONLY for now): the host header shows a `⚠ shared token` chip on a
   host still on the fleet master (from the served `tokenBound`; a bound host shows no chip), and
   offers a **Roll token** button on a live, unbound host reporting the `tokenRoll` capability (rolls it onto its derived token, XERK-268/284). Both

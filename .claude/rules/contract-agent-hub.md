@@ -104,15 +104,32 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
       host is offered on any briefly-offline host); a reinstall that registers first wins. Revoking
       instead locked a blipped host out for good; never releasing locked a reinstall out on strict.
     - **A released id may ONLY return home**, never rename: once a reinstall takes the name it is
-      dead, so Remove host + reinstall is the revoke path for a lost or stolen machine's token.
-      Residual: a leaked token that beats home first after a Remove keeps the host.
+      dead, so Remove host + reinstall also retires a lost or stolen machine's token.
+    - **`?identity=revoke` on that DELETE REVOKES** (XERK-2383, `revokeHostIdentities`): it deletes
+      every id whose home is the host, so its token is refused everywhere at once (heartbeat,
+      tunnel, enroll; `agentPresented` too, so no 32 MiB read) and its live tunnel is dropped. The
+      host returns only re-provisioned (`--agent-token`, then enroll mints a fresh id).
+      - 409, removing nothing, when no id lives there: a name or master token cannot be revoked
+        per host, and a Remove that left it working would read as done. 404 for no such host,
+        400 for any other `identity=` value (a typo must not quietly do a plain Remove).
+      - **A renamed agent's id becomes a `revoked` TOMBSTONE, never deleted, while its origin name
+        is retired**: `identityOf` ignores it, `nameTokenRefusal` still sees it. Deleting it
+        un-retired the OLD name's token, so revoking the new name re-opened the old one (QA).
+        A plain Remove of the origin name drops the tombstone, as it releases any name.
+        `trimAgentIdentities` never evicts one, and a master enroll for that name mints afresh.
+      - The revoked host's OWN name token is un-retired on purpose (it is the re-provision path).
+        Name tokens are deterministic, so one the machine ever held works again: residual.
+      - Written through to disk before the 200 (the file store debounces 5s; a kill lost it).
+      - `identityBound` (hub-derived, only `true` sent, forged copy stripped) gates the button.
+      - Never make it Remove's default: it locks a briefly offline host out (the XERK-2381 bug).
     - An id the hub does not know is told to re-provision (`--agent-token`), never re-issued.
     - A beat that renames carries the old record over (commands, org binding, alerts), drops every
       other record bound to the id (HA ghosts too), re-points ticket pins, appends `formerNames`.
     - Hub-owned, never served: `agentUid`, `uidBound` (ttydAuth's which-token), `formerNames`;
       a `setToken` command's token is stripped from the served `commands` (`servedCommands`).
     - `hostAgentToken` refuses the `uid:` namespace so a host name never collides with an id.
-    - Tests: the `XERK-2381:` cases in `server.test.js` + `usage-ledger.test.js`, `TestSetToken`.
+    - Tests: the `XERK-2381:`/`XERK-2383:` cases in `server.test.js` + `usage-ledger.test.js`,
+      `TestSetToken`, `XERK-2383` in `dashboard-tiles.test.js`.
   - **Onboarding onto that derived token is ONE action, not a per-host ritual** (XERK-578): the
     hub roll route + agent enroll endpoint, spanning hub + agent + native. Never re-key the enroll
     endpoint on a caller-named device for a PROVED caller. Mechanics: `agent-token-onboarding.md`.
