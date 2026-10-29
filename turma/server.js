@@ -12945,10 +12945,15 @@ async function oidcExchangeCode(disco, code, verifier) {
 // Only local, same-origin paths are allowed as the post-login `next`, so the
 // login flow can never be turned into an open redirect. Anything else → "/".
 function oidcSafeNext(next) {
-  if (typeof next !== "string" || !next.startsWith("/") || next.startsWith("//") || next.startsWith("/\\")) {
-    return "/";
-  }
-  return next;
+  if (typeof next !== "string" || !next.startsWith("/")) return "/";
+  // Resolve it as a browser would: the URL parser drops tab/CR/LF and reads "\"
+  // as "/", so "/\t/evil" and "/\\evil" both become another host. Prefix checks
+  // on the raw string miss those (XERK-2399).
+  let u;
+  try { u = new URL(next, "http://next.invalid"); } catch { return "/"; }
+  // A dot segment can normalize to "//host" ("/.//evil"), which is protocol-relative.
+  if (u.origin !== "http://next.invalid" || u.pathname.startsWith("//")) return "/";
+  return u.pathname + u.search + u.hash;
 }
 
 // The origin the hub is reached at, derived from the redirect URI, for building
