@@ -52,7 +52,7 @@ let orgKeys = [];
 // update() has seen the sites the data names); null = the plain stub above.
 let orgHooks = null;
 
-function loadHelpers(fetchReply = null, hash = "#permissions") {
+function loadHelpers(fetchReply = null, hash = "#permissions", storage = null) {
   const els = {};
   const sse = [];
   const fetches = [];
@@ -71,7 +71,7 @@ function loadHelpers(fetchReply = null, hash = "#permissions") {
   };
   const stubs = {
     document,
-    localStorage: {
+    localStorage: storage || {
       _m: {},
       getItem(k) { return this._m[k] ?? null; },
       setItem(k, v) { this._m[k] = String(v); },
@@ -119,7 +119,7 @@ function loadHelpers(fetchReply = null, hash = "#permissions") {
   };
   const keys = Object.keys(stubs);
   const body = `${script}\n;return { render, refresh, paneOf, PANES, getPane: () => pane,
-    decisionsHtml, renderDecisions, drafts, syncPermissionsScope,
+    decisionsHtml, renderDecisions, drafts, syncPermissionsScope, toggleCollapsed,
     modelQualityCardHtml, refreshModelQuality, syncModelQualityScope, mqBadRate, mqOrdered, getMqView: () => mqView,
     permissionsCardHtml, refreshPermissions, getPermView: () => permView, setCache: (c) => { cache = c; }, getCache: () => cache };`;
   // `els` rides along so the render-level tests can reach the containers the
@@ -230,6 +230,30 @@ test("XERK-2386: a decisions card names its org as the hosts report it, not the 
   P.renderDecisions({ agents: [{ org: "acme.atlassian.net", jira: { siteKey: "acme.atlassian.net", orgName: "Acme Corp" } }],
     decisions: { "acme.atlassian.net": [{ at: 1000, source: "note", text: "n" }] } }, 5000);
   assert.match(P.els.decisionsLog.innerHTML, /<span class="dec-org-name">Acme Corp <span class="n">1<\/span>/);
+});
+
+test("XERK-2386: an org's decisions card collapses to its heading, and stays so across repaints and loads", () => {
+  const data = { agents: [{ org: "a.net" }], decisions: { "a.net": [{ at: 1000, source: "note", text: "keep me" }] } };
+  const P = loadHelpers(null, "");
+  P.renderDecisions(data, 5000);
+  assert.match(P.els.decisionsLog.innerHTML, /data-collapse="a\.net" aria-expanded="true"/);
+  assert.match(P.els.decisionsLog.innerHTML, /keep me/);
+  P.toggleCollapsed("a.net");
+  P.renderDecisions(data, 5000);
+  const shut = P.els.decisionsLog.innerHTML;
+  assert.match(shut, /class="dec-org collapsed"/);
+  assert.match(shut, /aria-expanded="false"/);
+  assert.equal(shut.includes("keep me"), false, "a collapsed card shows its heading only");
+  assert.equal(shut.includes("data-note="), false);
+  // A fresh load reads the viewer's choice back from browser storage.
+  const Q = loadHelpers(null, "", P.stubs.localStorage);
+  Q.renderDecisions(data, 5000);
+  assert.match(Q.els.decisionsLog.innerHTML, /class="dec-org collapsed"/);
+  // Storage that throws (a private window) still renders, expanded.
+  const R = loadHelpers(null, "", { getItem() { throw new Error("blocked"); }, setItem() { throw new Error("blocked"); } });
+  R.renderDecisions(data, 5000);
+  assert.match(R.els.decisionsLog.innerHTML, /keep me/);
+  R.toggleCollapsed("a.net");
 });
 
 // --- Decisions (XERK-1574) -------------------------------------------------------

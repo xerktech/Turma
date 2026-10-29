@@ -141,6 +141,14 @@
   .dec-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
   .dec-org-name { font-family: var(--font-display); font-size: 18px; font-weight: 600; }
   .dec-org-name .n { color: var(--muted); font-weight: 400; font-size: 15px; }
+  /* The whole heading is the collapse toggle; a collapsed card is its heading alone. */
+  .dec-toggle {
+    display: flex; align-items: baseline; gap: 8px; width: 100%; padding: 0; border: 0;
+    background: none; color: inherit; font: inherit; text-align: left; cursor: pointer;
+  }
+  .dec-toggle .chev { color: var(--muted); font-size: 12px; transition: transform 0.15s; }
+  .dec-org.collapsed .dec-toggle .chev { transform: rotate(-90deg); }
+  .dec-org.collapsed .dec-head { margin-bottom: 0; }
   .dec-when { color: var(--muted); font-size: 12px; }
   .dec-list { list-style: none; margin: 0; padding: 0; }
   .dec-item { border-top: 1px solid var(--hairline); padding: 6px 0; font-size: 13px; min-width: 0; }
@@ -311,6 +319,18 @@ addEventListener("hashchange", () => {
 const $decisions = document.getElementById("decisionsLog");
 const noteBusy = new Set();   // orgs with a decision note in flight
 const drafts = new Map();     // org -> the note being typed (survives a repaint)
+// Orgs whose card the viewer collapsed. A per-viewer convenience, so browser
+// storage — which can be absent or throw (a private window), hence the guards.
+const COLLAPSED_KEY = "turma.insights.decisionsCollapsed";
+const collapsed = new Set();
+try {
+  const v = JSON.parse(localStorage.getItem(COLLAPSED_KEY) || "[]");
+  if (Array.isArray(v)) for (const s of v) if (typeof s === "string") collapsed.add(s);
+} catch { /* start expanded */ }
+function toggleCollapsed(site) {
+  if (collapsed.has(site)) collapsed.delete(site); else collapsed.add(site);
+  try { localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...collapsed])); } catch { /* this page load only */ }
+}
 // An age in the decisions log: seconds, minutes below the hour, hours to two
 // days, then days.
 function dur(ms) {
@@ -375,9 +395,12 @@ function decisionsHtml(site, list, now, live, count, name) {
       + ` placeholder="Record a decision for this org…" value="${esc(drafts.get(site) || "")}">`
       + `<button type="submit"${noteBusy.has(site) ? " disabled" : ""}>${noteBusy.has(site) ? "Adding…" : "Add"}</button></form>`
     : `<div class="dec-when">no host in this org</div>`;
-  return `<section class="dec-org"><div class="dec-head">`
-    + `<span class="dec-org-name">${esc(name || site)} <span class="n">${total}</span></span>`
-    + `</div>${body}${form}</section>`;
+  const shut = collapsed.has(site);
+  return `<section class="dec-org${shut ? " collapsed" : ""}"><div class="dec-head">`
+    + `<button type="button" class="dec-toggle" data-collapse="${esc(site)}" aria-expanded="${!shut}">`
+    + `<span class="chev" aria-hidden="true">▼</span>`
+    + `<span class="dec-org-name">${esc(name || site)} <span class="n">${total}</span></span></button>`
+    + `</div>${shut ? "" : body + form}</section>`;
 }
 function renderDecisions(data, now) {
   const decs = data.decisions && typeof data.decisions === "object" ? data.decisions : {};
@@ -434,6 +457,12 @@ async function addNote(site) {
 $decisions.addEventListener("input", (e) => {
   const site = e.target.dataset && e.target.dataset.noteInput;
   if (site !== undefined) drafts.set(site, e.target.value);
+});
+$decisions.addEventListener("click", (e) => {
+  const btn = e.target.closest && e.target.closest("[data-collapse]");
+  if (!btn) return;
+  toggleCollapsed(btn.dataset.collapse);
+  if (cache) render(cache);
 });
 $decisions.addEventListener("submit", (e) => {
   const form = e.target.closest("[data-note]");

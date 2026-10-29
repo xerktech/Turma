@@ -69,6 +69,10 @@ paths:
   no host is in it (`decidedOrgs`); nothing else removes a store key.
 - **Surface**: the Insights page's Decisions sub-page (`decisionsHtml`): one card per org, newest
   first, the note box for a live org; a draft survives repaints via `drafts` + a focus restore.
+  - The heading names the org as every page does: `TurmaBoard.orgName(site, <mergeSites orgName>)`
+    — the hosts' `BOARD_ORG_NAME` first, never the site key alone.
+  - Each card collapses to its heading (`collapsed`, kept per viewer in `localStorage`, guarded:
+    storage can be absent or throw, and the page then starts expanded).
   - A row's meta names its session (`label`, clipped to `DECISION_LABEL_MAX` 60) — the only tie
     back for an answer with no ticket.
   - **Each meta piece is unbreakable** (`.bit`) and **the "·" ENDS the piece before it** (`.sep`),
