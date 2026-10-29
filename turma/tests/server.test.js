@@ -108,6 +108,7 @@ process.env.ORG_COLORS_FILE = path.join(
 process.env.AUTOMERGE_ORGS_FILE = path.join(scratchDir(), `turma-test-automerge-orgs-${process.pid}.json`);
 process.env.DECISIONS_FILE = path.join(scratchDir(), `turma-test-decisions-${process.pid}.json`);
 process.env.DAILY_BRIEF_SCHEDULES_FILE = path.join(scratchDir(), `turma-test-daily-brief-schedules-${process.pid}.json`);
+process.env.DAILY_BRIEFS_FILE = path.join(scratchDir(), `turma-test-daily-briefs-${process.pid}.json`);
 process.env.DEDUPE_LINK_ORGS_FILE = path.join(scratchDir(), `turma-test-dedupe-link-orgs-${process.pid}.json`);
 process.env.EPIC_BUILDERS_FILE = path.join(scratchDir(), `turma-test-epic-builders-${process.pid}.json`);
 process.env.EPIC_RUNS_FILE = path.join(scratchDir(), `turma-test-epic-runs-${process.pid}.json`);
