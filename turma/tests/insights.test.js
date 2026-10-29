@@ -52,7 +52,7 @@ let orgKeys = [];
 // update() has seen the sites the data names); null = the plain stub above.
 let orgHooks = null;
 
-function loadHelpers(fetchReply = null, hash = "#permissions") {
+function loadHelpers(fetchReply = null, hash = "#permissions", storage = null, board = null) {
   const els = {};
   const sse = [];
   const fetches = [];
@@ -71,7 +71,7 @@ function loadHelpers(fetchReply = null, hash = "#permissions") {
   };
   const stubs = {
     document,
-    localStorage: {
+    localStorage: storage || {
       _m: {},
       getItem(k) { return this._m[k] ?? null; },
       setItem(k, v) { this._m[k] = String(v); },
@@ -113,13 +113,13 @@ function loadHelpers(fetchReply = null, hash = "#permissions") {
     TurmaOrg: { get: () => (orgKeys.length === 1 ? orgKeys[0] : ""), getKeys: () => (orgHooks ? orgHooks.getKeys() : orgKeys),
       update: (d) => { if (orgHooks) orgHooks.update(d); }, filter: (a) => orgFilter(a),
       subscribe: noop, sse: noop, orgColors: () => ({}) },
-    TurmaBoard: { orgName: (k, o) => o || k, orgColorMap: () => ({}),
+    TurmaBoard: board || { orgName: (k, o) => o || k, orgColorMap: () => ({}),
       mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
   };
   const keys = Object.keys(stubs);
   const body = `${script}\n;return { render, refresh, paneOf, PANES, getPane: () => pane,
-    decisionsHtml, renderDecisions, drafts, syncPermissionsScope,
+    decisionsHtml, renderDecisions, drafts, syncPermissionsScope, toggleCollapsed,
     modelQualityCardHtml, refreshModelQuality, syncModelQualityScope, mqBadRate, mqOrdered, getMqView: () => mqView,
     permissionsCardHtml, refreshPermissions, getPermView: () => permView, setCache: (c) => { cache = c; }, getCache: () => cache };`;
   // `els` rides along so the render-level tests can reach the containers the
@@ -223,6 +223,159 @@ test("XERK-2386: a first visit to a card fetches it once; a return to Model qual
   go("#decisions");
   go("#model-quality");
   assert.equal(count("/api/model-quality"), 2, "coming back refetches");
+});
+
+test("XERK-2386: a decisions card names its org as the hosts report it, not the derived name", () => {
+  const P = loadHelpers(null, "");
+  P.renderDecisions({ agents: [{ org: "acme.atlassian.net", jira: { siteKey: "acme.atlassian.net", orgName: "Acme Corp" } }],
+    decisions: { "acme.atlassian.net": [{ at: 1000, source: "note", text: "n" }] } }, 5000);
+  assert.match(P.els.decisionsLog.innerHTML, /<span class="dec-org-name">Acme Corp <span class="n">1<\/span>/);
+});
+
+test("XERK-2386: a decisions card names a split org as the header does, escaped (real board.js)", () => {
+  const board = require("../public/board.js");
+  const site = "acme.atlassian.net";
+  const host = (device, orgName, online) => ({ device, org: site, online,
+    jira: { siteKey: site, user: `${device}@x.com`, orgName, fetchedAt: "2026-10-29T12:00:00Z", tickets: [] } });
+  // The offline host first and the online one last, so neither "first host wins"
+  // nor "last host wins" can stand in for mergeSites' online-first rule.
+  const agents = [host("acme-b", "Acme Corp", false), host("acme-a", "Acme <img src=x onerror=alert(1)>", true),
+    host("acme-c", "Acme Old", false)];
+  const header = board.orgName(site, board.mergeSites(agents).find((s) => s.siteKey === site).orgName);
+  const P = loadHelpers(null, "", null, board);
+  P.renderDecisions({ agents, decisions: { [site]: [{ at: 1000, source: "note", text: "n" }] } }, 5000);
+  const html = P.els.decisionsLog.innerHTML;
+  const shown = html.match(/<span class="dec-org-name">(.*?) <span class="n">/)[1];
+  assert.equal(shown, header.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+  assert.equal(html.includes("<img"), false);
+});
+
+test("XERK-2386: an org's decisions card collapses to its heading, and stays so across repaints and loads", () => {
+  const data = { agents: [{ org: "a.net" }], decisions: { "a.net": [{ at: 1000, source: "note", text: "keep me" }] } };
+  const P = loadHelpers(null, "");
+  P.renderDecisions(data, 5000);
+  assert.match(P.els.decisionsLog.innerHTML, /data-collapse="a\.net" aria-expanded="true"/);
+  assert.match(P.els.decisionsLog.innerHTML, /keep me/);
+  P.toggleCollapsed("a.net");
+  P.renderDecisions(data, 5000);
+  const shut = P.els.decisionsLog.innerHTML;
+  assert.match(shut, /class="dec-org collapsed"/);
+  assert.match(shut, /aria-expanded="false"/);
+  assert.equal(shut.includes("keep me"), false, "a collapsed card shows its heading only");
+  assert.equal(shut.includes("data-note="), false);
+  // A fresh load reads the viewer's choice back from browser storage.
+  const Q = loadHelpers(null, "", P.stubs.localStorage);
+  Q.renderDecisions(data, 5000);
+  assert.match(Q.els.decisionsLog.innerHTML, /class="dec-org collapsed"/);
+  // Storage that throws (a private window) still renders, expanded.
+  const R = loadHelpers(null, "", { getItem() { throw new Error("blocked"); }, setItem() { throw new Error("blocked"); } });
+  R.renderDecisions(data, 5000);
+  assert.match(R.els.decisionsLog.innerHTML, /keep me/);
+  R.toggleCollapsed("a.net");
+});
+
+// A storage double shared by "tabs" (page loads) the way one browser profile is.
+function memStorage(init) {
+  return { _m: init ? { "turma.insights.decisionsCollapsed": init } : {},
+    getItem(k) { return this._m[k] ?? null; }, setItem(k, v) { this._m[k] = String(v); }, removeItem(k) { delete this._m[k]; } };
+}
+const decData = (sites) => ({ agents: sites.map((s) => ({ org: s })),
+  decisions: Object.fromEntries(sites.map((s) => [s, [{ at: 1000, source: "note", text: `note-${s}` }]])) });
+
+test("XERK-2386: a keyboard toggle keeps focus on its button across the repaint", () => {
+  const P = loadHelpers(null, "");
+  const data = decData(["a.net", "b.net"]);
+  P.setCache(data);
+  P.renderDecisions(data, 5000);
+  let focused = null;
+  const log = P.els.decisionsLog;
+  log.querySelectorAll = (sel) => (sel === "[data-collapse]"
+    ? [...log.innerHTML.matchAll(/data-collapse="([^"]*)"/g)].map((m) => ({ dataset: { collapse: m[1] }, focus() { focused = m[1]; } }))
+    : []);
+  P.stubs.document.activeElement = { dataset: { collapse: "b.net" } };
+  // The click path itself (Enter/Space on a button fire click): toggles AND repaints.
+  log.listeners.click[0]({ target: { closest: (s) => (s === "[data-collapse]" ? { dataset: { collapse: "b.net" } } : null) } });
+  assert.match(log.innerHTML, /data-collapse="b\.net" aria-expanded="false"/);
+  assert.equal(focused, "b.net", "focus returns to the toggle that was used");
+  delete P.stubs.document.activeElement;
+});
+
+test("XERK-2386: a hostile org key is escaped in the toggle and kept exact in storage", () => {
+  const site = 'x"><b onmouseover=alert(1)>';
+  const html = H.decisionsHtml(site, [{ at: 1000, source: "note", text: "n" }], 5000, false, 1, "n");
+  assert.ok(html.includes('data-collapse="x&quot;&gt;&lt;b onmouseover=alert(1)&gt;"'));
+  assert.equal(html.includes("<b onmouseover"), false);
+  const st = memStorage();
+  const P = loadHelpers(null, "", st);
+  P.toggleCollapsed(site);
+  assert.deepEqual(JSON.parse(st._m["turma.insights.decisionsCollapsed"]), [site]);
+});
+
+test("XERK-2386: junk in the collapse key is ignored; only string entries count", () => {
+  for (const junk of ["not json", '{"a.net":1}', "42", "null", '"a.net"', '[1, null, {"x":1}, "a.net"]']) {
+    const P = loadHelpers(null, "", memStorage(junk));
+    P.renderDecisions(decData(["a.net", "b.net"]), 5000);
+    const html = P.els.decisionsLog.innerHTML;
+    const aShut = /class="dec-org collapsed"><div class="dec-head"><button type="button" class="dec-toggle" data-collapse="a\.net"/.test(html);
+    assert.equal(aShut, junk === '[1, null, {"x":1}, "a.net"]', junk);
+    assert.match(html, /note-b\.net/, junk);
+  }
+  // The next toggle writes back a clean string array, never the junk.
+  const st = memStorage('[1, null, {"x":1}, "a.net"]');
+  loadHelpers(null, "", st).toggleCollapsed("b.net");
+  assert.deepEqual(JSON.parse(st._m["turma.insights.decisionsCollapsed"]), ["a.net", "b.net"]);
+});
+
+test("XERK-2386: two open tabs never overwrite each other's collapse choices", () => {
+  const st = memStorage();
+  const tab1 = loadHelpers(null, "", st);
+  const tab2 = loadHelpers(null, "", st);   // loaded before tab1 toggled
+  tab1.toggleCollapsed("a.net");
+  tab2.toggleCollapsed("b.net");
+  assert.deepEqual(JSON.parse(st._m["turma.insights.decisionsCollapsed"]).sort(), ["a.net", "b.net"]);
+  // Another tab's write repaints this one (the `storage` event).
+  tab1.setCache(decData(["a.net", "b.net"]));
+  for (const fn of tab1.winListeners.storage) fn({ key: "turma.insights.decisionsCollapsed" });
+  assert.match(tab1.els.decisionsLog.innerHTML, /data-collapse="b\.net" aria-expanded="false"/);
+});
+
+test("XERK-2386: storage that reads but won't write still toggles every click", () => {
+  const st = memStorage('["a.net"]');
+  st.setItem = () => { const e = new Error("full"); e.name = "QuotaExceededError"; throw e; };
+  const P = loadHelpers(null, "", st);
+  const data = decData(["a.net"]);
+  const shut = () => { P.renderDecisions(data, 5000); return /class="dec-org collapsed"/.test(P.els.decisionsLog.innerHTML); };
+  const seen = [shut()];
+  for (let i = 0; i < 4; i++) { P.toggleCollapsed("a.net"); seen.push(shut()); }
+  assert.deepEqual(seen, [true, false, true, false, true]);
+  // Its storage is stale now, so another tab's write is not followed (this load only).
+  P.setCache(data);
+  st._m["turma.insights.decisionsCollapsed"] = "[]";
+  for (const fn of P.winListeners.storage) fn({ key: "turma.insights.decisionsCollapsed" });
+  assert.match(P.els.decisionsLog.innerHTML, /class="dec-org collapsed"/);
+});
+
+test("XERK-2386: another tab's expand or clear reaches this tab", () => {
+  const st = memStorage('["a.net","b.net"]');
+  const P = loadHelpers(null, "", st);
+  P.setCache(decData(["a.net", "b.net"]));
+  const fire = (key) => { for (const fn of P.winListeners.storage) fn({ key }); };
+  st._m["turma.insights.decisionsCollapsed"] = '["b.net"]';   // the other tab expanded a.net
+  fire("turma.insights.decisionsCollapsed");
+  assert.match(P.els.decisionsLog.innerHTML, /data-collapse="a\.net" aria-expanded="true"/);
+  delete st._m["turma.insights.decisionsCollapsed"];           // the other tab cleared storage
+  fire(null);
+  assert.match(P.els.decisionsLog.innerHTML, /data-collapse="b\.net" aria-expanded="true"/);
+});
+
+test("XERK-2386: the collapse key keeps only the most recent 100 orgs", () => {
+  const big = JSON.stringify(Array.from({ length: 5000 }, (_, i) => `o${i}.net`));
+  const st = memStorage(big);
+  const P = loadHelpers(null, "", st);
+  P.toggleCollapsed("new.net");
+  const kept = JSON.parse(st._m["turma.insights.decisionsCollapsed"]);
+  assert.equal(kept.length, 100);
+  assert.equal(kept[kept.length - 1], "new.net");
 });
 
 // --- Decisions (XERK-1574) -------------------------------------------------------
