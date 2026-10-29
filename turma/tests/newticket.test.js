@@ -133,6 +133,19 @@ test("newticket: the button is hidden until an org reports, then appears", () =>
   assert.equal(slot.children.length, 0);
 });
 
+test("newticket: the org list org.js cached shows the button at mount (XERK-2432)", () => {
+  // A page change remounts the header; without this the button popped in only
+  // after the new page's first fetch, shifting the header.
+  global.window.TurmaOrg = { cachedSites: () => [{ siteKey: "acme.atlassian.net", orgName: "", source: "jira" }] };
+  try {
+    const { slot, button } = mountNT();
+    assert.deepEqual(slot.children, [button]);
+    // The fleet's own answer still wins: no org reports, so it is pulled out.
+    NT.update({ agents: [agent("h1", null)] });
+    assert.equal(slot.children.length, 0);
+  } finally { delete global.window.TurmaOrg; }
+});
+
 test("newticket: the modal backdrop is created under the body, hidden", () => {
   const { body } = mountNT();
   assert.equal(body.children.length, 1);

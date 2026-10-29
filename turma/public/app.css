@@ -349,6 +349,15 @@ h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 }
 .nav-tabs a:hover { color: var(--accent); background: var(--accent-soft); }
 .nav-tabs a.active { color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+/* The active tab is bolder, which made it wider, so the right-aligned row (and
+   the org + New-ticket buttons left of it) moved by a pixel or two between
+   pages. Each tab stacks an invisible bold copy of its label (nav.js's
+   data-label) under the real one, so every tab is always its bold width. */
+.nav-tabs a[data-label] { display: inline-grid; }
+.nav-tabs a[data-label]::after {
+  content: attr(data-label); font-weight: 600;
+  height: 0; overflow: hidden; visibility: hidden; pointer-events: none; user-select: none;
+}
 .nav-tabs a.signout { color: var(--muted); background: none; margin-left: 6px; }
 .nav-tabs a.signout:hover { color: var(--critical); background: none; }
 .bottom-nav { display: none; }

@@ -26,7 +26,7 @@ test("nav: exactly one tab is marked active, and only the named one", () => {
   for (const p of PAGES) {
     const html = tabsHtml(p.id);
     assert.equal((html.match(/class="active"/g) || []).length, 1);
-    assert.match(html, new RegExp(`<a href="${p.href.replace("/", "\\/")}" class="active">`));
+    assert.match(html, new RegExp(`<a href="${p.href.replace("/", "\\/")}" class="active"[ >]`));
   }
   // An unknown/absent page (e.g. a page that forgot data-page) simply lights
   // nothing up rather than throwing or defaulting to Dashboard.
@@ -66,7 +66,7 @@ test("nav: the bottom nav mirrors the tab list, in order, with the same active p
   const hrefs = [...html.matchAll(/<a href="([^"]+)"/g)].map(m => m[1]);
   assert.deepEqual(hrefs, PAGES.map(p => p.href));
   assert.equal((html.match(/class="active"/g) || []).length, 1);
-  assert.match(html, /<a href="\/usage" class="active">/);
+  assert.match(html, /<a href="\/usage" class="active"[ >]/);
   for (const p of PAGES) assert.match(html, new RegExp(`>\\s*${p.label}\\s*</a>`));
 });
 
@@ -76,7 +76,7 @@ test("nav: mount fills the header and bottom-nav placeholders from the header's 
     bottomNav: { innerHTML: "" },
   };
   mount({ getElementById: id => els[id] || null });
-  assert.match(els.siteHeader.innerHTML, /<a href="\/board" class="active">Board<\/a>/);
+  assert.match(els.siteHeader.innerHTML, /<a href="\/board" class="active" data-label="Board">Board<\/a>/);
   assert.match(els.bottomNav.innerHTML, /<a href="\/board" class="active">/);
 });
 

@@ -281,9 +281,13 @@
     if (!slot) return;
     docRef = doc;
     bodyEl = doc.body || doc.documentElement;
-    // Fresh mount: nothing known about the fleet yet, button hidden until the
-    // first update() learns of an org.
-    sites = []; btnShown = false; createState = null;
+    // Fresh mount: nothing known about the fleet yet, so start from the last
+    // fleet's org list org.js cached (XERK-2432) — the button is in place on
+    // load instead of popping in after the page's first fetch. The first
+    // update() replaces it; with no cache the button waits for that update.
+    const org = typeof window !== "undefined" && window.TurmaOrg;
+    sites = (org && org.cachedSites) ? org.cachedSites() : [];
+    btnShown = false; createState = null;
 
     const holder = doc.createElement("div");
     holder.innerHTML = buttonHtml();
@@ -307,6 +311,7 @@
     (doc.body || doc.documentElement).appendChild(backdrop);
 
     btnEl.addEventListener("click", openCreate);
+    setButtonVisible(sites.length > 0);
 
     panel.addEventListener("click", (e) => {
       if (!createState) return;

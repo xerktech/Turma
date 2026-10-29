@@ -24,6 +24,12 @@ makes an `android/` change part of the same PR) live there.
   always-scrolling page doesn't sit 15px narrower than the others. The header-to-content gap is a
   **margin**, so it collapses with the first content margin; mounted synchronously at the bottom of
   `<body>`, before the page's script reads the slots.
+- **The header keeps one shape across page changes** (XERK-2432) — every navigation remounts it:
+  - `org.js` caches the last fleet's orgs (`turma-org-sites`: siteKey/orgName/source + color pins)
+    and both header slots paint from it on mount; without it they popped in after each page's first
+    fetch, growing the header and shifting the page. The menu stays shut until a real `update()`.
+  - Each tab reserves its BOLD width (`data-label` + an invisible bold `::after`), so lighting a
+    different tab can't move the right-aligned row. Don't drop the attribute or the rule.
 - **`TurmaNav.preserveScroll(container, paint)` is the one wrapper every recurring innerHTML repaint
   must go through** (XERK-35) — else the ~1s beat throws window scroll and any inner `overflow:auto`
   region back to the start every second. It snapshots window + every scrolled descendant, runs
