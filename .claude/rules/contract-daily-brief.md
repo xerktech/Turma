@@ -69,6 +69,8 @@ ticket builds to this file; change it here first.
   - `day` = `sinceYesterday` + `stillOpen`;
   - `week` = `thisWeek`;
   - `next` = each `upNext[].text`, or "Nothing is queued next." when the list is empty.
+  - Each part ends in sentence punctuation (the agent adds "." when missing), or an
+    unpunctuated `upNext` list reads aloud as one run-on sentence (XERK-2394 QA, 2 of 4 real runs).
   - `parse_daily_brief` refuses a brief whose joined `day` or `next` would pass 2000 chars
     (`DAILY_BRIEF_WIRE_TEXT_MAX`), so the hub never cuts a script mid-sentence. Chars are
     Unicode CODE POINTS on both sides: the hub must count `[...s].length`, never `s.length`
@@ -90,6 +92,7 @@ ticket builds to this file; change it here first.
     too). Add a vector there, never to one side only.
   - A command re-delivered with the same `runId` runs once; an unusable command that still names a
     valid `runId` + `siteKey` is answered `failed`, one that does not is only logged.
+  - A queued run replaced by a newer one for the same org is answered `failed` ("replaced by run …").
 - Both keys are in `HEARTBEAT_KNOWN_KEYS`. `dailyBriefResults` is deleted from the payload before
   the record is stored; the ingest (XERK-2395) accepts a row only from the host the hub asked, for
   that run, while the host is still decided into `siteKey` (XERK-348).

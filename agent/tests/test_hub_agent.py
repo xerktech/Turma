@@ -55070,7 +55070,8 @@ class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual((job["model"], job["runtime"], job["runId"]), ("haiku", "claude", "ab12"))
         self.assertEqual(ha.validate_daily_brief_command(self._cmd(model="auto"))[0]["model"], "haiku")
-        for bad in ({"runId": "AB12"}, {"runId": "x" * 33}, {"runId": 7}, {"siteKey": ""},
+        for bad in ({"runId": "AB12"}, {"runId": "x" * 33}, {"runId": 7}, {"runId": "ab\n"},
+                    {"siteKey": ""},
                     {"siteKey": "s" * 201}):
             job, err = ha.validate_daily_brief_command(self._cmd(**bad))
             self.assertIsNone(job, bad)
@@ -55094,7 +55095,9 @@ class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.sm._dbrief_wants[self.SITE]["runId"], "b2")
         self.replies = [self._reply()]
         rows = self._drain()
-        self.assertEqual([r["runId"] for r in rows], ["b2"])
+        self.assertEqual([(r["runId"], r["status"]) for r in rows],
+                         [("a1", "failed"), ("b2", "ok")])
+        self.assertIn("replaced by run b2", rows[0]["error"])
 
     def test_a_redelivered_command_runs_once(self):
         self.sm._stage_daily_brief(self._cmd())
@@ -55137,6 +55140,15 @@ class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):
         self.assertTrue(argv[-1].startswith(ha.DAILY_BRIEF_INSTRUCTION))
         self.assertIn('"counts"', argv[-1])
 
+    def test_unpunctuated_parts_read_as_separate_sentences(self):
+        self.sm._stage_daily_brief(self._cmd())
+        self.replies = [self._reply(sinceYesterday="Ann finished one fix",
+                                    upNext=[{"key": "XERK-5", "text": "Hub ingest, now unblocked"},
+                                            {"key": "XERK-6", "text": "Then six!"}])]
+        [row] = self._drain()
+        self.assertEqual(row["day"], "Ann finished one fix. XERK-3 waits on XERK-9.")
+        self.assertEqual(row["next"], "Hub ingest, now unblocked. Then six!")
+
     def test_an_empty_up_next_says_nothing_is_queued(self):
         self.DATA = dict(self.DATA, next=[])
         self.sm._stage_daily_brief(self._cmd())
@@ -55162,6 +55174,7 @@ class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):
             [row] = self._drain()
             self.assertEqual(row["status"], "failed")
             self.assertIn("no usable brief", row["error"])
+            self.assertIn("timed out" if replies[0] is None else "contract", row["error"])
             self.assertEqual(len(self.argvs), ha.DAILY_BRIEF_MAX_ATTEMPTS)
 
     def test_a_runtime_without_a_locked_down_one_shot_fails_clearly(self):
@@ -55201,6 +55214,36 @@ class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):
         self.assertIn("collecting tickets failed", rows[1]["error"])
         self.assertIn("no ticket scope", rows[2]["error"])
         self.assertEqual(self.argvs, [])
+
+    def test_the_beat_re_arms_a_dead_worker_while_a_brief_is_owed(self):
+        tick = ha.SessionManager._daily_brief_tick
+        started = []
+
+        class FakeThread:
+            def __init__(self, target, name, daemon):
+                self.alive = False
+
+            def start(self):
+                started.append(self)
+                self.alive = True
+
+            def is_alive(self):
+                return self.alive
+        with mock.patch.object(ha.threading, "Thread", FakeThread):
+            tick(self.sm)                     # nothing owed: no worker
+            self.assertEqual(started, [])
+            self.sm._stage_daily_brief(self._cmd())
+            tick(self.sm)
+            self.assertEqual(len(started), 1)
+            tick(self.sm)                     # alive: not started twice
+            self.assertEqual(len(started), 1)
+            started[0].alive = False          # it died
+            tick(self.sm)
+            self.assertEqual(len(started), 2)
+        self.assertTrue(self.sm._dbrief_wake.is_set())
+        with mock.patch.object(ha.threading, "Thread", side_effect=RuntimeError("pids")):
+            self.sm._dbrief_worker = None
+            tick(self.sm)                     # never raises onto the beat
 
     def test_a_worker_crash_is_a_failed_row(self):
         with mock.patch.object(self.sm, "_run_daily_brief", side_effect=RuntimeError("boom")):

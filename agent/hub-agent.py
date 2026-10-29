@@ -24770,7 +24770,7 @@ def validate_daily_brief_command(cmd):
     if not isinstance(cmd, dict):
         return None, "not a command object"
     run_id, site = cmd.get("runId"), cmd.get("siteKey")
-    if not (isinstance(run_id, str) and _DAILY_BRIEF_RUN_ID_RE.match(run_id)):
+    if not (isinstance(run_id, str) and _DAILY_BRIEF_RUN_ID_RE.fullmatch(run_id)):
         return None, "runId is not 1-32 lowercase hex characters"
     if not (isinstance(site, str) and 0 < len(site) <= 200):
         return None, "siteKey is not a 1-200 character string"
@@ -24850,15 +24850,25 @@ def clean_daily_brief_text(text, cap=DAILY_BRIEF_WIRE_TEXT_MAX):
     return s
 
 
+def _daily_brief_sentence(text):
+    """`text` ending in sentence punctuation, so joined parts read aloud as
+    separate sentences: models often leave a short upNext entry unpunctuated."""
+    t = text.strip()
+    return t if not t or t[-1] in ".!?…" else t + "."
+
+
 def daily_brief_row(brief):
     """A parsed brief -> the wire row's three texts (contract-daily-brief.md):
     day = sinceYesterday + stillOpen, week = thisWeek, next = each upNext text
-    or DAILY_BRIEF_NOTHING_NEXT, each joined with one space and cleaned."""
+    or DAILY_BRIEF_NOTHING_NEXT, each part punctuated, joined with one space
+    and cleaned."""
+    def join(parts):
+        return clean_daily_brief_text(" ".join(_daily_brief_sentence(p) for p in parts))
     nxt = [e["text"] for e in brief.get("upNext") or []]
     return {
-        "day": clean_daily_brief_text(brief["sinceYesterday"] + " " + brief["stillOpen"]),
-        "week": clean_daily_brief_text(brief["thisWeek"]),
-        "next": clean_daily_brief_text(" ".join(nxt) if nxt else DAILY_BRIEF_NOTHING_NEXT),
+        "day": join([brief["sinceYesterday"], brief["stillOpen"]]),
+        "week": join([brief["thisWeek"]]),
+        "next": join(nxt or [DAILY_BRIEF_NOTHING_NEXT]),
     }
 
 
@@ -43283,7 +43293,9 @@ class SessionManager:
             self._dbrief_push(job, error=error)
             return
         if old is not None:
+            # Answered, so a hub waiting on the older run is never left hanging.
             log(f"daily brief: run {old['runId']} replaced by {job['runId']} before it ran")
+            self._dbrief_push(old, error=f"replaced by run {job['runId']} before it ran")
         self._daily_brief_tick()
 
     def _daily_brief_tick(self):
@@ -43346,19 +43358,25 @@ class SessionManager:
             return None, "no ticket scope on this host (its board lists no projects)"
         argv = ["claude", "-p", "--model", job["model"], *ATTENTION_HINT_LOCKDOWN,
                 DAILY_BRIEF_INSTRUCTION + daily_brief_input(data)]
+        why = "the brief's text cleaned to nothing"
         for attempt in range(1, DAILY_BRIEF_MAX_ATTEMPTS + 1):
             if attempt > 1:
                 time.sleep(DAILY_BRIEF_RETRY_BACKOFF_SEC * (attempt - 1))
             raw = self._run_lockdown_oneshot(argv, "daily-brief-", DAILY_BRIEF_TIMEOUT_SEC,
                                              DAILY_BRIEF_REPLY_MAX, "daily brief")
+            if raw is None:
+                why = "the model run failed or timed out"
             brief = parse_daily_brief(raw, data) if raw is not None else None
+            if raw is not None and brief is None:
+                why = "the model's reply broke the brief's contract"
             if brief is not None:
                 texts = daily_brief_row(brief)
                 if all(texts.values()):
                     return texts, None
             log(f"daily brief: attempt {attempt}/{DAILY_BRIEF_MAX_ATTEMPTS} for run "
                 f"{job['runId']} gave no usable brief")
-        return None, f"the model gave no usable brief in {DAILY_BRIEF_MAX_ATTEMPTS} attempts"
+        return None, (f"the model gave no usable brief in {DAILY_BRIEF_MAX_ATTEMPTS} attempts "
+                      f"(last: {why})")
 
     def _dbrief_push(self, job, texts=None, error=None):
         """Stage one result row on the `dailyBriefResults` outbox (bounded,
