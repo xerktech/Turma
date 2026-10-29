@@ -390,7 +390,11 @@ function renderDecisions(data, now) {
   const orgs = new Set(live);
   for (const s of Object.keys(decs)) if (Array.isArray(decs[s]) && decs[s].length) orgs.add(s);
   const sites = [...orgs].filter((s) => !keys.length || keys.includes(s)).sort();
-  const name = (s) => (TurmaBoard.orgName ? TurmaBoard.orgName(s) : s);
+  // The org's display name as every other page shows it: the name its hosts
+  // report (mergeSites' orgName), else one derived from the site key.
+  const names = new Map((TurmaBoard.mergeSites ? TurmaBoard.mergeSites(data.agents || []) : [])
+    .map((x) => [x.siteKey, x.orgName]));
+  const name = (s) => (TurmaBoard.orgName ? TurmaBoard.orgName(s, names.get(s)) : s);
   const html = sites.length
     ? sites.map((s) => decisionsHtml(s, decs[s], now, live.has(s), decCounts[s], name(s))).join("")
     : `<div class="dec-empty">No org yet — no host reports a tracker org.</div>`;

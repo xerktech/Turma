@@ -225,6 +225,13 @@ test("XERK-2386: a first visit to a card fetches it once; a return to Model qual
   assert.equal(count("/api/model-quality"), 2, "coming back refetches");
 });
 
+test("XERK-2386: a decisions card names its org as the hosts report it, not the derived name", () => {
+  const P = loadHelpers(null, "");
+  P.renderDecisions({ agents: [{ org: "acme.atlassian.net", jira: { siteKey: "acme.atlassian.net", orgName: "Acme Corp" } }],
+    decisions: { "acme.atlassian.net": [{ at: 1000, source: "note", text: "n" }] } }, 5000);
+  assert.match(P.els.decisionsLog.innerHTML, /<span class="dec-org-name">Acme Corp <span class="n">1<\/span>/);
+});
+
 // --- Decisions (XERK-1574) -------------------------------------------------------
 
 test("XERK-1574: the decisions tail is newest first, escaped, a composer only for a live org", () => {
