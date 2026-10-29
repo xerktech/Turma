@@ -20319,6 +20319,130 @@ test("XERK-2384: a revoke whose file write fails silently is 503 and not applied
   assert.equal(hub.nameTokenGen(host), 0);
 });
 
+test("XERK-2385: a revoke racing another replica's revoke of a DIFFERENT host keeps both", async () => {
+  const mine = "raceA2385";
+  const theirs = "raceB2385";
+  const key = "policy:nameTokenGens";
+  const store = new FileLiveStore();
+  // The other replica's revoke lands between this replica's read and its write.
+  const get = store.get.bind(store);
+  let raced = false;
+  store.get = async (k) => {
+    const v = await get(k);
+    if (!raced) {
+      raced = true;
+      await store.set(key, { ...(v || {}), [theirs]: { gen: 1, at: 1 } });
+    }
+    return v;
+  };
+  hub.__setLiveStore(store, true);
+  let r, kept;
+  try {
+    r = await hub.bumpNameTokenGen(mine);
+    kept = await get(key);
+  } finally {
+    hub.__setLiveStore(hub.liveStore, false);
+    store.close();
+  }
+  assert.equal(r.gen, 1);
+  assert.equal(kept[mine].gen, 1, "this revoke landed");
+  assert.equal(kept[theirs].gen, 1, "the other replica's revoke was not overwritten");
+  assert.equal(hub.nameTokenGen(theirs), 1, "and this replica learned it");
+  delete hub.nameTokenGens()[mine];
+  delete hub.nameTokenGens()[theirs];
+});
+
+test("XERK-2385: a stale watch event never un-revokes a host in memory", () => {
+  const host = "stale2385";
+  const desc = hub.__externalStores.list().find((d) => d.name === "nameTokenGens");
+  hub.__externalStores.applyExternalStoreValue(desc, { [host]: { gen: 2, at: 2 } });
+  assert.equal(hub.nameTokenGen(host), 2);
+  // An older map published late (it lacks this host) must not drop it.
+  hub.__externalStores.applyExternalStoreValue(desc, {});
+  assert.equal(hub.nameTokenGen(host), 2);
+  hub.__externalStores.applyExternalStoreValue(desc, { [host]: { gen: 1, at: 1 } });
+  assert.equal(hub.nameTokenGen(host), 2, "nor lower its generation");
+  delete hub.nameTokenGens()[host];
+});
+
+test("XERK-2385: a remote revoke installed while a revoke is saving survives it", async () => {
+  const mine = "midA2385";
+  const theirs = "midB2385";
+  const store = new FileLiveStore();
+  const cas = store.compareAndSet.bind(store);
+  store.compareAndSet = async (...a) => {
+    const ok = await cas(...a);
+    hub.nameTokenGens()[theirs] = { gen: 1, at: 1 }; // the watch installs another replica's revoke
+    return ok;
+  };
+  hub.__setLiveStore(store, true);
+  try {
+    await hub.bumpNameTokenGen(mine);
+  } finally {
+    hub.__setLiveStore(hub.liveStore, false);
+    store.close();
+  }
+  assert.equal(hub.nameTokenGen(mine), 1);
+  assert.equal(hub.nameTokenGen(theirs), 1, "merged into the mirror, not overwritten");
+  delete hub.nameTokenGens()[mine];
+  delete hub.nameTokenGens()[theirs];
+});
+
+test("XERK-2385: a revoke takes the next generation past one only the store has seen", async () => {
+  const host = "ahead2385";
+  const store = new FileLiveStore();
+  await store.set("policy:nameTokenGens", { [host]: { gen: 4, at: 1 } });
+  hub.__setLiveStore(store, true);
+  let r;
+  try {
+    r = await hub.bumpNameTokenGen(host);
+  } finally {
+    hub.__setLiveStore(hub.liveStore, false);
+    store.close();
+  }
+  assert.equal(r.gen, 5, "never re-issues a generation another replica already revoked");
+  delete hub.nameTokenGens()[host];
+});
+
+test("XERK-2385: undoing a failed revoke never sweeps away a revoke that landed since", async () => {
+  const mine = "undoA2385";
+  const theirs = "undoB2385";
+  const key = "policy:nameTokenGens";
+  // A file backend whose flush writes nothing (so this revoke is undone), and
+  // another replica's revoke lands before the undo runs.
+  const store = new FileLiveStore();
+  store.flush = () => { store.set(key, { ...store.map.get(key), [theirs]: { gen: 1, at: 1 } }); };
+  hub.__setLiveStore(store, false);
+  let r, kept;
+  try {
+    r = await hub.bumpNameTokenGen(mine);
+    await new Promise((res) => setImmediate(res));
+    kept = await store.get(key);
+  } finally {
+    hub.__setLiveStore(hub.liveStore, false);
+    store.close();
+  }
+  assert.equal(r.status, 503);
+  assert.equal(kept[theirs].gen, 1, "the later revoke survives the undo");
+  assert.equal(hub.nameTokenGen(mine), 0);
+});
+
+test("XERK-2385: a revoke that keeps losing the race gives up with a 503, applying nothing", async () => {
+  const host = "busy2385";
+  const store = new FileLiveStore();
+  store.compareAndSet = async () => false;
+  hub.__setLiveStore(store, true);
+  let r;
+  try {
+    r = await hub.bumpNameTokenGen(host);
+  } finally {
+    hub.__setLiveStore(hub.liveStore, false);
+    store.close();
+  }
+  assert.equal(r.status, 503);
+  assert.equal(hub.nameTokenGen(host), 0);
+});
+
 // A minimal RESP server holding one key, for the CLI's HA path.
 function fakeResp(key, value) {
   const net = require("net");
