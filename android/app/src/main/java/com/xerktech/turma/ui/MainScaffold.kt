@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.ViewKanban
 import androidx.compose.material3.Icon
@@ -28,11 +29,14 @@ enum class TopDest(val route: String, val label: String, val icon: ImageVector) 
     DASHBOARD("dashboard", "Dashboard", Icons.Filled.GridView),
     SESSIONS("sessions", "Sessions", Icons.Filled.Terminal),
     BOARD("board", "Board", Icons.Filled.ViewKanban),
+    // The Daily Brief (XERK-2397), the web's Brief page; between Board and Usage
+    // by operator choice.
+    BRIEF("brief", "Brief", Icons.Filled.RecordVoiceOver),
     USAGE("usage", "Usage", Icons.Filled.Analytics),
 }
 
 /**
- * Shared shell for the four top-level screens: no title bar (the "Turma" header
+ * Shared shell for the top-level screens: no title bar (the "Turma" header
  * is intentionally gone), just the content plus the web-style bottom nav. Detail
  * screens (chat/terminal) render without this, so the bar hides there.
  */

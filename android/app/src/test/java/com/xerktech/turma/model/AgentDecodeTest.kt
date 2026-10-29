@@ -852,4 +852,68 @@ class AgentDecodeTest {
         val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
         assertEquals(listOf("mxh-t16"), resp.agents.map { it.key })
     }
+
+    // ---- the Daily Brief (XERK-2397): typed top-level maps, decoded per entry ----
+
+    @Test fun `the dailyBriefs and dailyBriefSchedules maps decode`() {
+        val body = """
+            { "now": 1, "agents": [ $plainHost ],
+              "dailyBriefs": { "o.atlassian.net": [
+                { "runId": "a1", "status": "ok", "trigger": "scheduled", "meetingAt": 3000,
+                  "dayFrom": 1, "weekFrom": 0, "until": 2900, "startedAt": 2900, "model": "haiku",
+                  "host": "h1", "generatedAt": 2950, "day": "Two shipped.", "week": "Five.", "next": "XERK-1." },
+                { "runId": "a0", "status": "ok", "trigger": "manual", "meetingAt": 2000, "dayFrom": 1,
+                  "weekFrom": 0, "until": 1900, "startedAt": 1900, "model": "haiku", "headline": "One shipped." }
+              ] },
+              "dailyBriefSchedules": { "o.atlassian.net": { "enabled": true, "time": "09:30",
+                "timeZone": "America/New_York", "weekdays": [1, 2, 3, 4, 5], "leadMinutes": 5,
+                "model": "auto", "updatedAt": 5 } } }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val briefs = resp.dailyBriefs.getValue("o.atlassian.net")
+        assertEquals(listOf("a1", "a0"), briefs.map { it.runId })
+        assertEquals("Two shipped.", briefs[0].day)
+        assertEquals("h1", briefs[0].host)
+        assertEquals("One shipped.", briefs[1].headline)
+        assertEquals("", briefs[1].day)
+        val s = resp.dailyBriefSchedules.getValue("o.atlassian.net")
+        assertTrue(s.enabled)
+        assertEquals("09:30", s.time)
+        assertEquals(listOf(1, 2, 3, 4, 5), s.weekdays)
+    }
+
+    @Test fun `a hub predating the daily brief decodes with empty maps`() {
+        val resp = TurmaJson.decodeFromString<AgentsResponse>("""{ "now": 1, "agents": [ $plainHost ] }""")
+        assertTrue(resp.dailyBriefs.isEmpty())
+        assertTrue(resp.dailyBriefSchedules.isEmpty())
+        val nulls = TurmaJson.decodeFromString<AgentsResponse>(
+            """{ "now": 1, "agents": [ $plainHost ], "dailyBriefs": null, "dailyBriefSchedules": null }""")
+        assertEquals(listOf("mxh-t16"), nulls.agents.map { it.key })
+        assertTrue(nulls.dailyBriefs.isEmpty())
+    }
+
+    @Test fun `a malformed daily brief drops alone and never hides the fleet`() {
+        val body = """
+            { "now": 1, "agents": [ $plainHost ],
+              "dailyBriefs": { "good": [
+                  { "runId": "b2", "status": "ok", "meetingAt": "soon", "day": "bad row" },
+                  { "runId": "b1", "status": "ok", "meetingAt": 9, "day": "kept" },
+                  "not a row" ],
+                "worse": "not a list", "empty": [] },
+              "dailyBriefSchedules": { "ok": { "enabled": true, "time": "08:00", "timeZone": "UTC", "weekdays": [1] },
+                "bad": { "enabled": "maybe", "weekdays": "Mon" }, "junk": 7 } }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertEquals(listOf("mxh-t16"), resp.agents.map { it.key })
+        assertEquals(listOf("b1"), resp.dailyBriefs.getValue("good").map { it.runId })
+        assertNull(resp.dailyBriefs["worse"])
+        assertEquals(emptyList<DailyBrief>(), resp.dailyBriefs["empty"])
+        assertEquals(setOf("ok"), resp.dailyBriefSchedules.keys)
+        // A whole map of the wrong shape reads as none, the fleet intact.
+        val wrong = TurmaJson.decodeFromString<AgentsResponse>(
+            """{ "now": 1, "agents": [ $plainHost ], "dailyBriefs": [1, 2], "dailyBriefSchedules": "x" }""")
+        assertEquals(listOf("mxh-t16"), wrong.agents.map { it.key })
+        assertTrue(wrong.dailyBriefs.isEmpty())
+        assertTrue(wrong.dailyBriefSchedules.isEmpty())
+    }
 }

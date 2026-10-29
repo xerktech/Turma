@@ -49,7 +49,7 @@ class BottomNavTabTest {
         // Mirrors nav.js PAGES (pinned by turma/tests/nav.test.js) minus the web-only
         // Insights page (XERK-2386); the bar renders TopDest.entries in declaration order.
         assertEquals(
-            listOf("dashboard", "sessions", "board", "usage"),
+            listOf("dashboard", "sessions", "board", "brief", "usage"),
             TopDest.entries.map { it.route },
         )
     }

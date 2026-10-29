@@ -86,6 +86,11 @@ data class FleetState(
     // Epic-builder runs (XERK-725/731), keyed by builder id; the board's progress
     // strip reads it. Refreshed by the poll and the "epicBuilders" SSE event.
     val epicBuilders: Map<String, com.xerktech.turma.model.EpicBuilder> = emptyMap(),
+    // The Daily Brief (XERK-2390): each org's briefs newest-first and its standup
+    // schedule, keyed by siteKey; the Brief screen reads both. Refreshed by the
+    // poll and the "dailyBriefs" / "dailyBriefSchedules" SSE events.
+    val dailyBriefs: Map<String, List<com.xerktech.turma.model.DailyBrief>> = emptyMap(),
+    val dailyBriefSchedules: Map<String, com.xerktech.turma.model.DailyBriefSchedule> = emptyMap(),
 )
 
 class FleetRepository(
@@ -162,6 +167,8 @@ class FleetRepository(
             triagePolicies = resp.triagePolicies
             epicRuns = resp.epicRuns
             epicBuilders = resp.epicBuilders
+            dailyBriefs = resp.dailyBriefs
+            dailyBriefSchedules = resp.dailyBriefSchedules
             // Don't let a late/stale poll drag the clock backward under the
             // records we just kept fresh (XERK-812) — same upward coercion upsert
             // uses for an SSE event.
@@ -216,6 +223,12 @@ class FleetRepository(
     @Volatile
     private var epicBuilders: Map<String, com.xerktech.turma.model.EpicBuilder> = emptyMap()
 
+    @Volatile
+    private var dailyBriefs: Map<String, List<com.xerktech.turma.model.DailyBrief>> = emptyMap()
+
+    @Volatile
+    private var dailyBriefSchedules: Map<String, com.xerktech.turma.model.DailyBriefSchedule> = emptyMap()
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
@@ -235,6 +248,8 @@ class FleetRepository(
             triagePolicies = triagePolicies,
             epicRuns = epicRuns,
             epicBuilders = epicBuilders,
+            dailyBriefs = dailyBriefs,
+            dailyBriefSchedules = dailyBriefSchedules,
         )
     }
 
@@ -323,6 +338,15 @@ class FleetRepository(
                     "epicBuilders" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.EpicBuilder>>(data)
                     }.getOrNull()?.let { epicBuilders = it; emit(_state.value.now, null) }
+                    // A brief was started, written or failed (XERK-2395); the event
+                    // carries the whole served map, decoded per org like the poll.
+                    "dailyBriefs" -> runCatching {
+                        TurmaJson.decodeFromString(com.xerktech.turma.model.LenientBriefsSerializer, data)
+                    }.getOrNull()?.let { dailyBriefs = it; emit(_state.value.now, null) }
+                    // An org's standup schedule changed (XERK-2391); whole map.
+                    "dailyBriefSchedules" -> runCatching {
+                        TurmaJson.decodeFromString(com.xerktech.turma.model.LenientSchedulesSerializer, data)
+                    }.getOrNull()?.let { dailyBriefSchedules = it; emit(_state.value.now, null) }
                 }
             }
 

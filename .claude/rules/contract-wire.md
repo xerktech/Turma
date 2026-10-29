@@ -64,3 +64,7 @@ The heartbeat payload and what `/api/agents` serves to every client. Spans `hub-
   - Agent: `_cheap_job_value`; hub: `coerceGitProblem` (rebuilt or deleted, Android TYPES it);
     clients: web `gitProblemText`, Android `gitProblemText`.
   - Unreadable never claims "clean": the repo's `dirtyFiles` stays null and delete still warns.
+- **`dailyBriefs` / `dailyBriefSchedules` are TYPED on Android** (XERK-2397); their hub-side
+  coercion is the stores' whitelists (`sanitizeDailyBrief`/`dailyBriefWire`,
+  `validateDailyBriefSchedule`), so a field added there needs a defaulted field on
+  `DailyBrief`/`DailyBriefSchedule`. Android also decodes them per org, so a bad entry drops alone.
