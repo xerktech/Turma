@@ -123,6 +123,19 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
       - `identityBound` (hub-derived, only `true` sent, forged copy stripped) gates the button.
       - Never make it Remove's default: it locks a briefly offline host out (the XERK-2381 bug).
     - An id the hub does not know is told to re-provision (`--agent-token`), never re-issued.
+    - **A host's NAME token is revocable by GENERATION** (XERK-2384):
+      `POST /api/agents/<host>/revoke-name-token` bumps `nameTokenGens[host]` (durable store,
+      `/data/name-token-gens.json`); gen N keys the HMAC with `HMAC(master, 0xFF‖"name-token-gen:N")`,
+      gen 0 is the master, so pre-existing tokens are gen 0 and the token's shape never changes.
+      - The 0xFF lead byte is load-bearing: a plain-text label is the gen-0 MAC of the host NAMED
+        that label, whose holder could then forge every revoked host's next token (QA-reproduced).
+      - The 200 means DURABLE: the bump awaits the store write (file: flushed + read back) and
+        rolls back with a 503 on failure — never the fire-and-forget `persist()` other stores use.
+      - Never evict an entry: dropping one REVIVES every token it revoked (refused past the cap).
+      - `--agent-token <host>` must print the CURRENT generation; under HA it reads the shared
+        store and refuses to print rather than fall back to gen 0.
+      - It revokes no identity token; an explicit identity revoke (XERK-2383) should also call
+        `bumpNameTokenGen`, since un-retiring the name token is otherwise the way back in.
     - A beat that renames carries the old record over (commands, org binding, alerts), drops every
       other record bound to the id (HA ghosts too), re-points ticket pins, appends `formerNames`.
     - Hub-owned, never served: `agentUid`, `uidBound` (ttydAuth's which-token), `formerNames`;
