@@ -27492,6 +27492,9 @@ test("XERK-2383: Remove host with ?identity=revoke retires the agent's identity 
   const tok = enrollUid("rev2383");
   const uid = tokenUid(tok);
   assert.equal((await beatAs("rev2383", asAuth(tok))).status, 200);
+  const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.agents
+    .find((a) => a.key === "rev2383");
+  assert.equal(served.identityBound, true, "the dashboard is told there is an identity to revoke");
   // A live agent holding its tunnel is cut off by the revoke, not at its next reconnect.
   const ctrl = await wsConnect(`/agent/control?name=rev2383&token=${encodeURIComponent(tok)}`);
   assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
@@ -27504,7 +27507,8 @@ test("XERK-2383: Remove host with ?identity=revoke retires the agent's identity 
     assert.equal(hub.agentIdentities()[uid], undefined);
     assert.equal(((await hub.liveStore.get("policy:agentIdentities")) || {})[uid], undefined,
       "the revoke is persisted");
-    await closed;
+    await Promise.race([closed, new Promise((_, rej) =>
+      setTimeout(() => rej(new Error("the revoked agent's tunnel was left open")), 2000))]);
     assert.equal(controlChannels.rev2383, undefined);
   } finally { ctrl.socket.destroy(); }
   // Unlike a plain Remove, beating home first does not bring it back: refused,
@@ -27513,6 +27517,8 @@ test("XERK-2383: Remove host with ?identity=revoke retires the agent's identity 
   assert.equal(home.status, 403);
   assert.match(home.body.error, /re-provision/);
   assert.equal(agents.rev2383, undefined);
+  // Refused at the pre-body gate, so a revoked token cannot make the hub buffer a 32 MiB beat.
+  assert.equal(agentPresented({ headers: asAuth(tok) }), false);
   assert.equal((await beatAs("rev2383-elsewhere", asAuth(tok))).status, 403);
   assert.equal(agentWsAuthorized(new URL(`http://x/agent/control?name=rev2383&token=${tok}`), { headers: {} }, "rev2383"), false);
   assert.equal(resolveEnrollToken({ headers: asAuth(tok) }, "rev2383").status, 403);
@@ -27520,6 +27526,49 @@ test("XERK-2383: Remove host with ?identity=revoke retires the agent's identity 
   assert.equal((await beatAs("rev2383", asAuth(hostAgentToken("rev2383")))).status, 200);
   assert.notEqual(enrollUid("rev2383"), tok);
   forget2381("rev2383");
+});
+
+test("XERK-2383: revoking a renamed agent keeps its original name's token retired", async () => {
+  await beatAs("orig2383", asAuth(hostAgentToken("orig2383")));
+  const tok = enrollUid("orig2383");
+  const uid = tokenUid(tok);
+  assert.equal((await beatAs("orig2383", asAuth(tok))).status, 200);
+  agents.orig2383.updating = { reason: "restart", at: Date.now(), until: Date.now() + 60000 };
+  assert.equal((await beatAs("new2383", asAuth(tok))).status, 200);
+  assert.equal(hostOfUid(uid), "new2383");
+  const del = await request("DELETE", "/api/agents/new2383?identity=revoke", { headers: userHeaders });
+  assert.equal(del.status, 200, JSON.stringify(del.body));
+  assert.equal((await beatAs("new2383", asAuth(tok))).status, 403);
+  // The old name's token stays retired: a thief holding it gets neither the host nor a new identity.
+  const old = await beatAs("orig2383", asAuth(hostAgentToken("orig2383")));
+  assert.equal(old.status, 403);
+  assert.match(old.body.error, /retired/);
+  assert.equal(resolveEnrollToken({ headers: asAuth(hostAgentToken("orig2383")) }, "").status, 403);
+  assert.equal(hub.identityEntry(uid).revoked, true);
+  assert.equal(hub.coerceAgentIdentities(JSON.parse(JSON.stringify(hub.agentIdentities())))[uid].revoked, true,
+    "the tombstone survives a reload");
+  // The tombstone proves nothing and has no name to revoke again.
+  assert.equal(uidHostClaim(uid, "orig2383"), false);
+  assert.equal((await request("DELETE", "/api/agents/new2383?identity=revoke", { headers: userHeaders })).status, 404);
+  // The operator releases the old name deliberately with a plain Remove, as for any reinstall.
+  await request("DELETE", "/api/agents/orig2383", { headers: userHeaders });
+  assert.equal(hub.identityEntry(uid), null, "the tombstone goes with the name it guarded");
+  assert.equal((await beatAs("orig2383", asAuth(hostAgentToken("orig2383")))).status, 200);
+  forget2381("orig2383", "new2383");
+});
+
+test("XERK-2383: a mistyped identity param or an unknown host revokes nothing", async () => {
+  await beatAs("typo2383", asAuth(hostAgentToken("typo2383")));
+  const tok = enrollUid("typo2383");
+  await beatAs("typo2383", asAuth(tok));
+  const bad = await request("DELETE", "/api/agents/typo2383?identity=REVOKE", { headers: userHeaders });
+  assert.equal(bad.status, 400);
+  assert.ok(agents.typo2383, "nothing removed");
+  assert.equal((await beatAs("typo2383", asAuth(tok))).status, 200);
+  const none = await request("DELETE", "/api/agents/nosuch2383?identity=revoke", { headers: userHeaders });
+  assert.equal(none.status, 404);
+  assert.match(none.body.error, /no host or agent identity/);
+  forget2381("typo2383");
 });
 
 test("XERK-2383: revoking a host with no identity token refuses and removes nothing", async () => {

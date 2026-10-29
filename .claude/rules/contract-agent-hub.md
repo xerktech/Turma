@@ -110,7 +110,16 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
       tunnel, enroll; `agentPresented` too, so no 32 MiB read) and its live tunnel is dropped. The
       host returns only re-provisioned (`--agent-token`, then enroll mints a fresh id).
       - 409, removing nothing, when no id lives there: a name or master token cannot be revoked
-        per host, and a Remove that left it working would read as done.
+        per host, and a Remove that left it working would read as done. 404 for no such host,
+        400 for any other `identity=` value (a typo must not quietly do a plain Remove).
+      - **A renamed agent's id becomes a `revoked` TOMBSTONE, never deleted, while its origin name
+        is retired**: `identityOf` ignores it, `nameTokenRefusal` still sees it. Deleting it
+        un-retired the OLD name's token, so revoking the new name re-opened the old one (QA).
+        A plain Remove of the origin name drops the tombstone, as it releases any name.
+      - The revoked host's OWN name token is un-retired on purpose (it is the re-provision path).
+        Name tokens are deterministic, so one the machine ever held works again: residual.
+      - Written through to disk before the 200 (the file store debounces 5s; a kill lost it).
+      - `identityBound` (hub-derived, only `true` sent, forged copy stripped) gates the button.
       - Never make it Remove's default: it locks a briefly offline host out (the XERK-2381 bug).
     - An id the hub does not know is told to re-provision (`--agent-token`), never re-issued.
     - A beat that renames carries the old record over (commands, org binding, alerts), drops every

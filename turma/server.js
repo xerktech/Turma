@@ -1242,6 +1242,12 @@ function tokenUid(token) {
 // the agents map, is the binding: a record pruned after a week offline must not
 // cost the agent its name when it comes back.
 function identityOf(uid) {
+  const e = identityEntry(uid);
+  return e && !e.revoked ? e : null;
+}
+// The registry entry for `uid`, a revoked tombstone included (XERK-2383): it
+// proves nothing, but still keeps its origin name's token retired.
+function identityEntry(uid) {
   return typeof uid === "string" && Object.prototype.hasOwnProperty.call(agentIdentities, uid)
     ? agentIdentities[uid] : null;
 }
@@ -1262,7 +1268,9 @@ function identityByOrigin(host) {
 // leaked one could fetch the identity token. And a record bound to an identity
 // minted for ANOTHER name never accepts this name's token.
 function nameTokenRefusal(host) {
-  const minted = identityOf(identityByOrigin(host));
+  // A revoked tombstone counts: revoking a renamed agent must not hand its
+  // original name's token back to whoever still holds it (XERK-2383).
+  const minted = identityEntry(identityByOrigin(host));
   if (minted && minted.used) {
     return `${host} now authenticates with its agent identity token; its name-derived token is ` +
       `retired (remove ${host} from the dashboard to release the name for a reinstall)`;
@@ -1352,6 +1360,10 @@ const AGENT_NAMES_MAX = 8;
 function issueAgentUid(host) {
   const a = Object.prototype.hasOwnProperty.call(agents, host) ? agents[host] : null;
   let uid = identityByOrigin(host);
+  // A revoked tombstone is never handed back. Only a master-bootstrap enroll
+  // reaches here for its name (the name token stays retired), and a master
+  // holder may act as any host, so it simply mints afresh.
+  if (uid && agentIdentities[uid].revoked) { delete agentIdentities[uid]; uid = null; }
   if (!uid && a && a.agentUid && identityOf(a.agentUid) && agentIdentities[a.agentUid].home === host) {
     uid = a.agentUid;
   }
@@ -1384,8 +1396,14 @@ function trimAgentIdentities(keep) {
 // disk was replaced could never come back under its name on a strict hub.
 function releaseHostIdentities(host) {
   let changed = false;
-  for (const e of Object.values(agentIdentities)) {
+  for (const [uid, e] of Object.entries(agentIdentities)) {
     if (!e) continue;
+    // A revoked tombstone exists only to keep its origin name retired; once that
+    // name is released it has no job left (XERK-2383).
+    if (e.revoked) {
+      if (e.origin === host) { delete agentIdentities[uid]; changed = true; }
+      continue;
+    }
     if (e.origin === host) { delete e.origin; changed = true; }
     if (e.home === host && !e.released) { e.released = true; changed = true; }
   }
@@ -1397,13 +1415,25 @@ function releaseHostIdentities(host) {
 // not a reinstall ever takes the name. Unlike releaseHostIdentities this locks a
 // briefly offline host out too, which is why it is a deliberate second step and
 // never what a plain Remove does. Returns how many were revoked.
+//
+// An agent renamed here from another name is kept as a `revoked` TOMBSTONE
+// while its origin name's token is retired (identityOf ignores it,
+// nameTokenRefusal still sees it): deleting it would un-retire that name token,
+// so revoking the new name would re-open the old one. The revoked host's OWN
+// name token is un-retired, by design — it is how the host is re-provisioned.
 function revokeHostIdentities(host) {
   let n = 0;
   for (const [uid, e] of Object.entries(agentIdentities)) {
-    if (e && e.home === host) { delete agentIdentities[uid]; n++; }
+    if (!e || e.revoked || e.home !== host) continue;
+    n++;
+    if (e.origin && e.origin !== host && e.used) e.revoked = true;
+    else delete agentIdentities[uid];
   }
-  if (n) persistAgentIdentities();
   return n;
+}
+// Whether an unrevoked identity lives under `host` — what a revoke would retire.
+function hostHasIdentity(host) {
+  return Object.values(agentIdentities).some((e) => e && !e.revoked && e.home === host);
 }
 // A beat on identity `uid` as `key` (already authorized): mark it used and, on a
 // rename, move its home. Returns the name it moved FROM, or null.
@@ -2659,7 +2689,7 @@ function registerExternalStore({ name, file, coerce, read, install, afterLoad })
     // the file backend it writes this store's /data file (via STORE_PERSISTENT);
     // fire-and-forget — the mirror + SSE already reflect the change, a store blip
     // must not fail the operator's 200.
-    Promise.resolve(liveStore.set(key, read())).catch((e) =>
+    return Promise.resolve(liveStore.set(key, read())).catch((e) =>
       console.error(`store ${name}: persist failed: ${e && e.message}`));
   };
 }
@@ -2807,6 +2837,7 @@ function coerceAgentIdentities(raw) {
       const names = e.names.filter(name).slice(-8);
       if (names.length) rec.names = names;
     }
+    if (e.revoked === true) rec.revoked = true; // XERK-2383 tombstone, set last
     out[uid] = rec;
   }
   return out;
@@ -6211,7 +6242,7 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
   const { history, trajectoryTails, subagentHistory, jiraIssues, statusResults,
           priorityResults, linkResults, mergeResults,
           createMeta, createTypes, createResults, resultWaits, tokenBound,
-          agentUid: _uid, uidBound: _uidBound, formerNames: _formerNames,
+          agentUid: _uid, uidBound: _uidBound, formerNames: _formerNames, identityBound: _forgedIdBound,
           orgBound, autoPaused: _forgedAutoPaused, defectReports: _defects, ...a } = agent;
   // The paused-subscription set (XERK-544/548). buildAgentsCache computes it once
   // and passes it; the per-agent SSE broadcast has none and derives its own.
@@ -6297,6 +6328,9 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
     // unbound host that reports the setToken capability — replacing the "curl
     // the hub twice to verify it bound" step of the old onboarding ritual.
     ...(TURMA_AGENT_TOKEN ? { tokenBound: !!tokenBound } : {}),
+    // XERK-2383: whether this host has an agent identity a revoke would retire
+    // (hub-derived; only true is sent). Gates the dashboard's revoke button.
+    ...(agent.agentUid && hostOfUid(agent.agentUid) === key ? { identityBound: true } : {}),
   };
 }
 
@@ -22062,11 +22096,19 @@ const server = http.createServer(async (req, res) => {
       // when there is no identity to revoke: a name or master token cannot be
       // revoked per host, and a Remove that silently left it working would read
       // as done.
-      const revoke = url.searchParams.get("identity") === "revoke";
-      if (revoke && !Object.values(agentIdentities).some((e) => e && e.home === key)) {
+      const identityParam = url.searchParams.get("identity");
+      if (identityParam !== null && identityParam !== "revoke") {
+        return json(res, 400, { error: `identity must be "revoke" (got ${JSON.stringify(identityParam.slice(0, 40))})` });
+      }
+      const revoke = identityParam === "revoke";
+      if (revoke && !hostHasIdentity(key)) {
+        if (!Object.prototype.hasOwnProperty.call(agents, key)) {
+          return json(res, 404, { error: `no host or agent identity is registered as ${key}` });
+        }
         return json(res, 409, {
-          error: `${key} has no agent identity token to revoke — it authenticates with its ` +
-            "name-derived token or the fleet master; only rotating TURMA_AGENT_TOKEN revokes those",
+          error: `${key} has no agent identity token to revoke — it runs on its name-derived ` +
+            "token or the fleet master (only rotating TURMA_AGENT_TOKEN revokes those), or its " +
+            "agent has been renamed (revoke it under its new name)",
         });
       }
       delete agents[key];
@@ -22074,6 +22116,12 @@ const server = http.createServer(async (req, res) => {
       // take it on a new token, and its old identity may only return home.
       const revoked = revoke ? revokeHostIdentities(key) : 0;
       releaseHostIdentities(key);
+      if (revoked) {
+        // The 200 says the token is dead, so it must survive a hard kill: on the
+        // file backend write it through now rather than on the 5s debounce.
+        await persistAgentIdentities();
+        if (!HA_ON && typeof liveStore.flush === "function") liveStore.flush();
+      }
       // A revoked agent still holding its tunnel is cut off now, not at its next
       // reconnect (which agentWsAuthorized then refuses).
       if (revoked && controlChannels[key]) {
@@ -24040,7 +24088,7 @@ if (process.env.TURMA_TEST) {
     uidHostClaim,
     hostOfUid,
     uidHostRefusal,
-    revokeHostIdentities,
+    revokeHostIdentities, identityEntry,
     nameTokenRefusal,
     agentIdentities: () => agentIdentities,
     coerceAgentIdentities,
