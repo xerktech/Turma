@@ -6,7 +6,7 @@ Status: accepted (evaluation 2026-10-29). The operative rules are in
 ## Decisions
 
 1. **Default model: Haiku** (`DAILY_BRIEF_MODEL`, env `TURMA_DAILY_BRIEF_MODEL`). On 13 real-board
-   cases, two runs each, Haiku matched or beat Sonnet on every rubric dimension at 1/13 the cost.
+   cases, two runs each, Haiku beat Sonnet on every rubric dimension at 1/13 the cost.
 2. **"auto" does NOT escalate to Sonnet on large inputs.** On the 40+-tickets-since-yesterday
    cases Haiku still won the head-to-head (8 wins, 4 losses). Sonnet bought only latency,
    which a brief written 5 minutes before the meeting does not need.
