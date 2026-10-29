@@ -130,6 +130,13 @@ def _derive(raw):
         [r for r in d["closed"] if r["when"] == "week"][:4]
     d["truncated"] = False
     out["quiet-day"] = {"note": "2026-10-08 cut to 1 ticket since yesterday, 4 earlier", "data": d}
+    # The quiet day again, with its one ticket since yesterday and two in progress
+    # unowned: an unassigned ticket must never be credited to a person (XERK-2404).
+    d = json.loads(json.dumps(out["quiet-day"]["data"]))
+    for r in [r for r in d["closed"] if r["when"] == "day"] + d["open"][:2]:
+        r["assignee"] = None
+    out["unassigned-work"] = {"note": "quiet-day with the day's ticket and two open unassigned",
+                              "data": d}
     d = json.loads(json.dumps(by["2026-10-14"]))
     d["open"], d["next"] = [], []
     out["nothing-open"] = {"note": "2026-10-14 with nothing in progress and no candidates", "data": d}

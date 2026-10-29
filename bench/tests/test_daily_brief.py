@@ -14,7 +14,8 @@ spec = importlib.util.spec_from_file_location(
 ev = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ev)
 
-EDGE_CASES = {"quiet-day", "mon-after-weekend", "nothing-open", "empty-board", "noisy-summaries"}
+EDGE_CASES = {"quiet-day", "mon-after-weekend", "nothing-open", "empty-board", "noisy-summaries",
+              "unassigned-work"}
 
 
 class TestCorpus(unittest.TestCase):
@@ -25,6 +26,11 @@ class TestCorpus(unittest.TestCase):
         self.assertTrue(EDGE_CASES <= ids, EDGE_CASES - ids)
         big = [c for c in cases if sum(r["when"] == "day" for r in c["data"]["closed"]) >= 40]
         self.assertTrue(big, "no case with 40+ tickets closed since yesterday")
+
+    def test_unassigned_case_has_unowned_rows_in_day_and_open(self):
+        d = next(c for c in ev.corpus() if c["id"] == "unassigned-work")["data"]
+        self.assertTrue(any(r["assignee"] is None for r in d["closed"] if r["when"] == "day"))
+        self.assertTrue(any(r["assignee"] is None for r in d["open"]))
 
     def test_every_case_has_the_collector_shape(self):
         for c in ev.corpus():

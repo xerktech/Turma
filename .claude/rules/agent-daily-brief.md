@@ -63,6 +63,9 @@ model `DAILY_BRIEF_MODEL`. Evidence and the model decision: `docs/daily-brief-ad
   org can write, so the prompt frames them as data. Run it under `ATTENTION_HINT_LOCKDOWN`.
 - **`counts` are computed for the model, never left to it**: in the eval both Haiku and Sonnet
   misstated a 14-ticket day when counting the list themselves.
+- **An unassigned ticket is credited to no one, and not called ownerless aloud** (XERK-2404):
+  Haiku rarely names a plausible person, and without the line nearly always says "no owner".
+  The parser cannot check either; the eval's `unassigned-work` case can, over many reps.
 - **The parser rejects, never repairs**: wrong keys, markdown, a Jira-shaped key not in the data,
   an `upNext` key not in `next`, or a day/week section past `DAILY_BRIEF_WORDS_SLACK` x budget
   → None (retry). The eval scores with the same `daily_brief_problems`, so tightening one
