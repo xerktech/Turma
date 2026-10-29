@@ -336,9 +336,15 @@ function restoreFocus(key) {
   if (el && el.focus) el.focus();
 }
 // `force`: the viewer's own action (Save, Run now) paints its feedback now,
-// focus kept on the field or button it was on.
+// focus kept on the field or button it was on. Never through a pointer press.
+// When the hub answers, the result is forced only if focus began on a button (or
+// nowhere) and has not moved: a field may by then hold a half-typed time (QA),
+// which a swap would drop. Otherwise it is a background paint like any other.
+function stillOn(began) {
+  return (!began || !!began.k) && JSON.stringify(focusKey()) === JSON.stringify(began);
+}
 function renderBriefs(data, now, force = false) {
-  if (!force && (editing() || pointerDown)) { paintPending = true; return; }
+  if (pointerDown || (!force && editing())) { paintPending = true; return; }
   paintPending = false;
   const keys = TurmaOrg.getKeys();
   const { live, all } = orgsOf(data);
@@ -422,6 +428,7 @@ async function send(method, url, body) {
 // line and as the shared failure toast (XERK-264).
 async function runNow(site) {
   if (runBusy.has(site)) return;
+  const began = focusKey();
   runBusy.add(site);
   runRefusal.delete(site);
   if (cache) renderBriefs(cache, Date.now(), true);
@@ -439,7 +446,7 @@ async function runNow(site) {
     // Defined, not assigned: an org may be named __proto__ (XERK-1451).
     Object.defineProperty(map, site, { value: [out.brief, ...list], enumerable: true, writable: true, configurable: true });
   }
-  if (cache) renderBriefs(cache, Date.now(), true);
+  if (cache) renderBriefs(cache, Date.now(), stillOn(began));
 }
 async function saveSchedule(site) {
   if (schedBusy.has(site)) return;
@@ -447,6 +454,7 @@ async function saveSchedule(site) {
   const v = formValues(site, stored);
   const body = { enabled: v.enabled, time: v.time, timeZone: v.timeZone, weekdays: v.weekdays,
     leadMinutes: Number(v.leadMinutes), model: v.model };
+  const began = focusKey();
   schedBusy.add(site);
   schedErr.delete(site);
   if (cache) renderBriefs(cache, Date.now(), true);
@@ -464,7 +472,7 @@ async function saveSchedule(site) {
       nextFor.set(site, { sig: JSON.stringify(out.schedule), next: out.next || null, at: Date.now() });
     }
   }
-  if (cache) renderBriefs(cache, Date.now(), true);
+  if (cache) renderBriefs(cache, Date.now(), stillOn(began));
 }
 async function copyBrief(site) {
   const list = (cache && own(cache.dailyBriefs, site)) || [];

@@ -55,6 +55,9 @@ function loadPage(reply = null, agents = null) {
     location: { href: "", search: "", pathname: "/brief", hash: "" },
     navigator: { userAgent: "node", clipboard: { writeText: async (t) => { clip.push(t); } } },
     fetch: (u, init = {}) => {
+      // A page that loops on a route would starve the runner: past 50 calls it
+      // gets no answer, so the test fails on its count instead of hanging.
+      if (fetches.length > 50) return new Promise(() => {});
       fetches.push({ url: String(u), method: init.method || "GET", body: init.body ? JSON.parse(init.body) : undefined });
       if (String(u) === "/api/agents") {
         if (!agents) return new Promise(() => {});
@@ -324,6 +327,8 @@ test("XERK-2396: a repaint waits out a pointer press in the list, then paints af
   d.dailyBriefs = { [SITE]: [okBrief({ day: "Landed mid-press." })] };
   P.renderBriefs(d, NOW);
   assert.doesNotMatch(P.list(), /Landed mid-press/, "no swap between mousedown and mouseup");
+  P.renderBriefs(d, NOW, true);
+  assert.doesNotMatch(P.list(), /Landed mid-press/, "not even a forced paint (a Save answer landing mid-press)");
   for (const fn of P.winListeners.pointerup) fn({});
   P.runTimers();
   assert.match(P.list(), /Landed mid-press/);
@@ -371,14 +376,15 @@ test("XERK-2396: a Run now refusal gives way once the org's runs move on", async
 });
 
 test("XERK-2396: Run now pressed twice sends one request", async () => {
-  let release;
-  const P = loadPage((url, init) => (init.method === "POST" ? new Promise((r) => { release = r; }) : { ok: true, next: null }));
+  const releases = [];
+  const P = loadPage((url, init) => (init.method === "POST" ? new Promise((r) => { releases.push(r); }) : { ok: true, next: null }));
   const d = data();
   P.setCache(d);
   P.renderBriefs(d, NOW);
   const a = P.runNow(SITE);
   const b = P.runNow(SITE);
-  release({ ok: true, brief: { runId: "q1", status: "running", trigger: "manual", meetingAt: NOW, startedAt: NOW, model: "haiku", host: "h" } });
+  // Release every request sent, so a broken guard fails the count, never hangs.
+  for (const r of releases) r({ ok: true, brief: { runId: "q1", status: "running", trigger: "manual", meetingAt: NOW, startedAt: NOW, model: "haiku", host: "h" } });
   await Promise.all([a, b]);
   assert.equal(P.fetches.filter((f) => f.method === "POST").length, 1);
 });
@@ -413,4 +419,50 @@ test("XERK-2396: Run now for an org named __proto__ adds an own key, not a proto
   assert.equal(Object.getPrototypeOf(P.getCache().dailyBriefs), Object.prototype);
   assert.match(P.list(), /Writing a brief on h/);
   assert.match(P.list(), /<h2 class="brief-name">__proto__<\/h2>/);
+});
+
+const fieldIn = (f, value, site = SITE) => ({ tagName: "INPUT", inside: true, dataset: { f }, value,
+  closest: () => ({ dataset: { sched: site } }) });
+
+test("XERK-2396: Save and the gear paint at once even with a field focused; the hub's answer does not swap a field", async () => {
+  let release;
+  const P = loadPage((url, init) => (init.method === "PUT" ? new Promise((r) => { release = r; }) : { ok: true, next: null }));
+  const d = data();
+  P.setCache(d);
+  P.schedOpen.add(SITE);
+  P.renderBriefs(d, NOW);
+  P.document.activeElement = fieldIn("time", "09:00");
+  const saving = P.saveSchedule(SITE);
+  assert.match(P.list(), /Saving…/, "Save's own paint is not held by the focused field");
+  const during = P.list();
+  release({ ok: true, schedule: { enabled: true, time: "09:00", timeZone: "UTC", weekdays: [1], leadMinutes: 5, model: "auto" }, next: null });
+  await saving;
+  assert.equal(P.list(), during, "the answer waits while a field (maybe half-typed) has focus");
+  P.document.activeElement = null;
+  P.renderBriefs(d, NOW);
+  assert.doesNotMatch(P.list(), /Saving…/);
+
+  // The gear, clicked with a field focused, opens/closes at once.
+  const Q = loadPage();
+  Q.setCache(d);
+  Q.renderBriefs(d, NOW);
+  Q.document.activeElement = fieldIn("time", "09:00");
+  const gear = { dataset: { schedToggle: SITE } };
+  for (const fn of Q.els.briefList.listeners.click) fn({ target: { closest: () => gear } });
+  assert.match(Q.list(), /aria-expanded="true"/);
+});
+
+test("XERK-2396: a repaint gives focus back to the same weekday box", () => {
+  const P = loadPage();
+  const d = data();
+  P.setCache(d);
+  P.schedOpen.add(SITE);
+  P.renderBriefs(d, NOW);
+  const hits = [];
+  const box = (v) => ({ dataset: { f: "weekdays" }, value: v, closest: () => ({ dataset: { sched: SITE } }), focus: () => hits.push(v) });
+  P.els.briefList.querySelectorAll = (sel) => (sel === "[data-f]" ? ["1", "2", "3"].map(box) : []);
+  P.document.activeElement = fieldIn("weekdays", "3");
+  d.dailyBriefs = { [SITE]: [okBrief({ day: "Changed." })] };
+  P.renderBriefs(d, NOW, true);
+  assert.deepEqual(hits, ["3"]);
 });
