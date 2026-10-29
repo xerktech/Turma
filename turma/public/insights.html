@@ -139,11 +139,11 @@
     padding: 14px 16px; margin-bottom: 16px;
   }
   .dec-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
-  .dec-org-name { font-family: var(--font-display); font-size: 18px; font-weight: 600; }
+  .dec-org-name { font-family: var(--font-display); font-size: 18px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
   .dec-org-name .n { color: var(--muted); font-weight: 400; font-size: 15px; }
   /* The whole heading is the collapse toggle; a collapsed card is its heading alone. */
   .dec-toggle {
-    display: flex; align-items: baseline; gap: 8px; width: 100%; padding: 0; border: 0;
+    min-width: 0; display: flex; align-items: baseline; gap: 8px; width: 100%; padding: 0; border: 0;
     background: none; color: inherit; font: inherit; text-align: left; cursor: pointer;
   }
   .dec-toggle .chev { color: var(--muted); font-size: 12px; transition: transform 0.15s; }
@@ -322,15 +322,28 @@ const drafts = new Map();     // org -> the note being typed (survives a repaint
 // Orgs whose card the viewer collapsed. A per-viewer convenience, so browser
 // storage — which can be absent or throw (a private window), hence the guards.
 const COLLAPSED_KEY = "turma.insights.decisionsCollapsed";
+const COLLAPSED_MAX = 100;   // the most recently toggled; an org long gone ages out
 const collapsed = new Set();
-try {
-  const v = JSON.parse(localStorage.getItem(COLLAPSED_KEY) || "[]");
+// Re-read before every write, and on another tab's write (the `storage` event),
+// so two open tabs never overwrite each other's choices.
+function readCollapsed() {
+  let v = null;
+  try { v = JSON.parse(localStorage.getItem(COLLAPSED_KEY) || "[]"); } catch { return; }
+  collapsed.clear();
   if (Array.isArray(v)) for (const s of v) if (typeof s === "string") collapsed.add(s);
-} catch { /* start expanded */ }
-function toggleCollapsed(site) {
-  if (collapsed.has(site)) collapsed.delete(site); else collapsed.add(site);
-  try { localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...collapsed])); } catch { /* this page load only */ }
 }
+readCollapsed();
+function toggleCollapsed(site) {
+  readCollapsed();
+  if (collapsed.has(site)) collapsed.delete(site); else collapsed.add(site);
+  const keep = [...collapsed].slice(-COLLAPSED_MAX);
+  try { localStorage.setItem(COLLAPSED_KEY, JSON.stringify(keep)); } catch { /* this page load only */ }
+}
+addEventListener("storage", (e) => {
+  if (e.key !== COLLAPSED_KEY) return;
+  readCollapsed();
+  if (cache) render(cache);
+});
 // An age in the decisions log: seconds, minutes below the hour, hours to two
 // days, then days.
 function dur(ms) {
@@ -422,14 +435,18 @@ function renderDecisions(data, now) {
     ? sites.map((s) => decisionsHtml(s, decs[s], now, live.has(s), decCounts[s], name(s))).join("")
     : `<div class="dec-empty">No org yet — no host reports a tracker org.</div>`;
   // A repaint must not cost a half-typed note its focus or caret (the draft text
-  // itself rides `drafts`).
-  const focused = document.activeElement && document.activeElement.dataset
-    ? document.activeElement.dataset.noteInput : undefined;
+  // itself rides `drafts`), nor a keyboard user the collapse toggle they're on.
+  const ds = document.activeElement && document.activeElement.dataset;
+  const focused = ds ? ds.noteInput : undefined;
+  const toggle = ds ? ds.collapse : undefined;
   const caret = focused !== undefined ? document.activeElement.selectionStart : null;
   TurmaNav.preserveScroll($decisions, () => { $decisions.innerHTML = html; });
   if (focused !== undefined) {
     const el = [...$decisions.querySelectorAll("[data-note-input]")].find((x) => x.dataset.noteInput === focused);
     if (el) { el.focus(); if (caret != null) el.setSelectionRange(caret, caret); }
+  } else if (toggle !== undefined) {
+    const el = [...$decisions.querySelectorAll("[data-collapse]")].find((x) => x.dataset.collapse === toggle);
+    if (el) el.focus();
   }
 }
 // Record a decision by hand. The hub's refusal is toasted in its own words

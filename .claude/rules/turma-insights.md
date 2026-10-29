@@ -73,6 +73,10 @@ paths:
     — the hosts' `BOARD_ORG_NAME` first, never the site key alone.
   - Each card collapses to its heading (`collapsed`, kept per viewer in `localStorage`, guarded:
     storage can be absent or throw, and the page then starts expanded).
+    - Storage is re-read before each write and on the `storage` event, so two open tabs never
+      overwrite each other; only the newest `COLLAPSED_MAX` (100) orgs are kept.
+    - A repaint gives focus back to the toggle that had it — the toggle is replaced by every
+      `innerHTML` swap, and a keyboard user otherwise lands on `<body>`.
   - A row's meta names its session (`label`, clipped to `DECISION_LABEL_MAX` 60) — the only tie
     back for an answer with no ticket.
   - **Each meta piece is unbreakable** (`.bit`) and **the "·" ENDS the piece before it** (`.sep`),
