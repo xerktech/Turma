@@ -963,3 +963,24 @@ test("XERK-2381: a hub-recorded rename folds, including a rename back", () => {
     ledger.setHostAliases([]);
   }
 });
+
+test("XERK-2381: a retired name never folds into two live cards", () => {
+  // lx -> la -> lb, then another machine registers `la`: lx's spend must land
+  // on one card at most, never both (the fleet total would double).
+  ledger.ingest("lx", beat({ "2026-08-16": 1000 }), now);
+  const la = beat({ [DAY]: 10 }, {}, { device: "la" });
+  const lb = beat({ [DAY]: 20 }, {}, { device: "lb" });
+  ledger.ingest("la", la, now + 1000);
+  ledger.ingest("lb", lb, now + 1000);
+  try {
+    ledger.setHostAliases([["lx", "la"], ["la", "lb"]]);
+    const live = new Set(["la", "lb"]);
+    const a = ledger.fold("la", la, now, live);
+    const b = ledger.fold("lb", lb, now, live);
+    const total = (a ? totalOf(a.usage) : 10) + (b ? totalOf(b.usage) : 20) +
+      ledger.retiredAgents([...live], now).reduce((n, r) => n + totalOf(r.usage), 0);
+    assert.equal(total, 1030);
+  } finally {
+    ledger.setHostAliases([]);
+  }
+});

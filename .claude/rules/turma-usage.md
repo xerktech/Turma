@@ -186,7 +186,9 @@ paths:
   groups — the hub's renames (`syncLedgerAliases` from each record's `formerNames`, per cache
   build) plus `STATIC_HOST_ALIASES` for renames before agents had an identity (k8x→k8x-01,
   maxai↔maxai-win). Canonical = the group's smallest member, so a rename back never splits it.
-  Same only-if-not-live + high-water rules. Tests: the `XERK-2381:` cases in `usage-ledger.test.js`.
+  Same high-water rule; retired members fold only into a group's ONE live member (with two live,
+  e.g. an old name re-registered by another machine, they stay retired rows — never counted twice).
+  Tests: the `XERK-2381:` cases in `usage-ledger.test.js`.
 
 ### HA: the Postgres of-record backend (XERK-779, epic XERK-775; was Valkey XERK-758)
 

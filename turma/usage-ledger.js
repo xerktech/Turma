@@ -1324,7 +1324,12 @@ function fold(key, record, now = Date.now(), liveKeys = null) {
   const f = foldKey(key);
   const live = liveKeys ? (liveKeys instanceof Set ? liveKeys : new Set(liveKeys)) : null;
   const group = [key];
+  // Retired members fold only into a group's ONE live member: with two live
+  // (a renamed host's old name re-registered by another machine), folding them
+  // into both would count their spend twice — they stay retired rows instead.
+  const liveTwin = live && [...live].some((k) => k !== key && foldKey(k) === f);
   for (const k of Object.keys(hosts)) {
+    if (liveTwin) break;
     if (k === key || foldKey(k) !== f) continue;
     if (live && live.has(k)) continue;
     group.push(k);
@@ -1356,7 +1361,11 @@ function retiredAgents(liveKeys, now = Date.now()) {
   // A retired case-twin of a LIVE host folds into that host's card via `fold`, so
   // it is not emitted here (XERK-448); the rest group by `foldKey` and merge, so a
   // wholly-removed host that changed casing shows as ONE retired row, not two.
-  const liveFolds = new Set([...live].map(foldKey));
+  // A group with exactly ONE live member absorbs its retired members (see fold);
+  // with two or more they are emitted here instead.
+  const liveCount = new Map();
+  for (const k of live) liveCount.set(foldKey(k), (liveCount.get(foldKey(k)) || 0) + 1);
+  const liveFolds = new Set([...liveCount].filter(([, n]) => n === 1).map(([f]) => f));
   const groups = new Map(); // foldKey -> [ledger keys]
   for (const k of Object.keys(hosts)) {
     if (live.has(k)) continue;

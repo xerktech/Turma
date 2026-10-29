@@ -86,16 +86,24 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
     **`TURMA_AGENT_STRICT` retires it**, and the hub warns at boot until it is set. Detail in
     `turma.md`; the agent needs no code change, only the right `TURMA_TOKEN`.
   - **A host RENAME keeps the agent via its IDENTITY token** (XERK-2381): roll/enroll hand out
-    `<base64url("uid:"+id)>.<HMAC>` over a hub-minted random id, stored as `agentUid` on the record.
-    The token proves the AGENT; the hub binds it to the host name it beats as (`uidHostClaim`).
-    - It may claim a name only when that name's record is bound to it or no record holds the name.
-      A legacy record is bound only by a hub MINT (roll/enroll stamp `agentUid`), never by a claim —
-      else any identity holder could take over a host it was not minted for.
-    - A beat under a free new name RENAMES: the old record carries over (commands, org binding,
-      alerts), the old key is dropped, ticket pins follow, `formerNames` feeds the usage fold.
-    - Hub-owned and never served: `agentUid`, `uidBound` (ttydAuth's which-token), `formerNames`.
+    `<base64url("uid:"+id)>.<HMAC>` over a hub-minted id. The token proves the AGENT; the durable
+    `agentIdentities` store (`/data/agent-identities.json`, uid → origin/home/names/used) binds it
+    to a host name, mirrored as `agentUid` on the record. `uidHostRefusal` is the one rule.
+    - **One name mints ONE id, ever** (`identityByOrigin`): re-enrolling returns it, so a name token
+      cannot mint a stream of identities and flood the registry (QA reproduced that under strict).
+    - **Once the id has beaten, its name token is RETIRED** (`nameTokenRefusal`), so an old name
+      token can neither open a second record beside a renamed agent nor fetch the id again.
+    - **A rename takes only a name nobody else holds or held**: no record, no other id's home, no
+      live case twin, no usage-ledger history (a removed host's name) — unless this id went by it.
+      Loosening any of these lets a compromised agent squat a name and drain its queued commands.
+    - **No rename while the home record is still beating and not restarting** (`updating`): a real
+      rename restarts the agent, so that is two machines on one cloned token, refused with 403.
+    - A beat that renames carries the old record over (commands, org binding, alerts), drops every
+      other record bound to the id (HA ghosts too), re-points ticket pins, appends `formerNames`.
+    - Hub-owned, never served: `agentUid`, `uidBound` (ttydAuth's which-token), `formerNames`;
+      a `setToken` command's token is stripped from the served `commands` (`servedCommands`).
     - `hostAgentToken` refuses the `uid:` namespace so a host name never collides with an id.
-    - Tests: the `XERK-2381:` cases in `server.test.js`, `TestSetToken`.
+    - Tests: the `XERK-2381:` cases in `server.test.js` + `usage-ledger.test.js`, `TestSetToken`.
   - **Onboarding onto that derived token is ONE action, not a per-host ritual** (XERK-578): the
     hub roll route + agent enroll endpoint, spanning hub + agent + native. Never re-key the enroll
     endpoint on a caller-named device for a PROVED caller. Mechanics: `agent-token-onboarding.md`.

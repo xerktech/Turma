@@ -495,6 +495,8 @@ const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
 // the whole fleet — so the pin lives here, on the same durable /data volume as
 // the archive, rather than riding any one agent's ~/.turma.
 const TICKET_AGENTS_FILE = process.env.TICKET_AGENTS_FILE || "/data/ticket-agents.json";
+// Agent identities (XERK-2381): which agent id is bound to which host name.
+const AGENT_IDENTITIES_FILE = process.env.AGENT_IDENTITIES_FILE || "/data/agent-identities.json";
 // Tickets come and go while pins are only ever set by hand, so the map is
 // bounded rather than reconciled: past the cap the oldest pin is evicted.
 const TICKET_AGENTS_MAX = 500;
@@ -1232,24 +1234,89 @@ function tokenUid(token) {
   const uid = subject.slice(AGENT_UID_PREFIX.length);
   return safeEqual(token, uidAgentToken(uid)) ? uid : null;
 }
-// The registry key currently bound to agent `uid`, or null.
+// The hub's registry of agent identities (`agentIdentities`, a durable /data
+// store declared with the other external stores): uid -> {origin, home, at,
+// used?, names?}. `origin` is the host name the id was minted FOR (one id per
+// name, ever — so one name token can never mint a stream of identities), `home`
+// the name it beats as now, `names` the names it has gone by. The registry, not
+// the agents map, is the binding: a record pruned after a week offline must not
+// cost the agent its name when it comes back.
+function identityOf(uid) {
+  return typeof uid === "string" && Object.prototype.hasOwnProperty.call(agentIdentities, uid)
+    ? agentIdentities[uid] : null;
+}
+// The name agent `uid` is bound to, or null.
 function hostOfUid(uid) {
-  for (const [k, a] of Object.entries(agents)) {
-    if (a && a.agentUid === uid) return k;
+  const e = identityOf(uid);
+  return e ? e.home : null;
+}
+function identityByOrigin(host) {
+  for (const [uid, e] of Object.entries(agentIdentities)) {
+    if (e && e.origin === host) return uid;
   }
   return null;
 }
-// May agent `uid` act as `host`? True when the host is already bound to it, or
-// when no record holds the name at all (a first registration, or a RENAME onto a
-// free name — the heartbeat then moves the agent's record, `renameAgentRecord`).
-// A name another record holds is never claimable: a legacy record with no
-// `agentUid` is bound to it only by a hub mint (roll/enroll), so an identity
-// token can never take over a host it was not minted for.
+// Why a NAME-derived token may no longer act as `host`, or null. Once its agent
+// has beaten on the identity minted for that name, the name token is retired —
+// else the old token could open a second record beside a renamed agent, or a
+// leaked one could fetch the identity token. And a record bound to an identity
+// minted for ANOTHER name never accepts this name's token.
+function nameTokenRefusal(host) {
+  const minted = identityOf(identityByOrigin(host));
+  if (minted && minted.used) {
+    return `${host} now authenticates with its agent identity token; its name-derived token is retired`;
+  }
+  const a = Object.prototype.hasOwnProperty.call(agents, host) ? agents[host] : null;
+  if (a && a.agentUid) {
+    const e = identityOf(a.agentUid);
+    if (!e || e.origin !== host) return `${host} is registered to another agent`;
+  }
+  return null;
+}
+const lowerName = (n) => String(n).toLowerCase();
+// Why agent `uid` may not act as `host`, or null. Its own home is always its
+// own (unless another agent's record sits there). Any other name is a RENAME,
+// and a rename must not take a name that belongs to anyone else:
+//   - a name a record holds, an identity calls home, or a live host holds in
+//     another casing;
+//   - a name the usage ledger remembers (a removed host's), unless this agent
+//     went by it — or a compromised agent could squat a removed host's name
+//     and receive what is queued for it;
+//   - nor may it move while its current home is still beating and not
+//     restarting: a real rename restarts the agent, so that is two machines
+//     sharing one token (a cloned env file), and moving would hand one the
+//     other's commands.
+function uidHostRefusal(uid, host, now = Date.now()) {
+  const e = identityOf(uid);
+  if (!e) return "unknown agent identity — enroll again";
+  if (!isPlainHostKey(host) || !hostAgentToken(host)) return `${host} is not a usable host name`;
+  const rec = Object.prototype.hasOwnProperty.call(agents, host) ? agents[host] : null;
+  if (rec && rec.agentUid && rec.agentUid !== uid) return `${host} is registered to another agent`;
+  // Its home: a record there with no id is this agent's own, from before its
+  // first beat on the identity (minted while the host still ran on its name).
+  if (e.home === host) return null;
+  if (rec && !rec.agentUid) return `${host} is registered to another agent`;
+  if (rec) return null; // a stale copy of this agent's own record (an HA ghost)
+  const mine = new Set([e.origin, e.home, ...(Array.isArray(e.names) ? e.names : [])].map(lowerName));
+  const want = lowerName(host);
+  for (const [other, o] of Object.entries(agentIdentities)) {
+    if (other !== uid && o && lowerName(o.home) === want) return `${host} is registered to another agent`;
+  }
+  if (!mine.has(want)) {
+    for (const k of Object.keys(agents)) {
+      if (lowerName(k) === want) return `${host} is registered to another agent`;
+    }
+    if (usageLedger.has(host)) return `${host} belonged to another host — remove its usage history to reuse the name`;
+  }
+  const home = Object.prototype.hasOwnProperty.call(agents, e.home) ? agents[e.home] : null;
+  if (home && home.agentUid === uid && !(home.updating && now < home.updating.until) &&
+      now - (home.lastSeen || 0) < OFFLINE_AFTER_MS) {
+    return `this agent identity is still beating as ${e.home} — two agents share one token`;
+  }
+  return null;
+}
 function uidHostClaim(uid, host) {
-  if (!uid || typeof host !== "string" || !isPlainHostKey(host)) return false;
-  if (!Object.prototype.hasOwnProperty.call(agents, host)) return true;
-  const a = agents[host];
-  return !!a && a.agentUid === uid;
+  return !uidHostRefusal(uid, host);
 }
 // The credential a host's agent runs with, as the hub knows it: its identity
 // token once it beat on one, else its name token. ttydAuth needs exactly this.
@@ -1258,23 +1325,65 @@ function agentOwnToken(host) {
   if (a && a.uidBound && a.agentUid) return uidAgentToken(a.agentUid);
   return hostAgentToken(host);
 }
-// The identity token to HAND an existing host (roll/enroll): its bound id if it
-// has one, else a fresh id stamped onto its record so the agent's first beat on
-// it is bound, not a claim. A host with no record yet gets an unstamped id; its
-// first beat claims the free name.
+const AGENT_IDENTITIES_MAX = 1024;
+const AGENT_NAMES_MAX = 8;
+// The identity to HAND `host` (roll/enroll): the one minted for that name if
+// any (idempotent), else the one its record is bound to, else a fresh one —
+// registered and stamped on its record, so the agent's first beat on it is bound.
 function issueAgentUid(host) {
   const a = Object.prototype.hasOwnProperty.call(agents, host) ? agents[host] : null;
-  if (a && typeof a.agentUid === "string" && AGENT_UID_RE.test(a.agentUid)) return a.agentUid;
-  const uid = newAgentUid();
-  if (a) { a.agentUid = uid; publishAgent(host); }
+  let uid = identityByOrigin(host);
+  if (!uid && a && a.agentUid && identityOf(a.agentUid) && agentIdentities[a.agentUid].home === host) {
+    uid = a.agentUid;
+  }
+  if (!uid) {
+    uid = newAgentUid();
+    agentIdentities[uid] = { origin: host, home: host, at: Date.now() };
+    trimAgentIdentities(uid);
+    persistAgentIdentities();
+  }
+  if (a && a.agentUid !== uid && hostOfUid(uid) === host) { a.agentUid = uid; publishAgent(host); }
   return uid;
 }
+// Bound the registry, oldest first — never an identity a live record is bound to.
+function trimAgentIdentities(keep) {
+  const ids = Object.keys(agentIdentities);
+  if (ids.length <= AGENT_IDENTITIES_MAX) return;
+  const bound = new Set(Object.values(agents).map((a) => a && a.agentUid).filter(Boolean));
+  ids.filter((u) => u !== keep && !bound.has(u))
+    .sort((x, y) => (agentIdentities[x].at || 0) - (agentIdentities[y].at || 0))
+    .slice(0, ids.length - AGENT_IDENTITIES_MAX)
+    .forEach((u) => { delete agentIdentities[u]; });
+}
+// A beat on identity `uid` as `key` (already authorized): mark it used and, on a
+// rename, move its home. Returns the name it moved FROM, or null.
+function noteIdentityBeat(uid, key) {
+  const e = identityOf(uid);
+  if (!e) return null;
+  let changed = !e.used;
+  e.used = true;
+  let from = null;
+  if (e.home !== key) {
+    from = e.home;
+    const names = (Array.isArray(e.names) ? e.names : []).filter((n) => n !== from && n !== key);
+    e.names = [...names, from].slice(-AGENT_NAMES_MAX);
+    e.home = key;
+    changed = true;
+  }
+  if (changed) persistAgentIdentities();
+  return from;
+}
 const FORMER_NAMES_MAX = 8;
-// Retire `oldKey` after its agent beat in as `newKey` (XERK-2381). The new record
-// was built from the old one, so this only drops the old name and re-points what
-// the hub keeps BY name: a ticket pinned to the old host follows it.
 // Feed the usage ledger the names each live record was renamed away from, so a
 // retired old name's spend folds into the agent's current card (XERK-2381).
+// A refused RENAME beat leaves the agent's record under its old name; stamp the
+// refusal there (XERK-298) so the card says why it froze.
+function stampRenameRefusal(oldKey, reason, detail) {
+  if (!oldKey || !agents[oldKey]) return;
+  stampRefusal(agents[oldKey], reason, detail);
+  recordBytes.set(oldKey, agentRecordSize(agents[oldKey]));
+  publishAgent(oldKey);
+}
 function syncLedgerAliases() {
   const pairs = [];
   for (const [k, a] of Object.entries(agents)) {
@@ -1282,23 +1391,33 @@ function syncLedgerAliases() {
   }
   usageLedger.setHostAliases(pairs);
 }
-function renameAgentRecord(oldKey, newKey) {
-  console.log(`agent renamed: ${logName(oldKey)} -> ${logName(newKey)} (same agent identity)`);
-  delete agents[oldKey];
-  recordBytes.delete(oldKey);
-  recordSizeWarned.delete(oldKey);
-  shareWarned.delete(oldKey);
-  deviceCollisionWarned.delete(oldKey);
-  markAgentRemoved(oldKey);
-  sseBroadcast("removed", { key: oldKey });
+// Retire every other record bound to `uid` once its agent beat in as `newKey`
+// (XERK-2381): the renamed-from record, and any stale HA copy. The new record
+// was built from the old one, so this drops the old names and re-points what the
+// hub keeps BY name: a ticket pinned to the old host follows it.
+function renameAgentRecord(uid, newKey) {
   let pinsMoved = false;
-  for (const p of Object.values(ticketAgents)) {
-    if (p && p.host === oldKey) { p.host = newKey; pinsMoved = true; }
+  let removed = false;
+  for (const oldKey of Object.keys(agents)) {
+    if (oldKey === newKey || !agents[oldKey] || agents[oldKey].agentUid !== uid) continue;
+    removed = true;
+    console.log(`agent renamed: ${logName(oldKey)} -> ${logName(newKey)} (same agent identity)`);
+    delete agents[oldKey];
+    recordBytes.delete(oldKey);
+    recordSizeWarned.delete(oldKey);
+    shareWarned.delete(oldKey);
+    deviceCollisionWarned.delete(oldKey);
+    markAgentRemoved(oldKey);
+    sseBroadcast("removed", { key: oldKey });
+    for (const p of Object.values(ticketAgents)) {
+      if (p && p.host === oldKey) { p.host = newKey; pinsMoved = true; }
+    }
   }
   if (pinsMoved) {
     persistTicketAgents();
     sseBroadcast("ticketAgents", ticketAgents);
   }
+  if (!removed) return;
   syncLedgerAliases();
   invalidateAgentsCache();
   scheduleSave();
@@ -2609,6 +2728,32 @@ const persistTicketAgents = registerExternalStore({
   name: "ticketAgents", file: TICKET_AGENTS_FILE,
   coerce: asPlainObject, read: () => ticketAgents, install: (v) => { ticketAgents = v; },
 });
+// Agent identities (XERK-2381) — see identityOf. Durable like the pins above:
+// losing it would lock every renamed agent out of its own name.
+let agentIdentities = coerceAgentIdentities(readJsonFile(AGENT_IDENTITIES_FILE));
+const persistAgentIdentities = registerExternalStore({
+  name: "agentIdentities", file: AGENT_IDENTITIES_FILE,
+  coerce: coerceAgentIdentities, read: () => agentIdentities, install: (v) => { agentIdentities = v; },
+});
+// Whitelist, field by field (a hand-edited file or a remote replica's value).
+// Inline literals: this runs at module init.
+function coerceAgentIdentities(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  const name = (n) => typeof n === "string" && n.length > 0 && n.length <= 200;
+  for (const [uid, e] of Object.entries(raw)) {
+    if (!/^[0-9a-f]{32}$/.test(uid) || !e || typeof e !== "object") continue;
+    if (!name(e.origin) || !name(e.home)) continue;
+    const rec = { origin: e.origin, home: e.home, at: Number.isSafeInteger(e.at) && e.at > 0 ? e.at : 0 };
+    if (e.used === true) rec.used = true;
+    if (Array.isArray(e.names)) {
+      const names = e.names.filter(name).slice(-8);
+      if (names.length) rec.names = names;
+    }
+    out[uid] = rec;
+  }
+  return out;
+}
 function ticketAgentPin(siteKey, issueKey) {
   const p = ticketAgents[`${siteKey}/${issueKey}`];
   return p && typeof p.host === "string" && p.host ? p : null;
@@ -5983,6 +6128,16 @@ function publicCommands(cmds) {
   });
 }
 
+function servedCommands(cmds) {
+  const pub = publicCommands(cmds);
+  if (!Array.isArray(pub) || !pub.some((c) => c && c.type === "setToken")) return pub;
+  return pub.map((c) => {
+    if (!c || c.type !== "setToken") return c;
+    const { token: _token, ...rest } = c;
+    return rest;
+  });
+}
+
 function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
   // `resultWaits` is per-command bookkeeping with timestamps (XERK-151) — pure
   // internal state, stripped like the caches. `tokenBound` is HUB-OWNED (the
@@ -6035,7 +6190,9 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
     // (`fold` → null), which would otherwise serve the junk repo unfolded.
     // Idempotent, and returns the list unchanged when nothing matches.
     repoUsage: usageLedger.foldSystemRepos((durable && durable.repoUsage) || a.repoUsage),
-    commands: publicCommands(a.commands),
+    // A setToken's credential rides only the agent's own reply, never the
+    // fleet payload every logged-in viewer reads (XERK-2381).
+    commands: servedCommands(a.commands),
     // Each session's hub-derived attention (XERK-1571), stamped on a CLONE of
     // sessions[] — never into the stored record. See sessionsWithAttention.
     sessions: sessionsWithAttention(a.sessions, a.alerts && a.alerts.sessions),
@@ -12683,7 +12840,7 @@ function agentBearerKind(req, host) {
     const bound = tokenHost(token);
     // A host token proves exactly one host. Naming any other is the
     // impersonation this exists to refuse — not a fallback to `legacy`.
-    if (bound) return host != null && bound === host ? "proved" : null;
+    if (bound) return host != null && bound === host && !nameTokenRefusal(host) ? "proved" : null;
     const uid = tokenUid(token);
     if (uid) return host != null && uidHostClaim(uid, host) ? "proved" : null;
     if (safeEqual(token, TURMA_AGENT_TOKEN)) return "legacy";
@@ -12710,16 +12867,17 @@ function agentHostRefusal(req, host) {
     const bound = tokenHost(bearer);
     const uid = bound ? null : tokenUid(bearer);
     if (uid) {
-      // An identity token naming a host another agent's record holds. Naming
-      // which one it IS bound to is safe for the same reason as below: the
+      // An identity token that may not act as this host (uidHostRefusal says
+      // why). Naming where it IS bound is safe for the same reason as below: the
       // caller holds that agent's credential.
       const mine = hostOfUid(uid);
       return {
         status: 403,
-        error: `${host} is registered to another agent` +
-          (mine ? ` (this agent is ${mine})` : "") +
-          " — remove that host from the dashboard to reuse its name",
+        error: (uidHostRefusal(uid, host) || "unauthorized") + (mine && mine !== host ? ` (this agent is ${mine})` : ""),
       };
+    }
+    if (bound && bound === host) {
+      return { status: 403, error: nameTokenRefusal(host) || "unauthorized" };
     }
     if (bound) {
       return {
@@ -12760,6 +12918,9 @@ function resolveEnrollToken(req, device) {
       body: { host: hostOfUid(provedUid) || device || null, token: uidAgentToken(provedUid), bound: true } };
   }
   const proved = bearer ? tokenHost(bearer) : null;
+  if (proved && nameTokenRefusal(proved)) {
+    return { status: 403, body: { error: nameTokenRefusal(proved) } };
+  }
   if (proved) {
     // On its name-derived token: trade it for this host's IDENTITY token, so a
     // later rename keeps the agent (XERK-2381). Keyed on the PROVED host,
@@ -12823,7 +12984,7 @@ function agentWsAuthorized(url, req, host) {
   if (!TURMA_AGENT_TOKEN) return true;
   const token = url.searchParams.get("token");
   if (token) {
-    if (host != null && safeEqual(token, hostAgentToken(host))) return true;
+    if (host != null && safeEqual(token, hostAgentToken(host))) return !nameTokenRefusal(host);
     const uid = tokenUid(token);
     if (uid) return host != null && uidHostClaim(uid, host);
     return !TURMA_AGENT_STRICT && safeEqual(token, TURMA_AGENT_TOKEN);
@@ -19657,7 +19818,8 @@ const server = http.createServer(async (req, res) => {
       // command queue, org binding, alerts) instead of starting a new host.
       const beatUid = tokenBound ? tokenUid((req.headers.authorization || "").slice(7)) : null;
       const uidHome = beatUid ? hostOfUid(beatUid) : null;
-      const renamedFrom = uidHome && uidHome !== key ? uidHome : null;
+      const renamedFrom = uidHome && uidHome !== key && agents[uidHome] &&
+        agents[uidHome].agentUid === beatUid ? uidHome : null;
       // Admission control (XERK-272), ordered AFTER the binding above so an
       // unbound beat can never spend a registry slot. A host already in the
       // registry always gets in — its record is bounded below and replacing it
@@ -19858,7 +20020,7 @@ const server = http.createServer(async (req, res) => {
         // usage ledger folds their retired spend into this card (XERK-2381).
         formerNames: renamedFrom
           ? [...(Array.isArray(prev.formerNames) ? prev.formerNames : []), renamedFrom]
-            .filter((n) => n !== key).slice(-FORMER_NAMES_MAX)
+            .filter((n, i, all) => n !== key && all.indexOf(n) === i).slice(-FORMER_NAMES_MAX)
           : prev.formerNames,
         lastSeen: Date.now(),
         // Per-agent alert bookkeeping survives across beats and hub restarts.
@@ -19925,6 +20087,7 @@ const server = http.createServer(async (req, res) => {
           publishAgent(key);
         } else {
           delete agents[key];
+          stampRenameRefusal(renamedFrom, "record-too-large", detail);
         }
         console.error(`heartbeat from ${logName(key)}: ${detail} — beat refused`);
         return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
@@ -20011,6 +20174,7 @@ const server = http.createServer(async (req, res) => {
         } else {
           delete agents[key];
           recordBytes.delete(key);
+          stampRenameRefusal(renamedFrom, "registry-full", detail);
         }
         logRegistryFull(`${logName(key)} refused — its ${detail}`);
         return json(res, 429, {
@@ -20023,7 +20187,10 @@ const server = http.createServer(async (req, res) => {
       usageLedger.ingest(key, next);
       // A rename (XERK-2381) lands only now, past every gate that could refuse
       // the beat: the old name's record goes, the new one already holds it.
-      if (renamedFrom) renameAgentRecord(renamedFrom, key);
+      if (beatUid) {
+        noteIdentityBeat(beatUid, key);
+        renameAgentRecord(beatUid, key);
+      }
       // The permission ledger (XERK-1563), after the same gates and for the same
       // reason. Every field is whitelisted + bounded inside (sanitizePermissionEvent).
       if (Array.isArray(permissionEvents) && permissionEvents.length) {
@@ -23785,6 +23952,9 @@ if (process.env.TURMA_TEST) {
     tokenUid,
     uidHostClaim,
     hostOfUid,
+    uidHostRefusal,
+    nameTokenRefusal,
+    agentIdentities: () => agentIdentities,
     ttydAuth,
     triggerAuthorized,
     safeEqual,
