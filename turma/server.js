@@ -4029,10 +4029,13 @@ function* dailyBriefMeetings(s, ms, fromDay, step, days) {
 // The next brief after `now`: {runAt, meetingAt}, runAt = meetingAt minus the
 // lead. Null for a disabled or unusable schedule. Pure; the scheduler (XERK-2395)
 // keys "already ran" on meetingAt, which is unique per meeting date (DST included).
+// Both forward scans start one local day BEFORE today's: in a zone whose spring
+// gap opens at 23:00 (America/Nuuk), yesterday's 23:xx meeting resolves past local
+// midnight, so it can still be the next one after `now` (XERK-2415).
 function nextDailyBriefRun(schedule, now = Date.now()) {
   const s = sanitizeDailyBriefSchedule(schedule);
   if (!s || !s.enabled) return null;
-  for (const meetingAt of dailyBriefMeetings(s, now, 0, 1, 9)) {
+  for (const meetingAt of dailyBriefMeetings(s, now, -1, 1, 10)) {
     const runAt = meetingAt - s.leadMinutes * 60e3;
     if (runAt > now) return { runAt, meetingAt };
   }
@@ -4048,7 +4051,7 @@ function dailyBriefWindow(schedule, now = Date.now(), lastRunAt = null) {
   if (!s) return null;
   const weekFrom = now - 7 * 86400e3;
   let meetingAt = null;
-  for (const t of dailyBriefMeetings(s, now, 0, 1, 9)) {
+  for (const t of dailyBriefMeetings(s, now, -1, 1, 10)) {
     if (t >= now) { meetingAt = t; break; }
   }
   let prev = null;

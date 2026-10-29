@@ -27489,6 +27489,18 @@ test("XERK-2391: nextDailyBriefRun across DST — the spring gap still fires, th
     "2026-10-26T09:00:00.000Z", "GMT after the 10-25 change");
 });
 
+test("XERK-2415: a 23:xx meeting pushed past midnight by the spring gap is still next", () => {
+  const { nextDailyBriefRun: next, dailyBriefWindow: win } = hub;
+  // Nuuk's 2025 gap opens 23:00 on 03-29, so 23:30 that day resolves to 01:30Z on
+  // 03-30 — after local midnight (01:00Z). At 01:10Z its 01:25Z run is still ahead.
+  const nuuk = { ...NY2391, time: "23:30", timeZone: "America/Godthab", weekdays: [0, 1, 2, 3, 4, 5, 6], leadMinutes: 5 };
+  const now = Date.parse("2025-03-30T01:10:00Z");
+  assert.equal(iso2391(next(nuuk, now).meetingAt), "2025-03-30T01:30:00.000Z");
+  assert.equal(iso2391(win(nuuk, now).meetingAt), "2025-03-30T01:30:00.000Z");
+  // After that run, the next is the following day's 23:30, now at -01.
+  assert.equal(iso2391(next(nuuk, now + 20 * 60e3).meetingAt), "2025-03-31T00:30:00.000Z");
+});
+
 test("XERK-2391: DST holds east of +12h (Auckland) and offset zones are refused", () => {
   const { nextDailyBriefRun: next, sanitizeDailyBriefSchedule: san } = hub;
   // NZ spring-forward 2026-09-27 02:00 NZST -> 03:00 NZDT: 02:30 reads 03:30 NZDT.
