@@ -214,7 +214,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " armTermWatch, disarmTermWatch, termWatchdog, getTermWatch: () => termWatch,"
       + " chatToTerminal, terminalToChat, chatToTrajectory, trajectoryToChat, renderTrajectory,"
       + " transcriptToTrajectory, trajectoryBack, trajScrollClick, trajScrollKey, trajToggleTurn, loadTrajectory,"
-      + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml, hostCapHtml,"
+      + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml, hostCapHtml, toggleHost, hostWeekly, hostWeeklyHtml,"
       + " applyAgent, mergeSnapshot, sseClock: () => sseClock,"
       + " setCache: (c) => { cache = c; }, getCache: () => cache, setDraft: (t) => { renameDraft = t; },"
       + " setPendingSelectAt: (t) => { pendingSelectAt = t; }, SELECT_FOLLOW_MS };");
@@ -3946,5 +3946,69 @@ test("render puts the capacity beside the host in the New-session picker", () =>
   const data = host([]);
   data.host.capacity = { maxSessions: 6, running: 6, queued: 0, free: 0 };
   p.beat({ now: data.now, agents: [data.host] });
-  assert.match(p.els.spawn.innerHTML, /<div class="hname">hostA <span class="hcap full"[^>]*>6 \/ 6<\/span><\/div>/);
+  assert.match(p.els.spawn.innerHTML,
+    /<span class="hlabel">hostA<\/span><span class="hcap full"[^>]*>6 \/ 6<\/span><\/button>/);
+});
+
+// A host with dozens of repos buried every other host's list, so each host is
+// collapsed to its header until clicked — except a lone host (nothing to pick
+// between) and a host with an open composer (collapsing must not hide it).
+test("New-session picker: hosts collapsed until their header is clicked", () => {
+  const p = loadPage();
+  const a = host([]).host;
+  const b = { ...host([]).host, key: "hostB", device: "hostB", repos: [{ name: "repoY" }] };
+  p.beat({ now: Date.now(), agents: [a, b] });
+  let html = p.els.spawn.innerHTML;
+  assert.doesNotMatch(html, /repoX|repoY/, "no repo rendered while collapsed");
+  assert.match(html, /aria-expanded="false"[^>]*onclick="toggleHost\('hostA'\)"/);
+  p.toggleHost("hostA");
+  html = p.els.spawn.innerHTML;
+  assert.match(html, /\+ repoX/);
+  assert.doesNotMatch(html, /repoY/);
+  p.toggleHost("hostA");
+  assert.doesNotMatch(p.els.spawn.innerHTML, /repoX/);
+  // An open composer keeps its host open.
+  p.toggleComposer("hostB::repoY", "repoY");
+  assert.match(p.els.spawn.innerHTML, /repoY/);
+  // One host: always open.
+  const q = loadPage();
+  q.beat({ now: Date.now(), agents: [a] });
+  assert.match(q.els.spawn.innerHTML, /\+ repoX/);
+});
+
+test("hostWeekly: freshest 7d reading on the host's subscription, stale/absent read none", () => {
+  const { hostWeekly } = loadPage();
+  const now = 2_000_000_000;
+  const lim = (pct, age) => ({ capturedAt: now - age, sevenDay: { usedPct: pct, resetsAt: now + 3600 } });
+  const a = { key: "a", subscription: { key: "S" }, limits: lim(40, 600) };
+  const b = { key: "b", subscription: { key: "S" }, limits: lim(55, 60) };
+  const c = { key: "c", subscription: { key: "T" }, limits: lim(90, 1) };
+  const solo = { key: "d", limits: lim(20, 60) };
+  assert.equal(hostWeekly(a, [a, b, c, solo], now).usedPct, 55, "same-sub freshest wins");
+  assert.equal(hostWeekly(c, [a, b, c, solo], now).usedPct, 90);
+  // No subscription key: never folded into another silent host.
+  assert.equal(hostWeekly(solo, [solo, { key: "e", limits: lim(5, 1) }], now).usedPct, 20);
+  assert.equal(hostWeekly({ key: "x", limits: lim(10, 25 * 3600) }, [], now), null, "over a day old");
+  assert.equal(hostWeekly({ key: "x", limits: { capturedAt: now, sevenDay: {} } }, [], now), null);
+  assert.equal(hostWeekly({ key: "x" }, [], now), null);
+});
+
+test("hostWeeklyHtml: width, levels, pace tick, a passed reset reads —", () => {
+  const { hostWeeklyHtml } = loadPage();
+  const now = 2_000_000_000;
+  const half = hostWeeklyHtml({ usedPct: 41.4, resetsAt: now + 3.5 * 86400 }, now);
+  assert.match(half, /class="hweek"/);
+  assert.match(half, /width:41.4%/);
+  assert.match(half, />41%</);
+  assert.match(half, /class="hweek-pace" style="left:50.0%"/);
+  assert.match(half, /resets in 3d 12h/);
+  assert.match(hostWeeklyHtml({ usedPct: 80 }, now), /class="hweek warn"/);
+  assert.match(hostWeeklyHtml({ usedPct: 95 }, now), /class="hweek crit"/);
+  assert.doesNotMatch(hostWeeklyHtml({ usedPct: 95 }, now), /hweek-pace/, "no reset, no pace");
+  const gone = hostWeeklyHtml({ usedPct: 70, resetsAt: now - 5 }, now);
+  assert.match(gone, /class="hweek expired"/);
+  assert.match(gone, />—</);
+  assert.match(gone, /width:0%/);
+  assert.equal(hostWeeklyHtml(null, now), "");
+  assert.equal(hostWeeklyHtml({ usedPct: "x" }, now), "");
 });

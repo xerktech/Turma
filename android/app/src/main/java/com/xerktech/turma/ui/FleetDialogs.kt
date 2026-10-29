@@ -3,6 +3,20 @@ package com.xerktech.turma.ui
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import com.xerktech.turma.ui.theme.TurmaColors
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -318,6 +332,8 @@ fun NewSessionPickerDialog(
     onDismiss: () -> Unit,
     onPick: (host: String, repo: String, isRoot: Boolean) -> Unit,
 ) {
+    val expanded = remember { mutableStateListOf<String>() }
+    val nowSec = System.currentTimeMillis() / 1000
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("New session") },
@@ -330,33 +346,52 @@ fun NewSessionPickerDialog(
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     targets.forEach { h ->
+                        // Each host is collapsed to its header until tapped (web `hostBlock`): a
+                        // host with dozens of repos otherwise buried every other host's list. A
+                        // lone host is always open — there is nothing to pick between.
+                        val open = targets.size == 1 || h.key in expanded
                         // The agent/host name headers each group of repos. Render it LARGER than
                         // the repo rows below it (which take the dialog's default bodyMedium, 14sp)
                         // so where one agent's list ends and the next begins is easy to see — the
                         // muted labelSmall SectionLabel read SMALLER than its own rows (XERK-737).
                         Row(
-                            Modifier.padding(top = 12.dp, bottom = 4.dp),
+                            Modifier.fillMaxWidth()
+                                .clickable { if (!expanded.remove(h.key)) expanded.add(h.key) }
+                                .padding(top = 12.dp, bottom = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Text(
-                                h.device,
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.weight(1f, fill = false),
+                            Icon(
+                                if (open) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                                contentDescription = if (open) "Collapse" else "Expand",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(end = 4.dp).size(20.dp),
                             )
-                            // Active / limit, so a full host is visible before queueing onto it.
-                            hostCapLabel(h.capacity)?.let { cap ->
+                            // Name + count take the slack (ellipsizing a long name) so every
+                            // host's weekly bar lands in the same right-hand column.
+                            Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
                                 Text(
-                                    cap.text,
-                                    style = MaterialTheme.typography.titleSmall,
-                                    fontWeight = if (cap.full) FontWeight.SemiBold else FontWeight.Normal,
-                                    color = if (cap.full) MaterialTheme.colorScheme.error
-                                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(start = 8.dp),
+                                    h.device,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f, fill = false),
                                 )
+                                // Active / limit, so a full host is visible before queueing onto it.
+                                hostCapLabel(h.capacity)?.let { cap ->
+                                    Text(
+                                        cap.text,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = if (cap.full) FontWeight.SemiBold else FontWeight.Normal,
+                                        color = if (cap.full) MaterialTheme.colorScheme.error
+                                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(start = 8.dp),
+                                    )
+                                }
                             }
+                            HostWeeklyBar(h.weekly, nowSec)
                         }
-                        h.repos.forEach { repo ->
+                        if (open) h.repos.forEach { repo ->
                             Text(
                                 if (repo.root) "⌂ Repos root" else repo.name,
                                 Modifier.fillMaxWidth()
@@ -372,6 +407,52 @@ fun NewSessionPickerDialog(
         confirmButton = {},
         dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
+}
+
+/**
+ * A small copy of the Usage screen's weekly (7d) bar beside a host in the
+ * New-session picker (web `hostWeeklyHtml`), so the host with the most headroom
+ * is easy to pick: same 75%/90% colours, "—" once the reset passed, and a tick
+ * at NOW — the even-pace point. Nothing when the host has no reading.
+ */
+@Composable
+private fun HostWeeklyBar(win: com.xerktech.turma.model.LimitWindow?, nowSec: Long) {
+    val view = com.xerktech.turma.vm.UsageViewModel.limitView(win, nowSec, pace = true) ?: return
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val color = when {
+        view.expired -> muted
+        view.level == com.xerktech.turma.vm.UsageViewModel.LimitView.Level.CRIT -> TurmaColors.critical
+        view.level == com.xerktech.turma.vm.UsageViewModel.LimitView.Level.WARN -> TurmaColors.warning
+        else -> MaterialTheme.colorScheme.primary
+    }
+    val paceColor = MaterialTheme.colorScheme.onSurface
+    Row(Modifier.padding(start = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            Modifier.width(56.dp).height(5.dp)
+                .clip(RoundedCornerShape(3.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            val fraction = if (view.expired) 0f else (view.pct / 100.0).toFloat()
+            if (fraction > 0f) {
+                Box(Modifier.fillMaxWidth(fraction).fillMaxHeight().background(color))
+            }
+            val pace = view.pacing?.paceFrac
+            if (pace != null && !view.expired) {
+                Canvas(Modifier.matchParentSize()) {
+                    val x = (pace * size.width).toFloat()
+                    drawRect(paceColor, Offset(x - 0.75f, 0f), Size(1.5f, size.height))
+                }
+            }
+        }
+        Text(
+            if (view.expired) "—" else "${Math.round(view.pct)}%",
+            style = MaterialTheme.typography.labelSmall,
+            color = muted,
+            textAlign = TextAlign.End,
+            maxLines = 1,
+            modifier = Modifier.width(34.dp),
+        )
+    }
 }
 
 @Composable

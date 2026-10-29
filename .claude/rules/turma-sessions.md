@@ -18,6 +18,15 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
 - **`chat.js` is VENDORED into glasses byte-identical** as `glasses/src/vendor/chat.cjs` (like
   `board.js`), asserted by `vendor.test.ts`, gated by `glasses-ci.yml`. Re-copy on every edit (`cp
   turma/public/chat.js glasses/src/vendor/chat.cjs`) or glasses CI fails.
+- **The New-session picker shows each host COLLAPSED to its header** (name, active / max, a mini
+  weekly-limit bar); its repos render only once clicked — a host with dozens of repos buried the
+  rest. Web `hostBlock`/`hostOpen`, Android `NewSessionPickerDialog`.
+  - A host stays open while one of its composers is open or a spawn from it is in flight
+    (collapsing must not hide work in progress); a lone host is always open.
+  - The bar is the host's SUBSCRIPTION's freshest 7d reading (`hostWeekly`, web + Android), the
+    Usage page's fold: hosts on one account share a pool, so a stale host must not read lower.
+    Dropped past a day old; a passed reset reads "—". Tests: the picker/`hostWeekly*` cases in
+    `sessions.test.js`, `SessionsFlattenTest`.
 - **The fleet payload is polled ONCE, at load, while SSE is healthy** — the fallback interval only
   fires when SSE isn't. Anything on `cache` that must MOVE in the browser needs its own
   `es.addEventListener` in `connectSSE` (`agent`, `removed`, `orgColors`, `migrations` each have one);

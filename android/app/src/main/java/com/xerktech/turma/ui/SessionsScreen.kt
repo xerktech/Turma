@@ -318,7 +318,30 @@ data class SpawnHost(
     val device: String,
     val repos: List<com.xerktech.turma.model.RepoInfo>,
     val capacity: com.xerktech.turma.model.Capacity? = null,
+    /** The host's subscription weekly (7d) window for the picker's mini bar ([hostWeekly]). */
+    val weekly: com.xerktech.turma.model.LimitWindow? = null,
 )
+
+/**
+ * The weekly (7d) window drawn beside a host in the New-session picker (web
+ * `hostWeekly`): the freshest reading any host on the same subscription took —
+ * the Usage page's one-card-per-subscription fold, strictly newer replaces — or
+ * this host's own when it reports no subscription (never folded into another
+ * silent host). Null with no percentage, or past [UsageViewModel.LIMIT_MAX_AGE_SEC].
+ */
+fun hostWeekly(a: AgentInfo, agents: List<AgentInfo>, nowSec: Long): com.xerktech.turma.model.LimitWindow? {
+    val key = a.subscription?.key?.takeIf { it.isNotBlank() }
+    var best: com.xerktech.turma.model.LimitWindow? = null
+    var bestAt = 0L
+    for (b in if (key == null) listOf(a) else agents) {
+        if (b !== a && b.subscription?.key != key) continue
+        val lim = b.limits ?: continue
+        val win = lim.sevenDay?.takeIf { it.usedPct != null } ?: continue
+        if (nowSec - lim.capturedAt > com.xerktech.turma.vm.UsageViewModel.LIMIT_MAX_AGE_SEC) continue
+        if (best == null || lim.capturedAt > bestAt) { best = win; bestAt = lim.capturedAt }
+    }
+    return best
+}
 
 /**
  * "running / MAX_SESSIONS" beside a host in the New-session picker (web
@@ -342,13 +365,16 @@ fun hostCapLabel(c: com.xerktech.turma.model.Capacity?): HostCapLabel? {
  * allowed per host), matching the dashboard's hidden "+ New session" there. A host
  * left with no spawnable repo is omitted.
  */
-fun spawnTargets(agents: List<AgentInfo>): List<SpawnHost> =
+fun spawnTargets(
+    agents: List<AgentInfo>,
+    nowSec: Long = System.currentTimeMillis() / 1000,
+): List<SpawnHost> =
     agents.filter { it.online }
         .map { a ->
             val repos = a.repos.filter { repo ->
                 !repo.root || a.sessions.none { it.root && it.status == "running" }
             }
-            SpawnHost(a.key, a.device.ifBlank { a.key }, repos, a.capacity)
+            SpawnHost(a.key, a.device.ifBlank { a.key }, repos, a.capacity, hostWeekly(a, agents, nowSec))
         }
         .filter { it.repos.isNotEmpty() }
 
