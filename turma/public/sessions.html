@@ -1885,7 +1885,11 @@ function spawnReadyUploadIds(rk) {
 }
 // The header button's id, so the beat's innerHTML swap can hand its keyboard
 // focus back (captureFieldFocus restores `hhd-` ids like the composer's).
-function hostHeadId(key) { return "hhd-" + key.replace(/[^A-Za-z0-9]/g, "_"); }
+// Every non-alphanumeric is hex-escaped ("_2e_" for "."), so two hosts whose
+// keys differ only in punctuation (k8x-02 / k8x_02) never share an id.
+function hostHeadId(key) {
+  return "hhd-" + key.replace(/[^A-Za-z0-9]/g, c => "_" + c.codePointAt(0).toString(16) + "_");
+}
 function toggleHost(key) {
   if (hostOpen.has(key)) hostOpen.delete(key); else hostOpen.add(key);
   render(cache);

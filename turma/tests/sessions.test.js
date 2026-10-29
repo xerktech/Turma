@@ -214,14 +214,14 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " armTermWatch, disarmTermWatch, termWatchdog, getTermWatch: () => termWatch,"
       + " chatToTerminal, terminalToChat, chatToTrajectory, trajectoryToChat, renderTrajectory,"
       + " transcriptToTrajectory, trajectoryBack, trajScrollClick, trajScrollKey, trajToggleTurn, loadTrajectory,"
-      + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml, hostCapHtml, toggleHost, hostWeekly, hostWeeklyHtml,"
+      + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml, hostCapHtml, toggleHost, hostWeekly, hostWeeklyHtml, hostHeadId,"
       + " applyAgent, mergeSnapshot, sseClock: () => sseClock,"
       + " setCache: (c) => { cache = c; }, getCache: () => cache, setDraft: (t) => { renameDraft = t; },"
       + " setPendingSelectAt: (t) => { pendingSelectAt = t; }, SELECT_FOLLOW_MS };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
-  return { ...api, els, opened, posts, toasts, chat, sse, gets, body: document.body,
+  return { ...api, els, opened, posts, toasts, chat, sse, gets, body: document.body, doc: document,
     // Deliver one window-level event (e.g. the terminal beacons' `message`) to
     // every listener the page registered for it.
     fireWindow: (type, evt) => (winListeners[type] || []).forEach((fn) => fn(evt)),
@@ -3974,6 +3974,28 @@ test("New-session picker: hosts collapsed until their header is clicked", () => 
   const q = loadPage();
   q.beat({ now: Date.now(), agents: [a] });
   assert.match(q.els.spawn.innerHTML, /\+ repoX/);
+});
+
+test("New-session picker: a focused host header keeps focus across a repaint", () => {
+  const p = loadPage();
+  const a = host([]).host;
+  const b = { ...host([]).host, key: "hostB", device: "hostB" };
+  p.beat({ now: Date.now(), agents: [a, b] });
+  const head = p.doc.getElementById("hhd-hostA");
+  let focused = 0;
+  head.focus = () => { focused++; };
+  p.doc.activeElement = head;
+  p.toggleHost("hostA");
+  p.beat({ now: Date.now(), agents: [a, b] });
+  assert.equal(focused, 2, "refocused after the toggle and after the beat");
+});
+
+test("hostHeadId: hosts differing only in punctuation get distinct ids", () => {
+  const { hostHeadId } = loadPage();
+  const ids = ["a.b", "a_b", "a b", "a-b", "ab", "ünï"].map(hostHeadId);
+  assert.equal(new Set(ids).size, ids.length);
+  for (const id of ids) assert.match(id, /^hhd-[A-Za-z0-9_]+$/);
+  assert.equal(hostHeadId("hostA"), "hhd-hostA");
 });
 
 test("hostWeekly: freshest 7d reading on the host's subscription, stale/absent read none", () => {

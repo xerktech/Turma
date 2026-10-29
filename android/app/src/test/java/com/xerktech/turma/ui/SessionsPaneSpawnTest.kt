@@ -85,6 +85,8 @@ class SessionsPaneSpawnTest {
             )
         }
         compose.onNodeWithContentDescription("New session").performClick()
+        // Each host is collapsed until its header is tapped.
+        compose.onNodeWithText(host).performClick()
         compose.onNodeWithText("Targetrepo").performClick()
         compose.waitForIdle()
         compose.onNodeWithText("New session · Targetrepo").assertIsDisplayed()
