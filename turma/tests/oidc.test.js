@@ -136,6 +136,11 @@ test("oidcSafeNext only permits local, same-origin paths", () => {
   assert.equal(hub.oidcSafeNext("/\\evil.example"), "/"); // backslash trick
   assert.equal(hub.oidcSafeNext(""), "/");
   assert.equal(hub.oidcSafeNext(null), "/");
+  // XERK-2399: what a browser's URL parser turns into another host.
+  assert.equal(hub.oidcSafeNext("/\t/evil.example"), "/");
+  assert.equal(hub.oidcSafeNext("/\n/evil.example"), "/");
+  assert.equal(hub.oidcSafeNext("/\\\\evil.example"), "/");
+  assert.equal(hub.oidcSafeNext("/term/a b/#x"), "/term/a%20b/#x");
 });
 
 test("oidcVerifySignature accepts a valid RS256 token and returns its claims", () => {
