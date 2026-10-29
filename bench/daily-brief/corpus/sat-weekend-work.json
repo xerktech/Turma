@@ -1,0 +1,690 @@
+{
+ "id": "sat-weekend-work",
+ "note": "real board, standup 2026-10-24 13:00 UTC",
+ "data": {
+  "source": "jira",
+  "siteKey": "acme.atlassian.net",
+  "window": {
+   "dayFrom": "2026-10-23T13:00:00+00:00",
+   "weekFrom": "2026-10-17T13:00:00+00:00",
+   "until": "2026-10-24T13:00:00+00:00"
+  },
+  "scope": [
+   "ACME"
+  ],
+  "closed": [
+   {
+    "key": "ACME-2240",
+    "summary": "Storyline: every release fails at deploy-prefect while Storyline is paused (gpu_claim enum)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2126",
+    "summary": "Write node-4-produced datasets (bot-play shards, SSL sidecars) to scratch first, upload to the NAS in the background",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2060",
+    "summary": "[Model B] index_recordings --inventory: report incomplete session dirs (no metadata.json) instead of skipping them silently",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2251",
+    "summary": "[Model B] test_emu_windowsmash_bench fails on hosts whose /tmp is noexec",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2246",
+    "summary": "[Model B] Recorder: the play report's stage id overrides the SSS banner on 19 matches that disagree (all read 'Kongo Falls')",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2217",
+    "summary": "[Model A] RAM spec: map hitstun frames-left, max jumps and up-B used (left over from ACME-2206)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part A: everything that does NOT need human recordings (bot-play data, IDM v0, YouTube corpus, eval + RL machinery)",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2247",
+    "summary": "Decide a size cap for parked recordings and find why one session ran 10.7 h",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2234",
+    "summary": "[Model A] A Kueue-preempted train_bc / train_ssl run restarts from epoch 1",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2068",
+    "summary": "Record pod: a pod's first match can go unrecorded when the CSS is left quickly",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1906",
+    "summary": "ryujinx-bump.yml can't push its bump branch: ARGOCD_PUSH_TOKEN lacks write on Robo-Ultimate (403)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2071",
+    "summary": "Rescan datasets/menu and logs css_arrival frames for the ACME-1923 is_css gate (share ACL blocks truenas_admin)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2249",
+    "summary": "tests-full flake: test_label_videos Prefect test harness times out starting its ephemeral server",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2238",
+    "summary": "[Rollup] Storyline: low-severity findings",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2127",
+    "summary": "Parked unrecoverable recordings sit on node-4 scratch silently (2.3 TB for 13 days)",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2250",
+    "summary": "Flaky test_recorder TestLiveStateAccess: 3-dim action races the 8-dim default and fails stop_session",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2248",
+    "summary": "tests-full fails on every PR: recorder manifest test requires replicas 1, ArgoCD parked it at 0",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2241",
+    "summary": "Robo CI and Release Pipeline Speed",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2244",
+    "summary": "Robo image builds re-download ~6 GB of cached layers every run: add a persistent in-cluster BuildKit",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2239",
+    "summary": "Robo: post-match ntfy recap shows the session's average FPS",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2243",
+    "summary": "Robo: a match recorded from its first GO! frame is rejected as 'match start not detected'",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2237",
+    "summary": "Robo: post-match ntfy recap reports every recording goal (incl. off-stage %)",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2230",
+    "summary": "[Rollup] Robo-Ultimate: low-severity findings (successor to ACME-2225)",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2205",
+    "summary": "[Model A] Scenario resets via RAM WRITE: put fighters at a chosen position/damage mid-match, no menus",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part A: everything that does NOT need human recordings (bot-play data, IDM v0, YouTube corpus, eval + RL machinery)",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2233",
+    "summary": "Check whether the Prefect API serves Secret block values without auth",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2235",
+    "summary": "Running the test suite on a host with MLFLOW_TRACKING_URI set registers real model versions in production MLflow",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2236",
+    "summary": "Storyline: send the Prefect API credential before Storyline is unpaused",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2216",
+    "summary": "WindowSmash spike: build the recompiled SSBU on node-4 and measure it as an RL env",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2228",
+    "summary": "[Model A] IDM stride-1 windows end 4 frames after the label, but a press first shows on screen 6 frames later",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2225",
+    "summary": "[Rollup] Robo-Ultimate: low-severity findings",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2223",
+    "summary": "[Model A] Fork lockstep: measure how far the shm frame trails guest RAM (a RAM write shows on screen 7-20 frames later)",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2227",
+    "summary": "Shadow runs show as real sessions and use session slots",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2229",
+    "summary": "Agent updater: a full /tmp silently keeps the host on the old release",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2231",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2215",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2219",
+    "summary": "Agent: qwen's Rewind picker reads as an idle composer, so a typed message steps into a rewind",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2224",
+    "summary": "[Rollup] Robo-Ultimate: low-severity findings",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2226",
+    "summary": "[Rollup] ArgoCD: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2222",
+    "summary": "Agent: dialogs still read as typeable at the smallest pane sizes (≤4 rows, 4–8 cols)",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2220",
+    "summary": "Agent: verify pane/ADO reads that have only been checked against docs or stripped captures",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2211",
+    "summary": "APPO throughput: spread fork-serve env-servers across node-4's cards",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2218",
+    "summary": "[Rollup] ArgoCD: low-severity findings",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2206",
+    "summary": "[Model A] RAM spec: map velocity, facing, hitstun/hitlag, shield, jumps left and animation frame for critic, reward and IDM masks",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part A: everything that does NOT need human recordings (bot-play data, IDM v0, YouTube corpus, eval + RL machinery)",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2214",
+    "summary": "OpenLinkHub: a very large PrepareForSleep spoof flood still delays logind's signal past 5s through godbus decoding",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2212",
+    "summary": "OpenLinkHub: a flood of spoofed PrepareForSleep signals can delay logind's real one past the 5s inhibit delay",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2207",
+    "summary": "APPO throughput: run more env-servers per node-4 and trim the ~13 ms/step outside the fork STEP",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part A: everything that does NOT need human recordings (bot-play data, IDM v0, YouTube corpus, eval + RL machinery)",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2209",
+    "summary": "Non auto starting tickets",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2076",
+    "summary": "train_ssl: stage the SSL clip-sidecar corpus off NFS (share random-read capped at ~25 samples/s)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2203",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2213",
+    "summary": "OpenLinkHub: no test covers how monitor.Init passes cacheOwner to watchSleepSignals",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2192",
+    "summary": "[Rollup] OpenLinkHub: low-severity findings",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2208",
+    "summary": "[Rollup] Robo-Ultimate: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2204",
+    "summary": "[Model A] Ryujinx fork: SAVE/LOAD guest-state ops on the control socket for instant mid-match resets",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part A: everything that does NOT need human recordings (bot-play data, IDM v0, YouTube corpus, eval + RL machinery)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1107",
+    "summary": "Rewrite stale .claude/rules/curriculum-cpu-level.md (cites deleted css_cursor_paths / make_cpu_level_sequence / MenuNavigator)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part A: everything that does NOT need human recordings (bot-play data, IDM v0, YouTube corpus, eval + RL machinery)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1441",
+    "summary": "Profile where each RL step's time goes (env-servers run ~37 of 60 fps); co-locate emulators with the learner if the RPC hop dominates",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Robo model, part A: everything that does NOT need human recordings (bot-play data, IDM v0, YouTube corpus, eval + RL machinery)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1234",
+    "summary": "[M6] Eval flow + MLflow champion/challenger: promote a checkpoint only if it beats the champion",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part A: everything that does NOT need human recordings (bot-play data, IDM v0, YouTube corpus, eval + RL machinery)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-2202",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2198",
+    "summary": "Turma: report the head commit for GitLab MRs and ADO PRs so CI-result messages see a new run",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2200",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2201",
+    "summary": "[Rollup] Robo-Ultimate: low-severity findings",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2181",
+    "summary": "[Rollup] Ledger: low-severity findings",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "week"
+   }
+  ],
+  "open": [
+   {
+    "key": "ACME-2399",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2365",
+    "summary": "Beacon: controller play in Battle.net games (WoW gamepad mode)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2363"
+    ]
+   },
+   {
+    "key": "ACME-2386",
+    "summary": "Retire the org brief; move decisions, permissions and model quality to a web-only Insights page",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2393",
+    "summary": "Daily Brief: standup prompt and Haiku-vs-Sonnet quality evaluation",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2392"
+    ]
+   },
+   {
+    "key": "ACME-2391",
+    "summary": "Daily Brief: per-org meeting schedule store, route and the hub<->agent wire contract",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2354",
+    "summary": "Atlas-nexus: ship the launch-view cleanup to gamehost (upstream PR or fork backend path)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2371",
+    "summary": "node-1 hard-froze 2026-10-28 (8.5 min dark); freeze now on 2 of 3 identical nodes — needs memtest/SOL at the rack",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-1469",
+    "summary": "[Model B] IDM v1: train on bot + human recordings; gate on held-out human sessions AND the YouTube-style eval set",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "status": "In Progress",
+    "daysInStatus": 0,
+    "blockedBy": [
+     "ACME-1463",
+     "ACME-1462",
+     "ACME-1468"
+    ]
+   },
+   {
+    "key": "ACME-1468",
+    "summary": "[Model B] GATE: confirm we have enough high-quality human recordings (closes only when sufficient; blocks all of this epic)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-1260",
+     "ACME-1273",
+     "ACME-1274",
+     "ACME-1280",
+     "ACME-1326",
+     "ACME-1472"
+    ]
+   },
+   {
+    "key": "ACME-2291",
+    "summary": "Atlas-nexus: make 007 First Light run (exits with code 5 after cloud save sync)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   }
+  ],
+  "next": [
+   {
+    "key": "ACME-1229",
+    "summary": "[Model B] RL fine-tune from the base model: APPO with a KL tie to the base, CPU L1->L9 curriculum, champion checkpoint",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1470",
+    "summary": "[Model B] Label the YouTube corpus at scale with IDM v1 (confidence-filtered, both players)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1471",
+    "summary": "[Model B] Pretrain the base model on labelled YouTube + human (+ filtered bot) data; ablate vs human-only BC",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "unblocked by ACME-1234"
+   },
+   {
+    "key": "ACME-1230",
+    "summary": "[M5] Self-play league: P2 driven by past policy snapshots through a second socket player",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1237",
+    "summary": "[Deploy] Real-Switch deploy of the champion: pixel-only ONNX/TensorRT actor, HDMI + serial, latency profile",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "Medium",
+    "why": "unblocked by ACME-1234"
+   },
+   {
+    "key": "ACME-2325",
+    "summary": "CssNavigator: four live flakes on the fork CSS (grid entry loses the hand, fine-phase stall, Lv step lost, y crawl jumps the A band)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2326",
+    "summary": "Add a data-pool flow to delete named QA/test dirs on the share; remove the ACME-2126 QA leftovers (~13 GB)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2368",
+    "summary": "Beacon: Battle.net acceptance and compatibility matrix on node-4",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   }
+  ],
+  "truncated": true
+ }
+}

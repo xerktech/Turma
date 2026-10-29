@@ -27562,6 +27562,11 @@ test("XERK-2391: the capability block is coerced and the results outbox is never
   const q = { dailyBrief: "x" };
   hub.normalizeDailyBrief(q);
   assert.equal(q.dailyBrief, null);
+  // XERK-2394: the runtimes/models lists keep known names only.
+  const r = { dailyBrief: { available: true, runtimes: ["qwen", "x", "claude", 3],
+    models: "haiku" } };
+  hub.normalizeDailyBrief(r);
+  assert.deepEqual(r.dailyBrief, { available: true, runtimes: ["claude", "qwen"] });
   await beat1574("dbHostB", S, { dailyBrief: { available: true },
     dailyBriefResults: [{ runId: "r1", siteKey: S, status: "ok", day: "d", week: "w" }] });
   const a = (await fleet()).agents.find((x) => x.device === "dbHostB");
@@ -27594,8 +27599,8 @@ function cleanup2395(site, devices) {
 
 test("XERK-2395: the brief cleaner matches the shared vectors and is a fixed point", () => {
   const C = hub.cleanBriefNarrative;
-  const { max, vectors } = JSON.parse(fs.readFileSync(
-    path.join(__dirname, "../../agent/tests/brief_clean_vectors.json"), "utf8"));
+  const { cap: max, vectors } = JSON.parse(fs.readFileSync(
+    path.join(__dirname, "../../agent/tests/daily_brief_clean_vectors.json"), "utf8"));
   assert.equal(max, 2000);
   for (const [input, want] of vectors) {
     assert.equal(C(input, max), want, JSON.stringify(input));
@@ -27745,6 +27750,24 @@ test("XERK-2395: dispatch prefers a logged-in capable host and retries once else
   cleanup2395(O, ["dbHostOther"]);
 });
 
+test("XERK-2395: a host is asked only for a runtime and model it lists", async () => {
+  const S = "dbL2395.atlassian.net";
+  // Defaults to qwen but writes briefs on claude only; another lists no sonnet.
+  await briefHost2395("dbLQwen", S, { defaultRuntime: "qwen",
+    dailyBrief: { available: true, runtimes: ["claude"], models: ["haiku", "sonnet"] } });
+  await briefHost2395("dbLNone", S, { dailyBrief: { available: true, runtimes: [] } });
+  await briefHost2395("dbLHaiku", S, { dailyBrief: { available: true, models: ["haiku"] } });
+  hub.setDailyBriefSchedule(S, hub.sanitizeDailyBriefSchedule({ ...NY2395, model: "sonnet" }));
+  hub.dailyBriefTick(RUN2395);
+  const [cmd] = briefCmds2395("dbLQwen");
+  assert.deepEqual([cmd.runtime, cmd.model], ["claude", "sonnet"]);
+  assert.equal(briefCmds2395("dbLNone").length + briefCmds2395("dbLHaiku").length, 0);
+  // Its failure has nowhere to go: the one host listing nothing and the haiku-only one are skipped.
+  await result2395("dbLQwen", S, cmd, { status: "failed", error: "e" });
+  assert.equal(hub.getDailyBriefs()[S][0].status, "failed");
+  cleanup2395(S, ["dbLQwen", "dbLNone", "dbLHaiku"]);
+});
+
 test("XERK-2395: a result is taken only from the host asked, for its run, while in the org", async () => {
   const S = "dbI2395.atlassian.net";
   const O = "dbIo2395.atlassian.net";
@@ -27771,12 +27794,12 @@ test("XERK-2395: a result is taken only from the host asked, for its run, while 
   assert.deepEqual([hub.getDailyBriefs()[S][0].status, hub.getDailyBriefs()[S][0].host],
     ["running", "dbIngB"]);
   await result2395("dbIngB", S, cmd, { status: "ok", model: "claude-haiku-5-5",
-    day: "## Since yesterday\n- **XERK-1** closed <b>today</b>.", week: "Quiet.", open: "One open.",
+    day: "## Since yesterday\n- **XERK-1** closed <b>today</b>.", week: "Quiet.", open: "dropped",
     next: "XERK-4 next.", error: "ignored" });
   const b = (await fleet()).dailyBriefs[S][0];
-  assert.deepEqual([b.status, b.host, b.model, b.day, b.week, b.open, b.next, "error" in b],
-    ["ok", "dbIngB", "claude-haiku-5-5", "XERK-1 closed today .", "Quiet.", "One open.",
-      "XERK-4 next.", false]);
+  assert.deepEqual([b.status, b.host, b.model, b.day, b.week, b.next, "open" in b, "error" in b],
+    ["ok", "dbIngB", "claude-haiku-5-5", "XERK-1 closed today .", "Quiet.", "XERK-4 next.",
+      false, false]);
   assert.ok(Number.isSafeInteger(b.generatedAt));
   // A second delivery of the same row (the outbox resends until acked) changes nothing.
   await result2395("dbIngB", S, cmd, { status: "ok", day: "Rewritten." });

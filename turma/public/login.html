@@ -85,6 +85,21 @@
   </div>
 
 <script>
+  // Only a path on this hub may follow sign-in. Resolved as the browser will
+  // navigate it, so "//evil", "/\evil" and "/<TAB>/evil" (the parser drops tabs)
+  // cannot leave the origin (XERK-2399; the hub's oidcSafeNext is the same rule).
+  function safeNext(next) {
+    if (typeof next !== "string" || !next.startsWith("/")) return "/";
+    try {
+      const u = new URL(next, location.origin);
+      // A dot segment can normalize to "//host" ("/.//evil"): protocol-relative.
+      if (u.origin !== location.origin || u.pathname.startsWith("//")) return "/";
+      // The hub's redirect here can't carry a fragment (the browser never sends
+      // it), but the browser keeps it on this page's URL: hand it on.
+      return u.pathname + u.search + (u.hash || location.hash || "");
+    } catch { return "/"; }
+  }
+
   const form = document.getElementById("form");
   const errBox = document.getElementById("error");
   const submit = document.getElementById("submit");
@@ -136,8 +151,7 @@
       });
       if (res.ok) {
         // Land wherever the user was headed before the redirect, else the dashboard.
-        const next = new URLSearchParams(location.search).get("next");
-        location.replace(next && next.startsWith("/") ? next : "/");
+        location.replace(safeNext(new URLSearchParams(location.search).get("next")));
         return;
       }
       showError(res.status === 401 ? "Incorrect username or password." : "Sign-in failed. Please try again.");

@@ -4072,7 +4072,8 @@ function dailyBriefWindow(schedule, now = Date.now(), lastRunAt = null) {
 const DAILY_BRIEF_KEEP = 30;
 const DAILY_BRIEF_TEXT_MAX = 2000;
 const DAILY_BRIEF_ERROR_MAX = 300;
-const DAILY_BRIEF_SECTIONS = ["day", "week", "open", "next"];
+// `day` carries "Since yesterday" and "Still open" (the agent joins them, XERK-2394).
+const DAILY_BRIEF_SECTIONS = ["day", "week", "next"];
 const DAILY_BRIEF_STATUSES = new Set(["running", "ok", "failed"]);
 const DAILY_BRIEF_RUN_ID_RE = /^[0-9a-f]{1,32}$/;
 // What "auto" sends: the evaluated default (XERK-2393 / docs/daily-brief-adr.md).
@@ -4090,8 +4091,8 @@ const DAILY_BRIEF_RETAIN_MS = 30 * 86400e3; // an org no host is in any more
 // control/bidi characters go, whitespace collapses to single spaces, and an
 // over-long text is cut on a word with "…" past `max` code points. A FIXED POINT
 // (cleaning a cleaned text changes nothing), so a sanitized brief stays one for
-// HA's echo dedup. The agent's worker runs the same rules (XERK-2394); both read
-// agent/tests/brief_clean_vectors.json.
+// HA's echo dedup. The agent's clean_daily_brief_text is its twin (XERK-2394);
+// both pass agent/tests/daily_brief_clean_vectors.json.
 // The first n CODE POINTS of v (Python's v[:n]), without spreading a huge string.
 function cpPrefix(v, n) {
   let i = 0;
@@ -8782,7 +8783,9 @@ function normalizeCloseTicket(payload) {
 
 // The Daily Brief (XERK-2391) capability block: whether this host's manager runs a
 // `renderDailyBrief` command. Only a host reporting it is asked — an older agent
-// would ack the command and never answer. Coerced like normalizeCloseTicket.
+// would ack the command and never answer. Coerced like normalizeCloseTicket; the
+// agent's `runtimes`/`models` (XERK-2394) keep only known names, absent when sent none.
+const DAILY_BRIEF_CAP_LISTS = { runtimes: ["claude", "dsh", "qwen"], models: ["haiku", "sonnet"] };
 function normalizeDailyBrief(payload) {
   if (!payload || typeof payload !== "object") return;
   const t = payload.dailyBrief;
@@ -8790,7 +8793,11 @@ function normalizeDailyBrief(payload) {
     if ("dailyBrief" in payload) payload.dailyBrief = null;
     return;
   }
-  payload.dailyBrief = { available: t.available === true };
+  const out = { available: t.available === true };
+  for (const [key, known] of Object.entries(DAILY_BRIEF_CAP_LISTS)) {
+    if (Array.isArray(t[key])) out[key] = known.filter((v) => t[key].includes(v));
+  }
+  payload.dailyBrief = out;
 }
 
 // The sleeper-pause (XERK-1575) capability block: whether this host's manager
@@ -13160,10 +13167,15 @@ async function oidcExchangeCode(disco, code, verifier) {
 // Only local, same-origin paths are allowed as the post-login `next`, so the
 // login flow can never be turned into an open redirect. Anything else → "/".
 function oidcSafeNext(next) {
-  if (typeof next !== "string" || !next.startsWith("/") || next.startsWith("//") || next.startsWith("/\\")) {
-    return "/";
-  }
-  return next;
+  if (typeof next !== "string" || !next.startsWith("/")) return "/";
+  // Resolve it as a browser would: the URL parser drops tab/CR/LF and reads "\"
+  // as "/", so "/\t/evil" and "/\\evil" both become another host. Prefix checks
+  // on the raw string miss those (XERK-2399).
+  let u;
+  try { u = new URL(next, "http://next.invalid"); } catch { return "/"; }
+  // A dot segment can normalize to "//host" ("/.//evil"), which is protocol-relative.
+  if (u.origin !== "http://next.invalid" || u.pathname.startsWith("//")) return "/";
+  return u.pathname + u.search + u.hash;
 }
 
 // The origin the hub is reached at, derived from the redirect URI, for building
@@ -17482,13 +17494,26 @@ function dailyBriefDue(siteKey, schedule, now = Date.now()) {
   return next.meetingAt > fired ? next : null;
 }
 
+// The runtime a host would write the brief on: its default when it lists that
+// one, else the first it lists — or null when it lists none. An older agent
+// sends no list and gets its default.
+function dailyBriefRuntime(a) {
+  const r = a.defaultRuntime === "dsh" || a.defaultRuntime === "qwen" ? a.defaultRuntime : "claude";
+  const listed = a.dailyBrief && a.dailyBrief.runtimes;
+  if (!Array.isArray(listed)) return r;
+  return listed.includes(r) ? r : listed[0] || null;
+}
+
 // Which host writes an org's brief: online, in the org (jiraHostPool: declared
-// AND bound), reporting the capability, not one already tried for this run. A
-// host whose Claude login lapsed still advertises it, so a logged-in one wins.
-function pickDailyBriefHost(siteKey, exclude = []) {
+// AND bound), reporting the capability for a runtime it lists and the run's
+// model (when it lists models), not one already tried for this run. A host
+// whose Claude login lapsed still advertises it, so a logged-in one wins.
+function pickDailyBriefHost(siteKey, model, exclude = []) {
   const capable = jiraHostPool(siteKey, true).filter((k) => {
     const a = agents[k];
-    return a && !exclude.includes(k) && a.dailyBrief && a.dailyBrief.available === true;
+    if (!a || exclude.includes(k) || !a.dailyBrief || a.dailyBrief.available !== true) return false;
+    const models = a.dailyBrief.models;
+    return !!dailyBriefRuntime(a) && (!Array.isArray(models) || models.includes(model));
   });
   return capable.find((k) => !(agents[k].claudeAuth && agents[k].claudeAuth.needsLogin === true))
     || capable[0] || null;
@@ -17497,8 +17522,7 @@ function pickDailyBriefHost(siteKey, exclude = []) {
 // Queue the command for `row` on `host`; returns the row with its in-flight
 // fields set (the caller writes it).
 function dispatchDailyBrief(siteKey, row, host, now) {
-  const r = agents[host].defaultRuntime;
-  const runtime = r === "dsh" || r === "qwen" ? r : "claude";
+  const runtime = dailyBriefRuntime(agents[host]);
   const cmdId = queueCommand(host, { type: "renderDailyBrief", siteKey, runId: row.runId,
     dayFrom: row.dayFrom, weekFrom: row.weekFrom, until: row.until, meetingAt: row.meetingAt,
     model: row.model, runtime });
@@ -17546,7 +17570,7 @@ function startDailyBriefRun(siteKey, trigger, now = Date.now(), due = null) {
   const row = { runId: hostless ? hostless.runId : crypto.randomBytes(8).toString("hex"),
     status: "running", trigger, meetingAt, dayFrom, weekFrom, until: now, startedAt: now, model,
     attempt: 1, tried: [] };
-  const host = pickDailyBriefHost(siteKey);
+  const host = pickDailyBriefHost(siteKey, model);
   if (!host) {
     const error = "no online host of this org can write the brief";
     if (trigger === "manual") return { status: 409, error };
@@ -17560,7 +17584,7 @@ function startDailyBriefRun(siteKey, trigger, now = Date.now(), due = null) {
 // no-op once acked), then ask ONE other capable host, else settle it failed.
 function retryDailyBrief(siteKey, row, error, now) {
   if (row.cmdId) dropQueuedCommand(row.host, row.cmdId, "renderDailyBrief");
-  const host = row.attempt < 2 ? pickDailyBriefHost(siteKey, row.tried) : null;
+  const host = row.attempt < 2 ? pickDailyBriefHost(siteKey, row.model, row.tried) : null;
   if (host) return putDailyBrief(siteKey, dispatchDailyBrief(siteKey, { ...row, attempt: 2 }, host, now));
   return putDailyBrief(siteKey, { ...row, status: "failed", error, generatedAt: now });
 }
@@ -17583,7 +17607,7 @@ function ingestDailyBriefResults(key, rows, now = Date.now()) {
     const ok = r.status === "ok" && putDailyBrief(siteKey, {
       ...row, status: "ok", generatedAt: now,
       model: cleanBriefNarrative(r.model, 40) || row.model,
-      day: r.day, week: r.week, open: r.open, next: r.next,
+      day: r.day, week: r.week, next: r.next,
     });
     if (!ok) {
       const error = (r.status === "failed" && cleanBriefNarrative(r.error, DAILY_BRIEF_ERROR_MAX))
