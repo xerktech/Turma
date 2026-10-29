@@ -31,7 +31,7 @@ for (const v of [
   "TRIAGE_POLICIES_FILE", "PRIORITY_WRITEBACK_ORGS_FILE", "DEDUPE_LINK_ORGS_FILE",
   "ORG_COLORS_FILE", "REPO_TIERS_FILE", "EPIC_RUNS_FILE", "EPIC_BUILDERS_FILE",
   "USAGE_LEDGER_FILE", "STATE_FILE", "PERMISSION_POLICIES_FILE", "AGENT_IDENTITIES_FILE",
-  "DECISIONS_FILE", "MODEL_POLICY_FILE",
+  "DECISIONS_FILE", "MODEL_POLICY_FILE", "DAILY_BRIEF_SCHEDULES_FILE",
 ]) {
   process.env[v] = tmp(v.toLowerCase());
 }
@@ -60,6 +60,8 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     "epicRuns", "epicBuilders",
     // XERK-1566: the per-org permission policy text (operator-set, low churn).
     "permissionPolicies",
+    // XERK-2391: the Daily Brief's per-org meeting schedule.
+    "dailyBriefSchedules",
   ]) {
     assert.ok(names.has(n), `store ${n} is registered`);
   }

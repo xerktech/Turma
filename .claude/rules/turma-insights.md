@@ -26,7 +26,9 @@ paths:
   301s to `/insights`; the heartbeat still DROPS an older agent's `briefRender`/`briefNarratives`
   (kept in `HEARTBEAT_KNOWN_KEYS`) and `normalizeRecord` strips them from a restored
   record too. An existing `/data/briefs.json` is ignored.
-  - Do not reintroduce a scheduled brief or its push: the operator found it not useful.
+  - Do not reintroduce THIS brief (structured, 4-hourly) or its push: the operator found it not
+    useful. The meeting-scheduled Daily Brief (epic XERK-2390) is a different, operator-requested
+    feature with no push: `contract-daily-brief.md`.
 - Tests: the `XERK-2386:` cases in `insights.test.js` and `server.test.js`; `nav.test.js`.
 
 ## The decisions log (XERK-1574)
@@ -69,6 +71,16 @@ paths:
   no host is in it (`decidedOrgs`); nothing else removes a store key.
 - **Surface**: the Insights page's Decisions sub-page (`decisionsHtml`): one card per org, newest
   first, the note box for a live org; a draft survives repaints via `drafts` + a focus restore.
+  - The heading names the org as every page does: `TurmaBoard.orgName(site, <mergeSites orgName>)`
+    — the hosts' `BOARD_ORG_NAME` first, never the site key alone.
+  - Each card collapses to its heading (`collapsed`, kept per viewer in `localStorage`, guarded:
+    storage can be absent or throw, and the page then starts expanded).
+    - Storage is re-read before each write and on the `storage` event (a null key is a clear), so
+      two open tabs never overwrite each other; only the newest `COLLAPSED_MAX` (100) are kept.
+    - Once a write fails (`collapsedWritable`), storage is stale and never re-read again that page
+      load — else each click would undo the one before.
+    - A repaint gives focus back to the toggle that had it — the toggle is replaced by every
+      `innerHTML` swap, and a keyboard user otherwise lands on `<body>`.
   - A row's meta names its session (`label`, clipped to `DECISION_LABEL_MAX` 60) — the only tie
     back for an answer with no ticket.
   - **Each meta piece is unbreakable** (`.bit`) and **the "·" ENDS the piece before it** (`.sep`),

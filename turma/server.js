@@ -624,6 +624,10 @@ const EPIC_BUILDERS_FILE = process.env.EPIC_BUILDERS_FILE || "/data/epic-builder
 // permission dialog, a typed note) — human-rate writes, so it is a
 // registerExternalStore; the churn rule bites per-beat data.
 const DECISIONS_FILE = process.env.DECISIONS_FILE || "/data/decisions.json";
+// The Daily Brief's per-org meeting schedule (XERK-2391): siteKey -> {enabled,
+// time, timeZone, weekdays, leadMinutes, model}. Operator-set, human-rate.
+const DAILY_BRIEF_SCHEDULES_FILE =
+  process.env.DAILY_BRIEF_SCHEDULES_FILE || "/data/daily-brief-schedules.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -3899,6 +3903,159 @@ const persistDecisions = registerExternalStore({
   name: "decisions", file: DECISIONS_FILE,
   coerce: decisionsCoerce, read: () => decisions, install: (v) => { decisions = v; },
 });
+
+// ---- the Daily Brief's per-org meeting schedule (XERK-2391) --------------------
+// siteKey -> when that org's daily standup meets; the hub writes the org's brief
+// leadMinutes before it (XERK-2395). Operator-set, human-rate, so it is a
+// registerExternalStore. sanitizeDailyBriefSchedule is the ONE whitelist (route,
+// restore, a remote watch) and a coerce fixed point, so HA's watch echo dedups.
+// Null-prototype map (XERK-1451). Contract: .claude/rules/contract-daily-brief.md.
+const DAILY_BRIEF_MODELS = new Set(["auto", "haiku", "sonnet"]);
+const DAILY_BRIEF_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+// The zone's name as Intl spells it ("utc" -> "UTC"), or "" for anything Intl
+// rejects or an offset zone ("+05:30" — it has no DST rules, and the operator is
+// asked for a named zone). Intl's spelling so a coerced value is a fixed point.
+const DAILY_BRIEF_ORGS_MAX = 100; // dailyBriefSchedulesCoerce inlines the same 100 (module-init TDZ)
+const DAILY_BRIEF_SITE_MAX = 200; // ...and the same 200
+function canonicalTimeZone(tz) {
+  if (typeof tz !== "string" || !/^[A-Za-z]/.test(tz) || tz.length > 64) return "";
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: tz }).resolvedOptions().timeZone;
+  } catch {
+    return "";
+  }
+}
+// {value} for a usable schedule, or {error} worded for the operator (the route's
+// 400 body, XERK-264). A missing leadMinutes/model takes its default.
+function validateDailyBriefSchedule(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return { error: "schedule must be an object" };
+  if (typeof v.enabled !== "boolean") return { error: "enabled must be true or false" };
+  if (typeof v.time !== "string" || !DAILY_BRIEF_TIME_RE.test(v.time)) {
+    return { error: "time must be HH:MM on a 24-hour clock" };
+  }
+  const timeZone = canonicalTimeZone(v.timeZone);
+  if (!timeZone) return { error: "timeZone must be an IANA time zone, e.g. America/New_York" };
+  if (!Array.isArray(v.weekdays) || !v.weekdays.length || v.weekdays.length > 7 ||
+      !v.weekdays.every((d) => Number.isInteger(d) && d >= 0 && d <= 6)) {
+    return { error: "weekdays must list at least one day, 0 (Sunday) to 6 (Saturday)" };
+  }
+  const leadMinutes = v.leadMinutes ?? 5;
+  if (!Number.isInteger(leadMinutes) || leadMinutes < 1 || leadMinutes > 30) {
+    return { error: "leadMinutes must be a whole number from 1 to 30" };
+  }
+  const model = v.model ?? "auto";
+  if (typeof model !== "string" || !DAILY_BRIEF_MODELS.has(model)) {
+    return { error: "model must be auto, haiku or sonnet" };
+  }
+  const value = {
+    enabled: v.enabled, time: v.time, timeZone,
+    weekdays: [...new Set(v.weekdays)].sort((a, b) => a - b),
+    leadMinutes, model,
+  };
+  if (Number.isSafeInteger(v.updatedAt) && v.updatedAt > 0) value.updatedAt = v.updatedAt;
+  return { value };
+}
+function sanitizeDailyBriefSchedule(v) {
+  return validateDailyBriefSchedule(v).value || null;
+}
+const dailyBriefSchedulesCoerce = (raw) => {
+  const out = Object.create(null);
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [site, s] of Object.entries(raw).slice(0, 100)) {
+      if (!site || site.length > 200) continue;
+      const v = sanitizeDailyBriefSchedule(s);
+      if (v) out[site] = v;
+    }
+  }
+  return out;
+};
+let dailyBriefSchedules = dailyBriefSchedulesCoerce(readJsonFile(DAILY_BRIEF_SCHEDULES_FILE));
+const persistDailyBriefSchedules = registerExternalStore({
+  name: "dailyBriefSchedules", file: DAILY_BRIEF_SCHEDULES_FILE,
+  coerce: dailyBriefSchedulesCoerce, read: () => dailyBriefSchedules,
+  install: (v) => { dailyBriefSchedules = v; },
+});
+// Store an org's (already validated) schedule — durable save, cache bust, SSE frame.
+function setDailyBriefSchedule(siteKey, schedule) {
+  dailyBriefSchedules[siteKey] = schedule;
+  publishDailyBriefSchedules();
+}
+// Publish the map as it now stands (after a set, or a prune of departed orgs).
+function publishDailyBriefSchedules() {
+  persistDailyBriefSchedules();
+  invalidateAgentsCache();
+  sseBroadcast("dailyBriefSchedules", dailyBriefSchedules);
+}
+
+// The wall clock of instant `ms` in `timeZone`, as UTC-epoch fields.
+function zonedWall(ms, timeZone) {
+  const p = Object.create(null);
+  for (const { type, value } of new Intl.DateTimeFormat("en-US", {
+    timeZone, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric",
+    hour: "numeric", minute: "numeric", second: "numeric",
+  }).formatToParts(ms)) p[type] = Number(value);
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+}
+// The instant the clock in `timeZone` reads local date y-m-d at hh:mm. In a
+// spring-forward GAP (that wall time never happens) it is the instant the old
+// offset names, i.e. the clock reads one hour later; on a fall-back REPEAT it is
+// the FIRST of the two, so a meeting date maps to exactly one instant. The offset
+// probes sit 36h either side of the wall time: offsets run -12h..+14h, so a
+// nearer probe lands past the real instant in a zone east of +12h (Auckland,
+// Chatham) and never sees the pre-transition offset.
+function zonedInstant(y, m, d, hh, mm, timeZone) {
+  const wall = Date.UTC(y, m - 1, d, hh, mm);
+  const offsetAt = (ms) => zonedWall(ms, timeZone) - Math.floor(ms / 1000) * 1000;
+  const before = wall - offsetAt(wall - 36 * 3600e3);
+  const after = wall - offsetAt(wall + 36 * 3600e3);
+  const hits = [before, after].filter((t) => zonedWall(t, timeZone) === wall);
+  return hits.length ? Math.min(...hits) : before;
+}
+// Scheduled meeting instants by local date, starting `fromDay` local days after
+// the local date of `ms` and stepping `step` (+1 forward, -1 back), `days` of them.
+function* dailyBriefMeetings(s, ms, fromDay, step, days) {
+  const [hh, mm] = s.time.split(":").map(Number);
+  const base = new Date(zonedWall(ms, s.timeZone));
+  for (let i = 0; i < days; i++) {
+    const d = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(),
+      base.getUTCDate() + fromDay + step * i));
+    if (!s.weekdays.includes(d.getUTCDay())) continue;
+    yield zonedInstant(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate(), hh, mm, s.timeZone);
+  }
+}
+// The next brief after `now`: {runAt, meetingAt}, runAt = meetingAt minus the
+// lead. Null for a disabled or unusable schedule. Pure; the scheduler (XERK-2395)
+// keys "already ran" on meetingAt, which is unique per meeting date (DST included).
+function nextDailyBriefRun(schedule, now = Date.now()) {
+  const s = sanitizeDailyBriefSchedule(schedule);
+  if (!s || !s.enabled) return null;
+  for (const meetingAt of dailyBriefMeetings(s, now, 0, 1, 9)) {
+    const runAt = meetingAt - s.leadMinutes * 60e3;
+    if (runAt > now) return { runAt, meetingAt };
+  }
+  return null;
+}
+// What one brief covers, run at `now` for the next meeting at or after it:
+// the DAY window opens at the previous scheduled meeting (so Monday's covers the
+// weekend), or at `lastRunAt` when that is earlier (a missed brief's activity is
+// not lost), never past the WEEK window, which is the last 7 days. Ignores
+// `enabled` — "Run now" briefs a disabled org too. Null for an unusable schedule.
+function dailyBriefWindow(schedule, now = Date.now(), lastRunAt = null) {
+  const s = sanitizeDailyBriefSchedule(schedule);
+  if (!s) return null;
+  const weekFrom = now - 7 * 86400e3;
+  let meetingAt = null;
+  for (const t of dailyBriefMeetings(s, now, 0, 1, 9)) {
+    if (t >= now) { meetingAt = t; break; }
+  }
+  let prev = null;
+  for (const t of dailyBriefMeetings(s, now, 0, -1, 9)) {
+    if (t < now) { prev = t; break; }
+  }
+  let dayFrom = prev ?? now - 86400e3;
+  if (Number.isSafeInteger(lastRunAt) && lastRunAt > 0 && lastRunAt < dayFrom) dayFrom = lastRunAt;
+  return { dayFrom: Math.max(dayFrom, weekFrom), weekFrom, until: now, meetingAt };
+}
 // Which hosts of an org report a repo by name — CLONED (on-disk `repos[]`) OR
 // merely LISTED among the org's triaged `jira.repoOptions` (a gh-clonable repo no
 // host has cloned yet). Used by the route to refuse a builder pinned to a repo no
@@ -6345,6 +6502,9 @@ function buildAgentsCache() {
     // siteKey -> how many decisions that org keeps (the tail above is capped), so
     // a client's count is the org's, not the served tail's. Hub-computed ints.
     decisionCounts: decisionCountsWire(),
+    // The Daily Brief's per-org meeting schedules (XERK-2391), hub-owned and
+    // whitelisted on every write/restore (sanitizeDailyBriefSchedule).
+    dailyBriefSchedules,
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -8405,6 +8565,19 @@ function normalizeCloseTicket(payload) {
   payload.closeTicket = { available: t.available === true };
 }
 
+// The Daily Brief (XERK-2391) capability block: whether this host's manager runs a
+// `renderDailyBrief` command. Only a host reporting it is asked — an older agent
+// would ack the command and never answer. Coerced like normalizeCloseTicket.
+function normalizeDailyBrief(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const t = payload.dailyBrief;
+  if (!t || typeof t !== "object" || Array.isArray(t)) {
+    if ("dailyBrief" in payload) payload.dailyBrief = null;
+    return;
+  }
+  payload.dailyBrief = { available: t.available === true };
+}
+
 // The sleeper-pause (XERK-1575) capability block: whether this host's manager
 // executes a `pauseSleeper` command (kill a quiet sleeper, keeping its wake on the
 // closed record). The hub frees a slot that way only on a host reporting it — an
@@ -9843,6 +10016,8 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   // briefRender/briefNarratives: the retired org brief (XERK-2386); an older
   // agent still sends them, and the heartbeat handler drops them.
   "briefRender", "briefNarratives", "modelShadow", "shadowRuns", "defectReports",
+  // The Daily Brief (XERK-2391): the capability block and the results outbox.
+  "dailyBrief", "dailyBriefResults",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -10236,6 +10411,7 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeTriage(a);
   normalizeTrajectory(a);
   normalizeCloseTicket(a);
+  normalizeDailyBrief(a);
   normalizePauseSleepers(a);
   normalizeModelShadow(a);
   normalizeShadowRuns(a);
@@ -19464,6 +19640,9 @@ const server = http.createServer(async (req, res) => {
       // agent still sends them; nothing reads them.
       delete payload.briefRender;
       delete payload.briefNarratives;
+      // Daily Brief results (XERK-2391): never stored on the record. Their ingest
+      // (accept only from the host asked, for its decided org) is XERK-2395's.
+      delete payload.dailyBriefResults;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -22546,6 +22725,55 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, decision: appendDecision(siteKey, { source: "note", text }) });
     }
 
+    // GET/PUT /api/orgs/<siteKey>/daily-brief/schedule — an org's standup schedule
+    // (XERK-2391). PUT merges the body's fields over the stored schedule, so a
+    // toggle sends {enabled} alone; the result is validated whole (400 in the
+    // hub's words). The org must be one a host is DECIDED into, so a refusal
+    // mints no store key. GET answers {schedule|null, next|null}.
+    if ((req.method === "GET" || req.method === "PUT") && parts[0] === "api" &&
+        parts[1] === "orgs" && parts.length === 5 && parts[3] === "daily-brief" &&
+        parts[4] === "schedule") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const orgs = decidedOrgs();
+      if (!orgs.has(siteKey)) {
+        return json(res, 404, { error: "no host is in that org" });
+      }
+      if (req.method === "PUT") {
+        // Refuse what the store's coerce would silently drop, so a 200 always
+        // means stored. A full store first forgets orgs no host is in any more.
+        if (siteKey.length > DAILY_BRIEF_SITE_MAX) {
+          return json(res, 400, { error: `org key too long — the limit is ${DAILY_BRIEF_SITE_MAX} characters` });
+        }
+        const body = JSON.parse((await readBody(req)) || "{}");
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return json(res, 400, { error: "schedule must be an object" });
+        }
+        const merged = { ...(dailyBriefSchedules[siteKey] || {}) };
+        for (const k of ["enabled", "time", "timeZone", "weekdays", "leadMinutes", "model"]) {
+          if (k in body) merged[k] = body[k];
+        }
+        merged.updatedAt = Date.now();
+        const { value, error } = validateDailyBriefSchedule(merged);
+        if (error) return json(res, 400, { error });
+        if (!(siteKey in dailyBriefSchedules) &&
+            Object.keys(dailyBriefSchedules).length >= DAILY_BRIEF_ORGS_MAX) {
+          // Any prune frees a slot, so a refusal below never leaves one unpublished;
+          // the set that follows publishes the pruned map.
+          for (const k of Object.keys(dailyBriefSchedules)) {
+            if (!orgs.has(k)) delete dailyBriefSchedules[k];
+          }
+          if (Object.keys(dailyBriefSchedules).length >= DAILY_BRIEF_ORGS_MAX) {
+            return json(res, 409, {
+              error: `${DAILY_BRIEF_ORGS_MAX} orgs already have a meeting schedule — the limit`,
+            });
+          }
+        }
+        setDailyBriefSchedule(siteKey, value);
+      }
+      const schedule = dailyBriefSchedules[siteKey] || null;
+      return json(res, 200, { ok: true, schedule, next: schedule && nextDailyBriefRun(schedule) });
+    }
+
     // POST /api/jira/<siteKey>/automerge — flip an org's hands-off auto-merge
     // opt-in (XERK-550). Body: {enabled:true|false}. Same posture as /autostart:
     // hub-owned durable state, authoritative on return, the org must be one the
@@ -23848,6 +24076,9 @@ if (process.env.TURMA_TEST) {
     // The per-org decisions log (XERK-1574). A getter: a restore/watch install
     // REPLACES the map.
     getDecisions: () => decisions, decisionsCoerce, sanitizeDecision, appendDecision,
+    getDailyBriefSchedules: () => dailyBriefSchedules, dailyBriefSchedulesCoerce,
+    sanitizeDailyBriefSchedule, setDailyBriefSchedule, nextDailyBriefRun, dailyBriefWindow,
+    normalizeDailyBrief,
     decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, permissionAnswerKind,
     decisionsTick, decidedOrgs, DECISIONS_RETAIN_MS,
     autoStartCandidates,

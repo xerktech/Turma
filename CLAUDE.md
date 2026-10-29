@@ -102,6 +102,8 @@ Each spans components; the rule lives in the named file, which loads when any si
   the container limit** (XERK-258) → `contract-agent-hub.md`.
 - **Ported mirrors**: `board.js` column rule + Triage lane, `hub-agent.py` ↔ `tunnel-agent.js`
   parsers and device naming → `contract-mirrors.md`.
+- **The Daily Brief** schedule store, `renderDailyBrief` command and `dailyBriefResults` outbox
+  (XERK-2390) → `contract-daily-brief.md`.
 - **"Working" is `paneBusy` OR live background WORK** (XERK-245, XERK-1570) → `session-working.md`.
 
 ## Conventions
