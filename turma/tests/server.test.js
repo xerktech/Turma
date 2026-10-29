@@ -215,6 +215,7 @@ const {
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, REFUSED_DETAIL_MAX,
   userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
   agentBearerKind, agentHostRefusal, agentPresentedRefusal, resolveEnrollToken, hostAgentToken, tokenHost, ttydAuth,
+  uidAgentToken, tokenUid, uidHostClaim, hostOfUid,
   controlChannels, pendingChannels, termAgents,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, WHISPER_NON_SPEECH, issueWsToken, wsTokenValid,
@@ -20054,10 +20055,13 @@ test("XERK-578: roll-token mints this host's derived token and queues one setTok
   const again = await request("POST", "/api/agents/rollHost/roll-token",
     { body: {}, headers: userHeaders });
   assert.equal(again.body.cmdId, ok.body.cmdId);
-  // It rides the next reply carrying exactly THIS host's derived token.
+  // It rides the next reply carrying THIS host's identity token (XERK-2381),
+  // the id already stamped on its record so the agent's first beat on it binds.
   const reply = await beatAs("rollHost", { authorization: "Bearer agenttok" });
+  const uid = agents.rollHost.agentUid;
+  assert.match(uid, /^[0-9a-f]{32}$/);
   assert.deepEqual(reply.body.commands, [
-    { type: "setToken", token: hostAgentToken("rollHost"), cmdId: ok.body.cmdId },
+    { type: "setToken", token: uidAgentToken(uid), cmdId: ok.body.cmdId },
   ]);
   // Unknown host -> 404; and it needs the operator login (no anonymous access).
   assert.equal((await request("POST", "/api/agents/ghost578/roll-token",
@@ -20068,16 +20072,25 @@ test("XERK-578: roll-token mints this host's derived token and queues one setTok
 
 test("XERK-578: self-enroll returns ONLY the identity the request proved", () => {
   const bearer = (t) => ({ headers: { authorization: `Bearer ${t}` } });
-  // A host already on its derived token gets its OWN back (idempotent) and can
-  // NOT name another host — the escalation "never a caller-named device" guards.
+  // A host on its name token trades it for an IDENTITY token (XERK-2381) and
+  // can NOT name another host — the escalation "never a caller-named device"
+  // guards. The identity token is never usable as another host's.
   const own = resolveEnrollToken(bearer(hostAgentToken("hOwn")), "someoneelse");
   assert.equal(own.status, 200);
-  assert.deepEqual(own.body, { host: "hOwn", token: hostAgentToken("hOwn"), bound: true });
-  // The fleet master (rollover) names its OWN device and gets that host's token
-  // — exactly what `--agent-token <device>` mints, nothing more.
+  assert.equal(own.body.host, "hOwn");
+  assert.equal(own.body.bound, true);
+  const ownUid = tokenUid(own.body.token);
+  assert.ok(ownUid);
+  // Re-enrolling on that identity token is idempotent.
+  const again = resolveEnrollToken(bearer(own.body.token), "whatever");
+  assert.equal(again.status, 200);
+  assert.equal(again.body.token, own.body.token);
+  // The fleet master (rollover) names its OWN device and gets an identity token.
   const boot = resolveEnrollToken(bearer("agenttok"), "hBoot");
   assert.equal(boot.status, 200);
-  assert.deepEqual(boot.body, { host: "hBoot", token: hostAgentToken("hBoot"), bound: false });
+  assert.equal(boot.body.host, "hBoot");
+  assert.equal(boot.body.bound, false);
+  assert.ok(tokenUid(boot.body.token));
   // Master with no device can't bootstrap (which host?) -> 400.
   assert.equal(resolveEnrollToken(bearer("agenttok"), "").status, 400);
   // A master naming an UNUSABLE host name (a URL dot segment the hub refuses to
@@ -20089,7 +20102,7 @@ test("XERK-578: self-enroll returns ONLY the identity the request proved", () =>
   return request("GET", `/api/agent/token?device=hBoot`,
     { headers: { authorization: "Bearer agenttok" } }).then((res) => {
     assert.equal(res.status, 200);
-    assert.equal(res.body.token, hostAgentToken("hBoot"));
+    assert.ok(tokenUid(res.body.token));
   });
 });
 
@@ -20105,7 +20118,102 @@ test("XERK-578: self-enroll self-closes under TURMA_AGENT_STRICT", () => {
   // re-enroll after strict is a harmless no-op rather than a lockout.
   const own = strict.resolveEnrollToken(bearer(strict.hostAgentToken("hX")), "");
   assert.equal(own.status, 200);
-  assert.equal(own.body.token, strict.hostAgentToken("hX"));
+  assert.ok(strict.tokenUid(own.body.token));
+  const again = strict.resolveEnrollToken(bearer(own.body.token), "");
+  assert.equal(again.status, 200);
+  assert.equal(again.body.token, own.body.token);
+});
+
+// ---- XERK-2381: an agent keeps its identity across a host rename ----------
+
+test("XERK-2381: an identity token is not a host token, and `uid:` names derive none", () => {
+  const uid = "0123456789abcdef0123456789abcdef";
+  const tok = uidAgentToken(uid);
+  assert.match(tok, /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/);
+  assert.equal(tokenUid(tok), uid);
+  assert.equal(tokenHost(tok), null);
+  // A host NAMED like the identity namespace gets no name token, so the two
+  // credentials can never coincide.
+  assert.equal(hostAgentToken("uid:" + uid), "");
+  // Tampering with either half breaks it; a malformed id mints nothing.
+  assert.equal(tokenUid(tok.slice(0, -1) + (tok.endsWith("0") ? "1" : "0")), null);
+  assert.equal(uidAgentToken("not-hex"), "");
+});
+
+test("XERK-2381: a renamed agent's beat moves its record instead of making a new host", async () => {
+  const uid = "aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb";
+  const auth = { authorization: `Bearer ${uidAgentToken(uid)}` };
+  // First registration: a free name is claimed and bound.
+  assert.equal((await beatAs("ren2381a", auth)).status, 200);
+  assert.equal(agents.ren2381a.agentUid, uid);
+  assert.equal(agents.ren2381a.uidBound, true);
+  assert.equal(hostOfUid(uid), "ren2381a");
+  agents.ren2381a.orgBound = "org.example";
+  const cmdId = queueCommand("ren2381a", { type: "restartAgent" });
+  hub.ticketAgents["SITE/REN-1"] = { host: "ren2381a", at: Date.now() };
+  // Same agent, new DEVICE_NAME: same token proves it.
+  const r = await beatAs("ren2381b", auth);
+  assert.equal(r.status, 200);
+  assert.equal(agents.ren2381a, undefined);
+  const b = agents.ren2381b;
+  assert.equal(b.agentUid, uid);
+  assert.deepEqual(b.formerNames, ["ren2381a"]);
+  // What the hub keeps per host followed it.
+  assert.equal(b.orgBound, "org.example");
+  assert.ok(r.body.commands.some((c) => c.cmdId === cmdId));
+  assert.equal(hub.ticketAgents["SITE/REN-1"].host, "ren2381b");
+  delete hub.ticketAgents["SITE/REN-1"];
+  // The hub-owned fields never reach the wire.
+  const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.agents
+    .find((a) => a.key === "ren2381b");
+  assert.ok(served);
+  assert.equal(served.agentUid, undefined);
+  assert.equal(served.formerNames, undefined);
+  assert.equal(served.tokenBound, true);
+  delete agents.ren2381b;
+});
+
+test("XERK-2381: an identity token cannot take a name another record holds", async () => {
+  await beatAs("held2381", { authorization: `Bearer ${hostAgentToken("held2381")}` });
+  const uid = "cccccccccccccccccccccccccccccccc";
+  const auth = { authorization: `Bearer ${uidAgentToken(uid)}` };
+  const r = await beatAs("held2381", auth);
+  assert.equal(r.status, 403);
+  assert.match(r.body.error, /registered to another agent/);
+  assert.equal(agentBearerKind({ headers: auth }, "held2381"), null);
+  assert.equal(uidHostClaim(uid, "held2381"), false);
+  // Nor through the tunnel.
+  assert.equal(agentWsAuthorized(
+    new URL(`http://x/agent/control?token=${uidAgentToken(uid)}`), { headers: {} }, "held2381"), false);
+  // A legacy beat is untouched by the refusal.
+  assert.equal(agents.held2381.agentUid, undefined);
+  delete agents.held2381;
+});
+
+test("XERK-2381: a rolled host binds its minted id, then renames on it", async () => {
+  await beatAs("roll2381", { authorization: `Bearer ${hostAgentToken("roll2381")}` });
+  const roll = await request("POST", "/api/agents/roll2381/roll-token", { body: {}, headers: userHeaders });
+  assert.equal(roll.status, 200);
+  const uid = agents.roll2381.agentUid;
+  const tok = uidAgentToken(uid);
+  // A beat on the OLD name token keeps the stamped binding.
+  await beatAs("roll2381", { authorization: `Bearer ${hostAgentToken("roll2381")}` });
+  assert.equal(agents.roll2381.agentUid, uid);
+  assert.equal(agents.roll2381.uidBound, undefined);
+  assert.match(ttydAuth("roll2381"), /^Basic /);
+  assert.equal(Buffer.from(ttydAuth("roll2381").slice(6), "base64").toString(),
+    `term:${hostAgentToken("roll2381")}`);
+  // The agent restarts on the identity token: bound, and its ttyd now runs on it.
+  assert.equal((await beatAs("roll2381", { authorization: `Bearer ${tok}` })).status, 200);
+  assert.equal(Buffer.from(ttydAuth("roll2381").slice(6), "base64").toString(), `term:${tok}`);
+  // Then a rename: the tunnel may connect under the new name first.
+  assert.equal(agentWsAuthorized(new URL(`http://x/agent/control?token=${tok}`), { headers: {} }, "roll2381-new"), true);
+  assert.equal((await beatAs("roll2381-new", { authorization: `Bearer ${tok}` })).status, 200);
+  assert.equal(agents.roll2381, undefined);
+  assert.equal(agents["roll2381-new"].agentUid, uid);
+  // The old name token no longer reaches the renamed record's name.
+  assert.equal(agentBearerKind({ headers: { authorization: `Bearer ${hostAgentToken("roll2381")}` } }, "roll2381-new"), null);
+  delete agents["roll2381-new"];
 });
 
 test("XERK-578: tokenRoll is coerced to a strict boolean; absent stays absent", async () => {

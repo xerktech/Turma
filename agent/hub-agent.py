@@ -4035,6 +4035,17 @@ def token_device_name(token):
         return None
 
 
+# An agent IDENTITY token (XERK-2381) names `uid:<id>` instead of a host: the
+# hub binds that id to whatever DEVICE_NAME this agent beats as, so it survives
+# a rename. It is meant for THIS host because the hub handed it to this host's
+# own request (enroll) or over this host's own tunnel (setToken).
+AGENT_UID_TOKEN_PREFIX = "uid:"
+
+
+def token_is_identity(named):
+    return isinstance(named, str) and named.startswith(AGENT_UID_TOKEN_PREFIX)
+
+
 def agent_env_path():
     """The env file the native launcher SOURCES (where TURMA_TOKEN lives), or ""
     when there is none to roll. The launcher exports TURMA_AGENT_ENV=<resolved
@@ -4163,7 +4174,7 @@ def enroll_self():
     # Defence: the hub derives the token from a NAME; confirm it is ours before
     # persisting, so a DEVICE_NAME mismatch can't be written silently.
     named = token_device_name(token)
-    if named != device:
+    if named != device and not token_is_identity(named):
         print(f"enroll: hub returned a token for {named!r}, not this host "
               f"({device!r}); not writing it", file=sys.stderr)
         return 1
@@ -47666,7 +47677,7 @@ class SessionManager:
         if named is None:
             log("setToken: refused — payload is not an agent token")
             return
-        if named != self.device:
+        if named != self.device and not token_is_identity(named):
             log(f"setToken: refused — token is derived for {named!r}, not this "
                 f"host ({self.device!r}); NOT writing it (a host's token is "
                 "derived from its DEVICE_NAME, so re-check DEVICE_NAME if the "

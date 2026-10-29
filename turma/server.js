@@ -1155,13 +1155,17 @@ const TURMA_AGENT_STRICT = /^(1|true|yes|on)$/i.test(process.env.TURMA_AGENT_STR
 // host, and host names travel in the URL anyway.
 //
 // Keyed on the host name the agent reports as `device`, so a host RENAME
-// invalidates its token by design — the hub cannot tell a rename from an
-// impersonation, and guessing would be the bug.
+// invalidates THIS token by design — the hub cannot tell a rename from an
+// impersonation by name alone. An agent that must survive a rename runs on its
+// IDENTITY token instead (uidAgentToken, XERK-2381), which roll and enroll hand out.
 function hostAgentToken(host) {
   // Non-strings never get a token: `String(host)` would coerce an array or a
   // toString()-carrying object into a host name and mint a REAL credential for
   // it. No caller passes one today; this is so none can start.
   if (!TURMA_AGENT_TOKEN || typeof host !== "string" || !host) return "";
+  // The `uid:` namespace belongs to agent-identity tokens (XERK-2381): a host
+  // NAMED `uid:<x>` must never derive the same credential as agent identity <x>.
+  if (host.startsWith(AGENT_UID_PREFIX)) return "";
   const name = Buffer.from(host);
   // A name that doesn't survive the UTF-8 round trip gets no token: a lone
   // surrogate encodes to the replacement character, so two different host names
@@ -1178,23 +1182,126 @@ function hostAgentToken(host) {
     crypto.createHmac("sha256", TURMA_AGENT_TOKEN).update(host).digest("hex");
 }
 
-// The host a bearer token proves it is, or null if it proves nothing. Reads the
-// name off the token and re-derives to check it, so an attacker editing the name
-// half invalidates the HMAC half.
-function tokenHost(token) {
+// The subject a bearer token NAMES (a host name, or `uid:<id>`), unverified.
+function tokenSubject(token) {
   if (!TURMA_AGENT_TOKEN || typeof token !== "string") return null;
   const dot = token.indexOf(".");
   if (dot <= 0) return null;
-  let host;
   try {
-    host = Buffer.from(token.slice(0, dot), "base64url").toString();
+    return Buffer.from(token.slice(0, dot), "base64url").toString() || null;
   } catch {
     return null;
   }
+}
+
+// The host a NAME-derived bearer token proves it is, or null if it proves
+// nothing. Reads the name off the token and re-derives to check it, so an
+// attacker editing the name half invalidates the HMAC half. An identity token
+// (below) is never a host token: hostAgentToken refuses the `uid:` namespace.
+function tokenHost(token) {
+  const host = tokenSubject(token);
   // Compare the WHOLE token, so a name that doesn't round-trip through base64url
   // (padding games, a different encoding of the same bytes) fails here rather
   // than resolving to a host it isn't the token for.
   return host && safeEqual(token, hostAgentToken(host)) ? host : null;
+}
+
+// Agent IDENTITY tokens (XERK-2381). A name-derived token dies with the name, so
+// renaming a host (k8x -> k8x-01, maxai -> maxai-win) made it a different agent
+// with a dead credential. An identity token is `<base64url("uid:"+id)>.<HMAC>`
+// over a random id the HUB mints (roll / enroll), so it survives a DEVICE_NAME
+// change: the token proves the AGENT, and the hub binds that agent to the host
+// name it beats as (`agentUid` on the record, below — `uidHostClaim`).
+// Same shape as a host token on purpose: one parse, and the pre-body heartbeat
+// gate (`agentPresented`) can verify it before reading a byte of the body.
+const AGENT_UID_PREFIX = "uid:";
+const AGENT_UID_RE = /^[0-9a-f]{32}$/;
+function newAgentUid() {
+  return crypto.randomBytes(16).toString("hex");
+}
+function uidAgentToken(uid) {
+  if (!TURMA_AGENT_TOKEN || typeof uid !== "string" || !AGENT_UID_RE.test(uid)) return "";
+  const subject = AGENT_UID_PREFIX + uid;
+  return Buffer.from(subject).toString("base64url") + "." +
+    crypto.createHmac("sha256", TURMA_AGENT_TOKEN).update(subject).digest("hex");
+}
+// The agent id a bearer token proves, or null.
+function tokenUid(token) {
+  const subject = tokenSubject(token);
+  if (!subject || !subject.startsWith(AGENT_UID_PREFIX)) return null;
+  const uid = subject.slice(AGENT_UID_PREFIX.length);
+  return safeEqual(token, uidAgentToken(uid)) ? uid : null;
+}
+// The registry key currently bound to agent `uid`, or null.
+function hostOfUid(uid) {
+  for (const [k, a] of Object.entries(agents)) {
+    if (a && a.agentUid === uid) return k;
+  }
+  return null;
+}
+// May agent `uid` act as `host`? True when the host is already bound to it, or
+// when no record holds the name at all (a first registration, or a RENAME onto a
+// free name — the heartbeat then moves the agent's record, `renameAgentRecord`).
+// A name another record holds is never claimable: a legacy record with no
+// `agentUid` is bound to it only by a hub mint (roll/enroll), so an identity
+// token can never take over a host it was not minted for.
+function uidHostClaim(uid, host) {
+  if (!uid || typeof host !== "string" || !isPlainHostKey(host)) return false;
+  if (!Object.prototype.hasOwnProperty.call(agents, host)) return true;
+  const a = agents[host];
+  return !!a && a.agentUid === uid;
+}
+// The credential a host's agent runs with, as the hub knows it: its identity
+// token once it beat on one, else its name token. ttydAuth needs exactly this.
+function agentOwnToken(host) {
+  const a = agents[host];
+  if (a && a.uidBound && a.agentUid) return uidAgentToken(a.agentUid);
+  return hostAgentToken(host);
+}
+// The identity token to HAND an existing host (roll/enroll): its bound id if it
+// has one, else a fresh id stamped onto its record so the agent's first beat on
+// it is bound, not a claim. A host with no record yet gets an unstamped id; its
+// first beat claims the free name.
+function issueAgentUid(host) {
+  const a = Object.prototype.hasOwnProperty.call(agents, host) ? agents[host] : null;
+  if (a && typeof a.agentUid === "string" && AGENT_UID_RE.test(a.agentUid)) return a.agentUid;
+  const uid = newAgentUid();
+  if (a) { a.agentUid = uid; publishAgent(host); }
+  return uid;
+}
+const FORMER_NAMES_MAX = 8;
+// Retire `oldKey` after its agent beat in as `newKey` (XERK-2381). The new record
+// was built from the old one, so this only drops the old name and re-points what
+// the hub keeps BY name: a ticket pinned to the old host follows it.
+// Feed the usage ledger the names each live record was renamed away from, so a
+// retired old name's spend folds into the agent's current card (XERK-2381).
+function syncLedgerAliases() {
+  const pairs = [];
+  for (const [k, a] of Object.entries(agents)) {
+    if (a && Array.isArray(a.formerNames)) for (const n of a.formerNames) pairs.push([n, k]);
+  }
+  usageLedger.setHostAliases(pairs);
+}
+function renameAgentRecord(oldKey, newKey) {
+  console.log(`agent renamed: ${logName(oldKey)} -> ${logName(newKey)} (same agent identity)`);
+  delete agents[oldKey];
+  recordBytes.delete(oldKey);
+  recordSizeWarned.delete(oldKey);
+  shareWarned.delete(oldKey);
+  deviceCollisionWarned.delete(oldKey);
+  markAgentRemoved(oldKey);
+  sseBroadcast("removed", { key: oldKey });
+  let pinsMoved = false;
+  for (const p of Object.values(ticketAgents)) {
+    if (p && p.host === oldKey) { p.host = newKey; pinsMoved = true; }
+  }
+  if (pinsMoved) {
+    persistTicketAgents();
+    sseBroadcast("ticketAgents", ticketAgents);
+  }
+  syncLedgerAliases();
+  invalidateAgentsCache();
+  scheduleSave();
 }
 // A dedicated bearer token for the programmatic session-trigger endpoint
 // (POST /api/trigger), so external automation (CI, webhooks, cron) can start a
@@ -1330,7 +1437,7 @@ const OIDC_SESSION_TTL_MS = Math.max(
 // 401ing the hosts that haven't moved.
 function ttydAuth(host) {
   const a = agents[host];
-  const token = (a && a.tokenBound ? hostAgentToken(host) : TURMA_AGENT_TOKEN) || "changeme";
+  const token = (a && a.tokenBound ? agentOwnToken(host) : TURMA_AGENT_TOKEN) || "changeme";
   return "Basic " + Buffer.from(`term:${token}`).toString("base64");
 }
 
@@ -5892,6 +5999,7 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
   const { history, trajectoryTails, subagentHistory, jiraIssues, statusResults,
           priorityResults, linkResults, mergeResults,
           createMeta, createTypes, createResults, resultWaits, tokenBound,
+          agentUid: _uid, uidBound: _uidBound, formerNames: _formerNames,
           orgBound, autoPaused: _forgedAutoPaused, defectReports: _defects, ...a } = agent;
   // The paused-subscription set (XERK-544/548). buildAgentsCache computes it once
   // and passes it; the per-agent SSE broadcast has none and derives its own.
@@ -5988,6 +6096,9 @@ function buildAgentsCache() {
   const pausedSubs = pausedSubscriptions(now);
   // One live-key set for the whole build (XERK-448 case-twin fold); see serializeAgent.
   const liveKeys = new Set(Object.keys(agents));
+  // Renamed hosts fold their old names' spend in (XERK-2381); a restore or an HA
+  // registry apply can change formerNames without a beat, so resync per build.
+  syncLedgerAliases();
   // One host whose record cannot be serialized is left out, never the whole
   // fleet: a throw here otherwise froze /api/agents for every client on the last
   // good payload (or an empty fleet after a restart) until that host was pruned
@@ -9975,6 +10086,25 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeUploadMax(a);
   normalizeUpdating(a);
   normalizeDefectReports(a);
+  normalizeAgentIdentity(a);
+}
+
+// The hub-owned agent identity fields (XERK-2381). Never served, but restored
+// from state.json / the HA store, where a corrupt value would otherwise bind a
+// host to a garbage id or feed a non-string into the usage-ledger alias fold.
+// Inline literals: this runs from the restore at module init (TDZ).
+function normalizeAgentIdentity(a) {
+  if ("agentUid" in a && !(typeof a.agentUid === "string" && /^[0-9a-f]{32}$/.test(a.agentUid))) {
+    delete a.agentUid;
+  }
+  if ("uidBound" in a && a.uidBound !== true) delete a.uidBound;
+  if ("formerNames" in a) {
+    const names = Array.isArray(a.formerNames)
+      ? a.formerNames.filter((n) => typeof n === "string" && n && n.length <= 200).slice(-8)
+      : [];
+    if (names.length) a.formerNames = names;
+    else delete a.formerNames;
+  }
 }
 
 // The agent's defect-attribution findings (XERK-1846) — whitelisted and capped by
@@ -12494,7 +12624,7 @@ function agentPresented(req) {
   const header = req.headers.authorization || "";
   if (header.startsWith("Bearer ")) {
     const token = header.slice(7);
-    if (tokenHost(token)) return true;
+    if (tokenHost(token) || tokenUid(token)) return true;
     // Under TURMA_AGENT_STRICT the master is not a credential at all, and that
     // has to hold HERE and not only at the authorization check past it: this
     // gate stands in front of the 32 MiB read, so leaving the master usable
@@ -12528,8 +12658,9 @@ function agentPresentedRefusal(req) {
 // `device`, the tunnel's `?name=` — and this says whether the credential backs
 // that claim. Four outcomes:
 //
-//   "proved"   the bearer is this host's derived token, so `host` is the
-//              credential's and not the caller's to pick;
+//   "proved"   the bearer is this host's derived token, or an agent identity
+//              token (XERK-2381) bound to — or free to claim — `host`, so the
+//              host is the credential's and not the caller's to pick;
 //   "operator" the ordinary user login (Basic/cookie). The operator owns the
 //              whole fleet and can already drive every host through the user
 //              API, so they may name any host — this is what keeps the
@@ -12553,6 +12684,8 @@ function agentBearerKind(req, host) {
     // A host token proves exactly one host. Naming any other is the
     // impersonation this exists to refuse — not a fallback to `legacy`.
     if (bound) return host != null && bound === host ? "proved" : null;
+    const uid = tokenUid(token);
+    if (uid) return host != null && uidHostClaim(uid, host) ? "proved" : null;
     if (safeEqual(token, TURMA_AGENT_TOKEN)) return "legacy";
     return null;
   }
@@ -12573,7 +12706,21 @@ function agentHostRefusal(req, host) {
     // and "unauthorized" sends the operator hunting for a wrong secret instead
     // of a changed name. It tells the caller nothing it doesn't already hold:
     // the token names its own host on its face.
-    const bound = tokenHost((req.headers.authorization || "").slice(7));
+    const bearer = (req.headers.authorization || "").slice(7);
+    const bound = tokenHost(bearer);
+    const uid = bound ? null : tokenUid(bearer);
+    if (uid) {
+      // An identity token naming a host another agent's record holds. Naming
+      // which one it IS bound to is safe for the same reason as below: the
+      // caller holds that agent's credential.
+      const mine = hostOfUid(uid);
+      return {
+        status: 403,
+        error: `${host} is registered to another agent` +
+          (mine ? ` (this agent is ${mine})` : "") +
+          " — remove that host from the dashboard to reuse its name",
+      };
+    }
     if (bound) {
       return {
         status: 403,
@@ -12605,13 +12752,22 @@ function resolveEnrollToken(req, device) {
   }
   const header = req.headers.authorization || "";
   const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
+  // Already on its IDENTITY token (XERK-2381): hand back the same credential.
+  // Idempotent, works under strict, and never a different agent's.
+  const provedUid = bearer ? tokenUid(bearer) : null;
+  if (provedUid) {
+    return { status: 200,
+      body: { host: hostOfUid(provedUid) || device || null, token: uidAgentToken(provedUid), bound: true } };
+  }
   const proved = bearer ? tokenHost(bearer) : null;
   if (proved) {
-    // Already on its derived token: hand back its OWN, whatever ?device says. A
-    // proved host can never obtain a DIFFERENT host's token — the escalation
-    // "never a caller-named device" really guards. Works under strict too (it
-    // is the host's own credential), so a re-enroll is idempotent.
-    return { status: 200, body: { host: proved, token: hostAgentToken(proved), bound: true } };
+    // On its name-derived token: trade it for this host's IDENTITY token, so a
+    // later rename keeps the agent (XERK-2381). Keyed on the PROVED host,
+    // whatever ?device says — a proved host can never obtain a DIFFERENT host's
+    // credential, the escalation "never a caller-named device" really guards.
+    // Works under strict too (it is the host's own), and a re-enroll returns the
+    // id already stamped on the record.
+    return { status: 200, body: { host: proved, token: uidAgentToken(issueAgentUid(proved)), bound: true } };
   }
   const isMaster = bearer && safeEqual(bearer, TURMA_AGENT_TOKEN);
   if (!isMaster) return { status: 401, body: { error: "unauthorized" } };
@@ -12623,20 +12779,19 @@ function resolveEnrollToken(req, device) {
       body: { error: "this hub requires each agent's own token (TURMA_AGENT_STRICT is " +
         "set), not the fleet master — enroll only rolls OFF the master" } };
   }
-  // Master + the host's own name: the bootstrap. Deriving <device>'s token is
-  // exactly what `node server.js --agent-token <device>` already mints for a
-  // master holder, so it grants nothing new.
+  // Master + the host's own name: the bootstrap. A master holder can already
+  // act as any host (non-strict only), so handing <device> its identity token
+  // grants nothing new.
   if (!device) {
     return { status: 400,
       body: { error: "device required: on the fleet master, name this host's DEVICE_NAME " +
         "so the hub derives its token (?device=<name>)" } };
   }
-  const token = hostAgentToken(device);
-  if (!token) {
+  if (!hostAgentToken(device)) {
     return { status: 409,
       body: { error: `cannot derive a token for ${device} — it is not a usable host key` } };
   }
-  return { status: 200, body: { host: device, token, bound: false } };
+  return { status: 200, body: { host: device, token: uidAgentToken(issueAgentUid(device)), bound: false } };
 }
 
 // Trigger auth (POST /api/trigger). A caller passes either the dedicated
@@ -12669,6 +12824,8 @@ function agentWsAuthorized(url, req, host) {
   const token = url.searchParams.get("token");
   if (token) {
     if (host != null && safeEqual(token, hostAgentToken(host))) return true;
+    const uid = tokenUid(token);
+    if (uid) return host != null && uidHostClaim(uid, host);
     return !TURMA_AGENT_STRICT && safeEqual(token, TURMA_AGENT_TOKEN);
   }
   return !agentHostRefusal(req, host);
@@ -19494,6 +19651,13 @@ const server = http.createServer(async (req, res) => {
       // Which credential it used decides which token its ttyd is running with
       // (see ttydAuth). Hub-derived, never read off the payload.
       const tokenBound = agentBearerKind(req, key) === "proved";
+      // An agent IDENTITY token (XERK-2381) beating under a name other than the
+      // one its record holds is a RENAME: the auth gate above already proved the
+      // new name is free, so this beat takes over the old record (sessions,
+      // command queue, org binding, alerts) instead of starting a new host.
+      const beatUid = tokenBound ? tokenUid((req.headers.authorization || "").slice(7)) : null;
+      const uidHome = beatUid ? hostOfUid(beatUid) : null;
+      const renamedFrom = uidHome && uidHome !== key ? uidHome : null;
       // Admission control (XERK-272), ordered AFTER the binding above so an
       // unbound beat can never spend a registry slot. A host already in the
       // registry always gets in — its record is bounded below and replacing it
@@ -19506,7 +19670,7 @@ const server = http.createServer(async (req, res) => {
       // and the `legacy` master credential a mid-rollover fleet still accepts —
       // neither of which is nothing, and a host deriving its name from something
       // unstable grows records with no attacker at all.
-      const known = Object.prototype.hasOwnProperty.call(agents, key);
+      const known = Object.prototype.hasOwnProperty.call(agents, key) || !!renamedFrom;
       if (!known && !makeRegistryRoom(0, 1)) {
         // Throttled like the over-half warning, and for the same reason: the
         // flood this exists to survive is exactly the traffic that would write
@@ -19517,7 +19681,11 @@ const server = http.createServer(async (req, res) => {
           error: "agent registry full", limit: AGENTS_MAX, bytes: AGENTS_TOTAL_MAX,
         });
       }
-      const prev = agents[key] || {};
+      const prev = agents[key] || (renamedFrom && agents[renamedFrom]) || {};
+      // What a refused beat rolls back to. A rename's `prev` is the OLD name's
+      // record, which stays where it is until the beat is accepted — so a refused
+      // rename leaves no record under the new name.
+      const rollback = renamedFrom ? {} : prev;
       // XERK-289: warn when a second physical host beats under an existing
       // host's name (its agentId differs from the stored one). Read BEFORE the
       // record is overwritten below, so `prev` still holds the incumbent's id.
@@ -19680,6 +19848,18 @@ const server = http.createServer(async (req, res) => {
         // must not be able to make itself one. Set on the first beat that
         // declares an org and never moved after — see boundOrgOf.
         orgBound: prev.orgBound || siteKeyOf(payload) || undefined,
+        // The agent identity this host is bound to (XERK-2381), and whether THIS
+        // beat authenticated with it (ttydAuth). Hub-owned, after the spread:
+        // a mint stamps `agentUid` before the agent ever beats on it, so a beat
+        // on the old name token keeps the binding.
+        agentUid: beatUid || prev.agentUid || undefined,
+        uidBound: beatUid ? true : undefined,
+        // Names this agent's record was renamed AWAY from, oldest first, so the
+        // usage ledger folds their retired spend into this card (XERK-2381).
+        formerNames: renamedFrom
+          ? [...(Array.isArray(prev.formerNames) ? prev.formerNames : []), renamedFrom]
+            .filter((n) => n !== key).slice(-FORMER_NAMES_MAX)
+          : prev.formerNames,
         lastSeen: Date.now(),
         // Per-agent alert bookkeeping survives across beats and hub restarts.
         alerts: prev.alerts || {},
@@ -19733,15 +19913,15 @@ const server = http.createServer(async (req, res) => {
       const refuseOversized = (size) => {
         const detail = `record is ${size} bytes, over the ${AGENT_RECORD_MAX}-byte ` +
           `per-host limit — shrink this host's report (fewer/smaller sessions, repos)`;
-        if (prev && Object.keys(prev).length) {
-          agents[key] = prev;
+        if (rollback && Object.keys(rollback).length) {
+          agents[key] = rollback;
           // Stamp WHY onto the record still being served (XERK-298), so the host
           // shows a "hub refused" chip instead of silently freezing and aging to
           // offline. Re-measure and publish so the chip appears on open
           // dashboards this beat rather than on the next unrelated fleet event —
           // a refused beat otherwise invalidates nothing.
-          stampRefusal(prev, "record-too-large", detail);
-          recordBytes.set(key, agentRecordSize(prev));
+          stampRefusal(rollback, "record-too-large", detail);
+          recordBytes.set(key, agentRecordSize(rollback));
           publishAgent(key);
         } else {
           delete agents[key];
@@ -19770,7 +19950,7 @@ const server = http.createServer(async (req, res) => {
         recordCoercion.normalize(next);
       } catch (e) {
         console.error(`heartbeat from ${logName(key)}: coercion failed (${e.message}) — beat refused`);
-        if (prev && Object.keys(prev).length) agents[key] = prev;
+        if (rollback && Object.keys(rollback).length) agents[key] = rollback;
         else delete agents[key];
         return json(res, 400, { error: "malformed heartbeat" });
       }
@@ -19820,13 +20000,13 @@ const server = http.createServer(async (req, res) => {
         const detail = `record is ${recordSize} bytes, over its ${AGENT_FAIR_SHARE}-byte ` +
           `share of a full registry — shrink this host's report, or raise ` +
           `AGENTS_TOTAL_MAX`;
-        if (prev && Object.keys(prev).length) {
-          agents[key] = prev;
+        if (rollback && Object.keys(rollback).length) {
+          agents[key] = rollback;
           // Same as the 413 path (XERK-298): stamp the record still being served
           // and publish, so this refusal is a visible chip, not a host that
           // silently freezes and reads offline.
-          stampRefusal(prev, "registry-full", detail);
-          recordBytes.set(key, agentRecordSize(prev));
+          stampRefusal(rollback, "registry-full", detail);
+          recordBytes.set(key, agentRecordSize(rollback));
           publishAgent(key);
         } else {
           delete agents[key];
@@ -19841,6 +20021,9 @@ const server = http.createServer(async (req, res) => {
       // still refuse this beat — a refused beat is not history, and a record
       // rolled back to `prev` must not have been folded into the ledger first.
       usageLedger.ingest(key, next);
+      // A rename (XERK-2381) lands only now, past every gate that could refuse
+      // the beat: the old name's record goes, the new one already holds it.
+      if (renamedFrom) renameAgentRecord(renamedFrom, key);
       // The permission ledger (XERK-1563), after the same gates and for the same
       // reason. Every field is whitelisted + bounded inside (sanitizePermissionEvent).
       if (Array.isArray(permissionEvents) && permissionEvents.length) {
@@ -20912,7 +21095,10 @@ const server = http.createServer(async (req, res) => {
             "so it derives no per-host tokens to roll",
         });
       }
-      const token = hostAgentToken(key);
+      // An IDENTITY token (XERK-2381): the host's bound id, minted and stamped
+      // on first roll, so a re-roll is still idempotent and a later rename of
+      // the host keeps this credential.
+      const token = hostAgentToken(key) ? uidAgentToken(issueAgentUid(key)) : "";
       if (!token) {
         // The host name doesn't derive a token (a dot segment, a name that
         // doesn't UTF-8 round-trip) — the same names hostAgentToken refuses to
@@ -23595,6 +23781,10 @@ if (process.env.TURMA_TEST) {
     termAgents,
     agentWsAuthorized,
     hostAgentToken,
+    uidAgentToken,
+    tokenUid,
+    uidHostClaim,
+    hostOfUid,
     ttydAuth,
     triggerAuthorized,
     safeEqual,

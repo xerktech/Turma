@@ -85,6 +85,17 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
   - The master still authenticates as `legacy` so a fleet mid-rollover keeps beating;
     **`TURMA_AGENT_STRICT` retires it**, and the hub warns at boot until it is set. Detail in
     `turma.md`; the agent needs no code change, only the right `TURMA_TOKEN`.
+  - **A host RENAME keeps the agent via its IDENTITY token** (XERK-2381): roll/enroll hand out
+    `<base64url("uid:"+id)>.<HMAC>` over a hub-minted random id, stored as `agentUid` on the record.
+    The token proves the AGENT; the hub binds it to the host name it beats as (`uidHostClaim`).
+    - It may claim a name only when that name's record is bound to it or no record holds the name.
+      A legacy record is bound only by a hub MINT (roll/enroll stamp `agentUid`), never by a claim —
+      else any identity holder could take over a host it was not minted for.
+    - A beat under a free new name RENAMES: the old record carries over (commands, org binding,
+      alerts), the old key is dropped, ticket pins follow, `formerNames` feeds the usage fold.
+    - Hub-owned and never served: `agentUid`, `uidBound` (ttydAuth's which-token), `formerNames`.
+    - `hostAgentToken` refuses the `uid:` namespace so a host name never collides with an id.
+    - Tests: the `XERK-2381:` cases in `server.test.js`, `TestSetToken`.
   - **Onboarding onto that derived token is ONE action, not a per-host ritual** (XERK-578): the
     hub roll route + agent enroll endpoint, spanning hub + agent + native. Never re-key the enroll
     endpoint on a caller-named device for a PROVED caller. Mechanics: `agent-token-onboarding.md`.
