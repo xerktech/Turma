@@ -228,7 +228,11 @@ ready-for-review, ended sessions, composer, terminal.
 ## Insights page (`/insights`)
 
 See `.claude/rules/turma-insights.md` — the sub-pages (decisions, permission prompts, model
-quality), the decisions log, and the retired org brief.
+quality), the decisions log, and what is left of the retired org brief.
+
+## Daily Brief page (`/brief`)
+
+See `.claude/rules/turma-daily-brief.md` — per-org read-aloud brief, Run now, the schedule editor.
 
 ## Durable archive
 

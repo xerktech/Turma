@@ -83,6 +83,8 @@ A pure-core/adapter-shell split:
   (XERK-2386): no Android tab, types, or `/api/permissions` / `/api/model-quality` calls.
   `AgentsResponse` declares no `briefs`/`decisions`/`decisionCounts`; `ignoreUnknownKeys` drops
   them when an older hub sends them. Tests: `AgentDecodeTest` (briefs/decisions ignored case).
+- **The Daily Brief page (`/brief`, XERK-2396) has no Android screen yet** (`PARITY.md`):
+  `AgentsResponse` declares no `dailyBriefs`/`dailyBriefSchedules`; `ignoreUnknownKeys` drops them.
 
 ## Images (rollup XERK-2109)
 

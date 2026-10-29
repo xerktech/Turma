@@ -33,6 +33,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   Android has none of them, and the web nav's Insights tab has no Android bottom-nav counterpart.
 - **No org brief on either client (XERK-2386).** The brief page, its "Brief now" and its push alert
   are retired on the web and Android alike; Android ignores a `briefs` key an older hub still sends.
+- **The Daily Brief page is web-only for now (XERK-2396).** The web's `/brief` tab (each org's
+  latest standup brief, Run now, the meeting-schedule editor) has no Android screen yet; Android
+  ignores the `dailyBriefs`/`dailyBriefSchedules` keys.
 - **Manual Refresh button on the Dashboard.** The web dashboard has no explicit refresh control (it
   auto-polls + SSE); the phone keeps a header Refresh button for a deliberate re-poll. It now shows a
   spinner while the awaited `/api/agents` poll runs (a short visible floor so a fast poll still reads
