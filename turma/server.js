@@ -2903,7 +2903,7 @@ const NAME_TOKEN_GENS_MAX = 4096;
 // Resolves {gen} only once the bump is DURABLE: the store's usual fire-and-forget
 // write (a 5s debounce on the file backend) would let a crash, or the CLI run
 // right after, silently hand back the token just revoked. On any failure the
-// in-memory bump is rolled back and {status, error} says why.
+// in-memory map is left as it was and {status, error} says why.
 // Revokes run one at a time: an overlapping pair would let the first one's
 // rollback restore a generation from before the second one's 200.
 let nameTokenBumpChain = Promise.resolve();
@@ -2912,37 +2912,63 @@ function bumpNameTokenGen(host, now = Date.now()) {
   nameTokenBumpChain = run.catch(() => {});
   return run;
 }
-async function bumpNameTokenGenNow(host, now) {
-  const had = Object.prototype.hasOwnProperty.call(nameTokenGens, host);
-  if (!had && Object.keys(nameTokenGens).length >= NAME_TOKEN_GENS_MAX) {
-    return { status: 409, error: "too many hosts have a revoked name token; no room to record another" };
+// Per host, the higher generation wins: generations only rise once a revoke has
+// answered 200, so this is the merge of two copies that each missed a revoke.
+function mergeNameTokenGens(a, b) {
+  const out = Object.create(null);
+  for (const src of [a, b]) {
+    for (const [host, e] of Object.entries(src)) {
+      if (!out[host] || e.gen > out[host].gen) out[host] = e;
+    }
   }
+  return out;
+}
+// A revoke is a compare-and-swap on the whole map, retried on a lost race: under
+// HA another replica can revoke a DIFFERENT host at the same instant (a leader
+// handover), and a plain whole-value SET would drop its bump after its 200.
+const NAME_TOKEN_BUMP_TRIES = 5;
+async function bumpNameTokenGenNow(host, now) {
   const key = STORE_KEY_PREFIX + "nameTokenGens";
-  const prev = had ? nameTokenGens[host] : null;
-  const gen = nameTokenGen(host) + 1;
-  nameTokenGens[host] = { gen, at: now };
-  const rollback = (why) => {
-    if (prev) nameTokenGens[host] = prev; else delete nameTokenGens[host];
-    // The store may already hold the bumped value (its own snapshot, written on
-    // its next flush or shutdown): put the rolled-back value there too, or a
-    // revoke the operator was told did NOT happen takes effect at the restart.
-    Promise.resolve().then(() => liveStore.set(key, nameTokenGens)).catch((e) =>
-      console.error(`agent token: could not restore the name-token generations in the store: ${e && e.message}`));
+  let stored, next, gen, swapped = false;
+  const fail = (why) => {
     console.error(`agent token: revoking the name token for ${logName(host)} failed: ${why}`);
     return { status: 503, error: "the revoke could not be saved, so it was not applied — try again" };
   };
+  // Undo our write only while the store still holds exactly it: a revoke landed
+  // since must not be swept away with ours. Best effort — a failed undo leaves
+  // the bump in place, which revokes the token the operator asked to revoke.
+  const undo = () => Promise.resolve()
+    .then(() => liveStore.compareAndSet(key, next, coerceNameTokenGens(stored)))
+    .catch((e) => console.error(`agent token: could not restore the name-token generations in the store: ${e && e.message}`));
   try {
-    await liveStore.set(key, nameTokenGens);
+    for (let i = 0; i < NAME_TOKEN_BUMP_TRIES && !swapped; i++) {
+      stored = await liveStore.get(key);
+      next = mergeNameTokenGens(nameTokenGens, coerceNameTokenGens(stored));
+      if (!next[host] && Object.keys(next).length >= NAME_TOKEN_GENS_MAX) {
+        return { status: 409, error: "too many hosts have a revoked name token; no room to record another" };
+      }
+      gen = (next[host] ? next[host].gen : 0) + 1;
+      next[host] = { gen, at: now };
+      swapped = await liveStore.compareAndSet(key, stored, next);
+    }
+    if (!swapped) return fail("the store kept changing under it");
     if (!HA_ON) {
       // The file backend debounces; write now and read it back, since its
       // writer logs a failure rather than throwing.
       if (liveStore.flush) liveStore.flush();
       const onDisk = coerceNameTokenGens(readJsonFile(NAME_TOKEN_GENS_FILE));
-      if (!onDisk[host] || onDisk[host].gen !== gen) return rollback(`${NAME_TOKEN_GENS_FILE} was not written`);
+      if (!onDisk[host] || onDisk[host].gen !== gen) {
+        undo();
+        return fail(`${NAME_TOKEN_GENS_FILE} was not written`);
+      }
     }
   } catch (e) {
-    return rollback(e && e.message);
+    // A swap that threw may still have applied (a timed-out reply): undo it.
+    if (next) undo();
+    return fail(e && e.message);
   }
+  // Merged, not assigned: a remote revoke the watch installed meanwhile stays.
+  nameTokenGens = mergeNameTokenGens(nameTokenGens, next);
   invalidateAgentsCache();
   return { gen };
 }

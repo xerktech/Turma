@@ -132,6 +132,10 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
       - The 200 means DURABLE: the bump awaits the store write (file: flushed + read back) and
         rolls back with a 503 on failure — never the fire-and-forget `persist()` other stores use.
       - Never evict an entry: dropping one REVIVES every token it revoked (refused past the cap).
+      - The write is a COMPARE-AND-SWAP of the store's map merged (per-host max gen) with the
+        mirror, retried, never a whole-value SET (XERK-2385): two replicas revoking different
+        hosts in a handover otherwise lost one after its 200. An undo is a CAS back from exactly
+        what it wrote, so it never sweeps away a revoke that landed since.
       - `--agent-token <host>` must print the CURRENT generation; under HA it reads the shared
         store and refuses to print rather than fall back to gen 0.
       - It revokes no identity token; an explicit identity revoke (XERK-2383) should also call
