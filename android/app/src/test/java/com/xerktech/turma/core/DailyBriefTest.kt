@@ -100,4 +100,11 @@ class DailyBriefTest {
         assertEquals("Being written…", briefHeadline(row("a", "running")))
         assertEquals("No summary.", briefHeadline(row("a", "ok")))
     }
+
+    @Test fun `a scheduled row is labelled by its meeting, a Run now by when it ran`() {
+        val sched = DailyBrief(trigger = "scheduled", meetingAt = 500, startedAt = 200)
+        assertEquals(500L, briefAt(sched))
+        assertEquals(200L, briefAt(DailyBrief(trigger = "manual", meetingAt = 500, startedAt = 200)))
+        assertEquals(500L, briefAt(DailyBrief(trigger = "manual", meetingAt = 500)))
+    }
 }

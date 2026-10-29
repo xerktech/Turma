@@ -211,7 +211,8 @@ private fun BriefReadAloud(b: DailyBrief, now: Long, zone: ZoneId, locale: Local
     TurmaCard(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Text(
-                "For " + briefWhenLabel(briefAt(b), now, zone, locale),
+                (if (b.trigger == "manual") "Run now · " else "For ") +
+                    briefWhenLabel(briefAt(b), now, zone, locale),
                 style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.net.FleetState
 import com.xerktech.turma.net.hubErrorMessage
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -52,6 +53,10 @@ class BriefViewModel(app: Application) : AndroidViewModel(app) {
                 body != null && !body.ok -> body.error.ifBlank { "the hub did not start a brief" }
                 else -> null
             }
+        } catch (e: CancellationException) {
+            // Leaving the screen cancels the call; that is not "unreachable".
+            _asking.value = _asking.value - siteKey
+            throw e
         } catch (_: Exception) {
             "the hub is unreachable"
         }

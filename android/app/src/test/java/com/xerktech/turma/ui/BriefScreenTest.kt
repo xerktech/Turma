@@ -43,8 +43,9 @@ class BriefScreenTest {
     private val briefs = listOf(
         DailyBrief(runId = "b2", status = "ok", meetingAt = at(29, 9, 30), day = "Two tickets shipped.",
             week = "Five this week.", next = "XERK-9 is next."),
-        DailyBrief(runId = "b1", status = "ok", trigger = "manual", meetingAt = at(28, 9, 30),
-            headline = "One ticket shipped."),
+        // A Run now: labelled with when it ran, not the meeting it preceded.
+        DailyBrief(runId = "b1", status = "ok", trigger = "manual", meetingAt = at(29, 9, 30),
+            startedAt = at(28, 14, 5), headline = "One ticket shipped."),
     )
 
     private fun body(list: List<DailyBrief>, onRunNow: () -> Unit = {}) = compose.setContent {
@@ -64,7 +65,7 @@ class BriefScreenTest {
         compose.onNodeWithText("Two tickets shipped.").assertExists()
         compose.onNodeWithText("Five this week.").assertExists()
         compose.onNodeWithText("XERK-9 is next.").assertExists()
-        compose.onNodeWithText("Yesterday 9:30 AM · Run now").assertExists()
+        compose.onNodeWithText("Yesterday 2:05 PM · Run now").assertExists()
         compose.onNodeWithText("One ticket shipped.").assertExists()
         compose.onNodeWithText("Run now").assertIsEnabled().performClick()
         assertEquals(1, ran)

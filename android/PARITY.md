@@ -32,9 +32,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Insights is WEB-ONLY (operator decision, XERK-2386).** The web's Insights page (`/insights`)
   holds the per-org decisions log, the permission-prompts ledger and model quality (shadow runs);
   Android has none of them, and the web nav's Insights tab has no Android bottom-nav counterpart.
-- **Daily Brief schedule editing is WEB-ONLY (XERK-2397).** The web Brief page edits each org's
-  standup schedule (time, zone, weekdays, lead, model); the Android Brief tab reads the brief, shows
-  the next meeting and offers Run now, but never sends `PUT .../daily-brief/schedule`.
+- **Daily Brief schedule editing is WEB-ONLY (XERK-2397).** Schedules are edited on the web Brief
+  page (XERK-2396) or the `PUT .../daily-brief/schedule` route, never from the phone.
+  - The Android Brief tab reads the brief, shows the next meeting and offers Run now.
 - **No org brief on either client (XERK-2386).** The brief page, its "Brief now" and its push alert
   are retired on the web and Android alike; Android ignores a `briefs` key an older hub still sends.
 - **Manual Refresh button on the Dashboard.** The web dashboard has no explicit refresh control (it
@@ -716,10 +716,12 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 
 ## Done (XERK-2397 — Daily Brief screen)
 
-- Bottom-nav **Brief** tab (`TopDest.BRIEF`, between Board and Usage — the web nav should match): the picked org's newest finished brief in
-  read-aloud type (Since yesterday / This week / Up next), "Next meeting …" from the org's schedule,
-  Run now (off while a brief is being written; a refusal toasts the hub's words), earlier briefs as
-  headlines. A newest failed run shows its reason above the last good brief.
+- Bottom-nav **Brief** tab (`TopDest.BRIEF`), between Board and Usage; the web nav should match.
+  - The picked org's newest finished brief in read-aloud type (Since yesterday / This week / Up
+    next) and "Next meeting …" from the org's schedule.
+  - Run now: off while a brief is being written; a refusal toasts the hub's words.
+  - Earlier briefs as headlines; a Run now row is labelled with when it ran.
+  - A newest failed run shows its reason above the last good brief.
 - The org is the header's pick when it names one; otherwise a chip row offers the scoped orgs.
 - `dailyBriefs` / `dailyBriefSchedules` decode per org (`LenientSiteMapSerializer`), so a malformed
   entry drops alone. Schedule editing stays web-only (above).

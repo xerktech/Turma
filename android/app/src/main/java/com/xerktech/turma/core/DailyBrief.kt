@@ -103,5 +103,13 @@ fun briefHeadline(b: DailyBrief): String = when (b.status) {
         .ifBlank { "No summary." }
 }
 
-/** The instant a row is ABOUT: the meeting it was written for, else when it ran. */
-fun briefAt(b: DailyBrief): Long = if (b.meetingAt > 0) b.meetingAt else b.startedAt
+/**
+ * The instant a row is labelled with. A scheduled brief is ABOUT its meeting; a
+ * Run now carries the upcoming meeting too, so three runs in a day would all
+ * read "Tomorrow 9:30" — it is labelled with when it ran instead (XERK-2397 QA).
+ */
+fun briefAt(b: DailyBrief): Long = when {
+    b.trigger == "manual" && b.startedAt > 0 -> b.startedAt
+    b.meetingAt > 0 -> b.meetingAt
+    else -> b.startedAt
+}
