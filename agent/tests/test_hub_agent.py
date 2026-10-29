@@ -43362,7 +43362,8 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
         self.assertGreaterEqual(len(sites), 6)
         for at in sites:
             window = src[at:at + 900]
-            routed = '"argv": ["claude", "-p"' in src[at - 12:at + 30]
+            routed = ('"argv": ["claude", "-p"' in src[at - 12:at + 30]
+                      or "self._run_lockdown_oneshot(argv," in window)
             self.assertTrue(routed or "env=_session_env()" in window,
                             src[at:at + 120])
         runner = inspect.getsource(ha.SessionManager._run_lockdown_oneshot)

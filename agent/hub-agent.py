@@ -26447,10 +26447,11 @@ INTERNAL_TOOL_PROMPT_SIGS = (
     "turma limits probe",
     # The wait classifier (XERK-1572, ATTENTION_HINT_INSTRUCTION).
     "You are classifying why an autonomous coding session",
-    # The permission judge (XERK-1566, JUDGE_INSTRUCTION).
-    "You are the Turma permission judge",
     # The daily brief (XERK-2394, DAILY_BRIEF_INSTRUCTION).
     "You write the script for a team's daily standup",
+    # The permission judge (XERK-1566, JUDGE_INSTRUCTION). Kept LAST: its test
+    # reads INTERNAL_TOOL_PROMPT_SIGS[-1].
+    "You are the Turma permission judge",
 )
 
 
