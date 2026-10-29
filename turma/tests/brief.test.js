@@ -443,6 +443,9 @@ test("XERK-2396: Save's busy state and error reach the controls while a field ho
   const form = fakeForm(SITE);
   P.els.briefList.querySelectorAll = (sel) => (sel === "[data-sched]" ? [form] : []);
   P.document.createElement = () => ({ className: "", textContent: "" });
+  // An unsaved draft, so a success's repaint (draft dropped) would differ.
+  P.drafts.set(SITE, { enabled: true, time: "09:00", timeZone: "UTC", weekdays: [1], leadMinutes: "7", model: "auto" });
+  P.renderBriefs(d, NOW, true);
   P.document.activeElement = fieldIn("leadMinutes", "7");
   const listBefore = P.list();
   const first = P.saveSchedule(SITE);
