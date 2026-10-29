@@ -166,6 +166,16 @@ test("newticket: a form opened from the cache drops '(offline)' once the fleet l
     assert.doesNotMatch(select.innerHTML, /offline/);
     // Only the options moved: the rest of the form (and anything typed) stays.
     assert.equal(panel.innerHTML, formHtml);
+    // A settled beat rewrites nothing, even though the DOM reserializes the
+    // options differently from how they were built.
+    select.innerHTML = select.innerHTML.replace(" selected", ' selected=""');
+    const reserialized = select.innerHTML;
+    NT.update({ agents: [agent("h1", "acme.atlassian.net"), agent("h2", "beta.atlassian.net")] });
+    assert.equal(select.innerHTML, reserialized);
+    // The form's org leaving the fleet closes the form rather than throwing.
+    const backdrop = body.children[0];
+    assert.doesNotThrow(() => NT.update({ agents: [agent("h2", "beta.atlassian.net")] }));
+    assert.equal(backdrop.hidden, true);
   } finally { delete global.window.TurmaOrg; }
 });
 

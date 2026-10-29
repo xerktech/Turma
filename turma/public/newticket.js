@@ -77,6 +77,7 @@
   let btnShown = false;
   // { sites, siteKey, source, meta, types, values, busy, error, created }
   let createState = null, createSeq = 0;
+  let orgOptsPainted = "";   // the org <select>'s last options, as built (not as the DOM reserializes them)
 
   // The org list a create can target: every org the fleet reports, shaped down
   // to what createOrgOptions / the submit path need.
@@ -86,7 +87,9 @@
   }
 
   function paintCreate() {
-    if (createState && panel) panel.innerHTML = board().createFormHtml(createState);
+    if (!createState || !panel) return;
+    panel.innerHTML = board().createFormHtml(createState);
+    orgOptsPainted = board().createOrgOptions(createState.sites, createState.siteKey);
   }
 
   // A modal is open somewhere (this one or the board's own detail panel), so
@@ -277,9 +280,12 @@
       // "(offline)" — the cache carries no liveness. Refresh just the org
       // <select>'s options, not the whole form, so a half-typed title keeps
       // its text and caret.
+      // Compared against what was last BUILT: the DOM reserializes `selected`
+      // as `selected=""`, so reading innerHTML back never matches and would
+      // rebuild the options (closing an open dropdown) on every beat.
       const sel = panel && panel.querySelector("[data-cf-org]");
       const opts = board().createOrgOptions(createState.sites, createState.siteKey);
-      if (sel && sel.innerHTML !== opts) sel.innerHTML = opts;
+      if (sel && opts !== orgOptsPainted) { sel.innerHTML = opts; orgOptsPainted = opts; }
     }
   }
 
