@@ -3960,7 +3960,7 @@ test("New-session picker: hosts collapsed until their header is clicked", () => 
   p.beat({ now: Date.now(), agents: [a, b] });
   let html = p.els.spawn.innerHTML;
   assert.doesNotMatch(html, /repoX|repoY/, "no repo rendered while collapsed");
-  assert.match(html, /aria-expanded="false"[^>]*onclick="toggleHost\('hostA'\)"/);
+  assert.match(html, /id="hhd-hostA" aria-expanded="false"[^>]*onclick="toggleHost\('hostA'\)"/);
   p.toggleHost("hostA");
   html = p.els.spawn.innerHTML;
   assert.match(html, /\+ repoX/);
@@ -3988,6 +3988,10 @@ test("hostWeekly: freshest 7d reading on the host's subscription, stale/absent r
   assert.equal(hostWeekly(c, [a, b, c, solo], now).usedPct, 90);
   // No subscription key: never folded into another silent host.
   assert.equal(hostWeekly(solo, [solo, { key: "e", limits: lim(5, 1) }], now).usedPct, 20);
+  // Strictly newer replaces: on a tie the first reading in fleet order holds.
+  const t1 = { key: "t1", subscription: { key: "U" }, limits: lim(30, 60) };
+  const t2 = { key: "t2", subscription: { key: "U" }, limits: lim(70, 60) };
+  assert.equal(hostWeekly(t2, [t1, t2], now).usedPct, 30);
   assert.equal(hostWeekly({ key: "x", limits: lim(10, 25 * 3600) }, [], now), null, "over a day old");
   assert.equal(hostWeekly({ key: "x", limits: { capturedAt: now, sevenDay: {} } }, [], now), null);
   assert.equal(hostWeekly({ key: "x" }, [], now), null);
@@ -4005,6 +4009,8 @@ test("hostWeeklyHtml: width, levels, pace tick, a passed reset reads —", () =>
   assert.match(hostWeeklyHtml({ usedPct: 80 }, now), /class="hweek warn"/);
   assert.match(hostWeeklyHtml({ usedPct: 95 }, now), /class="hweek crit"/);
   assert.doesNotMatch(hostWeeklyHtml({ usedPct: 95 }, now), /hweek-pace/, "no reset, no pace");
+  assert.doesNotMatch(hostWeeklyHtml({ usedPct: 5, resetsAt: now + 10 * 86400 }, now), /hweek-pace/,
+    "a reset more than a week out has no place on the bar");
   const gone = hostWeeklyHtml({ usedPct: 70, resetsAt: now - 5 }, now);
   assert.match(gone, /class="hweek expired"/);
   assert.match(gone, />—</);

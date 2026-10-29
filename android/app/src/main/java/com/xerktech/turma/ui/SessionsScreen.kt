@@ -44,6 +44,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -597,6 +598,8 @@ fun SessionsListPane(
     LaunchedEffect(query.isNotBlank()) { if (query.isNotBlank()) endedOpen = true }
     // New-session picker: pick an online host + repo, then the spawn composer.
     var pickerOpen by remember { mutableStateOf(false) }
+    // Hosts expanded in the New-session picker, kept across reopening it (web `hostOpen`).
+    val pickerExpanded = remember { mutableStateListOf<String>() }
     var spawnFor by remember { mutableStateOf<Triple<String, String, Boolean>?>(null) }
     Box(modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
@@ -814,6 +817,7 @@ fun SessionsListPane(
             targets = remember(agents) { spawnTargets(agents) },
             onDismiss = { pickerOpen = false },
             onPick = { host, repo, isRoot -> pickerOpen = false; spawnFor = Triple(host, repo, isRoot) },
+            expanded = pickerExpanded,
         )
     }
     spawnFor?.let { (host, repo, isRoot) ->

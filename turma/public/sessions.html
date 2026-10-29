@@ -1883,6 +1883,9 @@ function spawnReadyUploadIds(rk) {
   }
   return ready;
 }
+// The header button's id, so the beat's innerHTML swap can hand its keyboard
+// focus back (captureFieldFocus restores `hhd-` ids like the composer's).
+function hostHeadId(key) { return "hhd-" + key.replace(/[^A-Za-z0-9]/g, "_"); }
 function toggleHost(key) {
   if (hostOpen.has(key)) hostOpen.delete(key); else hostOpen.add(key);
   render(cache);
@@ -1908,7 +1911,7 @@ function onOptionsToggle(rkey, repo, open) {
 // poll / SSE re-render.
 function captureFieldFocus() {
   const el = document.activeElement;
-  if (!el || !el.id || !/^(cmp|ren)-/.test(el.id)) return null;
+  if (!el || !el.id || !/^(cmp|ren|hhd)-/.test(el.id)) return null;
   const f = { id: el.id };
   try { f.start = el.selectionStart; f.end = el.selectionEnd; } catch { /* selects have none */ }
   return f;
@@ -3234,7 +3237,7 @@ function hostBlock(a, agents, nowSec, lone) {
     return `<div class="repo-item${open ? " open" : ""}">${btn}${panel}</div>`;
   }).join("");
   return `<div class="host-block${open ? " open" : ""}">
-    <button type="button" class="hname" aria-expanded="${open}"
+    <button type="button" class="hname" id="${esc(hostHeadId(a.key))}" aria-expanded="${open}"
         onclick="toggleHost('${escJs(a.key)}')"><span class="hchev">▶</span><span class="hlabel">${esc(a.key)}</span>${
       hostCapHtml(a.capacity)}${hostWeeklyHtml(hostWeekly(a, agents, nowSec), nowSec)}</button>
     ${open ? `<div class="repo-btns">${repos}</div>` : ""}

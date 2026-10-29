@@ -279,6 +279,10 @@ class SessionsFlattenTest {
         assertEquals(55.0, hostWeekly(a, all, now)?.usedPct)
         assertEquals(90.0, hostWeekly(c, all, now)?.usedPct)
         assertEquals(20.0, hostWeekly(solo, listOf(solo, ag("e", null, lim(5.0, 1))), now)?.usedPct)
+        // Strictly newer replaces: on a tie the first reading in fleet order holds.
+        val t1 = ag("t1", "U", lim(30.0, 60))
+        val t2 = ag("t2", "U", lim(70.0, 60))
+        assertEquals(30.0, hostWeekly(t2, listOf(t1, t2), now)?.usedPct)
         assertEquals(null, hostWeekly(ag("x", null, lim(10.0, 25 * 3600)), emptyList(), now))
         assertEquals(null, hostWeekly(ag("x", null, LimitsInfo(sevenDay = LimitWindow(), capturedAt = now)), emptyList(), now))
         assertEquals(null, hostWeekly(ag("x", null, null), emptyList(), now))

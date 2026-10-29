@@ -14,6 +14,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import com.xerktech.turma.ui.theme.TurmaColors
@@ -331,8 +334,10 @@ fun NewSessionPickerDialog(
     targets: List<SpawnHost>,
     onDismiss: () -> Unit,
     onPick: (host: String, repo: String, isRoot: Boolean) -> Unit,
+    // Hosts expanded in the picker. Owned by the caller so it survives closing
+    // and reopening the dialog, as the web sidebar's `hostOpen` does.
+    expanded: MutableList<String> = remember { mutableStateListOf() },
 ) {
-    val expanded = remember { mutableStateListOf<String>() }
     val nowSec = System.currentTimeMillis() / 1000
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -356,13 +361,16 @@ fun NewSessionPickerDialog(
                         // muted labelSmall SectionLabel read SMALLER than its own rows (XERK-737).
                         Row(
                             Modifier.fillMaxWidth()
-                                .clickable { if (!expanded.remove(h.key)) expanded.add(h.key) }
+                                .semantics { stateDescription = if (open) "Expanded" else "Collapsed" }
+                                .clickable(role = Role.Button) {
+                                    if (!expanded.remove(h.key)) expanded.add(h.key)
+                                }
                                 .padding(top = 12.dp, bottom = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Icon(
                                 if (open) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
-                                contentDescription = if (open) "Collapse" else "Expand",
+                                contentDescription = null,
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(end = 4.dp).size(20.dp),
                             )
