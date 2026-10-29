@@ -107,6 +107,7 @@ process.env.ORG_COLORS_FILE = path.join(
 // run on a host with a writable /data read the last run's leftovers.
 process.env.AUTOMERGE_ORGS_FILE = path.join(scratchDir(), `turma-test-automerge-orgs-${process.pid}.json`);
 process.env.DECISIONS_FILE = path.join(scratchDir(), `turma-test-decisions-${process.pid}.json`);
+process.env.DAILY_BRIEF_SCHEDULES_FILE = path.join(scratchDir(), `turma-test-daily-brief-schedules-${process.pid}.json`);
 process.env.DEDUPE_LINK_ORGS_FILE = path.join(scratchDir(), `turma-test-dedupe-link-orgs-${process.pid}.json`);
 process.env.EPIC_BUILDERS_FILE = path.join(scratchDir(), `turma-test-epic-builders-${process.pid}.json`);
 process.env.EPIC_RUNS_FILE = path.join(scratchDir(), `turma-test-epic-runs-${process.pid}.json`);
@@ -27379,4 +27380,156 @@ test("XERK-2381: a released identity cannot escape through a stale HA copy of it
   assert.ok(uidHostRefusal(uid, "ghost2381b"));
   assert.equal(uidHostRefusal(uid, "ghost2381"), null, "home stays open");
   forget2381("ghost2381", "ghost2381b");
+});
+
+// ---- XERK-2391: the Daily Brief's per-org meeting schedule ----------------------
+
+const NY2391 = { enabled: true, time: "09:30", timeZone: "America/New_York",
+  weekdays: [1, 2, 3, 4, 5], leadMinutes: 5, model: "auto" };
+const iso2391 = (ms) => new Date(ms).toISOString();
+
+test("XERK-2391: the schedule sanitizer whitelists, defaults and is a fixed point", () => {
+  const { sanitizeDailyBriefSchedule: san, dailyBriefSchedulesCoerce } = hub;
+  assert.deepEqual(san({ enabled: false, time: "07:05", timeZone: "utc", weekdays: [5, 1, 1],
+    extra: "x", updatedAt: 1700000000000 }),
+  { enabled: false, time: "07:05", timeZone: "UTC", weekdays: [1, 5], leadMinutes: 5,
+    model: "auto", updatedAt: 1700000000000 });
+  for (const bad of [
+    { ...NY2391, time: "24:00" }, { ...NY2391, time: "9:30" }, { ...NY2391, timeZone: "Mars/Base" },
+    { ...NY2391, weekdays: [] }, { ...NY2391, weekdays: [7] }, { ...NY2391, weekdays: [1.5] },
+    { ...NY2391, leadMinutes: 0 }, { ...NY2391, leadMinutes: 31 }, { ...NY2391, model: "opus" },
+    { ...NY2391, enabled: "yes" }, null, [], "x",
+  ]) assert.equal(san(bad), null, JSON.stringify(bad));
+  const raw = { "a.atlassian.net": NY2391, "b.atlassian.net": { time: "x" }, "": NY2391,
+    __proto__: null, ["c".repeat(201)]: NY2391 };
+  const out = dailyBriefSchedulesCoerce(JSON.parse(JSON.stringify(raw)));
+  assert.equal(Object.getPrototypeOf(out), null, "null-prototype map");
+  assert.deepEqual(Object.keys(out), ["a.atlassian.net"]);
+  assert.deepEqual(dailyBriefSchedulesCoerce(JSON.parse(JSON.stringify(out))), out, "a fixed point");
+});
+
+test("XERK-2391: GET/PUT /api/orgs/<site>/daily-brief/schedule validates; refusals mint nothing", async () => {
+  const S = "dbA2391.atlassian.net";
+  await beat1574("dbHostA", S);
+  const url = (site) => `/api/orgs/${site}/daily-brief/schedule`;
+  const put = (site, body, headers = userHeaders) => request("PUT", url(site), { body, headers });
+  assert.equal((await put(S, NY2391, {})).status, 401);
+  assert.equal((await request("GET", url(S), { headers: {} })).status, 401);
+  const phantom = await put("nobody2391.atlassian.net", NY2391);
+  assert.equal(phantom.status, 404);
+  assert.match(phantom.body.error, /no host/);
+  assert.equal((await request("GET", url("nobody2391.atlassian.net"), { headers: userHeaders })).status, 404);
+  for (const [body, re] of [
+    [{ ...NY2391, time: "25:00" }, /HH:MM/],
+    [{ ...NY2391, timeZone: "Nowhere/Land" }, /IANA/],
+    [{ ...NY2391, weekdays: [8] }, /weekdays/],
+    [{ ...NY2391, leadMinutes: 60 }, /1 to 30/],
+    [{ enabled: true }, /HH:MM/],
+  ]) {
+    const r = await put(S, body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.match(r.body.error, re);
+  }
+  assert.equal(S in hub.getDailyBriefSchedules(), false, "a refusal mints no store key");
+  const empty = await request("GET", url(S), { headers: userHeaders });
+  assert.deepEqual([empty.status, empty.body.schedule, empty.body.next], [200, null, null]);
+  const ok = await put(S, { ...NY2391, leadMinutes: undefined, model: "haiku" });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.schedule.leadMinutes, 5);
+  assert.equal(ok.body.schedule.model, "haiku");
+  assert.ok(ok.body.next.runAt > Date.now());
+  assert.ok(Number.isSafeInteger(ok.body.schedule.updatedAt));
+  // A partial PUT merges over the stored schedule.
+  const off = await put(S, { enabled: false });
+  assert.equal(off.status, 200);
+  assert.deepEqual({ ...off.body.schedule, updatedAt: 0 },
+    { ...NY2391, model: "haiku", enabled: false, updatedAt: 0 });
+  assert.equal(off.body.next, null, "a disabled schedule has no next run");
+  assert.deepEqual((await fleet()).dailyBriefSchedules[S], off.body.schedule);
+  const got = await request("GET", url(S), { headers: userHeaders });
+  assert.deepEqual(got.body.schedule, off.body.schedule);
+  delete agents.dbHostA;
+  delete hub.getDailyBriefSchedules()[S];
+});
+
+test("XERK-2391: nextDailyBriefRun honours the zone, the lead and the weekdays", () => {
+  const { nextDailyBriefRun: next } = hub;
+  // Friday 2026-10-30 10:00 EDT (14:00Z): next is Monday 11-02 09:30 EST (14:30Z) —
+  // the weekend is skipped and the DST change (11-01) is honoured.
+  const r = next(NY2391, Date.parse("2026-10-30T14:00:00Z"));
+  assert.equal(iso2391(r.meetingAt), "2026-11-02T14:30:00.000Z");
+  assert.equal(iso2391(r.runAt), "2026-11-02T14:25:00.000Z");
+  // Before today's run: today's. Exactly at the run instant: already due, so next.
+  assert.equal(iso2391(next(NY2391, Date.parse("2026-10-29T13:00:00Z")).meetingAt),
+    "2026-10-29T13:30:00.000Z");
+  assert.equal(iso2391(next(NY2391, Date.parse("2026-10-29T13:25:00Z")).meetingAt),
+    "2026-10-30T13:30:00.000Z");
+  // A lead crossing local midnight fires the evening before.
+  const early = { ...NY2391, time: "00:10", leadMinutes: 30, weekdays: [3] };
+  assert.equal(iso2391(next(early, Date.parse("2026-10-27T12:00:00Z")).runAt),
+    "2026-10-28T03:40:00.000Z");
+  assert.equal(next({ ...NY2391, enabled: false }, Date.now()), null);
+  assert.equal(next({ ...NY2391, timeZone: "x/y" }, Date.now()), null);
+  // A zone east of UTC: Tokyo's Monday 09:00 is Sunday 00:00Z.
+  const tokyo = { ...NY2391, time: "09:00", timeZone: "Asia/Tokyo", weekdays: [1] };
+  assert.equal(iso2391(next(tokyo, Date.parse("2026-10-30T00:00:00Z")).meetingAt),
+    "2026-11-02T00:00:00.000Z");
+});
+
+test("XERK-2391: nextDailyBriefRun across DST — the spring gap still fires, the fall repeat once", () => {
+  const { nextDailyBriefRun: next } = hub;
+  // US spring-forward 2026-03-08: 02:30 never happens; the clock reads 03:30 EDT.
+  const gap = { ...NY2391, time: "02:30", weekdays: [0, 1], leadMinutes: 5 };
+  const g = next(gap, Date.parse("2026-03-07T12:00:00Z"));
+  assert.equal(iso2391(g.meetingAt), "2026-03-08T07:30:00.000Z");
+  // The day after is ordinary 02:30 EDT.
+  assert.equal(iso2391(next(gap, g.runAt).meetingAt), "2026-03-09T06:30:00.000Z");
+  // US fall-back 2026-11-01: 01:30 happens twice; the FIRST (EDT) is the meeting,
+  // and the run after it is the next day's — never the repeat.
+  const rep = { ...NY2391, time: "01:30", weekdays: [0, 1], leadMinutes: 5 };
+  const f = next(rep, Date.parse("2026-10-31T12:00:00Z"));
+  assert.equal(iso2391(f.meetingAt), "2026-11-01T05:30:00.000Z");
+  const after = next(rep, f.runAt);
+  assert.equal(iso2391(after.meetingAt), "2026-11-02T06:30:00.000Z");
+  // Europe changes on a different date, same rule.
+  const ldn = { ...NY2391, time: "09:00", timeZone: "Europe/London", weekdays: [1] };
+  assert.equal(iso2391(next(ldn, Date.parse("2026-10-24T00:00:00Z")).meetingAt),
+    "2026-10-26T09:00:00.000Z", "GMT after the 10-25 change");
+});
+
+test("XERK-2391: dailyBriefWindow covers the weekend on Monday and the last 7 days", () => {
+  const { dailyBriefWindow: win } = hub;
+  // Monday 2026-11-02 run at 09:25 EST: DAY opens at Friday's 09:30 EDT meeting.
+  const now = Date.parse("2026-11-02T14:25:00Z");
+  const w = win(NY2391, now);
+  assert.equal(iso2391(w.dayFrom), "2026-10-30T13:30:00.000Z");
+  assert.equal(iso2391(w.weekFrom), "2026-10-26T14:25:00.000Z");
+  assert.equal(w.until, now);
+  assert.equal(iso2391(w.meetingAt), "2026-11-02T14:30:00.000Z");
+  // Tuesday's opens at Monday's meeting.
+  const tue = win(NY2391, Date.parse("2026-11-03T14:25:00Z"));
+  assert.equal(iso2391(tue.dayFrom), "2026-11-02T14:30:00.000Z");
+  // A missed run widens the DAY window back to the last run — never past the week.
+  assert.equal(iso2391(win(NY2391, now, Date.parse("2026-10-29T13:25:00Z")).dayFrom),
+    "2026-10-29T13:25:00.000Z");
+  assert.equal(win(NY2391, now, Date.parse("2026-10-01T00:00:00Z")).dayFrom, w.weekFrom);
+  // "Run now" briefs a disabled org; an unusable schedule has no window.
+  assert.equal(win({ ...NY2391, enabled: false }, now).dayFrom, w.dayFrom);
+  assert.equal(win({ ...NY2391, time: "nope" }, now), null);
+});
+
+test("XERK-2391: the capability block is coerced and the results outbox is never stored", async () => {
+  const S = "dbB2391.atlassian.net";
+  const p = { dailyBrief: { available: "yes", extra: 1 } };
+  hub.normalizeDailyBrief(p);
+  assert.deepEqual(p.dailyBrief, { available: false });
+  const q = { dailyBrief: "x" };
+  hub.normalizeDailyBrief(q);
+  assert.equal(q.dailyBrief, null);
+  await beat1574("dbHostB", S, { dailyBrief: { available: true },
+    dailyBriefResults: [{ runId: "r1", siteKey: S, status: "ok", day: "d", week: "w" }] });
+  const a = (await fleet()).agents.find((x) => x.device === "dbHostB");
+  assert.deepEqual(a.dailyBrief, { available: true });
+  assert.equal("dailyBriefResults" in a, false);
+  delete agents.dbHostB;
 });

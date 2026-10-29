@@ -26,7 +26,9 @@ paths:
   301s to `/insights`; the heartbeat still DROPS an older agent's `briefRender`/`briefNarratives`
   (kept in `HEARTBEAT_KNOWN_KEYS`) and `normalizeRecord` strips them from a restored
   record too. An existing `/data/briefs.json` is ignored.
-  - Do not reintroduce a scheduled brief or its push: the operator found it not useful.
+  - Do not reintroduce THIS brief (structured, 4-hourly) or its push: the operator found it not
+    useful. The meeting-scheduled Daily Brief (epic XERK-2390) is a different, operator-requested
+    feature with no push: `contract-daily-brief.md`.
 - Tests: the `XERK-2386:` cases in `insights.test.js` and `server.test.js`; `nav.test.js`.
 
 ## The decisions log (XERK-1574)
