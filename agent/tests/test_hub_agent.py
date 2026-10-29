@@ -54968,12 +54968,14 @@ class TestDailyBriefPrompt(unittest.TestCase):
         self.assertTrue(any("joined day" in p for p in ha.daily_brief_problems(b, self.DATA)))
         b = self._brief(upNext=[{"key": "XERK-5", "text": big}, {"key": "XERK-6", "text": big}])
         self.assertTrue(any("joined next" in p for p in ha.daily_brief_problems(b, self.DATA)))
-        b = self._brief(sinceYesterday="x" * 999, stillOpen="x" * 1000)
+        # Measured as the wire sends it (XERK-2394): each part ends in a "." the
+        # agent adds, so 998 + 1 + 1 + 999 + 1 = 2000 fits and one more does not.
+        b = self._brief(sinceYesterday="x" * 998, stillOpen="x" * 999)
         self.assertEqual(ha.daily_brief_problems(b, self.DATA), [])
-        b = self._brief(sinceYesterday="x" * 1000, stillOpen="x" * 1000)
+        b = self._brief(sinceYesterday="x" * 999, stillOpen="x" * 999)
         self.assertTrue(any("joined day" in p for p in ha.daily_brief_problems(b, self.DATA)))
-        # Measured as the wire joins it: whitespace collapsed first.
-        b = self._brief(sinceYesterday=("x" * 999) + " " * 150, stillOpen="x" * 1000)
+        # Whitespace collapsed first.
+        b = self._brief(sinceYesterday=("x" * 998) + " " * 150, stillOpen="x" * 999)
         self.assertEqual(ha.daily_brief_problems(b, self.DATA), [])
 
     def test_keys_from_the_data_and_hashes_are_allowed(self):
@@ -55244,6 +55246,28 @@ class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha.threading, "Thread", side_effect=RuntimeError("pids")):
             self.sm._dbrief_worker = None
             tick(self.sm)                     # never raises onto the beat
+
+    def test_build_payload_re_arms_the_worker(self):
+        # The beat, not only the command, re-arms it: a failed Thread.start()
+        # at staging would otherwise leave the brief owed forever.
+        self.sm._daily_brief_tick = types.MethodType(ha.SessionManager._daily_brief_tick, self.sm)
+        with mock.patch.object(ha.threading, "Thread", side_effect=RuntimeError("pids")):
+            self.sm._stage_daily_brief(self._cmd())
+        self.assertIsNone(self.sm._dbrief_worker)
+        self.replies = [self._reply()]
+        self.sm.build_payload(1)
+        deadline = time.time() + 5
+        while not self.sm.daily_brief_results and time.time() < deadline:
+            time.sleep(0.01)
+        [row] = self.sm.daily_brief_results
+        self.assertEqual((row["runId"], row["status"]), ("ab12", "ok"))
+
+    def test_the_size_check_counts_the_added_punctuation(self):
+        words = ("w" * 9 + " ") * 99 + "w" * 9          # 999 chars, no punctuation
+        brief = TestDailyBriefPrompt._brief(TestDailyBriefPrompt(),
+                                            sinceYesterday=words, stillOpen=words)
+        self.assertIn("joined day is 2001 chars", " ".join(ha.daily_brief_problems(brief, self.DATA)))
+        self.assertEqual(ha._daily_brief_sentence("Status:"), "Status:")
 
     def test_a_worker_crash_is_a_failed_row(self):
         with mock.patch.object(self.sm, "_run_daily_brief", side_effect=RuntimeError("boom")):

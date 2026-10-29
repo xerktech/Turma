@@ -24689,7 +24689,8 @@ def daily_brief_problems(brief, data):
     joined = {"day": [t for n, t in texts if n in ("sinceYesterday", "stillOpen")],
               "next": [t for n, t in texts if n.startswith("upNext")]}
     for field, parts in joined.items():
-        size = len(" ".join(" ".join(p.split()) for p in parts))
+        # As daily_brief_row will send it: each part ends in punctuation.
+        size = len(" ".join(_daily_brief_sentence(" ".join(p.split())) for p in parts))
         if size > DAILY_BRIEF_WIRE_TEXT_MAX:
             problems.append(f"joined {field} is {size} chars (wire cap {DAILY_BRIEF_WIRE_TEXT_MAX})")
     words = dict((n, _daily_brief_words(t)) for n, t in texts)
@@ -24854,7 +24855,8 @@ def _daily_brief_sentence(text):
     """`text` ending in sentence punctuation, so joined parts read aloud as
     separate sentences: models often leave a short upNext entry unpunctuated."""
     t = text.strip()
-    return t if not t or t[-1] in ".!?…" else t + "."
+    # A trailing ":" is left alone: the cleaner drops a short label line.
+    return t if not t or t[-1] in ".!?…:" else t + "."
 
 
 def daily_brief_row(brief):
@@ -43358,10 +43360,10 @@ class SessionManager:
             return None, "no ticket scope on this host (its board lists no projects)"
         argv = ["claude", "-p", "--model", job["model"], *ATTENTION_HINT_LOCKDOWN,
                 DAILY_BRIEF_INSTRUCTION + daily_brief_input(data)]
-        why = "the brief's text cleaned to nothing"
         for attempt in range(1, DAILY_BRIEF_MAX_ATTEMPTS + 1):
             if attempt > 1:
                 time.sleep(DAILY_BRIEF_RETRY_BACKOFF_SEC * (attempt - 1))
+            why = "the brief's text cleaned to nothing"
             raw = self._run_lockdown_oneshot(argv, "daily-brief-", DAILY_BRIEF_TIMEOUT_SEC,
                                              DAILY_BRIEF_REPLY_MAX, "daily brief")
             if raw is None:
