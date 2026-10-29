@@ -628,6 +628,9 @@ const DECISIONS_FILE = process.env.DECISIONS_FILE || "/data/decisions.json";
 // time, timeZone, weekdays, leadMinutes, model}. Operator-set, human-rate.
 const DAILY_BRIEF_SCHEDULES_FILE =
   process.env.DAILY_BRIEF_SCHEDULES_FILE || "/data/daily-brief-schedules.json";
+// The Daily Brief's written briefs (XERK-2395): siteKey -> newest-first briefs.
+// Written once per run (dispatch + settle), so human rate too.
+const DAILY_BRIEFS_FILE = process.env.DAILY_BRIEFS_FILE || "/data/daily-briefs.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -2707,9 +2710,9 @@ const asFlagMap = (raw) => {
 // store's setter AFTER mutating the mirror. `read` returns the current mirror
 // value; `install` replaces the mirror with a coerced value (boot-load / remote
 // watch); `coerce` validates a raw value to the store's shape.
-function registerExternalStore({ name, file, coerce, read, install, afterLoad }) {
+function registerExternalStore({ name, file, coerce, read, install, afterLoad, debounceMs = 5000 }) {
   const key = STORE_KEY_PREFIX + name;
-  STORE_PERSISTENT[key] = { file, debounceMs: 5000 };
+  STORE_PERSISTENT[key] = { file, debounceMs };
   externalizedStores.push({ key, name, coerce, read, install, afterLoad });
   return function persist() {
     // `liveStore` is the module-load backend (file/in-memory off, Valkey on). On
@@ -4056,6 +4059,215 @@ function dailyBriefWindow(schedule, now = Date.now(), lastRunAt = null) {
   if (Number.isSafeInteger(lastRunAt) && lastRunAt > 0 && lastRunAt < dayFrom) dayFrom = lastRunAt;
   return { dayFrom: Math.max(dayFrom, weekFrom), weekFrom, until: now, meetingAt };
 }
+// ---- the Daily Brief's briefs (XERK-2395) -------------------------------------
+// siteKey -> newest-first briefs, DAILY_BRIEF_KEEP kept. A row is minted when a
+// run is DISPATCHED (status "running", carrying the host asked and its cmdId) and
+// settled in place by that host's `dailyBriefResults` row, a retry, or a timeout.
+// So the store is also the scheduler's durable memory: the newest SCHEDULED row's
+// meetingAt is "already fired for", and a running row survives a restart with
+// everything the ingest's ownership check needs. sanitizeDailyBrief is the ONE
+// whitelist (every write goes through putDailyBrief, restore and remote watch
+// through the coerce), its field order fixed, so a live row is a coerce fixed
+// point. Contract: .claude/rules/contract-daily-brief.md.
+const DAILY_BRIEF_KEEP = 30;
+const DAILY_BRIEF_TEXT_MAX = 2000;
+const DAILY_BRIEF_ERROR_MAX = 300;
+const DAILY_BRIEF_SECTIONS = ["day", "week", "open", "next"];
+const DAILY_BRIEF_STATUSES = new Set(["running", "ok", "failed"]);
+const DAILY_BRIEF_RUN_ID_RE = /^[0-9a-f]{1,32}$/;
+// What "auto" sends: the evaluated default (XERK-2393 / docs/daily-brief-adr.md).
+const DAILY_BRIEF_AUTO_MODEL = "haiku";
+// A scheduled run missed by its fire time still runs this long after the meeting
+// (a hub down or failing over across the lead window); later ones are skipped.
+const DAILY_BRIEF_LATE_MS = 30 * 60e3;
+// A host that has not answered by then is given up on (and the run retried once).
+const DAILY_BRIEF_RUN_TIMEOUT_MS = 10 * 60e3;
+const DAILY_BRIEF_RUN_NOW_MIN_MS = 60e3; // per-org Run-now spacing
+const DAILY_BRIEF_RETAIN_MS = 30 * 86400e3; // an org no host is in any more
+
+// The plain read-aloud text a model's section is reduced to: markup (code fences,
+// tags, link syntax, emphasis/heading/table characters, list bullets) and
+// control/bidi characters go, whitespace collapses to single spaces, and an
+// over-long text is cut on a word with "…" past `max` code points. A FIXED POINT
+// (cleaning a cleaned text changes nothing), so a sanitized brief stays one for
+// HA's echo dedup. The agent's worker runs the same rules (XERK-2394); both read
+// agent/tests/brief_clean_vectors.json.
+// The first n CODE POINTS of v (Python's v[:n]), without spreading a huge string.
+function cpPrefix(v, n) {
+  let i = 0;
+  let k = 0;
+  for (const ch of v) {
+    if (k++ === n) break;
+    i += ch.length;
+  }
+  return v.slice(0, i);
+}
+function cleanBriefNarrative(v, max = DAILY_BRIEF_TEXT_MAX) {
+  if (typeof v !== "string" || !v) return "";
+  // A standalone HEADING line is dropped, never joined into the next sentence
+  // ("Since yesterday Two pieces…"): a #-heading or a line that is only
+  // *-emphasis (seen before the markup strip), or a short line ending ":"
+  // (seen after it). '#' is markup only as a line-LEADING heading mark (stripped
+  // with the bullets), so "PR #215" keeps it. The cleaned text has no * and
+  // never starts with a heading mark, and any line ending ":" that survived is
+  // longer than the colon bound, so it stays a fixed point.
+  // Lengths are code points ([...t]), as Python's len counts them.
+  const heading = (l) => {
+    const t = l.replace(/^ +| +$/g, "");
+    return /^#{1,6}(?: |$)/.test(t) || ([...t].length <= 80 && /^\*{1,3}[^*]+\*{1,3}:?$/.test(t));
+  };
+  let s = cpPrefix(v, 20000)
+    .replace(/```[^\n]*/g, " ")
+    // Each scan stops at the next opener, so bracket-heavy text stays linear.
+    .replace(/<[^<>\n]*>/g, " ")
+    .replace(/!?\[([^[\]\n]*)\]\([^()\n]*\)/g, "$1")
+    // Control/bidi/zero-width (all but the newline), then every other
+    // non-newline whitespace, become spaces BEFORE the per-line heading and
+    // bullet passes — a leading one would hide a heading or bullet from this
+    // pass and expose it to the next. Explicit ASCII classes after that, so a
+    // Python mirror (wider \s and \d) agrees exactly.
+    .replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, " ")
+    .replace(/[^\S\n]/g, " ")
+    .split("\n")
+    .filter((l) => !heading(l))
+    .map((l) => l.replace(/[*`~|<>[\]]/g, "")
+      .replace(/^ *(?:(?:[-+]|[0-9]+[.)]|#{1,6})(?: +|$))+/, "")
+      .replace(/ +/g, " ")
+      .replace(/^ | $/g, ""))
+    .filter((l) => !(l.endsWith(":") && [...l].length <= 40))
+    .join(" ")
+    .replace(/ +/g, " ")
+    .replace(/^ | $/g, "");
+  // The cut counts code points, so a text heavy in astral characters (emoji) is
+  // cut where a Python mirror cuts it, and never through a surrogate pair.
+  const cps = [...s];
+  if (cps.length > max) {
+    const cut = cps.slice(0, max - 1);
+    const sp = cut.lastIndexOf(" ");
+    s = `${(sp > Math.floor(max * 0.75) ? cut.slice(0, sp) : cut).join("").trimEnd()}…`;
+  }
+  return s;
+}
+
+// Bound an org's list to DAILY_BRIEF_KEEP, oldest first — except its newest
+// SCHEDULED row, the "already fired" record, which Run-now rows never push out.
+function keepDailyBriefs(list) {
+  const out = list.slice();
+  const fired = out.findIndex((b) => b.trigger === "scheduled");
+  for (let i = out.length - 1; out.length > DAILY_BRIEF_KEEP; i--) {
+    if (i !== fired) out.splice(i, 1);
+  }
+  return out;
+}
+const dbTime = (v) => (Number.isSafeInteger(v) && v > 0 ? v : null);
+function sanitizeDailyBrief(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  if (typeof v.runId !== "string" || !DAILY_BRIEF_RUN_ID_RE.test(v.runId)) return null;
+  if (!DAILY_BRIEF_STATUSES.has(v.status)) return null;
+  if (v.trigger !== "scheduled" && v.trigger !== "manual") return null;
+  const out = { runId: v.runId, status: v.status, trigger: v.trigger };
+  for (const k of ["meetingAt", "dayFrom", "weekFrom", "until", "startedAt"]) {
+    const t = dbTime(v[k]);
+    if (t === null) return null;
+    out[k] = t;
+  }
+  const model = cleanBriefNarrative(v.model, 40);
+  if (!model) return null;
+  out.model = model;
+  if (typeof v.host === "string" && v.host && v.host.length <= 200) out.host = v.host;
+  // In-flight bookkeeping, kept only while running (never served).
+  if (v.status === "running") {
+    if (!out.host) return null;
+    out.cmdId = typeof v.cmdId === "string" && /^[0-9a-f]{1,32}$/.test(v.cmdId) ? v.cmdId : "";
+    out.sentAt = dbTime(v.sentAt) || out.startedAt;
+    out.attempt = v.attempt === 2 ? 2 : 1;
+    out.tried = (Array.isArray(v.tried) ? v.tried : [])
+      .filter((h) => typeof h === "string" && h && h.length <= 200).slice(0, 2);
+  } else {
+    const at = dbTime(v.generatedAt);
+    if (at !== null) out.generatedAt = at;
+  }
+  if (v.status === "ok") {
+    let any = false;
+    for (const k of DAILY_BRIEF_SECTIONS) {
+      const t = cleanBriefNarrative(v[k]);
+      if (t) { out[k] = t; any = true; }
+    }
+    if (!any) return null;
+  }
+  if (v.status === "failed") {
+    out.error = cleanBriefNarrative(v.error, DAILY_BRIEF_ERROR_MAX) || "the brief could not be written";
+  }
+  return out;
+}
+const dailyBriefsCoerce = (raw) => {
+  const out = Object.create(null);
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [site, list] of Object.entries(raw).slice(0, DAILY_BRIEF_ORGS_MAX)) {
+      if (!site || site.length > DAILY_BRIEF_SITE_MAX || !Array.isArray(list)) continue;
+      const kept = keepDailyBriefs(list.slice(0, 1000).map(sanitizeDailyBrief).filter(Boolean));
+      if (kept.length) out[site] = kept;
+    }
+  }
+  return out;
+};
+let dailyBriefs = dailyBriefsCoerce(readJsonFile(DAILY_BRIEFS_FILE));
+const persistDailyBriefs = registerExternalStore({
+  name: "dailyBriefs", file: DAILY_BRIEFS_FILE,
+  coerce: dailyBriefsCoerce, read: () => dailyBriefs,
+  install: (v) => { dailyBriefs = v; },
+  // A row IS the "already fired" record, so it is written at once: a 5s debounce
+  // let a hub killed right after a fire fire the same meeting again on reboot.
+  debounceMs: 0,
+});
+
+// The served map: per org the newest brief AND the newest finished one in full
+// (so a running brief never hides the last one written), every other one
+// headline-only, and never the in-flight bookkeeping.
+function dailyBriefWire(b, full) {
+  const out = { runId: b.runId, status: b.status, trigger: b.trigger, meetingAt: b.meetingAt,
+    dayFrom: b.dayFrom, weekFrom: b.weekFrom, until: b.until, startedAt: b.startedAt,
+    model: b.model };
+  if (b.host) out.host = b.host;
+  if (b.generatedAt) out.generatedAt = b.generatedAt;
+  if (b.error) out.error = b.error;
+  if (full) {
+    for (const k of DAILY_BRIEF_SECTIONS) if (b[k]) out[k] = b[k];
+  } else if (b.day) {
+    // The day section's first sentence.
+    const m = /^.*?[.!?](?= |$)/u.exec(b.day);
+    out.headline = cleanBriefNarrative(m ? m[0] : b.day, 160);
+  }
+  return out;
+}
+function dailyBriefsWire() {
+  const out = Object.create(null); // an org may be named __proto__ (XERK-1451)
+  for (const [site, list] of Object.entries(dailyBriefs)) {
+    const ok = list.findIndex((b) => b.status === "ok");
+    out[site] = list.map((b, i) => dailyBriefWire(b, i === 0 || i === ok));
+  }
+  return out;
+}
+function publishDailyBriefs() {
+  persistDailyBriefs();
+  invalidateAgentsCache();
+  sseBroadcast("dailyBriefs", dailyBriefsWire());
+}
+// The one writer: insert (newest first) or replace a row by runId, through the
+// whitelist. The file store re-installs the coerced map on persist, so callers
+// re-read rows from `dailyBriefs` rather than holding one across a write.
+function putDailyBrief(siteKey, row) {
+  const b = sanitizeDailyBrief(row);
+  if (!b) return null;
+  const list = (dailyBriefs[siteKey] || []).filter((x) => x.runId !== b.runId);
+  const i = (dailyBriefs[siteKey] || []).findIndex((x) => x.runId === b.runId);
+  if (i < 0) list.unshift(b);
+  else list.splice(i, 0, b);
+  dailyBriefs[siteKey] = keepDailyBriefs(list);
+  publishDailyBriefs();
+  return b;
+}
+
 // Which hosts of an org report a repo by name — CLONED (on-disk `repos[]`) OR
 // merely LISTED among the org's triaged `jira.repoOptions` (a gh-clonable repo no
 // host has cloned yet). Used by the route to refuse a builder pinned to a repo no
@@ -6505,6 +6717,9 @@ function buildAgentsCache() {
     // The Daily Brief's per-org meeting schedules (XERK-2391), hub-owned and
     // whitelisted on every write/restore (sanitizeDailyBriefSchedule).
     dailyBriefSchedules,
+    // The Daily Brief's written briefs (XERK-2395): siteKey -> newest first, the
+    // newest and newest finished in full, the rest headline-only (dailyBriefsWire).
+    dailyBriefs: dailyBriefsWire(),
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -17242,6 +17457,182 @@ function decisionsReplyFor(key) {
   return { org, entries };
 }
 
+// ---- the Daily Brief's scheduler, dispatch and ingest (XERK-2395) ------------
+// The hub has no model access: on the leader's tick it asks ONE capable host of
+// the org to write the brief (`renderDailyBrief`), retries once on another host
+// when that host fails, times out or leaves, and folds the answer into the store.
+// Contract: .claude/rules/contract-daily-brief.md.
+const dailyBriefRunNowAt = new Map(); // siteKey -> last Run-now (in-memory: the leader serves)
+
+// The meeting a scheduled run is due for at `now`, or null: its runAt has come,
+// the meeting is less than DAILY_BRIEF_LATE_MS behind, and no SCHEDULED row was
+// already minted for it. Asking nextDailyBriefRun from (now - lead - late) finds
+// the first meeting after (now - late) — so a hub booting or failing over inside
+// the lead window, or up to the late bound past the meeting, still fires once.
+// A fire that found no capable host (a failed row with no host) is not a fire:
+// it is re-tried every tick while the meeting is still due.
+const dailyBriefHostless = (b) => b.status === "failed" && !b.host;
+function dailyBriefDue(siteKey, schedule, now = Date.now()) {
+  const s = sanitizeDailyBriefSchedule(schedule);
+  if (!s || !s.enabled) return null;
+  const next = nextDailyBriefRun(s, now - s.leadMinutes * 60e3 - DAILY_BRIEF_LATE_MS);
+  if (!next || next.runAt > now) return null;
+  const fired = (dailyBriefs[siteKey] || []).reduce((m, b) => (b.trigger === "scheduled"
+    && !dailyBriefHostless(b) && b.meetingAt > m ? b.meetingAt : m), 0);
+  return next.meetingAt > fired ? next : null;
+}
+
+// Which host writes an org's brief: online, in the org (jiraHostPool: declared
+// AND bound), reporting the capability, not one already tried for this run. A
+// host whose Claude login lapsed still advertises it, so a logged-in one wins.
+function pickDailyBriefHost(siteKey, exclude = []) {
+  const capable = jiraHostPool(siteKey, true).filter((k) => {
+    const a = agents[k];
+    return a && !exclude.includes(k) && a.dailyBrief && a.dailyBrief.available === true;
+  });
+  return capable.find((k) => !(agents[k].claudeAuth && agents[k].claudeAuth.needsLogin === true))
+    || capable[0] || null;
+}
+
+// Queue the command for `row` on `host`; returns the row with its in-flight
+// fields set (the caller writes it).
+function dispatchDailyBrief(siteKey, row, host, now) {
+  const r = agents[host].defaultRuntime;
+  const runtime = r === "dsh" || r === "qwen" ? r : "claude";
+  const cmdId = queueCommand(host, { type: "renderDailyBrief", siteKey, runId: row.runId,
+    dayFrom: row.dayFrom, weekFrom: row.weekFrom, until: row.until, meetingAt: row.meetingAt,
+    model: row.model, runtime });
+  return { ...row, status: "running", host, cmdId, sentAt: now,
+    tried: [...(row.tried || []), host] };
+}
+
+// Start one run. `due` is the scheduled meeting; Run now passes none. Answers
+// {row} or {error, status} — a scheduled run with no host still mints a failed
+// row (it records the fire and says why); Run now refuses instead.
+function startDailyBriefRun(siteKey, trigger, now = Date.now(), due = null) {
+  const list = dailyBriefs[siteKey] || [];
+  if (list.some((b) => b.status === "running")) {
+    return { status: 409, error: "a brief is already being written for this org" };
+  }
+  // Refuse what the store's coerce would drop: a dropped row would read as "never
+  // fired" and the schedule would re-fire every tick. A full store first forgets
+  // orgs no host is decided into.
+  if (!Object.hasOwn(dailyBriefs, siteKey)
+      && Object.keys(dailyBriefs).length >= DAILY_BRIEF_ORGS_MAX) {
+    const orgs = decidedOrgs();
+    for (const k of Object.keys(dailyBriefs)) {
+      if (!orgs.has(k) && !dailyBriefs[k].some((b) => b.status === "running")) delete dailyBriefs[k];
+    }
+    if (Object.keys(dailyBriefs).length >= DAILY_BRIEF_ORGS_MAX) {
+      return { status: 409, error: `${DAILY_BRIEF_ORGS_MAX} orgs already have briefs — the limit` };
+    }
+  }
+  const schedule = dailyBriefSchedules[siteKey] || null;
+  const lastOk = list.find((b) => b.status === "ok");
+  const lastRunAt = lastOk ? lastOk.until : null;
+  const weekFrom = now - 7 * 86400e3;
+  let win;
+  if (schedule) {
+    // As of the fire time, so a late run's DAY still opens at the previous
+    // meeting rather than at the one it is late for.
+    win = dailyBriefWindow(schedule, due ? Math.min(now, due.runAt) : now, lastRunAt);
+  }
+  const meetingAt = (due && due.meetingAt) || (win && win.meetingAt) || now;
+  const dayFrom = Math.max(win ? win.dayFrom : now - 86400e3, weekFrom);
+  const model = schedule && schedule.model !== "auto" ? schedule.model : DAILY_BRIEF_AUTO_MODEL;
+  // A meeting whose earlier fire found no host keeps that one row.
+  const hostless = due && list.find((b) => b.trigger === "scheduled"
+    && b.meetingAt === meetingAt && dailyBriefHostless(b));
+  const row = { runId: hostless ? hostless.runId : crypto.randomBytes(8).toString("hex"),
+    status: "running", trigger, meetingAt, dayFrom, weekFrom, until: now, startedAt: now, model,
+    attempt: 1, tried: [] };
+  const host = pickDailyBriefHost(siteKey);
+  if (!host) {
+    const error = "no online host of this org can write the brief";
+    if (trigger === "manual") return { status: 409, error };
+    if (hostless) return { row: hostless }; // still none: nothing new to say
+    return { row: putDailyBrief(siteKey, { ...row, status: "failed", error, generatedAt: now }) };
+  }
+  return { row: putDailyBrief(siteKey, dispatchDailyBrief(siteKey, row, host, now)) };
+}
+
+// A running row whose host failed, timed out or left: withdraw the command (a
+// no-op once acked), then ask ONE other capable host, else settle it failed.
+function retryDailyBrief(siteKey, row, error, now) {
+  if (row.cmdId) dropQueuedCommand(row.host, row.cmdId, "renderDailyBrief");
+  const host = row.attempt < 2 ? pickDailyBriefHost(siteKey, row.tried) : null;
+  if (host) return putDailyBrief(siteKey, dispatchDailyBrief(siteKey, { ...row, attempt: 2 }, host, now));
+  return putDailyBrief(siteKey, { ...row, status: "failed", error, generatedAt: now });
+}
+
+// Fold the agents' `dailyBriefResults` rows. A row is taken only from the host
+// the hub asked, for the run it asked about, while that host is still decided
+// into the org (XERK-348) — so no host can write another org's brief, or one
+// nobody asked for. Text is re-cleaned by the store's whitelist.
+function ingestDailyBriefResults(key, rows, now = Date.now()) {
+  if (!Array.isArray(rows)) return false;
+  let changed = false;
+  for (const r of rows.slice(0, 5)) {
+    if (!r || typeof r !== "object" || Array.isArray(r)) continue;
+    const { siteKey, runId } = r;
+    if (typeof siteKey !== "string" || typeof runId !== "string") continue;
+    if (!Object.hasOwn(dailyBriefs, siteKey)) continue;
+    const row = dailyBriefs[siteKey].find((b) => b.runId === runId);
+    if (!row || row.status !== "running" || row.host !== key) continue;
+    if (!agents[key] || decidedOrgOf(agents[key]) !== siteKey) continue;
+    const ok = r.status === "ok" && putDailyBrief(siteKey, {
+      ...row, status: "ok", generatedAt: now,
+      model: cleanBriefNarrative(r.model, 40) || row.model,
+      day: r.day, week: r.week, open: r.open, next: r.next,
+    });
+    if (!ok) {
+      const error = (r.status === "failed" && cleanBriefNarrative(r.error, DAILY_BRIEF_ERROR_MAX))
+        || (r.status === "ok" ? "the model's brief was empty" : "the host could not write the brief");
+      retryDailyBrief(siteKey, row, error, now);
+    }
+    changed = true;
+  }
+  return changed;
+}
+
+// On the leader's orchestration tick: settle runs whose host stopped answering,
+// fire every due schedule, and forget the briefs of an org no host has been in
+// for DAILY_BRIEF_RETAIN_MS. No push — the retired brief's was unwanted.
+function dailyBriefTick(now = Date.now()) {
+  const orgs = decidedOrgs();
+  for (const [siteKey, list] of Object.entries(dailyBriefs)) {
+    try {
+      const row = list.find((b) => b.status === "running");
+      if (row) {
+        const a = agents[row.host];
+        // Liveness on the wall clock, as jiraHostPool judges it.
+        const gone = !a || Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS
+          || decidedOrgOf(a) !== siteKey;
+        if (gone) retryDailyBrief(siteKey, row, "the host went offline before answering", now);
+        else if (now - row.sentAt >= DAILY_BRIEF_RUN_TIMEOUT_MS) {
+          retryDailyBrief(siteKey, row, "the host did not answer in time", now);
+        }
+      }
+      if (!orgs.has(siteKey) && !row && now - list[0].startedAt >= DAILY_BRIEF_RETAIN_MS) {
+        delete dailyBriefs[siteKey];
+        publishDailyBriefs();
+      }
+    } catch (e) {
+      console.error(`daily brief: settling ${logName(siteKey)} failed: ${e && e.message}`);
+    }
+  }
+  for (const [siteKey, schedule] of Object.entries(dailyBriefSchedules)) {
+    if (!orgs.has(siteKey)) continue;
+    try {
+      if ((dailyBriefs[siteKey] || []).some((b) => b.status === "running")) continue;
+      const due = dailyBriefDue(siteKey, schedule, now);
+      if (due) startDailyBriefRun(siteKey, "scheduled", now, due);
+    } catch (e) {
+      console.error(`daily brief: firing ${logName(siteKey)} failed: ${e && e.message}`);
+    }
+  }
+}
+
 // On the leader's orchestration tick: an org no host is decided into any more
 // keeps its decisions log DECISIONS_RETAIN_MS past its newest entry, then it is
 // dropped — nothing else ever removes a store key.
@@ -17310,6 +17701,8 @@ function masterOrchestrationTick() {
   epicRunCompleteSweep();
   // Age out the decisions log of an org no host is in any more (XERK-1574).
   decisionsTick();
+  // Fire each org's Daily Brief before its meeting; settle stuck runs (XERK-2395).
+  dailyBriefTick();
   // Fold ticket sessions into the outcome ledger (XERK-1839). Observes only.
   outcomeLedgerSweep();
   // Sample merged tickets into shadow runs on cheaper models (XERK-1847).
@@ -19640,8 +20033,9 @@ const server = http.createServer(async (req, res) => {
       // agent still sends them; nothing reads them.
       delete payload.briefRender;
       delete payload.briefNarratives;
-      // Daily Brief results (XERK-2391): never stored on the record. Their ingest
-      // (accept only from the host asked, for its decided org) is XERK-2395's.
+      // Daily Brief results (XERK-2391): never stored on the record; folded into
+      // the brief store below (ingestDailyBriefResults checks the hub asked).
+      const dailyBriefResults = payload.dailyBriefResults;
       delete payload.dailyBriefResults;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
@@ -19961,6 +20355,12 @@ const server = http.createServer(async (req, res) => {
         enforceCacheTotalBudget();
       }
       heartbeatAlerts(key, prev, next, attentionHints);
+      // A Daily Brief this host was asked for (XERK-2395). Never worth the beat.
+      try {
+        ingestDailyBriefResults(key, dailyBriefResults);
+      } catch (e) {
+        console.error(`daily brief ingest failed: ${e && e.message}`);
+      }
       rearmMovedWatches(key, prev, next);
       // A migration finishes the instant its target session heartbeats in — do
       // the handoff (kill source, mark done) now rather than waiting out the
@@ -22725,6 +23125,35 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, decision: appendDecision(siteKey, { source: "note", text }) });
     }
 
+    // POST /api/orgs/<siteKey>/daily-brief/run — "Run now" (XERK-2395): the
+    // scheduled path, for an org no host need be scheduled for, ignoring
+    // `enabled`. 404 for an org no host is decided into, 409 while a brief is
+    // being written or no capable host is online, 429 inside the per-org spacing.
+    // Answers {ok, brief} (the served shape of the run it started).
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 5 && parts[3] === "daily-brief" && parts[4] === "run") {
+      const siteKey = decodeURIComponent(parts[2]);
+      if (!decidedOrgs().has(siteKey)) {
+        return json(res, 404, { error: "no host is in that org" });
+      }
+      if (siteKey.length > DAILY_BRIEF_SITE_MAX) {
+        return json(res, 400, { error: `org key too long — the limit is ${DAILY_BRIEF_SITE_MAX} characters` });
+      }
+      if ((dailyBriefs[siteKey] || []).some((b) => b.status === "running")) {
+        return json(res, 409, { error: "a brief is already being written for this org" });
+      }
+      const now = Date.now();
+      const last = dailyBriefRunNowAt.get(siteKey) || 0;
+      if (now - last < DAILY_BRIEF_RUN_NOW_MIN_MS) {
+        const wait = Math.ceil((DAILY_BRIEF_RUN_NOW_MIN_MS - (now - last)) / 1000);
+        return json(res, 429, { error: `a brief was just asked for — try again in ${wait}s` });
+      }
+      const out = startDailyBriefRun(siteKey, "manual", now);
+      if (!out.row) return json(res, out.status, { error: out.error });
+      dailyBriefRunNowAt.set(siteKey, now);
+      return json(res, 200, { ok: true, brief: dailyBriefWire(out.row, true) });
+    }
+
     // GET/PUT /api/orgs/<siteKey>/daily-brief/schedule — an org's standup schedule
     // (XERK-2391). PUT merges the body's fields over the stored schedule, so a
     // toggle sends {enabled} alone; the result is validated whole (400 in the
@@ -24079,6 +24508,9 @@ if (process.env.TURMA_TEST) {
     getDailyBriefSchedules: () => dailyBriefSchedules, dailyBriefSchedulesCoerce,
     sanitizeDailyBriefSchedule, setDailyBriefSchedule, nextDailyBriefRun, dailyBriefWindow,
     normalizeDailyBrief,
+    getDailyBriefs: () => dailyBriefs, dailyBriefsCoerce, sanitizeDailyBrief, dailyBriefsWire,
+    cleanBriefNarrative, dailyBriefDue, dailyBriefTick, startDailyBriefRun,
+    ingestDailyBriefResults, dailyBriefRunNowAt, DAILY_BRIEF_RUN_TIMEOUT_MS, DAILY_BRIEF_LATE_MS,
     decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, permissionAnswerKind,
     decisionsTick, decidedOrgs, DECISIONS_RETAIN_MS,
     autoStartCandidates,
