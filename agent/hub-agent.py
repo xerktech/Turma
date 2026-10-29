@@ -24689,7 +24689,8 @@ def daily_brief_problems(brief, data):
     joined = {"day": [t for n, t in texts if n in ("sinceYesterday", "stillOpen")],
               "next": [t for n, t in texts if n.startswith("upNext")]}
     for field, parts in joined.items():
-        size = len(" ".join(" ".join(p.split()) for p in parts))
+        # As daily_brief_row will send it: each part ends in punctuation.
+        size = len(" ".join(_daily_brief_sentence(" ".join(p.split())) for p in parts))
         if size > DAILY_BRIEF_WIRE_TEXT_MAX:
             problems.append(f"joined {field} is {size} chars (wire cap {DAILY_BRIEF_WIRE_TEXT_MAX})")
     words = dict((n, _daily_brief_words(t)) for n, t in texts)
@@ -24723,6 +24724,155 @@ def parse_daily_brief(raw, data):
     out["upNext"] = [{"key": e["key"], "text": " ".join(e["text"].split())}
                      for e in obj["upNext"]]
     return out
+
+
+# ---- the daily brief's render worker (XERK-2394, epic XERK-2390) -------------
+#
+# The hub sends `renderDailyBrief` (contract-daily-brief.md); this host collects
+# its org's tickets for the windows and runs the locked-down model on its OWN
+# worker (never the beat, XERK-395): ATTENTION_HINT_LOCKDOWN (no tool, no MCP
+# server, user settings only), cwd REGISTRY_DIR, stdin closed, output to a fresh
+# mkstemp file (`_run_lockdown_oneshot`), ONE job in flight, bounded attempts
+# with backoff. The result row rides the `dailyBriefResults` outbox.
+DAILY_BRIEF_TIMEOUT_SEC = _env_int("TURMA_DAILY_BRIEF_TIMEOUT_SEC", 120, minimum=10)
+DAILY_BRIEF_MAX_ATTEMPTS = 2          # model runs per brief (retry once, ADR)
+DAILY_BRIEF_RETRY_BACKOFF_SEC = _env_int("TURMA_DAILY_BRIEF_RETRY_BACKOFF_SEC", 20,
+                                         minimum=0)
+DAILY_BRIEF_REPLY_MAX = 64 * 1024     # far more than one JSON brief needs
+DAILY_BRIEF_RESULTS_MAX = 5           # rows per beat and in the outbox (hub cap)
+DAILY_BRIEF_ERROR_MAX = 300           # `error` on a failed row (hub cap)
+DAILY_BRIEF_RUN_IDS_SEEN = 64         # runIds remembered against a re-delivery
+DAILY_BRIEF_NOTHING_NEXT = "Nothing is queued next."
+DAILY_BRIEF_RUNTIMES_ALL = ("claude", "dsh", "qwen")
+DAILY_BRIEF_MODELS = ("haiku", "sonnet")
+_DAILY_BRIEF_RUN_ID_RE = re.compile(r"^[0-9a-f]{1,32}$")
+_DAILY_BRIEF_MS_MAX = 2 ** 53
+
+
+def daily_brief_runtimes():
+    """The runtimes this host can render a brief on. Only Claude Code has a
+    VERIFIED locked-down one-shot (`claude -p` + ATTENTION_HINT_LOCKDOWN): dsh
+    has no one-shot, and `qwen -p` has no flag shown to run it with no tools,
+    so neither is offered and a command naming one is reported failed (the hub
+    then picks another host). Claude needs a usable login (claudeAuth)."""
+    try:
+        if claude_auth_status().get("needsLogin"):
+            return []
+    except Exception:
+        return []
+    return ["claude"]
+
+
+def validate_daily_brief_command(cmd):
+    """A `renderDailyBrief` command -> (job, error). `job` is None when the
+    command is unusable; `error` then says why, and is reported as a failed
+    row when the command still names a valid runId + siteKey to report it on
+    (`job` carries those two even then, under `reportable`)."""
+    if not isinstance(cmd, dict):
+        return None, "not a command object"
+    run_id, site = cmd.get("runId"), cmd.get("siteKey")
+    if not (isinstance(run_id, str) and _DAILY_BRIEF_RUN_ID_RE.fullmatch(run_id)):
+        return None, "runId is not 1-32 lowercase hex characters"
+    if not (isinstance(site, str) and 0 < len(site) <= 200):
+        return None, "siteKey is not a 1-200 character string"
+    base = {"runId": run_id, "siteKey": site}
+    times = {}
+    for k in ("dayFrom", "weekFrom", "until", "meetingAt"):
+        v = cmd.get(k)
+        if isinstance(v, bool) or not isinstance(v, int) or not 0 < v < _DAILY_BRIEF_MS_MAX:
+            return dict(base, reportable=True), f"{k} is not a positive epoch-ms integer"
+        times[k] = v
+    if not times["weekFrom"] <= times["dayFrom"] < times["until"]:
+        return dict(base, reportable=True), "the windows are out of order (weekFrom <= dayFrom < until)"
+    model = cmd.get("model")
+    if model == "auto":   # the hub resolves it; "auto" is haiku (docs/daily-brief-adr.md)
+        model = "haiku"
+    if model not in DAILY_BRIEF_MODELS:
+        return dict(base, reportable=True), "model is not haiku or sonnet"
+    runtime = cmd.get("runtime")
+    if runtime not in DAILY_BRIEF_RUNTIMES_ALL:
+        return dict(base, reportable=True), "runtime is not claude, dsh or qwen"
+    return dict(base, model=model, runtime=runtime, **times), None
+
+
+# The model's text is cleaned before it rides the wire, with the SAME fixed-point
+# rules the hub's ingest applies (XERK-2395), pinned by ONE vector file both test
+# suites read (agent/tests/daily_brief_clean_vectors.json): clean(clean(x)) ==
+# clean(x), so a row the agent ships is one the hub keeps as-is. Ported from the
+# retired org brief's clean_brief_narrative (XERK-1574). parse_daily_brief already
+# REJECTS markdown and control characters, so on a parsed brief this only
+# collapses whitespace; it is the backstop for anything that slips past.
+# Control/bidi/zero-width characters except the newline, then every whitespace
+# but the newline, become a space BEFORE bullets are stripped (else a leading one
+# hides a bullet on the first pass and the second removes it). Explicit ASCII
+# classes after that (` `, `[0-9]`) so Python's wider \s/\d cannot disagree with JS.
+_DBRIEF_CTRL_RE = re.compile(
+    "[\u0000-\u0009\u000b-\u001f\u007f-\u009f​-‏ -‮⁠-⁩﻿]")
+_DBRIEF_SPACE_RE = re.compile(r"[^\S\n]")
+# A leading bullet or heading mark ("- ", "1. ", "## "): '#' is markup ONLY
+# there, so "PR #215" keeps its own.
+_DBRIEF_BULLET_RE = re.compile(r"^ *(?:(?:[-+]|[0-9]+[.)]|#{1,6})(?: +|$))+")
+_DBRIEF_HEADING_RE = re.compile(r"#{1,6}(?: |$)")
+_DBRIEF_EMPHASIS_RE = re.compile(r"\*{1,3}[^*]+\*{1,3}:?")
+
+
+def _dbrief_heading_line(line):
+    t = line.strip(" ")
+    return bool(_DBRIEF_HEADING_RE.match(t)
+                or (len(t) <= 80 and _DBRIEF_EMPHASIS_RE.fullmatch(t)))
+
+
+def _dbrief_clean_line(line):
+    line = re.sub(r"[*`~|<>\[\]]", "", line)
+    line = _DBRIEF_BULLET_RE.sub("", line)
+    return re.sub(" +", " ", line).strip(" ")
+
+
+def clean_daily_brief_text(text, cap=DAILY_BRIEF_WIRE_TEXT_MAX):
+    """`text` as ONE plain-text paragraph of at most `cap` code points, or "":
+    code fences, tags, link syntax, emphasis/heading/table characters, list
+    bullets and a line-leading heading mark go ('#' mid-sentence stays);
+    control and bidi characters become spaces; a standalone heading line is
+    dropped; whitespace collapses; an over-long text is cut on a word with "…"."""
+    if not isinstance(text, str) or not text:
+        return ""
+    s = text[:20000]
+    s = re.sub(r"```[^\n]*", " ", s)
+    s = re.sub(r"<[^>\n]*>", " ", s)
+    s = re.sub(r"!?\[([^\]\n]*)\]\([^)\n]*\)", r"\1", s)
+    s = _DBRIEF_SPACE_RE.sub(" ", _DBRIEF_CTRL_RE.sub(" ", s))
+    lines = [_dbrief_clean_line(l) for l in s.split("\n") if not _dbrief_heading_line(l)]
+    s = " ".join(l for l in lines if not (l.endswith(":") and len(l) <= 40))
+    s = re.sub(" +", " ", s).strip(" ")
+    if len(s) > cap:
+        cut = s[:cap - 1]
+        sp = cut.rfind(" ")
+        s = (cut[:sp] if sp > cap * 3 // 4 else cut).rstrip() + "…"
+    return s
+
+
+def _daily_brief_sentence(text):
+    """`text` ending in sentence punctuation, so joined parts read aloud as
+    separate sentences: models often leave a short upNext entry unpunctuated."""
+    t = text.strip()
+    # A trailing ":" is left alone: the cleaner drops a short label line.
+    return t if not t or t[-1] in ".!?…:" else t + "."
+
+
+def daily_brief_row(brief):
+    """A parsed brief -> the wire row's three texts (contract-daily-brief.md):
+    day = sinceYesterday + stillOpen, week = thisWeek, next = each upNext text
+    or DAILY_BRIEF_NOTHING_NEXT, each part punctuated, joined with one space
+    and cleaned."""
+    def join(parts):
+        return clean_daily_brief_text(" ".join(_daily_brief_sentence(p) for p in parts))
+    nxt = [e["text"] for e in brief.get("upNext") or []]
+    return {
+        "day": join([brief["sinceYesterday"], brief["stillOpen"]]),
+        "week": join([brief["thisWeek"]]),
+        "next": join(nxt or [DAILY_BRIEF_NOTHING_NEXT]),
+    }
+
 
 def _board_error_summary(e):
     """A short, human-readable summary of a board-poll failure for the block's
@@ -26309,7 +26459,10 @@ INTERNAL_TOOL_PROMPT_SIGS = (
     "turma limits probe",
     # The wait classifier (XERK-1572, ATTENTION_HINT_INSTRUCTION).
     "You are classifying why an autonomous coding session",
-    # The permission judge (XERK-1566, JUDGE_INSTRUCTION).
+    # The daily brief (XERK-2394, DAILY_BRIEF_INSTRUCTION).
+    "You write the script for a team's daily standup",
+    # The permission judge (XERK-1566, JUDGE_INSTRUCTION). Kept LAST: its test
+    # reads INTERNAL_TOOL_PROMPT_SIGS[-1].
     "You are the Turma permission judge",
 )
 
@@ -27246,6 +27399,18 @@ class SessionManager:
         self._attn_edge = {}
         self._attn_signals = {}
         self.attention_hints = []
+        # The daily brief's render worker (XERK-2394): `_dbrief_wants` (siteKey ->
+        # the owed run; a newer run replaces one not yet started) is handed to
+        # ONE worker (`_daily_brief_worker_loop`); `daily_brief_results` is the
+        # `dailyBriefResults` outbox, cleared BY IDENTITY once a beat carried it.
+        # All three, and `_dbrief_seen` (runIds against a re-delivery), under
+        # `_dbrief_lock`: the worker appends while the beat snapshots.
+        self._dbrief_lock = threading.Lock()
+        self._dbrief_wake = threading.Event()
+        self._dbrief_worker = None
+        self._dbrief_wants = {}
+        self._dbrief_seen = deque(maxlen=DAILY_BRIEF_RUN_IDS_SEEN)
+        self.daily_brief_results = []
         # The permission judge (XERK-1566). `permission_policy` is the org's
         # policy text off the last heartbeat reply — written by the BEAT
         # (`_ingest_permission_policy`, a str rebind), read by the judge
@@ -43107,6 +43272,142 @@ class SessionManager:
         except Exception as e:
             log(f"decisions file write failed: {type(e).__name__}: {e}")
 
+    # ---- the daily brief's render worker (XERK-2394) -------------------------
+
+    def _stage_daily_brief(self, cmd):
+        """ON THE BEAT (handle_commands): take a `renderDailyBrief` — validate it
+        and queue it for the worker; list work only. A newer runId for the same
+        org REPLACES one not yet started. An unusable command that still names a
+        runId + siteKey is answered with a failed row; one that does not is only
+        logged (there is nothing to report it on)."""
+        job, error = validate_daily_brief_command(cmd)
+        if job is None:
+            log(f"daily brief: command refused ({error})")
+            return
+        with self._dbrief_lock:
+            if job["runId"] in self._dbrief_seen:
+                return  # a re-delivered command: queued, running or answered already
+            self._dbrief_seen.append(job["runId"])
+            if not error:
+                old = self._dbrief_wants.get(job["siteKey"])
+                self._dbrief_wants[job["siteKey"]] = job
+        if error:
+            self._dbrief_push(job, error=error)
+            return
+        if old is not None:
+            # Answered, so a hub waiting on the older run is never left hanging.
+            log(f"daily brief: run {old['runId']} replaced by {job['runId']} before it ran")
+            self._dbrief_push(old, error=f"replaced by run {job['runId']} before it ran")
+        self._daily_brief_tick()
+
+    def _daily_brief_tick(self):
+        """ON THE BEAT: (re)start the worker while a brief is owed, and wake it.
+        A failed Thread.start() (pids_limit) is retried next beat. Never raises."""
+        try:
+            with self._dbrief_lock:
+                if not self._dbrief_wants:
+                    return
+                worker = self._dbrief_worker
+                if worker is None or not worker.is_alive():
+                    worker = threading.Thread(target=self._daily_brief_worker_loop,
+                                              name="daily-brief", daemon=True)
+                    worker.start()
+                    self._dbrief_worker = worker
+            self._dbrief_wake.set()
+        except Exception as e:
+            log(f"daily brief worker could not start: {type(e).__name__}: {e}")
+
+    def _daily_brief_worker_loop(self):
+        """Run owed briefs one at a time (ONE job in flight). Wake cleared BEFORE
+        the queue is read, so a command staged mid-run is kept."""
+        while True:
+            self._dbrief_wake.wait()
+            self._dbrief_wake.clear()
+            while True:
+                with self._dbrief_lock:
+                    if not self._dbrief_wants:
+                        break
+                    job = self._dbrief_wants.pop(next(iter(self._dbrief_wants)))
+                try:
+                    texts, error = self._run_daily_brief(job)
+                except Exception as e:
+                    texts, error = None, f"render failed: {type(e).__name__}: {e}"
+                self._dbrief_push(job, texts=texts, error=error)
+
+    def _run_daily_brief(self, job):
+        """OFF THE BEAT: collect the org's tickets for the windows, then run the
+        locked-down model up to DAILY_BRIEF_MAX_ATTEMPTS times, judging each
+        reply with parse_daily_brief. Returns (texts, None) or (None, error)."""
+        runtime = job["runtime"]
+        if runtime not in daily_brief_runtimes():
+            if runtime == "claude":
+                return None, "the Claude login on this host needs renewal (claude /login)"
+            return None, (f"the {runtime} runtime has no locked-down one-shot; "
+                          "this host renders the daily brief with claude only")
+        if not board_configured() or board_site_key() != job["siteKey"]:
+            return None, "this host does not serve that org's board"
+
+        def at(ms):
+            return datetime.datetime.fromtimestamp(ms / 1000, tz=datetime.timezone.utc)
+
+        try:
+            data = collect_daily_brief_data(at(job["dayFrom"]), at(job["weekFrom"]),
+                                            at(job["until"]), daily_brief_projects(self.jira))
+        except Exception as e:
+            log(f"daily brief: collecting {job['siteKey']} failed: {type(e).__name__}: {e}")
+            return None, f"collecting tickets failed: {_board_error_summary(e)}"
+        if data is None:
+            return None, "no ticket scope on this host (its board lists no projects)"
+        argv = ["claude", "-p", "--model", job["model"], *ATTENTION_HINT_LOCKDOWN,
+                DAILY_BRIEF_INSTRUCTION + daily_brief_input(data)]
+        for attempt in range(1, DAILY_BRIEF_MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                time.sleep(DAILY_BRIEF_RETRY_BACKOFF_SEC * (attempt - 1))
+            why = "the brief's text cleaned to nothing"
+            raw = self._run_lockdown_oneshot(argv, "daily-brief-", DAILY_BRIEF_TIMEOUT_SEC,
+                                             DAILY_BRIEF_REPLY_MAX, "daily brief")
+            if raw is None:
+                why = "the model run failed or timed out"
+            brief = parse_daily_brief(raw, data) if raw is not None else None
+            if raw is not None and brief is None:
+                why = "the model's reply broke the brief's contract"
+            if brief is not None:
+                texts = daily_brief_row(brief)
+                if all(texts.values()):
+                    return texts, None
+            log(f"daily brief: attempt {attempt}/{DAILY_BRIEF_MAX_ATTEMPTS} for run "
+                f"{job['runId']} gave no usable brief")
+        return None, (f"the model gave no usable brief in {DAILY_BRIEF_MAX_ATTEMPTS} attempts "
+                      f"(last: {why})")
+
+    def _dbrief_push(self, job, texts=None, error=None):
+        """Stage one result row on the `dailyBriefResults` outbox (bounded,
+        oldest dropped). A failed row carries no text (contract)."""
+        row = {"runId": job["runId"], "siteKey": job["siteKey"],
+               "status": "ok" if texts else "failed", "model": (job.get("model") or "")[:40]}
+        if texts:
+            row.update(texts)
+        else:
+            row["error"] = (error or "failed")[:DAILY_BRIEF_ERROR_MAX]
+        with self._dbrief_lock:
+            self.daily_brief_results.append(row)
+            over = len(self.daily_brief_results) - DAILY_BRIEF_RESULTS_MAX
+            if over > 0:
+                del self.daily_brief_results[:over]
+        if over > 0:
+            log(f"daily brief: outbox past {DAILY_BRIEF_RESULTS_MAX}; dropped {over} oldest")
+
+    @staticmethod
+    def _daily_brief_payload():
+        """The `dailyBrief` capability: the hub asks only a host reporting
+        available (an older agent would ack and never answer). Never raises."""
+        try:
+            runtimes = daily_brief_runtimes() if board_configured() else []
+        except Exception:
+            runtimes = []
+        return {"available": bool(runtimes), "runtimes": runtimes,
+                "models": list(DAILY_BRIEF_MODELS)}
+
     def _attention_hint_tick(self, now=None):
         """ON THE BEAT: drain the worker's verdicts, then stage the next due edge.
         Never raises — a hint is never worth the beat."""
@@ -45952,6 +46253,10 @@ class SessionManager:
                     self.answer_pane_prompt(
                         cmd.get("sessionId"), cmd.get("optionNumber"),
                         cmd.get("dialogId"))
+                elif ctype == "renderDailyBrief":
+                    # The daily brief (XERK-2394): only STAGED here — the
+                    # collector and the `claude -p` run on its own worker.
+                    self._stage_daily_brief(cmd)
                 elif ctype == "history":
                     self._stage_history(cmd.get("sessionId"))
                 elif ctype == "trajectoryTail":
@@ -47429,6 +47734,8 @@ class SessionManager:
         # the next edge the sessions' payloads noted last beat. The `claude -p`
         # runs on its own worker; this is list work only. Never raises.
         self._attention_hint_tick()
+        # The daily brief worker (XERK-2394): re-arm it while a brief is owed.
+        self._daily_brief_tick()
         # Defect attribution (XERK-1846): the SZZ pass on its own thread.
         self._defect_scan_tick()
         # One snapshot both the session payloads and the mod-status pairing walk,
@@ -47589,6 +47896,9 @@ class SessionManager:
             # predates the reader would accept the request and never act on it.
             # Absent is coerced to "can't" hub-side (normalizeCloseTicket).
             "closeTicket": {"available": True},
+            # Whether this manager renders the hub's `renderDailyBrief`
+            # (XERK-2394), on which runtimes and models. Absent = "can't".
+            "dailyBrief": self._daily_brief_payload(),
             # Whether this manager pauses a sleeper on the hub's command
             # (XERK-1575). The hub sends `pauseSleeper` only to a host reporting
             # it; TURMA_PAUSE_SLEEPERS=0 reports false. Absent is coerced to
@@ -47669,6 +47979,13 @@ class SessionManager:
         # never shed: a hint is an event that exists nowhere else on the wire.
         if self.attention_hints:
             payload["attentionHints"] = list(self.attention_hints[:ATTENTION_HINTS_MAX])
+        # The daily brief's result rows (XERK-2394), snapshotted under the lock
+        # the worker appends under, cleared BY IDENTITY once a beat carried them,
+        # never shed: a row is a result that exists nowhere else.
+        with self._dbrief_lock:
+            if self.daily_brief_results:
+                payload["dailyBriefResults"] = list(
+                    self.daily_brief_results[:DAILY_BRIEF_RESULTS_MAX])
         if self.spawn_failures:
             # Snapshotted under the lock the export thread's _refuse_start
             # appends under (XERK-397): post() removes exactly these delivered
@@ -47798,6 +48115,13 @@ class SessionManager:
             delivered = {id(x) for x in hstaged}
             self.attention_hints[:] = [
                 x for x in self.attention_hints if id(x) not in delivered]
+        # The daily brief rows (XERK-2394): only what THIS payload carried.
+        dstaged = payload.get("dailyBriefResults")
+        if dstaged:
+            delivered = {id(x) for x in dstaged}
+            with self._dbrief_lock:
+                self.daily_brief_results[:] = [
+                    x for x in self.daily_brief_results if id(x) not in delivered]
 
     def post(self, payload):
         """POST one heartbeat. Returns the parsed reply dict, or None on failure

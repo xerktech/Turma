@@ -68,3 +68,21 @@ model `DAILY_BRIEF_MODEL`. Evidence and the model decision: `docs/daily-brief-ad
   → None (retry). The eval scores with the same `daily_brief_problems`, so tightening one
   without the other makes the ADR's numbers stale — re-run `bench/daily-brief/run_eval.py`.
 - Tests: `TestDailyBriefPrompt`; corpus/scrub: `bench/tests/test_daily_brief.py`.
+
+## The render worker (XERK-2394)
+
+`renderDailyBrief` → `_stage_daily_brief` (beat: validate + queue only) → ONE worker
+(`_daily_brief_worker_loop`) → `_run_daily_brief` → `dailyBriefResults` outbox. Wire: the contract.
+
+- **Collect once, then the model up to `DAILY_BRIEF_MAX_ATTEMPTS`** with backoff; the collector,
+  the `claude -p` and the sleeps are all on the worker, never the beat (XERK-395).
+- **The model run is `_run_lockdown_oneshot`** (the wait classifier's runner): ATTENTION_HINT_LOCKDOWN,
+  cwd REGISTRY_DIR, stdin closed, mkstemp output, process group killed on timeout. Its prompt
+  signature is in `INTERNAL_TOOL_PROMPT_SIGS`, so its transcript never shows as a repo.
+- **Only `claude` is offered** (`daily_brief_runtimes`), and only while `claudeAuth.needsLogin` is
+  false. Do not add `qwen -p` until a host run shows it can be made tool-less: the input is tracker
+  text anyone in the org writes.
+- **The siteKey must be this host's board** (`board_site_key`), else `failed`: the collector reads
+  this host's tracker, never another org's.
+- Tests: `TestDailyBriefWorker` (validation, replacement, re-delivery, retry/timeout, malformed
+  output, runtime fallback, login, outbox, cleaner vectors).

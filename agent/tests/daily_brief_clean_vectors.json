@@ -1,0 +1,26 @@
+{
+  "comment": "XERK-2394: the daily brief text cleaner's vectors, [input, expected]. The agent's clean_daily_brief_text and the hub's ingest cleaner (XERK-2395) must both pass every one, and each must be a fixed point (clean(expected) == expected). Add a vector here, never to one side only.",
+  "cap": 2000,
+  "vectors": [
+    ["Ann shipped two fixes.", "Ann shipped two fixes."],
+    ["  Two  in\nprogress.  ", "Two in progress."],
+    ["- one\n- two", "one two"],
+    ["1. first\n2) second", "first second"],
+    ["## Since yesterday\nAnn shipped it.", "Ann shipped it."],
+    ["**Highlights**\nA quiet week.", "A quiet week."],
+    ["Since yesterday:\nAnn shipped it.", "Ann shipped it."],
+    ["A **big** week.", "A big week."],
+    ["Fixed `x` in <b>bold</b>.", "Fixed x in bold ."],
+    ["See [the docs](https://example.test/x) now.", "See the docs now."],
+    ["```json\n{\"a\":1}\n```", "{\"a\":1}"],
+    ["PR #215 merged; issue #3 too.", "PR #215 merged; issue #3 too."],
+    ["zero​width and‮bidi", "zero width and bidi"],
+    ["tab\tand nbsp", "tab and nbsp"],
+    ["​- hidden bullet", "hidden bullet"],
+    ["- - nested bullet", "nested bullet"],
+    ["a | table | row", "a table row"],
+    ["Ship it:", ""],
+    ["", ""],
+    ["Emoji 🚀 stays.", "Emoji 🚀 stays."]
+  ]
+}

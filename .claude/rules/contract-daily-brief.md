@@ -69,6 +69,8 @@ ticket builds to this file; change it here first.
   - `day` = `sinceYesterday` + `stillOpen`;
   - `week` = `thisWeek`;
   - `next` = each `upNext[].text`, or "Nothing is queued next." when the list is empty.
+  - Each part ends in sentence punctuation (the agent adds "." when missing), or an
+    unpunctuated `upNext` list reads aloud as one run-on sentence (XERK-2394 QA, 2 of 4 real runs).
   - `parse_daily_brief` refuses a brief whose joined `day` or `next` would pass 2000 chars
     (`DAILY_BRIEF_WIRE_TEXT_MAX`), so the hub never cuts a script mid-sentence. Chars are
     Unicode CODE POINTS on both sides: the hub must count `[...s].length`, never `s.length`
@@ -76,12 +78,21 @@ ticket builds to this file; change it here first.
 
 ## Agent → hub: the heartbeat
 
-- `dailyBrief: {available: bool}` capability block; `normalizeDailyBrief` coerces it (absent stays
-  absent = "can't"; unusable → null).
+- `dailyBrief: {available: bool, runtimes: [..], models: [..]}` capability block;
+  `normalizeDailyBrief` coerces it (absent stays absent = "can't"; unusable → null; the two lists
+  keep only known names). Today the agent offers `runtimes: ["claude"]` alone (XERK-2394): dsh has
+  no one-shot and `qwen -p` none shown to run tool-less, so a command naming either is answered
+  `failed` with that reason — the hub should pick a host listing the runtime instead.
 - `dailyBriefResults: [{runId, siteKey, status:"ok"|"failed", day, week, next, model, error?}]`.
   - Caps (the hub truncates/drops past them): ≤5 rows per beat; `day`/`week`/`next` ≤2000 chars
     each, plain text for reading aloud; `model` ≤40; `error` ≤300; `failed` rows carry no text.
   - The agent clears a row only once a beat carrying it was accepted (outbox semantics).
+  - Every text is cleaned by the same fixed-point cleaner on both sides
+    (`clean_daily_brief_text`; the hub's ingest must pass `agent/tests/daily_brief_clean_vectors.json`
+    too). Add a vector there, never to one side only.
+  - A command re-delivered with the same `runId` runs once; an unusable command that still names a
+    valid `runId` + `siteKey` is answered `failed`, one that does not is only logged.
+  - A queued run replaced by a newer one for the same org is answered `failed` ("replaced by run …").
 - Both keys are in `HEARTBEAT_KNOWN_KEYS`. `dailyBriefResults` is deleted from the payload before
   the record is stored; the ingest (XERK-2395) accepts a row only from the host the hub asked, for
   that run, while the host is still decided into `siteKey` (XERK-348).

@@ -27562,6 +27562,11 @@ test("XERK-2391: the capability block is coerced and the results outbox is never
   const q = { dailyBrief: "x" };
   hub.normalizeDailyBrief(q);
   assert.equal(q.dailyBrief, null);
+  // XERK-2394: the runtimes/models lists keep known names only.
+  const r = { dailyBrief: { available: true, runtimes: ["qwen", "x", "claude", 3],
+    models: "haiku" } };
+  hub.normalizeDailyBrief(r);
+  assert.deepEqual(r.dailyBrief, { available: true, runtimes: ["claude", "qwen"] });
   await beat1574("dbHostB", S, { dailyBrief: { available: true },
     dailyBriefResults: [{ runId: "r1", siteKey: S, status: "ok", day: "d", week: "w" }] });
   const a = (await fleet()).agents.find((x) => x.device === "dbHostB");
