@@ -92,7 +92,11 @@
     if (typeof next !== "string" || !next.startsWith("/")) return "/";
     try {
       const u = new URL(next, location.origin);
-      return u.origin === location.origin ? u.pathname + u.search + u.hash : "/";
+      // A dot segment can normalize to "//host" ("/.//evil"): protocol-relative.
+      if (u.origin !== location.origin || u.pathname.startsWith("//")) return "/";
+      // The hub's redirect here can't carry a fragment (the browser never sends
+      // it), but the browser keeps it on this page's URL: hand it on.
+      return u.pathname + u.search + (u.hash || location.hash || "");
     } catch { return "/"; }
   }
 

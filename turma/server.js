@@ -12775,7 +12775,8 @@ function oidcSafeNext(next) {
   // on the raw string miss those (XERK-2399).
   let u;
   try { u = new URL(next, "http://next.invalid"); } catch { return "/"; }
-  if (u.origin !== "http://next.invalid") return "/";
+  // A dot segment can normalize to "//host" ("/.//evil"), which is protocol-relative.
+  if (u.origin !== "http://next.invalid" || u.pathname.startsWith("//")) return "/";
   return u.pathname + u.search + u.hash;
 }
 
