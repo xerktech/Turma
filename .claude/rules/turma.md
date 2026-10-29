@@ -226,10 +226,10 @@ auto-start/stop, the two tracker writes.
 See `.claude/rules/turma-sessions.md` — native chat view, model/mode chips, working-status bar,
 ready-for-review, ended sessions, composer, terminal.
 
-## Brief page (`/brief`)
+## Insights page (`/insights`)
 
-See `.claude/rules/turma-brief.md` — the per-org brief: the leader sweep, what it reads, the store,
-the on-demand route, the needs-you push.
+See `.claude/rules/turma-insights.md` — the sub-pages (decisions, permission prompts, model
+quality), the decisions log, and the retired org brief.
 
 ## Durable archive
 

@@ -17,7 +17,6 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 | Sessions sidebar full-search  | `ui/SessionsScreen.kt`'s search box + "In history" section          |
 | `board.html` + `board.js`     | `ui/BoardScreen.kt`, `core/Board.kt`, `vm/BoardViewModel.kt`       |
 | `usage.html`                  | `ui/UsageScreen.kt`                                                |
-| `brief.html` (org brief)      | `ui/BriefScreen.kt`, `core/Brief.kt`, `vm/BriefViewModel.kt`       |
 | `nav.js` (header/bottom-nav)  | `ui/MainScaffold.kt`, `ui/TurmaApp.kt`                             |
 | `org.js` (header org filter)  | `ui/OrgControl.kt`, `vm/OrgViewModel.kt`, `data/OrgFilter.kt`      |
 | `login.html`                  | `ui/LoginScreen.kt`                                                |
@@ -29,19 +28,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Hub-URL field on Login.** The web is same-origin; a phone app must point at any hub, so Login has
   an extra Hub-URL field.
 - **Voice dictation** into the spawn/compose fields — a phone-only addition.
-- **Model quality rework sample size (XERK-1849).** The web shows each rework median's `n`
-  ("median of N sessions") as a cell hover; a phone has no hover, so Android shows the median only.
-- **Brief rows (XERK-1573).** A ticket row on the web brief links to the board's own detail; the
-  phone row is plain text (the Board screen has no deep-link route to a ticket yet) — unless it
-  carries a folded merged PR, which a tap opens (the web links its "merged PR" bit) — and the phone
-  shows a row's age/ETA relative only. Earlier briefs are a count on the phone, an expandable list of
-  headline counts on the web. Same sections, counts, order and "Brief now" otherwise.
-- **Brief decisions log (XERK-1574) — read-only on the phone.** Both show the brief's model-written
-  Summary above the sections and the org's newest ten decisions, newest first. Recording a decision
-  by hand (the web's note box, `POST /api/orgs/<site>/decisions`) is WEB-ONLY for now: a phone
-  composer needs a text field + refusal handling in `BriefViewModel`, deferred to keep this change
-  small. The phone also lists the log only under an org it already shows (a decided org or one with
-  a kept brief); the web additionally lists an org whose only content is its log.
+- **Insights is WEB-ONLY (operator decision, XERK-2386).** The web's Insights page (`/insights`)
+  holds the per-org decisions log, the permission-prompts ledger and model quality (shadow runs);
+  Android has none of them, and the web nav's Insights tab has no Android bottom-nav counterpart.
+- **No org brief on either client (XERK-2386).** The brief page, its "Brief now" and its push alert
+  are retired on the web and Android alike; Android ignores a `briefs` key an older hub still sends.
 - **Manual Refresh button on the Dashboard.** The web dashboard has no explicit refresh control (it
   auto-polls + SSE); the phone keeps a header Refresh button for a deliberate re-poll. It now shows a
   spinner while the awaited `/api/agents` poll runs (a short visible floor so a fast poll still reads
@@ -705,34 +696,6 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   switch (XERK-550).
 - Tests: `core/BoardTest.kt` (`epicBuilderRows`/label/terminal cases), `model/AgentDecodeTest.kt`
   (the `epicBuilders` decode + tolerance case).
-
-## Done (XERK-1576 — Permission prompts on the Usage screen)
-
-- **The web Usage page's "Permission prompts (7 days)" card (XERK-1563) is on `ui/UsageScreen.kt`**
-  (`PermissionsSection` in `ui/UsagePermissions.kt`), below the grouping's rows, in the web's phone
-  layout: each group a block (kind chip; subject; Count / Allowed / denied / Median wait; the rule
-  with Copy, or why there is none), the one "Asked in chat" note, then "Recent prompts (N)".
-  Wording, kind labels and order are usage.html's; the pure helpers are `core/Permissions.kt`.
-- **Its own call, never the atomic `/api/agents` decode**: `HubApi.permissions` →
-  `model/Permissions.kt` (`PermissionSummary`), every field defaulted and `kind` a plain string, so an
-  older or newer hub still decodes and a wrong-typed field costs this section only.
-- **Scoped like the web**: `UsageViewModel.watchPermissions` waits for a FULL fleet snapshot
-  (`FleetState.polled`, set by the `/api/agents` poll only, never by an SSE upsert), fetches
-  `?days=7&org=<the header's effective keys>`, refetches when the scope moves and every 60s while the
-  screen shows. A scope change drops the old org's view at once and discards a late answer for it; a
-  failed refresh keeps the same scope's view; a first read that fails shows the hub's own words
-  (`hubErrorMessage`, XERK-264).
-- **"Recent prompts" stays open across scope changes** like the web's page-level `permRecentOpen`:
-  its open state is held by `PermissionsSection`, above the loading/error branch.
-- **Platform form**: Copy puts the raw rule on the clipboard with Android's own confirmation (the
-  system overlay on 13+, a toast below it), where the web flashes its button.
-- **The permission judge's rows (XERK-1566) render as on the web**: kind `judged` reads "Judged" in
-  an accent-outlined chip (web `.k-judged`; `colorScheme.primary` is the web's `--accent` in both
-  themes), its group shows the web's "no rule retires this" (the hub sends no rule for it), and a
-  Recent row adds "judge: <allow|stand>[ — <judgeReason>]" after its answer
-  (`Permissions.judgeMeta`). `verdict`/`judgeReason` decode as optional strings on `PermissionRow`.
-- Tests: `core/PermissionsTest`, `model/PermissionDecodeTest`, `vm/UsagePermissionsViewModelTest`,
-  `ui/PermissionsSectionTest`.
 
 ## Done (XERK-1566 — permission policy editor)
 

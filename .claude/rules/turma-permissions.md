@@ -2,7 +2,8 @@
 paths:
   - "turma/permission-ledger.js"
   - "turma/tests/permission-ledger.test.js"
-  - "turma/public/usage.html"
+  - "turma/public/insights.html"
+  - "turma/tests/insights.test.js"
   - "turma/server.js"
 ---
 
@@ -12,7 +13,7 @@ Every permission prompt a session hit, how long it held the session, and the all
 retire it — so an allow-list change is measured, not guessed. Agent half in `hub-agent.py`
 (`_permission_edges`, the hook-log tail) + `agent/hooks/permlog.py`; hub half in
 `turma/permission-ledger.js` + `server.js` (`permissionEvents` ingest, `GET /api/permissions`,
-`/metrics`); surface on `usage.html`, ported to Android's Usage screen (XERK-1576, `android.md`).
+`/metrics`); surface on the web-only Insights page's Permission prompts sub-page (`insights.html`).
 This file is the HUB + web half; the agent half (row kinds, dialog edges, the hook merge, the
 beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent files it governs.
 
@@ -163,7 +164,7 @@ replace it.
   `turma_permission_wait_seconds{kind}` — per-kind aggregates over the retention window ONLY;
   never a host, session or command. **GAUGES, not counters**: they fall as rows age out, and
   Prometheus reads a counter's drop as a reset (false `rate()` spikes).
-- **`usage.html`'s "Permission prompts (7 days)"** card reads its own route (not `/api/agents`), so
+- **`insights.html`'s "Permission prompts (7 days)"** card reads its own route (not `/api/agents`), so
   the beat's SSE patches never repaint it. Every agent-supplied field is escaped; each rule has a Copy
   button.
   - **Its first fetch waits for the first render's `TurmaOrg.update`** (`syncPermissionsScope`):
@@ -228,4 +229,4 @@ replace it.
 The `XERK-1566:` cases in `server.test.js` (reply, decided-org keying, route refusals, judged rows),
 `external-stores.test.js` and `board.test.js`. Agent-side tests are listed in `agent-permissions.md`. `permission-ledger.test.js`
 (ingest bounds, aggregates, the rule table, scoping, file + fake-Postgres backends); the `XERK-1563:`
-cases in `server.test.js` (ingest, org scoping, auth, `/metrics`) and `usage.test.js` (the card).
+cases in `server.test.js` (ingest, org scoping, auth, `/metrics`) and `insights.test.js` (the card).

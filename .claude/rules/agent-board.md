@@ -48,8 +48,8 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   - `fetch_azure_issue` (inline on the beat) reads that cache and never GETs the parent.
   - Tests: the `xerk1444` cases in `TestShapeAzureItem`, `TestCollectAzure`, `fetch_azure_issue`'s.
 - **Every row carries `resolved`** (Jira `resolutiondate`, ADO `Microsoft.VSTS.Common.ClosedDate`;
-  null while open) — the hub's org brief counts the period's outflow by it (XERK-1573,
-  `turma-brief.md`). Untyped on Android, so absent from an older agent is decode-safe.
+  null while open) — the hub's outcome ledger dates a ticket's Done by it (XERK-1573,
+  `model-quality.md`). Untyped on Android, so absent from an older agent is decode-safe.
 - **An agent serves exactly ONE org** (a host is Jira or Azure, never both).
   `board_source()`/`board_configured()`/`collect_board()`/`fetch_board_issue()`/`board_site_key()`/
   `valid_issue_key()` are the dispatch shims every gate goes through; downstream reads `self.jira`
