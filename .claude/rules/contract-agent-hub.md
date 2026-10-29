@@ -98,9 +98,12 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
       Loosening any of these lets a compromised agent squat a name and drain its queued commands.
     - **No rename while the home record is still beating and not restarting** (`updating`): a real
       rename restarts the agent, so that is two machines on one cloned token, refused with 403.
-    - **Removing a host (`DELETE /api/agents/<host>`) RELEASES its name** (`releaseHostIdentities`):
-      the id living there is revoked, and an id minted for it but renamed away loses its `origin`.
-      Without it a reinstalled host could never take its name back on a strict hub.
+    - **Removing a host (`DELETE /api/agents/<host>`) RELEASES its name, revoking nothing**
+      (`releaseHostIdentities`): ids minted for it lose `origin` (name token un-retired, enroll mints
+      afresh) and the id living there is marked `released`. It still returns if it beats first (Remove
+      host is offered on any briefly-offline host); a reinstall that registers first wins. Revoking
+      instead locked a blipped host out for good; never releasing locked a reinstall out on strict.
+    - An id the hub does not know is told to re-provision (`--agent-token`), never re-issued.
     - A beat that renames carries the old record over (commands, org binding, alerts), drops every
       other record bound to the id (HA ghosts too), re-points ticket pins, appends `formerNames`.
     - Hub-owned, never served: `agentUid`, `uidBound` (ttydAuth's which-token), `formerNames`;

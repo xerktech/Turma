@@ -27446,15 +27446,24 @@ test("XERK-2195: the string-field coercion keeps null, numbers and a numeric id"
 });
 
 test("XERK-2381: removing a host releases its name for a reinstall", async () => {
+  const persisted = async () => (await hub.liveStore.get("policy:agentIdentities")) || {};
   await beatAs("box2381", asAuth(hostAgentToken("box2381")));
   const tok = enrollUid("box2381");
+  const uid = tokenUid(tok);
   await beatAs("box2381", asAuth(tok));
   // Retired while the agent lives on its identity.
   assert.equal((await beatAs("box2381", asAuth(hostAgentToken("box2381")))).status, 403);
+  // Remove host on a briefly offline host: it comes straight back on its identity.
   assert.equal((await request("DELETE", "/api/agents/box2381", { headers: userHeaders })).status, 200);
-  // The old identity is revoked; a reinstall on the name token comes back.
-  assert.equal((await beatAs("box2381", asAuth(tok))).status, 403);
+  assert.equal((await persisted())[uid].released, true, "the release is persisted");
+  assert.equal((await beatAs("box2381", asAuth(tok))).status, 200);
+  assert.equal((await persisted())[uid].released, undefined, "and cleared once it is back");
+  // A reinstall that registers the name first wins; the old identity is refused there.
+  await request("DELETE", "/api/agents/box2381", { headers: userHeaders });
   assert.equal((await beatAs("box2381", asAuth(hostAgentToken("box2381")))).status, 200);
+  const old = await beatAs("box2381", asAuth(tok));
+  assert.equal(old.status, 403);
+  assert.match(old.body.error, /re-provision/);
   const fresh = enrollUid("box2381");
   assert.notEqual(fresh, tok);
   assert.equal((await beatAs("box2381", asAuth(fresh))).status, 200);
@@ -27466,5 +27475,16 @@ test("XERK-2381: removing a host releases its name for a reinstall", async () =>
   assert.equal((await beatAs("box2381", asAuth(hostAgentToken("box2381")))).status, 200);
   assert.notEqual(enrollUid("box2381"), fresh, "the new machine never gets the renamed agent's id");
   assert.equal((await beatAs("box2381b", asAuth(fresh))).status, 200, "the renamed agent keeps working");
+  // An origin-less identity survives a reload (a restart must not lock it out).
+  const reloaded = hub.coerceAgentIdentities(JSON.parse(JSON.stringify(await persisted())));
+  assert.equal(reloaded[tokenUid(fresh)].home, "box2381b");
+  assert.equal(reloaded[tokenUid(fresh)].origin, undefined);
   forget2381("box2381", "box2381b");
+});
+
+test("XERK-2381: an identity this hub does not know is told to re-provision, never re-issued", () => {
+  const tok = uidAgentToken("abcdefabcdefabcdefabcdefabcdefab");
+  const r = resolveEnrollToken({ headers: asAuth(tok) }, "x");
+  assert.equal(r.status, 403);
+  assert.match(r.body.error, /re-provision/);
 });

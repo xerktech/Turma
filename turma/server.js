@@ -1289,13 +1289,21 @@ const lowerName = (n) => String(n).toLowerCase();
 //     other's commands.
 function uidHostRefusal(uid, host, now = Date.now()) {
   const e = identityOf(uid);
-  if (!e) return "unknown agent identity — enroll again";
+  if (!e) {
+    return "this agent identity is not registered on this hub — re-provision the host with " +
+      "its own token (node turma/server.js --agent-token <host>)";
+  }
   if (!isPlainHostKey(host) || !hostAgentToken(host)) return `${host} is not a usable host name`;
   const rec = Object.prototype.hasOwnProperty.call(agents, host) ? agents[host] : null;
   if (rec && rec.agentUid && rec.agentUid !== uid) return `${host} is registered to another agent`;
   // Its home: a record there with no id is this agent's own, from before its
   // first beat on the identity (minted while the host still ran on its name).
-  if (e.home === host) return null;
+  if (e.home === host) {
+    return e.released && rec && !rec.agentUid
+      ? `${host} was removed and re-registered by another agent — re-provision this host ` +
+        "with its own token (node turma/server.js --agent-token <host>)"
+      : null;
+  }
   if (rec && !rec.agentUid) return `${host} is registered to another agent`;
   if (rec) return null; // a stale copy of this agent's own record (an HA ghost)
   const mine = new Set([e.origin, e.home, ...(Array.isArray(e.names) ? e.names : [])]
@@ -1361,17 +1369,19 @@ function trimAgentIdentities(keep) {
     .forEach((u) => { delete agentIdentities[u]; });
 }
 // The operator removed `host` from the dashboard: release its name for a
-// reinstall. An identity living there is revoked (its token proves nothing
-// any more; the agent re-enrolls like a new host), and an identity minted FOR
-// that name but since renamed away keeps working but no longer retires the
-// name's token or answers its enroll (`origin` dropped). Without this a host
-// whose disk was replaced could never come back under its name on a strict hub.
+// reinstall, WITHOUT revoking anyone. Every identity minted for that name loses
+// its `origin` (the name's token is no longer retired, and its enroll mints a
+// fresh id), and the one living there is marked `released`: it still comes back
+// under its name if it beats first — Remove host on a briefly offline host
+// must not lock it out — but a reinstall that registers the name first wins,
+// and the released identity is then refused there. Without this a host whose
+// disk was replaced could never come back under its name on a strict hub.
 function releaseHostIdentities(host) {
   let changed = false;
-  for (const [uid, e] of Object.entries(agentIdentities)) {
+  for (const e of Object.values(agentIdentities)) {
     if (!e) continue;
-    if (e.home === host) { delete agentIdentities[uid]; changed = true; }
-    else if (e.origin === host) { delete e.origin; changed = true; }
+    if (e.origin === host) { delete e.origin; changed = true; }
+    if (e.home === host && !e.released) { e.released = true; changed = true; }
   }
   if (changed) persistAgentIdentities();
 }
@@ -1380,8 +1390,9 @@ function releaseHostIdentities(host) {
 function noteIdentityBeat(uid, key) {
   const e = identityOf(uid);
   if (!e) return null;
-  let changed = !e.used;
+  let changed = !e.used || !!e.released;
   e.used = true;
+  delete e.released;
   let from = null;
   if (e.home !== key) {
     from = e.home;
@@ -2771,6 +2782,7 @@ function coerceAgentIdentities(raw) {
     rec.home = e.home;
     rec.at = Number.isSafeInteger(e.at) && e.at > 0 ? e.at : 0;
     if (e.used === true) rec.used = true;
+    if (e.released === true) rec.released = true;
     if (Array.isArray(e.names)) {
       const names = e.names.filter(name).slice(-8);
       if (names.length) rec.names = names;
@@ -12938,6 +12950,9 @@ function resolveEnrollToken(req, device) {
   // Already on its IDENTITY token (XERK-2381): hand back the same credential.
   // Idempotent, works under strict, and never a different agent's.
   const provedUid = bearer ? tokenUid(bearer) : null;
+  if (provedUid && !identityOf(provedUid)) {
+    return { status: 403, body: { error: uidHostRefusal(provedUid, device || "") } };
+  }
   if (provedUid) {
     return { status: 200,
       body: { host: hostOfUid(provedUid) || device || null, token: uidAgentToken(provedUid), bound: true } };
@@ -23983,6 +23998,7 @@ if (process.env.TURMA_TEST) {
     uidHostRefusal,
     nameTokenRefusal,
     agentIdentities: () => agentIdentities,
+    coerceAgentIdentities,
     ttydAuth,
     triggerAuthorized,
     safeEqual,
