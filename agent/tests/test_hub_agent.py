@@ -22469,8 +22469,14 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self.run_calls.clear()
         sm.save = mock.Mock()  # don't touch disk; just assert the record update
         self.pane = _PickerPane() if pane is None else pane
+        # ha.run is patched process-wide: a worker an earlier test left running
+        # (a git probe) would record into run_calls, so count only this
+        # thread's calls (XERK-2197, XERK-2387).
+        me = threading.get_ident()
 
         def fake_run(cmd, cwd=None):
+            if threading.get_ident() != me:
+                return ""
             self.run_calls.append(cmd)
             if cmd[:4] == ["tmux", "-L", "turma", "send-keys"] and hasattr(self.pane, "key"):
                 self.pane.key(cmd[-1])
