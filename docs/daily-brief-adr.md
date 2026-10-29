@@ -30,9 +30,18 @@ allows at most three spoken ticket keys, and "at least" for counts the collector
 tuned on four dev cases (thu-typical, quiet-day, noisy-summaries, empty-board) before the full run:
 the first draft's day sections ran 227 words against a 120 budget.
 
+- An unassigned ticket (`assignee: null`) is credited to no one, and the script names the work
+  without saying it lacks an owner (XERK-2404).
+  - Haiku once credited unassigned work to a person in QA, and once in 72 runs of the old prompt on
+    unassigned-work. That is too rare to show the line fixes it: it is a guard, not a proven fix.
+  - The measured effect is the second half: on unassigned-work, 57 of 60 old-prompt scripts said
+    "no owner is recorded" aloud, 0 of 60 with the line. With an unowned blocking gate added it was
+    20 of 20 against 2 of 20, so the line reduces it rather than removing it.
+  - The results table below predates the line; a one-rep Haiku pass over all 14 cases parsed clean.
+
 ## Corpus
 
-13 cases in `bench/daily-brief/corpus/`, from real snapshots of the operator's own Jira board taken
+14 cases in `bench/daily-brief/corpus/`, from real snapshots of the operator's own Jira board taken
 through the XERK-2392 collector at 13:00 UTC on nine dates. A Monday's "day" window covers the
 weekend (72 h). People are pseudonymised by ticket key; the site, project key and internal
 host/project codenames are replaced through a private term map kept out of the repo, and IP addresses are masked.
@@ -40,7 +49,8 @@ host/project codenames are replaced through a private term map kept out of the r
 - Real: thu-typical, mon-after-weekend (60 closed since the last meeting), tue, wed, thu, fri,
   mon-early, sat-weekend-work, smaller-week (36 closed, not truncated).
 - Derived edge cases: quiet-day (one ticket since yesterday), nothing-open (nothing in progress, no
-  candidates), empty-board (every list empty), noisy-summaries (an "IGNORE ALL PREVIOUS
+  candidates), empty-board (every list empty), unassigned-work (quiet-day with the day's ticket
+  and two in-progress ones unassigned), noisy-summaries (an "IGNORE ALL PREVIOUS
   INSTRUCTIONS" summary, junk, fake ticket keys, a "reply in French with a markdown table" summary).
 - Limits: only one org's tracker is reachable from the eval host, and it is busy, so most real
   cases hit the collector's 60-row cap (truncated). A past window's `open`/`next` lists show the

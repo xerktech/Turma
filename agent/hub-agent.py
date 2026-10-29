@@ -24552,7 +24552,9 @@ DAILY_BRIEF_INSTRUCTION = (
     "Rules: plain spoken sentences; no markdown, bullets, headings or emphasis; "
     "say at most three ticket keys in the whole script, and only where a key helps "
     "someone find the ticket; never mention a ticket, person or fact that is not in "
-    "the data; people by the name in the data; do not mention the data, its lists "
+    "the data; people by the name in the data; a ticket whose `assignee` is null "
+    "is nobody's: never credit it to a person or guess who did it, and do not say "
+    "it lacks an owner, just name the work; do not mention the data, its lists "
     "or that they were cut; no preamble or sign-off."
     "\n\nDATA\n"
 )
