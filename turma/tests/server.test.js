@@ -25299,11 +25299,15 @@ test("XERK-2386: a record restored from an older hub's state.json carries no bri
   } finally { fs.unlinkSync(f); }
 });
 
-test("XERK-2386: the org brief is retired — /brief lands on Insights, an older agent's brief keys are dropped", async () => {
+test("XERK-2386: the org brief is retired — /brief is the Daily Brief page, an older agent's brief keys are dropped", async () => {
   const page = await request("GET", "/insights", { headers: userHeaders });
   assert.equal(page.status, 200);
-  const old = await request("GET", "/brief", { headers: userHeaders });
-  assert.deepEqual([old.status, old.headers.location], [301, "/insights"]);
+  // XERK-2396: the URL now serves the meeting-scheduled Daily Brief page.
+  for (const p of ["/brief", "/brief.html"]) {
+    const brief = await request("GET", p, { headers: userHeaders });
+    assert.equal(brief.status, 200, p);
+    assert.match(brief.raw, /data-page="brief"/, p);
+  }
   const r = await beat1574("dcBrief2386", "dcBrief2386.atlassian.net", {
     briefRender: { available: true },
     briefNarratives: [{ siteKey: "dcBrief2386.atlassian.net", briefAt: 1, text: "x" }],

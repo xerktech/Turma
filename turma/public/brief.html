@@ -1,0 +1,646 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turma — Brief</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<meta name="theme-color" content="#f9f9f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/app.css">
+<style>
+  /* The Daily Brief (XERK-2396, epic XERK-2390): per org, the latest standup
+     brief set for reading aloud, its earlier briefs, Run now, and the meeting
+     schedule that writes it. Tokens/base/nav live in app.css. Web-only for now
+     (android/PARITY.md). */
+  .brief-org {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    padding: 16px 18px; margin-bottom: 18px; min-width: 0;
+  }
+  .brief-head { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; }
+  .brief-title { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; }
+  .brief-name {
+    font-family: var(--font-display); font-size: 19px; font-weight: 600; margin: 0;
+    min-width: 0; overflow-wrap: anywhere;
+  }
+  /* The schedule's settings toggle, beside the org name. */
+  button.sched-gear {
+    flex: none; display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; padding: 0; border-color: transparent; color: var(--muted); border-radius: 50%;
+  }
+  button.sched-gear:hover:not(:disabled) { color: var(--ink); border-color: var(--border); }
+  button.sched-gear[aria-expanded="true"] { color: var(--accent); background: var(--accent-soft); }
+  button.sched-gear svg { width: 18px; height: 18px; }
+  .brief-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .brief-status { font-size: 13px; margin-top: 10px; overflow-wrap: anywhere; }
+  .brief-status.running { color: var(--ink-2); }
+  .brief-status.failed { color: var(--critical-text); }
+  .brief-meta { color: var(--muted); font-size: 12.5px; margin-top: 10px; }
+  .brief-meta .bit { white-space: nowrap; }
+  /* The read-aloud text: large, roomy, a comfortable measure. */
+  .brief-read { margin-top: 6px; max-width: 68ch; }
+  .brief-read h3 {
+    font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+    color: var(--muted); margin: 18px 0 4px;
+  }
+  .brief-read p { font-size: 20px; line-height: 1.6; margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+  .brief-none { color: var(--muted); font-size: 14px; margin-top: 12px; }
+
+  .brief-org details { margin-top: 14px; border-top: 1px solid var(--hairline); padding-top: 10px; }
+  .brief-sched {
+    margin-top: 12px; padding: 12px 14px; border: 1px solid var(--hairline);
+    border-radius: var(--radius-sm); background: var(--page);
+  }
+  .sched-title { font-size: 13px; font-weight: 600; color: var(--ink-2); }
+  .sched-title .sum { font-weight: 400; color: var(--muted); margin-left: 6px; overflow-wrap: anywhere; }
+  .brief-org summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink-2); }
+  .brief-org summary .sum { font-weight: 400; color: var(--muted); margin-left: 6px; overflow-wrap: anywhere; }
+  .brief-earlier ul { list-style: none; margin: 8px 0 0; padding: 0; }
+  .brief-earlier li { border-top: 1px solid var(--hairline); padding: 6px 0; font-size: 13px; overflow-wrap: anywhere; }
+  .brief-earlier li:first-child { border-top: 0; }
+  .brief-earlier .when { color: var(--muted); font-size: 12px; margin-right: 8px; white-space: nowrap; }
+  .brief-earlier .bad { color: var(--critical-text); }
+
+  .sched-form { display: flex; flex-direction: column; gap: 12px; margin-top: 10px; font-size: 13px; }
+  .sched-row { display: flex; flex-wrap: wrap; gap: 12px 18px; }
+  .sched-form label.f { display: flex; flex-direction: column; gap: 4px; color: var(--ink-2); min-width: 0; }
+  .sched-form input[type=time], .sched-form input[type=number], .sched-form select {
+    font: inherit; font-size: 14px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--field); color: var(--ink); padding: 5px 8px; max-width: 100%;
+  }
+  .sched-form input[type=number] { width: 6em; }
+  .sched-form select.tz { width: 260px; }
+  .sched-form .sw { display: flex; align-items: center; gap: 8px; color: var(--ink); }
+  .sched-form fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+  .sched-form legend { color: var(--ink-2); padding: 0; margin-bottom: 4px; }
+  .sched-days { display: flex; flex-wrap: wrap; gap: 6px 12px; }
+  .sched-days label { display: inline-flex; align-items: center; gap: 4px; }
+  .sched-next { color: var(--ink-2); }
+  .sched-err { color: var(--critical-text); overflow-wrap: anywhere; }
+  .sched-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .brief-org button[aria-disabled="true"],
+  .brief-org button[aria-disabled="true"]:hover { opacity: 0.5; cursor: default; border-color: var(--border); }
+  .brief-empty { color: var(--muted); font-size: 14px; padding: 24px 0; }
+  .pane-note { color: var(--muted); font-size: 12px; margin: 16px 0 0; }
+
+  @media (max-width: 600px) {
+    .brief-org { padding: 14px 12px; }
+    .brief-read p { font-size: 18px; }
+    .sched-form select.tz { width: 100%; }
+  }
+</style>
+</head>
+<body class="app-shell">
+<header class="site-header" id="siteHeader" data-page="brief"></header>
+<div class="page-scroll">
+<div class="wrap">
+  <div id="briefList"></div>
+  <div class="pane-note">An agent host of each org writes its <b>daily brief</b> a few minutes before the org's meeting, from the org's tickets: what moved since the last meeting, the week so far and what is next. Times on this page are in your time zone.</div>
+</div>
+</div>
+
+<nav class="bottom-nav" id="bottomNav"></nav>
+<script src="/board.js"></script>
+<script src="/nav.js"></script>
+<script src="/org.js"></script>
+<script src="/newticket.js"></script>
+
+<script>
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[c]);
+}
+function ago(ms, now) {
+  const s = Math.max(0, Math.round((now - ms) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+// Every time on the page is the VIEWER's local time; the schedule's own zone is
+// named only beside its meeting time.
+function fmtWhen(ms) {
+  return new Date(ms).toLocaleString([], { weekday: "short", month: "short", day: "numeric",
+    hour: "numeric", minute: "2-digit" });
+}
+// An org's entry in a served map, OWN keys only: an org may be named
+// `__proto__` or `constructor` (XERK-1451), which a plain lookup reads off the prototype.
+const own = (map, k) => (map && Object.prototype.hasOwnProperty.call(map, k) ? map[k] : undefined);
+const isTime = (v) => typeof v === "number" && Number.isFinite(v) && v > 0;
+
+// ---- the brief ---------------------------------------------------------------
+// The wire carries three plain-text sections (contract-daily-brief.md): `day`
+// is "Since yesterday" AND "Still open" joined, `next` already says
+// "Nothing is queued next." for an empty list.
+const SECTIONS = [["day", "Since yesterday · still open"], ["week", "This week"], ["next", "Up next"]];
+function briefText(b) {
+  return SECTIONS.filter(([k]) => b[k]).map(([k, h]) => `${h}\n${b[k]}`).join("\n\n");
+}
+function headlineOf(b) {
+  if (b.headline) return b.headline;
+  const m = /^.*?[.!?](?= |$)/u.exec(b.day || "");
+  return m ? m[0] : (b.day || "");
+}
+const GEAR_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+  + `<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MODELS = ["auto", "haiku", "sonnet"];
+const DEFAULT_SCHEDULE = { enabled: true, time: "09:00", weekdays: [1, 2, 3, 4, 5], leadMinutes: 5, model: "auto" };
+function browserZone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch { return "UTC"; }
+}
+let zoneList = null;
+function zones() {
+  if (!zoneList) {
+    try { zoneList = Intl.supportedValuesOf("timeZone"); } catch { zoneList = []; }
+    if (!zoneList.includes("UTC")) zoneList = ["UTC", ...zoneList];
+  }
+  return zoneList;
+}
+function daysText(days) {
+  const d = [...days].sort((a, b) => a - b).join(",");
+  if (d === "0,1,2,3,4,5,6") return "Every day";
+  if (d === "1,2,3,4,5") return "Weekdays";
+  return days.map((i) => DAY_NAMES[i]).join(", ");
+}
+function scheduleSummary(s) {
+  if (!s) return "not set";
+  const at = `${daysText(s.weekdays)} at ${s.time} ${s.timeZone}`;
+  return s.enabled ? at : `off · ${at}`;
+}
+// What the form shows: an unsaved draft, else the stored schedule, else the
+// defaults (in the viewer's own zone).
+function formValues(site, stored) {
+  const d = drafts.get(site);
+  if (d) return d;
+  const s = stored || { ...DEFAULT_SCHEDULE, timeZone: browserZone() };
+  return { enabled: s.enabled, time: s.time, timeZone: s.timeZone, weekdays: [...s.weekdays],
+    leadMinutes: s.leadMinutes ?? 5, model: s.model || "auto" };
+}
+function nextHtml(site, stored) {
+  if (!stored) return "No schedule yet — save one to have a brief written before each meeting.";
+  if (!stored.enabled) return "Off — no brief is scheduled.";
+  const n = nextFor.get(site);
+  if (!n || !n.next) return "";
+  return `Next brief: <b>${esc(fmtWhen(n.next.runAt))}</b>, for the ${esc(fmtWhen(n.next.meetingAt))} meeting (your time).`;
+}
+function scheduleHtml(site, stored) {
+  if (!schedOpen.has(site)) return "";
+  const v = formValues(site, stored);
+  const tzs = zones().includes(v.timeZone) ? zones() : [v.timeZone, ...zones()];
+  const opt = (val, sel, label = val) => `<option value="${esc(val)}"${val === sel ? " selected" : ""}>${esc(label)}</option>`;
+  const err = schedErr.get(site);
+  const busy = schedBusy.has(site);
+  const next = nextHtml(site, stored);
+  return `<div class="brief-sched"><div class="sched-title">Schedule<span class="sum">${esc(scheduleSummary(stored))}</span></div>`
+    + `<form class="sched-form" data-sched="${esc(site)}">`
+    + `<label class="sw"><input type="checkbox" data-f="enabled"${v.enabled ? " checked" : ""}> Write a brief before each meeting</label>`
+    + `<div class="sched-row">`
+    + `<label class="f">Meeting time<input type="time" data-f="time" value="${esc(v.time)}" required></label>`
+    + `<label class="f">Time zone<select class="tz" data-f="timeZone">${tzs.map((z) => opt(z, v.timeZone)).join("")}</select></label>`
+    + `</div>`
+    + `<fieldset><legend>Meeting days</legend><div class="sched-days">`
+    + DAY_NAMES.map((n, i) => `<label><input type="checkbox" data-f="weekdays" value="${i}"${v.weekdays.includes(i) ? " checked" : ""}>${n}</label>`).join("")
+    + `</div></fieldset>`
+    + `<div class="sched-row">`
+    + `<label class="f">Minutes before the meeting<input type="number" data-f="leadMinutes" min="1" max="30" step="1" value="${esc(v.leadMinutes)}"></label>`
+    + `<label class="f">Model<select data-f="model">${MODELS.map((m) => opt(m, v.model, m === "auto" ? "auto (haiku)" : m)).join("")}</select></label>`
+    + `</div>`
+    + (next ? `<div class="sched-next">${next}</div>` : "")
+    + (err ? `<div class="sched-err">${esc(err)}</div>` : "")
+    + `<div class="sched-actions"><button type="submit" class="primary btn-sm" data-sched-save="${esc(site)}" aria-disabled="${busy}">${busy ? "Saving…" : "Save schedule"}</button>`
+    + (drafts.has(site) ? `<button type="button" class="btn-sm" data-sched-reset="${esc(site)}">Discard changes</button>` : "")
+    + `</div></form></div>`;
+}
+function statusHtml(site, head, latest, now) {
+  // A refusal stands only until the org's runs move on (a run started
+  // elsewhere, or this one settled): a stale "try again" must not hide it.
+  const refused = runRefusal.get(site);
+  if (refused && refused.head === (head ? head.runId : null)) {
+    return `<div class="brief-status failed">${esc(refused.text)}</div>`;
+  }
+  if (!head) return "";
+  if (head.status === "running") {
+    const on = head.host ? ` on ${esc(head.host)}` : "";
+    return `<div class="brief-status running">Writing ${head.trigger === "manual" ? "a" : "the scheduled"} brief${on}… started ${esc(ago(head.startedAt, now))}</div>`;
+  }
+  if (head.status === "failed" && head !== latest) {
+    return `<div class="brief-status failed">The ${esc(fmtWhen(head.startedAt))} brief failed — ${esc(head.error || "the brief could not be written")}</div>`;
+  }
+  return "";
+}
+function briefOrgHtml(site, { list, schedule, live, name, now }) {
+  list = Array.isArray(list) ? list : [];
+  const head = list[0];
+  const latest = list.find((b) => b.status === "ok" && SECTIONS.some(([k]) => b[k]));
+  const running = head && head.status === "running";
+  const actions = `<div class="brief-actions">`
+    + (latest ? `<button type="button" class="btn-sm" data-copy="${esc(site)}">${copied.has(site) ? "Copied" : "Copy"}</button>` : "")
+    + (live ? `<button type="button" class="btn-sm" data-run="${esc(site)}" aria-disabled="${!!(running || runBusy.has(site))}">Run now</button>` : "")
+    + `</div>`;
+  let body;
+  if (latest) {
+    const meta = [];
+    if (isTime(latest.meetingAt)) meta.push(`For the ${esc(fmtWhen(latest.meetingAt))} meeting`);
+    if (isTime(latest.generatedAt)) meta.push(`written ${esc(fmtWhen(latest.generatedAt))}`);
+    if (latest.model) meta.push(esc(latest.model));
+    if (latest.host) meta.push(`on ${esc(latest.host)}`);
+    body = `<div class="brief-meta">${meta.map((m) => `<span class="bit">${m}</span>`).join(" · ")}</div>`
+      + `<article class="brief-read">`
+      + SECTIONS.filter(([k]) => latest[k]).map(([k, h]) => `<h3>${esc(h)}</h3><p>${esc(latest[k])}</p>`).join("")
+      + `</article>`;
+  } else {
+    body = `<div class="brief-none">No brief written yet.${live ? " Run now writes one, or set a schedule with the gear by the org name." : ""}</div>`;
+  }
+  const earlier = list.filter((b) => b !== latest && b.status !== "running");
+  const earlierHtml = earlier.length
+    ? `<details class="brief-earlier" data-earlier-open="${esc(site)}"${earlierOpen.has(site) ? " open" : ""}>`
+      + `<summary>Earlier briefs<span class="sum">${earlier.length}</span></summary><ul>`
+      + earlier.map((b) => `<li><span class="when">${esc(fmtWhen(isTime(b.meetingAt) ? b.meetingAt : b.startedAt))}</span>`
+        + (b.status === "failed"
+          ? `<span class="bad">failed — ${esc(b.error || "the brief could not be written")}</span>`
+          : esc(headlineOf(b)))
+        + `</li>`).join("")
+      + `</ul></details>`
+    : "";
+  const open = schedOpen.has(site);
+  const gear = live
+    ? `<button type="button" class="sched-gear" data-sched-toggle="${esc(site)}" aria-expanded="${open}"`
+      + ` aria-label="Schedule settings" title="Schedule: ${esc(scheduleSummary(schedule))}">${GEAR_SVG}</button>`
+    : "";
+  return `<section class="brief-org"><div class="brief-head"><div class="brief-title"><h2 class="brief-name">${esc(name || site)}</h2>${gear}</div>${actions}</div>`
+    + (live ? scheduleHtml(site, schedule) : "")
+    + statusHtml(site, head, latest, now) + body + earlierHtml
+    + `</section>`;
+}
+
+// ---- page state ----------------------------------------------------------------
+const $briefs = document.getElementById("briefList");
+const drafts = new Map();      // site -> unsaved schedule form values
+const schedOpen = new Set();   // sites whose schedule settings are open (the gear)
+const earlierOpen = new Set(); // sites whose earlier-briefs list is open
+const schedErr = new Map();    // site -> the hub's refusal of the last save
+const schedBusy = new Set();
+const runBusy = new Set();
+const runRefusal = new Map();  // site -> {text, head}: the hub's refusal of the last Run now, and the newest runId then
+const copied = new Set();
+const nextFor = new Map();     // site -> {sig, next, at}: GET .../schedule's `next`
+const nextBusy = new Set();
+const NEXT_RETRY_MS = 60000;
+let cache = null;
+let liveOrgs = new Set();
+let shownSites = [];
+let painted = null;
+let paintPending = false;
+let pointerDown = false;
+
+function orgsOf(data) {
+  const live = new Set();
+  for (const a of data.agents || []) if (a && typeof a.org === "string" && a.org) live.add(a.org);
+  const all = new Set(live);
+  const briefs = data.dailyBriefs && typeof data.dailyBriefs === "object" ? data.dailyBriefs : {};
+  for (const s of Object.keys(briefs)) if (Array.isArray(own(briefs, s)) && own(briefs, s).length) all.add(s);
+  return { live, all };
+}
+// A repaint replaces the form, so a background one waits while a field in it
+// has focus (a native <select> popup would close, a half-typed time would be
+// lost), and while a pointer is pressed in the list: a swap between mousedown
+// and mouseup makes the browser dispatch no click at all (turma.md, the
+// dashboard's same trap). focusout / pointerup paint what was held.
+function editing() {
+  const ae = document.activeElement;
+  return !!(ae && /^(INPUT|SELECT)$/.test(ae.tagName || "") && typeof $briefs.contains === "function" && $briefs.contains(ae));
+}
+// What has focus, as keys that survive the swap: a button by its data-* site,
+// a form field by its site + field (+ value for a weekday).
+const FOCUS_KEYS = ["run", "copy", "schedToggle", "schedReset", "schedSave"];
+function focusKey() {
+  const ae = document.activeElement;
+  const ds = ae && ae.dataset;
+  if (!ds || typeof $briefs.contains !== "function" || !$briefs.contains(ae)) return null;
+  const k = FOCUS_KEYS.find((x) => ds[x] !== undefined);
+  if (k) return { k, site: ds[k] };
+  if (ds.f) return { f: ds.f, site: formSite(ae), value: ds.f === "weekdays" ? ae.value : undefined };
+  return null;
+}
+function restoreFocus(key) {
+  if (!key) return;
+  const el = key.k
+    ? [...$briefs.querySelectorAll("button")].find((x) => x.dataset[key.k] === key.site)
+    : [...$briefs.querySelectorAll("[data-f]")].find((x) => x.dataset.f === key.f && formSite(x) === key.site
+      && (key.value === undefined || x.value === key.value));
+  if (el && el.focus) el.focus();
+}
+// `force`: the viewer's own click (the gear, Discard) paints at once, focus
+// kept on the field or button it was on. Never through a pointer press.
+// Busy state and a save's error go straight onto the controls, never only
+// through a repaint: a repaint is held while a field has focus, and a Save left
+// reading "Saving…" and disabled swallowed the next click (QA). The next
+// repaint draws the same state from schedBusy / schedErr / runBusy.
+function patchSave(site) {
+  painted = null;
+  const form = [...$briefs.querySelectorAll("[data-sched]")].find((f) => f.dataset.sched === site);
+  if (!form) return;
+  const busy = schedBusy.has(site);
+  const btn = form.querySelector("[data-sched-save]");
+  // aria-disabled, not disabled: a disabled button drops keyboard focus to
+  // <body>; schedBusy already refuses a second submit.
+  if (btn) { btn.setAttribute("aria-disabled", String(busy)); btn.textContent = busy ? "Saving…" : "Save schedule"; }
+  const text = schedErr.get(site);
+  let err = form.querySelector(".sched-err");
+  if (text && !err) {
+    err = document.createElement("div");
+    err.className = "sched-err";
+    form.insertBefore(err, form.querySelector(".sched-actions"));
+  }
+  if (err) { if (text) err.textContent = text; else err.remove(); }
+}
+function patchRun(site) {
+  painted = null;
+  const running = orgRunning(site);
+  for (const b of $briefs.querySelectorAll("[data-run]")) {
+    if (b.dataset.run === site) b.setAttribute("aria-disabled", String(runBusy.has(site) || !!running));
+  }
+}
+function renderBriefs(data, now, force = false) {
+  if (pointerDown || (!force && editing())) { paintPending = true; return; }
+  paintPending = false;
+  const keys = TurmaOrg.getKeys();
+  const { live, all } = orgsOf(data);
+  liveOrgs = live;
+  shownSites = [...all].filter((s) => !keys.length || keys.includes(s)).sort();
+  const briefs = data.dailyBriefs && typeof data.dailyBriefs === "object" ? data.dailyBriefs : {};
+  const schedules = data.dailyBriefSchedules && typeof data.dailyBriefSchedules === "object" ? data.dailyBriefSchedules : {};
+  const names = new Map((TurmaBoard.mergeSites ? TurmaBoard.mergeSites(data.agents || []) : [])
+    .map((x) => [x.siteKey, x.orgName]));
+  const name = (s) => (TurmaBoard.orgName ? TurmaBoard.orgName(s, names.get(s)) : s);
+  const html = shownSites.length
+    ? shownSites.map((s) => briefOrgHtml(s, { list: own(briefs, s), schedule: own(schedules, s) || null,
+      live: live.has(s), name: name(s), now })).join("")
+    : `<div class="brief-empty">No org yet — no host reports a tracker org.</div>`;
+  syncNext(schedules, now);
+  if (html === painted) return;
+  painted = html;
+  const focus = focusKey();
+  TurmaNav.preserveScroll($briefs, () => { $briefs.innerHTML = html; });
+  restoreFocus(focus);
+}
+function render(data) {
+  TurmaOrg.update(data);
+  TurmaNewTicket.update(data);
+  renderBriefs(data, Date.now());
+}
+function flushHeld() {
+  setTimeout(() => { if (paintPending && cache) renderBriefs(cache, Date.now()); }, 0);
+}
+$briefs.addEventListener("focusout", flushHeld);
+$briefs.addEventListener("pointerdown", () => { pointerDown = true; }, true);
+// Released anywhere (a press can end off the list). The flush is a task later,
+// so the click this press makes has been dispatched first.
+// A context menu or the window losing focus can eat the pointerup; neither may
+// leave every background paint held. `blur` only for the WINDOW: on capture it
+// also fired for the field the press itself blurred, swapping the list mid-press (QA).
+function releasePress() { if (pointerDown) { pointerDown = false; flushHeld(); } }
+for (const ev of ["pointerup", "pointercancel", "contextmenu"]) addEventListener(ev, releasePress, true);
+addEventListener("blur", (e) => { if (e.target === window) releasePress(); });
+
+// The next run is the hub's to compute (DST, the lead window), so it is read
+// from GET .../schedule for each shown org with a schedule: again when the
+// schedule changes, and once the run it named has passed.
+function syncNext(schedules, now) {
+  for (const s of shownSites) {
+    const sch = own(schedules, s);
+    if (!sch || !liveOrgs.has(s) || nextBusy.has(s)) continue;
+    const sig = JSON.stringify(sch);
+    const have = nextFor.get(s);
+    if (have && now < (have.retryAt || 0)) continue;
+    if (have && have.sig === sig && !have.failed && !(have.next && have.next.runAt <= now && now - have.at > 30000)) continue;
+    fetchNext(s, sig);
+  }
+}
+async function fetchNext(site, sig) {
+  nextBusy.add(site);
+  try {
+    const r = await fetch(`/api/orgs/${encodeURIComponent(site)}/daily-brief/schedule`);
+    if (r.status === 401) return void (location.href = "/login");
+    const out = r.ok ? await r.json() : null;
+    nextFor.set(site, { sig, next: out && out.next ? out.next : null, at: Date.now() });
+  } catch {
+    // Unreachable, or not JSON (an auth proxy's page): keep what was shown and
+    // try again in a minute — retried at once, every repaint re-asked (QA: ~230/s).
+    const have = nextFor.get(site);
+    nextFor.set(site, { sig, next: have ? have.next : null, at: Date.now(), failed: true, retryAt: Date.now() + NEXT_RETRY_MS });
+  }
+  nextBusy.delete(site);
+  painted = null;
+  if (cache) renderBriefs(cache, Date.now());
+}
+
+// ---- actions -----------------------------------------------------------------
+async function send(method, url, body) {
+  let res = null, out = null;
+  try {
+    res = await fetch(url, { method, headers: { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body) });
+    try { out = await res.json(); } catch { /* not JSON */ }
+  } catch { /* unreachable */ }
+  return { res, out };
+}
+// Run now: the hub's refusal is shown in its own words, on the org's status
+// line and as the shared failure toast (XERK-264).
+// Run now and Save go aria-disabled, never `disabled` (which drops keyboard
+// focus to <body>), so these guards are what refuse a second press.
+function orgRunning(site) {
+  const list = cache && own(cache.dailyBriefs, site);
+  return Array.isArray(list) && !!list[0] && list[0].status === "running";
+}
+async function runNow(site) {
+  if (runBusy.has(site) || orgRunning(site)) return;
+  runBusy.add(site);
+  runRefusal.delete(site);
+  patchRun(site);
+  const { res, out } = await send("POST", `/api/orgs/${encodeURIComponent(site)}/daily-brief/run`);
+  runBusy.delete(site);
+  if (res && res.status === 401) return void (location.href = "/login");
+  if (!res || !res.ok) {
+    const text = res ? TurmaNav.refusalText("Run now", res.status, out) : "Run now failed — the hub is unreachable";
+    const list = cache && own(cache.dailyBriefs, site);
+    runRefusal.set(site, { text, head: Array.isArray(list) && list[0] ? list[0].runId : null });
+    TurmaNav.toast(text);
+  } else if (out && out.brief && cache) {
+    const map = cache.dailyBriefs && typeof cache.dailyBriefs === "object" ? cache.dailyBriefs : (cache.dailyBriefs = {});
+    const list = (own(map, site) || []).filter((b) => b.runId !== out.brief.runId);
+    // Defined, not assigned: an org may be named __proto__ (XERK-1451).
+    Object.defineProperty(map, site, { value: [out.brief, ...list], enumerable: true, writable: true, configurable: true });
+  }
+  patchRun(site);
+  if (cache) renderBriefs(cache, Date.now());
+}
+async function saveSchedule(site) {
+  if (schedBusy.has(site)) return;
+  const stored = (cache && own(cache.dailyBriefSchedules, site)) || null;
+  const v = formValues(site, stored);
+  const body = { enabled: v.enabled, time: v.time, timeZone: v.timeZone, weekdays: v.weekdays,
+    leadMinutes: Number(v.leadMinutes), model: v.model };
+  schedBusy.add(site);
+  schedErr.delete(site);
+  patchSave(site);
+  const { res, out } = await send("PUT", `/api/orgs/${encodeURIComponent(site)}/daily-brief/schedule`, body);
+  schedBusy.delete(site);
+  if (res && res.status === 401) return void (location.href = "/login");
+  if (!res || !res.ok) {
+    const text = res ? TurmaNav.refusalText("Saving the schedule", res.status, out) : "Saving the schedule failed — the hub is unreachable";
+    schedErr.set(site, text);
+    TurmaNav.toast(text);
+  } else {
+    drafts.delete(site);
+    if (out && out.schedule && cache) {
+      cache.dailyBriefSchedules = { ...(cache.dailyBriefSchedules || {}), [site]: out.schedule };
+      nextFor.set(site, { sig: JSON.stringify(out.schedule), next: out.next || null, at: Date.now() });
+    }
+  }
+  patchSave(site);
+  if (cache) renderBriefs(cache, Date.now());
+}
+async function copyBrief(site) {
+  const list = (cache && own(cache.dailyBriefs, site)) || [];
+  const b = list.find((x) => x.status === "ok" && SECTIONS.some(([k]) => x[k]));
+  if (!b) return;
+  try {
+    await navigator.clipboard.writeText(briefText(b));
+  } catch {
+    return void TurmaNav.toast("Copying the brief failed — the browser refused the clipboard");
+  }
+  copied.add(site);
+  if (cache) renderBriefs(cache, Date.now());
+  setTimeout(() => { copied.delete(site); if (cache) renderBriefs(cache, Date.now()); }, 1500);
+}
+// A field edit becomes the org's draft; the draft is what the form shows and
+// what Save sends, so a repaint never loses an edit.
+function editField(site, el) {
+  const stored = (cache && own(cache.dailyBriefSchedules, site)) || null;
+  const d = { ...formValues(site, stored) };
+  const f = el.dataset.f;
+  if (f === "enabled") d.enabled = !!el.checked;
+  else if (f === "weekdays") {
+    const i = Number(el.value);
+    const set = new Set(d.weekdays);
+    if (el.checked) set.add(i); else set.delete(i);
+    d.weekdays = [...set].sort((a, b) => a - b);
+  } else if (f === "leadMinutes") d.leadMinutes = el.value;
+  else if (f === "time" || f === "timeZone" || f === "model") d[f] = el.value;
+  else return;
+  drafts.set(site, d);
+}
+function formSite(el) {
+  const form = el.closest && el.closest("[data-sched]");
+  return form ? form.dataset.sched : undefined;
+}
+$briefs.addEventListener("input", (e) => {
+  const site = formSite(e.target);
+  if (site !== undefined && e.target.dataset && e.target.dataset.f) editField(site, e.target);
+});
+$briefs.addEventListener("change", (e) => {
+  const site = formSite(e.target);
+  if (site === undefined || !e.target.dataset || !e.target.dataset.f) return;
+  editField(site, e.target);
+  // A checkbox or select keeps no half-typed state, so show the Discard button now.
+  if (e.target.type === "checkbox" || e.target.tagName === "SELECT") { paintPending = true; }
+});
+$briefs.addEventListener("submit", (e) => {
+  const site = formSite(e.target);
+  if (site === undefined) return;
+  e.preventDefault();
+  saveSchedule(site);
+});
+$briefs.addEventListener("click", (e) => {
+  const t = e.target.closest && e.target.closest("[data-run],[data-copy],[data-sched-reset],[data-sched-toggle]");
+  if (!t) return;
+  if (t.dataset.schedToggle !== undefined) {
+    const site = t.dataset.schedToggle;
+    if (schedOpen.has(site)) schedOpen.delete(site); else schedOpen.add(site);
+    if (cache) renderBriefs(cache, Date.now(), true);
+  } else if (t.dataset.run !== undefined) runNow(t.dataset.run);
+  else if (t.dataset.copy !== undefined) copyBrief(t.dataset.copy);
+  else {
+    drafts.delete(t.dataset.schedReset);
+    schedErr.delete(t.dataset.schedReset);
+    if (cache) renderBriefs(cache, Date.now(), true);
+  }
+});
+// `toggle` does not bubble: catch it on capture so a repaint keeps each
+// <details> as the viewer left it.
+$briefs.addEventListener("toggle", (e) => {
+  const d = e.target;
+  if (!d || !d.dataset) return;
+  const site = d.dataset.earlierOpen;
+  if (site === undefined) return;
+  if (d.open) earlierOpen.add(site); else earlierOpen.delete(site);
+}, true);
+
+// ---- the fleet snapshot --------------------------------------------------------
+// A fetch MERGES, never replaces (XERK-444): an SSE frame that lands while
+// /api/agents is in flight is newer than its body.
+let briefsClock = 0, schedulesClock = 0;
+async function refresh() {
+  const bsince = briefsClock, ssince = schedulesClock;
+  try {
+    const r = await fetch("/api/agents");
+    if (r.status === 401) return void (location.href = "/login");
+    const body = await r.json();
+    if (cache && briefsClock !== bsince) body.dailyBriefs = cache.dailyBriefs;
+    if (cache && schedulesClock !== ssince) body.dailyBriefSchedules = cache.dailyBriefSchedules;
+    cache = body;
+  } catch { /* keep the last render */ }
+  if (cache) render(cache);
+}
+let sseOk = false, sseBackoff = 2000;
+function connectSSE() {
+  let es;
+  try { es = new EventSource("/api/events"); }
+  catch { setTimeout(connectSSE, sseBackoff); return; }
+  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  // Each frame is the whole map (every org).
+  es.addEventListener("dailyBriefs", (e) => {
+    let d;
+    try { d = JSON.parse(e.data); } catch { return; }
+    if (!cache) return void refresh();
+    briefsClock++;
+    cache.dailyBriefs = d;
+    renderBriefs(cache, Date.now());
+  });
+  es.addEventListener("dailyBriefSchedules", (e) => {
+    let d;
+    try { d = JSON.parse(e.data); } catch { return; }
+    if (!cache) return void refresh();
+    schedulesClock++;
+    cache.dailyBriefSchedules = d;
+    renderBriefs(cache, Date.now());
+  });
+  TurmaOrg.sse(es);
+  es.onerror = () => {
+    sseOk = false;
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(connectSSE, sseBackoff);
+      sseBackoff = Math.min(sseBackoff * 2, 30000);
+    }
+  };
+}
+TurmaOrg.subscribe(() => { if (cache) render(cache); });
+refresh();
+connectSSE();
+// The org list rides the agent payload, which this page does not live-patch, so a
+// slow poll keeps the header's org menu current; a fast one covers a dead stream.
+// The 30s repaint keeps "started Nm ago" and the next-run lookup current.
+setInterval(() => refresh(), 60000);
+setInterval(() => { if (!sseOk) refresh(); }, 15000);
+setInterval(() => { if (cache) renderBriefs(cache, Date.now()); }, 30000);
+</script>
+</body>
+</html>

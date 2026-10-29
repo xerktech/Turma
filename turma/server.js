@@ -17891,6 +17891,7 @@ const USAGE = htmlPage("usage.html");
 const SESSIONS = htmlPage("sessions.html");
 const BOARD = htmlPage("board.html");
 const INSIGHTS = htmlPage("insights.html");
+const BRIEF = htmlPage("brief.html");
 // Not an `htmlPage`: the login form is served `no-store` (a cached login page
 // is its own problem), so it has no conditional-GET path to carry an ETag for.
 const LOGIN = withHashedAssets(readAsset("login.html"));
@@ -19773,10 +19774,10 @@ const server = http.createServer(async (req, res) => {
       return sendPage(req, res, INSIGHTS);
     }
 
-    // The retired org brief page (XERK-2386): a bookmark lands on its successor.
+    // The Daily Brief page (XERK-2396). The URL was the retired org brief's
+    // (XERK-2386), so an old bookmark lands on its meeting-scheduled successor.
     if (req.method === "GET" && (url.pathname === "/brief" || url.pathname === "/brief.html")) {
-      res.writeHead(301, { Location: "/insights" });
-      return res.end();
+      return sendPage(req, res, BRIEF);
     }
 
     // The page was /history until it dropped cost and became token-only. Keep
