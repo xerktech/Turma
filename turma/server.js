@@ -18671,7 +18671,9 @@ const server = http.createServer(async (req, res) => {
     // cross-origin (hub-client.ts terminalUrl), and the dashboard's own
     // same-origin iframe would pass 'self' anyway. XFO is for old browsers;
     // CSP frame-ancestors wins where both are understood.
-    if (parts[0] !== "term") {
+    // /login is exempt too: the glasses' /term iframe is redirected there when it
+    // has no session cookie, and the form must render in that frame.
+    if (parts[0] !== "term" && url.pathname !== "/login") {
       res.setHeader("Content-Security-Policy", "frame-ancestors 'self'");
       res.setHeader("X-Frame-Options", "SAMEORIGIN");
     }
@@ -22814,6 +22816,18 @@ server.on("drop", () => {
   dropsSinceLog = 0;
 });
 
+// A browser-opened WebSocket names its page's origin; it must be the hub's own
+// (its Host, or the original Host a proxy forwarded). No Origin = not a browser
+// (curl, an agent), which the auth check alone governs. Origin "null" refuses.
+function sameOriginUpgrade(req) {
+  const origin = req.headers.origin;
+  if (origin === undefined) return true;
+  let host;
+  try { host = new URL(origin).host.toLowerCase(); } catch { return false; }
+  const fwd = String(req.headers["x-forwarded-host"] || "").split(",")[0].trim();
+  return [req.headers.host, fwd].some((h) => h && String(h).toLowerCase() === host);
+}
+
 // ---- WebSocket upgrades -----------------------------------------------------
 // Three kinds, all on this one port:
 //   /agent/control      — an agent's tunnel-agent registering its reverse tunnel
@@ -23234,6 +23248,13 @@ server.on("upgrade", async (req, socket, head) => {
   // re-sends the cached basic-auth credentials on same-origin WS upgrades (it
   // already authenticated to load the ttyd iframe assets).
   if (parts[0] === "term" && parts.length >= 2) {
+    // The terminal socket is cookie-authed and ttyd runs writable with no Origin
+    // check of its own, so a page on another origin (a same-site sibling sends
+    // the cookie) must not open it (XERK-2399).
+    if (!sameOriginUpgrade(req)) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      return socket.destroy();
+    }
     if (!userAuthorized(req)) {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       return socket.destroy();

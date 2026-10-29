@@ -337,14 +337,16 @@ retraction, `pushEnabled`.
     without credentials. Residual, accepted: the SAME-ORIGIN operator can still read `/token` — not an
     escalation on a single-user hub. Tests: the `XERK-314:` cases in `server.test.js`.
   - Tests: the `XERK-268:` cases in `server.test.js`.
-  - **Every response but `/term/*` carries `frame-ancestors 'self'` + `X-Frame-Options: SAMEORIGIN`**
-    (XERK-2399). `/term` is exempt because the glasses WebView frames a terminal cross-origin;
-    framing it there needs the session id plus a cookie partitioned to the embedding site.
-    Tests: `XERK-2399:` in `server.test.js`.
-  - **The WS upgrades take no Origin allowlist, by decision** (XERK-2399): the glasses WebView
-    opens `/live` + `/audio` cross-origin from a variable origin, and those take a ws-token a
-    cross-origin page cannot read (no `Allow-Credentials`). `/term` WS is cookie-authed, but the
-    HTTPS cookie is `Partitioned`, so another top-level site's socket does not carry it.
+  - **Every response but `/term/*` and `/login` carries `frame-ancestors 'self'` +
+    `X-Frame-Options: SAMEORIGIN`** (XERK-2399). The glasses WebView frames a terminal
+    cross-origin, and its iframe is 302'd to `/login` when it has no cookie, so both stay
+    frameable. Tests: `XERK-2399:` in `server.test.js`.
+  - **The `/term` WS upgrade refuses a browser Origin that is not the hub's own**
+    (`sameOriginUpgrade`: Host or X-Forwarded-Host; no Origin = not a browser, allowed). ttyd runs
+    writable with no `-O`, and CHIPS partitions by SITE, so a sibling subdomain carries the cookie.
+    The glasses reach `/term` only inside their iframe, whose origin is the hub's.
+  - **`/live` + `/audio` take no Origin check, by decision**: glasses open them cross-origin from a
+    variable origin, with a ws-token a cross-origin page cannot read (no `Allow-Credentials`).
 
 ### The agent registry's ceiling (XERK-272)
 

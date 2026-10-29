@@ -5581,14 +5581,50 @@ test("XERK-314: /api and /term reads do NOT get Allow-Credentials", async () => 
 // XERK-2399: no other site may frame the hub (clickjacking). /term/* is exempt:
 // the glasses WebView frames a session's terminal cross-origin.
 test("XERK-2399: hub pages refuse cross-origin framing; /term stays frameable", async () => {
-  for (const path of ["/", "/login", "/api/agents", "/healthz"]) {
+  for (const path of ["/", "/login.html", "/api/agents", "/healthz"]) {
     const res = await request("GET", path, { headers: userHeaders });
     assert.equal(res.headers["content-security-policy"], "frame-ancestors 'self'", path);
     assert.equal(res.headers["x-frame-options"], "SAMEORIGIN", path);
   }
-  const term = await request("GET", "/term/whatever/", { headers: userHeaders });
-  assert.equal(term.headers["content-security-policy"], undefined);
-  assert.equal(term.headers["x-frame-options"], undefined);
+  // A real navigation (Accept: text/html), incl. the unauthenticated redirect.
+  const nav = { accept: "text/html" };
+  for (const [path, headers] of [["/sessions", { ...userHeaders, ...nav }], ["/sessions", nav],
+                                 ["/app.css", nav], ["/nav.js", nav]]) {
+    const res = await request("GET", path, { headers });
+    assert.equal(res.headers["content-security-policy"], "frame-ancestors 'self'", path);
+    assert.equal(res.headers["x-frame-options"], "SAMEORIGIN", path);
+  }
+  // /term, and /login: an unauthenticated glasses /term iframe is sent there.
+  for (const path of ["/term/whatever/", "/login"]) {
+    const res = await request("GET", path, { headers: { ...nav } });
+    assert.equal(res.headers["content-security-policy"], undefined, path);
+    assert.equal(res.headers["x-frame-options"], undefined, path);
+  }
+});
+
+function termUpgradeStatus(origin) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(server.address().port, "127.0.0.1", () => {
+      socket.write("GET /term/nosuchsession/ws HTTP/1.1\r\nHost: hub.example\r\n" +
+        `Authorization: ${userHeaders.authorization}\r\n` +
+        (origin ? `Origin: ${origin}\r\n` : "") +
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+        "Sec-WebSocket-Key: dGVzdC1rZXktMDEyMzQ1Njc4OQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    });
+    let buf = "";
+    socket.on("data", (c) => { buf += c; });
+    socket.on("close", () => resolve(buf.split("\r\n")[0]));
+    socket.on("error", reject);
+  });
+}
+
+test("XERK-2399: the /term socket refuses a page on another origin", async () => {
+  // The id is unknown, so a request that passes the origin check is a 404.
+  assert.match(await termUpgradeStatus("https://evil.example.com"), / 403 /);
+  assert.match(await termUpgradeStatus("https://sibling.hub.example"), / 403 /);
+  assert.match(await termUpgradeStatus("null"), / 403 /);
+  assert.match(await termUpgradeStatus("https://hub.example"), / 404 /);
+  assert.match(await termUpgradeStatus(null), / 404 /, "no Origin = not a browser");
 });
 
 test("XERK-314: login and logout keep Allow-Credentials for the glasses cookie plant", async () => {
