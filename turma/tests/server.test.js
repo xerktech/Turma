@@ -20144,7 +20144,7 @@ const asAuth = (tok) => ({ authorization: `Bearer ${tok}` });
 // Age a record past the "still beating" window, as a restart would.
 const quiet = (host) => { agents[host].lastSeen = Date.now() - 10 * 60 * 1000; };
 const forget2381 = (...hosts) => {
-  for (const h of hosts) delete agents[h];
+  for (const h of hosts) { delete agents[h]; delete hub.nameTokenGens()[h]; }
   const ids = hub.agentIdentities();
   for (const [u, e] of Object.entries(ids)) if (hosts.includes(e.origin)) delete ids[u];
 };
@@ -27716,7 +27716,8 @@ test("XERK-2381: removing a host releases its name for a reinstall", async () =>
 });
 
 test("XERK-2383: Remove host with ?identity=revoke retires the agent's identity token at once", async () => {
-  await beatAs("rev2383", asAuth(hostAgentToken("rev2383")));
+  const nameTok = hostAgentToken("rev2383");
+  await beatAs("rev2383", asAuth(nameTok));
   const tok = enrollUid("rev2383");
   const uid = tokenUid(tok);
   assert.equal((await beatAs("rev2383", asAuth(tok))).status, 200);
@@ -27740,6 +27741,7 @@ test("XERK-2383: Remove host with ?identity=revoke retires the agent's identity 
     const del = await request("DELETE", "/api/agents/rev2383?identity=revoke", { headers: userHeaders });
     assert.equal(del.status, 200, JSON.stringify(del.body));
     assert.equal(del.body.identitiesRevoked, 1);
+    assert.equal(del.body.nameTokenRevoked, true);
     assert.equal(hub.agentIdentities()[uid], undefined);
     assert.equal(((await hub.liveStore.get("policy:agentIdentities")) || {})[uid], undefined,
       "the revoke is persisted");
@@ -27758,7 +27760,13 @@ test("XERK-2383: Remove host with ?identity=revoke retires the agent's identity 
   assert.equal((await beatAs("rev2383-elsewhere", asAuth(tok))).status, 403);
   assert.equal(agentWsAuthorized(new URL(`http://x/agent/control?name=rev2383&token=${tok}`), { headers: {} }, "rev2383"), false);
   assert.equal(resolveEnrollToken({ headers: asAuth(tok) }, "rev2383").status, 403);
-  // The reinstall path: re-provision on the name token, which enrolls a fresh identity.
+  // The name token this machine held is dead too (XERK-2384): a revoke bumps its
+  // generation, so a backup of the old env file does not get back in...
+  assert.equal(hub.nameTokenGen("rev2383"), 1);
+  assert.notEqual(hostAgentToken("rev2383"), nameTok);
+  assert.equal((await beatAs("rev2383", asAuth(nameTok))).status, 401);
+  assert.equal(resolveEnrollToken({ headers: asAuth(nameTok) }, "rev2383").status === 200, false);
+  // ...and the reinstall path re-provisions on the NEXT name token, which enrolls a fresh identity.
   assert.equal((await beatAs("rev2383", asAuth(hostAgentToken("rev2383")))).status, 200);
   assert.notEqual(enrollUid("rev2383"), tok);
   forget2381("rev2383");
@@ -27810,6 +27818,57 @@ test("XERK-2383: revoking a renamed agent keeps its original name's token retire
   forget2381("orig2383", "new2383");
 });
 
+test("XERK-2384: an identity revoke whose name-token bump cannot be saved removes nothing", async () => {
+  await beatAs("bump2384", asAuth(hostAgentToken("bump2384")));
+  const tok = enrollUid("bump2384");
+  await beatAs("bump2384", asAuth(tok));
+  const store = new FileLiveStore();
+  store.flush = () => {};
+  hub.__setLiveStore(store, false);
+  let del;
+  try {
+    del = await request("DELETE", "/api/agents/bump2384?identity=revoke", { headers: userHeaders });
+  } finally {
+    hub.__setLiveStore(hub.liveStore, false);
+    store.close();
+  }
+  assert.equal(del.status, 503);
+  assert.ok(agents.bump2384, "the host is still there");
+  assert.equal((await beatAs("bump2384", asAuth(tok))).status, 200, "its identity still works");
+  assert.equal(hub.nameTokenGen("bump2384"), 0);
+  forget2381("bump2384");
+});
+
+test("XERK-2384: a plain Remove bumps no name-token generation", async () => {
+  const nameTok = hostAgentToken("plain2384");
+  await beatAs("plain2384", asAuth(nameTok));
+  assert.equal((await request("DELETE", "/api/agents/plain2384", { headers: userHeaders })).status, 200);
+  assert.equal(hub.nameTokenGen("plain2384"), 0);
+  // A briefly offline host removed by hand comes back on the token it holds.
+  assert.equal((await beatAs("plain2384", asAuth(nameTok))).status, 200);
+  forget2381("plain2384");
+});
+
+test("XERK-2384: a full generations registry still revokes the identity, and says the name token was not", async () => {
+  await beatAs("cap2384", asAuth(hostAgentToken("cap2384")));
+  const tok = enrollUid("cap2384");
+  await beatAs("cap2384", asAuth(tok));
+  const gens = hub.nameTokenGens();
+  const filler = [];
+  for (let i = 0; Object.keys(gens).length < 4096; i++) { gens[`capfill2384-${i}`] = { gen: 1, at: 1 }; filler.push(`capfill2384-${i}`); }
+  let del;
+  try {
+    del = await request("DELETE", "/api/agents/cap2384?identity=revoke", { headers: userHeaders });
+  } finally {
+    for (const h of filler) delete gens[h];
+  }
+  assert.equal(del.status, 200, JSON.stringify(del.body));
+  assert.equal(del.body.identitiesRevoked, 1);
+  assert.equal(del.body.nameTokenRevoked, false);
+  assert.equal((await beatAs("cap2384", asAuth(tok))).status, 403, "the identity is revoked regardless");
+  forget2381("cap2384");
+});
+
 test("XERK-2383: a mistyped identity param or an unknown host revokes nothing", async () => {
   await beatAs("typo2383", asAuth(hostAgentToken("typo2383")));
   const tok = enrollUid("typo2383");
@@ -27829,7 +27888,9 @@ test("XERK-2383: revoking a host with no identity token refuses and removes noth
   const del = await request("DELETE", "/api/agents/norev2383?identity=revoke", { headers: userHeaders });
   assert.equal(del.status, 409);
   assert.match(del.body.error, /no agent identity token to revoke/);
+  assert.match(del.body.error, /revoke-name-token/, "it names the per-host name-token revoke");
   assert.ok(agents.norev2383, "the host is still there");
+  assert.equal(hub.nameTokenGen("norev2383"), 0, "a refused revoke bumps nothing");
   // Another host's identity is untouched by a revoke aimed elsewhere.
   const other = enrollUid("keep2383");
   await beatAs("keep2383", asAuth(other));

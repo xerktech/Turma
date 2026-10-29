@@ -117,8 +117,12 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
         un-retired the OLD name's token, so revoking the new name re-opened the old one (QA).
         A plain Remove of the origin name drops the tombstone, as it releases any name.
         `trimAgentIdentities` never evicts one, and a master enroll for that name mints afresh.
-      - The revoked host's OWN name token is un-retired on purpose (it is the re-provision path).
-        Name tokens are deterministic, so one the machine ever held works again: residual.
+      - The revoked host's OWN name token is un-retired on purpose (it is the re-provision path),
+        so the revoke first bumps its name-token GENERATION (XERK-2384, below): the one the machine
+        held stays dead, `--agent-token` mints the next. A bump that cannot be saved is a 503
+        that removes nothing.
+        A FULL generations registry (409) never blocks it: the identity is still revoked and the
+        reply says `nameTokenRevoked:false`. A plain Remove bumps nothing (a blipped host returns).
       - Written through to disk before the 200 (the file store debounces 5s; a kill lost it).
       - `identityBound` (hub-derived, only `true` sent, forged copy stripped) gates the button.
       - Never make it Remove's default: it locks a briefly offline host out (the XERK-2381 bug).
@@ -134,8 +138,7 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
       - Never evict an entry: dropping one REVIVES every token it revoked (refused past the cap).
       - `--agent-token <host>` must print the CURRENT generation; under HA it reads the shared
         store and refuses to print rather than fall back to gen 0.
-      - It revokes no identity token; an explicit identity revoke (XERK-2383) should also call
-        `bumpNameTokenGen`, since un-retiring the name token is otherwise the way back in.
+      - The route revokes no identity token; `?identity=revoke` (above) bumps it as well.
     - A beat that renames carries the old record over (commands, org binding, alerts), drops every
       other record bound to the id (HA ghosts too), re-points ticket pins, appends `formerNames`.
     - Hub-owned, never served: `agentUid`, `uidBound` (ttydAuth's which-token), `formerNames`;
