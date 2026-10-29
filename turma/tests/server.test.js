@@ -1969,7 +1969,7 @@ test("agentRecordSize bounds known keys too, and ignores the stripped caches", (
 
 test("safeAgentsCache serves something rather than failing the fleet payload", () => {
   // Unguarded, a serialization failure here reached the route's generic catch
-  // as a 400 — to every dashboard, Android and glasses client, and permanently,
+  // as a 400 — to every dashboard and Android client, and permanently,
   // because the records causing it live for PRUNE_AFTER_MS.
   // A host must actually be present, or "last good == degraded" is vacuously
   // true and the assertion below proves nothing.
@@ -2077,8 +2077,8 @@ test("sessionWorking: a dead host's session is not still working (XERK-235)", ()
 
 test("http: /api/agents degrades instead of 400ing when the fleet cannot serialize", async () => {
   // The failure this replaces was permanent: buildAgentsCache threw past V8's
-  // string ceiling, the route's generic catch answered 400 to every dashboard,
-  // Android and glasses client, and the records causing it live for a week.
+  // string ceiling, the route's generic catch answered 400 to every dashboard
+  // and Android client, and the records causing it live for a week.
   const boom = { key: "boom-route", device: "boom-route", lastSeen: Date.now() };
   boom.self = boom; // circular: the cheap stand-in for the RangeError
   agents["boom-route"] = boom;
@@ -4412,9 +4412,9 @@ test("http: login page is public; /api/login sets a working session cookie", asy
   assert.match((out.headers["set-cookie"] || [])[0] || "", /Max-Age=0/);
 });
 
-test("http: over HTTPS the session cookie is SameSite=None; Secure; Partitioned (cross-site iframe embed)", async () => {
+test("http: over HTTPS the session cookie is SameSite=Lax; Secure", async () => {
   // Simulate the Cloudflare-tunnel HTTPS hop so the cookie takes its
-  // production form, which the embedded-dashboard iframe on the phone needs.
+  // production form.
   const ok = await request("POST", "/api/login", {
     body: { username: "hubuser", password: "hubpass" },
     headers: { "x-forwarded-proto": "https" },
@@ -4423,11 +4423,10 @@ test("http: over HTTPS the session cookie is SameSite=None; Secure; Partitioned 
   const setCookie = (ok.headers["set-cookie"] || [])[0] || "";
   assert.match(setCookie, /^hub_session=/);
   assert.match(setCookie, /HttpOnly/);
-  assert.match(setCookie, /SameSite=None/);
+  assert.match(setCookie, /SameSite=Lax/);
   assert.match(setCookie, /Secure/);
-  assert.match(setCookie, /Partitioned/);
-  // Lax must NOT appear — it would shadow None and break the iframe embed.
-  assert.doesNotMatch(setCookie, /SameSite=Lax/);
+  assert.doesNotMatch(setCookie, /SameSite=None/);
+  assert.doesNotMatch(setCookie, /Partitioned/);
 });
 
 test("http: unauthenticated HTML navigation redirects to /login (no Basic popup)", async () => {
@@ -4462,8 +4461,8 @@ test("http: an old agent's bare-string usage models are coerced on ingest", asyn
   // the dashboard's shortModels() read `m.model` off a string, threw mid-render,
   // and left NO host cards at all (so "All orgs" showed nothing while filtering
   // to any single org still worked, since that excluded the old host). The
-  // coercion happens once, here at the hub's ingest boundary, so web, Android
-  // and glasses all see the current shape.
+  // coercion happens once, here at the hub's ingest boundary, so web and
+  // Android see the current shape.
   const legacy = { totals: { input: 1, output: 2, cacheWrite: 0, cacheRead: 0 },
                    models: ["claude-opus-5", "<synthetic>", ""] };
   assert.equal(
@@ -4584,7 +4583,7 @@ test("XERK-282: a heartbeat cannot publish a record under another host's key", a
   // `key` is hub-owned — the registry identity every client keys hosts by and
   // every control routes on. A heartbeat that echoes a `key` field must not
   // override it, or one agent's payload is served under another host's key and
-  // silently displaces the victim on the dashboard/Android/glasses.
+  // silently displaces the victim on the dashboard/Android.
   assert.equal((await request("POST", "/api/heartbeat", {
     body: { device: "victim-282", repos: [{ name: "Turma" }] }, headers: agentHeaders,
   })).status, 200);
@@ -4927,7 +4926,7 @@ test("http: an agent's subscription limits reach the clients, and clear again", 
 
 test("http: a malformed limits block is coerced at ingest, not fanned out", async () => {
   // Same reason the per-model usage lists are coerced here: this block reaches
-  // web, Android and glasses, and Android decodes it into TYPED fields — a
+  // web and Android, and Android decodes it into TYPED fields — a
   // `usedPct` of "lots" from one buggy host would fail the decode of the WHOLE
   // fleet payload, not just its own card.
   const beat = (body) =>
@@ -5537,78 +5536,20 @@ test("findSession routes a sessionId to its host and ttyd port", async () => {
   assert.equal(findSession("nope"), null);
 });
 
-// ---- CORS on /api and /term (glasses WebView client) --------------------------
+// ---- no CORS ------------------------------------------------------------------
+// No cross-origin client exists, so the hub sends no CORS headers: a page on
+// another origin can never read /api or /term (e.g. /term/<id>/token, which
+// returns the host's agent credential) off a logged-in operator's cookie.
 
-test("CORS: OPTIONS preflight on /api/* answers 204 with the CORS headers, no auth required", async () => {
-  const res = await request("OPTIONS", "/api/agents", { headers: { origin: "http://glasses.local" } });
-  assert.equal(res.status, 204);
-  assert.equal(res.raw, "");
-  assert.equal(res.headers["access-control-allow-origin"], "http://glasses.local");
-  assert.equal(res.headers["vary"], "Origin");
-  // XERK-314: credentialed CORS is NOT offered on ordinary reads — only the
-  // cookie-planting login/logout endpoints get Allow-Credentials.
-  assert.equal(res.headers["access-control-allow-credentials"], undefined);
-  assert.equal(res.headers["access-control-allow-headers"], "Authorization, Content-Type");
-  assert.equal(res.headers["access-control-allow-methods"], "GET, POST, DELETE, OPTIONS");
-});
-
-test("CORS: OPTIONS preflight on /term/* also answers 204 without auth", async () => {
-  const res = await request("OPTIONS", "/term/whatever", { headers: { origin: "http://glasses.local" } });
-  assert.equal(res.status, 204);
-  assert.equal(res.headers["access-control-allow-origin"], "http://glasses.local");
-});
-
-// XERK-314: /term/<id>/token hands the browser the host's agent credential, and
-// the CORS reflection + Allow-Credentials on the whole /api|/term surface let an
-// attacker page read it cross-origin off a logged-in victim's cookie. The fix
-// confines Allow-Credentials to the cookie-planting login/logout endpoints, so a
-// cross-origin credentialed read of any other route is blocked by the browser.
-test("XERK-314: /api and /term reads do NOT get Allow-Credentials", async () => {
-  for (const path of ["/api/agents", "/term/whatever", "/term/sl7/token"]) {
-    const res = await request("GET", path, {
-      headers: { ...userHeaders, origin: "http://evil.example" },
-    });
-    assert.equal(
-      res.headers["access-control-allow-credentials"], undefined,
-      `${path} must not offer credentialed CORS`,
-    );
-    // Reflection stays (glasses' Authorization-header reads rely on it), but a
-    // browser cannot turn it into a credentialed read without Allow-Credentials.
-    assert.equal(res.headers["access-control-allow-origin"], "http://evil.example");
+test("CORS: no route reflects an Origin or answers a preflight", async () => {
+  for (const path of ["/api/agents", "/term/whatever", "/term/sl7/token", "/api/login", "/api/logout"]) {
+    const pre = await request("OPTIONS", path, { headers: { origin: "http://evil.example" } });
+    assert.notEqual(pre.status, 204, `${path} must not answer a CORS preflight`);
+    assert.equal(pre.headers["access-control-allow-origin"], undefined);
+    const res = await request("GET", path, { headers: { ...userHeaders, origin: "http://evil.example" } });
+    assert.equal(res.headers["access-control-allow-origin"], undefined, `${path} must not reflect Origin`);
+    assert.equal(res.headers["access-control-allow-credentials"], undefined);
   }
-});
-
-test("XERK-314: login and logout keep Allow-Credentials for the glasses cookie plant", async () => {
-  for (const path of ["/api/login", "/api/logout"]) {
-    const res = await request("OPTIONS", path, { headers: { origin: "http://glasses.local" } });
-    assert.equal(res.status, 204);
-    assert.equal(res.headers["access-control-allow-origin"], "http://glasses.local");
-    assert.equal(
-      res.headers["access-control-allow-credentials"], "true",
-      `${path} must keep credentialed CORS`,
-    );
-  }
-});
-
-test("CORS: authenticated GET on /api reflects Origin + Vary", async () => {
-  const res = await request("GET", "/api/agents", {
-    headers: { ...userHeaders, origin: "http://glasses.local" },
-  });
-  assert.equal(res.status, 200);
-  assert.equal(res.headers["access-control-allow-origin"], "http://glasses.local");
-  assert.equal(res.headers["vary"], "Origin");
-});
-
-test("CORS: request without Origin gets no CORS headers", async () => {
-  const res = await request("GET", "/api/agents", { headers: userHeaders });
-  assert.equal(res.status, 200);
-  assert.equal(res.headers["access-control-allow-origin"], undefined);
-  assert.equal(res.headers["vary"], undefined);
-});
-
-test("CORS: non-/api /term path gets no CORS headers even with Origin", async () => {
-  const res = await request("GET", "/login", { headers: { origin: "http://glasses.local" } });
-  assert.equal(res.headers["access-control-allow-origin"], undefined);
 });
 
 // ---- session input endpoint -----------------------------------------------------
@@ -12140,7 +12081,7 @@ test("XERK-325: a host that triaged the ticket ELSEWHERE is not dispatched to ei
   await asBeat("tq325bOther", site, { autoStart: false, capacity: ROOMY,
     fetchedAt: "2026-07-14T12:00:00Z",
     tickets: [{ key: "ENG-5", statusCategory: "todo",
-                repoGuess: { repo: "Veiller", cloned: true } }] });
+                repoGuess: { repo: "Tenir", cloned: true } }] });
   // Fresher, so ticketRepo publishes "Turma" — which is what the card shows.
   await asBeat("tq325bTurma", site, { autoStart: false, capacity: ROOMY,
     fetchedAt: "2026-07-14T12:05:00Z",
@@ -12229,7 +12170,7 @@ test("XERK-325: an OFFLINE host's fresher triage never dictates the repo", async
   await asBeat("tq325gDown", site, { autoStart: false, capacity: ROOMY,
     fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
     tickets: [{ key: "ENG-5", statusCategory: "todo",
-                repoGuess: { repo: "Veiller", cloned: true } }] });
+                repoGuess: { repo: "Tenir", cloned: true } }] });
   agents.tq325gDown.lastSeen = Date.now() - 10 * 60 * 1000;
   await asBeat("tq325gUp", site, { autoStart: false, capacity: ROOMY,
     fetchedAt: "2026-07-14T12:00:00Z",                                // staler
@@ -12271,7 +12212,7 @@ test("XERK-325: 'slots full' names the hosts that can actually run it", async ()
   await asBeat("tq325iDisagreesFree", site, { autoStart: false, capacity: ROOMY,
     fetchedAt: "2026-07-14T12:00:00Z",
     tickets: [{ key: "ENG-5", statusCategory: "todo",
-                repoGuess: { repo: "Veiller", cloned: true } }] });
+                repoGuess: { repo: "Tenir", cloned: true } }] });
   const r = await startTicket(site, "ENG-5");
   // Still a capacity wait — the one host that can run it really is full, and
   // that reason clears itself — but worded truthfully.
@@ -12464,10 +12405,10 @@ test("XERK-325: the sweep and drain honour the newer `updated` too, not just the
                 triage: { priority: "P2", type: "task", actionable: true } }] });
   // Fresher block, older copy — the answer a block rank would give.
   await asBeat("tq325rRank", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
-    fetchedAt: "2026-07-14T12:30:00Z", repos: ["Veiller"],
+    fetchedAt: "2026-07-14T12:30:00Z", repos: ["Tenir"],
     tickets: [{ key: "ENG-5", statusCategory: "todo",
                 updated: "2026-07-14T08:00:00.000+0000",
-                repoGuess: { repo: "Veiller", cloned: true },
+                repoGuess: { repo: "Tenir", cloned: true },
                 triage: { priority: "P2", type: "task", actionable: true } }] });
   // The DRAIN route.
   assert.ok(enqueueTicketStart(site, "ENG-5", "manual"));
@@ -12574,9 +12515,9 @@ test("XERK-325: a copy with NO `updated` never overrides one that has it", async
   // block. The copy that HAS an `updated` is still the row.
   const site2 = "tq325w.atlassian.net";
   await asBeat("tq325wNull", site2, { autoStart: false, capacity: ROOMY, user: "b@x.com",
-    fetchedAt: "2026-07-14T12:30:00Z", repos: ["Veiller"],
+    fetchedAt: "2026-07-14T12:30:00Z", repos: ["Tenir"],
     tickets: [{ key: "ENG-5", statusCategory: "todo", updated: null,
-                repoGuess: { repo: "Veiller", cloned: true } }] });
+                repoGuess: { repo: "Tenir", cloned: true } }] });
   await asBeat("tq325wReal", site2, { autoStart: false, capacity: ROOMY, user: "a@x.com",
     fetchedAt: "2026-07-14T12:00:00Z", repos: ["Turma"],
     tickets: [{ key: "ENG-5", statusCategory: "todo",
@@ -16982,7 +16923,7 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
   assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
   const ctrlFrames = collectControlFrames(ctrl.socket, ctrl.leftover);
 
-  // The glasses live socket.
+  // The live socket.
   const token = await issueToken();
   const live = await wsConnect(`/live/livehost/ls1?auth=${token}`);
   assert.match(live.statusLine, /^HTTP\/1\.1 101/);
@@ -24493,7 +24434,7 @@ test("the drift warning is rate-limited per host, and capped on both sides", () 
 
 
 test("a models block with no usable label cannot clear a real host's label", async () => {
-  // `mergeSites` (board.js, its vendored copies, and Board.kt) writes the label
+  // `mergeSites` (board.js and Board.kt) writes the label
   // whenever `at` is at least the incumbent's, so a block with a FRESH `at` and an
   // empty label takes "Opus 5" off a host that probed properly — the picker drops
   // to "Default". A real agent reaches this honestly: the probe returns

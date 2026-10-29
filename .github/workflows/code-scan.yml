@@ -26,7 +26,7 @@ name: code-scan
 on:
   # No paths filter: the main ruleset REQUIRES this workflow's "Unit tests"
   # check (XERK-1542), and a required check that never starts blocks the PR
-  # forever — a glasses- or docs-only PR would be unmergeable. Semgrep scans the
+  # forever — a docs-only PR would be unmergeable. Semgrep scans the
   # whole tree and the size gate guards CLAUDE.md/.claude/rules, so every PR is
   # in scope for at least one job anyway.
   pull_request:

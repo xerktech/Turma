@@ -229,7 +229,7 @@ answer reports a cheap model doing well at reading.
 
 ### Yield
 
-From 1,628 transcripts: **57 curated tasks** (Turma 27, Tenir 29, Veiller 1).
+From 1,628 transcripts: **57 curated tasks** (Turma 27, Tenir 29, other 1).
 Drops, in order: 288 repo not cloned locally, 149 no merge commit for the ticket
 key, 114 no ticket key, **51 answer leak**, 17 no impl+test pair, 7 no derivable
 test command, 6 no usable intent, 6 duplicate sessions.
@@ -243,7 +243,7 @@ which proves red-with-fix-reverted and green-with-fix:
 |---|---|---|
 | Turma | **25** | 27 |
 | Tenir | 0 | 29 — blocked on XERK-449, see Limitations |
-| Veiller | 0 | 1 — suite exceeded the cap |
+| other | 0 | 1 — suite exceeded the cap |
 | **total** | **25** | 57 |
 
 **`bench/archive/tasks-validated.json` is the eval set** — 25 tasks, each proven

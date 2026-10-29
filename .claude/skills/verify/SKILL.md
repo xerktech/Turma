@@ -1,6 +1,6 @@
 ---
 name: verify
-description: Exercise a Turma change end-to-end — boot the hub, feed it a real agent payload, drive the UI in a browser. Use when verifying changes to turma/, agent/, glasses/ or android/.
+description: Exercise a Turma change end-to-end — boot the hub, feed it a real agent payload, drive the UI in a browser. Use when verifying changes to turma/, agent/ or android/.
 ---
 
 # Verifying Turma changes
@@ -14,7 +14,6 @@ agent container; each notes the trap that ate the time.
 ```bash
 cd turma   && node --test tests/*.test.js          # ~60s, 189 tests
 cd agent   && python3 -m unittest tests.test_hub_agent   # ~1s, 293 tests. NO pytest installed.
-cd glasses && npm ci --cache /tmp/claude-1000/npm-cache && npm run typecheck && npx vitest run
 cd android && gradle testDebugUnitTest --offline   # JVM unit tests
 cd android && ANDROID_USER_HOME=/tmp/claude-1000/andhome gradle assembleDebug --offline
 ```

@@ -252,5 +252,5 @@ What changed:
   migration re-validates against the TARGET's discovered set, falling back to its
   default when it serves a different set.
 
-Phase 3 (the UI dropdown + context override + Android/glasses parity) and Phase 4
+Phase 3 (the UI dropdown + context override + Android parity) and Phase 4
 (the context-fullness meter) build on this and ship as their own PRs.

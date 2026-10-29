@@ -56,8 +56,7 @@ _No changes._
 
 ## 0.3.0 — 2026-07-16
 
-First release of the unified pipeline: one `v<MAJOR>.<MINOR>.<PATCH>` tag carrying all five
-components (turma image, agent image, glasses `.ehpk`, android `.apk`, native tarball) plus a
-changelog, replacing the five per-component release streams whose versions had drifted out of
-lockstep. Pre-`0.3.0` history lives under the legacy `glasses-v*` / `android-v*` /
-`agent-native-v*` tags.
+First release of the unified pipeline: one `v<MAJOR>.<MINOR>.<PATCH>` tag carrying all four
+components (turma image, agent image, android `.apk`, native tarball) plus a
+changelog, replacing the per-component release streams whose versions had drifted out of
+lockstep. Pre-`0.3.0` history lives under the legacy per-component `<name>-v*` tags.

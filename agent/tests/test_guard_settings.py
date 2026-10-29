@@ -1001,7 +1001,7 @@ class TestLimitsSettings(unittest.TestCase):
         # the two sessions' permission-mode classes differ — and bypassPermissions
         # is a class of its own — by opening an approval dialog in the RECEIVING
         # session's pane. Nothing in Turma answers that dialog (it is not an
-        # AskUserQuestion, so the glasses bridge never sees it), and meanwhile it
+        # AskUserQuestion, so the ask bridge never sees it), and meanwhile it
         # owns the input line the chat composer types into.
         self.assertEqual(ha.build_guard_settings()["crossSessionInbound"],
                          "accept")

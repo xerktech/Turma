@@ -243,8 +243,8 @@ This file is the operative rules for what has shipped; the routing policy is `mo
       not a top-level `.md`, or an agent/skill/command whose frontmatter MENTIONS hook/mcp or holds a
       backslash (a YAML escape). Paths compare case-folded (macOS opens `.CLAUDE/`).
       **Judge bytes, never parse YAML**: a parser was beaten by quoted/complex keys, a BOM, a
-      nested dir, a non-ASCII (quoted) name and a symlinked dir. Today it refuses Veiller
-      (gitlink) and Tenir (Edit/WebFetch allows). No `Skill` tool (a typed skill's hooks run outside
+      nested dir, a non-ASCII (quoted) name and a symlinked dir. Today it refuses Tenir
+      (Edit/WebFetch allows). No `Skill` tool (a typed skill's hooks run outside
       the sandbox; a preload registers none, so the skills gate is defence in depth); fileguard refuses `.claude` at any depth; `--agents` is capped (E2BIG).
   - **So the shadow cannot commit**: the manager does (`_advance_shadow_run`), on
     `turma-shadow/<id>`, with git hardened against the tree (`core.fsmonitor=false`, no hooks,

@@ -38,8 +38,8 @@ client context. Keep it outside the repo. Only `scrub.py` output is committable.
 | `classify.py` | classifies every turn and reports the split, weighted by tokens |
 | `curate.py` | builds replay tasks from sessions that landed a merge commit |
 | `scrub.py` | redacts secrets and marks client-sensitive tasks `local-only` |
-| `tasks-archive.json` | the full curated pool, 57 accepted tasks |
-| `tasks-validated.json` | **the eval set** — 47 tasks (25 Turma + 22 Tenir) proven red-then-green and leak-free |
+| `tasks-archive.json` | the full curated pool, 37 accepted tasks |
+| `tasks-validated.json` | **the eval set** — 32 tasks (17 Turma + 15 Tenir) proven red-then-green and leak-free |
 
 Benchmark against `tasks-validated.json`. The pool file holds the curated tasks
 that did NOT pass validation as well as those that did — it does not hold the

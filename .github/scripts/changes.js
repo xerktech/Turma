@@ -11,7 +11,7 @@
 // WSL/Linux tarball) and `agent-windows` (the no-WSL Windows zip, XERK-666). A
 // change to the shared runtime (hub-agent.py, tunnel-agent.js, hooks/, mods/, qwen/,
 // runtime_*) ships to BOTH; the platform-specific shells build only their own.
-const COMPONENTS = ["turma", "agent-native", "agent-windows", "glasses", "android"];
+const COMPONENTS = ["turma", "agent-native", "agent-windows", "android"];
 
 // Top-level source dir -> the components ANY change under it can touch. This is
 // the ONLY map release.yml's push: filter mirrors (one `**` glob per prefix, a
@@ -22,7 +22,6 @@ const COMPONENTS = ["turma", "agent-native", "agent-windows", "glasses", "androi
 const PREFIX_MAP = [
   { prefix: "turma/", components: ["turma"] },
   { prefix: "agent/", components: ["agent-native", "agent-windows"] },
-  { prefix: "glasses/", components: ["glasses"] },
   { prefix: "android/", components: ["android"] },
 ];
 
@@ -50,8 +49,7 @@ const AGENT_SHARED = ["agent-native", "agent-windows"];
 // touches no component: it builds nothing and lands under "Other" in the
 // changelog. The turma image COPYs only server.js/archive.js/tar.js/push.js/
 // usage-ledger.js/public/ (turma/tests, turma/tools stay out); the native
-// tarball cp's a curated list that excludes agent/tests; the .ehpk packs from
-// dist (not glasses/tests); the .apk is built from app/src/main (not
+// tarball cp's a curated list that excludes agent/tests; the .apk is built from app/src/main (not
 // app/src/test). Checked longest-match FIRST, so an exclude always wins over the
 // bare prefix that contains it.
 //
@@ -65,7 +63,6 @@ const EXCLUDE_PREFIXES = [
   "turma/tools/",
   "agent/tests/",
   "agent/win/test/",
-  "glasses/tests/",
   "android/app/src/test/",
 ];
 

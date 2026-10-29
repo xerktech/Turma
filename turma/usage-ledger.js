@@ -194,8 +194,8 @@ const LEDGER_MAX = positiveEnv("USAGE_LEDGER_MAX", (() => {
 // How much of that may ride ONE /api/agents body as `retiredUsage`. The store's
 // own ceiling is not this bound: it covers the whole history including hosts that
 // are still live and therefore already in `agents`, and the fleet payload is
-// re-serialized per beat and fanned out to every dashboard, phone and pair of
-// glasses. Newest-first, so a truncation drops the oldest history rather than the
+// re-serialized per beat and fanned out to every dashboard and phone.
+// Newest-first, so a truncation drops the oldest history rather than the
 // spend anyone is looking at.
 const RETIRED_MAX = positiveEnv("USAGE_LEDGER_SERVE_MAX", 1 << 20);
 

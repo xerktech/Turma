@@ -71,7 +71,6 @@ function main() {
     build_turma: changed.turma,
     build_agent_native: changed["agent-native"],
     build_agent_windows: changed["agent-windows"],
-    build_glasses: changed.glasses,
     build_android: changed.android,
   });
 

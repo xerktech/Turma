@@ -17,11 +17,11 @@ import okhttp3.WebSocketListener
 import kotlin.coroutines.coroutineContext
 
 /**
- * Live transcript WebSocket — a port of glasses/src/live.ts. Streams a session's
+ * Live transcript WebSocket. Streams a session's
  * committed `tail` deltas and the in-progress `turn` from /live/<host>/<id>. A
  * fresh ws-token is fetched per (re)connect; reconnect uses capped exponential
  * backoff. Purely additive: if the socket never connects the caller falls back
- * to the /history poll, exactly as the web + glasses clients do.
+ * to the /history poll, exactly as the web client does.
  */
 sealed interface LiveEvent {
     /**

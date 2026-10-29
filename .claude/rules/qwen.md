@@ -15,7 +15,6 @@ paths:
   - "turma/public/board.js"
   - "turma/public/board.html"
   - "turma/tests/board.test.js"
-  - "glasses/src/vendor/board.cjs"
   - "android/**"
 ---
 

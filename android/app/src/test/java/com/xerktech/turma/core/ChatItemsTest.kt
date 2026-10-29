@@ -431,8 +431,8 @@ class ChatItemsTest {
     }
 
     @Test fun `degradedBlocks is LINEAR on bracket-heavy text that does not end in a marker`() {
-        // A regex `(?:\[…\])+$` backtracks O(n^2) here (the ReDoS the glasses
-        // twin hit, XERK-862/#835). "[x]"*N + "." has no trailing marker, so the
+        // A regex `(?:\[…\])+$` backtracks O(n^2) here (a ReDoS,
+        // XERK-862/#835). "[x]"*N + "." has no trailing marker, so the
         // whole thing must stay ONE bubble verbatim — and finish fast. A
         // quadratic scan would blow the timeout on this input length.
         val text = "[x]".repeat(200_000) + "."

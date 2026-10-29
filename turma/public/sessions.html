@@ -2376,7 +2376,7 @@ function sleepLabel(s, now) {
 }
 // A sleeper the hub paused to free its slot (XERK-1575): ended for now, but it
 // wakes on its own — the hub resumes it at its wake — so it never reads "killed".
-// null for an ordinary ended row. Android `endedStateText`, glasses `endedCardHtml`.
+// null for an ordinary ended row. Android `endedStateText`.
 function pausedLabel(p, now) {
   if (!p || !Number.isSafeInteger(p.wakeAt)) return null;
   const why = typeof p.wakeReason === "string" ? p.wakeReason.trim() : "";
@@ -2546,7 +2546,7 @@ function reviewState(s, live, now) {
 // The wait classifier's verdict on a needs-you card (XERK-1572): what kind of
 // wait it is and why, and the answer it suggests — the hub's `attention.hint`,
 // null when it serves none. Same words on the dashboard (index.html), Android
-// (`attentionHintLine`) and the glasses phone card.
+// (`attentionHintLine`).
 const HINT_KIND = {
   "rubber-stamp": "go-ahead", "design-decision": "decision", "needs-human-test": "needs a human test",
   "blocked-on-host": "blocked on the host", "looping": "looping", "waiting-external": "waiting on something outside",

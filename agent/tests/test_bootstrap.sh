@@ -214,8 +214,8 @@ fi
 # --- Case 5: a stream with no native asset fails clearly ---------------------
 echo "case: no native release found"
 fake="$(new_fake)"
-echo '[{"tag_name": "glasses-v0.2.22", "assets": [{"name": "turma-hud-v0.2.22.ehpk",
-  "browser_download_url": "https://github.com/o/r/releases/download/glasses-v0.2.22/turma-hud-v0.2.22.ehpk"}]}]' \
+echo '[{"tag_name": "android-v0.2.22", "assets": [{"name": "turma-android-v0.2.22.apk",
+  "browser_download_url": "https://github.com/o/r/releases/download/android-v0.2.22/turma-android-v0.2.22.apk"}]}]' \
   > "$fake/releases.json"
 if run_bootstrap "$fake"; then
   fail "claimed success with no native asset in the stream"

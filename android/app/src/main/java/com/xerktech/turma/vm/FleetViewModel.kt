@@ -36,7 +36,7 @@ import kotlinx.coroutines.launch
 /**
  * Owns the fleet state stream and every host/session mutation. Each mutation is
  * best-effort: it emits a transient [messages] toast and nudges the fleet to
- * re-poll so the change shows on the next beat (glasses nudgePoll pattern).
+ * re-poll so the change shows on the next beat.
  */
 class FleetViewModel(app: Application) : AndroidViewModel(app) {
     private val container = (app as TurmaApplication).container

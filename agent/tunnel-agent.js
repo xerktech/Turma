@@ -33,19 +33,19 @@ const TTYD_HOST = "127.0.0.1";
 const DEFAULT_TTYD_PORT = 7681;
 
 // ---- live transcript tail ---------------------------------------------------
-// The near-real-time path for the glasses' session screen. When a glasses
-// client is watching a session, the hub sends {"watch":<sessionId>,
+// The near-real-time path for a client's chat view. When a client is
+// watching a session, the hub sends {"watch":<sessionId>,
 // "worktreePath":<path>,"transcriptId":<id>} on the control channel — the id
 // naming which transcript in that cwd's project dir is the session's own (see
 // sessionTranscript). We then tail that ONE transcript every LIVE_TAIL_MS and
 // push {"tail":<sessionId>,"entries":[...]} deltas straight back on the same
-// control channel (the hub fans them out to the watching glasses).
+// control channel (the hub fans them out to the watching clients).
 // {"unwatch":<sessionId>} stops it. Tailing runs only while a session is
 // actively watched, so idle sessions cost nothing.
 //
 // The transcript read here is a deliberate re-implementation of hub-agent.py's
 // transcript_tail / _entry_text / _project_slug (same entry->text mapping,
-// ordering and dedup so the glasses get the same entries whether they arrive
+// ordering and dedup so a client gets the same entries whether they arrive
 // via this fast path or the 20s heartbeat). The one intentional difference:
 // this live path keeps the FULL per-message text (TAIL_MSG_CHARS below mirrors
 // the Python reading paths' TAIL_MSG_CHARS_FULL, not the heartbeat's smaller
@@ -54,15 +54,15 @@ const DEFAULT_TTYD_PORT = 7681;
 // entryBlocks() below is the same story: a line-for-line mirror of hub-agent.py
 // _entry_blocks(), the rich block feed the native chat UI renders (thinking,
 // tool inputs, tool outputs that entryText flattens away). entryText stays the
-// lossy backward-compat contract (glasses + heartbeat preview); entryBlocks is
+// lossy backward-compat contract (heartbeat preview); entryBlocks is
 // the additive rich contract. Both must be changed in lockstep.
 const PROJECTS_ROOT = process.env.CLAUDE_PROJECTS_ROOT || "/root/.claude/projects";
 const LIVE_TAIL_MS = Number(process.env.LIVE_TAIL_MS) || 1000;
 const TAIL_MSGS = Number(process.env.SESSION_TAIL_MSGS) || 30;
-// The live tail only runs while a glasses client is watching one session, so it
+// The live tail only runs while a client is watching one session, so it
 // carries the full message text — a long assistant response must not arrive cut
 // off mid-sentence. The heartbeat's transcript_tail ships a smaller per-message
-// preview (SESSION_TAIL_MSG_CHARS); the glasses keep whichever copy is longer.
+// preview (SESSION_TAIL_MSG_CHARS); a client keeps whichever copy is longer.
 const TAIL_MSG_CHARS = Number(process.env.SESSION_TAIL_MSG_CHARS_FULL) || 16000;
 const TAIL_READ_BYTES = 1 << 17; // ~128 KB, matches _tail_entries
 const MAX_WATCHERS = 16; // safety cap on concurrent live tails
@@ -458,7 +458,7 @@ function flattenText(raw) {
   return raw;
 }
 
-// One transcript entry -> glasses display text, or null to drop it (wrong
+// One transcript entry -> flat display text, or null to drop it (wrong
 // type, no message, tool_result-only turn, empty after ANSI strip). Mirrors
 // hub-agent.py _entry_text.
 function entryText(entry) {
@@ -911,7 +911,7 @@ function transcriptTail(worktreePath, cache, transcriptId, agentState) {
     const blocks = entryBlocks(entry, BLOCK_CAPS);
     // Rich path widens inclusion: a tool_result-only turn (text === null) still
     // has renderable blocks, so keep it for the chat UI. text stays the
-    // backward-compat flat string the glasses read.
+    // backward-compat flat string.
     if (text === null && (!blocks || blocks.length === 0)) continue;
     tail.push({
       id: entryId(entry),
@@ -1912,7 +1912,7 @@ function parsePaneLiveTurn(pane) {
     if (i > start && (/^[●❯]/.test(l) || isStatusLine(l) || isHintLine(l) || isChecklistLine(l))) break;
     block.push(i === start ? l.replace(/^●\s?/, "") : l.replace(/^ {1,3}/, ""));
   }
-  // Reflow the TUI's hard-wrapped lines into flowing text; the glasses re-wrap,
+  // Reflow the TUI's hard-wrapped lines into flowing text; the client re-wraps,
   // and the transcript delivers the authoritative structure on completion.
   const text = stripActivityTail(block.join(" ").replace(/\s+/g, " ").trim());
   return { generating: true, text, status, agents: [] };
@@ -2321,8 +2321,7 @@ function pollWatcher(sessionId) {
       // window on every transcript change — tens to hundreds of KB a second per
       // watched session, >95% of it bytes the browser already had, and the
       // change test was a string compare over those same huge strings. Every
-      // consumer of the frame (chat.js mergeTail, android mergeTail, the
-      // glasses buffer) is id-keyed and GROW-ONLY, so a delta merges exactly
+      // consumer of the frame (chat.js mergeTail, android mergeTail) is id-keyed and GROW-ONLY, so a delta merges exactly
       // like a snapshot did. `sent` is id -> the weight last sent, so an entry
       // that GREW (a tool_result landing on a turn already shipped) re-sends
       // and one that merely re-appeared in the window does not.
@@ -2897,7 +2896,7 @@ function connectControl() {
       const port = Number(msg.port) || DEFAULT_TTYD_PORT;
       openDataChannel(String(msg.open), port);
     } else if (msg.watch) {
-      // The hub re-sends a watch for every still-attached glasses client on
+      // The hub re-sends a watch for every still-attached client on
       // reconnect, and again whenever a watched session's transcript moves, so
       // startWatch is idempotent (it just refreshes the target).
       startWatch(String(msg.watch), msg.worktreePath ? String(msg.worktreePath) : "",

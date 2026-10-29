@@ -79,7 +79,7 @@ model. Tests: `TestResumableReport`, `TestResumeTranscript`, `TestTranscriptCwd`
     CLEAN. Tests: `TestPruneRepo`, `dashboard-prune.test.js`.
 - `refreshJira` — /board manual refresh (bypasses `JIRA_REFRESH_EVERY`), re-checks
   `jira_configured()`.
-- `input`/`history`/`answerQuestion` — chat composer + glasses client (below).
+- `input`/`history`/`answerQuestion` — chat composer (below).
 
 ### `input` / `send_input`, `notify_session`
 

@@ -6,8 +6,6 @@ paths:
   - "android/app/src/main/java/com/xerktech/turma/ui/FleetScreen.kt"
   - "android/app/src/main/java/com/xerktech/turma/ui/SessionsScreen.kt"
   - "android/app/src/main/java/com/xerktech/turma/core/Sessions.kt"
-  - "glasses/src/sessions.ts"
-  - "glasses/src/phone/render.ts"
   - "turma/tests/server.test.js"
   - "turma/tests/sessions.test.js"
   - "turma/tests/dashboard-tiles.test.js"
@@ -72,14 +70,13 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   needs-you list**: Ready for review is the one home for waiting work, so a second list on the
   dashboard (web or Android) would split it. The operator's call; don't add one.
   - **Where the hub serves attention it DECIDES the section** (`inReview`: sessions.html, Android
-    `core/Sessions.kt`, glasses `sessions.ts`): every `needs-you:*` session is listed — question,
+    `core/Sessions.kt`): every `needs-you:*` session is listed — question,
     permission, review, stalled (a stall whose own turn never finished included) — and a session
     it says is anything else is not. **No attention (an older hub) falls back to the page's own
-    `readyForReview` mirror**, so the five-mirror rule still decides there.
+    `readyForReview` mirror**, so the three-mirror rule still decides there.
   - **A session on an OFFLINE host falls back to `readyForReview` too** (its hub state is frozen
     at the last beat); a needs-you state it last had still lists it.
-  - Sorted by `since`, oldest first (`bySince`, Android `sortedBySince`, glasses phone
-    `render.ts`); a card with no `since` keeps its createdAt place after them.
+  - Sorted by `since`, oldest first (`bySince`, Android `sortedBySince`); a card with no `since` keeps its createdAt place after them.
 - **The dashboard tile is "Ready for review"** (worded as that section, hint "sessions waiting on
   you"), counting the SAME set off one helper (`needsYou(sess).length`; Android `fleetSummary`
   `waiting` via `needsYou`) — a questions-only count said 2 above a list of 4. Tiles don't link.
@@ -127,7 +124,7 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   wait keeps its label on EVERY branch ("· Sleep · 11m left"); with no ETA they add the time since the
   oldest wait row's `startedAt` ("· 12m").
 - **A sleeping card says what it will check**: "💤 sleeping until 22:31 · <wakeReason>" (`sleepLabel`
-  on both pages, Android `liveStateLabel`, glasses phone card); no reason = the time alone.
+  on both pages, Android `liveStateLabel`); no reason = the time alone.
 
 ## The wait classifier's verdict (XERK-1572)
 
@@ -156,14 +153,14 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
 - **Surfaces** — one wording (`HINT_KIND`: "decision · …", "needs a human test · …", then
   "Suggested: …"): the Ready-for-review cards on the Sessions page (`.att-hint`, from `reviewState`),
   the dashboard card's own unlabelled row (`attentionHintHtml`, needs-you only), Android
-  `attentionHintLine`/`attentionSuggested` on both cards, glasses phone card (`attentionHint`).
+  `attentionHintLine`/`attentionSuggested` on both cards.
 - **The verdict reads AFTER what it answers** on every card: below the question / permission row
   (dashboard, Android fleet card) as on the Sessions card — never inside the State row above it.
 - **`needs-you:test` is named "awaiting your test"**: the dashboard State row, the Sessions review
   card's headline (`reviewState`) and Android's `attentionLabel`, so it never reads as plain review.
 - **A looping card never reads "working"**: the dashboard State row (`liveState`, a `loop` + hub
   stall), the Sessions review card (`reviewState`), Android's fleet card and Sessions card dot
-  (`attentionStalled`) and the glasses phone card (`st-stalled`) speak the hub's stall.
+  (`attentionStalled`) speak the hub's stall.
 
 ## Nudges (XERK-1572)
 
@@ -186,8 +183,7 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   the agent's count, so the session reads working before it loops again; keying on the attention
   `since` would let a session that loops after every nudge be nudged forever.
 - Tests: the `XERK-1572:` cases in `server.test.js`, `attention:` in `sessions.test.js`, the loop +
-  State-row cases in `dashboard-livestate.test.js`, android `SessionsTest`/`AgentDecodeTest`, glasses
-  `sessions.test.ts`/`phone/render.test.ts`.
+  State-row cases in `dashboard-livestate.test.js`, android `SessionsTest`/`AgentDecodeTest`.
 
 ## The stalled alert
 
@@ -202,8 +198,7 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   session already stalled when the hub first judges it is not announced, as review isn't.
 - Tests: the `XERK-1571:` cases in `server.test.js`; `attention:` in `sessions.test.js`; the Ready
   for review tile case in `dashboard-tiles.test.js`; the wake + stall-age cases in
-  `dashboard-livestate.test.js`; glasses
-  `sessions.test.ts` + `phone/render.test.ts`; android `SessionsTest`, `SessionsFlattenTest`,
+  `dashboard-livestate.test.js`; android `SessionsTest`, `SessionsFlattenTest`,
   `AgentDecodeTest`.
 
 ## The wake directive
@@ -265,7 +260,7 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   once the host stops reporting it paused), the Sessions page Paused row (`pausedKill`, arm then
   confirm, pending kind `pausedKill`), and Android's `PausedCard` + Paused row
   (`FleetViewModel.killPaused`, pending `killPaused`). It ends as an ordinary killed session in
-  Ended. Glasses shows no control.
+  Ended.
 - **An operator Resume on a paused row holds off re-pausing until that wake**
   (`sleeperResumeHold`, set by the resume route): the carried wake makes it a sleeper again, and
   the next drain would otherwise pause it while the operator reads it.
@@ -312,15 +307,15 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   fires off the resume itself. `startedTicketKeys` reads closed records, so auto-start never
   re-dispatches its ticket meanwhile.
 - **It reads asleep, never "killed"**: "💤 paused until 14:05 · <reason>" (web `pausedLabel`,
-  Android `core/Sessions.kt` `pausedLabel`, glasses phone `pausedLabel`), in the sleeping
+  Android `core/Sessions.kt` `pausedLabel`), in the sleeping
   label's muted tone, with no "ended N ago" beside it. Resume on its row is an early wake.
 - **It is never hidden in the collapsed Ended history.** The Sessions list gives paused
   sleepers their own always-open **Paused** section above Ended, soonest wake first (web
-  `isPausedEntry` → `#paused`, Android `pausedEnded`, glasses `Paused` section).
+  `isPausedEntry` → `#paused`, Android `pausedEnded`).
 - **The dashboard keeps its card.** The host card's repo grid shows a `pausedCard` (Android
   `PausedCard`) beside the running ones, and the Running-sessions tile and host meta say
   "· N paused" (`pausedSleepers`; Android `FleetSummary.paused`). It holds no slot, so it
   is never in the running count — but a session must not vanish there as if killed.
 - Tests: the `XERK-1575:` cases in `server.test.js`, `sessions.test.js` and
-  `dashboard-tiles.test.js`, glasses `phone/render.test.ts`, android
+  `dashboard-tiles.test.js`, android
   `SessionsFlattenTest`/`AgentDecodeTest`/`FleetTest`.

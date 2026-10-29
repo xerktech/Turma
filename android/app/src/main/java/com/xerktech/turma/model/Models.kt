@@ -6,8 +6,7 @@ import kotlinx.serialization.json.JsonElement
 
 /**
  * Wire shapes mirrored from the Turma hub (turma/server.js `serializeAgent`,
- * the heartbeat session record, and the transcript `blocks[]`). Ported from
- * glasses/src/types.ts. Every field has a default and the shared [TurmaJson]
+ * the heartbeat session record, and the transcript `blocks[]`). Every field has a default and the shared [TurmaJson]
  * decoder ignores unknown keys, so an older/newer hub never breaks decoding.
  */
 
@@ -283,8 +282,8 @@ data class AgentInfo(
     // Shared Claude login health (XERK-98); null on an older agent.
     val claudeAuth: ClaudeAuth? = null,
     val lastSeen: Long = 0,
-    // ISO-8601 string on the wire (agent's now_iso()), NOT epoch — the hub, web
-    // client, and glasses all treat it as a string. Typing it Long made
+    // ISO-8601 string on the wire (agent's now_iso()), NOT epoch — the hub and web
+    // client both treat it as a string. Typing it Long made
     // kotlinx.serialization throw on the whole /api/agents payload.
     val startedAt: String = "",
     val online: Boolean = false,

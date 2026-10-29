@@ -6,7 +6,6 @@ paths:
   - "turma/public/chat.js"
   - "android/app/src/main/java/com/xerktech/turma/core/Sessions.kt"
   - "android/app/src/main/java/com/xerktech/turma/ui/CommonUi.kt"
-  - "glasses/src/sessions.ts"
   - "agent/hub-agent.py"
   - "agent/tunnel-agent.js"
   - "turma/tests/server.test.js"
@@ -16,16 +15,16 @@ paths:
   - "agent/tests/tunnel-agent.test.js"
 ---
 
-# Is a session "working"? — the five-mirror read (XERK-245, XERK-1570)
+# Is a session "working"? — the four-mirror read (XERK-245, XERK-1570)
 
 Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.py` ⇄
 `tunnel-agent.js`), the hub and every client, so it lives in a file scoped to all of them.
 
 ## Working is `paneBusy` OR live background WORK
 
-- **Five mirrors must agree**: `sessionWorking` in `turma/server.js`, `liveState` in
-  `turma/public/sessions.html` and `turma/public/index.html`, android `core/Sessions.kt`, and
-  `glasses/src/sessions.ts`. Change the rule → change all five in the same PR.
+- **Four mirrors must agree**: `sessionWorking` in `turma/server.js`, `liveState` in
+  `turma/public/sessions.html` and `turma/public/index.html`, and android `core/Sessions.kt`.
+  Change the rule → change all four in the same PR.
 - **A session that delegates work ENDS ITS OWN TURN**: the pane drops the interrupt hint, so
   `paneBusy` says False while an agent it launched keeps going — which read idle everywhere AND
   qualified as ready-for-review (XERK-245). The session's `agents[]` is the second input.
@@ -124,5 +123,5 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
   bar's verb is `Waiting…` (`backgroundBarVerb`, Android `ChatScreen.kt` mirrors it).
 - Tests: `TestShellKind`, `TestLiveAgentsScan` ↔ `scanAgentEntry` in `tunnel-agent.test.js`; the
   `XERK-1570:` cases in `server.test.js`; `background shell kinds` in `sessions.test.js`;
-  `dashboard-livestate.test.js`; `chat.test.js`; glasses `sessions.test.ts`; android `SessionsTest`,
+  `dashboard-livestate.test.js`; `chat.test.js`; android `SessionsTest`,
   `AgentDecodeTest`.

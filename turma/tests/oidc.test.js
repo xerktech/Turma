@@ -492,7 +492,7 @@ test("XERK-593: Basic-auth break-glass authorises headless callers with OIDC on"
 });
 
 test("XERK-593: a non-browser API caller gets 401, never a redirect into a browser flow", async () => {
-  // An XHR / header-auth client (glasses, curl) with no session must get a plain
+  // An XHR / header-auth client (curl) with no session must get a plain
   // 401 it can act on — being bounced to the IdP would be the XERK-585 shape.
   const res = await req("GET", "/api/agents");
   assert.equal(res.status, 401);

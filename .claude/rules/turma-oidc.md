@@ -9,7 +9,7 @@ paths:
 # OIDC relying-party in the hub (XERK-592, epic XERK-591)
 
 The hub can be a native OIDC relying-party against Authentik. XERK-592 is the RP **core** only.
-Read `.claude/rules/turma.md` "Auth and the glasses surface" for the auth model this plugs into.
+Read `.claude/rules/turma.md` "Auth" for the auth model this plugs into.
 
 ## What XERK-592 is, and is NOT
 
@@ -198,7 +198,7 @@ redirect they cannot complete, and the fleet went dead.
   (`agentWsAuthorized`). None of them ever reaches `humanLoginRedirect`. **Do not move the OIDC
   redirect earlier in the chain, and do not add an "OIDC middleware" wrapping the whole handler** —
   that is precisely the XERK-585 shape.
-- **A non-browser HUMAN caller (glasses, curl) still gets a plain 401, never a redirect** — the
+- **A non-browser HUMAN caller (curl, a script) still gets a plain 401, never a redirect** — the
   redirect is gated on `Accept: text/html` + GET. A WebSocket upgrade that fails auth is dropped at
   the socket (no HTTP body), so it is never an "interactive challenge" either.
 - **Break-glass is exempt and stays reachable with OIDC on** (XERK-595, `turma-break-glass.md`):

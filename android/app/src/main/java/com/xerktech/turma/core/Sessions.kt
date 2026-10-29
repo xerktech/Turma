@@ -10,9 +10,9 @@ import com.xerktech.turma.model.SessionInfo
 import kotlin.math.max
 
 /**
- * Session state derivation — a pure port of glasses/src/sessions.ts + the hub's
- * sessionWorking() (turma/server.js). Kept in Kotlin so the UI and any tests
- * agree on working/idle/waiting exactly as the web + glasses clients do.
+ * Session state derivation — a pure port of the hub's sessionWorking()
+ * (turma/server.js). Kept in Kotlin so the UI and any tests agree on
+ * working/idle/waiting exactly as the web client does.
  */
 
 private const val WORKING_WINDOW_MS = 90_000L

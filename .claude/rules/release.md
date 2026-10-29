@@ -15,13 +15,13 @@ paths:
 
 ## Unified releases
 
-- **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all five components + a changelog**, cut by
+- **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all four components + a changelog**, cut by
   `release.yml`. **Never split back into per-component workflows** — independent `run_number`
   patches drift out of lockstep.
 - `VERSION` holds `MAJOR.MINOR` only. **Patch is derived from existing `v*` tags** (max+1), never
   committed. Bump `VERSION` only for minor/major.
-- Five components: `turma` (hub) image, native agent tarball (`agent-native`), the no-WSL Windows
-  agent zip (`agent-windows`), glasses `.ehpk`, android `.apk`. All version math lives in tested
+- Four components: `turma` (hub) image, native agent tarball (`agent-native`), the no-WSL Windows
+  agent zip (`agent-windows`), android `.apk`. All version math lives in tested
   `.github/scripts`.
 - **`agent-native` and `agent-windows` are two builds off ONE shared runtime** (XERK-666):
   `changes.js`'s `AGENT_RULES` splits `agent/` into native-only (`agent/native/` bash + systemd +
@@ -42,9 +42,9 @@ paths:
 ### What a release builds vs carries
 
 - Only **changed** components build; **unchanged** are CARRIED at their prior version. Every release
-  publishes all five.
+  publishes all four.
 - Images: carried → manifest references the prior `:version` tag (no retag). Assets
-  (`.ehpk`/`.apk`/`.tar.gz`/`.zip`): carried → copied forward under the **ORIGINAL name** (installers
+  (`.apk`/`.tar.gz`/`.zip`): carried → copied forward under the **ORIGINAL name** (installers
   and the native bootstrap/updater resolve by filename, never by tag).
 - Per-release **`manifest.json`** is the machine-readable source of truth (version + bits location),
   read by the next release's `plan`, the native updater, and humans. `CLAUDE_CODE_VERSION` is pinned
@@ -52,7 +52,7 @@ paths:
 - Trigger: `workflow_dispatch` (`dry_run` on by default) + `push: main` for auto patch releases. A
   manual `minor`/`major` dispatch bumps `VERSION`, rolls patches into `CHANGELOG.md`, force-builds
   everything.
-- `push: main` is **path-filtered to the four component source dirs**, mirroring `changes.js`'s
+- `push: main` is **path-filtered to the three component source dirs**, mirroring `changes.js`'s
   `PREFIX_MAP` (a test asserts the two match — a workflow trigger can't call into JS). A docs-only
   merge cuts no release.
 
@@ -129,8 +129,6 @@ paths:
   `CLAUDE.md`'s "Editing these files".
 - `turma-image-scan.yml` — builds the hub image locally (no push), Trivy-scans for CVEs+secrets
   (`ignore-unfixed`, HIGH/CRITICAL gate). Path-filtered to `turma/`.
-- `glasses-ci.yml` — path-filtered to `glasses/**`: typecheck + Vitest + production build in a
-  throwaway `node:24-alpine` container.
 - `android-ci.yml` — path-filtered to `android/**`: JVM unit tests + `assembleDebug`.
 
 Keep pinned tool versions current — that's how most CVEs clear. Non-actionable upstream findings go

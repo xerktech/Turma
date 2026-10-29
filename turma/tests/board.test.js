@@ -105,7 +105,7 @@ test("XERK-325: mergeSites ranks an ONLINE host's block above any offline one", 
   const sites = mergeSites([
     agent("hostDown", block({
       fetchedAt: "2026-07-14T12:30:00Z",                      // freshest
-      tickets: [ticket("T-1", { repoGuess: { repo: "Veiller", cloned: true } })],
+      tickets: [ticket("T-1", { repoGuess: { repo: "Tenir", cloned: true } })],
     }), { online: false }),
     agent("hostUp", block({
       fetchedAt: "2026-07-14T12:00:00Z",                      // staler
@@ -122,7 +122,7 @@ test("XERK-325: with both hosts online, freshness still decides", () => {
   const sites = mergeSites([
     agent("hostOld", block({
       user: "a@x.com", fetchedAt: "2026-07-14T12:00:00Z",
-      tickets: [ticket("T-1", { repoGuess: { repo: "Veiller", cloned: true } })],
+      tickets: [ticket("T-1", { repoGuess: { repo: "Tenir", cloned: true } })],
     })),
     agent("hostNew", block({
       user: "a@x.com", fetchedAt: "2026-07-14T12:30:00Z",
@@ -2681,8 +2681,7 @@ const APP_CSS = fs.readFileSync(path.join(__dirname, "../public/app.css"), "utf8
 
 // EVERY rule whose selector names the strip or a column, in source order — not
 // just the first. A guard that reads one rule is beaten by a later unscoped
-// override, which is the exact idiom the glasses vendored board.css
-// already uses, so it is one copy-paste away from re-stacking the columns.
+// override, which is a common stylesheet idiom, so it is one copy-paste away from re-stacking the columns.
 function allRules() {
   return [...APP_CSS.matchAll(/([^{}]*)\{([^{}]*)\}/g)]
     .map(([, sel, body]) => [sel.trim().split("\n").pop().trim(), body]);
@@ -2723,8 +2722,7 @@ test("board: a column is one fixed width at every viewport", () => {
   // both of which an earlier version of this test let through: a SECOND rule on
   // `.kanban-col` (a bare `min-width` re-sizes it just as well as `flex` does),
   // and a rule that reaches the columns WITHOUT naming them — `.kanban-cols >
-  // div`, which is the later-unscoped-override idiom the vendored board.css
-  // files already use. So this collects every rule that can size a column by
+  // div`, the later-unscoped-override idiom. So this collects every rule that can size a column by
   // either route, and insists exactly one of them does.
   const SIZES = /(?:^|;)\s*(?:flex|flex-basis|width|min-width|max-width)\s*:/;
   const canSizeAColumn = ([sel]) =>

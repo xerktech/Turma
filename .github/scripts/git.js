@@ -25,7 +25,7 @@ function git(args) {
   return run("git", args).replace(/\s+$/, "");
 }
 
-// All tags, one per line -> array. Includes legacy glasses-v*/android-v*/... tags.
+// All tags, one per line -> array. Includes legacy android-v*/agent-native-v*/... tags.
 function allTags() {
   const out = git(["tag", "-l"]);
   return out ? out.split("\n").filter(Boolean) : [];

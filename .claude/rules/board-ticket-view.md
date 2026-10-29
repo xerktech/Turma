@@ -4,7 +4,6 @@ paths:
   - "agent/hub-agent.py"
   - "turma/public/board.js"
   - "turma/public/board.html"
-  - "glasses/src/vendor/board.cjs"
   - "android/app/src/main/java/com/xerktech/turma/core/Board.kt"
   - "turma/tests/server.test.js"
   - "turma/tests/board.test.js"
@@ -32,8 +31,8 @@ specific fixture that caught it was added.
     that answered a DIFFERENT repo would spawn against that one instead.
   - **ONLINE-first is the rule everywhere a tracker block is resolved across hosts** — hub-side one
     function, `blockOutranks` (`ticketRepo`, `fleetTicketRows`, both sweeps; a new site with its own
-    tie-break copy is a defect, guarded by test); client-side `mergeSites` + its two vendored copies
-    + Android's `Board.kt`. All rank an online host's block above any offline one, freshness only
+    tie-break copy is a defect, guarded by test); client-side `mergeSites` + Android's
+    `Board.kt`. All rank an online host's block above any offline one, freshness only
     breaking ties within a tier. Hosts poll independently (~10min apart), so an offline host holding
     the freshest block is ordinary — resolving it wrong either stalls a runnable ticket (hub) or
     shows a repo Start will never spawn against (card).
@@ -44,7 +43,7 @@ specific fixture that caught it was added.
     and `hostTriagedTicket` may read a block's `tickets`; a test pins that as a tripwire, not a proof
     — its own comment lists what still escapes it.
   - **Only a host DECIDED into the org it claims contributes a block** (XERK-1491):
-    `fleetTicketRows` skips `decidedOrgOf(a) !== jira.siteKey`; `mergeSites` (+ vendored copy,
+    `fleetTicketRows` skips `decidedOrgOf(a) !== jira.siteKey`; `mergeSites` (+
     `Board.kt`) skips a host whose served `org` differs from its claim (absent `org` = older hub,
     trusted). Grouping by the CLAIMED siteKey let a drifted host's newer-`updated` forged rows
     make the sweeps kill/merge another org's sessions. Tests: `XERK-1491` in all three suites.

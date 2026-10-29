@@ -25,7 +25,7 @@ it commits is unambiguously its own work.
 `validate_tasks.py` gates every task mechanically: with the fix reverted the
 tests **must** fail, and with the fix restored they **must** pass. A candidate
 that does not show that transition is dropped rather than shipped as a task
-nobody can pass. All 8 current tasks pass this gate.
+nobody can pass. All 7 current tasks pass this gate.
 
 ## What the agent is told
 
@@ -120,11 +120,11 @@ up in `docs/`.
 
 ## Known limits
 
-- 8 tasks is a small n; treat single-run differences of one task as noise. Use
+- 7 tasks is a small n; treat single-run differences of one task as noise. Use
   `--attempts 2+` before concluding anything from a gap that size.
 - The archive-sourced eval set (`bench/archive/tasks-validated.json`) now spans
-  two repos — 25 Turma + 22 Tenir (XERK-449) — adding TypeScript and an
-  npm-workspaces monorepo shape. The 8 tasks in this directory's `tasks.json`
+  two repos — 17 Turma + 15 Tenir (XERK-449) — adding TypeScript and an
+  npm-workspaces monorepo shape. The 7 tasks in this directory's `tasks.json`
   are still Turma-only and dependency-free, and remain the harness-comparison
   set precisely because they need no bootstrap.
 - Test-writing tasks were deliberately excluded: scoring them honestly needs

@@ -3,13 +3,12 @@ paths:
   - "turma/server.js"
   - "turma/public/**"
   - "android/app/src/**"
-  - "glasses/src/**"
   - "turma/tests/**"
 ---
 
 # Hub ⇄ client contracts
 
-Rules every client (web, Android, glasses) must keep with the hub and with each other.
+Rules every client (web, Android) must keep with the hub and with each other.
 
 - **Web UI ⇄ Android parity (XERK-30).** `turma/public/` is the source of truth; Android must match.
   **A PR changing user-facing behavior in `turma/public/` must carry the matching `android/` change in
@@ -28,9 +27,4 @@ Rules every client (web, Android, glasses) must keep with the hub and with each 
     `FleetViewModel.run`/`ChatViewModel.report` word the snackbar from it and drop the optimistic
     pending row. **`/history` refusals are `HistoryResult.Failed`, never `Pending`** — polling can't
     fix a refusal.
-  - Glasses (XERK-270): `hub-client.ts`'s `refusal()` reads the body BEFORE it throws, so the
-    `HttpError` carries the hub's words, and `app.ts`'s `failureFlash` puts them on the display. Both
-    halves or neither. `FLASH_HUB_UNREACHABLE` is only for a failure with **no status** — a dead
-    socket or fetch timeout. A one-line header clips a long refusal (`headerLine`); the session screen
-    wraps it whole.
-  - All three fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
+  - Both fall back to "the hub answered HTTP `<n>`", worded identically on purpose.

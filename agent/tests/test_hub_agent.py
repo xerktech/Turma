@@ -3981,7 +3981,7 @@ class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(tail[0], {"id": "u1", "role": "user", "text": "hello there",
                                    "blocks": [{"t": "text", "text": "hello there"}]})
         self.assertEqual(tail[1]["role"], "assistant")
-        # `text` stays the flat, lossy string the glasses have always read...
+        # `text` stays the flat, lossy text-feed string...
         self.assertEqual(tail[1]["text"], "red alert[Bash]")
         # ...and `blocks` is what stops that string lying to the chat: the
         # "[Bash]" in it is a TOOL CALL, not prose the model wrote.
@@ -5287,7 +5287,7 @@ class TestSkillBody(unittest.TestCase):
         self.assertTrue(block["truncated"])
 
     def test_entry_text_drops_it_like_any_tool_result(self):
-        # The text feed (glasses tail, heartbeat preview, archive index) carries
+        # The text feed (heartbeat preview, archive index) carries
         # no tool results; the assistant's own "[Skill]" marker already shows the
         # invocation, so dropping the wall costs it nothing.
         self.assertIsNone(ha._entry_text(self._entry()))
@@ -5502,7 +5502,7 @@ class TestInterruptMarker(unittest.TestCase):
                     [{"t": "interrupt", "text": text}])
 
     def test_text_feed_keeps_the_raw_line(self):
-        # Glasses/heartbeat/archive are one-dimensional text, where the bracket
+        # Heartbeat/archive are one-dimensional text, where the bracket
         # line already reads as the marker it is.
         self.assertEqual(
             ha._entry_text({"type": "user", "message": {
@@ -12255,8 +12255,8 @@ class TestSubscriptionIdentity(unittest.TestCase):
         self.assertEqual(len(block["key"]), ha.SUBSCRIPTION_KEY_CHARS)
 
     def test_the_key_carries_nothing_of_the_account_it_names(self):
-        # The hub persists every heartbeat and fans it out to web, Android and
-        # glasses; grouping only ever asks whether two hosts are equal, so the
+        # The hub persists every heartbeat and fans it out to web and Android;
+        # grouping only ever asks whether two hosts are equal, so the
         # uuid, the org uuid and the email have no business on the wire.
         self._write({"oauthAccount": {"accountUuid": "acc-1",
                                       "emailAddress": "someone@example.com",
@@ -12749,17 +12749,17 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
         # No worktree and no worktrees-shaped slug, but the transcript records
         # its cwd (e.g. an operator's dev-machine session, Windows path) — the
         # repo is read from there when its tail names a repo this host has.
-        self._mk_repo("Veiller")
-        wt = "/home/me/OneDrive/personal/Veiller"
+        self._mk_repo("Tenir")
+        wt = "/home/me/OneDrive/personal/Tenir"
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
         os.makedirs(proj, exist_ok=True)
         write_jsonl(os.path.join(proj, "t.jsonl"), [
-            {"type": "user", "cwd": "C:\\Users\\me\\personal\\Veiller",
+            {"type": "user", "cwd": "C:\\Users\\me\\personal\\Tenir",
              "message": {"role": "user", "content": "hi"}},
         ])
         sm = self.make_manager()
         sm._reconcile_orphan_transcripts()
-        self.assertEqual(sm.usage_ledger[proj]["repo"], "Veiller")
+        self.assertEqual(sm.usage_ledger[proj]["repo"], "Tenir")
 
     def test_junk_cwd_tail_folds_to_root(self):
         # A cwd whose last segment names no repo this host has ("repo", "tmp",
@@ -16969,7 +16969,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         )
         # The guard settings file was written and wires four PreToolUse
         # matchers: the Bash guard, the ~/.claude file guard, the
-        # AskUserQuestion → glasses bridge, and the QA/review model pin.
+        # AskUserQuestion → operator answer bridge, and the QA/review model pin.
         loaded = json.loads(open(settings).read())
         matchers = [e["matcher"] for e in loaded["hooks"]["PreToolUse"]]
         self.assertEqual(matchers, ["Bash", "Write|Edit|MultiEdit|NotebookEdit",
@@ -48884,7 +48884,7 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
             61: p(60, "claude", 5000, sid="a"),       # session a's agent pane
             62: p(61, "bash", 10, sid="a"),           # a Bash tool shell
             63: p(62, "node", 300, sid="a"),
-            64: p(63, "evenhub-sim", 700),            # env cleared, still a's work
+            64: p(63, "vite-dev", 700),            # env cleared, still a's work
             70: p(60, "sh", 10, sid="b"),             # session b's pane: dash, no exec
             71: p(70, "MainThread", 8000, sid="b"),   # ...so b's runtime is its child
             80: p(1, "vite", 800, sid="b"),           # orphaned daemon of b
@@ -49084,7 +49084,7 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
         return kill
 
     def _unit(self, **over):
-        u = {"root": 62, "comm": "evenhub-sim", "pids": [62, 63], "rss": 2**31,
+        u = {"root": 62, "comm": "vite-dev", "pids": [62, 63], "rss": 2**31,
              "sid": "s1", "worktree": None}
         u.update(over)
         return u
@@ -49235,7 +49235,7 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
         self.assertEqual([c.args[0] for c in sm.notify_session.call_args_list],
                          ["s1", "s2"])
         msg = sm.notify_session.call_args_list[0].args[1]
-        self.assertIn("evenhub-sim", msg)
+        self.assertIn("vite-dev", msg)
         self.assertIn("2.0 GiB", msg)
         self.assertEqual(sm.memguard_kills, [])
 

@@ -95,8 +95,8 @@ tokens, tool success rates, step timings, error rates — and flattening it into
 would throw it away.
 
 **Why derive the JSONL at all.** Turma's read side is a web of parity contracts that already cost
-N-way edits: `readyForReview` (four mirrors), "Working" = paneBusy OR live agents (five mirrors), the
-board column rule (four mirrors), and the whole `hub-agent.py` ↔ `tunnel-agent.js` py/js parity set.
+N-way edits: `readyForReview` (three mirrors), "Working" = paneBusy OR live agents (four mirrors), the
+board column rule (three mirrors), and the whole `hub-agent.py` ↔ `tunnel-agent.js` py/js parity set.
 Teaching the archive and every client a SECOND transcript shape multiplies each of those (N → 2N). A
 single agent-side projection into the shape they already read keeps the mirrors at N — WITHOUT making
 that projection the record. Display reads the projection; metrics read the native log. Neither

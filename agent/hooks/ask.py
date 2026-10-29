@@ -2,8 +2,8 @@
 """Turma AskUserQuestion bridge — a Claude Code ``PreToolUse`` hook.
 
 Claude Code renders ``AskUserQuestion`` as an interactive numbered picker in
-the session's TUI. That works when a human is attached to the terminal, but the
-Turma glasses client is *not* attached to the TUI — it reads the session over
+the session's TUI. That works when a human is attached to the terminal, but a
+Turma client (the web chat, Android) is *not* attached to the TUI — it reads the session over
 the heartbeat and answers out of band. Scraping the picker out of the tmux pane
 and typing a digit back into it (the previous approach) was unreliable: the
 pane parse saw phantom/garbled questions and the injected keystroke didn't
@@ -15,7 +15,7 @@ This hook replaces both halves with a structured round-trip:
     on stdin. For each question we write a request file
     (``$TURMA_QUESTIONS_DIR/<sessionId>.req.json``) and **block**, polling for
     the matching answer file (``<sessionId>.ans.json``) the agent drops when
-    the glasses answer arrives on the heartbeat.
+    the operator's answer arrives on the heartbeat.
   * The collected answers are returned as ``permissionDecision: "deny"`` with a
     structured ``permissionDecisionReason`` JSON blob. ``PreToolUse`` can't
     carry typed answer data through an *allow*, so deny-with-reason is the

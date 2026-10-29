@@ -8,7 +8,6 @@ const ALL_CHANGED = {
   turma: true,
   "agent-native": true,
   "agent-windows": true,
-  glasses: true,
   android: true,
 };
 
@@ -35,17 +34,9 @@ test("first release: every component fresh and built", () => {
   assert.equal(m.components["agent-windows"].asset, "turma-agent-windows-v0.3.0.zip");
   assert.equal(m.components["agent-windows"].sha256_asset, "turma-agent-windows-v0.3.0.zip.sha256");
   assert.equal(m.components["agent-windows"].release_tag, "v0.3.0");
-  assert.equal(m.components.glasses.kind, "evenhub");
-  assert.equal(m.components.glasses.package_id, "com.xerktech.turma");
-  assert.equal(m.components.glasses.asset, undefined); // the portal is the channel, not a release asset
   assert.equal(m.components.android.asset, "turma-android-v0.3.0.apk");
   assert.equal(m.components.android.version_code, 30000);
   for (const c of Object.values(m.components)) assert.equal(c.built, true);
-});
-
-test("glasses package_id is overridable (EVENHUB_PACKAGE_ID repo variable path)", () => {
-  const c = M.freshComponent("glasses", "0.3.0", "v0.3.0", { glassesPackageId: "com.xerktech.turma.beta" });
-  assert.equal(c.package_id, "com.xerktech.turma.beta");
 });
 
 test("carried image keeps its OLDER version and ref; never retagged to the new version", () => {
@@ -55,7 +46,7 @@ test("carried image keeps its OLDER version and ref; never retagged to the new v
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: false, "agent-native": false, "agent-windows": false, glasses: false, android: true },
+    changed: { turma: false, "agent-native": false, "agent-windows": false, android: true },
     prevManifest: prev,
     androidVersionCode: 30001,
   });
@@ -72,7 +63,7 @@ test("carried asset keeps its name/version but re-points release_tag to the new 
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-native": true, "agent-windows": true, glasses: true, android: false },
+    changed: { turma: true, "agent-native": true, "agent-windows": true, android: false },
     prevManifest: prev,
     androidVersionCode: 30001,
   });
@@ -83,60 +74,16 @@ test("carried asset keeps its name/version but re-points release_tag to the new 
   assert.equal(a.built, false);
 });
 
-test("carried glasses keeps its older version on the portal; nothing to copy", () => {
-  const prev = firstRelease();
-  const m = M.buildManifest({
-    version: "0.3.1",
-    tag: "v0.3.1",
-    commit: "bbb",
-    releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-native": true, "agent-windows": true, glasses: false, android: true },
-    prevManifest: prev,
-    androidVersionCode: 30001,
-  });
-  const g = m.components.glasses;
-  assert.equal(g.version, "0.3.0");
-  assert.equal(g.kind, "evenhub");
-  assert.equal(g.built, false);
-  assert.deepEqual(M.carryPlan(m, prev), []); // the portal already holds 0.3.0
-});
-
-test("carried glasses from a pre-portal (asset-kind) manifest is normalized to evenhub", () => {
-  // Manifests older than the portal pipeline shipped the .ehpk as a release
-  // asset; carrying one must NOT re-emit the asset entry (nothing copies the
-  // file forward anymore) — it becomes an evenhub reference at its old version.
-  const prev = firstRelease();
-  prev.components.glasses = {
-    version: "0.3.0",
-    kind: "asset",
-    asset: "turma-hud-v0.3.0.ehpk",
-    release_tag: "v0.3.0",
-    built: true,
-  };
-  const m = M.buildManifest({
-    version: "0.3.1",
-    tag: "v0.3.1",
-    commit: "bbb",
-    releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-native": true, "agent-windows": true, glasses: false, android: true },
-    prevManifest: prev,
-    androidVersionCode: 30001,
-  });
-  const g = m.components.glasses;
-  assert.deepEqual(g, { version: "0.3.0", kind: "evenhub", package_id: "com.xerktech.turma", built: false });
-  assert.deepEqual(M.carryPlan(m, prev), []);
-});
-
 test("unchanged component absent from prev manifest throws (never emit a hole)", () => {
   const prev = firstRelease();
-  delete prev.components.glasses;
+  delete prev.components.android;
   assert.throws(() =>
     M.buildManifest({
       version: "0.3.1",
       tag: "v0.3.1",
       commit: "bbb",
       releasedAt: "2026-07-17T00:00:00Z",
-      changed: { turma: true, "agent-native": true, "agent-windows": true, glasses: false, android: true },
+      changed: { turma: true, "agent-native": true, "agent-windows": true, android: false },
       prevManifest: prev,
       androidVersionCode: 30001,
     }),
@@ -150,14 +97,13 @@ test("carryPlan emits copy-asset only for carried assets, not images or built on
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-native": false, "agent-windows": false, glasses: false, android: false },
+    changed: { turma: true, "agent-native": false, "agent-windows": false, android: false },
     prevManifest: prev,
     androidVersionCode: 30001,
   });
   const plan = M.carryPlan(m, prev);
   const components = plan.map((a) => a.component).sort();
-  // turma carried but it's an image, glasses lives on the Even Hub portal
-  // -> no copy action for either. The three carried release ASSETS copy forward.
+  // turma carried but it's an image -> no copy action. The three carried release ASSETS copy forward.
   assert.deepEqual(components, ["agent-native", "agent-windows", "android"]);
   const androidAction = plan.find((a) => a.component === "android");
   assert.deepEqual(androidAction, {
@@ -189,7 +135,7 @@ test("carried agent-windows keeps its zip name/version and re-points release_tag
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-native": true, "agent-windows": false, glasses: true, android: true },
+    changed: { turma: true, "agent-native": true, "agent-windows": false, android: true },
     prevManifest: prev,
     androidVersionCode: 30001,
   });

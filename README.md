@@ -4,8 +4,7 @@
 troop of riders that fights as one unit.
 
 Run a fleet of [Claude Code](https://claude.ai/code) agents across your own
-machines, and drive them from one dashboard — in a browser, on your phone, or on
-a pair of smart glasses.
+machines, and drive them from one dashboard — in a browser or on your phone.
 
 Point Turma at a directory of git repos on any machine. It finds the repos, and
 from the dashboard you spawn a Claude Code session against any of them. Each
@@ -21,7 +20,7 @@ and nothing inbound exposed.
                     ┌──────────────┐
    browser ───────► │              │ ◄──── outbound ──── agent @ NAS      (repos)
    phone   ───────► │  turma hub   │ ◄──── outbound ──── agent @ WSL box  (repos)
-   glasses ───────► │  :8300       │ ◄──── outbound ──── agent @ laptop   (repos)
+                    │  :8300       │ ◄──── outbound ──── agent @ laptop   (repos)
                     └──────────────┘
                        archive
 ```
@@ -32,7 +31,6 @@ and nothing inbound exposed.
 |---|---|---|
 | **`agent/`** | One [native install](agent/native/README.md) per host (systemd + a shipped tarball), mounted at a git root. Scans it for repos and multiplexes many worktree-backed Claude Code sessions, each in its own tmux + loopback ttyd. Heartbeats state; carries terminals and live transcripts back over one outbound tunnel. | Every machine with repos |
 | **`turma/`** | The hub: dashboard, terminal gateway, and durable searchable archive of every ended session. Node **stdlib only** — zero npm dependencies. | Once, anywhere reachable |
-| **`glasses/`** | An [Even Realities G2](https://www.evenrealities.com/) smart-glasses client (Vite + TypeScript). Sessions, transcripts, question answering, and mic dictation. | Even Hub plugin |
 | **`android/`** | Native Android client (Kotlin + Compose). Everything the web dashboard does, plus push notifications and voice. | Phone |
 
 Full architecture, the session model, and the design rationale behind each piece
@@ -165,28 +163,9 @@ it runs one hub (no failover), and it is **not** the normal way to run Turma.
 
 ## Clients
 
-Both clients talk to the hub over HTTP Basic and are configured with a hub URL
-at their login screen. **Get the hub running first** — neither is useful without
+The Android client talks to the hub over HTTP Basic and is configured with a hub
+URL at its login screen. **Get the hub running first** — it isn't useful without
 one.
-
-### Glasses (`glasses/`)
-
-```sh
-cd glasses
-npm install
-npm run mock-hub                                  # terminal 1 — fake hub on :8301
-printf 'VITE_HUB_URL=http://localhost:8301\nVITE_HUB_USER=dev\nVITE_HUB_PASSWORD=dev\n' > .env.local  # no poll until all three are set
-npm run dev                                       # terminal 2 — :5173
-npm test && npm run typecheck                     # vitest + tsc
-npm run build && npm run pack                     # dist/ → ../turma.ehpk
-npx evenhub qr                                    # sideload to the glasses
-```
-
-Node 24. **Before packaging for your own hub**, edit `app.json`: the network
-`whitelist` is enforced at the WebView layer, so it must name your hub for both
-`https://` and `wss://`, and `package_id` must be your own. It currently carries
-this project's values. Details and on-hardware QA in
-[`glasses/README.md`](glasses/README.md).
 
 ### Android (`android/`)
 
@@ -247,7 +226,6 @@ Safety guard section of [`CLAUDE.md`](CLAUDE.md).
 
 ```sh
 node --test turma/tests/*.test.js agent/tests/*.test.js    # hub + agent (Node 24)
-cd glasses && npm test                                     # glasses (vitest)
 cd android && ./gradlew testDebugUnitTest                   # android (JVM)
 ```
 

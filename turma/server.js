@@ -383,16 +383,15 @@ const PORT = positiveEnv("PORT", 8300);
 //
 // The agent (Python) and Android each carry a SAME-NAMED flag, so no single
 // component can re-enable dsh on its own — the hub still refuses to accept or
-// advertise dsh here even if an agent reports the capability. (Glasses has no
-// runtime-selection surface, so it carries no such flag.) It gates the two
+// advertise dsh here even if an agent reports the capability. It gates the two
 // hub choke points every dsh decision funnels through: `dshAvailable` (server-side
 // acceptance — spawn gate, org gate, ticket routing) and `normalizeDsh` (the wire
 // coercion, so the served /api/agents payload never advertises dsh to any client).
 let DSH_ENABLED = false;
 
 // The qwen (Qwen Code, XERK-504) equivalent of DSH_ENABLED. Same in-CODE kill
-// switch discipline: the agent (Python) and Android carry a SAME-named flag
-// (glasses has no runtime-selection surface), so no single component can
+// switch discipline: the agent (Python) and Android carry a SAME-named flag,
+// so no single component can
 // re-enable qwen on its own — the hub still
 // refuses to accept or advertise qwen here even if an agent reports the
 // capability. It gates the two hub choke points every qwen decision funnels
@@ -1673,7 +1672,7 @@ function ttydAuth(host) {
 const LITELLM_URL = (process.env.LITELLM_URL || "").replace(/\/$/, "");
 const LITELLM_API_KEY = process.env.LITELLM_API_KEY || process.env.WHISPER_API_KEY || "";
 
-// Whisper STT: the glasses client streams mic PCM to us over /audio and we
+// Whisper STT: a client streams mic PCM to us over /audio and we
 // wrap+POST it to the same LiteLLM instance's OpenAI-compatible transcription
 // endpoint on finalize. Derived from LITELLM_URL / LITELLM_API_KEY by default;
 // WHISPER_URL / WHISPER_API_KEY still override if the STT server lives elsewhere.
@@ -2291,7 +2290,7 @@ function trimRestoredAgents() {
 // Assignment was worse, silently re-parenting the map.
 const controlChannels = Object.create(null);
 const pendingChannels = Object.create(null);
-// Live transcript subscribers: liveClients[host][sessionId] = Set of glasses
+// Live transcript subscribers: liveClients[host][sessionId] = Set of client
 // WebSocket sockets watching that session's transcript in near-real-time (see
 // the /live upgrade handler). The hub asks the host's tunnel-agent to tail a
 // session only while at least one socket here is watching it, and fans the
@@ -6251,8 +6250,8 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
     ...(hostAutoPaused(key, a, pausedSubs) ? { autoPaused: true } : {}),
     // The org the hub DECIDED this host is in (XERK-349) — the bound org, or ""
     // for a drifted or never-bound host. Served so the three client move-target
-    // predicates (sessions.html `eligibleMoveTargets`, android `Sessions.kt`,
-    // and any glasses twin) can agree with what the migrate route enforces;
+    // predicates (sessions.html `eligibleMoveTargets`, android `Sessions.kt`)
+    // can agree with what the migrate route enforces;
     // before this the route could only compare the CLAIMED `jira.siteKey`,
     // because `orgBound` was stripped from the payload and no client could
     // mirror a binding-keyed rule (the two reverted attempts). Computed off the
@@ -6375,8 +6374,8 @@ function buildAgentsCache() {
 
 // `buildAgentsCache` stringifies the whole fleet, so it can still throw past
 // V8's string ceiling however well the per-record bound holds. Unguarded that
-// reached the route's generic catch as a 400 — to EVERY dashboard, Android and
-// glasses client, and permanently, because the records that caused it live for
+// reached the route's generic catch as a 400 — to EVERY dashboard and Android
+// client, and permanently, because the records that caused it live for
 // PRUNE_AFTER_MS. Serving the last good payload (or an empty fleet) keeps the
 // UI alive and puts the reason in the log (XERK-235).
 let lastGoodAgentsCache = null;
@@ -7918,7 +7917,7 @@ function logUsageCoercion(payload, tally, source = "heartbeat") {
 
 // The subscription-limit snapshot (XERK-247), coerced to numbers or dropped, for
 // the same reason the model lists above are: this block is agent-authored and
-// fans out to web, Android and glasses, and the Android client decodes it into
+// fans out to web and Android, and the Android client decodes it into
 // TYPED fields — a `usedPct` of "lots" from one buggy host would fail the decode
 // of the WHOLE fleet payload, not just its own card. The agent validates before
 // reporting; this is the boundary that makes one that didn't survivable.
@@ -7963,7 +7962,7 @@ function normalizeLimits(payload) {
 }
 
 // The subscription grouping key (XERK-301), coerced for the same reason
-// normalizeLimits above is: it fans out to web, Android and glasses, and
+// normalizeLimits above is: it fans out to web and Android, and
 // Android decodes it into TYPED fields. Anything unusable becomes null — the
 // "that host can't tell you" value every client already handles by leaving the
 // host on a card of its own, never a plausible default, since a bogus shared
@@ -8143,7 +8142,7 @@ function hostAutoPaused(key, a, paused) {
 }
 
 // Coerce the local-model block at ingest, for exactly the reason normalizeLimits
-// above does it (XERK-246): this fans out to web, Android and glasses, and
+// above does it (XERK-246): this fans out to web and Android, and
 // Android decodes it into TYPED fields — `available: Boolean`, `contextTokens:
 // Int?` — so an `available` of "yes" or a contextTokens past 2^31 from ONE buggy
 // host fails the decode of the WHOLE /api/agents array, and every other host
@@ -8267,7 +8266,7 @@ function normalizeDsh(payload) {
   }
   // With the fleet-wide kill switch off, the served block is fully INERT — no
   // capability, no discovered models, no default, no web viewer — so nothing
-  // dsh-shaped rides /api/agents to any client (web, Android, glasses) even when
+  // dsh-shaped rides /api/agents to any client (web, Android) even when
   // an agent reports the capability. Zeroing `models`/`defaultModel` too (not
   // just `available`) matters because the hub's own `/model` route reads
   // `dsh.models` via `dshServes`: leaving them would keep a dsh code path live
@@ -9427,7 +9426,7 @@ function rememberCreateInFlight(fields, cmdId, host) {
 // displays while ignoring the ones it does.
 //
 // The rule itself: the hub can only ACT through an online host, and the board
-// ranks the same way (`mergeSites`, its two vendored copies, and `Board.kt`), so
+// ranks the same way (`mergeSites` and its `Board.kt` port), so
 // resolving against an offline host's fresher block makes the hub act on a copy
 // the operator was never shown. Hosts poll the tracker independently — ~10
 // minutes apart on this fleet — so an offline host holding the newest block is
@@ -9860,7 +9859,7 @@ const HEARTBEAT_UNKNOWN_MAX = 64 << 10; // 64 KiB
 // aggregate, so 400 unknown keys each just under the per-key limit added 25 MiB
 // through the very path meant to stop it. Enough of those and `buildAgentsCache`
 // throws past V8's ~512 MiB string ceiling, which answered 400 to every
-// dashboard, Android and glasses client — permanently, since records live 7
+// dashboard and Android client — permanently, since records live 7
 // days. Bounding the whole record closes known keys, unknown keys and the
 // aggregate in one place (XERK-235).
 //
@@ -10765,8 +10764,7 @@ function coerceGitProblem(o) {
 
 // `migratedFrom` (XERK-2109) — where a moved session came from, as this hub's
 // importSession / archive restore stamped it and the agent echoes it on every
-// beat. The glasses move a stashed draft by {host, sessionId}; Android does not
-// type it today. Rebuilt from its known leaves (a whitelist: anything else an
+// beat. No client types it today. Rebuilt from its known leaves (a whitelist: anything else an
 // agent adds is dropped) or deleted when not an object, so whichever client
 // types it next gets a decode-safe shape. `host`/`sessionId` are a string or
 // null (null = "can't tell", e.g. an archive restore has no source id); the
@@ -11096,8 +11094,8 @@ function normalizeModels(payload) {
   // Blanking `at` loses that compare to any dated incumbent while the block still
   // contributes its `available` entries, which is the whole of what it knows.
   // Fixed HERE rather than in the compare because `mergeSites` is mirrored across
-  // board.js, its two vendored copies and Board.kt — one hub-side line beats a
-  // five-way change, and the hub is where the value is untrusted anyway.
+  // board.js and Board.kt — one hub-side line beats a
+  // multi-client change, and the hub is where the value is untrusted anyway.
   const at = !defaultLabel ? "" : (typeof m.at === "string" ? m.at.slice(0, 120) : "");
   // The LIST is what makes the block worth serving. A `defaultLabel` or an `at`
   // with no usable `available` is still the rebuilt-empty block this function
@@ -12354,8 +12352,8 @@ function sessionTokenValid(token) {
 }
 
 // ---- ws-token (short-lived, query-string auth for the /audio WebSocket) ----
-// Browser `WebSocket` can't send an Authorization header, so the glasses
-// client fetches one of these over authenticated HTTP (GET /api/ws-token)
+// Browser `WebSocket` can't send an Authorization header, so a client
+// fetches one of these over authenticated HTTP (GET /api/ws-token)
 // and passes it as ?auth=. Same "<payload>.<hmac>" shape as the session
 // cookie, but scoped with a "ws." prefix in both the token and the MAC input
 // so session cookies and ws-tokens can never be used in place of each other.
@@ -12392,15 +12390,6 @@ function cookies(req) {
 
 // Mark the cookie Secure only when the request actually arrived over HTTPS
 // (Cloudflare sets x-forwarded-proto) so plain-HTTP LAN access still works.
-//
-// Over HTTPS the cookie is SameSite=None; Secure; Partitioned so the dashboard
-// works when it's embedded as a cross-site iframe (the glasses client's phone
-// view loads the real dashboard in an iframe). SameSite=Lax would be dropped
-// in that third-party context. Partitioned (CHIPS) keys the cookie to the
-// embedding top-level site, so it still works where third-party cookies are
-// blocked AND is never shared with any other embedder — it doesn't broaden
-// the hub's cross-site exposure the way a bare SameSite=None would. Plain
-// HTTP (LAN/dev) can't use SameSite=None (it requires Secure), so it stays Lax.
 function reqIsHttps(req) {
   return (
     (req.headers["x-forwarded-proto"] || "").split(",")[0].trim() === "https" ||
@@ -12408,14 +12397,14 @@ function reqIsHttps(req) {
   );
 }
 
-// A HttpOnly cookie with the same cross-site flags the session cookie uses (see
-// the block comment above). `maxAgeSec` 0 clears it. Factored out so the OIDC
-// logout-hint cookie (XERK-592) carries identical flags without duplicating the
-// HTTPS/SameSite logic.
+// A HttpOnly, SameSite=Lax cookie, Secure over HTTPS (reqIsHttps above).
+// `maxAgeSec` 0 clears it. Factored out so the OIDC logout-hint cookie
+// (XERK-592) carries identical flags without duplicating the HTTPS/SameSite
+// logic.
 function authCookie(req, name, value, maxAgeSec) {
   const base = `${name}=${value}; Path=/; HttpOnly; Max-Age=${maxAgeSec}`;
   return reqIsHttps(req)
-    ? `${base}; SameSite=None; Secure; Partitioned`
+    ? `${base}; SameSite=Lax; Secure`
     : `${base}; SameSite=Lax`;
 }
 
@@ -17732,7 +17721,7 @@ function wsParser(onFrame, { max = WS_FRAME_MAX, onOverflow } = {}) {
 }
 
 // ---- Whisper STT -------------------------------------------------------------
-// The glasses client streams raw 16 kHz signed 16-bit little-endian mono PCM
+// A client streams raw 16 kHz signed 16-bit little-endian mono PCM
 // over the /audio WebSocket; on finalize we wrap it in a WAV container and
 // POST it to an external OpenAI-compatible Whisper server.
 
@@ -17963,11 +17952,11 @@ function openChannel(name, port) {
 }
 
 // ---- live transcript relay --------------------------------------------------
-// The near-real-time tail path. The glasses open /live/<host>/<session>; the
+// The near-real-time tail path. A client opens /live/<host>/<session>; the
 // hub tells that host's tunnel-agent (over the persistent control channel) to
 // start tailing the one transcript, and fans the agent's `{tail, entries}`
 // deltas back to every socket watching that session. Everything here is
-// best-effort: if the control channel is offline the glasses simply keep
+// best-effort: if the control channel is offline the client simply keeps
 // getting the (slower) heartbeat tail via the poll.
 
 // Where the agent should look for a session's transcript, as last reported on a
@@ -18674,43 +18663,6 @@ const server = http.createServer(async (req, res) => {
       return json(res, 400, { error: `a ${req.method} request carries no body` });
     }
 
-    // CORS for the cross-origin glasses WebView client: only /api/* and
-    // /term/* opt in, and only when the request actually carries an Origin
-    // (same-origin requests — the dashboard UI itself — never send one, so
-    // this never fires for them). OPTIONS preflights are answered here,
-    // before any auth gate — they're credential-less by spec and must not 401.
-    const origin = req.headers.origin;
-    if ((parts[0] === "api" || parts[0] === "term") && origin) {
-      // Reflection (not "*") lets the cross-origin glasses WebView read /api/*
-      // and /term/* responses; the origin isn't fixed. Every glasses REST call
-      // authenticates with an explicit Authorization header (no cookie), which
-      // needs the reflected origin + Allow-Headers but NOT credentialed CORS.
-      // nosemgrep: javascript.express.security.cors-misconfiguration.cors-misconfiguration
-      res.setHeader("Access-Control-Allow-Origin", origin);
-      res.setHeader("Vary", "Origin");
-      res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-      // Credentialed (cookie-bearing) cross-origin access is confined to the
-      // TWO endpoints that need it: the glasses WebView plants/clears the hub
-      // session cookie via POST /api/login | /api/logout with
-      // `credentials:"include"` so its same-origin terminal iframe
-      // authenticates. Every OTHER /api/* and /term/* read is Authorization-
-      // header auth, so NOT emitting Allow-Credentials there is what stops a
-      // logged-in victim's browser being driven from an attacker page to read
-      // /api/agents (enumerate session ids) and then /term/<id>/token — which
-      // returns the host's own agent credential (XERK-268), the thing ttyd is
-      // started with (`-c term:$TURMA_TOKEN`). Without Allow-Credentials the
-      // browser blocks that cross-origin credentialed read regardless of
-      // whether it honours the cookie's `Partitioned` attribute (XERK-314).
-      if (url.pathname === "/api/login" || url.pathname === "/api/logout") {
-        res.setHeader("Access-Control-Allow-Credentials", "true");
-      }
-      if (req.method === "OPTIONS") {
-        res.writeHead(204);
-        return res.end();
-      }
-    }
-
     // Unauthenticated liveness probe for the Docker healthcheck (everything
     // informative sits behind auth; this leaks nothing). Without it the
     // healthcheck 401s and autoheal restart-loops the container.
@@ -18928,7 +18880,7 @@ const server = http.createServer(async (req, res) => {
       // Basic popup: page navigations bounce to the login (the IdP when OIDC is
       // the human gate, else the local form); XHR/asset requests get a plain
       // 401 the client-side code turns into a redirect. A non-browser client on
-      // the header-auth path (glasses, curl) gets that same 401, never a
+      // the header-auth path (curl) gets that same 401, never a
       // redirect into a browser flow.
       const wantsHtml = req.method === "GET" && (req.headers.accept || "").includes("text/html");
       if (wantsHtml) {
@@ -22886,7 +22838,7 @@ server.on("upgrade", async (req, socket, head) => {
     publishHostTunnel(name);
     // A fresh (or reconnected) tunnel doesn't know which sessions the hub still
     // has live watchers for — re-arm each so an agent restart / control-channel
-    // flap doesn't silently stop the live stream to already-attached glasses.
+    // flap doesn't silently stop the live stream to already-attached clients.
     clearWatchArmed(name); // the agent forgot every watch when the channel died
     for (const sessionId of Object.keys(liveClients[name] || {})) {
       const target = watchTargetFor(name, sessionId);
@@ -23043,7 +22995,7 @@ server.on("upgrade", async (req, socket, head) => {
     return;
   }
 
-  // Glasses live-transcript WebSocket: /live/<host>/<sessionId>?auth=<ws-token>.
+  // Live-transcript WebSocket: /live/<host>/<sessionId>?auth=<ws-token>.
   // The hub asks the host's tunnel-agent to tail that one session (over the
   // control channel) and streams back the agent's `{type:"tail", entries}`
   // deltas. Same short-lived ws-token auth as /audio (browser WebSocket can't
@@ -23125,7 +23077,7 @@ server.on("upgrade", async (req, socket, head) => {
     return;
   }
 
-  // Glasses mic-audio WebSocket: /audio?auth=<ws-token>. The client streams
+  // Mic-audio WebSocket: /audio?auth=<ws-token>. The client streams
   // raw 16kHz s16le mono PCM as binary frames; a {"type":"finalize"} text
   // frame triggers a Whisper transcription of everything buffered so far,
   // replied as one audio_result text frame, then we close the socket.

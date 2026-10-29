@@ -18,8 +18,8 @@ The fleet runs the agent natively; the two hosts you QA on differ in toolchain:
 | | TrueNAS native | WSL workstation (`MaxAI`) |
 |---|---|---|
 | `npm` / `npx` | **not on PATH** — see below | on PATH |
-| `java`, `gradle`, Android SDK | **absent** — use the `mingc` container, §2.4 | **installed** — see §2.4 |
-| emulator / `adb` | absent (no viable x86_64 AVD — §2.4) | **a running AVD** |
+| `java`, `gradle`, Android SDK | **absent** — use the `mingc` container, §2.3 | **installed** — see §2.3 |
+| emulator / `adb` | absent (no viable x86_64 AVD — §2.3) | **a running AVD** |
 | `apt`, writable `/usr` | **no** — read-only, no sudo | yes, with sudo |
 | `ps` / `pkill` | present | present |
 | `~/.claude`, `~/.turma` | the operator's real ones | the operator's real ones |
@@ -48,7 +48,7 @@ emulator download you don't need.
   with EACCES: `npm ci --cache /tmp/claude-0/npm-cache`.
 - **`bun` is available** at `/root/.local/bin/bun`, if a component needs it.
 - **No `java`/`gradle`/`adb`.** Android work must happen inside the agent image
-  (see §2.5).
+  (see §2.3).
 - **`/tmp` is `noexec`.** Write scratch files there freely, but anything that
   must be *executed* (a downloaded binary, an extracted tool) goes in
   `/root/.local`.
@@ -126,7 +126,7 @@ Hard rules:
   a throwaway `PREFIX` in your scratch dir.
 - **Ports.** The operator's hub is on **8300**; other sessions use **8399**.
   Never bind either. Pick a lane and stay in it — during XERK-235 the split was
-  hub-backend 8410-19, web UI 8420-29, agent 8430-49, glasses 8450-59, android
+  hub-backend 8410-19, web UI 8420-29, agent 8430-49, android
   8460-69, cross-component E2E 8480.
 - **`TTYD_PORT_BASE` defaults to 7700, which the live agent already holds.**
   A second `hub-agent.py` on this box will provision a session onto an occupied
@@ -211,22 +211,7 @@ next boot check, and can restart it); stub **all three** restart paths (a real
 system unit exists here); it holds `flock` on `update.lock` for the whole run.
 Recipes: `qa-findings.md` §5.9.
 
-### 2.3 Glasses (`glasses/`) — npm + vite + vitest
-
-```bash
-export PATH=/root/.local/node/bin:$PATH
-cd glasses
-npm ci --cache /mnt/data/tmp-qa/npm-cache
-npm run typecheck && npx vitest run                            # baseline: 455 tests
-npm run build                                                  # glasses-ci gates on this too
-```
-
-`src/vendor/vendor.test.ts` asserts `chat.cjs`/`board.cjs` are **byte-identical**
-to their `turma/public/` sources. Editing `turma/public/chat.js` without
-re-copying the vendored files fails here in `glasses-ci` — verified by
-mutating one byte.
-
-### 2.4 Android (`android/`) — inside a JDK/Android toolchain container, and it does work
+### 2.3 Android (`android/`) — inside a JDK/Android toolchain container, and it does work
 
 > **The agent is native-only — no `ghcr.io/xerktech/turma-agent` image bundles a
 > toolchain any more (XERK-495).** Two decided routes for local Android QA:
@@ -678,8 +663,7 @@ all. A green suite proves nothing here; measure it in a browser.
   the column strip survives it only because it carries `id="kanbanCols"`. Flip a
   note across a beat and re-check any OTHER scrolled node.
 - **A regex-over-CSS guard only sees the FIRST rule matching its selector**, so a
-  later unscoped override — the pattern the vendored `board.css` files use — sails
-  past it while winning the cascade. Prove any such test by mutating the stylesheet
+  later unscoped override sails past it while winning the cascade. Prove any such test by mutating the stylesheet
   and re-running it, never by reading it — and re-measure the mutation in a browser,
   because an escape is only a finding once you have shown it changes what renders.
 - `overflow-x: auto` computes `overflow-y` to `auto` too — confirm
@@ -717,7 +701,7 @@ all. A green suite proves nothing here; measure it in a browser.
 ## 4. Running QA agents in parallel
 
 XERK-235 ran multiple `qa` subagents at once (hub backend, web UI, python agent,
-glasses, android). That works, and it is much faster than serial, but
+android). That works, and it is much faster than serial, but
 give each one:
 
 - **Its own port lane**, stated in the prompt. They all boot hubs.
@@ -905,11 +889,10 @@ Say these are unverified rather than implying otherwise:
 
 - **The Android UI on TrueNAS.** The `mingc/android-build-box` image reaches
   build, unit tests and APK inspection, but its emulator is ARM-only, so it cannot
-  drive a KVM-accelerated AVD on this x86_64 host (§2.4). Driving the UI is the
+  drive a KVM-accelerated AVD on this x86_64 host (§2.3). Driving the UI is the
   **WSL workstation's** job (native x86_64 AVD) or a real device over
   `adb connect`; on TrueNAS it stays unverified unless a purpose-built x86_64-KVM
   emulator image is stood up.
-- **Real G2 glasses / the Even phone app.** No hardware or Even Hub on this host.
 - **Real FCM delivery** (needs a device + a service account) and **real Whisper
   STT** (needs `LITELLM_URL`).
 - **The ttyd terminal proxy and the OSC 52 clipboard bridge** — needs a real
@@ -953,10 +936,6 @@ are holding. Re-confirm with the same script on both before you spend time.
   fetched `/api/agents/null/sessions/null/history` (404); if you see either,
   you are on an older pin or looking at a regression. Drive it with the fake
   agent in §3.1: `agent.drop()`, then reconnect a new control channel.
-- **`preserveScrollOffset` in the glasses `App.onTurn` path has no test.**
-  Deleting the call leaves all 455 vitest tests green while a scrolled-up view
-  gets yanked down by a growing live turn. The behaviour is correct on both
-  `main` and HEAD — it is the coverage that is missing.
 - **One malformed host costs the phone every OTHER host, silently.** Decoding
   `/api/agents` is atomic on Android, so an object/array in any uncoerced field
   throws for the whole array; `FleetRepository.refresh` catches it into

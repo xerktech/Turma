@@ -113,8 +113,7 @@ Cross-component contract in `CLAUDE.md` ("The peer roster IS the org boundary");
   `sessions.html`'s `siteKeyOfAgent`, and Android's `siteKeyOf`. These are the ORG-FILTER/tint reads —
   still the claimed `jira.siteKey`, and only `org.js`'s mirrors the hub's coercion (`normalizeJira`
   makes that safe). **MOVE eligibility is separate**: `sessions.html`'s `orgOfAgent` + `eligibleMoveTargets`
-  and android's `orgOf` + `eligibleMoveTargets` read the served `org` (XERK-349). Glasses has no Move
-  UI, so no move mirror there.
+  and android's `orgOf` + `eligibleMoveTargets` read the served `org` (XERK-349).
 - **`boundOrgOf`/`siteKeyOf` coerce to string** — `orgBound` is persisted, so an uncoerced value
   400'd every heartbeat from that host on restore, forever.
 - **`orgPeers` bounds what it BUILDS, not what it returns** — building every row before slicing to
@@ -296,7 +295,7 @@ retraction, `pushEnabled`.
     wheel-down + settle); the conditional tmux binding + real-browser pill (both screen models) are
     host-verified (no CI tmux).
 
-## Auth and the glasses surface
+## Auth
 
 - UI/API/terminal sit behind single-user HTTP Basic auth (`TURMA_USER`/`TURMA_PASSWORD`). Agents
   authenticate with a **per-host** token — `TURMA_TOKEN` in the agent env, `hostAgentToken()` =
@@ -326,16 +325,13 @@ retraction, `pushEnabled`.
   - `ttydAuth(host)` sends the token that host's ttyd is ACTUALLY running (`tokenBound`), so a
     half-rolled fleet keeps every terminal working; hub-derived, stripped from the fleet payload.
   - **ttyd's `/token` returns that same credential** (ttyd echoes its `-c term:<token>` basic-auth as
-    the WS token), so the credentialed CORS on `/api|/term` is DELIBERATELY confined to `/api/login`
-    and `/api/logout` (XERK-314). Those two are the only endpoints the glasses WebView hits with
-    `credentials:"include"` (to plant/clear the hub cookie for its same-origin terminal iframe); every
-    other cross-origin read is Authorization-header auth, which needs the reflected origin but NOT
-    `Allow-Credentials`. **Do not add `Access-Control-Allow-Credentials` back onto the general
-    `/api|/term` surface** — it lets a logged-in operator's browser be driven from an attacker page to
-    read `/api/agents` then `/term/<id>/token` and lift the host's agent credential, regardless of the
-    cookie's `Partitioned` attribute. Origin reflection stays (glasses relies on it) and is safe
-    without credentials. Residual, accepted: the SAME-ORIGIN operator can still read `/token` — not an
-    escalation on a single-user hub. Tests: the `XERK-314:` cases in `server.test.js`.
+    the WS token). **The hub sends no CORS headers**, so no cross-origin page can read `/api` or
+    `/term`. Do not add any: credentialed CORS lets a logged-in operator's browser be driven from an
+    attacker page to read `/api/agents` then `/term/<id>/token` and lift the host's agent credential.
+    Residual, accepted: the SAME-ORIGIN operator can still read `/token` — not an escalation on a
+    single-user hub. Tests: `CORS: no route reflects an Origin` in `server.test.js`.
+  - **Auth cookies are `SameSite=Lax` (+ `Secure` over HTTPS)** (`authCookie`): the hub is never
+    embedded cross-site, and Lax still rides the OIDC callback's top-level GET back from the IdP.
   - Tests: the `XERK-268:` cases in `server.test.js`.
 
 ### The agent registry's ceiling (XERK-272)
@@ -408,7 +404,7 @@ retraction, `pushEnabled`.
   budget prints at boot (it's derived, not configured).
 - Tests: `registry-cap.test.js`, `registry-restore.test.js` (each its own process — caps read at
   require time); `server.test.js` lifts `AGENTS_MAX` for its ~100 synthetic hosts.
-- The hub also serves the `glasses/` client: a CORS'd `/api/*`, per-session `input`/`history`, `GET
+- The hub also serves the web UI and Android clients: per-session `input`/`history`, `GET
   /api/ws-token`, an `/audio` STT WebSocket, and a `/live/<host>/<sessionId>` live-transcript
   WebSocket (asks the host's tunnel-agent to `watch`, seeds the cached tail, fans deltas out,
   `unwatch`es on last-viewer-gone, re-arming on control reconnect).

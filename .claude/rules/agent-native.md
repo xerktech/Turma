@@ -292,7 +292,7 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   - **KNOWN GAP**: a per-ticket CLAUDE *pin* does NOT yet override a non-claude host default — the
     board Runtime row treats `{runtime:"claude"}` as RELEASE, so a claude-pinned ticket adopts the
     host default (dsh/qwen pins DO override). Closing it needs the Runtime picker to split "Auto —
-    host default" from a pinned "Claude Code" across `board.js`/`board.cjs`/`Board.kt`/glasses (a UX
+    host default" from a pinned "Claude Code" across `board.js`/`Board.kt` (a UX
     change), deferred to a follow-up. Latent today (dsh/qwen behind their kill switches).
   - **Known limitation — NONDETERMINISTIC in a MIXED org**: an unpinned ticket runs whatever host
     frees a slot first defaults to. Determinism needs a per-ticket pin (XERK-515) or homogeneous

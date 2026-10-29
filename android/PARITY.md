@@ -84,8 +84,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   stack: one chip `FlowRow` (mode/model/run + the PR badges, which already wrap) with the
   `ContextMeterBar` on its own line below. Both avoid the old overlap; a phone is too narrow for a
   left/right-split top row to buy anything, and Android's compose bar has no ticket chip. Accepted
-  platform-idiomatic difference — no Android change; web (`sessions.html` + `chat.js`) + glasses
-  vendor only.
+  platform-idiomatic difference — no Android change; web (`sessions.html` + `chat.js`) only.
 - **In-app updater** (`ui/UpdateBanner.kt`) — a sideload stopgap until Play (XERK-11), no web analog.
 - **Chat text-size control** (XERK-144) — a phone-only addition, no web analog. The chat settings menu
   (the top-bar ⚙/Tune button that holds verbosity) also picks a chat text size, scaling every bubble/
@@ -129,7 +128,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Session Trajectory view is WEB-ONLY (epic XERK-712).** The generalized Trajectory pane — a
   read-only turns / tool-calls / tokens render for Claude and Qwen sessions (not just dsh), toggled
   beside "Terminal ▸" (XERK-717) and served by `GET /api/archive/<transcriptId>/trajectory`
-  (XERK-715) — ships on the WEB only; no Android, no glasses. This includes the read-only stage's
+  (XERK-715) — ships on the WEB only; no Android. This includes the read-only stage's
   Trajectory toggle (XERK-718): the web ended/killed-session and archived-transcript views now
   offer the same archive-served Trajectory (full tokens/model/timings for an ended session, works
   for an offline host), also web-only. Android carries only the earlier dsh-specific Trajectory
@@ -139,7 +138,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   view to the phone if a need appears. Shape/renderer invariants: `.claude/rules/trajectory.md`.
   The XERK-720 additions — an absolute wall-clock timestamp on the head/turn/call and an
   expand-to-full toggle for any ellipsis-snippeted field — are part of this same web-only pane, so
-  no Android/glasses change; a future port carries them with it. So is XERK-734: each turn header is
+  no Android change; a future port carries them with it. So is XERK-734: each turn header is
   a collapse toggle that folds/unfolds that whole turn's body.
 
 - **Sessions card subtitle refresh (XERK-735).** The web card's second line (`cardMeta` in
@@ -578,8 +577,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **The `⚙ dsh` session-card runtime badge is GONE, on every surface.** The web dropped it
   (`runtimeMarkHtml` / `.runtime-mark` removed from `sessions.html`), so Android dropped it too:
   `RuntimeBadge` is removed from `ui/CommonUi.kt` and no longer rendered on the live session cards or
-  the ended rows in `ui/SessionsScreen.kt`. The glasses analogues (the phone companion's `ph-runtime`
-  chip and the G2 row's `·dsh` suffix) are gone as well. `Runtime.isDsh` stays as the shared runtime
+  the ended rows in `ui/SessionsScreen.kt`. `Runtime.isDsh` stays as the shared runtime
   predicate; the Trajectory viewer and composer still tell a dsh session apart.
 - **`EndedSession`/`ClosedSessionInfo.agentType` stay typed** — the hub serves them and they decode
   cleanly; they are simply no longer read for a card badge. Tests: the closed-`agentType` decode in
@@ -623,8 +621,6 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `ui/DshChatActionTest` (a dsh session shows Trajectory not Terminal, carries the transcript id; a
   claude session keeps Terminal — the wiring the `core/`-tested `Runtime.isDsh` gate does not cover),
   `ui/TrajectoryFormatTest` (the `trajMs`/`trajNum` formatters).
-- Still open: the **glasses** client (`hub-client.ts`) exposes the terminal for a dsh session — the
-  same suppression + Trajectory render, tracked under P2 above.
 
 ## Done (XERK-488 — client triage parity: Triage lane, verdicts, org policy)
 
@@ -645,13 +641,6 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     board bar): the six knobs (minPriority / excluded types / repo allow / repo deny / rateMax /
     includeNotActionable, XERK-2209)
     via `vm.saveTriagePolicy` → `POST /api/jira/<site>/triage-policy`; `null` clears a knob.
-- **Glasses + Veiller fork: PASSIVE read only** — both decode `ticketTriageActions` from
-  `/api/agents` (new `AppState` field, refreshed by poll) and pass `triageActions` into the
-  re-vendored `board.cjs` `boardHtml`, so the Triage lane + verdict chips render exactly as on
-  web/Android. No verdict/policy controls on the phones (they set no hub state). `board.cjs` was
-  re-vendored byte-identical from `turma/public/board.js` in `glasses/src/vendor/` and the Veiller
-  fork's `miniapps/turma/src/ui/vendor/` (both vendor tests pin byte-identity); `board.css` on both
-  phones gained the `.kanban-triage`/`.kc-triage*`/`.kc-queued*`/`.kc-dup` rules.
 - **Platform-form notes (parity by intent, not omission):** Android's lane is the first item of
   the same horizontal `LazyRow` strip (no separate scroll surface); the verdict picker is a
   dropdown dialog in the detail sheet rather than the web's in-place inline swap (sheet rows do not
@@ -659,14 +648,13 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   semantics, different gesture chrome.
 - Tests: `core/BoardTest.kt` (lane/chip pure functions), `ui/BoardTriageTest.kt` (4 Robolectric
   cases: lane placement incl. held card, chip rendering, verdict save over MockWebServer, policy
-  editor); glasses `phone/render.test.ts` (untriaged + held in-lane); Veiller
-  `ui/phone/render.test.ts` (same pair). All suites green.
+  editor). All suites green.
 
 ## Done (XERK-731 — Epic Builder composer + progress strip)
 
 - **Android has FULL Epic Builder parity** with the web board (XERK-725/726/728): the idea→epic
   composer AND the live progress strip, a client-only additive build (no column-rule/lane mirror is
-  touched, so no re-vendor/re-port).
+  touched, so no re-port).
   - **`epicBuilders` is TYPED on the fleet payload** — `AgentsResponse.epicBuilders: Map<String,
     EpicBuilder>` (`model/Models.kt`), decoded via `FleetRepository`/`HubApi` and mirrored on
     `FleetState` + the `"epicBuilders"` SSE event. Per the XERK-338 decode-fatality rule, `EpicBuilder`
@@ -792,9 +780,6 @@ those are marked `[MODEL]`.
   glance at the list says which sessions are on the weaker model without opening each one. Read
   `session.modelSource == "local"`, titled with `modelSourceAt`. Both fields already decode onto
   `SessionInfo`.
-- **P2 dsh Trajectory view, and no terminal for dsh (XERK-498).** Android half DONE (see Done below).
-  Still open: **glasses** (`hub-client.ts`) likewise still exposes the terminal for a dsh session —
-  the same suppression, plus ideally the same Trajectory render.
 - **P2 Trajectory generalized to claude/qwen (XERK-717, epic XERK-712).** Web now shows the
   Trajectory toggle for a claude/qwen session too — BESIDE "Terminal ▸" (not replacing it, since
   those runtimes keep their ttyd terminal), shown once the session has a `transcriptId`. It fetches
@@ -838,19 +823,9 @@ those are marked `[MODEL]`.
   a generating dsh turn frame now carries a working `status` (`{verb:"Deep diving", noStop:true}` +
   an elapsed clock past 15s) so the web chat shows the verb; `noStop` keeps Stop hidden (a dsh turn
   has no pane-Escape interrupt). Android's chat working bar should read the same `status.verb`/
-  `elapsed` and suppress its Stop control on `status.noStop`. Glasses gets the checklist free (the
-  vendored `chat.cjs`/`chat.css`); its live bar should honour `noStop` too.
-- **P2 Phone `chat.css` class coverage (XERK-488 follow-up).** Both phones' `chat.css` is a curated
-  extraction of `turma/public/app.css` taken when it was at v0.6.45, with phone overrides appended.
-  The re-vendored `chat.cjs` (this installment on the Veiller fork; earlier on glasses) is the
-  v1.1.67 engine and renders ~50 chat-feature classes the stale extraction never had (attachment
-  chips, the TodoWrite checklist card, the `noStop` live-bar state, …), so those elements fall back
-  to unstyled/default rendering. Pre-existing on glasses (the extraction went stale); surfaced on
-  Veiller by the XERK-488 re-vendor. Fix = re-extract the missing rules from the current
-  `app.css` into BOTH phones' `chat.css` (keeping the phone-override append) and re-run their
-  builds; the `board.css` half is already at parity (this PR's re-vendor).
+  `elapsed` and suppress its Stop control on `status.noStop`.
 - ~~P2 dsh runtime badge on session CARDS (XERK-465 remainder).~~ Removed: the `⚙ dsh` session-card
-  chip was dropped from every surface (web, Android, glasses) — see the Done section below.
+  chip was dropped from every surface (web, Android) — see the Done section below.
 - ~~P2 board ticket "Runtime" row (XERK-473 → XERK-477).~~ Done (XERK-477, see Done below): the board
   ticket detail sheet's fifth tap-to-change row, pinning which runtime a ticket's session spawns on.
 - ~~P0 Jump-to-latest pill + stick-bottom scroll.~~ Done (XERK-78, see Done above).
@@ -1054,7 +1029,7 @@ those are marked `[MODEL]`.
     `TranscriptFoldedThoughts`, collapsed by default, a tap reveals them in place); **Verbose** shows
     the traces expanded by default (`TranscriptThinking` now defaults open, matching the web's
     `openAttr(key, true)`). Web source is `renderFoldedThoughts` (a collapsed `<details>` carrying the
-    traces), which glasses renders through the same vendored engine (`vendor.test.ts`). The web builds
+    traces). The web builds
     every thinking item then folds runs at render; Android's single-pass `buildItems` folds inline but
     breaks a run on exactly what the web's item stream breaks it on — a bubble, a tool_use, an orphan
     tool_result or a task note, each an item there even when its card is hidden — so the counts agree in

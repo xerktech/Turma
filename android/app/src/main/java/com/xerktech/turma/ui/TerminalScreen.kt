@@ -379,11 +379,9 @@ private fun plantCookie(container: com.xerktech.turma.AppContainer, baseUrl: Str
             if (!resp.isSuccessful) return false
             val cm = CookieManager.getInstance()
             cm.setAcceptCookie(true)
-            // Strip the browser-context attributes (SameSite=None; Secure;
-            // Partitioned) the hub sets for its cross-site iframe use — a
-            // Partitioned/CHIPS cookie isn't reliably replayed on the WebView's
-            // top-level /term navigation, which renders the terminal blank. A bare
-            // first-party name=value is all this same-origin WebView needs.
+            // Strip the browser-context attributes (SameSite, Secure) the hub
+            // sets — a bare first-party name=value is all this same-origin
+            // WebView needs.
             for (c in resp.headers("Set-Cookie")) {
                 val pair = c.substringBefore(';').trim()
                 if (pair.contains('=')) cm.setCookie(baseUrl, "$pair; Path=/")

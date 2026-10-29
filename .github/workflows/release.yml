@@ -1,8 +1,8 @@
 name: release
 
 # The unified release pipeline: ONE v<MAJOR>.<MINOR>.<PATCH> tag per release,
-# carrying ALL four components (turma image, native agent tarball, glasses .ehpk,
-# android .apk) + a changelog. Replaces the per-component release/build
+# carrying ALL four components (turma image, native agent tarball, Windows agent
+# zip, android .apk) + a changelog. Replaces the per-component release/build
 # workflows. See RELEASING.md and .github/scripts/README.md.
 #
 # Model:
@@ -21,7 +21,7 @@ name: release
 # release / commit is created. It's the break-glass diagnostic — keep it.
 #
 # Triggers:
-#   - push: main   — the auto patch release. Path-filtered to the four component
+#   - push: main   — the auto patch release. Path-filtered to the three component
 #     source dirs, because a release whose every component is CARRIED publishes
 #     nothing new: a docs-only or .github-only merge would still mint a tag and
 #     re-attach the previous release's assets verbatim. Changing the release
@@ -40,13 +40,11 @@ on:
       # the positives; the changes.test.js parity test asserts both halves.
       - "turma/**"
       - "agent/**"
-      - "glasses/**"
       - "android/**"
       - "!turma/tests/**"
       - "!turma/tools/**"
       - "!agent/tests/**"
       - "!agent/win/test/**"
-      - "!glasses/tests/**"
       - "!android/app/src/test/**"
   workflow_dispatch:
     inputs:
@@ -119,7 +117,6 @@ jobs:
       build_turma: ${{ steps.plan.outputs.build_turma }}
       build_agent_native: ${{ steps.plan.outputs.build_agent_native }}
       build_agent_windows: ${{ steps.plan.outputs.build_agent_windows }}
-      build_glasses: ${{ steps.plan.outputs.build_glasses }}
       build_android: ${{ steps.plan.outputs.build_android }}
       dry_run: ${{ steps.flags.outputs.dry_run }}
       sha: ${{ github.sha }}
@@ -399,83 +396,6 @@ jobs:
           echo "::error::could not push to ${GITOPS_REPO} main after 3 attempts" >&2
           exit 1
 
-  # ------------------------------------------------------- build: glasses -----
-  # GitHub-hosted: an npm build + pack, no docker cache to keep warm.
-  # Packs AND publishes: the .ehpk ships straight to the Even Hub developer
-  # portal from this job (the portal — not the GitHub release — is its
-  # distribution channel), so a portal failure fails the build and blocks the
-  # release like any other build failure. The upload happens before the tag
-  # exists; the publish script skips versions the portal already has, so a
-  # release run that fails downstream and retries at the same version is safe.
-  # Promotion in the portal remains manual.
-  build-glasses:
-    needs: [plan, bump]
-    if: >-
-      !cancelled() && needs.plan.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.bump.result)
-      && needs.plan.outputs.build_glasses == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-          cache: npm
-          cache-dependency-path: glasses/package-lock.json
-      # Stamp the unified version into app.json before packing — Even Hub keys
-      # sideloaded installs on app.json's "version", so it MUST increase per
-      # build. Only app.json is touched (evenhub pack reads the version there;
-      # rewriting package.json would desync package-lock.json and break npm ci).
-      # The pack script writes ../turma.ehpk (repo root).
-      - name: Stamp version, install, build, pack
-        working-directory: glasses
-        env:
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          set -euo pipefail
-          node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync("app.json"));j.version=process.env.VERSION;fs.writeFileSync("app.json",JSON.stringify(j,null,2)+"\n")'
-          npm ci --no-audit --no-fund
-          npm run build
-          npm run pack
-      - name: Publish .ehpk to the Even Hub dev portal
-        working-directory: glasses
-        env:
-          EVENHUB_EMAIL: ${{ secrets.EVENHUB_EMAIL }}
-          EVENHUB_PASSWORD: ${{ secrets.EVENHUB_PASSWORD }}
-          PACKAGE_ID: ${{ vars.EVENHUB_PACKAGE_ID }}
-          TAG: ${{ needs.plan.outputs.tag }}
-          DRY_RUN: ${{ needs.plan.outputs.dry_run }}
-        run: |
-          set -euo pipefail
-          FLAGS=()
-          if [ "$DRY_RUN" = "true" ]; then
-            FLAGS+=(--dry-run)
-          elif [ -z "$EVENHUB_EMAIL" ] || [ -z "$EVENHUB_PASSWORD" ]; then
-            echo "::error::EVENHUB_EMAIL / EVENHUB_PASSWORD repository secrets are not set — the portal upload cannot authenticate. See RELEASING.md." >&2
-            exit 1
-          fi
-          # The committed app.json package_id is the default; the repo variable
-          # EVENHUB_PACKAGE_ID overrides it when the portal listing uses a
-          # different id.
-          if [ -n "$PACKAGE_ID" ]; then FLAGS+=(--package-id "$PACKAGE_ID"); fi
-          node scripts/evenhub-publish.mjs \
-            --skip-build \
-            --artifact ../turma.ehpk \
-            --changelog "Turma ${TAG} — https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}" \
-            "${FLAGS[@]}"
-      # No release asset for the .ehpk — the portal is its channel. Keep the
-      # packed file inspectable on dry-run rehearsals only (named so the publish
-      # job's asset-* download can't pick it up).
-      - uses: actions/upload-artifact@v4
-        if: needs.plan.outputs.dry_run == 'true'
-        with:
-          name: glasses-ehpk-dry-run
-          path: turma.ehpk
-          if-no-files-found: error
-          retention-days: 3
-
   # ------------------------------------------------------- build: android -----
   # Hosted: a hosted runner ships the Android SDK and a JDK, so this needs no
   # container at all — the mingc/android-build-box image it used to run in only
@@ -681,13 +601,12 @@ jobs:
   # and publish would then carry the previous asset forward under the new tag.
   publish:
     needs:
-      [plan, bump, build-turma-image, deploy-argocd, build-glasses, build-android, build-agent-native, build-agent-windows]
+      [plan, bump, build-turma-image, deploy-argocd, build-android, build-agent-native, build-agent-windows]
     if: >-
       !cancelled() && needs.plan.result == 'success'
       && contains(fromJSON('["success", "skipped"]'), needs.bump.result)
       && contains(fromJSON('["success", "skipped"]'), needs.build-turma-image.result)
       && contains(fromJSON('["success", "skipped"]'), needs.deploy-argocd.result)
-      && contains(fromJSON('["success", "skipped"]'), needs.build-glasses.result)
       && contains(fromJSON('["success", "skipped"]'), needs.build-android.result)
       && contains(fromJSON('["success", "skipped"]'), needs.build-agent-native.result)
       && contains(fromJSON('["success", "skipped"]'), needs.build-agent-windows.result)
@@ -705,10 +624,9 @@ jobs:
         with:
           node-version: "24"
       # Collect the built release assets into dist/ (flattened). The Android
-      # .apk, the native tarball and the Windows zip are the asset-* producers
-      # (the .ehpk ships to the Even Hub portal from build-glasses), so only
-      # download when one of them actually built — a zero-match pattern must not
-      # be able to fail a hub/glasses-only release.
+      # .apk, the native tarball and the Windows zip are the asset-* producers,
+      # so only download when one of them actually built — a zero-match pattern
+      # must not be able to fail a hub-only release.
       - uses: actions/download-artifact@v4
         if: needs.plan.outputs.build_android == 'true' || needs.plan.outputs.build_agent_native == 'true' || needs.plan.outputs.build_agent_windows == 'true'
         with:

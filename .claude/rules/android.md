@@ -5,7 +5,7 @@ paths:
 
 # `android/` — native Android client
 
-Kotlin + Jetpack Compose, MVVM. Full parity with the web dashboard + glasses client, plus phone-only
+Kotlin + Jetpack Compose, MVVM. Full parity with the web dashboard, plus phone-only
 **OS push notifications** (FCM) and **voice**.
 
 **The parity rule itself is in `contract-clients.md`**: the mobile web UI
@@ -14,9 +14,9 @@ the Android change or add a line to `android/PARITY.md`.
 
 ## Layout
 
-Mirrors the glasses pure-core/adapter-shell split:
+A pure-core/adapter-shell split:
 
-- `core/` — JVM-unit-tested reducers ported 1:1 from `glasses/src` (`Transcript` grow-only merge,
+- `core/` — JVM-unit-tested reducers (`Transcript` grow-only merge,
   `Sessions` working/idle/waiting, `ChatItems` buildItems+verbosity).
 - `model/` — wire shapes + shared `TurmaJson` decoder. `vm/` — the ViewModels.
 - `net/` — `HubClient` (Retrofit/OkHttp/kotlinx.serialization), `LiveTail`+`FleetRepository`
