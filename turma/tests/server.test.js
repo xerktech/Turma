@@ -27574,3 +27574,395 @@ test("XERK-2391: the capability block is coerced and the results outbox is never
   assert.equal("dailyBriefResults" in a, false);
   delete agents.dbHostB;
 });
+
+// ---- XERK-2395: the Daily Brief's scheduler, dispatch, ingest and store ---------
+
+// Monday 2026-11-02, the first Monday on EST: the 09:30 New York meeting is 14:30Z,
+// the previous one (Friday, still EDT) 13:30Z.
+const MEET2395 = Date.UTC(2026, 10, 2, 14, 30);
+const RUN2395 = MEET2395 - 5 * 60e3;
+const PREV2395 = Date.UTC(2026, 9, 30, 13, 30);
+// Mondays and Fridays only: the suite's own leader tick runs on the real clock.
+const NY2395 = { ...NY2391, weekdays: [1, 5] };
+const briefHost2395 = (device, site, extra = {}) =>
+  beat1574(device, site, { dailyBrief: { available: true }, ...extra });
+const briefCmds2395 = (device) =>
+  ((agents[device] && agents[device].commands) || []).filter((c) => c.type === "renderDailyBrief");
+const result2395 = (device, site, cmd, row) => briefHost2395(device, site, {
+  dailyBriefResults: [{ runId: cmd.runId, siteKey: site, ...row }] });
+function cleanup2395(site, devices) {
+  for (const d of devices) delete agents[d];
+  delete hub.getDailyBriefs()[site];
+  delete hub.getDailyBriefSchedules()[site];
+  hub.dailyBriefRunNowAt.delete(site);
+}
+
+test("XERK-2395: the brief cleaner matches the shared vectors and is a fixed point", () => {
+  const C = hub.cleanBriefNarrative;
+  const { cap: max, vectors } = JSON.parse(fs.readFileSync(
+    path.join(__dirname, "../../agent/tests/daily_brief_clean_vectors.json"), "utf8"));
+  assert.equal(max, 2000);
+  for (const [input, want] of vectors) {
+    assert.equal(C(input, max), want, JSON.stringify(input));
+    assert.equal(C(want, max), want, `a fixed point: ${JSON.stringify(input)}`);
+  }
+  assert.equal(C(42), "");
+  const long = C("word ".repeat(1000));
+  assert.ok([...long].length <= 2000 && long.endsWith("…"));
+  assert.equal(C(long), long);
+  // The cut counts code points and never splits a surrogate pair.
+  const emoji = (n) => Array(n).fill("\u{1F600}ok").join(" ");
+  assert.equal(C(emoji(500)), emoji(500), "1999 code points are kept whole");
+  const cut = C(emoji(700));
+  assert.ok([...cut].length <= 2000 && cut.endsWith("…"));
+  assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])/.test(cut), "no lone high surrogate");
+});
+
+test("XERK-2395: the brief whitelist, the store bounds and the served shape", () => {
+  const { sanitizeDailyBrief: san, dailyBriefsCoerce } = hub;
+  const row = (o = {}) => ({ runId: "ab12", status: "ok", trigger: "scheduled", meetingAt: 3e12,
+    dayFrom: 1e12, weekFrom: 1e12, until: 2e12, startedAt: 2e12, model: "haiku", host: "h",
+    generatedAt: 2e12 + 1, day: "## D\nDay **one** went well. More.", ...o });
+  assert.equal(san(row()).day, "Day one went well. More.");
+  assert.equal("cmdId" in san(row({ cmdId: "abc" })), false, "bookkeeping only while running");
+  for (const bad of [row({ runId: "XYZ" }), row({ status: "done" }), row({ trigger: "x" }),
+    row({ meetingAt: -1 }), row({ model: "" }), row({ day: "   " }), // ok with no text
+    row({ status: "running", host: undefined }), null, [], "x"]) {
+    assert.equal(san(bad), null, JSON.stringify(bad));
+  }
+  const run = san(row({ status: "running", cmdId: "c0ffee", sentAt: 2e12 + 5, attempt: 2,
+    tried: ["h", 7, "g", "k"], day: "x" }));
+  assert.deepEqual([run.cmdId, run.sentAt, run.attempt, run.tried], ["c0ffee", 2e12 + 5, 2, ["h", "g"]]);
+  assert.equal("day" in run, false, "a running row carries no text");
+  assert.equal(san(row({ status: "failed", error: "" })).error, "the brief could not be written");
+  // Bounds: 30 per org, a null-prototype map, a fixed point.
+  const many = Array.from({ length: 35 }, (_, i) => row({ runId: i.toString(16) }));
+  const raw = { "a.atlassian.net": many, "": many, ["c".repeat(201)]: many, "b.atlassian.net": [{}] };
+  const out = dailyBriefsCoerce(JSON.parse(JSON.stringify(raw)));
+  assert.equal(Object.getPrototypeOf(out), null);
+  assert.deepEqual(Object.keys(out), ["a.atlassian.net"]);
+  assert.equal(out["a.atlassian.net"].length, 30);
+  assert.deepEqual(dailyBriefsCoerce(JSON.parse(JSON.stringify(out))), out, "a fixed point");
+  // Served: the newest and the newest finished in full, the rest a headline.
+  const S = "dbW2395.atlassian.net";
+  hub.getDailyBriefs()[S] = [san(row({ runId: "c3", status: "running", cmdId: "aa", day: undefined })),
+    san(row({ runId: "c2" })), san(row({ runId: "c1", day: "Old day. Two." }))];
+  const w = hub.dailyBriefsWire()[S];
+  assert.equal(w[0].status, "running");
+  for (const k of ["cmdId", "sentAt", "attempt", "tried"]) assert.equal(k in w[0], false, k);
+  assert.equal(w[1].day, "Day one went well. More.");
+  assert.deepEqual([w[2].headline, "day" in w[2]], ["Old day.", false]);
+  delete hub.getDailyBriefs()[S];
+});
+
+test("XERK-2395: a run fires at meeting minus lead, once per meeting, up to 30 min late", async () => {
+  const S = "dbT2395.atlassian.net";
+  const due = (now, s = NY2395) => hub.dailyBriefDue(S, s, now);
+  assert.equal(due(RUN2395 - 1000), null, "before the fire time");
+  assert.equal(due(RUN2395).meetingAt, MEET2395);
+  assert.equal(due(MEET2395 + 29 * 60e3).meetingAt, MEET2395, "a missed fire still runs");
+  assert.equal(due(MEET2395 + 31 * 60e3), null, "too late: skipped");
+  assert.equal(due(RUN2395, { ...NY2395, enabled: false }), null);
+  await briefHost2395("dbTimeA", S);
+  hub.setDailyBriefSchedule(S, hub.sanitizeDailyBriefSchedule(NY2395));
+  hub.dailyBriefTick(RUN2395 - 1000);
+  assert.equal(hub.getDailyBriefs()[S], undefined, "nothing before the fire time");
+  hub.dailyBriefTick(RUN2395);
+  const [cmd] = briefCmds2395("dbTimeA");
+  assert.deepEqual({ ...cmd, cmdId: undefined, runId: undefined }, { type: "renderDailyBrief",
+    siteKey: S, dayFrom: PREV2395, weekFrom: RUN2395 - 7 * 86400e3, until: RUN2395,
+    meetingAt: MEET2395, model: "haiku", runtime: "claude", cmdId: undefined, runId: undefined });
+  assert.match(cmd.runId, /^[0-9a-f]{1,32}$/);
+  hub.dailyBriefTick(RUN2395 + 1000);
+  assert.equal(briefCmds2395("dbTimeA").length, 1, "one run in flight per org");
+  await result2395("dbTimeA", S, cmd, { status: "ok", day: "Two closed.", week: "Busy week." });
+  assert.equal(hub.getDailyBriefs()[S][0].status, "ok");
+  hub.dailyBriefTick(RUN2395 + 120e3);
+  assert.equal(hub.getDailyBriefs()[S].length, 1, "a meeting fires once");
+  // A restart (or a failover) re-reads the fire from the store and does not repeat it;
+  // a Run now for that meeting is not a fire.
+  const tmp = path.join(mkdtemp("turma-test-briefs-2395-"), "daily-briefs.json");
+  const reload = (list) => {
+    fs.writeFileSync(tmp, JSON.stringify({ [S]: list }));
+    return freshServerModule((env) => { env.DAILY_BRIEFS_FILE = tmp; });
+  };
+  const stored = JSON.parse(JSON.stringify(hub.getDailyBriefs()[S]));
+  assert.equal(reload(stored).dailyBriefDue(S, NY2395, RUN2395 + 60e3), null);
+  const manual = stored.map((b) => ({ ...b, trigger: "manual" }));
+  assert.equal(reload(manual).dailyBriefDue(S, NY2395, RUN2395 + 60e3).meetingAt, MEET2395);
+  // A hub that comes up 10 minutes after the meeting still fires it, its DAY still
+  // opening at the previous meeting.
+  delete hub.getDailyBriefs()[S];
+  agents.dbTimeA.commands = [];
+  hub.dailyBriefTick(MEET2395 + 10 * 60e3);
+  const [late] = briefCmds2395("dbTimeA");
+  assert.deepEqual([late.meetingAt, late.dayFrom, late.until],
+    [MEET2395, PREV2395, MEET2395 + 10 * 60e3]);
+  // The schedule's model is sent as is; an org no host is decided into never fires.
+  cleanup2395(S, ["dbTimeA"]);
+  hub.setDailyBriefSchedule(S, hub.sanitizeDailyBriefSchedule({ ...NY2395, model: "sonnet" }));
+  hub.dailyBriefTick(RUN2395);
+  assert.equal(hub.getDailyBriefs()[S], undefined, "no decided host, no fire");
+  await briefHost2395("dbTimeB", S);
+  hub.dailyBriefTick(RUN2395);
+  assert.equal(briefCmds2395("dbTimeB")[0].model, "sonnet");
+  cleanup2395(S, ["dbTimeB"]);
+});
+
+test("XERK-2395: dispatch prefers a logged-in capable host and retries once elsewhere", async () => {
+  const S = "dbH2395.atlassian.net";
+  const O = "dbHo2395.atlassian.net";
+  await briefHost2395("dbHostLapsed", S, { claudeAuth: { needsLogin: true } });
+  await briefHost2395("dbHostGood", S);
+  await beat1574("dbHostOld", S); // no capability: an older agent would never answer
+  await briefHost2395("dbHostOther", O);
+  const run = await request("POST", `/api/orgs/${S}/daily-brief/run`, { headers: userHeaders });
+  assert.equal(run.status, 200);
+  assert.equal(run.body.brief.status, "running");
+  assert.equal(run.body.brief.host, "dbHostGood");
+  assert.equal("cmdId" in run.body.brief, false);
+  const [first] = briefCmds2395("dbHostGood");
+  assert.equal(briefCmds2395("dbHostOld").length + briefCmds2395("dbHostOther").length, 0);
+  // It reports failed: the run moves, once, to the other capable host.
+  await result2395("dbHostGood", S, first, { status: "failed", error: "claude -p timed out" });
+  const moved = hub.getDailyBriefs()[S][0];
+  assert.deepEqual([moved.status, moved.host, moved.attempt], ["running", "dbHostLapsed", 2]);
+  const [second] = briefCmds2395("dbHostLapsed");
+  assert.equal(second.runId, first.runId, "the same run, retried");
+  // The first host's late answer is no longer the hub's to take.
+  await result2395("dbHostGood", S, first, { status: "ok", day: "late" });
+  assert.equal(hub.getDailyBriefs()[S][0].status, "running");
+  // The retry host never answers: the run fails with the hub's own reason, the
+  // undelivered command is withdrawn, and there is no third host.
+  hub.dailyBriefTick(moved.sentAt + hub.DAILY_BRIEF_RUN_TIMEOUT_MS);
+  const settled = hub.getDailyBriefs()[S][0];
+  assert.deepEqual([settled.status, settled.error], ["failed", "the host did not answer in time"]);
+  assert.equal(briefCmds2395("dbHostLapsed").length, 0);
+  assert.equal(hub.getDailyBriefs()[S].length, 1, "a retry is the same row");
+  // A host that leaves mid-run is retried at once.
+  hub.dailyBriefRunNowAt.delete(S);
+  assert.equal((await request("POST", `/api/orgs/${S}/daily-brief/run`,
+    { headers: userHeaders })).status, 200);
+  delete agents.dbHostGood;
+  hub.dailyBriefTick();
+  assert.equal(hub.getDailyBriefs()[S][0].host, "dbHostLapsed");
+  cleanup2395(S, ["dbHostLapsed", "dbHostOld"]);
+  cleanup2395(O, ["dbHostOther"]);
+});
+
+test("XERK-2395: a host is asked only for a runtime and model it lists", async () => {
+  const S = "dbL2395.atlassian.net";
+  // Defaults to qwen but writes briefs on claude only; another lists no sonnet.
+  await briefHost2395("dbLQwen", S, { defaultRuntime: "qwen",
+    dailyBrief: { available: true, runtimes: ["claude"], models: ["haiku", "sonnet"] } });
+  await briefHost2395("dbLNone", S, { dailyBrief: { available: true, runtimes: [] } });
+  await briefHost2395("dbLHaiku", S, { dailyBrief: { available: true, models: ["haiku"] } });
+  hub.setDailyBriefSchedule(S, hub.sanitizeDailyBriefSchedule({ ...NY2395, model: "sonnet" }));
+  hub.dailyBriefTick(RUN2395);
+  const [cmd] = briefCmds2395("dbLQwen");
+  assert.deepEqual([cmd.runtime, cmd.model], ["claude", "sonnet"]);
+  assert.equal(briefCmds2395("dbLNone").length + briefCmds2395("dbLHaiku").length, 0);
+  // Its failure has nowhere to go: the one host listing nothing and the haiku-only one are skipped.
+  await result2395("dbLQwen", S, cmd, { status: "failed", error: "e" });
+  assert.equal(hub.getDailyBriefs()[S][0].status, "failed");
+  cleanup2395(S, ["dbLQwen", "dbLNone", "dbLHaiku"]);
+});
+
+test("XERK-2395: a result is taken only from the host asked, for its run, while in the org", async () => {
+  const S = "dbI2395.atlassian.net";
+  const O = "dbIo2395.atlassian.net";
+  await briefHost2395("dbIngA", S);
+  await briefHost2395("dbIngB", S, { claudeAuth: { needsLogin: true } });
+  await briefHost2395("dbIngX", O);
+  assert.equal((await request("POST", `/api/orgs/${S}/daily-brief/run`,
+    { headers: userHeaders })).status, 200);
+  const [cmd] = briefCmds2395("dbIngA");
+  const ok = { status: "ok", day: "Two closed.", week: "w" };
+  // Another host of the org, a host of another org, a wrong run, a junk site key.
+  await result2395("dbIngB", S, cmd, ok);
+  await result2395("dbIngX", S, cmd, ok);
+  await result2395("dbIngA", S, { runId: "ffff" }, ok);
+  await briefHost2395("dbIngA", S, { dailyBriefResults: [{ ...ok, runId: cmd.runId, siteKey: "__proto__" },
+    "junk", null, [1]] });
+  assert.equal(hub.getDailyBriefs()[S][0].status, "running");
+  // The host asked, but now declaring another org (drifted): refused in that beat.
+  await briefHost2395("dbIngA", O, { dailyBriefResults: [{ ...ok, runId: cmd.runId, siteKey: S }] });
+  assert.equal(hub.getDailyBriefs()[S][0].status, "running");
+  await briefHost2395("dbIngA", S);
+  // An "ok" with nothing readable is a failure, and is retried on the other host.
+  await result2395("dbIngA", S, cmd, { status: "ok", day: "```\n```", week: "**Up next:**" });
+  assert.deepEqual([hub.getDailyBriefs()[S][0].status, hub.getDailyBriefs()[S][0].host],
+    ["running", "dbIngB"]);
+  await result2395("dbIngB", S, cmd, { status: "ok", model: "claude-haiku-5-5",
+    day: "## Since yesterday\n- **XERK-1** closed <b>today</b>.", week: "Quiet.", open: "dropped",
+    next: "XERK-4 next.", error: "ignored" });
+  const b = (await fleet()).dailyBriefs[S][0];
+  assert.deepEqual([b.status, b.host, b.model, b.day, b.week, b.next, "open" in b, "error" in b],
+    ["ok", "dbIngB", "claude-haiku-5-5", "XERK-1 closed today .", "Quiet.", "XERK-4 next.",
+      false, false]);
+  assert.ok(Number.isSafeInteger(b.generatedAt));
+  // A second delivery of the same row (the outbox resends until acked) changes nothing.
+  await result2395("dbIngB", S, cmd, { status: "ok", day: "Rewritten." });
+  assert.equal(hub.getDailyBriefs()[S][0].day, "XERK-1 closed today .");
+  cleanup2395(S, ["dbIngA", "dbIngB"]);
+  cleanup2395(O, ["dbIngX"]);
+});
+
+test("XERK-2395: POST /api/orgs/<site>/daily-brief/run is authed, org-checked and rate-limited", async () => {
+  const S = "dbR2395.atlassian.net";
+  const url = (site) => `/api/orgs/${site}/daily-brief/run`;
+  const post = (site, headers = userHeaders) => request("POST", url(site), { headers });
+  await beat1574("dbRunOld", S); // in the org, but no capable host
+  assert.equal((await post(S, {})).status, 401);
+  const phantom = await post("nobody2395.atlassian.net");
+  assert.equal(phantom.status, 404);
+  const none = await post(S);
+  assert.equal(none.status, 409);
+  assert.match(none.body.error, /no online host of this org can write the brief/);
+  assert.equal(S in hub.getDailyBriefs(), false, "a refusal mints nothing");
+  // No schedule at all: the last day and the last week, "auto" = Haiku.
+  await briefHost2395("dbRunA", S);
+  const t0 = Date.now();
+  const ok = await post(S);
+  assert.equal(ok.status, 200);
+  const b = ok.body.brief;
+  assert.deepEqual([b.trigger, b.model], ["manual", "haiku"]);
+  assert.ok(b.until >= t0 && b.until - b.dayFrom === 86400e3 && b.until - b.weekFrom === 7 * 86400e3);
+  const busy = await post(S);
+  assert.equal(busy.status, 409, "one run in flight per org");
+  const [cmd] = briefCmds2395("dbRunA");
+  await result2395("dbRunA", S, cmd, { status: "ok", day: "d" });
+  const soon = await post(S);
+  assert.equal(soon.status, 429);
+  assert.match(soon.body.error, /try again in \d+s/);
+  // Past the spacing it runs again, and the store keeps the newest 30.
+  hub.getDailyBriefs()[S] = Array.from({ length: 30 }, (_, i) => hub.sanitizeDailyBrief({
+    runId: (i + 1).toString(16), status: "ok", trigger: "manual", meetingAt: 1e12, dayFrom: 1e12,
+    weekFrom: 1e12, until: 1e12, startedAt: 1e12, model: "haiku", day: "old" }));
+  hub.dailyBriefRunNowAt.delete(S);
+  const again = await post(S);
+  assert.equal(again.status, 200);
+  assert.equal(hub.getDailyBriefs()[S].length, 30);
+  assert.equal(hub.getDailyBriefs()[S][0].runId, again.body.brief.runId);
+  assert.ok((await fleet()).dailyBriefs[S].length === 30);
+  cleanup2395(S, ["dbRunA", "dbRunOld"]);
+});
+
+test("XERK-2395: a full store forgets departed orgs, else refuses rather than re-firing", async () => {
+  const S = "dbF2395.atlassian.net";
+  await briefHost2395("dbFullA", S);
+  const store = hub.getDailyBriefs();
+  const filler = (k) => [hub.sanitizeDailyBrief({ runId: "a1", status: "ok", trigger: "manual",
+    meetingAt: 1e12, dayFrom: 1e12, weekFrom: 1e12, until: 1e12, startedAt: 1e12, model: "haiku",
+    day: "d" })];
+  const keys = Array.from({ length: 100 - Object.keys(store).length }, (_, i) => `gone${i}.atlassian.net`);
+  for (const k of keys) store[k] = filler(k);
+  store[keys[0]][0].status = "running"; // not decided, but mid-run: kept
+  store[keys[0]][0].host = "x";
+  const out = hub.startDailyBriefRun(S, "scheduled");
+  assert.ok(out.row, "departed orgs were forgotten to make room");
+  assert.equal(keys[0] in hub.getDailyBriefs(), true);
+  assert.equal(keys[1] in hub.getDailyBriefs(), false);
+  // Nothing to forget: refused, and nothing is dispatched.
+  const live = hub.getDailyBriefs();
+  delete live[S];
+  agents.dbFullA.commands = [];
+  for (const k of Object.keys(live)) delete live[k];
+  for (let i = 0; i < 100; i++) live[`gone${i}.atlassian.net`] = filler();
+  for (const k of Object.keys(live)) { live[k][0].status = "running"; live[k][0].host = "x"; }
+  const full = hub.startDailyBriefRun(S, "scheduled");
+  assert.equal(full.status, 409);
+  assert.equal(briefCmds2395("dbFullA").length, 0);
+  for (const k of Object.keys(live)) delete live[k];
+  cleanup2395(S, ["dbFullA"]);
+});
+
+test("XERK-2395 QA: a fire's row is written at once, so a hard kill cannot re-fire it", async () => {
+  const S = "dbK2395.atlassian.net";
+  const tmp = path.join(mkdtemp("turma-test-briefs-kill-2395-"), "daily-briefs.json");
+  const fresh = freshServerModule((env) => { env.DAILY_BRIEFS_FILE = tmp; });
+  fresh.setDailyBriefSchedule(S, fresh.sanitizeDailyBriefSchedule(NY2395));
+  fresh.startDailyBriefRun(S, "scheduled", RUN2395, fresh.dailyBriefDue(S, NY2395, RUN2395));
+  await new Promise((r) => setTimeout(r, 50)); // well inside the old 5s debounce
+  const onDisk = JSON.parse(fs.readFileSync(tmp, "utf8"));
+  assert.equal(onDisk[S][0].meetingAt, MEET2395);
+});
+
+test("XERK-2395 QA: Run-now rows never push out the meeting's fire record", () => {
+  const base = { status: "ok", meetingAt: 1e12, dayFrom: 1e12, weekFrom: 1e12, until: 1e12,
+    startedAt: 1e12, model: "haiku", day: "d" };
+  const list = [...Array.from({ length: 35 }, (_, i) => ({ ...base, runId: (i + 16).toString(16),
+    trigger: "manual" })), { ...base, runId: "f", trigger: "scheduled", meetingAt: MEET2395 }];
+  const kept = hub.dailyBriefsCoerce({ "k.atlassian.net": list })["k.atlassian.net"];
+  assert.equal(kept.length, 30);
+  assert.equal(kept[29].runId, "f", "the fire record survives, last");
+  hub.getDailyBriefs()["k.atlassian.net"] = kept;
+  assert.equal(hub.dailyBriefDue("k.atlassian.net", NY2395, RUN2395 + 60e3), null);
+  delete hub.getDailyBriefs()["k.atlassian.net"];
+});
+
+test("XERK-2395 QA: an org named __proto__ is served; the cleaner is linear", () => {
+  const store = hub.getDailyBriefs();
+  store.__proto__ = [hub.sanitizeDailyBrief({ runId: "a", status: "ok", trigger: "manual",
+    meetingAt: 1e12, dayFrom: 1e12, weekFrom: 1e12, until: 1e12, startedAt: 1e12, model: "haiku",
+    day: "Proto." })];
+  assert.equal(Object.hasOwn(store, "__proto__"), true);
+  const w = JSON.parse(JSON.stringify(hub.dailyBriefsWire()));
+  assert.equal(Object.hasOwn(w, "__proto__") && w.__proto__[0].day, "Proto.");
+  delete store.__proto__;
+  for (const ch of ["[", "<", "(", "]("]) {
+    const t0 = process.hrtime.bigint();
+    hub.cleanBriefNarrative(ch.repeat(20000));
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    assert.ok(ms < 100, `${JSON.stringify(ch)} x20000 took ${ms}ms`);
+  }
+});
+
+test("XERK-2395 QA: a second failure ends the run — a third host is never asked", async () => {
+  const S = "dbX2395.atlassian.net";
+  for (const d of ["dbX1", "dbX2", "dbX3"]) await briefHost2395(d, S);
+  assert.equal((await request("POST", `/api/orgs/${S}/daily-brief/run`,
+    { headers: userHeaders })).status, 200);
+  const asked = () => ["dbX1", "dbX2", "dbX3"].filter((d) => briefCmds2395(d).length);
+  const [h1] = asked();
+  await result2395(h1, S, briefCmds2395(h1)[0], { status: "failed", error: "e1" });
+  const h2 = hub.getDailyBriefs()[S][0].host;
+  assert.notEqual(h2, h1);
+  await result2395(h2, S, briefCmds2395(h2)[0], { status: "failed", error: "e2" });
+  const b = hub.getDailyBriefs()[S][0];
+  assert.deepEqual([b.status, b.error], ["failed", "e2"]);
+  const third = ["dbX1", "dbX2", "dbX3"].find((d) => d !== h1 && d !== h2);
+  assert.equal(briefCmds2395(third).length, 0);
+  cleanup2395(S, ["dbX1", "dbX2", "dbX3"]);
+});
+
+test("XERK-2395 QA: at most 5 result rows a beat are read", async () => {
+  const S = "dbY2395.atlassian.net";
+  await briefHost2395("dbY1", S);
+  assert.equal((await request("POST", `/api/orgs/${S}/daily-brief/run`,
+    { headers: userHeaders })).status, 200);
+  const [cmd] = briefCmds2395("dbY1");
+  await briefHost2395("dbY1", S, { dailyBriefResults: [...Array(5).fill({ runId: "ff", siteKey: S }),
+    { runId: cmd.runId, siteKey: S, status: "ok", day: "d" }] });
+  assert.equal(hub.getDailyBriefs()[S][0].status, "running", "the sixth row is never read");
+  cleanup2395(S, ["dbY1"]);
+});
+
+test("XERK-2395 QA: a fire with no capable host retries on the same row while due", async () => {
+  const S = "dbZ2395.atlassian.net";
+  await beat1574("dbZOld", S); // decided into the org, but cannot write a brief
+  hub.setDailyBriefSchedule(S, hub.sanitizeDailyBriefSchedule(NY2395));
+  hub.dailyBriefTick(RUN2395);
+  const [failed] = hub.getDailyBriefs()[S];
+  assert.deepEqual([failed.status, "host" in failed], ["failed", false]);
+  hub.dailyBriefTick(RUN2395 + 15e3);
+  assert.equal(hub.getDailyBriefs()[S].length, 1, "still no host: no new row");
+  assert.deepEqual(hub.getDailyBriefs()[S][0], failed, "nor a rewrite every tick");
+  await briefHost2395("dbZNew", S);
+  hub.dailyBriefTick(RUN2395 + 120e3);
+  const list = hub.getDailyBriefs()[S];
+  assert.equal(list.length, 1);
+  assert.deepEqual([list[0].runId, list[0].status, list[0].host], [failed.runId, "running", "dbZNew"]);
+  assert.equal(briefCmds2395("dbZNew")[0].runId, failed.runId);
+  cleanup2395(S, ["dbZOld", "dbZNew"]);
+});

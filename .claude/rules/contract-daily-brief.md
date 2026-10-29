@@ -82,17 +82,64 @@ ticket builds to this file; change it here first.
   `normalizeDailyBrief` coerces it (absent stays absent = "can't"; unusable → null; the two lists
   keep only known names). Today the agent offers `runtimes: ["claude"]` alone (XERK-2394): dsh has
   no one-shot and `qwen -p` none shown to run tool-less, so a command naming either is answered
-  `failed` with that reason — the hub should pick a host listing the runtime instead.
+  `failed` with that reason — the hub picks a host listing the runtime instead (below).
 - `dailyBriefResults: [{runId, siteKey, status:"ok"|"failed", day, week, next, model, error?}]`.
-  - Caps (the hub truncates/drops past them): ≤5 rows per beat; `day`/`week`/`next` ≤2000 chars
-    each, plain text for reading aloud; `model` ≤40; `error` ≤300; `failed` rows carry no text.
+  `day` carries "Since yesterday" AND "Still open" (XERK-2394); there is no separate open text.
+  - Caps (the hub truncates/drops past them): ≤5 rows per beat; `day`/`week`/`next` ≤2000 code
+    points each, plain text for reading aloud; `model` ≤40; `error` ≤300; `failed` rows carry no
+    text.
   - The agent clears a row only once a beat carrying it was accepted (outbox semantics).
-  - Every text is cleaned by the same fixed-point cleaner on both sides
-    (`clean_daily_brief_text`; the hub's ingest must pass `agent/tests/daily_brief_clean_vectors.json`
-    too). Add a vector there, never to one side only.
+  - Every text is cleaned by the same fixed-point cleaner on both sides (`clean_daily_brief_text`,
+    the hub's `cleanBriefNarrative`, re-run at ingest); both pass
+    `agent/tests/daily_brief_clean_vectors.json`. Add a vector there, never to one side only.
+  - Its regexes stop at the next opener (`<[^<>\n]*>`, `\[[^[\]\n]*\]`), so bracket-heavy text
+    is linear — the quadratic form blocked the hub's leader ~300ms a section. Keep both in step.
   - A command re-delivered with the same `runId` runs once; an unusable command that still names a
     valid `runId` + `siteKey` is answered `failed`, one that does not is only logged.
   - A queued run replaced by a newer one for the same org is answered `failed` ("replaced by run …").
 - Both keys are in `HEARTBEAT_KNOWN_KEYS`. `dailyBriefResults` is deleted from the payload before
-  the record is stored; the ingest (XERK-2395) accepts a row only from the host the hub asked, for
-  that run, while the host is still decided into `siteKey` (XERK-348).
+  the record is stored; the ingest accepts a row only from the host the hub asked, for that run,
+  while the host is still decided into `siteKey` (XERK-348) and the run is still `running`.
+  - An `ok` row with no readable section counts as a failure.
+
+## The scheduler, dispatch and brief store (hub, XERK-2395)
+
+- Store: `/data/daily-briefs.json` (`DAILY_BRIEFS_FILE`), a `registerExternalStore`, siteKey →
+  newest-first briefs, 30 kept. `sanitizeDailyBrief` is the ONE whitelist; every write goes
+  through `putDailyBrief` (the file store re-installs the coerced map, so never hold a row
+  across a write).
+  - Row: `{runId, status:"running"|"ok"|"failed", trigger:"scheduled"|"manual", meetingAt,
+    dayFrom, weekFrom, until, startedAt, model, host?, generatedAt?, day?, week?, next?, error?}`; a running row also keeps `cmdId, sentAt, attempt, tried` (never served).
+- **The row is minted at DISPATCH, so the store is the scheduler's durable memory.** The newest
+  `scheduled` row's `meetingAt` is "already fired"; a restart or failover re-reads it and never
+  fires a meeting twice. A Run now is no fire. Never key "fired" on in-memory state.
+  - **Written with no debounce** (`debounceMs: 0`): at the stores' 5s a hub killed right after
+    a fire lost the row and fired the meeting again on reboot (QA-reproduced).
+  - **Eviction never drops an org's newest `scheduled` row**: 30 Run-nows pushed it out and the
+    meeting re-fired.
+  - A fire that found no capable host (a `failed` row with no `host`) is NOT a fire: the tick
+    re-tries it on that same row while the meeting is still due.
+- `dailyBriefTick` (leader-only, `masterOrchestrationTick`, so boot-grace too): DUE = runAt has
+  come and the meeting is under `DAILY_BRIEF_LATE_MS` (30 min) behind (`dailyBriefDue`); later
+  is skipped. A late run's window is taken as of its runAt, so DAY still opens at the previous
+  meeting. No decided host, no fire.
+- **One run in flight per org**: a schedule waits while a row is `running`; Run now answers 409.
+- Host: `jiraHostPool(siteKey, true)` ∩ `dailyBrief.available`, a host with
+  `claudeAuth.needsLogin` last. `runtime` = the host's `defaultRuntime` when its `runtimes` lists
+  it, else the first it lists (absent list = an older agent: `defaultRuntime`); a host listing
+  `models` without the run's model is skipped. `"auto"` sends `DAILY_BRIEF_AUTO_MODEL` (haiku,
+  the XERK-2393 default).
+- **Retry ONCE on another capable host** — same row, same runId, `attempt: 2` — when the host
+  reports `failed`, sends an empty `ok`, goes offline/leaves the org, or has not answered in
+  `DAILY_BRIEF_RUN_TIMEOUT_MS` (10 min). The old command is withdrawn (no-op once acked). No
+  other host → the row settles `failed` with the reason.
+- A scheduled fire with no capable host mints ONE `failed` row saying why (above).
+- The served map is null-prototype, so an org named `__proto__` is served (XERK-1451).
+- `POST /api/orgs/<siteKey>/daily-brief/run` (operator-authed) = Run now, ignores `enabled`, no
+  schedule needed (DAY = last 24h). 404 an org no host is decided into, 409 running / no capable
+  host (mints nothing), 429 within 60s of the last Run now. Answers `{ok, brief}`.
+- Served as top-level `dailyBriefs` on `/api/agents` + its own `dailyBriefs` SSE frame: per org
+  the newest row AND the newest `ok` in full, every other one `headline` (the day's first
+  sentence) instead of the sections.
+- An org no host is decided into loses its briefs 30 days after its newest run. No push.
+- Tests: the `XERK-2395:` cases in `server.test.js`.

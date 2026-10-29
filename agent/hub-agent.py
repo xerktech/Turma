@@ -24840,8 +24840,10 @@ def clean_daily_brief_text(text, cap=DAILY_BRIEF_WIRE_TEXT_MAX):
         return ""
     s = text[:20000]
     s = re.sub(r"```[^\n]*", " ", s)
-    s = re.sub(r"<[^>\n]*>", " ", s)
-    s = re.sub(r"!?\[([^\]\n]*)\]\([^)\n]*\)", r"\1", s)
+    # Each scan stops at the next opener, so bracket-heavy text stays linear
+    # (the hub's twin, cleanBriefNarrative, matches exactly).
+    s = re.sub(r"<[^<>\n]*>", " ", s)
+    s = re.sub(r"!?\[([^\[\]\n]*)\]\([^()\n]*\)", r"\1", s)
     s = _DBRIEF_SPACE_RE.sub(" ", _DBRIEF_CTRL_RE.sub(" ", s))
     lines = [_dbrief_clean_line(l) for l in s.split("\n") if not _dbrief_heading_line(l)]
     s = " ".join(l for l in lines if not (l.endswith(":") and len(l) <= 40))
