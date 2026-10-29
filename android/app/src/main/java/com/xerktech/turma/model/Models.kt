@@ -2,7 +2,18 @@ package com.xerktech.turma.model
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.KSerializer
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.MapSerializer
+import kotlinx.serialization.builtins.serializer
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonEncoder
+import kotlinx.serialization.json.JsonObject
 
 /**
  * Wire shapes mirrored from the Turma hub (turma/server.js `serializeAgent`,
@@ -88,6 +99,102 @@ data class AgentsResponse(
     // (sanitizeEpicBuilderRecord) only ever emits clean object entries, so there
     // is no per-value coercion beyond the defaults + TurmaJson.coerceInputValues.
     val epicBuilders: Map<String, EpicBuilder> = emptyMap(),
+    // The Daily Brief (epic XERK-2390), keyed by siteKey: each org's briefs,
+    // newest first (hub dailyBriefsWire), and each org's standup schedule (hub
+    // validateDailyBriefSchedule). Both hub-sanitized, and both decoded per
+    // entry ([LenientBriefsSerializer]/[LenientSchedulesSerializer]) so one
+    // malformed org drops alone instead of throwing the atomic decode. Absent on
+    // an older hub, which reads as "no org has a brief or a schedule".
+    @Serializable(with = LenientBriefsSerializer::class)
+    val dailyBriefs: Map<String, List<DailyBrief>> = emptyMap(),
+    @Serializable(with = LenientSchedulesSerializer::class)
+    val dailyBriefSchedules: Map<String, DailyBriefSchedule> = emptyMap(),
+)
+
+/**
+ * One Daily Brief row as the hub serves it (`dailyBriefWire`, XERK-2395).
+ * [status] is "running" | "ok" | "failed"; [trigger] "scheduled" | "manual".
+ * Times are epoch ms. The newest row and the newest `ok` row carry the three
+ * read-aloud sections ([day] = since yesterday + still open, [week], [next]);
+ * every other row carries only [headline] (the day's first sentence). A failed
+ * row carries [error]. Every field defaulted (the heartbeat contract).
+ */
+@Serializable
+data class DailyBrief(
+    val runId: String = "",
+    val status: String = "",
+    val trigger: String = "",
+    val meetingAt: Long = 0,
+    val dayFrom: Long = 0,
+    val weekFrom: Long = 0,
+    val until: Long = 0,
+    val startedAt: Long = 0,
+    val model: String = "",
+    val host: String = "",
+    val generatedAt: Long = 0,
+    val day: String = "",
+    val week: String = "",
+    val next: String = "",
+    val headline: String = "",
+    val error: String = "",
+)
+
+/**
+ * An org's standup schedule (XERK-2391): the meeting's wall [time] "HH:MM" in
+ * the named IANA [timeZone], on [weekdays] (0 = Sunday .. 6), the brief written
+ * [leadMinutes] before it. Edited on the web only (android/PARITY.md).
+ */
+@Serializable
+data class DailyBriefSchedule(
+    val enabled: Boolean = false,
+    val time: String = "",
+    val timeZone: String = "",
+    val weekdays: List<Int> = emptyList(),
+    val leadMinutes: Int = 5,
+    val model: String = "auto",
+    val updatedAt: Long = 0,
+)
+
+/**
+ * A siteKey-keyed map decoded ENTRY BY ENTRY: a value that will not decode is
+ * dropped (and a non-object payload reads as empty) instead of throwing — the
+ * whole `/api/agents` decode is atomic, so one bad org would otherwise blank
+ * every screen. [decodeValue] returns null to drop an entry.
+ */
+abstract class LenientSiteMapSerializer<T : Any>(
+    private val encodeValue: (T) -> JsonElement,
+    private val decodeValue: (JsonElement) -> T?,
+) : KSerializer<Map<String, T>> {
+    override val descriptor: SerialDescriptor =
+        MapSerializer(String.serializer(), JsonElement.serializer()).descriptor
+
+    override fun deserialize(decoder: Decoder): Map<String, T> {
+        val obj = (decoder as? JsonDecoder)?.decodeJsonElement() as? JsonObject ?: return emptyMap()
+        val out = LinkedHashMap<String, T>()
+        for ((k, v) in obj) runCatching { decodeValue(v) }.getOrNull()?.let { out[k] = it }
+        return out
+    }
+
+    override fun serialize(encoder: Encoder, value: Map<String, T>) {
+        val json = encoder as JsonEncoder
+        json.encodeJsonElement(JsonObject(value.mapValues { encodeValue(it.value) }))
+    }
+}
+
+/** `dailyBriefs`: per org a list, each row decoded on its own (a bad row drops alone). */
+object LenientBriefsSerializer : LenientSiteMapSerializer<List<DailyBrief>>(
+    { TurmaJson.encodeToJsonElement(ListSerializer(DailyBrief.serializer()), it) },
+    { v ->
+        (v as? JsonArray)?.mapNotNull { row ->
+            runCatching { TurmaJson.decodeFromJsonElement(DailyBrief.serializer(), row) }.getOrNull()
+        }
+    },
+)
+
+/** `dailyBriefSchedules`: one schedule per org. */
+object LenientSchedulesSerializer : LenientSiteMapSerializer<DailyBriefSchedule>(
+    { TurmaJson.encodeToJsonElement(DailyBriefSchedule.serializer(), it) },
+    { v -> TurmaJson.decodeFromJsonElement(DailyBriefSchedule.serializer(), v) },
 )
 
 /**

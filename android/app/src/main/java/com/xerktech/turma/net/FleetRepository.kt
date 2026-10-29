@@ -86,6 +86,11 @@ data class FleetState(
     // Epic-builder runs (XERK-725/731), keyed by builder id; the board's progress
     // strip reads it. Refreshed by the poll and the "epicBuilders" SSE event.
     val epicBuilders: Map<String, com.xerktech.turma.model.EpicBuilder> = emptyMap(),
+    // The Daily Brief (XERK-2390): each org's briefs newest-first and its standup
+    // schedule, keyed by siteKey; the Brief screen reads both. Refreshed by the
+    // poll and the "dailyBriefs" / "dailyBriefSchedules" SSE events.
+    val dailyBriefs: Map<String, List<com.xerktech.turma.model.DailyBrief>> = emptyMap(),
+    val dailyBriefSchedules: Map<String, com.xerktech.turma.model.DailyBriefSchedule> = emptyMap(),
 )
 
 class FleetRepository(
@@ -162,6 +167,8 @@ class FleetRepository(
             triagePolicies = resp.triagePolicies
             epicRuns = resp.epicRuns
             epicBuilders = resp.epicBuilders
+            dailyBriefs = resp.dailyBriefs
+            dailyBriefSchedules = resp.dailyBriefSchedules
             // Don't let a late/stale poll drag the clock backward under the
             // records we just kept fresh (XERK-812) — same upward coercion upsert
             // uses for an SSE event.
@@ -216,6 +223,12 @@ class FleetRepository(
     @Volatile
     private var epicBuilders: Map<String, com.xerktech.turma.model.EpicBuilder> = emptyMap()
 
+    @Volatile
+    private var dailyBriefs: Map<String, List<com.xerktech.turma.model.DailyBrief>> = emptyMap()
+
+    @Volatile
+    private var dailyBriefSchedules: Map<String, com.xerktech.turma.model.DailyBriefSchedule> = emptyMap()
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
@@ -235,6 +248,8 @@ class FleetRepository(
             triagePolicies = triagePolicies,
             epicRuns = epicRuns,
             epicBuilders = epicBuilders,
+            dailyBriefs = dailyBriefs,
+            dailyBriefSchedules = dailyBriefSchedules,
         )
     }
 
@@ -257,73 +272,92 @@ class FleetRepository(
         emit(_state.value.now, null)
     }
 
+    /**
+     * Apply one `/api/events` frame to the fleet state. Split out of the SSE
+     * listener so the per-event wiring is tested directly (XERK-2397 QA: a
+     * dropped handler otherwise left every screen fed only by the poll, green).
+     */
+    @androidx.annotation.VisibleForTesting
+    internal fun onSseEvent(type: String?, data: String) {
+        when (type) {
+            "agent" -> runCatching { TurmaJson.decodeFromString<AgentInfo>(data) }.getOrNull()?.let { upsert(it) }
+            "removed" -> runCatching { TurmaJson.decodeFromString<JsonObject>(data) }
+                .getOrNull()?.get("key")?.jsonPrimitive?.content?.let { remove(it) }
+            // A ticket->agent pin changed somewhere; the event carries
+            // the whole (tiny) map, same as the web board consumes it.
+            "ticketAgents" -> runCatching {
+                TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketAgentPin>>(data)
+            }.getOrNull()?.let { ticketAgents = it; emit(_state.value.now, null) }
+            // An org's auto-start opt-in changed (XERK-41); the event
+            // carries the whole (tiny) map, same as the web board.
+            "autoStartOrgs" -> runCatching {
+                TurmaJson.decodeFromString<Map<String, Boolean>>(data)
+            }.getOrNull()?.let { autoStartOrgs = it; emit(_state.value.now, null) }
+            // An org's auto-merge opt-in changed (XERK-550); whole tiny map.
+            "autoMergeOrgs" -> runCatching {
+                TurmaJson.decodeFromString<Map<String, Boolean>>(data)
+            }.getOrNull()?.let { autoMergeOrgs = it; emit(_state.value.now, null) }
+            // A ticket->model pin changed (XERK-123); whole tiny map.
+            "ticketModels" -> runCatching {
+                TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketModelPin>>(data)
+            }.getOrNull()?.let { ticketModels = it; emit(_state.value.now, null) }
+            // The routing policy promoted or demoted a model (XERK-1848).
+            "modelPolicy" -> runCatching {
+                TurmaJson.decodeFromString<com.xerktech.turma.model.ModelPolicy>(data)
+            }.getOrNull()?.let { modelPolicy = it; emit(_state.value.now, null) }
+            // A ticket->runtime pin changed (XERK-473); whole tiny map.
+            "ticketRuntimes" -> runCatching {
+                TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketRuntimePin>>(data)
+            }.getOrNull()?.let { ticketRuntimes = it; emit(_state.value.now, null) }
+            // A ticket/epic host-OS requirement changed (XERK-693); whole tiny map.
+            "ticketPlatforms" -> runCatching {
+                TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketPlatformPin>>(data)
+            }.getOrNull()?.let { ticketPlatforms = it; emit(_state.value.now, null) }
+            // An org's color pin changed (XERK-145); whole tiny map.
+            "orgColors" -> runCatching {
+                TurmaJson.decodeFromString<Map<String, Int>>(data)
+            }.getOrNull()?.let { orgColors = it; emit(_state.value.now, null) }
+            // A ticket was queued, dispatched or cancelled (XERK-296);
+            // the event carries the whole (small) list, like the maps.
+            "ticketQueue" -> runCatching {
+                TurmaJson.decodeFromString<List<com.xerktech.turma.model.QueuedTicket>>(data)
+            }.getOrNull()?.let { ticketQueue = it; emit(_state.value.now, null) }
+            // A per-ticket triage verdict changed (XERK-486); the event
+            // carries the whole (tiny) map, like the other pins.
+            "triageActions" -> runCatching {
+                TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TriageActionPin>>(data)
+            }.getOrNull()?.let { ticketTriageActions = it; emit(_state.value.now, null) }
+            // An org's triage policy changed (XERK-486); whole tiny map.
+            "triagePolicies" -> runCatching {
+                TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TriagePolicy>>(data)
+            }.getOrNull()?.let { triagePolicies = it; emit(_state.value.now, null) }
+            // An epic run was armed/advanced/cancelled (XERK-638); the
+            // event carries the whole (small) map, like the other pins.
+            "epicRuns" -> runCatching {
+                TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.EpicRun>>(data)
+            }.getOrNull()?.let { epicRuns = it; emit(_state.value.now, null) }
+            // An epic builder was armed/advanced/cancelled (XERK-731); the
+            // event carries the whole (small) map, like the other pins.
+            "epicBuilders" -> runCatching {
+                TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.EpicBuilder>>(data)
+            }.getOrNull()?.let { epicBuilders = it; emit(_state.value.now, null) }
+            // A brief was started, written or failed (XERK-2395); the event
+            // carries the whole served map, decoded per org like the poll.
+            "dailyBriefs" -> runCatching {
+                TurmaJson.decodeFromString(com.xerktech.turma.model.LenientBriefsSerializer, data)
+            }.getOrNull()?.let { dailyBriefs = it; emit(_state.value.now, null) }
+            // An org's standup schedule changed (XERK-2391); whole map.
+            "dailyBriefSchedules" -> runCatching {
+                TurmaJson.decodeFromString(com.xerktech.turma.model.LenientSchedulesSerializer, data)
+            }.getOrNull()?.let { dailyBriefSchedules = it; emit(_state.value.now, null) }
+        }
+    }
+
     private fun openSse() {
         val url = config.current.baseUrl + "api/events"
         val listener = object : EventSourceListener() {
             override fun onEvent(source: EventSource, id: String?, type: String?, data: String) {
-                when (type) {
-                    "agent" -> runCatching { TurmaJson.decodeFromString<AgentInfo>(data) }.getOrNull()?.let { upsert(it) }
-                    "removed" -> runCatching { TurmaJson.decodeFromString<JsonObject>(data) }
-                        .getOrNull()?.get("key")?.jsonPrimitive?.content?.let { remove(it) }
-                    // A ticket->agent pin changed somewhere; the event carries
-                    // the whole (tiny) map, same as the web board consumes it.
-                    "ticketAgents" -> runCatching {
-                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketAgentPin>>(data)
-                    }.getOrNull()?.let { ticketAgents = it; emit(_state.value.now, null) }
-                    // An org's auto-start opt-in changed (XERK-41); the event
-                    // carries the whole (tiny) map, same as the web board.
-                    "autoStartOrgs" -> runCatching {
-                        TurmaJson.decodeFromString<Map<String, Boolean>>(data)
-                    }.getOrNull()?.let { autoStartOrgs = it; emit(_state.value.now, null) }
-                    // An org's auto-merge opt-in changed (XERK-550); whole tiny map.
-                    "autoMergeOrgs" -> runCatching {
-                        TurmaJson.decodeFromString<Map<String, Boolean>>(data)
-                    }.getOrNull()?.let { autoMergeOrgs = it; emit(_state.value.now, null) }
-                    // A ticket->model pin changed (XERK-123); whole tiny map.
-                    "ticketModels" -> runCatching {
-                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketModelPin>>(data)
-                    }.getOrNull()?.let { ticketModels = it; emit(_state.value.now, null) }
-                    // The routing policy promoted or demoted a model (XERK-1848).
-                    "modelPolicy" -> runCatching {
-                        TurmaJson.decodeFromString<com.xerktech.turma.model.ModelPolicy>(data)
-                    }.getOrNull()?.let { modelPolicy = it; emit(_state.value.now, null) }
-                    // A ticket->runtime pin changed (XERK-473); whole tiny map.
-                    "ticketRuntimes" -> runCatching {
-                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketRuntimePin>>(data)
-                    }.getOrNull()?.let { ticketRuntimes = it; emit(_state.value.now, null) }
-                    // A ticket/epic host-OS requirement changed (XERK-693); whole tiny map.
-                    "ticketPlatforms" -> runCatching {
-                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketPlatformPin>>(data)
-                    }.getOrNull()?.let { ticketPlatforms = it; emit(_state.value.now, null) }
-                    // An org's color pin changed (XERK-145); whole tiny map.
-                    "orgColors" -> runCatching {
-                        TurmaJson.decodeFromString<Map<String, Int>>(data)
-                    }.getOrNull()?.let { orgColors = it; emit(_state.value.now, null) }
-                    // A ticket was queued, dispatched or cancelled (XERK-296);
-                    // the event carries the whole (small) list, like the maps.
-                    "ticketQueue" -> runCatching {
-                        TurmaJson.decodeFromString<List<com.xerktech.turma.model.QueuedTicket>>(data)
-                    }.getOrNull()?.let { ticketQueue = it; emit(_state.value.now, null) }
-                    // A per-ticket triage verdict changed (XERK-486); the event
-                    // carries the whole (tiny) map, like the other pins.
-                    "triageActions" -> runCatching {
-                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TriageActionPin>>(data)
-                    }.getOrNull()?.let { ticketTriageActions = it; emit(_state.value.now, null) }
-                    // An org's triage policy changed (XERK-486); whole tiny map.
-                    "triagePolicies" -> runCatching {
-                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TriagePolicy>>(data)
-                    }.getOrNull()?.let { triagePolicies = it; emit(_state.value.now, null) }
-                    // An epic run was armed/advanced/cancelled (XERK-638); the
-                    // event carries the whole (small) map, like the other pins.
-                    "epicRuns" -> runCatching {
-                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.EpicRun>>(data)
-                    }.getOrNull()?.let { epicRuns = it; emit(_state.value.now, null) }
-                    // An epic builder was armed/advanced/cancelled (XERK-731); the
-                    // event carries the whole (small) map, like the other pins.
-                    "epicBuilders" -> runCatching {
-                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.EpicBuilder>>(data)
-                    }.getOrNull()?.let { epicBuilders = it; emit(_state.value.now, null) }
-                }
+                onSseEvent(type, data)
             }
 
             override fun onFailure(source: EventSource, t: Throwable?, response: okhttp3.Response?) {

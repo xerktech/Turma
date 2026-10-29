@@ -52,5 +52,6 @@ The web surface of the Daily Brief (epic XERK-2390). The wire it reads is
 - Every served string is escaped (model text, host, model, error, org name, site key).
 - Live via the `dailyBriefs` / `dailyBriefSchedules` SSE frames (whole maps); a snapshot fetch
   merges, never replaces (XERK-444 clocks).
-- Web-only for now (`android/PARITY.md`).
+- Android's Brief tab (XERK-2397) is its counterpart, minus schedule editing (web-only,
+  `android/PARITY.md`); a change to what a reader sees here goes to `BriefScreen.kt` too.
 - Tests: `turma/tests/brief.test.js`; the `/brief` case in `server.test.js` (XERK-2386 test).

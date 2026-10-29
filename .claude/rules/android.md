@@ -34,6 +34,7 @@ A pure-core/adapter-shell split:
 | `sessions.html` + `chat.js` | `ui/SessionsScreen.kt` + `ui/ChatScreen.kt` + `vm/ChatViewModel.kt` |
 | `board.js` + `board.html` | `ui/BoardScreen.kt` + `core/Board.kt` + `vm/BoardViewModel.kt` |
 | `usage.html` | `ui/UsageScreen.kt` |
+| Brief page | `ui/BriefScreen.kt` + `core/DailyBrief.kt` + `vm/BriefViewModel.kt` |
 | `nav.js` | `ui/MainScaffold.kt` + `ui/TurmaApp.kt` |
 | `org.js` | `ui/OrgControl.kt` + `vm/OrgViewModel.kt` + `data/OrgFilter.kt` |
 
@@ -83,8 +84,11 @@ A pure-core/adapter-shell split:
   (XERK-2386): no Android tab, types, or `/api/permissions` / `/api/model-quality` calls.
   `AgentsResponse` declares no `briefs`/`decisions`/`decisionCounts`; `ignoreUnknownKeys` drops
   them when an older hub sends them. Tests: `AgentDecodeTest` (briefs/decisions ignored case).
-- **The Daily Brief page (`/brief`, XERK-2396) has no Android screen yet** (`PARITY.md`):
-  `AgentsResponse` declares no `dailyBriefs`/`dailyBriefSchedules`; `ignoreUnknownKeys` drops them.
+- **Daily Brief (XERK-2397)**: `dailyBriefs`/`dailyBriefSchedules` decode PER ORG through
+  `LenientSiteMapSerializer` (a bad row or schedule drops alone), never as a plain typed map — the
+  `/api/agents` decode is atomic. Schedule editing is web-only (`PARITY.md`). The next meeting is
+  computed on the phone (`nextBriefMeeting`, java.time's gap/overlap rules = the hub's).
+  Tests: `AgentDecodeTest` (daily brief cases), `core/DailyBriefTest`, `ui/BriefScreenTest`.
 
 ## Images (rollup XERK-2109)
 

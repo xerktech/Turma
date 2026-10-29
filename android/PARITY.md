@@ -17,6 +17,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 | Sessions sidebar full-search  | `ui/SessionsScreen.kt`'s search box + "In history" section          |
 | `board.html` + `board.js`     | `ui/BoardScreen.kt`, `core/Board.kt`, `vm/BoardViewModel.kt`       |
 | `usage.html`                  | `ui/UsageScreen.kt`                                                |
+| Brief page (Daily Brief)      | `ui/BriefScreen.kt`, `core/DailyBrief.kt`, `vm/BriefViewModel.kt`  |
 | `nav.js` (header/bottom-nav)  | `ui/MainScaffold.kt`, `ui/TurmaApp.kt`                             |
 | `org.js` (header org filter)  | `ui/OrgControl.kt`, `vm/OrgViewModel.kt`, `data/OrgFilter.kt`      |
 | `login.html`                  | `ui/LoginScreen.kt`                                                |
@@ -31,11 +32,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Insights is WEB-ONLY (operator decision, XERK-2386).** The web's Insights page (`/insights`)
   holds the per-org decisions log, the permission-prompts ledger and model quality (shadow runs);
   Android has none of them, and the web nav's Insights tab has no Android bottom-nav counterpart.
+- **Daily Brief schedule editing is WEB-ONLY (XERK-2397).** Schedules are edited on the web Brief
+  page (XERK-2396) or the `PUT .../daily-brief/schedule` route, never from the phone.
+  - The Android Brief tab reads the brief, shows the next meeting and offers Run now.
 - **No org brief on either client (XERK-2386).** The brief page, its "Brief now" and its push alert
   are retired on the web and Android alike; Android ignores a `briefs` key an older hub still sends.
-- **The Daily Brief page is web-only for now (XERK-2396).** The web's `/brief` tab (each org's
-  latest standup brief, Run now, the meeting-schedule editor) has no Android screen yet; Android
-  ignores the `dailyBriefs`/`dailyBriefSchedules` keys.
 - **Manual Refresh button on the Dashboard.** The web dashboard has no explicit refresh control (it
   auto-polls + SSE); the phone keeps a header Refresh button for a deliberate re-poll. It now shows a
   spinner while the awaited `/api/agents` poll runs (a short visible floor so a fast poll still reads
@@ -712,6 +713,18 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - Tests: `ui/BoardPermissionPolicyTest.kt` (load, save, refused save keeps the edit, Use default,
   absent fields, refused load blocks Save, org-less board has no button — Robolectric over
   MockWebServer), `vm/PermissionPolicyResultTest.kt` (the response reading).
+
+## Done (XERK-2397 — Daily Brief screen)
+
+- Bottom-nav **Brief** tab (`TopDest.BRIEF`), between Board and Usage; the web nav should match.
+  - The picked org's newest finished brief in read-aloud type (Since yesterday / This week / Up
+    next) and "Next meeting …" from the org's schedule.
+  - Run now: off while a brief is being written; a refusal toasts the hub's words.
+  - Earlier briefs as headlines; a Run now row is labelled with when it ran.
+  - A newest failed run shows its reason above the last good brief.
+- The org is the header's pick when it names one; otherwise a chip row offers the scoped orgs.
+- `dailyBriefs` / `dailyBriefSchedules` decode per org (`LenientSiteMapSerializer`), so a malformed
+  entry drops alone. Schedule editing stays web-only (above).
 
 ## Open (subsequent installments), by screen and priority
 

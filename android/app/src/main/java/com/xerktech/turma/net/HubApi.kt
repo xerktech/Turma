@@ -415,6 +415,12 @@ interface HubApi {
         @Query("cmdId") cmdId: String,
     ): Response<StatusChangeResult>
 
+    // "Run now" for an org's Daily Brief (XERK-2395): starts a brief outside the
+    // schedule. 404 no host in that org, 409 one is already being written / no
+    // capable host, 429 asked again too soon — each with the hub's {error}.
+    @POST("api/orgs/{siteKey}/daily-brief/run")
+    suspend fun runDailyBrief(@Path("siteKey") siteKey: String): Response<OkResponse>
+
     // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
     // like the agent pin — an authoritative 200. Body: {enabled:true|false}.
     @POST("api/jira/{siteKey}/autostart")
