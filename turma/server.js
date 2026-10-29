@@ -1264,7 +1264,8 @@ function identityByOrigin(host) {
 function nameTokenRefusal(host) {
   const minted = identityOf(identityByOrigin(host));
   if (minted && minted.used) {
-    return `${host} now authenticates with its agent identity token; its name-derived token is retired`;
+    return `${host} now authenticates with its agent identity token; its name-derived token is ` +
+      `retired (remove ${host} from the dashboard to release the name for a reinstall)`;
   }
   const a = Object.prototype.hasOwnProperty.call(agents, host) ? agents[host] : null;
   if (a && a.agentUid) {
@@ -1297,7 +1298,8 @@ function uidHostRefusal(uid, host, now = Date.now()) {
   if (e.home === host) return null;
   if (rec && !rec.agentUid) return `${host} is registered to another agent`;
   if (rec) return null; // a stale copy of this agent's own record (an HA ghost)
-  const mine = new Set([e.origin, e.home, ...(Array.isArray(e.names) ? e.names : [])].map(lowerName));
+  const mine = new Set([e.origin, e.home, ...(Array.isArray(e.names) ? e.names : [])]
+    .filter(Boolean).map(lowerName));
   const want = lowerName(host);
   for (const [other, o] of Object.entries(agentIdentities)) {
     if (other !== uid && o && lowerName(o.home) === want) return `${host} is registered to another agent`;
@@ -1306,7 +1308,10 @@ function uidHostRefusal(uid, host, now = Date.now()) {
     for (const k of Object.keys(agents)) {
       if (lowerName(k) === want) return `${host} is registered to another agent`;
     }
-    if (usageLedger.has(host)) return `${host} belonged to another host — remove its usage history to reuse the name`;
+    if (usageLedger.has(host)) {
+      return `${host} belonged to another host — re-provision it with its own token, or purge its ` +
+        `usage history, to reuse the name`;
+    }
   }
   const home = Object.prototype.hasOwnProperty.call(agents, e.home) ? agents[e.home] : null;
   if (home && home.agentUid === uid && !(home.updating && now < home.updating.until) &&
@@ -1354,6 +1359,21 @@ function trimAgentIdentities(keep) {
     .sort((x, y) => (agentIdentities[x].at || 0) - (agentIdentities[y].at || 0))
     .slice(0, ids.length - AGENT_IDENTITIES_MAX)
     .forEach((u) => { delete agentIdentities[u]; });
+}
+// The operator removed `host` from the dashboard: release its name for a
+// reinstall. An identity living there is revoked (its token proves nothing
+// any more; the agent re-enrolls like a new host), and an identity minted FOR
+// that name but since renamed away keeps working but no longer retires the
+// name's token or answers its enroll (`origin` dropped). Without this a host
+// whose disk was replaced could never come back under its name on a strict hub.
+function releaseHostIdentities(host) {
+  let changed = false;
+  for (const [uid, e] of Object.entries(agentIdentities)) {
+    if (!e) continue;
+    if (e.home === host) { delete agentIdentities[uid]; changed = true; }
+    else if (e.origin === host) { delete e.origin; changed = true; }
+  }
+  if (changed) persistAgentIdentities();
 }
 // A beat on identity `uid` as `key` (already authorized): mark it used and, on a
 // rename, move its home. Returns the name it moved FROM, or null.
@@ -2743,8 +2763,13 @@ function coerceAgentIdentities(raw) {
   const name = (n) => typeof n === "string" && n.length > 0 && n.length <= 200;
   for (const [uid, e] of Object.entries(raw)) {
     if (!/^[0-9a-f]{32}$/.test(uid) || !e || typeof e !== "object") continue;
-    if (!name(e.origin) || !name(e.home)) continue;
-    const rec = { origin: e.origin, home: e.home, at: Number.isSafeInteger(e.at) && e.at > 0 ? e.at : 0 };
+    if (!name(e.home)) continue;
+    // `origin` is dropped when the operator releases that name (releaseHostIdentities).
+    // Keys in the order the hub writes them, so a coerced value equals the live
+    // one and the HA store's own-write echo dedups.
+    const rec = name(e.origin) ? { origin: e.origin } : {};
+    rec.home = e.home;
+    rec.at = Number.isSafeInteger(e.at) && e.at > 0 ? e.at : 0;
     if (e.used === true) rec.used = true;
     if (Array.isArray(e.names)) {
       const names = e.names.filter(name).slice(-8);
@@ -21993,6 +22018,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "agents" && parts.length === 3) {
       const key = decodeURIComponent(parts[2]);
       delete agents[key];
+      // Removing a host releases its name and revokes its agent identity
+      // (XERK-2381), so a reinstalled machine can take the name on a new token.
+      releaseHostIdentities(key);
       // Removing the host does NOT remove what it spent (XERK-338) — that is the
       // whole point of the ledger, and the Usage page keeps charting it as a
       // retired host. `?usage=purge` is the deliberate second step for an

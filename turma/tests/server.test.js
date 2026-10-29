@@ -67,6 +67,10 @@ process.env.TICKET_AGENTS_FILE = path.join(
   scratchDir(),
   `turma-test-ticket-agents-${process.pid}.json`
 );
+process.env.AGENT_IDENTITIES_FILE = path.join(
+  scratchDir(),
+  `turma-test-agent-identities-${process.pid}.json`
+);
 process.env.AUTOSTART_ORGS_FILE = path.join(
   scratchDir(),
   `turma-test-autostart-orgs-${process.pid}.json`
@@ -27439,4 +27443,28 @@ test("XERK-2195: the string-field coercion keeps null, numbers and a numeric id"
   assert.equal(s.branch, null);
   assert.deepEqual(s.ticket, { key: 9, summary: null });
   assert.deepEqual(s.prs[0], { url: "u", state: 2, checks: null });
+});
+
+test("XERK-2381: removing a host releases its name for a reinstall", async () => {
+  await beatAs("box2381", asAuth(hostAgentToken("box2381")));
+  const tok = enrollUid("box2381");
+  await beatAs("box2381", asAuth(tok));
+  // Retired while the agent lives on its identity.
+  assert.equal((await beatAs("box2381", asAuth(hostAgentToken("box2381")))).status, 403);
+  assert.equal((await request("DELETE", "/api/agents/box2381", { headers: userHeaders })).status, 200);
+  // The old identity is revoked; a reinstall on the name token comes back.
+  assert.equal((await beatAs("box2381", asAuth(tok))).status, 403);
+  assert.equal((await beatAs("box2381", asAuth(hostAgentToken("box2381")))).status, 200);
+  const fresh = enrollUid("box2381");
+  assert.notEqual(fresh, tok);
+  assert.equal((await beatAs("box2381", asAuth(fresh))).status, 200);
+  // A renamed agent's origin name, released, is a new machine's to take.
+  quiet("box2381");
+  assert.equal((await beatAs("box2381b", asAuth(fresh))).status, 200);
+  assert.equal((await beatAs("box2381", asAuth(hostAgentToken("box2381")))).status, 403);
+  await request("DELETE", "/api/agents/box2381", { headers: userHeaders });
+  assert.equal((await beatAs("box2381", asAuth(hostAgentToken("box2381")))).status, 200);
+  assert.notEqual(enrollUid("box2381"), fresh, "the new machine never gets the renamed agent's id");
+  assert.equal((await beatAs("box2381b", asAuth(fresh))).status, 200, "the renamed agent keeps working");
+  forget2381("box2381", "box2381b");
 });

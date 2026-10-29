@@ -38,6 +38,7 @@ process.env.AGENT_EVICT_IDLE_MS = String(60 * 1000);
 const tmp = (name) => path.join(scratchDir(), `turma-regcap-${name}-${process.pid}.json`);
 process.env.DEVICES_FILE = tmp("devices");
 process.env.TICKET_AGENTS_FILE = tmp("ticket-agents");
+process.env.AGENT_IDENTITIES_FILE = tmp("agent-identities");
 process.env.AUTOSTART_ORGS_FILE = tmp("autostart-orgs");
 process.env.TICKET_MODELS_FILE = tmp("ticket-models");
 process.env.ORG_COLORS_FILE = tmp("org-colors");
