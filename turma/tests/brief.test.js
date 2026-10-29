@@ -141,7 +141,8 @@ test("XERK-2396: a running brief keeps the last one on screen and says it is bei
   const h = P.list();
   assert.match(h, /Writing a brief on k8x-02… started 2m ago/);
   assert.match(h, /PROJ-1 merged/);
-  assert.match(h, /data-run="[^"]+" disabled/, "Run now is off while one runs");
+  assert.match(h, /data-run="[^"]+" aria-disabled="true"/, "Run now is off while one runs");
+  assert.doesNotMatch(h, / disabled[ >]/, "never `disabled`: it drops keyboard focus");
 });
 
 test("XERK-2396: a failed newest run shows the hub's reason; earlier briefs list headlines", () => {
@@ -489,14 +490,14 @@ test("XERK-2396: Run now's button is disabled in flight and released after, what
   const d = data();
   P.setCache(d);
   P.renderBriefs(d, NOW);
-  const btn = { dataset: { run: SITE }, disabled: false };
+  const btn = { dataset: { run: SITE }, aria: "false", setAttribute(k, v) { if (k === "aria-disabled") this.aria = v; } };
   P.els.briefList.querySelectorAll = (sel) => (sel === "[data-run]" ? [btn] : []);
   const run = P.runNow(SITE);
-  assert.equal(btn.disabled, true);
+  assert.equal(btn.aria, "true");
   P.document.activeElement = fieldIn("time", "09:00");
   releases[0]({ ok: true, brief: { runId: "q2", status: "ok", trigger: "manual", meetingAt: NOW, startedAt: NOW, model: "haiku", host: "h", day: "Done." } });
   await run;
-  assert.equal(btn.disabled, false);
+  assert.equal(btn.aria, "false");
 });
 
 test("XERK-2396: the gear and Discard paint at once even with a field focused", () => {
@@ -558,11 +559,11 @@ test("XERK-2396: Run now's answer keeps the button off while the org's run is ru
   P.setCache(d);
   P.renderBriefs(d, NOW);
   const before = P.list();
-  const btn = { dataset: { run: SITE }, disabled: false };
+  const btn = { dataset: { run: SITE }, aria: "false", setAttribute(k, v) { if (k === "aria-disabled") this.aria = v; } };
   P.els.briefList.querySelectorAll = (sel) => (sel === "[data-run]" ? [btn] : []);
   P.document.activeElement = fieldIn("time", "09:00");
   await P.runNow(SITE);
-  assert.equal(btn.disabled, true, "the run it started is running");
+  assert.equal(btn.aria, "true", "the run it started is running");
   assert.equal(P.list(), before, "the answer is a background paint");
 });
 
@@ -609,4 +610,38 @@ test("XERK-2396: a repaint keeps keyboard focus on Save", () => {
   d.dailyBriefs = { [SITE]: [okBrief({ day: "Changed." })] };
   P.renderBriefs(d, NOW);
   assert.equal(focused, 1);
+});
+
+test("XERK-2396: Save and Run now render aria-disabled, never disabled, and their guards refuse a second press", async () => {
+  const releases = [];
+  const P = loadPage((url, init) => (init.method === "GET" ? { ok: true, next: null } : new Promise((r) => { releases.push(r); })));
+  const running = { runId: "r1", status: "running", trigger: "manual", meetingAt: NOW, startedAt: NOW, model: "haiku", host: "h" };
+  const d = data();
+  P.setCache(d);
+  P.schedOpen.add(SITE);
+  P.renderBriefs(d, NOW);
+  P.saveSchedule(SITE);
+  P.saveSchedule(SITE);
+  assert.equal(P.fetches.filter((f) => f.method === "PUT").length, 1, "schedBusy refuses a second submit");
+  P.renderBriefs(d, NOW, true);
+  assert.match(P.list(), /data-sched-save="[^"]+" aria-disabled="true">Saving…/);
+  assert.doesNotMatch(P.list(), / disabled[ >]/);
+  // An org whose run is already running: Run now sends nothing.
+  d.dailyBriefs = { [SITE]: [running, okBrief()] };
+  await P.runNow(SITE);
+  assert.equal(P.fetches.filter((f) => f.method === "POST").length, 0);
+  for (const r of releases) r({ ok: true, schedule: null, next: null });
+});
+
+test("XERK-2396: a cancelled press (a drag the browser took) releases the hold", () => {
+  const P = loadPage();
+  const d = data();
+  P.setCache(d);
+  P.renderBriefs(d, NOW);
+  for (const fn of P.els.briefList.listeners.pointerdown) fn({});
+  d.dailyBriefs = { [SITE]: [okBrief({ day: "Held." })] };
+  P.renderBriefs(d, NOW);
+  for (const fn of P.winListeners.pointercancel) fn({});
+  P.runTimers();
+  assert.match(P.list(), /Held\./);
 });

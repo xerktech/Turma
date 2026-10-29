@@ -34,8 +34,9 @@ The web surface of the Daily Brief (epic XERK-2390). The wire it reads is
   - The press is released on `contextmenu` and the WINDOW's `blur` too, so a lost pointerup
     never holds every paint. **Never a capture `blur`**: it fires for the field the press itself
     blurs and swapped the list mid-press (QA).
-  - Save goes `aria-disabled` while busy, never `disabled`: a disabled button drops keyboard
-    focus to `<body>`; `schedBusy` refuses a second submit.
+  - Save and Run now go `aria-disabled` while busy/running, never `disabled`: a disabled button
+    drops keyboard focus to `<body>`. So `schedBusy` / `runBusy` + `orgRunning` are the ONLY
+    thing refusing a second press — never drop those guards.
   - The gear and Discard paint with `force` at the click; every repaint gives focus back to the
     button/field it was on. `force` never overrides a pointer press.
   - **Busy state and a save's error go straight onto the controls** (`patchSave`/`patchRun`),

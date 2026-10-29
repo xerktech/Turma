@@ -81,7 +81,8 @@
   .sched-next { color: var(--ink-2); }
   .sched-err { color: var(--critical-text); overflow-wrap: anywhere; }
   .sched-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-  .sched-actions button[aria-disabled="true"] { opacity: 0.5; cursor: default; }
+  .brief-org button[aria-disabled="true"],
+  .brief-org button[aria-disabled="true"]:hover { opacity: 0.5; cursor: default; border-color: var(--border); }
   .brief-empty { color: var(--muted); font-size: 14px; padding: 24px 0; }
   .pane-note { color: var(--muted); font-size: 12px; margin: 16px 0 0; }
 
@@ -241,7 +242,7 @@ function briefOrgHtml(site, { list, schedule, live, name, now }) {
   const running = head && head.status === "running";
   const actions = `<div class="brief-actions">`
     + (latest ? `<button type="button" class="btn-sm" data-copy="${esc(site)}">${copied.has(site) ? "Copied" : "Copy"}</button>` : "")
-    + (live ? `<button type="button" class="btn-sm" data-run="${esc(site)}"${running || runBusy.has(site) ? " disabled" : ""}>Run now</button>` : "")
+    + (live ? `<button type="button" class="btn-sm" data-run="${esc(site)}" aria-disabled="${!!(running || runBusy.has(site))}">Run now</button>` : "")
     + `</div>`;
   let body;
   if (latest) {
@@ -362,10 +363,9 @@ function patchSave(site) {
 }
 function patchRun(site) {
   painted = null;
-  const list = cache && own(cache.dailyBriefs, site);
-  const running = Array.isArray(list) && list[0] && list[0].status === "running";
+  const running = orgRunning(site);
   for (const b of $briefs.querySelectorAll("[data-run]")) {
-    if (b.dataset.run === site) b.disabled = runBusy.has(site) || !!running;
+    if (b.dataset.run === site) b.setAttribute("aria-disabled", String(runBusy.has(site) || !!running));
   }
 }
 function renderBriefs(data, now, force = false) {
@@ -454,8 +454,14 @@ async function send(method, url, body) {
 }
 // Run now: the hub's refusal is shown in its own words, on the org's status
 // line and as the shared failure toast (XERK-264).
+// Run now and Save go aria-disabled, never `disabled` (which drops keyboard
+// focus to <body>), so these guards are what refuse a second press.
+function orgRunning(site) {
+  const list = cache && own(cache.dailyBriefs, site);
+  return Array.isArray(list) && !!list[0] && list[0].status === "running";
+}
 async function runNow(site) {
-  if (runBusy.has(site)) return;
+  if (runBusy.has(site) || orgRunning(site)) return;
   runBusy.add(site);
   runRefusal.delete(site);
   patchRun(site);
