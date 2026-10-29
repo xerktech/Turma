@@ -322,27 +322,8 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   the XERK-1564 CLI but no reader would accept the request and never act. Absent = tracker wording.
 - Tests: `TestCloseTicketRequest`, `TestTicketClosingDirectives`; hub `XERK-1569` cases.
 
-## The brief narrative + the decisions file (XERK-1574, agent side)
+## The decisions file (XERK-1574, agent side)
 
-Hub side (the request, the store, the routes, the page): `turma-brief.md`.
-
-- **`renderBrief` is only STAGED by `handle_commands`** (`_stage_render_brief`: newest brief wins,
-  input re-serialised and cut at `BRIEF_RENDER_INPUT_MAX`); `_brief_render_tick` on the beat hands
-  ONE job to its own worker (`_brief_worker_loop`) and folds results — the wait classifier's split.
-  Attempt + backoff armed up-front, `BRIEF_RENDER_MAX_ATTEMPTS` (2), then the brief stands without one.
-- **The run is `_run_lockdown_oneshot`, shared with the wait classifier**: `ATTENTION_HINT_LOCKDOWN`
-  in the argv (no tool, no MCP server, `--setting-sources=user` — the brief carries session-written
-  `why`/titles), cwd `REGISTRY_DIR`, stdin `DEVNULL`, a fresh mkstemp output file read back through
-  its own fd, process group killed on `BRIEF_RENDER_TIMEOUT_SEC`. Its INPUT is the hub's structured
-  brief JSON alone — never a transcript. Never give it a second runner.
-- **`clean_brief_narrative` mirrors the hub's `cleanBriefNarrative`** (one plain paragraph,
-  ≤`BRIEF_TEXT_MAX`, a fixed point); the hub re-cleans regardless — it is the whitelist.
-  Same step order and EXPLICIT ASCII classes (` `, `[0-9]`) as the JS, since Python's `\s`/`\d`
-  are wider; change both together.
-- **Its heading-line drop (`_brief_heading_line` + the short-`:` filter) mirrors the hub's
-  `heading`** — same bounds, same vectors (`test_clean_brief_narrative_drops_heading_lines`).
-- **The result rides `briefNarratives`**, cleared BY IDENTITY like `attentionHints`; the capability
-  is `briefRender:{available:true}` (an older agent acks `renderBrief` and never answers).
 - **`_ingest_decisions` renders the reply's `decisions:{org, entries}` to
   `~/.turma/decisions-<org>.md`** (`decisions_path_for` flattens the siteKey), on every reply beside
   `_ingest_peers`. Written only when the text changed OR the file's BYTES differ (Bash walks past
@@ -365,7 +346,7 @@ Hub side (the request, the store, the routes, the page): `turma-brief.md`.
 - **Residual**: the questions in the file are SESSION-written (an AskUserQuestion's text), so one
   session can plant text another session reads. The directive frames it as data; an org boundary
   (decided org) still bounds who sees it.
-- Tests: `TestRenderBrief`, `TestDecisionsFile`, `test_the_decisions_log_is_readable_but_not_writable`.
+- Tests: `TestDecisionsFile`, `test_the_decisions_log_is_readable_but_not_writable`.
 
 ## Real-host spike (not yet run)
 

@@ -5,9 +5,8 @@ paths:
   - "turma/tests/outcome-ledger.test.js"
   - "turma/server.js"
   - "docs/model-quality-adr.md"
-  - "turma/public/usage.html"
-  - "android/app/src/main/java/com/xerktech/turma/**/ModelQuality.kt"
-  - "android/app/src/main/java/com/xerktech/turma/ui/UsageModelQuality.kt"
+  - "turma/public/insights.html"
+  - "turma/tests/insights.test.js"
 ---
 
 # Model quality loop — the outcome ledger (XERK-1839, epic XERK-1844)
@@ -318,26 +317,21 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   `server.test.js`; `TestQaRunScan`, `TestPrReworkFields`, `TestReworkSignalsReachTheWire`,
   `TestShadowRuns`, `TestShadowSandbox`; `TestShadowRun` (`test_guard.py`), `TestShadowRoot` (`test_fileguard.py`); the shadow cases in `test_session_cli.py`; `TestDefect*`.
 
-## The report (XERK-1849): Usage page "Model quality" card, web + Android
+## The report (XERK-1849): the Insights page's "Model quality" sub-page, web-only
 
-- A card on `/usage` (`modelQualityCardHtml`) and Android's Usage screen (`ModelQualitySection`,
-  ports in `core/ModelQuality.kt`) — its OWN fetch, never `/api/agents`, like the permission card.
+- A card on `/insights#model-quality` (`modelQualityCardHtml`) — its OWN fetch, never
+  `/api/agents`, like the permission card. Android has none (XERK-2386, `android/PARITY.md`).
 - **Groups are fleet-wide whatever the header picks**; only the session drill-down follows it, and
-  only when the filter resolves to EXACTLY one org (`TurmaOrg.get()` / `scope().singleOrNull()`),
+  only when the filter resolves to EXACTLY one org (`TurmaOrg.get()`),
   since the route serves rows for one named org. Several or none → "Pick one org…".
 - **Bad rate = bad ÷ (good + bad)**; pending, no-change and undelivered say nothing about code
   quality. The Opus column is that class's Opus bad rate (the baseline), never a fleet average.
-- **Rework renders one column per signal some group reported** (`MQ_REWORK` / Android
-  `ModelQuality.REWORK`: qaRuns, qaFail, ciRounds, changesRequested): the cell is its `median`,
+- **Rework renders one column per signal some group reported** (`MQ_REWORK`: qaRuns, qaFail, ciRounds, changesRequested): the cell is its `median`,
   `n` in the hover. A signal with no finite median is absent, never 0. A new signal needs a
-  label on BOTH clients or it stays hidden.
+  `MQ_REWORK` label or it stays hidden.
 - **Fields the later seams will serve, read when present** (absent = column hidden): per group
   `shadow: {pairs, candidateOnlyBad}` (XERK-1847), `promotion` string (XERK-1848, shown
-  verbatim). A seam that names them differently must change both clients in the same PR.
-- **Android reads the route field by field** (`parseModelQuality` over a raw `JsonElement`), not
-  a typed decode: one wrong-typed field from a later seam drops to its default, as on the web,
-  instead of blanking the card.
+  verbatim). A seam that names them differently must change the page in the same PR.
 - **A pick change clears the old org's view AND error at once**, and a late answer for a scope
-  since left is discarded (`mqStateOrg`/`mqFetchSeq`; Android `mqStateOrg`/`mqSeq`).
-- Tests: the `XERK-1849:` cases in `usage.test.js`; android `ModelQualityTest`,
-  `UsageModelQualityViewModelTest`, `ModelQualitySectionTest`.
+  since left is discarded (`mqStateOrg`/`mqFetchSeq`).
+- Tests: the `XERK-1849:` cases in `insights.test.js`.

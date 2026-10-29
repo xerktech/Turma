@@ -417,31 +417,6 @@ interface HubApi {
         @Query("cmdId") cmdId: String,
     ): Response<StatusChangeResult>
 
-    // Compile an org's brief now (XERK-1573). 200 {ok, brief}; the brief also
-    // rides /api/agents `briefs` + its SSE frame, so only the outcome is read.
-    @POST("api/orgs/{siteKey}/brief")
-    suspend fun briefNow(@Path("siteKey") siteKey: String): OkResponse
-
-    // The permission ledger (XERK-1563): prompts that held a session over the
-    // last `days`, grouped with the rule that would retire each. Its OWN call,
-    // never the atomic /api/agents decode. `org` = comma-separated siteKeys;
-    // null (omitted) = every org. A typed Response so a refusal's words survive.
-    @GET("api/permissions")
-    suspend fun permissions(
-        @Query("days") days: Int,
-        @Query("org") org: String?,
-    ): Response<com.xerktech.turma.model.PermissionSummary>
-
-    // The outcome ledger's report (XERK-1839): per (work class, model) outcome
-    // counts, fleet-wide. `org` + `rows=1` adds that ONE org's session rows; both
-    // null = groups only. Its own call, never the atomic /api/agents decode; raw
-    // JSON, read leniently by `parseModelQuality`.
-    @GET("api/model-quality")
-    suspend fun modelQuality(
-        @Query("org") org: String?,
-        @Query("rows") rows: Int?,
-    ): Response<kotlinx.serialization.json.JsonElement>
-
     // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
     // like the agent pin — an authoritative 200. Body: {enabled:true|false}.
     @POST("api/jira/{siteKey}/autostart")

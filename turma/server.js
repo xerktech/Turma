@@ -620,14 +620,10 @@ const EPIC_RUNS_FILE = process.env.EPIC_RUNS_FILE || "/data/epic-runs.json";
 // the hub restarts must survive so its idea is dispatched, not lost. Small (a few
 // per operator burst, bounded EPIC_BUILDERS_MAX).
 const EPIC_BUILDERS_FILE = process.env.EPIC_BUILDERS_FILE || "/data/epic-builders.json";
-// The per-org brief (XERK-1573): siteKey -> its last few briefs. LOW churn (one
-// write per org per BRIEF_INTERVAL_MIN, plus an operator's on-demand one), so it
-// is a registerExternalStore like epicRuns, not a high-churn ledger.
-const BRIEFS_FILE = process.env.BRIEFS_FILE || "/data/briefs.json";
 // The per-org decisions log (XERK-1574): siteKey -> its last 200 operator
 // decisions. Appended only by OPERATOR actions (an answered question, an answered
 // permission dialog, a typed note) — human-rate writes, so it is a
-// registerExternalStore like briefs; the churn rule bites per-beat data.
+// registerExternalStore; the churn rule bites per-beat data.
 const DECISIONS_FILE = process.env.DECISIONS_FILE || "/data/decisions.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
@@ -3855,190 +3851,6 @@ function publishEpicBuilders() {
   sseBroadcast("epicBuilders", epicBuilders);
 }
 
-// ---- the per-org brief store (XERK-1573) --------------------------------------
-// siteKey -> that org's last briefs, NEWEST FIRST. Served as top-level `briefs` on
-// /api/agents + its own SSE frame, and Android TYPES it — so every record goes
-// through sanitizeBrief, the ONE whitelist, on compose, restore and a remote
-// watch alike (a live record is then a coerce fixed-point, so HA's own-write echo
-// dedups). Bounds are INLINE LITERALS: this runs at module-init, where a const
-// declared below is in its TDZ (the sibling-store rule). Null-prototype map, like
-// the other org-keyed maps (XERK-1451).
-const BRIEF_SECTIONS = ["finished", "needsYou", "waiting", "stalled", "nextUp", "closedStale"];
-const BRIEF_COUNT_KEYS = [...BRIEF_SECTIONS, "intake", "outflow"];
-function sanitizeBriefItem(v) {
-  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
-  const str = (x, n) => (typeof x === "string" && x ? x.slice(0, n) : undefined);
-  const ms = (x) => (Number.isSafeInteger(x) && x > 0 ? x : undefined);
-  const kind = str(v.kind, 20);
-  const title = str(v.title, 200);
-  if (!kind || !title) return null;
-  const out = { kind, title };
-  for (const [k, n] of [["key", 64], ["url", 500], ["prUrl", 500], ["host", 200], ["sessionId", 100],
-    ["transcriptId", 100], ["state", 40], ["why", 200], ["reason", 200], ["note", 300]]) {
-    const s = str(v[k], n);
-    if (s !== undefined) out[k] = s;
-  }
-  for (const k of ["since", "eta"]) if (ms(v[k]) !== undefined) out[k] = v[k];
-  return out;
-}
-function sanitizeBriefSpend(v) {
-  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
-  if (typeof v.label !== "string" || !v.label) return null;
-  const out = { label: v.label.slice(0, 200) };
-  for (const k of ["fiveHourPct", "sevenDayPct"]) {
-    if (typeof v[k] === "number" && Number.isFinite(v[k])) out[k] = Math.min(100, Math.max(0, v[k]));
-  }
-  for (const k of ["fiveHourResetsAt", "sevenDayResetsAt", "capturedAt"]) {
-    if (Number.isSafeInteger(v[k]) && v[k] > 0) out[k] = v[k];
-  }
-  out.paused = v.paused === true;
-  return out;
-}
-function sanitizeBrief(v) {
-  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
-  if (typeof v.siteKey !== "string" || !v.siteKey) return null;
-  if (!Number.isSafeInteger(v.at) || v.at <= 0) return null;
-  const out = {
-    siteKey: v.siteKey.slice(0, 200),
-    at: v.at,
-    since: Number.isSafeInteger(v.since) && v.since > 0 && v.since <= v.at ? v.since : v.at,
-    trigger: v.trigger === "manual" ? "manual" : "scheduled",
-    autoStart: v.autoStart === true,
-  };
-  const counts = {};
-  const rawCounts = v.counts && typeof v.counts === "object" ? v.counts : {};
-  for (const k of BRIEF_COUNT_KEYS) {
-    const n = rawCounts[k];
-    counts[k] = Number.isSafeInteger(n) && n >= 0 ? n : 0;
-  }
-  out.counts = counts;
-  for (const k of BRIEF_SECTIONS) {
-    out[k] = (Array.isArray(v[k]) ? v[k] : []).map(sanitizeBriefItem).filter(Boolean).slice(0, 10);
-  }
-  out.spend = (Array.isArray(v.spend) ? v.spend : []).map(sanitizeBriefSpend).filter(Boolean).slice(0, 10);
-  // The model-written summary (XERK-1574), when a host rendered one: plain text
-  // only, re-cleaned here on every write/restore (cleanBriefNarrative is a fixed
-  // point), and absent — never "" — when there is none, so v1 renders unchanged.
-  const narrative = cleanBriefNarrative(v.narrative);
-  if (narrative) {
-    out.narrative = narrative;
-    if (Number.isSafeInteger(v.narrativeAt) && v.narrativeAt > 0) out.narrativeAt = v.narrativeAt;
-  }
-  // Hub-internal bookkeeping, never on the wire (briefWire strips both): the
-  // digest of the FULL needs-you set (the push compares it — the lists above are
-  // cut at 10), and every merged PR URL a brief already reported, carried forward
-  // on the newest brief alone (the 10-row `finished` list cannot hold them).
-  // Absent stays absent, so a coerced record is still a fixed point.
-  if (typeof v.needsYouSig === "string" && /^(?:[0-9a-f]{40})?$/.test(v.needsYouSig)) {
-    out.needsYouSig = v.needsYouSig;
-  }
-  if (Array.isArray(v.prsReported)) {
-    out.prsReported = [...new Set(v.prsReported.filter((u) => typeof u === "string" && u
-      && u.length <= 500))].slice(0, 500);
-  }
-  return out;
-}
-// What a client is served (/api/agents, the SSE frame, the route): the newest
-// brief in full, each earlier one as its headline only (both clients show just
-// its counts) — so the payload carries one brief's rows per org, not ten. Still
-// the typed shape (empty sections), minus the hub-internal keys.
-function briefWire(b, full) {
-  const out = { ...b };
-  delete out.needsYouSig;
-  delete out.prsReported;
-  if (!full) {
-    for (const k of BRIEF_SECTIONS) out[k] = [];
-    out.spend = [];
-    delete out.narrative;
-    delete out.narrativeAt;
-  }
-  return out;
-}
-// The brief's model-written summary (XERK-1574), as the hub keeps and serves it:
-// ONE paragraph of plain text, at most 1200 characters. The agent cleans its
-// model's reply the same way, but the hub is the whitelist — markup (fences,
-// tags, link syntax, emphasis/heading/table characters, list bullets) and
-// control/bidi characters go, whitespace collapses to single spaces, and an
-// over-long text is cut on a word with "…". A FIXED POINT (cleaning a cleaned
-// text changes nothing), so a sanitized brief stays one for HA's echo dedup.
-// Inline literals: sanitizeBrief runs at module-init (TDZ).
-// The first n CODE POINTS of v (Python's v[:n]), without spreading a huge string.
-function cpPrefix(v, n) {
-  let i = 0;
-  let k = 0;
-  for (const ch of v) {
-    if (k++ === n) break;
-    i += ch.length;
-  }
-  return v.slice(0, i);
-}
-function cleanBriefNarrative(v) {
-  if (typeof v !== "string" || !v) return "";
-  // A standalone HEADING line is dropped, never joined into the next sentence
-  // ("Summary for acme Two pieces…"): a #-heading or a line that is only
-  // *-emphasis (seen before the markup strip), or a short line ending ":"
-  // (seen after it). '#' is markup only as a line-LEADING heading mark (stripped
-  // with the bullets), so "PR #215" keeps it. The cleaned text has no * and
-  // never starts with a heading mark, and any line ending ":" that survived is
-  // longer than the colon bound, so it stays a fixed point.
-  // Lengths are code points ([...t]), as Python's len counts them.
-  const heading = (l) => {
-    const t = l.replace(/^ +| +$/g, "");
-    return /^#{1,6}(?: |$)/.test(t) || ([...t].length <= 80 && /^\*{1,3}[^*]+\*{1,3}:?$/.test(t));
-  };
-  let s = cpPrefix(v, 20000)
-    .replace(/```[^\n]*/g, " ")
-    .replace(/<[^>\n]*>/g, " ")
-    .replace(/!?\[([^\]\n]*)\]\([^)\n]*\)/g, "$1")
-    // Control/bidi/zero-width (all but the newline), then every other
-    // non-newline whitespace, become spaces BEFORE the per-line heading and
-    // bullet passes — a leading one would hide a heading or bullet from this
-    // pass and expose it to the next. Explicit ASCII classes after that, so the
-    // agent's Python mirror (wider \s and \d) agrees exactly.
-    .replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, " ")
-    .replace(/[^\S\n]/g, " ")
-    .split("\n")
-    .filter((l) => !heading(l))
-    .map((l) => l.replace(/[*`~|<>[\]]/g, "")
-      .replace(/^ *(?:(?:[-+]|[0-9]+[.)]|#{1,6})(?: +|$))+/, "")
-      .replace(/ +/g, " ")
-      .replace(/^ | $/g, ""))
-    .filter((l) => !(l.endsWith(":") && [...l].length <= 40))
-    .join(" ")
-    .replace(/ +/g, " ")
-    .replace(/^ | $/g, "");
-  // The cut counts code points too, as the agent's mirror does, so both cut a
-  // text heavy in astral characters (emoji) at the same place.
-  const cps = [...s];
-  if (cps.length > 1200) {
-    const cut = cps.slice(0, 1199);
-    const sp = cut.lastIndexOf(" ");
-    s = `${(sp > 900 ? cut.slice(0, sp) : cut).join("").trimEnd()}…`;
-  }
-  return s;
-}
-function briefsWire() {
-  const out = {};
-  for (const [site, list] of Object.entries(briefs)) out[site] = list.map((b, i) => briefWire(b, i === 0));
-  return out;
-}
-const briefsCoerce = (raw) => {
-  const out = Object.create(null);
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const [site, list] of Object.entries(raw).slice(0, 100)) {
-      if (!site || !Array.isArray(list)) continue;
-      const kept = list.map(sanitizeBrief).filter((b) => b && b.siteKey === site).slice(0, 10);
-      if (kept.length) out[site] = kept;
-    }
-  }
-  return out;
-};
-let briefs = briefsCoerce(readJsonFile(BRIEFS_FILE));
-const persistBriefs = registerExternalStore({
-  name: "briefs", file: BRIEFS_FILE,
-  coerce: briefsCoerce, read: () => briefs, install: (v) => { briefs = v; },
-});
-
 // ---- the per-org decisions log (XERK-1574) ------------------------------------
 // siteKey -> that org's last 200 operator decisions, OLDEST FIRST. Appended by the
 // answer-question and pane-prompt routes (the question + the chosen option) and by
@@ -6527,11 +6339,6 @@ function buildAgentsCache() {
     // channel for the builder UI (subtask E) plus its own SSE event. A NEW
     // top-level key, so an older client just ignores it.
     epicBuilders,
-    // The per-org brief (XERK-1573): siteKey -> its last briefs, newest first.
-    // Hub-owned, sanitized on every write/restore (sanitizeBrief) because Android
-    // TYPES it; clients scope it by the header org filter like every org surface.
-    // The newest brief per org in full, earlier ones as headlines (briefWire).
-    briefs: briefsWire(),
     // The per-org decisions log (XERK-1574): siteKey -> its newest operator
     // decisions, oldest first (decisionsWire's tail). Hub-owned, sanitized on every
     // write/restore (sanitizeDecision) because Android TYPES it.
@@ -8306,9 +8113,7 @@ function pausedSubscriptions(nowMs, opts) {
 }
 
 // The freshest non-stale `limits` per subscription, FLEET-WIDE: a subscription is
-// one shared pool whichever org's host reported it. pausedSubscriptions and the
-// brief's spend (XERK-1573) both read this, so a brief's % and its paused chip
-// always come from the same snapshot.
+// one shared pool whichever org's host reported it, as pausedSubscriptions reads it.
 function freshestLimitsBySub(nowMs) {
   const nowSec = Math.floor(nowMs / 1000);
   const freshest = new Map();  // subKey -> {capturedAt, limits}
@@ -8599,21 +8404,6 @@ function normalizeCloseTicket(payload) {
     return;
   }
   payload.closeTicket = { available: t.available === true };
-}
-
-// The brief-narrative (XERK-1574) capability block: whether this host's manager
-// runs a `renderBrief` command. Only a host reporting it is asked to write an
-// org's summary — an older agent would ack the command and never answer. Coerced
-// like normalizeCloseTicket: strictly boolean, unusable becomes NULL, ABSENT stays
-// absent ("this host can't").
-function normalizeBriefRender(payload) {
-  if (!payload || typeof payload !== "object") return;
-  const t = payload.briefRender;
-  if (!t || typeof t !== "object" || Array.isArray(t)) {
-    if ("briefRender" in payload) payload.briefRender = null;
-    return;
-  }
-  payload.briefRender = { available: t.available === true };
 }
 
 // The sleeper-pause (XERK-1575) capability block: whether this host's manager
@@ -10051,6 +9841,8 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "ticketPriorityResults", "ticketLinkResults", "ticketOutcomeResults",
   "spawnFailures", "epicBuilderStatus", "permissionEvents", "attentionHints",
+  // briefRender/briefNarratives: the retired org brief (XERK-2386); an older
+  // agent still sends them, and the heartbeat handler drops them.
   "briefRender", "briefNarratives", "modelShadow", "shadowRuns", "defectReports",
 ]);
 
@@ -10438,10 +10230,13 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeLocalModel(a);
   normalizeDsh(a);
   normalizeQwen(a);
+  // The retired org brief (XERK-2386): a record restored from an older hub's
+  // state, or beaten by an older agent, carries none of its blocks.
+  delete a.briefRender;
+  delete a.briefNarratives;
   normalizeTriage(a);
   normalizeTrajectory(a);
   normalizeCloseTicket(a);
-  normalizeBriefRender(a);
   normalizePauseSleepers(a);
   normalizeModelShadow(a);
   normalizeShadowRuns(a);
@@ -15818,9 +15613,7 @@ function ticketQueueOrder(rows) {
   return out;
 }
 
-// One org's auto-start candidates IN ORDER — the sweep's walk AND the org brief's
-// "what starts next" (XERK-1573), one list so the brief can't name an order the
-// sweep doesn't follow: To Do rows with a repo, not ignore-tier, stably sorted on
+// One org's auto-start candidates IN ORDER — the sweep's walk: To Do rows with a repo, not ignore-tier, stably sorted on
 // triageSortKey (board order within an identical key).
 // XERK-635: an epic and its children never ride the org auto-start stream — an
 // epic is not a work ticket, and a child is started by its epic run in dependency
@@ -17113,454 +16906,19 @@ function epicRunCompleteSweep() {
   }
 }
 
-// ---- the per-org brief (XERK-1573) --------------------------------------------
-// What the operator would otherwise open every session to learn, per org: what
-// finished, what waits on them and why, what waits on time, what is stalled, what
-// starts next and why, what a session closed as stale, and the subscription
-// spend. v1 is STRUCTURED — compiled from hub data only (the board rows, each
-// session's hub-stamped attention, ticket.outcome, limits), no model, no tracker
-// read. ONE leader sweep iterating orgs, one record per org; never a session per
-// org. The store, its sanitizer and the wire shape are above (sanitizeBrief).
-const BRIEF_INTERVAL_MS = positiveEnv("BRIEF_INTERVAL_MIN", 240) * 60 * 1000;
-const BRIEFS_KEEP = 10;      // briefsCoerce inlines the same 10 (module-init TDZ)
-const BRIEF_NEXT_MAX = 5;    // "what starts next" names this many
-const BRIEF_RETAIN_MS = 30 * 24 * 3600 * 1000;   // an org with no host: briefs kept this long
+// An org no host is decided into any more keeps its decisions log this long past
+// its newest entry (a host that went quiet or is being re-bound gets it back).
+const DECISIONS_RETAIN_MS = 30 * 24 * 3600 * 1000;
 
-// The orgs a brief is compiled for: every org some host is DECIDED into — the
-// org boundary every other org surface keys on, never a claimed jira.siteKey.
-function briefOrgs() {
+// Every org some host is DECIDED into — the org boundary every other org surface
+// keys on, never a claimed jira.siteKey.
+function decidedOrgs() {
   const out = new Set();
   for (const a of Object.values(agents)) {
     const org = decidedOrgOf(a);
     if (org) out.add(org);
   }
   return out;
-}
-
-// A duration as the brief words it — ONE rule with brief.html `dur` and Android
-// `briefDur` (pinned by the XERK-1573 parity test): minutes stop below the hour
-// (3570s rounds to 60m), so a 61-minute-old ticket reads "1h" here exactly as the
-// page's own ages do, never fmtDur's "61m"; hours run to two days, then days.
-function briefDur(ms) {
-  const s = Math.max(0, Math.round(ms / 1000));
-  if (s < 90) return `${s}s`;
-  if (s < 3570) return `${Math.round(s / 60)}m`;
-  if (s < 172800) return `${Math.round(s / 3600)}h`;
-  return `${Math.round(s / 86400)}d`;
-}
-
-// Why this ticket is next in the auto-start order — the triageSortKey terms, in
-// the order they decide: a P0 preempts, else the oldest goes first; type and a
-// non-default repo tier only break ties.
-function briefNextReason(t, repo, now) {
-  const tr = t && t.triage && typeof t.triage === "object" ? t.triage : null;
-  const created = t && typeof t.created === "string" ? Date.parse(t.created) : NaN;
-  const parts = [tr && tr.priority === "P0" ? "P0 preempts the line" : "oldest first"];
-  parts.push(Number.isFinite(created)
-    ? `created ${briefDur(Math.max(0, now - created))} ago` : "no created date");
-  if (tr && typeof tr.type === "string" && tr.type) parts.push(`type ${tr.type}`);
-  const tier = repoTier(repo);
-  if (tier !== DEFAULT_REPO_TIER) parts.push(`${tier} repo`);
-  return parts.join(" · ");
-}
-
-// Compile one org's brief from hub data. Pure over the registry/board/queue
-// state (writes nothing); the caller stores it. `prevList` is the org's kept
-// briefs, newest first — the period starts at the newest one.
-function compileBrief(siteKey, now, trigger, prevList) {
-  prevList = prevList || [];
-  const prev = prevList[0] || null;
-  const since = prev ? prev.at : now - BRIEF_INTERVAL_MS;
-  const inPeriod = (ms) => Number.isFinite(ms) && ms > since && ms <= now;
-  const isoIn = (iso) => inPeriod(typeof iso === "string" ? Date.parse(iso) : NaN);
-  const hosts = Object.entries(agents).filter(([, a]) => a && decidedOrgOf(a) === siteKey);
-  const title = (key, s) => s.summary || s.label || s.rcName || `${key} · ${s.id}`;
-  const ticketKey = (s) => (s.ticket && typeof s.ticket.key === "string" ? s.ticket.key : undefined);
-  const rows = fleetTicketRows();
-  const orgRows = ticketRowsForSite(rows, siteKey).map((r) => r.row).filter((t) => t && t.key);
-
-  // Finished since the last brief: Done tickets (resolved — or, from an agent
-  // predating `resolved`, last updated — in the period), merged PRs, ended
-  // sessions — each piece of work ONCE (stale-closed tickets and the ended
-  // sessions are cut below, once closedStale is known). Intake/outflow count the same rows' created/resolved
-  // dates. The rows are what the hosts poll (assignee-scoped, recent Done only).
-  const finished = [];
-  let intake = 0;
-  let outflow = 0;
-  for (const t of orgRows) {
-    if (isoIn(t.created)) intake++;
-    if (t.statusCategory === "done" && isoIn(t.resolved || t.updated)) {
-      outflow++;
-      finished.push({ kind: "ticket", key: t.key, title: t.summary || t.key, url: t.url,
-        since: Date.parse(t.resolved || t.updated) });
-    }
-  }
-  // A PR carries no merge time, so "merged since the last brief" is a MERGED PR
-  // no earlier brief reported. That memory is `prsReported`, carried forward on
-  // the newest brief — never the `finished` rows, which keep only 10 and drop
-  // with their brief (a brief from before `prsReported` still counts its rows).
-  const reported = new Set(prev && Array.isArray(prev.prsReported) ? prev.prsReported : []);
-  for (const b of prevList) {
-    for (const it of b.finished || []) if (it.kind === "pr" && it.url) reported.add(it.url);
-  }
-  const seenPrs = new Set(reported);
-  const newPrs = [];
-  const visiblePrs = new Set();   // every MERGED PR the org's sessions still carry
-  // A URL past sanitizeBrief's 500-char cap could never be remembered (the
-  // memory drops it, the `finished` row cuts it), so it would be finished in
-  // every brief; no real GitHub/GitLab/ADO PR URL is that long — skip it.
-  const mergedOf = (s) => (Array.isArray(s && s.prs) ? s.prs : []).filter((p) =>
-    p && typeof p.url === "string" && p.url && p.url.length <= 500
-    && String(p.state || "").toUpperCase() === "MERGED");
-  const addPrs = (key, s) => {
-    for (const p of mergedOf(s)) {
-      if (seenPrs.has(p.url)) continue;
-      seenPrs.add(p.url);
-      newPrs.push(p.url);
-      finished.push({ kind: "pr", url: p.url, title: p.title || p.url, host: key,
-        sessionId: s.id, key: ticketKey(s) });
-    }
-  };
-  for (const [, a] of hosts) {
-    for (const s of [...(a.sessions || []), ...(a.closedSessions || [])]) {
-      for (const p of mergedOf(s)) visiblePrs.add(p.url);
-    }
-  }
-  const ended = [];   // sessions that ended in the period; cut against the rest below
-  for (const [key, a] of hosts) {
-    for (const s of a.sessions || []) if (s) addPrs(key, s);
-    for (const c of a.closedSessions || []) {
-      if (!c || !isoIn(c.closedAt)) continue;
-      // A sleeper paused for its slot (XERK-1575) did not END: it is asleep, read
-      // under Waiting below, never a Finished row. Its merged PRs still count.
-      if (wirePaused(c.paused)) { addPrs(key, c); continue; }
-      ended.push({ kind: "session", title: title(key, c), host: key, sessionId: c.id,
-        key: ticketKey(c), since: Date.parse(c.closedAt),
-        transcriptId: typeof c.transcriptId === "string" ? c.transcriptId : undefined,
-        prUrls: mergedOf(c).map((p) => p.url) });   // matching only; sanitizeBrief drops it
-      addPrs(key, c);
-    }
-  }
-
-  // Needs-you / waiting / stalled: the hub's own attention stamp (XERK-1571),
-  // ONLINE hosts only — an offline host's state is frozen at its last beat.
-  // Oldest first; waiting by ETA.
-  const needsYou = [];
-  const waiting = [];
-  const stalled = [];
-  for (const [key, a] of hosts) {
-    if (!agentBlockOnline(a, now)) continue;
-    const alertSessions = a.alerts && a.alerts.sessions;
-    for (const s of a.sessions || []) {
-      if (!s || s.status !== "running") continue;
-      const attn = wireAttention(alertSessions && alertSessions[s.id] && alertSessions[s.id].attn);
-      if (!attn) continue;
-      const item = { kind: "session", title: title(key, s), host: key, sessionId: s.id,
-        state: attn.state, why: attn.why, since: attn.since, eta: attn.eta, key: ticketKey(s) };
-      if (attn.state === "needs-you:stalled") stalled.push(item);
-      else if (attn.state.startsWith("needs-you:")) needsYou.push(item);
-      else if (attn.state === "waiting" || attn.state === "sleeping") waiting.push(item);
-    }
-    // A sleeper paused for its slot (XERK-1575) is a closed record with no
-    // attention stamp, yet it is asleep until its wake, exactly as the Sessions
-    // page reads it — never dropped from Waiting for having given up its slot.
-    const live = new Set((a.sessions || []).map((s) => s && s.id));
-    for (const c of a.closedSessions || []) {
-      const p = c && !live.has(c.id) ? wirePaused(c.paused) : null;
-      if (!p) continue;
-      const since = Date.parse(c.closedAt);
-      waiting.push({ kind: "session", title: title(key, c), host: key, sessionId: c.id,
-        state: "sleeping", why: p.wakeReason || "paused until its wake",
-        since: p.at || (Number.isFinite(since) ? since : undefined), eta: p.wakeAt,
-        key: ticketKey(c) });
-    }
-  }
-  const bySince = (x, y) => (x.since || 0) - (y.since || 0);
-  needsYou.sort(bySince);
-  stalled.sort(bySince);
-  waiting.sort((x, y) => (x.eta || Infinity) - (y.eta || Infinity));
-
-  // What starts next: the org's line in the hub queue (drain order), then — with
-  // auto-start on — the auto-start order (autoStartCandidates, XERK-1567's key)
-  // past the gates the sweep applies, each with the reason it is next.
-  const autoStart = !!autoStartOrgs[siteKey];
-  const nextUp = [];
-  const lined = new Set();
-  for (const e of ticketQueueOrder(rows)) {
-    if (e.siteKey !== siteKey || e.expiredAt) continue;
-    lined.add(e.issueKey);
-    const hit = rows.get(ticketQueueKey(siteKey, e.issueKey));
-    const t = hit ? hit.row : null;
-    nextUp.push({ kind: "ticket", key: e.issueKey, title: (t && t.summary) || e.issueKey,
-      url: t && t.url, since: e.at,
-      reason: `queued (${e.reason || "capacity"}) · ${briefNextReason(t, ticketRepo(siteKey, e.issueKey, rows), now)}` });
-  }
-  if (autoStart) {
-    const started = startedTicketKeys();
-    for (const { t, repo } of autoStartCandidates(siteKey, rows)) {
-      if (lined.has(t.key) || started.has(siteKey + "\x00" + t.key)) continue;
-      const action = ticketTriageAction(siteKey, t.key);
-      if (action === "hold" || action === "reject") continue;
-      if (action !== "approve"
-        && (triageGateReason(t, siteKey, rows) || triagePolicyReason(siteKey, t.triage, repo))) continue;
-      if (spawnTicketInFlight(siteKey, t.key)) continue;
-      // The sweep holds a ticket in its retry backoff: still in line, but say so.
-      const prior = autoStarted.get(siteKey + "\x00" + t.key);
-      const backoff = prior && now < prior.nextAt
-        ? ` · retrying in ${briefDur(prior.nextAt - now)}` : "";
-      nextUp.push({ kind: "ticket", key: t.key, title: t.summary || t.key, url: t.url,
-        reason: briefNextReason(t, repo, now) + backoff });
-    }
-  }
-
-  // Tickets a session closed as stale (XERK-1569 ticket.outcome) in the period.
-  const closedStale = [];
-  const staleSeen = new Set();
-  const addStale = (key, s) => {
-    const t = s && s.ticket;
-    const o = t && t.outcome;
-    if (!o || (o.kind !== "not-reproducible" && o.kind !== "already-fixed")) return;
-    if (t.siteKey !== siteKey || typeof t.key !== "string" || !inPeriod(o.at)) return;
-    if (staleSeen.has(t.key)) return;
-    staleSeen.add(t.key);
-    closedStale.push({ kind: "ticket", key: t.key, title: t.summary || t.key, url: t.url,
-      reason: o.kind, note: o.note, since: o.at, host: key, sessionId: s.id });
-  };
-  for (const [key, a] of hosts) {
-    for (const s of a.sessions || []) addStale(key, s);
-    for (const c of a.closedSessions || []) addStale(key, c);
-    for (const r of a.repos || []) for (const c of (r && r.resumable) || []) addStale(key, c);
-  }
-
-  // A ticket closed as stale is NOT finished work, though XERK-1569 moves it to a
-  // Done-category status (Won't Do, Cannot Reproduce) and its board row then
-  // reads done + resolved in the period: Closed as stale is its one row. It
-  // still counts in outflow — it did leave the board.
-  const staleKeys = new Set(closedStale.map((it) => it.key));
-  for (let i = finished.length - 1; i >= 0; i--) {
-    if (finished[i].kind === "ticket" && staleKeys.has(finished[i].key)) finished.splice(i, 1);
-  }
-
-  // An ended session is the SAME piece of work as a row already counted when its
-  // merged PR is a Finished row, its ticket's Done row is, or its ticket was
-  // closed as stale — so it is a Finished row only when nothing else stands for
-  // it (else one piece of work counts two or three times). A Done ticket takes
-  // the host of the session that worked it, so the "where" is not lost.
-  const sessionTag = (host, id) => `${host}\x00${id}`;
-  const covered = new Set();
-  for (const it of finished) if (it.kind === "pr") covered.add(sessionTag(it.host, it.sessionId));
-  for (const it of closedStale) covered.add(sessionTag(it.host, it.sessionId));
-  // By URL too: two sessions carrying one merged PR give it ONE row (seenPrs), and
-  // the session that did not get it is that same piece of work.
-  const prRowUrls = new Set(finished.filter((it) => it.kind === "pr").map((it) => it.url));
-  const doneTickets = new Map(finished.filter((it) => it.kind === "ticket").map((it) => [it.key, it]));
-  for (const e of ended) {
-    const done = e.key ? doneTickets.get(e.key) : undefined;
-    if (done && !done.host) done.host = e.host;
-    if (done || (e.key && staleKeys.has(e.key)) || covered.has(sessionTag(e.host, e.sessionId))
-      || e.prUrls.some((u) => prRowUrls.has(u))) continue;
-    finished.push(e);
-  }
-  // A merged PR on a ticket whose Done row is here is that SAME piece of work
-  // (the hands-off flow: the session merges, the ticket goes Done), so it folds
-  // INTO the ticket row as its PR link — never a second Finished row. It stays in
-  // this brief's reported-PR memory (newPrs), so no later brief re-reports it.
-  for (let i = finished.length - 1; i >= 0; i--) {
-    const it = finished[i];
-    const done = it.kind === "pr" && it.key ? doneTickets.get(it.key) : undefined;
-    if (!done) continue;
-    done.prUrl = it.url;   // walking back, the ticket keeps its FIRST PR's link
-    if (!done.host) done.host = it.host;
-    finished.splice(i, 1);
-  }
-
-  // Spend vs the subscription window (XERK-544): one entry per subscription the
-  // org's hosts spend, that subscription's freshest non-stale `limits` FLEET-WIDE
-  // (the same reading pausedSubscriptions judges, so the % and the paused chip
-  // agree), and whether it pauses auto-start. A window whose reset has passed has
-  // rolled over — no figure.
-  const nowSec = Math.floor(now / 1000);
-  const paused = pausedSubscriptions(now);
-  const freshestLim = freshestLimitsBySub(now);
-  const subs = new Map();
-  for (const [key, a] of hosts) {
-    const subKey = subscriptionKeyOf(key, a);
-    let g = subs.get(subKey);
-    if (!g) subs.set(subKey, (g = { hosts: [], label: "", lim: null }));
-    g.hosts.push(key);
-    if (!g.label && a.subscription && a.subscription.label) g.label = a.subscription.label;
-    const f = freshestLim.get(subKey);
-    if (f) g.lim = f.limits;
-  }
-  const spend = [];
-  for (const [subKey, g] of subs) {
-    if (!g.lim) continue;
-    const entry = { label: g.label || g.hosts.join(", "), paused: paused.has(subKey),
-      capturedAt: Math.round((g.lim.capturedAt || 0) * 1000) };
-    for (const [win, name] of [["fiveHour", "fiveHour"], ["sevenDay", "sevenDay"]]) {
-      const w = g.lim[win];
-      if (!w || typeof w.usedPct !== "number") continue;
-      if (typeof w.resetsAt === "number" && w.resetsAt <= nowSec) continue;
-      entry[name + "Pct"] = w.usedPct;
-      if (typeof w.resetsAt === "number") entry[name + "ResetsAt"] = Math.round(w.resetsAt * 1000);
-    }
-    spend.push(entry);
-  }
-
-  // The reported-PR memory, bounded by sanitizeBrief's 500: this brief's new
-  // ones, then the remembered ones a session still carries (the ones that could
-  // be re-reported), then the rest — so a cut drops the PRs no longer visible.
-  const carried = [...reported];
-  const prsReported = [...newPrs, ...carried.filter((u) => visiblePrs.has(u)),
-    ...carried.filter((u) => !visiblePrs.has(u))];
-
-  return sanitizeBrief({
-    siteKey, at: now, since, trigger, autoStart,
-    counts: { finished: finished.length, needsYou: needsYou.length, waiting: waiting.length,
-      stalled: stalled.length, nextUp: nextUp.length, closedStale: closedStale.length,
-      intake, outflow },
-    finished, needsYou, waiting, stalled,
-    nextUp: nextUp.slice(0, BRIEF_NEXT_MAX), closedStale, spend,
-    needsYouSig: briefSigOf([...needsYou, ...stalled]), prsReported,
-  });
-}
-
-// The needs-you SET a brief carries, as a comparable digest: the push fires only
-// when it changes between two consecutive briefs (stalled included — it is a
-// needs-you state). compileBrief digests the FULL set before the 10-row cut, so a
-// newcomer past the cut still changes it; an empty set is "" (the retract case).
-function briefSigOf(items) {
-  const sig = items.map((i) => `${i.host}\x00${i.sessionId}\x00${i.state}`).sort().join("\n");
-  return sig ? crypto.createHash("sha1").update(sig).digest("hex") : "";
-}
-function briefNeedsYouSig(b) {
-  if (!b) return "";
-  if (typeof b.needsYouSig === "string") return b.needsYouSig;
-  // A brief stored before the digest: its (≤10-row) lists, the same digest.
-  return briefSigOf([...(b.needsYou || []), ...(b.stalled || [])]);
-}
-
-// One FCM push per brief, ONLY when the needs-you set changed since the org's
-// previous brief, under one notifKey per org so a new one REPLACES the last; a
-// set that emptied retracts it instead. Carries the headline counts.
-function briefPush(brief, prev) {
-  const sig = briefNeedsYouSig(brief);
-  if (sig === briefNeedsYouSig(prev)) return false;
-  const notifKey = `brief:${brief.siteKey}`;
-  if (!sig) { dismiss(notifKey); return true; }
-  const c = brief.counts;
-  const n = c.needsYou + c.stalled;
-  const org = brief.siteKey.replace(/\.atlassian\.net$/, "");
-  const parts = [`${c.needsYou} waiting on you`];
-  if (c.stalled) parts.push(`${c.stalled} stalled`);
-  parts.push(`${c.waiting} waiting`, `${c.finished} finished`);
-  if (brief.nextUp.length) parts.push(`next: ${brief.nextUp[0].key}`);
-  notify(`${org} brief: ${n} need${n === 1 ? "s" : ""} you`, parts.join(" · "), {
-    tags: "clipboard", notifKey,
-  });
-  return true;
-}
-
-// Compile, store and announce one org's brief (the sweep's per-org unit, and the
-// on-demand route's). Newest first, BRIEFS_KEEP kept.
-function briefSweep(siteKey, trigger = "scheduled", now = Date.now()) {
-  const prevList = briefs[siteKey] || [];
-  const brief = compileBrief(siteKey, now, trigger, prevList);
-  // The reported-PR memory rides the newest brief alone (it carries forward).
-  const older = prevList.map((b) => {
-    if (!b.prsReported) return b;
-    const o = { ...b };
-    delete o.prsReported;
-    return o;
-  });
-  briefs[siteKey] = [brief, ...older].slice(0, BRIEFS_KEEP);
-  persistBriefs();
-  invalidateAgentsCache();
-  sseBroadcast("briefs", briefsWire());
-  briefPush(brief, prevList[0] || null);
-  requestBriefNarrative(brief);
-  return brief;
-}
-
-// ---- the brief's narrative (XERK-1574) ----------------------------------------
-// The hub has no model access, so a fresh brief asks ONE online host of its org
-// (one reporting `briefRender.available`) to write a short plain-text summary of
-// it: a `renderBrief` command carrying the structured brief alone — never a
-// transcript — which the agent runs through a locked-down Haiku `claude -p` off
-// its beat and hands back as a `briefNarratives` row. ONE request per org in
-// flight (a newer brief replaces an undelivered older one); only the host asked,
-// for the brief asked about, still in that org, can answer it. No capable host,
-// a failed render, or a hub restart mid-render just leaves the brief without one.
-const briefRenders = new Map(); // siteKey -> {host, at, cmdId}
-
-// The structured brief the model summarises: the served shape minus the ids and
-// links a summary has no use for (they cost tokens and invite the model to quote
-// them).
-function briefNarrativeInput(b) {
-  const out = briefWire(b, true);
-  delete out.narrative;
-  delete out.narrativeAt;
-  for (const k of BRIEF_SECTIONS) {
-    out[k] = out[k].map((it) => {
-      const o = { ...it };
-      for (const drop of ["url", "prUrl", "sessionId", "transcriptId"]) delete o[drop];
-      return o;
-    });
-  }
-  return out;
-}
-
-function requestBriefNarrative(brief) {
-  const siteKey = brief.siteKey;
-  // A host whose Claude login has lapsed advertises the capability but cannot
-  // run claude -p, so a logged-in capable host is preferred; one that needs a
-  // login is asked only when no other can be.
-  const capable = jiraHostPool(siteKey, true).filter((k) => {
-    const a = agents[k];
-    return a && a.briefRender && a.briefRender.available === true;
-  });
-  const host = capable.find((k) => !(agents[k].claudeAuth && agents[k].claudeAuth.needsLogin === true))
-    || capable[0];
-  const prev = briefRenders.get(siteKey);
-  if (prev) dropQueuedCommand(prev.host, prev.cmdId, "renderBrief");
-  briefRenders.delete(siteKey);
-  if (!host) return null;
-  const cmdId = queueCommand(host, { type: "renderBrief", siteKey, briefAt: brief.at,
-    brief: briefNarrativeInput(brief) });
-  briefRenders.set(siteKey, { host, at: brief.at, cmdId });
-  return cmdId;
-}
-
-// Fold the agents' `briefNarratives` rows onto their briefs. A row is taken only
-// from the host the hub asked, for the brief it asked about, while that host is
-// still decided into the org — so no host can write another org's summary, or a
-// summary nobody asked for. The text is re-cleaned (sanitizeBrief is the
-// whitelist); an empty one leaves the brief as it was.
-function ingestBriefNarratives(key, rows, now = Date.now()) {
-  if (!Array.isArray(rows)) return false;
-  let changed = false;
-  for (const r of rows.slice(0, 5)) {
-    if (!r || typeof r !== "object" || Array.isArray(r)) continue;
-    const { siteKey, briefAt } = r;
-    if (typeof siteKey !== "string" || !Number.isSafeInteger(briefAt)) continue;
-    const want = briefRenders.get(siteKey);
-    if (!want || want.host !== key || want.at !== briefAt) continue;
-    if (!agents[key] || decidedOrgOf(agents[key]) !== siteKey) continue;
-    briefRenders.delete(siteKey);
-    const list = briefs[siteKey] || [];
-    const i = list.findIndex((b) => b.at === briefAt);
-    if (i < 0) continue;
-    const next = sanitizeBrief({ ...list[i], narrative: r.text, narrativeAt: now });
-    if (!next || !next.narrative) continue;
-    briefs[siteKey] = list.map((b, j) => (j === i ? next : b));
-    changed = true;
-  }
-  if (changed) {
-    persistBriefs();
-    invalidateAgentsCache();
-    sseBroadcast("briefs", briefsWire());
-  }
-  return changed;
 }
 
 // ---- the decisions log's writers + readers (XERK-1574) ------------------------
@@ -17719,44 +17077,22 @@ function decisionsReplyFor(key) {
   return { org, entries };
 }
 
-// The cadence gate, on the leader's orchestration tick: an org gets a fresh brief
-// BRIEF_INTERVAL_MS after its newest one — or, with none stored, after this hub
-// booted (the store persists, so a restart keeps the cadence; a fresh hub's first
-// brief is one interval in, or whenever the operator asks for one).
-// An org no host is decided into any more keeps its briefs BRIEF_RETAIN_MS past
-// its newest one (a host that went quiet or is being re-bound gets them back),
-// then they are dropped — nothing else ever removes a store key.
-function briefTick(now = Date.now()) {
-  const orgs = briefOrgs();
+// On the leader's orchestration tick: an org no host is decided into any more
+// keeps its decisions log DECISIONS_RETAIN_MS past its newest entry, then it is
+// dropped — nothing else ever removes a store key.
+function decisionsTick(now = Date.now()) {
+  const orgs = decidedOrgs();
   let pruned = false;
-  for (const [siteKey, list] of Object.entries(briefs)) {
-    if (orgs.has(siteKey) || now - ((list && list[0] && list[0].at) || 0) < BRIEF_RETAIN_MS) continue;
-    delete briefs[siteKey];
+  for (const [siteKey, list] of Object.entries(decisions)) {
+    const newest = (list && list.length && list[list.length - 1].at) || 0;
+    if (orgs.has(siteKey) || now - newest < DECISIONS_RETAIN_MS) continue;
+    delete decisions[siteKey];
     pruned = true;
   }
   if (pruned) {
-    persistBriefs();
-    invalidateAgentsCache();
-    sseBroadcast("briefs", briefsWire());
-  }
-  // The decisions log ages out the same way (XERK-1574): kept BRIEF_RETAIN_MS past
-  // its newest entry once no host is decided into the org.
-  let prunedDecisions = false;
-  for (const [siteKey, list] of Object.entries(decisions)) {
-    const newest = (list && list.length && list[list.length - 1].at) || 0;
-    if (orgs.has(siteKey) || now - newest < BRIEF_RETAIN_MS) continue;
-    delete decisions[siteKey];
-    prunedDecisions = true;
-  }
-  if (prunedDecisions) {
     persistDecisions();
     invalidateAgentsCache();
     broadcastDecisions();
-  }
-  for (const siteKey of orgs) {
-    const last = (briefs[siteKey] || [])[0];
-    if (now - (last ? last.at : BOOT_AT) < BRIEF_INTERVAL_MS) continue;
-    briefSweep(siteKey, "scheduled", now);
   }
 }
 
@@ -17807,8 +17143,8 @@ function masterOrchestrationTick() {
   // Epic completion (XERK-637): after autoCloseSweep has produced any child Done
   // edges this tick, move an all-children-Done epic to Done and retire its run.
   epicRunCompleteSweep();
-  // The per-org brief (XERK-1573): a fresh one per org every BRIEF_INTERVAL_MIN.
-  briefTick();
+  // Age out the decisions log of an org no host is in any more (XERK-1574).
+  decisionsTick();
   // Fold ticket sessions into the outcome ledger (XERK-1839). Observes only.
   outcomeLedgerSweep();
   // Sample merged tickets into shadow runs on cheaper models (XERK-1847).
@@ -17972,7 +17308,7 @@ const INDEX = htmlPage("index.html");
 const USAGE = htmlPage("usage.html");
 const SESSIONS = htmlPage("sessions.html");
 const BOARD = htmlPage("board.html");
-const BRIEF = htmlPage("brief.html");
+const INSIGHTS = htmlPage("insights.html");
 // Not an `htmlPage`: the login form is served `no-store` (a cached login page
 // is its own problem), so it has no conditional-GET path to carry an ETag for.
 const LOGIN = withHashedAssets(readAsset("login.html"));
@@ -19882,8 +19218,14 @@ const server = http.createServer(async (req, res) => {
       return sendPage(req, res, USAGE);
     }
 
+    if (req.method === "GET" && (url.pathname === "/insights" || url.pathname === "/insights.html")) {
+      return sendPage(req, res, INSIGHTS);
+    }
+
+    // The retired org brief page (XERK-2386): a bookmark lands on its successor.
     if (req.method === "GET" && (url.pathname === "/brief" || url.pathname === "/brief.html")) {
-      return sendPage(req, res, BRIEF);
+      res.writeHead(301, { Location: "/insights" });
+      return res.end();
     }
 
     // The page was /history until it dropped cost and became token-only. Keep
@@ -20160,9 +19502,9 @@ const server = http.createServer(async (req, res) => {
       // into each session's attention by heartbeatAlerts, never stored raw.
       const attentionHints = normalizeAttentionHints(payload.attentionHints);
       delete payload.attentionHints;
-      // The brief narratives this host rendered (XERK-1574) — folded onto their
-      // briefs below (ingestBriefNarratives checks the hub asked), never stored.
-      const briefNarratives = payload.briefNarratives;
+      // The retired org brief's render capability + output (XERK-2386): an older
+      // agent still sends them; nothing reads them.
+      delete payload.briefRender;
       delete payload.briefNarratives;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
@@ -20482,12 +19824,6 @@ const server = http.createServer(async (req, res) => {
         enforceCacheTotalBudget();
       }
       heartbeatAlerts(key, prev, next, attentionHints);
-      // A brief summary this host was asked for (XERK-1574). Never worth the beat.
-      try {
-        ingestBriefNarratives(key, briefNarratives);
-      } catch (e) {
-        console.error(`brief narrative ingest failed: ${e && e.message}`);
-      }
       rearmMovedWatches(key, prev, next);
       // A migration finishes the instant its target session heartbeats in — do
       // the handoff (kill source, mark done) now rather than waiting out the
@@ -21174,7 +20510,7 @@ const server = http.createServer(async (req, res) => {
       // XERK-791: a restore WRITES the local index (`restampOrg` re-points the row),
       // so it must not run concurrently with a hydrate — the same rule the ingest
       // routes and the beat cursor path follow. 503 "still syncing"; the operator
-      // (or the page's retry) re-issues once the brief boot/promotion hydrate ends.
+      // (or the page's retry) re-issues once the boot/promotion hydrate ends.
       // Inert off HA.
       if (archive.isHydrating()) {
         return json(res, 503, { error: "archive index is still syncing on this replica — retry" });
@@ -23229,21 +22565,6 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, enabled: body.enabled });
     }
 
-    // POST /api/orgs/<siteKey>/brief — compile that org's brief NOW (XERK-1573),
-    // the on-demand twin of the leader's BRIEF_INTERVAL_MIN cadence. Operator-
-    // authed and authoritative on the 200 (returns the brief; it also rides
-    // /api/agents + the `briefs` SSE frame). The org must be one a host is DECIDED
-    // into — never a phantom org that would mint a store key. It resets the cadence
-    // and, like a scheduled brief, pushes only if the needs-you set changed.
-    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
-        parts.length === 4 && parts[3] === "brief") {
-      const siteKey = decodeURIComponent(parts[2]);
-      if (!briefOrgs().has(siteKey)) {
-        return json(res, 404, { error: "no host is in that org" });
-      }
-      return json(res, 200, { ok: true, brief: briefWire(briefSweep(siteKey, "manual"), true) });
-    }
-
     // POST /api/orgs/<siteKey>/decisions {text} — record an operator decision in
     // that org's log by hand (XERK-1574), beside the ones the answer routes record.
     // Operator-authed, authoritative on the 200 (returns the entry; it also rides
@@ -23261,7 +22582,7 @@ const server = http.createServer(async (req, res) => {
           limit: DECISION_NOTE_MAX,
         });
       }
-      if (!briefOrgs().has(siteKey)) {
+      if (!decidedOrgs().has(siteKey)) {
         return json(res, 404, { error: "no host is in that org" });
       }
       return json(res, 200, { ok: true, decision: appendDecision(siteKey, { source: "note", text }) });
@@ -24059,7 +23380,6 @@ if (process.env.TURMA_TEST) {
       // read the mirrors the coerce/watch/seed path installs into.
       epicRuns: () => epicRuns,
       epicBuilders: () => epicBuilders,
-      briefs: () => briefs,
       decisions: () => decisions,
     },
     // XERK-756: the HA fleet-registry externalization. Exported so tests can
@@ -24157,7 +23477,6 @@ if (process.env.TURMA_TEST) {
     normalizeTriage,
     normalizeTrajectory,
     normalizeCloseTicket,
-    normalizeBriefRender,
     // XERK-1575: slot policy v2 (pause a sleeper, resume it at its wake).
     normalizePauseSleepers, wirePaused, sleeperPausable, wakePausedSleepers,
     pauseSleepersFor, sleeperPauseTried, sleeperWakeTried, sleeperUnpauseTried, sleeperResumeHold,
@@ -24545,15 +23864,12 @@ if (process.env.TURMA_TEST) {
     // hold each rule directly rather than only through a full sweep.
     triageGateReason,
     triageSortKey,
-    // The per-org brief (XERK-1573). `briefs` is a getter: a restore/watch
-    // install REPLACES the map.
-    getBriefs: () => briefs,
+    // The per-org decisions log (XERK-1574). A getter: a restore/watch install
+    // REPLACES the map.
     getDecisions: () => decisions, decisionsCoerce, sanitizeDecision, appendDecision,
-    decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, permissionAnswerKind, cleanBriefNarrative, requestBriefNarrative,
-    ingestBriefNarratives, briefRenders, briefNarrativeInput,
-    briefsCoerce, sanitizeBrief, compileBrief, briefSweep, briefTick, briefNeedsYouSig,
-    briefDur, briefNextReason,
-    autoStartCandidates, BRIEF_INTERVAL_MS,
+    decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, permissionAnswerKind,
+    decisionsTick, decidedOrgs, DECISIONS_RETAIN_MS,
+    autoStartCandidates,
     ticketQueueOrder,
     TRIAGE_PRIORITY_RANK,
     TRIAGE_TYPE_WEIGHT,

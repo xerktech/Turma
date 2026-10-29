@@ -307,9 +307,6 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   - **The handoff itself unpauses** (`unpauseMovedSleepers` in `advanceMigrations`): the move's
     source record, and ANY host's paused record of a restored transcript — a restore is not
     org-scoped, so after its done record retires the org-scoped check would miss it.
-- **The brief reads it as asleep, never finished** (`compileBrief`): a closed record carrying a
-  valid `paused` is no Finished row (its merged PRs still count) and is a Waiting row on an online
-  host, `state:"sleeping"`, `eta` its wake, `why` its reason. A live copy of the id wins.
 - **Never alerted.** A paused sleeper is a closed record (no `alerts.sessions` entry); the
   resumed session starts a fresh `sa` with no `reviewAt`/`prevAttn`, so neither review nor stalled
   fires off the resume itself. `startedTicketKeys` reads closed records, so auto-start never

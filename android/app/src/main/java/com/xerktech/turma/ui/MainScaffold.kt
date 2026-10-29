@@ -6,7 +6,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.GridView
-import androidx.compose.material.icons.filled.Summarize
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.ViewKanban
 import androidx.compose.material3.Icon
@@ -23,11 +22,10 @@ import androidx.compose.ui.unit.dp
 
 /**
  * The top-level destinations, in bottom-nav order — mirrors the web's phone bottom-nav
- * (nav.js PAGES): Brief sits between Dashboard and Sessions (XERK-1573).
+ * (nav.js PAGES), minus the web-only Insights page (XERK-2386).
  */
 enum class TopDest(val route: String, val label: String, val icon: ImageVector) {
     DASHBOARD("dashboard", "Dashboard", Icons.Filled.GridView),
-    BRIEF("brief", "Brief", Icons.Filled.Summarize),
     SESSIONS("sessions", "Sessions", Icons.Filled.Terminal),
     BOARD("board", "Board", Icons.Filled.ViewKanban),
     USAGE("usage", "Usage", Icons.Filled.Analytics),

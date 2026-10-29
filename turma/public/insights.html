@@ -1,0 +1,1009 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turma — Insights</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<meta name="theme-color" content="#f9f9f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/app.css">
+<style>
+  /* Insights (XERK-2386): the fleet's oversight surfaces, one sub-page each —
+     Decisions, Permission prompts, Model quality — so none is a long scroll
+     under another. Tokens/base/nav live in app.css. Web-only (android/PARITY.md). */
+  /* One row at any width: a phone scrolls it sideways rather than wrapping a tab. */
+  .subtabs {
+    display: flex; gap: 4px; margin: 0 0 16px; overflow-x: auto; scrollbar-width: none;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .subtabs::-webkit-scrollbar { display: none; }
+  .subtabs a {
+    color: var(--ink-2); text-decoration: none; font-size: 14px; font-weight: 600;
+    padding: 8px 12px; border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap;
+  }
+  .subtabs a:hover { color: var(--ink); }
+  .subtabs a.active { color: var(--accent-text); border-bottom-color: var(--accent); }
+  .pane-note { color: var(--muted); font-size: 12px; margin: 16px 0 0; }
+
+  .table-scroll {
+    overflow-x: auto; background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius-md); margin-top: 8px;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 8px 14px; text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; position: sticky; left: 0; background: var(--surface); }
+  thead th { color: var(--ink-2); font-weight: 600; font-size: 12px; border-bottom: 1px solid var(--hairline); }
+  thead th .sub { display: block; color: var(--muted); font-weight: 400; font-size: 11px; }
+  tbody td { border-bottom: 1px solid var(--hairline); font-variant-numeric: tabular-nums; }
+  tbody tr:last-child td { border-bottom: none; }
+
+  .models-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    padding: 14px 16px; margin-top: 16px;
+  }
+  .models-card h2 { font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 0 0 10px; }
+  .models-card table { font-size: 13px; }
+  .models-card td:first-child { font-family: var(--font-mono); font-size: 12px; word-break: break-all; }
+  .models-card .note { color: var(--muted); font-size: 12px; margin: -4px 0 10px; }
+
+  /* "Permission prompts" (XERK-1563): every prompt that held a session, grouped
+     with the allow rule that would retire it. Reuses the models card; the rule
+     column is mono + a copy button, the recent list sits under a disclosure. */
+  .perm-card td:first-child { font-family: inherit; font-size: 13px; word-break: normal; white-space: normal; min-width: 180px; }
+  .perm-card .perm-rule { text-align: left; white-space: normal; min-width: 220px; }
+  .perm-kind {
+    display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: 0.01em;
+    padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border);
+    color: var(--ink-2); background: var(--page); white-space: nowrap;
+  }
+  .perm-kind.k-classifier-denied { color: var(--critical); border-color: currentColor; background: transparent; }
+  .perm-kind.k-ask-in-chat { color: var(--warning-text); border-color: currentColor; background: transparent; }
+  .perm-kind.k-judged { color: var(--accent); border-color: currentColor; background: transparent; }
+  /* A subject is prose (an ask's question) unless it is a command or tool name:
+     prose wraps at word boundaries; only `.cmd` may break mid-token, and only
+     where the token would otherwise overflow. */
+  .perm-subj { font-size: 13px; color: var(--ink); margin-top: 4px; word-break: normal; overflow-wrap: break-word; }
+  .perm-subj.cmd { font-family: var(--font-mono); font-size: 12px; overflow-wrap: anywhere; }
+  .perm-tool { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .perm-rule code {
+    font-family: var(--font-mono); font-size: 12px; color: var(--ink);
+    background: var(--page); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
+    padding: 2px 6px; word-break: normal; overflow-wrap: anywhere; display: inline-block; max-width: 100%;
+  }
+  /* The rule and its Copy share one line: the rule shrinks and wraps inside its
+     box, Copy stays beside it — a long rule never drops Copy below it. */
+  .perm-rule-line { display: flex; align-items: center; gap: 6px; }
+  .perm-rule-line code { flex: 0 1 auto; min-width: 0; }
+  .perm-rule-line .perm-copy { flex: none; margin-left: 0; }
+  .perm-rule .none { color: var(--muted); }
+  /* Inline code inside an ask's question (`legacy/`), rendered — never raw backticks. */
+  .perm-subj code {
+    font-family: var(--font-mono); font-size: 0.92em; padding: 0 4px;
+    background: var(--page); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
+    overflow-wrap: anywhere;
+  }
+  /* The note sits below the table at the same gap as "Recent prompts" (12px), so it never
+     reads as part of the last row. `.models-card .note`'s -4px top would otherwise win. */
+  .models-card .note.perm-foot { margin-top: 12px; }
+  .perm-foot code { font-family: var(--font-mono); font-size: 0.92em; }
+  .perm-why { color: var(--muted); font-size: 11.5px; margin-top: 3px; word-break: normal; overflow-wrap: break-word; }
+  .perm-na { color: var(--muted); }
+  .perm-copy {
+    font: inherit; font-size: 11.5px; margin-left: 6px; padding: 2px 8px; cursor: pointer;
+    color: var(--ink-2); background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius-sm); vertical-align: middle;
+  }
+  .perm-copy:hover { color: var(--accent); border-color: var(--accent); }
+  .perm-recent { list-style: none; margin: 8px 0 0; padding: 0; }
+  .perm-recent li {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px;
+    padding: 7px 0; border-bottom: 1px solid var(--hairline); font-size: 12.5px;
+  }
+  .perm-recent li:last-child { border-bottom: none; }
+  .perm-recent .perm-subj { margin-top: 0; flex: 1 1 220px; min-width: 0; }
+  .perm-recent .perm-meta { display: flex; flex-wrap: wrap; gap: 2px 10px; flex: 0 1 auto; min-width: 0; }
+  .perm-recent .meta { color: var(--muted); font-size: 11.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .perm-recent .meta.meta-judge { white-space: normal; overflow-wrap: break-word; min-width: 0; }
+  .perm-empty { color: var(--muted); font-size: 12.5px; padding: 6px 0 2px; }
+
+  /* "Model quality" (XERK-1849): per work class x model outcome counts, fleet-wide.
+     Reuses the models card; numbers are tabular, the class + model cell is prose. */
+  .mq-card td:first-child { font-family: inherit; font-size: 13px; word-break: normal; white-space: nowrap; }
+  .mq-card td.mq-num { font-variant-numeric: tabular-nums; }
+  .mq-card .mq-model { font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); margin-left: 6px; }
+  .mq-card .mq-good { color: var(--good-text); }
+  .mq-card .mq-bad { color: var(--critical); }
+  .mq-card .mq-sub { color: var(--muted); font-size: 11.5px; }
+  .mq-card tr.mq-class-first td { border-top: 1px solid var(--hairline); }
+  .mq-rows { list-style: none; margin: 8px 0 0; padding: 0; }
+  .mq-rows li {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px;
+    padding: 6px 0; border-bottom: 1px solid var(--hairline); font-size: 12.5px;
+  }
+  .mq-rows li:last-child { border-bottom: none; }
+  .mq-rows .mq-issue { font-family: var(--font-mono); font-size: 12px; color: var(--ink); }
+  .mq-rows .meta { color: var(--muted); font-size: 11.5px; }
+  .mq-rows a { color: var(--accent); }
+  .mq-outcome { font-size: 11px; padding: 0 6px; border-radius: 999px; border: 1px solid currentColor; }
+  .mq-outcome.o-good { color: var(--good-text); }
+  .mq-outcome.o-bad { color: var(--critical); }
+  .mq-outcome.o-pending, .mq-outcome.o-no-change, .mq-outcome.o-undelivered { color: var(--muted); }
+
+  /* The decisions log (XERK-1574): one card per org, newest first, then the note box. */
+  .dec-org {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    padding: 14px 16px; margin-bottom: 16px;
+  }
+  .dec-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .dec-org-name { font-family: var(--font-display); font-size: 18px; font-weight: 600; }
+  .dec-org-name .n { color: var(--muted); font-weight: 400; font-size: 15px; }
+  .dec-when { color: var(--muted); font-size: 12px; }
+  .dec-list { list-style: none; margin: 0; padding: 0; }
+  .dec-item { border-top: 1px solid var(--hairline); padding: 6px 0; font-size: 13px; min-width: 0; }
+  .dec-item:first-child { border-top: 0; }
+  .dec-title { overflow-wrap: anywhere; }
+  .dec-meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .dec-meta .kind { color: var(--ink-2); }
+  .dec-meta .key { font-family: var(--font-mono); }
+  /* A meta line wraps only BETWEEN its pieces (kind, ticket, session, age, host),
+     never inside one; a piece wider than the row (a long session name) ends in "…".
+     The "·" ends the piece before it, so a wrapped line ends in one and never
+     starts with one, and the ellipsis can't eat it. */
+  .dec-meta .bit { display: inline-flex; max-width: 100%; white-space: nowrap; vertical-align: bottom; }
+  .dec-meta .bit > .v { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .dec-meta .bit > .sep { flex: none; white-space: pre; }
+  /* The typed-answer marker is not the chosen option: muted, never bold. */
+  .dec-item .typed { color: var(--muted); font-size: 12px; }
+  .dec-more { color: var(--muted); font-size: 12px; padding-top: 4px; }
+  .dec-none { color: var(--muted); font-size: 13px; font-style: italic; }
+  .dec-empty { color: var(--muted); font-size: 14px; padding: 24px 0; }
+  .dec-note { display: flex; gap: 8px; margin-top: 8px; }
+  .dec-note input {
+    flex: 1; min-width: 0; font: inherit; font-size: 13px; border: 1px solid var(--border);
+    border-radius: var(--radius-sm); background: var(--field); color: var(--ink); padding: 5px 8px;
+  }
+  .dec-note button {
+    font: inherit; font-size: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--field); color: var(--ink); padding: 4px 10px; cursor: pointer;
+  }
+  .dec-note button:disabled { opacity: 0.6; cursor: default; }
+
+  @media (max-width: 600px) {
+    .models-card { padding: 12px 10px; }
+    .subtabs a { padding: 8px 9px; font-size: 13px; }
+    /* Permission prompts on a phone: the five-column table cannot fit, and the
+       sticky Prompt column covered the rule column however far it scrolled.
+       Each group reflows to a stacked block instead — kind + subject; one line
+       of count, answers and median wait; the rule and its Copy on their own
+       line — with no sideways scroll. The desktop table is untouched. */
+    .perm-card .table-scroll { overflow-x: visible; }
+    .perm-card table, .perm-card tbody, .perm-card td { display: block; }
+    .perm-card thead { display: none; }
+    .perm-card tbody tr {
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px;
+      padding: 10px 12px; border-bottom: 1px solid var(--hairline);
+    }
+    .perm-card tbody tr:last-child { border-bottom: none; }
+    .perm-card tbody td {
+      position: static; padding: 0; border: none; background: none;
+      text-align: left; white-space: normal; min-width: 0;
+    }
+    .perm-card tbody td:first-child { flex: 1 1 100%; min-width: 0; }
+    .perm-card tbody td.perm-stat { flex: none; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+    .perm-card tbody td.perm-stat::before { content: attr(data-label) " "; color: var(--muted); }
+    .perm-card tbody td.perm-rule { flex: 1 1 100%; min-width: 0; margin-top: 2px; }
+    /* No allow/deny answer exists for an ask: a bare "—" under a label says nothing. */
+    .perm-card tbody td.perm-stat.perm-stat-na { display: none; }
+    /* Recent prompts: kind + subject on the first line, then host · wait · age
+       always on a line of their own, host first. */
+    .perm-recent .perm-subj { flex: 1 1 0; }
+    .perm-recent .perm-meta { flex: 1 1 100%; }
+    /* Model quality on a phone: each (class, model) row reflows to a block —
+       class + model, then one line of labelled counts — no sideways scroll. */
+    .mq-card .table-scroll { overflow-x: visible; }
+    .mq-card table, .mq-card tbody, .mq-card td { display: block; }
+    .mq-card thead { display: none; }
+    .mq-card tbody tr {
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px;
+      padding: 10px 12px; border-bottom: 1px solid var(--hairline);
+    }
+    .mq-card tbody tr:last-child { border-bottom: none; }
+    .mq-card tbody td {
+      position: static; padding: 0; border: none; background: none;
+      text-align: left; white-space: nowrap; min-width: 0;
+    }
+    .mq-card tbody td:first-child { flex: 1 1 100%; }
+    .mq-card tbody td.mq-num { font-size: 12px; color: var(--ink-2); }
+    .mq-card tbody td.mq-num::before { content: attr(data-label) " "; color: var(--muted); }
+    .mq-card tbody td.mq-na { display: none; }
+    .mq-card tbody tr.mq-class-first td { border-top: none; }
+  }
+  /* The narrowest phones (320px) still fit all three tabs without a hidden scroll. */
+  @media (max-width: 360px) {
+    .subtabs a { padding: 8px 6px; font-size: 12.5px; }
+  }
+  @media (pointer: coarse) {
+    th, td { padding: 10px 14px; }
+  }
+</style>
+</head>
+<body class="app-shell">
+<header class="site-header" id="siteHeader" data-page="insights"></header>
+<div class="page-scroll">
+<div class="wrap">
+  <nav class="subtabs" id="subtabs">
+    <a href="#decisions" data-pane="decisions">Decisions</a>
+    <a href="#permissions" data-pane="permissions">Permissions</a>
+    <a href="#model-quality" data-pane="model-quality">Model quality</a>
+  </nav>
+  <section id="pane-decisions" data-pane-body="decisions">
+    <div id="decisionsLog"></div>
+    <div class="pane-note"><b>Decisions</b> are your answers to sessions' questions and permission dialogs, plus notes you add; the org's sessions read them as reference material. An answer is logged as the question and the option picked — never typed words or a command line.</div>
+  </section>
+  <section id="pane-permissions" data-pane-body="permissions" hidden>
+    <div id="permissionsCard"></div>
+  </section>
+  <section id="pane-model-quality" data-pane-body="model-quality" hidden>
+    <div id="modelQualityCard"></div>
+  </section>
+</div>
+</div>
+
+<nav class="bottom-nav" id="bottomNav"></nav>
+<script src="/board.js"></script>
+<script src="/nav.js"></script>
+<script src="/org.js"></script>
+<script src="/newticket.js"></script>
+
+<script>
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[c]);
+}
+
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return sec + "s";
+  const mins = Math.round(sec / 60);
+  if (mins < 60) return mins + "m";
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return hours + "h " + String(mins % 60).padStart(2, "0") + "m";
+  const days = Math.floor(hours / 24);
+  return days + "d " + (hours % 24) + "h";
+}
+
+// ---- Sub-pages ----------------------------------------------------------------
+// One pane shows at a time, named by the URL hash so a sub-page is linkable and
+// Back works. No element's id equals a pane name, so the browser never scrolls
+// the sub-tabs away to a hash target. Permission prompts and Model quality fetch only while shown.
+const PANES = ["decisions", "permissions", "model-quality"];
+function paneOf(hash) {
+  const p = String(hash || "").replace(/^#/, "");
+  return PANES.includes(p) ? p : PANES[0];
+}
+let pane = paneOf(location.hash);
+function showPane() {
+  for (const a of document.querySelectorAll("[data-pane]")) a.classList.toggle("active", a.dataset.pane === pane);
+  for (const s of document.querySelectorAll("[data-pane-body]")) s.hidden = s.dataset.paneBody !== pane;
+  if (cache) syncPaneScope(cache);
+}
+// The active pane's own fetch follows the header's org scope; a hidden one waits.
+function syncPaneScope(data) {
+  if (pane === "permissions") syncPermissionsScope();
+  if (pane === "model-quality") syncModelQualityScope(data.agents);
+}
+// Coming back to a card refetches it: its minute timer only runs while it shows.
+// Not when showPane's own scope sync just fetched it (a first visit, a new org).
+addEventListener("hashchange", () => {
+  pane = paneOf(location.hash);
+  const permSeq = permFetchSeq, mqSeq = mqFetchSeq;
+  showPane();
+  if (pane === "permissions" && permScoped && permFetchSeq === permSeq) refreshPermissions();
+  if (pane === "model-quality" && mqScoped && mqFetchSeq === mqSeq) refreshModelQuality();
+});
+
+// ---- Decisions (XERK-1574) ----------------------------------------------------
+const $decisions = document.getElementById("decisionsLog");
+const noteBusy = new Set();   // orgs with a decision note in flight
+const drafts = new Map();     // org -> the note being typed (survives a repaint)
+// An age in the decisions log: seconds, minutes below the hour, hours to two
+// days, then days.
+function dur(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s}s`;
+  if (s < 3570) return `${Math.round(s / 60)}m`;
+  if (s < 172800) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+const ago = (ms, now) => dur(now - ms);
+// The newest DECISIONS_SHOWN, newest first, then — for an org a host is decided
+// into — the note composer. `count` is how many the org keeps (the hub's
+// `decisionCounts`); the served list is only its newest few, so it is a floor.
+const DECISIONS_SHOWN = 20;
+const DECISION_LABEL_MAX = 60;   // the session's name in a row's meta line
+const DECISION_KIND = { question: "question", permission: "permission", note: "note" };
+// The hub's typed-answer markers (server.js `questionAnswerText`): free text is
+// logged as a marker, never its words, and the marker is not a chosen option.
+const TYPED_SUFFIX = ", plus a typed answer";
+const TYPED_ALONE = "(a typed answer)";
+function answerHtml(a) {
+  if (a === TYPED_ALONE) return `<span class="typed">${esc(a)}</span>`;
+  if (a.endsWith(TYPED_SUFFIX) && a.length > TYPED_SUFFIX.length) {
+    return `<b>${esc(a.slice(0, -TYPED_SUFFIX.length))}</b><span class="typed">${esc(TYPED_SUFFIX)}</span>`;
+  }
+  return `<b>${esc(a)}</b>`;
+}
+function decisionsHtml(site, list, now, live, count, name) {
+  const rows = (Array.isArray(list) ? list : []).slice(-DECISIONS_SHOWN).reverse();
+  if (!rows.length && !live) return "";
+  const item = (d) => {
+    const title = d.source === "note" ? esc(d.text || "")
+      : `${esc(d.question || "")} → ${answerHtml(d.answer || "")}`;
+    // Each piece is one unbreakable `.bit`; the line wraps only between them.
+    const meta = [`<span class="kind">${esc(DECISION_KIND[d.source] || d.source || "")}</span>`];
+    if (d.ticket) meta.push(`<span class="key">${esc(d.ticket)}</span>`);
+    // Which session it came from — the only tie back for an answer with no ticket.
+    if (d.label) {
+      let l = d.label;
+      if (l.length > DECISION_LABEL_MAX) {
+        l = l.slice(0, DECISION_LABEL_MAX - 1);
+        if (/[\ud800-\udbff]$/.test(l)) l = l.slice(0, -1);   // never half a surrogate pair
+        l += "…";
+      }
+      meta.push(`<span class="sess">${esc(l)}</span>`);
+    }
+    if (typeof d.at === "number") meta.push(`${esc(ago(d.at, now))} ago`);
+    if (d.host) meta.push(esc(d.host));
+    const bits = meta.map((m, i) => `<span class="bit"><span class="v">${m}</span>`
+      + `${i < meta.length - 1 ? '<span class="sep"> ·</span>' : ""}</span>`);
+    return `<li class="dec-item"><div class="dec-title">${title}</div>`
+      + `<div class="dec-meta">${bits.join(" ")}</div></li>`;
+  };
+  const served = Array.isArray(list) ? list.length : 0;
+  const total = Math.max(served, Number.isSafeInteger(count) ? count : 0);
+  const body = rows.length
+    ? `<ul class="dec-list">${rows.map(item).join("")}</ul>`
+      + (total > rows.length ? `<div class="dec-more">+${total - rows.length} earlier</div>` : "")
+    : `<div class="dec-none">No decisions recorded yet.</div>`;
+  const form = live
+    ? `<form class="dec-note" data-note="${esc(site)}"><input data-note-input="${esc(site)}" maxlength="500"`
+      + ` placeholder="Record a decision for this org…" value="${esc(drafts.get(site) || "")}">`
+      + `<button type="submit"${noteBusy.has(site) ? " disabled" : ""}>${noteBusy.has(site) ? "Adding…" : "Add"}</button></form>`
+    : `<div class="dec-when">no host in this org</div>`;
+  return `<section class="dec-org"><div class="dec-head">`
+    + `<span class="dec-org-name">${esc(name || site)} <span class="n">${total}</span></span>`
+    + `</div>${body}${form}</section>`;
+}
+function renderDecisions(data, now) {
+  const decs = data.decisions && typeof data.decisions === "object" ? data.decisions : {};
+  const decCounts = data.decisionCounts && typeof data.decisionCounts === "object" ? data.decisionCounts : {};
+  const keys = TurmaOrg.getKeys();
+  // Every org a host is decided into (the served `org`) — so an org with no
+  // decisions yet still offers the note box — plus any org with a kept log.
+  const live = new Set();
+  for (const a of data.agents || []) if (a && typeof a.org === "string" && a.org) live.add(a.org);
+  const orgs = new Set(live);
+  for (const s of Object.keys(decs)) if (Array.isArray(decs[s]) && decs[s].length) orgs.add(s);
+  const sites = [...orgs].filter((s) => !keys.length || keys.includes(s)).sort();
+  const name = (s) => (TurmaBoard.orgName ? TurmaBoard.orgName(s) : s);
+  const html = sites.length
+    ? sites.map((s) => decisionsHtml(s, decs[s], now, live.has(s), decCounts[s], name(s))).join("")
+    : `<div class="dec-empty">No org yet — no host reports a tracker org.</div>`;
+  // A repaint must not cost a half-typed note its focus or caret (the draft text
+  // itself rides `drafts`).
+  const focused = document.activeElement && document.activeElement.dataset
+    ? document.activeElement.dataset.noteInput : undefined;
+  const caret = focused !== undefined ? document.activeElement.selectionStart : null;
+  TurmaNav.preserveScroll($decisions, () => { $decisions.innerHTML = html; });
+  if (focused !== undefined) {
+    const el = [...$decisions.querySelectorAll("[data-note-input]")].find((x) => x.dataset.noteInput === focused);
+    if (el) { el.focus(); if (caret != null) el.setSelectionRange(caret, caret); }
+  }
+}
+// Record a decision by hand. The hub's refusal is toasted in its own words
+// (XERK-264); the draft is kept until the hub took it.
+async function addNote(site) {
+  const text = (drafts.get(site) || "").trim();
+  if (!text || noteBusy.has(site)) return;
+  noteBusy.add(site);
+  if (cache) render(cache);
+  let res = null, out = null;
+  try {
+    res = await fetch(`/api/orgs/${encodeURIComponent(site)}/decisions`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }),
+    });
+    try { out = await res.json(); } catch { /* not JSON */ }
+  } catch {
+    TurmaNav.toast("Adding the decision failed — the hub is unreachable");
+  }
+  noteBusy.delete(site);
+  if (res && res.status === 401) return void (location.href = "/login");
+  if (res && !res.ok) TurmaNav.toast(TurmaNav.refusalText("Adding the decision", res.status, out));
+  if (res && res.ok) drafts.delete(site);
+  refresh();
+}
+$decisions.addEventListener("input", (e) => {
+  const site = e.target.dataset && e.target.dataset.noteInput;
+  if (site !== undefined) drafts.set(site, e.target.value);
+});
+$decisions.addEventListener("submit", (e) => {
+  const form = e.target.closest("[data-note]");
+  if (!form) return;
+  e.preventDefault();
+  addNote(form.dataset.note);
+});
+
+// ---- Permission prompts (XERK-1563) -----------------------------------------
+// Every prompt that held a session — a TUI permission dialog, an auto-mode
+// classifier block, or the session asking for permission in chat — grouped by
+// what it asked about, with the allow rule that would retire it (the hub's
+// deterministic `suggestedRule`). Its own fetch (`/api/permissions`), scoped by
+// the header's org filter like everything else here; it does not ride
+// /api/agents, so the beat's SSE patches never repaint it.
+const $perms = document.getElementById("permissionsCard");
+const PERM_DAYS = 7;
+const PERM_REFRESH_MS = 60000;
+// `judged` (XERK-1566): the agent's permission judge decided a Bash prompt.
+const PERM_KIND = { dialog: "Dialog", "classifier-denied": "Classifier block", "ask-in-chat": "Asked in chat",
+  judged: "Judged" };
+let permView = null;
+let permLoadError = null;
+let permFetchSeq = 0;
+// The card is fetched only once a render has run TurmaOrg.update: before that
+// org.js knows no sites, so getKeys() is [] and an unscoped fetch would show
+// every org's prompts under a scoped header. `permFetchedKeys` is the key set
+// the card was last fetched for — a render whose keys differ refetches it.
+let permScoped = false;
+let permFetchedKeys = null;
+// The key set `permView` itself was fetched for. A failed read keeps the last
+// view only when it is THAT scope's view — another org's view is never shown
+// under the new selection, not even while the new one loads or after it fails.
+let permViewKeys = null;
+// The last string painted, compared instead of $perms.innerHTML: a browser
+// re-serializes innerHTML (`open` reads back `open=""`), so that never matched.
+let permPainted = null;
+// The card repaints every PERM_REFRESH_MS and on every org change, which builds a
+// fresh <details> — and a fresh one defaults CLOSED, snapping "Recent prompts"
+// shut under the operator once a minute. Its open state lives here and is
+// re-applied each paint (the `tableOpen` fix, for this card).
+let permRecentOpen = false;
+
+function permWait(ms) {
+  return typeof ms === "number" && Number.isFinite(ms) && ms >= 0 ? fmtDuration(ms / 1000) : "—";
+}
+function permKindHtml(g) {
+  const kind = PERM_KIND[g.kind] ? g.kind : "dialog";
+  const sub = g.kind === "dialog" && g.dialogKind && g.dialogKind !== "permission" ? ` · ${g.dialogKind}` : "";
+  return `<span class="perm-kind k-${kind}">${esc((PERM_KIND[g.kind] || "Prompt") + sub)}</span>`;
+}
+function permSubject(g) {
+  if (g.head) return g.head;
+  if (g.kind === "ask-in-chat") return g.prompt || "asked for permission in chat";
+  return g.tool || "—";
+}
+// The subject as markup: a command or tool name is mono and may break
+// mid-token; an ask's question is prose and wraps only between words.
+function permSubjectHtml(g, tag) {
+  const prose = !g.head && g.kind === "ask-in-chat";
+  const text = prose ? permProseHtml(permSubject(g)) : esc(permSubject(g));
+  return `<${tag} class="perm-subj${prose ? "" : " cmd"}">${text}</${tag}>`;
+}
+// An ask's question is the session's own markdown: `code` spans render as code
+// and **bold** markers drop, so no literal backticks or asterisks show. ONE
+// pass, so a code span's own text (`**kwargs`) is never re-read as bold; `__`
+// is left alone (`__init__.py` is a name, not emphasis). Escaped FIRST (esc
+// leaves ` and * alone), so a span only wraps text that is already safe; an
+// unpaired marker (a question cut at its cap) stays as typed.
+function permProseHtml(text) {
+  return esc(text).replace(/`([^`\n]+)`|\*\*([^*\n]+)\*\*/g,
+    (m, code, bold) => (code !== undefined ? `<code>${code}</code>` : bold));
+}
+function permNum(n) { return typeof n === "number" && Number.isFinite(n) ? n : 0; }
+// Allowed / denied, or "—" when no answer is knowable: an ask in chat is
+// answered in prose, never allow/deny, so 0 / 0 there would read as "ignored".
+// A group whose every row is still holding its session says "open" until one
+// is answered — 0 / 0 there would read "asked and ignored" too.
+function permAnswers(g) {
+  const known = (n) => typeof n === "number" && Number.isFinite(n);
+  const open = known(g.open) && g.open > 0 ? g.open : 0;
+  if (open && open >= permNum(g.count)) {
+    return `<span class="perm-na" title="Still waiting for an answer">still open</span>`;
+  }
+  if (g.kind === "ask-in-chat" || !known(g.allowed) || !known(g.denied)) {
+    return `<span class="perm-na" title="No allow/deny answer is recorded for this kind of prompt">—</span>`;
+  }
+  return `${g.allowed} / ${g.denied}` + (open ? ` <span class="perm-na">· ${open} open</span>` : "");
+}
+// An ask that is no longer open has no allow/deny answer to show at all (its
+// cell reads "—"); on a phone that cell is hidden rather than labelled.
+function permAnswerless(g) {
+  const open = typeof g.open === "number" && g.open > 0 && g.open >= permNum(g.count);
+  return !open && g.kind === "ask-in-chat";
+}
+// The rule cell. A pasteable rule gets a Copy button beside it; the ask-in-chat
+// entry is a pointer, not a setting — its row says so in a few words and ONE
+// note under the table says where the fix lives (`PERM_BEHAVIOUR_NOTE`), rather
+// than the hub's terse pointer repeated on every ask; no rule says so — and a
+// classifier block says why it was blocked, the one thing to go on.
+const PERM_BEHAVIOUR_RE = /^model behaviour:\s*/;
+function permIsBehaviour(g) {
+  return typeof g.suggestedRule === "string" && PERM_BEHAVIOUR_RE.test(g.suggestedRule);
+}
+const PERM_BEHAVIOUR_NOTE = `<div class="note perm-foot"><b>Asked in chat</b> has no setting to copy: ` +
+  `the session ended its turn to ask in prose, and only its instructions change that. The fix is ` +
+  `step 0 of “Delivering work” in the global <code>~/.claude/CLAUDE.md</code> on each host: the ` +
+  `session runs unattended and never waits for a human to approve, continue, push or open a PR.</div>`;
+// A rule shown in its box: a narrow column wraps it after `(` or a `:` that
+// starts a value (`WebFetch(` / `domain:docs.example.com)`), never mid-name
+// where a natural break exists. Display only — Copy copies the raw rule.
+function permRuleCodeHtml(rule) {
+  return esc(rule).replace(/([(:])(?=[A-Za-z0-9])/g, "$1<wbr>");
+}
+function permRuleHtml(g) {
+  const rule = typeof g.suggestedRule === "string" && g.suggestedRule ? g.suggestedRule : "";
+  if (rule && permIsBehaviour(g)) {
+    return `<span class="none">Instructions, not a setting — see the note below</span>`;
+  }
+  if (rule) {
+    return `<span class="perm-rule-line"><code>${permRuleCodeHtml(rule)}</code><button type="button" class="perm-copy" data-perm-rule="${esc(rule)}" title="Copy this rule">Copy</button></span>`;
+  }
+  const why = g.kind === "classifier-denied" && typeof g.denyReason === "string" && g.denyReason
+    ? `<div class="perm-why">Blocked: ${esc(g.denyReason)}</div>` : "";
+  // A Bash head off the hub's safe list: no rule to copy, and the hub's reason.
+  // A classifier block's why is its deny reason ALONE: the allowlist reason is
+  // about Bash allow rules and says nothing of why the classifier said no.
+  if (typeof g.noRuleReason === "string" && g.noRuleReason) {
+    return `<span class="none">no safe rule — review it</span>` +
+      (why || `<div class="perm-why">${esc(g.noRuleReason)}</div>`);
+  }
+  return `<span class="none">no rule retires this</span>${why}`;
+}
+
+// The whole card, as markup — pure over the hub's `{days, top, recent}`. Every
+// field is agent-supplied text, so every one is escaped (a rule or a command can
+// carry anything).
+function permissionsCardHtml(view, now, recentOpen = false, loadError = null) {
+  const days = view && permNum(view.days) > 0 ? permNum(view.days) : PERM_DAYS;
+  const head = `<h2>Permission prompts (${days} days)</h2>` +
+    `<div class="note">Every permission dialog, auto-mode classifier block and ask-for-permission-in-chat ` +
+    `that held a session, grouped with the allow rule that would retire it. Follows the header's org ` +
+    `filter.</div>`;
+  // A first fetch that failed says so; "Loading…" there would wait forever.
+  if (!view && typeof loadError === "string" && loadError) {
+    return head + `<div class="perm-empty">Could not load permission prompts (${esc(loadError)}).</div>`;
+  }
+  if (!view) return head + `<div class="perm-empty">Loading…</div>`;
+  const top = Array.isArray(view.top) ? view.top.filter((g) => g && typeof g === "object") : [];
+  const recent = Array.isArray(view.recent) ? view.recent.filter((r) => r && typeof r === "object") : [];
+  if (!top.length) {
+    return head + `<div class="perm-empty">No permission prompts recorded in the last ${days} days for the selected orgs.</div>`;
+  }
+  // data-label names each number when a phone reflows the row into a block.
+  const rows = top.map((g) => {
+    const tool = g.tool && g.head && g.tool !== g.head ? `<div class="perm-tool">${esc(g.tool)}</div>` : "";
+    return `<tr>
+      <td>${permKindHtml(g)}${permSubjectHtml(g, "div")}${tool}</td>
+      <td class="perm-stat" data-label="Count">${permNum(g.count)}</td>
+      <td class="perm-stat${permAnswerless(g) ? " perm-stat-na" : ""}" data-label="Allowed / denied">${permAnswers(g)}</td>
+      <td class="perm-stat" data-label="Median wait">${esc(permWait(g.medianWaitMs))}</td>
+      <td class="perm-rule">${permRuleHtml(g)}</td>
+    </tr>`;
+  }).join("");
+  const table = `<div class="table-scroll"><table>
+    <thead><tr><th>Prompt</th><th>Count</th><th>Allowed / denied</th><th>Median wait</th><th class="perm-rule">Suggested rule</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+  const items = recent.map((r) => {
+    const opened = permNum(r.openedAt);
+    const ago = opened ? fmtDuration((now - opened) / 1000) + " ago" : "";
+    // A closed row without a wait (a classifier block holds nothing) says only
+    // its answer; a row with no close yet is still holding its session.
+    // An ask has no allow/deny by design (the table shows "—" for it), so it
+    // never says "unknown" here either — an older hub still sends that.
+    const parts = [];
+    if (typeof r.waitedMs === "number") parts.push(`waited ${permWait(r.waitedMs)}`);
+    else if (!r.closedAt && !r.answer) parts.push("still open");
+    if (r.answer && r.kind !== "ask-in-chat") parts.push(r.answer);
+    // A judged row says what the permission judge decided, and why (XERK-1566).
+    // The reason is free prose of any length, so it rides its own WRAPPING
+    // span: inside the no-break wait span it ran off a phone-width card.
+    let judge = "";
+    if (r.kind === "judged" && (r.verdict === "allow" || r.verdict === "stand")) {
+      const why = typeof r.judgeReason === "string" && r.judgeReason ? ` — ${r.judgeReason}` : "";
+      judge = `<span class="meta meta-judge">${esc(`judge: ${r.verdict}${why}`)}</span>`;
+    }
+    // Host, wait and age ride ONE group, host first, so the host sits in the
+    // same place on every row (on a phone: the start of the second line).
+    const span = (t) => (t ? `<span class="meta">${esc(t)}</span>` : "");
+    const meta = span(r.host) + span(parts.join(" · ")) + judge + span(ago);
+    return `<li>${permKindHtml(r)}${permSubjectHtml(r, "span")}` +
+      `<span class="perm-meta">${meta}</span></li>`;
+  }).join("");
+  const list = items
+    ? `<details class="table-view perm-recent-view"${recentOpen ? " open" : ""}><summary>Recent prompts (${recent.length})</summary><ul class="perm-recent">${items}</ul></details>`
+    : "";
+  const note = top.some(permIsBehaviour) ? PERM_BEHAVIOUR_NOTE : "";
+  return head + table + note + list;
+}
+
+function paintPermissions() {
+  const html = `<div class="models-card perm-card">${permissionsCardHtml(permView, Date.now(), permRecentOpen, permLoadError)}</div>`;
+  if (html === permPainted) return;
+  permPainted = html;
+  // A recurring innerHTML repaint: preserveScroll keeps the table's sideways
+  // scroll (and the page's) across the swap, like every other repaint here.
+  TurmaNav.preserveScroll($perms, () => { $perms.innerHTML = html; });
+}
+
+function permKeys() {
+  return (TurmaOrg.getKeys && TurmaOrg.getKeys()) || [];
+}
+
+function syncPermissionsScope() {
+  permScoped = true;
+  if (permKeys().join(",") !== permFetchedKeys) refreshPermissions();
+}
+
+async function refreshPermissions() {
+  const seq = ++permFetchSeq;
+  const keys = permKeys();
+  const scope = keys.join(",");
+  permFetchedKeys = scope;
+  const q = new URLSearchParams({ days: String(PERM_DAYS) });
+  if (keys.length) q.set("org", scope);
+  // A scope change drops the previous org's view at once: the card says
+  // loading rather than showing org A's prompts under org B's selection.
+  if (permView && permViewKeys !== scope) {
+    permView = null;
+    permViewKeys = null;
+    permLoadError = null;
+    paintPermissions();
+  }
+  // A failed read keeps this scope's last view; with none, the card says it failed.
+  const failed = (why) => {
+    if (seq !== permFetchSeq) return;
+    if (permView && permViewKeys === scope) return;
+    permView = null;
+    permViewKeys = null;
+    permLoadError = why;
+    paintPermissions();
+  };
+  try {
+    const r = await fetch("/api/permissions?" + q.toString());
+    if (!r.ok) return failed(`HTTP ${r.status}`);
+    const body = await r.json();
+    if (seq !== permFetchSeq) return;        // an org change raced this answer
+    permView = body;
+    permViewKeys = scope;
+    permLoadError = null;
+    paintPermissions();
+  } catch { failed("no readable answer from the hub"); }
+}
+
+// `toggle` does not bubble, so the disclosure's open state is caught on capture.
+$perms.addEventListener("toggle", (ev) => {
+  const d = ev.target;
+  if (d && d.matches && d.matches("details.perm-recent-view")) permRecentOpen = !!d.open;
+}, true);
+
+// One delegated listener: the card is repainted wholesale, its buttons are not.
+$perms.addEventListener("click", (ev) => {
+  const btn = ev.target && ev.target.closest && ev.target.closest("[data-perm-rule]");
+  if (!btn) return;
+  const rule = btn.getAttribute("data-perm-rule") || "";
+  const done = (label) => { btn.textContent = label; setTimeout(() => { btn.textContent = "Copy"; }, 1500); };
+  try {
+    navigator.clipboard.writeText(rule).then(() => done("Copied"), () => done("Copy failed"));
+  } catch { done("Copy failed"); }
+});
+
+// ---- Model quality (XERK-1849) -----------------------------------------------
+// The outcome ledger's report (/api/model-quality, XERK-1839): per (work class,
+// model) how ticket sessions turned out, FLEET-WIDE — evidence pools across orgs
+// on purpose (docs/model-quality-adr.md). Per-session rows are org-scoped: the
+// hub serves them only for the one org named, so they show only when the
+// header's filter resolves to exactly one org. Its own fetch, like the
+// permission card; the beat's SSE patches never repaint it.
+const $mq = document.getElementById("modelQualityCard");
+const MQ_REFRESH_MS = 60000;
+const MQ_OUTCOME_LABEL = { good: "good", bad: "bad", pending: "pending", "no-change": "no change",
+  undelivered: "undelivered" };
+let mqView = null;
+let mqLoadError = null;
+let mqFetchSeq = 0;
+// As the permission card: no fetch before the first render's TurmaOrg.update,
+// then refetch whenever the org the rows are scoped to moves. "" = no single org.
+let mqScoped = false;
+let mqFetchedOrg = null;
+let mqViewOrg = null;
+// The org the card's current state (view OR error) belongs to — a pick change
+// clears either at once, so neither another org's rows nor its error lingers.
+let mqStateOrg = null;
+// The header's display name per siteKey (the site's own orgName when it has one).
+let mqOrgNames = new Map();
+let mqPainted = null;
+let mqRowsOpen = false;
+
+function mqOrg() {
+  return (TurmaOrg.get && TurmaOrg.get()) || "";
+}
+// Bad share of the DECIDED sessions (good + bad); null while none is decided —
+// pending, no-change and undelivered say nothing about the code's quality.
+function mqBadRate(g) {
+  const decided = permNum(g.good) + permNum(g.bad);
+  return decided ? permNum(g.bad) / decided : null;
+}
+function mqPct(r) { return r == null ? "—" : `${Math.round(r * 100)}%`; }
+// Opus's bad rate per class: the bar a cheaper model must meet on that class.
+function mqBaselines(groups) {
+  const m = new Map();
+  for (const g of groups) if (g.model === "opus") m.set(g.cls, mqBadRate(g));
+  return m;
+}
+// Rework (XERK-1845): per signal `{median, n}` over the sessions that reported
+// it. A signal no session reported is absent, never 0.
+const MQ_REWORK = [["qaRuns", "QA runs"], ["qaFail", "QA failed"], ["ciRounds", "CI rounds"],
+  ["changesRequested", "Changes requested"]];
+// A median as shown, one decimal, or "—" when the hub sends none.
+function mqMedian(v) {
+  if (!(typeof v === "number" && Number.isFinite(v) && v >= 0)) return "—";
+  // A large one is whole: v * 10 would overflow to Infinity near the double's top.
+  return String(v >= 1e6 ? Math.round(v) : Math.round(v * 10) / 10);
+}
+function mqRework(g) { return g.rework && typeof g.rework === "object" ? g.rework : {}; }
+function mqFinite(v) { return typeof v === "number" && Number.isFinite(v); }
+// One signal of a group, or null when the hub sent no usable median for it.
+function mqSignal(g, key) {
+  const v = Object.hasOwn(mqRework(g), key) ? mqRework(g)[key] : null;
+  return v && typeof v === "object" && mqFinite(v.median) && v.median >= 0 ? v : null;
+}
+// Shadow pairs (XERK-1847): graded pairs, and how many the candidate lost to Opus.
+function mqShadow(g) {
+  const s = g.shadow && typeof g.shadow === "object" ? g.shadow : null;
+  if (!s || !(permNum(s.pairs) > 0)) return "—";
+  const worse = permNum(s.candidateOnlyBad);
+  return `${permNum(s.pairs)}` + (worse ? ` · ${worse} worse` : "");
+}
+// Promotion (XERK-1848). Opus is the baseline every class starts on.
+function mqStatus(g) {
+  if (typeof g.promotion === "string" && g.promotion) return g.promotion;
+  return g.model === "opus" ? "baseline" : "—";
+}
+// Which optional columns any group carries: a column the hub serves for no group
+// is left off rather than shown as a column of dashes.
+function mqColumns(groups) {
+  return {
+    rework: MQ_REWORK.filter(([k]) => groups.some((g) => mqSignal(g, k))),
+    shadow: groups.some((g) => g.shadow && typeof g.shadow === "object"),
+  };
+}
+// Classes by total sessions, Opus first inside each (the baseline), then by sessions.
+function mqOrdered(groups) {
+  const totals = new Map();
+  for (const g of groups) totals.set(g.cls, (totals.get(g.cls) || 0) + permNum(g.sessions));
+  return [...groups].sort((a, b) => (totals.get(b.cls) - totals.get(a.cls)) || a.cls.localeCompare(b.cls)
+    || ((b.model === "opus") - (a.model === "opus")) || (permNum(b.sessions) - permNum(a.sessions))
+    || a.model.localeCompare(b.model));
+}
+function mqPrLinks(prs) {
+  return (Array.isArray(prs) ? prs : []).filter((p) => p && /^https?:\/\//i.test(p.url || "")).map((p) => {
+    const n = (String(p.url).match(/\/(\d+)\/?$/) || [])[1];
+    const state = typeof p.state === "string" ? ` ${p.state.toLowerCase()}` : "";
+    return `<a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">${esc(n ? `#${n}` : "PR")}</a>${esc(state)}`;
+  }).join(", ");
+}
+
+function modelQualityCardHtml(view, now, org = "", rowsOpen = false, loadError = null) {
+  const days = view && permNum(view.windowDays) > 0 ? permNum(view.windowDays) : 90;
+  const head = `<h2>Model quality</h2>` +
+    `<div class="note">How ticket sessions turned out, per work class (the ticket's type) and model, ` +
+    `pooled across every org. Good = merged with no reopen for ${days} days; bad = reopened after Done ` +
+    `or every PR closed unmerged. Bad rate is bad ÷ (good + bad); the Opus column is that rate for Opus ` +
+    `on the same class — the bar a cheaper model has to meet.</div>`;
+  if (!view && typeof loadError === "string" && loadError) {
+    return head + `<div class="perm-empty">Could not load model quality (${esc(loadError)}).</div>`;
+  }
+  if (!view) return head + `<div class="perm-empty">Loading…</div>`;
+  const groups = (Array.isArray(view.groups) ? view.groups : [])
+    .filter((g) => g && typeof g === "object" && typeof g.cls === "string" && typeof g.model === "string");
+  if (!groups.length) return head + `<div class="perm-empty">No ticket sessions recorded yet.</div>`;
+  const base = mqBaselines(groups);
+  const cols = mqColumns(groups);
+  let lastCls = null;
+  const rows = mqOrdered(groups).map((g) => {
+    const first = g.cls !== lastCls;
+    lastCls = g.cls;
+    const other = [];
+    if (permNum(g["no-change"])) other.push(`${permNum(g["no-change"])} no change`);
+    if (permNum(g.undelivered)) other.push(`${permNum(g.undelivered)} undelivered`);
+    const reasons = g.reasons && typeof g.reasons === "object"
+      ? Object.entries(g.reasons).map(([k, n]) => `${permNum(n)} ${k}`).join(", ") : "";
+    const opus = g.model === "opus" ? null : base.get(g.cls);
+    const num = (label, text, cls = "") =>
+      `<td class="mq-num${cls}" data-label="${label}">${esc(text)}</td>`;
+    return `<tr${first ? ` class="mq-class-first"` : ""}>
+      <td><b>${esc(g.cls)}</b><span class="mq-model">${esc(g.model)}</span>` +
+      (other.length ? `<div class="mq-sub">${esc(other.join(" · "))}</div>` : "") + `</td>
+      ${num("Sessions", String(permNum(g.sessions)))}
+      <td class="mq-num mq-good" data-label="Good">${permNum(g.good)}</td>
+      <td class="mq-num${permNum(g.bad) ? " mq-bad" : ""}" data-label="Bad"${reasons ? ` title="${esc(reasons)}"` : ""}>${permNum(g.bad)}</td>
+      ${num("Pending", String(permNum(g.pending)))}
+      ${num("Bad rate", mqPct(mqBadRate(g)))}
+      ${num("Opus", opus === undefined || opus === null ? "—" : mqPct(opus), opus == null ? " mq-na" : "")}` +
+      cols.rework.map(([k, label]) => {
+        const sig = mqSignal(g, k);
+        return `<td class="mq-num${sig ? "" : " mq-na"}" data-label="${label}"` +
+          (sig ? ` title="median of ${permNum(sig.n)} session${permNum(sig.n) === 1 ? "" : "s"}"` : "") + `>${esc(mqMedian(sig && sig.median))}</td>`;
+      }).join("") +
+      (cols.shadow ? num("Shadow pairs", mqShadow(g)) : "") +
+      num("Status", mqStatus(g), mqStatus(g) === "—" ? " mq-na" : "") + `
+    </tr>`;
+  }).join("");
+  const th = `<th>Class · model</th><th>Sessions</th><th>Good</th><th>Bad</th><th>Pending</th>` +
+    `<th>Bad rate</th><th>Opus</th>` +
+    cols.rework.map(([, label]) => `<th title="Median per session">${label}</th>`).join("") +
+    (cols.shadow ? `<th>Shadow pairs</th>` : "") + `<th>Status</th>`;
+  const table = `<div class="table-scroll"><table><thead><tr>${th}</tr></thead><tbody>${rows}</tbody></table></div>`;
+  return head + table + mqSessionsHtml(view, now, org, rowsOpen);
+}
+
+// The org-scoped drill-down: the newest sessions of the ONE org the header picks.
+function mqSessionsHtml(view, now, org, rowsOpen) {
+  if (!org) {
+    return `<div class="note perm-foot">Pick one org in the header to list its sessions.</div>`;
+  }
+  const list = (Array.isArray(view.rows) ? view.rows : []).filter((r) => r && typeof r === "object");
+  const name = mqOrgNames.get(org) || (TurmaBoard.orgName ? TurmaBoard.orgName(org) : org);
+  if (!list.length) return `<div class="note perm-foot">No ticket sessions recorded for ${esc(name)}.</div>`;
+  const items = list.map((r) => {
+    const outcome = Object.hasOwn(MQ_OUTCOME_LABEL, r.outcome) ? r.outcome : "pending";
+    const at = permNum(r.updatedAt);
+    const span = (t) => (t ? `<span class="meta">${esc(t)}</span>` : "");
+    const prs = mqPrLinks(r.prs);
+    return `<li><span class="mq-issue">${esc(r.issue || "—")}</span>` +
+      `<span class="mq-outcome o-${outcome}"${r.reason ? ` title="${esc(r.reason)}"` : ""}>${esc(MQ_OUTCOME_LABEL[outcome])}</span>` +
+      span(`${r.cls || "other"} · ${r.model || "default"}`) + span(r.reason) + span(r.host) + span(r.repo) +
+      (prs ? `<span class="meta">${prs}</span>` : "") +
+      span(at ? `${fmtDuration((now - at) / 1000)} ago` : "") + `</li>`;
+  }).join("");
+  return `<details class="table-view mq-rows-view"${rowsOpen ? " open" : ""}>` +
+    `<summary>Sessions in ${esc(name)} (${list.length})</summary><ul class="mq-rows">${items}</ul></details>`;
+}
+
+function paintModelQuality() {
+  const html = `<div class="models-card mq-card">${modelQualityCardHtml(mqView, Date.now(), mqViewOrg || "", mqRowsOpen, mqLoadError)}</div>`;
+  if (html === mqPainted) return;
+  mqPainted = html;
+  TurmaNav.preserveScroll($mq, () => { $mq.innerHTML = html; });
+}
+
+function syncModelQualityScope(agents) {
+  mqScoped = true;
+  if (TurmaBoard.mergeSites && Array.isArray(agents)) {
+    mqOrgNames = new Map(TurmaBoard.mergeSites(agents).map((s) => [s.siteKey, TurmaBoard.orgName(s.siteKey, s.orgName)]));
+  }
+  if (mqOrg() !== mqFetchedOrg) refreshModelQuality();
+}
+
+async function refreshModelQuality() {
+  const seq = ++mqFetchSeq;
+  const org = mqOrg();
+  mqFetchedOrg = org;
+  const q = new URLSearchParams();
+  if (org) { q.set("org", org); q.set("rows", "1"); }
+  // Another org's rows — or its error — are never shown under the new pick,
+  // not even while it loads.
+  if (mqStateOrg !== org) {
+    mqView = null;
+    mqViewOrg = null;
+    mqLoadError = null;
+    mqStateOrg = null;
+    paintModelQuality();
+  }
+  const failed = (why) => {
+    if (seq !== mqFetchSeq) return;
+    if (mqView && mqViewOrg === org) return;
+    mqView = null;
+    mqViewOrg = null;
+    mqLoadError = why;
+    mqStateOrg = org;
+    paintModelQuality();
+  };
+  try {
+    const r = await fetch("/api/model-quality" + (org ? "?" + q.toString() : ""));
+    // The hub's own words when it sent them (XERK-264), worded as Android's.
+    if (!r.ok) return failed(TurmaNav.refusalText("", r.status, await r.json().catch(() => null)));
+    const body = await r.json();
+    if (seq !== mqFetchSeq) return;
+    mqView = body;
+    mqViewOrg = org;
+    mqStateOrg = org;
+    mqLoadError = null;
+    paintModelQuality();
+  } catch { failed("no readable answer from the hub"); }
+}
+
+$mq.addEventListener("toggle", (ev) => {
+  const d = ev.target;
+  if (d && d.matches && d.matches("details.mq-rows-view")) mqRowsOpen = !!d.open;
+}, true);
+
+// ---- The fleet snapshot -------------------------------------------------------
+let cache = null;
+function render(data) {
+  TurmaOrg.update(data);
+  TurmaNewTicket.update(data);
+  // Only now do the header's org keys mean anything (org.js resolves them
+  // against the sites this data names), so the active pane's fetch is scoped here.
+  syncPaneScope(data);
+  renderDecisions(data, Date.now());
+}
+// A fetch MERGES, never replaces (XERK-444): a `decisions` SSE frame that lands
+// while /api/agents is in flight is newer than the body, so `decisionsClock`
+// stamps every frame and a snapshot keeps the cached log when one landed since.
+let decisionsClock = 0;
+async function refresh() {
+  const dsince = decisionsClock;
+  try {
+    const r = await fetch("/api/agents");
+    if (r.status === 401) return void (location.href = "/login");
+    const body = await r.json();
+    if (cache && decisionsClock !== dsince) {
+      body.decisions = cache.decisions;
+      body.decisionCounts = cache.decisionCounts;
+    }
+    cache = body;
+  } catch { /* keep the last render */ }
+  if (cache) render(cache);
+}
+let sseOk = false, sseBackoff = 2000;
+function connectSSE() {
+  let es;
+  try { es = new EventSource("/api/events"); }
+  catch { setTimeout(connectSSE, sseBackoff); return; }
+  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  // The decisions log changed (any org): every org's served tail.
+  es.addEventListener("decisions", (e) => {
+    let d;
+    try { d = JSON.parse(e.data); } catch { return; }
+    if (!cache) return void refresh();
+    decisionsClock++;
+    cache.decisions = d;
+    render(cache);
+  });
+  // How many each org keeps (the tail above is capped); sent just before it.
+  es.addEventListener("decisionCounts", (e) => {
+    let n;
+    try { n = JSON.parse(e.data); } catch { return; }
+    if (!cache) return void refresh();
+    decisionsClock++;
+    cache.decisionCounts = n;
+  });
+  TurmaOrg.sse(es);
+  es.onerror = () => {
+    sseOk = false;
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(connectSSE, sseBackoff);
+      sseBackoff = Math.min(sseBackoff * 2, 30000);
+    }
+  };
+}
+TurmaOrg.subscribe(() => { if (cache) render(cache); });
+showPane();
+refresh();
+connectSSE();
+// The org list rides the agent payload, which this page does not live-patch, so a
+// slow poll keeps the header's org menu current; a fast one covers a dead stream.
+setInterval(() => refresh(), 60000);
+setInterval(() => { if (!sseOk) refresh(); }, 15000);
+paintPermissions();
+setInterval(() => { if (permScoped && pane === "permissions") refreshPermissions(); }, PERM_REFRESH_MS);
+paintModelQuality();
+setInterval(() => { if (mqScoped && pane === "model-quality") refreshModelQuality(); }, MQ_REFRESH_MS);
+</script>
+</body>
+</html>
