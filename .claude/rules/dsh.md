@@ -50,8 +50,8 @@ Naming trap: `agentType`/`agent_type` ALSO names Task-tool SUBAGENTS, an older u
   callers — they all funnel through `_launch_tmux`.
 - **Composer only, no card badge**: `sessions.html` gates a "Runtime" `<select>` on
   `a.dsh.available`, sending `agentType` only for "dsh"; Android mirrors just that composer row
-  (`core/Runtime.kt`, `SpawnDialog`). The web `⚙ dsh` marker, the glasses `ph-runtime`/G2 `·dsh`
-  suffix and Android's `RuntimeBadge` were removed — do not re-add a runtime chip to the card.
+  (`core/Runtime.kt`, `SpawnDialog`). The web `⚙ dsh` marker and Android's
+  `RuntimeBadge` were removed — do not re-add a runtime chip to the card.
 - Tests: `TestSpawnOptionHelpers`/`TestSessionLifecycle` (agent), `normalizeDsh`/spawn-route/restore
   cases (`server.test.js`), the Runtime cases in `sessions.test.js`, `RuntimeTest`/`SpawnRequestTest`/
   `SpawnComposerTest`/`AgentDecodeTest` (android).
@@ -105,7 +105,7 @@ plugin's control-socket `state` (running|idle).
 
 - **It REUSES the `paneBusy` wire field agent-side — it does NOT add a dsh signal to the mirrors.**
   `session_report(agent_type="dsh", dsh_status=…)` sources `paneBusy` from the cached dsh status
-  (`dsh_pane_busy`) instead of scraping. So `sessionWorking`, `liveState`, the five `readyForReview`
+  (`dsh_pane_busy`) instead of scraping. So `sessionWorking`, `liveState`, the three `readyForReview`
   mirrors, the alert and summaries are UNCHANGED and cannot drift. **"All mirrors branch on
   agentType" was the rejected alternative — do not restore it.**
 - **Everything OTHER than liveness stays transcript-derived** from the S1 projection: `lastRole`,
@@ -206,8 +206,8 @@ mechanics live in the file named, whose `paths:` load beside this one.
   worktree stays detached" with NO new launch code.
 - **Collectors, the two tracker writes and the `_board_column` mirrors are untouched** — the runtime
   pin is orthogonal to a ticket's column.
-- **Web ⇄ Android parity**: the board Runtime row shipped on Android too (XERK-477). The vendored
-  `board.cjs` stays byte-identical to `board.js`. Board mechanics: `turma-board.md`.
+- **Web ⇄ Android parity**: the board Runtime row shipped on Android too (XERK-477).
+  Board mechanics: `turma-board.md`.
 - Tests: `TestSpawnTicket` (`test_a_runtime_pin_lands_on_the_session_record`,
   `test_handle_commands_carries_the_runtime_pin`) agent-side; the `/runtime` route + dsh
   `findTicketHost` cases in

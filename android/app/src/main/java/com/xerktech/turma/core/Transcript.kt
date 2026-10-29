@@ -10,8 +10,8 @@ import com.xerktech.turma.model.ToolUseBlock
 import kotlin.math.max
 
 /**
- * Per-session transcript buffer logic — a port of the web chat.js mergeTail
- * (itself descended from glasses/src/transcript.ts). Entries only ever GROW
+ * Per-session transcript buffer logic — a port of the web chat.js mergeTail.
+ * Entries only ever GROW
  * (a shorter incoming copy is a bounded heartbeat preview that must not
  * clobber the full text) and are deduped by key.
  *

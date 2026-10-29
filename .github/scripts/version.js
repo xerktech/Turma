@@ -28,7 +28,7 @@ function parseBase(text) {
 }
 
 // Parse a full v<M>.<m>.<p> tag (or bare M.m.p). Returns null for anything that
-// isn't one — legacy glasses-v*/android-v*/agent-native-v* tags parse to null
+// isn't one — legacy per-component <name>-v* tags parse to null
 // here so nextPatch ignores them (but assertStrictlyGreatest still checks them).
 function parseTag(tag) {
   const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(tag).trim());
@@ -94,15 +94,15 @@ function androidVersionCode(v) {
   return v.major * 1000000 + v.minor * 10000 + v.patch;
 }
 
-// The glasses guard: the new version MUST sort strictly above EVERY existing
-// tag, including the legacy per-component namespaces (glasses-v0.2.32 etc.),
-// because Even Hub / Android version their installs by content and a regression
+// The regression guard: the new version MUST sort strictly above EVERY existing
+// tag, including the legacy per-component namespaces (android-v0.2.2 etc.),
+// because Android versions its installs by content and a regression
 // silently stops registering new builds. This is the assertion standing between
 // a fat-fingered VERSION edit and a bricked release channel.
 function assertStrictlyGreatest(version, allTags) {
   for (const t of allTags) {
     // Strip any known prefix down to the M.m.p core.
-    const core = String(t).replace(/^(v|glasses-v|android-v|agent-native-v)/, "");
+    const core = String(t).replace(/^(?:[a-z][a-z-]*-)?v/, "");
     const p = parseTag(core);
     if (p && compare(version, p) <= 0) {
       throw new Error(`computed version ${format(version)} is not greater than existing tag ${t}`);

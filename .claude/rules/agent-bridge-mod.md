@@ -23,7 +23,7 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
   Claude sessions only. dsh and qwen load no Claude mod.
 - **It only ever RAISES `paneBusy` to true, never lowers it.** The pane also reads busy for
   work that is no model turn (a compaction, a `!` command), and the pane stays the source for
-  mode, dialogs and everything else. No new wire field: the five working mirrors are unchanged.
+  mode, dialogs and everything else. No new wire field: the four working mirrors are unchanged.
 - **Skipped while a `panePrompt` dialog is up**: the turn is running, but every consumer reads
   a dialog as the session waiting on a person.
 - **Distrusted once the transcript is quiet** for `TURN_STATE_QUIET_SEC` (300s) or absent,

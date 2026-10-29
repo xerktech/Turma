@@ -181,7 +181,7 @@ class BoardTest {
         val down = agent("down", false, JiraBlock(siteKey = "org", user = "u1",
             fetchedAt = "2026-07-16T05:00:00Z",
             tickets = listOf(JiraTicket(key = "T-1", statusCategory = "todo",
-                repoGuess = com.xerktech.turma.model.RepoGuess(repo = "Veiller", cloned = true)))))
+                repoGuess = com.xerktech.turma.model.RepoGuess(repo = "Tenir", cloned = true)))))
         val up = agent("up", true, JiraBlock(siteKey = "org", user = "u1",
             fetchedAt = "2026-07-16T01:00:00Z",
             tickets = listOf(JiraTicket(key = "T-1", statusCategory = "todo",

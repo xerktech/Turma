@@ -15,9 +15,6 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
 
 ## The page
 
-- **`chat.js` is VENDORED into glasses byte-identical** as `glasses/src/vendor/chat.cjs` (like
-  `board.js`), asserted by `vendor.test.ts`, gated by `glasses-ci.yml`. Re-copy on every edit (`cp
-  turma/public/chat.js glasses/src/vendor/chat.cjs`) or glasses CI fails.
 - **The New-session picker shows each host COLLAPSED to its header** (name, active / max, a mini
   weekly-limit bar); its repos render only once clicked — a host with dozens of repos buried the
   rest. Web `hostBlock`/`hostOpen`, Android `NewSessionPickerDialog`.
@@ -177,7 +174,7 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
 - Typed prompts → `POST .../input`; pending `AskUserQuestion`s answer via option chips/custom text →
   `POST .../answer`. The picker renders Claude Code's full card set (description + collapsible
   `preview`, header chip, "n of N" counter) with a backward-compat flat-list fallback for
-  glasses/android; `multiSelect` renders checkboxes + a Submit posting `optionIndices`.
+  android; `multiSelect` renders checkboxes + a Submit posting `optionIndices`.
 - Raw ttyd terminal is one **"Terminal ▸"** toggle away (`#termPane` iframe); `GET /api/ws-token` also
   authenticates the chat's `/live` socket. Tests: `chat.test.js`.
 - **A grey-but-loaded terminal self-heals via a client watchdog** (XERK-879, `armTermWatch`): ttyd's
@@ -196,7 +193,7 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
   newest-turn-first. Replaces the removed per-session dsh terminal/web-server. A log syncs to the
   archive within a few beats, so a just-opened dsh session may 404 until then (pane says so, ↻
   Refresh). The dsh-web-through-tunnel PROXY path is ruled out (`dsh web` has no base-path flag).
-  Web-first; Android/glasses in `android/PARITY.md`. Tests: `dshTrajectory` in `archive.test.js`,
+  Web-first; Android in `android/PARITY.md`. Tests: `dshTrajectory` in `archive.test.js`,
   `/api/dsh/<id>/trajectory` in `server.test.js`.
 - **The Trajectory view is GENERALIZING to Claude/Qwen — one shape, one renderer, three runtimes**
   (epic XERK-712). The shared **`GET /api/archive/<transcriptId>/trajectory`** (XERK-715) dispatches
@@ -339,7 +336,7 @@ words its stage "Queued — <reason>", flipping live once provisioned. Tests: `s
   must not become a reason NOT to (the same conversation, handed new work, finishes with no new PR to
   show). `newWorkSincePrs` (against `prsLandedTs`) says the conversation moved past it, falling
   through to the finished-turn signal; false when unanswerable, erring toward parking.
-- **FIVE mirrors must agree** — see CLAUDE.md. Card shows WHY it qualified (`.dot.review`). Tests:
+- **THREE mirrors must agree** — see `contract-wire.md`. Card shows WHY it qualified (`.dot.review`). Tests:
   `sessions.test.js`, `readyForReview` in `server.test.js`.
 - **Where the hub serves attention, IT decides the section — every `needs-you:*` session (question,
   permission, review, stalled), oldest `since` first, each with a `.why` line; `readyForReview`

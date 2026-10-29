@@ -92,8 +92,7 @@ sealed interface ChatItem {
     /**
      * A run of consecutive thinking traces the NORMAL verbosity hides, folded
      * into ONE muted, counted, EXPANDABLE marker (XERK-860) — the web's
-     * `💭 n thought(s)` (chat.js `renderFoldedThoughts`), which glasses
-     * renders through the same vendored engine. Hidden thinking used to render
+     * `💭 n thought(s)` (chat.js `renderFoldedThoughts`). Hidden thinking used to render
      * as NOTHING here: next to the terminal — which always shows the trace — an
      * elided turn read as a quiet one, with no signal that anything was cut.
      *
@@ -487,8 +486,7 @@ fun stripFraming(raw: String): String {
  *
  * The trailing run is found by a LINEAR reverse scan, not a regex: an
  * unanchored `(?:\[…\])+$` backtracks O(n²) on bracket-heavy text that does not
- * end in a marker (e.g. "[x]"×N + "."), a ReDoS this same fix's glasses twin
- * hit (XERK-862/#835). buildItems runs on every tail/history render with no
+ * end in a marker (e.g. "[x]"×N + "."), a ReDoS (XERK-862/#835). buildItems runs on every tail/history render with no
  * hard clamp on entry text, so the scan peels whole markers off the end and
  * stops at the first char that isn't part of one, touching each char once.
  */

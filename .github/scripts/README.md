@@ -36,7 +36,7 @@ tag namespace, `v<M>.<m>.<p>`, one release, all four components.
 - **`plan.js`** — in: `RELEASE_TYPE` (patch|minor|major), `FORCE_ALL`. out
   (`$GITHUB_OUTPUT`): `version`, `tag`, `prev_tag`, `changed` (json),
   `android_version_code`, `build_turma`/`build_agent_native`/
-  `build_glasses`/`build_android`, `base_major`, `base_minor`.
+  `build_agent_windows`/`build_android`, `base_major`, `base_minor`.
 - **`publish.js`** — in: `VERSION_FULL`, `TAG`, `PREV_TAG`, `CHANGED` (json),
   `ANDROID_VERSION_CODE`, `COMMIT`, `RELEASED_AT`, `OUT_DIR`. out: writes
   `manifest.json`, `release-notes.md`, `carry-plan.json`; sets `carry`,

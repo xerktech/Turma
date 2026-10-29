@@ -395,7 +395,7 @@ POKE_CONN_TIMEOUT_SEC = _env_float("TURMA_POKE_CONN_TIMEOUT_SEC", 2.0)
 UPDATING_FLAG_PATH = os.path.join(REGISTRY_DIR, "updating.json")
 UPDATING_ANNOUNCE_TIMEOUT_SEC = _env_float("TURMA_UPDATING_ANNOUNCE_TIMEOUT_SEC", 4.0)
 # Rendezvous dir for the AskUserQuestion bridge (agent/hooks/ask.py). A pending
-# question lives here as `<sessionId>.req.json`; the answer the glasses client
+# question lives here as `<sessionId>.req.json`; the answer a client
 # sends rides back as `<sessionId>.ans.json`. See _hook_question / answer_question.
 QUESTIONS_DIR = os.path.join(REGISTRY_DIR, "questions")
 # The claude launch's long text arguments — the session directive and the
@@ -1067,7 +1067,7 @@ VALID_CLAUDE_SID_RE = re.compile(r"[A-Za-z0-9-]+")
 # relay URL — validated the same strict way as a transcript id since it also
 # reaches a URL path.
 VALID_MIGRATION_ID_RE = re.compile(r"[A-Za-z0-9-]+")
-# Glasses-client transcript tail: how many surviving messages to report per
+# Heartbeat transcript tail: how many surviving messages to report per
 # beat, and how many chars of each to keep (payload-size bounds).
 TAIL_MSGS = _env_int("SESSION_TAIL_MSGS", 30)
 TAIL_MSG_CHARS = _env_int("SESSION_TAIL_MSG_CHARS", 500)
@@ -1075,7 +1075,7 @@ TAIL_MSG_CHARS = _env_int("SESSION_TAIL_MSG_CHARS", 500)
 # every heartbeat, so a long message is clipped to keep the payload small. The
 # single-session reading paths — the live tail (tunnel-agent.js) and on-demand
 # `history` — instead keep this many chars per message, so a full assistant
-# response never shows up cut off mid-sentence on the glasses. The client keeps
+# response never shows up cut off mid-sentence in a client. The client keeps
 # whichever copy of a message is longer, so the preview never clobbers it.
 TAIL_MSG_CHARS_FULL = _env_int("SESSION_TAIL_MSG_CHARS_FULL", 16000)
 # Rich-block caps (native chat UI). _entry_blocks() preserves the thinking,
@@ -1113,8 +1113,8 @@ BLOCK_CAPS = {
 # from that tail, so a text-only row is a lie the operator reads: _entry_text
 # flattens a tool call to the literal "[Bash]", which the chat then paints as
 # PROSE, and the TAIL_MSG_CHARS clip arrives with no flag, so the renderer's
-# "… clipped to fit" mark never shows. Blocks fix both at once — the chat, the
-# glasses and android all already merge on `blocks` and keep whichever copy of
+# "… clipped to fit" mark never shows. Blocks fix both at once — the chat and
+# android both already merge on `blocks` and keep whichever copy of
 # an entry is richer — but this rides EVERY session on EVERY beat, so the caps
 # are far tighter than BLOCK_CAPS (which the SINGLE-session live tail and
 # `history` read at, XERK-347 — never narrow THOSE) and the whole per-session
@@ -1145,9 +1145,9 @@ SEND_FILE_IMG_MIME = {
 }
 SEND_FILE_HTML_EXT = {".html", ".htm"}
 # Terminal color/cursor codes sometimes make it into pasted transcript text;
-# strip them so the glasses client only ever sees plain text.
+# strip them so a client only ever sees plain text.
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
-# Glasses-client on-demand commands: how much typed text `input` accepts per
+# On-demand commands: how much typed text `input` accepts per
 # call, and how many surviving messages an on-demand `history` request returns
 # (independent of the per-heartbeat TAIL_MSGS above).
 #
@@ -2686,8 +2686,8 @@ LOCAL_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,60}$")
 # returns False regardless of TURMA_DSH / the DSH_* env, so this host never
 # advertises the dsh capability, refuses every agentType="dsh" spawn, and runs
 # no dsh launcher or `dsh web` viewer — the same "off" state a host without the
-# env has, but one no per-host env can override. The hub, Android and glasses
-# carry the SAME-named flag so no single component can re-enable dsh alone. Flip
+# env has, but one no per-host env can override. The hub and Android carry the
+# SAME-named flag so no single component can re-enable dsh alone. Flip
 # to True (and set the env) to bring dsh back. Tests that exercise the retained
 # dsh machinery patch this True (or patch dsh_configured directly).
 DSH_ENABLED = False
@@ -2698,8 +2698,8 @@ DSH_ENABLED = False
 # machinery. When False, qwen_configured() below returns False regardless of
 # TURMA_QWEN, so this host never advertises the qwen capability and refuses
 # every agentType="qwen" spawn — the same "off" state a host without the env
-# has, but one no per-host env can override. The hub, Android and glasses carry
-# the SAME-named flag so no single component can re-enable qwen alone. [Qwen A]
+# has, but one no per-host env can override. The hub and Android carry the
+# SAME-named flag so no single component can re-enable qwen alone. [Qwen A]
 # (XERK-506) establishes the field, the flag and the whole wire path; the qwen
 # LAUNCHER is [Qwen B]. The launcher now exists and the XERK-520 end-to-end gate
 # verified qwen on real Qwen Code (spawn, chat, the guard's hard-deny under
@@ -5565,7 +5565,7 @@ def statusline_script_path():
 
 
 # The ask.py bridge blocks the AskUserQuestion tool call while it waits for the
-# glasses answer, so its Claude-Code hook timeout must comfortably exceed the
+# operator's answer, so its Claude-Code hook timeout must comfortably exceed the
 # bridge's own per-question block (TURMA_QUESTION_TIMEOUT_SEC, default 600) or
 # Claude would kill the hook first. A little headroom over the 600s default.
 ASK_HOOK_TIMEOUT_SEC = 660
@@ -5775,10 +5775,10 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
                          subagent_model_path=None):
     """Build the dict passed to ``claude --settings``: ``PreToolUse`` hooks over
     Bash (the safety guard), the file-editing tools (the ~/.claude file guard)
-    and AskUserQuestion (the glasses answer bridge),
+    and AskUserQuestion (the operator answer bridge),
     plus deny rules protecting the host credential stores. The bypass-mode
     session runs freely except for what the guard blocks (see ``hooks/guard.py``);
-    the ask bridge routes interactive questions to the glasses (see
+    the ask bridge routes interactive questions to the operator (see
     ``hooks/ask.py``).
 
     Also folds in the operator's user-level ~/.claude/settings.local.json
@@ -5910,7 +5910,7 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
         # permission-mode classes differ — and `bypassPermissions` is a class of
         # its own — by opening an approval dialog in the RECEIVING session's
         # pane. Nothing in Turma can answer that dialog: it is not an
-        # AskUserQuestion, so the glasses bridge never sees it; it owns the input
+        # AskUserQuestion, so the ask bridge never sees it; it owns the input
         # line the chat composer types into, so the next operator message answers
         # it instead of reaching claude; and _busy_from_capture / _pane_prompt do
         # not know it is there. It then expires after `dialogExpiry` and drops
@@ -7250,7 +7250,7 @@ def claude_auth_status(path=None, now_ms=None):
 #
 # The GROUPING key that rides the wire is a HASH of that uuid, never the uuid,
 # the org uuid or the email. The hub persists every heartbeat into state.json
-# and fans it out to web, Android and glasses, and grouping only ever asks
+# and fans it out to web and Android, and grouping only ever asks
 # whether two hosts are equal — so there is nothing to gain by shipping the
 # identifier itself.
 #
@@ -7929,8 +7929,8 @@ def _finalize_usage(acc):
     accumulator's own buckets.
 
     `today`/`week` are pre-sliced here rather than left to each client: the day
-    buckets are UTC and the clients aren't, and three surfaces (hub, Android,
-    glasses) would otherwise each re-derive the same window."""
+    buckets are UTC and the clients aren't, and the surfaces (hub, Android)
+    would otherwise each re-derive the same window."""
     window = _week_window()
     days = {d: dict(acc.days[d]) for d in sorted(acc.days)[-HISTORY_DAYS:]}
     return {
@@ -10059,7 +10059,7 @@ def _parse_task_notification(text):
 
 def _tn_preview(tn):
     """Flatten a parsed task-notification to display text (summary + result), the
-    text-feed form used by the glasses tail, heartbeat preview and archive."""
+    text-feed form used by the heartbeat preview and archive."""
     parts = [tn["summary"] or tn["status"] or "background task update"]
     if tn["result"]:
         parts.append(tn["result"])
@@ -10205,7 +10205,7 @@ NO_OUTPUT_TEXT = "(no output)"
 
 def _lc_preview(lc):
     """Flatten a parsed local-command turn to display text, the text-feed form
-    used by the glasses tail, heartbeat preview and archive — or None to drop it
+    used by the heartbeat preview and archive — or None to drop it
     (the caveat, and an output turn that carried nothing)."""
     if lc["kind"] == "caveat":
         return None
@@ -10243,7 +10243,7 @@ def _entry_local_command(entry):
 # use]" marker entry. That is a statement ABOUT the turn, not something the
 # operator typed, so _entry_blocks classifies it as an `interrupt` block the
 # chat renders as a muted status marker instead of a user bubble. The text
-# feed (_entry_text) keeps the raw bracket line: glasses/heartbeat/archive are
+# feed (_entry_text) keeps the raw bracket line: heartbeat/archive are
 # one-dimensional text, where it already reads as the marker it is. Keep
 # mirrored with tunnel-agent.js INTERRUPT_RE.
 INTERRUPT_RE = re.compile(r"^\s*\[Request interrupted by user[^\]\n]*\]\s*$")
@@ -10421,7 +10421,7 @@ def _flatten_text(raw):
 
 
 def _entry_text(entry):
-    """Map one transcript entry to display text for the glasses tail feed, or
+    """Map one transcript entry to display text for the tail feed, or
     None to drop it (wrong type, no message, tool_result-only turn, a skill body
     (_entry_tool_source), a slash-command caveat, or empty after stripping
     ANSI). An away_summary system entry survives as its recap text (role
@@ -12716,7 +12716,7 @@ def transcript_tail(path):
     Missing/empty transcript -> []. id is the transcript entry's own uuid so
     clients can merge/dedup on it.
 
-    Two consumers, one row. `text` is the flat string the glasses read; `blocks`
+    Two consumers, one row. `text` is the flat text feed; `blocks`
     is what stops the row LYING to the chat, which seeds its buffer from here:
     `_entry_text` flattens a tool call to the literal "[Bash]", and a text-only
     row makes the chat synthesize one text block around it, so the operator sees
@@ -12779,7 +12779,7 @@ def transcript_tail(path):
         row = {
             "id": entry.get("uuid"),
             "role": _entry_role(entry),
-            # NOT clipped. The flat `text` is the glasses' feed and the chat's
+            # NOT clipped. The flat `text` is the text feed and the chat's
             # fallback when an entry carries no blocks; a cap here is what put
             # "… clipped to fit" under a 500-char slice of a long turn.
             # BLOCK_TEXT_CHARS is the same ceiling every other feed applies, so
@@ -13157,7 +13157,7 @@ def _history_row(entry):
 def _is_operator_row(row):
     """True when a history row renders as an operator (blue) bubble in the
     chat: user role with at least one text block. This is the same test the
-    web/android/glasses builders apply (a text block on a user entry becomes a
+    web/android builders apply (a text block on a user entry becomes a
     user message bubble), so what this keeps is exactly what the operator sees
     as "a message I sent". A `!` shell command counts too (XERK-2112): it is
     operator input, rendered on the operator's side. A plugin's prompt (a text
@@ -14088,8 +14088,8 @@ _Q_OPTS_MAX = 4
 
 
 def _question_labels(opts):
-    """Backward-compat: the option *labels* only, for older clients (glasses,
-    android) that render a flat pick list."""
+    """Backward-compat: the option *labels* only, for older clients
+    (android) that render a flat pick list."""
     if not isinstance(opts, list):
         return []
     return [
@@ -14241,7 +14241,7 @@ def _busy_from_capture(cap):
 # turn hasn't ended. It's a momentary artifact — but paneBusy is sampled only
 # once per heartbeat (TURMA_INTERVAL, 20s by default), so a single missed frame
 # shows the session "idle" for a whole interval on EVERY status surface (the
-# fleet dots, the session cards, the glasses glyph, the Android list — all key
+# fleet dots, the session cards, the Android list — all key
 # off this one field) AND fires a bogus "finished its turn" notification on the
 # hub's working->idle edge. That interval-long flip off and back is the "flaky
 # status icons" this guards against.
@@ -21295,7 +21295,7 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # the context-fullness meter's numerator (XERK-489 Phase 4). None until an
         # assistant turn is seen this beat; the record keeps the last known value.
         "lastTurnContextTokens": None,
-        "tail": [],                # recent transcript messages, for the glasses client
+        "tail": [],                # recent transcript messages (heartbeat preview)
         # A pending session-CLI `wake` request (XERK-1564), read off its
         # rendezvous file; _session_payload persists it on the registry record.
         "wakeAt": None,
@@ -28010,7 +28010,7 @@ class SessionManager:
 
         Deliberately NOT a busy/idle column: a peer's message enqueues and drains
         at its next tool round whatever it is doing, so the answer would change
-        nothing, and "working" is a five-mirror contract (see CLAUDE.md) that a
+        nothing, and "working" is a four-mirror contract (see session-working.md) that a
         convenience file has no business becoming the sixth mirror of.
 
         Best-effort. A roster that cannot be written must never cost the
@@ -34784,7 +34784,7 @@ class SessionManager:
         log(f"deleted paused session {sid}"
             + (" (a running session works in its worktree; kept)" if held else ""))
 
-    # --- on-demand input/history (glasses client) --------------------------
+    # --- on-demand input/history ---------------------------------------------
 
     def _download_upload(self, upload_id, timeout=None):
         """GET one staged attachment's bytes from the hub's upload relay
@@ -35114,8 +35114,7 @@ class SessionManager:
 
     def send_input(self, sid, text, uploads=None, defer_record=False):
         """Type free-text into a running session's Claude TUI and submit it.
-        This is the OPERATOR's path (the chat composer's Send, the glasses
-        actions menu) plus notify_session's fallback for a session with no
+        This is the OPERATOR's path (the chat composer's Send) plus notify_session's fallback for a session with no
         inbox; AskUserQuestion answers no longer ride it — they go through
         answer_question below. See _type_into_pane for how the text lands.
 
@@ -38043,7 +38042,7 @@ class SessionManager:
     def _on_dsh_interaction(self, sid, payload):
         """Reader-thread callback for a {evt:"interaction"} from a dsh session:
         render it into the SAME rendezvous file the ask.py bridge writes, so the
-        chat / glasses / mobile question surfaces show it with no client change.
+        chat / mobile question surfaces show it with no client change.
         The dsh requestId rides in the file (ignored by _hook_question and every
         client) so _dsh_answer can send the answer back. Best-effort; a callback
         must never raise on the reader thread."""
@@ -44096,7 +44095,7 @@ class SessionManager:
         which goes straight to the tmux pane and never reaches send_input — so the
         send_input trigger alone never fires for the most common flow. Reading the
         transcript catches the first prompt no matter how it was entered (terminal,
-        glasses/compose-bar input, or a resumed session).
+        compose-bar input, or a resumed session).
 
         A DSH session skips `claude -p` entirely (it has no Claude summarizer to
         lean on): it is named from dsh's own `session/title` event, captured by the
@@ -46285,8 +46284,7 @@ class SessionManager:
             "ticket": _served_ticket(sess),
             # Where a migrated session came from ({host, sessionId, at} as the
             # hub's importSession / archive restore stamped it), or None. The one
-            # proof a new (host, id) IS a moved conversation: the glasses follow
-            # a stashed draft by it (XERK-2109). The hub coerces it; .get() keeps
+            # proof a new (host, id) IS a moved conversation (XERK-2109). The hub coerces it; .get() keeps
             # a record without it (every non-migrated one) beat-safe.
             "migratedFrom": sess.get("migratedFrom"),
             # The hub command that created this session (spawn / resumeTranscript),

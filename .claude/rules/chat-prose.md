@@ -1,7 +1,6 @@
 ---
 paths:
   - "turma/public/chat.js"
-  - "glasses/src/vendor/chat.cjs"
   - "turma/tests/chat.test.js"
   - "turma/tests/prose-parity.js"
   - "turma/tests/prose-parity.test.js"
@@ -20,7 +19,7 @@ paths:
 
 Split out of `.claude/rules/turma-sessions.md` (the Sessions page + chat engine) to stay under the
 40,000-char ceiling. This is the markdown renderer that turns a bubble's prose into HTML, shared
-byte-for-byte between `chat.js` (vendored into glasses) and Android's `Prose.kt` port.
+byte-for-byte between `chat.js` and Android's `Prose.kt` port.
 
 - Bubble prose via `renderProse`: fenced ` ``` ` → `<pre class="md-code">` (language chip); GFM
   tables → real `<table>`s; ATX headings / `-`,`*`,`+` + `1.` lists / `>` quotes / `---` rules →

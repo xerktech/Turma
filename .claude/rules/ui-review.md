@@ -1,14 +1,13 @@
 ---
 paths:
   - "turma/public/**"
-  - "glasses/src/**"
   - "android/app/src/**"
 ---
 
 # Present UI changes for screenshot review BEFORE opening a PR
 
 Any change that alters what a person SEES or TOUCHES in a UI — `turma/public/**` (pages, CSS,
-`chat.js`/`board.js`/`nav.js`/…), `glasses/src/**`, `android/app/src/**` — is shown to the operator
+`chat.js`/`board.js`/`nav.js`/…), `android/app/src/**` — is shown to the operator
 as a rendered screenshot and approved BEFORE a pull request is created.
 
 ## Why

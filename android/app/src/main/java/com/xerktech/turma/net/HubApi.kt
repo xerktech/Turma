@@ -30,9 +30,7 @@ import retrofit2.http.Path
 import retrofit2.http.Query
 
 /**
- * The Turma hub REST surface (turma/server.js) as a Retrofit interface. Mirrors
- * glasses/src/hub-client.ts plus the full-parity extras the glasses omit
- * (clone, prune, resumeTranscript, model/mode, search, archive, devices).
+ * The Turma hub REST surface (turma/server.js) as a Retrofit interface.
  */
 interface HubApi {
 

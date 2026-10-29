@@ -43,7 +43,7 @@ services:
       # endpoint accepts only a logged-in operator, never an anonymous caller.
       # TURMA_TRIGGER_TOKEN: "${TURMA_TRIGGER_TOKEN:-}"
 
-      # Optional: Whisper STT for glasses/Android dictation, via any
+      # Optional: Whisper STT for Android dictation, via any
       # OpenAI-compatible endpoint (e.g. a LiteLLM instance). Point this at the
       # /v1 base; the hub derives /audio/transcriptions from it.
       # LITELLM_URL: "${LITELLM_URL:-}"

@@ -18,10 +18,9 @@ import okio.ByteString.Companion.toByteString
 
 /**
  * Voice dictation: streams 16 kHz mono PCM16 (the /audio contract) to the hub's
- * Whisper STT socket and returns the transcript. A port of glasses/src/audio.ts
- * discipline — open the socket first, THEN turn the mic on; mic-off is
- * idempotent on every teardown path (a stuck mic is the worst failure); never
- * throws — drops/timeouts degrade to [Result.Unavailable].
+ * Whisper STT socket and returns the transcript. Discipline: open the socket
+ * first, THEN turn the mic on; mic-off is idempotent on every teardown path (a
+ * stuck mic is the worst failure); never throws — drops/timeouts degrade to [Result.Unavailable].
  */
 class Dictation(private val client: HubClient, private val config: Config) {
 

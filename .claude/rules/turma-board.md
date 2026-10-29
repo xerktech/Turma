@@ -26,7 +26,7 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   - `resolved` covers **Azure DevOps** (XERK-250: Resolved = "fixed, not yet verified", reaches
     clients as `inprogress`); a Jira "Resolved" is normally `done`, which the carve-out can't pull
     from.
-  - **The rule has FIVE mirrors** — see `contract-mirrors.md` for the list.
+  - **The rule has THREE mirrors** — see `contract-mirrors.md` for the list.
 - **The columns are ALWAYS one horizontal row, at every width** (XERK-253, `.kanban-cols`): a flex
   strip that scrolls sideways. Never reintroduce a wrapping breakpoint — stacked columns stop
   reading as a Kanban.
@@ -141,7 +141,7 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   `spawn_ticket` clones and queues behind it, never a refusal.
 - **Only a TRIAGED host is eligible, and the hub resolves a ticket exactly as the board does**
   (XERK-325) — full rule, and everything downstream of it, in `.claude/rules/board-ticket-view.md`
-  (loads on the same files, plus the vendored board copies and Android's `Board.kt`).
+  (loads on the same files, plus Android's `Board.kt`).
 
 #### The hub's ticket queue (XERK-296)
 
@@ -296,7 +296,7 @@ button and the auto-start sweep.
     carries no `agentType` and the claiming host applies its own `TURMA_DEFAULT_RUNTIME` (possibly
     dsh/qwen). A dsh/qwen pin overrides (stores + forwards `agentType`); only claude is
     release-not-pin. Closing it needs the picker to split "Auto — host default" from a pinned "Claude
-    Code" across this file's four mirrors (`board.js` + vendored `board.cjs` + `Board.kt` + glasses)
+    Code" across this file's two mirrors (`board.js` + `Board.kt`)
     — a UX change deferred to a follow-up. Latent today (dsh/qwen behind their kill switches).
 - **Offered only when the org offers it** (`site.dshAvailable`/`site.qwenAvailable` via
   `mergeSites`; `orgOffersDsh`/`orgOffersQwen` gate hub-side) — but an existing pin is always
@@ -312,7 +312,7 @@ button and the auto-start sweep.
   to a ticket's column.
 - **Shipped on Android**: dsh row (XERK-477, `RuntimeSection`), qwen beside it (XERK-515,
   `qwenBySite` gated on `Runtime.QWEN_ENABLED`, `runtimeEditable(dshAvailable, qwenAvailable, pin)`
-  — a signature every caller must pass). Vendored `board.cjs` stays byte-identical to `board.js`.
+  — a signature every caller must pass).
 - Tests: `server.test.js` (`/runtime` route + dsh/qwen `findTicketHost`/spawnTicket cases);
   `runtimePinOf`/`runtimeFieldHtml`/`runtimePickerHtml`/`mergeSites` (both runtimes); Android
   `BoardTest.kt`.
@@ -338,9 +338,9 @@ button and the auto-start sweep.
   dashboard as an entry on the host `.host-meta` INFO line (`osMeta` in `index.html`, beside
   Memory/Uptime/Repos root/Sessions), NOT a header chip — header chips are reserved for actionable
   state (XERK-696). **Deliberately NOT surfaced in the Android UI** (the field is decoded but unused
-  there) and not a glasses/board surface.
+  there) and not a board surface.
 - **Web ⇄ Android parity**: the Host OS row shipped on Android too (`PlatformSection`/`PlatformPicker`,
-  `platformPinOf`/`prettyPlatform`). Vendored `board.cjs` stays byte-identical to `board.js`.
+  `platformPinOf`/`prettyPlatform`).
 - Tests: `server.test.js` (`normalizeHostOs`, `/platform` route, `effectiveTicketPlatform`,
   `findTicketHost` OS filter incl. epic inheritance); `platformPinOf`/`platformFieldHtml`/
   `platformPickerHtml` in `board.test.js`; Android `BoardTest.kt` + `AgentDecodeTest`; the `hostOs`
@@ -394,8 +394,8 @@ UNTOUCHED, so it triggers no column-mirror re-port. The ONE lane-rule change is 
 
 - **Epics sort to the TOP of every column** (`ticketSort`): an organizer reads best as the column's
   header, not buried by `updated` among its own children. Epics first, then newest `updated` within
-  each group (stable). NOT a column-rule mirror (`categoryOf` untouched), but it IS ported in vendored
-  `board.cjs` + Android — move all together. **Android's `BoardScreen` sorts its `(site,ticket)` pairs
+  each group (stable). NOT a column-rule mirror (`categoryOf` untouched), but it IS ported to
+  Android — move both together. **Android's `BoardScreen` sorts its `(site,ticket)` pairs
   via the shared `core/Board.kt` `TICKET_ORDER` comparator, NOT an inline copy** — an inline sort there
   drifted from this once and left epics unsorted on the phone; keep it routed through the comparator.
 - **An epic (`isEpicTicket` = `isEpic === true`) is an organizer, never a work session.** The card
@@ -404,7 +404,7 @@ UNTOUCHED, so it triggers no column-mirror re-port. The ONE lane-rule change is 
   state-tinted `▷ <state> <done>/<total>` chip. A work ticket with `epicKey` gets a dim `⧉ <epicKey>`
   chip. The full Start/Re-arm/Cancel + wave progress lives in the detail panel (`epicRunPanelHtml`).
 - **`triageLaneOf` excludes an epic** (an organizer has nothing to triage) — a lane-rule mirror, so
-  it re-vendored `glasses/src/vendor/board.cjs` (byte-identity) and re-ported `Board.kt`.
+  it re-ported `Board.kt`.
 - **`epicRunView(run, site, {sessionIndex, ticketQueue})` computes each child's status from the LIVE
   board — done/running/ready/blocked — mirroring the hub driver's readiness (`epicChildBlockersDone`):
   done = child in Done column; running = a running/queued session names it or it's ticket-queued;

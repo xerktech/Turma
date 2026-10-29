@@ -1,13 +1,10 @@
 # Releasing Turma
 
 One release publishes **all four components** under a single `v<MAJOR>.<MINOR>.<PATCH>`
-tag: the `turma` (hub) image, the native-agent tarball, the glasses app, and the
+tag: the `turma` (hub) image, the native-agent tarball, the Windows agent zip, and the
 android `.apk`. Driven by
 `.github/workflows/release.yml`;
-the logic lives in `.github/scripts/` (see its README). The glasses build is
-**not a release asset**: its distribution channel is the Even Hub developer
-portal, uploaded by `build-glasses` right after packing (see "Even Hub
-dev-portal publish").
+the logic lives in `.github/scripts/` (see its README).
 
 ## How the version is decided
 
@@ -20,16 +17,16 @@ dev-portal publish").
 ## Patch releases (automatic)
 
 Every merge to `main` that touches a component's source (`turma/`, `agent/`,
-`glasses/`, `android/`) cuts a patch release — a merge that touches only docs or
+`android/`) cuts a patch release — a merge that touches only docs or
 the release machinery does not, since every component would be carried and the
 release would publish nothing new. `plan` diffs the merge against the previous
 release tag and decides, per component, **build or carry**:
 
 - **Changed** components are rebuilt at the new version.
 - **Unchanged** components are **carried**: their prior artifact ships *at its
-  own prior version*, not rebuilt. A glasses-only merge builds and
-  portal-publishes the new glasses app and copies the previous
-  `turma-android-v*.apk` / native tarball onto the release unchanged.
+  own prior version*, not rebuilt. An android-only merge builds the
+  new `.apk` and copies the previous native tarball / Windows zip onto the
+  release unchanged.
 
 So a release always contains all four components; carried ones simply read their
 older version. The release notes render a **rebuilt vs carried** table from the
@@ -39,41 +36,10 @@ Carried **images** are referenced in the manifest at their prior `:version` tag
 (we do not retag an unchanged image to the new version — `:0.3.9` pointing at
 `0.3.4` bits would be as misleading as renaming a carried asset). `:latest` is
 already correct on a carried image, so Watchtower needs nothing. Carried
-**assets** (the `.apk` and native tarball) are copied forward
+**assets** (the `.apk`, native tarball and Windows zip) are copied forward
 under their **original filename**, because Android and the native updater version
 an install by the version baked *inside* the file — the name must describe the
-bits. A
-carried **glasses** component needs nothing physical: the Even Hub portal
-already holds its version, and the manifest references it (`kind: "evenhub"`).
-
-## Even Hub dev-portal publish
-
-The `build-glasses` job packs the `.ehpk` and immediately uploads it to the Even
-Hub developer portal (the portal's draft + create-version API, via
-`glasses/scripts/evenhub-publish.mjs`). The portal — not the GitHub release — is
-the glasses app's distribution channel, so the `.ehpk` is not attached to the
-release; a portal failure fails `build-glasses` and blocks the release like any
-other build failure. The upload happens **before the tag exists**: if a later
-job fails, no tag is minted, and the retrying run recomputes the same version —
-the publish script detects a version the portal already has (via
-`versions/list-private`) and skips, so retries are safe. A carried (unchanged)
-glasses component publishes nothing: the portal already holds its version, and
-the manifest references it. **Promoting** the uploaded build in the portal
-remains a manual step.
-
-Configuration (Settings → Secrets and variables → Actions):
-
-- **Secrets `EVENHUB_EMAIL` / `EVENHUB_PASSWORD`** — the Even Hub developer
-  account the build authenticates as. Access tokens live ~10 min, so a stored
-  token can't work for CI; email + password is the only durable credential.
-- **Variable `EVENHUB_PACKAGE_ID`** *(optional)* — overrides the committed
-  `glasses/app.json` `package_id` when the portal listing uses a different id.
-
-If the secrets are missing on a real release, `build-glasses` fails with a clear
-error before anything is tagged or published. A `dry_run` dispatch exercises the
-publish step (config + artifact resolution) without authenticating or uploading,
-and uploads the packed `.ehpk` as an Actions artifact (`glasses-ehpk-dry-run`)
-for inspection.
+bits.
 
 ## Minor / major releases (manual)
 
@@ -118,7 +84,7 @@ Cut `v0.3.0` by hand: run the workflow with `release_type: patch`,
 every component (no previous release to carry from). Watch it; keep
 `gh release delete v0.3.0 --cleanup-tag` handy if you need to redo it. The
 version guard (`assertStrictlyGreatest`) refuses any version at or below an
-existing tag — including the legacy `glasses-v*`/`android-v*`/`agent-native-v*`
+existing tag — including the legacy `android-v*`/`agent-native-v*`
 namespaces — so a fat-fingered `VERSION` can't regress a shipped channel.
 
 ## Native agent self-update

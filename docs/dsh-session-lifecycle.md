@@ -154,7 +154,7 @@ dsh call is made.
 - **"Working" for dsh comes from the control-socket `state` status** (running|idle), since a dsh
   session has no pane to scrape. **Implemented in [D] (XERK-468) by REUSING the `paneBusy` wire field
   agent-side, NOT by adding a dsh signal the mirrors branch on** — `session_report` sources `paneBusy`
-  from the cached dsh status, so all five/six mirrors and the CLAUDE.md "Working = paneBusy OR live
+  from the cached dsh status, so all the mirrors and the CLAUDE.md "Working = paneBusy OR live
   agents" contract are unchanged and cannot drift. (The earlier "all mirrors read `agentType` and fall
   back to the dsh signal" framing was the rejected alternative — it multiplies the mirror edits the
   projection seam exists to avoid. See `.claude/rules/dsh.md` "[D]".)

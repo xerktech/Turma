@@ -7,8 +7,7 @@
 // (text appears as it arrives — no typewriter, XERK-251). A three-way
 // verbosity preset (Concise hides thinking + tool actions entirely; Normal adds
 // tool cards with collapsed output; Verbose expands everything) picks how much
-// of each turn is shown. Ported in spirit from the glasses client (glasses/src/live.ts,
-// transcript.ts) into framework-free, build-free browser JS.
+// of each turn is shown. Framework-free, build-free browser JS.
 //
 // Reads a few shared helpers from the page's inline script (same classic-script
 // global scope): esc(), enc(), cache, sessTitle(), sessMeta(), fastPoll().
@@ -772,10 +771,10 @@
   }
   // Copy-to-clipboard button planted in the top-right of every fenced code
   // block (XERK-183). Two inline SVGs — the check is revealed by CSS only while
-  // .md-copy.copied is set (see sessions.html / vendor/chat.css). The button
+  // .md-copy.copied is set (see sessions.html). The button
   // sits OUTSIDE the <pre>, so it (like the language ::before label) never lands
   // in a copied text selection, and the click handler reads the <code> text, not
-  // the <pre>. Rendered pure so the phone companion's vendored engine shows it too.
+  // the <pre>.
   const MD_COPY_BTN =
     '<button class="md-copy" type="button" aria-label="Copy code" title="Copy code">' +
     '<svg class="ic-copy" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" ' +
@@ -3741,9 +3740,6 @@
   // words go to the page's shared toast — the one surface every refused command
   // on the page raises — and the button keeps its short wording. Returns the
   // parsed body so the caller can read `limit`/`error` for that wording.
-  //
-  // Guarded on TurmaNav: the vendored copy of this engine (glasses)
-  // renders transcripts with none of the site chrome loaded.
   // A 401 from ANY hub call means the operator's browser session (OIDC or the
   // local break-glass login) has expired. Every other page redirects to /login
   // on a 401 (grep `status === 401` across turma/public) rather than surfacing
@@ -3752,15 +3748,11 @@
   // here bounces to /login exactly as the rest of the site does, turning an
   // expired session into a re-login instead of a dead-end error toast.
   //
-  // Guarded on TurmaNav + a real `location`, like hubRefused below: the vendored
-  // glasses copy of this engine has neither, authenticates with its own header
-  // flow (no /login page), and never calls the fetch paths this guards anyway.
   // The one-shot latch stops two racing 401s (a send + the /live socket) each
   // kicking off a navigation.
   let authRedirecting = false;
   function authExpired(status) {
     if (status !== 401) return false;
-    if (typeof window === "undefined" || !window.TurmaNav || !window.location) return false;
     if (!authRedirecting) {
       authRedirecting = true;
       window.location.href = "/login";
@@ -3773,8 +3765,7 @@
     // every model/mode switch, which all funnel their refusals through here).
     if (authExpired(res.status)) return null;
     const body = await res.json().catch(() => null);
-    const nav = typeof window !== "undefined" && window.TurmaNav;
-    if (nav && nav.toast && nav.refusalText) nav.toast(nav.refusalText(what, res.status, body));
+    TurmaNav.toast(TurmaNav.refusalText(what, res.status, body));
     return body;
   }
   async function send() {

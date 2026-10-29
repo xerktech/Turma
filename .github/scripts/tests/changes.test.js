@@ -21,7 +21,6 @@ test("componentsForPath maps top-level dirs; shared agent runtime -> both agent 
   // The PowerShell shell + the ConPTY pty layer are agent-windows only.
   assert.deepEqual(C.componentsForPath("agent/native/windows/install.ps1"), ["agent-windows"]);
   assert.deepEqual(C.componentsForPath("agent/win/pty-host.mjs"), ["agent-windows"]);
-  assert.deepEqual(C.componentsForPath("glasses/src/app.ts"), ["glasses"]);
   assert.deepEqual(C.componentsForPath("android/app/build.gradle.kts"), ["android"]);
 });
 
@@ -38,7 +37,6 @@ test("componentsForPath excludes a component's non-shipped tests/tooling (XERK-4
   assert.deepEqual(C.componentsForPath("turma/tests/server.test.js"), []);
   assert.deepEqual(C.componentsForPath("turma/tools/recover-usage-from-archive.js"), []);
   assert.deepEqual(C.componentsForPath("agent/tests/hub_agent_test.py"), []);
-  assert.deepEqual(C.componentsForPath("glasses/tests/mock-hub.mjs"), []);
   assert.deepEqual(C.componentsForPath("android/app/src/test/AppTest.kt"), []);
   assert.deepEqual(C.componentsForPath("./turma/tests/server.test.js"), []);
   // agent/win/test/ is the ConPTY pty-host's own test dir — excluded despite
@@ -51,7 +49,6 @@ test("componentsForPath excludes a component's non-shipped tests/tooling (XERK-4
   assert.deepEqual(C.componentsForPath("turma/public/board.js"), ["turma"]);
   assert.deepEqual(C.componentsForPath("agent/hub-agent.py"), ["agent-native", "agent-windows"]);
   assert.deepEqual(C.componentsForPath("agent/win/pty-host.mjs"), ["agent-windows"]);
-  assert.deepEqual(C.componentsForPath("glasses/src/app.ts"), ["glasses"]);
   assert.deepEqual(C.componentsForPath("android/app/src/main/Main.kt"), ["android"]);
 });
 
@@ -87,7 +84,6 @@ test("detectChanges unions components across the diff", () => {
     turma: true,
     "agent-native": false,
     "agent-windows": false,
-    glasses: false,
     android: true,
   });
 });

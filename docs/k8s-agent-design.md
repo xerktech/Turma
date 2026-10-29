@@ -117,8 +117,8 @@ fleet:
 | | |
 |---|---|
 | A live `claude` session | **470–590 MB RSS** (4 concurrent sessions sampled) |
-| Every repo in `REPOS_ROOT`, with history | **4.3 GB**; Veiller alone is 3.8 GB |
-| Worktrees | **32 GB across 168 worktrees** — Veiller 22 GB, Tenir 5.1 GB, Turma 4.7 GB across 99 |
+| Every repo in `REPOS_ROOT`, with history | **4.3 GB**; the largest repo alone is 3.8 GB |
+| Worktrees | **32 GB across 168 worktrees** — the largest repo 22 GB, Tenir 5.1 GB, Turma 4.7 GB across 99 |
 | `~/.claude` | 266 MB, of which 183 MB is 718 transcript slugs |
 | Heartbeat cadence | 20 s, one `capture-pane` + transcript read per session per beat |
 | Agent image `:latest` | 3.0 GB (the `android-build` tier) |
@@ -207,8 +207,8 @@ is the one thing phase 2 gives up.
 ### Sizing the volume
 
 Repos are 4.3 GB. Worktrees are the budget: 32 GB across 168 of them on a host that has accumulated
-99 Turma worktrees. **200 GiB** is comfortable for an agent that clones everything including Veiller;
-100 GiB is enough if Veiller stays on truenas. Longhorn usable capacity today is ~2 TB (2 × 2 TB at 2
+99 Turma worktrees. **200 GiB** is comfortable for an agent that clones everything including the largest
+repo; 100 GiB is enough if that repo stays on truenas. Longhorn usable capacity today is ~2 TB (2 × 2 TB at 2
 replicas), so this is a rounding error. Volumes expand online — start smaller and **watch
 `.turma/worktrees`, not the repos**.
 
@@ -400,7 +400,7 @@ current code honest.
 
 Do not build it on faith. On a Longhorn RWX volume, and on the phase-1 RWO volume as the control:
 
-1. `git status` on a Veiller-sized checkout, cold and warm.
+1. `git status` on a multi-GB checkout, cold and warm.
 2. `npm ci` (or the repo's real dependency install) end to end.
 3. A Gradle build with `GRADLE_USER_HOME` on the shared volume, then on an `emptyDir`, to size the
    cache-redirection mitigation.

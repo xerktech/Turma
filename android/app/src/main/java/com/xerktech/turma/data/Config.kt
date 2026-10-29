@@ -10,8 +10,8 @@ import kotlinx.coroutines.flow.StateFlow
 
 /**
  * Hub connection config + credentials, persisted in EncryptedSharedPreferences.
- * The hub URL is user-editable here (unlike the glasses client's hardcoded URL —
- * a phone app should let the operator point at any hub / a LAN address).
+ * The hub URL is user-editable here — a phone app should let the operator
+ * point at any hub / a LAN address.
  */
 class Config private constructor(private val prefs: SharedPreferences) {
 

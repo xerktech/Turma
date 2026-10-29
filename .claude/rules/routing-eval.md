@@ -34,8 +34,8 @@ still governs how a task is graded — this directory changes where tasks come f
 - **Never believe a single red — re-run that task alone** (XERK-450). `server.test.js`'s dead-channel
   test fails ~1/10 runs on an idle box; ~70% of a full pass shows a spurious fail indistinguishable
   from a broken task. Contention worsens it but is NOT the cause — "validate serially" is wrong.
-- **`tasks-validated.json` is the eval set (47 tasks: 25 Turma + 22 Tenir), not `tasks-archive.json`
-  (57 curated)** — only the validated file is proven red-then-green.
+- **`tasks-validated.json` is the eval set (32 tasks: 17 Turma + 15 Tenir), not `tasks-archive.json`
+  (37 curated)** — only the validated file is proven red-then-green.
 - **A monorepo task carries an opt-in bootstrap, off by default** (XERK-449). `setup_cmd` (with
   `setup_timeout`) runs in the pristine worktree BEFORE the red/green check; `test_cwd` grades from a
   workspace/subproject. A bootstrap failure is reported DISTINCTLY (`SETUP`, not `FAIL`) — a missing

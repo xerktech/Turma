@@ -21,20 +21,18 @@ const COMPONENT_HEADING = {
   // touches both components and would otherwise list twice; the per-platform
   // versions still show as separate rows in the summary table below.
   "agent-windows": "Agent",
-  glasses: "Glasses",
   android: "Android",
 };
-const HEADING_ORDER = ["Hub", "Agent", "Glasses", "Android", "Other"];
+const HEADING_ORDER = ["Hub", "Agent", "Android", "Other"];
 
 // Component -> row label for the release-notes summary table.
 const COMPONENT_LABEL = {
   turma: "Hub (image)",
   "agent-native": "Agent (native)",
   "agent-windows": "Agent (Windows)",
-  glasses: "Glasses (Even Hub)",
   android: "Android",
 };
-const TABLE_ORDER = ["turma", "agent-native", "agent-windows", "glasses", "android"];
+const TABLE_ORDER = ["turma", "agent-native", "agent-windows", "android"];
 
 // First line, trimmed, internal whitespace collapsed — a PR title or commit
 // subject that somehow carries a newline can't break a markdown bullet/table.
@@ -124,7 +122,6 @@ function renderComponentTable(manifest) {
     let artifact = "";
     if (c.kind === "image") artifact = "`" + c.ref + "`";
     else if (c.kind === "asset") artifact = "`" + c.asset + "`" + (c.version_code ? ` (code ${c.version_code})` : "");
-    else if (c.kind === "evenhub") artifact = "`" + c.package_id + "` (Even Hub portal)";
     rows.push(`| ${COMPONENT_LABEL[key]} | ${c.version} | ${status} | ${artifact} |`);
   }
   return rows.join("\n");
@@ -138,8 +135,6 @@ const INSTALL_DETAILS = [
   "- **Agent (native)**: WSL/Linux hosts self-update from this stream; see `agent/native/README.md`.",
   "- **Agent (Windows)** (`.zip`): no-WSL Windows hosts; one-line install `irm .../bootstrap.ps1 | iex`,",
   "  then self-updated from this stream. See `.claude/rules/windows-launcher.md`.",
-  "- **Glasses**: published to the Even Hub developer portal (no release asset);",
-  "  promote the build there, then update the app from the Even phone app.",
   "- **Android** (`.apk`): download below and install (enable \"install unknown apps\"). Debug-signed.",
   "",
   "Carried components are unchanged since the version shown; their artifact name reflects the",

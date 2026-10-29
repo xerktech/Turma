@@ -20,7 +20,7 @@ test("run returns the command's stdout as a string", () => {
 // Nothing caught it because the first unified release force-builds every
 // component and so never carries one — the first auto patch release would have
 // been the first to ask, and publish.js would have failed the release with
-// "component glasses is unchanged but absent from the previous manifest".
+// "component android is unchanged but absent from the previous manifest".
 test("run returns '' rather than throwing when stdout is ignored", () => {
   assert.equal(git.run("echo", ["hello"], { stdio: ["ignore", "ignore", "ignore"] }), "");
 });

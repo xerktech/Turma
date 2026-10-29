@@ -196,7 +196,7 @@ try {
   Note "case: no windows release found"
   $fake = New-Fake
   Set-Content -LiteralPath (Join-Path $fake 'releases.json') -Value (ConvertTo-Json @(
-    [pscustomobject]@{ tag_name = 'glasses-v0.2.22'; assets = @([pscustomobject]@{ name = 'turma-hud-v0.2.22.ehpk'; browser_download_url = 'https://github.com/o/r/releases/download/glasses-v0.2.22/turma-hud-v0.2.22.ehpk' }) }
+    [pscustomobject]@{ tag_name = 'android-v0.2.22'; assets = @([pscustomobject]@{ name = 'turma-android-v0.2.22.apk'; browser_download_url = 'https://github.com/o/r/releases/download/android-v0.2.22/turma-android-v0.2.22.apk' }) }
   ) -Depth 8)
   $r = Invoke-Bootstrap-Child $fake (Join-Path $Work 'rec5') "@()"
   if ($r.Code -eq 0) { Fail "claimed success with no windows asset in the stream" }

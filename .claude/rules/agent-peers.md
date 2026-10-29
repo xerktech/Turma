@@ -32,7 +32,7 @@ Split out of `agent-sessions.md` (size ceiling). The org-boundary contract is in
     peers.
 - `_write_peers_file` publishes off the heartbeat each beat: **running sessions only** (queued has no
   claude, stopped's socket is gone), atomic whole-file, best-effort, **no busy/idle column** — a peer
-  message enqueues regardless, and "working" is a five-mirror contract this file must not become a
+  message enqueues regardless, and "working" is a four-mirror contract this file must not become a
   sixth mirror of.
 - A ticket-backed session's `rcName` falls back to the ticket **key**, not the session id, and
   **`_unique_rc_name` suffixes `-N` on collision** — two sessions sharing a name are BOTH

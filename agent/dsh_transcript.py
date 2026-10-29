@@ -6,7 +6,7 @@ This is the ONE translation seam the dsh integration is built around (XERK-460
 G0/D3): dsh's native event-sourced log stays canonical and is retained in full
 for metrics, while the agent emits a DERIVED Claude-Code JSONL PROJECTION of it
 so the existing read side keeps reading one shape. Projecting here — at the
-agent, once — is what keeps the five `readyForReview` mirrors from becoming ten:
+agent, once — is what keeps the three `readyForReview` mirrors from becoming six:
 `_entry_blocks`/`entryBlocks`, `_entry_text`, the usage accountancy, the PR-chip
 scan and the live tail all read the projected JSONL UNCHANGED, so there is no
 second transcript shape to teach any client, hub, archive or android surface.

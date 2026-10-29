@@ -79,7 +79,7 @@ machinery is in `.claude/rules/turma-board.md`.
   name> — not reproducible · 3h ago" (`sessionChipName`) off the newest session that closed it,
   then its evidence `note` clamped to 3 lines (`.td-outcome-note`, full text as `title`; a tap
   expands on Android); no note served = no note line. `board.html` passes the ticket's sessions
-  and repaints on `outcomeSig`. Mirrors: vendored `board.cjs` (+ its `board.css`) and Android
+  and repaints on `outcomeSig`. Mirror: Android
   `ticketOutcomeLabel`/`ticketOutcomeOf`/`ticketOutcomeText`/`ticketSessionName` +
   `TicketSession.outcome`/`outcomeAt`/`outcomeNote` in `Board.kt`, rendered in `BoardScreen.kt`
   (chip + sheet); `TicketRef.outcome` is typed there. Tests: `XERK-1569` in `board.test.js`,
@@ -159,8 +159,7 @@ attempt** (no retry budget burned, exactly like a repo-less ticket):
 - **`paused` is a SELF-CLEARING queue hold, distinct from `blocked`** (which only the operator can
   clear). `drainTicketQueue` holds it like `capacity` (waits to the max wait, never the 30-min blocked
   timer) but keeps its error so the card says WHY. Reason string `"paused"`, rendered
-  "⏳ queued · usage paused" on web/glasses (`board.js` `queuedLabel`/`queuedTip`, re-vendored
-  `board.cjs`) and Android (`Board.kt` `Queued.paused`, `BoardScreen.kt`). This also changed the AUTO
+  "⏳ queued · usage paused" on web (`board.js` `queuedLabel`/`queuedTip`) and Android (`Board.kt` `Queued.paused`, `BoardScreen.kt`). This also changed the AUTO
   pause hold from `blocked` to `paused` — more correct (the pause is self-clearing) and less churny
   (no 30-min drop + re-sweep cycle).
 - **Only a host that would SPEND the pool is paused**: `!wantRuntime && (a.defaultRuntime||"claude")
@@ -177,7 +176,7 @@ attempt** (no retry budget burned, exactly like a repo-less ticket):
   stripped from any agent-forged heartbeat value in `serializeAgent` and recomputed there (emitted
   only when true, so absent = not paused). Rendered as a dashboard host-header chip beside the
   login/board chips (`autoPausedBadge` in `index.html`; `FleetScreen.kt` Pill on Android). **No bypass
-  control** by design. Not a board/glasses surface — the fleet dashboard has no glasses mirror.
+  control** by design. Not a board surface.
 - Tests: the `XERK-544:`/`XERK-548:`/`XERK-555:` cases in `server.test.js` (`limitsPastPace`/
   `limitsFiveHourMaxed`/`subscriptionLimitsPaused`/`pausedSubscriptions` incl. the `fiveHourOnly`
   narrowing, the auto-vs-manual `findTicketHost` with the manual 5-hour gate + unpaused-sibling
@@ -206,12 +205,6 @@ Drain order is the stable sort on `triageSortKey(row, repo)` =
   `.kanban-triage` / `.kc-triage` / `.kc-triage-*` / `.kc-queued*` styles.
 - **Android**: full parity (lane, chip, verdict picker, policy editor) —
   `android/…/ui/BoardScreen.kt` (+ `BoardTriageTest`).
-- **Glasses and the Veiller fork: PASSIVE read only** — they decode `ticketTriageActions` from
-  `/api/agents` and pass it as `triageActions` into the vendored `board.cjs` `boardHtml`, so the
-  lane + chips render exactly as on web/Android; they offer NO verdict/policy controls. So a
-  change to `triageLaneOf`/`triageChipHtml` in `board.js` means re-vendoring `board.cjs` in
-  `glasses/src/vendor/` and the Veiller fork's `miniapps/turma/src/ui/vendor/` in the same PR —
-  both vendor tests pin byte-identity against `turma/public/board.js`.
 
 ## Tests
 

@@ -62,9 +62,9 @@ Split out of `agent.md` (size ceiling).
     whose whole content was `[Bash]`, and the `TAIL_MSG_CHARS` cut arrived with no flag so the
     renderer's `… clipped to fit` mark never showed. Both are wire fields now: a clipped row says
     `truncated`, and `blocks` is the same shape every other feed ships, so no client needed a new
-    code path (web/android/glasses all merge grow-only on `blocks` already, and the hub already
+    code path (web/android both merge grow-only on `blocks` already, and the hub already
     coerced `tail[].blocks` in `coerceLiveSignals`).
-    - `text` is UNCHANGED and stays the flat, lossy string the glasses read.
+    - `text` is UNCHANGED and stays the flat, lossy string.
     - Caps are `TAIL_PREVIEW_CAPS`, spent NEWEST-first against `TAIL_BLOCKS_BUDGET`; past it an
       older row degrades to `TAIL_PREVIEW_CAPS_MIN` — prose kept, tool payloads emptied. **Never
       degrade a row to NO blocks**: that is exactly what puts `[Bash]` back in a prose bubble.

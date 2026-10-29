@@ -20,7 +20,7 @@ Python side in `.claude/rules/agent.md`.
   window re-serialized on every transcript change — tens to hundreds of KB/s per watched session,
   >95% bytes the browser already had, with the change test a string compare over those same huge
   strings, on the event loop that also bridges terminal bytes. Every consumer is id-keyed and
-  grow-only (`mergeTail` in `chat.js` / `Transcript.kt`, the glasses buffer), so a delta merges
+  grow-only (`mergeTail` in `chat.js` / `Transcript.kt`), so a delta merges
   exactly as a snapshot did.
 - **An unchanged transcript costs NOTHING**: `transcriptTail`'s cache returns the SAME result
   object, and the identity compare retires the whole section.

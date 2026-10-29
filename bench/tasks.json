@@ -30,15 +30,6 @@
       "prompt": "On the Sessions page, the message compose box sometimes collapses to zero height — it becomes a sliver you cannot type into, and it stays broken until I reload the page. It seems to happen after switching between the chat and terminal views, and it is much worse on my phone. Once it collapses nothing brings it back short of a refresh. Please fix it."
     },
     {
-      "id": "turma-fix-whisper-lang",
-      "commit": "d0a7975",
-      "kind": "bugfix",
-      "lang": "js",
-      "revert_paths": ["glasses/README.md", "turma/server.js"],
-      "test_cmd": ["node", "--test", "turma/tests/server.test.js"],
-      "prompt": "Our speech-to-text backend now auto-detects the spoken language, which is the whole reason we moved to it. But Turma pins the transcription request to English no matter what, so everything I say in Spanish comes back as garbled English. I tried setting the language environment variable to an empty string to turn the hint off and it still sends English. Setting it to an empty value should mean 'send no language hint and let the model auto-detect'; leaving the variable unset should keep defaulting to English so existing deployments do not change. Please fix it."
-    },
-    {
       "id": "turma-feat-board-review",
       "commit": "bfaee22",
       "kind": "feature",

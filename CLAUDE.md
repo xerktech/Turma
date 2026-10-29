@@ -16,7 +16,7 @@ frontmatter matches. `ls .claude/rules` (and each file's heading) is the map; th
 - `turma*` — the hub and web UI; `turma-ha-*` for the HA deployment.
 - `dsh*`, `qwen*` — the alternate runtimes; rationale in `docs/dsh-adr.md`, `docs/qwen-adr.md`.
 - `windows-*`, `agent-native-windows.md` — the native Windows agent (`docs/windows-agent-adr.md`).
-- `android.md`, `glasses.md`, `chat-prose.md`, `ui-review.md`, `release.md`, the rest by name.
+- `android.md`, `chat-prose.md`, `ui-review.md`, `release.md`, the rest by name.
 
 ### Editing these files
 
@@ -96,7 +96,7 @@ Each spans components; the rule lives in the named file, which loads when any si
 - **A hub refusal reaches the operator in the hub's own words** (XERK-264) → `contract-clients.md`.
 - **The heartbeat is the wire contract**; a field a client TYPES needs its hub-side coercion in the
   same change → `contract-wire.md`. Also there: retired-host usage (XERK-338), `subagentHistory`
-  list-vs-absent (XERK-304), the four `readyForReview` mirrors.
+  list-vs-absent (XERK-304), the three `readyForReview` mirrors.
 - **The peer roster is the org boundary** (XERK-348), the **beat-loop time budget** (XERK-395), an
   agent's **host proved by its credential** (XERK-268), and **hub memory ceilings as fractions of
   the container limit** (XERK-258) → `contract-agent-hub.md`.
@@ -147,16 +147,16 @@ Each spans components; the rule lives in the named file, which loads when any si
 
 Full detail in `release.md`.
 
-- **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all five components + a changelog**, cut by
+- **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all four components + a changelog**, cut by
   `.github/workflows/release.yml`. Never split back into per-component workflows.
-- The five components: `turma` image, native agent tarball (`agent-native`), the no-WSL Windows agent
-  zip (`agent-windows`, XERK-666), glasses `.ehpk`, android `.apk`. The two agent builds share ONE
+- The four components: `turma` image, native agent tarball (`agent-native`), the no-WSL Windows agent
+  zip (`agent-windows`, XERK-666), android `.apk`. The two agent builds share ONE
   runtime; `changes.js`'s `AGENT_RULES` decides which build(s) a change feeds.
 - The root **`VERSION`** holds `MAJOR.MINOR` only; **the patch is derived from existing `v*` tags and
   never committed**. Bump `VERSION` only for a minor/major.
 - Only **changed** components build; unchanged ones are **carried** at their prior version. Every
-  release publishes all five.
+  release publishes all four.
 - PR gates that block a merge: `code-scan.yml` (Semgrep, hadolint, ShellCheck, PSScriptAnalyzer, unit
-  tests, the instruction-file size limits), `turma-image-scan.yml`, `glasses-ci.yml`, `android-ci.yml`.
+  tests, the instruction-file size limits), `turma-image-scan.yml`, `android-ci.yml`.
 - **Every workflow runs on GitHub-hosted `ubuntu-latest`.** The self-hosted-box workarounds were
   deleted, not disabled — reintroducing any is a regression.

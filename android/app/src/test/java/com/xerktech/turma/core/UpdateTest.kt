@@ -16,7 +16,7 @@ class UpdateTest {
     }
 
     @Test fun rejectsOtherAssets() {
-        assertNull(apkAssetVersion("turma-hud-v0.4.0.ehpk"))
+        assertNull(apkAssetVersion("turma-agent-windows-v0.4.0.zip"))
         assertNull(apkAssetVersion("turma-agent-native-v0.4.1.tar.gz"))
         assertNull(apkAssetVersion("manifest.json"))
         assertNull(apkAssetVersion("turma-android-v0.4.apk")) // not a full semver
@@ -78,7 +78,7 @@ class UpdateTest {
     }
 
     @Test fun noApkAssetsMeansNoOffer() {
-        val releases = listOf(rel("manifest.json", "turma-hud-v0.4.0.ehpk"))
+        val releases = listOf(rel("manifest.json", "turma-agent-windows-v0.4.0.zip"))
         assertNull(latestApkUpdate(releases, "0.4.0"))
     }
 }

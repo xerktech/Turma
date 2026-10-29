@@ -1178,10 +1178,10 @@ test("committedDupe: markdown renders away in the pane but still matches", () =>
   // The transcript keeps the raw syntax; the pane renders it (no ** or `),
   // so the compare runs on an alphanumeric skeleton.
   const entries = [
-    { id: "1", role: "assistant", text: "On your **current** build, power the strap fully **off** — the `G2` should stop cycling." },
+    { id: "1", role: "assistant", text: "On your **current** build, power the strap fully **off** — the `LED` should stop cycling." },
   ];
   assert.equal(committedDupe(
-    "On your current build, power the strap fully off — the G2 should stop cycling.",
+    "On your current build, power the strap fully off — the LED should stop cycling.",
     entries), true);
 });
 
@@ -2739,7 +2739,7 @@ test("ptyCaptureWindows: an unreachable ctrlPort yields null and never hangs", a
 // >95% of it bytes the browser already had, and the change test was a string
 // compare over those same huge strings — on the event loop this process also
 // bridges terminal bytes over. Every consumer (chat.js mergeTail, android
-// mergeTail, the glasses buffer) is id-keyed and grow-only, so a delta merges
+// mergeTail) is id-keyed and grow-only, so a delta merges
 // exactly as a snapshot did.
 function waitForCond(pred, timeoutMs = 5000) {
   const started = Date.now();

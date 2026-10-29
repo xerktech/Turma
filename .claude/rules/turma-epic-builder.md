@@ -107,7 +107,7 @@ builder session + its agent-side tracker writes are XERK-723 (C); the operator U
 ## The operator UI (E, XERK-726) — composer + progress strip (`board.js`/`board.html`)
 
 The board is the operator surface. **Purely ADDITIVE** — no column-rule/lane mirror is touched, so it
-triggers no re-vendor/re-port.
+triggers no re-port.
 
 - **The composer** is a board-bar "✨ New epic" button opening a narrow modal (`epicBuilderComposerHtml`,
   the triage-policy modal's backdrop/`td-narrow` pattern): title + free-form idea + an OPTIONAL repo

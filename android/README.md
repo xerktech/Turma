@@ -1,7 +1,7 @@
 # Turma Android client
 
-A native Android client for the Turma hub — full parity with the web dashboard
-and the G2 glasses client, plus two things only a phone can do well: **OS push
+A native Android client for the Turma hub — full parity with the web dashboard,
+plus two things only a phone can do well: **OS push
 notifications** and **voice** for starting sessions and mid-session prompts.
 
 ## Features
@@ -41,10 +41,10 @@ notifications** and **voice** for starting sessions and mid-session prompts.
 
 ## Architecture
 
-Mirrors the glasses client's pure-core / adapter-shell split:
+A pure-core / adapter-shell split:
 
 - `model/` — wire shapes + the shared `TurmaJson` decoder.
-- `core/` — pure, JVM-tested reducers ported from `glasses/src`: `Transcript`
+- `core/` — pure, JVM-tested reducers: `Transcript`
   (grow-only merge), `Sessions` (working/idle/waiting), `ChatItems`
   (buildItems + verbosity). Unit tests in `src/test/`.
 - `net/` — `HubClient` (Retrofit + OkHttp + kotlinx.serialization),

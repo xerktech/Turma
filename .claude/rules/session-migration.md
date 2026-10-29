@@ -121,8 +121,8 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
 - **A moved session's record carries `migratedFrom` {host, sessionId, at[, fromArchive]} on the
   wire** (XERK-2109): stamped by the hub's `importSession` / archive restore, kept on the agent's
   record, sent by `_session_payload`, rebuilt by the hub's `coerceMigratedFrom` (whitelisted leaves).
-  - It is the ONLY proof a new (host, id) is the old conversation — the glasses move a stashed
-    draft by it. Android does not type it; typing it there needs no new coercion.
+  - It is the ONLY proof a new (host, id) is the old conversation. No client types it yet; typing it
+    on Android needs no new coercion.
   - An archive restore's `sessionId` is null: it names no live session, so nothing follows it.
   - Tests: `test_migrated_from_rides_the_payload_and_is_none_without_one`, server.test.js
     "XERK-2109: a session's migratedFrom ...".

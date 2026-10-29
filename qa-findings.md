@@ -24,7 +24,7 @@ check whether anything validates the *scheme*.
 
 A test exists, is green, and is wired to nothing.
 
-- `glasses` vendors `turma/public/{chat,board}.js` verbatim and asserts
+- A client vendored `turma/public/{chat,board}.js` verbatim and asserted
   byte-identity — but its CI only triggered on its own directory. A PR
   editing the source of truth never ran the guard, and vendored copies
   drifted before anyone noticed. (A vendor test that compares the copy against a
@@ -58,7 +58,7 @@ trust:
   test asserted the rejected rules were present, locking it in. (The `Edit(...)`
   twins did hold, so this was noise, not exposure — but only launching the
   product showed it.)
-- `engines.ts` claimed "CI fails the moment they drift". It did not.
+- A vendoring module claimed "CI fails the moment they drift". It did not.
 
 Cheap way to catch this: **launch the real thing once and read its first 20 lines
 of output.** Static reading finds none of it.
@@ -119,7 +119,7 @@ exercised code in the tree.
   key at 64 KiB was defeated by sending 400 of them in one beat — 25 MiB through
   the very path written to stop it — and left every KNOWN key unbounded besides.
   When you see a per-item limit, always ask what N of them costs.
-- **A fix nothing can reach.** The glasses online gate was added as
+- **A fix nothing can reach.** A client's online gate was added as
   `if (hostLastSeen != null)` with two optional parameters, and every production
   caller omitted them; only the new unit test exercised it. **Check the call
   sites, not just the function** — a fix behind an optional argument is a fix

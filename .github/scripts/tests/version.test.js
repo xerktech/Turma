@@ -20,7 +20,7 @@ test("parseBase accepts MAJOR.MINOR, rejects everything else", () => {
 test("parseTag parses v-prefixed and bare triples, null otherwise", () => {
   assert.deepEqual(V.parseTag("v0.3.9"), { major: 0, minor: 3, patch: 9 });
   assert.deepEqual(V.parseTag("0.3.9"), { major: 0, minor: 3, patch: 9 });
-  assert.equal(V.parseTag("glasses-v0.2.32"), null);
+  assert.equal(V.parseTag("android-v0.2.32"), null);
   assert.equal(V.parseTag("v0.3"), null);
   assert.equal(V.parseTag("nonsense"), null);
 });
@@ -33,7 +33,7 @@ test("nextPatch: empty -> 0, max+1 on the matching line, numeric not lexical", (
   // ignores other minor lines
   assert.equal(V.nextPatch(["v0.2.99", "v0.4.5"], { major: 0, minor: 3 }), 0);
   // ignores legacy per-component tags
-  assert.equal(V.nextPatch(["glasses-v0.3.32", "android-v0.3.2"], { major: 0, minor: 3 }), 0);
+  assert.equal(V.nextPatch(["agent-native-v0.3.32", "android-v0.3.2"], { major: 0, minor: 3 }), 0);
   // ignores malformed
   assert.equal(V.nextPatch(["v0.3.x", "v0.3.2"], { major: 0, minor: 3 }), 3);
 });
@@ -75,12 +75,14 @@ test("androidVersionCode throws at each field's budget, never wraps silently", (
 });
 
 test("assertStrictlyGreatest rejects a regression against legacy namespaces", () => {
-  const legacy = ["glasses-v0.2.32", "android-v0.2.2", "agent-native-v0.2.3", "v0.3.0"];
+  const legacy = ["android-v0.2.32", "agent-native-v0.2.3", "v0.3.0"];
   assert.doesNotThrow(() => V.assertStrictlyGreatest({ major: 0, minor: 3, patch: 1 }, legacy));
   // 0.3.0 already exists -> not strictly greater
   assert.throws(() => V.assertStrictlyGreatest({ major: 0, minor: 3, patch: 0 }, legacy));
-  // 0.2.0 is below the published glasses 0.2.32 -> the bug the cutover avoids
-  assert.throws(() => V.assertStrictlyGreatest({ major: 0, minor: 2, patch: 0 }, ["glasses-v0.2.32"]));
+  // 0.2.0 is below the published android 0.2.32 -> the bug the cutover avoids
+  assert.throws(() => V.assertStrictlyGreatest({ major: 0, minor: 2, patch: 0 }, ["android-v0.2.32"]));
+  // Any retired component's <name>-v* tags still count, not just a listed set.
+  assert.throws(() => V.assertStrictlyGreatest({ major: 0, minor: 2, patch: 0 }, ["retired-thing-v0.2.32"]));
 });
 
 test("patchBase: a merge that raced a minor/major adopts the new line", () => {
