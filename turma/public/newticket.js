@@ -272,7 +272,14 @@
     // the open form's org list current so its selector doesn't offer a gone org.
     if (createState) {
       createState.sites = orgSites();
-      if (!createState.sites.some((s) => s.siteKey === createState.siteKey)) closeCreate();
+      if (!createState.sites.some((s) => s.siteKey === createState.siteKey)) return void closeCreate();
+      // A form opened from org.js's cached list (XERK-2432) labels every org
+      // "(offline)" — the cache carries no liveness. Refresh just the org
+      // <select>'s options, not the whole form, so a half-typed title keeps
+      // its text and caret.
+      const sel = panel && panel.querySelector("[data-cf-org]");
+      const opts = board().createOrgOptions(createState.sites, createState.siteKey);
+      if (sel && sel.innerHTML !== opts) sel.innerHTML = opts;
     }
   }
 

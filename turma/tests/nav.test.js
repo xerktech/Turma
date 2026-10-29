@@ -380,3 +380,17 @@ test("toast: shows the text, creates its element once, and never parses markup",
     assert.equal(el.textContent, "Rename failed — unknown session");
   } finally { global.document = savedDoc; global.setTimeout = savedTimeout; }
 });
+
+test("nav: every tab reserves its bold width, so the row can't shift between pages (XERK-2432)", () => {
+  // The active tab is bolder; without the reserved width the right-aligned row
+  // (and the org + New-ticket buttons beside it) moved as the active tab changed.
+  for (const p of PAGES) assert.match(tabsHtml(p.id), new RegExp(`data-label="${p.label}">${p.label}</a>`));
+  const css = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "public", "app.css"), "utf8");
+  const active = css.match(/\.nav-tabs a\.active \{[^}]*font-weight:\s*(\d+)/);
+  const reserve = css.match(/\.nav-tabs a\[data-label\]::after \{[^}]*content:\s*attr\(data-label\)[^}]*font-weight:\s*(\d+)[^}]*\}/);
+  assert.ok(active && reserve, "both rules present");
+  assert.equal(reserve[1], active[1], "the reserved copy is as bold as the active tab");
+  assert.match(css, /\.nav-tabs a\[data-label\] \{[^}]*display:\s*inline-grid/);
+  assert.match(reserve[0], /height:\s*0/);
+  assert.match(reserve[0], /visibility:\s*hidden/);
+});

@@ -281,6 +281,16 @@ test("org: the last fleet's orgs paint the button at mount, before any update (X
   assert.match(next.slot.innerHTML, /org-menu/);
 });
 
+test("org: a cached org name is escaped into the button label", () => {
+  // The cache is a second way an org name reaches the slot's innerHTML.
+  const { slot } = mountOrg({
+    storedOrg: "x.atlassian.net",
+    storedSites: JSON.stringify({ sites: [{ siteKey: "x.atlassian.net", orgName: "<img src=x onerror=alert(1)>" }] }),
+  });
+  assert.doesNotMatch(slot.innerHTML, /<img/);
+  assert.match(slot.innerHTML, /&lt;img src=x onerror=alert\(1\)&gt;/);
+});
+
 test("org: a malformed org cache degrades to an empty slot", () => {
   for (const raw of ["not json", "[]", '{"sites":"x"}', '{"sites":[null,{"siteKey":5},{"siteKey":""}]}']) {
     const { slot } = mountOrg({ storedSites: raw });
