@@ -324,8 +324,35 @@
   details.spawn-wrap > summary .chev { margin-left: auto; transition: transform .15s; }
   details.spawn-wrap[open] > summary .chev { transform: rotate(180deg); }
   .spawn-body { padding: 10px 2px 4px; display: flex; flex-direction: column; gap: 10px; }
-  .host-block .hname { font-weight: 600; font-size: 12.5px; margin-bottom: 7px; overflow-wrap: anywhere; }
-  .host-block .hcap { color: var(--muted); font-weight: 400; margin-left: 6px; font-variant-numeric: tabular-nums; }
+  /* Each host is collapsed to its header until clicked: a host with dozens of
+     repos otherwise buried every other host's list. */
+  .host-block .hname {
+    display: flex; align-items: center; gap: 6px; width: 100%;
+    background: none; border: 0; padding: 4px 0; color: inherit; cursor: pointer;
+    font: inherit; font-weight: 600; font-size: 12.5px; text-align: left;
+  }
+  .host-block .hname:hover .hlabel { color: var(--accent-text); }
+  .host-block .hname .hchev { color: var(--muted); font-size: 10px; transition: transform .15s; }
+  .host-block.open .hname .hchev { transform: rotate(90deg); }
+  .host-block .hlabel { overflow-wrap: anywhere; min-width: 0; }
+  .host-block.open .repo-btns { margin-top: 7px; }
+  .host-block .hcap { color: var(--muted); font-weight: 400; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* A small copy of the Usage page's weekly (7d) bar, right-aligned so the
+     hosts' bars line up for comparison. */
+  .hweek { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; flex: none; }
+  .hweek-track {
+    position: relative; width: 64px; height: 5px; border-radius: 3px;
+    background: var(--hairline); overflow: hidden;
+  }
+  .hweek-fill { display: block; height: 100%; background: var(--accent); min-width: 2px; }
+  .hweek.warn .hweek-fill { background: var(--warning); }
+  .hweek.crit .hweek-fill { background: var(--critical); }
+  .hweek.expired .hweek-fill { background: var(--muted); }
+  .hweek-pace { position: absolute; top: 0; bottom: 0; width: 1.5px; background: var(--ink-2); }
+  .hweek-pct {
+    color: var(--muted); font-weight: 400; font-size: 11px; min-width: 30px; text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
   .host-block .hcap.full { color: var(--critical); font-weight: 600; }
   /* Repos flow to fill the sidebar width, several per row (XERK-739), instead of
      one card per line. Each closed repo is sized to its button; an OPEN composer
@@ -1472,6 +1499,8 @@ let endedViewId = null;
 //   ONLY so the poll/SSE re-render can't wipe what's being typed. Option selects
 //   (base/model/perm) persist per-repo in localStorage (loadOpts/saveOpts).
 const composerOpen = new Set();
+// Hosts whose repo list is expanded in the New-session picker; collapsed by default.
+const hostOpen = new Set();
 const optionsOpen = new Set();
 const composerDraft = new Map();
 // Files staged for a NEW-SESSION spawn (XERK-234 spawn attach), keyed by
@@ -1854,6 +1883,17 @@ function spawnReadyUploadIds(rk) {
   }
   return ready;
 }
+// The header button's id, so the beat's innerHTML swap can hand its keyboard
+// focus back (captureFieldFocus restores `hhd-` ids like the composer's).
+// Every non-alphanumeric is hex-escaped ("_2e_" for "."), so two hosts whose
+// keys differ only in punctuation (k8x-02 / k8x_02) never share an id.
+function hostHeadId(key) {
+  return "hhd-" + key.replace(/[^A-Za-z0-9]/g, c => "_" + c.codePointAt(0).toString(16) + "_");
+}
+function toggleHost(key) {
+  if (hostOpen.has(key)) hostOpen.delete(key); else hostOpen.add(key);
+  render(cache);
+}
 function toggleComposer(rkey, repo) {
   if (composerOpen.has(rkey)) composerOpen.delete(rkey);
   else {
@@ -1875,7 +1915,7 @@ function onOptionsToggle(rkey, repo, open) {
 // poll / SSE re-render.
 function captureFieldFocus() {
   const el = document.activeElement;
-  if (!el || !el.id || !/^(cmp|ren)-/.test(el.id)) return null;
+  if (!el || !el.id || !/^(cmp|ren|hhd)-/.test(el.id)) return null;
   const f = { id: el.id };
   try { f.start = el.selectionStart; f.end = el.selectionEnd; } catch { /* selects have none */ }
   return f;
@@ -2828,7 +2868,7 @@ function render(data) {
       <summary>+ New session <span class="chev">▾</span></summary>
       <div class="spawn-body">${
         hosts.length
-          ? hosts.map(a => hostBlock(a)).join("")
+          ? hosts.map(a => hostBlock(a, agents, Math.floor(Date.now() / 1000), hosts.length === 1)).join("")
           : `<div class="empty" style="padding:20px 0">No online hosts with repos.</div>`
       }</div>
     </details>`;
@@ -3132,11 +3172,62 @@ function hostCapHtml(c) {
   const queued = Math.max(0, Number(c.queued) || 0);
   const title = `${running} running of ${max} session slots` +
     (queued ? ` · ${queued} queued` : "") + (full ? " · full — a new session will queue" : "");
-  return ` <span class="hcap${full ? " full" : ""}" title="${esc(title)}">${running} / ${max}</span>`;
+  return `<span class="hcap${full ? " full" : ""}" title="${esc(title)}">${running} / ${max}</span>`;
 }
 
-function hostBlock(a) {
-  const repos = (a.repos || []).map(r => {
+// The host's subscription WEEKLY (7d) window for the picker's mini bar: the
+// freshest reading any host on the same subscription took (the Usage page's
+// limitGroups fold — one pool, newest read wins, strictly newer replaces), or
+// this host's own when it reports no subscription. Null when there is none or
+// it is older than a day (the Usage page drops such a card: LIMIT_MAX_AGE_SEC).
+const HOST_WEEKLY_MAX_AGE_SEC = 24 * 60 * 60;
+function hostWeekly(a, agents, nowSec) {
+  const key = a.subscription && a.subscription.key;
+  let best = null;
+  for (const b of key ? agents || [] : [a]) {
+    if (b !== a && !(b && b.subscription && b.subscription.key === key)) continue;
+    const lim = b.limits, win = lim && lim.sevenDay;
+    if (!win || typeof win.usedPct !== "number") continue;
+    const at = Number(lim.capturedAt) || 0;
+    if (nowSec - at > HOST_WEEKLY_MAX_AGE_SEC) continue;
+    if (!best || at > best.at) best = { win, at };
+  }
+  return best && best.win;
+}
+
+// The mini weekly bar beside a host's capacity: same colours as the Usage page
+// (75% warn, 90% crit), a passed reset reads "—", and a tick at NOW marks the
+// even-pace point (fill past it is spending faster than 1/7 a day).
+const WEEK_SECS = 7 * 86400;
+function hostWeeklyHtml(win, nowSec) {
+  if (!win || typeof win.usedPct !== "number") return "";
+  const pct = Math.min(100, Math.max(0, win.usedPct));
+  const resetsIn = typeof win.resetsAt === "number" ? win.resetsAt - nowSec : null;
+  const expired = resetsIn !== null && resetsIn <= 0;
+  const level = expired ? " expired" : pct >= 90 ? " crit" : pct >= 75 ? " warn" : "";
+  const pace = !expired && resetsIn !== null && resetsIn < WEEK_SECS ? 1 - resetsIn / WEEK_SECS : null;
+  const resetIn = () => {
+    const h = Math.floor(resetsIn / 3600);
+    return h >= 24 ? `${Math.floor(h / 24)}d ${h % 24}h` : `${h}h ${Math.floor(resetsIn % 3600 / 60)}m`;
+  };
+  const title = "Weekly (7d) limit: " + (expired ? "window has since reset"
+    : `${Math.round(pct * 10) / 10}% used` + (resetsIn !== null ? ` · resets in ${resetIn()}` : ""))
+    + (pace !== null ? " · the tick is the even-pace point" : "");
+  return `<span class="hweek${level}" title="${esc(title)}">`
+    + `<span class="hweek-track"><span class="hweek-fill" style="width:${expired ? 0 : pct}%"></span>`
+    + (pace !== null ? `<span class="hweek-pace" style="left:${(pace * 100).toFixed(1)}%"></span>` : "")
+    + `</span><span class="hweek-pct">${expired ? "—" : Math.round(pct) + "%"}</span></span>`;
+}
+
+// A host's picker block: a header (name, active / max, weekly bar) that
+// expands its repo list. It renders open while one of its composers is open or
+// a spawn from it is in flight, so collapsing can't hide work in progress; a
+// lone host is always open — there is nothing to pick between.
+function hostBlock(a, agents, nowSec, lone) {
+  const busyHere = (a.repos || []).some(r => composerOpen.has(a.key + "::" + r.name)
+    || pending.has(pendKey("spawn", a.key, r.name)));
+  const open = hostOpen.has(a.key) || busyHere || !!lone;
+  const repos = !open ? "" : (a.repos || []).map(r => {
     const rk = a.key + "::" + r.name;
     const spawning = pending.has(pendKey("spawn", a.key, r.name));
     const open = composerOpen.has(rk);
@@ -3149,9 +3240,11 @@ function hostBlock(a) {
     const panel = open ? composer(a, r, rk, spawning) : "";
     return `<div class="repo-item${open ? " open" : ""}">${btn}${panel}</div>`;
   }).join("");
-  return `<div class="host-block">
-    <div class="hname">${esc(a.key)}${hostCapHtml(a.capacity)}</div>
-    <div class="repo-btns">${repos}</div>
+  return `<div class="host-block${open ? " open" : ""}">
+    <button type="button" class="hname" id="${esc(hostHeadId(a.key))}" aria-expanded="${open}"
+        onclick="toggleHost('${escJs(a.key)}')"><span class="hchev">▶</span><span class="hlabel">${esc(a.key)}</span>${
+      hostCapHtml(a.capacity)}${hostWeeklyHtml(hostWeekly(a, agents, nowSec), nowSec)}</button>
+    ${open ? `<div class="repo-btns">${repos}</div>` : ""}
   </div>`;
 }
 

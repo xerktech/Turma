@@ -3,6 +3,9 @@ package com.xerktech.turma.ui
 import com.xerktech.turma.core.LiveState
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.Capacity
+import com.xerktech.turma.model.LimitWindow
+import com.xerktech.turma.model.LimitsInfo
+import com.xerktech.turma.model.SubscriptionInfo
 import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.RepoInfo
 import com.xerktech.turma.model.SessionInfo
@@ -257,6 +260,33 @@ class SessionsFlattenTest {
         assertEquals(null, hostCapLabel(Capacity()))
         // A 0 ceiling hides the label too, as the web's hostCapHtml `!(max > 0)` does.
         assertEquals(null, hostCapLabel(Capacity(maxSessions = 0)))
+    }
+
+    // The New-session picker's mini weekly bar (web hostWeekly): the freshest 7d
+    // reading on the host's subscription; a host with no key is never folded
+    // into another silent one; a day-old or percentage-less reading is none.
+    @Test fun `hostWeekly takes the freshest reading on the host's subscription`() {
+        val now = 2_000_000_000L
+        fun lim(pct: Double, age: Long) = LimitsInfo(
+            sevenDay = LimitWindow(usedPct = pct, resetsAt = now + 3600), capturedAt = now - age)
+        fun ag(key: String, sub: String?, l: LimitsInfo?) = agentWithRepos(key, key, true, listOf(RepoInfo(name = "r")))
+            .copy(subscription = sub?.let { SubscriptionInfo(key = it) }, limits = l)
+        val a = ag("a", "S", lim(40.0, 600))
+        val b = ag("b", "S", lim(55.0, 60))
+        val c = ag("c", "T", lim(90.0, 1))
+        val solo = ag("d", null, lim(20.0, 60))
+        val all = listOf(a, b, c, solo)
+        assertEquals(55.0, hostWeekly(a, all, now)?.usedPct)
+        assertEquals(90.0, hostWeekly(c, all, now)?.usedPct)
+        assertEquals(20.0, hostWeekly(solo, listOf(solo, ag("e", null, lim(5.0, 1))), now)?.usedPct)
+        // Strictly newer replaces: on a tie the first reading in fleet order holds.
+        val t1 = ag("t1", "U", lim(30.0, 60))
+        val t2 = ag("t2", "U", lim(70.0, 60))
+        assertEquals(30.0, hostWeekly(t2, listOf(t1, t2), now)?.usedPct)
+        assertEquals(null, hostWeekly(ag("x", null, lim(10.0, 25 * 3600)), emptyList(), now))
+        assertEquals(null, hostWeekly(ag("x", null, LimitsInfo(sevenDay = LimitWindow(), capturedAt = now)), emptyList(), now))
+        assertEquals(null, hostWeekly(ag("x", null, null), emptyList(), now))
+        assertEquals(55.0, spawnTargets(all, now).first { it.key == "a" }.weekly?.usedPct)
     }
 
     // ---- collectSessions (the web collect(): queued + 3-channel ended) -------
