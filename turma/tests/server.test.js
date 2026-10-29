@@ -108,6 +108,7 @@ process.env.ORG_COLORS_FILE = path.join(
 process.env.AUTOMERGE_ORGS_FILE = path.join(scratchDir(), `turma-test-automerge-orgs-${process.pid}.json`);
 process.env.DECISIONS_FILE = path.join(scratchDir(), `turma-test-decisions-${process.pid}.json`);
 process.env.DAILY_BRIEF_SCHEDULES_FILE = path.join(scratchDir(), `turma-test-daily-brief-schedules-${process.pid}.json`);
+process.env.DAILY_BRIEFS_FILE = path.join(scratchDir(), `turma-test-daily-briefs-${process.pid}.json`);
 process.env.DEDUPE_LINK_ORGS_FILE = path.join(scratchDir(), `turma-test-dedupe-link-orgs-${process.pid}.json`);
 process.env.EPIC_BUILDERS_FILE = path.join(scratchDir(), `turma-test-epic-builders-${process.pid}.json`);
 process.env.EPIC_RUNS_FILE = path.join(scratchDir(), `turma-test-epic-runs-${process.pid}.json`);
@@ -27491,6 +27492,18 @@ test("XERK-2391: nextDailyBriefRun across DST — the spring gap still fires, th
   const ldn = { ...NY2391, time: "09:00", timeZone: "Europe/London", weekdays: [1] };
   assert.equal(iso2391(next(ldn, Date.parse("2026-10-24T00:00:00Z")).meetingAt),
     "2026-10-26T09:00:00.000Z", "GMT after the 10-25 change");
+});
+
+test("XERK-2415: a 23:xx meeting pushed past midnight by the spring gap is still next", () => {
+  const { nextDailyBriefRun: next, dailyBriefWindow: win } = hub;
+  // Nuuk's 2025 gap opens 23:00 on 03-29, so 23:30 that day resolves to 01:30Z on
+  // 03-30 — after local midnight (01:00Z). At 01:10Z its 01:25Z run is still ahead.
+  const nuuk = { ...NY2391, time: "23:30", timeZone: "America/Godthab", weekdays: [0, 1, 2, 3, 4, 5, 6], leadMinutes: 5 };
+  const now = Date.parse("2025-03-30T01:10:00Z");
+  assert.equal(iso2391(next(nuuk, now).meetingAt), "2025-03-30T01:30:00.000Z");
+  assert.equal(iso2391(win(nuuk, now).meetingAt), "2025-03-30T01:30:00.000Z");
+  // After that run, the next is the following day's 23:30, now at -01.
+  assert.equal(iso2391(next(nuuk, now + 20 * 60e3).meetingAt), "2025-03-31T00:30:00.000Z");
 });
 
 test("XERK-2391: DST holds east of +12h (Auckland) and offset zones are refused", () => {
