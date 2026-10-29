@@ -3913,10 +3913,13 @@ const persistDecisions = registerExternalStore({
 // Null-prototype map (XERK-1451). Contract: .claude/rules/contract-daily-brief.md.
 const DAILY_BRIEF_MODELS = new Set(["auto", "haiku", "sonnet"]);
 const DAILY_BRIEF_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
-// The zone's canonical IANA name ("utc" -> "UTC"), or "" for anything Intl
-// rejects. Canonical so a coerced value is a fixed point.
+// The zone's name as Intl spells it ("utc" -> "UTC"), or "" for anything Intl
+// rejects or an offset zone ("+05:30" — it has no DST rules, and the operator is
+// asked for a named zone). Intl's spelling so a coerced value is a fixed point.
+const DAILY_BRIEF_ORGS_MAX = 100; // dailyBriefSchedulesCoerce inlines the same 100 (module-init TDZ)
+const DAILY_BRIEF_SITE_MAX = 200; // ...and the same 200
 function canonicalTimeZone(tz) {
-  if (typeof tz !== "string" || !tz || tz.length > 64) return "";
+  if (typeof tz !== "string" || !/^[A-Za-z]/.test(tz) || tz.length > 64) return "";
   try {
     return new Intl.DateTimeFormat("en-US", { timeZone: tz }).resolvedOptions().timeZone;
   } catch {
@@ -3976,6 +3979,10 @@ const persistDailyBriefSchedules = registerExternalStore({
 // Store an org's (already validated) schedule — durable save, cache bust, SSE frame.
 function setDailyBriefSchedule(siteKey, schedule) {
   dailyBriefSchedules[siteKey] = schedule;
+  publishDailyBriefSchedules();
+}
+// Publish the map as it now stands (after a set, or a prune of departed orgs).
+function publishDailyBriefSchedules() {
   persistDailyBriefSchedules();
   invalidateAgentsCache();
   sseBroadcast("dailyBriefSchedules", dailyBriefSchedules);
@@ -3993,12 +4000,15 @@ function zonedWall(ms, timeZone) {
 // The instant the clock in `timeZone` reads local date y-m-d at hh:mm. In a
 // spring-forward GAP (that wall time never happens) it is the instant the old
 // offset names, i.e. the clock reads one hour later; on a fall-back REPEAT it is
-// the FIRST of the two, so a meeting date maps to exactly one instant.
+// the FIRST of the two, so a meeting date maps to exactly one instant. The offset
+// probes sit 36h either side of the wall time: offsets run -12h..+14h, so a
+// nearer probe lands past the real instant in a zone east of +12h (Auckland,
+// Chatham) and never sees the pre-transition offset.
 function zonedInstant(y, m, d, hh, mm, timeZone) {
   const wall = Date.UTC(y, m - 1, d, hh, mm);
   const offsetAt = (ms) => zonedWall(ms, timeZone) - Math.floor(ms / 1000) * 1000;
-  const before = wall - offsetAt(wall - 12 * 3600e3);
-  const after = wall - offsetAt(wall + 12 * 3600e3);
+  const before = wall - offsetAt(wall - 36 * 3600e3);
+  const after = wall - offsetAt(wall + 36 * 3600e3);
   const hits = [before, after].filter((t) => zonedWall(t, timeZone) === wall);
   return hits.length ? Math.min(...hits) : before;
 }
@@ -22766,10 +22776,16 @@ const server = http.createServer(async (req, res) => {
         parts[1] === "orgs" && parts.length === 5 && parts[3] === "daily-brief" &&
         parts[4] === "schedule") {
       const siteKey = decodeURIComponent(parts[2]);
-      if (!decidedOrgs().has(siteKey)) {
+      const orgs = decidedOrgs();
+      if (!orgs.has(siteKey)) {
         return json(res, 404, { error: "no host is in that org" });
       }
       if (req.method === "PUT") {
+        // Refuse what the store's coerce would silently drop, so a 200 always
+        // means stored. A full store first forgets orgs no host is in any more.
+        if (siteKey.length > DAILY_BRIEF_SITE_MAX) {
+          return json(res, 400, { error: `org key too long — the limit is ${DAILY_BRIEF_SITE_MAX} characters` });
+        }
         const body = JSON.parse((await readBody(req)) || "{}");
         if (!body || typeof body !== "object" || Array.isArray(body)) {
           return json(res, 400, { error: "schedule must be an object" });
@@ -22781,6 +22797,19 @@ const server = http.createServer(async (req, res) => {
         merged.updatedAt = Date.now();
         const { value, error } = validateDailyBriefSchedule(merged);
         if (error) return json(res, 400, { error });
+        if (!(siteKey in dailyBriefSchedules) &&
+            Object.keys(dailyBriefSchedules).length >= DAILY_BRIEF_ORGS_MAX) {
+          let pruned = false;
+          for (const k of Object.keys(dailyBriefSchedules)) {
+            if (!orgs.has(k)) { delete dailyBriefSchedules[k]; pruned = true; }
+          }
+          if (Object.keys(dailyBriefSchedules).length >= DAILY_BRIEF_ORGS_MAX) {
+            if (pruned) publishDailyBriefSchedules();
+            return json(res, 409, {
+              error: `${DAILY_BRIEF_ORGS_MAX} orgs already have a meeting schedule — the limit`,
+            });
+          }
+        }
         setDailyBriefSchedule(siteKey, value);
       }
       const schedule = dailyBriefSchedules[siteKey] || null;

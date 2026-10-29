@@ -18,8 +18,13 @@ ticket builds to this file; change it here first.
   `registerExternalStore`, siteKey → `{enabled, time "HH:MM", timeZone, weekdays [0-6],
   leadMinutes 1-30 (default 5), model "auto"|"haiku"|"sonnet" (default "auto"), updatedAt}`.
   - `validateDailyBriefSchedule` is the ONE whitelist (route, restore, remote watch); the zone is
-    stored in its canonical Intl spelling and weekdays deduped + sorted, so the coerce is a fixed
-    point (HA's watch echo dedups). Null-prototype map (XERK-1451).
+    stored as Intl spells it (aliases are NOT folded) and weekdays deduped + sorted, so the coerce
+    is a fixed point (HA's watch echo dedups). Null-prototype map (XERK-1451).
+  - Offset zones (`+05:30`) are refused: a named zone carries the DST rules.
+  - At most 100 orgs, siteKey ≤200 chars. **The route refuses what the coerce would drop** (400
+    long key, 409 full): the file store echoes `persist()` through the coerce synchronously even
+    HA-off, so a dropped key answered 200 with nothing stored. A full store first forgets orgs
+    no host is decided into.
 - `GET|PUT /api/orgs/<siteKey>/daily-brief/schedule`, operator-authed. PUT merges the body over
   the stored schedule (a toggle sends `{enabled}` alone) and validates the result whole.
   - 400 in the hub's own words (XERK-264); 404 for an org no host is DECIDED into
@@ -35,6 +40,11 @@ ticket builds to this file; change it here first.
   - A spring-forward gap time fires at the instant the old offset names (clock reads +1h); a
     fall-back repeated time is its FIRST occurrence. So each meeting date maps to ONE instant and
     the scheduler keys "already ran" on `meetingAt` — never on the wall time.
+  - Offset probes sit ±36h from the wall time: ±12h missed the pre-transition offset east of
+    +12h (Auckland, Chatham). Historical date-line skips (Apia 2011-12-30) are not handled.
+  - The scheduler must treat a run as DUE when `runAt <= now < meetingAt` and `meetingAt` has not
+    run — `nextDailyBriefRun(now)` already points past it, so a hub booting or failing over inside
+    the lead window would otherwise skip that day's brief.
 - `dailyBriefWindow(schedule, now, lastRunAt)` → `{dayFrom, weekFrom, until: now, meetingAt}`.
   - DAY opens at the previous SCHEDULED meeting (Monday's covers the weekend), or at `lastRunAt`
     when earlier (a missed brief loses nothing); never before WEEK, which is `now - 7d`.

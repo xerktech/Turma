@@ -27497,6 +27497,50 @@ test("XERK-2391: nextDailyBriefRun across DST — the spring gap still fires, th
     "2026-10-26T09:00:00.000Z", "GMT after the 10-25 change");
 });
 
+test("XERK-2391: DST holds east of +12h (Auckland) and offset zones are refused", () => {
+  const { nextDailyBriefRun: next, sanitizeDailyBriefSchedule: san } = hub;
+  // NZ spring-forward 2026-09-27 02:00 NZST -> 03:00 NZDT: 02:30 reads 03:30 NZDT.
+  const gap = { ...NY2391, time: "02:30", timeZone: "Pacific/Auckland", weekdays: [0], leadMinutes: 1 };
+  assert.equal(iso2391(next(gap, Date.parse("2026-09-25T00:00:00Z")).meetingAt),
+    "2026-09-26T14:30:00.000Z");
+  // NZ fall-back 2026-04-05 03:00 NZDT -> 02:00 NZST: 02:30 is its FIRST (NZDT) one.
+  assert.equal(iso2391(next(gap, Date.parse("2026-04-03T00:00:00Z")).meetingAt),
+    "2026-04-04T13:30:00.000Z");
+  assert.equal(san({ ...NY2391, timeZone: "+05:30" }), null);
+});
+
+test("XERK-2391: a PUT the store could not keep is refused, and a full store forgets departed orgs", async () => {
+  const url = (site) => `/api/orgs/${encodeURIComponent(site)}/daily-brief/schedule`;
+  const put = (site) => request("PUT", url(site), { body: NY2391, headers: userHeaders });
+  const long = "l".repeat(201) + ".atlassian.net";
+  await beat1574("dbHostL", long);
+  const r = await put(long);
+  assert.equal(r.status, 400);
+  assert.match(r.body.error, /too long/);
+  delete agents.dbHostL;
+  const store = hub.getDailyBriefSchedules();
+  const S = "dbC2391.atlassian.net";
+  await beat1574("dbHostC", S);
+  // 100 schedules, all for orgs a host is still in: refused, nothing evicted.
+  const live = Array.from({ length: 100 }, (_, i) => `full${i}.atlassian.net`);
+  for (const [i, k] of live.entries()) agents[`dbFull${i}`] = { ...agents.dbHostC, device: `dbFull${i}`,
+    jira: { ...agents.dbHostC.jira, siteKey: k }, orgBound: k };
+  for (const k of live) store[k] = hub.sanitizeDailyBriefSchedule(NY2391);
+  const full = await put(S);
+  assert.equal(full.status, 409);
+  assert.match(full.body.error, /100 orgs/);
+  assert.equal(S in store, false);
+  // One of those orgs loses its host: its schedule makes room.
+  delete agents.dbFull0;
+  const ok = await put(S);
+  assert.equal(ok.status, 200);
+  assert.ok(ok.body.schedule);
+  assert.equal(live[0] in store, false);
+  for (let i = 1; i < 100; i++) delete agents[`dbFull${i}`];
+  for (const k of [...live, S]) delete store[k];
+  delete agents.dbHostC;
+});
+
 test("XERK-2391: dailyBriefWindow covers the weekend on Monday and the last 7 days", () => {
   const { dailyBriefWindow: win } = hub;
   // Monday 2026-11-02 run at 09:25 EST: DAY opens at Friday's 09:30 EDT meeting.
