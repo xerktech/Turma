@@ -5602,10 +5602,11 @@ test("XERK-2399: hub pages refuse cross-origin framing; /term stays frameable", 
   }
 });
 
-function termUpgradeStatus(origin) {
+function termUpgradeStatus(origin, { host = "hub.example", fwdHost } = {}) {
   return new Promise((resolve, reject) => {
     const socket = net.connect(server.address().port, "127.0.0.1", () => {
-      socket.write("GET /term/nosuchsession/ws HTTP/1.1\r\nHost: hub.example\r\n" +
+      socket.write(`GET /term/nosuchsession/ws HTTP/1.1\r\nHost: ${host}\r\n` +
+        (fwdHost ? `X-Forwarded-Host: ${fwdHost}\r\n` : "") +
         `Authorization: ${userHeaders.authorization}\r\n` +
         (origin ? `Origin: ${origin}\r\n` : "") +
         "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
@@ -5625,6 +5626,13 @@ test("XERK-2399: the /term socket refuses a page on another origin", async () =>
   assert.match(await termUpgradeStatus("null"), / 403 /);
   assert.match(await termUpgradeStatus("https://hub.example"), / 404 /);
   assert.match(await termUpgradeStatus(null), / 404 /, "no Origin = not a browser");
+  // Behind a proxy that rewrites Host, the original rides X-Forwarded-Host.
+  const proxied = { host: "10.0.0.5:8300", fwdHost: "turma.example" };
+  assert.match(await termUpgradeStatus("https://turma.example", proxied), / 404 /);
+  assert.match(await termUpgradeStatus("https://evil.example", proxied), / 403 /);
+  // A default port written out is the same origin.
+  assert.match(await termUpgradeStatus("https://hub.example", { host: "hub.example:443" }), / 404 /);
+  assert.match(await termUpgradeStatus("http://hub.example", { host: "hub.example:443" }), / 403 /);
 });
 
 test("XERK-314: login and logout keep Allow-Credentials for the glasses cookie plant", async () => {

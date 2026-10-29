@@ -22822,10 +22822,13 @@ server.on("drop", () => {
 function sameOriginUpgrade(req) {
   const origin = req.headers.origin;
   if (origin === undefined) return true;
-  let host;
-  try { host = new URL(origin).host.toLowerCase(); } catch { return false; }
+  let o;
+  try { o = new URL(origin); } catch { return false; }
+  // Read each candidate under the Origin's scheme so a default port written out
+  // (Host "hub:443" vs Origin "https://hub") compares equal.
+  const hostOf = (h) => { try { return new URL(`${o.protocol}//${h}`).host; } catch { return null; } };
   const fwd = String(req.headers["x-forwarded-host"] || "").split(",")[0].trim();
-  return [req.headers.host, fwd].some((h) => h && String(h).toLowerCase() === host);
+  return [req.headers.host, fwd].some((h) => h && hostOf(String(h)) === o.host);
 }
 
 // ---- WebSocket upgrades -----------------------------------------------------
