@@ -325,7 +325,10 @@ const COLLAPSED_KEY = "turma.insights.decisionsCollapsed";
 const COLLAPSED_MAX = 100;   // the most recently toggled; an org long gone ages out
 const collapsed = new Set();
 // Re-read before every write, and on another tab's write (the `storage` event),
-// so two open tabs never overwrite each other's choices.
+// so two open tabs never overwrite each other's choices. Once a write has failed
+// (storage full, a read-only private mode), storage is stale: the in-memory set
+// is the truth for this page load, or every toggle would undo the one before.
+let collapsedWritable = true;
 function readCollapsed() {
   let v = null;
   try { v = JSON.parse(localStorage.getItem(COLLAPSED_KEY) || "[]"); } catch { return; }
@@ -334,13 +337,14 @@ function readCollapsed() {
 }
 readCollapsed();
 function toggleCollapsed(site) {
-  readCollapsed();
+  if (collapsedWritable) readCollapsed();
   if (collapsed.has(site)) collapsed.delete(site); else collapsed.add(site);
   const keep = [...collapsed].slice(-COLLAPSED_MAX);
-  try { localStorage.setItem(COLLAPSED_KEY, JSON.stringify(keep)); } catch { /* this page load only */ }
+  try { localStorage.setItem(COLLAPSED_KEY, JSON.stringify(keep)); } catch { collapsedWritable = false; }
 }
 addEventListener("storage", (e) => {
-  if (e.key !== COLLAPSED_KEY) return;
+  // A null key is another tab's localStorage.clear().
+  if ((e.key !== COLLAPSED_KEY && e.key !== null) || !collapsedWritable) return;
   readCollapsed();
   if (cache) render(cache);
 });

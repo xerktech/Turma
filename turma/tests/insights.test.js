@@ -339,6 +339,30 @@ test("XERK-2386: two open tabs never overwrite each other's collapse choices", (
   assert.match(tab1.els.decisionsLog.innerHTML, /data-collapse="b\.net" aria-expanded="false"/);
 });
 
+test("XERK-2386: storage that reads but won't write still toggles every click", () => {
+  const st = memStorage('["a.net"]');
+  st.setItem = () => { const e = new Error("full"); e.name = "QuotaExceededError"; throw e; };
+  const P = loadHelpers(null, "", st);
+  const data = decData(["a.net"]);
+  const shut = () => { P.renderDecisions(data, 5000); return /class="dec-org collapsed"/.test(P.els.decisionsLog.innerHTML); };
+  const seen = [shut()];
+  for (let i = 0; i < 4; i++) { P.toggleCollapsed("a.net"); seen.push(shut()); }
+  assert.deepEqual(seen, [true, false, true, false, true]);
+});
+
+test("XERK-2386: another tab's expand or clear reaches this tab", () => {
+  const st = memStorage('["a.net","b.net"]');
+  const P = loadHelpers(null, "", st);
+  P.setCache(decData(["a.net", "b.net"]));
+  const fire = (key) => { for (const fn of P.winListeners.storage) fn({ key }); };
+  st._m["turma.insights.decisionsCollapsed"] = '["b.net"]';   // the other tab expanded a.net
+  fire("turma.insights.decisionsCollapsed");
+  assert.match(P.els.decisionsLog.innerHTML, /data-collapse="a\.net" aria-expanded="true"/);
+  delete st._m["turma.insights.decisionsCollapsed"];           // the other tab cleared storage
+  fire(null);
+  assert.match(P.els.decisionsLog.innerHTML, /data-collapse="b\.net" aria-expanded="true"/);
+});
+
 test("XERK-2386: the collapse key keeps only the most recent 100 orgs", () => {
   const big = JSON.stringify(Array.from({ length: 5000 }, (_, i) => `o${i}.net`));
   const st = memStorage(big);
