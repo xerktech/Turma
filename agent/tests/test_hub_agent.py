@@ -54957,6 +54957,18 @@ class TestDailyBriefPrompt(unittest.TestCase):
             with self.subTest(repr(text[:8])):
                 self.assertTrue(ha.daily_brief_problems(self._brief(thisWeek=text), self.DATA))
         self.assertEqual(ha.daily_brief_problems(self._brief(thisWeek="a\tb"), self.DATA), [])
+        for text in ("XERK\u200b-77 shipped.", "a\u202eb"):
+            with self.subTest(repr(text)):
+                self.assertTrue(ha.daily_brief_problems(self._brief(thisWeek=text), self.DATA))
+
+    def test_a_valid_brief_fits_the_wire_caps_once_joined(self):
+        big = "x" * 1100
+        b = self._brief(sinceYesterday=big, stillOpen=big)
+        self.assertTrue(any("joined day" in p for p in ha.daily_brief_problems(b, self.DATA)))
+        b = self._brief(upNext=[{"key": "XERK-5", "text": big}, {"key": "XERK-6", "text": big}])
+        self.assertTrue(any("joined next" in p for p in ha.daily_brief_problems(b, self.DATA)))
+        b = self._brief(sinceYesterday="x" * 999, stillOpen="x" * 1000)
+        self.assertEqual(ha.daily_brief_problems(b, self.DATA), [])
 
     def test_keys_from_the_data_and_hashes_are_allowed(self):
         b = self._brief(sinceYesterday="XERK-1 and XERK-2 closed, see PR #12.",

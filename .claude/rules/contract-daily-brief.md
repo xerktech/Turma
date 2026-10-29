@@ -69,6 +69,8 @@ ticket builds to this file; change it here first.
   - `day` = `sinceYesterday` + `stillOpen`;
   - `week` = `thisWeek`;
   - `next` = each `upNext[].text`, or "Nothing is queued next." when the list is empty.
+  - `parse_daily_brief` refuses a brief whose joined `day` or `next` would pass 2000 chars
+    (`DAILY_BRIEF_WIRE_TEXT_MAX`), so the hub never cuts a script mid-sentence.
 
 ## Agent → hub: the heartbeat
 

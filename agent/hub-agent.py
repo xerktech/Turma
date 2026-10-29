@@ -24517,6 +24517,8 @@ DAILY_BRIEF_WORDS_SLACK = 1.25   # the parser's hard ceiling over each budget
 DAILY_BRIEF_NEXT_MAX = 4         # upNext entries (2 when the data offers 2+)
 DAILY_BRIEF_REPLY_TEXT_MAX = 1200  # chars per reply section / entry, a backstop
 # (named apart from the collector's DAILY_BRIEF_TEXT_MAX: one module global)
+DAILY_BRIEF_WIRE_TEXT_MAX = 2000  # each of the result row's day/week/next, joined
+                                  # (contract-daily-brief.md; the hub truncates past it)
 DAILY_BRIEF_INSTRUCTION = (
     "You write the script for a team's daily standup. A person will read your "
     "words ALOUD, verbatim, at the meeting. Everything after the line DATA is a "
@@ -24672,14 +24674,24 @@ def daily_brief_problems(brief, data):
     for name, t in texts:
         if len(t) > DAILY_BRIEF_REPLY_TEXT_MAX:
             problems.append(f"{name} is over {DAILY_BRIEF_REPLY_TEXT_MAX} chars")
-        if any(unicodedata.category(ch) == "Cs" or (unicodedata.category(ch) == "Cc"
-                                                     and ch not in "\t\n\r") for ch in t):
-            problems.append(f"{name} carries a control or lone surrogate character")
+        # Control, format (zero-width, bidi) and lone surrogate characters: a
+        # zero-width space inside a key would hide it from the invented-key check.
+        if any(unicodedata.category(ch) in ("Cs", "Cf") or (unicodedata.category(ch) == "Cc"
+                                                            and ch not in "\t\n\r") for ch in t):
+            problems.append(f"{name} carries a control, format or lone surrogate character")
         if _DAILY_BRIEF_MARKDOWN_RE.search(t):
             problems.append(f"{name} carries markdown")
         invented = sorted(_daily_brief_invented_keys(t, known))
         if invented:
             problems.append(f"{name} names tickets not in the data: {', '.join(invented)}")
+    # The wire row joins sections with one space (contract-daily-brief.md): day =
+    # sinceYesterday + stillOpen, next = every upNext text. Each must fit its cap.
+    joined = {"day": [t for n, t in texts if n in ("sinceYesterday", "stillOpen")],
+              "next": [t for n, t in texts if n.startswith("upNext")]}
+    for field, parts in joined.items():
+        size = len(" ".join(" ".join(p.split()) for p in parts))
+        if size > DAILY_BRIEF_WIRE_TEXT_MAX:
+            problems.append(f"joined {field} is {size} chars (wire cap {DAILY_BRIEF_WIRE_TEXT_MAX})")
     words = dict((n, _daily_brief_words(t)) for n, t in texts)
     day = sum(w for n, w in words.items() if n != "thisWeek")
     if day > DAILY_BRIEF_DAY_WORDS * DAILY_BRIEF_WORDS_SLACK:
