@@ -74,9 +74,9 @@ paths:
   - Each card collapses to its heading (`collapsed`, kept per viewer in `localStorage`, guarded:
     storage can be absent or throw, and the page then starts expanded).
     - Storage is re-read before each write and on the `storage` event (a null key is a clear), so
-      two open tabs never
-      overwrite each other; only the newest `COLLAPSED_MAX` (100) orgs are kept. Once a write fails
-      (`collapsedWritable`) storage is stale and is never re-read, or each click undoes the last.
+      two open tabs never overwrite each other; only the newest `COLLAPSED_MAX` (100) are kept.
+    - Once a write fails (`collapsedWritable`), storage is stale and never re-read again that page
+      load — else each click would undo the one before.
     - A repaint gives focus back to the toggle that had it — the toggle is replaced by every
       `innerHTML` swap, and a keyboard user otherwise lands on `<body>`.
   - A row's meta names its session (`label`, clipped to `DECISION_LABEL_MAX` 60) — the only tie
