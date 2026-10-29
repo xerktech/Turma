@@ -65,7 +65,9 @@
 
   function tabsHtml(active) {
     const tabs = PAGES.map(p =>
-      `<a href="${p.href}"${p.id === active ? ' class="active"' : ""}>${esc(p.label)}</a>`
+      // data-label lets app.css reserve each tab's BOLD width, so lighting a
+      // different tab on another page can't nudge the header's row (XERK-2432).
+      `<a href="${p.href}"${p.id === active ? ' class="active"' : ""} data-label="${esc(p.label)}">${esc(p.label)}</a>`
     ).join("\n      ");
     return `<nav class="nav-tabs">
       ${tabs}

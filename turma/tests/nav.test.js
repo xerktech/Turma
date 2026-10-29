@@ -26,7 +26,7 @@ test("nav: exactly one tab is marked active, and only the named one", () => {
   for (const p of PAGES) {
     const html = tabsHtml(p.id);
     assert.equal((html.match(/class="active"/g) || []).length, 1);
-    assert.match(html, new RegExp(`<a href="${p.href.replace("/", "\\/")}" class="active">`));
+    assert.match(html, new RegExp(`<a href="${p.href.replace("/", "\\/")}" class="active"[ >]`));
   }
   // An unknown/absent page (e.g. a page that forgot data-page) simply lights
   // nothing up rather than throwing or defaulting to Dashboard.
@@ -66,7 +66,7 @@ test("nav: the bottom nav mirrors the tab list, in order, with the same active p
   const hrefs = [...html.matchAll(/<a href="([^"]+)"/g)].map(m => m[1]);
   assert.deepEqual(hrefs, PAGES.map(p => p.href));
   assert.equal((html.match(/class="active"/g) || []).length, 1);
-  assert.match(html, /<a href="\/usage" class="active">/);
+  assert.match(html, /<a href="\/usage" class="active"[ >]/);
   for (const p of PAGES) assert.match(html, new RegExp(`>\\s*${p.label}\\s*</a>`));
 });
 
@@ -76,7 +76,7 @@ test("nav: mount fills the header and bottom-nav placeholders from the header's 
     bottomNav: { innerHTML: "" },
   };
   mount({ getElementById: id => els[id] || null });
-  assert.match(els.siteHeader.innerHTML, /<a href="\/board" class="active">Board<\/a>/);
+  assert.match(els.siteHeader.innerHTML, /<a href="\/board" class="active" data-label="Board">Board<\/a>/);
   assert.match(els.bottomNav.innerHTML, /<a href="\/board" class="active">/);
 });
 
@@ -379,4 +379,18 @@ test("toast: shows the text, creates its element once, and never parses markup",
     toast("");
     assert.equal(el.textContent, "Rename failed — unknown session");
   } finally { global.document = savedDoc; global.setTimeout = savedTimeout; }
+});
+
+test("nav: every tab reserves its bold width, so the row can't shift between pages (XERK-2432)", () => {
+  // The active tab is bolder; without the reserved width the right-aligned row
+  // (and the org + New-ticket buttons beside it) moved as the active tab changed.
+  for (const p of PAGES) assert.match(tabsHtml(p.id), new RegExp(`data-label="${p.label}">${p.label}</a>`));
+  const css = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "public", "app.css"), "utf8");
+  const active = css.match(/\.nav-tabs a\.active \{[^}]*font-weight:\s*(\d+)/);
+  const reserve = css.match(/\.nav-tabs a\[data-label\]::after \{[^}]*content:\s*attr\(data-label\)[^}]*font-weight:\s*(\d+)[^}]*\}/);
+  assert.ok(active && reserve, "both rules present");
+  assert.equal(reserve[1], active[1], "the reserved copy is as bold as the active tab");
+  assert.match(css, /\.nav-tabs a\[data-label\] \{[^}]*display:\s*inline-grid/);
+  assert.match(reserve[0], /height:\s*0/);
+  assert.match(reserve[0], /visibility:\s*hidden/);
 });

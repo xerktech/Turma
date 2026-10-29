@@ -33,6 +33,12 @@
   // rather than silently resetting to "all orgs" on upgrade.
   const KEY = "turma-org";
   const LEGACY_KEY = "turma-board-org";
+  // The last fleet's org list, trimmed to what the closed control and the
+  // New-ticket button need, so the next page paints them on mount rather than
+  // after its first fleet fetch — without it both slots start empty on every
+  // navigation and pop in a beat later, growing the header and shifting the
+  // page under it (XERK-2432). The first real update() replaces it.
+  const SITES_KEY = "turma-org-sites";
 
   function esc(s) {
     return String(s ?? "").replace(/[&<>"']/g, c => ({
@@ -221,6 +227,7 @@
   let open = false;
   let slot = null;
   let painted = "";       // last markup written, so a beat repaint is a no-op
+  let live = false;       // an update() has landed; until then `sites` is the cache
 
   // The persisted value is a JSON array of siteKeys ("" for none). A pre-multi
   // value — this key's own old single-siteKey format, or the board-era legacy
@@ -240,6 +247,36 @@
 
   function encodeStored(keys) {
     return keys.length ? JSON.stringify(keys) : "";
+  }
+
+  // The cache as `{sites: [{siteKey, orgName, source}], colorPins}`, empty when
+  // absent or malformed — it is read back from storage, so every field is
+  // retyped. Read by newticket.js too, so both slots agree on mount.
+  function readCache() {
+    const none = { sites: [], colorPins: {} };
+    let c;
+    try { c = JSON.parse(localStorage.getItem(SITES_KEY) || "null"); } catch { return none; }
+    if (!c || !Array.isArray(c.sites)) return none;
+    const str = v => (typeof v === "string" ? v : "");
+    const out = c.sites.filter(s => s && typeof s.siteKey === "string" && s.siteKey)
+      .map(s => ({ siteKey: s.siteKey, orgName: str(s.orgName), source: str(s.source) }));
+    const pins = Object.create(null);
+    if (c.colorPins && typeof c.colorPins === "object") {
+      for (const [k, v] of Object.entries(c.colorPins)) if (Number.isInteger(v)) pins[k] = v;
+    }
+    return { sites: out, colorPins: pins };
+  }
+  function cachedSites() { return readCache().sites; }
+
+  let cachedRaw = null;
+  function writeCache() {
+    const raw = JSON.stringify({
+      sites: sites.map(s => ({ siteKey: s.siteKey, orgName: s.orgName || "", source: s.source || "" })),
+      colorPins,
+    });
+    if (raw === cachedRaw) return;   // a settled fleet writes nothing per beat
+    cachedRaw = raw;
+    try { localStorage.setItem(SITES_KEY, raw); } catch { /* not persisted — the slots just pop in */ }
   }
 
   function readStored() {
@@ -313,6 +350,8 @@
     if (data && data.autoStartOrgs) autoMap = data.autoStartOrgs;
     if (data && data.autoMergeOrgs) mergeMap = data.autoMergeOrgs;
     if (data && data.orgColors) colorPins = data.orgColors;
+    live = true;
+    writeCache();
     paint();
   }
 
@@ -461,7 +500,10 @@
     if (!slot) return;
     // A freshly-mounted control starts closed, with nothing painted and nothing
     // known about the fleet — it learns the orgs from the first update().
-    painted = ""; open = false; sites = []; autoMap = {}; colorPins = {}; colorFor = null;
+    painted = ""; open = false; autoMap = {}; colorFor = null; live = false;
+    // Paint the closed button from the last fleet's org list (XERK-2432) so the
+    // header has its final shape before the page's first fetch lands.
+    ({ sites, colorPins } = readCache());
     stored = readStored();
     // One delegated listener set, attached once — the control's markup is
     // replaced on every change, so per-element handlers would have to be
@@ -494,7 +536,9 @@
       // An org row toggles and keeps the menu open; the empty key is the
       // "All orgs" row, which clears the selection and closes.
       if (pick) { toggle(pick.dataset.orgKey); return; }
-      if (e.target.closest("[data-org-toggle]")) { open = !open; paint(); }
+      // The cache carries only names, not the counts and switches the menu
+      // shows, so the menu waits for the first real update().
+      if (e.target.closest("[data-org-toggle]") && live) { open = !open; paint(); }
     });
     doc.addEventListener("click", (e) => {
       if (open && !e.turmaOrgHandled && !slot.contains(e.target)) { close(); paint(); }
@@ -518,6 +562,7 @@
     siteKeyOf, keysOf, filterAgents, effectiveKeys, autoOn, parseStored, encodeStored,
     buttonHtml, menuHtml, controlHtml, swatchRowHtml,
     get, getKeys, set, toggle, subscribe, update, sse, setAutoStart, setAutoMerge, setOrgColor, orgColors, mount,
+    SITES_KEY, cachedSites,
     // The common call site: scope the beat's fleet to the current selection.
     filter(agents) { return filterAgents(agents, getKeys()); },
   };

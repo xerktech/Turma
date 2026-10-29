@@ -133,6 +133,52 @@ test("newticket: the button is hidden until an org reports, then appears", () =>
   assert.equal(slot.children.length, 0);
 });
 
+test("newticket: the org list org.js cached shows the button at mount (XERK-2432)", () => {
+  // A page change remounts the header; without this the button popped in only
+  // after the new page's first fetch, shifting the header.
+  global.window.TurmaOrg = { cachedSites: () => [{ siteKey: "acme.atlassian.net", orgName: "", source: "jira" }] };
+  try {
+    const { slot, button } = mountNT();
+    assert.deepEqual(slot.children, [button]);
+    // The fleet's own answer still wins: no org reports, so it is pulled out.
+    NT.update({ agents: [agent("h1", null)] });
+    assert.equal(slot.children.length, 0);
+  } finally { delete global.window.TurmaOrg; }
+});
+
+test("newticket: a form opened from the cache drops '(offline)' once the fleet lands (XERK-2432)", () => {
+  // The cache has no liveness, so a form opened before the first fetch labels
+  // every org offline; the live update must correct the selector in place.
+  global.window.TurmaOrg = { cachedSites: () => [
+    { siteKey: "acme.atlassian.net", orgName: "", source: "jira" },
+    { siteKey: "beta.atlassian.net", orgName: "", source: "jira" },
+  ] };
+  try {
+    const { body, button } = mountNT();
+    const panel = body.children[0].children[0];
+    for (const fn of button._listeners.click || []) fn({});
+    const select = { innerHTML: "" };
+    panel.querySelector = (q) => (q === "[data-cf-org]" ? select : null);
+    assert.match(panel.innerHTML, /acme \(offline\)/);
+    const formHtml = panel.innerHTML;
+    NT.update({ agents: [agent("h1", "acme.atlassian.net"), agent("h2", "beta.atlassian.net")] });
+    assert.match(select.innerHTML, /acme</);
+    assert.doesNotMatch(select.innerHTML, /offline/);
+    // Only the options moved: the rest of the form (and anything typed) stays.
+    assert.equal(panel.innerHTML, formHtml);
+    // A settled beat rewrites nothing, even though the DOM reserializes the
+    // options differently from how they were built.
+    select.innerHTML = select.innerHTML.replace(" selected", ' selected=""');
+    const reserialized = select.innerHTML;
+    NT.update({ agents: [agent("h1", "acme.atlassian.net"), agent("h2", "beta.atlassian.net")] });
+    assert.equal(select.innerHTML, reserialized);
+    // The form's org leaving the fleet closes the form rather than throwing.
+    const backdrop = body.children[0];
+    assert.doesNotThrow(() => NT.update({ agents: [agent("h2", "beta.atlassian.net")] }));
+    assert.equal(backdrop.hidden, true);
+  } finally { delete global.window.TurmaOrg; }
+});
+
 test("newticket: the modal backdrop is created under the body, hidden", () => {
   const { body } = mountNT();
   assert.equal(body.children.length, 1);

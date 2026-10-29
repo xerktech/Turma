@@ -77,6 +77,7 @@
   let btnShown = false;
   // { sites, siteKey, source, meta, types, values, busy, error, created }
   let createState = null, createSeq = 0;
+  let orgOptsPainted = "";   // the org <select>'s last options, as built (not as the DOM reserializes them)
 
   // The org list a create can target: every org the fleet reports, shaped down
   // to what createOrgOptions / the submit path need.
@@ -86,7 +87,9 @@
   }
 
   function paintCreate() {
-    if (createState && panel) panel.innerHTML = board().createFormHtml(createState);
+    if (!createState || !panel) return;
+    panel.innerHTML = board().createFormHtml(createState);
+    orgOptsPainted = board().createOrgOptions(createState.sites, createState.siteKey);
   }
 
   // A modal is open somewhere (this one or the board's own detail panel), so
@@ -272,7 +275,17 @@
     // the open form's org list current so its selector doesn't offer a gone org.
     if (createState) {
       createState.sites = orgSites();
-      if (!createState.sites.some((s) => s.siteKey === createState.siteKey)) closeCreate();
+      if (!createState.sites.some((s) => s.siteKey === createState.siteKey)) return void closeCreate();
+      // A form opened from org.js's cached list (XERK-2432) labels every org
+      // "(offline)" — the cache carries no liveness. Refresh just the org
+      // <select>'s options, not the whole form, so a half-typed title keeps
+      // its text and caret.
+      // Compared against what was last BUILT: the DOM reserializes `selected`
+      // as `selected=""`, so reading innerHTML back never matches and would
+      // rebuild the options (closing an open dropdown) on every beat.
+      const sel = panel && panel.querySelector("[data-cf-org]");
+      const opts = board().createOrgOptions(createState.sites, createState.siteKey);
+      if (sel && opts !== orgOptsPainted) { sel.innerHTML = opts; orgOptsPainted = opts; }
     }
   }
 
@@ -281,9 +294,13 @@
     if (!slot) return;
     docRef = doc;
     bodyEl = doc.body || doc.documentElement;
-    // Fresh mount: nothing known about the fleet yet, button hidden until the
-    // first update() learns of an org.
-    sites = []; btnShown = false; createState = null;
+    // Fresh mount: nothing known about the fleet yet, so start from the last
+    // fleet's org list org.js cached (XERK-2432) — the button is in place on
+    // load instead of popping in after the page's first fetch. The first
+    // update() replaces it; with no cache the button waits for that update.
+    const org = typeof window !== "undefined" && window.TurmaOrg;
+    sites = (org && org.cachedSites) ? org.cachedSites() : [];
+    btnShown = false; createState = null;
 
     const holder = doc.createElement("div");
     holder.innerHTML = buttonHtml();
@@ -307,6 +324,7 @@
     (doc.body || doc.documentElement).appendChild(backdrop);
 
     btnEl.addEventListener("click", openCreate);
+    setButtonVisible(sites.length > 0);
 
     panel.addEventListener("click", (e) => {
       if (!createState) return;

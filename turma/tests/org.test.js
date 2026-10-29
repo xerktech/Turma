@@ -212,8 +212,9 @@ test("org: org names and site keys are escaped into the markup", () => {
 
 // The smallest document that org.js's mount() and paint() need: an #hdrOrg slot
 // and the three listener registrations it makes.
-function mountOrg({ storedOrg = null, storedBoardOrg = null } = {}) {
+function mountOrg({ storedOrg = null, storedBoardOrg = null, storedSites = null } = {}) {
   const store = {};
+  if (storedSites !== null) store[Org.SITES_KEY] = storedSites;
   if (storedOrg !== null) store[Org.KEY] = storedOrg;
   if (storedBoardOrg !== null) store[Org.LEGACY_KEY] = storedBoardOrg;
   const slot = {
@@ -254,6 +255,51 @@ test("org: a stored pick is read at mount, and applies once its org reports", ()
   Org.update({ agents: [agent("a", "acme.atlassian.net")] });
   assert.equal(Org.get(), "acme.atlassian.net");
   assert.match(slot.innerHTML, /class="org-btn scoped"/);
+});
+
+test("org: the last fleet's orgs paint the button at mount, before any update (XERK-2432)", () => {
+  // Every page change remounts the header. Without the cache the slot started
+  // empty and the control popped in once the page's first fetch landed,
+  // growing the header and shifting the page under it.
+  const { slot, store } = mountOrg({ storedOrg: "acme.atlassian.net" });
+  Org.update({ agents: [agent("a", "acme.atlassian.net")], orgColors: { "acme.atlassian.net": 3 } });
+  const cached = JSON.parse(store[Org.SITES_KEY]);
+  assert.deepEqual(cached.sites, [{ siteKey: "acme.atlassian.net", orgName: "", source: "jira" }]);
+  assert.deepEqual(cached.colorPins, { "acme.atlassian.net": 3 });
+  const painted = slot.innerHTML;
+  // The next page: same storage, nothing fetched yet — same control, at once.
+  const next = mountOrg({ storedOrg: "acme.atlassian.net", storedSites: store[Org.SITES_KEY] });
+  assert.equal(next.slot.innerHTML, painted);
+  assert.equal(Org.get(), "acme.atlassian.net");
+  assert.deepEqual(Org.cachedSites(), cached.sites);
+  // The cache carries no ticket counts or switches, so the menu waits for the
+  // first real update rather than opening on a stub.
+  next.click("data-org-toggle", "");
+  assert.doesNotMatch(next.slot.innerHTML, /org-menu/);
+  Org.update({ agents: [agent("a", "acme.atlassian.net")] });
+  next.click("data-org-toggle", "");
+  assert.match(next.slot.innerHTML, /org-menu/);
+});
+
+test("org: a cached org name is escaped into the button label", () => {
+  // The cache is a second way an org name reaches the slot's innerHTML.
+  const { slot } = mountOrg({
+    storedOrg: "x.atlassian.net",
+    storedSites: JSON.stringify({ sites: [{ siteKey: "x.atlassian.net", orgName: "<img src=x onerror=alert(1)>" }] }),
+  });
+  assert.doesNotMatch(slot.innerHTML, /<img/);
+  assert.match(slot.innerHTML, /&lt;img src=x onerror=alert\(1\)&gt;/);
+});
+
+test("org: a malformed org cache degrades to an empty slot", () => {
+  for (const raw of ["not json", "[]", '{"sites":"x"}', '{"sites":[null,{"siteKey":5},{"siteKey":""}]}']) {
+    const { slot } = mountOrg({ storedSites: raw });
+    assert.equal(slot.innerHTML, "", raw);
+    assert.deepEqual(Org.cachedSites(), []);
+  }
+  const { slot } = mountOrg({ storedSites: '{"sites":[{"siteKey":"a.atlassian.net","orgName":{"x":1}}],"colorPins":{"a.atlassian.net":"red"}}' });
+  assert.match(slot.innerHTML, /org-btn/);
+  assert.deepEqual(Org.cachedSites(), [{ siteKey: "a.atlassian.net", orgName: "", source: "" }]);
 });
 
 test("org: an existing board-only pick is migrated to the shared key", () => {
