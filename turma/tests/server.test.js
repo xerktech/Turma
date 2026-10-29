@@ -27456,6 +27456,8 @@ test("XERK-2381: removing a host releases its name for a reinstall", async () =>
   // Remove host on a briefly offline host: it comes straight back on its identity.
   assert.equal((await request("DELETE", "/api/agents/box2381", { headers: userHeaders })).status, 200);
   assert.equal((await persisted())[uid].released, true, "the release is persisted");
+  assert.equal(hub.coerceAgentIdentities(JSON.parse(JSON.stringify(await persisted())))[uid].released, true,
+    "and survives a reload");
   assert.equal((await beatAs("box2381", asAuth(tok))).status, 200);
   assert.equal((await persisted())[uid].released, undefined, "and cleared once it is back");
   // A reinstall that registers the name first wins; the old identity is refused there.
@@ -27464,6 +27466,9 @@ test("XERK-2381: removing a host releases its name for a reinstall", async () =>
   const old = await beatAs("box2381", asAuth(tok));
   assert.equal(old.status, 403);
   assert.match(old.body.error, /re-provision/);
+  // Superseded, the old identity can go nowhere else either: Remove + reinstall retires it.
+  assert.equal((await beatAs("box2381-elsewhere", asAuth(tok))).status, 403);
+  assert.equal(agents["box2381-elsewhere"], undefined);
   const fresh = enrollUid("box2381");
   assert.notEqual(fresh, tok);
   assert.equal((await beatAs("box2381", asAuth(fresh))).status, 200);

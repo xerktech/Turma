@@ -103,6 +103,9 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
       afresh) and the id living there is marked `released`. It still returns if it beats first (Remove
       host is offered on any briefly-offline host); a reinstall that registers first wins. Revoking
       instead locked a blipped host out for good; never releasing locked a reinstall out on strict.
+    - **A released id may ONLY return home**, never rename: once a reinstall takes the name it is
+      dead, so Remove host + reinstall is the revoke path for a lost or stolen machine's token.
+      Residual: a leaked token that beats home first after a Remove keeps the host.
     - An id the hub does not know is told to re-provision (`--agent-token`), never re-issued.
     - A beat that renames carries the old record over (commands, org binding, alerts), drops every
       other record bound to the id (HA ghosts too), re-points ticket pins, appends `formerNames`.

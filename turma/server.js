@@ -1270,7 +1270,7 @@ function nameTokenRefusal(host) {
   const a = Object.prototype.hasOwnProperty.call(agents, host) ? agents[host] : null;
   if (a && a.agentUid) {
     const e = identityOf(a.agentUid);
-    if (!e || e.origin !== host) return `${host} is registered to another agent`;
+    if (!e || e.origin !== host) return `${host} is registered to another agent — remove it from the dashboard to release the name`;
   }
   return null;
 }
@@ -1295,7 +1295,7 @@ function uidHostRefusal(uid, host, now = Date.now()) {
   }
   if (!isPlainHostKey(host) || !hostAgentToken(host)) return `${host} is not a usable host name`;
   const rec = Object.prototype.hasOwnProperty.call(agents, host) ? agents[host] : null;
-  if (rec && rec.agentUid && rec.agentUid !== uid) return `${host} is registered to another agent`;
+  if (rec && rec.agentUid && rec.agentUid !== uid) return `${host} is registered to another agent — remove it from the dashboard to release the name`;
   // Its home: a record there with no id is this agent's own, from before its
   // first beat on the identity (minted while the host still ran on its name).
   if (e.home === host) {
@@ -1304,17 +1304,21 @@ function uidHostRefusal(uid, host, now = Date.now()) {
         "with its own token (node turma/server.js --agent-token <host>)"
       : null;
   }
-  if (rec && !rec.agentUid) return `${host} is registered to another agent`;
+  if (rec && !rec.agentUid) return `${host} is registered to another agent — remove it from the dashboard to release the name`;
   if (rec) return null; // a stale copy of this agent's own record (an HA ghost)
+  // A released identity (its host was removed) may only come home: once a
+  // reinstall has taken that name it can go nowhere, so Remove host + reinstall
+  // is how an operator retires a decommissioned or stolen machine's token.
+  if (e.released) return `${e.home} was removed from the dashboard — this agent may only return as ${e.home}`;
   const mine = new Set([e.origin, e.home, ...(Array.isArray(e.names) ? e.names : [])]
     .filter(Boolean).map(lowerName));
   const want = lowerName(host);
   for (const [other, o] of Object.entries(agentIdentities)) {
-    if (other !== uid && o && lowerName(o.home) === want) return `${host} is registered to another agent`;
+    if (other !== uid && o && lowerName(o.home) === want) return `${host} is registered to another agent — remove it from the dashboard to release the name`;
   }
   if (!mine.has(want)) {
     for (const k of Object.keys(agents)) {
-      if (lowerName(k) === want) return `${host} is registered to another agent`;
+      if (lowerName(k) === want) return `${host} is registered to another agent — remove it from the dashboard to release the name`;
     }
     if (usageLedger.has(host)) {
       return `${host} belonged to another host — re-provision it with its own token, or purge its ` +
@@ -22033,8 +22037,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "agents" && parts.length === 3) {
       const key = decodeURIComponent(parts[2]);
       delete agents[key];
-      // Removing a host releases its name and revokes its agent identity
-      // (XERK-2381), so a reinstalled machine can take the name on a new token.
+      // Removing a host releases its name (XERK-2381): a reinstalled machine can
+      // take it on a new token, and its old identity may only return home.
       releaseHostIdentities(key);
       // Removing the host does NOT remove what it spent (XERK-338) — that is the
       // whole point of the ledger, and the Usage page keeps charting it as a
