@@ -2262,8 +2262,11 @@ function removeHost(key)  { del(`/api/agents/${enc(key)}`, "Remove host"); }
 
 // Remove a lost or stolen host AND revoke its agent identity token (XERK-2383).
 // Offered online too — a stolen machine still beats — on any host the hub says
-// has an agent identity (`identityBound`); a name or master token can't be
-// revoked per host, so those get no button.
+// has an agent identity (`identityBound`); a host on its name or master token
+// has no identity to revoke, so it gets no button. The revoke also retires the
+// host's name token (XERK-2384), except when the hub's generations registry is
+// full — then the identity is still revoked and the reply says the name token
+// was not, which the operator must hear (a 200 alone reads as all done).
 // Arm/confirm: unlike a plain Remove the host cannot come back without being
 // re-provisioned.
 function revokeHostBtn(a) {
@@ -2274,7 +2277,13 @@ function revokeHostBtn(a) {
     + ` onclick="revokeHost('${escJs(a.key)}')">${armed ? "Confirm revoke" : "Remove + revoke token"}</button>`;
 }
 function revokeHost(key) {
-  twoClick("rv::" + key, () => del(`/api/agents/${enc(key)}?identity=revoke`, "Revoke token"));
+  twoClick("rv::" + key, async () => {
+    const out = await del(`/api/agents/${enc(key)}?identity=revoke`, "Revoke token");
+    if (out && out.nameTokenRevoked === false) {
+      toast(`${key}'s agent identity is revoked, but its name-derived token is not ` +
+        "(the hub's revoked-token registry is full) — rotate TURMA_AGENT_TOKEN to retire it");
+    }
+  });
 }
 
 // Restart a host's agent manager (XERK-157). Arm/confirm first, then POST; the

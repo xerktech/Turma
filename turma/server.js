@@ -22247,9 +22247,23 @@ const server = http.createServer(async (req, res) => {
         }
         return json(res, 409, {
           error: `${key} has no agent identity token to revoke — it runs on its name-derived ` +
-            "token or the fleet master (only rotating TURMA_AGENT_TOKEN revokes those), or its " +
-            "agent has been renamed (revoke it under its new name)",
+            `token (revoke that with POST /api/agents/${key}/revoke-name-token) or the fleet ` +
+            "master (only rotating TURMA_AGENT_TOKEN revokes that), or its agent has been " +
+            "renamed (revoke it under its new name)",
         });
+      }
+      // A revoke un-retires the host's NAME token below (it is how the host is
+      // re-provisioned), and a name token is deterministic: bump its generation
+      // first (XERK-2384), so the one this machine held stays dead and
+      // `--agent-token <host>` mints the next. Done before anything is removed,
+      // so a bump that cannot be saved refuses the whole revoke.
+      // A full generations registry (409) must not keep a stolen IDENTITY token
+      // alive: revoke that anyway and say the name token was left as it was.
+      let nameTokenRevoked = false;
+      if (revoke && hostAgentToken(key)) {
+        const bumped = await bumpNameTokenGen(key);
+        if (bumped.error && bumped.status !== 409) return json(res, bumped.status, { error: bumped.error });
+        nameTokenRevoked = !bumped.error;
       }
       delete agents[key];
       // Removing a host releases its name (XERK-2381): a reinstalled machine can
@@ -22279,7 +22293,9 @@ const server = http.createServer(async (req, res) => {
       markAgentRemoved(key); // XERK-756: remove the host record from the shared store (HA)
       invalidateAgentsCache();
       sseBroadcast("removed", { key });
-      return json(res, 200, { ok: true, usagePurged: purged, identitiesRevoked: revoked });
+      const body = { ok: true, usagePurged: purged, identitiesRevoked: revoked };
+      if (revoke) body.nameTokenRevoked = nameTokenRevoked;
+      return json(res, 200, body);
     }
 
     // GET /api/jira/<siteKey>/create-meta[?project=<p>] -> the New-ticket form's

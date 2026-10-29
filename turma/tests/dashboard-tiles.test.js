@@ -49,6 +49,7 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   const sse = [];
   const fetches = [];
   const timers = [];
+  const toasts = [];
   const noop = () => {};
   let activeTagName = null;
   const docHandlers = {};
@@ -88,7 +89,7 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
     clearTimeout: (id) => { if (id) timers[id - 1] = null; },
     matchMedia: () => ({ matches: false, addEventListener: noop }),
     history: { replaceState: noop, pushState: noop },
-    TurmaNav: { preserveScroll: (_el, paint) => paint(), toast: noop },
+    TurmaNav: { preserveScroll: (_el, paint) => paint(), toast: (m) => toasts.push(m) },
     TurmaOrg: { get: () => "", update: noop, filter: (a) => orgFilter(a), subscribe: noop, sse: noop,
       orgColors: () => ({}) },
     TurmaBoard: { orgName: (k) => k || "", orgColorMap: () => new Map() },
@@ -99,7 +100,7 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   const keys = Object.keys(g);
   const fn = new Function(...keys, src +
     "\n;return { render, fmtTokens, applyAgent, connectSSE, contextMeterHtml, refresh, mergeSnapshot," +
-    " autoPausedBadge, refusedBadge, pausedKill, reconcilePending, toggleResume," +
+    " autoPausedBadge, refusedBadge, pausedKill, reconcilePending, toggleResume, revokeHost," +
     " sseClock: () => sseClock," +
     " setCache: (c) => { cache = c; }, getCache: () => cache };");
   const api = fn(...keys.map((k) => g[k]));
@@ -108,7 +109,7 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
     const due = timers.splice(0).filter(Boolean);
     for (const t of due) await t.fn();
   };
-  return Object.assign(api, { els, sse, fetches, timers, runTimers,
+  return Object.assign(api, { els, sse, fetches, timers, runTimers, toasts,
     setActiveTagName: (t) => { activeTagName = t; },
     fire: (name) => { for (const fn of docHandlers[name] || []) fn({}); } });
 }
@@ -707,4 +708,15 @@ test("XERK-2383: a host with an agent identity offers Remove + revoke token, onl
     { ...liveHost("named", 1, null), tokenBound: true },
     { ...liveHost("offnamed", 1, null), tokenBound: true, online: false }] });
   assert.doesNotMatch(D.els.groups.innerHTML, /revokeHost/);
+});
+
+test("XERK-2384: a revoke that left the name token live says so", async () => {
+  for (const [nameTokenRevoked, toasted] of [[false, true], [true, false], [undefined, false]]) {
+    const D = loadDashboard(undefined, () => ({ ok: true, identitiesRevoked: 1, nameTokenRevoked }));
+    D.revokeHost("stolen");   // arm
+    D.revokeHost("stolen");   // confirm
+    await settle();
+    assert.ok(D.fetches.includes("/api/agents/stolen?identity=revoke"));
+    assert.equal(D.toasts.some((m) => /name-derived token is not/.test(m)), toasted, String(nameTokenRevoked));
+  }
 });
