@@ -55179,6 +55179,12 @@ class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):
             self.assertIn("timed out" if replies[0] is None else "contract", row["error"])
             self.assertEqual(len(self.argvs), ha.DAILY_BRIEF_MAX_ATTEMPTS)
 
+    def test_the_failure_names_the_last_attempts_cause(self):
+        self.sm._stage_daily_brief(self._cmd())
+        self.replies = [None, self._reply(thisWeek="This week:")]
+        [row] = self._drain()
+        self.assertIn("(last: the brief's text cleaned to nothing)", row["error"])
+
     def test_a_runtime_without_a_locked_down_one_shot_fails_clearly(self):
         for runtime in ("dsh", "qwen"):
             self.sm._stage_daily_brief(self._cmd(runId={"dsh": "d1", "qwen": "e1"}[runtime], runtime=runtime))
