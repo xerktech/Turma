@@ -39,6 +39,10 @@ const tar = require("./tar.js");
 // Mobile push (FCM) fan-out for the alert bus. Lazily/gracefully no-ops when
 // FCM_SERVICE_ACCOUNT_JSON is unset, so requiring it is side-effect-free.
 const push = require("./push.js");
+// `--agent-token`'s stdout must be the token ALONE (an operator pipes it into an
+// env file), so every log line module init prints — the usage ledger's load, the
+// HA store's health — goes to stderr in that mode; the token is written directly.
+if (process.argv[2] === "--agent-token") console.log = console.error;
 // Durable token-usage history (XERK-338): usage is an agent-derived aggregate
 // that lived only on the registry record, so deleting/pruning a host threw it
 // away and a wiped host overwrote its own past with near-zero. This keeps it on
@@ -497,6 +501,8 @@ const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
 const TICKET_AGENTS_FILE = process.env.TICKET_AGENTS_FILE || "/data/ticket-agents.json";
 // Agent identities (XERK-2381): which agent id is bound to which host name.
 const AGENT_IDENTITIES_FILE = process.env.AGENT_IDENTITIES_FILE || "/data/agent-identities.json";
+// Name-token generations (XERK-2384): host -> {gen, at}, bumped by a revoke.
+const NAME_TOKEN_GENS_FILE = process.env.NAME_TOKEN_GENS_FILE || "/data/name-token-gens.json";
 // Tickets come and go while pins are only ever set by hand, so the map is
 // bounded rather than reconciled: past the cap the oldest pin is evicted.
 const TICKET_AGENTS_MAX = 500;
@@ -1181,7 +1187,26 @@ function hostAgentToken(host) {
   // name. Refusing at mint time is where the operator can still act on it.
   if (!isPlainHostKey(host)) return "";
   return name.toString("base64url") + "." +
-    crypto.createHmac("sha256", TURMA_AGENT_TOKEN).update(host).digest("hex");
+    crypto.createHmac("sha256", nameTokenKey(host)).update(host).digest("hex");
+}
+
+// The HMAC key for `host`'s name token at its current generation (XERK-2384).
+// Generation 0 is the master itself, so every token minted before generations
+// existed is still the gen-0 token. A revoke bumps the host's generation, and
+// gen N keys the HMAC with a key DERIVED from the master and N: the old token
+// stops matching, `--agent-token <host>` mints the new one, and the token's
+// shape (name half + digest) is unchanged, so no agent needs to change. A
+// derived key rather than a longer HMAC subject keeps the derivation injective
+// against every host name (see the label below).
+function nameTokenKey(host) {
+  const gen = nameTokenGen(host);
+  if (!gen) return TURMA_AGENT_TOKEN;
+  // The label leads with 0xFF, a byte no UTF-8 string holds — and hostAgentToken
+  // only mints for a name that round-trips UTF-8 — so no host's gen-0 MAC can
+  // ever equal a generation key (a plain-text label would be the MAC of the host
+  // NAMED that label, handing its holder every revoked host's next token).
+  return crypto.createHmac("sha256", TURMA_AGENT_TOKEN)
+    .update(Buffer.concat([Buffer.from([0xff]), Buffer.from(`name-token-gen:${gen}`)])).digest();
 }
 
 // The subject a bearer token NAMES (a host name, or `uid:<id>`), unverified.
@@ -2796,6 +2821,82 @@ function coerceAgentIdentities(raw) {
     out[uid] = rec;
   }
   return out;
+}
+// Name-token generations (XERK-2384) — see nameTokenKey. Durable like the
+// identities: losing an entry silently UN-revokes that host's old name token.
+let nameTokenGens = coerceNameTokenGens(readJsonFile(NAME_TOKEN_GENS_FILE));
+// No persist() kept: bumpNameTokenGen writes and confirms the store itself.
+registerExternalStore({
+  name: "nameTokenGens", file: NAME_TOKEN_GENS_FILE,
+  coerce: coerceNameTokenGens, read: () => nameTokenGens, install: (v) => { nameTokenGens = v; },
+});
+// Inline literals: this runs at module init. A malformed entry is dropped, which
+// reads as gen 0 — the only safe reading of a file that cannot say otherwise.
+function coerceNameTokenGens(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [host, e] of Object.entries(raw)) {
+    if (!host || host.length > 200 || !e || typeof e !== "object") continue;
+    if (!Number.isSafeInteger(e.gen) || e.gen <= 0) continue;
+    out[host] = { gen: e.gen, at: Number.isSafeInteger(e.at) && e.at > 0 ? e.at : 0 };
+  }
+  return out;
+}
+function nameTokenGen(host) {
+  const e = Object.prototype.hasOwnProperty.call(nameTokenGens, host) ? nameTokenGens[host] : null;
+  return e ? e.gen : 0;
+}
+// Never evicted: dropping an entry would revive the token it revoked. Bounded
+// instead by refusing a new host past the cap (an operator-only action).
+const NAME_TOKEN_GENS_MAX = 4096;
+// Revoke `host`'s name-derived token: bump its generation so the token every
+// earlier `--agent-token <host>` printed stops proving the host. Revokes nothing
+// else — an identity token is the identity store's business (XERK-2383).
+// Resolves {gen} only once the bump is DURABLE: the store's usual fire-and-forget
+// write (a 5s debounce on the file backend) would let a crash, or the CLI run
+// right after, silently hand back the token just revoked. On any failure the
+// in-memory bump is rolled back and {status, error} says why.
+// Revokes run one at a time: an overlapping pair would let the first one's
+// rollback restore a generation from before the second one's 200.
+let nameTokenBumpChain = Promise.resolve();
+function bumpNameTokenGen(host, now = Date.now()) {
+  const run = nameTokenBumpChain.then(() => bumpNameTokenGenNow(host, now));
+  nameTokenBumpChain = run.catch(() => {});
+  return run;
+}
+async function bumpNameTokenGenNow(host, now) {
+  const had = Object.prototype.hasOwnProperty.call(nameTokenGens, host);
+  if (!had && Object.keys(nameTokenGens).length >= NAME_TOKEN_GENS_MAX) {
+    return { status: 409, error: "too many hosts have a revoked name token; no room to record another" };
+  }
+  const key = STORE_KEY_PREFIX + "nameTokenGens";
+  const prev = had ? nameTokenGens[host] : null;
+  const gen = nameTokenGen(host) + 1;
+  nameTokenGens[host] = { gen, at: now };
+  const rollback = (why) => {
+    if (prev) nameTokenGens[host] = prev; else delete nameTokenGens[host];
+    // The store may already hold the bumped value (its own snapshot, written on
+    // its next flush or shutdown): put the rolled-back value there too, or a
+    // revoke the operator was told did NOT happen takes effect at the restart.
+    Promise.resolve().then(() => liveStore.set(key, nameTokenGens)).catch((e) =>
+      console.error(`agent token: could not restore the name-token generations in the store: ${e && e.message}`));
+    console.error(`agent token: revoking the name token for ${logName(host)} failed: ${why}`);
+    return { status: 503, error: "the revoke could not be saved, so it was not applied — try again" };
+  };
+  try {
+    await liveStore.set(key, nameTokenGens);
+    if (!HA_ON) {
+      // The file backend debounces; write now and read it back, since its
+      // writer logs a failure rather than throwing.
+      if (liveStore.flush) liveStore.flush();
+      const onDisk = coerceNameTokenGens(readJsonFile(NAME_TOKEN_GENS_FILE));
+      if (!onDisk[host] || onDisk[host].gen !== gen) return rollback(`${NAME_TOKEN_GENS_FILE} was not written`);
+    }
+  } catch (e) {
+    return rollback(e && e.message);
+  }
+  invalidateAgentsCache();
+  return { gen };
 }
 function ticketAgentPin(siteKey, issueKey) {
   const p = ticketAgents[`${siteKey}/${issueKey}`];
@@ -21329,6 +21430,42 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, cmdId });
     }
 
+    // POST /api/agents/<host>/revoke-name-token — retire every name-derived
+    // token minted so far for <host> (XERK-2384). The token is deterministic, so
+    // without this a machine that ever held it (or a backup of its env file)
+    // could get back in, and the only remedy was rotating the master for the
+    // whole fleet. Bumps the host's generation; `--agent-token <host>` then
+    // prints the new token for a re-provision. The host need not be registered:
+    // a stolen machine's card may already be removed. An agent on its identity
+    // token is untouched.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "revoke-name-token" && parts.length === 4) {
+      const key = decodeURIComponent(parts[2]);
+      if (!TURMA_AGENT_TOKEN) {
+        return json(res, 409, {
+          error: "this hub has no fleet master token set (TURMA_AGENT_TOKEN), so there are no name tokens to revoke",
+        });
+      }
+      if (!hostAgentToken(key)) {
+        return json(res, 409, { error: `${key} is not a usable host name, so no name token exists for it` });
+      }
+      const bumped = await bumpNameTokenGen(key);
+      if (bumped.error) return json(res, bumped.status, { error: bumped.error });
+      const gen = bumped.gen;
+      // A tunnel that came up on the revoked token stays open until it drops;
+      // drop it now so its re-dial is checked against the new generation.
+      const a = Object.prototype.hasOwnProperty.call(agents, key) ? agents[key] : null;
+      const ch = controlChannels[key];
+      if (ch && !(a && a.uidBound && a.agentUid)) {
+        // Close frame, then destroy: a half-open peer would otherwise stay
+        // registered (and read terminalOnline) until a ping write fails.
+        try { ch.socket.end(wsEncode(0x8, Buffer.from([0x03, 0xe9]))); } catch { /* gone */ }
+        try { ch.socket.destroy(); } catch { /* gone */ }
+      }
+      console.log(`agent token: revoked the name token for ${logName(key)} (generation ${gen})`);
+      return json(res, 200, { ok: true, generation: gen });
+    }
+
     // GET /api/agent/token — agent self-enroll (XERK-578, design B). An agent
     // authenticated with its CURRENT token asks for its OWN derived token, so a
     // `turma-agentctl enroll` (or an opt-in automatic-on-start) rolls a host off
@@ -24003,6 +24140,10 @@ if (process.env.TURMA_TEST) {
     hostOfUid,
     uidHostRefusal,
     nameTokenRefusal,
+    bumpNameTokenGen,
+    nameTokenGen,
+    coerceNameTokenGens,
+    nameTokenGens: () => nameTokenGens,
     agentIdentities: () => agentIdentities,
     coerceAgentIdentities,
     ttydAuth,
@@ -24375,15 +24516,34 @@ if (process.env.TURMA_TEST) {
     console.error("TURMA_AGENT_TOKEN is not set — there is no master to derive from");
     process.exit(2);
   } else {
-    const token = hostAgentToken(host);
-    if (!token) {
-      // Say WHY. A blank line here sent the operator looking at the master, and
-      // the failure it prevents (a reconnect loop with no mention of the name)
-      // gives them nothing to go on either.
-      console.error(`refusing to mint a token for ${JSON.stringify(host)}: the hub cannot register that host name, so its agent would rename itself and this token would never match`);
+    // The token depends on the host's name-token generation (XERK-2384). With HA
+    // off that is the /data file already loaded above; with HA on it lives in the
+    // shared store, so read it from there — printing the generation-0 token for a
+    // revoked host would hand the operator a dead credential.
+    const loadGens = HA_ON
+      ? Promise.race([
+        Promise.resolve(liveStore.ready && liveStore.ready())
+          .then(() => liveStore.get(STORE_KEY_PREFIX + "nameTokenGens"))
+          .then((raw) => { nameTokenGens = coerceNameTokenGens(raw); }),
+        // NOT unref'd: the store's own timers are, so with nothing else holding
+        // the loop a refused connection would exit 0 with no token and no error.
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timed out")), 10000)),
+      ])
+      : Promise.resolve();
+    loadGens.then(() => {
+      const token = hostAgentToken(host);
+      if (!token) {
+        // Say WHY. A blank line here sent the operator looking at the master, and
+        // the failure it prevents (a reconnect loop with no mention of the name)
+        // gives them nothing to go on either.
+        console.error(`refusing to mint a token for ${JSON.stringify(host)}: the hub cannot register that host name, so its agent would rename itself and this token would never match`);
+        process.exit(2);
+      }
+      process.stdout.write(token + "\n", () => process.exit(0));
+    }, (e) => {
+      console.error(`cannot read the name-token generations from the HA store (${e && e.message}); refusing to print a token that may have been revoked`);
       process.exit(2);
-    }
-    console.log(token);
+    });
   }
 } else {
   if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");

@@ -71,6 +71,10 @@ process.env.AGENT_IDENTITIES_FILE = path.join(
   scratchDir(),
   `turma-test-agent-identities-${process.pid}.json`
 );
+process.env.NAME_TOKEN_GENS_FILE = path.join(
+  scratchDir(),
+  `turma-test-name-token-gens-${process.pid}.json`
+);
 process.env.AUTOSTART_ORGS_FILE = path.join(
   scratchDir(),
   `turma-test-autostart-orgs-${process.pid}.json`
@@ -20208,6 +20212,230 @@ test("XERK-2381: a renamed agent's beat moves its record instead of making a new
   assert.equal(served.formerNames, undefined);
   assert.equal(served.tokenBound, true);
   forget2381("ren2381a", "ren2381b");
+});
+
+// ---- XERK-2384: a host's name-derived token can be revoked ------------------
+
+test("XERK-2384: a revoke retires the host's name token, everywhere it is checked", async () => {
+  const host = "rev2384";
+  const crypto = require("node:crypto");
+  const gen0 = hostAgentToken(host);
+  // Generation 0 is the token every earlier `--agent-token` printed.
+  assert.equal(gen0.split(".")[1],
+    crypto.createHmac("sha256", process.env.TURMA_AGENT_TOKEN).update(host).digest("hex"));
+  assert.equal((await beatAs(host, asAuth(gen0))).status, 200);
+  // Unauthenticated callers cannot revoke.
+  assert.equal((await request("POST", `/api/agents/${host}/revoke-name-token`)).status, 401);
+  const r = await request("POST", `/api/agents/${host}/revoke-name-token`, { headers: userHeaders });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.generation, 1);
+  const gen1 = hostAgentToken(host);
+  assert.notEqual(gen1, gen0);
+  assert.equal(gen1.split(".")[0], gen0.split(".")[0], "the name half is unchanged");
+  // The old token proves nothing: not the beat, not the tunnel, not enroll.
+  assert.equal(tokenHost(gen0), null);
+  assert.notEqual((await beatAs(host, asAuth(gen0))).status, 200);
+  assert.equal(agentWsAuthorized(new URL(`http://x/agent/control?name=${host}&token=${gen0}`), { headers: {} }, host), false);
+  assert.notEqual(resolveEnrollToken({ headers: asAuth(gen0) }, host).status, 200);
+  // The re-provisioned token works.
+  assert.equal(tokenHost(gen1), host);
+  assert.equal((await beatAs(host, asAuth(gen1))).status, 200);
+  assert.equal(agentWsAuthorized(new URL(`http://x/agent/control?name=${host}&token=${gen1}`), { headers: {} }, host), true);
+  // A second revoke retires gen 1 too, and gen 0 stays dead.
+  assert.equal((await request("POST", `/api/agents/${host}/revoke-name-token`, { headers: userHeaders })).body.generation, 2);
+  assert.equal(tokenHost(gen1), null);
+  assert.equal(tokenHost(gen0), null);
+  // Other hosts are untouched.
+  assert.equal(tokenHost(hostAgentToken("other2384")), "other2384");
+  delete hub.nameTokenGens()[host];
+  forget2381(host);
+});
+
+test("XERK-2384: revoking a host's name token leaves its identity token working", async () => {
+  const host = "idrev2384";
+  await beatAs(host, asAuth(hostAgentToken(host)));
+  const tok = enrollUid(host);
+  assert.equal((await beatAs(host, asAuth(tok))).status, 200);
+  assert.equal((await request("POST", `/api/agents/${host}/revoke-name-token`, { headers: userHeaders })).status, 200);
+  assert.equal((await beatAs(host, asAuth(tok))).status, 200);
+  delete hub.nameTokenGens()[host];
+  forget2381(host);
+});
+
+test("XERK-2384: the revoke route refuses a name that has no token", async () => {
+  const r = await request("POST", `/api/agents/${encodeURIComponent("uid:abc")}/revoke-name-token`, { headers: userHeaders });
+  assert.equal(r.status, 409);
+  assert.match(r.body.error, /not a usable host name/);
+  assert.equal(hub.nameTokenGen("uid:abc"), 0);
+});
+
+test("XERK-2384: a revoke is on disk before its 200, and the CLI run right after mints the new token", async () => {
+  const host = "disk2384";
+  const r = await request("POST", `/api/agents/${host}/revoke-name-token`, { headers: userHeaders });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const onDisk = JSON.parse(fs.readFileSync(process.env.NAME_TOKEN_GENS_FILE, "utf8"));
+  assert.equal(onDisk[host].gen, 1, "written now, not on the 5s debounce");
+  const out = require("child_process").execFileSync(process.execPath,
+    [path.join(__dirname, "..", "server.js"), "--agent-token", host],
+    { env: { ...process.env, TURMA_TEST: "", HA_MODE: "0" }, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  assert.equal(out.trim(), hostAgentToken(host));
+  assert.equal(tokenHost(out.trim()), host);
+  delete hub.nameTokenGens()[host];
+});
+
+test("XERK-2384: a revoke the store cannot save is not applied", async () => {
+  const host = "fail2384";
+  const failing = new FileLiveStore();
+  failing.set = async () => { throw new Error("store down"); };
+  hub.__setLiveStore(failing, true);
+  let r;
+  try {
+    r = await hub.bumpNameTokenGen(host);
+  } finally {
+    hub.__setLiveStore(hub.liveStore, false);
+    failing.close();
+  }
+  assert.equal(r.status, 503);
+  assert.equal(hub.nameTokenGen(host), 0, "rolled back");
+});
+
+test("XERK-2384: a revoke whose file write fails silently is 503 and not applied, in memory or in the store", async () => {
+  const host = "silent2384";
+  // A file backend whose flush writes nothing: the read-back must catch it.
+  const store = new FileLiveStore();
+  store.flush = () => {};
+  hub.__setLiveStore(store, false);
+  let r;
+  try {
+    r = await hub.bumpNameTokenGen(host);
+    await new Promise((res) => setImmediate(res));
+    const kept = await store.get("policy:nameTokenGens");
+    assert.equal(kept && kept[host], undefined, "the store's copy is rolled back too");
+  } finally {
+    hub.__setLiveStore(hub.liveStore, false);
+    store.close();
+  }
+  assert.equal(r.status, 503);
+  assert.equal(hub.nameTokenGen(host), 0);
+});
+
+// A minimal RESP server holding one key, for the CLI's HA path.
+function fakeResp(key, value) {
+  const net = require("net");
+  const db = { [key]: value };
+  return net.createServer((s) => {
+    let buf = "";
+    s.on("error", () => {});
+    s.on("data", (d) => {
+      buf += d.toString();
+      for (;;) {
+        if (buf[0] !== "*") { buf = ""; return; }
+        const lines = buf.split("\r\n");
+        const n = +lines[0].slice(1);
+        if (lines.length < 1 + 2 * n + 1) return;
+        const args = [];
+        for (let i = 0; i < n; i++) args.push(lines[2 + 2 * i]);
+        buf = lines.slice(1 + 2 * n).join("\r\n");
+        const c = args[0].toUpperCase();
+        if (c === "GET") { const v = db[args[1]]; s.write(v == null ? "$-1\r\n" : `$${Buffer.byteLength(v)}\r\n${v}\r\n`); }
+        else if (c === "PING") s.write("+PONG\r\n");
+        else if (c === "SUBSCRIBE" || c === "PSUBSCRIBE") for (const ch of args.slice(1)) s.write(`*3\r\n$9\r\nsubscribe\r\n$${ch.length}\r\n${ch}\r\n:1\r\n`);
+        else s.write("+OK\r\n");
+      }
+    });
+  });
+}
+
+test("XERK-2384: under HA the CLI reads the generation from the shared store, and stdout is the token alone", async () => {
+  const host = "hacli2384";
+  const srv = fakeResp("policy:nameTokenGens", JSON.stringify({ [host]: { gen: 2, at: 1 } }));
+  await new Promise((res) => srv.listen(0, "127.0.0.1", res));
+  // A ledger file present, so module init has a log line to (mis)print.
+  const ledger = path.join(scratchDir(), `turma-test-cli-ledger-${process.pid}.json`);
+  fs.writeFileSync(ledger, JSON.stringify({ [host]: { device: host, days: {}, totals: {} } }));
+  try {
+    const { execFile } = require("child_process");
+    const run = (env) => new Promise((res) => execFile(process.execPath,
+      [path.join(__dirname, "..", "server.js"), "--agent-token", host],
+      { env: { ...process.env, TURMA_TEST: "", USAGE_LEDGER_FILE: ledger, ...env }, encoding: "utf8", timeout: 20000 },
+      (err, stdout) => res({ code: err ? err.code : 0, stdout })));
+    const ha = await run({
+      HA_MODE: "1", TURMA_STORE_URL: `redis://127.0.0.1:${srv.address().port}`,
+      DATABASE_URL: "postgres://u:p@127.0.0.1:1/db", ARCHIVE_S3_BUCKET: "b",
+      ARCHIVE_S3_ENDPOINT: "http://127.0.0.1:1", ARCHIVE_S3_ACCESS_KEY: "a", ARCHIVE_S3_SECRET_KEY: "s",
+    });
+    assert.equal(ha.code, 0);
+    hub.nameTokenGens()[host] = { gen: 2, at: 1 };
+    assert.equal(ha.stdout, hostAgentToken(host) + "\n", "the gen-2 token, nothing else on stdout");
+    delete hub.nameTokenGens()[host];
+    const plain = await run({ HA_MODE: "0" });
+    assert.equal(plain.stdout, hostAgentToken(host) + "\n");
+  } finally {
+    srv.close();
+    fs.rmSync(ledger, { force: true });
+  }
+});
+
+test("XERK-2384: overlapping revokes of one host each land, one generation apiece", async () => {
+  const host = "conc2384";
+  const results = await Promise.all([1, 2, 3].map(() => hub.bumpNameTokenGen(host)));
+  assert.deepEqual(results.map((r) => r.gen), [1, 2, 3]);
+  assert.equal(hub.nameTokenGen(host), 3);
+  assert.equal(JSON.parse(fs.readFileSync(process.env.NAME_TOKEN_GENS_FILE, "utf8"))[host].gen, 3);
+  delete hub.nameTokenGens()[host];
+});
+
+test("XERK-2384: no host's name token is a generation key", async () => {
+  // A host NAMED like a generation label: its gen-0 MAC must not key anyone's gen 1.
+  const evil = "name-token-gen:1";
+  const k1 = Buffer.from(hostAgentToken(evil).split(".")[1], "hex");
+  const victim = "victim2384";
+  assert.equal((await request("POST", `/api/agents/${victim}/revoke-name-token`, { headers: userHeaders })).status, 200);
+  const forged = Buffer.from(victim).toString("base64url") + "." +
+    require("node:crypto").createHmac("sha256", k1).update(victim).digest("hex");
+  assert.equal(tokenHost(forged), null);
+  assert.notEqual(forged, hostAgentToken(victim));
+  delete hub.nameTokenGens()[victim];
+});
+
+test("XERK-2384: a revoke drops a name-token tunnel at once, but not an identity tunnel", async () => {
+  const mk = () => { const s = { ended: false, destroyed: false }; s.end = () => { s.ended = true; }; s.destroy = () => { s.destroyed = true; }; return s; };
+  const name = "tun2384";
+  const sock = mk();
+  hub.controlChannels[name] = { socket: sock };
+  try {
+    assert.equal((await request("POST", `/api/agents/${name}/revoke-name-token`, { headers: userHeaders })).status, 200);
+    assert.ok(sock.ended && sock.destroyed);
+  } finally {
+    delete hub.controlChannels[name];
+    delete hub.nameTokenGens()[name];
+  }
+  const idHost = "tunid2384";
+  await beatAs(idHost, asAuth(hostAgentToken(idHost)));
+  const tok = enrollUid(idHost);
+  await beatAs(idHost, asAuth(tok));
+  const idSock = mk();
+  hub.controlChannels[idHost] = { socket: idSock };
+  try {
+    assert.equal((await request("POST", `/api/agents/${idHost}/revoke-name-token`, { headers: userHeaders })).status, 200);
+    assert.equal(idSock.destroyed, false);
+  } finally {
+    delete hub.controlChannels[idHost];
+    delete hub.nameTokenGens()[idHost];
+    forget2381(idHost);
+  }
+});
+
+test("XERK-2384: a malformed generations file reads as generation 0, never a guess", () => {
+  const out = hub.coerceNameTokenGens({
+    good: { gen: 3, at: 5 }, zero: { gen: 0 }, neg: { gen: -1 }, str: { gen: "2" },
+    frac: { gen: 1.5 }, nul: null, noAt: { gen: 1 },
+  });
+  assert.deepEqual(Object.keys(out).sort(), ["good", "noAt"]);
+  assert.deepEqual(out.good, { gen: 3, at: 5 });
+  assert.deepEqual(out.noAt, { gen: 1, at: 0 });
+  assert.deepEqual(Object.keys(hub.coerceNameTokenGens([1, 2])), []);
+  assert.equal(Object.getPrototypeOf(hub.coerceNameTokenGens({})), null);
 });
 
 test("XERK-2381: an identity cannot take a name anyone else holds or held", async () => {
