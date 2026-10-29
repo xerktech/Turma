@@ -628,7 +628,7 @@ test("XERK-2396: Save and Run now render aria-disabled, never disabled, and thei
   assert.doesNotMatch(P.list(), / disabled[ >]/);
   // An org whose run is already running: Run now sends nothing.
   d.dailyBriefs = { [SITE]: [running, okBrief()] };
-  await P.runNow(SITE);
+  P.runNow(SITE); // not awaited: a broken guard's request never answers, and must fail, not hang
   assert.equal(P.fetches.filter((f) => f.method === "POST").length, 0);
   for (const r of releases) r({ ok: true, schedule: null, next: null });
 });
