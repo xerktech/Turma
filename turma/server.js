@@ -1305,11 +1305,13 @@ function uidHostRefusal(uid, host, now = Date.now()) {
       : null;
   }
   if (rec && !rec.agentUid) return `${host} is registered to another agent — remove it from the dashboard to release the name`;
-  if (rec) return null; // a stale copy of this agent's own record (an HA ghost)
   // A released identity (its host was removed) may only come home: once a
   // reinstall has taken that name it can go nowhere, so Remove host + reinstall
   // is how an operator retires a decommissioned or stolen machine's token.
+  // Checked before the ghost branch, or a stale HA copy of its record would
+  // be a way out.
   if (e.released) return `${e.home} was removed from the dashboard — this agent may only return as ${e.home}`;
+  if (rec) return null; // a stale copy of this agent's own record (an HA ghost)
   const mine = new Set([e.origin, e.home, ...(Array.isArray(e.names) ? e.names : [])]
     .filter(Boolean).map(lowerName));
   const want = lowerName(host);

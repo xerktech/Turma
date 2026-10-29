@@ -27493,3 +27493,13 @@ test("XERK-2381: an identity this hub does not know is told to re-provision, nev
   assert.equal(r.status, 403);
   assert.match(r.body.error, /re-provision/);
 });
+
+test("XERK-2381: a released identity cannot escape through a stale HA copy of its record", () => {
+  const tok = enrollUid("ghost2381");
+  const uid = tokenUid(tok);
+  hub.agentIdentities()[uid].released = true;
+  agents.ghost2381b = { agentUid: uid, lastSeen: 0 };
+  assert.ok(uidHostRefusal(uid, "ghost2381b"));
+  assert.equal(uidHostRefusal(uid, "ghost2381"), null, "home stays open");
+  forget2381("ghost2381", "ghost2381b");
+});
