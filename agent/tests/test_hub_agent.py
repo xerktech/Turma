@@ -54702,6 +54702,82 @@ class TestDailyBrief(unittest.TestCase):
         self.assertEqual(ha.daily_brief_projects(board), ["A", "B"])
         self.assertEqual(ha.daily_brief_projects(None), [])
 
+    def test_emails_and_url_forms_never_reach_the_model(self):
+        closed = [_brief_issue(
+            "XERK-1", "done", "2026-10-28T12:00:00.000+0000", assignee="bob@corp.com",
+            summary="mail bob@corp.com; see foohttps://evil.x/y file:///etc/x "
+                    "git@github.com:org/repo mailto:a@b.co h\u200bttps://z.io/q")]
+        out, _ = self._run(closed=closed)
+        text = json.dumps(out, ensure_ascii=False)
+        for leak in ("bob@corp.com", "evil.x", "/etc/x", "github.com", "a@b.co", "z.io"):
+            self.assertNotIn(leak, text)
+        self.assertEqual(out["closed"][0]["assignee"], "[email]")
+
+    def test_timestamps_with_any_fraction_length(self):
+        for raw in ("2026-10-28T12:00:00.5Z", "2026-10-28T12:00:00.78Z",
+                    "2026-10-28T12:00:00.1234567Z", "2026-10-28T12:00:00.000+0000"):
+            self.assertEqual(ha._brief_ts(raw).replace(microsecond=0),
+                             datetime.datetime(2026, 10, 28, 12, tzinfo=self.UTC), raw)
+
+    def test_only_in_window_closed_work_seeds_the_next_up_lookup(self):
+        # The query is widened a day; a ticket closed in that extra day must not
+        # name parents or unblock anything.
+        closed = [_brief_issue("XERK-1", "done", "2026-10-21T12:00:00.000+0000",
+                               parent="XERK-100", blocks=["XERK-50"])]
+        out, jqls = self._run(closed=closed)
+        self.assertEqual(out["closed"], [])
+        self.assertEqual(len(jqls), 2)        # no To Do query at all
+
+    def test_unsafe_related_keys_never_reach_the_jql(self):
+        closed = [_brief_issue("XERK-1", "done", "2026-10-28T12:00:00.000+0000",
+                               blocks=["XERK-2) OR (1=1", "XERK-3"],
+                               parent="XERK-9 OR 1=1")]
+        _, jqls = self._run(closed=closed)
+        todo_jql = jqls[-1][0]
+        self.assertIn("key in (XERK-3)", todo_jql)
+        self.assertNotIn("1=1", todo_jql)
+        self.assertNotIn("parent in", todo_jql)
+
+    def test_heartbeat_tickets_carry_no_raw_fields(self):
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "jira_get", lambda p, q: _jira_page(["A-1"])):
+            tickets, _ = ha.fetch_jira_issues("jql", 10)
+        self.assertNotIn("_fields", tickets[0])
+        with mock.patch.object(ha, "_azure_batch_get", lambda ids, f: [_azure_wi(1, "New")]), \
+             mock.patch.object(ha, "_azure_parent_types", lambda *a, **k: {}), \
+             mock.patch.object(ha, "_azure_note_portfolio", lambda *a: None), \
+             mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", lambda *a, **k: {"value": []}):
+            items = ha.fetch_azure_items([1], "dev.azure.com/o", "https://dev.azure.com/o")
+        self.assertNotIn("_fields", items[0])
+
+    def test_scope_is_bounded_by_the_char_cap(self):
+        def req(path, params, body=None):
+            if path == "/_apis/wit/wiql":
+                return {"workItems": []}
+            raise AssertionError(path)
+        names = ["O'Brien) OR ([System.Id] > 0"] + ["p" * 60] * 30
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/MyOrg", AZDO_TOKEN="pat",
+                                 AZDO_PROJECT="", DAILY_BRIEF_WIQL_SCOPE="", azure_req=req), \
+             mock.patch.object(ha, "DAILY_BRIEF_MAX_CHARS", 500):
+            out = ha.collect_daily_brief_data(self.DAY, self.WEEK, self.UNTIL, names)
+        self.assertLessEqual(len(json.dumps(out, ensure_ascii=False)), 500)
+        self.assertEqual(out["scope"], "trimmed")
+
+    def test_wiql_quotes_project_names(self):
+        wiqls = []
+
+        def req(path, params, body=None):
+            wiqls.append(body["query"])
+            return {"workItems": []}
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/MyOrg", AZDO_TOKEN="pat",
+                                 AZDO_PROJECT="", DAILY_BRIEF_WIQL_SCOPE="", azure_req=req):
+            ha.collect_daily_brief_data(self.DAY, self.WEEK, self.UNTIL,
+                                        ["O'Brien) OR ([System.Id] > 0"])
+        self.assertTrue(wiqls)
+        for q in wiqls:
+            self.assertIn("[System.TeamProject] IN ('O''Brien) OR ([System.Id] > 0')", q)
+
     def test_azure_parity(self):
         items = {
             1: _azure_wi(1, "Closed", title="Ship it", **{

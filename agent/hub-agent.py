@@ -24184,7 +24184,11 @@ DAILY_BRIEF_RELATED_MAX = 50      # parent / unblocked keys named in one clause
 DAILY_BRIEF_TEXT_MAX = 160        # chars per summary / name
 DAILY_BRIEF_MAX_CHARS = 24000     # the whole JSON the model receives
 _DAILY_BRIEF_PROJECT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
-_DAILY_BRIEF_URL_RE = re.compile(r"(?i)\b(?:https?|ftp)://\S+|\bwww\.\S+")
+# Any scheme://, mailto:/file:, scp-style git@host:path, www.* — and emails.
+_DAILY_BRIEF_URL_RE = re.compile(
+    r"(?i)[a-z][a-z0-9+.-]*://\S*|\b(?:mailto|file):\S+|\b[\w.-]+@[\w-]+(?:\.[\w-]+)*:\S+"
+    r"|\bwww\.\S+")
+_DAILY_BRIEF_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _DAILY_BRIEF_JIRA_EXTRA = ("assignee", "statuscategorychangedate")
 _DAILY_BRIEF_AZDO_EXTRA = ("System.AssignedTo", "Microsoft.VSTS.Common.StateChangeDate")
 # Lower = more urgent. Jira's stock names, then common synonyms; ADO's P1..P4
@@ -24198,7 +24202,10 @@ def _brief_text(v):
     """One line, URLs dropped, capped — this text goes to a model."""
     if not isinstance(v, str):
         return None
+    # Zero-width/format chars could split a URL past the regex: drop them first.
+    v = "".join(ch for ch in v if unicodedata.category(ch) != "Cf")
     v = _DAILY_BRIEF_URL_RE.sub("[link]", " ".join(v.split()))
+    v = _DAILY_BRIEF_EMAIL_RE.sub("[email]", v)
     return v[:DAILY_BRIEF_TEXT_MAX] or None
 
 
@@ -24207,7 +24214,8 @@ def _brief_ts(v):
     if not isinstance(v, str) or not v:
         return None
     v = v.strip().replace("Z", "+00:00")
-    v = re.sub(r"(\.\d{6})\d+", r"\1", v)    # ADO writes 7 fractional digits
+    # Python < 3.11 parses only 3 or 6 fraction digits; ADO writes 1 to 7.
+    v = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], v, count=1)
     m = re.match(r"^(.*[T ]\d\d:\d\d(?::\d\d(?:\.\d+)?)?)([+-]\d\d):?(\d\d)$", v)
     if m:
         v = f"{m.group(1)}{m.group(2)}:{m.group(3)}"
@@ -24216,6 +24224,17 @@ def _brief_ts(v):
     except ValueError:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+
+
+def _brief_in_window(closed, week_from, until):
+    """Keys of the fetched closed tickets that really resolved in the window —
+    the queries are widened a day, so the next-up lookup must not key on the rest."""
+    out = set()
+    for t in closed:
+        when = _brief_ts(t.get("resolved"))
+        if when is not None and week_from <= when < until:
+            out.add(t.get("key"))
+    return out
 
 
 def _brief_priority_rank(name):
@@ -24331,7 +24350,7 @@ def _brief_assemble(source, site_key, scope, day_from, week_from, until,
         "siteKey": site_key,
         "window": {"dayFrom": day_from.isoformat(), "weekFrom": week_from.isoformat(),
                    "until": until.isoformat()},
-        "scope": scope,
+        "scope": scope if isinstance(scope, str) else [_brief_text(n) for n in scope],
         "closed": closed,
         "open": open_rows,
         "next": next_rows,
@@ -24343,7 +24362,10 @@ def _brief_assemble(source, site_key, scope, day_from, week_from, until,
         lists = [out["closed"], out["open"], out["next"]]
         biggest = max(lists, key=len)
         if not biggest:
-            break
+            if out["scope"] == "trimmed":
+                break
+            out["scope"] = "trimmed"     # the scope names alone overflow the cap
+            continue
         biggest.pop()
         out["truncated"] = True
     return out
@@ -24365,7 +24387,8 @@ def _collect_daily_brief_jira(day_from, week_from, until, projects):
     if DAILY_BRIEF_JQL_SCOPE:
         scope_jql, scope = f"({DAILY_BRIEF_JQL_SCOPE})", "custom"
     else:
-        keys = [p for p in projects or [] if _DAILY_BRIEF_PROJECT_RE.match(p)]
+        keys = [p for p in projects or [] if isinstance(p, str)
+                and _DAILY_BRIEF_PROJECT_RE.match(p) and p.upper() not in ("AND", "OR", "NOT")]
         keys = keys[:DAILY_BRIEF_PROJECTS_MAX]
         if not keys:
             return None
@@ -24380,11 +24403,12 @@ def _collect_daily_brief_jira(day_from, week_from, until, projects):
     open_, t2 = fetch_jira_issues(
         f'{scope_jql} AND statusCategory = "In Progress" ORDER BY updated DESC',
         DAILY_BRIEF_FETCH_MAX, extra)
-    closed_keys = {t["key"] for t in closed}
+    closed_keys = _brief_in_window(closed, week_from, until)
     parents = sorted({t["parentKey"] for t in closed + open_
                       if t.get("parentKey") and (t["key"] in closed_keys
                                                  or t.get("statusCategory") == "inprogress")})
-    unblocks = sorted({k for t in closed for k in t.get("blocks") or []})
+    unblocks = sorted({k for t in closed if t["key"] in closed_keys
+                       for k in t.get("blocks") or []})
     parents = [k for k in parents if JIRA_KEY_RE.match(k)][:DAILY_BRIEF_RELATED_MAX]
     unblocks = [k for k in unblocks if JIRA_KEY_RE.match(k)][:DAILY_BRIEF_RELATED_MAX]
     todo, t3 = [], False
@@ -24418,7 +24442,7 @@ def _collect_daily_brief_azure(day_from, week_from, until, projects):
         scope_w, scope = f"({DAILY_BRIEF_WIQL_SCOPE})", "custom"
     else:
         names = [AZDO_PROJECT] if AZDO_PROJECT else [
-            p for p in projects or [] if isinstance(p, str) and p]
+            p for p in projects or [] if isinstance(p, str) and 0 < len(p) <= 64]
         names = names[:DAILY_BRIEF_PROJECTS_MAX]
         if not names:
             return None
@@ -24435,7 +24459,7 @@ def _collect_daily_brief_azure(day_from, week_from, until, projects):
     ids, t2 = _brief_azure_ids([scope_w, "[System.State] NOT IN ('Closed', 'Done', "
                                          "'Removed', 'New', 'To Do', 'Proposed')"])
     open_ = fetch_azure_items(ids, site_key, base, extra) if ids else []
-    closed_keys = {t["key"] for t in closed}
+    closed_keys = _brief_in_window(closed, week_from, until)
     parents = sorted({t["parentKey"] for t in closed + open_
                       if t.get("parentKey") and AZDO_KEY_RE.match(t["parentKey"])
                       and (t["key"] in closed_keys or t.get("statusCategory") == "inprogress")})
