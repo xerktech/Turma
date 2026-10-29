@@ -77,6 +77,12 @@ class BriefScreenTest {
         compose.onNodeWithText("Two tickets shipped.").assertExists()
     }
 
+    @Test fun `a Run now brief is headed with when it ran`() {
+        body(listOf(DailyBrief(runId = "m", status = "ok", trigger = "manual", meetingAt = at(30, 9, 30),
+            startedAt = at(29, 7, 15), day = "Ran early.")))
+        compose.onNodeWithText("Run now · Today 7:15 AM").assertExists()
+    }
+
     @Test fun `an org with no brief says so`() {
         body(emptyList())
         compose.onNodeWithText("No brief yet. Run now writes one.").assertExists()

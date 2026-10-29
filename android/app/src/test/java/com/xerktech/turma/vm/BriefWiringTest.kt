@@ -74,4 +74,19 @@ class BriefWiringTest {
         kotlinx.coroutines.runBlocking { first.join() }
         assertEquals(1, hits.get())
     }
+
+    @Test fun `a cancelled Run now clears its in-flight mark`() {
+        val release = CountDownLatch(1)
+        hub.route("/api/orgs/") {
+            release.await(10, TimeUnit.SECONDS)
+            MockResponse().setResponseCode(200).setBody("""{"ok":true}""")
+        }
+        val vm = main.track(BriefViewModel(hub.app))
+        val job = vm.runNow("o")
+        hub.awaitFlow(vm.asking) { "o" in it }
+        job.cancel()
+        hub.awaitFlow(vm.asking) { "o" !in it }
+        release.countDown()
+        kotlinx.coroutines.runBlocking { job.join() }
+    }
 }
