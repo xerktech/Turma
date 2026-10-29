@@ -54914,6 +54914,50 @@ class TestDailyBriefPrompt(unittest.TestCase):
         for raw in (None, "", "no json", "{not json", "[1, 2]"):
             self.assertIsNone(ha.parse_daily_brief(raw, self.DATA))
 
+    def test_the_collector_cap_is_not_shadowed_by_the_reply_cap(self):
+        # One module global: the reply backstop once redefined the collector's
+        # 160-char summary cap to 1200 (QA, XERK-2393).
+        self.assertEqual(ha.DAILY_BRIEF_TEXT_MAX, 160)
+        self.assertEqual(len(ha._brief_text("word " * 400)), 160)
+
+    def test_every_markdown_shape_is_refused(self):
+        for text in ("# Heading", "#Heading", "## Two", "1. first", "2) second", "- dash",
+                     "* star", "• dot", "– en dash", "· middot", "> quote", "| a | b |",
+                     "A *single* word.", "A _single_ word.", "A **bold** word.",
+                     "A __bold__ word.", "A ~~struck~~ word.", "Run `make`.",
+                     "See [the doc](x).", "A <b>tag</b>."):
+            with self.subTest(text):
+                self.assertTrue(ha.daily_brief_problems(self._brief(thisWeek=text), self.DATA))
+        for text in ("PR #12 merged.", "Fixed snake_case_name.", "Two * three is six.",
+                     "Done - mostly."):
+            with self.subTest(text):
+                self.assertEqual(ha.daily_brief_problems(self._brief(thisWeek=text),
+                                                         self.DATA), [])
+
+    def test_an_invented_key_cannot_hide_behind_case_width_or_dash(self):
+        for text in ("xerk-77 shipped.", "\uff38\uff25\uff32\uff2b-77 shipped.",
+                     "XERK\u201177 shipped.", "OTHER-5 shipped."):
+            with self.subTest(text):
+                self.assertTrue(ha.daily_brief_problems(self._brief(thisWeek=text), self.DATA))
+        for text in ("xerk-1 closed.", "Covid-19 slowed us.", "A top-10 week."):
+            with self.subTest(text):
+                self.assertEqual(ha.daily_brief_problems(self._brief(thisWeek=text),
+                                                         self.DATA), [])
+
+    def test_the_day_budget_counts_every_day_section(self):
+        third = "word " * 51
+        b = self._brief(sinceYesterday=third, stillOpen=third,
+                        upNext=[{"key": "XERK-5", "text": third}, {"key": "XERK-6", "text": "x"}])
+        self.assertTrue(any("day sections" in p for p in ha.daily_brief_problems(b, self.DATA)))
+        b = self._brief(sinceYesterday=third, stillOpen=third)
+        self.assertEqual(ha.daily_brief_problems(b, self.DATA), [])
+
+    def test_control_characters_and_the_length_backstop_are_refused(self):
+        for text in ("a\x00b", "a\ud800b", "x" * (ha.DAILY_BRIEF_REPLY_TEXT_MAX + 1)):
+            with self.subTest(repr(text[:8])):
+                self.assertTrue(ha.daily_brief_problems(self._brief(thisWeek=text), self.DATA))
+        self.assertEqual(ha.daily_brief_problems(self._brief(thisWeek="a\tb"), self.DATA), [])
+
     def test_keys_from_the_data_and_hashes_are_allowed(self):
         b = self._brief(sinceYesterday="XERK-1 and XERK-2 closed, see PR #12.",
                         stillOpen="XERK-4 runs; XERK-3 waits on XERK-9.")

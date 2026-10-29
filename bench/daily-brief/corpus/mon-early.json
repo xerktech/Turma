@@ -15,7 +15,7 @@
   "closed": [
    {
     "key": "ACME-990",
-    "summary": "Stock debouncer confirms any non-zero stock misread immediately: phantom KOs / stock gains from one-frame reader errors (242 wrong confirmed changes over 3.2k WSL frames)",
+    "summary": "Stock debouncer confirms any non-zero stock misread immediately: phantom KOs / stock gains from one-frame reader errors (242 wrong confirmed changes over 3.2k W",
     "type": "Bug",
     "assignee": "Blake Okafor",
     "epic": "Robo backlog: platform security/ops, perception reliability, navigator robustness",
@@ -151,7 +151,7 @@
    },
    {
     "key": "ACME-1094",
-    "summary": "Ryujinx crashes mid-session on the pod: PtcProfiler.PreSave IOException (PTC .info file 'used by another process'); env-server reports it as 'not ready within 120s'",
+    "summary": "Ryujinx crashes mid-session on the pod: PtcProfiler.PreSave IOException (PTC .info file 'used by another process'); env-server reports it as 'not ready within 1",
     "type": "Bug",
     "assignee": "Blake Okafor",
     "epic": null,
@@ -183,7 +183,7 @@
    },
    {
     "key": "ACME-1119",
-    "summary": "Ryujinx fork CI can't restore when git.ryujinx.app is down: Ryujinx.LibHac 0.21.0-alpha.133 only exists on that feed and the NuGet cache is evicted after 7 idle days",
+    "summary": "Ryujinx fork CI can't restore when git.ryujinx.app is down: Ryujinx.LibHac 0.21.0-alpha.133 only exists on that feed and the NuGet cache is evicted after 7 idle",
     "type": "Bug",
     "assignee": "Blake Okafor",
     "epic": null,
@@ -359,7 +359,7 @@
    },
    {
     "key": "ACME-1012",
-    "summary": "[emu 7e] `emu ram-labels` (Windows-only, track FROZEN): fold capture_ram_labels + discover_situation_offset + situation_discovery_acceptance onto EmulatorSession",
+    "summary": "[emu 7e] `emu ram-labels` (Windows-only, track FROZEN): fold capture_ram_labels + discover_situation_offset + situation_discovery_acceptance onto EmulatorSessio",
     "type": "Task",
     "assignee": "Emery Sato",
     "epic": "Consolidate emulator session automation into one cross-platform `emu` CLI + `ai/session` library",
@@ -496,6 +496,28 @@
   ],
   "open": [
    {
+    "key": "ACME-2399",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2365",
+    "summary": "Beacon: controller play in Battle.net games (WoW gamepad mode)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2363"
+    ]
+   },
+   {
     "key": "ACME-2386",
     "summary": "Retire the org brief; move decisions, permissions and model quality to a web-only Insights page",
     "type": "Task",
@@ -528,16 +550,6 @@
     "blockedBy": []
    },
    {
-    "key": "ACME-2399",
-    "summary": "[Rollup] Turma: low-severity findings",
-    "type": "Task",
-    "assignee": "Devon Rivera",
-    "epic": null,
-    "status": "In Progress",
-    "daysInStatus": null,
-    "blockedBy": []
-   },
-   {
     "key": "ACME-2354",
     "summary": "Atlas-nexus: ship the launch-view cleanup to gamehost (upstream PR or fork backend path)",
     "type": "Task",
@@ -546,18 +558,6 @@
     "status": "In Review",
     "daysInStatus": null,
     "blockedBy": []
-   },
-   {
-    "key": "ACME-2365",
-    "summary": "Beacon: controller play in Battle.net games (WoW gamepad mode)",
-    "type": "Task",
-    "assignee": "Blake Okafor",
-    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
-    "status": "In Review",
-    "daysInStatus": null,
-    "blockedBy": [
-     "ACME-2363"
-    ]
    },
    {
     "key": "ACME-2371",

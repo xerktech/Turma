@@ -8,7 +8,7 @@ Status: accepted (evaluation 2026-10-29). The operative rules are in
 1. **Default model: Haiku** (`DAILY_BRIEF_MODEL`, env `TURMA_DAILY_BRIEF_MODEL`). On 13 real-board
    cases, two runs each, Haiku matched or beat Sonnet on every rubric dimension at 1/13 the cost.
 2. **"auto" does NOT escalate to Sonnet on large inputs.** On the 40+-tickets-since-yesterday
-   cases Haiku still won the head-to-head (5 wins, 3 losses, 4 ties). Sonnet bought only latency,
+   cases Haiku still won the head-to-head (8 wins, 4 losses). Sonnet bought only latency,
    which a brief written 5 minutes before the meeting does not need.
 3. **The model is given counts and never counts.** `daily_brief_input` adds a `counts` block
    computed from the collector JSON. In a first dev run without it, both models misstated a
@@ -32,10 +32,10 @@ the first draft's day sections ran 227 words against a 120 budget.
 
 ## Corpus
 
-13 cases in `bench/daily-brief/corpus/`, from real snapshots of the XerkTech Jira board taken
+13 cases in `bench/daily-brief/corpus/`, from real snapshots of the operator's own Jira board taken
 through the XERK-2392 collector at 13:00 UTC on nine dates. A Monday's "day" window covers the
 weekend (72 h). People are pseudonymised by ticket key; the site, project key and internal
-host/project codenames are replaced through a private term map kept out of the repo.
+host/project codenames are replaced through a private term map kept out of the repo, and IP addresses are masked.
 
 - Real: thu-typical, mon-after-weekend (60 closed since the last meeting), tue, wed, thu, fri,
   mon-early, sat-weekend-work, smaller-week (36 closed, not truncated).
@@ -56,31 +56,36 @@ host/project codenames are replaced through a private term map kept out of the r
   accuracy (nothing invented or unsupported; counts right), coverage, read-aloud quality and
   next-candidate sense.
 
-## Results (final prompt, `bench/daily-brief/results/2026-10-29-*`)
+## Results (final prompt and corpus, `bench/daily-brief/results/2026-10-29-*`)
 
 | | Haiku | Sonnet |
 |---|---|---|
 | passes the parser | 26/26 | 26/26 |
-| cost per brief (median / max) | $0.0060 / $0.0074 | $0.078 / $0.093 |
-| latency (median / max) | 17.1 s / 25.9 s | 5.0 s / 11.9 s |
-| day words (median / max) | 94 / 130 | 91 / 109 |
-| week words (median / max) | 29 / 45 | 28.5 / 36 |
-| judge: accuracy | 4.50 | 4.27 |
-| judge: coverage | 3.92 | 3.77 |
-| judge: read-aloud | 4.19 | 4.27 |
-| judge: up next | 4.08 | 3.96 |
-| head to head, all (wins) | 13 | 8 (5 ties) |
-| head to head, 40+ since yesterday | 5 | 3 (4 ties) |
+| cost per brief (median / max) | $0.0062 / $0.0077 | $0.079 / $0.089 |
+| latency (median / max) | 18.4 s / 27.2 s | 5.2 s / 13.5 s |
+| day words (median / max) | 91.5 / 108 | 94 / 107 |
+| week words (median / max) | 28 / 47 | 29 / 34 |
+| judge: accuracy | 4.54 | 4.35 |
+| judge: coverage | 4.08 | 3.88 |
+| judge: read-aloud | 4.42 | 3.96 |
+| judge: up next | 4.19 | 3.85 |
+| head to head, all (wins) | 19 | 5 (2 ties) |
+| head to head, 40+ since yesterday | 8 | 4 (0 ties) |
 
-- Haiku's latency comes from thinking: about 4.3k output tokens a brief, against Sonnet's ~370.
+- Haiku's latency comes from thinking: about 4.6k output tokens a brief, against Sonnet's ~370.
   It is still 13x cheaper.
 - Neither model followed an injected instruction, repeated a fake key, or switched to French or
   markdown in any run.
-- Each model had one accuracy-2 script, of 26: a misattributed "who closed the most" (Haiku), and
-  an invented gate description (Sonnet). The judge's most common complaint against both was
-  coverage: in-review work and a hardware freeze left out of a 35-word `stillOpen`.
-- An earlier full run, before "at least" replaced "at least or more than", gave the same verdict:
-  Haiku 16 wins, Sonnet 6, 4 ties.
+- Accuracy-2 scripts:
+  - Haiku, one of 26: it inverted a dependency, saying a gate blocks six tickets when six
+    block it.
+  - Sonnet, two of 26: per-person tallies on smaller-week that did not add up.
+- The judge's most common complaint against both was coverage: in-review work left out of a
+  35-word `stillOpen`.
+- Two earlier full runs gave the same verdict: Haiku 16 wins to Sonnet's 6, then 13 to 8.
+  - The second followed the "at least" wording fix.
+  - The corpus for both was snapshotted while a constant clash let summaries reach 1200 chars
+    instead of the collector's 160 (caught by QA).
 
 ## Follow-ups
 

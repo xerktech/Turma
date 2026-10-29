@@ -496,6 +496,28 @@
   ],
   "open": [
    {
+    "key": "ACME-2399",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2365",
+    "summary": "Beacon: controller play in Battle.net games (WoW gamepad mode)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "status": "In Progress",
+    "daysInStatus": 0,
+    "blockedBy": [
+     "ACME-2363"
+    ]
+   },
+   {
     "key": "ACME-2386",
     "summary": "Retire the org brief; move decisions, permissions and model quality to a web-only Insights page",
     "type": "Task",
@@ -528,16 +550,6 @@
     "blockedBy": []
    },
    {
-    "key": "ACME-2399",
-    "summary": "[Rollup] Turma: low-severity findings",
-    "type": "Task",
-    "assignee": "Devon Rivera",
-    "epic": null,
-    "status": "In Progress",
-    "daysInStatus": null,
-    "blockedBy": []
-   },
-   {
     "key": "ACME-2354",
     "summary": "Atlas-nexus: ship the launch-view cleanup to gamehost (upstream PR or fork backend path)",
     "type": "Task",
@@ -546,18 +558,6 @@
     "status": "In Review",
     "daysInStatus": 1,
     "blockedBy": []
-   },
-   {
-    "key": "ACME-2365",
-    "summary": "Beacon: controller play in Battle.net games (WoW gamepad mode)",
-    "type": "Task",
-    "assignee": "Blake Okafor",
-    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
-    "status": "In Review",
-    "daysInStatus": 0,
-    "blockedBy": [
-     "ACME-2363"
-    ]
    },
    {
     "key": "ACME-2371",

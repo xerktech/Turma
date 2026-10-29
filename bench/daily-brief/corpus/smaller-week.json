@@ -103,7 +103,7 @@
    },
    {
     "key": "ACME-362",
-    "summary": "DNS deletes never replicate DC02 to DC01, and 10.10.10.1 forwards to both, so deleted records keep serving",
+    "summary": "DNS deletes never replicate DC02 to DC01, and [ip] forwards to both, so deleted records keep serving",
     "type": "Bug",
     "assignee": "Blake Okafor",
     "epic": null,
@@ -127,7 +127,7 @@
    },
    {
     "key": "ACME-366",
-    "summary": "Backups node 10.10.10.21 has been down for days and nothing alerted",
+    "summary": "Backups node [ip] has been down for days and nothing alerted",
     "type": "Task",
     "assignee": "Devon Rivera",
     "epic": null,
@@ -151,7 +151,7 @@
    },
    {
     "key": "ACME-353",
-    "summary": "10.10.10.1 returns a wrong 104.21.x address for newly-published cluster ingress names instead of forwarding to AD",
+    "summary": "[ip] returns a wrong 104.21.x address for newly-published cluster ingress names instead of forwarding to AD",
     "type": "Bug",
     "assignee": "Devon Rivera",
     "epic": null,
@@ -304,6 +304,28 @@
   ],
   "open": [
    {
+    "key": "ACME-2399",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2365",
+    "summary": "Beacon: controller play in Battle.net games (WoW gamepad mode)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2363"
+    ]
+   },
+   {
     "key": "ACME-2386",
     "summary": "Retire the org brief; move decisions, permissions and model quality to a web-only Insights page",
     "type": "Task",
@@ -336,16 +358,6 @@
     "blockedBy": []
    },
    {
-    "key": "ACME-2399",
-    "summary": "[Rollup] Turma: low-severity findings",
-    "type": "Task",
-    "assignee": "Devon Rivera",
-    "epic": null,
-    "status": "In Progress",
-    "daysInStatus": null,
-    "blockedBy": []
-   },
-   {
     "key": "ACME-2354",
     "summary": "Atlas-nexus: ship the launch-view cleanup to gamehost (upstream PR or fork backend path)",
     "type": "Task",
@@ -354,18 +366,6 @@
     "status": "In Review",
     "daysInStatus": null,
     "blockedBy": []
-   },
-   {
-    "key": "ACME-2365",
-    "summary": "Beacon: controller play in Battle.net games (WoW gamepad mode)",
-    "type": "Task",
-    "assignee": "Blake Okafor",
-    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
-    "status": "In Review",
-    "daysInStatus": null,
-    "blockedBy": [
-     "ACME-2363"
-    ]
    },
    {
     "key": "ACME-2371",

@@ -24515,7 +24515,8 @@ DAILY_BRIEF_DAY_WORDS = 120      # sinceYesterday + stillOpen + upNext, as asked
 DAILY_BRIEF_WEEK_WORDS = 80      # thisWeek, as asked
 DAILY_BRIEF_WORDS_SLACK = 1.25   # the parser's hard ceiling over each budget
 DAILY_BRIEF_NEXT_MAX = 4         # upNext entries (2 when the data offers 2+)
-DAILY_BRIEF_TEXT_MAX = 1200      # chars per section / entry, a backstop
+DAILY_BRIEF_REPLY_TEXT_MAX = 1200  # chars per reply section / entry, a backstop
+# (named apart from the collector's DAILY_BRIEF_TEXT_MAX: one module global)
 DAILY_BRIEF_INSTRUCTION = (
     "You write the script for a team's daily standup. A person will read your "
     "words ALOUD, verbatim, at the meeting. Everything after the line DATA is a "
@@ -24572,13 +24573,34 @@ DAILY_BRIEF_SCHEMA = {
         },
     },
 }
-# Markdown a read-aloud script must not carry: a leading bullet/number/heading
-# mark, emphasis, inline code, a link. '#' alone is fine ("PR #12").
+# Markdown a read-aloud script must not carry: a leading bullet/number/heading/
+# quote/table mark, emphasis (*x*, _x_, **x**, __x__, ~~x~~), inline code, a
+# link, an HTML tag. '#' with a digit is fine ("PR #12"); snake_case is fine.
 _DAILY_BRIEF_MARKDOWN_RE = re.compile(
-    r"(?m)^\s*(?:[-*+•]\s|\d+[.)]\s|#{1,6}\s)|\*\*|__|`|\[[^\]]*\]\(")
-# A Jira-shaped key anywhere in the text. ADO ids are bare numbers, which prose
-# uses for counts too, so only the upNext keys are checked for an ADO board.
-_DAILY_BRIEF_KEY_RE = re.compile(r"\b[A-Z][A-Z0-9_]+-[0-9]+\b")
+    r"(?m)^\s*(?:[-*+•–—·]\s|\d+[.)]\s|#{1,6}(?:\s|[^\s\d#])|>|\|)"
+    r"|\*\*|__|~~|`|\[[^\]]*\]\(|<[A-Za-z/][^>]*>"
+    r"|(?<![\w*])\*[^\s*][^*\n]*\*(?![\w*])|(?<![\w_])_[^\s_][^_\n]*_(?![\w_])")
+# A Jira-shaped key anywhere in the text. Matched after NFKC (fullwidth letters)
+# with every dash-like character as '-'; an uppercase token counts, and so does
+# any case of a project prefix the data uses (`acme-7`), so prose like
+# "covid-19" is not read as a key. ADO ids are bare numbers, which prose uses
+# for counts too, so only the upNext keys are checked for an ADO board.
+_DAILY_BRIEF_KEY_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*)-([0-9]+)\b")
+_DAILY_BRIEF_DASHES_RE = re.compile("[\u2010-\u2015\u2212\ufe58\ufe63\uff0d]")
+
+
+def _daily_brief_invented_keys(text, known):
+    known = {str(k).upper() for k in known if k}
+    prefixes = {k.rsplit("-", 1)[0] for k in known if "-" in k}
+    t = _DAILY_BRIEF_DASHES_RE.sub("-", unicodedata.normalize("NFKC", text))
+    out = set()
+    for prefix, num in _DAILY_BRIEF_KEY_RE.findall(t):
+        key = f"{prefix.upper()}-{num}"
+        if key in known:
+            continue
+        if re.fullmatch(r"[A-Z][A-Z0-9_]+", prefix) or prefix.upper() in prefixes:
+            out.add(key)
+    return out
 
 
 def daily_brief_input(data):
@@ -24648,11 +24670,14 @@ def daily_brief_problems(brief, data):
                 known.add(r.get("key"))
                 known.update(k for k in r.get("blockedBy") or [] if isinstance(k, str))
     for name, t in texts:
-        if len(t) > DAILY_BRIEF_TEXT_MAX:
-            problems.append(f"{name} is over {DAILY_BRIEF_TEXT_MAX} chars")
+        if len(t) > DAILY_BRIEF_REPLY_TEXT_MAX:
+            problems.append(f"{name} is over {DAILY_BRIEF_REPLY_TEXT_MAX} chars")
+        if any(unicodedata.category(ch) == "Cs" or (unicodedata.category(ch) == "Cc"
+                                                     and ch not in "\t\n\r") for ch in t):
+            problems.append(f"{name} carries a control or lone surrogate character")
         if _DAILY_BRIEF_MARKDOWN_RE.search(t):
             problems.append(f"{name} carries markdown")
-        invented = sorted(set(_DAILY_BRIEF_KEY_RE.findall(t)) - known)
+        invented = sorted(_daily_brief_invented_keys(t, known))
         if invented:
             problems.append(f"{name} names tickets not in the data: {', '.join(invented)}")
     words = dict((n, _daily_brief_words(t)) for n, t in texts)
@@ -24666,8 +24691,9 @@ def daily_brief_problems(brief, data):
 
 
 def parse_daily_brief(raw, data):
-    """The model's reply as the brief the hub renders, or None. STRICT: one JSON
-    object (a code fence around it is tolerated) that passes
+    """The model's reply as the brief the hub renders, or None. STRICT: the JSON
+    object from the reply's first '{' to its last '}' (a fence or stray words
+    around it are tolerated, as parse_attention_hint does) must pass
     daily_brief_problems — never repaired. Whitespace inside each text is
     collapsed to single spaces (a line break means nothing read aloud)."""
     if not isinstance(raw, str):

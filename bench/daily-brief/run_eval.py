@@ -7,7 +7,7 @@ daily_brief_problems), so the eval measures exactly what the render worker runs.
 Results and the decision: docs/daily-brief-adr.md.
 
     # 1. snapshot real boards (needs this host's tracker creds; writes OUTSIDE the repo)
-    python3 bench/daily-brief/run_eval.py snapshot --out /tmp/raw --project XERK
+    python3 bench/daily-brief/run_eval.py snapshot --out /tmp/raw --project PROJ
     # 2. scrub into the committed corpus (people pseudonymised; --map renames terms)
     python3 bench/daily-brief/run_eval.py scrub --raw /tmp/raw --map private-map.json
     # 3. run every case through each model, twice
@@ -83,6 +83,7 @@ def cmd_snapshot(a):
 
 # ---- scrub ------------------------------------------------------------------
 
+IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 PEOPLE = ("Avery Chen", "Blake Okafor", "Casey Novak", "Devon Rivera", "Emery Sato")
 
 
@@ -98,6 +99,7 @@ def scrub(data, terms):
     def text(s):
         if not isinstance(s, str):
             return s
+        s = IP_RE.sub("[ip]", s)
         for k in order:
             s = re.sub(re.escape(k), terms[k], s, flags=re.I)
         return s
@@ -191,6 +193,8 @@ def claude(model, prompt, timeout=180):
                                capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             return None, {"error": "timeout", "wallMs": int((time.monotonic() - t0) * 1000)}
+        except OSError as e:
+            sys.exit(f"cannot run claude: {e}")
         wall = int((time.monotonic() - t0) * 1000)
     try:
         j = json.loads(p.stdout)
@@ -234,7 +238,11 @@ def _words(b):
 
 def cmd_run(a):
     ha = load_agent()
-    jobs = [(c, m, r) for c in corpus() for m in a.models for r in range(a.reps)
+    cases = corpus()
+    unknown = set(a.cases or ()) - {c["id"] for c in cases}
+    if unknown:
+        sys.exit(f"unknown case(s): {', '.join(sorted(unknown))}")
+    jobs = [(c, m, r) for c in cases for m in a.models for r in range(a.reps)
             if not a.cases or c["id"] in a.cases]
     with open(a.out, "a") as out, concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
         for res in pool.map(lambda j: run_one(ha, *j), jobs):
@@ -311,6 +319,9 @@ def cmd_report(a):
         day = [r["words"]["day"] for r in rs if r.get("words")]
         week = [r["words"]["week"] for r in rs if r.get("words")]
         print(f"## {m}: {sum(r['ok'] for r in rs)}/{len(rs)} pass the parser")
+        if not (cost and lat and day and week):
+            print("  (no successful runs to summarise)")
+            continue
         print(f"  cost/brief  median ${statistics.median(cost):.4f}  max ${max(cost):.4f}")
         print(f"  latency     median {statistics.median(lat)/1000:.1f}s  max {max(lat)/1000:.1f}s")
         print(f"  words day   median {statistics.median(day)}  max {max(day)}  over-120 "
@@ -369,7 +380,7 @@ def main():
     s.add_argument("--reps", type=int, default=2)
     s.add_argument("--jobs", type=int, default=4)
     s.add_argument("--cases", nargs="*")
-    s.add_argument("--out", required=True)
+    s.add_argument("--out", required=True, help="results JSONL, APPENDED to (resume a run)")
     s = sub.add_parser("judge")
     s.add_argument("--results", required=True)
     s.add_argument("--jobs", type=int, default=4)
