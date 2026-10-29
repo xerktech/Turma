@@ -18655,6 +18655,12 @@ const server = http.createServer(async (req, res) => {
     stripForwardHeaders(req);
     if (dropIfClosing(req)) return;
 
+    // Clickjacking hardening (XERK-2399): no other site may frame the hub. The
+    // dashboard's own /term iframe is same-origin, so 'self' covers it. XFO is
+    // for old browsers; CSP frame-ancestors wins where both are understood.
+    res.setHeader("Content-Security-Policy", "frame-ancestors 'self'");
+    res.setHeader("X-Frame-Options", "SAMEORIGIN");
+
     // No GET/HEAD/OPTIONS route reads a body, and several answer one through a raw
     // writeHead (the login redirect, static assets) that json() never sees — so a
     // large body on one is refused here, closing rather than dumped (XERK-1598).
@@ -22756,6 +22762,21 @@ server.on("drop", () => {
   dropsSinceLog = 0;
 });
 
+// A browser-opened WebSocket names its page's origin; it must be the hub's own
+// (its Host, or the original Host a proxy forwarded). No Origin = not a browser
+// (curl, the Android app's OkHttp), which auth alone governs. "null" refuses.
+function sameOriginUpgrade(req) {
+  const origin = req.headers.origin;
+  if (origin === undefined) return true;
+  let o;
+  try { o = new URL(origin); } catch { return false; }
+  // Read each candidate under the Origin's scheme so a default port written out
+  // (Host "hub:443" vs Origin "https://hub") compares equal.
+  const hostOf = (h) => { try { return new URL(`${o.protocol}//${h}`).host; } catch { return null; } };
+  const fwd = String(req.headers["x-forwarded-host"] || "").split(",")[0].trim();
+  return [req.headers.host, fwd].some((h) => h && hostOf(String(h)) === o.host);
+}
+
 // ---- WebSocket upgrades -----------------------------------------------------
 // Three kinds, all on this one port:
 //   /agent/control      — an agent's tunnel-agent registering its reverse tunnel
@@ -22781,6 +22802,14 @@ server.on("upgrade", async (req, socket, head) => {
   }
   const url = new URL(req.url, "http://x");
   const parts = url.pathname.split("/").filter(Boolean);
+
+  // The browser sockets are cookie- or ws-token-authed, and ttyd runs writable
+  // with no Origin check of its own, so a page on another origin (a same-site
+  // sibling sends the Lax cookie) must not open one (XERK-2399).
+  if ((parts[0] === "term" || parts[0] === "live" || parts[0] === "audio") && !sameOriginUpgrade(req)) {
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+    return socket.destroy();
+  }
 
   // Agent control channel: persistent, carries {open:ch, port} requests to the agent.
   if (parts[0] === "agent" && parts[1] === "control") {

@@ -27321,3 +27321,54 @@ test("XERK-2381: a released identity cannot escape through a stale HA copy of it
   assert.equal(uidHostRefusal(uid, "ghost2381"), null, "home stays open");
   forget2381("ghost2381", "ghost2381b");
 });
+
+// XERK-2399: no other site may frame the hub (clickjacking), and a browser page
+// on another origin may not open the hub's terminal, live or audio socket.
+test("XERK-2399: every hub response refuses cross-origin framing", async () => {
+  const nav = { accept: "text/html" };
+  for (const [path, headers] of [["/", userHeaders], ["/login", nav], ["/api/agents", {}],
+                                 ["/healthz", {}], ["/sessions", { ...userHeaders, ...nav }],
+                                 ["/sessions", nav], ["/app.css", nav], ["/nav.js", nav],
+                                 ["/term/whatever/", userHeaders], ["/term/whatever/", nav]]) {
+    const res = await request("GET", path, { headers });
+    assert.equal(res.headers["content-security-policy"], "frame-ancestors 'self'", path);
+    assert.equal(res.headers["x-frame-options"], "SAMEORIGIN", path);
+  }
+});
+
+function upgradeStatus(pathName, origin, { host = "hub.example", fwdHost } = {}) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(server.address().port, "127.0.0.1", () => {
+      socket.write(`GET ${pathName} HTTP/1.1\r\nHost: ${host}\r\n` +
+        (fwdHost ? `X-Forwarded-Host: ${fwdHost}\r\n` : "") +
+        `Authorization: ${userHeaders.authorization}\r\n` +
+        (origin ? `Origin: ${origin}\r\n` : "") +
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+        "Sec-WebSocket-Key: dGVzdC1rZXktMDEyMzQ1Njc4OQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    });
+    let buf = "";
+    socket.on("data", (c) => { buf += c; });
+    socket.on("close", () => resolve(buf.split("\r\n")[0]));
+    socket.on("error", reject);
+  });
+}
+
+test("XERK-2399: the browser sockets refuse a page on another origin", async () => {
+  // Each path fails later for its own reason (unknown session, no ws-token), so
+  // any status but 403 means the origin check passed it.
+  for (const p of ["/term/nosuchsession/ws", "/live/nohost/nosess", "/audio"]) {
+    assert.match(await upgradeStatus(p, "https://evil.example.com"), / 403 /, p);
+    assert.match(await upgradeStatus(p, "https://sibling.hub.example"), / 403 /, p);
+    assert.match(await upgradeStatus(p, "null"), / 403 /, p);
+    assert.doesNotMatch(await upgradeStatus(p, "https://hub.example"), / 403 /, p);
+    assert.doesNotMatch(await upgradeStatus(p, null), / 403 /, `${p}: no Origin = not a browser`);
+  }
+  const t = "/term/nosuchsession/ws";
+  // Behind a proxy that rewrites Host, the original rides X-Forwarded-Host.
+  const proxied = { host: "10.0.0.5:8300", fwdHost: "turma.example" };
+  assert.match(await upgradeStatus(t, "https://turma.example", proxied), / 404 /);
+  assert.match(await upgradeStatus(t, "https://evil.example", proxied), / 403 /);
+  // A default port written out is the same origin; another scheme is not.
+  assert.match(await upgradeStatus(t, "https://hub.example", { host: "hub.example:443" }), / 404 /);
+  assert.match(await upgradeStatus(t, "http://hub.example", { host: "hub.example:443" }), / 403 /);
+});
