@@ -1391,6 +1391,20 @@ function releaseHostIdentities(host) {
   }
   if (changed) persistAgentIdentities();
 }
+// The operator REVOKED `host`'s agent token (XERK-2383, `DELETE /api/agents/<host>
+// ?identity=revoke`): delete every identity living under that name, so its token
+// is refused everywhere at once (identityOf null -> "not registered"), whether or
+// not a reinstall ever takes the name. Unlike releaseHostIdentities this locks a
+// briefly offline host out too, which is why it is a deliberate second step and
+// never what a plain Remove does. Returns how many were revoked.
+function revokeHostIdentities(host) {
+  let n = 0;
+  for (const [uid, e] of Object.entries(agentIdentities)) {
+    if (e && e.home === host) { delete agentIdentities[uid]; n++; }
+  }
+  if (n) persistAgentIdentities();
+  return n;
+}
 // A beat on identity `uid` as `key` (already authorized): mark it used and, on a
 // rename, move its home. Returns the name it moved FROM, or null.
 function noteIdentityBeat(uid, key) {
@@ -12824,7 +12838,9 @@ function agentPresented(req) {
   const header = req.headers.authorization || "";
   if (header.startsWith("Bearer ")) {
     const token = header.slice(7);
-    if (tokenHost(token) || tokenUid(token)) return true;
+    // An identity token counts only while the hub still knows the identity: a
+    // revoked one (XERK-2383) must not buy the 32 MiB read either.
+    if (tokenHost(token) || identityOf(tokenUid(token))) return true;
     // Under TURMA_AGENT_STRICT the master is not a credential at all, and that
     // has to hold HERE and not only at the authorization check past it: this
     // gate stands in front of the 32 MiB read, so leaving the master usable
@@ -12850,6 +12866,9 @@ function agentPresentedRefusal(req) {
       error: "this hub requires each agent's own token (TURMA_AGENT_STRICT is set), not the fleet master",
     };
   }
+  // A well-formed identity token the hub no longer knows (revoked, or minted by
+  // another hub): say so, as every host-scoped surface does, not a bare 401.
+  if (token && tokenUid(token)) return { status: 403, error: uidHostRefusal(tokenUid(token), "") };
   return { status: 401, error: "unauthorized" };
 }
 
@@ -22038,10 +22057,29 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "agents" && parts.length === 3) {
       const key = decodeURIComponent(parts[2]);
+      // `?identity=revoke` (XERK-2383) also retires the host's agent identity
+      // token, for a lost or stolen machine. Refused up front, removing nothing,
+      // when there is no identity to revoke: a name or master token cannot be
+      // revoked per host, and a Remove that silently left it working would read
+      // as done.
+      const revoke = url.searchParams.get("identity") === "revoke";
+      if (revoke && !Object.values(agentIdentities).some((e) => e && e.home === key)) {
+        return json(res, 409, {
+          error: `${key} has no agent identity token to revoke — it authenticates with its ` +
+            "name-derived token or the fleet master; only rotating TURMA_AGENT_TOKEN revokes those",
+        });
+      }
       delete agents[key];
       // Removing a host releases its name (XERK-2381): a reinstalled machine can
       // take it on a new token, and its old identity may only return home.
+      const revoked = revoke ? revokeHostIdentities(key) : 0;
       releaseHostIdentities(key);
+      // A revoked agent still holding its tunnel is cut off now, not at its next
+      // reconnect (which agentWsAuthorized then refuses).
+      if (revoked && controlChannels[key]) {
+        dropTermAgents(key);
+        try { controlChannels[key].socket.destroy(); } catch { /* gone */ }
+      }
       // Removing the host does NOT remove what it spent (XERK-338) — that is the
       // whole point of the ledger, and the Usage page keeps charting it as a
       // retired host. `?usage=purge` is the deliberate second step for an
@@ -22053,7 +22091,7 @@ const server = http.createServer(async (req, res) => {
       markAgentRemoved(key); // XERK-756: remove the host record from the shared store (HA)
       invalidateAgentsCache();
       sseBroadcast("removed", { key });
-      return json(res, 200, { ok: true, usagePurged: purged });
+      return json(res, 200, { ok: true, usagePurged: purged, identitiesRevoked: revoked });
     }
 
     // GET /api/jira/<siteKey>/create-meta[?project=<p>] -> the New-ticket form's
@@ -24002,6 +24040,7 @@ if (process.env.TURMA_TEST) {
     uidHostClaim,
     hostOfUid,
     uidHostRefusal,
+    revokeHostIdentities,
     nameTokenRefusal,
     agentIdentities: () => agentIdentities,
     coerceAgentIdentities,

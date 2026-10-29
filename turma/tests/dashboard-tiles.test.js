@@ -689,3 +689,20 @@ test("dashboard: a paused card's Kill arms, confirms, and clears once it is no l
   g = D.els.groups.innerHTML;
   assert.ok(!g.includes("Napping") && !g.includes("Killing…"), "an ordinary kill leaves the card grid");
 });
+
+test("XERK-2383: a host on its own token offers Remove + revoke token, online or not", () => {
+  const D = loadDashboard();
+  const now = Date.now();
+  const bound = { ...liveHost("stolen", 1), tokenBound: true };
+  D.render({ now, agents: [bound] });
+  let g = D.els.groups.innerHTML;
+  assert.match(g, /revokeHost\('stolen'\)/, "a beating (stolen) machine can be revoked");
+  assert.doesNotMatch(g, /removeHost\('stolen'\)/, "plain Remove stays offline-only");
+  D.render({ now, agents: [{ ...bound, online: false }] });
+  g = D.els.groups.innerHTML;
+  assert.match(g, /removeHost\('stolen'\)/);
+  assert.match(g, /revokeHost\('stolen'\)/);
+  // A host on the shared master has no identity of its own to revoke.
+  D.render({ now, agents: [{ ...liveHost("shared", 1), tokenBound: false }] });
+  assert.doesNotMatch(D.els.groups.innerHTML, /revokeHost/);
+});

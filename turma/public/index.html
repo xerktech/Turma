@@ -1575,8 +1575,9 @@ function hostCard(a, now) {
         ontoggle="logToggle('${escJs(a.key)}', this.open)">
       <summary>Container log (tail)</summary><pre>${esc(a.logTail)}</pre>
     </details>` : ""}
-    ${(a.online || a.updating) ? "" : `<div class="actions">
-      <button onclick="removeHost('${escJs(a.key)}')">Remove host</button>
+    ${(a.online || a.updating) && a.tokenBound !== true ? "" : `<div class="actions">
+      ${(a.online || a.updating) ? "" : `<button onclick="removeHost('${escJs(a.key)}')">Remove host</button>`}
+      ${revokeHostBtn(a)}
     </div>`}`;
 
   // When collapsed, surface the session count alongside the name so the row still
@@ -2258,6 +2259,22 @@ function twoClick(actionKey, doIt) {
 }
 
 function removeHost(key)  { del(`/api/agents/${enc(key)}`, "Remove host"); }
+
+// Remove a lost or stolen host AND revoke its agent identity token (XERK-2383).
+// Offered online too — a stolen machine still beats — on any host running its
+// own token; the hub refuses (and toasts why) one with no identity to revoke.
+// Arm/confirm: unlike a plain Remove the host cannot come back without being
+// re-provisioned.
+function revokeHostBtn(a) {
+  if (a.tokenBound !== true) return "";
+  const armed = confirming.has("rv::" + a.key);
+  return `<button class="${armed ? "confirm" : ""}"`
+    + ` title="Remove this host and revoke its agent token: it is refused at once and must be re-provisioned (--agent-token) to return"`
+    + ` onclick="revokeHost('${escJs(a.key)}')">${armed ? "Confirm revoke" : "Remove + revoke token"}</button>`;
+}
+function revokeHost(key) {
+  twoClick("rv::" + key, () => del(`/api/agents/${enc(key)}?identity=revoke`, "Revoke token"));
+}
 
 // Restart a host's agent manager (XERK-157). Arm/confirm first, then POST; the
 // pending state captures the current startedAt so reconcilePending can clear the

@@ -27487,6 +27487,57 @@ test("XERK-2381: removing a host releases its name for a reinstall", async () =>
   forget2381("box2381", "box2381b");
 });
 
+test("XERK-2383: Remove host with ?identity=revoke retires the agent's identity token at once", async () => {
+  await beatAs("rev2383", asAuth(hostAgentToken("rev2383")));
+  const tok = enrollUid("rev2383");
+  const uid = tokenUid(tok);
+  assert.equal((await beatAs("rev2383", asAuth(tok))).status, 200);
+  // A live agent holding its tunnel is cut off by the revoke, not at its next reconnect.
+  const ctrl = await wsConnect(`/agent/control?name=rev2383&token=${encodeURIComponent(tok)}`);
+  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+  collectControlFrames(ctrl.socket, ctrl.leftover);
+  const closed = new Promise((r) => ctrl.socket.once("close", r));
+  try {
+    const del = await request("DELETE", "/api/agents/rev2383?identity=revoke", { headers: userHeaders });
+    assert.equal(del.status, 200, JSON.stringify(del.body));
+    assert.equal(del.body.identitiesRevoked, 1);
+    assert.equal(hub.agentIdentities()[uid], undefined);
+    assert.equal(((await hub.liveStore.get("policy:agentIdentities")) || {})[uid], undefined,
+      "the revoke is persisted");
+    await closed;
+    assert.equal(controlChannels.rev2383, undefined);
+  } finally { ctrl.socket.destroy(); }
+  // Unlike a plain Remove, beating home first does not bring it back: refused,
+  // with the re-provision wording, before the hub reads the body.
+  const home = await beatAs("rev2383", asAuth(tok));
+  assert.equal(home.status, 403);
+  assert.match(home.body.error, /re-provision/);
+  assert.equal(agents.rev2383, undefined);
+  assert.equal((await beatAs("rev2383-elsewhere", asAuth(tok))).status, 403);
+  assert.equal(agentWsAuthorized(new URL(`http://x/agent/control?name=rev2383&token=${tok}`), { headers: {} }, "rev2383"), false);
+  assert.equal(resolveEnrollToken({ headers: asAuth(tok) }, "rev2383").status, 403);
+  // The reinstall path: re-provision on the name token, which enrolls a fresh identity.
+  assert.equal((await beatAs("rev2383", asAuth(hostAgentToken("rev2383")))).status, 200);
+  assert.notEqual(enrollUid("rev2383"), tok);
+  forget2381("rev2383");
+});
+
+test("XERK-2383: revoking a host with no identity token refuses and removes nothing", async () => {
+  await beatAs("norev2383", asAuth(hostAgentToken("norev2383")));
+  const del = await request("DELETE", "/api/agents/norev2383?identity=revoke", { headers: userHeaders });
+  assert.equal(del.status, 409);
+  assert.match(del.body.error, /no agent identity token to revoke/);
+  assert.ok(agents.norev2383, "the host is still there");
+  // Another host's identity is untouched by a revoke aimed elsewhere.
+  const other = enrollUid("keep2383");
+  await beatAs("keep2383", asAuth(other));
+  enrollUid("norev2383");
+  await beatAs("norev2383", asAuth(enrollUid("norev2383")));
+  assert.equal((await request("DELETE", "/api/agents/norev2383?identity=revoke", { headers: userHeaders })).status, 200);
+  assert.equal((await beatAs("keep2383", asAuth(other))).status, 200);
+  forget2381("norev2383", "keep2383");
+});
+
 test("XERK-2381: an identity this hub does not know is told to re-provision, never re-issued", () => {
   const tok = uidAgentToken("abcdefabcdefabcdefabcdefabcdefab");
   const r = resolveEnrollToken({ headers: asAuth(tok) }, "x");
