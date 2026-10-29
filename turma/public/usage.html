@@ -284,8 +284,16 @@ const HIDDEN_KEY = "turma-hidden-sessions";
 // Toggle state persists across visits, keyed by "<host>::<sessionId>". Colors are
 // assigned to sessions, not to visible positions, so toggling never repaints the
 // remaining series.
-let hidden = new Set(JSON.parse(localStorage.getItem(HIDDEN_KEY) || "[]"));
-function saveHidden() { localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hidden])); }
+// Storage can throw (blocked site data, some private windows) or hold junk; a
+// toggle or view choice is a convenience, so either just falls back to the
+// default rather than killing the page's script before it renders.
+function storeGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function storeSet(k, v) { try { localStorage.setItem(k, v); } catch { /* not persisted */ } }
+let hidden = new Set((() => {
+  try { const a = JSON.parse(storeGet(HIDDEN_KEY) || "[]"); return Array.isArray(a) ? a : []; }
+  catch { return []; }
+})());
+function saveHidden() { storeSet(HIDDEN_KEY, JSON.stringify([...hidden])); }
 
 // The chart re-renders on every SSE beat (see scheduleRender), which rebuilds the
 // whole subtree — table view included. So the details' open state can't live in
@@ -295,11 +303,11 @@ let tableOpen = false;
 
 // View mode: "repos" (fleet-wide, unified across hosts) or "hosts". Persisted.
 const MODE_KEY = "turma-usage-mode";
-let mode = localStorage.getItem(MODE_KEY) === "hosts" ? "hosts" : "repos";
+let mode = storeGet(MODE_KEY) === "hosts" ? "hosts" : "repos";
 function setMode(m) {
   if (m === mode) return;
   mode = m;
-  localStorage.setItem(MODE_KEY, m);
+  storeSet(MODE_KEY, m);
   renderViewbar();
   if (cache) render(cache);
 }

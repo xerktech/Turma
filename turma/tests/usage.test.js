@@ -53,7 +53,7 @@ let orgKeys = [];
 // update() has seen the sites the data names); null = the plain stub above.
 let orgHooks = null;
 
-function loadHelpers(fetchReply = null) {
+function loadHelpers(fetchReply = null, storage = null) {
   const els = {};
   const sse = [];
   const fetches = [];
@@ -70,7 +70,7 @@ function loadHelpers(fetchReply = null) {
   };
   const stubs = {
     document,
-    localStorage: {
+    localStorage: storage || {
       _m: {},
       getItem(k) { return this._m[k] ?? null; },
       setItem(k, v) { this._m[k] = String(v); },
@@ -136,6 +136,17 @@ function loadHelpers(fetchReply = null) {
 }
 
 const H = loadHelpers();
+
+test("usage: the page boots when storage throws or holds junk", () => {
+  // Blocked site data makes every localStorage call throw; the page read two
+  // keys at top level and died before rendering, header and all.
+  const throwing = { getItem() { throw new Error("denied"); }, setItem() { throw new Error("denied"); } };
+  assert.doesNotThrow(() => loadHelpers(null, throwing));
+  for (const junk of ["not json", '"abc"', "{}"]) {
+    const store = { getItem: (k) => (k === "turma-hidden-sessions" ? junk : null), setItem() {} };
+    assert.doesNotThrow(() => loadHelpers(null, store), junk);
+  }
+});
 const bucket = (o) => Object.assign(H.blankBucket(), o);
 
 // --- cacheHitRate ------------------------------------------------------------
