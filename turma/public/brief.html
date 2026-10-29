@@ -212,7 +212,7 @@ function scheduleHtml(site, stored) {
     + `</div>`
     + (next ? `<div class="sched-next">${next}</div>` : "")
     + (err ? `<div class="sched-err">${esc(err)}</div>` : "")
-    + `<div class="sched-actions"><button type="submit" class="primary btn-sm"${busy ? " disabled" : ""}>${busy ? "Saving…" : "Save schedule"}</button>`
+    + `<div class="sched-actions"><button type="submit" class="primary btn-sm" data-sched-save="${esc(site)}"${busy ? " disabled" : ""}>${busy ? "Saving…" : "Save schedule"}</button>`
     + (drafts.has(site) ? `<button type="button" class="btn-sm" data-sched-reset="${esc(site)}">Discard changes</button>` : "")
     + `</div></form></div>`;
 }
@@ -317,7 +317,7 @@ function editing() {
 }
 // What has focus, as keys that survive the swap: a button by its data-* site,
 // a form field by its site + field (+ value for a weekday).
-const FOCUS_KEYS = ["run", "copy", "schedToggle", "schedReset"];
+const FOCUS_KEYS = ["run", "copy", "schedToggle", "schedReset", "schedSave"];
 function focusKey() {
   const ae = document.activeElement;
   const ds = ae && ae.dataset;
@@ -335,13 +335,35 @@ function restoreFocus(key) {
       && (key.value === undefined || x.value === key.value));
   if (el && el.focus) el.focus();
 }
-// `force`: the viewer's own action (Save, Run now) paints its feedback now,
-// focus kept on the field or button it was on. Never through a pointer press.
-// When the hub answers, the result is forced only if focus began on a button (or
-// nowhere) and has not moved: a field may by then hold a half-typed time (QA),
-// which a swap would drop. Otherwise it is a background paint like any other.
-function stillOn(began) {
-  return (!began || !!began.k) && JSON.stringify(focusKey()) === JSON.stringify(began);
+// `force`: the viewer's own click (the gear, Discard) paints at once, focus
+// kept on the field or button it was on. Never through a pointer press.
+// Busy state and a save's error go straight onto the controls, never only
+// through a repaint: a repaint is held while a field has focus, and a Save left
+// reading "Saving…" and disabled swallowed the next click (QA). The next
+// repaint draws the same state from schedBusy / schedErr / runBusy.
+function patchSave(site) {
+  painted = null;
+  const form = [...$briefs.querySelectorAll("[data-sched]")].find((f) => f.dataset.sched === site);
+  if (!form) return;
+  const busy = schedBusy.has(site);
+  const btn = form.querySelector("[data-sched-save]");
+  if (btn) { btn.disabled = busy; btn.textContent = busy ? "Saving…" : "Save schedule"; }
+  const text = schedErr.get(site);
+  let err = form.querySelector(".sched-err");
+  if (text && !err) {
+    err = document.createElement("div");
+    err.className = "sched-err";
+    form.insertBefore(err, form.querySelector(".sched-actions"));
+  }
+  if (err) { if (text) err.textContent = text; else err.remove(); }
+}
+function patchRun(site) {
+  painted = null;
+  const list = cache && own(cache.dailyBriefs, site);
+  const running = Array.isArray(list) && list[0] && list[0].status === "running";
+  for (const b of $briefs.querySelectorAll("[data-run]")) {
+    if (b.dataset.run === site) b.disabled = runBusy.has(site) || !!running;
+  }
 }
 function renderBriefs(data, now, force = false) {
   if (pointerDown || (!force && editing())) { paintPending = true; return; }
@@ -378,7 +400,9 @@ $briefs.addEventListener("focusout", flushHeld);
 $briefs.addEventListener("pointerdown", () => { pointerDown = true; }, true);
 // Released anywhere (a press can end off the list). The flush is a task later,
 // so the click this press makes has been dispatched first.
-for (const ev of ["pointerup", "pointercancel"]) {
+// A context menu or a lost window can eat the pointerup; neither may leave
+// every background paint held.
+for (const ev of ["pointerup", "pointercancel", "contextmenu", "blur"]) {
   addEventListener(ev, () => { if (pointerDown) { pointerDown = false; flushHeld(); } }, true);
 }
 
@@ -428,10 +452,9 @@ async function send(method, url, body) {
 // line and as the shared failure toast (XERK-264).
 async function runNow(site) {
   if (runBusy.has(site)) return;
-  const began = focusKey();
   runBusy.add(site);
   runRefusal.delete(site);
-  if (cache) renderBriefs(cache, Date.now(), true);
+  patchRun(site);
   const { res, out } = await send("POST", `/api/orgs/${encodeURIComponent(site)}/daily-brief/run`);
   runBusy.delete(site);
   if (res && res.status === 401) return void (location.href = "/login");
@@ -446,7 +469,8 @@ async function runNow(site) {
     // Defined, not assigned: an org may be named __proto__ (XERK-1451).
     Object.defineProperty(map, site, { value: [out.brief, ...list], enumerable: true, writable: true, configurable: true });
   }
-  if (cache) renderBriefs(cache, Date.now(), stillOn(began));
+  patchRun(site);
+  if (cache) renderBriefs(cache, Date.now());
 }
 async function saveSchedule(site) {
   if (schedBusy.has(site)) return;
@@ -454,10 +478,9 @@ async function saveSchedule(site) {
   const v = formValues(site, stored);
   const body = { enabled: v.enabled, time: v.time, timeZone: v.timeZone, weekdays: v.weekdays,
     leadMinutes: Number(v.leadMinutes), model: v.model };
-  const began = focusKey();
   schedBusy.add(site);
   schedErr.delete(site);
-  if (cache) renderBriefs(cache, Date.now(), true);
+  patchSave(site);
   const { res, out } = await send("PUT", `/api/orgs/${encodeURIComponent(site)}/daily-brief/schedule`, body);
   schedBusy.delete(site);
   if (res && res.status === 401) return void (location.href = "/login");
@@ -472,7 +495,8 @@ async function saveSchedule(site) {
       nextFor.set(site, { sig: JSON.stringify(out.schedule), next: out.next || null, at: Date.now() });
     }
   }
-  if (cache) renderBriefs(cache, Date.now(), stillOn(began));
+  patchSave(site);
+  if (cache) renderBriefs(cache, Date.now());
 }
 async function copyBrief(site) {
   const list = (cache && own(cache.dailyBriefs, site)) || [];

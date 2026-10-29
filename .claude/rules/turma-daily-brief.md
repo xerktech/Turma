@@ -31,11 +31,13 @@ The web surface of the Daily Brief (epic XERK-2390). The wire it reads is
   - **A repaint also waits out a pointer press in the list** (`pointerDown`, released on window
     `pointerup`/`pointercancel`): a swap between mousedown and mouseup dispatches no click, so the
     first Save after a select/checkbox change was lost (QA). Same trap as the dashboard's.
-  - The viewer's own action (Save, Run now, the gear) paints with `force` at the click, so its
-    feedback shows while a field still has focus; every repaint gives focus back to the
+  - The press is released on `contextmenu` and window `blur` too, so a lost pointerup never
+    holds every paint.
+  - The gear and Discard paint with `force` at the click; every repaint gives focus back to the
     button/field it was on. `force` never overrides a pointer press.
-  - **The hub's ANSWER is not forced** unless focus began on a button and has not moved
-    (`stillOn`): forcing it dropped a time half-typed while a slow Save was in flight (QA).
+  - **Busy state and a save's error go straight onto the controls** (`patchSave`/`patchRun`),
+    never only through a repaint. A forced repaint on the hub's answer dropped a half-typed time;
+    a held one left Save "Saving…" and disabled, swallowing the next click (QA, both).
 - **A failed next-run lookup backs off** (`NEXT_RETRY_MS`): retried at once, every repaint re-asked
   it — ~230 requests/s per tab against a dead hub (QA).
 - Run now and Save show a refusal in the hub's words, inline and as the shared toast (XERK-264).

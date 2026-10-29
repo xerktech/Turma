@@ -424,25 +424,75 @@ test("XERK-2396: Run now for an org named __proto__ adds an own key, not a proto
 const fieldIn = (f, value, site = SITE) => ({ tagName: "INPUT", inside: true, dataset: { f }, value,
   closest: () => ({ dataset: { sched: site } }) });
 
-test("XERK-2396: Save and the gear paint at once even with a field focused; the hub's answer does not swap a field", async () => {
-  let release;
-  const P = loadPage((url, init) => (init.method === "PUT" ? new Promise((r) => { release = r; }) : { ok: true, next: null }));
+// A stand-in for one org's rendered form: what patchSave touches.
+function fakeForm(site) {
+  const btn = { dataset: { schedSave: site }, disabled: false, textContent: "Save schedule" };
+  const form = { dataset: { sched: site }, btn, err: null,
+    querySelector(sel) { return sel === "[data-sched-save]" ? btn : sel === ".sched-err" ? this.err : null; },
+    insertBefore(el) { this.err = el; el.remove = () => { form.err = null; }; } };
+  return form;
+}
+
+test("XERK-2396: Save's busy state and error reach the controls while a field holds focus, and the next Save is sent", async () => {
+  const releases = [];
+  const P = loadPage((url, init) => (init.method === "PUT" ? new Promise((r) => { releases.push(r); }) : { ok: true, next: null }));
   const d = data();
   P.setCache(d);
   P.schedOpen.add(SITE);
   P.renderBriefs(d, NOW);
-  P.document.activeElement = fieldIn("time", "09:00");
-  const saving = P.saveSchedule(SITE);
-  assert.match(P.list(), /Saving…/, "Save's own paint is not held by the focused field");
-  const during = P.list();
-  release({ ok: true, schedule: { enabled: true, time: "09:00", timeZone: "UTC", weekdays: [1], leadMinutes: 5, model: "auto" }, next: null });
-  await saving;
-  assert.equal(P.list(), during, "the answer waits while a field (maybe half-typed) has focus");
-  P.document.activeElement = null;
-  P.renderBriefs(d, NOW);
-  assert.doesNotMatch(P.list(), /Saving…/);
+  const form = fakeForm(SITE);
+  P.els.briefList.querySelectorAll = (sel) => (sel === "[data-sched]" ? [form] : []);
+  P.document.createElement = () => ({ className: "", textContent: "" });
+  P.document.activeElement = fieldIn("leadMinutes", "7");
+  const listBefore = P.list();
+  const first = P.saveSchedule(SITE);
+  assert.deepEqual([form.btn.disabled, form.btn.textContent], [true, "Saving…"]);
+  assert.equal(P.list(), listBefore, "no swap under the focused field");
+  // A 400 comes back while the field still has focus.
+  releases[0]({ ok: true, schedule: null, next: null });
+  await first;
+  assert.deepEqual([form.btn.disabled, form.btn.textContent], [false, "Save schedule"], "never left stuck");
+  assert.equal(P.list(), listBefore, "the answer swaps nothing under a field that may hold a half-typed time");
+  // The QA repro: the next Save is sent.
+  const second = P.saveSchedule(SITE);
+  assert.equal(P.fetches.filter((f) => f.method === "PUT").length, 2);
+  releases[1]({ ok: true, schedule: null, next: null });
+  await second;
+});
 
-  // The gear, clicked with a field focused, opens/closes at once.
+test("XERK-2396: a refused Save shows its error on the form at once, focus in a field", async () => {
+  const P = loadPage((url, init) => (init.method === "PUT" ? { status: 400, body: { error: "leadMinutes must be a whole number from 1 to 30" } } : { ok: true, next: null }));
+  const d = data();
+  P.setCache(d);
+  P.schedOpen.add(SITE);
+  P.renderBriefs(d, NOW);
+  const form = fakeForm(SITE);
+  P.els.briefList.querySelectorAll = (sel) => (sel === "[data-sched]" ? [form] : []);
+  P.document.createElement = () => ({ className: "", textContent: "" });
+  P.document.activeElement = fieldIn("leadMinutes", "99");
+  await P.saveSchedule(SITE);
+  assert.equal(form.err && form.err.textContent, "Saving the schedule failed — leadMinutes must be a whole number from 1 to 30");
+  assert.equal(form.btn.disabled, false);
+});
+
+test("XERK-2396: Run now's button is disabled in flight and released after, whatever has focus", async () => {
+  const releases = [];
+  const P = loadPage((url, init) => (init.method === "POST" ? new Promise((r) => { releases.push(r); }) : { ok: true, next: null }));
+  const d = data();
+  P.setCache(d);
+  P.renderBriefs(d, NOW);
+  const btn = { dataset: { run: SITE }, disabled: false };
+  P.els.briefList.querySelectorAll = (sel) => (sel === "[data-run]" ? [btn] : []);
+  const run = P.runNow(SITE);
+  assert.equal(btn.disabled, true);
+  P.document.activeElement = fieldIn("time", "09:00");
+  releases[0]({ ok: true, brief: { runId: "q2", status: "ok", trigger: "manual", meetingAt: NOW, startedAt: NOW, model: "haiku", host: "h", day: "Done." } });
+  await run;
+  assert.equal(btn.disabled, false);
+});
+
+test("XERK-2396: the gear and Discard paint at once even with a field focused", () => {
+  const d = data();
   const Q = loadPage();
   Q.setCache(d);
   Q.renderBriefs(d, NOW);
@@ -450,6 +500,12 @@ test("XERK-2396: Save and the gear paint at once even with a field focused; the 
   const gear = { dataset: { schedToggle: SITE } };
   for (const fn of Q.els.briefList.listeners.click) fn({ target: { closest: () => gear } });
   assert.match(Q.list(), /aria-expanded="true"/);
+  Q.drafts.set(SITE, { enabled: true, time: "11:11", timeZone: "UTC", weekdays: [1], leadMinutes: 5, model: "auto" });
+  Q.renderBriefs(d, NOW, true);
+  assert.match(Q.list(), /value="11:11"/);
+  const discard = { dataset: { schedReset: SITE } };
+  for (const fn of Q.els.briefList.listeners.click) fn({ target: { closest: () => discard } });
+  assert.doesNotMatch(Q.list(), /value="11:11"/);
 });
 
 test("XERK-2396: a repaint gives focus back to the same weekday box", () => {
