@@ -127,6 +127,9 @@ function fmtWhen(ms) {
   return new Date(ms).toLocaleString([], { weekday: "short", month: "short", day: "numeric",
     hour: "numeric", minute: "2-digit" });
 }
+// An org's entry in a served map, OWN keys only: an org may be named
+// `__proto__` or `constructor` (XERK-1451), which a plain lookup reads off the prototype.
+const own = (map, k) => (map && Object.prototype.hasOwnProperty.call(map, k) ? map[k] : undefined);
 const isTime = (v) => typeof v === "number" && Number.isFinite(v) && v > 0;
 
 // ---- the brief ---------------------------------------------------------------
@@ -214,8 +217,12 @@ function scheduleHtml(site, stored) {
     + `</div></form></div>`;
 }
 function statusHtml(site, head, latest, now) {
+  // A refusal stands only until the org's runs move on (a run started
+  // elsewhere, or this one settled): a stale "try again" must not hide it.
   const refused = runRefusal.get(site);
-  if (refused) return `<div class="brief-status failed">${esc(refused)}</div>`;
+  if (refused && refused.head === (head ? head.runId : null)) {
+    return `<div class="brief-status failed">${esc(refused.text)}</div>`;
+  }
   if (!head) return "";
   if (head.status === "running") {
     const on = head.host ? ` on ${esc(head.host)}` : "";
@@ -279,33 +286,59 @@ const earlierOpen = new Set(); // sites whose earlier-briefs list is open
 const schedErr = new Map();    // site -> the hub's refusal of the last save
 const schedBusy = new Set();
 const runBusy = new Set();
-const runRefusal = new Map();  // site -> the hub's refusal of the last Run now
+const runRefusal = new Map();  // site -> {text, head}: the hub's refusal of the last Run now, and the newest runId then
 const copied = new Set();
 const nextFor = new Map();     // site -> {sig, next, at}: GET .../schedule's `next`
 const nextBusy = new Set();
+const NEXT_RETRY_MS = 60000;
 let cache = null;
 let liveOrgs = new Set();
 let shownSites = [];
 let painted = null;
 let paintPending = false;
+let pointerDown = false;
 
 function orgsOf(data) {
   const live = new Set();
   for (const a of data.agents || []) if (a && typeof a.org === "string" && a.org) live.add(a.org);
   const all = new Set(live);
   const briefs = data.dailyBriefs && typeof data.dailyBriefs === "object" ? data.dailyBriefs : {};
-  for (const s of Object.keys(briefs)) if (Array.isArray(briefs[s]) && briefs[s].length) all.add(s);
+  for (const s of Object.keys(briefs)) if (Array.isArray(own(briefs, s)) && own(briefs, s).length) all.add(s);
   return { live, all };
 }
-// A repaint replaces the form, so it waits while a field in it has focus (a
-// native <select> popup would close, a half-typed time would be lost); the
-// focusout handler paints what was held.
+// A repaint replaces the form, so a background one waits while a field in it
+// has focus (a native <select> popup would close, a half-typed time would be
+// lost), and while a pointer is pressed in the list: a swap between mousedown
+// and mouseup makes the browser dispatch no click at all (turma.md, the
+// dashboard's same trap). focusout / pointerup paint what was held.
 function editing() {
   const ae = document.activeElement;
   return !!(ae && /^(INPUT|SELECT)$/.test(ae.tagName || "") && typeof $briefs.contains === "function" && $briefs.contains(ae));
 }
-function renderBriefs(data, now) {
-  if (editing()) { paintPending = true; return; }
+// What has focus, as keys that survive the swap: a button by its data-* site,
+// a form field by its site + field (+ value for a weekday).
+const FOCUS_KEYS = ["run", "copy", "schedToggle", "schedReset"];
+function focusKey() {
+  const ae = document.activeElement;
+  const ds = ae && ae.dataset;
+  if (!ds || typeof $briefs.contains !== "function" || !$briefs.contains(ae)) return null;
+  const k = FOCUS_KEYS.find((x) => ds[x] !== undefined);
+  if (k) return { k, site: ds[k] };
+  if (ds.f) return { f: ds.f, site: formSite(ae), value: ds.f === "weekdays" ? ae.value : undefined };
+  return null;
+}
+function restoreFocus(key) {
+  if (!key) return;
+  const el = key.k
+    ? [...$briefs.querySelectorAll("button")].find((x) => x.dataset[key.k] === key.site)
+    : [...$briefs.querySelectorAll("[data-f]")].find((x) => x.dataset.f === key.f && formSite(x) === key.site
+      && (key.value === undefined || x.value === key.value));
+  if (el && el.focus) el.focus();
+}
+// `force`: the viewer's own action (Save, Run now) paints its feedback now,
+// focus kept on the field or button it was on.
+function renderBriefs(data, now, force = false) {
+  if (!force && (editing() || pointerDown)) { paintPending = true; return; }
   paintPending = false;
   const keys = TurmaOrg.getKeys();
   const { live, all } = orgsOf(data);
@@ -317,33 +350,43 @@ function renderBriefs(data, now) {
     .map((x) => [x.siteKey, x.orgName]));
   const name = (s) => (TurmaBoard.orgName ? TurmaBoard.orgName(s, names.get(s)) : s);
   const html = shownSites.length
-    ? shownSites.map((s) => briefOrgHtml(s, { list: briefs[s], schedule: schedules[s] || null,
+    ? shownSites.map((s) => briefOrgHtml(s, { list: own(briefs, s), schedule: own(schedules, s) || null,
       live: live.has(s), name: name(s), now })).join("")
     : `<div class="brief-empty">No org yet — no host reports a tracker org.</div>`;
   syncNext(schedules, now);
   if (html === painted) return;
   painted = html;
+  const focus = focusKey();
   TurmaNav.preserveScroll($briefs, () => { $briefs.innerHTML = html; });
+  restoreFocus(focus);
 }
 function render(data) {
   TurmaOrg.update(data);
   TurmaNewTicket.update(data);
   renderBriefs(data, Date.now());
 }
-$briefs.addEventListener("focusout", () => {
+function flushHeld() {
   setTimeout(() => { if (paintPending && cache) renderBriefs(cache, Date.now()); }, 0);
-});
+}
+$briefs.addEventListener("focusout", flushHeld);
+$briefs.addEventListener("pointerdown", () => { pointerDown = true; }, true);
+// Released anywhere (a press can end off the list). The flush is a task later,
+// so the click this press makes has been dispatched first.
+for (const ev of ["pointerup", "pointercancel"]) {
+  addEventListener(ev, () => { if (pointerDown) { pointerDown = false; flushHeld(); } }, true);
+}
 
 // The next run is the hub's to compute (DST, the lead window), so it is read
 // from GET .../schedule for each shown org with a schedule: again when the
 // schedule changes, and once the run it named has passed.
 function syncNext(schedules, now) {
   for (const s of shownSites) {
-    const sch = schedules[s];
+    const sch = own(schedules, s);
     if (!sch || !liveOrgs.has(s) || nextBusy.has(s)) continue;
     const sig = JSON.stringify(sch);
     const have = nextFor.get(s);
-    if (have && have.sig === sig && !(have.next && have.next.runAt <= now && now - have.at > 30000)) continue;
+    if (have && now < (have.retryAt || 0)) continue;
+    if (have && have.sig === sig && !have.failed && !(have.next && have.next.runAt <= now && now - have.at > 30000)) continue;
     fetchNext(s, sig);
   }
 }
@@ -354,7 +397,12 @@ async function fetchNext(site, sig) {
     if (r.status === 401) return void (location.href = "/login");
     const out = r.ok ? await r.json() : null;
     nextFor.set(site, { sig, next: out && out.next ? out.next : null, at: Date.now() });
-  } catch { /* the next sync retries */ }
+  } catch {
+    // Unreachable, or not JSON (an auth proxy's page): keep what was shown and
+    // try again in a minute — retried at once, every repaint re-asked (QA: ~230/s).
+    const have = nextFor.get(site);
+    nextFor.set(site, { sig, next: have ? have.next : null, at: Date.now(), failed: true, retryAt: Date.now() + NEXT_RETRY_MS });
+  }
   nextBusy.delete(site);
   painted = null;
   if (cache) renderBriefs(cache, Date.now());
@@ -376,30 +424,32 @@ async function runNow(site) {
   if (runBusy.has(site)) return;
   runBusy.add(site);
   runRefusal.delete(site);
-  if (cache) renderBriefs(cache, Date.now());
+  if (cache) renderBriefs(cache, Date.now(), true);
   const { res, out } = await send("POST", `/api/orgs/${encodeURIComponent(site)}/daily-brief/run`);
   runBusy.delete(site);
   if (res && res.status === 401) return void (location.href = "/login");
   if (!res || !res.ok) {
     const text = res ? TurmaNav.refusalText("Run now", res.status, out) : "Run now failed — the hub is unreachable";
-    runRefusal.set(site, text);
+    const list = cache && own(cache.dailyBriefs, site);
+    runRefusal.set(site, { text, head: Array.isArray(list) && list[0] ? list[0].runId : null });
     TurmaNav.toast(text);
   } else if (out && out.brief && cache) {
     const map = cache.dailyBriefs && typeof cache.dailyBriefs === "object" ? cache.dailyBriefs : (cache.dailyBriefs = {});
-    const list = (map[site] || []).filter((b) => b.runId !== out.brief.runId);
-    map[site] = [out.brief, ...list];
+    const list = (own(map, site) || []).filter((b) => b.runId !== out.brief.runId);
+    // Defined, not assigned: an org may be named __proto__ (XERK-1451).
+    Object.defineProperty(map, site, { value: [out.brief, ...list], enumerable: true, writable: true, configurable: true });
   }
-  if (cache) renderBriefs(cache, Date.now());
+  if (cache) renderBriefs(cache, Date.now(), true);
 }
 async function saveSchedule(site) {
   if (schedBusy.has(site)) return;
-  const stored = cache && cache.dailyBriefSchedules ? cache.dailyBriefSchedules[site] : null;
+  const stored = (cache && own(cache.dailyBriefSchedules, site)) || null;
   const v = formValues(site, stored);
   const body = { enabled: v.enabled, time: v.time, timeZone: v.timeZone, weekdays: v.weekdays,
     leadMinutes: Number(v.leadMinutes), model: v.model };
   schedBusy.add(site);
   schedErr.delete(site);
-  if (cache) renderBriefs(cache, Date.now());
+  if (cache) renderBriefs(cache, Date.now(), true);
   const { res, out } = await send("PUT", `/api/orgs/${encodeURIComponent(site)}/daily-brief/schedule`, body);
   schedBusy.delete(site);
   if (res && res.status === 401) return void (location.href = "/login");
@@ -414,10 +464,10 @@ async function saveSchedule(site) {
       nextFor.set(site, { sig: JSON.stringify(out.schedule), next: out.next || null, at: Date.now() });
     }
   }
-  if (cache) renderBriefs(cache, Date.now());
+  if (cache) renderBriefs(cache, Date.now(), true);
 }
 async function copyBrief(site) {
-  const list = cache && cache.dailyBriefs ? cache.dailyBriefs[site] || [] : [];
+  const list = (cache && own(cache.dailyBriefs, site)) || [];
   const b = list.find((x) => x.status === "ok" && SECTIONS.some(([k]) => x[k]));
   if (!b) return;
   try {
@@ -432,7 +482,7 @@ async function copyBrief(site) {
 // A field edit becomes the org's draft; the draft is what the form shows and
 // what Save sends, so a repaint never loses an edit.
 function editField(site, el) {
-  const stored = cache && cache.dailyBriefSchedules ? cache.dailyBriefSchedules[site] : null;
+  const stored = (cache && own(cache.dailyBriefSchedules, site)) || null;
   const d = { ...formValues(site, stored) };
   const f = el.dataset.f;
   if (f === "enabled") d.enabled = !!el.checked;
@@ -473,16 +523,13 @@ $briefs.addEventListener("click", (e) => {
   if (t.dataset.schedToggle !== undefined) {
     const site = t.dataset.schedToggle;
     if (schedOpen.has(site)) schedOpen.delete(site); else schedOpen.add(site);
-    if (cache) renderBriefs(cache, Date.now());
-    // The repaint replaced the button; keep a keyboard user on it.
-    const again = [...$briefs.querySelectorAll("[data-sched-toggle]")].find((x) => x.dataset.schedToggle === site);
-    if (again) again.focus();
+    if (cache) renderBriefs(cache, Date.now(), true);
   } else if (t.dataset.run !== undefined) runNow(t.dataset.run);
   else if (t.dataset.copy !== undefined) copyBrief(t.dataset.copy);
   else {
     drafts.delete(t.dataset.schedReset);
     schedErr.delete(t.dataset.schedReset);
-    if (cache) renderBriefs(cache, Date.now());
+    if (cache) renderBriefs(cache, Date.now(), true);
   }
 });
 // `toggle` does not bubble: catch it on capture so a repaint keeps each

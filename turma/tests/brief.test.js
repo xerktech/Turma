@@ -31,9 +31,13 @@ function makeEl() {
   return el;
 }
 
-// `reply(url, init)` answers each fetch: a body for 200, or {status, body} for a refusal.
-function loadPage(reply = null) {
+// `reply(url, init)` answers each fetch: a body for 200, {status, body} for a
+// refusal, or a Promise (resolving to a body) to hold the answer. `agents`, when
+// given, answers the boot's /api/agents the same way; else that never lands.
+function loadPage(reply = null, agents = null) {
   const els = {};
+  const sse = [];
+  const winListeners = {};
   const fetches = [];
   const toasts = [];
   const timers = [];
@@ -52,17 +56,28 @@ function loadPage(reply = null) {
     navigator: { userAgent: "node", clipboard: { writeText: async (t) => { clip.push(t); } } },
     fetch: (u, init = {}) => {
       fetches.push({ url: String(u), method: init.method || "GET", body: init.body ? JSON.parse(init.body) : undefined });
-      // The boot's own snapshot never lands: each test sets the cache itself.
-      if (!reply || String(u) === "/api/agents") return new Promise(() => {});
+      if (String(u) === "/api/agents") {
+        if (!agents) return new Promise(() => {});
+        return Promise.resolve(agents()).then((b) => ({ status: 200, ok: true, json: () => Promise.resolve(b) }));
+      }
+      if (!reply) return new Promise(() => {});
       const r = reply(String(u), init);
+      if (r instanceof Error) return Promise.reject(r);
+      if (r && typeof r.then === "function") {
+        return r.then((b) => ({ status: 200, ok: true, json: () => Promise.resolve(b) }));
+      }
       if (r && r.status) {
         return Promise.resolve({ status: r.status, ok: false, json: () => Promise.resolve(r.body || {}) });
       }
       return Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(r) });
     },
-    EventSource: class { constructor() { this.readyState = 1; } addEventListener() {} close() {} },
+    EventSource: class {
+      constructor() { sse.push(this); this.handlers = {}; this.readyState = 1; }
+      addEventListener(name, fn) { this.handlers[name] = fn; } close() {}
+    },
     setInterval: () => 0, clearInterval: noop,
     setTimeout: (fn) => { timers.push(fn); return timers.length; }, clearTimeout: noop,
+    addEventListener: (name, fn) => { (winListeners[name] ||= []).push(fn); }, removeEventListener: noop,
     console, Date, Math, JSON, Intl, encodeURIComponent, Number, String, Object, Array, Map, Set,
     TurmaNav: { preserveScroll: (el, paint) => paint(), toast: (m) => toasts.push(m),
       refusalText: (what, status, body) => {
@@ -75,10 +90,15 @@ function loadPage(reply = null) {
   };
   const keys = Object.keys(stubs);
   const body = `${script}\n;return { render, renderBriefs, briefOrgHtml, briefText, runNow, saveSchedule,
-    editField, drafts, nextFor, schedOpen, setCache: (c) => { cache = c; }, getCache: () => cache };`;
+    editField, drafts, nextFor, schedOpen, runRefusal, setCache: (c) => { cache = c; }, getCache: () => cache };`;
   const api = new Function(...keys, body)(...keys.map((k) => stubs[k]));
-  const settle = () => new Promise((r) => setImmediate(r));
-  return Object.assign(api, { els, fetches, toasts, clip, settle, list: () => els.briefList.innerHTML });
+  const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
+  const runTimers = () => { for (const t of timers.splice(0)) t(); };
+  const list = els.briefList;
+  // What a test puts "inside" the list: the focused element counts as inside.
+  list.contains = (el) => !!el && el.inside === true;
+  return Object.assign(api, { els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document,
+    list: () => list.innerHTML, fire: (name, data) => sse[0].handlers[name]({ data: JSON.stringify(data) }) });
 }
 
 const SITE = "acme.atlassian.net";
@@ -278,4 +298,119 @@ test("XERK-2396: no org yet says so", () => {
   const P = loadPage();
   P.renderBriefs({ agents: [], dailyBriefs: {}, dailyBriefSchedules: {} }, NOW);
   assert.match(P.list(), /No org yet/);
+});
+
+test("XERK-2396: a background repaint waits while a schedule field has focus; the viewer's own action paints", async () => {
+  const P = loadPage();
+  const d = data();
+  P.setCache(d);
+  P.schedOpen.add(SITE);
+  P.renderBriefs(d, NOW);
+  const before = P.list();
+  P.document.activeElement = { tagName: "SELECT", inside: true, dataset: { f: "model" }, closest: () => ({ dataset: { sched: SITE } }) };
+  d.dailyBriefs = { [SITE]: [okBrief({ day: "A newer brief." })] };
+  P.renderBriefs(d, NOW);
+  assert.equal(P.list(), before, "held while the select has focus");
+  P.renderBriefs(d, NOW, true);
+  assert.match(P.list(), /A newer brief\./, "an action's paint is not held");
+});
+
+test("XERK-2396: a repaint waits out a pointer press in the list, then paints after the click", () => {
+  const P = loadPage();
+  const d = data();
+  P.setCache(d);
+  P.renderBriefs(d, NOW);
+  for (const fn of P.els.briefList.listeners.pointerdown) fn({});
+  d.dailyBriefs = { [SITE]: [okBrief({ day: "Landed mid-press." })] };
+  P.renderBriefs(d, NOW);
+  assert.doesNotMatch(P.list(), /Landed mid-press/, "no swap between mousedown and mouseup");
+  for (const fn of P.winListeners.pointerup) fn({});
+  P.runTimers();
+  assert.match(P.list(), /Landed mid-press/);
+});
+
+test("XERK-2396: a repaint keeps keyboard focus on the button it was on", () => {
+  const P = loadPage();
+  const d = data();
+  P.setCache(d);
+  P.renderBriefs(d, NOW);
+  let focused = 0;
+  const fresh = { dataset: { run: SITE }, focus: () => { focused++; } };
+  P.els.briefList.querySelectorAll = (sel) => (sel === "button" ? [{ dataset: { copy: SITE } }, fresh] : []);
+  P.document.activeElement = { tagName: "BUTTON", inside: true, dataset: { run: SITE } };
+  d.dailyBriefs = { [SITE]: [okBrief({ day: "Changed." })] };
+  P.renderBriefs(d, NOW);
+  assert.equal(focused, 1);
+});
+
+test("XERK-2396: a failed next-run lookup backs off instead of re-asking every repaint", async () => {
+  const P = loadPage(() => new Error("network down"));
+  const schedule = { enabled: true, time: "09:30", timeZone: "UTC", weekdays: [1], leadMinutes: 5, model: "auto", updatedAt: 1 };
+  const d = data({ dailyBriefSchedules: { [SITE]: schedule } });
+  P.setCache(d);
+  for (let i = 0; i < 5; i++) { P.renderBriefs(d, Date.now()); await P.settle(); }
+  assert.equal(P.fetches.filter((f) => f.url.endsWith("/daily-brief/schedule")).length, 1);
+  // A minute on, it asks again.
+  P.renderBriefs(d, Date.now() + 61000);
+  await P.settle();
+  assert.equal(P.fetches.filter((f) => f.url.endsWith("/daily-brief/schedule")).length, 2);
+});
+
+test("XERK-2396: a Run now refusal gives way once the org's runs move on", async () => {
+  const P = loadPage((url, init) => (init.method === "POST"
+    ? { status: 429, body: { error: "a brief was just asked for — try again in 59s" } } : { ok: true, next: null }));
+  const d = data();
+  P.setCache(d);
+  P.renderBriefs(d, NOW);
+  await P.runNow(SITE);
+  assert.match(P.list(), /try again in 59s/);
+  const running = { runId: "zz", status: "running", trigger: "manual", meetingAt: NOW, startedAt: NOW, model: "haiku", host: "k8x-09" };
+  P.fire("dailyBriefs", { [SITE]: [running, okBrief()] });
+  assert.doesNotMatch(P.list(), /try again/);
+  assert.match(P.list(), /Writing a brief on k8x-09/);
+});
+
+test("XERK-2396: Run now pressed twice sends one request", async () => {
+  let release;
+  const P = loadPage((url, init) => (init.method === "POST" ? new Promise((r) => { release = r; }) : { ok: true, next: null }));
+  const d = data();
+  P.setCache(d);
+  P.renderBriefs(d, NOW);
+  const a = P.runNow(SITE);
+  const b = P.runNow(SITE);
+  release({ ok: true, brief: { runId: "q1", status: "running", trigger: "manual", meetingAt: NOW, startedAt: NOW, model: "haiku", host: "h" } });
+  await Promise.all([a, b]);
+  assert.equal(P.fetches.filter((f) => f.method === "POST").length, 1);
+});
+
+test("XERK-2396: the running status line escapes its host", () => {
+  const P = loadPage();
+  const running = { runId: "r9", status: "running", trigger: "scheduled", meetingAt: NOW, startedAt: NOW, model: "haiku",
+    host: "<img src=x onerror=alert(1)>" };
+  P.renderBriefs(data({ dailyBriefs: { [SITE]: [running] } }), NOW);
+  assert.doesNotMatch(P.list(), /<img/);
+  assert.match(P.list(), /on &lt;img/);
+});
+
+test("XERK-2396: an SSE frame landing while /api/agents is in flight is not overwritten by the older body", async () => {
+  let release;
+  const P = loadPage(null, () => new Promise((r) => { release = r; }));
+  await P.settle();
+  P.setCache(data());
+  P.fire("dailyBriefs", { [SITE]: [okBrief({ day: "From the frame." })] });
+  release(data({ dailyBriefs: { [SITE]: [okBrief({ day: "From the older body." })] } }));
+  await P.settle();
+  assert.equal(P.getCache().dailyBriefs[SITE][0].day, "From the frame.");
+});
+
+test("XERK-2396: Run now for an org named __proto__ adds an own key, not a prototype", async () => {
+  const started = { runId: "p1", status: "running", trigger: "manual", meetingAt: NOW, startedAt: NOW, model: "haiku", host: "h" };
+  const P = loadPage((url, init) => (init.method === "POST" ? { ok: true, brief: started } : { ok: true, next: null }));
+  const d = { agents: [{ org: "__proto__" }], dailyBriefs: JSON.parse("{}"), dailyBriefSchedules: {} };
+  P.setCache(d);
+  await P.runNow("__proto__");
+  assert.deepEqual(Object.keys(P.getCache().dailyBriefs), ["__proto__"]);
+  assert.equal(Object.getPrototypeOf(P.getCache().dailyBriefs), Object.prototype);
+  assert.match(P.list(), /Writing a brief on h/);
+  assert.match(P.list(), /<h2 class="brief-name">__proto__<\/h2>/);
 });

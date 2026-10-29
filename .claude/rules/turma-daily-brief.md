@@ -28,7 +28,18 @@ The web surface of the Daily Brief (epic XERK-2390). The wire it reads is
     schedule and the hub validates it. A refusal keeps the draft and shows the hub's words.
   - **A repaint waits while a form field has focus** (`editing()`, flushed on `focusout`): a
     swap closes a native `<select>` popup and drops a half-typed time.
+  - **A repaint also waits out a pointer press in the list** (`pointerDown`, released on window
+    `pointerup`/`pointercancel`): a swap between mousedown and mouseup dispatches no click, so the
+    first Save after a select/checkbox change was lost (QA). Same trap as the dashboard's.
+  - The viewer's own action (Save, Run now, the gear) paints with `force`, so its feedback shows
+    while a field still has focus; every repaint gives focus back to the button/field it was on.
+- **A failed next-run lookup backs off** (`NEXT_RETRY_MS`): retried at once, every repaint re-asked
+  it — ~230 requests/s per tab against a dead hub (QA).
 - Run now and Save show a refusal in the hub's words, inline and as the shared toast (XERK-264).
+  - A Run now refusal stands only while the org's newest `runId` is the one it was answered
+    against: a stale "try again in 59s" otherwise hid a run started elsewhere.
+- **Every lookup by site goes through `own()`**: an org named `__proto__` read `Object.prototype`
+  as its schedule and threw (XERK-1451).
 - Every served string is escaped (model text, host, model, error, org name, site key).
 - Live via the `dailyBriefs` / `dailyBriefSchedules` SSE frames (whole maps); a snapshot fetch
   merges, never replaces (XERK-444 clocks).
