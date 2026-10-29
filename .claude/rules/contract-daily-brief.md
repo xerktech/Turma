@@ -18,7 +18,8 @@ ticket builds to this file; change it here first.
   `registerExternalStore`, siteKey → `{enabled, time "HH:MM", timeZone, weekdays [0-6],
   leadMinutes 1-30 (default 5), model "auto"|"haiku"|"sonnet" (default "auto"), updatedAt}`.
   - `validateDailyBriefSchedule` is the ONE whitelist (route, restore, remote watch); the zone is
-    stored as Intl spells it (aliases are NOT folded) and weekdays deduped + sorted, so the coerce
+    stored as Intl spells it (which may rewrite an alias: `Asia/Kolkata` reads back
+    `Asia/Calcutta` on node 24) and weekdays deduped + sorted, so the coerce
     is a fixed point (HA's watch echo dedups). Null-prototype map (XERK-1451).
   - Offset zones (`+05:30`) are refused: a named zone carries the DST rules.
   - At most 100 orgs, siteKey ≤200 chars. **The route refuses what the coerce would drop** (400

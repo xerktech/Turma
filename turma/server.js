@@ -22799,12 +22799,12 @@ const server = http.createServer(async (req, res) => {
         if (error) return json(res, 400, { error });
         if (!(siteKey in dailyBriefSchedules) &&
             Object.keys(dailyBriefSchedules).length >= DAILY_BRIEF_ORGS_MAX) {
-          let pruned = false;
+          // Any prune frees a slot, so a refusal below never leaves one unpublished;
+          // the set that follows publishes the pruned map.
           for (const k of Object.keys(dailyBriefSchedules)) {
-            if (!orgs.has(k)) { delete dailyBriefSchedules[k]; pruned = true; }
+            if (!orgs.has(k)) delete dailyBriefSchedules[k];
           }
           if (Object.keys(dailyBriefSchedules).length >= DAILY_BRIEF_ORGS_MAX) {
-            if (pruned) publishDailyBriefSchedules();
             return json(res, 409, {
               error: `${DAILY_BRIEF_ORGS_MAX} orgs already have a meeting schedule — the limit`,
             });
