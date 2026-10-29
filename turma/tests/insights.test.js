@@ -348,6 +348,11 @@ test("XERK-2386: storage that reads but won't write still toggles every click", 
   const seen = [shut()];
   for (let i = 0; i < 4; i++) { P.toggleCollapsed("a.net"); seen.push(shut()); }
   assert.deepEqual(seen, [true, false, true, false, true]);
+  // Its storage is stale now, so another tab's write is not followed (this load only).
+  P.setCache(data);
+  st._m["turma.insights.decisionsCollapsed"] = "[]";
+  for (const fn of P.winListeners.storage) fn({ key: "turma.insights.decisionsCollapsed" });
+  assert.match(P.els.decisionsLog.innerHTML, /class="dec-org collapsed"/);
 });
 
 test("XERK-2386: another tab's expand or clear reaches this tab", () => {
