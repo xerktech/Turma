@@ -1,0 +1,498 @@
+{
+ "id": "smaller-week",
+ "note": "real board, standup 2026-08-20 13:00 UTC",
+ "data": {
+  "source": "jira",
+  "siteKey": "acme.atlassian.net",
+  "window": {
+   "dayFrom": "2026-08-19T13:00:00+00:00",
+   "weekFrom": "2026-08-13T13:00:00+00:00",
+   "until": "2026-08-20T13:00:00+00:00"
+  },
+  "scope": [
+   "ACME"
+  ],
+  "closed": [
+   {
+    "key": "ACME-400",
+    "summary": "DockerOps .claude/rules/k8s-migration.md is over the 36k instruction-size warn line — split it by path",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-401",
+    "summary": "node-3 is down; cluster at 2/3 control plane and apiserver exec streaming is broken",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-404",
+    "summary": "TrueNAS has had no metrics, no logs and no alerting since 2026-08-19 — grafana + docker-utils stacks are stopped",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-355",
+    "summary": "SendUserFile previews escape every transcript ceiling: one entry can weigh ~11 MB",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-340",
+    "summary": "Deliver the hub's machine-generated pokes over the messaging socket, not the tmux pane",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-343",
+    "summary": "Failed Session Creation",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-369",
+    "summary": "Turma k8s design",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-341",
+    "summary": "Sweep leaked Claude Code inbox sockets: 9,236 dead files in /tmp/cc-socks on truenas",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-350",
+    "summary": "Rotate LITELLM_MASTER_KEY and LITELLM_SALT_KEY — placeholder-shaped keys on a public admin API",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-352",
+    "summary": "DockerOps CLAUDE.md and .claude/rules/firefly.md are in the 36k warn band, ~2k from the 40k CI gate",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-361",
+    "summary": "acme.com apex round-robins onto the two DCs, so 2 of 3 LAN hits miss the website",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-362",
+    "summary": "DNS deletes never replicate DC02 to DC01, and 10.10.10.1 forwards to both, so deleted records keep serving",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-364",
+    "summary": "Pin the TeslaMate app image — `:latest` runs irreversible schema migrations on an unbacked 5.3M-row database",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-363",
+    "summary": "agents / mail / node .acme.com have no DNS anywhere and answer 530 via the AD wildcard",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-366",
+    "summary": "Backups node 10.10.10.21 has been down for days and nothing alerted",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-367",
+    "summary": "Portainer holds two stacks for compose/teslamate.yaml; one is orphaned on a dead endpoint",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-347",
+    "summary": "Remove 'Show More' button",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-353",
+    "summary": "10.10.10.1 returns a wrong 104.21.x address for newly-published cluster ingress names instead of forwarding to AD",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-354",
+    "summary": "ExternalDNS AXFR against xhome-dc02 fails, so it cannot read the zone and rewrites every record every minute",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-339",
+    "summary": "Cross session messaging",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-338",
+    "summary": "Persistent usage data",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-303",
+    "summary": "A spawnTicket handed to a host that then goes offline strands the ticket for days",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-267",
+    "summary": "Archived transcripts can be 15,000x their source on /data: SendUserFile payloads are stored base64 in the archive",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-270",
+    "summary": "The glasses client throws away the hub's {error} text — a refusal reaches the wearer as a bare status number",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-304",
+    "summary": "A Workflow row in a session's background-agent list always opens an empty history",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-306",
+    "summary": "One host's float token count fails the whole /api/agents decode on Android",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-312",
+    "summary": "Static assets are unfingerprinted with max-age=300, so a deploy renders pages unstyled for up to 5 minutes",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-320",
+    "summary": "Move both Dex LDAP connectors off cleartext LDAP to LDAPS",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-322",
+    "summary": "omnictl and talosctl cannot reach Omni through the ingress — no HTTP/2 negotiated",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-324",
+    "summary": "Etcd insufficient members",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-307",
+    "summary": "CLAUDE.md is past the 36k warn threshold — split another section into .claude/rules/",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-321",
+    "summary": "Omni serves a stale machine-API certificate after cert-manager renews it",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-323",
+    "summary": "Upstream: Reloader's --resources-to-ignore=configmaps silently disables --reload-on-create and --reload-on-delete",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-296",
+    "summary": "Ticket Queue Changes",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-162",
+    "summary": "Merge Request Handling",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-226",
+    "summary": "ADO PR Chips",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   }
+  ],
+  "open": [
+   {
+    "key": "ACME-2386",
+    "summary": "Retire the org brief; move decisions, permissions and model quality to a web-only Insights page",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2393",
+    "summary": "Daily Brief: standup prompt and Haiku-vs-Sonnet quality evaluation",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2392"
+    ]
+   },
+   {
+    "key": "ACME-2391",
+    "summary": "Daily Brief: per-org meeting schedule store, route and the hub<->agent wire contract",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2399",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2354",
+    "summary": "Atlas-nexus: ship the launch-view cleanup to gamehost (upstream PR or fork backend path)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2365",
+    "summary": "Beacon: controller play in Battle.net games (WoW gamepad mode)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2363"
+    ]
+   },
+   {
+    "key": "ACME-2371",
+    "summary": "node-1 hard-froze 2026-10-28 (8.5 min dark); freeze now on 2 of 3 identical nodes — needs memtest/SOL at the rack",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-1469",
+    "summary": "[Model B] IDM v1: train on bot + human recordings; gate on held-out human sessions AND the YouTube-style eval set",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-1463",
+     "ACME-1462",
+     "ACME-1468"
+    ]
+   },
+   {
+    "key": "ACME-1468",
+    "summary": "[Model B] GATE: confirm we have enough high-quality human recordings (closes only when sufficient; blocks all of this epic)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-1260",
+     "ACME-1273",
+     "ACME-1274",
+     "ACME-1280",
+     "ACME-1326",
+     "ACME-1472"
+    ]
+   },
+   {
+    "key": "ACME-2291",
+    "summary": "Atlas-nexus: make 007 First Light run (exits with code 5 after cloud save sync)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   }
+  ],
+  "next": [
+   {
+    "key": "ACME-1229",
+    "summary": "[Model B] RL fine-tune from the base model: APPO with a KL tie to the base, CPU L1->L9 curriculum, champion checkpoint",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1470",
+    "summary": "[Model B] Label the YouTube corpus at scale with IDM v1 (confidence-filtered, both players)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1471",
+    "summary": "[Model B] Pretrain the base model on labelled YouTube + human (+ filtered bot) data; ablate vs human-only BC",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1230",
+    "summary": "[M5] Self-play league: P2 driven by past policy snapshots through a second socket player",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1237",
+    "summary": "[Deploy] Real-Switch deploy of the champion: pixel-only ONNX/TensorRT actor, HDMI + serial, latency profile",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2368",
+    "summary": "Beacon: Battle.net acceptance and compatibility matrix on node-4",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2394",
+    "summary": "Daily Brief: agent render worker (renderDailyBrief command -> lockdown model run -> heartbeat result)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2395",
+    "summary": "Daily Brief: hub scheduler, host dispatch, result ingest and brief store",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   }
+  ],
+  "truncated": false
+ }
+}

@@ -1,0 +1,690 @@
+{
+ "id": "fri",
+ "note": "real board, standup 2026-10-02 13:00 UTC",
+ "data": {
+  "source": "jira",
+  "siteKey": "acme.atlassian.net",
+  "window": {
+   "dayFrom": "2026-10-01T13:00:00+00:00",
+   "weekFrom": "2026-09-25T13:00:00+00:00",
+   "until": "2026-10-02T13:00:00+00:00"
+  },
+  "scope": [
+   "ACME"
+  ],
+  "closed": [
+   {
+    "key": "ACME-1307",
+    "summary": "ArgoCD: library.acme.com behind Authentik and Phase 2 exit test",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1389",
+    "summary": "[GPU pool] Honest VRAM claims: every GPU workload claims its measured peak, enforces it in-process, and fits a 24 GB 3090",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1388",
+    "summary": "[GPU pool] NVENC/NVDEC shim auto-applies to every node-4 GPU pod (opt-out annotation), gated on a CUDA no-regression check",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1261",
+    "summary": "[M6] Leaked hand-made privileged pod Robo/rlenv-ACME1196 on node-4 (ACME-1196 leftover, 18h+)",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1311",
+    "summary": "ArgoCD: CronJob backing up the local Steam home and game library to TrueNAS NFS",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1253",
+    "summary": "train_bc DataLoader workers die (exit 1, no traceback) under the cluster-gpu-pool Prefect flow; --num-workers 0 works",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1267",
+    "summary": "rl_rollout leaked an env-server Job + LoadBalancer Service for 4 days (holds a shared-VIP port)",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1350",
+    "summary": "node-4: the two HP OEM RTX 3090s (gpu-0, gpu-1) refuse NVENC (NV_ENC_ERR_UNSUPPORTED_DEVICE)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1384",
+    "summary": "ArgoCD: rename Ledger's STT server to model-neutral names (ai/Ledger/stt.yaml, Ledger-stt)",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1383",
+    "summary": "Robo: train_rl memory request 40Gi -> pool default 16Gi (measured peak 11.4 GiB on GPU)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1355",
+    "summary": "ArgoCD: deploy MiLMMT-46-4B translation server on node-4 and route Ledger translations to it",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1354",
+    "summary": "Ledger: native-prompt translator for MiLMMT-46-4B (completion prompt, run language, English guard)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1258",
+    "summary": "[M4] Robo: RyujinxControlClient speaks control protocol v2 (STEP) and the emulator image moves to fork >= 1.3.5",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1246",
+    "summary": "[M1] train_rl --resume trains a whole new --total-timesteps budget (docs say total)",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1254",
+    "summary": "rl_rollout cancels a train_rl child that Kueue is still queueing (900 s start timeout predates Kueue)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1381",
+    "summary": "node-4 env-server: start_match fails 3x in a row ('not ready within 120s') with a Ryujinx RSS drop, stalling every env for 13+ min",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1250",
+    "summary": "[emu serve] node-4 self-test: 2nd start_match fails \"never reached the Character Select Screen\" after match 1 (2 of 4 env-servers)",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1249",
+    "summary": "[emu serve] reboot on a node-4 env-server fails: \"/dev/uinput\" cannot be opened for writing",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1216",
+    "summary": "[emu serve] match-ready fires during the countdown with misread stocks (3/1, 2/3)",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1215",
+    "summary": "[emu serve] SSS goto gives up when the cursor doesn't start on Random (misread cursor, 0/7 tiles)",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1313",
+    "summary": "Move sessions to a dedicated 3090 once detected",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1304",
+    "summary": "ArgoCD: deploy gamehost to streaming and bring up single-session streaming",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1264",
+    "summary": "[M1] node-4 env-servers: CPU to 5 cores, and A/B the headless NVIDIA Xorg vs Xvfb across several pods",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1363",
+    "summary": "Beacon: disconnect kills the game — rebuild sessions on Wolf lobbies so /resume works",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1359",
+    "summary": "node-4 GPU preferences (learner→PRO 6000, emulators→3090) need Kueue firstAvailable on capacity-backed mappings",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1265",
+    "summary": "Prefect: stale live deployment Robo-capture-ram-labels/data points at a flow main deleted",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1319",
+    "summary": "quay.io/minio/mc now returns 401: turma-archive-create-bucket and mlflow bucket Jobs can't pull their image",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1365",
+    "summary": "operator: SessionController.Reconcile mutates the informer-cached Session in place",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1357",
+    "summary": "ArgoCD: wire the gamehost pairing-page proxy secret (--pin-proxy-secret-file + Authentik additionalHeaders) before bumping Beacon past ACME-1342",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1328",
+    "summary": "operator: SessionController trackedSessions/trackedGames maps mutated by 2 workers without a lock",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1367",
+    "summary": "wolf-agent's in-pod agent controller never resubscribes after Wolf's /api/v1/events stream closes or the first subscribe fails",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1320",
+    "summary": "Security: operator sends wolf-agent bearer token over TLS without verifying the agent's certificate",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1361",
+    "summary": "Beacon: App.spec.volumeClaimTemplate.metadata labels/annotations are never copied to the session PVC",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1325",
+    "summary": "wolf-agent reads its bearer token once at startup; a rotated token Secret causes permanent 401s until the pod restarts",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1362",
+    "summary": "Beacon: CI has no codegen-drift gate (crds/, schemas/, zz_generated, pkg/generated)",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1360",
+    "summary": "Kueue node-4 Cohort VRAM still sized from the PRO 6000 alone; count gpu-0/gpu-1 and the freed record-pod share",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1327",
+    "summary": "node-4: /dev/uhid does not exist — Talos kernel ships no uhid module, so Wolf's DualSense emulation cannot work",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1342",
+    "summary": "Security: moonlight-proxy PIN page trusts any pod on node-1-03 (source-IP trust under hostNetwork)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1346",
+    "summary": "DCGM profiling metrics (engine/tensor/DRAM activity, PCIe throughput) gone for all node-4 GPUs since the 3090s joined",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1347",
+    "summary": "App CRD prunes spec.template.metadata, so App pod labels/annotations never reach session pods",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1334",
+    "summary": "operator: existing session Deployments never pick up App/User/operator-option changes (only port-block drift triggers a rebuild)",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1324",
+    "summary": "Beacon operator never updates the pod spec of an existing session Deployment (pre-ACME-1293 pods crash-loop / stay unauthenticated after upgrade)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1333",
+    "summary": "examples/user.yaml still requests nvidia.com/gpu device-plugin resources; unschedulable on DRA-only node-4",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1332",
+    "summary": "operator: shared session Deployment ownerRefs are invalid (multiple Controller=true, wrong UID), so GC can delete it under a live session",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1352",
+    "summary": "Talos drift: node-1-03 gitops-bootstrap inline manifest differs from what the repo renders",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1345",
+    "summary": "GPU thermal/hardware slowdown alert to ntfy (proxy for unreadable 3090 memory temps)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-1318",
+    "summary": "longhorn-mc: keep Minecraft replicas on node-1-03 now that node-4 is a fourth Longhorn node",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1309",
+    "summary": "RomM integration: ROM entries launch as RetroArch sessions",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1308",
+    "summary": "Catalogue scanner: sync App CRs from Steam/Heroic installs, box art, per-game settings",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1303",
+    "summary": "Controller hotplug: test emptyDir device nodes on Talos and implement the chosen path",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1306",
+    "summary": "Library controller in the operator: on-demand pod, proxy, idle shutdown, Steam lock",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1301",
+    "summary": "Session lifecycle: Job-like pod, disconnect grace period, /cancel",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1299",
+    "summary": "moonlight-proxy: single-session policy, busy error, launch timeout ~100s",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1300",
+    "summary": "Pass the real client IP into Wolf AddSession",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1297",
+    "summary": "Host networking with per-session port blocks; drop the LoadBalancer Service hack",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1310",
+    "summary": "Web pairing page behind Authentik",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1298",
+    "summary": "GPU through DRA claims; remove NVIDIA_VISIBLE_DEVICES=all",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1317",
+    "summary": "archive.reseedCeiling: an explicit second argument can still hide ARCHIVE_RESEED_MAX unnoticed",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1302",
+    "summary": "ArgoCD: deploy nri-input DaemonSet on node-4 and run the Phase 0 exit test",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1295",
+    "summary": "node-4: enable containerd NRI, add Wolf udev rules, fix GPU comments",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Beacon Buildout: on-demand Moonlight game streaming on node-4",
+    "when": "week"
+   }
+  ],
+  "open": [
+   {
+    "key": "ACME-2386",
+    "summary": "Retire the org brief; move decisions, permissions and model quality to a web-only Insights page",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2393",
+    "summary": "Daily Brief: standup prompt and Haiku-vs-Sonnet quality evaluation",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2392"
+    ]
+   },
+   {
+    "key": "ACME-2391",
+    "summary": "Daily Brief: per-org meeting schedule store, route and the hub<->agent wire contract",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2399",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2354",
+    "summary": "Atlas-nexus: ship the launch-view cleanup to gamehost (upstream PR or fork backend path)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2365",
+    "summary": "Beacon: controller play in Battle.net games (WoW gamepad mode)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2363"
+    ]
+   },
+   {
+    "key": "ACME-2371",
+    "summary": "node-1 hard-froze 2026-10-28 (8.5 min dark); freeze now on 2 of 3 identical nodes — needs memtest/SOL at the rack",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-1469",
+    "summary": "[Model B] IDM v1: train on bot + human recordings; gate on held-out human sessions AND the YouTube-style eval set",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-1463",
+     "ACME-1462",
+     "ACME-1468"
+    ]
+   },
+   {
+    "key": "ACME-1468",
+    "summary": "[Model B] GATE: confirm we have enough high-quality human recordings (closes only when sufficient; blocks all of this epic)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-1260",
+     "ACME-1273",
+     "ACME-1274",
+     "ACME-1280",
+     "ACME-1326",
+     "ACME-1472"
+    ]
+   },
+   {
+    "key": "ACME-2291",
+    "summary": "Atlas-nexus: make 007 First Light run (exits with code 5 after cloud save sync)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   }
+  ],
+  "next": [
+   {
+    "key": "ACME-1229",
+    "summary": "[Model B] RL fine-tune from the base model: APPO with a KL tie to the base, CPU L1->L9 curriculum, champion checkpoint",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "unblocked by ACME-1389"
+   },
+   {
+    "key": "ACME-1470",
+    "summary": "[Model B] Label the YouTube corpus at scale with IDM v1 (confidence-filtered, both players)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1471",
+    "summary": "[Model B] Pretrain the base model on labelled YouTube + human (+ filtered bot) data; ablate vs human-only BC",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1230",
+    "summary": "[M5] Self-play league: P2 driven by past policy snapshots through a second socket player",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1237",
+    "summary": "[Deploy] Real-Switch deploy of the champion: pixel-only ONNX/TensorRT actor, HDMI + serial, latency profile",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2325",
+    "summary": "CssNavigator: four live flakes on the fork CSS (grid entry loses the hand, fine-phase stall, Lv step lost, y crawl jumps the A band)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2326",
+    "summary": "Add a data-pool flow to delete named QA/test dirs on the share; remove the ACME-2126 QA leftovers (~13 GB)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2368",
+    "summary": "Beacon: Battle.net acceptance and compatibility matrix on node-4",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   }
+  ],
+  "truncated": true
+ }
+}

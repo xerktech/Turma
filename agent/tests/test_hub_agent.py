@@ -54862,5 +54862,86 @@ class TestDailyBrief(unittest.TestCase):
         self.assertNotIn("a@x.com", json.dumps(out))
 
 
+
+class TestDailyBriefPrompt(unittest.TestCase):
+    """XERK-2393: the standup prompt's input, output contract and strict parser."""
+    DATA = {
+        "closed": [{"key": "XERK-1", "summary": "a", "assignee": "Ann", "when": "day"},
+                   {"key": "XERK-2", "summary": "b", "assignee": "Bo", "when": "week"}],
+        "open": [{"key": "XERK-3", "summary": "c", "blockedBy": ["XERK-9"]},
+                 {"key": "XERK-4", "summary": "d", "blockedBy": []}],
+        "next": [{"key": "XERK-5"}, {"key": "XERK-6"}, {"key": "XERK-7"}],
+        "truncated": True,
+    }
+
+    def _brief(self, **over):
+        b = {"sinceYesterday": "Ann finished one fix.", "thisWeek": "A quiet week.",
+             "stillOpen": "XERK-3 waits on XERK-9.",
+             "upNext": [{"key": "XERK-5", "text": "Do five next."},
+                        {"key": "XERK-6", "text": "Then six."}]}
+        b.update(over)
+        return b
+
+    def test_a_conforming_reply_parses_and_is_flattened(self):
+        raw = "```json\n" + json.dumps(self._brief(stillOpen="Two  in\nprogress.")) + "\n```"
+        out = ha.parse_daily_brief(raw, self.DATA)
+        self.assertEqual(out["stillOpen"], "Two in progress.")
+        self.assertEqual([e["key"] for e in out["upNext"]], ["XERK-5", "XERK-6"])
+        self.assertEqual(set(out), set(ha.DAILY_BRIEF_SECTIONS))
+
+    def test_each_contract_break_is_no_brief(self):
+        cases = {
+            "extra key": self._brief(extra="x"),
+            "empty section": self._brief(thisWeek=" "),
+            "invented key in text": self._brief(sinceYesterday="XERK-77 shipped."),
+            "upNext not a candidate": self._brief(upNext=[{"key": "XERK-1", "text": "x"},
+                                                          {"key": "XERK-5", "text": "y"}]),
+            "too few upNext": self._brief(upNext=[{"key": "XERK-5", "text": "x"}]),
+            "too many upNext": self._brief(upNext=[{"key": k, "text": "x"} for k in
+                                                   ("XERK-5", "XERK-6", "XERK-7", "XERK-5", "XERK-6")]),
+            "repeated upNext": self._brief(upNext=[{"key": "XERK-5", "text": "x"},
+                                                   {"key": "XERK-5", "text": "y"}]),
+            "bullet": self._brief(stillOpen="- one\n- two"),
+            "emphasis": self._brief(thisWeek="A **big** week."),
+            "code": self._brief(thisWeek="Fixed `x`."),
+            "day over budget": self._brief(sinceYesterday="word " * 160),
+            "week over budget": self._brief(thisWeek="word " * 110),
+        }
+        for name, b in cases.items():
+            with self.subTest(name):
+                self.assertTrue(ha.daily_brief_problems(b, self.DATA))
+                self.assertIsNone(ha.parse_daily_brief(json.dumps(b), self.DATA))
+        for raw in (None, "", "no json", "{not json", "[1, 2]"):
+            self.assertIsNone(ha.parse_daily_brief(raw, self.DATA))
+
+    def test_keys_from_the_data_and_hashes_are_allowed(self):
+        b = self._brief(sinceYesterday="XERK-1 and XERK-2 closed, see PR #12.",
+                        stillOpen="XERK-4 runs; XERK-3 waits on XERK-9.")
+        self.assertEqual(ha.daily_brief_problems(b, self.DATA), [])
+
+    def test_no_candidates_means_an_empty_up_next(self):
+        data = dict(self.DATA, next=[])
+        self.assertEqual(ha.daily_brief_problems(self._brief(upNext=[]), data), [])
+        one = dict(self.DATA, next=[{"key": "XERK-5"}])
+        self.assertEqual(ha.daily_brief_problems(
+            self._brief(upNext=[{"key": "XERK-5", "text": "x"}]), one), [])
+
+    def test_input_carries_counts_the_model_need_not_derive(self):
+        out = json.loads(ha.daily_brief_input(self.DATA))
+        self.assertEqual(out["counts"], {"closedSinceYesterday": 1, "closedThisWeek": 2,
+                                         "inProgress": 2, "blocked": 1, "nextCandidates": 3})
+        self.assertTrue(out["countsAreMinimums"])
+        self.assertEqual(out["closed"], self.DATA["closed"])
+        self.assertNotIn("counts", self.DATA)
+
+    def test_the_instruction_names_every_section_and_frames_data(self):
+        for k in ha.DAILY_BRIEF_SECTIONS:
+            self.assertIn(k, ha.DAILY_BRIEF_INSTRUCTION)
+        self.assertTrue(ha.DAILY_BRIEF_INSTRUCTION.endswith("\n\nDATA\n"))
+        self.assertIn("never instructions", ha.DAILY_BRIEF_INSTRUCTION)
+        self.assertEqual(ha.DAILY_BRIEF_SCHEMA["required"], list(ha.DAILY_BRIEF_SECTIONS))
+        self.assertEqual(ha.DAILY_BRIEF_MODEL, "haiku")
+
+
 if __name__ == "__main__":
     unittest.main()

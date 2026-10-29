@@ -1,0 +1,690 @@
+{
+ "id": "tue",
+ "note": "real board, standup 2026-10-20 13:00 UTC",
+ "data": {
+  "source": "jira",
+  "siteKey": "acme.atlassian.net",
+  "window": {
+   "dayFrom": "2026-10-19T13:00:00+00:00",
+   "weekFrom": "2026-10-13T13:00:00+00:00",
+   "until": "2026-10-20T13:00:00+00:00"
+  },
+  "scope": [
+   "ACME"
+  ],
+  "closed": [
+   {
+    "key": "ACME-2125",
+    "summary": "Cache training datasets on node-4 scratch so trainers stop saturating the NAS",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2091",
+    "summary": "OpenLinkHub psuhid: hung PSU blocks all PSU init; unplug mid-init leaves a zombie entry",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2097",
+    "summary": "wolf: API utils/get-icon serves any file on the host (e.g. /etc/shadow, Wolf's key.pem)",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2121",
+    "summary": "Ryujinx headless: SDL3Driver.Dispose can deadlock on normal exit once MainLoop stops",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2111",
+    "summary": "wolf: a session paused or stopped before its consumer pipelines start leaks those pipelines forever",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2112",
+    "summary": "Commands in chat view",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2123",
+    "summary": "wolf: a pause/stop during a consumer pipeline's PLAYING transition can deadlock it and wedge the event bus",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2100",
+    "summary": "Beacon: drop NET_ADMIN from hostNetwork game Apps and examples",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2101",
+    "summary": "wolf: ENet packets are sent from other threads while the control thread services the same host",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2114",
+    "summary": "wolf: interpipe producer teardown can SIGSEGV while many consumers attach/detach (gst_inter_pipe_sink_finalize race)",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2118",
+    "summary": "wolf: authenticate RTSP with Sunshine's encrypted RTSP ([link] keyed by the launch rikey)",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1946",
+    "summary": "wolf: configurable HTTP/HTTPS bind address and no unknown-issuer pairing",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2122",
+    "summary": "Ryujinx headless: a corrupt installed NCA aborts (rc 134) in LoadEntries",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2098",
+    "summary": "Ryujinx headless: failed load still aborts (rc 134) intermittently at teardown; blocks a CI guard",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2102",
+    "summary": "wolf: add a ThreadSanitizer CI leg (follow-up to the ASan leg)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2115",
+    "summary": "wolf: RTSP matches a stream by rtsp_fake_ip from any source, so anyone who knows it can take the client's video or block its stream",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2108",
+    "summary": "Android: an image-free SVG <pattern> in agent prose pins the CPU and keeps running after Back",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2093",
+    "summary": "Ledger: bound the fact check's parallel Kiwix reads (load cap, wall-clock timeout)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2116",
+    "summary": "Beacon: a slow Wolf sessions/add makes the operator end a healthy session (\"unrecorded stream\")",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1957",
+    "summary": "[Rollup] wolf: low-severity findings",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2120",
+    "summary": "Ryujinx headless: --list-input-ids prints the IDs then never exits",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2096",
+    "summary": "wolf: an RTSP ANNOUNCE flood on a live session SIGSEGVs Wolf (interpipe node removed during finalize)",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2117",
+    "summary": "Ryujinx headless: no Vulkan loader aborts (rc 134) instead of exiting with an error",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2099",
+    "summary": "Ryujinx GUI: Restart Emulation on a homebrew NRO throws \"source memory block is not mirrorable\"",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2038",
+    "summary": "Storyline: use the multi-angle LoRA for lock-pack dataset angle edits, and compare before switching",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2104",
+    "summary": "wolf: a lobby stop landing while its runner launches is lost, stranding the app and its audio sink",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2092",
+    "summary": "OpenLinkHub: identical serial-less PSUs can swap profiles across restart/replug order",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2095",
+    "summary": "Glasses: a draft in the box when a question arrives hides the sheet and Send posts it as the answer",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2110",
+    "summary": "wolf: a client relaunching within ~3 s of a Wolf restart gets no audio (sink created as virtual_sink_<id>.2)",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2089",
+    "summary": "wolf: add an ASan (and ideally TSan) CI job so snapshot-lifetime regressions fail CI",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1867",
+    "summary": "[Rollup] Beacon: low-severity findings",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1858",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2080",
+    "summary": "Ryujinx GUI: Escape and hotkeys leak past open menus, dropdowns and flyouts",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1583",
+    "summary": "[Rollup] Ryujinx: low-severity findings",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2078",
+    "summary": "Ryujinx HID: concurrent Npad Remap from the hid service and input threads",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2062",
+    "summary": "[Rollup] wolf: low-severity findings",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2075",
+    "summary": "Ryujinx fork: --deterministic-scheduling boot stalls a STEP past 30 s when SIGSTOP/SIGCONT duty-cycled",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2057",
+    "summary": "[Rollup] Ledger: low-severity findings",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2086",
+    "summary": "gst-wayland-display: a window committed before the output exists is dropped and never mapped",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2079",
+    "summary": "Ryujinx: add a headless GUI test project (OverlayPopupEscape, X11Compositor, AppHost)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2085",
+    "summary": "Ryujinx GUI: a failed game load disposes the Switch twice",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2000",
+    "summary": "[Rollup] gst-wayland-display: low-severity findings",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1969",
+    "summary": "[Rollup] Ryujinx: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2084",
+    "summary": "Ledger: land the fact-check direct-read commits stranded after PR #265",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2090",
+    "summary": "OpenLinkHub: test seam so device keying in Init/InitManual is covered by repo tests",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2081",
+    "summary": "Ryujinx: guest memory accesses that still race a concurrent unmap",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2077",
+    "summary": "Ryujinx: ObjectDisposedException on close, a texture RegionHandle disposed twice",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2088",
+    "summary": "Ryujinx: JitReuseTests.BlockBelowEntryChangedIsNotReused(True) fails in Debug builds",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2064",
+    "summary": "Decide whether the recorder_dev smoke may outrank batch work in Kueue",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2083",
+    "summary": "OpenLinkHub main: two identical serial-less PSUs collide on one device key",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2072",
+    "summary": "Ledger: decide how the cue fact check copes with cold Kiwix searches (async check vs pre-warm)",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2082",
+    "summary": "Ryujinx RL env: can a READ waiting on a GPU flush hold up shutdown?",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1994",
+    "summary": "[Rollup] OpenLinkHub: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2061",
+    "summary": "[Rollup] Talos: low-severity findings",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1973",
+    "summary": "cluster: node-3 unreachable (no route to host), control plane at 2/3 since 2026-10-15 04:56Z",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2001",
+    "summary": "gst-wayland-display: restarting waylanddisplaysrc panics because start() consumes the one command receiver",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1954",
+    "summary": "train_ssl at its defaults cannot finish inside its 6 h deadline (~12 samples/s decoding video per sample)",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2067",
+    "summary": "Record pod: dev recorders, capture Jobs and booting fork-serves still slow the player (the batch throttle can't reach them)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-2074",
+    "summary": "train_ssl reads clip sidecars from NFS at ~25 samples/s, 10x below the cached rate",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1882",
+    "summary": "Check fork-serve lockstep stays deterministic while the record-pod throttle is on",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   }
+  ],
+  "open": [
+   {
+    "key": "ACME-2386",
+    "summary": "Retire the org brief; move decisions, permissions and model quality to a web-only Insights page",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2393",
+    "summary": "Daily Brief: standup prompt and Haiku-vs-Sonnet quality evaluation",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2392"
+    ]
+   },
+   {
+    "key": "ACME-2391",
+    "summary": "Daily Brief: per-org meeting schedule store, route and the hub<->agent wire contract",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2399",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2354",
+    "summary": "Atlas-nexus: ship the launch-view cleanup to gamehost (upstream PR or fork backend path)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2365",
+    "summary": "Beacon: controller play in Battle.net games (WoW gamepad mode)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2363"
+    ]
+   },
+   {
+    "key": "ACME-2371",
+    "summary": "node-1 hard-froze 2026-10-28 (8.5 min dark); freeze now on 2 of 3 identical nodes — needs memtest/SOL at the rack",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-1469",
+    "summary": "[Model B] IDM v1: train on bot + human recordings; gate on held-out human sessions AND the YouTube-style eval set",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-1463",
+     "ACME-1462",
+     "ACME-1468"
+    ]
+   },
+   {
+    "key": "ACME-1468",
+    "summary": "[Model B] GATE: confirm we have enough high-quality human recordings (closes only when sufficient; blocks all of this epic)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-1260",
+     "ACME-1273",
+     "ACME-1274",
+     "ACME-1280",
+     "ACME-1326",
+     "ACME-1472"
+    ]
+   },
+   {
+    "key": "ACME-2291",
+    "summary": "Atlas-nexus: make 007 First Light run (exits with code 5 after cloud save sync)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   }
+  ],
+  "next": [
+   {
+    "key": "ACME-1229",
+    "summary": "[Model B] RL fine-tune from the base model: APPO with a KL tie to the base, CPU L1->L9 curriculum, champion checkpoint",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1470",
+    "summary": "[Model B] Label the YouTube corpus at scale with IDM v1 (confidence-filtered, both players)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1471",
+    "summary": "[Model B] Pretrain the base model on labelled YouTube + human (+ filtered bot) data; ablate vs human-only BC",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1230",
+    "summary": "[M5] Self-play league: P2 driven by past policy snapshots through a second socket player",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1237",
+    "summary": "[Deploy] Real-Switch deploy of the champion: pixel-only ONNX/TensorRT actor, HDMI + serial, latency profile",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2325",
+    "summary": "CssNavigator: four live flakes on the fork CSS (grid entry loses the hand, fine-phase stall, Lv step lost, y crawl jumps the A band)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2326",
+    "summary": "Add a data-pool flow to delete named QA/test dirs on the share; remove the ACME-2126 QA leftovers (~13 GB)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2368",
+    "summary": "Beacon: Battle.net acceptance and compatibility matrix on node-4",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   }
+  ],
+  "truncated": true
+ }
+}

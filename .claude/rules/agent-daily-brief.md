@@ -2,6 +2,9 @@
 paths:
   - "agent/hub-agent.py"
   - "agent/tests/test_hub_agent.py"
+  - "bench/daily-brief/**"
+  - "bench/tests/test_daily_brief.py"
+  - "docs/daily-brief-adr.md"
 ---
 
 # Daily Brief — the agent-side ticket collector (XERK-2392, epic XERK-2390)
@@ -49,3 +52,19 @@ progress) and `next` (To Do candidates). Board mechanics it reuses: `agent-board
 - Tests: `TestDailyBrief` (window boundaries incl. a `+0400` offset, fraction lengths, URL and
   email scrubbing, candidate ranking + cap, in-window seeding, row/char/scope caps, unsafe keys in
   JQL, WIQL quoting, no `_fields` on heartbeat tickets, Azure parity). Run it on python3.9 too.
+
+## The standup prompt (XERK-2393)
+
+`DAILY_BRIEF_INSTRUCTION` + `daily_brief_input(data)` is the whole model input; the reply must
+pass `parse_daily_brief` (sections `DAILY_BRIEF_SECTIONS`, schema `DAILY_BRIEF_SCHEMA`). Default
+model `DAILY_BRIEF_MODEL`. Evidence and the model decision: `docs/daily-brief-adr.md`.
+
+- **The input is the collector JSON and nothing else** — summaries are tracker text anyone in the
+  org can write, so the prompt frames them as data. Run it under `ATTENTION_HINT_LOCKDOWN`.
+- **`counts` are computed for the model, never left to it**: in the eval both Haiku and Sonnet
+  misstated a 14-ticket day when counting the list themselves.
+- **The parser rejects, never repairs**: wrong keys, markdown, a Jira-shaped key not in the data,
+  an `upNext` key not in `next`, or a day/week section past `DAILY_BRIEF_WORDS_SLACK` x budget
+  → None (retry). The eval scores with the same `daily_brief_problems`, so tightening one
+  without the other makes the ADR's numbers stale — re-run `bench/daily-brief/run_eval.py`.
+- Tests: `TestDailyBriefPrompt`; corpus/scrub: `bench/tests/test_daily_brief.py`.

@@ -1,0 +1,690 @@
+{
+ "id": "thu",
+ "note": "real board, standup 2026-10-08 13:00 UTC",
+ "data": {
+  "source": "jira",
+  "siteKey": "acme.atlassian.net",
+  "window": {
+   "dayFrom": "2026-10-07T13:00:00+00:00",
+   "weekFrom": "2026-10-01T13:00:00+00:00",
+   "until": "2026-10-08T13:00:00+00:00"
+  },
+  "scope": [
+   "ACME"
+  ],
+  "closed": [
+   {
+    "key": "ACME-1692",
+    "summary": "Guard: glued loop values beyond two lists (3-way $a$b$c, via c=$a, function args, eval, printf -v)",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1691",
+    "summary": "Guard: a substitution printing text that ends in a lone backslash, spliced into sh -c/eval, hides the command",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1680",
+    "summary": "Guard: an unquoted ${x: -5} is split at its space, so the target it builds is never judged",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1683",
+    "summary": "Guard: a brace expansion glued to a quoted word (eval 'R'{,x}) is cut inside the quotes",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1689",
+    "summary": "Guard: a \\<newline> inside a value an eval'd script assigns hides the command (eval 'y=\"\\⏎R\"; $y')",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1676",
+    "summary": "examples/testball.yaml session gets no GPU on DRA-only clusters: App.spec.gpu never reaches Wolf without app containers",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1658",
+    "summary": "Guard: IFS/-d splitting, bash -c readers and mapfile -C still hide a read command",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1673",
+    "summary": "Guard: a braced name inside an op word on the assignment route, or a nested default glued to text, hides the command",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1674",
+    "summary": "Guard: more write-then-run spellings (cat -, cp/mv, $PWD paths, cat f | sh, bash -s < f) still run a file the line wrote",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1666",
+    "summary": "Guard: eval named by ${!x} indirection or a for-loop variable hides an assignment",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1686",
+    "summary": "Guard: a program word built from a set HOME (${HOME:+r}m -rf /) is not detected",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1668",
+    "summary": "Guard: assignments bound via source <(…) or an eval of uncomputable output hide the command",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1687",
+    "summary": "Guard: chmod -R, chown -R and find -delete on \"$x/$y\" reach / when both names are unset",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1685",
+    "summary": "Guard: ~ ignores a HOME reassigned on the same line (HOME=/; rm -rf ~/etc is allowed)",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1662",
+    "summary": "Guard: IFS, OLDPWD, CDPATH and $\\<newline> spellings let a destructive command through",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1671",
+    "summary": "Guard: $PWD after cd, and $BASH as a program, hide the target or command",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1665",
+    "summary": "Guard: an assignment inside $(…) is not resolved for its own uses (rm -rf \"$(q=/etc; echo $q)\" is allowed)",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1660",
+    "summary": "Guard: a later assignment is read into an earlier use (q=/etc; d=$q$c; c=x; rm -rf $d is allowed)",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1659",
+    "summary": "Guard: ${x:+…}, ${x:=…}, pattern ops and subscripted/positional defaults are never applied, hiding the command",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1679",
+    "summary": "Cluster health: Longhorn Degraded for a week after a node outage; GHCR usage exporter 404s; NFS partial alert flaps on aitraining",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-1684",
+    "summary": "Guard: spaced prefix assignments still hide the command via eval/pipe arg joins, body-bound names and source <(…)",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1652",
+    "summary": "Guard: an unset name after the first / of a protected target is allowed",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1580",
+    "summary": "Deleting a Pairing does not end that client's running session",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1340",
+    "summary": "Beacon Library idle rule: an open tab or paused download keeps it up (and the Steam lock held) indefinitely",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1699",
+    "summary": "Guard: an unbraced name ending a default word is not resolved (rm -rf ${y:-$x} with x=/etc allowed)",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1657",
+    "summary": "Guard: loop-bound values reaching a command via bash -c \"$v\", positionals, select, arrays, while read",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1681",
+    "summary": "Guard: a module planted in hooks/ disables guard.py (hooks run without -I, so their dir leads sys.path)",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1645",
+    "summary": "Guard: a spaced prefix assignment printed by a substitution inside a re-parsed script hides the command after it",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1693",
+    "summary": "Guard: an ANSI-C string with an escape Python can't decode hides the whole script",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1646",
+    "summary": "Guard: a trailing unquoted backslash stops bash -c / sh -c / eval scripts from being re-read",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1656",
+    "summary": "Guard: a target built from $HOME into a protected path is allowed",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1643",
+    "summary": "Agent: installed Bash safety guard on TrueNAS was replaced by an allow-all stub",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1380",
+    "summary": "Beacon: a /resume before Wolf times out the dead client's ENet peer is killed by that peer's late PauseStreamEvent",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1554",
+    "summary": "Beacon: session PVC ignores the App template's volumeAttributesClassName",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1522",
+    "summary": "Beacon: App/User template metadata the CRD can't validate (nested ephemeral VCT keys, annotation size) still wedges the session pod",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1641",
+    "summary": "Guard: remaining bypasses (stdin producers, redirects, shell names, value setters, positionals, program rebinds)",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1374",
+    "summary": "Beacon: wolf-agent server tests flake under -race (TestServerStreamsPastReadTimeout, TestServerDropsWithheldBody)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1521",
+    "summary": "Beacon: App CRD cannot be installed on Kubernetes 1.28 (chart floor) — spec.gpu rule uses CEL quantity()",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1358",
+    "summary": "examples/steam.yaml has no spec.gpu; example Steam session gets no GPU now that GPUs come only from DRA",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1642",
+    "summary": "Guard: a shell named via ${@:-bash}/${*-bash} runs its -c script unchecked",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1647",
+    "summary": "Guard: a destructive word among several in a for…in list runs via $v unseen",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1651",
+    "summary": "Guard: an unset variable glued after the target path, or a -c script's eval/set -- value, hides the command",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1462",
+    "summary": "[Model A] YouTube-style robustness eval set: re-encode labelled clips at stream bitrates / 30 fps / 720p / overlays",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part A: everything that does NOT need human recordings (bot-play data, IDM v0, YouTube corpus, eval + RL machinery)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1505",
+    "summary": "emu boot on node-4: intermittent nav failure after \"Disconnected Controller ProController from Player1\" ~8.6 s into launch",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1483",
+    "summary": "capture --gpu nvidia --emu-subcommand boot fails on node-4: nav never reaches SSS/CSS (extra gamepads ahead of P1 pad?)",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1648",
+    "summary": "Guard: a variable assigned from another variable two levels deep reads as empty (Q=/etc; D=$Q; R=$D; rm -rf $R is allowed)",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1277",
+    "summary": "cluster: slow etcd applies (150-180ms) preceded node-3/04 going NotReady at ~10:56 on 2026-09-30, restarting CNPG postgres and resetting hub connections",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1593",
+    "summary": "Guard: exec wrappers taskset, watch, unshare, runuser, systemd-run, strace, busybox and others run a command the guard never classifies",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1649",
+    "summary": "Guard: an assigned $(…) in a script run by xargs, find -exec, <(…) or source hides the command",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1663",
+    "summary": "Give Ledger STT and translator top priority on node-4",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "week"
+   },
+   {
+    "key": "ACME-1653",
+    "summary": "Guard: a default nested in another default (${x:-${y:-…}}) hides the command",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1650",
+    "summary": "Guard: a value read by while-read, a grouped read, mapfile or select hides the command",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1654",
+    "summary": "Guard: POSIX bracket classes and $HOME* globs miss the protected-root check (rm -rf /e[[:alpha:]]c, rm -rf $HOME*)",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1628",
+    "summary": "Guard: compound commands, >(sh), eval \"$(cat)\" and exec {fd} still feed a shell its stdin unclassified",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1626",
+    "summary": "Guard: positional parameters bound by a shell function or top-level set -- are never followed, so rm -rf \"$1\" of a protected path is allowed",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1639",
+    "summary": "Guard: an unset name at the start of a protected target is allowed",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1622",
+    "summary": "Guard: a value run via for…in, read <<<, {,} or an assignment inside bash -c '…' hides the command",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1623",
+    "summary": "Guard: an unset name glued after a protected target (rm -rf /etc$x, $HOME$x) is allowed",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1620",
+    "summary": "Guard: a quoted prefix assignment with whitespace (X='a b' cmd) hides the whole command",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   },
+   {
+    "key": "ACME-1627",
+    "summary": "Guard: a wrapper's short-option cluster ending in a value-taking letter (sudo -nu, timeout -vk, env -iu) hides the command it runs",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": "Guard: close shell-spelling bypasses in the command guard (agent/hooks/guard.py)",
+    "when": "week"
+   }
+  ],
+  "open": [
+   {
+    "key": "ACME-2386",
+    "summary": "Retire the org brief; move decisions, permissions and model quality to a web-only Insights page",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2393",
+    "summary": "Daily Brief: standup prompt and Haiku-vs-Sonnet quality evaluation",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2392"
+    ]
+   },
+   {
+    "key": "ACME-2391",
+    "summary": "Daily Brief: per-org meeting schedule store, route and the hub<->agent wire contract",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2399",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2354",
+    "summary": "Atlas-nexus: ship the launch-view cleanup to gamehost (upstream PR or fork backend path)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2365",
+    "summary": "Beacon: controller play in Battle.net games (WoW gamepad mode)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2363"
+    ]
+   },
+   {
+    "key": "ACME-2371",
+    "summary": "node-1 hard-froze 2026-10-28 (8.5 min dark); freeze now on 2 of 3 identical nodes — needs memtest/SOL at the rack",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-1469",
+    "summary": "[Model B] IDM v1: train on bot + human recordings; gate on held-out human sessions AND the YouTube-style eval set",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-1463",
+     "ACME-1462",
+     "ACME-1468"
+    ]
+   },
+   {
+    "key": "ACME-1468",
+    "summary": "[Model B] GATE: confirm we have enough high-quality human recordings (closes only when sufficient; blocks all of this epic)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-1260",
+     "ACME-1273",
+     "ACME-1274",
+     "ACME-1280",
+     "ACME-1326",
+     "ACME-1472"
+    ]
+   },
+   {
+    "key": "ACME-2291",
+    "summary": "Atlas-nexus: make 007 First Light run (exits with code 5 after cloud save sync)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   }
+  ],
+  "next": [
+   {
+    "key": "ACME-1229",
+    "summary": "[Model B] RL fine-tune from the base model: APPO with a KL tie to the base, CPU L1->L9 curriculum, champion checkpoint",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1470",
+    "summary": "[Model B] Label the YouTube corpus at scale with IDM v1 (confidence-filtered, both players)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1471",
+    "summary": "[Model B] Pretrain the base model on labelled YouTube + human (+ filtered bot) data; ablate vs human-only BC",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1230",
+    "summary": "[M5] Self-play league: P2 driven by past policy snapshots through a second socket player",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1237",
+    "summary": "[Deploy] Real-Switch deploy of the champion: pixel-only ONNX/TensorRT actor, HDMI + serial, latency profile",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2325",
+    "summary": "CssNavigator: four live flakes on the fork CSS (grid entry loses the hand, fine-phase stall, Lv step lost, y crawl jumps the A band)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2326",
+    "summary": "Add a data-pool flow to delete named QA/test dirs on the share; remove the ACME-2126 QA leftovers (~13 GB)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Robo ML platform: everything on k8s (node-4), Ryujinx fork as a fast RL env, production-style MLOps",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2368",
+    "summary": "Beacon: Battle.net acceptance and compatibility matrix on node-4",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   }
+  ],
+  "truncated": true
+ }
+}

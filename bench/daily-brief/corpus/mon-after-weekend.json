@@ -1,0 +1,690 @@
+{
+ "id": "mon-after-weekend",
+ "note": "real board, standup 2026-10-26 13:00 UTC",
+ "data": {
+  "source": "jira",
+  "siteKey": "acme.atlassian.net",
+  "window": {
+   "dayFrom": "2026-10-23T13:00:00+00:00",
+   "weekFrom": "2026-10-19T13:00:00+00:00",
+   "until": "2026-10-26T13:00:00+00:00"
+  },
+  "scope": [
+   "ACME"
+  ],
+  "closed": [
+   {
+    "key": "ACME-2346",
+    "summary": "gamehost Degraded: steam-backup-full OOMKilled at its 1Gi limit",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2345",
+    "summary": "Two turma-agent pods share node-2 despite their anti-affinity",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2344",
+    "summary": "Add memory to node-1/02/03 so turma-agent can be sized to its real use",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2342",
+    "summary": "turma-agent: close the remaining memory-request gap and re-derive its limit for 60 GiB nodes",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2334",
+    "summary": "node-2 hard-froze again 2026-10-19 (15.5 h dark); watchdog did not reset it — next step memtest/board",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2340",
+    "summary": "Rotate the Omni SideroLink join token exposed in Loki",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2339",
+    "summary": "Size turma-agent's memory request to its real use (8Gi requested, 20Gi p99)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2338",
+    "summary": "Talos: Argo CD components and kube-proxy run with no resource requests",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2269",
+    "summary": "Robo-Ultimate: delete stale CI artifacts and check the org's Actions storage quota",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2332",
+    "summary": "node-fencer fences live-but-stuck nodes; a Postgres replica was corrupted after node-3 was fenced while still running",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2337",
+    "summary": "[Rollup] ArgoCD: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2333",
+    "summary": "Omni SideroLink join token is logged in plaintext to Loki on every reconnect",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2253",
+    "summary": "[Model A] A transient MLflow 504 on a periodic checkpoint upload kills a train_appo run",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2336",
+    "summary": "ArgoCD: right-size requests/limits from Prometheus history, spread and rebalance nodes",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2297",
+    "summary": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "type": "Epic",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2309",
+    "summary": "Atlas-nexus: game log reducer can suppress err: lines whose text contains \":fixme:\" or \":trace:\"",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2304",
+    "summary": "Atlas-nexus runtime: queue termination drops completions of in-flight XAsync ops",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2300",
+    "summary": "Atlas-nexus runtime: canceled XAsync completions skip the title's completion callback",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2285",
+    "summary": "Beacon: a Nexus launch that fails leaves the session on the Nexus launcher window",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2283",
+    "summary": "Beacon: encrypt the shared Nexus keyring with a password from a k8s Secret",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2282",
+    "summary": "ArgoCD: base Apps and operator flags for the partner launchers",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2281",
+    "summary": "ArgoCD: back up Atlas game saves alongside the Steam saves",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2278",
+    "summary": "Beacon: Battle.net in the Library and catalogue (if confirmed in scope)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2277",
+    "summary": "Beacon: Ubisoft Connect in the Library and catalogue (if confirmed in scope)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2276",
+    "summary": "Beacon: EA app in the Library and catalogue (EA Play via Game Pass)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2275",
+    "summary": "Beacon: decide which Game Pass partner launchers to support and how on Linux",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2274",
+    "summary": "Beacon: fix loop for failing Xbox titles (ours here, runtime issues reported upstream)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2273",
+    "summary": "Beacon: Game Pass compatibility matrix run through gamehost",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2272",
+    "summary": "Beacon: per-game settings for Atlas Apps (GPU share, launch options, prerequisites)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2271",
+    "summary": "Beacon: game updates and DLC for Atlas games from the Library",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2270",
+    "summary": "ArgoCD: plan games storage for Xbox PC titles on node-4",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2267",
+    "summary": "Beacon: v1 acceptance on node-4 (Nexus, partner launchers, compatibility)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2266",
+    "summary": "Beacon: make Atlas game sessions robust (license, sign-in, saves, resume)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "when": "day"
+   },
+   {
+    "key": "ACME-2335",
+    "summary": "Longhorn rebuilds 5 replicas per node after a node loss, saturating disks and stalling etcd",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2331",
+    "summary": "node-3 hung 6.5h: a privileged qa-* buildkit pod's C++ build escaped its memory limit on a control-plane node",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2330",
+    "summary": "[Model B] IDM can't fit its own training data: find why before more data or resolution",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2252",
+    "summary": "[Rollup] Robo-Ultimate: low-severity findings (successor to ACME-2245)",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2301",
+    "summary": "Atlas-nexus: game log grows unbounded from unique vkd3d warn lines (177 MB in 11 min on 007)",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2303",
+    "summary": "Atlas-nexus: game log reducer writes every line raw once 512 signatures exist, and the log has no size cap",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2329",
+    "summary": "nexus-xgameruntime: Immediate-mode waiter that terminates and closes its queue crashes",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2328",
+    "summary": "nexus-xgameruntime: Immediate-mode waiters that unregister themselves concurrently deadlock",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2324",
+    "summary": "[Rollup] nexus-xgameruntime: low-severity findings",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2323",
+    "summary": "nexus-xgameruntime: GitHub Actions has never run on the acme fork",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2322",
+    "summary": "nexus-xgameruntime: CI never runs on the acme fork, so PRs merge without checks",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2321",
+    "summary": "nexus-xgameruntime: TaskQueue waiter gets no canceled callback if termination starts mid-dispatch",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2320",
+    "summary": "nexus-xgameruntime: use-after-free when an Immediate TaskQueue waiter closes its queue from its own callback",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2319",
+    "summary": "nexus-xgameruntime: Dispatch spins forever when an inline-dispatching monitor's callback terminates the queue",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2318",
+    "summary": "nexus-xgameruntime: TaskQueue waiter can receive two canceled callbacks on termination",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2313",
+    "summary": "[Rollup] nexus-xgameruntime: low-severity findings",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2307",
+    "summary": "Atlas-nexus runtime: free XAsync state after completion (refcounted lifetime + provider worker holds)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2312",
+    "summary": "Atlas-nexus runtime: i386 xgameruntime.dll fails the async contract probes",
+    "type": "Bug",
+    "assignee": "Casey Novak",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2316",
+    "summary": "[Rollup] nexus-xgameruntime: low-severity findings",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2305",
+    "summary": "Atlas-nexus runtime: concurrent XAsyncGetResult/GetResultSize read the caller's buffer size from shared state",
+    "type": "Bug",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2314",
+    "summary": "nexus-xgameruntime: composite TaskQueue termination test crashes on repeat (null call)",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2311",
+    "summary": "nexus-xgameruntime: gamesave-files probe fails 3 checks without a UTF-8 locale",
+    "type": "Bug",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2315",
+    "summary": "nexus-xgameruntime: save writes put their temp file in the working directory as C.tmp",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2310",
+    "summary": "nexus-xgameruntime: component CI never runs the async probes with a DLL path",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2317",
+    "summary": "nexus-xgameruntime: no test covers Store receipt request-path formatting",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2308",
+    "summary": "[Rollup] Atlas-nexus: low-severity findings",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "when": "day"
+   },
+   {
+    "key": "ACME-2210",
+    "summary": "Fork long-match: CSS CPU-level picker never opens, so level changes stay at 9 and the walk can strand off-grid",
+    "type": "Bug",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part A: everything that does NOT need human recordings (bot-play data, IDM v0, YouTube corpus, eval + RL machinery)",
+    "when": "day"
+   }
+  ],
+  "open": [
+   {
+    "key": "ACME-2386",
+    "summary": "Retire the org brief; move decisions, permissions and model quality to a web-only Insights page",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2393",
+    "summary": "Daily Brief: standup prompt and Haiku-vs-Sonnet quality evaluation",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2392"
+    ]
+   },
+   {
+    "key": "ACME-2391",
+    "summary": "Daily Brief: per-org meeting schedule store, route and the hub<->agent wire contract",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2399",
+    "summary": "[Rollup] Turma: low-severity findings",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": null,
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2354",
+    "summary": "Atlas-nexus: ship the launch-view cleanup to gamehost (upstream PR or fork backend path)",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-2365",
+    "summary": "Beacon: controller play in Battle.net games (WoW gamepad mode)",
+    "type": "Task",
+    "assignee": "Blake Okafor",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-2363"
+    ]
+   },
+   {
+    "key": "ACME-2371",
+    "summary": "node-1 hard-froze 2026-10-28 (8.5 min dark); freeze now on 2 of 3 identical nodes — needs memtest/SOL at the rack",
+    "type": "Bug",
+    "assignee": "Blake Okafor",
+    "epic": null,
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   },
+   {
+    "key": "ACME-1469",
+    "summary": "[Model B] IDM v1: train on bot + human recordings; gate on held-out human sessions AND the YouTube-style eval set",
+    "type": "Task",
+    "assignee": "Devon Rivera",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "status": "In Progress",
+    "daysInStatus": 2,
+    "blockedBy": [
+     "ACME-1463",
+     "ACME-1462",
+     "ACME-1468"
+    ]
+   },
+   {
+    "key": "ACME-1468",
+    "summary": "[Model B] GATE: confirm we have enough high-quality human recordings (closes only when sufficient; blocks all of this epic)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "status": "In Progress",
+    "daysInStatus": null,
+    "blockedBy": [
+     "ACME-1260",
+     "ACME-1273",
+     "ACME-1274",
+     "ACME-1280",
+     "ACME-1326",
+     "ACME-1472"
+    ]
+   },
+   {
+    "key": "ACME-2291",
+    "summary": "Atlas-nexus: make 007 First Light run (exits with code 5 after cloud save sync)",
+    "type": "Task",
+    "assignee": "Avery Chen",
+    "epic": "Atlas Nexus (upstream + public fork) for Game Pass PC in gamehost",
+    "status": "In Review",
+    "daysInStatus": null,
+    "blockedBy": []
+   }
+  ],
+  "next": [
+   {
+    "key": "ACME-1229",
+    "summary": "[Model B] RL fine-tune from the base model: APPO with a KL tie to the base, CPU L1->L9 curriculum, champion checkpoint",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1470",
+    "summary": "[Model B] Label the YouTube corpus at scale with IDM v1 (confidence-filtered, both players)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1471",
+    "summary": "[Model B] Pretrain the base model on labelled YouTube + human (+ filtered bot) data; ablate vs human-only BC",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "High",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1230",
+    "summary": "[M5] Self-play league: P2 driven by past policy snapshots through a second socket player",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-1237",
+    "summary": "[Deploy] Real-Switch deploy of the champion: pixel-only ONNX/TensorRT actor, HDMI + serial, latency profile",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Robo model, part B: everything that depends on human recordings (IDM v1, YouTube labelling, base model, RL fine-tune, deploy)",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2368",
+    "summary": "Beacon: Battle.net acceptance and compatibility matrix on node-4",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Battle.net in gamehost: Blizzard games incl. WoW, controller play, managed WoW addons",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2394",
+    "summary": "Daily Brief: agent render worker (renderDailyBrief command -> lockdown model run -> heartbeat result)",
+    "type": "Task",
+    "assignee": "Casey Novak",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   },
+   {
+    "key": "ACME-2395",
+    "summary": "Daily Brief: hub scheduler, host dispatch, result ingest and brief store",
+    "type": "Task",
+    "assignee": "Emery Sato",
+    "epic": "Daily Brief: a per-org standup summary written by an agent before each org's daily meeting",
+    "priority": "Medium",
+    "why": "same epic/parent as recent work"
+   }
+  ],
+  "truncated": true
+ }
+}
