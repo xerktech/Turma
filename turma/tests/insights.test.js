@@ -52,7 +52,7 @@ let orgKeys = [];
 // update() has seen the sites the data names); null = the plain stub above.
 let orgHooks = null;
 
-function loadHelpers(fetchReply = null, hash = "#permissions", storage = null) {
+function loadHelpers(fetchReply = null, hash = "#permissions", storage = null, board = null) {
   const els = {};
   const sse = [];
   const fetches = [];
@@ -113,7 +113,7 @@ function loadHelpers(fetchReply = null, hash = "#permissions", storage = null) {
     TurmaOrg: { get: () => (orgKeys.length === 1 ? orgKeys[0] : ""), getKeys: () => (orgHooks ? orgHooks.getKeys() : orgKeys),
       update: (d) => { if (orgHooks) orgHooks.update(d); }, filter: (a) => orgFilter(a),
       subscribe: noop, sse: noop, orgColors: () => ({}) },
-    TurmaBoard: { orgName: (k, o) => o || k, orgColorMap: () => ({}),
+    TurmaBoard: board || { orgName: (k, o) => o || k, orgColorMap: () => ({}),
       mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
   };
@@ -230,6 +230,21 @@ test("XERK-2386: a decisions card names its org as the hosts report it, not the 
   P.renderDecisions({ agents: [{ org: "acme.atlassian.net", jira: { siteKey: "acme.atlassian.net", orgName: "Acme Corp" } }],
     decisions: { "acme.atlassian.net": [{ at: 1000, source: "note", text: "n" }] } }, 5000);
   assert.match(P.els.decisionsLog.innerHTML, /<span class="dec-org-name">Acme Corp <span class="n">1<\/span>/);
+});
+
+test("XERK-2386: a decisions card names a split org as the header does, escaped (real board.js)", () => {
+  const board = require("../public/board.js");
+  const site = "acme.atlassian.net";
+  const host = (device, orgName, online) => ({ device, org: site, online,
+    jira: { siteKey: site, user: `${device}@x.com`, orgName, fetchedAt: "2026-10-29T12:00:00Z", tickets: [] } });
+  const agents = [host("acme-a", "Acme <img src=x onerror=alert(1)>", true), host("acme-b", "Acme Corp", false)];
+  const header = board.orgName(site, board.mergeSites(agents).find((s) => s.siteKey === site).orgName);
+  const P = loadHelpers(null, "", null, board);
+  P.renderDecisions({ agents, decisions: { [site]: [{ at: 1000, source: "note", text: "n" }] } }, 5000);
+  const html = P.els.decisionsLog.innerHTML;
+  const shown = html.match(/<span class="dec-org-name">(.*?) <span class="n">/)[1];
+  assert.equal(shown, header.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+  assert.equal(html.includes("<img"), false);
 });
 
 test("XERK-2386: an org's decisions card collapses to its heading, and stays so across repaints and loads", () => {
