@@ -116,6 +116,7 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
         is retired**: `identityOf` ignores it, `nameTokenRefusal` still sees it. Deleting it
         un-retired the OLD name's token, so revoking the new name re-opened the old one (QA).
         A plain Remove of the origin name drops the tombstone, as it releases any name.
+        `trimAgentIdentities` never evicts one, and a master enroll for that name mints afresh.
       - The revoked host's OWN name token is un-retired on purpose (it is the re-provision path).
         Name tokens are deterministic, so one the machine ever held works again: residual.
       - Written through to disk before the 200 (the file store debounces 5s; a kill lost it).

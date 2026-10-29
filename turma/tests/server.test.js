@@ -27495,6 +27495,14 @@ test("XERK-2383: Remove host with ?identity=revoke retires the agent's identity 
   const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.agents
     .find((a) => a.key === "rev2383");
   assert.equal(served.identityBound, true, "the dashboard is told there is an identity to revoke");
+  // A forged flag from a heartbeat never reaches the wire.
+  await request("POST", "/api/heartbeat", { body: { device: "forge2383", identityBound: true },
+    headers: { ...asAuth(hostAgentToken("forge2383")), "content-type": "application/json" } });
+  const forged = (await request("GET", "/api/agents", { headers: userHeaders })).body.agents
+    .find((a) => a.key === "forge2383");
+  assert.ok(forged);
+  assert.equal(forged.identityBound, undefined);
+  forget2381("forge2383");
   // A live agent holding its tunnel is cut off by the revoke, not at its next reconnect.
   const ctrl = await wsConnect(`/agent/control?name=rev2383&token=${encodeURIComponent(tok)}`);
   assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
@@ -27547,9 +27555,26 @@ test("XERK-2383: revoking a renamed agent keeps its original name's token retire
   assert.equal(hub.identityEntry(uid).revoked, true);
   assert.equal(hub.coerceAgentIdentities(JSON.parse(JSON.stringify(hub.agentIdentities())))[uid].revoked, true,
     "the tombstone survives a reload");
-  // The tombstone proves nothing and has no name to revoke again.
+  // The tombstone proves nothing, has no name to revoke again, and survives a registry trim.
   assert.equal(uidHostClaim(uid, "orig2383"), false);
+  const ids = hub.agentIdentities();
+  const filler = [];
+  for (let i = 0; i < 1030; i++) {
+    const u = (0x2383000 + i).toString(16).padStart(32, "0");
+    ids[u] = { home: `fill2383-${i}`, at: 1 };
+    filler.push(u);
+  }
+  hub.trimAgentIdentities();
+  assert.equal(hub.identityEntry(uid).revoked, true, "a trim never evicts a tombstone");
+  for (const u of filler) delete ids[u];
   assert.equal((await request("DELETE", "/api/agents/new2383?identity=revoke", { headers: userHeaders })).status, 404);
+  // A master-bootstrap enroll for the old name mints afresh, never the tombstone.
+  const fresh = resolveEnrollToken({ headers: asAuth("agenttok") }, "orig2383");
+  assert.equal(fresh.status, 200, JSON.stringify(fresh.body));
+  assert.notEqual(tokenUid(fresh.body.token), uid);
+  assert.equal(hub.identityEntry(uid), null, "the tombstone is dropped, not re-issued");
+  delete hub.agentIdentities()[tokenUid(fresh.body.token)];
+  hub.agentIdentities()[uid] = { origin: "orig2383", home: "new2383", at: 1, used: true, revoked: true };
   // The operator releases the old name deliberately with a plain Remove, as for any reinstall.
   await request("DELETE", "/api/agents/orig2383", { headers: userHeaders });
   assert.equal(hub.identityEntry(uid), null, "the tombstone goes with the name it guarded");

@@ -1273,7 +1273,8 @@ function nameTokenRefusal(host) {
   const minted = identityEntry(identityByOrigin(host));
   if (minted && minted.used) {
     return `${host} now authenticates with its agent identity token; its name-derived token is ` +
-      `retired (remove ${host} from the dashboard to release the name for a reinstall)`;
+      `retired (Remove host on its card, or DELETE /api/agents/${host} once it has none, releases ` +
+      "the name for a reinstall)";
   }
   const a = Object.prototype.hasOwnProperty.call(agents, host) ? agents[host] : null;
   if (a && a.agentUid) {
@@ -1376,12 +1377,14 @@ function issueAgentUid(host) {
   if (a && a.agentUid !== uid && hostOfUid(uid) === host) { a.agentUid = uid; publishAgent(host); }
   return uid;
 }
-// Bound the registry, oldest first — never an identity a live record is bound to.
+// Bound the registry, oldest first — never an identity a live record is bound to,
+// nor a revoked tombstone (XERK-2383: trimming one would un-retire its origin
+// name's token; they are minted only by an operator revoke, so few).
 function trimAgentIdentities(keep) {
   const ids = Object.keys(agentIdentities);
   if (ids.length <= AGENT_IDENTITIES_MAX) return;
   const bound = new Set(Object.values(agents).map((a) => a && a.agentUid).filter(Boolean));
-  ids.filter((u) => u !== keep && !bound.has(u))
+  ids.filter((u) => u !== keep && !bound.has(u) && !agentIdentities[u].revoked)
     .sort((x, y) => (agentIdentities[x].at || 0) - (agentIdentities[y].at || 0))
     .slice(0, ids.length - AGENT_IDENTITIES_MAX)
     .forEach((u) => { delete agentIdentities[u]; });
@@ -24088,7 +24091,7 @@ if (process.env.TURMA_TEST) {
     uidHostClaim,
     hostOfUid,
     uidHostRefusal,
-    revokeHostIdentities, identityEntry,
+    revokeHostIdentities, identityEntry, trimAgentIdentities,
     nameTokenRefusal,
     agentIdentities: () => agentIdentities,
     coerceAgentIdentities,

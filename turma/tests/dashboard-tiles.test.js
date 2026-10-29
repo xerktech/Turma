@@ -704,6 +704,7 @@ test("XERK-2383: a host with an agent identity offers Remove + revoke token, onl
   assert.match(g, /revokeHost\('stolen'\)/);
   // A host on the shared master, or on its name token, has no identity to revoke.
   D.render({ now, agents: [{ ...liveHost("shared", 1), tokenBound: false },
-    { ...liveHost("named", 1, null), tokenBound: true }] });
+    { ...liveHost("named", 1, null), tokenBound: true },
+    { ...liveHost("offnamed", 1, null), tokenBound: true, online: false }] });
   assert.doesNotMatch(D.els.groups.innerHTML, /revokeHost/);
 });
