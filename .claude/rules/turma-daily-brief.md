@@ -31,8 +31,11 @@ The web surface of the Daily Brief (epic XERK-2390). The wire it reads is
   - **A repaint also waits out a pointer press in the list** (`pointerDown`, released on window
     `pointerup`/`pointercancel`): a swap between mousedown and mouseup dispatches no click, so the
     first Save after a select/checkbox change was lost (QA). Same trap as the dashboard's.
-  - The press is released on `contextmenu` and window `blur` too, so a lost pointerup never
-    holds every paint.
+  - The press is released on `contextmenu` and the WINDOW's `blur` too, so a lost pointerup
+    never holds every paint. **Never a capture `blur`**: it fires for the field the press itself
+    blurs and swapped the list mid-press (QA).
+  - Save goes `aria-disabled` while busy, never `disabled`: a disabled button drops keyboard
+    focus to `<body>`; `schedBusy` refuses a second submit.
   - The gear and Discard paint with `force` at the click; every repaint gives focus back to the
     button/field it was on. `force` never overrides a pointer press.
   - **Busy state and a save's error go straight onto the controls** (`patchSave`/`patchRun`),

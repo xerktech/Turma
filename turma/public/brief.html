@@ -81,6 +81,7 @@
   .sched-next { color: var(--ink-2); }
   .sched-err { color: var(--critical-text); overflow-wrap: anywhere; }
   .sched-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .sched-actions button[aria-disabled="true"] { opacity: 0.5; cursor: default; }
   .brief-empty { color: var(--muted); font-size: 14px; padding: 24px 0; }
   .pane-note { color: var(--muted); font-size: 12px; margin: 16px 0 0; }
 
@@ -212,7 +213,7 @@ function scheduleHtml(site, stored) {
     + `</div>`
     + (next ? `<div class="sched-next">${next}</div>` : "")
     + (err ? `<div class="sched-err">${esc(err)}</div>` : "")
-    + `<div class="sched-actions"><button type="submit" class="primary btn-sm" data-sched-save="${esc(site)}"${busy ? " disabled" : ""}>${busy ? "Saving…" : "Save schedule"}</button>`
+    + `<div class="sched-actions"><button type="submit" class="primary btn-sm" data-sched-save="${esc(site)}" aria-disabled="${busy}">${busy ? "Saving…" : "Save schedule"}</button>`
     + (drafts.has(site) ? `<button type="button" class="btn-sm" data-sched-reset="${esc(site)}">Discard changes</button>` : "")
     + `</div></form></div>`;
 }
@@ -347,7 +348,9 @@ function patchSave(site) {
   if (!form) return;
   const busy = schedBusy.has(site);
   const btn = form.querySelector("[data-sched-save]");
-  if (btn) { btn.disabled = busy; btn.textContent = busy ? "Saving…" : "Save schedule"; }
+  // aria-disabled, not disabled: a disabled button drops keyboard focus to
+  // <body>; schedBusy already refuses a second submit.
+  if (btn) { btn.setAttribute("aria-disabled", String(busy)); btn.textContent = busy ? "Saving…" : "Save schedule"; }
   const text = schedErr.get(site);
   let err = form.querySelector(".sched-err");
   if (text && !err) {
@@ -400,11 +403,12 @@ $briefs.addEventListener("focusout", flushHeld);
 $briefs.addEventListener("pointerdown", () => { pointerDown = true; }, true);
 // Released anywhere (a press can end off the list). The flush is a task later,
 // so the click this press makes has been dispatched first.
-// A context menu or a lost window can eat the pointerup; neither may leave
-// every background paint held.
-for (const ev of ["pointerup", "pointercancel", "contextmenu", "blur"]) {
-  addEventListener(ev, () => { if (pointerDown) { pointerDown = false; flushHeld(); } }, true);
-}
+// A context menu or the window losing focus can eat the pointerup; neither may
+// leave every background paint held. `blur` only for the WINDOW: on capture it
+// also fired for the field the press itself blurred, swapping the list mid-press (QA).
+function releasePress() { if (pointerDown) { pointerDown = false; flushHeld(); } }
+for (const ev of ["pointerup", "pointercancel", "contextmenu"]) addEventListener(ev, releasePress, true);
+addEventListener("blur", (e) => { if (e.target === window) releasePress(); });
 
 // The next run is the hub's to compute (DST, the lead window), so it is read
 // from GET .../schedule for each shown org with a schedule: again when the

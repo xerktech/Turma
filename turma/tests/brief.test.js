@@ -81,6 +81,7 @@ function loadPage(reply = null, agents = null) {
     setInterval: () => 0, clearInterval: noop,
     setTimeout: (fn) => { timers.push(fn); return timers.length; }, clearTimeout: noop,
     addEventListener: (name, fn) => { (winListeners[name] ||= []).push(fn); }, removeEventListener: noop,
+    window: { name: "the window" },
     console, Date, Math, JSON, Intl, encodeURIComponent, Number, String, Object, Array, Map, Set,
     TurmaNav: { preserveScroll: (el, paint) => paint(), toast: (m) => toasts.push(m),
       refusalText: (what, status, body) => {
@@ -100,7 +101,7 @@ function loadPage(reply = null, agents = null) {
   const list = els.briefList;
   // What a test puts "inside" the list: the focused element counts as inside.
   list.contains = (el) => !!el && el.inside === true;
-  return Object.assign(api, { els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document,
+  return Object.assign(api, { els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document, window: stubs.window,
     list: () => list.innerHTML, fire: (name, data) => sse[0].handlers[name]({ data: JSON.stringify(data) }) });
 }
 
@@ -426,7 +427,8 @@ const fieldIn = (f, value, site = SITE) => ({ tagName: "INPUT", inside: true, da
 
 // A stand-in for one org's rendered form: what patchSave touches.
 function fakeForm(site) {
-  const btn = { dataset: { schedSave: site }, disabled: false, textContent: "Save schedule" };
+  const btn = { dataset: { schedSave: site }, aria: "false", textContent: "Save schedule",
+    setAttribute(k, v) { if (k === "aria-disabled") this.aria = v; } };
   const form = { dataset: { sched: site }, btn, err: null,
     querySelector(sel) { return sel === "[data-sched-save]" ? btn : sel === ".sched-err" ? this.err : null; },
     insertBefore(el) { this.err = el; el.remove = () => { form.err = null; }; } };
@@ -449,12 +451,12 @@ test("XERK-2396: Save's busy state and error reach the controls while a field ho
   P.document.activeElement = fieldIn("leadMinutes", "7");
   const listBefore = P.list();
   const first = P.saveSchedule(SITE);
-  assert.deepEqual([form.btn.disabled, form.btn.textContent], [true, "Saving…"]);
+  assert.deepEqual([form.btn.aria, form.btn.textContent], ["true", "Saving…"]);
   assert.equal(P.list(), listBefore, "no swap under the focused field");
   // A 400 comes back while the field still has focus.
   releases[0]({ ok: true, schedule: null, next: null });
   await first;
-  assert.deepEqual([form.btn.disabled, form.btn.textContent], [false, "Save schedule"], "never left stuck");
+  assert.deepEqual([form.btn.aria, form.btn.textContent], ["false", "Save schedule"], "never left stuck");
   assert.equal(P.list(), listBefore, "the answer swaps nothing under a field that may hold a half-typed time");
   // The QA repro: the next Save is sent.
   const second = P.saveSchedule(SITE);
@@ -475,7 +477,10 @@ test("XERK-2396: a refused Save shows its error on the form at once, focus in a 
   P.document.activeElement = fieldIn("leadMinutes", "99");
   await P.saveSchedule(SITE);
   assert.equal(form.err && form.err.textContent, "Saving the schedule failed — leadMinutes must be a whole number from 1 to 30");
-  assert.equal(form.btn.disabled, false);
+  assert.equal(form.btn.aria, "false");
+  // A later success clears that error on the form, focus still in the field.
+  P.document.activeElement = fieldIn("leadMinutes", "9");
+  await P.saveSchedule(SITE);
 });
 
 test("XERK-2396: Run now's button is disabled in flight and released after, whatever has focus", async () => {
@@ -524,4 +529,84 @@ test("XERK-2396: a repaint gives focus back to the same weekday box", () => {
   d.dailyBriefs = { [SITE]: [okBrief({ day: "Changed." })] };
   P.renderBriefs(d, NOW, true);
   assert.deepEqual(hits, ["3"]);
+});
+
+test("XERK-2396: a successful Save takes a shown error off the form at once", async () => {
+  let fail = true;
+  const P = loadPage((url, init) => (init.method === "PUT"
+    ? (fail ? { status: 400, body: { error: "bad" } } : { ok: true, schedule: null, next: null }) : { ok: true, next: null }));
+  const d = data();
+  P.setCache(d);
+  P.schedOpen.add(SITE);
+  P.renderBriefs(d, NOW);
+  const form = fakeForm(SITE);
+  P.els.briefList.querySelectorAll = (sel) => (sel === "[data-sched]" ? [form] : []);
+  P.document.createElement = () => ({ className: "", textContent: "" });
+  P.document.activeElement = fieldIn("leadMinutes", "9");
+  await P.saveSchedule(SITE);
+  assert.ok(form.err);
+  fail = false;
+  await P.saveSchedule(SITE);
+  assert.equal(form.err, null);
+});
+
+test("XERK-2396: Run now's answer keeps the button off while the org's run is running, and swaps no focused field", async () => {
+  const P = loadPage((url, init) => (init.method === "POST"
+    ? { ok: true, brief: { runId: "q3", status: "running", trigger: "manual", meetingAt: NOW, startedAt: NOW, model: "haiku", host: "h" } }
+    : { ok: true, next: null }));
+  const d = data();
+  P.setCache(d);
+  P.renderBriefs(d, NOW);
+  const before = P.list();
+  const btn = { dataset: { run: SITE }, disabled: false };
+  P.els.briefList.querySelectorAll = (sel) => (sel === "[data-run]" ? [btn] : []);
+  P.document.activeElement = fieldIn("time", "09:00");
+  await P.runNow(SITE);
+  assert.equal(btn.disabled, true, "the run it started is running");
+  assert.equal(P.list(), before, "the answer is a background paint");
+});
+
+test("XERK-2396: a press is released by the window losing focus, never by a field's blur", () => {
+  const P = loadPage();
+  const d = data();
+  P.setCache(d);
+  P.renderBriefs(d, NOW);
+  for (const fn of P.els.briefList.listeners.pointerdown) fn({});
+  d.dailyBriefs = { [SITE]: [okBrief({ day: "Held." })] };
+  P.renderBriefs(d, NOW);
+  // The press blurred the focused field: still pressed.
+  for (const fn of P.winListeners.blur || []) fn({ target: { tagName: "INPUT" } });
+  P.runTimers();
+  assert.doesNotMatch(P.list(), /Held\./);
+  // A context menu ate the pointerup: released.
+  for (const fn of P.winListeners.contextmenu) fn({});
+  P.runTimers();
+  assert.match(P.list(), /Held\./);
+});
+
+test("XERK-2396: the window losing focus mid-press releases it", () => {
+  const P = loadPage();
+  const d = data();
+  P.setCache(d);
+  P.renderBriefs(d, NOW);
+  for (const fn of P.els.briefList.listeners.pointerdown) fn({});
+  d.dailyBriefs = { [SITE]: [okBrief({ day: "Held." })] };
+  P.renderBriefs(d, NOW);
+  for (const fn of P.winListeners.blur) fn({ target: P.window });
+  P.runTimers();
+  assert.match(P.list(), /Held\./);
+});
+
+test("XERK-2396: a repaint keeps keyboard focus on Save", () => {
+  const P = loadPage();
+  const d = data();
+  P.setCache(d);
+  P.schedOpen.add(SITE);
+  P.renderBriefs(d, NOW);
+  let focused = 0;
+  P.els.briefList.querySelectorAll = (sel) => (sel === "button" ? [{ dataset: { schedSave: SITE }, focus: () => { focused++; } }] : []);
+  P.document.activeElement = { tagName: "BUTTON", inside: true, dataset: { schedSave: SITE } };
+  d.dailyBriefs = { [SITE]: [okBrief({ day: "Changed." })] };
+  P.renderBriefs(d, NOW);
+  assert.equal(focused, 1);
 });
