@@ -333,6 +333,12 @@ retraction, `pushEnabled`.
   - **Auth cookies are `SameSite=Lax` (+ `Secure` over HTTPS)** (`authCookie`): the hub is never
     embedded cross-site, and Lax still rides the OIDC callback's top-level GET back from the IdP.
   - Tests: the `XERK-268:` cases in `server.test.js`.
+  - **Every response carries `frame-ancestors 'self'` + `X-Frame-Options: SAMEORIGIN`**
+    (XERK-2399). The only framer is the Sessions page's same-origin `/term` iframe.
+  - **`/term`, `/live` and `/audio` upgrades refuse a browser Origin that is not the hub's own**
+    (`sameOriginUpgrade`: Host or X-Forwarded-Host, default port normalized; no Origin = not a
+    browser, auth alone). ttyd runs writable with no `-O`, and a same-site sibling sends the Lax
+    cookie. Never extend it to `/agent/*`: agents are token-authed. Tests: `XERK-2399:`.
 
 ### The agent registry's ceiling (XERK-272)
 

@@ -3225,3 +3225,48 @@ test("buildItems: a framing tag inside an operator's code fence is their text (r
   // Claude Code's own matched paste framing goes even inside the operator's fence.
   assert.equal(byId.i.text, "look at this log:\n```\n\n\nE1 boom\nE2 boom\n\n```\nwhy does it fail?");
 });
+
+// XERK-2399: hubRefused/authExpired had no unit coverage — blanking the toast
+// line or the /login redirect left every chat/sessions test green. Driven
+// through answerPanePrompt, whose refusal funnels through hubRefused like
+// send/stop/every model switch.
+async function refusedAnswer(status, body) {
+  const toasts = [];
+  const location = { href: "/sessions" };
+  const realFetch = global.fetch;
+  const realDoc = global.document;
+  const realWin = global.window;
+  const realNav = global.TurmaNav;
+  global.document = { getElementById: () => null, querySelectorAll: () => [],
+                      addEventListener() {} };
+  global.window = { location };
+  global.TurmaNav = {
+    toast: (t) => toasts.push(t),
+    refusalText: (what, st, b) => `${what}: HTTP ${st}: ${(b && b.error) || ""}`,
+  };
+  global.fetch = () => Promise.resolve({ ok: false, status, json: async () => body });
+  try {
+    __setSess({ id: "AAAAA" });
+    __setHostKey("hostA");
+    await answerPanePrompt(1, { prompt: "Do you want to proceed?", options: [] });
+  } finally {
+    global.fetch = realFetch;
+    if (realDoc === undefined) delete global.document; else global.document = realDoc;
+    if (realWin === undefined) delete global.window; else global.window = realWin;
+    if (realNav === undefined) delete global.TurmaNav; else global.TurmaNav = realNav;
+    __setPanePromptActive(false);
+  }
+  return { toasts, location };
+}
+
+test("XERK-2399: a hub refusal is toasted in the hub's own words", async () => {
+  const { toasts, location } = await refusedAnswer(409, { error: "host is in another org" });
+  assert.deepEqual(toasts, ["Answer: HTTP 409: host is in another org"]);
+  assert.equal(location.href, "/sessions", "a non-401 refusal never navigates");
+});
+
+test("XERK-2399: a 401 bounces to /login instead of toasting", async () => {
+  const { toasts, location } = await refusedAnswer(401, { error: "unauthorized" });
+  assert.equal(location.href, "/login");
+  assert.deepEqual(toasts, [], "an expired session is a re-login, not an error toast");
+});
