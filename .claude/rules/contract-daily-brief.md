@@ -70,7 +70,9 @@ ticket builds to this file; change it here first.
   - `week` = `thisWeek`;
   - `next` = each `upNext[].text`, or "Nothing is queued next." when the list is empty.
   - `parse_daily_brief` refuses a brief whose joined `day` or `next` would pass 2000 chars
-    (`DAILY_BRIEF_WIRE_TEXT_MAX`), so the hub never cuts a script mid-sentence.
+    (`DAILY_BRIEF_WIRE_TEXT_MAX`), so the hub never cuts a script mid-sentence. Chars are
+    Unicode CODE POINTS on both sides: the hub must count `[...s].length`, never `s.length`
+    (UTF-16 units), or an emoji-bearing script passes here and is cut there.
 
 ## Agent → hub: the heartbeat
 

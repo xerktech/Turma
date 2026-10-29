@@ -54969,6 +54969,11 @@ class TestDailyBriefPrompt(unittest.TestCase):
         self.assertTrue(any("joined next" in p for p in ha.daily_brief_problems(b, self.DATA)))
         b = self._brief(sinceYesterday="x" * 999, stillOpen="x" * 1000)
         self.assertEqual(ha.daily_brief_problems(b, self.DATA), [])
+        b = self._brief(sinceYesterday="x" * 1000, stillOpen="x" * 1000)
+        self.assertTrue(any("joined day" in p for p in ha.daily_brief_problems(b, self.DATA)))
+        # Measured as the wire joins it: whitespace collapsed first.
+        b = self._brief(sinceYesterday=("x" * 999) + " " * 150, stillOpen="x" * 1000)
+        self.assertEqual(ha.daily_brief_problems(b, self.DATA), [])
 
     def test_keys_from_the_data_and_hashes_are_allowed(self):
         b = self._brief(sinceYesterday="XERK-1 and XERK-2 closed, see PR #12.",
