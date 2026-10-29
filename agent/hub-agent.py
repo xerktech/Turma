@@ -22632,25 +22632,40 @@ def _shape_issue(issue, site_key):
     }
 
 
-def fetch_jira_issues(jql, max_issues):
+_JIRA_LIST_FIELDS = ("summary,status,priority,issuetype,updated,created,"
+                     "resolutiondate,duedate,labels,project,parent,issuelinks")
+
+
+def fetch_jira_issues(jql, max_issues, extra_fields=()):
     """All issues matching a JQL, shaped, via GET /rest/api/3/search/jql —
     the nextPageToken-paginated replacement for the removed (410 since 2025)
     /rest/api/3/search. Returns (tickets, truncated): truncated means the cap
-    (or the page bound) cut the result short."""
+    (or the page bound) cut the result short.
+
+    `extra_fields` (raw Jira field ids) are also requested and ride each ticket
+    UNSHAPED as `_fields` — for an internal reader (the daily brief), never the
+    heartbeat, which calls this without them."""
     site_key = normalize_jira_site(JIRA_SITE)
+    fields = _JIRA_LIST_FIELDS
+    extra = [f for f in extra_fields if f not in fields.split(",")]
+    if extra:
+        fields += "," + ",".join(extra)
     tickets, token = [], None
     for _ in range(JIRA_MAX_PAGES):
         params = {
             "jql": jql,
             "maxResults": min(JIRA_PAGE_SIZE, max_issues - len(tickets)),
-            "fields": "summary,status,priority,issuetype,updated,created,"
-                      "resolutiondate,duedate,labels,project,parent,issuelinks",
+            "fields": fields,
         }
         if token:
             params["nextPageToken"] = token
         data = jira_get("/rest/api/3/search/jql", params)
         for issue in data.get("issues") or []:
-            tickets.append(_shape_issue(issue, site_key))
+            t = _shape_issue(issue, site_key)
+            if extra_fields:
+                raw = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+                t["_fields"] = {k: raw.get(k) for k in extra_fields}
+            tickets.append(t)
         token = data.get("nextPageToken")
         if not token:
             return tickets, False
@@ -23557,11 +23572,13 @@ def _azure_parent_types(parent_ids, known=None, known_projects=None):
     return types
 
 
-def fetch_azure_items(ids, site_key, base):
+def fetch_azure_items(ids, site_key, base, extra_fields=()):
     """Batch-GET work items by id, shaped. Parents outside the batch get one
     extra type-only GET so an Epic/Feature parent sets `epicKey` (XERK-1444),
-    and each project's portfolio levels are read (cached) first (XERK-1888)."""
-    raw = _azure_batch_get(ids, _AZDO_LIST_FIELDS)
+    and each project's portfolio levels are read (cached) first (XERK-1888).
+    `extra_fields` ride each ticket unshaped as `_fields`, as fetch_jira_issues'."""
+    raw = _azure_batch_get(ids, _AZDO_LIST_FIELDS + [
+        f for f in extra_fields if f not in _AZDO_LIST_FIELDS])
     known = {str(wi["id"]): (wi.get("fields") or {}).get("System.WorkItemType")
              for wi in raw}
     known_projects = {str(wi["id"]): (wi.get("fields") or {}).get("System.TeamProject")
@@ -23572,7 +23589,14 @@ def fetch_azure_items(ids, site_key, base):
     # assigned item lives in has its own process, read too.
     _azure_note_portfolio(site_key, list(known_projects.values()) + [
         _AZDO_PARENT_PROJECT_CACHE.get(str(p)) for p in parent_ids if p is not None])
-    return [_shape_azure_item(wi, site_key, base, parent_types) for wi in raw]
+    out = []
+    for wi in raw:
+        t = _shape_azure_item(wi, site_key, base, parent_types)
+        if extra_fields:
+            f = wi.get("fields") or {}
+            t["_fields"] = {k: f.get(k) for k in extra_fields}
+        out.append(t)
+    return out
 
 
 def collect_azure():
@@ -24142,6 +24166,337 @@ def collect_board():
     block["orgName"] = BOARD_ORG_NAME or None
     return block
 
+
+# --- Daily Brief collector (XERK-2392, epic XERK-2390) -------------------------
+# A team standup reads the ORG's tickets over a time window, which the board's
+# collection can't answer: it is assignee-scoped and keeps Done by `updated`.
+# This is a separate, read-only, bounded pass whose output is handed to a model,
+# so it carries summaries only (no URLs, no descriptions) under hard row and
+# character caps. NETWORK: run it on a worker, never the beat (XERK-395).
+DAILY_BRIEF_JQL_SCOPE = os.environ.get("TURMA_DAILY_BRIEF_JQL_SCOPE", "").strip()
+DAILY_BRIEF_WIQL_SCOPE = os.environ.get("TURMA_DAILY_BRIEF_WIQL_SCOPE", "").strip()
+DAILY_BRIEF_MAX_CLOSED = 60       # rows of closed work kept (newest first)
+DAILY_BRIEF_MAX_OPEN = 60         # rows of in-progress work kept
+DAILY_BRIEF_MAX_NEXT = 8          # next-up candidates kept
+DAILY_BRIEF_FETCH_MAX = 200       # issues read per query (before filtering)
+DAILY_BRIEF_PROJECTS_MAX = 20     # projects named in one scope clause
+DAILY_BRIEF_RELATED_MAX = 50      # parent / unblocked keys named in one clause
+DAILY_BRIEF_TEXT_MAX = 160        # chars per summary / name
+DAILY_BRIEF_MAX_CHARS = 24000     # the whole JSON the model receives
+_DAILY_BRIEF_PROJECT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+# Any scheme://, mailto:/file:, scp-style git@host:path, www.* — and emails.
+_DAILY_BRIEF_URL_RE = re.compile(
+    r"(?i)[a-z][a-z0-9+.-]*://\S*|\b(?:mailto|file):\S+|\b[\w.-]+@[\w-]+(?:\.[\w-]+)*:\S+"
+    r"|\bwww\.\S+")
+_DAILY_BRIEF_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_DAILY_BRIEF_JIRA_EXTRA = ("assignee", "statuscategorychangedate")
+_DAILY_BRIEF_AZDO_EXTRA = ("System.AssignedTo", "Microsoft.VSTS.Common.StateChangeDate")
+# Lower = more urgent. Jira's stock names, then common synonyms; ADO's P1..P4
+# are read numerically. Unknown/absent sorts with Medium.
+_DAILY_BRIEF_PRIORITY = {"highest": 0, "blocker": 0, "critical": 0, "urgent": 0,
+                         "high": 1, "major": 1, "medium": 2, "normal": 2,
+                         "low": 3, "minor": 3, "lowest": 4, "trivial": 4}
+
+
+def _brief_text(v):
+    """One line, URLs dropped, capped — this text goes to a model."""
+    if not isinstance(v, str):
+        return None
+    # Cut first: the scrub regexes are superlinear on a long separator-free run.
+    # Zero-width/format chars could split a URL past the regex: drop them too.
+    v = "".join(ch for ch in v[:DAILY_BRIEF_TEXT_MAX * 4] if unicodedata.category(ch) != "Cf")
+    v = _DAILY_BRIEF_URL_RE.sub("[link]", " ".join(v.split()))
+    v = _DAILY_BRIEF_EMAIL_RE.sub("[email]", v)
+    return v[:DAILY_BRIEF_TEXT_MAX] or None
+
+
+def _brief_ts(v):
+    """An ISO timestamp (Jira's `+0000` or ADO's `Z`) as an aware datetime, else None."""
+    if not isinstance(v, str) or not v:
+        return None
+    v = v.strip().replace("Z", "+00:00")
+    # Python < 3.11 parses only 3 or 6 fraction digits; ADO writes 1 to 7.
+    v = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], v, count=1)
+    m = re.match(r"^(.*[T ]\d\d:\d\d(?::\d\d(?:\.\d+)?)?)([+-]\d\d):?(\d\d)$", v)
+    if m:
+        v = f"{m.group(1)}{m.group(2)}:{m.group(3)}"
+    try:
+        dt = datetime.datetime.fromisoformat(v)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+
+
+def _brief_in_window(closed, week_from, until):
+    """Keys of the fetched closed tickets that really resolved in the window —
+    the queries are widened a day, so the next-up lookup must not key on the rest."""
+    out = set()
+    for t in closed:
+        when = _brief_ts(t.get("resolved"))
+        if when is not None and week_from <= when < until:
+            out.add(t.get("key"))
+    return out
+
+
+def _brief_priority_rank(name):
+    s = (name or "").strip().lower() if isinstance(name, str) else ""
+    m = re.match(r"^p(\d)$", s)
+    if m:
+        return int(m.group(1)) - 1
+    return _DAILY_BRIEF_PRIORITY.get(s, 2)
+
+
+def _brief_person(v):
+    """An assignee's display name from Jira's user object or ADO's identity
+    (object, or the legacy "Name <email>" string) — never the email."""
+    if isinstance(v, dict):
+        v = v.get("displayName")
+    if isinstance(v, str):
+        v = re.sub(r"\s*<[^>]*>\s*$", "", v)
+    return _brief_text(v)
+
+
+def daily_brief_projects(board):
+    """The org's projects, as the board rows this host collected name them —
+    the default brief scope. Sorted, deduped, capped."""
+    tickets = (board or {}).get("tickets") if isinstance(board, dict) else None
+    names = {t.get("project") for t in tickets or [] if isinstance(t, dict)}
+    return sorted(n for n in names if isinstance(n, str) and n)[:DAILY_BRIEF_PROJECTS_MAX]
+
+
+def _brief_row(t, parents):
+    f = t.get("_fields") or {}
+    parent = t.get("parentKey")
+    return {
+        "key": t.get("key"),
+        "summary": _brief_text(t.get("summary")),
+        "type": _brief_text(t.get("type")),
+        "assignee": _brief_person(f.get("assignee", f.get("System.AssignedTo"))),
+        "epic": parents.get(parent) if parent else None,
+    }
+
+
+def _brief_days_in(t, until):
+    f = t.get("_fields") or {}
+    since = _brief_ts(f.get("statuscategorychangedate")
+                      or f.get("Microsoft.VSTS.Common.StateChangeDate"))
+    if since is None or since > until:
+        return None
+    return int((until - since).total_seconds() // 86400)
+
+
+def _brief_assemble(source, site_key, scope, day_from, week_from, until,
+                    closed_raw, open_raw, todo_raw, parents, truncated):
+    """Pure: the fetched rows -> the brief JSON. Shared by both sources, so a Jira
+    and an ADO org produce the same shape (XERK-43)."""
+    closed = []
+    for t in closed_raw:
+        when = _brief_ts(t.get("resolved"))
+        if t.get("statusCategory") != "done" or when is None \
+                or not (week_from <= when < until):
+            continue
+        row = _brief_row(t, parents)
+        row["when"] = "day" if when >= day_from else "week"
+        row["_at"] = when
+        closed.append(row)
+    closed.sort(key=lambda r: r["_at"], reverse=True)
+    if len(closed) > DAILY_BRIEF_MAX_CLOSED:
+        truncated = True
+    closed = closed[:DAILY_BRIEF_MAX_CLOSED]
+
+    open_rows = []
+    for t in open_raw:
+        if t.get("statusCategory") != "inprogress" or t.get("isEpic"):
+            continue
+        row = _brief_row(t, parents)
+        row["status"] = _brief_text(t.get("status"))
+        row["daysInStatus"] = _brief_days_in(t, until)
+        row["blockedBy"] = [k for k in t.get("blockedBy") or [] if isinstance(k, str)][:10]
+        open_rows.append(row)
+    if len(open_rows) > DAILY_BRIEF_MAX_OPEN:
+        truncated = True
+    open_rows = open_rows[:DAILY_BRIEF_MAX_OPEN]
+
+    # Next-up: To Do work tied to what moved — same parent as closed or in-progress
+    # work, or unblocked by something that closed in the window.
+    closed_keys = {r["key"] for r in closed}
+    active_parents = {t.get("parentKey") for t in closed_raw + open_raw
+                      if (t.get("key") in closed_keys
+                          or t.get("statusCategory") == "inprogress")
+                      and t.get("parentKey")}
+    seen, cands = set(), []
+    for t in todo_raw:
+        key = t.get("key")
+        if key in seen or t.get("statusCategory") != "todo" or t.get("isEpic"):
+            continue
+        unblocked = [k for k in t.get("blockedBy") or [] if k in closed_keys]
+        same_parent = t.get("parentKey") in active_parents
+        if not (unblocked or same_parent):
+            continue
+        seen.add(key)
+        row = _brief_row(t, parents)
+        row["priority"] = _brief_text(t.get("priority"))
+        row["why"] = (f"unblocked by {', '.join(unblocked[:3])}" if unblocked
+                      else "same epic/parent as recent work")
+        created = _brief_ts(t.get("created"))
+        cands.append((_brief_priority_rank(t.get("priority")),
+                      created or until, key or "", row))
+    cands.sort(key=lambda c: c[:3])
+    next_rows = [c[3] for c in cands[:DAILY_BRIEF_MAX_NEXT]]
+
+    for r in closed:
+        r.pop("_at", None)
+    out = {
+        "source": source,
+        "siteKey": site_key,
+        "window": {"dayFrom": day_from.isoformat(), "weekFrom": week_from.isoformat(),
+                   "until": until.isoformat()},
+        "scope": scope if isinstance(scope, str) else [_brief_text(n) for n in scope],
+        "closed": closed,
+        "open": open_rows,
+        "next": next_rows,
+        "truncated": bool(truncated),
+    }
+    # Character cap: shed from the bulkiest list (oldest closed / longest-open
+    # last rows first) until the whole thing fits.
+    while len(json.dumps(out, ensure_ascii=False)) > DAILY_BRIEF_MAX_CHARS:
+        lists = [out["closed"], out["open"], out["next"]]
+        biggest = max(lists, key=len)
+        if not biggest:
+            if out["scope"] == "trimmed":
+                break
+            out["scope"] = "trimmed"     # the scope names alone overflow the cap
+            continue
+        biggest.pop()
+        out["truncated"] = True
+    return out
+
+
+def _brief_parent_names_jira(tickets):
+    names = {}
+    for t in tickets:
+        raw = t.get("_fields") or {}
+        p = raw.get("parent")
+        pk = t.get("parentKey")
+        if pk and isinstance(p, dict) and isinstance(p.get("fields"), dict):
+            names.setdefault(pk, _brief_text(p["fields"].get("summary")))
+    return names
+
+
+def _collect_daily_brief_jira(day_from, week_from, until, projects):
+    site_key = normalize_jira_site(JIRA_SITE)
+    if DAILY_BRIEF_JQL_SCOPE:
+        scope_jql, scope = f"({DAILY_BRIEF_JQL_SCOPE})", "custom"
+    else:
+        keys = [p for p in projects or [] if isinstance(p, str)
+                and _DAILY_BRIEF_PROJECT_RE.fullmatch(p) and p.upper() not in ("AND", "OR", "NOT")]
+        keys = keys[:DAILY_BRIEF_PROJECTS_MAX]
+        if not keys:
+            return None
+        scope_jql, scope = f"project in ({', '.join(keys)})", keys
+    extra = _DAILY_BRIEF_JIRA_EXTRA + ("parent",)
+    # JQL dates read in the Jira user's own timezone, so the query is widened by
+    # a day and the window is enforced exactly on the returned `resolved`.
+    since = (week_from - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    closed, t1 = fetch_jira_issues(
+        f'{scope_jql} AND statusCategory = Done AND resolutiondate >= "{since}"'
+        " ORDER BY resolutiondate DESC", DAILY_BRIEF_FETCH_MAX, extra)
+    open_, t2 = fetch_jira_issues(
+        f'{scope_jql} AND statusCategory = "In Progress" ORDER BY updated DESC',
+        DAILY_BRIEF_FETCH_MAX, extra)
+    closed_keys = _brief_in_window(closed, week_from, until)
+    parents = sorted({t["parentKey"] for t in closed + open_
+                      if t.get("parentKey") and (t["key"] in closed_keys
+                                                 or t.get("statusCategory") == "inprogress")})
+    unblocks = sorted({k for t in closed if t["key"] in closed_keys
+                       for k in t.get("blocks") or []})
+    parents = [k for k in parents if JIRA_KEY_RE.match(k)][:DAILY_BRIEF_RELATED_MAX]
+    unblocks = [k for k in unblocks if JIRA_KEY_RE.match(k)][:DAILY_BRIEF_RELATED_MAX]
+    todo, t3 = [], False
+    related = []
+    if parents:
+        related.append(f"parent in ({', '.join(parents)})")
+    if unblocks:
+        related.append(f"key in ({', '.join(unblocks)})")
+    if related:
+        todo, t3 = fetch_jira_issues(
+            f'{scope_jql} AND statusCategory = "To Do" AND ({" OR ".join(related)})'
+            " ORDER BY created ASC", DAILY_BRIEF_FETCH_MAX, extra)
+    return _brief_assemble("jira", site_key, scope, day_from, week_from, until,
+                           closed, open_, todo, _brief_parent_names_jira(closed + open_ + todo),
+                           t1 or t2 or t3)
+
+
+def _brief_azure_ids(where):
+    wiql = ("SELECT [System.Id] FROM WorkItems WHERE " + " AND ".join(where) +
+            " ORDER BY [System.ChangedDate] DESC")
+    res = azure_req("/_apis/wit/wiql", {}, body={"query": wiql})
+    ids = [w.get("id") for w in (res.get("workItems") or []) if w.get("id") is not None]
+    return ids[:DAILY_BRIEF_FETCH_MAX], len(ids) > DAILY_BRIEF_FETCH_MAX
+
+
+def _collect_daily_brief_azure(day_from, week_from, until, projects):
+    site_key = normalize_azure_site(AZDO_URL)
+    base = azure_base()
+    q = lambda v: "'" + str(v).replace("'", "''") + "'"
+    if DAILY_BRIEF_WIQL_SCOPE:
+        scope_w, scope = f"({DAILY_BRIEF_WIQL_SCOPE})", "custom"
+    else:
+        names = [AZDO_PROJECT] if AZDO_PROJECT else [
+            p for p in projects or [] if isinstance(p, str) and 0 < len(p) <= 64]
+        names = names[:DAILY_BRIEF_PROJECTS_MAX]
+        if not names:
+            return None
+        scope_w = f"[System.TeamProject] IN ({', '.join(q(n) for n in names)})"
+        scope = names
+    # WIQL compares dates at day precision; widen and filter exactly below.
+    since = (week_from - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    extra = _DAILY_BRIEF_AZDO_EXTRA
+    ids, t1 = _brief_azure_ids([scope_w, "[System.State] <> 'Removed'",
+                                f"[Microsoft.VSTS.Common.ClosedDate] >= {q(since)}"])
+    closed = fetch_azure_items(ids, site_key, base, extra) if ids else []
+    # ADO has no category in WIQL: exclude the stock done states here, and the
+    # statusCategory read in _brief_assemble drops any custom one.
+    ids, t2 = _brief_azure_ids([scope_w, "[System.State] NOT IN ('Closed', 'Done', "
+                                         "'Removed', 'New', 'To Do', 'Proposed')"])
+    open_ = fetch_azure_items(ids, site_key, base, extra) if ids else []
+    closed_keys = _brief_in_window(closed, week_from, until)
+    parents = sorted({t["parentKey"] for t in closed + open_
+                      if t.get("parentKey") and AZDO_KEY_RE.match(t["parentKey"])
+                      and (t["key"] in closed_keys or t.get("statusCategory") == "inprogress")})
+    parents = parents[:DAILY_BRIEF_RELATED_MAX]
+    todo, t3 = [], False
+    if parents:
+        ids, t3 = _brief_azure_ids([scope_w, f"[System.Parent] IN ({', '.join(parents)})"])
+        todo = fetch_azure_items(ids, site_key, base, extra) if ids else []
+    names = {}
+    want = sorted({t["parentKey"] for t in closed + open_ + todo
+                   if t.get("parentKey") and AZDO_KEY_RE.match(t["parentKey"])})
+    if want:
+        for wi in _azure_batch_get(want[:AZDO_BATCH], ["System.Id", "System.Title"]):
+            names[str(wi["id"])] = _brief_text((wi.get("fields") or {}).get("System.Title"))
+    return _brief_assemble("azure", site_key, scope, day_from, week_from, until,
+                           closed, open_, todo, names, t1 or t2 or t3)
+
+
+def collect_daily_brief_data(day_from, week_from, until, projects=None):
+    """The org's ticket activity for a standup window, as compact JSON for a model.
+
+    All three are aware datetimes, `week_from <= day_from < until`. A ticket
+    resolved in [week_from, until) is listed, tagged `day` when it resolved at
+    or after `day_from`, else `week`. `projects` is the org's
+    project list (`daily_brief_projects(self.jira)`), overridden by
+    TURMA_DAILY_BRIEF_JQL_SCOPE / _WIQL_SCOPE. Returns None when no board is
+    configured or no scope is known; tracker errors PROPAGATE to the caller's
+    worker. Blocking network I/O — never call it on the beat (XERK-395).
+
+    Azure carries no `blockedBy` (the board reads no ADO links), so its `open`
+    rows list none and its candidates come from shared parents alone."""
+    if azure_configured():
+        return _collect_daily_brief_azure(day_from, week_from, until, projects)
+    if jira_configured():
+        return _collect_daily_brief_jira(day_from, week_from, until, projects)
+    return None
 
 def _board_error_summary(e):
     """A short, human-readable summary of a board-poll failure for the block's
