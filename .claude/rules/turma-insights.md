@@ -17,10 +17,15 @@ paths:
   - **Only the shown pane fetches** (`syncPaneScope`, the minute timers check `pane`): the two
     cards' routes are their own fetches, never `/api/agents`, and a hidden one costs the hub nothing.
   - The cards scope by the header org pick exactly as they did on `/usage` (same code).
+  - **Coming back to a sub-page refetches its card** (the `hashchange` handler): its timer only
+    ran while it showed, so it would otherwise show a stale view.
+  - **No element id may equal a pane name** (`decisionsLog`, `permissionsCard`,
+    `modelQualityCard`): a matching id made the browser scroll the sub-tabs out of view on load.
 - **Web-only by operator decision** — Android has none of it (`android/PARITY.md`).
 - **The org brief is retired** (XERK-2386): no sweep, store, push, narrative or page. `/brief`
   301s to `/insights`; the heartbeat still DROPS an older agent's `briefRender`/`briefNarratives`
-  (kept in `HEARTBEAT_KNOWN_KEYS`). An existing `/data/briefs.json` is ignored.
+  (kept in `HEARTBEAT_KNOWN_KEYS`) and `normalizeRecord` strips them from a restored
+  record too. An existing `/data/briefs.json` is ignored.
   - Do not reintroduce a scheduled brief or its push: the operator found it not useful.
 - Tests: the `XERK-2386:` cases in `insights.test.js` and `server.test.js`; `nav.test.js`.
 

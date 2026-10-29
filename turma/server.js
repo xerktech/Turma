@@ -10230,6 +10230,10 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeLocalModel(a);
   normalizeDsh(a);
   normalizeQwen(a);
+  // The retired org brief (XERK-2386): a record restored from an older hub's
+  // state, or beaten by an older agent, carries none of its blocks.
+  delete a.briefRender;
+  delete a.briefNarratives;
   normalizeTriage(a);
   normalizeTrajectory(a);
   normalizeCloseTicket(a);

@@ -57,6 +57,8 @@ function loadHelpers(fetchReply = null, hash = "#permissions") {
   const sse = [];
   const fetches = [];
   const timers = [];
+  const intervals = [];
+  const winListeners = {};
   const scrollCalls = [];
   const noop = () => {};
   const document = {
@@ -94,7 +96,7 @@ function loadHelpers(fetchReply = null, hash = "#permissions") {
       addEventListener(name, fn) { this.handlers[name] = fn; }
       close() {}
     },
-    setInterval: () => 0, clearInterval: noop,
+    setInterval: (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; }, clearInterval: noop,
     setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
     clearTimeout: (id) => { if (id) timers[id - 1] = null; },
     requestAnimationFrame: () => 0, cancelAnimationFrame: noop,
@@ -103,7 +105,7 @@ function loadHelpers(fetchReply = null, hash = "#permissions") {
     URL: global.URL, URLSearchParams: global.URLSearchParams,
     console, Date, Math, JSON, encodeURIComponent, decodeURIComponent,
     parseInt, parseFloat, isNaN, Number, String, Object, Array, Map, Set,
-    addEventListener: noop, removeEventListener: noop,
+    addEventListener: (name, fn) => { (winListeners[name] ||= []).push(fn); }, removeEventListener: noop,
     TurmaNav: { preserveScroll: (el, paint) => { scrollCalls.push(el); paint(); },
       refusalText: (what, status, body) => (body && typeof body.error === "string" && body.error) || `the hub answered HTTP ${status}` },
     // Indirected through `orgFilter` so a test can narrow the page the way the
@@ -117,7 +119,7 @@ function loadHelpers(fetchReply = null, hash = "#permissions") {
   };
   const keys = Object.keys(stubs);
   const body = `${script}\n;return { render, refresh, paneOf, PANES, getPane: () => pane,
-    decisionsHtml, renderDecisions,
+    decisionsHtml, renderDecisions, drafts, syncPermissionsScope,
     modelQualityCardHtml, refreshModelQuality, syncModelQualityScope, mqBadRate, mqOrdered, getMqView: () => mqView,
     permissionsCardHtml, refreshPermissions, getPermView: () => permView, setCache: (c) => { cache = c; }, getCache: () => cache };`;
   // `els` rides along so the render-level tests can reach the containers the
@@ -126,7 +128,7 @@ function loadHelpers(fetchReply = null, hash = "#permissions") {
   const runTimers = async () => {
     for (const t of timers.splice(0).filter(Boolean)) await t.fn();
   };
-  return Object.assign(api, { els, sse, fetches, timers, runTimers, scrollCalls,
+  return Object.assign(api, { els, sse, fetches, timers, runTimers, scrollCalls, intervals, winListeners, stubs,
     navigator: stubs.navigator });
 }
 
@@ -162,6 +164,50 @@ test("XERK-2386: each sub-page has a tab and a pane; the page is the nav's Insig
     assert.match(src, new RegExp(`data-pane-body="${p}"`));
   }
   assert.match(src, /data-page="insights"/);
+});
+
+test("XERK-2386: no element id equals a sub-page hash, so loading one never scrolls the tabs away", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "public", "insights.html"), "utf8");
+  for (const p of H.PANES) assert.equal(src.includes(`id="${p}"`), false, p);
+});
+
+test("XERK-2386: switching sub-page by hash shows it and refetches its card", async () => {
+  const reply = (u) => (u.startsWith("/api/agents") ? { agents: [] } : { days: 7, top: [], recent: [], groups: [] });
+  const P = loadHelpers(reply, "#permissions");
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  const perms = () => P.fetches.filter((u) => u.startsWith("/api/permissions")).length;
+  const before = perms();
+  assert.ok(before >= 1);
+  P.stubs.location.hash = "#decisions";
+  for (const fn of P.winListeners.hashchange) fn();
+  assert.equal(P.getPane(), "decisions");
+  P.stubs.location.hash = "#permissions";
+  for (const fn of P.winListeners.hashchange) fn();
+  assert.equal(P.getPane(), "permissions");
+  assert.equal(perms(), before + 1, "coming back refetches; its timer did not run while hidden");
+});
+
+test("XERK-2386: a card's minute timer fetches only while its sub-page shows", async () => {
+  const reply = (u) => (u.startsWith("/api/agents") ? { agents: [] } : { days: 7, top: [], recent: [], groups: [] });
+  const P = loadHelpers(reply, "");
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  P.syncPermissionsScope();   // each card was shown once, so it is scoped
+  P.syncModelQualityScope([]);
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  const n = P.fetches.length;
+  for (const t of P.intervals.filter((x) => x.ms === 60000)) t.fn();
+  const cards = P.fetches.slice(n).filter((u) => u.startsWith("/api/permissions") || u.startsWith("/api/model-quality"));
+  assert.deepEqual(cards, []);
+});
+
+test("XERK-1574: a note's text is escaped; the draft survives a repaint", () => {
+  H.drafts.set("a.net", 'half <img src=x onerror="alert(1)">');
+  try {
+    const html = H.decisionsHtml("a.net", [{ at: 1000, source: "note", text: "<script>x</script>" }], 5000, true);
+    assert.equal(html.includes("<script>"), false);
+    assert.ok(html.includes("&lt;script&gt;x&lt;/script&gt;"));
+    assert.ok(html.includes('value="half &lt;img src=x onerror=&quot;alert(1)&quot;&gt;"'));
+  } finally { H.drafts.delete("a.net"); }
 });
 
 // --- Decisions (XERK-1574) -------------------------------------------------------
@@ -372,7 +418,7 @@ test("XERK-1563: a refused first fetch says it failed; a later one keeps the las
   reply.httpStatus = (u) => (u.startsWith("/api/permissions") ? refuse : 0);
   const H5 = loadHelpers(reply);
   await H5.refreshPermissions();
-  const el = H5.els.permissions;
+  const el = H5.els.permissionsCard;
   assert.match(el.innerHTML, /Could not load permission prompts \(HTTP 401\)\./);
   assert.doesNotMatch(el.innerHTML, /Loading/);
   refuse = 0;
@@ -391,7 +437,7 @@ test("XERK-1563: a failed fetch after an org change never shows the old org's vi
   const reply = () => permView;
   reply.httpStatus = (u) => (u.startsWith("/api/permissions") ? refuse : 0);
   const H6 = loadHelpers(reply);
-  const el = H6.els.permissions;
+  const el = H6.els.permissionsCard;
   orgKeys = ["acme.atlassian.net"];
   try {
     await H6.refreshPermissions();
@@ -418,7 +464,7 @@ test("XERK-1563: a failed fetch after an org change never shows the old org's vi
 test("XERK-1563: the minute repaint keeps Recent prompts open and goes through preserveScroll", async () => {
   const H4 = loadHelpers(() => permView);
   await H4.refreshPermissions();
-  const el = H4.els.permissions;
+  const el = H4.els.permissionsCard;
   assert.match(el.innerHTML, /<details class="table-view perm-recent-view"><summary>/);   // closed by default
   assert.ok(H4.scrollCalls.includes(el), "the repaint must go through TurmaNav.preserveScroll");
   // The operator opens it; the next refresh must not snap it shut.
@@ -450,7 +496,7 @@ test("XERK-1563: the card's fetch is scoped by the header's org filter", async (
   const url = H3.fetches.filter((u) => u.startsWith("/api/permissions")).pop();
   assert.equal(url, "/api/permissions?days=7&org=acme.atlassian.net%2Crival.atlassian.net");
   assert.equal(H3.getPermView(), permView);
-  assert.match(H3.els.permissions.innerHTML, /Bash\(git status:\*\)/);
+  assert.match(H3.els.permissionsCard.innerHTML, /Bash\(git status:\*\)/);
 });
 
 test("XERK-1563: the card's first fetch waits for the org scope, then follows it", async () => {
@@ -583,14 +629,14 @@ test("XERK-1563: a Bash head with no safe rule says review it, and Copy copies n
   await H6.refreshPermissions();
   const writes = [];
   H6.navigator.clipboard = { writeText: (t) => { writes.push(t); return Promise.resolve(); } };
-  const click = (target) => H6.els.permissions.listeners.click.forEach((fn) => fn({ target }));
+  const click = (target) => H6.els.permissionsCard.listeners.click.forEach((fn) => fn({ target }));
   click({ closest: () => null });                    // the no-rule cell: no button inside it
   assert.deepEqual(writes, []);
   const btn = { textContent: "Copy", getAttribute: (k) => (k === "data-perm-rule" ? "Bash(git status:*)" : null) };
   click({ closest: (sel) => (sel === "[data-perm-rule]" ? btn : null) });
   assert.deepEqual(writes, ["Bash(git status:*)"]);
   // The rendered card holds exactly one copyable rule — the safe group's.
-  const rules = [...H6.els.permissions.innerHTML.matchAll(/data-perm-rule="([^"]*)"/g)].map((m) => m[1]);
+  const rules = [...H6.els.permissionsCard.innerHTML.matchAll(/data-perm-rule="([^"]*)"/g)].map((m) => m[1]);
   assert.deepEqual(rules, ["Bash(git status:*)"]);
 });
 
@@ -699,7 +745,7 @@ test("XERK-1849: the card asks for rows only when exactly one org applies", asyn
 test("XERK-1849: a failed first read says why rather than loading forever", async () => {
   const H7 = loadHelpers(Object.assign(() => ({}), { httpStatus: (u) => (u.includes("model-quality") ? 503 : 0) }));
   await H7.refreshModelQuality();
-  assert.match(H7.els.modelQuality.innerHTML, /Could not load model quality \(the hub answered HTTP 503\)/);
+  assert.match(H7.els.modelQualityCard.innerHTML, /Could not load model quality \(the hub answered HTTP 503\)/);
 });
 
 // fetchReply may return a Promise: a deferred answer lets a test land replies out of order.
@@ -729,18 +775,18 @@ test("XERK-1849: a pick change drops the old org's rows and error at once", asyn
     const H9 = loadHelpers(Object.assign((u) => (hang ? new Promise(() => {}) : { groups: [mqG({ sessions: 1 })], rows: [{ issue: "A-1" }] }),
       { httpStatus: (u) => (u.includes("org=bad") ? 500 : 0) }));
     await H9.refreshModelQuality();
-    assert.match(H9.els.modelQuality.innerHTML, /A-1/);
+    assert.match(H9.els.modelQualityCard.innerHTML, /A-1/);
     hang = true;
     orgKeys = ["rival"];
     H9.refreshModelQuality();
-    assert.doesNotMatch(H9.els.modelQuality.innerHTML, /A-1/);
-    assert.match(H9.els.modelQuality.innerHTML, /Loading…/);
+    assert.doesNotMatch(H9.els.modelQualityCard.innerHTML, /A-1/);
+    assert.match(H9.els.modelQualityCard.innerHTML, /Loading…/);
     orgKeys = ["bad"];
     await H9.refreshModelQuality();
-    assert.match(H9.els.modelQuality.innerHTML, /Could not load/);
+    assert.match(H9.els.modelQualityCard.innerHTML, /Could not load/);
     orgKeys = ["rival"];
     H9.refreshModelQuality();
-    assert.doesNotMatch(H9.els.modelQuality.innerHTML, /Could not load/);
+    assert.doesNotMatch(H9.els.modelQualityCard.innerHTML, /Could not load/);
   } finally { orgKeys = saved; }
 });
 
@@ -754,8 +800,8 @@ test("XERK-1849: a failed refresh keeps that org's view; rework with no figures 
     await H10.refreshModelQuality();
     fail = true;
     await H10.refreshModelQuality();
-    assert.match(H10.els.modelQuality.innerHTML, /A-1/);
-    assert.doesNotMatch(H10.els.modelQuality.innerHTML, /QA runs/);
+    assert.match(H10.els.modelQualityCard.innerHTML, /A-1/);
+    assert.doesNotMatch(H10.els.modelQualityCard.innerHTML, /QA runs/);
   } finally { orgKeys = saved; }
 });
 
@@ -780,7 +826,7 @@ test("XERK-1849: the drill-down names the org as the header does", async () => {
     H11.syncModelQualityScope([{ jira: { siteKey: "acme", orgName: "Acme Corp" } }]);
     await new Promise((r) => setImmediate(r));
     await new Promise((r) => setImmediate(r));
-    assert.match(H11.els.modelQuality.innerHTML, /Sessions in Acme Corp \(1\)/);
+    assert.match(H11.els.modelQualityCard.innerHTML, /Sessions in Acme Corp \(1\)/);
   } finally { orgKeys = saved; }
 });
 
@@ -798,7 +844,7 @@ test("XERK-1849: a late refusal for an org the operator left is discarded", asyn
     await H12.refreshModelQuality();
     release();
     await first;
-    assert.match(H12.els.modelQuality.innerHTML, /R-1/);
-    assert.doesNotMatch(H12.els.modelQuality.innerHTML, /acme down/);
+    assert.match(H12.els.modelQualityCard.innerHTML, /R-1/);
+    assert.doesNotMatch(H12.els.modelQualityCard.innerHTML, /acme down/);
   } finally { orgKeys = saved; }
 });

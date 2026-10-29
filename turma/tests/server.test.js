@@ -25364,6 +25364,12 @@ test("XERK-2386: the org brief is retired — /brief lands on Insights, an older
   delete agents.dcBrief2386;
 });
 
+test("XERK-2386: the leader's orchestration tick ages out the decisions log", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const tick = src.slice(src.indexOf("function masterOrchestrationTick("));
+  assert.match(tick.slice(0, tick.indexOf("\n}\n")), /\bdecisionsTick\(\);/);
+});
+
 test("XERK-1574: decisionsTick drops an org's log once no host is in it and it is old", async () => {
   const S = "dcD1574.atlassian.net";
   const now = Date.now();

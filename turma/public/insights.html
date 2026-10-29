@@ -15,13 +15,15 @@
   /* Insights (XERK-2386): the fleet's oversight surfaces, one sub-page each —
      Decisions, Permission prompts, Model quality — so none is a long scroll
      under another. Tokens/base/nav live in app.css. Web-only (android/PARITY.md). */
+  /* One row at any width: a phone scrolls it sideways rather than wrapping a tab. */
   .subtabs {
-    display: flex; gap: 4px; flex-wrap: wrap; margin: 0 0 16px;
+    display: flex; gap: 4px; margin: 0 0 16px; overflow-x: auto; scrollbar-width: none;
     border-bottom: 1px solid var(--hairline);
   }
+  .subtabs::-webkit-scrollbar { display: none; }
   .subtabs a {
     color: var(--ink-2); text-decoration: none; font-size: 14px; font-weight: 600;
-    padding: 8px 12px; border-bottom: 2px solid transparent; margin-bottom: -1px;
+    padding: 8px 12px; border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap;
   }
   .subtabs a:hover { color: var(--ink); }
   .subtabs a.active { color: var(--accent-text); border-bottom-color: var(--accent); }
@@ -172,6 +174,7 @@
 
   @media (max-width: 600px) {
     .models-card { padding: 12px 10px; }
+    .subtabs a { padding: 8px 9px; font-size: 13px; }
     /* Permission prompts on a phone: the five-column table cannot fit, and the
        sticky Prompt column covered the rule column however far it scrolled.
        Each group reflows to a stacked block instead — kind + subject; one line
@@ -234,14 +237,14 @@
     <a href="#model-quality" data-pane="model-quality">Model quality</a>
   </nav>
   <section id="pane-decisions" data-pane-body="decisions">
-    <div id="decisions"></div>
+    <div id="decisionsLog"></div>
     <div class="pane-note"><b>Decisions</b> are your answers to sessions' questions and permission dialogs, plus notes you add; the org's sessions read them as reference material. An answer is logged as the question and the option picked — never typed words or a command line.</div>
   </section>
   <section id="pane-permissions" data-pane-body="permissions" hidden>
-    <div id="permissions"></div>
+    <div id="permissionsCard"></div>
   </section>
   <section id="pane-model-quality" data-pane-body="model-quality" hidden>
-    <div id="modelQuality"></div>
+    <div id="modelQualityCard"></div>
   </section>
 </div>
 </div>
@@ -272,7 +275,8 @@ function fmtDuration(sec) {
 
 // ---- Sub-pages ----------------------------------------------------------------
 // One pane shows at a time, named by the URL hash so a sub-page is linkable and
-// Back works. Permission prompts and Model quality fetch only while shown.
+// Back works. No element's id equals a pane name, so the browser never scrolls
+// the sub-tabs away to a hash target. Permission prompts and Model quality fetch only while shown.
 const PANES = ["decisions", "permissions", "model-quality"];
 function paneOf(hash) {
   const p = String(hash || "").replace(/^#/, "");
@@ -289,10 +293,16 @@ function syncPaneScope(data) {
   if (pane === "permissions") syncPermissionsScope();
   if (pane === "model-quality") syncModelQualityScope(data.agents);
 }
-addEventListener("hashchange", () => { pane = paneOf(location.hash); showPane(); });
+// Coming back to a card refetches it: its minute timer only runs while it shows.
+addEventListener("hashchange", () => {
+  pane = paneOf(location.hash);
+  showPane();
+  if (pane === "permissions" && permScoped) refreshPermissions();
+  if (pane === "model-quality" && mqScoped) refreshModelQuality();
+});
 
 // ---- Decisions (XERK-1574) ----------------------------------------------------
-const $decisions = document.getElementById("decisions");
+const $decisions = document.getElementById("decisionsLog");
 const noteBusy = new Set();   // orgs with a decision note in flight
 const drafts = new Map();     // org -> the note being typed (survives a repaint)
 // An age in the decisions log: seconds, minutes below the hour, hours to two
@@ -429,7 +439,7 @@ $decisions.addEventListener("submit", (e) => {
 // deterministic `suggestedRule`). Its own fetch (`/api/permissions`), scoped by
 // the header's org filter like everything else here; it does not ride
 // /api/agents, so the beat's SSE patches never repaint it.
-const $perms = document.getElementById("permissions");
+const $perms = document.getElementById("permissionsCard");
 const PERM_DAYS = 7;
 const PERM_REFRESH_MS = 60000;
 // `judged` (XERK-1566): the agent's permission judge decided a Bash prompt.
@@ -556,7 +566,7 @@ function permissionsCardHtml(view, now, recentOpen = false, loadError = null) {
   const head = `<h2>Permission prompts (${days} days)</h2>` +
     `<div class="note">Every permission dialog, auto-mode classifier block and ask-for-permission-in-chat ` +
     `that held a session, grouped with the allow rule that would retire it. Follows the header's org ` +
-    `filter only — the chart's series toggles above do not apply here.</div>`;
+    `filter.</div>`;
   // A first fetch that failed says so; "Loading…" there would wait forever.
   if (!view && typeof loadError === "string" && loadError) {
     return head + `<div class="perm-empty">Could not load permission prompts (${esc(loadError)}).</div>`;
@@ -692,7 +702,7 @@ $perms.addEventListener("click", (ev) => {
 // hub serves them only for the one org named, so they show only when the
 // header's filter resolves to exactly one org. Its own fetch, like the
 // permission card; the beat's SSE patches never repaint it.
-const $mq = document.getElementById("modelQuality");
+const $mq = document.getElementById("modelQualityCard");
 const MQ_REFRESH_MS = 60000;
 const MQ_OUTCOME_LABEL = { good: "good", bad: "bad", pending: "pending", "no-change": "no change",
   undelivered: "undelivered" };
