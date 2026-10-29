@@ -67,6 +67,10 @@ process.env.TICKET_AGENTS_FILE = path.join(
   scratchDir(),
   `turma-test-ticket-agents-${process.pid}.json`
 );
+process.env.AGENT_IDENTITIES_FILE = path.join(
+  scratchDir(),
+  `turma-test-agent-identities-${process.pid}.json`
+);
 process.env.AUTOSTART_ORGS_FILE = path.join(
   scratchDir(),
   `turma-test-autostart-orgs-${process.pid}.json`
@@ -215,6 +219,7 @@ const {
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, REFUSED_DETAIL_MAX,
   userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
   agentBearerKind, agentHostRefusal, agentPresentedRefusal, resolveEnrollToken, hostAgentToken, tokenHost, ttydAuth,
+  uidAgentToken, tokenUid, uidHostClaim, hostOfUid, uidHostRefusal,
   controlChannels, pendingChannels, termAgents,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, WHISPER_NON_SPEECH, issueWsToken, wsTokenValid,
@@ -20054,10 +20059,13 @@ test("XERK-578: roll-token mints this host's derived token and queues one setTok
   const again = await request("POST", "/api/agents/rollHost/roll-token",
     { body: {}, headers: userHeaders });
   assert.equal(again.body.cmdId, ok.body.cmdId);
-  // It rides the next reply carrying exactly THIS host's derived token.
+  // It rides the next reply carrying THIS host's identity token (XERK-2381),
+  // the id already stamped on its record so the agent's first beat on it binds.
   const reply = await beatAs("rollHost", { authorization: "Bearer agenttok" });
+  const uid = agents.rollHost.agentUid;
+  assert.match(uid, /^[0-9a-f]{32}$/);
   assert.deepEqual(reply.body.commands, [
-    { type: "setToken", token: hostAgentToken("rollHost"), cmdId: ok.body.cmdId },
+    { type: "setToken", token: uidAgentToken(uid), cmdId: ok.body.cmdId },
   ]);
   // Unknown host -> 404; and it needs the operator login (no anonymous access).
   assert.equal((await request("POST", "/api/agents/ghost578/roll-token",
@@ -20068,16 +20076,25 @@ test("XERK-578: roll-token mints this host's derived token and queues one setTok
 
 test("XERK-578: self-enroll returns ONLY the identity the request proved", () => {
   const bearer = (t) => ({ headers: { authorization: `Bearer ${t}` } });
-  // A host already on its derived token gets its OWN back (idempotent) and can
-  // NOT name another host — the escalation "never a caller-named device" guards.
+  // A host on its name token trades it for an IDENTITY token (XERK-2381) and
+  // can NOT name another host — the escalation "never a caller-named device"
+  // guards. The identity token is never usable as another host's.
   const own = resolveEnrollToken(bearer(hostAgentToken("hOwn")), "someoneelse");
   assert.equal(own.status, 200);
-  assert.deepEqual(own.body, { host: "hOwn", token: hostAgentToken("hOwn"), bound: true });
-  // The fleet master (rollover) names its OWN device and gets that host's token
-  // — exactly what `--agent-token <device>` mints, nothing more.
+  assert.equal(own.body.host, "hOwn");
+  assert.equal(own.body.bound, true);
+  const ownUid = tokenUid(own.body.token);
+  assert.ok(ownUid);
+  // Re-enrolling on that identity token is idempotent.
+  const again = resolveEnrollToken(bearer(own.body.token), "whatever");
+  assert.equal(again.status, 200);
+  assert.equal(again.body.token, own.body.token);
+  // The fleet master (rollover) names its OWN device and gets an identity token.
   const boot = resolveEnrollToken(bearer("agenttok"), "hBoot");
   assert.equal(boot.status, 200);
-  assert.deepEqual(boot.body, { host: "hBoot", token: hostAgentToken("hBoot"), bound: false });
+  assert.equal(boot.body.host, "hBoot");
+  assert.equal(boot.body.bound, false);
+  assert.ok(tokenUid(boot.body.token));
   // Master with no device can't bootstrap (which host?) -> 400.
   assert.equal(resolveEnrollToken(bearer("agenttok"), "").status, 400);
   // A master naming an UNUSABLE host name (a URL dot segment the hub refuses to
@@ -20089,7 +20106,7 @@ test("XERK-578: self-enroll returns ONLY the identity the request proved", () =>
   return request("GET", `/api/agent/token?device=hBoot`,
     { headers: { authorization: "Bearer agenttok" } }).then((res) => {
     assert.equal(res.status, 200);
-    assert.equal(res.body.token, hostAgentToken("hBoot"));
+    assert.ok(tokenUid(res.body.token));
   });
 });
 
@@ -20105,7 +20122,213 @@ test("XERK-578: self-enroll self-closes under TURMA_AGENT_STRICT", () => {
   // re-enroll after strict is a harmless no-op rather than a lockout.
   const own = strict.resolveEnrollToken(bearer(strict.hostAgentToken("hX")), "");
   assert.equal(own.status, 200);
-  assert.equal(own.body.token, strict.hostAgentToken("hX"));
+  assert.ok(strict.tokenUid(own.body.token));
+  const again = strict.resolveEnrollToken(bearer(own.body.token), "");
+  assert.equal(again.status, 200);
+  assert.equal(again.body.token, own.body.token);
+});
+
+// ---- XERK-2381: an agent keeps its identity across a host rename ----------
+
+// Mint `host`'s identity the way an agent does: enroll on its name token.
+const enrollUid = (host) => {
+  const r = resolveEnrollToken({ headers: { authorization: `Bearer ${hostAgentToken(host)}` } }, host);
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  return r.body.token;
+};
+const asAuth = (tok) => ({ authorization: `Bearer ${tok}` });
+// Age a record past the "still beating" window, as a restart would.
+const quiet = (host) => { agents[host].lastSeen = Date.now() - 10 * 60 * 1000; };
+const forget2381 = (...hosts) => {
+  for (const h of hosts) delete agents[h];
+  const ids = hub.agentIdentities();
+  for (const [u, e] of Object.entries(ids)) if (hosts.includes(e.origin)) delete ids[u];
+};
+
+test("XERK-2381: an identity token is not a host token, and `uid:` names derive none", () => {
+  const uid = "0123456789abcdef0123456789abcdef";
+  const tok = uidAgentToken(uid);
+  assert.match(tok, /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/);
+  assert.equal(tokenUid(tok), uid);
+  assert.equal(tokenHost(tok), null);
+  // A host NAMED like the identity namespace gets no name token.
+  assert.equal(hostAgentToken("uid:" + uid), "");
+  assert.equal(tokenUid(tok.slice(0, -1) + (tok.endsWith("0") ? "1" : "0")), null);
+  assert.equal(uidAgentToken("not-hex"), "");
+  // A well-formed token for an id the hub never minted proves nothing.
+  assert.equal(uidHostClaim(uid, "anyfree2381"), false);
+});
+
+test("XERK-2381: one name mints one identity, however often it enrolls", () => {
+  const a = enrollUid("mint2381");
+  assert.equal(enrollUid("mint2381"), a);
+  assert.equal(hostOfUid(tokenUid(a)), "mint2381");
+  forget2381("mint2381");
+});
+
+test("XERK-2381: a renamed agent's beat moves its record instead of making a new host", async () => {
+  await beatAs("ren2381a", asAuth(hostAgentToken("ren2381a")));
+  const tok = enrollUid("ren2381a");
+  const uid = tokenUid(tok);
+  assert.equal(agents.ren2381a.agentUid, uid, "the mint stamps the existing record");
+  assert.equal((await beatAs("ren2381a", asAuth(tok))).status, 200);
+  assert.equal(agents.ren2381a.uidBound, true);
+  agents.ren2381a.orgBound = "org.example";
+  const cmdId = queueCommand("ren2381a", { type: "restartAgent" });
+  hub.ticketAgents["SITE/REN-1"] = { host: "ren2381a", at: Date.now() };
+  // Still beating as the old name: two agents on one token, never a move.
+  const clone = await beatAs("ren2381b", asAuth(tok));
+  assert.equal(clone.status, 403);
+  assert.match(clone.body.error, /two agents share one token/);
+  // The agent restarts under its new DEVICE_NAME (it announces the restart).
+  agents.ren2381a.updating = { reason: "restart", at: Date.now(), until: Date.now() + 60000 };
+  const r = await beatAs("ren2381b", asAuth(tok));
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(agents.ren2381a, undefined);
+  const b = agents.ren2381b;
+  assert.equal(b.agentUid, uid);
+  assert.deepEqual(b.formerNames, ["ren2381a"]);
+  assert.equal(hostOfUid(uid), "ren2381b");
+  assert.equal(b.orgBound, "org.example");
+  assert.ok(r.body.commands.some((c) => c.cmdId === cmdId));
+  assert.equal(hub.ticketAgents["SITE/REN-1"].host, "ren2381b");
+  delete hub.ticketAgents["SITE/REN-1"];
+  // Its old name token is retired: no second record beside the renamed one.
+  const old = await beatAs("ren2381a", asAuth(hostAgentToken("ren2381a")));
+  assert.equal(old.status, 403);
+  assert.match(old.body.error, /retired/);
+  assert.equal(agents.ren2381a, undefined);
+  // Nor can it fetch the identity token any more.
+  assert.equal(resolveEnrollToken({ headers: asAuth(hostAgentToken("ren2381a")) }, "").status, 403);
+  // Hub-owned fields never reach the wire.
+  const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.agents
+    .find((a) => a.key === "ren2381b");
+  assert.ok(served);
+  assert.equal(served.agentUid, undefined);
+  assert.equal(served.formerNames, undefined);
+  assert.equal(served.tokenBound, true);
+  forget2381("ren2381a", "ren2381b");
+});
+
+test("XERK-2381: an identity cannot take a name anyone else holds or held", async () => {
+  // Another live host (a legacy name-token record).
+  await beatAs("held2381", asAuth(hostAgentToken("held2381")));
+  // A removed host whose usage history the ledger keeps.
+  await request("POST", "/api/heartbeat", { body: {
+    device: "gone2381", usage: { totals: { input: 5, output: 0, cacheRead: 0, cacheCreation: 0 },
+      today: { input: 5, output: 0, cacheRead: 0, cacheCreation: 0 }, week: { input: 5, output: 0, cacheRead: 0, cacheCreation: 0 },
+      days: { [new Date().toISOString().slice(0, 10)]: { input: 5, output: 0, cacheRead: 0, cacheCreation: 0 } }, sessions: 1 },
+  }, headers: { ...asAuth(hostAgentToken("gone2381")), "content-type": "application/json" } });
+  delete agents.gone2381;
+  // Another agent's identity home.
+  const other = enrollUid("home2381");
+  const tok = enrollUid("sq2381");
+  const uid = tokenUid(tok);
+  for (const name of ["held2381", "HELD2381", "gone2381", "home2381"]) {
+    assert.ok(uidHostRefusal(uid, name), name);
+    const r = await beatAs(name, asAuth(tok));
+    assert.equal(r.status, 403, name);
+    assert.equal(agentWsAuthorized(new URL(`http://x/agent/control?token=${tok}`), { headers: {} }, name), false, name);
+  }
+  assert.equal(agents.held2381.agentUid, undefined);
+  // A record bound to another identity refuses that name's token... and a
+  // legacy host's own name token still works for it.
+  assert.equal((await beatAs("held2381", asAuth(hostAgentToken("held2381")))).status, 200);
+  assert.ok(tokenUid(other));
+  forget2381("held2381", "home2381", "sq2381");
+});
+
+test("XERK-2381: a rolled host binds its minted id; the token never rides the fleet payload", async () => {
+  await beatAs("roll2381", asAuth(hostAgentToken("roll2381")));
+  const roll = await request("POST", "/api/agents/roll2381/roll-token", { body: {}, headers: userHeaders });
+  assert.equal(roll.status, 200);
+  const uid = agents.roll2381.agentUid;
+  const tok = uidAgentToken(uid);
+  const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.agents
+    .find((a) => a.key === "roll2381");
+  const cmd = served.commands.find((c) => c.type === "setToken");
+  assert.ok(cmd);
+  assert.equal(cmd.token, undefined, "setToken's credential is not served to viewers");
+  // A beat on the OLD name token (before the agent restarts) keeps the binding.
+  const pre = await beatAs("roll2381", asAuth(hostAgentToken("roll2381")));
+  assert.equal(pre.body.commands.find((c) => c.type === "setToken").token, tok);
+  assert.equal(agents.roll2381.agentUid, uid);
+  assert.equal(Buffer.from(ttydAuth("roll2381").slice(6), "base64").toString(),
+    `term:${hostAgentToken("roll2381")}`);
+  assert.equal((await beatAs("roll2381", asAuth(tok))).status, 200);
+  assert.equal(Buffer.from(ttydAuth("roll2381").slice(6), "base64").toString(), `term:${tok}`);
+  // A re-roll hands out the same identity.
+  await request("POST", "/api/agents/roll2381/roll-token", { body: {}, headers: userHeaders });
+  assert.equal(agents.roll2381.agentUid, uid);
+  // Pruned while offline, it comes back under its own name.
+  delete agents.roll2381;
+  assert.equal((await beatAs("roll2381", asAuth(tok))).status, 200);
+  assert.equal(agents.roll2381.agentUid, uid);
+  // And renames once its old record has gone quiet.
+  quiet("roll2381");
+  assert.equal(agentWsAuthorized(new URL(`http://x/agent/control?token=${tok}`), { headers: {} }, "roll2381-new"), true);
+  assert.equal((await beatAs("roll2381-new", asAuth(tok))).status, 200);
+  assert.equal(agents.roll2381, undefined);
+  assert.equal(agents["roll2381-new"].agentUid, uid);
+  forget2381("roll2381", "roll2381-new");
+});
+
+test("XERK-2381: a refused rename leaves the old record intact and says why", async () => {
+  await beatAs("rb2381a", asAuth(hostAgentToken("rb2381a")));
+  const tok = enrollUid("rb2381a");
+  await beatAs("rb2381a", asAuth(tok));
+  const cmdId = queueCommand("rb2381a", { type: "restartAgent" });
+  quiet("rb2381a");
+  const big = { device: "rb2381b", sessions: "A".repeat(AGENT_RECORD_MAX + 1024) };
+  const r = await request("POST", "/api/heartbeat",
+    { body: big, headers: { ...asAuth(tok), "content-type": "application/json" } });
+  assert.equal(r.status, 413);
+  assert.equal(agents.rb2381b, undefined);
+  assert.ok(agents.rb2381a.commands.some((c) => c.cmdId === cmdId));
+  assert.equal(agents.rb2381a.refused && agents.rb2381a.refused.reason, "record-too-large");
+  assert.equal(hostOfUid(tokenUid(tok)), "rb2381a", "a refused beat moves nothing");
+  forget2381("rb2381a", "rb2381b");
+});
+
+test("XERK-2381: a forged identity in the beat is ignored, a corrupt restored one dropped", async () => {
+  const tok = enrollUid("forge2381");
+  await beatAs("forge2381", asAuth(tok));
+  const uid = tokenUid(tok);
+  const r = await request("POST", "/api/heartbeat", { body: {
+    device: "forge2381", agentUid: "ffffffffffffffffffffffffffffffff", uidBound: false, formerNames: ["victim"],
+  }, headers: { ...asAuth(tok), "content-type": "application/json" } });
+  assert.equal(r.status, 200);
+  assert.equal(agents.forge2381.agentUid, uid);
+  assert.equal(agents.forge2381.uidBound, true);
+  assert.equal(agents.forge2381.formerNames, undefined);
+  const rec = { agentUid: "NOT-HEX", uidBound: "yes", formerNames: ["ok", 5, "x".repeat(300)] };
+  hub.normalizeRecord(rec, "restore");
+  assert.deepEqual(rec, { formerNames: ["ok"] });
+  forget2381("forge2381");
+});
+
+test("XERK-2381: a restored rename folds its old name's spend without a beat", async () => {
+  // The old name spent on an EARLIER day (a shared day folds by high-water).
+  const usage = (n, day) => ({ totals: { input: n, output: 0, cacheRead: 0, cacheCreation: 0 },
+    today: { input: n, output: 0, cacheRead: 0, cacheCreation: 0 }, week: { input: n, output: 0, cacheRead: 0, cacheCreation: 0 },
+    days: { [day]: { input: n, output: 0, cacheRead: 0, cacheCreation: 0 } }, sessions: 1 });
+  const post = (device, n, day) => request("POST", "/api/heartbeat", { body: { device, usage: usage(n, day) },
+    headers: { ...asAuth(hostAgentToken(device)), "content-type": "application/json" } });
+  await post("fold2381a", 500, new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10));
+  delete agents.fold2381a;
+  await post("fold2381b", 7, new Date().toISOString().slice(0, 10));
+  const sum = async () => {
+    const body = (await request("GET", "/api/agents", { headers: userHeaders })).body;
+    const a = body.agents.find((x) => x.key === "fold2381b");
+    return a.usage.totals.input;
+  };
+  assert.equal(await sum(), 7);
+  // As a restore/HA apply would leave it: formerNames on the record, no beat.
+  agents.fold2381b.formerNames = ["fold2381a"];
+  hub.invalidateAgentsCache();
+  assert.equal(await sum(), 507);
+  delete agents.fold2381b;
+  hub.invalidateAgentsCache();
 });
 
 test("XERK-578: tokenRoll is coerced to a strict boolean; absent stays absent", async () => {
@@ -27220,4 +27443,63 @@ test("XERK-2195: the string-field coercion keeps null, numbers and a numeric id"
   assert.equal(s.branch, null);
   assert.deepEqual(s.ticket, { key: 9, summary: null });
   assert.deepEqual(s.prs[0], { url: "u", state: 2, checks: null });
+});
+
+test("XERK-2381: removing a host releases its name for a reinstall", async () => {
+  const persisted = async () => (await hub.liveStore.get("policy:agentIdentities")) || {};
+  await beatAs("box2381", asAuth(hostAgentToken("box2381")));
+  const tok = enrollUid("box2381");
+  const uid = tokenUid(tok);
+  await beatAs("box2381", asAuth(tok));
+  // Retired while the agent lives on its identity.
+  assert.equal((await beatAs("box2381", asAuth(hostAgentToken("box2381")))).status, 403);
+  // Remove host on a briefly offline host: it comes straight back on its identity.
+  assert.equal((await request("DELETE", "/api/agents/box2381", { headers: userHeaders })).status, 200);
+  assert.equal((await persisted())[uid].released, true, "the release is persisted");
+  assert.equal(hub.coerceAgentIdentities(JSON.parse(JSON.stringify(await persisted())))[uid].released, true,
+    "and survives a reload");
+  assert.equal((await beatAs("box2381", asAuth(tok))).status, 200);
+  assert.equal((await persisted())[uid].released, undefined, "and cleared once it is back");
+  // A reinstall that registers the name first wins; the old identity is refused there.
+  await request("DELETE", "/api/agents/box2381", { headers: userHeaders });
+  assert.equal((await beatAs("box2381", asAuth(hostAgentToken("box2381")))).status, 200);
+  const old = await beatAs("box2381", asAuth(tok));
+  assert.equal(old.status, 403);
+  assert.match(old.body.error, /re-provision/);
+  // Superseded, the old identity can go nowhere else either: Remove + reinstall retires it.
+  assert.equal((await beatAs("box2381-elsewhere", asAuth(tok))).status, 403);
+  assert.equal(agents["box2381-elsewhere"], undefined);
+  const fresh = enrollUid("box2381");
+  assert.notEqual(fresh, tok);
+  assert.equal((await beatAs("box2381", asAuth(fresh))).status, 200);
+  // A renamed agent's origin name, released, is a new machine's to take.
+  quiet("box2381");
+  assert.equal((await beatAs("box2381b", asAuth(fresh))).status, 200);
+  assert.equal((await beatAs("box2381", asAuth(hostAgentToken("box2381")))).status, 403);
+  await request("DELETE", "/api/agents/box2381", { headers: userHeaders });
+  assert.equal((await beatAs("box2381", asAuth(hostAgentToken("box2381")))).status, 200);
+  assert.notEqual(enrollUid("box2381"), fresh, "the new machine never gets the renamed agent's id");
+  assert.equal((await beatAs("box2381b", asAuth(fresh))).status, 200, "the renamed agent keeps working");
+  // An origin-less identity survives a reload (a restart must not lock it out).
+  const reloaded = hub.coerceAgentIdentities(JSON.parse(JSON.stringify(await persisted())));
+  assert.equal(reloaded[tokenUid(fresh)].home, "box2381b");
+  assert.equal(reloaded[tokenUid(fresh)].origin, undefined);
+  forget2381("box2381", "box2381b");
+});
+
+test("XERK-2381: an identity this hub does not know is told to re-provision, never re-issued", () => {
+  const tok = uidAgentToken("abcdefabcdefabcdefabcdefabcdefab");
+  const r = resolveEnrollToken({ headers: asAuth(tok) }, "x");
+  assert.equal(r.status, 403);
+  assert.match(r.body.error, /re-provision/);
+});
+
+test("XERK-2381: a released identity cannot escape through a stale HA copy of its record", () => {
+  const tok = enrollUid("ghost2381");
+  const uid = tokenUid(tok);
+  hub.agentIdentities()[uid].released = true;
+  agents.ghost2381b = { agentUid: uid, lastSeen: 0 };
+  assert.ok(uidHostRefusal(uid, "ghost2381b"));
+  assert.equal(uidHostRefusal(uid, "ghost2381"), null, "home stays open");
+  forget2381("ghost2381", "ghost2381b");
 });

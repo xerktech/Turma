@@ -1236,8 +1236,53 @@ function repoBlocks(entry, liveRepos, now) {
 // archive raw-write owner check, the migration/re-point org gates) stays byte-exact.
 // Locale-independent lowercase (`toLowerCase`, not `toLocaleLowerCase`) so the fold
 // is stable regardless of the hub's locale.
+//
+// It also folds a RENAMED host (XERK-2381): names one agent has gone by group
+// under one key, so a retired old name's spend lands on the live new name's card
+// by exactly the case-twin rules (only a name NOT itself live folds in, and
+// twins merge by high-water, never a sum). The groups are the hub's renames
+// (`setHostAliases`, from each record's `formerNames`) plus the renames that
+// happened before agents had a stable identity, hardcoded below.
+const STATIC_HOST_ALIASES = [
+  // The k8x agent ran as one cluster-wide agent before each node got its own.
+  ["k8x", "k8x-01"],
+  // MaxAI's WSL agent and its native Windows agent are one machine.
+  ["maxai", "maxai-win"],
+];
+// folded name -> its group's canonical folded name (the smallest member, so the
+// answer never depends on rename order or a rename back to an old name).
+let hostAliasRoots = new Map();
+function setHostAliases(pairs) {
+  const parent = new Map();
+  const find = (x) => {
+    while (parent.has(x) && parent.get(x) !== x) x = parent.get(x);
+    return x;
+  };
+  const union = (a, b) => {
+    const ra = find(a), rb = find(b);
+    if (ra === rb) return;
+    if (ra < rb) parent.set(rb, ra); else parent.set(ra, rb);
+    if (!parent.has(ra)) parent.set(ra, ra);
+    if (!parent.has(rb)) parent.set(rb, rb);
+  };
+  for (const pair of [...STATIC_HOST_ALIASES, ...(Array.isArray(pairs) ? pairs : [])]) {
+    if (!Array.isArray(pair) || pair.length !== 2) continue;
+    const [a, b] = pair;
+    if (typeof a !== "string" || typeof b !== "string" || !a || !b) continue;
+    union(a.toLowerCase(), b.toLowerCase());
+  }
+  const roots = new Map();
+  for (const name of parent.keys()) {
+    const r = find(name);
+    if (r !== name) roots.set(name, r);
+  }
+  hostAliasRoots = roots;
+}
+setHostAliases([]);
+
 function foldKey(k) {
-  return String(k == null ? "" : k).toLowerCase();
+  const f = String(k == null ? "" : k).toLowerCase();
+  return hostAliasRoots.get(f) || f;
 }
 
 // Combine several ledger entries (same `foldKey`) into ONE synthetic entry for the
@@ -1279,7 +1324,12 @@ function fold(key, record, now = Date.now(), liveKeys = null) {
   const f = foldKey(key);
   const live = liveKeys ? (liveKeys instanceof Set ? liveKeys : new Set(liveKeys)) : null;
   const group = [key];
+  // Retired members fold only into a group's ONE live member: with two live
+  // (a renamed host's old name re-registered by another machine), folding them
+  // into both would count their spend twice — they stay retired rows instead.
+  const liveTwin = live && [...live].some((k) => k !== key && foldKey(k) === f);
   for (const k of Object.keys(hosts)) {
+    if (liveTwin) break;
     if (k === key || foldKey(k) !== f) continue;
     if (live && live.has(k)) continue;
     group.push(k);
@@ -1311,7 +1361,11 @@ function retiredAgents(liveKeys, now = Date.now()) {
   // A retired case-twin of a LIVE host folds into that host's card via `fold`, so
   // it is not emitted here (XERK-448); the rest group by `foldKey` and merge, so a
   // wholly-removed host that changed casing shows as ONE retired row, not two.
-  const liveFolds = new Set([...live].map(foldKey));
+  // A group with exactly ONE live member absorbs its retired members (see fold);
+  // with two or more they are emitted here instead.
+  const liveCount = new Map();
+  for (const k of live) liveCount.set(foldKey(k), (liveCount.get(foldKey(k)) || 0) + 1);
+  const liveFolds = new Set([...liveCount].filter(([, n]) => n === 1).map(([f]) => f));
   const groups = new Map(); // foldKey -> [ledger keys]
   for (const k of Object.keys(hosts)) {
     if (live.has(k)) continue;
@@ -1390,7 +1444,7 @@ function has(key) {
 load();
 
 module.exports = {
-  ingest, fold, retiredAgents, forget, has, flush, configure, rehydrate,
+  ingest, fold, retiredAgents, forget, has, flush, configure, rehydrate, setHostAliases,
   LEDGER_FILE, LEDGER_MAX, LEDGER_DAYS, LEDGER_HOSTS, LEDGER_REPOS, RETIRED_MAX,
   LEDGER_MODELS, LEDGER_NAME_MAX, hostShare,
   SYSTEM_USAGE_REPO, isSystemUsageRepo, foldSystemRepos,
@@ -1419,6 +1473,6 @@ module.exports = {
     // about), so an absolute assertion is order-dependent on the whole file.
     shareChecks: () => shareChecks,
     load, writeNow, absorb, render, servedSeries, blankSeries, seriesTotals, usageOf, reposOf,
-    weekWindow, utcToday, bucketTokens, foldKey, mergeSeries, mergeEntries,
+    weekWindow, utcToday, bucketTokens, foldKey, mergeSeries, mergeEntries, setHostAliases,
   },
 };

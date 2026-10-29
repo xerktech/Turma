@@ -182,6 +182,13 @@ paths:
   Android) gets it with no parity change; the dashboard token TILES sum fleet-wide, so the merge
   correcting the split (removing the overlap double-count) is the only movement they see.
 - Tests: the `XERK-448:` cases in `usage-ledger.test.js`.
+- **A RENAMED host folds the same way** (XERK-2381): `foldKey` resolves a name through alias
+  groups — the hub's renames (`syncLedgerAliases` from each record's `formerNames`, per cache
+  build) plus `STATIC_HOST_ALIASES` for renames before agents had an identity (k8x→k8x-01,
+  maxai↔maxai-win). Canonical = the group's smallest member, so a rename back never splits it.
+  Same high-water rule; retired members fold only into a group's ONE live member (with two live,
+  e.g. an old name re-registered by another machine, they stay retired rows — never counted twice).
+  Tests: the `XERK-2381:` cases in `usage-ledger.test.js`.
 
 ### HA: the Postgres of-record backend (XERK-779, epic XERK-775; was Valkey XERK-758)
 

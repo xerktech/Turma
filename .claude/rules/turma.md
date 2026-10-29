@@ -304,7 +304,8 @@ retraction, `pushEnabled`.
   for the rule; the mechanics:
   - The hub keeps only the master and **re-derives** the expected value per host — no hub-side list,
     no restart to add a host (`node turma/server.js --agent-token <device>`). The name is IN the
-    token, so a **host rename invalidates it** (the hub cannot tell a rename from an impersonation).
+    token, so a **host rename invalidates it**; roll/enroll hand out a rename-proof IDENTITY token
+    instead (XERK-2381, `contract-agent-hub.md`).
   - `agentBearerKind(req, host)` is the single resolver → `proved`/`operator`/`legacy` (refused under
     `TURMA_AGENT_STRICT`)/null; `agentHostRefusal` turns it into the response. **Never settle for
     `agentAuthorized` where a host is in hand** — it answers "an agent", not "which".

@@ -929,3 +929,58 @@ test.after(() => {
     try { fs.unlinkSync(f); } catch { /* already gone */ }
   }
 });
+
+// ---- XERK-2381: a renamed host's retired name folds into its new one --------
+
+test("XERK-2381: the pre-identity renames fold (k8x -> k8x-01, maxai <-> maxai-win)", () => {
+  ledger.ingest("k8x", beat({ "2026-08-16": 500 }), now);
+  const live = beat({ [DAY]: 400 }, {}, { device: "k8x-01" });
+  ledger.ingest("k8x-01", live, now + 1000);
+  assert.equal(totalOf(ledger.fold("k8x-01", live, now, new Set(["k8x-01"])).usage), 900);
+  assert.deepEqual(ledger.retiredAgents(["k8x-01"], now), []);
+  // Direction-free: whichever of maxai / MAXAI-WIN is live absorbs the other.
+  ledger.ingest("MAXAI-WIN", beat({ "2026-08-16": 300 }, {}, { device: "MAXAI-WIN" }), now);
+  const mx = beat({ [DAY]: 100 }, {}, { device: "maxai" });
+  ledger.ingest("maxai", mx, now + 1000);
+  assert.equal(totalOf(ledger.fold("maxai", mx, now, new Set(["k8x-01", "maxai"])).usage), 400);
+  // Both live: neither folds (that would double the fleet total).
+  assert.equal(ledger.fold("maxai", mx, now, new Set(["maxai", "MAXAI-WIN"])), null,
+    "served as its agent sent it");
+});
+
+test("XERK-2381: a hub-recorded rename folds, including a rename back", () => {
+  ledger.ingest("nodeA", beat({ "2026-08-16": 500 }), now);
+  const live = beat({ [DAY]: 400 }, {}, { device: "nodeB" });
+  ledger.ingest("nodeB", live, now + 1000);
+  assert.equal(ledger.fold("nodeB", live, now, new Set(["nodeB"])), null, "no alias, no fold");
+  try {
+    ledger.setHostAliases([["nodeA", "nodeB"]]);
+    assert.equal(totalOf(ledger.fold("nodeB", live, now, new Set(["nodeB"])).usage), 900);
+    // A cycle (renamed back) still resolves both names to one group.
+    ledger.setHostAliases([["nodeA", "nodeB"], ["nodeB", "nodeA"]]);
+    assert.equal(ledger._internals.foldKey("nodeA"), ledger._internals.foldKey("NODEB"));
+  } finally {
+    ledger.setHostAliases([]);
+  }
+});
+
+test("XERK-2381: a retired name never folds into two live cards", () => {
+  // lx -> la -> lb, then another machine registers `la`: lx's spend must land
+  // on one card at most, never both (the fleet total would double).
+  ledger.ingest("lx", beat({ "2026-08-16": 1000 }), now);
+  const la = beat({ [DAY]: 10 }, {}, { device: "la" });
+  const lb = beat({ [DAY]: 20 }, {}, { device: "lb" });
+  ledger.ingest("la", la, now + 1000);
+  ledger.ingest("lb", lb, now + 1000);
+  try {
+    ledger.setHostAliases([["lx", "la"], ["la", "lb"]]);
+    const live = new Set(["la", "lb"]);
+    const a = ledger.fold("la", la, now, live);
+    const b = ledger.fold("lb", lb, now, live);
+    const total = (a ? totalOf(a.usage) : 10) + (b ? totalOf(b.usage) : 20) +
+      ledger.retiredAgents([...live], now).reduce((n, r) => n + totalOf(r.usage), 0);
+    assert.equal(total, 1030);
+  } finally {
+    ledger.setHostAliases([]);
+  }
+});

@@ -18,7 +18,7 @@ process.env.TURMA_AGENT_TOKEN = "agenttok";
 process.env.INDEX_MIRROR_QUEUE_MAX = "3";
 process.env.INDEX_MIRROR_REFILL_RETRY_MS = "30";
 const tmp = (name) => path.join(scratchDir(), `turma-idxrepair-${name}-${process.pid}.json`);
-for (const [k, n] of [["DEVICES_FILE", "devices"], ["TICKET_AGENTS_FILE", "ticket-agents"],
+for (const [k, n] of [["DEVICES_FILE", "devices"], ["TICKET_AGENTS_FILE", "ticket-agents"], ["AGENT_IDENTITIES_FILE", "agent-identities"],
   ["AUTOSTART_ORGS_FILE", "autostart-orgs"], ["TICKET_MODELS_FILE", "ticket-models"],
   ["ORG_COLORS_FILE", "org-colors"], ["USAGE_LEDGER_FILE", "usage-ledger"], ["STATE_FILE", "state"]]) {
   process.env[k] = tmp(n);

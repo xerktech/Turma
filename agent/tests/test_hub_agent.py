@@ -46313,6 +46313,41 @@ class TestSetToken(unittest.TestCase):
         self.assertEqual(rc, 1)
         rw.assert_not_called()
 
+    # XERK-2381: an identity token names `uid:<id>`, not a host — the hub binds
+    # it to whatever DEVICE_NAME the agent beats as, so it survives a rename.
+    def test_set_token_accepts_an_identity_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=agenttok\n")
+            sm = ha.SessionManager()
+            sm.device = "nas01"
+            tok = self._derived("uid:" + "ab" * 16)
+            self.assertTrue(ha.token_is_identity(ha.token_device_name(tok)))
+            with mock.patch.dict(os.environ, {"TURMA_AGENT_ENV": p}), \
+                 mock.patch.object(sm, "request_restart") as restart:
+                sm.set_token("c1", tok)
+            self.assertIn(f"TURMA_TOKEN={tok}\n", open(p).read())
+            restart.assert_called_once()
+
+    def test_enroll_self_writes_an_identity_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=agenttok\n")
+            tok = self._derived("uid:" + "cd" * 16)
+            resp = io.BytesIO(json.dumps({"host": "nas01", "token": tok}).encode())
+            resp.__enter__ = lambda s=resp: s
+            resp.__exit__ = lambda *a: False
+            with mock.patch.dict(os.environ, {"TURMA_AGENT_ENV": p}), \
+                 mock.patch.object(ha, "TURMA_URL", "https://h"), \
+                 mock.patch.object(ha, "TURMA_TOKEN", "agenttok"), \
+                 mock.patch.object(ha, "device_name", return_value="nas01"), \
+                 mock.patch.object(ha.urllib.request, "urlopen", return_value=resp):
+                rc = ha.enroll_self()
+            self.assertEqual(rc, 0)
+            self.assertIn(f"TURMA_TOKEN={tok}\n", open(p).read())
+
 
 class TestWindowsPortability(unittest.TestCase):
     """XERK-670 — hub-agent.py runs unforked on native Windows. These pin the

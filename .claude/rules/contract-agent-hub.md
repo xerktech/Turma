@@ -85,6 +85,34 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
   - The master still authenticates as `legacy` so a fleet mid-rollover keeps beating;
     **`TURMA_AGENT_STRICT` retires it**, and the hub warns at boot until it is set. Detail in
     `turma.md`; the agent needs no code change, only the right `TURMA_TOKEN`.
+  - **A host RENAME keeps the agent via its IDENTITY token** (XERK-2381): roll/enroll hand out
+    `<base64url("uid:"+id)>.<HMAC>` over a hub-minted id. The token proves the AGENT; the durable
+    `agentIdentities` store (`/data/agent-identities.json`, uid → origin/home/names/used) binds it
+    to a host name, mirrored as `agentUid` on the record. `uidHostRefusal` is the one rule.
+    - **One name mints ONE id, ever** (`identityByOrigin`): re-enrolling returns it, so a name token
+      cannot mint a stream of identities and flood the registry (QA reproduced that under strict).
+    - **Once the id has beaten, its name token is RETIRED** (`nameTokenRefusal`), so an old name
+      token can neither open a second record beside a renamed agent nor fetch the id again.
+    - **A rename takes only a name nobody else holds or held**: no record, no other id's home, no
+      live case twin, no usage-ledger history (a removed host's name) — unless this id went by it.
+      Loosening any of these lets a compromised agent squat a name and drain its queued commands.
+    - **No rename while the home record is still beating and not restarting** (`updating`): a real
+      rename restarts the agent, so that is two machines on one cloned token, refused with 403.
+    - **Removing a host (`DELETE /api/agents/<host>`) RELEASES its name, revoking nothing**
+      (`releaseHostIdentities`): ids minted for it lose `origin` (name token un-retired, enroll mints
+      afresh) and the id living there is marked `released`. It still returns if it beats first (Remove
+      host is offered on any briefly-offline host); a reinstall that registers first wins. Revoking
+      instead locked a blipped host out for good; never releasing locked a reinstall out on strict.
+    - **A released id may ONLY return home**, never rename: once a reinstall takes the name it is
+      dead, so Remove host + reinstall is the revoke path for a lost or stolen machine's token.
+      Residual: a leaked token that beats home first after a Remove keeps the host.
+    - An id the hub does not know is told to re-provision (`--agent-token`), never re-issued.
+    - A beat that renames carries the old record over (commands, org binding, alerts), drops every
+      other record bound to the id (HA ghosts too), re-points ticket pins, appends `formerNames`.
+    - Hub-owned, never served: `agentUid`, `uidBound` (ttydAuth's which-token), `formerNames`;
+      a `setToken` command's token is stripped from the served `commands` (`servedCommands`).
+    - `hostAgentToken` refuses the `uid:` namespace so a host name never collides with an id.
+    - Tests: the `XERK-2381:` cases in `server.test.js` + `usage-ledger.test.js`, `TestSetToken`.
   - **Onboarding onto that derived token is ONE action, not a per-host ritual** (XERK-578): the
     hub roll route + agent enroll endpoint, spanning hub + agent + native. Never re-key the enroll
     endpoint on a caller-named device for a PROVED caller. Mechanics: `agent-token-onboarding.md`.
