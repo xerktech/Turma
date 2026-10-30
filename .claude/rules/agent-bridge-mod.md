@@ -100,8 +100,7 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
   still submit it — one duplicate machine message, never a lost one.
 - A launch clears the request dir; the beat re-writes the head (same `at`) for the new process.
   An entry for an earlier conversation (`csid` ≠ the pinned id: a clear-context restart) or a
-  session no longer running is dropped, with a log line. A pending submit counts as undelivered input, so a
-  sleeper is never paused over it (`_input_undelivered`).
+  session no longer running is dropped, with a log line.
 - No compaction outbox: the message is submitted only while idle, so it starts its own turn and
   is a normal transcript entry before any compaction can run (`_pending_scan` has nothing to
   resend). The mod's text cap is `SUBMIT_MAX` (20000), matching `MOD_SUBMIT_MAX`.

@@ -676,8 +676,6 @@ class SessionsTest {
         val wakeAt = now + 30 * 60_000L
         assertEquals("💤 sleeping until ${clockTime(wakeAt, now)}", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING,
             LiveSignals(paneBusy = false, transcriptAgeSec = 5.0, wakeAt = wakeAt, wakeReason = bom), now))
-        assertEquals("💤 paused until ${clockTime(wakeAt, now)} · $fs",
-            pausedLabel(com.xerktech.turma.model.PausedSleep(wakeAt = wakeAt, wakeReason = fs), now))
         // The hub's why (JS-trimmed there) shows whenever it is non-empty, as the web's filter(Boolean).
         assertEquals("stalled · \u001E", attentionLabel(att("needs-you:stalled", now, "\u001E")))
         val done = SessionInfo(status = "running", session = LiveSignals(paneBusy = false, transcriptAgeSec = 1.0, lastRole = "assistant"))
