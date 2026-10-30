@@ -187,6 +187,10 @@ const titles = () => notifications.filter((n) => n.title != null).map((n) => n.t
 const dismisses = () => notifications.filter((n) => n.data?.action === "dismiss").map((n) => n.data.notifKey);
 
 const hub = require("../server.js");
+// Off for the shared hub: its 100+ synthetic orgs would each fire the default
+// Daily Brief schedule (XERK-2398) on the real-clock leader tick; the XERK-2398
+// cases turn it back on with only their own host present.
+hub.__setDailyBriefDefault(null);
 // dsh ships behind an OFF-by-default in-code kill switch (server.js DSH_ENABLED).
 // The dsh tests below flip it ON to exercise the retained machinery; this resets
 // it after EVERY test (runs even on a thrown assertion) so that ON state can
@@ -27863,6 +27867,71 @@ test("XERK-2395: POST /api/orgs/<site>/daily-brief/run is authed, org-checked an
   assert.equal(hub.getDailyBriefs()[S][0].runId, again.body.brief.runId);
   assert.ok((await fleet()).dailyBriefs[S].length === 30);
   cleanup2395(S, ["dbRunA", "dbRunOld"]);
+});
+
+test("XERK-2398 QA: a running brief whose command a restart lost is re-sent once", async () => {
+  const S = "dbK2398.atlassian.net";
+  await briefHost2395("dbKeepA", S);
+  hub.setDailyBriefSchedule(S, hub.sanitizeDailyBriefSchedule(NY2395));
+  hub.dailyBriefTick(RUN2395);
+  const [cmd] = briefCmds2395("dbKeepA");
+  // A hub killed before state.json saved the host's queue boots with the row alone.
+  agents.dbKeepA.commands = [];
+  hub.dailyBriefSent.clear();
+  const sentAt = hub.getDailyBriefs()[S][0].sentAt;
+  await briefHost2395("dbKeepA", S);
+  hub.dailyBriefTick(RUN2395 + 30e3);
+  const again = briefCmds2395("dbKeepA");
+  assert.equal(again.length, 1);
+  assert.equal(again[0].runId, cmd.runId, "the same run, which the agent runs once");
+  const row = hub.getDailyBriefs()[S][0];
+  assert.deepEqual([row.status, row.sentAt, row.cmdId], ["running", sentAt, again[0].cmdId]);
+  hub.dailyBriefTick(RUN2395 + 60e3);
+  assert.equal(briefCmds2395("dbKeepA").length, 1, "once per process, never a stream");
+  cleanup2395(S, ["dbKeepA"]);
+});
+
+test("XERK-2398: an org with no stored schedule runs on the 09:00 New York default", async (t) => {
+  const S = "dbD2398.atlassian.net";
+  // Only this test's host is in an org, else every other suite org fires too.
+  const others = Object.fromEntries(Object.entries(agents));
+  for (const k of Object.keys(others)) delete agents[k];
+  hub.__setDailyBriefDefault(hub.DAILY_BRIEF_DEFAULT_SCHEDULE);
+  t.after(() => { hub.__setDailyBriefDefault(null); Object.assign(agents, others); });
+  const def = { ...hub.DAILY_BRIEF_DEFAULT_SCHEDULE, weekdays: [1, 2, 3, 4, 5] };
+  // Monday 2026-11-02 (EST): the default 09:00 meeting is 14:00Z, fired 5 min early.
+  const meet = Date.UTC(2026, 10, 2, 14, 0), run = meet - 5 * 60e3;
+  assert.equal(S in (await fleet()).dailyBriefSchedules, false, "no host, no default");
+  // A host that cannot write briefs (an older agent): the default is shown but
+  // never fires, so no failed row lands every weekday (XERK-2398 QA).
+  await beat1574("dbDefOld", S);
+  hub.dailyBriefTick(run);
+  assert.equal(hub.getDailyBriefs()[S], undefined, "no capable host, no default fire");
+  delete agents.dbDefOld;
+  await briefHost2395("dbDefA", S);
+  assert.deepEqual((await fleet()).dailyBriefSchedules[S], def, "served the schedule it runs on");
+  assert.equal(S in hub.getDailyBriefSchedules(), false, "the default is never stored");
+  const got = await request("GET", `/api/orgs/${S}/daily-brief/schedule`, { headers: userHeaders });
+  assert.deepEqual(got.body.schedule, def);
+  assert.ok(got.body.next.runAt > Date.now());
+  hub.dailyBriefTick(run - 1000);
+  assert.equal(hub.getDailyBriefs()[S], undefined);
+  hub.dailyBriefTick(run);
+  const [cmd] = briefCmds2395("dbDefA");
+  assert.equal(cmd.meetingAt, meet);
+  assert.equal(cmd.model, "haiku");
+  // Saturday: not a default weekday.
+  assert.equal(hub.dailyBriefDue(S, def, Date.UTC(2026, 10, 7, 13, 55)), null);
+  // A toggle merges over the default and is stored: the org has opted out.
+  const r = await request("PUT", `/api/orgs/${S}/daily-brief/schedule`,
+    { body: { enabled: false }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual({ ...r.body.schedule, updatedAt: 0 }, { ...def, enabled: false, updatedAt: 0 });
+  assert.equal(r.body.next, null);
+  delete hub.getDailyBriefs()[S];
+  hub.dailyBriefTick(run);
+  assert.equal(hub.getDailyBriefs()[S], undefined, "an opted-out org never fires");
+  cleanup2395(S, ["dbDefA", "dbDefOld"]);
 });
 
 test("XERK-2395: a full store forgets departed orgs, else refuses rather than re-firing", async () => {

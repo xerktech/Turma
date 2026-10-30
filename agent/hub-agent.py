@@ -24189,7 +24189,7 @@ _DAILY_BRIEF_URL_RE = re.compile(
     r"(?i)[a-z][a-z0-9+.-]*://\S*|\b(?:mailto|file):\S+|\b[\w.-]+@[\w-]+(?:\.[\w-]+)*:\S+"
     r"|\bwww\.\S+")
 _DAILY_BRIEF_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
-_DAILY_BRIEF_JIRA_EXTRA = ("assignee", "statuscategorychangedate")
+_DAILY_BRIEF_JIRA_EXTRA = ("assignee", "statuscategorychangedate", "issuelinks")
 _DAILY_BRIEF_AZDO_EXTRA = ("System.AssignedTo", "Microsoft.VSTS.Common.StateChangeDate")
 # Lower = more urgent. Jira's stock names, then common synonyms; ADO's P1..P4
 # are read numerically. Unknown/absent sorts with Medium.
@@ -24276,6 +24276,32 @@ def _brief_row(t, parents):
     }
 
 
+def _brief_open_blockers(t, done=()):
+    """The keys still holding `t` up. The shaped `blockedBy` keeps a blocker that
+    is already Done, so a ticket whose blockers all closed read as blocked aloud
+    (XERK-2398 QA, live Jira). Jira's raw `issuelinks` carry each linked issue's
+    status category; `done` adds the keys the brief itself saw closed."""
+    links = (t.get("_fields") or {}).get("issuelinks")
+    done = set(done)
+    keys = [k for k in t.get("blockedBy") or [] if isinstance(k, str) and k not in done]
+    if not isinstance(links, list):
+        return keys
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        ltype = link.get("type")
+        if not isinstance(ltype, dict) or (ltype.get("name") or "") != "Blocks":
+            continue
+        inw = link.get("inwardIssue")
+        if not isinstance(inw, dict) or not isinstance(inw.get("key"), str):
+            continue
+        status = (inw.get("fields") or {}).get("status") if isinstance(inw.get("fields"), dict) else None
+        cat = (status or {}).get("statusCategory") if isinstance(status, dict) else None
+        if isinstance(cat, dict) and (cat.get("key") or "").lower() == "done":
+            done.add(inw["key"])
+    return [k for k in keys if k not in done]
+
+
 def _brief_days_in(t, until):
     f = t.get("_fields") or {}
     since = _brief_ts(f.get("statuscategorychangedate")
@@ -24304,6 +24330,7 @@ def _brief_assemble(source, site_key, scope, day_from, week_from, until,
         truncated = True
     closed = closed[:DAILY_BRIEF_MAX_CLOSED]
 
+    done_keys = {t.get("key") for t in closed_raw if t.get("statusCategory") == "done"}
     open_rows = []
     for t in open_raw:
         if t.get("statusCategory") != "inprogress" or t.get("isEpic"):
@@ -24311,7 +24338,7 @@ def _brief_assemble(source, site_key, scope, day_from, week_from, until,
         row = _brief_row(t, parents)
         row["status"] = _brief_text(t.get("status"))
         row["daysInStatus"] = _brief_days_in(t, until)
-        row["blockedBy"] = [k for k in t.get("blockedBy") or [] if isinstance(k, str)][:10]
+        row["blockedBy"] = _brief_open_blockers(t, done_keys)[:10]
         open_rows.append(row)
     if len(open_rows) > DAILY_BRIEF_MAX_OPEN:
         truncated = True
@@ -24328,6 +24355,10 @@ def _brief_assemble(source, site_key, scope, day_from, week_from, until,
     for t in todo_raw:
         key = t.get("key")
         if key in seen or t.get("statusCategory") != "todo" or t.get("isEpic"):
+            continue
+        # Ready work only: a candidate a blocker still holds up is not next, and
+        # "unblocked by X" while Y is open was read aloud as false (XERK-2398 QA).
+        if _brief_open_blockers(t, done_keys):
             continue
         unblocked = [k for k in t.get("blockedBy") or [] if k in closed_keys]
         same_parent = t.get("parentKey") in active_parents

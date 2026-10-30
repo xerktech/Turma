@@ -3978,6 +3978,30 @@ const persistDailyBriefSchedules = registerExternalStore({
   coerce: dailyBriefSchedulesCoerce, read: () => dailyBriefSchedules,
   install: (v) => { dailyBriefSchedules = v; },
 });
+// The schedule an org with none stored runs on (XERK-2398, operator decision):
+// a standup at 09:00 New York time, Monday to Friday. It is never stored — an
+// operator edit stores the whole schedule, and a stored {enabled:false} is how
+// an org opts out — so every org a host is decided into gets a brief by default.
+const DAILY_BRIEF_DEFAULT_SCHEDULE = Object.freeze({
+  enabled: true, time: "09:00", timeZone: "America/New_York",
+  weekdays: Object.freeze([1, 2, 3, 4, 5]), leadMinutes: 5, model: "auto",
+});
+// Tests swap it out (__setDailyBriefDefault): the shared test hub holds 100+
+// synthetic orgs and runs its leader tick on the real clock.
+let dailyBriefDefault = DAILY_BRIEF_DEFAULT_SCHEDULE;
+function dailyBriefScheduleOf(siteKey) {
+  if (Object.hasOwn(dailyBriefSchedules, siteKey)) return dailyBriefSchedules[siteKey];
+  return dailyBriefDefault && { ...dailyBriefDefault, weekdays: [...dailyBriefDefault.weekdays] };
+}
+// What clients read: the stored map plus the default for every org a host is
+// decided into that stores none, so the page and the phone show the schedule
+// that will actually run.
+function dailyBriefSchedulesWire() {
+  const out = Object.create(null);
+  if (dailyBriefDefault) for (const site of decidedOrgs()) out[site] = dailyBriefScheduleOf(site);
+  for (const [site, s] of Object.entries(dailyBriefSchedules)) out[site] = s;
+  return out;
+}
 // Store an org's (already validated) schedule — durable save, cache bust, SSE frame.
 function setDailyBriefSchedule(siteKey, schedule) {
   dailyBriefSchedules[siteKey] = schedule;
@@ -3987,7 +4011,7 @@ function setDailyBriefSchedule(siteKey, schedule) {
 function publishDailyBriefSchedules() {
   persistDailyBriefSchedules();
   invalidateAgentsCache();
-  sseBroadcast("dailyBriefSchedules", dailyBriefSchedules);
+  sseBroadcast("dailyBriefSchedules", dailyBriefSchedulesWire());
 }
 
 // The wall clock of instant `ms` in `timeZone`, as UTC-epoch fields.
@@ -6719,8 +6743,9 @@ function buildAgentsCache() {
     // a client's count is the org's, not the served tail's. Hub-computed ints.
     decisionCounts: decisionCountsWire(),
     // The Daily Brief's per-org meeting schedules (XERK-2391), hub-owned and
-    // whitelisted on every write/restore (sanitizeDailyBriefSchedule).
-    dailyBriefSchedules,
+    // whitelisted on every write/restore (sanitizeDailyBriefSchedule); an org
+    // with none stored is served the default it runs on (XERK-2398).
+    dailyBriefSchedules: dailyBriefSchedulesWire(),
     // The Daily Brief's written briefs (XERK-2395): siteKey -> newest first, the
     // newest and newest finished in full, the rest headline-only (dailyBriefsWire).
     dailyBriefs: dailyBriefsWire(),
@@ -17524,7 +17549,14 @@ function pickDailyBriefHost(siteKey, model, exclude = []) {
 
 // Queue the command for `row` on `host`; returns the row with its in-flight
 // fields set (the caller writes it).
+// runIds whose command THIS process queued or re-queued. A command lives in the
+// host record, saved on state.json's 30s debounce, while the row is written at
+// once — so a hub killed right after a fire boots with a `running` row and no
+// command (XERK-2398 QA). The tick re-queues each running row once per process;
+// the agent runs a re-delivered runId once.
+const dailyBriefSent = new Set();
 function dispatchDailyBrief(siteKey, row, host, now) {
+  dailyBriefSent.add(row.runId);
   const runtime = dailyBriefRuntime(agents[host]);
   const cmdId = queueCommand(host, { type: "renderDailyBrief", siteKey, runId: row.runId,
     dayFrom: row.dayFrom, weekFrom: row.weekFrom, until: row.until, meetingAt: row.meetingAt,
@@ -17554,7 +17586,7 @@ function startDailyBriefRun(siteKey, trigger, now = Date.now(), due = null) {
       return { status: 409, error: `${DAILY_BRIEF_ORGS_MAX} orgs already have briefs — the limit` };
     }
   }
-  const schedule = dailyBriefSchedules[siteKey] || null;
+  const schedule = dailyBriefScheduleOf(siteKey);
   const lastOk = list.find((b) => b.status === "ok");
   const lastRunAt = lastOk ? lastOk.until : null;
   const weekFrom = now - 7 * 86400e3;
@@ -17638,6 +17670,11 @@ function dailyBriefTick(now = Date.now()) {
         if (gone) retryDailyBrief(siteKey, row, "the host went offline before answering", now);
         else if (now - row.sentAt >= DAILY_BRIEF_RUN_TIMEOUT_MS) {
           retryDailyBrief(siteKey, row, "the host did not answer in time", now);
+        } else if (!dailyBriefSent.has(row.runId)) {
+          // Keep the first sentAt, so the timeout still runs from the fire.
+          if (row.cmdId) dropQueuedCommand(row.host, row.cmdId, "renderDailyBrief");
+          const again = dispatchDailyBrief(siteKey, row, row.host, now);
+          putDailyBrief(siteKey, { ...again, sentAt: row.sentAt, tried: row.tried });
         }
       }
       if (!orgs.has(siteKey) && !row && now - list[0].startedAt >= DAILY_BRIEF_RETAIN_MS) {
@@ -17648,11 +17685,17 @@ function dailyBriefTick(now = Date.now()) {
       console.error(`daily brief: settling ${logName(siteKey)} failed: ${e && e.message}`);
     }
   }
-  for (const [siteKey, schedule] of Object.entries(dailyBriefSchedules)) {
-    if (!orgs.has(siteKey)) continue;
+  for (const siteKey of orgs) {
+    const schedule = dailyBriefScheduleOf(siteKey);
+    if (!schedule) continue;
     try {
       if ((dailyBriefs[siteKey] || []).some((b) => b.status === "running")) continue;
       const due = dailyBriefDue(siteKey, schedule, now);
+      // The default fires only where a host can write it: an org no host of
+      // which can (an older agent) would get a failed row every weekday
+      // (XERK-2398 QA). A schedule the operator saved still records why.
+      if (due && !Object.hasOwn(dailyBriefSchedules, siteKey)
+          && !pickDailyBriefHost(siteKey, DAILY_BRIEF_AUTO_MODEL)) continue;
       if (due) startDailyBriefRun(siteKey, "scheduled", now, due);
     } catch (e) {
       console.error(`daily brief: firing ${logName(siteKey)} failed: ${e && e.message}`);
@@ -23205,7 +23248,7 @@ const server = http.createServer(async (req, res) => {
         if (!body || typeof body !== "object" || Array.isArray(body)) {
           return json(res, 400, { error: "schedule must be an object" });
         }
-        const merged = { ...(dailyBriefSchedules[siteKey] || {}) };
+        const merged = { ...(dailyBriefScheduleOf(siteKey) || {}) };
         for (const k of ["enabled", "time", "timeZone", "weekdays", "leadMinutes", "model"]) {
           if (k in body) merged[k] = body[k];
         }
@@ -23227,7 +23270,7 @@ const server = http.createServer(async (req, res) => {
         }
         setDailyBriefSchedule(siteKey, value);
       }
-      const schedule = dailyBriefSchedules[siteKey] || null;
+      const schedule = dailyBriefScheduleOf(siteKey);
       return json(res, 200, { ok: true, schedule, next: schedule && nextDailyBriefRun(schedule) });
     }
 
@@ -24052,6 +24095,7 @@ if (process.env.TURMA_TEST) {
     // inject a FileLiveStore as the shared store (a real Valkey can't run in CI),
     // drive the per-host write-through and hydration, and pin the non-HA path off.
     __setLiveStore(store, on) { liveStore = store; HA_ON = !!on; },
+    __setDailyBriefDefault(s) { dailyBriefDefault = s; },
     __getHaOn() { return HA_ON; },
     // XERK-763: leader election + the shared single-flight guards. Exported so a
     // test can inject a leader (drive isLeader() true/false), drive the guard
@@ -24534,6 +24578,7 @@ if (process.env.TURMA_TEST) {
     // REPLACES the map.
     getDecisions: () => decisions, decisionsCoerce, sanitizeDecision, appendDecision,
     getDailyBriefSchedules: () => dailyBriefSchedules, dailyBriefSchedulesCoerce,
+    DAILY_BRIEF_DEFAULT_SCHEDULE, dailyBriefSchedulesWire, dailyBriefSent,
     sanitizeDailyBriefSchedule, setDailyBriefSchedule, nextDailyBriefRun, dailyBriefWindow,
     normalizeDailyBrief,
     getDailyBriefs: () => dailyBriefs, dailyBriefsCoerce, sanitizeDailyBrief, dailyBriefsWire,
