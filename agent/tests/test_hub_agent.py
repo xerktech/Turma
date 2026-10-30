@@ -56,6 +56,8 @@ spec.loader.exec_module(ha)
 # Never let a test sweep the REAL host's processes: resume_on_boot reaps
 # pre-XERK-1588 ttyds, which on a live agent host would signal real terminals.
 ha.PROC_ROOT = tempfile.mkdtemp(prefix="hub-agent-noproc-")
+# Removed at exit: a dir per run otherwise piles up in /tmp (554 on one host, XERK-2476).
+atexit.register(shutil.rmtree, ha.PROC_ROOT, True)
 # The defect-attribution worker (XERK-1846) would fetch and blame every repo
 # under the real REPOS_ROOT from a beat; TestDefectAttribution turns it on.
 ha.DEFECT_SCAN = False
@@ -33733,6 +33735,216 @@ class TestPokeListener(unittest.TestCase):
                 port = int(open(port_file).read().strip())
                 self._connect_and_send(port, b"anything\n")
                 self.assertTrue(ha._poke.wait(2))
+
+
+class TestReapEndedSessions(unittest.TestCase):
+    """_reap_ended (XERK-2476) over a REAL git repo + worktrees, a fake /proc
+    and a temp Claude scratch root: only ended sessions' processes, scratch and
+    clean, ref-held worktrees go; live ones and unsafe trees stay."""
+
+    def setUp(self):
+        import subprocess
+        if not shutil.which("git"):
+            self.skipTest("git not available")
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-reap-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = os.path.join(self.tmp, "demo")
+        os.makedirs(self.repo)
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        self._run = lambda *a, cwd=None: subprocess.run(
+            ["git", *a], cwd=cwd or self.repo, env=env, capture_output=True,
+            text=True, check=True)
+        self._run("init", "-q", "-b", "main")
+        self._run("commit", "-q", "--allow-empty", "-m", "c1")
+        self.wt_root = os.path.join(self.tmp, "worktrees")
+        self.claude_tmp = os.path.join(self.tmp, "claude-tmp")
+        self.proc = os.path.join(self.tmp, "proc")
+        os.makedirs(self.claude_tmp)
+        os.makedirs(self.proc)
+        patches = [
+            ("REGISTRY_DIR", self.tmp),
+            ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
+            ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
+            ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
+            ("RESUMABLE_CACHE_PATH", os.path.join(self.tmp, "resumable-cache.json")),
+            ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
+            ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
+            ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
+            ("PRIORITY_WRITE_LEDGER_PATH", os.path.join(self.tmp, "jira-priority-writes.json")),
+            ("DUPLICATE_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-duplicate-links.json")),
+            ("BLOCKS_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-blocks-links.json")),
+            ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
+            ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
+            ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
+            ("DEFECT_SCAN_PATH", os.path.join(self.tmp, "defect-scan.json")),
+            ("ARCHIVE_OFFERED_PATH", os.path.join(self.tmp, "archive-offered.json")),
+            ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
+            ("IMPORT_STAGING_ROOT", os.path.join(self.tmp, "import-staging")),
+            ("WORKTREES_ROOT", self.wt_root),
+            ("REPOS_ROOT", self.tmp),
+            ("PROC_ROOT", self.proc),
+            ("REAP_TERM_GRACE_SEC", 0),
+            ("device_name", lambda: "test-host"),
+            ("scan_repos", lambda: [{"name": "demo", "path": self.repo}]),
+            ("claude_tmp_root", lambda: self.claude_tmp),
+        ]
+        for name, value in patches:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.sm = ha.SessionManager()
+        # The agent's tmux server is pid 900; nothing real is ever asked.
+        p = mock.patch.object(self.sm, "_agent_tmux_pids", lambda: [900])
+        p.start()
+        self.addCleanup(p.stop)
+        self.signals = []
+        p = mock.patch.object(ha.os, "kill",
+                              lambda pid, sig: self.signals.append((pid, sig)))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _add_worktree(self, sid):
+        path = os.path.join(self.wt_root, "demo", sid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self._run("worktree", "add", "--detach", path, "main")
+        return path
+
+    def _age(self, path, days):
+        """Back-date `path` and everything under it."""
+        t = time.time() - days * 86400
+        for root, dirs, files in os.walk(path):
+            for n in dirs + files:
+                os.utime(os.path.join(root, n), (t, t), follow_symlinks=False)
+        os.utime(path, (t, t))
+
+    def _scratch(self, wt, days):
+        d = os.path.join(self.claude_tmp, ha._project_slug(wt))
+        os.makedirs(os.path.join(d, "sess", "scratchpad"), exist_ok=True)
+        self._age(d, days)
+        return d
+
+    def _proc(self, pid, cwd="/", argv=("sleep", "1"), ppid=1, tty=0):
+        d = os.path.join(self.proc, str(pid))
+        os.makedirs(d)
+        with open(os.path.join(d, "stat"), "w") as f:
+            f.write(f"{pid} (x) S {ppid} {pid} {pid} {tty} " + " ".join(["0"] * 15)
+                    + f" {pid * 7} 0 0\n")
+        with open(os.path.join(d, "cmdline"), "wb") as f:
+            f.write(b"\0".join(a.encode() for a in argv) + b"\0")
+        os.symlink(cwd, os.path.join(d, "cwd"))
+
+    def _killed(self):
+        return sorted({pid for pid, _ in self.signals})
+
+    def test_reaps_an_ended_session_and_leaves_a_live_one(self):
+        ended = self._add_worktree("ended")
+        live = self._add_worktree("live")
+        self.sm.registry = [{"id": "live", "worktreePath": live, "status": "running"}]
+        self._age(ended, 5)
+        self._age(live, 5)
+        ended_tmp = self._scratch(ended, 5)
+        live_tmp = self._scratch(live, 5)
+        gone_tmp = self._scratch(os.path.join(self.wt_root, "demo", "gone"), 5)
+        foreign_tmp = os.path.join(self.claude_tmp, "-home-someone-else")
+        os.makedirs(foreign_tmp)
+        self._age(foreign_tmp, 5)
+
+        self._proc(101, cwd=ended)                                  # orphan: killed
+        self._proc(102, cwd=os.path.join(ended, "sub"), tty=34816)  # a shell: kept
+        self._proc(103, cwd=live)                                   # live session's
+        self._proc(104, argv=("bash", ended_tmp + "/sess/scratchpad/pf.sh"))  # killed
+        self._proc(900, argv=("tmux", "new-session", "-c", ended))  # agent server
+        self._proc(905, cwd=ended, ppid=900)                        # a live pane's
+        self._proc(106, argv=("tmux", "-L", ha.TMUX_SOCKET, "new", "-c", ended))
+        self._proc(107, argv=("cat", ended + "x/f"))                # another path
+        self._proc(108, cwd=gone_tmp + " (deleted)")                # killed
+
+        self.sm._reap_ended()
+
+        self.assertEqual(self._killed(), [101, 104, 108])
+        self.assertFalse(os.path.exists(ended_tmp))
+        self.assertFalse(os.path.exists(gone_tmp))
+        self.assertTrue(os.path.isdir(live_tmp))
+        self.assertTrue(os.path.isdir(foreign_tmp))
+        self.assertFalse(os.path.isdir(ended))      # clean + on main: removed
+        self.assertTrue(os.path.isdir(live))
+
+    def test_keeps_dirty_and_unreferenced_worktrees(self):
+        dirty = self._add_worktree("dirty")
+        with open(os.path.join(dirty, "wip.txt"), "w") as f:
+            f.write("x")
+        orphan = self._add_worktree("orphan")
+        self._run("commit", "-q", "--allow-empty", "-m", "no ref holds me", cwd=orphan)
+        pushed = self._add_worktree("pushed")
+        self._run("commit", "-q", "--allow-empty", "-m", "on a branch", cwd=pushed)
+        self._run("branch", "feature", "HEAD", cwd=pushed)
+        ignored = os.path.join(pushed, "bin")
+        os.makedirs(ignored)
+        with open(os.path.join(pushed, ".git", "info", "exclude") if os.path.isdir(
+                os.path.join(pushed, ".git")) else os.path.join(
+                self.repo, ".git", "info", "exclude"), "a") as f:
+            f.write("bin/\n")
+        with open(os.path.join(ignored, "out.dll"), "w") as f:
+            f.write("build output")
+        for wt in (dirty, orphan, pushed):
+            self._age(wt, 5)
+
+        self.sm._reap_ended()
+
+        self.assertTrue(os.path.isdir(dirty))
+        self.assertTrue(os.path.isdir(orphan))
+        self.assertFalse(os.path.isdir(pushed))     # ignored output goes with it
+        self.assertIn("feature", self._run("branch", "--format=%(refname:short)").stdout)
+
+    def test_a_recent_or_within_retention_session_is_left_alone(self):
+        recent = self._add_worktree("recent")       # ended minutes ago
+        recent_tmp = self._scratch(recent, 0)
+        kept = self._add_worktree("kept")           # idle a day: < 3d retention
+        self._age(kept, 1)
+        kept_tmp = self._scratch(kept, 1)
+        self._proc(101, cwd=recent)
+        self._proc(102, cwd=kept)
+
+        self.sm._reap_ended()
+
+        self.assertEqual(self._killed(), [102])
+        self.assertTrue(os.path.isdir(recent_tmp))
+        self.assertFalse(os.path.exists(kept_tmp))
+        self.assertTrue(os.path.isdir(recent))
+        self.assertTrue(os.path.isdir(kept))
+
+    def test_no_process_is_killed_when_the_agent_tmux_server_is_unreadable(self):
+        ended = self._add_worktree("ended")
+        self._age(ended, 5)
+        self._proc(101, cwd=ended)
+        with mock.patch.object(self.sm, "_agent_tmux_pids", lambda: None):
+            self.sm._reap_ended()
+        self.assertEqual(self.signals, [])
+
+    def test_retention_zero_never_removes_a_worktree(self):
+        ended = self._add_worktree("ended")
+        self._age(ended, 30)
+        with mock.patch.object(ha, "WORKTREE_RETENTION_SEC", 0):
+            self.sm._reap_ended()
+        self.assertTrue(os.path.isdir(ended))
+
+    def test_a_worktree_claimed_by_a_resume_is_not_removed(self):
+        ended = self._add_worktree("ended")
+        self._age(ended, 5)
+        with mock.patch.object(self.sm, "_claim_for_removal", lambda p: False):
+            self.sm._reap_ended()
+        self.assertTrue(os.path.isdir(ended))
+
+    def test_the_beat_starts_one_reaper_per_interval(self):
+        started = []
+        with mock.patch.object(ha, "REAP_ENDED", True), \
+                mock.patch.object(self.sm, "_reap_ended", lambda: started.append(1)):
+            self.sm._reap_last = time.monotonic() - ha.REAP_EVERY_SEC - 1
+            self.sm._maybe_reap_ended()
+            self.sm._reap_worker.join(5)
+            self.sm._maybe_reap_ended()             # interval not yet passed
+        self.assertEqual(started, [1])
 
 
 class TestPruneRepo(unittest.TestCase):
