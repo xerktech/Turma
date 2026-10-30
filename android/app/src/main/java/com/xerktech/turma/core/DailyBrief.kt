@@ -35,9 +35,10 @@ fun nextBriefMeeting(s: DailyBriefSchedule?, now: Long): Long? {
     if (days.isEmpty()) return null
     val time = LocalTime.of(m.groupValues[1].toInt(), m.groupValues[2].toInt())
     val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
-    // Eight days: today's meeting may already have passed, and the same weekday
-    // a week out is the latest a one-weekday schedule can be.
-    for (i in 0L..7L) {
+    // From yesterday, as the hub scans (XERK-2415): where the spring gap opens at
+    // 23:00 (America/Nuuk) yesterday's 23:xx meeting lands after local midnight.
+    // Through a week out, the latest a one-weekday schedule can be.
+    for (i in -1L..7L) {
         val d = today.plusDays(i)
         if (d.dayOfWeek.value % 7 !in days) continue
         val at = ZonedDateTime.of(d, time, zone).toInstant().toEpochMilli()
