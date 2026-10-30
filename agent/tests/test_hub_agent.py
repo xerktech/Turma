@@ -28376,9 +28376,26 @@ class TestRecreatedWorktreeKeepsItsBranch(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "heads/k")
         self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"), self.tip)
 
-    def test_a_name_valid_ref_name_refuses_never_reaches_git(self):
-        sm = self._killed_session_on("feat+plus")      # git allows it; we don't
-        sm.closed[-1]["lastBranch"] = "refs/heads/feat+plus"
+    def test_a_plus_or_non_ascii_branch_is_restored(self):
+        # XERK-2484: git allows these; valid_ref_name refused them, so the tree
+        # came back detached at the base.
+        for i, name in enumerate(("feat+plus", "feat-é-ü")):
+            with self.subTest(name=name):
+                if i:
+                    self.wt = os.path.join(self.tmp, "wt", "Turma", f"abcd{i}")
+                sm = self._killed_session_on(name)
+                self.assertEqual(sm.closed[-1]["lastBranch"], f"refs/heads/{name}")
+                sm.resume(sm.closed[-1]["id"])
+                self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), name)
+                self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"), self.tip)
+
+    def test_revision_syntax_or_an_option_never_reaches_a_checkout(self):
+        sm = self._killed_session_on("feat-r")
+        for bad in ("feat-r@{0}", "feat-r~1", "feat-r^", "-feat-r", "feat r",
+                    "../feat-r", "feat-r.lock", ".feat-r"):
+            with self.subTest(bad=bad):
+                self.assertFalse(ha.local_branch_exists(self.repo, bad))
+        sm.closed[-1]["lastBranch"] = "feat-r@{0}"
         sm.resume("abcde")
         self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "")
         self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"),
@@ -28444,6 +28461,81 @@ class TestRecreatedWorktreeKeepsItsBranch(ManagerMixin, unittest.TestCase):
         sm.resume_transcript(tid, self.wt)
         self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "feat-e")
         self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"), self.tip)
+
+    def test_branch_name_rule_agrees_with_git(self):
+        # Each layer pinned on its own: the validator against git's own
+        # check-ref-format (HEAD and @ are refused on purpose, git or not).
+        names = ["a+b", "café/日本", "x/😀", "feat-1.2", "a/b/c", "x.y",
+                 "x@{1}", "x~1", "x^", "-x", "x..y", "..", "x.lock", "a/.b",
+                 ".x", "x/", "x.", "a//b", "a b", "a:b", "a?b", "a*b", "a[b",
+                 "a\\b", "a\x7fb", "a\tb", "", "@{x"]
+        for n in names:
+            with self.subTest(name=n):
+                git_ok = subprocess.run(["git", "check-ref-format", "--branch", n],
+                                        capture_output=True).returncode == 0
+                self.assertEqual(ha.git_branch_name_ok(n), git_ok)
+        self.assertFalse(ha.git_branch_name_ok("HEAD"))
+        self.assertFalse(ha.git_branch_name_ok("@"))
+        self.assertFalse(ha.git_branch_name_ok("@{-1}"))  # git expands it: no oracle
+
+    def test_the_lookup_matches_the_exact_ref_even_past_the_validator(self):
+        sm = self._killed_session_on("feat-q")
+        with mock.patch.object(ha, "git_branch_name_ok", lambda n: True):
+            self.assertTrue(ha.local_branch_exists(self.repo, "feat-q"))
+            for rev in ("feat-q@{0}", "feat-q~0", "feat-q^0", "HEAD"):
+                with self.subTest(rev=rev):
+                    self.assertFalse(ha.local_branch_exists(self.repo, rev))
+
+    def test_resume_any_with_no_closed_record_reads_the_transcripts_branch(self):
+        # XERK-2484: an older agent's (or aged-out) closed record carries no
+        # lastBranch; the transcript's own gitBranch is the answer, but only
+        # while it is still a local branch.
+        for branch, want in (("feat-t", "feat-t"), ("gone", ""), ("HEAD", "")):
+            with self.subTest(branch=branch):
+                sm, tid = self._resume_any_setup("feat-t", tx_branch=branch)
+                sm.closed = []
+                sm.resume_transcript(tid, self.wt)
+                self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), want)
+                if not want:
+                    self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"),
+                                     self.git("-C", self.repo, "rev-parse", "main"))
+                self.git("-C", self.repo, "worktree", "remove", "--force", self.wt)
+                self.git("-C", self.repo, "branch", "-q", "-D", "feat-t")
+
+    def test_a_closed_records_branch_wins_over_the_transcripts(self):
+        sm, tid = self._resume_any_setup("feat-c", tx_branch="main")
+        sm.resume_transcript(tid, self.wt)
+        self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "feat-c")
+
+    def _resume_any_setup(self, branch, *, tx_branch):
+        if not getattr(self, "_root_patched", False):
+            root = os.path.join(self.tmp, "reposX")
+            os.makedirs(root)
+            os.rename(self.repo, os.path.join(root, "Turma"))
+            self.repo = os.path.join(root, "Turma")
+            self.wt = os.path.join(root, ".turma", "worktrees", "Turma", "abcde")
+            self.proj = os.path.join(self.tmp, "projects")
+            for k, v in (("REPOS_ROOT", root), ("PROJECTS_ROOT", self.proj),
+                         ("WORKTREES_ROOT", os.path.join(root, ".turma", "worktrees"))):
+                p = mock.patch.object(ha, k, v)
+                p.start()
+                self.addCleanup(p.stop)
+            p = mock.patch.object(ha, "scan_repos",
+                                  lambda: [{"name": "Turma", "path": self.repo}])
+            p.start()
+            self.addCleanup(p.stop)
+            self._root_patched = True
+        sm = self._killed_session_on(branch)
+        tid = "22222222-2222-4222-8222-222222222222"
+        sm.closed[-1]["transcriptId"] = sm.closed[-1]["claudeSessionId"] = tid
+        d = os.path.join(self.proj, ha._project_slug(self.wt))
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, tid + ".jsonl"), [
+            {"type": "user", "cwd": self.wt, "gitBranch": "main",
+             "message": {"role": "user", "content": "hi"}},
+            {"type": "assistant", "cwd": self.wt, "gitBranch": tx_branch,
+             "message": {"role": "assistant", "content": "ok"}}])
+        return sm, tid
 
     def test_a_branch_that_is_gone_falls_back_to_the_base(self):
         sm = self._killed_session_on("feat-z")
