@@ -363,13 +363,16 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
     tmux server's argv is its FIRST client's, so ours can name a long-ended worktree). Server pid
     unreadable while a session runs → no process is killed.
   - A host-shared daemon started from a session (the adb server) IS reaped; it restarts on demand.
-  - Only worktree slugs count as live: the repos-root session's slug prefixes every worktree slug.
+  - Only live WORKTREES count as live (slugs and process cwds): the repos-root session's cwd
+    and slug contain every worktree, so counting them reaped nothing (QA, twice).
   - Tests point `PROC_ROOT` at a fake tree; never scan the real `/proc` from a test.
 - After `WORKTREE_RETENTION_SEC` (3 days, 0 = never): `git worktree remove` (no `--force`) only
   when `_worktree_removable`: no modified/untracked file (`-uall`), no assume-unchanged or
   skip-worktree entry, no ignored file outside `REAP_REGENERABLE_DIRS` (the migration set + bin/
   obj/build; a `.env` or `CLAUDE.local.md` keeps it), and every HEAD-reflog commit held by a ref.
-  Through `_claim_for_removal`, which also refuses an import's cwd or a path already claimed.
+  Never while any process's cwd is in the tree (`_procs_in_tree`: the kept shells above).
+  Through `_claim_for_removal`, which also refuses an import's cwd or a path already claimed;
+  every side of that handshake compares REALPATHS (git lists resolved paths, records may not).
   Resume re-creates the dir at the repo's HEAD (the branch survives). Ended entries are kept.
 - Not reaped: generic `/tmp` litter not attributable to a session cwd (`qa*`, `MSBuild*`).
 - Tests: `TestReapEndedSessions`.

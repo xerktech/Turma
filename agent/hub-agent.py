@@ -4395,6 +4395,26 @@ def _ended_orphan_pids(dead_roots, protect_pids, protect_socket=None,
     return sorted(picked.items())
 
 
+def _procs_in_tree(path, proc_root=None):
+    """Whether any readable process has its cwd in `path` (either spelling).
+    An unreadable /proc reads as yes, which only keeps the tree."""
+    proc_root = proc_root or PROC_ROOT
+    roots = {os.path.normpath(path), os.path.realpath(path)}
+    try:
+        names = [n for n in os.listdir(proc_root) if n.isdigit()]
+    except OSError:
+        return True
+    for n in names:
+        try:
+            cwd = os.readlink(os.path.join(proc_root, n, "cwd"))
+        except OSError:
+            continue
+        cwd = cwd[:-len(" (deleted)")] if cwd.endswith(" (deleted)") else cwd
+        if any(cwd == r or cwd.startswith(r + os.sep) for r in roots):
+            return True
+    return False
+
+
 def _kill_orphans(orphans, proc_root=None, grace=None):
     """SIGTERM each (pid, starttime), then SIGKILL any still alive after the
     grace. A pid whose start time no longer matches was reused — left alone."""
@@ -34106,7 +34126,7 @@ class SessionManager:
             refuse(f"a session is already running in {norm}")
             return
         with self._prune_lock:
-            if norm in self._prune_removing:
+            if os.path.realpath(norm) in self._prune_removing:
                 refuse(f"a prune is removing the worktree at {norm}")
                 return
             with self._imports_lock:
@@ -45503,21 +45523,25 @@ class SessionManager:
         True, skip _worktree_add, and launch claude into a directory about to be
         unlinked. A bare check before the removal doesn't close that: only
         pairing it with the beat's own claim under ONE lock does."""
+        # Compared as REALPATHS on every side: git lists a worktree resolved,
+        # while a record or import may name it through a symlinked REPOS_ROOT.
+        real = os.path.realpath(path)
         with self._prune_lock:
             # A migration import holds its cwd too; and a path another
             # remover (prune vs the ended-session reaper) already claimed is
             # theirs — the first release would otherwise clear its marker
             # while the second removal is still running.
-            if (path in {s.get("worktreePath") for s in list(self.registry)}
-                    or path in list(self._imports_inflight.values())
-                    or path in self._prune_removing):
+            held = [s.get("worktreePath") for s in list(self.registry)]
+            held += list(self._imports_inflight.values())
+            if (real in {os.path.realpath(h) for h in held if h}
+                    or real in self._prune_removing):
                 return False
-            self._prune_removing.add(path)
+            self._prune_removing.add(real)
             return True
 
     def _release_removal(self, path):
         with self._prune_lock:
-            self._prune_removing.discard(path)
+            self._prune_removing.discard(os.path.realpath(path))
 
     def _claim_worktree(self, path, sess):
         """Beat side of that handshake: register `sess` unless a prune is
@@ -45529,7 +45553,7 @@ class SessionManager:
         stopped session's record is still in the registry, so a prune never
         considers either."""
         with self._prune_lock:
-            if path in self._prune_removing:
+            if os.path.realpath(path) in self._prune_removing:
                 return False
             self.registry.append(sess)
             return True
@@ -45738,6 +45762,15 @@ class SessionManager:
         slugs = {_project_slug(p) for p in paths if p.startswith(roots)}
         return paths, slugs
 
+    def _reap_live_trees(self):
+        """Live worktrees under WORKTREES_ROOT (both spellings): what a process
+        must not be working in to be reaped. Never the repos-root session's
+        cwd, which contains every worktree on the host."""
+        paths, _slugs = self._reap_live()
+        roots = (os.path.join(WORKTREES_ROOT, ""),
+                 os.path.join(os.path.realpath(WORKTREES_ROOT), ""))
+        return {p for p in paths if p.startswith(roots)}
+
     @staticmethod
     def _slug_is_live(name, slugs):
         return any(name == s or name.startswith(s + "-") for s in slugs)
@@ -45830,7 +45863,8 @@ class SessionManager:
                 roots = [p for p in idle_trees if p not in live] + dead_tmp
                 roots += [os.path.realpath(r) for r in roots]
                 killed = _kill_orphans(_ended_orphan_pids(
-                    roots, protect, protect_socket=TMUX_SOCKET, live_roots=live))
+                    roots, protect, protect_socket=TMUX_SOCKET,
+                    live_roots=self._reap_live_trees()))
                 if killed:
                     log(f"reap: killed {len(killed)} orphan process(es) of ended "
                         f"sessions: {', '.join(map(str, killed))}")
@@ -45847,6 +45881,10 @@ class SessionManager:
         if WORKTREE_RETENTION_SEC > 0:
             for repo_path, p, idle in ended:
                 if idle < WORKTREE_RETENTION_SEC or p in self._reap_live()[0]:
+                    continue
+                # A process the kill step kept (an operator's shell, a tmux
+                # pane) still works there: never pull the tree from under it.
+                if not IS_WINDOWS and _procs_in_tree(p):
                     continue
                 if not self._worktree_removable(p):
                     continue

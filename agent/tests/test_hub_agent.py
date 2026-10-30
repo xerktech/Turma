@@ -33877,7 +33877,8 @@ class TestReapEndedSessions(unittest.TestCase):
         self.assertFalse(os.path.exists(gone_tmp))
         self.assertTrue(os.path.isdir(live_tmp))
         self.assertTrue(os.path.isdir(foreign_tmp))
-        self.assertFalse(os.path.isdir(ended))      # clean + on main: removed
+        # Clean and on main, but the kept shell (102) still works in it.
+        self.assertTrue(os.path.isdir(ended))
         self.assertTrue(os.path.isdir(live))
 
     def test_keeps_dirty_and_unreferenced_worktrees(self):
@@ -33972,6 +33973,59 @@ class TestReapEndedSessions(unittest.TestCase):
         self.sm._imports_inflight["mig1"] = ended
         self.sm._reap_ended()
         self.assertTrue(os.path.isdir(ended))
+
+    def test_a_repos_root_session_does_not_shield_worktree_orphans(self):
+        self.sm.registry = [{"id": "root", "root": True, "worktreePath": self.tmp,
+                             "status": "running"}]
+        ended = self._add_worktree("ended")
+        self._age(ended, 1)
+        self._proc(101, cwd=ended)
+        self.sm._reap_ended()
+        self.assertEqual(self._killed(), [101])
+
+    def test_a_tree_a_kept_process_works_in_is_not_removed(self):
+        ended = self._add_worktree("ended")
+        self._age(ended, 5)
+        self._proc(110, cwd=ended)                  # an operator's tmux server
+        self._proc(111, cwd=ended, ppid=110, tty=34817)
+        self.sm._reap_ended()
+        self.assertEqual(self.signals, [])
+        self.assertTrue(os.path.isdir(ended))
+
+    def test_the_claim_refuses_an_import_or_a_record_through_a_symlink(self):
+        link = os.path.join(self.tmp, "link-root")
+        os.symlink(self.wt_root, link)
+        real = os.path.join(self.wt_root, "demo", "x")
+        via_link = os.path.join(link, "demo", "x")
+        self.sm._imports_inflight["m"] = via_link
+        self.assertFalse(self.sm._claim_for_removal(real))
+        self.sm._imports_inflight.clear()
+        self.sm.registry = [{"id": "s", "worktreePath": via_link}]
+        self.assertFalse(self.sm._claim_for_removal(real))
+        self.sm.registry = []
+        self.assertTrue(self.sm._claim_for_removal(real))
+        # A resume naming it through the link waits for the removal.
+        self.assertFalse(self.sm._claim_worktree(via_link, {"id": "r"}))
+        self.sm._release_removal(real)
+        self.assertTrue(self.sm._claim_worktree(via_link, {"id": "r"}))
+
+    def test_a_resume_landing_mid_sweep_keeps_its_scratch(self):
+        a = self._scratch(os.path.join(self.wt_root, "demo", "a1"), 5)
+        b_wt = os.path.join(self.wt_root, "demo", "b2")
+        b = self._scratch(b_wt, 5)
+        real_rmtree = shutil.rmtree
+
+        def rmtree(path, *args, **kw):
+            # The first removal lets a resume of b2 register.
+            self.sm.registry = [{"id": "b2", "worktreePath": b_wt,
+                                 "status": "running"}]
+            return real_rmtree(path, *args, **kw)
+        with mock.patch.object(ha.shutil, "rmtree", rmtree), \
+                mock.patch.object(ha.os, "listdir",
+                                  lambda d, _l=os.listdir: sorted(_l(d))):
+            self.sm._reap_ended()
+        self.assertFalse(os.path.exists(a))
+        self.assertTrue(os.path.isdir(b))
 
     def test_a_path_already_being_removed_cannot_be_claimed_again(self):
         self.assertTrue(self.sm._claim_for_removal("/x"))
