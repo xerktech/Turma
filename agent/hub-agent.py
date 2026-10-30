@@ -45553,7 +45553,7 @@ class SessionManager:
         stopped session's record is still in the registry, so a prune never
         considers either."""
         with self._prune_lock:
-            if os.path.realpath(path) in self._prune_removing:
+            if path and os.path.realpath(path) in self._prune_removing:
                 return False
             self.registry.append(sess)
             return True
