@@ -25,7 +25,7 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   evicts is not lost. **Never a `/`-joined key**: an ADO site key is `dev.azure.com/<org>`.
   - Only a host DECIDED into the session's `ticket.siteKey` (`decidedOrgOf`) contributes — the
     siteKey is agent-asserted.
-  - A paused sleeper is skipped (waiting, not ended); a `queued` record has no work yet.
+  - A `queued` record is skipped: it has no work yet.
 - **Work class = the tracker's issue type**, lowercased (`workClass`), "other" when unknown. Coarse
   on purpose so each (class, model) collects enough tickets to compare.
 - **Model = the family that ANSWERED** (`modelActual`), else the spawn alias, else the host's
@@ -306,9 +306,8 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     allowWrite**: the guard's `Edit(~/.turma/session-requests/**)` made the shadow's own request
     dir read-only, so `shadow-done` failed. `build_shadow_settings` drops that one rule
     (`SESSION_REQUESTS_DENY_RULE`); a new guard Edit deny over an allowWrite path needs the same.
-  - **A shadow is never resumed, migrated or paused** (`resume`, `_resume_at_cwd`,
-    `export_session`, `_sleeper_unpausable`, hub `sleeperPausable`): relaunched it would carry none
-    of its launch protections. The closed record keeps `shadow`, and every shadow session and
+  - **A shadow is never resumed or migrated** (`resume`, `_resume_at_cwd`, `export_session`):
+    relaunched it would carry none of its launch protections. The closed record keeps `shadow`, and every shadow session and
     transcript id is persisted (`_sessions` in `shadow-runs.json`) so a record that lost the flag
     is still refused. An operator-killed shadow's closed record + worktree are reaped.
   - Peeking at later git history is forbidden by the directive only (validity, not safety).

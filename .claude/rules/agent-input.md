@@ -136,8 +136,8 @@ composed.**
       waiting out its backoff blocks the rest (live rig: a due resend overtook it).
     - The worker sleeps to the earliest due time among each session's FIRST held message
       (`_held_wait`): a blocked later one's past due time spun it at 20 Hz.
-    - A held entry stays on `input_held` until typed, so `_input_undelivered` (sleeper pause)
-      sees it; it moves to `input_landed` in one locked step. `_resend_queued` sees held resends.
+    - A held entry stays on `input_held` until typed; it moves to `input_landed` in one locked
+      step. `_resend_queued` sees held resends.
     - Pinned to the pane epoch it was typed against: a relaunch drops it (old conversation).
     - What a stopped message typed is RECORDED per pane (`_PANE_LEFTOVERS`, `_note_leftover`:
       the typed prefix, or "a paste" for the bracketed path). The next write into that pane
