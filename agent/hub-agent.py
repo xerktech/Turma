@@ -7225,6 +7225,38 @@ def branch_exists(repo_path, ref):
                      "--quiet", ref]))
 
 
+# git's own branch-name rules (git-check-ref-format, plus `--branch`'s no
+# leading dash), checked in Python so no name reaches git that it could read as
+# an option or as revision syntax. Unlike valid_ref_name this admits `+` and
+# non-ASCII, which git allows in a branch name (XERK-2484).
+_BRANCH_NAME_FORBIDDEN_RE = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
+
+
+def git_branch_name_ok(name):
+    """True if `name` is a branch name git itself would accept."""
+    if not isinstance(name, str) or not name or len(name.encode()) > 1024:
+        return False
+    # `HEAD` is refused by git as a branch name, and `worktree add <p> HEAD`
+    # would detach at the repo's HEAD (rc 0, the wrong commit); `@` git allows
+    # but reads the same way, so it is refused on purpose.
+    if name.startswith("-") or name in ("@", "HEAD") or name.endswith(("/", ".")):
+        return False
+    if _BRANCH_NAME_FORBIDDEN_RE.search(name) or ".." in name or "@{" in name:
+        return False
+    return all(seg and not seg.startswith(".") and not seg.endswith(".lock")
+               for seg in name.split("/"))
+
+
+def local_branch_exists(repo_path, name):
+    """True if `refs/heads/<name>` is an existing local branch. `show-ref
+    --verify` matches the exact ref, never revision syntax (`x@{1}`, `x~1`)."""
+    if not git_branch_name_ok(name):
+        return False
+    rc, _ = run_ok(["git", "-C", repo_path, "show-ref", "--verify", "--quiet",
+                    f"refs/heads/{name}"])
+    return rc == 0
+
+
 def repo_head_ready(repo_path):
     """True once the repo has a HEAD that resolves to a commit — the exact
     precondition `git worktree add --detach` has, and the one a `.git` entry
@@ -10123,6 +10155,21 @@ def _read_tail_lines(path, max_bytes):
     except OSError:
         return []
     return [line.strip() for line in raw.split(b"\n") if line.strip()]
+
+
+def _transcript_git_branch(path):
+    """The branch the newest entry of a transcript was recorded on (Claude
+    Code stamps `gitBranch` on its entries), or None: detached (`HEAD`),
+    absent, or unreadable. A hint only; callers check it is a local branch."""
+    for raw in reversed(_read_tail_lines(path, 1 << 20)):
+        try:
+            e = json.loads(raw)
+        except ValueError:
+            continue
+        b = e.get("gitBranch") if isinstance(e, dict) else None
+        if isinstance(b, str) and b:
+            return None if b == "HEAD" else b
+    return None
 
 
 def _last_entry(path):
@@ -31895,8 +31942,8 @@ class SessionManager:
             os.makedirs(os.path.dirname(sess["worktreePath"]), exist_ok=True)
             run(["git", "-C", sess["repoPath"], "worktree", "prune"])
             env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
-            # `--` is not accepted between path and commit-ish here; the name is
-            # valid_ref_name-checked (no leading dash) and resolved by full ref.
+            # `--` is not accepted between path and commit-ish here; the name
+            # passed `local_branch_exists` (no leading dash, an exact local ref).
             rc, _err = run_ok(["git", "-C", sess["repoPath"], "worktree", "add",
                                sess["worktreePath"], branch], env=env)
             if rc == 0:
@@ -31954,8 +32001,7 @@ class SessionManager:
             if name.startswith(prefix):
                 cands.insert(0, name[len(prefix):])
         for cand in cands:
-            if valid_ref_name(cand) and branch_exists(sess["repoPath"],
-                                                      f"refs/heads/{cand}"):
+            if local_branch_exists(sess["repoPath"], cand):
                 return cand
         return None
 
@@ -33776,6 +33822,14 @@ class SessionManager:
                   # The branch its tree was on, for a re-created worktree (XERK-2482).
                   "lastBranch": closed.get("lastBranch")}
                  if closed else None)
+        # No closed record (an older agent's, or one aged out of
+        # CLOSED_PER_REPO) knows no lastBranch: take the branch the transcript
+        # itself was last recorded on. `_recreate_branch` uses it only if it is
+        # still a local branch (XERK-2484).
+        if not (extra or {}).get("lastBranch"):
+            tb = _transcript_git_branch(path)
+            if tb:
+                extra = {**(extra or {}), "lastBranch": tb}
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id, extra=extra)
 
     def _refuse_start(self, reason, *, cmd_id=None, migration_id=None,

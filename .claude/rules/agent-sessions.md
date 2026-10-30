@@ -352,6 +352,11 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
     `_recreate_branch` resolves it, stripped first: `heads/x` (tag `x` too), `refs/heads/x`
     (branch `heads/x` too). The kill stores the FULL ref (`refs/heads/x`): stripped-first would
     read a killed `heads/k` as an unrelated `k`.
+  - The name is judged by git's own branch rules (`git_branch_name_ok`) and matched EXACTLY
+    (`local_branch_exists`: `show-ref --verify`), never `valid_ref_name` (XERK-2484): that
+    refused `+` and non-ASCII names, and `rev-parse` would resolve `x@{1}`/`x~1`.
+  - **Resume-any with no closed record** (older agent, aged out of `CLOSED_PER_REPO`) takes the
+    transcript's newest `gitBranch` (`_transcript_git_branch`), same local-branch check.
   - **Never `ticket.branch`**: it is only reserved at spawn, so a session killed before cutting it
     would resume on a LATER session's branch of the same ticket.
   Tests: `TestRecreatedWorktreeKeepsItsBranch`.
