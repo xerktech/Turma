@@ -343,6 +343,18 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   re-creating a deleted/pruned worktree there first: Claude scopes id lookup to a repo's live
   worktrees + repo dir. A dev-machine session synced through the shared `~/.claude` has a foreign cwd
   and stays view-only.
+- **A re-created worktree lands on the session's OWN branch** (XERK-2482, `_recreate_branch`):
+  the record's `lastBranch` (stamped by the beat on each real read, and at kill) is checked out by
+  start/resume/resume-any when it still exists locally. Held by another worktree → detached at
+  its tip; gone → the base ref. Bare `baseRef` ran the resumed agent without its own commits.
+  - A read that finds no branch (the tree is gone) never clears it, or Start lands on an older one.
+  - The beat stores git's `--abbrev-ref` read AS-IS and runs no git for it (XERK-1262); only
+    `_recreate_branch` resolves it, stripped first: `heads/x` (tag `x` too), `refs/heads/x`
+    (branch `heads/x` too). The kill stores the FULL ref (`refs/heads/x`): stripped-first would
+    read a killed `heads/k` as an unrelated `k`.
+  - **Never `ticket.branch`**: it is only reserved at spawn, so a session killed before cutting it
+    would resume on a LATER session's branch of the same ticket.
+  Tests: `TestRecreatedWorktreeKeepsItsBranch`.
 - **Delete** (on a stopped session) also removes the worktree; any branch the agent committed
   survives (the app owns no branch).
 
