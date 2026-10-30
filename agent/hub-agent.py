@@ -31647,12 +31647,29 @@ class SessionManager:
             except (OSError, ValueError):
                 pass
 
-    def _worktree_add(self, sess, base_ref=None):
+    def _worktree_add(self, sess, base_ref=None, branch=None):
         """Add the worktree in DETACHED HEAD — the app never creates a branch;
         the running agent branches its own work. base_ref (a pre-validated
         commit-ish, typically origin/<default> for latest main) is the detach
         point; None detaches at the repo's current HEAD. Used by spawn and, as a
-        cold-path recovery, by start/resume when the worktree dir has vanished."""
+        cold-path recovery, by start/resume when the worktree dir has vanished.
+
+        `branch` (a recovery only, from `_recreate_branch`) is the session's own
+        EXISTING local branch (XERK-2482): the tree is checked out on it, so the
+        resumed conversation continues on its own commits rather than at
+        base_ref. A branch another worktree holds cannot be checked out twice,
+        so that case detaches at its tip instead. Nothing is created either way."""
+        if branch:
+            os.makedirs(os.path.dirname(sess["worktreePath"]), exist_ok=True)
+            run(["git", "-C", sess["repoPath"], "worktree", "prune"])
+            env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+            # `--` is not accepted between path and commit-ish here; the name is
+            # valid_ref_name-checked (no leading dash) and resolved by full ref.
+            rc, _err = run_ok(["git", "-C", sess["repoPath"], "worktree", "add",
+                               sess["worktreePath"], branch], env=env)
+            if rc == 0:
+                return
+            base_ref = f"refs/heads/{branch}"
         # With no base ref we detach at the repo's own HEAD, so an unborn one is
         # a guaranteed failure — and git's answer to it is seven lines of orphan
         # advice around one line of cause (XERK-343). Say what is actually wrong
@@ -31683,6 +31700,43 @@ class SessionManager:
         rc, err = run_ok(cmd, env=env)
         if rc != 0:
             raise RuntimeError(f"git worktree add failed: {git_error_text(err)}")
+
+    def _recreate_branch(self, sess):
+        """The branch a re-created worktree lands on (XERK-2482): `lastBranch`,
+        the branch the session's tree was last seen on (read by the beat, and at
+        kill), when it is still a LOCAL branch. None → the caller's base ref, as
+        before. Worktree removal never deletes a branch.
+
+        The beat stores git's `rev-parse --abbrev-ref HEAD` as-is, which spells
+        an ambiguous name `heads/x` (a tag `x` too) or `refs/heads/x` (a branch
+        `heads/x` too); the stripped name is tried first, then the read itself.
+
+        Never `ticket.branch`: that name is only RESERVED at spawn, and a session
+        killed before cutting it leaves it free for a later session of the same
+        ticket, whose work this one would then resume on."""
+        name = sess.get("lastBranch")
+        if not isinstance(name, str):
+            return None
+        cands = [name]
+        for prefix in ("heads/", "refs/heads/"):
+            if name.startswith(prefix):
+                cands.insert(0, name[len(prefix):])
+        for cand in cands:
+            if valid_ref_name(cand) and branch_exists(sess["repoPath"],
+                                                      f"refs/heads/{cand}"):
+                return cand
+        return None
+
+    def _live_branch(self, sess):
+        """The branch checked out in the session's worktree now, as its FULL
+        ref (`refs/heads/x`), or None (detached, root, gone, or git can't say).
+        Full, so `_recreate_branch` never mistakes a branch named `heads/k` for
+        the beat's ambiguous spelling of `k`."""
+        wt = sess.get("worktreePath")
+        if sess.get("root") or not wt or not os.path.isdir(wt):
+            return None
+        ref = run(["git", "-C", wt, "symbolic-ref", "-q", "HEAD"])
+        return ref if ref.startswith("refs/heads/") else None
 
     def _worktree_remove(self, sess):
         run(["git", "-C", sess["repoPath"], "worktree", "remove",
@@ -33145,6 +33199,10 @@ class SessionManager:
             "claudeSessionId",
         )}
         rec["closedAt"] = now_iso()
+        # The branch its tree is on, so a resume that must re-create a removed
+        # worktree lands back on it (XERK-2482). Kept from an earlier life when
+        # the tree is already gone.
+        rec["lastBranch"] = self._live_branch(sess) or sess.get("lastBranch")
         # Snapshot the two things the live caches are about to forget, so the
         # hub's Ended-sessions view can still show what this session did:
         #
@@ -33227,7 +33285,8 @@ class SessionManager:
             # Root runs in REPOS_ROOT (always present) — no worktree to re-add.
             # Normally the worktree persists (kill keeps it), so this is skipped.
             if not sess.get("root") and not os.path.isdir(sess["worktreePath"]):
-                self._worktree_add(sess, base_ref=sess.get("baseRef"))
+                self._worktree_add(sess, base_ref=sess.get("baseRef"),
+                                   branch=self._recreate_branch(sess))
             if sess.get("ticket") is not None:
                 sess["ticket"] = _reopened_ticket(sess["ticket"])
             # A close request left from before the stop (a non-final failure, or
@@ -33285,6 +33344,7 @@ class SessionManager:
             "worktreePath": rec.get("worktreePath"),
             "branch": rec.get("branch"),
             "baseRef": rec.get("baseRef"),
+            "lastBranch": rec.get("lastBranch"),
             "root": rec.get("root"),
             "label": rec.get("label"),
             "summary": rec.get("summary"),   # keep the name across resume...
@@ -33353,7 +33413,8 @@ class SessionManager:
             # Root has no worktree to re-add; it resumes in place at REPOS_ROOT.
             # The kept worktree normally still exists, so this is skipped.
             if not sess.get("root") and not os.path.isdir(sess["worktreePath"]):
-                self._worktree_add(sess, base_ref=sess.get("baseRef"))
+                self._worktree_add(sess, base_ref=sess.get("baseRef"),
+                                   branch=self._recreate_branch(sess))
             self._launch_tmux(sess, resume=True)
             self._launch_ttyd(sess)
             # A link the closed record didn't snapshot (e.g. an agent restart
@@ -33479,7 +33540,9 @@ class SessionManager:
                   # record without a summary (never named) carries none, and the
                   # session is named once from the transcript as before.
                   "summary": closed.get("summary"),
-                  "summaryManual": closed.get("summaryManual")}
+                  "summaryManual": closed.get("summaryManual"),
+                  # The branch its tree was on, for a re-created worktree (XERK-2482).
+                  "lastBranch": closed.get("lastBranch")}
                  if closed else None)
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id, extra=extra)
 
@@ -33629,6 +33692,7 @@ class SessionManager:
             "summaryManual": extra.get("summaryManual"),
             "ticket": extra.get("ticket"),
             "migratedFrom": extra.get("migratedFrom"),
+            "lastBranch": extra.get("lastBranch"),
             # A session that was ALREADY named (XERK-815) must come back already
             # ANSWERING to that name, not to a launch slug the rc-name reconciler
             # then has to `/rename` away on the first idle beat. That `/rename`
@@ -33706,7 +33770,8 @@ class SessionManager:
                     sess["baseRef"] = f"origin/{name}"
             elif not is_root and not os.path.isdir(cwd):
                 sess["baseRef"] = resolve_base_ref(repo_path, None)
-                self._worktree_add(sess, base_ref=sess["baseRef"])
+                self._worktree_add(sess, base_ref=sess["baseRef"],
+                                   branch=self._recreate_branch(sess))
             self._remember_usage(sess)
             self._launch_tmux(sess, resume=True, resume_id=transcript_id)
             self._launch_ttyd(sess)
@@ -46581,6 +46646,18 @@ class SessionManager:
                     self.save()
             except Exception as e:
                 log(f"ticket adopt failed for {sid}: {e}")
+            # Remember the branch the tree is on, so a tree removed before the
+            # next kill/Start is re-created on it (XERK-2482). Only a REAL read
+            # moves it: once the tree is gone the read is None and must not
+            # erase it. Stored as READ (`heads/x` beside a tag `x`) and resolved
+            # only at re-create time, so the beat runs no git for it (XERK-1262);
+            # it saves only when the read changes.
+            try:
+                if lb and lb != sess.get("lastBranch"):
+                    sess["lastBranch"] = lb
+                    self.save()
+            except Exception as e:
+                log(f"last-branch record failed for {sid}: {e}")
         return {
             "id": sid,
             # Read with .get(), NEVER a bare sess["..."] — this dict is built on

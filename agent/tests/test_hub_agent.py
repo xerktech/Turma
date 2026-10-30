@@ -28153,6 +28153,305 @@ class TestWorktreeAddSkipsLfsSmudge(unittest.TestCase):
                 sm._worktree_add(sess, base_ref="origin/main")
 
 
+class TestRecreatedWorktreeKeepsItsBranch(ManagerMixin, unittest.TestCase):
+    """XERK-2482: a killed session whose worktree was removed (prune, delete,
+    the ended-session reaper) is re-created on resume. It must come back on the
+    session's OWN branch, not detached at the repo's HEAD without its commits.
+    Driven over real git."""
+
+    GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x",
+               "GIT_CONFIG_NOSYSTEM": "1"}
+    REAL_RUNNERS = {"run": ha.run, "run_ok": ha.run_ok, "run_out": ha.run_out}
+
+    def setUp(self):
+        super().setUp()
+        for name, fn in self.REAL_RUNNERS.items():
+            p = mock.patch.object(ha, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.dict(os.environ, {**self.GIT_ENV,
+                                         "HOME": os.path.join(self.tmp, "home")})
+        p.start()
+        self.addCleanup(p.stop)
+        os.makedirs(os.environ["HOME"], exist_ok=True)
+        self.repo = os.path.join(self.tmp, "repo")
+        self.git("init", "-q", "-b", "main", self.repo)
+        self.git("-C", self.repo, "commit", "-q", "--allow-empty", "-m", "base")
+        self.wt = os.path.join(self.tmp, "wt", "Turma", "abcde")
+
+    def git(self, *args):
+        out = subprocess.run(["git", *args], capture_output=True, text=True)
+        if out.returncode:
+            raise AssertionError(f"git {args}: {out.stderr}")
+        return out.stdout.strip()
+
+    def _killed_session_on(self, branch, *, ticket=None):
+        """A session that cut `branch`, committed on it, and was killed —
+        then had its worktree removed."""
+        sm = self.make_manager()
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        sess = {"id": "abcde", "repo": "Turma", "repoPath": self.repo,
+                "worktreePath": self.wt, "branch": None, "baseRef": "main",
+                "status": "running", "tmuxName": "agent-abcde",
+                "ticket": ticket}
+        sm._worktree_add(sess, base_ref="main")
+        self.git("-C", self.wt, "switch", "-q", "-c", branch)
+        self.git("-C", self.wt, "commit", "-q", "--allow-empty", "-m", "work")
+        self.tip = self.git("-C", self.wt, "rev-parse", "HEAD")
+        sm.registry = [sess]
+        with mock.patch.object(sm, "_kill_tmux"), mock.patch.object(sm, "_kill_ttyd"):
+            sm.kill("abcde")
+        self.git("-C", self.repo, "worktree", "remove", "--force", self.wt)
+        return sm
+
+    def test_a_resume_re_creates_the_tree_on_its_own_branch(self):
+        sm = self._killed_session_on("feat-x")
+        self.assertEqual(sm.closed[-1]["lastBranch"], "refs/heads/feat-x")
+        sm.resume("abcde")
+        self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "feat-x")
+        self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"), self.tip)
+
+    def test_a_branch_checked_out_elsewhere_detaches_at_its_tip(self):
+        sm = self._killed_session_on("feat-y")
+        other = os.path.join(self.tmp, "other")
+        self.git("-C", self.repo, "worktree", "add", "-q", other, "feat-y")
+        sm.resume("abcde")
+        self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "")
+        self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"), self.tip)
+
+    def test_a_ticket_branch_another_session_cut_is_never_taken(self):
+        # Killed while still detached: the ticket's reserved name is not its own
+        # branch, and a later session of the same ticket cut and committed on it.
+        sm = self.make_manager()
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        sess = {"id": "abcde", "repo": "Turma", "repoPath": self.repo,
+                "worktreePath": self.wt, "branch": None, "baseRef": "main",
+                "status": "running", "tmuxName": "agent-abcde",
+                "ticket": {"key": "XERK-9", "branch": "XERK-9"}}
+        sm._worktree_add(sess, base_ref="main")
+        sm.registry = [sess]
+        with mock.patch.object(sm, "_kill_tmux"), mock.patch.object(sm, "_kill_ttyd"):
+            sm.kill("abcde")
+        self.assertIsNone(sm.closed[-1]["lastBranch"])
+        self.git("-C", self.repo, "worktree", "remove", "--force", self.wt)
+        self.git("-C", self.repo, "branch", "XERK-9")
+        sm.resume("abcde")
+        self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "")
+        self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"),
+                         self.git("-C", self.repo, "rev-parse", "main"))
+
+    def test_a_branch_named_like_a_tag_is_still_recorded(self):
+        self.git("-C", self.repo, "tag", "v1.2")
+        sm = self._killed_session_on("v1.2")
+        self.assertEqual(sm.closed[-1]["lastBranch"], "refs/heads/v1.2")
+        sm.resume("abcde")
+        self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "v1.2")
+        self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"), self.tip)
+
+    def test_a_second_kill_with_the_tree_gone_keeps_the_branch(self):
+        sm = self._killed_session_on("feat-k")
+        sess = sm.closed[-1]
+        sess["status"] = "running"
+        sm.registry = [dict(sess)]
+        sm.closed = []
+        with mock.patch.object(sm, "_kill_tmux"), mock.patch.object(sm, "_kill_ttyd"):
+            sm.kill("abcde")                      # tree is gone: nothing to read
+        self.assertEqual(sm.closed[-1]["lastBranch"], "refs/heads/feat-k")
+
+    def _beat_until(self, sm, sess, want):
+        """Run the REAL session payload (the beat's git reads, served by the
+        cheap-git worker) until the record's lastBranch reads `want`."""
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            sm._session_payload(sess)
+            if sess.get("lastBranch") in (want, f"heads/{want}", f"refs/heads/{want}"):
+                return
+            time.sleep(0.05)
+        self.fail(f"lastBranch stayed {sess.get('lastBranch')!r}, wanted {want!r}")
+
+    def _switch_then_lose_the_tree(self, branch, tag=False):
+        """Resumed on feat-a, switched to `branch` and committed; the beat saw it;
+        then the tree vanished, the beat kept reading, and the session errored."""
+        sm = self._killed_session_on("feat-a")
+        sm.resume("abcde")
+        sess = sm.registry[0]
+        if tag:
+            self.git("-C", self.repo, "tag", branch)
+        self.git("-C", self.wt, "switch", "-q", "-c", branch)
+        self.git("-C", self.wt, "commit", "-q", "--allow-empty", "-m", "b")
+        tip = self.git("-C", self.wt, "rev-parse", "HEAD")
+        self._beat_until(sm, sess, branch)
+        self.git("-C", self.repo, "worktree", "remove", "--force", self.wt)
+        for _ in range(5):                         # reads now say "no branch"
+            sm._session_payload(sess)
+            time.sleep(0.05)
+        self.assertIn(sess["lastBranch"], (branch, f"heads/{branch}"))
+        sess["status"] = "error"
+        sm.start(sess["id"])
+        return tip
+
+    def test_start_comes_back_on_the_branch_the_beat_last_saw(self):
+        tip = self._switch_then_lose_the_tree("feat-b")
+        self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "feat-b")
+        self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"), tip)
+
+    def test_the_beat_records_a_tag_named_branch_by_its_own_name(self):
+        tip = self._switch_then_lose_the_tree("v2.0", tag=True)
+        self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "v2.0")
+        self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"), tip)
+
+    def test_an_unchanged_beat_makes_no_git_call_and_no_save(self):
+        # The beat stores the read as-is (`refs/heads/x` here: a tag `x` and a
+        # branch `heads/x` both exist); resolving it is re-create time's job.
+        sm = self._killed_session_on("feat-a")
+        sm.resume("abcde")
+        sess = sm.registry[0]
+        self.git("-C", self.repo, "tag", "feat-x")
+        self.git("-C", self.repo, "branch", "heads/feat-x")
+        self.git("-C", self.wt, "switch", "-q", "-c", "feat-x")
+        self._beat_until(sm, sess, "feat-x")
+        calls = []
+        real = ha.branch_exists
+        me = threading.get_ident()
+
+        def counted(*a, **k):
+            if threading.get_ident() == me:
+                calls.append(a)
+            return real(*a, **k)
+        with mock.patch.object(ha, "branch_exists", counted), \
+             mock.patch.object(sm, "save") as save:
+            for _ in range(10):
+                sm._session_payload(sess)
+        self.assertEqual(calls, [])
+        save.assert_not_called()
+
+    def test_a_failing_record_never_reaches_the_beat(self):
+        sm = self._killed_session_on("feat-a")
+        sm.resume("abcde")
+        sess = sm.registry[0]
+        self.git("-C", self.wt, "switch", "-q", "-c", "feat-r")
+        with mock.patch.object(sm, "save", side_effect=OSError("disk full")) as save:
+            deadline = time.monotonic() + 10
+            while not save.called and time.monotonic() < deadline:
+                sm._session_payload(sess)        # must not raise
+                time.sleep(0.05)
+        self.assertTrue(save.called)
+
+    def test_an_ambiguous_read_re_creates_on_the_right_branch(self):
+        # With a tag `feat-x` and branches `feat-x` + `heads/feat-x`, git reads
+        # `refs/heads/feat-x` on the first and `heads/heads/feat-x` on the second.
+        self.git("-C", self.repo, "tag", "feat-x")
+        self.git("-C", self.repo, "branch", "feat-x")
+        self.git("-C", self.repo, "branch", "heads/feat-x")
+        for on in ("feat-x", "heads/feat-x"):
+            with self.subTest(on=on):
+                sm = self._killed_session_on("feat-a-" + on.replace("/", "-"))
+                sm.resume("abcde")
+                sess = sm.registry[0]
+                self.git("-C", self.wt, "switch", "-q", on)
+                self.git("-C", self.wt, "commit", "-q", "--allow-empty", "-m", on)
+                tip = self.git("-C", self.wt, "rev-parse", "HEAD")
+                before = sess.get("lastBranch")
+                deadline = time.monotonic() + 10
+                while sess.get("lastBranch") == before and time.monotonic() < deadline:
+                    sm._session_payload(sess)
+                    time.sleep(0.05)
+                self.git("-C", self.repo, "worktree", "remove", "--force", self.wt)
+                sess["status"] = "error"
+                sm.start(sess["id"])
+                self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), on)
+                self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"), tip)
+                self.git("-C", self.repo, "worktree", "remove", "--force", self.wt)
+
+    def test_a_killed_heads_named_branch_is_not_read_as_its_stem(self):
+        # The session cut `heads/k` beside an unrelated branch `k`.
+        self.git("-C", self.repo, "branch", "k")
+        sm = self._killed_session_on("heads/k")
+        sm.resume("abcde")
+        self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "heads/k")
+        self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"), self.tip)
+
+    def test_a_name_valid_ref_name_refuses_never_reaches_git(self):
+        sm = self._killed_session_on("feat+plus")      # git allows it; we don't
+        sm.closed[-1]["lastBranch"] = "refs/heads/feat+plus"
+        sm.resume("abcde")
+        self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "")
+        self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"),
+                         self.git("-C", self.repo, "rev-parse", "main"))
+
+    def test_a_kill_records_the_branch_it_is_on_not_an_older_one(self):
+        # Resumed on feat-a, switched to feat-b and killed before any beat saw it.
+        sm = self._killed_session_on("feat-a")
+        sm.resume("abcde")
+        self.git("-C", self.wt, "switch", "-q", "-c", "feat-b")
+        self.git("-C", self.wt, "commit", "-q", "--allow-empty", "-m", "b")
+        tip = self.git("-C", self.wt, "rev-parse", "HEAD")
+        with mock.patch.object(sm, "_kill_tmux"), mock.patch.object(sm, "_kill_ttyd"):
+            sm.kill("abcde")
+        self.assertEqual(sm.closed[-1]["lastBranch"], "refs/heads/feat-b")
+        self.git("-C", self.repo, "worktree", "remove", "--force", self.wt)
+        sm.resume("abcde")
+        self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "feat-b")
+        self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"), tip)
+
+    def test_the_stripped_name_wins_over_a_later_raw_branch(self):
+        # On `kk` beside a tag `kk`, the beat reads `heads/kk`. A branch literally
+        # named `heads/kk` created after the tree went must not capture it.
+        self.git("-C", self.repo, "tag", "kk")
+        sm = self._killed_session_on("feat-a")
+        sm.resume("abcde")
+        sess = sm.registry[0]
+        self.git("-C", self.wt, "switch", "-q", "-c", "kk")
+        self.git("-C", self.wt, "commit", "-q", "--allow-empty", "-m", "kk")
+        tip = self.git("-C", self.wt, "rev-parse", "HEAD")
+        self._beat_until(sm, sess, "kk")
+        self.assertEqual(sess["lastBranch"], "heads/kk")
+        self.git("-C", self.repo, "worktree", "remove", "--force", self.wt)
+        self.git("-C", self.repo, "branch", "heads/kk", "main")
+        sess["status"] = "error"
+        sm.start(sess["id"])
+        self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "kk")
+        self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"), tip)
+
+    def test_resume_any_re_creates_the_tree_on_its_branch(self):
+        root = os.path.join(self.tmp, "reposX")
+        os.makedirs(root)
+        os.rename(self.repo, os.path.join(root, "Turma"))
+        self.repo = os.path.join(root, "Turma")
+        self.wt = os.path.join(root, ".turma", "worktrees", "Turma", "abcde")
+        proj = os.path.join(self.tmp, "projects")
+        for k, v in (("REPOS_ROOT", root), ("PROJECTS_ROOT", proj),
+                     ("WORKTREES_ROOT", os.path.join(root, ".turma", "worktrees"))):
+            p = mock.patch.object(ha, k, v)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(ha, "scan_repos",
+                              lambda: [{"name": "Turma", "path": self.repo}])
+        p.start()
+        self.addCleanup(p.stop)
+        sm = self._killed_session_on("feat-e")
+        tid = "11111111-1111-4111-8111-111111111111"
+        sm.closed[-1]["transcriptId"] = sm.closed[-1]["claudeSessionId"] = tid
+        d = os.path.join(proj, ha._project_slug(self.wt))
+        os.makedirs(d)
+        write_jsonl(os.path.join(d, tid + ".jsonl"), [
+            {"type": "user", "cwd": self.wt, "message": {"role": "user", "content": "hi"}}])
+        sm.resume_transcript(tid, self.wt)
+        self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "feat-e")
+        self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"), self.tip)
+
+    def test_a_branch_that_is_gone_falls_back_to_the_base(self):
+        sm = self._killed_session_on("feat-z")
+        self.git("-C", self.repo, "branch", "-q", "-D", "feat-z")
+        sm.resume("abcde")
+        self.assertEqual(self.git("-C", self.wt, "branch", "--show-current"), "")
+        self.assertEqual(self.git("-C", self.wt, "rev-parse", "HEAD"),
+                         self.git("-C", self.repo, "rev-parse", "main"))
+
+
 class TestRepoHeadReady(unittest.TestCase):
     """XERK-343: `.git` exists from the first instant of a clone, so it is not
     the question. `repo_head_ready` asks whether HEAD resolves; `repo_forkable`
