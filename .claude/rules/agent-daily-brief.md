@@ -32,6 +32,11 @@ progress) and `next` (To Do candidates). Board mechanics it reuses: `agent-board
   a blocker that closed in the window (from the closed ticket's `blocks`). Ranked by priority
   (`_brief_priority_rank`: Jira names, ADO `P1..P4`, unknown = Medium), then oldest `created`,
   capped at `DAILY_BRIEF_MAX_NEXT`.
+- **Only OPEN blockers count, and blocked work is never a candidate** (XERK-2398 QA, live Jira):
+  the shaped `blockedBy` keeps a blocker already Done, so 4 of 5 "blocked" tickets were not, and
+  "unblocked by X" was read aloud while Y still held it. `_brief_open_blockers` drops a blocker
+  the raw `issuelinks` (`_fields`) report Done or the brief saw closed; `open[].blockedBy` and
+  `counts.blocked` use it, and a To Do ticket with any open blocker is left out of `next`.
 - **ADO carries no `blockedBy`** (the board reads no ADO links), so its candidates come from shared
   parents alone. The output SHAPE is still identical (XERK-43, pinned by `test_azure_parity`).
 - **This text goes to a model**: summaries only, no descriptions. `_brief_text` drops format

@@ -26,11 +26,21 @@ ticket builds to this file; change it here first.
     long key, 409 full): the file store echoes `persist()` through the coerce synchronously even
     HA-off, so a dropped key answered 200 with nothing stored. A full store first forgets orgs
     no host is decided into.
+- **An org with no stored schedule runs on `DAILY_BRIEF_DEFAULT_SCHEDULE`** (XERK-2398, operator
+  decision): enabled, 09:00 `America/New_York`, Mon-Fri, lead 5, model auto.
+  - Never stored: `dailyBriefScheduleOf` resolves it for the tick, Run now's window, GET and the
+    PUT merge base, so a toggle `{enabled:false}` stores the opt-out.
+  - Served for every decided org (`dailyBriefSchedulesWire`, payload + SSE), so web and Android
+    show the schedule that will actually run. Keep the tick and the wire on the same resolver.
+  - The default FIRES only while a capable host is there (`pickDailyBriefHost`): an org of older
+    agents otherwise got a failed row every weekday. A stored schedule still records why.
 - `GET|PUT /api/orgs/<siteKey>/daily-brief/schedule`, operator-authed. PUT merges the body over
-  the stored schedule (a toggle sends `{enabled}` alone) and validates the result whole.
+  the stored (else default) schedule (a toggle sends `{enabled}` alone) and validates the
+  result whole.
   - 400 in the hub's own words (XERK-264); 404 for an org no host is DECIDED into
     (`decidedOrgs`), checked first so a refusal mints no store key.
-  - Answers `{ok, schedule|null, next: {runAt, meetingAt}|null}`.
+  - Answers `{ok, schedule, next: {runAt, meetingAt}|null}`; `schedule` is the default when none
+    is stored.
 - Served as top-level `dailyBriefSchedules` on `/api/agents` and its own `dailyBriefSchedules` SSE
   frame (the whole map).
 
@@ -133,10 +143,15 @@ ticket builds to this file; change it here first.
   reports `failed`, sends an empty `ok`, goes offline/leaves the org, or has not answered in
   `DAILY_BRIEF_RUN_TIMEOUT_MS` (10 min). The old command is withdrawn (no-op once acked). No
   other host → the row settles `failed` with the reason.
+- **A running row's command is re-queued once per hub process** (`dailyBriefSent`, XERK-2398):
+  the command rides the host record (state.json, 30s debounce) while the row is written at once,
+  so a hub killed right after a fire booted with the row and no command, and the meeting got no
+  brief. Same runId and `sentAt`; the agent runs a re-delivered runId once.
 - A scheduled fire with no capable host mints ONE `failed` row saying why (above).
 - The served map is null-prototype, so an org named `__proto__` is served (XERK-1451).
 - `POST /api/orgs/<siteKey>/daily-brief/run` (operator-authed) = Run now, ignores `enabled`, no
-  schedule needed (DAY = last 24h). 404 an org no host is decided into, 409 running / no capable
+  stored schedule needed (DAY opens at the default's previous meeting; last 24h with the default
+  off). 404 an org no host is decided into, 409 running / no capable
   host (mints nothing), 429 within 60s of the last Run now. Answers `{ok, brief}`.
 - Served as top-level `dailyBriefs` on `/api/agents` + its own `dailyBriefs` SSE frame: per org
   the newest row AND the newest `ok` in full, every other one `headline` (the day's first

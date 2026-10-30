@@ -54553,10 +54553,14 @@ class TestDefectForgeAndTracker(unittest.TestCase):
 
 def _brief_issue(key, cat, resolved=None, parent=None, parent_summary=None,
                  blocks=(), blocked_by=(), priority="Medium", created=None,
-                 assignee="Ada Lovelace", summary=None, cat_since=None):
-    """A raw Jira search issue for the daily-brief collector."""
+                 assignee="Ada Lovelace", summary=None, cat_since=None, blocked_by_done=()):
+    """A raw Jira search issue for the daily-brief collector. `blocked_by_done`
+    are blockers Jira reports in a Done status (the link's own status block)."""
     links = [{"type": {"name": "Blocks"}, "outwardIssue": {"key": k}} for k in blocks]
     links += [{"type": {"name": "Blocks"}, "inwardIssue": {"key": k}} for k in blocked_by]
+    links += [{"type": {"name": "Blocks"}, "inwardIssue": {"key": k, "fields": {
+        "status": {"name": "Done", "statusCategory": {"key": "done"}}}}}
+        for k in blocked_by_done]
     f = {"summary": summary or f"Do {key}",
          "status": {"name": {"done": "Done", "indeterminate": "In Progress",
                              "new": "To Do"}[cat], "statusCategory": {"key": cat}},
@@ -54667,6 +54671,34 @@ class TestDailyBrief(unittest.TestCase):
         todo_jql = jqls[-1][0]
         self.assertIn("parent in (XERK-100)", todo_jql)
         self.assertIn("key in (XERK-50)", todo_jql)
+
+    def test_only_open_blockers_count_and_blocked_work_is_never_next(self):
+        # XERK-2398 QA on live Jira: blockers already Done (outside the window)
+        # still counted as "blocked", and a candidate one closed blocker freed
+        # read "unblocked" while another still held it.
+        closed = [_brief_issue("XERK-1", "done", "2026-10-28T12:00:00.000+0000",
+                               parent="XERK-100", blocks=["XERK-50", "XERK-51"])]
+        open_ = [
+            _brief_issue("XERK-10", "indeterminate", blocked_by_done=["XERK-2", "XERK-3"]),
+            _brief_issue("XERK-11", "indeterminate", blocked_by=["XERK-12"],
+                         blocked_by_done=["XERK-2"]),
+            _brief_issue("XERK-12", "indeterminate", parent="XERK-100"),
+        ]
+        todo = [
+            _brief_issue("XERK-50", "new", blocked_by=["XERK-1"]),               # freed
+            _brief_issue("XERK-51", "new", blocked_by=["XERK-1", "XERK-12"]),    # still held
+            _brief_issue("XERK-52", "new", parent="XERK-100", blocked_by=["XERK-12"]),
+            _brief_issue("XERK-53", "new", parent="XERK-100", blocked_by_done=["XERK-4"]),
+        ]
+        out, _ = self._run(closed=closed, open_=open_, todo=todo)
+        blocked = {r["key"]: r["blockedBy"] for r in out["open"]}
+        self.assertEqual(blocked, {"XERK-10": [], "XERK-11": ["XERK-12"], "XERK-12": []})
+        self.assertEqual(json.loads(ha.daily_brief_input(out))["counts"]["blocked"], 1)
+        nxt = {r["key"]: r["why"] for r in out["next"]}
+        self.assertEqual(nxt, {"XERK-50": "unblocked by XERK-1",
+                               "XERK-53": "same epic/parent as recent work"})
+        # The raw links ride only the internal `_fields`, never the model's JSON.
+        self.assertNotIn("issuelinks", json.dumps(out))
 
     def test_row_and_char_caps(self):
         closed = [_brief_issue(f"XERK-{i}", "done", "2026-10-28T12:00:00.000+0000",

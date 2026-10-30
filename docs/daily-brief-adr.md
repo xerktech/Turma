@@ -103,8 +103,18 @@ host/project codenames are replaced through a private term map kept out of the r
   empty-board and nothing-open. So the worker fills the wire's `next` with "Nothing is queued
   next." for an empty list (`contract-daily-brief.md`). The keys stay in the parsed brief, so the
   parser can check them, but the merged wire carries plain text only.
-- **Up-next candidates can be work still waiting on an open gate.** `next` rows carry no
-  `blockedBy`, so the model cannot tell. Suspected, not proven, so it goes on the Turma rollup
-  ticket.
+- **Up-next candidates were work still waiting on an open gate** — proven on live data in the
+  XERK-2398 QA (all 8 candidates blocked), and the blocked count included blockers already Done.
+  Fixed in the collector: only open blockers count, and blocked work is never a candidate.
+
+## Live-data re-check (XERK-2398)
+
+- One real org's live data, through the real agent and the real lockdown runner: Haiku 4 runs,
+  Sonnet 4. Both parsed every time and fit their budgets.
+- Sonnet misstated a ticket's days-in-status on its first run, read ticket keys aloud, and led
+  next-up with items still gated; Haiku picked more sensible next items and answered in 14-25 s
+  (Sonnet 5-11 s).
+- Both repeated the collector's wrong blocked facts (fixed above), so the input, not the model,
+  was the defect. **The default stays Haiku.**
 - **The render worker (XERK-2394)** can turn Haiku's thinking off if latency ever matters. Retry
   once on a `parse_daily_brief` None: every eval reply parsed, so retries should be rare.
