@@ -25310,6 +25310,48 @@ class TestResumeCarry(ManagerMixin, unittest.TestCase):
             closed = sm.build_payload(0, light=True)["closedSessions"]
         self.assertTrue(all("paused" not in c for c in closed))
 
+    def test_a_dropped_pause_reaps_the_idle_tmux_it_left(self):
+        # XERK-2453: an older agent's pause teardown still in flight at its
+        # self-update leaves `agent-<id>` alive with no record behind it.
+        recs = [{"id": "p1", "repo": "r", "tmuxName": "agent-p1",
+                 "closedAt": "2026-10-01T00:00:00Z",
+                 "paused": {"wakeAt": self.NOW, "pausedAt": 1}},
+                {"id": "p2", "repo": "r", "closedAt": "2026-10-01T00:00:00Z",
+                 "paused": {"wakeAt": self.NOW, "pausedAt": 1}},
+                {"id": "p3", "repo": "r", "closedAt": "2026-10-01T00:00:00Z",
+                 "paused": {"wakeAt": self.NOW, "pausedAt": 1}},
+                {"id": "p4", "repo": "r", "tmuxName": "agent-p4",
+                 "closedAt": "2026-10-01T00:00:00Z",
+                 "paused": {"wakeAt": self.NOW, "pausedAt": 1}},
+                {"id": "p5", "repo": "r", "tmuxName": "agent-p5",
+                 "closedAt": "2026-10-01T00:00:00Z",
+                 "paused": {"wakeAt": self.NOW, "pausedAt": 1}},
+                {"id": "k1", "repo": "r", "tmuxName": "agent-k1",
+                 "closedAt": "2026-10-01T00:00:00Z"}]
+        with open(ha.CLOSED_PATH, "w") as f:
+            json.dump(recs, f)
+        sm = self._manager()
+        # p2 was resumed since: a live record owns its tmux name.
+        sm.registry.append({"id": "p2", "tmuxName": "agent-p2", "status": "stopped"})
+        killed, checked = [], []
+
+        def alive(name, strict=False):
+            checked.append((name, strict))
+            return name != "agent-p4"          # p4's tmux is already gone
+
+        def kill(sess):
+            killed.append(sess["tmuxName"])
+            if sess["tmuxName"] == "agent-p5":
+                raise RuntimeError("tmux wedged")
+
+        with mock.patch.object(sm, "_tmux_alive", side_effect=alive), \
+             mock.patch.object(sm, "_kill_tmux", side_effect=kill):
+            sm.resume_on_boot()                # a failed kill never raises
+            sm.resume_on_boot()                # the reap is one-shot
+        # p3 has no tmuxName: its `agent-<id>` is reaped by default.
+        self.assertEqual(killed, ["agent-p1", "agent-p3", "agent-p5"])
+        self.assertTrue(all(strict for _, strict in checked))
+
     def test_a_plain_resume_keeps_its_pr_links_and_gets_new_comments(self):
         # An ordinary kill + Resume still brings back the PRs the session opened:
         # the transcript scan restarts at EOF and never re-reads the create, so

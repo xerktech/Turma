@@ -10028,6 +10028,19 @@ test("XERK-296: one dispatch per host per pass (the shared login is what limits 
   assert.deepEqual((agents.tqOne.commands || []).map((c) => c.issueKey), ["ENG-2"]);
 });
 
+test("XERK-2453: a pending resume takes the slot a ticket spawn would need", () => {
+  const a = { capacity: { maxSessions: 1, running: 0, queued: 0, free: 1 }, commands: [] };
+  assert.equal(hostHasFreeSlot(a), true);
+  a.commands = [{ cmdId: "r1", type: "resume", sessionId: "s1" }];
+  assert.equal(hostHasFreeSlot(a), false, "a resume in flight fills the one slot");
+  a.commands = [{ cmdId: "r2", type: "resumeTranscript", transcriptId: "t1" }];
+  assert.equal(hostHasFreeSlot(a), false);
+  a.commands = [{ cmdId: "s1", type: "start", sessionId: "s2" }];
+  assert.equal(hostHasFreeSlot(a), false, "starting a stopped session takes the slot");
+  a.commands = [{ cmdId: "k1", type: "kill", sessionId: "s1" }];
+  assert.equal(hostHasFreeSlot(a), true, "a non-spawning command takes no slot");
+});
+
 test("XERK-296: an agent that reports no capacity is 'can't tell', never 'full'", async () => {
   // The heartbeat contract: an absent capability degrades, it doesn't block. Such
   // a host still takes the spawn and queues it itself, exactly as before.

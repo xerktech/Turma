@@ -33059,13 +33059,42 @@ class SessionManager:
     def _drop_paused_closed(self):
         """Turn a closed record an older agent PAUSED as a sleeper into an
         ordinary ended, resumable one (XERK-2441). Sleepers are never paused now
-        (they keep their slot), and nothing would ever wake such a record."""
+        (they keep their slot), and nothing would ever wake such a record.
+
+        The older agent tore a pause's tmux down off the beat, so one still in
+        flight at its self-update leaves an idle `agent-<id>` behind with no
+        record. Its name is remembered for `_reap_paused_tmux` (run from
+        `resume_on_boot`, once the live registry is known)."""
+        self._paused_tmux_reap = []
         for c in self.closed:
             if isinstance(c, dict) and "paused" in c:
                 c.pop("paused", None)
                 c.pop("prCommentBase", None)
                 log(f"closed session {c.get('id')}: dropped its sleeper pause; "
                     f"it is an ordinary ended session now")
+                tmux = c.get("tmuxName")
+                if not (isinstance(tmux, str) and tmux) and c.get("id"):
+                    tmux = f"agent-{c['id']}"
+                if isinstance(tmux, str) and tmux:
+                    self._paused_tmux_reap.append(tmux)
+
+    def _reap_paused_tmux(self):
+        """End the tmux a dropped sleeper pause may have left alive (see
+        `_drop_paused_closed`). Skips a name a registry record owns: a resumed
+        session relaunches under the same `agent-<id>`. Never raises."""
+        names = getattr(self, "_paused_tmux_reap", None) or []
+        self._paused_tmux_reap = []
+        owned = {s.get("tmuxName") for s in self.registry if isinstance(s, dict)}
+        for name in names:
+            if name in owned:
+                continue
+            try:
+                # strict: on Windows a stale state file can name a reused pid.
+                if self._tmux_alive(name, strict=True):
+                    self._kill_tmux({"tmuxName": name})
+                    log(f"reaped {name}: an idle tmux left by a dropped sleeper pause")
+            except Exception as e:
+                log(f"reaping {name} after a dropped sleeper pause failed: {e}")
 
     def _remember_closed(self, sess):
         """Record a killed session in the closed history so the hub can offer
@@ -45454,6 +45483,7 @@ class SessionManager:
           --resume, continuing the prior CONVERSATION (not a fresh context).
 
         Either way, a session whose worktree vanished is demoted to stopped."""
+        self._reap_paused_tmux()
         for sess in self.registry:
             if sess.get("status") != "running":
                 continue  # stopped stays stopped (kept for usage; resumable)

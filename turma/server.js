@@ -9877,9 +9877,15 @@ function ticketRepo(siteKey, issueKey, rows) {
 // runs this build, is all of them) but stays eligible so a mixed fleet still
 // routes. Can go negative (more committed than free) — that's fine, it's a
 // sortable score, not a count.
+// A queued `resume`/`resumeTranscript`/`start` takes a slot just like a spawn
+// (XERK-2453): uncounted, a one-slot host got one and a drained `spawnTicket` in
+// the same beat and had to queue or refuse the second agent-side. A start/resume
+// of an `error` session that already holds its slot is counted too — that holds
+// a ticket for one beat, the safe direction.
+const SLOT_TAKING_COMMANDS = new Set(
+  ["spawn", "spawnTicket", "resume", "resumeTranscript", "start"]);
 function pendingSpawnCount(a) {
-  return (a.commands || []).filter(
-    (c) => c && (c.type === "spawn" || c.type === "spawnTicket")).length;
+  return (a.commands || []).filter((c) => c && SLOT_TAKING_COMMANDS.has(c.type)).length;
 }
 function hostAvailability(a) {
   const c = a.capacity;
