@@ -346,6 +346,37 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
 - **Delete** (on a stopped session) also removes the worktree; any branch the agent committed
   survives (the app owns no branch).
 
+## Reaping what ended sessions leave (XERK-2476)
+
+- `_reap_ended` runs on its own thread every `REAP_EVERY_SEC` (6h; `TURMA_REAP_ENDED=0` off).
+  "Ended" = a `WORKTREES_ROOT/<repo>/<id>` worktree no registry record (running OR stopped) or
+  import holds. Idle = newest of its dir, transcripts and `/tmp/claude-<uid>/<slug>`, never its
+  index (a `git status` rewrites that). Paths compare as realpaths (git lists realpaths).
+- After `REAP_MIN_IDLE_SEC` (1h): kills its orphan processes, then deletes its Claude scratch dir.
+  - An orphan's cwd is in the tree/scratch, or an argv word names one (ending at a path/word
+    boundary: `<root>~` is another path). Its whole subtree goes with it.
+  - **Never killed: a process whose SUBTREE holds a tty or a cwd in a live worktree.** A tmux/
+    screen/`script` server looks like any detached orphan from its own entry, yet may host an
+    operator's shell or a live session's pane (QA reproduced both). So a leftover tmux server
+    with panes is NOT reaped; nothing here can tell it from those. Never loosen this.
+  - Also never: the manager's ancestors/descendants, the agent's tmux server + every pane (a
+    tmux server's argv is its FIRST client's, so ours can name a long-ended worktree). Server pid
+    unreadable while a session runs → no process is killed.
+  - A host-shared daemon started from a session (the adb server) IS reaped; it restarts on demand.
+  - Only live WORKTREES count as live (slugs and process cwds): the repos-root session's cwd
+    and slug contain every worktree, so counting them reaped nothing (QA, twice).
+  - Tests point `PROC_ROOT` at a fake tree; never scan the real `/proc` from a test.
+- After `WORKTREE_RETENTION_SEC` (3 days, 0 = never): `git worktree remove` (no `--force`) only
+  when `_worktree_removable`: no modified/untracked file (`-uall`), no assume-unchanged or
+  skip-worktree entry, no ignored file outside `REAP_REGENERABLE_DIRS` (the migration set + bin/
+  obj/build; a `.env` or `CLAUDE.local.md` keeps it), and every HEAD-reflog commit held by a ref.
+  Never while any process's cwd is in the tree (`_procs_in_tree`: the kept shells above).
+  Through `_claim_for_removal`, which also refuses an import's cwd or a path already claimed;
+  every side of that handshake compares REALPATHS (git lists resolved paths, records may not).
+  Resume re-creates the dir at the repo's HEAD (the branch survives). Ended entries are kept.
+- Not reaped: generic `/tmp` litter not attributable to a session cwd (`qa*`, `MSBuild*`).
+- Tests: `TestReapEndedSessions`.
+
 ## New-work branching policy
 
 - A session's checkout is only as fresh as spawn (`default_base_ref`'s short-bounded `git fetch`
