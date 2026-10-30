@@ -34027,6 +34027,33 @@ class TestReapEndedSessions(unittest.TestCase):
         self.assertFalse(os.path.exists(a))
         self.assertTrue(os.path.isdir(b))
 
+    def test_an_import_through_a_symlink_waits_for_a_removal(self):
+        link = os.path.join(self.tmp, "link-root")
+        os.symlink(self.wt_root, link)
+        real = os.path.join(self.wt_root, "demo", "x")
+        refusals = []
+        self.assertTrue(self.sm._claim_for_removal(real))
+        with mock.patch.object(self.sm, "_localize_migrated_cwd",
+                               lambda c: os.path.join(link, "demo", "x")), \
+                mock.patch.object(self.sm, "_resumable_cwd_class",
+                                  lambda c, names: ("demo", None, False)), \
+                mock.patch.object(self.sm, "_refuse_start",
+                                  lambda reason, **kw: refusals.append(reason)):
+            self.sm.import_session({"type": "importSession", "cmdId": "c1",
+                                    "migrationId": "mig1", "transcriptId": "tX",
+                                    "cwd": "x", "repo": "demo"})
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("a prune is removing", refusals[0])
+        self.assertEqual(self.sm._imports_inflight, {})
+
+    def test_procs_in_tree_reads_deleted_cwds_and_fails_safe(self):
+        tree = os.path.join(self.tmp, "t")
+        self.assertFalse(ha._procs_in_tree(tree, proc_root=self.proc))
+        self._proc(101, cwd=tree + " (deleted)")
+        self.assertTrue(ha._procs_in_tree(tree, proc_root=self.proc))
+        # An unreadable /proc keeps the tree.
+        self.assertTrue(ha._procs_in_tree(tree, proc_root=os.path.join(self.tmp, "none")))
+
     def test_a_path_already_being_removed_cannot_be_claimed_again(self):
         self.assertTrue(self.sm._claim_for_removal("/x"))
         self.assertFalse(self.sm._claim_for_removal("/x"))
