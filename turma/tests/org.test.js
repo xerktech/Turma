@@ -281,6 +281,38 @@ test("org: the last fleet's orgs paint the button at mount, before any update (X
   assert.match(next.slot.innerHTML, /org-menu/);
 });
 
+test("org: an unchanged fleet rewrites a cache another tab overwrote (XERK-2435)", () => {
+  const { store } = mountOrg();
+  const fleet = { agents: [agent("a", "acme.atlassian.net")] };
+  Org.update(fleet);
+  const mine = store[Org.SITES_KEY];
+  // Another tab, seeing a different fleet, writes its own list.
+  store[Org.SITES_KEY] = JSON.stringify({ sites: [{ siteKey: "other.atlassian.net" }], colorPins: {} });
+  Org.update(fleet);
+  assert.equal(store[Org.SITES_KEY], mine);
+});
+
+test("org: a settled fleet writes the cache once, not per beat (XERK-2435)", () => {
+  mountOrg();
+  const fleet = { agents: [agent("a", "acme.atlassian.net")] };
+  Org.update(fleet);
+  const setItem = global.localStorage.setItem;
+  let writes = 0;
+  global.localStorage.setItem = (k, v) => { if (k === Org.SITES_KEY) writes++; setItem(k, v); };
+  Org.update(fleet);
+  Org.update(fleet);
+  assert.equal(writes, 0);
+});
+
+test("org: throwing storage leaves the cache write harmless (XERK-2435)", () => {
+  const { slot } = mountOrg();
+  const boom = () => { throw new Error("SecurityError"); };
+  global.localStorage.getItem = boom;
+  global.localStorage.setItem = boom;
+  Org.update({ agents: [agent("a", "acme.atlassian.net")] });
+  assert.match(slot.innerHTML, /org-btn/);
+});
+
 test("org: a cached org name is escaped into the button label", () => {
   // The cache is a second way an org name reaches the slot's innerHTML.
   const { slot } = mountOrg({

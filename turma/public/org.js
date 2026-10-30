@@ -268,15 +268,17 @@
   }
   function cachedSites() { return readCache().sites; }
 
-  let cachedRaw = null;
   function writeCache() {
     const raw = JSON.stringify({
       sites: sites.map(s => ({ siteKey: s.siteKey, orgName: s.orgName || "", source: s.source || "" })),
       colorPins,
     });
-    if (raw === cachedRaw) return;   // a settled fleet writes nothing per beat
-    cachedRaw = raw;
-    try { localStorage.setItem(SITES_KEY, raw); } catch { /* not persisted — the slots just pop in */ }
+    // Compare against storage itself, not a per-tab memo: another tab may have
+    // written its own fleet since, and a memo hit would leave that one standing.
+    // A settled fleet still writes nothing per beat.
+    try {
+      if (localStorage.getItem(SITES_KEY) !== raw) localStorage.setItem(SITES_KEY, raw);
+    } catch { /* not persisted — the slots just pop in */ }
   }
 
   function readStored() {
