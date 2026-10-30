@@ -1258,6 +1258,7 @@ REAP_MIN_IDLE_SEC = _env_int("TURMA_REAP_MIN_IDLE_SEC", 3600, minimum=60)
 WORKTREE_RETENTION_SEC = _env_int("TURMA_WORKTREE_RETENTION_SEC", 3 * 86400,
                                   minimum=0)
 REAP_TERM_GRACE_SEC = 5   # SIGTERM, then SIGKILL whatever is still there
+REAP_REFLOG_MAX = 500     # HEAD reflog entries checked; a longer one keeps the tree
 # Filename charset, mirrored from the hub's safeUploadName. The hub sanitizes
 # first so the operator's chip shows the landing name; this repeats it because a
 # name arriving over the wire must never be able to escape UPLOADS_DIR.
@@ -4283,14 +4284,19 @@ def _proc_stat(proc_root, pid):
 
 
 def _ended_orphan_pids(dead_roots, protect_pids, protect_socket=None,
-                       proc_root=None):
+                       proc_root=None, live_roots=()):
     """[(pid, starttime)] of this uid's processes left behind by ended sessions:
     cwd inside one of `dead_roots`, or an argv word naming a path in one (a
-    `tmux new-session -c <worktree>`, a script under a dead scratchpad).
+    script under a dead scratchpad, a probe started in the worktree), plus
+    every descendant of such a process.
 
     Never a candidate, whatever its cwd or argv says:
-    * one holding a controlling tty — an operator's shell, a pane; a detached
-      orphan (nohup'd script, daemonized tmux server) has none;
+    * one whose subtree holds a process with a controlling tty, or one whose
+      cwd is in `live_roots` — so never a tmux/screen/`script` server with a
+      pane: an operator's multiplexer started from an old worktree, or a
+      shared server some live or stopped session's pane runs on, looks like
+      any detached orphan from its own entry alone. A leftover tmux server
+      with panes is therefore NOT reaped; nothing here can tell it from those;
     * this process, its ancestors and descendants (ttyds, git children);
     * `protect_pids` and their descendants — the agent's tmux server(s) and so
       every live pane. A tmux server's argv is its FIRST client's, so the
@@ -4302,8 +4308,11 @@ def _ended_orphan_pids(dead_roots, protect_pids, protect_socket=None,
     roots = sorted({os.path.normpath(r) for r in dead_roots if r})
     if not roots:
         return []
-    word = re.compile("(?:%s)(?![A-Za-z0-9._-])"
+    # A root ends at a path or word boundary; `<root>~`, `<root>+old` or
+    # `<root>2` are other paths.
+    word = re.compile("(?:%s)(?=$|[/\\s'\"=:;,|&<>()\\[\\]{}])"
                       % "|".join(re.escape(r) for r in roots))
+    live = sorted({os.path.normpath(r) for r in live_roots if r})
     try:
         names = [n for n in os.listdir(proc_root) if n.isdigit()]
     except OSError:
@@ -4336,9 +4345,33 @@ def _ended_orphan_pids(dead_roots, protect_pids, protect_socket=None,
         protected.add(p)
     euid = os.geteuid()
     sock = protect_socket.encode() if protect_socket else None
-    out = []
+
+    def under(path, rs):
+        return any(path == r or path.startswith(r + os.sep) for r in rs)
+
+    def cwd_of(pid):
+        try:
+            cwd = os.readlink(os.path.join(proc_root, str(pid), "cwd"))
+        except OSError:
+            return ""
+        # A cwd whose dir was since removed reads "<path> (deleted)".
+        return cwd[:-len(" (deleted)")] if cwd.endswith(" (deleted)") else cwd
+
+    def subtree(pid):
+        seen, stack = [], [pid]
+        while stack:
+            p = stack.pop()
+            seen.append(p)
+            stack.extend(children.get(p, ()))
+        return seen
+
+    def unsafe(p):
+        # Holds a terminal, or works in a live session's tree.
+        return table[p][1] != 0 or (live and under(cwd_of(p), live))
+
+    picked = {}
     for pid, (_ppid, tty, start) in table.items():
-        if pid in protected or tty != 0:
+        if pid in protected or tty != 0 or pid in picked:
             continue
         base = os.path.join(proc_root, str(pid))
         try:
@@ -4350,17 +4383,16 @@ def _ended_orphan_pids(dead_roots, protect_pids, protect_socket=None,
             continue
         if sock and any(a == b"-L" and v == sock for a, v in zip(argv, argv[1:])):
             continue
-        try:
-            cwd = os.readlink(os.path.join(base, "cwd"))
-        except OSError:
-            cwd = ""
-        # A cwd whose dir was since removed reads "<path> (deleted)".
-        cwd = cwd[:-len(" (deleted)")] if cwd.endswith(" (deleted)") else cwd
-        hit = any(cwd == r or cwd.startswith(r + os.sep) for r in roots) or any(
+        hit = under(cwd_of(pid), roots) or any(
             word.search(a.decode("utf-8", "replace")) for a in argv)
-        if hit:
-            out.append((pid, start))
-    return out
+        if not hit:
+            continue
+        tree = subtree(pid)
+        if any(p in protected or unsafe(p) for p in tree):
+            continue
+        for p in tree:
+            picked[p] = table[p][2]
+    return sorted(picked.items())
 
 
 def _kill_orphans(orphans, proc_root=None, grace=None):
@@ -35109,8 +35141,11 @@ class SessionManager:
     MIGRATION_REGENERABLE_DIRS = frozenset((
         "node_modules", "__pycache__", ".venv", "venv", "target", "dist", ".gradle",
         ".next", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"))
+    # The ended-session reaper may also drop .NET's bin/obj and a build/ dir
+    # (XERK-2476: ~10G of one host's worktrees), never a migration.
+    REAP_REGENERABLE_DIRS = MIGRATION_REGENERABLE_DIRS | {"bin", "obj", "build"}
 
-    def _holds_unregenerable_ignored(self, cwd, timeout):
+    def _holds_unregenerable_ignored(self, cwd, timeout, regenerable=None):
         """True when `git status --ignored=matching` lists an ignored entry that
         is not regenerable. Regenerable is only an entry that IS an ignored dir
         named in MIGRATION_REGENERABLE_DIRS (`!! a/node_modules/`), or a .pyc/.pyo
@@ -35134,7 +35169,8 @@ class SessionManager:
             if not e.startswith("!! "):
                 continue
             parts = e[3:].rstrip("/").split("/")
-            if e.endswith("/") and parts[-1] in self.MIGRATION_REGENERABLE_DIRS:
+            if e.endswith("/") and parts[-1] in (
+                    regenerable or self.MIGRATION_REGENERABLE_DIRS):
                 regen_dirs = True
                 continue
             if not e.endswith("/") and len(parts) > 1 and parts[-2] == "__pycache__" \
@@ -45468,7 +45504,13 @@ class SessionManager:
         unlinked. A bare check before the removal doesn't close that: only
         pairing it with the beat's own claim under ONE lock does."""
         with self._prune_lock:
-            if path in {s.get("worktreePath") for s in list(self.registry)}:
+            # A migration import holds its cwd too; and a path another
+            # remover (prune vs the ended-session reaper) already claimed is
+            # theirs — the first release would otherwise clear its marker
+            # while the second removal is still running.
+            if (path in {s.get("worktreePath") for s in list(self.registry)}
+                    or path in list(self._imports_inflight.values())
+                    or path in self._prune_removing):
                 return False
             self._prune_removing.add(path)
             return True
@@ -45682,15 +45724,61 @@ class SessionManager:
                 return None
         return pids
 
+    # Ignored dirs the reaper may drop with an ended worktree: the migration
+    # set plus the build output that filled this host (.NET bin/obj, build/).
+    def _reap_live(self):
+        """(live worktree paths + their realpaths, live Claude slugs) read fresh.
+        Only worktrees under WORKTREES_ROOT give slugs: the repos-root
+        session's slug is a prefix of EVERY worktree slug, so counting it
+        would keep every scratch dir on the host."""
+        paths = {p for p in self._live_worktree_paths() if p}
+        paths |= {os.path.realpath(p) for p in paths}
+        roots = (os.path.join(WORKTREES_ROOT, ""),
+                 os.path.join(os.path.realpath(WORKTREES_ROOT), ""))
+        slugs = {_project_slug(p) for p in paths if p.startswith(roots)}
+        return paths, slugs
+
+    @staticmethod
+    def _slug_is_live(name, slugs):
+        return any(name == s or name.startswith(s + "-") for s in slugs)
+
+    def _worktree_removable(self, path):
+        """True only when removing `path` loses nothing but regenerable
+        output: no modified/untracked file (hidden ones included), no
+        assume-unchanged/skip-worktree entry, no unregenerable ignored file
+        (a `.env`, a `CLAUDE.local.md`), and every commit its HEAD reflog
+        names still held by a branch, remote or tag. Any git failure keeps it."""
+        t = PRUNE_GIT_TIMEOUT_SEC
+        rc, dirty = run_out(["git", "-C", path, "status", "--porcelain",
+                             "--untracked-files=all", "--ignore-submodules=none"],
+                            timeout=t)
+        if rc != 0 or dirty:
+            return False
+        rc, flags = run_out(["git", "-C", path, "ls-files", "-v"], timeout=t)
+        if rc != 0 or any(ln[:1].islower() or ln[:1] == "S"
+                          for ln in flags.splitlines()):
+            return False
+        if self._holds_unregenerable_ignored(path, t, self.REAP_REGENERABLE_DIRS):
+            return False
+        rc, shas = run_out(["git", "-C", path, "reflog", "show", "--format=%H",
+                            "HEAD"], timeout=t)
+        if rc != 0:
+            return False
+        shas = list(dict.fromkeys(["HEAD"] + shas.split()))
+        if len(shas) > REAP_REFLOG_MAX:
+            return False
+        rc, n = run_out(["git", "-C", path, "rev-list", "--count", *shas,
+                         "--not", "--branches", "--remotes", "--tags"], timeout=t)
+        return rc == 0 and n.strip() == "0"
+
     def _reap_ended(self):
         """Reap what ended sessions left behind (XERK-2476), in order:
 
         1. kill their orphan processes (_ended_orphan_pids says which);
         2. delete their Claude Code scratch, `claude_tmp_root()/<slug>`;
-        3. remove their worktree once idle past WORKTREE_RETENTION_SEC — only a
-           clean tree (no modified or untracked file; ignored build output goes)
-           whose HEAD a branch or remote ref holds, so no commit is lost and
-           resume re-creates it. Through the prune's removal handshake.
+        3. remove their worktree once idle past WORKTREE_RETENTION_SEC, only
+           when _worktree_removable says nothing but build output goes, through
+           the prune's removal handshake. Resume re-creates the dir.
 
         Only session worktrees (WORKTREES_ROOT/<repo>/<id>, registered with that
         repo's git) and scratch dirs under WORKTREES_ROOT's slug are considered;
@@ -45698,14 +45786,17 @@ class SessionManager:
         never are. Steps 1-2 wait REAP_MIN_IDLE_SEC. The live set is re-read
         before each destructive step: a resume can land mid-sweep."""
         now = time.time()
-        live = {p for p in self._live_worktree_paths() if p}
+        live, _slugs = self._reap_live()
         tmp_root = None if IS_WINDOWS else claude_tmp_root()
+        wt_real = os.path.realpath(WORKTREES_ROOT)
         ended = []                                    # (repo path, worktree, idle)
         for repo in scan_repos():
-            prefix = os.path.join(WORKTREES_ROOT, repo["name"]) + os.sep
+            # git lists realpaths, so compare against the resolved root.
+            prefix = os.path.join(wt_real, repo["name"]) + os.sep
             for wt in self._repo_worktrees(repo["path"], timeout=PRUNE_GIT_TIMEOUT_SEC):
                 p = wt["path"]
-                if not p.startswith(prefix) or p in live or not os.path.isdir(p):
+                if (not os.path.realpath(p).startswith(prefix) or p in live
+                        or os.path.realpath(p) in live or not os.path.isdir(p)):
                     continue
                 ended.append((repo["path"], p, now - self._worktree_idle_since(p)))
         idle_trees = [p for _r, p, idle in ended if idle >= REAP_MIN_IDLE_SEC]
@@ -45715,17 +45806,16 @@ class SessionManager:
         # already gone, which is most of them.
         dead_tmp = []
         if tmp_root and os.path.isdir(tmp_root):
-            wt_slug = _project_slug(WORKTREES_ROOT) + "-"
-            live_slugs = [_project_slug(p) for p in live]
+            wt_slugs = {_project_slug(WORKTREES_ROOT) + "-", _project_slug(wt_real) + "-"}
+            _live, slugs = self._reap_live()
             try:
                 names = os.listdir(tmp_root)
             except OSError:
                 names = []
             for name in names:
                 d = os.path.join(tmp_root, name)
-                if (not name.startswith(wt_slug) or os.path.islink(d)
-                        or not os.path.isdir(d)
-                        or any(name == s or name.startswith(s + "-") for s in live_slugs)
+                if (not name.startswith(tuple(wt_slugs)) or os.path.islink(d)
+                        or not os.path.isdir(d) or self._slug_is_live(name, slugs)
                         or now - _newest_mtime(d) < REAP_MIN_IDLE_SEC):
                     continue
                 dead_tmp.append(d)
@@ -45736,20 +45826,19 @@ class SessionManager:
             if protect is None:
                 log("reap: agent tmux server unreadable; not reaping processes")
             else:
-                live = {p for p in self._live_worktree_paths() if p}
+                live, _slugs = self._reap_live()
                 roots = [p for p in idle_trees if p not in live] + dead_tmp
                 roots += [os.path.realpath(r) for r in roots]
                 killed = _kill_orphans(_ended_orphan_pids(
-                    roots, protect, protect_socket=TMUX_SOCKET))
+                    roots, protect, protect_socket=TMUX_SOCKET, live_roots=live))
                 if killed:
                     log(f"reap: killed {len(killed)} orphan process(es) of ended "
                         f"sessions: {', '.join(map(str, killed))}")
 
-        live_slugs = [_project_slug(p) for p in self._live_worktree_paths() if p]
         removed_tmp = 0
         for d in dead_tmp:
-            name = os.path.basename(d)
-            if any(name == s or name.startswith(s + "-") for s in live_slugs):
+            # Per dir, not once: a resume can register between two removals.
+            if self._slug_is_live(os.path.basename(d), self._reap_live()[1]):
                 continue
             shutil.rmtree(d, ignore_errors=True)
             removed_tmp += not os.path.exists(d)
@@ -45757,17 +45846,10 @@ class SessionManager:
         removed_wt = 0
         if WORKTREE_RETENTION_SEC > 0:
             for repo_path, p, idle in ended:
-                if idle < WORKTREE_RETENTION_SEC or p in self._live_worktree_paths():
+                if idle < WORKTREE_RETENTION_SEC or p in self._reap_live()[0]:
                     continue
-                rc, dirty = run_out(["git", "-C", p, "status", "--porcelain"],
-                                    timeout=PRUNE_GIT_TIMEOUT_SEC)
-                if rc != 0 or dirty:
-                    continue                  # uncommitted work, or unreadable
-                rc, held = run_out(["git", "-C", p, "for-each-ref", "--count=1",
-                                    "--contains", "HEAD", "refs/heads", "refs/remotes"],
-                                   timeout=PRUNE_GIT_TIMEOUT_SEC)
-                if rc != 0 or not held:
-                    continue                  # commits no ref holds — keep them
+                if not self._worktree_removable(p):
+                    continue
                 if not self._claim_for_removal(p):
                     continue
                 try:

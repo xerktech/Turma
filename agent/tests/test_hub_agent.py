@@ -33828,7 +33828,7 @@ class TestReapEndedSessions(unittest.TestCase):
         d = os.path.join(self.proc, str(pid))
         os.makedirs(d)
         with open(os.path.join(d, "stat"), "w") as f:
-            f.write(f"{pid} (x) S {ppid} {pid} {pid} {tty} " + " ".join(["0"] * 15)
+            f.write(f"{pid} (x) S {ppid} {pid} {pid} {tty} " + " ".join(["0"] * 14)
                     + f" {pid * 7} 0 0\n")
         with open(os.path.join(d, "cmdline"), "wb") as f:
             f.write(b"\0".join(a.encode() for a in argv) + b"\0")
@@ -33859,10 +33859,20 @@ class TestReapEndedSessions(unittest.TestCase):
         self._proc(106, argv=("tmux", "-L", ha.TMUX_SOCKET, "new", "-c", ended))
         self._proc(107, argv=("cat", ended + "x/f"))                # another path
         self._proc(108, cwd=gone_tmp + " (deleted)")                # killed
+        self._proc(109, cwd="/", ppid=101)                          # orphan's child
+        # An operator's tmux started from the ended tree: its pane has a tty.
+        self._proc(110, cwd=ended)
+        self._proc(111, cwd=ended, ppid=110, tty=34817)
+        # A shared server first started for the ended session, now hosting a
+        # live session's pane (no tty of its own here) — kept.
+        self._proc(112, argv=("tmux", "-L", "x", "new", "-c", ended))
+        self._proc(113, cwd=live, ppid=112)
+        self._proc(114, argv=("cat", ended + "~"))                  # a sibling path
+        self._proc(115, argv=("cat", ended + "+old/f"))
 
         self.sm._reap_ended()
 
-        self.assertEqual(self._killed(), [101, 104, 108])
+        self.assertEqual(self._killed(), [101, 104, 108, 109])
         self.assertFalse(os.path.exists(ended_tmp))
         self.assertFalse(os.path.exists(gone_tmp))
         self.assertTrue(os.path.isdir(live_tmp))
@@ -33913,6 +33923,87 @@ class TestReapEndedSessions(unittest.TestCase):
         self.assertFalse(os.path.exists(kept_tmp))
         self.assertTrue(os.path.isdir(recent))
         self.assertTrue(os.path.isdir(kept))
+
+    def test_ignored_secrets_reflog_commits_and_hidden_edits_keep_a_worktree(self):
+        exclude = os.path.join(self.repo, ".git", "info", "exclude")
+        with open(exclude, "a") as f:
+            f.write(".env\nCLAUDE.local.md\nobj/\n")
+        env_wt = self._add_worktree("env")
+        with open(os.path.join(env_wt, ".env"), "w") as f:
+            f.write("TOKEN=x")
+        local_wt = self._add_worktree("localmd")
+        with open(os.path.join(local_wt, "CLAUDE.local.md"), "w") as f:
+            f.write("notes")
+        build_wt = self._add_worktree("build")      # only obj/: regenerable
+        os.makedirs(os.path.join(build_wt, "obj"))
+        with open(os.path.join(build_wt, "obj", "x.o"), "w") as f:
+            f.write("o")
+        reflog_wt = self._add_worktree("reflog")    # a commit only its reflog holds
+        self._run("commit", "-q", "--allow-empty", "-m", "lost?", cwd=reflog_wt)
+        self._run("checkout", "-q", "--detach", "main", cwd=reflog_wt)
+        hidden_wt = self._add_worktree("hidden")    # an assume-unchanged edit
+        with open(os.path.join(hidden_wt, "t.txt"), "w") as f:
+            f.write("a")
+        self._run("add", "t.txt", cwd=hidden_wt)
+        self._run("commit", "-q", "-m", "t", cwd=hidden_wt)
+        self._run("branch", "hidden-br", "HEAD", cwd=hidden_wt)
+        self._run("update-index", "--assume-unchanged", "t.txt", cwd=hidden_wt)
+        with open(os.path.join(hidden_wt, "t.txt"), "w") as f:
+            f.write("edited")
+        trees = (env_wt, local_wt, build_wt, reflog_wt, hidden_wt)
+        for wt in trees:
+            self._age(wt, 5)
+
+        self.sm._reap_ended()
+
+        self.assertEqual([os.path.isdir(wt) for wt in trees],
+                         [True, True, False, True, True])
+
+    def test_a_repos_root_session_does_not_shield_every_scratch_dir(self):
+        self.sm.registry = [{"id": "root", "root": True, "worktreePath": self.tmp,
+                             "status": "running"}]
+        gone_tmp = self._scratch(os.path.join(self.wt_root, "demo", "gone"), 5)
+        self.sm._reap_ended()
+        self.assertFalse(os.path.exists(gone_tmp))
+
+    def test_an_import_in_flight_holds_its_worktree(self):
+        ended = self._add_worktree("ended")
+        self._age(ended, 5)
+        self.sm._imports_inflight["mig1"] = ended
+        self.sm._reap_ended()
+        self.assertTrue(os.path.isdir(ended))
+
+    def test_a_path_already_being_removed_cannot_be_claimed_again(self):
+        self.assertTrue(self.sm._claim_for_removal("/x"))
+        self.assertFalse(self.sm._claim_for_removal("/x"))
+        self.sm._release_removal("/x")
+        self.assertTrue(self.sm._claim_for_removal("/x"))
+
+    def test_a_symlinked_repos_root_still_reaps(self):
+        link = os.path.join(self.tmp, "link-root")
+        os.symlink(self.wt_root, link)
+        ended = self._add_worktree("ended")
+        self._age(ended, 5)
+        with mock.patch.object(ha, "WORKTREES_ROOT", link):
+            self.sm._reap_ended()
+        self.assertFalse(os.path.isdir(ended))
+
+    def test_a_reused_pid_is_not_signalled(self):
+        self._proc(101)
+        ha._kill_orphans([(101, 101 * 7 + 1)], proc_root=self.proc, grace=0)
+        self.assertEqual(self.signals, [])
+        ha._kill_orphans([(101, 101 * 7)], proc_root=self.proc, grace=0)
+        self.assertEqual([sig for _p, sig in self.signals],
+                         [ha.signal.SIGTERM, ha.signal.SIGKILL])
+
+    def test_agent_tmux_pids_is_none_only_when_a_running_session_needs_it(self):
+        sm = self.sm
+        with mock.patch.object(ha, "run_out", lambda *a, **k: (1, "no server running")):
+            self.assertEqual(ha.SessionManager._agent_tmux_pids(sm), [])
+            sm.registry = [{"id": "a", "status": "running"}]
+            self.assertIsNone(ha.SessionManager._agent_tmux_pids(sm))
+        with mock.patch.object(ha, "run_out", lambda *a, **k: (0, "4242\n")):
+            self.assertEqual(ha.SessionManager._agent_tmux_pids(sm), [4242])
 
     def test_no_process_is_killed_when_the_agent_tmux_server_is_unreadable(self):
         ended = self._add_worktree("ended")

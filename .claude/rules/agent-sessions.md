@@ -351,18 +351,26 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
 - `_reap_ended` runs on its own thread every `REAP_EVERY_SEC` (6h; `TURMA_REAP_ENDED=0` off).
   "Ended" = a `WORKTREES_ROOT/<repo>/<id>` worktree no registry record (running OR stopped) or
   import holds. Idle = newest of its dir, transcripts and `/tmp/claude-<uid>/<slug>`, never its
-  index (a `git status` rewrites that).
+  index (a `git status` rewrites that). Paths compare as realpaths (git lists realpaths).
 - After `REAP_MIN_IDLE_SEC` (1h): kills its orphan processes, then deletes its Claude scratch dir.
-  - A process is an orphan when its cwd is in the tree/scratch, or an argv word names one.
-  - **Never killed**: one with a controlling tty (an operator shell), the manager's own
-    ancestors/descendants, and the agent's tmux server + every pane under it. A tmux server's argv
-    is its FIRST client's, so ours can name a long-ended session's worktree — killing it ends every
-    session on the host. Server pid unreadable while a session runs → no process is killed.
+  - An orphan's cwd is in the tree/scratch, or an argv word names one (ending at a path/word
+    boundary: `<root>~` is another path). Its whole subtree goes with it.
+  - **Never killed: a process whose SUBTREE holds a tty or a cwd in a live worktree.** A tmux/
+    screen/`script` server looks like any detached orphan from its own entry, yet may host an
+    operator's shell or a live session's pane (QA reproduced both). So a leftover tmux server
+    with panes is NOT reaped; nothing here can tell it from those. Never loosen this.
+  - Also never: the manager's ancestors/descendants, the agent's tmux server + every pane (a
+    tmux server's argv is its FIRST client's, so ours can name a long-ended worktree). Server pid
+    unreadable while a session runs → no process is killed.
+  - A host-shared daemon started from a session (the adb server) IS reaped; it restarts on demand.
+  - Only worktree slugs count as live: the repos-root session's slug prefixes every worktree slug.
   - Tests point `PROC_ROOT` at a fake tree; never scan the real `/proc` from a test.
 - After `WORKTREE_RETENTION_SEC` (3 days, 0 = never): `git worktree remove` (no `--force`) only
-  when clean (`status --porcelain` empty) AND HEAD is held by a branch or remote ref, through the
-  prune's `_claim_for_removal` handshake. Ignored build output goes; no commit is lost; resume
-  re-creates the dir at the repo's HEAD. The Ended-sessions entry is kept (unlike `prune`).
+  when `_worktree_removable`: no modified/untracked file (`-uall`), no assume-unchanged or
+  skip-worktree entry, no ignored file outside `REAP_REGENERABLE_DIRS` (the migration set + bin/
+  obj/build; a `.env` or `CLAUDE.local.md` keeps it), and every HEAD-reflog commit held by a ref.
+  Through `_claim_for_removal`, which also refuses an import's cwd or a path already claimed.
+  Resume re-creates the dir at the repo's HEAD (the branch survives). Ended entries are kept.
 - Not reaped: generic `/tmp` litter not attributable to a session cwd (`qa*`, `MSBuild*`).
 - Tests: `TestReapEndedSessions`.
 
