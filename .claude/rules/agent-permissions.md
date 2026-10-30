@@ -184,7 +184,7 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
     past it a request stands). An allow then grants the named session one exact command the model
     approved under its policy — the same-uid residual in `agent-hooks.md`, not a new one.
 - **Order**: `judge_never_reason` FIRST (plain gate + never-list below) → `stand`, no model call. Else,
-  with a policy, `claude -p --model haiku --tools "" --strict-mcp-config` (list argv, cwd
+  with a policy, `claude -p --model haiku --tools "" --strict-mcp-config --setting-sources=user` (list argv, cwd
   `REGISTRY_DIR`, no `--settings`, stdin DEVNULL, `JUDGE_TIMEOUT_SEC` 20s, at most
   `JUDGE_ATTEMPTS`) over `JUDGE_INSTRUCTION` + the policy + the request JSON-encoded as untrusted
   data.

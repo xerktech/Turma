@@ -26840,8 +26840,15 @@ def clean_summary(raw):
     text = (raw or "").strip()
     if not text:
         return None
-    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
-    line = re.sub(r"[\"'`]+", " ", line)
+    # A code-fence line is never the name; the line after it is read instead.
+    line = next((ln.strip() for ln in text.splitlines()
+                 if ln.strip() and not ln.strip().startswith("```")), "")
+    line = re.sub(r"[\"'`]+", " ", line).strip()
+    # Markup is never a name: a tool-less run told to "use Bash" prints fake
+    # tool-call tags (`<invoke name="Bash">`) as its reply (XERK-2445 QA), so
+    # judged after the quotes and backticks around it are gone.
+    if line.startswith("<"):
+        return None
     # rstrip, NOT re.sub(r"[.\s]+$", ...): that pattern backtracks quadratically
     # on a long run of trailing whitespace, and this runs on unbounded `claude
     # -p` output ON THE HEARTBEAT THREAD — 50k trailing spaces stalled every
@@ -27838,7 +27845,7 @@ class SessionManager:
             # prompt alone. The command is a list (no shell), so ticket text can't
             # inject, and _poll_jira_triage's timeout backstops a hang.
             proc = subprocess.Popen(
-                ["claude", "-p", "--model", JIRA_TRIAGE_MODEL,
+                ["claude", "-p", "--model", JIRA_TRIAGE_MODEL, *ATTENTION_HINT_LOCKDOWN,
                  _triage_prompt(batch, cands)],
                 stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
                 # The prompt carries untrusted ticket/transcript text, so no agent
@@ -28179,7 +28186,7 @@ class SessionManager:
             # text can't inject, and _poll_ticket_triage's timeout backstops a
             # hang.
             proc = subprocess.Popen(
-                ["claude", "-p", "--model", JIRA_TRIAGE_MODEL,
+                ["claude", "-p", "--model", JIRA_TRIAGE_MODEL, *ATTENTION_HINT_LOCKDOWN,
                  _ticket_triage_prompt(batch, tickets)],
                 stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
                 # The prompt carries untrusted ticket/transcript text, so no agent
@@ -43869,8 +43876,11 @@ class SessionManager:
         prompt."""
         try:
             proc = subprocess.run(
+                # --setting-sources=user: cwd REGISTRY_DIR is session-writable, so
+                # a planted .claude/settings.json or CLAUDE.md there would run hooks
+                # as the manager and steer the verdict (XERK-2445 QA).
                 ["claude", "-p", "--model", JUDGE_MODEL, "--tools", "",
-                 "--strict-mcp-config", prompt],
+                 "--strict-mcp-config", "--setting-sources=user", prompt],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR, env=_session_env(),
                 timeout=JUDGE_TIMEOUT_SEC)
@@ -44890,7 +44900,7 @@ class SessionManager:
             # the timeout in _poll_summaries backstops anything that hangs. The
             # command is a list (no shell), so the prompt text can't inject.
             proc = subprocess.Popen(
-                ["claude", "-p", "--model", SESSION_SUMMARY_MODEL,
+                ["claude", "-p", "--model", SESSION_SUMMARY_MODEL, *ATTENTION_HINT_LOCKDOWN,
                  SUMMARY_INSTRUCTION + prompt[:SUMMARY_PROMPT_CAP]],
                 stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
                 # The prompt carries untrusted ticket/transcript text, so no agent
