@@ -42,6 +42,18 @@ class DailyBriefTest {
             nextBriefMeeting(fb, at(2026, 11, 1, 0, 0)))
     }
 
+    @Test fun `a 23xx meeting the spring gap pushes past midnight is still next, as the hub finds it`() {
+        // Nuuk's 2025 gap opens 23:00 on 03-29: 23:30 that day is 01:30Z on 03-30,
+        // after local midnight (01:00Z). At 01:10Z it is still the next meeting.
+        val s = weekdays.copy(time = "23:30", timeZone = "America/Godthab", weekdays = (0..6).toList())
+        val utc = ZoneId.of("UTC")
+        assertEquals(ms(ZonedDateTime.of(2025, 3, 30, 1, 30, 0, 0, utc)),
+            nextBriefMeeting(s, ms(ZonedDateTime.of(2025, 3, 30, 1, 10, 0, 0, utc))))
+        // After it, the following day's 23:30, now at -01.
+        assertEquals(ms(ZonedDateTime.of(2025, 3, 31, 0, 30, 0, 0, utc)),
+            nextBriefMeeting(s, ms(ZonedDateTime.of(2025, 3, 30, 1, 30, 0, 0, utc))))
+    }
+
     @Test fun `no next meeting for an absent, disabled or unusable schedule`() {
         val now = at(2026, 10, 29, 8, 0)
         assertNull(nextBriefMeeting(null, now))

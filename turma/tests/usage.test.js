@@ -53,7 +53,7 @@ let orgKeys = [];
 // update() has seen the sites the data names); null = the plain stub above.
 let orgHooks = null;
 
-function loadHelpers(fetchReply = null) {
+function loadHelpers(fetchReply = null, storage = null) {
   const els = {};
   const sse = [];
   const fetches = [];
@@ -70,7 +70,7 @@ function loadHelpers(fetchReply = null) {
   };
   const stubs = {
     document,
-    localStorage: {
+    localStorage: storage || {
       _m: {},
       getItem(k) { return this._m[k] ?? null; },
       setItem(k, v) { this._m[k] = String(v); },
@@ -123,7 +123,8 @@ function loadHelpers(fetchReply = null) {
     fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC, fmtTokens,
     blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render,
     hostLabel, hostSeries, repoSeries,
-    applyAgent, connectSSE, refresh, mergeSnapshot,
+    applyAgent, connectSSE, refresh, mergeSnapshot, setMode, saveHidden,
+    getHidden: () => hidden,
     setCache: (c) => { cache = c; }, getCache: () => cache };`;
   // `els` rides along so the render-level tests can reach the containers the
   // page paints INTO — the strip is written to #totals rather than returned.
@@ -136,6 +137,21 @@ function loadHelpers(fetchReply = null) {
 }
 
 const H = loadHelpers();
+
+test("usage: the page boots when storage throws or holds junk", () => {
+  // Blocked site data makes every localStorage call throw; the page read two
+  // keys at top level and died before rendering, header and all.
+  const throwing = { getItem() { throw new Error("denied"); }, setItem() { throw new Error("denied"); } };
+  const Hb = loadHelpers(null, throwing);
+  // The writes are guarded too: switching view or toggling a series still works.
+  assert.doesNotThrow(() => Hb.setMode("hosts"));
+  assert.doesNotThrow(() => Hb.saveHidden());
+  for (const junk of ["not json", '"abc"', "{}", "42"]) {
+    const store = { getItem: (k) => (k === "turma-hidden-sessions" ? junk : null), setItem() {} };
+    const Hj = loadHelpers(null, store);
+    assert.equal(Hj.getHidden().size, 0, junk);
+  }
+});
 const bucket = (o) => Object.assign(H.blankBucket(), o);
 
 // --- cacheHitRate ------------------------------------------------------------
