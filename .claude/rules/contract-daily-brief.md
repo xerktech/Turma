@@ -8,7 +8,8 @@ paths:
 
 # The Daily Brief wire contract (epic XERK-2390)
 
-A per-org standup summary written on an agent host shortly before each org's daily meeting. The
+A per-org standup summary of the Turma user's OWN tickets (the rendering host's tracker user,
+XERK-2398), written on an agent host shortly before each org's daily meeting. The
 hub has no model access, so it schedules and asks; one agent host of the org renders. Every child
 ticket builds to this file; change it here first.
 
