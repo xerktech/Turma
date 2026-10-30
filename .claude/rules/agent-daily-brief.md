@@ -9,15 +9,17 @@ paths:
 
 # Daily Brief — the agent-side ticket collector (XERK-2392, epic XERK-2390)
 
-`collect_daily_brief_data(day_from, week_from, until, projects)` returns the org's ticket activity
-for a standup window as compact JSON for a model: `closed` (tagged `day`/`week`), `open` (in
+`collect_daily_brief_data(day_from, week_from, until, projects)` returns the TURMA USER's ticket
+activity for a standup window as compact JSON for a model: `closed` (tagged `day`/`week`), `open` (in
 progress) and `next` (To Do candidates). Board mechanics it reuses: `agent-board.md`.
 
-- **It is NOT the board collection and must not reuse its queries.** The board is assignee-scoped
-  and keeps Done by `updated`; a standup needs the whole org, Done by RESOLUTION date
-  (Jira `resolutiondate`, ADO `ClosedDate`).
+- **It is NOT the board collection and must not reuse its queries.** The board keeps Done by
+  `updated`; a standup needs Done by RESOLUTION date (Jira `resolutiondate`, ADO `ClosedDate`).
+- **The brief is ONE person's standup: the host's tracker user** (operator, XERK-2398). Every
+  query ANDs `assignee = currentUser()` (Jira) / `[System.AssignedTo] = @Me` (ADO) onto the
+  scope, the custom overrides included. An org-wide brief read every teammate's work aloud.
 - **Scope = the org's projects**, `daily_brief_projects(self.jira)` (the projects this host's
-  board rows live in), never `assignee = currentUser()`. Overrides: `TURMA_DAILY_BRIEF_JQL_SCOPE`
+  board rows live in), then the assignee clause above. Overrides: `TURMA_DAILY_BRIEF_JQL_SCOPE`
   (Jira) / `TURMA_DAILY_BRIEF_WIQL_SCOPE` (ADO), operator-set clauses used verbatim. ADO's
   `AZDO_PROJECT`, when set, wins over the board's projects. No scope → `None`, never an org-wide
   query.

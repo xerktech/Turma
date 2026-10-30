@@ -53980,9 +53980,9 @@ class TestDailyBrief(unittest.TestCase):
                                 "XERK-2": "week", "XERK-3": "week"})
         self.assertEqual(out["source"], "jira")
         self.assertEqual(out["scope"], ["XERK"])
-        # Scoped to the org's projects, never the assignee.
-        self.assertTrue(all("project in (XERK)" in j for j, _ in jqls))
-        self.assertFalse(any("currentUser" in j for j, _ in jqls))
+        # Scoped to the org's projects AND the Turma user's own tickets (XERK-2398).
+        self.assertTrue(all("project in (XERK) AND assignee = currentUser()" in j
+                            for j, _ in jqls))
         # The query is widened a day (JQL reads the user's timezone).
         self.assertIn('resolutiondate >= "2026-10-21"', jqls[0][0])
         self.assertIn("assignee", jqls[0][1])
@@ -54080,6 +54080,21 @@ class TestDailyBrief(unittest.TestCase):
             out = ha.collect_daily_brief_data(self.DAY, self.WEEK, self.UNTIL, [])
         self.assertEqual(out["scope"], "custom")
         self.assertTrue(all(j.startswith("(labels = team) AND") for j, _ in jqls))
+
+    def test_every_query_is_the_users_own_custom_scope_and_next_included(self):
+        # XERK-2398: the brief is the Turma user's standup, so EVERY query — the
+        # next-up one and an operator's custom scope too — is assignee-scoped.
+        closed = [_brief_issue("XERK-1", "done", "2026-10-28T12:00:00.000+0000",
+                               parent="XERK-100", blocks=["XERK-50"])]
+        for scope, head in (("", "project in (XERK) AND assignee = currentUser()"),
+                            ("labels = a OR labels = b",
+                             "(labels = a OR labels = b) AND assignee = currentUser()")):
+            patches, jqls = self._jira(closed=closed)
+            with patches, mock.patch.object(ha, "DAILY_BRIEF_JQL_SCOPE", scope):
+                ha.collect_daily_brief_data(self.DAY, self.WEEK, self.UNTIL, ["XERK"])
+            self.assertEqual(len(jqls), 3, "closed, open and the next-up query")
+            for j, _ in jqls:
+                self.assertTrue(j.startswith(head + " AND "), j)
 
     def test_unconfigured_returns_none(self):
         with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
@@ -54190,7 +54205,24 @@ class TestDailyBrief(unittest.TestCase):
                                         ["O'Brien) OR ([System.Id] > 0"])
         self.assertTrue(wiqls)
         for q in wiqls:
-            self.assertIn("[System.TeamProject] IN ('O''Brien) OR ([System.Id] > 0')", q)
+            self.assertIn("[System.TeamProject] IN ('O''Brien) OR ([System.Id] > 0') "
+                          "AND [System.AssignedTo] = @Me", q)  # the user's own (XERK-2398)
+
+    def test_wiql_custom_scope_is_the_users_own_too(self):
+        wiqls = []
+
+        def req(path, params, body=None):
+            wiqls.append(body["query"])
+            return {"workItems": []}
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/MyOrg", AZDO_TOKEN="pat",
+                                 AZDO_PROJECT="",
+                                 DAILY_BRIEF_WIQL_SCOPE="[System.AreaPath] UNDER 'A' OR [x] = 1",
+                                 azure_req=req):
+            ha.collect_daily_brief_data(self.DAY, self.WEEK, self.UNTIL, ["P"])
+        self.assertTrue(wiqls)
+        for q in wiqls:
+            self.assertIn("WHERE ([System.AreaPath] UNDER 'A' OR [x] = 1) "
+                          "AND [System.AssignedTo] = @Me AND ", q)
 
     def test_azure_parity(self):
         items = {

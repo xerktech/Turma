@@ -116,5 +116,9 @@ host/project codenames are replaced through a private term map kept out of the r
   (Sonnet 5-11 s).
 - Both repeated the collector's wrong blocked facts (fixed above), so the input, not the model,
   was the defect. **The default stays Haiku.**
+- **The brief became ONE person's standup** (operator, after the first production brief): the
+  collector reads only the host tracker user's tickets, and the prompt says every ticket is the
+  speaker's own and never to say who did it. The eval numbers above predate that wording;
+  re-run `bench/daily-brief/run_eval.py` before the next model decision.
 - **The render worker (XERK-2394)** can turn Haiku's thinking off if latency ever matters. Retry
   once on a `parse_daily_brief` None: every eval reply parsed, so retries should be rare.
