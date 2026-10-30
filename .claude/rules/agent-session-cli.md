@@ -225,7 +225,8 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   specific files), and without it a planted `~/.turma/.claude/settings.json` ran its hooks AS THE
   MANAGER on every ended turn, and a planted `CLAUDE.md` (cwd or any ancestor) steered the verdicts on
   OTHER sessions' cards. Verified on CLI 2.1.288: hooks fire and CLAUDE.md is obeyed without the flag,
-  neither with it. Never drop it; `_start_summary`/`_start_jira_triage` still lack it (follow-up).
+  neither with it. Never drop it. The repo/ticket triage and summary one-shots take the whole
+  `ATTENTION_HINT_LOCKDOWN` too, the permission judge its `--setting-sources=user` (XERK-2445).
 - **Output goes to a FILE and the child leads its own process group** (`start_new_session`), killed
   whole on a timeout and reaped with a bound — a pipe read waits for EOF unbounded, so a grandchild
   holding stdout would wedge the one worker. Only the job's OWN answer (same edge + `stagedAt`) frees

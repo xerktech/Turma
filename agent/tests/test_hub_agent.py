@@ -32474,6 +32474,7 @@ class TestSessionSummaries(ManagerMixin, unittest.TestCase):
             sm._start_summary({"id": "s1"}, "Add a docker compose flag")
             args = popen.call_args[0][0]
             self.assertEqual(args[:4], ["claude", "-p", "--model", ha.SESSION_SUMMARY_MODEL])
+            self.assertEqual(args[4:-1], list(ha.ATTENTION_HINT_LOCKDOWN))  # XERK-2445
             self.assertIn("Add a docker compose flag", args[-1])  # task in the prompt
             # Runs in the registry dir (not a worktree) and passes no --settings,
             # so it never loads the session safety guard.
@@ -43351,6 +43352,37 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
         self.assertNotIn("TURMA_TOKEN", env)
         self.assertNotIn("TURMA_AGENT_TOKEN", env)
 
+    def test_triage_and_summary_runs_get_no_tools_and_user_settings_only(self):
+        # XERK-2445: their prompts carry untrusted ticket/transcript text, and
+        # without the lockdown the run was offered Bash under the operator's
+        # auto mode and allow list. None needs a tool.
+        import inspect
+        src = inspect.getsource(ha)
+        for model, prompt in (("JIRA_TRIAGE_MODEL", "_triage_prompt("),
+                              ("JIRA_TRIAGE_MODEL", "_ticket_triage_prompt("),
+                              ("SESSION_SUMMARY_MODEL", "SUMMARY_INSTRUCTION + prompt")):
+            at = src.index(prompt, src.index(f'["claude", "-p", "--model", {model}'))
+            head = src[src.rindex('["claude", "-p"', 0, at):at]
+            self.assertIn("*ATTENTION_HINT_LOCKDOWN", head, prompt)
+        self.assertEqual(ha.ATTENTION_HINT_LOCKDOWN,
+                         ("--tools=", "--strict-mcp-config", "--setting-sources=user"))
+
+    def test_the_judge_loads_user_settings_only(self):
+        # XERK-2445 QA: cwd REGISTRY_DIR is session-writable; without the flag a
+        # planted project settings file ran hooks and a CLAUDE.md steered it.
+        import inspect
+        src = inspect.getsource(ha)
+        at = src.index('["claude", "-p", "--model", JUDGE_MODEL')
+        self.assertIn('"--setting-sources=user", prompt]', src[at:at + 200])
+
+    def test_clean_summary_refuses_fake_tool_markup(self):
+        # XERK-2445 QA: a tool-less run told to use Bash printed these as its name.
+        for raw in ('<invoke:Bash>', '<invoke name="Bash">', "  <invoke_tool name= Bash >\nx",
+                    '`<invoke>`', '"<invoke name=Bash>"', '```xml\n<invoke name="Bash">\n```'):
+            self.assertIsNone(ha.clean_summary(raw), raw)
+        self.assertEqual(ha.clean_summary("Bind Hub Loopback"), "Bind Hub Loopback")
+        self.assertEqual(ha.clean_summary("```\nBind Hub Loopback\n```"), "Bind Hub Loopback")
+
     def test_every_headless_claude_run_gets_the_scrubbed_env(self):
         # XERK-1588: pins EVERY prompt-driven `claude -p` launch, not just the
         # triage one above — each prompt carries untrusted ticket/transcript text.
@@ -43467,7 +43499,8 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
             sm._start_jira_triage()
         cmd = self.popen_calls[0]
         self.assertEqual(cmd[:4], ["claude", "-p", "--model", ha.JIRA_TRIAGE_MODEL])
-        self.assertEqual(len(cmd), 5)          # the prompt is ONE argv element
+        self.assertEqual(cmd[4:-1], list(ha.ATTENTION_HINT_LOCKDOWN))  # XERK-2445
+        self.assertEqual(len(cmd), 8)          # the prompt is ONE argv element
         self.assertNotIn("--settings", cmd)
 
     def test_a_settled_board_costs_nothing(self):
@@ -43946,7 +43979,8 @@ class TestTicketTriage(ManagerMixin, unittest.TestCase):
             sm._start_ticket_triage()
         cmd = self.popen_calls[0]
         self.assertEqual(cmd[:4], ["claude", "-p", "--model", ha.JIRA_TRIAGE_MODEL])
-        self.assertEqual(len(cmd), 5)          # the prompt is ONE argv element
+        self.assertEqual(cmd[4:-1], list(ha.ATTENTION_HINT_LOCKDOWN))  # XERK-2445
+        self.assertEqual(len(cmd), 8)          # the prompt is ONE argv element
         self.assertNotIn("--settings", cmd)
 
     def test_a_settled_board_costs_nothing(self):
@@ -52034,7 +52068,7 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
             # boolean flag that ends `--tools`' variadic list.
             self.assertEqual(run.call_args.args[0],
                              ["claude", "-p", "--model", "haiku", "--tools", "",
-                              "--strict-mcp-config", "p"])
+                              "--strict-mcp-config", "--setting-sources=user", "p"])
             run.side_effect = ha.subprocess.TimeoutExpired("claude", 20)
             self.assertIsNone(self.sm._run_judge_model("p"))
         self.model.start()
