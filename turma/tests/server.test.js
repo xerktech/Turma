@@ -20255,12 +20255,48 @@ test("XERK-2531: a code never takes a name another host holds or an unusable one
 
 test("XERK-2531: a fresh code for a name supersedes an identity that never beat", () => {
   forget2531("enr-s");
-  const first = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-s");
-  const second = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-s");
-  assert.equal(second.status, 200);
+  const t0 = Date.now();
+  const first = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-s", t0);
+  assert.equal(first.status, 200);
+  const code2 = hub.mintEnrollCode("local:op", "").body.code;
+  // XERK-2574: inside the grace window the first holder's token is protected,
+  // and the refused code is not burned.
+  const early = hub.consumeEnrollCode(code2, "enr-s", t0 + 1000);
+  assert.equal(early.status, 409, JSON.stringify(early.body));
+  assert.match(early.body.error, /redeemed moments ago.*retry in \d+s/);
+  assert.equal(hostOfUid(tokenUid(first.body.token)), "enr-s"); // still the first holder's
+  const second = hub.consumeEnrollCode(code2, "enr-s", t0 + hub.ENROLL_SUPERSEDE_GRACE_MS + 1);
+  assert.equal(second.status, 200, JSON.stringify(second.body));
   assert.notEqual(tokenUid(first.body.token), tokenUid(second.body.token));
   assert.equal(hostOfUid(tokenUid(first.body.token)), null); // never two machines on one id
   forget2531("enr-s");
+});
+
+test("XERK-2574: the grace window is case-folded, and Remove host lifts it", async () => {
+  forget2531("enr-gc", "ENR-GC", "enr-gr");
+  const t0 = Date.now();
+  const a = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "ENR-GC", t0);
+  assert.equal(a.status, 200);
+  const twin = hub.mintEnrollCode("local:op", "").body.code;
+  assert.equal(hub.consumeEnrollCode(twin, "enr-gc", t0 + 1000).status, 409); // case twin refused
+  // After the window the twin supersedes the never-beaten identity: one name, one id.
+  const b = hub.consumeEnrollCode(twin, "enr-gc", t0 + hub.ENROLL_SUPERSEDE_GRACE_MS + 1);
+  assert.equal(b.status, 200, JSON.stringify(b.body));
+  assert.equal(hostOfUid(tokenUid(a.body.token)), null);
+  // A host that beat, then was removed, frees its name at once: no grace wait.
+  const beat = (tok, device) => request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: { device, sessions: [] } });
+  const r1 = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-gr");
+  assert.equal((await beat(r1.body.token, "enr-gr")).status, 200);
+  quiet("enr-gr");
+  assert.equal((await request("DELETE", "/api/agents/enr-gr", { headers: userHeaders })).status, 200);
+  const r2 = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-gr");
+  assert.equal(r2.status, 200, JSON.stringify(r2.body));
+  // So does removing one that never beat.
+  assert.equal((await request("DELETE", "/api/agents/enr-gr", { headers: userHeaders })).status, 200);
+  const r3 = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-gr");
+  assert.equal(r3.status, 200, JSON.stringify(r3.body));
+  forget2531("enr-gc", "ENR-GC", "enr-gr");
 });
 
 test("XERK-2531: a renamed-then-removed host's old name gets a FRESH identity, not the old machine's", async () => {

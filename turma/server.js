@@ -13945,6 +13945,10 @@ const ENROLL_CODE_TTL_MS = positiveEnv("ENROLL_CODE_TTL_MS", 15 * 60 * 1000);
 const ENROLL_CODE_KEEP_MS = 24 * 60 * 60 * 1000;
 const ENROLL_CODES_LIVE_MAX = 20; // unredeemed codes at once
 const ENROLL_CODES_MAX = 200; // records, settled included
+// How long a redeemed code's identity is protected from being superseded by
+// another code for the same name before its host first beats (XERK-2574).
+// A healthy host beats within seconds of redeeming; this only has to outlast that.
+const ENROLL_SUPERSEDE_GRACE_MS = positiveEnv("ENROLL_SUPERSEDE_GRACE_MS", 2 * 60 * 1000);
 // Failed redemptions (unknown code) per window, fleet-wide. 128 bits cannot be
 // guessed; this bounds the work an anonymous caller can make the hub do. It is
 // NOT keyed per client: behind Cloudflare + the ingress every public caller
@@ -14116,6 +14120,8 @@ function consumeEnrollCode(code, device, now = Date.now()) {
   }
   const refusal = enrollNameRefusal(device);
   if (refusal) return { status: refusal.status, body: { error: refusal.error } };
+  const superseding = enrollSupersedeRefusal(rec, device, now);
+  if (superseding) return superseding;
   // An identity minted for this name that never beat (an earlier code whose host
   // never came up) is superseded: the operator minted a new code for the name,
   // and handing back the SAME id would put two machines on one token.
@@ -14127,7 +14133,10 @@ function consumeEnrollCode(code, device, now = Date.now()) {
   let dropped = false;
   for (const [uid, e] of Object.entries(agentIdentities)) {
     if (!e || e.revoked) continue;
-    if (!e.used && (e.home === device || e.origin === device)) { delete agentIdentities[uid]; dropped = true; }
+    // Case-folded (XERK-2574): a never-beaten case twin is the same name to an operator.
+    if (!e.used && [e.home, e.origin].some((n) => typeof n === "string" && lowerName(n) === lowerName(device))) {
+      delete agentIdentities[uid]; dropped = true;
+    }
     else if (e.released && e.origin === device) { delete e.origin; dropped = true; }
   }
   if (dropped) persistAgentIdentities();
@@ -14146,6 +14155,31 @@ function consumeEnrollCode(code, device, now = Date.now()) {
 }
 
 const enrollFails = { start: 0, n: 0 };
+// Why redeeming `rec` for `device` now would kill a token another code just
+// handed out, or null (XERK-2574). Redemption supersedes an identity minted for
+// the name that never beat, so two codes for one name redeemed back to back both
+// answered 200 and the first holder's token was dead on arrival. Inside the grace
+// window that is refused instead (the code is not burned); after it, the earlier
+// host is presumed lost and the new code supersedes it as before.
+// Case-folded like enrollNameRefusal: a case twin would otherwise slip past and
+// register beside it. An identity Remove host released is not protected — the
+// operator explicitly gave the name up.
+function enrollSupersedeRefusal(rec, device, now = Date.now()) {
+  const want = lowerName(device);
+  const pending = Object.values(agentIdentities).some((e) =>
+    e && !e.revoked && !e.used && !e.released &&
+    [e.home, e.origin].some((n) => typeof n === "string" && lowerName(n) === want));
+  if (!pending) return null;
+  for (const other of Object.values(enrollCodes)) {
+    if (other === rec || !other.usedAt || typeof other.usedBy !== "string" || lowerName(other.usedBy) !== want) continue;
+    const left = other.usedAt + ENROLL_SUPERSEDE_GRACE_MS - now;
+    if (left > 0) {
+      return { status: 409, body: { error: `another enrollment code for ${device} was redeemed moments ago and its host has not connected yet — retry in ${Math.ceil(left / 1000)}s if that host is lost (this code is still valid)` } };
+    }
+  }
+  return null;
+}
+
 // Count one failed redemption; true once the window's budget is spent.
 function enrollFailLimited(now = Date.now()) {
   if (now - enrollFails.start >= ENROLL_ATTEMPT_WINDOW_MS) { enrollFails.start = now; enrollFails.n = 0; }
@@ -25165,6 +25199,7 @@ if (process.env.TURMA_TEST) {
     listEnrollCodes,
     enrollFails,
     ENROLL_CODE_TTL_MS,
+    ENROLL_SUPERSEDE_GRACE_MS,
     enrollCodes: () => enrollCodes,
     coerceEnrollCodes,
     serializeAgent,
