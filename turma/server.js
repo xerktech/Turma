@@ -1244,13 +1244,10 @@ function nameTokenKey(host) {
 //     and two tenants sharing a key would share a host.
 //   - No plain name may END in that shape (hostAgentToken, hostKeyUsable), so an
 //     untenanted key can never equal a tenant key.
-const TENANT_KEY_RE = /@([0-9a-f]{32})$/;
+const TENANT_KEY_RE = tenancy.TENANT_HOST_KEY_RE;
 const TENANT_ID_RE = /^[0-9a-f]{32}$/;
 // The tenant a registry key belongs to, or "" for an untenanted one.
-function tenantOfKey(key) {
-  const m = typeof key === "string" ? TENANT_KEY_RE.exec(key) : null;
-  return m ? m[1] : "";
-}
+const tenantOfKey = tenancy.tenantOfHostKey;
 // The device name a key carries (the key itself when untenanted).
 function baseOfKey(key) {
   return tenantOfKey(key) ? key.slice(0, -33) : key;
@@ -1305,6 +1302,72 @@ function principalTenant(p) {
   return p && p.kind === "user" && typeof p.tenantId === "string" && TENANT_ID_RE.test(p.tenantId)
     ? p.tenantId : "";
 }
+
+// ---- the ledger scope (XERK-2550) -------------------------------------------
+// Every ledger row (usage, permission, outcome) is keyed by the registry key of
+// the host that produced it, and a tenant host's key carries its tenant, so a
+// row's tenant is read off its key. A principal reads exactly ONE scope: a
+// tenant user its own tenant (even with the admin role too — an admin's own
+// data comes via its user role, and mixing the untenanted fleet in would be an
+// aggregate over two scopes); a principal with no tenant that may drive the
+// untenanted hosts (break-glass, admin-only, legacy, open) the untenanted
+// fleet; anyone else nothing. No aggregate spans two tenants
+// (docs/multi-tenant-adr.md "Usage, ledgers and insights"): the routing policy,
+// its shadow evidence and the subscription pause are each computed per tenant.
+function ledgerTenantOf(p) {
+  const t = principalTenant(p);
+  if (t) return t;
+  return principalMayDriveHost(p, "x") ? "" : null;   // null = no scope at all
+}
+function ledgerVisible(p) {
+  const t = ledgerTenantOf(p);
+  return t === null ? () => false : tenantScope(t);
+}
+// One string per distinct scope, for the per-scope parts of the fleet payload.
+function ledgerScopeKey(p) {
+  const t = ledgerTenantOf(p);
+  return t === null ? "none" : `t:${t}`;
+}
+// The rows of ONE tenant ("" = the untenanted fleet): what the routing sweep
+// and /metrics read.
+function tenantScope(t) {
+  return (key) => tenantOfKey(key) === t;
+}
+
+// The tenant purge (XERK-2550 + its siblings): each store that holds a
+// tenant's data registers one function, and deleting a user (XERK-2552) runs
+// them all. Each runs in its own try/catch — one store failing must not leave
+// the rest holding the tenant's data. Answers {name: result | {error}}.
+const tenantPurges = new Map();
+function registerTenantPurge(name, fn) {
+  if (typeof name === "string" && name && typeof fn === "function") tenantPurges.set(name, fn);
+}
+function purgeTenantData(tenantId) {
+  if (typeof tenantId !== "string" || !TENANT_ID_RE.test(tenantId)) {
+    throw new Error("purgeTenantData needs a tenant id");
+  }
+  const out = {};
+  for (const [name, fn] of tenantPurges) {
+    try { out[name] = fn(tenantId); } catch (e) {
+      console.error(`tenant purge: ${name} failed: ${(e && e.message) || e}`);
+      out[name] = { error: String((e && e.message) || e) };
+    }
+  }
+  invalidateAgentsCache();
+  return out;
+}
+registerTenantPurge("usageLedger", (t) => ({ hosts: usageLedger.purgeTenant(t).length }));
+registerTenantPurge("permissionLedger", (t) => ({ hosts: permissionLedger.purgeTenant(t).length }));
+registerTenantPurge("outcomeLedger", (t) => ({ rows: outcomeLedger.purgeTenant(t).length }));
+// The routing policy's per-tenant state (`<tenantId>:<class>/<model>` keys).
+registerTenantPurge("modelPolicy", (t) => {
+  let n = 0;
+  for (const k of Object.keys(modelPolicyState)) {
+    if (modelPolicyKeyParts(k).tenant === t) { delete modelPolicyState[k]; n += 1; }
+  }
+  if (n) persistModelPolicy();
+  return { entries: n };
+});
 
 // The subject a bearer token NAMES (a host name, or `uid:<id>`), unverified.
 function tokenSubject(token) {
@@ -3266,7 +3329,7 @@ function ticketSpawnModelFields(siteKey, issueKey, rpin, host, rows) {
   if (rpin && rpin.runtime && rpin.runtime !== "claude") return {};
   const a = host ? agents[host] : null;
   if (!rpin && a && (a.defaultRuntime || "claude") !== "claude") return {};
-  const model = modelPolicyPick(siteKey, issueKey, rows);
+  const model = modelPolicyPick(siteKey, issueKey, rows, tenantOfKey(host));
   return model ? { model } : {};
 }
 
@@ -5954,7 +6017,7 @@ let metricsBlocked = { at: -Infinity, n: 0 };
 // The permission ledger's served view (XERK-1563). `org` scopes it to the hosts
 // that currently declare one of those orgs — off the LIVE fleet, like
 // `retiredUsage` is scoped client-side — and `days` (default 7) picks the window.
-function permissionsView(params, now = Date.now()) {
+function permissionsView(params, now = Date.now(), visible = null) {
   const orgs = new Set();
   for (const v of params.getAll("org")) {
     for (const k of String(v).split(",")) if (k.trim()) orgs.add(k.trim());
@@ -5966,7 +6029,7 @@ function permissionsView(params, now = Date.now()) {
   }
   const days = Number(params.get("days"));
   return permissionLedger.aggregate({
-    hosts, days: Number.isFinite(days) && days > 0 ? Math.floor(days) : 7, now,
+    hosts, days: Number.isFinite(days) && days > 0 ? Math.floor(days) : 7, now, visible,
   });
 }
 
@@ -5976,7 +6039,9 @@ function permissionsView(params, now = Date.now()) {
 // FALL as rows age out — GAUGES, never counters (Prometheus reads every drop in a
 // counter as a reset, and rate()/increase() report false spikes).
 function permissionMetricsText() {
-  const totals = permissionLedger.kindTotals();
+  // The untenanted fleet only (XERK-2550): this route is unauthenticated, and no
+  // count may sum two tenants' rows.
+  const totals = permissionLedger.kindTotals(tenantScope(""));
   let out = "# HELP turma_permission_prompts Permission prompts the permission ledger " +
     "holds, by kind, over its retention window.\n" +
     "# TYPE turma_permission_prompts gauge\n";
@@ -6006,7 +6071,9 @@ function outcomeLedgerSweep(now = Date.now()) {
       const org = decidedOrgOf(a);
       if (!org) continue;
       // Defect reports (XERK-1846) attribute only within the host's decided org.
-      if (Array.isArray(a.defectReports)) defects.push({ site: org, reports: a.defectReports });
+      if (Array.isArray(a.defectReports)) {
+        defects.push({ site: org, tenant: tenantOfKey(host), reports: a.defectReports });
+      }
       const add = (s, running) => {
         const t = s && s.ticket;
         if (!t || typeof t.key !== "string" || t.siteKey !== org || typeof s.id !== "string") return;
@@ -6095,11 +6162,13 @@ function shadowModelFor(cls, liveModel, pairs) {
 // cloned (a shadow never clones on demand), a free shadow run (`modelShadow.free`,
 // XERK-2227; an older agent without it needs a free session slot), and a
 // subscription not paused; the most available wins.
-function shadowHostFor(site, repo, used, now) {
+function shadowHostFor(site, repo, used, now, tenant = "") {
   const paused = pausedSubscriptions(now);
   let best = null, bestAvail = -Infinity;
   for (const [key, a] of Object.entries(agents)) {
-    if (used.has(key) || decidedOrgOf(a) !== site) continue;
+    // Only a host of the live row's tenant (XERK-2550): a shadow re-runs that
+    // tenant's ticket on its code, so another tenant's host must never see it.
+    if (used.has(key) || decidedOrgOf(a) !== site || tenantOfKey(key) !== tenant) continue;
     if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
     if (!(a.modelShadow && a.modelShadow.available === true)) continue;
     if ((a.defaultRuntime || "claude") !== "claude") continue;
@@ -6126,22 +6195,35 @@ function modelShadowSweep(now = Date.now(),
       now, maxAgeMs: MODEL_SHADOW_MAX_AGE_DAYS * 86400000,
     });
     if (!candidates.length) return;
-    let used = outcomeLedger.shadowsDispatchedSince(now - 86400000, now);
-    const pairs = outcomeLedger.aggregate({ now }).pairs;
+    // Per tenant (XERK-2550): each tenant has its own daily cap and its own pair
+    // counts, so one tenant's merged work never spends another's shadow budget.
+    const perTenant = new Map();
+    const scopeOf = (t) => {
+      let v = perTenant.get(t);
+      if (!v) {
+        const visible = tenantScope(t);
+        v = { used: outcomeLedger.shadowsDispatchedSince(now - 86400000, now, visible),
+          pairs: outcomeLedger.aggregate({ now, visible }).pairs };
+        perTenant.set(t, v);
+      }
+      return v;
+    };
     const hostsUsed = new Set();
     for (const c of candidates) {
       if (!shadowSampled(c.key, rate)) {
         outcomeLedger.decideShadow(c.key, { sampled: false, at: now }, now);
         continue;
       }
+      const tenant = c.tenant || "";
+      const scope = scopeOf(tenant);
       // Over the daily cap the rest stay undecided, for a later day.
-      if (used >= dailyMax) break;
-      const model = shadowModelFor(c.cls, c.model, pairs);
+      if (scope.used >= dailyMax) continue;
+      const model = shadowModelFor(c.cls, c.model, scope.pairs);
       if (!model) {
         outcomeLedger.decideShadow(c.key, { sampled: false, at: now }, now);
         continue;
       }
-      const host = shadowHostFor(c.site, c.repo, hostsUsed, now);
+      const host = shadowHostFor(c.site, c.repo, hostsUsed, now, tenant);
       if (!host) continue;     // no free host now: retried next sweep
       const id = `sh-${crypto.randomBytes(8).toString("hex")}`;
       const cmdId = queueCommand(host, {
@@ -6151,7 +6233,7 @@ function modelShadowSweep(now = Date.now(),
       if (!cmdId) continue;
       outcomeLedger.decideShadow(c.key, { sampled: true, at: now, id, model, host }, now);
       hostsUsed.add(host);
-      used += 1;
+      scope.used += 1;
       console.log(`model shadow: ${logName(c.issue)} on ${model} -> ${logName(host)} (${id})`);
     }
   } catch (e) {
@@ -6174,6 +6256,9 @@ function modelShadowSweep(now = Date.now(),
 //   - Only a cheaper Claude family (MODEL_COST_ORDER) is ever promoted.
 // State is hub-owned and durable: "<class>/<model>" -> {state, at, graded,
 // mOnlyFail} (+ the tripwire's {bad, n, baseline} on a demotion).
+//   - PER TENANT (XERK-2550): the untenanted fleet keeps the bare key; tenant T's
+//     entries are "<T>:<class>/<model>", promoted only on T's own shadow pairs
+//     and tripped only on T's own live work. No routing prior spans tenants.
 const MODEL_PROMOTE_MIN_PAIRS = positiveEnv("MODEL_PROMOTE_MIN_PAIRS", 40);
 const MODEL_POLICY_STATES = new Set(["promoted", "demoted"]);
 // Cheapest first: a class with two promoted models routes to the cheaper one.
@@ -6183,7 +6268,7 @@ const modelPolicyCoerce = (raw) => {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
   const count = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : 0);
   for (const [k, v] of Object.entries(raw)) {
-    if (!/^[a-z0-9-]{1,40}\/[a-z0-9._-]{1,40}$/.test(k) || k.endsWith("/opus")) continue;
+    if (!/^(?:[0-9a-f]{32}:)?[a-z0-9-]{1,40}\/[a-z0-9._-]{1,40}$/.test(k) || k.endsWith("/opus")) continue;
     if (!v || typeof v !== "object" || !MODEL_POLICY_STATES.has(v.state)) continue;
     if (!(Number.isSafeInteger(v.at) && v.at > 0)) continue;
     const e = { state: v.state, at: v.at, graded: count(v.graded), mOnlyFail: count(v.mOnlyFail) };
@@ -6203,8 +6288,17 @@ const persistModelPolicy = registerExternalStore({
   install: (v) => { modelPolicyState = v; invalidateAgentsCache(); },
 });
 
-// Each promoted class's model (the cheapest when several are promoted).
-function modelPolicyPromoted() {
+// A policy key for tenant `t` ("" = untenanted, the bare legacy key) and back.
+function modelPolicyKey(t, cls, model) {
+  return t ? `${t}:${cls}/${model}` : `${cls}/${model}`;
+}
+function modelPolicyKeyParts(k) {
+  const m = /^(?:([0-9a-f]{32}):)?([^/]+)\/(.+)$/.exec(k);
+  return m ? { tenant: m[1] || "", cls: m[2], model: m[3] } : { tenant: null, cls: "", model: "" };
+}
+
+// Each promoted class's model for tenant `t` (the cheapest when several are promoted).
+function modelPolicyPromoted(t = "") {
   const out = Object.create(null);
   const rank = (m) => {
     const i = MODEL_COST_ORDER.indexOf(m);
@@ -6212,39 +6306,53 @@ function modelPolicyPromoted() {
   };
   for (const [k, e] of Object.entries(modelPolicyState)) {
     if (e.state !== "promoted") continue;
-    const [cls, model] = k.split("/");
+    const { tenant, cls, model } = modelPolicyKeyParts(k);
+    if (tenant !== t) continue;
     const cur = out[cls];
     if (!cur || rank(model) < rank(cur) || (rank(model) === rank(cur) && model < cur)) out[cls] = model;
   }
   return out;
 }
 
-function modelPolicyPayload() {
-  return { mode: MODEL_POLICY, promoted: { ...modelPolicyPromoted() } };
+function modelPolicyPayload(t = "") {
+  return { mode: MODEL_POLICY, promoted: { ...modelPolicyPromoted(t) } };
 }
 
 // The model an unpinned ticket's spawn carries under the policy, or null.
-function modelPolicyPick(siteKey, issueKey, rows) {
+// `tenant` is the DISPATCH host's: its own tenant's promotions route it.
+function modelPolicyPick(siteKey, issueKey, rows, tenant = "") {
   if (MODEL_POLICY !== "on") return null;
   const r = (rows || fleetTicketRows()).get(ticketQueueKey(siteKey, issueKey));
   const cls = outcomeLedger.workClass(r && r.row ? r.row.type : "");
-  return modelPolicyPromoted()[cls] || null;
+  return modelPolicyPromoted(tenant)[cls] || null;
 }
 
 function modelPolicySweep(now = Date.now()) {
   if (MODEL_POLICY === "off") return;
+  // One pass per tenant with ledger rows or policy state (XERK-2550).
+  const tenants = new Set(outcomeLedger.tenants());
+  for (const k of Object.keys(modelPolicyState)) {
+    const t = modelPolicyKeyParts(k).tenant;
+    if (t !== null) tenants.add(t);
+  }
+  tenants.add("");
+  for (const t of tenants) modelPolicySweepTenant(t, now);
+}
+
+function modelPolicySweepTenant(t, now) {
+  const visible = tenantScope(t);
   try {
-    const pairs = outcomeLedger.aggregate({ now }).pairs;
+    const pairs = outcomeLedger.aggregate({ now, visible }).pairs;
     let changed = false;
     for (const p of pairs) {
       // Only a cheaper Claude family is routable; Opus is the baseline.
       if (!MODEL_COST_ORDER.includes(p.model)) continue;
-      const key = `${p.cls}/${p.model}`;
-      if (!/^[a-z0-9-]{1,40}\/[a-z0-9._-]{1,40}$/.test(key)) continue;
+      if (!/^[a-z0-9-]{1,40}\/[a-z0-9._-]{1,40}$/.test(`${p.cls}/${p.model}`)) continue;
+      const key = modelPolicyKey(t, p.cls, p.model);
       const cur = modelPolicyState[key];
       if (cur && cur.state === "promoted") continue;
       // After a demotion only the pairs graded since it count (sticky).
-      const ev = cur ? outcomeLedger.pairEvidence(p.cls, p.model, { since: cur.at, now })
+      const ev = cur ? outcomeLedger.pairEvidence(p.cls, p.model, { since: cur.at, now, visible })
         : { graded: p.graded, mOnlyFail: p.mOnlyFail };
       const graded = ev.graded, mOnly = ev.mOnlyFail;
       if (!outcomeLedger.promotionPasses(graded, mOnly, { minPairs: MODEL_PROMOTE_MIN_PAIRS })) continue;
@@ -6258,10 +6366,11 @@ function modelPolicySweep(now = Date.now()) {
       for (const [key, e] of Object.entries(modelPolicyState)) {
         // A promotion made this sweep has routed nothing yet.
         if (e.state !== "promoted" || e.at >= now) continue;
-        const [cls, model] = key.split("/");
-        const live = outcomeLedger.liveRate(cls, model, { since: e.at, now });
+        const { tenant, cls, model } = modelPolicyKeyParts(key);
+        if (tenant !== t) continue;
+        const live = outcomeLedger.liveRate(cls, model, { since: e.at, now, visible });
         if (!live.n) continue;
-        const base = outcomeLedger.liveRate(cls, "opus", { now });
+        const base = outcomeLedger.liveRate(cls, "opus", { now, visible });
         const baseline = base.n ? base.bad / base.n : 0;
         if (outcomeLedger.wilson(live.bad, live.n).lower <= baseline) continue;
         const p = pairs.find((x) => x.cls === cls && x.model === model);
@@ -6272,16 +6381,20 @@ function modelPolicySweep(now = Date.now()) {
         const pct = (x) => `${Math.round(x * 100)}%`;
         console.log(`model policy: demoted ${model} for ${cls} work (${live.bad}/${live.n} bad`
           + ` vs Opus ${pct(baseline)})`);
-        notify(`${cls} work moved back to Opus`,
+        // A tenant's demotion is not pushed until push is tenant-routed
+        // (XERK-2551): notify() fans out to every registered device, which would
+        // hand one tenant's figures to every other tenant's phones.
+        if (!t) notify(`${cls} work moved back to Opus`,
           `${model} had ${live.bad} bad of ${live.n} since its promotion, worse than Opus's`
           + ` ${pct(baseline)} for ${cls} work. It stays on Opus until new shadow runs earn it back.`,
-          { tags: "warning", notifKey: `model-demoted:${key}` });
+          { tags: "warning", notifKey: `model-demoted:${key}`, tenant: t });
       }
     }
     if (changed) {
       persistModelPolicy();
       invalidateAgentsCache();
-      sseBroadcast("modelPolicy", modelPolicyPayload());
+      // Only to clients reading this tenant's policy (XERK-2550).
+      sseBroadcast("modelPolicy", modelPolicyPayload(t), { policyTenant: t });
     }
   } catch (e) {
     console.error(`model policy sweep failed: ${(e && e.message) || e}`);
@@ -6289,22 +6402,27 @@ function modelPolicySweep(now = Date.now()) {
 }
 
 // The Usage card's status cell per (class, model) group (XERK-1849 reads it).
-function modelPolicyStatus(g) {
+function modelPolicyStatus(g, t = "") {
   if (g.model === "opus") return null;
-  const e = modelPolicyState[`${g.cls}/${g.model}`];
+  const e = modelPolicyState[modelPolicyKey(t, g.cls, g.model)];
   if (!e) return null;
   if (e.state === "demoted") return "demoted";
-  const routed = MODEL_POLICY === "on" && modelPolicyPromoted()[g.cls] === g.model;
+  const routed = MODEL_POLICY === "on" && modelPolicyPromoted(t)[g.cls] === g.model;
   return routed ? "promoted" : MODEL_POLICY === "on" ? "promoted (unused)" : "promoted (observe)";
 }
 
-function modelQualityView(params, now = Date.now()) {
+// `p` is the caller (XERK-2550): the groups and rows are its scope's alone, and
+// each group's promotion is its own tenant's policy. No principal (an internal
+// caller) reads the untenanted fleet.
+function modelQualityView(params, now = Date.now(), p = null) {
   const org = String(params.get("org") || "").trim();
   const view = outcomeLedger.aggregate({
     site: org || null, withRows: !!org && params.get("rows") === "1", now,
+    visible: p ? ledgerVisible(p) : tenantScope(""),
   });
+  const t = principalTenant(p);
   for (const g of view.groups) {
-    const status = modelPolicyStatus(g);
+    const status = modelPolicyStatus(g, t);
     if (status) g.promotion = status;
   }
   view.policy = MODEL_POLICY;
@@ -6331,7 +6449,7 @@ function metricsText(now = Date.now()) {
     "# TYPE turma_archive_ingest_gated_seconds gauge\n" +
     `turma_archive_ingest_gated_seconds ${Math.floor(archive.hydratingForMs(now) / 1000)}\n` +
     permissionMetricsText() +
-    outcomeLedger.metricsText(now);
+    outcomeLedger.metricsText(now, tenantScope(""));
 }
 
 // Under HA a transcript's raw files may still be in the bucket (XERK-1043): fetch
@@ -7254,9 +7372,6 @@ function buildAgentsCache() {
   // own SSE events for open boards).
   const body = JSON.stringify({
     now, agents: list, ticketAgents, ticketModels,
-    // The routing policy (XERK-1848): its mode and each promoted work class's
-    // model, so the board's Model row names what an unpinned Start will send.
-    modelPolicy: modelPolicyPayload(),
     ticketRuntimes, ticketPlatforms, autoStartOrgs, autoMergeOrgs, priorityWriteBackOrgs, dedupeLinkOrgs, orgColors,
     // Per-org triage policy (XERK-486 [F]) and the per-ticket triage verdicts
     // (approve/hold/reject): hub-owned like the pins above, and the board's one
@@ -7305,13 +7420,6 @@ function buildAgentsCache() {
     // In-flight (and just-settled) session migrations, so the Sessions page can
     // follow a moved session onto its new host and surface a failure (XERK-101).
     migrations: migrationList(),
-    // Token usage for hosts the registry no longer has (XERK-338): deleted,
-    // pruned, or evicted. Agent-shaped records carrying nothing but `usage` /
-    // `repoUsage` / `jira.siteKey` and flagged `retired`, so the Usage page and
-    // the Android Usage screen chart them beside the live fleet with the code
-    // they already have — and so no OTHER page picks them up, since none of them
-    // reads this key. Empty from a hub predating the ledger.
-    retiredUsage: usageLedger.retiredAgents(Object.keys(agents), now),
     // Whether the hub can actually deliver mobile push (FCM configured). Surfaced
     // so a disabled/misconfigured push is VISIBLE on the dashboard instead of
     // silently swallowing every alert — the failure mode of XERK-152, whose only
@@ -7319,10 +7427,55 @@ function buildAgentsCache() {
     // process's life (the service account is parsed once at startup).
     pushEnabled: push.fcmEnabled(),
   });
-  const etag = '"' + crypto.createHash("sha1").update(body).digest("base64") + '"';
-  agentsCache = { body, etag };
+  // The per-SCOPE tail (XERK-2550) — `modelPolicy` and `retiredUsage` — rides
+  // after everything else, so one shared body serves every principal and only
+  // the tail differs. `body` carries the operators' tail (the untenanted fleet);
+  // `agentsPayloadFor` swaps in another scope's, memoized for this build.
+  const shared = body.slice(0, -1);
+  const opsTail = agentsScopeTail(tenantScope(""), "", liveKeys, now);
+  const full = `${shared},${opsTail}}`;
+  const etag = '"' + crypto.createHash("sha1").update(full).digest("base64") + '"';
+  agentsCache = { body: full, etag, shared, liveKeys, now, scoped: new Map(), scopedBytes: 0 };
   lastGoodAgentsCache = agentsCache;
   return agentsCache;
+}
+
+// The part of /api/agents that differs per ledger scope (XERK-2550), as the JSON
+// members `"modelPolicy":…,"retiredUsage":…` (no braces):
+//   - modelPolicy (XERK-1848): the mode and each promoted work class's model in
+//     the caller's OWN tenant's policy, so the board's Model row names what an
+//     unpinned Start sends for it.
+//   - retiredUsage (XERK-338): token usage of hosts the registry no longer has —
+//     agent-shaped records carrying only `usage`/`repoUsage`/`jira.siteKey`,
+//     flagged `retired`, read only by the Usage page and the token tiles —
+//     limited to the hosts the caller may drive, BEFORE the byte budget.
+function agentsScopeTail(visible, policyTenant, liveKeys, now) {
+  return `"modelPolicy":${JSON.stringify(modelPolicyPayload(policyTenant))},`
+    + `"retiredUsage":${JSON.stringify(usageLedger.retiredAgents([...liveKeys], now, visible))}`;
+}
+// Bound on the memoized per-scope tails of one build (each ≤ USAGE_LEDGER_SERVE_MAX).
+const AGENTS_SCOPED_TAILS_MAX_BYTES = 4 << 20;
+// The fleet payload as principal `p` reads it: `{body, etag}`.
+function agentsPayloadFor(p) {
+  const cached = agentsCache || safeAgentsCache();
+  if (!cached || typeof cached.shared !== "string") return cached;   // the degraded body
+  const sk = ledgerScopeKey(p);
+  if (sk === "t:") return cached;                                      // the operators' tail
+  // Only the TAIL is kept per scope, never a whole body: the shared part is the
+  // whole fleet, and a copy per scope would multiply the payload's footprint.
+  let v = cached.scoped.get(sk);
+  if (!v) {
+    const tail = agentsScopeTail(ledgerVisible(p), ledgerTenantOf(p), cached.liveKeys, cached.now);
+    const etag = '"' + crypto.createHash("sha1").update(cached.etag).update(tail).digest("base64") + '"';
+    v = { tail, etag };
+    if (cached.scopedBytes + tail.length > AGENTS_SCOPED_TAILS_MAX_BYTES) {
+      cached.scoped.clear();
+      cached.scopedBytes = 0;
+    }
+    cached.scoped.set(sk, v);
+    cached.scopedBytes += tail.length;
+  }
+  return { body: `${cached.shared},${v.tail}}`, etag: v.etag };
 }
 
 // `buildAgentsCache` stringifies the whole fleet, so it can still throw past
@@ -7549,20 +7702,26 @@ function forwardBodyCaps() {
 // "close" handler). The LOCAL half — the whole story with HA off, and the
 // per-replica delivery step in HA (both the originator's own clients and, via
 // the bus subscription, another replica's events).
-function sseDeliverLocal(event, dataObj) {
+// `scope.policyTenant` (XERK-2550) limits a frame to the clients reading that
+// tenant's routing policy ("" = the untenanted fleet's); absent = every client.
+function sseDeliverLocal(event, dataObj, scope) {
   if (!sseClients.size) return;
+  const only = scope && typeof scope.policyTenant === "string" ? scope.policyTenant : null;
   const frame = `event: ${event}\ndata: ${JSON.stringify(dataObj)}\n\n`;
   for (const res of sseClients) {
+    if (only !== null && ledgerTenantOf(ssePrincipals.get(res)) !== only) continue;
     try { res.write(frame); } catch { sseClients.delete(res); }
   }
 }
+// The principal each SSE client connected as (XERK-2550), for scoped frames.
+const ssePrincipals = new WeakMap();
 
 // Broadcast one SSE event: deliver to this replica's clients now, and in HA mode
 // publish it to the shared bus so every OTHER replica re-emits it to its own
 // clients (XERK-762). Signature unchanged, so its ~40 call sites are untouched.
-function sseBroadcast(event, dataObj) {
-  sseDeliverLocal(event, dataObj);
-  if (sseBus) sseBus.publish(event, dataObj);
+function sseBroadcast(event, dataObj, scope) {
+  sseDeliverLocal(event, dataObj, scope);
+  if (sseBus) sseBus.publish(event, dataObj, scope);
 }
 
 // Wire cross-replica SSE fan-out onto a LiveStore's pub/sub. Standalone + the
@@ -7576,16 +7735,22 @@ function makeSseBus(store, replicaId, deliverLocal) {
     // but the bus is shared infrastructure, so never trust the shape.
     if (!msg || typeof msg !== "object" || msg.origin === replicaId) return;
     if (typeof msg.event !== "string") return;
-    deliverLocal(msg.event, msg.data);
+    // A scope that is present but not a string is malformed: drop the frame
+    // rather than deliver a scoped frame to every client.
+    if ("policyTenant" in msg && typeof msg.policyTenant !== "string") return;
+    deliverLocal(msg.event, msg.data,
+      typeof msg.policyTenant === "string" ? { policyTenant: msg.policyTenant } : undefined);
   });
   return {
-    publish(event, dataObj) {
+    publish(event, dataObj, scope) {
       // Best-effort: a failed publish (a store blip) never fails the mutation it
       // followed — local clients already got the frame, and the next per-host
       // beat re-ships that host's FULL serialized record, so a cross-replica
       // frame missed during a blip self-heals within a beat. Matches the store's
       // own best-effort watch/announce posture.
-      Promise.resolve(store.publish(SSE_BUS_CHANNEL, { origin: replicaId, event, data: dataObj }))
+      const msg = { origin: replicaId, event, data: dataObj };
+      if (scope && typeof scope.policyTenant === "string") msg.policyTenant = scope.policyTenant;
+      Promise.resolve(store.publish(SSE_BUS_CHANNEL, msg))
         .catch(() => {});
     },
   };
@@ -9021,7 +9186,11 @@ function subscriptionLimitsPaused(limits, nowMs) {
 // `subscription.key` (XERK-301), or a per-host fallback so a host that can't
 // identify its account paces only against itself, never merged with another.
 function subscriptionKeyOf(key, a) {
-  return (a.subscription && a.subscription.key) || ("host:" + key);
+  const sub = (a.subscription && a.subscription.key) || ("host:" + key);
+  // Per tenant (XERK-2550): two tenants' hosts on one Claude account are two
+  // pools here, so one tenant's reading never pauses (or reveals) the other's.
+  const t = tenantOfKey(key);
+  return t ? `${t}:${sub}` : sub;
 }
 
 // The set of subscription keys a limit pauses (XERK-544 pace line OR XERK-548
@@ -21299,6 +21468,7 @@ const server = http.createServer(async (req, res) => {
       });
       res.write("retry: 3000\n\n"); // client reconnect backoff hint
       res.write(": connected\n\n");
+      ssePrincipals.set(res, requestPrincipal(req));
       sseClients.add(res);
       const keepalive = setInterval(() => {
         try { res.write(": keepalive\n\n"); } catch { /* dropped; close cleans up */ }
@@ -21318,7 +21488,7 @@ const server = http.createServer(async (req, res) => {
     // the body+ETag and revalidates with If-None-Match on its next poll. The
     // history cache is excluded from the payload (see serializeAgent).
     if (req.method === "GET" && url.pathname === "/api/agents") {
-      const cached = agentsCache || safeAgentsCache();
+      const cached = agentsPayloadFor(requestPrincipal(req));
       if ((req.headers["if-none-match"] || "") === cached.etag) {
         res.writeHead(304, { ETag: cached.etag, "Cache-Control": "no-cache" });
         return res.end();
@@ -21339,14 +21509,15 @@ const server = http.createServer(async (req, res) => {
     // set org.js builds for `retiredUsage` — so a removed host's rows show only
     // under "All orgs".
     if (req.method === "GET" && url.pathname === "/api/permissions") {
-      return json(res, 200, permissionsView(url.searchParams));
+      return json(res, 200, permissionsView(url.searchParams, Date.now(),
+        ledgerVisible(requestPrincipal(req))));
     }
 
     // The outcome ledger (XERK-1839): per (work class, model) outcome counts,
     // FLEET-WIDE — evidence pools across orgs (docs/model-quality-adr.md).
     // `org=<siteKey>&rows=1` adds that one org's per-session rows.
     if (req.method === "GET" && url.pathname === "/api/model-quality") {
-      return json(res, 200, modelQualityView(url.searchParams));
+      return json(res, 200, modelQualityView(url.searchParams, Date.now(), requestPrincipal(req)));
     }
 
     if (req.method === "POST" && url.pathname === "/api/heartbeat") {
@@ -25486,7 +25657,9 @@ if (process.env.TURMA_TEST) {
     permissionLedger,
     // The outcome ledger, its sweep and served view (XERK-1839).
     outcomeLedger, outcomeLedgerSweep, modelQualityView, modelShadowSweep, shadowSampled,
-    modelPolicySweep, modelPolicyPick, modelPolicyPayload,
+    modelPolicySweep, modelPolicyPick, modelPolicyPayload, modelPolicyKey, agentsPayloadFor,
+    registerTenantPurge, purgeTenantData, ledgerVisible, ledgerScopeKey, tenantScope, subscriptionKeyOf,
+    shadowHostFor,
     __modelPolicyState: () => modelPolicyState,
     __setModelPolicy: (mode) => { MODEL_POLICY = mode; invalidateAgentsCache(); },
     __setModelPolicyState: (v) => { modelPolicyState = modelPolicyCoerce(v); invalidateAgentsCache(); },
@@ -26128,7 +26301,7 @@ if (process.env.TURMA_TEST) {
     // (`makeSseBus` over an injected store), and hold the local-delivery seam
     // (`sseClients`/`sseDeliverLocal`) and the HA toggle (`__setSseBus`) that
     // `sseBroadcast` gates on.
-    sseBroadcast, sseDeliverLocal, makeSseBus, sseClients, SSE_BUS_CHANNEL, SSE_REPLICA_ID,
+    sseBroadcast, sseDeliverLocal, makeSseBus, sseClients, ssePrincipals, SSE_BUS_CHANNEL, SSE_REPLICA_ID,
     __setSseBus(v) { sseBus = v; },
     // XERK-764: the cross-replica tunnel directory + control bus. Exported so tests
     // can drive the directory publish/retire/mirror, the freshness-gated

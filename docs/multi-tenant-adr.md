@@ -46,6 +46,35 @@ tenants, run by an admin panel.
   break-glass, a pre-tenancy cookie, an open hub — never by a plain tenant user, until the
   migration (XERK-2554) binds it. An admin who rolls such a host with their own tenant binds it there.
 
+### Usage, ledgers and insights belong to the tenant (XERK-2550)
+
+- A ledger row (usage, permission prompt, outcome) carries its tenant as the registry key of the
+  host that produced it, `<device>@<tenantId>`. No separate `tenantId` column: the key is set by the
+  hub from the credential and never moves tenant, so a second field could only disagree with it.
+- **No aggregate spans two tenants — none.** Every served view reads ONE scope: a tenant user its
+  own tenant's hosts (also when it holds the admin role — its admin role adds no data); a
+  tenant-less operator (break-glass, admin-only) the untenanted ones. And every
+  hub decision computed from ledgers is computed per tenant:
+  - the routing policy (XERK-1848): promotions, the tripwire's Opus baseline, shadow pairs and the
+    shadow daily cap are each one tenant's. A shadow re-runs a ticket only on a host of its tenant.
+  - the subscription pause (XERK-544/548): one Claude account shared by two tenants is two pools.
+  - defect attribution marks only the reporting host's tenant's rows.
+  - eviction budgets rank by (tenant, org) or host, so one tenant's churn cannot crowd another out
+    of a shared ceiling's ranking, and the retired-usage serve budget is the scope's own.
+  - `/metrics` (unauthenticated) counts the untenanted fleet only.
+- Rejected: shared "routing-quality priors" pooled across tenants. More evidence would promote a
+  cheaper model sooner, but it lets one tenant's work steer another's model choice and its counts
+  reveal another's activity — the overlap the epic forbids. A tenant with little evidence simply
+  stays on Opus longer.
+- Rejected: a `tenant` label on `/metrics`. The route is unauthenticated; a label would publish
+  tenant ids and per-tenant activity.
+- A host's spend stays with the key it was spent under. Binding an untenanted host into a tenant
+  (XERK-2533) does NOT carry its pre-bind usage into the tenant; the usage-ledger alias groups never
+  join two tenants. Moving today's fleet into a tenant is the migration's job (XERK-2554).
+- Tenant purge: `purgeTenantData(tenantId)` (server.js) runs every store's registered purge
+  (`registerTenantPurge`), each in its own try/catch; the ledgers drop their hot rows and delete
+  them in Postgres (usage by host, permission by `@<tenantId>` suffix, outcome by key).
+
 ### Admin without a tenant: break-glass
 
 - The `TURMA_USER`/`TURMA_PASSWORD` break-glass login (XERK-595) stays, IdP-independent, and maps to
