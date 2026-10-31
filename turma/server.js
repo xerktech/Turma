@@ -1300,17 +1300,19 @@ function principalMayDriveHost(p, key) {
   return Array.isArray(p.roles) && p.roles.includes("admin");
 }
 // Whether the plain host name `host` now belongs to a tenant-bound agent
-// identity (XERK-2583): one minted for that name (origin) or living under it in
-// a tenant (home `<host>@<t>`). The fleet master proves no tenant, so a beat
+// identity (XERK-2583): one minted for that PLAIN name (its origin) and since
+// bound to a tenant by a roll. The fleet master proves no tenant, so a beat
 // naming such a host on it would only recreate an untenanted ghost beside the
-// bound record. Only once that identity has BEATEN: a host still on the master
+// bound record. Never match on the home's device part: a host a tenant enrolled
+// under the same device name (origin `<name>@<t>`) is another machine, and
+// matching it let any tenant user lock the operators' `<name>` off the master. Only once that identity has BEATEN: a host still on the master
 // when its roll bound it must receive the bind's setToken on a master beat. A
 // released identity (Remove host) or a revoked tombstone no longer holds the name.
 function tenantBoundName(host) {
   if (typeof host !== "string" || !host || tenantOfKey(host)) return false;
   for (const e of Object.values(agentIdentities)) {
     if (!e || !e.tenantId || !e.used || e.revoked || e.released) continue;
-    if (e.origin === host || baseOfKey(e.home) === host) return true;
+    if (e.origin === host) return true;
   }
   return false;
 }
@@ -14709,7 +14711,7 @@ function agentWsAuthorized(url, req, host) {
     if (host != null && safeEqual(token, hostAgentToken(host))) return !nameTokenRefusal(host);
     const uid = tokenUid(token);
     if (uid) return host != null && uidHostClaim(uid, host);
-    return !TURMA_AGENT_STRICT && safeEqual(token, TURMA_AGENT_TOKEN) && !tenantOfKey(host);
+    return !TURMA_AGENT_STRICT && safeEqual(token, TURMA_AGENT_TOKEN) && !tenantOfKey(host) && !tenantBoundName(host);
   }
   return !agentHostRefusal(req, host);
 }

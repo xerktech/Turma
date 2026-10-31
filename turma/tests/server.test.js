@@ -20864,10 +20864,29 @@ test("XERK-2583: the fleet master cannot beat the plain name of a tenant-bound h
     assert.equal(agentBearerKind({ headers: master }, "t2583g"), null);
     // Other plain names still take the master (the pre-strict trust model).
     assert.equal(agentBearerKind({ headers: master }, "t2583other"), "legacy");
+    // The tunnel takes the master as ?token= (tunnel-agent.js): refused too.
+    assert.equal(hub.agentWsAuthorized(new URL("http://x/agent/control?name=t2583g&token=agenttok"),
+      { headers: {} }, "t2583g"), false);
+    assert.equal(hub.agentWsAuthorized(new URL("http://x/agent/control?name=other2583&token=agenttok"),
+      { headers: {} }, "other2583"), true);
     // Remove host releases the name, and the master may claim it again.
     assert.equal((await request("DELETE", `/api/agents/${encodeURIComponent(kc)}`, { headers: T.C.h })).status, 200);
     assert.equal(hub.tenantBoundName("t2583g"), false);
   } finally { forget2533("t2583g", kc); T.restore(); }
+});
+
+test("XERK-2583: a tenant's same-named host never locks the operators' plain host off the master", async () => {
+  const T = tenants2533();
+  const ka = `t2583s@${T.A.t}`;
+  try {
+    forget2533("t2583s", ka);
+    assert.equal((await beat2533("agenttok", "t2583s")).status, 200);
+    const tok = await enroll2533(T.A, "t2583s");
+    assert.equal((await beat2533(tok, "t2583s")).status, 200);
+    assert.ok(agents[ka]);
+    assert.equal(hub.tenantBoundName("t2583s"), false);
+    assert.equal((await beat2533("agenttok", "t2583s")).status, 200, "the fleet host still beats on the master");
+  } finally { forget2533("t2583s", ka); T.restore(); }
 });
 
 test("XERK-2533: enrollment codes belong to their owner's tenant (list + revoke)", async () => {
