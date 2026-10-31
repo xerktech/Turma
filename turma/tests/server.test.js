@@ -20206,6 +20206,23 @@ test("XERK-2531: a fresh code for a name supersedes an identity that never beat"
   forget2531("enr-s");
 });
 
+test("XERK-2531: a renamed-then-removed host's old name gets a FRESH identity, not the old machine's", async () => {
+  forget2531("enr-ra", "enr-rb");
+  const old = enrollUid("enr-ra");
+  const beat = (tok, device) => request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: { device, sessions: [] } });
+  assert.equal((await beat(old, "enr-ra")).status, 200);
+  quiet("enr-ra");
+  assert.equal((await beat(old, "enr-rb")).status, 200); // renamed to enr-rb
+  assert.equal((await request("DELETE", "/api/agents/enr-rb", { headers: userHeaders })).status, 200);
+  const r = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-ra");
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.notEqual(r.body.token, old);
+  assert.notEqual(tokenUid(r.body.token), tokenUid(old));
+  assert.equal((await beat(r.body.token, "enr-ra")).status, 200); // the reinstall beats under its name
+  forget2531("enr-ra", "enr-rb");
+});
+
 test("XERK-2531: unknown codes are rate-limited, and a flood never blocks a real code", async () => {
   forget2531("enr-rl");
   const statuses = [];
@@ -20244,6 +20261,11 @@ test("XERK-2531: a code never takes a renamed host's old name or a revoked tombs
   const t = hub.consumeEnrollCode(m.body.code, "enr-alpha");
   assert.equal(t.status, 409);
   assert.ok(ids["b".repeat(32)], "the tombstone survives");
+  // The revoked branch alone (no `used`) still refuses, naming the real release.
+  ids["b".repeat(32)].used = false;
+  const t2 = hub.consumeEnrollCode(m.body.code, "enr-alpha");
+  assert.equal(t2.status, 409);
+  assert.match(t2.body.error, /revoked — release the name first \(DELETE \/api\/agents\/enr-alpha\)/);
   // A released home (Remove host) is free again.
   delete ids["b".repeat(32)];
   ids["c".repeat(32)] = { home: "enr-alpha", at: 1, used: true, released: true };

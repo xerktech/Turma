@@ -67,6 +67,10 @@ Split out of `CLAUDE.md`, which keeps the per-host credential contract (XERK-268
     keeps the id minted for its old name, and `issueAgentUid` would hand that id back) or a former
     name — and so is a revoked tombstone's origin (minting there deleted it, un-retiring the old
     name token, XERK-2383). Only Remove host's `released` frees a name.
+  - **A code always mints a FRESH identity** — never one that has beaten. A released identity keeps
+    an `origin` that differs from its last home (renamed, then removed), so `identityByOrigin` would
+    hand the old machine's live id to the new one; redemption strips that origin first, and refuses
+    if `issueAgentUid` still returns a used id.
   - `owner` records the minting principal (`oidc:<sub>` or `local:<user>`) for the tenancy epic
     (XERK-2529) to bind the host to a tenant. **Recorded, not enforced.**
   - Agent: `hub-agent.py --enroll` with `TURMA_ENROLL_CODE` in the ENV (never argv) runs

@@ -13813,7 +13813,7 @@ function enrollNameRefusal(device) {
       .filter(Boolean).some((n) => lowerName(n) === want);
     if (!held) continue;
     if (e.revoked) {
-      return { status: 409, error: `${device} belonged to an agent whose token was revoked — remove ${e.home} from the dashboard to release the name` };
+      return { status: 409, error: `${device} belonged to an agent whose token was revoked — release the name first (DELETE /api/agents/${device})` };
     }
     if (e.used) {
       return { status: 409, error: e.home && lowerName(e.home) !== want
@@ -13912,17 +13912,28 @@ function consumeEnrollCode(code, device, now = Date.now()) {
   // An identity minted for this name that never beat (an earlier code whose host
   // never came up) is superseded: the operator minted a new code for the name,
   // and handing back the SAME id would put two machines on one token.
+  // A RELEASED identity (its host was removed) keeps the `origin` it was minted for
+  // when that differs from its last home, so identityByOrigin would hand a renamed-
+  // then-removed agent's live id to this new machine (XERK-2531 QA). Releasing a
+  // name means a reinstall that registers first wins, so it loses that origin.
+  // A code therefore always mints a FRESH identity — never one another machine holds.
   let dropped = false;
   for (const [uid, e] of Object.entries(agentIdentities)) {
-    if (e && !e.used && !e.revoked && (e.home === device || e.origin === device)) {
-      delete agentIdentities[uid]; dropped = true;
-    }
+    if (!e || e.revoked) continue;
+    if (!e.used && (e.home === device || e.origin === device)) { delete agentIdentities[uid]; dropped = true; }
+    else if (e.released && e.origin === device) { delete e.origin; dropped = true; }
   }
   if (dropped) persistAgentIdentities();
+  const uid = issueAgentUid(device);
+  const ident = identityEntry(uid);
+  if (!ident || ident.used || ident.home !== device) {
+    // Defence in depth: never hand out an id that has beaten anywhere.
+    return { status: 409, body: { error: `${device} is still bound to another agent identity — remove it from the dashboard first` } };
+  }
   rec.usedAt = now;
   rec.usedBy = device;
   persistEnrollCodes();
-  const token = uidAgentToken(issueAgentUid(device));
+  const token = uidAgentToken(uid);
   console.log(`agent enrolled by code: ${logName(device)} (code ${id}, minted by ${logName(rec.owner)})`);
   return { status: 200, body: { host: device, token, bound: true } };
 }
