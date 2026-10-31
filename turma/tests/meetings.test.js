@@ -147,6 +147,12 @@ test("XERK-2510: a refusal reaches the operator in the hub's words; review state
   await P.review(P.itemKey(SITE, "m1", "p1"), "reject");
   assert.deepEqual(P.toasts, ["Rejecting failed — no online host reports that org"]);
   assert.match(P.list(), /class="mt-err">Rejecting failed/);
+  // An editor opened and left alone sends no `edited`; a ticket description has no decision cap.
+  const k1 = P.itemKey(SITE, "m1", "p1");
+  P.startEdit(k1);
+  assert.match(P.list(), /<textarea data-edit-desc="[^"]+">/);
+  await P.review(k1, "approve");
+  assert.equal("edited" in P.fetches.filter((f) => f.method === "POST").at(-1).body, false);
   const items = meeting().items;
   P.renderMeetings(data([meeting({ items: [
     { ...items[0], review: { state: "created", at: 1, key: "ACME-9", start: true, session: "queued" } },
