@@ -49138,7 +49138,7 @@ class PidAliveWindowsProbe(unittest.TestCase):
         self.assertIn("WaitForSingleObject", win_block)
         self.assertNotIn("os.kill(int(pid), 0)", win_block)
         # The POSIX branch keeps the signal-0 probe.
-        self.assertIn("os.kill(int(pid), 0)", src[posix_def:])
+        self.assertIn("os.kill(pid, 0)", src[posix_def:])
 
 
 
@@ -51051,6 +51051,33 @@ class TestKillpgNeverHitsPidOne(unittest.TestCase):
             ha.SessionManager._kill_attention_hint(proc)
         killpg.assert_not_called()
         proc.kill.assert_called_once()
+
+    def test_an_int_pid_of_one_or_less_is_never_killpg_d(self):
+        for bad in (1, 0, -1, True):
+            with self.subTest(pid=bad):
+                proc = mock.MagicMock()
+                proc.pid = bad
+                with mock.patch.object(ha.os, "killpg", create=True) as killpg:
+                    ha.SessionManager._kill_attention_hint(proc)
+                killpg.assert_not_called()
+
+    def test_signalable_pid(self):
+        for good, want in ((2, 2), (4242, 4242), ("4242", 4242), (" 77 ", 77)):
+            self.assertEqual(ha._signalable_pid(good), want)
+        for bad in (None, 0, 1, -1, "-1", "1", "", "x", 1.5, True, mock.MagicMock()):
+            with self.subTest(pid=bad):
+                self.assertIsNone(ha._signalable_pid(bad))
+
+    def test_a_persisted_ttyd_pid_of_minus_one_is_never_signalled(self):
+        sm = mock.MagicMock()
+        sm.ttyd = {}
+        for bad in (-1, "-1", 1, mock.MagicMock()):
+            with self.subTest(pid=bad):
+                sm._find.return_value = {"ttydPid": bad}
+                with mock.patch.object(ha.os, "kill") as kill, \
+                        mock.patch.object(ha, "IS_WINDOWS", False):
+                    ha.SessionManager._kill_ttyd(sm, "s1")
+                kill.assert_not_called()
 
     def test_a_real_child_still_has_its_group_killed(self):
         proc = mock.MagicMock()

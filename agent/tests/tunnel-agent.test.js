@@ -783,6 +783,9 @@ test("pokeHeartbeat falls back to PID 1 (the container's exec'd manager)", () =>
   // group", not "no one".
   assert.deepEqual(capturePoke(""), [[1, "SIGUSR1"]]);
   assert.deepEqual(capturePoke("nonsense"), [[1, "SIGUSR1"]]);
+  // A negative pid would be kill(-1, SIGUSR1): every process this user owns.
+  assert.deepEqual(capturePoke("-1"), [[1, "SIGUSR1"]]);
+  assert.deepEqual(capturePoke("1.5"), [[1, "SIGUSR1"]]);
 });
 
 test("pokeHeartbeat swallows a failing signal (best-effort)", () => {

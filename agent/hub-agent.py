@@ -2010,12 +2010,30 @@ if IS_WINDOWS:
             _kernel32.CloseHandle(h)
 else:
     def _pid_alive(pid):
-        """Whether a pid is a live process (signal 0 probes without delivering)."""
+        """Whether a pid is a live process (signal 0 probes without delivering).
+        kill(-1, 0) succeeds whenever ANY process can be signalled, so a pid
+        that names no single process (_signalable_pid) is not alive."""
+        pid = _signalable_pid(pid)
+        if pid is None:
+            return False
         try:
-            os.kill(int(pid), 0)
+            os.kill(pid, 0)
             return True
         except (OSError, TypeError, ValueError):
             return False
+
+
+
+def _signalable_pid(v):
+    """`v` as a pid that names ONE real process (an int > 1), else None.
+
+    Every pid this manager signals comes from a record, a state file or a proc
+    object a test may have mocked. kill(-1) and killpg(1) reach every process the
+    user owns (systemd --user and every session); kill(0) the manager's own group.
+    A MagicMock coerces to 1, and a persisted "-1" parses, so both are refused."""
+    if type(v) is str and v.strip().isdigit():
+        v = int(v.strip())
+    return v if type(v) is int and v > 1 else None
 
 
 # --- leaked Claude Code inbox sockets (XERK-341) -------------------------------
@@ -30898,9 +30916,9 @@ class SessionManager:
         # _kill_ttyd's identical reap-by-persisted-pid step.
         sess = self._find(sid)
         pid = sess.get("qwenPeerInboxPid") if sess else None
-        if pid and (proc is None or proc.pid != pid):
+        if pid and (proc is None or proc.pid != pid) and _signalable_pid(pid):
             try:
-                os.kill(int(pid), signal.SIGTERM)
+                os.kill(_signalable_pid(pid), signal.SIGTERM)
             except (OSError, ValueError):
                 pass
 
@@ -32268,8 +32286,10 @@ class SessionManager:
             time.sleep(0.05)
         else:
             for target in {proc.pid if proc is not None else None, pid} - {None}:
+                if _signalable_pid(target) is None:
+                    continue
                 try:
-                    os.kill(int(target), signal.SIGKILL)
+                    os.kill(_signalable_pid(target), signal.SIGKILL)
                 except (OSError, ValueError):
                     pass
             if proc is not None:
@@ -32317,9 +32337,9 @@ class SessionManager:
         # port. Best-effort — a recycled/dead pid just fails harmlessly.
         sess = self._find(sid)
         pid = sess.get("ttydPid") if sess else None
-        if pid and (proc is None or proc.pid != pid):
+        if pid and (proc is None or proc.pid != pid) and _signalable_pid(pid):
             try:
-                os.kill(int(pid), signal.SIGTERM)
+                os.kill(_signalable_pid(pid), signal.SIGTERM)
             except (OSError, ValueError):
                 pass
 
@@ -44118,12 +44138,11 @@ class SessionManager:
         """Kill a timed-out classifier and everything it started (its process
         group on POSIX), then reap it with a bound — never an unbounded wait."""
         killpg = getattr(os, "killpg", None)
-        pid = proc.pid
+        pid = _signalable_pid(proc.pid)
         try:
-            # killpg only a real child's group. A mocked proc's pid coerces to
-            # 1, and killpg(1) is kill(-1): every process this user owns, the
-            # user manager and every session included (TrueNAS, 2026-10-31).
-            if killpg is not None and type(pid) is int and pid > 1:
+            # killpg only a real child's group (_signalable_pid): killpg(1) is
+            # kill(-1), every process this user owns (TrueNAS, 2026-10-31).
+            if killpg is not None and pid is not None:
                 killpg(pid, signal.SIGKILL)
             else:
                 proc.kill()
