@@ -20595,6 +20595,14 @@ test("XERK-2533: a tenant user's roll binds an untenanted host to their tenant; 
     const tok = (await request("POST", "/api/agent/enroll", { body: { code: m.body.code, device: "t2533r" } })).body.token;
     assert.equal((await beat2533(tok, "t2533r")).status, 200);
     assert.ok(agents.t2533r);
+    // Its live tunnel, registered under the plain name. It PONGS, so only the
+    // hub's bind-beat close can end it inside this test (never the dead timer).
+    const ctrl = await wsConnect(`/agent/control?name=t2533r&token=${tok}`);
+    assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+    collectControlFrames(ctrl.socket, ctrl.leftover);
+    let tunnelClosed = false;
+    ctrl.socket.on("close", () => { tunnelClosed = true; });
+    await waitFor(() => !!controlChannels.t2533r);
     // A plain tenant user cannot roll it; the admin with a tenant binds it.
     assert.equal((await request("POST", "/api/agents/t2533r/roll-token", { headers: T.A.h, body: {} })).status, 404);
     const roll = await request("POST", "/api/agents/t2533r/roll-token", { headers: T.C.h, body: {} });
@@ -20609,6 +20617,10 @@ test("XERK-2533: a tenant user's roll binds an untenanted host to their tenant; 
     const st = (after.body.commands || []).find((c) => c.cmdId === roll.body.cmdId);
     assert.ok(st && st.type === "setToken" && !("bindTenant" in st), JSON.stringify(after.body.commands));
     assert.ok(!(agents[kc].commands || []).filter((c) => c.type !== "setToken").length);
+    // The bind beat closed the plain-named tunnel, so the agent re-dials onto the
+    // namespaced key (QA: left open, the bound host's terminals read offline).
+    await waitFor(() => tunnelClosed, 300);
+    assert.ok(!controlChannels.t2533r);
     assert.equal(hostOfUid(tokenUid(tok)), kc);
     // The old plain name is closed to it now: no beat as an untenanted host.
     assert.equal(hub.agentKeyFor({ headers: { authorization: `Bearer ${tok}` } }, "t2533r"), kc);

@@ -117,7 +117,9 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   into the caller's tenant; an untenanted code is the operators', like an untenanted host.
 - **The bind roll's `setToken` crosses the bind** (hub-only `bindTenant`): delivered on the old plain
   key or the new one, so the agent restarts. The bind beat also closes the plain-named tunnel, so it
-  re-dials onto the namespaced key (left open, terminals read offline).
+  re-dials onto the namespaced key (left open, terminals read offline). That close is replica-local,
+  which holds because the HA leader serves beats AND tunnels (XERK-919); under active-active it would
+  need the control bus.
 - **A tenant host's queued command carries `tenant`** (hub-only, an `INTERNAL_COMMAND_FIELDS` member)
   and is dropped at delivery unless it matches the key's tenant — a command queued before a bind is
   never run inside the tenant. Untenanted hosts' commands carry no stamp (byte-identical).
