@@ -317,6 +317,19 @@ test("XERK-2532: losing only the user group drops the tenant but keeps admin (no
   assert.equal(userBySub("demoted-1").disabled, false);
 });
 
+test("XERK-2532: a local group an operator added admits a user the IdP groups don't", async () => {
+  await driveCallback([USER_GROUP], { sub: "local-grp-1" });
+  const u = userBySub("local-grp-1");
+  hub.__setTenancy(tenancy.updateUser(hub.tenancyState(), u.id, { groups: ["turma-admins"] }).state);
+  const { res } = await driveCallback([], { sub: "local-grp-1" });
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.location, "/board");
+  const p = principalOf(res);
+  assert.deepEqual([...p.roles], ["admin"]);
+  assert.equal(p.tenantId, null);
+  assert.equal(userBySub("local-grp-1").disabled, false);
+});
+
 test("XERK-2532: an identity in neither group is never provisioned", async () => {
   await driveCallback(["something-else"], { sub: "never-1" });
   assert.equal(userBySub("never-1"), null);

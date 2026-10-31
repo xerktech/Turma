@@ -173,8 +173,8 @@ flow and renders the local form for, never re-bouncing to the IdP.)
   (`requestPrincipal`). `roles`/`groups`/`userId` also ride the `oidcSessions` record (logout hint).
   A disabled user gets `/login?error=forbidden`.
 - **An identity the groups admit nowhere is never provisioned**; a KNOWN one whose login grants no
-  role is marked `disabled` + `disabledBy:"idp"` (the denied branch still calls `oidcPrincipal` with
-  `[]`). Its record and tenant stay until an admin deletes the user; a later login that grants a role
+  role (IdP groups AND local groups) is marked `disabled` + `disabledBy:"idp"`; every verified login
+  runs `oidcPrincipal`, so a local group an operator added still admits. Its record and tenant stay until an admin deletes the user; a later login that grants a role
   lifts ONLY an IdP disable, never an operator's (`upsertOidcUser`, `updateUser`).
 - **The mobile exchange returns the callback's token**, so it is the same principal (pinned).
 - **OIDC-issued sessions are SHORTER-lived** so a revoked user re-authenticates (and is re-checked

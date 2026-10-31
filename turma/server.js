@@ -13376,7 +13376,7 @@ function oidcPrincipal(iss, claims, roles, now = Date.now()) {
     idpRoles: roles, now,
   });
   if (!user) return null; // never admitted: nothing provisioned
-  if (user.disabled || !roles.length) {
+  if (user.disabled) {
     if (state !== tenancyState) setTenancy(state);
     return null;
   }
@@ -13401,7 +13401,7 @@ const OIDC_TX_TTL_MS = 10 * 60 * 1000; // an auth round trip is minutes, not hou
 const OIDC_TX_MAX = 2000; // heap-guard cap vs a /login flood (file backend only — see oidcEnforceCap)
 
 // Established browser sessions, keyed by the random sid in the OIDC_SID cookie:
-// sid -> {idToken, sub, role, groups, at}. Holds only the last ID token, used as
+// sid -> {idToken, sub, userId, roles, groups, at}. Holds only the last ID token, used as
 // the `id_token_hint` on RP-initiated logout so the IdP ends the right session
 // without a confirmation prompt. Also in the shared store (XERK-760) under
 // OIDC_SESSION_PREFIX, so a session established on replica A can be logged out on
@@ -20533,33 +20533,23 @@ const server = http.createServer(async (req, res) => {
         // the local credential, but never a hub session from OIDC alone).
         const groups = oidcGroupsFromClaims(claims);
         const access = oidcAccessDecision(groups);
-        if (!access.allowed) {
-          // A KNOWN user the groups no longer admit is marked disabled (its
-          // tenant is kept); an unknown one is never provisioned.
-          try {
-            oidcPrincipal(disco.issuer, claims, []);
-          } catch (e) {
-            console.log(`OIDC disable-on-removal failed: ${logName(e && e.message || "?")}`);
-          }
-          console.log(
-            `OIDC access denied for ${logName(String(claims.sub || "?"))}: in none of ` +
-              `[${logName(OIDC_USER_GROUP)}, ${logName(OIDC_ADMIN_GROUP)}]`
-          );
-          res.writeHead(302, {
-            Location: failLocation("forbidden"),
-            "Cache-Control": "no-store",
-            "Set-Cookie": clearState,
-          });
-          return res.end();
-        }
         // One principal (XERK-2530): the IdP identity becomes a hub user with its
-        // own tenant, and the session names it. A disabled user gets no session.
+        // own tenant, and the session names it. Run for EVERY verified login
+        // (XERK-2532): a known user the groups no longer admit is marked disabled
+        // (tenant kept), an unknown one is never provisioned, and a local group
+        // an operator added still admits a user the IdP groups don't.
         let principal;
         try {
           principal = oidcPrincipal(disco.issuer, claims, access.roles);
         } catch (e) {
           console.log(`OIDC sign-in refused: ${logName(e && e.message || "?")}`);
           principal = null;
+        }
+        if (!principal && !access.allowed) {
+          console.log(
+            `OIDC access denied for ${logName(String(claims.sub || "?"))}: in none of ` +
+              `[${logName(OIDC_USER_GROUP)}, ${logName(OIDC_ADMIN_GROUP)}]`
+          );
         }
         if (!principal) {
           res.writeHead(302, { Location: failLocation("forbidden"), "Cache-Control": "no-store", "Set-Cookie": clearState });
