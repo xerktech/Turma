@@ -44,7 +44,9 @@ param(
   [string]$Command = 'status',
   # Optional trailing argument (the line count for `logs`).
   [Parameter(Position = 1)]
-  [string]$Arg
+  [string]$Arg,
+  # `enroll -Code <code>` (XERK-2531): the one-time code from the dashboard's Add host dialog.
+  [string]$Code = ''
 )
 
 # StrictMode is the `set -u` analog; ErrorActionPreference stays 'Continue' so best-effort
@@ -416,6 +418,40 @@ function Invoke-Uninstall {
   Log "turma-agent service '$ServiceName' uninstalled (running sessions were left alone)"
 }
 
+# --- enroll: onto this host's OWN agent token (XERK-578), or with a one-time code (XERK-2531) ---
+# The Windows twin of the bash ctl's `enroll`: load the same config the launcher sources, run
+# the shared manager's `--enroll` (fetch + verify + atomic owner-only write), and restart onto
+# the new token. With -Code (or a positional code) the code IS the credential -- the new-host
+# path that needs no TURMA_TOKEN and no hub shell. The code rides TURMA_ENROLL_CODE in the
+# child's environment, never the manager's command line. Exit codes mirror the bash ctl.
+function Invoke-Enroll([string]$EnrollCode) {
+  $appData = Coalesce $env:APPDATA (Join-Path $env:USERPROFILE 'AppData\Roaming')
+  $cfgPath = Coalesce $env:TURMA_AGENT_ENV (Join-Path $appData 'turma-agent\turma-agent.env')
+  if (-not (Test-Path -LiteralPath $cfgPath)) { Log "enroll: no config at $cfgPath"; exit 1 }
+  foreach ($line in [System.IO.File]::ReadAllLines($cfgPath)) {
+    if ($line -match '^\s*(#|$)') { continue }
+    if ($line -notmatch '^\s*(export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { continue }
+    $key = $Matches[2]; $val = $Matches[3]
+    if ($val.Length -ge 2 -and (($val[0] -eq '"' -and $val[-1] -eq '"') -or ($val[0] -eq "'" -and $val[-1] -eq "'"))) {
+      $val = $val.Substring(1, $val.Length - 2)
+    }
+    Set-Item -Path "env:$key" -Value $val
+  }
+  $env:TURMA_AGENT_ENV = $cfgPath
+  if (-not $env:DEVICE_NAME) { $env:DEVICE_NAME = Coalesce $env:COMPUTERNAME ([System.Net.Dns]::GetHostName()) }
+  $python = Coalesce $env:TURMA_PYTHON 'python'
+  if ($EnrollCode) { $env:TURMA_ENROLL_CODE = $EnrollCode }
+  try { & $python $Manager --enroll; $rc = $LASTEXITCODE }
+  finally { Remove-Item -Path env:TURMA_ENROLL_CODE -ErrorAction SilentlyContinue }
+  if ($rc -eq 0) {
+    Log "enroll: restarting to re-authenticate (sessions preserved)"
+    Invoke-Restart
+  }
+  elseif ($rc -eq 2 -and $EnrollCode) { Log "enroll: this hub does not accept enrollment codes yet"; exit 1 }
+  elseif ($rc -eq 2) { Log "enroll: hub does not offer self-enroll yet -- left on the current token" }
+  else { exit $rc }
+}
+
 switch ($Command) {
   'start'     { Invoke-Start }
   'stop'      { Invoke-Stop }
@@ -424,8 +460,9 @@ switch ($Command) {
   'logs'      { Invoke-Logs $Arg }
   'install'   { Invoke-Install }
   'uninstall' { Invoke-Uninstall }
+  'enroll'    { Invoke-Enroll (Coalesce $Code $Arg) }
   default {
-    Log "usage: turma-agentctl.ps1 {start|stop|restart|status|logs [N]|install|uninstall}"
+    Log "usage: turma-agentctl.ps1 {start|stop|restart|status|logs [N]|enroll [-Code C]|install|uninstall}"
     exit 2
   }
 }

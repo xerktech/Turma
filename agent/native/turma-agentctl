@@ -152,7 +152,21 @@ restart_manager() {
 # the config, ask the hub for this host's derived token (authenticated with the
 # CURRENT token), persist it atomically, and restart to re-authenticate on it.
 # Idempotent: a host already on its derived token is a no-op (no restart).
+#
+# `enroll --code <code>` (XERK-2531) is the NEW-host path: no token yet, so the
+# one-time code from the dashboard's Add host dialog is the credential. It rides
+# to hub-agent.py in TURMA_ENROLL_CODE (never the manager's argv). Single-use, so
+# a failure here means mint a new one.
 enroll() {
+  code=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --code) shift; code="${1:-}" ;;
+      --code=*) code="${1#--code=}" ;;
+      *) echo "usage: turma-agentctl enroll [--code <code>]" >&2; exit 2 ;;
+    esac
+    shift
+  done
   CFG="${TURMA_AGENT_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/turma-agent/turma-agent.env}"
   if [ ! -f "$CFG" ]; then
     echo "enroll: no config at $CFG" >&2
@@ -170,12 +184,19 @@ enroll() {
   # hub-agent.py --enroll does the fetch + verify + atomic write and exits:
   # 0 success/no-op, 2 hub too old (soft skip), 1 failure.
   set +e
-  python3 "$PREFIX/hub-agent.py" --enroll
+  if [ -n "$code" ]; then
+    TURMA_ENROLL_CODE="$code" python3 "$PREFIX/hub-agent.py" --enroll
+  else
+    python3 "$PREFIX/hub-agent.py" --enroll
+  fi
   rc=$?
   set -e
   if [ "$rc" = 0 ]; then
     echo "enroll: restarting to re-authenticate (sessions preserved)"
     restart_manager
+  elif [ "$rc" = 2 ] && [ -n "$code" ]; then
+    echo "enroll: this hub does not accept enrollment codes yet" >&2
+    exit 1
   elif [ "$rc" = 2 ]; then
     echo "enroll: hub does not offer self-enroll yet — left on the current token" >&2
     exit 0
@@ -189,10 +210,10 @@ case "${1:-}" in
   stop)     stop ;;
   restart)  restart ;;
   status)   status ;;
-  enroll)   enroll ;;
+  enroll)   shift; enroll "$@" ;;
   logs)     exec tail -n "${2:-200}" -f "$LOG" ;;
   update)   exec "$PREFIX/bin/turma-agent-update" ;;
   *)
-    echo "usage: turma-agentctl {start|stop|restart|status|enroll|logs [N]|update}" >&2
+    echo "usage: turma-agentctl {start|stop|restart|status|enroll [--code C]|logs [N]|update}" >&2
     exit 2 ;;
 esac

@@ -67,6 +67,8 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     "dailyBriefs",
     // XERK-2508: meetings Tenir posted (a 200 promises the row is kept).
     "meetingProposals",
+    // XERK-2531: one-time host enrollment codes (hashed; a used stamp must stick).
+    "enrollCodes",
     // XERK-2530: hub users + tenants.
     "tenancy",
   ]) {
@@ -78,8 +80,11 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     // The briefs store's rows are the scheduler's "already fired" record (XERK-2395)
     // and a meeting's row is what Tenir's 200 promised (XERK-2508), so both are
     // written at once, as are hub users (XERK-2530: an account change is
-    // human-rate and its 200 must mean it is kept); every other store keeps 5s.
-    const immediate = d.name === "dailyBriefs" || d.name === "meetingProposals" || d.name === "tenancy";
+    // human-rate and its 200 must mean it is kept) and an enrollment code's used
+    // stamp (XERK-2531: a kill inside the debounce would let a single-use code
+    // redeem twice); every other store keeps 5s.
+    const immediate = d.name === "dailyBriefs" || d.name === "meetingProposals" ||
+      d.name === "tenancy" || d.name === "enrollCodes";
     assert.equal(persistent[d.key].debounceMs, immediate ? 0 : 5000,
       `${d.name} keeps its debounce`);
   }

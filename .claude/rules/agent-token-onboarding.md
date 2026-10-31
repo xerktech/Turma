@@ -5,6 +5,8 @@ paths:
   - "agent/hub-agent.py"
   - "agent/tests/test_hub_agent.py"
   - "agent/native/**"
+  - "turma/public/index.html"
+  - "turma/tests/dashboard-addhost.test.js"
 ---
 
 # Per-host agent token onboarding (XERK-578)
@@ -41,3 +43,45 @@ Split out of `CLAUDE.md`, which keeps the per-host credential contract (XERK-268
     (absent = no per-host tokens here). `tokenRoll` is the agent capability that gates the Roll
     button. Android types NEITHER yet (`ignoreUnknownKeys` skips them — safe); web-only, in
     `PARITY.md`. Native/agent detail in `agent-native.md`.
+- **A NEW host enrolls with a one-time CODE, not a token** (XERK-2531): it has no credential for the
+  two paths above, and minting one (`--agent-token`) needs a shell in the hub pod.
+  - `POST /api/enroll-codes {device?}` (operator-authed) mints `te-<32 hex>` (128 bits), 15 min
+    (`ENROLL_CODE_TTL_MS`), single-use; `GET` lists, `DELETE /api/enroll-codes/<id>` revokes. The
+    dashboard's "+ Add host" dialog drives them and shows the install commands.
+  - **Stored only as its SHA-256** in `enrollCodes` (`/data/enroll-codes.json`, a
+    `registerExternalStore` with `debounceMs: 0`, HA-shared). The plain code is in the mint reply
+    once and never served again. Never store or log it.
+  - `POST /api/agent/enroll {code, device}` is exempt from the login gate — the code IS the
+    credential (`consumeEnrollCode`). Lookup → state check → name check → used-stamp in ONE
+    synchronous turn, so two racing redemptions cannot both win (the leader is the single writer).
+  - It returns the host's IDENTITY token (`issueAgentUid`), and works under `TURMA_AGENT_STRICT`.
+  - **A code never takes a name another agent holds** (`enrollNameRefusal`, case-folded) — that
+    would hand the code holder that host's token and queued commands. An identity minted for the
+    name that never beat is SUPERSEDED, so two machines never share one id.
+  - A refusal that is the caller's mistake (wrong device for a device-bound code, a taken or
+    unusable name) does NOT burn the code. Used/expired/revoked → 410 in the hub's words.
+  - **Only UNKNOWN codes are rate-limited, fleet-wide** (`enrollFailLimited`, 30/min → 429); a
+    live code always redeems. Never key it per client: behind Cloudflare + the ingress every public
+    caller shares one forwarding hop, so a per-client bucket let anyone lock out all enrollment.
+  - **A name any beaten identity answers to is refused** — its home, its ORIGIN (a renamed host
+    keeps the id minted for its old name, and `issueAgentUid` would hand that id back) or a former
+    name — and so is a revoked tombstone's origin (minting there deleted it, un-retiring the old
+    name token, XERK-2383). Only Remove host's `released` frees a name.
+  - **A code always mints a FRESH identity** — never one that has beaten. A released identity keeps
+    an `origin` that differs from its last home (renamed, then removed), so `identityByOrigin` would
+    hand the old machine's live id to the new one; redemption strips that origin first, and refuses
+    if `issueAgentUid` still returns a used id.
+  - `owner` records the minting principal (`requestPrincipal`: `user:<id>` + `tenantId`, else its
+    kind, e.g. `breakglass`) for the tenancy epic
+    (XERK-2529) to bind the host to a tenant. **Recorded, not enforced.**
+  - Agent: `hub-agent.py --enroll` with `TURMA_ENROLL_CODE` in the ENV (never argv) runs
+    `enroll_with_code`, which writes only an identity token. Front ends: `turma-agentctl enroll
+    --code`, `turma-agentctl.ps1 enroll -Code`, `install.sh --url --enroll-code`, `install.ps1 -Url
+    -EnrollCode` (the installers call the manager directly, before the service starts). Those front
+    ends take the code on their OWN argv (single-use, so accepted); only the manager's is clean.
+  - The installers' URL check is a character WHITELIST over the whole value (a line-wise grep let
+    a newline add lines to the sourced env file).
+  - `--agent-token <host>` stays the break-glass path; master bootstrap still works until strict.
+  - Tests: the `XERK-2531:` cases in `server.test.js` and `dashboard-addhost.test.js`; the
+    `enroll_with_code` cases in `TestSetToken`; the enroll cases in `test_turma_agentctl.sh`,
+    `test_turma_agentctl_ps1.ps1`, `test_install_ps1.ps1`.

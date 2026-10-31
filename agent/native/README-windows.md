@@ -145,6 +145,9 @@ Moving a host from the shared master onto its own derived token (XERK-268/578) i
   command tunnel; the agent writes it here atomically and does a session-preserving
   restart to adopt it. The chip clears when it beats back bound — that IS the
   verification (a bound host shows no chip).
+- **A brand-new host** — dashboard → **+ Add host** mints a one-time code and shows
+  the command: `& ([scriptblock]::Create((irm …/bootstrap.ps1))) -Url <hub> -EnrollCode <code>`.
+  An installed host takes `turma-agentctl.ps1 enroll -Code <code>`.
 - **On the host** — `turma-agentctl.ps1 enroll`: fetches this host's derived token
   from the hub (authenticated with the current token), persists it, and restarts.
   Idempotent; refuses to write a token for the wrong `DEVICE_NAME`.

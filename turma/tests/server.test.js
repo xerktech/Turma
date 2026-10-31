@@ -20145,6 +20145,220 @@ test("XERK-578: self-enroll self-closes under TURMA_AGENT_STRICT", () => {
   assert.equal(again.body.token, own.body.token);
 });
 
+// ---- XERK-2531: one-time enrollment codes -----------------------------------
+
+const forget2531 = (...hosts) => {
+  for (const h of hosts) delete agents[h];
+  const ids = hub.agentIdentities();
+  for (const [u, e] of Object.entries(ids)) if (hosts.includes(e.home) || hosts.includes(e.origin)) delete ids[u];
+  for (const k of Object.keys(hub.enrollCodes())) delete hub.enrollCodes()[k];
+  hub.enrollFails.start = 0; hub.enrollFails.n = 0;
+};
+
+test("XERK-2531: a code is single-use and trades for the host's identity token", async () => {
+  forget2531("enr-a");
+  const minted = await request("POST", "/api/enroll-codes", { headers: userHeaders, body: {} });
+  assert.equal(minted.status, 200, JSON.stringify(minted.body));
+  const code = minted.body.code;
+  assert.match(code, /^te-[0-9a-f]{32}$/);
+  // Stored only hashed: the plain code is nowhere in the record or the listing.
+  assert.ok(!JSON.stringify(hub.enrollCodes()).includes(code.slice(3)));
+  const list = await request("GET", "/api/enroll-codes", { headers: userHeaders });
+  assert.equal(list.status, 200);
+  assert.ok(!list.raw.includes(code.slice(3)));
+  assert.equal(list.body.codes[0].state, "live");
+  assert.match(list.body.codes[0].owner, /^(breakglass|user:)/); // the minting principal is recorded
+  // Redeemed WITHOUT any credential (the route is exempt from the login gate).
+  const r = await request("POST", "/api/agent/enroll", { body: { code, device: "enr-a" } });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.host, "enr-a");
+  const uid = tokenUid(r.body.token);
+  assert.ok(uid);
+  assert.equal(hostOfUid(uid), "enr-a");
+  // The token beats as that host.
+  const beat = await request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${r.body.token}`, "content-type": "application/json" },
+    body: { device: "enr-a", sessions: [] },
+  });
+  assert.equal(beat.status, 200);
+  // Replay: refused, clearly, and naming who used it.
+  const replay = await request("POST", "/api/agent/enroll", { body: { code, device: "enr-b" } });
+  assert.equal(replay.status, 410);
+  assert.match(replay.body.error, /already used \(by enr-a\)/);
+  const after = await request("GET", "/api/enroll-codes", { headers: userHeaders });
+  assert.equal(after.body.codes[0].state, "used");
+  assert.equal(after.body.codes[0].usedBy, "enr-a");
+  forget2531("enr-a");
+});
+
+test("XERK-2531: minting and listing need the operator login", async () => {
+  forget2531();
+  assert.equal((await request("POST", "/api/enroll-codes", { body: {} })).status, 401);
+  assert.equal((await request("GET", "/api/enroll-codes")).status, 401);
+  // An agent token is not an operator.
+  assert.equal((await request("POST", "/api/enroll-codes", { headers: agentHeaders, body: {} })).status, 401);
+});
+
+test("XERK-2531: an expired or revoked code is refused and never consumed", () => {
+  forget2531("enr-x");
+  const now = Date.now();
+  const m = hub.mintEnrollCode("local:op", "", now);
+  assert.equal(m.status, 200);
+  const late = hub.consumeEnrollCode(m.body.code, "enr-x", now + hub.ENROLL_CODE_TTL_MS + 1);
+  assert.equal(late.status, 410);
+  assert.match(late.body.error, /expired/);
+  const m2 = hub.mintEnrollCode("local:op", "", now);
+  assert.equal(hub.revokeEnrollCode(m2.body.enrollCode.id, now).status, 200);
+  assert.equal(hub.revokeEnrollCode(m2.body.enrollCode.id, now).status, 409); // already revoked
+  const rev = hub.consumeEnrollCode(m2.body.code, "enr-x", now);
+  assert.equal(rev.status, 410);
+  assert.match(rev.body.error, /revoked/);
+  assert.equal(hub.consumeEnrollCode("te-" + "0".repeat(32), "enr-x", now).status, 401);
+  assert.equal(hub.consumeEnrollCode("nope", "enr-x", now).status, 400);
+  assert.equal(hub.revokeEnrollCode("0000000000000000", now).status, 404);
+  assert.ok(!hostOfUid(Object.keys(hub.agentIdentities()).find((u) => hub.agentIdentities()[u].home === "enr-x")));
+  forget2531("enr-x");
+});
+
+test("XERK-2531: a code bound to a device refuses another, without burning it", () => {
+  forget2531("enr-d", "enr-e");
+  const m = hub.mintEnrollCode("local:op", "enr-d");
+  assert.equal(m.status, 200);
+  assert.equal(m.body.enrollCode.device, "enr-d");
+  const wrong = hub.consumeEnrollCode(m.body.code, "enr-e");
+  assert.equal(wrong.status, 403);
+  assert.match(wrong.body.error, /for enr-d, not enr-e/);
+  // Not burned: the right name still redeems it.
+  const right = hub.consumeEnrollCode(m.body.code, "enr-d");
+  assert.equal(right.status, 200);
+  assert.equal(right.body.host, "enr-d");
+  forget2531("enr-d", "enr-e");
+});
+
+test("XERK-2531: a code never takes a name another host holds or an unusable one", async () => {
+  forget2531("enr-held");
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: "enr-held", sessions: [] } });
+  // Refused at mint for a named code...
+  assert.equal(hub.mintEnrollCode("local:op", "ENR-HELD").status, 409);
+  // ...and at redemption for an unbound one, case-folded, without burning it.
+  const m = hub.mintEnrollCode("local:op", "");
+  const taken = hub.consumeEnrollCode(m.body.code, "Enr-Held");
+  assert.equal(taken.status, 409);
+  assert.match(taken.body.error, /already registered/);
+  assert.equal(hub.consumeEnrollCode(m.body.code, "..").status, 400);
+  assert.equal(hub.consumeEnrollCode(m.body.code, "").status, 400);
+  // Removing the host releases the name; the same code now works.
+  delete agents["enr-held"];
+  assert.equal(hub.consumeEnrollCode(m.body.code, "enr-held").status, 200);
+  forget2531("enr-held");
+});
+
+test("XERK-2531: a fresh code for a name supersedes an identity that never beat", () => {
+  forget2531("enr-s");
+  const first = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-s");
+  const second = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-s");
+  assert.equal(second.status, 200);
+  assert.notEqual(tokenUid(first.body.token), tokenUid(second.body.token));
+  assert.equal(hostOfUid(tokenUid(first.body.token)), null); // never two machines on one id
+  forget2531("enr-s");
+});
+
+test("XERK-2531: a renamed-then-removed host's old name gets a FRESH identity, not the old machine's", async () => {
+  forget2531("enr-ra", "enr-rb");
+  const old = enrollUid("enr-ra");
+  const beat = (tok, device) => request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: { device, sessions: [] } });
+  assert.equal((await beat(old, "enr-ra")).status, 200);
+  quiet("enr-ra");
+  assert.equal((await beat(old, "enr-rb")).status, 200); // renamed to enr-rb
+  assert.equal((await request("DELETE", "/api/agents/enr-rb", { headers: userHeaders })).status, 200);
+  const r = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-ra");
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.notEqual(r.body.token, old);
+  assert.notEqual(tokenUid(r.body.token), tokenUid(old));
+  assert.equal((await beat(r.body.token, "enr-ra")).status, 200); // the reinstall beats under its name
+  forget2531("enr-ra", "enr-rb");
+});
+
+test("XERK-2531: unknown codes are rate-limited, and a flood never blocks a real code", async () => {
+  forget2531("enr-rl");
+  const statuses = [];
+  for (let i = 0; i < 32; i++) {
+    // A different forwarding hop every time: the limit must not be per client.
+    const r = await request("POST", "/api/agent/enroll", {
+      headers: { "x-forwarded-for": `10.0.0.${i}` },
+      body: { code: "te-" + "1".repeat(32), device: "x" },
+    });
+    statuses.push(r.status);
+  }
+  assert.deepEqual(statuses.slice(0, 30), Array(30).fill(401));
+  assert.equal(statuses[30], 429);
+  // A valid code still redeems while junk is being refused.
+  const code = hub.mintEnrollCode("local:op", "").body.code;
+  const ok = await request("POST", "/api/agent/enroll", { body: { code, device: "enr-rl" } });
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+  forget2531("enr-rl");
+});
+
+test("XERK-2531: a code never takes a renamed host's old name or a revoked tombstone's", () => {
+  forget2531("enr-alpha", "enr-beta");
+  const ids = hub.agentIdentities();
+  // A renamed agent: minted for alpha, beats as beta.
+  ids["a".repeat(32)] = { origin: "enr-alpha", home: "enr-beta", at: 1, used: true, names: ["enr-alpha"] };
+  const m = hub.mintEnrollCode("local:op", "");
+  const r = hub.consumeEnrollCode(m.body.code, "ENR-ALPHA");
+  assert.equal(r.status, 409);
+  assert.match(r.body.error, /earlier name of enr-beta/);
+  assert.equal(hub.mintEnrollCode("local:op", "enr-alpha").status, 409);
+  // Its current name is held too, with no record on this replica.
+  assert.equal(hub.consumeEnrollCode(m.body.code, "enr-beta").status, 409);
+  // A revoked tombstone keeps its origin name retired: redeeming must not delete it.
+  delete ids["a".repeat(32)];
+  ids["b".repeat(32)] = { origin: "enr-alpha", home: "enr-beta", at: 1, used: true, revoked: true };
+  const t = hub.consumeEnrollCode(m.body.code, "enr-alpha");
+  assert.equal(t.status, 409);
+  assert.ok(ids["b".repeat(32)], "the tombstone survives");
+  // Removed AND revoked: the tombstone still refuses (released must not skip it).
+  ids["b".repeat(32)].released = true;
+  assert.equal(hub.consumeEnrollCode(m.body.code, "enr-alpha").status, 409);
+  assert.ok(ids["b".repeat(32)], "the released tombstone survives");
+  delete ids["b".repeat(32)].released;
+  // The revoked branch alone (no `used`) still refuses, naming the real release.
+  ids["b".repeat(32)].used = false;
+  const t2 = hub.consumeEnrollCode(m.body.code, "enr-alpha");
+  assert.equal(t2.status, 409);
+  assert.match(t2.body.error, /revoked — release the name first \(DELETE \/api\/agents\/enr-alpha\)/);
+  // A released home (Remove host) is free again.
+  delete ids["b".repeat(32)];
+  ids["c".repeat(32)] = { home: "enr-alpha", at: 1, used: true, released: true };
+  const free = hub.consumeEnrollCode(m.body.code, "enr-alpha");
+  assert.equal(free.status, 200);
+  assert.notEqual(tokenUid(free.body.token), "c".repeat(32));
+  forget2531("enr-alpha", "enr-beta");
+});
+
+test("XERK-2531: the live-code cap and the store whitelist", () => {
+  forget2531();
+  const now = Date.now();
+  for (let i = 0; i < 20; i++) assert.equal(hub.mintEnrollCode("local:op", "", now).status, 200);
+  const full = hub.mintEnrollCode("local:op", "", now);
+  assert.equal(full.status, 409);
+  assert.match(full.body.error, /still unused/);
+  // Coerce is a fixed point and drops junk.
+  const live = hub.enrollCodes();
+  assert.equal(JSON.stringify(hub.coerceEnrollCodes(JSON.parse(JSON.stringify(live)))), JSON.stringify(live));
+  assert.deepEqual(Object.keys(hub.coerceEnrollCodes({ bad: {}, "0123456789abcdef": { hash: "x" } })), []);
+  forget2531();
+});
+
+test("XERK-2531: code enrollment works under TURMA_AGENT_STRICT", () => {
+  const strict = freshServerModule((env) => { env.TURMA_AGENT_STRICT = "1"; });
+  const m = strict.mintEnrollCode("local:op", "");
+  const r = strict.consumeEnrollCode(m.body.code, "enr-strict");
+  assert.equal(r.status, 200);
+  assert.ok(strict.tokenUid(r.body.token));
+});
+
 // ---- XERK-2381: an agent keeps its identity across a host rename ----------
 
 // Mint `host`'s identity the way an agent does: enroll on its name token.

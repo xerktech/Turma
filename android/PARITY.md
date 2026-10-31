@@ -732,6 +732,12 @@ Many of these need Android's wire model (`model/Models.kt`) to decode fields the
 those are marked `[MODEL]`.
 
 ### Dashboard (`index.html` → `FleetScreen`/`FleetDialogs`)
+
+- **Add host dialog (XERK-2531) — web only.** The dashboard's "+ Add host" mints a one-time
+  enrollment code (`POST /api/enroll-codes`), shows the copy-paste install/enroll commands, and
+  lists/revokes recent codes. Android has no dialog yet; onboarding a host is a desk task (the
+  commands are pasted into a terminal), and the hub routes need no client to work. No new
+  `/api/agents` key, so nothing for Android to decode.
 - ~~P0 Session card detail~~ / ~~P0 queued/stopping + Cancel + optimistic pending~~ — done (XERK-78,
   see Done above). Still open from that pass: the spawn "ghost card" (a pending spawn shows only as
   the composer's toast today) — P2.

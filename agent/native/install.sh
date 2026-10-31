@@ -37,6 +37,8 @@ DO=install
 INSTALL_DEPS=yes
 AUTOSTART=no
 WITH_DSH=no
+HUB_URL=""
+ENROLL_CODE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --verify)          DO=verify ;;
@@ -47,8 +49,10 @@ while [ $# -gt 0 ]; do
     --autostart)       AUTOSTART=yes ;;
     --with-dsh)        WITH_DSH=yes ;;
     --prefix)          shift; PREFIX="$1" ;;
+    --url)             shift; HUB_URL="${1:-}" ;;
+    --enroll-code)     shift; ENROLL_CODE="${1:-}" ;;
     -h|--help)
-      echo "usage: install.sh [--prefix DIR] [--no-install-deps] [--autostart] [--with-dsh] [--verify] [--uninstall] [--protect] [--unprotect]"
+      echo "usage: install.sh [--prefix DIR] [--no-install-deps] [--autostart] [--with-dsh] [--url HUB_URL --enroll-code CODE] [--verify] [--uninstall] [--protect] [--unprotect]"
       exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -374,6 +378,52 @@ install_config() {
   chmod 600 "$CFG" 2>/dev/null || true   # holds a bearer token
 }
 
+# One-command onboarding (XERK-2531): `--url <hub> --enroll-code <code>` points
+# the config at the hub and trades the dashboard's one-time code for this host's
+# own agent token BEFORE the service first starts, so a new host needs no token
+# pasted and no hub shell. The URL is written UNQUOTED into a file the launcher
+# sources, so only a plain http(s) URL is accepted. The code goes to the manager
+# in its environment, never its argv. A refused code fails the install loudly
+# (it is single-use: mint a new one and re-run).
+configure_enrollment() {
+  if [ -n "$HUB_URL" ]; then
+    case "$HUB_URL" in
+      http://*|https://*) ;;
+      *) echo "[install] ERROR: --url must be an http(s) URL" >&2; exit 2 ;;
+    esac
+    # A WHITELIST, matched by `case` on the whole value: a line-wise grep let a
+    # newline through, writing extra KEY=value lines into the sourced file.
+    case "$HUB_URL" in
+      *[!A-Za-z0-9._~:/%+=,@-]*)
+        echo "[install] ERROR: --url holds characters a sourced env file cannot carry" >&2; exit 2 ;;
+    esac
+    HUB_URL="${HUB_URL%/}"
+    if grep -q '^[[:space:]]*\(export[[:space:]]\+\)\?TURMA_URL=' "$CFG"; then
+      tmp="$CFG.$$.tmp"
+      awk -v u="$HUB_URL" '/^[[:space:]]*(export[[:space:]]+)?TURMA_URL=/ { if (!d) print "TURMA_URL=" u; d=1; next } { print }' "$CFG" >"$tmp"
+      chmod 600 "$tmp"; mv -f "$tmp" "$CFG"
+    else
+      printf 'TURMA_URL=%s\n' "$HUB_URL" >>"$CFG"
+    fi
+    info "TURMA_URL set to $HUB_URL in $CFG"
+  fi
+  [ -n "$ENROLL_CODE" ] || return 0
+  info "enrolling this host with the one-time code"
+  if ! (
+    set -a
+    # shellcheck disable=SC1090
+    . "$CFG"
+    set +a
+    export TURMA_AGENT_ENV="$CFG"
+    export DEVICE_NAME="${DEVICE_NAME:-$(hostname)}"
+    TURMA_ENROLL_CODE="$ENROLL_CODE" python3 "$PREFIX/hub-agent.py" --enroll
+  ); then
+    echo "[install] ERROR: enrollment failed (see above). Codes are single-use and expire —" >&2
+    echo "[install]        mint a new one in the dashboard's Add host dialog and re-run." >&2
+    exit 1
+  fi
+}
+
 # A preserved (non-Turma) tmux.conf is the one silent parity gap vs the
 # container, which always ships ours at /etc/tmux.conf: without the bundled
 # settings the web terminal's truecolor flattens AND every copy made in it is
@@ -614,6 +664,7 @@ fi
 install_files
 if dsh_wanted; then install_dsh_files; fi
 install_config
+configure_enrollment
 install_tmux_conf
 install_service
 
@@ -622,9 +673,13 @@ info "preflight:"
 "$PREFIX/bin/turma-agent" --preflight || true
 echo
 info "Done. Next steps:"
-info "  1) Edit $CFG — set TURMA_URL and TURMA_TOKEN (the hub's shared token to"
-info "     start; then roll onto this host's own token from the dashboard, with"
-info "     'turma-agentctl enroll', or by setting TURMA_AGENT_SELF_ENROLL=1)."
+if [ -n "$ENROLL_CODE" ]; then
+  info "  1) Enrolled: $CFG holds this host's own agent token."
+else
+  info "  1) Enroll: dashboard → Add host gives a one-time code; run"
+  info "     'turma-agentctl enroll --code <code>' (after setting TURMA_URL in $CFG)."
+  info "     (Or set TURMA_URL + TURMA_TOKEN there by hand, then roll from the dashboard.)"
+fi
 info "  2) Log in to Claude on this host if you haven't:  claude /login"
 info "  3) (optional) gh auth login   — for private git and 'gh pr create'."
 if systemd_user_ok; then
