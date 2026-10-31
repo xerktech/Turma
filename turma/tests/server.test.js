@@ -20261,6 +20261,11 @@ test("XERK-2531: a code never takes a renamed host's old name or a revoked tombs
   const t = hub.consumeEnrollCode(m.body.code, "enr-alpha");
   assert.equal(t.status, 409);
   assert.ok(ids["b".repeat(32)], "the tombstone survives");
+  // Removed AND revoked: the tombstone still refuses (released must not skip it).
+  ids["b".repeat(32)].released = true;
+  assert.equal(hub.consumeEnrollCode(m.body.code, "enr-alpha").status, 409);
+  assert.ok(ids["b".repeat(32)], "the released tombstone survives");
+  delete ids["b".repeat(32)].released;
   // The revoked branch alone (no `used`) still refuses, naming the real release.
   ids["b".repeat(32)].used = false;
   const t2 = hub.consumeEnrollCode(m.body.code, "enr-alpha");

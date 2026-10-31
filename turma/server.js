@@ -13808,13 +13808,16 @@ function enrollNameRefusal(device) {
   // and minting there would delete it (XERK-2383). Remove host releases a home
   // name; an earlier name of a live agent stays its own.
   for (const e of Object.values(agentIdentities)) {
-    if (!e || e.released) continue;
+    if (!e) continue;
     const held = [e.home, e.origin, ...(Array.isArray(e.names) ? e.names : [])]
       .filter(Boolean).some((n) => lowerName(n) === want);
     if (!held) continue;
+    // Revoked BEFORE released: a removed-then-revoked host is both, and only its
+    // origin name's own release may drop the tombstone.
     if (e.revoked) {
       return { status: 409, error: `${device} belonged to an agent whose token was revoked — release the name first (DELETE /api/agents/${device})` };
     }
+    if (e.released) continue;
     if (e.used) {
       return { status: 409, error: e.home && lowerName(e.home) !== want
         ? `${device} is an earlier name of ${e.home} — that agent still owns it`
