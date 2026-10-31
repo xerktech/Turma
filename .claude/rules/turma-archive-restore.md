@@ -45,6 +45,9 @@ reason the raw layer exists in a form nothing else reads (the rendered entries a
     `status:"running"` for `PRUNE_AFTER_MS` (7 days), so gating on it refuses restores naming a host
     the operator can't kill it on. Fixing only admission is worse than not fixing it (spends a slot
     and a pack, then dies a tick later).
+  - **Only hosts of the TARGET's tenant get a veto**, at both points (rollup XERK-2593): a
+    transcript id is agent-asserted, so another tenant's host could otherwise block the restore and
+    have its tenant-keyed name served in the refusal.
   - The re-check skips **the migration's own session**, never the whole target host — a local resume
     on the target between admission and its next beat must not get archived bytes written over it.
 - **The recorded worktree is checked against the ROW, never guessed from the path** — the hub doesn't

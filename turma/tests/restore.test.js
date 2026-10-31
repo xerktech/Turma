@@ -341,6 +341,24 @@ test("restore: one conversation, one session", async () => {
   await beat("k8x");
 });
 
+test("rollup XERK-2593: another tenant's host running the same transcript id neither blocks nor is named", async () => {
+  const tid = "eeeeeeee-2593-2222-3333-444444444444";
+  seedArchive(tid);
+  const other = `k8x@${"d".repeat(32)}`;
+  agents[other] = { device: "k8x", lastSeen: Date.now(), repos: [{ name: "Widget" }],
+    sessions: [{ id: "x-1", status: "running", repo: "Widget", transcriptId: tid }] };
+  try {
+    await beat("k8x");
+    const r = await request("POST", `/api/archive/${tid}/restore`,
+      { headers: userHeaders, body: { host: "k8x" } });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.doesNotMatch(JSON.stringify(r.body), /d{32}/);
+    const m = migrations.get(r.body.migrationId);
+    advanceMigrations();
+    assert.notEqual(m.phase, "failed", m.error || "");
+  } finally { delete agents[other]; releaseInFlight(); }
+});
+
 test("restore: a double click does not fan out into two restores", async () => {
   const tid = "ffffffff-1111-2222-3333-444444444444";
   seedArchive(tid);

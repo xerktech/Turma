@@ -7945,22 +7945,40 @@ function forwardBodyCaps() {
 function sseDeliverLocal(event, dataObj, scope) {
   if (!sseClients.size) return;
   const only = scope && typeof scope.policyTenant === "string" ? scope.policyTenant : null;
-  const frames = new Map(); // view signature -> frame ("" = nothing to send)
+  const snapshot = routeScope.SNAPSHOT_EVENTS.has(event);
+  const frames = new Map(); // view signature -> {frame ("" = nothing to send), digest}
   for (const res of sseClients) {
     const p = ssePrincipals.has(res) ? ssePrincipals.get(res) : null;
     if (!p) continue; // a stream nobody opened (default-deny)
     if (only !== null && ledgerTenantOf(p) !== only) continue;
     const sig = tenantViewSig(p);
-    let frame = frames.get(sig);
-    if (frame === undefined) {
+    let f = frames.get(sig);
+    if (f === undefined) {
       const data = routeScope.scopeEvent(event, dataObj, tenantViewFor(p));
-      frame = data === undefined ? "" : `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-      frames.set(sig, frame);
+      const frame = data === undefined ? "" : `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+      f = { frame, digest: snapshot && frame
+        ? crypto.createHash("sha256").update(frame).digest("base64") : null };
+      frames.set(sig, f);
     }
-    if (!frame) continue;
-    try { res.write(frame); } catch { sseClients.delete(res); }
+    if (!f.frame) continue;
+    // A whole-map event whose slice for THIS stream is unchanged since the last frame
+    // it received is skipped (rollup XERK-2593). Per stream, never per view: a stream
+    // that connected later never received the earlier frame, so it must get this one.
+    let last = null;
+    if (f.digest) {
+      last = sseLastSent.get(res);
+      if (last && last.get(event) === f.digest) continue;
+    }
+    try { res.write(f.frame); } catch { sseClients.delete(res); continue; }
+    if (f.digest) {
+      if (!last) sseLastSent.set(res, (last = new Map()));
+      last.set(event, f.digest);
+    }
   }
 }
+// Per stream: SNAPSHOT_EVENTS event -> digest of the last frame written to it. A
+// WeakMap, so a closed stream's entry goes with it; bounded by the event set.
+const sseLastSent = new WeakMap();
 // The principal each SSE client connected as (XERK-2550), for scoped frames.
 const ssePrincipals = new WeakMap();
 
@@ -8916,6 +8934,10 @@ function advanceMigrations() {
         // the operator has now also spent an in-flight slot, a spool file and a
         // pack, and the agent 404s the download it was told to make.
         if (Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+        // Only the target's own tenant (rollup XERK-2593): transcript ids are
+        // agent-asserted, so another tenant's host reporting this id is another
+        // machine's file — it must neither kill this restore nor learn of it.
+        if (tenantOfKey(host) !== tenantOfKey(m.targetHost)) continue;
         const live = (a.sessions || []).find(
           (s) => s.transcriptId === m.transcriptId && s.status === "running" &&
                  // Never the migration's OWN imported session. Belt-and-braces
@@ -9903,9 +9925,10 @@ function normalizeTokenRoll(a) {
 // the session's pinned `agentType`. Only claude/qwen reach the degraded path (a
 // dsh session resolves off its live raw log before this), so a "dsh" answer here
 // would be a stale record and is ignored; anything else defaults to claude.
-function liveRuntimeForTranscript(transcriptId) {
+function liveRuntimeForTranscript(transcriptId, p) {
   if (!transcriptId) return "claude";
-  for (const a of Object.values(agents)) {
+  for (const [key, a] of Object.entries(agents)) {
+    if (p !== undefined && !principalMayDriveHost(p, key)) continue;
     for (const s of a.sessions || []) {
       if (s.transcriptId === transcriptId) {
         return s.agentType === "qwen" ? "qwen" : "claude";
@@ -9924,11 +9947,15 @@ function liveRuntimeForTranscript(transcriptId) {
 // endpoint dispatches off archived data rather than a live lookup). `runtime` is
 // the session's pinned agentType, so the reduced trajectory and the degraded
 // fallback agree on which runtime they describe.
-function liveSessionForTranscript(transcriptId) {
+// `p` (rollup XERK-2593): only a host that principal may drive — two tenants'
+// agents reporting one transcript id must not shadow each other (the first host
+// found answered for both, so the second tenant's own live trajectory 404'd).
+function liveSessionForTranscript(transcriptId, p) {
   if (!transcriptId) return null;
   const now = Date.now();
   for (const [key, a] of Object.entries(agents)) {
     if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    if (p !== undefined && !principalMayDriveHost(p, key)) continue;
     for (const s of a.sessions || []) {
       if (s.transcriptId !== transcriptId || s.status !== "running") continue;
       if (s.agentType === "dsh") return null; // resolved off its live raw log
@@ -11227,7 +11254,7 @@ function tenantViewSig(p) {
 function transcriptVisible(p, tid) {
   const row = archive.sessionRow(tid);
   if (row && typeof row.host === "string") return principalMayDriveHost(p, row.host);
-  const live = liveSessionForTranscript(tid);
+  const live = liveSessionForTranscript(tid, p);
   if (live && live.key) return principalMayDriveHost(p, live.key);
   const r = archiveRefusalFor(tid);
   if (r && typeof r.host === "string") return principalMayDriveHost(p, r.host);
@@ -23329,6 +23356,9 @@ const server = http.createServer(async (req, res) => {
         // the restore with "kill it there first" naming a host the operator
         // cannot reach — on exactly the population this feature exists for.
         if (Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+        // The target's tenant only (rollup XERK-2593): another tenant's host
+        // asserting this id would block the restore AND be named to the caller.
+        if (tenantOfKey(host) !== tenantOfKey(target)) continue;
         const live = (a.sessions || []).find(
           (x) => x.transcriptId === transcriptId && x.status === "running");
         if (live)
@@ -23457,7 +23487,8 @@ const server = http.createServer(async (req, res) => {
       // Live full-fidelity for a RUNNING claude/qwen session (XERK-716): reduce
       // the agent's on-demand raw tail if it is cached, else request it and serve
       // the degraded rendered layer now (the client re-polls for the full one).
-      const live = liveSessionForTranscript(transcriptId);
+      const caller = requestPrincipal(req);
+      const live = liveSessionForTranscript(transcriptId, caller);
       if (live && live.agent.trajectory && live.agent.trajectory.available === true) {
         const tail = live.agent.trajectoryTails
           ? live.agent.trajectoryTails[live.session.id] : null;
@@ -23471,7 +23502,7 @@ const server = http.createServer(async (req, res) => {
         if (degraded) return json(res, 200, pending ? { ...degraded, pending: true } : degraded);
       }
       const degraded = archive.renderedTrajectory(
-        transcriptId, liveRuntimeForTranscript(transcriptId));
+        transcriptId, liveRuntimeForTranscript(transcriptId, caller));
       if (degraded) return json(res, 200, degraded);
       const r = archiveRefusalFor(transcriptId);
       return json(res, 404, withIngestClosed(r
@@ -26363,7 +26394,7 @@ if (process.env.TURMA_TEST) {
     normalizeCloseTicket,
     autoCloseMergedMessage,
     ingestTrajectoryTails,
-    liveSessionForTranscript,
+    liveSessionForTranscript, liveRuntimeForTranscript,
     normalizeDefaultRuntime,
     qwenAvailable,
     // The fleet-wide qwen kill switch (XERK-504) mirrors the dsh one above: the

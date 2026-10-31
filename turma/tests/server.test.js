@@ -21177,6 +21177,90 @@ test("XERK-2534: SSE frames reach only streams whose principal may see them", as
   }
 });
 
+test("rollup XERK-2593: a whole-map SSE frame unchanged for a stream is not sent to it again", async () => {
+  const T = tenants2533();
+  const mk = (p) => { const frames = []; const res = { write: (f) => frames.push(f) };
+    hub.ssePrincipals.set(res, p); hub.sseClients.add(res); return { res, frames }; };
+  const pa = hub.principalFromToken(T.A.h.cookie.slice("hub_session=".length));
+  const pb = hub.principalFromToken(T.B.h.cookie.slice("hub_session=".length));
+  const A = mk(pa), B = mk(pb);
+  let L = null;
+  try {
+    const { ka, sa, sb } = await fleet2534(T);
+    for (const c of [A, B]) c.frames.length = 0;
+    hub.sseBroadcast("orgColors", { [sa]: { slot: 3 } });
+    // B's org changes: A's slice is unchanged, so A hears nothing (no activity timing).
+    hub.sseBroadcast("orgColors", { [sa]: { slot: 3 }, [sb]: { slot: 1 } });
+    hub.sseBroadcast("orgColors", { [sa]: { slot: 3 }, [sb]: { slot: 2 } });
+    assert.equal(A.frames.length, 1, "A got its slice once");
+    assert.equal(B.frames.length, 3, "B's slice changed every time");
+    // A real change to A's slice is sent; a stream that connects later gets the current slice.
+    L = mk(pa);
+    hub.sseBroadcast("orgColors", { [sa]: { slot: 3 }, [sb]: { slot: 4 } });
+    assert.equal(L.frames.length, 1, "a later stream never received it, so it gets it");
+    assert.equal(A.frames.length, 1);
+    hub.sseBroadcast("orgColors", { [sa]: { slot: 5 }, [sb]: { slot: 4 } });
+    assert.equal(A.frames.length, 2);
+    assert.match(A.frames[1], /"slot":5/);
+    // Per-host events are never deduped: an identical agent frame still goes out.
+    hub.sseBroadcast("agent", { key: ka, n: 1 });
+    hub.sseBroadcast("agent", { key: ka, n: 1 });
+    assert.equal(A.frames.filter((f) => f.startsWith("event: agent")).length, 2);
+  } finally {
+    for (const c of [A, B, L]) if (c) hub.sseClients.delete(c.res);
+    forget2534(T); T.restore();
+  }
+});
+
+test("rollup XERK-2593: two tenants reporting one live transcript id each resolve their own host", async () => {
+  const T = tenants2533();
+  try {
+    const { ka, kb } = await fleet2534(T);
+    const pa = hub.principalFromToken(T.A.h.cookie.slice("hub_session=".length));
+    const pb = hub.principalFromToken(T.B.h.cookie.slice("hub_session=".length));
+    // B's agent reports the same transcript id A's session has (ids are agent-asserted).
+    hub.agents[kb].sessions[0].transcriptId = "tid-a2534.example";
+    hub.agents[kb].sessions[0].agentType = "qwen";
+    assert.equal(hub.liveSessionForTranscript("tid-a2534.example", pa).key, ka);
+    assert.equal(hub.liveSessionForTranscript("tid-a2534.example", pb).key, kb);
+    assert.equal(hub.transcriptVisible(pb, "tid-a2534.example"), true, "B's own live session is visible to B");
+    assert.equal(hub.transcriptVisible(pa, "tid-a2534.example"), true);
+    assert.equal(hub.liveSessionForTranscript("tid-a2534.example", OPERATOR), null, "operators see neither");
+    // The degraded runtime hint reads the caller's own session too.
+    assert.equal(hub.liveRuntimeForTranscript("tid-a2534.example", pb), "qwen");
+    assert.equal(hub.liveRuntimeForTranscript("tid-a2534.example", pa), "claude");
+  } finally { forget2534(T); T.restore(); }
+});
+
+test("rollup XERK-2593: GET /api/archive/<tid>/trajectory serves each tenant its OWN live session for a shared id", async () => {
+  const T = tenants2533();
+  try {
+    const { ta, tb } = await fleet2534(T);
+    const raw = (said) => [
+      '{"type":"user","timestamp":"2026-10-31T03:00:00Z","message":{"role":"user","content":"go"}}',
+      '{"type":"assistant","timestamp":"2026-10-31T03:00:05Z","message":{"role":"assistant","model":"m",' +
+        `"content":[{"type":"text","text":"${said}"}]}}`,
+    ].join("\n") + "\n";
+    // Both tenants' agents report one live transcript id, each with its own cached raw tail.
+    const live = (site, said) => ({ jira: { configured: true, available: true, siteKey: site, tickets: [] },
+      repos: [{ name: `repo-${site}` }], trajectory: { available: true },
+      sessions: [{ id: `s-${site}`, status: "running", transcriptId: "tid-shared-2593",
+        agentType: "claude", ttydPort: 7700 }],
+      trajectoryTailResults: [{ sessionId: `s-${site}`, text: raw(said), truncated: false }] });
+    assert.equal((await beat2533(ta, "t2534h", live("a2534.example", "A-content"))).status, 200);
+    assert.equal((await beat2533(tb, "t2534h", live("b2534.example", "B-content"))).status, 200);
+    const said = async (h) => {
+      const r = await request("GET", "/api/archive/tid-shared-2593/trajectory", { headers: h });
+      return [r.status, r.status === 200 ? JSON.stringify(r.body.turns) : null];
+    };
+    const [sa, ba] = await said(T.A.h), [sb, bb] = await said(T.B.h);
+    assert.equal(sa, 200); assert.equal(sb, 200);
+    assert.match(ba, /A-content/); assert.doesNotMatch(ba, /B-content/);
+    assert.match(bb, /B-content/); assert.doesNotMatch(bb, /A-content/);
+    assert.equal((await said(userHeaders))[0], 404, "the operators see neither tenant's session");
+  } finally { forget2534(T); T.restore(); }
+});
+
 test("XERK-2534: terminals, /live and ws-tokens are scoped to the caller's tenant", async () => {
   const T = tenants2533();
   try {
