@@ -56284,5 +56284,94 @@ class TestLockdownOneshotStdin(ManagerMixin, unittest.TestCase):
         self.assertEqual([n for n in os.listdir(ha.REGISTRY_DIR) if n.startswith("meeting-")], [])
 
 
+class TestOneshotShutdownAndTmpWrites(ManagerMixin, unittest.TestCase):
+    """XERK-2545: a manager restart kills its one-shot `claude -p` children's
+    process groups, and the savers' temp files are never written through a link."""
+
+    def test_shutdown_kills_a_running_oneshots_whole_group(self):
+        sm = self.make_manager()
+        pidfile = os.path.join(self.tmp, "grandchild.pid")
+        out = {}
+        t = threading.Thread(target=lambda: out.setdefault("r", sm._run_lockdown_oneshot(
+            ["sh", "-c", f"sleep 60 & echo $! > {pidfile}; wait"], "daily-brief-", 60, 100, "t")))
+        t.start()
+        deadline = time.time() + 10
+        while time.time() < deadline and not (sm._oneshot_procs and os.path.exists(pidfile)
+                                              and open(pidfile).read().strip()):
+            time.sleep(0.02)
+        grandchild = int(open(pidfile).read())
+        with mock.patch.object(sm, "_announce_updating"):
+            with self.assertRaises(SystemExit):
+                sm._handle_shutdown(ha.signal.SIGTERM, None)
+        t.join(10)
+        self.assertFalse(t.is_alive(), "the run returned once its child was killed")
+        self.assertIsNone(out["r"])
+        self.assertEqual(sm._oneshot_procs, set(), "a finished run forgets its child")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                with open(f"/proc/{grandchild}/stat") as f:
+                    if f.read().split(") ")[-1].startswith("Z"):
+                        break
+            except FileNotFoundError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("the one-shot's grandchild outlived the shutdown")
+
+    def test_a_shutdown_landing_inside_popen_still_kills_that_child(self):
+        sm = self.make_manager()
+        real_popen = ha.subprocess.Popen
+        killer = {}
+
+        def kill_like_shutdown():
+            # In production nothing runs after _kill_oneshots: _handle_shutdown
+            # raises SystemExit and the one-shot workers are daemon threads, so
+            # the child must already be launched and killed when this returns.
+            sm._kill_oneshots()
+            killer["at_return"] = killer.get("proc")
+
+        def slow_popen(*a, **kw):
+            killer["t"] = threading.Thread(target=kill_like_shutdown)
+            killer["t"].start()
+            time.sleep(0.2)              # the shutdown arrives mid-fork
+            proc = real_popen(*a, **kw)
+            killer["proc"] = proc
+            return proc
+        started = time.monotonic()
+        with mock.patch.object(ha.subprocess, "Popen", slow_popen):
+            out = sm._run_lockdown_oneshot(["sleep", "60"], "meeting-", 60, 100, "t")
+        killer["t"].join(5)
+        self.assertIsNone(out)
+        self.assertIsNotNone(killer.get("at_return"),
+                             "the shutdown waited for the in-flight launch before returning")
+        self.assertLess(time.monotonic() - started, 20, "the run ended with its killed child")
+        self.assertEqual(killer["proc"].wait(timeout=5), -ha.signal.SIGKILL,
+                         "the just-forked child was SIGKILLed, not left to finish")
+        # Once closing, no new one-shot starts at all: nothing is even forked,
+        # since a daemon worker forking after the manager exits is never killed.
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            self.assertIsNone(sm._run_lockdown_oneshot(["echo", "x"], "meeting-", 10, 100, "t"))
+        popen.assert_not_called()
+
+    def test_a_finished_oneshot_is_forgotten(self):
+        sm = self.make_manager()
+        self.assertEqual(sm._run_lockdown_oneshot(["echo", "hi"], "meeting-", 10, 100, "t"), "hi\n")
+        self.assertEqual(sm._oneshot_procs, set())
+        sm._kill_oneshots()   # nothing live: a no-op, never raises
+
+    def test_a_link_planted_at_a_savers_temp_name_is_not_written_through(self):
+        target = os.path.join(self.tmp, "victim")
+        with open(target, "w") as f:
+            f.write("keep")
+        tmp = os.path.join(self.tmp, "ledger.json.tmp")
+        os.symlink(target, tmp)
+        with ha._open_tmp_for_replace(tmp, encoding="utf-8") as f:
+            f.write("new")
+        self.assertEqual(open(target).read(), "keep", "the link's target is untouched")
+        self.assertFalse(os.path.islink(tmp))
+        self.assertEqual(open(tmp).read(), "new")
+
+
 if __name__ == "__main__":
     unittest.main()

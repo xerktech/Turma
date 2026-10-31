@@ -1390,7 +1390,7 @@ def _start_poke_listener():
     # onto a new port is picked up with no tunnel restart.
     try:
         tmp = POKE_PORT_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        with _open_tmp_for_replace(tmp, encoding="utf-8") as f:
             f.write(str(port))
         os.replace(tmp, POKE_PORT_FILE)
     except OSError as e:
@@ -1620,7 +1620,7 @@ def _publish_legacy_tmux():
     try:
         if _legacy_tmux:
             tmp = LEGACY_TMUX_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
+            with _open_tmp_for_replace(tmp, encoding="utf-8") as f:
                 f.write("".join(n + "\n" for n in sorted(_legacy_tmux)))
             os.replace(tmp, LEGACY_TMUX_FILE)
         elif os.path.exists(LEGACY_TMUX_FILE):
@@ -15319,6 +15319,10 @@ ATTENTION_HINTS_ON = os.environ.get("TURMA_ATTENTION_HINTS", "1").strip() != "0"
 ATTENTION_HINT_MODEL = (os.environ.get("TURMA_ATTENTION_HINT_MODEL", "haiku").strip()
                         or "haiku")
 ATTENTION_HINT_TIMEOUT_SEC = _env_int("TURMA_ATTENTION_HINT_TIMEOUT_SEC", 60, minimum=5)
+# How long a shutdown waits for a one-shot Popen already in flight to register
+# its child, so the child is killed with the rest (XERK-2545). A fork+exec.
+ONESHOT_LAUNCH_WAIT_SEC = 2.0
+
 # Every `_run_lockdown_oneshot` prefix (plus the meeting worker's), swept at
 # manager start: a manager killed mid-run never removes its scratch.
 ONESHOT_SCRATCH_PREFIXES = ("attention-hint-", "daily-brief-", "meeting-")
@@ -17919,6 +17923,27 @@ def _write_new_file(path, blob):
         except Exception:
             pass
         raise
+
+
+def _open_tmp_for_replace(tmp, encoding=None, newline=None):
+    """Open the temp file a saver fills and then os.replace()s over its target.
+
+    The savers write under ~/.turma (and a few other dirs a session can write),
+    so a plain open(tmp, "w") follows a symlink planted at the temp name and
+    writes through it. Instead: drop whatever entry sits at the name (unlink
+    removes a link itself, never its target), then CREATE the file with
+    O_EXCL|O_NOFOLLOW — a link planted between the two makes the open fail,
+    which every caller already treats as a failed (retried) save. Mode is left to
+    the umask, as open() did. Raises OSError like open()."""
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    # O_BINARY (Windows only): else the C runtime turns "\n" into "\r\n" under
+    # Python's own newline handling, and peers.tsv is byte-identical on every OS.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0), 0o666)
+    return os.fdopen(fd, "w", encoding=encoding, newline=newline)
 
 
 def _unique_upload_path(dirpath, name):
@@ -28117,6 +28142,13 @@ class SessionManager:
         # view is heartbeated).
         self.github = {"available": False, "login": None, "repos": []}
         self.clones = {}
+        # Live `_run_lockdown_oneshot` children (daily brief, meeting extraction,
+        # attention hint): each leads its own process group, so KillMode=process
+        # leaves it running past a restart. `_handle_shutdown` kills them (XERK-2545).
+        self._oneshot_procs = set()
+        self._oneshot_cond = threading.Condition()
+        self._oneshot_launching = 0      # Popen calls not yet registered
+        self._oneshot_closing = False    # set by _kill_oneshots: kill on register
         # Extra clone sources (XERK-155), keyed by source ("azure"/"gitlab"),
         # present only when that source's creds are configured. Each holds the
         # last GOOD listing (repos keep their internal cloneUrl; the payload
@@ -28348,7 +28380,7 @@ class SessionManager:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             for path, data in ((REGISTRY_PATH, self.registry), (CLOSED_PATH, self.closed)):
                 tmp = path + ".tmp"
-                with open(tmp, "w") as f:
+                with _open_tmp_for_replace(tmp) as f:
                     json.dump(data, f, indent=2)
                 os.replace(tmp, path)
         except OSError as e:
@@ -28368,7 +28400,7 @@ class SessionManager:
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = TRIAGE_LEDGER_PATH + ".tmp"
-            with open(tmp, "w") as f:
+            with _open_tmp_for_replace(tmp) as f:
                 json.dump(self.triage_ledger, f, indent=2)
             os.replace(tmp, TRIAGE_LEDGER_PATH)
         except OSError as e:
@@ -28648,7 +28680,7 @@ class SessionManager:
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = TICKET_TRIAGE_LEDGER_PATH + ".tmp"
-            with open(tmp, "w") as f:
+            with _open_tmp_for_replace(tmp) as f:
                 json.dump(self.ticket_triage_ledger, f, indent=2)
             os.replace(tmp, TICKET_TRIAGE_LEDGER_PATH)
         except OSError as e:
@@ -28673,7 +28705,7 @@ class SessionManager:
             while len(self.priority_writes) > PRIORITY_WRITE_LEDGER_MAX:
                 self.priority_writes.pop(next(iter(self.priority_writes)))
             tmp = PRIORITY_WRITE_LEDGER_PATH + ".tmp"
-            with open(tmp, "w") as f:
+            with _open_tmp_for_replace(tmp) as f:
                 json.dump(self.priority_writes, f, indent=2)
             os.replace(tmp, PRIORITY_WRITE_LEDGER_PATH)
         except OSError as e:
@@ -28698,7 +28730,7 @@ class SessionManager:
             while len(self.duplicate_links) > DUPLICATE_LINK_LEDGER_MAX:
                 self.duplicate_links.pop(next(iter(self.duplicate_links)))
             tmp = DUPLICATE_LINK_LEDGER_PATH + ".tmp"
-            with open(tmp, "w") as f:
+            with _open_tmp_for_replace(tmp) as f:
                 json.dump(self.duplicate_links, f, indent=2)
             os.replace(tmp, DUPLICATE_LINK_LEDGER_PATH)
         except OSError as e:
@@ -28731,7 +28763,7 @@ class SessionManager:
             while len(self.blocks_links) > BLOCKS_LINK_LEDGER_MAX:
                 self.blocks_links.pop(next(iter(self.blocks_links)))
             tmp = BLOCKS_LINK_LEDGER_PATH + ".tmp"
-            with open(tmp, "w") as f:
+            with _open_tmp_for_replace(tmp) as f:
                 json.dump(self.blocks_links, f, indent=2)
             os.replace(tmp, BLOCKS_LINK_LEDGER_PATH)
         except OSError as e:
@@ -29238,7 +29270,7 @@ class SessionManager:
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = USAGE_LEDGER_PATH + ".tmp"
-            with open(tmp, "w") as f:
+            with _open_tmp_for_replace(tmp) as f:
                 json.dump(self.usage_ledger, f, indent=2)
             os.replace(tmp, USAGE_LEDGER_PATH)
         except OSError as e:
@@ -29277,7 +29309,7 @@ class SessionManager:
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = USAGE_BASELINE_PATH + ".tmp"
-            with open(tmp, "w") as f:
+            with _open_tmp_for_replace(tmp) as f:
                 json.dump(state, f, indent=2)
             os.replace(tmp, USAGE_BASELINE_PATH)
         except OSError as e:
@@ -29418,7 +29450,7 @@ class SessionManager:
             # UTF-8 explicitly, newline="" for byte-identical output on every OS:
             # a cell can hold any char (a peer's summary/task), and the platform
             # default (cp1252 on Windows) raised UnicodeEncodeError on e.g. "⋮".
-            with open(tmp, "w", encoding="utf-8", newline="") as f:
+            with _open_tmp_for_replace(tmp, encoding="utf-8", newline="") as f:
                 f.write("\n".join(rows) + "\n")
             os.replace(tmp, PEERS_FILE)
         except Exception as e:
@@ -29440,7 +29472,7 @@ class SessionManager:
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = TICKET_LEDGER_PATH + ".tmp"
-            with open(tmp, "w") as f:
+            with _open_tmp_for_replace(tmp) as f:
                 json.dump(self.ticket_ledger, f, indent=2)
             os.replace(tmp, TICKET_LEDGER_PATH)
         except OSError as e:
@@ -29588,7 +29620,7 @@ class SessionManager:
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = PR_LEDGER_PATH + ".tmp"
-            with open(tmp, "w") as f:
+            with _open_tmp_for_replace(tmp) as f:
                 json.dump(self.pr_ledger, f, indent=2)
             os.replace(tmp, PR_LEDGER_PATH)
         except OSError as e:
@@ -29755,7 +29787,7 @@ class SessionManager:
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = PR_STATUS_LEDGER_PATH + ".tmp"
-            with open(tmp, "w") as f:
+            with _open_tmp_for_replace(tmp) as f:
                 json.dump(self.pr_status_cache, f, indent=2)
             os.replace(tmp, PR_STATUS_LEDGER_PATH)
         except OSError as e:
@@ -30227,7 +30259,7 @@ class SessionManager:
                                  guard_config=guard_plugin)
         path = os.path.join(profile_dir, "cordis.patch.yml")
         tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        with _open_tmp_for_replace(tmp, encoding="utf-8") as f:
             f.write(body)
         os.replace(tmp, path)
 
@@ -31180,7 +31212,7 @@ class SessionManager:
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = f"{path}.tmp.{os.getpid()}"
-            with open(tmp, "w", encoding="utf-8") as f:
+            with _open_tmp_for_replace(tmp, encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp, path)
         except OSError as e:
@@ -33178,7 +33210,7 @@ class SessionManager:
                     rid: {"siteKey": j["cmd"].get("siteKey"), "issueKey": j["key"],
                           "model": j["model"], "startedAt": j["at"]}
                     for rid, j in self._shadow_placing.items()}
-            with open(tmp, "w") as f:
+            with _open_tmp_for_replace(tmp) as f:
                 json.dump(data, f)
             os.replace(tmp, SHADOW_RUNS_PATH)
         except OSError as e:
@@ -38949,7 +38981,7 @@ class SessionManager:
             answer["custom"] = custom[:INPUT_MAX_CHARS]
         try:
             tmp = f"{ans_path}.tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
+            with _open_tmp_for_replace(tmp, encoding="utf-8") as f:
                 json.dump(answer, f)
             os.replace(tmp, ans_path)
         except OSError as e:
@@ -39132,7 +39164,7 @@ class SessionManager:
         try:
             os.makedirs(QUESTIONS_DIR, exist_ok=True)
             tmp = f"{req_path}.tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
+            with _open_tmp_for_replace(tmp, encoding="utf-8") as f:
                 json.dump(req, f)
             os.replace(tmp, req_path)
         except OSError as e:
@@ -40096,7 +40128,7 @@ class SessionManager:
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = DEFECT_SCAN_PATH + ".tmp"
-            with open(tmp, "w") as f:
+            with _open_tmp_for_replace(tmp) as f:
                 json.dump(state, f)
             os.replace(tmp, DEFECT_SCAN_PATH)
         except OSError as e:
@@ -41047,7 +41079,7 @@ class SessionManager:
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = ARCHIVE_OFFERED_PATH + ".tmp"
-            with open(tmp, "w") as f:
+            with _open_tmp_for_replace(tmp) as f:
                 json.dump({"offered": self._archive_offered,
                            "seq": self._archive_offer_seq,
                            "hwm": self._archive_cand_hwm}, f)
@@ -44045,7 +44077,14 @@ class SessionManager:
             self._drop_oneshot_input(inf, in_path)
             return None
         outf = os.fdopen(fd, "w+b")
+        proc = None
         try:
+            # Counted as launching across the Popen so a shutdown landing inside
+            # it waits for the child to register (never misses a just-forked one).
+            with self._oneshot_cond:
+                if self._oneshot_closing:
+                    return None
+                self._oneshot_launching += 1
             try:
                 proc = subprocess.Popen(argv, stdin=inf if inf is not None else subprocess.DEVNULL,
                                         stdout=outf,
@@ -44053,6 +44092,16 @@ class SessionManager:
                                         env=_session_env(), start_new_session=True)
             except OSError as e:
                 log(f"{what} launch failed: {e}")
+                return None
+            finally:
+                with self._oneshot_cond:
+                    self._oneshot_launching -= 1
+                    if proc is not None:
+                        self._oneshot_procs.add(proc)
+                    closing = self._oneshot_closing
+                    self._oneshot_cond.notify_all()
+            if closing:
+                self._kill_oneshot_proc(proc)
                 return None
             try:
                 rc = proc.wait(timeout=timeout)
@@ -44070,6 +44119,9 @@ class SessionManager:
                 return None
             return raw.decode("utf-8", "replace")
         finally:
+            if proc is not None:
+                with self._oneshot_cond:
+                    self._oneshot_procs.discard(proc)
             try:
                 outf.close()
             except OSError:
@@ -45328,6 +45380,35 @@ class SessionManager:
             tmp = job.get("tmp")
             if tmp:
                 shutil.rmtree(tmp, ignore_errors=True)
+
+    def _kill_oneshots(self):
+        """Kill every live `_run_lockdown_oneshot` child's process group.
+        Called from _handle_shutdown (XERK-2545). No wait: the manager is
+        exiting, and SIGKILL to the group needs none. A Popen still in flight is
+        waited for (bounded) so its child registers first; one launched after
+        this sees `_oneshot_closing` and is never started. Best-effort; never raises."""
+        try:
+            with self._oneshot_cond:
+                self._oneshot_closing = True
+                self._oneshot_cond.wait_for(lambda: self._oneshot_launching == 0,
+                                            timeout=ONESHOT_LAUNCH_WAIT_SEC)
+                procs = list(self._oneshot_procs)
+        except Exception:
+            return
+        for proc in procs:
+            self._kill_oneshot_proc(proc)
+
+    @staticmethod
+    def _kill_oneshot_proc(proc):
+        """SIGKILL a one-shot's process group (its own child on Windows)."""
+        killpg = getattr(os, "killpg", None)
+        try:
+            if killpg is not None:
+                killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except Exception:
+            pass
 
     def _staging_recent_mtime(self, path, cap=2000):
         """Newest mtime anywhere under a clone staging dir (XERK-374), for the
@@ -49281,6 +49362,11 @@ class SessionManager:
         # sweep. Unlike sessions/dsh-web (deliberately adopted), a clone has no
         # adoption path, so killing it loses no landable work.
         self._kill_clones()
+        # A one-shot `claude -p` (daily brief, meeting extraction, attention
+        # hint) leads its own process group on a worker thread whose `finally`
+        # will not run through this exit, and nothing adopts it after the
+        # restart, so it would finish its model call unmanaged (XERK-2545).
+        self._kill_oneshots()
         # The host-wide dsh web viewer is DELIBERATELY left running: like a dsh
         # session's tmux it outlives an in-place update (KillMode=process), and
         # the next boot's supervisor adopts the surviving instance (has-session
