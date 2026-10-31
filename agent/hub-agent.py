@@ -28057,6 +28057,9 @@ class SessionManager:
         self._meeting_worker = None
         self._meeting_wants = {}
         self._meeting_seen = deque(maxlen=MEETING_RUN_IDS_SEEN)
+        # runId -> the last few answered rows, for a command re-sent after the
+        # hub lost the delivered answer (as `_dbrief_answered`).
+        self._meeting_answered = {}
         self.meeting_results = []
         # The permission judge (XERK-1566). `permission_policy` is the org's
         # policy text off the last heartbeat reply — written by the BEAT
@@ -43613,6 +43616,12 @@ class SessionManager:
             return
         with self._meeting_lock:
             if job["runId"] in self._meeting_seen:
+                # Re-delivered: an answer already carried is staged again (the
+                # hub lost it, e.g. killed before its write; it drops a stale one).
+                row = self._meeting_answered.get(job["runId"])
+                if (row is not None and len(self.meeting_results) < MEETING_RESULTS_MAX
+                        and not any(r is row for r in self.meeting_results)):
+                    self.meeting_results.append(row)
                 return
             self._meeting_seen.append(job["runId"])
             if not error:
@@ -43641,10 +43650,8 @@ class SessionManager:
 
     def _meeting_worker_loop(self):
         """Extract owed meetings one at a time. Wake cleared BEFORE the queue is
-        read, so a command staged mid-run is kept. First drops the prompt/reply
-        files a killed manager left (a `.in` holds a whole meeting): none is in
-        use, since this is the only worker that writes them."""
-        self._sweep_meeting_scratch()
+        read, so a command staged mid-run is kept. A killed manager's scratch
+        (a `.in` holds a whole meeting) is swept at start (`_sweep_oneshot_scratch`)."""
         while True:
             self._meeting_wake.wait()
             self._meeting_wake.clear()
@@ -43658,17 +43665,6 @@ class SessionManager:
                 except Exception as e:
                     items, error = None, f"extraction failed: {type(e).__name__}: {e}"
                 self._meeting_push(job, items=items, error=error)
-
-    @staticmethod
-    def _sweep_meeting_scratch():
-        try:
-            for name in os.listdir(REGISTRY_DIR):
-                if name.startswith("meeting-") and name.endswith((".in", ".out")):
-                    path = os.path.join(REGISTRY_DIR, name)
-                    if os.path.isfile(path) and not os.path.islink(path):
-                        os.remove(path)
-        except OSError as e:
-            log(f"meeting: scratch sweep failed: {e}")
 
     def _fetch_meeting_transcript(self, run_id):
         """OFF THE BEAT: GET the run's transcript from the hub (agent-authed,
@@ -43774,6 +43770,9 @@ class SessionManager:
         else:
             row["error"] = (error or "failed")[:MEETING_ERROR_MAX]
         with self._meeting_lock:
+            self._meeting_answered[job["runId"]] = row
+            while len(self._meeting_answered) > MEETING_RESULTS_MAX:
+                del self._meeting_answered[next(iter(self._meeting_answered))]
             self.meeting_results.append(row)
             over = len(self.meeting_results) - MEETING_RESULTS_MAX
             if over > 0:

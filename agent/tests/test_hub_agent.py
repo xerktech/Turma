@@ -55861,6 +55861,24 @@ class TestMeetingWorker(ManagerMixin, unittest.TestCase):
         self.sm._stage_meeting(self._cmd())
         self.assertEqual(self.sm._meeting_wants, {})
 
+    def test_a_redelivery_after_the_answer_was_carried_restages_it(self):
+        # XERK-2524: the hub lost the delivered answer and re-sent the runId.
+        self.sm._stage_meeting(self._cmd())
+        self.replies = [self._good_reply()]
+        [row] = self._drain()
+        runs = len(self.calls)
+        self.sm.meeting_results.clear()               # a beat carried it
+        self.sm._stage_meeting(self._cmd())
+        self.assertEqual((self.sm._meeting_wants, len(self.calls)), ({}, runs))
+        self.assertIs(self.sm.meeting_results[0], row)
+        self.sm._stage_meeting(self._cmd())           # not staged twice
+        self.assertEqual(len(self.sm.meeting_results), 1)
+        for i in range(ha.MEETING_RESULTS_MAX + 1):   # only the last few are held
+            self.sm._stage_meeting(self._cmd(model="opus", runId=f"f{i}"))
+        self.sm.meeting_results.clear()
+        self.sm._stage_meeting(self._cmd())
+        self.assertEqual(self.sm.meeting_results, [])
+
     def test_an_unusable_but_reportable_command_is_answered_failed(self):
         self.sm._stage_meeting(self._cmd(model="opus"))
         self.sm._stage_meeting(self._cmd(runId="XX"))           # unreportable: logged only
@@ -55979,22 +55997,17 @@ class TestMeetingFetchAndScratch(ManagerMixin, unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 sm._fetch_meeting_transcript("ab12")
 
-    def test_the_worker_sweeps_a_killed_runs_files(self):
+    def test_manager_start_sweeps_a_killed_runs_files(self):
+        # The sweep moved to manager start (XERK-2524, `_sweep_oneshot_scratch`).
         sm = self.make_manager()
-        calls = []
-        sm._meeting_wake = mock.Mock(wait=mock.Mock(side_effect=RuntimeError("stop")))
-        with mock.patch.object(sm, "_sweep_meeting_scratch", lambda: calls.append(1)):
-            with self.assertRaises(RuntimeError):
-                sm._meeting_worker_loop()          # the loop sweeps before it waits
-        self.assertEqual(calls, [1])
         os.makedirs(ha.REGISTRY_DIR, exist_ok=True)
-        for name in ("meeting-x.in", "meeting-y.out", "daily-brief-z.out", "meeting-keep"):
+        for name in ("meeting-x.in", "meeting-y.out", "daily-brief-z.in", "meeting-keep"):
             with open(os.path.join(ha.REGISTRY_DIR, name), "w") as f:
                 f.write("t")
-        sm._sweep_meeting_scratch()
+        sm._sweep_oneshot_scratch()
         self.assertEqual(sorted(n for n in os.listdir(ha.REGISTRY_DIR)
                                 if n.startswith(("meeting-", "daily-brief-"))),
-                         ["daily-brief-z.out", "meeting-keep"])
+                         ["meeting-keep"])
 
 
 class TestLockdownOneshotStdin(ManagerMixin, unittest.TestCase):
