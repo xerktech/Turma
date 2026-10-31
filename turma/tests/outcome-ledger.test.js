@@ -430,6 +430,41 @@ test("XERK-1839: past MAX_ROWS the org holding the most rows loses first, not th
   assert.equal(all.filter((r) => r.site === "small.atlassian.net").length, 10);
 });
 
+test("XERK-2591: past MAX_ROWS the tenant holding the most rows pays, even in a shared org", () => {
+  L._internals.reset();
+  const TA = "a".repeat(32), TB = "b".repeat(32);
+  // Both tenants work one org's tickets; B's rows are the OLDEST. The org pass alone
+  // took them, since that org holds the most rows.
+  const site = "shared.atlassian.net";
+  L.observe(Array.from({ length: 10 }, (_, i) => obs({ site, issue: `S-${i}`,
+    host: `b${i}@${TB}`, sid: `s${i}` })), T0);
+  const per = Math.floor(L.MAX_ROWS / 4);
+  for (let h = 0; h < 5; h++) {
+    L.observe(Array.from({ length: per }, (_, i) => obs({ site, issue: "B-1",
+      host: `a${h}@${TA}`, sid: `a${h}-${i}` })), T0 + 1 + h);
+  }
+  const all = [...L._internals.rows().values()];
+  assert.equal(all.length, L.MAX_ROWS);
+  assert.equal(all.filter((r) => r.host.endsWith(`@${TB}`)).length, 10);
+});
+
+test("XERK-2591: a tenant spread over many small orgs pays before another's one bigger org", () => {
+  L._internals.reset();
+  const TA = "a".repeat(32), TB = "b".repeat(32);
+  // B: one org of 4000 rows, the biggest ORG. A: 8 orgs of 1000, the biggest TENANT.
+  for (let h = 0; h < 4; h++) {
+    L.observe(Array.from({ length: 1000 }, (_, i) => obs({ site: "b.atlassian.net",
+      issue: "B-1", host: `b${h}@${TB}`, sid: `b${h}-${i}` })), T0 + h);
+  }
+  for (let o = 0; o < 8; o++) {
+    L.observe(Array.from({ length: 1000 }, (_, i) => obs({ site: `a${o}.atlassian.net`,
+      issue: "A-1", host: `a${o}@${TA}`, sid: `a${o}-${i}` })), T0 + 10 + o);
+  }
+  const all = [...L._internals.rows().values()];
+  assert.equal(all.length, L.MAX_ROWS);
+  assert.equal(all.filter((r) => r.host.endsWith(`@${TB}`)).length, 4000);
+});
+
 test("XERK-1839: a rescan resets the load gate, deletes what it evicts, and a failed one is retried", async () => {
   const table = new Map();
   let fail = false;

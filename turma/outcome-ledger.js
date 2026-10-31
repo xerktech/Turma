@@ -750,7 +750,7 @@ function commit(prev, next, now, changed) {
 }
 
 // Drop rows past retention, then any host past its share, then — past MAX_ROWS —
-// a row of whichever org holds the most. Returns the keys dropped.
+// a row of whichever org holds the most, within the tenant holding the most. Returns the keys dropped.
 // Within a host or org the victim is (XERK-1855) a row no host reports this sweep,
 // then a row this sweep created, then the oldest: dropping a row its host still
 // reports re-creates it next sweep with a new firstSeen and rewrites the backend,
@@ -811,15 +811,20 @@ function evict(now = Date.now(), sweep = null) {
       units.set(r.key, { head: r, rows: [r], orphan: true });
     }
   }
-  const bySite = new Map();         // site -> {units (next victim last), n rows}
+  // MAX_ROWS is shared, but the pass is per-tenant fair (XERK-2591): the tenant
+  // holding the most rows pays first (its tenant from the unit's host key), then the
+  // org holding the most within it — so a tenant at or under its even share never
+  // loses a row while another tenant is over it.
+  const bySite = new Map();         // tenant \0 site -> {units (next victim last), n rows, tenant}
+  const tenantRows = new Map();     // tenant -> n rows
   for (const u of units.values()) {
-    // One org worked by two tenants is two orgs here (XERK-2550): the busiest
-    // (tenant, org) loses first, so one tenant's churn never evicts another's.
-    const site = `${rowTenant(u.head)}\u0000${u.head.site}`;
-    if (!bySite.has(site)) bySite.set(site, { units: [], n: 0 });
-    const org = bySite.get(site);
+    const tenant = rowTenant(u.head);
+    const id = `${tenant}\u0000${u.head.site}`;
+    if (!bySite.has(id)) bySite.set(id, { units: [], n: 0, tenant });
+    const org = bySite.get(id);
     org.units.push(u);
     org.n += u.rows.length;
+    tenantRows.set(tenant, (tenantRows.get(tenant) || 0) + u.rows.length);
   }
   const unitVictimFirst = (a, b) => (b.orphan - a.orphan) || victimFirst(a.head, b.head);
   for (const org of bySite.values()) org.units.sort((a, b) => unitVictimFirst(b, a));
@@ -830,12 +835,14 @@ function evict(now = Date.now(), sweep = null) {
     // reported row between them every sweep.
     for (const org of bySite.values()) {
       if (!org.units.length) continue;
-      if (!big || org.n > big.n
-        || (org.n === big.n && keep(next(org).head) < keep(next(big).head))) big = org;
+      const t = tenantRows.get(org.tenant), bt = big ? tenantRows.get(big.tenant) : 0;
+      if (!big || t > bt || (t === bt && (org.n > big.n
+        || (org.n === big.n && keep(next(org).head) < keep(next(big).head))))) big = org;
     }
     const u = big.units.pop();
     for (const r of u.rows) drop(r);
     big.n -= u.rows.length;
+    tenantRows.set(big.tenant, tenantRows.get(big.tenant) - u.rows.length);
     over -= u.rows.length;
   }
   return dropped;
