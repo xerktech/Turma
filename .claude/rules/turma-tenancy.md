@@ -3,6 +3,7 @@ paths:
   - turma/server.js
   - turma/tenancy.js
   - turma/tests/tenancy.test.js
+  - turma/tests/breakglass-pool.test.js
   - turma/tests/oidc-groups.test.js
   - turma/tests/oidc.test.js
   - turma/tests/server.test.js
@@ -63,7 +64,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   - **`TURMA_TRUSTED_PROXIES` (XERK-2579)** collapses that to CF-Connecting-IP alone ONLY when the
     socket AND the last XFF hop are both inside it — else 2 cloudflared x 2 ingress pods = 4 keys.
     - List the ingress, cloudflared AND hub pods (an HA follower forwards logins, so it is the
-      leader's socket peer) — in practice the pod CIDR. Anything inside can forge all three headers.
+      leader's socket peer) — in practice the pod CIDR. Anything inside can forge all three headers;
+      break-glass guesses on a CF-Connecting-IP key also hit the hub-wide pool (XERK-2587, below).
     - **Only the network keeps a pod off :8300** (XERK-2592): a pod dialling the Service directly
       forges the untrusted last hop, which the hub cannot tell from the ingress relaying a LAN
       client. ArgoCD `ai/turma/networkpolicy-ingress.yaml` admits only the ingress, hub, turma-agent
@@ -77,7 +79,9 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     and gets a fresh backoff each time — break-glass runs no scrypt, so that was unlimited guessing.
     - IPv6 keys collapse to the /64 (`loginIpv6Prefix64`): one subscriber rotates within it.
       Accepted: a /56 holder still gets 256 keys. An embedded-IPv4 address (mapped, NAT64, compat /96, by range) keys whole.
-    - Residual: anything inside the trusted CIDR still forges all headers.
+    - Residual: anything inside the trusted CIDR still forges all headers. The CF-Connecting-IP
+      branch is pooled (XERK-2587); a pod forging an untrusted hop straight at the hub Service is
+      kept off by the network (XERK-2592), not the hub.
     - Tests: `tenancy-nopassword.test.js` "XERK-2585: off Cloudflare…".
   - `loginFailures` keys are a sha256 of client + username — the username is unbounded (1 MiB body),
     and a raw key let one client heap-OOM the hub in ~35 s.
@@ -104,6 +108,16 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     client already in flight 503) BEFORE the compare: a busy refusal neither evaluates nor counts it,
     so the response pattern never reveals which name is break-glass.
   - Android never retries a password `/api/login` refused (401) as Basic — one miss, not two.
+- **Break-glass guesses keyed on CF-Connecting-IP alone share ONE hub-wide pool of misses**
+  (XERK-2587, `loginKeyFromCf`, `BREAKGLASS_POOL_*`): an in-cluster pod rotating that header got a
+  fresh per-client budget per request (~7k guesses/s).
+  - Pool spent → the guess is NOT evaluated and is treated as a non-break-glass name (Basic 401,
+    form falls to the local check) — never a 429, so the pool never reveals the break-glass name.
+  - Only misses drain it (a polling Basic script is free) and it always refills: never a lockout.
+  - Keys with an unforgeable part (LAN via the ingress, a pod's own socket) never touch it, so
+    break-glass over the LAN works through any flood (XERK-595). Never pool those keys.
+  - Accepted cost: during a CF-path flood, the operator's break-glass via Cloudflare competes for
+    the refill. Tests: `breakglass-pool.test.js`.
   - Residual (XERK-2568's key-trust model): a caller bypassing Cloudflare rotates CF-Connecting-IP
     for a fresh budget per request — scrypt-free break-glass makes that a real bypass (XERK-2585).
     The direct-to-Service variant (a pod forging the XFF hop) is closed by the network (XERK-2592).

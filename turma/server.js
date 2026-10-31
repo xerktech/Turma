@@ -13691,7 +13691,7 @@ function requestPrincipal(req) {
   // (correct) password as Basic too, and counting that would back the user off.
   const user = sep < 0 ? "" : decoded.slice(0, sep);
   const verdict = sep < 0 || !safeEqual(user, TURMA_USER) ? null
-    : breakGlassAttempt(loginClientKey(req), user, decoded.slice(sep + 1));
+    : breakGlassAttempt(loginClientKey(req), user, decoded.slice(sep + 1), Date.now(), loginKeyFromCf(req));
   const principal = verdict === true ? BREAKGLASS_PRINCIPAL : null;
   basicVerdicts.set(req, principal);
   return principal;
@@ -13708,14 +13708,36 @@ const basicVerdicts = new WeakMap(); // req -> the Basic principal (or null) alr
 // client learns nothing, not even from the right password.
 // The miss is recorded synchronously, before any await, so concurrent guesses
 // from one client cannot all slip in ahead of the backoff.
-function breakGlassAttempt(clientKey, username, password, now = Date.now()) {
+//
+// XERK-2587: `fromCf` (loginKeyFromCf) marks a key that is CF-Connecting-IP alone.
+// Any pod inside TURMA_TRUSTED_PROXIES (prod: the whole pod CIDR) can reach the
+// ingress and rotate that header per request, so each guess got a fresh per-client
+// budget — ~7k guesses/s. Those guesses also draw on ONE hub-wide pool of misses
+// (BREAKGLASS_POOL_BURST, refilled one per BREAKGLASS_POOL_REFILL_MS). With the
+// pool empty, the guess is not evaluated and returns null: the caller treats it
+// as a guess at a non-break-glass name (Basic: 401; /api/login: the plain local
+// check), so the pool's state never reveals which name is break-glass.
+// Never a full lockout (XERK-595): only misses drain the pool, it always refills,
+// and a key with an unforgeable part (the LAN, a pod's own socket) never touches it.
+const BREAKGLASS_POOL_BURST = 20;
+const BREAKGLASS_POOL_REFILL_MS = 2000;
+const breakGlassPool = { tokens: BREAKGLASS_POOL_BURST, at: 0 };
+function breakGlassPoolReady(now) {
+  const elapsed = Math.max(0, now - breakGlassPool.at);
+  breakGlassPool.tokens = Math.min(BREAKGLASS_POOL_BURST, breakGlassPool.tokens + elapsed / BREAKGLASS_POOL_REFILL_MS);
+  breakGlassPool.at = now;
+  return breakGlassPool.tokens >= 1;
+}
+function breakGlassAttempt(clientKey, username, password, now = Date.now(), fromCf = false) {
   const wait = loginBackoffMs(clientKey, username, now);
   if (wait) return Math.ceil(wait / 1000);
+  if (fromCf && !breakGlassPoolReady(now)) return null;
   if (credentialsMatch(username, password)) {
     loginFailures.delete(loginFailureKey(clientKey, username));
     return true;
   }
   recordLoginFailure(clientKey, username, now);
+  if (fromCf) breakGlassPool.tokens -= 1;
   return false;
 }
 
@@ -13839,12 +13861,24 @@ function loginClientAddr(ip) {
   if (net.isIP(bare) !== 6) return ip;
   return LOGIN_EMBEDDED_V4.check(bare, "ipv6") ? bare.toLowerCase() : loginIpv6Prefix64(bare.toLowerCase());
 }
-function loginClientKey(req, trusted = LOGIN_TRUSTED_PROXIES) {
+function loginClientParts(req) {
   const h = req.headers || {};
   const xff = String(h["x-forwarded-for"] || "").split(",");
-  const cf = loginClientPart(h["cf-connecting-ip"]);
-  const hop = loginClientPart(xff[xff.length - 1]);
-  const peer = loginClientPart(req.socket && req.socket.remoteAddress);
+  return {
+    cf: loginClientPart(h["cf-connecting-ip"]),
+    hop: loginClientPart(xff[xff.length - 1]),
+    peer: loginClientPart(req.socket && req.socket.remoteAddress),
+  };
+}
+// True when loginClientKey is CF-Connecting-IP — its last branch below, the one key
+// a caller inside the trusted CIDRs can rotate per request (XERK-2587,
+// breakGlassAttempt's pool). Keep it in step with loginClientKey.
+function loginKeyFromCf(req, trusted = LOGIN_TRUSTED_PROXIES) {
+  const { cf, hop, peer } = loginClientParts(req);
+  return !!(trusted && loginProxyTrusted(peer, trusted) && loginProxyTrusted(hop, trusted) && net.isIP(cf));
+}
+function loginClientKey(req, trusted = LOGIN_TRUSTED_PROXIES) {
+  const { cf, hop, peer } = loginClientParts(req);
   if (!trusted) return [cf, hop, peer].join("|");
   // The hub was reached directly: its own headers are the caller's to forge.
   if (!loginProxyTrusted(peer, trusted)) return loginClientAddr(peer);
@@ -21102,7 +21136,7 @@ const server = http.createServer(async (req, res) => {
           const wait = loginBackoffMs(clientKey, username, Date.now());
           if (wait) bg = { throttled: Math.ceil(wait / 1000) };
           else if (loginClientsInflight.has(clientKey)) bg = { busy: true };
-          else bg = breakGlassAttempt(clientKey, username, password);
+          else bg = breakGlassAttempt(clientKey, username, password, Date.now(), loginKeyFromCf(req));
         }
         if (bg === true) {
           token = issueSessionToken(SESSION_TTL_MS, principalClaims(BREAKGLASS_PRINCIPAL));
@@ -26008,8 +26042,11 @@ if (process.env.TURMA_TEST) {
     authEnabled,
     localLogin,
     loginClientKey,
+    loginKeyFromCf,
+    breakGlassAttempt,
     parseTrustedProxies,
     loginIpv6Prefix64,
+    __resetBreakGlassPool() { breakGlassPool.tokens = BREAKGLASS_POOL_BURST; breakGlassPool.at = 0; },
     loginFailureKey,
     loginBackoffMs,
     oidcPrincipal,
