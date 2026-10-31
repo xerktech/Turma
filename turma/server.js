@@ -641,6 +641,8 @@ const DAILY_BRIEFS_FILE = process.env.DAILY_BRIEFS_FILE || "/data/daily-briefs.j
 // siteKey -> newest-first meetings. Written per meeting/run, human rate.
 const MEETING_PROPOSALS_FILE =
   process.env.MEETING_PROPOSALS_FILE || "/data/meeting-proposals.json";
+// Each tenant's Tenir bearer, as its SHA-256 only (XERK-2551).
+const MEETING_TOKENS_FILE = process.env.MEETING_TOKENS_FILE || "/data/meeting-tokens.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -1385,6 +1387,96 @@ registerTenantPurge("modelPolicy", (t) => {
   if (n) persistModelPolicy();
   return { entries: n };
 });
+
+// ---- Org keys belong to tenants (XERK-2551) --------------------------------
+// An org (a tracker site) is keyed hub-side by `siteKey`, and every per-org store
+// (auto-start, auto-merge, triage, epic runs/builders, the ticket queue, Daily
+// Brief schedules + briefs, meetings, decisions, colors, policies) and every sweep
+// keys on it. A tenant host's org is NAMESPACED like its registry key —
+// `<siteKey>@<tenantId>` — so two tenants polling the same Jira site are two
+// orgs that share no store row, queue entry or host pool, with no per-store
+// check (the XERK-2533 rationale: a field checked at each site leaks at the one
+// that forgets). The hub rewrites at the AGENT boundary only:
+//   - a beat's every `siteKey` is re-scoped into the host's tenant (an
+//     untenanted host's forged suffix is stripped), see scopeSiteKeys;
+//   - commands and heartbeat-reply org fields go back to the agent PLAIN, see
+//     unscopeSiteKeys — the agent compares them against its own site.
+// Browsers see and send the scoped key; orgRouteRefusal gates every
+// /api/jira/<site> and /api/orgs/<site> route on it, as principalMayDriveHost
+// gates a host.
+function tenantOfSite(site) { return tenantOfKey(site); }
+function baseOfSite(site) { return baseOfKey(site); }
+function scopeSite(site, tenantId) {
+  if (typeof site !== "string" || !site) return site;
+  const base = baseOfKey(site);
+  return tenantId ? `${base}@${tenantId}` : base;
+}
+// Payload keys whose objects are session CONTENT (transcripts, logs, ticket
+// bodies, the permission ledger's own rows) — a `siteKey` inside them is text
+// the operator reads, not a routing key, so it is left exactly as sent.
+const SITE_SCOPE_SKIP = new Set([
+  "historyResults", "trajectoryTailResults", "subagentHistoryResults", "logTail",
+  "jiraIssueResults", "permissionEvents", "archiveManifest",
+]);
+// Re-scope every string `siteKey` property under `v` into `tenantId` (in place).
+// Walks the whole beat rather than a list of fields: a field this missed would
+// be another tenant's org on the very key the stores read. Depth-bounded (a
+// beat's routing objects nest ≤4 deep); content keys are skipped above.
+function scopeSiteKeys(v, tenantId, depth = 0) {
+  if (!v || typeof v !== "object" || depth > 8) return;
+  if (Array.isArray(v)) {
+    for (const x of v) scopeSiteKeys(x, tenantId, depth + 1);
+    return;
+  }
+  for (const k of Object.keys(v)) {
+    if (depth === 0 && SITE_SCOPE_SKIP.has(k)) continue;
+    const x = v[k];
+    if (k === "siteKey") {
+      if (typeof x === "string") v[k] = scopeSite(x, tenantId);
+    } else if (x && typeof x === "object") {
+      scopeSiteKeys(x, tenantId, depth + 1);
+    }
+  }
+}
+// A copy of `v` with every `siteKey` back to its PLAIN site — what an agent
+// is handed. Copy-on-write: an object with nothing to change is returned
+// as-is, so the stored command queue is never mutated.
+function unscopeSiteKeys(v, depth = 0) {
+  if (!v || typeof v !== "object" || depth > 8) return v;
+  if (Array.isArray(v)) {
+    let out = null;
+    v.forEach((x, i) => {
+      const y = unscopeSiteKeys(x, depth + 1);
+      if (y !== x) { out = out || v.slice(); out[i] = y; }
+    });
+    return out || v;
+  }
+  let out = null;
+  for (const k of Object.keys(v)) {
+    const x = v[k];
+    const y = k === "siteKey" && typeof x === "string" ? baseOfSite(x) : unscopeSiteKeys(x, depth + 1);
+    if (y !== x) { out = out || { ...v }; out[k] = y; }
+  }
+  return out || v;
+}
+// A restored record's orgs, re-scoped into its key's tenant (XERK-2551), as its
+// next beat would: a record saved before this hub (or before its host's tenant
+// bind) otherwise served the plain org — operator-reachable, its own tenant
+// 404'd — until that host beat again, forever for an offline one.
+function rescopeRestoredOrgs(map) {
+  for (const [key, a] of Object.entries(map)) {
+    if (!a || typeof a !== "object") continue;
+    const t = tenantOfKey(key);
+    scopeSiteKeys(a, t);
+    if (typeof a.orgBound === "string" && a.orgBound) a.orgBound = scopeSite(a.orgBound, t);
+  }
+}
+// Whether principal `p` may read or act on org `site`: a tenant's org only for
+// that tenant, an untenanted one for the hub's operators — the host rule,
+// applied to the org's tenant.
+function principalMaySite(p, site) {
+  return principalMayDriveHost(p, tenantHostKey("org", tenantOfSite(site)));
+}
 
 // The subject a bearer token NAMES (a host name, or `uid:<id>`), unverified.
 function tokenSubject(token) {
@@ -2601,6 +2693,7 @@ if (!HA_ON) try {
   // re-coercing values it PERSISTED (XERK-429). The source-regex test pins the
   // literal `normalizeRecord(a` here, so keep the call recognisable.
   for (const a of Object.values(agents)) normalizeRecord(a, "restore");
+  rescopeRestoredOrgs(agents);
   // A RESTORED command cannot be proven undelivered (XERK-303), so it is stamped
   // as delivered here. `deliveredAt` is written when the reply hands the command
   // over, and `scheduleSave` is a 30-SECOND DEBOUNCE: a save that landed between
@@ -2996,13 +3089,20 @@ function wireExternalStores(store) {
 // STATE_FILE, same best-effort pattern (losing it just means devices re-register
 // on their next app launch). Each entry: {token, platform, addedAt, seenAt}.
 let devices = [];
-const devicesCoerce = (raw) => (Array.isArray(raw) ? raw : []);
+const devicesCoerce = (raw) => (Array.isArray(raw) ? raw : [])
+  .filter((d) => d && typeof d === "object" && typeof d.token === "string")
+  .map((d) => (d.tenantId === undefined || TENANT_ID_RE.test(d.tenantId) ? d
+    : (({ tenantId: _t, ...rest }) => rest)(d)));
 devices = devicesCoerce(readJsonFile(DEVICES_FILE));
 const persistDevices = registerExternalStore({
   name: "devices", file: DEVICES_FILE,
   coerce: devicesCoerce, read: () => devices, install: (v) => { devices = v; },
 });
-function registerDevice(token, platform, features) {
+// Each device belongs to the tenant of the principal that registered it
+// (XERK-2551, `tenantId`; absent = the operators'), and is sent only alerts about
+// that tenant's hosts (notify/dismiss). A phone signing in as someone else
+// re-registers the same token, which moves it.
+function registerDevice(token, platform, features, tenantId = "") {
   const now = Date.now();
   // What this app build can do (XERK-154). Only a build that declares "dismiss"
   // is sent retractions — an older one has no handler for them and would render
@@ -3013,9 +3113,12 @@ function registerDevice(token, platform, features) {
   if (existing) {
     existing.platform = platform || existing.platform;
     if (caps) existing.features = caps;
+    if (tenantId) existing.tenantId = tenantId; else delete existing.tenantId;
     existing.seenAt = now;
   } else {
-    devices.push({ token, platform: platform || "android", features: caps || [], addedAt: now, seenAt: now });
+    const d = { token, platform: platform || "android", features: caps || [], addedAt: now, seenAt: now };
+    if (tenantId) d.tenantId = tenantId;
+    devices.push(d);
   }
   persistDevices();
 }
@@ -3033,6 +3136,12 @@ function pruneDevices(deadTokens) {
 }
 function listDevices() {
   return devices;
+}
+// The devices an alert about `host` may reach: its tenant's, or the operators'
+// for an untenanted host (and a fleet-wide alert, host "").
+function devicesForHost(host) {
+  const t = tenantOfKey(host || "");
+  return devices.filter((d) => ((d && typeof d.tenantId === "string") ? d.tenantId : "") === t);
 }
 
 // ---- ticket -> agent pins (XERK-38) ----------------------------------------
@@ -4825,6 +4934,27 @@ const persistMeetings = registerExternalStore({
   // A 200 tells Tenir the meeting is kept, so the row is written at once.
   debounceMs: 0,
 });
+// Tenant Tenir tokens (XERK-2551): tenantId -> {hash, at}. Random, stored as a
+// SHA-256 only, minted/rotated by the tenant's own user (POST
+// /api/meetings-token), so nothing the operators hold — the fleet meetings
+// token, the session secret, the break-glass password — derives one, and a
+// rotation revokes the old one alone. Whitelisted field by field (a coerce
+// fixed point); inline literals, it runs at module init.
+function meetingTokensCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [t, e] of Object.entries(raw)) {
+    if (!/^[0-9a-f]{32}$/.test(t) || !e || typeof e !== "object") continue;
+    if (typeof e.hash !== "string" || !/^[0-9a-f]{64}$/.test(e.hash)) continue;
+    out[t] = { hash: e.hash, at: Number.isSafeInteger(e.at) && e.at > 0 ? e.at : 0 };
+  }
+  return out;
+}
+let meetingTokens = meetingTokensCoerce(readJsonFile(MEETING_TOKENS_FILE));
+const persistMeetingTokens = registerExternalStore({
+  name: "meetingTokens", file: MEETING_TOKENS_FILE, debounceMs: 0, mode: 0o600,
+  coerce: meetingTokensCoerce, read: () => meetingTokens, install: (v) => { meetingTokens = v; },
+});
 // The one writer: insert (newest first) or replace a row by meetingId, through
 // the whitelist. Callers re-read rows rather than holding one across a write.
 function putMeeting(siteKey, row) {
@@ -6398,10 +6528,8 @@ function modelPolicySweepTenant(t, now) {
         const pct = (x) => `${Math.round(x * 100)}%`;
         console.log(`model policy: demoted ${model} for ${cls} work (${live.bad}/${live.n} bad`
           + ` vs Opus ${pct(baseline)})`);
-        // A tenant's demotion is not pushed until push is tenant-routed
-        // (XERK-2551): notify() fans out to every registered device, which would
-        // hand one tenant's figures to every other tenant's phones.
-        if (!t) notify(`${cls} work moved back to Opus`,
+        // Pushed to that tenant's devices only (`tenant`, XERK-2551).
+        notify(`${cls} work moved back to Opus`,
           `${model} had ${live.bad} bad of ${live.n} since its promotion, worse than Opus's`
           + ` ${pct(baseline)} for ${cls} work. It stays on Opus until new shadow runs earn it back.`,
           { tags: "warning", notifKey: `model-demoted:${key}`, tenant: t });
@@ -7152,6 +7280,70 @@ const sseClients = new Set(); // open /api/events response streams
 
 function invalidateAgentsCache() { agentsCache = null; }
 
+// ---- Tenant purge (XERK-2551) ------------------------------------------------
+// The org stores, ticket queue, push devices and tenant meeting tokens register
+// into the one tenant-delete entry point (purgeTenantData, XERK-2550).
+// The org a store key names: the whole key for an org-keyed store, the part
+// before the LAST "/" for a "<siteKey>/<issueKey>" one (an ADO siteKey holds a
+// "/" itself; an issue key never does).
+const siteOfTicketKey = (k) => (k.lastIndexOf("/") > 0 ? k.slice(0, k.lastIndexOf("/")) : k);
+function dropTenantKeys(map, tenantId, siteOf = (k) => k) {
+  let n = 0;
+  for (const k of Object.keys(map)) {
+    if (tenantOfSite(siteOf(k)) === tenantId) { delete map[k]; n++; }
+  }
+  return n;
+}
+for (const [name, read, persist, siteOf] of [
+  ["autoStartOrgs", () => autoStartOrgs, () => persistAutoStartOrgs()],
+  ["autoMergeOrgs", () => autoMergeOrgs, () => persistAutoMergeOrgs()],
+  ["triagePolicies", () => triagePolicies, () => persistTriagePolicies()],
+  ["permissionPolicies", () => permissionPolicies, () => persistPermissionPolicies()],
+  ["priorityWriteBackOrgs", () => priorityWriteBackOrgs, () => persistPriorityWriteBackOrgs()],
+  ["dedupeLinkOrgs", () => dedupeLinkOrgs, () => persistDedupeLinkOrgs()],
+  ["orgColors", () => orgColors, () => persistOrgColors()],
+  ["decisions", () => decisions, () => persistDecisions()],
+  ["dailyBriefSchedules", () => dailyBriefSchedules, () => persistDailyBriefSchedules()],
+  ["dailyBriefs", () => dailyBriefs, () => persistDailyBriefs()],
+  ["meetingProposals", () => meetingProposals, () => persistMeetings()],
+  ["ticketAgents", () => ticketAgents, () => persistTicketAgents(), siteOfTicketKey],
+  ["ticketModels", () => ticketModels, () => persistTicketModels(), siteOfTicketKey],
+  ["ticketRuntimes", () => ticketRuntimes, () => persistTicketRuntimes(), siteOfTicketKey],
+  ["ticketPlatforms", () => ticketPlatforms, () => persistTicketPlatforms(), siteOfTicketKey],
+  ["triageActions", () => ticketTriageActions, () => persistTriageActions(), siteOfTicketKey],
+  ["epicRuns", () => epicRuns, () => persistEpicRuns(), siteOfTicketKey],
+]) {
+  registerTenantPurge(name, (t) => {
+    const n = dropTenantKeys(read(), t, siteOf);
+    if (n) persist();
+    return n;
+  });
+}
+registerTenantPurge("epicBuilders", (t) => {
+  const n = dropTenantKeys(epicBuilders, t, (id) => (epicBuilders[id] && epicBuilders[id].siteKey) || "");
+  if (n) persistEpicBuilders();
+  return n;
+});
+registerTenantPurge("ticketQueue", (t) => {
+  let n = 0;
+  for (let i = ticketQueue.length - 1; i >= 0; i--) {
+    if (tenantOfSite(ticketQueue[i].siteKey) === t) { ticketQueue.splice(i, 1); n++; }
+  }
+  return n;
+});
+registerTenantPurge("meetingTokens", (t) => {
+  if (!Object.hasOwn(meetingTokens, t)) return 0;
+  delete meetingTokens[t];
+  persistMeetingTokens();
+  return 1;
+});
+registerTenantPurge("devices", (t) => {
+  const before = devices.length;
+  devices = devices.filter((d) => !(d && d.tenantId === t));
+  if (devices.length !== before) persistDevices();
+  return before - devices.length;
+});
+
 // One agent record shaped exactly as /api/agents returns it: the (potentially
 // large) on-demand caches (session history, Jira issue detail) stripped — each
 // has its own route — plus the two time/tunnel-derived live flags.
@@ -7824,6 +8016,9 @@ function applyRemoteAgent(key, value) {
       if (Object.prototype.hasOwnProperty.call(existing, ck)) value[ck] = existing[ck];
     }
   }
+  // A record an OLDER replica wrote mid-rolling-upgrade carries plain orgs
+  // (XERK-2551): scope it as hydrate does (a no-op on an already-scoped one).
+  rescopeRestoredOrgs({ [key]: value });
   agents[key] = value;
   try { recordBytes.set(key, agentRecordSize(value)); } catch { /* best effort */ }
   invalidateAgentsCache();
@@ -7896,6 +8091,7 @@ async function hydrateAgentsFromStore() {
     console.warn(`dropping restored agent with a non-object record under ${hostKeyLabel(k)}`);
   }
   for (const a of Object.values(agents)) normalizeRecord(a, "restore");
+  rescopeRestoredOrgs(agents);
   sanitizeRestoredCommands(agents);
   trimRestoredAgents();
   console.log(`hydrated ${loaded} agent record(s) from the HA store`);
@@ -14928,7 +15124,11 @@ function agentWsAuthorized(url, req, host) {
 // ride as data so the app picks the notification channel and deep-links a tap to
 // the exact session or host.
 function notify(title, message, opts = {}) {
-  const tokens = listDevices();
+  // Only the host's own tenant's devices (XERK-2551), or the explicit `tenant`
+  // of an alert about no host; any other alert reaches the operators' devices.
+  const tokens = typeof opts.tenant === "string" && opts.tenant
+    ? devicesForHost(tenantHostKey("x", opts.tenant))
+    : devicesForHost(opts.route && opts.route.host);
   if (!tokens.length) return; // no registered devices; also skips when FCM off
   const data = {
     tags: opts.tags || "",
@@ -14955,13 +15155,13 @@ function notify(title, message, opts = {}) {
 // `action:"dismiss"` and cancels by the same `notifKey` the original alert
 // carried. Best-effort and a no-op with no devices / FCM off, exactly like
 // notify(); carries no title/body, so it shows nothing itself.
-function dismiss(notifKey) {
+function dismiss(notifKey, host = "") {
   if (!notifKey) return;
   // Only devices whose app build declared "dismiss" support — a retraction is a
   // data-only message an older build would show as a blank notification instead
   // of cancelling (XERK-154). Withheld devices simply keep the stale alert until
   // the app updates, which is strictly better than a blank one.
-  const tokens = listDevices()
+  const tokens = devicesForHost(host)
     .filter((d) => Array.isArray(d.features) && d.features.includes("dismiss"))
     .map((d) => d.token);
   if (!tokens.length) return;
@@ -15618,7 +15818,7 @@ function heartbeatAlerts(key, prev, next, hints = []) {
       // Answered/cleared elsewhere (e.g. from the desktop) — retract the
       // phone's now-stale question notification (XERK-154). The guard fires the
       // dismiss once, on the edge, not every quiet beat.
-      if (sa.lastQuestion) dismiss(questionKey);
+      if (sa.lastQuestion) dismiss(questionKey, key);
       delete sa.lastQuestion;
     }
 
@@ -15749,7 +15949,7 @@ function heartbeatAlerts(key, prev, next, hints = []) {
     // replied, or it picked the work back up) or by its PRs landing — a merge
     // IS the review. Fires once, on the edge, via the reviewAlerted flag.
     if (sa.reviewAlerted && !ready) {
-      dismiss(reviewKey);
+      dismiss(reviewKey, key);
       delete sa.reviewAlerted;
     }
     // Stalled (XERK-1571): a session parked on a background wait that has gone
@@ -15775,7 +15975,7 @@ function heartbeatAlerts(key, prev, next, hints = []) {
       sa.stalledAlerted = true;
     }
     if (sa.stalledAlerted && !stalled) {
-      dismiss(stalledKey);
+      dismiss(stalledKey, key);
       delete sa.stalledAlerted;
     }
     // A stale finish edge must not outlive the turn that follows it; a held PR
@@ -15785,7 +15985,7 @@ function heartbeatAlerts(key, prev, next, hints = []) {
     // one on the same edge it used to, so an upgrade doesn't strand it on the
     // phone with nothing left to clear it.
     if (working && sa.turnAlerted) {
-      dismiss(`turn:${key}:${session.id}`);
+      dismiss(`turn:${key}:${session.id}`, key);
       delete sa.turnAlerted;
     }
 
@@ -18855,10 +19055,43 @@ const MEETINGS_PENDING_BYTES_MAX = 2 << 20;
 const MEETINGS_PENDING_BYTES_ORG_MAX = 1 << 20; // so one org can't fill the whole budget
 const meetingSegmentBytes = (m) => (m.segments ? Buffer.byteLength(JSON.stringify(m.segments)) : 0);
 
-function meetingsAuthorized(req) {
+// The tenant a Tenir meeting post belongs to (XERK-2551): "" for the fleet
+// `TURMA_MEETINGS_TOKEN` (the operators' untenanted orgs), a tenant id for that
+// tenant's own token, null when the bearer proves nothing. A tenant token is
+// `tm1.<tenantId>.<43 random base64url>`, stored as its SHA-256
+// (`meetingTokens`), and the URL's site is scoped by the TOKEN's tenant, never a
+// suffix the caller types — the site key alone proves no tenant. It works only
+// while a user with that tenant holds the user role (a disabled or deleted
+// user's Tenir stops at once). Tenir needs no change: it sends a bearer either way.
+const sha256Hex = (s) => crypto.createHash("sha256").update(s).digest("hex");
+// Mint (or rotate) tenant `tenantId`'s token; returns the plain token once.
+function mintMeetingsTenantToken(tenantId) {
+  if (!TENANT_ID_RE.test(tenantId || "")) return "";
+  const token = `tm1.${tenantId}.${crypto.randomBytes(32).toString("base64url")}`;
+  meetingTokens[tenantId] = { hash: sha256Hex(token), at: Date.now() };
+  persistMeetingTokens();
+  return token;
+}
+function tenantIsLive(tenantId) {
+  if (!TENANT_ID_RE.test(tenantId || "")) return false;
+  return Object.values(tenancyState.users || {}).some((u) => {
+    if (!u || u.tenantId !== tenantId) return false;
+    const p = userPrincipal(u);
+    return !!(p && p.tenantId === tenantId);
+  });
+}
+function meetingsTenant(req) {
   const header = req.headers.authorization || "";
-  return !!TURMA_MEETINGS_TOKEN && header.startsWith("Bearer ") &&
-    safeEqual(header.slice(7), TURMA_MEETINGS_TOKEN);
+  if (!TURMA_MEETINGS_TOKEN || !header.startsWith("Bearer ")) return null;
+  const bearer = header.slice(7);
+  if (safeEqual(bearer, TURMA_MEETINGS_TOKEN)) return "";
+  const m = /^tm1\.([0-9a-f]{32})\.[A-Za-z0-9_-]{43}$/.exec(bearer);
+  const stored = m && Object.hasOwn(meetingTokens, m[1]) ? meetingTokens[m[1]] : null;
+  if (!stored || !safeEqual(sha256Hex(bearer), stored.hash)) return null;
+  return tenantIsLive(m[1]) ? m[1] : null;
+}
+function meetingsAuthorized(req) {
+  return meetingsTenant(req) != null;
 }
 
 // Validate Tenir's body into a queued row, or {error}. Field rules: the contract.
@@ -21076,6 +21309,45 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // Every per-ORG route (XERK-2551) answers only a principal that may act on
+    // that org: a tenant's org (`<siteKey>@<tenantId>`) for that tenant, an
+    // untenanted one for the hub's operators — the host rule above, applied to
+    // the org. 404 in the routes' own words, so another tenant cannot tell the
+    // org exists. Tenir's meeting post is scoped by its TOKEN instead: the
+    // URL names the plain site, and a typed suffix is refused.
+    if (parts[0] === "api" && (parts[1] === "jira" || parts[1] === "orgs") && parts.length >= 3 &&
+        !(parts[1] === "jira" && parts[2] === "refresh" && parts.length === 3)) {
+      let site = null;
+      try { site = decodeURIComponent(parts[2]); } catch { /* the route 400s it */ }
+      if (site != null) {
+        if (isMeetingsIngest) {
+          const t = meetingsTenant(req);
+          if (tenantOfSite(site) || t == null) return json(res, 404, { error: "no host is in that org" });
+          parts[2] = encodeURIComponent(scopeSite(site, t));
+        } else if (!principalMaySite(requestPrincipal(req), site)) {
+          return json(res, 404, { error: "no host is in that org" });
+        }
+      }
+    }
+
+    // GET|POST /api/meetings-token — the caller's own tenant's Tenir bearer
+    // (XERK-2551, meetingsTenant). GET says whether one exists ({exists, at});
+    // POST mints a new one, revoking the last, and answers it ONCE ({token}) —
+    // only its hash is kept. 404 for a principal with no tenant (they use the
+    // fleet TURMA_MEETINGS_TOKEN), 503 when meetings are not configured.
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/meetings-token") {
+      const t = principalTenant(requestPrincipal(req));
+      if (!t) return json(res, 404, { error: "only a tenant user has a meetings token" });
+      if (!TURMA_MEETINGS_TOKEN) {
+        return json(res, 503, { error: "meetings ingest is not configured on this hub (TURMA_MEETINGS_TOKEN)" });
+      }
+      if (req.method === "GET") {
+        const e = Object.hasOwn(meetingTokens, t) ? meetingTokens[t] : null;
+        return json(res, 200, e ? { exists: true, at: e.at } : { exists: false });
+      }
+      return json(res, 200, { token: mintMeetingsTenantToken(t) });
+    }
+
     // Login form (public). Already-authenticated visitors skip straight in.
     // HEAD as well as GET, for the same reason the asset routes take it: this is
     // the one unauthenticated HTML surface, so it is what a CDN or an uptime
@@ -21500,7 +21772,7 @@ const server = http.createServer(async (req, res) => {
       if (!token) return json(res, 400, { error: "token required" });
       const platform = typeof body.platform === "string" ? body.platform : "android";
       const features = Array.isArray(body.features) ? body.features : undefined;
-      registerDevice(token, platform, features);
+      registerDevice(token, platform, features, principalTenant(requestPrincipal(req)));
       return json(res, 200, { ok: true });
     }
     if (req.method === "DELETE" && url.pathname === "/api/devices") {
@@ -21608,6 +21880,10 @@ const server = http.createServer(async (req, res) => {
       // queued for it, which is how a migration/upload id leaves the fleet.
       const beatRefusal = agentHostRefusal(req, key);
       if (beatRefusal) return json(res, beatRefusal.status, { error: beatRefusal.error });
+      // Every org this beat names is scoped into the host's tenant (XERK-2551),
+      // before anything reads it: the record, the binding, every ingest.
+      const beatTenant = tenantOfKey(key);
+      scopeSiteKeys(payload, beatTenant);
       // Which credential it used decides which token its ttyd is running with
       // (see ttydAuth). Hub-derived, never read off the payload.
       const tokenBound = agentBearerKind(req, key) === "proved";
@@ -21773,7 +22049,7 @@ const server = http.createServer(async (req, res) => {
           // `next` below (after the spread), so this reconstructs the same value
           // the record will carry from `prev` + this beat's declaration.
           const beatDecidedOrg = decidedOrgOf({
-            orgBound: prev.orgBound || siteKeyOf(payload),
+            orgBound: scopeSite(prev.orgBound, beatTenant) || siteKeyOf(payload),
             jira: payload.jira,
           });
           if (haveInventory) {
@@ -21817,7 +22093,9 @@ const server = http.createServer(async (req, res) => {
         // for the same reason `tokenBound` is: a heartbeat claiming a binding
         // must not be able to make itself one. Set on the first beat that
         // declares an org and never moved after — see boundOrgOf.
-        orgBound: prev.orgBound || siteKeyOf(payload) || undefined,
+        // A binding made before the host joined a tenant (XERK-2533's bind) moves
+        // into that tenant with it (XERK-2551): the identity never moves again.
+        orgBound: scopeSite(prev.orgBound, beatTenant) || siteKeyOf(payload) || undefined,
         // The agent identity this host is bound to (XERK-2381), and whether THIS
         // beat authenticated with it (ttydAuth). Hub-owned, after the spread:
         // a mint stamps `agentUid` before the agent ever beats on it, so a beat
@@ -22102,7 +22380,10 @@ const server = http.createServer(async (req, res) => {
       // hub's only evidence for either, since the queue drains on ACK, not on
       // delivery. dropQueuedCommand and the create poll both turn on it.
       for (const c of commands) if (c && !c.deliveredAt) c.deliveredAt = Date.now();
-      const reply = publicCommands(commands);   // strip AFTER stamping, or the
+      // A tenant host is handed its orgs PLAIN (XERK-2551): it compares them
+      // against its own tracker site.
+      const reply = beatTenant ? unscopeSiteKeys(publicCommands(commands))
+        : publicCommands(commands);               // strip AFTER stamping, or the
       scheduleSave();                           // no-op copy hands back the
                                                 // same objects and leaks it
       // Re-measure what the record ACTUALLY ended up as. The gate above runs
@@ -22148,6 +22429,10 @@ const server = http.createServer(async (req, res) => {
       // The org's decisions log (XERK-1574) rides every reply like the roster,
       // keyed on the DECIDED org; the agent renders it to ~/.turma/decisions-<org>.md.
       const decisionsTail = decisionsReplyFor(key);
+      if (beatTenant) {
+        decisionsTail.org = baseOfSite(decisionsTail.org);
+        if (permissionPolicy.site) permissionPolicy.site = baseOfSite(permissionPolicy.site);
+      }
       return json(res, 200, archiveHave
         ? { commands: reply, peers, decisions: decisionsTail, bodyMax, archiveOffer: "hub",
             archiveHave, archiveShed, archiveFull, archiveRawHave, archiveRawSkip,
@@ -22632,7 +22917,8 @@ const server = http.createServer(async (req, res) => {
       for (const siteKey of Object.keys(meetingProposals)) {
         const m = meetingRunOf(host, siteKey, runId);
         if (m) {
-          return json(res, 200, { runId, siteKey, meetingId: m.meetingId, title: m.title,
+          // The agent is handed its org PLAIN (XERK-2551), as in its command.
+          return json(res, 200, { runId, siteKey: baseOfSite(siteKey), meetingId: m.meetingId, title: m.title,
             platform: m.platform, startedAt: m.startedAt, endedAt: m.endedAt,
             participants: m.participants, segments: m.segments });
         }
@@ -23237,7 +23523,9 @@ const server = http.createServer(async (req, res) => {
     // fleet gets no commands (the agent re-checks anyway).
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
         parts[2] === "refresh" && parts.length === 3) {
+      const caller = requestPrincipal(req);
       const hosts = Object.keys(agents).filter((k) => {
+        if (!principalMayDriveHost(caller, k)) return false; // its own hosts only (XERK-2551)
         const j = agents[k] && agents[k].jira;
         return !!j && (j.configured === true || !!j.siteKey);
       });
@@ -24808,7 +25096,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "jira" &&
         parts.length === 5 && parts[3] === "epic-builder") {
       const id = decodeURIComponent(parts[4]);
-      const existed = clearEpicBuilder(id);
+      // Only a builder OF THIS ORG (XERK-2551): the org guard proved the caller
+      // may act on `<siteKey>`, not on a builder id it read off the feed.
+      const siteKey = decodeURIComponent(parts[2]);
+      const run = Object.hasOwn(epicBuilders, id) ? epicBuilders[id] : null;
+      const existed = !!run && run.siteKey === siteKey && clearEpicBuilder(id);
       return json(res, existed ? 200 : 404,
         existed ? { ok: true, cleared: true } : { error: "no builder run by that id" });
     }
@@ -26054,6 +26346,9 @@ if (process.env.TURMA_TEST) {
     __setTenancy(v) { tenancyState = tenancy.coerceTenancy(v); },
     // Host ⇄ tenant binding (XERK-2533).
     tenantOfKey,
+    // XERK-2551: org keys belong to tenants.
+    tenantOfSite, baseOfSite, scopeSite, scopeSiteKeys, unscopeSiteKeys, principalMaySite,
+    devicesForHost, mintMeetingsTenantToken, meetingsTenant, notify, rescopeRestoredOrgs,
     baseOfKey,
     agentKeyFor,
     principalMayDriveHost,

@@ -770,12 +770,17 @@ fun statusChangeable(online: Boolean, options: List<com.xerktech.turma.model.Sta
 fun orgName(siteKey: String, override: String = ""): String {
     val o = override.trim()
     if (o.isNotEmpty()) return o
-    if (siteKey.contains('/')) {
-        val segs = siteKey.split('/').filter { it.isNotEmpty() }
-        return segs.lastOrNull() ?: siteKey
+    // A tenant's org key carries its tenant (`<siteKey>@<32-hex>`, XERK-2551);
+    // the label is the site alone. Mirrors board.js `orgName`.
+    val site = siteKey.replace(TENANT_SUFFIX, "")
+    if (site.contains('/')) {
+        val segs = site.split('/').filter { it.isNotEmpty() }
+        return segs.lastOrNull() ?: site
     }
-    return siteKey.replace(Regex("\\.atlassian\\.net$", RegexOption.IGNORE_CASE), "")
+    return site.replace(Regex("\\.atlassian\\.net$", RegexOption.IGNORE_CASE), "")
 }
+
+private val TENANT_SUFFIX = Regex("@[0-9a-f]{32}$")
 
 /**
  * Whether an org is opted in to auto-start, for the org-chip switch (XERK-41), a

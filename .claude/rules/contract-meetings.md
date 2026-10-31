@@ -19,6 +19,8 @@ ticket builds to this file; change it here first.
 
 - Authed ONLY by the dedicated `TURMA_MEETINGS_TOKEN` bearer — never the trigger token (that one
   starts arbitrary sessions) and never the operator login. Unset env = 503 "not configured".
+  - Or a TENANT's token derived from it (XERK-2551, `turma-tenancy.md`): the URL names the PLAIN
+    site and the token decides the tenant's org; a suffixed URL site is a 404.
 - Body: `{meetingId, title, platform, startedAt, endedAt, tenirUrl, participants[],
   segments[{speaker, text, startMs, endMs}]}`.
   - `meetingId` `^[A-Za-z0-9._:-]{1,128}$` (Tenir's own id); `title` ≤300; `platform` ≤40

@@ -116,6 +116,7 @@ process.env.DECISIONS_FILE = path.join(scratchDir(), `turma-test-decisions-${pro
 process.env.DAILY_BRIEF_SCHEDULES_FILE = path.join(scratchDir(), `turma-test-daily-brief-schedules-${process.pid}.json`);
 process.env.DAILY_BRIEFS_FILE = path.join(scratchDir(), `turma-test-daily-briefs-${process.pid}.json`);
 process.env.MEETING_PROPOSALS_FILE = path.join(scratchDir(), `turma-test-meeting-proposals-${process.pid}.json`);
+process.env.MEETING_TOKENS_FILE = path.join(scratchDir(), `turma-test-meeting-tokens-${process.pid}.json`);
 process.env.DEDUPE_LINK_ORGS_FILE = path.join(scratchDir(), `turma-test-dedupe-link-orgs-${process.pid}.json`);
 process.env.EPIC_BUILDERS_FILE = path.join(scratchDir(), `turma-test-epic-builders-${process.pid}.json`);
 process.env.EPIC_RUNS_FILE = path.join(scratchDir(), `turma-test-epic-runs-${process.pid}.json`);
@@ -20735,7 +20736,9 @@ test("XERK-2533: a session never migrates across tenants, and the roster never c
     for (const [tok, dev] of [[ta, "t2533m"], [ta2, "t2533m2"], [tb, "t2533m"]]) {
       assert.equal((await beat2533(tok, dev, { ...extra, sessions: sess })).status, 200);
     }
-    assert.equal(hub.decidedOrgOf(agents[kb]), site, "same org on every side");
+    // One Jira site, but each tenant's own org (XERK-2551).
+    assert.equal(hub.decidedOrgOf(agents[kb]), `${site}@${T.B.t}`);
+    assert.equal(hub.decidedOrgOf(agents[ka]), `${site}@${T.A.t}`);
     const move = (to) => request("POST",
       `/api/agents/${encodeURIComponent(ka)}/sessions/s2533/migrate`, { headers: T.A.h, body: { host: to } });
     const cross = await move(kb);
@@ -28930,6 +28933,7 @@ test("XERK-2550: the routing policy promotes and routes per tenant, never on ano
 test("XERK-2550: a tenant's demotion is never pushed to the fleet's devices", () => {
   const TA = "a".repeat(32);
   resetPolicy();
+  hub.registerDevice("dev2550ta", "android", [], TA);
   hub.__setModelPolicy("on");
   const before = notifications.length;
   try {
@@ -28944,9 +28948,11 @@ test("XERK-2550: a tenant's demotion is never pushed to the fleet's devices", ()
     }
     hub.modelPolicySweep();
     assert.equal(hub.__modelPolicyState()[`${TA}:bug/sonnet`].state, "demoted");
-    assert.ok(!notifications.slice(before).some((x) => x.data && /model-demoted/.test(x.data.notifKey || "")),
-      "no push until push is tenant-routed (XERK-2551)");
-  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
+    const pushed = notifications.slice(before).filter((x) => x.data && /model-demoted/.test(x.data.notifKey || ""));
+    // XERK-2551: push is tenant-routed — the tenant's own devices only.
+    assert.equal(pushed.length, 1);
+    assert.deepEqual(pushed[0].tokens, ["dev2550ta"]);
+  } finally { hub.unregisterDevice("dev2550ta"); hub.__setModelPolicy("observe"); resetPolicy(); }
 });
 
 test("XERK-2550: a bus frame with a malformed scope is dropped, never delivered unscoped", () => {
@@ -29060,4 +29066,275 @@ test("XERK-2550: purgeTenantData removes the tenant's ledger rows and policy, no
     hub.outcomeLedger._internals.reset();
     hub.__setModelPolicyState({});
   }
+});
+// ---- XERK-2551: org stores, queue, meetings and push partitioned by tenant ----
+
+const S2551 = "acme2551.atlassian.net";
+const jira2551 = (site = S2551, extra = {}) => ({
+  jira: { available: true, configured: true, siteKey: site, user: "u@x.com",
+    fetchedAt: new Date().toISOString(), tickets: [] }, ...extra });
+// Two tenants (A, B) each with a host polling the SAME Jira site, plus an
+// untenanted (master) host on it. Returns the keys and tokens.
+async function fleet2551(T, tag) {
+  const ka = `${tag}@${T.A.t}`, kb = `${tag}@${T.B.t}`, kl = `${tag}leg`;
+  forget2533(tag, ka, kb, kl);
+  const ta = await enroll2533(T.A, tag);
+  const tb = await enroll2533(T.B, tag);
+  assert.equal((await beat2533(ta, tag, jira2551())).status, 200);
+  assert.equal((await beat2533(tb, tag, jira2551())).status, 200);
+  assert.equal((await request("POST", "/api/heartbeat",
+    { headers: agentHeaders, body: { device: kl, sessions: [], ...jira2551() } })).status, 200);
+  return { ka, kb, kl, ta, tb, SA: `${S2551}@${T.A.t}`, SB: `${S2551}@${T.B.t}` };
+}
+
+test("XERK-2551: a tenant host's every org key is scoped into its tenant; an agent gets it back plain", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await fleet2551(T, "t2551s");
+    // The record, the binding and the decided org are the tenant's org.
+    assert.equal(agents[F.ka].jira.siteKey, F.SA);
+    assert.equal(hub.decidedOrgOf(agents[F.ka]), F.SA);
+    assert.equal(hub.decidedOrgOf(agents[F.kb]), F.SB);
+    assert.equal(hub.decidedOrgOf(agents[F.kl]), S2551, "an untenanted host keeps the plain site");
+    // Nested keys too (a session's ticket), and a forged suffix is replaced.
+    await beat2533(F.ta, "t2551s", jira2551(`${S2551}@${T.B.t}`, {
+      sessions: [{ id: "s1", status: "running", ticket: { siteKey: `${S2551}@${T.B.t}`, key: "X-1" } }] }));
+    assert.equal(agents[F.ka].jira.siteKey, F.SA, "A can never claim B's org");
+    assert.equal(agents[F.ka].sessions[0].ticket.siteKey, F.SA);
+    // An untenanted host cannot reach a tenant's org by typing its suffix.
+    await request("POST", "/api/heartbeat", { headers: agentHeaders,
+      body: { device: F.kl, sessions: [], ...jira2551(F.SA) } });
+    assert.equal(agents[F.kl].jira.siteKey, S2551);
+    assert.ok(!hub.hostInOrg(agents[F.kl], F.SA) && !hub.hostInOrg(agents[F.kb], F.SA));
+    assert.ok(hub.hostInOrg(agents[F.ka], F.SA));
+    // Commands and reply fields reach the agent plain; the stored queue keeps the key.
+    queueCommand(F.ka, { type: "refreshJira", siteKey: F.SA, nested: { siteKey: F.SA } });
+    hub.appendDecision(F.SA, { source: "note", text: "only A's" });
+    const r = await beat2533(F.ta, "t2551s", jira2551());
+    const sent = r.body.commands.find((c) => c.type === "refreshJira" && c.siteKey);
+    assert.deepEqual([sent.siteKey, sent.nested.siteKey], [S2551, S2551]);
+    assert.ok(agents[F.ka].commands.every((c) => !c.siteKey || c.siteKey === F.SA) || !agents[F.ka].commands.length);
+    assert.equal(r.body.decisions.org, S2551);
+    assert.deepEqual(r.body.decisions.entries.map((e) => e.text), ["only A's"]);
+    const rb = await beat2533(F.tb, "t2551s", jira2551());
+    assert.deepEqual(rb.body.decisions.entries, [], "B shares no decision with A");
+    assert.equal(rb.body.permissionPolicy.site, S2551);
+  } finally {
+    if (F) { forget2533("t2551s", F.ka, F.kb, F.kl); delete hub.getDecisions()[F.SA]; }
+    T.restore();
+  }
+});
+
+test("XERK-2551: per-org routes answer only the org's own tenant; two tenants configure one site independently", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await fleet2551(T, "t2551r");
+    const flip = (site, h, enabled = true) => request("POST", `/api/jira/${encodeURIComponent(site)}/autostart`,
+      { headers: { ...h, "content-type": "application/json" }, body: { enabled } });
+    assert.equal((await flip(F.SA, T.B.h)).status, 404, "another tenant cannot tell it exists");
+    assert.equal((await flip(F.SA, T.C.h)).status, 404, "an admin role grants no tenant org");
+    assert.equal((await flip(F.SA, userHeaders)).status, 404, "break-glass has no tenant");
+    assert.equal((await flip(S2551, T.A.h)).status, 404, "a tenant user reaches no untenanted org");
+    assert.equal((await flip(F.SA, T.A.h)).status, 200);
+    assert.equal((await flip(F.SB, T.B.h, false)).status, 200);
+    assert.equal((await flip(S2551, userHeaders)).status, 200);
+    assert.equal(autoStartOrgs[F.SA], true);
+    assert.ok(!autoStartOrgs[F.SB], "B's setting is its own");
+    // Every /api/orgs route rides the same gate (a decision note here).
+    const note = (site, h) => request("POST", `/api/orgs/${encodeURIComponent(site)}/decisions`,
+      { headers: { ...h, "content-type": "application/json" }, body: { text: "n" } });
+    assert.equal((await note(F.SB, T.A.h)).status, 404);
+    assert.equal((await note(F.SA, T.A.h)).status, 200);
+    assert.ok(!(F.SB in hub.getDecisions()));
+    // The board's manual refresh fans out to the caller's own hosts only.
+    agents[F.ka].commands = []; agents[F.kb].commands = [];
+    const rf = await request("POST", "/api/jira/refresh", { headers: { ...T.A.h, "content-type": "application/json" }, body: {} });
+    assert.deepEqual(rf.body.hosts, [F.ka]);
+    assert.equal(agents[F.kb].commands.length, 0);
+  } finally {
+    if (F) {
+      forget2533("t2551r", F.ka, F.kb, F.kl);
+      for (const k of [F.SA, F.SB, S2551]) { delete autoStartOrgs[k]; delete hub.getDecisions()[k]; }
+    }
+    T.restore();
+  }
+});
+
+test("XERK-2551: the ticket queue routes a tenant's ticket only to that tenant's hosts", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await fleet2551(T, "t2551q");
+    // B's host is the only one with a free slot; A's ticket must still not go there.
+    agents[F.ka].capacity = { max: 1, used: 1 };
+    agents[F.kb].capacity = { max: 4, used: 0 };
+    const pick = hub.findTicketHost(F.SA, null, null, { requireFree: true });
+    assert.ok(!pick.host || pick.host === F.ka, JSON.stringify(pick));
+    assert.notEqual(pick.host, F.kb);
+    assert.notEqual(pick.host, F.kl);
+    const pickB = hub.findTicketHost(F.SB, null, null, {});
+    assert.equal(pickB.host, F.kb);
+  } finally { if (F) forget2533("t2551q", F.ka, F.kb, F.kl); T.restore(); }
+});
+
+test("XERK-2551: Tenir's meeting post is scoped by its token's tenant, never by the URL", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await fleet2551(T, "t2551m");
+    const mint = (who) => request("POST", "/api/meetings-token", { headers: { ...who.h, "content-type": "application/json" }, body: {} });
+    const tokA = (await mint(T.A)).body.token;
+    assert.match(tokA, /^tm1\.[0-9a-f]{32}\./);
+    // A's host can read meetings, so A's meeting is dispatched to it — and the
+    // transcript it pulls names the org PLAIN, as its command does.
+    await beat2533(F.ta, "t2551m", jira2551(S2551, { meetings: { available: true } }));
+    const post = (site, tok, id) => request("POST", `/api/orgs/${encodeURIComponent(site)}/meetings`,
+      { headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: meeting2508(id) });
+    assert.equal((await post(S2551, tokA, "a1")).status, 200);
+    assert.equal(hub.getMeetings()[F.SA].length, 1, "A's token files into A's org");
+    const run = hub.getMeetings()[F.SA][0];
+    assert.equal(run.host, F.ka);
+    const tx = await request("GET", `/api/agents/t2551m/meetings/${run.runId}/transcript`,
+      { headers: { authorization: `Bearer ${F.ta}` } });
+    assert.equal(tx.status, 200, JSON.stringify(tx.body));
+    assert.equal(tx.body.siteKey, S2551);
+    const cmd = agents[F.ka].commands.find((c) => c.type === "extractMeeting");
+    assert.equal(cmd.siteKey, F.SA, "stored scoped; handed over plain (asserted above for commands)");
+    assert.ok(!(F.SB in hub.getMeetings()) && !(S2551 in hub.getMeetings()));
+    // A typed suffix proves nothing: refused, with any token.
+    assert.equal((await post(F.SB, tokA, "a2")).status, 404);
+    assert.equal((await post(F.SA, "meetingstok", "a3")).status, 404);
+    // The fleet token is the operators' untenanted org.
+    assert.equal((await post(S2551, "meetingstok", "l1")).status, 200);
+    assert.equal(hub.getMeetings()[S2551].length, 1);
+    // A's secret under B's id is nobody's; B has no token until B mints one.
+    assert.equal((await post(S2551, `tm1.${T.B.t}.${tokA.split(".")[2]}`, "b1")).status, 401);
+    // Nothing the operators hold derives a tenant token: the old HMAC shape fails.
+    const crypto = require("node:crypto");
+    const forged = `tm1.${T.A.t}.${crypto.createHmac("sha256", "meetingstok")
+      .update(`turma-meetings-tenant:${T.A.t}`).digest("base64url")}`;
+    assert.equal((await post(S2551, forged, "f1")).status, 401);
+    // Status, never the token; break-glass has none.
+    const st = await request("GET", "/api/meetings-token", { headers: T.A.h });
+    assert.deepEqual([st.body.exists, "token" in st.body], [true, false]);
+    assert.equal((await request("GET", "/api/meetings-token", { headers: userHeaders })).status, 404);
+    // Rotating revokes the old token alone.
+    const tokA2 = (await mint(T.A)).body.token;
+    assert.notEqual(tokA2, tokA);
+    assert.equal((await post(S2551, tokA, "a4")).status, 401);
+    assert.equal((await post(S2551, tokA2, "a5")).status, 200);
+    // A disabled user's Tenir stops at once.
+    const tenancy = require("../tenancy.js");
+    hub.__setTenancy(tenancy.updateUser(hub.tenancyState(), T.A.user.id, { disabled: true }).state);
+    assert.equal(hub.meetingsTenant({ headers: { authorization: `Bearer ${tokA2}` } }), null);
+  } finally {
+    if (F) { forget2533("t2551m", F.ka, F.kb, F.kl); for (const k of [F.SA, F.SB, S2551]) delete hub.getMeetings()[k]; }
+    T.restore();
+  }
+});
+
+test("XERK-2551: an alert reaches only its host's tenant's devices", async () => {
+  const T = tenants2533();
+  try {
+    const ka = `t2551p@${T.A.t}`;
+    hub.registerDevice("dev2551a", "android", ["dismiss"], T.A.t);
+    hub.registerDevice("dev2551b", "android", ["dismiss"], T.B.t);
+    const toks = (host) => hub.devicesForHost(host).map((d) => d.token);
+    assert.ok(toks(ka).includes("dev2551a") && !toks(ka).includes("dev2551b"));
+    assert.ok(!toks(ka).includes("capture-device"), "an operator device gets no tenant alert");
+    assert.ok(toks("t2551leg").includes("capture-device") && !toks("t2551leg").includes("dev2551a"));
+    notifications.length = 0;
+    hub.notify("x", "y", { route: { host: ka } });
+    assert.deepEqual(notifications[0].tokens, ["dev2551a"]);
+    // A phone re-registering under another login moves to that tenant.
+    hub.registerDevice("dev2551a", "android", ["dismiss"], T.B.t);
+    assert.ok(!toks(ka).includes("dev2551a"));
+    // The route records the caller's tenant.
+    await request("POST", "/api/devices", { headers: { ...T.A.h, "content-type": "application/json" },
+      body: { token: "dev2551c" } });
+    assert.ok(toks(ka).includes("dev2551c"));
+  } finally {
+    for (const t of ["dev2551a", "dev2551b", "dev2551c"]) hub.unregisterDevice(t);
+    T.restore();
+  }
+});
+
+test("XERK-2551: purging a tenant removes all of its org data and nobody else's", async () => {
+  const T = tenants2533();
+  const SA = `${S2551}@${T.A.t}`, SB = `${S2551}@${T.B.t}`;
+  try {
+    autoStartOrgs[SA] = true; autoStartOrgs[SB] = true;
+    hub.appendDecision(SA, { source: "note", text: "a" });
+    hub.appendDecision(SB, { source: "note", text: "b" });
+    hub.ticketAgents[`${SA}/X-1`] = "h"; hub.ticketAgents[`${SB}/X-1`] = "h";
+    hub.ticketQueue.push({ siteKey: SA, issueKey: "X-2", source: "manual", at: Date.now() });
+    hub.registerDevice("dev2551z", "android", [], T.A.t);
+    const r = hub.purgeTenantData(T.A.t);
+    assert.equal(r.autoStartOrgs, 1);
+    assert.ok(!(SA in autoStartOrgs) && autoStartOrgs[SB]);
+    assert.ok(!(SA in hub.getDecisions()) && SB in hub.getDecisions());
+    assert.ok(!(`${SA}/X-1` in hub.ticketAgents) && `${SB}/X-1` in hub.ticketAgents);
+    assert.ok(!hub.ticketQueue.some((e) => e.siteKey === SA));
+    assert.ok(!hub.listDevices().some((d) => d.token === "dev2551z"));
+    // A registered purge runs too, and a failing one does not stop the rest.
+    let seen = null;
+    hub.registerTenantPurge("t2551boom", () => { throw new Error("boom"); });
+    hub.registerTenantPurge("t2551seen", (t) => { seen = t; return 1; });
+    const r2 = hub.purgeTenantData(T.B.t);
+    assert.equal(seen, T.B.t);
+    assert.ok(r2.t2551boom.error);
+    assert.ok(!(SB in autoStartOrgs));
+    assert.throws(() => hub.purgeTenantData("nope"));
+  } finally {
+    hub.registerTenantPurge("t2551boom", () => 0);
+    for (const k of [SA, SB]) { delete autoStartOrgs[k]; delete hub.getDecisions()[k]; }
+    for (const k of Object.keys(hub.ticketAgents)) if (k.includes("acme2551")) delete hub.ticketAgents[k];
+    T.restore();
+  }
+});
+
+test("XERK-2551: an epic builder is cancelled only through its own org", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await fleet2551(T, "t2551e");
+    hub.epicBuilders.eb2551b = { id: "eb2551b", siteKey: F.SB, title: "t", idea: "i", state: "queued",
+      startedAt: 1, updatedAt: 1 };
+    const del = (site, h) => request("DELETE",
+      `/api/jira/${encodeURIComponent(site)}/epic-builder/eb2551b`, { headers: h });
+    assert.equal((await del(F.SA, T.A.h)).status, 404, "A's own org passes the guard, not B's builder");
+    assert.ok(hub.epicBuilders.eb2551b);
+    assert.equal((await del(F.SB, T.B.h)).status, 200);
+    assert.ok(!hub.epicBuilders.eb2551b);
+  } finally { if (F) forget2533("t2551e", F.ka, F.kb, F.kl); delete hub.epicBuilders.eb2551b; T.restore(); }
+});
+
+test("XERK-2551: a binding made before the tenant follows the host; a restored record is re-scoped", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await fleet2551(T, "t2551b");
+    // A binding stored plain (made before the host joined its tenant) moves into it on the beat.
+    agents[F.ka].orgBound = S2551;
+    await beat2533(F.ta, "t2551b", jira2551());
+    assert.equal(agents[F.ka].orgBound, F.SA);
+    assert.equal(hub.decidedOrgOf(agents[F.ka]), F.SA, "not read as drifted");
+    // A record saved before this hub: re-scoped on restore, before any beat.
+    const map = {
+      [F.ka]: { device: "t2551b", orgBound: S2551, jira: { siteKey: S2551 },
+        sessions: [{ id: "s", ticket: { siteKey: S2551, key: "X-1" } }] },
+      t2551bleg: { device: "t2551bleg", orgBound: F.SB, jira: { siteKey: F.SB } },
+    };
+    hub.rescopeRestoredOrgs(map);
+    assert.deepEqual([map[F.ka].orgBound, map[F.ka].jira.siteKey, map[F.ka].sessions[0].ticket.siteKey],
+      [F.SA, F.SA, F.SA]);
+    assert.deepEqual([map.t2551bleg.orgBound, map.t2551bleg.jira.siteKey], [S2551, S2551],
+      "an untenanted record never keeps a tenant's org");
+    // An older replica's record arriving over the HA watch is scoped too.
+    hub.applyRemoteAgent(F.ka, { device: "t2551b", lastSeen: Date.now(), sessions: [], commands: [],
+      orgBound: S2551, jira: { siteKey: S2551 } });
+    assert.deepEqual([agents[F.ka].orgBound, agents[F.ka].jira.siteKey], [F.SA, F.SA]);
+  } finally { if (F) forget2533("t2551b", F.ka, F.kb, F.kl); T.restore(); }
 });

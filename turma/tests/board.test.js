@@ -408,6 +408,9 @@ test("orgColor: honors a pin, with and without the full set (XERK-145)", () => {
 
 test("orgName: the org, not the Jira Cloud host", () => {
   assert.equal(orgName("myorg.atlassian.net"), "myorg");
+  // XERK-2551: a tenant's org key carries its tenant; the label is the site alone.
+  assert.equal(orgName(`myorg.atlassian.net@${"a".repeat(32)}`), "myorg");
+  assert.equal(orgName(`dev.azure.com/acme@${"b".repeat(32)}`), "acme");
   assert.equal(orgName("MyOrg.Atlassian.Net"), "MyOrg", "case-insensitive suffix");
   // Only the Jira Cloud suffix goes: on any other host the whole host is the
   // org's name there, and a site merely CONTAINING the suffix keeps it.
