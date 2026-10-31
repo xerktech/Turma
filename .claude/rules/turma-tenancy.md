@@ -1,0 +1,74 @@
+---
+paths:
+  - turma/server.js
+  - turma/tenancy.js
+  - turma/tests/tenancy.test.js
+  - turma/tests/oidc-groups.test.js
+  - turma/tests/oidc.test.js
+  - turma/public/login.html
+description: Hub users + tenants (XERK-2530, epic XERK-2529) — the principal every route keys on, and the invariants a tenancy change must keep.
+---
+
+# Hub users, tenants and the request principal (XERK-2530)
+
+Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`; wiring in
+`server.js` (`requestPrincipal`, `localLogin`, `oidcPrincipal`, the `tenancy` store).
+
+## The principal
+
+- **`requestPrincipal(req)` is the ONLY way a route learns who is calling** —
+  `{kind, userId, tenantId, roles}`. Never re-derive identity from a cookie, header or body.
+  `userAuthorized(req)` = "some principal"; a tenancy check reads `tenantId`, an admin check `roles`.
+- Kinds: `user` (own tenant), `breakglass` (admin, NO tenant), `legacy` (pre-tenancy cookie:
+  signed in, no tenant, no role), `open` (no login configured at all).
+- **Break-glass never gets a tenant.** It may reach the admin surface, never tenant data. Do not
+  give it a tenant to make a route "just work".
+- **An admin role grants no tenant data.** Admin = identities only; an admin's own data comes via
+  its `user` role and its own `tenantId`.
+- **Roles and existence are read from the STORE every request** (`principalFromToken`), never trusted
+  from the cookie's claims: disabling a user or dropping its group ends its sessions at once.
+  A principal with no role is not signed in.
+- A token's `t` must equal the user's stored `tenantId`, or it names nobody.
+- `authEnabled()` = break-glass password OR bootstrap env OR any stored user. It replaced every
+  `!!TURMA_PASSWORD` auth check; a new one must use it, or a passwordless hub with local users
+  reads as open.
+
+## Records
+
+- One user = one tenant. `tenantId` is random 32-hex, immutable (`updateUser` pins it), distinct from
+  `userId`, and NEVER derived from a username, display name or email.
+- OIDC identity is `(oidcIss, oidcSub)`, never the email or name (the IdP lets those change).
+- `coerceTenancy` is the ONE whitelist (boot, remote watch); it is a coerce fixed point, null-prototype
+  maps, and drops duplicate logins (case-folded username / iss+sub) and reused tenants.
+  - An unset group map is OMITTED (not `{}`), so the shipped defaults keep applying after a re-coerce.
+- Store: `/data/users.json` (`TENANCY_FILE`), `registerExternalStore` with `debounceMs: 0`. Never
+  `state.json`. Tests must set `TENANCY_FILE` (an unset one writes the host's real `/data`).
+
+## Passwords + login
+
+- scrypt via stdlib only; `scrypt$N$r$p$salt$key`. Plaintext is never stored or logged.
+- **At most `LOGIN_SCRYPT_INFLIGHT_MAX` (2) scrypt verifications at once; the rest get 503 +
+  `Retry-After`.** Each costs 16 MiB inside the XERK-287 margin (`turma-limits.md`) — never raise N or
+  the cap without re-measuring.
+- `parseHash` refuses a stored cost past `SCRYPT_MAXMEM`: a hand-edited store must not OOM a login.
+- **`/api/login` checks break-glass FIRST, scrypt-free**, so a flood cannot lock break-glass out.
+- An unknown username verifies against a dummy hash (same cost, no timing oracle); every failure is
+  the same 401 `invalid credentials` (no enumeration of disabled/role-less users).
+- Basic auth is break-glass ONLY — never check a local password per request.
+
+## Tokens
+
+- `hub_session` is `u2.<expiry>.<b64url claims>.<hmac>`: `{u,t,r}` for a user, `{bg:1,r:["admin"]}`
+  for break-glass. OIDC and local logins issue the same shape (one principal).
+- Signed with `SESSION_SIGN_KEY`: `SESSION_KEY` when it is secret (`TURMA_SESSION_SECRET` or the
+  break-glass password), else a per-process random key. Never sign browser credentials with the
+  public-string default. Relay/forward auth keep `SESSION_KEY` (must match across replicas).
+
+## Bootstrap
+
+- `TURMA_BOOTSTRAP_ADMIN_USER`/`_PASSWORD` create one local admin ONLY when the store has no user.
+  Never reuse `TURMA_USER` for it (break-glass has no tenant by design).
+
+## Tests
+
+- `turma/tests/tenancy.test.js` (own process); `XERK-2530:` in `oidc-groups.test.js`.

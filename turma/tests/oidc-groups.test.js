@@ -40,6 +40,7 @@ process.env.STATE_FILE = tmp("state");
 process.env.DEVICES_FILE = tmp("devices");
 process.env.TICKET_AGENTS_FILE = tmp("ticket-agents");
 process.env.AGENT_IDENTITIES_FILE = tmp("agent-identities");
+process.env.TENANCY_FILE = tmp("tenancy");
 process.env.AUTOSTART_ORGS_FILE = tmp("autostart-orgs");
 process.env.TICKET_MODELS_FILE = tmp("ticket-models");
 process.env.TICKET_RUNTIMES_FILE = tmp("ticket-runtimes");
@@ -194,6 +195,26 @@ test("a user in the admin group is admitted with an admin-role session", async (
   const rec = await sessGet(sidFromSetCookie(res));
   assert.ok(rec);
   assert.equal(rec.role, "admin");
+});
+
+test("XERK-2530: the callback's session names a hub user with its own tenant; the admin group adds admin", async () => {
+  const { res } = await driveCallback([ADMIN_GROUP]);
+  assert.equal(res.status, 302);
+  const token = setCookieText(res).match(/hub_session=([^;]+)/)[1];
+  const p = hub.requestPrincipal({ headers: { cookie: `hub_session=${token}` } });
+  assert.equal(p.kind, "user");
+  assert.equal(p.source, "oidc");
+  assert.match(p.tenantId, /^[0-9a-f]{32}$/);
+  assert.deepEqual([...p.roles], ["user", "admin"]);
+  const rec = await sessGet(sidFromSetCookie(res));
+  assert.equal(rec.userId, p.userId);
+  // The same IdP subject signing in again is the same user and tenant.
+  const again = await driveCallback([USER_GROUP]);
+  const t2 = setCookieText(again.res).match(/hub_session=([^;]+)/)[1];
+  const p2 = hub.requestPrincipal({ headers: { cookie: `hub_session=${t2}` } });
+  assert.equal(p2.userId, p.userId);
+  assert.equal(p2.tenantId, p.tenantId);
+  assert.deepEqual([...p2.roles], ["user"]);
 });
 
 test("a user in NEITHER group is denied a session and bounced to /login?error=forbidden", async () => {

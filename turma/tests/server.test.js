@@ -72,6 +72,7 @@ process.env.AGENT_IDENTITIES_FILE = path.join(
   scratchDir(),
   `turma-test-agent-identities-${process.pid}.json`
 );
+process.env.TENANCY_FILE = path.join(scratchDir(), `turma-test-tenancy-${process.pid}.json`);
 process.env.NAME_TOKEN_GENS_FILE = path.join(
   scratchDir(),
   `turma-test-name-token-gens-${process.pid}.json`
