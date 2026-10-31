@@ -72,6 +72,7 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     CF-Connecting-IP when the hop is untrusted: a caller off Cloudflare rotates it per request
     and gets a fresh backoff each time — break-glass runs no scrypt, so that was unlimited guessing.
     - IPv6 keys collapse to the /64 (`loginIpv6Prefix64`): one subscriber rotates within it.
+      Accepted: a /56 holder still gets 256 keys. An embedded-IPv4 form keys whole (one client).
     - Residual: anything inside the trusted CIDR still forges all headers.
     - Tests: `tenancy-nopassword.test.js` "XERK-2585: off Cloudflare…".
   - `loginFailures` keys are a sha256 of client + username — the username is unbounded (1 MiB body),

@@ -207,6 +207,11 @@ test("XERK-2585: off Cloudflare, a rotated CF-Connecting-IP never changes the si
   assert.equal(key({}, "fe80::1%eth0"), "fe80:0:0:0::/64");
   assert.equal(hub.loginIpv6Prefix64("::1"), "0:0:0:0::/64");
   assert.equal(hub.loginIpv6Prefix64("64:ff9b::1.2.3.4"), "64:ff9b:0:0::/64");
+  // An IPv4 client in IPv6 dress keys on itself, never on a shared /64.
+  assert.equal(key({ "cf-connecting-ip": "64:ff9b::1.2.3.4", "x-forwarded-for": "10.244.1.5" }, "10.244.2.8"),
+    "64:ff9b::1.2.3.4");
+  assert.notEqual(key({ "x-forwarded-for": "0:0:0:0:0:ffff:1.2.3.4" }, "10.244.2.8"),
+    key({ "x-forwarded-for": "0:0:0:0:0:ffff:5.6.7.8" }, "10.244.2.8"));
   // Unset env keeps the three-part key exactly.
   assert.equal(key({ "cf-connecting-ip": "198.51.100.1", "x-forwarded-for": "192.168.1.50" }, "10.244.2.8", null),
     "198.51.100.1|192.168.1.50|10.244.2.8");

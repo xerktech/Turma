@@ -13434,9 +13434,10 @@ function loginIpv6Prefix64(ip) {
   const full = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - groups(head) - groups(tail))).fill("0"), ...t];
   return `${full.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(":")}::/64`;
 }
+// An IPv6 form carrying an IPv4 tail (mapped, NAT64) names one IPv4 client, so it
+// keys on the whole address — its /64 would pool every such client together.
 function loginClientAddr(ip) {
-  const bare = ip.replace(/%.*$/, "");
-  return net.isIP(bare) === 6 ? loginIpv6Prefix64(bare.toLowerCase()) : ip;
+  return net.isIP(ip) === 6 && !ip.includes(".") ? loginIpv6Prefix64(ip.toLowerCase()) : ip;
 }
 function loginClientKey(req, trusted = LOGIN_TRUSTED_PROXIES) {
   const h = req.headers || {};
