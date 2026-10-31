@@ -86,6 +86,10 @@ class LoginTest {
             loginRefusalMessage("too many failed sign-ins — try again later", "300"),
         )
         assertEquals("slow down (retry in 2 min)", loginRefusalMessage("slow down", "61"))
+        assertEquals("slow down (retry in 59s)", loginRefusalMessage("slow down", "59"))
+        assertEquals("slow down (retry in 1 min)", loginRefusalMessage("slow down", "60"))
+        assertEquals("slow down", loginRefusalMessage("slow down", "99999999999999999999999"))
+        assertEquals("slow down", loginRefusalMessage("slow down", "\u0661\u0662"))
         assertEquals("slow down", loginRefusalMessage("slow down", null))
         assertEquals("slow down", loginRefusalMessage("slow down", "0"))
         assertEquals("slow down", loginRefusalMessage("slow down", "Wed, 21 Oct 2026 07:28:00 GMT"))

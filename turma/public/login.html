@@ -122,7 +122,8 @@
   function refusalMessage(status, body, retryAfter) {
     const said = body && typeof body.error === "string" ? body.error.trim() : "";
     if (!said) return `Sign-in failed (HTTP ${status}). Please try again.`;
-    const secs = /^\d+$/.test(String(retryAfter || "").trim()) ? Number(retryAfter) : 0;
+    const n = /^[0-9]+$/.test(String(retryAfter || "").trim()) ? Number(retryAfter) : 0;
+    const secs = Number.isSafeInteger(n) ? n : 0; // an absurd value: no wait, as on Android
     if (!secs) return said;
     const wait = secs < 60 ? `${secs}s` : `${Math.ceil(secs / 60)} min`;
     return `${said} (retry in ${wait})`;

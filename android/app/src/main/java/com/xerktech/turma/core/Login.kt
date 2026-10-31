@@ -68,7 +68,7 @@ fun signInError(result: SignInResult): String? = when (result) {
  * HTTP-date or zero Retry-After leaves the hub's words alone.
  */
 fun loginRefusalMessage(said: String, retryAfter: String?): String {
-    val secs = retryAfter?.trim()?.takeIf { it.isNotEmpty() && it.all(Char::isDigit) }?.toLongOrNull() ?: 0L
+    val secs = retryAfter?.trim()?.takeIf { it.isNotEmpty() && it.all { c -> c in '0'..'9' } }?.toLongOrNull() ?: 0L
     if (secs <= 0L) return said
     val wait = if (secs < 60) "${secs}s" else "${(secs + 59) / 60} min"
     return "$said (retry in $wait)"

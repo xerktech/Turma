@@ -224,4 +224,20 @@ class PasswordLoginTest {
         hub.json("/api/agents", "{\"agents\":[]}")
         assertEquals(SignInResult.Ok, hub.container.client.signIn(candidate()).result)
     }
+
+    // A throttled re-login drops the lapsed session but KEEPS the password, so
+    // the next call signs in again — it must never sign the operator out.
+    @Test fun `a throttled re-login keeps the stored credentials`() = runBlocking {
+        hub.container.config.save(base, "alice", "s3cret", "dead-tok")
+        hub.route("/api/login") {
+            MockResponse().setResponseCode(503).setHeader("Retry-After", "1")
+                .setHeader("Content-Type", "application/json")
+                .setBody("{\"error\":\"too many sign-ins in progress — try again in a moment\"}")
+        }
+        hub.route("/api/agents") { MockResponse().setResponseCode(401) }
+        assertTrue(runCatching { hub.container.client.api.listAgents() }.isFailure)
+        assertEquals("alice", hub.container.config.current.user)
+        assertEquals("s3cret", hub.container.config.current.password)
+        assertEquals("", hub.container.config.current.sessionToken)
+    }
 }
