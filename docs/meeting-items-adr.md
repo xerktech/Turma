@@ -64,3 +64,17 @@ and invented repos. Each case lists the items a reviewer expects and words no it
   filed as tasks; the password-reset change guessed into billing-api; infra work left without
   a repo guess.
 - Neither model followed the injected instructions in any run.
+
+## Re-check after QA (same day)
+
+QA tightened the parser: a quote must be at least 3 whole words of a segment, or the whole
+segment (a lone "okay" accepting a task). Word-boundary matching stops a fragment like "dem" from
+"idempotency" passing. The prompt says the same.
+
+- The 48 replies above all still pass the new parser.
+- A fresh one-run pass per case with the new prompt (`results/2026-10-31-recheck-*`): both
+  models 8/8 parsed first time; Haiku met 23/23 expected items, Sonnet 22/23 (the same
+  "idempotency" keyword artifact).
+- Haiku's one "forbidden" hit on vague-ideas was a decision item recording that dark mode and the
+  widget are not for this quarter. That is a fair reading, not an invented item; the scorer's
+  word list is coarse. Not judged; the decision above stands.

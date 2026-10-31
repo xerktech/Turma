@@ -25163,6 +25163,7 @@ MEETING_DESCRIPTION_MAX = 4000
 MEETING_NAME_MAX = 100              # speaker / suggestedAssignee
 MEETING_DUE_MAX = 40
 MEETING_QUOTE_MAX = 500
+MEETING_QUOTE_MIN_WORDS = 3         # a shorter quote must be its WHOLE segment
 MEETING_REPO_MAX = 200
 MEETING_SEGMENTS_MAX = 10000        # the hub's ingest cap
 MEETING_INPUT_MAX = 400_000         # chars of model input; past it the tail is cut
@@ -25179,7 +25180,7 @@ MEETING_DUP_WORDS = 6               # title words searched for duplicates
 MEETING_DUP_FETCH = 20              # open issues read per item
 MEETING_DUP_KEYS_MAX = 5
 MEETING_DUP_BUDGET_SEC = 90         # the whole duplicate check, per meeting
-_MEETING_WORD_RE = re.compile(r"[a-z0-9]+")
+_MEETING_WORD_RE = re.compile(r"[^\W_]+")
 _MEETING_STOPWORDS = frozenset(
     "the and for with from that this into onto over under about after before "
     "when then than them they their there these those what which while will "
@@ -25213,7 +25214,7 @@ MEETING_INSTRUCTION = (
     f'release"), at most {MEETING_DUE_MAX} characters; null when none was said.\n'
     '- "quotes": 1 to 3 objects {"speaker", "text", "atMs"} that show the item '
     "was said: `text` copied word for word from ONE segment's `text` (a "
-    "contiguous part of it, at most 300 characters), `speaker` that segment's "
+    "run of at least 3 whole words, or the whole segment; at most 300 characters), `speaker` that segment's "
     "speaker and `atMs` that segment's `at`.\n"
     '- "repoGuess": the repository the work belongs in, exactly one `name` '
     "from `repos`, or null when none clearly fits or for a decision.\n\n"
@@ -25346,7 +25347,7 @@ def meeting_items_problems(obj, transcript, repos):
                                     and len(due) <= MEETING_DUE_MAX):
             problems.append(f"{where} due is not 1-{MEETING_DUE_MAX} chars")
         repo = it.get("repoGuess")
-        if repo is not None and repo not in repo_names:
+        if repo is not None and not (isinstance(repo, str) and repo in repo_names):
             problems.append(f"{where} repoGuess {repo!r} is not a listed repo")
         quotes = it["quotes"]
         if not (isinstance(quotes, list) and 1 <= len(quotes) <= MEETING_QUOTES_MAX):
@@ -25360,10 +25361,14 @@ def meeting_items_problems(obj, transcript, repos):
                 continue
             want, spk = _meeting_norm(q["text"]), q["speaker"].casefold()
             at = q["atMs"]
-            if not want or not any(s_spk == spk and s_at == at and want in s_norm
-                                   for s_spk, s_at, s_norm in segs):
-                problems.append(f"{where} quote {q['text'][:40]!r} is not in the transcript "
-                                "as given (speaker, atMs, words)")
+            whole = len(want.split()) >= MEETING_QUOTE_MIN_WORDS
+            if not want or not any(
+                    s_spk == spk and s_at == at
+                    and (want == s_norm or (whole and f" {want} " in f" {s_norm} "))
+                    for s_spk, s_at, s_norm in segs):
+                problems.append(f"{where} quote {q['text'][:40]!r} is neither "
+                                f"{MEETING_QUOTE_MIN_WORDS}+ whole words of nor a whole segment "
+                                "as given (speaker, atMs)")
     return problems
 
 
@@ -25395,10 +25400,11 @@ def parse_meeting_items(raw, transcript, repos):
 
 def _meeting_words(text):
     """The significant words of a title, in order, deduped: what a duplicate
-    search matches on. Only [a-z0-9] survives, so a word is safe in JQL/WIQL."""
+    search matches on. Only letters and digits survive (any script), so a word
+    holds no quote, backslash or operator and is safe in JQL/WIQL."""
     out = []
     for w in _MEETING_WORD_RE.findall(unicodedata.normalize("NFKC", str(text or "")).lower()):
-        if len(w) >= 3 and w not in _MEETING_STOPWORDS and w not in out:
+        if (len(w) >= 3 or not w.isascii()) and w not in _MEETING_STOPWORDS and w not in out:
             out.append(w)
     return out
 
@@ -43609,7 +43615,10 @@ class SessionManager:
 
     def _meeting_worker_loop(self):
         """Extract owed meetings one at a time. Wake cleared BEFORE the queue is
-        read, so a command staged mid-run is kept."""
+        read, so a command staged mid-run is kept. First drops the prompt/reply
+        files a killed manager left (a `.in` holds a whole meeting): none is in
+        use, since this is the only worker that writes them."""
+        self._sweep_meeting_scratch()
         while True:
             self._meeting_wake.wait()
             self._meeting_wake.clear()
@@ -43624,6 +43633,17 @@ class SessionManager:
                     items, error = None, f"extraction failed: {type(e).__name__}: {e}"
                 self._meeting_push(job, items=items, error=error)
 
+    @staticmethod
+    def _sweep_meeting_scratch():
+        try:
+            for name in os.listdir(REGISTRY_DIR):
+                if name.startswith("meeting-") and name.endswith((".in", ".out")):
+                    path = os.path.join(REGISTRY_DIR, name)
+                    if os.path.isfile(path) and not os.path.islink(path):
+                        os.remove(path)
+        except OSError as e:
+            log(f"meeting: scratch sweep failed: {e}")
+
     def _fetch_meeting_transcript(self, run_id):
         """OFF THE BEAT: GET the run's transcript from the hub (agent-authed,
         bounded in time and bytes). Returns the parsed JSON or raises."""
@@ -43633,8 +43653,20 @@ class SessionManager:
         url = (f"{TURMA_URL}/api/agents/{urllib.parse.quote(self.device, safe='')}"
                f"/meetings/{urllib.parse.quote(run_id, safe='')}/transcript")
         req = urllib.request.Request(url, headers=headers, method="GET")
+        # The socket timeout bounds each read only, so a trickling peer could
+        # hold the one worker for ages: read in chunks against a hard deadline.
+        deadline = time.monotonic() + MEETING_FETCH_TIMEOUT_SEC
+        chunks, got = [], 0
         with urllib.request.urlopen(req, timeout=MEETING_FETCH_TIMEOUT_SEC) as resp:
-            body = resp.read(MEETING_TRANSCRIPT_MAX_BYTES + 1)
+            while got <= MEETING_TRANSCRIPT_MAX_BYTES:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("the transcript took too long to arrive")
+                chunk = resp.read1(64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                got += len(chunk)
+        body = b"".join(chunks)
         if len(body) > MEETING_TRANSCRIPT_MAX_BYTES:
             raise ValueError("the transcript is larger than this agent reads")
         return json.loads(body.decode("utf-8", "replace"))

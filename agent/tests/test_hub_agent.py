@@ -55581,16 +55581,31 @@ class TestMeetingItems(unittest.TestCase):
         for bad in (dict(q, text="add a retry queue to the charge call"),  # invented
                     dict(q, speaker="Lena Fischer"),                        # wrong speaker
                     dict(q, atMs=q["atMs"] + 1),                            # wrong segment
-                    dict(q, text=""), {"speaker": q["speaker"], "text": q["text"]}):
+                    dict(q, text=""), {"speaker": q["speaker"], "text": q["text"]},
+                    dict(q, text="the charge"),                  # short, not the whole segment
+                    dict(q, text="dempotency key to the"),                 # mid-word
+                    dict(q, text=["add", "the", "key"])):
             self.assertIsNone(ha.parse_meeting_items(self.reply(self.item(quotes=[bad])),
                                                      self.t, self.repos), bad)
         self.assertIsNone(ha.parse_meeting_items(self.reply(self.item(quotes=[])),
                                                  self.t, self.repos))
 
+    def test_a_short_quote_counts_only_as_its_whole_segment(self):
+        doc = dict(self.doc, segments=self.doc["segments"] + [
+            {"speaker": "Tom Okafor", "text": "Okay.", "startMs": 999_000}])
+        t = ha.normalize_meeting_transcript(doc, "ab12", "acme.atlassian.net")
+        ok = {"speaker": "Tom Okafor", "text": "okay", "atMs": 999_000}
+        self.assertIsNotNone(ha.parse_meeting_items(self.reply(self.item(quotes=[ok])),
+                                                    t, self.repos))
+        self.assertIsNone(ha.parse_meeting_items(
+            self.reply(self.item(quotes=[dict(ok, text="o")])), t, self.repos))
+
     def test_the_parser_rejects_never_repairs(self):
         bad = [self.item(kind="epic"), self.item(title=""), self.item(title="a\nb"),
                self.item(title="x" * 201), self.item(suggestedAssignee="Somebody Else"),
-               self.item(repoGuess="not-a-repo"), self.item(due=""), self.item(due="x" * 41),
+               self.item(repoGuess="not-a-repo"), self.item(repoGuess=["billing-api"]),
+               self.item(repoGuess={"a": 1}), self.item(suggestedAssignee=["Tom Okafor"]),
+               self.item(due=""), self.item(due="x" * 41),
                self.item(extra=1), {k: v for k, v in self.item().items() if k != "quotes"}]
         for it in bad:
             self.assertIsNone(ha.parse_meeting_items(self.reply(it), self.t, self.repos), it)
@@ -55659,6 +55674,9 @@ class TestMeetingDuplicates(unittest.TestCase):
                          ["A-1", "A-2", "A-4"])
         self.assertEqual(ha._meeting_words('Fix "the" O\'Brien; DROP-table x9'),
                          ["brien", "drop", "table"])   # "fix" is a stopword
+        # Any script's letters count; nothing that could quote out of JQL survives.
+        self.assertEqual(ha._meeting_words("Résumé café naïve — 支付失败 \"x\\y'"),
+                         ["résumé", "café", "naïve", "支付失败"])
 
     def test_jira_search_is_a_scoped_read(self):
         seen = []
@@ -55895,6 +55913,40 @@ class TestMeetingWorker(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha.threading, "Thread", side_effect=RuntimeError("pids")):
             self.sm._meeting_worker = None
             tick(self.sm)                     # never raises onto the beat
+
+
+class TestMeetingFetchAndScratch(ManagerMixin, unittest.TestCase):
+    """XERK-2509 QA: a trickling hub cannot hold the worker past the fetch
+    deadline, and a killed run's prompt file is swept when the worker starts."""
+
+    def test_a_trickling_transcript_hits_the_deadline(self):
+        sm = self.make_manager()
+
+        class Drip:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read1(self, n):
+                return b" "
+        clock = iter(range(0, 10 ** 6, 5))
+        with mock.patch.object(ha.urllib.request, "urlopen", lambda req, timeout: Drip()), \
+                mock.patch.object(ha.time, "monotonic", lambda: next(clock)):
+            with self.assertRaises(TimeoutError):
+                sm._fetch_meeting_transcript("ab12")
+
+    def test_the_worker_sweeps_a_killed_runs_files(self):
+        sm = self.make_manager()
+        os.makedirs(ha.REGISTRY_DIR, exist_ok=True)
+        for name in ("meeting-x.in", "meeting-y.out", "daily-brief-z.out", "meeting-keep"):
+            with open(os.path.join(ha.REGISTRY_DIR, name), "w") as f:
+                f.write("t")
+        sm._sweep_meeting_scratch()
+        self.assertEqual(sorted(n for n in os.listdir(ha.REGISTRY_DIR)
+                                if n.startswith(("meeting-", "daily-brief-"))),
+                         ["daily-brief-z.out", "meeting-keep"])
 
 
 class TestLockdownOneshotStdin(ManagerMixin, unittest.TestCase):

@@ -25,6 +25,8 @@ Wire: `contract-meetings.md`. Model decision and eval: `docs/meeting-items-adr.m
   with the same function, so tightening one re-runs `bench/meeting-items/run_eval.py`):
   - every quote must be found in ONE segment with that speaker and that `at` (`atMs`), compared
     NFKC + case-folded + punctuation as spaces (`_meeting_norm`) — an invented quote fails;
+  - a quote is `MEETING_QUOTE_MIN_WORDS`+ WHOLE words of it, or the whole segment ("okay"):
+    a bare substring let "the" or "dem" (from "idempotency") pass as evidence (XERK-2509 QA);
   - `suggestedAssignee` must be a participant or a speaker; `repoGuess` a name from `repos`;
   - unknown/missing keys, an unknown kind, over-long fields or >30 items fail the reply.
   - `[]` is a real answer ("nothing to propose") and ships as `ok, items: []`.
@@ -32,7 +34,7 @@ Wire: `contract-meetings.md`. Model decision and eval: `docs/meeting-items-adr.m
   from a READ-ONLY search (`meeting_duplicate_keys`: a Jira JQL `summary ~` / an ADO WIQL
   `CONTAINS` over OPEN issues of the org's projects, any assignee), ranked client-side by shared
   title words (`_meeting_dup_rank`: ≥2 shared, covering half the title's). Never a tracker write.
-  - Only `[a-z0-9]` words reach JQL/WIQL (`_meeting_words`); project keys pass
+  - Only letters and digits (any script) reach JQL/WIQL (`_meeting_words`); project keys pass
     `_DAILY_BRIEF_PROJECT_RE`, ADO names are `'`-escaped.
   - Best-effort: a search error, or `MEETING_DUP_BUDGET_SEC` spent, leaves `[]`; the items ship.
   - A `decision` files nothing, so is not searched.
@@ -40,8 +42,11 @@ Wire: `contract-meetings.md`. Model decision and eval: `docs/meeting-items-adr.m
   same allowlist a ticket's repoGuess is checked against.
 - **Only `claude` is offered** (`meeting_runtimes` = `daily_brief_runtimes`), and only with a
   board (`meetings.available`); the siteKey must be this host's board, else `failed`.
+- The transcript GET has a HARD deadline over the whole read (`read1` chunks), not just a
+  per-socket timeout: a trickling peer otherwise held the one worker for minutes.
+- The worker sweeps `meeting-*.in/.out` at start: a killed manager left a whole meeting there.
 - A re-delivered runId runs once (`_meeting_seen`); an unusable command that names a run is
   answered `failed`. The outbox is cleared BY IDENTITY once a beat carried it.
 - Tests: `TestMeetingItems`, `TestMeetingDuplicates`, `TestMeetingWorker` (the fixture
   `meeting_transcript.json` = `bench/meeting-items/corpus/sprint-planning.json`),
-  `TestLockdownOneshotStdin`.
+  `TestMeetingFetchAndScratch`, `TestLockdownOneshotStdin`.
