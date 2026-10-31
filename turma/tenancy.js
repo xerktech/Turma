@@ -322,6 +322,16 @@ function bootstrapAdmin(state, { username, password, now = Date.now() }) {
   });
 }
 
+// The tenant a registry/ledger host key belongs to, or "" for an untenanted key
+// (XERK-2533: a tenant host's key is `<device>@<32-hex tenantId>`, set by the hub
+// from the credential, never by the agent). Every ledger row is keyed by that
+// host key, so this is how a row's tenant is read (XERK-2550).
+const TENANT_HOST_KEY_RE = /@([0-9a-f]{32})$/;
+function tenantOfHostKey(key) {
+  const m = typeof key === "string" ? TENANT_HOST_KEY_RE.exec(key) : null;
+  return m ? m[1] : "";
+}
+
 module.exports = {
   ROLES,
   DEFAULT_GROUPS,
@@ -345,4 +355,6 @@ module.exports = {
   upsertOidcUser,
   updateUser,
   bootstrapAdmin,
+  TENANT_HOST_KEY_RE,
+  tenantOfHostKey,
 };

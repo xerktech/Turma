@@ -22,6 +22,8 @@
 
 "use strict";
 
+const { tenantOfHostKey } = require("./tenancy.js");
+
 const fs = require("fs");
 const path = require("path");
 
@@ -502,11 +504,12 @@ function suggestedRule(g) {
   return ruleVerdict(g).rule || null;
 }
 
-function scopedRows(hostSet, days, now) {
+function scopedRows(hostSet, days, now, visible = null) {
   const since = now - Math.min(Math.max(1, days || 7), DAYS) * DAY_MS;
   const out = [];
   for (const [host, m] of hosts) {
     if (hostSet && !hostSet.has(host)) continue;
+    if (visible && !visible(host)) continue;
     for (const row of m.values()) if (row.openedAt >= since) out.push({ host, row });
   }
   return out;
@@ -527,8 +530,8 @@ function askKey(prompt) {
  * `{top, recent}` for the Usage page. `hostSet` (a Set of host keys) scopes it —
  * the route builds it from the LIVE fleet's org, like `retiredUsage`; null = all.
  */
-function aggregate({ hosts: hostSet = null, days = 7, now = Date.now() } = {}) {
-  const rows = scopedRows(hostSet, days, now);
+function aggregate({ hosts: hostSet = null, days = 7, now = Date.now(), visible = null } = {}) {
+  const rows = scopedRows(hostSet, days, now, visible);
   const groups = new Map();
   for (const { row } of rows) {
     const ask = row.kind === "ask-in-chat";
@@ -598,16 +601,32 @@ function aggregate({ hosts: hostSet = null, days = 7, now = Date.now() } = {}) {
 }
 
 /** Per-kind counts and summed waits across everything retained (for /metrics). */
-function kindTotals() {
+function kindTotals(visible = null) {
   const out = {};
   for (const k of KINDS) out[k] = { count: 0, waitMs: 0 };
-  for (const m of hosts.values()) {
+  for (const [host, m] of hosts) {
+    if (visible && !visible(host)) continue;
     for (const row of m.values()) {
       out[row.kind].count += 1;
       if (typeof row.waitedMs === "number") out[row.kind].waitMs += row.waitedMs;
     }
   }
   return out;
+}
+
+/**
+ * Drop every row of tenant `tenantId`'s hosts (XERK-2550, the tenant purge): the
+ * hot model at once, the file on its next save, the Postgres table by a DELETE
+ * on the host-key suffix. Returns the host keys dropped. An empty/invalid id
+ * purges nothing.
+ */
+function purgeTenant(tenantId) {
+  if (typeof tenantId !== "string" || !/^[0-9a-f]{32}$/.test(tenantId)) return [];
+  const gone = [...hosts.keys()].filter((h) => tenantOfHostKey(h) === tenantId);
+  for (const h of gone) hosts.delete(h);
+  if (backend.onPurgeTenant) backend.onPurgeTenant(tenantId, gone);
+  else if (gone.length) backend.onChange();
+  return gone;
 }
 
 // ---- the file backend (non-HA) ---------------------------------------------------
@@ -946,6 +965,22 @@ class PermissionLedgerPgStore {
     return this._draining;
   }
 
+  // A tenant purge (XERK-2550): queued writes for its hosts go, then one DELETE
+  // on the `@<tenantId>` suffix. A failed delete is logged; the rows stay out of
+  // the hot model, and the next purge call (the admin retries) removes them.
+  onPurgeTenant(tenantId) {
+    const suffix = `@${tenantId}`;
+    this._queue = this._queue.filter((vals) => !String(vals[0]).endsWith(suffix));
+    return (async () => {
+      try {
+        await this._ensureSchema();
+        await this.pool.query(`DELETE FROM ${this.table} WHERE right(host, 33) = $1`, [suffix]);
+      } catch (e) {
+        console.error(`permission ledger: Postgres tenant purge failed: ${(e && e.message) || e}`);
+      }
+    })();
+  }
+
   async sweep(now = Date.now()) {
     if (this._closed) return;
     await this._ensureSchema();
@@ -992,7 +1027,7 @@ function flush(done) { backend.flush(done); }
 load();
 
 module.exports = {
-  ingest, aggregate, kindTotals, sanitizePermissionEvent, suggestedRule, ruleVerdict, configure,
+  ingest, aggregate, kindTotals, purgeTenant, sanitizePermissionEvent, suggestedRule, ruleVerdict, configure,
   rehydrate, flush, setMemoryLimit,
   LEDGER_FILE, MAX_ROWS, HOST_MAX_ROWS, DAYS, EVENTS_PER_BEAT, T_EVENT, OPEN_MAX_MS,
   SUBCOMMAND_CLIS, BASH_SAFE_HEADS, BASH_SAFE_SUBCOMMANDS, PermissionLedgerPgStore,

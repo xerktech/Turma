@@ -16,9 +16,10 @@ This file is the operative rules for what has shipped; the routing policy is `mo
 
 - **Model provenance is hub-owned, never written into git.** Some orgs require user-authored
   commits with no model attribution; never add a model trailer/author/PR-body line for this.
-- **Evidence is FLEET-WIDE.** `aggregate()` groups per (work class, model) across every org —
-  "sonnet is good at bug work" is learned and applied everywhere. Per-session ROWS are served only
-  for an org the caller names (`/api/model-quality?org=<site>&rows=1`). Never org-scope the groups.
+- **Evidence pools across orgs, never across tenants** (XERK-2550). `aggregate()` groups per
+  (work class, model) over every org of ONE scope (`visible`, a host-key predicate) — never
+  org-scope the groups, never drop the scope. Per-session ROWS are served only for an org the
+  caller names (`/api/model-quality?org=<site>&rows=1`). Rules: `turma-tenancy-ledgers.md`.
 - **The hub observes; nothing is agent-sent.** `outcomeLedgerSweep` (leader, on
   `masterOrchestrationTick`) folds `sessions` + `closedSessions` + `fleetTicketRows()` into rows
   keyed by the JSON tuple `[site, issue, host, sid]`, so a session the agent's closed cache
@@ -320,7 +321,7 @@ This file is the operative rules for what has shipped; the routing policy is `mo
 
 - A card on `/insights#model-quality` (`modelQualityCardHtml`) — its OWN fetch, never
   `/api/agents`, like the permission card. Android has none (XERK-2386, `android/PARITY.md`).
-- **Groups are fleet-wide whatever the header picks**; only the session drill-down follows it, and
+- **Groups cover the caller's whole scope whatever the header picks**; only the session drill-down follows it, and
   only when the filter resolves to EXACTLY one org (`TurmaOrg.get()`),
   since the route serves rows for one named org. Several or none → "Pick one org…".
 - **Bad rate = bad ÷ (good + bad)**; pending, no-change and undelivered say nothing about code

@@ -157,7 +157,7 @@ replace it.
   not open. An older hub without `open` keeps the plain answers.
 - **A `recent` ask-in-chat row is served WITHOUT `answer`** (its stored `unknown` is not an answer):
   the table shows "—" for its group, so the recent list must not say "unknown" for it either.
-- **Groups are fleet-wide, not per host** — a deliberate deviation from the ticket's
+- **Groups span the caller's scope, not per host** (XERK-2550: never across tenants) — a deliberate deviation from the ticket's
   `(host, kind, tool, head)`: one allow rule retires a prompt on every host, so per-host groups would
   split one fix into N rows. The host rides each `recent` row; scope by org to narrow.
 - **`/metrics`** (UNAUTHENTICATED) appends `turma_permission_prompts{kind}` and

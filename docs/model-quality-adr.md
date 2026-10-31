@@ -16,10 +16,10 @@ evidence from real work that it does not ship worse code.
 1. **Provenance is hub-owned, never written into git.** Some orgs require commits authored by the
    user with no model attribution, so nothing about the model goes in a commit, trailer, author
    or PR body. The hub joins ticket → session → model → PR → merge commit itself.
-2. **Evidence and policy are FLEET-WIDE, across orgs.** "Sonnet is good at bug work" is learned
-   from every org's tickets and applied to every org. Aggregates are counts per (work class,
-   model); they carry no ticket text or code, so pooling them leaks nothing. Per-session ROWS
-   stay org-scoped on any org-filtered surface.
+2. **Evidence and policy pool across orgs, never across tenants.** "Sonnet is good at bug work"
+   is learned from every org's tickets of one TENANT and applied to that tenant's orgs. Aggregates
+   are counts per (work class, model); per-session ROWS stay org-scoped on any org-filtered
+   surface. No routing prior is shared between tenants (XERK-2550, `docs/multi-tenant-adr.md`).
 3. **QA and review always run on Opus**, whatever model did the work. A grader no stronger than
    the author shares its blind spots; QA is ~9% of sessions, so it is cheap insurance.
 4. **A cheaper model earns a work class in shadow before it touches a real PR**, and is demoted
@@ -94,7 +94,7 @@ evidence from real work that it does not ship worse code.
 ## Routing policy
 
 - `MODEL_POLICY=off|observe|on` (default `observe`: record, shadow, report; route nothing).
-- Promotion of model M for class C, evaluated fleet-wide:
+- Promotion of model M for class C, evaluated per tenant (XERK-2550):
   - at least `MODEL_PROMOTE_MIN_PAIRS` (default 40) graded shadow pairs for (C, M), and
   - M-only failures (Opus good, M bad) are ≤ 5% of pairs, with a 95% Wilson upper bound ≤ 10%.
 - A promoted (C, M) starts unpinned tickets of class C on M. The operator's model pin always wins.
