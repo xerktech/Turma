@@ -189,6 +189,11 @@ this file → restart → curl twice to verify). Any one of these does it:
   enrolls in one go:
   `curl -fsSL …/bootstrap.sh | bash -s -- --url <hub> --enroll-code <code>`.
   An already-installed host takes `turma-agentctl enroll --code <code>`.
+  A second code for the same name is refused for 2 minutes after the first is
+  redeemed (so the first host's new token is not killed); after that it replaces
+  a host that never connected. A name still held by a revoked or renamed agent is
+  refused until you release it: `DELETE /api/agents/<that name>` (the refusal
+  names the call) — for a renamed agent, that can be its original name.
 - **On the host** — `turma-agentctl enroll`: fetches this host's derived token
   from the hub (authenticated with the current token), persists it here, and
   restarts. Idempotent; refuses to write a token for the wrong `DEVICE_NAME`.

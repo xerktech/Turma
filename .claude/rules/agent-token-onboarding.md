@@ -58,6 +58,9 @@ Split out of `CLAUDE.md`, which keeps the per-host credential contract (XERK-268
   - **A code never takes a name another agent holds** (`enrollNameRefusal`, case-folded) — that
     would hand the code holder that host's token and queued commands. An identity minted for the
     name that never beat is SUPERSEDED, so two machines never share one id.
+  - **Except inside `ENROLL_SUPERSEDE_GRACE_MS` (2 min) of another code's redemption for that
+    name** (`enrollSupersedeRefusal`, XERK-2574): 409, code not burned. Superseding at once let two
+    back-to-back redemptions both answer 200 with the first token already dead.
   - A refusal that is the caller's mistake (wrong device for a device-bound code, a taken or
     unusable name) does NOT burn the code. Used/expired/revoked → 410 in the hub's words.
   - **Only UNKNOWN codes are rate-limited, fleet-wide** (`enrollFailLimited`, 30/min → 429); a
