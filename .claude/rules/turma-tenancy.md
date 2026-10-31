@@ -3,6 +3,7 @@ paths:
   - turma/server.js
   - turma/tenancy.js
   - turma/tests/tenancy.test.js
+  - turma/tests/breakglass-pool.test.js
   - turma/tests/oidc-groups.test.js
   - turma/tests/oidc.test.js
   - turma/tests/server.test.js
@@ -64,7 +65,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     socket AND the last XFF hop are both inside it — else 2 cloudflared x 2 ingress pods = 4 keys.
     - List the ingress, cloudflared AND hub pods (an HA follower forwards logins, so it is the
       leader's socket peer) — in practice the pod CIDR. Anything inside can forge all three headers,
-      directly or through the ingress's ClusterIP (agent pods included): accepted, fairness only.
+      directly or through the ingress's ClusterIP (agent pods included): accepted for fairness;
+      break-glass guesses on such a key also hit the hub-wide pool (XERK-2587, below).
     - Correct only while the ingress APPENDS its peer to XFF (no `use-forwarded-headers`).
     - A malformed entry exits the hub at boot (2) rather than silently keying three-part.
     - Tests: `tenancy-nopassword.test.js` "XERK-2579: behind trusted proxies…".
@@ -93,6 +95,16 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     client already in flight 503) BEFORE the compare: a busy refusal neither evaluates nor counts it,
     so the response pattern never reveals which name is break-glass.
   - Android never retries a password `/api/login` refused (401) as Basic — one miss, not two.
+- **Break-glass guesses keyed on CF-Connecting-IP alone share ONE hub-wide pool of misses**
+  (XERK-2587, `loginKeyFromCf`, `BREAKGLASS_POOL_*`): an in-cluster pod rotating that header got a
+  fresh per-client budget per request (~7k guesses/s).
+  - Pool spent → the guess is NOT evaluated and is treated as a non-break-glass name (Basic 401,
+    form falls to the local check) — never a 429, so the pool never reveals the break-glass name.
+  - Only misses drain it (a polling Basic script is free) and it always refills: never a lockout.
+  - Keys with an unforgeable part (LAN via the ingress, a pod's own socket) never touch it, so
+    break-glass over the LAN works through any flood (XERK-595). Never pool those keys.
+  - Accepted cost: during a CF-path flood, the operator's break-glass via Cloudflare competes for
+    the refill. Tests: `breakglass-pool.test.js`.
   - Residual (XERK-2568's key-trust model): a caller bypassing Cloudflare rotates CF-Connecting-IP
     for a fresh budget per request — scrypt-free break-glass makes that a real bypass (XERK-2585).
   - A `/api/login` break-glass miss still runs the local scrypt check (shared name, no timing tell
