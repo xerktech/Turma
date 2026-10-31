@@ -55319,6 +55319,14 @@ class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):
         self.assertIs(self.sm.daily_brief_results[0], row)
         self.sm._stage_daily_brief(self._cmd())      # not staged twice
         self.assertEqual(len(self.sm.daily_brief_results), 1)
+        # A full outbox keeps its bound: not staged, and said so.
+        self.sm.daily_brief_results[:] = [{"runId": f"x{n}"} for n in range(ha.DAILY_BRIEF_RESULTS_MAX)]
+        with mock.patch.object(ha, "log") as logged:
+            self.sm._stage_daily_brief(self._cmd())
+        self.assertEqual(len(self.sm.daily_brief_results), ha.DAILY_BRIEF_RESULTS_MAX)
+        self.assertNotIn(row, self.sm.daily_brief_results)
+        self.assertIn("outbox full", logged.call_args[0][0])
+        self.sm.daily_brief_results.clear()
         # Only the last few answers are held.
         for i in range(ha.DAILY_BRIEF_RESULTS_MAX + 1):
             self.sm._stage_daily_brief(self._cmd(model="opus", runId=f"f{i}"))
@@ -55884,6 +55892,14 @@ class TestMeetingWorker(ManagerMixin, unittest.TestCase):
         self.assertIs(self.sm.meeting_results[0], row)
         self.sm._stage_meeting(self._cmd())           # not staged twice
         self.assertEqual(len(self.sm.meeting_results), 1)
+        # A full outbox keeps its bound: not staged, and said so.
+        self.sm.meeting_results[:] = [{"runId": f"x{n}"} for n in range(ha.MEETING_RESULTS_MAX)]
+        with mock.patch.object(ha, "log") as logged:
+            self.sm._stage_meeting(self._cmd())
+        self.assertEqual(len(self.sm.meeting_results), ha.MEETING_RESULTS_MAX)
+        self.assertNotIn(row, self.sm.meeting_results)
+        self.assertIn("outbox full", logged.call_args[0][0])
+        self.sm.meeting_results.clear()
         for i in range(ha.MEETING_RESULTS_MAX + 1):   # only the last few are held
             self.sm._stage_meeting(self._cmd(model="opus", runId=f"f{i}"))
         self.sm.meeting_results.clear()
