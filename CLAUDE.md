@@ -104,6 +104,8 @@ Each spans components; the rule lives in the named file, which loads when any si
   parsers and device naming → `contract-mirrors.md`.
 - **The Daily Brief** schedule store, `renderDailyBrief` command and `dailyBriefResults` outbox
   (XERK-2390) → `contract-daily-brief.md`.
+- **Meetings**: Tenir's `POST /api/orgs/<site>/meetings`, the proposal store, `extractMeeting`
+  and the `meetingResults` outbox (XERK-2508) → `contract-meetings.md`.
 - **"Working" is `paneBusy` OR live background WORK** (XERK-245, XERK-1570) → `session-working.md`.
 
 ## Conventions
