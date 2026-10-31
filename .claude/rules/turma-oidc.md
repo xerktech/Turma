@@ -154,9 +154,12 @@ flow and renders the local form for, never re-bouncing to the IdP.)
   `oidcVerifyIdToken`, BEFORE any session is issued.
 - **Two pure helpers, unit-tested offline**: `oidcGroupsFromClaims` normalizes the claim (array /
   bare single string / absent → `string[]`, dropping non-string members so a forged number can't
-  match a name); `oidcAccessDecision(groups)` → `{allowed, role}`. `role` is `"admin"` for
-  `OIDC_ADMIN_GROUP` (which OUTRANKS user — a user in both is admin), `"user"` for `OIDC_USER_GROUP`,
-  else denied. **A denied user gets NO session and no `oidcSessions` record** — a 302 to
+  match a name); `oidcAccessDecision(groups)` → `{allowed, roles}`.
+- **Each group maps to its OWN role** (XERK-2532): `OIDC_USER_GROUP` → `user` (a tenant),
+  `OIDC_ADMIN_GROUP` → `admin` (the admin panel). **Admin no longer implies user**: admin-only gets
+  the panel and NO tenant (`requestPrincipal().tenantId` null); both groups get both. Do not restore
+  "admin outranks user" — it handed every admin a tenant.
+- **A denied user gets NO session and no `oidcSessions` record** — a 302 to
   `/login?error=forbidden` (which `login.html` surfaces, pointing them at the break-glass local
   credential). The tx is still consumed (single use).
 - **Config, env only**: `TURMA_OIDC_USER_GROUP` (default `k8x-ai`), `TURMA_OIDC_ADMIN_GROUP` (default
@@ -165,9 +168,15 @@ flow and renders the local form for, never re-bouncing to the IdP.)
   authenticated OIDC user admitted as a plain `user`); `?? default` leaves an explicit `""` untouched
   so unset ≠ empty. Boot logs which (a warn on the opt-out).
 - **The callback upserts the IdP identity as a hub USER with its own tenant** (XERK-2530,
-  `oidcPrincipal`, `turma-tenancy.md`); the `hub_session` cookie names that principal and roles are
-  re-read from the user store on every request (`requestPrincipal`). `role`/`groups`/`userId` also
-  ride the `oidcSessions` record (logout hint). A disabled user gets `/login?error=forbidden`.
+  `oidcPrincipal`, `turma-tenancy.md`), keyed by `(iss, sub)`, never email/name; the `hub_session`
+  cookie names that principal and roles are re-read from the user store on every request
+  (`requestPrincipal`). `roles`/`groups`/`userId` also ride the `oidcSessions` record (logout hint).
+  A disabled user gets `/login?error=forbidden`.
+- **An identity the groups admit nowhere is never provisioned**; a KNOWN one whose login grants no
+  role (IdP groups AND local groups) is marked `disabled` + `disabledBy:"idp"`; every verified login
+  runs `oidcPrincipal`, so a local group an operator added still admits. Its record and tenant stay until an admin deletes the user; a later login that grants a role
+  lifts ONLY an IdP disable, never an operator's (`upsertOidcUser`, `updateUser`).
+- **The mobile exchange returns the callback's token**, so it is the same principal (pinned).
 - **OIDC-issued sessions are SHORTER-lived** so a revoked user re-authenticates (and is re-checked
   against current groups) within a bounded window: `issueSessionToken(ttlMs)` +
   `sessionSetCookie(req, token, ttlMs)` take `OIDC_SESSION_TTL_MS` (`TURMA_OIDC_SESSION_TTL_MS`,
@@ -212,9 +221,11 @@ redirect they cannot complete, and the fleet went dead.
 ## Tests
 
 - `turma/tests/oidc-groups.test.js` (own process — group + OIDC env read at require time): the two
-  pure helpers (claim-shape normalization, allow/role incl. admin-outranks-user), and the callback
-  driven for a user-group / admin-group / neither-group / no-claim token (admit-with-role vs
-  302→`/login?error=forbidden` with no session/record), plus the shorter session-cookie Max-Age.
+  pure helpers, and the callback driven for a user-group / admin-group / neither-group / no-claim
+  token (admit-with-roles vs 302→`/login?error=forbidden` with no session/record), plus the shorter
+  session-cookie Max-Age. The `XERK-2532:` cases: per-group roles, admin-only has no tenant,
+  `(iss, sub)` identity, disable-on-removal + restore, an operator disable sticks, never-admitted
+  never provisioned, the mobile exchange's principal.
 - The `XERK-593:` cases in `oidc.test.js` (OIDC ON): the IdP bounce for a browser page + bare `/login`
   carrying `next`, `?breakglass=1` never bounced, break-glass cookie + Basic auth still authorise, the
   API-401-not-redirect rule, the heartbeat / self-enroll / `/agent/control` tunnel establishing on

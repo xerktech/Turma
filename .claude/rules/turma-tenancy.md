@@ -24,7 +24,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 - **Break-glass never gets a tenant.** It may reach the admin surface, never tenant data. Do not
   give it a tenant to make a route "just work".
 - **An admin role grants no tenant data.** Admin = identities only; an admin's own data comes via
-  its `user` role and its own `tenantId`.
+  its `user` role and its own `tenantId`. `userPrincipal` serves `tenantId` ONLY with the `user`
+  role (XERK-2532); the record keeps its tenant either way, and the token's `t` is the RECORD's.
 - **Roles and existence are read from the STORE every request** (`principalFromToken`), never trusted
   from the cookie's claims: disabling a user or dropping its group ends its sessions at once.
   A principal with no role is not signed in.
@@ -39,6 +40,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 - One user = one tenant. `tenantId` is random 32-hex, immutable (`updateUser` pins it), distinct from
   `userId`, and NEVER derived from a username, display name or email.
 - OIDC identity is `(oidcIss, oidcSub)`, never the email or name (the IdP lets those change).
+- `disabledBy:"idp"` (OIDC only) marks a disable the IdP's groups caused; a login lifts only that
+  kind. `updateUser` setting `disabled` drops it, so an operator's call is never lifted (XERK-2532).
 - `coerceTenancy` is the ONE whitelist (boot, remote watch); it is a coerce fixed point, null-prototype
   maps, and drops duplicate logins (case-folded username / iss+sub) and reused tenants.
   - An unset group map is OMITTED (not `{}`), so the shipped defaults keep applying after a re-coerce.

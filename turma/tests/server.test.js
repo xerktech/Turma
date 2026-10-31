@@ -2744,7 +2744,7 @@ test("XERK-2530: on a passwordless hub an OIDC user does not flip it closed; a l
   });
   assert.equal(open.authEnabled(), false);
   assert.equal(open.requestPrincipal({ headers: {} }).kind, "open");
-  assert.ok(open.oidcPrincipal("https://idp/", { sub: "s1" }, "user"));
+  assert.ok(open.oidcPrincipal("https://idp/", { sub: "s1" }, ["user"]));
   assert.equal(open.authEnabled(), false, "an SSO login leaves an open hub open");
   const tenancy = require("../tenancy.js");
   const { state } = tenancy.createLocalUser(open.tenancyState(), {
