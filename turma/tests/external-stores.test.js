@@ -32,6 +32,7 @@ for (const v of [
   "ORG_COLORS_FILE", "REPO_TIERS_FILE", "EPIC_RUNS_FILE", "EPIC_BUILDERS_FILE",
   "USAGE_LEDGER_FILE", "STATE_FILE", "PERMISSION_POLICIES_FILE", "AGENT_IDENTITIES_FILE",
   "DECISIONS_FILE", "MODEL_POLICY_FILE", "DAILY_BRIEF_SCHEDULES_FILE", "DAILY_BRIEFS_FILE",
+  "MEETING_PROPOSALS_FILE",
 ]) {
   process.env[v] = tmp(v.toLowerCase());
 }
@@ -64,15 +65,19 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     "dailyBriefSchedules",
     // XERK-2395: the Daily Brief's briefs (each row is a fire record).
     "dailyBriefs",
+    // XERK-2508: meetings Tenir posted (a 200 promises the row is kept).
+    "meetingProposals",
   ]) {
     assert.ok(names.has(n), `store ${n} is registered`);
   }
   for (const d of list) {
     assert.ok(d.key.startsWith("policy:"), `${d.name} key is namespaced`);
     assert.ok(persistent[d.key] && persistent[d.key].file, `${d.name} has a persistent file`);
-    // The briefs store's rows are the scheduler's "already fired" record, so it is
-    // written at once (XERK-2395); every other store keeps the 5s debounce.
-    assert.equal(persistent[d.key].debounceMs, d.name === "dailyBriefs" ? 0 : 5000,
+    // The briefs store's rows are the scheduler's "already fired" record (XERK-2395)
+    // and a meeting's row is what Tenir's 200 promised (XERK-2508), so both are
+    // written at once; every other store keeps the 5s debounce.
+    const immediate = d.name === "dailyBriefs" || d.name === "meetingProposals";
+    assert.equal(persistent[d.key].debounceMs, immediate ? 0 : 5000,
       `${d.name} keeps its debounce`);
   }
 });

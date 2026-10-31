@@ -631,6 +631,10 @@ const DAILY_BRIEF_SCHEDULES_FILE =
 // The Daily Brief's written briefs (XERK-2395): siteKey -> newest-first briefs.
 // Written once per run (dispatch + settle), so human rate too.
 const DAILY_BRIEFS_FILE = process.env.DAILY_BRIEFS_FILE || "/data/daily-briefs.json";
+// Meetings Tenir posted and the work items proposed from them (XERK-2508):
+// siteKey -> newest-first meetings. Written per meeting/run, human rate.
+const MEETING_PROPOSALS_FILE =
+  process.env.MEETING_PROPOSALS_FILE || "/data/meeting-proposals.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -4294,6 +4298,187 @@ function putDailyBrief(siteKey, row) {
   dailyBriefs[siteKey] = keepDailyBriefs(list);
   publishDailyBriefs();
   return b;
+}
+
+// ---- Meetings: the proposal store (XERK-2508, epic XERK-2503) -----------------
+// siteKey -> newest-first meetings Tenir posted, each settled in place by the
+// org host asked to propose work items from it (`extractMeeting`). The transcript
+// (`segments`) is kept only while a row is pending — the agent pulls it — and
+// dropped once it settles. sanitizeMeeting is the ONE whitelist (route, ingest,
+// restore, remote watch), its field order fixed so a live row is a coerce fixed
+// point. Contract: .claude/rules/contract-meetings.md.
+const MEETINGS_KEEP = 50;
+const MEETINGS_ORGS_MAX = 100;
+const MEETINGS_SITE_MAX = 200;
+const MEETING_SEGMENTS_MAX = 10000;
+const MEETING_ITEMS_MAX = 30;
+const MEETING_ITEMS_BYTES_MAX = 64 << 10;
+const MEETING_ERROR_MAX = 300;
+const MEETING_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+// No quote, bracket, space, control, format (bidi) or invisible character: the
+// URL will be rendered as a link (XERK-2510), and those spoof its text.
+// The `u` flag counts code points, so the 500-unit length is checked apart.
+const MEETING_URL_CHARS_RE =
+  /^https?:\/\/(?!\/)[^\s"'`<>\\\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]+$/iu;
+const meetingUrlOk = (v) => typeof v === "string" && v.length <= 500 && MEETING_URL_CHARS_RE.test(v);
+const MEETING_MODEL_RE = /^[A-Za-z0-9._:-]{1,40}$/;
+const MEETING_STATUSES = new Set(["queued", "running", "ok", "failed"]);
+const MEETING_ITEM_KINDS = new Set(["task", "bug", "followup", "decision"]);
+const MEETING_PENDING = new Set(["queued", "running"]);
+
+// Plain text from Tenir or a model: lone surrogates repaired, control/bidi/
+// zero-width characters removed (a newline kept only where `multiline`),
+// whitespace collapsed, cut to `max` code points. A fixed point.
+function meetingText(v, max, multiline = false) {
+  if (typeof v !== "string" || !v) return "";
+  let s = cpPrefix(v, max * 2 + 64).toWellFormed()
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, "");
+  s = multiline
+    ? s.replace(/[^\S\n]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim()
+    : s.replace(/\s+/g, " ").trim();
+  return cpPrefix(s, max).trimEnd();
+}
+const meetingMs = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : null);
+function sanitizeMeetingSegment(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const text = meetingText(v.text, 2000);
+  if (!text) return null;
+  const out = { speaker: meetingText(v.speaker, 100), text };
+  const start = meetingMs(v.startMs);
+  const end = meetingMs(v.endMs);
+  if (start !== null) out.startMs = start;
+  if (end !== null && (start === null || end >= start)) out.endMs = end;
+  return out;
+}
+function sanitizeMeetingItem(v, i) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const title = meetingText(v.title, 200);
+  if (!title || !MEETING_ITEM_KINDS.has(v.kind)) return null;
+  const out = { id: `p${i + 1}`, kind: v.kind, title,
+    description: meetingText(v.description, 4000, true) };
+  const assignee = meetingText(v.suggestedAssignee, 100);
+  if (assignee) out.suggestedAssignee = assignee;
+  const due = meetingText(v.due, 40);
+  if (due) out.due = due;
+  out.quotes = (Array.isArray(v.quotes) ? v.quotes : []).slice(0, 20).map((q) => {
+    if (!q || typeof q !== "object" || Array.isArray(q)) return null;
+    const text = meetingText(q.text, 500);
+    if (!text) return null;
+    const quote = { speaker: meetingText(q.speaker, 100), text };
+    if (meetingMs(q.atMs) !== null) quote.atMs = q.atMs;
+    return quote;
+  }).filter(Boolean).slice(0, 5);
+  out.duplicateKeys = [...new Set((Array.isArray(v.duplicateKeys) ? v.duplicateKeys : [])
+    .filter((k) => typeof k === "string" && k.length <= 64 && isIssueKey(k)))].slice(0, 5);
+  const repo = meetingText(v.repoGuess, 200);
+  if (repo) out.repoGuess = repo;
+  return out;
+}
+// The item list a row keeps: each item re-whitelisted, renumbered p1..pN, and
+// cut once its JSON passes MEETING_ITEMS_BYTES_MAX — a settled row is kept for
+// MEETINGS_KEEP meetings and the store is written whole.
+function sanitizeMeetingItems(list) {
+  const out = [];
+  let bytes = 0;
+  for (const raw of list.slice(0, MEETING_ITEMS_MAX * 2)) {
+    const it = sanitizeMeetingItem(raw, out.length);
+    if (!it) continue;
+    bytes += Buffer.byteLength(JSON.stringify(it));
+    if (out.length >= MEETING_ITEMS_MAX || bytes > MEETING_ITEMS_BYTES_MAX) break;
+    out.push(it);
+  }
+  return out;
+}
+function sanitizeMeeting(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  if (typeof v.meetingId !== "string" || !MEETING_ID_RE.test(v.meetingId)) return null;
+  if (!MEETING_STATUSES.has(v.status)) return null;
+  const out = { meetingId: v.meetingId, status: v.status,
+    title: meetingText(v.title, 300) || "Untitled meeting",
+    platform: meetingText(v.platform, 40).toLowerCase() };
+  for (const k of ["startedAt", "endedAt", "receivedAt"]) {
+    const t = dbTime(v[k]);
+    if (t === null) return null;
+    out[k] = t;
+  }
+  if (meetingUrlOk(v.tenirUrl)) out.tenirUrl = v.tenirUrl;
+  out.participants = [...new Set((Array.isArray(v.participants) ? v.participants : []).slice(0, 200)
+    .map((p) => meetingText(p, 100)).filter(Boolean))].slice(0, 100);
+  if (typeof v.model === "string" && MEETING_MODEL_RE.test(v.model)) out.model = v.model;
+  if (typeof v.host === "string" && v.host && v.host.length <= 200) out.host = v.host;
+  if (typeof v.runId === "string" && DAILY_BRIEF_RUN_ID_RE.test(v.runId)) out.runId = v.runId;
+  if (MEETING_PENDING.has(v.status)) {
+    // The transcript, kept only until the run settles.
+    out.segments = (Array.isArray(v.segments) ? v.segments : []).slice(0, MEETING_SEGMENTS_MAX)
+      .map(sanitizeMeetingSegment).filter(Boolean);
+    if (!out.segments.length) return null;
+  }
+  if (v.status === "running") {
+    if (!out.host || !out.runId || !out.model) return null;
+    out.cmdId = typeof v.cmdId === "string" && /^[0-9a-f]{1,32}$/.test(v.cmdId) ? v.cmdId : "";
+    out.sentAt = dbTime(v.sentAt) || out.receivedAt;
+    out.attempt = v.attempt === 2 ? 2 : 1;
+    out.tried = (Array.isArray(v.tried) ? v.tried : [])
+      .filter((h) => typeof h === "string" && h && h.length <= 200).slice(0, 2);
+  } else if (!MEETING_PENDING.has(v.status)) {
+    const at = dbTime(v.generatedAt);
+    if (at !== null) out.generatedAt = at;
+  }
+  if (v.status === "ok") {
+    if (!Array.isArray(v.items)) return null;
+    out.items = sanitizeMeetingItems(v.items);
+  }
+  if (v.status === "failed") {
+    out.error = meetingText(v.error, MEETING_ERROR_MAX) || "the meeting could not be read";
+  }
+  return out;
+}
+// Bound an org's list to MEETINGS_KEEP: settled rows go first, oldest first.
+function keepMeetings(list) {
+  const out = list.slice();
+  for (let i = out.length - 1; out.length > MEETINGS_KEEP && i >= 0; i--) {
+    if (!MEETING_PENDING.has(out[i].status)) out.splice(i, 1);
+  }
+  return out.slice(0, MEETINGS_KEEP);
+}
+const meetingsCoerce = (raw) => {
+  const out = Object.create(null);
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [site, list] of Object.entries(raw).slice(0, MEETINGS_ORGS_MAX)) {
+      if (!site || site.length > MEETINGS_SITE_MAX || !Array.isArray(list)) continue;
+      const kept = keepMeetings(list.slice(0, 1000).map(sanitizeMeeting).filter(Boolean));
+      if (kept.length) out[site] = kept;
+    }
+  }
+  return out;
+};
+let meetingProposals = meetingsCoerce(readJsonFile(MEETING_PROPOSALS_FILE));
+const persistMeetings = registerExternalStore({
+  name: "meetingProposals", file: MEETING_PROPOSALS_FILE,
+  coerce: meetingsCoerce, read: () => meetingProposals,
+  install: (v) => { meetingProposals = v; },
+  // A 200 tells Tenir the meeting is kept, so the row is written at once.
+  debounceMs: 0,
+});
+// The one writer: insert (newest first) or replace a row by meetingId, through
+// the whitelist. Callers re-read rows rather than holding one across a write.
+function putMeeting(siteKey, row) {
+  const m = sanitizeMeeting(row);
+  if (!m) return null;
+  const cur = meetingProposals[siteKey] || [];
+  const i = cur.findIndex((x) => x.meetingId === m.meetingId);
+  const list = cur.filter((x) => x.meetingId !== m.meetingId);
+  if (i < 0) list.unshift(m);
+  else list.splice(i, 0, m);
+  meetingProposals[siteKey] = keepMeetings(list);
+  persistMeetings();
+  invalidateAgentsCache();
+  return m;
+}
+// A row as answered to Tenir: never the transcript or the in-flight bookkeeping.
+function meetingWire(m) {
+  const { segments, cmdId, sentAt, attempt, tried, ...out } = m;
+  return out;
 }
 
 // Which hosts of an org report a repo by name — CLONED (on-disk `repos[]`) OR
@@ -8791,19 +8976,26 @@ function normalizeCloseTicket(payload) {
 // `renderDailyBrief` command. Only a host reporting it is asked — an older agent
 // would ack the command and never answer. Coerced like normalizeCloseTicket; the
 // agent's `runtimes`/`models` (XERK-2394) keep only known names, absent when sent none.
-const DAILY_BRIEF_CAP_LISTS = { runtimes: ["claude", "dsh", "qwen"], models: ["haiku", "sonnet"] };
-function normalizeDailyBrief(payload) {
+// The Meetings block (XERK-2508, `extractMeeting`) has the same shape and rules.
+// Runs from loadState's restore loop at module init, so the known lists are
+// inline literals: a module const here is in its TDZ there and empties the
+// whole registry on restore (XERK-301).
+function normalizeRunCapability(payload, cap) {
   if (!payload || typeof payload !== "object") return;
-  const t = payload.dailyBrief;
+  const t = payload[cap];
   if (!t || typeof t !== "object" || Array.isArray(t)) {
-    if ("dailyBrief" in payload) payload.dailyBrief = null;
+    if (cap in payload) payload[cap] = null;
     return;
   }
   const out = { available: t.available === true };
-  for (const [key, known] of Object.entries(DAILY_BRIEF_CAP_LISTS)) {
+  const lists = { runtimes: ["claude", "dsh", "qwen"], models: ["haiku", "sonnet"] };
+  for (const [key, known] of Object.entries(lists)) {
     if (Array.isArray(t[key])) out[key] = known.filter((v) => t[key].includes(v));
   }
-  payload.dailyBrief = out;
+  payload[cap] = out;
+}
+function normalizeDailyBrief(payload) {
+  normalizeRunCapability(payload, "dailyBrief");
 }
 
 // The shadow-run (XERK-1847) capability block: whether this host's manager runs
@@ -10229,6 +10421,8 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "briefRender", "briefNarratives", "modelShadow", "shadowRuns", "defectReports",
   // The Daily Brief (XERK-2391): the capability block and the results outbox.
   "dailyBrief", "dailyBriefResults",
+  // Meetings (XERK-2508): the capability block and the results outbox.
+  "meetings", "meetingResults",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -10623,6 +10817,7 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeTrajectory(a);
   normalizeCloseTicket(a);
   normalizeDailyBrief(a);
+  normalizeRunCapability(a, "meetings");
   // The retired sleeper-pause capability: an older agent still reports it, and
   // the hub never pauses a sleeper, so it is dropped rather than stored.
   delete a.pauseSleepers;
@@ -17106,29 +17301,34 @@ function dailyBriefDue(siteKey, schedule, now = Date.now()) {
   return next.meetingAt > fired ? next : null;
 }
 
-// The runtime a host would write the brief on: its default when it lists that
-// one, else the first it lists — or null when it lists none. An older agent
-// sends no list and gets its default.
-function dailyBriefRuntime(a) {
+// The runtime a host would run a `cap` job (dailyBrief, meetings) on: its default
+// when it lists that one, else the first it lists — or null when it lists none.
+// An older agent sends no list and gets its default.
+function capabilityRuntime(a, cap) {
   const r = a.defaultRuntime === "dsh" || a.defaultRuntime === "qwen" ? a.defaultRuntime : "claude";
-  const listed = a.dailyBrief && a.dailyBrief.runtimes;
+  const listed = a[cap] && a[cap].runtimes;
   if (!Array.isArray(listed)) return r;
   return listed.includes(r) ? r : listed[0] || null;
 }
 
-// Which host writes an org's brief: online, in the org (jiraHostPool: declared
+const dailyBriefRuntime = (a) => capabilityRuntime(a, "dailyBrief");
+
+// Which host runs an org's `cap` job: online, in the org (jiraHostPool: declared
 // AND bound), reporting the capability for a runtime it lists and the run's
 // model (when it lists models), not one already tried for this run. A host
 // whose Claude login lapsed still advertises it, so a logged-in one wins.
-function pickDailyBriefHost(siteKey, model, exclude = []) {
+function pickCapabilityHost(cap, siteKey, model, exclude = []) {
   const capable = jiraHostPool(siteKey, true).filter((k) => {
     const a = agents[k];
-    if (!a || exclude.includes(k) || !a.dailyBrief || a.dailyBrief.available !== true) return false;
-    const models = a.dailyBrief.models;
-    return !!dailyBriefRuntime(a) && (!Array.isArray(models) || models.includes(model));
+    if (!a || exclude.includes(k) || !a[cap] || a[cap].available !== true) return false;
+    const models = a[cap].models;
+    return !!capabilityRuntime(a, cap) && (!Array.isArray(models) || models.includes(model));
   });
   return capable.find((k) => !(agents[k].claudeAuth && agents[k].claudeAuth.needsLogin === true))
     || capable[0] || null;
+}
+function pickDailyBriefHost(siteKey, model, exclude = []) {
+  return pickCapabilityHost("dailyBrief", siteKey, model, exclude);
 }
 
 // Queue the command for `row` on `host`; returns the row with its in-flight
@@ -17287,6 +17487,225 @@ function dailyBriefTick(now = Date.now()) {
   }
 }
 
+// ---- Meetings: ingest, dispatch and results (XERK-2508) -----------------------
+// Tenir posts a finished meeting (POST /api/orgs/<site>/meetings); ONE capable
+// host of the org at a time is asked to propose work items from it
+// (`extractMeeting`), pulls the transcript by runId, and answers on its beat
+// (`meetingResults`). Retried once on another host, as the Daily Brief is.
+// Contract: .claude/rules/contract-meetings.md.
+const TURMA_MEETINGS_TOKEN = process.env.TURMA_MEETINGS_TOKEN || "";
+const MEETING_BODY_MAX = 1 << 20;
+// What every run sends until XERK-2509's eval picks a default.
+const MEETINGS_AUTO_MODEL = "sonnet";
+const MEETING_RUN_TIMEOUT_MS = 15 * 60e3;
+// A meeting no capable host has taken for this long settles failed.
+const MEETING_QUEUE_MAX_MS = 24 * 3600e3;
+const MEETINGS_RETAIN_MS = 30 * 86400e3; // an org no host is in any more
+// Pending rows hold their transcript in the store, which is written whole on
+// every change (and published whole to the peer under HA), so both the count
+// and the BYTES of pending transcripts are bounded. An hour of captions is
+// ~60 KB, so the byte budget still holds dozens of real meetings.
+const MEETINGS_PENDING_ORG_MAX = 10;
+const MEETINGS_PENDING_TOTAL_MAX = 20;
+const MEETINGS_PENDING_BYTES_MAX = 2 << 20;
+const MEETINGS_PENDING_BYTES_ORG_MAX = 1 << 20; // so one org can't fill the whole budget
+const meetingSegmentBytes = (m) => (m.segments ? Buffer.byteLength(JSON.stringify(m.segments)) : 0);
+
+function meetingsAuthorized(req) {
+  const header = req.headers.authorization || "";
+  return !!TURMA_MEETINGS_TOKEN && header.startsWith("Bearer ") &&
+    safeEqual(header.slice(7), TURMA_MEETINGS_TOKEN);
+}
+
+// Validate Tenir's body into a queued row, or {error}. Field rules: the contract.
+function meetingFromBody(body, now) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "meeting must be an object" };
+  if (typeof body.meetingId !== "string" || !MEETING_ID_RE.test(body.meetingId)) {
+    return { error: "meetingId must be 1-128 letters, digits or . _ : -" };
+  }
+  for (const k of ["startedAt", "endedAt"]) {
+    if (dbTime(body[k]) === null) return { error: `${k} must be epoch milliseconds` };
+  }
+  if (body.endedAt < body.startedAt) return { error: "endedAt is before startedAt" };
+  if (body.endedAt > now + 86400e3) return { error: "endedAt is in the future" };
+  // Refused, never silently cut or defaulted (XERK-2518).
+  if (body.title != null && (typeof body.title !== "string" || [...body.title].length > 300)) {
+    return { error: "title must be text of at most 300 characters" };
+  }
+  if (body.platform != null && (typeof body.platform !== "string" || [...body.platform].length > 40)) {
+    return { error: "platform must be text of at most 40 characters" };
+  }
+  if (body.tenirUrl != null && !meetingUrlOk(body.tenirUrl)) {
+    return { error: "tenirUrl must be an http(s) URL of at most 500 characters, with no quotes, spaces or brackets" };
+  }
+  if (body.participants != null && !Array.isArray(body.participants)) {
+    return { error: "participants must be a list" };
+  }
+  if (!Array.isArray(body.segments) || !body.segments.length) return { error: "segments must be a non-empty list" };
+  const row = sanitizeMeeting({ ...body, status: "queued", receivedAt: now, model: undefined,
+    host: undefined, runId: undefined, items: undefined, error: undefined });
+  if (!row) return { error: "no segment carries any text" };
+  return { row };
+}
+
+const meetingPendingCount = (list) => (list || []).filter((m) => MEETING_PENDING.has(m.status)).length;
+
+// The answer to a valid POST: {status, body}. Idempotent on meetingId.
+function acceptMeeting(siteKey, body, now = Date.now()) {
+  const { row, error } = meetingFromBody(body, now);
+  if (error) return { status: 400, body: { error } };
+  const dup = (meetingProposals[siteKey] || []).find((m) => m.meetingId === row.meetingId);
+  if (dup) return { status: 200, body: { ok: true, duplicate: true, meeting: meetingWire(dup) } };
+  if (siteKey.length > MEETINGS_SITE_MAX) {
+    return { status: 400, body: { error: `org key too long — the limit is ${MEETINGS_SITE_MAX} characters` } };
+  }
+  // Refuse what the coerce would drop: a full store first forgets orgs no host
+  // is decided into (and that wait on nothing).
+  if (!Object.hasOwn(meetingProposals, siteKey) &&
+      Object.keys(meetingProposals).length >= MEETINGS_ORGS_MAX) {
+    const orgs = decidedOrgs();
+    for (const k of Object.keys(meetingProposals)) {
+      if (!orgs.has(k) && !meetingPendingCount(meetingProposals[k])) delete meetingProposals[k];
+    }
+    if (Object.keys(meetingProposals).length >= MEETINGS_ORGS_MAX) {
+      return { status: 409, body: { error: `${MEETINGS_ORGS_MAX} orgs already have meetings — the limit` } };
+    }
+  }
+  if (meetingPendingCount(meetingProposals[siteKey]) >= MEETINGS_PENDING_ORG_MAX) {
+    return { status: 429, body: { error: `${MEETINGS_PENDING_ORG_MAX} meetings of this org are already waiting to be read — try again later` } };
+  }
+  const pending = Object.values(meetingProposals).flat().filter((m) => MEETING_PENDING.has(m.status));
+  if (pending.length >= MEETINGS_PENDING_TOTAL_MAX) {
+    return { status: 429, body: { error: `${MEETINGS_PENDING_TOTAL_MAX} meetings are already waiting to be read — try again later` } };
+  }
+  const sum = (rows) => rows.reduce((n, m) => n + meetingSegmentBytes(m), meetingSegmentBytes(row));
+  const orgPending = (meetingProposals[siteKey] || []).filter((m) => MEETING_PENDING.has(m.status));
+  if (sum(orgPending) > MEETINGS_PENDING_BYTES_ORG_MAX) {
+    return { status: 429, body: { error: "this org's meetings already waiting to be read fill its transcript budget — try again later" } };
+  }
+  if (sum(pending) > MEETINGS_PENDING_BYTES_MAX) {
+    return { status: 429, body: { error: "the meetings already waiting to be read fill the hub's transcript budget — try again later" } };
+  }
+  const kept = putMeeting(siteKey, row);
+  if (!kept) return { status: 400, body: { error: "the meeting could not be stored" } };
+  dispatchNextMeeting(siteKey, now);
+  const m = meetingProposals[siteKey].find((x) => x.meetingId === row.meetingId) || kept;
+  return { status: 200, body: { ok: true, meeting: meetingWire(m) } };
+}
+
+// runIds whose command THIS process queued or re-queued (the dailyBriefSent rule:
+// the command rides the host record on state.json's debounce, the row is written
+// at once, so a running row is re-sent once per process).
+const meetingSent = new Set();
+function sendMeetingCommand(siteKey, row, host, now) {
+  meetingSent.add(row.runId);
+  const cmdId = queueCommand(host, { type: "extractMeeting", runId: row.runId, siteKey,
+    meetingId: row.meetingId, model: row.model, runtime: capabilityRuntime(agents[host], "meetings") });
+  return { ...row, status: "running", host, cmdId, sentAt: now,
+    tried: [...(row.tried || []), host] };
+}
+
+// Start the org's oldest queued meeting when none is running and a host can
+// take it. A queued row past MEETING_QUEUE_MAX_MS settles failed.
+function dispatchNextMeeting(siteKey, now = Date.now()) {
+  const list = meetingProposals[siteKey] || [];
+  if (list.some((m) => m.status === "running")) return null;
+  const queued = list.filter((m) => m.status === "queued");
+  for (let i = queued.length - 1; i >= 0; i--) {
+    const m = queued[i];
+    if (now - m.receivedAt < MEETING_QUEUE_MAX_MS) {
+      const model = MEETINGS_AUTO_MODEL;
+      const host = pickCapabilityHost("meetings", siteKey, model);
+      if (!host) return null;
+      const row = { ...m, model, runId: crypto.randomBytes(8).toString("hex"), attempt: 1, tried: [] };
+      return putMeeting(siteKey, sendMeetingCommand(siteKey, row, host, now));
+    }
+    putMeeting(siteKey, { ...m, status: "failed", generatedAt: now,
+      error: "no online host of this org could read the meeting" });
+  }
+  return null;
+}
+
+// A running row whose host failed, timed out or left: withdraw the command,
+// then ask ONE other capable host, else settle it failed and start the next.
+function retryMeeting(siteKey, row, error, now) {
+  if (row.cmdId) dropQueuedCommand(row.host, row.cmdId, "extractMeeting");
+  const host = row.attempt < 2 ? pickCapabilityHost("meetings", siteKey, row.model, row.tried) : null;
+  if (host) return putMeeting(siteKey, sendMeetingCommand(siteKey, { ...row, attempt: 2 }, host, now));
+  const out = putMeeting(siteKey, { ...row, status: "failed", error, generatedAt: now });
+  dispatchNextMeeting(siteKey, now);
+  return out;
+}
+
+// The running row `host` may act on for (siteKey, runId), or null: the host the
+// hub asked, for that run, while it is still decided into the org (XERK-348).
+function meetingRunOf(host, siteKey, runId) {
+  if (typeof siteKey !== "string" || typeof runId !== "string") return null;
+  if (!Object.hasOwn(meetingProposals, siteKey)) return null;
+  const row = meetingProposals[siteKey].find((m) => m.runId === runId);
+  if (!row || row.status !== "running" || row.host !== host) return null;
+  if (!agents[host] || decidedOrgOf(agents[host]) !== siteKey) return null;
+  return row;
+}
+
+// Fold the agents' `meetingResults` rows; only meetingRunOf's row is taken.
+function ingestMeetingResults(key, rows, now = Date.now()) {
+  if (!Array.isArray(rows)) return false;
+  let changed = false;
+  for (const r of rows.slice(0, 5)) {
+    if (!r || typeof r !== "object" || Array.isArray(r)) continue;
+    const row = meetingRunOf(key, r.siteKey, r.runId);
+    if (!row) continue;
+    const ok = r.status === "ok" && Array.isArray(r.items) && putMeeting(r.siteKey, {
+      ...row, status: "ok", generatedAt: now, items: r.items,
+      model: typeof r.model === "string" && MEETING_MODEL_RE.test(r.model) ? r.model : row.model,
+    });
+    if (ok) dispatchNextMeeting(r.siteKey, now);
+    else {
+      const error = (r.status === "failed" && meetingText(r.error, MEETING_ERROR_MAX))
+        || (r.status === "ok" ? "the model's answer carried no item list" : "the host could not read the meeting");
+      retryMeeting(r.siteKey, row, error, now);
+    }
+    changed = true;
+  }
+  return changed;
+}
+
+// On the leader's orchestration tick: settle runs whose host stopped answering,
+// start queued meetings, forget an org no host has been in for MEETINGS_RETAIN_MS.
+function meetingsTick(now = Date.now()) {
+  const orgs = decidedOrgs();
+  for (const [siteKey, list] of Object.entries(meetingProposals)) {
+    try {
+      const row = list.find((m) => m.status === "running");
+      if (row) {
+        const a = agents[row.host];
+        const gone = !a || Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS
+          || decidedOrgOf(a) !== siteKey;
+        if (gone) retryMeeting(siteKey, row, "the host went offline before answering", now);
+        else if (now - row.sentAt >= MEETING_RUN_TIMEOUT_MS) {
+          retryMeeting(siteKey, row, "the host did not answer in time", now);
+        } else if (!meetingSent.has(row.runId)) {
+          if (row.cmdId) dropQueuedCommand(row.host, row.cmdId, "extractMeeting");
+          const again = sendMeetingCommand(siteKey, row, row.host, now);
+          putMeeting(siteKey, { ...again, sentAt: row.sentAt, tried: row.tried });
+        }
+      } else {
+        dispatchNextMeeting(siteKey, now);
+      }
+      const cur = meetingProposals[siteKey];
+      if (cur && !orgs.has(siteKey) && !meetingPendingCount(cur)
+          && now - cur[0].receivedAt >= MEETINGS_RETAIN_MS) {
+        delete meetingProposals[siteKey];
+        persistMeetings();
+        invalidateAgentsCache();
+      }
+    } catch (e) {
+      console.error(`meetings: settling ${logName(siteKey)} failed: ${e && e.message}`);
+    }
+  }
+}
+
 // On the leader's orchestration tick: an org no host is decided into any more
 // keeps its decisions log DECISIONS_RETAIN_MS past its newest entry, then it is
 // dropped — nothing else ever removes a store key.
@@ -17357,6 +17776,8 @@ function masterOrchestrationTick() {
   decisionsTick();
   // Fire each org's Daily Brief before its meeting; settle stuck runs (XERK-2395).
   dailyBriefTick();
+  // Ask an org host to read each meeting Tenir posted; settle stuck runs (XERK-2508).
+  meetingsTick();
   // Fold ticket sessions into the outcome ledger (XERK-1839). Observes only.
   outcomeLedgerSweep();
   // Sample merged tickets into shadow runs on cheaper models (XERK-1847).
@@ -19060,6 +19481,18 @@ const server = http.createServer(async (req, res) => {
       req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
       parts[3] === "uploads" && parts[5] === "blob" && parts.length === 6;
 
+    // An agent pulling the transcript of the meeting it was asked to read
+    // (XERK-2508): agent-authed against <host>, like the upload blob above.
+    const isMeetingTranscript =
+      req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
+      parts[3] === "meetings" && parts[5] === "transcript" && parts.length === 6;
+
+    // Tenir posting a finished meeting (XERK-2508): its own TURMA_MEETINGS_TOKEN
+    // bearer, never the trigger token (which starts sessions) nor the login.
+    const isMeetingsIngest =
+      req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+      parts[3] === "meetings" && parts.length === 4;
+
     if (url.pathname === "/api/heartbeat") {
       // The heartbeat names the host it acts as in its BODY, so it is bound to
       // the credential in the handler, once that is parsed (XERK-268). All this
@@ -19070,7 +19503,7 @@ const server = http.createServer(async (req, res) => {
       const gate = agentPresentedRefusal(req);
       if (gate) return json(res, gate.status, { error: gate.error });
     } else if (isArchiveIngest || isUpdatingSignal || isAliveSignal || isMigrationBlob ||
-               isUploadBlob) {
+               isUploadBlob || isMeetingTranscript) {
       // These all carry the host they act as in `<host>`, so the credential is
       // checked AGAINST it rather than merely being a valid agent token. The
       // decode is the same expression each route runs on the same segment, so
@@ -19083,6 +19516,11 @@ const server = http.createServer(async (req, res) => {
       if (refusal) return json(res, refusal.status, { error: refusal.error });
     } else if (isTrigger) {
       if (!triggerAuthorized(req)) return json(res, 401, { error: "unauthorized" });
+    } else if (isMeetingsIngest) {
+      if (!TURMA_MEETINGS_TOKEN) {
+        return json(res, 503, { error: "meetings ingest is not configured on this hub (TURMA_MEETINGS_TOKEN)" });
+      }
+      if (!meetingsAuthorized(req)) return json(res, 401, { error: "unauthorized" });
     } else if (isAgentTokenEndpoint) {
       // GET /api/agent/token (XERK-578, self-enroll) authenticates itself in the
       // handler: it resolves which host the AGENT credential proves and hands
@@ -19689,6 +20127,9 @@ const server = http.createServer(async (req, res) => {
       // the brief store below (ingestDailyBriefResults checks the hub asked).
       const dailyBriefResults = payload.dailyBriefResults;
       delete payload.dailyBriefResults;
+      // Meeting proposals (XERK-2508): folded into the proposal store below.
+      const meetingResults = payload.meetingResults;
+      delete payload.meetingResults;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -20012,6 +20453,11 @@ const server = http.createServer(async (req, res) => {
         ingestDailyBriefResults(key, dailyBriefResults);
       } catch (e) {
         console.error(`daily brief ingest failed: ${e && e.message}`);
+      }
+      try {
+        ingestMeetingResults(key, meetingResults);
+      } catch (e) {
+        console.error(`meetings ingest failed: ${e && e.message}`);
       }
       rearmMovedWatches(key, prev, next);
       // A migration finishes the instant its target session heartbeats in — do
@@ -20555,6 +21001,25 @@ const server = http.createServer(async (req, res) => {
       // The agent hanging up mid-download must not leave the read running.
       res.on("close", () => stream.destroy());
       return;
+    }
+
+    // GET /api/agents/<host>/meetings/<runId>/transcript — the agent pulling the
+    // meeting it was asked to read (XERK-2508). `<host>` is proved at the gate;
+    // served only for the run the hub sent THAT host, while it is decided into
+    // the org and the run is running — anything else is a 404.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "meetings" && parts[5] === "transcript" && parts.length === 6) {
+      const host = decodeURIComponent(parts[2]);
+      const runId = decodeURIComponent(parts[4]);
+      for (const siteKey of Object.keys(meetingProposals)) {
+        const m = meetingRunOf(host, siteKey, runId);
+        if (m) {
+          return json(res, 200, { runId, siteKey, meetingId: m.meetingId, title: m.title,
+            platform: m.platform, startedAt: m.startedAt, endedAt: m.endedAt,
+            participants: m.participants, segments: m.segments });
+        }
+      }
+      return json(res, 404, { error: "no such meeting run" });
     }
 
     // GET /api/agents/<host>/uploads/<id>/blob — the agent collecting a file the
@@ -22752,6 +23217,31 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, decision: appendDecision(siteKey, { source: "note", text }) });
     }
 
+    // POST /api/orgs/<siteKey>/meetings — Tenir posting a finished meeting
+    // (XERK-2508; authed at the gate by TURMA_MEETINGS_TOKEN). 404 an org no
+    // host is decided into, before the body is read, so a refusal mints nothing.
+    // Idempotent on meetingId. Contract: .claude/rules/contract-meetings.md.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 4 && parts[3] === "meetings") {
+      const siteKey = decodeURIComponent(parts[2]);
+      if (!decidedOrgs().has(siteKey)) {
+        return json(res, 404, { error: "no host is in that org" });
+      }
+      let body;
+      try {
+        body = JSON.parse((await readBody(req, MEETING_BODY_MAX)) || "null");
+      } catch (e) {
+        if (e && (e.tooLarge || e.budgetExceeded)) throw e;
+        return json(res, 400, { error: "body is not JSON" });
+      }
+      if (body && Array.isArray(body.segments) && body.segments.length > MEETING_SEGMENTS_MAX) {
+        return json(res, 413, { error: `too many segments — the limit is ${MEETING_SEGMENTS_MAX}`,
+          limit: MEETING_SEGMENTS_MAX });
+      }
+      const out = acceptMeeting(siteKey, body);
+      return json(res, out.status, out.body);
+    }
+
     // POST /api/orgs/<siteKey>/daily-brief/run — "Run now" (XERK-2395): the
     // scheduled path, for an org no host need be scheduled for, ignoring
     // `enabled`. 404 for an org no host is decided into, 409 while a brief is
@@ -24134,7 +24624,10 @@ if (process.env.TURMA_TEST) {
     normalizeDailyBrief,
     getDailyBriefs: () => dailyBriefs, dailyBriefsCoerce, sanitizeDailyBrief, dailyBriefsWire,
     cleanBriefNarrative, dailyBriefDue, dailyBriefTick, startDailyBriefRun,
-    ingestDailyBriefResults, dailyBriefRunNowAt, DAILY_BRIEF_RUN_TIMEOUT_MS, DAILY_BRIEF_LATE_MS,
+    ingestDailyBriefResults, dailyBriefRunNowAt,
+    getMeetings: () => meetingProposals, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
+    ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETING_RUN_TIMEOUT_MS,
+    MEETING_QUEUE_MAX_MS, MEETINGS_KEEP, MEETINGS_AUTO_MODEL, DAILY_BRIEF_RUN_TIMEOUT_MS, DAILY_BRIEF_LATE_MS,
     decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, permissionAnswerKind,
     decisionsTick, decidedOrgs, DECISIONS_RETAIN_MS,
     autoStartCandidates,

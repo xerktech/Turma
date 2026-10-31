@@ -83,6 +83,14 @@ class FileLiveStore {
     this.channels = new Map(); // channel -> Set<cb>
     this.persistent = opts.persistent || {};
     this._saveTimers = new Map(); // key -> timer
+    // Async durable writes run one at a time per key: two in flight shared one
+    // tmp path and could rename a torn or older blob over the file. A write
+    // asked for meanwhile re-runs once the current one lands, with the newest
+    // value; a sync flush bumps the key's generation, and an older async write
+    // that renamed after it writes the newest value again at once.
+    this._writing = new Set();
+    this._writeAgain = new Set();
+    this._writeGen = new Map();
     // Load durable keys up front so a restart restores them, same as today's
     // boot-time file reads. A missing/invalid file is "not set", never fatal —
     // the same best-effort posture the policy stores have (losing one just means
@@ -312,6 +320,10 @@ class FileLiveStore {
     // set rewrites it (the same as today: a store never writes "null" over its
     // own file). If the key is gone we simply skip the write.
     if (!this.map.has(key)) return;
+    if (!sync && this._writing.has(key)) {
+      this._writeAgain.add(key);
+      return;
+    }
     let blob;
     try {
       blob = JSON.stringify(this.map.get(key));
@@ -321,10 +333,12 @@ class FileLiveStore {
       console.error(`store: could not serialize durable key ${JSON.stringify(key)}: ${e.message}`);
       return;
     }
+    const gen = (this._writeGen.get(key) || 0) + 1;
+    this._writeGen.set(key, gen);
     if (sync) {
       try {
         fs.mkdirSync(path.dirname(file), { recursive: true });
-        const tmp = `${file}.tmp-${process.pid}`;
+        const tmp = `${file}.tmp-${process.pid}-sync`;
         fs.writeFileSync(tmp, blob);
         fs.renameSync(tmp, file);
       } catch (e) {
@@ -332,11 +346,17 @@ class FileLiveStore {
       }
       return;
     }
+    this._writing.add(key);
+    const done = () => {
+      this._writing.delete(key);
+      if (this._writeAgain.delete(key)) this._writeNow(key, false);
+    };
     fs.mkdir(path.dirname(file), { recursive: true }, () => {
       const tmp = `${file}.tmp-${process.pid}`;
       fs.writeFile(tmp, blob, (err) => {
         if (err) {
           console.error(`store: durable save of ${JSON.stringify(key)} failed: ${err.message}`);
+          done();
           return;
         }
         fs.rename(tmp, file, (rerr) => {
@@ -344,6 +364,10 @@ class FileLiveStore {
             console.error(`store: durable save of ${JSON.stringify(key)} failed: ${rerr.message}`);
             fs.unlink(tmp, () => {});
           }
+          // A sync flush landed while this rename was queued, so this older
+          // blob may now sit over it: write the newest value again, at once.
+          if (this._writeGen.get(key) !== gen) this._writeNow(key, true);
+          done();
         });
       });
     });

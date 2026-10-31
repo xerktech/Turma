@@ -58,6 +58,11 @@ fs.writeFileSync(process.env.STATE_FILE, JSON.stringify({
     sessions: [],
   },
   plain2: { device: "plain2", lastSeen: Date.now(), sessions: [] },
+  // XERK-2508 QA: the dailyBrief/meetings capability blocks ran through a
+  // module const at restore and emptied the registry the same way.
+  cap3: { device: "cap3", lastSeen: Date.now(), sessions: [],
+    dailyBrief: { available: true, runtimes: ["claude", "x"] },
+    meetings: { available: true, models: ["sonnet"] } },
 }));
 
 const errors = [];
@@ -73,6 +78,11 @@ test("a restored localModel record does not TDZ-empty the whole registry", () =>
   );
   assert.ok(hub.agents.lm1, "the local-model host itself restored");
   assert.ok(hub.agents.plain2, "a plain host beside it restored (not emptied by the TDZ throw)");
+});
+
+test("XERK-2508: restored dailyBrief/meetings blocks are normalized, not a TDZ throw", () => {
+  assert.deepEqual(hub.agents.cap3.dailyBrief, { available: true, runtimes: ["claude"] });
+  assert.deepEqual(hub.agents.cap3.meetings, { available: true, models: ["sonnet"] });
 });
 
 test("the restored localModel block is normalized and preserved", () => {

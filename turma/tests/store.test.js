@@ -185,6 +185,63 @@ test("XERK-754: a durable key persists JSON byte-for-byte via temp+rename", asyn
   assert.deepEqual(leftovers, [], "no .tmp- file left after an atomic write");
 });
 
+test("XERK-2508: overlapping debounce-0 writes land whole and newest, never torn", async (t) => {
+  // Unserialized, two writes share one tmp path and the loser's rename fails
+  // ENOENT (logged) on every run, even when the newest value happens to land.
+  const errors = [];
+  t.mock.method(console, "error", (m) => { errors.push(String(m)); });
+  const dir = mkdtemp("turma-store-");
+  const file = path.join(dir, "big.json");
+  const s = new FileLiveStore({ persistent: { big: { file, debounceMs: 0 } } });
+  // Large values written back to back: before the per-key serialization two
+  // writes shared one tmp path and a torn or older blob could be renamed in.
+  // Hold every rename until all six sets were issued, so each set's write
+  // overlaps the ones before it — deterministically, not by disk timing.
+  const realRename = fs.rename;
+  let release;
+  const held = new Promise((r) => { release = r; });
+  t.mock.method(fs, "rename", (...args) => { held.then(() => realRename(...args)); });
+  const big = (n) => ({ n, pad: "x".repeat(1 << 20) });
+  for (let n = 1; n <= 6; n++) {
+    await s.set("big", big(n));
+    await new Promise((r) => setTimeout(r, 20)); // the debounce-0 write starts
+  }
+  release();
+  // The write's bookkeeping clears in the rename callback, after the bytes are
+  // visible, so wait for both.
+  for (let i = 0; i < 400 && (s._writing.size || JSON.parse(fs.readFileSync(file, "utf8")).n !== 6); i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).n, 6, "the newest value landed");
+  assert.equal(s._writing.size, 0, "no write left in flight");
+  assert.deepEqual(errors, [], "no durable write failed");
+});
+
+// A sync flush (the in-process durable writes: identity revoke, name-token
+// generations) must win over an older async write held at either stage.
+for (const stage of ["writeFile", "rename"]) {
+  test(`XERK-2508: a sync flush wins over an older async write held at ${stage}`, async (t) => {
+    const dir = mkdtemp("turma-store-");
+    const file = path.join(dir, "v.json");
+    const s = new FileLiveStore({ persistent: { v: { file, debounceMs: 0 } } });
+    const real = fs[stage];
+    let release;
+    const held = new Promise((r) => { release = r; });
+    t.mock.method(fs, stage, (...args) => { held.then(() => real(...args)); });
+    await s.set("v", { v: "old" });
+    await new Promise((r) => setTimeout(r, 20)); // the async write reaches the held stage
+    await s.set("v", { v: "new" });
+    s.flush();
+    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).v, "new");
+    release();
+    for (let i = 0; i < 100 && s._writing.size; i++) await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => setTimeout(r, 30));
+    t.mock.restoreAll();
+    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).v, "new", "the older blob never lands last");
+    assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes(".tmp-")), []);
+  });
+}
+
 test("XERK-754: a durable key reloads on a fresh store (restart restore)", async () => {
   const dir = mkdtemp("turma-store-");
   const file = path.join(dir, "policy.json");

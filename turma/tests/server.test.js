@@ -35,6 +35,7 @@ process.env.TURMA_USER = "hubuser";
 process.env.TURMA_PASSWORD = "hubpass";
 process.env.TURMA_AGENT_TOKEN = "agenttok";
 process.env.TURMA_TRIGGER_TOKEN = "triggertok"; // programmatic /api/trigger bearer
+process.env.TURMA_MEETINGS_TOKEN = "meetingstok"; // Tenir's POST /api/orgs/<site>/meetings bearer
 // Control-channel liveness, wound right down so the beat/drop is testable in ms
 // rather than the 30s/90s the fleet runs. No other test opens a real
 // /agent/control socket, so nothing else feels these.
@@ -109,6 +110,7 @@ process.env.AUTOMERGE_ORGS_FILE = path.join(scratchDir(), `turma-test-automerge-
 process.env.DECISIONS_FILE = path.join(scratchDir(), `turma-test-decisions-${process.pid}.json`);
 process.env.DAILY_BRIEF_SCHEDULES_FILE = path.join(scratchDir(), `turma-test-daily-brief-schedules-${process.pid}.json`);
 process.env.DAILY_BRIEFS_FILE = path.join(scratchDir(), `turma-test-daily-briefs-${process.pid}.json`);
+process.env.MEETING_PROPOSALS_FILE = path.join(scratchDir(), `turma-test-meeting-proposals-${process.pid}.json`);
 process.env.DEDUPE_LINK_ORGS_FILE = path.join(scratchDir(), `turma-test-dedupe-link-orgs-${process.pid}.json`);
 process.env.EPIC_BUILDERS_FILE = path.join(scratchDir(), `turma-test-epic-builders-${process.pid}.json`);
 process.env.EPIC_RUNS_FILE = path.join(scratchDir(), `turma-test-epic-runs-${process.pid}.json`);
@@ -27451,4 +27453,275 @@ test("XERK-2395 QA: a fire with no capable host retries on the same row while du
   assert.deepEqual([list[0].runId, list[0].status, list[0].host], [failed.runId, "running", "dbZNew"]);
   assert.equal(briefCmds2395("dbZNew")[0].runId, failed.runId);
   cleanup2395(S, ["dbZOld", "dbZNew"]);
+});
+
+// ---- XERK-2508: Meetings — ingest route, proposal store, dispatch, results -------
+
+const meetHeaders2508 = { authorization: "Bearer meetingstok", "content-type": "application/json" };
+const meetHost2508 = (device, site, extra = {}) =>
+  beat1574(device, site, { meetings: { available: true }, ...extra });
+const meetCmds2508 = (device) =>
+  ((agents[device] && agents[device].commands) || []).filter((c) => c.type === "extractMeeting");
+const meeting2508 = (id, extra = {}) => ({
+  meetingId: id, title: "Sprint\u0007 sync", platform: "Zoom", startedAt: 1.7e12, endedAt: 1.7e12 + 3.6e6,
+  tenirUrl: "https://tenir.example/c/1", participants: ["Ann", "Bo", "Ann"],
+  segments: [{ speaker: "Ann", text: "We should fix the login bug.", startMs: 1000, endMs: 4000 },
+    { speaker: "Bo", text: "   ", startMs: 5000 }],
+  ...extra });
+const postMeeting2508 = (site, body, headers = meetHeaders2508) =>
+  request("POST", `/api/orgs/${encodeURIComponent(site)}/meetings`, { body, headers });
+const meetResult2508 = (device, site, cmd, row) => meetHost2508(device, site, {
+  meetingResults: [{ runId: cmd.runId, siteKey: site, meetingId: cmd.meetingId, ...row }] });
+function cleanup2508(site, devices) {
+  for (const d of devices) delete agents[d];
+  delete hub.getMeetings()[site];
+}
+
+test("XERK-2508: POST /api/orgs/<site>/meetings is token-authed, org-checked, bounded and idempotent", async () => {
+  const S = "mtA2508.atlassian.net";
+  await beat1574("mtOld2508", S); // in the org, but no host reads meetings yet
+  // Only the meetings token: not the trigger token, not the operator login, not an agent's.
+  for (const headers of [{}, { authorization: "Bearer triggertok" }, userHeaders, agentHeaders]) {
+    assert.equal((await postMeeting2508(S, meeting2508("m1"), headers)).status, 401);
+  }
+  const phantom = await postMeeting2508("nobody2508.atlassian.net", meeting2508("m1"));
+  assert.equal(phantom.status, 404);
+  assert.equal("nobody2508.atlassian.net" in hub.getMeetings(), false, "a refusal mints no key");
+  for (const [bad, re] of [[{ ...meeting2508("bad id!") }, /meetingId/],
+    [meeting2508("m1", { startedAt: "soon" }), /startedAt/],
+    [meeting2508("m1", { endedAt: 1 }), /endedAt/],
+    [meeting2508("m1", { tenirUrl: "javascript:alert(1)" }), /tenirUrl/],
+    // XERK-2518: refused, never silently cut or defaulted.
+    [meeting2508("m1", { platform: "p".repeat(41) }), /platform/],
+    [meeting2508("m1", { title: { t: 1 } }), /title/],
+    [meeting2508("m1", { title: "t".repeat(301) }), /title/],
+    [meeting2508("m1", { startedAt: 9e15, endedAt: 9e15 }), /future/],
+    [meeting2508("m1", { segments: [] }), /segments/],
+    [meeting2508("m1", { segments: [{ text: "​ " }] }), /no segment carries any text/]]) {
+    const r = await postMeeting2508(S, bad);
+    assert.equal(r.status, 400);
+    assert.match(r.body.error, re);
+  }
+  const many = await postMeeting2508(S, meeting2508("m1", {
+    segments: Array.from({ length: 10001 }, () => ({ text: "x" })) }));
+  assert.equal(many.status, 413);
+  const huge = await postMeeting2508(S, meeting2508("m1", {
+    segments: [{ text: "x".repeat(1.2 * (1 << 20)) }] }));
+  assert.equal(huge.status, 413);
+  assert.equal(S in hub.getMeetings(), false);
+  // Accepted: queued (no capable host), the transcript never answered back.
+  // An upper-case scheme is still an http(s) URL.
+  assert.equal((await postMeeting2508(S, meeting2508("m0", { tenirUrl: "HTTPS://tenir.example/c/0" }))).status, 200);
+  delete hub.getMeetings()[S];
+  const ok = await postMeeting2508(S, meeting2508("m1"));
+  assert.equal(ok.status, 200);
+  const m = ok.body.meeting;
+  assert.deepEqual([m.status, m.title, m.platform, m.participants, "segments" in m],
+    ["queued", "Sprint sync", "zoom", ["Ann", "Bo"], false]);
+  assert.deepEqual(hub.getMeetings()[S][0].segments,
+    [{ speaker: "Ann", text: "We should fix the login bug.", startMs: 1000, endMs: 4000 }]);
+  // A retry (same meetingId) changes nothing: the first copy wins.
+  const again = await postMeeting2508(S, meeting2508("m1", { title: "Renamed" }));
+  assert.deepEqual([again.status, again.body.duplicate, again.body.meeting.title], [200, true, "Sprint sync"]);
+  assert.equal(hub.getMeetings()[S].length, 1);
+  // At most 10 of an org's meetings wait for a host.
+  for (let i = 2; i <= 10; i++) assert.equal((await postMeeting2508(S, meeting2508(`m${i}`))).status, 200);
+  const full = await postMeeting2508(S, meeting2508("m11"));
+  assert.equal(full.status, 429);
+  assert.match(full.body.error, /already waiting/);
+  assert.equal(meetCmds2508("mtOld2508").length, 0, "an older agent is never asked");
+  cleanup2508(S, ["mtOld2508"]);
+});
+
+test("XERK-2508: a meeting is read by one capable host, which pulls the transcript and answers", async () => {
+  const S = "mtD2508.atlassian.net";
+  const O = "mtDo2508.atlassian.net";
+  await meetHost2508("mtLapsed2508", S, { claudeAuth: { needsLogin: true } });
+  await meetHost2508("mtGood2508", S, { defaultRuntime: "qwen", meetings: { available: true, runtimes: ["claude"] } });
+  await meetHost2508("mtOther2508", O);
+  const r = await postMeeting2508(S, meeting2508("d1"));
+  assert.deepEqual([r.body.meeting.status, r.body.meeting.host], ["running", "mtGood2508"]);
+  assert.equal("cmdId" in r.body.meeting, false);
+  const [cmd] = meetCmds2508("mtGood2508");
+  assert.deepEqual([cmd.siteKey, cmd.meetingId, cmd.model, cmd.runtime, "segments" in cmd],
+    [S, "d1", hub.MEETINGS_AUTO_MODEL, "claude", false]);
+  // A second meeting waits: one run per org.
+  await postMeeting2508(S, meeting2508("d2"));
+  assert.equal(hub.getMeetings()[S][0].status, "queued");
+  assert.equal(meetCmds2508("mtGood2508").length + meetCmds2508("mtLapsed2508").length, 1);
+  // The transcript goes only to the host asked, for its run.
+  const url = (host, runId = cmd.runId) => `/api/agents/${host}/meetings/${runId}/transcript`;
+  const own = await request("GET", url("mtGood2508"), { headers: asHost("mtGood2508") });
+  assert.equal(own.status, 200);
+  assert.deepEqual([own.body.meetingId, own.body.segments.length, own.body.siteKey], ["d1", 1, S]);
+  assert.equal((await request("GET", url("mtLapsed2508"), { headers: asHost("mtLapsed2508") })).status, 404);
+  assert.equal((await request("GET", url("mtGood2508"), { headers: asHost("mtLapsed2508") })).status, 403);
+  assert.equal((await request("GET", url("mtGood2508"), {})).status, 401);
+  assert.equal((await request("GET", url("mtGood2508", "ffff"), { headers: asHost("mtGood2508") })).status, 404);
+  // Results from anyone but the host asked, or for another run, change nothing.
+  const items = [{ kind: "bug", title: "Fix the login bug", description: "Ann:\n\n\n\nit 500s",
+    suggestedAssignee: "Ann", quotes: [{ speaker: "Ann", text: "fix the login bug", atMs: 1000 }],
+    duplicateKeys: ["XERK-1", "not a key", "XERK-1"], repoGuess: "Turma", extra: "dropped" },
+    { kind: "rant", title: "dropped" }, { kind: "task", title: "" }, "junk",
+    { kind: "decision", title: "Ship Friday" }];
+  await meetResult2508("mtLapsed2508", S, cmd, { status: "ok", items });
+  await meetResult2508("mtOther2508", S, cmd, { status: "ok", items });
+  await meetResult2508("mtGood2508", S, { runId: "ffff", meetingId: "d1" }, { status: "ok", items });
+  assert.equal(hub.getMeetings()[S][1].status, "running");
+  // It fails: retried once, on the other capable host, same run.
+  await meetResult2508("mtGood2508", S, cmd, { status: "failed", error: "claude -p timed out" });
+  const moved = hub.getMeetings()[S][1];
+  assert.deepEqual([moved.status, moved.host, moved.attempt, moved.runId], ["running", "mtLapsed2508", 2, cmd.runId]);
+  // An ok without an item list is not an answer: no third host, so it fails, and the next starts.
+  await meetResult2508("mtLapsed2508", S, cmd, { status: "ok" });
+  const [d2, d1] = hub.getMeetings()[S];
+  assert.deepEqual([d1.status, d1.error, "segments" in d1], ["failed", "the model's answer carried no item list", false]);
+  // (Each result beat re-reports the host without its lapsed login, so either may take it.)
+  assert.deepEqual([d2.meetingId, d2.status, d2.attempt], ["d2", "running", 1]);
+  const h2 = d2.host;
+  const [cmd2] = meetCmds2508(h2);
+  await meetResult2508(h2, S, cmd2, { status: "ok", model: "claude-sonnet-5-5", items });
+  const done = hub.getMeetings()[S][0];
+  assert.deepEqual([done.status, done.model, "segments" in done, "cmdId" in done], ["ok", "claude-sonnet-5-5", false, false]);
+  assert.deepEqual(done.items, [
+    { id: "p1", kind: "bug", title: "Fix the login bug", description: "Ann:\n\nit 500s",
+      suggestedAssignee: "Ann", quotes: [{ speaker: "Ann", text: "fix the login bug", atMs: 1000 }],
+      duplicateKeys: ["XERK-1"], repoGuess: "Turma" },
+    { id: "p2", kind: "decision", title: "Ship Friday", description: "", quotes: [], duplicateKeys: [] }]);
+  // The outbox resends until acked: a settled run takes nothing more.
+  await meetResult2508(h2, S, cmd2, { status: "ok", items: [] });
+  assert.equal(hub.getMeetings()[S][0].items.length, 2);
+  assert.equal((await request("GET", url(h2, cmd2.runId), { headers: asHost(h2) })).status, 404);
+  // `ok` with an empty list is a real answer, and the store is a coerce fixed point.
+  assert.deepEqual(hub.meetingsCoerce(JSON.parse(JSON.stringify(hub.getMeetings()))), hub.getMeetings());
+  cleanup2508(S, ["mtLapsed2508", "mtGood2508"]);
+  cleanup2508(O, ["mtOther2508"]);
+});
+
+test("XERK-2508: the tick waits for a host, retries a silent or departed one, and expires the queue", async () => {
+  const S = "mtT2508.atlassian.net";
+  await beat1574("mtTOld2508", S);
+  await postMeeting2508(S, meeting2508("t1"));
+  hub.meetingsTick();
+  assert.equal(hub.getMeetings()[S][0].status, "queued", "no capable host: it waits");
+  // A capable host appears: the next tick sends it.
+  await meetHost2508("mtTA2508", S);
+  hub.meetingsTick();
+  const row = hub.getMeetings()[S][0];
+  assert.deepEqual([row.status, row.host], ["running", "mtTA2508"]);
+  const [cmd] = meetCmds2508("mtTA2508");
+  // A restart lost the host's queue: re-sent once, same run, same sentAt.
+  agents.mtTA2508.commands = [];
+  hub.meetingSent.clear();
+  hub.meetingsTick(row.sentAt + 1000);
+  hub.meetingsTick(row.sentAt + 2000);
+  const again = meetCmds2508("mtTA2508");
+  assert.equal(again.length, 1);
+  assert.equal(again[0].runId, cmd.runId);
+  assert.equal(hub.getMeetings()[S][0].sentAt, row.sentAt);
+  // A second capable host; the first goes silent past the timeout: retried there.
+  await meetHost2508("mtTB2508", S);
+  hub.meetingsTick(row.sentAt + hub.MEETING_RUN_TIMEOUT_MS);
+  assert.deepEqual([hub.getMeetings()[S][0].host, hub.getMeetings()[S][0].attempt], ["mtTB2508", 2]);
+  assert.equal(meetCmds2508("mtTA2508").length, 0, "the old command is withdrawn");
+  // It leaves the org: no third host, so the run fails with the hub's reason.
+  delete agents.mtTB2508;
+  hub.meetingsTick();
+  assert.deepEqual([hub.getMeetings()[S][0].status, hub.getMeetings()[S][0].error],
+    ["failed", "the host went offline before answering"]);
+  // A meeting no host takes within a day fails rather than waiting forever.
+  delete agents.mtTA2508;
+  await postMeeting2508(S, meeting2508("t2"));
+  const t2 = hub.getMeetings()[S][0];
+  hub.meetingsTick(t2.receivedAt + hub.MEETING_QUEUE_MAX_MS - 1);
+  assert.equal(hub.getMeetings()[S][0].status, "queued");
+  hub.meetingsTick(t2.receivedAt + hub.MEETING_QUEUE_MAX_MS);
+  assert.deepEqual([hub.getMeetings()[S][0].status, hub.getMeetings()[S][0].error],
+    ["failed", "no online host of this org could read the meeting"]);
+  cleanup2508(S, ["mtTOld2508"]);
+});
+
+test("XERK-2508: the whitelist, the capability block and the store bound", () => {
+  assert.equal(hub.meetingText("a‮ b\u0000\n c", 100), "a b c");
+  assert.equal(hub.meetingText("a  \n\n\n\n b", 100, true), "a\n\nb");
+  assert.equal(hub.meetingText("😀".repeat(5), 3), "😀".repeat(3));
+  assert.equal(hub.meetingText("x\ud800y", 10), "x�y");
+  const p = { meetings: { available: "yes", runtimes: ["claude", "bash"], models: "sonnet" } };
+  hub.normalizeRunCapability(p, "meetings");
+  assert.deepEqual(p.meetings, { available: false, runtimes: ["claude"] });
+  const q = { meetings: [1] };
+  hub.normalizeRunCapability(q, "meetings");
+  assert.equal(q.meetings, null);
+  // A running row without its run fields, an ok row without items, a queued row
+  // without a transcript are all dropped; a settled row never keeps segments.
+  const base = { meetingId: "w1", title: "t", platform: "teams", startedAt: 1, endedAt: 2, receivedAt: 3,
+    segments: [{ text: "hi" }] };
+  assert.equal(hub.sanitizeMeeting({ ...base, status: "running" }), null);
+  assert.equal(hub.sanitizeMeeting({ ...base, status: "ok" }), null);
+  assert.equal(hub.sanitizeMeeting({ ...base, status: "queued", segments: [] }), null);
+  assert.equal("segments" in hub.sanitizeMeeting({ ...base, status: "failed" }), false);
+  // Eviction drops settled rows first, so a waiting meeting is never lost to them.
+  const rows = [{ ...base, meetingId: "q", status: "queued" },
+    ...Array.from({ length: hub.MEETINGS_KEEP }, (_, i) => ({ ...base, meetingId: `s${i}`, status: "failed" }))];
+  const kept = hub.meetingsCoerce({ "o.atlassian.net": rows.reverse() })["o.atlassian.net"];
+  assert.equal(kept.length, hub.MEETINGS_KEEP);
+  assert.ok(kept.some((m) => m.meetingId === "q"));
+  assert.equal(Object.getPrototypeOf(hub.meetingsCoerce({ __proto__: null })), null);
+});
+
+test("XERK-2508 QA: a drifted host is refused, the fleet caps hold, and an empty list is an answer", async () => {
+  const S = "mtQ2508.atlassian.net";
+  const O = "mtQo2508.atlassian.net";
+  await meetHost2508("mtQA2508", S);
+  await postMeeting2508(S, meeting2508("q1"));
+  const [cmd] = meetCmds2508("mtQA2508");
+  const url = `/api/agents/mtQA2508/meetings/${cmd.runId}/transcript`;
+  // Declaring another org (drift): no transcript and no result taken.
+  await meetHost2508("mtQA2508", O);
+  assert.equal((await request("GET", url, { headers: asHost("mtQA2508") })).status, 404);
+  await meetHost2508("mtQA2508", O, { meetingResults: [{ runId: cmd.runId, siteKey: S, status: "ok", items: [] }] });
+  assert.equal(hub.getMeetings()[S][0].status, "running");
+  // Back in the org: `ok` with no items is a real answer, not a failure.
+  await meetResult2508("mtQA2508", S, cmd, { status: "ok", items: [], model: "<script>" });
+  const row = hub.getMeetings()[S][0];
+  assert.deepEqual([row.status, row.items, row.model], ["ok", [], hub.MEETINGS_AUTO_MODEL]);
+  // A tenirUrl that could break out of an attribute is refused.
+  for (const tenirUrl of ["https://x/'onmouseover='a", "https://x/\u202egpj.exe", "https://x/a\u200bb",
+    "https://x/a\u061cb", "https://x/a\u00adb", "https://x/a\u3164b", "https://x/a\u{E0041}b",
+    "https://x/a\u0600b", "https://x/a\u0001b", "https:///x", `https://x/${"\u{1F600}".repeat(250)}`]) {
+    assert.equal((await postMeeting2508(S, meeting2508("q2", { tenirUrl }))).status, 400, tenirUrl);
+  }
+  // A restored row's model is charset-checked too; an item list is byte-bounded.
+  const restored = hub.sanitizeMeeting({ ...row, model: "<script>", items: Array.from({ length: 30 },
+    () => ({ kind: "task", title: "t", description: "d".repeat(4000) })) });
+  assert.equal("model" in restored, false);
+  assert.ok(restored.items.length < 30 && Buffer.byteLength(JSON.stringify(restored.items)) <= 64 << 10);
+  const many = hub.sanitizeMeeting({ ...row, items: Array.from({ length: 35 }, (_, i) => ({ kind: "task", title: `t${i}` })) });
+  assert.deepEqual([many.items.length, many.items[29].id], [30, "p30"]);
+  // Fleet-wide: 20 pending meetings across orgs, then 429.
+  delete agents.mtQA2508;
+  const orgs = ["mtQ1", "mtQ2", "mtQ3"].map((o) => `${o}2508.atlassian.net`);
+  for (const [i, o] of orgs.entries()) await beat1574(`mtQH${i}2508`, o);
+  let n = 0;
+  for (const o of orgs) for (let i = 0; i < 7 && n < 20; i++, n++) {
+    assert.equal((await postMeeting2508(o, meeting2508(`f${i}`))).status, 200);
+  }
+  const fleet = await postMeeting2508(orgs[2], meeting2508("f9"));
+  assert.equal(fleet.status, 429);
+  assert.match(fleet.body.error, /20 meetings are already waiting/);
+  for (const o of orgs) delete hub.getMeetings()[o];
+  // The byte budget: pending transcripts past 2 MiB fleet-wide are refused.
+  // The byte budgets: 1 MiB of pending transcript per org, 2 MiB fleet-wide.
+  const fat = (id) => meeting2508(id, { segments: Array.from({ length: 450 }, () => ({ text: "y".repeat(2000) })) });
+  assert.equal((await postMeeting2508(orgs[0], fat("b1"))).status, 200);
+  const orgOver = await postMeeting2508(orgs[0], fat("b2"));
+  assert.equal(orgOver.status, 429);
+  assert.match(orgOver.body.error, /this org's meetings/);
+  assert.equal((await postMeeting2508(orgs[1], fat("b2"))).status, 200);
+  const over = await postMeeting2508(orgs[2], fat("b3"));
+  assert.equal(over.status, 429);
+  assert.match(over.body.error, /fill the hub's transcript budget/);
+  for (const [i, o] of orgs.entries()) cleanup2508(o, [`mtQH${i}2508`]);
+  cleanup2508(S, []);
+  cleanup2508(O, []);
 });
