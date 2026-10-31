@@ -273,21 +273,21 @@ test("XERK-2530: concurrent local sign-ins past the cap are told to retry; break
 
 test("XERK-2530: an OIDC login becomes a hub user with its own tenant; disabled gets none", () => {
   const iss = "https://idp.test/application/o/turma/";
-  const p1 = hub.oidcPrincipal(iss, { sub: "oidc-1", name: "Olive" }, "user");
+  const p1 = hub.oidcPrincipal(iss, { sub: "oidc-1", name: "Olive" }, ["user"]);
   assert.equal(p1.kind, "user");
   assert.equal(p1.source, "oidc");
   assert.match(p1.tenantId, /^[0-9a-f]{32}$/);
   assert.deepEqual([...p1.roles], ["user"]);
-  const p2 = hub.oidcPrincipal(iss, { sub: "oidc-1", name: "Olive" }, "admin");
+  const p2 = hub.oidcPrincipal(iss, { sub: "oidc-1", name: "Olive" }, ["user", "admin"]);
   assert.equal(p2.userId, p1.userId);
   assert.equal(p2.tenantId, p1.tenantId);
   assert.deepEqual([...p2.roles], ["user", "admin"]);
   const token = hub.issueSessionToken(60000, hub.principalClaims(p2));
   assert.equal(principalOfToken(token).userId, p1.userId);
   hub.__setTenancy(tenancy.updateUser(hub.tenancyState(), p1.userId, { disabled: true }).state);
-  assert.equal(hub.oidcPrincipal(iss, { sub: "oidc-1" }, "admin"), null);
+  assert.equal(hub.oidcPrincipal(iss, { sub: "oidc-1" }, ["user", "admin"]), null);
   assert.equal(principalOfToken(token), null);
-  assert.throws(() => hub.oidcPrincipal(iss, { sub: 42 }, "user"), /subject/);
+  assert.throws(() => hub.oidcPrincipal(iss, { sub: 42 }, ["user"]), /subject/);
 });
 
 test("XERK-2530: the store is written to its own durable file, never state.json", async () => {

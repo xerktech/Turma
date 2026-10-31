@@ -1,6 +1,7 @@
 "use strict";
 
-// XERK-594 — group-based access from the OIDC `groups` claim (k8x-ai / k8x-admins).
+// XERK-594 — group-based access from the OIDC `groups` claim (k8x-ai / k8x-admins);
+// XERK-2532 — each group maps to its own role (user = a tenant, admin = the panel).
 //
 // Its own process, like oidc.test.js: the group config AND the OIDC env are read
 // at require time. Here group enforcement is ON (the default names) and the OIDC
@@ -53,6 +54,7 @@ process.env.ARCHIVE_DIR = mkdtemp("turma-oidcgrp-archive-");
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
 
 const hub = require("../server.js");
+const tenancy = require("../tenancy.js");
 const { server } = hub;
 
 // The OIDC side-stores moved into the shared LiveStore (XERK-760); in tests HA is
@@ -114,14 +116,15 @@ test("oidcGroupsFromClaims normalizes the many shapes of the claim", () => {
   assert.deepEqual(hub.oidcGroupsFromClaims({ groups: [USER_GROUP, 1, "", null, {}] }), [USER_GROUP]);
 });
 
-test("oidcAccessDecision maps groups to allow + role", () => {
-  assert.deepEqual(hub.oidcAccessDecision([USER_GROUP]), { allowed: true, role: "user" });
-  assert.deepEqual(hub.oidcAccessDecision([ADMIN_GROUP]), { allowed: true, role: "admin" });
-  // Admin outranks user when a user is in both.
-  assert.deepEqual(hub.oidcAccessDecision([USER_GROUP, ADMIN_GROUP]), { allowed: true, role: "admin" });
+test("XERK-2532: oidcAccessDecision maps each group to its own role", () => {
+  assert.deepEqual(hub.oidcAccessDecision([USER_GROUP]), { allowed: true, roles: ["user"] });
+  // Admin alone no longer implies user: admin panel, no tenant.
+  assert.deepEqual(hub.oidcAccessDecision([ADMIN_GROUP]), { allowed: true, roles: ["admin"] });
+  // Both groups -> both roles, in tenancy.ROLES order whatever the claim's order.
+  assert.deepEqual(hub.oidcAccessDecision([ADMIN_GROUP, USER_GROUP]), { allowed: true, roles: ["user", "admin"] });
   // In neither group -> denied.
-  assert.deepEqual(hub.oidcAccessDecision(["something-else"]), { allowed: false, role: null });
-  assert.deepEqual(hub.oidcAccessDecision([]), { allowed: false, role: null });
+  assert.deepEqual(hub.oidcAccessDecision(["something-else"]), { allowed: false, roles: [] });
+  assert.deepEqual(hub.oidcAccessDecision([]), { allowed: false, roles: [] });
 });
 
 // ---- the callback route ------------------------------------------------------
@@ -146,15 +149,17 @@ function get(pathName, headers = {}) {
 }
 
 // Drive a full callback with the token endpoint stubbed to mint the given claims.
-async function driveCallback(groups) {
+// `over` overrides claims (a distinct `sub` keeps a test's user its own); `mobile`
+// is a PKCE challenge, making it the native-app flow.
+async function driveCallback(groups, over = {}, mobile = "") {
   hub.__setOidcCaches(DISCOVERY, jwksKeys);
   const state = `state-${crypto.randomBytes(4).toString("hex")}`;
-  await txSet(state, { nonce: "the-nonce", verifier: "verifier-xyz-1234567890", next: "/board", at: Date.now() });
+  await txSet(state, { nonce: "the-nonce", verifier: "verifier-xyz-1234567890", next: "/board", mobile, at: Date.now() });
   const saved = global.fetch;
   global.fetch = async () => ({
     ok: true,
     status: 200,
-    text: async () => JSON.stringify({ id_token: signJwt(claimsWith(groups)) }),
+    text: async () => JSON.stringify({ id_token: signJwt(claimsWith(groups, over)) }),
   });
   try {
     const res = await get(`/auth/oidc/callback?state=${state}&code=the-code`, { cookie: `hub_oidc_state=${state}` });
@@ -162,6 +167,19 @@ async function driveCallback(groups) {
   } finally {
     global.fetch = saved;
   }
+}
+
+function post(pathName, body) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body);
+    const req = http.request(baseUrl + pathName, { method: "POST", headers: { "content-type": "application/json" } }, (res) => {
+      let out = "";
+      res.on("data", (c) => (out += c));
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, raw: out }));
+    });
+    req.on("error", reject);
+    req.end(data);
+  });
 }
 
 function setCookieText(res) {
@@ -183,38 +201,142 @@ test("a user in the user group is admitted with a user-role session", async () =
   assert.match(sc, new RegExp(`hub_session=[^;]+; .*Max-Age=${OIDC_TTL_MS / 1000}(;|\\b)`));
   const rec = await sessGet(sidFromSetCookie(res));
   assert.ok(rec);
-  assert.equal(rec.role, "user");
+  assert.deepEqual(rec.roles, ["user"]);
   assert.deepEqual(rec.groups, [USER_GROUP]);
   assert.equal(await txHas(state), false); // tx consumed
 });
 
-test("a user in the admin group is admitted with an admin-role session", async () => {
-  const { res } = await driveCallback([ADMIN_GROUP, USER_GROUP]);
+test("a user in both groups is admitted with both roles", async () => {
+  const { res } = await driveCallback([ADMIN_GROUP, USER_GROUP], { sub: "both-1" });
   assert.equal(res.status, 302);
   assert.equal(res.headers.location, "/board");
   const rec = await sessGet(sidFromSetCookie(res));
   assert.ok(rec);
-  assert.equal(rec.role, "admin");
+  assert.deepEqual(rec.roles, ["user", "admin"]);
+  const p = principalOf(res);
+  assert.deepEqual([...p.roles], ["user", "admin"]);
+  assert.match(p.tenantId, /^[0-9a-f]{32}$/);
 });
 
-test("XERK-2530: the callback's session names a hub user with its own tenant; the admin group adds admin", async () => {
-  const { res } = await driveCallback([ADMIN_GROUP]);
+function tokenOf(res) {
+  const m = setCookieText(res).match(/hub_session=([^;]+)/);
+  return m ? m[1] : null;
+}
+function principalOf(res) {
+  return hub.requestPrincipal({ headers: { cookie: `hub_session=${tokenOf(res)}` } });
+}
+const userBySub = (sub) => Object.values(hub.tenancyState().users).find((u) => u.oidcSub === sub) || null;
+
+test("XERK-2532: an admin-group-only user gets the admin role and NO tenant; joining the user group adds it", async () => {
+  const { res } = await driveCallback([ADMIN_GROUP], { sub: "admin-only-1" });
   assert.equal(res.status, 302);
-  const token = setCookieText(res).match(/hub_session=([^;]+)/)[1];
-  const p = hub.requestPrincipal({ headers: { cookie: `hub_session=${token}` } });
+  const p = principalOf(res);
   assert.equal(p.kind, "user");
   assert.equal(p.source, "oidc");
-  assert.match(p.tenantId, /^[0-9a-f]{32}$/);
-  assert.deepEqual([...p.roles], ["user", "admin"]);
+  assert.deepEqual([...p.roles], ["admin"]);
+  assert.equal(p.tenantId, null, "admin grants no tenant");
   const rec = await sessGet(sidFromSetCookie(res));
   assert.equal(rec.userId, p.userId);
-  // The same IdP subject signing in again is the same user and tenant.
-  const again = await driveCallback([USER_GROUP]);
-  const t2 = setCookieText(again.res).match(/hub_session=([^;]+)/)[1];
-  const p2 = hub.requestPrincipal({ headers: { cookie: `hub_session=${t2}` } });
+  // The record keeps a reserved tenant, so a later user role is that same tenant.
+  const stored = userBySub("admin-only-1");
+  assert.match(stored.tenantId, /^[0-9a-f]{32}$/);
+  const again = await driveCallback([USER_GROUP], { sub: "admin-only-1" });
+  const p2 = principalOf(again.res);
   assert.equal(p2.userId, p.userId);
-  assert.equal(p2.tenantId, p.tenantId);
+  assert.equal(p2.tenantId, stored.tenantId);
   assert.deepEqual([...p2.roles], ["user"]);
+  // The earlier admin-only cookie now reads the CURRENT roles (store, not cookie).
+  assert.deepEqual([...principalOf(res).roles], ["user"]);
+});
+
+test("XERK-2532: a user-group-only user gets a tenant and no admin role", async () => {
+  const { res } = await driveCallback([USER_GROUP], { sub: "user-only-1" });
+  const p = principalOf(res);
+  assert.deepEqual([...p.roles], ["user"]);
+  assert.match(p.tenantId, /^[0-9a-f]{32}$/);
+});
+
+test("XERK-2532: the identity is (issuer, sub) — a changed email/name is the same user", async () => {
+  const a = await driveCallback([USER_GROUP], { sub: "stable-1", email: "a@x.test", name: "A" });
+  const b = await driveCallback([USER_GROUP], { sub: "stable-1", email: "b@x.test", name: "B" });
+  assert.equal(principalOf(a.res).userId, principalOf(b.res).userId);
+  assert.equal(userBySub("stable-1").displayName, "B");
+  // A different sub sharing the email is a different user and tenant.
+  const c = await driveCallback([USER_GROUP], { sub: "stable-2", email: "b@x.test", name: "B" });
+  assert.notEqual(principalOf(c.res).userId, principalOf(b.res).userId);
+  assert.notEqual(principalOf(c.res).tenantId, principalOf(b.res).tenantId);
+});
+
+test("XERK-2532: removal from every group disables the user (tenant kept), revoking its live session; re-adding restores it", async () => {
+  const first = await driveCallback([USER_GROUP], { sub: "leaver-1" });
+  const p = principalOf(first.res);
+  assert.ok(p);
+  const tenantId = p.tenantId;
+  // Removed from the groups: the next login is refused AND marks the user disabled.
+  const denied = await driveCallback(["something-else"], { sub: "leaver-1" });
+  assert.equal(denied.res.headers.location, "/login?error=forbidden");
+  const u = userBySub("leaver-1");
+  assert.equal(u.disabled, true);
+  assert.equal(u.disabledBy, "idp");
+  assert.equal(u.tenantId, tenantId, "tenant retained until an admin deletes the user");
+  // The still-unexpired cookie from before names nobody now (roles re-read per request).
+  assert.equal(principalOf(first.res), null);
+  // Re-added to the user group: the IdP disable lifts, same user + tenant.
+  const back = await driveCallback([USER_GROUP], { sub: "leaver-1" });
+  const p2 = principalOf(back.res);
+  assert.equal(p2.userId, p.userId);
+  assert.equal(p2.tenantId, tenantId);
+  assert.equal(userBySub("leaver-1").disabled, false);
+  assert.equal(userBySub("leaver-1").disabledBy, undefined);
+});
+
+test("XERK-2532: an operator's disable is never lifted by a login", async () => {
+  await driveCallback([USER_GROUP], { sub: "op-disabled-1" });
+  const u = userBySub("op-disabled-1");
+  hub.__setTenancy(tenancy.updateUser(hub.tenancyState(), u.id, { disabled: true }).state);
+  const again = await driveCallback([USER_GROUP], { sub: "op-disabled-1" });
+  assert.equal(again.res.headers.location, "/login?error=forbidden");
+  assert.equal(userBySub("op-disabled-1").disabled, true);
+  // Re-stating an IdP disable as the operator's makes it the operator's too.
+  await driveCallback([USER_GROUP], { sub: "op-disabled-2" });
+  await driveCallback([], { sub: "op-disabled-2" });
+  const u2 = userBySub("op-disabled-2");
+  assert.equal(u2.disabledBy, "idp");
+  hub.__setTenancy(tenancy.updateUser(hub.tenancyState(), u2.id, { disabled: true }).state);
+  assert.equal(userBySub("op-disabled-2").disabledBy, undefined);
+  await driveCallback([USER_GROUP], { sub: "op-disabled-2" });
+  assert.equal(userBySub("op-disabled-2").disabled, true);
+});
+
+test("XERK-2532: losing only the user group drops the tenant but keeps admin (not disabled)", async () => {
+  await driveCallback([USER_GROUP, ADMIN_GROUP], { sub: "demoted-1" });
+  const { res } = await driveCallback([ADMIN_GROUP], { sub: "demoted-1" });
+  const p = principalOf(res);
+  assert.deepEqual([...p.roles], ["admin"]);
+  assert.equal(p.tenantId, null);
+  assert.equal(userBySub("demoted-1").disabled, false);
+});
+
+test("XERK-2532: an identity in neither group is never provisioned", async () => {
+  await driveCallback(["something-else"], { sub: "never-1" });
+  assert.equal(userBySub("never-1"), null);
+});
+
+test("XERK-2532: the mobile exchange issues the same principal as the browser flow", async () => {
+  const verifier = "mobile-verifier-2532-abcdefgh";
+  const { res } = await driveCallback([ADMIN_GROUP], { sub: "mobile-1" }, hub.pkceChallenge(verifier));
+  assert.equal(res.status, 302);
+  const code = new URL(res.headers.location).searchParams.get("code");
+  const ex = await post("/api/oidc/mobile/exchange", { code, verifier });
+  assert.equal(ex.status, 200);
+  const { token } = JSON.parse(ex.raw);
+  const pm = hub.requestPrincipal({ headers: { cookie: `hub_session=${token}` } });
+  const browser = await driveCallback([ADMIN_GROUP], { sub: "mobile-1" });
+  const pb = principalOf(browser.res);
+  assert.equal(pm.userId, pb.userId);
+  assert.deepEqual([...pm.roles], ["admin"]);
+  assert.deepEqual([...pm.roles], [...pb.roles]);
+  assert.equal(pm.tenantId, null);
 });
 
 test("a user in NEITHER group is denied a session and bounced to /login?error=forbidden", async () => {

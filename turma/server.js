@@ -13281,13 +13281,21 @@ function userPrincipal(user) {
   if (!user || user.disabled) return null;
   const roles = tenancy.effectiveRoles(tenancyState, user);
   if (!roles.length) return null; // no group grants access any more
+  // The tenant comes with the USER role only (XERK-2532): an admin-only
+  // principal reaches the admin panel and no tenant. The record keeps its
+  // tenantId either way, so a later user role finds the same tenant.
   return Object.freeze({
-    kind: "user", userId: user.id, tenantId: user.tenantId, roles: Object.freeze(roles), source: user.source,
+    kind: "user", userId: user.id, tenantId: roles.includes("user") ? user.tenantId : null,
+    roles: Object.freeze(roles), source: user.source,
   });
 }
 
+// A user token names the RECORD's tenant (even for an admin-only principal, whose
+// tenantId is null), so principalFromToken's "same tenant for life" check holds.
 function principalClaims(p) {
-  return p.kind === "breakglass" ? { bg: 1, r: ["admin"] } : { u: p.userId, t: p.tenantId, r: [...p.roles] };
+  if (p.kind === "breakglass") return { bg: 1, r: ["admin"] };
+  const user = Object.hasOwn(tenancyState.users, p.userId) ? tenancyState.users[p.userId] : null;
+  return { u: p.userId, t: user ? user.tenantId : p.tenantId, r: [...p.roles] };
 }
 
 // The principal a session token names, re-checked against the store NOW.
@@ -13357,15 +13365,18 @@ async function localLogin(username, password, now = Date.now()) {
 
 // The OIDC callback's half of the one-principal convergence: the IdP's
 // (issuer, sub) is upserted as a hub user with its own tenant, and the roles the
-// groups claim granted are recorded. Null when the user is disabled.
-function oidcPrincipal(iss, claims, role, now = Date.now()) {
+// groups claim granted (`roles`, possibly none) are recorded. Called for EVERY
+// verified login, so a known user the groups no longer admit is marked disabled
+// (`tenancy.upsertOidcUser`). Null when the login yields no principal.
+function oidcPrincipal(iss, claims, roles, now = Date.now()) {
   const displayName = typeof claims.name === "string" ? claims.name
     : typeof claims.preferred_username === "string" ? claims.preferred_username : "";
   const { state, user } = tenancy.upsertOidcUser(tenancyState, {
     iss, sub: typeof claims.sub === "string" ? claims.sub : "", displayName,
-    idpRoles: role === "admin" ? ["user", "admin"] : ["user"], now,
+    idpRoles: roles, now,
   });
-  if (user.disabled) {
+  if (!user) return null; // never admitted: nothing provisioned
+  if (user.disabled || !roles.length) {
     if (state !== tenancyState) setTenancy(state);
     return null;
   }
@@ -13669,16 +13680,19 @@ function oidcGroupsFromClaims(claims) {
   return arr.filter((x) => typeof x === "string" && x.length > 0);
 }
 
-// Decide access + role from the user's groups. Admin membership implies access
-// AND outranks user membership (a user in both is an admin). With enforcement
+// Decide the roles the user's groups grant (XERK-2532). The two groups map
+// INDEPENDENTLY: the user group -> "user" (a tenant), the admin group -> "admin"
+// (the admin panel, no tenant data). Admin no longer implies user — a user in
+// only the admin group gets no tenant; one in both gets both. With enforcement
 // off (both group names empty) any authenticated OIDC user is a plain user.
-// Returns { allowed, role } — role is "admin" | "user", null when denied.
+// Returns { allowed, roles } — roles ordered as tenancy.ROLES, [] when denied.
 function oidcAccessDecision(groups) {
   const set = new Set(groups || []);
-  if (OIDC_ADMIN_GROUP && set.has(OIDC_ADMIN_GROUP)) return { allowed: true, role: "admin" };
-  if (OIDC_USER_GROUP && set.has(OIDC_USER_GROUP)) return { allowed: true, role: "user" };
-  if (!OIDC_GROUPS_ENFORCED) return { allowed: true, role: "user" };
-  return { allowed: false, role: null };
+  if (!OIDC_GROUPS_ENFORCED) return { allowed: true, roles: ["user"] };
+  const roles = [];
+  if (OIDC_USER_GROUP && set.has(OIDC_USER_GROUP)) roles.push("user");
+  if (OIDC_ADMIN_GROUP && set.has(OIDC_ADMIN_GROUP)) roles.push("admin");
+  return { allowed: roles.length > 0, roles };
 }
 
 // Exchange the authorization code for tokens (confidential client, PKCE). We
@@ -20520,6 +20534,13 @@ const server = http.createServer(async (req, res) => {
         const groups = oidcGroupsFromClaims(claims);
         const access = oidcAccessDecision(groups);
         if (!access.allowed) {
+          // A KNOWN user the groups no longer admit is marked disabled (its
+          // tenant is kept); an unknown one is never provisioned.
+          try {
+            oidcPrincipal(disco.issuer, claims, []);
+          } catch (e) {
+            console.log(`OIDC disable-on-removal failed: ${logName(e && e.message || "?")}`);
+          }
           console.log(
             `OIDC access denied for ${logName(String(claims.sub || "?"))}: in none of ` +
               `[${logName(OIDC_USER_GROUP)}, ${logName(OIDC_ADMIN_GROUP)}]`
@@ -20535,7 +20556,7 @@ const server = http.createServer(async (req, res) => {
         // own tenant, and the session names it. A disabled user gets no session.
         let principal;
         try {
-          principal = oidcPrincipal(disco.issuer, claims, access.role);
+          principal = oidcPrincipal(disco.issuer, claims, access.roles);
         } catch (e) {
           console.log(`OIDC sign-in refused: ${logName(e && e.message || "?")}`);
           principal = null;
@@ -20567,7 +20588,7 @@ const server = http.createServer(async (req, res) => {
           idToken: tokens.id_token,
           sub: claims.sub,
           userId: principal.userId,
-          role: access.role,
+          roles: [...principal.roles],
           groups,
           at: Date.now(),
         });
