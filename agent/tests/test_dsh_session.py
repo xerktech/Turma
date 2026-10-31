@@ -481,6 +481,56 @@ class DshDelegationTailTest(unittest.TestCase):
         self.assertTrue(p and os.path.isfile(p))
         self.assertGreaterEqual(len(self._read(p)), 2)
 
+    def test_workflow_record_and_journal_never_write_through_a_planted_link(self):
+        # XERK-2564: the run record and journal names are session-writable, so a
+        # symlink planted there must be replaced, never written through.
+        run = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        claude_run = ds.workflow_run_id(run)
+        stem = self.transcript[:-len(".jsonl")]
+        rec = os.path.join(stem, "workflows", claude_run + ".json")
+        journal = os.path.join(stem, "subagents", "workflows", claude_run,
+                               "journal.jsonl")
+        victim = os.path.join(self.tmp, "victim")
+        with open(victim, "w") as f:
+            f.write("untouched")
+        for p in (rec, journal):
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            os.symlink(victim, p)
+        self._parent([
+            {"type": "tool-workflow/run-start", "seq": 2, "time": 1000,
+             "data": {"runId": run, "name": "review"}},
+            {"type": "tool-workflow/agent-start", "seq": 3, "time": 1100,
+             "data": {"runId": run, "seq": 1, "label": "review:bugs", "childId": "c1"}},
+            {"type": "tool-workflow/agent-end", "seq": 4, "time": 2000,
+             "data": {"runId": run, "seq": 1, "outcome": "completed"}},
+        ])
+        self.tail._pump()
+        with open(victim) as f:
+            self.assertEqual(f.read(), "untouched")
+        for p in (rec, journal):
+            self.assertFalse(os.path.islink(p), p)
+        self.assertEqual(ha._workflow_run_record(self.transcript, claude_run)["runId"],
+                         claude_run)
+        self.assertTrue(self._read(journal))
+        self.assertEqual([n for n in os.listdir(os.path.dirname(rec)) if n.endswith(".tmp")],
+                         [])
+
+    def test_transcript_create_does_not_follow_a_dangling_link(self):
+        outside = os.path.join(self.tmp, "created-through-link")
+        os.unlink(self.transcript)
+        os.symlink(outside, self.transcript)
+        self.tail._stop.set()       # run only the launch-time create, then exit
+        self.tail._run()
+        self.assertFalse(os.path.exists(outside))
+
+    def test_child_move_create_does_not_follow_a_dangling_link(self):
+        new = os.path.join(self.tmp, "moved", "agent-x.jsonl")
+        outside = os.path.join(self.tmp, "created-through-link")
+        os.makedirs(os.path.dirname(new))
+        os.symlink(outside, new)
+        self.tail._move_child_file(os.path.join(self.tmp, "absent.jsonl"), new)
+        self.assertFalse(os.path.exists(outside))
+
     def test_workflow_agent_is_not_a_top_level_subagent_row(self):
         # A workflow agent reaches the tail through the subagent seam too, so the
         # driver forwards a `turma/subagent-*` for it — but it belongs to the run,

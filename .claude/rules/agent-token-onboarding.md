@@ -71,7 +71,8 @@ Split out of `CLAUDE.md`, which keeps the per-host credential contract (XERK-268
     an `origin` that differs from its last home (renamed, then removed), so `identityByOrigin` would
     hand the old machine's live id to the new one; redemption strips that origin first, and refuses
     if `issueAgentUid` still returns a used id.
-  - `owner` records the minting principal (`oidc:<sub>` or `local:<user>`) for the tenancy epic
+  - `owner` records the minting principal (`requestPrincipal`: `user:<id>` + `tenantId`, else its
+    kind, e.g. `breakglass`) for the tenancy epic
     (XERK-2529) to bind the host to a tenant. **Recorded, not enforced.**
   - Agent: `hub-agent.py --enroll` with `TURMA_ENROLL_CODE` in the ENV (never argv) runs
     `enroll_with_code`, which writes only an identity token. Front ends: `turma-agentctl enroll

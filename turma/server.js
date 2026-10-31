@@ -66,6 +66,7 @@ const outcomeLedger = require("./outcome-ledger.js");
 // it. See docs/turma-ha-store-adr.md.
 const { resolveHaConfig } = require("./ha-config.js");
 const { createLiveStore, sameValue } = require("./store.js");
+const tenancy = require("./tenancy.js");
 const { createLeader } = require("./leader.js");
 // The archive's object-store backend + mirror (XERK-759, epic XERK-751). The
 // durable archive's BYTES (rendered + raw layers) move to object storage as the
@@ -626,6 +627,9 @@ const EPIC_BUILDERS_FILE = process.env.EPIC_BUILDERS_FILE || "/data/epic-builder
 // permission dialog, a typed note) — human-rate writes, so it is a
 // registerExternalStore; the churn rule bites per-beat data.
 const DECISIONS_FILE = process.env.DECISIONS_FILE || "/data/decisions.json";
+// Hub users + tenants and the local group -> role map (XERK-2530). Durable store,
+// never state.json: losing it would drop every tenant's identity.
+const TENANCY_FILE = process.env.TENANCY_FILE || "/data/users.json";
 // The Daily Brief's per-org meeting schedule (XERK-2391): siteKey -> {enabled,
 // time, timeZone, weekdays, leadMinutes, model}. Operator-set, human-rate.
 const DAILY_BRIEF_SCHEDULES_FILE =
@@ -1559,6 +1563,16 @@ const SESSION_TTL_MS = 30 * 24 * 3600 * 1000; // stay signed in for 30 days
 const SESSION_KEY =
   process.env.TURMA_SESSION_SECRET ||
   crypto.createHash("sha256").update(`${TURMA_USER}\n${TURMA_PASSWORD}`).digest("hex");
+// The key that signs BROWSER credentials (session cookies, ws-tokens). It is
+// SESSION_KEY whenever that is a secret; with neither TURMA_SESSION_SECRET nor
+// TURMA_PASSWORD set, SESSION_KEY is the hash of a PUBLIC string, which was
+// harmless while such a hub was fully open — but local accounts (XERK-2530) turn
+// the login on without a password, and a public key would let anyone forge a
+// session. So that case signs with a per-process random key instead (sessions
+// end at a restart; HA replicas need TURMA_SESSION_SECRET, warned at boot). The
+// relay/forward auth keeps SESSION_KEY: it must be identical across replicas.
+const SESSION_KEY_SECRET = !!(process.env.TURMA_SESSION_SECRET || TURMA_PASSWORD);
+const SESSION_SIGN_KEY = SESSION_KEY_SECRET ? SESSION_KEY : crypto.randomBytes(32).toString("hex");
 
 // ---- OIDC relying-party (XERK-592, foundation for the XERK-591 epic) --------
 // Optional native OIDC login: when the four env vars below are all set, the hub
@@ -2716,9 +2730,9 @@ const asFlagMap = (raw) => {
 // store's setter AFTER mutating the mirror. `read` returns the current mirror
 // value; `install` replaces the mirror with a coerced value (boot-load / remote
 // watch); `coerce` validates a raw value to the store's shape.
-function registerExternalStore({ name, file, coerce, read, install, afterLoad, debounceMs = 5000 }) {
+function registerExternalStore({ name, file, coerce, read, install, afterLoad, debounceMs = 5000, mode }) {
   const key = STORE_KEY_PREFIX + name;
-  STORE_PERSISTENT[key] = { file, debounceMs };
+  STORE_PERSISTENT[key] = mode ? { file, debounceMs, mode } : { file, debounceMs };
   externalizedStores.push({ key, name, coerce, read, install, afterLoad });
   return function persist() {
     // `liveStore` is the module-load backend (file/in-memory off, Valkey on). On
@@ -2852,6 +2866,50 @@ const persistAgentIdentities = registerExternalStore({
   name: "agentIdentities", file: AGENT_IDENTITIES_FILE,
   coerce: coerceAgentIdentities, read: () => agentIdentities, install: (v) => { agentIdentities = v; },
 });
+// Users + tenants (XERK-2530): `{users, groups?}`, whitelisted by
+// tenancy.coerceTenancy. No debounce: a login or an account change is human-rate,
+// and a 200 must mean the record is kept.
+let tenancyState = tenancy.coerceTenancy(readJsonFile(TENANCY_FILE));
+const persistTenancy = registerExternalStore({
+  name: "tenancy", file: TENANCY_FILE, debounceMs: 0, mode: 0o600, // holds password hashes
+  coerce: tenancy.coerceTenancy, read: () => tenancyState, install: (v) => { tenancyState = v; },
+});
+function setTenancy(next) {
+  tenancyState = next;
+  persistTenancy();
+}
+// First run: an initial local admin from env, so a fresh install is
+// administrable from the browser without pod access. Only when the store holds
+// no user at all — the env pair never resets or re-creates an account later.
+const BOOTSTRAP_ADMIN_USER = (process.env.TURMA_BOOTSTRAP_ADMIN_USER || "").trim();
+const BOOTSTRAP_ADMIN_PASSWORD = process.env.TURMA_BOOTSTRAP_ADMIN_PASSWORD || "";
+const BOOTSTRAP_CONFIGURED = !!(BOOTSTRAP_ADMIN_USER && BOOTSTRAP_ADMIN_PASSWORD);
+function bootstrapTenancy() {
+  if (!!BOOTSTRAP_ADMIN_USER !== !!BOOTSTRAP_ADMIN_PASSWORD) {
+    console.warn("WARNING: only one of TURMA_BOOTSTRAP_ADMIN_USER / TURMA_BOOTSTRAP_ADMIN_PASSWORD is set — no bootstrap admin will be created");
+  }
+  if (BOOTSTRAP_CONFIGURED) try {
+    const r = tenancy.bootstrapAdmin(tenancyState, { username: BOOTSTRAP_ADMIN_USER, password: BOOTSTRAP_ADMIN_PASSWORD });
+    if (r) {
+      setTenancy(r.state);
+      console.log(`tenancy: created the bootstrap admin (user ${r.user.id})`);
+    } else {
+      console.log("tenancy: bootstrap admin skipped — a local account already exists (the pair only seeds an empty store)");
+    }
+  } catch (e) {
+    console.error(`tenancy: bootstrap admin not created: ${e && e.message}`);
+  }
+  // A local account or the pair closes the hub, so say so when nothing can open it.
+  if (!hasLocalUsers() && !BOOTSTRAP_CONFIGURED) return; // open hub, warned at boot
+  const usable = Object.values(tenancyState.users).some((u) => u.source === "local" && !u.disabled &&
+    tenancy.effectiveRoles(tenancyState, u).length);
+  if (!TURMA_PASSWORD && !usable) {
+    console.error(hasLocalUsers()
+      ? "ERROR: no break-glass password and every local account is disabled or role-less — this hub admits NOBODY (OIDC aside) until TURMA_PASSWORD is set"
+      : "ERROR: no break-glass password and no usable local account — this hub admits NOBODY (OIDC aside) until TURMA_BOOTSTRAP_ADMIN_* is fixed or TURMA_PASSWORD is set");
+  }
+}
+bootstrapTenancy();
 // Whitelist, field by field (a hand-edited file or a remote replica's value).
 // Inline literals: this runs at module init.
 function coerceAgentIdentities(raw) {
@@ -2898,6 +2956,7 @@ function coerceEnrollCodes(raw) {
     if (typeof e.hash !== "string" || !/^[0-9a-f]{64}$/.test(e.hash)) continue;
     if (!str(e.owner, 200) || !time(e.createdAt) || !time(e.expiresAt)) continue;
     const rec = { hash: e.hash, owner: e.owner };
+    if (str(e.tenantId, 200)) rec.tenantId = e.tenantId;
     if (str(e.device, 200)) rec.device = e.device;
     rec.createdAt = e.createdAt;
     rec.expiresAt = e.expiresAt;
@@ -13054,10 +13113,42 @@ function breakGlassEnabled() {
 // ---- Login sessions (signed cookie) -----------------------------------------
 // A session token is "<expiryMs>.<hmac>" — the browser can't forge it and it
 // self-expires. HttpOnly keeps it out of reach of any injected script.
-function issueSessionToken(ttlMs = SESSION_TTL_MS) {
+//
+// With `claims` (XERK-2530) the token is "u2.<expiryMs>.<b64url(JSON claims)>.<hmac>"
+// and names its principal: `{u, t, r}` (userId, tenantId, roles) for a hub user,
+// `{bg: 1, r: ["admin"]}` for the break-glass login. The claims are signed, but
+// `principalFromToken` still re-reads the user from the store on every request,
+// so disabling a user or dropping its group takes effect at once. Without
+// `claims` it is the pre-tenancy "<expiry>.<hmac>" shape, issued only by a hub
+// with no login configured.
+function issueSessionToken(ttlMs = SESSION_TTL_MS, claims = null) {
   const expiry = Date.now() + ttlMs;
-  const mac = crypto.createHmac("sha256", SESSION_KEY).update(String(expiry)).digest("base64url");
+  if (claims) {
+    const body = `u2.${expiry}.${Buffer.from(JSON.stringify(claims)).toString("base64url")}`;
+    return `${body}.${crypto.createHmac("sha256", SESSION_SIGN_KEY).update(body).digest("base64url")}`;
+  }
+  const mac = crypto.createHmac("sha256", SESSION_SIGN_KEY).update(String(expiry)).digest("base64url");
   return `${expiry}.${mac}`;
+}
+
+// The signed claims of a "u2." token, or null (malformed, forged, expired).
+function sessionTokenClaims(token) {
+  if (typeof token !== "string" || !token.startsWith("u2.") || token.length > 4096) return null;
+  const last = token.lastIndexOf(".");
+  const body = token.slice(0, last);
+  const parts = body.split(".");
+  if (parts.length !== 3) return null;
+  const expNum = Number(parts[1]);
+  if (!Number.isSafeInteger(expNum) || expNum < Date.now()) return null;
+  const want = Buffer.from(crypto.createHmac("sha256", SESSION_SIGN_KEY).update(body).digest("base64url"));
+  const got = Buffer.from(token.slice(last + 1));
+  if (got.length !== want.length || !crypto.timingSafeEqual(got, want)) return null;
+  try {
+    const c = JSON.parse(Buffer.from(parts[2], "base64url").toString());
+    return c && typeof c === "object" && !Array.isArray(c) ? c : null;
+  } catch {
+    return null;
+  }
 }
 
 // Where an unauthenticated HUMAN browser is sent to sign in (XERK-593). This is
@@ -13080,12 +13171,13 @@ function humanLoginRedirect(nextPathAndSearch) {
 
 function sessionTokenValid(token) {
   if (!token) return false;
+  if (token.startsWith("u2.")) return !!sessionTokenClaims(token);
   const dot = token.indexOf(".");
   if (dot < 0) return false;
   const expiry = token.slice(0, dot);
   const expNum = parseInt(expiry, 10);
   if (!Number.isFinite(expNum) || expNum < Date.now()) return false;
-  const expected = crypto.createHmac("sha256", SESSION_KEY).update(expiry).digest("base64url");
+  const expected = crypto.createHmac("sha256", SESSION_SIGN_KEY).update(expiry).digest("base64url");
   const got = Buffer.from(token.slice(dot + 1));
   const want = Buffer.from(expected);
   return got.length === want.length && crypto.timingSafeEqual(got, want);
@@ -13100,7 +13192,7 @@ function sessionTokenValid(token) {
 const WS_TOKEN_TTL_MS = 5 * 60 * 1000;
 function issueWsToken() {
   const expiry = Date.now() + WS_TOKEN_TTL_MS;
-  const mac = crypto.createHmac("sha256", SESSION_KEY).update(`ws.${expiry}`).digest("base64url");
+  const mac = crypto.createHmac("sha256", SESSION_SIGN_KEY).update(`ws.${expiry}`).digest("base64url");
   return `ws.${expiry}.${mac}`;
 }
 
@@ -13112,7 +13204,7 @@ function wsTokenValid(token) {
   const expiry = rest.slice(0, dot);
   const expNum = parseInt(expiry, 10);
   if (!Number.isFinite(expNum) || expNum < Date.now()) return false;
-  const expected = crypto.createHmac("sha256", SESSION_KEY).update(`ws.${expiry}`).digest("base64url");
+  const expected = crypto.createHmac("sha256", SESSION_SIGN_KEY).update(`ws.${expiry}`).digest("base64url");
   const got = Buffer.from(rest.slice(dot + 1));
   const want = Buffer.from(expected);
   return got.length === want.length && crypto.timingSafeEqual(got, want);
@@ -13156,18 +13248,129 @@ function sessionSetCookie(req, token, ttlMs = SESSION_TTL_MS) {
   return authCookie(req, SESSION_COOKIE, token, token ? Math.floor(ttlMs / 1000) : 0);
 }
 
-// Browser/user auth (UI + all API except the heartbeat). A valid login cookie
-// or the equivalent Basic-auth header (kept for curl and the agent heartbeat
-// fallback) both pass.
-function userAuthorized(req) {
-  if (!TURMA_PASSWORD) return true;
-  if (sessionTokenValid(cookies(req)[SESSION_COOKIE])) return true;
+// ---- Principals (XERK-2530) ---------------------------------------------------
+// WHO is calling. `requestPrincipal(req)` is the single way a route learns it:
+// `{kind, userId, tenantId, roles}`, or null when the request is not signed in.
+//   - "user"       a hub user (local or OIDC) — its own tenant, roles from the store.
+//   - "breakglass" TURMA_USER/TURMA_PASSWORD (cookie or Basic): ADMIN only, and
+//                  NO tenant — it can reach the admin surface, never tenant data.
+//   - "legacy"     a pre-tenancy session cookie still within its TTL: signed in,
+//                  but no tenant and no role (it re-logs-in for either).
+//   - "open"       a hub with no login configured at all (the old single-user
+//                  open mode, warned about at boot).
+// Until the routes enforce tenancy (later XERK-2529 tickets) every principal is
+// equally "signed in" to them; `userAuthorized` keeps meaning exactly that.
+const BREAKGLASS_PRINCIPAL = Object.freeze({ kind: "breakglass", userId: null, tenantId: null, roles: Object.freeze(["admin"]) });
+const LEGACY_PRINCIPAL = Object.freeze({ kind: "legacy", userId: null, tenantId: null, roles: Object.freeze([]) });
+const OPEN_PRINCIPAL = Object.freeze({ kind: "open", userId: null, tenantId: null, roles: Object.freeze(["user", "admin"]) });
+
+// A login is required once a LOCAL credential exists: the break-glass password,
+// a local account, or the bootstrap pair about to create one. OIDC users do not
+// count: a passwordless OIDC hub was open before tenancy, and its first SSO
+// login must not silently flip it closed (closing it is an operator decision —
+// set TURMA_PASSWORD or the bootstrap pair).
+function hasLocalUsers() {
+  for (const u of Object.values(tenancyState.users)) if (u.source === "local") return true;
+  return false;
+}
+function authEnabled() {
+  return !!TURMA_PASSWORD || BOOTSTRAP_CONFIGURED || hasLocalUsers();
+}
+
+function userPrincipal(user) {
+  if (!user || user.disabled) return null;
+  const roles = tenancy.effectiveRoles(tenancyState, user);
+  if (!roles.length) return null; // no group grants access any more
+  return Object.freeze({
+    kind: "user", userId: user.id, tenantId: user.tenantId, roles: Object.freeze(roles), source: user.source,
+  });
+}
+
+function principalClaims(p) {
+  return p.kind === "breakglass" ? { bg: 1, r: ["admin"] } : { u: p.userId, t: p.tenantId, r: [...p.roles] };
+}
+
+// The principal a session token names, re-checked against the store NOW.
+function principalFromToken(token) {
+  if (!token) return null;
+  if (token.startsWith("u2.")) {
+    const c = sessionTokenClaims(token);
+    if (!c) return null;
+    if (c.bg === 1) return breakGlassEnabled() ? BREAKGLASS_PRINCIPAL : null;
+    if (typeof c.u !== "string" || !Object.hasOwn(tenancyState.users, c.u)) return null;
+    const user = tenancyState.users[c.u];
+    if (user.tenantId !== c.t) return null; // a tenant is the user's for life
+    return userPrincipal(user);
+  }
+  return sessionTokenValid(token) ? LEGACY_PRINCIPAL : null;
+}
+
+function requestPrincipal(req) {
+  if (!authEnabled()) return OPEN_PRINCIPAL;
+  const fromCookie = principalFromToken(cookies(req)[SESSION_COOKIE]);
+  if (fromCookie) return fromCookie;
+  // Basic is the headless break-glass channel only (XERK-595) — a local user's
+  // password is never checked per request (a scrypt per call would be a DoS).
   const header = req.headers.authorization || "";
-  if (!header.startsWith("Basic ")) return false;
+  if (!TURMA_PASSWORD || !header.startsWith("Basic ")) return null;
   const decoded = Buffer.from(header.slice(6), "base64").toString();
   const sep = decoded.indexOf(":");
-  if (sep < 0) return false;
-  return credentialsMatch(decoded.slice(0, sep), decoded.slice(sep + 1));
+  if (sep < 0) return null;
+  return credentialsMatch(decoded.slice(0, sep), decoded.slice(sep + 1)) ? BREAKGLASS_PRINCIPAL : null;
+}
+
+// Browser/user auth (UI + all API except the heartbeat): any signed-in principal.
+function userAuthorized(req) {
+  return !!requestPrincipal(req);
+}
+
+// A local user's sign-in. scrypt costs 16 MiB a call, so at most
+// LOGIN_SCRYPT_INFLIGHT_MAX run at once and the rest are told to retry — an
+// anonymous /api/login flood must not OOM the hub (turma-limits.md). The
+// break-glass check runs BEFORE this and costs no scrypt, so a flood can never
+// lock break-glass out. An unknown username is verified against a dummy hash so
+// it costs the same as a known one.
+const LOGIN_SCRYPT_INFLIGHT_MAX = 2;
+let loginScryptInflight = 0;
+async function localLogin(username, password, now = Date.now()) {
+  if (loginScryptInflight >= LOGIN_SCRYPT_INFLIGHT_MAX) return { busy: true };
+  const user = tenancy.findLocalUser(tenancyState, username);
+  const hash = (user && user.passwordHash) || tenancy.dummyPasswordHash();
+  loginScryptInflight++;
+  let ok = false;
+  try {
+    ok = await tenancy.verifyPassword(password, hash);
+  } catch {
+    ok = false;
+  } finally {
+    loginScryptInflight--;
+  }
+  if (!ok || !user) return {};
+  // The store may have moved during the await (disabled, removed, re-passworded).
+  const cur = Object.hasOwn(tenancyState.users, user.id) ? tenancyState.users[user.id] : null;
+  if (!cur || cur.passwordHash !== user.passwordHash) return {};
+  const principal = userPrincipal(cur);
+  if (!principal) return {};
+  setTenancy(tenancy.updateUser(tenancyState, cur.id, { lastLoginAt: now }).state);
+  return { principal };
+}
+
+// The OIDC callback's half of the one-principal convergence: the IdP's
+// (issuer, sub) is upserted as a hub user with its own tenant, and the roles the
+// groups claim granted are recorded. Null when the user is disabled.
+function oidcPrincipal(iss, claims, role, now = Date.now()) {
+  const displayName = typeof claims.name === "string" ? claims.name
+    : typeof claims.preferred_username === "string" ? claims.preferred_username : "";
+  const { state, user } = tenancy.upsertOidcUser(tenancyState, {
+    iss, sub: typeof claims.sub === "string" ? claims.sub : "", displayName,
+    idpRoles: role === "admin" ? ["user", "admin"] : ["user"], now,
+  });
+  if (user.disabled) {
+    if (state !== tenancyState) setTenancy(state);
+    return null;
+  }
+  setTenancy(tenancy.updateUser(state, user.id, { lastLoginAt: now }).state);
+  return userPrincipal(tenancyState.users[user.id]);
 }
 
 // ---- OIDC relying-party core (XERK-592) -------------------------------------
@@ -13546,7 +13749,7 @@ function agentPresented(req) {
     // whole point was that the master had been retired.
     return !TURMA_AGENT_STRICT && safeEqual(token, TURMA_AGENT_TOKEN);
   }
-  return userAuthorized(req) && !!TURMA_PASSWORD;
+  return userAuthorized(req) && authEnabled();
 }
 
 // The heartbeat's pre-body gate as a response. Refusing the master under strict
@@ -13606,7 +13809,7 @@ function agentBearerKind(req, host) {
     if (safeEqual(token, TURMA_AGENT_TOKEN)) return "legacy";
     return null;
   }
-  return userAuthorized(req) && !!TURMA_PASSWORD ? "operator" : null;
+  return userAuthorized(req) && authEnabled() ? "operator" : null;
 }
 
 // The gate every host-scoped agent route goes through: resolve the credential
@@ -13773,6 +13976,7 @@ function sweepEnrollCodes(now = Date.now()) {
 function enrollCodeWire(id, rec, now = Date.now()) {
   const out = { id, state: enrollCodeState(rec, now), owner: rec.owner,
     createdAt: rec.createdAt, expiresAt: rec.expiresAt };
+  if (rec.tenantId) out.tenantId = rec.tenantId;
   if (rec.device) out.device = rec.device;
   if (rec.usedAt) { out.usedAt = rec.usedAt; out.usedBy = rec.usedBy; }
   if (rec.revokedAt) out.revokedAt = rec.revokedAt;
@@ -13827,23 +14031,22 @@ function enrollNameRefusal(device) {
   return null;
 }
 
-// Who is minting (the code's `owner`): the OIDC subject when the browser signed
-// in through the IdP, else the local login. Never trusted for authorization yet.
-async function enrollCodeOwner(req) {
-  if (!TURMA_PASSWORD) return "open";
-  const sid = OIDC_ENABLED ? cookies(req)[OIDC_SID_COOKIE] : "";
-  if (sid && /^[A-Za-z0-9_-]{1,128}$/.test(sid)) {
-    try {
-      const rec = await liveStore.get(OIDC_SESSION_PREFIX + sid);
-      if (rec && typeof rec.sub === "string" && rec.sub) return `oidc:${rec.sub.slice(0, 190)}`;
-    } catch { /* store blip: fall back to the local principal */ }
-  }
-  return `local:${(TURMA_USER || "operator").slice(0, 190)}`;
+// Who is minting: the request's principal (XERK-2530) — `user:<id>` with its
+// tenant, else its kind (breakglass / open). Recorded so the tenancy work can
+// bind the enrolled host to that tenant; NOT enforced yet.
+function enrollCodeOwner(req) {
+  const p = requestPrincipal(req);
+  if (!p) return { owner: "unknown" };
+  if (p.userId) return { owner: `user:${String(p.userId).slice(0, 190)}`, tenantId: p.tenantId || undefined };
+  return { owner: String(p.kind || "unknown") };
 }
 
 // Mint a code. Returns {status, body}; the plain code is in the body ONCE and
 // never stored or served again.
 function mintEnrollCode(owner, device, now = Date.now()) {
+  // `owner` is a string, or {owner, tenantId} from enrollCodeOwner.
+  const tenantId = owner && typeof owner === "object" && typeof owner.tenantId === "string" ? owner.tenantId : "";
+  if (owner && typeof owner === "object") owner = owner.owner;
   if (!TURMA_AGENT_TOKEN) return { status: 409, body: { error: "this hub derives no agent tokens (no TURMA_AGENT_TOKEN set)" } };
   if (device !== undefined && device !== null && device !== "") {
     const refusal = enrollNameRefusal(device);
@@ -13866,6 +14069,7 @@ function mintEnrollCode(owner, device, now = Date.now()) {
   const code = ENROLL_CODE_PREFIX + crypto.randomBytes(16).toString("hex");
   const id = crypto.randomBytes(8).toString("hex");
   const rec = { hash: enrollCodeHash(code), owner: String(owner).slice(0, 200) || "unknown" };
+  if (tenantId) rec.tenantId = tenantId.slice(0, 200);
   if (device) rec.device = device;
   rec.createdAt = now;
   rec.expiresAt = now + ENROLL_CODE_TTL_MS;
@@ -16623,6 +16827,11 @@ function autoStopSweep() {
       if (s.status !== "running" && s.status !== "queued") continue;
       const t = s.ticket;
       if (!t || !t.key) continue;
+      // A bare session the agent only ADOPTED onto this ticket from its branch
+      // name (XERK-817) was started by the operator, who closes it (XERK-2547).
+      // Never kill it on Done: its branch may name a ticket already Done, or an
+      // auto-started twin may close the shared ticket while it still works.
+      if (ticketAdopted(t)) continue;
       if (!doneKeys.has((t.siteKey || "") + "\x00" + t.key)) continue;
       const dk = host + "\x00" + s.id;
       if (autoStopped.has(dk) || autoStopResumeExempt.has(dk)) continue;
@@ -20156,13 +20365,27 @@ const server = http.createServer(async (req, res) => {
     // Validate credentials and hand back the session cookie.
     if (req.method === "POST" && url.pathname === "/api/login") {
       const body = JSON.parse((await readBody(req)) || "{}");
-      if (TURMA_PASSWORD && !credentialsMatch(body.username, body.password)) {
-        return json(res, 401, { error: "invalid credentials" });
+      const username = body && typeof body.username === "string" ? body.username : "";
+      const password = body && typeof body.password === "string" ? body.password : "";
+      let token;
+      if (!authEnabled()) {
+        token = issueSessionToken(); // an open hub: no credential to check
+      } else if (TURMA_PASSWORD && credentialsMatch(username, password)) {
+        // Break-glass (XERK-595) first and scrypt-free, so it works under a flood.
+        token = issueSessionToken(SESSION_TTL_MS, principalClaims(BREAKGLASS_PRINCIPAL));
+      } else {
+        const r = await localLogin(username, password);
+        if (r.busy) {
+          res.setHeader("Retry-After", "1");
+          return json(res, 503, { error: "too many sign-ins in progress — try again in a moment" });
+        }
+        if (!r.principal) return json(res, 401, { error: "invalid credentials" });
+        token = issueSessionToken(SESSION_TTL_MS, principalClaims(r.principal));
       }
       res.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
-        "Set-Cookie": sessionSetCookie(req, issueSessionToken()),
+        "Set-Cookie": sessionSetCookie(req, token),
       });
       return res.end(JSON.stringify({ ok: true }));
     }
@@ -20308,12 +20531,26 @@ const server = http.createServer(async (req, res) => {
           });
           return res.end();
         }
+        // One principal (XERK-2530): the IdP identity becomes a hub user with its
+        // own tenant, and the session names it. A disabled user gets no session.
+        let principal;
+        try {
+          principal = oidcPrincipal(disco.issuer, claims, access.role);
+        } catch (e) {
+          console.log(`OIDC sign-in refused: ${logName(e && e.message || "?")}`);
+          principal = null;
+        }
+        if (!principal) {
+          res.writeHead(302, { Location: failLocation("forbidden"), "Cache-Control": "no-store", "Set-Cookie": clearState });
+          return res.end();
+        }
+        const sessionClaims = principalClaims(principal);
         // A MOBILE flow ends here: the app can't read a browser cookie, so mint a
         // single-use handoff code bound to the app's PKCE challenge and hand the
         // session token back over the deep link (exchanged at /api/oidc/mobile/
         // exchange). No session/sid cookie is set — the Custom Tab is throwaway.
         if (mobile) {
-          const token = issueSessionToken(OIDC_SESSION_TTL_MS);
+          const token = issueSessionToken(OIDC_SESSION_TTL_MS, sessionClaims);
           const handoff = crypto.randomBytes(32).toString("base64url");
           await oidcPutHandoff(handoff, { token, challenge: mobile, at: Date.now() });
           res.writeHead(302, {
@@ -20329,6 +20566,7 @@ const server = http.createServer(async (req, res) => {
         await oidcPutSession(sid, {
           idToken: tokens.id_token,
           sub: claims.sub,
+          userId: principal.userId,
           role: access.role,
           groups,
           at: Date.now(),
@@ -20337,7 +20575,7 @@ const server = http.createServer(async (req, res) => {
           Location: oidcSafeNext(tx.next),
           "Cache-Control": "no-store",
           "Set-Cookie": [
-            sessionSetCookie(req, issueSessionToken(OIDC_SESSION_TTL_MS), OIDC_SESSION_TTL_MS),
+            sessionSetCookie(req, issueSessionToken(OIDC_SESSION_TTL_MS, sessionClaims), OIDC_SESSION_TTL_MS),
             authCookie(req, OIDC_SID_COOKIE, sid, Math.floor(OIDC_SESSION_TTL_MS / 1000)),
             clearState,
           ],
@@ -20467,7 +20705,7 @@ const server = http.createServer(async (req, res) => {
           (body.device != null && typeof body.device !== "string")) {
         return json(res, 400, { error: "body must be JSON {device?: string}" });
       }
-      const r = mintEnrollCode(await enrollCodeOwner(req), (body.device || "").trim());
+      const r = mintEnrollCode(enrollCodeOwner(req), (body.device || "").trim());
       return json(res, r.status, r.body);
     }
     if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "enroll-codes" && parts.length === 3) {
@@ -24961,6 +25199,17 @@ if (process.env.TURMA_TEST) {
     humanLoginRedirect,
     issueSessionToken,
     sessionTokenValid,
+    sessionTokenClaims,
+    // Users + tenants (XERK-2530).
+    requestPrincipal,
+    principalFromToken,
+    principalClaims,
+    authEnabled,
+    localLogin,
+    oidcPrincipal,
+    tenancyState: () => tenancyState,
+    __setTenancy(v) { tenancyState = tenancy.coerceTenancy(v); },
+    BREAKGLASS_PRINCIPAL,
     // OIDC relying-party core (XERK-592). The pure pieces are exported so the
     // security-critical validation is unit-tested offline with a locally-minted
     // RSA key; the caches + tx map are exported so a route test can seed
@@ -25362,7 +25611,10 @@ if (process.env.TURMA_TEST) {
     });
   }
 } else {
-  if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");
+  if (!authEnabled()) console.warn("WARNING: no login configured (TURMA_PASSWORD, local users) — UI is unauthenticated");
+  if (authEnabled() && !SESSION_KEY_SECRET) {
+    console.warn("WARNING: TURMA_SESSION_SECRET is unset — sessions are signed with a per-process key, so a restart signs everyone out and HA replicas cannot share sessions");
+  }
   // The local login is the break-glass path (XERK-595): the IdP-independent way
   // in when SSO is down, and the thing a future mandatory-OIDC switch must never
   // disable. Say at boot whether one exists, so a lockout risk is visible before
