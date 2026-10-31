@@ -604,3 +604,29 @@ test("XERK-2384: a revoke that left the name token live says so", async () => {
     assert.equal(D.toasts.some((m) => /name-derived token is not/.test(m)), toasted, String(nameTokenRevoked));
   }
 });
+
+// ---- an SSE reconnect re-reads the payload (rollup XERK-2598) ---------------
+
+test("XERK-2598: an SSE RECONNECT re-reads /api/agents once; the first open does not", () => {
+  const D = loadDashboard();
+  D.connectSSE();
+  const es = D.sse[0];
+  const agentsReads = () => D.fetches.filter((u) => u === "/api/agents").length;
+  const before = agentsReads();
+  es.onopen();                                   // first connect: the boot refresh covers it
+  assert.equal(agentsReads(), before);
+  es.onopen();                                   // reconnect (hub restart / rollout)
+  assert.equal(agentsReads(), before + 1);
+});
+
+test("XERK-2598: every page's SSE reconnect re-reads its snapshot", () => {
+  // The per-stream dedupe sends a whole-map event only when the stream's slice
+  // changes, so a fresh stream never repairs what moved while it was down.
+  for (const f of ["index", "sessions", "usage", "insights", "brief", "meetings", "board"]) {
+    const html = fs.readFileSync(path.join(__dirname, "..", "public", f + ".html"), "utf8");
+    const open = html.match(/es\.onopen = \(\) => \{([\s\S]*?)\n  \};/);
+    assert.ok(open, `${f}: onopen block`);
+    assert.match(open[1], /if \(sseEverOpen\) refresh\(\);/, `${f}: reconnect refresh`);
+    assert.match(open[1], /sseEverOpen = true;/, `${f}: first open marked`);
+  }
+});
