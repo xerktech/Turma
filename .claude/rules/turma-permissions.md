@@ -138,6 +138,14 @@ replace it.
   - **The upsert is MONOTONE** (`WHERE EXCLUDED.progress >= permission_event.progress`, `progress` =
     `rowProgress`): a late retry of an OPEN copy (an old leader's ready edge after a handover) never
     reverts a CLOSED row. Equal progress → the newer write wins.
+  - **A row `evict()` drops from the model is DELETEd from the table** (XERK-2595, `onDelete`, as
+    outcome-ledger does): the rescan reads `LIMIT MAX_ROWS` newest-first, so a table holding more
+    than the model loaded only the newest rows fleet-wide and a quiet host's rows vanished at every
+    rollout. Queued deletes and upserts cancel each other's pending copy; a failed delete is held.
+  - **Every rescan first prunes each host to `HOST_MAX_ROWS` in SQL** (newest kept, evict()'s tie-break),
+    so a table already over the cap (pre-fix rows, deletes lost to a restart) can't fill the LIMIT
+    with one busy host. Upserts drain before deletes: a failed upsert put back beside its key's
+    delete would otherwise resurrect it. Tests: the `XERK-2595:` cases.
   - **One INSERT never carries the same `(host, id)` twice** — Postgres refuses ("cannot affect row a
     second time") and an outage backlog holds a row open AND closed; the batch keeps the last copy.
 - **Aggregates are computed from the hot in-memory model in both modes**, not by SQL `GROUP BY` —

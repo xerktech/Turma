@@ -763,6 +763,26 @@ class FakePgPool {
       for (const [k, r] of this.rows) if (Number(r.opened_at) < Number(params[0])) this.rows.delete(k);
       return Promise.resolve([]);
     }
+    m = /^DELETE FROM "permission_event" WHERE \(host, id\) IN \((\(\$\d+, \$\d+\)(, \(\$\d+, \$\d+\))*)\)$/.exec(sql);
+    if (m) {
+      assert.equal(params.length, 2 * m[1].split("), (").length);
+      if (this.failDeletes) return Promise.reject(new Error("pg down"));
+      for (let i = 0; i < params.length; i += 2) this.rows.delete(`${params[i]}\u0000${params[i + 1]}`);
+      return Promise.resolve([]);
+    }
+    m = /^DELETE FROM "permission_event" WHERE \(host, id\) IN \(SELECT host, id FROM \(SELECT host, id, ROW_NUMBER\(\) OVER \(PARTITION BY host ORDER BY opened_at DESC, id DESC\) AS rn FROM "permission_event"\) ranked WHERE rn > \$1\)$/.exec(sql);
+    if (m) {
+      const byHost = new Map();
+      for (const [k, r] of this.rows) {
+        if (!byHost.has(r.host)) byHost.set(r.host, []);
+        byHost.get(r.host).push([k, r]);
+      }
+      for (const list of byHost.values()) {
+        list.sort((x, y) => Number(y[1].opened_at) - Number(x[1].opened_at) || (y[1].id < x[1].id ? -1 : 1));
+        for (const [k] of list.slice(Number(params[0]))) this.rows.delete(k);
+      }
+      return Promise.resolve([]);
+    }
     throw new Error(`FakePgPool: unrecognised SQL: ${sql}`);
   }
 }
@@ -912,6 +932,194 @@ test("HA: one row open AND closed in one batch upserts once, the closed copy win
     row("d-3", { openedAt: now - MIN, closedAt: now })], now);
   await new Promise((r) => ledger.flush(r));
   assert.equal(JSON.parse(pool.rows.get("h1\u0000d-3").doc).closedAt, now);
+});
+
+// XERK-2595: the table is as bounded as the model, so a fresh leader's
+// `LIMIT MAX_ROWS` rescan loads what the old leader served — not just the newest
+// rows fleet-wide, which dropped a quiet host's older rows at every rollout.
+test("XERK-2595: rows evicted from the model leave the table, so a fresh rescan keeps a quiet host", async () => {
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool);
+  await ledger._internals.getBackend()._onReady();
+  const now = Date.now();
+  ledger.ingest("b@tenantB", [row("quiet", { openedAt: now - 60 * MIN, closedAt: now - 59 * MIN })], now);
+  // A busy host floods past its share over many beats: each beat's rows are
+  // written, then a later beat's evict() trims them (never the quiet host).
+  for (let beat = 0; beat < 5; beat++) {
+    const rows = [];
+    for (let i = 0; i < 10; i++) rows.push(row(`a-${beat}-${i}`, { openedAt: now - 50 * MIN + (beat * 10 + i) * 1000 }));
+    ledger.ingest("a@tenantA", rows, now);
+    await new Promise((r) => ledger.flush(r));
+  }
+  assert.ok(ledger._internals.hosts().get("b@tenantB").has("quiet"));
+  // The table holds exactly what the model holds.
+  const model = [];
+  for (const [h, m] of ledger._internals.hosts()) for (const id of m.keys()) model.push(`${h}\u0000${id}`);
+  assert.deepEqual([...pool.rows.keys()].sort(), model.sort());
+  assert.ok(pool.rows.size <= ledger.MAX_ROWS);
+  // A fresh replica (rollout / promotion) loads the quiet host's row back.
+  ledger._internals.hosts().clear();
+  await ledger.rehydrate();
+  assert.ok(ledger._internals.hosts().get("b@tenantB").has("quiet"));
+  assert.equal(ledger._internals.hosts().get("a@tenantA").size, ledger.HOST_MAX_ROWS);
+});
+
+test("XERK-2595: a rescan's own eviction deletes the overflow an older table still holds", async () => {
+  const pool = new FakePgPool();
+  const now = Date.now();
+  for (let i = 0; i < ledger.HOST_MAX_ROWS + 5; i++) {
+    const r = row(`a-${i}`, { openedAt: now - 50 * MIN + i * 1000 });
+    pool.rows.set(`a\u0000${r.id}`, { host: "a", id: r.id, opened_at: String(r.openedAt), progress: "2", doc: JSON.stringify(r) });
+  }
+  await ledger.configure({ ha: true }, pool);
+  await ledger._internals.getBackend()._onReady();
+  await new Promise((r) => ledger.flush(r));
+  assert.equal(pool.rows.size, ledger.HOST_MAX_ROWS);
+  assert.equal(pool.rows.has("a\u0000a-0"), false);          // the oldest went
+});
+
+test("XERK-2595: a failed delete is held and retried; a row re-sent meanwhile is not deleted", async () => {
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool);
+  await ledger._internals.getBackend()._onReady();
+  const store = ledger._internals.getBackend();
+  const now = Date.now();
+  ledger.ingest("h1", [row("x", { openedAt: now - MIN }), row("y", { openedAt: now - MIN })], now);
+  await new Promise((r) => ledger.flush(r));
+  pool.failDeletes = true;
+  const orig = console.error;
+  const errs = [];
+  console.error = (m) => errs.push(String(m));
+  try {
+    store.onDelete([["h1", "x"], ["h1", "y"]]);
+    await new Promise((r) => ledger.flush(r));
+  } finally { console.error = orig; }
+  assert.ok(errs.some((m) => /Postgres delete failed/.test(m)));
+  assert.equal(pool.rows.size, 2);
+  pool.failDeletes = false;
+  // "y" comes back (the agent re-sent it) before the retry: its upsert wins.
+  store.onChange("h1", [sanitize(row("y", { openedAt: now - MIN }), now)]);
+  await new Promise((r) => ledger.flush(r));
+  assert.deepEqual([...pool.rows.keys()], ["h1\u0000y"]);
+});
+
+test("XERK-2595: an eviction drops a still-queued upsert of the same row", async () => {
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool);
+  await ledger._internals.getBackend()._onReady();
+  const store = ledger._internals.getBackend();
+  const now = Date.now();
+  pool.failInserts = true;
+  const orig = console.error;
+  console.error = () => {};
+  try {
+    ledger.ingest("h1", [row("z", { openedAt: now - MIN })], now);
+    await new Promise((r) => ledger.flush(r));
+  } finally { console.error = orig; }
+  pool.failInserts = false;
+  store.onDelete([["h1", "z"]]);
+  await new Promise((r) => ledger.flush(r));
+  assert.equal(pool.rows.has("h1\u0000z"), false);
+});
+
+test("XERK-2595: a table over the cap (pre-fix surplus) still yields the quiet host on the FIRST rescan", async () => {
+  const pool = new FakePgPool();
+  const now = Date.now();
+  const put = (host, r) => pool.rows.set(`${host}\u0000${r.id}`,
+    { host, id: r.id, opened_at: String(r.openedAt), progress: "2", doc: JSON.stringify(r) });
+  put("quiet", row("q", { openedAt: now - 120 * MIN }));
+  for (let i = 0; i < 3 * ledger.MAX_ROWS; i++) put("busy", row(`b-${i}`, { openedAt: now - 100 * MIN + i * 1000 }));
+  await ledger.configure({ ha: true }, pool);
+  await ledger._internals.getBackend()._onReady();
+  assert.ok(ledger._internals.hosts().get("quiet").has("q"));
+  await new Promise((r) => ledger.flush(r));
+  assert.equal(pool.rows.size, ledger.HOST_MAX_ROWS + 1);
+});
+
+test("XERK-2595: rows a rescan evicts by the STORE-WIDE cap are deleted from the table", async () => {
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool);
+  await ledger._internals.getBackend()._onReady();
+  const now = Date.now();
+  // The table holds 25 old rows for h1; the hot model 25 newer ones for h2: the
+  // union (50) is over MAX_ROWS (40) though each host is under its share (30).
+  for (let i = 0; i < 25; i++) {
+    const r = row(`o-${i}`, { openedAt: now - 100 * MIN + i * 1000 });
+    pool.rows.set(`h1\u0000${r.id}`, { host: "h1", id: r.id, opened_at: String(r.openedAt), progress: "2", doc: JSON.stringify(r) });
+  }
+  const hot = new Map();
+  for (let i = 0; i < 25; i++) { const r = sanitize(row(`n-${i}`, { openedAt: now - 10 * MIN + i * 1000 }), now); hot.set(r.id, r); }
+  ledger._internals.hosts().set("h2", hot);
+  await ledger.rehydrate();
+  await new Promise((r) => ledger.flush(r));
+  assert.equal(ledger._internals.rowCount(), ledger.MAX_ROWS);
+  const model = [];
+  for (const [h, m] of ledger._internals.hosts()) for (const id of m.keys()) model.push(`${h}\u0000${id}`);
+  assert.deepEqual([...pool.rows.keys()].sort(), model.sort());
+});
+
+// A pool whose next matching query is held until released (and optionally failed).
+function gate(pool, re) {
+  const orig = pool.query.bind(pool);
+  let release;
+  const held = new Promise((r) => { release = r; });
+  let armed = true;
+  pool.query = (text, params) => {
+    if (armed && re.test(text)) {
+      armed = false;
+      return held.then((fail) => (fail ? Promise.reject(new Error("pg down")) : orig(text, params)));
+    }
+    return orig(text, params);
+  };
+  return (fail) => release(fail);
+}
+
+for (const fail of [false, true]) {
+  test(`XERK-2595: a row evicted while its upsert is IN FLIGHT (${fail ? "failing" : "landing"}) ends up deleted`, async () => {
+    const pool = new FakePgPool();
+    await ledger.configure({ ha: true }, pool);
+    await ledger._internals.getBackend()._onReady();
+    const store = ledger._internals.getBackend();
+    const now = Date.now();
+    const go = gate(pool, /^INSERT/);
+    const orig = console.error;
+    console.error = () => {};
+    try {
+      ledger.ingest("h1", [row("k", { openedAt: now - MIN })], now);
+      await null; await null;                                 // the INSERT is out
+      store.onDelete([["h1", "k"]]);
+      // A failed upsert is put back beside the queued delete: upserts must drain
+      // first or the retry resurrects the evicted row.
+      go(fail);
+      await new Promise((r) => ledger.flush(r));
+    } finally { console.error = orig; }
+    await new Promise((r) => ledger.flush(r));
+    assert.equal(pool.rows.has("h1\u0000k"), false);
+  });
+}
+
+test("XERK-2595: a row re-sent while its delete is IN FLIGHT and fails is not deleted on the retry", async () => {
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool);
+  await ledger._internals.getBackend()._onReady();
+  const store = ledger._internals.getBackend();
+  const now = Date.now();
+  ledger.ingest("h1", [row("y", { openedAt: now - MIN }), row("w", { openedAt: now - MIN })], now);
+  await new Promise((r) => ledger.flush(r));
+  const go = gate(pool, /^DELETE FROM "permission_event" WHERE \(host, id\) IN \(\(/);
+  const orig = console.error;
+  console.error = () => {};
+  try {
+    store.onDelete([["h1", "y"], ["h1", "w"]]);
+    await null; await null;                                   // the DELETE is out
+    pool.failInserts = true;                                  // keep the re-send queued
+    store.onChange("h1", [sanitize(row("y", { openedAt: now - MIN }), now)]);
+    go(true);                                                 // the in-flight delete fails
+    await new Promise((r) => ledger.flush(r));
+  } finally { console.error = orig; }
+  pool.failInserts = false;
+  await new Promise((r) => ledger.flush(r));
+  assert.deepEqual([...pool.rows.keys()], ["h1\u0000y"]);
 });
 
 test("HA off: configure is a no-op, the file backend stays", async () => {

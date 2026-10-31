@@ -266,7 +266,7 @@ function ingest(host, events, now = Date.now()) {
   for (const row of kept) m.set(row.id, row);
   const closed = closeSuperseded(m, kept);
   const aged = ageOut(now);
-  evict(now);
+  const gone = evict(now);
   const mine = [...kept, ...closed, ...(aged.get(host) || [])].filter((r) => m.get(r.id) === r);
   backend.onChange(host, mine);
   for (const [h, rows] of aged) {
@@ -275,6 +275,7 @@ function ingest(host, events, now = Date.now()) {
     const live = hm ? rows.filter((r) => hm.get(r.id) === r) : [];
     if (live.length) backend.onChange(h, live);
   }
+  if (gone.length && backend.onDelete) backend.onDelete(gone);
   return kept.length;
 }
 
@@ -803,6 +804,7 @@ class PermissionLedgerPgStore {
     const { quoteIdent } = require("./pgclient.js");
     this.table = quoteIdent(T_EVENT);
     this._queue = [];
+    this._deletes = [];   // [host, id] pairs evicted from the model, to DELETE from the table
     this._draining = null;
     this._closed = false;
     this._offHealth = null;
@@ -876,6 +878,15 @@ class PermissionLedgerPgStore {
     await this._ensureSchema();
     const since = now - DAYS * DAY_MS;
     const stale = [];
+    // First drop what evict() would drop per host anyway (its row share, newest
+    // kept, same id tie-break): a table larger than the model — rows a pre-fix
+    // hub never deleted, or deletes lost to a restart — would otherwise fill the
+    // LIMIT below with a busy host's surplus and hide a quiet host's older rows.
+    await this.pool.query(
+      `DELETE FROM ${this.table} WHERE (host, id) IN (SELECT host, id FROM (SELECT host, id, ` +
+      `ROW_NUMBER() OVER (PARTITION BY host ORDER BY opened_at DESC, id DESC) AS rn ` +
+      `FROM ${this.table}) ranked WHERE rn > $1)`,
+      [String(HOST_MAX_ROWS)]);
     const got = (await this.pool.query(
       `SELECT host, doc FROM ${this.table} WHERE opened_at >= $1 ORDER BY opened_at DESC LIMIT $2`,
       [String(since), String(MAX_ROWS)])) || [];
@@ -899,7 +910,7 @@ class PermissionLedgerPgStore {
       m.set(row.id, track(row));
     }
     for (const [host, rows] of ageOut(now)) for (const row of rows) stale.push([host, row]);
-    evict(now);
+    const gone = evict(now);
     // A LIMIT-truncated read says nothing about rows older than its oldest.
     const floor = got.length >= MAX_ROWS ? oldest : since;
     for (const [host, m] of hosts) {
@@ -909,6 +920,8 @@ class PermissionLedgerPgStore {
     }
     for (const [host, row] of stale) this._queue.push(this._tuple(host, row));
     this._trimQueue();
+    // After the re-queue: onDelete drops any queued upsert of a row evict() just dropped.
+    if (gone.length) this.onDelete(gone);
     if (stale.length) this._drain();
     if (this._onExternalChange) { try { this._onExternalChange(); } catch { /* never breaks a scan */ } }
   }
@@ -932,49 +945,93 @@ class PermissionLedgerPgStore {
   }
 
   onChange(host, rows) {
+    if (this._deletes.length) {
+      // A row re-sent after its eviction was queued keeps its upsert, not the delete.
+      const back = new Set(rows.map((row) => `${host}\u0000${row.id}`));
+      this._deletes = this._deletes.filter(([h, id]) => !back.has(`${h}\u0000${id}`));
+    }
     for (const row of rows) this._queue.push(this._tuple(host, row));
     this._trimQueue();
     this._drain();
   }
 
+  // Rows evicted from the hot model leave the table too (as outcome-ledger does), so
+  // the table is as bounded as the model. Without this the table held every row the
+  // window kept, and a rescan's `LIMIT MAX_ROWS` loaded only the NEWEST rows
+  // fleet-wide — the per-host/tenant fairness of evict() lasted until the next rollout.
+  // Bounded like the write queue: an outage past PG_QUEUE_MAX drops the oldest deletes
+  // (and a restart drops every held one); the next rescan's per-host prune removes a
+  // host's surplus, and the retention sweep the rest.
+  onDelete(pairs) {
+    const gone = new Set(pairs.map(([host, id]) => `${host}\u0000${id}`));
+    if (this._queue.length) this._queue = this._queue.filter((vals) => !gone.has(`${vals[0]}\u0000${vals[1]}`));
+    for (const pair of pairs) this._deletes.push(pair);
+    const over = this._deletes.length - PG_QUEUE_MAX;
+    if (over > 0) this._deletes.splice(0, over);
+    this._drain();
+  }
+
   _drain() {
     if (this._draining) return this._draining;
-    if (this._closed || !this._queue.length) return Promise.resolve();
+    if (this._closed || (!this._queue.length && !this._deletes.length)) return Promise.resolve();
     this._draining = (async () => {
       // Yield first: an async body that never awaited would run its `finally`
       // BEFORE `_draining` is assigned, leaving a settled promise there for good
       // and every later drain a silent no-op.
       await null;
       try {
-        while (this._queue.length) {
-          // One statement may not upsert the same key twice (Postgres refuses
-          // "cannot affect row a second time"), and an outage backlog carries a
-          // row open AND closed — keep the LAST copy of each (host, id).
-          const raw = this._queue.splice(0, PG_ROWS_PER_INSERT);
-          const byKey = new Map();
-          for (const vals of raw) byKey.set(`${vals[0]}\u0000${vals[1]}`, vals);
-          const batch = [...byKey.values()];
-          const params = [];
-          const tuples = batch.map((vals) => `(${vals.map((v) => { params.push(v); return `$${params.length}`; }).join(", ")})`);
-          try {
-            await this._ensureSchema();
-            await this.pool.query(
-              // MONOTONE: a late retry of an OPEN copy (an old leader's ready
-              // edge after a handover) never reverts a CLOSED row another
-              // replica already wrote. Equal progress → the newer write wins.
-              `INSERT INTO ${this.table} (host, id, opened_at, progress, doc) VALUES ${tuples.join(", ")} ` +
-              `ON CONFLICT (host, id) DO UPDATE SET opened_at = EXCLUDED.opened_at, ` +
-              `progress = EXCLUDED.progress, doc = EXCLUDED.doc ` +
-              `WHERE EXCLUDED.progress >= ${this.table}.progress`,
-              params);
-          } catch (e) {
-            // Put the batch BACK (ahead of anything newer) and stop: the pool's
-            // next ready edge — or the next beat's write — retries it. Dropping
-            // it lost a closed row for good once a rescan read the stale copy.
-            this._queue.unshift(...batch);
-            this._trimQueue();
-            console.error(`permission ledger: Postgres write failed (${(e && e.message) || e}); ${batch.length} row(s) held for retry`);
-            break;
+        // Ops queued while a batch was in flight drain too. Upserts go first: a
+        // queued delete is never for a key still queued for an upsert (each
+        // side's enqueue drops the other's), so the order cannot resurrect a row.
+        while (this._queue.length || this._deletes.length) {
+          while (this._queue.length) {
+            // One statement may not upsert the same key twice (Postgres refuses
+            // "cannot affect row a second time"), and an outage backlog carries a
+            // row open AND closed — keep the LAST copy of each (host, id).
+            const raw = this._queue.splice(0, PG_ROWS_PER_INSERT);
+            const byKey = new Map();
+            for (const vals of raw) byKey.set(`${vals[0]}\u0000${vals[1]}`, vals);
+            const batch = [...byKey.values()];
+            const params = [];
+            const tuples = batch.map((vals) => `(${vals.map((v) => { params.push(v); return `$${params.length}`; }).join(", ")})`);
+            try {
+              await this._ensureSchema();
+              await this.pool.query(
+                // MONOTONE: a late retry of an OPEN copy (an old leader's ready
+                // edge after a handover) never reverts a CLOSED row another
+                // replica already wrote. Equal progress → the newer write wins.
+                `INSERT INTO ${this.table} (host, id, opened_at, progress, doc) VALUES ${tuples.join(", ")} ` +
+                `ON CONFLICT (host, id) DO UPDATE SET opened_at = EXCLUDED.opened_at, ` +
+                `progress = EXCLUDED.progress, doc = EXCLUDED.doc ` +
+                `WHERE EXCLUDED.progress >= ${this.table}.progress`,
+                params);
+            } catch (e) {
+              // Put the batch BACK (ahead of anything newer) and stop: the pool's
+              // next ready edge — or the next beat's write — retries it. Dropping
+              // it lost a closed row for good once a rescan read the stale copy.
+              this._queue.unshift(...batch);
+              this._trimQueue();
+              console.error(`permission ledger: Postgres write failed (${(e && e.message) || e}); ${batch.length} row(s) held for retry`);
+              return;
+            }
+          }
+          while (this._deletes.length) {
+            const batch = this._deletes.splice(0, PG_ROWS_PER_INSERT);
+            const params = [];
+            const tuples = batch.map(([host, id]) => { params.push(host, id); return `($${params.length - 1}, $${params.length})`; });
+            try {
+              await this._ensureSchema();
+              await this.pool.query(
+                `DELETE FROM ${this.table} WHERE (host, id) IN (${tuples.join(", ")})`, params);
+            } catch (e) {
+              // Held for retry, minus any key re-sent since: its upsert drains first
+              // on retry and this stale delete would remove it.
+              const queued = new Set(this._queue.map((vals) => `${vals[0]}\u0000${vals[1]}`));
+              const held = batch.filter(([h, id]) => !queued.has(`${h}\u0000${id}`));
+              this._deletes.unshift(...held);
+              console.error(`permission ledger: Postgres delete failed (${(e && e.message) || e}); ${held.length} row(s) held for retry`);
+              return;
+            }
           }
         }
       } finally {
