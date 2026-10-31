@@ -224,6 +224,48 @@ class QwenProjectionTailTest(unittest.TestCase):
                      if ".rebuild." in n]
         self.assertEqual(leftovers, [])
 
+    def test_resume_rebuild_never_writes_through_a_planted_tmp_link(self):
+        # XERK-2564: the rebuild tmp name is predictable and session-writable; a
+        # symlink planted there must be replaced, never written through.
+        self._append_native(self._user("t1"))
+        victim = os.path.join(os.path.dirname(self.transcript), "victim")
+        with open(victim, "w") as f:
+            f.write("untouched")
+        os.symlink(victim, "%s.rebuild.%d.tmp" % (self.transcript, os.getpid()))
+        resumed = self._tail(resume=True, use_glob=False)
+        self.addCleanup(resumed.stop)
+        resumed._pump()
+        with open(victim) as f:
+            self.assertEqual(f.read(), "untouched")
+        self.assertEqual(len(self._read_transcript()), 1)
+        self.assertFalse(os.path.islink(self.transcript))
+
+    def test_raw_mirror_never_appends_through_a_planted_link(self):
+        # XERK-2564: the raw mirror name is session-writable; a symlink or
+        # hardlink planted there must be refused, never appended through.
+        for plant in (os.symlink, os.link):
+            victim = os.path.join(self.tmp, "victim-" + plant.__name__)
+            with open(victim, "w") as f:
+                f.write("untouched")
+            os.makedirs(self.store_dir, exist_ok=True)
+            if os.path.lexists(self.mirror_path):
+                os.unlink(self.mirror_path)
+            plant(victim, self.mirror_path)
+            self._append_native(self._user("hello " + plant.__name__))
+            tail = self._tail(use_glob=False, store=True)
+            self.addCleanup(tail.stop)
+            tail._pump()
+            with open(victim) as f:
+                self.assertEqual(f.read(), "untouched", plant.__name__)
+
+    def test_transcript_create_does_not_follow_a_dangling_link(self):
+        outside = os.path.join(self.tmp, "created-through-link")
+        os.symlink(outside, self.transcript)
+        tail = self._tail(use_glob=False)
+        tail._stop.set()            # run only the launch-time create, then exit
+        tail._run()
+        self.assertFalse(os.path.exists(outside))
+
     def test_resume_holds_a_trailing_partial_line_then_completes_it(self):
         # qwen may be mid-write at resume, leaving an unterminated last line. The
         # rebuild must hold that fragment (not project a truncated event) and
@@ -451,6 +493,23 @@ class QwenDelegationTailTest(unittest.TestCase):
     def _fixture(self, name):
         with open(os.path.join(self.FIXTURES, name)) as f:
             return json.load(f)
+
+    def test_reset_child_file_never_truncates_a_planted_link(self):
+        # XERK-2564: the child dest is session-writable; resetting it must
+        # replace a planted symlink or hardlink, never truncate its target.
+        os.makedirs(os.path.dirname(self.projected_child), exist_ok=True)
+        victim = os.path.join(self.tmp, "victim")
+        for plant in (os.symlink, os.link):
+            with open(victim, "w") as f:
+                f.write("untouched")
+            if os.path.lexists(self.projected_child):
+                os.unlink(self.projected_child)
+            plant(victim, self.projected_child)
+            self._tail()._reset_child_file(self.projected_child)
+            with open(victim) as f:
+                self.assertEqual(f.read(), "untouched", plant.__name__)
+            self.assertFalse(os.path.islink(self.projected_child))
+            self.assertEqual(os.path.getsize(self.projected_child), 0)
 
     def _tail(self):
         return qs.QwenProjectionTail(
