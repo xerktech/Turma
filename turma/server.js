@@ -3885,6 +3885,11 @@ const EPIC_BUILDER_STATUS_MAX = 50;
 // cleared so the driver re-dispatches it. Comfortably longer than a builder's
 // first-report latency (a research session takes minutes to its first edge).
 const EPIC_BUILDER_REDISPATCH_MS = positiveEnv("EPIC_BUILDER_REDISPATCH_MS", 3 * 60 * 1000);
+// A host that TOOK the dispatch and then went silent may be running the builder
+// (its report just has not arrived), so the run is held for it rather than sent
+// to a second host (XERK-2545) — until this long, past the agent's own 45-minute
+// builder timeout, after which the claim is given up as lost.
+const EPIC_BUILDER_ORPHAN_MS = positiveEnv("EPIC_BUILDER_ORPHAN_MS", 60 * 60 * 1000);
 
 // Coerce ONE persisted builder record to the fixed shape the payload serves.
 // Inline literal bounds (NOT the EPIC_BUILDER_* consts below other consts' TDZ,
@@ -4762,6 +4767,35 @@ function ingestEpicBuilderStatus(hostKey, agent) {
 // and once inline right after the route arms one (so a free fleet dispatches at
 // once). A queued builder with no free host HOLDS and is retried next tick — the
 // same self-clearing backpressure the ticket queue gives, without a Jira ticket.
+// May a dispatched, still-"queued" builder run go to another host? Only when its
+// first host provably never started it (XERK-2545): a host that took the command
+// and then went quiet may have a builder session running whose report is late, and
+// re-dispatching then ran two builders for one idea (the agent's per-host dedupe of
+// builder ids cannot see across hosts).
+//   - command still queued and never delivered: withdraw it, then yes;
+//   - host gone from the registry: yes;
+//   - host took it (delivered or acked) and has beaten since the dispatch while
+//     still not reporting the builder: the agent acked without a session — yes;
+//   - otherwise (it took it and has been silent since): hold until
+//     EPIC_BUILDER_ORPHAN_MS, past the agent's own builder timeout.
+// Never before EPIC_BUILDER_REDISPATCH_MS, the first report's grace.
+function epicBuilderClaimLapsed(id, run, now) {
+  const since = now - (run.dispatchedAt || 0);
+  if (since <= EPIC_BUILDER_REDISPATCH_MS) return false;
+  const a = agents[run.host];
+  if (!a) return true;
+  const cmds = Array.isArray(a.commands) ? a.commands : [];
+  const cmd = cmds.find((c) => c && typeof c === "object"
+    && c.type === "spawnEpicBuilder" && c.builderId === id);
+  if (cmd && !("deliveredAt" in cmd)) {
+    if (!dropQueuedCommand(run.host, cmd.cmdId, "spawnEpicBuilder")) return false;
+    console.log(`epic builder: withdrew undelivered ${logName(id)} from ${logName(run.host)}`);
+    return true;
+  }
+  const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
+  if (!cmd && online && (a.lastSeen || 0) > (run.dispatchedAt || 0)) return true;
+  return since > EPIC_BUILDER_ORPHAN_MS;
+}
 function epicBuilderDriveSweep() {
   const ids = Object.keys(epicBuilders);
   if (!ids.length) return;
@@ -4781,7 +4815,7 @@ function epicBuilderDriveSweep() {
     // shape, minus the growing timer: a builder is rare, so a flat re-dispatch is
     // enough and never churns).
     if (run.host) {
-      if (now - (run.dispatchedAt || 0) <= EPIC_BUILDER_REDISPATCH_MS) continue;
+      if (!epicBuilderClaimLapsed(id, run, now)) continue;
       delete run.host; delete run.dispatchedAt; run.updatedAt = now;
       publishEpicBuilders();
     }
@@ -25354,7 +25388,7 @@ if (process.env.TURMA_TEST) {
     normalizeEpicBuilderStatus,
     EPIC_BUILDER_STATES,
     EPIC_BUILDER_IDEA_MAX,
-    EPIC_BUILDER_REDISPATCH_MS,
+    EPIC_BUILDER_REDISPATCH_MS, EPIC_BUILDER_ORPHAN_MS, epicBuilderClaimLapsed,
     // XERK-636: the wave-dispatch driver + its readiness/state helpers, and the
     // per-child backoff map (XERK-61/109 hot-loop guard).
     epicRunDriveSweep,

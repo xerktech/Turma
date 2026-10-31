@@ -252,7 +252,8 @@ const {
   buildEpicWaves, epicChildRows,
   isEpicOrEpicChild, isRollupTicket, sanitizeEpicRunRecord,
   epicBuilders, armEpicBuilder, clearEpicBuilder, advanceEpicBuilder,
-  ingestEpicBuilderStatus, epicBuilderDriveSweep, sanitizeEpicBuilderRecord,
+  ingestEpicBuilderStatus, epicBuilderDriveSweep, epicBuilderClaimLapsed,
+  EPIC_BUILDER_REDISPATCH_MS, EPIC_BUILDER_ORPHAN_MS, sanitizeEpicBuilderRecord,
   normalizeEpicBuilderStatus, EPIC_BUILDER_STATES, EPIC_BUILDER_IDEA_MAX,
   epicRunDriveSweep, epicChildBlockersDone, epicRunAllChildrenDone, epicChildAttempts,
   epicRunChildSession, anyArmedEpicRun, epicRunCompleteSweep, epicDoneWritten,
@@ -13664,6 +13665,44 @@ test("XERK-725: a full fleet holds the builder queued; a freed slot dispatches i
   assert.equal(epicBuilders[id].host, "ebFull");
   assert.ok((agents.ebFull.commands || []).some(
     (c) => c.type === "spawnEpicBuilder" && c.builderId === id));
+});
+
+test("XERK-2545: a builder a host took is not re-dispatched to another host while that host is silent", async () => {
+  resetEpicBuilders();
+  await builderBeat("ebSlowA", "eb2545.atlassian.net");
+  await builderBeat("ebSlowB", "eb2545.atlassian.net");
+  agents.ebSlowA.commands = []; agents.ebSlowB.commands = [];
+  const r = await request("POST", "/api/jira/eb2545.atlassian.net/epic-builder",
+    { body: { title: "Slow", idea: "first host goes quiet" }, headers: userHeaders });
+  const id = r.body.run.id;
+  const first = epicBuilders[id].host;
+  const other = first === "ebSlowA" ? "ebSlowB" : "ebSlowA";
+  const cmd = agents[first].commands.find((c) => c.type === "spawnEpicBuilder");
+  const now = Date.now();
+  // Delivered, then the host went silent past the redispatch window: it may be
+  // running the builder, so the run stays with it.
+  cmd.deliveredAt = now;
+  epicBuilders[id].dispatchedAt = now - EPIC_BUILDER_REDISPATCH_MS - 1000;
+  agents[first].lastSeen = epicBuilders[id].dispatchedAt - 1;
+  epicBuilderDriveSweep();
+  assert.equal(epicBuilders[id].host, first, "a silent host that took it keeps the run");
+  assert.equal(agents[other].commands.some((c) => c.type === "spawnEpicBuilder"), false,
+    "no second builder dispatched");
+  // Silent past the orphan bound: the claim is given up.
+  assert.equal(epicBuilderClaimLapsed(id, epicBuilders[id],
+    epicBuilders[id].dispatchedAt + EPIC_BUILDER_ORPHAN_MS + 1), true);
+  // Acked (command gone) and beating since, with no report: acked-no-session, released.
+  agents[first].commands = [];
+  agents[first].lastSeen = now;
+  assert.equal(epicBuilderClaimLapsed(id, epicBuilders[id], now), true);
+  // Never delivered: the command is withdrawn and the run released.
+  agents[first].commands = [{ ...cmd }]; delete agents[first].commands[0].deliveredAt;
+  agents[first].lastSeen = epicBuilders[id].dispatchedAt - 1;
+  assert.equal(epicBuilderClaimLapsed(id, epicBuilders[id], now), true);
+  assert.equal(agents[first].commands.some((c) => c.type === "spawnEpicBuilder"), false,
+    "the undelivered command was withdrawn");
+  // Inside the first-report grace nothing is released.
+  assert.equal(epicBuilderClaimLapsed(id, { ...epicBuilders[id], dispatchedAt: now }, now), false);
 });
 
 test("XERK-725: a host's epicBuilderStatus report advances the run; another host cannot", async () => {

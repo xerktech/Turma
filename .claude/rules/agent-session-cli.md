@@ -138,6 +138,11 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   whole on a timeout and reaped with a bound — a pipe read waits for EOF unbounded, so a grandchild
   holding stdout would wedge the one worker. Only the job's OWN answer (same edge + `stagedAt`) frees
   `_attn_job`; a late answer from a watchdog-dropped job does not.
+- **A manager restart kills every live `_run_lockdown_oneshot` child's group** (`_oneshot_procs`,
+  `_kill_oneshots` from `_handle_shutdown`, XERK-2545): `KillMode=process` and its own process
+  group leave it running, and nothing adopts it. A new one-shot runner must register there too.
+- **A saver's temp file opens through `_open_tmp_for_replace`**, never `open(tmp, "w")` (XERK-2545):
+  `~/.turma` is session-writable, and a plain open writes through a link planted at the temp name.
 - `TURMA_ATTENTION_HINTS=0` turns the classifier off; dsh/qwen skip it (no Claude login assumed,
   like naming).
 - **Only a NEW edge is classified** (`attention_edge`, a pure read of the beat's signals: question |
