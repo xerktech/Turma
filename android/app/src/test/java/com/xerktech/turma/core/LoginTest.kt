@@ -73,4 +73,26 @@ class LoginTest {
         assertNull(sessionTokenFrom(emptyList()))
         assertNull(sessionTokenFrom(listOf("garbage")))
     }
+
+    // ---- loginRefusalMessage (XERK-2576) — mirrors login.html's refusalMessage --
+
+    @Test fun throttledSignInReadsInTheHubsWordsWithTheWait() {
+        assertEquals(
+            "too many sign-ins in progress — try again in a moment (retry in 1s)",
+            loginRefusalMessage("too many sign-ins in progress — try again in a moment", "1"),
+        )
+        assertEquals(
+            "too many failed sign-ins — try again later (retry in 5 min)",
+            loginRefusalMessage("too many failed sign-ins — try again later", "300"),
+        )
+        assertEquals("slow down (retry in 2 min)", loginRefusalMessage("slow down", "61"))
+        assertEquals("slow down (retry in 59s)", loginRefusalMessage("slow down", "59"))
+        assertEquals("slow down (retry in 1 min)", loginRefusalMessage("slow down", "60"))
+        assertEquals("slow down", loginRefusalMessage("slow down", "99999999999999999999999"))
+        assertEquals("slow down", loginRefusalMessage("slow down", "\u0661\u0662"))
+        assertEquals("slow down", loginRefusalMessage("slow down", null))
+        assertEquals("slow down", loginRefusalMessage("slow down", "0"))
+        assertEquals("slow down", loginRefusalMessage("slow down", "Wed, 21 Oct 2026 07:28:00 GMT"))
+        assertEquals("slow down", signInError(SignInResult.HubRefused("slow down")))
+    }
 }
