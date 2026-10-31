@@ -33598,6 +33598,9 @@ class SessionManager:
             elif state == "creating":
                 rec["state"] = "failed"
                 rec["error"] = EPIC_BUILDER_RESTART_LOST
+                # Newly failed, so the load cap and the status order keep it
+                # until the hub hears it (its run is still `creating`).
+                rec["updatedAt"] = now
                 log(f"epic builder {bid} failed: {EPIC_BUILDER_RESTART_LOST}")
             out[bid] = rec
         # The file may hold more than the cap (it's session-writable): keep every
@@ -33643,7 +33646,7 @@ class SessionManager:
         with self._epic_builders_lock:
             held = bid in self.epic_builders
         if held:
-            log(f"epic builder {bid} already running here — re-dispatch ignored")
+            log(f"epic builder {bid} already held here — re-dispatch ignored")
             return
 
         def fail(msg):

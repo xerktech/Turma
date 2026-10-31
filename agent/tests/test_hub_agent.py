@@ -45039,19 +45039,56 @@ class TestEpicBuilderRun(ManagerMixin, unittest.TestCase):
     def test_status_reports_live_builders_within_the_hub_cap(self):
         # The hub reads only EPIC_BUILDER_STATUS_MAX entries; a backlog of
         # finished records must not hide a new builder.
+        # The live and just-failed records are OLDER than the whole finished
+        # backlog, so only the live-first ordering (not recency) keeps them.
+        now = time.time()
         recs = {f"d{i}": {"id": f"d{i}", "state": "done", "epicKey": f"X-{i}",
-                          "updatedAt": time.time() - 100 + i}
+                          "updatedAt": now - 100 + i}
                 for i in range(ha.EPIC_BUILDERS_MAX + 6)}
+        wt = os.path.join(ha.WORKTREES_ROOT, "abcdh")
+        recs["live"] = {"id": "live", "state": "researching", "sessionId": "s",
+                        "worktreePath": wt, "updatedAt": now - 1000}
+        recs["mid"] = {"id": "mid", "state": "creating", "sessionId": "s2",
+                       "worktreePath": wt, "updatedAt": now - 1000}
         with open(ha.EPIC_BUILDERS_PATH, "w") as f:
             json.dump(recs, f)
         sm = self.make_manager()
         self.assertEqual(len(sm.epic_builders), ha.EPIC_BUILDERS_MAX)
-        wt = os.path.join(ha.WORKTREES_ROOT, "abcdh")
-        os.makedirs(wt, exist_ok=True)
-        self._researching(sm, wt)
+        self.assertIn("live", sm.epic_builders)
         st = sm.epic_builder_status()
         self.assertEqual(len(st), ha.EPIC_BUILDER_STATUS_MAX)
-        self.assertEqual(st[0], {"id": "b1", "state": "researching"})
+        self.assertEqual(st[0], {"id": "live", "state": "researching"})
+        # A run that died mid-create is reported failed, never crowded out.
+        self.assertIn({"id": "mid", "state": "failed",
+                       "error": ha.EPIC_BUILDER_RESTART_LOST}, st)
+
+    def test_a_stale_snapshot_is_never_saved_last(self):
+        # The worker and the beat both save. A save that snapshotted before a
+        # newer save ran must not overwrite it, or a restart loads stale state.
+        sm = self.make_manager()
+        wt = os.path.join(ha.WORKTREES_ROOT, "abcdj")
+        os.makedirs(wt, exist_ok=True)
+        self._researching(sm, wt)
+        sm.epic_builders["b1"]["state"] = "creating"
+        real = sm._epic_builders_save_lock
+
+        class Racing:
+            # The first acquirer is delayed while a newer save runs to completion.
+            pending = True
+
+            def __enter__(self):
+                if Racing.pending:
+                    Racing.pending = False
+                    sm.epic_builders["b1"]["state"] = "done"
+                    sm._save_epic_builders()
+                return real.__enter__()
+
+            def __exit__(self, *a):
+                return real.__exit__(*a)
+
+        sm._epic_builders_save_lock = Racing()
+        sm._save_epic_builders()
+        self.assertEqual(self.make_manager().epic_builders["b1"]["state"], "done")
 
     def test_redispatch_of_a_held_builder_spawns_nothing(self):
         sm = self.make_manager()
