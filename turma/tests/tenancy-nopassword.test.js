@@ -151,6 +151,38 @@ test("XERK-2568: the sign-in client is CF-Connecting-IP + the last X-Forwarded-F
     key({ "x-forwarded-for": "10.10.10.77" }));
 });
 
+test("XERK-2579: behind trusted proxies one public IP is one sign-in key", () => {
+  const trusted = hub.parseTrustedProxies(" 10.244.0.0/16, fd00::/8 ");
+  const key = (headers, remoteAddress, t = trusted) => hub.loginClientKey({ headers, socket: { remoteAddress } }, t);
+  const viaCf = (cloudflaredPod, ingressPod) =>
+    key({ "cf-connecting-ip": "203.0.113.7", "x-forwarded-for": `203.0.113.7, ${cloudflaredPod}` }, ingressPod);
+  // 2 cloudflared x 2 ingress pods: was four keys, now one.
+  const keys = new Set([viaCf("10.244.1.5", "10.244.2.8"), viaCf("10.244.3.9", "10.244.2.8"),
+    viaCf("10.244.1.5", "::ffff:10.244.4.2"), viaCf("10.244.3.9", "10.244.4.2")]);
+  assert.deepEqual([...keys], ["203.0.113.7"]);
+  assert.equal(key({ "cf-connecting-ip": "2001:db8::1", "x-forwarded-for": "fd00::5" }, "fd00::6"), "2001:db8::1");
+  // A LAN caller reaching the ingress directly: the hop the ingress appends is its own
+  // untrusted address, so a forged CF-Connecting-IP still cannot pose as the victim.
+  assert.notEqual(key({ "cf-connecting-ip": "203.0.113.7", "x-forwarded-for": "192.168.1.50" }, "10.244.2.8"),
+    "203.0.113.7");
+  // Reaching the hub without the ingress (untrusted socket), even with a trusted-looking hop.
+  assert.notEqual(key({ "cf-connecting-ip": "203.0.113.7", "x-forwarded-for": "10.244.1.5" }, "192.168.1.50"),
+    "203.0.113.7");
+  // No CF-Connecting-IP, junk hop, or the env unset: the three-part key.
+  assert.equal(key({ "x-forwarded-for": "10.244.1.5" }, "10.244.2.8"), "|10.244.1.5|10.244.2.8");
+  assert.equal(key({ "cf-connecting-ip": "203.0.113.7", "x-forwarded-for": "nope" }, "10.244.2.8"),
+    "203.0.113.7|nope|10.244.2.8");
+  assert.equal(key({ "cf-connecting-ip": "203.0.113.7", "x-forwarded-for": "10.244.1.5" }, "10.244.2.8", null),
+    "203.0.113.7|10.244.1.5|10.244.2.8");
+  assert.equal(hub.parseTrustedProxies(""), null);
+  assert.equal(hub.parseTrustedProxies(" , "), null);
+  assert.ok(hub.parseTrustedProxies("10.0.0.1").check("10.0.0.1", "ipv4"), "a bare IP is a /32");
+  assert.ok(!hub.parseTrustedProxies("10.0.0.1").check("10.0.0.2", "ipv4"));
+  for (const bad of ["10.0.0.0/33", "10.0.0.0/x", "host.local", "10.0.0.0/8/1", "::/129", "10.0.0.0/"]) {
+    assert.throws(() => hub.parseTrustedProxies(bad), /TURMA_TRUSTED_PROXIES/, bad);
+  }
+});
+
 test("XERK-2568: the failure map's key is bounded whatever the username", () => {
   assert.equal(hub.loginFailureKey("a|b|c", "u".repeat(1 << 20)).length, 64);
   assert.equal(hub.loginFailureKey("a|b|c", "RootAdmin"), hub.loginFailureKey("a|b|c", "rootadmin"));
