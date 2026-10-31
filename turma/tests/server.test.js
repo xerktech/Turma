@@ -29329,5 +29329,9 @@ test("XERK-2551: a binding made before the tenant follows the host; a restored r
       [F.SA, F.SA, F.SA]);
     assert.deepEqual([map.t2551bleg.orgBound, map.t2551bleg.jira.siteKey], [S2551, S2551],
       "an untenanted record never keeps a tenant's org");
+    // An older replica's record arriving over the HA watch is scoped too.
+    hub.applyRemoteAgent(F.ka, { device: "t2551b", lastSeen: Date.now(), sessions: [], commands: [],
+      orgBound: S2551, jira: { siteKey: S2551 } });
+    assert.deepEqual([agents[F.ka].orgBound, agents[F.ka].jira.siteKey], [F.SA, F.SA]);
   } finally { if (F) forget2533("t2551b", F.ka, F.kb, F.kl); T.restore(); }
 });

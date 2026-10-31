@@ -8018,6 +8018,9 @@ function applyRemoteAgent(key, value) {
       if (Object.prototype.hasOwnProperty.call(existing, ck)) value[ck] = existing[ck];
     }
   }
+  // A record an OLDER replica wrote mid-rolling-upgrade carries plain orgs
+  // (XERK-2551): scope it as hydrate does (a no-op on an already-scoped one).
+  rescopeRestoredOrgs({ [key]: value });
   agents[key] = value;
   try { recordBytes.set(key, agentRecordSize(value)); } catch { /* best effort */ }
   invalidateAgentsCache();
