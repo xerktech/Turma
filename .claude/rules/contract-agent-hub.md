@@ -117,6 +117,9 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
       instead locked a blipped host out for good; never releasing locked a reinstall out on strict.
     - **A released id may ONLY return home**, never rename: once a reinstall takes the name it is
       dead, so Remove host + reinstall also retires a lost or stolen machine's token.
+    - **Redeeming an enrollment code for a released name revokes the id living there**
+      (XERK-2573), so the reinstall cannot lose the race to the old machine's identity token.
+      Mechanics: `agent-token-onboarding.md`.
     - **`?identity=revoke` on that DELETE REVOKES** (XERK-2383, `revokeHostIdentities`): it deletes
       every id whose home is the host, so its token is refused everywhere at once (heartbeat,
       tunnel, enroll; `agentPresented` too, so no 32 MiB read) and its live tunnel is dropped. The

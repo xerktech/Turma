@@ -14993,17 +14993,44 @@ function consumeEnrollCode(code, device, now = Date.now(), check = false) {
   // then-removed agent's live id to this new machine (XERK-2531 QA). Releasing a
   // name means a reinstall that registers first wins, so it loses that origin.
   // A code therefore always mints a FRESH identity — never one another machine holds.
+  //
+  // The released identity still LIVING under this name is REVOKED, not just left
+  // released (XERK-2573): released, it may come home if it beats first, so the old
+  // machine could beat in the window before the new host's first beat and the new
+  // identity would then be refused there. Minting a code for the name is the
+  // operator choosing the new machine. Revoked like revokeHostIdentities, except a
+  // renamed agent's tombstone moves home to its origin name: left here it would
+  // hold this name and refuse the next code (enrollNameRefusal).
+  const want = lowerName(key);
   let dropped = false;
+  let revoked = 0;
   for (const [uid, e] of Object.entries(agentIdentities)) {
     if (!e || e.revoked) continue;
     // Case-folded (XERK-2574): a never-beaten case twin is the same name to an operator.
     // Compared as this tenant's KEY (XERK-2533): another tenant's "laptop" is not it.
-    if (!e.used && [e.home, e.origin].some((n) => typeof n === "string" && lowerName(n) === lowerName(key))) {
+    if (!e.used && [e.home, e.origin].some((n) => typeof n === "string" && lowerName(n) === want)) {
       delete agentIdentities[uid]; dropped = true;
     }
-    else if (e.released && e.origin === key) { delete e.origin; dropped = true; }
+    else if (e.released && typeof e.home === "string" && lowerName(e.home) === want) {
+      revoked++;
+      // Its former names go too: a tombstone holds every name it lists, and only a
+      // release of the ORIGIN drops it, so a kept middle name of a rename chain would
+      // refuse codes with no DELETE that frees it (XERK-2573 QA).
+      if (e.origin && lowerName(e.origin) !== want) { e.home = e.origin; delete e.names; e.revoked = true; }
+      else delete agentIdentities[uid];
+    } else if (e.released && e.origin === key) { delete e.origin; dropped = true; }
   }
-  if (dropped) persistAgentIdentities();
+  if (dropped || revoked) persistAgentIdentities();
+  // Its tunnel, if still up, is cut now (no record holds this name, so any control
+  // channel under it is the old machine's); agentWsAuthorized refuses the reconnect.
+  // Case-folded like the revoke (enrollNameRefusal left no record in any casing).
+  if (revoked) {
+    for (const name of Object.keys(controlChannels)) {
+      if (lowerName(name) !== want) continue;
+      dropTermAgents(name);
+      try { controlChannels[name].socket.destroy(); } catch { /* gone */ }
+    }
+  }
   const uid = issueAgentUid(key);
   const ident = identityEntry(uid);
   if (!ident || ident.used || ident.home !== key || tenantOfUid(uid) !== tenantId) {
@@ -15016,7 +15043,7 @@ function consumeEnrollCode(code, device, now = Date.now(), check = false) {
   const token = uidAgentToken(uid);
   console.log(`agent enrolled by code: ${logName(device)}${tenantId ? " into its owner's tenant" : ""} ` +
     `(code ${id}, minted by ${logName(rec.owner)})`);
-  return { status: 200, body: { host: device, token, bound: true } };
+  return { status: 200, body: { host: device, token, bound: true }, revoked };
 }
 
 // POST /api/agent/enroll: revoke `device`'s NAME-derived token, THEN redeem.
@@ -15036,7 +15063,16 @@ async function redeemEnrollCode(code, device, now = Date.now()) {
   if (bumped.error) {
     console.error(`agent enrolled by code: could not revoke ${logName(device)}'s old name token (${bumped.error}); it may still work`);
   }
-  return consumeEnrollCode(code, device, Date.now());
+  const done = consumeEnrollCode(code, device, Date.now());
+  if (done.status === 200) {
+    // The code is burned at once (enrollCodes has no debounce), so the identity it
+    // minted — and any it revoked — must survive a hard kill too: on the file
+    // backend write it through, not on the 5s debounce, or a kill leaves a spent
+    // code and a token the hub does not know.
+    await persistAgentIdentities();
+    if (!HA_ON && typeof liveStore.flush === "function") liveStore.flush();
+  }
+  return done;
 }
 
 const enrollFails = { start: 0, n: 0 };
