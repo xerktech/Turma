@@ -20892,6 +20892,10 @@ const server = http.createServer(async (req, res) => {
       if (!authEnabled()) {
         token = issueSessionToken(); // an open hub: no credential to check
       } else {
+        // A socket that already closed has no peer address, so every such request
+        // would share one key — one backoff bucket and one in-flight slot. Its
+        // caller is gone and cannot read an answer, so spend nothing on it.
+        if (!req.socket || !req.socket.remoteAddress) return res.end();
         const clientKey = loginClientKey(req);
         // Break-glass (XERK-595) first and scrypt-free, so it works under another
         // client's flood — but throttled per client (XERK-2577). Only a guess at
@@ -25796,6 +25800,7 @@ if (process.env.TURMA_TEST) {
     parseTrustedProxies,
     loginIpv6Prefix64,
     loginFailureKey,
+    loginBackoffMs,
     oidcPrincipal,
     tenancyState: () => tenancyState,
     __setTenancy(v) { tenancyState = tenancy.coerceTenancy(v); },
