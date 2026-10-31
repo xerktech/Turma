@@ -86,11 +86,14 @@ const LEDGER_DAYS = positiveEnv("USAGE_LEDGER_DAYS", 120);
 // Repos kept per host, biggest spender first. A host that clones and drops repos
 // over years would otherwise accumulate an entry per name it ever saw.
 const LEDGER_REPOS = positiveEnv("USAGE_LEDGER_REPOS", 100);
-// Hosts kept, least-recently-seen evicted first. Above AGENTS_MAX's 64 would be
+// Hosts kept. Past it a host gone quiet goes before a live one, then the tenant
+// holding the most hosts gives up its stalest (XERK-2591). Above AGENTS_MAX's 64 would be
 // the wrong instinct: what is kept here is one usage block per host, and the byte
 // ceiling below is the bound that actually holds — a count so high that the bytes
 // always decide it first is not a second bound, just a slower one.
 const LEDGER_HOSTS = positiveEnv("USAGE_LEDGER_HOSTS", 32);
+// A host seen this recently is still beating (the registry's AGENT_EVICT_IDLE_MS).
+const LIVE_MS = 60 * 60 * 1000;
 // Models kept per series, and the longest a model/repo name may be.
 //
 // These are the ONLY things here that grow on agent-supplied STRINGS, and the
@@ -733,11 +736,17 @@ function evictOverflow() {
   let dropped = 0;
   // The COUNT ceiling is a recency question: too many hosts, drop the stalest —
   // of the tenant holding the most hosts (XERK-2591), so one tenant's fleet of
-  // hosts cannot retire another tenant's history.
+  // hosts cannot retire another tenant's history. A live host is dropped only
+  // when every host is live: its next beat re-creates it, so dropping one would
+  // churn every save and lose its aged-out days each time, while a quiet host
+  // somewhere was kept forever.
   let count = Object.keys(hosts).length;
+  const now = Date.now();
+  const quiet = (k) => now - (hosts[k].lastSeen || 0) >= LIVE_MS;
   while (count > LEDGER_HOSTS) {
     const stalest = (a, b) => (hosts[a].lastSeen || 0) - (hosts[b].lastSeen || 0);
-    delete hosts[fromBiggestTenant(() => 1, stalest)];
+    const anyQuiet = Object.keys(hosts).some(quiet);
+    delete hosts[fromBiggestTenant(() => 1, stalest, anyQuiet ? quiet : () => true)];
     dropped += 1;
     count -= 1;
   }
@@ -787,19 +796,22 @@ function evictOverflow() {
 // The ledger's ceilings are shared, but eviction is per-tenant fair (XERK-2591):
 // the victim is a host of the tenant whose hosts weigh the most (`weight` per
 // host), so a tenant at or under its even share never loses a host while another
-// is over it. Within that tenant, the first host by `victimFirst`.
-function fromBiggestTenant(weight, victimFirst) {
-  const tenants = new Map();          // tenant -> {keys, weight}
+// is over it. Within that tenant, the first host by `victimFirst`. Only an
+// `eligible` host may be the victim; a tenant still weighs all of its hosts.
+function fromBiggestTenant(weight, victimFirst, eligible = () => true) {
+  const tenants = new Map();          // tenant -> {keys (eligible), weight}
   for (const key of Object.keys(hosts)) {
     const t = tenantOfHostKey(key);
     if (!tenants.has(t)) tenants.set(t, { keys: [], weight: 0 });
     const held = tenants.get(t);
-    held.keys.push(key);
+    if (eligible(key)) held.keys.push(key);
     held.weight += weight(key);
   }
   let big = null;
-  for (const held of tenants.values()) if (!big || held.weight > big.weight) big = held;
-  return big.keys.sort(victimFirst)[0];
+  for (const held of tenants.values()) {
+    if (held.keys.length && (!big || held.weight > big.weight)) big = held;
+  }
+  return big ? big.keys.sort(victimFirst)[0] : undefined;
 }
 
 function sizeOf(key) {

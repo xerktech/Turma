@@ -449,6 +449,40 @@ test("XERK-2591: the byte ceiling drops the biggest host of the tenant holding t
   assert.ok(out.bytes <= 90000, `file left at ${out.bytes}, over its own ceiling`);
 });
 
+test("XERK-2591: the byte ceiling weighs a tenant by BYTES, not by how many hosts it has", () => {
+  // A: three small hosts. B: one host heavier than all of A's together.
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const fs = require("fs"), path = require("path");
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
+    process.env.USAGE_LEDGER_FILE = path.join(mkdtemp("turma-fair-"), "l.json");
+    process.env.USAGE_LEDGER_MAX = "60000";
+    process.env.USAGE_LEDGER_HOSTS = "4";          // share floors at 64 KiB: no trimming
+    process.env.USAGE_LEDGER_REPOS = "400";
+    const l = require(${JSON.stringify(path.join(__dirname, "..", "usage-ledger.js"))});
+    const b = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
+    const blk = () => ({ totals: b(5), today: b(0), week: b(5),
+      days: { "2026-08-18": b(5) }, sessions: 1, models: [] });
+    const rec = (dev, repos) => ({ device: dev, usage: blk(),
+      repoUsage: Array.from({ length: repos }, (_, i) =>
+        ({ repo: "r" + i, remoteKey: "rk" + i, remote: "", usage: blk() })) });
+    const A = "a".repeat(32), B = "b".repeat(32);
+    l.ingest("b1@" + B, rec("b1", 200), 1000);
+    for (const h of ["a1", "a2", "a3"]) l.ingest(h + "@" + A, rec(h, 20), 2000);
+    const sizes = Object.fromEntries(Object.entries(l._internals.hosts())
+      .map(([k, e]) => [k.split("@")[0], JSON.stringify(e).length]));
+    l._internals.writeNow(() => {
+      console.log(JSON.stringify({ sizes, b1: l.has("b1@" + B),
+        a: ["a1", "a2", "a3"].filter((h) => l.has(h + "@" + A)).length }));
+    });
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const out = JSON.parse(fresh.stdout.trim().split("\n").pop());
+  const a = out.sizes.a1 + out.sizes.a2 + out.sizes.a3;
+  assert.ok(out.sizes.b1 > a && out.sizes.b1 + a > 60000, JSON.stringify(out.sizes));
+  assert.equal(out.a, 3, "tenant A paid for tenant B's bytes");
+  assert.equal(out.b1, false);
+});
+
 test("the byte ceiling drops the BIGGEST host, never an innocent bystander", () => {
   // Least-recently-seen is the right victim for the COUNT ceiling and the wrong
   // one for the BYTE ceiling: it destroyed a small innocent host's durable
@@ -692,14 +726,28 @@ test("the least-recently-seen host is evicted past the count ceiling", async () 
 
 test("XERK-2591: the count ceiling drops the stalest host of the tenant holding the most", async () => {
   const TA = "a".repeat(32), TB = "b".repeat(32);
-  // Tenant B's one host is the stalest — what least-recently-seen alone dropped.
+  // Every host has gone quiet; tenant B's one host is the stalest — what
+  // least-recently-seen alone dropped.
+  const base = Date.now() - 6 * 3600 * 1000;
   const keys = [`b1@${TB}`, `a1@${TA}`, `a2@${TA}`, `a3@${TA}`];
   for (const [i, key] of keys.entries()) {
-    ledger.ingest(key, beat({ [DAY]: 100 }, null, { device: key.split("@")[0] }), now + i * 1000);
+    ledger.ingest(key, beat({ [DAY]: 100 }, null, { device: key.split("@")[0] }), base + i * 1000);
   }
   // USAGE_LEDGER_HOSTS is 3 in this process.
   await saved();
   assert.deepEqual(Object.keys(hosts()).sort(), [`a2@${TA}`, `a3@${TA}`, `b1@${TB}`]);
+});
+
+test("XERK-2591: the count ceiling drops a quiet host before a live one, whatever its tenant", async () => {
+  const TA = "a".repeat(32), TB = "b".repeat(32);
+  // Dropping a live host instead re-created it next beat and dropped it again
+  // every save, losing its aged-out days, while the quiet host stayed for good.
+  ledger.ingest(`b1@${TB}`, beat({ [DAY]: 100 }, null, { device: "b1" }), Date.now() - 30 * 86400000);
+  for (const h of ["a1", "a2", "a3"]) {
+    ledger.ingest(`${h}@${TA}`, beat({ [DAY]: 100 }, null, { device: h }), Date.now());
+  }
+  await saved();
+  assert.deepEqual(Object.keys(hosts()).sort(), [`a1@${TA}`, `a2@${TA}`, `a3@${TA}`]);
 });
 
 // ---- the file ---------------------------------------------------------------

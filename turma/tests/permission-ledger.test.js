@@ -609,6 +609,25 @@ test("XERK-2591: past the store's ceiling the tenant holding the most rows pays,
   assert.equal(held.get(`a1@${TA}`).size, 15);
 });
 
+test("XERK-2591: over the BYTE budget the tenant holding the most bytes pays, not the most rows", () => {
+  const now = Date.now();
+  ledger.setMemoryLimit(1 << 20);                          // the 64 KiB floor; a host keeps 16 KiB
+  try {
+    // A: more rows, few bytes. B: fewer rows, one max-size row on each of 5 hosts.
+    ledger.ingest(`a1@${TA}`, Array.from({ length: 10 }, (_, i) =>
+      row(`a${i}`, { openedAt: now - 120 * MIN + i })), now);
+    for (let h = 0; h < 5; h++) ledger.ingest(`b${h}@${TB}`, [fatRow(`b${h}`, now - 60 * MIN + h)], now);
+    const held = ledger._internals.hosts();
+    assert.equal(held.get(`a1@${TA}`).size, 10, "tenant A paid for tenant B's bytes");
+    let b = 0;
+    for (let h = 0; h < 5; h++) b += (held.get(`b${h}@${TB}`) || new Map()).size;
+    assert.ok(b < 5 && b > 0, `tenant B kept ${b} rows`);
+    assert.ok(!held.has(`b0@${TB}`), "B's oldest row goes first");
+  } finally {
+    ledger.setMemoryLimit(null);
+  }
+});
+
 test("XERK-2591: a lone tenant may still fill the whole store", () => {
   const now = Date.now();
   for (let h = 0; h < 2; h++) {

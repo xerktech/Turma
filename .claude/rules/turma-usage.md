@@ -375,6 +375,9 @@ paths:
   - **Both ceilings pick the TENANT first** (XERK-2591, `fromBiggestTenant`): the count ceiling
     drops the stalest host of the tenant with the most hosts, the byte ceiling the biggest host of
     the tenant with the most bytes. File backend only (HA has neither eviction).
+  - **The count ceiling drops a QUIET host (unseen 1h) before any live one** (XERK-2591): a dropped
+    live host is re-created by its next beat, so it churned every save and lost its aged-out days
+    each time while another tenant's dead host stayed forever.
   - **The BYTE ceiling evicts the BIGGEST host; only the COUNT ceiling evicts the STALEST** —
     least-recently-seen is right for "too many hosts", wrong for "too many bytes" (it would destroy a
     small innocent host's history while the overflow-causing host stays).
