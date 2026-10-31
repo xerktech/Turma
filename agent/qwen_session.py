@@ -54,7 +54,9 @@ try:
     # crash-safe numeric-env parser are shared with the dsh tail (XERK-528); only
     # WHERE a child lands and the parent-pump / native-log mirror below are
     # qwen-specific.
-    from runtime_tail import ChildProjection, append_entries, env_float
+    from runtime_tail import (
+        ChildProjection, append_entries, env_float, open_fresh_for_write,
+    )
 except ImportError:  # pragma: no cover - only when run outside the agent dir
     QwenProjector = None
 
@@ -337,7 +339,9 @@ class QwenProjectionTail:
         entries, partial = self._project_bytes(proj, b"", data)
         tmp = "%s.rebuild.%d.tmp" % (self.transcript_path, os.getpid())
         try:
-            with open(tmp, "w", encoding="utf-8") as fh:
+            # Fresh O_EXCL|O_NOFOLLOW tmp: a link planted at the tmp name is
+            # never written through (XERK-2564).
+            with open_fresh_for_write(tmp) as fh:
                 for e in entries:
                     fh.write(json.dumps(e, ensure_ascii=False) + "\n")
             os.replace(tmp, self.transcript_path)
@@ -455,7 +459,7 @@ class QwenProjectionTail:
         existing dest across a resume/adopt. Never raises (logged)."""
         try:
             os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, "w", encoding="utf-8"):
+            with open_fresh_for_write(dest):
                 pass
         except OSError as e:
             self._log(f"qwen child transcript reset failed: {e}")

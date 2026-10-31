@@ -91,6 +91,44 @@ def env_float(name, default, *, minimum=None, maximum=None):
     return env_num(name, default, float, minimum=minimum, maximum=maximum)
 
 
+def open_fresh_for_write(path):
+    """Open `path` for writing as a brand-new file the tail itself created.
+
+    The projected files live under `~/.claude/projects/<slug>/…`, which a
+    session's own Bash can write, so a symlink (or hardlink) planted at the name
+    would make a plain `open(path, "w")` write through it as the agent's uid
+    (XERK-2564). Unlinking the entry first and then creating with
+    O_EXCL|O_NOFOLLOW guarantees the write lands in a fresh inode at exactly this
+    name: a link re-planted between the unlink and the open makes O_EXCL fail
+    (EEXIST) rather than be followed. Returns a text-mode file object; raises
+    OSError like `open` does."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0), 0o600)
+    return os.fdopen(fd, "w", encoding="utf-8")
+
+
+def write_text_replace(path, text):
+    """Write `text` to a fresh per-pid tmp (via `open_fresh_for_write`), then
+    os.replace it over `path` — a reader sees the old file or the new one, never
+    a half one, and a link planted at either name is never written through.
+    Raises OSError; the tmp is removed on failure."""
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open_fresh_for_write(tmp) as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def ensure_transcript_file(path, log, what="transcript"):
     """Create the destination transcript (empty) plus its parent dir so a reader
     resolving it mid-run finds a file — an empty one reads as an empty

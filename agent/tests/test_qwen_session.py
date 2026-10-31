@@ -224,6 +224,22 @@ class QwenProjectionTailTest(unittest.TestCase):
                      if ".rebuild." in n]
         self.assertEqual(leftovers, [])
 
+    def test_resume_rebuild_never_writes_through_a_planted_tmp_link(self):
+        # XERK-2564: the rebuild tmp name is predictable and session-writable; a
+        # symlink planted there must be replaced, never written through.
+        self._append_native(self._user("t1"))
+        victim = os.path.join(os.path.dirname(self.transcript), "victim")
+        with open(victim, "w") as f:
+            f.write("untouched")
+        os.symlink(victim, "%s.rebuild.%d.tmp" % (self.transcript, os.getpid()))
+        resumed = self._tail(resume=True, use_glob=False)
+        self.addCleanup(resumed.stop)
+        resumed._pump()
+        with open(victim) as f:
+            self.assertEqual(f.read(), "untouched")
+        self.assertEqual(len(self._read_transcript()), 1)
+        self.assertFalse(os.path.islink(self.transcript))
+
     def test_resume_holds_a_trailing_partial_line_then_completes_it(self):
         # qwen may be mid-write at resume, leaving an unterminated last line. The
         # rebuild must hold that fragment (not project a truncated event) and

@@ -319,6 +319,9 @@ on [Qwen C]; [Qwen D] is the read-side verification that PINS these:
 BOTH layers with NO new archive code, only a store-dir contract. The one difference from dsh [E] is
 WHO writes the native log into the store.
 
+- **A tail writes a projected file only via `runtime_tail.open_fresh_for_write`/`write_text_replace`,
+  never a plain `open(path, "w")`** (XERK-2564): the store dirs are session-writable, so a
+  planted link would be written through. Tests: `FreshWriteTest`, the `*planted*` tail cases.
 - **The projection (`<slug>/<sid>.jsonl`) rides the RENDERED layer unchanged** — a top-level `*.jsonl`
   in the usage ledger's slug, enumerated by `_archive_manifest` like any transcript.
 - **The native event log rides the RAW layer at `<slug>/<sid>/qwen/`** (`QWEN_STORE_DIRNAME`, a fixed

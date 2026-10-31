@@ -65,5 +65,56 @@ class EnvNumHelpersTest(unittest.TestCase):
         self.assertEqual(val, 0.1)
 
 
+class FreshWriteTest(unittest.TestCase):
+    """XERK-2564: a link planted at a projected file's name is never written
+    through — the write lands in a fresh inode at that name instead."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.victim = os.path.join(self.tmp, "victim")
+        with open(self.victim, "w") as fh:
+            fh.write("untouched")
+
+    def _victim(self):
+        with open(self.victim) as fh:
+            return fh.read()
+
+    def test_open_fresh_replaces_a_planted_symlink(self):
+        path = os.path.join(self.tmp, "out.json")
+        os.symlink(self.victim, path)
+        with rt.open_fresh_for_write(path) as fh:
+            fh.write("mine")
+        self.assertEqual(self._victim(), "untouched")
+        self.assertFalse(os.path.islink(path))
+        with open(path) as fh:
+            self.assertEqual(fh.read(), "mine")
+
+    def test_open_fresh_does_not_write_through_a_hardlink(self):
+        path = os.path.join(self.tmp, "out.json")
+        os.link(self.victim, path)
+        with rt.open_fresh_for_write(path) as fh:
+            fh.write("mine")
+        self.assertEqual(self._victim(), "untouched")
+
+    def test_write_text_replace_ignores_links_at_target_and_tmp(self):
+        path = os.path.join(self.tmp, "rec.json")
+        os.symlink(self.victim, path)
+        os.symlink(self.victim, "%s.%d.tmp" % (path, os.getpid()))
+        rt.write_text_replace(path, "new")
+        self.assertEqual(self._victim(), "untouched")
+        self.assertFalse(os.path.islink(path))
+        with open(path) as fh:
+            self.assertEqual(fh.read(), "new")
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["rec.json", "victim"])
+
+    def test_write_text_replace_cleans_up_and_raises_on_failure(self):
+        path = os.path.join(self.tmp, "rec.json")
+        with mock.patch.object(rt.os, "replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                rt.write_text_replace(path, "new")
+        self.assertEqual(os.listdir(self.tmp), ["victim"])
+
+
 if __name__ == "__main__":
     unittest.main()
