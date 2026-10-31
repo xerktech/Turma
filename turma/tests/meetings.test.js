@@ -129,10 +129,14 @@ test("XERK-2510: Approve + start posts the org's project, the kind's issue type 
   assert.match(post.body.description, /> Ann: login <b>is<\/b> broken \[1:01\]/);
   assert.equal("edited" in post.body, false, "the default text is not an edit");
   assert.match(P.list(), /Creating the ticket…/);
-  // A decision posts no project.
-  await P.review(P.itemKey(SITE, "m1", "p2"), "approve");
-  const dec = P.fetches.filter((f) => f.method === "POST")[1];
-  assert.equal("project" in dec.body, false);
+  // A decision: its detail fits the decisions log, and an editor opened and changed says so.
+  const k2 = P.itemKey(SITE, "m1", "p2");
+  P.startEdit(k2);
+  assert.match(P.list(), /data-edit-desc="[^"]+" maxlength="290"/);
+  P.edits.get(k2).description += " more";
+  await P.review(k2, "approve");
+  const dec = P.fetches.filter((f) => f.method === "POST").at(-1);
+  assert.deepEqual([dec.body.edited, "project" in dec.body], [true, false]);
 });
 
 test("XERK-2510: a refusal reaches the operator in the hub's words; review states render", async () => {
