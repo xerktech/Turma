@@ -21,6 +21,7 @@ import importlib.util
 import inspect
 import io
 import json
+import operator
 import os
 import stat
 import re
@@ -49137,7 +49138,7 @@ class PidAliveWindowsProbe(unittest.TestCase):
         self.assertIn("WaitForSingleObject", win_block)
         self.assertNotIn("os.kill(int(pid), 0)", win_block)
         # The POSIX branch keeps the signal-0 probe.
-        self.assertIn("os.kill(int(pid), 0)", src[posix_def:])
+        self.assertIn("os.kill(pid, 0)", src[posix_def:])
 
 
 
@@ -51037,6 +51038,89 @@ class TestSessionReportLoop(ProjectDirMixin, unittest.TestCase):
             self.assertIsNone(ha.session_report(self.WORKDIR, state, "agent-x")["loop"])
         with mock.patch.object(ha, "_pane_status", return_value=(True, "auto", None)):
             self.assertEqual(ha.session_report(self.WORKDIR, state, "agent-x")["loop"], rep["loop"])
+
+
+class TestKillpgNeverHitsPidOne(unittest.TestCase):
+    """A mocked proc's pid coerces to 1 and killpg(1) is kill(-1), which SIGKILLs
+    every process the user owns — it took a whole host's agent and sessions down."""
+
+    def test_a_mocked_proc_is_never_killpg_d(self):
+        proc = mock.MagicMock()
+        self.assertEqual(operator.index(proc.pid), 1)   # the trap this guards
+        with mock.patch.object(ha.os, "killpg", create=True) as killpg:
+            ha.SessionManager._kill_attention_hint(proc)
+        killpg.assert_not_called()
+        proc.kill.assert_called_once()
+
+    def test_an_int_pid_of_one_or_less_is_never_killpg_d(self):
+        for bad in (1, 0, -1, True):
+            with self.subTest(pid=bad):
+                proc = mock.MagicMock()
+                proc.pid = bad
+                with mock.patch.object(ha.os, "killpg", create=True) as killpg:
+                    ha.SessionManager._kill_attention_hint(proc)
+                killpg.assert_not_called()
+
+    def test_signalable_pid(self):
+        for good, want in ((2, 2), (4242, 4242), ("4242", 4242), (" 77 ", 77)):
+            self.assertEqual(ha._signalable_pid(good), want)
+        for bad in (None, 0, 1, -1, "-1", "1", "", "x", 1.5, True, mock.MagicMock()):
+            with self.subTest(pid=bad):
+                self.assertIsNone(ha._signalable_pid(bad))
+
+    def test_a_persisted_ttyd_pid_of_minus_one_is_never_signalled(self):
+        sm = mock.MagicMock()
+        sm.ttyd = {}
+        for bad in (-1, "-1", 1, mock.MagicMock()):
+            with self.subTest(pid=bad):
+                sm._find.return_value = {"ttydPid": bad}
+                with mock.patch.object(ha.os, "kill") as kill, \
+                        mock.patch.object(ha, "IS_WINDOWS", False):
+                    ha.SessionManager._kill_ttyd(sm, "s1")
+                kill.assert_not_called()
+
+    BAD_PIDS = (-1, "-1", 1, "1", 0, True)
+
+    def test_pid_alive_never_probes_a_pid_that_names_no_single_process(self):
+        with mock.patch.object(ha.os, "kill") as kill, \
+                mock.patch.object(ha, "IS_WINDOWS", False):
+            for bad in self.BAD_PIDS + (mock.MagicMock(),):
+                with self.subTest(pid=bad):
+                    self.assertFalse(ha._pid_alive(bad))
+            kill.assert_not_called()
+        self.assertTrue(ha._pid_alive(os.getpid()))
+
+    def test_a_persisted_qwen_inbox_pid_of_minus_one_is_never_signalled(self):
+        sm = mock.MagicMock()
+        sm.qwen_peer_inboxes = {}
+        for bad in self.BAD_PIDS + (mock.MagicMock(),):
+            with self.subTest(pid=bad):
+                sm._find.return_value = {"qwenPeerInboxPid": bad}
+                with mock.patch.object(ha.os, "kill") as kill:
+                    ha.SessionManager._stop_qwen_peer_inbox(sm, "s1")
+                kill.assert_not_called()
+
+    def test_kill_and_await_ttyd_never_sigkills_a_bad_pid(self):
+        sm = mock.MagicMock()
+        for bad in self.BAD_PIDS:
+            with self.subTest(pid=bad):
+                proc = mock.MagicMock()
+                proc.pid = bad
+                proc.poll.return_value = None          # never exits
+                sm.ttyd = {"s1": proc}
+                with mock.patch.object(ha.os, "kill") as kill, \
+                        mock.patch.object(ha.time, "sleep"), \
+                        mock.patch.object(ha, "_pid_alive", return_value=True):
+                    ha.SessionManager._kill_and_await_ttyd(
+                        sm, {"id": "s1", "ttydPid": bad})
+                kill.assert_not_called()
+
+    def test_a_real_child_still_has_its_group_killed(self):
+        proc = mock.MagicMock()
+        proc.pid = 4242
+        with mock.patch.object(ha.os, "killpg", create=True) as killpg:
+            ha.SessionManager._kill_attention_hint(proc)
+        killpg.assert_called_once_with(4242, ha.signal.SIGKILL)
 
 
 class TestAttentionHints(ManagerMixin, unittest.TestCase):
