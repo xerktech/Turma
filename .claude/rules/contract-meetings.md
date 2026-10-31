@@ -26,6 +26,8 @@ ticket builds to this file; change it here first.
     `text` ≤2000, `startMs`/`endMs` offsets in ms from `startedAt`.
   - Text is code points with control/bidi characters removed (`meetingText`); a segment with no
     text is dropped.
+  - A wrong-typed or over-long `title`/`platform`, or an `endedAt` over a day ahead, is a 400 —
+    never silently cut or defaulted (XERK-2518). Segment/participant text is still capped.
 - Refusals in the hub's own words (XERK-264), checked in this order, none minting a store key:
   401 bad token → 404 an org no host is DECIDED into (`decidedOrgs`) → 413 body over
   `MEETING_BODY_MAX` (1 MiB) or too many segments → 400 a malformed field → 409 the store full

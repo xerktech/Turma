@@ -17511,6 +17511,14 @@ function meetingFromBody(body, now) {
     if (dbTime(body[k]) === null) return { error: `${k} must be epoch milliseconds` };
   }
   if (body.endedAt < body.startedAt) return { error: "endedAt is before startedAt" };
+  if (body.endedAt > now + 86400e3) return { error: "endedAt is in the future" };
+  // Refused, never silently cut or defaulted (XERK-2518).
+  if (body.title != null && (typeof body.title !== "string" || [...body.title].length > 300)) {
+    return { error: "title must be text of at most 300 characters" };
+  }
+  if (body.platform != null && (typeof body.platform !== "string" || [...body.platform].length > 40)) {
+    return { error: "platform must be text of at most 40 characters" };
+  }
   if (body.tenirUrl != null && (typeof body.tenirUrl !== "string" || !MEETING_URL_RE.test(body.tenirUrl))) {
     return { error: "tenirUrl must be an http(s) URL of at most 500 characters, with no quotes, spaces or brackets" };
   }

@@ -27463,7 +27463,7 @@ const meetHost2508 = (device, site, extra = {}) =>
 const meetCmds2508 = (device) =>
   ((agents[device] && agents[device].commands) || []).filter((c) => c.type === "extractMeeting");
 const meeting2508 = (id, extra = {}) => ({
-  meetingId: id, title: "Sprint\u0007 sync", platform: "Zoom", startedAt: 1.8e12, endedAt: 1.8e12 + 3.6e6,
+  meetingId: id, title: "Sprint\u0007 sync", platform: "Zoom", startedAt: 1.7e12, endedAt: 1.7e12 + 3.6e6,
   tenirUrl: "https://tenir.example/c/1", participants: ["Ann", "Bo", "Ann"],
   segments: [{ speaker: "Ann", text: "We should fix the login bug.", startMs: 1000, endMs: 4000 },
     { speaker: "Bo", text: "   ", startMs: 5000 }],
@@ -27491,6 +27491,11 @@ test("XERK-2508: POST /api/orgs/<site>/meetings is token-authed, org-checked, bo
     [meeting2508("m1", { startedAt: "soon" }), /startedAt/],
     [meeting2508("m1", { endedAt: 1 }), /endedAt/],
     [meeting2508("m1", { tenirUrl: "javascript:alert(1)" }), /tenirUrl/],
+    // XERK-2518: refused, never silently cut or defaulted.
+    [meeting2508("m1", { platform: "p".repeat(41) }), /platform/],
+    [meeting2508("m1", { title: { t: 1 } }), /title/],
+    [meeting2508("m1", { title: "t".repeat(301) }), /title/],
+    [meeting2508("m1", { startedAt: 9e15, endedAt: 9e15 }), /future/],
     [meeting2508("m1", { segments: [] }), /segments/],
     [meeting2508("m1", { segments: [{ text: "​ " }] }), /no segment carries any text/]]) {
     const r = await postMeeting2508(S, bad);
@@ -27505,6 +27510,9 @@ test("XERK-2508: POST /api/orgs/<site>/meetings is token-authed, org-checked, bo
   assert.equal(huge.status, 413);
   assert.equal(S in hub.getMeetings(), false);
   // Accepted: queued (no capable host), the transcript never answered back.
+  // An upper-case scheme is still an http(s) URL.
+  assert.equal((await postMeeting2508(S, meeting2508("m0", { tenirUrl: "HTTPS://tenir.example/c/0" }))).status, 200);
+  delete hub.getMeetings()[S];
   const ok = await postMeeting2508(S, meeting2508("m1"));
   assert.equal(ok.status, 200);
   const m = ok.body.meeting;
