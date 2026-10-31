@@ -141,6 +141,8 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
 - **A manager restart kills every live `_run_lockdown_oneshot` child's group** (`_oneshot_procs`,
   `_kill_oneshots` from `_handle_shutdown`, XERK-2545): `KillMode=process` and its own process
   group leave it running, and nothing adopts it. A new one-shot runner must register there too.
+  - A Popen in flight is counted (`_oneshot_launching`) and the shutdown waits for it, bounded by
+    `ONESHOT_LAUNCH_WAIT_SEC`; registering only after Popen returned missed a just-forked child.
 - **A saver's temp file opens through `_open_tmp_for_replace`**, never `open(tmp, "w")` (XERK-2545):
   `~/.turma` is session-writable, and a plain open writes through a link planted at the temp name.
 - `TURMA_ATTENTION_HINTS=0` turns the classifier off; dsh/qwen skip it (no Claude login assumed,

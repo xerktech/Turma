@@ -88,10 +88,15 @@ builder session + its agent-side tracker writes are XERK-723 (C); the operator U
   WHICH host, never around it); else the run HOLDS.
 - **Acked-no-session recovery** (`epicBuilderClaimLapsed`): a run still `queued` past
   `EPIC_BUILDER_REDISPATCH_MS` re-dispatches ONLY when its host provably never started it — the
-  command was never delivered (withdrawn first), the host is gone, or it acked and has beaten since
-  with no report. A host that took it and went SILENT keeps the claim until `EPIC_BUILDER_ORPHAN_MS`
-  (60m, past the agent's 45m builder timeout): re-dispatching then ran two builders for one idea,
-  since the agent's builder-id dedupe is per host (XERK-2545). Test: `XERK-2545:` in `server.test.js`.
+  command was never delivered, the host is gone, or it acked and has beaten since with no report.
+  A host that took it and went SILENT keeps the claim until `EPIC_BUILDER_ORPHAN_MS` (60m, past the
+  agent's 45m builder timeout): re-dispatching then ran two builders for one idea, since the
+  agent's builder-id dedupe is per host and in memory (XERK-2545).
+  - "Never delivered" is no `deliveredAt` OR no beat since the dispatch (`lastSeen < dispatchedAt`):
+    a hub restart stamps every restored command delivered, and only the beat test sees through it.
+  - **Every release withdraws the old host's command** (`withdrawEpicBuilderCommand`), delivered or
+    not: left queued it re-delivers on the host's return, and a restarted agent runs it again.
+  - Test: the `XERK-2545:` cases in `server.test.js`.
 
 ## Advancing the run — the per-agent heartbeat field
 

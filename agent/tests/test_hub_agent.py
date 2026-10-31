@@ -56319,6 +56319,26 @@ class TestOneshotShutdownAndTmpWrites(ManagerMixin, unittest.TestCase):
         else:
             self.fail("the one-shot's grandchild outlived the shutdown")
 
+    def test_a_shutdown_landing_inside_popen_still_kills_that_child(self):
+        sm = self.make_manager()
+        real_popen = ha.subprocess.Popen
+        killer = {}
+
+        def slow_popen(*a, **kw):
+            killer["t"] = threading.Thread(target=sm._kill_oneshots)
+            killer["t"].start()
+            time.sleep(0.2)              # the shutdown arrives mid-fork
+            proc = real_popen(*a, **kw)
+            killer["proc"] = proc
+            return proc
+        with mock.patch.object(ha.subprocess, "Popen", slow_popen):
+            out = sm._run_lockdown_oneshot(["sleep", "60"], "meeting-", 60, 100, "t")
+        killer["t"].join(5)
+        self.assertIsNone(out)
+        self.assertIsNotNone(killer["proc"].wait(timeout=5), "the just-forked child was killed")
+        # Once closing, no new one-shot starts at all.
+        self.assertIsNone(sm._run_lockdown_oneshot(["echo", "x"], "meeting-", 10, 100, "t"))
+
     def test_a_finished_oneshot_is_forgotten(self):
         sm = self.make_manager()
         self.assertEqual(sm._run_lockdown_oneshot(["echo", "hi"], "meeting-", 10, 100, "t"), "hi\n")

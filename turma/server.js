@@ -4772,7 +4772,12 @@ function ingestEpicBuilderStatus(hostKey, agent) {
 // and then went quiet may have a builder session running whose report is late, and
 // re-dispatching then ran two builders for one idea (the agent's per-host dedupe of
 // builder ids cannot see across hosts).
-//   - command still queued and never delivered: withdraw it, then yes;
+//   - command still queued and never delivered: yes. "Never delivered" is no
+//     `deliveredAt`, OR no beat since the dispatch (`lastSeen < dispatchedAt`):
+//     delivery rides a beat's reply, stamped in the same synchronous handler that
+//     set `lastSeen`, so a host that has not beaten since cannot have it — and a
+//     hub restart stamps every restored command delivered, which only this
+//     second test sees through (/alive only ever raises `lastSeen`, the safe way);
 //   - host gone from the registry: yes;
 //   - host took it (delivered or acked) and has beaten since the dispatch while
 //     still not reporting the builder: the agent acked without a session — yes;
@@ -4787,14 +4792,22 @@ function epicBuilderClaimLapsed(id, run, now) {
   const cmds = Array.isArray(a.commands) ? a.commands : [];
   const cmd = cmds.find((c) => c && typeof c === "object"
     && c.type === "spawnEpicBuilder" && c.builderId === id);
-  if (cmd && !("deliveredAt" in cmd)) {
-    if (!dropQueuedCommand(run.host, cmd.cmdId, "spawnEpicBuilder")) return false;
-    console.log(`epic builder: withdrew undelivered ${logName(id)} from ${logName(run.host)}`);
-    return true;
-  }
+  if (cmd && (!("deliveredAt" in cmd) || (a.lastSeen || 0) < (run.dispatchedAt || 0))) return true;
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
   if (!cmd && online && (a.lastSeen || 0) > (run.dispatchedAt || 0)) return true;
   return since > EPIC_BUILDER_ORPHAN_MS;
+}
+// Drop every queued spawnEpicBuilder for `id` from `host` (the caller is giving
+// that host's claim up). Best-effort: a host already gone has nothing queued.
+function withdrawEpicBuilderCommand(host, id) {
+  const a = agents[host];
+  if (!a || !Array.isArray(a.commands)) return;
+  for (const c of a.commands.filter((x) => x && typeof x === "object"
+    && x.type === "spawnEpicBuilder" && x.builderId === id)) {
+    if (dropQueuedCommand(host, c.cmdId, "spawnEpicBuilder")) {
+      console.log(`epic builder: withdrew ${logName(id)} from ${logName(host)}`);
+    }
+  }
 }
 function epicBuilderDriveSweep() {
   const ids = Object.keys(epicBuilders);
@@ -4816,6 +4829,10 @@ function epicBuilderDriveSweep() {
     // enough and never churns).
     if (run.host) {
       if (!epicBuilderClaimLapsed(id, run, now)) continue;
+      // Take the command back from the host being given up on, delivered or
+      // not: left queued it re-delivers when that host returns, and an agent
+      // whose restart lost its ack memory runs a second builder (XERK-2545).
+      withdrawEpicBuilderCommand(run.host, id);
       delete run.host; delete run.dispatchedAt; run.updatedAt = now;
       publishEpicBuilders();
     }
@@ -25389,6 +25406,7 @@ if (process.env.TURMA_TEST) {
     EPIC_BUILDER_STATES,
     EPIC_BUILDER_IDEA_MAX,
     EPIC_BUILDER_REDISPATCH_MS, EPIC_BUILDER_ORPHAN_MS, epicBuilderClaimLapsed,
+    withdrawEpicBuilderCommand,
     // XERK-636: the wave-dispatch driver + its readiness/state helpers, and the
     // per-child backoff map (XERK-61/109 hot-loop guard).
     epicRunDriveSweep,

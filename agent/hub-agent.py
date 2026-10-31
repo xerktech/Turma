@@ -15319,6 +15319,10 @@ ATTENTION_HINTS_ON = os.environ.get("TURMA_ATTENTION_HINTS", "1").strip() != "0"
 ATTENTION_HINT_MODEL = (os.environ.get("TURMA_ATTENTION_HINT_MODEL", "haiku").strip()
                         or "haiku")
 ATTENTION_HINT_TIMEOUT_SEC = _env_int("TURMA_ATTENTION_HINT_TIMEOUT_SEC", 60, minimum=5)
+# How long a shutdown waits for a one-shot Popen already in flight to register
+# its child, so the child is killed with the rest (XERK-2545). A fork+exec.
+ONESHOT_LAUNCH_WAIT_SEC = 2.0
+
 # Every `_run_lockdown_oneshot` prefix (plus the meeting worker's), swept at
 # manager start: a manager killed mid-run never removes its scratch.
 ONESHOT_SCRATCH_PREFIXES = ("attention-hint-", "daily-brief-", "meeting-")
@@ -17935,8 +17939,10 @@ def _open_tmp_for_replace(tmp, encoding=None, newline=None):
         os.unlink(tmp)
     except FileNotFoundError:
         pass
+    # O_BINARY (Windows only): else the C runtime turns "\n" into "\r\n" under
+    # Python's own newline handling, and peers.tsv is byte-identical on every OS.
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                 | getattr(os, "O_NOFOLLOW", 0), 0o666)
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0), 0o666)
     return os.fdopen(fd, "w", encoding=encoding, newline=newline)
 
 
@@ -28140,7 +28146,9 @@ class SessionManager:
         # attention hint): each leads its own process group, so KillMode=process
         # leaves it running past a restart. `_handle_shutdown` kills them (XERK-2545).
         self._oneshot_procs = set()
-        self._oneshot_lock = threading.Lock()
+        self._oneshot_cond = threading.Condition()
+        self._oneshot_launching = 0      # Popen calls not yet registered
+        self._oneshot_closing = False    # set by _kill_oneshots: kill on register
         # Extra clone sources (XERK-155), keyed by source ("azure"/"gitlab"),
         # present only when that source's creds are configured. Each holds the
         # last GOOD listing (repos keep their internal cloneUrl; the payload
@@ -44071,6 +44079,12 @@ class SessionManager:
         outf = os.fdopen(fd, "w+b")
         proc = None
         try:
+            # Counted as launching across the Popen so a shutdown landing inside
+            # it waits for the child to register (never misses a just-forked one).
+            with self._oneshot_cond:
+                if self._oneshot_closing:
+                    return None
+                self._oneshot_launching += 1
             try:
                 proc = subprocess.Popen(argv, stdin=inf if inf is not None else subprocess.DEVNULL,
                                         stdout=outf,
@@ -44079,8 +44093,16 @@ class SessionManager:
             except OSError as e:
                 log(f"{what} launch failed: {e}")
                 return None
-            with self._oneshot_lock:
-                self._oneshot_procs.add(proc)
+            finally:
+                with self._oneshot_cond:
+                    self._oneshot_launching -= 1
+                    if proc is not None:
+                        self._oneshot_procs.add(proc)
+                    closing = self._oneshot_closing
+                    self._oneshot_cond.notify_all()
+            if closing:
+                self._kill_oneshot_proc(proc)
+                return None
             try:
                 rc = proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -44098,7 +44120,7 @@ class SessionManager:
             return raw.decode("utf-8", "replace")
         finally:
             if proc is not None:
-                with self._oneshot_lock:
+                with self._oneshot_cond:
                     self._oneshot_procs.discard(proc)
             try:
                 outf.close()
@@ -45362,18 +45384,31 @@ class SessionManager:
     def _kill_oneshots(self):
         """Kill every live `_run_lockdown_oneshot` child's process group.
         Called from _handle_shutdown (XERK-2545). No wait: the manager is
-        exiting, and SIGKILL to the group needs none. Best-effort; never raises."""
-        with self._oneshot_lock:
-            procs = list(self._oneshot_procs)
-        killpg = getattr(os, "killpg", None)
+        exiting, and SIGKILL to the group needs none. A Popen still in flight is
+        waited for (bounded) so its child registers first; one launched after
+        this sees `_oneshot_closing` and is never started. Best-effort; never raises."""
+        try:
+            with self._oneshot_cond:
+                self._oneshot_closing = True
+                self._oneshot_cond.wait_for(lambda: self._oneshot_launching == 0,
+                                            timeout=ONESHOT_LAUNCH_WAIT_SEC)
+                procs = list(self._oneshot_procs)
+        except Exception:
+            return
         for proc in procs:
-            try:
-                if killpg is not None:
-                    killpg(proc.pid, signal.SIGKILL)
-                else:
-                    proc.kill()
-            except Exception:
-                pass
+            self._kill_oneshot_proc(proc)
+
+    @staticmethod
+    def _kill_oneshot_proc(proc):
+        """SIGKILL a one-shot's process group (its own child on Windows)."""
+        killpg = getattr(os, "killpg", None)
+        try:
+            if killpg is not None:
+                killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except Exception:
+            pass
 
     def _staging_recent_mtime(self, path, cap=2000):
         """Newest mtime anywhere under a clone staging dir (XERK-374), for the
