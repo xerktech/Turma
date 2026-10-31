@@ -4374,19 +4374,42 @@ function sanitizeMeetingItem(v, i) {
   if (repo) out.repoGuess = repo;
   return out;
 }
-// The item list a row keeps: each item re-whitelisted, renumbered p1..pN, and
-// cut once its JSON passes MEETING_ITEMS_BYTES_MAX — a settled row is kept for
-// MEETINGS_KEEP meetings and the store is written whole.
+// The item list a row keeps: each item re-whitelisted and renumbered p1..pN,
+// its JSON held to MEETING_ITEMS_BYTES_MAX — a settled row is kept for
+// MEETINGS_KEEP meetings and the store is written whole. Over the budget, the
+// descriptions and quotes are shortened (ending "…") by the least that fits, so
+// no item is lost to length; only one that cannot fit even then is dropped.
+const meetingItemsBytes = (items) => Buffer.byteLength(JSON.stringify(items));
+// A cut that is not SMALLER in bytes keeps the text ("ab" → "…" grows it), so the
+// list's size only grows with the cap and the bisection below finds the least cut.
+function meetingCut(v, max) {
+  if (cpPrefix(v, max + 1) === cpPrefix(v, max)) return v;
+  const cut = `${cpPrefix(v, max - 1).trimEnd()}…`;
+  return Buffer.byteLength(JSON.stringify(cut)) < Buffer.byteLength(JSON.stringify(v)) ? cut : v;
+}
+// `cap` (1..4000) bounds a description; a quote gets an eighth of it (40..500).
+function shrinkMeetingItem(it, cap) {
+  const quoteCap = Math.max(40, Math.min(500, cap >> 3));
+  return { ...it, description: meetingCut(it.description, cap),
+    quotes: it.quotes.map((q) => ({ ...q, text: meetingCut(q.text, quoteCap) })) };
+}
 function sanitizeMeetingItems(list) {
-  const out = [];
-  let bytes = 0;
+  let out = [];
   for (const raw of list.slice(0, MEETING_ITEMS_MAX * 2)) {
+    if (out.length >= MEETING_ITEMS_MAX) break;
     const it = sanitizeMeetingItem(raw, out.length);
-    if (!it) continue;
-    bytes += Buffer.byteLength(JSON.stringify(it));
-    if (out.length >= MEETING_ITEMS_MAX || bytes > MEETING_ITEMS_BYTES_MAX) break;
-    out.push(it);
+    if (it) out.push(it);
   }
+  if (meetingItemsBytes(out) <= MEETING_ITEMS_BYTES_MAX) return out;
+  let lo = 1;
+  let hi = 4000;   // the largest cap that fits, by bisection (size grows with it)
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (meetingItemsBytes(out.map((it) => shrinkMeetingItem(it, mid))) <= MEETING_ITEMS_BYTES_MAX) lo = mid;
+    else hi = mid - 1;
+  }
+  out = out.map((it) => shrinkMeetingItem(it, lo));
+  while (meetingItemsBytes(out) > MEETING_ITEMS_BYTES_MAX) out.pop();
   return out;
 }
 function sanitizeMeeting(v) {

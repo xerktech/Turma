@@ -148,6 +148,9 @@ ticket builds to this file; change it here first.
   the command rides the host record (state.json, 30s debounce) while the row is written at once,
   so a hub killed right after a fire booted with the row and no command, and the meeting got no
   brief. Same runId and `sentAt`; the agent runs a re-delivered runId once.
+- **A re-delivered runId the agent already answered is answered again** (`_dbrief_answered`, the
+  last `DAILY_BRIEF_RESULTS_MAX` rows; XERK-2524): a hub killed after the result beat but before its
+  write re-sends the command, and a silent drop left the row waiting out the 10-min timeout.
 - A scheduled fire with no capable host mints ONE `failed` row saying why (above).
 - The served map is null-prototype, so an org named `__proto__` is served (XERK-1451).
 - `POST /api/orgs/<siteKey>/daily-brief/run` (operator-authed) = Run now, ignores `enabled`, no

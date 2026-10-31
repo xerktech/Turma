@@ -27669,6 +27669,49 @@ test("XERK-2508: the whitelist, the capability block and the store bound", () =>
   assert.equal(Object.getPrototypeOf(hub.meetingsCoerce({ __proto__: null })), null);
 });
 
+test("XERK-2524: an over-budget item list is shortened to fit, never silently cut", () => {
+  const row = { meetingId: "w1", title: "t", platform: "teams", startedAt: 1, endedAt: 2, receivedAt: 3,
+    status: "ok", generatedAt: 4 };
+  // 30 items at the agent parser's limits: 4000-char descriptions, 5 quotes of 500.
+  const quote = (j) => ({ speaker: "s".repeat(100), text: `${j}${"q".repeat(499)}`, atMs: j });
+  const items = Array.from({ length: 30 }, (_, i) => ({ kind: "task", title: `t${i}`,
+    description: "d".repeat(4000), quotes: [0, 1, 2, 3, 4].map(quote) }));
+  const kept = hub.sanitizeMeeting({ ...row, items });
+  assert.equal(kept.items.length, 30);
+  assert.ok(Buffer.byteLength(JSON.stringify(kept.items)) <= 64 << 10);
+  assert.ok(kept.items.every((it) => it.description.endsWith("…") && it.quotes.length === 5
+    && it.quotes.every((q) => q.text.endsWith("…"))));
+  // Shortened by the least that fits, not to nothing.
+  assert.ok(kept.items.every((it) => [...it.description].length > 100));
+  assert.ok(Buffer.byteLength(JSON.stringify(kept.items)) > (64 << 10) - 30 * 64);
+  // A coerce fixed point: the store restores it unchanged.
+  assert.deepEqual(hub.sanitizeMeeting(kept), kept);
+  // A cut that would GROW a short text keeps it ("ab" -> "…" is a byte longer), so the size only
+  // grows with the cap: near the budget the old cut rewrote every description and lost an item.
+  const E = "\u{1F600}";
+  const near = Array.from({ length: 30 }, (_, i) => ({ kind: "task",
+    title: i === 0 ? "x".repeat(199) : E.repeat(200), suggestedAssignee: E.repeat(100),
+    repoGuess: E.repeat(200), due: E.repeat(40),
+    description: i === 0 ? "long description here" : i <= 19 ? "ab" : "abc",
+    quotes: [{ speaker: E.repeat(i < 14 ? 11 : 10), text: "q" }] }));
+  const fits = hub.sanitizeMeeting({ ...row, items: near });
+  assert.equal(fits.items.length, 28);
+  assert.ok(fits.items.slice(1).every((it) => it.description === "ab" || it.description === "abc"));
+  assert.ok(Buffer.byteLength(JSON.stringify(fits.items)) <= 64 << 10);
+  assert.deepEqual(hub.sanitizeMeeting(fits), fits);
+  // A list that fits is untouched.
+  const small = items.slice(0, 2);
+  assert.deepEqual(hub.sanitizeMeeting({ ...row, items: small }).items.map((it) => it.description),
+    ["d".repeat(4000), "d".repeat(4000)]);
+  // Past what any cap can fit (wide characters in every field), whole items go last-first.
+  const wide = Array.from({ length: 30 }, () => ({ kind: "task", title: "\u{1F600}".repeat(200),
+    suggestedAssignee: "\u{1F600}".repeat(100), repoGuess: "\u{1F600}".repeat(200),
+    description: "x", quotes: [0, 1, 2, 3, 4].map(() => ({ speaker: "\u{1F600}".repeat(100), text: "q" })) }));
+  const cut = hub.sanitizeMeeting({ ...row, items: wide });
+  assert.ok(cut.items.length < 30 && Buffer.byteLength(JSON.stringify(cut.items)) <= 64 << 10);
+  assert.deepEqual(hub.sanitizeMeeting(cut), cut);
+});
+
 test("XERK-2508 QA: a drifted host is refused, the fleet caps hold, and an empty list is an answer", async () => {
   const S = "mtQ2508.atlassian.net";
   const O = "mtQo2508.atlassian.net";
@@ -27695,7 +27738,8 @@ test("XERK-2508 QA: a drifted host is refused, the fleet caps hold, and an empty
   const restored = hub.sanitizeMeeting({ ...row, model: "<script>", items: Array.from({ length: 30 },
     () => ({ kind: "task", title: "t", description: "d".repeat(4000) })) });
   assert.equal("model" in restored, false);
-  assert.ok(restored.items.length < 30 && Buffer.byteLength(JSON.stringify(restored.items)) <= 64 << 10);
+  assert.ok(restored.items.length === 30 && Buffer.byteLength(JSON.stringify(restored.items)) <= 64 << 10);
+  assert.ok(restored.items.every((it) => it.description.endsWith("…")));
   const many = hub.sanitizeMeeting({ ...row, items: Array.from({ length: 35 }, (_, i) => ({ kind: "task", title: `t${i}` })) });
   assert.deepEqual([many.items.length, many.items[29].id], [30, "p30"]);
   // Fleet-wide: 20 pending meetings across orgs, then 429.

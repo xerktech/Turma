@@ -15319,6 +15319,10 @@ ATTENTION_HINTS_ON = os.environ.get("TURMA_ATTENTION_HINTS", "1").strip() != "0"
 ATTENTION_HINT_MODEL = (os.environ.get("TURMA_ATTENTION_HINT_MODEL", "haiku").strip()
                         or "haiku")
 ATTENTION_HINT_TIMEOUT_SEC = _env_int("TURMA_ATTENTION_HINT_TIMEOUT_SEC", 60, minimum=5)
+# Every `_run_lockdown_oneshot` prefix (plus the meeting worker's), swept at
+# manager start: a manager killed mid-run never removes its scratch.
+ONESHOT_SCRATCH_PREFIXES = ("attention-hint-", "daily-brief-", "meeting-")
+ONESHOT_SCRATCH_SUFFIXES = (".in", ".out")
 # The classifier's input is the session's OWN text (its question, its tail), which
 # repo content and tool output can steer, so the one-shot runs with NO tool and NO
 # MCP server: it only has to print one JSON object. The equals form on purpose —
@@ -28039,6 +28043,9 @@ class SessionManager:
         self._dbrief_worker = None
         self._dbrief_wants = {}
         self._dbrief_seen = deque(maxlen=DAILY_BRIEF_RUN_IDS_SEEN)
+        # runId -> the last few answered rows, re-staged for a command the hub
+        # re-sends after losing the delivered answer (a crash before its write).
+        self._dbrief_answered = {}
         self.daily_brief_results = []
         # Meeting extraction (XERK-2509), the daily brief's shape: `_meeting_wants`
         # (runId -> owed job, oldest first) goes to ONE worker
@@ -28050,6 +28057,9 @@ class SessionManager:
         self._meeting_worker = None
         self._meeting_wants = {}
         self._meeting_seen = deque(maxlen=MEETING_RUN_IDS_SEEN)
+        # runId -> the last few answered rows, for a command re-sent after the
+        # hub lost the delivered answer (as `_dbrief_answered`).
+        self._meeting_answered = {}
         self.meeting_results = []
         # The permission judge (XERK-1566). `permission_policy` is the org's
         # policy text off the last heartbeat reply — written by the BEAT
@@ -43473,7 +43483,16 @@ class SessionManager:
             return
         with self._dbrief_lock:
             if job["runId"] in self._dbrief_seen:
-                return  # a re-delivered command: queued, running or answered already
+                # A re-delivered command: queued or running is answered when done;
+                # an answer already carried is staged again (the hub drops it
+                # unless that run is still waiting on this host).
+                row = self._dbrief_answered.get(job["runId"])
+                if row is not None and not any(r is row for r in self.daily_brief_results):
+                    if len(self.daily_brief_results) < DAILY_BRIEF_RESULTS_MAX:
+                        self.daily_brief_results.append(row)
+                    else:
+                        log(f"daily brief: outbox full; run {job['runId']} re-sent, its answer not re-staged")
+                return
             self._dbrief_seen.append(job["runId"])
             if not error:
                 old = self._dbrief_wants.get(job["siteKey"])
@@ -43577,6 +43596,9 @@ class SessionManager:
         else:
             row["error"] = (error or "failed")[:DAILY_BRIEF_ERROR_MAX]
         with self._dbrief_lock:
+            self._dbrief_answered[job["runId"]] = row
+            while len(self._dbrief_answered) > DAILY_BRIEF_RESULTS_MAX:
+                del self._dbrief_answered[next(iter(self._dbrief_answered))]
             self.daily_brief_results.append(row)
             over = len(self.daily_brief_results) - DAILY_BRIEF_RESULTS_MAX
             if over > 0:
@@ -43596,6 +43618,14 @@ class SessionManager:
             return
         with self._meeting_lock:
             if job["runId"] in self._meeting_seen:
+                # Re-delivered: an answer already carried is staged again (the
+                # hub lost it, e.g. killed before its write; it drops a stale one).
+                row = self._meeting_answered.get(job["runId"])
+                if row is not None and not any(r is row for r in self.meeting_results):
+                    if len(self.meeting_results) < MEETING_RESULTS_MAX:
+                        self.meeting_results.append(row)
+                    else:
+                        log(f"meeting: outbox full; run {job['runId']} re-sent, its answer not re-staged")
                 return
             self._meeting_seen.append(job["runId"])
             if not error:
@@ -43624,10 +43654,8 @@ class SessionManager:
 
     def _meeting_worker_loop(self):
         """Extract owed meetings one at a time. Wake cleared BEFORE the queue is
-        read, so a command staged mid-run is kept. First drops the prompt/reply
-        files a killed manager left (a `.in` holds a whole meeting): none is in
-        use, since this is the only worker that writes them."""
-        self._sweep_meeting_scratch()
+        read, so a command staged mid-run is kept. A killed manager's scratch
+        (a `.in` holds a whole meeting) is swept at start (`_sweep_oneshot_scratch`)."""
         while True:
             self._meeting_wake.wait()
             self._meeting_wake.clear()
@@ -43641,17 +43669,6 @@ class SessionManager:
                 except Exception as e:
                     items, error = None, f"extraction failed: {type(e).__name__}: {e}"
                 self._meeting_push(job, items=items, error=error)
-
-    @staticmethod
-    def _sweep_meeting_scratch():
-        try:
-            for name in os.listdir(REGISTRY_DIR):
-                if name.startswith("meeting-") and name.endswith((".in", ".out")):
-                    path = os.path.join(REGISTRY_DIR, name)
-                    if os.path.isfile(path) and not os.path.islink(path):
-                        os.remove(path)
-        except OSError as e:
-            log(f"meeting: scratch sweep failed: {e}")
 
     def _fetch_meeting_transcript(self, run_id):
         """OFF THE BEAT: GET the run's transcript from the hub (agent-authed,
@@ -43757,6 +43774,9 @@ class SessionManager:
         else:
             row["error"] = (error or "failed")[:MEETING_ERROR_MAX]
         with self._meeting_lock:
+            self._meeting_answered[job["runId"]] = row
+            while len(self._meeting_answered) > MEETING_RESULTS_MAX:
+                del self._meeting_answered[next(iter(self._meeting_answered))]
             self.meeting_results.append(row)
             over = len(self.meeting_results) - MEETING_RESULTS_MAX
             if over > 0:
@@ -43968,6 +43988,26 @@ class SessionManager:
                 os.remove(path)
             except OSError:
                 pass
+
+    @staticmethod
+    def _sweep_oneshot_scratch():
+        """At manager start, before any worker runs: drop the reply files a
+        killed manager left mid one-shot (`_run_lockdown_oneshot` removes its own
+        only when it returns). None can be in use yet. Regular files only."""
+        try:
+            names = os.listdir(REGISTRY_DIR)
+        except OSError:
+            return
+        for name in names:
+            if not (name.startswith(ONESHOT_SCRATCH_PREFIXES)
+                    and name.endswith(ONESHOT_SCRATCH_SUFFIXES)):
+                continue
+            path = os.path.join(REGISTRY_DIR, name)
+            try:
+                if os.path.isfile(path) and not os.path.islink(path):
+                    os.remove(path)
+            except OSError as e:
+                log(f"one-shot scratch sweep: {name}: {e}")
 
     @staticmethod
     def _kill_attention_hint(proc):
@@ -49169,6 +49209,7 @@ class SessionManager:
         # bring us back. Must be set on the main thread, like SIGUSR1 above.
         signal.signal(signal.SIGTERM, self._handle_shutdown)
         signal.signal(signal.SIGINT, self._handle_shutdown)
+        self._sweep_oneshot_scratch()
         # Load the bundled tmux config into the shared server BEFORE any session
         # launches or `resume_on_boot` adopts — otherwise the whole config (the
         # mouse-wheel scroll routing especially) silently never applies, since the

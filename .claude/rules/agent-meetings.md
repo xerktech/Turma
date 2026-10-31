@@ -45,9 +45,11 @@ Wire: `contract-meetings.md`. Model decision and eval: `docs/meeting-items-adr.m
   board (`meetings.available`); the siteKey must be this host's board, else `failed`.
 - The transcript GET has a HARD deadline over the whole read (`read1` chunks), not just a
   per-socket timeout: a trickling peer otherwise held the one worker for minutes.
-- The worker sweeps `meeting-*.in/.out` at start: a killed manager left a whole meeting there.
-- A re-delivered runId runs once (`_meeting_seen`); an unusable command that names a run is
-  answered `failed`. The outbox is cleared BY IDENTITY once a beat carried it.
+- `meeting-*.in/.out` are swept at manager start (`ONESHOT_SCRATCH_PREFIXES`): a killed manager
+  left a whole meeting there.
+- A re-delivered runId runs once (`_meeting_seen`); one already answered re-stages its held row
+  (`_meeting_answered`, XERK-2524). An unusable command that names a run is answered `failed`.
+  The outbox is cleared BY IDENTITY once a beat carried it.
 - Tests: `TestMeetingItems`, `TestMeetingDuplicates`, `TestMeetingWorker` (the fixture
   `meeting_transcript.json` = `bench/meeting-items/corpus/sprint-planning.json`),
   `TestMeetingFetchAndScratch`, `TestLockdownOneshotStdin`.
