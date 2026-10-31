@@ -269,6 +269,55 @@ test("XERK-2530: concurrent local sign-ins past the cap are told to retry; break
   assert.deepEqual(glass.map((r) => r.status), Array(8).fill(200));
 });
 
+// ---- XERK-2577: break-glass guesses share the per-client backoff ------------
+
+const glassFrom = (client, password) =>
+  request("POST", "/api/login", { headers: { "cf-connecting-ip": client }, body: { username: "glass", password } });
+const basicFrom = (client, password, path = "/api/agents") =>
+  request("GET", path, { headers: {
+    "cf-connecting-ip": client,
+    authorization: `Basic ${Buffer.from(`glass:${password}`).toString("base64")}`,
+  } });
+
+test("XERK-2577: break-glass misses back off that client; the right password waits too", async () => {
+  for (let i = 0; i < 5; i++) assert.equal((await glassFrom("198.51.100.20", "guess")).status, 401, `miss ${i}`);
+  const held = await glassFrom("198.51.100.20", "glass-pass");
+  assert.equal(held.status, 429, "a backed-off client learns nothing, not even from the right password");
+  assert.ok(Number(held.headers["retry-after"]) >= 1, held.headers["retry-after"]);
+  // Another client is never locked out by that one.
+  assert.equal((await glassFrom("198.51.100.21", "glass-pass")).status, 200);
+});
+
+test("XERK-2577: a concurrent burst of break-glass guesses is counted, not slipped past", async () => {
+  const burst = await Promise.all(Array.from({ length: 40 }, () => glassFrom("198.51.100.30", "guess")));
+  const codes = burst.map((r) => r.status);
+  assert.ok(codes.filter((c) => c === 429).length >= 30, codes.join());
+  assert.equal((await glassFrom("198.51.100.30", "glass-pass")).status, 429);
+});
+
+test("XERK-2577: a break-glass miss counts once, and a success clears the count", async () => {
+  for (let i = 0; i < 4; i++) assert.equal((await glassFrom("198.51.100.40", "guess")).status, 401);
+  assert.equal((await glassFrom("198.51.100.40", "glass-pass")).status, 200, "four misses are still free");
+  for (let i = 0; i < 4; i++) assert.equal((await glassFrom("198.51.100.40", "guess")).status, 401, `after reset ${i}`);
+});
+
+test("XERK-2577: Basic auth draws on the same budget, one count per request", async () => {
+  assert.equal((await basicFrom("198.51.100.50", "glass-pass")).status, 200);
+  for (let i = 0; i < 5; i++) assert.equal((await basicFrom("198.51.100.50", "guess")).status, 401, `miss ${i}`);
+  assert.equal((await basicFrom("198.51.100.50", "glass-pass")).status, 401, "backed off: refused");
+  assert.equal((await glassFrom("198.51.100.50", "glass-pass")).status, 429, "the form shares it");
+  assert.equal((await basicFrom("198.51.100.51", "glass-pass")).status, 200, "another client is unaffected");
+  // A request that asks for its principal twice records one miss, not two.
+  const req = { headers: { "cf-connecting-ip": "198.51.100.52",
+    authorization: `Basic ${Buffer.from("glass:guess").toString("base64")}` }, socket: { remoteAddress: "127.0.0.1" } };
+  for (let i = 0; i < 4; i++) {
+    const r = { ...req, headers: { ...req.headers } };
+    assert.equal(hub.requestPrincipal(r), null);
+    assert.equal(hub.requestPrincipal(r), null);
+  }
+  assert.equal((await basicFrom("198.51.100.52", "glass-pass")).status, 200, "four requests, four misses: still free");
+});
+
 // ---- OIDC converges on the same principal -----------------------------------
 
 test("XERK-2530: an OIDC login becomes a hub user with its own tenant; disabled gets none", () => {

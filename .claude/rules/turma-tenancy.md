@@ -72,6 +72,14 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     buys it queue places (bounded by `LOGIN_QUEUE_MAX`, so ~18 keys 503 others), not more scrypt.
 - `parseHash` refuses a stored cost past `SCRYPT_MAXMEM`: a hand-edited store must not OOM a login.
 - **`/api/login` checks break-glass FIRST, scrypt-free**, so a flood cannot lock break-glass out.
+- Break-glass guesses share XERK-2568's per-(client, username) backoff (XERK-2577), via
+  `breakGlassAttempt`, for `/api/login` AND Basic — one budget, so neither channel is a free oracle.
+  - Backoff is checked BEFORE the compare: a backed-off client gets 429 (Basic: 401) even when the
+    password is right. Accepted cost: an operator who mistypes it 5 times waits.
+  - The miss is recorded synchronously, before any await — a concurrent burst cannot outrun it.
+  - Basic caches its verdict per `req` (`basicVerdicts`): routes ask more than once per request.
+  - A `/api/login` break-glass miss still runs the local scrypt check (shared name, no timing tell
+    for which name is break-glass), passed `counted` so it is not recorded twice.
 - An unknown username verifies against a dummy hash (same cost, no timing oracle); every failure is
   the same 401 `invalid credentials` (no enumeration of disabled/role-less users).
 - Basic auth is break-glass ONLY — never check a local password per request.
@@ -97,5 +105,6 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   process, bootstrap admin ONLY — the forgery / empty-Basic / dummy-hash / mid-verify-disable guards);
   `XERK-2530:` in `oidc-groups.test.js` and `server.test.js` (an OIDC user leaves an open hub open).
 - Fair sign-in: the `XERK-2568:` cases in `tenancy-nopassword.test.js`.
+- Break-glass throttle: the `XERK-2577:` cases in `tenancy.test.js`.
 - Android signs in through `POST /api/login` and rides `hub_session` (XERK-2569), so local accounts
   work there too; Basic stays its break-glass fallback (`android/PARITY.md`).

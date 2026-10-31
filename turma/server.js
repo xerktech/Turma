@@ -13321,10 +13321,36 @@ function requestPrincipal(req) {
   // password is never checked per request (a scrypt per call would be a DoS).
   const header = req.headers.authorization || "";
   if (!TURMA_PASSWORD || !header.startsWith("Basic ")) return null;
+  // Routes may ask more than once per request; a miss must count once.
+  if (basicVerdicts.has(req)) return basicVerdicts.get(req);
   const decoded = Buffer.from(header.slice(6), "base64").toString();
   const sep = decoded.indexOf(":");
-  if (sep < 0) return null;
-  return credentialsMatch(decoded.slice(0, sep), decoded.slice(sep + 1)) ? BREAKGLASS_PRINCIPAL : null;
+  const verdict = sep < 0 ? null : breakGlassAttempt(loginClientKey(req), decoded.slice(0, sep), decoded.slice(sep + 1));
+  const principal = verdict === true ? BREAKGLASS_PRINCIPAL : null;
+  basicVerdicts.set(req, principal);
+  return principal;
+}
+const basicVerdicts = new WeakMap(); // req -> the Basic principal (or null) already decided
+
+// One break-glass guess (XERK-2577), shared by /api/login and Basic so both draw
+// on ONE per-(client, username) failure budget — XERK-2568's backoff. Before it,
+// break-glass was evaluated unthrottled (~2.6k guesses/s per client). Still
+// scrypt-free, and keyed on the client, so another client's flood can never back
+// the operator off; the cost is that an operator who mistypes it
+// LOGIN_FAIL_FREE times waits. Returns true (match), false (miss, recorded), or
+// the seconds left in a backoff — checked BEFORE the compare, so a backed-off
+// client learns nothing, not even from the right password.
+// The miss is recorded synchronously, before any await, so concurrent guesses
+// from one client cannot all slip in ahead of the backoff.
+function breakGlassAttempt(clientKey, username, password, now = Date.now()) {
+  const wait = loginBackoffMs(clientKey, username, now);
+  if (wait) return Math.ceil(wait / 1000);
+  if (credentialsMatch(username, password)) {
+    loginFailures.delete(loginFailureKey(clientKey, username));
+    return true;
+  }
+  recordLoginFailure(clientKey, username, now);
+  return false;
 }
 
 // Browser/user auth (UI + all API except the heartbeat): any signed-in principal.
@@ -13433,19 +13459,21 @@ function recordLoginFailure(clientKey, username, now) {
   while (loginFailures.size > LOGIN_FAIL_TRACK_MAX) loginFailures.delete(loginFailures.keys().next().value);
 }
 
-async function localLogin(username, password, now = Date.now(), clientKey = "local") {
-  const wait = loginBackoffMs(clientKey, username, now);
+// `counted`: this attempt's failure is already recorded and its backoff already
+// checked (a break-glass miss, breakGlassAttempt) — don't do either twice.
+async function localLogin(username, password, now = Date.now(), clientKey = "local", counted = false) {
+  const wait = counted ? 0 : loginBackoffMs(clientKey, username, now);
   if (wait) return { throttled: Math.ceil(wait / 1000) };
   if (loginClientsInflight.has(clientKey)) return { busy: true };
   loginClientsInflight.add(clientKey);
   try {
-    return await localLoginVerify(username, password, clientKey, now);
+    return await localLoginVerify(username, password, clientKey, now, counted);
   } finally {
     loginClientsInflight.delete(clientKey);
   }
 }
 
-async function localLoginVerify(username, password, clientKey, now) {
+async function localLoginVerify(username, password, clientKey, now, counted) {
   const user = tenancy.findLocalUser(tenancyState, username);
   const hash = (user && user.passwordHash) || tenancy.dummyPasswordHash();
   if (!(await acquireLoginSlot())) return { busy: true };
@@ -13459,7 +13487,7 @@ async function localLoginVerify(username, password, clientKey, now) {
   }
   // Stamped after the verify, so the clock is when the failure was learned.
   if (!ok || !user) {
-    recordLoginFailure(clientKey, username, Date.now());
+    if (!counted) recordLoginFailure(clientKey, username, Date.now());
     return {};
   }
   loginFailures.delete(loginFailureKey(clientKey, username));
@@ -20527,21 +20555,32 @@ const server = http.createServer(async (req, res) => {
       let token;
       if (!authEnabled()) {
         token = issueSessionToken(); // an open hub: no credential to check
-      } else if (TURMA_PASSWORD && credentialsMatch(username, password)) {
-        // Break-glass (XERK-595) first and scrypt-free, so it works under a flood.
-        token = issueSessionToken(SESSION_TTL_MS, principalClaims(BREAKGLASS_PRINCIPAL));
       } else {
-        const r = await localLogin(username, password, Date.now(), loginClientKey(req));
-        if (r.throttled) {
-          res.setHeader("Retry-After", String(r.throttled));
-          return json(res, 429, { error: "too many failed sign-ins — try again later" });
+        const clientKey = loginClientKey(req);
+        // Break-glass (XERK-595) first and scrypt-free, so it works under another
+        // client's flood — but throttled per client (XERK-2577). Only a guess at
+        // the break-glass username is one; any other name is a plain local login.
+        const bg = TURMA_PASSWORD && safeEqual(username, TURMA_USER)
+          ? breakGlassAttempt(clientKey, username, password) : null;
+        if (bg === true) {
+          token = issueSessionToken(SESSION_TTL_MS, principalClaims(BREAKGLASS_PRINCIPAL));
+        } else {
+          // A break-glass miss still runs the local check — a local account may
+          // share the name, and the scrypt keeps the miss as slow as any other
+          // (no timing tell for which name is break-glass) — but it is counted once.
+          const r = typeof bg === "number" ? { throttled: bg }
+            : await localLogin(username, password, Date.now(), clientKey, bg === false);
+          if (r.throttled) {
+            res.setHeader("Retry-After", String(r.throttled));
+            return json(res, 429, { error: "too many failed sign-ins — try again later" });
+          }
+          if (r.busy) {
+            res.setHeader("Retry-After", "1");
+            return json(res, 503, { error: "too many sign-ins in progress — try again in a moment" });
+          }
+          if (!r.principal) return json(res, 401, { error: "invalid credentials" });
+          token = issueSessionToken(SESSION_TTL_MS, principalClaims(r.principal));
         }
-        if (r.busy) {
-          res.setHeader("Retry-After", "1");
-          return json(res, 503, { error: "too many sign-ins in progress — try again in a moment" });
-        }
-        if (!r.principal) return json(res, 401, { error: "invalid credentials" });
-        token = issueSessionToken(SESSION_TTL_MS, principalClaims(r.principal));
       }
       res.writeHead(200, {
         "Content-Type": "application/json",
