@@ -43487,9 +43487,11 @@ class SessionManager:
                 # an answer already carried is staged again (the hub drops it
                 # unless that run is still waiting on this host).
                 row = self._dbrief_answered.get(job["runId"])
-                if (row is not None and len(self.daily_brief_results) < DAILY_BRIEF_RESULTS_MAX
-                        and not any(r is row for r in self.daily_brief_results)):
-                    self.daily_brief_results.append(row)
+                if row is not None and not any(r is row for r in self.daily_brief_results):
+                    if len(self.daily_brief_results) < DAILY_BRIEF_RESULTS_MAX:
+                        self.daily_brief_results.append(row)
+                    else:
+                        log(f"daily brief: outbox full; run {job['runId']} re-sent, its answer not re-staged")
                 return
             self._dbrief_seen.append(job["runId"])
             if not error:
@@ -43619,9 +43621,11 @@ class SessionManager:
                 # Re-delivered: an answer already carried is staged again (the
                 # hub lost it, e.g. killed before its write; it drops a stale one).
                 row = self._meeting_answered.get(job["runId"])
-                if (row is not None and len(self.meeting_results) < MEETING_RESULTS_MAX
-                        and not any(r is row for r in self.meeting_results)):
-                    self.meeting_results.append(row)
+                if row is not None and not any(r is row for r in self.meeting_results):
+                    if len(self.meeting_results) < MEETING_RESULTS_MAX:
+                        self.meeting_results.append(row)
+                    else:
+                        log(f"meeting: outbox full; run {job['runId']} re-sent, its answer not re-staged")
                 return
             self._meeting_seen.append(job["runId"])
             if not error:

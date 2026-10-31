@@ -4380,8 +4380,12 @@ function sanitizeMeetingItem(v, i) {
 // descriptions and quotes are shortened (ending "…") by the least that fits, so
 // no item is lost to length; only one that cannot fit even then is dropped.
 const meetingItemsBytes = (items) => Buffer.byteLength(JSON.stringify(items));
+// A cut that is not SMALLER in bytes keeps the text ("ab" → "…" grows it), so the
+// list's size only grows with the cap and the bisection below finds the least cut.
 function meetingCut(v, max) {
-  return cpPrefix(v, max + 1) === cpPrefix(v, max) ? v : `${cpPrefix(v, max - 1).trimEnd()}…`;
+  if (cpPrefix(v, max + 1) === cpPrefix(v, max)) return v;
+  const cut = `${cpPrefix(v, max - 1).trimEnd()}…`;
+  return Buffer.byteLength(JSON.stringify(cut)) < Buffer.byteLength(JSON.stringify(v)) ? cut : v;
 }
 // `cap` (1..4000) bounds a description; a quote gets an eighth of it (40..500).
 function shrinkMeetingItem(it, cap) {

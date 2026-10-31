@@ -27681,8 +27681,24 @@ test("XERK-2524: an over-budget item list is shortened to fit, never silently cu
   assert.ok(Buffer.byteLength(JSON.stringify(kept.items)) <= 64 << 10);
   assert.ok(kept.items.every((it) => it.description.endsWith("…") && it.quotes.length === 5
     && it.quotes.every((q) => q.text.endsWith("…"))));
+  // Shortened by the least that fits, not to nothing.
+  assert.ok(kept.items.every((it) => [...it.description].length > 100));
+  assert.ok(Buffer.byteLength(JSON.stringify(kept.items)) > (64 << 10) - 30 * 64);
   // A coerce fixed point: the store restores it unchanged.
   assert.deepEqual(hub.sanitizeMeeting(kept), kept);
+  // A cut that would GROW a short text keeps it ("ab" -> "…" is a byte longer), so the size only
+  // grows with the cap: near the budget the old cut rewrote every description and lost an item.
+  const E = "\u{1F600}";
+  const near = Array.from({ length: 30 }, (_, i) => ({ kind: "task",
+    title: i === 0 ? "x".repeat(199) : E.repeat(200), suggestedAssignee: E.repeat(100),
+    repoGuess: E.repeat(200), due: E.repeat(40),
+    description: i === 0 ? "long description here" : i <= 19 ? "ab" : "abc",
+    quotes: [{ speaker: E.repeat(i < 14 ? 11 : 10), text: "q" }] }));
+  const fits = hub.sanitizeMeeting({ ...row, items: near });
+  assert.equal(fits.items.length, 28);
+  assert.ok(fits.items.slice(1).every((it) => it.description === "ab" || it.description === "abc"));
+  assert.ok(Buffer.byteLength(JSON.stringify(fits.items)) <= 64 << 10);
+  assert.deepEqual(hub.sanitizeMeeting(fits), fits);
   // A list that fits is untouched.
   const small = items.slice(0, 2);
   assert.deepEqual(hub.sanitizeMeeting({ ...row, items: small }).items.map((it) => it.description),

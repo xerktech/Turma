@@ -55327,6 +55327,17 @@ class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.sm.daily_brief_results, [])
         self.assertEqual(len(self.sm._dbrief_answered), ha.DAILY_BRIEF_RESULTS_MAX)
 
+    def test_run_forever_sweeps_before_anything_launches(self):
+        class _Stop(Exception):
+            pass
+        sm = self.make_manager()
+        with mock.patch.object(ha.signal, "signal"), mock.patch.object(ha, "_install_sigusr1"), \
+                mock.patch.object(ha, "_start_poke_listener"), \
+                mock.patch.object(ha, "load_tmux_config", side_effect=AssertionError("swept late")), \
+                mock.patch.object(sm, "_sweep_oneshot_scratch", side_effect=_Stop):
+            with self.assertRaises(_Stop):
+                sm.run_forever()
+
     def test_manager_start_sweeps_every_oneshot_scratch_file(self):
         # XERK-2524: a manager killed mid one-shot leaves its reply file.
         with tempfile.TemporaryDirectory() as d, mock.patch.object(ha, "REGISTRY_DIR", d):
