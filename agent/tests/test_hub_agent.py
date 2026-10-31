@@ -56324,8 +56324,15 @@ class TestOneshotShutdownAndTmpWrites(ManagerMixin, unittest.TestCase):
         real_popen = ha.subprocess.Popen
         killer = {}
 
+        def kill_like_shutdown():
+            # In production nothing runs after _kill_oneshots: _handle_shutdown
+            # raises SystemExit and the one-shot workers are daemon threads, so
+            # the child must already be launched and killed when this returns.
+            sm._kill_oneshots()
+            killer["at_return"] = killer.get("proc")
+
         def slow_popen(*a, **kw):
-            killer["t"] = threading.Thread(target=sm._kill_oneshots)
+            killer["t"] = threading.Thread(target=kill_like_shutdown)
             killer["t"].start()
             time.sleep(0.2)              # the shutdown arrives mid-fork
             proc = real_popen(*a, **kw)
@@ -56336,6 +56343,8 @@ class TestOneshotShutdownAndTmpWrites(ManagerMixin, unittest.TestCase):
             out = sm._run_lockdown_oneshot(["sleep", "60"], "meeting-", 60, 100, "t")
         killer["t"].join(5)
         self.assertIsNone(out)
+        self.assertIsNotNone(killer.get("at_return"),
+                             "the shutdown waited for the in-flight launch before returning")
         self.assertLess(time.monotonic() - started, 20, "the run ended with its killed child")
         self.assertEqual(killer["proc"].wait(timeout=5), -ha.signal.SIGKILL,
                          "the just-forked child was SIGKILLed, not left to finish")
