@@ -1299,6 +1299,21 @@ function principalMayDriveHost(p, key) {
   if (p.kind === "open" || p.kind === "legacy" || p.kind === "breakglass") return true;
   return Array.isArray(p.roles) && p.roles.includes("admin");
 }
+// Whether the plain host name `host` now belongs to a tenant-bound agent
+// identity (XERK-2583): one minted for that name (origin) or living under it in
+// a tenant (home `<host>@<t>`). The fleet master proves no tenant, so a beat
+// naming such a host on it would only recreate an untenanted ghost beside the
+// bound record. Only once that identity has BEATEN: a host still on the master
+// when its roll bound it must receive the bind's setToken on a master beat. A
+// released identity (Remove host) or a revoked tombstone no longer holds the name.
+function tenantBoundName(host) {
+  if (typeof host !== "string" || !host || tenantOfKey(host)) return false;
+  for (const e of Object.values(agentIdentities)) {
+    if (!e || !e.tenantId || !e.used || e.revoked || e.released) continue;
+    if (e.origin === host || baseOfKey(e.home) === host) return true;
+  }
+  return false;
+}
 // The tenant a principal's action binds an untenanted host to (roll-token): its
 // own, when it is a tenant user. "" = leave it untenanted.
 function principalTenant(p) {
@@ -14219,7 +14234,11 @@ function agentBearerKind(req, host) {
     if (uid) return host != null && uidHostClaim(uid, host) ? "proved" : null;
     // The master proves no tenant, so it may act only as an UNTENANTED host
     // (XERK-2533): a tenant's host is reachable on that tenant's identity alone.
-    if (safeEqual(token, TURMA_AGENT_TOKEN)) return host != null && tenantOfKey(host) ? null : "legacy";
+    // Nor as the plain name of a host since bound to a tenant (XERK-2583): it
+    // would open an untenanted ghost record beside the bound one.
+    if (safeEqual(token, TURMA_AGENT_TOKEN)) {
+      return host != null && (tenantOfKey(host) || tenantBoundName(host)) ? null : "legacy";
+    }
     return null;
   }
   if (!(userAuthorized(req) && authEnabled())) return null;
@@ -14256,6 +14275,9 @@ function agentHostRefusal(req, host) {
     }
     if (bound && bound === host) {
       return { status: 403, error: nameTokenRefusal(host) || "unauthorized" };
+    }
+    if (!tenantOfKey(host) && bearer && safeEqual(bearer, TURMA_AGENT_TOKEN) && tenantBoundName(host)) {
+      return { status: 403, error: `${host} is bound to a tenant and authenticates only with its own agent identity token, never the fleet master (Remove host on its card releases the name)` };
     }
     if (tenantOfKey(host) && bearer && safeEqual(bearer, TURMA_AGENT_TOKEN)) {
       return { status: 403, error: `${baseOfKey(host)} belongs to a tenant and authenticates only with its own agent identity token, never the fleet master` };
@@ -22877,13 +22899,6 @@ const server = http.createServer(async (req, res) => {
       // the host keeps this credential.
       const uid = hostKeyUsable(key) ? issueAgentUid(key) : null;
       const token = uid ? uidAgentToken(uid) : "";
-      // A tenant user rolling an UNTENANTED host binds it to their tenant
-      // (XERK-2533): from its next beat on this identity the host is
-      // `<host>@<tenant>`, carrying its record over. A tenant host keeps its
-      // tenant (the drive gate above already required the caller to be in it);
-      // an operator with no tenant leaves it untenanted.
-      const bindTo = principalTenant(requestPrincipal(req));
-      const bound = uid && !tenantOfKey(key) && bindTo ? bindIdentityTenant(uid, bindTo) : false;
       if (!token) {
         // The host name doesn't derive a token (a dot segment, a name that
         // doesn't UTF-8 round-trip) — the same names hostAgentToken refuses to
@@ -22893,6 +22908,27 @@ const server = http.createServer(async (req, res) => {
             "usable host key, so rename the host to a plain name first",
         });
       }
+      // A tenant user rolling an UNTENANTED host may bind it to their tenant
+      // (XERK-2533): from its next beat on this identity the host is
+      // `<host>@<tenant>`, carrying its record over, and the hub's operators
+      // (break-glass) no longer reach it. That is one-way, so a roll never binds
+      // by surprise (XERK-2583): when it COULD bind, the caller must say
+      // `?bind=1` (bind) or `?bind=0` (rotate only); asked neither, the hub
+      // queues nothing and answers 409 `wouldBind` so the dashboard can ask. A
+      // tenant host keeps its tenant; an operator with no tenant never binds.
+      const bindTo = principalTenant(requestPrincipal(req));
+      const ident = identityOf(uid);
+      const canBind = !!(bindTo && !tenantOfKey(key) && ident && !ident.tenantId && !tenantOfKey(ident.home));
+      const bindAsk = url.searchParams.get("bind");
+      if (canBind && bindAsk !== "1" && bindAsk !== "0") {
+        return json(res, 409, {
+          error: `rolling ${key}'s token would bind it to your tenant, after which the hub's ` +
+            "break-glass login can no longer reach it — roll with ?bind=1 to bind it, or ?bind=0 " +
+            "to rotate its token and leave it untenanted",
+          wouldBind: true,
+        });
+      }
+      const bound = canBind && bindAsk === "1" ? bindIdentityTenant(uid, bindTo) : false;
       // Collapse a mashed button: don't queue a second setToken while one is
       // already unacked in flight (mirrors the restart route). A retry reuses
       // the pending cmdId; the token itself is the same value either way.
@@ -25805,6 +25841,7 @@ if (process.env.TURMA_TEST) {
     agentKeyFor,
     principalMayDriveHost,
     bindIdentityTenant,
+    tenantBoundName,
     BREAKGLASS_PRINCIPAL,
     // OIDC relying-party core (XERK-592). The pure pieces are exported so the
     // security-critical validation is unit-tested offline with a locally-minted

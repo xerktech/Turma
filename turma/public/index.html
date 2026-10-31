@@ -878,10 +878,18 @@ function tokenBadge(a) {
 // agent too old would ack-and-drop it (XERK-151), so the button stays hidden
 // rather than silently no-op. Arm/confirm because it briefly restarts the
 // manager (running sessions are re-adopted, like Restart).
+// When the roll would BIND the host to the viewer's tenant (XERK-2583: the hub
+// answers 409 `wouldBind`), the button becomes an explicit choice — bind it, or
+// just rotate the token — since a bound host is out of break-glass reach for good.
 function rollTokenBtn(a) {
   if (!a.online || a.tokenBound !== false || !a.tokenRoll) return "";
   if (pending.has(pendKey("setToken", a.key, "_")))
     return `<button class="host-restart btn-sm" disabled title="Rolling this host onto its own token…"><span class="spin"></span> Rolling…</button>`;
+  if (rollBindAsk.has(a.key))
+    return `<button class="host-restart btn-sm confirm" title="Bind this host to your tenant, then roll its token. Permanent: the hub's break-glass login can no longer reach it."`
+      + ` onclick="sendRoll('${escJs(a.key)}', true)">Bind to my tenant + roll</button>`
+      + `<button class="host-restart btn-sm" title="Roll its token and leave it untenanted"`
+      + ` onclick="sendRoll('${escJs(a.key)}', false)">Roll only</button>`;
   const armed = confirming.has("rt::" + a.key);
   return `<button class="host-restart btn-sm${armed ? " confirm" : ""}"`
     + ` title="Give this host its own derived token and restart it to adopt it (sessions are re-adopted)"`
@@ -2132,7 +2140,9 @@ function toast(msg) {
 // every refusal raises the hub's own explanation through the shared toast, and
 // callers that painted something optimistically roll it back on a null.
 // `what` names the action for that notice ("Clone", "Prune", …).
-async function post(url, body, what) {
+// `handled(status, body)` may claim a refusal the caller answers itself (it
+// returns true): no toast then, and post() still resolves null.
+async function post(url, body, what, handled) {
   let res;
   try {
     res = await fetch(url, body
@@ -2150,6 +2160,7 @@ async function post(url, body, what) {
   refresh();
   fastPoll();
   if (!res.ok) {
+    if (handled && handled(res.status, out)) return null;
     toast(window.TurmaNav && TurmaNav.refusalText
       ? TurmaNav.refusalText(what, res.status, out)
       : `${what || "That"} failed`);
@@ -2243,12 +2254,26 @@ function restartHost(key) {
 // clears the moment the rolled host beats back bound (or a fresh manager beats
 // in), rather than on the blind TTL.
 function rollToken(key) {
-  twoClick("rt::" + key, () => {
-    const host = (cache.agents || []).find(a => a.key === key);
-    busy(pendKey("setToken", key, "_"),
-      { kind: "setToken", host: key, startedAt: host ? host.startedAt : null },
-      () => post(`/api/agents/${enc(key)}/roll-token`, null, "Roll token"));
-  });
+  twoClick("rt::" + key, () => sendRoll(key, null));
+}
+// Hosts whose roll the hub said would bind them to the viewer's tenant: the
+// button asks which (XERK-2583). Cleared on a choice, or after ROLL_BIND_ASK_MS.
+const rollBindAsk = new Map();
+const ROLL_BIND_ASK_MS = 15000;
+// `bind` null = ask the hub plainly (it answers 409 wouldBind if it would bind),
+// true = bind + roll, false = rotate only.
+function sendRoll(key, bind) {
+  clearTimeout(rollBindAsk.get(key));
+  rollBindAsk.delete(key);
+  const host = (cache.agents || []).find(a => a.key === key);
+  const q = bind == null ? "" : `?bind=${bind ? 1 : 0}`;
+  busy(pendKey("setToken", key, "_"),
+    { kind: "setToken", host: key, startedAt: host ? host.startedAt : null },
+    () => post(`/api/agents/${enc(key)}/roll-token${q}`, null, "Roll token", (status, out) => {
+      if (bind != null || status !== 409 || !out || out.wouldBind !== true) return false;
+      rollBindAsk.set(key, setTimeout(() => { rollBindAsk.delete(key); render(cache); }, ROLL_BIND_ASK_MS));
+      return true;
+    }));
 }
 
 // Mark an action pending and re-render immediately (instant feedback), then fire

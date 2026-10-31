@@ -753,6 +753,8 @@ those are marked `[MODEL]`.
   `@POST("api/agents/{host}/roll-token")` trio (the same shape as `restartAgent`). A host can also
   self-enroll with no app at all (`turma-agentctl enroll` / `TURMA_AGENT_SELF_ENROLL=1`), so this is
   a convenience, not the only path.
+  A mirror must handle the 409 `wouldBind` reply (XERK-2583): offer "Bind to my tenant + roll"
+  (`?bind=1`) and "Roll only" (`?bind=0`) instead of showing it as a failure.
 - ~~P1 Clone bar: collapse + search + multi-select + `🔒` private marker + clone-job status rows.~~
   Done (XERK-126, see Done below).
 - P1 `[MODEL]` Repo blocks: branch/dirty meta (incl. XERK-1887 "git unreadable"), remote link, orphan repos, prune-note, empty state.
