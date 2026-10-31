@@ -240,6 +240,10 @@ quality), the decisions log, and what is left of the retired org brief.
 
 See `.claude/rules/turma-daily-brief.md` — per-org read-aloud brief, Run now, the schedule editor.
 
+## Meetings page (`/meetings`, XERK-2510)
+
+See `.claude/rules/turma-meetings.md` — review of the work items proposed from a Tenir meeting.
+
 ## Durable archive
 
 See `.claude/rules/turma-archive.md` (`turma/archive.js` + tests) — the two layers, size ceilings, how

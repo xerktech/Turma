@@ -363,7 +363,7 @@ const ago = (ms, now) => dur(now - ms);
 // `decisionCounts`); the served list is only its newest few, so it is a floor.
 const DECISIONS_SHOWN = 20;
 const DECISION_LABEL_MAX = 60;   // the session's name in a row's meta line
-const DECISION_KIND = { question: "question", permission: "permission", note: "note" };
+const DECISION_KIND = { question: "question", permission: "permission", note: "note", meeting: "meeting" };
 // The hub's typed-answer markers (server.js `questionAnswerText`): free text is
 // logged as a marker, never its words, and the marker is not a chosen option.
 const TYPED_SUFFIX = ", plus a typed answer";
@@ -379,7 +379,7 @@ function decisionsHtml(site, list, now, live, count, name) {
   const rows = (Array.isArray(list) ? list : []).slice(-DECISIONS_SHOWN).reverse();
   if (!rows.length && !live) return "";
   const item = (d) => {
-    const title = d.source === "note" ? esc(d.text || "")
+    const title = d.source === "note" || d.source === "meeting" ? esc(d.text || "")
       : `${esc(d.question || "")} → ${answerHtml(d.answer || "")}`;
     // Each piece is one unbreakable `.bit`; the line wraps only between them.
     const meta = [`<span class="kind">${esc(DECISION_KIND[d.source] || d.source || "")}</span>`];

@@ -34,7 +34,8 @@ paths:
 - **Store**: `/data/decisions.json` (`DECISIONS_FILE`), siteKey → oldest-first entries, 200 kept
   (`DECISIONS_KEEP`, oldest evicted). Appended ONLY by operator actions — human rate, so a
   `registerExternalStore` is right; HA rewrites ≤200 short rows per org per answer, not per beat.
-  `sanitizeDecision` is the one whitelist (`source` question|permission|note; `question` ≤300,
+  `sanitizeDecision` is the one whitelist (`source` question|permission|note|meeting — a
+  meeting decision is text + `label` = the meeting, XERK-2510; `question` ≤300,
   `answer` ≤200, `text` ≤500; inline literals; null-proto map; a coerce fixed point).
 - **No lone surrogate leaves the whitelist**: a cap through an emoji drops the stranded high half,
   any other becomes U+FFFD (`permissionWhy`'s clip too). The agent writes UTF-8, which cannot

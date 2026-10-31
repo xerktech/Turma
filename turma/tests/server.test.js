@@ -27769,3 +27769,157 @@ test("XERK-2508 QA: a drifted host is refused, the fleet caps hold, and an empty
   cleanup2508(S, []);
   cleanup2508(O, []);
 });
+
+// ---- XERK-2510: Meetings — reviewing a proposal --------------------------------
+
+const okMeeting2510 = (id, extra = {}) => ({
+  meetingId: id, status: "ok", title: "Planning", platform: "zoom", startedAt: 1.7e12,
+  endedAt: 1.7e12 + 3.6e6, receivedAt: Date.now(), tenirUrl: "https://tenir.example/c/9",
+  participants: ["Ann"], model: "sonnet", host: "h", runId: "abc", generatedAt: Date.now(),
+  items: [
+    { kind: "bug", title: "Fix the <b>login</b> bug", description: "It 500s",
+      quotes: [{ speaker: "Ann", text: "login is broken", atMs: 61000 }] },
+    { kind: "task", title: "Write the runbook", description: "" },
+    { kind: "decision", title: "Ship on Friday", description: "after QA" },
+  ], ...extra });
+const review2510 = (site, mid, iid, body, headers = userHeaders) =>
+  request("POST", `/api/orgs/${encodeURIComponent(site)}/meetings/${encodeURIComponent(mid)}/items/${iid}`,
+    { body, headers });
+const creates2510 = (device) =>
+  ((agents[device] && agents[device].commands) || []).filter((c) => c.type === "createTicket");
+const item2510 = (site, mid, iid) =>
+  hub.getMeetings()[site].find((m) => m.meetingId === mid).items.find((i) => i.id === iid);
+
+test("XERK-2510: approving a proposal creates the ticket on the right board, Jira and ADO", async () => {
+  const J = "mtJ2510.atlassian.net";
+  const A = "dev.azure.com/mtA2510";
+  await beat1574("mtJira2510", J);
+  await beat1574("mtAdo2510", A, { jira: { available: true, configured: true, source: "azure",
+    siteKey: A, user: "u", fetchedAt: new Date().toISOString(), tickets: [] } });
+  hub.putMeeting(J, okMeeting2510("j1"));
+  hub.putMeeting(A, okMeeting2510("a1"));
+
+  // Served to clients (never a transcript), the review absent until there is one.
+  const fleet = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.deepEqual(fleet.body.meetingProposals[A][0].items.map((i) => [i.id, "review" in i]),
+    [["p1", false], ["p2", false], ["p3", false]]);
+
+  // Refusals, in the hub's words, change nothing.
+  for (const [site, mid, iid, body, status, re] of [
+    [J, "j1", "p1", {}, 400, /action/],
+    [J, "j1", "p1", { action: "approve" }, 400, /project/],
+    [J, "j1", "p1", { action: "approve", project: "ENG" }, 400, /issue type/],
+    [J, "j1", "p1", { action: "approve", project: "ENG", issueType: "1", title: "  " }, 400, /title/],
+    [J, "nope", "p1", { action: "reject" }, 404, /meeting/],
+    [J, "j1", "p9", { action: "reject" }, 404, /proposal/],
+    ["nobody2510.atlassian.net", "j1", "p1", { action: "reject" }, 404, /org/],
+  ]) {
+    const r = await review2510(site, mid, iid, body);
+    assert.equal(r.status, status, JSON.stringify(body));
+    assert.match(r.body.error, re);
+  }
+  assert.equal((await review2510(J, "j1", "p1", { action: "reject" }, agentHeaders)).status, 401);
+  assert.equal(item2510(J, "j1", "p1").review, undefined);
+
+  // Jira: Approve + start queues the createTicket on the Jira org's host only.
+  const rj = await review2510(J, "j1", "p1", { action: "approve", project: "ENG", issueType: "10004",
+    description: "It 500s\n\nFrom the meeting", start: true });
+  assert.equal(rj.status, 200);
+  assert.equal(rj.body.meeting.items[0].review.state, "creating");
+  const [cj] = creates2510("mtJira2510");
+  assert.deepEqual([cj.project, cj.issueType, cj.summary, cj.description, cj.labels],
+    ["ENG", "10004", "Fix the <b>login</b> bug", "It 500s\n\nFrom the meeting", []]);
+  assert.equal(creates2510("mtAdo2510").length, 0);
+  // A second approve while it is in flight is refused, not a second ticket.
+  assert.equal((await review2510(J, "j1", "p1", { action: "approve", project: "ENG", issueType: "1" })).status, 409);
+
+  // ADO: an edited title, on the ADO org's host.
+  const ra = await review2510(A, "a1", "p2", { action: "approve", project: "Fleet", issueType: "Task",
+    title: "Write the on-call runbook" });
+  assert.equal(ra.status, 200);
+  const [ca] = creates2510("mtAdo2510");
+  assert.deepEqual([ca.project, ca.issueType, ca.summary], ["Fleet", "Task", "Write the on-call runbook"]);
+  assert.equal(item2510(A, "a1", "p2").review.edited, true);
+  assert.equal(creates2510("mtJira2510").length, 1);
+
+  // Each host's outcome settles its own proposal.
+  await beat1574("mtJira2510", J, { createTicketResults: [{ cmdId: cj.cmdId, key: "ENG-100",
+    url: "https://mtJ2510.atlassian.net/browse/ENG-100", error: null }] });
+  await beat1574("mtAdo2510", A, { jira: { available: true, configured: true, source: "azure", siteKey: A,
+    user: "u", fetchedAt: new Date().toISOString(), tickets: [] },
+  createTicketResults: [{ cmdId: ca.cmdId, key: "4321",
+    url: "https://dev.azure.com/mtA2510/Fleet/_workitems/edit/4321", error: null }] });
+  const j = item2510(J, "j1", "p1").review;
+  assert.deepEqual([j.state, j.key, j.url, j.start, j.session, "cmdId" in j],
+    ["created", "ENG-100", "https://mtJ2510.atlassian.net/browse/ENG-100", true, "waiting", false]);
+  const a = item2510(A, "a1", "p2").review;
+  assert.deepEqual([a.state, a.key, "start" in a], ["created", "4321", false]);
+  // The new ticket's board is asked to re-poll so it shows up.
+  assert.ok((agents.mtJira2510.commands || []).some((c) => c.type === "refreshJira"));
+
+  // Approve + start: the session is queued once the board lists the ticket with a repo.
+  hub.settleMeetingReviews();
+  assert.equal(item2510(J, "j1", "p1").review.session, "waiting");
+  await beat1574("mtJira2510", J, { jira: { available: true, configured: true, siteKey: J,
+    user: "mtJira2510@x.com", fetchedAt: new Date().toISOString(),
+    tickets: [{ key: "ENG-100", summary: "Fix", statusCategory: "new", repoGuess: { repo: "Turma" } }] } });
+  hub.settleMeetingReviews();
+  assert.equal(item2510(J, "j1", "p1").review.session, "queued");
+  assert.ok(ticketQueuePayload().some((q) => q.siteKey === J && q.issueKey === "ENG-100"));
+  assert.equal((await review2510(J, "j1", "p1", { action: "reject" })).status, 409);
+  dropQueuedTicket(J, "ENG-100", "test");
+
+  // A decision is logged to the org's decisions log (source "meeting"), not the board.
+  const rd = await review2510(J, "j1", "p3", { action: "approve" });
+  assert.equal(rd.status, 200);
+  assert.equal(item2510(J, "j1", "p3").review.state, "logged");
+  const d = hub.getDecisions()[J].at(-1);
+  assert.deepEqual([d.source, d.text, d.label], ["meeting", "Ship on Friday — after QA", "Planning"]);
+  assert.equal(creates2510("mtJira2510").length, 1);
+  assert.match(hub.decisionsReplyFor("mtJira2510").entries.at(-1).text, /Ship on Friday/);
+
+  // Reject is recorded; rejecting twice is refused; it can still be approved later.
+  assert.equal((await review2510(A, "a1", "p1", { action: "reject" })).status, 200);
+  assert.equal(item2510(A, "a1", "p1").review.state, "rejected");
+  assert.equal((await review2510(A, "a1", "p1", { action: "reject" })).status, 409);
+
+  // A store round trip keeps every review (a coerce fixed point).
+  assert.deepEqual(hub.meetingsCoerce(JSON.parse(JSON.stringify(hub.getMeetings()))), hub.getMeetings());
+  delete hub.getDecisions()[J];
+  cleanup2508(J, ["mtJira2510"]);
+  cleanup2508(A, ["mtAdo2510"]);
+});
+
+test("XERK-2510: a create whose host goes silent fails in honest words; an agent cannot forge a review", async () => {
+  const S = "mtF2510.atlassian.net";
+  await beat1574("mtFail2510", S);
+  hub.putMeeting(S, okMeeting2510("f1"));
+  assert.equal((await review2510(S, "f1", "p2", { action: "approve", project: "ENG", issueType: "1" })).status, 200);
+  // The tracker refused: failed with its reason, and a retry is a fresh create.
+  const [c1] = creates2510("mtFail2510");
+  await beat1574("mtFail2510", S, { createTicketResults: [{ cmdId: c1.cmdId, error: "project ENG is archived" }] });
+  assert.deepEqual([item2510(S, "f1", "p2").review.state, item2510(S, "f1", "p2").review.error],
+    ["failed", "project ENG is archived"]);
+  assert.equal((await review2510(S, "f1", "p2", { action: "approve", project: "OPS", issueType: "1" })).status, 200);
+  // Its host goes offline before taking it: nothing ran, and the command is withdrawn.
+  agents.mtFail2510.lastSeen = Date.now() - 10 * 60e3;
+  hub.settleMeetingReviews();
+  const rv = item2510(S, "f1", "p2").review;
+  assert.deepEqual([rv.state, rv.error], ["failed", "the host went offline before the ticket was created"]);
+  assert.equal(creates2510("mtFail2510").filter((c) => c.project === "OPS").length, 0);
+
+  // A review rides only the operator's route — never an agent's result row.
+  await beat1574("mtFail2510", S, { meetings: { available: true } });
+  hub.putMeeting(S, { meetingId: "r1", status: "running", title: "t", platform: "", startedAt: 1.7e12,
+    endedAt: 1.7e12 + 1, receivedAt: Date.now(), participants: [], model: "sonnet", host: "mtFail2510",
+    runId: "abcd", segments: [{ text: "x" }] });
+  hub.ingestMeetingResults("mtFail2510", [{ runId: "abcd", siteKey: S, status: "ok",
+    items: [{ kind: "task", title: "t", review: { state: "created", at: 1, key: "ENG-1" } }] }]);
+  const forged = hub.getMeetings()[S].find((m) => m.meetingId === "r1");
+  assert.equal(forged.status, "ok");
+  assert.equal("review" in forged.items[0], false);
+  // A recorded review never pushes an item off a full list.
+  assert.equal(hub.sanitizeMeeting({ ...okMeeting2510("z"), items: okMeeting2510("z").items.map((i) =>
+    ({ ...i, review: { state: "rejected", at: 1 } })) }).items.length, 3);
+  cleanup2508(S, ["mtFail2510"]);
+});

@@ -1004,6 +1004,11 @@ those are marked `[MODEL]`.
   as the cache split above, and for the same reason (no table view yet).
 - P2 Per-day tooltip; the web's texture channel for series 9+ (Android reuses hues past 8).
 
+### Meetings (`meetings.html`, XERK-2510)
+- P1 The Meetings page — proposed work items per meeting, Approve / Approve + start / Edit /
+  Reject — is web-only for now. `meetingProposals` is an untyped top-level key Android's
+  `ignoreUnknownKeys` skips (decode-safe). A port must decode it PER ORG like `dailyBriefs`.
+
 ### Nav / Login
 - **Native Authentik SSO is IMPLEMENTED on Android (XERK-591).** `LoginScreen.kt` shows a "Sign in
   with SSO" button beside the Hub-URL + break-glass credential fields. It opens the hub's existing

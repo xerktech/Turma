@@ -3870,7 +3870,7 @@ function publishEpicBuilders() {
 // and HA's whole-value rewrite of ≤200 short rows per org is cheap at that rate.
 // sanitizeDecision is the ONE whitelist (compose, restore, a remote watch); inline
 // literal bounds (module-init TDZ); null-prototype map (XERK-1451).
-const DECISION_SOURCES = new Set(["question", "permission", "note"]);
+const DECISION_SOURCES = new Set(["question", "permission", "note", "meeting"]);
 function sanitizeDecision(v) {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
   if (!Number.isSafeInteger(v.at) || v.at <= 0) return null;
@@ -3890,8 +3890,11 @@ function sanitizeDecision(v) {
     const s = str(v[k], n);
     if (s) out[k] = s;
   }
-  // A note IS its text; an answer is a question and what was chosen.
-  if (out.source === "note" ? !out.text : !(out.question && out.answer)) return null;
+  // A note IS its text, and so is a decision approved from a meeting
+  // (XERK-2510, `label` = the meeting's title); an answer is a question and what
+  // was chosen.
+  const isText = out.source === "note" || out.source === "meeting";
+  if (isText ? !out.text : !(out.question && out.answer)) return null;
   return out;
 }
 const decisionsCoerce = (raw) => {
@@ -4325,6 +4328,49 @@ const MEETING_MODEL_RE = /^[A-Za-z0-9._:-]{1,40}$/;
 const MEETING_STATUSES = new Set(["queued", "running", "ok", "failed"]);
 const MEETING_ITEM_KINDS = new Set(["task", "bug", "followup", "decision"]);
 const MEETING_PENDING = new Set(["queued", "running"]);
+// The operator's review of one proposed item (XERK-2510). `creating` holds the
+// createTicket command it queued; `logged` is a decision written to the
+// decisions log; a `created` item asked to also start a session carries
+// `session` waiting -> queued | failed.
+const MEETING_REVIEW_STATES = new Set(["creating", "created", "failed", "rejected", "logged"]);
+const MEETING_SESSION_STATES = new Set(["waiting", "queued", "failed"]);
+const MEETING_CMD_ID_RE = /^[0-9a-f]{1,32}$/;
+function sanitizeMeetingReview(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  if (!MEETING_REVIEW_STATES.has(v.state)) return null;
+  const at = dbTime(v.at);
+  if (at === null) return null;
+  const out = { state: v.state, at };
+  const project = meetingText(v.project, 100);
+  if (project) out.project = project;
+  const issueType = meetingText(v.issueType, 100);
+  if (issueType) out.issueType = issueType;
+  if (v.edited === true) out.edited = true;
+  if (v.state === "creating") {
+    if (typeof v.cmdId !== "string" || !MEETING_CMD_ID_RE.test(v.cmdId)) return null;
+    if (typeof v.host !== "string" || !v.host || v.host.length > 200) return null;
+    out.cmdId = v.cmdId;
+    out.host = v.host;
+  }
+  if (v.state === "created") {
+    if (typeof v.key !== "string" || v.key.length > 64 || !isIssueKey(v.key)) return null;
+    out.key = v.key;
+    if (meetingUrlOk(v.url)) out.url = v.url;
+  }
+  if (v.state === "failed") {
+    out.error = meetingText(v.error, MEETING_ERROR_MAX) || "the ticket could not be created";
+  }
+  if ((v.state === "creating" || v.state === "created") && v.start === true) {
+    out.start = true;
+    if (v.state === "created") {
+      out.session = MEETING_SESSION_STATES.has(v.session) ? v.session : "waiting";
+      if (out.session === "failed") {
+        out.sessionError = meetingText(v.sessionError, MEETING_ERROR_MAX) || "the session could not be started";
+      }
+    }
+  }
+  return out;
+}
 
 // Plain text from Tenir or a model: lone surrogates repaired, control/bidi/
 // zero-width characters removed (a newline kept only where `multiline`),
@@ -4372,6 +4418,8 @@ function sanitizeMeetingItem(v, i) {
     .filter((k) => typeof k === "string" && k.length <= 64 && isIssueKey(k)))].slice(0, 5);
   const repo = meetingText(v.repoGuess, 200);
   if (repo) out.repoGuess = repo;
+  const review = sanitizeMeetingReview(v.review);
+  if (review) out.review = review;
   return out;
 }
 // The item list a row keeps: each item re-whitelisted and renumbered p1..pN,
@@ -4379,7 +4427,10 @@ function sanitizeMeetingItem(v, i) {
 // MEETINGS_KEEP meetings and the store is written whole. Over the budget, the
 // descriptions and quotes are shortened (ending "…") by the least that fits, so
 // no item is lost to length; only one that cannot fit even then is dropped.
-const meetingItemsBytes = (items) => Buffer.byteLength(JSON.stringify(items));
+// Measured WITHOUT each item's review (XERK-2510), so recording one never shrinks
+// or cuts the proposals.
+const meetingItemsBytes = (items) =>
+  Buffer.byteLength(JSON.stringify(items.map((it) => ({ ...it, review: undefined }))));
 // A cut that is not SMALLER in bytes keeps the text ("ab" → "…" grows it), so the
 // list's size only grows with the cap and the bisection below finds the least cut.
 function meetingCut(v, max) {
@@ -4496,12 +4547,33 @@ function putMeeting(siteKey, row) {
   meetingProposals[siteKey] = keepMeetings(list);
   persistMeetings();
   invalidateAgentsCache();
+  broadcastMeetingsSoon();
   return m;
 }
 // A row as answered to Tenir: never the transcript or the in-flight bookkeeping.
 function meetingWire(m) {
   const { segments, cmdId, sentAt, attempt, tried, ...out } = m;
   return out;
+}
+// What clients read (XERK-2510): each org's newest MEETINGS_WIRE_TAIL rows,
+// never a transcript. Served as top-level `meetingProposals` + its SSE frame.
+const MEETINGS_WIRE_TAIL = 20;
+function meetingProposalsWire() {
+  const out = Object.create(null);
+  for (const [site, list] of Object.entries(meetingProposals)) {
+    out[site] = list.slice(0, MEETINGS_WIRE_TAIL).map(meetingWire);
+  }
+  return out;
+}
+// One whole-map frame per turn, however many rows a tick rewrote.
+let meetingsBroadcastQueued = false;
+function broadcastMeetingsSoon() {
+  if (meetingsBroadcastQueued) return;
+  meetingsBroadcastQueued = true;
+  setImmediate(() => {
+    meetingsBroadcastQueued = false;
+    sseBroadcast("meetingProposals", meetingProposalsWire());
+  });
 }
 
 // Which hosts of an org report a repo by name — CLONED (on-disk `repos[]`) OR
@@ -6959,6 +7031,10 @@ function buildAgentsCache() {
     // The Daily Brief's written briefs (XERK-2395): siteKey -> newest first, the
     // newest and newest finished in full, the rest headline-only (dailyBriefsWire).
     dailyBriefs: dailyBriefsWire(),
+    // Meetings Tenir posted and the work items proposed from them, with the
+    // operator's review of each (XERK-2510): siteKey -> newest first, never a
+    // transcript (meetingProposalsWire).
+    meetingProposals: meetingProposalsWire(),
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -10003,6 +10079,43 @@ function forgetCreateInFlight(cmdId) {
       guardStoreDel("createInFlight", fp);
     }
   }
+}
+// Queue a tracker create on the org's ranked online board-write host: the ONE
+// path the New-ticket route (XERK-137/241) and a meeting proposal's approval
+// (XERK-2510) take, so both get the same single-flight, gap and routing rules.
+// Returns {status, body}: 200 {ok, cmdId, host} (an identical create still in
+// flight rejoins its cmdId), else a refusal in the hub's own words.
+function queueCreateTicket(siteKey, { project, issueType, summary, description = "", labels = [] }) {
+  if (!summary) return { status: 400, body: { error: "a title is required" } };
+  if (!project) return { status: 400, body: { error: "a project is required" } };
+  if (!issueType) return { status: 400, body: { error: "an issue type is required" } };
+  // Single-flight an identical create that's still IN FLIGHT anywhere in the
+  // org (XERK-241): the reported failure had the operator retrying a create
+  // that was in fact succeeding, ending with four copies of one ticket. A
+  // retry of the same (project, type, title) while the first has no outcome
+  // yet is a retry, not a second ticket, so it rejoins the first cmdId. Once
+  // that create RESOLVES, an identical one is a new ticket again — deliberate
+  // repeats stay possible.
+  const fields = [siteKey, project, issueType, summary, description, labels];
+  const inFlight = findCreateInFlight(...fields);
+  if (inFlight) return { status: 200, body: { ok: true, cmdId: inFlight.cmdId, host: inFlight.host } };
+  const key = pickBoardWriteHost(siteKey, "createTicket");
+  if (!key) {
+    return findJiraHost(siteKey, false)
+      ? { status: 503, body: { error: "no online host reports that org" } }
+      : { status: 404, body: { error: "no host reports that org" } };
+  }
+  // Refuse rather than queue a create this agent can't run (XERK-151); the
+  // client would otherwise poll the outcome until it timed out.
+  const gap = agentGapError(agents[key], "createTicket", "create tickets");
+  if (gap) return { status: 409, body: { error: gap } };
+  const cmdId = queueCommand(key, {
+    type: "createTicket", project, issueType, summary, description, labels,
+  });
+  awaitResult(agents[key], cmdId, "createTicket");
+  rememberCmdHost(cmdId, key, "createTicket");
+  rememberCreateInFlight(fields, cmdId, key);
+  return { status: 200, body: { ok: true, cmdId, host: key } };
 }
 function rememberCreateInFlight(fields, cmdId, host) {
   const fp = createFp(...fields);
@@ -17680,7 +17793,10 @@ function ingestMeetingResults(key, rows, now = Date.now()) {
     const row = meetingRunOf(key, r.siteKey, r.runId);
     if (!row) continue;
     const ok = r.status === "ok" && Array.isArray(r.items) && putMeeting(r.siteKey, {
-      ...row, status: "ok", generatedAt: now, items: r.items,
+      // A review is the operator's (XERK-2510): never taken off an agent's row.
+      ...row, status: "ok", generatedAt: now,
+      items: r.items.map((it) => (it && typeof it === "object" && !Array.isArray(it)
+        ? { ...it, review: undefined } : it)),
       model: typeof r.model === "string" && MEETING_MODEL_RE.test(r.model) ? r.model : row.model,
     });
     if (ok) dispatchNextMeeting(r.siteKey, now);
@@ -17697,6 +17813,11 @@ function ingestMeetingResults(key, rows, now = Date.now()) {
 // On the leader's orchestration tick: settle runs whose host stopped answering,
 // start queued meetings, forget an org no host has been in for MEETINGS_RETAIN_MS.
 function meetingsTick(now = Date.now()) {
+  try {
+    settleMeetingReviews(now);
+  } catch (e) {
+    console.error(`meetings: settling reviews failed: ${e && e.message}`);
+  }
   const orgs = decidedOrgs();
   for (const [siteKey, list] of Object.entries(meetingProposals)) {
     try {
@@ -17722,9 +17843,139 @@ function meetingsTick(now = Date.now()) {
         delete meetingProposals[siteKey];
         persistMeetings();
         invalidateAgentsCache();
+        broadcastMeetingsSoon();
       }
     } catch (e) {
       console.error(`meetings: settling ${logName(siteKey)} failed: ${e && e.message}`);
+    }
+  }
+}
+
+// ---- Meetings: the operator's review of a proposal (XERK-2510) ---------------
+// Approve queues the SAME createTicket the New-ticket modal does (the tracker
+// write stays the operator's action); a decision is written to the decisions
+// log instead; reject is recorded. The create settles off the host's
+// `createTicketResults` (settleMeetingReviews), and "approve + start" then
+// queues a manual ticket start once the board lists the ticket with a repo.
+const MEETING_START_WAIT_MS = 2 * 3600e3;
+const MEETING_TICKET_DESC_MAX = 8000;
+function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
+  const refuse = (status, error) => ({ status, body: { error } });
+  if (!body || typeof body !== "object" || Array.isArray(body)) return refuse(400, "the body must be an object");
+  if (body.action !== "approve" && body.action !== "reject") {
+    return refuse(400, 'action must be "approve" or "reject"');
+  }
+  if (!decidedOrgs().has(siteKey)) return refuse(404, "no host is in that org");
+  const m = Object.hasOwn(meetingProposals, siteKey)
+    && meetingProposals[siteKey].find((x) => x.meetingId === meetingId);
+  if (!m) return refuse(404, "no such meeting");
+  if (m.status !== "ok") return refuse(409, "that meeting has no proposals yet");
+  const item = (m.items || []).find((i) => i.id === itemId);
+  if (!item) return refuse(404, "no such proposal");
+  const cur = item.review && item.review.state;
+  if (cur === "creating") return refuse(409, "that proposal's ticket is already being created");
+  if (cur === "created") return refuse(409, `that proposal is already ticket ${item.review.key}`);
+  if (cur === "logged") return refuse(409, "that decision is already logged");
+  const save = (review) => {
+    const row = putMeeting(siteKey, { ...m,
+      items: m.items.map((i) => (i.id === itemId ? { ...i, review } : i)) });
+    return row ? { status: 200, body: { ok: true, meeting: meetingWire(row) } }
+      : refuse(500, "the review could not be stored");
+  };
+  if (body.action === "reject") {
+    if (cur === "rejected") return refuse(409, "that proposal is already rejected");
+    return save({ state: "rejected", at: now });
+  }
+  for (const k of ["title", "description", "project", "issueType"]) {
+    if (body[k] != null && typeof body[k] !== "string") return refuse(400, `${k} must be text`);
+  }
+  const title = meetingText(body.title == null ? item.title : body.title, 200);
+  if (!title) return refuse(400, "a title is required");
+  const description = meetingText(body.description == null ? item.description : body.description,
+    MEETING_TICKET_DESC_MAX, true);
+  const edited = title !== item.title || (body.description != null && description !== item.description);
+  if (item.kind === "decision") {
+    const d = appendDecision(siteKey, { source: "meeting",
+      text: [title, description].filter(Boolean).join(" — "), label: m.title });
+    if (!d) return refuse(500, "the decision could not be logged");
+    return save({ state: "logged", at: now, ...(edited ? { edited: true } : {}) });
+  }
+  const project = meetingText(body.project, 100);
+  const issueType = meetingText(body.issueType, 100);
+  if (!project) return refuse(400, "a project is required");
+  if (!issueType) return refuse(400, "an issue type is required");
+  const q = queueCreateTicket(siteKey, { project, issueType, summary: title, description, labels: [] });
+  if (q.status !== 200) return q;
+  return save({ state: "creating", at: now, project, issueType, cmdId: q.body.cmdId,
+    host: q.body.host, ...(edited ? { edited: true } : {}), ...(body.start === true ? { start: true } : {}) });
+}
+
+// Ask every host of the org to re-poll its board, so a just-created ticket
+// (and its triage) shows up without waiting out the poll interval.
+function refreshOrgBoard(siteKey) {
+  for (const [k, a] of Object.entries(agents)) {
+    if (!hostInOrg(a, siteKey)) continue;
+    if ((a.commands || []).some((c) => c.type === "refreshJira")) continue;
+    queueCommand(k, { type: "refreshJira" });
+  }
+}
+
+// One review's next state, or the same object when nothing moved.
+function settleMeetingReview(siteKey, rv, now) {
+  if (!rv) return rv;
+  if (rv.state === "creating") {
+    const { cmdId, host, ...base } = rv;
+    const a = agents[host];
+    const r = a && a.createResults && a.createResults[cmdId];
+    if (r) {
+      if (r.error || !r.key) {
+        forgetCreateInFlight(cmdId);
+        return { ...base, state: "failed", at: now, error: r.error || "the tracker named no ticket" };
+      }
+      refreshOrgBoard(siteKey);
+      return { ...base, state: "created", at: now, key: r.key, url: r.url || undefined,
+        ...(rv.start ? { session: "waiting" } : {}) };
+    }
+    const gap = a ? agentGapError(a, "createTicket", "create tickets") : null;
+    if (!a || gap || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) {
+      // The GET poll's wording (XERK-241): never claim no ticket exists once
+      // the command was handed over.
+      const nothingRan = !a || !commandDelivered(host, cmdId, "createTicket");
+      if (a) dropQueuedCommand(host, cmdId, "createTicket");
+      forgetCreateInFlight(cmdId);
+      return { ...base, state: "failed", at: now, error: gap || (nothingRan
+        ? "the host went offline before the ticket was created"
+        : "the host went silent while creating the ticket — it may have been created, "
+          + "so check the board before approving again") };
+    }
+    return rv;
+  }
+  if (rv.state === "created" && rv.start && rv.session === "waiting") {
+    if (ticketRepo(siteKey, rv.key)) {
+      return enqueueTicketStart(siteKey, rv.key, "manual")
+        ? { ...rv, session: "queued" }
+        : { ...rv, session: "failed", sessionError: "the ticket queue is full — start it from the board" };
+    }
+    if (now - rv.at >= MEETING_START_WAIT_MS) {
+      return { ...rv, session: "failed",
+        sessionError: "the ticket never reached the board with a repo — start it from the board" };
+    }
+  }
+  return rv;
+}
+function settleMeetingReviews(now = Date.now()) {
+  for (const [siteKey, list] of Object.entries(meetingProposals)) {
+    for (const m of list) {
+      if (m.status !== "ok" || !(m.items || []).some((i) => i.review
+          && (i.review.state === "creating" || i.review.session === "waiting"))) continue;
+      let changed = false;
+      const items = m.items.map((it) => {
+        const next = settleMeetingReview(siteKey, it.review, now);
+        if (next === it.review) return it;
+        changed = true;
+        return { ...it, review: next };
+      });
+      if (changed) putMeeting(siteKey, { ...m, items });
     }
   }
 }
@@ -17963,6 +18214,7 @@ const SESSIONS = htmlPage("sessions.html");
 const BOARD = htmlPage("board.html");
 const INSIGHTS = htmlPage("insights.html");
 const BRIEF = htmlPage("brief.html");
+const MEETINGS_PAGE = htmlPage("meetings.html");
 // Not an `htmlPage`: the login form is served `no-store` (a cached login page
 // is its own problem), so it has no conditional-GET path to carry an ETag for.
 const LOGIN = withHashedAssets(readAsset("login.html"));
@@ -19867,6 +20119,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && (url.pathname === "/brief" || url.pathname === "/brief.html")) {
       return sendPage(req, res, BRIEF);
     }
+    if (req.method === "GET" && (url.pathname === "/meetings" || url.pathname === "/meetings.html")) {
+      return sendPage(req, res, MEETINGS_PAGE);
+    }
 
     // The page was /history until it dropped cost and became token-only. Keep
     // old bookmarks and the Android client's deep links working.
@@ -20479,6 +20734,8 @@ const server = http.createServer(async (req, res) => {
       }
       try {
         ingestMeetingResults(key, meetingResults);
+        // A proposal's ticket just landed (XERK-2510): settle it this beat.
+        if (Array.isArray(createTicketResults) && createTicketResults.length) settleMeetingReviews();
       } catch (e) {
         console.error(`meetings ingest failed: ${e && e.message}`);
       }
@@ -22384,36 +22641,8 @@ const server = http.createServer(async (req, res) => {
         ? body.labels.filter((l) => typeof l === "string" && l.trim())
             .map((l) => l.trim()).slice(0, 20)
         : [];
-      if (!summary) return json(res, 400, { error: "a title is required" });
-      if (!project) return json(res, 400, { error: "a project is required" });
-      if (!issueType) return json(res, 400, { error: "an issue type is required" });
-      // Single-flight an identical create that's still IN FLIGHT anywhere in the
-      // org (XERK-241): the reported failure had the operator retrying a create
-      // that was in fact succeeding, ending with four copies of one ticket. A
-      // retry of the same (project, type, title) while the first has no outcome
-      // yet is a retry, not a second ticket, so it rejoins the first cmdId. Once
-      // that create RESOLVES, an identical one is a new ticket again — deliberate
-      // repeats stay possible.
-      const fields = [siteKey, project, issueType, summary, description, labels];
-      const inFlight = findCreateInFlight(...fields);
-      if (inFlight) return json(res, 200, { ok: true, cmdId: inFlight.cmdId, host: inFlight.host });
-      const key = pickBoardWriteHost(siteKey, "createTicket");
-      if (!key) {
-        return findJiraHost(siteKey, false)
-          ? json(res, 503, { error: "no online host reports that org" })
-          : json(res, 404, { error: "no host reports that org" });
-      }
-      // Refuse rather than queue a create this agent can't run (XERK-151); the
-      // client would otherwise poll the outcome until it timed out.
-      const gap = agentGapError(agents[key], "createTicket", "create tickets");
-      if (gap) return json(res, 409, { error: gap });
-      const cmdId = queueCommand(key, {
-        type: "createTicket", project, issueType, summary, description, labels,
-      });
-      awaitResult(agents[key], cmdId, "createTicket");
-      rememberCmdHost(cmdId, key, "createTicket");
-      rememberCreateInFlight(fields, cmdId, key);
-      return json(res, 200, { ok: true, cmdId, host: key });
+      const out = queueCreateTicket(siteKey, { project, issueType, summary, description, labels });
+      return json(res, out.status, out.body);
     }
 
     // GET /api/jira/<siteKey>/tickets/<cmdId> -> poll a create's outcome
@@ -23222,6 +23451,24 @@ const server = http.createServer(async (req, res) => {
     // Operator-authed, authoritative on the 200 (returns the entry; it also rides
     // /api/agents + the `decisions` SSE frame and the org's next heartbeat replies).
     // The org must be one a host is DECIDED into, so a refusal mints no store key.
+    // POST /api/orgs/<siteKey>/meetings/<meetingId>/items/<itemId> — the
+    // operator's review of one proposed work item (XERK-2510), operator-authed
+    // (only the 4-part POST is Tenir's token route). Body {action:"approve"|
+    // "reject", title?, description?, project?, issueType?, start?}. Approve
+    // queues the org's createTicket (a decision goes to the decisions log
+    // instead); answers {ok, meeting} or a refusal in the hub's words.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 7 && parts[3] === "meetings" && parts[5] === "items") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const meetingId = decodeURIComponent(parts[4]);
+      const itemId = decodeURIComponent(parts[6]);
+      let body;
+      try { body = JSON.parse((await readBody(req)) || "{}"); }
+      catch { return json(res, 400, { error: "the body is not JSON" }); }
+      const out = reviewMeetingItem(siteKey, meetingId, itemId, body);
+      return json(res, out.status, out.body);
+    }
+
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
         parts.length === 4 && parts[3] === "decisions") {
       const siteKey = decodeURIComponent(parts[2]);
@@ -24649,6 +24896,7 @@ if (process.env.TURMA_TEST) {
     cleanBriefNarrative, dailyBriefDue, dailyBriefTick, startDailyBriefRun,
     ingestDailyBriefResults, dailyBriefRunNowAt,
     getMeetings: () => meetingProposals, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
+    putMeeting, reviewMeetingItem, settleMeetingReviews, meetingProposalsWire, MEETING_START_WAIT_MS,
     ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETING_RUN_TIMEOUT_MS,
     MEETING_QUEUE_MAX_MS, MEETINGS_KEEP, MEETINGS_AUTO_MODEL, DAILY_BRIEF_RUN_TIMEOUT_MS, DAILY_BRIEF_LATE_MS,
     decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, permissionAnswerKind,
