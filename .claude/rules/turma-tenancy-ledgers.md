@@ -49,8 +49,7 @@ tenant"). Tenancy model: `turma-tenancy.md`.
   DISPATCH host's tenant; the SSE `modelPolicy` frame goes only to clients whose ledger scope is
   that tenant (`sseBroadcast(..., {policyTenant})`, `ledgerTenantOf` of the `ssePrincipals` entry
   stamped at `/api/events` connect — a client with no scope gets no scoped frame).
-- A tenant's demotion is NOT pushed: `notify()` fans out to every device until push is
-  tenant-routed (XERK-2551). The untenanted fleet's demotion still notifies.
+- A tenant's demotion is pushed to that tenant's devices only (`notify(..., {tenant})`, XERK-2551).
 - A bus frame whose `policyTenant` is present but not a string is dropped, never delivered unscoped.
 - Shadows: `shadowHostFor` takes only the live row's tenant's hosts; the daily cap and pair counts
   are per tenant; `pairsOf`/`pairEvidence` skip a pair whose two rows' tenants differ.

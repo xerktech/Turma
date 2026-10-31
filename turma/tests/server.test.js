@@ -28933,6 +28933,7 @@ test("XERK-2550: the routing policy promotes and routes per tenant, never on ano
 test("XERK-2550: a tenant's demotion is never pushed to the fleet's devices", () => {
   const TA = "a".repeat(32);
   resetPolicy();
+  hub.registerDevice("dev2550ta", "android", [], TA);
   hub.__setModelPolicy("on");
   const before = notifications.length;
   try {
@@ -28947,9 +28948,11 @@ test("XERK-2550: a tenant's demotion is never pushed to the fleet's devices", ()
     }
     hub.modelPolicySweep();
     assert.equal(hub.__modelPolicyState()[`${TA}:bug/sonnet`].state, "demoted");
-    assert.ok(!notifications.slice(before).some((x) => x.data && /model-demoted/.test(x.data.notifKey || "")),
-      "no push until push is tenant-routed (XERK-2551)");
-  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
+    const pushed = notifications.slice(before).filter((x) => x.data && /model-demoted/.test(x.data.notifKey || ""));
+    // XERK-2551: push is tenant-routed — the tenant's own devices only.
+    assert.equal(pushed.length, 1);
+    assert.deepEqual(pushed[0].tokens, ["dev2550ta"]);
+  } finally { hub.unregisterDevice("dev2550ta"); hub.__setModelPolicy("observe"); resetPolicy(); }
 });
 
 test("XERK-2550: a bus frame with a malformed scope is dropped, never delivered unscoped", () => {

@@ -6528,10 +6528,8 @@ function modelPolicySweepTenant(t, now) {
         const pct = (x) => `${Math.round(x * 100)}%`;
         console.log(`model policy: demoted ${model} for ${cls} work (${live.bad}/${live.n} bad`
           + ` vs Opus ${pct(baseline)})`);
-        // A tenant's demotion is not pushed until push is tenant-routed
-        // (XERK-2551): notify() fans out to every registered device, which would
-        // hand one tenant's figures to every other tenant's phones.
-        if (!t) notify(`${cls} work moved back to Opus`,
+        // Pushed to that tenant's devices only (`tenant`, XERK-2551).
+        notify(`${cls} work moved back to Opus`,
           `${model} had ${live.bad} bad of ${live.n} since its promotion, worse than Opus's`
           + ` ${pct(baseline)} for ${cls} work. It stays on Opus until new shadow runs earn it back.`,
           { tags: "warning", notifKey: `model-demoted:${key}`, tenant: t });
@@ -15126,9 +15124,11 @@ function agentWsAuthorized(url, req, host) {
 // ride as data so the app picks the notification channel and deep-links a tap to
 // the exact session or host.
 function notify(title, message, opts = {}) {
-  // Only the host's own tenant's devices (XERK-2551); an alert with no host
-  // (a fleet-wide one) reaches the operators' devices.
-  const tokens = devicesForHost(opts.route && opts.route.host);
+  // Only the host's own tenant's devices (XERK-2551), or the explicit `tenant`
+  // of an alert about no host; any other alert reaches the operators' devices.
+  const tokens = typeof opts.tenant === "string" && opts.tenant
+    ? devicesForHost(tenantHostKey("x", opts.tenant))
+    : devicesForHost(opts.route && opts.route.host);
   if (!tokens.length) return; // no registered devices; also skips when FCM off
   const data = {
     tags: opts.tags || "",
