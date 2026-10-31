@@ -63,8 +63,11 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   - **`TURMA_TRUSTED_PROXIES` (XERK-2579)** collapses that to CF-Connecting-IP alone ONLY when the
     socket AND the last XFF hop are both inside it — else 2 cloudflared x 2 ingress pods = 4 keys.
     - List the ingress, cloudflared AND hub pods (an HA follower forwards logins, so it is the
-      leader's socket peer) — in practice the pod CIDR. Anything inside can forge all three headers,
-      directly or through the ingress's ClusterIP (agent pods included): accepted, fairness only.
+      leader's socket peer) — in practice the pod CIDR. Anything inside can forge all three headers.
+    - **Only the network keeps a pod off :8300** (XERK-2592): a pod dialling the Service directly
+      forges the untrusted last hop, which the hub cannot tell from the ingress relaying a LAN
+      client. ArgoCD `ai/turma/networkpolicy-ingress.yaml` admits only the ingress, hub, turma-agent
+      and Prometheus pods. Residual: turma-agent pods, which already hold a host token.
     - Correct only while the ingress APPENDS its peer to XFF (no `use-forwarded-headers`).
     - A malformed entry exits the hub at boot (2) rather than silently keying three-part.
     - Tests: `tenancy-nopassword.test.js` "XERK-2579: behind trusted proxies…".
@@ -95,6 +98,7 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   - Android never retries a password `/api/login` refused (401) as Basic — one miss, not two.
   - Residual (XERK-2568's key-trust model): a caller bypassing Cloudflare rotates CF-Connecting-IP
     for a fresh budget per request — scrypt-free break-glass makes that a real bypass (XERK-2585).
+    The direct-to-Service variant (a pod forging the XFF hop) is closed by the network (XERK-2592).
   - A `/api/login` break-glass miss still runs the local scrypt check (shared name, no timing tell
     for which name is break-glass), passed `counted` so it is not recorded twice.
 - An unknown username verifies against a dummy hash (same cost, no timing oracle); every failure is
