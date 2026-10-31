@@ -240,6 +240,32 @@ class QwenProjectionTailTest(unittest.TestCase):
         self.assertEqual(len(self._read_transcript()), 1)
         self.assertFalse(os.path.islink(self.transcript))
 
+    def test_raw_mirror_never_appends_through_a_planted_link(self):
+        # XERK-2564: the raw mirror name is session-writable; a symlink or
+        # hardlink planted there must be refused, never appended through.
+        for plant in (os.symlink, os.link):
+            victim = os.path.join(self.tmp, "victim-" + plant.__name__)
+            with open(victim, "w") as f:
+                f.write("untouched")
+            os.makedirs(self.store_dir, exist_ok=True)
+            if os.path.lexists(self.mirror_path):
+                os.unlink(self.mirror_path)
+            plant(victim, self.mirror_path)
+            self._append_native(self._user("hello " + plant.__name__))
+            tail = self._tail(use_glob=False, store=True)
+            self.addCleanup(tail.stop)
+            tail._pump()
+            with open(victim) as f:
+                self.assertEqual(f.read(), "untouched", plant.__name__)
+
+    def test_transcript_create_does_not_follow_a_dangling_link(self):
+        outside = os.path.join(self.tmp, "created-through-link")
+        os.symlink(outside, self.transcript)
+        tail = self._tail(use_glob=False)
+        tail._stop.set()            # run only the launch-time create, then exit
+        tail._run()
+        self.assertFalse(os.path.exists(outside))
+
     def test_resume_holds_a_trailing_partial_line_then_completes_it(self):
         # qwen may be mid-write at resume, leaving an unterminated last line. The
         # rebuild must hold that fragment (not project a truncated event) and

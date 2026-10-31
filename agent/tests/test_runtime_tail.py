@@ -189,7 +189,11 @@ class FreshWriteTest(unittest.TestCase):
         path = os.path.join(self.tmp, "t.jsonl")
         os.mkfifo(path)
         with self.assertRaises(OSError):
-            rt.open_for_append(path)
+            rt.open_for_append(path)            # no reader: ENXIO, never a hang
+        reader = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        with self.assertRaises(OSError):
+            rt.open_for_append(path)            # reader attached: not a regular file
 
     def test_child_projection_rewrite_never_truncates_a_planted_link(self):
         src = os.path.join(self.tmp, "child.jsonl")

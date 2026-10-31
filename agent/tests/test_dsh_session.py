@@ -515,6 +515,22 @@ class DshDelegationTailTest(unittest.TestCase):
         self.assertEqual([n for n in os.listdir(os.path.dirname(rec)) if n.endswith(".tmp")],
                          [])
 
+    def test_transcript_create_does_not_follow_a_dangling_link(self):
+        outside = os.path.join(self.tmp, "created-through-link")
+        os.unlink(self.transcript)
+        os.symlink(outside, self.transcript)
+        self.tail._stop.set()       # run only the launch-time create, then exit
+        self.tail._run()
+        self.assertFalse(os.path.exists(outside))
+
+    def test_child_move_create_does_not_follow_a_dangling_link(self):
+        new = os.path.join(self.tmp, "moved", "agent-x.jsonl")
+        outside = os.path.join(self.tmp, "created-through-link")
+        os.makedirs(os.path.dirname(new))
+        os.symlink(outside, new)
+        self.tail._move_child_file(os.path.join(self.tmp, "absent.jsonl"), new)
+        self.assertFalse(os.path.exists(outside))
+
     def test_workflow_agent_is_not_a_top_level_subagent_row(self):
         # A workflow agent reaches the tail through the subagent seam too, so the
         # driver forwards a `turma/subagent-*` for it — but it belongs to the run,
