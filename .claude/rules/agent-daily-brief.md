@@ -89,6 +89,8 @@ model `DAILY_BRIEF_MODEL`. Evidence and the model decision: `docs/daily-brief-ad
 - **The model run is `_run_lockdown_oneshot`** (the wait classifier's runner): ATTENTION_HINT_LOCKDOWN,
   cwd REGISTRY_DIR, stdin closed, mkstemp output, process group killed on timeout. Its prompt
   signature is in `INTERNAL_TOOL_PROMPT_SIGS`, so its transcript never shows as a repo.
+- **A new one-shot scratch prefix goes in `ONESHOT_SCRATCH_PREFIXES`**: `_sweep_oneshot_scratch`
+  drops those files at manager start, since a manager killed mid-run never removes its own.
 - **Only `claude` is offered** (`daily_brief_runtimes`), and only while `claudeAuth.needsLogin` is
   false. Do not add `qwen -p` until a host run shows it can be made tool-less: the input is tracker
   text anyone in the org writes.

@@ -55305,6 +55305,42 @@ class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.sm._dbrief_wants, {})
         self.assertEqual(len(self.sm.daily_brief_results), 1)
 
+    def test_a_redelivery_after_the_answer_was_carried_restages_it(self):
+        # XERK-2524: a hub that lost the delivered answer (a crash before its
+        # write) re-sends the runId; the held row is staged again, not re-run.
+        self.sm._stage_daily_brief(self._cmd())
+        self.replies = [self._reply()]
+        [row] = self._drain()
+        runs = len(self.argvs)
+        self.sm.daily_brief_results.clear()          # a beat carried it
+        self.sm._stage_daily_brief(self._cmd())
+        self.assertEqual(self.sm._dbrief_wants, {})
+        self.assertEqual(len(self.argvs), runs)
+        self.assertIs(self.sm.daily_brief_results[0], row)
+        self.sm._stage_daily_brief(self._cmd())      # not staged twice
+        self.assertEqual(len(self.sm.daily_brief_results), 1)
+        # Only the last few answers are held.
+        for i in range(ha.DAILY_BRIEF_RESULTS_MAX + 1):
+            self.sm._stage_daily_brief(self._cmd(model="opus", runId=f"f{i}"))
+        self.sm.daily_brief_results.clear()
+        self.sm._stage_daily_brief(self._cmd())
+        self.assertEqual(self.sm.daily_brief_results, [])
+        self.assertEqual(len(self.sm._dbrief_answered), ha.DAILY_BRIEF_RESULTS_MAX)
+
+    def test_manager_start_sweeps_every_oneshot_scratch_file(self):
+        # XERK-2524: a manager killed mid one-shot leaves its reply file.
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(ha, "REGISTRY_DIR", d):
+            names = ["daily-brief-x.out", "attention-hint-y.out", "meeting-z.in",
+                     "daily-brief-keep.json", "decisions.md", "other-a.out"]
+            for n in names:
+                open(os.path.join(d, n), "w").close()
+            os.mkdir(os.path.join(d, "meeting-dir.out"))
+            os.symlink(os.path.join(d, "decisions.md"), os.path.join(d, "meeting-link.out"))
+            ha.SessionManager._sweep_oneshot_scratch()
+            self.assertEqual(sorted(os.listdir(d)), ["daily-brief-keep.json", "decisions.md",
+                                                     "meeting-dir.out", "meeting-link.out",
+                                                     "other-a.out"])
+
     def test_an_unusable_but_reportable_command_is_answered_failed(self):
         self.sm._stage_daily_brief(self._cmd(model="opus"))
         self.assertEqual(self.sm._dbrief_wants, {})

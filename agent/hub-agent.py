@@ -15319,6 +15319,10 @@ ATTENTION_HINTS_ON = os.environ.get("TURMA_ATTENTION_HINTS", "1").strip() != "0"
 ATTENTION_HINT_MODEL = (os.environ.get("TURMA_ATTENTION_HINT_MODEL", "haiku").strip()
                         or "haiku")
 ATTENTION_HINT_TIMEOUT_SEC = _env_int("TURMA_ATTENTION_HINT_TIMEOUT_SEC", 60, minimum=5)
+# Every `_run_lockdown_oneshot` prefix (plus the meeting worker's), swept at
+# manager start: a manager killed mid-run never removes its scratch.
+ONESHOT_SCRATCH_PREFIXES = ("attention-hint-", "daily-brief-", "meeting-")
+ONESHOT_SCRATCH_SUFFIXES = (".in", ".out")
 # The classifier's input is the session's OWN text (its question, its tail), which
 # repo content and tool output can steer, so the one-shot runs with NO tool and NO
 # MCP server: it only has to print one JSON object. The equals form on purpose —
@@ -28039,6 +28043,9 @@ class SessionManager:
         self._dbrief_worker = None
         self._dbrief_wants = {}
         self._dbrief_seen = deque(maxlen=DAILY_BRIEF_RUN_IDS_SEEN)
+        # runId -> the last few answered rows, re-staged for a command the hub
+        # re-sends after losing the delivered answer (a crash before its write).
+        self._dbrief_answered = {}
         self.daily_brief_results = []
         # Meeting extraction (XERK-2509), the daily brief's shape: `_meeting_wants`
         # (runId -> owed job, oldest first) goes to ONE worker
@@ -43473,7 +43480,14 @@ class SessionManager:
             return
         with self._dbrief_lock:
             if job["runId"] in self._dbrief_seen:
-                return  # a re-delivered command: queued, running or answered already
+                # A re-delivered command: queued or running is answered when done;
+                # an answer already carried is staged again (the hub drops it
+                # unless that run is still waiting on this host).
+                row = self._dbrief_answered.get(job["runId"])
+                if (row is not None and len(self.daily_brief_results) < DAILY_BRIEF_RESULTS_MAX
+                        and not any(r is row for r in self.daily_brief_results)):
+                    self.daily_brief_results.append(row)
+                return
             self._dbrief_seen.append(job["runId"])
             if not error:
                 old = self._dbrief_wants.get(job["siteKey"])
@@ -43577,6 +43591,9 @@ class SessionManager:
         else:
             row["error"] = (error or "failed")[:DAILY_BRIEF_ERROR_MAX]
         with self._dbrief_lock:
+            self._dbrief_answered[job["runId"]] = row
+            while len(self._dbrief_answered) > DAILY_BRIEF_RESULTS_MAX:
+                del self._dbrief_answered[next(iter(self._dbrief_answered))]
             self.daily_brief_results.append(row)
             over = len(self.daily_brief_results) - DAILY_BRIEF_RESULTS_MAX
             if over > 0:
@@ -43968,6 +43985,26 @@ class SessionManager:
                 os.remove(path)
             except OSError:
                 pass
+
+    @staticmethod
+    def _sweep_oneshot_scratch():
+        """At manager start, before any worker runs: drop the reply files a
+        killed manager left mid one-shot (`_run_lockdown_oneshot` removes its own
+        only when it returns). None can be in use yet. Regular files only."""
+        try:
+            names = os.listdir(REGISTRY_DIR)
+        except OSError:
+            return
+        for name in names:
+            if not (name.startswith(ONESHOT_SCRATCH_PREFIXES)
+                    and name.endswith(ONESHOT_SCRATCH_SUFFIXES)):
+                continue
+            path = os.path.join(REGISTRY_DIR, name)
+            try:
+                if os.path.isfile(path) and not os.path.islink(path):
+                    os.remove(path)
+            except OSError as e:
+                log(f"one-shot scratch sweep: {name}: {e}")
 
     @staticmethod
     def _kill_attention_hint(proc):
@@ -49169,6 +49206,7 @@ class SessionManager:
         # bring us back. Must be set on the main thread, like SIGUSR1 above.
         signal.signal(signal.SIGTERM, self._handle_shutdown)
         signal.signal(signal.SIGINT, self._handle_shutdown)
+        self._sweep_oneshot_scratch()
         # Load the bundled tmux config into the shared server BEFORE any session
         # launches or `resume_on_boot` adopts — otherwise the whole config (the
         # mouse-wheel scroll routing especially) silently never applies, since the
