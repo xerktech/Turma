@@ -1,0 +1,8 @@
+## haiku: 8/8 pass the parser first time
+  cost/meeting median $0.0031  max $0.0038
+  latency      median 4.3s  max 10.9s
+  expected items met 23/23, right assignee 23, extra items 3, forbidden 1
+## sonnet: 8/8 pass the parser first time
+  cost/meeting median $0.0517  max $0.0611
+  latency      median 4.7s  max 6.7s
+  expected items met 22/23, right assignee 22, extra items 2, forbidden 0

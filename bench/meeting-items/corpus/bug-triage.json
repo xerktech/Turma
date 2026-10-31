@@ -1,0 +1,152 @@
+{
+ "transcript": {
+  "runId": "00000000",
+  "siteKey": "acme.atlassian.net",
+  "meetingId": "bench-bug-triage",
+  "title": "Weekly bug triage",
+  "platform": "zoom",
+  "startedAt": 1793000000000,
+  "endedAt": 1793000055250,
+  "participants": [
+   "Tom Okafor",
+   "Lena Fischer",
+   "Jun Park"
+  ],
+  "segments": [
+   {
+    "speaker": "Jun Park",
+    "text": "first one, the android app crashes when you rotate on the payment screen",
+    "startMs": 4000,
+    "endMs": 7960
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "it's in the crash reports, about two hundred users since monday",
+    "startMs": 8360,
+    "endMs": 11825
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "that sounds like the fragment state loss again",
+    "startMs": 12225,
+    "endMs": 14755
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "i can take it, it's a mobile bug, i'll look today",
+    "startMs": 15155,
+    "endMs": 17850
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "next, customers say the password reset email arrives after like ten minutes",
+    "startMs": 18250,
+    "endMs": 22375
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "i checked, the mail queue worker only runs every ten minutes, that's the cause",
+    "startMs": 22775,
+    "endMs": 27065
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "so not really a bug but we should make reset emails go out immediately",
+    "startMs": 27465,
+    "endMs": 31315
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "yeah i'll change the reset mail to send right away instead of the queue",
+    "startMs": 31715,
+    "endMs": 35620
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "third, the dashboard shows the wrong currency symbol for swiss francs",
+    "startMs": 36020,
+    "endMs": 39815
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "oh that's mine, we hardcode the symbol map, i'll fix the chf symbol",
+    "startMs": 40215,
+    "endMs": 43900
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "and the last one, someone reported the export button does nothing on safari",
+    "startMs": 44300,
+    "endMs": 48425
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "can't reproduce that, can you ask the customer for their safari version Jun",
+    "startMs": 48825,
+    "endMs": 52950
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "sure i'll reach out to them",
+    "startMs": 53350,
+    "endMs": 54850
+   }
+  ]
+ },
+ "repos": [
+  {
+   "name": "billing-api",
+   "description": "Invoices, payments and the dunning jobs"
+  },
+  {
+   "name": "web-app",
+   "description": "Customer dashboard (React)"
+  },
+  {
+   "name": "mobile",
+   "description": "iOS and Android app"
+  },
+  {
+   "name": "infra",
+   "description": "Terraform and Helm for every environment"
+  }
+ ],
+ "expect": [
+  {
+   "kind": "bug",
+   "words": [
+    "rotat"
+   ],
+   "assignee": "Jun Park"
+  },
+  {
+   "kind": "task",
+   "words": [
+    "reset"
+   ],
+   "assignee": "Tom Okafor",
+   "kinds": [
+    "task",
+    "bug"
+   ]
+  },
+  {
+   "kind": "bug",
+   "words": [
+    "franc",
+    "chf",
+    "currency"
+   ],
+   "any": true,
+   "assignee": "Lena Fischer"
+  },
+  {
+   "kind": "followup",
+   "words": [
+    "safari"
+   ],
+   "assignee": "Jun Park"
+  }
+ ],
+ "forbid": []
+}

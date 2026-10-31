@@ -1,0 +1,174 @@
+{
+ "transcript": {
+  "runId": "00000000",
+  "siteKey": "acme.atlassian.net",
+  "meetingId": "bench-sprint-planning",
+  "title": "Sprint 42 planning",
+  "platform": "zoom",
+  "startedAt": 1793000000000,
+  "endedAt": 1793000066515,
+  "participants": [
+   "Priya Raman",
+   "Tom Okafor",
+   "Lena Fischer",
+   "Marco Silva"
+  ],
+  "segments": [
+   {
+    "speaker": "Priya Raman",
+    "text": "okay let's get going, sprint forty two, we have the invoice retry work carried over",
+    "startMs": 4000,
+    "endMs": 8565
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "yeah so the retry job still double charges when stripe times out",
+    "startMs": 8965,
+    "endMs": 12485
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "i think we need an idempotency key on the charge call",
+    "startMs": 12885,
+    "endMs": 15800
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "can you take that Tom",
+    "startMs": 16200,
+    "endMs": 17700
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "sure, i'll add the idempotency key to the charge call in billing api, should be done by thursday",
+    "startMs": 18100,
+    "endMs": 23380
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "on the dashboard side the invoice list is really slow for big accounts",
+    "startMs": 23780,
+    "endMs": 27630
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "we load all invoices at once, i want to add pagination to the invoice list",
+    "startMs": 28030,
+    "endMs": 32100
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "great Lena that's yours then, end of sprint is fine",
+    "startMs": 32500,
+    "endMs": 35305
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "one thing from infra, the staging database is still on postgres thirteen",
+    "startMs": 35705,
+    "endMs": 39665
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "we agreed last month to move to sixteen, i can do the upgrade next week",
+    "startMs": 40065,
+    "endMs": 43970
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "okay Marco, staging postgres upgrade next week",
+    "startMs": 44370,
+    "endMs": 46900
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "and we decided we're dropping the legacy pdf export, nobody uses it",
+    "startMs": 47300,
+    "endMs": 50985
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "yep agreed, we'll remove it from the menu, I'll just do that with the pagination",
+    "startMs": 51385,
+    "endMs": 55785
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "um, also somebody should check with finance whether they still need the monthly csv",
+    "startMs": 56185,
+    "endMs": 60750
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "I'll ask finance about the monthly csv this week",
+    "startMs": 61150,
+    "endMs": 63790
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "alright, that's it, thanks everyone",
+    "startMs": 64190,
+    "endMs": 66115
+   }
+  ]
+ },
+ "repos": [
+  {
+   "name": "billing-api",
+   "description": "Invoices, payments and the dunning jobs"
+  },
+  {
+   "name": "web-app",
+   "description": "Customer dashboard (React)"
+  },
+  {
+   "name": "mobile",
+   "description": "iOS and Android app"
+  },
+  {
+   "name": "infra",
+   "description": "Terraform and Helm for every environment"
+  }
+ ],
+ "expect": [
+  {
+   "kind": "task",
+   "words": [
+    "idempotency"
+   ],
+   "assignee": "Tom Okafor"
+  },
+  {
+   "kind": "task",
+   "words": [
+    "paginat"
+   ],
+   "assignee": "Lena Fischer"
+  },
+  {
+   "kind": "task",
+   "words": [
+    "postgres"
+   ],
+   "assignee": "Marco Silva"
+  },
+  {
+   "kind": "decision",
+   "words": [
+    "pdf"
+   ],
+   "kinds": [
+    "decision",
+    "task"
+   ]
+  },
+  {
+   "kind": "followup",
+   "words": [
+    "finance"
+   ],
+   "assignee": "Priya Raman"
+  }
+ ],
+ "forbid": []
+}

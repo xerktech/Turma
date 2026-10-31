@@ -1,0 +1,86 @@
+{
+ "transcript": {
+  "runId": "00000000",
+  "siteKey": "acme.atlassian.net",
+  "meetingId": "bench-small-talk",
+  "title": "Friday coffee",
+  "platform": "zoom",
+  "startedAt": 1793000000000,
+  "endedAt": 1793000025215,
+  "participants": [
+   "Priya Raman",
+   "Marco Silva",
+   "Jun Park"
+  ],
+  "segments": [
+   {
+    "speaker": "Priya Raman",
+    "text": "hey how was everyone's week",
+    "startMs": 4000,
+    "endMs": 5500
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "good, long, the kids had a school play on wednesday",
+    "startMs": 5900,
+    "endMs": 8705
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "nice, i finally finished that book about the apollo program",
+    "startMs": 9105,
+    "endMs": 12350
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "oh which one",
+    "startMs": 12750,
+    "endMs": 14250
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "the one about the computers, really good",
+    "startMs": 14650,
+    "endMs": 16850
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "anyone watching the football this weekend",
+    "startMs": 17250,
+    "endMs": 19505
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "probably, if it doesn't rain we're going hiking though",
+    "startMs": 19905,
+    "endMs": 22875
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "okay have a good weekend all",
+    "startMs": 23275,
+    "endMs": 24815
+   }
+  ]
+ },
+ "repos": [
+  {
+   "name": "billing-api",
+   "description": "Invoices, payments and the dunning jobs"
+  },
+  {
+   "name": "web-app",
+   "description": "Customer dashboard (React)"
+  },
+  {
+   "name": "mobile",
+   "description": "iOS and Android app"
+  },
+  {
+   "name": "infra",
+   "description": "Terraform and Helm for every environment"
+  }
+ ],
+ "expect": [],
+ "forbid": []
+}
