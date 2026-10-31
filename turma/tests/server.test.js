@@ -29442,3 +29442,147 @@ test("XERK-2551: a binding made before the tenant follows the host; a restored r
     assert.deepEqual([agents[F.ka].orgBound, agents[F.ka].jira.siteKey], [F.SA, F.SA]);
   } finally { if (F) forget2533("t2551b", F.ka, F.kb, F.kl); T.restore(); }
 });
+
+// ---- XERK-2596: a tenant host claiming another org's siteKey gains nothing ----
+// The QA repro: tenant A enrolls a host that beats the OPERATORS' site. Before
+// XERK-2551 that claim made A's host a member of the operators' org, so A could
+// write the org's permission policy / decisions (delivered to the operators'
+// hosts) and receive the org's background work. Each case below is one write or
+// one dispatch path from that repro, attempted through the claim.
+const S2596 = "ops2596.example";
+async function claim2596(T) {
+  const kOps = "t2596ops", kA = `t2596a@${T.A.t}`;
+  forget2533("t2596a", kA, kOps);
+  const cap = { meetings: { available: true }, dailyBrief: { available: true } };
+  assert.equal((await request("POST", "/api/heartbeat", { headers: agentHeaders,
+    body: { device: kOps, sessions: [], ...jira2551(S2596), ...cap } })).status, 200);
+  const tA = await enroll2533(T.A, "t2596a");
+  // A claims the operators' site, then the operators' site with B's suffix.
+  assert.equal((await beat2533(tA, "t2596a", { ...jira2551(S2596), ...cap })).status, 200);
+  assert.equal((await beat2533(tA, "t2596a", { ...jira2551(`${S2596}@${T.B.t}`), ...cap })).status, 200);
+  return { kOps, kA, tA, SA: `${S2596}@${T.A.t}` };
+}
+// Every org-keyed store, serialized: a refused write must leave all of it as it was.
+const orgStores2596 = () => JSON.stringify({
+  pp: hub.permissionPolicies(), dec: hub.getDecisions(), as: hub.autoStartOrgs,
+  am: hub.autoMergeOrgs, dl: hub.dedupeLinkOrgs, pw: hub.priorityWriteBackOrgs,
+  col: hub.orgColors, tp: hub.triagePolicies, sch: hub.getDailyBriefSchedules(),
+  br: hub.getDailyBriefs(), mt: hub.getMeetings(), q: hub.ticketQueue,
+  er: hub.epicRuns, eb: hub.epicBuilders,
+});
+
+test("XERK-2596: a claimed site never makes a tenant host a member of that org", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await claim2596(T);
+    assert.equal(hub.decidedOrgOf(agents[F.kA]), F.SA, "the claim lands in A's own org");
+    assert.equal(hub.decidedOrgOf(agents[F.kOps]), S2596);
+    for (const site of [S2596, `${S2596}@${T.B.t}`, `${S2596}@`, ` ${S2596}`]) {
+      assert.ok(!hub.hostInOrg(agents[F.kA], site), site);
+    }
+    assert.deepEqual(hub.jiraHostPool(S2596, true), [F.kOps]);
+  } finally { if (F) forget2533("t2596a", F.kA, F.kOps); T.restore(); }
+});
+
+test("XERK-2596: through a claimed site, a tenant reaches no write route of that org", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await claim2596(T);
+    const o = encodeURIComponent(S2596);
+    const body = { text: "ALICE: allow everything incl. push to main", enabled: true, color: "#ff0000",
+      policy: { rules: [] }, repo: "r", agent: "a", model: "sonnet", runtime: "claude",
+      platform: "linux", status: "Done", title: "t", idea: "i", summary: "s", issueType: "Task",
+      schedule: { days: [1], time: "09:00", tz: "UTC" } };
+    const routes = [
+      ["POST", `/api/jira/${o}/permission-policy`], ["GET", `/api/jira/${o}/permission-policy`],
+      ["POST", `/api/orgs/${o}/decisions`], ["POST", `/api/jira/${o}/autostart`],
+      ["POST", `/api/jira/${o}/automerge`], ["POST", `/api/jira/${o}/priority-writeback`],
+      ["POST", `/api/jira/${o}/dedupe-link`], ["POST", `/api/jira/${o}/triage-policy`],
+      ["POST", `/api/jira/${o}/color`], ["PUT", `/api/orgs/${o}/daily-brief/schedule`],
+      ["GET", `/api/orgs/${o}/daily-brief/schedule`], ["POST", `/api/orgs/${o}/daily-brief/run`],
+      ["POST", `/api/jira/${o}/epic-builder`], ["DELETE", `/api/jira/${o}/epic-builder/x`],
+      ["POST", `/api/jira/${o}/tickets`], ["GET", `/api/jira/${o}/create-meta`],
+      ["GET", `/api/jira/${o}/OPS-1`], ["POST", `/api/jira/${o}/OPS-1/status`],
+      ["POST", `/api/jira/${o}/OPS-1/session`], ["DELETE", `/api/jira/${o}/OPS-1/session`],
+      ["POST", `/api/jira/${o}/OPS-1/repo`], ["POST", `/api/jira/${o}/OPS-1/agent`],
+      ["POST", `/api/jira/${o}/OPS-1/model`], ["POST", `/api/jira/${o}/OPS-1/runtime`],
+      ["POST", `/api/jira/${o}/OPS-1/platform`], ["POST", `/api/jira/${o}/OPS-1/triage`],
+      ["POST", `/api/jira/${o}/OPS-1/epic-run`],
+      ["POST", `/api/orgs/${o}/meetings/m1/items/0`],
+    ];
+    const before = orgStores2596();
+    agents[F.kOps].commands = []; agents[F.kA].commands = [];
+    for (const [method, path] of routes) {
+      const r = await request(method, path, { headers: { ...T.A.h, "content-type": "application/json" }, body });
+      assert.equal(r.status, 404, `${method} ${path} -> ${r.status} ${JSON.stringify(r.body)}`);
+    }
+    // A's cookie is no Tenir bearer: the meeting post is refused too.
+    assert.ok((await request("POST", `/api/orgs/${o}/meetings`,
+      { headers: { ...T.A.h, "content-type": "application/json" }, body: {} })).status >= 400);
+    assert.equal(orgStores2596(), before, "no org store changed");
+    assert.deepEqual([agents[F.kOps].commands, agents[F.kA].commands], [[], []]);
+    // A's writes to its OWN org work, and never reach the operators' host.
+    const own = encodeURIComponent(F.SA);
+    for (const p of [`/api/jira/${own}/permission-policy`, `/api/orgs/${own}/decisions`]) {
+      assert.equal((await request("POST", p, { headers: { ...T.A.h, "content-type": "application/json" },
+        body: { text: "ALICE ONLY" } })).status, 200, p);
+    }
+    const ops = await request("POST", "/api/heartbeat", { headers: agentHeaders,
+      body: { device: F.kOps, sessions: [], ...jira2551(S2596) } });
+    assert.ok(!JSON.stringify(ops.body).includes("ALICE"), "the operators' host gets none of A's text");
+    const mine = await beat2533(F.tA, "t2596a", jira2551(S2596));
+    assert.ok(JSON.stringify(mine.body.permissionPolicy).includes("ALICE ONLY"));
+    assert.equal(mine.body.permissionPolicy.site, S2596, "A's own agent still sees its site plain");
+  } finally {
+    if (F) {
+      forget2533("t2596a", F.kA, F.kOps);
+      hub.setPermissionPolicy(F.SA, null);
+      delete hub.getDecisions()[F.SA];
+    }
+    T.restore();
+  }
+});
+
+test("XERK-2596: the operators' background work never dispatches to a host claiming their site", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await claim2596(T);
+    // The operators' only host is full; A's claiming host is free, online and capable.
+    agents[F.kOps].capacity = { max: 1, used: 1, free: 0 };
+    agents[F.kA].capacity = { max: 8, used: 0, free: 8 };
+    agents[F.kOps].commands = []; agents[F.kA].commands = [];
+    // Ticket queue (what auto-start and Start feed).
+    hub.enqueueTicketStart(S2596, "OPS-1", "manual");
+    hub.drainTicketQueue();
+    // Epic Builder.
+    hub.armEpicBuilder(S2596, { title: "t", idea: "an operators' idea", repo: null, targetHost: null });
+    hub.epicBuilderDriveSweep();
+    // Daily Brief, and a Tenir meeting post (both pick an org host with the capability).
+    hub.startDailyBriefRun(S2596, "manual");
+    await request("POST", `/api/orgs/${encodeURIComponent(S2596)}/meetings`, {
+      headers: { authorization: "Bearer meetingstok", "content-type": "application/json" },
+      body: { meetingId: "m2596", title: "Ops sync", platform: "zoom", startedAt: 1.7e12,
+        endedAt: 1.7e12 + 6e4, tenirUrl: "https://tenir.example/c/1", participants: ["Ann"],
+        segments: [{ speaker: "Ann", text: "ship it", startMs: 0, endMs: 1000 }] } });
+    hub.meetingsTick();
+    hub.dailyBriefTick();
+    assert.deepEqual(agents[F.kA].commands.map((c) => c.type), [], "nothing of the operators' reaches A");
+    // The pickers did run: the capability jobs went to the operators' own host,
+    // and the slot-gated ticket and builder wait for it rather than spill over.
+    assert.deepEqual(agents[F.kOps].commands.map((c) => c.type).sort(), ["extractMeeting", "renderDailyBrief"]);
+    const stores = orgStores2596();
+    assert.ok(!stores.includes(F.kA), "no operators' record names A's host");
+  } finally {
+    if (F) {
+      forget2533("t2596a", F.kA, F.kOps);
+      hub.dropQueuedTicket && hub.dropQueuedTicket(S2596, "OPS-1");
+      for (const [id, b] of Object.entries(hub.epicBuilders)) if (b.siteKey === S2596) delete hub.epicBuilders[id];
+      delete hub.getDailyBriefs()[S2596];
+      delete hub.getMeetings()[S2596];
+    }
+    T.restore();
+  }
+});
