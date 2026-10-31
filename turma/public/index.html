@@ -56,6 +56,13 @@
   .host-name .host-ver { color: var(--muted); font-size: 12px; font-weight: 400; word-break: break-word; }
   .host-name .caret { color: var(--muted); font-size: 11px; flex-shrink: 0; transition: transform 0.15s; }
   .host-card.collapsed .host-name .caret { transform: rotate(-90deg); }
+  /* Phones (XERK-2589): the chips + Roll token/Restart + status otherwise take
+     the whole row and squeeze the name to one letter per line. Give the name its
+     own row and let the actions wrap beneath it. */
+  @media (max-width: 560px) {
+    .host-top { flex-wrap: wrap; row-gap: 8px; }
+    .host-name { flex-basis: 100%; }
+  }
   /* Claude subscription-login health chip (XERK-98) — only ever rendered when
      it needs action, so its presence alone flags a host that can't run. Red
      when the login has lapsed, amber when it's about to. */
