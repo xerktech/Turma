@@ -1,6 +1,8 @@
 ---
 paths:
   - "turma/server.js"
+  - "turma/public/meetings.html"
+  - "turma/tests/meetings.test.js"
   - "agent/hub-agent.py"
   - "turma/tests/server.test.js"
   - "agent/tests/test_hub_agent.py"
@@ -62,8 +64,42 @@ ticket builds to this file; change it here first.
     are pending.
 - A meeting arriving while another of the org is running waits `queued`; ONE run per org.
 - An org no host is decided into loses its meetings 30 days after its newest one arrived.
-- Serving it to clients (top-level `meetingProposals` + SSE, never `segments`) and the review
-  fields on an item are XERK-2510's; add them to `sanitizeMeeting`'s whitelist there.
+- **Served** as top-level `meetingProposals` on `/api/agents` + its own `meetingProposals` SSE
+  frame (whole map, coalesced per turn): each org's newest `MEETINGS_WIRE_TAIL` (20) rows through
+  `meetingWire` — never `segments`/`cmdId`/`sentAt`/`attempt`/`tried`.
+
+## The operator's review (hub, XERK-2510)
+
+- `POST /api/orgs/<siteKey>/meetings/<meetingId>/items/<itemId>` — OPERATOR-authed (only the
+  4-part POST is Tenir's token route). Body `{action:"approve"|"reject", title?, description?,
+  project?, issueType?, start?}`; answers `{ok, meeting}` or a refusal in the hub's words:
+  400 body/action/fields → 404 org no host is decided into / meeting / item → 409 meeting not
+  `ok`, item already `creating`/`created`/`logged`, or rejecting a rejected one.
+- **Approve queues the SAME `createTicket` the New-ticket modal does** (`queueCreateTicket`:
+  single-flight, ranked board-write host of THAT org, gap refusal). The tracker write stays the
+  operator's action — nothing creates a ticket from a model's output unasked.
+- **A `decision` item never touches the board**: approve appends `{source:"meeting", text, label:
+  <meeting title>}` to the decisions log, so every same-org session receives it on its reply.
+  Approval-gated on purpose: the log reaches every session's context.
+- `item.review` (whitelisted in `sanitizeMeetingReview`, measured OUTSIDE the items byte budget so a
+  review never cuts an item): `{state:"creating"|"created"|"failed"|"rejected"|"logged", at,
+  project?, issueType?, edited?, cmdId+host (creating), key+url? (created), error (failed),
+  start?, session:"waiting"|"queued"|"failed" + sessionError? (created with start)}`.
+  - **Never taken from an agent**: `ingestMeetingResults` drops a `review` off every result item.
+- `settleMeetingReviews` (on `meetingsTick` and on a beat carrying `createTicketResults`): the
+  owning host's `createResults[cmdId]` → `created` (and every org host is asked to `refreshJira`)
+  or `failed`; that host offline/gapped → `failed` in the GET poll's honest words (XERK-241).
+- **A `creating` review fails at `MEETING_CREATE_DEADLINE_MS`** (15 min) with no answer: a hub
+  killed before the host took the command (debounced queue, unpersisted result caches) otherwise
+  left it `creating` forever, refusing both Approve and Reject.
+- `edited` is the page's own flag (or a changed title): the page always sends the meeting context
+  as the description, so a text compare reads every approve as edited.
+- Tenir's duplicate answer (`meetingTenirWire`) carries no `review`.
+- A meeting decision's `label` (the meeting title) rides the heartbeat reply (`decisionsReplyFor`).
+- **Approve + start** waits (`session:"waiting"`) until `ticketRepo` resolves the new ticket on the
+  board, then `enqueueTicketStart(..., "manual")` — the Start button's queue. Past
+  `MEETING_START_WAIT_MS` (2h) it gives up with "start it from the board".
+- Tests: the `XERK-2510:` cases in `server.test.js` (a Jira org AND an ADO org).
 
 ## Hub → agent: the `extractMeeting` command (XERK-2508 / XERK-2509)
 

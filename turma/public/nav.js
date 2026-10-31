@@ -52,6 +52,11 @@
       join: `stroke-linejoin="round"`,
     },
     {
+      id: "meetings", href: "/meetings", label: "Meetings",
+      icon: `<path d="M4 5h16v11H9l-5 4z"/><path d="M8 9h8"/><path d="M8 12h5"/>`,
+      join: `stroke-linejoin="round"`,
+    },
+    {
       id: "usage", href: "/usage", label: "Usage",
       icon: `<path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/>`,
     },

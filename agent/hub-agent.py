@@ -15665,6 +15665,14 @@ def render_decisions(org, entries):
             if not text:
                 continue
             body = f"note: {text}"
+        elif e.get("source") == "meeting":
+            # A decision the operator approved from a meeting (XERK-2510);
+            # `label` is the meeting's title.
+            text = _decision_cell(e.get("text"), 500)
+            if not text:
+                continue
+            meeting = _decision_cell(e.get("label"), 120)
+            body = f"meeting decision ({meeting}): {text}" if meeting else f"meeting decision: {text}"
         else:
             q, a = _decision_cell(e.get("question")), _decision_cell(e.get("answer"), 200)
             if not q or not a:

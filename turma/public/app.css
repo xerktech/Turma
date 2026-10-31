@@ -1255,13 +1255,17 @@ body.td-open { overflow: hidden; }
     background: color-mix(in srgb, var(--surface) 88%, transparent);
     backdrop-filter: saturate(1.4) blur(10px);
     border-top: 1px solid var(--hairline);
-    padding: 4px 8px calc(4px + env(safe-area-inset-bottom));
+    padding: 4px 2px calc(4px + env(safe-area-inset-bottom));
   }
+  /* Seven tabs (XERK-2510): min-width 0 lets a long label share the row evenly. */
   .bottom-nav a {
-    flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
-    color: var(--muted); text-decoration: none; font-size: 11px; padding: 6px 0 4px;
+    flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 2px;
+    color: var(--muted); text-decoration: none; font-size: 10.5px; padding: 6px 0 4px;
   }
   .bottom-nav a svg { width: 21px; height: 21px; }
+  .bottom-nav a { overflow: hidden; white-space: nowrap; }
+  @media (max-width: 380px) { .bottom-nav a { font-size: 9.5px; letter-spacing: -0.2px; } }
+  @media (max-width: 340px) { .bottom-nav a { font-size: 8.5px; letter-spacing: -0.3px; } }
   .bottom-nav a.active { color: var(--accent); }
   body { padding-bottom: 68px; }
   /* Clear the bottom nav: the toast is now on every page (XERK-264), and at its
