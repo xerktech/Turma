@@ -214,10 +214,6 @@ class FreshWriteTest(unittest.TestCase):
         self.assertEqual(self._victim(), "untouched")
         self.assertFalse(os.path.islink(dest))
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ParentLinkTest(unittest.TestCase):
     """XERK-2570: a symlink planted at a PARENT directory below the anchor is
     refused by every anchored write helper, on both the fd-relative path and
@@ -297,3 +293,22 @@ class ParentLinkTest(unittest.TestCase):
                 rt.open_for_append(os.path.join(fresh, "t.jsonl"), anchor=fresh,
                                    create=True).close()
                 self.assertTrue(os.path.isfile(os.path.join(fresh, "t.jsonl")))
+
+    def test_child_projection_rewrite_never_truncates_through_a_linked_parent(self):
+        src = os.path.join(self.tmp, "child.jsonl")
+        with open(src, "w") as fh:
+            fh.write("x" * 10)
+
+        class _Proj:
+            def feed(self, ev):
+                return []
+
+        cp = rt.ChildProjection(_Proj, self.target, anchor=self.anchor)
+        cp.offset = 100                    # larger than src: reads as rewritten
+        cp.pump(src, lambda path, entries: None)
+        with open(self.victim) as f:
+            self.assertEqual(f.read(), "untouched")
+
+
+if __name__ == "__main__":
+    unittest.main()

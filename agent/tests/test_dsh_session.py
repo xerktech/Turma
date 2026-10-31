@@ -532,6 +532,23 @@ class DshDelegationTailTest(unittest.TestCase):
         self.tail._move_child_file(os.path.join(slug, "absent.jsonl"), new)
         self.assertFalse(os.path.exists(outside))
 
+    def test_child_append_never_written_through_a_symlinked_subagents_dir(self):
+        # XERK-2570: a child pumped while `<stem>/subagents` is a link — neither
+        # the create nor the projected append may land in the link's target.
+        stem = self.transcript[:-len(".jsonl")]
+        outside = os.path.join(self.tmp, "outside-app")
+        os.makedirs(outside)
+        os.makedirs(stem, exist_ok=True)
+        os.symlink(outside, os.path.join(stem, "subagents"))
+        self._parent([
+            {"type": "turma/subagent-start", "seq": "sa-start-r", "time": 1000,
+             "data": {"runId": "r", "childId": "childx", "label": "L"}},
+        ])
+        self._child("childx")
+        self.tail._pump()
+        self.assertEqual(os.listdir(outside), [])
+        self.assertTrue(self._read(self.transcript))   # the child really was pumped
+
     def test_workflow_record_never_written_through_a_symlinked_parent_dir(self):
         # XERK-2570: `<stem>/workflows` replaced by a symlink to an outside dir
         # holding `wf_<id>.json` — the outside file must stay untouched (the

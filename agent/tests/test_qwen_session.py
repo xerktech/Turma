@@ -540,6 +540,21 @@ class QwenDelegationTailTest(unittest.TestCase):
             self.projects_root, self.transcript, self.sid,
             cwd="/repos/wt", log=lambda m: None, events_path=None)
 
+    def test_child_append_never_written_through_a_symlinked_subagents_dir(self):
+        # XERK-2570: the projected child's `subagents/` dir planted as a link —
+        # the reset and the projected append both stay out of its target.
+        self._write(self.native_log, self._fixture("qwen_delegation_corpus.json"))
+        self._write(self.child_native, self._fixture("qwen_delegation_child.json"))
+        outside = os.path.join(self.tmp, "outside-app")
+        os.makedirs(outside)
+        sub = os.path.dirname(self.projected_child)
+        os.makedirs(os.path.dirname(sub), exist_ok=True)
+        os.symlink(outside, sub)
+        tail = self._tail()
+        self.addCleanup(tail.stop)
+        tail._pump()
+        self.assertEqual(os.listdir(outside), [])
+
     def test_child_log_is_projected_into_the_claude_layout_and_resolves(self):
         # Parent delegation native log + the child's OWN native log on disk.
         self._write(self.native_log, self._fixture("qwen_delegation_corpus.json"))
