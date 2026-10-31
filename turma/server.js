@@ -2886,23 +2886,25 @@ function bootstrapTenancy() {
   if (!!BOOTSTRAP_ADMIN_USER !== !!BOOTSTRAP_ADMIN_PASSWORD) {
     console.warn("WARNING: only one of TURMA_BOOTSTRAP_ADMIN_USER / TURMA_BOOTSTRAP_ADMIN_PASSWORD is set — no bootstrap admin will be created");
   }
-  if (!BOOTSTRAP_CONFIGURED) return;
-  try {
+  if (BOOTSTRAP_CONFIGURED) try {
     const r = tenancy.bootstrapAdmin(tenancyState, { username: BOOTSTRAP_ADMIN_USER, password: BOOTSTRAP_ADMIN_PASSWORD });
     if (r) {
       setTenancy(r.state);
       console.log(`tenancy: created the bootstrap admin (user ${r.user.id})`);
     } else {
-      console.log("tenancy: bootstrap admin skipped — a local account already exists");
+      console.log("tenancy: bootstrap admin skipped — a local account already exists (the pair only seeds an empty store)");
     }
   } catch (e) {
     console.error(`tenancy: bootstrap admin not created: ${e && e.message}`);
   }
-  // The bootstrap pair closes the hub, so say so when nothing can open it.
+  // A local account or the pair closes the hub, so say so when nothing can open it.
+  if (!hasLocalUsers() && !BOOTSTRAP_CONFIGURED) return; // open hub, warned at boot
   const usable = Object.values(tenancyState.users).some((u) => u.source === "local" && !u.disabled &&
     tenancy.effectiveRoles(tenancyState, u).length);
   if (!TURMA_PASSWORD && !usable) {
-    console.error("ERROR: no break-glass password and no usable local account — this hub admits NOBODY (OIDC aside) until TURMA_BOOTSTRAP_ADMIN_* is fixed or TURMA_PASSWORD is set");
+    console.error(hasLocalUsers()
+      ? "ERROR: no break-glass password and every local account is disabled or role-less — this hub admits NOBODY (OIDC aside) until TURMA_PASSWORD is set"
+      : "ERROR: no break-glass password and no usable local account — this hub admits NOBODY (OIDC aside) until TURMA_BOOTSTRAP_ADMIN_* is fixed or TURMA_PASSWORD is set");
   }
 }
 bootstrapTenancy();
