@@ -12928,6 +12928,44 @@ test("auto-stop: fires each session at most once, across repeated sweeps", async
   assert.equal((agents.apOnce.commands || []).filter((c) => c.type === "kill").length, 1);
 });
 
+// ---- a session ADOPTED onto a ticket by its branch name is never auto-stopped (XERK-2547) ----
+// A bare "new session" the agent linked to a ticket only from its branch name
+// (XERK-817, `ticket.adopted`) was started by the operator, who closes it. Killing
+// it on Done ended manual work early: a branch named after an already-Done ticket
+// was killed within a beat, and an auto-started twin closing the shared ticket
+// killed the manual session with it.
+
+test("auto-stop: an ADOPTED session on a Done ticket is not killed (XERK-2547)", async () => {
+  autoStopped.clear();
+  await asBeat("apAdopt", "ap11.atlassian.net", {
+    tickets: [{ key: "ENG-9", statusCategory: "done",
+                repoGuess: { repo: "Turma", cloned: true } }],
+    sessions: [
+      { id: "sd-manual", status: "running",
+        ticket: { key: "ENG-9", siteKey: "ap11.atlassian.net", adopted: true } },
+      // The auto-started twin on the same ticket keeps today's behaviour.
+      { id: "sd-auto", status: "running",
+        ticket: { key: "ENG-9", siteKey: "ap11.atlassian.net" } },
+    ],
+  });
+  autoStopSweep();
+  assert.deepEqual((agents.apAdopt.commands || []).filter((c) => c.type === "kill")
+    .map((c) => c.sessionId), ["sd-auto"]);
+});
+
+test("auto-stop: only a strict adopted:true exempts a session (XERK-2547)", async () => {
+  autoStopped.clear();
+  await asBeat("apAdopt2", "ap12.atlassian.net", {
+    tickets: [{ key: "ENG-9", statusCategory: "done",
+                repoGuess: { repo: "Turma", cloned: true } }],
+    sessions: [{ id: "sd1", status: "running",
+                 ticket: { key: "ENG-9", siteKey: "ap12.atlassian.net", adopted: "yes" } }],
+  });
+  autoStopSweep();
+  assert.deepEqual((agents.apAdopt2.commands || []).filter((c) => c.type === "kill")
+    .map((c) => c.sessionId), ["sd1"]);
+});
+
 // ---- resuming a Done-ticket session overrides auto-stop (XERK-561) ------------
 // Deliberately resuming an ended session whose ticket is already Done is the
 // operator overriding auto-stop — they want it running again despite Done.
