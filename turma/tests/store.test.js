@@ -185,6 +185,31 @@ test("XERK-754: a durable key persists JSON byte-for-byte via temp+rename", asyn
   assert.deepEqual(leftovers, [], "no .tmp- file left after an atomic write");
 });
 
+test("XERK-2508: overlapping debounce-0 writes land whole and newest, never torn", async () => {
+  const dir = mkdtemp("turma-store-");
+  const file = path.join(dir, "big.json");
+  const s = new FileLiveStore({ persistent: { big: { file, debounceMs: 0 } } });
+  // Large values written back to back: before the per-key serialization two
+  // writes shared one tmp path and a torn or older blob could be renamed in.
+  const big = (n) => ({ n, pad: "x".repeat(4 << 20) });
+  for (let n = 1; n <= 6; n++) {
+    await s.set("big", big(n));
+    await new Promise((r) => setTimeout(r, 1));
+  }
+  for (let i = 0; i < 400 && JSON.parse(fs.readFileSync(file, "utf8")).n !== 6; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).n, 6, "the newest value landed");
+  assert.equal(s._writing.size, 0, "no write left in flight");
+  // A sync flush wins over an async write still in flight.
+  await s.set("big", big(7));
+  await s.set("big", { n: 8 });
+  s.flush();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).n, 8);
+  assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes(".tmp-")), []);
+});
+
 test("XERK-754: a durable key reloads on a fresh store (restart restore)", async () => {
   const dir = mkdtemp("turma-store-");
   const file = path.join(dir, "policy.json");

@@ -20,7 +20,8 @@ ticket builds to this file; change it here first.
 - Body: `{meetingId, title, platform, startedAt, endedAt, tenirUrl, participants[],
   segments[{speaker, text, startMs, endMs}]}`.
   - `meetingId` `^[A-Za-z0-9._:-]{1,128}$` (Tenir's own id); `title` ≤300; `platform` ≤40
-    (`zoom`, `teams`, …); times epoch ms; `tenirUrl` an http(s) URL ≤500 or absent.
+    (`zoom`, `teams`, …); times epoch ms; `tenirUrl` an http(s) URL ≤500 with no quote, space,
+    backslash or angle bracket (it is rendered as a link), or absent.
   - `participants` ≤100 names ≤100; `segments` 1..`MEETING_SEGMENTS_MAX` (10000), `speaker` ≤100,
     `text` ≤2000, `startMs`/`endMs` offsets in ms from `startedAt`.
   - Text is code points with control/bidi characters removed (`meetingText`); a segment with no
@@ -29,7 +30,12 @@ ticket builds to this file; change it here first.
   401 bad token → 404 an org no host is DECIDED into (`decidedOrgs`) → 413 body over
   `MEETING_BODY_MAX` (1 MiB) or too many segments → 400 a malformed field → 409 the store full
   → 429 too many meetings waiting (`MEETINGS_PENDING_ORG_MAX` 10 per org,
-  `MEETINGS_PENDING_TOTAL_MAX` 20 fleet-wide: each pending row holds its transcript in the store).
+  `MEETINGS_PENDING_TOTAL_MAX` 20 fleet-wide, or pending transcripts past
+  `MEETINGS_PENDING_BYTES_MAX` 2 MiB fleet-wide).
+- **Why the byte budget**: the store is written whole on every change (and published whole to the
+  peer under HA); at 20 × 1 MiB each write blocked the event loop ~1 s and pushed RSS past the
+  512Mi pod limit (XERK-2508 QA). An hour of captions is ~60 KB. Do not raise it without moving
+  transcripts out of the policy store.
 - **Idempotent on `meetingId` per org**: a repeat answers 200 `{ok, meeting, duplicate:true}`
   and changes nothing (first copy wins), so Tenir retries freely, also after a hub restart.
 - Answers `{ok, meeting}`: the row without its transcript.
@@ -60,8 +66,10 @@ ticket builds to this file; change it here first.
 - **The command carries no transcript** (a command rides the host record and `state.json`). The
   agent pulls it: `GET /api/agents/<host>/meetings/<runId>/transcript` (agent-authed, `<host>`
   proved by the credential, XERK-268) answers `{runId, siteKey, meetingId, title, platform,
-  startedAt, endedAt, participants, segments}` ONLY to the host the run was sent to, while that
-  host is decided into `siteKey` and the run is `running`; anything else is 404.
+  startedAt, endedAt, participants, segments}` ONLY on the asked host's path, while that host is
+  decided into `siteKey` and the run is `running`; anything else is 404. The gate is
+  `agentHostRefusal`, so (as on every `<host>` route) the operator login and, until
+  `TURMA_AGENT_STRICT`, the master token pass it too.
 - Host: the SAME pick as the Daily Brief (`pickCapabilityHost`): `jiraHostPool(siteKey, true)` ∩
   `meetings.available === true`, a host with `claudeAuth.needsLogin` last, runtime/models as
   `pickDailyBriefHost`.
@@ -86,6 +94,8 @@ ticket builds to this file; change it here first.
   `{kind:"task"|"bug"|"followup"|"decision", title ≤200, description ≤4000, suggestedAssignee
   ≤100?, due ≤40?, quotes[{speaker ≤100, text ≤500, atMs}] ≤5, duplicateKeys[] ≤5 issue keys,
   repoGuess ≤200?}`. A title-less or unknown-kind item is dropped; the hub stamps `id` "p1".."pN".
+  Item text is stored as plain text, markup included: every client renders it ESCAPED.
+  A result's `model` counts only as `^[A-Za-z0-9._:-]{1,40}$`, else the row keeps the one sent.
 - Both keys are in `HEARTBEAT_KNOWN_KEYS`; `meetingResults` is deleted from the payload before
   the record is stored.
 - Tests: the `XERK-2508:` cases in `server.test.js`.

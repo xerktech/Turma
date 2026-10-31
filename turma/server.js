@@ -4314,6 +4314,9 @@ const MEETING_SEGMENTS_MAX = 10000;
 const MEETING_ITEMS_MAX = 30;
 const MEETING_ERROR_MAX = 300;
 const MEETING_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+// No quote, bracket or space: the URL will be rendered as a link (XERK-2510).
+const MEETING_URL_RE = /^https?:\/\/[^\s"'`<>\\]{1,492}$/i;
+const MEETING_MODEL_RE = /^[A-Za-z0-9._:-]{1,40}$/;
 const MEETING_STATUSES = new Set(["queued", "running", "ok", "failed"]);
 const MEETING_ITEM_KINDS = new Set(["task", "bug", "followup", "decision"]);
 const MEETING_PENDING = new Set(["queued", "running"]);
@@ -4383,13 +4386,10 @@ function sanitizeMeeting(v) {
     if (t === null) return null;
     out[k] = t;
   }
-  if (typeof v.tenirUrl === "string" && v.tenirUrl.length <= 500 && /^https?:\/\/[^\s"<>]+$/.test(v.tenirUrl)) {
-    out.tenirUrl = v.tenirUrl;
-  }
+  if (typeof v.tenirUrl === "string" && MEETING_URL_RE.test(v.tenirUrl)) out.tenirUrl = v.tenirUrl;
   out.participants = [...new Set((Array.isArray(v.participants) ? v.participants : []).slice(0, 200)
     .map((p) => meetingText(p, 100)).filter(Boolean))].slice(0, 100);
-  const model = meetingText(v.model, 40);
-  if (model) out.model = model;
+  if (typeof v.model === "string" && MEETING_MODEL_RE.test(v.model)) out.model = v.model;
   if (typeof v.host === "string" && v.host && v.host.length <= 200) out.host = v.host;
   if (typeof v.runId === "string" && DAILY_BRIEF_RUN_ID_RE.test(v.runId)) out.runId = v.runId;
   if (MEETING_PENDING.has(v.status)) {
@@ -8961,8 +8961,10 @@ function normalizeCloseTicket(payload) {
 // `renderDailyBrief` command. Only a host reporting it is asked — an older agent
 // would ack the command and never answer. Coerced like normalizeCloseTicket; the
 // agent's `runtimes`/`models` (XERK-2394) keep only known names, absent when sent none.
-const DAILY_BRIEF_CAP_LISTS = { runtimes: ["claude", "dsh", "qwen"], models: ["haiku", "sonnet"] };
 // The Meetings block (XERK-2508, `extractMeeting`) has the same shape and rules.
+// Runs from loadState's restore loop at module init, so the known lists are
+// inline literals: a module const here is in its TDZ there and empties the
+// whole registry on restore (XERK-301).
 function normalizeRunCapability(payload, cap) {
   if (!payload || typeof payload !== "object") return;
   const t = payload[cap];
@@ -8971,7 +8973,8 @@ function normalizeRunCapability(payload, cap) {
     return;
   }
   const out = { available: t.available === true };
-  for (const [key, known] of Object.entries(DAILY_BRIEF_CAP_LISTS)) {
+  const lists = { runtimes: ["claude", "dsh", "qwen"], models: ["haiku", "sonnet"] };
+  for (const [key, known] of Object.entries(lists)) {
     if (Array.isArray(t[key])) out[key] = known.filter((v) => t[key].includes(v));
   }
   payload[cap] = out;
@@ -17483,9 +17486,14 @@ const MEETING_RUN_TIMEOUT_MS = 15 * 60e3;
 // A meeting no capable host has taken for this long settles failed.
 const MEETING_QUEUE_MAX_MS = 24 * 3600e3;
 const MEETINGS_RETAIN_MS = 30 * 86400e3; // an org no host is in any more
-// Pending rows hold their transcript (up to MEETING_BODY_MAX each) in the store.
+// Pending rows hold their transcript in the store, which is written whole on
+// every change (and published whole to the peer under HA), so both the count
+// and the BYTES of pending transcripts are bounded. An hour of captions is
+// ~60 KB, so the byte budget still holds dozens of real meetings.
 const MEETINGS_PENDING_ORG_MAX = 10;
 const MEETINGS_PENDING_TOTAL_MAX = 20;
+const MEETINGS_PENDING_BYTES_MAX = 2 << 20;
+const meetingSegmentBytes = (m) => (m.segments ? Buffer.byteLength(JSON.stringify(m.segments)) : 0);
 
 function meetingsAuthorized(req) {
   const header = req.headers.authorization || "";
@@ -17503,9 +17511,8 @@ function meetingFromBody(body, now) {
     if (dbTime(body[k]) === null) return { error: `${k} must be epoch milliseconds` };
   }
   if (body.endedAt < body.startedAt) return { error: "endedAt is before startedAt" };
-  if (body.tenirUrl != null && (typeof body.tenirUrl !== "string" || body.tenirUrl.length > 500 ||
-      !/^https?:\/\/[^\s"<>]+$/.test(body.tenirUrl))) {
-    return { error: "tenirUrl must be an http(s) URL of at most 500 characters" };
+  if (body.tenirUrl != null && (typeof body.tenirUrl !== "string" || !MEETING_URL_RE.test(body.tenirUrl))) {
+    return { error: "tenirUrl must be an http(s) URL of at most 500 characters, with no quotes, spaces or brackets" };
   }
   if (body.participants != null && !Array.isArray(body.participants)) {
     return { error: "participants must be a list" };
@@ -17543,9 +17550,12 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   if (meetingPendingCount(meetingProposals[siteKey]) >= MEETINGS_PENDING_ORG_MAX) {
     return { status: 429, body: { error: `${MEETINGS_PENDING_ORG_MAX} meetings of this org are already waiting to be read — try again later` } };
   }
-  const total = Object.values(meetingProposals).reduce((n, l) => n + meetingPendingCount(l), 0);
-  if (total >= MEETINGS_PENDING_TOTAL_MAX) {
+  const pending = Object.values(meetingProposals).flat().filter((m) => MEETING_PENDING.has(m.status));
+  if (pending.length >= MEETINGS_PENDING_TOTAL_MAX) {
     return { status: 429, body: { error: `${MEETINGS_PENDING_TOTAL_MAX} meetings are already waiting to be read — try again later` } };
+  }
+  if (pending.reduce((n, m) => n + meetingSegmentBytes(m), meetingSegmentBytes(row)) > MEETINGS_PENDING_BYTES_MAX) {
+    return { status: 429, body: { error: "the meetings already waiting to be read fill the hub's transcript budget — try again later" } };
   }
   const kept = putMeeting(siteKey, row);
   if (!kept) return { status: 400, body: { error: "the meeting could not be stored" } };
@@ -17619,7 +17629,7 @@ function ingestMeetingResults(key, rows, now = Date.now()) {
     if (!row) continue;
     const ok = r.status === "ok" && Array.isArray(r.items) && putMeeting(r.siteKey, {
       ...row, status: "ok", generatedAt: now, items: r.items,
-      model: meetingText(r.model, 40) || row.model,
+      model: typeof r.model === "string" && MEETING_MODEL_RE.test(r.model) ? r.model : row.model,
     });
     if (ok) dispatchNextMeeting(r.siteKey, now);
     else {
@@ -24587,7 +24597,7 @@ if (process.env.TURMA_TEST) {
     cleanBriefNarrative, dailyBriefDue, dailyBriefTick, startDailyBriefRun,
     ingestDailyBriefResults, dailyBriefRunNowAt,
     getMeetings: () => meetingProposals, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
-    ingestMeetingResults, normalizeRunCapability, meetingSent, MEETING_RUN_TIMEOUT_MS,
+    ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETING_RUN_TIMEOUT_MS,
     MEETING_QUEUE_MAX_MS, MEETINGS_KEEP, MEETINGS_AUTO_MODEL, DAILY_BRIEF_RUN_TIMEOUT_MS, DAILY_BRIEF_LATE_MS,
     decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, permissionAnswerKind,
     decisionsTick, decidedOrgs, DECISIONS_RETAIN_MS,

@@ -27660,3 +27660,46 @@ test("XERK-2508: the whitelist, the capability block and the store bound", () =>
   assert.ok(kept.some((m) => m.meetingId === "q"));
   assert.equal(Object.getPrototypeOf(hub.meetingsCoerce({ __proto__: null })), null);
 });
+
+test("XERK-2508 QA: a drifted host is refused, the fleet caps hold, and an empty list is an answer", async () => {
+  const S = "mtQ2508.atlassian.net";
+  const O = "mtQo2508.atlassian.net";
+  await meetHost2508("mtQA2508", S);
+  await postMeeting2508(S, meeting2508("q1"));
+  const [cmd] = meetCmds2508("mtQA2508");
+  const url = `/api/agents/mtQA2508/meetings/${cmd.runId}/transcript`;
+  // Declaring another org (drift): no transcript and no result taken.
+  await meetHost2508("mtQA2508", O);
+  assert.equal((await request("GET", url, { headers: asHost("mtQA2508") })).status, 404);
+  await meetHost2508("mtQA2508", O, { meetingResults: [{ runId: cmd.runId, siteKey: S, status: "ok", items: [] }] });
+  assert.equal(hub.getMeetings()[S][0].status, "running");
+  // Back in the org: `ok` with no items is a real answer, not a failure.
+  await meetResult2508("mtQA2508", S, cmd, { status: "ok", items: [], model: "<script>" });
+  const row = hub.getMeetings()[S][0];
+  assert.deepEqual([row.status, row.items, row.model], ["ok", [], hub.MEETINGS_AUTO_MODEL]);
+  // A tenirUrl that could break out of an attribute is refused.
+  const quoted = await postMeeting2508(S, meeting2508("q2", { tenirUrl: "https://x/'onmouseover='a" }));
+  assert.equal(quoted.status, 400);
+  // Fleet-wide: 20 pending meetings across orgs, then 429.
+  delete agents.mtQA2508;
+  const orgs = ["mtQ1", "mtQ2", "mtQ3"].map((o) => `${o}2508.atlassian.net`);
+  for (const [i, o] of orgs.entries()) await beat1574(`mtQH${i}2508`, o);
+  let n = 0;
+  for (const o of orgs) for (let i = 0; i < 7 && n < 20; i++, n++) {
+    assert.equal((await postMeeting2508(o, meeting2508(`f${i}`))).status, 200);
+  }
+  const fleet = await postMeeting2508(orgs[2], meeting2508("f9"));
+  assert.equal(fleet.status, 429);
+  assert.match(fleet.body.error, /20 meetings are already waiting/);
+  for (const o of orgs) delete hub.getMeetings()[o];
+  // The byte budget: pending transcripts past 2 MiB fleet-wide are refused.
+  const fat = (id) => meeting2508(id, { segments: Array.from({ length: 450 }, () => ({ text: "y".repeat(2000) })) });
+  assert.equal((await postMeeting2508(orgs[0], fat("b1"))).status, 200);
+  assert.equal((await postMeeting2508(orgs[0], fat("b2"))).status, 200);
+  const over = await postMeeting2508(orgs[0], fat("b3"));
+  assert.equal(over.status, 429);
+  assert.match(over.body.error, /transcript budget/);
+  for (const [i, o] of orgs.entries()) cleanup2508(o, [`mtQH${i}2508`]);
+  cleanup2508(S, []);
+  cleanup2508(O, []);
+});
