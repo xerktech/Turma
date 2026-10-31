@@ -27678,7 +27678,13 @@ test("XERK-2395 QA: a fire's row is written at once, so a hard kill cannot re-fi
   const fresh = freshServerModule((env) => { env.DAILY_BRIEFS_FILE = tmp; });
   fresh.setDailyBriefSchedule(S, fresh.sanitizeDailyBriefSchedule(NY2395));
   fresh.startDailyBriefRun(S, "scheduled", RUN2395, fresh.dailyBriefDue(S, NY2395, RUN2395));
-  await new Promise((r) => setTimeout(r, 50)); // well inside the old 5s debounce
+  // Poll rather than sleep a fixed 50ms: the write is async, and a loaded CI
+  // runner took longer than 50ms to land it (ENOENT). 2s is still well inside
+  // the old 5s debounce, so a debounced write would still fail this test.
+  const deadline = Date.now() + 2000;
+  while (!fs.existsSync(tmp) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
   const onDisk = JSON.parse(fs.readFileSync(tmp, "utf8"));
   assert.equal(onDisk[S][0].meetingAt, MEET2395);
 });
