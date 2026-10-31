@@ -587,7 +587,7 @@ test("org: a swatch pick paints optimistically, POSTs, and rolls back on failure
   assert.ok(seen.length >= 1);
   await p;
   assert.deepEqual(posts, [{ url: "/api/jira/acme.atlassian.net/color", body: { slot: 5 } }]);
-  assert.deepEqual(Org.orgColors(), {});
+  assert.deepEqual({ ...Org.orgColors() }, {});
 });
 
 test("org: releasing a pin POSTs {auto:true}", async () => {
@@ -688,6 +688,65 @@ test("XERK-2598: a network-failed POST re-reads the hub instead of rolling back 
     : Promise.resolve({ ok: true, status: 200, json: async () => ({ agents: [], orgColors: {} }) });
   await Org.setOrgColor("acme.atlassian.net", 4);
   assert.deepEqual({ ...Org.orgColors() }, {});
+});
+
+test("XERK-2598: a slow re-read changes only the failed org, never another org's newer state", async () => {
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net"), agent("b", "beta.atlassian.net")],
+    autoStartOrgs: {} });
+  click("data-org-toggle", "");
+  const handlers = {};
+  Org.sse({ addEventListener: (t, fn) => { handlers[t] = fn; } });
+  let release;
+  global.fetch = (url) => url.endsWith("/autostart") ? Promise.reject(new TypeError("network"))
+    : new Promise((res) => { release = res; });
+  const p = Org.setAutoStart("acme.atlassian.net", true);
+  await new Promise((r) => setImmediate(r));             // the re-read is now in flight
+  handlers.autoStartOrgs({ data: JSON.stringify({ "acme.atlassian.net": true, "beta.atlassian.net": true }) });
+  // The held body predates beta's change.
+  release({ ok: true, status: 200, json: async () => ({ autoStartOrgs: { "acme.atlassian.net": true } }) });
+  await p;
+  const on = (k) => new RegExp(`org-chip-auto on" data-org-auto="${k.replace(/\./g, "\\.")}"`).test(slot.innerHTML);
+  assert.ok(on("beta.atlassian.net"), "beta keeps the SSE state");
+  assert.ok(on("acme.atlassian.net"), "acme takes the hub's word");
+});
+
+test("XERK-2598: a re-read saying the hub did NOT apply it repaints the switch off", async () => {
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {} });
+  click("data-org-toggle", "");
+  global.fetch = (url) => url.endsWith("/autostart") ? Promise.reject(new TypeError("network"))
+    : Promise.resolve({ ok: true, status: 200, json: async () => ({ autoStartOrgs: {} }) });
+  await Org.setAutoStart("acme.atlassian.net", true);
+  assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/);
+});
+
+test("XERK-2598: an HTTP refusal rolls back with no re-read; a refused re-read rolls back", async () => {
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {} });
+  click("data-org-toggle", "");
+  const urls = [];
+  global.fetch = (url) => { urls.push(url);
+    return Promise.resolve({ ok: false, status: 500, json: async () => ({ autoStartOrgs: { "acme.atlassian.net": true } }) }); };
+  await Org.setAutoStart("acme.atlassian.net", true);
+  assert.deepEqual(urls, ["/api/jira/acme.atlassian.net/autostart"]);
+  assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/);
+  // Network-failed POST + a non-2xx re-read (a JSON error body) is no answer.
+  global.fetch = (url) => url.endsWith("/autostart") ? Promise.reject(new TypeError("network"))
+    : Promise.resolve({ ok: false, status: 503, json: async () => ({ autoStartOrgs: { "acme.atlassian.net": true } }) });
+  await Org.setAutoStart("acme.atlassian.net", true);
+  assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/);
+});
+
+test("XERK-2598: re-rendering the same cache keeps an SSE-moved color pin", () => {
+  mountOrg();
+  const cache = { agents: [agent("a", "acme.atlassian.net")], orgColors: {} };
+  Org.update(cache);
+  const handlers = {};
+  Org.sse({ addEventListener: (t, fn) => { handlers[t] = fn; } });
+  handlers.orgColors({ data: JSON.stringify({ "acme.atlassian.net": 4 }) });
+  Org.update(cache);
+  assert.deepEqual({ ...Org.orgColors() }, { "acme.atlassian.net": 4 });
 });
 
 test("XERK-2598: with the re-read failing too, a network-failed POST rolls back", async () => {

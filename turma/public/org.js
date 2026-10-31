@@ -402,20 +402,18 @@
   // hub (the response was lost), so rolling back blindly can leave this page
   // disagreeing with the hub until that org's map next changes — the SSE
   // dedupe (rollup XERK-2593) sends a map only when this stream's slice moves.
-  // Re-read the hub's truth instead; false = couldn't, so the caller rolls back.
-  async function resyncOrgMaps() {
+  // So re-read the hub's map and return it; null = couldn't, caller rolls back.
+  // The caller adopts ONLY its own org's entry from it: the body may predate a
+  // later SSE change to another org (or this tab's own optimistic flip there),
+  // and installing it whole regressed those (QA, XERK-2598).
+  async function hubOrgMap(field) {
     try {
       const r = await fetch("/api/agents");
-      if (!r.ok) return false;
+      if (!r.ok) return null;
       const d = await r.json();
-      if (!d || typeof d !== "object") return false;
-      if (d.autoStartOrgs) autoMap = d.autoStartOrgs;
-      if (d.autoMergeOrgs) mergeMap = d.autoMergeOrgs;
-      if (d.orgColors) colorPins = d.orgColors;
-      paint();
-      notify();
-      return true;
-    } catch { return false; }
+      const m = d && typeof d === "object" ? d[field] : null;
+      return m && typeof m === "object" ? m : null;
+    } catch { return null; }
   }
 
   // Flip an org's hub-side auto-start opt-in (XERK-41). Painted optimistically —
@@ -435,10 +433,11 @@
       if (r.status === 401) { location.href = "/login"; return; }
       ok = r.ok;
     } catch { netErr = true; /* outcome unknown — re-read below */ }
-    if (!ok && netErr && await resyncOrgMaps()) return;
+    const hub = !ok && netErr ? await hubOrgMap("autoStartOrgs") : null;
     if (!ok) {
+      const on = hub ? autoOn(hub, siteKey) : had;
       autoMap = orgMapCopy(autoMap);
-      if (had) autoMap[siteKey] = true; else delete autoMap[siteKey];
+      if (on) autoMap[siteKey] = true; else delete autoMap[siteKey];
       paint();
     }
   }
@@ -459,10 +458,11 @@
       if (r.status === 401) { location.href = "/login"; return; }
       ok = r.ok;
     } catch { netErr = true; /* outcome unknown — re-read below */ }
-    if (!ok && netErr && await resyncOrgMaps()) return;
+    const hub = !ok && netErr ? await hubOrgMap("autoMergeOrgs") : null;
     if (!ok) {
+      const on = hub ? autoOn(hub, siteKey) : had;
       mergeMap = orgMapCopy(mergeMap);
-      if (had) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
+      if (on) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
       paint();
     }
   }
@@ -473,7 +473,9 @@
   // change so each page repaints its org-tinted cards at once — every page
   // reads the pins through orgColors() below, so a repaint sees the new map.
   async function setOrgColor(siteKey, slotN) {
-    const prev = colorPins;
+    const pinOf = (m) => (Object.prototype.hasOwnProperty.call(m, siteKey) &&
+      Number.isInteger(m[siteKey]) ? m[siteKey] : null);
+    const had = pinOf(colorPins);
     colorPins = orgMapCopy(colorPins);
     if (slotN) colorPins[siteKey] = slotN; else delete colorPins[siteKey];
     colorFor = null;
@@ -487,9 +489,12 @@
       if (r.status === 401) { location.href = "/login"; return; }
       ok = r.ok;
     } catch { netErr = true; /* outcome unknown — re-read below */ }
-    if (!ok && netErr && await resyncOrgMaps()) return;
+    const hub = !ok && netErr ? await hubOrgMap("orgColors") : null;
     if (!ok) {
-      colorPins = prev;
+      // Only this org's pin: another org's may have moved meanwhile (SSE).
+      const pin = hub ? pinOf(hub) : had;
+      colorPins = orgMapCopy(colorPins);
+      if (pin) colorPins[siteKey] = pin; else delete colorPins[siteKey];
       paint();
       notify();
     }

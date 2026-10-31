@@ -82,7 +82,7 @@ makes an `android/` change part of the same PR) live there.
 - **`update()` adopts a hub map only from a NEW snapshot object** (rollup XERK-2598): pages call
   `update(cache)` every render but never write `autoStartOrgs`/`autoMergeOrgs` back from SSE, so
   re-adopting the same stale object reverted every SSE-moved or optimistic switch on the next beat.
-- **A POST that fails at the NETWORK level re-reads `/api/agents`** before rolling back: the hub
+- **A POST that fails at the NETWORK level re-reads `/api/agents`** and takes ONLY that org's entry: the hub
   may have applied it, and the per-stream SSE dedupe no longer resends an unchanged map.
 - Repaints skip when markup is unchanged (beat can't churn the DOM under an open menu). A handled
   click is flagged on the EVENT, not looked up after — the repaint detaches the clicked node, so a
