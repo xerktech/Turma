@@ -25694,6 +25694,7 @@ if (process.env.TURMA_TEST) {
     localLogin,
     loginClientKey,
     loginFailureKey,
+    loginBackoffMs,
     oidcPrincipal,
     tenancyState: () => tenancyState,
     __setTenancy(v) { tenancyState = tenancy.coerceTenancy(v); },

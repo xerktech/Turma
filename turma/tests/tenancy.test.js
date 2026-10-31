@@ -388,3 +388,25 @@ test("XERK-2530: the store is written to its own durable file, never state.json"
     assert.match(u.tenantId, /^[0-9a-f]{32}$/);
   }
 });
+
+test("XERK-2586: a break-glass sign-in whose socket already closed is not evaluated", async () => {
+  // A closed socket reports no peer address, so its key would be shared by every such caller.
+  // `connection: close` keeps the doctored socket out of the keep-alive pool.
+  const strip = (req) => {
+    if (req.headers["x-test-closed"]) Object.defineProperty(req.socket, "remoteAddress", { value: undefined, configurable: true });
+  };
+  server.prependListener("request", strip);
+  const gone = (password) => request("POST", "/api/login", {
+    headers: { "x-test-closed": "1", connection: "close" }, body: { username: "glass", password },
+  });
+  try {
+    const r = await gone("glass-pass");
+    assert.ok(!/hub_session=/.test(String(r.headers["set-cookie"] || "")), "no session for a caller that is gone");
+    for (let i = 0; i < 8; i++) await gone("wrong");
+    assert.equal(hub.loginBackoffMs("||", "glass", Date.now()), 0, "no shared backoff bucket built up");
+  } finally {
+    server.removeListener("request", strip);
+  }
+  const ok = await login("glass", "glass-pass");
+  assert.equal(ok.status, 200, "a live break-glass sign-in afterwards still works");
+});
