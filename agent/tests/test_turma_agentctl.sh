@@ -233,21 +233,23 @@ CODE="te-0123456789abcdef0123456789abcdef"
 HOME="$HOME_DIR" TURMA_AGENT_ENV="$CFGF" ENROLL_PROBE="$WORK/probe" ENROLL_RC=1 \
   "$CTL" enroll --code "$CODE" >/dev/null 2>&1
 rc=$?
-[ "$rc" = 1 ] && ok "a failed code enroll exits nonzero" || fail "code enroll rc=$rc, want 1"
-grep -qx "argv=--enroll" "$WORK/probe" && ok "the code is not on the manager's argv" \
-  || fail "manager argv: $(grep argv "$WORK/probe")"
-grep -qx "code=$CODE" "$WORK/probe" && ok "TURMA_ENROLL_CODE carries the code" || fail "no code in env"
-grep -qx "url=https://hub.example" "$WORK/probe" && grep -qx "device=newbox" "$WORK/probe" \
-  && grep -qx "env=$CFGF" "$WORK/probe" && ok "config + DEVICE_NAME loaded" || fail "config not loaded: $(cat "$WORK/probe")"
+if [ "$rc" = 1 ]; then ok "a failed code enroll exits nonzero"; else fail "code enroll rc=$rc, want 1"; fi
+if grep -qx "argv=--enroll" "$WORK/probe"; then ok "the code is not on the manager's argv"
+else fail "manager argv: $(grep argv "$WORK/probe")"; fi
+if grep -qx "code=$CODE" "$WORK/probe"; then ok "TURMA_ENROLL_CODE carries the code"; else fail "no code in env"; fi
+if grep -qx "url=https://hub.example" "$WORK/probe" && grep -qx "device=newbox" "$WORK/probe" \
+   && grep -qx "env=$CFGF" "$WORK/probe"; then ok "config + DEVICE_NAME loaded"
+else fail "config not loaded: $(cat "$WORK/probe")"; fi
 HOME="$HOME_DIR" TURMA_AGENT_ENV="$CFGF" ENROLL_PROBE="$WORK/probe" ENROLL_RC=2 \
   "$CTL" enroll --code="$CODE" >/dev/null 2>&1
 rc=$?
-[ "$rc" = 1 ] && ok "a hub without code enroll fails the code path" || fail "rc=$rc on a too-old hub, want 1"
+if [ "$rc" = 1 ]; then ok "a hub without code enroll fails the code path"; else fail "rc=$rc on a too-old hub, want 1"; fi
 HOME="$HOME_DIR" TURMA_AGENT_ENV="$CFGF" ENROLL_PROBE="$WORK/probe" ENROLL_RC=1 \
   "$CTL" enroll >/dev/null 2>&1
-grep -qx "code=" "$WORK/probe" && ok "plain enroll sends no code" || fail "plain enroll leaked a code"
+if grep -qx "code=" "$WORK/probe"; then ok "plain enroll sends no code"; else fail "plain enroll leaked a code"; fi
 "$CTL" enroll --bogus >/dev/null 2>&1
-[ $? = 2 ] && ok "an unknown enroll flag is a usage error" || fail "unknown flag not refused"
+rc=$?
+if [ "$rc" = 2 ]; then ok "an unknown enroll flag is a usage error"; else fail "unknown flag not refused"; fi
 rm -f "$PREFIX/hub-agent.py"
 
 if [ "$FAILED" -eq 0 ]; then

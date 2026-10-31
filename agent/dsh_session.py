@@ -51,6 +51,7 @@ try:
     # keeps its own workflow re-home + records.
     from runtime_tail import (
         ChildProjection, append_entries, ensure_transcript_file, env_float, env_int,
+        open_for_append, write_text_replace,
     )
 except ImportError:  # pragma: no cover - only when run outside the agent dir
     DshProjector = None
@@ -466,7 +467,7 @@ class DshProjectionTail:
         try:
             os.makedirs(os.path.dirname(self.transcript_path), exist_ok=True)
             if not os.path.exists(self.transcript_path):
-                open(self.transcript_path, "a", encoding="utf-8").close()
+                open_for_append(self.transcript_path).close()
         except OSError as e:
             self._log(f"dsh projection: cannot create transcript: {e}")
         while not self._stop.is_set():
@@ -645,9 +646,11 @@ class DshProjectionTail:
                 continue
             try:
                 os.makedirs(self._wf_records_dir, exist_ok=True)
-                tmp = os.path.join(self._wf_records_dir, run_id + ".json")
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(record, fh, ensure_ascii=False)
+                # tmp + replace through a fresh O_EXCL|O_NOFOLLOW file: no half
+                # record for a reader, no planted link written through (XERK-2564).
+                write_text_replace(
+                    os.path.join(self._wf_records_dir, run_id + ".json"),
+                    json.dumps(record, ensure_ascii=False))
             except OSError as e:
                 self._log(f"dsh workflow record write failed ({run_id}): {e}")
             # The journal is the fallback `_workflow_finished_agents` reads when
@@ -657,10 +660,9 @@ class DshProjectionTail:
             try:
                 os.makedirs(run_dir, exist_ok=True)
                 lines = self._wf.finished(run_id)
-                with open(os.path.join(run_dir, "journal.jsonl"), "w",
-                          encoding="utf-8") as fh:
-                    for ln in lines:
-                        fh.write(json.dumps(ln, ensure_ascii=False) + "\n")
+                write_text_replace(
+                    os.path.join(run_dir, "journal.jsonl"),
+                    "".join(json.dumps(ln, ensure_ascii=False) + "\n" for ln in lines))
             except OSError as e:
                 self._log(f"dsh workflow journal write failed ({run_id}): {e}")
 
@@ -733,6 +735,6 @@ class DshProjectionTail:
             if os.path.exists(old):
                 os.replace(old, new)
             elif not os.path.exists(new):
-                open(new, "a", encoding="utf-8").close()
+                open_for_append(new).close()
         except OSError as e:
             self._log(f"dsh child transcript move failed: {e}")

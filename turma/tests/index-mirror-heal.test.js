@@ -17,7 +17,7 @@ process.env.TURMA_USER = "hubuser";
 process.env.TURMA_PASSWORD = "hubpass";
 process.env.TURMA_AGENT_TOKEN = "agenttok";
 const tmp = (name) => path.join(scratchDir(), `turma-idxheal-${name}-${process.pid}.json`);
-for (const [k, n] of [["DEVICES_FILE", "devices"], ["TICKET_AGENTS_FILE", "ticket-agents"], ["AGENT_IDENTITIES_FILE", "agent-identities"],
+for (const [k, n] of [["DEVICES_FILE", "devices"], ["TICKET_AGENTS_FILE", "ticket-agents"], ["AGENT_IDENTITIES_FILE", "agent-identities"], ["TENANCY_FILE", "tenancy"],
   ["AUTOSTART_ORGS_FILE", "autostart-orgs"], ["TICKET_MODELS_FILE", "ticket-models"],
   ["ORG_COLORS_FILE", "org-colors"], ["USAGE_LEDGER_FILE", "usage-ledger"], ["STATE_FILE", "state"]]) {
   process.env[k] = tmp(n);
