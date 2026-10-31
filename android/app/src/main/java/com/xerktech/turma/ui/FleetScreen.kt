@@ -835,6 +835,10 @@ fun ScreenHeader(
                     HeaderIconButton(onClick = { menuOpen = true }) { Icon(Icons.Filled.MoreVert, "More") }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                         menuItems { menuOpen = false }
+                        // Who is signed in (XERK-2553), above Sign out — the web's
+                        // Sign out tooltip. Not a control, so disabled.
+                        val who = com.xerktech.turma.core.meLabel(LocalAccount.current)
+                        if (who.isNotEmpty()) DropdownMenuItem(text = { Text(who) }, onClick = {}, enabled = false)
                         DropdownMenuItem(
                             text = { Text("Sign out") },
                             onClick = { menuOpen = false; signOut() },

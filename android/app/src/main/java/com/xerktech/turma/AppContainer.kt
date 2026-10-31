@@ -27,6 +27,9 @@ class AppContainer(context: Context) {
     val fleet = FleetRepository(client, config, appScope)
     val liveTail = LiveTail(client, config)
 
+    /** Who is signed in (XERK-2553): the ⋮ menu's label and the admin-only screen. */
+    val account = com.xerktech.turma.net.AccountRepository(client, config, appScope)
+
     /**
      * Native Authentik SSO (XERK-591). Here rather than in the LoginViewModel
      * because the flow spans a Custom Tab round-trip — it is started on the login

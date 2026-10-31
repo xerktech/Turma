@@ -256,6 +256,9 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     other tenant's activity. Per stream, never per view: a later stream never saw the earlier frame.
 - **The ws-token names its principal** (`ws2.<exp>.<claims>.<mac>`, re-read from the store at
   socket open); `/live` 404s another tenant's host. The pre-tenancy `ws.` token is refused.
+- **`GET /api/me` (`meView`) is how a client learns who it is** (XERK-2553): name, source, roles,
+  `tenant` (bool) and `adminOnly` — never the tenant or user id. Clients show admin-only principals an
+  explanation instead of an empty fleet (`android/PARITY.md`).
 - `findSession(id, p)` resolves only the caller's hosts, so another tenant's agent reporting the
   same session id can never capture a terminal.
 - `liveSessionForTranscript(tid, p)` likewise (rollup XERK-2593): two tenants reporting one live

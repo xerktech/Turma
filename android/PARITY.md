@@ -738,6 +738,10 @@ those are marked `[MODEL]`.
   lists/revokes recent codes. Android has no dialog yet; onboarding a host is a desk task (the
   commands are pasted into a terminal), and the hub routes need no client to work. No new
   `/api/agents` key, so nothing for Android to decode.
+  - **Still web-only under tenancy (XERK-2553, deliberate).** A code mints into the minting user's
+    tenant, so a tenant user adds a host from the web dashboard (or `turma-agentctl enroll --code`);
+    the phone shows the host once it beats. A port is `POST/GET /api/enroll-codes` +
+    `DELETE /api/enroll-codes/<id>` — no new `/api/agents` key.
 - ~~P0 Session card detail~~ / ~~P0 queued/stopping + Cancel + optimistic pending~~ — done (XERK-78,
   see Done above). Still open from that pass: the spawn "ghost card" (a pending spawn shows only as
   the composer's toast today) — P2.
@@ -1038,6 +1042,24 @@ those are marked `[MODEL]`.
     re-authenticate. A break-glass password login keeps the 30-day session.
   - Tests: `core/OidcTest` (PKCE golden vector, deep-link parse), `net/OidcControllerTest` (probe /
     exchange / cookie auth / forbidden / 401-drop over MockWebServer).
+- **Who is signed in, and admin-only accounts (XERK-2553).** Both clients read `GET /api/me`
+  (`{kind, name, source, roles, tenant, adminOnly}`, built field by field by the hub's `meView`;
+  Android TYPES it as `model.Me`, every field defaulted).
+  - The name: web puts "Signed in as <name>" on Sign out's tooltip (a visible label would move the
+    right-aligned header row after first paint, XERK-2432); Android shows the same words as a
+    disabled item above Sign out in every `ScreenHeader` ⋮ menu (`LocalAccount`).
+  - An ADMIN-ONLY principal (admin role, no tenant) sees no host, session or ticket, and the admin
+    panel (XERK-2552) is web-only: web shows `ADMIN_ONLY_NOTE` under the header on every page,
+    Android covers the app with `AdminOnlyScreen` (same words + Sign out). Null / an older hub's 404
+    = not admin-only, so nothing changes against an older hub.
+  - `net/AccountRepository` re-reads it whenever the stored credential changes, so a sign-in as
+    somebody else never shows the previous account.
+  - A session route's 404 (an unknown id OR another account's — XERK-2534 answers both alike) reads
+    "This session isn't available — it has ended, or it belongs to another account (<hub words>)"
+    (`sessionUnavailableMessage`, from `HubClient.mapHistory`). Every list is already tenant-scoped
+    by the hub, so only a stale deep link (a push from a previous sign-in) reaches one.
+  - Tests: `core/AccountTest`, `net/AccountRepositoryTest`, `ui/AdminOnlyScreenTest`,
+    `net/MapHistoryTest`; web `XERK-2553` in `nav.test.js`; hub `XERK-2553` in `server.test.js`.
 - **Password sign-in goes through `POST /api/login`, as `login.html` does** (XERK-2569). The hub
   checks Basic against its break-glass credential only — never a local account's password — so
   `HubClient.signIn` posts the username/password and carries the returned `hub_session` cookie,

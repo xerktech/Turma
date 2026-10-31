@@ -394,3 +394,26 @@ test("nav: every tab reserves its bold width, so the row can't shift between pag
   assert.match(reserve[0], /height:\s*0/);
   assert.match(reserve[0], /visibility:\s*hidden/);
 });
+
+test("XERK-2553: the signed-in label and the admin-only note come from /api/me", () => {
+  const nav = require("../public/nav.js");
+  assert.equal(nav.meLabel({ name: "alice" }), "Signed in as alice");
+  assert.equal(nav.meLabel({ name: "" }), "");
+  assert.equal(nav.meLabel(null), "");
+  assert.equal(nav.adminOnlyNoteHtml({ adminOnly: false }), "");
+  assert.equal(nav.adminOnlyNoteHtml({ adminOnly: "yes" }), "", "strict boolean");
+  assert.match(nav.adminOnlyNoteHtml({ adminOnly: true }), /class="admin-only-note"/);
+  // applyMe: the label rides Sign out's tooltip; the note mounts once after the header.
+  const so = { title: "" }, inserted = [];
+  let note = null;
+  const doc = {
+    getElementById: (id) => (id === "navSignout" ? so
+      : id === "siteHeader" ? { insertAdjacentHTML: (_w, h) => { inserted.push(h); note = {}; } } : null),
+    querySelector: () => note,
+  };
+  nav.applyMe(doc, { name: "<b>x</b>", adminOnly: true });
+  nav.applyMe(doc, { name: "<b>x</b>", adminOnly: true });
+  assert.equal(so.title, "Signed in as <b>x</b>", "a title attribute is text, never markup");
+  assert.equal(inserted.length, 1);
+  assert.ok(tabsHtml("x").includes('id="navSignout"'));
+});

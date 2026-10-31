@@ -13986,6 +13986,30 @@ function principalClaims(p) {
   return { u: p.userId, t: user ? user.tenantId : p.tenantId, r: [...p.roles] };
 }
 
+// Who the caller is, as GET /api/me serves it (XERK-2553): the signed-in label a
+// client shows beside Sign out, and whether it is an ADMIN-ONLY principal (admin
+// role, no tenant) that a client turns into the "admin panel is web-only" screen.
+// Built field by field from the principal and the stored user, so the wire shape is
+// fixed: Android TYPES it. Never serves the tenant id or the user id.
+function meView(p) {
+  const kind = p && typeof p.kind === "string" ? p.kind : "open";
+  const roles = p && Array.isArray(p.roles) ? p.roles.filter((r) => r === "user" || r === "admin") : [];
+  let name = "", source = "";
+  if (kind === "user") {
+    const u = Object.hasOwn(tenancyState.users, p.userId) ? tenancyState.users[p.userId] : null;
+    if (u) {
+      source = u.source === "oidc" ? "oidc" : "local";
+      const label = typeof u.displayName === "string" && u.displayName ? u.displayName
+        : typeof u.username === "string" ? u.username : "";
+      name = label.slice(0, 100);
+    }
+  } else if (kind === "breakglass") {
+    name = "break-glass";
+  }
+  const tenant = !!(p && p.tenantId);
+  return { kind, name, source, roles, tenant, adminOnly: roles.includes("admin") && !tenant };
+}
+
 // The principal a session token names, re-checked against the store NOW.
 function principalFromToken(token) {
   if (!token) return null;
@@ -21926,6 +21950,10 @@ const server = http.createServer(async (req, res) => {
 
     // Short-lived token for the /audio WebSocket (browser WebSocket can't set
     // an Authorization header, so the token rides the query string instead).
+    // Who is signed in (XERK-2553): the clients' account label + admin-only screen.
+    if (req.method === "GET" && url.pathname === "/api/me") {
+      return json(res, 200, meView(requestPrincipal(req)));
+    }
     if (req.method === "GET" && url.pathname === "/api/ws-token") {
       return json(res, 200, { token: issueWsToken(requestPrincipal(req)), expiresInSec: WS_TOKEN_TTL_MS / 1000 });
     }
