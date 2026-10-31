@@ -9,6 +9,7 @@ DshProjector."""
 import importlib.util
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -609,6 +610,216 @@ class DshDelegationTailTest(unittest.TestCase):
                              "agent-%s.jsonl" % child)
         self.assertTrue(os.path.isfile(moved), "moved under the run dir")
         self.assertFalse(os.path.isfile(flat), "flat copy removed")
+
+    def test_refused_flat_to_run_move_keeps_the_flat_transcript_growing(self):
+        # XERK-2578: a move into the run dir that fails must NOT repoint the
+        # child — later appends keep landing in the flat file, and the move is
+        # retried on the next pump once the obstruction is gone.
+        run = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        child = "wfchild-stuck"
+        self._parent([{"type": "tool-workflow/run-start", "seq": 2, "time": 1000,
+                       "data": {"runId": run, "name": "review"}}])
+        self._child(child, answer="early work")
+        self.tail._pump()
+        stem = self.transcript[:-len(".jsonl")]
+        flat = os.path.join(stem, "subagents", "agent-%s.jsonl" % child)
+        moved = os.path.join(stem, "subagents", "workflows", ds.workflow_run_id(run),
+                             "agent-%s.jsonl" % child)
+        # obstruct the destination: a non-empty directory where the file must go
+        os.makedirs(os.path.join(moved, "block"))
+        with open(self.events_path, "a") as f:
+            f.write(json.dumps({"type": "tool-workflow/agent-start", "seq": 3,
+                    "time": 1100, "data": {"runId": run, "seq": 1,
+                    "label": "review:bugs", "childId": child}}) + "\n")
+        with open(os.path.join(self.child_dir, child + ".jsonl"), "a") as f:
+            f.write(json.dumps({"type": "assistant/message", "seq": 4, "time": 4, "data": {
+                "message": {"id": "d", "role": "assistant", "source": {"model": "m"},
+                            "content": [{"type": "text", "text": "late work"}]}}}) + "\n")
+        self.tail._pump()
+        self.assertIn("late work", open(flat).read(), "flat transcript kept growing")
+        self.assertTrue(os.path.isdir(moved))
+        # obstruction gone: the next pump completes the move
+        os.rmdir(os.path.join(moved, "block"))
+        os.rmdir(moved)
+        self.tail._pump()
+        self.assertTrue(os.path.isfile(moved))
+        self.assertFalse(os.path.exists(flat))
+        self.assertIn("late work", open(moved).read())
+
+    def test_child_streams_while_the_parent_log_is_quiet(self):
+        # XERK-2578: a foreground workflow keeps the parent log silent while its
+        # children run, so the child projection must not wait on parent bytes.
+        self._parent([{"type": "tool-workflow/run-start", "seq": 2, "time": 1000,
+                       "data": {"runId": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+                                "name": "review"}}])
+        self.tail._pump()
+        child = "quiet-parent-child"
+        self._child(child, answer="streamed")
+        self.tail._pump()               # no new parent bytes
+        flat = os.path.join(self.transcript[:-len(".jsonl")], "subagents",
+                            "agent-%s.jsonl" % child)
+        self.assertIn("streamed", open(flat).read())
+
+    def test_resumed_tail_does_not_re_project_existing_children(self):
+        # XERK-2578: a resumed tail (reattach / host-local resume) starts each
+        # child log already on disk at its EOF, like the parent — the first
+        # quiet pump must not append a second copy of every child transcript.
+        child = "resumed-kid"
+        self._child(child, answer="before restart")
+        self.tail._pump()
+        flat = os.path.join(self.transcript[:-len(".jsonl")], "subagents",
+                            "agent-%s.jsonl" % child)
+        before = self._read(flat)
+        self.assertTrue(before)
+        tail2 = ds.DshProjectionTail(self.events_path, self.transcript, self.SID,
+                                     cwd="/repos/x", log=lambda m: None, resume=True)
+        tail2._pump()
+        self.assertEqual(self._read(flat), before, "no re-projection on resume")
+        with open(os.path.join(self.child_dir, child + ".jsonl"), "a") as f:
+            f.write(json.dumps({"type": "assistant/message", "seq": 4, "time": 4, "data": {
+                "message": {"id": "d", "role": "assistant", "source": {"model": "m"},
+                            "content": [{"type": "text", "text": "after restart"}]}}}) + "\n")
+        tail2._pump()
+        after = self._read(flat)
+        self.assertEqual(len(after), len(before) + 1)
+        self.assertIn("after restart", json.dumps(after[-1]))
+
+    def test_resumed_workflow_child_keeps_its_run_dir_home(self):
+        # XERK-2578: on resume the run mapping is behind the parent's EOF, so a
+        # still-streaming workflow child must keep appending to the run-dir file
+        # the earlier tail moved it to — no stray flat file, no split transcript.
+        run = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        child = "wfkid-resumed"
+        self._parent([
+            {"type": "tool-workflow/run-start", "seq": 2, "time": 1000,
+             "data": {"runId": run, "name": "review"}},
+            {"type": "tool-workflow/agent-start", "seq": 3, "time": 1100,
+             "data": {"runId": run, "seq": 1, "label": "review:bugs", "childId": child}},
+        ])
+        self._child(child, answer="before restart")
+        self.tail._pump()
+        stem = self.transcript[:-len(".jsonl")]
+        flat = os.path.join(stem, "subagents", "agent-%s.jsonl" % child)
+        home = os.path.join(stem, "subagents", "workflows", ds.workflow_run_id(run),
+                            "agent-%s.jsonl" % child)
+        before = self._read(home)
+        tail2 = ds.DshProjectionTail(self.events_path, self.transcript, self.SID,
+                                     cwd="/repos/x", log=lambda m: None, resume=True)
+        tail2._pump()
+        with open(os.path.join(self.child_dir, child + ".jsonl"), "a") as f:
+            f.write(json.dumps({"type": "assistant/message", "seq": 4, "time": 4, "data": {
+                "message": {"id": "d", "role": "assistant", "source": {"model": "m"},
+                            "content": [{"type": "text", "text": "after restart"}]}}}) + "\n")
+        tail2._pump()
+        tail2._pump()
+        self.assertFalse(os.path.exists(flat), "no stray flat file")
+        self.assertEqual(len(self._read(home)), len(before) + 1)
+
+    def _resume_with_run_homes(self, child, plant):
+        # A child projected before a restart, then `plant(stem)` rearranges its
+        # run-dir homes; returns (flat, resumed tail) after one post-resume append.
+        self._child(child, answer="before restart")
+        self.tail._pump()
+        stem = self.transcript[:-len(".jsonl")]
+        plant(stem)
+        tail2 = ds.DshProjectionTail(self.events_path, self.transcript, self.SID,
+                                     cwd="/repos/x", log=lambda m: None, resume=True)
+        tail2._pump()
+        with open(os.path.join(self.child_dir, child + ".jsonl"), "a") as f:
+            f.write(json.dumps({"type": "assistant/message", "seq": 4, "time": 4, "data": {
+                "message": {"id": "d", "role": "assistant", "source": {"model": "m"},
+                            "content": [{"type": "text", "text": "after restart"}]}}}) + "\n")
+        tail2._pump()
+        return os.path.join(stem, "subagents", "agent-%s.jsonl" % child)
+
+    def _assert_not_re_homed_through(self, child, link_dir):
+        # `link_dir(wf, outside)` plants ONE run-dir home that resolves outside
+        # the tree; the resumed child must stay flat and write nothing outside.
+        outside = os.path.join(self.tmp, "outside-" + child)
+        victim = os.path.join(outside, "agent-%s.jsonl" % child)
+
+        def plant(stem):
+            os.makedirs(outside)
+            with open(victim, "w") as f:
+                f.write("untouched\n")
+            wf = os.path.join(stem, "subagents", "workflows")
+            os.makedirs(wf, exist_ok=True)
+            link_dir(wf, outside)
+        flat = self._resume_with_run_homes(child, plant)
+        with open(victim) as f:
+            self.assertEqual(f.read(), "untouched\n")
+        self.assertIn("after restart", open(flat).read(), "stays flat")
+
+    def test_resumed_child_is_not_re_homed_through_a_linked_run_dir(self):
+        self._assert_not_re_homed_through(
+            "wfkid-dirlink", lambda wf, out: os.symlink(out, os.path.join(wf, "wf_evil")))
+
+    def test_resumed_child_is_not_re_homed_through_a_linked_file(self):
+        child = "wfkid-leaflink"
+
+        def link(wf, out):
+            os.makedirs(os.path.join(wf, "wf_leaf"))
+            os.symlink(os.path.join(out, "agent-%s.jsonl" % child),
+                       os.path.join(wf, "wf_leaf", "agent-%s.jsonl" % child))
+        self._assert_not_re_homed_through(child, link)
+
+    def _assert_not_re_homed_through_linked(self, child, linked):
+        # `linked` ("subagents" or "subagents/workflows") is swapped for a link to
+        # an outside copy holding a run-dir home; the re-home must refuse it.
+        stem_rel = linked.split("/")
+        real = os.path.join(self.tmp, "outside-" + child)
+        victim = {}
+
+        def plant(stem):
+            path = os.path.join(stem, *stem_rel)
+            os.makedirs(path, exist_ok=True)
+            shutil.move(path, real)
+            os.symlink(real, path)
+            run_dir = os.path.join(stem, "subagents", "workflows", "wf_x")
+            os.makedirs(run_dir, exist_ok=True)
+            victim["p"] = os.path.realpath(os.path.join(run_dir, "agent-%s.jsonl" % child))
+            with open(victim["p"], "w") as f:
+                f.write("untouched\n")
+        self._resume_with_run_homes(child, plant)
+        with open(victim["p"]) as f:
+            self.assertEqual(f.read(), "untouched\n")
+
+    def test_resumed_child_is_not_re_homed_through_a_linked_workflows_dir(self):
+        self._assert_not_re_homed_through_linked("wfkid-wflink", "subagents/workflows")
+
+    def test_resumed_child_is_not_re_homed_through_a_linked_subagents_dir(self):
+        self._assert_not_re_homed_through_linked("wfkid-sublink", "subagents")
+
+    def test_resumed_child_with_two_run_homes_stays_flat(self):
+        child = "wfkid-ambiguous"
+
+        def plant(stem):
+            for run in ("wf_a", "wf_b"):
+                d = os.path.join(stem, "subagents", "workflows", run)
+                os.makedirs(d)
+                open(os.path.join(d, "agent-%s.jsonl" % child), "w").close()
+        flat = self._resume_with_run_homes(child, plant)
+        self.assertIn("after restart", open(flat).read())
+
+    def test_a_stuck_child_move_logs_once(self):
+        logs = []
+        self.tail._log = logs.append
+        stem = self.transcript[:-len(".jsonl")]
+        new = os.path.join(stem, "blocked", "agent-x.jsonl")
+        os.makedirs(os.path.join(new, "block"))
+        old = os.path.join(stem, "old.jsonl")
+        open(old, "w").close()
+        for _ in range(5):
+            self.assertFalse(self.tail._move_child_file(old, new))
+        self.assertEqual(len(logs), 1)
+        # once the move lands, a later refusal of the same dest is logged again
+        os.rmdir(os.path.join(new, "block"))
+        os.rmdir(new)
+        self.assertTrue(self.tail._move_child_file(old, new))
+        os.replace(new, old)
+        os.makedirs(os.path.join(new, "block"))
+        self.assertFalse(self.tail._move_child_file(old, new))
+        self.assertEqual(len(logs), 2)
 
     def test_emitted_launches_is_bounded_by_ended_subagents(self):
         # An ordinary subagent's end retires it and drops it from the reclaim

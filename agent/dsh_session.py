@@ -36,6 +36,7 @@ OFFLINE_AFTER_MS):
     and (for the reader) reconnect with backoff while the control is open.
 """
 
+import glob
 import json
 import os
 import re
@@ -409,6 +410,27 @@ class DshProjectionTail:
         self._subagents_dir = os.path.join(stem, "subagents")
         self._wf_agents_dir = os.path.join(self._subagents_dir, "workflows")
         self._wf_records_dir = os.path.join(stem, "workflows")
+        # On RESUME the child logs already on disk were projected by the earlier
+        # tail too, so each starts at the size it had now — the same EOF rule as
+        # the parent above. Without this, the first pump re-projected every
+        # child from 0 and doubled its transcript (XERK-2578).
+        self._resume_child_sizes = {}
+        if resume:
+            try:
+                names = os.listdir(self._child_events_dir)
+            except OSError:
+                names = []
+            for name in names:
+                if not name.endswith(".jsonl"):
+                    continue
+                try:
+                    self._resume_child_sizes[name[:-len(".jsonl")]] = os.path.getsize(
+                        os.path.join(self._child_events_dir, name))
+                except OSError:
+                    pass
+        # Child dests whose move was refused and already logged, so a stuck move
+        # retried every pump logs once, not twice a second.
+        self._move_refused = set()
         # The latest automatically-derived session title dsh wrote to the log
         # (`session/title` event data.title), or None until one arrives. Read on
         # the beat by hub-agent's _seed_summaries so a dsh session is named from
@@ -479,6 +501,23 @@ class DshProjectionTail:
             self._wake.clear()
 
     def _pump(self):
+        self._pump_parent()
+        # Delegation side-effects run every pump, even when the parent log gained
+        # no bytes: a foreground workflow keeps the parent quiet while its child
+        # logs stream, and a refused child move retries here (XERK-2578). Each is
+        # contained: a delegation failure must never cost the main transcript,
+        # which is what every other surface reads.
+        if self._wf is not None:
+            try:
+                self._sync_workflow_records()
+            except Exception as e:      # never let it kill the tail
+                self._log(f"dsh workflow record sync error: {e}")
+        try:
+            self._sync_children()
+        except Exception as e:
+            self._log(f"dsh child projection error: {e}")
+
+    def _pump_parent(self):
         try:
             size = os.path.getsize(self.events_path)
         except OSError:
@@ -583,19 +622,6 @@ class DshProjectionTail:
             entries.extend(projected)
         if entries:
             self._append(self.transcript_path, entries)
-        # Delegation side-effects run every pump (a workflow record advances even
-        # when the parent transcript gained no entry, and child logs stream on
-        # their own). Each is contained: a delegation failure must never cost the
-        # main transcript, which is what every other surface reads.
-        if self._wf is not None:
-            try:
-                self._sync_workflow_records()
-            except Exception as e:      # never let it kill the tail
-                self._log(f"dsh workflow record sync error: {e}")
-        try:
-            self._sync_children()
-        except Exception as e:
-            self._log(f"dsh child projection error: {e}")
 
     def _reclaim_if_workflow_child(self, event):
         """If `event` is a `tool-workflow/agent-start` whose child we already
@@ -714,15 +740,38 @@ class DshProjectionTail:
                                      git_branch=self._git_branch),
                 self._child_dest(child_id))
             self._children[child_id] = st
-            self._ensure_child_file(st.dest)
+            primed = self._resume_child_sizes.pop(child_id, None)
+            if primed is not None:
+                # Already projected before the restart; its file exists wherever
+                # that tail put it, so creating one here would only leave a stray.
+                # Its run mapping is behind the parent's EOF, so find a run-dir
+                # home the earlier tail moved it to, else later entries split off
+                # into a new flat file.
+                st.offset = primed
+                # No link anywhere on the way (the leaf, its run dir, workflows/,
+                # subagents/): a re-home must never aim appends outside the tree.
+                homes = [p for p in glob.glob(os.path.join(
+                             self._wf_agents_dir, "wf_*", "agent-%s.jsonl" % child_id))
+                         if os.path.isfile(p) and not any(os.path.islink(q) for q in (
+                             p, os.path.dirname(p), self._wf_agents_dir,
+                             self._subagents_dir))]
+                if len(homes) == 1:
+                    st.dest = homes[0]
+            else:
+                self._ensure_child_file(st.dest)
         else:
             # A workflow agent's run assignment may only now have arrived (its
             # `tool-workflow/agent-start` was folded this pump), moving its home
             # from the flat subagents/ dir into the run dir. Move the file we have
-            # and repoint — the projector's offset is unchanged (same bytes).
+            # and repoint — the projector's offset is unchanged (same bytes). Only
+            # repoint once the move landed: a refused move (e.g. a link planted at
+            # the run dir) keeps appending to the file we have and retries next
+            # pump, rather than aiming every later append at a path that refuses.
+            # A move's destination is always a run dir: a resumed child re-homed
+            # above has no run mapping, and must not be dragged back to flat.
             desired = self._child_dest(child_id)
-            if desired != st.dest:
-                self._move_child_file(st.dest, desired)
+            if (desired != st.dest and desired.startswith(self._wf_agents_dir + os.sep)
+                    and self._move_child_file(st.dest, desired)):
                 st.dest = desired
         st.pump(src, self._append)
 
@@ -730,6 +779,8 @@ class DshProjectionTail:
         ensure_transcript_file(dest, self._log, "dsh child transcript")
 
     def _move_child_file(self, old, new):
+        """Move child transcript `old` to `new` (or create `new` if there is no
+        `old`). True once `new` is the child's file; False (logged) on refusal."""
         try:
             os.makedirs(os.path.dirname(new), exist_ok=True)
             if os.path.exists(old):
@@ -737,4 +788,9 @@ class DshProjectionTail:
             elif not os.path.exists(new):
                 open_for_append(new).close()
         except OSError as e:
-            self._log(f"dsh child transcript move failed: {e}")
+            if new not in self._move_refused:
+                self._move_refused.add(new)
+                self._log(f"dsh child transcript move failed (retrying quietly): {e}")
+            return False
+        self._move_refused.discard(new)
+        return True
