@@ -72,6 +72,7 @@ process.env.AGENT_IDENTITIES_FILE = path.join(
   scratchDir(),
   `turma-test-agent-identities-${process.pid}.json`
 );
+process.env.TENANCY_FILE = path.join(scratchDir(), `turma-test-tenancy-${process.pid}.json`);
 process.env.NAME_TOKEN_GENS_FILE = path.join(
   scratchDir(),
   `turma-test-name-token-gens-${process.pid}.json`
@@ -2734,6 +2735,24 @@ test("XERK-595: breakGlassEnabled reflects whether a local credential is set", (
   // mandatory-OIDC change must not create).
   const open = freshServerModule((env) => { env.TURMA_PASSWORD = ""; env.TURMA_USER = ""; });
   assert.equal(open.breakGlassEnabled(), false);
+});
+
+test("XERK-2530: on a passwordless hub an OIDC user does not flip it closed; a local account does", async () => {
+  const open = freshServerModule((env) => {
+    env.TURMA_PASSWORD = ""; env.TURMA_USER = "";
+    env.TENANCY_FILE = path.join(scratchDir(), `turma-test-tenancy-open-${process.pid}.json`);
+  });
+  assert.equal(open.authEnabled(), false);
+  assert.equal(open.requestPrincipal({ headers: {} }).kind, "open");
+  assert.ok(open.oidcPrincipal("https://idp/", { sub: "s1" }, "user"));
+  assert.equal(open.authEnabled(), false, "an SSO login leaves an open hub open");
+  const tenancy = require("../tenancy.js");
+  const { state } = tenancy.createLocalUser(open.tenancyState(), {
+    username: "local1", passwordHash: tenancy.hashPasswordSync("local-password"),
+  });
+  open.__setTenancy(state);
+  assert.equal(open.authEnabled(), true);
+  assert.equal(open.requestPrincipal({ headers: {} }), null);
 });
 
 test("XERK-595: local login works with the IdP unreachable (no OIDC configured)", async () => {

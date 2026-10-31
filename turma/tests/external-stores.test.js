@@ -32,7 +32,7 @@ for (const v of [
   "ORG_COLORS_FILE", "REPO_TIERS_FILE", "EPIC_RUNS_FILE", "EPIC_BUILDERS_FILE",
   "USAGE_LEDGER_FILE", "STATE_FILE", "PERMISSION_POLICIES_FILE", "AGENT_IDENTITIES_FILE",
   "DECISIONS_FILE", "MODEL_POLICY_FILE", "DAILY_BRIEF_SCHEDULES_FILE", "DAILY_BRIEFS_FILE",
-  "MEETING_PROPOSALS_FILE",
+  "MEETING_PROPOSALS_FILE", "TENANCY_FILE",
 ]) {
   process.env[v] = tmp(v.toLowerCase());
 }
@@ -67,6 +67,8 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     "dailyBriefs",
     // XERK-2508: meetings Tenir posted (a 200 promises the row is kept).
     "meetingProposals",
+    // XERK-2530: hub users + tenants.
+    "tenancy",
   ]) {
     assert.ok(names.has(n), `store ${n} is registered`);
   }
@@ -75,8 +77,9 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     assert.ok(persistent[d.key] && persistent[d.key].file, `${d.name} has a persistent file`);
     // The briefs store's rows are the scheduler's "already fired" record (XERK-2395)
     // and a meeting's row is what Tenir's 200 promised (XERK-2508), so both are
-    // written at once; every other store keeps the 5s debounce.
-    const immediate = d.name === "dailyBriefs" || d.name === "meetingProposals";
+    // written at once, as are hub users (XERK-2530: an account change is
+    // human-rate and its 200 must mean it is kept); every other store keeps 5s.
+    const immediate = d.name === "dailyBriefs" || d.name === "meetingProposals" || d.name === "tenancy";
     assert.equal(persistent[d.key].debounceMs, immediate ? 0 : 5000,
       `${d.name} keeps its debounce`);
   }

@@ -164,11 +164,10 @@ flow and renders the local form for, never re-bouncing to the IdP.)
   on**. Setting BOTH to empty is the deliberate opt-out (`OIDC_GROUPS_ENFORCED` false → any
   authenticated OIDC user admitted as a plain `user`); `?? default` leaves an explicit `""` untouched
   so unset ≠ empty. Boot logs which (a warn on the opt-out).
-- **`role`/`groups` are recorded on the `oidcSessions` record for a future admin-only surface; NO
-  route is gated on `admin` yet** (Turma has one `userAuthorized` level — admin currently grants the
-  same access as user). The session cookie stays opaque (no identity on the wire); admin gating, when
-  it comes, reads the record via the `hub_oidc` sid cookie. Do NOT put the role on the `hub_session`
-  cookie.
+- **The callback upserts the IdP identity as a hub USER with its own tenant** (XERK-2530,
+  `oidcPrincipal`, `turma-tenancy.md`); the `hub_session` cookie names that principal and roles are
+  re-read from the user store on every request (`requestPrincipal`). `role`/`groups`/`userId` also
+  ride the `oidcSessions` record (logout hint). A disabled user gets `/login?error=forbidden`.
 - **OIDC-issued sessions are SHORTER-lived** so a revoked user re-authenticates (and is re-checked
   against current groups) within a bounded window: `issueSessionToken(ttlMs)` +
   `sessionSetCookie(req, token, ttlMs)` take `OIDC_SESSION_TTL_MS` (`TURMA_OIDC_SESSION_TTL_MS`,
