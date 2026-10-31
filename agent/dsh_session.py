@@ -690,23 +690,26 @@ class DshProjectionTail:
     def _sync_children(self):
         """Discover and project every descendant session's native log the driver
         has written, appending to its Claude-Code destination transcript."""
+        # scandir, not listdir + islink/isfile: the entry's type comes with the
+        # listing, so an idle child costs one stat (its size, in the cursor), not
+        # three, on every pump.
         try:
-            names = os.listdir(self._child_events_dir)
+            entries = list(os.scandir(self._child_events_dir))
         except OSError:
             return  # no children yet
-        for name in names:
+        for entry in entries:
+            name = entry.name
             if not name.endswith(".jsonl"):
                 continue
             child_id = name[:-len(".jsonl")]
             if not _CHILD_ID_RE.match(child_id):
                 continue
-            src = os.path.join(self._child_events_dir, name)
             try:
-                if os.path.islink(src) or not os.path.isfile(src):
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
                     continue      # never follow a planted link into another tree
             except OSError:
                 continue
-            self._pump_child(child_id, src)
+            self._pump_child(child_id, entry.path)
 
     def _pump_child(self, child_id, src):
         st = self._children.get(child_id)

@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 AGENT_DIR = os.path.dirname(HERE)
@@ -433,6 +434,95 @@ class DshDelegationTailTest(unittest.TestCase):
                 return [json.loads(x) for x in f if x.strip()]
         except OSError:
             return []
+
+    def test_child_sync_failure_never_costs_the_parent_transcript(self):
+        # XERK-2582: the child sync is contained — an exception inside it is
+        # logged, never raised out of `_pump` (which would kill the tail thread),
+        # and the parent's entries from the same pump still land.
+        logs = []
+        self.tail._log = logs.append
+
+        def boom():
+            raise RuntimeError("child sync exploded")
+        self.tail._sync_children = boom
+        with open(self.events_path, "w") as f:
+            f.write(json.dumps({"type": "user/message", "seq": 1, "time": 1, "data": {
+                "role": "user", "source": {"kind": "user"},
+                "content": [{"type": "text", "text": "hi"}]}}) + "\n")
+        self.tail._pump()               # must not raise
+        self.assertTrue(self._read(self.transcript))
+        self.assertTrue(any("child sync exploded" in m for m in logs), logs)
+
+    def test_idle_child_is_not_reopened_each_pump(self):
+        # XERK-2582: a child whose log has not grown since the last pump costs a
+        # stat, not an open+read; a later append is still projected.
+        # Drives `_sync_children` directly: whether `_pump` reaches it on a quiet
+        # parent is a separate rule (XERK-2578).
+        child = "a1b2c3d4-7777"
+        self._child(child)
+        self.tail._sync_children()
+        dest = os.path.join(self.transcript[:-len(".jsonl")], "subagents",
+                            "agent-%s.jsonl" % child)
+        before = len(self._read(dest))
+        self.assertTrue(before)
+        src = os.path.join(self.child_dir, child + ".jsonl")
+        real_open = os.open
+        opened = []
+
+        def spy(path, *a, **k):
+            if path == src:
+                opened.append(path)
+            return real_open(path, *a, **k)
+        with mock.patch("os.open", spy):
+            self.tail._sync_children()
+        self.assertEqual(opened, [], "an unchanged child log must not be reopened")
+        with open(src, "a") as f:
+            f.write(json.dumps({"type": "user/message", "seq": 4, "time": 4, "data": {
+                "role": "user", "source": {"kind": "user"},
+                "content": [{"type": "text", "text": "more"}]}}) + "\n")
+        self.tail._sync_children()
+        self.assertGreater(len(self._read(dest)), before)
+
+    def test_child_log_swapped_to_a_link_after_listing_is_refused(self):
+        # XERK-2582: the listing's file-type check is stale by the time a child
+        # is pumped, so the read itself must refuse a link planted since.
+        child = "a1b2c3d4-5555"
+        self._child(child, answer="SECRET")
+        src = os.path.join(self.child_dir, child + ".jsonl")
+        outside = src + ".outside"
+        os.rename(src, outside)
+        os.symlink(outside, src)
+        dest = os.path.join(self.transcript[:-len(".jsonl")], "subagents",
+                            "agent-%s.jsonl" % child)
+        self.tail._pump_child(child, src)       # past the listing's check
+        self.assertNotIn("SECRET", json.dumps(self._read(dest)))
+
+    def test_fifo_or_dir_child_log_is_refused(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs here")
+        os.mkfifo(os.path.join(self.child_dir, "a1b2c3d4-4444.jsonl"))
+        os.mkdir(os.path.join(self.child_dir, "a1b2c3d4-3333.jsonl"))
+        self.tail._sync_children()              # must not block or raise
+        self.assertNotIn("a1b2c3d4-4444", self.tail._children)
+        self.assertNotIn("a1b2c3d4-3333", self.tail._children)
+
+    def test_one_byte_append_completing_a_line_is_projected(self):
+        # The idle skip must not swallow a tiny append: a log ending in a
+        # partial line, completed by just its newline, projects that line.
+        child = "a1b2c3d4-2222"
+        src = os.path.join(self.child_dir, child + ".jsonl")
+        with open(src, "w") as f:
+            f.write(json.dumps({"type": "user/message", "seq": 1, "time": 1, "data": {
+                "role": "user", "source": {"kind": "user"},
+                "content": [{"type": "text", "text": "tiny"}]}}))
+        self.tail._sync_children()
+        dest = os.path.join(self.transcript[:-len(".jsonl")], "subagents",
+                            "agent-%s.jsonl" % child)
+        self.assertEqual(self._read(dest), [])
+        with open(src, "a") as f:
+            f.write("\n")
+        self.tail._sync_children()
+        self.assertIn("tiny", json.dumps(self._read(dest)))
 
     def test_ordinary_subagent_transcript_resolves(self):
         child = "a1b2c3d4-9999"

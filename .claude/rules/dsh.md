@@ -148,6 +148,10 @@ plugin's control-socket `state` (running|idle).
   `write_text_replace` or `open_for_append`, never a plain `open(path, "w"/"a")`** (XERK-2564):
   the store dirs are session-writable, so a planted link would be written through.
   Tests: `FreshWriteTest`, the `*planted*` tail cases.
+- **`ChildProjection.pump` re-checks the child log's type at the read** (lstat + `O_NOFOLLOW`
+  open + fstat; XERK-2582): the caller's listing check is stale by then, so a log swapped to a
+  link or FIFO mid-sync would be followed. Never go back to `getsize` + plain `open` there.
+  Tests: `test_child_log_swapped_to_a_link_after_listing_is_refused`.
 - **Every such write passes `anchor=` the transcript's own dir, never a bare `os.makedirs`**
   (XERK-2570): makedirs accepts a symlinked parent, so `<stem>/workflows` -> elsewhere redirected
   the write. Below the anchor each dir is opened `O_DIRECTORY|O_NOFOLLOW`, ops fd-relative
