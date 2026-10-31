@@ -223,6 +223,12 @@
   let autoMap = {};       // the hub's per-org auto-start opt-in
   let mergeMap = {};      // the hub's per-org auto-merge opt-in (XERK-550)
   let colorPins = {};     // the hub's manual org-color pins (XERK-145)
+  // The snapshot map objects update() last adopted (rollup XERK-2598). Pages
+  // call update(cache) on every render, but no page writes autoStartOrgs /
+  // autoMergeOrgs back into its cache from SSE — so re-adopting the SAME stale
+  // object each render reverted a switch the hub's SSE event (or this tab's
+  // optimistic flip) had just moved. Only a NEW snapshot object is adopted.
+  let seenAuto = null, seenMerge = null, seenColors = null;
   let colorFor = null;    // the org whose swatch strip is expanded, or null
   let open = false;
   let slot = null;
@@ -349,9 +355,9 @@
   function update(data) {
     const B = board();
     sites = B.mergeSites((data && data.agents) || []);
-    if (data && data.autoStartOrgs) autoMap = data.autoStartOrgs;
-    if (data && data.autoMergeOrgs) mergeMap = data.autoMergeOrgs;
-    if (data && data.orgColors) colorPins = data.orgColors;
+    if (data && data.autoStartOrgs && data.autoStartOrgs !== seenAuto) autoMap = seenAuto = data.autoStartOrgs;
+    if (data && data.autoMergeOrgs && data.autoMergeOrgs !== seenMerge) mergeMap = seenMerge = data.autoMergeOrgs;
+    if (data && data.orgColors && data.orgColors !== seenColors) colorPins = seenColors = data.orgColors;
     live = true;
     writeCache();
     paint();
@@ -392,6 +398,26 @@
     return attrs.length ? attrs.map(a => `[${a.name}="${CSS.escape(a.value)}"]`).join("") : null;
   }
 
+  // A POST that failed at the NETWORK level may still have been applied by the
+  // hub (the response was lost), so rolling back blindly can leave this page
+  // disagreeing with the hub until that org's map next changes — the SSE
+  // dedupe (rollup XERK-2593) sends a map only when this stream's slice moves.
+  // Re-read the hub's truth instead; false = couldn't, so the caller rolls back.
+  async function resyncOrgMaps() {
+    try {
+      const r = await fetch("/api/agents");
+      if (!r.ok) return false;
+      const d = await r.json();
+      if (!d || typeof d !== "object") return false;
+      if (d.autoStartOrgs) autoMap = d.autoStartOrgs;
+      if (d.autoMergeOrgs) mergeMap = d.autoMergeOrgs;
+      if (d.orgColors) colorPins = d.orgColors;
+      paint();
+      notify();
+      return true;
+    } catch { return false; }
+  }
+
   // Flip an org's hub-side auto-start opt-in (XERK-41). Painted optimistically —
   // the hub is authoritative the moment the POST returns and its SSE event keeps
   // every other open page in step, but the local flip makes THIS one respond
@@ -401,14 +427,15 @@
     autoMap = orgMapCopy(autoMap);
     if (enabled) autoMap[siteKey] = true; else delete autoMap[siteKey];
     paint();
-    let ok = false;
+    let ok = false, netErr = false;
     try {
       const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/autostart`,
         { method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ enabled }) });
       if (r.status === 401) { location.href = "/login"; return; }
       ok = r.ok;
-    } catch { /* network error — fall through to rollback */ }
+    } catch { netErr = true; /* outcome unknown — re-read below */ }
+    if (!ok && netErr && await resyncOrgMaps()) return;
     if (!ok) {
       autoMap = orgMapCopy(autoMap);
       if (had) autoMap[siteKey] = true; else delete autoMap[siteKey];
@@ -424,14 +451,15 @@
     mergeMap = orgMapCopy(mergeMap);
     if (enabled) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
     paint();
-    let ok = false;
+    let ok = false, netErr = false;
     try {
       const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/automerge`,
         { method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ enabled }) });
       if (r.status === 401) { location.href = "/login"; return; }
       ok = r.ok;
-    } catch { /* network error — fall through to rollback */ }
+    } catch { netErr = true; /* outcome unknown — re-read below */ }
+    if (!ok && netErr && await resyncOrgMaps()) return;
     if (!ok) {
       mergeMap = orgMapCopy(mergeMap);
       if (had) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
@@ -451,14 +479,15 @@
     colorFor = null;
     paint();
     notify();
-    let ok = false;
+    let ok = false, netErr = false;
     try {
       const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/color`,
         { method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify(slotN ? { slot: slotN } : { auto: true }) });
       if (r.status === 401) { location.href = "/login"; return; }
       ok = r.ok;
-    } catch { /* network error — fall through to rollback */ }
+    } catch { netErr = true; /* outcome unknown — re-read below */ }
+    if (!ok && netErr && await resyncOrgMaps()) return;
     if (!ok) {
       colorPins = prev;
       paint();

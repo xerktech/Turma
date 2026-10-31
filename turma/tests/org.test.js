@@ -633,6 +633,72 @@ test("org: the hub's autoStartOrgs broadcast repaints the switches", () => {
   assert.match(slot.innerHTML, /org-chip-auto on/);
 });
 
+test("XERK-2598: a re-render with the same stale cache never reverts an SSE-moved switch", () => {
+  const { slot, click } = mountOrg();
+  // A page's cache object, fetched once; no page writes autoStartOrgs back from SSE.
+  const cache = { agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {}, autoMergeOrgs: {} };
+  Org.update(cache);
+  click("data-org-toggle", "");
+  const handlers = {};
+  Org.sse({ addEventListener: (t, fn) => { handlers[t] = fn; } });
+  handlers.autoStartOrgs({ data: JSON.stringify({ "acme.atlassian.net": true }) });
+  handlers.autoMergeOrgs({ data: JSON.stringify({ "acme.atlassian.net": true }) });
+  Org.update(cache);                                     // the next beat's render
+  assert.match(slot.innerHTML, /org-chip-auto on/);
+  assert.match(slot.innerHTML, /org-chip-merge on/);
+  // A NEW snapshot (a refetch) is still the hub's word and is adopted.
+  Org.update({ ...cache, autoStartOrgs: {}, autoMergeOrgs: {} });
+  assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/);
+  assert.doesNotMatch(slot.innerHTML, /org-chip-merge on/);
+});
+
+test("XERK-2598: an optimistic flip survives a re-render before the POST settles", async () => {
+  const { slot, click } = mountOrg();
+  const cache = { agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {} };
+  Org.update(cache);
+  click("data-org-toggle", "");
+  let settle;
+  global.fetch = () => new Promise((res) => { settle = res; });
+  const p = Org.setAutoStart("acme.atlassian.net", true);
+  Org.update(cache);                                     // a beat lands mid-POST
+  assert.match(slot.innerHTML, /org-chip-auto on/);
+  settle({ ok: true, status: 200 });
+  await p;
+  assert.match(slot.innerHTML, /org-chip-auto on/);
+});
+
+test("XERK-2598: a network-failed POST re-reads the hub instead of rolling back blindly", async () => {
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {}, orgColors: {} });
+  click("data-org-toggle", "");
+  const urls = [];
+  global.fetch = (url) => {
+    urls.push(url);
+    // The hub applied the flip but the response was lost.
+    if (url.endsWith("/autostart")) return Promise.reject(new TypeError("network"));
+    return Promise.resolve({ ok: true, status: 200,
+      json: async () => ({ agents: [], autoStartOrgs: { "acme.atlassian.net": true } }) });
+  };
+  await Org.setAutoStart("acme.atlassian.net", true);
+  assert.deepEqual(urls, ["/api/jira/acme.atlassian.net/autostart", "/api/agents"]);
+  assert.match(slot.innerHTML, /org-chip-auto on/);
+
+  // The hub did NOT apply a color pin: the re-read says so, and the pin goes.
+  global.fetch = (url) => url.endsWith("/color") ? Promise.reject(new TypeError("network"))
+    : Promise.resolve({ ok: true, status: 200, json: async () => ({ agents: [], orgColors: {} }) });
+  await Org.setOrgColor("acme.atlassian.net", 4);
+  assert.deepEqual({ ...Org.orgColors() }, {});
+});
+
+test("XERK-2598: with the re-read failing too, a network-failed POST rolls back", async () => {
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")], autoMergeOrgs: {} });
+  click("data-org-toggle", "");
+  global.fetch = () => Promise.reject(new TypeError("network"));
+  await Org.setAutoMerge("acme.atlassian.net", true);
+  assert.doesNotMatch(slot.innerHTML, /org-chip-merge on/);
+});
+
 // ---- wiring: every page must actually obey it -------------------------------
 
 test("org: every page loads board.js, nav.js and org.js, in that order", () => {
