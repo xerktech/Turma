@@ -46,8 +46,9 @@ tenant"). Tenancy model: `turma-tenancy.md`.
   twin, rename or tenant BIND folds spend across tenants. A host's pre-bind spend stays untenanted.
 - Routing policy: state keys `<class>/<model>` (untenanted, the pre-tenancy keys) and
   `<tenantId>:<class>/<model>`; `modelPolicySweepTenant` per tenant; `modelPolicyPick` takes the
-  DISPATCH host's tenant; the SSE `modelPolicy` frame goes only to clients reading that tenant's
-  policy (`sseBroadcast(..., {policyTenant})`, `ssePrincipals` stamped at `/api/events` connect).
+  DISPATCH host's tenant; the SSE `modelPolicy` frame goes only to clients whose ledger scope is
+  that tenant (`sseBroadcast(..., {policyTenant})`, `ledgerTenantOf` of the `ssePrincipals` entry
+  stamped at `/api/events` connect — a client with no scope gets no scoped frame).
 - A tenant's demotion is NOT pushed: `notify()` fans out to every device until push is
   tenant-routed (XERK-2551). The untenanted fleet's demotion still notifies.
 - A bus frame whose `policyTenant` is present but not a string is dropped, never delivered unscoped.

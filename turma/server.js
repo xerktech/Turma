@@ -7709,7 +7709,7 @@ function sseDeliverLocal(event, dataObj, scope) {
   const only = scope && typeof scope.policyTenant === "string" ? scope.policyTenant : null;
   const frame = `event: ${event}\ndata: ${JSON.stringify(dataObj)}\n\n`;
   for (const res of sseClients) {
-    if (only !== null && principalTenant(ssePrincipals.get(res)) !== only) continue;
+    if (only !== null && ledgerTenantOf(ssePrincipals.get(res)) !== only) continue;
     try { res.write(frame); } catch { sseClients.delete(res); }
   }
 }

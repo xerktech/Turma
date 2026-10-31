@@ -28786,11 +28786,17 @@ test("XERK-2550: a routing-policy frame reaches only clients reading that tenant
     const pb = hub.principalFromToken(hub.issueSessionToken(60_000, { u: T.B.user.id, t: T.B.t, r: ["user"] }));
     hub.ssePrincipals.set(ra, pa);
     hub.ssePrincipals.set(rb, pb);
+    hub.ssePrincipals.set(rops, { kind: "breakglass", userId: null, tenantId: null, roles: ["admin"] });
     for (const r of [ra, rb, rops]) hub.sseClients.add(r);
     hub.sseDeliverLocal("modelPolicy", { mode: "observe", promoted: {} }, { policyTenant: T.A.t });
     assert.deepEqual([wrote(ra), wrote(rb), wrote(rops)], [1, 0, 0]);
+    // A principal with no ledger scope at all gets no scoped frame.
+    const rnone = mk();
+    hub.ssePrincipals.set(rnone, { kind: "user", tenantId: "nothex", roles: ["user"] });
+    hub.sseClients.add(rnone);
     hub.sseDeliverLocal("modelPolicy", { mode: "observe", promoted: {} }, { policyTenant: "" });
-    assert.deepEqual([wrote(ra), wrote(rb), wrote(rops)], [1, 0, 1]);
+    assert.deepEqual([wrote(ra), wrote(rb), wrote(rops), wrote(rnone)], [1, 0, 1, 0]);
+    hub.sseClients.delete(rnone);
     hub.sseDeliverLocal("modelPolicy", { mode: "observe", promoted: {} });   // unscoped: everyone
     assert.deepEqual([wrote(ra), wrote(rb), wrote(rops)], [2, 1, 2]);
   } finally {
