@@ -51079,6 +51079,42 @@ class TestKillpgNeverHitsPidOne(unittest.TestCase):
                     ha.SessionManager._kill_ttyd(sm, "s1")
                 kill.assert_not_called()
 
+    BAD_PIDS = (-1, "-1", 1, "1", 0, True)
+
+    def test_pid_alive_never_probes_a_pid_that_names_no_single_process(self):
+        with mock.patch.object(ha.os, "kill") as kill, \
+                mock.patch.object(ha, "IS_WINDOWS", False):
+            for bad in self.BAD_PIDS + (mock.MagicMock(),):
+                with self.subTest(pid=bad):
+                    self.assertFalse(ha._pid_alive(bad))
+            kill.assert_not_called()
+        self.assertTrue(ha._pid_alive(os.getpid()))
+
+    def test_a_persisted_qwen_inbox_pid_of_minus_one_is_never_signalled(self):
+        sm = mock.MagicMock()
+        sm.qwen_peer_inboxes = {}
+        for bad in self.BAD_PIDS + (mock.MagicMock(),):
+            with self.subTest(pid=bad):
+                sm._find.return_value = {"qwenPeerInboxPid": bad}
+                with mock.patch.object(ha.os, "kill") as kill:
+                    ha.SessionManager._stop_qwen_peer_inbox(sm, "s1")
+                kill.assert_not_called()
+
+    def test_kill_and_await_ttyd_never_sigkills_a_bad_pid(self):
+        sm = mock.MagicMock()
+        for bad in self.BAD_PIDS:
+            with self.subTest(pid=bad):
+                proc = mock.MagicMock()
+                proc.pid = bad
+                proc.poll.return_value = None          # never exits
+                sm.ttyd = {"s1": proc}
+                with mock.patch.object(ha.os, "kill") as kill, \
+                        mock.patch.object(ha.time, "sleep"), \
+                        mock.patch.object(ha, "_pid_alive", return_value=True):
+                    ha.SessionManager._kill_and_await_ttyd(
+                        sm, {"id": "s1", "ttydPid": bad})
+                kill.assert_not_called()
+
     def test_a_real_child_still_has_its_group_killed(self):
         proc = mock.MagicMock()
         proc.pid = 4242
