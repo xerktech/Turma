@@ -1,0 +1,124 @@
+{
+ "transcript": {
+  "runId": "00000000",
+  "siteKey": "acme.atlassian.net",
+  "meetingId": "bench-architecture-review",
+  "title": "Architecture review: events",
+  "platform": "zoom",
+  "startedAt": 1793000000000,
+  "endedAt": 1793000036905,
+  "participants": [
+   "Priya Raman",
+   "Tom Okafor",
+   "Marco Silva"
+  ],
+  "segments": [
+   {
+    "speaker": "Priya Raman",
+    "text": "the question today is kafka versus the managed queue for billing events",
+    "startMs": 4000,
+    "endMs": 7905
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "we only need ordering per customer, the managed queue does that with message groups",
+    "startMs": 8305,
+    "endMs": 12870
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "and we don't want to run kafka ourselves, ops cost is too high",
+    "startMs": 13270,
+    "endMs": 16680
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "okay so decided: managed queue, no kafka",
+    "startMs": 17080,
+    "endMs": 19280
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "second, do we keep the event schema in json or move to protobuf",
+    "startMs": 19680,
+    "endMs": 23145
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "json for now, we revisit when volume is ten times higher",
+    "startMs": 23545,
+    "endMs": 26625
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "decided, json stays",
+    "startMs": 27025,
+    "endMs": 28525
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "someone needs to write the adr for this",
+    "startMs": 28925,
+    "endMs": 31070
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Tom, write the ADR for the queue decision, by next review",
+    "startMs": 31470,
+    "endMs": 34605
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "okay",
+    "startMs": 35005,
+    "endMs": 36505
+   }
+  ]
+ },
+ "repos": [
+  {
+   "name": "billing-api",
+   "description": "Invoices, payments and the dunning jobs"
+  },
+  {
+   "name": "web-app",
+   "description": "Customer dashboard (React)"
+  },
+  {
+   "name": "mobile",
+   "description": "iOS and Android app"
+  },
+  {
+   "name": "infra",
+   "description": "Terraform and Helm for every environment"
+  }
+ ],
+ "expect": [
+  {
+   "kind": "decision",
+   "words": [
+    "kafka",
+    "queue"
+   ],
+   "any": true
+  },
+  {
+   "kind": "decision",
+   "words": [
+    "json"
+   ]
+  },
+  {
+   "kind": "task",
+   "words": [
+    "adr"
+   ],
+   "assignee": "Tom Okafor",
+   "kinds": [
+    "task",
+    "followup"
+   ]
+  }
+ ],
+ "forbid": []
+}

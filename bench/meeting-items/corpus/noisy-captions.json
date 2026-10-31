@@ -1,0 +1,122 @@
+{
+ "transcript": {
+  "runId": "00000000",
+  "siteKey": "acme.atlassian.net",
+  "meetingId": "bench-noisy-captions",
+  "title": "Infra sync",
+  "platform": "zoom",
+  "startedAt": 1793000000000,
+  "endedAt": 1793000031415,
+  "participants": [
+   "Marco Silva",
+   "Tom Okafor"
+  ],
+  "segments": [
+   {
+    "speaker": "Marco Silva",
+    "text": "so the uh terra form plan for the new",
+    "startMs": 4000,
+    "endMs": 6035
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "v p c is failing on the nat gateway quota",
+    "startMs": 6435,
+    "endMs": 8690
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "right we hit the elastic i p limit in us east one",
+    "startMs": 9090,
+    "endMs": 11785
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "i'll file the quota increase with a w s today",
+    "startMs": 12185,
+    "endMs": 14660
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "and the cert for api dot acme dot example expires in",
+    "startMs": 15060,
+    "endMs": 17920
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "nine days, the auto renewal broke when we moved d n s",
+    "startMs": 18320,
+    "endMs": 21235
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "that one's urgent, can you fix the renewal Tom",
+    "startMs": 21635,
+    "endMs": 24165
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "yeah i'll fix the cert renewal tomorrow morning",
+    "startMs": 24565,
+    "endMs": 27150
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "cool, um, we said we'd keep both regions active, that's decided",
+    "startMs": 27550,
+    "endMs": 31015
+   }
+  ]
+ },
+ "repos": [
+  {
+   "name": "billing-api",
+   "description": "Invoices, payments and the dunning jobs"
+  },
+  {
+   "name": "web-app",
+   "description": "Customer dashboard (React)"
+  },
+  {
+   "name": "mobile",
+   "description": "iOS and Android app"
+  },
+  {
+   "name": "infra",
+   "description": "Terraform and Helm for every environment"
+  }
+ ],
+ "expect": [
+  {
+   "kind": "task",
+   "words": [
+    "quota"
+   ],
+   "assignee": "Marco Silva",
+   "kinds": [
+    "task",
+    "followup"
+   ]
+  },
+  {
+   "kind": "task",
+   "words": [
+    "renew",
+    "cert"
+   ],
+   "any": true,
+   "assignee": "Tom Okafor",
+   "kinds": [
+    "task",
+    "bug"
+   ]
+  },
+  {
+   "kind": "decision",
+   "words": [
+    "region"
+   ]
+  }
+ ],
+ "forbid": []
+}

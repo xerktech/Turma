@@ -17495,7 +17495,7 @@ function dailyBriefTick(now = Date.now()) {
 // Contract: .claude/rules/contract-meetings.md.
 const TURMA_MEETINGS_TOKEN = process.env.TURMA_MEETINGS_TOKEN || "";
 const MEETING_BODY_MAX = 1 << 20;
-// What every run sends until XERK-2509's eval picks a default.
+// What every run sends: the XERK-2509 eval's pick (docs/meeting-items-adr.md).
 const MEETINGS_AUTO_MODEL = "sonnet";
 const MEETING_RUN_TIMEOUT_MS = 15 * 60e3;
 // A meeting no capable host has taken for this long settles failed.

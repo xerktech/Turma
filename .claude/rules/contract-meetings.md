@@ -66,8 +66,8 @@ ticket builds to this file; change it here first.
 ## Hub → agent: the `extractMeeting` command (XERK-2508 / XERK-2509)
 
 - `{type:"extractMeeting", runId, siteKey, meetingId, model, runtime}`; `runId` hub-minted
-  `^[0-9a-f]{1,32}$`, `model` concrete (`MEETINGS_AUTO_MODEL`, "sonnet" until XERK-2509's eval
-  picks), `runtime` `claude|dsh|qwen`.
+  `^[0-9a-f]{1,32}$`, `model` concrete (`MEETINGS_AUTO_MODEL` = "sonnet", the XERK-2509
+  eval's pick, `docs/meeting-items-adr.md`), `runtime` `claude|dsh|qwen`.
 - **The command carries no transcript** (a command rides the host record and `state.json`). The
   agent pulls it: `GET /api/agents/<host>/meetings/<runId>/transcript` (agent-authed, `<host>`
   proved by the credential, XERK-268) answers `{runId, siteKey, meetingId, title, platform,
@@ -101,6 +101,8 @@ ticket builds to this file; change it here first.
   repoGuess ≤200?}`. A title-less or unknown-kind item is dropped; the hub stamps `id` "p1".."pN".
   Item text is stored as plain text, markup included: every client renders it ESCAPED.
   A result's `model` counts only as `^[A-Za-z0-9._:-]{1,40}$`, else the row keeps the one sent.
+  - The agent fills `duplicateKeys` from a READ-ONLY tracker search, never from the model, and
+    offers `meetings.runtimes: ["claude"]` alone (agent half: `agent-meetings.md`).
 - Both keys are in `HEARTBEAT_KNOWN_KEYS`; `meetingResults` is deleted from the payload before
   the record is stored.
-- Tests: the `XERK-2508:` cases in `server.test.js`.
+- Tests: the `XERK-2508:` cases in `server.test.js`; agent: `TestMeetingWorker`.

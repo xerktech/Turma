@@ -1,0 +1,418 @@
+{
+ "transcript": {
+  "runId": "00000000",
+  "siteKey": "acme.atlassian.net",
+  "meetingId": "bench-long-standup",
+  "title": "Daily standup (long)",
+  "platform": "zoom",
+  "startedAt": 1793000000000,
+  "endedAt": 1793000167115,
+  "participants": [
+   "Priya Raman",
+   "Tom Okafor",
+   "Lena Fischer",
+   "Marco Silva",
+   "Jun Park"
+  ],
+  "segments": [
+   {
+    "speaker": "Priya Raman",
+    "text": "okay status round, Lena you first",
+    "startMs": 4000,
+    "endMs": 5815
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "still on the dashboard charts, going fine",
+    "startMs": 6215,
+    "endMs": 8470
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Tom",
+    "startMs": 8870,
+    "endMs": 10370
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "reviewing pull requests mostly, nothing blocked",
+    "startMs": 10770,
+    "endMs": 13355
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Marco",
+    "startMs": 13755,
+    "endMs": 15255
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "on call was quiet, two pages, both false alarms",
+    "startMs": 15655,
+    "endMs": 18240
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Jun",
+    "startMs": 18640,
+    "endMs": 20140
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "testing the new build on older phones, looks good so far",
+    "startMs": 20540,
+    "endMs": 23620
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "okay status round, Lena you first (round 2)",
+    "startMs": 24020,
+    "endMs": 26385
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "still on the dashboard charts, going fine (round 2)",
+    "startMs": 26785,
+    "endMs": 29590
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Tom (round 2)",
+    "startMs": 29990,
+    "endMs": 31490
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "reviewing pull requests mostly, nothing blocked (round 2)",
+    "startMs": 31890,
+    "endMs": 35025
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Marco (round 2)",
+    "startMs": 35425,
+    "endMs": 36925
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "on call was quiet, two pages, both false alarms (round 2)",
+    "startMs": 37325,
+    "endMs": 40460
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Jun (round 2)",
+    "startMs": 40860,
+    "endMs": 42360
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "testing the new build on older phones, looks good so far (round 2)",
+    "startMs": 42760,
+    "endMs": 46390
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "the false alarms are from the disk alert threshold, it's at seventy percent",
+    "startMs": 46790,
+    "endMs": 50915
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "i'll raise the disk alert threshold to eighty five",
+    "startMs": 51315,
+    "endMs": 54065
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "fine by me",
+    "startMs": 54465,
+    "endMs": 55965
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "okay status round, Lena you first (round 3)",
+    "startMs": 56365,
+    "endMs": 58730
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "still on the dashboard charts, going fine (round 3)",
+    "startMs": 59130,
+    "endMs": 61935
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Tom (round 3)",
+    "startMs": 62335,
+    "endMs": 63835
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "reviewing pull requests mostly, nothing blocked (round 3)",
+    "startMs": 64235,
+    "endMs": 67370
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Marco (round 3)",
+    "startMs": 67770,
+    "endMs": 69270
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "on call was quiet, two pages, both false alarms (round 3)",
+    "startMs": 69670,
+    "endMs": 72805
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Jun (round 3)",
+    "startMs": 73205,
+    "endMs": 74705
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "testing the new build on older phones, looks good so far (round 3)",
+    "startMs": 75105,
+    "endMs": 78735
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "okay status round, Lena you first (round 4)",
+    "startMs": 79135,
+    "endMs": 81500
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "still on the dashboard charts, going fine (round 4)",
+    "startMs": 81900,
+    "endMs": 84705
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Tom (round 4)",
+    "startMs": 85105,
+    "endMs": 86605
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "reviewing pull requests mostly, nothing blocked (round 4)",
+    "startMs": 87005,
+    "endMs": 90140
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Marco (round 4)",
+    "startMs": 90540,
+    "endMs": 92040
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "on call was quiet, two pages, both false alarms (round 4)",
+    "startMs": 92440,
+    "endMs": 95575
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Jun (round 4)",
+    "startMs": 95975,
+    "endMs": 97475
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "testing the new build on older phones, looks good so far (round 4)",
+    "startMs": 97875,
+    "endMs": 101505
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "found one real bug, push notifications don't open the right screen on ios",
+    "startMs": 101905,
+    "endMs": 105920
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "i'll fix the ios notification deep link this sprint",
+    "startMs": 106320,
+    "endMs": 109125
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "okay status round, Lena you first (round 5)",
+    "startMs": 109525,
+    "endMs": 111890
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "still on the dashboard charts, going fine (round 5)",
+    "startMs": 112290,
+    "endMs": 115095
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Tom (round 5)",
+    "startMs": 115495,
+    "endMs": 116995
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "reviewing pull requests mostly, nothing blocked (round 5)",
+    "startMs": 117395,
+    "endMs": 120530
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Marco (round 5)",
+    "startMs": 120930,
+    "endMs": 122430
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "on call was quiet, two pages, both false alarms (round 5)",
+    "startMs": 122830,
+    "endMs": 125965
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Jun (round 5)",
+    "startMs": 126365,
+    "endMs": 127865
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "testing the new build on older phones, looks good so far (round 5)",
+    "startMs": 128265,
+    "endMs": 131895
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "we agreed to freeze features on the twentieth for the audit",
+    "startMs": 132295,
+    "endMs": 135540
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "and I need someone to pair on the chart accessibility review",
+    "startMs": 135940,
+    "endMs": 139240
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "i can pair with you on that Lena, wednesday",
+    "startMs": 139640,
+    "endMs": 142005
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "okay status round, Lena you first (round 6)",
+    "startMs": 142405,
+    "endMs": 144770
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "still on the dashboard charts, going fine (round 6)",
+    "startMs": 145170,
+    "endMs": 147975
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Tom (round 6)",
+    "startMs": 148375,
+    "endMs": 149875
+   },
+   {
+    "speaker": "Tom Okafor",
+    "text": "reviewing pull requests mostly, nothing blocked (round 6)",
+    "startMs": 150275,
+    "endMs": 153410
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Marco (round 6)",
+    "startMs": 153810,
+    "endMs": 155310
+   },
+   {
+    "speaker": "Marco Silva",
+    "text": "on call was quiet, two pages, both false alarms (round 6)",
+    "startMs": 155710,
+    "endMs": 158845
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Jun (round 6)",
+    "startMs": 159245,
+    "endMs": 160745
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "testing the new build on older phones, looks good so far (round 6)",
+    "startMs": 161145,
+    "endMs": 164775
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "thanks all, see you tomorrow",
+    "startMs": 165175,
+    "endMs": 166715
+   }
+  ]
+ },
+ "repos": [
+  {
+   "name": "billing-api",
+   "description": "Invoices, payments and the dunning jobs"
+  },
+  {
+   "name": "web-app",
+   "description": "Customer dashboard (React)"
+  },
+  {
+   "name": "mobile",
+   "description": "iOS and Android app"
+  },
+  {
+   "name": "infra",
+   "description": "Terraform and Helm for every environment"
+  }
+ ],
+ "expect": [
+  {
+   "kind": "task",
+   "words": [
+    "threshold"
+   ],
+   "assignee": "Marco Silva"
+  },
+  {
+   "kind": "bug",
+   "words": [
+    "notification"
+   ],
+   "assignee": "Jun Park",
+   "kinds": [
+    "bug",
+    "task"
+   ]
+  },
+  {
+   "kind": "decision",
+   "words": [
+    "freeze"
+   ]
+  },
+  {
+   "kind": "task",
+   "words": [
+    "accessib"
+   ],
+   "assignee": "Tom Okafor",
+   "kinds": [
+    "task",
+    "followup"
+   ]
+  }
+ ],
+ "forbid": []
+}

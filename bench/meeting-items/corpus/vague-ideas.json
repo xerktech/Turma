@@ -1,0 +1,95 @@
+{
+ "transcript": {
+  "runId": "00000000",
+  "siteKey": "acme.atlassian.net",
+  "meetingId": "bench-vague-ideas",
+  "title": "Product brainstorm",
+  "platform": "zoom",
+  "startedAt": 1793000000000,
+  "endedAt": 1793000026600,
+  "participants": [
+   "Priya Raman",
+   "Lena Fischer",
+   "Jun Park"
+  ],
+  "segments": [
+   {
+    "speaker": "Lena Fischer",
+    "text": "what if we did dark mode at some point",
+    "startMs": 4000,
+    "endMs": 6090
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "maybe, or a widget for the home screen, could be cool",
+    "startMs": 6490,
+    "endMs": 9405
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "yeah lots of ideas, none for this quarter though",
+    "startMs": 9805,
+    "endMs": 12445
+   },
+   {
+    "speaker": "Lena Fischer",
+    "text": "someone could look at analytics one day",
+    "startMs": 12845,
+    "endMs": 14990
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "the one real thing: the onboarding survey closes on the fifteenth",
+    "startMs": 15390,
+    "endMs": 18965
+   },
+   {
+    "speaker": "Priya Raman",
+    "text": "Jun please send the survey results summary to the team after it closes",
+    "startMs": 19365,
+    "endMs": 23215
+   },
+   {
+    "speaker": "Jun Park",
+    "text": "will do, i'll send the summary on the sixteenth",
+    "startMs": 23615,
+    "endMs": 26200
+   }
+  ]
+ },
+ "repos": [
+  {
+   "name": "billing-api",
+   "description": "Invoices, payments and the dunning jobs"
+  },
+  {
+   "name": "web-app",
+   "description": "Customer dashboard (React)"
+  },
+  {
+   "name": "mobile",
+   "description": "iOS and Android app"
+  },
+  {
+   "name": "infra",
+   "description": "Terraform and Helm for every environment"
+  }
+ ],
+ "expect": [
+  {
+   "kind": "followup",
+   "words": [
+    "survey"
+   ],
+   "assignee": "Jun Park",
+   "kinds": [
+    "task",
+    "followup"
+   ]
+  }
+ ],
+ "forbid": [
+  "dark mode",
+  "widget"
+ ]
+}

@@ -1,0 +1,11 @@
+## haiku: 24/24 pass the parser first time
+  cost/meeting median $0.0031  max $0.0043
+  latency      median 5.4s  max 14.0s
+  expected items met 68/69, right assignee 68, extra items 3, forbidden 0
+  judge mean   precision 5.00  recall 4.96  fields 4.58  titles 5.00
+## sonnet: 24/24 pass the parser first time
+  cost/meeting median $0.0519  max $0.0612
+  latency      median 5.0s  max 8.3s
+  expected items met 66/69, right assignee 66, extra items 6, forbidden 0
+  judge mean   precision 5.00  recall 5.00  fields 5.00  titles 5.00
+## head to head: haiku wins 0, sonnet wins 11, ties 13
