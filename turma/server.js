@@ -13377,8 +13377,9 @@ function loginClientPart(v) {
 //
 // XERK-2579: with several cloudflared and ingress pods, those three parts give
 // one public IP a key per (cloudflared pod, ingress pod) pair — ~4x the free
-// guesses. TURMA_TRUSTED_PROXIES (comma-separated CIDRs/IPs: the ingress and
-// cloudflared pods) collapses that: when the socket AND the right-most XFF hop
+// guesses. TURMA_TRUSTED_PROXIES (comma-separated CIDRs/IPs: the ingress,
+// cloudflared AND hub pods — under HA a follower forwards the login to the leader
+// over its own socket, turma/forward.js) collapses that: when the socket AND the right-most XFF hop
 // are BOTH inside it, the request came Cloudflare -> ingress -> hub, so
 // CF-Connecting-IP is Cloudflare's and is the key alone. Anything else keeps the
 // three-part key. Unset = always three parts. Residual: a host inside those CIDRs
