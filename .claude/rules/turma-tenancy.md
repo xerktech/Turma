@@ -78,5 +78,6 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 - `turma/tests/tenancy.test.js` (own process, break-glass set); `tenancy-nopassword.test.js` (own
   process, bootstrap admin ONLY — the forgery / empty-Basic / dummy-hash / mid-verify-disable guards);
   `XERK-2530:` in `oidc-groups.test.js` and `server.test.js` (an OIDC user leaves an open hub open).
-- Known gaps, ticketed: local-login fairness under an anonymous flood (the 2-slot cap is global);
-  Android signs in with Basic, so local accounts cannot use the app yet.
+- Known gap, ticketed: local-login fairness under an anonymous flood (the 2-slot cap is global).
+- Android signs in through `POST /api/login` and rides `hub_session` (XERK-2569), so local accounts
+  work there too; Basic stays its break-glass fallback (`android/PARITY.md`).
