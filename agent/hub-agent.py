@@ -25786,6 +25786,9 @@ EPIC_BUILDERS_MAX = _env_int("EPIC_BUILDERS_MAX", 64)
 # ~/.turma, so the load re-validates every record.
 EPIC_BUILDERS_PATH = os.path.join(REGISTRY_DIR, "epic-builders.json")
 EPIC_BUILDERS_FILE_MAX_BYTES = 256 * 1024
+# The hub reads only the first 50 epicBuilderStatus entries (normalizeEpicBuilderStatus's
+# inline slice), fewer than EPIC_BUILDERS_MAX, so the report puts live builders first.
+EPIC_BUILDER_STATUS_MAX = 50
 EPIC_BUILDER_RESTART_LOST = ("the agent restarted while creating the epic; "
                              "check Jira for a partially created epic")
 # The child issue types a plan may use (case-insensitive) — a work ticket, never
@@ -33597,15 +33600,20 @@ class SessionManager:
                 rec["error"] = EPIC_BUILDER_RESTART_LOST
                 log(f"epic builder {bid} failed: {EPIC_BUILDER_RESTART_LOST}")
             out[bid] = rec
-        return out
+        # The file may hold more than the cap (it's session-writable): keep every
+        # live builder, then the newest terminal ones.
+        keep = sorted(out.values(), key=lambda r: (
+            r["state"] not in ("done", "failed"), r["updatedAt"]), reverse=True)
+        return {r["id"]: r for r in keep[:EPIC_BUILDERS_MAX]}
 
     def _save_epic_builders(self):
-        with self._epic_builders_lock:
-            data = {bid: {k: v for k, v in b.items() if k != "plan"}
-                    for bid, b in self.epic_builders.items()}
-        # The beat and the materialization worker both save; one writer at a time
-        # so they never share the tmp file.
+        # The beat and the materialization worker both save. The snapshot is
+        # taken inside the save lock so an older snapshot can never be written
+        # after a newer one (a restart would then load a stale state).
         with self._epic_builders_save_lock:
+            with self._epic_builders_lock:
+                data = {bid: {k: v for k, v in b.items() if k != "plan"}
+                        for bid, b in self.epic_builders.items()}
             try:
                 os.makedirs(REGISTRY_DIR, exist_ok=True)
                 tmp = EPIC_BUILDERS_PATH + f".{os.getpid()}.tmp"
@@ -33630,6 +33638,13 @@ class SessionManager:
         title = str(cmd.get("title") or "").strip()
         idea = str(cmd.get("idea") or "")
         repo_req = str(cmd.get("repo") or "").strip() or None
+        # A run this host already holds (e.g. restored after a restart) is never
+        # spawned twice: the hub re-dispatches a run it has not yet seen advance.
+        with self._epic_builders_lock:
+            held = bid in self.epic_builders
+        if held:
+            log(f"epic builder {bid} already running here — re-dispatch ignored")
+            return
 
         def fail(msg):
             with self._epic_builders_lock:
@@ -33825,7 +33840,13 @@ class SessionManager:
         have it (done, or a partial-failure epic); `error` only while failed."""
         out = []
         with self._epic_builders_lock:
-            for b in self.epic_builders.values():
+            # Live builders first, then the newest terminal ones, within the
+            # hub's cap — a backlog of finished records must never crowd out a
+            # new builder's report.
+            ordered = sorted(self.epic_builders.values(), key=lambda b: (
+                b.get("state") not in ("done", "failed"), b.get("updatedAt", 0)),
+                reverse=True)[:EPIC_BUILDER_STATUS_MAX]
+            for b in ordered:
                 s = {"id": b.get("id"), "state": b.get("state")}
                 if b.get("epicKey"):
                     s["epicKey"] = b["epicKey"]

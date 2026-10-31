@@ -45022,6 +45022,45 @@ class TestEpicBuilderRun(ManagerMixin, unittest.TestCase):
         self.assertFalse(b["materializing"])
         self.assertEqual(b["error"], ha.EPIC_BUILDER_RESTART_LOST)
 
+    def test_restart_keeps_the_timeout_and_the_fixed_plan_file(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "abcdg")
+        old = time.time() - ha.EPIC_BUILDER_TIMEOUT_SEC - 60
+        with open(ha.EPIC_BUILDERS_PATH, "w") as f:
+            json.dump({"b1": {"id": "b1", "state": "researching", "sessionId": "s",
+                              "worktreePath": wt, "planFile": "../../etc/passwd",
+                              "startedAt": old}}, f)
+        sm = self.make_manager()
+        self.assertEqual(sm.epic_builders["b1"]["planFile"], ha.EPIC_BUILDER_PLAN_FILENAME)
+        self.assertEqual(sm.epic_builders["b1"]["startedAt"], old)
+        with mock.patch.object(sm, "_kill_epic_builder_session", lambda *a: None):
+            sm._advance_epic_builders()
+        self.assertIn("timed out", sm.epic_builders["b1"]["error"])
+
+    def test_status_reports_live_builders_within_the_hub_cap(self):
+        # The hub reads only EPIC_BUILDER_STATUS_MAX entries; a backlog of
+        # finished records must not hide a new builder.
+        recs = {f"d{i}": {"id": f"d{i}", "state": "done", "epicKey": f"X-{i}",
+                          "updatedAt": time.time() - 100 + i}
+                for i in range(ha.EPIC_BUILDERS_MAX + 6)}
+        with open(ha.EPIC_BUILDERS_PATH, "w") as f:
+            json.dump(recs, f)
+        sm = self.make_manager()
+        self.assertEqual(len(sm.epic_builders), ha.EPIC_BUILDERS_MAX)
+        wt = os.path.join(ha.WORKTREES_ROOT, "abcdh")
+        os.makedirs(wt, exist_ok=True)
+        self._researching(sm, wt)
+        st = sm.epic_builder_status()
+        self.assertEqual(len(st), ha.EPIC_BUILDER_STATUS_MAX)
+        self.assertEqual(st[0], {"id": "b1", "state": "researching"})
+
+    def test_redispatch_of_a_held_builder_spawns_nothing(self):
+        sm = self.make_manager()
+        wt = os.path.join(ha.WORKTREES_ROOT, "abcdi")
+        os.makedirs(wt, exist_ok=True)
+        self._researching(sm, wt)
+        self._researching(self.make_manager(), wt, sid="sid2")
+        self.assertEqual(self.make_manager().epic_builders["b1"]["sessionId"], "sid1")
+
     def test_restart_drops_a_record_pointing_outside_the_worktrees(self):
         # ~/.turma is session-writable: a forged record must not aim the beat's
         # plan-file read at an arbitrary path.
