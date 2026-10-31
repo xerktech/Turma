@@ -56348,8 +56348,11 @@ class TestOneshotShutdownAndTmpWrites(ManagerMixin, unittest.TestCase):
         self.assertLess(time.monotonic() - started, 20, "the run ended with its killed child")
         self.assertEqual(killer["proc"].wait(timeout=5), -ha.signal.SIGKILL,
                          "the just-forked child was SIGKILLed, not left to finish")
-        # Once closing, no new one-shot starts at all.
-        self.assertIsNone(sm._run_lockdown_oneshot(["echo", "x"], "meeting-", 10, 100, "t"))
+        # Once closing, no new one-shot starts at all: nothing is even forked,
+        # since a daemon worker forking after the manager exits is never killed.
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            self.assertIsNone(sm._run_lockdown_oneshot(["echo", "x"], "meeting-", 10, 100, "t"))
+        popen.assert_not_called()
 
     def test_a_finished_oneshot_is_forgotten(self):
         sm = self.make_manager()
