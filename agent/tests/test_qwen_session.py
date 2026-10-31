@@ -240,6 +240,30 @@ class QwenProjectionTailTest(unittest.TestCase):
         self.assertEqual(len(self._read_transcript()), 1)
         self.assertFalse(os.path.islink(self.transcript))
 
+    def test_raw_mirror_never_written_through_a_symlinked_store_dir(self):
+        # XERK-2570: `<sid>/qwen` (or `<sid>` itself) planted as a link to an
+        # outside dir — the mirror must not land there.
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        sid_dir = os.path.dirname(self.store_dir)
+        os.symlink(outside, sid_dir)
+        self._append_native(self._user("hello"))
+        tail = self._tail(use_glob=False, store=True)
+        self.addCleanup(tail.stop)
+        tail._pump()
+        self.assertEqual(os.listdir(outside), [])
+        self.assertEqual(len(self._read_transcript()), 1)   # parent still projects
+
+    def test_child_reset_never_written_through_a_symlinked_parent_dir(self):
+        # XERK-2570: the reset child dest's parent planted as a link.
+        outside = os.path.join(self.tmp, "outside-sub")
+        os.makedirs(outside)
+        sid_dir = os.path.join(os.path.dirname(self.transcript), self.sid)
+        os.symlink(outside, sid_dir)
+        tail = self._tail(use_glob=False)
+        tail._reset_child_file(os.path.join(sid_dir, "subagents", "agent-a.jsonl"))
+        self.assertEqual(os.listdir(outside), [])
+
     def test_raw_mirror_never_appends_through_a_planted_link(self):
         # XERK-2564: the raw mirror name is session-writable; a symlink or
         # hardlink planted there must be refused, never appended through.
@@ -515,6 +539,21 @@ class QwenDelegationTailTest(unittest.TestCase):
         return qs.QwenProjectionTail(
             self.projects_root, self.transcript, self.sid,
             cwd="/repos/wt", log=lambda m: None, events_path=None)
+
+    def test_child_append_never_written_through_a_symlinked_subagents_dir(self):
+        # XERK-2570: the projected child's `subagents/` dir planted as a link —
+        # the reset and the projected append both stay out of its target.
+        self._write(self.native_log, self._fixture("qwen_delegation_corpus.json"))
+        self._write(self.child_native, self._fixture("qwen_delegation_child.json"))
+        outside = os.path.join(self.tmp, "outside-app")
+        os.makedirs(outside)
+        sub = os.path.dirname(self.projected_child)
+        os.makedirs(os.path.dirname(sub), exist_ok=True)
+        os.symlink(outside, sub)
+        tail = self._tail()
+        self.addCleanup(tail.stop)
+        tail._pump()
+        self.assertEqual(os.listdir(outside), [])
 
     def test_child_log_is_projected_into_the_claude_layout_and_resolves(self):
         # Parent delegation native log + the child's OWN native log on disk.

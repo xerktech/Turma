@@ -269,25 +269,110 @@ test("XERK-2530: concurrent local sign-ins past the cap are told to retry; break
   assert.deepEqual(glass.map((r) => r.status), Array(8).fill(200));
 });
 
+// ---- XERK-2577: break-glass guesses share the per-client backoff ------------
+
+const glassFrom = (client, password) =>
+  request("POST", "/api/login", { headers: { "cf-connecting-ip": client }, body: { username: "glass", password } });
+const basicFrom = (client, password, path = "/api/agents") =>
+  request("GET", path, { headers: {
+    "cf-connecting-ip": client,
+    authorization: `Basic ${Buffer.from(`glass:${password}`).toString("base64")}`,
+  } });
+
+test("XERK-2577: break-glass misses back off that client; the right password waits too", async () => {
+  for (let i = 0; i < 5; i++) assert.equal((await glassFrom("198.51.100.20", "guess")).status, 401, `miss ${i}`);
+  const held = await glassFrom("198.51.100.20", "glass-pass");
+  assert.equal(held.status, 429, "a backed-off client learns nothing, not even from the right password");
+  assert.ok(Number(held.headers["retry-after"]) >= 1, held.headers["retry-after"]);
+  // Another client is never locked out by that one.
+  assert.equal((await glassFrom("198.51.100.21", "glass-pass")).status, 200);
+});
+
+test("XERK-2577: a concurrent burst of break-glass guesses is counted, not slipped past", async () => {
+  // The right password rides in the middle of the burst: a guess arriving while this client's
+  // previous miss is still being checked is refused busy, never evaluated.
+  const burst = await Promise.all(Array.from({ length: 40 },
+    (_, i) => glassFrom("198.51.100.30", i === 20 ? "glass-pass" : "guess")));
+  const codes = burst.map((r) => r.status);
+  assert.ok(!codes.includes(200), codes.join());
+  assert.equal(codes.filter((c) => c === 401).length, 1, codes.join());
+});
+
+test("XERK-2577: a break-glass miss counts once, and a success clears the count", async () => {
+  for (let i = 0; i < 4; i++) assert.equal((await glassFrom("198.51.100.40", "guess")).status, 401);
+  assert.equal((await glassFrom("198.51.100.40", "glass-pass")).status, 200, "four misses are still free");
+  for (let i = 0; i < 4; i++) assert.equal((await glassFrom("198.51.100.40", "guess")).status, 401, `after reset ${i}`);
+});
+
+test("XERK-2577: Basic auth draws on the same budget, one count per request", async () => {
+  assert.equal((await basicFrom("198.51.100.50", "glass-pass")).status, 200);
+  for (let i = 0; i < 5; i++) assert.equal((await basicFrom("198.51.100.50", "guess")).status, 401, `miss ${i}`);
+  assert.equal((await basicFrom("198.51.100.50", "glass-pass")).status, 401, "backed off: refused");
+  assert.equal((await glassFrom("198.51.100.50", "glass-pass")).status, 429, "the form shares it");
+  assert.equal((await basicFrom("198.51.100.51", "glass-pass")).status, 200, "another client is unaffected");
+  // A request that asks for its principal twice records one miss, not two.
+  const req = { headers: { "cf-connecting-ip": "198.51.100.52",
+    authorization: `Basic ${Buffer.from("glass:guess").toString("base64")}` }, socket: { remoteAddress: "127.0.0.1" } };
+  for (let i = 0; i < 4; i++) {
+    const r = { ...req, headers: { ...req.headers } };
+    assert.equal(hub.requestPrincipal(r), null);
+    assert.equal(hub.requestPrincipal(r), null);
+  }
+  assert.equal((await basicFrom("198.51.100.52", "glass-pass")).status, 200, "four requests, four misses: still free");
+});
+
+test("XERK-2577: Basic carrying a LOCAL user's password never backs that user off", async () => {
+  await addLocalUser("basicky", "basicky-pass");
+  const basic = () => request("GET", "/api/agents", { headers: {
+    "cf-connecting-ip": "198.51.100.60",
+    authorization: `Basic ${Buffer.from("basicky:basicky-pass").toString("base64")}`,
+  } });
+  const codes = await Promise.all(Array.from({ length: 8 }, basic));
+  assert.deepEqual(codes.map((r) => r.status), Array(8).fill(401), "Basic is break-glass only");
+  const form = await request("POST", "/api/login", {
+    headers: { "cf-connecting-ip": "198.51.100.60" }, body: { username: "basicky", password: "basicky-pass" },
+  });
+  assert.equal(form.status, 200);
+});
+
+test("XERK-2577: a busy refusal looks the same for the break-glass name as for any other", async () => {
+  await addLocalUser("plainuser", "plainuser-pass");
+  const tally = async (client, username) => {
+    const rs = await Promise.all(Array.from({ length: 6 }, () => request("POST", "/api/login", {
+      headers: { "cf-connecting-ip": client }, body: { username, password: "guess" },
+    })));
+    const out = {};
+    for (const r of rs) out[r.status] = (out[r.status] || 0) + 1;
+    const next = await request("POST", "/api/login", {
+      headers: { "cf-connecting-ip": client }, body: { username, password: "guess" },
+    });
+    return { out, next: next.status };
+  };
+  const glass = await tally("198.51.100.70", "glass");
+  const plain = await tally("198.51.100.71", "plainuser");
+  assert.deepEqual(glass, plain);
+  assert.deepEqual(glass, { out: { 401: 1, 503: 5 }, next: 401 }, "a busy refusal neither evaluates nor counts");
+});
+
 // ---- OIDC converges on the same principal -----------------------------------
 
 test("XERK-2530: an OIDC login becomes a hub user with its own tenant; disabled gets none", () => {
   const iss = "https://idp.test/application/o/turma/";
-  const p1 = hub.oidcPrincipal(iss, { sub: "oidc-1", name: "Olive" }, "user");
+  const p1 = hub.oidcPrincipal(iss, { sub: "oidc-1", name: "Olive" }, ["user"]);
   assert.equal(p1.kind, "user");
   assert.equal(p1.source, "oidc");
   assert.match(p1.tenantId, /^[0-9a-f]{32}$/);
   assert.deepEqual([...p1.roles], ["user"]);
-  const p2 = hub.oidcPrincipal(iss, { sub: "oidc-1", name: "Olive" }, "admin");
+  const p2 = hub.oidcPrincipal(iss, { sub: "oidc-1", name: "Olive" }, ["user", "admin"]);
   assert.equal(p2.userId, p1.userId);
   assert.equal(p2.tenantId, p1.tenantId);
   assert.deepEqual([...p2.roles], ["user", "admin"]);
   const token = hub.issueSessionToken(60000, hub.principalClaims(p2));
   assert.equal(principalOfToken(token).userId, p1.userId);
   hub.__setTenancy(tenancy.updateUser(hub.tenancyState(), p1.userId, { disabled: true }).state);
-  assert.equal(hub.oidcPrincipal(iss, { sub: "oidc-1" }, "admin"), null);
+  assert.equal(hub.oidcPrincipal(iss, { sub: "oidc-1" }, ["user", "admin"]), null);
   assert.equal(principalOfToken(token), null);
-  assert.throws(() => hub.oidcPrincipal(iss, { sub: 42 }, "user"), /subject/);
+  assert.throws(() => hub.oidcPrincipal(iss, { sub: 42 }, ["user"]), /subject/);
 });
 
 test("XERK-2530: the store is written to its own durable file, never state.json", async () => {

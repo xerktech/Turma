@@ -41,6 +41,18 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
     filter, so an off-org session sharing the Claude login can still DELIVER into a session — it just
     can't discover one. **One Claude login per org is the only hard boundary**, a per-host deployment
     decision. Don't describe this contract as sealing it.
+- **Every host belongs to at most ONE tenant, and the HUB decides which** (XERK-2533,
+  `turma-tenancy.md`). The agent still names itself by its plain `DEVICE_NAME`; it never sends a tenant.
+  - The tenant lives on the identity (`agentIdentities[uid].tenantId`): an enrollment code mints into
+    its owner's tenant, a tenant user's roll binds an untenanted host. Never read it off the agent.
+  - The hub NAMESPACES the registry key as `<device>@<tenantId>` (`agentKeyFor`) from the tenant the
+    credential proves, on every agent surface (heartbeat `device`, tunnel `?name=`, `<host>` routes).
+  - A token of tenant A can never act as a key of B, nor as an untenanted key (`uidHostRefusal`); the
+    master and name tokens act only as untenanted keys (no name token is derivable for a tenant key).
+  - **The peer roster and migration also require ONE tenant** on both sides: `orgPeers` skips another
+    tenant's hosts, `sameDecidedOrg(src, tgt, srcKey, tgtKey)` compares tenants, and the migrate route
+    answers a cross-tenant target 404 "unknown target host". Never key either on the org alone.
+  - A roster row's `host` is the DEVICE name (`baseOfKey`): the agent finds itself by it.
 - **Nothing on the agent's BEAT LOOP may have a worst case at or above the hub's `OFFLINE_AFTER_MS`**
   (XERK-395). The hub calls a host offline after 75s of silence; what sets the gap between beats is
   the AGENT's own timeouts and retry counts, so it lives here, where both halves load.

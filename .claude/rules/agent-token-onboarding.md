@@ -58,6 +58,9 @@ Split out of `CLAUDE.md`, which keeps the per-host credential contract (XERK-268
   - **A code never takes a name another agent holds** (`enrollNameRefusal`, case-folded) — that
     would hand the code holder that host's token and queued commands. An identity minted for the
     name that never beat is SUPERSEDED, so two machines never share one id.
+  - **Except inside `ENROLL_SUPERSEDE_GRACE_MS` (2 min) of another code's redemption for that
+    name** (`enrollSupersedeRefusal`, XERK-2574): 409, code not burned. Superseding at once let two
+    back-to-back redemptions both answer 200 with the first token already dead.
   - A refusal that is the caller's mistake (wrong device for a device-bound code, a taken or
     unusable name) does NOT burn the code. Used/expired/revoked → 410 in the hub's words.
   - **Only UNKNOWN codes are rate-limited, fleet-wide** (`enrollFailLimited`, 30/min → 429); a
@@ -77,11 +80,13 @@ Split out of `CLAUDE.md`, which keeps the per-host credential contract (XERK-268
     after the bump lands means a beat inside the store round trip takes the name and the code is
     refused (409, not burned). A redemption refused at the check pass never bumps (else any code
     holder could revoke a live host's token); a code revoked or expired DURING the bump still bumps
-    that released name (accepted). A failed bump still redeems, logged.
+    that released name (accepted). A failed bump still redeems, logged. A TENANTED code never bumps:
+    only plain names have name tokens, so it would revoke the untenanted host of that name.
     Tests: `XERK-2572:` cases (the slow-store case pins the await).
   - `owner` records the minting principal (`requestPrincipal`: `user:<id>` + `tenantId`, else its
-    kind, e.g. `breakglass`) for the tenancy epic
-    (XERK-2529) to bind the host to a tenant. **Recorded, not enforced.**
+    kind, e.g. `breakglass`). **The host joins the owner's tenant** (XERK-2533): its key is
+    `<device>@<tenantId>` and its identity carries the tenant; names are checked as that tenant's key.
+    A code with no tenant enrolls an untenanted host. Mechanics: `turma-tenancy.md`.
   - Agent: `hub-agent.py --enroll` with `TURMA_ENROLL_CODE` in the ENV (never argv) runs
     `enroll_with_code`, which writes only an identity token. Front ends: `turma-agentctl enroll
     --code`, `turma-agentctl.ps1 enroll -Code`, `install.sh --url --enroll-code`, `install.ps1 -Url

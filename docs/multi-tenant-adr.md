@@ -33,6 +33,19 @@ tenants, run by an admin panel.
   new, because the only principals that can exist are the bootstrap admin, break-glass, and OIDC users
   who already had full access.
 
+### A host belongs to one tenant (XERK-2533)
+
+- The tenant is recorded on the agent's IDENTITY by the hub — from the enrollment code's owner, or
+  the tenant user who rolls an untenanted host — never taken from anything the agent sends.
+- The registry key is `<device>@<tenantId>`, so two tenants can each have a "laptop"; the agent
+  keeps its plain `DEVICE_NAME` and the hub namespaces it from the credential.
+- Rejected: a separate tenant field beside a shared device-name key. Every surface already keys on
+  the host key (HA store, tunnel directory, SSE, ttyd, usage ledger), so namespacing the key isolates
+  them all at once; a field would need a check at each one, and one missed is a cross-tenant leak.
+- An untenanted host (all of today's fleet) is reachable only by the hub's operators — an admin,
+  break-glass, a pre-tenancy cookie, an open hub — never by a plain tenant user, until the
+  migration (XERK-2554) binds it. An admin who rolls such a host with their own tenant binds it there.
+
 ### Admin without a tenant: break-glass
 
 - The `TURMA_USER`/`TURMA_PASSWORD` break-glass login (XERK-595) stays, IdP-independent, and maps to
@@ -65,8 +78,14 @@ tenants, run by an admin panel.
 - Two roles: `user` (owns a tenant) and `admin` (manages identities).
 - Local groups map to roles: `turma-users` → user, `turma-admins` → admin by default, editable by the
   admin panel. Orgs without Authentik manage membership by hand here.
-- OIDC users take roles from the IdP's `groups` claim at each login (XERK-594: the admin group grants
-  user + admin), plus any local group the operator adds them to.
+- OIDC users take roles from the IdP's `groups` claim at each login, plus any local group the operator
+  adds them to. Each group maps to one role (XERK-2532): `TURMA_OIDC_USER_GROUP` (`k8x-ai`) → user,
+  `TURMA_OIDC_ADMIN_GROUP` (`k8x-admins`) → admin. An admin-only user gets the admin panel and no
+  tenant; XERK-594's "admin implies user" was dropped so administering identities never grants data.
+- An OIDC identity is provisioned (user + tenant) only on a login that grants a role. A known user
+  whose login grants none is disabled by the IdP; the tenant is kept until an admin deletes the user,
+  and re-joining a group lifts that disable (never an operator's). Removal takes effect at the next
+  login, at most `TURMA_OIDC_SESSION_TTL_MS` (24h) after the group change.
 - A principal with no role is not signed in.
 
 ### Storage

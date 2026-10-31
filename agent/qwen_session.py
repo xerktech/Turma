@@ -56,7 +56,7 @@ try:
     # qwen-specific.
     from runtime_tail import (
         ChildProjection, append_entries, env_float, open_for_append,
-        open_fresh_for_write,
+        open_fresh_for_write, write_text_replace,
     )
 except ImportError:  # pragma: no cover - only when run outside the agent dir
     QwenProjector = None
@@ -192,6 +192,10 @@ class QwenProjectionTail:
                 if transcript_path.endswith(".jsonl") else transcript_path)
         self._subagents_dir = os.path.join(stem, "subagents")
         self._children = {}
+        # Every projected write (transcript, child dests, the raw mirror under
+        # `<sid>/qwen/`) is anchored at the transcript's own dir: no link a
+        # session plants at a directory BELOW it is followed (XERK-2570).
+        self._anchor = os.path.dirname(os.path.abspath(transcript_path))
 
     def start(self):
         if self._proj is None:
@@ -253,9 +257,9 @@ class QwenProjectionTail:
         # moment the session is launched (an empty file reads as an empty
         # conversation, exactly like a Claude session before its first byte).
         try:
-            os.makedirs(os.path.dirname(self.transcript_path), exist_ok=True)
             if not os.path.exists(self.transcript_path):
-                open_for_append(self.transcript_path).close()
+                open_for_append(self.transcript_path, anchor=self._anchor,
+                                create=True).close()
         except OSError as e:
             self._log(f"qwen projection: cannot create transcript: {e}")
         while not self._stop.is_set():
@@ -338,20 +342,16 @@ class QwenProjectionTail:
         proj = QwenProjector(self._session_id, cwd=self._cwd,
                              git_branch=self._git_branch)
         entries, partial = self._project_bytes(proj, b"", data)
-        tmp = "%s.rebuild.%d.tmp" % (self.transcript_path, os.getpid())
         try:
-            # Fresh O_EXCL|O_NOFOLLOW tmp: a link planted at the tmp name is
-            # never written through (XERK-2564).
-            with open_fresh_for_write(tmp) as fh:
-                for e in entries:
-                    fh.write(json.dumps(e, ensure_ascii=False) + "\n")
-            os.replace(tmp, self.transcript_path)
+            # Fresh O_EXCL|O_NOFOLLOW tmp, renamed over the transcript: a link
+            # planted at the tmp name (XERK-2564) or a parent dir (XERK-2570) is
+            # never written through; the helper removes the tmp on failure.
+            write_text_replace(
+                self.transcript_path,
+                "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries),
+                anchor=self._anchor, tmp_tag="rebuild")
         except OSError as e:
             self._log(f"qwen projection: transcript rebuild failed: {e}")
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
             return False
         # Committed atomically — advance the live cursors past the rebuilt bytes.
         self._proj = proj
@@ -441,7 +441,7 @@ class QwenProjectionTail:
             st = ChildProjection(
                 lambda: QwenProjector(child_id, cwd=self._cwd,
                                       git_branch=self._git_branch),
-                dest)
+                dest, anchor=self._anchor)
             self._children[child_id] = st
             # START THE CHILD TRANSCRIPT OVER (XERK-530). A fresh ChildProjection
             # reads the child's native log from offset 0, so it re-projects the
@@ -459,8 +459,7 @@ class QwenProjectionTail:
         the from-0 re-projection of the child's native log never doubles an
         existing dest across a resume/adopt. Never raises (logged)."""
         try:
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open_fresh_for_write(dest):
+            with open_fresh_for_write(dest, anchor=self._anchor, create=True):
                 pass
         except OSError as e:
             self._log(f"qwen child transcript reset failed: {e}")
@@ -511,10 +510,10 @@ class QwenProjectionTail:
         if native_size == self._raw_offset:
             return
         try:
-            os.makedirs(self._store_dir, exist_ok=True)
             copied = 0
             with open(events_path, "rb") as src, \
-                    open_for_append(self._raw_path, binary=True) as dst:
+                    open_for_append(self._raw_path, binary=True,
+                                    anchor=self._anchor, create=True) as dst:
                 src.seek(self._raw_offset)
                 while True:
                     # Bounded read: the one large-copy case is a pre-existing
@@ -553,4 +552,5 @@ class QwenProjectionTail:
                     return
 
     def _append(self, path, entries):
-        append_entries(path, entries, self._log, "qwen projection")
+        append_entries(path, entries, self._log, "qwen projection",
+                       anchor=self._anchor)
