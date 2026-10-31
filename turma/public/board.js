@@ -1185,7 +1185,9 @@
   function orgName(siteKey, override) {
     const o = String(override ?? "").trim();
     if (o) return o;
-    let s = String(siteKey ?? "");
+    // A tenant's org key carries its tenant (`<siteKey>@<32-hex>`, XERK-2551);
+    // the label is the site alone.
+    let s = String(siteKey ?? "").replace(/@[0-9a-f]{32}$/, "");
     if (s.includes("/")) {
       const segs = s.split("/").filter(Boolean);
       return segs[segs.length - 1] || s;
@@ -1334,9 +1336,10 @@
     const tw = (site && site.tickets || []).find((x) => x && x.key === twin);
     if (tw && tw.url) return tw.url;
     if (!site || !site.siteKey) return "";
+    const host = String(site.siteKey).replace(/@[0-9a-f]{32}$/, ""); // a tenant's org key (XERK-2551)
     return site.source === "azure"
-      ? `https://${site.siteKey}/_workitems/edit/${twin}`
-      : `https://${site.siteKey}/browse/${twin}`;
+      ? `https://${host}/_workitems/edit/${twin}`
+      : `https://${host}/browse/${twin}`;
   }
   function dedupeChipHtml(t, site) {
     const twin = t && t.triage && t.triage.dedupeOf;

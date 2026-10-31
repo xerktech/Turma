@@ -427,6 +427,9 @@ class BoardTest {
 
     @Test fun `org name strips the atlassian net suffix`() {
         assertEquals("xerktech", orgName("xerktech.atlassian.net"))
+        // XERK-2551: a tenant's org key carries its tenant; the label is the site alone.
+        assertEquals("xerktech", orgName("xerktech.atlassian.net@" + "a".repeat(32)))
+        assertEquals("myorg", orgName("dev.azure.com/myorg@" + "b".repeat(32)))
         assertEquals("self-hosted.example.com", orgName("self-hosted.example.com"))
     }
 

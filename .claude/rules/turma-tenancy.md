@@ -8,6 +8,8 @@ paths:
   - turma/tests/oidc.test.js
   - turma/tests/server.test.js
   - turma/public/login.html
+  - turma/public/board.js
+  - android/app/src/main/java/com/xerktech/turma/core/Board.kt
 description: Hub users + tenants (XERK-2530, epic XERK-2529) — the principal every route keys on, and the invariants a tenancy change must keep.
 ---
 
@@ -187,6 +189,36 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 - `coerceAgentIdentities` drops an entry whose home is a tenant key with a missing/different tenant.
 - **Ledgers, insights, routing and usage read their tenant off that key** (XERK-2550): no
   aggregate spans two tenants, and `purgeTenantData` is the tenant purge. `turma-tenancy-ledgers.md`.
+
+## Orgs belong to tenants (XERK-2551)
+
+- **A tenant host's org key is `<siteKey>@<tenantId>`** (`scopeSite`), like its host key: two
+  tenants on one Jira site are two orgs that share no store row, queue entry, host pool or setting.
+  - Rewritten at the AGENT boundary only: `scopeSiteKeys` re-scopes every `siteKey` in a beat
+    (whole-payload walk, so no field is missed; content keys in `SITE_SCOPE_SKIP` excluded) and
+    strips an untenanted host's forged suffix. `orgBound` follows the host into its tenant.
+  - The agent always gets its org PLAIN (`unscopeSiteKeys`): delivered commands, the reply's
+    `decisions.org`/`permissionPolicy.site`, the meeting transcript GET. It compares them to its
+    own site; a scoped one makes it drop the command. A new agent-bound siteKey must be unscoped too.
+  - Every store, sweep and queue needs NO tenant check of its own; never add a tenantId field
+    beside a plain siteKey (the rejected design, `docs/multi-tenant-adr.md`).
+- **`principalMaySite` gates every `/api/jira/<site>` and `/api/orgs/<site>` route** (404) with the
+  host rule (`principalMayDriveHost` on the org's tenant), in ONE guard after the human gate.
+  `POST /api/jira/refresh` fans out to the caller's own hosts only.
+- **Tenir's meeting post is scoped by its TOKEN** (`meetingsTenant`): the fleet
+  `TURMA_MEETINGS_TOKEN` = untenanted; `tm1.<tenantId>.<HMAC(that token, tenant)>` = that tenant,
+  live only while a user of the tenant holds the user role. A suffixed URL site is refused.
+  `GET /api/meetings-token` hands a tenant user theirs. Tenir needs no change (a bearer either way).
+- **Push devices carry the registrant's tenant** (`registerDevice`); `notify`/`dismiss` send only to
+  `devicesForHost(host)` — the host's tenant's devices, the operators' for an untenanted host or a
+  fleet-wide alert. Pass the host to every new `dismiss`.
+- **Clients show the site alone**: `orgName` drops the suffix (board.js + `Board.kt`), as does the
+  dedupe twin's tracker URL. Keys round-trip unchanged in route URLs.
+- **`purgeTenantData(tenantId)` is the one tenant-delete entry point**; each store registers its own
+  purge (`registerTenantPurge`), each run in its own try/catch. A new per-tenant store must register.
+- Not here: scoping the `/api/agents` payload + SSE per principal is XERK-2534's; until it lands
+  every signed-in principal still RECEIVES every org's maps (writes and per-org routes are gated).
+- Tests: the `XERK-2551:` cases in `server.test.js`.
 
 ## Tests
 
