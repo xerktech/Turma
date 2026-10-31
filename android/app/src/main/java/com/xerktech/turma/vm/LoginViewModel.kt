@@ -38,9 +38,9 @@ class LoginViewModel(private val app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(busy = true, error = null) }
         val candidate = Config.Settings(hubUrl = hubUrl.trim(), user = user.trim(), password = password)
         viewModelScope.launch {
-            val result = container.client.probeCredentials(candidate)
+            val (result, sessionToken) = container.client.signIn(candidate)
             if (result == SignInResult.Ok) {
-                container.config.save(hubUrl, user, password)
+                container.config.save(hubUrl, user, password, sessionToken)
                 PushRegistrar.register(app, container)
                 _state.update { it.copy(busy = false, done = true) }
             } else {

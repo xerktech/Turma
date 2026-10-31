@@ -41,3 +41,39 @@ test("XERK-2399: a fragment the redirect dropped is handed on", () => {
   assert.equal(safeNext("/board#own"), "/board#own", "next's own fragment wins");
   assert.equal(safeNext("//evil.example/"), "/", "never carried onto a refusal");
 });
+
+// XERK-2576: a non-401 /api/login refusal shows the hub's own words + its wait.
+function loadRefusalMessage() {
+  const html = fs.readFileSync(path.join(__dirname, "..", "public", "login.html"), "utf8");
+  const src = html.match(/function refusalMessage\(status, body, retryAfter\) \{[\s\S]*?\n  \}\n/);
+  assert.ok(src, "login.html defines refusalMessage");
+  return new Function(`${src[0]}; return refusalMessage;`)();
+}
+
+test("XERK-2576: a sign-in refusal reads in the hub's words with the Retry-After wait", () => {
+  const msg = loadRefusalMessage();
+  assert.equal(msg(503, { error: "too many sign-ins in progress — try again in a moment" }, "1"),
+    "too many sign-ins in progress — try again in a moment (retry in 1s)");
+  assert.equal(msg(429, { error: "too many failed sign-ins — try again later" }, "300"),
+    "too many failed sign-ins — try again later (retry in 5 min)");
+  assert.equal(msg(429, { error: "slow down" }, "61"), "slow down (retry in 2 min)");
+  assert.equal(msg(429, { error: "slow down" }, "59"), "slow down (retry in 59s)");
+  assert.equal(msg(429, { error: "slow down" }, "60"), "slow down (retry in 1 min)");
+  assert.equal(msg(429, { error: "slow down" }, "99999999999999999999999"), "slow down");
+  // No / unparseable / zero Retry-After: the hub's words alone.
+  assert.equal(msg(429, { error: "slow down" }, null), "slow down");
+  assert.equal(msg(429, { error: "slow down" }, "Wed, 21 Oct 2026 07:28:00 GMT"), "slow down");
+  assert.equal(msg(429, { error: "slow down" }, "0"), "slow down");
+  // No usable {error}: the bare status, never a blank box.
+  assert.equal(msg(502, null, "5"), "Sign-in failed (HTTP 502). Please try again.");
+  assert.equal(msg(500, { error: "   " }, null), "Sign-in failed (HTTP 500). Please try again.");
+  assert.equal(msg(500, { error: 7 }, null), "Sign-in failed (HTTP 500). Please try again.");
+});
+
+test("XERK-2576: login.html routes non-401 refusals through refusalMessage", () => {
+  const html = fs.readFileSync(path.join(__dirname, "..", "public", "login.html"), "utf8");
+  assert.match(html, /refusalMessage\(res\.status, body, res\.headers\.get\("Retry-After"\)\)/);
+  assert.doesNotMatch(html, /"Sign-in failed\. Please try again\."/);
+  // Only a 401 is a wrong password — a throttled 503/429 must not read as one.
+  assert.match(html, /if \(res\.status === 401\) \{\n\s*showError\("Incorrect username or password\."\);/);
+});

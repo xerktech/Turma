@@ -359,8 +359,10 @@ private fun plantCookie(container: com.xerktech.turma.AppContainer, baseUrl: Str
     val s = container.config.current
     // An SSO session (XERK-591) has no password to POST — plant the stored
     // hub_session token straight into the WebView so ttyd's subresources + its
-    // WebSocket authenticate the same way an API call does.
-    if (s.sessionToken.isNotBlank()) {
+    // WebSocket authenticate the same way an API call does. With a password on
+    // file, a fresh /api/login below is preferred over the stored token: that
+    // token may have lapsed, and nothing in the WebView would sign in again.
+    if (s.sessionToken.isNotBlank() && s.password.isEmpty()) {
         return try {
             val cm = CookieManager.getInstance()
             cm.setAcceptCookie(true)

@@ -136,6 +136,10 @@ function coerceUser(id, u) {
     ? [...new Set(u.groups.filter((g) => typeof g === "string" && GROUP_RE.test(g)))].slice(0, 20)
     : [];
   out.disabled = u.disabled === true;
+  // "idp": the IdP's groups stopped granting any role (XERK-2532). Only that
+  // kind of disable lifts itself when the groups grant a role again; an
+  // operator's disable (no `disabledBy`) never does.
+  if (out.disabled && u.source === "oidc" && u.disabledBy === "idp") out.disabledBy = "idp";
   out.createdAt = finiteMs(u.createdAt) || 0;
   const last = finiteMs(u.lastLoginAt);
   if (last) out.lastLoginAt = last;
@@ -254,20 +258,37 @@ function createLocalUser(state, { username, displayName, passwordHash, groups = 
 }
 
 // The OIDC callback's upsert: the (issuer, sub) pair is the identity — never the
-// display name or email, which the IdP lets a user change. A first login mints
-// the user and its tenant; later logins refresh the IdP roles + display name.
+// display name or email, which the IdP lets a user change. `idpRoles` are what
+// the groups claim grants this login (XERK-2532: user group -> "user", admin
+// group -> "admin", independently).
+// - A first login mints the user and its tenant, but only when the groups grant
+//   a role: an identity the IdP admits nowhere is never provisioned (user: null).
+// - A later login refreshes the IdP roles + display name. One left with no role
+//   at all (removed from every group, no local group either) is marked disabled
+//   by the IdP; its record and tenant stay until an admin deletes the user. A
+//   later login that grants a role again lifts that disable — never an
+//   operator's.
 function upsertOidcUser(state, { iss, sub, displayName, idpRoles, now = Date.now() }) {
   if (typeof iss !== "string" || !iss || iss.length > ISS_MAX) throw new Error("invalid issuer");
   if (typeof sub !== "string" || !sub || sub.length > SUB_MAX) throw new Error("invalid subject");
+  const roles = Array.isArray(idpRoles) ? idpRoles.filter((r) => ROLES.includes(r)) : [];
   const existing = findOidcUser(state, iss, sub);
   if (!existing) {
-    return addUser(state, { source: "oidc", oidcIss: iss, oidcSub: sub, displayName, idpRoles, groups: [], createdAt: now });
+    if (!roles.length) return { state, user: null };
+    return addUser(state, { source: "oidc", oidcIss: iss, oidcSub: sub, displayName, idpRoles: roles, groups: [], createdAt: now });
   }
-  const user = coerceUser(existing.id, {
+  const next = {
     ...existing,
     displayName: cleanText(displayName, DISPLAY_MAX) || existing.displayName,
-    idpRoles,
-  });
+    idpRoles: roles,
+  };
+  const granted = effectiveRoles(state, next).length > 0;
+  if (!granted && !existing.disabled) Object.assign(next, { disabled: true, disabledBy: "idp" });
+  else if (granted && existing.disabled && existing.disabledBy === "idp") {
+    next.disabled = false;
+    delete next.disabledBy;
+  }
+  const user = coerceUser(existing.id, next);
   const users = Object.assign(Object.create(null), state.users, { [user.id]: user });
   return { state: { ...state, users }, user };
 }
@@ -276,7 +297,11 @@ function updateUser(state, id, patch) {
   const cur = Object.hasOwn(state.users, id) ? state.users[id] : null;
   if (!cur) throw new Error("no such user");
   // Identity fields never move: a tenant is the user's for life.
-  const next = coerceUser(id, { ...cur, ...patch, id, tenantId: cur.tenantId, source: cur.source });
+  const merged = { ...cur, ...patch, id, tenantId: cur.tenantId, source: cur.source };
+  // An operator setting `disabled` owns it from then on: an IdP disable it
+  // re-states becomes the operator's, so a later login cannot lift it.
+  if (Object.hasOwn(patch, "disabled") && !Object.hasOwn(patch, "disabledBy")) delete merged.disabledBy;
+  const next = coerceUser(id, merged);
   if (!next) throw new Error("invalid user record");
   const users = Object.assign(Object.create(null), state.users, { [id]: next });
   return { state: { ...state, users }, user: next };

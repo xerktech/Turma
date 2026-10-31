@@ -814,7 +814,7 @@ test("XERK-936: server.js forwardBodyRoute names each stateless-413 route, forwa
   // ...and only past the auth gate the leader runs BEFORE reading the body (QA L1).
   assert.match(src, /agentPresentedRefusal\(req\) \? "" : "heartbeat"/);
   assert.match(src, /userAuthorized\(req\) \? "upload" : ""/);
-  assert.match(src, /agentHostRefusal\(req, claimed\) \? "" : "archiveRaw"/);
+  assert.match(src, /agentHostRefusal\(req, agentKeyFor\(req, claimed\)\) \? "" : "archiveRaw"/);
 });
 
 // ---- XERK-939: the follower judges against the LEADER's published caps ----------
