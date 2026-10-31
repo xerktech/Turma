@@ -289,10 +289,13 @@ test("XERK-2577: break-glass misses back off that client; the right password wai
 });
 
 test("XERK-2577: a concurrent burst of break-glass guesses is counted, not slipped past", async () => {
-  const burst = await Promise.all(Array.from({ length: 40 }, () => glassFrom("198.51.100.30", "guess")));
+  // The right password rides in the middle of the burst: a guess arriving while this client's
+  // previous miss is still being checked is refused busy, never evaluated.
+  const burst = await Promise.all(Array.from({ length: 40 },
+    (_, i) => glassFrom("198.51.100.30", i === 20 ? "glass-pass" : "guess")));
   const codes = burst.map((r) => r.status);
-  assert.ok(codes.filter((c) => c === 429).length >= 30, codes.join());
-  assert.equal((await glassFrom("198.51.100.30", "glass-pass")).status, 429);
+  assert.ok(!codes.includes(200), codes.join());
+  assert.equal(codes.filter((c) => c === 401).length, 1, codes.join());
 });
 
 test("XERK-2577: a break-glass miss counts once, and a success clears the count", async () => {
@@ -316,6 +319,39 @@ test("XERK-2577: Basic auth draws on the same budget, one count per request", as
     assert.equal(hub.requestPrincipal(r), null);
   }
   assert.equal((await basicFrom("198.51.100.52", "glass-pass")).status, 200, "four requests, four misses: still free");
+});
+
+test("XERK-2577: Basic carrying a LOCAL user's password never backs that user off", async () => {
+  await addLocalUser("basicky", "basicky-pass");
+  const basic = () => request("GET", "/api/agents", { headers: {
+    "cf-connecting-ip": "198.51.100.60",
+    authorization: `Basic ${Buffer.from("basicky:basicky-pass").toString("base64")}`,
+  } });
+  const codes = await Promise.all(Array.from({ length: 8 }, basic));
+  assert.deepEqual(codes.map((r) => r.status), Array(8).fill(401), "Basic is break-glass only");
+  const form = await request("POST", "/api/login", {
+    headers: { "cf-connecting-ip": "198.51.100.60" }, body: { username: "basicky", password: "basicky-pass" },
+  });
+  assert.equal(form.status, 200);
+});
+
+test("XERK-2577: a busy refusal looks the same for the break-glass name as for any other", async () => {
+  await addLocalUser("plainuser", "plainuser-pass");
+  const tally = async (client, username) => {
+    const rs = await Promise.all(Array.from({ length: 6 }, () => request("POST", "/api/login", {
+      headers: { "cf-connecting-ip": client }, body: { username, password: "guess" },
+    })));
+    const out = {};
+    for (const r of rs) out[r.status] = (out[r.status] || 0) + 1;
+    const next = await request("POST", "/api/login", {
+      headers: { "cf-connecting-ip": client }, body: { username, password: "guess" },
+    });
+    return { out, next: next.status };
+  };
+  const glass = await tally("198.51.100.70", "glass");
+  const plain = await tally("198.51.100.71", "plainuser");
+  assert.deepEqual(glass, plain);
+  assert.deepEqual(glass, { out: { 401: 1, 503: 5 }, next: 401 }, "a busy refusal neither evaluates nor counts");
 });
 
 // ---- OIDC converges on the same principal -----------------------------------

@@ -78,6 +78,14 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     password is right. Accepted cost: an operator who mistypes it 5 times waits.
   - The miss is recorded synchronously, before any await — a concurrent burst cannot outrun it.
   - Basic caches its verdict per `req` (`basicVerdicts`): routes ask more than once per request.
+  - Basic counts only a guess at the break-glass NAME: Android sends a local user's correct password
+    as Basic too, and counting it would back that user's own form sign-in off.
+  - `/api/login` refuses a break-glass-name attempt in `localLogin`'s order (backoff 429, then this
+    client already in flight 503) BEFORE the compare: a busy refusal neither evaluates nor counts it,
+    so the response pattern never reveals which name is break-glass.
+  - Android never retries a password `/api/login` refused (401) as Basic — one miss, not two.
+  - Residual (XERK-2568's key-trust model): a caller bypassing Cloudflare rotates CF-Connecting-IP
+    for a fresh budget per request — scrypt-free break-glass makes that a real bypass (XERK-2585).
   - A `/api/login` break-glass miss still runs the local scrypt check (shared name, no timing tell
     for which name is break-glass), passed `counted` so it is not recorded twice.
 - An unknown username verifies against a dummy hash (same cost, no timing oracle); every failure is

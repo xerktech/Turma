@@ -13325,7 +13325,11 @@ function requestPrincipal(req) {
   if (basicVerdicts.has(req)) return basicVerdicts.get(req);
   const decoded = Buffer.from(header.slice(6), "base64").toString();
   const sep = decoded.indexOf(":");
-  const verdict = sep < 0 ? null : breakGlassAttempt(loginClientKey(req), decoded.slice(0, sep), decoded.slice(sep + 1));
+  // Only a guess at the break-glass NAME is one: Android sends a local user's
+  // (correct) password as Basic too, and counting that would back the user off.
+  const user = sep < 0 ? "" : decoded.slice(0, sep);
+  const verdict = sep < 0 || !safeEqual(user, TURMA_USER) ? null
+    : breakGlassAttempt(loginClientKey(req), user, decoded.slice(sep + 1));
   const principal = verdict === true ? BREAKGLASS_PRINCIPAL : null;
   basicVerdicts.set(req, principal);
   return principal;
@@ -20560,15 +20564,24 @@ const server = http.createServer(async (req, res) => {
         // Break-glass (XERK-595) first and scrypt-free, so it works under another
         // client's flood — but throttled per client (XERK-2577). Only a guess at
         // the break-glass username is one; any other name is a plain local login.
-        const bg = TURMA_PASSWORD && safeEqual(username, TURMA_USER)
-          ? breakGlassAttempt(clientKey, username, password) : null;
+        // Its refusals run in localLogin's order — backoff (429), then this
+        // client's sign-in already in flight (503) — BEFORE the compare, so a busy
+        // refusal neither evaluates nor counts the guess, exactly as for any other
+        // name: the response pattern never tells which name is break-glass.
+        let bg = null;
+        if (TURMA_PASSWORD && safeEqual(username, TURMA_USER)) {
+          const wait = loginBackoffMs(clientKey, username, Date.now());
+          if (wait) bg = { throttled: Math.ceil(wait / 1000) };
+          else if (loginClientsInflight.has(clientKey)) bg = { busy: true };
+          else bg = breakGlassAttempt(clientKey, username, password);
+        }
         if (bg === true) {
           token = issueSessionToken(SESSION_TTL_MS, principalClaims(BREAKGLASS_PRINCIPAL));
         } else {
           // A break-glass miss still runs the local check — a local account may
           // share the name, and the scrypt keeps the miss as slow as any other
           // (no timing tell for which name is break-glass) — but it is counted once.
-          const r = typeof bg === "number" ? { throttled: bg }
+          const r = typeof bg === "number" ? { throttled: bg } : bg && typeof bg === "object" ? bg
             : await localLogin(username, password, Date.now(), clientKey, bg === false);
           if (r.throttled) {
             res.setHeader("Retry-After", String(r.throttled));
