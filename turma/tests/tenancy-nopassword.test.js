@@ -219,6 +219,10 @@ test("XERK-2585: off Cloudflare, a rotated CF-Connecting-IP never changes the si
   assert.equal(key({ "x-forwarded-for": "2001:db8:1:3::1.2.3.4" }, "10.244.2.8"), "2001:db8:1:3::/64");
   // A zone id naming a VLAN (with a dot) still collapses to the /64.
   assert.equal(key({ "x-forwarded-for": "fe80::1%eth0.100" }, "10.244.2.8"), "fe80:0:0:0::/64");
+  // Whole keys drop their zone; ::/96 compat is whole; the /96 edge is an ordinary /64.
+  assert.equal(key({ "x-forwarded-for": "64:ff9b::1.2.3.4%eth0" }, "10.244.2.8"), "64:ff9b::1.2.3.4");
+  assert.equal(key({ "x-forwarded-for": "::1.2.3.4%eth0.100" }, "10.244.2.8"), "::1.2.3.4");
+  assert.equal(key({ "x-forwarded-for": "64:ff9b:0:0:0:1::1" }, "10.244.2.8"), "64:ff9b:0:0::/64");
   // Unset env keeps the three-part key exactly.
   assert.equal(key({ "cf-connecting-ip": "198.51.100.1", "x-forwarded-for": "192.168.1.50" }, "10.244.2.8", null),
     "198.51.100.1|192.168.1.50|10.244.2.8");
