@@ -16361,6 +16361,11 @@ function autoStopSweep() {
       if (s.status !== "running" && s.status !== "queued") continue;
       const t = s.ticket;
       if (!t || !t.key) continue;
+      // A bare session the agent only ADOPTED onto this ticket from its branch
+      // name (XERK-817) was started by the operator, who closes it (XERK-2547).
+      // Never kill it on Done: its branch may name a ticket already Done, or an
+      // auto-started twin may close the shared ticket while it still works.
+      if (ticketAdopted(t)) continue;
       if (!doneKeys.has((t.siteKey || "") + "\x00" + t.key)) continue;
       const dk = host + "\x00" + s.id;
       if (autoStopped.has(dk) || autoStopResumeExempt.has(dk)) continue;

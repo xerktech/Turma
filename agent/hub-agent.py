@@ -38583,8 +38583,9 @@ class SessionManager:
         if refusal is None and ticket.get("adopted"):
             # An ADOPTED block came from the session's own branch name
             # (`_maybe_adopt_ticket`), so any ticket this host collected is one
-            # branch rename away, and closing it gets every session working it
-            # killed org-wide (the hub's auto-stop). The provenance reason
+            # branch rename away, and closing it gets every ticket-spawned
+            # session working it killed org-wide (the hub's auto-stop; adopted
+            # sessions are exempt, XERK-2547). The provenance reason
             # XERK-1440 refuses auto-merge for an adopted session.
             refusal = "an adopted ticket is closed with the host's tracker tool"
         if refusal is not None:
