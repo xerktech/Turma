@@ -1073,3 +1073,6 @@ those are marked `[MODEL]`.
     parity-exempt), but it loads `/term` at top level (no parent iframe) and does not run the
     sessions-page watchdog, so its terminal has no grey-heal. `TerminalScreen` should watch a
     WebView load/connect signal and reload on a stall, or add a manual refresh control.
+- **Local hub accounts (XERK-2530) cannot sign in from the app** — the password path sends Basic,
+  which the hub now accepts for break-glass only; local accounts must use `POST /api/login` and the
+  `hub_session` cookie. Web works (`login.html`). Tracked in XERK-2569.

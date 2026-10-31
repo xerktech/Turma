@@ -72,6 +72,7 @@ process.env.AGENT_IDENTITIES_FILE = path.join(
   scratchDir(),
   `turma-test-agent-identities-${process.pid}.json`
 );
+process.env.TENANCY_FILE = path.join(scratchDir(), `turma-test-tenancy-${process.pid}.json`);
 process.env.NAME_TOKEN_GENS_FILE = path.join(
   scratchDir(),
   `turma-test-name-token-gens-${process.pid}.json`
@@ -2738,6 +2739,24 @@ test("XERK-595: breakGlassEnabled reflects whether a local credential is set", (
   // mandatory-OIDC change must not create).
   const open = freshServerModule((env) => { env.TURMA_PASSWORD = ""; env.TURMA_USER = ""; });
   assert.equal(open.breakGlassEnabled(), false);
+});
+
+test("XERK-2530: on a passwordless hub an OIDC user does not flip it closed; a local account does", async () => {
+  const open = freshServerModule((env) => {
+    env.TURMA_PASSWORD = ""; env.TURMA_USER = "";
+    env.TENANCY_FILE = path.join(scratchDir(), `turma-test-tenancy-open-${process.pid}.json`);
+  });
+  assert.equal(open.authEnabled(), false);
+  assert.equal(open.requestPrincipal({ headers: {} }).kind, "open");
+  assert.ok(open.oidcPrincipal("https://idp/", { sub: "s1" }, "user"));
+  assert.equal(open.authEnabled(), false, "an SSO login leaves an open hub open");
+  const tenancy = require("../tenancy.js");
+  const { state } = tenancy.createLocalUser(open.tenancyState(), {
+    username: "local1", passwordHash: tenancy.hashPasswordSync("local-password"),
+  });
+  open.__setTenancy(state);
+  assert.equal(open.authEnabled(), true);
+  assert.equal(open.requestPrincipal({ headers: {} }), null);
 });
 
 test("XERK-595: local login works with the IdP unreachable (no OIDC configured)", async () => {
@@ -12932,6 +12951,44 @@ test("auto-stop: fires each session at most once, across repeated sweeps", async
   assert.equal((agents.apOnce.commands || []).filter((c) => c.type === "kill").length, 1);
 });
 
+// ---- a session ADOPTED onto a ticket by its branch name is never auto-stopped (XERK-2547) ----
+// A bare "new session" the agent linked to a ticket only from its branch name
+// (XERK-817, `ticket.adopted`) was started by the operator, who closes it. Killing
+// it on Done ended manual work early: a branch named after an already-Done ticket
+// was killed within a beat, and an auto-started twin closing the shared ticket
+// killed the manual session with it.
+
+test("auto-stop: an ADOPTED session on a Done ticket is not killed (XERK-2547)", async () => {
+  autoStopped.clear();
+  await asBeat("apAdopt", "ap11.atlassian.net", {
+    tickets: [{ key: "ENG-9", statusCategory: "done",
+                repoGuess: { repo: "Turma", cloned: true } }],
+    sessions: [
+      { id: "sd-manual", status: "running",
+        ticket: { key: "ENG-9", siteKey: "ap11.atlassian.net", adopted: true } },
+      // The auto-started twin on the same ticket keeps today's behaviour.
+      { id: "sd-auto", status: "running",
+        ticket: { key: "ENG-9", siteKey: "ap11.atlassian.net" } },
+    ],
+  });
+  autoStopSweep();
+  assert.deepEqual((agents.apAdopt.commands || []).filter((c) => c.type === "kill")
+    .map((c) => c.sessionId), ["sd-auto"]);
+});
+
+test("auto-stop: only a strict adopted:true exempts a session (XERK-2547)", async () => {
+  autoStopped.clear();
+  await asBeat("apAdopt2", "ap12.atlassian.net", {
+    tickets: [{ key: "ENG-9", statusCategory: "done",
+                repoGuess: { repo: "Turma", cloned: true } }],
+    sessions: [{ id: "sd1", status: "running",
+                 ticket: { key: "ENG-9", siteKey: "ap12.atlassian.net", adopted: "yes" } }],
+  });
+  autoStopSweep();
+  assert.deepEqual((agents.apAdopt2.commands || []).filter((c) => c.type === "kill")
+    .map((c) => c.sessionId), ["sd1"]);
+});
+
 // ---- resuming a Done-ticket session overrides auto-stop (XERK-561) ------------
 // Deliberately resuming an ended session whose ticket is already Done is the
 // operator overriding auto-stop — they want it running again despite Done.
@@ -20114,7 +20171,7 @@ test("XERK-2531: a code is single-use and trades for the host's identity token",
   assert.equal(list.status, 200);
   assert.ok(!list.raw.includes(code.slice(3)));
   assert.equal(list.body.codes[0].state, "live");
-  assert.match(list.body.codes[0].owner, /^local:/); // the minting principal is recorded
+  assert.match(list.body.codes[0].owner, /^(breakglass|user:)/); // the minting principal is recorded
   // Redeemed WITHOUT any credential (the route is exempt from the login gate).
   const r = await request("POST", "/api/agent/enroll", { body: { code, device: "enr-a" } });
   assert.equal(r.status, 200, JSON.stringify(r.body));

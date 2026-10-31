@@ -91,7 +91,8 @@ Split out of `CLAUDE.md`, which keeps the per-host credential contract (XERK-268
   - **Every 200 redemption writes the identities through before answering**: the code is burned at
     once (no debounce), so an identity left on the 5s debounce was a spent code plus a token the
     hub did not know after a hard kill. Tests: `XERK-2573:` cases (the on-disk checks).
-  - `owner` records the minting principal (`oidc:<sub>` or `local:<user>`) for the tenancy epic
+  - `owner` records the minting principal (`requestPrincipal`: `user:<id>` + `tenantId`, else its
+    kind, e.g. `breakglass`) for the tenancy epic
     (XERK-2529) to bind the host to a tenant. **Recorded, not enforced.**
   - Agent: `hub-agent.py --enroll` with `TURMA_ENROLL_CODE` in the ENV (never argv) runs
     `enroll_with_code`, which writes only an identity token. Front ends: `turma-agentctl enroll

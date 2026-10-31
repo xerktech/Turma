@@ -190,6 +190,11 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
 - `autoStopSweep()` (15s) reads every org's Done tickets, scans the fleet for sessions naming one,
   kills each **live** one (`running`/`queued`) on its host. Guard: `autoStopped`
   (`<host>\x00<sessionId>`, once per hub lifetime).
+- **A session ADOPTED onto a ticket by its branch name is never auto-stopped** (XERK-2547,
+  `ticketAdopted`, strict `adopted === true`): the operator started it by hand and closes it.
+  - Not "only when Done predates adoption": an auto-started twin closing the shared ticket AFTER
+    adoption must not kill it either, and the board row carries no Done-transition time.
+  - Ticket-spawned sessions (no `adopted`) keep the kill. An older agent never sends the flag.
 - **Deliberately RESUMING a session whose ticket is already Done overrides auto-stop** (XERK-561):
   the resume/start route pre-seats a dedicated `autoStopResumeExempt` guard
   (`markResumedTicketAutoStopExempt`, scoped to a ticket Done AT RESUME TIME) so the sweep leaves the

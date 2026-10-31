@@ -339,7 +339,7 @@ class FileLiveStore {
       try {
         fs.mkdirSync(path.dirname(file), { recursive: true });
         const tmp = `${file}.tmp-${process.pid}-sync`;
-        fs.writeFileSync(tmp, blob);
+        fs.writeFileSync(tmp, blob, spec.mode ? { mode: spec.mode } : undefined);
         fs.renameSync(tmp, file);
       } catch (e) {
         console.error(`store: durable flush of ${JSON.stringify(key)} failed: ${e.message}`);
@@ -353,7 +353,9 @@ class FileLiveStore {
     };
     fs.mkdir(path.dirname(file), { recursive: true }, () => {
       const tmp = `${file}.tmp-${process.pid}`;
-      fs.writeFile(tmp, blob, (err) => {
+      // `mode` (e.g. 0o600 for the users store's password hashes) applies when the
+      // temp file is created, so the renamed file never exists world-readable.
+      fs.writeFile(tmp, blob, spec.mode ? { mode: spec.mode } : {}, (err) => {
         if (err) {
           console.error(`store: durable save of ${JSON.stringify(key)} failed: ${err.message}`);
           done();

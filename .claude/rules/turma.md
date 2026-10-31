@@ -311,7 +311,8 @@ retraction, `pushEnabled`.
 
 ## Auth
 
-- UI/API/terminal sit behind single-user HTTP Basic auth (`TURMA_USER`/`TURMA_PASSWORD`). Agents
+- UI/API/terminal sit behind the human login: hub users (local or OIDC, one tenant each) and the
+  `TURMA_USER`/`TURMA_PASSWORD` break-glass; `requestPrincipal` says who (`turma-tenancy.md`). Agents
   authenticate with a **per-host** token — `TURMA_TOKEN` in the agent env, `hostAgentToken()` =
   `<base64url(device)>.<HMAC(master, device)>` on the hub. See CLAUDE.md's cross-cutting contracts
   for the rule; the mechanics:
