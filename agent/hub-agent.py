@@ -25781,6 +25781,13 @@ EPIC_BUILDER_IDEA_MAX = _env_int("EPIC_BUILDER_IDEA_MAX", 8000)
 EPIC_BUILDER_PLAN_MAX_BYTES = _env_int("EPIC_BUILDER_PLAN_MAX_BYTES", 256 * 1024)
 EPIC_BUILDER_TIMEOUT_SEC = _env_int("EPIC_BUILDER_TIMEOUT_SEC", 45 * 60)
 EPIC_BUILDERS_MAX = _env_int("EPIC_BUILDERS_MAX", 64)
+# The builder records, persisted so an agent restart mid-research (a self-update)
+# keeps watching the surviving session's plan file (XERK-2546). Session-writable
+# ~/.turma, so the load re-validates every record.
+EPIC_BUILDERS_PATH = os.path.join(REGISTRY_DIR, "epic-builders.json")
+EPIC_BUILDERS_FILE_MAX_BYTES = 256 * 1024
+EPIC_BUILDER_RESTART_LOST = ("the agent restarted while creating the epic; "
+                             "check Jira for a partially created epic")
 # The child issue types a plan may use (case-insensitive) — a work ticket, never
 # another Epic and never a Subtask. Mirrors epic-plan.js EPIC_PLAN_CHILD_TYPES.
 EPIC_BUILDER_CHILD_TYPES = ("task", "story")
@@ -28207,11 +28214,13 @@ class SessionManager:
         # Epic Builder runs this host is driving (XERK-724), keyed by the hub's
         # builderId: {id, siteKey, title, idea, repo, state, sessionId,
         # worktreePath, planFile, plan, project, epicKey, error, materializing,
-        # startedAt, updatedAt}. In-memory (a rare, short-lived run); the hub's
-        # own epicBuilders record is the durable side. Read on the beat to build
+        # startedAt, updatedAt}. Persisted to EPIC_BUILDERS_PATH (minus `plan`,
+        # re-read from the plan file) so a restart keeps advancing a run whose
+        # session survives it (XERK-2546). Read on the beat to build
         # epicBuilderStatus, written by the beat (spawn/advance) AND the
         # materialization worker, so every access is lock-guarded.
-        self.epic_builders = {}
+        self.epic_builders = self._load_epic_builders()
+        self._epic_builders_save_lock = threading.Lock()
         # Shadow runs (XERK-1847): id -> run record, persisted so a manager restart
         # keeps advancing (and reporting) a run whose sessions survive it.
         self.shadow_runs = self._load_shadow_runs()
@@ -33545,6 +33554,66 @@ class SessionManager:
                     key=lambda x: x.get("updatedAt", 0))
                 for x in done[:over]:
                     self.epic_builders.pop(x["id"], None)
+        self._save_epic_builders()
+
+    def _load_epic_builders(self):
+        """The persisted builder records, re-validated (the file sits in
+        session-writable ~/.turma). A `researching` record resumes watching its
+        plan file, but only from a worktree under WORKTREES_ROOT, so a forged
+        record cannot point the beat at an arbitrary path. A `creating` record's
+        materialization died with the process: it is reported failed, never
+        replayed, since a replay could create a second, duplicate epic."""
+        data = _read_untrusted_json(EPIC_BUILDERS_PATH, EPIC_BUILDERS_FILE_MAX_BYTES)
+        out = {}
+        root = os.path.realpath(WORKTREES_ROOT) + os.sep
+        now = time.time()
+        for bid, r in (data or {}).items():
+            if not (isinstance(r, dict) and isinstance(bid, str)
+                    and 0 < len(bid) <= 64 and r.get("id") == bid):
+                continue
+            state = r.get("state")
+            if state not in ("researching", "creating", "done", "failed"):
+                continue
+            rec = {"id": bid, "plan": None, "project": None, "materializing": False,
+                   "planFile": EPIC_BUILDER_PLAN_FILENAME}
+            for k in ("siteKey", "title", "repo", "sessionId", "worktreePath",
+                      "epicKey", "error"):
+                v = r.get(k)
+                rec[k] = v if isinstance(v, str) else None
+            rec["idea"] = str(r.get("idea") or "")[:EPIC_BUILDER_IDEA_MAX]
+            for k in ("startedAt", "updatedAt"):
+                v = r.get(k)
+                rec[k] = (float(v) if isinstance(v, (int, float))
+                          and not isinstance(v, bool) and 0 < v <= now + 60 else now)
+            rec["sessionKilled"] = r.get("sessionKilled") is True
+            rec["state"] = state
+            if state == "researching":
+                wt = rec["worktreePath"]
+                if not (wt and rec["sessionId"]
+                        and os.path.realpath(wt).startswith(root)):
+                    continue
+            elif state == "creating":
+                rec["state"] = "failed"
+                rec["error"] = EPIC_BUILDER_RESTART_LOST
+                log(f"epic builder {bid} failed: {EPIC_BUILDER_RESTART_LOST}")
+            out[bid] = rec
+        return out
+
+    def _save_epic_builders(self):
+        with self._epic_builders_lock:
+            data = {bid: {k: v for k, v in b.items() if k != "plan"}
+                    for bid, b in self.epic_builders.items()}
+        # The beat and the materialization worker both save; one writer at a time
+        # so they never share the tmp file.
+        with self._epic_builders_save_lock:
+            try:
+                os.makedirs(REGISTRY_DIR, exist_ok=True)
+                tmp = EPIC_BUILDERS_PATH + f".{os.getpid()}.tmp"
+                with open(tmp, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp, EPIC_BUILDERS_PATH)
+            except (OSError, TypeError, ValueError) as e:
+                log(f"epic builders save failed: {e}")
 
     def spawn_epic_builder(self, cmd):
         """Handle a {type:"spawnEpicBuilder"} command (XERK-724): spawn a real
@@ -33571,6 +33640,7 @@ class SessionManager:
                     "materializing": False, "plan": None, "project": None,
                     "startedAt": time.time(), "updatedAt": time.time(),
                 }
+            self._save_epic_builders()
             log(f"epic builder {bid} refused: {msg}")
 
         # Jira-only: the epic parenting + Blocks-link APIs are Jira's, exactly
@@ -33613,6 +33683,7 @@ class SessionManager:
                 "plan": None, "project": None,
                 "startedAt": time.time(), "updatedAt": time.time(),
             }
+        self._save_epic_builders()
         log(f"epic builder {bid} spawned session {sid} in {repo_name}")
 
     def _epic_builder_project(self, plan, site_key):
