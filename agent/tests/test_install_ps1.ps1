@@ -293,6 +293,28 @@ if ($fail -eq 0) { Write-Host 'SVCPROBE_OK' }
   $svcProbeOut = if (Test-Path $svcOut) { Get-Content -Raw $svcOut } else { '' }
   if ($svcProbeOut -match 'SVCPROBE_OK') { Ok "the override name reaches the WinSW <id> and the descriptor basename" }
   else { Fail "service-name templating: $svcProbeOut" }
+
+  # --- Case E: -Url + -EnrollCode (XERK-2531) set TURMA_URL and hand the code to the manager
+  # in TURMA_ENROLL_CODE (never its argv); a refused code fails the install. ------------
+  Note "case: -Url -EnrollCode sets the hub and redeems the code"
+  $probeE = Join-Path $Work 'probeE'
+  $pyE = Join-Path $Work 'fakepyE.sh'
+  Set-Content -LiteralPath $pyE -Value "#!/bin/sh`nprintf 'argv=%s\ncode=%s\nurl=%s\nenv=%s\n' `"`$*`" `"`$TURMA_ENROLL_CODE`" `"`$TURMA_URL`" `"`$TURMA_AGENT_ENV`" > `"$probeE`"`nexit `${FAKE_RC:-0}"
+  & chmod +x $pyE
+  $env:TURMA_PYTHON = $pyE; $env:FAKE_RC = '0'
+  $codeE = 'te-0123456789abcdef0123456789abcdef'
+  $cE = Invoke-Install "-NoInstallDeps -Url https://hub.example/ -EnrollCode $codeE" (Join-Path $Work 'installE.log')
+  if ($cE.ExitCode -eq 0) { Ok "install with a code exited 0" } else { Fail "exit $($cE.ExitCode): $(Get-Content (Join-Path $Work 'installE.log') -Raw)" }
+  if (Get-Content -LiteralPath $Cfg | Where-Object { $_ -eq 'TURMA_URL=https://hub.example' }) { Ok "TURMA_URL written (trailing / dropped)" } else { Fail "TURMA_URL not written" }
+  $gotE = Get-Content -LiteralPath $probeE -ErrorAction SilentlyContinue
+  if (($gotE -contains "code=$codeE") -and ($gotE -contains 'url=https://hub.example') -and ($gotE -contains "env=$Cfg")) { Ok "the manager got the code, URL and config path" } else { Fail "manager saw: $gotE" }
+  if ($gotE -contains "argv=$(Join-Path $Prefix 'hub-agent.py') --enroll") { Ok "the code is not on the manager's argv" } else { Fail "argv: $gotE" }
+  $env:FAKE_RC = '1'
+  $cE2 = Invoke-Install "-NoInstallDeps -EnrollCode $codeE" (Join-Path $Work 'installE2.log')
+  if ($cE2.ExitCode -eq 1) { Ok "a refused code fails the install" } else { Fail "refused code exit $($cE2.ExitCode)" }
+  $cE3 = Invoke-Install "-NoInstallDeps -Url 'https://h;x'" (Join-Path $Work 'installE3.log')
+  if ($cE3.ExitCode -eq 2) { Ok "an unsafe -Url is refused" } else { Fail "unsafe url exit $($cE3.ExitCode)" }
+  Remove-Item env:TURMA_PYTHON, env:FAKE_RC -ErrorAction SilentlyContinue
 }
 finally {
   if (Test-Path $Work) { Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue }

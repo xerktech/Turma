@@ -67,6 +67,8 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     "dailyBriefs",
     // XERK-2508: meetings Tenir posted (a 200 promises the row is kept).
     "meetingProposals",
+    // XERK-2531: one-time host enrollment codes (hashed; a used stamp must stick).
+    "enrollCodes",
   ]) {
     assert.ok(names.has(n), `store ${n} is registered`);
   }
@@ -75,8 +77,10 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     assert.ok(persistent[d.key] && persistent[d.key].file, `${d.name} has a persistent file`);
     // The briefs store's rows are the scheduler's "already fired" record (XERK-2395)
     // and a meeting's row is what Tenir's 200 promised (XERK-2508), so both are
-    // written at once; every other store keeps the 5s debounce.
-    const immediate = d.name === "dailyBriefs" || d.name === "meetingProposals";
+    // written at once, as is an enrollment code's used stamp (XERK-2531: a kill
+    // inside the debounce would let a single-use code redeem twice); every other
+    // store keeps the 5s debounce.
+    const immediate = d.name === "dailyBriefs" || d.name === "meetingProposals" || d.name === "enrollCodes";
     assert.equal(persistent[d.key].debounceMs, immediate ? 0 : 5000,
       `${d.name} keeps its debounce`);
   }

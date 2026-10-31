@@ -352,6 +352,29 @@ try {
   try { $p8b.Kill() } catch { }
   $null = $p8b.WaitForExit(3000)
   Remove-Item env:TURMA_FORCE_SERVICE_MODE -ErrorAction SilentlyContinue
+
+  # --- Case 9: `enroll -Code <c>` (XERK-2531) loads the config and hands the code to the
+  # manager in TURMA_ENROLL_CODE, never on its argv; exit 2 (a hub without codes) FAILS. -----
+  Note "case: enroll -Code passes the code via TURMA_ENROLL_CODE"
+  Set-BaseEnv
+  $cfg9 = Join-Path $Work 'agent9.env'
+  Set-Content -LiteralPath $cfg9 -Value "TURMA_URL=https://hub.example`nTURMA_TOKEN=`nDEVICE_NAME=newbox"
+  $probe9 = Join-Path $Work 'probe9'
+  $py9 = Join-Path $Work 'fakepy.sh'
+  Set-Content -LiteralPath $py9 -Value "#!/bin/sh`nprintf 'argv=%s\ncode=%s\nurl=%s\ndevice=%s\n' `"`$*`" `"`$TURMA_ENROLL_CODE`" `"`$TURMA_URL`" `"`$DEVICE_NAME`" > `"$probe9`"`nexit `${FAKE_RC:-1}"
+  & chmod +x $py9
+  $env:TURMA_AGENT_ENV = $cfg9; $env:TURMA_PYTHON = $py9; $env:FAKE_RC = '1'
+  $code9 = 'te-0123456789abcdef0123456789abcdef'
+  $p9 = Invoke-Ctl "enroll -Code $code9" (Join-Path $Work 'enroll9.log')
+  if ($p9.ExitCode -eq 1) { Ok "a failed code enroll exits 1" } else { Fail "enroll exit $($p9.ExitCode): $(Get-Content (Join-Path $Work 'enroll9.log') -Raw -ErrorAction SilentlyContinue)" }
+  $got9 = Get-Content -LiteralPath $probe9 -ErrorAction SilentlyContinue
+  if ($got9 -contains "argv=$Manager --enroll") { Ok "the code is not on the manager's argv" } else { Fail "manager argv: $got9" }
+  if ($got9 -contains "code=$code9") { Ok "TURMA_ENROLL_CODE carries the code" } else { Fail "no code in env: $got9" }
+  if (($got9 -contains 'url=https://hub.example') -and ($got9 -contains 'device=newbox')) { Ok "config + DEVICE_NAME loaded" } else { Fail "config not loaded: $got9" }
+  $env:FAKE_RC = '2'
+  $p9b = Invoke-Ctl "enroll $code9" (Join-Path $Work 'enroll9b.log')
+  if ($p9b.ExitCode -eq 1) { Ok "a hub without code enroll fails the code path (positional code)" } else { Fail "rc=$($p9b.ExitCode) on a too-old hub, want 1" }
+  Remove-Item env:TURMA_AGENT_ENV, env:TURMA_PYTHON, env:FAKE_RC -ErrorAction SilentlyContinue
 }
 finally {
   Reset-Fixture

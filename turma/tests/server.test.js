@@ -20088,6 +20088,161 @@ test("XERK-578: self-enroll self-closes under TURMA_AGENT_STRICT", () => {
   assert.equal(again.body.token, own.body.token);
 });
 
+// ---- XERK-2531: one-time enrollment codes -----------------------------------
+
+const forget2531 = (...hosts) => {
+  for (const h of hosts) delete agents[h];
+  const ids = hub.agentIdentities();
+  for (const [u, e] of Object.entries(ids)) if (hosts.includes(e.home) || hosts.includes(e.origin)) delete ids[u];
+  for (const k of Object.keys(hub.enrollCodes())) delete hub.enrollCodes()[k];
+  hub.enrollAttempts.clear();
+};
+
+test("XERK-2531: a code is single-use and trades for the host's identity token", async () => {
+  forget2531("enr-a");
+  const minted = await request("POST", "/api/enroll-codes", { headers: userHeaders, body: {} });
+  assert.equal(minted.status, 200, JSON.stringify(minted.body));
+  const code = minted.body.code;
+  assert.match(code, /^te-[0-9a-f]{32}$/);
+  // Stored only hashed: the plain code is nowhere in the record or the listing.
+  assert.ok(!JSON.stringify(hub.enrollCodes()).includes(code.slice(3)));
+  const list = await request("GET", "/api/enroll-codes", { headers: userHeaders });
+  assert.equal(list.status, 200);
+  assert.ok(!list.raw.includes(code.slice(3)));
+  assert.equal(list.body.codes[0].state, "live");
+  assert.match(list.body.codes[0].owner, /^local:/); // the minting principal is recorded
+  // Redeemed WITHOUT any credential (the route is exempt from the login gate).
+  const r = await request("POST", "/api/agent/enroll", { body: { code, device: "enr-a" } });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.host, "enr-a");
+  const uid = tokenUid(r.body.token);
+  assert.ok(uid);
+  assert.equal(hostOfUid(uid), "enr-a");
+  // The token beats as that host.
+  const beat = await request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${r.body.token}`, "content-type": "application/json" },
+    body: { device: "enr-a", sessions: [] },
+  });
+  assert.equal(beat.status, 200);
+  // Replay: refused, clearly, and naming who used it.
+  const replay = await request("POST", "/api/agent/enroll", { body: { code, device: "enr-b" } });
+  assert.equal(replay.status, 410);
+  assert.match(replay.body.error, /already used \(by enr-a\)/);
+  const after = await request("GET", "/api/enroll-codes", { headers: userHeaders });
+  assert.equal(after.body.codes[0].state, "used");
+  assert.equal(after.body.codes[0].usedBy, "enr-a");
+  forget2531("enr-a");
+});
+
+test("XERK-2531: minting and listing need the operator login", async () => {
+  forget2531();
+  assert.equal((await request("POST", "/api/enroll-codes", { body: {} })).status, 401);
+  assert.equal((await request("GET", "/api/enroll-codes")).status, 401);
+  // An agent token is not an operator.
+  assert.equal((await request("POST", "/api/enroll-codes", { headers: agentHeaders, body: {} })).status, 401);
+});
+
+test("XERK-2531: an expired or revoked code is refused and never consumed", () => {
+  forget2531("enr-x");
+  const now = Date.now();
+  const m = hub.mintEnrollCode("local:op", "", now);
+  assert.equal(m.status, 200);
+  const late = hub.consumeEnrollCode(m.body.code, "enr-x", now + hub.ENROLL_CODE_TTL_MS + 1);
+  assert.equal(late.status, 410);
+  assert.match(late.body.error, /expired/);
+  const m2 = hub.mintEnrollCode("local:op", "", now);
+  assert.equal(hub.revokeEnrollCode(m2.body.enrollCode.id, now).status, 200);
+  assert.equal(hub.revokeEnrollCode(m2.body.enrollCode.id, now).status, 409); // already revoked
+  const rev = hub.consumeEnrollCode(m2.body.code, "enr-x", now);
+  assert.equal(rev.status, 410);
+  assert.match(rev.body.error, /revoked/);
+  assert.equal(hub.consumeEnrollCode("te-" + "0".repeat(32), "enr-x", now).status, 401);
+  assert.equal(hub.consumeEnrollCode("nope", "enr-x", now).status, 400);
+  assert.equal(hub.revokeEnrollCode("0000000000000000", now).status, 404);
+  assert.ok(!hostOfUid(Object.keys(hub.agentIdentities()).find((u) => hub.agentIdentities()[u].home === "enr-x")));
+  forget2531("enr-x");
+});
+
+test("XERK-2531: a code bound to a device refuses another, without burning it", () => {
+  forget2531("enr-d", "enr-e");
+  const m = hub.mintEnrollCode("local:op", "enr-d");
+  assert.equal(m.status, 200);
+  assert.equal(m.body.enrollCode.device, "enr-d");
+  const wrong = hub.consumeEnrollCode(m.body.code, "enr-e");
+  assert.equal(wrong.status, 403);
+  assert.match(wrong.body.error, /for enr-d, not enr-e/);
+  // Not burned: the right name still redeems it.
+  const right = hub.consumeEnrollCode(m.body.code, "enr-d");
+  assert.equal(right.status, 200);
+  assert.equal(right.body.host, "enr-d");
+  forget2531("enr-d", "enr-e");
+});
+
+test("XERK-2531: a code never takes a name another host holds or an unusable one", async () => {
+  forget2531("enr-held");
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: "enr-held", sessions: [] } });
+  // Refused at mint for a named code...
+  assert.equal(hub.mintEnrollCode("local:op", "ENR-HELD").status, 409);
+  // ...and at redemption for an unbound one, case-folded, without burning it.
+  const m = hub.mintEnrollCode("local:op", "");
+  const taken = hub.consumeEnrollCode(m.body.code, "Enr-Held");
+  assert.equal(taken.status, 409);
+  assert.match(taken.body.error, /already registered/);
+  assert.equal(hub.consumeEnrollCode(m.body.code, "..").status, 400);
+  assert.equal(hub.consumeEnrollCode(m.body.code, "").status, 400);
+  // Removing the host releases the name; the same code now works.
+  delete agents["enr-held"];
+  assert.equal(hub.consumeEnrollCode(m.body.code, "enr-held").status, 200);
+  forget2531("enr-held");
+});
+
+test("XERK-2531: a fresh code for a name supersedes an identity that never beat", () => {
+  forget2531("enr-s");
+  const first = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-s");
+  const second = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-s");
+  assert.equal(second.status, 200);
+  assert.notEqual(tokenUid(first.body.token), tokenUid(second.body.token));
+  assert.equal(hostOfUid(tokenUid(first.body.token)), null); // never two machines on one id
+  forget2531("enr-s");
+});
+
+test("XERK-2531: redemption attempts are rate-limited per client", async () => {
+  forget2531();
+  const statuses = [];
+  for (let i = 0; i < 12; i++) {
+    const r = await request("POST", "/api/agent/enroll", { body: { code: "te-" + "1".repeat(32), device: "x" } });
+    statuses.push(r.status);
+  }
+  assert.deepEqual(statuses.slice(0, 10), Array(10).fill(401));
+  assert.equal(statuses[10], 429);
+  assert.match((await request("POST", "/api/agent/enroll", { body: {} })).body.error, /too many/);
+  // The window is per client key and resets.
+  assert.equal(hub.enrollRateLimited("other-client"), false);
+  forget2531();
+});
+
+test("XERK-2531: the live-code cap and the store whitelist", () => {
+  forget2531();
+  const now = Date.now();
+  for (let i = 0; i < 20; i++) assert.equal(hub.mintEnrollCode("local:op", "", now).status, 200);
+  const full = hub.mintEnrollCode("local:op", "", now);
+  assert.equal(full.status, 409);
+  assert.match(full.body.error, /still unused/);
+  // Coerce is a fixed point and drops junk.
+  const live = hub.enrollCodes();
+  assert.equal(JSON.stringify(hub.coerceEnrollCodes(JSON.parse(JSON.stringify(live)))), JSON.stringify(live));
+  assert.deepEqual(Object.keys(hub.coerceEnrollCodes({ bad: {}, "0123456789abcdef": { hash: "x" } })), []);
+  forget2531();
+});
+
+test("XERK-2531: code enrollment works under TURMA_AGENT_STRICT", () => {
+  const strict = freshServerModule((env) => { env.TURMA_AGENT_STRICT = "1"; });
+  const m = strict.mintEnrollCode("local:op", "");
+  const r = strict.consumeEnrollCode(m.body.code, "enr-strict");
+  assert.equal(r.status, 200);
+  assert.ok(strict.tokenUid(r.body.token));
+});
+
 // ---- XERK-2381: an agent keeps its identity across a host rename ----------
 
 // Mint `host`'s identity the way an agent does: enroll on its name token.

@@ -500,6 +500,8 @@ const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
 const TICKET_AGENTS_FILE = process.env.TICKET_AGENTS_FILE || "/data/ticket-agents.json";
 // Agent identities (XERK-2381): which agent id is bound to which host name.
 const AGENT_IDENTITIES_FILE = process.env.AGENT_IDENTITIES_FILE || "/data/agent-identities.json";
+// One-time host enrollment codes (XERK-2531): id -> {hash, owner, device?, ...}.
+const ENROLL_CODES_FILE = process.env.ENROLL_CODES_FILE || "/data/enroll-codes.json";
 // Name-token generations (XERK-2384): host -> {gen, at}, bumped by a revoke.
 const NAME_TOKEN_GENS_FILE = process.env.NAME_TOKEN_GENS_FILE || "/data/name-token-gens.json";
 // Tickets come and go while pins are only ever set by hand, so the map is
@@ -2873,6 +2875,35 @@ function coerceAgentIdentities(raw) {
     }
     if (e.revoked === true) rec.revoked = true; // XERK-2383 tombstone, set last
     out[uid] = rec;
+  }
+  return out;
+}
+// One-time enrollment codes (XERK-2531) — see consumeEnrollCode. Durable and
+// shared (an HA store) so a code minted on one replica is honoured on any, and
+// written with no debounce: a code answered "used" must stay used across a kill.
+let enrollCodes = coerceEnrollCodes(readJsonFile(ENROLL_CODES_FILE));
+const persistEnrollCodes = registerExternalStore({
+  name: "enrollCodes", file: ENROLL_CODES_FILE, debounceMs: 0,
+  coerce: coerceEnrollCodes, read: () => enrollCodes, install: (v) => { enrollCodes = v; },
+});
+// Whitelist, field by field, in the order the hub writes them (a coerce fixed
+// point, so the HA own-write echo dedups). Inline literals: runs at module init.
+function coerceEnrollCodes(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  const str = (v, max) => typeof v === "string" && v.length > 0 && v.length <= max;
+  const time = (v) => Number.isSafeInteger(v) && v > 0;
+  for (const [id, e] of Object.entries(raw)) {
+    if (!/^[0-9a-f]{16}$/.test(id) || !e || typeof e !== "object") continue;
+    if (typeof e.hash !== "string" || !/^[0-9a-f]{64}$/.test(e.hash)) continue;
+    if (!str(e.owner, 200) || !time(e.createdAt) || !time(e.expiresAt)) continue;
+    const rec = { hash: e.hash, owner: e.owner };
+    if (str(e.device, 200)) rec.device = e.device;
+    rec.createdAt = e.createdAt;
+    rec.expiresAt = e.expiresAt;
+    if (time(e.usedAt) && str(e.usedBy, 200)) { rec.usedAt = e.usedAt; rec.usedBy = e.usedBy; }
+    if (time(e.revokedAt)) rec.revokedAt = e.revokedAt;
+    out[id] = rec;
   }
   return out;
 }
@@ -13687,6 +13718,214 @@ function resolveEnrollToken(req, device) {
   return { status: 200, body: { host: device, token: uidAgentToken(issueAgentUid(device)), bound: false } };
 }
 
+// ---- One-time host enrollment codes (XERK-2531) ---------------------------
+// A new host cannot run `node turma/server.js --agent-token <host>` (that needs
+// a shell in the hub pod), and the GET /api/agent/token enroll above needs a
+// credential it does not have yet. So an operator mints a short-lived,
+// single-use code in the dashboard ("Add host"), and the host trades it ONCE for
+// its IDENTITY token (POST /api/agent/enroll). The code is the whole credential
+// of that call, so:
+//   - it carries 128 bits from crypto.randomBytes and is stored only as its
+//     SHA-256 (a leaked /data file or store dump hands out nothing);
+//   - it is consumed in the same synchronous turn that checks it (the leader is
+//     the single writer, XERK-919), so two racing redemptions cannot both win;
+//   - it expires (ENROLL_CODE_TTL_MS) and can be revoked from the dialog;
+//   - a refusal that is the CALLER's mistake (wrong/unusable/taken name) does
+//     not burn it, so the operator can retry with the right DEVICE_NAME.
+// It works under TURMA_AGENT_STRICT: it hands out a host's own identity token,
+// never the master. `owner` records who minted it, so the tenancy child
+// (XERK-2529) can bind the enrolled host to that user's tenant; not enforced yet.
+const ENROLL_CODE_PREFIX = "te-";
+const ENROLL_CODE_RE = /^te-[0-9a-f]{32}$/;
+const ENROLL_CODE_TTL_MS = positiveEnv("ENROLL_CODE_TTL_MS", 15 * 60 * 1000);
+// Settled (used/expired/revoked) records stay listable this long, then go.
+const ENROLL_CODE_KEEP_MS = 24 * 60 * 60 * 1000;
+const ENROLL_CODES_LIVE_MAX = 20; // unredeemed codes at once
+const ENROLL_CODES_MAX = 200; // records, settled included
+// Redemption attempts per client per window (defence in depth: 128 bits cannot
+// be guessed, but each attempt is an unauthenticated request).
+const ENROLL_ATTEMPTS_PER_WINDOW = 10;
+const ENROLL_ATTEMPT_WINDOW_MS = 60 * 1000;
+const ENROLL_ATTEMPT_KEYS_MAX = 1000;
+const enrollAttempts = new Map(); // client -> {start, n}
+
+function enrollCodeHash(code) {
+  return crypto.createHash("sha256").update(code).digest("hex");
+}
+function enrollCodeState(rec, now = Date.now()) {
+  if (rec.usedAt) return "used";
+  if (rec.revokedAt) return "revoked";
+  if (now >= rec.expiresAt) return "expired";
+  return "live";
+}
+// Drop settled records past their keep window; never a live one.
+function sweepEnrollCodes(now = Date.now()) {
+  let changed = false;
+  for (const [id, rec] of Object.entries(enrollCodes)) {
+    if (enrollCodeState(rec, now) === "live") continue;
+    const settledAt = rec.usedAt || rec.revokedAt || rec.expiresAt;
+    if (now - settledAt > ENROLL_CODE_KEEP_MS) { delete enrollCodes[id]; changed = true; }
+  }
+  return changed;
+}
+function enrollCodeWire(id, rec, now = Date.now()) {
+  const out = { id, state: enrollCodeState(rec, now), owner: rec.owner,
+    createdAt: rec.createdAt, expiresAt: rec.expiresAt };
+  if (rec.device) out.device = rec.device;
+  if (rec.usedAt) { out.usedAt = rec.usedAt; out.usedBy = rec.usedBy; }
+  if (rec.revokedAt) out.revokedAt = rec.revokedAt;
+  return out;
+}
+function listEnrollCodes(now = Date.now()) {
+  if (sweepEnrollCodes(now)) persistEnrollCodes();
+  return Object.entries(enrollCodes)
+    .sort((a, b) => b[1].createdAt - a[1].createdAt)
+    .map(([id, rec]) => enrollCodeWire(id, rec, now));
+}
+
+// Why `device` may not be enrolled under a code, or null. A code never takes a
+// name another agent holds — that would hand the code holder that host's queued
+// commands. Case-folded like a rename (uidHostRefusal): a live case twin is the
+// same machine to an operator. Remove host on the dashboard releases a name.
+function enrollNameRefusal(device) {
+  if (!TURMA_AGENT_TOKEN) return { status: 409, error: "this hub derives no agent tokens (no TURMA_AGENT_TOKEN set)" };
+  if (typeof device !== "string" || !device || device.length > 200 ||
+      !isPlainHostKey(device) || !hostAgentToken(device)) {
+    return { status: 400, error: `${typeof device === "string" && device ? device : "(empty)"} is not a usable host name` };
+  }
+  const want = lowerName(device);
+  for (const k of Object.keys(agents)) {
+    if (lowerName(k) === want) {
+      return { status: 409, error: `${k} is already registered — remove it from the dashboard first to reinstall it` };
+    }
+  }
+  for (const e of Object.values(agentIdentities)) {
+    if (e && !e.revoked && !e.released && e.used && lowerName(e.home) === want) {
+      return { status: 409, error: `${e.home} is registered to another agent — remove it from the dashboard first` };
+    }
+  }
+  return null;
+}
+
+// Who is minting (the code's `owner`): the OIDC subject when the browser signed
+// in through the IdP, else the local login. Never trusted for authorization yet.
+async function enrollCodeOwner(req) {
+  if (!TURMA_PASSWORD) return "open";
+  const sid = OIDC_ENABLED ? cookies(req)[OIDC_SID_COOKIE] : "";
+  if (sid && /^[A-Za-z0-9_-]{1,128}$/.test(sid)) {
+    try {
+      const rec = await liveStore.get(OIDC_SESSION_PREFIX + sid);
+      if (rec && typeof rec.sub === "string" && rec.sub) return `oidc:${rec.sub.slice(0, 190)}`;
+    } catch { /* store blip: fall back to the local principal */ }
+  }
+  return `local:${(TURMA_USER || "operator").slice(0, 190)}`;
+}
+
+// Mint a code. Returns {status, body}; the plain code is in the body ONCE and
+// never stored or served again.
+function mintEnrollCode(owner, device, now = Date.now()) {
+  if (!TURMA_AGENT_TOKEN) return { status: 409, body: { error: "this hub derives no agent tokens (no TURMA_AGENT_TOKEN set)" } };
+  if (device !== undefined && device !== null && device !== "") {
+    const refusal = enrollNameRefusal(device);
+    if (refusal) return { status: refusal.status, body: { error: refusal.error } };
+  } else {
+    device = "";
+  }
+  if (sweepEnrollCodes(now)) persistEnrollCodes();
+  const live = Object.values(enrollCodes).filter((r) => enrollCodeState(r, now) === "live").length;
+  if (live >= ENROLL_CODES_LIVE_MAX) {
+    return { status: 409, body: { error: `${live} enrollment codes are still unused — revoke one or let it expire first` } };
+  }
+  if (Object.keys(enrollCodes).length >= ENROLL_CODES_MAX) {
+    // Oldest settled first; a live one is never dropped (the cap above holds).
+    const settled = Object.entries(enrollCodes)
+      .filter(([, r]) => enrollCodeState(r, now) !== "live")
+      .sort((a, b) => a[1].createdAt - b[1].createdAt);
+    for (const [id] of settled.slice(0, Object.keys(enrollCodes).length - ENROLL_CODES_MAX + 1)) delete enrollCodes[id];
+  }
+  const code = ENROLL_CODE_PREFIX + crypto.randomBytes(16).toString("hex");
+  const id = crypto.randomBytes(8).toString("hex");
+  const rec = { hash: enrollCodeHash(code), owner: String(owner).slice(0, 200) || "unknown" };
+  if (device) rec.device = device;
+  rec.createdAt = now;
+  rec.expiresAt = now + ENROLL_CODE_TTL_MS;
+  enrollCodes[id] = rec;
+  persistEnrollCodes();
+  return { status: 200, body: { ok: true, code, enrollCode: enrollCodeWire(id, rec, now) } };
+}
+
+function revokeEnrollCode(id, now = Date.now()) {
+  const rec = typeof id === "string" && Object.prototype.hasOwnProperty.call(enrollCodes, id) ? enrollCodes[id] : null;
+  if (!rec) return { status: 404, body: { error: "no such enrollment code" } };
+  const state = enrollCodeState(rec, now);
+  if (state !== "live") return { status: 409, body: { error: `this enrollment code is already ${state}` } };
+  rec.revokedAt = now;
+  persistEnrollCodes();
+  return { status: 200, body: { ok: true, enrollCode: enrollCodeWire(id, rec, now) } };
+}
+
+// The decision behind POST /api/agent/enroll {code, device}: the code's single
+// use, traded for `device`'s IDENTITY token. Synchronous from lookup to the
+// used-stamp, so it is atomic on the serving replica.
+function consumeEnrollCode(code, device, now = Date.now()) {
+  if (typeof code !== "string" || !ENROLL_CODE_RE.test(code.trim().toLowerCase())) {
+    return { status: 400, body: { error: "malformed enrollment code (expected te-<32 hex>)" } };
+  }
+  const hash = enrollCodeHash(code.trim().toLowerCase());
+  let id = null;
+  for (const [k, rec] of Object.entries(enrollCodes)) {
+    if (safeEqual(rec.hash, hash)) { id = k; break; }
+  }
+  if (!id) return { status: 401, body: { error: "unknown enrollment code — mint a new one from the dashboard's Add host dialog" } };
+  const rec = enrollCodes[id];
+  const state = enrollCodeState(rec, now);
+  if (state === "used") return { status: 410, body: { error: `this enrollment code was already used (by ${rec.usedBy}) — mint a new one` } };
+  if (state === "revoked") return { status: 410, body: { error: "this enrollment code was revoked — mint a new one" } };
+  if (state === "expired") return { status: 410, body: { error: "this enrollment code expired — mint a new one" } };
+  if (rec.device && device !== rec.device) {
+    return { status: 403, body: { error: `this enrollment code is for ${rec.device}, not ${device || "(no name)"} — set DEVICE_NAME=${rec.device} or mint a code for this name` } };
+  }
+  const refusal = enrollNameRefusal(device);
+  if (refusal) return { status: refusal.status, body: { error: refusal.error } };
+  // An identity minted for this name that never beat (an earlier code whose host
+  // never came up) is superseded: the operator minted a new code for the name,
+  // and handing back the SAME id would put two machines on one token.
+  let dropped = false;
+  for (const [uid, e] of Object.entries(agentIdentities)) {
+    if (e && !e.used && !e.revoked && (e.home === device || e.origin === device)) {
+      delete agentIdentities[uid]; dropped = true;
+    }
+  }
+  if (dropped) persistAgentIdentities();
+  rec.usedAt = now;
+  rec.usedBy = device;
+  persistEnrollCodes();
+  const token = uidAgentToken(issueAgentUid(device));
+  console.log(`agent enrolled by code: ${logName(device)} (code ${id}, minted by ${logName(rec.owner)})`);
+  return { status: 200, body: { host: device, token, bound: true } };
+}
+
+// The client a redemption attempt is counted against: the hop nginx saw (the
+// RIGHTMOST X-Forwarded-For entry — anything left of it is client-supplied),
+// else the socket peer.
+function enrollClientKey(req) {
+  const xff = String(req.headers["x-forwarded-for"] || "").split(",").map((v) => v.trim()).filter(Boolean);
+  return (xff.length ? xff[xff.length - 1] : (req.socket && req.socket.remoteAddress) || "?").slice(0, 100);
+}
+function enrollRateLimited(key, now = Date.now()) {
+  let e = enrollAttempts.get(key);
+  if (!e || now - e.start >= ENROLL_ATTEMPT_WINDOW_MS) {
+    if (!e && enrollAttempts.size >= ENROLL_ATTEMPT_KEYS_MAX) {
+      for (const [k, v] of enrollAttempts) if (now - v.start >= ENROLL_ATTEMPT_WINDOW_MS) enrollAttempts.delete(k);
+      if (enrollAttempts.size >= ENROLL_ATTEMPT_KEYS_MAX) return true; // a flood: refuse new keys
+    }
+    e = { start: now, n: 0 };
+    enrollAttempts.set(key, e);
+  }
+  e.n += 1;
+  return e.n > ENROLL_ATTEMPTS_PER_WINDOW;
+}
+
 // Trigger auth (POST /api/trigger). A caller passes either the dedicated
 // TURMA_TRIGGER_TOKEN as a Bearer token (the programmatic path — CI/webhooks)
 // or the ordinary user login (Basic/cookie), so a logged-in operator or curl
@@ -19760,6 +19999,11 @@ const server = http.createServer(async (req, res) => {
     const isAgentTokenEndpoint =
       req.method === "GET" && url.pathname === "/api/agent/token";
 
+    // One-time code enrollment (XERK-2531): a NEW host has no credential yet, so
+    // the code in its body is the whole authentication (consumeEnrollCode).
+    const isAgentEnrollEndpoint =
+      req.method === "POST" && url.pathname === "/api/agent/enroll";
+
     // The migration transcript relay is agent-pushed/pulled (bearer token) like
     // the heartbeat/archive — a source agent POSTs the bundle, the target agent
     // GETs it (XERK-101). The user-triggered /migrate endpoint that starts it
@@ -19816,6 +20060,8 @@ const server = http.createServer(async (req, res) => {
         return json(res, 503, { error: "meetings ingest is not configured on this hub (TURMA_MEETINGS_TOKEN)" });
       }
       if (!meetingsAuthorized(req)) return json(res, 401, { error: "unauthorized" });
+    } else if (isAgentEnrollEndpoint) {
+      // Authenticated by the one-time code in the body (consumeEnrollCode).
     } else if (isAgentTokenEndpoint) {
       // GET /api/agent/token (XERK-578, self-enroll) authenticates itself in the
       // handler: it resolves which host the AGENT credential proves and hands
@@ -20184,6 +20430,26 @@ const server = http.createServer(async (req, res) => {
     // an Authorization header, so the token rides the query string instead).
     if (req.method === "GET" && url.pathname === "/api/ws-token") {
       return json(res, 200, { token: issueWsToken(), expiresInSec: WS_TOKEN_TTL_MS / 1000 });
+    }
+
+    // Host enrollment codes (XERK-2531): the dashboard's Add host dialog mints,
+    // lists and revokes them; the host redeems one at POST /api/agent/enroll.
+    if (url.pathname === "/api/enroll-codes" && req.method === "GET") {
+      return json(res, 200, { codes: listEnrollCodes(), ttlMs: ENROLL_CODE_TTL_MS });
+    }
+    if (url.pathname === "/api/enroll-codes" && req.method === "POST") {
+      let body;
+      try { body = JSON.parse((await readBody(req, 4096)) || "{}"); } catch { body = null; }
+      if (!body || typeof body !== "object" || Array.isArray(body) ||
+          (body.device != null && typeof body.device !== "string")) {
+        return json(res, 400, { error: "body must be JSON {device?: string}" });
+      }
+      const r = mintEnrollCode(await enrollCodeOwner(req), (body.device || "").trim());
+      return json(res, r.status, r.body);
+    }
+    if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "enroll-codes" && parts.length === 3) {
+      const r = revokeEnrollCode(parts[2]);
+      return json(res, r.status, r.body);
     }
 
     // Mobile push device registry. The Android client registers its FCM token
@@ -21861,6 +22127,22 @@ const server = http.createServer(async (req, res) => {
     // endpoint self-closes with the master it exists to roll away from.
     if (isAgentTokenEndpoint) {
       const r = resolveEnrollToken(req, url.searchParams.get("device") || "");
+      return json(res, r.status, r.body);
+    }
+
+    // POST /api/agent/enroll {code, device} (XERK-2531): a new host trades a
+    // one-time code from the dashboard's Add host dialog for its IDENTITY token.
+    // Rate-limited per client BEFORE the (small, capped) body is read.
+    if (isAgentEnrollEndpoint) {
+      if (enrollRateLimited(enrollClientKey(req))) {
+        return json(res, 429, { error: "too many enrollment attempts — wait a minute and retry" });
+      }
+      let body;
+      try { body = JSON.parse((await readBody(req, 4096)) || "{}"); } catch { body = null; }
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return json(res, 400, { error: "body must be JSON {code, device}" });
+      }
+      const r = consumeEnrollCode(body.code, typeof body.device === "string" ? body.device.trim() : "");
       return json(res, r.status, r.body);
     }
 
@@ -24619,6 +24901,15 @@ if (process.env.TURMA_TEST) {
     agentHostRefusal,
     agentPresentedRefusal,
     resolveEnrollToken,
+    consumeEnrollCode,
+    mintEnrollCode,
+    revokeEnrollCode,
+    listEnrollCodes,
+    enrollRateLimited,
+    enrollAttempts,
+    ENROLL_CODE_TTL_MS,
+    enrollCodes: () => enrollCodes,
+    coerceEnrollCodes,
     serializeAgent,
     tokenHost,
     // The reverse-tunnel maps, exported so their null prototype can be asserted

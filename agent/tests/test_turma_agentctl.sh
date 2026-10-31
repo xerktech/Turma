@@ -210,6 +210,46 @@ HOME="$HOME_DIR" XDG_RUNTIME_DIR="$RUN" TURMA_MANAGER_STOP_WAIT=0 \
   "$CTL" stop >/dev/null 2>&1 || true
 [ -n "$NEWPID" ] && kill -9 "$NEWPID" 2>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# Case: `enroll --code <c>` (XERK-2531) hands the code to hub-agent.py in the
+# ENVIRONMENT (never its argv), with the config's values and DEVICE_NAME loaded.
+# The manager stub exits 1 so no restart runs; exit 2 (a hub with no code
+# endpoint) is a FAILURE for a code enroll, not the soft skip the token path has.
+# ---------------------------------------------------------------------------
+echo "case: enroll --code passes the code via TURMA_ENROLL_CODE"
+new_home enrollcode
+CFGF="$HOME_DIR/agent.env"
+printf 'TURMA_URL=https://hub.example\nTURMA_TOKEN=\nDEVICE_NAME=newbox\n' > "$CFGF"
+cat > "$PREFIX/hub-agent.py" <<'STUB'
+import os, sys
+with open(os.environ["ENROLL_PROBE"], "w") as f:
+    f.write("argv=%s\ncode=%s\nurl=%s\ndevice=%s\nenv=%s\n" % (
+        " ".join(sys.argv[1:]), os.environ.get("TURMA_ENROLL_CODE", ""),
+        os.environ.get("TURMA_URL", ""), os.environ.get("DEVICE_NAME", ""),
+        os.environ.get("TURMA_AGENT_ENV", "")))
+sys.exit(int(os.environ.get("ENROLL_RC", "1")))
+STUB
+CODE="te-0123456789abcdef0123456789abcdef"
+HOME="$HOME_DIR" TURMA_AGENT_ENV="$CFGF" ENROLL_PROBE="$WORK/probe" ENROLL_RC=1 \
+  "$CTL" enroll --code "$CODE" >/dev/null 2>&1
+rc=$?
+[ "$rc" = 1 ] && ok "a failed code enroll exits nonzero" || fail "code enroll rc=$rc, want 1"
+grep -qx "argv=--enroll" "$WORK/probe" && ok "the code is not on the manager's argv" \
+  || fail "manager argv: $(grep argv "$WORK/probe")"
+grep -qx "code=$CODE" "$WORK/probe" && ok "TURMA_ENROLL_CODE carries the code" || fail "no code in env"
+grep -qx "url=https://hub.example" "$WORK/probe" && grep -qx "device=newbox" "$WORK/probe" \
+  && grep -qx "env=$CFGF" "$WORK/probe" && ok "config + DEVICE_NAME loaded" || fail "config not loaded: $(cat "$WORK/probe")"
+HOME="$HOME_DIR" TURMA_AGENT_ENV="$CFGF" ENROLL_PROBE="$WORK/probe" ENROLL_RC=2 \
+  "$CTL" enroll --code="$CODE" >/dev/null 2>&1
+rc=$?
+[ "$rc" = 1 ] && ok "a hub without code enroll fails the code path" || fail "rc=$rc on a too-old hub, want 1"
+HOME="$HOME_DIR" TURMA_AGENT_ENV="$CFGF" ENROLL_PROBE="$WORK/probe" ENROLL_RC=1 \
+  "$CTL" enroll >/dev/null 2>&1
+grep -qx "code=" "$WORK/probe" && ok "plain enroll sends no code" || fail "plain enroll leaked a code"
+"$CTL" enroll --bogus >/dev/null 2>&1
+[ $? = 2 ] && ok "an unknown enroll flag is a usage error" || fail "unknown flag not refused"
+rm -f "$PREFIX/hub-agent.py"
+
 if [ "$FAILED" -eq 0 ]; then
   echo "all turma-agentctl tests passed"
 else

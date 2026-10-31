@@ -46632,6 +46632,82 @@ class TestSetToken(unittest.TestCase):
             self.assertIn(f"TURMA_TOKEN={tok}\n", open(p).read())
 
 
+    # XERK-2531: a NEW host redeems a one-time code — no TURMA_TOKEN needed.
+    def _code_resp(self, body):
+        resp = io.BytesIO(json.dumps(body).encode())
+        resp.__enter__ = lambda s=resp: s
+        resp.__exit__ = lambda *a: False
+        return resp
+
+    def test_enroll_with_code_posts_the_code_and_writes_the_identity_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            with open(p, "w") as f:
+                f.write("TURMA_URL=https://h\nTURMA_TOKEN=\n")
+            tok = self._derived("uid:" + "ef" * 16)
+            code = "te-" + "a" * 32
+            seen = {}
+
+            def urlopen(req, timeout=None):
+                seen["url"] = req.full_url
+                seen["method"] = req.get_method()
+                seen["body"] = json.loads(req.data.decode())
+                seen["auth"] = req.get_header("Authorization")
+                return self._code_resp({"host": "newbox", "token": tok})
+            with mock.patch.dict(os.environ, {"TURMA_AGENT_ENV": p}), \
+                 mock.patch.object(ha, "TURMA_URL", "https://h"), \
+                 mock.patch.object(ha, "TURMA_TOKEN", ""), \
+                 mock.patch.object(ha, "device_name", return_value="newbox"), \
+                 mock.patch.object(ha.urllib.request, "urlopen", side_effect=urlopen):
+                rc = ha.enroll_with_code(code.upper())  # case-folded
+            self.assertEqual(rc, 0)
+            self.assertEqual(seen["url"], "https://h/api/agent/enroll")
+            self.assertEqual(seen["method"], "POST")
+            self.assertEqual(seen["body"], {"code": code, "device": "newbox"})
+            self.assertIsNone(seen["auth"])  # no credential needed or sent
+            self.assertIn(f"TURMA_TOKEN={tok}\n", open(p).read())
+
+    def test_enroll_with_code_refuses_a_non_identity_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            open(p, "w").write("TURMA_TOKEN=\n")
+            with mock.patch.dict(os.environ, {"TURMA_AGENT_ENV": p}), \
+                 mock.patch.object(ha, "TURMA_URL", "https://h"), \
+                 mock.patch.object(ha, "device_name", return_value="newbox"), \
+                 mock.patch.object(ha, "rewrite_env_var") as rw, \
+                 mock.patch.object(ha.urllib.request, "urlopen", return_value=self._code_resp(
+                     {"host": "other", "token": self._derived("other")})):
+                rc = ha.enroll_with_code("te-" + "b" * 32)
+            self.assertEqual(rc, 1)
+            rw.assert_not_called()
+
+    def test_enroll_with_code_reports_the_hubs_refusal_and_rejects_junk(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            open(p, "w").write("TURMA_TOKEN=\n")
+            err = ha.urllib.error.HTTPError(
+                "u", 410, "Gone", {},
+                io.BytesIO(b'{"error":"this enrollment code was already used"}'))
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, {"TURMA_AGENT_ENV": p}), \
+                 mock.patch.object(ha, "TURMA_URL", "https://h"), \
+                 mock.patch.object(ha, "device_name", return_value="newbox"), \
+                 mock.patch.object(ha.urllib.request, "urlopen", side_effect=err) as uo, \
+                 mock.patch.object(ha.sys, "stderr", stderr):
+                self.assertEqual(ha.enroll_with_code("te-" + "c" * 32), 1)
+                self.assertIn("already used", stderr.getvalue())
+                # A malformed code never reaches the hub (and is never echoed).
+                uo.reset_mock()
+                self.assertEqual(ha.enroll_with_code("not-a-code"), 1)
+                uo.assert_not_called()
+            self.assertNotIn("TURMA_TOKEN=x", open(p).read())
+
+    def test_the_cli_entry_takes_the_code_from_the_environment(self):
+        src = open(os.path.join(os.path.dirname(ha.__file__), "hub-agent.py")).read()
+        self.assertIn('os.environ.get("TURMA_ENROLL_CODE"', src)
+        self.assertNotIn('"--code"', src)  # never on the manager's argv
+
+
 class TestWindowsPortability(unittest.TestCase):
     """XERK-670 — hub-agent.py runs unforked on native Windows. These pin the
     OS-dispatched seams (path defaults, the chmod-600 -> NTFS-ACL, the XDG ->

@@ -184,6 +184,11 @@ this file → restart → curl twice to verify). Any one of these does it:
   adopt it (running sessions are re-adopted). The `⚠ shared token` chip clears
   when it beats back bound — that IS the verification (a bound host shows no
   chip).
+- **A brand-new host** — dashboard → **+ Add host** mints a one-time code (15 min,
+  single use) and shows the one command to run; it installs, sets `TURMA_URL` and
+  enrolls in one go:
+  `curl -fsSL …/bootstrap.sh | bash -s -- --url <hub> --enroll-code <code>`.
+  An already-installed host takes `turma-agentctl enroll --code <code>`.
 - **On the host** — `turma-agentctl enroll`: fetches this host's derived token
   from the hub (authenticated with the current token), persists it here, and
   restarts. Idempotent; refuses to write a token for the wrong `DEVICE_NAME`.

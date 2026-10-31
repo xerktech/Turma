@@ -40,6 +40,11 @@ param(
   # The password comes from $env:TURMA_SERVICE_PASSWORD (unattended) or an interactive
   # prompt -- never a plaintext CLI param -- and is stored by the SCM, LSA-encrypted.
   [string]$ServiceAccount = '',
+  # One-command onboarding (XERK-2531): point the config at the hub and trade the
+  # dashboard's one-time Add-host code for this host's own agent token before the service
+  # first starts. The code is single-use and never stored.
+  [string]$Url = '',
+  [string]$EnrollCode = '',
   [switch]$Help
 )
 
@@ -47,7 +52,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'   # best-effort throughout, like the bash `|| true`
 
 if ($Help) {
-  [Console]::Out.WriteLine("usage: install.ps1 [-Prefix DIR] [-NoInstallDeps] [-Verify] [-Uninstall]")
+  [Console]::Out.WriteLine("usage: install.ps1 [-Prefix DIR] [-NoInstallDeps] [-Url HUB -EnrollCode CODE] [-Verify] [-Uninstall]")
   exit 0
 }
 
@@ -506,6 +511,53 @@ function Install-Config {
 }
 
 # =====================================================================================
+# Enrollment (XERK-2531) -- set TURMA_URL and redeem a one-time code, before the service.
+# =====================================================================================
+# The Windows twin of install.sh's configure_enrollment. The URL is written into a file the
+# bash hosts SOURCE, so only a plain http(s) URL is accepted. The code reaches the shared
+# manager in TURMA_ENROLL_CODE (never its argv); hub-agent.py --enroll writes TURMA_TOKEN
+# with the owner-only ACL. A refused code fails the install (single-use: mint a new one).
+function Set-EnrollmentConfig([string]$HubUrl, [string]$Code) {
+  if ($HubUrl) {
+    if ($HubUrl -notmatch '^https?://[^\s"''`$\;&|<>()]+$') {
+      [Console]::Error.WriteLine("[install] ERROR: -Url must be a plain http(s) URL"); exit 2
+    }
+    $u = $HubUrl.TrimEnd('/')
+    $lines = @([System.IO.File]::ReadAllLines($Cfg))
+    $done = $false
+    $out = foreach ($l in $lines) {
+      if ($l -match '^\s*(export\s+)?TURMA_URL=') { if (-not $done) { "TURMA_URL=$u"; $done = $true } }
+      else { $l }
+    }
+    if (-not $done) { $out = @($out) + "TURMA_URL=$u" }
+    Set-Content -LiteralPath $Cfg -Value $out
+    Restrict-FileToOwner $Cfg
+    Info "TURMA_URL set to $u in $Cfg"
+  }
+  if (-not $Code) { return }
+  Info "enrolling this host with the one-time code"
+  # The manager directly, NOT `turma-agentctl enroll`: the ctl restarts the agent, which
+  # before the service is registered would start a pidfile launcher beside the service.
+  foreach ($l in [System.IO.File]::ReadAllLines($Cfg)) {
+    if ($l -match '^\s*(export\s+)?(TURMA_URL|DEVICE_NAME)=(.*)$' -and $Matches[3]) {
+      Set-Item -Path "env:$($Matches[2])" -Value $Matches[3].Trim('"', "'")
+    }
+  }
+  if (-not $env:DEVICE_NAME) { $env:DEVICE_NAME = Coalesce $env:COMPUTERNAME ([System.Net.Dns]::GetHostName()) }
+  $env:TURMA_AGENT_ENV = $Cfg
+  $env:TURMA_ENROLL_CODE = $Code
+  try {
+    & (Coalesce $env:TURMA_PYTHON 'python') (Join-Path $Prefix 'hub-agent.py') --enroll
+    $rc = $LASTEXITCODE
+  } finally { Remove-Item env:TURMA_ENROLL_CODE -ErrorAction SilentlyContinue }
+  if ($rc -ne 0) {
+    [Console]::Error.WriteLine("[install] ERROR: enrollment failed (see above). Codes are single-use and expire --")
+    [Console]::Error.WriteLine("[install]        mint a new one in the dashboard's Add host dialog and re-run.")
+    exit 1
+  }
+}
+
+# =====================================================================================
 # Service -- render the WinSW descriptor and register + try-restart it (Windows only).
 # =====================================================================================
 # Render turma-agent.xml into bin\, substituting the installer placeholders: %BASE% -> the
@@ -750,6 +802,7 @@ if ($NoInstallDeps) {
 Install-Files
 if (-not $NoInstallDeps) { Ensure-PtyLayer }
 Install-Config
+Set-EnrollmentConfig $Url $EnrollCode
 # Resolve the run-as account at SCRIPT scope (may prompt on Windows) and hand it in, so the
 # service comes up as the user rather than LocalSystem (XERK-678). Off Windows this is '' and
 # Install-Service no-ops the service wiring anyway.
@@ -760,9 +813,12 @@ Info "preflight:"
 try { & (Join-Path $Bin 'turma-agent.ps1') -Preflight } catch { Warn "preflight could not run: $_" }
 [Console]::Out.WriteLine("")
 Info "Done. Next steps:"
-Info "  1) Edit $Cfg -- set TURMA_URL and TURMA_TOKEN (the hub's shared token to start; then"
-Info "     roll onto this host's own token from the dashboard, with 'turma-agentctl enroll',"
-Info "     or by setting TURMA_AGENT_SELF_ENROLL=1)."
+if ($EnrollCode) {
+  Info "  1) Enrolled: $Cfg holds this host's own agent token."
+} else {
+  Info "  1) Enroll: dashboard -> Add host gives a one-time code; run"
+  Info "     'turma-agentctl enroll -Code <code>' (after setting TURMA_URL in $Cfg)."
+}
 Info "  2) Log in to Claude on this host if you haven't:  claude /login"
 Info "  3) (optional) gh auth login   -- for private git and 'gh pr create'."
 if ($IsWindows) {

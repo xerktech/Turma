@@ -49497,6 +49497,70 @@ def main():
     SessionManager().run_forever()
 
 
+# A one-time enrollment code from the dashboard's Add host dialog (XERK-2531).
+_ENROLL_CODE_RE = re.compile(r"^te-[0-9a-f]{32}$")
+
+
+def enroll_with_code(code):
+    """Enroll a NEW host with a one-time code (XERK-2531): POST {code, device}
+    to {TURMA_URL}/api/agent/enroll, confirm the returned token is an identity
+    token (never another host's), and write it to the sourced env file as
+    TURMA_TOKEN — so a fresh host needs no token, no hub shell and no hand-edited
+    dotenv, only the code an operator minted. The code is single-use, so it is
+    sent once; a refusal prints the hub's own words.
+
+    Same exit codes as enroll_self: 0 success, 2 a hub predating the endpoint
+    (404), 1 anything else. NEVER prints the token or the code."""
+    code = (code or "").strip().lower()
+    if not _ENROLL_CODE_RE.match(code):
+        print("enroll: that is not an enrollment code (expected te-<32 hex>, "
+              "from the dashboard's Add host dialog)", file=sys.stderr)
+        return 1
+    if not TURMA_URL:
+        print("enroll: TURMA_URL is not set", file=sys.stderr)
+        return 1
+    path = agent_env_path()
+    if not path:
+        print("enroll: no env file to update (set TURMA_AGENT_ENV, or run this "
+              "against an installed config)", file=sys.stderr)
+        return 1
+    device = device_name()
+    body = json.dumps({"code": code, "device": device}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{TURMA_URL}/api/agent/enroll", data=body, method="POST",
+        headers={"User-Agent": "hub-agent/1.0",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=HEARTBEAT_TIMEOUT_SEC) as resp:
+            data = json.loads(resp.read(65536).decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        print(f"enroll: hub refused ({e.code}): {_http_error_detail(e)}",
+              file=sys.stderr)
+        return 2 if e.code == 404 else 1
+    except Exception as e:
+        print(f"enroll: could not reach the hub at {TURMA_URL}: {e}",
+              file=sys.stderr)
+        return 1
+    token = (data or {}).get("token")
+    if not isinstance(token, str) or not token:
+        print("enroll: hub returned no token", file=sys.stderr)
+        return 1
+    # A code only ever trades for an IDENTITY token; anything else (a name token,
+    # least of all another host's) is not written.
+    if not token_is_identity(token_device_name(token)):
+        print("enroll: hub returned a token that is not an agent identity token; "
+              "not writing it", file=sys.stderr)
+        return 1
+    try:
+        rewrite_env_var(path, "TURMA_TOKEN", token)
+    except OSError as e:
+        print(f"enroll: could not update {path}: {e}", file=sys.stderr)
+        return 1
+    print(f"enroll: enrolled as {device}; wrote its token to {path} — restart "
+          "to authenticate on it")
+    return 0
+
+
 if __name__ == "__main__":
     # The native launcher calls this to resolve the host name once and export it.
     # The "DEVICE_NAME=" prefix lets the caller sed it out cleanly, ignoring the
@@ -49507,8 +49571,11 @@ if __name__ == "__main__":
     if "--enroll" in sys.argv:
         # XERK-578 design B: fetch + persist this host's derived token, then let
         # the caller (turma-agentctl enroll) restart. Exit codes: 0 success/no-op,
-        # 2 hub too old (soft skip on boot), 1 failure.
-        sys.exit(enroll_self())
+        # 2 hub too old (soft skip on boot), 1 failure. With TURMA_ENROLL_CODE
+        # set (XERK-2531) it redeems that one-time code instead — passed in the
+        # environment, never argv, so it is not in this process's command line.
+        _code = os.environ.get("TURMA_ENROLL_CODE", "").strip()
+        sys.exit(enroll_with_code(_code) if _code else enroll_self())
     try:
         main()
     except KeyboardInterrupt:
