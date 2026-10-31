@@ -59,6 +59,12 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   AND the LAST X-Forwarded-For hop (the ingress's view) AND the socket. Fairness only, never auth.
   - **All three, never CF-Connecting-IP alone**: the LAN reaches the ingress without Cloudflare, so
     that header is forgeable there; alone, a LAN caller could back a chosen victim's key off.
+  - **`TURMA_TRUSTED_PROXIES` (XERK-2579)** collapses that to CF-Connecting-IP alone ONLY when the
+    socket AND the last XFF hop are both inside it — else 2 cloudflared x 2 ingress pods = 4 keys.
+    - List only the ingress + cloudflared pods' CIDRs: anything inside can forge all three headers.
+    - Correct only while the ingress APPENDS its peer to XFF (no `use-forwarded-headers`).
+    - A malformed entry exits the hub at boot (2) rather than silently keying three-part.
+    - Tests: `tenancy-nopassword.test.js` "XERK-2579: behind trusted proxies…".
   - `loginFailures` keys are a sha256 of client + username — the username is unbounded (1 MiB body),
     and a raw key let one client heap-OOM the hub in ~35 s.
   - One sign-in queued-or-running per client; its extras get 503 + `Retry-After` at once, no scrypt.

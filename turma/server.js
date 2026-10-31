@@ -13374,14 +13374,55 @@ const loginFailures = new Map(); // loginFailureKey -> { count, until, at }
 function loginClientPart(v) {
   return String(v || "").trim().replace(/^::ffff:/i, "").slice(0, LOGIN_CLIENT_KEY_MAX);
 }
-function loginClientKey(req) {
+//
+// XERK-2579: with several cloudflared and ingress pods, those three parts give
+// one public IP a key per (cloudflared pod, ingress pod) pair — ~4x the free
+// guesses. TURMA_TRUSTED_PROXIES (comma-separated CIDRs/IPs: the ingress and
+// cloudflared pods) collapses that: when the socket AND the right-most XFF hop
+// are BOTH inside it, the request came Cloudflare -> ingress -> hub, so
+// CF-Connecting-IP is Cloudflare's and is the key alone. Anything else keeps the
+// three-part key. Unset = always three parts. Residual: a host inside those CIDRs
+// that reaches the hub directly can forge all three headers — list no wider than
+// the proxies.
+function parseTrustedProxies(spec) {
+  const list = new net.BlockList();
+  let any = false;
+  for (const raw of String(spec || "").split(",")) {
+    const entry = raw.trim();
+    if (!entry) continue;
+    const [addr, bits, extra] = entry.split("/");
+    const family = net.isIP(addr);
+    const type = family === 6 ? "ipv6" : "ipv4";
+    const max = family === 6 ? 128 : 32;
+    const prefix = bits === undefined ? max : Number(bits);
+    // bits "" would be Number("") = 0, i.e. trust everything: require digits.
+    if (!family || extra !== undefined || (bits !== undefined && !/^\d{1,3}$/.test(bits)) || prefix > max) {
+      throw new Error(`TURMA_TRUSTED_PROXIES: "${entry}" is not an IP or CIDR`);
+    }
+    list.addSubnet(addr, prefix, type);
+    any = true;
+  }
+  return any ? list : null;
+}
+let LOGIN_TRUSTED_PROXIES = null;
+try {
+  LOGIN_TRUSTED_PROXIES = parseTrustedProxies(process.env.TURMA_TRUSTED_PROXIES);
+} catch (e) {
+  console.error(`turma: ${e.message}`);
+  process.exit(2);
+}
+function loginProxyTrusted(ip, trusted) {
+  const family = net.isIP(ip);
+  return !!family && trusted.check(ip, family === 6 ? "ipv6" : "ipv4");
+}
+function loginClientKey(req, trusted = LOGIN_TRUSTED_PROXIES) {
   const h = req.headers || {};
   const xff = String(h["x-forwarded-for"] || "").split(",");
-  return [
-    loginClientPart(h["cf-connecting-ip"]),
-    loginClientPart(xff[xff.length - 1]),
-    loginClientPart(req.socket && req.socket.remoteAddress),
-  ].join("|");
+  const cf = loginClientPart(h["cf-connecting-ip"]);
+  const hop = loginClientPart(xff[xff.length - 1]);
+  const peer = loginClientPart(req.socket && req.socket.remoteAddress);
+  if (trusted && cf && loginProxyTrusted(peer, trusted) && loginProxyTrusted(hop, trusted)) return cf;
+  return [cf, hop, peer].join("|");
 }
 
 function acquireLoginSlot() {
@@ -25366,6 +25407,7 @@ if (process.env.TURMA_TEST) {
     authEnabled,
     localLogin,
     loginClientKey,
+    parseTrustedProxies,
     loginFailureKey,
     oidcPrincipal,
     tenancyState: () => tenancyState,
