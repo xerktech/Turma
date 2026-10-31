@@ -212,6 +212,13 @@ test("XERK-2585: off Cloudflare, a rotated CF-Connecting-IP never changes the si
     "64:ff9b::1.2.3.4");
   assert.notEqual(key({ "x-forwarded-for": "0:0:0:0:0:ffff:1.2.3.4" }, "10.244.2.8"),
     key({ "x-forwarded-for": "0:0:0:0:0:ffff:5.6.7.8" }, "10.244.2.8"));
+  // By range, not spelling: Node writes NAT64 in hex.
+  assert.notEqual(key({ "x-forwarded-for": "64:ff9b::102:304" }, "10.244.2.8"),
+    key({ "x-forwarded-for": "64:ff9b::506:708" }, "10.244.2.8"));
+  // A dotted tail outside those ranges is still an ordinary /64.
+  assert.equal(key({ "x-forwarded-for": "2001:db8:1:3::1.2.3.4" }, "10.244.2.8"), "2001:db8:1:3::/64");
+  // A zone id naming a VLAN (with a dot) still collapses to the /64.
+  assert.equal(key({ "x-forwarded-for": "fe80::1%eth0.100" }, "10.244.2.8"), "fe80:0:0:0::/64");
   // Unset env keeps the three-part key exactly.
   assert.equal(key({ "cf-connecting-ip": "198.51.100.1", "x-forwarded-for": "192.168.1.50" }, "10.244.2.8", null),
     "198.51.100.1|192.168.1.50|10.244.2.8");

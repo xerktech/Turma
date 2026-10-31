@@ -13434,10 +13434,18 @@ function loginIpv6Prefix64(ip) {
   const full = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - groups(head) - groups(tail))).fill("0"), ...t];
   return `${full.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(":")}::/64`;
 }
-// An IPv6 form carrying an IPv4 tail (mapped, NAT64) names one IPv4 client, so it
-// keys on the whole address — its /64 would pool every such client together.
+// An IPv6 address that EMBEDS an IPv4 one (mapped ::ffff:0:0/96, NAT64
+// 64:ff9b::/96, compat ::/96) names one IPv4 client, so it keys on the whole
+// address — its /64 would pool every such client together. Judged by RANGE, not
+// spelling (Node writes NAT64 in hex), on the address with any zone id dropped.
+const LOGIN_EMBEDDED_V4 = new net.BlockList();
+LOGIN_EMBEDDED_V4.addSubnet("::ffff:0:0", 96, "ipv6");
+LOGIN_EMBEDDED_V4.addSubnet("64:ff9b::", 96, "ipv6");
+LOGIN_EMBEDDED_V4.addSubnet("::", 96, "ipv6");
 function loginClientAddr(ip) {
-  return net.isIP(ip) === 6 && !ip.includes(".") ? loginIpv6Prefix64(ip.toLowerCase()) : ip;
+  const bare = ip.replace(/%.*$/, "");
+  if (net.isIP(bare) !== 6) return ip;
+  return LOGIN_EMBEDDED_V4.check(bare, "ipv6") ? bare.toLowerCase() : loginIpv6Prefix64(bare.toLowerCase());
 }
 function loginClientKey(req, trusted = LOGIN_TRUSTED_PROXIES) {
   const h = req.headers || {};
