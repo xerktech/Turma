@@ -27686,8 +27686,14 @@ test("XERK-2508 QA: a drifted host is refused, the fleet caps hold, and an empty
   const row = hub.getMeetings()[S][0];
   assert.deepEqual([row.status, row.items, row.model], ["ok", [], hub.MEETINGS_AUTO_MODEL]);
   // A tenirUrl that could break out of an attribute is refused.
-  const quoted = await postMeeting2508(S, meeting2508("q2", { tenirUrl: "https://x/'onmouseover='a" }));
-  assert.equal(quoted.status, 400);
+  for (const tenirUrl of ["https://x/'onmouseover='a", "https://x/\u202egpj.exe", "https://x/a\u200bb"]) {
+    assert.equal((await postMeeting2508(S, meeting2508("q2", { tenirUrl }))).status, 400, tenirUrl);
+  }
+  // A restored row's model is charset-checked too; an item list is byte-bounded.
+  const restored = hub.sanitizeMeeting({ ...row, model: "<script>", items: Array.from({ length: 30 },
+    () => ({ kind: "task", title: "t", description: "d".repeat(4000) })) });
+  assert.equal("model" in restored, false);
+  assert.ok(restored.items.length < 30 && Buffer.byteLength(JSON.stringify(restored.items)) <= 64 << 10);
   // Fleet-wide: 20 pending meetings across orgs, then 429.
   delete agents.mtQA2508;
   const orgs = ["mtQ1", "mtQ2", "mtQ3"].map((o) => `${o}2508.atlassian.net`);
@@ -27701,12 +27707,16 @@ test("XERK-2508 QA: a drifted host is refused, the fleet caps hold, and an empty
   assert.match(fleet.body.error, /20 meetings are already waiting/);
   for (const o of orgs) delete hub.getMeetings()[o];
   // The byte budget: pending transcripts past 2 MiB fleet-wide are refused.
+  // The byte budgets: 1 MiB of pending transcript per org, 2 MiB fleet-wide.
   const fat = (id) => meeting2508(id, { segments: Array.from({ length: 450 }, () => ({ text: "y".repeat(2000) })) });
   assert.equal((await postMeeting2508(orgs[0], fat("b1"))).status, 200);
-  assert.equal((await postMeeting2508(orgs[0], fat("b2"))).status, 200);
-  const over = await postMeeting2508(orgs[0], fat("b3"));
+  const orgOver = await postMeeting2508(orgs[0], fat("b2"));
+  assert.equal(orgOver.status, 429);
+  assert.match(orgOver.body.error, /this org's meetings/);
+  assert.equal((await postMeeting2508(orgs[1], fat("b2"))).status, 200);
+  const over = await postMeeting2508(orgs[2], fat("b3"));
   assert.equal(over.status, 429);
-  assert.match(over.body.error, /transcript budget/);
+  assert.match(over.body.error, /fill the hub's transcript budget/);
   for (const [i, o] of orgs.entries()) cleanup2508(o, [`mtQH${i}2508`]);
   cleanup2508(S, []);
   cleanup2508(O, []);

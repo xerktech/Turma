@@ -196,19 +196,39 @@ test("XERK-2508: overlapping debounce-0 writes land whole and newest, never torn
     await s.set("big", big(n));
     await new Promise((r) => setTimeout(r, 1));
   }
-  for (let i = 0; i < 400 && JSON.parse(fs.readFileSync(file, "utf8")).n !== 6; i++) {
+  // The write's bookkeeping clears in the rename callback, after the bytes are
+  // visible, so wait for both.
+  for (let i = 0; i < 400 && (s._writing.size || JSON.parse(fs.readFileSync(file, "utf8")).n !== 6); i++) {
     await new Promise((r) => setTimeout(r, 10));
   }
   assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).n, 6, "the newest value landed");
   assert.equal(s._writing.size, 0, "no write left in flight");
-  // A sync flush wins over an async write still in flight.
-  await s.set("big", big(7));
-  await s.set("big", { n: 8 });
-  s.flush();
-  await new Promise((r) => setTimeout(r, 300));
-  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).n, 8);
-  assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes(".tmp-")), []);
 });
+
+// A sync flush (the in-process durable writes: identity revoke, name-token
+// generations) must win over an older async write held at either stage.
+for (const stage of ["writeFile", "rename"]) {
+  test(`XERK-2508: a sync flush wins over an older async write held at ${stage}`, async (t) => {
+    const dir = mkdtemp("turma-store-");
+    const file = path.join(dir, "v.json");
+    const s = new FileLiveStore({ persistent: { v: { file, debounceMs: 0 } } });
+    const real = fs[stage];
+    let release;
+    const held = new Promise((r) => { release = r; });
+    t.mock.method(fs, stage, (...args) => { held.then(() => real(...args)); });
+    await s.set("v", { v: "old" });
+    await new Promise((r) => setTimeout(r, 20)); // the async write reaches the held stage
+    await s.set("v", { v: "new" });
+    s.flush();
+    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).v, "new");
+    release();
+    for (let i = 0; i < 100 && s._writing.size; i++) await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => setTimeout(r, 30));
+    t.mock.restoreAll();
+    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).v, "new", "the older blob never lands last");
+    assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes(".tmp-")), []);
+  });
+}
 
 test("XERK-754: a durable key reloads on a fresh store (restart restore)", async () => {
   const dir = mkdtemp("turma-store-");

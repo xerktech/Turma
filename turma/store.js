@@ -86,8 +86,8 @@ class FileLiveStore {
     // Async durable writes run one at a time per key: two in flight shared one
     // tmp path and could rename a torn or older blob over the file. A write
     // asked for meanwhile re-runs once the current one lands, with the newest
-    // value; a sync flush bumps the key's generation so an older async write
-    // in flight never renames over it.
+    // value; a sync flush bumps the key's generation, and an older async write
+    // that renamed after it writes the newest value again at once.
     this._writing = new Set();
     this._writeAgain = new Set();
     this._writeGen = new Map();
@@ -359,16 +359,14 @@ class FileLiveStore {
           done();
           return;
         }
-        if (this._writeGen.get(key) !== gen) {
-          // A sync flush wrote a newer value meanwhile.
-          fs.unlink(tmp, () => done());
-          return;
-        }
         fs.rename(tmp, file, (rerr) => {
           if (rerr) {
             console.error(`store: durable save of ${JSON.stringify(key)} failed: ${rerr.message}`);
             fs.unlink(tmp, () => {});
           }
+          // A sync flush landed while this rename was queued, so this older
+          // blob may now sit over it: write the newest value again, at once.
+          if (this._writeGen.get(key) !== gen) this._writeNow(key, true);
           done();
         });
       });

@@ -4312,10 +4312,12 @@ const MEETINGS_ORGS_MAX = 100;
 const MEETINGS_SITE_MAX = 200;
 const MEETING_SEGMENTS_MAX = 10000;
 const MEETING_ITEMS_MAX = 30;
+const MEETING_ITEMS_BYTES_MAX = 64 << 10;
 const MEETING_ERROR_MAX = 300;
 const MEETING_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 // No quote, bracket or space: the URL will be rendered as a link (XERK-2510).
-const MEETING_URL_RE = /^https?:\/\/[^\s"'`<>\\]{1,492}$/i;
+const MEETING_URL_RE =
+  /^https?:\/\/[^\s"'`<>\\\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]{1,492}$/i;
 const MEETING_MODEL_RE = /^[A-Za-z0-9._:-]{1,40}$/;
 const MEETING_STATUSES = new Set(["queued", "running", "ok", "failed"]);
 const MEETING_ITEM_KINDS = new Set(["task", "bug", "followup", "decision"]);
@@ -4369,10 +4371,20 @@ function sanitizeMeetingItem(v, i) {
   if (repo) out.repoGuess = repo;
   return out;
 }
-// The item list a row keeps: each item re-whitelisted, renumbered p1..pN.
+// The item list a row keeps: each item re-whitelisted, renumbered p1..pN, and
+// cut once its JSON passes MEETING_ITEMS_BYTES_MAX — a settled row is kept for
+// MEETINGS_KEEP meetings and the store is written whole.
 function sanitizeMeetingItems(list) {
-  return list.slice(0, MEETING_ITEMS_MAX * 2).map((it) => sanitizeMeetingItem(it, 0))
-    .filter(Boolean).slice(0, MEETING_ITEMS_MAX).map((it, i) => ({ ...it, id: `p${i + 1}` }));
+  const out = [];
+  let bytes = 0;
+  for (const raw of list.slice(0, MEETING_ITEMS_MAX * 2)) {
+    const it = sanitizeMeetingItem(raw, out.length);
+    if (!it) continue;
+    bytes += Buffer.byteLength(JSON.stringify(it));
+    if (out.length >= MEETING_ITEMS_MAX || bytes > MEETING_ITEMS_BYTES_MAX) break;
+    out.push(it);
+  }
+  return out;
 }
 function sanitizeMeeting(v) {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
@@ -17493,6 +17505,7 @@ const MEETINGS_RETAIN_MS = 30 * 86400e3; // an org no host is in any more
 const MEETINGS_PENDING_ORG_MAX = 10;
 const MEETINGS_PENDING_TOTAL_MAX = 20;
 const MEETINGS_PENDING_BYTES_MAX = 2 << 20;
+const MEETINGS_PENDING_BYTES_ORG_MAX = 1 << 20; // so one org can't fill the whole budget
 const meetingSegmentBytes = (m) => (m.segments ? Buffer.byteLength(JSON.stringify(m.segments)) : 0);
 
 function meetingsAuthorized(req) {
@@ -17562,7 +17575,12 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   if (pending.length >= MEETINGS_PENDING_TOTAL_MAX) {
     return { status: 429, body: { error: `${MEETINGS_PENDING_TOTAL_MAX} meetings are already waiting to be read — try again later` } };
   }
-  if (pending.reduce((n, m) => n + meetingSegmentBytes(m), meetingSegmentBytes(row)) > MEETINGS_PENDING_BYTES_MAX) {
+  const sum = (rows) => rows.reduce((n, m) => n + meetingSegmentBytes(m), meetingSegmentBytes(row));
+  const orgPending = (meetingProposals[siteKey] || []).filter((m) => MEETING_PENDING.has(m.status));
+  if (sum(orgPending) > MEETINGS_PENDING_BYTES_ORG_MAX) {
+    return { status: 429, body: { error: "this org's meetings already waiting to be read fill its transcript budget — try again later" } };
+  }
+  if (sum(pending) > MEETINGS_PENDING_BYTES_MAX) {
     return { status: 429, body: { error: "the meetings already waiting to be read fill the hub's transcript budget — try again later" } };
   }
   const kept = putMeeting(siteKey, row);

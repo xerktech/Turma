@@ -21,7 +21,8 @@ ticket builds to this file; change it here first.
   segments[{speaker, text, startMs, endMs}]}`.
   - `meetingId` `^[A-Za-z0-9._:-]{1,128}$` (Tenir's own id); `title` ≤300; `platform` ≤40
     (`zoom`, `teams`, …); times epoch ms; `tenirUrl` an http(s) URL ≤500 with no quote, space,
-    backslash or angle bracket (it is rendered as a link), or absent.
+    backslash, angle bracket, control, bidi or zero-width character (it is rendered as a link),
+    or absent.
   - `participants` ≤100 names ≤100; `segments` 1..`MEETING_SEGMENTS_MAX` (10000), `speaker` ≤100,
     `text` ≤2000, `startMs`/`endMs` offsets in ms from `startedAt`.
   - Text is code points with control/bidi characters removed (`meetingText`); a segment with no
@@ -33,7 +34,8 @@ ticket builds to this file; change it here first.
   `MEETING_BODY_MAX` (1 MiB) or too many segments → 400 a malformed field → 409 the store full
   → 429 too many meetings waiting (`MEETINGS_PENDING_ORG_MAX` 10 per org,
   `MEETINGS_PENDING_TOTAL_MAX` 20 fleet-wide, or pending transcripts past
-  `MEETINGS_PENDING_BYTES_MAX` 2 MiB fleet-wide).
+  `MEETINGS_PENDING_BYTES_MAX` 2 MiB fleet-wide, 1 MiB of it per org).
+- A settled row's items are cut once their JSON passes `MEETING_ITEMS_BYTES_MAX` (64 KiB).
 - **Why the byte budget**: the store is written whole on every change (and published whole to the
   peer under HA); at 20 × 1 MiB each write blocked the event loop ~1 s and pushed RSS past the
   512Mi pod limit (XERK-2508 QA). An hour of captions is ~60 KB. Do not raise it without moving
