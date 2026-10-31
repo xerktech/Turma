@@ -52,9 +52,24 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 ## Passwords + login
 
 - scrypt via stdlib only; `scrypt$N$r$p$salt$key`. Plaintext is never stored or logged.
-- **At most `LOGIN_SCRYPT_INFLIGHT_MAX` (2) scrypt verifications at once; the rest get 503 +
-  `Retry-After`.** Each costs 16 MiB inside the XERK-287 margin (`turma-limits.md`) — never raise N or
-  the cap without re-measuring.
+- **At most `LOGIN_SCRYPT_INFLIGHT_MAX` (2) scrypt verifications at once per hub process** (each HA
+  replica has its own). Each costs
+  16 MiB inside the XERK-287 margin (`turma-limits.md`) — never raise N or the cap without re-measuring.
+- **Sign-in is fair per client (XERK-2568)**, the client being `loginClientKey`: CF-Connecting-IP
+  AND the LAST X-Forwarded-For hop (the ingress's view) AND the socket. Fairness only, never auth.
+  - **All three, never CF-Connecting-IP alone**: the LAN reaches the ingress without Cloudflare, so
+    that header is forgeable there; alone, a LAN caller could back a chosen victim's key off.
+  - `loginFailures` keys are a sha256 of client + username — the username is unbounded (1 MiB body),
+    and a raw key let one client heap-OOM the hub in ~35 s.
+  - One sign-in queued-or-running per client; its extras get 503 + `Retry-After` at once, no scrypt.
+  - A request finding both slots busy waits in a bounded FIFO (`LOGIN_QUEUE_MAX`,
+    `LOGIN_QUEUE_WAIT_MS`), 503 only past that — a single flooding client can no longer 503 everyone.
+  - Failures back off exponentially per (client, username) after `LOGIN_FAIL_FREE`: 429 +
+    `Retry-After`, answered before any scrypt.
+  - **Never add a per-USERNAME in-flight cap or a username-only backoff** — either lets an anonymous
+    client lock a known account out for everyone, the exact failure this replaced.
+  - Residual: a caller reaching the hub without Cloudflare can rotate its CF-Connecting-IP; that
+    buys it queue places (bounded by `LOGIN_QUEUE_MAX`, so ~18 keys 503 others), not more scrypt.
 - `parseHash` refuses a stored cost past `SCRYPT_MAXMEM`: a hand-edited store must not OOM a login.
 - **`/api/login` checks break-glass FIRST, scrypt-free**, so a flood cannot lock break-glass out.
 - An unknown username verifies against a dummy hash (same cost, no timing oracle); every failure is
@@ -81,6 +96,6 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 - `turma/tests/tenancy.test.js` (own process, break-glass set); `tenancy-nopassword.test.js` (own
   process, bootstrap admin ONLY — the forgery / empty-Basic / dummy-hash / mid-verify-disable guards);
   `XERK-2530:` in `oidc-groups.test.js` and `server.test.js` (an OIDC user leaves an open hub open).
-- Known gap, ticketed: local-login fairness under an anonymous flood (the 2-slot cap is global).
+- Fair sign-in: the `XERK-2568:` cases in `tenancy-nopassword.test.js`.
 - Android signs in through `POST /api/login` and rides `hub_session` (XERK-2569), so local accounts
   work there too; Basic stays its break-glass fallback (`android/PARITY.md`).

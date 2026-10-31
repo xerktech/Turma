@@ -13333,27 +13333,136 @@ function userAuthorized(req) {
 }
 
 // A local user's sign-in. scrypt costs 16 MiB a call, so at most
-// LOGIN_SCRYPT_INFLIGHT_MAX run at once and the rest are told to retry — an
-// anonymous /api/login flood must not OOM the hub (turma-limits.md). The
-// break-glass check runs BEFORE this and costs no scrypt, so a flood can never
-// lock break-glass out. An unknown username is verified against a dummy hash so
-// it costs the same as a known one.
+// LOGIN_SCRYPT_INFLIGHT_MAX run at once — an anonymous /api/login flood must not
+// OOM the hub (turma-limits.md). The break-glass check runs BEFORE this and costs
+// no scrypt, so a flood can never lock break-glass out. An unknown username is
+// verified against a dummy hash so it costs the same as a known one.
+//
+// Fairness (XERK-2568): the global cap alone let ONE client holding two bad
+// requests in flight 503 every other sign-in. So:
+//  - each client (loginClientKey) has at most ONE sign-in queued or running; its
+//    extras are refused at once, costing no scrypt;
+//  - a request that finds both slots busy WAITS in a bounded FIFO
+//    (LOGIN_QUEUE_MAX, LOGIN_QUEUE_WAIT_MS) instead of an instant 503, so a
+//    victim waits behind at most one request per other client;
+//  - failures back off exponentially per (client, username) after
+//    LOGIN_FAIL_FREE, answered 429 before any scrypt. Keyed on the client too, so
+//    an attacker cannot lock a known username out for everyone else.
+// Deliberately NO per-username in-flight cap: one keyed on the username alone is
+// exactly the lockout this fixes, aimed at a known account.
 const LOGIN_SCRYPT_INFLIGHT_MAX = 2;
+const LOGIN_QUEUE_MAX = 16;
+const LOGIN_QUEUE_WAIT_MS = 3000;
+const LOGIN_FAIL_FREE = 5;
+const LOGIN_BACKOFF_BASE_MS = 1000;
+const LOGIN_BACKOFF_MAX_MS = 15 * 60 * 1000;
+const LOGIN_FAIL_TRACK_MAX = 10000;
+const LOGIN_CLIENT_KEY_MAX = 64; // per part of loginClientKey
 let loginScryptInflight = 0;
-async function localLogin(username, password, now = Date.now()) {
-  if (loginScryptInflight >= LOGIN_SCRYPT_INFLIGHT_MAX) return { busy: true };
+const loginQueue = []; // FIFO of { grant } waiters for a scrypt slot
+const loginClientsInflight = new Set();
+const loginFailures = new Map(); // loginFailureKey -> { count, until, at }
+
+// Who is signing in, for fairness only — never for authorization. Three parts,
+// all of them: CF-Connecting-IP (Cloudflare sets it, overwriting a client-sent
+// one), the right-most X-Forwarded-For entry (what the nginx ingress saw), and
+// the socket peer. A caller that bypasses Cloudflare (the LAN reaches the ingress
+// directly) can forge the first and the left of the second, but not the hop the
+// ingress appends nor the socket — so it can never present ANOTHER client's key
+// and back that client off. Forging a fresh key per request only buys queue
+// places (bounded by LOGIN_QUEUE_MAX), never more scrypt (residual, accepted).
+function loginClientPart(v) {
+  return String(v || "").trim().replace(/^::ffff:/i, "").slice(0, LOGIN_CLIENT_KEY_MAX);
+}
+function loginClientKey(req) {
+  const h = req.headers || {};
+  const xff = String(h["x-forwarded-for"] || "").split(",");
+  return [
+    loginClientPart(h["cf-connecting-ip"]),
+    loginClientPart(xff[xff.length - 1]),
+    loginClientPart(req.socket && req.socket.remoteAddress),
+  ].join("|");
+}
+
+function acquireLoginSlot() {
+  if (loginScryptInflight < LOGIN_SCRYPT_INFLIGHT_MAX) {
+    loginScryptInflight++;
+    return Promise.resolve(true);
+  }
+  if (loginQueue.length >= LOGIN_QUEUE_MAX) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const waiter = {
+      grant: () => { clearTimeout(waiter.timer); resolve(true); },
+      timer: setTimeout(() => {
+        const i = loginQueue.indexOf(waiter);
+        if (i >= 0) loginQueue.splice(i, 1);
+        resolve(false);
+      }, LOGIN_QUEUE_WAIT_MS),
+    };
+    loginQueue.push(waiter);
+  });
+}
+
+// A freed slot passes straight to the oldest waiter, so the count never dips
+// below the cap while anyone queues (and never exceeds it).
+function releaseLoginSlot() {
+  const next = loginQueue.shift();
+  if (next) next.grant();
+  else loginScryptInflight--;
+}
+
+// Hashed, so a megabyte username costs the map 64 bytes, not a megabyte.
+function loginFailureKey(clientKey, username) {
+  return crypto.createHash("sha256").update(`${clientKey}\n${String(username).toLowerCase()}`).digest("hex");
+}
+
+function loginBackoffMs(clientKey, username, now) {
+  const f = loginFailures.get(loginFailureKey(clientKey, username));
+  return f && f.until > now ? f.until - now : 0;
+}
+
+function recordLoginFailure(clientKey, username, now) {
+  const key = loginFailureKey(clientKey, username);
+  const prev = loginFailures.get(key);
+  // A record idle past the longest backoff starts over.
+  const count = prev && now - prev.at < LOGIN_BACKOFF_MAX_MS ? prev.count + 1 : 1;
+  const over = count - LOGIN_FAIL_FREE;
+  const until = over >= 0 ? now + Math.min(LOGIN_BACKOFF_BASE_MS * 2 ** Math.min(over, 20), LOGIN_BACKOFF_MAX_MS) : 0;
+  loginFailures.delete(key); // re-insert so Map order is least-recently-failed first
+  loginFailures.set(key, { count, until, at: now });
+  while (loginFailures.size > LOGIN_FAIL_TRACK_MAX) loginFailures.delete(loginFailures.keys().next().value);
+}
+
+async function localLogin(username, password, now = Date.now(), clientKey = "local") {
+  const wait = loginBackoffMs(clientKey, username, now);
+  if (wait) return { throttled: Math.ceil(wait / 1000) };
+  if (loginClientsInflight.has(clientKey)) return { busy: true };
+  loginClientsInflight.add(clientKey);
+  try {
+    return await localLoginVerify(username, password, clientKey, now);
+  } finally {
+    loginClientsInflight.delete(clientKey);
+  }
+}
+
+async function localLoginVerify(username, password, clientKey, now) {
   const user = tenancy.findLocalUser(tenancyState, username);
   const hash = (user && user.passwordHash) || tenancy.dummyPasswordHash();
-  loginScryptInflight++;
+  if (!(await acquireLoginSlot())) return { busy: true };
   let ok = false;
   try {
     ok = await tenancy.verifyPassword(password, hash);
   } catch {
     ok = false;
   } finally {
-    loginScryptInflight--;
+    releaseLoginSlot();
   }
-  if (!ok || !user) return {};
+  // Stamped after the verify, so the clock is when the failure was learned.
+  if (!ok || !user) {
+    recordLoginFailure(clientKey, username, Date.now());
+    return {};
+  }
+  loginFailures.delete(loginFailureKey(clientKey, username));
   // The store may have moved during the await (disabled, removed, re-passworded).
   const cur = Object.hasOwn(tenancyState.users, user.id) ? tenancyState.users[user.id] : null;
   if (!cur || cur.passwordHash !== user.passwordHash) return {};
@@ -20422,7 +20531,11 @@ const server = http.createServer(async (req, res) => {
         // Break-glass (XERK-595) first and scrypt-free, so it works under a flood.
         token = issueSessionToken(SESSION_TTL_MS, principalClaims(BREAKGLASS_PRINCIPAL));
       } else {
-        const r = await localLogin(username, password);
+        const r = await localLogin(username, password, Date.now(), loginClientKey(req));
+        if (r.throttled) {
+          res.setHeader("Retry-After", String(r.throttled));
+          return json(res, 429, { error: "too many failed sign-ins — try again later" });
+        }
         if (r.busy) {
           res.setHeader("Retry-After", "1");
           return json(res, 503, { error: "too many sign-ins in progress — try again in a moment" });
@@ -25252,6 +25365,8 @@ if (process.env.TURMA_TEST) {
     principalClaims,
     authEnabled,
     localLogin,
+    loginClientKey,
+    loginFailureKey,
     oidcPrincipal,
     tenancyState: () => tenancyState,
     __setTenancy(v) { tenancyState = tenancy.coerceTenancy(v); },
