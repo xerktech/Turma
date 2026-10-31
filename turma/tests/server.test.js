@@ -20296,6 +20296,52 @@ test("XERK-2572: a refused redemption leaves the name token's generation alone",
   forget2531("enr-live", "enr-other"); forget2381("enr-live", "enr-other");
 });
 
+test("XERK-2573: redeeming a code for a released name revokes the old machine's identity token", async () => {
+  forget2531("enr-id"); forget2381("enr-id");
+  const beat = (tok) => request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: { device: "enr-id", sessions: [] } });
+  const oldUid = enrollUid("enr-id");
+  assert.equal((await beat(oldUid)).status, 200);
+  assert.equal((await request("DELETE", "/api/agents/enr-id", { headers: userHeaders })).status, 200);
+  // Released, not revoked: it could still come home here...
+  assert.equal(hostOfUid(tokenUid(oldUid)), "enr-id");
+  const code = hub.mintEnrollCode("local:op", "enr-id").body.code;
+  const r = await request("POST", "/api/agent/enroll", { body: { code, device: "enr-id" } });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  // ...but once a code is redeemed for the name, the old identity is gone.
+  assert.equal(hostOfUid(tokenUid(oldUid)), null);
+  const early = await beat(oldUid); // before the new host's first beat
+  assert.equal(early.status, 403, JSON.stringify(early.body));
+  assert.match(early.body.error, /not registered/);
+  assert.ok(!Object.prototype.hasOwnProperty.call(agents, "enr-id"));
+  assert.equal((await beat(r.body.token)).status, 200); // the new machine keeps the name
+  forget2531("enr-id"); forget2381("enr-id");
+});
+
+test("XERK-2573: a renamed-then-removed agent's revoked tombstone keeps its origin retired and frees the name", async () => {
+  forget2531("enr-ta", "enr-tb"); forget2381("enr-ta", "enr-tb");
+  const beat = (tok, device) => request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: { device, sessions: [] } });
+  const old = enrollUid("enr-ta");
+  assert.equal((await beat(old, "enr-ta")).status, 200);
+  quiet("enr-ta");
+  assert.equal((await beat(old, "enr-tb")).status, 200); // renamed to enr-tb
+  assert.equal((await request("DELETE", "/api/agents/enr-tb", { headers: userHeaders })).status, 200);
+  const first = await request("POST", "/api/agent/enroll", {
+    body: { code: hub.mintEnrollCode("local:op", "").body.code, device: "Enr-TB" } }); // case-folded
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  const dead = await beat(old, "enr-tb");
+  assert.equal(dead.status, 403);
+  assert.match(dead.body.error, /not registered/); // the old identity is dead
+  const tomb = hub.agentIdentities()[tokenUid(old)];
+  assert.ok(tomb && tomb.revoked && tomb.home === "enr-ta", JSON.stringify(tomb));
+  assert.equal((await beat(hostAgentToken("enr-ta"), "enr-ta")).status, 403); // origin name token still retired
+  // The new host never came up: a second code for the same name is not blocked.
+  const second = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "Enr-TB");
+  assert.equal(second.status, 200, JSON.stringify(second.body));
+  forget2531("enr-ta", "enr-tb", "Enr-TB"); forget2381("enr-ta", "enr-tb");
+});
+
 test("XERK-2531: unknown codes are rate-limited, and a flood never blocks a real code", async () => {
   forget2531("enr-rl");
   const statuses = [];

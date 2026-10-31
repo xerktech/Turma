@@ -13923,13 +13923,33 @@ function consumeEnrollCode(code, device, now = Date.now(), check = false) {
   // then-removed agent's live id to this new machine (XERK-2531 QA). Releasing a
   // name means a reinstall that registers first wins, so it loses that origin.
   // A code therefore always mints a FRESH identity — never one another machine holds.
+  //
+  // The released identity still LIVING under this name is REVOKED, not just left
+  // released (XERK-2573): released, it may come home if it beats first, so the old
+  // machine could beat in the window before the new host's first beat and the new
+  // identity would then be refused there. Minting a code for the name is the
+  // operator choosing the new machine. Revoked like revokeHostIdentities, except a
+  // renamed agent's tombstone moves home to its origin name: left here it would
+  // hold this name and refuse the next code (enrollNameRefusal).
+  const want = lowerName(device);
   let dropped = false;
+  let revoked = 0;
   for (const [uid, e] of Object.entries(agentIdentities)) {
     if (!e || e.revoked) continue;
     if (!e.used && (e.home === device || e.origin === device)) { delete agentIdentities[uid]; dropped = true; }
-    else if (e.released && e.origin === device) { delete e.origin; dropped = true; }
+    else if (e.released && typeof e.home === "string" && lowerName(e.home) === want) {
+      revoked++;
+      if (e.origin && lowerName(e.origin) !== want) { e.home = e.origin; e.revoked = true; }
+      else delete agentIdentities[uid];
+    } else if (e.released && e.origin === device) { delete e.origin; dropped = true; }
   }
-  if (dropped) persistAgentIdentities();
+  if (dropped || revoked) persistAgentIdentities();
+  // Its tunnel, if still up, is cut now (no record holds this name, so any control
+  // channel under it is the old machine's); agentWsAuthorized refuses the reconnect.
+  if (revoked && controlChannels[device]) {
+    dropTermAgents(device);
+    try { controlChannels[device].socket.destroy(); } catch { /* gone */ }
+  }
   const uid = issueAgentUid(device);
   const ident = identityEntry(uid);
   if (!ident || ident.used || ident.home !== device) {
@@ -13941,7 +13961,7 @@ function consumeEnrollCode(code, device, now = Date.now(), check = false) {
   persistEnrollCodes();
   const token = uidAgentToken(uid);
   console.log(`agent enrolled by code: ${logName(device)} (code ${id}, minted by ${logName(rec.owner)})`);
-  return { status: 200, body: { host: device, token, bound: true } };
+  return { status: 200, body: { host: device, token, bound: true }, revoked };
 }
 
 // POST /api/agent/enroll: revoke `device`'s NAME-derived token, THEN redeem.
@@ -13959,7 +13979,14 @@ async function redeemEnrollCode(code, device, now = Date.now()) {
   if (bumped.error) {
     console.error(`agent enrolled by code: could not revoke ${logName(device)}'s old name token (${bumped.error}); it may still work`);
   }
-  return consumeEnrollCode(code, device, Date.now());
+  const done = consumeEnrollCode(code, device, Date.now());
+  if (done.revoked) {
+    // The old machine's identity is dead once this 200 is sent, so the revoke must
+    // survive a hard kill: on the file backend write it through, not on the debounce.
+    await persistAgentIdentities();
+    if (!HA_ON && typeof liveStore.flush === "function") liveStore.flush();
+  }
+  return done;
 }
 
 const enrollFails = { start: 0, n: 0 };

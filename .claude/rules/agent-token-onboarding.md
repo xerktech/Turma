@@ -79,6 +79,14 @@ Split out of `CLAUDE.md`, which keeps the per-host credential contract (XERK-268
     holder could revoke a live host's token); a code revoked or expired DURING the bump still bumps
     that released name (accepted). A failed bump still redeems, logged.
     Tests: `XERK-2572:` cases (the slow-store case pins the await).
+  - **Redemption REVOKES the released identity still living under the name** (XERK-2573): left
+    released it may come home if it beats first, so the old machine won the window before the new
+    host's first beat and the new identity was refused. Minting a code for the name is the
+    operator choosing the new machine; the cost is that a blipped host whose operator Removed it
+    AND minted a code is locked out (intended). Like `revokeHostIdentities`, except a renamed
+    agent's tombstone moves `home` to its origin, or it would hold the name and refuse the next
+    code. Written through before the 200; a live tunnel under the name is cut.
+    Tests: `XERK-2573:` cases.
   - `owner` records the minting principal (`oidc:<sub>` or `local:<user>`) for the tenancy epic
     (XERK-2529) to bind the host to a tenant. **Recorded, not enforced.**
   - Agent: `hub-agent.py --enroll` with `TURMA_ENROLL_CODE` in the ENV (never argv) runs
