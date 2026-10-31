@@ -197,4 +197,31 @@ class PasswordLoginTest {
             assertFalse("no Basic fallback once a session was issued", basicTried)
         }
     }
+
+    // XERK-2576: a throttled /api/login is shown in the hub's words, and never
+    // retried as Basic — that 401 would word it as a wrong password.
+    @Test fun `a throttled sign-in shows the hub's words and wait, not bad credentials`() = runBlocking {
+        for ((code, said, wait, shown) in listOf(
+            listOf("429", "too many failed sign-ins — try again later", "300", " (retry in 5 min)"),
+            listOf("503", "too many sign-ins in progress — try again in a moment", "1", " (retry in 1s)"),
+        )) {
+            val agentCalls = AtomicInteger()
+            hub.route("/api/login") {
+                MockResponse().setResponseCode(code.toInt()).setHeader("Retry-After", wait)
+                    .setHeader("Content-Type", "application/json").setBody("{\"error\":\"$said\"}")
+            }
+            hub.route("/api/agents") { agentCalls.incrementAndGet(); MockResponse().setResponseCode(401) }
+            val signIn = hub.container.client.signIn(candidate())
+            assertEquals(SignInResult.HubRefused(said + shown), signIn.result)
+            assertEquals("", signIn.sessionToken)
+            assertEquals(0, agentCalls.get())
+        }
+    }
+
+    // A 503 with no {error} (a proxy's page) still falls back to Basic, as before.
+    @Test fun `a bare 503 from api login still falls back to Basic`() = runBlocking {
+        hub.route("/api/login") { MockResponse().setResponseCode(503).setBody("<html>busy</html>") }
+        hub.json("/api/agents", "{\"agents\":[]}")
+        assertEquals(SignInResult.Ok, hub.container.client.signIn(candidate()).result)
+    }
 }

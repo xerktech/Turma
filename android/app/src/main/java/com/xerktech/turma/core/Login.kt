@@ -25,6 +25,12 @@ sealed interface SignInResult {
     /** The hub answered with something else (a wrong URL's 404, a 5xx, …). */
     data class HttpError(val code: Int) : SignInResult
 
+    /**
+     * The hub throttled the sign-in (429/503 from /api/login, XERK-2576);
+     * [message] is its own words plus the wait — see [loginRefusalMessage].
+     */
+    data class HubRefused(val message: String) : SignInResult
+
     /** Nothing answered: bad host, DNS/TLS failure, timeout, no route. */
     data object Unreachable : SignInResult
 }
@@ -52,6 +58,20 @@ fun signInError(result: SignInResult): String? = when (result) {
     is SignInResult.SessionRefused ->
         "Password accepted, but the hub refused the session (HTTP ${result.code}). Please try again."
     is SignInResult.HttpError -> "Sign-in failed (HTTP ${result.code}). Please try again."
+    is SignInResult.HubRefused -> result.message
+}
+
+/**
+ * A throttled sign-in in the hub's own words [said] plus the `Retry-After`
+ * wait (XERK-2576) — the web login's `refusalMessage`, worded identically so
+ * the same refusal reads the same on both. Only delta-seconds is read; an
+ * HTTP-date or zero Retry-After leaves the hub's words alone.
+ */
+fun loginRefusalMessage(said: String, retryAfter: String?): String {
+    val secs = retryAfter?.trim()?.takeIf { it.isNotEmpty() && it.all(Char::isDigit) }?.toLongOrNull() ?: 0L
+    if (secs <= 0L) return said
+    val wait = if (secs < 60) "${secs}s" else "${(secs + 59) / 60} min"
+    return "$said (retry in $wait)"
 }
 
 /** The hub's login cookie name — `SESSION_COOKIE` in turma/server.js. */

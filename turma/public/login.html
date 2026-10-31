@@ -115,6 +115,19 @@
     document.title = "Break-glass sign in · Turma";
   }
 
+  // A non-401 refusal in the hub's own words (XERK-264/XERK-2576): its {error}
+  // body — "too many sign-ins in progress", the failed-sign-in backoff — plus the
+  // Retry-After wait, so a throttled operator knows to wait rather than retype.
+  // Only the delta-seconds form is read; an HTTP-date Retry-After is ignored.
+  function refusalMessage(status, body, retryAfter) {
+    const said = body && typeof body.error === "string" ? body.error.trim() : "";
+    if (!said) return `Sign-in failed (HTTP ${status}). Please try again.`;
+    const secs = /^\d+$/.test(String(retryAfter || "").trim()) ? Number(retryAfter) : 0;
+    if (!secs) return said;
+    const wait = secs < 60 ? `${secs}s` : `${Math.ceil(secs / 60)} min`;
+    return `${said} (retry in ${wait})`;
+  }
+
   function showError(msg) {
     errBox.textContent = msg;
     errBox.classList.add("show");
@@ -154,7 +167,12 @@
         location.replace(safeNext(new URLSearchParams(location.search).get("next")));
         return;
       }
-      showError(res.status === 401 ? "Incorrect username or password." : "Sign-in failed. Please try again.");
+      if (res.status === 401) {
+        showError("Incorrect username or password.");
+      } else {
+        const body = await res.json().catch(() => null);
+        showError(refusalMessage(res.status, body, res.headers.get("Retry-After")));
+      }
     } catch {
       showError("Network error. Please try again.");
     }

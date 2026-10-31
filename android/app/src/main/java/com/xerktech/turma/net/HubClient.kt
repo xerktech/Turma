@@ -3,6 +3,7 @@ package com.xerktech.turma.net
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import com.xerktech.turma.core.SESSION_COOKIE
 import com.xerktech.turma.core.SignInResult
+import com.xerktech.turma.core.loginRefusalMessage
 import com.xerktech.turma.core.sessionTokenFrom
 import com.xerktech.turma.core.signInResultFor
 import com.xerktech.turma.data.Config
@@ -41,6 +42,13 @@ class HubClient(private val config: Config) {
         data object Refused : LoginOutcome
         /** No session to be had here — a non-hub URL, a hub without the route, a 5xx, no network. */
         data object Unavailable : LoginOutcome
+        /**
+         * The hub answered 429/503 with its own `{error}` (XERK-2576): sign-in is
+         * throttled — too many in flight, or the failed-sign-in backoff. [message]
+         * is the hub's words plus the Retry-After wait, shown as-is on the login
+         * screen; never retried as Basic, which would word it as a wrong password.
+         */
+        data class Throttled(val message: String) : LoginOutcome
     }
 
     // Serialises re-logins, so a burst of calls that all 401 on one lapsed
@@ -82,7 +90,7 @@ class HubClient(private val config: Config) {
                 // the app returns to the login screen, rather than replaying a
                 // known-bad password on every call.
                 LoginOutcome.Refused -> config.clear()
-                LoginOutcome.Unavailable -> dropSession(s)
+                LoginOutcome.Unavailable, is LoginOutcome.Throttled -> dropSession(s)
             }
         } else {
             // An SSO-only sign-in has no password to retry with: drop the token so
@@ -144,6 +152,13 @@ class HubClient(private val config: Config) {
             bare.newCall(req).execute().use { resp ->
                 when {
                     resp.code == 401 -> LoginOutcome.Refused
+                    resp.code == 429 || resp.code == 503 -> {
+                        val said = runCatching {
+                            TurmaJson.decodeFromString<OkResponse>(resp.body?.string().orEmpty()).error
+                        }.getOrNull()?.trim().orEmpty()
+                        if (said.isEmpty()) LoginOutcome.Unavailable
+                        else LoginOutcome.Throttled(loginRefusalMessage(said, resp.header("Retry-After")))
+                    }
                     !resp.isSuccessful -> LoginOutcome.Unavailable
                     else -> sessionTokenFrom(resp.headers("Set-Cookie"))
                         ?.let { LoginOutcome.Token(it) } ?: LoginOutcome.Unavailable
@@ -219,7 +234,9 @@ class HubClient(private val config: Config) {
      * operator into a hub that isn't there.
      */
     suspend fun signIn(settings: Config.Settings): SignIn = withContext(Dispatchers.IO) {
-        val token = (login(settings) as? LoginOutcome.Token)?.token
+        val outcome = login(settings)
+        if (outcome is LoginOutcome.Throttled) return@withContext SignIn(SignInResult.HubRefused(outcome.message))
+        val token = (outcome as? LoginOutcome.Token)?.token
         if (token != null) {
             // The hub accepted the password, so its verdict on the session is
             // the answer — falling back to Basic here would word a refused
