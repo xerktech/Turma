@@ -4315,9 +4315,10 @@ const MEETING_ITEMS_MAX = 30;
 const MEETING_ITEMS_BYTES_MAX = 64 << 10;
 const MEETING_ERROR_MAX = 300;
 const MEETING_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
-// No quote, bracket or space: the URL will be rendered as a link (XERK-2510).
+// No quote, bracket, space, control, format (bidi) or invisible character: the
+// URL will be rendered as a link (XERK-2510), and those spoof its text.
 const MEETING_URL_RE =
-  /^https?:\/\/[^\s"'`<>\\\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]{1,492}$/i;
+  /^https?:\/\/[^\s"'`<>\\\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]{1,492}$/iu;
 const MEETING_MODEL_RE = /^[A-Za-z0-9._:-]{1,40}$/;
 const MEETING_STATUSES = new Set(["queued", "running", "ok", "failed"]);
 const MEETING_ITEM_KINDS = new Set(["task", "bug", "followup", "decision"]);

@@ -21,7 +21,8 @@ ticket builds to this file; change it here first.
   segments[{speaker, text, startMs, endMs}]}`.
   - `meetingId` `^[A-Za-z0-9._:-]{1,128}$` (Tenir's own id); `title` ≤300; `platform` ≤40
     (`zoom`, `teams`, …); times epoch ms; `tenirUrl` an http(s) URL ≤500 with no quote, space,
-    backslash, angle bracket, control, bidi or zero-width character (it is rendered as a link),
+    backslash, angle bracket, control, format (`\p{Cf}`, every bidi control) or default-ignorable
+    character (it is rendered as a link),
     or absent.
   - `participants` ≤100 names ≤100; `segments` 1..`MEETING_SEGMENTS_MAX` (10000), `speaker` ≤100,
     `text` ≤2000, `startMs`/`endMs` offsets in ms from `startedAt`.

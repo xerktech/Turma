@@ -27686,7 +27686,8 @@ test("XERK-2508 QA: a drifted host is refused, the fleet caps hold, and an empty
   const row = hub.getMeetings()[S][0];
   assert.deepEqual([row.status, row.items, row.model], ["ok", [], hub.MEETINGS_AUTO_MODEL]);
   // A tenirUrl that could break out of an attribute is refused.
-  for (const tenirUrl of ["https://x/'onmouseover='a", "https://x/\u202egpj.exe", "https://x/a\u200bb"]) {
+  for (const tenirUrl of ["https://x/'onmouseover='a", "https://x/\u202egpj.exe", "https://x/a\u200bb",
+    "https://x/a\u061cb", "https://x/a\u00adb", "https://x/a\u3164b", "https://x/a\u{E0041}b"]) {
     assert.equal((await postMeeting2508(S, meeting2508("q2", { tenirUrl }))).status, 400, tenirUrl);
   }
   // A restored row's model is charset-checked too; an item list is byte-bounded.
@@ -27694,6 +27695,8 @@ test("XERK-2508 QA: a drifted host is refused, the fleet caps hold, and an empty
     () => ({ kind: "task", title: "t", description: "d".repeat(4000) })) });
   assert.equal("model" in restored, false);
   assert.ok(restored.items.length < 30 && Buffer.byteLength(JSON.stringify(restored.items)) <= 64 << 10);
+  const many = hub.sanitizeMeeting({ ...row, items: Array.from({ length: 35 }, (_, i) => ({ kind: "task", title: `t${i}` })) });
+  assert.deepEqual([many.items.length, many.items[29].id], [30, "p30"]);
   // Fleet-wide: 20 pending meetings across orgs, then 429.
   delete agents.mtQA2508;
   const orgs = ["mtQ1", "mtQ2", "mtQ3"].map((o) => `${o}2508.atlassian.net`);
