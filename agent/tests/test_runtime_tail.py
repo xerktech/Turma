@@ -8,6 +8,8 @@ junk value. Same fall-back contract as hub-agent's copy, verified here directly.
 
 import contextlib
 import io
+import shutil
+import tempfile
 import os
 import sys
 import unittest
@@ -214,3 +216,84 @@ class FreshWriteTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParentLinkTest(unittest.TestCase):
+    """XERK-2570: a symlink planted at a PARENT directory below the anchor is
+    refused by every anchored write helper, on both the fd-relative path and
+    the lstat fallback (Windows)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.anchor = os.path.join(self.tmp, "slug")
+        self.outside = os.path.join(self.tmp, "outside")
+        os.makedirs(self.anchor)
+        os.makedirs(self.outside)
+        self.victim = os.path.join(self.outside, "f.json")
+        with open(self.victim, "w") as f:
+            f.write("untouched")
+        os.symlink(self.outside, os.path.join(self.anchor, "workflows"))
+        self.target = os.path.join(self.anchor, "workflows", "f.json")
+
+    def _assert_all_refused(self):
+        a = self.anchor
+        with self.assertRaises(OSError):
+            rt.write_text_replace(self.target, "x", anchor=a, create=True)
+        with self.assertRaises(OSError):
+            rt.open_fresh_for_write(self.target, anchor=a, create=True)
+        with self.assertRaises(OSError):
+            rt.open_for_append(self.target, anchor=a, create=True)
+        with self.assertRaises(OSError):
+            rt.ensure_dir(os.path.join(a, "workflows", "deeper"), a)
+        with self.assertRaises(OSError):
+            rt.move_file(os.path.join(a, "workflows", "f.json"),
+                         os.path.join(a, "moved.json"), a)
+        msgs = []
+        rt.ensure_transcript_file(os.path.join(a, "workflows", "new.jsonl"),
+                                  msgs.append, anchor=a)
+        self.assertTrue(msgs)
+        rt.append_entries(self.target, [{"a": 1}], msgs.append, anchor=a)
+        with open(self.victim) as f:
+            self.assertEqual(f.read(), "untouched")
+        self.assertEqual(sorted(os.listdir(self.outside)), ["f.json"])
+
+    def test_fd_path_refuses_a_symlinked_parent(self):
+        if not rt.FD_DIR_OPS:
+            self.skipTest("no fd-relative dir ops here")
+        self._assert_all_refused()
+
+    def test_fallback_path_refuses_a_symlinked_parent(self):
+        with mock.patch.object(rt, "FD_DIR_OPS", False):
+            self._assert_all_refused()
+
+    def test_a_path_outside_the_anchor_is_refused(self):
+        with self.assertRaises(OSError):
+            rt.open_for_append(os.path.join(self.outside, "x"), anchor=self.anchor)
+        with self.assertRaises(OSError):
+            rt.ensure_dir(os.path.join(self.anchor, "..", "outside", "y"), self.anchor)
+
+    def test_anchored_writes_create_real_dirs_and_files(self):
+        for fd_ops in (True, False):
+            if fd_ops and not rt.FD_DIR_OPS:
+                continue
+            with mock.patch.object(rt, "FD_DIR_OPS", fd_ops):
+                base = os.path.join(self.anchor, "sub%d" % fd_ops)
+                rec = os.path.join(base, "workflows", "r.json")
+                rt.write_text_replace(rec, "rec", anchor=self.anchor, create=True)
+                with open(rec) as f:
+                    self.assertEqual(f.read(), "rec")
+                self.assertEqual(os.listdir(os.path.dirname(rec)), ["r.json"])
+                log = os.path.join(base, "a", "b.jsonl")
+                rt.ensure_transcript_file(log, self.fail, anchor=self.anchor)
+                rt.append_entries(log, [{"k": 1}], self.fail, anchor=self.anchor)
+                moved = os.path.join(base, "c", "d", "b.jsonl")
+                self.assertTrue(rt.move_file(log, moved, self.anchor))
+                self.assertFalse(rt.move_file(log, moved, self.anchor))
+                with open(moved) as f:
+                    self.assertEqual(f.read(), '{"k": 1}\n')
+                # the anchor itself is created when missing
+                fresh = os.path.join(self.tmp, "new-slug%d" % fd_ops)
+                rt.open_for_append(os.path.join(fresh, "t.jsonl"), anchor=fresh,
+                                   create=True).close()
+                self.assertTrue(os.path.isfile(os.path.join(fresh, "t.jsonl")))

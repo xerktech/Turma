@@ -524,12 +524,53 @@ class DshDelegationTailTest(unittest.TestCase):
         self.assertFalse(os.path.exists(outside))
 
     def test_child_move_create_does_not_follow_a_dangling_link(self):
-        new = os.path.join(self.tmp, "moved", "agent-x.jsonl")
+        slug = os.path.dirname(self.transcript)
+        new = os.path.join(slug, "moved", "agent-x.jsonl")
         outside = os.path.join(self.tmp, "created-through-link")
         os.makedirs(os.path.dirname(new))
         os.symlink(outside, new)
-        self.tail._move_child_file(os.path.join(self.tmp, "absent.jsonl"), new)
+        self.tail._move_child_file(os.path.join(slug, "absent.jsonl"), new)
         self.assertFalse(os.path.exists(outside))
+
+    def test_workflow_record_never_written_through_a_symlinked_parent_dir(self):
+        # XERK-2570: `<stem>/workflows` replaced by a symlink to an outside dir
+        # holding `wf_<id>.json` — the outside file must stay untouched (the
+        # write is refused, never redirected), and so must the journal's dir.
+        run = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        claude_run = ds.workflow_run_id(run)
+        stem = self.transcript[:-len(".jsonl")]
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(os.path.join(outside, claude_run))
+        victim = os.path.join(outside, claude_run + ".json")
+        jvictim = os.path.join(outside, claude_run, "journal.jsonl")
+        for v in (victim, jvictim):
+            with open(v, "w") as f:
+                f.write("untouched")
+        os.makedirs(stem, exist_ok=True)
+        os.symlink(outside, os.path.join(stem, "workflows"))
+        os.symlink(outside, os.path.join(stem, "subagents"))
+        self._parent([
+            {"type": "tool-workflow/run-start", "seq": 2, "time": 1000,
+             "data": {"runId": run, "name": "review"}},
+        ])
+        self.tail._pump()
+        for v in (victim, jvictim):
+            with open(v) as f:
+                self.assertEqual(f.read(), "untouched", v)
+        self.assertEqual(sorted(os.listdir(outside)), sorted([claude_run, claude_run + ".json"]))
+
+    def test_child_transcript_never_created_through_a_symlinked_parent_dir(self):
+        # XERK-2570: the child dest's `subagents/` dir planted as a link.
+        stem = self.transcript[:-len(".jsonl")]
+        outside = os.path.join(self.tmp, "outside-sub")
+        os.makedirs(outside)
+        os.makedirs(stem, exist_ok=True)
+        os.symlink(outside, os.path.join(stem, "subagents"))
+        self.tail._ensure_child_file(os.path.join(stem, "subagents", "agent-c.jsonl"))
+        self.tail._move_child_file(os.path.join(stem, "absent.jsonl"),
+                                   os.path.join(stem, "subagents", "workflows",
+                                                "wf_x", "agent-c.jsonl"))
+        self.assertEqual(os.listdir(outside), [])
 
     def test_workflow_agent_is_not_a_top_level_subagent_row(self):
         # A workflow agent reaches the tail through the subagent seam too, so the
