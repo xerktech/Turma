@@ -294,9 +294,11 @@ test("XERK-2532: an operator's disable is never lifted by a login", async () => 
   await driveCallback([USER_GROUP], { sub: "op-disabled-1" });
   const u = userBySub("op-disabled-1");
   hub.__setTenancy(tenancy.updateUser(hub.tenancyState(), u.id, { disabled: true }).state);
+  const lastLogin = userBySub("op-disabled-1").lastLoginAt;
   const again = await driveCallback([USER_GROUP], { sub: "op-disabled-1" });
   assert.equal(again.res.headers.location, "/login?error=forbidden");
   assert.equal(userBySub("op-disabled-1").disabled, true);
+  assert.equal(userBySub("op-disabled-1").lastLoginAt, lastLogin, "a refused login is not a login");
   // Re-stating an IdP disable as the operator's makes it the operator's too.
   await driveCallback([USER_GROUP], { sub: "op-disabled-2" });
   await driveCallback([], { sub: "op-disabled-2" });
