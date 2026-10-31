@@ -1632,3 +1632,15 @@ test("XERK-1450: two entries differing only by a NUL converge (the re-seat compa
     assert.equal(await archive.reseatIndexFromFiles([{ transcriptId: "t-nul2", msgCount: 2, n: 2, u: 1 }]), 0);
   } finally { pgTeardown(); }
 });
+
+test("XERK-2534: buildList/buildSearch carry the tenant scope as a bound parameter", () => {
+  const t = "c".repeat(32);
+  const l = buildList("archive", { scope: { tenant: t, untenanted: true }, limit: 5 });
+  assert.match(l.text, /host !~ '@\[0-9a-f\]\{32\}\$' OR host LIKE \$1/);
+  assert.deepEqual(l.params.slice(0, 1), [`%@${t}`]);
+  assert.match(buildList("archive", { scope: { tenant: null, untenanted: false } }).text, /WHERE FALSE/);
+  assert.doesNotMatch(buildList("archive", {}).text, /WHERE/);
+  const s = buildSearch("archive", "q:*", { scope: { tenant: t, untenanted: false } });
+  assert.match(s.text, /s\.host LIKE \$2/);
+  assert.equal(s.params[1], `%@${t}`);
+});
