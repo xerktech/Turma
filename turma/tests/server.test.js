@@ -28787,3 +28787,277 @@ test("XERK-2510: a create whose host goes silent fails in honest words; an agent
     ({ ...i, review: { state: "rejected", at: 1 } })) }).items.length, 3);
   cleanup2508(S, ["mtFail2510"]);
 });
+
+// ---- XERK-2550: usage, ledgers and insights partitioned by tenant -------------
+
+const retiredBeat2550 = (device, n) => {
+  const b = { input: n, output: 0, cacheWrite: 0, cacheRead: 0 };
+  const day = new Date().toISOString().slice(0, 10);
+  const u = { totals: b, today: b, week: b, days: { [day]: b }, sessions: 1, models: [] };
+  return { device, jira: { siteKey: "acme.atlassian.net" }, usage: u, repoUsage: [] };
+};
+
+test("XERK-2550: /api/agents serves each principal its own retired usage and routing policy", async () => {
+  const T = tenants2533();
+  const keys = [`ret2550@${T.A.t}`, `ret2550@${T.B.t}`, "ret2550ops", `ret2550@${T.C.t}`];
+  try {
+    hub.usageLedger.ingest(keys[3], retiredBeat2550("ret2550", 44));
+    hub.usageLedger.ingest(keys[0], retiredBeat2550("ret2550", 11));
+    hub.usageLedger.ingest(keys[1], retiredBeat2550("ret2550", 22));
+    hub.usageLedger.ingest(keys[2], retiredBeat2550("ret2550ops", 33));
+    hub.__setModelPolicyState({ [`${T.A.t}:bug/sonnet`]: { state: "promoted", at: 1 } });
+    invalidateAgentsCache();
+    const mine = (r) => r.body.retiredUsage.filter((x) => keys.includes(x.key)).map((x) => x.key);
+    const a = await request("GET", "/api/agents", { headers: T.A.h });
+    const b = await request("GET", "/api/agents", { headers: T.B.h });
+    const ops = await request("GET", "/api/agents", { headers: userHeaders });
+    assert.deepEqual(mine(a), [keys[0]]);
+    assert.deepEqual(mine(b), [keys[1]]);
+    assert.deepEqual(mine(ops), [keys[2]]);
+    // A tenant user who is ALSO an admin reads its own tenant alone — never its
+    // tenant mixed with the untenanted fleet it may drive (QA, XERK-2550).
+    const c = await request("GET", "/api/agents", { headers: T.C.h });
+    assert.deepEqual(mine(c), [keys[3]]);
+    assert.deepEqual(c.body.modelPolicy.promoted, {});
+    assert.deepEqual(a.body.modelPolicy.promoted, { bug: "sonnet" });
+    assert.deepEqual(b.body.modelPolicy.promoted, {});
+    assert.deepEqual(ops.body.modelPolicy.promoted, {});
+    // One shared fleet body; only the tail differs, so each scope revalidates on its own ETag.
+    assert.notEqual(a.headers.etag, b.headers.etag);
+    assert.notEqual(a.headers.etag, ops.headers.etag);
+    const again = await request("GET", "/api/agents", { headers: { ...T.A.h, "if-none-match": a.headers.etag } });
+    assert.equal(again.status, 304);
+    const cross = await request("GET", "/api/agents", { headers: { ...T.B.h, "if-none-match": a.headers.etag } });
+    assert.equal(cross.status, 200);
+    assert.deepEqual(a.body.agents, ops.body.agents);   // listing scoping is XERK-2534's
+  } finally {
+    for (const k of keys) hub.usageLedger.forget(k);
+    hub.__setModelPolicyState({});
+    T.restore();
+  }
+});
+
+test("XERK-2550: /api/permissions and /api/model-quality read only the caller's scope", async () => {
+  const T = tenants2533();
+  hub.permissionLedger._internals.reset();
+  hub.outcomeLedger._internals.reset();
+  try {
+    const now = Date.now();
+    const row = (id) => ({ id, kind: "dialog", dialogKind: "permission", tool: "Bash", head: "npm test",
+      openedAt: now - 60000, closedAt: now, waitedMs: 60000, answer: "allow", via: "terminal" });
+    hub.permissionLedger.ingest(`p2550@${T.A.t}`, [row("1")], now);
+    hub.permissionLedger.ingest(`p2550@${T.B.t}`, [row("1"), row("2")], now);
+    hub.permissionLedger.ingest("p2550ops", [row("1"), row("2"), row("3")], now);
+    hub.permissionLedger.ingest(`p2550@${T.C.t}`, [row("1"), row("2"), row("3"), row("4")], now);
+    const count = async (h) => {
+      const r = await request("GET", "/api/permissions", { headers: h });
+      return r.body.top.length ? r.body.top[0].count : 0;
+    };
+    assert.equal(await count(T.A.h), 1);
+    assert.equal(await count(T.B.h), 2);
+    assert.equal(await count(userHeaders), 3);
+    assert.equal(await count(T.C.h), 4, "admin + user: its tenant only, never 3 + 4");
+    const rows = hub.outcomeLedger._internals.rows();
+    for (const [host, n] of [[`q2550@${T.A.t}`, 1], [`q2550@${T.B.t}`, 2], ["q2550ops", 4]]) {
+      for (let i = 0; i < n; i++) {
+        const r = hub.outcomeLedger.sanitizeRow({ site: "acme.atlassian.net", issue: `Q-${i}`, host,
+          sid: `q${i}`, cls: "bug", model: "opus", firstSeen: now, updatedAt: now });
+        rows.set(r.key, r);
+      }
+    }
+    const sessions = async (h) => {
+      const r = await request("GET", "/api/model-quality?org=acme.atlassian.net&rows=1", { headers: h });
+      return [r.body.groups.reduce((s, g) => s + g.sessions, 0), (r.body.rows || []).map((x) => x.host)];
+    };
+    assert.deepEqual(await sessions(T.A.h), [1, [`q2550@${T.A.t}`]]);
+    const [nb, hb] = await sessions(T.B.h);
+    assert.equal(nb, 2);
+    assert.ok(hb.every((h) => h === `q2550@${T.B.t}`));
+    assert.equal((await sessions(userHeaders))[0], 4);
+    // /metrics (unauthenticated) counts the untenanted fleet only.
+    const m = await request("GET", "/metrics");
+    assert.match(m.raw, /turma_permission_prompts\{kind="dialog"\} 3\n/);
+    assert.match(m.raw, /turma_model_outcomes\{class="bug",model="opus",outcome="pending"\} 4\n/);
+  } finally {
+    hub.permissionLedger._internals.reset();
+    hub.outcomeLedger._internals.reset();
+    T.restore();
+  }
+});
+
+test("XERK-2550: the routing policy promotes and routes per tenant, never on another's evidence", () => {
+  const TA = "a".repeat(32), TB = "b".repeat(32);
+  resetPolicy();
+  try {
+    const rows = hub.outcomeLedger._internals.rows();
+    // 40 good sonnet pairs in tenant A only; tenant B has 39 and a bad untenanted fleet.
+    const seed = (host, n, verdict) => {
+      for (let i = 0; i < n; i++) {
+        const id = `t${++policySeq}`, at = Date.now() - 1000;
+        const live = hub.outcomeLedger.sanitizeRow({ site: "s.atlassian.net", issue: `T-${policySeq}`,
+          host, sid: id, cls: "bug", model: "opus", firstSeen: at, updatedAt: at, startedAt: at,
+          prs: [{ url: `https://github.com/x/y/pull/7${policySeq}`, state: "MERGED", mergedAt: at }] });
+        rows.set(live.key, live);
+        const sh = hub.outcomeLedger.sanitizeRow({ site: "s.atlassian.net", issue: `T-${policySeq}`,
+          host, sid: `sh-${id}`, cls: "bug", model: "sonnet", firstSeen: at, updatedAt: at,
+          kind: "shadow", pairOf: live.key, shadowState: "graded", grade: { verdict } });
+        rows.set(sh.key, sh);
+      }
+    };
+    seed(`pa@${TA}`, 40, "good");
+    seed(`pb@${TB}`, 39, "good");
+    seed("pops", 40, "bad");
+    hub.modelPolicySweep();
+    const st = hub.__modelPolicyState();
+    assert.equal(st[`${TA}:bug/sonnet`].state, "promoted");
+    assert.ok(!st[`${TB}:bug/sonnet`], "39 pairs in B: A's evidence never tops it up");
+    assert.ok(!st["bug/sonnet"], "the untenanted fleet's own pairs are all bad");
+    assert.deepEqual(hub.modelPolicyPayload(TA).promoted, { bug: "sonnet" });
+    assert.deepEqual(hub.modelPolicyPayload("").promoted, {});
+    hub.__setModelPolicy("on");
+    const site = "pol2550.atlassian.net";
+    const r = new Map([[`${site}\u0000ENG-5`, { row: { type: "Bug" } }]]);
+    assert.equal(hub.modelPolicyPick(site, "ENG-5", r, TA), "sonnet");
+    assert.equal(hub.modelPolicyPick(site, "ENG-5", r, TB), null);
+    assert.equal(hub.modelPolicyPick(site, "ENG-5", r), null);
+    // The persisted key survives the coerce; a malformed tenant prefix does not.
+    hub.__setModelPolicyState({ [`${TA}:bug/sonnet`]: { state: "promoted", at: 1 },
+      ["xyz:bug/sonnet"]: { state: "promoted", at: 1 } });
+    assert.deepEqual(Object.keys(hub.__modelPolicyState()), [`${TA}:bug/sonnet`]);
+  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
+});
+
+test("XERK-2550: a tenant's demotion is never pushed to the fleet's devices", () => {
+  const TA = "a".repeat(32);
+  resetPolicy();
+  hub.__setModelPolicy("on");
+  const before = notifications.length;
+  try {
+    const at = Date.now() - 120000;
+    hub.__setModelPolicyState({ [`${TA}:bug/sonnet`]: { state: "promoted", at } });
+    const rows = hub.outcomeLedger._internals.rows();
+    for (let i = 0; i < 3; i++) {
+      const r = hub.outcomeLedger.sanitizeRow({ site: "s", issue: `D-${i}`, host: `d2550@${TA}`,
+        sid: `d${i}`, cls: "bug", model: "sonnet", firstSeen: at + 5, updatedAt: at + 5, startedAt: at + 5,
+        prs: [{ url: `https://github.com/x/y/pull/55${i}`, state: "CLOSED", mergedAt: at + 5 }] });
+      rows.set(r.key, r);
+    }
+    hub.modelPolicySweep();
+    assert.equal(hub.__modelPolicyState()[`${TA}:bug/sonnet`].state, "demoted");
+    assert.ok(!notifications.slice(before).some((x) => x.data && /model-demoted/.test(x.data.notifKey || "")),
+      "no push until push is tenant-routed (XERK-2551)");
+  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
+});
+
+test("XERK-2550: a bus frame with a malformed scope is dropped, never delivered unscoped", () => {
+  const handlers = [];
+  const store = { subscribe(_c, fn) { handlers.push(fn); }, publish() { return Promise.resolve(); } };
+  const got = [];
+  hub.makeSseBus(store, "me", (e, d, s) => got.push([e, s]));
+  handlers[0]({ origin: "peer", event: "modelPolicy", data: {}, policyTenant: 5 });
+  handlers[0]({ origin: "peer", event: "modelPolicy", data: {}, policyTenant: "" });
+  handlers[0]({ origin: "peer", event: "agent", data: {} });
+  assert.deepEqual(got, [["modelPolicy", { policyTenant: "" }], ["agent", undefined]]);
+});
+
+test("XERK-2550: a routing-policy frame reaches only clients reading that tenant's policy", () => {
+  const T = tenants2533();
+  const wrote = (res) => res.frames.filter((f) => f.startsWith("event: modelPolicy")).length;
+  const mk = () => ({ frames: [], write(f) { this.frames.push(f); } });
+  const ra = mk(), rb = mk(), rops = mk();
+  try {
+    const pa = hub.principalFromToken(hub.issueSessionToken(60_000, { u: T.A.user.id, t: T.A.t, r: ["user"] }));
+    const pb = hub.principalFromToken(hub.issueSessionToken(60_000, { u: T.B.user.id, t: T.B.t, r: ["user"] }));
+    hub.ssePrincipals.set(ra, pa);
+    hub.ssePrincipals.set(rb, pb);
+    hub.ssePrincipals.set(rops, { kind: "breakglass", userId: null, tenantId: null, roles: ["admin"] });
+    for (const r of [ra, rb, rops]) hub.sseClients.add(r);
+    hub.sseDeliverLocal("modelPolicy", { mode: "observe", promoted: {} }, { policyTenant: T.A.t });
+    assert.deepEqual([wrote(ra), wrote(rb), wrote(rops)], [1, 0, 0]);
+    // A principal with no ledger scope at all gets no scoped frame.
+    const rnone = mk();
+    hub.ssePrincipals.set(rnone, { kind: "user", tenantId: "nothex", roles: ["user"] });
+    hub.sseClients.add(rnone);
+    hub.sseDeliverLocal("modelPolicy", { mode: "observe", promoted: {} }, { policyTenant: "" });
+    assert.deepEqual([wrote(ra), wrote(rb), wrote(rops), wrote(rnone)], [1, 0, 1, 0]);
+    hub.sseClients.delete(rnone);
+    hub.sseDeliverLocal("modelPolicy", { mode: "observe", promoted: {} });   // unscoped: everyone
+    assert.deepEqual([wrote(ra), wrote(rb), wrote(rops)], [2, 1, 2]);
+  } finally {
+    for (const r of [ra, rb, rops]) hub.sseClients.delete(r);
+    T.restore();
+  }
+});
+
+test("XERK-2550: a shadow runs only on a host of the live row's tenant; a pause never crosses one", () => {
+  const TA = "a".repeat(32), TB = "b".repeat(32);
+  const site = "sh2550.atlassian.net";
+  const now = Date.now();
+  const host = (key) => {
+    agents[key] = { device: key.split("@")[0], lastSeen: now, orgBound: site,
+      jira: { siteKey: site }, modelShadow: { available: true, free: 1 },
+      repos: [{ name: "Turma" }], capacity: { free: 2, max: 2 }, commands: [],
+      subscription: { key: "acct-1" } };
+  };
+  const ka = `sh2550@${TA}`, kb = `sh2550@${TB}`;
+  try {
+    host(kb);
+    assert.equal(hub.shadowHostFor(site, "Turma", new Set(), now, TA), null);
+    host(ka);
+    assert.equal(hub.shadowHostFor(site, "Turma", new Set(), now, TA), ka);
+    assert.equal(hub.shadowHostFor(site, "Turma", new Set(), now, ""), null);
+    // One Claude account shared across tenants is two pools here.
+    assert.notEqual(hub.subscriptionKeyOf(ka, agents[ka]), hub.subscriptionKeyOf(kb, agents[kb]));
+    assert.equal(hub.subscriptionKeyOf("plain", { subscription: { key: "acct-1" } }), "acct-1");
+    agents[kb].limits = { capturedAt: Math.floor(now / 1000),
+      fiveHour: { usedPct: 99, resetsAt: Math.floor(now / 1000) + 3600 } };
+    const paused = hub.pausedSubscriptions(now);
+    assert.ok(paused.has(hub.subscriptionKeyOf(kb, agents[kb])));
+    assert.ok(!paused.has(hub.subscriptionKeyOf(ka, agents[ka])));
+  } finally {
+    delete agents[ka];
+    delete agents[kb];
+  }
+});
+
+test("XERK-2550: purgeTenantData removes the tenant's ledger rows and policy, nothing else", () => {
+  const TA = "a".repeat(32), TB = "b".repeat(32);
+  hub.permissionLedger._internals.reset();
+  hub.outcomeLedger._internals.reset();
+  const now = Date.now();
+  try {
+    hub.usageLedger.ingest(`u2550@${TA}`, retiredBeat2550("u2550", 1));
+    hub.usageLedger.ingest(`u2550@${TB}`, retiredBeat2550("u2550", 2));
+    hub.permissionLedger.ingest(`u2550@${TA}`, [{ id: "1", kind: "dialog", openedAt: now - 1 }], now);
+    hub.permissionLedger.ingest(`u2550@${TB}`, [{ id: "1", kind: "dialog", openedAt: now - 1 }], now);
+    for (const h of [`u2550@${TA}`, `u2550@${TB}`]) {
+      const r = hub.outcomeLedger.sanitizeRow({ site: "s", issue: "E-1", host: h, sid: "s1",
+        cls: "bug", model: "opus", firstSeen: now, updatedAt: now });
+      hub.outcomeLedger._internals.rows().set(r.key, r);
+    }
+    hub.__setModelPolicyState({ [`${TA}:bug/sonnet`]: { state: "promoted", at: 1 },
+      [`${TB}:bug/sonnet`]: { state: "promoted", at: 1 }, "bug/haiku": { state: "promoted", at: 1 } });
+    assert.throws(() => hub.purgeTenantData(""), /tenant id/);
+    const out = hub.purgeTenantData(TA);
+    assert.deepEqual(out.usageLedger, { hosts: 1 });
+    assert.deepEqual(out.permissionLedger, { hosts: 1 });
+    assert.deepEqual(out.outcomeLedger, { rows: 1 });
+    assert.deepEqual(out.modelPolicy, { entries: 1 });
+    assert.ok(!hub.usageLedger.has(`u2550@${TA}`) && hub.usageLedger.has(`u2550@${TB}`));
+    assert.deepEqual([...hub.permissionLedger._internals.hosts().keys()], [`u2550@${TB}`]);
+    assert.deepEqual([...hub.outcomeLedger._internals.rows().values()].map((r) => r.host), [`u2550@${TB}`]);
+    assert.deepEqual(Object.keys(hub.__modelPolicyState()).sort(), [`${TB}:bug/sonnet`, "bug/haiku"].sort());
+    // A throwing store never stops the rest.
+    hub.registerTenantPurge("broken2550", () => { throw new Error("boom"); });
+    const again = hub.purgeTenantData(TB);
+    assert.match(again.broken2550.error, /boom/);
+    assert.deepEqual(again.usageLedger, { hosts: 1 });
+  } finally {
+    hub.registerTenantPurge("broken2550", () => ({}));
+    hub.usageLedger.forget(`u2550@${TA}`);
+    hub.usageLedger.forget(`u2550@${TB}`);
+    hub.permissionLedger._internals.reset();
+    hub.outcomeLedger._internals.reset();
+    hub.__setModelPolicyState({});
+  }
+});

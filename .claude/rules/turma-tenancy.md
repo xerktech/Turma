@@ -171,6 +171,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   and is dropped at delivery unless it matches the key's tenant — a command queued before a bind is
   never run inside the tenant. Untenanted hosts' commands carry no stamp (byte-identical).
 - `coerceAgentIdentities` drops an entry whose home is a tenant key with a missing/different tenant.
+- **Ledgers, insights, routing and usage read their tenant off that key** (XERK-2550): no
+  aggregate spans two tenants, and `purgeTenantData` is the tenant purge. `turma-tenancy-ledgers.md`.
 
 ## Tests
 

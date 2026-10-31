@@ -153,6 +153,9 @@ paths:
   - The web page **re-polls on the SSE `removed` event** (`retiredUsage` has no SSE event of its own,
     and the 30s poll is skipped while the stream is healthy). Appended AFTER `TurmaOrg.update(data)`
     so a retired host can't resurrect an org in the header menu.
+- **`retiredUsage` is the CALLER's scope** (XERK-2550): a per-principal tail of `/api/agents`,
+  filtered before the serve budget; alias/case-twin folds never cross tenants. Rules:
+  `turma-tenancy-ledgers.md`.
 - **Removing a host is not a purge** — `DELETE /api/agents/<host>` keeps history
   (`usagePurged:false`); `?usage=purge` is the deliberate, irreversible second step.
 

@@ -22,6 +22,8 @@
 
 "use strict";
 
+const { tenantOfHostKey } = require("./tenancy.js");
+
 const fs = require("fs");
 const path = require("path");
 
@@ -365,6 +367,18 @@ function sanitizeDefectReports(list) {
   return out;
 }
 
+// A row's tenant is its host key's (XERK-2550): every row, live or shadow, is
+// keyed by the registry key of the host that ran it, which carries the tenant.
+function rowTenant(r) {
+  return tenantOfHostKey(r && r.host);
+}
+// A row in a read's scope: `visible` (a host-key predicate) or every row.
+// A shadow row also needs its live row's host in scope — a pair never spans two
+// scopes, so one tenant's shadow evidence never grades another's work.
+function inScope(r, visible) {
+  return !visible || visible(r.host);
+}
+
 function rowKey(site, issue, host, sid) {
   return JSON.stringify([site, issue, host, sid]);
 }
@@ -555,6 +569,10 @@ function attributeDefects(entries, now = Date.now(), windowDays = WINDOW_DAYS) {
   const changed = new Map();
   for (const e of entries) {
     if (!e || typeof e.site !== "string" || !e.site) continue;
+    // The reporting host's tenant (XERK-2550): two tenants may work one org, and
+    // a host must never mark the other tenant's rows. Absent = an older caller,
+    // which only ever ran untenanted.
+    const tenant = typeof e.tenant === "string" ? e.tenant : "";
     for (const rep of sanitizeDefectReports(e.reports)) {
       const fixPrs = new Set(rep.fixPrs);
       for (const intro of rep.introducers) {
@@ -562,7 +580,7 @@ function attributeDefects(entries, now = Date.now(), windowDays = WINDOW_DAYS) {
         for (const u of intro.prs) hits.push(...(byUrl.get(u) || []));
         for (const { r, p } of hits) {
           const cur = rows.get(r.key);
-          if (!cur || cur.site !== e.site) continue;
+          if (!cur || cur.site !== e.site || rowTenant(cur) !== tenant) continue;
           if ((cur.prs || []).some((x) => fixPrs.has(x.url) || x.mergeCommit === rep.fix)) continue;
           const mergedAt = p.mergedAt || cur.updatedAt;
           if (rep.at < mergedAt || rep.at - mergedAt > windowDays * DAY_MS) continue;
@@ -594,7 +612,7 @@ function shadowCandidates({ now = Date.now(), maxAgeMs = 0 } = {}) {
     const mergedAt = pr.mergedAt || r.updatedAt;
     if (maxAgeMs && now - mergedAt > maxAgeMs) continue;
     out.push({
-      key: r.key, site: r.site, issue: r.issue, host: r.host, repo: r.repo, cls: r.cls,
+      key: r.key, site: r.site, issue: r.issue, host: r.host, tenant: rowTenant(r), repo: r.repo, cls: r.cls,
       model: r.model, mergeSha: pr.mergeCommit, prUrl: pr.url, mergedAt,
       startedAt: r.startedAt || r.firstSeen,
     });
@@ -619,12 +637,13 @@ function decideShadow(key, decision, now = Date.now()) {
 const SHADOW_LOST_MS = 60 * 60 * 1000;
 
 /** Shadows dispatched at or after `since` (the daily cap's count). */
-function shadowsDispatchedSince(since, now = Date.now()) {
+function shadowsDispatchedSince(since, now = Date.now(), visible = null) {
   const reported = new Set();
   for (const r of rows.values()) if (r.kind === "shadow") reported.add(r.sid);
   let n = 0;
   for (const r of rows.values()) {
     if (!r.shadow || !r.shadow.sampled || r.shadow.at < since) continue;
+    if (!inScope(r, visible)) continue;
     if (!reported.has(r.shadow.id) && now - r.shadow.at > SHADOW_LOST_MS) continue;
     n += 1;
   }
@@ -794,7 +813,9 @@ function evict(now = Date.now(), sweep = null) {
   }
   const bySite = new Map();         // site -> {units (next victim last), n rows}
   for (const u of units.values()) {
-    const site = u.head.site;
+    // One org worked by two tenants is two orgs here (XERK-2550): the busiest
+    // (tenant, org) loses first, so one tenant's churn never evicts another's.
+    const site = `${rowTenant(u.head)}\u0000${u.head.site}`;
     if (!bySite.has(site)) bySite.set(site, { units: [], n: 0 });
     const org = bySite.get(site);
     org.units.push(u);
@@ -887,11 +908,13 @@ function median(vals) {
  * The served view. Groups are fleet-wide per (class, model). `site` narrows the
  * served ROWS to one org (and only then are rows served at all).
  */
-function aggregate({ site = null, withRows = false, now = Date.now(), windowDays = WINDOW_DAYS } = {}) {
+function aggregate({ site = null, withRows = false, now = Date.now(), windowDays = WINDOW_DAYS,
+  visible = null } = {}) {
   const groups = new Map();
   const served = [];
   const shadows = [];
   for (const r of rows.values()) {
+    if (!inScope(r, visible)) continue;
     const { outcome, reason } = outcomeOf(r, now, windowDays);
     if (withRows && site && r.site === site && r.kind === "shadow") served.push({ ...r, outcome, reason });
     // Shadow rows never feed the live groups (ADR: they never merge).
@@ -923,7 +946,7 @@ function aggregate({ site = null, withRows = false, now = Date.now(), windowDays
     windowDays,
     groups: [...groups.values()].sort((a, b) => b.sessions - a.sessions
       || a.cls.localeCompare(b.cls) || a.model.localeCompare(b.model)),
-    pairs: pairsOf(shadows, now, windowDays),
+    pairs: pairsOf(shadows, now, windowDays, visible),
   };
   // The XERK-1849 report reads the paired evidence per group, as `shadow`. A
   // candidate that ran no live session still shows, as a zero-session group.
@@ -949,11 +972,11 @@ function aggregate({ site = null, withRows = false, now = Date.now(), windowDays
  * shadow row against the live row it re-ran. `mOnlyFail` = the shadow graded
  * bad while the live work is not bad — the promotion rule's numerator.
  */
-function pairsOf(shadows, now, windowDays) {
+function pairsOf(shadows, now, windowDays, visible = null) {
   const pairs = new Map();
   for (const r of shadows) {
     const live = r.pairOf ? rows.get(r.pairOf) : null;
-    if (!live) continue;
+    if (!live || !inScope(live, visible) || rowTenant(live) !== rowTenant(r)) continue;
     const gk = `${r.cls}\u0000${r.model}`;
     let p = pairs.get(gk);
     if (!p) {
@@ -1007,13 +1030,14 @@ function promotionPasses(graded, mOnlyFail, { minPairs = 40, maxRate = 0.05, max
  * these — never on count deltas, which fall when rows are evicted or a live row
  * later goes bad.
  */
-function pairEvidence(cls, model, { since = 0, now = Date.now(), windowDays = WINDOW_DAYS } = {}) {
+function pairEvidence(cls, model, { since = 0, now = Date.now(), windowDays = WINDOW_DAYS,
+  visible = null } = {}) {
   let graded = 0, mOnlyFail = 0;
   for (const r of rows.values()) {
     if (r.kind !== "shadow" || r.cls !== cls || r.model !== model || !r.grade) continue;
-    if ((r.grade.at || r.updatedAt) < since) continue;
+    if ((r.grade.at || r.updatedAt) < since || !inScope(r, visible)) continue;
     const live = r.pairOf ? rows.get(r.pairOf) : null;
-    if (!live) continue;
+    if (!live || !inScope(live, visible) || rowTenant(live) !== rowTenant(r)) continue;
     graded += 1;
     if (r.grade.verdict !== "good" && outcomeOf(live, now, windowDays).outcome !== "bad") mOnlyFail += 1;
   }
@@ -1027,10 +1051,11 @@ function pairEvidence(cls, model, { since = 0, now = Date.now(), windowDays = WI
  * read as all-bad just because `good` needs the whole window to elapse; the Opus
  * baseline is read the same way.
  */
-function liveRate(cls, model, { since = 0, now = Date.now(), windowDays = WINDOW_DAYS } = {}) {
+function liveRate(cls, model, { since = 0, now = Date.now(), windowDays = WINDOW_DAYS,
+  visible = null } = {}) {
   let bad = 0, n = 0;
   for (const r of rows.values()) {
-    if (r.kind === "shadow" || r.cls !== cls || r.model !== model) continue;
+    if (r.kind === "shadow" || r.cls !== cls || r.model !== model || !inScope(r, visible)) continue;
     // Strictly after: work started in the promotion's own millisecond was not
     // routed by it. The agent stamps createdAt in whole seconds, so a whole-second
     // start reads as the end of its second — else work started later in the
@@ -1045,12 +1070,12 @@ function liveRate(cls, model, { since = 0, now = Date.now(), windowDays = WINDOW
 }
 
 /** Per (class, model, outcome) counts for /metrics (no host, ticket or session). */
-function metricsText(now = Date.now()) {
+function metricsText(now = Date.now(), visible = null) {
   // Bounded label sets: models outside the known families read "other", and only
   // the largest METRIC_CLASSES_MAX classes keep their name.
   const merged = new Map();
   // Live sessions only: a candidate's zero-session shadow-evidence group has no outcome.
-  const raw = aggregate({ now }).groups.filter((g) => g.sessions > 0);
+  const raw = aggregate({ now, visible }).groups.filter((g) => g.sessions > 0);
   const classTotals = new Map();
   for (const g of raw) classTotals.set(g.cls, (classTotals.get(g.cls) || 0) + g.sessions);
   const keep = new Set([...classTotals].sort((a, b) => b[1] - a[1]).slice(0, METRIC_CLASSES_MAX)
@@ -1071,6 +1096,30 @@ function metricsText(now = Date.now()) {
     }
   }
   return out;
+}
+
+/** Every tenant id with a row here ("" = untenanted hosts) — the routing sweep's scopes. */
+function tenants() {
+  const out = new Set();
+  for (const r of rows.values()) out.add(rowTenant(r));
+  return out;
+}
+
+/**
+ * Drop every row a host of tenant `tenantId` ran (XERK-2550, the tenant purge),
+ * live and shadow alike; Postgres deletes them by key. Returns the keys dropped.
+ * An empty/invalid id purges nothing.
+ */
+function purgeTenant(tenantId) {
+  if (typeof tenantId !== "string" || !/^[0-9a-f]{32}$/.test(tenantId)) return [];
+  const gone = [];
+  for (const r of rows.values()) if (rowTenant(r) === tenantId) gone.push(r.key);
+  for (const k of gone) rows.delete(k);
+  if (gone.length) {
+    if (backend.onDelete) backend.onDelete(gone);
+    else backend.onChange([]);
+  }
+  return gone;
 }
 
 // ---- the file backend (non-HA) ---------------------------------------------------
@@ -1351,7 +1400,7 @@ function flush(done) { backend.flush(done); }
 load();
 
 module.exports = {
-  observe, attributeDefects, sanitizeDefectReports, aggregate, outcomeOf, metricsText, workClass, modelFamily, sanitizeRow,
+  observe, attributeDefects, sanitizeDefectReports, aggregate, tenants, purgeTenant, rowTenant, outcomeOf, metricsText, workClass, modelFamily, sanitizeRow,
   shadowCandidates, decideShadow, shadowsDispatchedSince, observeShadows, SHADOW_ID_RE,
   wilson, promotionPasses, liveRate, pairEvidence,
   configure, rehydrate, flush,
