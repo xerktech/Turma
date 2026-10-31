@@ -29,9 +29,11 @@ beat, XERK-395), so nothing here raises: every OSError is logged and the next po
 retries.
 """
 
+import errno
 import json
 import math
 import os
+import stat
 import sys
 
 # Make this module importable as a sibling both under hub-agent.py and when a tail
@@ -102,13 +104,43 @@ def open_fresh_for_write(path):
     name: a link re-planted between the unlink and the open makes O_EXCL fail
     (EEXIST) rather than be followed. Returns a text-mode file object; raises
     OSError like `open` does."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     try:
         os.unlink(path)
     except FileNotFoundError:
         pass
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0), 0o600)
+    except PermissionError:
+        # Windows refuses to unlink a file another process holds open without
+        # FILE_SHARE_DELETE (a reader mid-read). There O_NOFOLLOW is a no-op
+        # anyway, so truncate in place exactly as a plain open would have.
+        if os.name != "nt":
+            raise
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(path, flags | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_BINARY", 0), 0o600)
     return os.fdopen(fd, "w", encoding="utf-8")
+
+
+def open_for_append(path, binary=False):
+    """Open `path` to APPEND, creating it if absent, without ever writing
+    through a link planted at the name (XERK-2564): O_NOFOLLOW refuses a
+    symlink (ELOOP), and a file that is not a regular single-link file (a
+    hardlink to something else, a FIFO) is refused too. Raises OSError, so a
+    caller's existing `except OSError` logs it and the next poll retries."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                 | getattr(os, "O_BINARY", 0), 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+            raise OSError(errno.EPERM, "refusing to append to a linked or "
+                          "non-regular file", path)
+    except BaseException:
+        os.close(fd)
+        raise
+    if binary:
+        return os.fdopen(fd, "ab")
+    return os.fdopen(fd, "a", encoding="utf-8")
 
 
 def write_text_replace(path, text):
@@ -121,7 +153,7 @@ def write_text_replace(path, text):
         with open_fresh_for_write(tmp) as fh:
             fh.write(text)
         os.replace(tmp, path)
-    except OSError:
+    except BaseException:           # incl. UnicodeEncodeError: never leak the tmp
         try:
             os.unlink(tmp)
         except OSError:
@@ -137,7 +169,7 @@ def ensure_transcript_file(path, log, what="transcript"):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         if not os.path.exists(path):
-            open(path, "a", encoding="utf-8").close()
+            open_for_append(path).close()
     except OSError as e:
         log(f"{what} create failed: {e}")
 
@@ -146,7 +178,7 @@ def append_entries(path, entries, log, what="projection"):
     """Append already-projected Claude-JSONL entry dicts to `path`, one per line,
     `ensure_ascii=False` (matching Claude Code). Never raises."""
     try:
-        with open(path, "a", encoding="utf-8") as fh:
+        with open_for_append(path) as fh:
             for e in entries:
                 fh.write(json.dumps(e, ensure_ascii=False) + "\n")
     except OSError as e:
@@ -190,7 +222,7 @@ class ChildProjection:
             self.partial = b""
             self.proj = self._make()
             try:
-                open(self.dest, "w").close()   # start the destination over too
+                open_fresh_for_write(self.dest).close()   # start the dest over too
             except OSError:
                 pass
         try:

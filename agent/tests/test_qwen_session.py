@@ -468,6 +468,23 @@ class QwenDelegationTailTest(unittest.TestCase):
         with open(os.path.join(self.FIXTURES, name)) as f:
             return json.load(f)
 
+    def test_reset_child_file_never_truncates_a_planted_link(self):
+        # XERK-2564: the child dest is session-writable; resetting it must
+        # replace a planted symlink or hardlink, never truncate its target.
+        os.makedirs(os.path.dirname(self.projected_child), exist_ok=True)
+        victim = os.path.join(self.tmp, "victim")
+        for plant in (os.symlink, os.link):
+            with open(victim, "w") as f:
+                f.write("untouched")
+            if os.path.lexists(self.projected_child):
+                os.unlink(self.projected_child)
+            plant(victim, self.projected_child)
+            self._tail()._reset_child_file(self.projected_child)
+            with open(victim) as f:
+                self.assertEqual(f.read(), "untouched", plant.__name__)
+            self.assertFalse(os.path.islink(self.projected_child))
+            self.assertEqual(os.path.getsize(self.projected_child), 0)
+
     def _tail(self):
         return qs.QwenProjectionTail(
             self.projects_root, self.transcript, self.sid,

@@ -144,9 +144,10 @@ plugin's control-socket `state` (running|idle).
 
 ## [E] (XERK-469) archive sync — the store-dir contract
 
-- **A tail writes a projected file only via `runtime_tail.open_fresh_for_write`/`write_text_replace`,
-  never a plain `open(path, "w")`** (XERK-2564): the store dirs are session-writable, so a
-  planted link would be written through. Tests: `FreshWriteTest`, the `*planted*` tail cases.
+- **A tail opens a projected file for writing only via `runtime_tail`'s `open_fresh_for_write`,
+  `write_text_replace` or `open_for_append`, never a plain `open(path, "w"/"a")`** (XERK-2564):
+  the store dirs are session-writable, so a planted link would be written through.
+  Tests: `FreshWriteTest`, the `*planted*` tail cases.
 - **The projection (`<slug>/<sid>.jsonl`) rides the RENDERED layer unchanged** — `_archive_manifest`
   enumerates every ledger slug's top-level `*.jsonl`. The native log (`<slug>/<sid>/dsh/...`) is
   nested, so it is NOT mistaken for a rendered transcript.

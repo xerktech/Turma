@@ -51,7 +51,7 @@ try:
     # keeps its own workflow re-home + records.
     from runtime_tail import (
         ChildProjection, append_entries, ensure_transcript_file, env_float, env_int,
-        write_text_replace,
+        open_for_append, write_text_replace,
     )
 except ImportError:  # pragma: no cover - only when run outside the agent dir
     DshProjector = None
@@ -467,7 +467,7 @@ class DshProjectionTail:
         try:
             os.makedirs(os.path.dirname(self.transcript_path), exist_ok=True)
             if not os.path.exists(self.transcript_path):
-                open(self.transcript_path, "a", encoding="utf-8").close()
+                open_for_append(self.transcript_path).close()
         except OSError as e:
             self._log(f"dsh projection: cannot create transcript: {e}")
         while not self._stop.is_set():
@@ -735,6 +735,6 @@ class DshProjectionTail:
             if os.path.exists(old):
                 os.replace(old, new)
             elif not os.path.exists(new):
-                open(new, "a", encoding="utf-8").close()
+                open_for_append(new).close()
         except OSError as e:
             self._log(f"dsh child transcript move failed: {e}")

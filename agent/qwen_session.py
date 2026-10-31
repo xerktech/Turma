@@ -55,7 +55,8 @@ try:
     # WHERE a child lands and the parent-pump / native-log mirror below are
     # qwen-specific.
     from runtime_tail import (
-        ChildProjection, append_entries, env_float, open_fresh_for_write,
+        ChildProjection, append_entries, env_float, open_for_append,
+        open_fresh_for_write,
     )
 except ImportError:  # pragma: no cover - only when run outside the agent dir
     QwenProjector = None
@@ -254,7 +255,7 @@ class QwenProjectionTail:
         try:
             os.makedirs(os.path.dirname(self.transcript_path), exist_ok=True)
             if not os.path.exists(self.transcript_path):
-                open(self.transcript_path, "a", encoding="utf-8").close()
+                open_for_append(self.transcript_path).close()
         except OSError as e:
             self._log(f"qwen projection: cannot create transcript: {e}")
         while not self._stop.is_set():
@@ -513,7 +514,7 @@ class QwenProjectionTail:
             os.makedirs(self._store_dir, exist_ok=True)
             copied = 0
             with open(events_path, "rb") as src, \
-                    open(self._raw_path, "ab") as dst:
+                    open_for_append(self._raw_path, binary=True) as dst:
                 src.seek(self._raw_offset)
                 while True:
                     # Bounded read: the one large-copy case is a pre-existing
