@@ -38,10 +38,13 @@
      warm accent so it reads as transient rather than dead (XERK-29). */
   .host-card.updating { opacity: 0.9; border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
   .host-card.collapsed { gap: 0; }
-  .host-top { display: flex; align-items: center; gap: 10px; }
+  /* Wraps (XERK-2589): the chips + Roll token/Restart + status otherwise take the
+     whole row and squeeze the name to one letter per line. The name keeps at least
+     240px and the actions wrap beneath it whenever they can't share the row. */
+  .host-top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
   /* The name + caret toggle the host card open/closed; keep the status chip out
      of the clickable area so tapping it doesn't collapse the card. */
-  .host-name { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
+  .host-name { display: flex; align-items: center; gap: 8px; flex: 1 1 240px; min-width: 0;
     cursor: pointer; background: none; border: 0; padding: 0; text-align: left; color: inherit; font: inherit; }
   .host-name .host-name-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
   .host-name h3 { font-size: 15px; margin: 0; font-weight: 600; word-break: break-all; }
@@ -56,6 +59,8 @@
   .host-name .host-ver { color: var(--muted); font-size: 12px; font-weight: 400; word-break: break-word; }
   .host-name .caret { color: var(--muted); font-size: 11px; flex-shrink: 0; transition: transform 0.15s; }
   .host-card.collapsed .host-name .caret { transform: rotate(-90deg); }
+  /* Phones: the name always takes its own row, actions beneath. */
+  @media (max-width: 560px) { .host-name { flex-basis: 100%; } }
   /* Claude subscription-login health chip (XERK-98) — only ever rendered when
      it needs action, so its presence alone flags a host that can't run. Red
      when the login has lapsed, amber when it's about to. */
