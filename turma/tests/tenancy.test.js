@@ -169,6 +169,11 @@ test("XERK-2530: first run created the bootstrap admin from env, hashed, with bo
   // Never again once a user exists.
   assert.equal(tenancy.bootstrapAdmin(hub.tenancyState(), { username: "other", password: "other-pass" }), null);
   assert.throws(() => tenancy.bootstrapAdmin({ users: {} }, { username: "x", password: "short" }), /8\+/);
+  // An OIDC user does not count: a passwordless OIDC hub closed with the pair still gets its admin.
+  const oidcOnly = tenancy.upsertOidcUser(tenancy.coerceTenancy({}), { iss: "i", sub: "s", idpRoles: ["user"] }).state;
+  const made = tenancy.bootstrapAdmin(oidcOnly, { username: "boot", password: "boot-pass-1" });
+  assert.ok(made, "bootstrap runs when only OIDC users exist");
+  assert.equal(Object.keys(made.state.users).length, 2);
 });
 
 // ---- login + principal ------------------------------------------------------

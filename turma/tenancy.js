@@ -282,11 +282,13 @@ function updateUser(state, id, patch) {
   return { state: { ...state, users }, user: next };
 }
 
-// First run: no users at all and the bootstrap pair set -> one local admin.
-// Returns null when there is nothing to do.
+// First run: no LOCAL account yet and the bootstrap pair set -> one local admin.
+// OIDC users do not count: a passwordless OIDC hub that an operator closes with
+// the bootstrap pair must still get its admin, or it admits nobody. Returns null
+// when there is nothing to do.
 function bootstrapAdmin(state, { username, password, now = Date.now() }) {
   if (!username || !password) return null;
-  if (Object.keys(state.users).length) return null;
+  if (Object.values(state.users).some((u) => u.source === "local")) return null;
   if (!USERNAME_RE.test(username)) throw new Error("TURMA_BOOTSTRAP_ADMIN_USER is not a valid username");
   if (!validPassword(password)) throw new Error(`TURMA_BOOTSTRAP_ADMIN_PASSWORD must be ${PASSWORD_MIN}+ characters`);
   return createLocalUser(state, {

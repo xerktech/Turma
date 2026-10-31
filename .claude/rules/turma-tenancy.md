@@ -68,7 +68,9 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 
 ## Bootstrap
 
-- `TURMA_BOOTSTRAP_ADMIN_USER`/`_PASSWORD` create one local admin ONLY when the store has no user.
+- `TURMA_BOOTSTRAP_ADMIN_USER`/`_PASSWORD` create one local admin ONLY when no LOCAL account exists
+  (OIDC users don't count — the pair is how an operator closes a passwordless OIDC hub, and skipping
+  it there admitted nobody). Boot ERRORs when no break-glass and no usable local account remain.
   Never reuse `TURMA_USER` for it (break-glass has no tenant by design).
 
 ## Tests

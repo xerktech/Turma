@@ -80,7 +80,7 @@ tenants, run by an admin panel.
 
 ### Bootstrap
 
-- First run with an empty store and `TURMA_BOOTSTRAP_ADMIN_USER` + `TURMA_BOOTSTRAP_ADMIN_PASSWORD`
+- First run with no local account and `TURMA_BOOTSTRAP_ADMIN_USER` + `TURMA_BOOTSTRAP_ADMIN_PASSWORD`
   set creates one local admin (groups `turma-users` + `turma-admins`), so a fresh install is
   administrable from a browser. It never runs again once any user exists.
 - **Not** a reuse of `TURMA_USER`: that is the break-glass credential, which deliberately has no
