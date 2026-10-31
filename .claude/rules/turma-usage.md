@@ -372,6 +372,9 @@ paths:
     (trimmed days fold into `pre`) → per-model breakdown (kept in full as `totals`) → smallest repos.
     Days alone are not always enough (a host with many repos/models/long names has little day-byte
     headroom).
+  - **Both ceilings pick the TENANT first** (XERK-2591, `fromBiggestTenant`): the count ceiling
+    drops the stalest host of the tenant with the most hosts, the byte ceiling the biggest host of
+    the tenant with the most bytes. File backend only (HA has neither eviction).
   - **The BYTE ceiling evicts the BIGGEST host; only the COUNT ceiling evicts the STALEST** —
     least-recently-seen is right for "too many hosts", wrong for "too many bytes" (it would destroy a
     small innocent host's history while the overflow-causing host stays).

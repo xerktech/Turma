@@ -28,6 +28,10 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
 - Bounds: `EVENTS_PER_BEAT` (200) per beat, `PERMISSION_LEDGER_HOST_MAX_ROWS` per host (a flooding
   host cannot evict the fleet), `PERMISSION_LEDGER_MAX_ROWS` (20000) store-wide, oldest-`openedAt`
   first; `PERMISSION_LEDGER_DAYS` (30) retention.
+- **Past the store's ceiling the TENANT holding the most pays first** (XERK-2591): bytes while the
+  byte budget is over, else rows; oldest row first within it. Plain oldest-first let one tenant's
+  busy hosts evict another tenant's rows. Untenanted hosts count as one tenant.
+  Tests: the `XERK-2591:` cases in `permission-ledger.test.js`.
 - A host also keeps at most a QUARTER of the byte budget, oldest first. The row share alone does not
   protect the fleet: the binding limit is bytes, and a host's row share of max-size rows fills most of
   it. Tests: `one host's max-size rows cannot push another host's rows out`.

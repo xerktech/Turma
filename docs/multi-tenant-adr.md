@@ -75,6 +75,17 @@ tenants, run by an admin panel.
   (`registerTenantPurge`), each in its own try/catch; the ledgers drop their hot rows and delete
   them in Postgres (usage by host, permission by `@<tenantId>` suffix, outcome by key).
 
+### Shared ledger ceilings, fair per tenant (XERK-2591)
+
+- The permission, usage and outcome ledgers keep ONE store-wide ceiling each, and evict from the
+  tenant holding the most (rows, bytes or hosts, by whichever ceiling is over) first; oldest/biggest
+  within it as before. A row's tenant is its host key's suffix (`tenancy.tenantOfHostKey`); an untenanted
+  host is one more tenant.
+- So a tenant at or under its even share never loses data while another is over it, and a lone
+  tenant can still use the whole store.
+- Rejected: a hard per-tenant quota (ceiling / tenants). It strands capacity whenever few tenants are
+  busy, and the count of tenants changes at runtime, so every quota would shift on each signup.
+
 ### Admin without a tenant: break-glass
 
 - The `TURMA_USER`/`TURMA_PASSWORD` break-glass login (XERK-595) stays, IdP-independent, and maps to

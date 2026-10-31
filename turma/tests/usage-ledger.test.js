@@ -410,6 +410,45 @@ test("a host is trimmed to its share of the store, keeping its all-time total", 
   assert.match(fresh.stderr, /over its .* share/);
 });
 
+test("XERK-2591: the byte ceiling drops the biggest host of the tenant holding the most bytes", () => {
+  // Tenant B's one host is the biggest single host; tenant A's two together outweigh
+  // it. Biggest-host-first alone dropped B's whole history for A's overflow.
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const fs = require("fs"), path = require("path");
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
+    process.env.USAGE_LEDGER_FILE = path.join(mkdtemp("turma-fair-"), "l.json");
+    process.env.USAGE_LEDGER_MAX = "90000";
+    process.env.USAGE_LEDGER_HOSTS = "3";          // share floors at 64 KiB: no trimming
+    process.env.USAGE_LEDGER_REPOS = "400";
+    const l = require(${JSON.stringify(path.join(__dirname, "..", "usage-ledger.js"))});
+    const b = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
+    const blk = () => ({ totals: b(5), today: b(0), week: b(5),
+      days: { "2026-08-18": b(5) }, sessions: 1, models: [] });
+    const rec = (dev, repos) => ({ device: dev, usage: blk(),
+      repoUsage: Array.from({ length: repos }, (_, i) =>
+        ({ repo: "r" + i, remoteKey: "rk" + i, remote: "", usage: blk() })) });
+    const A = "a".repeat(32), B = "b".repeat(32);
+    l.ingest("b1@" + B, rec("b1", 150), 1000);
+    l.ingest("a1@" + A, rec("a1", 120), 2000);
+    l.ingest("a2@" + A, rec("a2", 110), 3000);
+    const sizes = Object.fromEntries(Object.entries(l._internals.hosts())
+      .map(([k, e]) => [k.split("@")[0], JSON.stringify(e).length]));
+    l._internals.writeNow(() => {
+      console.log(JSON.stringify({ sizes, b1: l.has("b1@" + B), a1: l.has("a1@" + A),
+        a2: l.has("a2@" + A), bytes: fs.statSync(process.env.USAGE_LEDGER_FILE).size }));
+    });
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const out = JSON.parse(fresh.stdout.trim().split("\n").pop());
+  // The fixture holds what it claims: B is the biggest host, A the bigger tenant.
+  assert.ok(out.sizes.b1 > out.sizes.a1 && out.sizes.b1 < out.sizes.a1 + out.sizes.a2, JSON.stringify(out.sizes));
+  assert.ok(out.sizes.b1 + out.sizes.a1 + out.sizes.a2 > 90000, JSON.stringify(out.sizes));
+  assert.equal(out.b1, true, "tenant B's history was dropped for tenant A's overflow");
+  assert.equal(out.a1, false, "tenant A's biggest host goes");
+  assert.equal(out.a2, true);
+  assert.ok(out.bytes <= 90000, `file left at ${out.bytes}, over its own ceiling`);
+});
+
 test("the byte ceiling drops the BIGGEST host, never an innocent bystander", () => {
   // Least-recently-seen is the right victim for the COUNT ceiling and the wrong
   // one for the BYTE ceiling: it destroyed a small innocent host's durable
@@ -649,6 +688,18 @@ test("the least-recently-seen host is evicted past the count ceiling", async () 
   // USAGE_LEDGER_HOSTS is 3 in this process; eviction runs on the save path.
   await saved();
   assert.deepEqual(Object.keys(hosts()).sort(), ["b", "c", "d"]);
+});
+
+test("XERK-2591: the count ceiling drops the stalest host of the tenant holding the most", async () => {
+  const TA = "a".repeat(32), TB = "b".repeat(32);
+  // Tenant B's one host is the stalest — what least-recently-seen alone dropped.
+  const keys = [`b1@${TB}`, `a1@${TA}`, `a2@${TA}`, `a3@${TA}`];
+  for (const [i, key] of keys.entries()) {
+    ledger.ingest(key, beat({ [DAY]: 100 }, null, { device: key.split("@")[0] }), now + i * 1000);
+  }
+  // USAGE_LEDGER_HOSTS is 3 in this process.
+  await saved();
+  assert.deepEqual(Object.keys(hosts()).sort(), [`a2@${TA}`, `a3@${TA}`, `b1@${TB}`]);
 });
 
 // ---- the file ---------------------------------------------------------------

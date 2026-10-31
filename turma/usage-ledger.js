@@ -731,9 +731,16 @@ function warnHostShare(key, before, after, fits, lostRepos, lostTokens) {
 // retired history — the only thing here that can be given up.
 function evictOverflow() {
   let dropped = 0;
-  // The COUNT ceiling is a recency question: too many hosts, drop the stalest.
-  const byAge = Object.keys(hosts).sort((a, b) => (hosts[a].lastSeen || 0) - (hosts[b].lastSeen || 0));
-  while (byAge.length > LEDGER_HOSTS) { delete hosts[byAge.shift()]; dropped += 1; }
+  // The COUNT ceiling is a recency question: too many hosts, drop the stalest —
+  // of the tenant holding the most hosts (XERK-2591), so one tenant's fleet of
+  // hosts cannot retire another tenant's history.
+  let count = Object.keys(hosts).length;
+  while (count > LEDGER_HOSTS) {
+    const stalest = (a, b) => (hosts[a].lastSeen || 0) - (hosts[b].lastSeen || 0);
+    delete hosts[fromBiggestTenant(() => 1, stalest)];
+    dropped += 1;
+    count -= 1;
+  }
 
   let blob = serialize();
   if (blob === null || blob.length <= LEDGER_MAX) { if (dropped) warnEvicted(dropped); return blob; }
@@ -749,9 +756,10 @@ function evictOverflow() {
     if (blob !== null && blob.length <= LEDGER_MAX) break;
   }
   while (blob !== null && blob.length > LEDGER_MAX && Object.keys(hosts).length > 1) {
-    // Still over with everything trimmed: now the biggest goes, not the oldest.
-    const biggest = Object.keys(hosts).sort((a, b) => sizeOf(b) - sizeOf(a))[0];
-    delete hosts[biggest];
+    // Still over with everything trimmed: now the biggest goes, not the oldest —
+    // the biggest host of the tenant holding the most bytes (XERK-2591).
+    const sizes = new Map(Object.keys(hosts).map((k) => [k, sizeOf(k)]));
+    delete hosts[fromBiggestTenant((k) => sizes.get(k), (a, b) => sizes.get(b) - sizes.get(a))];
     dropped += 1;
     blob = serialize();
   }
@@ -776,6 +784,24 @@ function evictOverflow() {
   return blob;
 }
 
+// The ledger's ceilings are shared, but eviction is per-tenant fair (XERK-2591):
+// the victim is a host of the tenant whose hosts weigh the most (`weight` per
+// host), so a tenant at or under its even share never loses a host while another
+// is over it. Within that tenant, the first host by `victimFirst`.
+function fromBiggestTenant(weight, victimFirst) {
+  const tenants = new Map();          // tenant -> {keys, weight}
+  for (const key of Object.keys(hosts)) {
+    const t = tenantOfHostKey(key);
+    if (!tenants.has(t)) tenants.set(t, { keys: [], weight: 0 });
+    const held = tenants.get(t);
+    held.keys.push(key);
+    held.weight += weight(key);
+  }
+  let big = null;
+  for (const held of tenants.values()) if (!big || held.weight > big.weight) big = held;
+  return big.keys.sort(victimFirst)[0];
+}
+
 function sizeOf(key) {
   try { return JSON.stringify(hosts[key]).length; } catch { return 0; }
 }
@@ -786,8 +812,8 @@ function warnEvicted(dropped) {
   lastEvictWarnAt = now;
   console.warn(
     `usage ledger over its ${LEDGER_HOSTS}-host / ${LEDGER_MAX}-byte budget — ` +
-      `dropped ${dropped} host(s): the stalest for the count ceiling, the largest ` +
-      `for the byte one.`
+      `dropped ${dropped} host(s) of the tenant holding the most: the stalest for ` +
+      `the count ceiling, the largest for the byte one.`
   );
 }
 

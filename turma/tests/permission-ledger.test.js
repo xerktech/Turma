@@ -571,6 +571,55 @@ test("bytes: one host's max-size rows cannot push another host's rows out", () =
   assert.ok(ledger._internals.hosts().get("evil").has("e29"));      // its newest stays
 });
 
+// XERK-2591 — the store's ceiling is shared, its eviction per-tenant fair.
+const TA = "a".repeat(32), TB = "b".repeat(32);
+test("XERK-2591: a busy tenant's hosts never push a quieter tenant's rows out", () => {
+  const now = Date.now();
+  // Tenant B's one row is the OLDEST in the store — exactly what oldest-first took.
+  ledger.ingest(`b1@${TB}`, [row("b-only", { openedAt: now - 120 * MIN })], now);
+  // Tenant A: several hosts, each under its own host cap (30), together past MAX_ROWS (40).
+  for (let h = 0; h < 3; h++) {
+    ledger.ingest(`a${h}@${TA}`, Array.from({ length: 15 }, (_, i) =>
+      row(`a${h}-${i}`, { openedAt: now - 60 * MIN + h * 15 + i })), now);
+  }
+  const held = ledger._internals.hosts();
+  assert.ok(held.get(`b1@${TB}`).has("b-only"), "tenant B's row was evicted for tenant A's");
+  let a = 0;
+  for (let h = 0; h < 3; h++) a += (held.get(`a${h}@${TA}`) || new Map()).size;
+  assert.equal(a, 39);
+  assert.ok(!held.get(`a0@${TA}`).has("a0-0"), "A's oldest row goes first");
+});
+
+test("XERK-2591: past the store's ceiling the tenant holding the most rows pays, oldest first", () => {
+  const now = Date.now();
+  // B holds 15 old rows, A 30 newer ones (one host each, both under the host cap).
+  ledger.ingest(`b1@${TB}`, Array.from({ length: 15 }, (_, i) =>
+    row(`b${i}`, { openedAt: now - 120 * MIN + i })), now);
+  ledger.ingest(`a1@${TA}`, Array.from({ length: 30 }, (_, i) =>
+    row(`a${i}`, { openedAt: now - 60 * MIN + i })), now);
+  const held = ledger._internals.hosts();
+  assert.equal(held.get(`b1@${TB}`).size, 15);
+  assert.equal(held.get(`a1@${TA}`).size, 25);
+  for (let i = 0; i < 5; i++) assert.ok(!held.get(`a1@${TA}`).has(`a${i}`));
+  // An untenanted host is its own share, like any tenant.
+  ledger.ingest("plain", Array.from({ length: 10 }, (_, i) =>
+    row(`p${i}`, { openedAt: now - 200 * MIN + i })), now);
+  assert.equal(held.get("plain").size, 10);
+  assert.equal(held.get(`b1@${TB}`).size, 15);
+  assert.equal(held.get(`a1@${TA}`).size, 15);
+});
+
+test("XERK-2591: a lone tenant may still fill the whole store", () => {
+  const now = Date.now();
+  for (let h = 0; h < 2; h++) {
+    ledger.ingest(`a${h}@${TA}`, Array.from({ length: 30 }, (_, i) =>
+      row(`a${h}-${i}`, { openedAt: now - 60 * MIN + h * 30 + i })), now);
+  }
+  const held = ledger._internals.hosts();
+  assert.equal(held.get(`a0@${TA}`).size + held.get(`a1@${TA}`).size, 40);
+  assert.equal(held.get(`a0@${TA}`).size, 10);                      // oldest-first within it
+});
+
 test("bytes: the budget is a fraction of the container limit, never above the file budget", () => {
   // A sixty-fourth: 8 MiB at the deployed 512m, sized from the XERK-287 margin.
   assert.equal(ledger.setMemoryLimit(8 << 20), (8 << 20) / 64);
