@@ -186,7 +186,8 @@ function oldestFirst(list) {
 }
 
 // Drop rows past retention, then trim any host past its share, then the store
-// past MAX_ROWS — oldest first each time. Returns the (host, id) pairs dropped.
+// past MAX_ROWS — oldest first each time, the store pass from the tenant holding
+// the most. Returns the (host, id) pairs dropped.
 function evict(now = Date.now()) {
   const cutoff = now - DAYS * DAY_MS;
   const dropped = [];
@@ -213,13 +214,31 @@ function evict(now = Date.now()) {
   let over = rowCount() - MAX_ROWS;
   let overBytes = totalBytes() - maxBytes;
   if (over > 0 || overBytes > 0) {
-    const all = [];
-    for (const [host, m] of hosts) for (const row of m.values()) all.push({ host, row });
-    all.sort((a, b) => a.row.openedAt - b.row.openedAt);
-    for (const { host, row } of all) {
-      if (over <= 0 && overBytes <= 0) break;
+    // The store's ceiling is shared, but its eviction is per-tenant fair
+    // (XERK-2591): the tenant holding the most pays first — in bytes while the
+    // byte budget is over, else in rows — oldest row first within it. So a tenant
+    // at or under its even share never loses a row while another tenant is over
+    // it, and a lone tenant may still use the whole store.
+    const tenants = new Map();          // tenant -> {rows (oldest last), bytes}
+    for (const [host, m] of hosts) {
+      const t = tenantOfHostKey(host);
+      if (!tenants.has(t)) tenants.set(t, { rows: [], bytes: 0 });
+      const held = tenants.get(t);
+      for (const row of m.values()) { held.rows.push({ host, row }); held.bytes += bytesOf(row); }
+    }
+    for (const held of tenants.values()) {
+      held.rows.sort((a, b) => b.row.openedAt - a.row.openedAt || (a.row.id < b.row.id ? 1 : -1));
+    }
+    while (over > 0 || overBytes > 0) {
+      const size = overBytes > 0 ? (h) => h.bytes : (h) => h.rows.length;
+      let big = null;
+      for (const held of tenants.values()) if (held.rows.length && (!big || size(held) > size(big))) big = held;
+      if (!big) break;
+      const { host, row } = big.rows.pop();
+      const n = bytesOf(row);
+      big.bytes -= n;
       over -= 1;
-      overBytes -= bytesOf(row);
+      overBytes -= n;
       const m = hosts.get(host);
       m.delete(row.id);
       if (!m.size) hosts.delete(host);

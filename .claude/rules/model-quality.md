@@ -57,6 +57,9 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   `OUTCOME_LEDGER_HOST_MAX_ROWS` (a quarter), and past `MAX_ROWS` the org holding the most rows
   loses its oldest first — plain oldest-first let one host evict every other org's evidence.
   Evicted keys are DELETEd from Postgres too, so the table is as bounded as the model.
+- **Past `MAX_ROWS` the TENANT holding the most rows pays first, then its biggest org** (XERK-2591):
+  ranked by (tenant total, org total, next victim). The tenant is the unit's host key suffix.
+  Tests: the `XERK-2591:` case in `outcome-ledger.test.js`.
 - **A host's shadow rows and live rows are capped apart** (XERK-1858): counted together, a busy
   shadow host evicted the live evidence its shadows pair against.
 - **A live row dropped by retention or its host's cap takes its paired shadows with it**
