@@ -750,6 +750,18 @@ test("XERK-2591: the count ceiling drops a quiet host before a live one, whateve
   assert.deepEqual(Object.keys(hosts()).sort(), [`a1@${TA}`, `a2@${TA}`, `a3@${TA}`]);
 });
 
+test("XERK-2591: among quiet hosts a tenant is weighed by ALL its hosts, live ones too", async () => {
+  const TA = "a".repeat(32), TB = "b".repeat(32);
+  const quiet = Date.now() - 6 * 3600 * 1000;
+  // B: one quiet host. A: one quiet host plus two live ones — A holds the most hosts,
+  // so its quiet host pays even though each tenant has just one quiet host.
+  ledger.ingest(`b1@${TB}`, beat({ [DAY]: 100 }, null, { device: "b1" }), quiet);
+  ledger.ingest(`a3@${TA}`, beat({ [DAY]: 100 }, null, { device: "a3" }), quiet + 1000);
+  for (const h of ["a1", "a2"]) ledger.ingest(`${h}@${TA}`, beat({ [DAY]: 100 }, null, { device: h }), Date.now());
+  await saved();
+  assert.deepEqual(Object.keys(hosts()).sort(), [`a1@${TA}`, `a2@${TA}`, `b1@${TB}`]);
+});
+
 // ---- the file ---------------------------------------------------------------
 
 test("history round-trips through the file", async () => {
