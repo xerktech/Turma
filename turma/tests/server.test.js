@@ -20773,7 +20773,7 @@ test("XERK-2533: a tenant user's roll binds an untenanted host to their tenant; 
     await waitFor(() => !!controlChannels.t2533r);
     // A plain tenant user cannot roll it; the admin with a tenant binds it.
     assert.equal((await request("POST", "/api/agents/t2533r/roll-token", { headers: T.A.h, body: {} })).status, 404);
-    const roll = await request("POST", "/api/agents/t2533r/roll-token", { headers: T.C.h, body: {} });
+    const roll = await request("POST", "/api/agents/t2533r/roll-token?bind=1", { headers: T.C.h, body: {} });
     assert.equal(roll.status, 200, JSON.stringify(roll.body));
     assert.equal(roll.body.tenantBound, true);
     // Its next beat on the same identity lands in tenant C, carrying the record —
@@ -20795,6 +20795,98 @@ test("XERK-2533: a tenant user's roll binds an untenanted host to their tenant; 
     // Break-glass (no tenant) leaves an untenanted host untenanted.
     assert.equal(hub.bindIdentityTenant(tokenUid(tok), T.A.t), false, "never moved out of a tenant");
   } finally { forget2533("t2533r", kc); T.restore(); }
+});
+
+test("XERK-2583: a roll that would bind asks first; ?bind=0 rotates and leaves the host untenanted", async () => {
+  const T = tenants2533();
+  const kc = `t2583r@${T.C.t}`;
+  try {
+    forget2583();
+    const m = await request("POST", "/api/enroll-codes", { headers: userHeaders, body: {} });
+    const tok = (await request("POST", "/api/agent/enroll", { body: { code: m.body.code, device: "t2583r" } })).body.token;
+    assert.equal((await beat2533(tok, "t2583r")).status, 200);
+    const uid = tokenUid(tok);
+    const setTokens = () => (agents.t2583r.commands || []).filter((c) => c.type === "setToken");
+    // Asked neither way: 409 wouldBind, nothing queued, nothing bound.
+    const ask = await request("POST", "/api/agents/t2583r/roll-token", { headers: T.C.h, body: {} });
+    assert.equal(ask.status, 409, JSON.stringify(ask.body));
+    assert.equal(ask.body.wouldBind, true);
+    assert.match(ask.body.error, /break-glass/);
+    assert.equal(setTokens().length, 0);
+    assert.ok(!hub.agentIdentities()[uid].tenantId);
+    // A junk value is no answer either.
+    assert.equal((await request("POST", "/api/agents/t2583r/roll-token?bind=yes", { headers: T.C.h, body: {} })).status, 409);
+    // Rotate only: queued, untenanted, and the host keeps its plain key.
+    const rot = await request("POST", "/api/agents/t2583r/roll-token?bind=0", { headers: T.C.h, body: {} });
+    assert.equal(rot.status, 200, JSON.stringify(rot.body));
+    assert.ok(!("tenantBound" in rot.body));
+    assert.equal(setTokens().length, 1);
+    assert.ok(!("bindTenant" in setTokens()[0]));
+    assert.ok(!hub.agentIdentities()[uid].tenantId);
+    assert.equal((await beat2533(tok, "t2583r")).status, 200);
+    assert.ok(agents.t2583r && !agents[kc]);
+    // Break-glass has no tenant, so its roll never binds and never asks.
+    const bg = await request("POST", "/api/agents/t2583r/roll-token", { headers: userHeaders, body: {} });
+    assert.equal(bg.status, 200, JSON.stringify(bg.body));
+    assert.ok(!("tenantBound" in bg.body));
+  } finally { forget2583(); T.restore(); }
+  function forget2583() { forget2533("t2583r", kc); }
+});
+
+test("XERK-2583: the fleet master cannot beat the plain name of a tenant-bound host", async () => {
+  const T = tenants2533();
+  const kc = `t2583g@${T.C.t}`;
+  const master = { authorization: "Bearer agenttok" };
+  try {
+    forget2533("t2583g", kc);
+    // On the master before its roll, as a fleet host awaiting onboarding is.
+    assert.equal((await beat2533("agenttok", "t2583g")).status, 200);
+    const roll = await request("POST", "/api/agents/t2583g/roll-token?bind=1", { headers: T.C.h, body: {} });
+    assert.equal(roll.status, 200, JSON.stringify(roll.body));
+    assert.equal(roll.body.tenantBound, true);
+    const uid = [...Object.entries(hub.agentIdentities())].find(([, e]) => e.origin === "t2583g")[0];
+    // Until the identity beats, the master still reaches the plain key: that is
+    // how a master-token host receives the bind's own setToken.
+    assert.equal(hub.tenantBoundName("t2583g"), false);
+    const pre = await beat2533("agenttok", "t2583g");
+    assert.equal(pre.status, 200);
+    assert.ok((pre.body.commands || []).some((c) => c.cmdId === roll.body.cmdId && c.type === "setToken"));
+    // The agent restarts on its identity token and lands in tenant C.
+    const tok = hub.uidAgentToken(uid);
+    assert.equal((await beat2533(tok, "t2583g")).status, 200);
+    assert.ok(agents[kc] && !agents.t2583g);
+    // Now the master's plain-name beat would recreate an untenanted ghost: refused.
+    assert.equal(hub.tenantBoundName("t2583g"), true);
+    const ghost = await beat2533("agenttok", "t2583g");
+    assert.equal(ghost.status, 403, JSON.stringify(ghost.body));
+    assert.match(ghost.body.error, /bound to a tenant/);
+    assert.ok(!agents.t2583g, "no ghost record");
+    assert.equal(agentBearerKind({ headers: master }, "t2583g"), null);
+    // Other plain names still take the master (the pre-strict trust model).
+    assert.equal(agentBearerKind({ headers: master }, "t2583other"), "legacy");
+    // The tunnel takes the master as ?token= (tunnel-agent.js): refused too.
+    assert.equal(hub.agentWsAuthorized(new URL("http://x/agent/control?name=t2583g&token=agenttok"),
+      { headers: {} }, "t2583g"), false);
+    assert.equal(hub.agentWsAuthorized(new URL("http://x/agent/control?name=other2583&token=agenttok"),
+      { headers: {} }, "other2583"), true);
+    // Remove host releases the name, and the master may claim it again.
+    assert.equal((await request("DELETE", `/api/agents/${encodeURIComponent(kc)}`, { headers: T.C.h })).status, 200);
+    assert.equal(hub.tenantBoundName("t2583g"), false);
+  } finally { forget2533("t2583g", kc); T.restore(); }
+});
+
+test("XERK-2583: a tenant's same-named host never locks the operators' plain host off the master", async () => {
+  const T = tenants2533();
+  const ka = `t2583s@${T.A.t}`;
+  try {
+    forget2533("t2583s", ka);
+    assert.equal((await beat2533("agenttok", "t2583s")).status, 200);
+    const tok = await enroll2533(T.A, "t2583s");
+    assert.equal((await beat2533(tok, "t2583s")).status, 200);
+    assert.ok(agents[ka]);
+    assert.equal(hub.tenantBoundName("t2583s"), false);
+    assert.equal((await beat2533("agenttok", "t2583s")).status, 200, "the fleet host still beats on the master");
+  } finally { forget2533("t2583s", ka); T.restore(); }
 });
 
 test("XERK-2533: enrollment codes belong to their owner's tenant (list + revoke)", async () => {

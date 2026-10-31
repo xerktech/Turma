@@ -133,6 +133,17 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 - **The tenant is a property of the agent IDENTITY**, set only by the hub: `consumeEnrollCode`
   mints into the code owner's tenant; a tenant user's `roll-token` on an UNTENANTED host binds it
   (`bindIdentityTenant`, reply `tenantBound:true`). A bound identity never moves tenant.
+  - **A roll binds only when asked** (XERK-2583): a roll that COULD bind needs `?bind=1` (bind) or
+    `?bind=0` (rotate only, stays untenanted); asked neither it queues nothing and answers 409
+    `wouldBind`, which the dashboard turns into a two-button choice. Binding is one-way and takes the
+    host out of break-glass reach, so routine rotation must never do it silently.
+  - **The fleet master may not beat the plain name of a tenant-bound host** (`tenantBoundName`, 403)
+    once its identity has beaten (`used`), or it recreates an untenanted ghost beside the bound
+    record. Before that beat the master still reaches it: a master host gets the bind's `setToken`
+    that way. Remove host (`released`) frees the name. Tests: `XERK-2583:` in `server.test.js`.
+  - It matches only an identity whose `origin` IS that plain name (roll-bound), never a tenant's
+    host enrolled under the same device name (origin `<name>@<t>`): that let any tenant user lock
+    the operators' host off the master. Heartbeat, `<host>` routes AND the tunnel's `?token=`.
 - **Registry key = `<device>@<32-hex tenantId>`** (`TENANT_KEY_RE`, `tenantHostKey`); untenanted keys
   stay plain. Full id on purpose: a shortened one could collide and share a host across tenants.
   - No plain name may END in that shape (`hostAgentToken`/`hostKeyUsable` refuse it), or an

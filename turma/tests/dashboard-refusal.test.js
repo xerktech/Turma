@@ -64,7 +64,7 @@ function loadPage({ reply = { ok: true }, status = 200, throws = false } = {}) {
   g.window = g; g.globalThis = g;
 
   const exportTail = `
-    ;globalThis.__page = { sessStart, resumeSession, sessKill, pendKey, pending, post, del };
+    ;globalThis.__page = { sessStart, resumeSession, sessKill, pendKey, pending, post, del, sendRoll, rollTokenBtn, rollBindAsk };
     globalThis.__setRender = (f) => { render = f; };
     globalThis.__setCache = (c) => { cache = c; };
   `;
@@ -130,4 +130,35 @@ test("a POST that never lands is reported too, not only one the hub refused", as
   await flush();
   assert.deepEqual(p.toasts, ["Start failed — the hub is unreachable"]);
   assert.ok(!p.pending.has(p.pendKey("start", "hostA", "s1")));
+});
+
+test("XERK-2583: a roll that would bind the host asks, without a toast, and each choice says which", async () => {
+  const p = loadPage({ reply: { error: "rolling h would bind it to your tenant", wouldBind: true }, status: 409 });
+  const host = { key: "hostA", online: true, tokenBound: false, tokenRoll: true };
+  p.sendRoll("hostA", null);
+  await flush();
+  assert.deepEqual(p.toasts, [], "the hub's question is answered on the button, not toasted");
+  assert.ok(!p.pending.has(p.pendKey("setToken", "hostA", "_")), "nothing was queued");
+  assert.ok(p.rollBindAsk.has("hostA"));
+  const btn = p.rollTokenBtn(host);
+  assert.match(btn, /sendRoll\('hostA', true\)/);
+  assert.match(btn, /sendRoll\('hostA', false\)/);
+  assert.match(btn, /break-glass/);
+  p.sendRoll("hostA", false);
+  assert.equal(p.calls.at(-1).url, "/api/agents/hostA/roll-token?bind=0");
+  assert.ok(!p.rollBindAsk.has("hostA"));
+  await flush();
+  p.sendRoll("hostA", true);
+  assert.equal(p.calls.at(-1).url, "/api/agents/hostA/roll-token?bind=1");
+  await flush();
+  // An explicit choice the hub still refuses is a real failure: toasted.
+  assert.equal(p.toasts.length, 2);
+});
+
+test("XERK-2583: any other roll refusal is toasted as before", async () => {
+  const p = loadPage({ reply: { error: "this hub has no fleet master token set" }, status: 409 });
+  p.sendRoll("hostA", null);
+  await flush();
+  assert.equal(p.toasts.length, 1);
+  assert.ok(!p.rollBindAsk.has("hostA"));
 });
