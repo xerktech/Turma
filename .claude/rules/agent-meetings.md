@@ -34,7 +34,8 @@ Wire: `contract-meetings.md`. Model decision and eval: `docs/meeting-items-adr.m
   from a READ-ONLY search (`meeting_duplicate_keys`: a Jira JQL `summary ~` / an ADO WIQL
   `CONTAINS` over OPEN issues of the org's projects, any assignee), ranked client-side by shared
   title words (`_meeting_dup_rank`: ≥2 shared, covering half the title's). Never a tracker write.
-  - Only letters and digits (any script) reach JQL/WIQL (`_meeting_words`); project keys pass
+  - A word is letters, digits and combining marks (any script, ≥3 chars; `_meeting_words`), so
+    nothing quotes out of JQL/WIQL and a Hindi word stays whole (QA: it fell into letters); keys pass
     `_DAILY_BRIEF_PROJECT_RE`, ADO names are `'`-escaped.
   - Best-effort: a search error, or `MEETING_DUP_BUDGET_SEC` spent, leaves `[]`; the items ship.
   - A `decision` files nothing, so is not searched.

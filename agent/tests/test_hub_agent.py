@@ -55584,7 +55584,8 @@ class TestMeetingItems(unittest.TestCase):
                     dict(q, text=""), {"speaker": q["speaker"], "text": q["text"]},
                     dict(q, text="the charge"),                  # short, not the whole segment
                     dict(q, text="dempotency key to the"),                 # mid-word
-                    dict(q, text=["add", "the", "key"])):
+                    dict(q, text=["add", "the", "key"]),
+                    dict(q, atMs=float(q["atMs"]))):                         # float ms
             self.assertIsNone(ha.parse_meeting_items(self.reply(self.item(quotes=[bad])),
                                                      self.t, self.repos), bad)
         self.assertIsNone(ha.parse_meeting_items(self.reply(self.item(quotes=[])),
@@ -55677,6 +55678,11 @@ class TestMeetingDuplicates(unittest.TestCase):
         # Any script's letters count; nothing that could quote out of JQL survives.
         self.assertEqual(ha._meeting_words("Résumé café naïve — 支付失败 \"x\\y'"),
                          ["résumé", "café", "naïve", "支付失败"])
+        # Combining marks stay inside a word (Devanagari vowel signs), so a Hindi
+        # title is whole words, never single letters that match everything.
+        self.assertEqual(ha._meeting_words("हिन्दी परीक्षण"), ["हिन्दी", "परीक्षण"])
+        self.assertEqual(ha._meeting_dup_rank("लॉगिन पेज पर त्रुटि ठीक करें",
+                                              [("X-1", "बिलिंग सेवा में कैश जोड़ें")]), [])
 
     def test_jira_search_is_a_scoped_read(self):
         seen = []
@@ -55939,6 +55945,12 @@ class TestMeetingFetchAndScratch(ManagerMixin, unittest.TestCase):
 
     def test_the_worker_sweeps_a_killed_runs_files(self):
         sm = self.make_manager()
+        calls = []
+        sm._meeting_wake = mock.Mock(wait=mock.Mock(side_effect=RuntimeError("stop")))
+        with mock.patch.object(sm, "_sweep_meeting_scratch", lambda: calls.append(1)):
+            with self.assertRaises(RuntimeError):
+                sm._meeting_worker_loop()          # the loop sweeps before it waits
+        self.assertEqual(calls, [1])
         os.makedirs(ha.REGISTRY_DIR, exist_ok=True)
         for name in ("meeting-x.in", "meeting-y.out", "daily-brief-z.out", "meeting-keep"):
             with open(os.path.join(ha.REGISTRY_DIR, name), "w") as f:

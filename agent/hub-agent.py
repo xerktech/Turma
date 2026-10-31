@@ -25180,7 +25180,6 @@ MEETING_DUP_WORDS = 6               # title words searched for duplicates
 MEETING_DUP_FETCH = 20              # open issues read per item
 MEETING_DUP_KEYS_MAX = 5
 MEETING_DUP_BUDGET_SEC = 90         # the whole duplicate check, per meeting
-_MEETING_WORD_RE = re.compile(r"[^\W_]+")
 _MEETING_STOPWORDS = frozenset(
     "the and for with from that this into onto over under about after before "
     "when then than them they their there these those what which while will "
@@ -25361,6 +25360,9 @@ def meeting_items_problems(obj, transcript, repos):
                 continue
             want, spk = _meeting_norm(q["text"]), q["speaker"].casefold()
             at = q["atMs"]
+            if at is not None and _meeting_ms(at) is None:
+                problems.append(f"{where} quote atMs is not integer milliseconds")
+                continue
             whole = len(want.split()) >= MEETING_QUOTE_MIN_WORDS
             if not want or not any(
                     s_spk == spk and s_at == at
@@ -25402,9 +25404,16 @@ def _meeting_words(text):
     """The significant words of a title, in order, deduped: what a duplicate
     search matches on. Only letters and digits survive (any script), so a word
     holds no quote, backslash or operator and is safe in JQL/WIQL."""
-    out = []
-    for w in _MEETING_WORD_RE.findall(unicodedata.normalize("NFKC", str(text or "")).lower()):
-        if (len(w) >= 3 or not w.isascii()) and w not in _MEETING_STOPWORDS and w not in out:
+    out, cur = [], []
+    for ch in unicodedata.normalize("NFKC", str(text or "")).lower() + " ":
+        cat = unicodedata.category(ch)
+        if cat[0] in "LN" or (cat[0] == "M" and cur):
+            cur.append(ch)
+            continue
+        w, cur = "".join(cur), []
+        # Three characters minimum, any script: a lone letter matches nearly every
+        # title. (A CJK word is one run, so it stays one word.)
+        if len(w) >= 3 and w not in _MEETING_STOPWORDS and w not in out:
             out.append(w)
     return out
 
