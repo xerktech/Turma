@@ -6,9 +6,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -46,12 +48,41 @@ class AccountRepositoryTest {
         assertEquals(true, hub.awaitValue { r.me.value }.adminOnly)
     }
 
-    @Test fun `an older hub without the route leaves the account unknown`() {
-        hub.json("/api/me", """{"error":"not found"}""", code = 404)
+    @Test fun `an older hub without the route leaves the account unknown, and is not re-asked`() {
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        hub.route("/api/me") { calls.incrementAndGet(); okhttp3.mockwebserver.MockResponse().setResponseCode(404).setBody("{}") }
         val r = repo()
-        hub.findRequest("/api/me")
+        hub.awaitValue { if (calls.get() >= 1) true else null }
+        // The container's own repository may ask once too, so judge GROWTH: with a
+        // 50ms retry period, a retry loop would keep adding calls here.
         Thread.sleep(300)
+        val settled = calls.get()
+        Thread.sleep(500)
         assertNull(r.me.value)
+        assertEquals(settled, calls.get())
+    }
+
+    @Test fun `a hub mid-rollout (5xx) is asked again until it answers`() {
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        hub.route("/api/me") {
+            if (calls.incrementAndGet() < 3) okhttp3.mockwebserver.MockResponse().setResponseCode(503).setBody("{}")
+            else okhttp3.mockwebserver.MockResponse().setResponseCode(200)
+                .setHeader("Content-Type", "application/json").setBody("""{"kind":"user","name":"alice"}""")
+        }
+        val r = repo()
+        assertEquals("alice", hub.awaitValue { r.me.value }.name)
+    }
+
+    @Test fun `a session-token refresh for the same sign-in never blanks the account`() {
+        hub.json("/api/me", """{"kind":"user","name":"alice","roles":["user"],"tenant":true}""")
+        val r = repo()
+        hub.awaitValue { r.me.value }
+        val seen = mutableListOf<Me?>()
+        val job = scope.launch { r.me.collect { synchronized(seen) { seen += it } } }
+        hub.container.config.saveSession("fresh-token")
+        Thread.sleep(400)
+        job.cancel()
+        synchronized(seen) { assertTrue("never null: $seen", seen.none { it == null }) }
     }
 
     @Test fun `signing out forgets the account`() {

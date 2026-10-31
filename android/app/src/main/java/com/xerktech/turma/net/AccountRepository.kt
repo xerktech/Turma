@@ -20,7 +20,12 @@ import retrofit2.HttpException
  * as somebody else never shows the previous account.
  *
  * Null = not known: signed out, an older hub (404), or not answered yet. A
- * failure the hub ANSWERED stays null for good; a network failure retries.
+ * 4xx the hub answered stays null until the credential changes; a 5xx (a hub
+ * mid-rollout) or a network failure retries every [retryMs].
+ *
+ * Only a change of WHO (signed in or out, hub, username) clears the value; a
+ * session-token refresh for the same sign-in re-reads it in place, so the ⋮
+ * label and the admin-only screen never blink off.
  */
 class AccountRepository(
     private val client: HubClient,
@@ -33,16 +38,19 @@ class AccountRepository(
 
     init {
         scope.launch {
+            var who: Triple<Boolean, String, String>? = null
             config.state
-                .map { Triple(it.configured, it.hubUrl, it.sessionToken + "\u0000" + it.user) }
+                .map { Triple(Triple(it.configured, it.hubUrl, it.user), it.sessionToken, it.password) }
                 .distinctUntilChanged()
-                .collectLatest { (configured, _, _) ->
-                    _me.value = null
-                    if (!configured) return@collectLatest
+                .collectLatest { (id, _, _) ->
+                    if (id != who) _me.value = null
+                    who = id
+                    if (!id.first) return@collectLatest
                     while (true) {
                         val r = runCatching { client.api.me() }
                         r.getOrNull()?.let { _me.value = it; return@collectLatest }
-                        if (r.exceptionOrNull() is HttpException) return@collectLatest
+                        val e = r.exceptionOrNull()
+                        if (e is HttpException && e.code() < 500) return@collectLatest
                         delay(retryMs)
                     }
                 }

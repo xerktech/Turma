@@ -30021,30 +30021,24 @@ test("XERK-2596: the operators' background work never dispatches to a host claim
   }
 });
 
-test("XERK-2553: /api/me names the caller and marks an admin-only principal", async () => {
+test("XERK-2553: /api/me names the caller and never an id", async () => {
   assert.equal((await request("GET", "/api/me")).status, 401);
   const bg = await request("GET", "/api/me", { headers: userHeaders });
   assert.equal(bg.status, 200);
-  assert.deepEqual(bg.body, { kind: "breakglass", name: "break-glass", source: "", roles: ["admin"],
-    tenant: false, adminOnly: true });
+  const { adminOnly, ...rest } = bg.body;
+  assert.deepEqual(rest, { kind: "breakglass", name: "break-glass", source: "", roles: ["admin"], tenant: false });
+  assert.equal(typeof adminOnly, "boolean");
   const T = tenants2533();
   try {
     const a = (await request("GET", "/api/me", { headers: T.A.h })).body;
     assert.deepEqual(a, { kind: "user", name: "t2533a", source: "local", roles: ["user"],
       tenant: true, adminOnly: false });
     assert.ok(!JSON.stringify(a).includes(T.A.t), "never the tenant id");
-    // Admin-only: the admin role and no user role -> no tenant.
-    const tenancy = require("../tenancy.js");
-    const { state, user } = tenancy.createLocalUser(hub.tenancyState(), {
-      username: "t2553admin", passwordHash: tenancy.hashPasswordSync("pw-2553-long-enough"),
-      groups: ["turma-admins"] });
-    hub.__setTenancy(state);
-    const p = hub.principalFromToken(hub.issueSessionToken(60_000, { u: user.id, t: user.tenantId, r: ["admin"] }));
-    const h = { cookie: `hub_session=${hub.issueSessionToken(60_000, hub.principalClaims(p))}` };
-    const ad = (await request("GET", "/api/me", { headers: h })).body;
-    assert.equal(ad.adminOnly, true);
-    assert.equal(ad.tenant, false);
-    assert.deepEqual(ad.roles, ["admin"]);
-    assert.equal(ad.name, "t2553admin");
+    assert.ok(!JSON.stringify(a).includes(T.A.user.id), "never the user id");
+    // Admin-only is decided by the hosts the principal may drive (tenancy.test.js
+    // pins the empty-fleet side): with an untenanted host in the fleet, break-glass
+    // is that fleet's operator, never admin-only.
+    assert.equal((await request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: "me2553-host" } })).status, 200);
+    assert.equal((await request("GET", "/api/me", { headers: userHeaders })).body.adminOnly, false);
   } finally { T.restore(); }
 });

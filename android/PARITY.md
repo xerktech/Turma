@@ -1048,12 +1048,16 @@ those are marked `[MODEL]`.
   - The name: web puts "Signed in as <name>" on Sign out's tooltip (a visible label would move the
     right-aligned header row after first paint, XERK-2432); Android shows the same words as a
     disabled item above Sign out in every `ScreenHeader` ⋮ menu (`LocalAccount`).
-  - An ADMIN-ONLY principal (admin role, no tenant) sees no host, session or ticket, and the admin
-    panel (XERK-2552) is web-only: web shows `ADMIN_ONLY_NOTE` under the header on every page,
-    Android covers the app with `AdminOnlyScreen` (same words + Sign out). Null / an older hub's 404
-    = not admin-only, so nothing changes against an older hub.
+  - ADMIN-ONLY = the hub's call: admin role, no tenant, AND no host it may drive. Break-glass and an
+    admin-role user drive every UNTENANTED host, so before the migration (XERK-2554) they are the
+    fleet's operators, never admin-only; an open hub's principal never is. The admin panel
+    (XERK-2552) is web-only, so web shows `ADMIN_ONLY_NOTE` under the header on every page and
+    Android covers the app with `AdminOnlyScreen` (same words + Sign out) — Android only while its
+    loaded fleet is still empty (`showAdminOnly`), so a host enrolled later lifts it on the next
+    poll. Null / an older hub's 404 = not admin-only, so nothing changes against an older hub.
   - `net/AccountRepository` re-reads it whenever the stored credential changes, so a sign-in as
-    somebody else never shows the previous account.
+    somebody else never shows the previous account; a token refresh for the same sign-in re-reads
+    in place (no blink), a 5xx or network failure retries, a 4xx stops.
   - A session route's 404 (an unknown id OR another account's — XERK-2534 answers both alike) reads
     "This session isn't available — it has ended, or it belongs to another account (<hub words>)"
     (`sessionUnavailableMessage`, from `HubClient.mapHistory`). Every list is already tenant-scoped

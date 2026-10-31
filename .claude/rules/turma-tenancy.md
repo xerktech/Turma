@@ -259,6 +259,10 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 - **`GET /api/me` (`meView`) is how a client learns who it is** (XERK-2553): name, source, roles,
   `tenant` (bool) and `adminOnly` — never the tenant or user id. Clients show admin-only principals an
   explanation instead of an empty fleet (`android/PARITY.md`).
+  - `adminOnly` = admin role, no tenant AND no host `principalMayDriveHost` grants; never `open`.
+    Never drop the host check: break-glass and admin-role users operate the untenanted fleet, and
+    marking them admin-only locked the phone app out of it (QA).
+  - Tests: `XERK-2553:` in `tenancy.test.js` (empty fleet, then an untenanted host) and `server.test.js`.
 - `findSession(id, p)` resolves only the caller's hosts, so another tenant's agent reporting the
   same session id can never capture a terminal.
 - `liveSessionForTranscript(tid, p)` likewise (rollup XERK-2593): two tenants reporting one live

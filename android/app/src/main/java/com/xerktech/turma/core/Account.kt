@@ -19,6 +19,15 @@ fun meLabel(me: Me?): String = me?.name?.takeIf { it.isNotEmpty() }?.let { "Sign
  */
 fun isAdminOnly(me: Me?): Boolean = me?.adminOnly == true
 
+/**
+ * Whether to cover the app with the admin-only screen: the hub said admin-only
+ * (it counted no host this account may drive) AND the fleet, once loaded, still
+ * lists none. The fleet half keeps it live: a host enrolled after `/api/me`
+ * answered lifts the screen on the next poll, with no re-read of `/api/me`.
+ */
+fun showAdminOnly(me: Me?, fleetLoading: Boolean, hostCount: Int): Boolean =
+    isAdminOnly(me) && !fleetLoading && hostCount == 0
+
 const val ADMIN_ONLY_NOTE =
     "This account is an administrator without a workspace of its own, so there are no hosts, " +
         "sessions or tickets to show. Sign in with a user account to work in a workspace."

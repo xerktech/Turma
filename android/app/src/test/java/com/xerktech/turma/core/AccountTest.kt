@@ -34,4 +34,14 @@ class AccountTest {
         assertTrue(m.contains("another account"))
         assertTrue(m.endsWith("(unknown agent)."))
     }
+
+    // QA D1/D2: the hub's admin-only verdict alone never covers a fleet the account can see.
+    @Test fun `the admin-only screen needs the hub's verdict AND a loaded, empty fleet`() {
+        val admin = Me(roles = listOf("admin"), adminOnly = true)
+        assertTrue(showAdminOnly(admin, fleetLoading = false, hostCount = 0))
+        assertFalse(showAdminOnly(admin, fleetLoading = false, hostCount = 1)) // a host enrolled since
+        assertFalse(showAdminOnly(admin, fleetLoading = true, hostCount = 0)) // not loaded yet
+        assertFalse(showAdminOnly(Me(roles = listOf("admin")), fleetLoading = false, hostCount = 0))
+        assertFalse(showAdminOnly(null, fleetLoading = false, hostCount = 0))
+    }
 }

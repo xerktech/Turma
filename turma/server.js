@@ -13988,7 +13988,8 @@ function principalClaims(p) {
 
 // Who the caller is, as GET /api/me serves it (XERK-2553): the signed-in label a
 // client shows beside Sign out, and whether it is an ADMIN-ONLY principal (admin
-// role, no tenant) that a client turns into the "admin panel is web-only" screen.
+// role, no tenant, no host it may drive) that a client turns into the "admin
+// panel is web-only" screen.
 // Built field by field from the principal and the stored user, so the wire shape is
 // fixed: Android TYPES it. Never serves the tenant id or the user id.
 function meView(p) {
@@ -14007,7 +14008,14 @@ function meView(p) {
     name = "break-glass";
   }
   const tenant = !!(p && p.tenantId);
-  return { kind, name, source, roles, tenant, adminOnly: roles.includes("admin") && !tenant };
+  // Admin-only = an admin with no workspace AND nothing to drive. Break-glass and
+  // an admin-role user also drive every UNTENANTED host (principalMayDriveHost),
+  // so before the migration (XERK-2554) they are the fleet's operators: calling
+  // them admin-only would hide a working fleet behind "nothing to show" (QA).
+  // An open hub is never admin-only: there is no account to switch to.
+  const adminOnly = kind !== "open" && roles.includes("admin") && !tenant &&
+    !Object.keys(agents).some((k) => principalMayDriveHost(p, k));
+  return { kind, name, source, roles, tenant, adminOnly };
 }
 
 // The principal a session token names, re-checked against the store NOW.
@@ -26563,6 +26571,7 @@ if (process.env.TURMA_TEST) {
     requestPrincipal,
     principalFromToken,
     principalClaims,
+    meView,
     authEnabled,
     localLogin,
     loginClientKey,

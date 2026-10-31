@@ -300,7 +300,10 @@ fun TurmaApp(
             )
         }
     }
-    if (settings.configured && com.xerktech.turma.core.isAdminOnly(me)) AdminOnlyScreen(me, signOut)
+    val fleet by container.fleet.state.collectAsStateWithLifecycle()
+    if (settings.configured && com.xerktech.turma.core.showAdminOnly(me, fleet.loading, fleet.agents.size)) {
+        AdminOnlyScreen(me, signOut)
+    }
     }
     }
 }
