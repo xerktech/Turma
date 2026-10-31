@@ -58,6 +58,8 @@
 // independently of the repo blocks, never summed from them.
 "use strict";
 
+const { tenantOfHostKey } = require("./tenancy.js");
+
 const fs = require("fs");
 const path = require("path");
 
@@ -1269,6 +1271,10 @@ function setHostAliases(pairs) {
     if (!Array.isArray(pair) || pair.length !== 2) continue;
     const [a, b] = pair;
     if (typeof a !== "string" || typeof b !== "string" || !a || !b) continue;
+    // A rename never crosses a tenant (XERK-2550): a host bound into a tenant
+    // (`laptop` -> `laptop@<t>`) keeps its pre-bind spend under the untenanted
+    // name, which is the hub operators' — never the tenant's card.
+    if (tenantOfHostKey(a) !== tenantOfHostKey(b)) continue;
     union(a.toLowerCase(), b.toLowerCase());
   }
   const roots = new Map();
@@ -1281,8 +1287,14 @@ function setHostAliases(pairs) {
 setHostAliases([]);
 
 function foldKey(k) {
-  const f = String(k == null ? "" : k).toLowerCase();
-  return hostAliasRoots.get(f) || f;
+  const raw = String(k == null ? "" : k);
+  const f = raw.toLowerCase();
+  const root = hostAliasRoots.get(f) || f;
+  // The tenant (read off the key as typed, XERK-2550) leads a tenant key's fold,
+  // so no case twin or alias can fold one tenant's spend into another's — or an
+  // untenanted name that merely lowercases into a tenant key's shape into it.
+  const t = tenantOfHostKey(raw);
+  return t ? `${t}\u0000${root}` : root;
 }
 
 // Combine several ledger entries (same `foldKey`) into ONE synthetic entry for the
@@ -1356,7 +1368,7 @@ let retiredTruncLogAt = 0;
  * live fleet with the code they already have; `retired` is what marks them, and
  * `jira.siteKey` is carried so the org filter keeps applying to them.
  */
-function retiredAgents(liveKeys, now = Date.now()) {
+function retiredAgents(liveKeys, now = Date.now(), visible = null) {
   const live = new Set(liveKeys || []);
   // A retired case-twin of a LIVE host folds into that host's card via `fold`, so
   // it is not emitted here (XERK-448); the rest group by `foldKey` and merge, so a
@@ -1369,6 +1381,9 @@ function retiredAgents(liveKeys, now = Date.now()) {
   const groups = new Map(); // foldKey -> [ledger keys]
   for (const k of Object.keys(hosts)) {
     if (live.has(k)) continue;
+    // Scoped BEFORE the byte budget (XERK-2550): another tenant's newer retired
+    // hosts must never crowd this scope's history out of RETIRED_MAX.
+    if (visible && !visible(k)) continue;
     const f = foldKey(k);
     if (liveFolds.has(f)) continue;
     let g = groups.get(f);
@@ -1436,6 +1451,19 @@ function forget(key) {
   return true;
 }
 
+/**
+ * Forget every host of tenant `tenantId` (XERK-2550, the tenant purge): the
+ * file backend rewrites without them, Postgres deletes their rows. Returns the
+ * keys removed. An empty/invalid id purges nothing — untenanted history is never
+ * a tenant's to purge.
+ */
+function purgeTenant(tenantId) {
+  if (typeof tenantId !== "string" || !/^[0-9a-f]{32}$/.test(tenantId)) return [];
+  const gone = Object.keys(hosts).filter((k) => tenantOfHostKey(k) === tenantId);
+  for (const k of gone) forget(k);
+  return gone;
+}
+
 /** Whether anything is recorded for this host. */
 function has(key) {
   return Object.prototype.hasOwnProperty.call(hosts, key);
@@ -1444,7 +1472,7 @@ function has(key) {
 load();
 
 module.exports = {
-  ingest, fold, retiredAgents, forget, has, flush, configure, rehydrate, setHostAliases,
+  ingest, fold, retiredAgents, forget, purgeTenant, has, flush, configure, rehydrate, setHostAliases,
   LEDGER_FILE, LEDGER_MAX, LEDGER_DAYS, LEDGER_HOSTS, LEDGER_REPOS, RETIRED_MAX,
   LEDGER_MODELS, LEDGER_NAME_MAX, hostShare,
   SYSTEM_USAGE_REPO, isSystemUsageRepo, foldSystemRepos,

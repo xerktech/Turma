@@ -3,6 +3,7 @@ paths:
   - turma/server.js
   - turma/tenancy.js
   - turma/tests/tenancy.test.js
+  - turma/tests/breakglass-pool.test.js
   - turma/tests/oidc-groups.test.js
   - turma/tests/oidc.test.js
   - turma/tests/server.test.js
@@ -60,6 +61,28 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   AND the LAST X-Forwarded-For hop (the ingress's view) AND the socket. Fairness only, never auth.
   - **All three, never CF-Connecting-IP alone**: the LAN reaches the ingress without Cloudflare, so
     that header is forgeable there; alone, a LAN caller could back a chosen victim's key off.
+  - **`TURMA_TRUSTED_PROXIES` (XERK-2579)** collapses that to CF-Connecting-IP alone ONLY when the
+    socket AND the last XFF hop are both inside it — else 2 cloudflared x 2 ingress pods = 4 keys.
+    - List the ingress, cloudflared AND hub pods (an HA follower forwards logins, so it is the
+      leader's socket peer) — in practice the pod CIDR. Anything inside can forge all three headers;
+      break-glass guesses on a CF-Connecting-IP key also hit the hub-wide pool (XERK-2587, below).
+    - **Only the network keeps a pod off :8300** (XERK-2592): a pod dialling the Service directly
+      forges the untrusted last hop, which the hub cannot tell from the ingress relaying a LAN
+      client. ArgoCD `ai/turma/networkpolicy-ingress.yaml` admits only the ingress, hub, turma-agent
+      and Prometheus pods. Residual: turma-agent pods, which already hold a host token.
+    - Correct only while the ingress APPENDS its peer to XFF (no `use-forwarded-headers`).
+    - A malformed entry exits the hub at boot (2) rather than silently keying three-part.
+    - Tests: `tenancy-nopassword.test.js` "XERK-2579: behind trusted proxies…".
+  - **With it set, the key is the FIRST untrusted address from the hub inward** (XERK-2585): an
+    untrusted socket, else an untrusted last XFF hop, else CF-Connecting-IP. Never key on
+    CF-Connecting-IP when the hop is untrusted: a caller off Cloudflare rotates it per request
+    and gets a fresh backoff each time — break-glass runs no scrypt, so that was unlimited guessing.
+    - IPv6 keys collapse to the /64 (`loginIpv6Prefix64`): one subscriber rotates within it.
+      Accepted: a /56 holder still gets 256 keys. An embedded-IPv4 address (mapped, NAT64, compat /96, by range) keys whole.
+    - Residual: anything inside the trusted CIDR still forges all headers. The CF-Connecting-IP
+      branch is pooled (XERK-2587); a pod forging an untrusted hop straight at the hub Service is
+      kept off by the network (XERK-2592), not the hub.
+    - Tests: `tenancy-nopassword.test.js` "XERK-2585: off Cloudflare…".
   - `loginFailures` keys are a sha256 of client + username — the username is unbounded (1 MiB body),
     and a raw key let one client heap-OOM the hub in ~35 s.
   - One sign-in queued-or-running per client; its extras get 503 + `Retry-After` at once, no scrypt.
@@ -69,8 +92,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     `Retry-After`, answered before any scrypt.
   - **Never add a per-USERNAME in-flight cap or a username-only backoff** — either lets an anonymous
     client lock a known account out for everyone, the exact failure this replaced.
-  - Residual: a caller reaching the hub without Cloudflare can rotate its CF-Connecting-IP; that
-    buys it queue places (bounded by `LOGIN_QUEUE_MAX`, so ~18 keys 503 others), not more scrypt.
+  - Residual with `TURMA_TRUSTED_PROXIES` UNSET: a caller off Cloudflare rotates its
+    CF-Connecting-IP into a fresh key per request (fresh backoff, queue places). Set it in prod.
 - `parseHash` refuses a stored cost past `SCRYPT_MAXMEM`: a hand-edited store must not OOM a login.
 - **`/api/login` checks break-glass FIRST, scrypt-free**, so a flood cannot lock break-glass out.
 - Break-glass guesses share XERK-2568's per-(client, username) backoff (XERK-2577), via
@@ -85,8 +108,19 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     client already in flight 503) BEFORE the compare: a busy refusal neither evaluates nor counts it,
     so the response pattern never reveals which name is break-glass.
   - Android never retries a password `/api/login` refused (401) as Basic — one miss, not two.
+- **Break-glass guesses keyed on CF-Connecting-IP alone share ONE hub-wide pool of misses**
+  (XERK-2587, `loginKeyFromCf`, `BREAKGLASS_POOL_*`): an in-cluster pod rotating that header got a
+  fresh per-client budget per request (~7k guesses/s).
+  - Pool spent → the guess is NOT evaluated and is treated as a non-break-glass name (Basic 401,
+    form falls to the local check) — never a 429, so the pool never reveals the break-glass name.
+  - Only misses drain it (a polling Basic script is free) and it always refills: never a lockout.
+  - Keys with an unforgeable part (LAN via the ingress, a pod's own socket) never touch it, so
+    break-glass over the LAN works through any flood (XERK-595). Never pool those keys.
+  - Accepted cost: during a CF-path flood, the operator's break-glass via Cloudflare competes for
+    the refill. Tests: `breakglass-pool.test.js`.
   - Residual (XERK-2568's key-trust model): a caller bypassing Cloudflare rotates CF-Connecting-IP
     for a fresh budget per request — scrypt-free break-glass makes that a real bypass (XERK-2585).
+    The direct-to-Service variant (a pod forging the XFF hop) is closed by the network (XERK-2592).
   - A `/api/login` break-glass miss still runs the local scrypt check (shared name, no timing tell
     for which name is break-glass), passed `counted` so it is not recorded twice.
 - An unknown username verifies against a dummy hash (same cost, no timing oracle); every failure is
@@ -113,6 +147,17 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 - **The tenant is a property of the agent IDENTITY**, set only by the hub: `consumeEnrollCode`
   mints into the code owner's tenant; a tenant user's `roll-token` on an UNTENANTED host binds it
   (`bindIdentityTenant`, reply `tenantBound:true`). A bound identity never moves tenant.
+  - **A roll binds only when asked** (XERK-2583): a roll that COULD bind needs `?bind=1` (bind) or
+    `?bind=0` (rotate only, stays untenanted); asked neither it queues nothing and answers 409
+    `wouldBind`, which the dashboard turns into a two-button choice. Binding is one-way and takes the
+    host out of break-glass reach, so routine rotation must never do it silently.
+  - **The fleet master may not beat the plain name of a tenant-bound host** (`tenantBoundName`, 403)
+    once its identity has beaten (`used`), or it recreates an untenanted ghost beside the bound
+    record. Before that beat the master still reaches it: a master host gets the bind's `setToken`
+    that way. Remove host (`released`) frees the name. Tests: `XERK-2583:` in `server.test.js`.
+  - It matches only an identity whose `origin` IS that plain name (roll-bound), never a tenant's
+    host enrolled under the same device name (origin `<name>@<t>`): that let any tenant user lock
+    the operators' host off the master. Heartbeat, `<host>` routes AND the tunnel's `?token=`.
 - **Registry key = `<device>@<32-hex tenantId>`** (`TENANT_KEY_RE`, `tenantHostKey`); untenanted keys
   stay plain. Full id on purpose: a shortened one could collide and share a host across tenants.
   - No plain name may END in that shape (`hostAgentToken`/`hostKeyUsable` refuse it), or an
@@ -140,6 +185,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   and is dropped at delivery unless it matches the key's tenant — a command queued before a bind is
   never run inside the tenant. Untenanted hosts' commands carry no stamp (byte-identical).
 - `coerceAgentIdentities` drops an entry whose home is a tenant key with a missing/different tenant.
+- **Ledgers, insights, routing and usage read their tenant off that key** (XERK-2550): no
+  aggregate spans two tenants, and `purgeTenantData` is the tenant purge. `turma-tenancy-ledgers.md`.
 
 ## Tests
 

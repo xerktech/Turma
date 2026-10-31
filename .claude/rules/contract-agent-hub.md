@@ -44,7 +44,7 @@ Rules whose two halves live in the agent and the hub, so neither side's own file
 - **Every host belongs to at most ONE tenant, and the HUB decides which** (XERK-2533,
   `turma-tenancy.md`). The agent still names itself by its plain `DEVICE_NAME`; it never sends a tenant.
   - The tenant lives on the identity (`agentIdentities[uid].tenantId`): an enrollment code mints into
-    its owner's tenant, a tenant user's roll binds an untenanted host. Never read it off the agent.
+    its owner's tenant, a tenant user's roll binds an untenanted host (only on `?bind=1`, XERK-2583). Never read it off the agent.
   - The hub NAMESPACES the registry key as `<device>@<tenantId>` (`agentKeyFor`) from the tenant the
     credential proves, on every agent surface (heartbeat `device`, tunnel `?name=`, `<host>` routes).
   - A token of tenant A can never act as a key of B, nor as an untenanted key (`uidHostRefusal`); the

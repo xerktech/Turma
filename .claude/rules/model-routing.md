@@ -19,7 +19,9 @@ Never restore a ladder or route from bench solve rates (`bench/run_policy.py` is
 
 - **`MODEL_POLICY=off|observe|on`** (hub env, default `observe`). observe records promotions
   (and runs shadows) but routes nothing; only `on` changes a spawn and runs the tripwire.
-- **Promotion is fleet-wide per (work class, model)** (`modelPolicySweep`, leader, after
+- **Promotion is per TENANT per (work class, model)** (XERK-2550: `modelPolicySweep` runs one
+  `modelPolicySweepTenant` per tenant; untenanted keys stay `<class>/<model>`, a tenant's are
+  `<tenantId>:<class>/<model>`; `modelPolicyPick` reads the DISPATCH host's tenant) (leader, after
   `modelShadowSweep`): `MODEL_PROMOTE_MIN_PAIRS` (40) graded pairs, candidate-only failures
   ≤ 5% AND 95% Wilson upper ≤ 10% (`outcomeLedger.promotionPasses`). At 40 pairs that means 0
   failures; ~70 allow one.

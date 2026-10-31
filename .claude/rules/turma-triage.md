@@ -166,7 +166,8 @@ attempt** (no retry budget burned, exactly like a repo-less ticket):
   === "claude"`. A qwen/dsh pin, or a qwen/dsh-default host, spends no Claude subscription and is
   never paused (dsh/qwen have no window — `agent-usage.md`).
 - **Per-SUBSCRIPTION, not per-host** (`pausedSubscriptions`): grouped by `subscription.key` (a
-  keyless host keyed on itself) like the Usage page's `limitGroups`, the freshest non-stale reading
+  keyless host keyed on itself; prefixed with the host's tenant, XERK-2550, so one account shared by
+  two tenants is two pools) like the Usage page's `limitGroups`, the freshest non-stale reading
   decides — so a sibling with a good probe pauses one whose probe is missing/stale, and two hosts on
   SEPARATE accounts pause independently.
 - **Staleness = "can't tell", never a pause** (`LIMIT_MAX_AGE_SEC`, hub mirror of usage.html's
