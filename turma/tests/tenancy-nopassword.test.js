@@ -160,7 +160,7 @@ test("XERK-2579: behind trusted proxies one public IP is one sign-in key", () =>
   const keys = new Set([viaCf("10.244.1.5", "10.244.2.8"), viaCf("10.244.3.9", "10.244.2.8"),
     viaCf("10.244.1.5", "::ffff:10.244.4.2"), viaCf("10.244.3.9", "10.244.4.2")]);
   assert.deepEqual([...keys], ["203.0.113.7"]);
-  assert.equal(key({ "cf-connecting-ip": "2001:db8::1", "x-forwarded-for": "fd00::5" }, "fd00::6"), "2001:db8::1");
+  assert.equal(key({ "cf-connecting-ip": "2001:db8::1", "x-forwarded-for": "fd00::5" }, "fd00::6"), "2001:db8:0:0::/64");
   // A LAN caller reaching the ingress directly: the hop the ingress appends is its own
   // untrusted address, so a forged CF-Connecting-IP still cannot pose as the victim.
   assert.notEqual(key({ "cf-connecting-ip": "203.0.113.7", "x-forwarded-for": "192.168.1.50" }, "10.244.2.8"),
@@ -168,10 +168,9 @@ test("XERK-2579: behind trusted proxies one public IP is one sign-in key", () =>
   // Reaching the hub without the ingress (untrusted socket), even with a trusted-looking hop.
   assert.notEqual(key({ "cf-connecting-ip": "203.0.113.7", "x-forwarded-for": "10.244.1.5" }, "192.168.1.50"),
     "203.0.113.7");
-  // No CF-Connecting-IP, junk hop, or the env unset: the three-part key.
-  assert.equal(key({ "x-forwarded-for": "10.244.1.5" }, "10.244.2.8"), "|10.244.1.5|10.244.2.8");
-  assert.equal(key({ "cf-connecting-ip": "203.0.113.7", "x-forwarded-for": "nope" }, "10.244.2.8"),
-    "203.0.113.7|nope|10.244.2.8");
+  // No CF-Connecting-IP: the trusted hop. A junk hop: the trusted peer itself. Env unset: three parts.
+  assert.equal(key({ "x-forwarded-for": "10.244.1.5" }, "10.244.2.8"), "10.244.1.5");
+  assert.equal(key({ "cf-connecting-ip": "203.0.113.7", "x-forwarded-for": "nope" }, "10.244.2.8"), "10.244.2.8");
   assert.equal(key({ "cf-connecting-ip": "203.0.113.7", "x-forwarded-for": "10.244.1.5" }, "10.244.2.8", null),
     "203.0.113.7|10.244.1.5|10.244.2.8");
   assert.equal(hub.parseTrustedProxies(""), null);
@@ -181,6 +180,52 @@ test("XERK-2579: behind trusted proxies one public IP is one sign-in key", () =>
   for (const bad of ["10.0.0.0/33", "10.0.0.0/x", "host.local", "10.0.0.0/8/1", "::/129", "10.0.0.0/"]) {
     assert.throws(() => hub.parseTrustedProxies(bad), /TURMA_TRUSTED_PROXIES/, bad);
   }
+});
+
+test("XERK-2585: off Cloudflare, a rotated CF-Connecting-IP never changes the sign-in key", () => {
+  const trusted = hub.parseTrustedProxies("10.244.0.0/16");
+  const key = (headers, remoteAddress, t = trusted) => hub.loginClientKey({ headers, socket: { remoteAddress } }, t);
+  // LAN -> ingress directly: the ingress appends the LAN address; the forged header is ignored.
+  const lan = new Set();
+  for (let i = 0; i < 50; i++) {
+    lan.add(key({ "cf-connecting-ip": `198.51.100.${i}`, "x-forwarded-for": `198.51.100.${i}, 192.168.1.50` }, "10.244.2.8"));
+  }
+  assert.deepEqual([...lan], ["192.168.1.50"]);
+  // Straight at the hub from outside the proxies: the socket, whatever the headers say.
+  const direct = new Set();
+  for (let i = 0; i < 50; i++) {
+    direct.add(key({ "cf-connecting-ip": `198.51.100.${i}`, "x-forwarded-for": `10.244.1.${i}` }, "192.168.1.50"));
+  }
+  assert.deepEqual([...direct], ["192.168.1.50"]);
+  // A pod straight at the hub with no XFF: the pod's own address.
+  assert.equal(key({ "cf-connecting-ip": "198.51.100.9" }, "10.244.7.7"), "10.244.7.7");
+  // IPv6: one key per /64, through Cloudflare and off it.
+  const v6 = new Set(["2001:db8:1:2::1", "2001:db8:1:2:ffff:1:2:3", "2001:DB8:1:2:0:0:0:9"].map((ip) =>
+    key({ "cf-connecting-ip": ip, "x-forwarded-for": "10.244.1.5" }, "10.244.2.8")));
+  assert.deepEqual([...v6], ["2001:db8:1:2::/64"]);
+  assert.equal(key({ "x-forwarded-for": "2001:db8:9:9::42" }, "10.244.2.8"), "2001:db8:9:9::/64");
+  assert.equal(key({}, "fe80::1%eth0"), "fe80:0:0:0::/64");
+  assert.equal(hub.loginIpv6Prefix64("::1"), "0:0:0:0::/64");
+  assert.equal(hub.loginIpv6Prefix64("64:ff9b::1.2.3.4"), "64:ff9b:0:0::/64");
+  // An IPv4 client in IPv6 dress keys on itself, never on a shared /64.
+  assert.equal(key({ "cf-connecting-ip": "64:ff9b::1.2.3.4", "x-forwarded-for": "10.244.1.5" }, "10.244.2.8"),
+    "64:ff9b::1.2.3.4");
+  assert.notEqual(key({ "x-forwarded-for": "0:0:0:0:0:ffff:1.2.3.4" }, "10.244.2.8"),
+    key({ "x-forwarded-for": "0:0:0:0:0:ffff:5.6.7.8" }, "10.244.2.8"));
+  // By range, not spelling: Node writes NAT64 in hex.
+  assert.notEqual(key({ "x-forwarded-for": "64:ff9b::102:304" }, "10.244.2.8"),
+    key({ "x-forwarded-for": "64:ff9b::506:708" }, "10.244.2.8"));
+  // A dotted tail outside those ranges is still an ordinary /64.
+  assert.equal(key({ "x-forwarded-for": "2001:db8:1:3::1.2.3.4" }, "10.244.2.8"), "2001:db8:1:3::/64");
+  // A zone id naming a VLAN (with a dot) still collapses to the /64.
+  assert.equal(key({ "x-forwarded-for": "fe80::1%eth0.100" }, "10.244.2.8"), "fe80:0:0:0::/64");
+  // Whole keys drop their zone; ::/96 compat is whole; the /96 edge is an ordinary /64.
+  assert.equal(key({ "x-forwarded-for": "64:ff9b::1.2.3.4%eth0" }, "10.244.2.8"), "64:ff9b::1.2.3.4");
+  assert.equal(key({ "x-forwarded-for": "::1.2.3.4%eth0.100" }, "10.244.2.8"), "::1.2.3.4");
+  assert.equal(key({ "x-forwarded-for": "64:ff9b:0:0:0:1::1" }, "10.244.2.8"), "64:ff9b:0:0::/64");
+  // Unset env keeps the three-part key exactly.
+  assert.equal(key({ "cf-connecting-ip": "198.51.100.1", "x-forwarded-for": "192.168.1.50" }, "10.244.2.8", null),
+    "198.51.100.1|192.168.1.50|10.244.2.8");
 });
 
 test("XERK-2568: the failure map's key is bounded whatever the username", () => {

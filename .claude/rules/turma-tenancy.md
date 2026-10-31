@@ -68,6 +68,14 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     - Correct only while the ingress APPENDS its peer to XFF (no `use-forwarded-headers`).
     - A malformed entry exits the hub at boot (2) rather than silently keying three-part.
     - Tests: `tenancy-nopassword.test.js` "XERK-2579: behind trusted proxies…".
+  - **With it set, the key is the FIRST untrusted address from the hub inward** (XERK-2585): an
+    untrusted socket, else an untrusted last XFF hop, else CF-Connecting-IP. Never key on
+    CF-Connecting-IP when the hop is untrusted: a caller off Cloudflare rotates it per request
+    and gets a fresh backoff each time — break-glass runs no scrypt, so that was unlimited guessing.
+    - IPv6 keys collapse to the /64 (`loginIpv6Prefix64`): one subscriber rotates within it.
+      Accepted: a /56 holder still gets 256 keys. An embedded-IPv4 address (mapped, NAT64, compat /96, by range) keys whole.
+    - Residual: anything inside the trusted CIDR still forges all headers.
+    - Tests: `tenancy-nopassword.test.js` "XERK-2585: off Cloudflare…".
   - `loginFailures` keys are a sha256 of client + username — the username is unbounded (1 MiB body),
     and a raw key let one client heap-OOM the hub in ~35 s.
   - One sign-in queued-or-running per client; its extras get 503 + `Retry-After` at once, no scrypt.
@@ -77,8 +85,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     `Retry-After`, answered before any scrypt.
   - **Never add a per-USERNAME in-flight cap or a username-only backoff** — either lets an anonymous
     client lock a known account out for everyone, the exact failure this replaced.
-  - Residual: a caller reaching the hub without Cloudflare can rotate its CF-Connecting-IP; that
-    buys it queue places (bounded by `LOGIN_QUEUE_MAX`, so ~18 keys 503 others), not more scrypt.
+  - Residual with `TURMA_TRUSTED_PROXIES` UNSET: a caller off Cloudflare rotates its
+    CF-Connecting-IP into a fresh key per request (fresh backoff, queue places). Set it in prod.
 - `parseHash` refuses a stored cost past `SCRYPT_MAXMEM`: a hand-edited store must not OOM a login.
 - **`/api/login` checks break-glass FIRST, scrypt-free**, so a flood cannot lock break-glass out.
 - Break-glass guesses share XERK-2568's per-(client, username) backoff (XERK-2577), via
