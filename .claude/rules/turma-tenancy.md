@@ -226,6 +226,11 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 - Not here: scoping the `/api/agents` payload + SSE per principal is XERK-2534's; until it lands
   every signed-in principal still RECEIVES every org's maps (writes and per-org routes are gated).
 - Tests: the `XERK-2551:` cases in `server.test.js`.
+- **A claimed siteKey grants nothing** (XERK-2596): an org's membership, writes and dispatch all
+  key on the SCOPED org, so a tenant host beating another org's site is only in its own org.
+  - Never add an org route outside the `/api/jira|orgs/<site>` guard, nor a host picker that
+    bypasses `hostInOrg` (every dispatch — queue, builder, brief, meeting — goes through it).
+  - Tests: the `XERK-2596:` cases in `server.test.js` (every write route + every dispatch path).
 
 ## Tests
 
