@@ -84,9 +84,13 @@ Split out of `CLAUDE.md`, which keeps the per-host credential contract (XERK-268
     host's first beat and the new identity was refused. Minting a code for the name is the
     operator choosing the new machine; the cost is that a blipped host whose operator Removed it
     AND minted a code is locked out (intended). Like `revokeHostIdentities`, except a renamed
-    agent's tombstone moves `home` to its origin, or it would hold the name and refuse the next
-    code. Written through before the 200; a live tunnel under the name is cut.
-    Tests: `XERK-2573:` cases.
+    agent's tombstone moves `home` to its origin and drops its `names`: a tombstone holds every
+    name it lists and only the ORIGIN's release drops it, so a kept middle name of a rename chain
+    refused codes with no DELETE that freed it. A live tunnel under the name (any casing) is cut.
+    The origin name itself stays refused for codes until it is released (the XERK-2383 rule).
+  - **Every 200 redemption writes the identities through before answering**: the code is burned at
+    once (no debounce), so an identity left on the 5s debounce was a spent code plus a token the
+    hub did not know after a hard kill. Tests: `XERK-2573:` cases (the on-disk checks).
   - `owner` records the minting principal (`oidc:<sub>` or `local:<user>`) for the tenancy epic
     (XERK-2529) to bind the host to a tenant. **Recorded, not enforced.**
   - Agent: `hub-agent.py --enroll` with `TURMA_ENROLL_CODE` in the ENV (never argv) runs

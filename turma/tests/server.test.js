@@ -20296,6 +20296,11 @@ test("XERK-2572: a refused redemption leaves the name token's generation alone",
   forget2531("enr-live", "enr-other"); forget2381("enr-live", "enr-other");
 });
 
+// What a hard kill right now would boot with (the file, not the debounced store).
+const onDiskIdentities = () => {
+  try { return JSON.parse(fs.readFileSync(process.env.AGENT_IDENTITIES_FILE, "utf8")) || {}; }
+  catch { return {}; }
+};
 test("XERK-2573: redeeming a code for a released name revokes the old machine's identity token", async () => {
   forget2531("enr-id"); forget2381("enr-id");
   const beat = (tok) => request("POST", "/api/heartbeat", {
@@ -20314,6 +20319,9 @@ test("XERK-2573: redeeming a code for a released name revokes the old machine's 
   assert.equal(early.status, 403, JSON.stringify(early.body));
   assert.match(early.body.error, /not registered/);
   assert.ok(!Object.prototype.hasOwnProperty.call(agents, "enr-id"));
+  const stored = onDiskIdentities();
+  assert.equal(stored[tokenUid(oldUid)], undefined, "the revoke is written through before the 200");
+  assert.ok(stored[tokenUid(r.body.token)], "so is the new identity");
   assert.equal((await beat(r.body.token)).status, 200); // the new machine keeps the name
   forget2531("enr-id"); forget2381("enr-id");
 });
@@ -20340,6 +20348,54 @@ test("XERK-2573: a renamed-then-removed agent's revoked tombstone keeps its orig
   const second = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "Enr-TB");
   assert.equal(second.status, 200, JSON.stringify(second.body));
   forget2531("enr-ta", "enr-tb", "Enr-TB"); forget2381("enr-ta", "enr-tb");
+});
+
+test("XERK-2573: a rename chain's middle name stays enrollable after its tombstone is made", async () => {
+  forget2531("enr-ca", "enr-cb", "enr-cc"); forget2381("enr-ca", "enr-cb", "enr-cc");
+  const beat = (tok, device) => request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: { device, sessions: [] } });
+  const old = enrollUid("enr-ca");
+  assert.equal((await beat(old, "enr-ca")).status, 200);
+  quiet("enr-ca");
+  assert.equal((await beat(old, "enr-cb")).status, 200);
+  quiet("enr-cb");
+  assert.equal((await beat(old, "enr-cc")).status, 200);
+  assert.equal((await request("DELETE", "/api/agents/enr-cc", { headers: userHeaders })).status, 200);
+  assert.equal(hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-cc").status, 200);
+  assert.equal(hub.agentIdentities()[tokenUid(old)].names, undefined);
+  assert.equal(hub.mintEnrollCode("local:op", "enr-cb").status, 200); // not held by the tombstone
+  forget2531("enr-ca", "enr-cb", "enr-cc"); forget2381("enr-ca", "enr-cb", "enr-cc");
+});
+
+test("XERK-2573: the old machine's live tunnel is cut on redemption, in any casing", async () => {
+  forget2531("enr-tun"); forget2381("enr-tun");
+  const tok = enrollUid("enr-tun");
+  assert.equal((await request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" },
+    body: { device: "enr-tun", sessions: [] } })).status, 200);
+  const ctrl = await wsConnect(`/agent/control?name=enr-tun&token=${encodeURIComponent(tok)}`);
+  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+  collectControlFrames(ctrl.socket, ctrl.leftover);
+  const closed = new Promise((r) => ctrl.socket.once("close", r));
+  try {
+    assert.equal((await request("DELETE", "/api/agents/enr-tun", { headers: userHeaders })).status, 200);
+    assert.ok(controlChannels["enr-tun"], "a plain Remove leaves it");
+    const r = await request("POST", "/api/agent/enroll", {
+      body: { code: hub.mintEnrollCode("local:op", "").body.code, device: "Enr-Tun" } });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    await Promise.race([closed, new Promise((_, rej) =>
+      setTimeout(() => rej(new Error("the revoked agent's tunnel was left open")), 2000))]);
+  } finally { ctrl.socket.destroy(); }
+  forget2531("enr-tun", "Enr-Tun"); forget2381("enr-tun", "Enr-Tun");
+});
+
+test("XERK-2573: a plain redemption's new identity is written through before the 200", async () => {
+  forget2531("enr-wt");
+  const r = await request("POST", "/api/agent/enroll", {
+    body: { code: hub.mintEnrollCode("local:op", "").body.code, device: "enr-wt" } });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.ok(onDiskIdentities()[tokenUid(r.body.token)], "on disk, not on the 5s debounce");
+  forget2531("enr-wt");
 });
 
 test("XERK-2531: unknown codes are rate-limited, and a flood never blocks a real code", async () => {
