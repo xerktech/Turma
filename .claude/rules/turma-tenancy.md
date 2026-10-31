@@ -2,6 +2,7 @@
 paths:
   - turma/server.js
   - turma/tenancy.js
+  - turma/tenant-scope.js
   - turma/tests/tenancy.test.js
   - turma/tests/breakglass-pool.test.js
   - turma/tests/oidc-groups.test.js
@@ -172,7 +173,7 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   403): a tenant host only for a `user` principal of that tenant (no admin role, no break-glass); an
   untenanted host only for the hub's operators (admin role, break-glass, legacy cookie, open hub),
   never a plain tenant user — until the migration (XERK-2554) binds it.
-  - Listing/SSE/terminal scoping is XERK-2534's; this gate covers the per-host command routes.
+  - Listings, streams and every other route are scoped by the route table below (XERK-2534).
   - **A route that takes its host from the BODY runs the same check**: `/api/trigger` (the shared
     `TURMA_TRIGGER_TOKEN` proves no tenant, so it reaches untenanted hosts only) and
     `POST /api/archive/<tid>/restore`'s target. A new body-host route must too (QA found both).
@@ -223,8 +224,7 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   dedupe twin's tracker URL. Keys round-trip unchanged in route URLs.
 - **`purgeTenantData(tenantId)` is the one tenant-delete entry point**; each store registers its own
   purge (`registerTenantPurge`), each run in its own try/catch. A new per-tenant store must register.
-- Not here: scoping the `/api/agents` payload + SSE per principal is XERK-2534's; until it lands
-  every signed-in principal still RECEIVES every org's maps (writes and per-org routes are gated).
+- The `/api/agents` payload + SSE carry only the caller's orgs' maps (XERK-2534, below).
 - Tests: the `XERK-2551:` cases in `server.test.js`.
 - **A claimed siteKey grants nothing** (XERK-2596): an org's membership, writes and dispatch all
   key on the SCOPED org, so a tenant host beating another org's site is only in its own org.
@@ -232,8 +232,36 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     bypasses `hostInOrg` (every dispatch — queue, builder, brief, meeting — goes through it).
   - Tests: the `XERK-2596:` cases in `server.test.js` (every write route + every dispatch path).
 
+## Every route and stream is scoped to the caller's tenant (XERK-2534)
+
+- **`turma/tenant-scope.js` lists EVERY route and upgrade with a class** (public, agent, automation,
+  signed-in, host, session, org, repo, transcript, filtered). The handler 404s a path in no row
+  BEFORE any route runs — a new route is unreachable until it is classified. Add the row with it.
+  - The route-table test scans server.js's handlers, so a route whose condition the scan cannot
+    read (an `||` of two shapes) needs an explicit route statement it can.
+- **Visibility is the host rule**: hosts by `principalMayDriveHost`, orgs by `principalMaySite`
+  (the org key carries its tenant, XERK-2551), a repo when a host the caller may drive reports it,
+  a transcript when its archived (else live) host is the caller's.
+  - A repo or transcript no host reports at all is the operators' (the untenanted world).
+- **Every refusal is the 404 an unknown id gets**, never 403 (existence never leaks).
+- **`/api/agents` and every SSE frame go through `scopePayload`/`scopeEvent`**: each top-level key and
+  event has a scoper; an unknown one is DROPPED for every view (default-deny). A new payload key or
+  SSE event needs a `SCOPERS` row (a test pins every key the payload emits).
+  - It runs on top of `agentsPayloadFor`'s per-scope tail (XERK-2550), memoized per payload ETag and
+    view (`tenantViewSig`) with its own ETag; a view that loses nothing gets the payload's bytes.
+  - An SSE stream is scoped to the principal that opened it (`ssePrincipals`); a stream with none
+    gets nothing. A disabled user's open stream keeps its view until it reconnects.
+- **The ws-token names its principal** (`ws2.<exp>.<claims>.<mac>`, re-read from the store at
+  socket open); `/live` 404s another tenant's host. The pre-tenancy `ws.` token is refused.
+- `findSession(id, p)` resolves only the caller's hosts, so another tenant's agent reporting the
+  same session id can never capture a terminal.
+- Archive list/search pass `scope` (`archiveScopeFor`) into SQL (`scopeSql` / `scopeWhere`), never a
+  post-filter (paging would break).
+
 ## Tests
 
+- The `XERK-2534:` cases in `server.test.js`, `archive.test.js`, `index-store.test.js` (route table,
+  scoped payload/SSE/terminal/live/archive).
 - The `XERK-2533:` cases in `server.test.js` (cross-tenant beat/tunnel/route/enroll/migrate forges,
   the roll bind, the identity coerce).
 - `turma/tests/tenancy.test.js` (own process, break-glass set); `tenancy-nopassword.test.js` (own

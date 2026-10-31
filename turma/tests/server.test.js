@@ -195,6 +195,8 @@ const titles = () => notifications.filter((n) => n.title != null).map((n) => n.t
 const dismisses = () => notifications.filter((n) => n.data?.action === "dismiss").map((n) => n.data.notifKey);
 
 const hub = require("../server.js");
+// A hub operator (break-glass): the principal of an SSE stream a test opens by hand.
+const OPERATOR = Object.freeze({ kind: "breakglass", userId: null, tenantId: null, roles: Object.freeze(["admin"]) });
 // Off for the shared hub: its 100+ synthetic orgs would each fire the default
 // Daily Brief schedule (XERK-2398) on the real-clock leader tick; the XERK-2398
 // cases turn it back on with only their own host present.
@@ -16343,14 +16345,15 @@ test("transcribePcm: no Authorization header when WHISPER_API_KEY unset", async 
 
 test("ws-token: issued token validates; garbage/expired/tampered are rejected", () => {
   const tok = issueWsToken();
-  assert.match(tok, /^ws\./);
+  assert.match(tok, /^ws2\./);
   assert.equal(wsTokenValid(tok), true);
   assert.equal(wsTokenValid(""), false);
   assert.equal(wsTokenValid("nodot"), false);
   assert.equal(wsTokenValid("ws.notanumber.abc"), false);
   assert.equal(wsTokenValid(tok + "x"), false); // tampered MAC
 
-  // Correctly-signed but already-expired token (forged expiry, real HMAC key).
+  // Correctly-signed but already-expired token (forged expiry, real HMAC key) —
+  // both the pre-tenancy shape (no longer accepted at all, XERK-2534) and ws2.
   const pastExpiry = Date.now() - 1000;
   const key =
     process.env.TURMA_SESSION_SECRET ||
@@ -16360,6 +16363,9 @@ test("ws-token: issued token validates; garbage/expired/tampered are rejected", 
     .update(`ws.${pastExpiry}`)
     .digest("base64url");
   assert.equal(wsTokenValid(`ws.${pastExpiry}.${mac}`), false);
+  const body2 = `ws2.${pastExpiry}.${Buffer.from(JSON.stringify({ bg: 1, r: ["admin"] })).toString("base64url")}`;
+  const mac2 = require("crypto").createHmac("sha256", key).update(body2).digest("base64url");
+  assert.equal(wsTokenValid(`${body2}.${mac2}`), false);
 });
 
 test("ws-token: scope isolation — a session cookie fails wsTokenValid and vice versa", () => {
@@ -16375,7 +16381,7 @@ test("http: GET /api/ws-token is user-auth gated; returns {token, expiresInSec}"
 
   const res = await request("GET", "/api/ws-token", { headers: userHeaders });
   assert.equal(res.status, 200);
-  assert.match(res.body.token, /^ws\./);
+  assert.match(res.body.token, /^ws2\./);
   assert.equal(res.body.expiresInSec, 300);
   assert.equal(wsTokenValid(res.body.token), true);
 });
@@ -21029,6 +21035,346 @@ test("XERK-2533: the identity store drops an entry whose key and tenant disagree
   assert.ok(!("tenantId" in out["4".repeat(32)]));
 });
 
+// ---- XERK-2534: every browser route and live stream is scoped to the caller's tenant
+
+// The route table is default-deny: enumerate every route condition in the HTTP
+// and upgrade handlers (source scan) and require each to be classified.
+test("XERK-2534: every route the handlers serve is in the tenant route table", () => {
+  const scope = require("../tenant-scope.js");
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const start = src.indexOf("const server = http.createServer(");
+  const upg = src.indexOf('server.on("upgrade"', start);
+  const handler = src.slice(start, upg);
+  // Each top-level statement of the handler (4-space indent) that names a path.
+  const stmts = [];
+  const lines = handler.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^ {4}(if \(|const is[A-Z]\w* =)/.test(lines[i])) continue;
+    let st = lines[i];
+    while (!/[{;]\s*$/.test(st) && i + 1 < lines.length) st += " " + lines[++i].trim();
+    // A flag joining two shapes with || (archive ingest) is served by explicit routes below.
+    if (/parts\.length === \d+ \|\|/.test(st)) continue;
+    if (/parts\[|url\.pathname ===/.test(st) && !/!==/.test(st)) stmts.push(st);
+  }
+  const samples = [];
+  for (const st of stmts) {
+    const methods = [...st.matchAll(/req\.method === "([A-Z]+)"/g)].map((m) => m[1]);
+    for (const m of st.matchAll(/url\.pathname === "([^"]+)"/g)) {
+      samples.push({ st, methods, parts: m[1].split("/").filter(Boolean) });
+    }
+    if (!/parts\[0\] === "/.test(st)) continue;
+    const segs = [];
+    for (const m of st.matchAll(/parts\[(\d)\] === "([^"]+)"/g)) segs[Number(m[1])] = m[2];
+    const len = st.match(/parts\.length (===|>=) (\d)/);
+    const n = len ? Number(len[2]) : segs.length;
+    const parts = [];
+    for (let i = 0; i < Math.max(n, segs.length); i++) parts.push(segs[i] || `x${i}`);
+    samples.push({ st, methods, parts });
+  }
+  assert.ok(samples.length >= 60, `found only ${samples.length} routes`);
+  for (const { st, methods, parts } of samples) {
+    const ms = methods.length ? methods : ["GET", "POST", "PUT", "DELETE", "HEAD"];
+    const hit = ms.map((m) => scope.classifyRoute(m, parts));
+    const ok = methods.length ? hit.every(Boolean) : hit.some(Boolean);
+    assert.ok(ok, `unclassified route /${parts.join("/")} [${ms}]: ${st.trim().slice(0, 140)}`);
+    for (const h of hit) if (h) assert.ok(scope.CLASSES.has(h.cls));
+  }
+  // The upgrade handler's top-level branches.
+  const upgSrc = src.slice(upg, src.indexOf("\n});", upg));
+  for (const m of upgSrc.matchAll(/\n {2}if \(parts\[0\] === "(\w+)"(?: && parts\[1\] === "(\w+)")?/g)) {
+    const parts = [m[1], m[2] || "x1", "x2"];
+    const short = [m[1], ...(m[2] ? [m[2]] : [])];
+    assert.ok(scope.classifyUpgrade(parts) || scope.classifyUpgrade(short),
+      `unclassified upgrade /${short.join("/")}`);
+  }
+  // And a path in no row is refused before any route runs.
+  assert.equal(scope.classifyRoute("GET", ["api", "nope"]), null);
+  assert.equal(scope.classifyRoute("POST", ["api", "agents"]), null);
+});
+
+test("XERK-2534: an unlisted path answers 404 to a signed-in caller", async () => {
+  const r = await request("GET", "/api/definitely-not-a-route", { headers: userHeaders });
+  assert.equal(r.status, 404);
+});
+
+// Two tenants' hosts (A, B), one untenanted host, each bound to its own org.
+async function fleet2534(T) {
+  const ka = `t2534h@${T.A.t}`, kb = `t2534h@${T.B.t}`;
+  forget2534(T);
+  const ta = await enroll2533(T.A, "t2534h");
+  const tb = await enroll2533(T.B, "t2534h");
+  const jira = (site) => ({ jira: { configured: true, available: true, siteKey: site, tickets: [] },
+    repos: [{ name: `repo-${site}` }],
+    sessions: [{ id: `s-${site}`, status: "running", transcriptId: `tid-${site}`, ttydPort: 7700 }] });
+  assert.equal((await beat2533(ta, "t2534h", jira("a2534.example"))).status, 200);
+  assert.equal((await beat2533(tb, "t2534h", jira("b2534.example"))).status, 200);
+  assert.equal((await request("POST", "/api/heartbeat", { body: { device: "t2534leg", ...jira("u2534.example") },
+    headers: { ...agentHeaders, "content-type": "application/json" } })).status, 200);
+  // XERK-2551: a tenant host's org is its site scoped into its tenant.
+  return { ka, kb, ta, tb, sa: `a2534.example@${T.A.t}`, sb: `b2534.example@${T.B.t}` };
+}
+function forget2534(T) {
+  forget2533("t2534h", "t2534leg", `t2534h@${T.A.t}`, `t2534h@${T.B.t}`);
+}
+const keysOf = (body) => body.agents.map((a) => a.key).filter((k) => k.startsWith("t2534"));
+
+test("XERK-2534: /api/agents serves each caller only its own tenant's hosts and orgs", async () => {
+  const T = tenants2533();
+  try {
+    const { ka, kb, sa } = await fleet2534(T);
+    // Each tenant pins a color on its own org; the other cannot even tell it exists.
+    const color = (site, h) => request("POST", `/api/jira/${site}/color`, { headers: h, body: { slot: 3 } });
+    assert.equal((await color(sa, T.A.h)).status, 200);
+    assert.equal((await color(sa, T.B.h)).status, 404, "404, never 403");
+    assert.equal((await color("u2534.example", T.A.h)).status, 404, "a tenant reaches no untenanted org");
+    assert.equal((await color("u2534.example", userHeaders)).status, 200);
+    const get = async (h) => (await request("GET", "/api/agents", { headers: h })).body;
+    const a = await get(T.A.h);
+    assert.deepEqual(keysOf(a), [ka]);
+    assert.ok(a.orgColors[sa] && !a.orgColors["u2534.example"]);
+    const b = await get(T.B.h);
+    assert.deepEqual(keysOf(b), [kb]);
+    assert.ok(!b.orgColors[sa]);
+    // Break-glass (no tenant): the untenanted world only, never tenant data.
+    const bg = await get(userHeaders);
+    assert.deepEqual(keysOf(bg), ["t2534leg"]);
+    assert.ok(!bg.orgColors[sa] && bg.orgColors["u2534.example"]);
+    // An admin who is also a user: its own tenant plus (pre-migration) the untenanted hosts.
+    assert.deepEqual(keysOf(await get(T.C.h)).sort(), ["t2534leg"]);
+    // Each view has its own ETag, so one tenant's 304 never serves another's body.
+    const ra = await request("GET", "/api/agents", { headers: T.A.h });
+    const rb = await request("GET", "/api/agents", { headers: { ...T.B.h, "if-none-match": ra.headers.etag } });
+    assert.equal(rb.status, 200);
+  } finally { forget2534(T); T.restore(); }
+});
+
+test("XERK-2534: SSE frames reach only streams whose principal may see them", async () => {
+  const T = tenants2533();
+  const mk = (p) => { const frames = []; const res = { write: (f) => frames.push(f) };
+    hub.ssePrincipals.set(res, p); hub.sseClients.add(res); return { res, frames }; };
+  const pa = hub.principalFromToken(T.A.h.cookie.slice("hub_session=".length));
+  const pb = hub.principalFromToken(T.B.h.cookie.slice("hub_session=".length));
+  const A = mk(pa), B = mk(pb), O = mk(OPERATOR), N = mk(null);
+  try {
+    const { ka, sa } = await fleet2534(T);
+    for (const c of [A, B, O, N]) c.frames.length = 0;
+    hub.sseBroadcast("agent", { key: ka, n: 1 });
+    hub.sseBroadcast("removed", { key: "t2534leg" });
+    hub.sseBroadcast("orgColors", { [sa]: { slot: 3 }, "u2534.example": { slot: 1 } });
+    hub.sseBroadcast("someFutureEvent", { x: 1 });
+    const evs = (c) => c.frames.map((f) => f.split("\n")[0].slice(7));
+    assert.deepEqual(evs(A), ["agent", "orgColors"]);
+    assert.match(A.frames[1], /a2534\.example/);
+    assert.doesNotMatch(A.frames[1], /u2534/);
+    assert.deepEqual(evs(B), ["orgColors"]);
+    assert.equal(B.frames[0], 'event: orgColors\ndata: {}\n\n');
+    assert.deepEqual(evs(O), ["removed", "orgColors"]);
+    assert.doesNotMatch(O.frames[1], /a2534/);
+    assert.deepEqual(N.frames, [], "a stream nobody opened gets nothing (default-deny)");
+  } finally {
+    for (const c of [A, B, O, N]) hub.sseClients.delete(c.res);
+    forget2534(T); T.restore();
+  }
+});
+
+test("XERK-2534: terminals, /live and ws-tokens are scoped to the caller's tenant", async () => {
+  const T = tenants2533();
+  try {
+    const { ka, kb } = await fleet2534(T);
+    const pa = hub.principalFromToken(T.A.h.cookie.slice("hub_session=".length));
+    // A session id another tenant's agent reports never resolves for this caller.
+    assert.equal(hub.findSession("s-a2534.example", pa).host, ka);
+    assert.equal(hub.findSession("s-b2534.example", pa), null);
+    assert.equal((await request("GET", "/term/s-b2534.example/", { headers: T.A.h })).status, 404);
+    // The ws-token names its principal, re-read from the store.
+    const tok = (await request("GET", "/api/ws-token", { headers: T.A.h })).body.token;
+    assert.equal(hub.wsTokenPrincipal(tok).tenantId, T.A.t);
+    const live = async (host, sid) => {
+      const r = await wsConnect(`/live/${encodeURIComponent(host)}/${sid}?auth=${encodeURIComponent(tok)}`);
+      r.socket.destroy();
+      return r.statusLine;
+    };
+    assert.match(await live(kb, "s-b2534.example"), / 404 /, "another tenant's host reads as no host");
+    assert.match(await live("t2534leg", "s-u2534.example"), / 404 /);
+    assert.match(await live(ka, "s-a2534.example"), / 101 /);
+  } finally { forget2534(T); T.restore(); }
+});
+
+test("XERK-2534: archive reads, search and browse are scoped to the caller's hosts", async () => {
+  const T = tenants2533();
+  try {
+    await fleet2534(T);
+    const pa = hub.principalFromToken(T.A.h.cookie.slice("hub_session=".length));
+    // A live session's transcript resolves to its host; an unknown id is the operators'.
+    assert.equal(hub.transcriptVisible(pa, "tid-a2534.example"), true);
+    assert.equal(hub.transcriptVisible(pa, "tid-b2534.example"), false);
+    assert.equal(hub.transcriptVisible(pa, "tid-nobody-2534"), false);
+    assert.equal(hub.transcriptVisible(OPERATOR, "tid-nobody-2534"), true);
+    assert.equal((await request("GET", "/api/archive/tid-b2534.example", { headers: T.A.h })).status, 404);
+    assert.deepEqual(hub.archiveScopeFor(pa), { tenant: T.A.t, untenanted: false });
+    assert.deepEqual(hub.archiveScopeFor(OPERATOR), { tenant: null, untenanted: true });
+    // Browse runs under that scope (no error, every row the caller's).
+    const list = await request("GET", "/api/archive", { headers: T.A.h });
+    assert.equal(list.status, 200);
+    for (const s of list.body.sessions) assert.ok(s.host.endsWith(`@${T.A.t}`), s.host);
+    const bgList = await request("GET", "/api/archive", { headers: userHeaders });
+    for (const s of bgList.body.sessions) assert.ok(!/@[0-9a-f]{32}$/.test(s.host), s.host);
+  } finally { forget2534(T); T.restore(); }
+});
+
+test("XERK-2534: Refresh, permissions and repo tiers reach only the caller's hosts", async () => {
+  const T = tenants2533();
+  try {
+    const { ka, sb } = await fleet2534(T);
+    const r = await request("POST", "/api/jira/refresh", { headers: T.A.h, body: {} });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.hosts.filter((k) => k.startsWith("t2534")), [ka]);
+    const tier = (repo, h) => request("POST", `/api/repos/${repo}/tier`, { headers: h, body: { tier: "live" } });
+    assert.equal((await tier("repo-b2534.example", T.A.h)).status, 404);
+    assert.equal((await tier("repo-a2534.example", T.A.h)).status, 200);
+    const agentsA = (await request("GET", "/api/agents", { headers: T.A.h })).body;
+    assert.ok(agentsA.repoTiers["repo-a2534.example"] && !agentsA.repoTiers["repo-b2534.example"]);
+    assert.equal((await request("POST", "/api/repos/repo-a2534.example/tier",
+      { headers: T.A.h, body: { auto: true } })).status, 200);
+    const mq = await request("GET", `/api/model-quality?org=${encodeURIComponent(sb)}&rows=1`, { headers: T.A.h });
+    assert.ok(mq.status === 404 || !JSON.stringify(mq.body).includes("b2534"), JSON.stringify(mq.body));
+  } finally { forget2534(T); T.restore(); }
+});
+
+test("XERK-2534: a host claiming another org's siteKey never routes its caller to that org's hosts (QA)", async () => {
+  const T = tenants2533();
+  const ke = `t2534evil@${T.A.t}`;
+  try {
+    await fleet2534(T);
+    forget2533("t2534evil", ke);
+    const te = await enroll2533(T.A, "t2534evil");
+    // Alice's second host CLAIMS the operators' org.
+    assert.equal((await beat2533(te, "t2534evil", { jira: { configured: true, available: true,
+      siteKey: "u2534.example", tickets: [] } })).status, 200);
+    const cmds = (k) => (agents[k].commands || []).map((c) => c.type);
+    const before = cmds("t2534leg").length;
+    const issue = await request("GET", "/api/jira/u2534.example/OPS-1", { headers: T.A.h });
+    assert.notEqual(issue.body && issue.body.host, "t2534leg");
+    const st = await request("POST", "/api/jira/u2534.example/OPS-1/status",
+      { headers: T.A.h, body: { category: "done" } });
+    assert.notEqual(st.body && st.body.host, "t2534leg");
+    const repo = await request("POST", "/api/jira/u2534.example/OPS-1/repo",
+      { headers: T.A.h, body: { repo: "repo-u2534.example" } });
+    assert.ok(!JSON.stringify(repo.body).includes("t2534leg"), JSON.stringify(repo.body));
+    const pin = await request("POST", "/api/jira/u2534.example/OPS-1/agent",
+      { headers: T.A.h, body: { host: "t2534leg" } });
+    assert.notEqual(pin.status, 200, "another principal's host is no pin target");
+    assert.equal(cmds("t2534leg").length, before, "nothing was queued on the operators' host");
+    // The operator still reaches its own host through the same org.
+    const op = await request("POST", "/api/jira/u2534.example/OPS-1/agent",
+      { headers: userHeaders, body: { host: "t2534leg" } });
+    assert.equal(op.status, 200);
+    await request("POST", "/api/jira/u2534.example/OPS-1/agent", { headers: userHeaders, body: { auto: true } });
+  } finally { forget2533("t2534evil", ke); forget2534(T); T.restore(); }
+});
+
+test("XERK-2534: an epic-builder run is cancelled only through its own org (QA)", async () => {
+  const T = tenants2533();
+  try {
+    await fleet2534(T);
+    const mk = await request("POST", "/api/jira/u2534.example/epic-builder",
+      { headers: userHeaders, body: { title: "t", idea: "i" } });
+    assert.equal(mk.status, 200, JSON.stringify(mk.body));
+    const id = mk.body.run.id;
+    const del = (site, h) => request("DELETE", `/api/jira/${site}/epic-builder/${id}`, { headers: h });
+    assert.equal((await del(`a2534.example@${T.A.t}`, T.A.h)).status, 404, "another org's run reads as absent");
+    assert.equal((await del("u2534.example", userHeaders)).status, 200);
+  } finally { forget2534(T); T.restore(); }
+});
+
+test("XERK-2534: a removed tenant host's permission rows never fall to the operators (QA)", async () => {
+  const T = tenants2533();
+  try {
+    const { tb, kb } = await fleet2534(T);
+    const now = Date.now();
+    assert.equal((await beat2533(tb, "t2534h", { permissionEvents: [{ id: "p2534b", sessionId: "s2534b",
+      kind: "ask-in-chat", prompt: "BOBPROMPT2534 shall I?", openedAt: now - 1000 }] })).status, 200);
+    const prompts = async (h) => JSON.stringify((await request("GET", "/api/permissions", { headers: h })).body);
+    assert.match(await prompts(T.B.h), /BOBPROMPT2534/);
+    forget2533(kb);
+    assert.doesNotMatch(await prompts(userHeaders), /BOBPROMPT2534/);
+    assert.match(await prompts(T.B.h), /BOBPROMPT2534/, "still its own tenant's");
+  } finally { forget2534(T); T.restore(); }
+});
+
+test("XERK-2534: a route's inline fleet sweep never routes another org's run to the caller's host (QA)", async () => {
+  const T = tenants2533();
+  const ke = `t2534ev2@${T.A.t}`;
+  try {
+    await fleet2534(T);
+    forget2533("t2534ev2", ke);
+    // The operators' run queues while their only host is full.
+    agents.t2534leg.capacity = { free: 0, max: 4 };
+    const ops = await request("POST", "/api/jira/u2534.example/epic-builder",
+      { headers: userHeaders, body: { title: "OPS SECRET", idea: "ops idea", repo: "repo-u2534.example" } });
+    assert.equal(ops.status, 200, JSON.stringify(ops.body));
+    const id = ops.body.run.id;
+    assert.ok(!epicBuilders[id].host, "held queued");
+    // Their host frees up (repo cloned); then Alice's host claims their org.
+    agents.t2534leg.capacity = { free: 4, max: 4 };
+    const te = await enroll2533(T.A, "t2534ev2");
+    assert.equal((await beat2533(te, "t2534ev2", { capacity: { free: 4, max: 4 }, jira: { configured: true,
+      available: true, siteKey: "u2534.example", tickets: [] } })).status, 200);
+    // Alice arms a builder on her OWN org: the inline sweep runs outside her
+    // scope, so the operators' run goes to their own (cloned, free) host.
+    await request("POST", `/api/jira/a2534.example@${T.A.t}/epic-builder`,
+      { headers: T.A.h, body: { title: "mine", idea: "mine" } });
+    assert.equal(epicBuilders[id].host, "t2534leg");
+    assert.ok(!(agents[ke].commands || []).some((c) => c.type === "spawnEpicBuilder" && c.builderId === id));
+    await request("DELETE", `/api/jira/u2534.example/epic-builder/${id}`, { headers: userHeaders });
+  } finally { forget2533("t2534ev2", ke); forget2534(T); T.restore(); }
+});
+
+test("XERK-2534: a builder run dispatches only to hosts of the principal that armed it (QA)", async () => {
+  const T = tenants2533();
+  const kb2 = `t2534bob2@${T.B.t}`;
+  try {
+    const { ka } = await fleet2534(T);
+    forget2533("t2534bob2", kb2);
+    // Bob's roomier host claims Alice's org; Alice's own host has one free slot.
+    const tb2 = await enroll2533(T.B, "t2534bob2");
+    assert.equal((await beat2533(tb2, "t2534bob2", { capacity: { free: 4, max: 4 }, jira: { configured: true,
+      available: true, siteKey: "a2534.example", tickets: [] } })).status, 200);
+    // ...and so does a roomier UNTENANTED host (the operators').
+    assert.equal((await request("POST", "/api/heartbeat", { headers: { ...agentHeaders, "content-type": "application/json" },
+      body: { device: "t2534legb", capacity: { free: 4, max: 4 }, jira: { configured: true, available: true,
+        siteKey: "a2534.example", tickets: [] } } })).status, 200);
+    agents[ka].capacity = { free: 1, max: 4 };
+    const mk = await request("POST", `/api/jira/a2534.example@${T.A.t}/epic-builder`,
+      { headers: T.A.h, body: { title: "ALICE SECRET", idea: "alice idea" } });
+    assert.equal(mk.status, 200, JSON.stringify(mk.body));
+    const run = epicBuilders[mk.body.run.id];
+    assert.equal(run.host, ka, "her own host, never the claimer's");
+    assert.deepEqual(hub.sanitizeEpicBuilderRecord(run), run, "the coerce is a fixed point");
+    // The 15s sweep (no request) honours the same scope on a re-dispatch.
+    delete run.host; delete run.dispatchedAt;
+    agents[ka].capacity = { free: 0, max: 4 };
+    hub.epicBuilderDriveSweep();
+    assert.ok(!run.host, "held for her own host rather than sent to Bob's");
+    for (const k of [kb2, "t2534legb"]) {
+      assert.ok(!(agents[k].commands || []).some((c) => c.type === "spawnEpicBuilder"), k);
+    }
+    await request("DELETE", `/api/jira/a2534.example@${T.A.t}/epic-builder/${run.id}`, { headers: T.A.h });
+  } finally { forget2533("t2534bob2", kb2, "t2534legb"); forget2534(T); T.restore(); }
+});
+
+test("XERK-2534: scopePayload drops every key it does not know (default-deny)", () => {
+  const scope = require("../tenant-scope.js");
+  const view = { mayHost: () => true, maySite: () => true, repos: new Set(),
+    fleetRepos: new Set(), seesUntenanted: true };
+  const { out, changed } = scope.scopePayload({ now: 1, agents: [], brandNewKey: { secret: 1 } }, view);
+  assert.equal(changed, true);
+  assert.ok(!("brandNewKey" in out));
+  // Every key the hub's payload carries today is listed.
+  const body = JSON.parse(hub.safeAgentsCache().body);
+  for (const k of Object.keys(body)) assert.ok(k in scope.SCOPERS, `payload key ${k} has no scoper`);
+});
+
 // ---- XERK-2381: an agent keeps its identity across a host rename ----------
 
 // Mint `host`'s identity the way an agent does: enroll on its name token.
@@ -25489,6 +25835,7 @@ test("XERK-762: sseBroadcast delivers locally AND publishes to the bus when HA i
   // A fake SSE client capturing the frames written to it.
   const frames = [];
   const fakeRes = { write(s) { frames.push(s); } };
+  hub.ssePrincipals.set(fakeRes, OPERATOR); // XERK-2534: a stream is opened BY someone
   hub.sseClients.add(fakeRes);
 
   // Non-HA (default): bus stays null, only local delivery, no publish.
@@ -25533,6 +25880,7 @@ test("XERK-762: a store blip (publish rejects) never throws out of sseBroadcast"
   // And through sseBroadcast (local delivery still happens; publish is swallowed).
   const frames = [];
   const fakeRes = { write(s) { frames.push(s); } };
+  hub.ssePrincipals.set(fakeRes, OPERATOR); // XERK-2534: a stream is opened BY someone
   hub.sseClients.add(fakeRes);
   hub.__setSseBus(bus);
   assert.doesNotThrow(() => hub.sseBroadcast("agent", { key: "h" }));
@@ -28936,7 +29284,9 @@ test("XERK-2550: /api/agents serves each principal its own retired usage and rou
     assert.equal(again.status, 304);
     const cross = await request("GET", "/api/agents", { headers: { ...T.B.h, "if-none-match": a.headers.etag } });
     assert.equal(cross.status, 200);
-    assert.deepEqual(a.body.agents, ops.body.agents);   // listing scoping is XERK-2534's
+    // The listing itself is scoped too (XERK-2534): each caller's own hosts only.
+    assert.ok(a.body.agents.every((x) => x.key.endsWith(`@${T.A.t}`)));
+    assert.ok(ops.body.agents.every((x) => !/@[0-9a-f]{32}$/.test(x.key)));
   } finally {
     for (const k of keys) hub.usageLedger.forget(k);
     hub.__setModelPolicyState({});

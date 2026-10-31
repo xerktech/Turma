@@ -2192,6 +2192,23 @@ function ftsQuery(q) {
 // ASYNC in both modes (XERK-793): pg mode serves DIRECT from the Postgres of-record
 // (there is no local entries_fts to search); sqlite mode wraps the local FTS5 query.
 // The caller (`GET /api/search`) awaits either way.
+// The tenant scope of an archive read (XERK-2534): `{tenant, untenanted}` from the
+// hub's request principal. A host key `<device>@<32-hex tenant>` is that tenant's;
+// any other host is untenanted (the operators', until the migration binds it).
+// Absent = no filter (callers that pass none see every row, as before). Returns a
+// SQLite WHERE fragment over `col` and its args; "0" when the scope sees nothing.
+const TENANT_HOST_GLOB = "*@" + "[0-9a-f]".repeat(32);
+function scopeSql(scope, col) {
+  if (!scope) return null;
+  const parts = [];
+  const args = [];
+  if (scope.untenanted) { parts.push(`NOT (${col} GLOB ?)`); args.push(TENANT_HOST_GLOB); }
+  if (typeof scope.tenant === "string" && /^[0-9a-f]{32}$/.test(scope.tenant)) {
+    parts.push(`${col} GLOB ?`); args.push("*@" + scope.tenant);
+  }
+  return { sql: parts.length ? `(${parts.join(" OR ")})` : "0", args };
+}
+
 async function searchArchive(query, opts) {
   const match = ftsQuery(query);
   if (!match) return { query: String(query || ""), groups: [] };
@@ -2203,6 +2220,7 @@ async function searchArchive(query, opts) {
     const pgRows = await pgIndex.searchQuery(match, {
       repo: opts && opts.repo ? opts.repo : undefined,
       host: opts && opts.host ? opts.host : undefined,
+      scope: opts && opts.scope ? opts.scope : undefined,
       limit,
     });
     rows = (pgRows || []).map((r) => ({
@@ -2216,6 +2234,8 @@ async function searchArchive(query, opts) {
     const args = [match];
     if (opts && opts.repo) { where.push("s.repo = ?"); args.push(opts.repo); }
     if (opts && opts.host) { where.push("s.host = ?"); args.push(opts.host); }
+    const sc = scopeSql(opts && opts.scope, "s.host");
+    if (sc) { where.push(sc.sql); args.push(...sc.args); }
     const sql = `
       SELECT s.transcriptId, s.host, s.remoteKey, s.repo, s.summary, s.endedTs,
              f.role AS role, f.ts AS ts, f.uuid AS uuid,
@@ -2260,6 +2280,7 @@ async function listArchive(opts) {
     // local-sqlite-lies repair with no analogue here).
     const rows = await pgIndex.listQuery({
       repo: opts.repo || undefined, host: opts.host || undefined, limit, offset,
+      scope: opts.scope || undefined,
     });
     const sessions = (rows || []).map((r) => ({
       transcriptId: r.transcriptId, host: r.host, remoteKey: r.remoteKey, repo: r.repo,
@@ -2273,6 +2294,8 @@ async function listArchive(opts) {
   const args = [];
   if (opts.repo) { where.push("repo = ?"); args.push(opts.repo); }
   if (opts.host) { where.push("host = ?"); args.push(opts.host); }
+  const sc = scopeSql(opts.scope, "host");
+  if (sc) { where.push(sc.sql); args.push(...sc.args); }
   // filePath + archiveBytes are fetched only to verify each row against its file
   // (XERK-280); they are stripped before the row is returned.
   const sql = `SELECT transcriptId, host, remoteKey, repo, worktree, summary,

@@ -67,6 +67,7 @@ const outcomeLedger = require("./outcome-ledger.js");
 const { resolveHaConfig } = require("./ha-config.js");
 const { createLiveStore, sameValue } = require("./store.js");
 const tenancy = require("./tenancy.js");
+const routeScope = require("./tenant-scope.js");
 const { createLeader } = require("./leader.js");
 // The archive's object-store backend + mirror (XERK-759, epic XERK-751). The
 // durable archive's BYTES (rendered + raw layers) move to object storage as the
@@ -7706,6 +7707,30 @@ function degradedAgentsError(e) {
   return e instanceof RangeError ? "payload too large"
     : "agents payload could not be serialized";
 }
+// The fleet payload as principal `p` may see it (XERK-2534): on top of the per-
+// scope tail agentsPayloadFor already picks (XERK-2550), every host it may not
+// drive and every org/repo/ticket-keyed entry outside its orgs is removed
+// (tenant-scope.js `scopePayload`). Memoized per payload ETag and view, so a poll
+// still costs a 304; a view that loses nothing is served the payload's own bytes.
+const scopedPayloads = new Map(); // `${view}|${etag}` -> {body, etag}
+function scopedAgentsCache(payload, p) {
+  if (!payload || typeof payload.body !== "string") return payload;
+  const key = `${tenantViewSig(p)}|${payload.etag}`;
+  const hit = scopedPayloads.get(key);
+  if (hit) return hit;
+  let obj;
+  try { obj = JSON.parse(payload.body); } catch { return { body: '{"agents":[]}', etag: '"scoped-empty"' }; }
+  const { out, changed } = routeScope.scopePayload(obj, tenantViewFor(p));
+  let entry = payload;
+  if (changed) {
+    const body = JSON.stringify(out);
+    entry = { body, etag: '"' + crypto.createHash("sha1").update(body).digest("base64") + '"' };
+  }
+  // A handful of views per build; old builds' entries are dropped wholesale.
+  if (scopedPayloads.size >= 64) scopedPayloads.clear();
+  scopedPayloads.set(key, entry);
+  return entry;
+}
 function safeAgentsCache() {
   try {
     return buildAgentsCache();
@@ -7913,12 +7938,26 @@ function forwardBodyCaps() {
 // the bus subscription, another replica's events).
 // `scope.policyTenant` (XERK-2550) limits a frame to the clients reading that
 // tenant's routing policy ("" = the untenanted fleet's); absent = every client.
+//
+// Each frame is also scoped to the principal that opened the stream (XERK-2534,
+// tenant-scope.js `scopeEvent`): another tenant's host frame is not sent at all,
+// and an org-keyed map is cut to the stream's orgs. One scoping per distinct view.
 function sseDeliverLocal(event, dataObj, scope) {
   if (!sseClients.size) return;
   const only = scope && typeof scope.policyTenant === "string" ? scope.policyTenant : null;
-  const frame = `event: ${event}\ndata: ${JSON.stringify(dataObj)}\n\n`;
+  const frames = new Map(); // view signature -> frame ("" = nothing to send)
   for (const res of sseClients) {
-    if (only !== null && ledgerTenantOf(ssePrincipals.get(res)) !== only) continue;
+    const p = ssePrincipals.has(res) ? ssePrincipals.get(res) : null;
+    if (!p) continue; // a stream nobody opened (default-deny)
+    if (only !== null && ledgerTenantOf(p) !== only) continue;
+    const sig = tenantViewSig(p);
+    let frame = frames.get(sig);
+    if (frame === undefined) {
+      const data = routeScope.scopeEvent(event, dataObj, tenantViewFor(p));
+      frame = data === undefined ? "" : `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+      frames.set(sig, frame);
+    }
+    if (!frame) continue;
     try { res.write(frame); } catch { sseClients.delete(res); }
   }
 }
@@ -8533,6 +8572,7 @@ function decidedOrgOf(a) {
 function hostInOrg(a, siteKey) {
   return !!siteKey && siteKeyOf(a) === siteKey && boundOrgOf(a) === siteKey;
 }
+
 
 // May a session move from `src` to `tgt`? Only within one decided org, and only
 // a NON-EMPTY one — so a drifted host (decided ""), a never-bound host (decided
@@ -11157,8 +11197,53 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
 // Which HOST owns a given sessionId, and that session's ttyd port. Sessions are
 // per-host but sessionIds are globally unique, so /term/<sessionId> can be
 // routed by scanning every host's sessions[]. null if no host reports it.
-function findSession(sessionId) {
+// ---- Tenant scoping of the request surface (XERK-2534) -----------------------
+// What principal `p` may see, in the shape turma/tenant-scope.js takes: its hosts
+// (principalMayDriveHost — a tenant host for that tenant's users, an untenanted one
+// for the operators), its orgs (principalMaySite: an org key carries its tenant,
+// XERK-2551), and its hosts' repo names beside the fleet's (repo names carry no
+// tenant, so a repo no host reports at all is the operators').
+function tenantViewFor(p) {
+  const mayHost = (key) => principalMayDriveHost(p, key);
+  const repos = new Set(), fleetRepos = new Set();
   for (const [key, a] of Object.entries(agents)) {
+    const vis = mayHost(key);
+    for (const r of (a && Array.isArray(a.repos) && a.repos) || []) {
+      if (r && typeof r.name === "string") { fleetRepos.add(r.name); if (vis) repos.add(r.name); }
+    }
+  }
+  return { mayHost, maySite: (site) => principalMaySite(p, site), repos, fleetRepos,
+    seesUntenanted: mayHost("") };
+}
+// A stable name for the set of hosts a principal reaches, for memoizing a scoped
+// payload per view (tenant users of one tenant, and the operators, share one).
+function tenantViewSig(p) {
+  const t = p && p.kind === "user" && typeof p.tenantId === "string" ? p.tenantId : "";
+  return `${t}|${principalMayDriveHost(p, "") ? 1 : 0}`;
+}
+// Whether `p` may read archived transcript `tid`: its archived host, else the live
+// session's host, else (an unknown id) only the operators — every one of those
+// answers the same 404 the route gives an unknown id, so existence never leaks.
+function transcriptVisible(p, tid) {
+  const row = archive.sessionRow(tid);
+  if (row && typeof row.host === "string") return principalMayDriveHost(p, row.host);
+  const live = liveSessionForTranscript(tid);
+  if (live && live.key) return principalMayDriveHost(p, live.key);
+  const r = archiveRefusalFor(tid);
+  if (r && typeof r.host === "string") return principalMayDriveHost(p, r.host);
+  return principalMayDriveHost(p, "");
+}
+// The archive scope (archive.js `scopeSql`) a principal's list/search runs under.
+function archiveScopeFor(p) {
+  const t = p && p.kind === "user" && typeof p.tenantId === "string" ? p.tenantId : null;
+  return { tenant: t, untenanted: principalMayDriveHost(p, "") };
+}
+
+// `p` (XERK-2534): only a host that principal may drive — another tenant's agent
+// reporting the same session id must never capture this caller's terminal.
+function findSession(sessionId, p) {
+  for (const [key, a] of Object.entries(agents)) {
+    if (p !== undefined && !principalMayDriveHost(p, key)) continue;
     for (const s of a.sessions || []) {
       if (s.id === sessionId) return { host: key, port: s.ttydPort };
     }
@@ -13747,25 +13832,43 @@ function sessionTokenValid(token) {
 // and passes it as ?auth=. Same "<payload>.<hmac>" shape as the session
 // cookie, but scoped with a "ws." prefix in both the token and the MAC input
 // so session cookies and ws-tokens can never be used in place of each other.
+//
+// The token NAMES its principal (XERK-2534): `ws2.<expiry>.<b64url claims>.<hmac>`,
+// the claims being the session token's (`principalClaims`) or `{k: "open"|"legacy"}`.
+// A /live socket is scoped to the caller's tenant off it, and the principal is
+// re-read from the store when the socket opens (disable / group loss bites at once).
+// The pre-tenancy `ws.<expiry>.<mac>` shape named nobody and is no longer accepted;
+// it lived 5 minutes, and every client fetches a fresh one per socket.
 const WS_TOKEN_TTL_MS = 5 * 60 * 1000;
-function issueWsToken() {
+function issueWsToken(p) {
   const expiry = Date.now() + WS_TOKEN_TTL_MS;
-  const mac = crypto.createHmac("sha256", SESSION_SIGN_KEY).update(`ws.${expiry}`).digest("base64url");
-  return `ws.${expiry}.${mac}`;
+  const claims = p && (p.kind === "user" || p.kind === "breakglass") ? principalClaims(p)
+    : { k: p && p.kind === "open" ? "open" : "legacy" };
+  const body = `ws2.${expiry}.${Buffer.from(JSON.stringify(claims)).toString("base64url")}`;
+  return `${body}.${crypto.createHmac("sha256", SESSION_SIGN_KEY).update(body).digest("base64url")}`;
 }
 
+// The principal a ws-token names, re-checked against the store NOW, or null.
+function wsTokenPrincipal(token) {
+  if (typeof token !== "string" || !token.startsWith("ws2.") || token.length > 4096) return null;
+  const last = token.lastIndexOf(".");
+  const body = token.slice(0, last);
+  const parts = body.split(".");
+  if (parts.length !== 3) return null;
+  const expNum = Number(parts[1]);
+  if (!Number.isSafeInteger(expNum) || expNum < Date.now()) return null;
+  const want = Buffer.from(crypto.createHmac("sha256", SESSION_SIGN_KEY).update(body).digest("base64url"));
+  const got = Buffer.from(token.slice(last + 1));
+  if (got.length !== want.length || !crypto.timingSafeEqual(got, want)) return null;
+  let c;
+  try { c = JSON.parse(Buffer.from(parts[2], "base64url").toString()); } catch { return null; }
+  if (!c || typeof c !== "object" || Array.isArray(c)) return null;
+  if (c.k === "open") return authEnabled() ? null : OPEN_PRINCIPAL;
+  if (c.k === "legacy") return authEnabled() ? LEGACY_PRINCIPAL : OPEN_PRINCIPAL;
+  return principalFromClaims(c);
+}
 function wsTokenValid(token) {
-  if (!token || !token.startsWith("ws.")) return false;
-  const rest = token.slice(3);
-  const dot = rest.indexOf(".");
-  if (dot < 0) return false;
-  const expiry = rest.slice(0, dot);
-  const expNum = parseInt(expiry, 10);
-  if (!Number.isFinite(expNum) || expNum < Date.now()) return false;
-  const expected = crypto.createHmac("sha256", SESSION_SIGN_KEY).update(`ws.${expiry}`).digest("base64url");
-  const got = Buffer.from(rest.slice(dot + 1));
-  const want = Buffer.from(expected);
-  return got.length === want.length && crypto.timingSafeEqual(got, want);
+  return !!wsTokenPrincipal(token);
 }
 
 function cookies(req) {
@@ -13861,14 +13964,17 @@ function principalFromToken(token) {
   if (!token) return null;
   if (token.startsWith("u2.")) {
     const c = sessionTokenClaims(token);
-    if (!c) return null;
-    if (c.bg === 1) return breakGlassEnabled() ? BREAKGLASS_PRINCIPAL : null;
-    if (typeof c.u !== "string" || !Object.hasOwn(tenancyState.users, c.u)) return null;
-    const user = tenancyState.users[c.u];
-    if (user.tenantId !== c.t) return null; // a tenant is the user's for life
-    return userPrincipal(user);
+    return c ? principalFromClaims(c) : null;
   }
   return sessionTokenValid(token) ? LEGACY_PRINCIPAL : null;
+}
+// The principal signed claims name (a session token's or a ws-token's), from the store.
+function principalFromClaims(c) {
+  if (c.bg === 1) return breakGlassEnabled() ? BREAKGLASS_PRINCIPAL : null;
+  if (typeof c.u !== "string" || !Object.hasOwn(tenancyState.users, c.u)) return null;
+  const user = tenancyState.users[c.u];
+  if (user.tenantId !== c.t) return null; // a tenant is the user's for life
+  return userPrincipal(user);
 }
 
 function requestPrincipal(req) {
@@ -21345,6 +21451,29 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // The tenant gate (XERK-2534). Every route is in turma/tenant-scope.js's table,
+    // and one that is not answers 404 here, before it runs — a route without an
+    // explicit tenant scope is unreachable rather than open. Cross-tenant ids
+    // answer the SAME 404 an unknown one does, never 403, so existence never leaks.
+    {
+      const route = routeScope.classifyRoute(req.method, parts);
+      if (!route) return json(res, 404, { error: "not found" });
+      // Orgs are gated by XERK-2551's guard below (principalMaySite).
+      const scoped = route.cls === "repo" || route.cls === "transcript";
+      if (scoped) {
+        const p = requestPrincipal(req);
+        const raw = route.cls === "repo" ? route.params.repo : route.params.tid;
+        let id;
+        try { id = decodeURIComponent(raw); } catch { return json(res, 400, { error: "bad path" }); }
+        if (route.cls === "repo" && !routeScope.repoVisible(tenantViewFor(p), id)) {
+          return json(res, 404, { error: "no host reports a repo by that name" });
+        }
+        if (route.cls === "transcript" && !transcriptVisible(p, id)) {
+          return json(res, 404, { error: "unknown transcript" });
+        }
+      }
+    }
+
     // Every per-ORG route (XERK-2551) answers only a principal that may act on
     // that org: a tenant's org (`<siteKey>@<tenantId>`) for that tenant, an
     // untenanted one for the hub's operators — the host rule above, applied to
@@ -21771,7 +21900,7 @@ const server = http.createServer(async (req, res) => {
     // Short-lived token for the /audio WebSocket (browser WebSocket can't set
     // an Authorization header, so the token rides the query string instead).
     if (req.method === "GET" && url.pathname === "/api/ws-token") {
-      return json(res, 200, { token: issueWsToken(), expiresInSec: WS_TOKEN_TTL_MS / 1000 });
+      return json(res, 200, { token: issueWsToken(requestPrincipal(req)), expiresInSec: WS_TOKEN_TTL_MS / 1000 });
     }
 
     // Host enrollment codes (XERK-2531): the dashboard's Add host dialog mints,
@@ -21854,7 +21983,7 @@ const server = http.createServer(async (req, res) => {
     // the body+ETag and revalidates with If-None-Match on its next poll. The
     // history cache is excluded from the payload (see serializeAgent).
     if (req.method === "GET" && url.pathname === "/api/agents") {
-      const cached = agentsPayloadFor(requestPrincipal(req));
+      const cached = scopedAgentsCache(agentsPayloadFor(requestPrincipal(req)), requestPrincipal(req));
       if ((req.headers["if-none-match"] || "") === cached.etag) {
         res.writeHead(304, { ETag: cached.etag, "Cache-Control": "no-cache" });
         return res.end();
@@ -23047,6 +23176,7 @@ const server = http.createServer(async (req, res) => {
           repo: url.searchParams.get("repo") || undefined,
           host: url.searchParams.get("host") || undefined,
           limit: url.searchParams.get("limit") || undefined,
+          scope: archiveScopeFor(requestPrincipal(req)),
         }));
       } catch (e) {
         return json(res, 500, { error: e.message });
@@ -23061,6 +23191,7 @@ const server = http.createServer(async (req, res) => {
           host: url.searchParams.get("host") || undefined,
           limit: url.searchParams.get("limit") || undefined,
           offset: url.searchParams.get("offset") || undefined,
+          scope: archiveScopeFor(requestPrincipal(req)),
         }));
       } catch (e) {
         return json(res, 500, { error: e.message });
@@ -23563,7 +23694,8 @@ const server = http.createServer(async (req, res) => {
       const hosts = Object.keys(agents).filter((k) => {
         if (!principalMayDriveHost(caller, k)) return false; // its own hosts only (XERK-2551)
         const j = agents[k] && agents[k].jira;
-        return !!j && (j.configured === true || !!j.siteKey);
+        // Only the caller's own hosts (XERK-2534).
+        return !!j && (j.configured === true || !!j.siteKey) && principalMayDriveHost(caller, k);
       });
       // Collapse a mashed button: a host already holding an unacked refresh
       // would otherwise run one full re-poll per click. `hosts` still reports
@@ -25447,7 +25579,7 @@ const server = http.createServer(async (req, res) => {
     // enforced by the gate above.
     if (parts[0] === "term" && parts.length >= 2) {
       const sessionId = decodeURIComponent(parts[1]);
-      const loc = findSession(sessionId);
+      const loc = findSession(sessionId, requestPrincipal(req));
       if (!loc) return json(res, 404, { error: "unknown session" });
       // ttyd runs with `-b /term/<id>`, so it answers the BARE base path with a
       // 302 to that same path plus a trailing slash. A hop that normalizes the
@@ -25793,13 +25925,18 @@ server.on("upgrade", async (req, socket, head) => {
   // deltas. Same short-lived ws-token auth as /audio (browser WebSocket can't
   // set an Authorization header).
   if (parts[0] === "live" && parts.length >= 3) {
-    if (!wsTokenValid(url.searchParams.get("auth"))) {
+    const livePrincipal = wsTokenPrincipal(url.searchParams.get("auth"));
+    if (!livePrincipal) {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       return socket.destroy();
     }
-    const host = decodeURIComponent(parts[1]);
-    const sessionId = decodeURIComponent(parts[2]);
-    if (!agents[host]) {
+    let host, sessionId;
+    try { host = decodeURIComponent(parts[1]); sessionId = decodeURIComponent(parts[2]); } catch {
+      socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+      return socket.destroy();
+    }
+    // Another tenant's host reads exactly as no host (XERK-2534): 404, never 403.
+    if (!agents[host] || !principalMayDriveHost(livePrincipal, host)) {
       socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
       return socket.destroy();
     }
@@ -25973,7 +26110,7 @@ server.on("upgrade", async (req, socket, head) => {
       return socket.destroy();
     }
     const sessionId = decodeURIComponent(parts[1]);
-    const loc = findSession(sessionId);
+    const loc = findSession(sessionId, requestPrincipal(req));
     if (!loc) {
       socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
       return socket.destroy();
@@ -26388,6 +26525,8 @@ if (process.env.TURMA_TEST) {
     baseOfKey,
     agentKeyFor,
     principalMayDriveHost,
+    tenantViewFor, tenantViewSig, transcriptVisible, archiveScopeFor, scopedAgentsCache,
+    wsTokenPrincipal, findSession,
     bindIdentityTenant,
     tenantBoundName,
     BREAKGLASS_PRINCIPAL,

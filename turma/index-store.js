@@ -191,6 +191,20 @@ function buildEntryInsert(prefix, transcriptId, entries, startSeq, overwrite) {
 // AND-joined) so the query semantics match the local index. Returns the same row
 // shape searchArchive's SQL projects (id/host/remoteKey/repo/summary/endedTs +
 // role/ts/uuid + a <mark>…</mark> snippet + rank), ordered by rank. Pure builder.
+// The tenant scope of an archive read (XERK-2534), the Postgres twin of
+// archive.js's scopeSql: a `<device>@<32-hex>` host is that tenant's, any other is
+// untenanted. Absent scope = no filter. Pushes its params; returns the fragment.
+function scopeWhere(scope, col, params) {
+  if (!scope) return null;
+  const parts = [];
+  if (scope.untenanted) parts.push(`${col} !~ '@[0-9a-f]{32}$'`);
+  if (typeof scope.tenant === "string" && /^[0-9a-f]{32}$/.test(scope.tenant)) {
+    params.push("%@" + scope.tenant);
+    parts.push(`${col} LIKE $${params.length}`);
+  }
+  return parts.length ? `(${parts.join(" OR ")})` : "FALSE";
+}
+
 function buildSearch(prefix, tsquery, opts) {
   const sessions = `${prefix}_sessions`;
   const entries = `${prefix}_entries`;
@@ -198,6 +212,8 @@ function buildSearch(prefix, tsquery, opts) {
   const params = [tsquery];
   if (opts && opts.repo) { params.push(opts.repo); where.push(`s.repo = $${params.length}`); }
   if (opts && opts.host) { params.push(opts.host); where.push(`s.host = $${params.length}`); }
+  const sc = scopeWhere(opts && opts.scope, "s.host", params);
+  if (sc) where.push(sc);
   params.push(opts && opts.limit ? opts.limit : 100);
   const limitIdx = params.length;
   const text = `
@@ -220,6 +236,8 @@ function buildList(prefix, opts) {
   const params = [];
   if (opts && opts.repo) { params.push(opts.repo); where.push(`repo = $${params.length}`); }
   if (opts && opts.host) { params.push(opts.host); where.push(`host = $${params.length}`); }
+  const sc = scopeWhere(opts && opts.scope, "host", params);
+  if (sc) where.push(sc);
   params.push(opts && opts.limit ? opts.limit : 100);
   const limitIdx = params.length;
   params.push(opts && opts.offset ? opts.offset : 0);

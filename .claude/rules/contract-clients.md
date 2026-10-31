@@ -28,3 +28,7 @@ Rules every client (web, Android) must keep with the hub and with each other.
     pending row. **`/history` refusals are `HistoryResult.Failed`, never `Pending`** — polling can't
     fix a refusal.
   - Both fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
+- **Every browser route answers only the caller's tenant** (XERK-2534, `turma-tenancy.md`): another
+  tenant's host, org, session or transcript reads as absent (404, never 403), and `/api/agents` + SSE
+  carry only the caller's hosts and orgs. Clients need no change: the org filter (`org.js`) stays a
+  within-tenant filter over what the hub already scoped. A ws-token must be fetched per socket.

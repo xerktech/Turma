@@ -1887,3 +1887,23 @@ test("XERK-1364: a restart mid-re-send stays de-duplicated; held entries stay se
   assert.deepEqual(uuids, ["r1", "r2", "r3", "r4"]);
   fresh.closeDb();
 });
+
+test("XERK-2534: list + search run under a tenant scope (a `<device>@<32-hex>` host is that tenant's)", async () => {
+  const T = "a".repeat(32), U = "b".repeat(32);
+  const meta = (slug) => ({ remoteKey: "github.com/x/scoped", repo: "scoped", worktree: "/w",
+    slug, createdAt: "2026-07-11T00:00:00Z", endedTs: "2026-07-11T00:00:00Z", summary: "scoped" });
+  archive.ingestChunk(`lap@${T}`, "s2534a", meta("a"), 0, 10, [ent("sa", "user", "tenantword alpha")]);
+  archive.ingestChunk(`lap@${U}`, "s2534b", meta("b"), 0, 10, [ent("sb", "user", "tenantword beta")]);
+  archive.ingestChunk("plainhost", "s2534c", meta("c"), 0, 10, [ent("sc", "user", "tenantword gamma")]);
+  const ids = async (scope) => (await archive.listArchive({ repo: "scoped", scope })).sessions
+    .map((s) => s.transcriptId).sort();
+  assert.deepEqual(await ids(undefined), ["s2534a", "s2534b", "s2534c"], "no scope = no filter");
+  assert.deepEqual(await ids({ tenant: T, untenanted: false }), ["s2534a"]);
+  assert.deepEqual(await ids({ tenant: null, untenanted: true }), ["s2534c"]);
+  assert.deepEqual(await ids({ tenant: T, untenanted: true }), ["s2534a", "s2534c"]);
+  assert.deepEqual(await ids({ tenant: null, untenanted: false }), [], "a scope that sees nothing");
+  assert.deepEqual(await ids({ tenant: "x' OR 1=1 --", untenanted: false }), [], "a bad tenant matches nothing");
+  const hits = (await archive.searchArchive("tenantword", { scope: { tenant: U, untenanted: false } }))
+    .groups.flatMap((g) => g.matches).map((m) => m.transcriptId);
+  assert.deepEqual(hits, ["s2534b"]);
+});
