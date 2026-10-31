@@ -29,7 +29,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   from the cookie's claims: disabling a user or dropping its group ends its sessions at once.
   A principal with no role is not signed in.
 - A token's `t` must equal the user's stored `tenantId`, or it names nobody.
-- `authEnabled()` = break-glass password OR bootstrap env OR any stored user. It replaced every
+- `authEnabled()` = break-glass password OR bootstrap env OR any LOCAL user. OIDC users never count:
+  a passwordless OIDC hub was open before tenancy and its first SSO login must not flip it closed. It replaced every
   `!!TURMA_PASSWORD` auth check; a new one must use it, or a passwordless hub with local users
   reads as open.
 
@@ -41,7 +42,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 - `coerceTenancy` is the ONE whitelist (boot, remote watch); it is a coerce fixed point, null-prototype
   maps, and drops duplicate logins (case-folded username / iss+sub) and reused tenants.
   - An unset group map is OMITTED (not `{}`), so the shipped defaults keep applying after a re-coerce.
-- Store: `/data/users.json` (`TENANCY_FILE`), `registerExternalStore` with `debounceMs: 0`. Never
+- Store: `/data/users.json` (`TENANCY_FILE`), `registerExternalStore` with `debounceMs: 0` and
+  `mode: 0o600` (password hashes; store.js creates the temp file with it before the rename). Never
   `state.json`. Tests must set `TENANCY_FILE` (an unset one writes the host's real `/data`).
 
 ## Passwords + login
@@ -71,4 +73,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 
 ## Tests
 
-- `turma/tests/tenancy.test.js` (own process); `XERK-2530:` in `oidc-groups.test.js`.
+- `turma/tests/tenancy.test.js` (own process, break-glass set); `tenancy-nopassword.test.js` (own
+  process, bootstrap admin ONLY — the forgery / empty-Basic / dummy-hash / mid-verify-disable guards);
+  `XERK-2530:` in `oidc-groups.test.js` and `server.test.js` (an OIDC user leaves an open hub open).
+- Known gaps, ticketed: local-login fairness under an anonymous flood (the 2-slot cap is global);
+  Android signs in with Basic, so local accounts cannot use the app yet.

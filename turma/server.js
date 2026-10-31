@@ -2728,9 +2728,9 @@ const asFlagMap = (raw) => {
 // store's setter AFTER mutating the mirror. `read` returns the current mirror
 // value; `install` replaces the mirror with a coerced value (boot-load / remote
 // watch); `coerce` validates a raw value to the store's shape.
-function registerExternalStore({ name, file, coerce, read, install, afterLoad, debounceMs = 5000 }) {
+function registerExternalStore({ name, file, coerce, read, install, afterLoad, debounceMs = 5000, mode }) {
   const key = STORE_KEY_PREFIX + name;
-  STORE_PERSISTENT[key] = { file, debounceMs };
+  STORE_PERSISTENT[key] = mode ? { file, debounceMs, mode } : { file, debounceMs };
   externalizedStores.push({ key, name, coerce, read, install, afterLoad });
   return function persist() {
     // `liveStore` is the module-load backend (file/in-memory off, Valkey on). On
@@ -2869,7 +2869,7 @@ const persistAgentIdentities = registerExternalStore({
 // and a 200 must mean the record is kept.
 let tenancyState = tenancy.coerceTenancy(readJsonFile(TENANCY_FILE));
 const persistTenancy = registerExternalStore({
-  name: "tenancy", file: TENANCY_FILE, debounceMs: 0,
+  name: "tenancy", file: TENANCY_FILE, debounceMs: 0, mode: 0o600, // holds password hashes
   coerce: tenancy.coerceTenancy, read: () => tenancyState, install: (v) => { tenancyState = v; },
 });
 function setTenancy(next) {
@@ -2891,6 +2891,9 @@ function bootstrapTenancy() {
     }
   } catch (e) {
     console.error(`tenancy: bootstrap admin not created: ${e && e.message}`);
+    if (!TURMA_PASSWORD && !hasLocalUsers()) {
+      console.error("ERROR: no break-glass password and no local account — this hub admits NOBODY until TURMA_BOOTSTRAP_ADMIN_* is fixed or TURMA_PASSWORD is set");
+    }
   }
 }
 bootstrapTenancy();
@@ -13218,14 +13221,17 @@ const BREAKGLASS_PRINCIPAL = Object.freeze({ kind: "breakglass", userId: null, t
 const LEGACY_PRINCIPAL = Object.freeze({ kind: "legacy", userId: null, tenantId: null, roles: Object.freeze([]) });
 const OPEN_PRINCIPAL = Object.freeze({ kind: "open", userId: null, tenantId: null, roles: Object.freeze(["user", "admin"]) });
 
-// A login is required once ANY credential exists: the break-glass password, a
-// local user, or the bootstrap pair about to create one.
-function tenancyHasUsers() {
-  for (const _ in tenancyState.users) return true;
+// A login is required once a LOCAL credential exists: the break-glass password,
+// a local account, or the bootstrap pair about to create one. OIDC users do not
+// count: a passwordless OIDC hub was open before tenancy, and its first SSO
+// login must not silently flip it closed (closing it is an operator decision —
+// set TURMA_PASSWORD or the bootstrap pair).
+function hasLocalUsers() {
+  for (const u of Object.values(tenancyState.users)) if (u.source === "local") return true;
   return false;
 }
 function authEnabled() {
-  return !!TURMA_PASSWORD || BOOTSTRAP_CONFIGURED || tenancyHasUsers();
+  return !!TURMA_PASSWORD || BOOTSTRAP_CONFIGURED || hasLocalUsers();
 }
 
 function userPrincipal(user) {

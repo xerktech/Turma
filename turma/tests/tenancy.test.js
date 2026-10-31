@@ -291,6 +291,7 @@ test("XERK-2530: the store is written to its own durable file, never state.json"
   const onDisk = JSON.parse(fs.readFileSync(process.env.TENANCY_FILE, "utf8"));
   assert.ok(Object.values(onDisk.users).some((u) => u.username === "firstadmin"));
   assert.ok(!fs.readFileSync(process.env.TENANCY_FILE, "utf8").includes("first-admin-pass"));
+  assert.equal(fs.statSync(process.env.TENANCY_FILE).mode & 0o777, 0o600, "password hashes are owner-only");
   // Opaque ids only — never the login or display name as a key.
   for (const [id, u] of Object.entries(onDisk.users)) {
     assert.match(id, /^[0-9a-f]{32}$/);

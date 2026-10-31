@@ -53,6 +53,13 @@ tenants, run by an admin panel.
   or removing its access group ends its live sessions at once, and roles come from the store, never
   the cookie.
 
+### When the login turns on
+
+- A login is required once a LOCAL credential exists: `TURMA_PASSWORD`, the bootstrap pair, or a local
+  account. An OIDC user alone does not turn it on: a passwordless OIDC hub was open before tenancy, and
+  closing it on its first SSO login would be a silent behaviour change. Closing it is the operator's
+  call (set `TURMA_PASSWORD` or the bootstrap pair).
+
 ### Roles from groups
 
 - Two roles: `user` (owns a tenant) and `admin` (manages identities).
