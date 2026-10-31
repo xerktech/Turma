@@ -56284,6 +56284,61 @@ class TestLockdownOneshotStdin(ManagerMixin, unittest.TestCase):
         self.assertEqual([n for n in os.listdir(ha.REGISTRY_DIR) if n.startswith("meeting-")], [])
 
 
+@unittest.skipUnless(hasattr(os, "killpg") and os.path.isdir("/proc"), "POSIX /proc only")
+class TestOneshotTimeoutKillsRealGroup(ManagerMixin, unittest.TestCase):
+    """XERK-2584: a timed-out one-shot's whole REAL process group dies — its
+    backgrounded children and a nested shell's child too, not just the leader."""
+
+    def _gone(self, pid):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                return f.read().split(") ")[-1].startswith("Z")   # zombie = dead
+        except FileNotFoundError:
+            return True
+
+    def test_a_timeout_kills_every_member_of_the_group(self):
+        sm = self.make_manager()
+        pidfile = os.path.join(self.tmp, "members.pid")
+        script = (f"echo $$ >> {pidfile}; sleep 300 & echo $! >> {pidfile}; "
+                  f"sh -c 'echo $$ >> {pidfile}; sleep 301 & echo $! >> {pidfile}; wait' & wait")
+        real_killpg = os.killpg
+        killed = []
+
+        def guarded_killpg(pgid, sig):
+            # A broken pid must never reach the real call: killpg(0|1|-1)
+            # would signal this test's own group, init, or everything.
+            if not isinstance(pgid, int) or pgid <= 1:
+                raise AssertionError(f"refused killpg({pgid!r})")
+            killed.append(pgid)
+            real_killpg(pgid, sig)
+        try:
+            with mock.patch.object(ha.os, "killpg", guarded_killpg):
+                self.assertIsNone(sm._run_lockdown_oneshot(
+                    ["sh", "-c", script], "attention-hint-", 2, 100, "t"))
+            with open(pidfile) as f:
+                members = [int(x) for x in f.read().split()]
+            self.assertEqual(len(members), 4, "outer sh, sleep 300, inner sh, sleep 301")
+            self.assertEqual(killed, [members[0]], "the group led by the child was killed once")
+            deadline = time.time() + 5
+            while time.time() < deadline and not all(self._gone(p) for p in members):
+                time.sleep(0.02)
+            self.assertEqual([p for p in members if not self._gone(p)], [],
+                             "a group member outlived the timeout")
+        finally:
+            # Never leak a 300s sleeper if the kill never ran or missed one.
+            try:
+                with open(pidfile) as f:
+                    left = [int(x) for x in f.read().split()]
+            except (OSError, ValueError):
+                left = []
+            for p in left:
+                if p > 1 and not self._gone(p):
+                    try:
+                        os.kill(p, ha.signal.SIGKILL)
+                    except OSError:
+                        pass
+
+
 class TestOneshotShutdownAndTmpWrites(ManagerMixin, unittest.TestCase):
     """XERK-2545: a manager restart kills its one-shot `claude -p` children's
     process groups, and the savers' temp files are never written through a link."""
