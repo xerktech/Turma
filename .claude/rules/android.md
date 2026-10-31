@@ -131,7 +131,7 @@ A pure-core/adapter-shell split:
 - Compares the version in the **asset FILENAME** (`turma-android-v<x.y.z>.apk`) against the
   installed `versionName`, **never the release TAG**; scans every recent release's assets, not just
   "latest".
-- **Anonymous + credential-isolated**: its OWN `OkHttpClient`, without `HubClient`'s Basic-auth
+- **Anonymous + credential-isolated**: its OWN `OkHttpClient`, without `HubClient`'s auth
   interceptor, so the hub password never reaches github.com. Checked on app start + each Dashboard
   visit, throttled ~15 min; **quiet on failure**.
 - Install: `REQUEST_INSTALL_PACKAGES` + `FileProvider` over a `content://` URI. API 26+ gates on

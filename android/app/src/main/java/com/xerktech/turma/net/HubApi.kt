@@ -678,6 +678,10 @@ data class ResumeRequest(val cwd: String = "")
 @Serializable
 data class OidcConfig(val enabled: Boolean = false)
 
+/** POST /api/login's body — the web login's own (XERK-2569). */
+@Serializable
+data class LoginRequest(val username: String, val password: String)
+
 @Serializable
 data class OidcExchangeRequest(val code: String, val verifier: String)
 
