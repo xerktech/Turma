@@ -323,6 +323,10 @@ WHO writes the native log into the store.
   `write_text_replace` or `open_for_append`, never a plain `open(path, "w"/"a")`** (XERK-2564):
   the store dirs are session-writable, so a planted link would be written through.
   Tests: `FreshWriteTest`, the `*planted*` tail cases.
+- **Every such write passes `anchor=` the transcript's own dir, never a bare `os.makedirs`**
+  (XERK-2570): makedirs accepts a symlinked parent, so `<stem>/workflows` -> elsewhere redirected
+  the write. Below the anchor each dir is opened `O_DIRECTORY|O_NOFOLLOW`, ops fd-relative
+  (lstat-checked fallback on Windows). Tests: `ParentLinkTest`, the `*symlinked*` tail cases.
 - **The projection (`<slug>/<sid>.jsonl`) rides the RENDERED layer unchanged** — a top-level `*.jsonl`
   in the usage ledger's slug, enumerated by `_archive_manifest` like any transcript.
 - **The native event log rides the RAW layer at `<slug>/<sid>/qwen/`** (`QWEN_STORE_DIRNAME`, a fixed

@@ -51,7 +51,7 @@ try:
     # keeps its own workflow re-home + records.
     from runtime_tail import (
         ChildProjection, append_entries, ensure_transcript_file, env_float, env_int,
-        open_for_append, write_text_replace,
+        move_file, open_for_append, write_text_replace,
     )
 except ImportError:  # pragma: no cover - only when run outside the agent dir
     DshProjector = None
@@ -409,6 +409,11 @@ class DshProjectionTail:
         self._subagents_dir = os.path.join(stem, "subagents")
         self._wf_agents_dir = os.path.join(self._subagents_dir, "workflows")
         self._wf_records_dir = os.path.join(stem, "workflows")
+        # Every projected write is anchored at the transcript's own dir (the
+        # session's project slug, under PROJECTS_ROOT): no link a session plants
+        # at a directory BELOW it — `<stem>/workflows`, `<stem>/subagents` — is
+        # followed (XERK-2570).
+        self._anchor = os.path.dirname(os.path.abspath(transcript_path))
         # The latest automatically-derived session title dsh wrote to the log
         # (`session/title` event data.title), or None until one arrives. Read on
         # the beat by hub-agent's _seed_summaries so a dsh session is named from
@@ -465,9 +470,9 @@ class DshProjectionTail:
         # Ensure the transcript file exists so the pinned path resolves the moment
         # the session is launched (an empty file reads as an empty conversation).
         try:
-            os.makedirs(os.path.dirname(self.transcript_path), exist_ok=True)
             if not os.path.exists(self.transcript_path):
-                open_for_append(self.transcript_path).close()
+                open_for_append(self.transcript_path, anchor=self._anchor,
+                                create=True).close()
         except OSError as e:
             self._log(f"dsh projection: cannot create transcript: {e}")
         while not self._stop.is_set():
@@ -629,7 +634,8 @@ class DshProjectionTail:
         return bool(child) and self._wf.run_of_child(child) is not None
 
     def _append(self, path, entries):
-        append_entries(path, entries, self._log, "dsh projection")
+        append_entries(path, entries, self._log, "dsh projection",
+                       anchor=self._anchor)
 
     # ---- workflow run records (XERK-474 [J]) -------------------------------
 
@@ -645,12 +651,13 @@ class DshProjectionTail:
             if record is None:
                 continue
             try:
-                os.makedirs(self._wf_records_dir, exist_ok=True)
                 # tmp + replace through a fresh O_EXCL|O_NOFOLLOW file: no half
-                # record for a reader, no planted link written through (XERK-2564).
+                # record for a reader, no planted link written through, at the
+                # name (XERK-2564) or a parent dir (XERK-2570).
                 write_text_replace(
                     os.path.join(self._wf_records_dir, run_id + ".json"),
-                    json.dumps(record, ensure_ascii=False))
+                    json.dumps(record, ensure_ascii=False),
+                    anchor=self._anchor, create=True)
             except OSError as e:
                 self._log(f"dsh workflow record write failed ({run_id}): {e}")
             # The journal is the fallback `_workflow_finished_agents` reads when
@@ -658,11 +665,11 @@ class DshProjectionTail:
             # few dozen one-line records — cheap and idempotent).
             run_dir = os.path.join(self._wf_agents_dir, run_id)
             try:
-                os.makedirs(run_dir, exist_ok=True)
                 lines = self._wf.finished(run_id)
                 write_text_replace(
                     os.path.join(run_dir, "journal.jsonl"),
-                    "".join(json.dumps(ln, ensure_ascii=False) + "\n" for ln in lines))
+                    "".join(json.dumps(ln, ensure_ascii=False) + "\n" for ln in lines),
+                    anchor=self._anchor, create=True)
             except OSError as e:
                 self._log(f"dsh workflow journal write failed ({run_id}): {e}")
 
@@ -712,7 +719,7 @@ class DshProjectionTail:
             st = ChildProjection(
                 lambda: DshProjector(child_id, cwd=self._cwd,
                                      git_branch=self._git_branch),
-                self._child_dest(child_id))
+                self._child_dest(child_id), anchor=self._anchor)
             self._children[child_id] = st
             self._ensure_child_file(st.dest)
         else:
@@ -727,14 +734,12 @@ class DshProjectionTail:
         st.pump(src, self._append)
 
     def _ensure_child_file(self, dest):
-        ensure_transcript_file(dest, self._log, "dsh child transcript")
+        ensure_transcript_file(dest, self._log, "dsh child transcript",
+                               anchor=self._anchor)
 
     def _move_child_file(self, old, new):
         try:
-            os.makedirs(os.path.dirname(new), exist_ok=True)
-            if os.path.exists(old):
-                os.replace(old, new)
-            elif not os.path.exists(new):
-                open_for_append(new).close()
+            if not move_file(old, new, self._anchor) and not os.path.exists(new):
+                open_for_append(new, anchor=self._anchor, create=True).close()
         except OSError as e:
             self._log(f"dsh child transcript move failed: {e}")

@@ -148,6 +148,10 @@ plugin's control-socket `state` (running|idle).
   `write_text_replace` or `open_for_append`, never a plain `open(path, "w"/"a")`** (XERK-2564):
   the store dirs are session-writable, so a planted link would be written through.
   Tests: `FreshWriteTest`, the `*planted*` tail cases.
+- **Every such write passes `anchor=` the transcript's own dir, never a bare `os.makedirs`**
+  (XERK-2570): makedirs accepts a symlinked parent, so `<stem>/workflows` -> elsewhere redirected
+  the write. Below the anchor each dir is opened `O_DIRECTORY|O_NOFOLLOW`, ops fd-relative
+  (lstat-checked fallback on Windows). Tests: `ParentLinkTest`, the `*symlinked*` tail cases.
 - **The projection (`<slug>/<sid>.jsonl`) rides the RENDERED layer unchanged** — `_archive_manifest`
   enumerates every ledger slug's top-level `*.jsonl`. The native log (`<slug>/<sid>/dsh/...`) is
   nested, so it is NOT mistaken for a rendered transcript.
