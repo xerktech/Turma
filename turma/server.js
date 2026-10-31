@@ -13887,7 +13887,9 @@ function revokeEnrollCode(id, now = Date.now()) {
 // The decision behind POST /api/agent/enroll {code, device}: the code's single
 // use, traded for `device`'s IDENTITY token. Synchronous from lookup to the
 // used-stamp, so it is atomic on the serving replica.
-function consumeEnrollCode(code, device, now = Date.now()) {
+// `check` stops after every refusal, before anything is stamped or dropped, so
+// redeemEnrollCode can revoke the name token first (XERK-2572).
+function consumeEnrollCode(code, device, now = Date.now(), check = false) {
   if (typeof code !== "string" || !ENROLL_CODE_RE.test(code.trim().toLowerCase())) {
     return { status: 400, body: { error: "malformed enrollment code (expected te-<32 hex>)" } };
   }
@@ -13912,6 +13914,7 @@ function consumeEnrollCode(code, device, now = Date.now()) {
   }
   const refusal = enrollNameRefusal(device);
   if (refusal) return { status: refusal.status, body: { error: refusal.error } };
+  if (check) return { status: 200 };
   // An identity minted for this name that never beat (an earlier code whose host
   // never came up) is superseded: the operator minted a new code for the name,
   // and handing back the SAME id would put two machines on one token.
@@ -13939,6 +13942,24 @@ function consumeEnrollCode(code, device, now = Date.now()) {
   const token = uidAgentToken(uid);
   console.log(`agent enrolled by code: ${logName(device)} (code ${id}, minted by ${logName(rec.owner)})`);
   return { status: 200, body: { host: device, token, bound: true } };
+}
+
+// POST /api/agent/enroll: revoke `device`'s NAME-derived token, THEN redeem.
+// Remove host un-retires a name's token so a reinstall can come back
+// (XERK-2381); a holder of that old token could otherwise beat before the new
+// host's first beat and create the record the new identity then silently adopts
+// (XERK-2572). The bump is a store round trip, so the code is redeemed only once
+// it has landed: an old beat inside it registers the name first and the redemption
+// is refused (409, code not burned) rather than adopting that record. A refused
+// redemption bumps nothing. A failed bump still redeems (the identity is sound).
+async function redeemEnrollCode(code, device, now = Date.now()) {
+  const pre = consumeEnrollCode(code, device, now, true);
+  if (pre.status !== 200) return pre;
+  const bumped = await bumpNameTokenGen(device, now);
+  if (bumped.error) {
+    console.error(`agent enrolled by code: could not revoke ${logName(device)}'s old name token (${bumped.error}); it may still work`);
+  }
+  return consumeEnrollCode(code, device, Date.now());
 }
 
 const enrollFails = { start: 0, n: 0 };
@@ -22162,7 +22183,7 @@ const server = http.createServer(async (req, res) => {
       if (!body || typeof body !== "object" || Array.isArray(body)) {
         return json(res, 400, { error: "body must be JSON {code, device}" });
       }
-      const r = consumeEnrollCode(body.code, typeof body.device === "string" ? body.device.trim() : "");
+      const r = await redeemEnrollCode(body.code, typeof body.device === "string" ? body.device.trim() : "");
       return json(res, r.status, r.body);
     }
 
@@ -24922,6 +24943,7 @@ if (process.env.TURMA_TEST) {
     agentPresentedRefusal,
     resolveEnrollToken,
     consumeEnrollCode,
+    redeemEnrollCode,
     mintEnrollCode,
     revokeEnrollCode,
     listEnrollCodes,
