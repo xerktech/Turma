@@ -409,4 +409,5 @@ test("XERK-2586: a break-glass sign-in whose socket already closed is not evalua
   }
   const ok = await login("glass", "glass-pass");
   assert.equal(ok.status, 200, "a live break-glass sign-in afterwards still works");
+  assert.ok(/hub_session=/.test(String(ok.headers["set-cookie"] || "")), "and is issued a session");
 });
