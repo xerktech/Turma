@@ -127,6 +127,7 @@ test("XERK-2510: Approve + start posts the org's project, the kind's issue type 
     ["approve", "ACME", "10004", true]);
   assert.match(post.body.description, /^It 500s\n\nProposed from the meeting "Sprint <sync>"/);
   assert.match(post.body.description, /> Ann: login <b>is<\/b> broken \[1:01\]/);
+  assert.equal("edited" in post.body, false, "the default text is not an edit");
   assert.match(P.list(), /Creating the ticket…/);
   // A decision posts no project.
   await P.review(P.itemKey(SITE, "m1", "p2"), "approve");
@@ -151,6 +152,9 @@ test("XERK-2510: a refusal reaches the operator in the hub's words; review state
   const h = P.list();
   assert.match(h, /Created <a href="\/board\?ticket=ACME-9&amp;site=acme\.atlassian\.net">ACME-9<\/a>/);
   assert.match(h, /session starting/);
+  P.renderMeetings(data([meeting({ items: [{ ...items[0], review: { state: "created", at: 1, key: "ACME-9", start: true,
+    session: "failed", sessionError: "<img src=x>" } }] })]));
+  assert.match(P.list(), /no session — &lt;img src=x&gt;/);
   assert.match(h, /Added to the decisions log/);
   assert.match(h, /Not created — &lt;boom&gt;/);
   assert.match(h, /class="mt-item rejected"/);

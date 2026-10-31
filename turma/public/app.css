@@ -1263,6 +1263,8 @@ body.td-open { overflow: hidden; }
     color: var(--muted); text-decoration: none; font-size: 10.5px; padding: 6px 0 4px;
   }
   .bottom-nav a svg { width: 21px; height: 21px; }
+  .bottom-nav a { overflow: hidden; white-space: nowrap; }
+  @media (max-width: 380px) { .bottom-nav a { font-size: 9.5px; letter-spacing: -0.2px; } }
   .bottom-nav a.active { color: var(--accent); }
   body { padding-bottom: 68px; }
   /* Clear the bottom nav: the toast is now on every page (XERK-264), and at its

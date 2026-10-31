@@ -4555,6 +4555,12 @@ function meetingWire(m) {
   const { segments, cmdId, sentAt, attempt, tried, ...out } = m;
   return out;
 }
+// Tenir's answer: the row with no operator review on it (host, cmdId, key, project).
+function meetingTenirWire(m) {
+  const out = meetingWire(m);
+  if (Array.isArray(out.items)) out.items = out.items.map(({ review, ...it }) => it);
+  return out;
+}
 // What clients read (XERK-2510): each org's newest MEETINGS_WIRE_TAIL rows,
 // never a transcript. Served as top-level `meetingProposals` + its SSE frame.
 const MEETINGS_WIRE_TAIL = 20;
@@ -17400,13 +17406,15 @@ function broadcastDecisions() {
 // in no decided org gets `org: ""` and no entries, so its file goes away.
 function decisionsReplyFor(key) {
   const org = agents[key] ? decidedOrgOf(agents[key]) : "";
-  // Only the cells `render_decisions` writes: id/host/sessionId/label never reach
-  // the file, and this rides every heartbeat reply.
+  // Only the cells `render_decisions` writes: id/host/sessionId never reach the
+  // file, and this rides every heartbeat reply. `label` only for a meeting
+  // decision, where it names the meeting (XERK-2510).
   const entries = org ? (decisions[org] || []).slice(-DECISIONS_REPLY_TAIL).map((e) => {
     const out = {};
     for (const k of ["at", "source", "ticket", "question", "answer", "text"]) {
       if (e && e[k] !== undefined) out[k] = e[k];
     }
+    if (e && e.source === "meeting" && e.label) out.label = e.label;
     return out;
   }) : [];
   return { org, entries };
@@ -17691,7 +17699,7 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   const { row, error } = meetingFromBody(body, now);
   if (error) return { status: 400, body: { error } };
   const dup = (meetingProposals[siteKey] || []).find((m) => m.meetingId === row.meetingId);
-  if (dup) return { status: 200, body: { ok: true, duplicate: true, meeting: meetingWire(dup) } };
+  if (dup) return { status: 200, body: { ok: true, duplicate: true, meeting: meetingTenirWire(dup) } };
   if (siteKey.length > MEETINGS_SITE_MAX) {
     return { status: 400, body: { error: `org key too long — the limit is ${MEETINGS_SITE_MAX} characters` } };
   }
@@ -17858,6 +17866,10 @@ function meetingsTick(now = Date.now()) {
 // `createTicketResults` (settleMeetingReviews), and "approve + start" then
 // queues a manual ticket start once the board lists the ticket with a repo.
 const MEETING_START_WAIT_MS = 2 * 3600e3;
+// A create with no answer this long is failed: a hub killed before the host took
+// the command (the queue is saved on a debounce, the result caches never) left it
+// `creating` forever, refusing both Approve and Reject (XERK-2510 QA).
+const MEETING_CREATE_DEADLINE_MS = 15 * 60e3;
 const MEETING_TICKET_DESC_MAX = 8000;
 function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   const refuse = (status, error) => ({ status, body: { error } });
@@ -17893,7 +17905,9 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   if (!title) return refuse(400, "a title is required");
   const description = meetingText(body.description == null ? item.description : body.description,
     MEETING_TICKET_DESC_MAX, true);
-  const edited = title !== item.title || (body.description != null && description !== item.description);
+  // The page sends the meeting context as the description, so only its own
+  // `edited` flag (or a changed title) says the operator rewrote the proposal.
+  const edited = title !== item.title || body.edited === true;
   if (item.kind === "decision") {
     const d = appendDecision(siteKey, { source: "meeting",
       text: [title, description].filter(Boolean).join(" — "), label: m.title });
@@ -17937,6 +17951,12 @@ function settleMeetingReview(siteKey, rv, now) {
         ...(rv.start ? { session: "waiting" } : {}) };
     }
     const gap = a ? agentGapError(a, "createTicket", "create tickets") : null;
+    if (a && !gap && now - (a.lastSeen || 0) < OFFLINE_AFTER_MS && now - rv.at >= MEETING_CREATE_DEADLINE_MS) {
+      dropQueuedCommand(host, cmdId, "createTicket");
+      forgetCreateInFlight(cmdId);
+      return { ...base, state: "failed", at: now, error: "the host never reported the create — it may "
+        + "have been created, so check the board before approving again" };
+    }
     if (!a || gap || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) {
       // The GET poll's wording (XERK-241): never claim no ticket exists once
       // the command was handed over.
@@ -24897,6 +24917,7 @@ if (process.env.TURMA_TEST) {
     ingestDailyBriefResults, dailyBriefRunNowAt,
     getMeetings: () => meetingProposals, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
     putMeeting, reviewMeetingItem, settleMeetingReviews, meetingProposalsWire, MEETING_START_WAIT_MS,
+    MEETING_CREATE_DEADLINE_MS, acceptMeeting,
     ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETING_RUN_TIMEOUT_MS,
     MEETING_QUEUE_MAX_MS, MEETINGS_KEEP, MEETINGS_AUTO_MODEL, DAILY_BRIEF_RUN_TIMEOUT_MS, DAILY_BRIEF_LATE_MS,
     decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, permissionAnswerKind,

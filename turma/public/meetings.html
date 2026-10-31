@@ -234,7 +234,7 @@ function editHtml(site, m, it, k) {
   const dis = busy.has(k) ? ' aria-disabled="true"' : "";
   return `<div class="mt-edit">`
     + `<label>Title <input data-edit-title="${esc(k)}" maxlength="200" value="${esc(e.title)}"></label>`
-    + `<label>${isDecision ? "Detail" : "Description"} <textarea data-edit-desc="${esc(k)}">${esc(e.description)}</textarea></label>`
+    + `<label>${isDecision ? "Detail" : "Description"} <textarea data-edit-desc="${esc(k)}"${isDecision ? ' maxlength="290"' : ""}>${esc(e.description)}</textarea></label>`
     + typeSel
     + `<div class="row"><button class="btn-sm primary" data-act="approve" data-k="${esc(k)}"${dis}>${isDecision ? "Log decision" : "Approve"}</button>`
     + (isDecision ? "" : `<button class="btn-sm" data-act="start" data-k="${esc(k)}"${dis}>Approve + start session</button>`)
@@ -396,6 +396,7 @@ async function review(k, action, start = false) {
   if (action === "approve") {
     const e = edits.get(k);
     body.title = e ? e.title : it.title;
+    if (e && (e.title !== e.initial.title || e.description !== e.initial.description)) body.edited = true;
     body.description = e ? e.description : (it.kind === "decision" ? it.description : ticketDescription(m, it));
     if (it.kind !== "decision") {
       const project = projectOf(site);
@@ -439,8 +440,9 @@ function startEdit(k) {
   if (!hit) return;
   const { site, m, it } = hit;
   const t = typesOf(site);
-  edits.set(k, { title: it.title,
-    description: it.kind === "decision" ? (it.description || "") : ticketDescription(m, it),
+  const draft = { title: it.title,
+    description: it.kind === "decision" ? (it.description || "") : ticketDescription(m, it) };
+  edits.set(k, { ...draft, initial: { ...draft },
     issueType: it.kind === "decision" ? "" : defaultType(it.kind, t && t.types) });
   if (it.kind !== "decision") ensureTypes(site);
   repaint(true);

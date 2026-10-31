@@ -27876,7 +27876,9 @@ test("XERK-2510: approving a proposal creates the ticket on the right board, Jir
   const d = hub.getDecisions()[J].at(-1);
   assert.deepEqual([d.source, d.text, d.label], ["meeting", "Ship on Friday — after QA", "Planning"]);
   assert.equal(creates2510("mtJira2510").length, 1);
-  assert.match(hub.decisionsReplyFor("mtJira2510").entries.at(-1).text, /Ship on Friday/);
+  // The meeting's title rides the reply, so the agent's file can name it.
+  assert.deepEqual([hub.decisionsReplyFor("mtJira2510").entries.at(-1).text,
+    hub.decisionsReplyFor("mtJira2510").entries.at(-1).label], ["Ship on Friday — after QA", "Planning"]);
 
   // Reject is recorded; rejecting twice is refused; it can still be approved later.
   assert.equal((await review2510(A, "a1", "p1", { action: "reject" })).status, 200);
@@ -27907,6 +27909,28 @@ test("XERK-2510: a create whose host goes silent fails in honest words; an agent
   const rv = item2510(S, "f1", "p2").review;
   assert.deepEqual([rv.state, rv.error], ["failed", "the host went offline before the ticket was created"]);
   assert.equal(creates2510("mtFail2510").filter((c) => c.project === "OPS").length, 0);
+
+  // A create no one ever answers (the hub died before the host took it) fails at the
+  // deadline instead of refusing Approve and Reject forever.
+  agents.mtFail2510.lastSeen = Date.now();
+  assert.equal((await review2510(S, "f1", "p1", { action: "approve", project: "ENG", issueType: "1", edited: true })).status, 200);
+  assert.equal(item2510(S, "f1", "p1").review.edited, true);
+  hub.settleMeetingReviews(Date.now() + 60e3);
+  assert.equal(item2510(S, "f1", "p1").review.state, "creating");
+  const late = Date.now() + hub.MEETING_CREATE_DEADLINE_MS + 1;
+  agents.mtFail2510.lastSeen = late;   // still beating, the command long gone
+  hub.settleMeetingReviews(late);
+  agents.mtFail2510.lastSeen = Date.now();
+  assert.deepEqual([item2510(S, "f1", "p1").review.state, /may have been created/.test(item2510(S, "f1", "p1").review.error)],
+    ["failed", true]);
+  assert.equal((await review2510(S, "f1", "p1", { action: "reject" })).status, 200);
+  // An unedited approve (the page always sends the meeting context) is not "edited".
+  assert.equal((await review2510(S, "f1", "p3", { action: "approve", description: "context" })).status, 200);
+  assert.equal("edited" in item2510(S, "f1", "p3").review, false);
+  // Tenir's duplicate answer never carries the operator's review.
+  const dup = hub.acceptMeeting(S, { meetingId: "f1", startedAt: 1.7e12, endedAt: 1.7e12 + 1, segments: [{ text: "x" }] });
+  assert.equal(dup.body.duplicate, true);
+  assert.ok(dup.body.meeting.items.every((i) => !("review" in i)));
 
   // A review rides only the operator's route — never an agent's result row.
   await beat1574("mtFail2510", S, { meetings: { available: true } });
