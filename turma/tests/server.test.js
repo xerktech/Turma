@@ -20528,6 +20528,17 @@ test("XERK-2533: operator routes answer only the host's own tenant (404 otherwis
     assert.equal((await restart("t2533leg", T.A.h)).status, 404);
     assert.equal((await restart("t2533leg", T.C.h)).status, 200);
     assert.equal((await restart("t2533leg", userHeaders)).status, 200);
+    // /api/trigger picks its host from the BODY: the same gate applies (QA).
+    const trig = (host, h) => request("POST", "/api/trigger",
+      { headers: { ...h, "content-type": "application/json" }, body: { hostname: host, repo: "r", prompt: "p" } });
+    assert.equal((await trig(ka, T.B.h)).status, 404, "another tenant cannot spawn on it");
+    assert.equal((await trig(ka, userHeaders)).status, 404, "break-glass has no tenant");
+    assert.equal((await trig(ka, { authorization: "Bearer triggertok" })).status, 404,
+      "the shared trigger token proves no tenant");
+    assert.equal((await trig("t2533leg", T.A.h)).status, 404, "a tenant user reaches no untenanted host");
+    assert.equal((await trig(ka, T.A.h)).status, 200);
+    assert.equal((await trig("t2533leg", { authorization: "Bearer triggertok" })).status, 200);
+    agents[ka].commands = agents[ka].commands.filter((c) => c.type !== "spawn");
     // The queued command carries the tenant, hub-only.
     const cmd = agents[ka].commands.find((c) => c.type === "restartAgent");
     assert.equal(cmd.tenant, T.A.t);
@@ -20589,15 +20600,41 @@ test("XERK-2533: a tenant user's roll binds an untenanted host to their tenant; 
     const roll = await request("POST", "/api/agents/t2533r/roll-token", { headers: T.C.h, body: {} });
     assert.equal(roll.status, 200, JSON.stringify(roll.body));
     assert.equal(roll.body.tenantBound, true);
-    // Its next beat on the same identity lands in tenant C, carrying the record.
-    assert.equal((await beat2533(tok, "t2533r")).status, 200);
+    // Its next beat on the same identity lands in tenant C, carrying the record —
+    // and the bind's own setToken still reaches it (QA: it was dropped, so the
+    // agent never restarted and its tunnel stayed on the plain key).
+    const after = await beat2533(tok, "t2533r");
+    assert.equal(after.status, 200);
     assert.ok(agents[kc] && !agents.t2533r);
+    const st = (after.body.commands || []).find((c) => c.cmdId === roll.body.cmdId);
+    assert.ok(st && st.type === "setToken" && !("bindTenant" in st), JSON.stringify(after.body.commands));
+    assert.ok(!(agents[kc].commands || []).filter((c) => c.type !== "setToken").length);
     assert.equal(hostOfUid(tokenUid(tok)), kc);
     // The old plain name is closed to it now: no beat as an untenanted host.
     assert.equal(hub.agentKeyFor({ headers: { authorization: `Bearer ${tok}` } }, "t2533r"), kc);
     // Break-glass (no tenant) leaves an untenanted host untenanted.
     assert.equal(hub.bindIdentityTenant(tokenUid(tok), T.A.t), false, "never moved out of a tenant");
   } finally { forget2533("t2533r", kc); T.restore(); }
+});
+
+test("XERK-2533: enrollment codes belong to their owner's tenant (list + revoke)", async () => {
+  const T = tenants2533();
+  try {
+    forget2533();
+    const m = await request("POST", "/api/enroll-codes", { headers: T.A.h, body: { device: "t2533code" } });
+    assert.equal(m.status, 200);
+    const id = m.body.enrollCode.id;
+    const ids = async (h) => (await request("GET", "/api/enroll-codes", { headers: h })).body.codes.map((c) => c.id);
+    assert.ok((await ids(T.A.h)).includes(id));
+    assert.ok(!(await ids(T.B.h)).includes(id), "another tenant never lists it");
+    assert.ok(!(await ids(userHeaders)).includes(id), "nor break-glass");
+    assert.equal((await request("DELETE", `/api/enroll-codes/${id}`, { headers: T.B.h })).status, 404);
+    assert.equal(hub.enrollCodes()[id].revokedAt, undefined, "B's revoke changed nothing");
+    // An untenanted (break-glass) code is the operators', not a tenant user's.
+    const bg = await request("POST", "/api/enroll-codes", { headers: userHeaders, body: {} });
+    assert.ok(!(await ids(T.A.h)).includes(bg.body.enrollCode.id));
+    assert.equal((await request("DELETE", `/api/enroll-codes/${id}`, { headers: T.A.h })).status, 200);
+  } finally { forget2533(); T.restore(); }
 });
 
 test("XERK-2533: the identity store drops an entry whose key and tenant disagree", () => {

@@ -7041,14 +7041,14 @@ function sanitizeRestoredCommands(reg) {
 // does not walk commands) would 400 that host's every beat with the internal
 // error text, and serve every dashboard a stale payload from `lastGoodAgentsCache`
 // for as long as the record lived. That is XERK-235's loop, from a one-word gap.
-const INTERNAL_COMMAND_FIELDS = ["deliveredAt", "ticketSource", "ticketSite", "epicRun", "tenant"];
+const INTERNAL_COMMAND_FIELDS = ["deliveredAt", "ticketSource", "ticketSite", "epicRun", "tenant", "bindTenant"];
 function publicCommands(cmds) {
   const internal = (c) => c && typeof c === "object"
     && INTERNAL_COMMAND_FIELDS.some((f) => f in c);
   if (!cmds || !cmds.some(internal)) return cmds;
   return cmds.map((c) => {
     if (!internal(c)) return c;
-    const { deliveredAt, ticketSource, ticketSite, epicRun, tenant, ...rest } = c;
+    const { deliveredAt, ticketSource, ticketSite, epicRun, tenant, bindTenant, ...rest } = c;
     return rest;
   });
 }
@@ -14306,6 +14306,15 @@ function enrollCodeOwner(req) {
   return { owner: String(p.kind || "unknown") };
 }
 
+// Whether principal `p` may see (and revoke) enrollment code `c` (XERK-2533): a
+// code minting into a tenant belongs to that tenant's users alone — its device
+// name and owner are that tenant's data, and revoking it would block their
+// enrollment. An untenanted code, like an untenanted host, is the operators'.
+function enrollCodeVisible(p, c) {
+  const t = c && typeof c.tenantId === "string" && TENANT_ID_RE.test(c.tenantId) ? c.tenantId : "";
+  return principalMayDriveHost(p, t ? tenantHostKey("code", t) : "code");
+}
+
 // Mint a code. Returns {status, body}; the plain code is in the body ONCE and
 // never stored or served again.
 function mintEnrollCode(owner, device, now = Date.now()) {
@@ -21023,7 +21032,8 @@ const server = http.createServer(async (req, res) => {
     // Host enrollment codes (XERK-2531): the dashboard's Add host dialog mints,
     // lists and revokes them; the host redeems one at POST /api/agent/enroll.
     if (url.pathname === "/api/enroll-codes" && req.method === "GET") {
-      return json(res, 200, { codes: listEnrollCodes(), ttlMs: ENROLL_CODE_TTL_MS });
+      const p = requestPrincipal(req);
+      return json(res, 200, { codes: listEnrollCodes().filter((c) => enrollCodeVisible(p, c)), ttlMs: ENROLL_CODE_TTL_MS });
     }
     if (url.pathname === "/api/enroll-codes" && req.method === "POST") {
       let body;
@@ -21036,6 +21046,8 @@ const server = http.createServer(async (req, res) => {
       return json(res, r.status, r.body);
     }
     if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "enroll-codes" && parts.length === 3) {
+      const code = Object.prototype.hasOwnProperty.call(enrollCodes, parts[2]) ? enrollCodes[parts[2]] : null;
+      if (code && !enrollCodeVisible(requestPrincipal(req), code)) return json(res, 404, { error: "no such enrollment code" });
       const r = revokeEnrollCode(parts[2]);
       return json(res, r.status, r.body);
     }
@@ -21210,7 +21222,8 @@ const server = http.createServer(async (req, res) => {
       // on the first beat, so a junk element cannot outlive one round trip.
       const commands = (prev.commands || []).filter(
         (c) => c && typeof c === "object" && !acked.has(c.cmdId) &&
-          (typeof c.tenant === "string" ? c.tenant : "") === tenantOfKey(key));
+          ((typeof c.tenant === "string" ? c.tenant : "") === tenantOfKey(key) ||
+           (!c.tenant && c.type === "setToken" && c.bindTenant === tenantOfKey(key))));
       delete payload.ackedCommands; // don't persist the transient ack list
       // On-demand session history the agent fetched since the last beat (see
       // the {type:"history"} command); ingested into the cache below, not
@@ -21544,8 +21557,16 @@ const server = http.createServer(async (req, res) => {
       // A rename (XERK-2381) lands only now, past every gate that could refuse
       // the beat: the old name's record goes, the new one already holds it.
       if (beatUid) {
-        noteIdentityBeat(beatUid, key);
+        const movedFrom = noteIdentityBeat(beatUid, key);
         renameAgentRecord(beatUid, key);
+        // A TENANT BIND moved the host to `<name>@<t>` (XERK-2533), but its live
+        // tunnel is still registered under the plain name, so its terminals read
+        // offline. Close it: the agent re-dials and lands on the new key.
+        if (movedFrom && !tenantOfKey(movedFrom) && tenantOfKey(key) && controlChannels[movedFrom]) {
+          const ch = controlChannels[movedFrom];
+          try { ch.socket.end(wsEncode(0x8, Buffer.from([0x03, 0xe9]))); } catch { /* gone */ }
+          try { ch.socket.destroy(); } catch { /* gone */ }
+        }
       }
       // The permission ledger (XERK-1563), after the same gates and for the same
       // reason. Every field is whitelisted + bounded inside (sanitizePermissionEvent).
@@ -22397,7 +22418,8 @@ const server = http.createServer(async (req, res) => {
                  "only the rendered transcript, which can be read but not resumed",
         });
       if (!target) return json(res, 400, { error: "a target host is required" });
-      const tgt = agents[target];
+      // Restoring onto a host is driving it (XERK-2533): only one the caller may.
+      const tgt = principalMayDriveHost(requestPrincipal(req), target) ? agents[target] : null;
       if (!tgt) return json(res, 404, { error: "unknown target host" });
       if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)
         return json(res, 503, { error: "the target agent is offline" });
@@ -22669,7 +22691,11 @@ const server = http.createServer(async (req, res) => {
       // already unacked in flight (mirrors the restart route). A retry reuses
       // the pending cmdId; the token itself is the same value either way.
       const pending = (agents[key].commands || []).find((c) => c.type === "setToken");
-      const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "setToken", token });
+      // A BIND's setToken is the one command that crosses the bind (XERK-2533):
+      // `bindTenant` lets it be delivered on the host's next beat whether that
+      // lands on the old plain key or, already, on the namespaced one.
+      const cmdId = pending ? pending.cmdId
+        : queueCommand(key, bound ? { type: "setToken", token, bindTenant: bindTo } : { type: "setToken", token });
       if (bound) console.log(`agent token: ${logName(key)} bound to the rolling user's tenant`);
       return json(res, 200, bound ? { ok: true, cmdId, tenantBound: true } : { ok: true, cmdId });
     }
@@ -22808,7 +22834,16 @@ const server = http.createServer(async (req, res) => {
       if (!repo) return json(res, 400, { error: "repo required" });
       if (!prompt) return json(res, 400, { error: "prompt required" });
       if (prompt.length > 10000) return json(res, 400, { error: "prompt too long" });
-      const agent = agents[hostname];
+      // The host must be one the CALLER may drive (XERK-2533), as on every
+      // /api/agents/<host> route: a login by principalMayDriveHost; the shared
+      // TURMA_TRIGGER_TOKEN proves no tenant, so it reaches untenanted hosts
+      // only (like the fleet master). 404, so no tenant host's existence leaks.
+      const trigHeader = req.headers.authorization || "";
+      const viaTriggerToken = !!TURMA_TRIGGER_TOKEN && trigHeader.startsWith("Bearer ") &&
+        safeEqual(trigHeader.slice(7), TURMA_TRIGGER_TOKEN);
+      const mayDrive = viaTriggerToken ? !tenantOfKey(hostname)
+        : principalMayDriveHost(requestPrincipal(req), hostname);
+      const agent = mayDrive ? agents[hostname] : null;
       if (!agent) return json(res, 404, { error: "unknown host" });
       // Validate the repo against what the host actually reports (its scanned
       // repos plus the "(root)" pseudo-repo). Skip the check only if the host

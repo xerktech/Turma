@@ -110,6 +110,14 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   untenanted host only for the hub's operators (admin role, break-glass, legacy cookie, open hub),
   never a plain tenant user — until the migration (XERK-2554) binds it.
   - Listing/SSE/terminal scoping is XERK-2534's; this gate covers the per-host command routes.
+  - **A route that takes its host from the BODY runs the same check**: `/api/trigger` (the shared
+    `TURMA_TRIGGER_TOKEN` proves no tenant, so it reaches untenanted hosts only) and
+    `POST /api/archive/<tid>/restore`'s target. A new body-host route must too (QA found both).
+- **Enrollment codes are their tenant's** (`enrollCodeVisible`): list + revoke see only codes minting
+  into the caller's tenant; an untenanted code is the operators', like an untenanted host.
+- **The bind roll's `setToken` crosses the bind** (hub-only `bindTenant`): delivered on the old plain
+  key or the new one, so the agent restarts. The bind beat also closes the plain-named tunnel, so it
+  re-dials onto the namespaced key (left open, terminals read offline).
 - **A tenant host's queued command carries `tenant`** (hub-only, an `INTERNAL_COMMAND_FIELDS` member)
   and is dropped at delivery unless it matches the key's tenant — a command queued before a bind is
   never run inside the tenant. Untenanted hosts' commands carry no stamp (byte-identical).
