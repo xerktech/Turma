@@ -44118,9 +44118,13 @@ class SessionManager:
         """Kill a timed-out classifier and everything it started (its process
         group on POSIX), then reap it with a bound — never an unbounded wait."""
         killpg = getattr(os, "killpg", None)
+        pid = proc.pid
         try:
-            if killpg is not None:
-                killpg(proc.pid, signal.SIGKILL)
+            # killpg only a real child's group. A mocked proc's pid coerces to
+            # 1, and killpg(1) is kill(-1): every process this user owns, the
+            # user manager and every session included (TrueNAS, 2026-10-31).
+            if killpg is not None and type(pid) is int and pid > 1:
+                killpg(pid, signal.SIGKILL)
             else:
                 proc.kill()
         except (OSError, ProcessLookupError):

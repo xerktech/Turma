@@ -21,6 +21,7 @@ import importlib.util
 import inspect
 import io
 import json
+import operator
 import os
 import stat
 import re
@@ -51037,6 +51038,26 @@ class TestSessionReportLoop(ProjectDirMixin, unittest.TestCase):
             self.assertIsNone(ha.session_report(self.WORKDIR, state, "agent-x")["loop"])
         with mock.patch.object(ha, "_pane_status", return_value=(True, "auto", None)):
             self.assertEqual(ha.session_report(self.WORKDIR, state, "agent-x")["loop"], rep["loop"])
+
+
+class TestKillpgNeverHitsPidOne(unittest.TestCase):
+    """A mocked proc's pid coerces to 1 and killpg(1) is kill(-1), which SIGKILLs
+    every process the user owns — it took a whole host's agent and sessions down."""
+
+    def test_a_mocked_proc_is_never_killpg_d(self):
+        proc = mock.MagicMock()
+        self.assertEqual(operator.index(proc.pid), 1)   # the trap this guards
+        with mock.patch.object(ha.os, "killpg", create=True) as killpg:
+            ha.SessionManager._kill_attention_hint(proc)
+        killpg.assert_not_called()
+        proc.kill.assert_called_once()
+
+    def test_a_real_child_still_has_its_group_killed(self):
+        proc = mock.MagicMock()
+        proc.pid = 4242
+        with mock.patch.object(ha.os, "killpg", create=True) as killpg:
+            ha.SessionManager._kill_attention_hint(proc)
+        killpg.assert_called_once_with(4242, ha.signal.SIGKILL)
 
 
 class TestAttentionHints(ManagerMixin, unittest.TestCase):
