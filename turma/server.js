@@ -4317,8 +4317,10 @@ const MEETING_ERROR_MAX = 300;
 const MEETING_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 // No quote, bracket, space, control, format (bidi) or invisible character: the
 // URL will be rendered as a link (XERK-2510), and those spoof its text.
-const MEETING_URL_RE =
-  /^https?:\/\/[^\s"'`<>\\\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]{1,492}$/iu;
+// The `u` flag counts code points, so the 500-unit length is checked apart.
+const MEETING_URL_CHARS_RE =
+  /^https?:\/\/(?!\/)[^\s"'`<>\\\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]+$/iu;
+const meetingUrlOk = (v) => typeof v === "string" && v.length <= 500 && MEETING_URL_CHARS_RE.test(v);
 const MEETING_MODEL_RE = /^[A-Za-z0-9._:-]{1,40}$/;
 const MEETING_STATUSES = new Set(["queued", "running", "ok", "failed"]);
 const MEETING_ITEM_KINDS = new Set(["task", "bug", "followup", "decision"]);
@@ -4399,7 +4401,7 @@ function sanitizeMeeting(v) {
     if (t === null) return null;
     out[k] = t;
   }
-  if (typeof v.tenirUrl === "string" && MEETING_URL_RE.test(v.tenirUrl)) out.tenirUrl = v.tenirUrl;
+  if (meetingUrlOk(v.tenirUrl)) out.tenirUrl = v.tenirUrl;
   out.participants = [...new Set((Array.isArray(v.participants) ? v.participants : []).slice(0, 200)
     .map((p) => meetingText(p, 100)).filter(Boolean))].slice(0, 100);
   if (typeof v.model === "string" && MEETING_MODEL_RE.test(v.model)) out.model = v.model;
@@ -17533,7 +17535,7 @@ function meetingFromBody(body, now) {
   if (body.platform != null && (typeof body.platform !== "string" || [...body.platform].length > 40)) {
     return { error: "platform must be text of at most 40 characters" };
   }
-  if (body.tenirUrl != null && (typeof body.tenirUrl !== "string" || !MEETING_URL_RE.test(body.tenirUrl))) {
+  if (body.tenirUrl != null && !meetingUrlOk(body.tenirUrl)) {
     return { error: "tenirUrl must be an http(s) URL of at most 500 characters, with no quotes, spaces or brackets" };
   }
   if (body.participants != null && !Array.isArray(body.participants)) {
