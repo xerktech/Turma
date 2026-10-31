@@ -138,12 +138,22 @@ test("XERK-2530: a user disabled while its password is being checked is not sign
 const loginAs = (client, username, password) =>
   request("POST", "/api/login", { headers: { "cf-connecting-ip": client }, body: { username, password } });
 
-test("XERK-2568: the sign-in client is CF-Connecting-IP, else the last X-Forwarded-For hop, else the socket", () => {
+test("XERK-2568: the sign-in client is CF-Connecting-IP + the last X-Forwarded-For hop + the socket", () => {
   const key = (headers, remoteAddress = "10.0.0.9") => hub.loginClientKey({ headers, socket: { remoteAddress } });
-  assert.equal(key({ "cf-connecting-ip": " 203.0.113.7 ", "x-forwarded-for": "1.1.1.1, 2.2.2.2" }), "203.0.113.7");
-  assert.equal(key({ "x-forwarded-for": "6.6.6.6, 198.51.100.4" }), "198.51.100.4", "a client-sent first hop is ignored");
-  assert.equal(key({}), "10.0.0.9");
-  assert.equal(key({ "cf-connecting-ip": "x".repeat(500) }).length, 64, "bounded");
+  assert.equal(key({ "cf-connecting-ip": " 203.0.113.7 ", "x-forwarded-for": "1.1.1.1, 2.2.2.2" }), "203.0.113.7|2.2.2.2|10.0.0.9");
+  assert.equal(key({ "x-forwarded-for": "6.6.6.6, 198.51.100.4" }), key({ "x-forwarded-for": "198.51.100.4" }),
+    "a client-sent first hop is ignored");
+  assert.equal(key({}, "::ffff:10.0.0.9"), key({}, "10.0.0.9"), "an IPv4-mapped socket is the same client");
+  assert.ok(key({ "cf-connecting-ip": "x".repeat(500), "x-forwarded-for": "y".repeat(500) }).length <= 3 * 64 + 2, "bounded");
+  // A caller bypassing Cloudflare forges CF-Connecting-IP, but not the hop the ingress appends:
+  // it can never present another client's key.
+  assert.notEqual(key({ "cf-connecting-ip": "10.10.10.77", "x-forwarded-for": "10.10.10.66" }),
+    key({ "x-forwarded-for": "10.10.10.77" }));
+});
+
+test("XERK-2568: the failure map's key is bounded whatever the username", () => {
+  assert.equal(hub.loginFailureKey("a|b|c", "u".repeat(1 << 20)).length, 64);
+  assert.equal(hub.loginFailureKey("a|b|c", "RootAdmin"), hub.loginFailureKey("a|b|c", "rootadmin"));
 });
 
 test("XERK-2568: a flood from one client neither locks out another nor exceeds the scrypt cap", async () => {
@@ -196,4 +206,54 @@ test("XERK-2568: repeated failures back off per client and username, answered be
 test("XERK-2568: a client's second concurrent sign-in is refused, not queued", async () => {
   const both = await Promise.all([1, 2].map(() => loginAs("192.0.2.77", "rootadmin", "root-admin-pass")));
   assert.deepEqual(both.map((r) => r.status).sort(), [200, 503]);
+});
+
+// Holds every verify for `ms` so slots stay busy and the queue is exercised.
+async function withSlowVerify(ms, fn) {
+  const real = tenancy.verifyPassword;
+  const stats = { inflight: 0, peak: 0 };
+  tenancy.verifyPassword = async (pw, hash) => {
+    stats.peak = Math.max(stats.peak, ++stats.inflight);
+    try {
+      await new Promise((r) => setTimeout(r, ms));
+      return await real(pw, hash);
+    } finally {
+      stats.inflight--;
+    }
+  };
+  try {
+    await fn(stats);
+  } finally {
+    tenancy.verifyPassword = real;
+  }
+  return stats;
+}
+
+test("XERK-2568: sign-ins finding both slots busy wait their turn instead of a 503", async () => {
+  const stats = await withSlowVerify(200, async () => {
+    const r = await Promise.all(Array.from({ length: 6 }, (_, i) => loginAs(`192.0.2.${100 + i}`, "rootadmin", "root-admin-pass")));
+    assert.deepEqual(r.map((x) => x.status), Array(6).fill(200));
+  });
+  assert.equal(stats.peak, 2, "queued sign-ins never run past the cap");
+});
+
+test("XERK-2568: many distinct clients never run more than two scrypts at once", async () => {
+  const stats = await withSlowVerify(30, async () => {
+    await Promise.all(Array.from({ length: 12 }, (_, i) => loginAs(`192.0.2.${120 + i}`, `nobody-${i}`, "x")));
+  });
+  assert.equal(stats.peak, 2);
+});
+
+test("XERK-2568: a successful sign-in clears that client's failure count", async () => {
+  for (let i = 0; i < 4; i++) assert.equal((await loginAs("192.0.2.60", "rootadmin", "wrong")).status, 401);
+  assert.equal((await loginAs("192.0.2.60", "rootadmin", "root-admin-pass")).status, 200);
+  for (let i = 0; i < 4; i++) assert.equal((await loginAs("192.0.2.60", "rootadmin", "wrong")).status, 401, `after clear ${i}`);
+});
+
+test("XERK-2568: a forged CF-Connecting-IP cannot back another client off", async () => {
+  // Both arrive through the "ingress": the victim as X-Forwarded-For 10.10.10.77, the attacker
+  // from 10.10.10.66 claiming to be 10.10.10.77.
+  const as = (headers, password) => request("POST", "/api/login", { headers, body: { username: "rootadmin", password } });
+  for (let i = 0; i < 8; i++) await as({ "cf-connecting-ip": "10.10.10.77", "x-forwarded-for": "10.10.10.66" }, "wrong");
+  assert.equal((await as({ "x-forwarded-for": "10.10.10.77" }, "root-admin-pass")).status, 200);
 });

@@ -13357,24 +13357,31 @@ const LOGIN_FAIL_FREE = 5;
 const LOGIN_BACKOFF_BASE_MS = 1000;
 const LOGIN_BACKOFF_MAX_MS = 15 * 60 * 1000;
 const LOGIN_FAIL_TRACK_MAX = 10000;
-const LOGIN_CLIENT_KEY_MAX = 64;
+const LOGIN_CLIENT_KEY_MAX = 64; // per part of loginClientKey
 let loginScryptInflight = 0;
 const loginQueue = []; // FIFO of { grant } waiters for a scrypt slot
 const loginClientsInflight = new Set();
-const loginFailures = new Map(); // `${client}\n${username}` -> { count, until, at }
+const loginFailures = new Map(); // loginFailureKey -> { count, until, at }
 
-// Who is signing in, for fairness only — never for authorization. Cloudflare
-// sets CF-Connecting-IP (and overwrites a client-sent one); without it the
-// right-most X-Forwarded-For entry is what the nginx ingress saw; else the
-// socket. A caller reaching the hub without Cloudflare can choose its key, which
-// buys it no more than one queue place per key (residual, accepted).
+// Who is signing in, for fairness only — never for authorization. Three parts,
+// all of them: CF-Connecting-IP (Cloudflare sets it, overwriting a client-sent
+// one), the right-most X-Forwarded-For entry (what the nginx ingress saw), and
+// the socket peer. A caller that bypasses Cloudflare (the LAN reaches the ingress
+// directly) can forge the first and the left of the second, but not the hop the
+// ingress appends nor the socket — so it can never present ANOTHER client's key
+// and back that client off. Forging a fresh key per request only buys queue
+// places (bounded by LOGIN_QUEUE_MAX), never more scrypt (residual, accepted).
+function loginClientPart(v) {
+  return String(v || "").trim().replace(/^::ffff:/i, "").slice(0, LOGIN_CLIENT_KEY_MAX);
+}
 function loginClientKey(req) {
-  const cf = String((req.headers && req.headers["cf-connecting-ip"]) || "").trim();
-  if (cf) return cf.slice(0, LOGIN_CLIENT_KEY_MAX);
-  const xff = String((req.headers && req.headers["x-forwarded-for"]) || "").split(",");
-  const last = xff[xff.length - 1].trim();
-  if (last) return last.slice(0, LOGIN_CLIENT_KEY_MAX);
-  return String((req.socket && req.socket.remoteAddress) || "unknown").slice(0, LOGIN_CLIENT_KEY_MAX);
+  const h = req.headers || {};
+  const xff = String(h["x-forwarded-for"] || "").split(",");
+  return [
+    loginClientPart(h["cf-connecting-ip"]),
+    loginClientPart(xff[xff.length - 1]),
+    loginClientPart(req.socket && req.socket.remoteAddress),
+  ].join("|");
 }
 
 function acquireLoginSlot() {
@@ -13404,8 +13411,9 @@ function releaseLoginSlot() {
   else loginScryptInflight--;
 }
 
+// Hashed, so a megabyte username costs the map 64 bytes, not a megabyte.
 function loginFailureKey(clientKey, username) {
-  return `${clientKey}\n${String(username).toLowerCase()}`;
+  return crypto.createHash("sha256").update(`${clientKey}\n${String(username).toLowerCase()}`).digest("hex");
 }
 
 function loginBackoffMs(clientKey, username, now) {
@@ -25358,6 +25366,7 @@ if (process.env.TURMA_TEST) {
     authEnabled,
     localLogin,
     loginClientKey,
+    loginFailureKey,
     oidcPrincipal,
     tenancyState: () => tenancyState,
     __setTenancy(v) { tenancyState = tenancy.coerceTenancy(v); },
