@@ -20333,8 +20333,8 @@ test("XERK-2531: a code never takes a name another host holds or an unusable one
   forget2531("enr-held");
 });
 
-test("XERK-2531: a fresh code for a name supersedes an identity that never beat", () => {
-  forget2531("enr-s");
+test("XERK-2531: a fresh code for a name supersedes an identity that never beat", async () => {
+  forget2531("enr-s"); forget2381("enr-s");
   const t0 = Date.now();
   const first = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-s", t0);
   assert.equal(first.status, 200);
@@ -20344,12 +20344,16 @@ test("XERK-2531: a fresh code for a name supersedes an identity that never beat"
   const early = hub.consumeEnrollCode(code2, "enr-s", t0 + 1000);
   assert.equal(early.status, 409, JSON.stringify(early.body));
   assert.match(early.body.error, /redeemed moments ago.*retry in \d+s/);
+  // XERK-2572: the route's redemption is refused at the check pass too, so it bumps nothing.
+  const viaRoute = await hub.redeemEnrollCode(code2, "enr-s", t0 + 1000);
+  assert.equal(viaRoute.status, 409, JSON.stringify(viaRoute.body));
+  assert.equal(hub.nameTokenGen("enr-s"), 0);
   assert.equal(hostOfUid(tokenUid(first.body.token)), "enr-s"); // still the first holder's
   const second = hub.consumeEnrollCode(code2, "enr-s", t0 + hub.ENROLL_SUPERSEDE_GRACE_MS + 1);
   assert.equal(second.status, 200, JSON.stringify(second.body));
   assert.notEqual(tokenUid(first.body.token), tokenUid(second.body.token));
   assert.equal(hostOfUid(tokenUid(first.body.token)), null); // never two machines on one id
-  forget2531("enr-s");
+  forget2531("enr-s"); forget2381("enr-s");
 });
 
 test("XERK-2574: the grace window is case-folded, and Remove host lifts it", async () => {
