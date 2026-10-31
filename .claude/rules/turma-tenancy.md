@@ -251,10 +251,15 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     view (`tenantViewSig`) with its own ETag; a view that loses nothing gets the payload's bytes.
   - An SSE stream is scoped to the principal that opened it (`ssePrincipals`); a stream with none
     gets nothing. A disabled user's open stream keeps its view until it reconnects.
+  - **A whole-map event (`SNAPSHOT_EVENTS`) is skipped for a stream whose slice is unchanged since
+    the last frame IT received** (`sseLastSent`, rollup XERK-2593): else every stream heard every
+    other tenant's activity. Per stream, never per view: a later stream never saw the earlier frame.
 - **The ws-token names its principal** (`ws2.<exp>.<claims>.<mac>`, re-read from the store at
   socket open); `/live` 404s another tenant's host. The pre-tenancy `ws.` token is refused.
 - `findSession(id, p)` resolves only the caller's hosts, so another tenant's agent reporting the
   same session id can never capture a terminal.
+- `liveSessionForTranscript(tid, p)` likewise (rollup XERK-2593): two tenants reporting one live
+  transcript id each resolve their own host, never the first one found.
 - Archive list/search pass `scope` (`archiveScopeFor`) into SQL (`scopeSql` / `scopeWhere`), never a
   post-filter (paging would break).
 

@@ -233,6 +233,12 @@ const SCOPERS = {
 // SSE events whose name is not their payload key.
 const EVENT_ALIASES = { triageActions: "ticketTriageActions" };
 const SINGLE_HOST_EVENTS = new Set(["agent", "removed"]);
+// Events that carry a WHOLE scoped map or list (the view's full current value, not a
+// delta): a frame identical to the last one a stream received for that event is
+// redundant, so the hub skips it (rollup XERK-2593). Without it every stream got a
+// frame whenever ANY org's map changed — another tenant's activity timing, and noise.
+const SNAPSHOT_EVENTS = new Set(Object.keys(SCOPERS).concat(Object.keys(EVENT_ALIASES))
+  .filter((e) => !["now", "pushEnabled", "error", "modelPolicy", "agents", "retiredUsage"].includes(e)));
 
 // The payload a view may see. Returns `{out, changed}`; `changed` false means the
 // caller may serve the unscoped bytes as they are.
@@ -266,6 +272,6 @@ function scopeEvent(event, data, view) {
 
 module.exports = {
   ROUTES, UPGRADES, CLASSES, classifyRoute, classifyUpgrade,
-  SCOPERS, EVENT_ALIASES, SINGLE_HOST_EVENTS, scopePayload, scopeEvent,
+  SCOPERS, EVENT_ALIASES, SINGLE_HOST_EVENTS, SNAPSHOT_EVENTS, scopePayload, scopeEvent,
   orgVisible, repoVisible, siteOfTicketKey,
 };
