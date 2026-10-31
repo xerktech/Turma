@@ -13597,8 +13597,8 @@ const loginFailures = new Map(); // loginFailureKey -> { count, until, at }
 // the socket peer. A caller that bypasses Cloudflare (the LAN reaches the ingress
 // directly) can forge the first and the left of the second, but not the hop the
 // ingress appends nor the socket — so it can never present ANOTHER client's key
-// and back that client off. Forging a fresh key per request only buys queue
-// places (bounded by LOGIN_QUEUE_MAX), never more scrypt (residual, accepted).
+// and back that client off. Unset TURMA_TRUSTED_PROXIES, forging a fresh key per
+// request still gets a fresh backoff budget — set it (XERK-2585, below).
 function loginClientPart(v) {
   return String(v || "").trim().replace(/^::ffff:/i, "").slice(0, LOGIN_CLIENT_KEY_MAX);
 }
@@ -13644,6 +13644,37 @@ function loginProxyTrusted(ip, trusted) {
   const family = net.isIP(ip);
   return !!family && trusted.check(ip, family === 6 ? "ipv6" : "ipv4");
 }
+// XERK-2585: with TURMA_TRUSTED_PROXIES set, the key is the FIRST address outside
+// the trusted list, read from the hub's side inward: the socket peer, else the
+// hop the ingress appended, else CF-Connecting-IP (only when both of those are
+// trusted, i.e. the request really came through cloudflared). A caller that
+// reaches the ingress without Cloudflare is therefore keyed on the address the
+// ingress saw, so rotating a forged CF-Connecting-IP no longer buys a fresh
+// backoff budget (break-glass runs no scrypt, so that budget was the only brake).
+// An IPv6 client is keyed on its /64: one subscriber holds the whole /64 and can
+// rotate inside it. Residual (documented): a host INSIDE the trusted list can
+// still forge every header. Unset = the three-part key, unchanged.
+function loginIpv6Prefix64(ip) {
+  const [head, tail] = ip.split("::");
+  const groups = (s) => (s ? s.split(":").reduce((n, g) => n + (g.includes(".") ? 2 : 1), 0) : 0);
+  const h = head ? head.split(":") : [];
+  const t = tail ? tail.split(":") : [];
+  const full = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - groups(head) - groups(tail))).fill("0"), ...t];
+  return `${full.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(":")}::/64`;
+}
+// An IPv6 address that EMBEDS an IPv4 one (mapped ::ffff:0:0/96, NAT64
+// 64:ff9b::/96, compat ::/96) names one IPv4 client, so it keys on the whole
+// address — its /64 would pool every such client together. Judged by RANGE, not
+// spelling (Node writes NAT64 in hex), on the address with any zone id dropped.
+const LOGIN_EMBEDDED_V4 = new net.BlockList();
+LOGIN_EMBEDDED_V4.addSubnet("::ffff:0:0", 96, "ipv6");
+LOGIN_EMBEDDED_V4.addSubnet("64:ff9b::", 96, "ipv6");
+LOGIN_EMBEDDED_V4.addSubnet("::", 96, "ipv6");
+function loginClientAddr(ip) {
+  const bare = ip.replace(/%.*$/, "");
+  if (net.isIP(bare) !== 6) return ip;
+  return LOGIN_EMBEDDED_V4.check(bare, "ipv6") ? bare.toLowerCase() : loginIpv6Prefix64(bare.toLowerCase());
+}
 function loginClientParts(req) {
   const h = req.headers || {};
   const xff = String(h["x-forwarded-for"] || "").split(",");
@@ -13653,16 +13684,24 @@ function loginClientParts(req) {
     peer: loginClientPart(req.socket && req.socket.remoteAddress),
   };
 }
-// True when loginClientKey is CF-Connecting-IP ALONE — the one key a caller inside
-// the trusted CIDRs can rotate per request (XERK-2587, breakGlassAttempt's pool).
+// True when loginClientKey is CF-Connecting-IP — its last branch below, the one key
+// a caller inside the trusted CIDRs can rotate per request (XERK-2587,
+// breakGlassAttempt's pool). Keep it in step with loginClientKey.
 function loginKeyFromCf(req, trusted = LOGIN_TRUSTED_PROXIES) {
   const { cf, hop, peer } = loginClientParts(req);
-  return !!(trusted && cf && loginProxyTrusted(peer, trusted) && loginProxyTrusted(hop, trusted));
+  return !!(trusted && loginProxyTrusted(peer, trusted) && loginProxyTrusted(hop, trusted) && net.isIP(cf));
 }
 function loginClientKey(req, trusted = LOGIN_TRUSTED_PROXIES) {
   const { cf, hop, peer } = loginClientParts(req);
-  if (loginKeyFromCf(req, trusted)) return cf;
-  return [cf, hop, peer].join("|");
+  if (!trusted) return [cf, hop, peer].join("|");
+  // The hub was reached directly: its own headers are the caller's to forge.
+  if (!loginProxyTrusted(peer, trusted)) return loginClientAddr(peer);
+  // A trusted peer with no hop it appended is itself the client (a pod, a probe).
+  if (!net.isIP(hop)) return loginClientAddr(peer);
+  // The ingress appended an address outside the proxies: that is the client.
+  if (!loginProxyTrusted(hop, trusted)) return loginClientAddr(hop);
+  // Cloudflare -> cloudflared -> ingress -> hub: Cloudflare's view is the client.
+  return net.isIP(cf) ? loginClientAddr(cf) : loginClientAddr(hop);
 }
 
 function acquireLoginSlot() {
@@ -25767,6 +25806,7 @@ if (process.env.TURMA_TEST) {
     loginKeyFromCf,
     breakGlassAttempt,
     parseTrustedProxies,
+    loginIpv6Prefix64,
     __resetBreakGlassPool() { breakGlassPool.tokens = BREAKGLASS_POOL_BURST; breakGlassPool.at = 0; },
     loginFailureKey,
     oidcPrincipal,
