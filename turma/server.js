@@ -13742,12 +13742,14 @@ const ENROLL_CODE_TTL_MS = positiveEnv("ENROLL_CODE_TTL_MS", 15 * 60 * 1000);
 const ENROLL_CODE_KEEP_MS = 24 * 60 * 60 * 1000;
 const ENROLL_CODES_LIVE_MAX = 20; // unredeemed codes at once
 const ENROLL_CODES_MAX = 200; // records, settled included
-// Redemption attempts per client per window (defence in depth: 128 bits cannot
-// be guessed, but each attempt is an unauthenticated request).
-const ENROLL_ATTEMPTS_PER_WINDOW = 10;
+// Failed redemptions (unknown code) per window, fleet-wide. 128 bits cannot be
+// guessed; this bounds the work an anonymous caller can make the hub do. It is
+// NOT keyed per client: behind Cloudflare + the ingress every public caller
+// shares one forwarding hop, so a per-client key let anyone lock out all
+// enrollment (XERK-2531 QA). And a VALID code is never refused by it, so a
+// flood of junk cannot block a real host from enrolling.
+const ENROLL_FAILS_PER_WINDOW = 30;
 const ENROLL_ATTEMPT_WINDOW_MS = 60 * 1000;
-const ENROLL_ATTEMPT_KEYS_MAX = 1000;
-const enrollAttempts = new Map(); // client -> {start, n}
 
 function enrollCodeHash(code) {
   return crypto.createHash("sha256").update(code).digest("hex");
@@ -13799,9 +13801,24 @@ function enrollNameRefusal(device) {
       return { status: 409, error: `${k} is already registered — remove it from the dashboard first to reinstall it` };
     }
   }
+  // Any identity that has BEATEN and still answers to this name — as its home, its
+  // origin (a renamed host keeps the identity minted for its old name, and
+  // issueAgentUid would hand that same id back) or a former name — owns it. So
+  // does a revoked tombstone: it exists to keep its origin name's token retired,
+  // and minting there would delete it (XERK-2383). Remove host releases a home
+  // name; an earlier name of a live agent stays its own.
   for (const e of Object.values(agentIdentities)) {
-    if (e && !e.revoked && !e.released && e.used && lowerName(e.home) === want) {
-      return { status: 409, error: `${e.home} is registered to another agent — remove it from the dashboard first` };
+    if (!e || e.released) continue;
+    const held = [e.home, e.origin, ...(Array.isArray(e.names) ? e.names : [])]
+      .filter(Boolean).some((n) => lowerName(n) === want);
+    if (!held) continue;
+    if (e.revoked) {
+      return { status: 409, error: `${device} belonged to an agent whose token was revoked — remove ${e.home} from the dashboard to release the name` };
+    }
+    if (e.used) {
+      return { status: 409, error: e.home && lowerName(e.home) !== want
+        ? `${device} is an earlier name of ${e.home} — that agent still owns it`
+        : `${e.home} is registered to another agent — remove it from the dashboard first` };
     }
   }
   return null;
@@ -13876,7 +13893,12 @@ function consumeEnrollCode(code, device, now = Date.now()) {
   for (const [k, rec] of Object.entries(enrollCodes)) {
     if (safeEqual(rec.hash, hash)) { id = k; break; }
   }
-  if (!id) return { status: 401, body: { error: "unknown enrollment code — mint a new one from the dashboard's Add host dialog" } };
+  if (!id) {
+    if (enrollFailLimited(now)) {
+      return { status: 429, body: { error: "too many failed enrollment attempts — wait a minute and retry" } };
+    }
+    return { status: 401, body: { error: "unknown enrollment code — mint a new one from the dashboard's Add host dialog" } };
+  }
   const rec = enrollCodes[id];
   const state = enrollCodeState(rec, now);
   if (state === "used") return { status: 410, body: { error: `this enrollment code was already used (by ${rec.usedBy}) — mint a new one` } };
@@ -13905,25 +13927,12 @@ function consumeEnrollCode(code, device, now = Date.now()) {
   return { status: 200, body: { host: device, token, bound: true } };
 }
 
-// The client a redemption attempt is counted against: the hop nginx saw (the
-// RIGHTMOST X-Forwarded-For entry — anything left of it is client-supplied),
-// else the socket peer.
-function enrollClientKey(req) {
-  const xff = String(req.headers["x-forwarded-for"] || "").split(",").map((v) => v.trim()).filter(Boolean);
-  return (xff.length ? xff[xff.length - 1] : (req.socket && req.socket.remoteAddress) || "?").slice(0, 100);
-}
-function enrollRateLimited(key, now = Date.now()) {
-  let e = enrollAttempts.get(key);
-  if (!e || now - e.start >= ENROLL_ATTEMPT_WINDOW_MS) {
-    if (!e && enrollAttempts.size >= ENROLL_ATTEMPT_KEYS_MAX) {
-      for (const [k, v] of enrollAttempts) if (now - v.start >= ENROLL_ATTEMPT_WINDOW_MS) enrollAttempts.delete(k);
-      if (enrollAttempts.size >= ENROLL_ATTEMPT_KEYS_MAX) return true; // a flood: refuse new keys
-    }
-    e = { start: now, n: 0 };
-    enrollAttempts.set(key, e);
-  }
-  e.n += 1;
-  return e.n > ENROLL_ATTEMPTS_PER_WINDOW;
+const enrollFails = { start: 0, n: 0 };
+// Count one failed redemption; true once the window's budget is spent.
+function enrollFailLimited(now = Date.now()) {
+  if (now - enrollFails.start >= ENROLL_ATTEMPT_WINDOW_MS) { enrollFails.start = now; enrollFails.n = 0; }
+  enrollFails.n += 1;
+  return enrollFails.n > ENROLL_FAILS_PER_WINDOW;
 }
 
 // Trigger auth (POST /api/trigger). A caller passes either the dedicated
@@ -22132,11 +22141,8 @@ const server = http.createServer(async (req, res) => {
 
     // POST /api/agent/enroll {code, device} (XERK-2531): a new host trades a
     // one-time code from the dashboard's Add host dialog for its IDENTITY token.
-    // Rate-limited per client BEFORE the (small, capped) body is read.
+    // Unknown codes are rate-limited fleet-wide (consumeEnrollCode); the body is capped.
     if (isAgentEnrollEndpoint) {
-      if (enrollRateLimited(enrollClientKey(req))) {
-        return json(res, 429, { error: "too many enrollment attempts — wait a minute and retry" });
-      }
       let body;
       try { body = JSON.parse((await readBody(req, 4096)) || "{}"); } catch { body = null; }
       if (!body || typeof body !== "object" || Array.isArray(body)) {
@@ -24905,8 +24911,7 @@ if (process.env.TURMA_TEST) {
     mintEnrollCode,
     revokeEnrollCode,
     listEnrollCodes,
-    enrollRateLimited,
-    enrollAttempts,
+    enrollFails,
     ENROLL_CODE_TTL_MS,
     enrollCodes: () => enrollCodes,
     coerceEnrollCodes,

@@ -20095,7 +20095,7 @@ const forget2531 = (...hosts) => {
   const ids = hub.agentIdentities();
   for (const [u, e] of Object.entries(ids)) if (hosts.includes(e.home) || hosts.includes(e.origin)) delete ids[u];
   for (const k of Object.keys(hub.enrollCodes())) delete hub.enrollCodes()[k];
-  hub.enrollAttempts.clear();
+  hub.enrollFails.start = 0; hub.enrollFails.n = 0;
 };
 
 test("XERK-2531: a code is single-use and trades for the host's identity token", async () => {
@@ -20206,19 +20206,51 @@ test("XERK-2531: a fresh code for a name supersedes an identity that never beat"
   forget2531("enr-s");
 });
 
-test("XERK-2531: redemption attempts are rate-limited per client", async () => {
-  forget2531();
+test("XERK-2531: unknown codes are rate-limited, and a flood never blocks a real code", async () => {
+  forget2531("enr-rl");
   const statuses = [];
-  for (let i = 0; i < 12; i++) {
-    const r = await request("POST", "/api/agent/enroll", { body: { code: "te-" + "1".repeat(32), device: "x" } });
+  for (let i = 0; i < 32; i++) {
+    // A different forwarding hop every time: the limit must not be per client.
+    const r = await request("POST", "/api/agent/enroll", {
+      headers: { "x-forwarded-for": `10.0.0.${i}` },
+      body: { code: "te-" + "1".repeat(32), device: "x" },
+    });
     statuses.push(r.status);
   }
-  assert.deepEqual(statuses.slice(0, 10), Array(10).fill(401));
-  assert.equal(statuses[10], 429);
-  assert.match((await request("POST", "/api/agent/enroll", { body: {} })).body.error, /too many/);
-  // The window is per client key and resets.
-  assert.equal(hub.enrollRateLimited("other-client"), false);
-  forget2531();
+  assert.deepEqual(statuses.slice(0, 30), Array(30).fill(401));
+  assert.equal(statuses[30], 429);
+  // A valid code still redeems while junk is being refused.
+  const code = hub.mintEnrollCode("local:op", "").body.code;
+  const ok = await request("POST", "/api/agent/enroll", { body: { code, device: "enr-rl" } });
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+  forget2531("enr-rl");
+});
+
+test("XERK-2531: a code never takes a renamed host's old name or a revoked tombstone's", () => {
+  forget2531("enr-alpha", "enr-beta");
+  const ids = hub.agentIdentities();
+  // A renamed agent: minted for alpha, beats as beta.
+  ids["a".repeat(32)] = { origin: "enr-alpha", home: "enr-beta", at: 1, used: true, names: ["enr-alpha"] };
+  const m = hub.mintEnrollCode("local:op", "");
+  const r = hub.consumeEnrollCode(m.body.code, "ENR-ALPHA");
+  assert.equal(r.status, 409);
+  assert.match(r.body.error, /earlier name of enr-beta/);
+  assert.equal(hub.mintEnrollCode("local:op", "enr-alpha").status, 409);
+  // Its current name is held too, with no record on this replica.
+  assert.equal(hub.consumeEnrollCode(m.body.code, "enr-beta").status, 409);
+  // A revoked tombstone keeps its origin name retired: redeeming must not delete it.
+  delete ids["a".repeat(32)];
+  ids["b".repeat(32)] = { origin: "enr-alpha", home: "enr-beta", at: 1, used: true, revoked: true };
+  const t = hub.consumeEnrollCode(m.body.code, "enr-alpha");
+  assert.equal(t.status, 409);
+  assert.ok(ids["b".repeat(32)], "the tombstone survives");
+  // A released home (Remove host) is free again.
+  delete ids["b".repeat(32)];
+  ids["c".repeat(32)] = { home: "enr-alpha", at: 1, used: true, released: true };
+  const free = hub.consumeEnrollCode(m.body.code, "enr-alpha");
+  assert.equal(free.status, 200);
+  assert.notEqual(tokenUid(free.body.token), "c".repeat(32));
+  forget2531("enr-alpha", "enr-beta");
 });
 
 test("XERK-2531: the live-code cap and the store whitelist", () => {

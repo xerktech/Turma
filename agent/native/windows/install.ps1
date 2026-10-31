@@ -519,7 +519,7 @@ function Install-Config {
 # with the owner-only ACL. A refused code fails the install (single-use: mint a new one).
 function Set-EnrollmentConfig([string]$HubUrl, [string]$Code) {
   if ($HubUrl) {
-    if ($HubUrl -notmatch '^https?://[^\s"''`$\;&|<>()]+$') {
+    if ($HubUrl -cnotmatch '\Ahttps?://[A-Za-z0-9._~:/%+=,@-]+\z') {
       [Console]::Error.WriteLine("[install] ERROR: -Url must be a plain http(s) URL"); exit 2
     }
     $u = $HubUrl.TrimEnd('/')

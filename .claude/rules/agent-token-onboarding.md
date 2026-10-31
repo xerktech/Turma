@@ -55,20 +55,27 @@ Split out of `CLAUDE.md`, which keeps the per-host credential contract (XERK-268
     credential (`consumeEnrollCode`). Lookup → state check → name check → used-stamp in ONE
     synchronous turn, so two racing redemptions cannot both win (the leader is the single writer).
   - It returns the host's IDENTITY token (`issueAgentUid`), and works under `TURMA_AGENT_STRICT`.
-  - **A code never takes a name another agent holds** (`enrollNameRefusal`: a record, case-folded,
-    or a used unreleased identity) — that would hand the code holder that host's queued commands.
-    Remove host releases the name. An identity minted for the name that never beat is SUPERSEDED,
-    so two machines never share one id.
+  - **A code never takes a name another agent holds** (`enrollNameRefusal`, case-folded) — that
+    would hand the code holder that host's token and queued commands. An identity minted for the
+    name that never beat is SUPERSEDED, so two machines never share one id.
   - A refusal that is the caller's mistake (wrong device for a device-bound code, a taken or
     unusable name) does NOT burn the code. Used/expired/revoked → 410 in the hub's words.
-  - Rate-limited per client BEFORE the body is read (`enrollRateLimited`: 10/min keyed on the
-    rightmost `X-Forwarded-For` hop, the one nginx appends; bounded map). Defence in depth only.
+  - **Only UNKNOWN codes are rate-limited, fleet-wide** (`enrollFailLimited`, 30/min → 429); a
+    live code always redeems. Never key it per client: behind Cloudflare + the ingress every public
+    caller shares one forwarding hop, so a per-client bucket let anyone lock out all enrollment.
+  - **A name any beaten identity answers to is refused** — its home, its ORIGIN (a renamed host
+    keeps the id minted for its old name, and `issueAgentUid` would hand that id back) or a former
+    name — and so is a revoked tombstone's origin (minting there deleted it, un-retiring the old
+    name token, XERK-2383). Only Remove host's `released` frees a name.
   - `owner` records the minting principal (`oidc:<sub>` or `local:<user>`) for the tenancy epic
     (XERK-2529) to bind the host to a tenant. **Recorded, not enforced.**
   - Agent: `hub-agent.py --enroll` with `TURMA_ENROLL_CODE` in the ENV (never argv) runs
     `enroll_with_code`, which writes only an identity token. Front ends: `turma-agentctl enroll
     --code`, `turma-agentctl.ps1 enroll -Code`, `install.sh --url --enroll-code`, `install.ps1 -Url
-    -EnrollCode` (the installers call the manager directly, before the service starts).
+    -EnrollCode` (the installers call the manager directly, before the service starts). Those front
+    ends take the code on their OWN argv (single-use, so accepted); only the manager's is clean.
+  - The installers' URL check is a character WHITELIST over the whole value (a line-wise grep let
+    a newline add lines to the sourced env file).
   - `--agent-token <host>` stays the break-glass path; master bootstrap still works until strict.
   - Tests: the `XERK-2531:` cases in `server.test.js` and `dashboard-addhost.test.js`; the
     `enroll_with_code` cases in `TestSetToken`; the enroll cases in `test_turma_agentctl.sh`,

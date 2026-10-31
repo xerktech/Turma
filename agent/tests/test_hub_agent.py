@@ -46703,10 +46703,19 @@ class TestSetToken(unittest.TestCase):
             self.assertNotIn("TURMA_TOKEN=x", open(p).read())
 
     def test_the_cli_entry_takes_the_code_from_the_environment(self):
-        src = open(os.path.join(os.path.dirname(ha.__file__), "hub-agent.py")).read()
-        self.assertIn('os.environ.get("TURMA_ENROLL_CODE"', src)
-        self.assertNotIn('"--code"', src)  # never on the manager's argv
-
+        # Run the real entry point: a malformed TURMA_ENROLL_CODE must reach
+        # enroll_with_code (which refuses it before any network), never the
+        # token path (which would complain about TURMA_TOKEN instead).
+        script = os.path.join(os.path.dirname(os.path.abspath(ha.__file__)), "hub-agent.py")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("TURMA_TOKEN", "TURMA_AGENT_ENV")}
+        env.update({"TURMA_ENROLL_CODE": "not-a-code", "TURMA_URL": "http://127.0.0.1:9",
+                    "HOME": tempfile.mkdtemp()})
+        p = subprocess.run([sys.executable, script, "--enroll"], env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("not an enrollment code", p.stderr)
+        self.assertNotIn("not-a-code", p.stdout + p.stderr)
 
 class TestWindowsPortability(unittest.TestCase):
     """XERK-670 — hub-agent.py runs unforked on native Windows. These pin the

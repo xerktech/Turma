@@ -391,9 +391,12 @@ configure_enrollment() {
       http://*|https://*) ;;
       *) echo "[install] ERROR: --url must be an http(s) URL" >&2; exit 2 ;;
     esac
-    if printf '%s' "$HUB_URL" | grep -q "[[:space:]\"'\$\`\\;&|<>()]"; then
-      echo "[install] ERROR: --url holds characters a sourced env file cannot carry" >&2; exit 2
-    fi
+    # A WHITELIST, matched by `case` on the whole value: a line-wise grep let a
+    # newline through, writing extra KEY=value lines into the sourced file.
+    case "$HUB_URL" in
+      *[!A-Za-z0-9._~:/%+=,@-]*)
+        echo "[install] ERROR: --url holds characters a sourced env file cannot carry" >&2; exit 2 ;;
+    esac
     HUB_URL="${HUB_URL%/}"
     if grep -q '^[[:space:]]*\(export[[:space:]]\+\)\?TURMA_URL=' "$CFG"; then
       tmp="$CFG.$$.tmp"
