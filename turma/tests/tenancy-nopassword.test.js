@@ -257,3 +257,24 @@ test("XERK-2568: a forged CF-Connecting-IP cannot back another client off", asyn
   for (let i = 0; i < 8; i++) await as({ "cf-connecting-ip": "10.10.10.77", "x-forwarded-for": "10.10.10.66" }, "wrong");
   assert.equal((await as({ "x-forwarded-for": "10.10.10.77" }, "root-admin-pass")).status, 200);
 });
+
+test("XERK-2586: a sign-in whose socket already closed spends no scrypt and shares no bucket", async () => {
+  // A closed socket reports no peer address; mark one request so its socket reads that way.
+  const strip = (req) => {
+    if (req.headers["x-test-closed"]) Object.defineProperty(req.socket, "remoteAddress", { value: undefined, configurable: true });
+  };
+  server.prependListener("request", strip);
+  const real = tenancy.verifyPassword;
+  let calls = 0;
+  tenancy.verifyPassword = async (...a) => { calls++; return real(...a); };
+  try {
+    const r = await request("POST", "/api/login", {
+      headers: { "x-test-closed": "1" }, body: { username: "rootadmin", password: "wrong" },
+    });
+    assert.equal(calls, 0, "no scrypt for a caller that is gone");
+    assert.ok(!/hub_session=/.test(String(r.headers["set-cookie"] || "")), "no session issued");
+  } finally {
+    tenancy.verifyPassword = real;
+    server.removeListener("request", strip);
+  }
+});
