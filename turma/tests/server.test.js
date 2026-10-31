@@ -116,6 +116,7 @@ process.env.DECISIONS_FILE = path.join(scratchDir(), `turma-test-decisions-${pro
 process.env.DAILY_BRIEF_SCHEDULES_FILE = path.join(scratchDir(), `turma-test-daily-brief-schedules-${process.pid}.json`);
 process.env.DAILY_BRIEFS_FILE = path.join(scratchDir(), `turma-test-daily-briefs-${process.pid}.json`);
 process.env.MEETING_PROPOSALS_FILE = path.join(scratchDir(), `turma-test-meeting-proposals-${process.pid}.json`);
+process.env.MEETING_TOKENS_FILE = path.join(scratchDir(), `turma-test-meeting-tokens-${process.pid}.json`);
 process.env.DEDUPE_LINK_ORGS_FILE = path.join(scratchDir(), `turma-test-dedupe-link-orgs-${process.pid}.json`);
 process.env.EPIC_BUILDERS_FILE = path.join(scratchDir(), `turma-test-epic-builders-${process.pid}.json`);
 process.env.EPIC_RUNS_FILE = path.join(scratchDir(), `turma-test-epic-runs-${process.pid}.json`);
@@ -29180,12 +29181,24 @@ test("XERK-2551: Tenir's meeting post is scoped by its token's tenant, never by 
   let F;
   try {
     F = await fleet2551(T, "t2551m");
-    const tokA = hub.meetingsTenantToken(T.A.t);
+    const mint = (who) => request("POST", "/api/meetings-token", { headers: { ...who.h, "content-type": "application/json" }, body: {} });
+    const tokA = (await mint(T.A)).body.token;
     assert.match(tokA, /^tm1\.[0-9a-f]{32}\./);
+    // A's host can read meetings, so A's meeting is dispatched to it — and the
+    // transcript it pulls names the org PLAIN, as its command does.
+    await beat2533(F.ta, "t2551m", jira2551(S2551, { meetings: { available: true } }));
     const post = (site, tok, id) => request("POST", `/api/orgs/${encodeURIComponent(site)}/meetings`,
       { headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: meeting2508(id) });
     assert.equal((await post(S2551, tokA, "a1")).status, 200);
     assert.equal(hub.getMeetings()[F.SA].length, 1, "A's token files into A's org");
+    const run = hub.getMeetings()[F.SA][0];
+    assert.equal(run.host, F.ka);
+    const tx = await request("GET", `/api/agents/t2551m/meetings/${run.runId}/transcript`,
+      { headers: { authorization: `Bearer ${F.ta}` } });
+    assert.equal(tx.status, 200, JSON.stringify(tx.body));
+    assert.equal(tx.body.siteKey, S2551);
+    const cmd = agents[F.ka].commands.find((c) => c.type === "extractMeeting");
+    assert.equal(cmd.siteKey, F.SA, "stored scoped; handed over plain (asserted above for commands)");
     assert.ok(!(F.SB in hub.getMeetings()) && !(S2551 in hub.getMeetings()));
     // A typed suffix proves nothing: refused, with any token.
     assert.equal((await post(F.SB, tokA, "a2")).status, 404);
@@ -29193,16 +29206,26 @@ test("XERK-2551: Tenir's meeting post is scoped by its token's tenant, never by 
     // The fleet token is the operators' untenanted org.
     assert.equal((await post(S2551, "meetingstok", "l1")).status, 200);
     assert.equal(hub.getMeetings()[S2551].length, 1);
-    // A forged or other-tenant-signed token is nobody's.
+    // A's secret under B's id is nobody's; B has no token until B mints one.
     assert.equal((await post(S2551, `tm1.${T.B.t}.${tokA.split(".")[2]}`, "b1")).status, 401);
-    // A route hands each tenant user its own token; break-glass has none.
-    const mine = await request("GET", "/api/meetings-token", { headers: T.B.h });
-    assert.equal(mine.body.token, hub.meetingsTenantToken(T.B.t));
+    // Nothing the operators hold derives a tenant token: the old HMAC shape fails.
+    const crypto = require("node:crypto");
+    const forged = `tm1.${T.A.t}.${crypto.createHmac("sha256", "meetingstok")
+      .update(`turma-meetings-tenant:${T.A.t}`).digest("base64url")}`;
+    assert.equal((await post(S2551, forged, "f1")).status, 401);
+    // Status, never the token; break-glass has none.
+    const st = await request("GET", "/api/meetings-token", { headers: T.A.h });
+    assert.deepEqual([st.body.exists, "token" in st.body], [true, false]);
     assert.equal((await request("GET", "/api/meetings-token", { headers: userHeaders })).status, 404);
+    // Rotating revokes the old token alone.
+    const tokA2 = (await mint(T.A)).body.token;
+    assert.notEqual(tokA2, tokA);
+    assert.equal((await post(S2551, tokA, "a4")).status, 401);
+    assert.equal((await post(S2551, tokA2, "a5")).status, 200);
     // A disabled user's Tenir stops at once.
     const tenancy = require("../tenancy.js");
     hub.__setTenancy(tenancy.updateUser(hub.tenancyState(), T.A.user.id, { disabled: true }).state);
-    assert.equal(hub.meetingsTenant({ headers: { authorization: `Bearer ${tokA}` } }), null);
+    assert.equal(hub.meetingsTenant({ headers: { authorization: `Bearer ${tokA2}` } }), null);
   } finally {
     if (F) { forget2533("t2551m", F.ka, F.kb, F.kl); for (const k of [F.SA, F.SB, S2551]) delete hub.getMeetings()[k]; }
     T.restore();
@@ -29267,4 +29290,44 @@ test("XERK-2551: purging a tenant removes all of its org data and nobody else's"
     for (const k of Object.keys(hub.ticketAgents)) if (k.includes("acme2551")) delete hub.ticketAgents[k];
     T.restore();
   }
+});
+
+test("XERK-2551: an epic builder is cancelled only through its own org", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await fleet2551(T, "t2551e");
+    hub.epicBuilders.eb2551b = { id: "eb2551b", siteKey: F.SB, title: "t", idea: "i", state: "queued",
+      startedAt: 1, updatedAt: 1 };
+    const del = (site, h) => request("DELETE",
+      `/api/jira/${encodeURIComponent(site)}/epic-builder/eb2551b`, { headers: h });
+    assert.equal((await del(F.SA, T.A.h)).status, 404, "A's own org passes the guard, not B's builder");
+    assert.ok(hub.epicBuilders.eb2551b);
+    assert.equal((await del(F.SB, T.B.h)).status, 200);
+    assert.ok(!hub.epicBuilders.eb2551b);
+  } finally { if (F) forget2533("t2551e", F.ka, F.kb, F.kl); delete hub.epicBuilders.eb2551b; T.restore(); }
+});
+
+test("XERK-2551: a binding made before the tenant follows the host; a restored record is re-scoped", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await fleet2551(T, "t2551b");
+    // A binding stored plain (made before the host joined its tenant) moves into it on the beat.
+    agents[F.ka].orgBound = S2551;
+    await beat2533(F.ta, "t2551b", jira2551());
+    assert.equal(agents[F.ka].orgBound, F.SA);
+    assert.equal(hub.decidedOrgOf(agents[F.ka]), F.SA, "not read as drifted");
+    // A record saved before this hub: re-scoped on restore, before any beat.
+    const map = {
+      [F.ka]: { device: "t2551b", orgBound: S2551, jira: { siteKey: S2551 },
+        sessions: [{ id: "s", ticket: { siteKey: S2551, key: "X-1" } }] },
+      t2551bleg: { device: "t2551bleg", orgBound: F.SB, jira: { siteKey: F.SB } },
+    };
+    hub.rescopeRestoredOrgs(map);
+    assert.deepEqual([map[F.ka].orgBound, map[F.ka].jira.siteKey, map[F.ka].sessions[0].ticket.siteKey],
+      [F.SA, F.SA, F.SA]);
+    assert.deepEqual([map.t2551bleg.orgBound, map.t2551bleg.jira.siteKey], [S2551, S2551],
+      "an untenanted record never keeps a tenant's org");
+  } finally { if (F) forget2533("t2551b", F.ka, F.kb, F.kl); T.restore(); }
 });

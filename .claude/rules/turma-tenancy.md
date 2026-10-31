@@ -197,6 +197,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   - Rewritten at the AGENT boundary only: `scopeSiteKeys` re-scopes every `siteKey` in a beat
     (whole-payload walk, so no field is missed; content keys in `SITE_SCOPE_SKIP` excluded) and
     strips an untenanted host's forged suffix. `orgBound` follows the host into its tenant.
+  - A restored record is re-scoped the same way (`rescopeRestoredOrgs`, state.json + HA hydrate):
+    else a record saved before its host's tenant served the plain org until that host beat again.
   - The agent always gets its org PLAIN (`unscopeSiteKeys`): delivered commands, the reply's
     `decisions.org`/`permissionPolicy.site`, the meeting transcript GET. It compares them to its
     own site; a scoped one makes it drop the command. A new agent-bound siteKey must be unscoped too.
@@ -204,11 +206,16 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     beside a plain siteKey (the rejected design, `docs/multi-tenant-adr.md`).
 - **`principalMaySite` gates every `/api/jira/<site>` and `/api/orgs/<site>` route** (404) with the
   host rule (`principalMayDriveHost` on the org's tenant), in ONE guard after the human gate.
+  - The guard proves only the URL's org: a route that also takes an id (epic builder DELETE) must
+    check the record belongs to that org, or any tenant acts on ids read off the shared feed.
   `POST /api/jira/refresh` fans out to the caller's own hosts only.
 - **Tenir's meeting post is scoped by its TOKEN** (`meetingsTenant`): the fleet
-  `TURMA_MEETINGS_TOKEN` = untenanted; `tm1.<tenantId>.<HMAC(that token, tenant)>` = that tenant,
-  live only while a user of the tenant holds the user role. A suffixed URL site is refused.
-  `GET /api/meetings-token` hands a tenant user theirs. Tenir needs no change (a bearer either way).
+  `TURMA_MEETINGS_TOKEN` = untenanted; `tm1.<tenantId>.<random>` = that tenant, live only while a
+  user of the tenant holds the user role. A suffixed URL site is refused. Tenir needs no change.
+  - **Random and stored as a SHA-256 only** (`meetingTokens`, `/data/meeting-tokens.json`, 0600),
+    minted/rotated by the tenant's own user (`POST /api/meetings-token`, shown once; GET = status).
+    Never derive it from an operator-held secret (fleet token, session key, break-glass password):
+    QA forged every tenant's token from the fleet token that way.
 - **Push devices carry the registrant's tenant** (`registerDevice`); `notify`/`dismiss` send only to
   `devicesForHost(host)` — the host's tenant's devices, the operators' for an untenanted host or a
   fleet-wide alert. Pass the host to every new `dismiss`.

@@ -641,6 +641,8 @@ const DAILY_BRIEFS_FILE = process.env.DAILY_BRIEFS_FILE || "/data/daily-briefs.j
 // siteKey -> newest-first meetings. Written per meeting/run, human rate.
 const MEETING_PROPOSALS_FILE =
   process.env.MEETING_PROPOSALS_FILE || "/data/meeting-proposals.json";
+// Each tenant's Tenir bearer, as its SHA-256 only (XERK-2551).
+const MEETING_TOKENS_FILE = process.env.MEETING_TOKENS_FILE || "/data/meeting-tokens.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -1456,6 +1458,18 @@ function unscopeSiteKeys(v, depth = 0) {
     if (y !== x) { out = out || { ...v }; out[k] = y; }
   }
   return out || v;
+}
+// A restored record's orgs, re-scoped into its key's tenant (XERK-2551), as its
+// next beat would: a record saved before this hub (or before its host's tenant
+// bind) otherwise served the plain org — operator-reachable, its own tenant
+// 404'd — until that host beat again, forever for an offline one.
+function rescopeRestoredOrgs(map) {
+  for (const [key, a] of Object.entries(map)) {
+    if (!a || typeof a !== "object") continue;
+    const t = tenantOfKey(key);
+    scopeSiteKeys(a, t);
+    if (typeof a.orgBound === "string" && a.orgBound) a.orgBound = scopeSite(a.orgBound, t);
+  }
 }
 // Whether principal `p` may read or act on org `site`: a tenant's org only for
 // that tenant, an untenanted one for the hub's operators — the host rule,
@@ -2679,6 +2693,7 @@ if (!HA_ON) try {
   // re-coercing values it PERSISTED (XERK-429). The source-regex test pins the
   // literal `normalizeRecord(a` here, so keep the call recognisable.
   for (const a of Object.values(agents)) normalizeRecord(a, "restore");
+  rescopeRestoredOrgs(agents);
   // A RESTORED command cannot be proven undelivered (XERK-303), so it is stamped
   // as delivered here. `deliveredAt` is written when the reply hands the command
   // over, and `scheduleSave` is a 30-SECOND DEBOUNCE: a save that landed between
@@ -4918,6 +4933,27 @@ const persistMeetings = registerExternalStore({
   install: (v) => { meetingProposals = v; },
   // A 200 tells Tenir the meeting is kept, so the row is written at once.
   debounceMs: 0,
+});
+// Tenant Tenir tokens (XERK-2551): tenantId -> {hash, at}. Random, stored as a
+// SHA-256 only, minted/rotated by the tenant's own user (POST
+// /api/meetings-token), so nothing the operators hold — the fleet meetings
+// token, the session secret, the break-glass password — derives one, and a
+// rotation revokes the old one alone. Whitelisted field by field (a coerce
+// fixed point); inline literals, it runs at module init.
+function meetingTokensCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [t, e] of Object.entries(raw)) {
+    if (!/^[0-9a-f]{32}$/.test(t) || !e || typeof e !== "object") continue;
+    if (typeof e.hash !== "string" || !/^[0-9a-f]{64}$/.test(e.hash)) continue;
+    out[t] = { hash: e.hash, at: Number.isSafeInteger(e.at) && e.at > 0 ? e.at : 0 };
+  }
+  return out;
+}
+let meetingTokens = meetingTokensCoerce(readJsonFile(MEETING_TOKENS_FILE));
+const persistMeetingTokens = registerExternalStore({
+  name: "meetingTokens", file: MEETING_TOKENS_FILE, debounceMs: 0, mode: 0o600,
+  coerce: meetingTokensCoerce, read: () => meetingTokens, install: (v) => { meetingTokens = v; },
 });
 // The one writer: insert (newest first) or replace a row by meetingId, through
 // the whitelist. Callers re-read rows rather than holding one across a write.
@@ -7297,6 +7333,12 @@ registerTenantPurge("ticketQueue", (t) => {
   }
   return n;
 });
+registerTenantPurge("meetingTokens", (t) => {
+  if (!Object.hasOwn(meetingTokens, t)) return 0;
+  delete meetingTokens[t];
+  persistMeetingTokens();
+  return 1;
+});
 registerTenantPurge("devices", (t) => {
   const before = devices.length;
   devices = devices.filter((d) => !(d && d.tenantId === t));
@@ -8048,6 +8090,7 @@ async function hydrateAgentsFromStore() {
     console.warn(`dropping restored agent with a non-object record under ${hostKeyLabel(k)}`);
   }
   for (const a of Object.values(agents)) normalizeRecord(a, "restore");
+  rescopeRestoredOrgs(agents);
   sanitizeRestoredCommands(agents);
   trimRestoredAgents();
   console.log(`hydrated ${loaded} agent record(s) from the HA store`);
@@ -19012,16 +19055,19 @@ const meetingSegmentBytes = (m) => (m.segments ? Buffer.byteLength(JSON.stringif
 // The tenant a Tenir meeting post belongs to (XERK-2551): "" for the fleet
 // `TURMA_MEETINGS_TOKEN` (the operators' untenanted orgs), a tenant id for that
 // tenant's own token, null when the bearer proves nothing. A tenant token is
-// `tm1.<tenantId>.<HMAC(TURMA_MEETINGS_TOKEN, tenantId)>`: derived, so nothing
-// is stored, and the URL's site is scoped by the TOKEN's tenant, never a
+// `tm1.<tenantId>.<43 random base64url>`, stored as its SHA-256
+// (`meetingTokens`), and the URL's site is scoped by the TOKEN's tenant, never a
 // suffix the caller types — the site key alone proves no tenant. It works only
 // while a user with that tenant holds the user role (a disabled or deleted
 // user's Tenir stops at once). Tenir needs no change: it sends a bearer either way.
-function meetingsTenantToken(tenantId) {
-  if (!TURMA_MEETINGS_TOKEN || !TENANT_ID_RE.test(tenantId || "")) return "";
-  const mac = crypto.createHmac("sha256", TURMA_MEETINGS_TOKEN)
-    .update(`turma-meetings-tenant:${tenantId}`).digest("base64url");
-  return `tm1.${tenantId}.${mac}`;
+const sha256Hex = (s) => crypto.createHash("sha256").update(s).digest("hex");
+// Mint (or rotate) tenant `tenantId`'s token; returns the plain token once.
+function mintMeetingsTenantToken(tenantId) {
+  if (!TENANT_ID_RE.test(tenantId || "")) return "";
+  const token = `tm1.${tenantId}.${crypto.randomBytes(32).toString("base64url")}`;
+  meetingTokens[tenantId] = { hash: sha256Hex(token), at: Date.now() };
+  persistMeetingTokens();
+  return token;
 }
 function tenantIsLive(tenantId) {
   if (!TENANT_ID_RE.test(tenantId || "")) return false;
@@ -19037,7 +19083,8 @@ function meetingsTenant(req) {
   const bearer = header.slice(7);
   if (safeEqual(bearer, TURMA_MEETINGS_TOKEN)) return "";
   const m = /^tm1\.([0-9a-f]{32})\.[A-Za-z0-9_-]{43}$/.exec(bearer);
-  if (!m || !safeEqual(bearer, meetingsTenantToken(m[1]))) return null;
+  const stored = m && Object.hasOwn(meetingTokens, m[1]) ? meetingTokens[m[1]] : null;
+  if (!stored || !safeEqual(sha256Hex(bearer), stored.hash)) return null;
   return tenantIsLive(m[1]) ? m[1] : null;
 }
 function meetingsAuthorized(req) {
@@ -21280,16 +21327,22 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // GET /api/meetings-token — the caller's own tenant's Tenir bearer
-    // (XERK-2551, meetingsTenant). 404 for a principal with no tenant (they use
-    // the fleet TURMA_MEETINGS_TOKEN), 503 when meetings are not configured.
-    if (req.method === "GET" && url.pathname === "/api/meetings-token") {
+    // GET|POST /api/meetings-token — the caller's own tenant's Tenir bearer
+    // (XERK-2551, meetingsTenant). GET says whether one exists ({exists, at});
+    // POST mints a new one, revoking the last, and answers it ONCE ({token}) —
+    // only its hash is kept. 404 for a principal with no tenant (they use the
+    // fleet TURMA_MEETINGS_TOKEN), 503 when meetings are not configured.
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/meetings-token") {
       const t = principalTenant(requestPrincipal(req));
       if (!t) return json(res, 404, { error: "only a tenant user has a meetings token" });
       if (!TURMA_MEETINGS_TOKEN) {
         return json(res, 503, { error: "meetings ingest is not configured on this hub (TURMA_MEETINGS_TOKEN)" });
       }
-      return json(res, 200, { token: meetingsTenantToken(t) });
+      if (req.method === "GET") {
+        const e = Object.hasOwn(meetingTokens, t) ? meetingTokens[t] : null;
+        return json(res, 200, e ? { exists: true, at: e.at } : { exists: false });
+      }
+      return json(res, 200, { token: mintMeetingsTenantToken(t) });
     }
 
     // Login form (public). Already-authenticated visitors skip straight in.
@@ -25040,7 +25093,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "jira" &&
         parts.length === 5 && parts[3] === "epic-builder") {
       const id = decodeURIComponent(parts[4]);
-      const existed = clearEpicBuilder(id);
+      // Only a builder OF THIS ORG (XERK-2551): the org guard proved the caller
+      // may act on `<siteKey>`, not on a builder id it read off the feed.
+      const siteKey = decodeURIComponent(parts[2]);
+      const run = Object.hasOwn(epicBuilders, id) ? epicBuilders[id] : null;
+      const existed = !!run && run.siteKey === siteKey && clearEpicBuilder(id);
       return json(res, existed ? 200 : 404,
         existed ? { ok: true, cleared: true } : { error: "no builder run by that id" });
     }
@@ -26288,7 +26345,7 @@ if (process.env.TURMA_TEST) {
     tenantOfKey,
     // XERK-2551: org keys belong to tenants.
     tenantOfSite, baseOfSite, scopeSite, scopeSiteKeys, unscopeSiteKeys, principalMaySite,
-    devicesForHost, meetingsTenantToken, meetingsTenant, notify,
+    devicesForHost, mintMeetingsTenantToken, meetingsTenant, notify, rescopeRestoredOrgs,
     baseOfKey,
     agentKeyFor,
     principalMayDriveHost,
