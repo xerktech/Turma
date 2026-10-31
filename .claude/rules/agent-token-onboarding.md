@@ -74,6 +74,15 @@ Split out of `CLAUDE.md`, which keeps the per-host credential contract (XERK-268
     an `origin` that differs from its last home (renamed, then removed), so `identityByOrigin` would
     hand the old machine's live id to the new one; redemption strips that origin first, and refuses
     if `issueAgentUid` still returns a used id.
+  - **Redemption revokes the name's old NAME token FIRST** (`redeemEnrollCode`, XERK-2572): a
+    check-only pass, then `bumpNameTokenGen`, then the real redemption. Remove host un-retires the
+    token, so its holder could beat before the new host and have its record adopted. Redeeming only
+    after the bump lands means a beat inside the store round trip takes the name and the code is
+    refused (409, not burned). A redemption refused at the check pass never bumps (else any code
+    holder could revoke a live host's token); a code revoked or expired DURING the bump still bumps
+    that released name (accepted). A failed bump still redeems, logged. A TENANTED code never bumps:
+    only plain names have name tokens, so it would revoke the untenanted host of that name.
+    Tests: `XERK-2572:` cases (the slow-store case pins the await).
   - `owner` records the minting principal (`requestPrincipal`: `user:<id>` + `tenantId`, else its
     kind, e.g. `breakglass`). **The host joins the owner's tenant** (XERK-2533): its key is
     `<device>@<tenantId>` and its identity carries the tenant; names are checked as that tenant's key.

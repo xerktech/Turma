@@ -77,6 +77,10 @@ process.env.NAME_TOKEN_GENS_FILE = path.join(
   scratchDir(),
   `turma-test-name-token-gens-${process.pid}.json`
 );
+process.env.ENROLL_CODES_FILE = path.join(
+  scratchDir(),
+  `turma-test-enroll-codes-${process.pid}.json`
+);
 process.env.AUTOSTART_ORGS_FILE = path.join(
   scratchDir(),
   `turma-test-autostart-orgs-${process.pid}.json`
@@ -20329,8 +20333,8 @@ test("XERK-2531: a code never takes a name another host holds or an unusable one
   forget2531("enr-held");
 });
 
-test("XERK-2531: a fresh code for a name supersedes an identity that never beat", () => {
-  forget2531("enr-s");
+test("XERK-2531: a fresh code for a name supersedes an identity that never beat", async () => {
+  forget2531("enr-s"); forget2381("enr-s");
   const t0 = Date.now();
   const first = hub.consumeEnrollCode(hub.mintEnrollCode("local:op", "").body.code, "enr-s", t0);
   assert.equal(first.status, 200);
@@ -20340,12 +20344,16 @@ test("XERK-2531: a fresh code for a name supersedes an identity that never beat"
   const early = hub.consumeEnrollCode(code2, "enr-s", t0 + 1000);
   assert.equal(early.status, 409, JSON.stringify(early.body));
   assert.match(early.body.error, /redeemed moments ago.*retry in \d+s/);
+  // XERK-2572: the route's redemption is refused at the check pass too, so it bumps nothing.
+  const viaRoute = await hub.redeemEnrollCode(code2, "enr-s", t0 + 1000);
+  assert.equal(viaRoute.status, 409, JSON.stringify(viaRoute.body));
+  assert.equal(hub.nameTokenGen("enr-s"), 0);
   assert.equal(hostOfUid(tokenUid(first.body.token)), "enr-s"); // still the first holder's
   const second = hub.consumeEnrollCode(code2, "enr-s", t0 + hub.ENROLL_SUPERSEDE_GRACE_MS + 1);
   assert.equal(second.status, 200, JSON.stringify(second.body));
   assert.notEqual(tokenUid(first.body.token), tokenUid(second.body.token));
   assert.equal(hostOfUid(tokenUid(first.body.token)), null); // never two machines on one id
-  forget2531("enr-s");
+  forget2531("enr-s"); forget2381("enr-s");
 });
 
 test("XERK-2574: the grace window is case-folded, and Remove host lifts it", async () => {
@@ -20390,6 +20398,75 @@ test("XERK-2531: a renamed-then-removed host's old name gets a FRESH identity, n
   assert.notEqual(tokenUid(r.body.token), tokenUid(old));
   assert.equal((await beat(r.body.token, "enr-ra")).status, 200); // the reinstall beats under its name
   forget2531("enr-ra", "enr-rb");
+});
+
+test("XERK-2572: redeeming a code for a released name revokes that name's old name token", async () => {
+  forget2531("enr-nt"); forget2381("enr-nt");
+  const beat = (tok) => request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: { device: "enr-nt", sessions: [] } });
+  const oldName = hostAgentToken("enr-nt"); // gen 0, what the old machine held
+  const oldUid = enrollUid("enr-nt");
+  assert.equal((await beat(oldUid)).status, 200);
+  assert.equal((await request("DELETE", "/api/agents/enr-nt", { headers: userHeaders })).status, 200);
+  const code = hub.mintEnrollCode("local:op", "enr-nt").body.code;
+  const r = await request("POST", "/api/agent/enroll", { body: { code, device: "enr-nt" } });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(hub.nameTokenGen("enr-nt"), 1);
+  // Before the new host's first beat, the old name token can no longer claim the name.
+  assert.equal((await beat(oldName)).status, 401);
+  assert.ok(!Object.prototype.hasOwnProperty.call(agents, "enr-nt"));
+  assert.equal((await beat(r.body.token)).status, 200); // the new identity still beats
+  forget2531("enr-nt"); forget2381("enr-nt");
+});
+
+test("XERK-2572: an old name-token beat inside the bump's store round trip takes the name; the code is refused, not burned", async () => {
+  forget2531("enr-slow"); forget2381("enr-slow");
+  const beat = (tok) => request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: { device: "enr-slow", sessions: [] } });
+  const oldName = hostAgentToken("enr-slow");
+  assert.equal((await beat(enrollUid("enr-slow"))).status, 200);
+  assert.equal((await request("DELETE", "/api/agents/enr-slow", { headers: userHeaders })).status, 200);
+  const code = hub.mintEnrollCode("local:op", "enr-slow").body.code;
+  // A store whose read takes a network round trip (HA), so the bump is not instant.
+  const slow = new FileLiveStore();
+  const get = slow.get.bind(slow);
+  slow.get = async (k) => { await new Promise((res) => setTimeout(res, 300)); return get(k); };
+  hub.__setLiveStore(slow, true);
+  let r, b;
+  try {
+    const redeeming = request("POST", "/api/agent/enroll", { body: { code, device: "enr-slow" } });
+    await new Promise((res) => setTimeout(res, 100));
+    b = await beat(oldName); // still gen 0: the bump has not landed
+    r = await redeeming;
+  } finally {
+    hub.__setLiveStore(hub.liveStore, false);
+    slow.close();
+  }
+  assert.equal(b.status, 200);
+  assert.equal(r.status, 409, JSON.stringify(r.body)); // never adopts the record the old token made
+  assert.equal(hub.nameTokenGen("enr-slow"), 1);
+  assert.equal((await beat(oldName)).status, 401);
+  const listed = await request("GET", "/api/enroll-codes", { headers: userHeaders });
+  assert.ok(listed.body.codes.some((c) => c.device === "enr-slow" && c.state === "live"), "the code is not burned");
+  forget2531("enr-slow"); forget2381("enr-slow");
+});
+
+test("XERK-2572: a refused redemption leaves the name token's generation alone", async () => {
+  forget2531("enr-live", "enr-other"); forget2381("enr-live", "enr-other");
+  const live = hostAgentToken("enr-live");
+  const beat = (tok) => request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: { device: "enr-live", sessions: [] } });
+  assert.equal((await beat(live)).status, 200);
+  const enroll = (code, device) => request("POST", "/api/agent/enroll", { body: { code, device } });
+  // Unbound code against a live name (409), a device-bound code for another name (403),
+  // a malformed and an unknown code: none may revoke the live host's token.
+  assert.equal((await enroll(hub.mintEnrollCode("local:op", "").body.code, "enr-live")).status, 409);
+  assert.equal((await enroll(hub.mintEnrollCode("local:op", "enr-other").body.code, "enr-live")).status, 403);
+  assert.equal((await enroll("nope", "enr-live")).status, 400);
+  assert.equal((await enroll("te-" + "2".repeat(32), "enr-live")).status, 401);
+  assert.equal(hub.nameTokenGen("enr-live"), 0);
+  assert.equal((await beat(live)).status, 200);
+  forget2531("enr-live", "enr-other"); forget2381("enr-live", "enr-other");
 });
 
 test("XERK-2531: unknown codes are rate-limited, and a flood never blocks a real code", async () => {
@@ -20547,6 +20624,21 @@ test("XERK-2533: a code enrolls the host INTO its owner's tenant; two tenants ca
     const bad = await request("POST", "/api/agent/enroll", { body: { code: m2.body.code, device: kb } });
     assert.equal(bad.status, 400);
   } finally { forget2533("t2533lap", ka, kb); T.restore(); }
+});
+
+test("XERK-2572: a tenanted redemption never revokes the untenanted host of that name", async () => {
+  const T = tenants2533();
+  const ka = `t2572ten@${T.A.t}`;
+  try {
+    forget2533("t2572ten", ka); forget2381("t2572ten");
+    const plain = hostAgentToken("t2572ten");
+    assert.equal((await beat2533(plain, "t2572ten")).status, 200);
+    const ta = await enroll2533(T.A, "t2572ten");
+    assert.equal(hostOfUid(tokenUid(ta)), ka);
+    // Only the plain name has a name token; bumping it would kill this live host.
+    assert.equal(hub.nameTokenGen("t2572ten"), 0);
+    assert.equal((await beat2533(plain, "t2572ten")).status, 200);
+  } finally { forget2533("t2572ten", ka); forget2381("t2572ten"); T.restore(); }
 });
 
 test("XERK-2533: a tenant's token can never beat, tunnel or fetch as another tenant's host", async () => {
