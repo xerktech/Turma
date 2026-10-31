@@ -5947,6 +5947,8 @@ class ManagerMixin:
             ("SESSION_REQUESTS_DIR", os.path.join(self.tmp, "session-requests")),
             # XERK-1847: derived from REGISTRY_DIR at import.
             ("SHADOW_RUNS_PATH", os.path.join(self.tmp, "shadow-runs.json")),
+            # XERK-2546: derived from REGISTRY_DIR at import.
+            ("EPIC_BUILDERS_PATH", os.path.join(self.tmp, "epic-builders.json")),
             # XERK-1587: every launch/teardown unlinks the session's snapshot.
             ("LIVE_AGENTS_DIR", os.path.join(self.tmp, "live-agents")),
             # XERK-2131: every launch/teardown unlinks the session's turn state.
@@ -44969,6 +44971,147 @@ class TestEpicBuilderRun(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.epic_builders["b1"]["project"], "XERK")
         self.assertEqual(sm.epic_builder_status(),
                          [{"id": "b1", "state": "done", "epicKey": "XERK-500"}])
+
+    def _researching(self, sm, wt, sid="sid1"):
+        with self._jira(), mock.patch.object(ha, "scan_repos", lambda: [{"name": "Turma", "path": "/x"}]), \
+             self._spawn_returns(sm, sid, wt):
+            sm.spawn_epic_builder({"builderId": "b1", "siteKey": "s.atlassian.net",
+                                   "title": "T", "idea": "i", "repo": "Turma"})
+
+    def test_restart_keeps_watching_a_researching_builder(self):
+        # XERK-2546: an agent restart (self-update) mid-research must not orphan
+        # the run — the restarted manager resumes watching the surviving
+        # session's plan file and materializes it.
+        sm = self.make_manager()
+        wt = os.path.join(ha.WORKTREES_ROOT, "abcde")
+        os.makedirs(wt, exist_ok=True)
+        self._researching(sm, wt)
+        sm2 = self.make_manager()
+        b = sm2.epic_builders["b1"]
+        self.assertEqual((b["state"], b["sessionId"], b["worktreePath"]),
+                         ("researching", "sid1", wt))
+        with open(os.path.join(wt, ha.EPIC_BUILDER_PLAN_FILENAME), "w") as f:
+            f.write(json.dumps(self._plan()))
+        sm2.registry.append({"id": "sid1", "worktreePath": wt, "status": "running"})
+        sm2.jira = {"tickets": [{"key": "XERK-1"}]}
+        with mock.patch.object(sm2, "_start_epic_builder_materialize",
+                               lambda bid: sm2._materialize_epic_builder(
+                                   bid, sm2.epic_builders[bid]["plan"],
+                                   sm2.epic_builders[bid]["project"])), \
+             mock.patch.object(sm2, "_kill_epic_builder_session", lambda *a: None), \
+             mock.patch.object(ha, "materialize_epic_plan",
+                               lambda plan, project: {"epicKey": "XERK-9"}):
+            sm2._advance_epic_builders()
+        self.assertEqual(sm2.epic_builder_status(),
+                         [{"id": "b1", "state": "done", "epicKey": "XERK-9"}])
+        # The terminal state is what a third restart reports.
+        self.assertEqual(self.make_manager().epic_builders["b1"]["epicKey"], "XERK-9")
+
+    def test_restart_mid_create_fails_rather_than_replaying(self):
+        # A replayed materialization could create a second epic; report instead.
+        sm = self.make_manager()
+        wt = os.path.join(ha.WORKTREES_ROOT, "abcdf")
+        os.makedirs(wt, exist_ok=True)
+        self._researching(sm, wt)
+        sm._set_epic_builder("b1", state="creating", materializing=True,
+                             plan=self._plan(), project="XERK")
+        with open(ha.EPIC_BUILDERS_PATH) as f:
+            self.assertNotIn("plan", json.load(f)["b1"])
+        b = self.make_manager().epic_builders["b1"]
+        self.assertEqual(b["state"], "failed")
+        self.assertFalse(b["materializing"])
+        self.assertEqual(b["error"], ha.EPIC_BUILDER_RESTART_LOST)
+
+    def test_restart_keeps_the_timeout_and_the_fixed_plan_file(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "abcdg")
+        old = time.time() - ha.EPIC_BUILDER_TIMEOUT_SEC - 60
+        with open(ha.EPIC_BUILDERS_PATH, "w") as f:
+            json.dump({"b1": {"id": "b1", "state": "researching", "sessionId": "s",
+                              "worktreePath": wt, "planFile": "../../etc/passwd",
+                              "startedAt": old}}, f)
+        sm = self.make_manager()
+        self.assertEqual(sm.epic_builders["b1"]["planFile"], ha.EPIC_BUILDER_PLAN_FILENAME)
+        self.assertEqual(sm.epic_builders["b1"]["startedAt"], old)
+        with mock.patch.object(sm, "_kill_epic_builder_session", lambda *a: None):
+            sm._advance_epic_builders()
+        self.assertIn("timed out", sm.epic_builders["b1"]["error"])
+
+    def test_status_reports_live_builders_within_the_hub_cap(self):
+        # The hub reads only EPIC_BUILDER_STATUS_MAX entries; a backlog of
+        # finished records must not hide a new builder.
+        # The live and just-failed records are OLDER than the whole finished
+        # backlog, so only the live-first ordering (not recency) keeps them.
+        now = time.time()
+        recs = {f"d{i}": {"id": f"d{i}", "state": "done", "epicKey": f"X-{i}",
+                          "updatedAt": now - 100 + i}
+                for i in range(ha.EPIC_BUILDERS_MAX + 6)}
+        wt = os.path.join(ha.WORKTREES_ROOT, "abcdh")
+        recs["live"] = {"id": "live", "state": "researching", "sessionId": "s",
+                        "worktreePath": wt, "updatedAt": now - 1000}
+        recs["mid"] = {"id": "mid", "state": "creating", "sessionId": "s2",
+                       "worktreePath": wt, "updatedAt": now - 1000}
+        with open(ha.EPIC_BUILDERS_PATH, "w") as f:
+            json.dump(recs, f)
+        sm = self.make_manager()
+        self.assertEqual(len(sm.epic_builders), ha.EPIC_BUILDERS_MAX)
+        self.assertIn("live", sm.epic_builders)
+        st = sm.epic_builder_status()
+        self.assertEqual(len(st), ha.EPIC_BUILDER_STATUS_MAX)
+        self.assertEqual(st[0], {"id": "live", "state": "researching"})
+        # A run that died mid-create is reported failed, never crowded out.
+        self.assertIn({"id": "mid", "state": "failed",
+                       "error": ha.EPIC_BUILDER_RESTART_LOST}, st)
+
+    def test_a_stale_snapshot_is_never_saved_last(self):
+        # The worker and the beat both save. A save that snapshotted before a
+        # newer save ran must not overwrite it, or a restart loads stale state.
+        sm = self.make_manager()
+        wt = os.path.join(ha.WORKTREES_ROOT, "abcdj")
+        os.makedirs(wt, exist_ok=True)
+        self._researching(sm, wt)
+        sm.epic_builders["b1"]["state"] = "creating"
+        real = sm._epic_builders_save_lock
+
+        class Racing:
+            # The first acquirer is delayed while a newer save runs to completion.
+            pending = True
+
+            def __enter__(self):
+                if Racing.pending:
+                    Racing.pending = False
+                    sm.epic_builders["b1"]["state"] = "done"
+                    sm._save_epic_builders()
+                return real.__enter__()
+
+            def __exit__(self, *a):
+                return real.__exit__(*a)
+
+        sm._epic_builders_save_lock = Racing()
+        sm._save_epic_builders()
+        self.assertEqual(self.make_manager().epic_builders["b1"]["state"], "done")
+
+    def test_redispatch_of_a_held_builder_spawns_nothing(self):
+        sm = self.make_manager()
+        wt = os.path.join(ha.WORKTREES_ROOT, "abcdi")
+        os.makedirs(wt, exist_ok=True)
+        self._researching(sm, wt)
+        self._researching(self.make_manager(), wt, sid="sid2")
+        self.assertEqual(self.make_manager().epic_builders["b1"]["sessionId"], "sid1")
+
+    def test_restart_drops_a_record_pointing_outside_the_worktrees(self):
+        # ~/.turma is session-writable: a forged record must not aim the beat's
+        # plan-file read at an arbitrary path.
+        with open(ha.EPIC_BUILDERS_PATH, "w") as f:
+            json.dump({
+                "b1": {"id": "b1", "state": "researching", "sessionId": "s",
+                       "worktreePath": "/etc"},
+                "b2": {"id": "b2", "state": "bogus"},
+                "b3": {"id": "other", "state": "failed"},
+                "b4": {"id": "b4", "state": "failed", "error": "x", "startedAt": "y"},
+            }, f)
+        got = self.make_manager().epic_builders
+        self.assertEqual(sorted(got), ["b4"])
+        self.assertIsInstance(got["b4"]["startedAt"], float)
 
     def test_advance_fails_an_invalid_plan(self):
         sm = self.make_manager()

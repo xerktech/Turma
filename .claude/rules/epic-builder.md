@@ -156,6 +156,18 @@ already understand, so nothing downstream changes:
 
 ## The beat sweep (C) — `_advance_epic_builders` / `_advance_researching_builder`
 
+- **Builder records persist to `~/.turma/epic-builders.json`** (XERK-2546). An agent restart
+  mid-research (a self-update) otherwise orphans the run: the session is adopted, but nothing reads
+  its plan, and the hub's run stays `researching` forever.
+  - The load re-validates every record (session-writable file). A `researching` record must point
+    under `WORKTREES_ROOT`, so a forged record can't aim the plan read at an arbitrary path.
+  - **A `creating` record restores as `failed`, NEVER re-materialized.** The worker died mid-create,
+    and a replay could produce a second, duplicate epic. `plan` isn't saved; it's re-read from the file.
+  - **`epic_builder_status` reports live builders first, capped at `EPIC_BUILDER_STATUS_MAX` (50).**
+    The hub keeps only the first 50 entries, fewer than `EPIC_BUILDERS_MAX`, so with persisted records
+    a backlog of finished ones would otherwise hide every new builder forever.
+  - `spawn_epic_builder` ignores a `builderId` it already holds: the hub re-dispatches a run it hasn't
+    seen advance, and a restored builder must not get a second session.
 - **The plan file is SESSION-written, so untrusted from the beat**: read via `_read_untrusted_json`
   (`O_NONBLOCK|O_NOFOLLOW` + regular-file + bounded by `EPIC_BUILDER_PLAN_MAX_BYTES`). A plain
   `open()` would let a session swap the file for a FIFO between beats and WEDGE the heartbeat with no
