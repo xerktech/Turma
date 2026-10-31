@@ -132,3 +132,68 @@ test("XERK-2530: a user disabled while its password is being checked is not sign
   }
   assert.equal((await login("rootadmin", "root-admin-pass")).status, 200);
 });
+
+// ---- XERK-2568: fair local sign-in under an anonymous flood ------------------
+
+const loginAs = (client, username, password) =>
+  request("POST", "/api/login", { headers: { "cf-connecting-ip": client }, body: { username, password } });
+
+test("XERK-2568: the sign-in client is CF-Connecting-IP, else the last X-Forwarded-For hop, else the socket", () => {
+  const key = (headers, remoteAddress = "10.0.0.9") => hub.loginClientKey({ headers, socket: { remoteAddress } });
+  assert.equal(key({ "cf-connecting-ip": " 203.0.113.7 ", "x-forwarded-for": "1.1.1.1, 2.2.2.2" }), "203.0.113.7");
+  assert.equal(key({ "x-forwarded-for": "6.6.6.6, 198.51.100.4" }), "198.51.100.4", "a client-sent first hop is ignored");
+  assert.equal(key({}), "10.0.0.9");
+  assert.equal(key({ "cf-connecting-ip": "x".repeat(500) }).length, 64, "bounded");
+});
+
+test("XERK-2568: a flood from one client neither locks out another nor exceeds the scrypt cap", async () => {
+  const real = tenancy.verifyPassword;
+  let inflight = 0;
+  let peak = 0;
+  tenancy.verifyPassword = async (pw, hash) => {
+    peak = Math.max(peak, ++inflight);
+    try { return await real(pw, hash); } finally { inflight--; }
+  };
+  let flooding = true;
+  const attackerCodes = [];
+  // Four concurrent loops of wrong passwords, a fresh username each time so the
+  // per-username backoff never quiets the attacker: only the queue protects the victim.
+  const attacker = Array.from({ length: 4 }, async () => {
+    while (flooding) attackerCodes.push((await loginAs("198.51.100.66", `ghost-${crypto.randomUUID()}`, "nope")).status);
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 150)); // let the flood saturate
+    for (let i = 0; i < 5; i++) {
+      const victim = await loginAs("203.0.113.10", "rootadmin", "root-admin-pass");
+      assert.equal(victim.status, 200, `victim attempt ${i}`);
+    }
+  } finally {
+    flooding = false;
+    await Promise.all(attacker);
+    tenancy.verifyPassword = real;
+  }
+  assert.ok(peak <= 2, `peak concurrent scrypt ${peak}`);
+  assert.ok(attackerCodes.includes(503), "the attacker's extra in-flight requests are refused");
+});
+
+test("XERK-2568: repeated failures back off per client and username, answered before scrypt", async () => {
+  for (let i = 0; i < 5; i++) assert.equal((await loginAs("192.0.2.50", "rootadmin", "wrong")).status, 401);
+  const real = tenancy.verifyPassword;
+  let calls = 0;
+  tenancy.verifyPassword = async (...a) => { calls++; return real(...a); };
+  try {
+    const held = await loginAs("192.0.2.50", "rootadmin", "root-admin-pass");
+    assert.equal(held.status, 429);
+    assert.ok(Number(held.headers["retry-after"]) >= 1, held.headers["retry-after"]);
+    assert.equal(calls, 0, "a backed-off attempt costs no scrypt");
+    // The same username from another client is not locked out.
+    assert.equal((await loginAs("192.0.2.51", "rootadmin", "root-admin-pass")).status, 200);
+  } finally {
+    tenancy.verifyPassword = real;
+  }
+});
+
+test("XERK-2568: a client's second concurrent sign-in is refused, not queued", async () => {
+  const both = await Promise.all([1, 2].map(() => loginAs("192.0.2.77", "rootadmin", "root-admin-pass")));
+  assert.deepEqual(both.map((r) => r.status).sort(), [200, 503]);
+});
