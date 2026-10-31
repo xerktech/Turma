@@ -1030,6 +1030,13 @@ those are marked `[MODEL]`.
     re-authenticate. A break-glass password login keeps the 30-day session.
   - Tests: `core/OidcTest` (PKCE golden vector, deep-link parse), `net/OidcControllerTest` (probe /
     exchange / cookie auth / forbidden / 401-drop over MockWebServer).
+- **Password sign-in goes through `POST /api/login`, as `login.html` does** (XERK-2569). The hub
+  checks Basic against its break-glass credential only — never a local account's password — so
+  `HubClient.signIn` posts the username/password and carries the returned `hub_session` cookie,
+  exactly like an SSO token. Basic is the fallback only when `/api/login` yields no session.
+  - On a 401 with a password stored, `HubClient` signs in again and retries once (this also moves a
+    pre-XERK-2569 install onto a session); a password `/api/login` now refuses signs the app out.
+  - Tests: `net/PasswordLoginTest`, the `sessionTokenFrom` cases in `core/LoginTest`.
 
 - **Chat render performance + two render refinements are WEB-ONLY (XERK-860 / Track B PR 2).** The
   web chat rebuilt its entire transcript's HTML twice a second (`repaint()` on both the `tail` and

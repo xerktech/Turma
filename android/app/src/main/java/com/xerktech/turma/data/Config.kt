@@ -22,12 +22,15 @@ class Config private constructor(private val prefs: SharedPreferences) {
         val hubUrl: String = DEFAULT_HUB_URL,
         val user: String = "",
         val password: String = "",
-        // The opaque hub_session token obtained via the native Authentik SSO
-        // flow (XERK-591). When present, requests authenticate with it as a
-        // Cookie instead of Basic auth — the SAME token the web cookie carries.
+        // The opaque hub_session token — the SAME one the web cookie carries —
+        // from either the native Authentik SSO flow (XERK-591) or a password
+        // sign-in through POST /api/login (XERK-2569). When present, requests
+        // authenticate with it as a Cookie; Basic auth is only the fallback for
+        // a hub that issued none (the hub checks Basic against its break-glass
+        // credential alone, never a local account).
         val sessionToken: String = "",
     ) {
-        // Signed in either way: a break-glass password OR an SSO session token.
+        // Signed in either way: a stored password OR a session token.
         val configured: Boolean get() = hubUrl.isNotBlank() && (password.isNotBlank() || sessionToken.isNotBlank())
 
         /**
@@ -58,14 +61,20 @@ class Config private constructor(private val prefs: SharedPreferences) {
         sessionToken = prefs.getString(KEY_SESSION, "") ?: "",
     )
 
-    fun save(hubUrl: String, user: String, password: String) {
-        // A break-glass password login supersedes any prior SSO session token.
-        prefs.edit()
+    /**
+     * Store a password sign-in. [sessionToken] is the `hub_session` that
+     * POST /api/login returned (XERK-2569), or empty when the hub issued none and
+     * the app falls back to Basic. Either way it supersedes any prior SSO token.
+     * The password is kept so [com.xerktech.turma.net.HubClient] can sign in
+     * again when the session lapses.
+     */
+    fun save(hubUrl: String, user: String, password: String, sessionToken: String = "") {
+        val edit = prefs.edit()
             .putString(KEY_URL, hubUrl.trim())
             .putString(KEY_USER, user.trim())
             .putString(KEY_PASS, password)
-            .remove(KEY_SESSION)
-            .apply()
+        if (sessionToken.isNotEmpty()) edit.putString(KEY_SESSION, sessionToken) else edit.remove(KEY_SESSION)
+        edit.apply()
         _state.value = read()
     }
 
@@ -96,11 +105,11 @@ class Config private constructor(private val prefs: SharedPreferences) {
     }
 
     /**
-     * Drop ONLY the SSO session token — used when the hub 401s an SSO session
-     * (the shorter OIDC TTL lapsed, or the user was removed from an access
-     * group). Leaves a break-glass password intact, so a hub that has both stays
-     * signed in. `configured` flips false when no password remains, sending the
-     * app back to the login screen to re-authenticate.
+     * Drop ONLY the session token — used when the hub 401s a session (the
+     * shorter OIDC TTL lapsed, or the user was removed from an access group) and
+     * no fresh one could be had. Leaves a stored password intact, so the app
+     * falls back to Basic. `configured` flips false when no password remains,
+     * sending the app back to the login screen to re-authenticate.
      */
     fun clearSession() {
         if (prefs.getString(KEY_SESSION, "").isNullOrEmpty()) return

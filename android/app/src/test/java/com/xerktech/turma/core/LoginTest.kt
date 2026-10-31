@@ -46,4 +46,31 @@ class LoginTest {
     @Test fun httpErrorNamesTheStatus() {
         assertEquals("Sign-in failed (HTTP 502). Please try again.", signInError(SignInResult.HttpError(502)))
     }
+
+    // The password was accepted, so the wording must not call it wrong.
+    @Test fun sessionRefusedDoesNotBlameThePassword() {
+        val msg = signInError(SignInResult.SessionRefused(403))!!
+        assertEquals("Password accepted, but the hub refused the session (HTTP 403). Please try again.", msg)
+    }
+
+    // ---- sessionTokenFrom (XERK-2569) ------------------------------------------
+
+    @Test fun readsTheHubSessionOutOfSetCookie() {
+        assertEquals(
+            "tok-1",
+            sessionTokenFrom(listOf("hub_session=tok-1; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=2592000")),
+        )
+    }
+
+    @Test fun skipsOtherCookies() {
+        assertEquals("tok-2", sessionTokenFrom(listOf("other=x; Path=/", "hub_session=tok-2; Path=/")))
+        assertNull(sessionTokenFrom(listOf("not_hub_session=x; Path=/")))
+    }
+
+    // A logout's cleared cookie (empty value) is not a session.
+    @Test fun emptyOrMissingIsNull() {
+        assertNull(sessionTokenFrom(listOf("hub_session=; Path=/; Max-Age=0")))
+        assertNull(sessionTokenFrom(emptyList()))
+        assertNull(sessionTokenFrom(listOf("garbage")))
+    }
 }
