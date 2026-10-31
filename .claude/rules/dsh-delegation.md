@@ -71,6 +71,14 @@ UNCHANGED. Three streams feed it; the split is the whole design.
   - **`_emitted_launches` is bounded by DROP-ON-END**, not an arbitrary cap: an id is removed on its
     `subagent-end`; `EMITTED_LAUNCHES_MAX` is a pure backstop for a lost end.
   A child filed flat before its `agent-start` arrives is MOVED under the run dir on the next pump.
+  - **The child is repointed only once that move LANDS** (XERK-2578); a refused move keeps
+    appending to the flat file and retries each pump, logging once.
+- **Child logs and run records sync EVERY pump, not only when the parent log grew** — a foreground
+  workflow keeps the parent silent while its children stream.
+- **A resumed tail starts each child log already on disk at its EOF**, like the parent — else the
+  first pump re-projects every child and doubles its transcript.
+  - Its run mapping is behind that EOF, so a primed child keeps the run-dir file the earlier tail
+    moved it to (never through a link); a move's destination is always a run dir, never flat.
 
 - **Where the extra streams live.** Driver writes each descendant's native log to
   `<store>/subagents/<childId>.jsonl` (sibling of the parent's `events.jsonl` under `<tid>/dsh/`,

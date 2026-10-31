@@ -1198,6 +1198,13 @@ function hostAgentToken(host) {
   // matches, and the tunnel reconnect-loops forever without ever mentioning the
   // name. Refusing at mint time is where the operator can still act on it.
   if (!isPlainHostKey(host)) return "";
+  // A TENANT host's registry key (`<device>@<tenantId>`, XERK-2533) never gets a
+  // name token, and neither does an untenanted name SHAPED like one: a tenant host
+  // runs only on its identity token, whose tenant the hub recorded at enrollment.
+  // A name token for `laptop@<T>` would let `--agent-token` (or a master holder)
+  // mint a credential for tenant T's host, and an untenanted host so named would
+  // collide with it.
+  if (TENANT_KEY_RE.test(host)) return "";
   return name.toString("base64url") + "." +
     crypto.createHmac("sha256", nameTokenKey(host)).update(host).digest("hex");
 }
@@ -1219,6 +1226,84 @@ function nameTokenKey(host) {
   // NAMED that label, handing its holder every revoked host's next token).
   return crypto.createHmac("sha256", TURMA_AGENT_TOKEN)
     .update(Buffer.concat([Buffer.from([0xff]), Buffer.from(`name-token-gen:${gen}`)])).digest();
+}
+
+// ---- Host ⇄ tenant binding (XERK-2533) ------------------------------------
+// Every host belongs to at most one tenant, and the hub — never the agent —
+// decides which: an identity minted from an enrollment code carries the code
+// owner's tenant, a roll by a tenant user binds an untenanted host to that user's
+// tenant, and the binding lives on the identity (`agentIdentities[uid].tenantId`).
+// The agent still names itself by its plain DEVICE_NAME; the hub NAMESPACES the
+// registry key as `<device>@<tenantId>` from the tenant its credential proves, so
+// two tenants can each have a "laptop" and every surface keyed by host (registry,
+// HA store keys, tunnel directory, SSE frames, ttyd routing, usage ledger) keeps
+// them apart with no change of its own. An untenanted host (every host enrolled
+// before tenancy, and any bootstrapped by the master/name token) keeps its plain
+// key until the migration (XERK-2554) binds it.
+//   - The suffix is the full 32-hex tenant id: a shortened one could collide,
+//     and two tenants sharing a key would share a host.
+//   - No plain name may END in that shape (hostAgentToken, hostKeyUsable), so an
+//     untenanted key can never equal a tenant key.
+const TENANT_KEY_RE = /@([0-9a-f]{32})$/;
+const TENANT_ID_RE = /^[0-9a-f]{32}$/;
+// The tenant a registry key belongs to, or "" for an untenanted one.
+function tenantOfKey(key) {
+  const m = typeof key === "string" ? TENANT_KEY_RE.exec(key) : null;
+  return m ? m[1] : "";
+}
+// The device name a key carries (the key itself when untenanted).
+function baseOfKey(key) {
+  return tenantOfKey(key) ? key.slice(0, -33) : key;
+}
+function tenantHostKey(device, tenantId) {
+  return tenantId ? `${device}@${tenantId}` : device;
+}
+// Whether `key` is a registry key a host may hold: a plain usable name, or a
+// tenant key whose device part is one. (hostAgentToken alone refuses every
+// tenant key, by design.)
+function hostKeyUsable(key) {
+  if (!isPlainHostKey(key)) return false;
+  const base = baseOfKey(key);
+  return !!base && isPlainHostKey(base) && !!hostAgentToken(base);
+}
+// The tenant agent identity `uid` is bound to, or "".
+function tenantOfUid(uid) {
+  const e = identityEntry(uid);
+  return e && typeof e.tenantId === "string" ? e.tenantId : "";
+}
+// The registry key an agent-authed request acts as, given the host name it
+// TYPED (`device`, `?name=`, `<host>`). An identity token bound to tenant T
+// namespaces the name into T; any other credential takes it as typed. Idempotent
+// (a key already in T stays put — the hub hands keys back in commands and
+// channel ids), and a name already suffixed with ANOTHER tenant is left alone so
+// the credential check that follows refuses it rather than nesting it.
+function agentKeyFor(req, claimed, queryToken) {
+  if (typeof claimed !== "string" || !claimed) return claimed;
+  const header = (req && req.headers && req.headers.authorization) || "";
+  // The tunnel sockets may carry the credential as `?token=` (agentWsAuthorized).
+  const token = queryToken || (header.startsWith("Bearer ") ? header.slice(7) : "");
+  const t = token ? tenantOfUid(tokenUid(token)) : "";
+  if (!t || TENANT_KEY_RE.test(claimed)) return claimed;
+  return tenantHostKey(claimed, t);
+}
+// Whether principal `p` may see and drive the host at `key` (XERK-2533). A
+// tenant host: only a principal carrying that tenant — never an admin role, never
+// break-glass (no tenant data, turma-tenancy.md). An untenanted host is not any
+// tenant's data yet; until the migration binds it (XERK-2554) only the hub's
+// operators reach it — an admin, break-glass, a pre-tenancy cookie, or an open hub
+// — and never a plain tenant user.
+function principalMayDriveHost(p, key) {
+  if (!p) return false;
+  const t = tenantOfKey(key);
+  if (t) return p.kind === "user" && p.tenantId === t;
+  if (p.kind === "open" || p.kind === "legacy" || p.kind === "breakglass") return true;
+  return Array.isArray(p.roles) && p.roles.includes("admin");
+}
+// The tenant a principal's action binds an untenanted host to (roll-token): its
+// own, when it is a tenant user. "" = leave it untenanted.
+function principalTenant(p) {
+  return p && p.kind === "user" && typeof p.tenantId === "string" && TENANT_ID_RE.test(p.tenantId)
+    ? p.tenantId : "";
 }
 
 // The subject a bearer token NAMES (a host name, or `uid:<id>`), unverified.
@@ -1339,7 +1424,13 @@ function uidHostRefusal(uid, host, now = Date.now()) {
     return "this agent identity is not registered on this hub — re-provision the host with " +
       "its own token (node turma/server.js --agent-token <host>)";
   }
-  if (!isPlainHostKey(host) || !hostAgentToken(host)) return `${host} is not a usable host name`;
+  if (!hostKeyUsable(host)) return `${host} is not a usable host name`;
+  // The tenant is the IDENTITY's, never the name's (XERK-2533): an agent bound
+  // to tenant A may act only as a key in A, and an untenanted one only as an
+  // untenanted key — so no token of A can beat, tunnel or fetch as B's host.
+  if (tenantOfKey(host) !== tenantOfUid(uid)) {
+    return `${baseOfKey(host)} is registered to another agent — remove it from the dashboard to release the name`;
+  }
   const rec = Object.prototype.hasOwnProperty.call(agents, host) ? agents[host] : null;
   if (rec && rec.agentUid && rec.agentUid !== uid) return `${host} is registered to another agent — remove it from the dashboard to release the name`;
   // Its home: a record there with no id is this agent's own, from before its
@@ -1373,6 +1464,11 @@ function uidHostRefusal(uid, host, now = Date.now()) {
         `usage history, to reuse the name`;
     }
   }
+  // A TENANT BIND is not a rename (XERK-2533): the identity was bound to a
+  // tenant while it lived under the same plain name, and this beat is that very
+  // agent arriving under its namespaced key. Its old record is carried over, so
+  // there are never two records to share a token between.
+  if (!tenantOfKey(e.home) && tenantHostKey(e.home, tenantOfUid(uid)) === host) return null;
   const home = Object.prototype.hasOwnProperty.call(agents, e.home) ? agents[e.home] : null;
   if (home && home.agentUid === uid && !(home.updating && now < home.updating.until) &&
       now - (home.lastSeen || 0) < OFFLINE_AFTER_MS) {
@@ -1408,11 +1504,24 @@ function issueAgentUid(host) {
   if (!uid) {
     uid = newAgentUid();
     agentIdentities[uid] = { origin: host, home: host, at: Date.now() };
+    // A tenant key's identity is minted INTO that tenant (XERK-2533).
+    if (tenantOfKey(host)) agentIdentities[uid].tenantId = tenantOfKey(host);
     trimAgentIdentities(uid);
     persistAgentIdentities();
   }
   if (a && a.agentUid !== uid && hostOfUid(uid) === host) { a.agentUid = uid; publishAgent(host); }
   return uid;
+}
+// Bind untenanted identity `uid` to tenant `t` (XERK-2533: a roll by a tenant
+// user). From its next beat the agent acts as `<home>@<t>` (agentKeyFor), and
+// that beat carries its old record over (uidHostRefusal's tenant-bind case).
+// Never moves an identity that already has a tenant. Returns whether it bound.
+function bindIdentityTenant(uid, t) {
+  const e = identityOf(uid);
+  if (!e || !TENANT_ID_RE.test(t || "") || e.tenantId || tenantOfKey(e.home)) return false;
+  e.tenantId = t;
+  persistAgentIdentities();
+  return true;
 }
 // Bound the registry, oldest first — never an identity a live record is bound to,
 // nor a revoked tombstone (XERK-2383: trimming one would un-retire its origin
@@ -2925,6 +3034,13 @@ function coerceAgentIdentities(raw) {
     const rec = name(e.origin) ? { origin: e.origin } : {};
     rec.home = e.home;
     rec.at = Number.isSafeInteger(e.at) && e.at > 0 ? e.at : 0;
+    // The tenant this agent belongs to (XERK-2533) — hub-set at mint/bind, the
+    // ONE record of it. An entry whose home is a tenant key but whose tenant is
+    // missing or different is dropped: it would let the identity act outside it.
+    const t = typeof e.tenantId === "string" && /^[0-9a-f]{32}$/.test(e.tenantId) ? e.tenantId : "";
+    const homeT = (/@([0-9a-f]{32})$/.exec(e.home) || [])[1] || "";
+    if (homeT && homeT !== t) continue;
+    if (t) rec.tenantId = t;
     if (e.used === true) rec.used = true;
     if (e.released === true) rec.released = true;
     if (Array.isArray(e.names)) {
@@ -3885,6 +4001,11 @@ const EPIC_BUILDER_STATUS_MAX = 50;
 // cleared so the driver re-dispatches it. Comfortably longer than a builder's
 // first-report latency (a research session takes minutes to its first edge).
 const EPIC_BUILDER_REDISPATCH_MS = positiveEnv("EPIC_BUILDER_REDISPATCH_MS", 3 * 60 * 1000);
+// A host that TOOK the dispatch and then went silent may be running the builder
+// (its report just has not arrived), so the run is held for it rather than sent
+// to a second host (XERK-2545) — until this long, past the agent's own 45-minute
+// builder timeout, after which the claim is given up as lost.
+const EPIC_BUILDER_ORPHAN_MS = positiveEnv("EPIC_BUILDER_ORPHAN_MS", 60 * 60 * 1000);
 
 // Coerce ONE persisted builder record to the fixed shape the payload serves.
 // Inline literal bounds (NOT the EPIC_BUILDER_* consts below other consts' TDZ,
@@ -4762,6 +4883,48 @@ function ingestEpicBuilderStatus(hostKey, agent) {
 // and once inline right after the route arms one (so a free fleet dispatches at
 // once). A queued builder with no free host HOLDS and is retried next tick — the
 // same self-clearing backpressure the ticket queue gives, without a Jira ticket.
+// May a dispatched, still-"queued" builder run go to another host? Only when its
+// first host provably never started it (XERK-2545): a host that took the command
+// and then went quiet may have a builder session running whose report is late, and
+// re-dispatching then ran two builders for one idea (the agent's per-host dedupe of
+// builder ids cannot see across hosts).
+//   - command still queued and never delivered: yes. "Never delivered" is no
+//     `deliveredAt`, OR no beat since the dispatch (`lastSeen < dispatchedAt`):
+//     delivery rides a beat's reply, stamped in the same synchronous handler that
+//     set `lastSeen`, so a host that has not beaten since cannot have it — and a
+//     hub restart stamps every restored command delivered, which only this
+//     second test sees through (/alive only ever raises `lastSeen`, the safe way);
+//   - host gone from the registry: yes;
+//   - host took it (delivered or acked) and has beaten since the dispatch while
+//     still not reporting the builder: the agent acked without a session — yes;
+//   - otherwise (it took it and has been silent since): hold until
+//     EPIC_BUILDER_ORPHAN_MS, past the agent's own builder timeout.
+// Never before EPIC_BUILDER_REDISPATCH_MS, the first report's grace.
+function epicBuilderClaimLapsed(id, run, now) {
+  const since = now - (run.dispatchedAt || 0);
+  if (since <= EPIC_BUILDER_REDISPATCH_MS) return false;
+  const a = agents[run.host];
+  if (!a) return true;
+  const cmds = Array.isArray(a.commands) ? a.commands : [];
+  const cmd = cmds.find((c) => c && typeof c === "object"
+    && c.type === "spawnEpicBuilder" && c.builderId === id);
+  if (cmd && (!("deliveredAt" in cmd) || (a.lastSeen || 0) < (run.dispatchedAt || 0))) return true;
+  const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
+  if (!cmd && online && (a.lastSeen || 0) > (run.dispatchedAt || 0)) return true;
+  return since > EPIC_BUILDER_ORPHAN_MS;
+}
+// Drop every queued spawnEpicBuilder for `id` from `host` (the caller is giving
+// that host's claim up). Best-effort: a host already gone has nothing queued.
+function withdrawEpicBuilderCommand(host, id) {
+  const a = agents[host];
+  if (!a || !Array.isArray(a.commands)) return;
+  for (const c of a.commands.filter((x) => x && typeof x === "object"
+    && x.type === "spawnEpicBuilder" && x.builderId === id)) {
+    if (dropQueuedCommand(host, c.cmdId, "spawnEpicBuilder")) {
+      console.log(`epic builder: withdrew ${logName(id)} from ${logName(host)}`);
+    }
+  }
+}
 function epicBuilderDriveSweep() {
   const ids = Object.keys(epicBuilders);
   if (!ids.length) return;
@@ -4781,7 +4944,11 @@ function epicBuilderDriveSweep() {
     // shape, minus the growing timer: a builder is rare, so a flat re-dispatch is
     // enough and never churns).
     if (run.host) {
-      if (now - (run.dispatchedAt || 0) <= EPIC_BUILDER_REDISPATCH_MS) continue;
+      if (!epicBuilderClaimLapsed(id, run, now)) continue;
+      // Take the command back from the host being given up on, delivered or
+      // not: left queued it re-delivers when that host returns, and an agent
+      // whose restart lost its ack memory runs a second builder (XERK-2545).
+      withdrawEpicBuilderCommand(run.host, id);
       delete run.host; delete run.dispatchedAt; run.updatedAt = now;
       publishEpicBuilders();
     }
@@ -6925,14 +7092,14 @@ function sanitizeRestoredCommands(reg) {
 // does not walk commands) would 400 that host's every beat with the internal
 // error text, and serve every dashboard a stale payload from `lastGoodAgentsCache`
 // for as long as the record lived. That is XERK-235's loop, from a one-word gap.
-const INTERNAL_COMMAND_FIELDS = ["deliveredAt", "ticketSource", "ticketSite", "epicRun"];
+const INTERNAL_COMMAND_FIELDS = ["deliveredAt", "ticketSource", "ticketSite", "epicRun", "tenant", "bindTenant"];
 function publicCommands(cmds) {
   const internal = (c) => c && typeof c === "object"
     && INTERNAL_COMMAND_FIELDS.some((f) => f in c);
   if (!cmds || !cmds.some(internal)) return cmds;
   return cmds.map((c) => {
     if (!internal(c)) return c;
-    const { deliveredAt, ticketSource, ticketSite, epicRun, ...rest } = c;
+    const { deliveredAt, ticketSource, ticketSite, epicRun, tenant, bindTenant, ...rest } = c;
     return rest;
   });
 }
@@ -7364,7 +7531,7 @@ function forwardBodyRoute(req) {
   if (parts[3] === "archive" && parts[5] === "raw" && parts.length === 7) {
     let claimed;
     try { claimed = decodeURIComponent(parts[2]); } catch { claimed = parts[2]; }
-    return agentHostRefusal(req, claimed) ? "" : "archiveRaw";
+    return agentHostRefusal(req, agentKeyFor(req, claimed)) ? "" : "archiveRaw";
   }
   return "";
 }
@@ -7739,7 +7906,11 @@ function queueCommand(key, cmd) {
   const a = agents[key];
   const cmdId = crypto.randomBytes(6).toString("hex");
   a.commands = a.commands || [];
-  a.commands.push({ ...cmd, cmdId });
+  // A tenant host's command CARRIES its tenant (XERK-2533, hub-only, stripped
+  // from every served copy) and is delivered only while the host is still in it
+  // — a command queued before a tenant bind never runs inside the tenant.
+  const t = tenantOfKey(key);
+  a.commands.push(t ? { ...cmd, cmdId, tenant: t } : { ...cmd, cmdId });
   // Bound the queue so a hub-side write can never grow this record without limit
   // and lock the host out with permanent 413s (XERK-261). Two bounds, oldest
   // dropped first:
@@ -7993,9 +8164,12 @@ function hostInOrg(a, siteKey) {
 // XERK-348/349; a claimed-org compare disagreed both ways). The non-empty gate
 // is what closes the hole XERK-349 was split off to close: two hosts that both
 // declare no org used to match "whatever they are bound to".
-function sameDecidedOrg(src, tgt) {
+// `srcKey`/`tgtKey` are the two hosts' registry keys: a migration also needs
+// ONE tenant on both sides (XERK-2533) — a session never moves out of its
+// tenant, whatever org the two hosts declare.
+function sameDecidedOrg(src, tgt, srcKey, tgtKey) {
   const org = decidedOrgOf(src);
-  return !!org && org === decidedOrgOf(tgt);
+  return !!org && org === decidedOrgOf(tgt) && tenantOfKey(srcKey) === tenantOfKey(tgtKey);
 }
 
 // A session payload's `git.branch` is `rev-parse --abbrev-ref HEAD`, so a
@@ -8024,7 +8198,7 @@ function pushPeerRows(rows, host, a) {
     rows.push({
       id: peerCell(s.id),
       name: peerCell(s.rcName),
-      host: peerCell(host),
+      host: peerCell(baseOfKey(host)), // its DEVICE_NAME, as the agent knows itself (XERK-2533)
       repo: peerCell(s.repo),
       // The branch the agent named for itself; "" reads as detached agent-side.
       branch: peerCell(peerBranch(s.git)),
@@ -8050,6 +8224,8 @@ function orgPeers(key) {
   for (const [host, a] of Object.entries(agents)) {
     if (rows.length >= PEERS_MAX_ROWS) break;
     if (!a || host === key) continue;
+    // A roster never crosses a tenant (XERK-2533): same org AND same tenant.
+    if (tenantOfKey(host) !== tenantOfKey(key)) continue;
     // No org of its own means no peers of its own; a drifted host is excluded
     // from everyone else's roster as well as getting none of its own.
     if (boundOrgOf(a) !== org || orgDrifted(a)) continue;
@@ -13321,10 +13497,40 @@ function requestPrincipal(req) {
   // password is never checked per request (a scrypt per call would be a DoS).
   const header = req.headers.authorization || "";
   if (!TURMA_PASSWORD || !header.startsWith("Basic ")) return null;
+  // Routes may ask more than once per request; a miss must count once.
+  if (basicVerdicts.has(req)) return basicVerdicts.get(req);
   const decoded = Buffer.from(header.slice(6), "base64").toString();
   const sep = decoded.indexOf(":");
-  if (sep < 0) return null;
-  return credentialsMatch(decoded.slice(0, sep), decoded.slice(sep + 1)) ? BREAKGLASS_PRINCIPAL : null;
+  // Only a guess at the break-glass NAME is one: Android sends a local user's
+  // (correct) password as Basic too, and counting that would back the user off.
+  const user = sep < 0 ? "" : decoded.slice(0, sep);
+  const verdict = sep < 0 || !safeEqual(user, TURMA_USER) ? null
+    : breakGlassAttempt(loginClientKey(req), user, decoded.slice(sep + 1));
+  const principal = verdict === true ? BREAKGLASS_PRINCIPAL : null;
+  basicVerdicts.set(req, principal);
+  return principal;
+}
+const basicVerdicts = new WeakMap(); // req -> the Basic principal (or null) already decided
+
+// One break-glass guess (XERK-2577), shared by /api/login and Basic so both draw
+// on ONE per-(client, username) failure budget — XERK-2568's backoff. Before it,
+// break-glass was evaluated unthrottled (~2.6k guesses/s per client). Still
+// scrypt-free, and keyed on the client, so another client's flood can never back
+// the operator off; the cost is that an operator who mistypes it
+// LOGIN_FAIL_FREE times waits. Returns true (match), false (miss, recorded), or
+// the seconds left in a backoff — checked BEFORE the compare, so a backed-off
+// client learns nothing, not even from the right password.
+// The miss is recorded synchronously, before any await, so concurrent guesses
+// from one client cannot all slip in ahead of the backoff.
+function breakGlassAttempt(clientKey, username, password, now = Date.now()) {
+  const wait = loginBackoffMs(clientKey, username, now);
+  if (wait) return Math.ceil(wait / 1000);
+  if (credentialsMatch(username, password)) {
+    loginFailures.delete(loginFailureKey(clientKey, username));
+    return true;
+  }
+  recordLoginFailure(clientKey, username, now);
+  return false;
 }
 
 // Browser/user auth (UI + all API except the heartbeat): any signed-in principal.
@@ -13513,19 +13719,21 @@ function recordLoginFailure(clientKey, username, now) {
   while (loginFailures.size > LOGIN_FAIL_TRACK_MAX) loginFailures.delete(loginFailures.keys().next().value);
 }
 
-async function localLogin(username, password, now = Date.now(), clientKey = "local") {
-  const wait = loginBackoffMs(clientKey, username, now);
+// `counted`: this attempt's failure is already recorded and its backoff already
+// checked (a break-glass miss, breakGlassAttempt) — don't do either twice.
+async function localLogin(username, password, now = Date.now(), clientKey = "local", counted = false) {
+  const wait = counted ? 0 : loginBackoffMs(clientKey, username, now);
   if (wait) return { throttled: Math.ceil(wait / 1000) };
   if (loginClientsInflight.has(clientKey)) return { busy: true };
   loginClientsInflight.add(clientKey);
   try {
-    return await localLoginVerify(username, password, clientKey, now);
+    return await localLoginVerify(username, password, clientKey, now, counted);
   } finally {
     loginClientsInflight.delete(clientKey);
   }
 }
 
-async function localLoginVerify(username, password, clientKey, now) {
+async function localLoginVerify(username, password, clientKey, now, counted) {
   const user = tenancy.findLocalUser(tenancyState, username);
   const hash = (user && user.passwordHash) || tenancy.dummyPasswordHash();
   if (!(await acquireLoginSlot())) return { busy: true };
@@ -13539,7 +13747,7 @@ async function localLoginVerify(username, password, clientKey, now) {
   }
   // Stamped after the verify, so the clock is when the failure was learned.
   if (!ok || !user) {
-    recordLoginFailure(clientKey, username, Date.now());
+    if (!counted) recordLoginFailure(clientKey, username, Date.now());
     return {};
   }
   loginFailures.delete(loginFailureKey(clientKey, username));
@@ -14009,10 +14217,14 @@ function agentBearerKind(req, host) {
     if (bound) return host != null && bound === host && !nameTokenRefusal(host) ? "proved" : null;
     const uid = tokenUid(token);
     if (uid) return host != null && uidHostClaim(uid, host) ? "proved" : null;
-    if (safeEqual(token, TURMA_AGENT_TOKEN)) return "legacy";
+    // The master proves no tenant, so it may act only as an UNTENANTED host
+    // (XERK-2533): a tenant's host is reachable on that tenant's identity alone.
+    if (safeEqual(token, TURMA_AGENT_TOKEN)) return host != null && tenantOfKey(host) ? null : "legacy";
     return null;
   }
-  return userAuthorized(req) && authEnabled() ? "operator" : null;
+  if (!(userAuthorized(req) && authEnabled())) return null;
+  // The operator login names any host it may DRIVE — never another tenant's.
+  return host == null || principalMayDriveHost(requestPrincipal(req), host) ? "operator" : null;
 }
 
 // The gate every host-scoped agent route goes through: resolve the credential
@@ -14044,6 +14256,9 @@ function agentHostRefusal(req, host) {
     }
     if (bound && bound === host) {
       return { status: 403, error: nameTokenRefusal(host) || "unauthorized" };
+    }
+    if (tenantOfKey(host) && bearer && safeEqual(bearer, TURMA_AGENT_TOKEN)) {
+      return { status: 403, error: `${baseOfKey(host)} belongs to a tenant and authenticates only with its own agent identity token, never the fleet master` };
     }
     if (bound) {
       return {
@@ -14084,7 +14299,8 @@ function resolveEnrollToken(req, device) {
   }
   if (provedUid) {
     return { status: 200,
-      body: { host: hostOfUid(provedUid) || device || null, token: uidAgentToken(provedUid), bound: true } };
+      body: { host: (hostOfUid(provedUid) && baseOfKey(hostOfUid(provedUid))) || device || null,
+        token: uidAgentToken(provedUid), bound: true } };
   }
   const proved = bearer ? tokenHost(bearer) : null;
   if (proved && nameTokenRefusal(proved)) {
@@ -14200,16 +14416,20 @@ function listEnrollCodes(now = Date.now()) {
 // name another agent holds — that would hand the code holder that host's queued
 // commands. Case-folded like a rename (uidHostRefusal): a live case twin is the
 // same machine to an operator. Remove host on the dashboard releases a name.
-function enrollNameRefusal(device) {
+// `tenantId` is the tenant the host would join (the code owner's, XERK-2533):
+// names are checked as that tenant's KEY, so another tenant's "laptop" is no
+// collision, and a name shaped like a tenant key is refused outright.
+function enrollNameRefusal(device, tenantId = "") {
   if (!TURMA_AGENT_TOKEN) return { status: 409, error: "this hub derives no agent tokens (no TURMA_AGENT_TOKEN set)" };
+  const key = typeof device === "string" ? tenantHostKey(device, tenantId) : device;
   if (typeof device !== "string" || !device || device.length > 200 ||
-      !isPlainHostKey(device) || !hostAgentToken(device)) {
+      !isPlainHostKey(device) || !hostAgentToken(device) || !isPlainHostKey(key)) {
     return { status: 400, error: `${typeof device === "string" && device ? device : "(empty)"} is not a usable host name` };
   }
-  const want = lowerName(device);
+  const want = lowerName(key);
   for (const k of Object.keys(agents)) {
     if (lowerName(k) === want) {
-      return { status: 409, error: `${k} is already registered — remove it from the dashboard first to reinstall it` };
+      return { status: 409, error: `${baseOfKey(k)} is already registered — remove it from the dashboard first to reinstall it` };
     }
   }
   // Any identity that has BEATEN and still answers to this name — as its home, its
@@ -14231,21 +14451,31 @@ function enrollNameRefusal(device) {
     if (e.released) continue;
     if (e.used) {
       return { status: 409, error: e.home && lowerName(e.home) !== want
-        ? `${device} is an earlier name of ${e.home} — that agent still owns it`
-        : `${e.home} is registered to another agent — remove it from the dashboard first` };
+        ? `${device} is an earlier name of ${baseOfKey(e.home)} — that agent still owns it`
+        : `${baseOfKey(e.home)} is registered to another agent — remove it from the dashboard first` };
     }
   }
   return null;
 }
 
 // Who is minting: the request's principal (XERK-2530) — `user:<id>` with its
-// tenant, else its kind (breakglass / open). Recorded so the tenancy work can
-// bind the enrolled host to that tenant; NOT enforced yet.
+// tenant, else its kind (breakglass / open). The host a code enrolls joins that
+// TENANT (XERK-2533, consumeEnrollCode); a code with no tenant enrolls an
+// untenanted host.
 function enrollCodeOwner(req) {
   const p = requestPrincipal(req);
   if (!p) return { owner: "unknown" };
   if (p.userId) return { owner: `user:${String(p.userId).slice(0, 190)}`, tenantId: p.tenantId || undefined };
   return { owner: String(p.kind || "unknown") };
+}
+
+// Whether principal `p` may see (and revoke) enrollment code `c` (XERK-2533): a
+// code minting into a tenant belongs to that tenant's users alone — its device
+// name and owner are that tenant's data, and revoking it would block their
+// enrollment. An untenanted code, like an untenanted host, is the operators'.
+function enrollCodeVisible(p, c) {
+  const t = c && typeof c.tenantId === "string" && TENANT_ID_RE.test(c.tenantId) ? c.tenantId : "";
+  return principalMayDriveHost(p, t ? tenantHostKey("code", t) : "code");
 }
 
 // Mint a code. Returns {status, body}; the plain code is in the body ONCE and
@@ -14256,7 +14486,7 @@ function mintEnrollCode(owner, device, now = Date.now()) {
   if (owner && typeof owner === "object") owner = owner.owner;
   if (!TURMA_AGENT_TOKEN) return { status: 409, body: { error: "this hub derives no agent tokens (no TURMA_AGENT_TOKEN set)" } };
   if (device !== undefined && device !== null && device !== "") {
-    const refusal = enrollNameRefusal(device);
+    const refusal = enrollNameRefusal(device, tenantId);
     if (refusal) return { status: refusal.status, body: { error: refusal.error } };
   } else {
     device = "";
@@ -14321,9 +14551,13 @@ function consumeEnrollCode(code, device, now = Date.now()) {
   if (rec.device && device !== rec.device) {
     return { status: 403, body: { error: `this enrollment code is for ${rec.device}, not ${device || "(no name)"} — set DEVICE_NAME=${rec.device} or mint a code for this name` } };
   }
-  const refusal = enrollNameRefusal(device);
+  // The host joins the code OWNER's tenant (XERK-2533) — never one the agent
+  // names: its registry key and identity are minted inside that tenant.
+  const tenantId = typeof rec.tenantId === "string" && TENANT_ID_RE.test(rec.tenantId) ? rec.tenantId : "";
+  const refusal = enrollNameRefusal(device, tenantId);
   if (refusal) return { status: refusal.status, body: { error: refusal.error } };
-  const superseding = enrollSupersedeRefusal(rec, device, now);
+  const key = tenantHostKey(device, tenantId);
+  const superseding = enrollSupersedeRefusal(rec, key, now);
   if (superseding) return superseding;
   // An identity minted for this name that never beat (an earlier code whose host
   // never came up) is superseded: the operator minted a new code for the name,
@@ -14337,15 +14571,16 @@ function consumeEnrollCode(code, device, now = Date.now()) {
   for (const [uid, e] of Object.entries(agentIdentities)) {
     if (!e || e.revoked) continue;
     // Case-folded (XERK-2574): a never-beaten case twin is the same name to an operator.
-    if (!e.used && [e.home, e.origin].some((n) => typeof n === "string" && lowerName(n) === lowerName(device))) {
+    // Compared as this tenant's KEY (XERK-2533): another tenant's "laptop" is not it.
+    if (!e.used && [e.home, e.origin].some((n) => typeof n === "string" && lowerName(n) === lowerName(key))) {
       delete agentIdentities[uid]; dropped = true;
     }
-    else if (e.released && e.origin === device) { delete e.origin; dropped = true; }
+    else if (e.released && e.origin === key) { delete e.origin; dropped = true; }
   }
   if (dropped) persistAgentIdentities();
-  const uid = issueAgentUid(device);
+  const uid = issueAgentUid(key);
   const ident = identityEntry(uid);
-  if (!ident || ident.used || ident.home !== device) {
+  if (!ident || ident.used || ident.home !== key || tenantOfUid(uid) !== tenantId) {
     // Defence in depth: never hand out an id that has beaten anywhere.
     return { status: 409, body: { error: `${device} is still bound to another agent identity — remove it from the dashboard first` } };
   }
@@ -14353,7 +14588,8 @@ function consumeEnrollCode(code, device, now = Date.now()) {
   rec.usedBy = device;
   persistEnrollCodes();
   const token = uidAgentToken(uid);
-  console.log(`agent enrolled by code: ${logName(device)} (code ${id}, minted by ${logName(rec.owner)})`);
+  console.log(`agent enrolled by code: ${logName(device)}${tenantId ? " into its owner's tenant" : ""} ` +
+    `(code ${id}, minted by ${logName(rec.owner)})`);
   return { status: 200, body: { host: device, token, bound: true } };
 }
 
@@ -14367,14 +14603,20 @@ const enrollFails = { start: 0, n: 0 };
 // Case-folded like enrollNameRefusal: a case twin would otherwise slip past and
 // register beside it. An identity Remove host released is not protected — the
 // operator explicitly gave the name up.
-function enrollSupersedeRefusal(rec, device, now = Date.now()) {
-  const want = lowerName(device);
+// `key` is the registry key the redemption would mint (XERK-2533: the device
+// inside the code owner's tenant), so only a code redeemed into the SAME tenant
+// for the same name counts.
+function enrollSupersedeRefusal(rec, key, now = Date.now()) {
+  const want = lowerName(key);
+  const device = baseOfKey(key);
   const pending = Object.values(agentIdentities).some((e) =>
     e && !e.revoked && !e.used && !e.released &&
     [e.home, e.origin].some((n) => typeof n === "string" && lowerName(n) === want));
   if (!pending) return null;
   for (const other of Object.values(enrollCodes)) {
-    if (other === rec || !other.usedAt || typeof other.usedBy !== "string" || lowerName(other.usedBy) !== want) continue;
+    if (other === rec || !other.usedAt || typeof other.usedBy !== "string") continue;
+    const otherT = typeof other.tenantId === "string" && TENANT_ID_RE.test(other.tenantId) ? other.tenantId : "";
+    if (lowerName(tenantHostKey(other.usedBy, otherT)) !== want) continue;
     const left = other.usedAt + ENROLL_SUPERSEDE_GRACE_MS - now;
     if (left > 0) {
       return { status: 409, body: { error: `another enrollment code for ${device} was redeemed moments ago and its host has not connected yet — retry in ${Math.ceil(left / 1000)}s if that host is lost (this code is still valid)` } };
@@ -14422,7 +14664,7 @@ function agentWsAuthorized(url, req, host) {
     if (host != null && safeEqual(token, hostAgentToken(host))) return !nameTokenRefusal(host);
     const uid = tokenUid(token);
     if (uid) return host != null && uidHostClaim(uid, host);
-    return !TURMA_AGENT_STRICT && safeEqual(token, TURMA_AGENT_TOKEN);
+    return !TURMA_AGENT_STRICT && safeEqual(token, TURMA_AGENT_TOKEN) && !tenantOfKey(host);
   }
   return !agentHostRefusal(req, host);
 }
@@ -20520,7 +20762,11 @@ const server = http.createServer(async (req, res) => {
       // still gets 401 here rather than the route's 400 before any auth ran.
       let claimed;
       try { claimed = decodeURIComponent(parts[2]); } catch { claimed = parts[2]; }
-      const refusal = agentHostRefusal(req, claimed);
+      // Namespace the typed name into the credential's tenant (XERK-2533) and
+      // hand the ROUTE that key: every handler below decodes parts[2] itself.
+      const scoped = agentKeyFor(req, claimed);
+      if (scoped !== claimed) parts[2] = encodeURIComponent(scoped);
+      const refusal = agentHostRefusal(req, scoped);
       if (refusal) return json(res, refusal.status, { error: refusal.error });
     } else if (isTrigger) {
       if (!triggerAuthorized(req)) return json(res, 401, { error: "unauthorized" });
@@ -20565,6 +20811,21 @@ const server = http.createServer(async (req, res) => {
       return json(res, 401, { error: "unauthorized" });
     }
 
+    // Every OPERATOR route on one host — spawn, kill, roll, migrate, input,
+    // remove, … — answers only a principal that may drive that host (XERK-2533):
+    // a tenant's host for that tenant, an untenanted one for the hub's operators.
+    // 404, never 403, so another tenant cannot tell the host exists. The
+    // agent-authed <host> routes above bound their caller to the host already.
+    if (parts[0] === "api" && parts[1] === "agents" && parts.length >= 3 &&
+        url.pathname !== "/api/heartbeat" && !(isArchiveIngest || isUpdatingSignal ||
+          isAliveSignal || isMigrationBlob || isUploadBlob || isMeetingTranscript)) {
+      let hostKey = null;
+      try { hostKey = decodeURIComponent(parts[2]); } catch { /* the route 400s it */ }
+      if (hostKey != null && !principalMayDriveHost(requestPrincipal(req), hostKey)) {
+        return json(res, 404, { error: "unknown agent" });
+      }
+    }
+
     // Login form (public). Already-authenticated visitors skip straight in.
     // HEAD as well as GET, for the same reason the asset routes take it: this is
     // the one unauthenticated HTML surface, so it is what a CDN or an uptime
@@ -20607,21 +20868,41 @@ const server = http.createServer(async (req, res) => {
       let token;
       if (!authEnabled()) {
         token = issueSessionToken(); // an open hub: no credential to check
-      } else if (TURMA_PASSWORD && credentialsMatch(username, password)) {
-        // Break-glass (XERK-595) first and scrypt-free, so it works under a flood.
-        token = issueSessionToken(SESSION_TTL_MS, principalClaims(BREAKGLASS_PRINCIPAL));
       } else {
-        const r = await localLogin(username, password, Date.now(), loginClientKey(req));
-        if (r.throttled) {
-          res.setHeader("Retry-After", String(r.throttled));
-          return json(res, 429, { error: "too many failed sign-ins — try again later" });
+        const clientKey = loginClientKey(req);
+        // Break-glass (XERK-595) first and scrypt-free, so it works under another
+        // client's flood — but throttled per client (XERK-2577). Only a guess at
+        // the break-glass username is one; any other name is a plain local login.
+        // Its refusals run in localLogin's order — backoff (429), then this
+        // client's sign-in already in flight (503) — BEFORE the compare, so a busy
+        // refusal neither evaluates nor counts the guess, exactly as for any other
+        // name: the response pattern never tells which name is break-glass.
+        let bg = null;
+        if (TURMA_PASSWORD && safeEqual(username, TURMA_USER)) {
+          const wait = loginBackoffMs(clientKey, username, Date.now());
+          if (wait) bg = { throttled: Math.ceil(wait / 1000) };
+          else if (loginClientsInflight.has(clientKey)) bg = { busy: true };
+          else bg = breakGlassAttempt(clientKey, username, password);
         }
-        if (r.busy) {
-          res.setHeader("Retry-After", "1");
-          return json(res, 503, { error: "too many sign-ins in progress — try again in a moment" });
+        if (bg === true) {
+          token = issueSessionToken(SESSION_TTL_MS, principalClaims(BREAKGLASS_PRINCIPAL));
+        } else {
+          // A break-glass miss still runs the local check — a local account may
+          // share the name, and the scrypt keeps the miss as slow as any other
+          // (no timing tell for which name is break-glass) — but it is counted once.
+          const r = typeof bg === "number" ? { throttled: bg } : bg && typeof bg === "object" ? bg
+            : await localLogin(username, password, Date.now(), clientKey, bg === false);
+          if (r.throttled) {
+            res.setHeader("Retry-After", String(r.throttled));
+            return json(res, 429, { error: "too many failed sign-ins — try again later" });
+          }
+          if (r.busy) {
+            res.setHeader("Retry-After", "1");
+            return json(res, 503, { error: "too many sign-ins in progress — try again in a moment" });
+          }
+          if (!r.principal) return json(res, 401, { error: "invalid credentials" });
+          token = issueSessionToken(SESSION_TTL_MS, principalClaims(r.principal));
         }
-        if (!r.principal) return json(res, 401, { error: "invalid credentials" });
-        token = issueSessionToken(SESSION_TTL_MS, principalClaims(r.principal));
       }
       res.writeHead(200, {
         "Content-Type": "application/json",
@@ -20934,7 +21215,8 @@ const server = http.createServer(async (req, res) => {
     // Host enrollment codes (XERK-2531): the dashboard's Add host dialog mints,
     // lists and revokes them; the host redeems one at POST /api/agent/enroll.
     if (url.pathname === "/api/enroll-codes" && req.method === "GET") {
-      return json(res, 200, { codes: listEnrollCodes(), ttlMs: ENROLL_CODE_TTL_MS });
+      const p = requestPrincipal(req);
+      return json(res, 200, { codes: listEnrollCodes().filter((c) => enrollCodeVisible(p, c)), ttlMs: ENROLL_CODE_TTL_MS });
     }
     if (url.pathname === "/api/enroll-codes" && req.method === "POST") {
       let body;
@@ -20947,6 +21229,8 @@ const server = http.createServer(async (req, res) => {
       return json(res, r.status, r.body);
     }
     if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "enroll-codes" && parts.length === 3) {
+      const code = Object.prototype.hasOwnProperty.call(enrollCodes, parts[2]) ? enrollCodes[parts[2]] : null;
+      if (code && !enrollCodeVisible(requestPrincipal(req), code)) return json(res, 404, { error: "no such enrollment code" });
       const r = revokeEnrollCode(parts[2]);
       return json(res, r.status, r.body);
     }
@@ -21046,7 +21330,10 @@ const server = http.createServer(async (req, res) => {
       // Identity is the physical host name (`device`); with one container per
       // host the container name is no longer meaningful. agentId is a last-resort
       // fallback if the host name couldn't be read.
-      const key = payload.device || payload.agentId;
+      // The registry key is the device name NAMESPACED into the tenant the
+      // credential proves (XERK-2533); `device` stays the plain name it typed,
+      // which is what every client displays.
+      const key = agentKeyFor(req, payload.device || payload.agentId);
       if (!key) return json(res, 400, { error: "device/agentId required" });
       // A beat the hub would throw away must never report success — see
       // isPlainHostKey for which names are refused and why. Logged because the
@@ -21117,7 +21404,9 @@ const server = http.createServer(async (req, res) => {
       // offline loop. Filtering rather than tolerating also self-heals the record
       // on the first beat, so a junk element cannot outlive one round trip.
       const commands = (prev.commands || []).filter(
-        (c) => c && typeof c === "object" && !acked.has(c.cmdId));
+        (c) => c && typeof c === "object" && !acked.has(c.cmdId) &&
+          ((typeof c.tenant === "string" ? c.tenant : "") === tenantOfKey(key) ||
+           (!c.tenant && c.type === "setToken" && c.bindTenant === tenantOfKey(key))));
       delete payload.ackedCommands; // don't persist the transient ack list
       // On-demand session history the agent fetched since the last beat (see
       // the {type:"history"} command); ingested into the cache below, not
@@ -21451,8 +21740,16 @@ const server = http.createServer(async (req, res) => {
       // A rename (XERK-2381) lands only now, past every gate that could refuse
       // the beat: the old name's record goes, the new one already holds it.
       if (beatUid) {
-        noteIdentityBeat(beatUid, key);
+        const movedFrom = noteIdentityBeat(beatUid, key);
         renameAgentRecord(beatUid, key);
+        // A TENANT BIND moved the host to `<name>@<t>` (XERK-2533), but its live
+        // tunnel is still registered under the plain name, so its terminals read
+        // offline. Close it: the agent re-dials and lands on the new key.
+        if (movedFrom && !tenantOfKey(movedFrom) && tenantOfKey(key) && controlChannels[movedFrom]) {
+          const ch = controlChannels[movedFrom];
+          try { ch.socket.end(wsEncode(0x8, Buffer.from([0x03, 0xe9]))); } catch { /* gone */ }
+          try { ch.socket.destroy(); } catch { /* gone */ }
+        }
       }
       // The permission ledger (XERK-1563), after the same gates and for the same
       // reason. Every field is whitelisted + bounded inside (sanitizePermissionEvent).
@@ -22304,7 +22601,8 @@ const server = http.createServer(async (req, res) => {
                  "only the rendered transcript, which can be read but not resumed",
         });
       if (!target) return json(res, 400, { error: "a target host is required" });
-      const tgt = agents[target];
+      // Restoring onto a host is driving it (XERK-2533): only one the caller may.
+      const tgt = principalMayDriveHost(requestPrincipal(req), target) ? agents[target] : null;
       if (!tgt) return json(res, 404, { error: "unknown target host" });
       if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)
         return json(res, 503, { error: "the target agent is offline" });
@@ -22554,7 +22852,15 @@ const server = http.createServer(async (req, res) => {
       // An IDENTITY token (XERK-2381): the host's bound id, minted and stamped
       // on first roll, so a re-roll is still idempotent and a later rename of
       // the host keeps this credential.
-      const token = hostAgentToken(key) ? uidAgentToken(issueAgentUid(key)) : "";
+      const uid = hostKeyUsable(key) ? issueAgentUid(key) : null;
+      const token = uid ? uidAgentToken(uid) : "";
+      // A tenant user rolling an UNTENANTED host binds it to their tenant
+      // (XERK-2533): from its next beat on this identity the host is
+      // `<host>@<tenant>`, carrying its record over. A tenant host keeps its
+      // tenant (the drive gate above already required the caller to be in it);
+      // an operator with no tenant leaves it untenanted.
+      const bindTo = principalTenant(requestPrincipal(req));
+      const bound = uid && !tenantOfKey(key) && bindTo ? bindIdentityTenant(uid, bindTo) : false;
       if (!token) {
         // The host name doesn't derive a token (a dot segment, a name that
         // doesn't UTF-8 round-trip) — the same names hostAgentToken refuses to
@@ -22568,8 +22874,13 @@ const server = http.createServer(async (req, res) => {
       // already unacked in flight (mirrors the restart route). A retry reuses
       // the pending cmdId; the token itself is the same value either way.
       const pending = (agents[key].commands || []).find((c) => c.type === "setToken");
-      const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "setToken", token });
-      return json(res, 200, { ok: true, cmdId });
+      // A BIND's setToken is the one command that crosses the bind (XERK-2533):
+      // `bindTenant` lets it be delivered on the host's next beat whether that
+      // lands on the old plain key or, already, on the namespaced one.
+      const cmdId = pending ? pending.cmdId
+        : queueCommand(key, bound ? { type: "setToken", token, bindTenant: bindTo } : { type: "setToken", token });
+      if (bound) console.log(`agent token: ${logName(key)} bound to the rolling user's tenant`);
+      return json(res, 200, bound ? { ok: true, cmdId, tenantBound: true } : { ok: true, cmdId });
     }
 
     // POST /api/agents/<host>/revoke-name-token — retire every name-derived
@@ -22706,7 +23017,16 @@ const server = http.createServer(async (req, res) => {
       if (!repo) return json(res, 400, { error: "repo required" });
       if (!prompt) return json(res, 400, { error: "prompt required" });
       if (prompt.length > 10000) return json(res, 400, { error: "prompt too long" });
-      const agent = agents[hostname];
+      // The host must be one the CALLER may drive (XERK-2533), as on every
+      // /api/agents/<host> route: a login by principalMayDriveHost; the shared
+      // TURMA_TRIGGER_TOKEN proves no tenant, so it reaches untenanted hosts
+      // only (like the fleet master). 404, so no tenant host's existence leaks.
+      const trigHeader = req.headers.authorization || "";
+      const viaTriggerToken = !!TURMA_TRIGGER_TOKEN && trigHeader.startsWith("Bearer ") &&
+        safeEqual(trigHeader.slice(7), TURMA_TRIGGER_TOKEN);
+      const mayDrive = viaTriggerToken ? !tenantOfKey(hostname)
+        : principalMayDriveHost(requestPrincipal(req), hostname);
+      const agent = mayDrive ? agents[hostname] : null;
       if (!agent) return json(res, 404, { error: "unknown host" });
       // Validate the repo against what the host actually reports (its scanned
       // repos plus the "(root)" pseudo-repo). Skip the check only if the host
@@ -22891,7 +23211,8 @@ const server = http.createServer(async (req, res) => {
         if (!target || target === key)
           return json(res, 400, { error: "a different target host is required" });
         const tgt = agents[target];
-        if (!tgt) return json(res, 404, { error: "unknown target host" });
+        // Another tenant's host is "unknown" (XERK-2533): no existence leak.
+        if (!tgt || tenantOfKey(target) !== tenantOfKey(key)) return json(res, 404, { error: "unknown target host" });
         // The DECIDED org on both sides (XERK-349), not the CLAIMED one. Since
         // the hub now SERVES that decision as `org` (serializeAgent), the three
         // client move-target predicates key on exactly what this refuses, so hub
@@ -22919,7 +23240,7 @@ const server = http.createServer(async (req, res) => {
         //     binding never moved and silence is not drift (XERK-348). Making it
         //     PERMANENT would need drift history the record does not keep and would
         //     undo the over-refusal fix — do not claim it holds past one beat.
-        if (!sameDecidedOrg(src, tgt))
+        if (!sameDecidedOrg(src, tgt, key, target))
           return json(res, 409, { error: "the target agent is in a different org" });
         if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)
           return json(res, 503, { error: "the target agent is offline" });
@@ -24658,7 +24979,9 @@ server.on("upgrade", async (req, socket, head) => {
     // `name` is read BEFORE the auth check, because it is what the credential
     // has to back (XERK-268) — registering another host's tunnel would route
     // that host's terminals through the impostor.
-    const name = url.searchParams.get("name");
+    // The typed DEVICE_NAME, namespaced into the tenant its credential proves
+    // (XERK-2533), so the tunnel registers under the same key the heartbeat does.
+    const name = agentKeyFor(req, url.searchParams.get("name"), url.searchParams.get("token"));
     if (!name) return socket.destroy();
     if (!agentWsAuthorized(url, req, name)) return socket.destroy();
     wsHandshake(socket, req);
@@ -25452,6 +25775,12 @@ if (process.env.TURMA_TEST) {
     oidcPrincipal,
     tenancyState: () => tenancyState,
     __setTenancy(v) { tenancyState = tenancy.coerceTenancy(v); },
+    // Host ⇄ tenant binding (XERK-2533).
+    tenantOfKey,
+    baseOfKey,
+    agentKeyFor,
+    principalMayDriveHost,
+    bindIdentityTenant,
     BREAKGLASS_PRINCIPAL,
     // OIDC relying-party core (XERK-592). The pure pieces are exported so the
     // security-critical validation is unit-tested offline with a locally-minted
@@ -25551,7 +25880,8 @@ if (process.env.TURMA_TEST) {
     normalizeEpicBuilderStatus,
     EPIC_BUILDER_STATES,
     EPIC_BUILDER_IDEA_MAX,
-    EPIC_BUILDER_REDISPATCH_MS,
+    EPIC_BUILDER_REDISPATCH_MS, EPIC_BUILDER_ORPHAN_MS, epicBuilderClaimLapsed,
+    withdrawEpicBuilderCommand,
     // XERK-636: the wave-dispatch driver + its readiness/state helpers, and the
     // per-child backoff map (XERK-61/109 hot-loop guard).
     epicRunDriveSweep,

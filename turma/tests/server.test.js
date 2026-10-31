@@ -252,7 +252,8 @@ const {
   buildEpicWaves, epicChildRows,
   isEpicOrEpicChild, isRollupTicket, sanitizeEpicRunRecord,
   epicBuilders, armEpicBuilder, clearEpicBuilder, advanceEpicBuilder,
-  ingestEpicBuilderStatus, epicBuilderDriveSweep, sanitizeEpicBuilderRecord,
+  ingestEpicBuilderStatus, epicBuilderDriveSweep, epicBuilderClaimLapsed,
+  EPIC_BUILDER_REDISPATCH_MS, EPIC_BUILDER_ORPHAN_MS, sanitizeEpicBuilderRecord,
   normalizeEpicBuilderStatus, EPIC_BUILDER_STATES, EPIC_BUILDER_IDEA_MAX,
   epicRunDriveSweep, epicChildBlockersDone, epicRunAllChildrenDone, epicChildAttempts,
   epicRunChildSession, anyArmedEpicRun, epicRunCompleteSweep, epicDoneWritten,
@@ -13666,6 +13667,81 @@ test("XERK-725: a full fleet holds the builder queued; a freed slot dispatches i
     (c) => c.type === "spawnEpicBuilder" && c.builderId === id));
 });
 
+test("XERK-2545: a builder a host took is not re-dispatched to another host while that host is silent", async () => {
+  resetEpicBuilders();
+  await builderBeat("ebSlowA", "eb2545.atlassian.net");
+  await builderBeat("ebSlowB", "eb2545.atlassian.net");
+  agents.ebSlowA.commands = []; agents.ebSlowB.commands = [];
+  const r = await request("POST", "/api/jira/eb2545.atlassian.net/epic-builder",
+    { body: { title: "Slow", idea: "first host goes quiet" }, headers: userHeaders });
+  const id = r.body.run.id;
+  const first = epicBuilders[id].host;
+  const other = first === "ebSlowA" ? "ebSlowB" : "ebSlowA";
+  const cmd = agents[first].commands.find((c) => c.type === "spawnEpicBuilder");
+  const now = Date.now();
+  // Delivered on a beat after the dispatch, then the host went silent past the
+  // redispatch window: it may be running the builder, so the run stays with it.
+  epicBuilders[id].dispatchedAt = now - EPIC_BUILDER_REDISPATCH_MS - 1000;
+  agents[first].lastSeen = epicBuilders[id].dispatchedAt + 1;
+  cmd.deliveredAt = agents[first].lastSeen;
+  epicBuilderDriveSweep();
+  assert.equal(epicBuilders[id].host, first, "a silent host that took it keeps the run");
+  assert.equal(agents[other].commands.some((c) => c.type === "spawnEpicBuilder"), false,
+    "no second builder dispatched");
+  // Silent past the orphan bound: the claim is given up.
+  assert.equal(epicBuilderClaimLapsed(id, epicBuilders[id],
+    epicBuilders[id].dispatchedAt + EPIC_BUILDER_ORPHAN_MS + 1), true);
+  // Acked (command gone) but silent since: it may be running the builder — held.
+  agents[first].commands = [];
+  agents[first].lastSeen = epicBuilders[id].dispatchedAt + 1;
+  assert.equal(epicBuilderClaimLapsed(id, epicBuilders[id], now), false,
+    "an offline host that acked keeps the run until the orphan bound");
+  // Acked (command gone) and beating since, with no report: acked-no-session, released.
+  agents[first].commands = [];
+  agents[first].lastSeen = now;
+  assert.equal(epicBuilderClaimLapsed(id, epicBuilders[id], now), true);
+  // Never delivered: the command is withdrawn and the run released.
+  agents[first].commands = [{ ...cmd }]; delete agents[first].commands[0].deliveredAt;
+  agents[first].lastSeen = epicBuilders[id].dispatchedAt - 1;
+  assert.equal(epicBuilderClaimLapsed(id, epicBuilders[id], now), true,
+    "a never-delivered command releases the run (the sweep withdraws it)");
+  // Inside the first-report grace nothing is released.
+  assert.equal(epicBuilderClaimLapsed(id, { ...epicBuilders[id], dispatchedAt: now }, now), false);
+  // Delivered, still unacked, host still beating (or kept alive): it may be mid-spawn — held.
+  agents[first].commands = [{ ...cmd, deliveredAt: now }];
+  agents[first].lastSeen = now;
+  assert.equal(epicBuilderClaimLapsed(id, epicBuilders[id], now), false,
+    "an online host holding the delivered command keeps the run");
+  // A hub restart stamps every restored command delivered; a host that has not
+  // beaten since the dispatch still cannot have it, so the run is released.
+  agents[first].lastSeen = epicBuilders[id].dispatchedAt - 1;
+  assert.equal(epicBuilderClaimLapsed(id, epicBuilders[id], now), true,
+    "no beat since the dispatch means never delivered, whatever the stamp says");
+  // A host removed from the registry releases the run.
+  assert.equal(epicBuilderClaimLapsed(id, { ...epicBuilders[id], host: "ebSlowGone" }, now), true);
+});
+
+test("XERK-2545: releasing a silent host's builder withdraws its command, so it cannot run a second one", async () => {
+  resetEpicBuilders();
+  await builderBeat("ebOrphA", "eb2545b.atlassian.net");
+  await builderBeat("ebOrphB", "eb2545b.atlassian.net", { capacity: { free: 0, total: 3, queued: 0 } });
+  agents.ebOrphA.commands = []; agents.ebOrphB.commands = [];
+  const r = await request("POST", "/api/jira/eb2545b.atlassian.net/epic-builder",
+    { body: { title: "Orphan", idea: "A goes quiet for good" }, headers: userHeaders });
+  const id = r.body.run.id;
+  assert.equal(epicBuilders[id].host, "ebOrphA");
+  // A took it and went silent past the orphan bound.
+  const cmd = agents.ebOrphA.commands.find((c) => c.type === "spawnEpicBuilder");
+  cmd.deliveredAt = Date.now();
+  epicBuilders[id].dispatchedAt = Date.now() - EPIC_BUILDER_ORPHAN_MS - 1000;
+  agents.ebOrphA.lastSeen = epicBuilders[id].dispatchedAt + 1;
+  await builderBeat("ebOrphB", "eb2545b.atlassian.net", { capacity: { free: 2, total: 3, queued: 0 } });
+  epicBuilderDriveSweep();
+  assert.equal(epicBuilders[id].host, "ebOrphB", "the run moved to the other host");
+  assert.equal(agents.ebOrphA.commands.some((c) => c.type === "spawnEpicBuilder" && c.builderId === id),
+    false, "the old host's command was withdrawn, so its return re-delivers nothing");
+});
+
 test("XERK-725: a host's epicBuilderStatus report advances the run; another host cannot", async () => {
   resetEpicBuilders();
   await builderBeat("ebRep", "eb4.atlassian.net");
@@ -20393,6 +20469,273 @@ test("XERK-2531: code enrollment works under TURMA_AGENT_STRICT", () => {
   const r = strict.consumeEnrollCode(m.body.code, "enr-strict");
   assert.equal(r.status, 200);
   assert.ok(strict.tokenUid(r.body.token));
+});
+
+// ---- XERK-2533: every agent host is bound to exactly one tenant ------------
+
+// Two tenant users (A, B) and an admin with a tenant of its own (C), each with a
+// signed session cookie. The store is restored afterwards so no other test sees
+// local accounts.
+function tenants2533() {
+  const tenancy = require("../tenancy.js");
+  const saved = hub.tenancyState();
+  let s = saved;
+  const hash = tenancy.hashPasswordSync("pw-2533-long-enough");
+  const mk = (username, groups) => {
+    const r = tenancy.createLocalUser(s, { username, passwordHash: hash, groups });
+    s = r.state;
+    return r.user;
+  };
+  const ua = mk("t2533a", ["turma-users"]);
+  const ub = mk("t2533b", ["turma-users"]);
+  const uc = mk("t2533c", ["turma-users", "turma-admins"]);
+  hub.__setTenancy(s);
+  const cookieOf = (u) => {
+    const p = hub.principalFromToken(hub.issueSessionToken(60_000,
+      { u: u.id, t: u.tenantId, r: ["user"] }));
+    return { cookie: `hub_session=${hub.issueSessionToken(60_000, hub.principalClaims(p))}` };
+  };
+  return {
+    A: { user: ua, t: ua.tenantId, h: cookieOf(ua) },
+    B: { user: ub, t: ub.tenantId, h: cookieOf(ub) },
+    C: { user: uc, t: uc.tenantId, h: cookieOf(uc) },
+    restore() { hub.__setTenancy(saved); },
+  };
+}
+const forget2533 = (...keys) => {
+  for (const k of keys) delete agents[k];
+  const ids = hub.agentIdentities();
+  for (const [u, e] of Object.entries(ids)) {
+    if (keys.some((k) => e.home === k || e.origin === k || hub.baseOfKey(e.home) === k)) delete ids[u];
+  }
+  for (const k of Object.keys(hub.enrollCodes())) delete hub.enrollCodes()[k];
+  hub.enrollFails.start = 0; hub.enrollFails.n = 0;
+};
+// Enroll `device` with a code minted by `who`'s cookie; returns the token.
+async function enroll2533(who, device) {
+  const m = await request("POST", "/api/enroll-codes", { headers: who.h, body: {} });
+  assert.equal(m.status, 200, JSON.stringify(m.body));
+  const r = await request("POST", "/api/agent/enroll", { body: { code: m.body.code, device } });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  return r.body.token;
+}
+const beat2533 = (token, device, extra = {}) => request("POST", "/api/heartbeat", {
+  headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+  body: { device, sessions: [], ...extra },
+});
+
+test("XERK-2533: a code enrolls the host INTO its owner's tenant; two tenants can each have a 'laptop'", async () => {
+  const T = tenants2533();
+  const ka = `t2533lap@${T.A.t}`, kb = `t2533lap@${T.B.t}`;
+  try {
+    forget2533("t2533lap", ka, kb);
+    const ta = await enroll2533(T.A, "t2533lap");
+    const tb = await enroll2533(T.B, "t2533lap"); // no collision with A's
+    assert.equal(hub.tenantOfKey(hostOfUid(tokenUid(ta))), T.A.t);
+    assert.equal(hostOfUid(tokenUid(tb)), kb);
+    assert.equal(hub.agentIdentities()[tokenUid(ta)].tenantId, T.A.t);
+    // Each agent beats under its plain DEVICE_NAME; the hub namespaces the key.
+    assert.equal((await beat2533(ta, "t2533lap")).status, 200);
+    assert.equal((await beat2533(tb, "t2533lap")).status, 200);
+    assert.ok(agents[ka] && agents[kb] && !agents.t2533lap);
+    assert.equal(agents[ka].device, "t2533lap", "clients still display the plain name");
+    // The same code owner cannot enroll the name twice inside one tenant.
+    const m = await request("POST", "/api/enroll-codes", { headers: T.A.h, body: { device: "t2533lap" } });
+    assert.equal(m.status, 409);
+    // A name shaped like another tenant's key is never a usable device.
+    const m2 = await request("POST", "/api/enroll-codes", { headers: T.A.h, body: {} });
+    const bad = await request("POST", "/api/agent/enroll", { body: { code: m2.body.code, device: kb } });
+    assert.equal(bad.status, 400);
+  } finally { forget2533("t2533lap", ka, kb); T.restore(); }
+});
+
+test("XERK-2533: a tenant's token can never beat, tunnel or fetch as another tenant's host", async () => {
+  const T = tenants2533();
+  const ka = `t2533f@${T.A.t}`, kb = `t2533f@${T.B.t}`;
+  try {
+    forget2533("t2533f", ka, kb);
+    const ta = await enroll2533(T.A, "t2533f");
+    const tb = await enroll2533(T.B, "t2533f");
+    assert.equal((await beat2533(tb, "t2533f")).status, 200);
+    agents[kb].commands = [{ type: "restartAgent", cmdId: "c2533b", tenant: T.B.t }];
+    // A's token naming B's key outright: refused, and B's queue is untouched.
+    const forged = await beat2533(ta, kb);
+    assert.equal(forged.status, 403);
+    assert.equal(agents[kb].commands.length, 1);
+    // ... nor an untenanted key of the same name.
+    assert.ok(!agents.t2533f);
+    // Agent-authed <host> routes: A's token on B's key is refused.
+    const upd = await request("POST", `/api/agents/${encodeURIComponent(kb)}/updating`, {
+      headers: { authorization: `Bearer ${ta}`, "content-type": "application/json" }, body: {},
+    });
+    assert.equal(upd.status, 403);
+    // The tunnel: the typed name is namespaced into the TOKEN's tenant.
+    const req = (tok) => ({ headers: { authorization: `Bearer ${tok}` } });
+    assert.equal(hub.agentKeyFor(req(ta), "t2533f"), ka);
+    assert.equal(hub.agentKeyFor(req(ta), kb), kb, "left alone so the check refuses it");
+    const url = (name, tok) => new URL(`http://x/agent/control?name=${encodeURIComponent(name)}&token=${tok}`);
+    assert.equal(hub.agentWsAuthorized(url(kb, ta), { headers: {} }, kb), false);
+    assert.equal(hub.agentWsAuthorized(url(ka, ta), { headers: {} }, ka), true);
+    // The master proves no tenant: it may act only as an untenanted host.
+    assert.equal((await beat2533("agenttok", kb)).status, 403);
+    assert.equal(hub.agentWsAuthorized(url(kb, "agenttok"), { headers: {} }, kb), false);
+    // No name token is derivable for a tenant key (so `--agent-token` can't mint one).
+    assert.equal(hostAgentToken(kb), "");
+    // The operator login (Basic break-glass) is no agent of a tenant host either.
+    assert.equal((await beatAs(kb, userHeaders)).status, 401);
+    assert.ok(!agents[kb].lastSeen || agents[kb].commands.length === 1);
+  } finally { forget2533("t2533f", ka, kb); T.restore(); }
+});
+
+test("XERK-2533: operator routes answer only the host's own tenant (404 otherwise)", async () => {
+  const T = tenants2533();
+  const ka = `t2533op@${T.A.t}`;
+  try {
+    forget2533("t2533op", "t2533leg", ka);
+    const ta = await enroll2533(T.A, "t2533op");
+    assert.equal((await beat2533(ta, "t2533op")).status, 200);
+    assert.equal((await beatAs("t2533leg", agentHeaders)).status, 200); // untenanted (master)
+    const restart = (k, h) => request("POST", `/api/agents/${encodeURIComponent(k)}/restart`, { headers: h, body: {} });
+    assert.equal((await restart(ka, T.B.h)).status, 404, "another tenant cannot tell it exists");
+    assert.equal((await restart(ka, T.C.h)).status, 404, "an admin role grants no tenant host");
+    assert.equal((await restart(ka, userHeaders)).status, 404, "break-glass has no tenant");
+    assert.equal((await restart(ka, T.A.h)).status, 200);
+    // An untenanted host: the hub's operators (admin, break-glass) — never a plain tenant user.
+    assert.equal((await restart("t2533leg", T.A.h)).status, 404);
+    assert.equal((await restart("t2533leg", T.C.h)).status, 200);
+    assert.equal((await restart("t2533leg", userHeaders)).status, 200);
+    // /api/trigger picks its host from the BODY: the same gate applies (QA).
+    const trig = (host, h) => request("POST", "/api/trigger",
+      { headers: { ...h, "content-type": "application/json" }, body: { hostname: host, repo: "r", prompt: "p" } });
+    assert.equal((await trig(ka, T.B.h)).status, 404, "another tenant cannot spawn on it");
+    assert.equal((await trig(ka, userHeaders)).status, 404, "break-glass has no tenant");
+    assert.equal((await trig(ka, { authorization: "Bearer triggertok" })).status, 404,
+      "the shared trigger token proves no tenant");
+    assert.equal((await trig("t2533leg", T.A.h)).status, 404, "a tenant user reaches no untenanted host");
+    assert.equal((await trig(ka, T.A.h)).status, 200);
+    assert.equal((await trig("t2533leg", { authorization: "Bearer triggertok" })).status, 200);
+    agents[ka].commands = agents[ka].commands.filter((c) => c.type !== "spawn");
+    // The queued command carries the tenant, hub-only.
+    const cmd = agents[ka].commands.find((c) => c.type === "restartAgent");
+    assert.equal(cmd.tenant, T.A.t);
+    const reply = await beat2533(ta, "t2533op");
+    const sent = (reply.body.commands || []).find((c) => c.cmdId === cmd.cmdId);
+    assert.ok(sent && !("tenant" in sent), "delivered, with the stamp stripped");
+    // A command stamped for another tenant (or none) is never delivered to it.
+    agents[ka].commands.push({ type: "restartAgent", cmdId: "c2533x" });
+    const r2 = await beat2533(ta, "t2533op");
+    assert.ok(!(r2.body.commands || []).some((c) => c.cmdId === "c2533x"));
+    assert.ok(!agents[ka].commands.some((c) => c.cmdId === "c2533x"));
+  } finally { forget2533("t2533op", "t2533leg", ka); T.restore(); }
+});
+
+test("XERK-2533: a session never migrates across tenants, and the roster never crosses one", async () => {
+  const T = tenants2533();
+  const ka = `t2533m@${T.A.t}`, ka2 = `t2533m2@${T.A.t}`, kb = `t2533m@${T.B.t}`;
+  const site = "t2533.atlassian.net";
+  try {
+    forget2533("t2533m", "t2533m2", ka, ka2, kb);
+    const ta = await enroll2533(T.A, "t2533m");
+    const ta2 = await enroll2533(T.A, "t2533m2");
+    const tb = await enroll2533(T.B, "t2533m");
+    const sess = [{ id: "s2533", status: "running", repo: "r2533", transcriptId: "tx2533", rcName: "rc2533" }];
+    const extra = { jira: { siteKey: site, available: true, tickets: [] }, repos: [{ name: "r2533" }] };
+    for (const [tok, dev] of [[ta, "t2533m"], [ta2, "t2533m2"], [tb, "t2533m"]]) {
+      assert.equal((await beat2533(tok, dev, { ...extra, sessions: sess })).status, 200);
+    }
+    assert.equal(hub.decidedOrgOf(agents[kb]), site, "same org on every side");
+    const move = (to) => request("POST",
+      `/api/agents/${encodeURIComponent(ka)}/sessions/s2533/migrate`, { headers: T.A.h, body: { host: to } });
+    const cross = await move(kb);
+    assert.equal(cross.status, 404, JSON.stringify(cross.body));
+    assert.equal(cross.body.error, "unknown target host");
+    assert.equal(hub.sameDecidedOrg(agents[ka], agents[kb], ka, kb), false);
+    assert.equal(hub.sameDecidedOrg(agents[ka], agents[ka2], ka, ka2), true);
+    // B cannot even start a move of A's session.
+    assert.equal((await request("POST", `/api/agents/${encodeURIComponent(ka)}/sessions/s2533/migrate`,
+      { headers: T.B.h, body: { host: kb } })).status, 404);
+    // The peer roster: A sees its own tenant's hosts only, by device name.
+    const hosts = new Set(hub.orgPeers(ka).map((r) => r.host));
+    assert.deepEqual([...hosts].sort(), ["t2533m", "t2533m2"]);
+    assert.ok(hub.orgPeers(kb).every((r) => r.name === "rc2533") && hub.orgPeers(kb).length === 1);
+  } finally { forget2533("t2533m", "t2533m2", ka, ka2, kb); T.restore(); }
+});
+
+test("XERK-2533: a tenant user's roll binds an untenanted host to their tenant; the record follows", async () => {
+  const T = tenants2533();
+  const kc = `t2533r@${T.C.t}`;
+  try {
+    forget2533("t2533r", kc);
+    // Enrolled untenanted (break-glass minted the code), beating on its identity.
+    const m = await request("POST", "/api/enroll-codes", { headers: userHeaders, body: {} });
+    const tok = (await request("POST", "/api/agent/enroll", { body: { code: m.body.code, device: "t2533r" } })).body.token;
+    assert.equal((await beat2533(tok, "t2533r")).status, 200);
+    assert.ok(agents.t2533r);
+    // Its live tunnel, registered under the plain name. It PONGS, so only the
+    // hub's bind-beat close can end it inside this test (never the dead timer).
+    const ctrl = await wsConnect(`/agent/control?name=t2533r&token=${tok}`);
+    assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+    collectControlFrames(ctrl.socket, ctrl.leftover);
+    let tunnelClosed = false;
+    ctrl.socket.on("close", () => { tunnelClosed = true; });
+    await waitFor(() => !!controlChannels.t2533r);
+    // A plain tenant user cannot roll it; the admin with a tenant binds it.
+    assert.equal((await request("POST", "/api/agents/t2533r/roll-token", { headers: T.A.h, body: {} })).status, 404);
+    const roll = await request("POST", "/api/agents/t2533r/roll-token", { headers: T.C.h, body: {} });
+    assert.equal(roll.status, 200, JSON.stringify(roll.body));
+    assert.equal(roll.body.tenantBound, true);
+    // Its next beat on the same identity lands in tenant C, carrying the record —
+    // and the bind's own setToken still reaches it (QA: it was dropped, so the
+    // agent never restarted and its tunnel stayed on the plain key).
+    const after = await beat2533(tok, "t2533r");
+    assert.equal(after.status, 200);
+    assert.ok(agents[kc] && !agents.t2533r);
+    const st = (after.body.commands || []).find((c) => c.cmdId === roll.body.cmdId);
+    assert.ok(st && st.type === "setToken" && !("bindTenant" in st), JSON.stringify(after.body.commands));
+    assert.ok(!(agents[kc].commands || []).filter((c) => c.type !== "setToken").length);
+    // The bind beat closed the plain-named tunnel, so the agent re-dials onto the
+    // namespaced key (QA: left open, the bound host's terminals read offline).
+    await waitFor(() => tunnelClosed, 300);
+    assert.ok(!controlChannels.t2533r);
+    assert.equal(hostOfUid(tokenUid(tok)), kc);
+    // The old plain name is closed to it now: no beat as an untenanted host.
+    assert.equal(hub.agentKeyFor({ headers: { authorization: `Bearer ${tok}` } }, "t2533r"), kc);
+    // Break-glass (no tenant) leaves an untenanted host untenanted.
+    assert.equal(hub.bindIdentityTenant(tokenUid(tok), T.A.t), false, "never moved out of a tenant");
+  } finally { forget2533("t2533r", kc); T.restore(); }
+});
+
+test("XERK-2533: enrollment codes belong to their owner's tenant (list + revoke)", async () => {
+  const T = tenants2533();
+  try {
+    forget2533();
+    const m = await request("POST", "/api/enroll-codes", { headers: T.A.h, body: { device: "t2533code" } });
+    assert.equal(m.status, 200);
+    const id = m.body.enrollCode.id;
+    const ids = async (h) => (await request("GET", "/api/enroll-codes", { headers: h })).body.codes.map((c) => c.id);
+    assert.ok((await ids(T.A.h)).includes(id));
+    assert.ok(!(await ids(T.B.h)).includes(id), "another tenant never lists it");
+    assert.ok(!(await ids(userHeaders)).includes(id), "nor break-glass");
+    assert.equal((await request("DELETE", `/api/enroll-codes/${id}`, { headers: T.B.h })).status, 404);
+    assert.equal(hub.enrollCodes()[id].revokedAt, undefined, "B's revoke changed nothing");
+    // An untenanted (break-glass) code is the operators', not a tenant user's.
+    const bg = await request("POST", "/api/enroll-codes", { headers: userHeaders, body: {} });
+    assert.ok(!(await ids(T.A.h)).includes(bg.body.enrollCode.id));
+    assert.equal((await request("DELETE", `/api/enroll-codes/${id}`, { headers: T.A.h })).status, 200);
+  } finally { forget2533(); T.restore(); }
+});
+
+test("XERK-2533: the identity store drops an entry whose key and tenant disagree", () => {
+  const t = "a".repeat(32), u = "b".repeat(32);
+  const out = hub.coerceAgentIdentities({
+    ["1".repeat(32)]: { origin: `x@${t}`, home: `x@${t}`, at: 1, tenantId: t },
+    ["2".repeat(32)]: { origin: `y@${t}`, home: `y@${t}`, at: 1, tenantId: u },
+    ["3".repeat(32)]: { origin: `z@${t}`, home: `z@${t}`, at: 1 },
+    ["4".repeat(32)]: { origin: "w", home: "w", at: 1, tenantId: "NOT-HEX" },
+  });
+  assert.deepEqual(Object.keys(out).sort(), ["1".repeat(32), "4".repeat(32)]);
+  assert.equal(out["1".repeat(32)].tenantId, t);
+  assert.ok(!("tenantId" in out["4".repeat(32)]));
 });
 
 // ---- XERK-2381: an agent keeps its identity across a host rename ----------

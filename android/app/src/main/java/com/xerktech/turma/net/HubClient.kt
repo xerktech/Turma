@@ -236,6 +236,11 @@ class HubClient(private val config: Config) {
     suspend fun signIn(settings: Config.Settings): SignIn = withContext(Dispatchers.IO) {
         val outcome = login(settings)
         if (outcome is LoginOutcome.Throttled) return@withContext SignIn(SignInResult.HubRefused(outcome.message))
+        // The hub itself refused the password (401). Basic checks the same
+        // break-glass credential, so retrying it there can't succeed — and the
+        // hub counts each miss toward this client's sign-in backoff (XERK-2577),
+        // so a second try would spend the user's budget twice.
+        if (outcome is LoginOutcome.Refused) return@withContext SignIn(SignInResult.BadCredentials)
         val token = (outcome as? LoginOutcome.Token)?.token
         if (token != null) {
             // The hub accepted the password, so its verdict on the session is

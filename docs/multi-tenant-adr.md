@@ -33,6 +33,19 @@ tenants, run by an admin panel.
   new, because the only principals that can exist are the bootstrap admin, break-glass, and OIDC users
   who already had full access.
 
+### A host belongs to one tenant (XERK-2533)
+
+- The tenant is recorded on the agent's IDENTITY by the hub — from the enrollment code's owner, or
+  the tenant user who rolls an untenanted host — never taken from anything the agent sends.
+- The registry key is `<device>@<tenantId>`, so two tenants can each have a "laptop"; the agent
+  keeps its plain `DEVICE_NAME` and the hub namespaces it from the credential.
+- Rejected: a separate tenant field beside a shared device-name key. Every surface already keys on
+  the host key (HA store, tunnel directory, SSE, ttyd, usage ledger), so namespacing the key isolates
+  them all at once; a field would need a check at each one, and one missed is a cross-tenant leak.
+- An untenanted host (all of today's fleet) is reachable only by the hub's operators — an admin,
+  break-glass, a pre-tenancy cookie, an open hub — never by a plain tenant user, until the
+  migration (XERK-2554) binds it. An admin who rolls such a host with their own tenant binds it there.
+
 ### Admin without a tenant: break-glass
 
 - The `TURMA_USER`/`TURMA_PASSWORD` break-glass login (XERK-595) stays, IdP-independent, and maps to

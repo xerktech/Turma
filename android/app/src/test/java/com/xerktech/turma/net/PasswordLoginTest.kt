@@ -80,10 +80,13 @@ class PasswordLoginTest {
 
     @Test fun `a refused password is bad credentials and earns no session`() = runBlocking {
         hub.json("/api/login", "{\"error\":\"invalid credentials\"}", 401)
-        hub.json("/api/agents", "{\"error\":\"unauthorized\"}", 401)
+        var basicTried = false
+        hub.route("/api/agents") { basicTried = true; MockResponse().setResponseCode(401) }
         val signIn = hub.container.client.signIn(candidate())
         assertEquals(SignInResult.BadCredentials, signIn.result)
         assertEquals("", signIn.sessionToken)
+        // XERK-2577: the hub counts every miss, so a refused password is not retried as Basic.
+        assertFalse("no Basic retry of a password the hub refused", basicTried)
     }
 
     // Break-glass fallback: a hub (or proxy) that gives no session through

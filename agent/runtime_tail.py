@@ -378,10 +378,16 @@ class ChildProjection:
         rewrite: reset and re-project from 0 (deterministic uuids reproduce the
         same entries), truncating the destination too so it does not double. Never
         raises — an unreadable source simply projects nothing this pump."""
+        # lstat, and a no-follow open below: the caller's "regular file, not a
+        # link" check is from its directory listing, so a log swapped to a link
+        # (or FIFO) since then must still be refused here, at the read.
         try:
-            size = os.path.getsize(src)
+            st = os.lstat(src)
         except OSError:
             return
+        if not stat.S_ISREG(st.st_mode):
+            return
+        size = st.st_size
         if size < self.offset:      # rewritten under us — re-project from 0
             self.offset = 0
             self.partial = b""
@@ -390,8 +396,16 @@ class ChildProjection:
                 open_fresh_for_write(self.dest, anchor=self.anchor).close()  # start over too
             except OSError:
                 pass
+        elif size == self.offset:
+            # Nothing new since the last pump: skip the open/seek/read. A tail
+            # polls every child every pump, and most children are idle or done.
+            return
         try:
-            with open(src, "rb") as fh:
+            fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                         | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+            with os.fdopen(fd, "rb") as fh:
+                if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                    return          # swapped to a FIFO/device after the lstat
                 fh.seek(self.offset)
                 data = fh.read()
         except OSError:

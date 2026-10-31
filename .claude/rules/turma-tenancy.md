@@ -5,6 +5,7 @@ paths:
   - turma/tests/tenancy.test.js
   - turma/tests/oidc-groups.test.js
   - turma/tests/oidc.test.js
+  - turma/tests/server.test.js
   - turma/public/login.html
 description: Hub users + tenants (XERK-2530, epic XERK-2529) — the principal every route keys on, and the invariants a tenancy change must keep.
 ---
@@ -88,6 +89,22 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
     CF-Connecting-IP into a fresh key per request (fresh backoff, queue places). Set it in prod.
 - `parseHash` refuses a stored cost past `SCRYPT_MAXMEM`: a hand-edited store must not OOM a login.
 - **`/api/login` checks break-glass FIRST, scrypt-free**, so a flood cannot lock break-glass out.
+- Break-glass guesses share XERK-2568's per-(client, username) backoff (XERK-2577), via
+  `breakGlassAttempt`, for `/api/login` AND Basic — one budget, so neither channel is a free oracle.
+  - Backoff is checked BEFORE the compare: a backed-off client gets 429 (Basic: 401) even when the
+    password is right. Accepted cost: an operator who mistypes it 5 times waits.
+  - The miss is recorded synchronously, before any await — a concurrent burst cannot outrun it.
+  - Basic caches its verdict per `req` (`basicVerdicts`): routes ask more than once per request.
+  - Basic counts only a guess at the break-glass NAME: Android sends a local user's correct password
+    as Basic too, and counting it would back that user's own form sign-in off.
+  - `/api/login` refuses a break-glass-name attempt in `localLogin`'s order (backoff 429, then this
+    client already in flight 503) BEFORE the compare: a busy refusal neither evaluates nor counts it,
+    so the response pattern never reveals which name is break-glass.
+  - Android never retries a password `/api/login` refused (401) as Basic — one miss, not two.
+  - Residual (XERK-2568's key-trust model): a caller bypassing Cloudflare rotates CF-Connecting-IP
+    for a fresh budget per request — scrypt-free break-glass makes that a real bypass (XERK-2585).
+  - A `/api/login` break-glass miss still runs the local scrypt check (shared name, no timing tell
+    for which name is break-glass), passed `counted` so it is not recorded twice.
 - An unknown username verifies against a dummy hash (same cost, no timing oracle); every failure is
   the same 401 `invalid credentials` (no enumeration of disabled/role-less users).
 - Basic auth is break-glass ONLY — never check a local password per request.
@@ -107,11 +124,47 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   it there admitted nobody). Boot ERRORs when no break-glass and no usable local account remain.
   Never reuse `TURMA_USER` for it (break-glass has no tenant by design).
 
+## Hosts belong to tenants (XERK-2533)
+
+- **The tenant is a property of the agent IDENTITY**, set only by the hub: `consumeEnrollCode`
+  mints into the code owner's tenant; a tenant user's `roll-token` on an UNTENANTED host binds it
+  (`bindIdentityTenant`, reply `tenantBound:true`). A bound identity never moves tenant.
+- **Registry key = `<device>@<32-hex tenantId>`** (`TENANT_KEY_RE`, `tenantHostKey`); untenanted keys
+  stay plain. Full id on purpose: a shortened one could collide and share a host across tenants.
+  - No plain name may END in that shape (`hostAgentToken`/`hostKeyUsable` refuse it), or an
+    untenanted host could equal a tenant key. Clients display `device`, the plain name.
+  - Everything keyed by host (HA store, tunnel directory, SSE, ttyd routing, usage ledger) is
+    namespaced by the key with no change of its own.
+  - The first beat of a just-bound identity is a TENANT BIND, not a rename: `uidHostRefusal` lets
+    `<home>` move to `<home>@<t>` even while the old record is live, and the record is carried over.
+- **`principalMayDriveHost(p, key)` gates every operator `/api/agents/<host>/…` route** (404, never
+  403): a tenant host only for a `user` principal of that tenant (no admin role, no break-glass); an
+  untenanted host only for the hub's operators (admin role, break-glass, legacy cookie, open hub),
+  never a plain tenant user — until the migration (XERK-2554) binds it.
+  - Listing/SSE/terminal scoping is XERK-2534's; this gate covers the per-host command routes.
+  - **A route that takes its host from the BODY runs the same check**: `/api/trigger` (the shared
+    `TURMA_TRIGGER_TOKEN` proves no tenant, so it reaches untenanted hosts only) and
+    `POST /api/archive/<tid>/restore`'s target. A new body-host route must too (QA found both).
+- **Enrollment codes are their tenant's** (`enrollCodeVisible`): list + revoke see only codes minting
+  into the caller's tenant; an untenanted code is the operators', like an untenanted host.
+- **The bind roll's `setToken` crosses the bind** (hub-only `bindTenant`): delivered on the old plain
+  key or the new one, so the agent restarts. The bind beat also closes the plain-named tunnel, so it
+  re-dials onto the namespaced key (left open, terminals read offline). That close is replica-local,
+  which holds because the HA leader serves beats AND tunnels (XERK-919); under active-active it would
+  need the control bus.
+- **A tenant host's queued command carries `tenant`** (hub-only, an `INTERNAL_COMMAND_FIELDS` member)
+  and is dropped at delivery unless it matches the key's tenant — a command queued before a bind is
+  never run inside the tenant. Untenanted hosts' commands carry no stamp (byte-identical).
+- `coerceAgentIdentities` drops an entry whose home is a tenant key with a missing/different tenant.
+
 ## Tests
 
+- The `XERK-2533:` cases in `server.test.js` (cross-tenant beat/tunnel/route/enroll/migrate forges,
+  the roll bind, the identity coerce).
 - `turma/tests/tenancy.test.js` (own process, break-glass set); `tenancy-nopassword.test.js` (own
   process, bootstrap admin ONLY — the forgery / empty-Basic / dummy-hash / mid-verify-disable guards);
   `XERK-2530:` in `oidc-groups.test.js` and `server.test.js` (an OIDC user leaves an open hub open).
 - Fair sign-in: the `XERK-2568:` cases in `tenancy-nopassword.test.js`.
+- Break-glass throttle: the `XERK-2577:` cases in `tenancy.test.js`.
 - Android signs in through `POST /api/login` and rides `hub_session` (XERK-2569), so local accounts
   work there too; Basic stays its break-glass fallback (`android/PARITY.md`).
