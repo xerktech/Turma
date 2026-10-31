@@ -13691,6 +13691,11 @@ test("XERK-2545: a builder a host took is not re-dispatched to another host whil
   // Silent past the orphan bound: the claim is given up.
   assert.equal(epicBuilderClaimLapsed(id, epicBuilders[id],
     epicBuilders[id].dispatchedAt + EPIC_BUILDER_ORPHAN_MS + 1), true);
+  // Acked (command gone) but silent since: it may be running the builder — held.
+  agents[first].commands = [];
+  agents[first].lastSeen = epicBuilders[id].dispatchedAt + 1;
+  assert.equal(epicBuilderClaimLapsed(id, epicBuilders[id], now), false,
+    "an offline host that acked keeps the run until the orphan bound");
   // Acked (command gone) and beating since, with no report: acked-no-session, released.
   agents[first].commands = [];
   agents[first].lastSeen = now;

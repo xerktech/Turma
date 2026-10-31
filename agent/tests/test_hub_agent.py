@@ -56331,11 +56331,14 @@ class TestOneshotShutdownAndTmpWrites(ManagerMixin, unittest.TestCase):
             proc = real_popen(*a, **kw)
             killer["proc"] = proc
             return proc
+        started = time.monotonic()
         with mock.patch.object(ha.subprocess, "Popen", slow_popen):
             out = sm._run_lockdown_oneshot(["sleep", "60"], "meeting-", 60, 100, "t")
         killer["t"].join(5)
         self.assertIsNone(out)
-        self.assertIsNotNone(killer["proc"].wait(timeout=5), "the just-forked child was killed")
+        self.assertLess(time.monotonic() - started, 20, "the run ended with its killed child")
+        self.assertEqual(killer["proc"].wait(timeout=5), -ha.signal.SIGKILL,
+                         "the just-forked child was SIGKILLed, not left to finish")
         # Once closing, no new one-shot starts at all.
         self.assertIsNone(sm._run_lockdown_oneshot(["echo", "x"], "meeting-", 10, 100, "t"))
 
