@@ -51,8 +51,9 @@ tenants, run by an admin panel.
 - A ledger row (usage, permission prompt, outcome) carries its tenant as the registry key of the
   host that produced it, `<device>@<tenantId>`. No separate `tenantId` column: the key is set by the
   hub from the credential and never moves tenant, so a second field could only disagree with it.
-- **No aggregate spans two tenants — none.** Every served view reads one scope (a tenant user its
-  own tenant's hosts; the hub's operators the untenanted ones — `principalMayDriveHost`), and every
+- **No aggregate spans two tenants — none.** Every served view reads ONE scope: a tenant user its
+  own tenant's hosts (also when it holds the admin role — its admin role adds no data); a
+  tenant-less operator (break-glass, admin-only) the untenanted ones. And every
   hub decision computed from ledgers is computed per tenant:
   - the routing policy (XERK-1848): promotions, the tripwire's Opus baseline, shadow pairs and the
     shadow daily cap are each one tenant's. A shadow re-runs a ticket only on a host of its tenant.

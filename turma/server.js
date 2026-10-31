@@ -1306,17 +1306,27 @@ function principalTenant(p) {
 // ---- the ledger scope (XERK-2550) -------------------------------------------
 // Every ledger row (usage, permission, outcome) is keyed by the registry key of
 // the host that produced it, and a tenant host's key carries its tenant, so a
-// row's tenant is read off its key. A principal reads exactly the rows of the
-// hosts it may drive (principalMayDriveHost): a tenant user its own tenant's,
-// the hub's operators the untenanted ones. No aggregate spans two tenants
-// (docs/multi-tenant-adr.md "Usage and ledgers"): the routing policy, its
-// shadow evidence and the subscription pause are each computed per tenant.
+// row's tenant is read off its key. A principal reads exactly ONE scope: a
+// tenant user its own tenant (even with the admin role too — an admin's own
+// data comes via its user role, and mixing the untenanted fleet in would be an
+// aggregate over two scopes); a principal with no tenant that may drive the
+// untenanted hosts (break-glass, admin-only, legacy, open) the untenanted
+// fleet; anyone else nothing. No aggregate spans two tenants
+// (docs/multi-tenant-adr.md "Usage, ledgers and insights"): the routing policy,
+// its shadow evidence and the subscription pause are each computed per tenant.
+function ledgerTenantOf(p) {
+  const t = principalTenant(p);
+  if (t) return t;
+  return principalMayDriveHost(p, "x") ? "" : null;   // null = no scope at all
+}
 function ledgerVisible(p) {
-  return (key) => principalMayDriveHost(p, key);
+  const t = ledgerTenantOf(p);
+  return t === null ? () => false : tenantScope(t);
 }
 // One string per distinct scope, for the per-scope parts of the fleet payload.
 function ledgerScopeKey(p) {
-  return `${principalTenant(p)}|${principalMayDriveHost(p, "x") ? 1 : 0}`;
+  const t = ledgerTenantOf(p);
+  return t === null ? "none" : `t:${t}`;
 }
 // The rows of ONE tenant ("" = the untenanted fleet): what the routing sweep
 // and /metrics read.
@@ -6371,7 +6381,10 @@ function modelPolicySweepTenant(t, now) {
         const pct = (x) => `${Math.round(x * 100)}%`;
         console.log(`model policy: demoted ${model} for ${cls} work (${live.bad}/${live.n} bad`
           + ` vs Opus ${pct(baseline)})`);
-        notify(`${cls} work moved back to Opus`,
+        // A tenant's demotion is not pushed until push is tenant-routed
+        // (XERK-2551): notify() fans out to every registered device, which would
+        // hand one tenant's figures to every other tenant's phones.
+        if (!t) notify(`${cls} work moved back to Opus`,
           `${model} had ${live.bad} bad of ${live.n} since its promotion, worse than Opus's`
           + ` ${pct(baseline)} for ${cls} work. It stays on Opus until new shadow runs earn it back.`,
           { tags: "warning", notifKey: `model-demoted:${key}`, tenant: t });
@@ -7447,12 +7460,12 @@ function agentsPayloadFor(p) {
   const cached = agentsCache || safeAgentsCache();
   if (!cached || typeof cached.shared !== "string") return cached;   // the degraded body
   const sk = ledgerScopeKey(p);
-  if (sk === "|1") return cached;                                      // the operators' tail
+  if (sk === "t:") return cached;                                      // the operators' tail
   // Only the TAIL is kept per scope, never a whole body: the shared part is the
   // whole fleet, and a copy per scope would multiply the payload's footprint.
   let v = cached.scoped.get(sk);
   if (!v) {
-    const tail = agentsScopeTail(ledgerVisible(p), principalTenant(p), cached.liveKeys, cached.now);
+    const tail = agentsScopeTail(ledgerVisible(p), ledgerTenantOf(p), cached.liveKeys, cached.now);
     const etag = '"' + crypto.createHash("sha1").update(cached.etag).update(tail).digest("base64") + '"';
     v = { tail, etag };
     if (cached.scopedBytes + tail.length > AGENTS_SCOPED_TAILS_MAX_BYTES) {
@@ -7722,6 +7735,9 @@ function makeSseBus(store, replicaId, deliverLocal) {
     // but the bus is shared infrastructure, so never trust the shape.
     if (!msg || typeof msg !== "object" || msg.origin === replicaId) return;
     if (typeof msg.event !== "string") return;
+    // A scope that is present but not a string is malformed: drop the frame
+    // rather than deliver a scoped frame to every client.
+    if ("policyTenant" in msg && typeof msg.policyTenant !== "string") return;
     deliverLocal(msg.event, msg.data,
       typeof msg.policyTenant === "string" ? { policyTenant: msg.policyTenant } : undefined);
   });

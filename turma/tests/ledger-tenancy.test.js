@@ -91,6 +91,10 @@ test("XERK-2550: no case twin or rename folds one tenant's spend into another's 
     assert.notEqual(foldKey(`l1@${TA}`), foldKey(`l2@${TB}`));
     const card = usage.fold(`desk@${TA}`, beat("desk", 1), NOW, new Set([`desk@${TA}`]));
     assert.equal(card ? tokens(card) : 1, 1);
+    // The groups themselves never join two tenants: aliasing the untenanted
+    // `desk` to a smaller untenanted name must leave the tenant key's root alone.
+    setHostAliases([["desk", `desk@${TA}`], ["desk", "dask"]]);
+    assert.equal(foldKey(`desk@${TA}`), `${TA}\u0000desk@${TA}`);
     // Same-tenant renames still fold.
     setHostAliases([[`old@${TA}`, `new@${TA}`]]);
     assert.equal(foldKey(`old@${TA}`), foldKey(`new@${TA}`));
@@ -161,7 +165,16 @@ test("XERK-2550: a permission purge drops the tenant's hosts and deletes them in
   const store = new perms.PermissionLedgerPgStore(pool);
   store._schemaReady = true;
   store._queue.push([`a@${TA}`, "9", "1", "1", "{}"], [`b@${TB}`, "9", "1", "1", "{}"]);
-  await store.onPurgeTenant(TA);
+  // A batch already in flight must land BEFORE the DELETE (QA: it landed after).
+  let release;
+  store._draining = new Promise((r) => { release = r; }).then(() => { queries.push(["INSERT in-flight", []]); });
+  const purge = store.onPurgeTenant(TA);
+  await new Promise((r) => setImmediate(r));
+  assert.ok(!queries.some(([sql]) => /^DELETE/.test(sql)), "waits for the in-flight batch");
+  store._queue.unshift([`a@${TA}`, "8", "1", "1", "{}"]);   // a failed batch put back
+  release();
+  await purge;
+  assert.ok(queries.findIndex(([sql]) => /^INSERT/.test(sql)) < queries.findIndex(([sql]) => /^DELETE/.test(sql)));
   assert.deepEqual(store._queue.map((v) => v[0]), [`b@${TB}`]);
   const del = queries.find(([sql]) => /^DELETE/.test(sql));
   assert.ok(del && /right\(host, 33\) = \$1/.test(del[0]));

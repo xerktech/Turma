@@ -28615,8 +28615,9 @@ const retiredBeat2550 = (device, n) => {
 
 test("XERK-2550: /api/agents serves each principal its own retired usage and routing policy", async () => {
   const T = tenants2533();
-  const keys = [`ret2550@${T.A.t}`, `ret2550@${T.B.t}`, "ret2550ops"];
+  const keys = [`ret2550@${T.A.t}`, `ret2550@${T.B.t}`, "ret2550ops", `ret2550@${T.C.t}`];
   try {
+    hub.usageLedger.ingest(keys[3], retiredBeat2550("ret2550", 44));
     hub.usageLedger.ingest(keys[0], retiredBeat2550("ret2550", 11));
     hub.usageLedger.ingest(keys[1], retiredBeat2550("ret2550", 22));
     hub.usageLedger.ingest(keys[2], retiredBeat2550("ret2550ops", 33));
@@ -28629,6 +28630,11 @@ test("XERK-2550: /api/agents serves each principal its own retired usage and rou
     assert.deepEqual(mine(a), [keys[0]]);
     assert.deepEqual(mine(b), [keys[1]]);
     assert.deepEqual(mine(ops), [keys[2]]);
+    // A tenant user who is ALSO an admin reads its own tenant alone — never its
+    // tenant mixed with the untenanted fleet it may drive (QA, XERK-2550).
+    const c = await request("GET", "/api/agents", { headers: T.C.h });
+    assert.deepEqual(mine(c), [keys[3]]);
+    assert.deepEqual(c.body.modelPolicy.promoted, {});
     assert.deepEqual(a.body.modelPolicy.promoted, { bug: "sonnet" });
     assert.deepEqual(b.body.modelPolicy.promoted, {});
     assert.deepEqual(ops.body.modelPolicy.promoted, {});
@@ -28658,6 +28664,7 @@ test("XERK-2550: /api/permissions and /api/model-quality read only the caller's 
     hub.permissionLedger.ingest(`p2550@${T.A.t}`, [row("1")], now);
     hub.permissionLedger.ingest(`p2550@${T.B.t}`, [row("1"), row("2")], now);
     hub.permissionLedger.ingest("p2550ops", [row("1"), row("2"), row("3")], now);
+    hub.permissionLedger.ingest(`p2550@${T.C.t}`, [row("1"), row("2"), row("3"), row("4")], now);
     const count = async (h) => {
       const r = await request("GET", "/api/permissions", { headers: h });
       return r.body.top.length ? r.body.top[0].count : 0;
@@ -28665,6 +28672,7 @@ test("XERK-2550: /api/permissions and /api/model-quality read only the caller's 
     assert.equal(await count(T.A.h), 1);
     assert.equal(await count(T.B.h), 2);
     assert.equal(await count(userHeaders), 3);
+    assert.equal(await count(T.C.h), 4, "admin + user: its tenant only, never 3 + 4");
     const rows = hub.outcomeLedger._internals.rows();
     for (const [host, n] of [[`q2550@${T.A.t}`, 1], [`q2550@${T.B.t}`, 2], ["q2550ops", 4]]) {
       for (let i = 0; i < n; i++) {
@@ -28733,6 +28741,39 @@ test("XERK-2550: the routing policy promotes and routes per tenant, never on ano
       ["xyz:bug/sonnet"]: { state: "promoted", at: 1 } });
     assert.deepEqual(Object.keys(hub.__modelPolicyState()), [`${TA}:bug/sonnet`]);
   } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
+});
+
+test("XERK-2550: a tenant's demotion is never pushed to the fleet's devices", () => {
+  const TA = "a".repeat(32);
+  resetPolicy();
+  hub.__setModelPolicy("on");
+  const before = notifications.length;
+  try {
+    const at = Date.now() - 120000;
+    hub.__setModelPolicyState({ [`${TA}:bug/sonnet`]: { state: "promoted", at } });
+    const rows = hub.outcomeLedger._internals.rows();
+    for (let i = 0; i < 3; i++) {
+      const r = hub.outcomeLedger.sanitizeRow({ site: "s", issue: `D-${i}`, host: `d2550@${TA}`,
+        sid: `d${i}`, cls: "bug", model: "sonnet", firstSeen: at + 5, updatedAt: at + 5, startedAt: at + 5,
+        prs: [{ url: `https://github.com/x/y/pull/55${i}`, state: "CLOSED", mergedAt: at + 5 }] });
+      rows.set(r.key, r);
+    }
+    hub.modelPolicySweep();
+    assert.equal(hub.__modelPolicyState()[`${TA}:bug/sonnet`].state, "demoted");
+    assert.ok(!notifications.slice(before).some((x) => x.data && /model-demoted/.test(x.data.notifKey || "")),
+      "no push until push is tenant-routed (XERK-2551)");
+  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
+});
+
+test("XERK-2550: a bus frame with a malformed scope is dropped, never delivered unscoped", () => {
+  const handlers = [];
+  const store = { subscribe(_c, fn) { handlers.push(fn); }, publish() { return Promise.resolve(); } };
+  const got = [];
+  hub.makeSseBus(store, "me", (e, d, s) => got.push([e, s]));
+  handlers[0]({ origin: "peer", event: "modelPolicy", data: {}, policyTenant: 5 });
+  handlers[0]({ origin: "peer", event: "modelPolicy", data: {}, policyTenant: "" });
+  handlers[0]({ origin: "peer", event: "agent", data: {} });
+  assert.deepEqual(got, [["modelPolicy", { policyTenant: "" }], ["agent", undefined]]);
 });
 
 test("XERK-2550: a routing-policy frame reaches only clients reading that tenant's policy", () => {

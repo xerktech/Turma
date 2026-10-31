@@ -970,9 +970,15 @@ class PermissionLedgerPgStore {
   // the hot model, and the next purge call (the admin retries) removes them.
   onPurgeTenant(tenantId) {
     const suffix = `@${tenantId}`;
-    this._queue = this._queue.filter((vals) => !String(vals[0]).endsWith(suffix));
+    const drop = () => { this._queue = this._queue.filter((vals) => !String(vals[0]).endsWith(suffix)); };
+    drop();
     return (async () => {
       try {
+        // A batch already pulled off the queue may still be INSERTing: wait it
+        // out, or it lands AFTER the DELETE and the rows outlive the purge. A
+        // failed batch is put back on the queue, so drop the tenant's rows again.
+        if (this._draining) await this._draining.catch(() => {});
+        drop();
         await this._ensureSchema();
         await this.pool.query(`DELETE FROM ${this.table} WHERE right(host, 33) = $1`, [suffix]);
       } catch (e) {
