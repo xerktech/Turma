@@ -5,6 +5,7 @@ paths:
   - turma/tests/tenancy.test.js
   - turma/tests/oidc-groups.test.js
   - turma/tests/oidc.test.js
+  - turma/tests/server.test.js
   - turma/public/login.html
 description: Hub users + tenants (XERK-2530, epic XERK-2529) — the principal every route keys on, and the invariants a tenancy change must keep.
 ---
@@ -91,8 +92,43 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   it there admitted nobody). Boot ERRORs when no break-glass and no usable local account remain.
   Never reuse `TURMA_USER` for it (break-glass has no tenant by design).
 
+## Hosts belong to tenants (XERK-2533)
+
+- **The tenant is a property of the agent IDENTITY**, set only by the hub: `consumeEnrollCode`
+  mints into the code owner's tenant; a tenant user's `roll-token` on an UNTENANTED host binds it
+  (`bindIdentityTenant`, reply `tenantBound:true`). A bound identity never moves tenant.
+- **Registry key = `<device>@<32-hex tenantId>`** (`TENANT_KEY_RE`, `tenantHostKey`); untenanted keys
+  stay plain. Full id on purpose: a shortened one could collide and share a host across tenants.
+  - No plain name may END in that shape (`hostAgentToken`/`hostKeyUsable` refuse it), or an
+    untenanted host could equal a tenant key. Clients display `device`, the plain name.
+  - Everything keyed by host (HA store, tunnel directory, SSE, ttyd routing, usage ledger) is
+    namespaced by the key with no change of its own.
+  - The first beat of a just-bound identity is a TENANT BIND, not a rename: `uidHostRefusal` lets
+    `<home>` move to `<home>@<t>` even while the old record is live, and the record is carried over.
+- **`principalMayDriveHost(p, key)` gates every operator `/api/agents/<host>/…` route** (404, never
+  403): a tenant host only for a `user` principal of that tenant (no admin role, no break-glass); an
+  untenanted host only for the hub's operators (admin role, break-glass, legacy cookie, open hub),
+  never a plain tenant user — until the migration (XERK-2554) binds it.
+  - Listing/SSE/terminal scoping is XERK-2534's; this gate covers the per-host command routes.
+  - **A route that takes its host from the BODY runs the same check**: `/api/trigger` (the shared
+    `TURMA_TRIGGER_TOKEN` proves no tenant, so it reaches untenanted hosts only) and
+    `POST /api/archive/<tid>/restore`'s target. A new body-host route must too (QA found both).
+- **Enrollment codes are their tenant's** (`enrollCodeVisible`): list + revoke see only codes minting
+  into the caller's tenant; an untenanted code is the operators', like an untenanted host.
+- **The bind roll's `setToken` crosses the bind** (hub-only `bindTenant`): delivered on the old plain
+  key or the new one, so the agent restarts. The bind beat also closes the plain-named tunnel, so it
+  re-dials onto the namespaced key (left open, terminals read offline). That close is replica-local,
+  which holds because the HA leader serves beats AND tunnels (XERK-919); under active-active it would
+  need the control bus.
+- **A tenant host's queued command carries `tenant`** (hub-only, an `INTERNAL_COMMAND_FIELDS` member)
+  and is dropped at delivery unless it matches the key's tenant — a command queued before a bind is
+  never run inside the tenant. Untenanted hosts' commands carry no stamp (byte-identical).
+- `coerceAgentIdentities` drops an entry whose home is a tenant key with a missing/different tenant.
+
 ## Tests
 
+- The `XERK-2533:` cases in `server.test.js` (cross-tenant beat/tunnel/route/enroll/migrate forges,
+  the roll bind, the identity coerce).
 - `turma/tests/tenancy.test.js` (own process, break-glass set); `tenancy-nopassword.test.js` (own
   process, bootstrap admin ONLY — the forgery / empty-Basic / dummy-hash / mid-verify-disable guards);
   `XERK-2530:` in `oidc-groups.test.js` and `server.test.js` (an OIDC user leaves an open hub open).

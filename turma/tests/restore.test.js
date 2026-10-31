@@ -165,6 +165,18 @@ function beat(device, { repos = ["Widget"], sessions = [] } = {}) {
 
 test.before(() => { seedArchive(); });
 
+test("XERK-2533: restore never targets a host the caller may not drive (another tenant's)", async () => {
+  const key = `k8x@${"c".repeat(32)}`;
+  agents[key] = { device: "k8x", lastSeen: Date.now(), repos: [{ name: "Widget" }], sessions: [] };
+  try {
+    // Break-glass has no tenant, so a tenant's host is unknown to it.
+    const r = await request("POST", `/api/archive/${TID}/restore`, { headers: userHeaders, body: { host: key } });
+    assert.equal(r.status, 404, JSON.stringify(r.body));
+    assert.equal(r.body.error, "unknown target host");
+    assert.ok(!(agents[key].commands || []).length);
+  } finally { delete agents[key]; }
+});
+
 test("restore: an archived session is packed and imported onto a live host", async () => {
   await beat("k8x");
   const r = await request("POST", `/api/archive/${TID}/restore`,
