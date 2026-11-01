@@ -67,12 +67,12 @@ class DailyBriefTest {
 
     @Test fun `when labels read against the phone's own clock`() {
         val now = at(2026, 10, 29, 8, 0)
-        assertEquals("Today 9:30 AM", briefWhenLabel(at(2026, 10, 29, 9, 30), now, ny, Locale.US))
-        assertEquals("Tomorrow 9:30 AM", briefWhenLabel(at(2026, 10, 30, 9, 30), now, ny, Locale.US))
-        assertEquals("Yesterday 9:30 AM", briefWhenLabel(at(2026, 10, 28, 9, 30), now, ny, Locale.US))
-        assertEquals("Mon 2 Nov, 9:30 AM", briefWhenLabel(at(2026, 11, 2, 9, 30), now, ny, Locale.US))
+        assertEquals(usClock("Today 9:30 AM"), briefWhenLabel(at(2026, 10, 29, 9, 30), now, ny, Locale.US))
+        assertEquals(usClock("Tomorrow 9:30 AM"), briefWhenLabel(at(2026, 10, 30, 9, 30), now, ny, Locale.US))
+        assertEquals(usClock("Yesterday 9:30 AM"), briefWhenLabel(at(2026, 10, 28, 9, 30), now, ny, Locale.US))
+        assertEquals(usClock("Mon 2 Nov, 9:30 AM"), briefWhenLabel(at(2026, 11, 2, 9, 30), now, ny, Locale.US))
         // Same instant, a phone in London.
-        assertEquals("Today 1:30 PM",
+        assertEquals(usClock("Today 1:30 PM"),
             briefWhenLabel(at(2026, 10, 29, 9, 30), now, ZoneId.of("Europe/London"), Locale.US))
     }
 
