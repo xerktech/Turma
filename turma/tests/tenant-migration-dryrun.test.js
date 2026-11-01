@@ -32,6 +32,9 @@ test("XERK-2554: a dry run moves nothing, creates no owner and closes no route",
   hub.registerDevice("fcm-dry", "android", [], "");
   hub.tenantOrgStores().find((s) => s.name === "autoStartOrgs").read()["acme.atlassian.net"] = true;
   assert.equal(hub.tenantMigrationGateClosed(), false);
+  // A host still in the registry (every real upgrade): its rows move at its bind
+  // beat, and the warning must count them now (QA).
+  hub.agents.oldhost = { device: "oldhost", lastSeen: Date.now(), sessions: [] };
   const list = [{ uuid: "u1", role: "user", ts: "2026-10-01T00:00:00Z", text: "hello there" }];
   archive.ingestChunk("oldhost", "td2554", { repo: "app", remoteKey: "github.com/x/app", worktree: "/w",
     slug: "s", createdAt: "2026-10-01T00:00:00Z", endedTs: "2026-10-01T00:00:00Z", summary: "s" },

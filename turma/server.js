@@ -8063,7 +8063,9 @@ async function runTenantMigration() {
     // row's files to its host's tenant), so an archive past it would refuse the
     // owner's new transcripts from the first push. Say so before anything moves.
     if (!tenantMigrationMarker.completedAt && archive.ARCHIVE_TENANT_MAX > 0) {
-      const bytes = archiveRowsToMove(null).reduce((n, r) => n + (r.bytes || 0), 0) +
+      // Every untenanted row: a live host's move at its bind beat, not now, but
+      // they move all the same (QA: counting only today's movable rows read 0).
+      const bytes = archive.listRowOwners().filter((r) => plainKey(r.host)).reduce((n, r) => n + (r.bytes || 0), 0) +
         archive.tenantBytes(owned.user.tenantId);
       if (bytes >= archive.ARCHIVE_TENANT_MAX) {
         console.warn(`WARNING: tenant migration: the owner's archive will hold ${bytes} bytes, over its ` +
