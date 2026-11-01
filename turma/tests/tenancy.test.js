@@ -7,6 +7,8 @@
 
 const path = require("path");
 const http = require("http");
+const net = require("net");
+const crypto = require("crypto");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { mkdtemp, scratchDir } = require("./tmpdirs");
@@ -17,21 +19,28 @@ process.env.TURMA_PASSWORD = "glass-pass";
 process.env.TURMA_AGENT_TOKEN = "agenttok";
 process.env.TURMA_BOOTSTRAP_ADMIN_USER = "firstadmin";
 process.env.TURMA_BOOTSTRAP_ADMIN_PASSWORD = "first-admin-pass";
+process.env.TURMA_MEETINGS_TOKEN = "meetingstok"; // XERK-2556: Tenir's route, per-tenant tokens
 
 const tmp = (name) => path.join(scratchDir(), `turma-tenancy-${name}-${process.pid}.json`);
-for (const [k, n] of [
-  ["STATE_FILE", "state"], ["DEVICES_FILE", "devices"], ["TICKET_AGENTS_FILE", "ticket-agents"],
-  ["AGENT_IDENTITIES_FILE", "agent-identities"], ["TENANCY_FILE", "tenancy"],
-  ["AUTOSTART_ORGS_FILE", "autostart-orgs"], ["TICKET_MODELS_FILE", "ticket-models"],
-  ["TICKET_RUNTIMES_FILE", "ticket-runtimes"], ["ORG_COLORS_FILE", "org-colors"],
-  ["TRIAGE_POLICIES_FILE", "triage-policies"], ["TRIAGE_ACTIONS_FILE", "triage-actions"],
-  ["USAGE_LEDGER_FILE", "usage-ledger"],
-]) process.env[k] = tmp(n);
+// Every durable store the hub opens gets a scratch file: an unset one writes the
+// host's real /data (XERK-2556 found most of them unset here).
+for (const k of [
+  "STATE_FILE", "DEVICES_FILE", "TICKET_AGENTS_FILE", "AGENT_IDENTITIES_FILE", "TENANCY_FILE",
+  "AUTOSTART_ORGS_FILE", "TICKET_MODELS_FILE", "TICKET_RUNTIMES_FILE", "ORG_COLORS_FILE",
+  "TRIAGE_POLICIES_FILE", "TRIAGE_ACTIONS_FILE", "USAGE_LEDGER_FILE", "ADMIN_AUDIT_FILE",
+  "ARCHIVE_PURGED_TENANTS_FILE", "AUTOMERGE_ORGS_FILE", "DAILY_BRIEFS_FILE",
+  "DAILY_BRIEF_SCHEDULES_FILE", "DECISIONS_FILE", "DEDUPE_LINK_ORGS_FILE", "ENROLL_CODES_FILE",
+  "EPIC_BUILDERS_FILE", "EPIC_RUNS_FILE", "MEETING_PROPOSALS_FILE", "MEETING_TOKENS_FILE",
+  "MODEL_POLICY_FILE", "NAME_TOKEN_GENS_FILE", "PERMISSION_POLICIES_FILE",
+  "PRIORITY_WRITEBACK_ORGS_FILE", "REPO_TIERS_FILE", "TENANT_MIGRATION_FILE",
+  "TICKET_PLATFORMS_FILE",
+]) process.env[k] = tmp(k.toLowerCase().replace(/_file$/, "").replace(/_/g, "-"));
 process.env.MIGRATE_SPOOL_DIR = mkdtemp("turma-tenancy-migrations-");
 process.env.ARCHIVE_DIR = mkdtemp("turma-tenancy-archive-");
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
 
 const tenancy = require("../tenancy.js");
+const archive = require("../archive.js");
 const hub = require("../server.js");
 const { server } = hub;
 
@@ -437,4 +446,511 @@ test("XERK-2553: admin-only means an admin with no workspace AND no host to driv
   assert.equal((await me(cookieFor(root, ["admin"]))).adminOnly, false);
   // An open hub's principal is never admin-only (no account to switch to).
   assert.equal(hub.meView({ kind: "open", userId: null, tenantId: null, roles: ["user", "admin"] }).adminOnly, false);
+});
+
+// ---- XERK-2556: cross-tenant isolation, every surface, one fleet ---------------
+//
+// One hub, two tenants (A, B), an admin-only user (C: admin role, no tenant) and
+// break-glass, with REAL agent payloads for a host in each tenant plus one
+// untenanted host. The fixture collides on purpose: all three hosts are named
+// "laptop", both tenants report the same Jira site, the same session id and the
+// same transcript id. Each tenant's data carries a canary string; no response a
+// principal gets may contain another tenant's canary, tenant id or host key.
+
+const SITE = "iso2556.atlassian.net";
+const rand = () => crypto.randomBytes(6).toString("hex");
+const CANARY = { A: `canaryA${rand()}`, B: `canaryB${rand()}`, U: `canaryU${rand()}` };
+
+let iso = null;
+async function isoFleet() {
+  if (iso) return iso;
+  const mk = async (name, groups) => {
+    const pw = `${name}-pass-2556`;
+    const user = await addLocalUser(name, pw, groups);
+    const res = await login(name, pw);
+    assert.equal(res.status, 200, res.raw);
+    return { user, t: user.tenantId, h: { cookie: `hub_session=${sessionOf(res)}` } };
+  };
+  const A = await mk("iso2556a", ["turma-users"]);
+  const B = await mk("iso2556b", ["turma-users"]);
+  const C = await mk("iso2556c", ["turma-admins"]);
+  const G = { h: { cookie: `hub_session=${hub.issueSessionToken(600_000, { bg: 1, r: ["admin"] })}` } };
+  // The untenanted "laptop" beats first, on the fleet master (an operators' host).
+  const beatAs = (bearer, device, body) => request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${bearer}` }, body: { device, ...body } });
+  const payload = (tag, canary) => ({
+    jira: { configured: true, available: true, siteKey: SITE,
+      tickets: [{ key: "ISO-1", summary: `${canary} ticket`, status: "To Do", statusCategory: "new" }] },
+    repos: [{ name: "shared-repo" }, { name: `repo-${tag}-${canary}` }],
+    sessions: [
+      { id: "s-same", status: "running", repo: "shared-repo", transcriptId: "t-same",
+        rcName: `rc-${canary}`, label: `${canary} label`, ttydPort: 7700 },
+      { id: `s-${tag}-only`, status: "running", repo: "shared-repo", transcriptId: `t-${tag}-only`,
+        rcName: `rc2-${canary}`, ttydPort: 7701 },
+    ],
+  });
+  assert.equal((await beatAs("agenttok", "laptop", payload("u", CANARY.U))).status, 200);
+  const enroll = async (who) => {
+    const m = await request("POST", "/api/enroll-codes", { headers: who.h, body: {} });
+    assert.equal(m.status, 200, m.raw);
+    const r = await request("POST", "/api/agent/enroll", { body: { code: JSON.parse(m.raw).code, device: "laptop" } });
+    assert.equal(r.status, 200, r.raw);
+    return JSON.parse(r.raw).token;
+  };
+  A.tok = await enroll(A);
+  B.tok = await enroll(B);
+  A.key = `laptop@${A.t}`; B.key = `laptop@${B.t}`;
+  A.site = `${SITE}@${A.t}`; B.site = `${SITE}@${B.t}`;
+  A.canary = CANARY.A; B.canary = CANARY.B;
+  for (const [who, tag] of [[A, "a"], [B, "b"]]) {
+    const r = await beatAs(who.tok, "laptop", payload(tag, who.canary));
+    assert.equal(r.status, 200, r.raw);
+    who.reply = JSON.parse(r.raw);
+    who.beat = (extra = {}) => beatAs(who.tok, "laptop", { ...payload(tag, who.canary), ...extra });
+    who.tag = tag;
+  }
+  iso = { A, B, C, G, beatAs };
+  return iso;
+}
+// Everything that names a tenant: its id, its host key, its org key, its canary.
+const marks = (who) => [who.t, who.canary];
+function assertNoneOf(text, whos, what) {
+  for (const w of whos) {
+    for (const m of marks(w)) assert.ok(!text.includes(m), `${what} leaks ${m}`);
+  }
+}
+const get = async (p, h) => request("GET", p, { headers: h });
+
+test("XERK-2556: three hosts named 'laptop', one site, one session id — three separate records", async () => {
+  const { A, B } = await isoFleet();
+  const keys = Object.keys(hub.agents).filter((k) => k === "laptop" || k.startsWith("laptop@"));
+  assert.deepEqual(keys.sort(), ["laptop", A.key, B.key].sort());
+  assert.equal(hub.tenantOfKey(A.key), A.t);
+  assert.equal(hub.tenantOfKey("laptop"), "");
+  // The same session id resolves to each caller's own host, and to nobody's else.
+  const pa = principalOfToken(A.h.cookie.slice("hub_session=".length));
+  const pb = principalOfToken(B.h.cookie.slice("hub_session=".length));
+  assert.equal(hub.findSession("s-same", pa).host, A.key);
+  assert.equal(hub.findSession("s-same", pb).host, B.key);
+  assert.equal(hub.findSession("s-b-only", pa), null);
+  assert.equal(hub.findSession("s-u-only", pa), null);
+});
+
+// The route table, swept: every row whose path names a host, org, session,
+// transcript or repo, called with ANOTHER tenant's id, by every principal that
+// must not reach it. Each answers 404 — byte-identical to a never-seen id — and
+// changes nothing.
+test("XERK-2556: every scoped route answers another tenant's id exactly as an unknown one", async () => {
+  const { A, B, C, G } = await isoFleet();
+  const scope = require("../tenant-scope.js");
+  const ghost = `laptop@${crypto.randomBytes(16).toString("hex")}`;
+  const targets = (who) => ({
+    host: who ? who.key : "laptop", site: who ? who.site : SITE,
+    sid: who ? `s-${who.tag}-only` : "s-u-only", tid: who ? `t-${who.tag}-only` : "t-u-only",
+    repo: who ? `repo-${who.tag}-${who.canary}` : `repo-u-${CANARY.U}`,
+  });
+  const unknown = { host: ghost, site: `${SITE}@${ghost.slice(7)}`, sid: "s-nobody", tid: "t-nobody",
+    repo: `repo-nobody-${rand()}` };
+  const fill = (pattern, t) => "/" + pattern.split("/").filter(Boolean).map((seg) => {
+    if (seg === "*") return "x";
+    if (!seg.startsWith(":")) return seg;
+    const v = { host: t.host, site: t.site, sid: t.sid, tid: t.tid, repo: t.repo, issue: "ISO-1" }[seg.slice(1)];
+    return encodeURIComponent(v === undefined ? "x1" : v);
+  }).join("/") + (pattern.startsWith("/term/") ? "/" : "");
+  const call = (m, p, h) => request(m, p, { headers: h, body: m === "GET" || m === "HEAD" ? undefined : {} });
+  const before = JSON.stringify(hub.agents[B.key].commands || []);
+  // who → the targets they must never reach.
+  const cases = [
+    [A, [B, null]], [B, [A, null]], [C, [A, B]], [G, [A, B]],
+  ];
+  let checked = 0;
+  for (const row of scope.ROUTES) {
+    const [methods, pattern, cls] = row;
+    if (!["host", "org", "session", "transcript", "repo"].includes(cls)) continue;
+    // A repo/transcript no host reports is the operators' (untenanted) by design,
+    // so the "unknown" twin only means "unknown" to a tenant user.
+    for (const m of methods.split(" ")) {
+      for (const [who, forbidden] of cases) {
+        const tenantCaller = who === A || who === B;
+        for (const victim of forbidden) {
+          const p = fill(pattern, targets(victim));
+          const r = await call(m, p, who.h);
+          assert.equal(r.status, 404, `${m} ${p} as ${who.user ? who.user.username : "break-glass"}: ${r.status} ${r.raw}`);
+          if (tenantCaller || (cls !== "repo" && cls !== "transcript")) {
+            const u = await call(m, fill(pattern, unknown), who.h);
+            assert.equal(u.status, 404, `${m} unknown twin of ${p}`);
+            if (m !== "HEAD") assert.equal(r.raw, u.raw, `${m} ${p}: another tenant's id must read as an unknown one`);
+          }
+          checked++;
+        }
+      }
+    }
+  }
+  assert.ok(checked > 300, `swept only ${checked} calls`);
+  // Nothing reached B's host: no command queued, the record still there.
+  assert.ok(hub.agents[B.key]);
+  assert.equal(JSON.stringify(hub.agents[B.key].commands || []), before);
+  // Positive control: the owner reaches the same rows.
+  assert.equal((await request("POST", `/api/jira/${encodeURIComponent(B.site)}/color`, { headers: B.h, body: { slot: 4 } })).status, 200);
+  assert.equal((await request("POST", `/api/agents/${encodeURIComponent(B.key)}/restart`, { headers: B.h, body: {} })).status, 200);
+  assert.equal((await request("POST", "/api/agents/laptop/restart", { headers: G.h, body: {} })).status, 200);
+});
+
+test("XERK-2556: /api/agents carries nothing of another tenant, for every principal", async () => {
+  const { A, B, C, G } = await isoFleet();
+  // Give each org something in every per-org store a client can set.
+  for (const w of [A, B]) {
+    const s = encodeURIComponent(w.site);
+    for (const [m, p, body] of [
+      ["POST", `/api/jira/${s}/color`, { slot: 2 }],
+      ["POST", `/api/jira/${s}/autostart`, { enabled: true }],
+      ["POST", `/api/jira/${s}/triage-policy`, { minPriority: "P2" }],
+      ["POST", `/api/jira/${s}/ISO-1/triage`, { action: "hold" }],
+      ["POST", `/api/jira/${s}/ISO-1/model`, { model: "opus" }],
+      ["POST", `/api/orgs/${s}/decisions`, { text: `${w.canary} decision` }],
+      ["PUT", `/api/orgs/${s}/daily-brief/schedule`, { enabled: false }],
+    ]) {
+      const r = await request(m, p, { headers: w.h, body });
+      assert.ok(r.status < 500 && r.status !== 404, `${m} ${p} as owner: ${r.status} ${r.raw}`);
+    }
+  }
+  for (const [who, others] of [[A, [B]], [B, [A]], [C, [A, B]], [G, [A, B]]]) {
+    const r = await get("/api/agents", who.h);
+    assert.equal(r.status, 200);
+    assertNoneOf(r.raw, others, "/api/agents");
+    const body = JSON.parse(r.raw);
+    const mine = body.agents.map((a) => a.key).filter((k) => k === "laptop" || k.startsWith("laptop@"));
+    assert.deepEqual(mine, who.key ? [who.key] : ["laptop"]);
+    if (who.key) {
+      assert.ok(r.raw.includes(who.canary), "positive control: the owner sees its own data");
+      assert.ok(!r.raw.includes(CANARY.U), "a tenant sees nothing of the operators' fleet");
+    }
+  }
+  // One tenant's ETag never answers another's 304.
+  const ra = await get("/api/agents", A.h);
+  const rb = await request("GET", "/api/agents", { headers: { ...B.h, "if-none-match": ra.headers.etag } });
+  assert.equal(rb.status, 200);
+});
+
+// A live SSE stream, read raw.
+function sseOpen(h) {
+  return new Promise((resolve, reject) => {
+    let text = "";
+    const req = http.get(baseUrl + "/api/events", { headers: h }, (res) => {
+      res.setEncoding("utf8");
+      res.on("data", (c) => (text += c));
+      resolve({ status: res.statusCode, text: () => text, close: () => req.destroy() });
+    });
+    req.on("error", (e) => (e.code === "ECONNRESET" ? null : reject(e)));
+  });
+}
+const settle = (ms = 300) => new Promise((r) => setTimeout(r, ms));
+
+test("XERK-2556: SSE frames from one tenant's activity reach no other stream", async () => {
+  const { A, B, C, G } = await isoFleet();
+  const streams = { A: await sseOpen(A.h), B: await sseOpen(B.h), C: await sseOpen(C.h), G: await sseOpen(G.h) };
+  try {
+    for (const s of Object.values(streams)) assert.equal(s.status, 200);
+    await settle(100);
+    // B acts: a beat with new content, an org setting, a decision note.
+    const fresh = `${B.canary}-live`;
+    await B.beat({ sessions: [{ id: "s-b-only", status: "running", repo: "shared-repo",
+      transcriptId: "t-b-only", label: fresh, ttydPort: 7701 }] });
+    await request("POST", `/api/jira/${encodeURIComponent(B.site)}/color`, { headers: B.h, body: { slot: 7 } });
+    await request("POST", `/api/orgs/${encodeURIComponent(B.site)}/decisions`, { headers: B.h, body: { text: `${fresh} note` } });
+    await settle();
+    assert.ok(streams.B.text().includes(fresh), "positive control: B's own stream hears it");
+    for (const k of ["A", "C", "G"]) {
+      assertNoneOf(streams[k].text(), [B], `SSE stream of ${k}`);
+      assert.ok(!streams[k].text().includes(fresh), `SSE stream of ${k} heard B's activity`);
+    }
+    assertNoneOf(streams.B.text(), [A], "B's own stream");
+  } finally { for (const s of Object.values(streams)) s.close(); }
+});
+
+// A raw WebSocket upgrade; resolves with the status line.
+function upgrade(pathAndQuery, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(server.address().port, "127.0.0.1", () => {
+      socket.write(`GET ${pathAndQuery} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n` +
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGVzdC1rZXktMDEyMzQ1Ng==\r\nSec-WebSocket-Version: 13\r\n" +
+        Object.entries(headers).map(([k, v]) => `${k}: ${v}\r\n`).join("") + "\r\n");
+    });
+    let buf = "";
+    socket.on("data", (c) => {
+      buf += c.toString("latin1");
+      const i = buf.indexOf("\r\n");
+      if (i >= 0) { socket.destroy(); resolve(buf.slice(0, i)); }
+    });
+    socket.on("error", reject);
+    socket.on("close", () => resolve(buf.split("\r\n")[0] || "closed"));
+  });
+}
+
+test("XERK-2556: terminals and live transcripts never open onto another tenant's host", async () => {
+  const { A, B } = await isoFleet();
+  const tokOf = async (who) => JSON.parse((await get("/api/ws-token", who.h)).raw).token;
+  const ta = await tokOf(A);
+  const live = (host, sid, tok) => upgrade(`/live/${encodeURIComponent(host)}/${sid}?auth=${encodeURIComponent(tok)}`);
+  assert.match(await live(B.key, "s-b-only", ta), / 404 /);
+  assert.match(await live(B.key, "s-same", ta), / 404 /, "a shared session id grants nothing");
+  assert.match(await live("laptop", "s-u-only", ta), / 404 /, "nor the operators' host of that name");
+  assert.match(await live(A.key, "s-same", ta), / 101 /, "positive control");
+  // A ws-token re-signed to claim B's tenant names nobody.
+  const parts = ta.split(".");
+  const claims = JSON.parse(Buffer.from(parts[2], "base64url").toString());
+  claims.t = B.t;
+  const forged = [parts[0], parts[1], Buffer.from(JSON.stringify(claims)).toString("base64url"), parts[3]].join(".");
+  assert.doesNotMatch(await live(B.key, "s-b-only", forged), / 101 /);
+  assert.doesNotMatch(await live(A.key, "s-same", forged), / 101 /, "a tampered token is nobody's");
+  // The terminal proxy: another tenant's session, over HTTP and as an upgrade.
+  assert.equal((await get("/term/s-b-only/", A.h)).status, 404);
+  assert.match(await upgrade("/term/s-b-only/ws", { Cookie: A.h.cookie.split(";")[0] }), / 404 /);
+});
+
+test("XERK-2556: archive search, browse and reads see only the caller's tenant", async () => {
+  const { A, B, C, G, beatAs } = await isoFleet();
+  void beatAs;
+  const meta = (who) => ({ remoteKey: "github.com/x/shared-repo", repo: "shared-repo", worktree: "/w/iso",
+    slug: "-w-iso", createdAt: "2026-10-01T00:00:00Z", endedTs: "2026-10-01T01:00:00Z", summary: `${who.canary} summary` });
+  const ingest = (who, tid, word) => request("POST", `/api/agents/laptop/archive/${tid}`, {
+    headers: { authorization: `Bearer ${who.tok}` },
+    body: { startOffset: 0, endOffset: 64, size: 64, meta: meta(who),
+      entries: [{ uuid: `${tid}-${who.tag}`, role: "user", ts: "2026-10-01T00:00:00Z", text: `${word} ${who.canary}` }] },
+  });
+  // Both tenants archive the SAME transcript id, and each one of its own. A row
+  // never crosses tenants: the first writer's tenant owns the id, and the other's
+  // push stores nothing (cursor handed back, never an error) — it cannot append to
+  // or re-point A's copy.
+  for (const w of [A, B]) {
+    for (const tid of ["t-same", `t-${w.tag}-only`]) {
+      const r = await ingest(w, tid, "zebrafish");
+      assert.equal(r.status, 200, `${w.tag} ${tid}: ${r.raw}`);
+    }
+  }
+  assert.equal(hub.tenantOfKey(archive.sessionRow("t-same").host), A.t, "B's push never re-pointed A's row");
+  for (const [who, others] of [[A, [B]], [B, [A]], [C, [A, B]], [G, [A, B]]]) {
+    const s = await get("/api/search?q=zebrafish", who.h);
+    assert.equal(s.status, 200, s.raw);
+    assertNoneOf(s.raw, others, "/api/search");
+    const list = await get("/api/archive", who.h);
+    assertNoneOf(list.raw, others, "/api/archive");
+    const same = await get("/api/archive/t-same", who.h);
+    assertNoneOf(same.raw, others, "/api/archive/t-same");
+    if (who.canary) {
+      assert.ok(s.raw.includes(who.canary), "positive control: the owner finds its own words");
+      const own = await get(`/api/archive/t-${who.tag}-only`, who.h);
+      assert.ok(own.raw.includes(who.canary), "positive control: the owner reads its own transcript");
+    }
+    if (who === B) assert.equal(same.status, 404, "the id A owns reads as unknown to B");
+  }
+  assert.equal((await get("/api/archive/t-b-only", A.h)).status, 404);
+  assert.equal((await get("/api/archive/t-b-only/raw", A.h)).status, 404);
+  // A's agent cannot write into B's archive under a guessed key.
+  const cross = await request("POST", `/api/agents/${encodeURIComponent(B.key)}/archive/t-b-only`, {
+    headers: { authorization: `Bearer ${A.tok}` },
+    body: { startOffset: 0, endOffset: 8, size: 8, meta: meta(A), entries: [] } });
+  assert.equal(cross.status, 403);
+});
+
+test("XERK-2556: usage and insights aggregate only the caller's tenant", async () => {
+  const { A, B, C, G } = await isoFleet();
+  const now = Date.now();
+  const row = (id, w) => ({ id, kind: "dialog", dialogKind: "permission", tool: "Bash", head: `${w.canary} cmd`,
+    status: "answered", answer: "allow", askedAt: now - 1000, answeredAt: now, repo: "shared-repo" });
+  hub.permissionLedger.ingest(A.key, [row("1", A)], now);
+  hub.permissionLedger.ingest(B.key, [row("1", B), row("2", B)], now);
+  for (const [who, others] of [[A, [B]], [B, [A]], [C, [A, B]], [G, [A, B]]]) {
+    for (const p of ["/api/permissions", "/api/model-quality", `/api/model-quality?org=${encodeURIComponent((others[0]).site)}`]) {
+      const r = await get(p, who.h);
+      assert.ok(r.status === 200 || r.status === 404, `${p}: ${r.status}`);
+      assertNoneOf(r.raw, others, p);
+    }
+  }
+  // The unauthenticated /metrics counts the untenanted fleet only.
+  const m = await get("/metrics", {});
+  assertNoneOf(m.raw, [A, B], "/metrics");
+});
+
+test("XERK-2556: board ids, epic builders and meetings stay inside their org", async () => {
+  const { A, B } = await isoFleet();
+  // B arms an epic builder; A cannot cancel it through A's own org.
+  const arm = await request("POST", `/api/jira/${encodeURIComponent(B.site)}/epic-builder`,
+    { headers: B.h, body: { title: `${B.canary} epic`, idea: "an idea" } });
+  assert.equal(arm.status, 200, arm.raw);
+  const id = JSON.parse(arm.raw).run.id;
+  const del = await request("DELETE", `/api/jira/${encodeURIComponent(A.site)}/epic-builder/${id}`, { headers: A.h });
+  const ghost = await request("DELETE", `/api/jira/${encodeURIComponent(A.site)}/epic-builder/${"0".repeat(id.length)}`, { headers: A.h });
+  assert.equal(del.status, 404);
+  assert.equal(del.raw, ghost.raw, "another org's builder id reads as unknown");
+  assert.ok(JSON.parse((await get("/api/agents", B.h)).raw).epicBuilders[id], "B's builder survives");
+  // Tenir's meeting post: each tenant's token posts to the PLAIN site, landing in its own org.
+  const tokens = {};
+  for (const w of [A, B]) {
+    const r = await request("POST", "/api/meetings-token", { headers: w.h, body: {} });
+    assert.equal(r.status, 200, r.raw);
+    tokens[w.tag] = JSON.parse(r.raw).token;
+  }
+  const post = (tok, mid, who) => request("POST", `/api/orgs/${encodeURIComponent(SITE)}/meetings`, {
+    headers: { authorization: `Bearer ${tok}` },
+    body: { meetingId: mid, title: `${who.canary} standup`, platform: "zoom", startedAt: Date.now() - 60_000,
+      endedAt: Date.now(), participants: ["x"], segments: [{ speaker: "x", text: `${who.canary} said`, startMs: 0, endMs: 1 }] },
+  });
+  assert.equal((await post(tokens.a, "m-same", A)).status, 200);
+  assert.equal((await post(tokens.b, "m-same", B)).status, 200, "one meeting id, two tenants: no duplicate");
+  // A token naming B's tenant with A's secret, or the suffixed site, is refused.
+  assert.equal((await post(`tm1.${B.t}.${tokens.a.split(".")[2]}`, "m-x", A)).status, 401);
+  const suffixed = await request("POST", `/api/orgs/${encodeURIComponent(B.site)}/meetings`,
+    { headers: { authorization: `Bearer ${tokens.a}` }, body: {} });
+  assert.equal(suffixed.status, 404);
+  const pa = JSON.parse((await get("/api/agents", A.h)).raw);
+  assert.ok(pa.meetingProposals[A.site].some((m) => m.meetingId === "m-same"));
+  assertNoneOf(JSON.stringify(pa), [B], "A's payload after both meetings");
+  // A's review route on B's meeting id, through A's org, finds no item of B's.
+  const rv = await request("POST", `/api/orgs/${encodeURIComponent(A.site)}/meetings/m-b-${rand()}/items/p1`,
+    { headers: A.h, body: { action: "reject" } });
+  assert.equal(rv.status, 404);
+});
+
+test("XERK-2556: push, peer roster and migration never cross a tenant", async () => {
+  const { A, B, G } = await isoFleet();
+  for (const [w, tok] of [[A, "dev2556a"], [B, "dev2556b"], [G, "dev2556g"]]) {
+    const r = await request("POST", "/api/devices", { headers: w.h, body: { token: tok } });
+    assert.equal(r.status, 200, r.raw);
+  }
+  try {
+    const toks = (host) => hub.devicesForHost(host).map((d) => d.token);
+    assert.ok(toks(A.key).includes("dev2556a") && !toks(A.key).includes("dev2556b") && !toks(A.key).includes("dev2556g"));
+    assert.ok(toks(B.key).includes("dev2556b") && !toks(B.key).includes("dev2556a"));
+    assert.ok(toks("laptop").includes("dev2556g") && !toks("laptop").some((t) => t === "dev2556a" || t === "dev2556b"));
+  } finally {
+    for (const t of ["dev2556a", "dev2556b", "dev2556g"]) hub.unregisterDevice(t);
+  }
+  // The roster on each beat reply: its own tenant's sessions only.
+  const ra = JSON.parse((await A.beat()).raw);
+  const peers = JSON.stringify(ra.peers || []);
+  assert.ok(peers.includes(`rc-${A.canary}`), "positive control: A's own sessions are its peers");
+  assertNoneOf(peers, [B], "A's peer roster");
+  assert.ok(!peers.includes(CANARY.U), "A's roster holds no operator session");
+  // A session moves only within its tenant.
+  for (const to of [B.key, "laptop", `laptop@${crypto.randomBytes(16).toString("hex")}`]) {
+    const r = await request("POST", `/api/agents/${encodeURIComponent(A.key)}/sessions/s-a-only/migrate`,
+      { headers: A.h, body: { host: to } });
+    assert.equal(r.status, 404, `migrate to ${to}: ${r.raw}`);
+  }
+});
+
+test("XERK-2556: enrollment codes are their tenant's; ids from another read as unknown", async () => {
+  const { A, B, C, G } = await isoFleet();
+  const m = await request("POST", "/api/enroll-codes", { headers: A.h, body: { device: "spare2556" } });
+  assert.equal(m.status, 200, m.raw);
+  const listA = JSON.parse((await get("/api/enroll-codes", A.h)).raw).codes;
+  const mine = listA.find((c) => c.device === "spare2556");
+  assert.ok(mine, "positive control");
+  for (const who of [B, C, G]) {
+    const l = await get("/api/enroll-codes", who.h);
+    assert.ok(!JSON.parse(l.raw).codes.some((c) => c.id === mine.id), "another principal lists A's code");
+    const d = await request("DELETE", `/api/enroll-codes/${mine.id}`, { headers: who.h });
+    const u = await request("DELETE", `/api/enroll-codes/${"f".repeat(mine.id.length)}`, { headers: who.h });
+    assert.equal(d.status, 404);
+    assert.equal(d.raw, u.raw, "another tenant's code id reads as unknown");
+  }
+  assert.ok(JSON.parse((await get("/api/enroll-codes", A.h)).raw).codes.some((c) => c.id === mine.id), "A's code survives");
+});
+
+test("XERK-2556: forged tokens name nobody — session, agent, meetings", async () => {
+  const { A, B } = await isoFleet();
+  // hub_session claiming A's user in B's tenant, or with its MAC bent.
+  assert.equal(principalOfToken(hub.issueSessionToken(60_000, { u: A.user.id, t: B.t, r: ["user"] })), null);
+  const real = A.h.cookie.slice("hub_session=".length);
+  const bent = real.slice(0, -2) + (real.endsWith("AA") ? "BB" : "AA");
+  for (const tok of [bent, real.replace(/^u2\.\d+/, "u2.9999999999999")]) {
+    const r = await get("/api/agents", { cookie: `hub_session=${tok}` });
+    assert.equal(r.status, 401, "a tampered cookie is signed out");
+  }
+  // A's agent token can be no other key: B's, the operators' plain name, or a ghost.
+  for (const dev of [B.key, `laptop@${crypto.randomBytes(16).toString("hex")}`]) {
+    const r = await request("POST", "/api/heartbeat", { headers: { authorization: `Bearer ${A.tok}` }, body: { device: dev } });
+    assert.equal(r.status, 403, `A's token beating ${dev}`);
+  }
+  // The plain name typed with A's token is namespaced into A's tenant: it acts on
+  // A's own "laptop", never the operators' record of that name.
+  const before = JSON.stringify(hub.agents.laptop);
+  await request("POST", `/api/agents/laptop/updating`, { headers: { authorization: `Bearer ${A.tok}` }, body: {} });
+  assert.equal(JSON.stringify(hub.agents.laptop), before, "the operators' laptop is untouched");
+  // The fleet master proves no tenant.
+  const master = await request("POST", "/api/heartbeat", { headers: { authorization: "Bearer agenttok" }, body: { device: B.key } });
+  assert.equal(master.status, 403);
+  // A meetings token is random per tenant, never derivable from the fleet token.
+  const derived = `tm1.${B.t}.${crypto.createHmac("sha256", "meetingstok").update(B.t).digest("base64url")}`;
+  const r = await request("POST", `/api/orgs/${encodeURIComponent(SITE)}/meetings`,
+    { headers: { authorization: `Bearer ${derived}` }, body: {} });
+  assert.equal(r.status, 401);
+});
+
+test("XERK-2556: the admin surface is admins-only and serves identities, never tenant data", async () => {
+  const { A, B, C, G } = await isoFleet();
+  const scope = require("../tenant-scope.js");
+  for (const [methods, pattern, cls] of scope.ROUTES) {
+    if (cls !== "admin") continue;
+    const p = pattern.replace(":id", A.user.id);
+    for (const m of methods.split(" ")) {
+      for (const who of [A, B]) {
+        const r = await request(m, p, { headers: { ...who.h, origin: baseUrl }, body: m === "GET" ? undefined : {} });
+        assert.equal(r.status, 404, `${m} ${p} as a tenant user: ${r.status}`);
+      }
+    }
+  }
+  for (const who of [C, G]) {
+    const r = await get("/api/admin/users", who.h);
+    assert.equal(r.status, 200, r.raw);
+    assert.ok(r.raw.includes("iso2556a"), "positive control: the admin sees the identity");
+    assertNoneOf(r.raw, [A, B], "/api/admin/users");
+    assert.ok(!/scrypt\$|"tenantId"|laptop@/.test(r.raw), "no hash, tenant id or host key");
+    const audit = await get("/api/admin/audit", who.h);
+    assertNoneOf(audit.raw, [A, B], "/api/admin/audit");
+  }
+});
+
+test("XERK-2556: host names shaped like another tenant's key are no way in", async () => {
+  const { A, B } = await isoFleet();
+  // Enrolling a device named as B's key is refused; an upper-cased copy is not a
+  // tenant key at all (ids are lower-case hex), so it lands inside A's own tenant.
+  for (const dev of [B.key, `x@${B.t}`]) {
+    const m = await request("POST", "/api/enroll-codes", { headers: A.h, body: {} });
+    const r = await request("POST", "/api/agent/enroll", { body: { code: JSON.parse(m.raw).code, device: dev } });
+    assert.notEqual(r.status, 200, `enrolled ${dev}`);
+    await request("DELETE", `/api/enroll-codes/${JSON.parse(m.raw).id}`, { headers: A.h });
+  }
+  {
+    const m = await request("POST", "/api/enroll-codes", { headers: A.h, body: {} });
+    const r = await request("POST", "/api/agent/enroll", { body: { code: JSON.parse(m.raw).code, device: B.key.toUpperCase() } });
+    if (r.status === 200) {
+      const tok = JSON.parse(r.raw).token;
+      const beat = await request("POST", "/api/heartbeat", { headers: { authorization: `Bearer ${tok}` }, body: { device: B.key.toUpperCase() } });
+      assert.equal(beat.status, 200);
+      const k = `${B.key.toUpperCase()}@${A.t}`;
+      assert.ok(hub.agents[k], "the look-alike is A's host");
+      assert.equal((await request("POST", `/api/agents/${encodeURIComponent(k)}/restart`, { headers: B.h, body: {} })).status, 404);
+      assert.ok(!JSON.parse((await get("/api/agents", B.h)).raw).agents.some((a) => a.key === k), "B never sees it");
+      delete hub.agents[k];
+    }
+  }
+  // The fleet master beating a name of that shape (any case) never becomes B's host.
+  for (const dev of [`laptop@${B.t}`, `LAPTOP@${B.t.toUpperCase()}`, `laptop@${B.t}/`]) {
+    const had = new Set(Object.keys(hub.agents));
+    const r = await request("POST", "/api/heartbeat", { headers: { authorization: "Bearer agenttok" }, body: { device: dev } });
+    const made = Object.keys(hub.agents).filter((k) => !had.has(k) && k.toLowerCase() === dev.toLowerCase());
+    for (const k of made) {
+      assert.equal(hub.tenantOfKey(k), "", `${dev} became a tenant key`);
+      assert.equal((await request("POST", `/api/agents/${encodeURIComponent(k)}/restart`, { headers: B.h, body: {} })).status, 404,
+        "and B cannot drive it as its own");
+      delete hub.agents[k];
+    }
+    if (dev === `laptop@${B.t}`) assert.equal(r.status, 403, "the master never beats as B's key");
+    assert.ok(hub.agents[B.key] && hub.tenantOfKey(B.key) === B.t, "B's record is untouched");
+  }
+  // A second "laptop" inside one tenant is refused (two machines, one key).
+  const m = await request("POST", "/api/enroll-codes", { headers: A.h, body: { device: "Laptop" } });
+  assert.notEqual(m.status, 200, "a case twin of A's own host");
 });
