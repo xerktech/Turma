@@ -1,5 +1,7 @@
 package com.xerktech.turma.ui
 
+import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.test.core.app.ApplicationProvider
 import com.xerktech.turma.MainActivity
@@ -53,5 +55,43 @@ class TurmaAppDeepLinkTest {
         compose.runOnUiThread { container.config.save("http://localhost:1/", "op", "pw") }
         compose.waitForIdle()
         assertTrue("the held deep link must be consumed once signed in", consumed)
+    }
+
+    /**
+     * A "N proposals from <meeting>" push carries only a click path (rollup
+     * XERK-2602): tapping it must land on the Meetings tab. `deepLinkTab` is
+     * pinned alone in `BottomNavTabTest`; this pins the effect that acts on it.
+     */
+    @Test fun aMeetingsPushOpensTheMeetingsTab() {
+        container.config.save("http://localhost:1/", "op", "pw")
+        var consumed = false
+        compose.setContent {
+            TurmaApp(
+                container = container,
+                wide = false,
+                pendingDeepLink = MainActivity.DeepLink(null, null, "/meetings?site=o.atlassian.net"),
+                onDeepLinkConsumed = { consumed = true },
+            )
+        }
+        compose.waitForIdle()
+        assertTrue("the meetings link must be consumed", consumed)
+        compose.onAllNodes(hasText("No meetings yet", substring = true)).assertCountEquals(1)
+    }
+
+    /** A click path naming no tab is consumed but moves nothing: the app stays on the Dashboard. */
+    @Test fun aPushNamingNoTabStaysOnTheDashboard() {
+        container.config.save("http://localhost:1/", "op", "pw")
+        var consumed = false
+        compose.setContent {
+            TurmaApp(
+                container = container,
+                wide = false,
+                pendingDeepLink = MainActivity.DeepLink(null, null, "/board?ticket=X-1"),
+                onDeepLinkConsumed = { consumed = true },
+            )
+        }
+        compose.waitForIdle()
+        assertTrue("the link must be consumed", consumed)
+        compose.onAllNodes(hasText("No meetings yet", substring = true)).assertCountEquals(0)
     }
 }
