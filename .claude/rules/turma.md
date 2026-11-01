@@ -89,8 +89,10 @@ makes an `android/` change part of the same PR) live there.
     earlier click's unconfirmed flip that nothing would correct.
   - The hub applies an org's clicks in order, so an OK for click N makes every older click moot.
     The switch shows the newest in-flight click NEWER than the newest OK, else `confirmed`.
-  - An OK is taken into `confirmed` only if it is the newest OK and no SSE frame of that map landed
-    since the click; only SSE frames count there, never a polled snapshot.
+  - An answer (OK, re-read) is taken into `confirmed` only if no newer click's answer was taken
+    (`takenAt`) and no SSE frame of that map landed since it was asked. Only SSE frames count, never
+    a polled snapshot (its age is unknown): with SSE down a late answer can outvote a newer poll
+    until the next one. Accepted; SSE up, the hub's frame corrects it at once.
   - A NETWORK failure (the hub may have applied it) re-reads `/api/agents` and takes ONLY its org's
     entry, and not even that when an SSE frame of that map landed during the re-read.
 - Repaints skip when markup is unchanged (beat can't churn the DOM under an open menu). A handled

@@ -967,15 +967,15 @@ test("XERK-2598: an older click's late re-read never becomes the hub's word", as
 
 test("XERK-2598: a new snapshot is the hub's word for auto-merge and colors too", async () => {
   const { slot, click } = mountOrg();
-  Org.update({ agents: [agent("a", "acme.atlassian.net")], autoMergeOrgs: {}, orgColors: {} });
-  Org.update({ agents: [agent("a", "acme.atlassian.net")],
-    autoMergeOrgs: { "acme.atlassian.net": true }, orgColors: { "acme.atlassian.net": 3 } });
+  Org.update({ agents: [agent("a", "snap.atlassian.net")], autoMergeOrgs: {}, orgColors: {} });
+  Org.update({ agents: [agent("a", "snap.atlassian.net")],
+    autoMergeOrgs: { "snap.atlassian.net": true }, orgColors: { "snap.atlassian.net": 3 } });
   click("data-org-toggle", "");
   global.fetch = () => Promise.resolve({ ok: false, status: 500 });
-  await Org.setAutoMerge("acme.atlassian.net", false);
-  assert.ok(mergeIsOn(slot, "acme.atlassian.net"));
-  await Org.setOrgColor("acme.atlassian.net", 6);
-  assert.deepEqual({ ...Org.orgColors() }, { "acme.atlassian.net": 3 });
+  await Org.setAutoMerge("snap.atlassian.net", false);
+  assert.ok(mergeIsOn(slot, "snap.atlassian.net"));
+  await Org.setOrgColor("snap.atlassian.net", 6);
+  assert.deepEqual({ ...Org.orgColors() }, { "snap.atlassian.net": 3 });
 });
 
 test("XERK-2598: the re-read confirms only its own org, never another org's stale entry", async () => {
@@ -1160,6 +1160,60 @@ test("XERK-2598: a polled snapshot landing mid-POST never throws the POST's OK a
   global.fetch = () => Promise.resolve({ ok: false, status: 500 });
   await Org.setAutoStart(site, false);
   assert.ok(autoIsOn(slot, site), "and a refused click falls back to it");
+});
+
+test("XERK-2598: two lost clicks' re-reads land in click order, whatever order they arrive", async () => {
+  const site = "h2.atlassian.net";
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {} });
+  click("data-org-toggle", "");
+  const reads = [];
+  global.fetch = (url) => url === "/api/agents" ? new Promise((res) => reads.push(res))
+    : Promise.reject(new TypeError("network"));                       // both applied, both responses lost
+  const c1 = Org.setAutoStart(site, true);
+  await tick();
+  const c2 = Org.setAutoStart(site, false);
+  await tick();
+  reads[1]({ ok: true, status: 200, json: async () => ({ autoStartOrgs: {} }) });
+  await c2;
+  reads[0]({ ok: true, status: 200, json: async () => ({ autoStartOrgs: { [site]: true } }) });  // older body
+  await c1;
+  assert.ok(!autoIsOn(slot, site));
+});
+
+test("XERK-2598: an older click's late OK never overwrites a newer click's re-read", async () => {
+  const site = "okvsread.atlassian.net";
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {} });
+  click("data-org-toggle", "");
+  let holdA, call = 0;
+  global.fetch = (url) => {
+    if (url === "/api/agents") return Promise.resolve({ ok: true, status: 200, json: async () => ({ autoStartOrgs: {} }) });
+    return ++call === 1 ? new Promise((res) => { holdA = res; }) : Promise.reject(new TypeError("network"));
+  };
+  const a = Org.setAutoStart(site, true);                              // applied, 200 held
+  await Org.setAutoStart(site, false);                                 // applied, lost; re-read says off
+  holdA({ ok: true, status: 200 });
+  await a;
+  assert.ok(!autoIsOn(slot, site));
+});
+
+test("XERK-2598: an SSE frame BEFORE the re-read was asked doesn't void the re-read", async () => {
+  const site = "rrgen.atlassian.net";
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {} });
+  click("data-org-toggle", "");
+  const handlers = {};
+  Org.sse({ addEventListener: (t, fn) => { handlers[t] = fn; } });
+  let failPost;
+  global.fetch = (url) => url === "/api/agents"
+    ? Promise.resolve({ ok: true, status: 200, json: async () => ({ autoStartOrgs: { [site]: true } }) })
+    : new Promise((_, rej) => { failPost = () => rej(new TypeError("network")); });
+  const p = Org.setAutoStart(site, true);
+  handlers.autoStartOrgs({ data: "{}" });                              // a frame from before the hub applied it
+  failPost();
+  await p;
+  assert.ok(autoIsOn(slot, site), "the re-read, asked after the frame, is the newer word");
 });
 
 test("XERK-2598: a failed color pick repaints the control back", async () => {

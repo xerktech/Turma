@@ -419,9 +419,11 @@
   //   answered OK every OLDER click is moot. While a click NEWER than the
   //   newest OK is in flight the switch shows the newest such click; otherwise
   //   it shows `confirmed`.
-  // - An OK is taken into `confirmed` only if it is the newest OK so far and no
-  //   SSE frame of the map landed since the click (a frame is the whole map:
-  //   newer, and usually this very change). A polled snapshot never blocks it.
+  // - An answer (OK, re-read) is taken into `confirmed` only if no newer
+  //   click's answer was taken and no SSE frame of the map landed since it was
+  //   asked (a frame is the whole map: newer, and usually this very change). A
+  //   polled snapshot never blocks it — its age is unknown, so with SSE down a
+  //   late answer can still outvote a newer poll until the next one (accepted).
   // - A POST that failed at the NETWORK level may still have been applied, so
   //   it re-reads the hub (`hubOrgMap`) and takes ONLY its own org's entry —
   //   the body may predate an SSE change to another org — and not even that
@@ -430,7 +432,7 @@
   const ROUTE = { auto: "autostart", merge: "automerge", color: "color" };
   const confirmed = { auto: {}, merge: {}, color: {} };
   const hubGen = { auto: 0, merge: 0, color: 0 };
-  const flights = new Map();   // kind\0siteKey -> {next, maxOk, pending: n -> value}
+  const flights = new Map();   // kind\0siteKey -> {next, maxOk, takenAt, pending: n -> value}
 
   // `fromSse`: a frame bumps the generation; a polled snapshot does not.
   function hubSays(kind, map, fromSse) { confirmed[kind] = map || {}; if (fromSse) hubGen[kind]++; }
@@ -470,7 +472,7 @@
   async function flip(kind, siteKey, value, body) {
     const k = kind + "\0" + siteKey;
     let f = flights.get(k);
-    if (!f) flights.set(k, (f = { next: 0, maxOk: 0, pending: new Map() }));
+    if (!f) flights.set(k, (f = { next: 0, maxOk: 0, takenAt: 0, pending: new Map() }));
     const n = ++f.next;
     f.pending.set(n, value);
     const clickGen = hubGen[kind];
@@ -483,13 +485,18 @@
       if (r.status === 401) { location.href = "/login"; return; }
       ok = r.ok;
     } catch { netErr = true; /* outcome unknown — re-read below */ }
+    // `takenAt` orders every answer that sets `confirmed`, OK and re-read alike:
+    // an older click's answer never overwrites a newer click's (QA H2).
     if (ok) {
-      if (n > f.maxOk && hubGen[kind] === clickGen) confirm(kind, siteKey, value);
+      if (n > f.takenAt && hubGen[kind] === clickGen) { confirm(kind, siteKey, value); f.takenAt = n; }
       if (n > f.maxOk) f.maxOk = n;
     } else if (netErr) {
       const gen = hubGen[kind];
       const hub = await hubOrgMap(FIELD[kind]);
-      if (hub && f.maxOk < n && hubGen[kind] === gen) confirm(kind, siteKey, valueIn(kind, hub, siteKey));
+      if (hub && n > f.takenAt && f.maxOk < n && hubGen[kind] === gen) {
+        confirm(kind, siteKey, valueIn(kind, hub, siteKey));
+        f.takenAt = n;
+      }
     }
     f.pending.delete(n);
     // The newest click still in flight that an OK has not made moot, else the hub's word.
