@@ -993,6 +993,76 @@ test("XERK-2598: the re-read confirms only its own org, never another org's stal
   assert.ok(autoIsOn(slot, "beta.atlassian.net"));
 });
 
+test("XERK-2598: with SSE down, an older click's late success still counts once the newer fails", async () => {
+  for (const kind of ["auto", "merge", "color"]) {
+    for (const order of ["older-first", "newer-first"]) {
+      const { slot, click } = mountOrg();
+      Org.update({ agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {}, autoMergeOrgs: {}, orgColors: {} });
+      click("data-org-toggle", "");
+      const pending = [];
+      global.fetch = () => new Promise((res) => pending.push(res));
+      const set = (on) => kind === "auto" ? Org.setAutoStart("acme.atlassian.net", on)
+        : kind === "merge" ? Org.setAutoMerge("acme.atlassian.net", on)
+        : Org.setOrgColor("acme.atlassian.net", on ? 3 : null);
+      const a = set(true);                                             // hub applies it
+      const b = set(false);                                            // hub refuses it
+      const okA = () => pending[0]({ ok: true, status: 200 });
+      const failB = () => pending[1]({ ok: false, status: 500 });
+      if (order === "older-first") { okA(); await a; failB(); await b; }
+      else { failB(); await b; okA(); await a; }
+      const shown = kind === "auto" ? autoIsOn(slot, "acme.atlassian.net")
+        : kind === "merge" ? mergeIsOn(slot, "acme.atlassian.net")
+        : Org.orgColors()["acme.atlassian.net"] === 3;
+      assert.ok(shown, `${kind} ${order}: the hub has it on`);
+    }
+  }
+});
+
+test("XERK-2598: an older click's lost response re-read counts when the newer click fails", async () => {
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")], autoMergeOrgs: {} });
+  click("data-org-toggle", "");
+  let n = 0, releaseRead, failB;
+  global.fetch = (url) => {
+    if (url === "/api/agents") return new Promise((res) => { releaseRead = res; });
+    return ++n === 1 ? Promise.reject(new TypeError("network"))       // A: applied, response lost
+      : new Promise((res) => { failB = () => res({ ok: false, status: 500 }); });
+  };
+  const a = Org.setAutoMerge("acme.atlassian.net", true);
+  await tick();
+  const b = Org.setAutoMerge("acme.atlassian.net", false);
+  releaseRead({ ok: true, status: 200, json: async () => ({ autoMergeOrgs: { "acme.atlassian.net": true } }) });
+  await a;
+  assert.ok(!mergeIsOn(slot, "acme.atlassian.net"), "B is still in flight: it shows B's off");
+  failB();
+  await b;
+  assert.ok(mergeIsOn(slot, "acme.atlassian.net"), "B refused: the hub's on");
+});
+
+test("XERK-2598: an older click's failure never repaints over a newer pending click", async () => {
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {} });
+  click("data-org-toggle", "");
+  const pending = [];
+  global.fetch = () => new Promise((res) => pending.push(res));
+  const a = Org.setAutoStart("acme.atlassian.net", true);
+  Org.setAutoStart("acme.atlassian.net", false);
+  Org.setAutoStart("acme.atlassian.net", true);                        // newest, pending
+  pending[0]({ ok: false, status: 500 });
+  await a;
+  assert.ok(autoIsOn(slot, "acme.atlassian.net"));
+});
+
+test("XERK-2598: a new snapshot is the hub's word for auto-start", async () => {
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", "solo.atlassian.net")], autoStartOrgs: {} });
+  Org.update({ agents: [agent("a", "solo.atlassian.net")], autoStartOrgs: { "solo.atlassian.net": true } });
+  click("data-org-toggle", "");
+  global.fetch = () => Promise.resolve({ ok: false, status: 500 });
+  await Org.setAutoStart("solo.atlassian.net", false);
+  assert.ok(autoIsOn(slot, "solo.atlassian.net"));
+});
+
 test("XERK-2598: a failed color pick repaints the control back", async () => {
   const { slot } = mountOrg();
   Org.update({ agents: [agent("a", "acme.atlassian.net")], orgColors: {} });

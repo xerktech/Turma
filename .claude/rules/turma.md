@@ -87,9 +87,10 @@ makes an `android/` change part of the same PR) live there.
   - A failed click resolves to `confirmed[kind]`, the hub's last word (adopted snapshot, every SSE
     frame, an OK POST, the re-read), never to what the switch showed when clicked: that may be an
     earlier click's unconfirmed flip that nothing would correct.
-  - Only the NEWEST click on an org's switch resolves it; an older click's late outcome is dropped.
-  - An OK POST or re-read counts as the hub's word only if it is still the newest click AND no SSE
-    frame of that map arrived since it was asked; a late 200 otherwise outvoted a newer change.
+  - While any click on an org's switch is in flight it shows the NEWEST pending click's value, else
+    `confirmed`: an older click's late success (SSE down) still counts once the newer one fails.
+  - An answer (OK POST, re-read) is taken only if no NEWER click's answer was taken and no SSE frame
+    of that map landed since it was asked; a late 200 otherwise outvoted a newer change.
   - A NETWORK failure (the hub may have applied it) re-reads `/api/agents` and takes ONLY its org's
     entry, and not even that when an SSE frame of that map landed during the re-read.
 - Repaints skip when markup is unchanged (beat can't churn the DOM under an open menu). A handled
