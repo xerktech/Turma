@@ -28,5 +28,5 @@ The web surface of the Meetings epic (XERK-2503). The wire and the review route 
   Brief page's rule, `turma-daily-brief.md`). Buttons go `aria-disabled` while busy; `busy` is
   the guard.
 - Live via the `meetingProposals` SSE frame (whole map); a snapshot fetch merges (XERK-444 clock).
-- Web-only for now (`android/PARITY.md`).
+- Android has the same screen (XERK-2511, `android.md`); a change here needs its port there.
 - Tests: `turma/tests/meetings.test.js`.
