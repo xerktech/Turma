@@ -957,8 +957,10 @@ function chargeTenant(tenant, n) {
 // The tenant rows whose files sit OUTSIDE their partition (archived before it
 // existed): `files` maps the rendered `.jsonl` (relative to ARCHIVE_DIR) to its
 // tenant, `ids` maps the transcript id (its raw subdirectory's name) to it. The
-// store walk attributes those bytes by row, as the charge above does. Bounded by
-// the pre-partition rows, which no longer grow: a new tenant row is partitioned.
+// store walk attributes those bytes by row, as the charge above does. The maps
+// hold only pre-partition rows, which no longer grow (a new tenant row is
+// partitioned); sqlite filters them in the query, pg mode scans the in-memory
+// row map once per walk.
 function legacyTenantFiles() {
   const files = new Map(), ids = new Map();
   const add = (r) => {
@@ -971,7 +973,7 @@ function legacyTenantFiles() {
     if (isPgMode()) { for (const r of sessionsMap.values()) add(r); }
     else if (db) {
       db.prepare("SELECT transcriptId, filePath, host FROM sessions " +
-        "WHERE filePath IS NOT NULL AND host GLOB '*@*'").all().forEach(add);
+        "WHERE filePath IS NOT NULL AND filePath NOT GLOB '@*' AND host GLOB '*@*'").all().forEach(add);
     }
   } catch { /* an index hiccup costs the attribution, never the walk */ }
   return { files, ids };

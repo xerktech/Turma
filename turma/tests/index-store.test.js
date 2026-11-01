@@ -1674,6 +1674,27 @@ test("XERK-2549 pg mode: a tenant purge removes the map rows, the Postgres rows 
   } finally { pgTeardown(); }
 });
 
+test("XERK-2618 pg mode: a pre-partition tenant row is measured toward its tenant from the map", () => {
+  pgSetup();
+  const A = "c".repeat(32);
+  try {
+    // Archived before the partition: the tenant's files sit in the untenanted tree.
+    const rel = path.join("turma", "2026-07-12__legacy__lap__pg2618.jsonl");
+    const abs = path.join(process.env.ARCHIVE_DIR, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, JSON.stringify(ent("u", "user", "legacy")) + "\n");
+    fs.writeFileSync(abs + ".meta", JSON.stringify({ transcriptId: "pg2618", host: `lap@${A}`, repo: "turma" }));
+    const raw = path.join(abs + ".raw", "pg2618");
+    fs.mkdirSync(raw, { recursive: true });
+    fs.writeFileSync(path.join(raw, "pg2618.jsonl"), "raw-bytes");
+    assert.equal(archive.backfillPgIndexFromFiles(), 1);
+    assert.equal(archive.sessionRow("pg2618").filePath, rel);
+    archive.__resetTotalCache();
+    archive.totalArchiveBytes();
+    assert.equal(archive.tenantBytes(A), fs.statSync(abs).size + "raw-bytes".length);
+  } finally { archive.__resetTotalCache(); pgTeardown(); }
+});
+
 test("XERK-2549 pg mode: a purge whose Postgres delete was LOST is not undone by the next hydrate", async () => {
   const mem = pgSetup();
   const A = "c".repeat(32);
