@@ -2813,7 +2813,10 @@ test("board: the page widens only its column area; header/toolbar stay at --wrap
 // sessions.test.js / usage.test.js use for their pages.
 
 const BOARD_HTML = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
-const BOARD_SCRIPT = [...BOARD_HTML.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
+// The page opens its stream once its first snapshot is in (XERK-2599, pinned in
+// nav.test.js); these tests drive the stream beside an in-flight fetch, so the
+// harness opens it at load as the page did before.
+const BOARD_SCRIPT = [...BOARD_HTML.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1].replace("\nrefresh().finally(connectSSE);\n", "\nrefresh();\nconnectSSE();\n");
 const TurmaBoardModule = require("../public/board.js");
 
 function loadBoardPage(opts = {}) {

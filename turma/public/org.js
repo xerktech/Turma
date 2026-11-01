@@ -222,31 +222,22 @@
   let sites = [];         // the orgs the fleet currently reports
   let autoMap = {};       // the hub's per-org auto-start opt-in
   let mergeMap = {};      // the hub's per-org auto-merge opt-in (XERK-550)
-  // XERK-2600: which of the two opt-in maps the open SSE stream owns. Once the
-  // stream has delivered a map's frame (or this tab flipped it while the stream
-  // was up), every later change reaches us as a frame too, so a snapshot's copy
-  // can only be the same or OLDER: a /api/agents body that left the hub before
-  // the frame, or the page's cached poll that every render hands back to
-  // update(). Adopting either reverted the switch until the map's next frame.
-  // Cleared when the stream opens (a reconnect's re-read is current) or drops
-  // (frames may be missed, so the pages' polls are the source again).
-  const sseOwns = { auto: false, merge: false };
-  let sseOpen = false;
-  // The snapshot map last offered to update(): a render re-feeding the SAME
-  // cached poll is never news (the cache never learns a frame), so only a newly
-  // fetched body may change a switch. Without this a reconnect, which releases
-  // ownership, let the next render adopt the page-load cache on pages that do
-  // not re-read on reconnect (index, sessions, usage).
-  const snapSeen = { auto: null, merge: null };
-  // Frames received per map, so a click whose POST response was lost does not
-  // roll back over the hub's own word that already arrived.
-  const frames = { auto: 0, merge: 0 };
-  function adoptSnapshot(kind, map) {
-    if (!map || map === snapSeen[kind]) return false;
-    snapSeen[kind] = map;
-    return !sseOwns[kind];
-  }
   let colorPins = {};     // the hub's manual org-color pins (XERK-145)
+  // The snapshot map objects update() last adopted (rollup XERK-2598). Pages
+  // call update(cache) on every render, but no page writes autoStartOrgs /
+  // autoMergeOrgs back into its cache from SSE — so re-adopting the SAME stale
+  // object each render reverted a switch the hub's SSE event (or this tab's
+  // optimistic flip) had just moved. Only a NEW snapshot object is adopted.
+  let seenAuto = null, seenMerge = null, seenColors = null;
+  // XERK-2600: which opt-in maps the open SSE stream owns. Once the stream has
+  // delivered a map's frame, every later change reaches us as a frame too, so a
+  // NEW snapshot can only be the same or OLDER — a /api/agents body that left
+  // the hub before the frame and landed after it, which reverted the switch
+  // until the map's next frame. The stream's open (the page's re-read is
+  // current) and error (frames may be missed; polls are the source) hand the
+  // maps back to the snapshots.
+  const sseOwns = { auto: false, merge: false };
+  function releaseSseOwns() { sseOwns.auto = false; sseOwns.merge = false; }
   let colorFor = null;    // the org whose swatch strip is expanded, or null
   let open = false;
   let slot = null;
@@ -373,9 +364,18 @@
   function update(data) {
     const B = board();
     sites = B.mergeSites((data && data.agents) || []);
-    if (data && adoptSnapshot("auto", data.autoStartOrgs)) autoMap = data.autoStartOrgs;
-    if (data && adoptSnapshot("merge", data.autoMergeOrgs)) mergeMap = data.autoMergeOrgs;
-    if (data && data.orgColors) colorPins = data.orgColors;
+    if (data && data.autoStartOrgs && data.autoStartOrgs !== seenAuto) {
+      seenAuto = data.autoStartOrgs;
+      if (!sseOwns.auto) { autoMap = seenAuto; hubSays("auto", autoMap); }
+    }
+    if (data && data.autoMergeOrgs && data.autoMergeOrgs !== seenMerge) {
+      seenMerge = data.autoMergeOrgs;
+      if (!sseOwns.merge) { mergeMap = seenMerge; hubSays("merge", mergeMap); }
+    }
+    if (data && data.orgColors && data.orgColors !== seenColors) {
+      colorPins = seenColors = data.orgColors;
+      hubSays("color", colorPins);
+    }
     live = true;
     writeCache();
     paint();
@@ -416,92 +416,127 @@
     return attrs.length ? attrs.map(a => `[${a.name}="${CSS.escape(a.value)}"]`).join("") : null;
   }
 
+  // The three hub-owned switches — auto-start, auto-merge, color pin — share one
+  // optimistic-flip path (`flip`). Rules it keeps, each from a defect (rollup
+  // XERK-2598):
+  // - `confirmed[kind]` is the hub's last word: the newest snapshot update()
+  //   adopted, every SSE frame (a whole map), the re-read below, and an OK
+  //   POST's own org. A failed click resolves to THAT, never to the value the
+  //   switch showed when clicked — which may be an earlier click's unconfirmed
+  //   flip, and nothing would ever correct it.
+  // - The hub applies an org's clicks in click order, so once click N is
+  //   answered OK every OLDER click is moot. While a click NEWER than the
+  //   newest OK is in flight the switch shows the newest such click; otherwise
+  //   it shows `confirmed`.
+  // - An answer (OK, re-read) is taken into `confirmed` only if no newer
+  //   click's answer was taken and no SSE frame of the map landed since it was
+  //   asked (a frame is the whole map: newer, and usually this very change). A
+  //   polled snapshot never blocks it — its age is unknown, so with SSE down a
+  //   late answer can still outvote a newer poll until the next one (accepted).
+  // - A POST that failed at the NETWORK level may still have been applied, so
+  //   it re-reads the hub (`hubOrgMap`) and takes ONLY its own org's entry —
+  //   the body may predate an SSE change to another org — and not even that
+  //   when an SSE frame of that map landed during the re-read (newer word).
+  const FIELD = { auto: "autoStartOrgs", merge: "autoMergeOrgs", color: "orgColors" };
+  const ROUTE = { auto: "autostart", merge: "automerge", color: "color" };
+  const confirmed = { auto: {}, merge: {}, color: {} };
+  const hubGen = { auto: 0, merge: 0, color: 0 };
+  const flights = new Map();   // kind\0siteKey -> {next, maxOk, takenAt, pending: n -> value}
+
+  // `fromSse`: a frame bumps the generation; a polled snapshot does not.
+  function hubSays(kind, map, fromSse) { confirmed[kind] = map || {}; if (fromSse) hubGen[kind]++; }
+  // An org's value in a map: true / a slot number, or null for off / auto.
+  function valueIn(kind, map, siteKey) {
+    if (kind !== "color") return autoOn(map, siteKey) ? true : null;
+    return Object.prototype.hasOwnProperty.call(map, siteKey) && Number.isInteger(map[siteKey])
+      ? map[siteKey] : null;
+  }
+  function withValue(map, siteKey, value) {
+    const m = orgMapCopy(map);
+    if (value) m[siteKey] = value; else delete m[siteKey];
+    return m;
+  }
+  function showLocal(kind, siteKey, value) {
+    if (kind === "auto") autoMap = withValue(autoMap, siteKey, value);
+    else if (kind === "merge") mergeMap = withValue(mergeMap, siteKey, value);
+    else colorPins = withValue(colorPins, siteKey, value);
+    paint();
+    if (kind === "color") notify();
+  }
+
+  async function hubOrgMap(field) {
+    try {
+      const r = await fetch("/api/agents");
+      if (!r.ok) return null;
+      const d = await r.json();
+      const m = d && typeof d === "object" ? d[field] : null;
+      return m && typeof m === "object" ? m : null;
+    } catch { return null; }
+  }
+
+  function confirm(kind, siteKey, value) {
+    confirmed[kind] = withValue(confirmed[kind], siteKey, value);
+  }
+
+  async function flip(kind, siteKey, value, body) {
+    const k = kind + "\0" + siteKey;
+    let f = flights.get(k);
+    if (!f) flights.set(k, (f = { next: 0, maxOk: 0, takenAt: 0, pending: new Map() }));
+    const n = ++f.next;
+    f.pending.set(n, value);
+    const clickGen = hubGen[kind];
+    showLocal(kind, siteKey, value);
+    let ok = false, netErr = false;
+    try {
+      const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/${ROUTE[kind]}`,
+        { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify(body) });
+      if (r.status === 401) { location.href = "/login"; return; }
+      ok = r.ok;
+    } catch { netErr = true; /* outcome unknown — re-read below */ }
+    // `takenAt` orders every answer that sets `confirmed`, OK and re-read alike:
+    // an older click's answer never overwrites a newer click's (QA H2).
+    if (ok) {
+      if (n > f.takenAt && hubGen[kind] === clickGen) { confirm(kind, siteKey, value); f.takenAt = n; }
+      if (n > f.maxOk) f.maxOk = n;
+    } else if (netErr) {
+      const gen = hubGen[kind];
+      const hub = await hubOrgMap(FIELD[kind]);
+      if (hub && n > f.takenAt && f.maxOk < n && hubGen[kind] === gen) {
+        confirm(kind, siteKey, valueIn(kind, hub, siteKey));
+        f.takenAt = n;
+      }
+    }
+    f.pending.delete(n);
+    // The newest click still in flight that an OK has not made moot, else the hub's word.
+    let top = 0;
+    for (const m of f.pending.keys()) if (m > f.maxOk && m > top) top = m;
+    if (!f.pending.size) flights.delete(k);     // every answer is in: nothing late can arrive
+    showLocal(kind, siteKey, top ? f.pending.get(top) : valueIn(kind, confirmed[kind], siteKey));
+  }
+
   // Flip an org's hub-side auto-start opt-in (XERK-41). Painted optimistically —
   // the hub is authoritative the moment the POST returns and its SSE event keeps
   // every other open page in step, but the local flip makes THIS one respond
-  // instantly. Rolls back if the POST fails.
-  async function setAutoStart(siteKey, enabled) {
-    const had = autoOn(autoMap, siteKey);
-    const framesAtClick = frames.auto;
-    const ownedAtClick = sseOwns.auto;
-    if (sseOpen) sseOwns.auto = true;   // the cached snapshot predates this flip
-    autoMap = orgMapCopy(autoMap);
-    if (enabled) autoMap[siteKey] = true; else delete autoMap[siteKey];
-    paint();
-    let ok = false;
-    try {
-      const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/autostart`,
-        { method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ enabled }) });
-      if (r.status === 401) { location.href = "/login"; return; }
-      ok = r.ok;
-    } catch { /* network error — fall through to rollback */ }
-    // A frame since the click is the hub's word: keep it over a rollback.
-    if (!ok && frames.auto === framesAtClick) {
-      // Give back only the ownership the click took: a frame from before the
-      // click still owns the map, so an older in-flight poll can't revert it.
-      sseOwns.auto = ownedAtClick;
-      autoMap = orgMapCopy(autoMap);
-      if (had) autoMap[siteKey] = true; else delete autoMap[siteKey];
-      paint();
-    }
+  // instantly. Resolves to the hub's word if the POST fails.
+  function setAutoStart(siteKey, enabled) {
+    return flip("auto", siteKey, enabled ? true : null, { enabled });
   }
 
   // Flip an org's hub-side auto-merge opt-in (XERK-550) — the same optimistic
-  // paint + rollback as setAutoStart. Consequential (it merges to the default
-  // branch unreviewed), so it stays its own switch beside auto-start.
-  async function setAutoMerge(siteKey, enabled) {
-    const had = autoOn(mergeMap, siteKey);
-    const framesAtClick = frames.merge;
-    const ownedAtClick = sseOwns.merge;
-    if (sseOpen) sseOwns.merge = true;  // the cached snapshot predates this flip
-    mergeMap = orgMapCopy(mergeMap);
-    if (enabled) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
-    paint();
-    let ok = false;
-    try {
-      const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/automerge`,
-        { method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ enabled }) });
-      if (r.status === 401) { location.href = "/login"; return; }
-      ok = r.ok;
-    } catch { /* network error — fall through to rollback */ }
-    // A frame since the click is the hub's word: keep it over a rollback.
-    if (!ok && frames.merge === framesAtClick) {
-      // Give back only the ownership the click took: a frame from before the
-      // click still owns the map, so an older in-flight poll can't revert it.
-      sseOwns.merge = ownedAtClick;
-      mergeMap = orgMapCopy(mergeMap);
-      if (had) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
-      paint();
-    }
+  // flip as setAutoStart. Consequential (it merges to the default branch
+  // unreviewed), so it stays its own switch beside auto-start.
+  function setAutoMerge(siteKey, enabled) {
+    return flip("merge", siteKey, enabled ? true : null, { enabled });
   }
 
   // Pin an org's palette slot (1..8), or release it back to auto (slot null) —
-  // XERK-145. Hub-owned durable state like the auto-start opt-in, painted
-  // optimistically and rolled back if the POST fails. notify() runs on every
-  // change so each page repaints its org-tinted cards at once — every page
-  // reads the pins through orgColors() below, so a repaint sees the new map.
-  async function setOrgColor(siteKey, slotN) {
-    const prev = colorPins;
-    colorPins = orgMapCopy(colorPins);
-    if (slotN) colorPins[siteKey] = slotN; else delete colorPins[siteKey];
+  // XERK-145. Hub-owned durable state like the auto-start opt-in, flipped the
+  // same way. notify() runs on every change so each page repaints its
+  // org-tinted cards at once — every page reads the pins through orgColors().
+  function setOrgColor(siteKey, slotN) {
     colorFor = null;
-    paint();
-    notify();
-    let ok = false;
-    try {
-      const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/color`,
-        { method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify(slotN ? { slot: slotN } : { auto: true }) });
-      if (r.status === 401) { location.href = "/login"; return; }
-      ok = r.ok;
-    } catch { /* network error — fall through to rollback */ }
-    if (!ok) {
-      colorPins = prev;
-      paint();
-      notify();
-    }
+    return flip("color", siteKey, slotN || null, slotN ? { slot: slotN } : { auto: true });
   }
 
   // The current org-color pins, for the pages' own card tints: one live source
@@ -512,16 +547,17 @@
   // page hands its EventSource over rather than opening a second one.
   function sse(es) {
     if (!es || !es.addEventListener) return;
-    // A (re)connect or a drop hands the maps back to the snapshots (XERK-2600).
-    const release = (open) => { sseOpen = open; sseOwns.auto = false; sseOwns.merge = false; };
-    es.addEventListener("open", () => release(true));
-    es.addEventListener("error", () => release(false));
+    // A new stream starts unowned: pages open it after re-reading (XERK-2599).
+    releaseSseOwns();
+    const release = releaseSseOwns;   // XERK-2600
+    es.addEventListener("open", release);
+    es.addEventListener("error", release);
     es.addEventListener("autoStartOrgs", (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       autoMap = m || {};
       sseOwns.auto = true;
-      frames.auto++;
+      hubSays("auto", autoMap, true);
       paint();
     });
     es.addEventListener("autoMergeOrgs", (e) => {
@@ -529,13 +565,14 @@
       try { m = JSON.parse(e.data); } catch { return; }
       mergeMap = m || {};
       sseOwns.merge = true;
-      frames.merge++;
+      hubSays("merge", mergeMap, true);
       paint();
     });
     es.addEventListener("orgColors", (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       colorPins = m || {};
+      hubSays("color", colorPins, true);
       paint();
       // The pins tint cards on every page, so a change (this tab's or another's)
       // repaints more than this control.
@@ -544,6 +581,7 @@
   }
 
   function mount(doc) {
+    releaseSseOwns();   // a fresh page: no stream owns anything yet
     slot = doc.getElementById("hdrOrg");
     if (!slot) return;
     // A freshly-mounted control starts closed, with nothing painted and nothing

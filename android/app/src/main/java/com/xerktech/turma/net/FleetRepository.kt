@@ -111,12 +111,14 @@ class FleetRepository(
     fun start() {
         if (pollJob?.isActive == true) return
         pollJob = scope.launch {
+            var first = true
             while (isActive) {
                 refresh()
+                // The stream opens once the first snapshot is in, naming it (XERK-2599).
+                if (first) { first = false; openSse() }
                 delay(POLL_MS)
             }
         }
-        openSse()
     }
 
     fun stop() {
@@ -132,7 +134,9 @@ class FleetRepository(
 
     suspend fun refresh() {
         try {
-            val resp = client.api.listAgents()
+            val r = client.api.listAgentsResponse()
+            if (!r.isSuccessful) throw retrofit2.HttpException(r)
+            val resp = r.body() ?: throw IllegalStateException("empty /api/agents body")
             synchronized(byKey) {
                 // Membership is the snapshot's (a host absent here is gone), but a
                 // record we already hold FRESHER by `lastSeen` is kept, never
@@ -173,6 +177,7 @@ class FleetRepository(
             // records we just kept fresh (XERK-812) — same upward coercion upsert
             // uses for an SSE event.
             emit(_state.value.now.coerceAtLeast(resp.now), error = null)
+            snapshotEtag = r.headers()["ETag"]   // only once the snapshot is applied
         } catch (e: Exception) {
             emit(_state.value.now, error = e.message ?: "hub unreachable")
         }
@@ -353,8 +358,18 @@ class FleetRepository(
         }
     }
 
+    // The ETag of the last snapshot applied. The hub seeds a new /api/events stream
+    // from that snapshot, so another tenant's map change never reaches this client as
+    // the stream's first frame, and sends at connect whatever moved since (XERK-2599).
+    // A later stream names the latest poll too: the next 6s poll replaces every map,
+    // so a frame applied between the two never strands state for long.
+    @Volatile
+    private var snapshotEtag: String? = null
+
     private fun openSse() {
-        val url = config.current.baseUrl + "api/events"
+        val since = snapshotEtag
+        val url = config.current.baseUrl + "api/events" +
+            (if (since.isNullOrEmpty()) "" else "?since=" + java.net.URLEncoder.encode(since, "UTF-8"))
         val listener = object : EventSourceListener() {
             override fun onEvent(source: EventSource, id: String?, type: String?, data: String) {
                 onSseEvent(type, data)

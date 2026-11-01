@@ -315,8 +315,26 @@
     return what ? `${what} failed — ${why}` : why;
   }
 
+  // A page's /api/events stream names the /api/agents snapshot it rendered
+  // (`?since=<ETag>`), so the hub seeds the stream from it and another tenant's map
+  // change never reaches the page as a first frame (XERK-2599). Only a snapshot read
+  // while NO stream is open counts: with one open the page has applied frames past it.
+  // A page that loses its stream calls eventsClosed(), re-reads, and opens a new one.
+  let snapshotEtag = null, streamOpen = false;
+  function noteSnapshot(r) {
+    if (streamOpen || !r || !r.headers || typeof r.headers.get !== "function") return;
+    snapshotEtag = r.headers.get("ETag") || null;
+  }
+  function eventsUrl() {
+    const e = streamOpen ? null : snapshotEtag;
+    streamOpen = true;
+    snapshotEtag = null;
+    return e ? "/api/events?since=" + encodeURIComponent(e) : "/api/events";
+  }
+  function eventsClosed() { streamOpen = false; snapshotEtag = null; }
+
   const api = { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, esc, preserveScroll, toast, refusalText,
-    meLabel, adminOnlyNoteHtml, applyMe, loadMe, ADMIN_ONLY_NOTE };
+    meLabel, adminOnlyNoteHtml, applyMe, loadMe, ADMIN_ONLY_NOTE, noteSnapshot, eventsUrl, eventsClosed };
   if (typeof window !== "undefined") window.TurmaNav = api;
   // Guarded on `document`, not `window`: a test can put a stand-in on a fake
   // global `window` before requiring this and still drive mount() itself.

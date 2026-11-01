@@ -2508,14 +2508,17 @@ function mergeSnapshot(body, since) {
   cache = body;
 }
 
-async function refresh() {
+async function refresh(opts) {
   const since = sseClock;   // captured BEFORE the fetch — the write window is its RTT
   try {
     const r = await fetch("/api/agents");
     if (r.status === 401) return void (location.href = "/login"); // session expired
     mergeSnapshot(await r.json(), since);
+    if (typeof TurmaNav !== "undefined" && TurmaNav.noteSnapshot) TurmaNav.noteSnapshot(r);
   } catch { /* keep last data; the "updated" stamp goes stale visibly */ }
-  render(cache);
+  // A background re-read (the SSE reconnect) must not swap the tree under a
+  // focused <select>, exactly like the poll and the SSE push (bgRender).
+  if (opts && opts.background) bgRender(); else render(cache);
 }
 
 // A full-tree innerHTML swap closes any native <select> popup the user has open
@@ -2592,6 +2595,7 @@ function refetchSoon() {
 // entry; we patch it into `cache` and re-render, so Kill/Spawn/Restart/new
 // question/finished turn appear near-instantly instead of on the next poll.
 // The poll stays as a fallback (slower cadence, skipped while SSE is healthy).
+let sseEverOpen = false;
 let sseOk = false, sseBackoff = 2000;
 function applyAgent(rec) {
   const list = cache.agents || (cache.agents = []);
@@ -2610,9 +2614,17 @@ function applyAgent(rec) {
 }
 function connectSSE() {
   let es;
-  try { es = new EventSource("/api/events"); }
+  try { es = new EventSource(typeof TurmaNav !== "undefined" && TurmaNav.eventsUrl ? TurmaNav.eventsUrl() : "/api/events"); }
   catch { setTimeout(connectSSE, sseBackoff); return; }
-  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  es.onopen = () => {
+    // A RECONNECT re-reads the payload once, as board.html does (rollup XERK-2598):
+    // the hub sends a whole-map event only when this stream's slice CHANGES, so
+    // nothing on a fresh stream repairs what moved while it was down (a hub
+    // restart or rollout) — and the fallback poll runs only while SSE is down.
+    if (sseEverOpen) refresh({ background: true });
+    sseEverOpen = true;
+    sseOk = true; sseBackoff = 2000;
+  };
   es.addEventListener("agent", (e) => {
     try { applyAgent(JSON.parse(e.data)); } catch { return; }
     bgRender();
@@ -2648,11 +2660,13 @@ function connectSSE() {
   TurmaOrg.sse(es);
   es.onerror = () => {
     sseOk = false;
-    // The browser auto-retries an open stream; only re-create one it gave up on.
-    if (es.readyState === EventSource.CLOSED) {
-      setTimeout(connectSSE, sseBackoff);
-      sseBackoff = Math.min(sseBackoff * 2, 30000);
-    }
+    // Never the browser's own retry: it replays the old URL, which the hub never
+    // seeds, so other tenants' first map frames would reach it (XERK-2599). Re-read
+    // the snapshot and open a fresh stream naming it.
+    es.close();
+    if (typeof TurmaNav !== "undefined" && TurmaNav.eventsClosed) TurmaNav.eventsClosed();
+    setTimeout(() => refresh().finally(connectSSE), sseBackoff);
+    sseBackoff = Math.min(sseBackoff * 2, 30000);
   };
 }
 
@@ -2783,8 +2797,8 @@ function addHostCopy(key) {
 }
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && addHost.open) addHostClose(); });
 
-refresh();
-connectSSE();
+// The stream opens once the first snapshot is in, naming it (XERK-2599).
+refresh().finally(connectSSE);
 // Fallback poll: slower now that SSE carries live updates, and skipped entirely
 // while the stream is healthy (and while a <select> popup is open).
 setInterval(() => {
