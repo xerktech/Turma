@@ -23804,6 +23804,14 @@ test("XERK-2603: the memory limit never exceeds what V8's heap can back", () => 
     process.env.MEMORY_LIMIT_BYTES);
 });
 
+test("XERK-2603: the image runs node with the heap share the ceilings assume", () => {
+  // Dropping the flag fails no other gate: prod would silently fall to ~2/3 ceilings.
+  const df = fs.readFileSync(path.join(__dirname, "..", "Dockerfile"), "utf8");
+  const m = df.match(/^ENTRYPOINT .*"--max-old-space-size-percentage=(\d+)"/m);
+  assert.ok(m, "turma/Dockerfile ENTRYPOINT must pass --max-old-space-size-percentage");
+  assert.strictEqual(Number(m[1]), Math.round(hub.HEAP_SHARE * 100));
+});
+
 test("budget: the ceilings are derived from the container limit, and only tighten", async () => {
   // Fixed numbers are what made this a bug: UPLOAD_TOTAL_MAX_BYTES was a flat
   // 128 MiB, DOUBLE the 256m the hub is deployed with, so it could never refuse

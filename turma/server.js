@@ -26479,7 +26479,7 @@ if (process.env.TURMA_TEST) {
     // memory-limited container: the ceilings so a test can hold the arithmetic
     // that derives them from the container limit, and charge/release so the
     // "idle hub admits anything, a busy one does not" rule can be held directly.
-    MEMORY_LIMIT, effectiveMemoryLimit, BODY_INFLIGHT_MAX, BODY_INFLIGHT_TOTAL_MAX, UPLOAD_TOTAL_MAX_BYTES,
+    MEMORY_LIMIT, HEAP_SHARE, effectiveMemoryLimit, BODY_INFLIGHT_MAX, BODY_INFLIGHT_TOTAL_MAX, UPLOAD_TOTAL_MAX_BYTES,
     // The archive route's own ceiling and the refusal record behind it
     // (XERK-356): a test has to be able to hold BOTH — that the hub takes a
     // multi-MB delta at all, and that a refused one is still answerable when the
