@@ -68,6 +68,7 @@ const outcomeLedger = require("./outcome-ledger.js");
 const { resolveHaConfig } = require("./ha-config.js");
 const { createLiveStore, sameValue } = require("./store.js");
 const tenancy = require("./tenancy.js");
+const tenantMigration = require("./tenant-migration.js");
 const routeScope = require("./tenant-scope.js");
 const { createLeader } = require("./leader.js");
 // The archive's object-store backend + mirror (XERK-759, epic XERK-751). The
@@ -521,6 +522,9 @@ const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
 const TICKET_AGENTS_FILE = process.env.TICKET_AGENTS_FILE || "/data/ticket-agents.json";
 // Agent identities (XERK-2381): which agent id is bound to which host name.
 const AGENT_IDENTITIES_FILE = process.env.AGENT_IDENTITIES_FILE || "/data/agent-identities.json";
+// The pre-tenancy migration's marker (XERK-2554): which tenant the deployment moved
+// into, which steps landed, and the untenanted keys it found.
+const TENANT_MIGRATION_FILE = process.env.TENANT_MIGRATION_FILE || "/data/tenant-migration.json";
 // One-time host enrollment codes (XERK-2531): id -> {hash, owner, device?, ...}.
 const ENROLL_CODES_FILE = process.env.ENROLL_CODES_FILE || "/data/enroll-codes.json";
 // Name-token generations (XERK-2384): host -> {gen, at}, bumped by a revoke.
@@ -1650,6 +1654,13 @@ function uidHostRefusal(uid, host, now = Date.now()) {
   for (const [other, o] of Object.entries(agentIdentities)) {
     if (other !== uid && o && lowerName(o.home) === want) return `${host} is registered to another agent — remove it from the dashboard to release the name`;
   }
+  // A TENANT BIND is not a rename (XERK-2533): the identity was bound to a
+  // tenant while it lived under the same plain name, and this beat is that very
+  // agent arriving under its namespaced key. Its old record is carried over, so
+  // there are never two records to share a token between. Ahead of the usage-ledger
+  // check: the pre-tenancy migration (XERK-2554) may already have moved its rows
+  // under that key.
+  if (!tenantOfKey(e.home) && tenantHostKey(e.home, tenantOfUid(uid)) === host) return null;
   if (!mine.has(want)) {
     for (const k of Object.keys(agents)) {
       if (lowerName(k) === want) return `${host} is registered to another agent — remove it from the dashboard to release the name`;
@@ -1659,11 +1670,6 @@ function uidHostRefusal(uid, host, now = Date.now()) {
         `usage history, to reuse the name`;
     }
   }
-  // A TENANT BIND is not a rename (XERK-2533): the identity was bound to a
-  // tenant while it lived under the same plain name, and this beat is that very
-  // agent arriving under its namespaced key. Its old record is carried over, so
-  // there are never two records to share a token between.
-  if (!tenantOfKey(e.home) && tenantHostKey(e.home, tenantOfUid(uid)) === host) return null;
   const home = Object.prototype.hasOwnProperty.call(agents, e.home) ? agents[e.home] : null;
   if (home && home.agentUid === uid && !(home.updating && now < home.updating.until) &&
       now - (home.lastSeen || 0) < OFFLINE_AFTER_MS) {
@@ -7596,7 +7602,9 @@ function dropTenantKeys(map, tenantId, siteOf = (k) => k) {
   }
   return n;
 }
-for (const [name, read, persist, siteOf] of [
+// Every org-keyed store, once (XERK-2551 purge, XERK-2554 migration): its name, a
+// reader, its persist and how to read a key's site (default: the key IS the site).
+const TENANT_ORG_STORES = [
   ["autoStartOrgs", () => autoStartOrgs, () => persistAutoStartOrgs()],
   ["autoMergeOrgs", () => autoMergeOrgs, () => persistAutoMergeOrgs()],
   ["triagePolicies", () => triagePolicies, () => persistTriagePolicies()],
@@ -7614,7 +7622,8 @@ for (const [name, read, persist, siteOf] of [
   ["ticketPlatforms", () => ticketPlatforms, () => persistTicketPlatforms(), siteOfTicketKey],
   ["triageActions", () => ticketTriageActions, () => persistTriageActions(), siteOfTicketKey],
   ["epicRuns", () => epicRuns, () => persistEpicRuns(), siteOfTicketKey],
-]) {
+];
+for (const [name, read, persist, siteOf] of TENANT_ORG_STORES) {
   registerTenantPurge(name, (t) => {
     const n = dropTenantKeys(read(), t, siteOf);
     if (n) persist();
@@ -7645,6 +7654,501 @@ registerTenantPurge("devices", (t) => {
   if (devices.length !== before) persistDevices();
   return before - devices.length;
 });
+
+// ---- Moving the pre-tenancy deployment into one tenant (XERK-2554) ---------
+// `TURMA_MIGRATE_OWNER` (a local username or OIDC subject; turma/tenancy.js
+// `ensureOwner`) names the user whose tenant takes over everything the hub held
+// before tenancy: hosts, org settings and queues, ledgers, the routing policy,
+// the archive's rows and the push devices. The run lives in
+// turma/tenant-migration.js; each store contributes one idempotent step below.
+// Until it completes, no tenant user is served tenant data
+// (`tenantMigrationGateClosed`). Rationale + rollback: docs/multi-tenant-adr.md.
+const MIGRATE_OWNER = (process.env.TURMA_MIGRATE_OWNER || "").trim();
+const MIGRATE_DRY_RUN = /^(1|true|yes)$/i.test((process.env.TURMA_MIGRATE_DRY_RUN || "").trim());
+// How long after completion the leftover sweep keeps re-keying the migrated
+// hosts' late rows (a record pruned after a week offline, a ledger rescan).
+const MIGRATE_SETTLE_MS = positiveEnv("TURMA_MIGRATE_SETTLE_MS", 14 * 24 * 3600 * 1000);
+const MIGRATE_LEFTOVER_EVERY_MS = 5 * 60 * 1000;
+let tenantMigrationMarker = tenantMigration.coerceMarker(readJsonFile(TENANT_MIGRATION_FILE));
+const persistTenantMigration = registerExternalStore({
+  name: "tenantMigration", file: TENANT_MIGRATION_FILE, debounceMs: 0,
+  coerce: tenantMigration.coerceMarker, read: () => tenantMigrationMarker,
+  install: (v) => { tenantMigrationMarker = v; invalidateAgentsCache(); },
+});
+let tenantMigrationRunning = null;     // the in-flight run's promise
+let tenantMigrationLastError = "";
+let tenantMigrationLeftoverAt = 0;
+// The tenant the pre-tenancy deployment now belongs to, or "" (none / not done).
+function migratedTenant() {
+  return tenantMigrationMarker.completedAt ? tenantMigrationMarker.tenantId : "";
+}
+// While the owner is configured and the move has not completed, a TENANT user is
+// served no tenant data: half-moved state is never what it sees. Operators keep
+// the (still untenanted) fleet meanwhile.
+// A dry run moves nothing, so it closes nothing either.
+function tenantMigrationGateClosed() {
+  return !!MIGRATE_OWNER && !MIGRATE_DRY_RUN && !tenantMigrationMarker.completedAt;
+}
+const TENANT_MIGRATION_GATED = new Set(["host", "session", "org", "repo", "transcript", "filtered"]);
+function tenantMigrationRefuses(p, route) {
+  // The ws-token is the /live socket's credential, so it is gated with the data.
+  return !!(tenantMigrationGateClosed() && p && p.kind === "user" && route &&
+    (TENANT_MIGRATION_GATED.has(route.cls) || route.pattern === "/api/ws-token"));
+}
+
+// What a pass moves: `scope` null = everything untenanted (the first run), else
+// only the keys the marker recorded (the leftover sweep and a bind beat).
+const plainKey = (k) => typeof k === "string" && k !== "" && !tenantOfKey(k);
+function migrateSiteKey(site, t) { return scopeSite(site, t); }
+function migrateTicketKey(k, t, siteOf) {
+  const site = siteOf(k);
+  return site === k ? scopeSite(k, t) : scopeSite(site, t) + k.slice(site.length);
+}
+// Merge a moved value into one the tenant already holds: the tenant's wins, a
+// list keeps the tenant's entries and appends the moved ones it lacks.
+function mergeMovedValue(into, moved) {
+  if (Array.isArray(into) && Array.isArray(moved)) {
+    const seen = new Set(into.map((x) => JSON.stringify(x)));
+    return into.concat(moved.filter((x) => !seen.has(JSON.stringify(x))));
+  }
+  if (into && typeof into === "object" && moved && typeof moved === "object" &&
+      !Array.isArray(into) && !Array.isArray(moved)) return { ...moved, ...into };
+  return into;
+}
+// A host's data may move once nothing still runs under its plain name: a live
+// plain record moves at its own bind beat (tenantMigrationOnBind), so a host
+// that has not re-beaten yet never splits its rows across two keys.
+function hostMovable(k, scope) {
+  if (!plainKey(k) || Object.prototype.hasOwnProperty.call(agents, k)) return false;
+  if (!scope) return true;
+  if (!scope.hosts.has(k)) return false;
+  // Once the migrated host has arrived on its tenant key, a row under its plain
+  // name is no longer its: an operator re-used the name (QA). Only its own bind
+  // beat, which moves what it left behind, still takes them.
+  return !!scope.atBind || !migratedHostArrived(k, scope.t);
+}
+// Whether the agent migrated from plain name `k` has beaten as `<k>@<t>`.
+function migratedHostArrived(k, t) {
+  // Recorded on the marker at the bind beat, so a later Remove + revoke (which
+  // deletes the identity) cannot make the name look unarrived (QA).
+  if ((tenantMigrationMarker.arrived || []).includes(k)) return true;
+  const tk = tenantHostKey(k, t);
+  return Object.values(agentIdentities).some((e) => e && !e.revoked && e.tenantId === t && e.home === tk &&
+    (e.origin === k || (Array.isArray(e.names) && e.names.includes(k))));
+}
+// Whether the live plain record `k` is a migrated host still on its way into
+// tenant `t` (bound, not yet re-beaten) — not an operator's host that re-used a
+// recorded name (QA): only the migrated agent's record carries a bound identity.
+function migratingRecord(k, t) {
+  const a = agents[k];
+  return !!(a && a.agentUid && tenantOfUid(a.agentUid) === t);
+}
+// Under a scope (after the move) an org moves only while no untenanted host the
+// migration did NOT record works in it: once an operator enrolls a new host in
+// that org, its plain settings and queue are the operators' again.
+function siteMovable(site, scope) {
+  if (!plainKey(site)) return false;
+  if (!scope) return true;
+  if (!scope.sites.has(site)) return false;
+  // A recorded host still on its way in (its record carries the bound identity)
+  // is the tenant's, also at another host's bind beat (QA: a one-host scope split
+  // outcome rows); an operator host that re-used a recorded name is not.
+  for (const [k, a] of Object.entries(agents)) {
+    if (!a || !plainKey(k) || (scope.recorded.has(k) && migratingRecord(k, scope.t))) continue;
+    if ((a.jira && a.jira.siteKey === site) || a.orgBound === site) return false;
+  }
+  return true;
+}
+function orgStoreStep([name, read, persist, siteOf = (k) => k]) {
+  const keys = (scope) => Object.keys(read()).filter((k) => siteMovable(siteOf(k), scope));
+  return {
+    name,
+    count: (t, scope) => keys(scope).length,
+    apply: (t, scope) => {
+      const map = read();
+      const moving = keys(scope);
+      for (const k of moving) {
+        const nk = migrateTicketKey(k, t, siteOf);
+        const v = map[k];
+        if (v && typeof v === "object") { scopeSiteKeys(v, t); scopeHostFields(v, t); }
+        map[nk] = Object.prototype.hasOwnProperty.call(map, nk) ? mergeMovedValue(map[nk], v) : v;
+        delete map[k];
+      }
+      if (moving.length) persist();
+      return moving.length;
+    },
+  };
+}
+// A moved org-store value's `host` fields (a brief's or meeting's running host, a
+// ticket's agent pin) follow their host into the tenant.
+function scopeHostFields(v, t, depth = 0) {
+  if (!v || typeof v !== "object" || depth > 4) return;
+  for (const k of Object.keys(v)) {
+    if (k === "host" && plainKey(v[k])) v[k] = tenantHostKey(v[k], t);
+    else if (v[k] && typeof v[k] === "object") scopeHostFields(v[k], t, depth + 1);
+  }
+}
+const tenantMigrationSteps = [];
+function registerTenantMigration(step) { tenantMigrationSteps.push(step); }
+
+// Hosts first: every untenanted agent identity is bound to the tenant, exactly as
+// a tenant user's `roll-token?bind=1` binds one (XERK-2533/2583). A host already
+// on its identity token arrives as `<device>@<tenant>` on its next beat, carrying
+// its record over; one still on a name or the master token is handed its
+// identity token (`setToken` + `bindTenant`), so no host is re-enrolled. A
+// released or revoked identity is left alone (it may not come home bound).
+function untenantedHostsToBind(scope) {
+  const out = [];
+  for (const [key, a] of Object.entries(agents)) {
+    if (!plainKey(key) || !a || !hostKeyUsable(key) || !TURMA_AGENT_TOKEN) continue;
+    if (scope && !scope.hosts.has(key)) continue;
+    const uid = a.agentUid && identityOf(a.agentUid) ? a.agentUid : identityByOrigin(key);
+    const e = uid ? identityOf(uid) : null;
+    if (e && (e.tenantId || e.released)) continue;
+    // Under a scope, only a host whose identity predates the run (a binding that
+    // never landed is redone); a host an operator enrolled under a recorded name
+    // afterwards is never taken.
+    if (scope && !(e && (e.at || 0) <= tenantMigrationMarker.startedAt)) continue;
+    out.push(key);
+  }
+  return out;
+}
+// A recorded host whose identity the run already bound but which still beats
+// plain on its name token without the setToken (its record pruned while offline
+// took the queued command with it): hand it the identity again (QA).
+function boundHostsAwaitingToken(scope, t) {
+  if (!scope) return [];
+  const out = [];
+  for (const [key, a] of Object.entries(agents)) {
+    if (!plainKey(key) || !a || !scope.hosts.has(key) || !TURMA_AGENT_TOKEN) continue;
+    const uid = identityByOrigin(key);
+    const e = uid ? identityOf(uid) : null;
+    if (!e || e.tenantId !== t || e.home !== key || e.released) continue;
+    if ((a.uidBound && a.agentUid === uid) || (a.commands || []).some((c) => c.type === "setToken")) continue;
+    out.push([key, uid]);
+  }
+  return out;
+}
+registerTenantMigration({
+  name: "hosts",
+  // Under a scope only the hosts the run recorded: a crash before the bindings
+  // were written re-binds them on the next sweep, never an operator's new host.
+  count: (t, scope) => untenantedHostsToBind(scope).length + boundHostsAwaitingToken(scope, t).length,
+  apply: (t, scope) => {
+    let n = 0;
+    for (const [key, uid] of boundHostsAwaitingToken(scope, t)) {
+      // Stamp the record with the identity, as issueAgentUid does: the bind beat
+      // carries over only a record bound to the beating identity (QA: else the
+      // plain record stays behind as a ghost and its rows split).
+      agents[key].agentUid = uid;
+      publishAgent(key);
+      queueCommand(key, { type: "setToken", token: uidAgentToken(uid), bindTenant: t });
+      n++;
+    }
+    if (!scope) {
+      for (const k of Object.keys(agents)) {
+        if (plainKey(k) && (!hostKeyUsable(k) || !TURMA_AGENT_TOKEN)) {
+          console.warn(`tenant migration: ${logName(k)} cannot be bound (no fleet master token or no ` +
+            "usable host name) — it stays the operators' until it is rolled with ?bind=1");
+        }
+      }
+    }
+    for (const key of untenantedHostsToBind(scope)) {
+      const uid = issueAgentUid(key);
+      if (!uid || !bindIdentityTenant(uid, t)) {
+        console.warn(`tenant migration: ${logName(key)} cannot be bound (no fleet master token or no usable ` +
+          "host name) — roll its token with ?bind=1 once it can be");
+        continue;
+      }
+      const a = agents[key];
+      // On its identity token already: its next beat lands on the tenant key.
+      if (!(a.uidBound && a.agentUid === uid) && !(a.commands || []).some((c) => c.type === "setToken")) {
+        queueCommand(key, { type: "setToken", token: uidAgentToken(uid), bindTenant: t });
+      }
+      n++;
+    }
+    return n;
+  },
+});
+// Identities with no live record (offline past the prune) bind too, so the
+// host is its tenant's whenever it comes back.
+registerTenantMigration({
+  name: "agentIdentities",
+  count: (t, scope) => Object.values(agentIdentities)
+    .filter((e) => e && !e.revoked && !e.released && !e.tenantId && plainKey(e.home) &&
+      (!scope || (scope.hosts.has(e.home) && (e.at || 0) <= tenantMigrationMarker.startedAt))).length,
+  apply: (t, scope) => {
+    let n = 0;
+    for (const [uid, e] of Object.entries(agentIdentities)) {
+      if (!e || e.revoked || e.released || e.tenantId || !plainKey(e.home)) continue;
+      if (scope && (!scope.hosts.has(e.home) || (e.at || 0) > tenantMigrationMarker.startedAt)) continue;
+      if (bindIdentityTenant(uid, t)) n++;
+    }
+    return n;
+  },
+});
+registerTenantMigration({
+  name: "devices",
+  count: (t, scope) => (scope ? 0 : devices.filter((d) => d && !d.tenantId).length),
+  apply: (t, scope) => {
+    if (scope) return 0;
+    let n = 0;
+    devices = devices.map((d) => (d && !d.tenantId ? (n++, { ...d, tenantId: t }) : d));
+    if (n) persistDevices();
+    return n;
+  },
+});
+for (const store of TENANT_ORG_STORES) registerTenantMigration(orgStoreStep(store));
+registerTenantMigration({
+  name: "epicBuilders",
+  count: (t, scope) => Object.values(epicBuilders).filter((r) => r && siteMovable(r.siteKey, scope)).length,
+  apply: (t, scope) => {
+    let n = 0;
+    for (const r of Object.values(epicBuilders)) {
+      if (r && siteMovable(r.siteKey, scope)) { r.siteKey = migrateSiteKey(r.siteKey, t); n++; }
+    }
+    if (n) publishEpicBuilders();
+    return n;
+  },
+});
+registerTenantMigration({
+  name: "ticketQueue",
+  count: (t, scope) => ticketQueue.filter((e) => siteMovable(e.siteKey, scope)).length,
+  apply: (t, scope) => {
+    let n = 0;
+    for (const e of ticketQueue) {
+      if (siteMovable(e.siteKey, scope)) { e.siteKey = migrateSiteKey(e.siteKey, t); n++; }
+    }
+    if (n) publishTicketQueue();
+    return n;
+  },
+});
+// The routing policy's untenanted keys become the tenant's (`<t>:<class>/<model>`).
+registerTenantMigration({
+  name: "modelPolicy",
+  count: (t, scope) => (scope ? 0 : Object.keys(modelPolicyState).filter((k) => modelPolicyKeyParts(k).tenant === "").length),
+  apply: (t, scope) => {
+    if (scope) return 0;
+    let n = 0;
+    for (const k of Object.keys(modelPolicyState)) {
+      const { tenant, cls, model } = modelPolicyKeyParts(k);
+      if (tenant !== "") continue;
+      const nk = modelPolicyKey(t, cls, model);
+      if (!Object.prototype.hasOwnProperty.call(modelPolicyState, nk)) modelPolicyState[nk] = modelPolicyState[k];
+      delete modelPolicyState[k];
+      n++;
+    }
+    if (n) persistModelPolicy();
+    return n;
+  },
+});
+// The ledgers: a row's tenant is its host key (XERK-2550), so each host's rows
+// move under `<device>@<tenant>` — the binding alone never carries them.
+registerTenantMigration({
+  name: "usageLedger",
+  count: (t, scope) => usageLedger.keys().filter((k) => hostMovable(k, scope)).length,
+  apply: (t, scope) => usageLedger.keys().filter((k) => hostMovable(k, scope))
+    .filter((k) => usageLedger.rekeyHost(k, tenantHostKey(k, t),
+      { siteKey: (s) => (plainKey(s) ? scopeSite(s, t) : s) })).length,
+});
+registerTenantMigration({
+  name: "permissionLedger",
+  count: (t, scope) => permissionLedger.hostKeys().filter((k) => hostMovable(k, scope)).length,
+  apply: (t, scope) => {
+    let n = 0;
+    for (const k of permissionLedger.hostKeys().filter((h) => hostMovable(h, scope))) {
+      n += permissionLedger.rekeyHost(k, tenantHostKey(k, t));
+    }
+    return n;
+  },
+});
+registerTenantMigration({
+  name: "outcomeLedger",
+  count: (t, scope) => outcomeLedger.hostKeys().filter((k) => hostMovable(k, scope)).length,
+  apply: (t, scope) => outcomeLedger.rekey(
+    (h) => (hostMovable(h, scope) ? tenantHostKey(h, t) : null),
+    // A row's site moves with its host — never a live plain host's row early, and
+    // a row already on the tenant's host left on a plain site is healed.
+    (s, row) => ((hostMovable(row.host, scope) || tenantOfKey(row.host) === t) && siteMovable(s, scope)
+      ? scopeSite(s, t) : null)),
+});
+// The archive's rows (files stay where they are, XERK-2549): host and decided org.
+function archiveRowsToMove(scope) {
+  return archive.listRowOwners().filter((r) => hostMovable(r.host, scope));
+}
+registerTenantMigration({
+  name: "archive",
+  count: (t, scope) => archiveRowsToMove(scope).length,
+  apply: (t, scope) => {
+    let n = 0;
+    for (const r of archiveRowsToMove(scope)) {
+      const site = typeof r.siteKey === "string" && r.siteKey ? scopeSite(r.siteKey, t) : r.siteKey;
+      if (archive.rekeyOwner(r.transcriptId, tenantHostKey(r.host, t), site)) n++;
+    }
+    return n;
+  },
+});
+
+// The untenanted host and org keys the deployment holds now — recorded on the
+// marker when the run starts, so later leftovers are re-keyed for them only.
+function tenantMigrationSnapshot() {
+  const hosts = new Set();
+  const sites = new Set();
+  const addHost = (k) => { if (plainKey(k)) hosts.add(k); };
+  const addSite = (k) => { if (plainKey(k)) sites.add(k); };
+  for (const [k, a] of Object.entries(agents)) {
+    addHost(k);
+    if (a && a.jira) addSite(a.jira.siteKey);
+    if (a) addSite(a.orgBound);
+  }
+  for (const e of Object.values(agentIdentities)) if (e) addHost(e.home);
+  usageLedger.keys().forEach(addHost);
+  permissionLedger.hostKeys().forEach(addHost);
+  outcomeLedger.hostKeys().forEach(addHost);
+  outcomeLedger.siteKeys().forEach(addSite);
+  for (const r of archive.listRowOwners()) { addHost(r.host); addSite(r.siteKey); }
+  for (const [, read, , siteOf = (k) => k] of TENANT_ORG_STORES) {
+    for (const k of Object.keys(read())) addSite(siteOf(k));
+  }
+  return { hosts: [...hosts], sites: [...sites] };
+}
+
+// Everything a step changed reaches disk before the marker records the step: the
+// file stores and state.json debounce, so a hub killed just after "done" would
+// otherwise boot with a completed marker over data that never moved (QA). Under
+// HA the external stores write through; the registry and ledgers are flushed.
+async function flushMigratedStores() {
+  flushStateNow();
+  if (!HA_ON && typeof liveStore.flush === "function") liveStore.flush();
+  await Promise.all([usageLedger, permissionLedger, outcomeLedger].map((l) =>
+    new Promise((resolve) => { try { l.flush(() => resolve()); } catch { resolve(); } })));
+}
+// A refusal or failure the tick retries every 15s is logged when it changes, and
+// at most hourly while it holds.
+let tenantMigrationLoggedAt = 0;
+let tenantMigrationLogged = "";
+function logTenantMigrationError(msg) {
+  const now = Date.now();
+  if (msg === tenantMigrationLogged && now - tenantMigrationLoggedAt < 3600e3) return;
+  tenantMigrationLogged = msg;
+  tenantMigrationLoggedAt = now;
+  console.error(`${msg} — the tenant routes stay closed until it runs`);
+}
+// Resolve (or create) the owner, then run/resume the migration. Leader-only; a
+// failure leaves the tenant routes closed and is retried by the leader tick.
+async function runTenantMigration() {
+  if (!MIGRATE_OWNER || tenantMigrationMarker.completedAt) return null;
+  if (tenantMigrationRunning) return tenantMigrationRunning;
+  tenantMigrationRunning = (async () => {
+    let owned;
+    if (MIGRATE_DRY_RUN) {
+      // A dry run creates nobody: an owner still to be created counts under a
+      // placeholder tenant (the counts do not depend on it).
+      const found = tenancy.findOwner(tenancyState, MIGRATE_OWNER);
+      if (!found) console.log(`tenant migration (dry run): the owner ${MIGRATE_OWNER} does not exist yet — a real run would create it`);
+      owned = { user: found || { id: "", tenantId: "0".repeat(32) }, created: false };
+    } else {
+      let iss;
+      if (OIDC_ENABLED && /^oidc:/.test(MIGRATE_OWNER) && !tenancy.findOwner(tenancyState, MIGRATE_OWNER)) {
+        iss = (await oidcDiscovery()).issuer;
+      }
+      owned = tenancy.ensureOwner(tenancyState, MIGRATE_OWNER, { iss });
+    }
+    if (owned.created) {
+      setTenancy(owned.state);
+      console.log(`tenant migration: created the owner (user ${owned.user.id}, ${owned.user.source})` +
+        (owned.user.source === "local" ? " — set its password in the admin panel before it can sign in" : ""));
+    }
+    // The moved rows count toward the owner's archive quota (XERK-2618 charges a
+    // row's files to its host's tenant), so an archive past it would refuse the
+    // owner's new transcripts from the first push. Say so before anything moves.
+    if (!tenantMigrationMarker.completedAt && archive.ARCHIVE_TENANT_MAX > 0) {
+      // Every untenanted row: a live host's move at its bind beat, not now, but
+      // they move all the same (QA: counting only today's movable rows read 0).
+      const bytes = archive.listRowOwners().filter((r) => plainKey(r.host)).reduce((n, r) => n + (r.bytes || 0), 0) +
+        archive.tenantBytes(owned.user.tenantId);
+      if (bytes >= archive.ARCHIVE_TENANT_MAX) {
+        console.warn(`WARNING: tenant migration: the owner's archive will hold ${bytes} bytes, over its ` +
+          `${archive.ARCHIVE_TENANT_MAX}-byte quota (ARCHIVE_TENANT_MAX_BYTES) — raise it (or set 0) ` +
+          "before migrating, or the owner's new transcripts are refused");
+      }
+    }
+    const r = await tenantMigration.runMigration({
+      steps: tenantMigrationSteps, marker: tenantMigrationMarker,
+      tenantId: owned.user.tenantId, owner: owned.user.id, dryRun: MIGRATE_DRY_RUN,
+      snapshot: tenantMigrationSnapshot,
+      save: async (m) => {
+        await flushMigratedStores();
+        tenantMigrationMarker = m;
+        await persistTenantMigration();
+        if (!HA_ON && typeof liveStore.flush === "function") liveStore.flush();
+      },
+      log: (l) => (/failed/.test(l) ? logTenantMigrationError(l) : console.log(l)),
+    });
+    if (r.state === "refused") logTenantMigrationError(`tenant migration refused: ${r.error}`);
+    tenantMigrationLastError = r.error || "";
+    if (r.state === "done") invalidateAgentsCache();
+    return r;
+  })().catch((e) => {
+    const msg = `tenant migration failed: ${String((e && e.message) || e)}`;
+    logTenantMigrationError(msg);
+    tenantMigrationLastError = msg;
+    return { state: "failed", error: msg };
+  }).finally(() => { tenantMigrationRunning = null; });
+  return tenantMigrationRunning;
+}
+// Re-key what the migrated hosts and orgs still left untenanted (`scope` = the
+// marker's keys), on its own and with `onlyHost` at one host's bind beat.
+function migrateTenantLeftovers(onlyHost) {
+  const t = migratedTenant();
+  if (!t) return 0;
+  const recorded = new Set(tenantMigrationMarker.hosts);
+  const scope = {
+    hosts: onlyHost ? new Set([onlyHost].filter((h) => recorded.has(h))) : recorded,
+    sites: new Set(tenantMigrationMarker.sites),
+    recorded, t, atBind: !!onlyHost,
+  };
+  let n = 0;
+  for (const s of tenantMigrationSteps) {
+    try { n += Number(s.apply(t, scope)) || 0; } catch (e) {
+      console.error(`tenant migration leftovers: ${s.name} failed: ${(e && e.message) || e}`);
+    }
+  }
+  if (n) {
+    invalidateAgentsCache();
+    console.log(`tenant migration: re-keyed ${n} leftover row(s)${onlyHost ? ` for ${logName(onlyHost)}` : ""}`);
+  }
+  return n;
+}
+// A migrated host's first beat on its tenant key (the bind beat): its plain
+// record is gone, so its rows follow now rather than at the next sweep.
+function tenantMigrationOnBind(fromKey, toKey) {
+  const t = migratedTenant();
+  if (!t || tenantOfKey(toKey) !== t || !tenantMigrationMarker.hosts.includes(fromKey)) return;
+  migrateTenantLeftovers(fromKey);
+  if (!(tenantMigrationMarker.arrived || []).includes(fromKey)) {
+    tenantMigrationMarker = tenantMigration.coerceMarker({
+      ...tenantMigrationMarker, arrived: [...(tenantMigrationMarker.arrived || []), fromKey],
+    });
+    persistTenantMigration();
+  }
+}
+// Leader tick: run/resume an incomplete migration, else sweep leftovers for
+// TURMA_MIGRATE_SETTLE_MS after completion.
+let tenantMigrationDryRunLogged = false;
+function tenantMigrationTick(now = Date.now()) {
+  if (!MIGRATE_OWNER) return;
+  if (!tenantMigrationMarker.completedAt) {
+    // A dry run counts and logs once; it never moves anything.
+    if (!MIGRATE_DRY_RUN || !tenantMigrationDryRunLogged) runTenantMigration();
+    tenantMigrationDryRunLogged = true;
+    return;
+  }
+  if (now - tenantMigrationMarker.completedAt > MIGRATE_SETTLE_MS) return;
+  if (now - tenantMigrationLeftoverAt < MIGRATE_LEFTOVER_EVERY_MS) return;
+  tenantMigrationLeftoverAt = now;
+  migrateTenantLeftovers();
+}
 
 // One agent record shaped exactly as /api/agents returns it: the (potentially
 // large) on-demand caches (session history, Jira issue detail) stripped — each
@@ -19671,7 +20175,9 @@ function meetingsTenant(req) {
   const header = req.headers.authorization || "";
   if (!TURMA_MEETINGS_TOKEN || !header.startsWith("Bearer ")) return null;
   const bearer = header.slice(7);
-  if (safeEqual(bearer, TURMA_MEETINGS_TOKEN)) return "";
+  // The fleet token posts for the untenanted orgs — after the pre-tenancy
+  // migration (XERK-2554) those are its owner's, so Tenir needs no new token.
+  if (safeEqual(bearer, TURMA_MEETINGS_TOKEN)) return migratedTenant();
   const m = /^tm1\.([0-9a-f]{32})\.[A-Za-z0-9_-]{43}$/.exec(bearer);
   const stored = m && Object.hasOwn(meetingTokens, m[1]) ? meetingTokens[m[1]] : null;
   if (!stored || !safeEqual(sha256Hex(bearer), stored.hash)) return null;
@@ -20071,6 +20577,9 @@ function decisionsTick(now = Date.now()) {
 function masterOrchestrationTick() {
   if (!isLeader()) return;
   if (Date.now() - BOOT_AT < BOOT_GRACE_MS) return;
+  // Move the pre-tenancy deployment into its owner's tenant (XERK-2554): run or
+  // resume it, then sweep the migrated hosts' leftovers for a settle window.
+  tenantMigrationTick();
   // Work dispatched to a host that then died before taking it goes back in the
   // queue (XERK-303), in time for the drain at the end of this same tick to hand
   // it to a host that is actually up.
@@ -21900,6 +22409,14 @@ const server = http.createServer(async (req, res) => {
       return json(res, 401, { error: "unauthorized" });
     }
 
+    // Until the pre-tenancy migration completes (XERK-2554) a tenant user is
+    // served no tenant data — never a half-moved fleet. 503: it is temporary.
+    if (tenantMigrationGateClosed() &&
+        tenantMigrationRefuses(requestPrincipal(req), routeScope.classifyRoute(req.method, parts))) {
+      res.setHeader("Retry-After", "30");
+      return json(res, 503, { error: "this hub is moving its existing data into its owner's tenant — try again shortly" });
+    }
+
     // Every OPERATOR route on one host — spawn, kill, roll, migrate, input,
     // remove, … — answers only a principal that may drive that host (XERK-2533):
     // a tenant's host for that tenant, an untenanted one for the hub's operators.
@@ -23062,6 +23579,8 @@ const server = http.createServer(async (req, res) => {
         // A TENANT BIND moved the host to `<name>@<t>` (XERK-2533), but its live
         // tunnel is still registered under the plain name, so its terminals read
         // offline. Close it: the agent re-dials and lands on the new key.
+        // A host the pre-tenancy migration bound (XERK-2554): its rows follow it now.
+        if (movedFrom && !tenantOfKey(movedFrom) && tenantOfKey(key)) tenantMigrationOnBind(movedFrom, key);
         if (movedFrom && !tenantOfKey(movedFrom) && tenantOfKey(key) && controlChannels[movedFrom]) {
           const ch = controlChannels[movedFrom];
           try { ch.socket.end(wsEncode(0x8, Buffer.from([0x03, 0xe9]))); } catch { /* gone */ }
@@ -24365,7 +24884,7 @@ const server = http.createServer(async (req, res) => {
     // fails fast with a clear error instead of silently landing on the agent.
     if (req.method === "POST" && url.pathname === "/api/trigger") {
       const body = JSON.parse((await readBody(req)) || "{}");
-      const hostname = typeof body.hostname === "string" ? body.hostname.trim() : "";
+      let hostname = typeof body.hostname === "string" ? body.hostname.trim() : "";
       const repo = typeof body.repo === "string" ? body.repo.trim() : "";
       const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
       if (!hostname) return json(res, 400, { error: "hostname required" });
@@ -24379,7 +24898,13 @@ const server = http.createServer(async (req, res) => {
       const trigHeader = req.headers.authorization || "";
       const viaTriggerToken = !!TURMA_TRIGGER_TOKEN && trigHeader.startsWith("Bearer ") &&
         safeEqual(trigHeader.slice(7), TURMA_TRIGGER_TOKEN);
-      const mayDrive = viaTriggerToken ? !tenantOfKey(hostname)
+      // After the pre-tenancy migration (XERK-2554) the token's untenanted fleet
+      // is its owner's, so it names a host by its plain device name as before.
+      const trigTenant = viaTriggerToken ? migratedTenant() : "";
+      if (trigTenant && !tenantOfKey(hostname) && agents[tenantHostKey(hostname, trigTenant)]) {
+        hostname = tenantHostKey(hostname, trigTenant);
+      }
+      const mayDrive = viaTriggerToken ? (!tenantOfKey(hostname) || tenantOfKey(hostname) === trigTenant)
         : principalMayDriveHost(requestPrincipal(req), hostname);
       const agent = mayDrive ? agents[hostname] : null;
       if (!agent) return json(res, 404, { error: "unknown host" });
@@ -26332,6 +26857,11 @@ server.on("upgrade", async (req, socket, head) => {
     socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
     return socket.destroy();
   }
+  // A tenant user's terminal waits for the pre-tenancy migration too (XERK-2554).
+  if (parts[0] === "term" && tenantMigrationRefuses(requestPrincipal(req), routeScope.classifyUpgrade(parts))) {
+    socket.write("HTTP/1.1 503 Service Unavailable\r\nRetry-After: 30\r\n\r\n");
+    return socket.destroy();
+  }
 
   // Agent control channel: persistent, carries {open:ch, port} requests to the agent.
   if (parts[0] === "agent" && parts[1] === "control") {
@@ -26829,6 +27359,13 @@ if (process.env.TURMA_TEST) {
     __resetArchivePurgedTenants: () => { archivePurgedTenants = archivePurgedTenantsCoerce({}); },
     registerTenantPurge, purgeTenantData, ledgerVisible, ledgerScopeKey, tenantScope, subscriptionKeyOf,
     shadowHostFor,
+    // XERK-2554: the pre-tenancy migration.
+    runTenantMigration, migrateTenantLeftovers, tenantMigrationTick, tenantMigrationGateClosed,
+    logTenantMigrationError,
+    tenantMigrationSteps, tenantMigrationPurgeNames: () => [...tenantPurges.keys()],
+    tenantMigrationMarker: () => tenantMigrationMarker, migratedTenant,
+    tenantOrgStores: () => TENANT_ORG_STORES.map(([name, read, persist]) => ({ name, read, persist })),
+    devicesState: () => devices, ticketQueue, modelPolicyKeyParts,
     __modelPolicyState: () => modelPolicyState,
     __setModelPolicy: (mode) => { MODEL_POLICY = mode; invalidateAgentsCache(); },
     __setModelPolicyState: (v) => { modelPolicyState = modelPolicyCoerce(v); invalidateAgentsCache(); },

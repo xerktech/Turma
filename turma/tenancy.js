@@ -357,6 +357,68 @@ function bootstrapAdmin(state, { username, password, now = Date.now() }) {
   });
 }
 
+// The owner TURMA_MIGRATE_OWNER names (XERK-2554): `local:<username>`,
+// `oidc:<sub>`, or a bare value matched as a local username first, then as the
+// subject of exactly one OIDC user. Returns {kind, value} or null when the spec is
+// malformed.
+function parseOwnerSpec(spec) {
+  const s = typeof spec === "string" ? spec.trim() : "";
+  const m = /^(local|oidc):(.+)$/.exec(s);
+  const kind = m ? m[1] : "";
+  const value = m ? m[2] : s;
+  if (!value) return null;
+  if (kind !== "oidc" && !USERNAME_RE.test(value)) return kind === "local" ? null : { kind: "oidc", value };
+  if (kind === "oidc" && value.length > SUB_MAX) return null;
+  return { kind, value };
+}
+// The existing user an owner spec names, or null. An OIDC subject matching users
+// of two issuers is ambiguous and names nobody.
+function findOwner(state, spec) {
+  const p = parseOwnerSpec(spec);
+  if (!p) return null;
+  if (p.kind !== "oidc") {
+    const u = findLocalUser(state, p.value);
+    if (u || p.kind === "local") return u;
+  }
+  const hits = Object.values(state.users).filter((u) => u.source === "oidc" && u.oidcSub === p.value);
+  return hits.length === 1 ? hits[0] : null;
+}
+function ownerAmbiguous(state, spec) {
+  const p = parseOwnerSpec(spec);
+  return !!p && Object.values(state.users).filter((u) => u.source === "oidc" && u.oidcSub === p.value).length > 1;
+}
+// Find or create the owner. Creating needs an explicit kind: a bare value that
+// names nobody is refused (a typo must not mint an account). A created local
+// owner gets an unusable random password (set one in the admin panel, or sign in
+// with OIDC); a created OIDC owner is keyed on `iss` (the IdP discovery issuer,
+// verbatim) and granted the user role until its first login re-reads its groups.
+function ensureOwner(state, spec, { iss, now = Date.now() } = {}) {
+  const found = findOwner(state, spec);
+  if (found) return { state, user: found, created: false };
+  const p = parseOwnerSpec(spec);
+  if (!p) throw new Error("TURMA_MIGRATE_OWNER is not a valid username or OIDC subject");
+  if (p.kind !== "local" && ownerAmbiguous(state, spec)) {
+    // Prefer the configured IdP's user; never re-upsert it (that rewrites its roles).
+    const mine = p.kind === "oidc" && iss ? findOidcUser(state, iss, p.value) : null;
+    if (mine) return { state, user: mine, created: false };
+    throw new Error(`${p.value} names more than one OIDC user (several issuers) — name the owner unambiguously`);
+  }
+  if (!p.kind) {
+    throw new Error(`no user is named ${p.value} — prefix it with local: or oidc: to create that owner`);
+  }
+  if (p.kind === "local") {
+    const r = createLocalUser(state, {
+      username: p.value, displayName: p.value, groups: ["turma-users"], now,
+      passwordHash: hashPasswordSync(crypto.randomBytes(32).toString("base64")),
+    });
+    return { ...r, created: true };
+  }
+  if (typeof iss !== "string" || !iss) throw new Error("creating an OIDC owner needs OIDC configured (its issuer)");
+  const r = upsertOidcUser(state, { iss, sub: p.value, displayName: p.value, idpRoles: ["user"], now });
+  if (!r.user) throw new Error("could not create the OIDC owner");
+  return { ...r, created: true };
+}
+
 // The tenant a registry/ledger host key belongs to, or "" for an untenanted key
 // (XERK-2533: a tenant host's key is `<device>@<32-hex tenantId>`, set by the hub
 // from the credential, never by the agent). Every ledger row is keyed by that
@@ -394,6 +456,9 @@ module.exports = {
   validGroupList,
   GROUP_RE,
   bootstrapAdmin,
+  parseOwnerSpec,
+  findOwner,
+  ensureOwner,
   TENANT_HOST_KEY_RE,
   tenantOfHostKey,
 };

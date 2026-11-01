@@ -1502,6 +1502,50 @@ function purgeTenant(tenantId) {
   return gone;
 }
 
+/** Every host key this store holds (XERK-2554: the tenant migration's inventory). */
+function keys() {
+  return Object.keys(hosts);
+}
+
+// Whether `to` is `from`'s own tenant key: `<from>@<32 hex>`, `from` untenanted.
+// The re-keys below move a host's history into ITS tenant only — never to
+// another device's key, never out of a tenant.
+const TENANT_SUFFIX_RE = /^@[0-9a-f]{32}$/;
+function isTenantKeyOf(from, to) {
+  return typeof from === "string" && !!from && from !== "__proto__" && typeof to === "string" &&
+    !tenantOfHostKey(from) && to.startsWith(from) && TENANT_SUFFIX_RE.test(to.slice(from.length));
+}
+
+/**
+ * Move host `from`'s whole history to its tenant key `to` (XERK-2554, migrating a
+ * pre-tenancy hub into a tenant). Into an empty `to` the entry moves as-is; into a
+ * `to` that already holds history the two merge by the HIGH-WATER rule
+ * (`mergeTwoEntries`: per-day max, never a sum — they are one machine's spend).
+ * `opts.siteKey`, when a string, replaces the entry's org label (the caller scopes
+ * it into the tenant too). `to` is persisted BEFORE `from` is dropped, so a crash in
+ * between leaves a duplicate the next run merges away, never a loss. Returns
+ * whether anything moved; a rerun finds `from` gone and moves nothing.
+ */
+function rekeyHost(from, to, opts = {}) {
+  if (!isTenantKeyOf(from, to) || !Object.prototype.hasOwnProperty.call(hosts, from)) return false;
+  const src = hosts[from];
+  const dst = Object.prototype.hasOwnProperty.call(hosts, to) ? hosts[to] : null;
+  const entry = dst ? mergeTwoEntries(dst, src) : src;
+  // `opts.siteKey`: the new org label, or a function of the current one.
+  const site = opts && typeof opts.siteKey === "function" ? opts.siteKey(entry.siteKey) : opts && opts.siteKey;
+  if (typeof site === "string" && site) entry.siteKey = site;
+  hosts[to] = entry;
+  delete hosts[from];
+  shortfallLoggedAt.delete(from);
+  if (dst) enforceHostShare(to, entry);
+  backend.onChange(to, true);
+  backend.flush(() => {
+    // Re-created meanwhile (the host beat under its old key): its own writes own it.
+    if (!Object.prototype.hasOwnProperty.call(hosts, from)) backend.onForget(from);
+  });
+  return true;
+}
+
 /** Whether anything is recorded for this host. */
 function has(key) {
   return Object.prototype.hasOwnProperty.call(hosts, key);
@@ -1510,7 +1554,7 @@ function has(key) {
 load();
 
 module.exports = {
-  ingest, fold, retiredAgents, forget, purgeTenant, has, flush, configure, rehydrate, setHostAliases,
+  ingest, fold, retiredAgents, forget, purgeTenant, has, keys, rekeyHost, flush, configure, rehydrate, setHostAliases,
   LEDGER_FILE, LEDGER_MAX, LEDGER_DAYS, LEDGER_HOSTS, LEDGER_REPOS, RETIRED_MAX,
   LEDGER_MODELS, LEDGER_NAME_MAX, hostShare,
   SYSTEM_USAGE_REPO, isSystemUsageRepo, foldSystemRepos,

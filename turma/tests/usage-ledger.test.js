@@ -1095,3 +1095,36 @@ test("XERK-2381: a retired name never folds into two live cards", () => {
     ledger.setHostAliases([]);
   }
 });
+
+// ---- XERK-2554: re-keying a host into its tenant -------------------------------
+
+const T2554 = "a".repeat(32);
+test("XERK-2554: rekeyHost moves a host's history to its empty tenant key", () => {
+  ledger.ingest("h", beat({ [DAY]: 100 }, { r: { [DAY]: 40 } }), now);
+  assert.deepEqual(ledger.keys(), ["h"]);
+  assert.equal(ledger.rekeyHost("h", `h@${T2554}`, { siteKey: `XERK@${T2554}` }), true);
+  assert.deepEqual(ledger.keys(), [`h@${T2554}`]);
+  const e = hosts()[`h@${T2554}`];
+  assert.equal(e.siteKey, `XERK@${T2554}`);
+  assert.equal(bucketTokens(ledger._internals.seriesTotals(e.host)), 100);
+  // A rerun moves nothing.
+  assert.equal(ledger.rekeyHost("h", `h@${T2554}`), false);
+});
+
+test("XERK-2554: rekeyHost merges into an existing tenant key by the high-water rule", () => {
+  ledger.ingest("h", beat({ [DAY]: 100 }, {}), now);
+  ledger.ingest(`h@${T2554}`, beat({ [DAY]: 60, "2026-08-17": 30 }, {}), now);
+  assert.equal(ledger.rekeyHost("h", `h@${T2554}`), true);
+  // max(100, 60) for the shared day + 30: never a sum, never lowered.
+  assert.equal(bucketTokens(ledger._internals.seriesTotals(hosts()[`h@${T2554}`].host)), 130);
+  assert.deepEqual(ledger.keys(), [`h@${T2554}`]);
+});
+
+test("XERK-2554: rekeyHost refuses anything but the host's own tenant key", () => {
+  ledger.ingest("h", beat({ [DAY]: 100 }, {}), now);
+  for (const to of ["h", "g@" + T2554, "h@short", `h@${T2554}@${T2554}`, ""]) {
+    assert.equal(ledger.rekeyHost("h", to), false, to);
+  }
+  assert.equal(ledger.rekeyHost(`h@${T2554}`, `h@${T2554}@${T2554}`), false);
+  assert.deepEqual(ledger.keys(), ["h"]);
+});
