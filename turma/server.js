@@ -7726,6 +7726,7 @@ function scopedAgentsCache(payload, p) {
     const body = JSON.stringify(out);
     entry = { body, etag: '"' + crypto.createHash("sha1").update(body).digest("base64") + '"' };
   }
+  rememberSnapshotSeed(`${tenantViewSig(p)}|${entry.etag}`, out);   // XERK-2599
   // A handful of views per build; old builds' entries are dropped wholesale.
   if (scopedPayloads.size >= 64) scopedPayloads.clear();
   scopedPayloads.set(key, entry);
@@ -7956,8 +7957,7 @@ function sseDeliverLocal(event, dataObj, scope) {
     if (f === undefined) {
       const data = routeScope.scopeEvent(event, dataObj, tenantViewFor(p));
       const frame = data === undefined ? "" : `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-      f = { frame, digest: snapshot && frame
-        ? crypto.createHash("sha256").update(frame).digest("base64") : null };
+      f = { frame, digest: snapshot && frame ? sseFrameDigest(frame) : null };
       frames.set(sig, f);
     }
     if (!f.frame) continue;
@@ -7979,6 +7979,77 @@ function sseDeliverLocal(event, dataObj, scope) {
 // Per stream: SNAPSHOT_EVENTS event -> digest of the last frame written to it. A
 // WeakMap, so a closed stream's entry goes with it; bounded by the event set.
 const sseLastSent = new WeakMap();
+function sseFrameDigest(frame) {
+  return crypto.createHash("sha256").update(frame).digest("base64");
+}
+// XERK-2599: a NEW stream has no digest, so without a seed the first whole-map frame
+// of each event after connect was written to it whoever caused the broadcast — one
+// bit of another tenant's activity timing per event per page load. So the page opens
+// /api/events with the ETag of the /api/agents body it rendered (`?since=`), and the
+// stream is seeded from THAT snapshot — never from the current one: a digest newer
+// than the page's snapshot would dedupe away the very change it is missing.
+//   Each scoped snapshot the hub serves leaves its per-event frame digests here (plus
+// its hosts' online flags), keyed by view + ETag. At connect the stream is seeded from
+// the held snapshot, and whatever moved between that snapshot and now is sent at
+// once: a map whose digest differs, a host gone (`removed`) or whose online flag
+// flipped (`agent`). Only the caller's own slice, so nothing leaks; it also closes the
+// window between the page's fetch and its connect. Any other host change rides the
+// next beat. An unknown ETag seeds nothing: every map frame goes out as before.
+const sseSnapshotSeeds = new Map(); // `${view}|${etag}` -> {digests: Map, online: Map}
+const SSE_SNAPSHOT_SEEDS_MAX = 256;
+function rememberSnapshotSeed(key, obj) {
+  if (sseSnapshotSeeds.has(key) || !obj || typeof obj !== "object") return;
+  const digests = new Map();
+  for (const event of routeScope.SNAPSHOT_EVENTS) {
+    const k = routeScope.EVENT_ALIASES[event] || event;
+    if (!Object.hasOwn(obj, k) || obj[k] === undefined) continue;
+    digests.set(event, sseFrameDigest(`event: ${event}\ndata: ${JSON.stringify(obj[k])}\n\n`));
+  }
+  const online = new Map();
+  for (const a of Array.isArray(obj.agents) ? obj.agents : []) {
+    if (a && typeof a.key === "string") online.set(a.key, a.online === true);
+  }
+  // Insertion order is age: the oldest snapshot goes first.
+  if (sseSnapshotSeeds.size >= SSE_SNAPSHOT_SEEDS_MAX) {
+    sseSnapshotSeeds.delete(sseSnapshotSeeds.keys().next().value);
+  }
+  sseSnapshotSeeds.set(key, { digests, online });
+}
+// Seeds stream `res` (principal `p`) from the snapshot named by `since`, writing the
+// frames that snapshot is behind on. Returns false when nothing was seeded.
+function sseSeedStream(res, p, since) {
+  if (typeof since !== "string" || !since || since.length > 200) return false;
+  const view = tenantViewSig(p);
+  const held = sseSnapshotSeeds.get(`${view}|${since}`);
+  if (!held) return false;
+  const cur = scopedAgentsCache(agentsPayloadFor(p), p);
+  if (!cur || typeof cur.body !== "string") return false;
+  let obj = null;
+  const now = () => obj || (obj = JSON.parse(cur.body));
+  let live = sseSnapshotSeeds.get(`${view}|${cur.etag}`);
+  try {
+    if (!live) { rememberSnapshotSeed(`${view}|${cur.etag}`, now()); live = sseSnapshotSeeds.get(`${view}|${cur.etag}`); }
+    if (!live) return false;
+    const last = new Map();
+    const out = [];
+    for (const [event, d] of live.digests) {
+      last.set(event, d);
+      if (held.digests.get(event) === d) continue;
+      const k = routeScope.EVENT_ALIASES[event] || event;
+      out.push(`event: ${event}\ndata: ${JSON.stringify(now()[k])}\n\n`);
+    }
+    for (const [key, wasOnline] of held.online) {
+      if (!live.online.has(key)) out.push(`event: removed\ndata: ${JSON.stringify({ key })}\n\n`);
+      else if (live.online.get(key) !== wasOnline) {
+        const rec = (now().agents || []).find((a) => a && a.key === key);
+        if (rec) out.push(`event: agent\ndata: ${JSON.stringify(rec)}\n\n`);
+      }
+    }
+    for (const f of out) res.write(f);
+    sseLastSent.set(res, last);
+    return true;
+  } catch { return false; }
+}
 // The principal each SSE client connected as (XERK-2550), for scoped frames.
 const ssePrincipals = new WeakMap();
 
@@ -22025,8 +22096,13 @@ const server = http.createServer(async (req, res) => {
         "X-Accel-Buffering": "no",
       });
       res.write("retry: 3000\n\n"); // client reconnect backoff hint
-      res.write(": connected\n\n");
-      ssePrincipals.set(res, requestPrincipal(req));
+      // `id:` makes a browser's automatic reconnect send Last-Event-ID; that stream
+      // replays the first connect's `?since=`, but the page has applied frames since,
+      // so it is never seeded (XERK-2599).
+      res.write("id: 0\n: connected\n\n");
+      const sp = requestPrincipal(req);
+      ssePrincipals.set(res, sp);
+      if (!req.headers["last-event-id"]) sseSeedStream(res, sp, url.searchParams.get("since"));
       sseClients.add(res);
       const keepalive = setInterval(() => {
         try { res.write(": keepalive\n\n"); } catch { /* dropped; close cleans up */ }
@@ -26915,7 +26991,7 @@ if (process.env.TURMA_TEST) {
     // (`makeSseBus` over an injected store), and hold the local-delivery seam
     // (`sseClients`/`sseDeliverLocal`) and the HA toggle (`__setSseBus`) that
     // `sseBroadcast` gates on.
-    sseBroadcast, sseDeliverLocal, makeSseBus, sseClients, ssePrincipals, SSE_BUS_CHANNEL, SSE_REPLICA_ID,
+    sseBroadcast, sseDeliverLocal, makeSseBus, sseClients, ssePrincipals, sseLastSent, sseSnapshotSeeds, rememberSnapshotSeed, SSE_SNAPSHOT_SEEDS_MAX, SSE_BUS_CHANNEL, SSE_REPLICA_ID,
     __setSseBus(v) { sseBus = v; },
     // XERK-764: the cross-replica tunnel directory + control bus. Exported so tests
     // can drive the directory publish/retire/mirror, the freshness-gated
