@@ -299,6 +299,13 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 - `turma/tests/tenancy.test.js` (own process, break-glass set); `tenancy-nopassword.test.js` (own
   process, bootstrap admin ONLY — the forgery / empty-Basic / dummy-hash / mid-verify-disable guards);
   `XERK-2530:` in `oidc-groups.test.js` and `server.test.js` (an OIDC user leaves an open hub open).
+- **The cross-tenant isolation suite** (XERK-2556): the `XERK-2556:` cases in `tenancy.test.js`.
+  One fixture (tenants A, B, an admin-only user, break-glass; three hosts named "laptop", one Jira
+  site, one session id) and a SWEEP of every `tenant-scope.js` row of class host/org/session/
+  transcript/repo/admin with another tenant's id, which must answer the unknown id's exact bytes.
+  - A new scoped route is swept with no test change; a new SURFACE (payload key, SSE event, store)
+    gets a canary assertion there. Never weaken the byte-equal 404 check to a status check.
+  - The suite sets every `*_FILE` store env to scratch: a new store needs its env added there.
 - Fair sign-in: the `XERK-2568:` cases in `tenancy-nopassword.test.js`.
 - Break-glass throttle: the `XERK-2577:` cases in `tenancy.test.js`.
 - Android signs in through `POST /api/login` and rides `hub_session` (XERK-2569), so local accounts
