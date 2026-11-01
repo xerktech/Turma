@@ -646,7 +646,10 @@ test("XERK-2598: a re-render with the same stale cache never reverts an SSE-move
   Org.update(cache);                                     // the next beat's render
   assert.match(slot.innerHTML, /org-chip-auto on/);
   assert.match(slot.innerHTML, /org-chip-merge on/);
-  // A NEW snapshot (a refetch) is still the hub's word and is adopted.
+  // A NEW snapshot is the hub's word once the stream hands the maps back
+  // (reconnect re-read, or polls while down). While the stream owns them a new
+  // snapshot may have left before the frame, so it is ignored (XERK-2600).
+  handlers.error();
   Org.update({ ...cache, autoStartOrgs: {}, autoMergeOrgs: {} });
   assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/);
   assert.doesNotMatch(slot.innerHTML, /org-chip-merge on/);
@@ -1254,6 +1257,63 @@ test("XERK-2598: with the re-read failing too, a network-failed POST rolls back"
   click("data-org-toggle", "");
   global.fetch = () => Promise.reject(new TypeError("network"));
   await Org.setAutoMerge("acme.atlassian.net", true);
+  assert.doesNotMatch(slot.innerHTML, /org-chip-merge on/);
+});
+
+// XERK-2600: a NEW /api/agents body that left the hub before an opt-in frame
+// but landed after it must not revert the switch.
+function orgStream() {
+  const handlers = {};
+  Org.sse({ addEventListener: (t, fn) => { handlers[t] = fn; } });
+  handlers.open();
+  return handlers;
+}
+
+test("XERK-2600: a snapshot older than a frame never reverts auto-start/auto-merge", () => {
+  const site = "acme.atlassian.net";
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {}, autoMergeOrgs: {} });
+  click("data-org-toggle", "");
+  const h = orgStream();
+  h.autoStartOrgs({ data: JSON.stringify({ [site]: true }) });
+  h.autoMergeOrgs({ data: JSON.stringify({ [site]: true }) });
+  // The held reply (fetched before the frames) lands as a NEW object.
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {}, autoMergeOrgs: {} });
+  assert.match(slot.innerHTML, /org-chip-auto on/);
+  assert.match(slot.innerHTML, /org-chip-merge on/);
+  h.error();
+});
+
+test("XERK-2600: a reconnect or a drop hands both maps back to the snapshots", () => {
+  const site = "acme.atlassian.net";
+  for (const edge of ["open", "error"]) {
+    const { slot, click } = mountOrg();
+    Org.update({ agents: [agent("a", site)], autoStartOrgs: {}, autoMergeOrgs: {} });
+    click("data-org-toggle", "");
+    const h = orgStream();
+    h.autoStartOrgs({ data: JSON.stringify({ [site]: true }) });
+    h.autoMergeOrgs({ data: JSON.stringify({ [site]: true }) });
+    h[edge]();
+    // The re-read (or a poll while down) is the hub's word: it has both OFF now.
+    Org.update({ agents: [agent("a", site)], autoStartOrgs: {}, autoMergeOrgs: {} });
+    assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/, edge);
+    assert.doesNotMatch(slot.innerHTML, /org-chip-merge on/, edge);
+    h.error();
+  }
+});
+
+test("XERK-2600: a new stream starts unowned", () => {
+  const site = "acme.atlassian.net";
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {}, autoMergeOrgs: {} });
+  click("data-org-toggle", "");
+  const h = orgStream();
+  h.autoStartOrgs({ data: JSON.stringify({ [site]: true }) });
+  h.autoMergeOrgs({ data: JSON.stringify({ [site]: true }) });
+  // The page swaps streams without the old one erroring: its re-read is current.
+  Org.sse({ addEventListener() {} });
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {}, autoMergeOrgs: {} });
+  assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/);
   assert.doesNotMatch(slot.innerHTML, /org-chip-merge on/);
 });
 

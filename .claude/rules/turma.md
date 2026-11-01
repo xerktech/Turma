@@ -82,6 +82,10 @@ makes an `android/` change part of the same PR) live there.
 - **`update()` adopts a hub map only from a NEW snapshot object** (rollup XERK-2598): pages call
   `update(cache)` every render but never write `autoStartOrgs`/`autoMergeOrgs` back from SSE, so
   re-adopting the same stale object reverted every SSE-moved or optimistic switch on the next beat.
+- **A NEW snapshot never overrides an opt-in map the open SSE stream owns** (XERK-2600, `sseOwns`):
+  a `/api/agents` body can leave before a frame and land after it, and adopting it reverted the
+  auto-start/auto-merge switch until the next frame. A frame takes ownership; the stream's
+  `open` (the page's reconnect re-read is current) and `error` (polls are the source) hand it back.
 - **The three switches (auto-start, auto-merge, color pin) share ONE optimistic path, `flip`**
   (rollup XERK-2598); its rules each come from a QA-reproduced defect:
   - A failed click resolves to `confirmed[kind]`, the hub's last word (adopted snapshot, every SSE

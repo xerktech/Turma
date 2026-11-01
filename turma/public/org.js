@@ -229,6 +229,15 @@
   // object each render reverted a switch the hub's SSE event (or this tab's
   // optimistic flip) had just moved. Only a NEW snapshot object is adopted.
   let seenAuto = null, seenMerge = null, seenColors = null;
+  // XERK-2600: which opt-in maps the open SSE stream owns. Once the stream has
+  // delivered a map's frame, every later change reaches us as a frame too, so a
+  // NEW snapshot can only be the same or OLDER — a /api/agents body that left
+  // the hub before the frame and landed after it, which reverted the switch
+  // until the map's next frame. The stream's open (the page's re-read is
+  // current) and error (frames may be missed; polls are the source) hand the
+  // maps back to the snapshots.
+  const sseOwns = { auto: false, merge: false };
+  function releaseSseOwns() { sseOwns.auto = false; sseOwns.merge = false; }
   let colorFor = null;    // the org whose swatch strip is expanded, or null
   let open = false;
   let slot = null;
@@ -356,12 +365,12 @@
     const B = board();
     sites = B.mergeSites((data && data.agents) || []);
     if (data && data.autoStartOrgs && data.autoStartOrgs !== seenAuto) {
-      autoMap = seenAuto = data.autoStartOrgs;
-      hubSays("auto", autoMap);
+      seenAuto = data.autoStartOrgs;
+      if (!sseOwns.auto) { autoMap = seenAuto; hubSays("auto", autoMap); }
     }
     if (data && data.autoMergeOrgs && data.autoMergeOrgs !== seenMerge) {
-      mergeMap = seenMerge = data.autoMergeOrgs;
-      hubSays("merge", mergeMap);
+      seenMerge = data.autoMergeOrgs;
+      if (!sseOwns.merge) { mergeMap = seenMerge; hubSays("merge", mergeMap); }
     }
     if (data && data.orgColors && data.orgColors !== seenColors) {
       colorPins = seenColors = data.orgColors;
@@ -538,10 +547,16 @@
   // page hands its EventSource over rather than opening a second one.
   function sse(es) {
     if (!es || !es.addEventListener) return;
+    // A new stream starts unowned: pages open it after re-reading (XERK-2599).
+    releaseSseOwns();
+    const release = releaseSseOwns;   // XERK-2600
+    es.addEventListener("open", release);
+    es.addEventListener("error", release);
     es.addEventListener("autoStartOrgs", (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       autoMap = m || {};
+      sseOwns.auto = true;
       hubSays("auto", autoMap, true);
       paint();
     });
@@ -549,6 +564,7 @@
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       mergeMap = m || {};
+      sseOwns.merge = true;
       hubSays("merge", mergeMap, true);
       paint();
     });
@@ -565,6 +581,7 @@
   }
 
   function mount(doc) {
+    releaseSseOwns();   // a fresh page: no stream owns anything yet
     slot = doc.getElementById("hdrOrg");
     if (!slot) return;
     // A freshly-mounted control starts closed, with nothing painted and nothing
