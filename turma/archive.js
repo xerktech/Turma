@@ -940,15 +940,43 @@ function writeSidecar(metaPath, obj, local) {
 // and waiting one window to see it costs nothing.
 let totalCache = { at: 0, bytes: 0 };
 let writtenSinceWalk = 0;
-// The same baseline + charge, per tenant partition (XERK-2549): the walk fills
-// `tenantCache` (tenantId -> bytes under `@<tenantId>/`), every append charges
+// The same baseline + charge, per tenant (XERK-2549): the walk fills
+// `tenantCache` (tenantId -> bytes the tenant's rows hold), every append charges
 // `tenantWritten`, and the walk zeroes it — so a tenant's figure is exactly as
 // fresh as the store's.
+//
+// Keyed on the ROW's host, never the file's path (XERK-2618): a tenant row
+// archived before the partition existed keeps its files in the untenanted tree,
+// and charging by path let a resumed session append to it outside the quota.
 let tenantCache = new Map();
 let tenantWritten = new Map();
-function chargeTenant(relPath, n) {
-  const t = tenantOfRel(relPath);
-  if (t) tenantWritten.set(t, (tenantWritten.get(t) || 0) + n);
+function chargeTenant(tenant, n) {
+  if (tenant) tenantWritten.set(tenant, (tenantWritten.get(tenant) || 0) + n);
+}
+
+// The tenant rows whose files sit OUTSIDE their partition (archived before it
+// existed): `files` maps the rendered `.jsonl` (relative to ARCHIVE_DIR) to its
+// tenant, `ids` maps the transcript id (its raw subdirectory's name) to it. The
+// store walk attributes those bytes by row, as the charge above does. The maps
+// hold only pre-partition rows, which no longer grow (a new tenant row is
+// partitioned); sqlite filters them in the query, pg mode scans the in-memory
+// row map once per walk.
+function legacyTenantFiles() {
+  const files = new Map(), ids = new Map();
+  const add = (r) => {
+    const t = tenantOfHost(r.host);
+    if (!t || !r.filePath || tenantOfRel(r.filePath)) return;
+    files.set(path.normalize(r.filePath), t);
+    ids.set(r.transcriptId, t);
+  };
+  try {
+    if (isPgMode()) { for (const r of sessionsMap.values()) add(r); }
+    else if (db) {
+      db.prepare("SELECT transcriptId, filePath, host FROM sessions " +
+        "WHERE filePath IS NOT NULL AND filePath NOT GLOB '@*' AND host GLOB '*@*'").all().forEach(add);
+    }
+  } catch { /* an index hiccup costs the attribution, never the walk */ }
+  return { files, ids };
 }
 const TOTAL_CACHE_MS = 5 * 60 * 1000;
 // While the store reads FULL, re-measure far more often. Precision is worth
@@ -1069,16 +1097,35 @@ function walkJsonlBytes(dir, depth, stats, inTenant) {
       // most of the raw layer's bytes outside the ceiling that exists to keep
       // this volume writable (XERK-338). Raw files are NOT `sessions` rows, so
       // they are never counted into `stats.files`.
-      bytes += isRawDir(d.name, depth)
-        ? walkAllBytes(full) : walkJsonlBytes(full, depth + 1, stats);
+      if (!isRawDir(d.name, depth)) { bytes += walkJsonlBytes(full, depth + 1, stats, inTenant); continue; }
+      // A raw directory outside a partition holds one subdirectory per
+      // transcript id; a pre-partition tenant row's is charged to its tenant.
+      const legacy = !inTenant && stats && stats.legacy;
+      if (!legacy || !legacy.ids.size) { bytes += walkAllBytes(full); continue; }
+      let subs;
+      try { subs = fs.readdirSync(full, { withFileTypes: true }); } catch { continue; }
+      for (const s of subs) {
+        // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+        const sfull = path.join(full, s.name);
+        let n = 0;
+        if (s.isDirectory()) n = walkAllBytes(sfull);
+        else if (s.isFile()) { try { n = fs.statSync(sfull).size; } catch { /* raced */ } }
+        bytes += n;
+        const t = s.isDirectory() && legacy.ids.get(s.name);
+        if (t) stats.byTenant.set(t, (stats.byTenant.get(t) || 0) + n);
+      }
     } else if (d.isFile() && d.name.endsWith(".jsonl")) {
       // One unreadable file must not abandon the measurement and hand back a
       // total far under the truth — skip it and keep counting. An ENOENT is a
       // raced delete (the honest signal the reclaim looks for); any other stat
       // failure is an under-count that, like a skipped directory, must not drive
       // the reclaim.
-      try { bytes += fs.statSync(full).size; if (stats) stats.files++; }
-      catch (e) { if (stats && e && e.code !== "ENOENT") stats.partial = true; }
+      let n;
+      try { n = fs.statSync(full).size; bytes += n; if (stats) stats.files++; }
+      catch (e) { if (stats && e && e.code !== "ENOENT") stats.partial = true; continue; }
+      const legacy = !inTenant && stats && stats.legacy;
+      const t = legacy && legacy.files.size && legacy.files.get(path.relative(ARCHIVE_DIR, full));
+      if (t) stats.byTenant.set(t, (stats.byTenant.get(t) || 0) + n);
     }
   }
   return bytes;
@@ -1137,7 +1184,7 @@ function totalArchiveBytes(now, maxAgeMs) {
   const age = maxAgeMs === undefined ? TOTAL_CACHE_MS : maxAgeMs;
   if (now - totalCache.at < age) return totalCache.bytes + writtenSinceWalk;
   let bytes;
-  const stats = { files: 0, partial: false, byTenant: new Map() };
+  const stats = { files: 0, partial: false, byTenant: new Map(), legacy: legacyTenantFiles() };
   try {
     bytes = walkJsonlBytes(ARCHIVE_DIR, 0, stats);
   } catch (e) {
@@ -1615,7 +1662,7 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
       // Charge the store total immediately rather than waiting for the next
       // walk — that gap is what let a burst run 1,200x past the ceiling.
       writtenSinceWalk += Buffer.byteLength(lines);
-      chargeTenant(relPath, Buffer.byteLength(lines));
+      chargeTenant(tenantOfHost(host), Buffer.byteLength(lines));
     }
     if (isPgMode()) {
       // The SAME upsert against the in-memory map (XERK-793): COALESCE createdAt/
@@ -2003,7 +2050,7 @@ function ingestRaw(host, transcriptId, rel, start, buf) {
   // Charge the store total immediately rather than waiting for the next walk —
   // the same rule the rendered layer follows, and for the same reason.
   writtenSinceWalk += buf.length;
-  chargeTenant(row.filePath, buf.length);
+  chargeTenant(tenantOfHost(row.host), buf.length);
   const rawNowIso = new Date().toISOString();
   if (isPgMode()) {
     mapPutSession({ ...row, rawBytes: rawBytes + buf.length, updatedAt: rawNowIso });
