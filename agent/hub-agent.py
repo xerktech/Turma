@@ -45425,9 +45425,13 @@ class SessionManager:
     def _kill_oneshot_proc(proc):
         """SIGKILL a one-shot's process group (its own child on Windows)."""
         killpg = getattr(os, "killpg", None)
+        pid = _signalable_pid(proc.pid)
         try:
-            if killpg is not None:
-                killpg(proc.pid, signal.SIGKILL)
+            # killpg only a real child's group (_signalable_pid): a mocked
+            # Popen's pid coerces to 1, and killpg(1) is kill(-1) — every
+            # process this user owns (TrueNAS, 2026-10-31).
+            if killpg is not None and pid is not None:
+                killpg(pid, signal.SIGKILL)
             else:
                 proc.kill()
         except Exception:
