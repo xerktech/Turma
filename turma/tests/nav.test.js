@@ -411,6 +411,13 @@ test("XERK-2599: the first stream names the snapshot the page rendered, later on
   assert.equal(nav.eventsUrl(), "/api/events?since=%22fresh%22");
 });
 
+test("XERK-2599: the board's 304 re-read names the snapshot it holds", () => {
+  const src = fs.readFileSync(path.join(PUBLIC, "board.html"), "utf8");
+  assert.match(src, /if \(r\.status === 304\) return void noteSnapshot\(r\);/);
+  assert.match(src, /mergeSnapshot\(await r\.json\(\), since\);\n\s*noteSnapshot\(r\);/);
+  assert.match(src, /function noteSnapshot\(r\) \{\n\s*if \(typeof TurmaNav !== "undefined" && TurmaNav\.noteSnapshot\) TurmaNav\.noteSnapshot\(r\);/);
+});
+
 test("XERK-2599: every page opens its stream after its first snapshot, through eventsUrl", () => {
   for (const f of PAGE_FILES) {
     const src = fs.readFileSync(path.join(PUBLIC, f), "utf8");

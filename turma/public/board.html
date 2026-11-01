@@ -2353,15 +2353,20 @@ function mergeSnapshot(body, since) {
   cache = body;
 }
 
+// Names the snapshot for the next /api/events stream (XERK-2599). A 304 names it too:
+// the page holds exactly that snapshot.
+function noteSnapshot(r) {
+  if (typeof TurmaNav !== "undefined" && TurmaNav.noteSnapshot) TurmaNav.noteSnapshot(r);
+}
 async function refresh() {
   const since = sseClock;   // captured BEFORE the fetch — the write window is its RTT
   try {
     const r = await fetch("/api/agents", { headers: etag ? { "If-None-Match": etag } : {} });
     if (r.status === 401) return void (location.href = "/login");
-    if (r.status === 304) return;
+    if (r.status === 304) return void noteSnapshot(r);
     etag = r.headers.get("ETag");
     mergeSnapshot(await r.json(), since);
-    if (typeof TurmaNav !== "undefined" && TurmaNav.noteSnapshot) TurmaNav.noteSnapshot(r);
+    noteSnapshot(r);
   } catch { /* keep last render */ }
   if (cache) render(cache);
 }

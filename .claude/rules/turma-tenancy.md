@@ -263,6 +263,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
       `noteSnapshot`/`eventsUrl`): only a snapshot read with NO stream open is named.
     - A page never takes the browser's own retry: `onerror` closes, `eventsClosed()`, re-reads,
       reopens naming the new snapshot. Android names its latest poll's (the 6s poll heals the rest).
+    - A 304 re-read names its ETag too (board's own `If-None-Match`): the page holds that snapshot.
+    - Residual: a re-read that FAILS (5xx, network) reopens unseeded, as every stream did before.
     - The stream starts `id: 0`, so any browser auto-reconnect carries Last-Event-ID and is never
       seeded (it replays an old `since`). Seeds live on the serving leader; a failover drops the
       stream, and the page re-reads from the new leader before it reconnects.
