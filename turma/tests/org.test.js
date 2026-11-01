@@ -1302,6 +1302,21 @@ test("XERK-2600: a reconnect or a drop hands both maps back to the snapshots", (
   }
 });
 
+test("XERK-2600: a new stream starts unowned", () => {
+  const site = "acme.atlassian.net";
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {}, autoMergeOrgs: {} });
+  click("data-org-toggle", "");
+  const h = orgStream();
+  h.autoStartOrgs({ data: JSON.stringify({ [site]: true }) });
+  h.autoMergeOrgs({ data: JSON.stringify({ [site]: true }) });
+  // The page swaps streams without the old one erroring: its re-read is current.
+  Org.sse({ addEventListener() {} });
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {}, autoMergeOrgs: {} });
+  assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/);
+  assert.doesNotMatch(slot.innerHTML, /org-chip-merge on/);
+});
+
 // ---- wiring: every page must actually obey it -------------------------------
 
 test("org: every page loads board.js, nav.js and org.js, in that order", () => {
