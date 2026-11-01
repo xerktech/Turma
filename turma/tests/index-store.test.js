@@ -1725,3 +1725,32 @@ test("XERK-2549 pg mode: a file another tenant's surviving row also names is KEP
     assert.equal(archive.getTranscript("pg-sh-u").entries.length, 1, "the other row still reads");
   } finally { pgTeardown(); }
 });
+
+test("XERK-2549: the sqlite-mode index hydrate (indexLoader) skips a purged tenant and re-sends its delete", async () => {
+  archive.closeDb();
+  fs.rmSync(process.env.ARCHIVE_DIR, { recursive: true, force: true });
+  const mem = new MemIndexStore();
+  const A = "f".repeat(32);
+  const purged = new Set();
+  archive.setTenantPurged((t) => purged.has(t));
+  archive.setIndexSink(mem.sink());
+  try {
+    const b = (w) => [ent(`u-${w}`, "user", `loaderword ${w}`)];
+    const len = (w) => Buffer.byteLength(JSON.stringify(b(w)));
+    archive.ingestChunk(`lap@${A}`, "il-a", META, 0, len("a"), b("a"), `acme@${A}`);
+    archive.ingestChunk("nas", "il-u", META, 0, len("u"), b("u"), "acme");
+    purged.add(A);
+    // The purge's delete never reached the of-record; a replica re-hydrates from it.
+    mem.hydrateInto(archive.indexLoader());
+    assert.equal(archive.sessionRow("il-a"), null, "the purged row is not loaded");
+    const hits = (await archive.searchArchive("loaderword")).groups.flatMap((g) => g.matches)
+      .map((m) => m.transcriptId);
+    assert.deepEqual(hits, ["il-u"], "nor are its search entries");
+    assert.ok(!mem.sessions.has("il-a"), "the delete was re-sent to the of-record");
+    assert.ok(mem.sessions.has("il-u"));
+  } finally {
+    archive.setTenantPurged(null);
+    archive.setIndexSink(null);
+    archive.closeDb();
+  }
+});

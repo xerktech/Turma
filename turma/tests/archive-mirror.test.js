@@ -1253,8 +1253,12 @@ test("XERK-2549: a PUT in flight when a tenant is purged cannot re-create its ob
   const store = memStore();
   let release;
   const gate = new Promise((r) => { release = r; });
-  const put = store.put.bind(store);
-  store.put = async (k, src) => { await gate; return put(k, src); };
+  // Like a real streaming upload, the body is read BEFORE the request finishes.
+  store.put = async (k, src) => {
+    const body = src.file ? fs.readFileSync(src.file) : Buffer.from(src.body);
+    await gate;
+    store.map.set(k, body);
+  };
   const purged = new Set();
   const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {},
     purgedKey: (k) => purged.has(k.split("/")[0].slice(1)) });
@@ -1285,9 +1289,19 @@ test("XERK-2549: a hydrate neither fetches nor keeps a purged tenant's leftover 
   const store = memStore();
   store.map.set(`@${T}/r/a.jsonl`, Buffer.from("x"));
   store.map.set("r/keep.jsonl", Buffer.from("k"));
+  const gets = [];
+  const get = store.getToFile.bind(store);
+  store.getToFile = async (k, dest, ...rest) => { gets.push(k); return get(k, dest, ...rest); };
+  // A FOLLOWER deletes nothing, so only the listing filter can keep it from fetching.
+  const follower = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {},
+    isLeader: () => false, purgedKey: (k) => k.startsWith(`@${T}/`) });
+  await follower.hydrate();
+  assert.deepEqual(gets.filter((k) => k.startsWith("@")), [], "never fetched");
+  assert.ok(store.map.has(`@${T}/r/a.jsonl`), "a follower leaves the bucket alone");
   const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {},
     purgedKey: (k) => k.startsWith(`@${T}/`) });
   await m.hydrate();
+  assert.deepEqual(gets.filter((k) => k.startsWith("@")), [], "never fetched");
   assert.ok(!fs.existsSync(path.join(root, `@${T}`)), "not downloaded");
   assert.ok(fs.existsSync(path.join(root, "r", "keep.jsonl")));
   await new Promise((r) => setTimeout(r, 20));
