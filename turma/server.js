@@ -3231,6 +3231,236 @@ function bootstrapTenancy() {
   }
 }
 bootstrapTenancy();
+
+// ---- The admin panel (XERK-2552) ---------------------------------------------
+// /admin + /api/admin/*: identities only. An admin manages users, local groups and
+// their roles, and deletes a user (and with it the user's tenant); no admin route
+// serves tenant data (sessions, transcripts, usage detail, tickets), and nothing
+// here lets an admin act as a user or enter a tenant. Who may: any principal with
+// the admin role — an OIDC admin-group user, a local turma-admins member,
+// break-glass, or an open hub (its principal carries every role).
+//
+// The audit log: every admin action (who, what, when), durable, bounded, newest
+// last. Never a password, hash or token — the `detail` is built by the route from
+// fixed fields only.
+const ADMIN_AUDIT_FILE = process.env.ADMIN_AUDIT_FILE || "/data/admin-audit.json";
+const ADMIN_AUDIT_MAX = 1000;
+const ADMIN_AUDIT_ACTIONS = new Set(["user.create", "user.update", "user.password", "user.delete",
+  "groups.update"]);
+function adminAuditClean(s, max) {
+  // eslint-disable-next-line no-control-regex
+  return typeof s === "string" ? s.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").slice(0, max) : "";
+}
+function coerceAdminAudit(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const e of list) {
+    if (!e || typeof e !== "object" || Array.isArray(e)) continue;
+    if (!Number.isSafeInteger(e.at) || e.at <= 0 || !ADMIN_AUDIT_ACTIONS.has(e.action)) continue;
+    const row = { at: e.at, actor: adminAuditClean(e.actor, 120) || "unknown", action: e.action };
+    const target = adminAuditClean(e.target, 120);
+    if (target) row.target = target;
+    const detail = adminAuditClean(e.detail, 500);
+    if (detail) row.detail = detail;
+    out.push(row);
+  }
+  return out.slice(-ADMIN_AUDIT_MAX);
+}
+let adminAudit = coerceAdminAudit(readJsonFile(ADMIN_AUDIT_FILE));
+const persistAdminAudit = registerExternalStore({
+  name: "adminAudit", file: ADMIN_AUDIT_FILE, debounceMs: 0, mode: 0o600,
+  coerce: coerceAdminAudit, read: () => adminAudit, install: (v) => { adminAudit = v; },
+});
+function principalIsAdmin(p) {
+  return !!(p && Array.isArray(p.roles) && p.roles.includes("admin"));
+}
+// The actor an audit row names: the account's login, never its tenant.
+function adminActorLabel(p) {
+  if (!p) return "unknown";
+  if (p.kind === "breakglass") return "break-glass";
+  if (p.kind === "open") return "open hub";
+  if (p.kind === "legacy") return "pre-tenancy session";
+  const u = p.userId && Object.hasOwn(tenancyState.users, p.userId) ? tenancyState.users[p.userId] : null;
+  return u ? adminUserLabel(u) : "unknown";
+}
+function adminUserLabel(u) {
+  return u.source === "local" ? `${u.username} (local)` : `${u.displayName} (oidc)`;
+}
+function recordAdminAction(p, action, target, detail, now = Date.now()) {
+  adminAudit = coerceAdminAudit([...adminAudit, {
+    at: now, actor: adminActorLabel(p), action, target: target || "", detail: detail || "",
+  }]);
+  persistAdminAudit();
+}
+// One user as the panel lists it: metadata ONLY — never the tenant id, a
+// password hash, an OIDC subject, or anything from inside the tenant. The host
+// count is how many registry records carry the user's tenant (a number, not
+// which hosts).
+function adminUserView(u) {
+  let hosts = 0;
+  for (const k of Object.keys(agents)) if (tenantOfKey(k) === u.tenantId) hosts += 1;
+  const out = {
+    id: u.id, name: u.source === "local" ? u.username : u.displayName,
+    displayName: u.displayName, source: u.source,
+    roles: tenancy.effectiveRoles(tenancyState, u), groups: [...(u.groups || [])],
+    disabled: u.disabled === true, createdAt: u.createdAt || 0, hosts,
+  };
+  if (u.disabledBy === "idp") out.disabledBy = "idp";
+  if (u.lastLoginAt) out.lastLoginAt = u.lastLoginAt;
+  // The roles the IdP's groups granted at the last login: read-only here.
+  if (u.source === "oidc") out.idpRoles = [...(u.idpRoles || [])];
+  return out;
+}
+function adminGroupsView() {
+  const map = tenancy.groupMap(tenancyState);
+  return {
+    groups: Object.entries(map).map(([name, g]) => ({ name, role: g.role })),
+    isDefault: !tenancyState.groups,
+  };
+}
+// Whether `next` still leaves a way in as an admin: break-glass, or some enabled
+// user holding the admin role. Refusing a change that strands the hub with no
+// admin is the panel's one self-protection (the operator can still fix it from
+// the pod, but that is exactly the trip the panel exists to save).
+// An SSO user counts only while OIDC is configured: with it off nobody can sign
+// in that way, whatever role its last login recorded (QA).
+function adminWayInRemains(next, breakGlass = breakGlassEnabled(), oidc = OIDC_ENABLED) {
+  if (breakGlass) return true;
+  return Object.values(next.users).some((u) => !u.disabled && (u.source === "local" || oidc) &&
+    tenancy.effectiveRoles(next, u).includes("admin"));
+}
+const ADMIN_STRANDED = "that would leave no administrator able to sign in (and no break-glass login is set)";
+
+// Deleting a user deletes its TENANT (XERK-2552), in this order:
+//  1. disable the user — every cookie it holds stops naming anybody at once;
+//  2. kill its running sessions — a kill command per live session on each of its
+//     hosts, poked over the tunnel, waiting (bounded) for the hosts to take them;
+//  3. revoke its hosts' tokens — every agent identity in the tenant, and the
+//     name-token generation of any plain name a roll bound into it, then cut the
+//     tunnels; the hosts' records leave the registry;
+//  4. cancel what it had waiting (the ticket queue and enrollment codes);
+//  5. purge its data through every store's registered purge (purgeTenantData);
+//  6. drop the user record.
+// Kills go BEFORE the revoke: a command rides the host's next beat, which a
+// revoked token can no longer make. A host that is offline (or does not take its
+// kill in time) still has its token revoked, so whatever runs there can never
+// report back into the hub again.
+const ADMIN_DELETE_KILL_WAIT_MS = positiveEnv("ADMIN_DELETE_KILL_WAIT_MS", 20000);
+const adminDeletesInFlight = new Set(); // user ids
+const tenantsBeingDeleted = new Set(); // their tenant ids: no re-enable, no new host meanwhile
+// A session the hub can still stop: anything not already ended.
+const ADMIN_KILLABLE = new Set(["running", "queued", "cloning", "starting"]);
+// The purges that stop NEW work landing in the tenant while its kills are in
+// flight (dispatches from the queue, an epic run or builder, the auto-start
+// sweep). The rest run after the kills, in the full purge.
+const ADMIN_DELETE_EARLY_PURGES = ["ticketQueue", "autoStartOrgs", "epicRuns", "epicBuilders"];
+async function deleteUserAndTenant(p, id) {
+  const user = Object.hasOwn(tenancyState.users, id) ? tenancyState.users[id] : null;
+  if (!user) return { status: 404, error: "no such user" };
+  if (p && p.kind === "user" && p.userId === id) return { status: 409, error: "you cannot delete your own account" };
+  if (adminDeletesInFlight.has(id)) return { status: 409, error: "that user is already being deleted" };
+  const t = user.tenantId;
+  const rest = tenancy.deleteUser(tenancyState, id);
+  if (!adminWayInRemains(rest)) return { status: 409, error: ADMIN_STRANDED };
+  adminDeletesInFlight.add(id);
+  tenantsBeingDeleted.add(t);
+  try {
+    // 1. Close every way in: the user's sessions, its unredeemed enrollment codes
+    // (a code minted earlier must not enroll a host mid-delete), and what would
+    // dispatch new work into the tenant.
+    if (!user.disabled) setTenancy(tenancy.updateUser(tenancyState, id, { disabled: true }).state);
+    let codes = 0;
+    for (const [cid, rec] of Object.entries(enrollCodes)) {
+      if (rec && rec.tenantId === t) { delete enrollCodes[cid]; codes += 1; }
+    }
+    if (codes) persistEnrollCodes();
+    for (const name of ADMIN_DELETE_EARLY_PURGES) {
+      const fn = tenantPurges.get(name);
+      if (fn) try { fn(t); } catch (e) { console.error(`tenant purge: ${name} failed: ${(e && e.message) || e}`); }
+    }
+    // 2. Kill every live session on the tenant's hosts. Re-scanned until the wait
+    // ends, so a host or session that appears meanwhile is killed too.
+    const tenantHosts = () => Object.keys(agents).filter((k) => tenantOfKey(k) === t);
+    const kills = new Map(); // `${key}\0${sid}` -> {key, cmdId}
+    const queueKills = () => {
+      for (const key of tenantHosts()) {
+        for (const s of agents[key].sessions || []) {
+          if (!s || typeof s.id !== "string" || !ADMIN_KILLABLE.has(s.status)) continue;
+          const k = `${key}\0${s.id}`;
+          if (!kills.has(k)) kills.set(k, { key, cmdId: queueCommand(key, { type: "kill", sessionId: s.id }) });
+        }
+      }
+    };
+    const taken = (k) => {
+      const a = agents[k.key];
+      if (!a || Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) return true; // offline: nothing to wait for
+      const c = (a.commands || []).find((x) => x.cmdId === k.cmdId);
+      return !c || !!c.deliveredAt;
+    };
+    const deadline = Date.now() + ADMIN_DELETE_KILL_WAIT_MS;
+    queueKills();
+    while (kills.size && Date.now() < deadline) {
+      if ([...kills.values()].every(taken)) break;
+      await new Promise((r) => setTimeout(r, 200));
+      queueKills();
+    }
+    queueKills(); // whatever reported in the last poll still gets its command
+    const killsDelivered = [...kills.values()].filter((k) => {
+      const a = agents[k.key];
+      const c = a && (a.commands || []).find((x) => x.cmdId === k.cmdId);
+      return a && (!c || !!c.deliveredAt);
+    }).length;
+    // 3. Revoke the tenant's agent identities (+ the name tokens of plain names a
+    // roll bound in), cut their tunnels, drop their records — read NOW, after the
+    // wait, so a host enrolled during it goes too.
+    let identitiesRevoked = 0;
+    const plainOrigins = new Set();
+    for (const [uid, e] of Object.entries(agentIdentities)) {
+      if (!e || e.tenantId !== t) continue;
+      if (e.origin && !tenantOfKey(e.origin)) plainOrigins.add(e.origin);
+      // A roll-bound identity keeps a tombstone so its plain origin's name token
+      // stays retired (the XERK-2383 rule); anything else simply goes.
+      if (!e.revoked) identitiesRevoked += 1;
+      if (e.origin && e.origin !== e.home && e.used) { e.revoked = true; delete e.tenantId; e.home = e.origin; }
+      else delete agentIdentities[uid];
+    }
+    const nameTokens = { revoked: 0, failed: 0 };
+    for (const name of plainOrigins) {
+      const r = await bumpNameTokenGen(name);
+      if (r && r.error) nameTokens.failed += 1; else nameTokens.revoked += 1;
+    }
+    await persistAgentIdentities();
+    if (!HA_ON && typeof liveStore.flush === "function") liveStore.flush();
+    for (const key of Object.keys(controlChannels)) {
+      if (tenantOfKey(key) !== t) continue;
+      dropTermAgents(key);
+      try { controlChannels[key].socket.destroy(); } catch { /* gone */ }
+    }
+    const hosts = tenantHosts();
+    for (const key of hosts) {
+      delete agents[key];
+      recordBytes.delete(key);
+      markAgentRemoved(key);
+      sseBroadcast("removed", { key });
+    }
+    scheduleSave();
+    // 4. Every store's own purge, then 5. the record itself.
+    const purge = purgeTenantData(t);
+    setTenancy(tenancy.deleteUser(tenancyState, id));
+    invalidateAgentsCache();
+    return {
+      status: 200,
+      body: {
+        ok: true, hosts: hosts.length, sessionsKilled: kills.size, killsDelivered,
+        identitiesRevoked, nameTokens, enrollCodes: codes,
+        purge: Object.fromEntries(Object.entries(purge).map(([k, v]) => [k, v && v.error ? "failed" : "ok"])),
+      },
+    };
+  } finally {
+    adminDeletesInFlight.delete(id);
+    tenantsBeingDeleted.delete(t);
+  }
+}
 // Whitelist, field by field (a hand-edited file or a remote replica's value).
 // Inline literals: this runs at module init.
 function coerceAgentIdentities(raw) {
@@ -15293,6 +15523,13 @@ function consumeEnrollCode(code, device, now = Date.now(), check = false) {
   // The host joins the code OWNER's tenant (XERK-2533) — never one the agent
   // names: its registry key and identity are minted inside that tenant.
   const tenantId = typeof rec.tenantId === "string" && TENANT_ID_RE.test(rec.tenantId) ? rec.tenantId : "";
+  // A tenant's code is good only while a user of that tenant can still use it
+  // (XERK-2552): never once its owner was disabled, lost the user role, or is
+  // being deleted — else a code minted earlier enrolls a host nobody owns.
+  if (tenantId && (tenantsBeingDeleted.has(tenantId) || !Object.values(tenancyState.users).some((u) =>
+    u.tenantId === tenantId && !u.disabled && tenancy.effectiveRoles(tenancyState, u).includes("user")))) {
+    return { status: 410, body: { error: "the account this enrollment code belongs to can no longer add hosts — mint a new one" } };
+  }
   const refusal = enrollNameRefusal(device, tenantId);
   if (refusal) return { status: refusal.status, body: { error: refusal.error } };
   const key = tenantHostKey(device, tenantId);
@@ -20036,6 +20273,7 @@ const BOARD = htmlPage("board.html");
 const INSIGHTS = htmlPage("insights.html");
 const BRIEF = htmlPage("brief.html");
 const MEETINGS_PAGE = htmlPage("meetings.html");
+const ADMIN_PAGE = htmlPage("admin.html");
 // Not an `htmlPage`: the login form is served `no-store` (a cached login page
 // is its own problem), so it has no conditional-GET path to carry an ETag for.
 const LOGIN = withHashedAssets(readAsset("login.html"));
@@ -21685,6 +21923,11 @@ const server = http.createServer(async (req, res) => {
       const route = routeScope.classifyRoute(req.method, parts);
       if (!route) return json(res, 404, { error: "not found" });
       // Orgs are gated by XERK-2551's guard below (principalMaySite).
+      // The admin panel (XERK-2552): admin role only, 404 otherwise like every
+      // refusal here. It serves identities, never tenant data.
+      if (route.cls === "admin" && !principalIsAdmin(requestPrincipal(req))) {
+        return json(res, 404, { error: "not found" });
+      }
       const scoped = route.cls === "repo" || route.cls === "transcript";
       if (scoped) {
         const p = requestPrincipal(req);
@@ -22125,6 +22368,146 @@ const server = http.createServer(async (req, res) => {
 
     // Short-lived token for the /audio WebSocket (browser WebSocket can't set
     // an Authorization header, so the token rides the query string instead).
+    // The admin panel (XERK-2552). The tenant gate above already 404'd a caller
+    // without the admin role (the "admin" route class), so these only validate.
+    if (req.method === "GET" && (url.pathname === "/admin" || url.pathname === "/admin.html")) {
+      return sendPage(req, res, ADMIN_PAGE);
+    }
+    if (url.pathname.startsWith("/api/admin/")) {
+      const p = requestPrincipal(req);
+      const readJson = async () => {
+        try {
+          const v = JSON.parse((await readBody(req, 16384)) || "{}");
+          return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+        } catch { return null; }
+      };
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        // A write must come from the hub's own page: a cross-site form or fetch
+        // carries the operator's cookie (SameSite=Lax still sends it on a
+        // top-level POST) and the hub reads any body as JSON.
+        if (!sameOriginUpgrade(req)) return json(res, 403, { error: "cross-site request refused" });
+        const ct = String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+        if (req.method !== "DELETE" && ct !== "application/json") {
+          return json(res, 415, { error: "send the body as application/json" });
+        }
+        // An open hub (no login configured) makes every caller an admin, and a
+        // local account would close it: never let an anonymous caller do that.
+        if (p && p.kind === "open") {
+          return json(res, 409, { error: "this hub has no login configured, so anyone could manage its users — " +
+            "set TURMA_PASSWORD or TURMA_BOOTSTRAP_ADMIN_USER/_PASSWORD first" });
+        }
+      }
+      if (req.method === "GET" && url.pathname === "/api/admin/users") {
+        const users = Object.values(tenancyState.users).map(adminUserView)
+          .sort((a, b) => a.name.localeCompare(b.name));
+        return json(res, 200, { users, breakGlass: breakGlassEnabled(), you: p && p.kind === "user" ? p.userId : null });
+      }
+      if (req.method === "GET" && url.pathname === "/api/admin/groups") {
+        return json(res, 200, adminGroupsView());
+      }
+      if (req.method === "GET" && url.pathname === "/api/admin/audit") {
+        return json(res, 200, { entries: adminAudit.slice(-200).reverse(), total: adminAudit.length });
+      }
+      if (req.method === "PUT" && url.pathname === "/api/admin/groups") {
+        const body = await readJson();
+        if (!body || !body.groups || typeof body.groups !== "object" || Array.isArray(body.groups)) {
+          return json(res, 400, { error: "body must be {groups: {name: role}}" });
+        }
+        let next;
+        try { next = tenancy.setGroupMap(tenancyState, body.groups); } catch (e) { return json(res, 400, { error: e.message }); }
+        if (!adminWayInRemains(next)) return json(res, 409, { error: ADMIN_STRANDED });
+        setTenancy(next);
+        recordAdminAction(p, "groups.update", "",
+          Object.entries(next.groups).map(([n, g]) => `${n}=${g.role}`).join(", ").slice(0, 500));
+        return json(res, 200, adminGroupsView());
+      }
+      if (req.method === "POST" && url.pathname === "/api/admin/users") {
+        const body = await readJson();
+        if (!body) return json(res, 400, { error: "body must be a JSON object" });
+        const { username, displayName, password } = body;
+        const groups = body.groups === undefined ? ["turma-users"] : body.groups;
+        if (typeof username !== "string" || !tenancy.USERNAME_RE.test(username)) {
+          return json(res, 400, { error: "username must be 1-64 letters, digits or . _ @ -" });
+        }
+        if (displayName !== undefined && typeof displayName !== "string") return json(res, 400, { error: "displayName must be a string" });
+        if (!tenancy.validPassword(password)) {
+          return json(res, 400, { error: `password must be ${tenancy.PASSWORD_MIN}+ characters` });
+        }
+        if (!tenancy.validGroupList(groups)) return json(res, 400, { error: "groups must be a list of group names" });
+        if (tenancy.findLocalUser(tenancyState, username)) return json(res, 409, { error: "username already taken" });
+        const passwordHash = await tenancy.hashPassword(password);
+        let r;
+        try {
+          r = tenancy.createLocalUser(tenancyState, { username, displayName: displayName || username, passwordHash, groups });
+        } catch (e) { return json(res, 409, { error: e.message }); }
+        setTenancy(r.state);
+        recordAdminAction(p, "user.create", adminUserLabel(r.user), `groups: ${groups.join(", ") || "none"}`);
+        return json(res, 200, { ok: true, user: adminUserView(r.user) });
+      }
+      const m = /^\/api\/admin\/users\/([0-9a-f]{32})(\/password)?$/.exec(url.pathname);
+      const target = m && Object.hasOwn(tenancyState.users, m[1]) ? tenancyState.users[m[1]] : null;
+      if (m && !target) return json(res, 404, { error: "no such user" });
+      if (m && !m[2] && req.method === "PATCH") {
+        const body = await readJson();
+        if (!body) return json(res, 400, { error: "body must be a JSON object" });
+        const patch = {};
+        const said = [];
+        if (body.disabled !== undefined) {
+          if (typeof body.disabled !== "boolean") return json(res, 400, { error: "disabled must be true or false" });
+          if (tenantsBeingDeleted.has(target.tenantId)) return json(res, 409, { error: "that user is being deleted" });
+          if (body.disabled && p && p.kind === "user" && p.userId === target.id) {
+            return json(res, 409, { error: "you cannot disable your own account" });
+          }
+          patch.disabled = body.disabled;
+          said.push(body.disabled ? "disabled" : "enabled");
+        }
+        if (body.groups !== undefined) {
+          if (!tenancy.validGroupList(body.groups)) return json(res, 400, { error: "groups must be a list of group names" });
+          patch.groups = body.groups;
+          said.push(`groups: ${body.groups.join(", ") || "none"}`);
+        }
+        if (body.displayName !== undefined) {
+          if (typeof body.displayName !== "string" || !body.displayName.trim()) return json(res, 400, { error: "displayName must be a non-empty string" });
+          if (target.source !== "local") return json(res, 409, { error: "an SSO user's name comes from the identity provider" });
+          patch.displayName = body.displayName;
+          said.push("renamed");
+        }
+        if (!said.length) return json(res, 400, { error: "nothing to change (disabled, groups or displayName)" });
+        let r;
+        try { r = tenancy.updateUser(tenancyState, target.id, patch); } catch (e) { return json(res, 400, { error: e.message }); }
+        if (!adminWayInRemains(r.state)) return json(res, 409, { error: ADMIN_STRANDED });
+        setTenancy(r.state);
+        recordAdminAction(p, "user.update", adminUserLabel(r.user), said.join("; "));
+        return json(res, 200, { ok: true, user: adminUserView(r.user) });
+      }
+      if (m && m[2] && req.method === "POST") {
+        if (target.source !== "local") return json(res, 409, { error: "an SSO user's password is the identity provider's" });
+        const body = await readJson();
+        if (!body || !tenancy.validPassword(body.password)) {
+          return json(res, 400, { error: `password must be ${tenancy.PASSWORD_MIN}+ characters` });
+        }
+        const passwordHash = await tenancy.hashPassword(body.password);
+        // Re-read: the record may have changed (or gone) during the hash.
+        if (!Object.hasOwn(tenancyState.users, target.id)) return json(res, 404, { error: "no such user" });
+        const r = tenancy.updateUser(tenancyState, target.id, { passwordHash });
+        setTenancy(r.state);
+        recordAdminAction(p, "user.password", adminUserLabel(r.user), "password reset");
+        return json(res, 200, { ok: true, user: adminUserView(r.user) });
+      }
+      if (m && !m[2] && req.method === "DELETE") {
+        const label = adminUserLabel(target);
+        const r = await deleteUserAndTenant(p, target.id);
+        if (r.status !== 200) return json(res, r.status, { error: r.error });
+        const b = r.body;
+        recordAdminAction(p, "user.delete", label,
+          `hosts ${b.hosts}, sessions killed ${b.sessionsKilled} (${b.killsDelivered} taken), ` +
+          `agent tokens revoked ${b.identitiesRevoked}, enrollment codes ${b.enrollCodes}` +
+          (Object.values(b.purge).includes("failed") ? `, purge failed: ${Object.keys(b.purge).filter((k) => b.purge[k] === "failed").join(", ")}` : ""));
+        return json(res, 200, b);
+      }
+      return json(res, 404, { error: "not found" });
+    }
+
     // Who is signed in (XERK-2553): the clients' account label + admin-only screen.
     if (req.method === "GET" && url.pathname === "/api/me") {
       return json(res, 200, meView(requestPrincipal(req)));
@@ -26715,6 +27098,9 @@ if (process.env.TURMA_TEST) {
     ENROLL_CODE_TTL_MS,
     ENROLL_SUPERSEDE_GRACE_MS,
     enrollCodes: () => enrollCodes,
+    adminAudit: () => adminAudit,
+    deleteUserAndTenant,
+    adminWayInRemains,
     coerceEnrollCodes,
     serializeAgent,
     tokenHost,
