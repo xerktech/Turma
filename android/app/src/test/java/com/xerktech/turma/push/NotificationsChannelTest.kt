@@ -17,6 +17,10 @@ import org.junit.Test
  */
 class NotificationsChannelTest {
 
+    @Test fun `a meeting's proposals route to their own channel`() {
+        assertEquals(Notifications.CH_MEETINGS, Notifications.channelFor("meetings"))
+    }
+
     @Test fun `runaway spend routes to its own channel`() {
         assertEquals(Notifications.CH_SPEND, Notifications.channelFor("money_with_wings"))
     }

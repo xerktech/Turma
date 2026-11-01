@@ -877,6 +877,41 @@ class AgentDecodeTest {
         assertEquals(listOf(1, 2, 3, 4, 5), s.weekdays)
     }
 
+    // ---- Meetings (XERK-2511): typed top-level map, decoded per meeting ----
+
+    @Test fun `meetingProposals decode per meeting, a bad row dropping alone`() {
+        val body = """
+            { "now": 1, "agents": [ $plainHost ],
+              "meetingProposals": {
+                "o.atlassian.net": [
+                  { "meetingId": "m2", "status": "ok", "title": "Sync", "platform": "Zoom",
+                    "startedAt": 1000, "endedAt": 2000, "tenirUrl": "https://t/x", "participants": ["Ann"],
+                    "receivedAt": 2100, "model": "sonnet", "host": "h1", "generatedAt": 2200,
+                    "items": [
+                      { "id": "p1", "kind": "bug", "title": "Fix", "description": "d",
+                        "quotes": [ { "speaker": "Ann", "text": "broken", "atMs": 0 } ],
+                        "duplicateKeys": ["XERK-1"], "review": { "state": "created", "at": 3, "key": "XERK-9",
+                          "start": true, "session": "queued" } },
+                      { "id": "p2", "kind": "decision", "title": "Ship", "description": "", "quotes": [],
+                        "duplicateKeys": [] } ] },
+                  { "meetingId": "bad", "items": "not a list" },
+                  { "meetingId": "m1", "status": "queued", "title": "Old" } ],
+                "x.atlassian.net": "not a list" } }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertEquals(listOf("mxh-t16"), resp.agents.map { it.key })
+        val list = resp.meetingProposals.getValue("o.atlassian.net")
+        assertEquals(listOf("m2", "m1"), list.map { it.meetingId })
+        val it0 = list[0].items[0]
+        assertEquals(0L, it0.quotes.single().atMs)
+        assertEquals("XERK-9", it0.review!!.key)
+        assertEquals("queued", it0.review!!.session)
+        assertEquals(null, list[0].items[1].review)
+        assertEquals(-1L, com.xerktech.turma.model.MeetingQuote().atMs)
+        assertTrue("x.atlassian.net" !in resp.meetingProposals)
+        assertTrue(TurmaJson.decodeFromString<AgentsResponse>("""{ "now": 1, "agents": [] }""").meetingProposals.isEmpty())
+    }
+
     @Test fun `a hub predating the daily brief decodes with empty maps`() {
         val resp = TurmaJson.decodeFromString<AgentsResponse>("""{ "now": 1, "agents": [ $plainHost ] }""")
         assertTrue(resp.dailyBriefs.isEmpty())

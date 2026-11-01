@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.ViewKanban
@@ -20,6 +21,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 
 /**
  * The top-level destinations, in bottom-nav order — mirrors the web's phone bottom-nav
@@ -32,6 +34,8 @@ enum class TopDest(val route: String, val label: String, val icon: ImageVector) 
     // The Daily Brief (XERK-2397), the web's Brief page; between Board and Usage
     // by operator choice.
     BRIEF("brief", "Brief", Icons.Filled.RecordVoiceOver),
+    // Meetings (XERK-2511), the web's /meetings page, right after Brief as in nav.js.
+    MEETINGS("meetings", "Meetings", Icons.Filled.Groups),
     USAGE("usage", "Usage", Icons.Filled.Analytics),
 }
 
@@ -77,7 +81,19 @@ internal fun TurmaBottomNav(current: TopDest, onNavigate: (TopDest) -> Unit) {
                 selected = dest == current,
                 onClick = { if (dest != current) onNavigate(dest) },
                 icon = { Icon(dest.icon, dest.label) },
-                label = { Text(dest.label) },
+                // Six tabs since Meetings (XERK-2511): a label may never break mid-word
+                // ("Dashbo/ard"), so one line, a hair smaller, no tracking.
+                label = {
+                    Text(
+                        dest.label,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.labelMedium.copy(
+                            fontSize = 11.sp, letterSpacing = 0.sp,
+                        ),
+                    )
+                },
                 alwaysShowLabel = true,
                 colors = NavigationBarItemDefaults.colors(
                     selectedIconColor = MaterialTheme.colorScheme.onPrimary,

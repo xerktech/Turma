@@ -24,6 +24,7 @@ object Notifications {
     const val CH_PR = "turma_pr"
     const val CH_HOST = "turma_host"
     const val CH_SPEND = "turma_spend"
+    const val CH_MEETINGS = "turma_meetings"
 
     fun createChannels(context: Context) {
         val mgr = context.getSystemService(NotificationManager::class.java) ?: return
@@ -39,6 +40,8 @@ object Notifications {
             // host status: this fires rarely and is worth muting or promoting
             // independently of whether a host went offline.
             Triple(CH_SPEND, "Session spend", NotificationManager.IMPORTANCE_DEFAULT),
+            // "N proposals from <meeting>" (XERK-2511): once per meeting.
+            Triple(CH_MEETINGS, "Meeting proposals", NotificationManager.IMPORTANCE_DEFAULT),
             Triple(CH_ALERTS, "General alerts", NotificationManager.IMPORTANCE_DEFAULT),
         )
         for ((id, name, importance) in channels) {
@@ -57,6 +60,8 @@ object Notifications {
         // still routed, since an older hub keeps sending them.
         tags.contains("mag") || tags.contains("checkered_flag") -> CH_TURN
         tags.contains("rocket") -> CH_PR
+        // A meeting's proposals are ready to review (XERK-2511).
+        tags.contains("meetings") -> CH_MEETINGS
         // "key" is the Claude-login alert (XERK-98); "circle" also catches the
         // green_circle "login restored" notification. Both are host-level.
         // Runaway per-session spend. Checked BEFORE the host row, which already

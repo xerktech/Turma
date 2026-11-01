@@ -91,6 +91,9 @@ data class FleetState(
     // poll and the "dailyBriefs" / "dailyBriefSchedules" SSE events.
     val dailyBriefs: Map<String, List<com.xerktech.turma.model.DailyBrief>> = emptyMap(),
     val dailyBriefSchedules: Map<String, com.xerktech.turma.model.DailyBriefSchedule> = emptyMap(),
+    // Meetings (XERK-2511): each org's meetings and proposed work items, keyed by
+    // siteKey. Refreshed by the poll and the "meetingProposals" SSE event.
+    val meetingProposals: Map<String, List<com.xerktech.turma.model.Meeting>> = emptyMap(),
 )
 
 class FleetRepository(
@@ -127,12 +130,25 @@ class FleetRepository(
         eventSource?.cancel(); eventSource = null
     }
 
+    /**
+     * Put the hub's answer to a review POST (XERK-2511) in place at once, so the
+     * item shows its new state before the next SSE frame. Counts as a newer map
+     * than any poll already in flight.
+     */
+    fun patchMeeting(siteKey: String, row: com.xerktech.turma.model.Meeting) {
+        val list = meetingProposals[siteKey] ?: return
+        meetingsClock++
+        meetingProposals = meetingProposals + (siteKey to list.map { if (it.meetingId == row.meetingId) row else it })
+        emit(_state.value.now, null)
+    }
+
     /** Force an immediate poll (after a mutation, on resume). */
     fun nudge() {
         scope.launch { refresh() }
     }
 
     suspend fun refresh() {
+        val since = meetingsClock
         try {
             val r = client.api.listAgentsResponse()
             if (!r.isSuccessful) throw retrofit2.HttpException(r)
@@ -173,6 +189,7 @@ class FleetRepository(
             epicBuilders = resp.epicBuilders
             dailyBriefs = resp.dailyBriefs
             dailyBriefSchedules = resp.dailyBriefSchedules
+            if (meetingsClock == since) meetingProposals = resp.meetingProposals
             // Don't let a late/stale poll drag the clock backward under the
             // records we just kept fresh (XERK-812) — same upward coercion upsert
             // uses for an SSE event.
@@ -234,6 +251,14 @@ class FleetRepository(
     @Volatile
     private var dailyBriefSchedules: Map<String, com.xerktech.turma.model.DailyBriefSchedule> = emptyMap()
 
+    @Volatile
+    private var meetingProposals: Map<String, List<com.xerktech.turma.model.Meeting>> = emptyMap()
+
+    // Bumped by every meetingProposals SSE frame and local patch: a poll that
+    // started before one keeps the newer map (the web page's XERK-444 merge).
+    @Volatile
+    private var meetingsClock = 0
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
@@ -255,6 +280,7 @@ class FleetRepository(
             epicBuilders = epicBuilders,
             dailyBriefs = dailyBriefs,
             dailyBriefSchedules = dailyBriefSchedules,
+            meetingProposals = meetingProposals,
         )
     }
 
@@ -355,6 +381,10 @@ class FleetRepository(
             "dailyBriefSchedules" -> runCatching {
                 TurmaJson.decodeFromString(com.xerktech.turma.model.LenientSchedulesSerializer, data)
             }.getOrNull()?.let { dailyBriefSchedules = it; emit(_state.value.now, null) }
+            // A meeting arrived, was read or reviewed (XERK-2508/2510); whole map.
+            "meetingProposals" -> runCatching {
+                TurmaJson.decodeFromString(com.xerktech.turma.model.LenientMeetingsSerializer, data)
+            }.getOrNull()?.let { meetingsClock++; meetingProposals = it; emit(_state.value.now, null) }
         }
     }
 

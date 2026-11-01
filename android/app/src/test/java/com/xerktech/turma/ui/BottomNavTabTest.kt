@@ -49,8 +49,16 @@ class BottomNavTabTest {
         // Mirrors nav.js PAGES (pinned by turma/tests/nav.test.js) minus the web-only
         // Insights page (XERK-2386); the bar renders TopDest.entries in declaration order.
         assertEquals(
-            listOf("dashboard", "sessions", "board", "brief", "usage"),
+            listOf("dashboard", "sessions", "board", "brief", "meetings", "usage"),
             TopDest.entries.map { it.route },
         )
+    }
+
+    @Test fun `a meetings push opens the Meetings tab, nothing else does`() {
+        assertEquals(TopDest.MEETINGS, deepLinkTab("/meetings?site=o.atlassian.net"))
+        assertEquals(TopDest.MEETINGS, deepLinkTab("/meetings"))
+        assertEquals(null, deepLinkTab("/board?ticket=X-1"))
+        assertEquals(null, deepLinkTab("/meetingsx"))
+        assertEquals(null, deepLinkTab(null))
     }
 }

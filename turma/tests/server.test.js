@@ -29269,6 +29269,35 @@ const creates2510 = (device) =>
   ((agents[device] && agents[device].commands) || []).filter((c) => c.type === "createTicket");
 const item2510 = (site, mid, iid) =>
   hub.getMeetings()[site].find((m) => m.meetingId === mid).items.find((i) => i.id === iid);
+test("XERK-2511: proposals ready push once per meeting, never for an empty one or a re-sent row", async () => {
+  const S = "mtP2511.atlassian.net";
+  await meetHost2508("mtP2511", S);
+  await postMeeting2508(S, meeting2508("n1", { title: "Sprint sync" }));
+  await postMeeting2508(S, meeting2508("n2", { title: "Retro" }));
+  const [c1] = meetCmds2508("mtP2511");
+  notifications.length = 0;
+  const items = [{ kind: "task", title: "Write the doc" }, { kind: "decision", title: "Ship Friday" }];
+  await meetResult2508("mtP2511", S, c1, { status: "ok", items });
+  const pushed = notifications.filter((n) => n.title != null);
+  assert.deepEqual(pushed.map((n) => n.title), ["2 proposals from Sprint sync"]);
+  assert.deepEqual([pushed[0].data.tags, pushed[0].data.notifKey, pushed[0].data.click, pushed[0].data.host],
+    ["meetings", `meeting:${S}:n1`, `/meetings?site=${encodeURIComponent(S)}`, "mtP2511"]);
+  // The outbox re-sends the row until a beat is accepted: no second push.
+  await meetResult2508("mtP2511", S, c1, { status: "ok", items });
+  assert.equal(notifications.filter((n) => n.title != null).length, 1);
+  // A meeting with nothing to propose stays quiet; a failed one too.
+  const c2 = meetCmds2508("mtP2511").find((c) => c.meetingId === "n2");
+  await meetResult2508("mtP2511", S, c2, { status: "ok", items: [] });
+  assert.equal(notifications.filter((n) => n.title != null).length, 1);
+  // One proposal reads singular.
+  await postMeeting2508(S, meeting2508("n3", { title: "1:1" }));
+  const c3 = meetCmds2508("mtP2511").find((c) => c.meetingId === "n3");
+  await meetResult2508("mtP2511", S, c3, { status: "ok", items: [items[0]] });
+  assert.deepEqual(notifications.filter((n) => n.title != null).map((n) => n.title).slice(1),
+    ["1 proposal from 1:1"]);
+  cleanup2508(S, ["mtP2511"]);
+});
+
 
 test("XERK-2510: approving a proposal creates the ticket on the right board, Jira and ADO", async () => {
   const J = "mtJ2510.atlassian.net";

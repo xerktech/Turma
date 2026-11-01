@@ -83,6 +83,16 @@ val LocalTextSize = staticCompositionLocalOf { TextSizeControl() }
  * differs from the navigated route; here the ids are identical.) These tabs are
  * single-screen, so there is no per-tab stack worth preserving.
  */
+/**
+ * The tab a notification's `click` path opens (XERK-2511), or null. Only the
+ * path's first segment counts, so `/meetings?site=…` is the Meetings tab; a
+ * session alert routes by host + session instead.
+ */
+internal fun deepLinkTab(url: String?): TopDest? {
+    val path = url?.substringBefore('?')?.substringBefore('#')?.trim('/') ?: return null
+    return if (path == TopDest.MEETINGS.route) TopDest.MEETINGS else null
+}
+
 internal fun tabNavOptions(): NavOptionsBuilder.() -> Unit = {
     popUpTo(TopDest.DASHBOARD.route) { inclusive = false }
     launchSingleTop = true
@@ -162,6 +172,9 @@ fun TurmaApp(
                 launchSingleTop = true
             }
             nav.navigate(Routes.chat(dl.host, dl.sessionId)) { launchSingleTop = true }
+        } else if (deepLinkTab(dl.url) == TopDest.MEETINGS) {
+            // "N proposals from <meeting>" (XERK-2511): open the Meetings tab.
+            nav.navigate(TopDest.MEETINGS.route, tabNavOptions())
         }
         onDeepLinkConsumed()
     }
@@ -235,6 +248,9 @@ fun TurmaApp(
         }
         composable(TopDest.BRIEF.route) {
             MainScaffold(TopDest.BRIEF, goTab) { m -> BriefScreen(modifier = m) }
+        }
+        composable(TopDest.MEETINGS.route) {
+            MainScaffold(TopDest.MEETINGS, goTab) { m -> MeetingsScreen(modifier = m) }
         }
         composable(
             "chat/{host}/{session}",
