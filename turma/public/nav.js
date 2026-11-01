@@ -76,7 +76,7 @@
     ).join("\n      ");
     return `<nav class="nav-tabs">
       ${tabs}
-      <a href="#" class="signout" onclick="${SIGNOUT}">Sign out</a>
+      <a href="#" class="signout" id="navSignout" onclick="${SIGNOUT}">Sign out</a>
     </nav>`;
   }
 
@@ -99,6 +99,55 @@
   </a>`).join("\n  ");
   }
 
+  // Who is signed in (XERK-2553), from GET /api/me. The name rides Sign out's
+  // tooltip rather than a visible label: the header's row is right-aligned and
+  // must keep one shape across page loads (XERK-2432), and /api/me answers after
+  // the first paint. Android shows the same line in its ⋮ menu above Sign out.
+  function meLabel(me) {
+    if (!me || typeof me !== "object") return "";
+    const name = typeof me.name === "string" ? me.name : "";
+    return name ? `Signed in as ${name}` : "";
+  }
+  // An admin-only principal (admin role, no tenant of its own) reaches no host,
+  // session or ticket, so every page would read as an empty fleet. Say why
+  // instead. Android shows the same words as a whole screen (AdminOnlyScreen).
+  const ADMIN_ONLY_NOTE = "This account is an administrator without a workspace of its own, " +
+    "so there are no hosts, sessions or tickets to show. Sign in with a user account to work in a workspace.";
+  function adminOnlyNoteHtml(me) {
+    return me && me.adminOnly === true
+      ? `<div class="admin-only-note" role="status">${esc(ADMIN_ONLY_NOTE)}</div>` : "";
+  }
+  function applyMe(doc, me) {
+    const so = doc.getElementById("navSignout");
+    const label = meLabel(me);
+    if (so && label) so.title = label;
+    const header = doc.getElementById("siteHeader");
+    const html = adminOnlyNoteHtml(me);
+    const shown = doc.querySelector(".admin-only-note");
+    if (header && html && !shown) header.insertAdjacentHTML("afterend", html);
+    else if (!html && shown && shown.remove) shown.remove();
+  }
+  // While the note shows, re-ask: the first host enrolling makes this account a
+  // fleet operator, and the note must not sit above that host until a reload
+  // (Android re-checks against every fleet poll). Stops once the note is gone.
+  // A failed RE-check (a hub mid-rollout, a dropped connection) keeps the loop
+  // going, as Android retries a 5xx; only a first load that fails gives up.
+  const ME_RECHECK_MS = 15000;
+  function loadMe(doc, rechecking = false) {
+    const win = doc.defaultView;
+    const f = win && win.fetch;
+    if (typeof f !== "function") return Promise.resolve();
+    const again = () => { if (typeof win.setTimeout === "function") win.setTimeout(() => loadMe(doc, true), ME_RECHECK_MS); };
+    return f.call(win, "/api/me", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((me) => {
+        if (!me) { if (rechecking) again(); return; }
+        applyMe(doc, me);
+        if (me.adminOnly === true) again();
+      })
+      .catch(() => { if (rechecking) again(); }); // an older hub 404s it: nothing to show
+  }
+
   // Mount into the page's placeholders. `data-page` on the <header> picks the
   // active tab.
   function mount(doc) {
@@ -106,6 +155,7 @@
     if (!header) return;
     const active = header.dataset.page || "";
     header.innerHTML = siteHeaderHtml(active);
+    loadMe(doc);
     const bottom = doc.getElementById("bottomNav");
     if (bottom) bottom.innerHTML = bottomNavHtml(active);
     const pane = doc.querySelector && doc.querySelector(".page-scroll");
@@ -265,7 +315,8 @@
     return what ? `${what} failed — ${why}` : why;
   }
 
-  const api = { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, esc, preserveScroll, toast, refusalText };
+  const api = { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, esc, preserveScroll, toast, refusalText,
+    meLabel, adminOnlyNoteHtml, applyMe, loadMe, ADMIN_ONLY_NOTE };
   if (typeof window !== "undefined") window.TurmaNav = api;
   // Guarded on `document`, not `window`: a test can put a stand-in on a fake
   // global `window` before requiring this and still drive mount() itself.

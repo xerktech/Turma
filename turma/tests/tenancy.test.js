@@ -415,3 +415,26 @@ test("XERK-2586: a break-glass sign-in whose socket already closed is not evalua
   assert.equal(ok.status, 200, "a live break-glass sign-in afterwards still works");
   assert.ok(/hub_session=/.test(String(ok.headers["set-cookie"] || "")), "and is issued a session");
 });
+
+test("XERK-2553: admin-only means an admin with no workspace AND no host to drive", async () => {
+  const glass = { authorization: "Basic " + Buffer.from("glass:glass-pass").toString("base64") };
+  const me = async (h) => JSON.parse((await request("GET", "/api/me", { headers: h })).raw);
+  // No host anywhere: break-glass has nothing to drive. An open hub's principal
+  // is still never admin-only (no account to switch to).
+  assert.equal((await me(glass)).adminOnly, true);
+  assert.equal(hub.meView({ kind: "open", userId: null, tenantId: null, roles: ["user", "admin"] }).adminOnly, false);
+  const root = await addLocalUser("root2553", "root-2553-pass", ["turma-admins"]);
+  const both = await addLocalUser("both2553", "both-2553-pass", ["turma-users", "turma-admins"]);
+  const cookieFor = (u, r) => ({ cookie: `hub_session=${hub.issueSessionToken(60_000, { u: u.id, t: u.tenantId, r })}` });
+  assert.equal((await me(cookieFor(root, ["admin"]))).adminOnly, true);
+  assert.equal((await me(cookieFor(both, ["user", "admin"]))).adminOnly, false, "a workspace is never admin-only");
+  // An untenanted host appears: break-glass and an admin-role user drive it, so
+  // they are the fleet's operators, not admin-only (QA D1/D2).
+  const beat = await request("POST", "/api/heartbeat", {
+    headers: { authorization: "Bearer agenttok" }, body: { device: "ops2553" } });
+  assert.equal(beat.status, 200);
+  assert.equal((await me(glass)).adminOnly, false);
+  assert.equal((await me(cookieFor(root, ["admin"]))).adminOnly, false);
+  // An open hub's principal is never admin-only (no account to switch to).
+  assert.equal(hub.meView({ kind: "open", userId: null, tenantId: null, roles: ["user", "admin"] }).adminOnly, false);
+});

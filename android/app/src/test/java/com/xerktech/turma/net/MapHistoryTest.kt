@@ -51,4 +51,13 @@ class MapHistoryTest {
         val r = HubClient.mapHistory(Response.success(HistoryResponse(entries = entries, truncated = true)))
         assertEquals(HubClient.HistoryResult.Ready(entries, true), r)
     }
+
+    // XERK-2553: since tenancy a 404 is an unknown session OR another account's
+    // (the hub answers both alike), so the app says so — keeping the hub's words.
+    @Test fun `a 404 says the session may belong to another account`() {
+        val r = HubClient.mapHistory(refusal(404, "{\"error\":\"unknown agent\"}"))
+        val why = (r as HubClient.HistoryResult.Failed).why
+        assertTrue(why.contains("another account"))
+        assertTrue(why.contains("unknown agent"))
+    }
 }

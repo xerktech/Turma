@@ -1,7 +1,9 @@
 package com.xerktech.turma.ui
 
+import androidx.compose.foundation.layout.Box
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
@@ -44,6 +46,13 @@ object Routes {
  * previews/tests happy.
  */
 val LocalSignOut = staticCompositionLocalOf<() -> Unit> { {} }
+
+/**
+ * Who is signed in (XERK-2553), for the shared [ScreenHeader]'s ⋮ menu label.
+ * Null = not known (signed out, an older hub). Changes at runtime, so a
+ * dynamic local.
+ */
+val LocalAccount = compositionLocalOf<com.xerktech.turma.model.Me?> { null }
 
 /**
  * The fleet-wide chat text size (XERK-144), provided around the NavHost so the
@@ -92,6 +101,7 @@ fun TurmaApp(
     val ctx = LocalContext.current
     val settings by container.config.state.collectAsStateWithLifecycle()
     val textSize by container.textSize.size.collectAsStateWithLifecycle()
+    val me by container.account.me.collectAsStateWithLifecycle()
     val start = if (settings.configured) TopDest.DASHBOARD.route else Routes.LOGIN
 
     // The native SSO Custom Tab returns here as a deep link (XERK-591): redeem
@@ -181,7 +191,12 @@ fun TurmaApp(
     CompositionLocalProvider(
         LocalSignOut provides signOut,
         LocalTextSize provides TextSizeControl(textSize, container.textSize::set),
+        LocalAccount provides me,
     ) {
+    // An admin-only account (XERK-2553) gets one explanatory screen OVER the app:
+    // the NavHost stays composed underneath so sign-out's navigation still has a
+    // graph to navigate.
+    Box {
     NavHost(navController = nav, startDestination = start) {
         composable(Routes.LOGIN) {
             LoginScreen(onSignedIn = {
@@ -284,6 +299,11 @@ fun TurmaApp(
                 showBack = true,
             )
         }
+    }
+    val fleet by container.fleet.state.collectAsStateWithLifecycle()
+    if (settings.configured && com.xerktech.turma.core.showAdminOnly(me, fleet.loading, fleet.agents.size)) {
+        AdminOnlyScreen(me, signOut)
+    }
     }
     }
 }
