@@ -179,20 +179,21 @@ class HubClient(private val config: Config) {
     // The same pool and timeouts with no auth interceptor, for /api/login.
     private val bare: OkHttpClient by lazy { http.newBuilder().apply { interceptors().clear() }.build() }
 
-    // MUST stay declared before `apiRef`: `apiRef`'s initializer calls build(),
+    // MUST stay declared before `built`: `built`'s initializer calls build(),
     // which reads contentType. A property initialized textually later is still
-    // null at that point, so ordering this after apiRef makes build() pass a
+    // null at that point, so ordering this after built makes build() pass a
     // null contentType and asConverterFactory throws on launch (crashes onCreate).
     private val contentType = "application/json".toMediaType()
 
+    // The URL and the API built for it are ONE reference, swapped together
+    // (rollup XERK-2602). As two fields, the URL was recorded before the API
+    // for it existed, so a call racing a hub-URL change (the account fetch the
+    // same save triggers) read the new URL, skipped the rebuild and was handed
+    // the API still pointed at the previous hub.
     @Volatile
-    private var builtFor: String = ""
-
-    @Volatile
-    private var apiRef: HubApi = build(config.current.baseUrl)
+    private var built: Pair<String, HubApi> = config.current.baseUrl.let { it to build(it) }
 
     private fun build(baseUrl: String): HubApi {
-        builtFor = baseUrl
         return Retrofit.Builder()
             .baseUrl(baseUrl)
             .client(http)
@@ -205,10 +206,11 @@ class HubClient(private val config: Config) {
     val api: HubApi
         get() {
             val base = config.current.baseUrl
-            if (base != builtFor) synchronized(this) {
-                if (base != builtFor) apiRef = build(base)
+            built.let { (url, api) -> if (url == base) return api }
+            synchronized(this) {
+                built.let { (url, api) -> if (url == base) return api }
+                return build(base).also { built = base to it }
             }
-            return apiRef
         }
 
     /** A sign-in verdict plus the session token it earned (empty = use Basic). */
