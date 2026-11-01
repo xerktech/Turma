@@ -269,6 +269,8 @@ sqlite-mode corruption guards.
   under HA is the hydrated working copy), so `ARCHIVE_TOTAL_MAX_BYTES` et al. behave exactly as
   before. The bucket itself is unbounded object storage (it scales — the ADR's whole reason for the
   split); an operator-side lifecycle/quota on the bucket is the deployment's concern, not the hub's.
+- **A tenant purge DOES reach the bucket** (XERK-2549, `ArchiveMirror.remove`, keys under
+  `@<tenantId>/` plus any pre-partition file) — `turma-archive-tenancy.md`.
 - **Known gap, documented not closed:** an operator HAND-DELETING a local `.jsonl` is not propagated
   to the bucket (the mirror only pushes writes); its transcript stays blocked (XERK-1050). The of-record keeps the object until a bucket-side
   lifecycle rule or a future reconcile sweep removes it. This mirrors the archive's existing posture

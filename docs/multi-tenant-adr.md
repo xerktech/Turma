@@ -86,6 +86,34 @@ tenants, run by an admin panel.
 - Rejected: a hard per-tenant quota (ceiling / tenants). It strands capacity whenever few tenants are
   busy, and the count of tenants changes at runtime, so every quota would shift on each signup.
 
+### The durable archive is partitioned per tenant (XERK-2549)
+
+- A tenant host's archived transcripts live under `ARCHIVE_DIR/@<tenantId>/` (the bucket keys under
+  HA follow, since keys are relative paths). `@` can never start a repo folder, so the partition
+  cannot collide with the untenanted tree. The row's tenant is still its host key; no tenant column.
+- Every by-id read (`getTranscript`, `sessionRow`, the raw files, the trajectories) takes the
+  caller's scope at the store, as list/search already did (XERK-2534). The live `/history` path
+  scopes to the HOST's tenant: the session's transcript id is agent-asserted.
+- A row never moves between tenants: an ingest re-point and a restore target are refused across
+  tenants, the legacy NULL-org escape included.
+- **Quota, not shared-ceiling eviction.** The archive never evicts: it is the only copy of a
+  conversation, so eviction would be data loss (unlike a ledger's derived rows, XERK-2591). With only
+  the shared ceiling, one tenant filling it refuses every other tenant's ingest. So each tenant's
+  partition has its own quota, `ARCHIVE_TENANT_MAX_BYTES` (default an eighth of
+  `ARCHIVE_TOTAL_MAX_BYTES`, `0` = off), refused like the shared ceiling (cursor + `full`). The
+  untenanted fleet keeps only the shared ceiling.
+  - A FIXED quota, never ceiling / tenants: it does not shift on each signup. The cost is stranded
+    capacity when few tenants are busy, and eight full tenants can still fill the shared ceiling
+    together; both are the operator's to tune.
+  - A tenant transcript archived before the partition sits in the untenanted tree and counts toward
+    the shared ceiling only. Files are never renamed; the purge still finds it by its row.
+- **Purge** (`registerTenantPurge("archive")`): tombstone the tenant in the HA-shared
+  `archivePurgedTenants` store FIRST, then delete its rows (Postgres via the mirror's `remove` op),
+  files, raw directories, partition and bucket objects. The tombstone is what stops a follower's
+  stale local copy being re-indexed by the boot backfill or a rebuild; the store walk reaps it.
+  Every hydrate re-issues any delete that did not land (Postgres rows, bucket objects), so a purge
+  converges even when its own best-effort deletes were lost.
+
 ### Admin without a tenant: break-glass
 
 - The `TURMA_USER`/`TURMA_PASSWORD` break-glass login (XERK-595) stays, IdP-independent, and maps to

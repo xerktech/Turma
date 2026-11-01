@@ -189,6 +189,7 @@ class MemIndexStore {
         if (this.dropRepairs) return;           // a lost mirror op (pod died, retries spent)
         this.replaceEntries(t, e); this.setCounts(t, n, b); if (done) done();
       },
+      remove: (t) => this.deleteTranscript(t),   // IndexMirror's "remove" op (XERK-2549)
     };
   }
   // Mirrors PgIndexStore.hydrateInto: reset once, then batch-apply sessions + entries.
@@ -1643,4 +1644,113 @@ test("XERK-2534: buildList/buildSearch carry the tenant scope as a bound paramet
   const s = buildSearch("archive", "q:*", { scope: { tenant: t, untenanted: false } });
   assert.match(s.text, /s\.host LIKE \$2/);
   assert.equal(s.params[1], `%@${t}`);
+});
+
+test("XERK-2549 pg mode: a tenant purge removes the map rows, the Postgres rows and the files", async () => {
+  const mem = pgSetup();
+  const A = "a".repeat(32), B = "b".repeat(32);
+  try {
+    const b = (w) => [ent(`u-${w}`, "user", `purgeword ${w}`)];
+    const len = (w) => Buffer.byteLength(JSON.stringify(b(w)));
+    archive.ingestChunk(`lap@${A}`, "pg-ta", META, 0, len("a"), b("a"), `acme@${A}`);
+    archive.ingestChunk(`lap@${B}`, "pg-tb", META, 0, len("b"), b("b"), `acme@${B}`);
+    const relA = archive.sessionRow("pg-ta").filePath;
+    assert.ok(relA.startsWith(`@${A}${path.sep}`), relA);
+    assert.ok(fs.existsSync(path.join(process.env.ARCHIVE_DIR, relA)));
+    const searchIds = async (scope) => (await archive.searchArchive("purgeword", { scope }))
+      .groups.flatMap((g) => g.matches.map((m) => m.transcriptId)).sort();
+    // (The Postgres scope filter itself is pinned by the XERK-2534 SQL-builder case.)
+    assert.equal(archive.getTranscript("pg-ta", { tenant: B, untenanted: false }), null,
+      "A's transcript never reaches B");
+    assert.deepEqual(await searchIds(undefined), ["pg-ta", "pg-tb"]);
+
+    const out = archive.purgeTenant(A);
+    assert.equal(out.transcripts, 1);
+    assert.equal(archive.sessionRow("pg-ta"), null, "map row gone");
+    assert.ok(!mem.sessions.has("pg-ta") && !mem.entries.has("pg-ta"), "Postgres rows gone");
+    assert.ok(!fs.existsSync(path.join(process.env.ARCHIVE_DIR, `@${A}`)), "partition gone");
+    assert.deepEqual(await searchIds(undefined), ["pg-tb"], "nothing of A is searchable");
+    assert.equal(archive.getTranscript("pg-tb").entries.length, 1, "B untouched");
+  } finally { pgTeardown(); }
+});
+
+test("XERK-2549 pg mode: a purge whose Postgres delete was LOST is not undone by the next hydrate", async () => {
+  const mem = pgSetup();
+  const A = "c".repeat(32);
+  const purged = new Set();
+  archive.setTenantPurged((t) => purged.has(t));
+  try {
+    const b = [ent("u-l", "user", "lostword secret")];
+    archive.ingestChunk(`lap@${A}`, "pg-lost", META, 0, Buffer.byteLength(JSON.stringify(b)), b, `acme@${A}`);
+    // The mirror drops the purge's `remove` op (retries spent, queue overflow, leader died).
+    archive.setIndexSink({ ...mem.sink(), remove: () => {} });
+    purged.add(A);
+    archive.purgeTenant(A);
+    assert.ok(mem.sessions.has("pg-lost"), "precondition: Postgres still holds the row");
+    // Postgres search never serves it meanwhile.
+    assert.equal((await archive.searchArchive("lostword")).groups.length, 0);
+    assert.equal((await archive.listArchive({})).sessions.some((s) => s.transcriptId === "pg-lost"), false);
+    // A fresh replica's hydrate does not load it and re-sends the delete.
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    assert.equal(archive.sessionRow("pg-lost"), null, "not resurrected into the map");
+    assert.ok(!mem.sessions.has("pg-lost") && !mem.entries.has("pg-lost"), "the delete was re-sent");
+  } finally { archive.setTenantPurged(null); pgTeardown(); }
+});
+
+test("XERK-2549 pg mode: a file another tenant's surviving row also names is KEPT by the purge", async () => {
+  const mem = pgSetup();
+  const A = "d".repeat(32);
+  try {
+    // A pre-XERK-277 collision: two transcripts, one file, one untenanted.
+    const rel = path.join("part", "2026-07-01__shared__h__shared.jsonl");
+    const abs = path.join(process.env.ARCHIVE_DIR, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, JSON.stringify(ent("x", "user", "shared line")) + "\n");
+    fs.writeFileSync(abs + ".meta", JSON.stringify({ transcriptId: "pg-sh-u", host: "plainsh" }));
+    const row = (id, host) => ({ transcriptId: id, host, filePath: rel, msgCount: 1,
+      bytesStored: 10, archiveBytes: fs.statSync(abs).size });
+    mem.upsertSession(row("pg-sh-a", `lap@${A}`));
+    mem.upsertSession(row("pg-sh-u", "plainsh"));
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    const raw = path.join(abs + ".raw", "pg-sh-a");
+    fs.mkdirSync(raw, { recursive: true });
+    fs.writeFileSync(path.join(raw, "pg-sh-a.jsonl"), "x");
+    archive.purgeTenant(A);
+    assert.ok(fs.existsSync(abs) && fs.existsSync(abs + ".meta"), "the shared file stays");
+    assert.ok(!fs.existsSync(abs + ".raw"), "the tenant's own raw dir and its emptied suffix dir go");
+    assert.equal(archive.sessionRow("pg-sh-a"), null);
+    assert.equal(archive.getTranscript("pg-sh-u").entries.length, 1, "the other row still reads");
+  } finally { pgTeardown(); }
+});
+
+test("XERK-2549: the sqlite-mode index hydrate (indexLoader) skips a purged tenant and re-sends its delete", async () => {
+  archive.closeDb();
+  fs.rmSync(process.env.ARCHIVE_DIR, { recursive: true, force: true });
+  const mem = new MemIndexStore();
+  const A = "f".repeat(32);
+  const purged = new Set();
+  archive.setTenantPurged((t) => purged.has(t));
+  archive.setIndexSink(mem.sink());
+  try {
+    const b = (w) => [ent(`u-${w}`, "user", `loaderword ${w}`)];
+    const len = (w) => Buffer.byteLength(JSON.stringify(b(w)));
+    archive.ingestChunk(`lap@${A}`, "il-a", META, 0, len("a"), b("a"), `acme@${A}`);
+    archive.ingestChunk("nas", "il-u", META, 0, len("u"), b("u"), "acme");
+    purged.add(A);
+    // The purge's delete never reached the of-record; a replica re-hydrates from it.
+    mem.hydrateInto(archive.indexLoader());
+    assert.equal(archive.sessionRow("il-a"), null, "the purged row is not loaded");
+    const hits = (await archive.searchArchive("loaderword")).groups.flatMap((g) => g.matches)
+      .map((m) => m.transcriptId);
+    assert.deepEqual(hits, ["il-u"], "nor are its search entries");
+    assert.ok(!mem.sessions.has("il-a"), "the delete was re-sent to the of-record");
+    assert.ok(mem.sessions.has("il-u"));
+  } finally {
+    archive.setTenantPurged(null);
+    archive.setIndexSink(null);
+    archive.closeDb();
+  }
 });

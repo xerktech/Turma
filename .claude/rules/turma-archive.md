@@ -35,6 +35,9 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
   honestly empty (XERK-422). In sqlite mode (HA off) reclaim reaps the disposable local rows + VACUUMs
   as before (XERK-332).
 
+- **Partitioned by tenant** (XERK-2549): `@<tenantId>/` subtrees, per-tenant quota, store-layer
+  scoped reads, tenant purge — `turma-archive-tenancy.md`.
+
 - The hub hosts a **durable, searchable archive of ended sessions**: agents push each inactive
   transcript in, landing as organized files on `/data`
   (`/data/archive/<repo>/<YYYY-MM-DD>__<summary>__<host>__<shortId>.jsonl` + `.meta` sidecar),

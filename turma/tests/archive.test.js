@@ -1907,3 +1907,152 @@ test("XERK-2534: list + search run under a tenant scope (a `<device>@<32-hex>` h
     .groups.flatMap((g) => g.matches).map((m) => m.transcriptId);
   assert.deepEqual(hits, ["s2534b"]);
 });
+
+// ---- XERK-2549: the archive partitioned by tenant ---------------------------
+const T49A = "1".repeat(32), T49B = "2".repeat(32);
+const meta49 = (summary) => ({ remoteKey: "github.com/x/part", repo: "part", worktree: "/w",
+  slug: "s", createdAt: "2026-07-12T00:00:00Z", endedTs: "2026-07-12T00:00:00Z", summary });
+function push49(host, tid, words, siteKey) {
+  const list = [ent(`${tid}-u`, "user", words)];
+  return archive.ingestChunk(host, tid, meta49(tid), 0, Buffer.byteLength(JSON.stringify(list)),
+    list, siteKey);
+}
+
+test("XERK-2549: a tenant host's transcript lands in its own @<tenantId>/ partition", () => {
+  push49(`lap@${T49A}`, "p49a", "partword one", `acme@${T49A}`);
+  push49("plain49", "p49u", "partword two", "acme");
+  const relA = archive.sessionRow("p49a").filePath;
+  assert.equal(relA.split(path.sep)[0], `@${T49A}`);
+  assert.ok(fs.existsSync(path.join(process.env.ARCHIVE_DIR, relA)));
+  assert.equal(archive.tenantOfRel(relA), T49A);
+  assert.equal(archive.sessionRow("p49u").filePath.split(path.sep)[0], "part", "untenanted tree unchanged");
+  assert.equal(archive.tenantOfHost(`lap@${T49A}`), T49A);
+  assert.equal(archive.tenantOfHost("plain49"), "");
+  // The walk measures the partition per tenant, raw files included.
+  archive.ingestRaw(`lap@${T49A}`, "p49a", "p49a.jsonl", 0, Buffer.from("raw-bytes"));
+  archive.__resetTotalCache();
+  archive.totalArchiveBytes();
+  const dir = path.join(process.env.ARCHIVE_DIR, `@${T49A}`);
+  const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).reduce((n, e) =>
+    n + (e.isDirectory() ? walk(path.join(d, e.name))
+      : e.name.endsWith(".meta") ? 0 : fs.statSync(path.join(d, e.name)).size), 0);
+  assert.equal(archive.tenantBytes(T49A), walk(dir));
+  assert.equal(archive.tenantBytes(T49B), 0);
+});
+
+test("XERK-2549: tenant A's reads never return tenant B's rows, at the store layer", async () => {
+  push49(`lap@${T49B}`, "p49b", "partword three", `acme@${T49B}`);
+  archive.ingestRaw(`lap@${T49B}`, "p49b", "p49b.jsonl", 0, Buffer.from("b-raw"));
+  const A = { tenant: T49A, untenanted: false };
+  const B = { tenant: T49B, untenanted: false };
+  const ops = { tenant: null, untenanted: true };
+  const search = async (scope) => (await archive.searchArchive("partword", { scope }))
+    .groups.flatMap((g) => g.matches.map((m) => m.transcriptId)).sort();
+  assert.deepEqual(await search(A), ["p49a"]);
+  assert.deepEqual(await search(B), ["p49b"]);
+  assert.deepEqual(await search(ops), ["p49u"]);
+  const list = async (scope) => (await archive.listArchive({ repo: "part", scope })).sessions
+    .map((s) => s.transcriptId).sort();
+  assert.deepEqual(await list(A), ["p49a"]);
+  // Every by-id read answers "unknown" for another tenant's transcript.
+  assert.equal(archive.getTranscript("p49b", A), null);
+  assert.equal(archive.sessionRow("p49b", A), null);
+  assert.equal(archive.listRawFiles("p49b", A), null);
+  assert.equal(archive.rawDirOf("p49b", A), null);
+  assert.equal(archive.rawFileFor("p49b", "p49b.jsonl", A), null);
+  assert.equal(archive.renderedTrajectory("p49b", "claude", A), null);
+  assert.equal(archive.getTranscript("p49b", ops), null, "the operators do not see tenant rows");
+  assert.equal(archive.getTranscript("p49u", A), null, "nor a tenant the operators' rows");
+  // ...and its own.
+  assert.equal(archive.getTranscript("p49b", B).entries.length, 1);
+  assert.ok(archive.rawFileFor("p49b", "p49b.jsonl", B));
+});
+
+test("XERK-2549: a row never crosses tenants on ingest, even a legacy NULL-org row", () => {
+  // Same org string, different tenants: refused.
+  const before = archive.sessionRow("p49b").host;
+  push49(`lap@${T49A}`, "p49b", "hijack", `acme@${T49B}`);
+  assert.equal(archive.sessionRow("p49b").host, before);
+  assert.equal(archive.getTranscript("p49b").entries.length, 1, "nothing appended");
+  // (The legacy NULL-org row is pinned in the purge case below, which rebuilds.)
+});
+
+test("XERK-2549: a tenant at its quota is refused; other tenants and the operators are not", () => {
+  const max = archive.ARCHIVE_TENANT_MAX;
+  assert.ok(max > 0 && max <= archive.ARCHIVE_TOTAL_MAX);
+  archive.__resetTotalCache(0, { [T49A]: max });
+  const r = push49(`lap@${T49A}`, "p49quota", "over", `acme@${T49A}`);
+  assert.deepEqual(r, { bytesStored: 0, full: true });
+  assert.equal(archive.ingestRaw(`lap@${T49A}`, "p49a", "p49a/more.txt", 0, Buffer.from("x")).full, true);
+  assert.equal(archive.archiveLimits([], `lap@${T49A}`).full, true);
+  assert.equal(archive.archiveLimits([], `lap@${T49B}`).full, false, "B keeps archiving");
+  assert.equal(archive.archiveLimits([], "plain49").full, false);
+  assert.ok(push49(`lap@${T49B}`, "p49quotab", "fine", `acme@${T49B}`).bytesStored > 0);
+  archive.__resetTotalCache();
+});
+
+test("XERK-2549: a tenant purge removes every byte and row, and nothing resurrects it", async () => {
+  // A tenant transcript archived BEFORE the partition: its files sit in the
+  // untenanted tree, attributed only by its sidecar's host.
+  const legacyRel = path.join("part", "2026-07-12__legacy__lap__p49old.jsonl");
+  const legacyAbs = path.join(process.env.ARCHIVE_DIR, legacyRel);
+  fs.writeFileSync(legacyAbs, JSON.stringify(ent("o", "user", "partword legacy")) + "\n");
+  fs.writeFileSync(legacyAbs + ".meta", JSON.stringify({ transcriptId: "p49old", host: `lap@${T49A}`, repo: "part" }));
+  // And an untenanted pre-XERK-344 row (no siteKey: NULL after a rebuild).
+  const nullRel = path.join("part", "2026-07-12__nullorg__plain49__p49null.jsonl");
+  const nullAbs = path.join(process.env.ARCHIVE_DIR, nullRel);
+  fs.writeFileSync(nullAbs, JSON.stringify(ent("n", "user", "nullorg")) + "\n");
+  fs.writeFileSync(nullAbs + ".meta", JSON.stringify({ transcriptId: "p49null", host: "plain49" }));
+  archive.rebuildIndex();
+  assert.equal(archive.sessionRow("p49old").host, `lap@${T49A}`);
+  // Legacy NULL-org trust-on-first-sight never lets a tenant host adopt that row.
+  const nullBytes = archive.getTranscript("p49null").entries.length;
+  push49(`lap@${T49A}`, "p49null", "hijack", null);
+  assert.equal(archive.sessionRow("p49null").host, "plain49");
+  assert.equal(archive.getTranscript("p49null").entries.length, nullBytes, "nothing appended");
+  const purged = new Set();
+  archive.setTenantPurged((t) => purged.has(t));
+  try {
+    purged.add(T49A);   // server.js records the tombstone first
+    const out = archive.purgeTenant(T49A);
+    assert.equal(out.transcripts, 2, "p49a and p49old (the quota-refused push stored no row)");
+    const all = (await archive.listArchive({ limit: 500 })).sessions.map((s) => s.host);
+    assert.ok(!all.some((h) => h.endsWith(`@${T49A}`)), "no row of A is left");
+    const hits = (await archive.searchArchive("partword")).groups.flatMap((g) => g.matches)
+      .map((m) => m.transcriptId).sort();
+    assert.deepEqual(hits, ["p49b", "p49u"]);
+    assert.ok(!fs.existsSync(path.join(process.env.ARCHIVE_DIR, `@${T49A}`)), "partition gone");
+    assert.ok(!fs.existsSync(legacyAbs) && !fs.existsSync(legacyAbs + ".meta"), "legacy file gone");
+    assert.equal(archive.getTranscript("p49b").entries.length, 1, "B untouched");
+    assert.ok(archive.listRawFiles("p49b").length, "B's raw layer untouched");
+    // A stale copy (an HA follower's working copy) is never rebuilt into the index,
+    // and the next store walk reaps it.
+    const stale = path.join(process.env.ARCHIVE_DIR, `@${T49A}`, "part", "x.jsonl");
+    fs.mkdirSync(path.dirname(stale), { recursive: true });
+    fs.writeFileSync(stale, JSON.stringify(ent("s", "user", "partword stale")) + "\n");
+    fs.writeFileSync(stale + ".meta", JSON.stringify({ transcriptId: "p49stale", host: `lap@${T49A}` }));
+    fs.writeFileSync(legacyAbs, JSON.stringify(ent("o", "user", "partword legacy")) + "\n");
+    fs.writeFileSync(legacyAbs + ".meta", JSON.stringify({ transcriptId: "p49old", host: `lap@${T49A}` }));
+    archive.rebuildIndex();
+    assert.equal(archive.sessionRow("p49stale"), null);
+    assert.equal(archive.sessionRow("p49old"), null);
+    archive.__resetTotalCache();
+    archive.totalArchiveBytes();
+    assert.ok(!fs.existsSync(path.join(process.env.ARCHIVE_DIR, `@${T49A}`)), "stale partition reaped");
+    // A purged tenant's host stores nothing new.
+    assert.equal(push49(`lap@${T49A}`, "p49new", "again", `acme@${T49A}`).bytesStored, 0);
+    assert.deepEqual(archive.manifestCursors(`lap@${T49A}`, [{ transcriptId: "p49new2", ...meta49("x") }],
+      `acme@${T49A}`), {});
+    assert.equal(archive.sessionRow("p49new2"), null, "no placeholder row for a purged tenant");
+    assert.deepEqual(archive.inventoryCursors(`lap@${T49A}`, [{ i: "p49new3", s: 10, r: 0 }], `acme@${T49A}`), {});
+    // A replica learning the tombstone reaps its stale partition without a walk.
+    fs.mkdirSync(path.join(process.env.ARCHIVE_DIR, `@${T49A}`, "part"), { recursive: true });
+    assert.equal(archive.reapPurgedPartitions(), 1);
+    assert.ok(!fs.existsSync(path.join(process.env.ARCHIVE_DIR, `@${T49A}`)));
+    assert.deepEqual(archive.purgeTenant("not-a-tenant"), { transcripts: 0, files: 0 });
+  } finally {
+    fs.rmSync(legacyAbs, { force: true }); fs.rmSync(legacyAbs + ".meta", { force: true });
+    fs.rmSync(nullAbs, { force: true }); fs.rmSync(nullAbs + ".meta", { force: true });
+    archive.setTenantPurged(null);
+  }
+});

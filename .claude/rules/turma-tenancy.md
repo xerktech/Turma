@@ -284,6 +284,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   transcript id each resolve their own host, never the first one found.
 - Archive list/search pass `scope` (`archiveScopeFor`) into SQL (`scopeSql` / `scopeWhere`), never a
   post-filter (paging would break).
+- The archive is partitioned per tenant, by-id reads are scoped at the store, and it registers
+  the `archive` tenant purge (XERK-2549) → `turma-archive-tenancy.md`.
 
 ## Tests
 
