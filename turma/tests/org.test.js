@@ -1063,6 +1063,105 @@ test("XERK-2598: a new snapshot is the hub's word for auto-start", async () => {
   assert.ok(autoIsOn(slot, "solo.atlassian.net"));
 });
 
+test("XERK-2598: a newer click's OK wins over an older click still in flight", async () => {
+  for (const kind of ["auto", "merge", "color"]) {
+    for (const sse of ["down", "up"]) {
+      const site = `d10-${kind}-${sse}.atlassian.net`;
+      const { slot, click } = mountOrg();
+      Org.update({ agents: [agent("a", site)], autoStartOrgs: {}, autoMergeOrgs: {}, orgColors: {} });
+      click("data-org-toggle", "");
+      const handlers = {};
+      Org.sse({ addEventListener: (t, fn) => { handlers[t] = fn; } });
+      let holdA;
+      let call = 0;
+      global.fetch = () => ++call === 1 ? new Promise((res) => { holdA = res; })
+        : Promise.resolve({ ok: true, status: 200 });
+      const set = (on) => kind === "auto" ? Org.setAutoStart(site, on)
+        : kind === "merge" ? Org.setAutoMerge(site, on) : Org.setOrgColor(site, on ? 3 : null);
+      const shown = () => kind === "auto" ? autoIsOn(slot, site)
+        : kind === "merge" ? mergeIsOn(slot, site) : Org.orgColors()[site] === 3;
+      const a = set(true);                                             // slow; the hub never applies it
+      if (sse === "up") {                                              // B's own frame lands before its 200
+        const ev = { auto: "autoStartOrgs", merge: "autoMergeOrgs", color: "orgColors" }[kind];
+        const b = set(false);
+        handlers[ev]({ data: "{}" });
+        await b;
+      } else await set(false);
+      assert.ok(!shown(), `${kind} sse ${sse}: the newer click's OK shows at once`);
+      holdA({ ok: false, status: 500 });
+      await a;
+      assert.ok(!shown(), `${kind} sse ${sse}: and still after the older one fails`);
+    }
+  }
+});
+
+test("XERK-2598: three clicks — the newest OK decides, whatever order the answers land", async () => {
+  const site = "three.atlassian.net";
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {} });
+  click("data-org-toggle", "");
+  const pending = [];
+  global.fetch = () => new Promise((res) => pending.push(res));
+  const c1 = Org.setAutoStart(site, true);
+  const c2 = Org.setAutoStart(site, false);
+  const c3 = Org.setAutoStart(site, true);
+  pending[1]({ ok: true, status: 200 });  await c2;                    // off applied
+  assert.ok(autoIsOn(slot, site), "c3 is newer and still in flight");
+  pending[2]({ ok: false, status: 500 }); await c3;                    // c3 refused
+  assert.ok(!autoIsOn(slot, site), "c2's off is the hub's word");
+  pending[0]({ ok: true, status: 200 });  await c1;                    // c1's late OK is moot
+  assert.ok(!autoIsOn(slot, site), "c1 is older than c2's OK");
+});
+
+test("XERK-2598: an older click's late OK never revives a click a newer OK made moot", async () => {
+  const site = "moot.atlassian.net";
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {} });
+  click("data-org-toggle", "");
+  const pending = [];
+  global.fetch = () => new Promise((res) => pending.push(res));
+  const c1 = Org.setAutoStart(site, true);
+  Org.setAutoStart(site, false);                                       // c2, never answers
+  const c3 = Org.setAutoStart(site, true);
+  pending[2]({ ok: true, status: 200 }); await c3;                     // on applied, newest
+  pending[0]({ ok: true, status: 200 }); await c1;                     // c1's late OK
+  assert.ok(autoIsOn(slot, site), "c2 is older than c3's OK: it must not show");
+});
+
+test("XERK-2598: a refused click in the middle keeps the older click's late answer in order", async () => {
+  const site = "mid.atlassian.net";
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {} });
+  click("data-org-toggle", "");
+  const pending = [];
+  global.fetch = () => new Promise((res) => pending.push(res));
+  const c1 = Org.setAutoStart(site, true);
+  const c2 = Org.setAutoStart(site, false);
+  pending[1]({ ok: false, status: 500 }); await c2;                    // refused while c1 in flight
+  const c3 = Org.setAutoStart(site, false);
+  pending[2]({ ok: true, status: 200 }); await c3;                     // off applied, newest
+  pending[0]({ ok: true, status: 200 }); await c1;                     // c1 is older than c3
+  assert.ok(!autoIsOn(slot, site));
+});
+
+test("XERK-2598: a polled snapshot landing mid-POST never throws the POST's OK away", async () => {
+  const site = "poll.atlassian.net";
+  const { slot, click } = mountOrg();
+  const ag = [agent("a", site)];
+  Org.update({ agents: ag, autoStartOrgs: {} });
+  click("data-org-toggle", "");
+  let release;
+  global.fetch = () => new Promise((res) => { release = res; });
+  const p = Org.setAutoStart(site, true);
+  Org.update({ agents: ag, autoStartOrgs: {} });                       // a poll fetched before the hub applied it
+  release({ ok: true, status: 200 });
+  await p;
+  assert.ok(autoIsOn(slot, site), "the OK is the newer word");
+  global.fetch = () => Promise.resolve({ ok: false, status: 500 });
+  await Org.setAutoStart(site, false);
+  assert.ok(autoIsOn(slot, site), "and a refused click falls back to it");
+});
+
 test("XERK-2598: a failed color pick repaints the control back", async () => {
   const { slot } = mountOrg();
   Org.update({ agents: [agent("a", "acme.atlassian.net")], orgColors: {} });

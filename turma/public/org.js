@@ -415,14 +415,13 @@
   //   POST's own org. A failed click resolves to THAT, never to the value the
   //   switch showed when clicked — which may be an earlier click's unconfirmed
   //   flip, and nothing would ever correct it.
-  // - While any click on an org's switch is still in flight the switch shows
-  //   the NEWEST pending click's value; once none is, it shows `confirmed`. An
-  //   older click's late failure must not undo a newer one, and an older click's
-  //   late SUCCESS must still count once the newer one fails (SSE down).
-  // - An answer (an OK POST, the re-read) is taken into `confirmed` only if no
-  //   NEWER click's answer was taken already and no SSE frame of the map landed
-  //   since it was asked (a frame is the whole map, so it is newer): a late 200
-  //   otherwise outvoted a newer click or another client's change.
+  // - The hub applies an org's clicks in click order, so once click N is
+  //   answered OK every OLDER click is moot. While a click NEWER than the
+  //   newest OK is in flight the switch shows the newest such click; otherwise
+  //   it shows `confirmed`.
+  // - An OK is taken into `confirmed` only if it is the newest OK so far and no
+  //   SSE frame of the map landed since the click (a frame is the whole map:
+  //   newer, and usually this very change). A polled snapshot never blocks it.
   // - A POST that failed at the NETWORK level may still have been applied, so
   //   it re-reads the hub (`hubOrgMap`) and takes ONLY its own org's entry —
   //   the body may predate an SSE change to another org — and not even that
@@ -431,9 +430,10 @@
   const ROUTE = { auto: "autostart", merge: "automerge", color: "color" };
   const confirmed = { auto: {}, merge: {}, color: {} };
   const hubGen = { auto: 0, merge: 0, color: 0 };
-  const flights = new Map();   // kind\0siteKey -> {next, takenAt, pending: n -> value}
+  const flights = new Map();   // kind\0siteKey -> {next, maxOk, pending: n -> value}
 
-  function hubSays(kind, map) { confirmed[kind] = map || {}; hubGen[kind]++; }
+  // `fromSse`: a frame bumps the generation; a polled snapshot does not.
+  function hubSays(kind, map, fromSse) { confirmed[kind] = map || {}; if (fromSse) hubGen[kind]++; }
   // An org's value in a map: true / a slot number, or null for off / auto.
   function valueIn(kind, map, siteKey) {
     if (kind !== "color") return autoOn(map, siteKey) ? true : null;
@@ -463,16 +463,14 @@
     } catch { return null; }
   }
 
-  function take(kind, siteKey, f, n, gen, value) {
-    if (n <= f.takenAt || hubGen[kind] !== gen) return;
-    f.takenAt = n;
+  function confirm(kind, siteKey, value) {
     confirmed[kind] = withValue(confirmed[kind], siteKey, value);
   }
 
   async function flip(kind, siteKey, value, body) {
     const k = kind + "\0" + siteKey;
     let f = flights.get(k);
-    if (!f) flights.set(k, (f = { next: 0, takenAt: 0, pending: new Map() }));
+    if (!f) flights.set(k, (f = { next: 0, maxOk: 0, pending: new Map() }));
     const n = ++f.next;
     f.pending.set(n, value);
     const clickGen = hubGen[kind];
@@ -485,17 +483,19 @@
       if (r.status === 401) { location.href = "/login"; return; }
       ok = r.ok;
     } catch { netErr = true; /* outcome unknown — re-read below */ }
-    if (ok) take(kind, siteKey, f, n, clickGen, value);
-    else if (netErr) {
+    if (ok) {
+      if (n > f.maxOk && hubGen[kind] === clickGen) confirm(kind, siteKey, value);
+      if (n > f.maxOk) f.maxOk = n;
+    } else if (netErr) {
       const gen = hubGen[kind];
       const hub = await hubOrgMap(FIELD[kind]);
-      if (hub) take(kind, siteKey, f, n, gen, valueIn(kind, hub, siteKey));
+      if (hub && f.maxOk < n && hubGen[kind] === gen) confirm(kind, siteKey, valueIn(kind, hub, siteKey));
     }
     f.pending.delete(n);
-    // The newest click still in flight, else the hub's word.
+    // The newest click still in flight that an OK has not made moot, else the hub's word.
     let top = 0;
-    for (const m of f.pending.keys()) if (m > top) top = m;
-    if (!top) flights.delete(k);     // every answer is in: nothing late can arrive
+    for (const m of f.pending.keys()) if (m > f.maxOk && m > top) top = m;
+    if (!f.pending.size) flights.delete(k);     // every answer is in: nothing late can arrive
     showLocal(kind, siteKey, top ? f.pending.get(top) : valueIn(kind, confirmed[kind], siteKey));
   }
 
@@ -535,21 +535,21 @@
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       autoMap = m || {};
-      hubSays("auto", autoMap);
+      hubSays("auto", autoMap, true);
       paint();
     });
     es.addEventListener("autoMergeOrgs", (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       mergeMap = m || {};
-      hubSays("merge", mergeMap);
+      hubSays("merge", mergeMap, true);
       paint();
     });
     es.addEventListener("orgColors", (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       colorPins = m || {};
-      hubSays("color", colorPins);
+      hubSays("color", colorPins, true);
       paint();
       // The pins tint cards on every page, so a change (this tab's or another's)
       // repaints more than this control.
