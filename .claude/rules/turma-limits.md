@@ -2,6 +2,7 @@
 paths:
   - "turma/server.js"
   - "turma/tests/server.test.js"
+  - "turma/Dockerfile"
 ---
 
 # The hub's memory bounds (XERK-273, XERK-258)
@@ -12,6 +13,17 @@ contract, the XERK-287 gap) stay there. This file is the `turma/server.js` mecha
 The hub is the fleet's sole control plane under `mem_limit: 512m` (raised from 256m for XERK-287),
 with `restart: unless-stopped`
 (a crash loop, not a safety net). Two bounds are needed; neither substitutes for the other.
+
+## The V8 heap is a THIRD bound (XERK-2603)
+
+- **V8 caps its heap at ~HALF the cgroup by default** (256 MB of the 512Mi pod), independent of the
+  container — the boot hydrate + reconnect burst crossed it and crash-looped every rollout with
+  `JavaScript heap out of memory`, while every ceiling here assumed the whole 512 MiB.
+- **The image runs `node --max-old-space-size-percentage=75`** (`turma/Dockerfile`; Node reads the
+  cgroup limit for it) — never drop it, and keep it equal to `HEAP_SHARE` in `server.js`.
+- **`MEMORY_LIMIT` is never more than `heap_size_limit / HEAP_SHARE`** (`effectiveMemoryLimit`), so a
+  node started without the flag tightens every derived ceiling instead of crashing. Boot logs both.
+- Tests: `XERK-2603:` in `server.test.js`.
 
 ## Two bounds
 
