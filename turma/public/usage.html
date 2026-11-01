@@ -1644,6 +1644,7 @@ renderViewbar();
 // trigger a DEBOUNCED re-render (~1s) to avoid rebuilding the SVG on every
 // heartbeat / flickering the tooltip. The 30s poll stays as a fallback, skipped
 // while the stream is healthy.
+let sseEverOpen = false;
 let sseOk = false, sseBackoff = 2000, renderTimer = null;
 function scheduleRender() {
   if (renderTimer) return;
@@ -1669,7 +1670,15 @@ function connectSSE() {
   let es;
   try { es = new EventSource(typeof TurmaNav !== "undefined" && TurmaNav.eventsUrl ? TurmaNav.eventsUrl() : "/api/events"); }
   catch { setTimeout(connectSSE, sseBackoff); return; }
-  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  es.onopen = () => {
+    // A RECONNECT re-reads the payload once, as board.html does (rollup XERK-2598):
+    // the hub sends a whole-map event only when this stream's slice CHANGES, so
+    // nothing on a fresh stream repairs what moved while it was down (a hub
+    // restart or rollout) — and the fallback poll runs only while SSE is down.
+    if (sseEverOpen) refresh();
+    sseEverOpen = true;
+    sseOk = true; sseBackoff = 2000;
+  };
   es.addEventListener("agent", (e) => {
     try { applyAgent(JSON.parse(e.data)); } catch { return; }
     scheduleRender();

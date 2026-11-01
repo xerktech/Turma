@@ -4999,6 +4999,7 @@ async function refresh() {
 // host record (as /api/agents returns it); we patch it into `cache` and
 // re-render so a new/finished/waiting session surfaces near-instantly. The poll
 // stays as a slower fallback, skipped while SSE is healthy.
+let sseEverOpen = false;
 let sseOk = false, sseBackoff = 2000;
 function applyAgent(rec) {
   const list = cache.agents || (cache.agents = []);
@@ -5011,7 +5012,15 @@ function connectSSE() {
   let es;
   try { es = new EventSource(typeof TurmaNav !== "undefined" && TurmaNav.eventsUrl ? TurmaNav.eventsUrl() : "/api/events"); }
   catch { setTimeout(connectSSE, sseBackoff); return; }
-  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  es.onopen = () => {
+    // A RECONNECT re-reads the payload once, as board.html does (rollup XERK-2598):
+    // the hub sends a whole-map event only when this stream's slice CHANGES, so
+    // nothing on a fresh stream repairs what moved while it was down (a hub
+    // restart or rollout) — and the fallback poll runs only while SSE is down.
+    if (sseEverOpen) refresh();
+    sseEverOpen = true;
+    sseOk = true; sseBackoff = 2000;
+  };
   es.addEventListener("agent", (e) => {
     try { applyAgent(JSON.parse(e.data)); } catch { return; }
     render(cache);
