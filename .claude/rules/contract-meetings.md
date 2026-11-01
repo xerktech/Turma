@@ -134,6 +134,10 @@ ticket builds to this file; change it here first.
   ≤5 rows a beat; outbox semantics (the agent clears a row once a beat carrying it was accepted).
   - Accepted only from the host asked, for that run, while it is still decided into `siteKey`
     (XERK-348) and the run is still `running`. A re-sent row after that changes nothing.
+  - **The running → ok edge pushes "N proposals from <title>"** (XERK-2511,
+    `notifyMeetingProposals`): once per meeting, since only that edge sends it; none for an empty
+    list or a failure. Routed by the reporting host (its tenant's devices), `tags:"meetings"`,
+    `notifKey: meeting:<site>:<id>`, `click: /meetings?site=…` (Android opens the Meetings tab).
   - `ok` with `items: []` is a real answer ("nothing to propose"); `ok` with no `items` array fails.
 - An item (XERK-2509's schema, re-whitelisted by the hub, ≤`MEETING_ITEMS_MAX` (30) per meeting):
   `{kind:"task"|"bug"|"followup"|"decision", title ≤200, description ≤4000, suggestedAssignee

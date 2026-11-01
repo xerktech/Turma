@@ -109,6 +109,103 @@ data class AgentsResponse(
     val dailyBriefs: Map<String, List<DailyBrief>> = emptyMap(),
     @Serializable(with = LenientSchedulesSerializer::class)
     val dailyBriefSchedules: Map<String, DailyBriefSchedule> = emptyMap(),
+    // Meetings (epic XERK-2503): each org's newest meetings and the work items
+    // proposed from them (hub meetingProposalsWire), keyed by siteKey. Decoded
+    // per row like dailyBriefs, so one malformed meeting drops alone. Absent on
+    // an older hub, which reads as "no meetings".
+    @Serializable(with = LenientMeetingsSerializer::class)
+    val meetingProposals: Map<String, List<Meeting>> = emptyMap(),
+)
+
+/**
+ * One meeting Tenir captured, as the hub serves it (`meetingWire`, XERK-2508).
+ * [status] is "queued" | "running" | "ok" | "failed"; times are epoch ms. Only
+ * an `ok` row carries [items]. Every field defaulted (the heartbeat contract).
+ */
+@Serializable
+data class Meeting(
+    val meetingId: String = "",
+    val status: String = "",
+    val title: String = "",
+    val platform: String = "",
+    val startedAt: Long = 0,
+    val endedAt: Long = 0,
+    val tenirUrl: String = "",
+    val participants: List<String> = emptyList(),
+    val receivedAt: Long = 0,
+    val model: String = "",
+    val host: String = "",
+    val generatedAt: Long = 0,
+    val error: String = "",
+    val items: List<MeetingItem> = emptyList(),
+)
+
+/**
+ * A proposed work item (XERK-2509's schema, hub-whitelisted). [kind] is
+ * "task" | "bug" | "followup" | "decision"; [id] is the hub's "p1".."pN".
+ * [review] is the operator's verdict so far (XERK-2510), absent = unreviewed.
+ */
+@Serializable
+data class MeetingItem(
+    val id: String = "",
+    val kind: String = "",
+    val title: String = "",
+    val description: String = "",
+    val suggestedAssignee: String = "",
+    val due: String = "",
+    val quotes: List<MeetingQuote> = emptyList(),
+    val duplicateKeys: List<String> = emptyList(),
+    val repoGuess: String = "",
+    val review: MeetingReview? = null,
+)
+
+/** A caption line backing an item; [atMs] is the offset into the meeting, -1 = none. */
+@Serializable
+data class MeetingQuote(
+    val speaker: String = "",
+    val text: String = "",
+    val atMs: Long = -1,
+)
+
+/**
+ * The operator's review of an item (`sanitizeMeetingReview`): [state] is
+ * "creating" | "created" | "failed" | "rejected" | "logged". A created one
+ * carries the ticket [key]; with [start] its [session] is "waiting" | "queued"
+ * | "failed".
+ */
+@Serializable
+data class MeetingReview(
+    val state: String = "",
+    val at: Long = 0,
+    val project: String = "",
+    val issueType: String = "",
+    val edited: Boolean = false,
+    val key: String = "",
+    val url: String = "",
+    val error: String = "",
+    val start: Boolean = false,
+    val session: String = "",
+    val sessionError: String = "",
+)
+
+/** POST /api/orgs/<site>/meetings/<id>/items/<item> body (XERK-2510). */
+@Serializable
+data class MeetingReviewRequest(
+    val action: String,
+    val title: String? = null,
+    val description: String? = null,
+    val project: String? = null,
+    val issueType: String? = null,
+    val start: Boolean? = null,
+    val edited: Boolean? = null,
+)
+
+/** That route's answer: {ok, meeting} or the hub's {error}. */
+@Serializable
+data class MeetingReviewResponse(
+    val ok: Boolean = false,
+    val meeting: Meeting? = null,
+    val error: String = "",
 )
 
 /**
@@ -187,6 +284,16 @@ object LenientBriefsSerializer : LenientSiteMapSerializer<List<DailyBrief>>(
     { v ->
         (v as? JsonArray)?.mapNotNull { row ->
             runCatching { TurmaJson.decodeFromJsonElement(DailyBrief.serializer(), row) }.getOrNull()
+        }
+    },
+)
+
+/** `meetingProposals`: per org a list, each meeting decoded on its own. */
+object LenientMeetingsSerializer : LenientSiteMapSerializer<List<Meeting>>(
+    { TurmaJson.encodeToJsonElement(ListSerializer(Meeting.serializer()), it) },
+    { v ->
+        (v as? JsonArray)?.mapNotNull { row ->
+            runCatching { TurmaJson.decodeFromJsonElement(Meeting.serializer(), row) }.getOrNull()
         }
     },
 )

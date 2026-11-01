@@ -19497,6 +19497,22 @@ function meetingRunOf(host, siteKey, runId) {
   return row;
 }
 
+// The phone push when a meeting's proposals are ready (XERK-2511): "N proposals
+// from <title>". Sent on the running -> ok edge, which meetingRunOf lets happen
+// once per meeting, so a re-sent outbox row never pushes again. A meeting with
+// nothing to propose sends nothing. Routed by the reporting host, so only its
+// tenant's devices (XERK-2551); one notifKey per meeting, a tap opens Meetings.
+function notifyMeetingProposals(host, siteKey, row) {
+  const n = Array.isArray(row.items) ? row.items.length : 0;
+  if (!n) return;
+  notify(`${n} proposal${n === 1 ? "" : "s"} from ${row.title || "a meeting"}`,
+    "Review them on the Meetings page — nothing reaches the board until you approve.", {
+      tags: "meetings", route: { host },
+      notifKey: `meeting:${siteKey}:${row.meetingId}`,
+      click: `/meetings?site=${encodeURIComponent(siteKey)}`,
+    });
+}
+
 // Fold the agents' `meetingResults` rows; only meetingRunOf's row is taken.
 function ingestMeetingResults(key, rows, now = Date.now()) {
   if (!Array.isArray(rows)) return false;
@@ -19512,8 +19528,10 @@ function ingestMeetingResults(key, rows, now = Date.now()) {
         ? { ...it, review: undefined } : it)),
       model: typeof r.model === "string" && MEETING_MODEL_RE.test(r.model) ? r.model : row.model,
     });
-    if (ok) dispatchNextMeeting(r.siteKey, now);
-    else {
+    if (ok) {
+      notifyMeetingProposals(key, r.siteKey, ok);
+      dispatchNextMeeting(r.siteKey, now);
+    } else {
       const error = (r.status === "failed" && meetingText(r.error, MEETING_ERROR_MAX))
         || (r.status === "ok" ? "the model's answer carried no item list" : "the host could not read the meeting");
       retryMeeting(r.siteKey, row, error, now);

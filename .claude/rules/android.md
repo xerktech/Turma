@@ -35,6 +35,7 @@ A pure-core/adapter-shell split:
 | `board.js` + `board.html` | `ui/BoardScreen.kt` + `core/Board.kt` + `vm/BoardViewModel.kt` |
 | `usage.html` | `ui/UsageScreen.kt` |
 | Brief page | `ui/BriefScreen.kt` + `core/DailyBrief.kt` + `vm/BriefViewModel.kt` |
+| `meetings.html` | `ui/MeetingsScreen.kt` + `core/Meetings.kt` + `vm/MeetingsViewModel.kt` |
 | `nav.js` | `ui/MainScaffold.kt` + `ui/TurmaApp.kt` |
 | `org.js` | `ui/OrgControl.kt` + `vm/OrgViewModel.kt` + `data/OrgFilter.kt` |
 
@@ -89,6 +90,12 @@ A pure-core/adapter-shell split:
   `/api/agents` decode is atomic. Schedule editing is web-only (`PARITY.md`). The next meeting is
   computed on the phone (`nextBriefMeeting`, java.time's gap/overlap rules = the hub's).
   Tests: `AgentDecodeTest` (daily brief cases), `core/DailyBriefTest`, `ui/BriefScreenTest`.
+- **Meetings (XERK-2511)**: `meetingProposals` decodes per meeting; the ticket description and
+  default type are ported from `meetings.html` (`core/Meetings.kt`), so phone and web send the
+  same create. A poll begun before a `meetingProposals` SSE frame or a review answer keeps the
+  newer map (`meetingsClock`, the web's XERK-444 merge). Six bottom-nav tabs: labels stay ONE
+  line at 11sp; never let one wrap mid-word. Tests: `core/MeetingsTest`, `vm/MeetingsWiringTest`,
+  `ui/MeetingsScreenTest`, `BottomNavTabTest`.
 
 ## Images (rollup XERK-2109)
 

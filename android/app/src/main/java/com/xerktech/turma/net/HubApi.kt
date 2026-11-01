@@ -429,6 +429,17 @@ interface HubApi {
     @POST("api/orgs/{siteKey}/daily-brief/run")
     suspend fun runDailyBrief(@Path("siteKey") siteKey: String): Response<OkResponse>
 
+    // Review one proposed work item of a meeting (XERK-2510): approve (creates
+    // the ticket through the New-ticket path, or logs a decision) or reject.
+    // Answers {ok, meeting} or the hub's {error} (400/404/409).
+    @POST("api/orgs/{siteKey}/meetings/{meetingId}/items/{itemId}")
+    suspend fun reviewMeetingItem(
+        @Path("siteKey") siteKey: String,
+        @Path("meetingId") meetingId: String,
+        @Path("itemId") itemId: String,
+        @Body body: com.xerktech.turma.model.MeetingReviewRequest,
+    ): Response<com.xerktech.turma.model.MeetingReviewResponse>
+
     // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
     // like the agent pin — an authoritative 200. Body: {enabled:true|false}.
     @POST("api/jira/{siteKey}/autostart")

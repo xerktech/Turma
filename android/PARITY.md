@@ -1017,9 +1017,14 @@ those are marked `[MODEL]`.
 - P2 Per-day tooltip; the web's texture channel for series 9+ (Android reuses hues past 8).
 
 ### Meetings (`meetings.html`, XERK-2510)
-- P1 The Meetings page — proposed work items per meeting, Approve / Approve + start / Edit /
-  Reject — is web-only for now. `meetingProposals` is an untyped top-level key Android's
-  `ignoreUnknownKeys` skips (decode-safe). A port must decode it PER ORG like `dailyBriefs`.
+- **At parity (XERK-2511)**: the Meetings tab (`ui/MeetingsScreen.kt`) offers Approve / Approve +
+  start / Edit / Reject / Log decision, the "New tickets go to" project pick and the same review
+  states and refusal words. `meetingProposals` decodes PER MEETING (`LenientMeetingsSerializer`).
+- Platform differences: a created ticket's key and a "May duplicate" key are text, not board
+  links; quote/Tenir links open the system browser. The project pick is kept per phone
+  (SharedPreferences), as the web keeps it per browser.
+- Phone-only: the "N proposals from <meeting>" push (channel "Meeting proposals"); a tap opens
+  the Meetings tab.
 
 ### Nav / Login
 - **Native Authentik SSO is IMPLEMENTED on Android (XERK-591).** `LoginScreen.kt` shows a "Sign in

@@ -853,26 +853,8 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
      * `project`), or a project's issue/work-item types (`project` set). Same
      * 202-poll-with-backoff shape as [fetchIssue].
      */
-    suspend fun fetchCreateMeta(siteKey: String, project: String?): CreateMetaFetch {
-        val deadline = System.currentTimeMillis() + 45_000
-        var delayMs = 600L
-        val wantTypes = !project.isNullOrBlank()
-        while (System.currentTimeMillis() < deadline) {
-            val outcome = try {
-                val resp = container.client.api.createMeta(siteKey, project?.ifBlank { null })
-                classifyCreateMeta(resp.code(), resp.body(), wantTypes)
-            } catch (_: Exception) {
-                return CreateMetaFetch.Error("the hub is unreachable")
-            }
-            if (outcome is CreateMetaFetch.Pending) {
-                delay(delayMs)
-                delayMs = (delayMs * 3 / 2).coerceAtMost(3_000L)
-            } else {
-                return outcome
-            }
-        }
-        return CreateMetaFetch.Error("the host didn't answer in time")
-    }
+    suspend fun fetchCreateMeta(siteKey: String, project: String?): CreateMetaFetch =
+        fetchCreateMetaFrom(container.client.api, siteKey, project)
 
     /**
      * Create a ticket, then poll its outcome by the cmdId the POST returns — the
@@ -968,4 +950,37 @@ internal fun <T> retrofit2.Response<T>.hubError(): String? = try {
         ?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
 } catch (_: Exception) {
     null
+}
+
+/**
+ * The create-meta 202-poll (XERK-137), shared by the board's New-ticket sheet
+ * and the Meetings screen's approve (XERK-2511): the org's projects (no
+ * `project`) or a project's issue types, polled with backoff while the host
+ * fetches.
+ */
+internal suspend fun fetchCreateMetaFrom(
+    api: com.xerktech.turma.net.HubApi,
+    siteKey: String,
+    project: String?,
+): CreateMetaFetch {
+    val deadline = System.currentTimeMillis() + 45_000
+    var delayMs = 600L
+    val wantTypes = !project.isNullOrBlank()
+    while (System.currentTimeMillis() < deadline) {
+        val outcome = try {
+            val resp = api.createMeta(siteKey, project?.ifBlank { null })
+            classifyCreateMeta(resp.code(), resp.body(), wantTypes)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return CreateMetaFetch.Error("the hub is unreachable")
+        }
+        if (outcome is CreateMetaFetch.Pending) {
+            delay(delayMs)
+            delayMs = (delayMs * 3 / 2).coerceAtMost(3_000L)
+        } else {
+            return outcome
+        }
+    }
+    return CreateMetaFetch.Error("the host didn't answer in time")
 }
