@@ -302,25 +302,29 @@ test("XERK-2552 QA: a delete kills sessions that appear during its wait, refuses
     headers: { authorization: `Bearer ${token}` }, body: { device: "racebox", sessions },
   });
   assert.equal((await beat()).status, 200);
+  hub.ticketQueue.push({ siteKey: `race.atlassian.net@${t}`, issueKey: "RC-1", source: "manual", at: Date.now(), reason: "capacity" });
   const pending = request("DELETE", `/api/admin/users/${racer.id}`, { headers: BASIC });
   await new Promise((r) => setTimeout(r, 50));
+  // The queue is emptied at the START, so nothing dispatches into the tenant during the wait.
+  assert.ok(!hub.ticketQueue.some((e) => e.siteKey.endsWith(`@${t}`)), "queued work is cancelled before the kill wait");
   // Mid-delete: a re-enable is refused, a code minted before it enrolls nothing.
   assert.equal((await request("PATCH", `/api/admin/users/${racer.id}`, { headers: BASIC, body: { disabled: false } })).status, 409);
   const late = await request("POST", "/api/agent/enroll", { body: { code: spare, device: "latebox" } });
   assert.ok(late.status >= 400, `a pre-delete code must not enroll (got ${late.status})`);
   // A second session shows up on the next beat.
-  sessions = [{ id: "r1", status: "running" }, { id: "r2", status: "running" }];
+  sessions = [{ id: "r1", status: "running" }, { id: "r2", status: "running" }, { id: "r3", status: "cloning" },
+    { id: "r4", status: "stopped" }];
   const killed = new Set();
-  for (let i = 0; i < 25 && killed.size < 2; i++) {
+  for (let i = 0; i < 25 && killed.size < 3; i++) {
     const b = await beat();
     if (b.status !== 200) break;
     for (const c of b.body.commands || []) if (c.type === "kill") killed.add(c.sessionId);
     await new Promise((r) => setTimeout(r, 100));
   }
-  assert.deepEqual([...killed].sort(), ["r1", "r2"], "both sessions were killed");
+  assert.deepEqual([...killed].sort(), ["r1", "r2", "r3"], "every live session (a cloning one too) was killed; a stopped one is not");
   const del = await pending;
   assert.equal(del.status, 200, del.raw);
-  assert.equal(del.body.sessionsKilled, 2);
+  assert.equal(del.body.sessionsKilled, 3);
   assert.ok(!Object.keys(hub.agents).some((k) => k.endsWith(`@${t}`)), "no host of the tenant remains");
 });
 
