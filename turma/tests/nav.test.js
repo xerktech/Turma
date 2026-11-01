@@ -455,4 +455,8 @@ test("XERK-2553: the admin-only note is re-checked until the hub stops saying so
   calls = 3; answers[3] = { ok: false, json: async () => ({}) };
   await nav.loadMe(doc);
   assert.equal(timers.length, 0);
+  // Nor does a first load whose fetch throws (the hub unreachable at page load).
+  calls = 2;
+  await nav.loadMe(doc);
+  assert.equal(timers.length, 0);
 });
