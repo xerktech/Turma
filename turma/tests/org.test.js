@@ -691,6 +691,67 @@ test("XERK-2600: a flip made while the stream is up survives renders of the old 
   h.error();
 });
 
+test("XERK-2600: a reconnect never re-adopts the page's unchanged cached poll", () => {
+  const { slot, click } = mountOrg();
+  const cache = { agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {}, autoMergeOrgs: {} };
+  Org.update(cache);
+  click("data-org-toggle", "");
+  const h = orgStream();
+  h.autoStartOrgs({ data: JSON.stringify({ "acme.atlassian.net": true }) });
+  h.autoMergeOrgs({ data: JSON.stringify({ "acme.atlassian.net": true }) });
+  h.error(); h.open();          // a hub restart; index/sessions/usage do not re-read
+  Org.update(cache);            // the next beat renders the page-load cache
+  assert.match(slot.innerHTML, /org-chip-auto on/);
+  assert.match(slot.innerHTML, /org-chip-merge on/);
+  h.error();
+});
+
+test("XERK-2600: a lost POST response never rolls back over the hub's frame", async () => {
+  for (const [set, ev, re] of [["setAutoStart", "autoStartOrgs", /org-chip-auto on/],
+                               ["setAutoMerge", "autoMergeOrgs", /org-chip-merge on/]]) {
+    const { slot, click } = mountOrg();
+    Org.update({ agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {}, autoMergeOrgs: {} });
+    click("data-org-toggle", "");
+    const h = orgStream();
+    let fail;
+    global.fetch = () => new Promise((_, rej) => { fail = rej; });
+    const p = Org[set]("acme.atlassian.net", true);
+    h[ev]({ data: JSON.stringify({ "acme.atlassian.net": true }) });   // the hub applied it
+    fail(new Error("connection reset"));                               // its answer is lost
+    await p;
+    assert.match(slot.innerHTML, re, set);
+    h.error();
+  }
+});
+
+test("XERK-2600: each click owns its own map, and only while the stream is up", async () => {
+  const site = "acme.atlassian.net";
+  global.fetch = () => Promise.resolve({ ok: true, status: 200 });
+  // Auto-merge's click takes ownership of the merge map (not just auto-start's).
+  let { slot, click } = mountOrg();
+  let cache = { agents: [agent("a", site)], autoStartOrgs: {}, autoMergeOrgs: {} };
+  Org.update(cache);
+  click("data-org-toggle", "");
+  let h = orgStream();
+  await Org.setAutoMerge(site, true);
+  Org.update({ ...cache, autoMergeOrgs: {} });       // a fetch that left before the click
+  assert.match(slot.innerHTML, /org-chip-merge on/);
+  h.error();
+  // With the stream down a click owns nothing: the next poll is the hub's word.
+  ({ slot, click } = mountOrg());
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {}, autoMergeOrgs: {} });
+  click("data-org-toggle", "");
+  await Org.setAutoStart(site, true);
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {}, autoMergeOrgs: {} });
+  assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/);
+  // A drop releases BOTH maps.
+  h = orgStream();
+  h.autoMergeOrgs({ data: JSON.stringify({ [site]: true }) });
+  h.error();
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {}, autoMergeOrgs: {} });
+  assert.doesNotMatch(slot.innerHTML, /org-chip-merge on/);
+});
+
 // ---- wiring: every page must actually obey it -------------------------------
 
 test("org: every page loads board.js, nav.js and org.js, in that order", () => {

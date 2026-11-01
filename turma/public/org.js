@@ -232,6 +232,20 @@
   // (frames may be missed, so the pages' polls are the source again).
   const sseOwns = { auto: false, merge: false };
   let sseOpen = false;
+  // The snapshot map last offered to update(): a render re-feeding the SAME
+  // cached poll is never news (the cache never learns a frame), so only a newly
+  // fetched body may change a switch. Without this a reconnect, which releases
+  // ownership, let the next render adopt the page-load cache on pages that do
+  // not re-read on reconnect (index, sessions, usage).
+  const snapSeen = { auto: null, merge: null };
+  // Frames received per map, so a click whose POST response was lost does not
+  // roll back over the hub's own word that already arrived.
+  const frames = { auto: 0, merge: 0 };
+  function adoptSnapshot(kind, map) {
+    if (!map || map === snapSeen[kind]) return false;
+    snapSeen[kind] = map;
+    return !sseOwns[kind];
+  }
   let colorPins = {};     // the hub's manual org-color pins (XERK-145)
   let colorFor = null;    // the org whose swatch strip is expanded, or null
   let open = false;
@@ -359,8 +373,8 @@
   function update(data) {
     const B = board();
     sites = B.mergeSites((data && data.agents) || []);
-    if (data && data.autoStartOrgs && !sseOwns.auto) autoMap = data.autoStartOrgs;
-    if (data && data.autoMergeOrgs && !sseOwns.merge) mergeMap = data.autoMergeOrgs;
+    if (data && adoptSnapshot("auto", data.autoStartOrgs)) autoMap = data.autoStartOrgs;
+    if (data && adoptSnapshot("merge", data.autoMergeOrgs)) mergeMap = data.autoMergeOrgs;
     if (data && data.orgColors) colorPins = data.orgColors;
     live = true;
     writeCache();
@@ -408,6 +422,7 @@
   // instantly. Rolls back if the POST fails.
   async function setAutoStart(siteKey, enabled) {
     const had = autoOn(autoMap, siteKey);
+    const framesAtClick = frames.auto;
     if (sseOpen) sseOwns.auto = true;   // the cached snapshot predates this flip
     autoMap = orgMapCopy(autoMap);
     if (enabled) autoMap[siteKey] = true; else delete autoMap[siteKey];
@@ -420,7 +435,9 @@
       if (r.status === 401) { location.href = "/login"; return; }
       ok = r.ok;
     } catch { /* network error — fall through to rollback */ }
-    if (!ok) {
+    // A frame since the click is the hub's word: keep it over a rollback.
+    if (!ok && frames.auto === framesAtClick) {
+      sseOwns.auto = false;   // a later snapshot may correct a lost response
       autoMap = orgMapCopy(autoMap);
       if (had) autoMap[siteKey] = true; else delete autoMap[siteKey];
       paint();
@@ -432,6 +449,7 @@
   // branch unreviewed), so it stays its own switch beside auto-start.
   async function setAutoMerge(siteKey, enabled) {
     const had = autoOn(mergeMap, siteKey);
+    const framesAtClick = frames.merge;
     if (sseOpen) sseOwns.merge = true;  // the cached snapshot predates this flip
     mergeMap = orgMapCopy(mergeMap);
     if (enabled) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
@@ -444,7 +462,9 @@
       if (r.status === 401) { location.href = "/login"; return; }
       ok = r.ok;
     } catch { /* network error — fall through to rollback */ }
-    if (!ok) {
+    // A frame since the click is the hub's word: keep it over a rollback.
+    if (!ok && frames.merge === framesAtClick) {
+      sseOwns.merge = false;   // a later snapshot may correct a lost response
       mergeMap = orgMapCopy(mergeMap);
       if (had) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
       paint();
@@ -495,6 +515,7 @@
       try { m = JSON.parse(e.data); } catch { return; }
       autoMap = m || {};
       sseOwns.auto = true;
+      frames.auto++;
       paint();
     });
     es.addEventListener("autoMergeOrgs", (e) => {
@@ -502,6 +523,7 @@
       try { m = JSON.parse(e.data); } catch { return; }
       mergeMap = m || {};
       sseOwns.merge = true;
+      frames.merge++;
       paint();
     });
     es.addEventListener("orgColors", (e) => {

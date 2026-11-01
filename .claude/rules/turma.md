@@ -83,6 +83,10 @@ makes an `android/` change part of the same PR) live there.
   render re-feeds `update()` the page's cached poll, and a fetch can leave before a frame and land
   after it — adopting either reverted the auto-start/auto-merge switch until its next frame. A frame
   (or a flip while the stream is up) takes ownership; the stream's `open`/`error` hands it back.
+  - Only a NEW snapshot object is ever adopted (`snapSeen`): index/sessions/usage do not re-read on
+    reconnect, so after the hand-back their next render would otherwise adopt the page-load cache.
+  - A failed POST does not roll back once a frame arrived since the click (`frames`): the response
+    was lost, the hub applied it, and the rollback stuck because snapshots were ignored.
 - Repaints skip when markup is unchanged (beat can't churn the DOM under an open menu). A handled
   click is flagged on the EVENT, not looked up after — the repaint detaches the clicked node, so a
   `contains()` click-away test would close the menu on the click that opened it.
