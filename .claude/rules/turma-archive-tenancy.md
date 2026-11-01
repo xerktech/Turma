@@ -40,7 +40,10 @@ Tenancy model: `turma-tenancy.md`.
   partition, from the same walk + per-append charge as the store total (`tenantCache`,
   `tenantWritten`, `chargeTenant`). `ceilingRefuses(tenant)` is the one check `ingestChunk`,
   `ingestRaw` and `archiveLimits(ids, host)` share. Untenanted hosts: shared ceiling only.
-- Pre-partition tenant files count toward the shared ceiling only (accepted).
+- **Charged and measured by the ROW's host, never the file's path** (XERK-2618): a pre-partition
+  tenant row's files sit in the untenanted tree, and a path-keyed charge let a resumed session
+  append there outside the quota. `chargeTenant(tenantOfHost(host))`; the walk attributes those
+  files via `legacyTenantFiles()` (`.jsonl` by filePath, raw subdirectory by transcript id).
 
 ## Purge
 
@@ -67,7 +70,7 @@ Tenancy model: `turma-tenancy.md`.
 
 ## Tests
 
-- The `XERK-2549:` cases in `archive.test.js` (layout + per-tenant walk, store-layer read isolation,
+- The `XERK-2549:` and `XERK-2618:` cases in `archive.test.js` (layout + per-tenant walk, store-layer read isolation,
   no cross-tenant re-point incl. legacy NULL, quota, purge completeness + no resurrection),
   `index-store.test.js` (pg-mode purge), `archive-mirror.test.js` (`rawRootOf`, `remove`),
   `server.test.js` (cross-tenant `/history`, `purgeTenantData`), `external-stores.test.js`.

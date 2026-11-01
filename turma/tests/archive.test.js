@@ -1991,6 +1991,45 @@ test("XERK-2549: a tenant at its quota is refused; other tenants and the operato
   archive.__resetTotalCache();
 });
 
+test("XERK-2618: a pre-partition tenant row is measured and charged to its tenant's quota", () => {
+  // Archived before the partition: the tenant's files sit in the untenanted tree.
+  const rel = path.join("part", "2026-07-12__legacy__lap__q2618.jsonl");
+  const abs = path.join(process.env.ARCHIVE_DIR, rel);
+  fs.writeFileSync(abs, JSON.stringify(ent("q", "user", "legacy2618")) + "\n");
+  fs.writeFileSync(abs + ".meta", JSON.stringify({ transcriptId: "q2618", host: `lap@${T49B}`, repo: "part" }));
+  archive.rebuildIndex();
+  assert.equal(archive.sessionRow("q2618").filePath, rel);
+  // The walk counts the legacy file (and its raw copy) toward B, not A.
+  archive.__resetTotalCache();
+  archive.totalArchiveBytes();
+  const base = archive.tenantBytes(T49B);
+  const aBase = archive.tenantBytes(T49A);
+  const raw = Buffer.from("legacy-raw-bytes");
+  assert.equal(archive.ingestRaw(`lap@${T49B}`, "q2618", "q2618.jsonl", 0, raw).stored, raw.length);
+  assert.equal(archive.tenantBytes(T49B), base + raw.length, "a raw append is charged by row");
+  // The agent's cursor: an offset mismatch stores nothing and hands it back.
+  const cursor = () => archive.ingestChunk(`lap@${T49B}`, "q2618", meta49("q2618"), 1e9, 1e9 + 1,
+    [], `acme@${T49B}`).bytesStored;
+  const have = cursor();
+  const list = [ent("q2", "user", "resumed2618")];
+  const end = have + Buffer.byteLength(JSON.stringify(list));
+  assert.equal(archive.ingestChunk(`lap@${T49B}`, "q2618", meta49("q2618"), have, end, list,
+    `acme@${T49B}`).bytesStored, end);
+  const charged = archive.tenantBytes(T49B);
+  assert.ok(charged > base + raw.length, "a rendered append is charged by row");
+  archive.__resetTotalCache();
+  archive.totalArchiveBytes();
+  assert.equal(archive.tenantBytes(T49B), charged, "the walk agrees with the charge");
+  assert.equal(archive.tenantBytes(T49A), aBase, "another tenant is not charged");
+  // At B's quota the legacy row is refused like a partitioned one.
+  archive.__resetTotalCache(0, { [T49B]: archive.ARCHIVE_TENANT_MAX });
+  const have2 = cursor();
+  const more = [ent("q3", "user", "over2618")];
+  assert.equal(archive.ingestChunk(`lap@${T49B}`, "q2618", meta49("q2618"), have2,
+    have2 + Buffer.byteLength(JSON.stringify(more)), more, `acme@${T49B}`).full, true);
+  archive.__resetTotalCache();
+});
+
 test("XERK-2549: a tenant purge removes every byte and row, and nothing resurrects it", async () => {
   // A tenant transcript archived BEFORE the partition: its files sit in the
   // untenanted tree, attributed only by its sidecar's host.
