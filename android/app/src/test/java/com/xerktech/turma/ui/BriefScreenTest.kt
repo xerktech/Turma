@@ -7,6 +7,7 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import com.xerktech.turma.core.briefPage
+import com.xerktech.turma.core.usClock
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
 import com.xerktech.turma.model.DailyBrief
@@ -59,13 +60,13 @@ class BriefScreenTest {
     @Test fun `the latest brief reads aloud with the next meeting and earlier headlines`() {
         var ran = 0
         body(briefs) { ran++ }
-        compose.onNodeWithText("Next meeting Tomorrow 9:30 AM").assertExists()
-        compose.onNodeWithText("For Today 9:30 AM").assertExists()
+        compose.onNodeWithText(usClock("Next meeting Tomorrow 9:30 AM")).assertExists()
+        compose.onNodeWithText(usClock("For Today 9:30 AM")).assertExists()
         compose.onNodeWithText("Since yesterday").assertExists()
         compose.onNodeWithText("Two tickets shipped.").assertExists()
         compose.onNodeWithText("Five this week.").assertExists()
         compose.onNodeWithText("XERK-9 is next.").assertExists()
-        compose.onNodeWithText("Yesterday 2:05 PM · Run now").assertExists()
+        compose.onNodeWithText(usClock("Yesterday 2:05 PM · Run now")).assertExists()
         compose.onNodeWithText("One ticket shipped.").assertExists()
         compose.onNodeWithText("Run now").assertIsEnabled().performClick()
         assertEquals(1, ran)
@@ -80,7 +81,7 @@ class BriefScreenTest {
     @Test fun `a Run now brief is headed with when it ran`() {
         body(listOf(DailyBrief(runId = "m", status = "ok", trigger = "manual", meetingAt = at(30, 9, 30),
             startedAt = at(29, 7, 15), day = "Ran early.")))
-        compose.onNodeWithText("Run now · Today 7:15 AM").assertExists()
+        compose.onNodeWithText(usClock("Run now · Today 7:15 AM")).assertExists()
     }
 
     @Test fun `an org with no brief says so`() {
