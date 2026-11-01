@@ -45,6 +45,8 @@ Decision, upgrade + rollback notes: `docs/multi-tenant-adr.md` ("Moving the pre-
 - **Each step is flushed to disk before the marker records it** (`flushMigratedStores`): the file
   stores and state.json debounce, and a kill right after "done" booted a completed marker over
   unmoved data (QA).
+- **The moved archive rows count toward the owner's `ARCHIVE_TENANT_MAX_BYTES`** (XERK-2618
+  charges by row host): the run and the dry run warn when they would exceed it.
 - **A dry run creates no owner and closes no route**; a refused/failed run keeps the gate closed and
   logs on change or hourly, never every tick.
 - **A host's rows move only once no plain record is live** (`hostMovable`): a live host moves at its

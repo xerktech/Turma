@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turma — Admin</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<meta name="theme-color" content="#f9f9f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/app.css">
+<style>
+  /* The admin panel (XERK-2552): users, local groups and their roles, and the
+     audit log. Identities only — nothing here shows or reaches a tenant's data.
+     Web-only (android/PARITY.md). Tokens/base/nav live in app.css. */
+  .ad-section { margin-bottom: 28px; min-width: 0; }
+  .ad-section h2 { font-family: var(--font-display); font-size: 19px; font-weight: 600; margin: 0 0 10px; }
+  .ad-head { display: flex; align-items: baseline; gap: 8px 14px; flex-wrap: wrap; }
+  .ad-head h2 { flex: 1 1 auto; }
+  .ad-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    padding: 4px 16px; min-width: 0;
+  }
+  .ad-user { border-top: 1px solid var(--hairline); padding: 12px 0; min-width: 0; }
+  .ad-user:first-child { border-top: 0; }
+  .ad-user-head { display: flex; align-items: baseline; gap: 6px 10px; flex-wrap: wrap; }
+  .ad-name { font-weight: 600; font-size: 15px; min-width: 0; overflow-wrap: anywhere; }
+  .ad-pill {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase;
+    padding: 1px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-text);
+  }
+  .ad-pill.off { background: color-mix(in srgb, var(--critical) 14%, transparent); color: var(--critical-text); }
+  .ad-pill.src { background: color-mix(in srgb, var(--ink) 8%, transparent); color: var(--ink-2); }
+  .ad-meta { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+  .ad-meta .bit { white-space: nowrap; display: inline-block; }
+  .ad-meta .sep::after { content: " · "; white-space: pre; }
+  .ad-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .ad-form { display: grid; gap: 8px; margin-top: 10px; max-width: 520px; }
+  .ad-form label { font-size: 13px; color: var(--ink-2); display: grid; gap: 3px; }
+  .ad-form input, .ad-form select, .ad-groups select {
+    font: inherit; font-size: 14px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--field); color: var(--ink); padding: 6px 8px; max-width: 100%; min-width: 0;
+  }
+  .ad-form .row { display: flex; gap: 6px; flex-wrap: wrap; }
+  .ad-err { color: var(--critical-text); font-size: 13px; overflow-wrap: anywhere; }
+  .ad-ok { color: var(--good-text); font-size: 13px; overflow-wrap: anywhere; }
+  .ad-confirm {
+    margin-top: 10px; padding: 10px 12px; border: 1px solid var(--critical); border-radius: var(--radius-sm);
+    font-size: 13.5px; color: var(--ink);
+  }
+  .ad-confirm b { color: var(--critical-text); }
+  .ad-groups { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .ad-groups td { padding: 6px 4px; border-top: 1px solid var(--hairline); vertical-align: middle; }
+  .ad-groups tr:first-child td { border-top: 0; }
+  .ad-groups td.name { font-family: var(--font-mono); font-size: 13px; overflow-wrap: anywhere; }
+  .ad-note { color: var(--muted); font-size: 13px; margin: 8px 0 24px; }
+  .ad-audit { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+  .ad-audit li { border-top: 1px solid var(--hairline); padding: 8px 0; overflow-wrap: anywhere; }
+  .ad-audit li:first-child { border-top: 0; }
+  .ad-audit .when { color: var(--muted); white-space: nowrap; }
+  .ad-audit .act { font-family: var(--font-mono); font-size: 12px; }
+  .ad-audit .detail { color: var(--ink-2); }
+</style>
+</head>
+<body class="app-shell">
+<header class="site-header" id="siteHeader" data-page="admin"></header>
+<div class="page-scroll">
+<div class="wrap">
+  <section class="ad-section">
+    <div class="ad-head"><h2>Users</h2><button class="btn-sm" id="addUserBtn" type="button">Add local user</button></div>
+    <div id="addUser"></div>
+    <div class="ad-card" id="users"><div class="ad-meta">Loading…</div></div>
+  </section>
+  <section class="ad-section">
+    <h2>Local groups</h2>
+    <div class="ad-card" id="groups"><div class="ad-meta">Loading…</div></div>
+  </section>
+  <section class="ad-section">
+    <h2>Audit log</h2>
+    <div class="ad-card" id="audit"><div class="ad-meta">Loading…</div></div>
+  </section>
+  <p class="ad-note">This page manages who can sign in and what they may do. It never shows a user's hosts, sessions, transcripts, usage or tickets, and an administrator cannot act as a user or open their workspace. Each user's roles come from their local groups below; an SSO user's roles also come from their identity-provider groups, refreshed at each sign-in.</p>
+</div>
+</div>
+
+<nav class="bottom-nav" id="bottomNav"></nav>
+<script src="/board.js"></script>
+<script src="/nav.js"></script>
+<script src="/org.js"></script>
+<script>
+const esc = (s) => TurmaNav.esc(s);
+const fmtWhen = (ms) => new Date(ms).toLocaleString([], { year: "numeric", month: "short", day: "numeric",
+  hour: "numeric", minute: "2-digit" });
+const ROLES = ["user", "admin"];
+
+let users = null, you = null, breakGlass = false, groups = null, audit = null;
+let adding = false, addError = "";
+// Per-user open panel: {kind: "groups"|"password"|"delete", error, busy}
+const panels = new Map();
+let groupDraft = null, groupError = "", groupBusy = false;
+
+async function call(method, path, body) {
+  let r;
+  try {
+    r = await fetch(path, { method, credentials: "same-origin",
+      headers: body ? { "Content-Type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined });
+  } catch (e) { return { ok: false, error: "the hub could not be reached" }; }
+  let data = null;
+  try { data = await r.json(); } catch { /* no body */ }
+  if (!r.ok) return { ok: false, error: TurmaNav.refusalText("", r.status, data) };
+  return { ok: true, data };
+}
+
+async function load() {
+  const [u, g, a] = await Promise.all([call("GET", "/api/admin/users"), call("GET", "/api/admin/groups"),
+    call("GET", "/api/admin/audit")]);
+  if (u.ok) { users = u.data.users; you = u.data.you; breakGlass = !!u.data.breakGlass; }
+  if (g.ok) groups = g.data;
+  if (a.ok) audit = a.data.entries;
+  if (!u.ok) document.getElementById("users").innerHTML = `<div class="ad-err">${esc(u.error)}</div>`;
+  render();
+}
+
+function groupsKnown() { return groups ? groups.groups.map((x) => x.name) : ["turma-users", "turma-admins"]; }
+
+function userHtml(u) {
+  const panel = panels.get(u.id);
+  const meta = [
+    `${u.hosts} host${u.hosts === 1 ? "" : "s"}`,
+    `created ${u.createdAt ? fmtWhen(u.createdAt) : "—"}`,
+    `last sign-in ${u.lastLoginAt ? fmtWhen(u.lastLoginAt) : "never"}`,
+  ].map((b, i, all) => `<span class="bit${i < all.length - 1 ? " sep" : ""}">${esc(b)}</span>`).join("");
+  const roles = u.roles.length ? u.roles.map((r) => `<span class="ad-pill">${esc(r)}</span>`).join(" ")
+    : `<span class="ad-pill off">no role</span>`;
+  const grp = u.groups.length ? u.groups.map(esc).join(", ") : "none";
+  const idp = u.source === "oidc"
+    ? `<div class="ad-meta">From the identity provider: ${u.idpRoles.length ? u.idpRoles.map(esc).join(", ") : "no role"} (read-only)</div>` : "";
+  const isYou = u.id === you;
+  const disabledPill = u.disabled
+    ? `<span class="ad-pill off">${u.disabledBy === "idp" ? "disabled by SSO groups" : "disabled"}</span>` : "";
+  let body = "";
+  if (panel && panel.kind === "groups") {
+    const known = [...new Set([...groupsKnown(), ...u.groups])];
+    body = `<div class="ad-form">
+      <div class="row">${known.map((g) => `<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" data-group="${esc(g)}"${u.groups.includes(g) ? " checked" : ""}> ${esc(g)}</label>`).join("")}</div>
+      <div class="row"><button class="btn-sm primary" data-act="save-groups" data-id="${u.id}"${panel.busy ? " disabled" : ""}>Save groups</button>
+      <button class="btn-sm" data-act="close" data-id="${u.id}">Cancel</button></div>
+      ${panel.error ? `<div class="ad-err">${esc(panel.error)}</div>` : ""}</div>`;
+  } else if (panel && panel.kind === "password") {
+    body = `<div class="ad-form"><label>New password (8+ characters)
+      <input type="password" autocomplete="new-password" data-pw="${u.id}"></label>
+      <div class="row"><button class="btn-sm primary" data-act="save-password" data-id="${u.id}"${panel.busy ? " disabled" : ""}>Set password</button>
+      <button class="btn-sm" data-act="close" data-id="${u.id}">Cancel</button></div>
+      ${panel.error ? `<div class="ad-err">${esc(panel.error)}</div>` : ""}</div>`;
+  } else if (panel && panel.kind === "delete") {
+    body = `<div class="ad-confirm"><b>Delete ${esc(u.name)}? This cannot be undone.</b>
+      Their running sessions are killed, the agent tokens of their ${u.hosts} host${u.hosts === 1 ? "" : "s"} are revoked,
+      their queued tickets are cancelled, and everything in their workspace (transcripts, usage, settings) is permanently deleted.
+      <div class="row" style="margin-top:8px"><button class="btn-sm confirm" data-act="confirm-delete" data-id="${u.id}"${panel.busy ? " disabled" : ""}>${panel.busy ? "Deleting…" : "Delete permanently"}</button>
+      <button class="btn-sm" data-act="close" data-id="${u.id}"${panel.busy ? " disabled" : ""}>Cancel</button></div>
+      ${panel.error ? `<div class="ad-err">${esc(panel.error)}</div>` : ""}</div>`;
+  } else if (panel && panel.kind === "done") {
+    body = `<div class="ad-ok">${esc(panel.message)}</div>`;
+  }
+  const actions = isYou ? `<div class="ad-meta">This is you.</div>` : `<div class="ad-actions">
+      <button class="btn-sm" data-act="groups" data-id="${u.id}">Groups</button>
+      ${u.source === "local" ? `<button class="btn-sm" data-act="password" data-id="${u.id}">Reset password</button>` : ""}
+      <button class="btn-sm" data-act="toggle" data-id="${u.id}">${u.disabled ? "Enable" : "Disable"}</button>
+      <button class="btn-sm kill-btn" data-act="delete" data-id="${u.id}">Delete…</button></div>`;
+  return `<div class="ad-user">
+    <div class="ad-user-head"><span class="ad-name">${esc(u.name)}</span>
+      <span class="ad-pill src">${u.source === "oidc" ? "SSO" : "local"}</span> ${roles} ${disabledPill}</div>
+    <div class="ad-meta">${meta}</div>
+    <div class="ad-meta">Local groups: ${grp}</div>${idp}
+    ${actions}${body}</div>`;
+}
+
+function addUserHtml() {
+  if (!adding) return "";
+  return `<div class="ad-card" style="margin-bottom:10px"><div class="ad-form" style="padding:6px 0 10px">
+    <label>Username<input id="nuName" autocomplete="off" maxlength="64"></label>
+    <label>Display name (optional)<input id="nuDisplay" maxlength="100"></label>
+    <label>Initial password (8+ characters)<input id="nuPw" type="password" autocomplete="new-password"></label>
+    <div class="row">${groupsKnown().map((g) => `<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" data-newgroup="${esc(g)}"${g === "turma-users" ? " checked" : ""}> ${esc(g)}</label>`).join("")}</div>
+    <div class="row"><button class="btn-sm primary" data-act="create">Create user</button><button class="btn-sm" data-act="cancel-add">Cancel</button></div>
+    ${addError ? `<div class="ad-err">${esc(addError)}</div>` : ""}</div></div>`;
+}
+
+function groupsHtml() {
+  if (!groups) return `<div class="ad-meta">Loading…</div>`;
+  const rows = groupDraft || groups.groups.map((g) => ({ ...g }));
+  return `<table class="ad-groups">${rows.map((g, i) => `<tr><td class="name">${esc(g.name)}</td>
+      <td><select data-grole="${i}">${ROLES.map((r) => `<option value="${r}"${g.role === r ? " selected" : ""}>${r}</option>`).join("")}</select></td>
+      <td><button class="btn-sm" data-act="rm-group" data-i="${i}">Remove</button></td></tr>`).join("")}</table>
+    <div class="ad-form"><div class="row"><input id="ngName" placeholder="new-group" maxlength="64">
+      <select id="ngRole">${ROLES.map((r) => `<option value="${r}">${r}</option>`).join("")}</select>
+      <button class="btn-sm" data-act="add-group">Add group</button></div>
+      ${groupDraft ? `<div class="row"><button class="btn-sm primary" data-act="save-groupmap"${groupBusy ? " disabled" : ""}>Save groups</button><button class="btn-sm" data-act="reset-groupmap">Discard</button></div>` : ""}
+      ${groupError ? `<div class="ad-err">${esc(groupError)}</div>` : ""}
+      ${groups.isDefault && !groupDraft ? `<div class="ad-meta">These are the shipped defaults; saving makes them yours to edit.</div>` : ""}</div>`;
+}
+
+function auditHtml() {
+  if (!audit) return `<div class="ad-meta">Loading…</div>`;
+  if (!audit.length) return `<div class="ad-meta">No admin actions yet.</div>`;
+  return `<ul class="ad-audit">${audit.map((e) => `<li><span class="when">${esc(fmtWhen(e.at))}</span> ·
+    <b>${esc(e.actor)}</b> <span class="act">${esc(e.action)}</span>${e.target ? ` ${esc(e.target)}` : ""}
+    ${e.detail ? `<div class="detail">${esc(e.detail)}</div>` : ""}</li>`).join("")}</ul>`;
+}
+
+function render() {
+  document.getElementById("addUser").innerHTML = addUserHtml();
+  if (users) {
+    document.getElementById("users").innerHTML = users.length ? users.map(userHtml).join("")
+      : `<div class="ad-meta" style="padding:10px 0">No users yet.</div>`;
+  }
+  document.getElementById("groups").innerHTML = groupsHtml();
+  document.getElementById("audit").innerHTML = auditHtml();
+}
+
+document.getElementById("addUserBtn").addEventListener("click", () => { adding = true; addError = ""; render(); });
+
+document.addEventListener("change", (ev) => {
+  const sel = ev.target.closest && ev.target.closest("[data-grole]");
+  if (!sel) return;
+  groupDraft = groupDraft || groups.groups.map((g) => ({ ...g }));
+  groupDraft[Number(sel.dataset.grole)].role = sel.value;
+  render();
+});
+
+document.addEventListener("click", async (ev) => {
+  const b = ev.target.closest && ev.target.closest("[data-act]");
+  if (!b) return;
+  const id = b.dataset.id;
+  const act = b.dataset.act;
+  const u = id && users ? users.find((x) => x.id === id) : null;
+  if (act === "cancel-add") { adding = false; render(); return; }
+  if (act === "create") {
+    const body = {
+      username: document.getElementById("nuName").value.trim(),
+      displayName: document.getElementById("nuDisplay").value.trim() || undefined,
+      password: document.getElementById("nuPw").value,
+      groups: [...document.querySelectorAll("[data-newgroup]")].filter((c) => c.checked).map((c) => c.dataset.newgroup),
+    };
+    b.disabled = true;
+    const r = await call("POST", "/api/admin/users", body);
+    if (!r.ok) { addError = r.error; render(); return; }
+    adding = false; addError = "";
+    return load();
+  }
+  if (act === "groups" || act === "password" || act === "delete") { panels.set(id, { kind: act }); render(); return; }
+  if (act === "close") { panels.delete(id); render(); return; }
+  if (act === "toggle" && u) {
+    const r = await call("PATCH", `/api/admin/users/${id}`, { disabled: !u.disabled });
+    if (!r.ok) TurmaNav.toast(r.error);
+    return load();
+  }
+  if (act === "save-groups") {
+    const list = [...b.closest(".ad-user").querySelectorAll("[data-group]")].filter((c) => c.checked).map((c) => c.dataset.group);
+    panels.set(id, { kind: "groups", busy: true }); render();
+    const r = await call("PATCH", `/api/admin/users/${id}`, { groups: list });
+    if (!r.ok) { panels.set(id, { kind: "groups", error: r.error }); render(); return; }
+    panels.delete(id);
+    return load();
+  }
+  if (act === "save-password") {
+    const pw = document.querySelector(`[data-pw="${id}"]`).value;
+    panels.set(id, { kind: "password", busy: true }); render();
+    const r = await call("POST", `/api/admin/users/${id}/password`, { password: pw });
+    if (!r.ok) { panels.set(id, { kind: "password", error: r.error }); render(); return; }
+    panels.set(id, { kind: "done", message: "Password set. Tell the user their new password through a channel you trust." });
+    return load();
+  }
+  if (act === "confirm-delete") {
+    panels.set(id, { kind: "delete", busy: true }); render();
+    const r = await call("DELETE", `/api/admin/users/${id}`);
+    if (!r.ok) { panels.set(id, { kind: "delete", error: r.error }); render(); return; }
+    panels.delete(id);
+    return load();
+  }
+  if (act === "rm-group") {
+    groupDraft = groupDraft || groups.groups.map((g) => ({ ...g }));
+    groupDraft.splice(Number(b.dataset.i), 1);
+    render(); return;
+  }
+  if (act === "add-group") {
+    const name = document.getElementById("ngName").value.trim();
+    const role = document.getElementById("ngRole").value;
+    if (!name) return;
+    groupDraft = groupDraft || groups.groups.map((g) => ({ ...g }));
+    if (groupDraft.some((g) => g.name === name)) { groupError = `${name} is already listed`; render(); return; }
+    groupDraft.push({ name, role }); groupError = "";
+    render(); return;
+  }
+  if (act === "reset-groupmap") { groupDraft = null; groupError = ""; render(); return; }
+  if (act === "save-groupmap") {
+    groupBusy = true; render();
+    const r = await call("PUT", "/api/admin/groups", { groups: Object.fromEntries(groupDraft.map((g) => [g.name, g.role])) });
+    groupBusy = false;
+    if (!r.ok) { groupError = r.error; render(); return; }
+    groupDraft = null; groupError = "";
+    return load();
+  }
+});
+
+load();
+</script>
+</body>
+</html>

@@ -307,6 +307,41 @@ function updateUser(state, id, patch) {
   return { state: { ...state, users }, user: next };
 }
 
+// Admin panel (XERK-2552). Remove a user record outright; the caller has already
+// purged the tenant's data (server.js deleteUserAndTenant). The tenant id goes
+// with it and is never reused (freshTenantId draws fresh randomness).
+function deleteUser(state, id) {
+  if (!Object.hasOwn(state.users, id)) throw new Error("no such user");
+  const users = Object.assign(Object.create(null), state.users);
+  delete users[id];
+  return { ...state, users };
+}
+
+// Replace the local group -> role map whole. `groups` is `{name: role}`; every
+// entry is validated (name shape, a known role) and a malformed one refuses the
+// whole change rather than silently dropping, so the operator's 200 means what
+// they sent is what applies.
+function setGroupMap(state, groups) {
+  if (!groups || typeof groups !== "object" || Array.isArray(groups)) throw new Error("groups must be an object");
+  const entries = Object.entries(groups);
+  if (entries.length > GROUPS_MAX) throw new Error(`at most ${GROUPS_MAX} groups`);
+  const out = Object.create(null);
+  for (const [name, role] of entries) {
+    if (!GROUP_RE.test(name)) throw new Error(`invalid group name: ${JSON.stringify(name.slice(0, 64))}`);
+    if (!ROLES.includes(role)) throw new Error(`group ${name}: role must be one of ${ROLES.join(", ")}`);
+    out[name] = { role };
+  }
+  return { ...state, groups: out };
+}
+
+// The local groups a user may be put in: names shaped like a group, at most 20
+// (coerceUser's own cap). A group need not exist in the map yet — an unmapped
+// group grants nothing, the same as a removed one.
+function validGroupList(groups) {
+  return Array.isArray(groups) && groups.length <= 20 &&
+    groups.every((g) => typeof g === "string" && GROUP_RE.test(g));
+}
+
 // First run: no LOCAL account yet and the bootstrap pair set -> one local admin.
 // OIDC users do not count: a passwordless OIDC hub that an operator closes with
 // the bootstrap pair must still get its admin, or it admits nobody. Returns null
@@ -416,6 +451,10 @@ module.exports = {
   createLocalUser,
   upsertOidcUser,
   updateUser,
+  deleteUser,
+  setGroupMap,
+  validGroupList,
+  GROUP_RE,
   bootstrapAdmin,
   parseOwnerSpec,
   findOwner,

@@ -1047,6 +1047,9 @@ those are marked `[MODEL]`.
     re-authenticate. A break-glass password login keeps the 30-day session.
   - Tests: `core/OidcTest` (PKCE golden vector, deep-link parse), `net/OidcControllerTest` (probe /
     exchange / cookie auth / forbidden / 401-drop over MockWebServer).
+- **The admin panel is WEB-ONLY (XERK-2552, deliberate).** `/admin` (users, local groups and roles,
+  delete user, audit log) has no Android screen; Android's `AdminOnlyScreen` points an admin-only
+  account at the web. The web header's Admin tab (shown for the admin role) has no phone twin.
 - **Who is signed in, and admin-only accounts (XERK-2553).** Both clients read `GET /api/me`
   (`{kind, name, source, roles, tenant, adminOnly}`, built field by field by the hub's `meView`;
   Android TYPES it as `model.Me`, every field defaulted).

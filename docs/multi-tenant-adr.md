@@ -153,6 +153,12 @@ tenants, run by an admin panel.
   host the owner does not hold stays reachable by its plain name), so Tenir and CI need no change.
 - A marker for a different tenant is refused: changing the owner after a move needs the rollback.
 
+- **Size the owner's archive quota first**: the moved rows count toward the owner's
+  `ARCHIVE_TENANT_MAX_BYTES` (default an eighth of the ceiling; their files stay in the untenanted
+  tree but are charged by row, XERK-2618). A whole fleet's history can exceed it, and the owner's
+  new transcripts would then be refused. The run (and the dry run) warns when it would; raise the
+  quota or set it to `0` before migrating.
+
 #### Rollback
 
 - Take a snapshot first: stop the hub (or scale to 0 under HA) and copy `/data` (every `*.json` store,

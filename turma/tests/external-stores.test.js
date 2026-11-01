@@ -33,6 +33,7 @@ for (const v of [
   "USAGE_LEDGER_FILE", "STATE_FILE", "PERMISSION_POLICIES_FILE", "AGENT_IDENTITIES_FILE",
   "DECISIONS_FILE", "MODEL_POLICY_FILE", "DAILY_BRIEF_SCHEDULES_FILE", "DAILY_BRIEFS_FILE",
   "MEETING_PROPOSALS_FILE", "TENANCY_FILE", "MEETING_TOKENS_FILE", "ARCHIVE_PURGED_TENANTS_FILE",
+  "ADMIN_AUDIT_FILE",
 ]) {
   process.env[v] = tmp(v.toLowerCase());
 }
@@ -77,6 +78,8 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     "archivePurgedTenants",
     // XERK-2554: the pre-tenancy migration's marker (a landed step must stick).
     "tenantMigration",
+    // XERK-2552: the admin panel's audit log (a 200 means the action is recorded).
+    "adminAudit",
   ]) {
     assert.ok(names.has(n), `store ${n} is registered`);
   }
@@ -91,7 +94,7 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     // redeem twice); every other store keeps 5s.
     const immediate = d.name === "dailyBriefs" || d.name === "meetingProposals" ||
       d.name === "tenancy" || d.name === "enrollCodes" || d.name === "meetingTokens" ||
-      d.name === "archivePurgedTenants" || d.name === "tenantMigration";
+      d.name === "archivePurgedTenants" || d.name === "tenantMigration" || d.name === "adminAudit";
     assert.equal(persistent[d.key].debounceMs, immediate ? 0 : 5000,
       `${d.name} keeps its debounce`);
   }
