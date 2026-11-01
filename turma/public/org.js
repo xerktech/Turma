@@ -222,6 +222,16 @@
   let sites = [];         // the orgs the fleet currently reports
   let autoMap = {};       // the hub's per-org auto-start opt-in
   let mergeMap = {};      // the hub's per-org auto-merge opt-in (XERK-550)
+  // XERK-2600: which of the two opt-in maps the open SSE stream owns. Once the
+  // stream has delivered a map's frame (or this tab flipped it while the stream
+  // was up), every later change reaches us as a frame too, so a snapshot's copy
+  // can only be the same or OLDER: a /api/agents body that left the hub before
+  // the frame, or the page's cached poll that every render hands back to
+  // update(). Adopting either reverted the switch until the map's next frame.
+  // Cleared when the stream opens (a reconnect's re-read is current) or drops
+  // (frames may be missed, so the pages' polls are the source again).
+  const sseOwns = { auto: false, merge: false };
+  let sseOpen = false;
   let colorPins = {};     // the hub's manual org-color pins (XERK-145)
   let colorFor = null;    // the org whose swatch strip is expanded, or null
   let open = false;
@@ -349,8 +359,8 @@
   function update(data) {
     const B = board();
     sites = B.mergeSites((data && data.agents) || []);
-    if (data && data.autoStartOrgs) autoMap = data.autoStartOrgs;
-    if (data && data.autoMergeOrgs) mergeMap = data.autoMergeOrgs;
+    if (data && data.autoStartOrgs && !sseOwns.auto) autoMap = data.autoStartOrgs;
+    if (data && data.autoMergeOrgs && !sseOwns.merge) mergeMap = data.autoMergeOrgs;
     if (data && data.orgColors) colorPins = data.orgColors;
     live = true;
     writeCache();
@@ -398,6 +408,7 @@
   // instantly. Rolls back if the POST fails.
   async function setAutoStart(siteKey, enabled) {
     const had = autoOn(autoMap, siteKey);
+    if (sseOpen) sseOwns.auto = true;   // the cached snapshot predates this flip
     autoMap = orgMapCopy(autoMap);
     if (enabled) autoMap[siteKey] = true; else delete autoMap[siteKey];
     paint();
@@ -421,6 +432,7 @@
   // branch unreviewed), so it stays its own switch beside auto-start.
   async function setAutoMerge(siteKey, enabled) {
     const had = autoOn(mergeMap, siteKey);
+    if (sseOpen) sseOwns.merge = true;  // the cached snapshot predates this flip
     mergeMap = orgMapCopy(mergeMap);
     if (enabled) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
     paint();
@@ -474,16 +486,22 @@
   // page hands its EventSource over rather than opening a second one.
   function sse(es) {
     if (!es || !es.addEventListener) return;
+    // A (re)connect or a drop hands the maps back to the snapshots (XERK-2600).
+    const release = (open) => { sseOpen = open; sseOwns.auto = false; sseOwns.merge = false; };
+    es.addEventListener("open", () => release(true));
+    es.addEventListener("error", () => release(false));
     es.addEventListener("autoStartOrgs", (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       autoMap = m || {};
+      sseOwns.auto = true;
       paint();
     });
     es.addEventListener("autoMergeOrgs", (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       mergeMap = m || {};
+      sseOwns.merge = true;
       paint();
     });
     es.addEventListener("orgColors", (e) => {

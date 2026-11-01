@@ -79,6 +79,10 @@ makes an `android/` change part of the same PR) live there.
   the host returns.
 - The per-org auto-start switch (XERK-41) rides the menu's org rows — `org.js` owns the flip/POST/
   rollback.
+- **A snapshot never overrides an opt-in map the open SSE stream owns** (XERK-2600, `sseOwns`): every
+  render re-feeds `update()` the page's cached poll, and a fetch can leave before a frame and land
+  after it — adopting either reverted the auto-start/auto-merge switch until its next frame. A frame
+  (or a flip while the stream is up) takes ownership; the stream's `open`/`error` hands it back.
 - Repaints skip when markup is unchanged (beat can't churn the DOM under an open menu). A handled
   click is flagged on the EVENT, not looked up after — the repaint detaches the clicked node, so a
   `contains()` click-away test would close the menu on the click that opened it.

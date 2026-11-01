@@ -633,6 +633,64 @@ test("org: the hub's autoStartOrgs broadcast repaints the switches", () => {
   assert.match(slot.innerHTML, /org-chip-auto on/);
 });
 
+// XERK-2600: a snapshot that left the hub before an opt-in frame (or the page's
+// cached poll, which every render hands back to update()) must not revert it.
+function orgStream() {
+  const handlers = {};
+  Org.sse({ addEventListener: (t, fn) => { handlers[t] = fn; } });
+  handlers.open();
+  return handlers;
+}
+
+test("XERK-2600: a stale snapshot never reverts an auto-start/auto-merge frame", () => {
+  const { slot, click } = mountOrg();
+  const stale = { agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {}, autoMergeOrgs: {} };
+  Org.update(stale);
+  click("data-org-toggle", "");
+  const h = orgStream();
+  h.autoStartOrgs({ data: JSON.stringify({ "acme.atlassian.net": true }) });
+  h.autoMergeOrgs({ data: JSON.stringify({ "acme.atlassian.net": true }) });
+  // The held /api/agents reply lands, then a later render re-feeds the cache.
+  Org.update({ ...stale });
+  Org.update(stale);
+  assert.match(slot.innerHTML, /org-chip-auto on/);
+  assert.match(slot.innerHTML, /org-chip-merge on/);
+  h.error();
+});
+
+test("XERK-2600: a reconnect or a drop hands the maps back to the snapshot", () => {
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {} });
+  click("data-org-toggle", "");
+  const h = orgStream();
+  h.autoStartOrgs({ data: JSON.stringify({ "acme.atlassian.net": true }) });
+  // Reconnected: the re-read is current again, and the hub has it OFF by now.
+  h.open();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {} });
+  assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/);
+  // Stream down: polls are the only source, so they are adopted.
+  h.autoStartOrgs({ data: JSON.stringify({ "acme.atlassian.net": true }) });
+  h.error();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {} });
+  assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/);
+});
+
+test("XERK-2600: a flip made while the stream is up survives renders of the old cache", async () => {
+  const { slot, click } = mountOrg();
+  const cache = { agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {} };
+  Org.update(cache);
+  click("data-org-toggle", "");
+  const h = orgStream();
+  global.fetch = () => Promise.resolve({ ok: true, status: 200 });
+  const p = Org.setAutoStart("acme.atlassian.net", true);
+  Org.update(cache);                                     // a beat renders before the POST settles
+  assert.match(slot.innerHTML, /org-chip-auto on/);
+  await p;
+  Org.update(cache);
+  assert.match(slot.innerHTML, /org-chip-auto on/);
+  h.error();
+});
+
 // ---- wiring: every page must actually obey it -------------------------------
 
 test("org: every page loads board.js, nav.js and org.js, in that order", () => {
