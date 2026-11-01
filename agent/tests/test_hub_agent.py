@@ -51061,6 +51061,23 @@ class TestKillpgNeverHitsPidOne(unittest.TestCase):
                     ha.SessionManager._kill_attention_hint(proc)
                 killpg.assert_not_called()
 
+    def test_a_mocked_oneshot_proc_is_never_killpg_d(self):
+        # The exact call that took TrueNAS down: a mutant let a mocked Popen
+        # reach _kill_oneshot_proc, whose killpg(1) killed every user process.
+        for bad in (mock.MagicMock().pid, 1, 0, -1, True):
+            with self.subTest(pid=bad):
+                proc = mock.MagicMock()
+                proc.pid = bad
+                with mock.patch.object(ha.os, "killpg", create=True) as killpg:
+                    ha.SessionManager._kill_oneshot_proc(proc)
+                killpg.assert_not_called()
+                proc.kill.assert_called_once()
+        proc = mock.MagicMock()
+        proc.pid = 4242
+        with mock.patch.object(ha.os, "killpg", create=True) as killpg:
+            ha.SessionManager._kill_oneshot_proc(proc)
+        killpg.assert_called_once_with(4242, ha.signal.SIGKILL)
+
     def test_signalable_pid(self):
         for good, want in ((2, 2), (4242, 4242), ("4242", 4242), (" 77 ", 77)):
             self.assertEqual(ha._signalable_pid(good), want)
