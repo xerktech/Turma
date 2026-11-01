@@ -5,7 +5,7 @@ paths:
   - turma/tenant-scope.js
   - turma/public/admin.html
   - turma/public/nav.js
-  - turma/tests/admin.test.js
+  - turma/tests/admin*.test.js
 description: The admin panel (XERK-2552) — users, local groups/roles, deleting a user and its tenant, the audit log.
 ---
 
