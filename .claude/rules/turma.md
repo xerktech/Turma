@@ -84,6 +84,9 @@ makes an `android/` change part of the same PR) live there.
   re-adopting the same stale object reverted every SSE-moved or optimistic switch on the next beat.
 - **A POST that fails at the NETWORK level re-reads `/api/agents`** and takes ONLY that org's entry: the hub
   may have applied it, and the per-stream SSE dedupe no longer resends an unchanged map.
+- **A switch POST's outcome (re-read or rollback) applies only while it is the newest word** on that
+  org's switch (`claimClick`): no newer click on it AND no SSE frame of that map since. A frame is
+  the whole map, so it already answers this org; else a stale body overrode a later click.
 - Repaints skip when markup is unchanged (beat can't churn the DOM under an open menu). A handled
   click is flagged on the EVENT, not looked up after — the repaint detaches the clicked node, so a
   `contains()` click-away test would close the menu on the click that opened it.

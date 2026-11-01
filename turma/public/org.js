@@ -406,6 +406,21 @@
   // The caller adopts ONLY its own org's entry from it: the body may predate a
   // later SSE change to another org (or this tab's own optimistic flip there),
   // and installing it whole regressed those (QA, XERK-2598).
+  // A POST's outcome (re-read or rollback) applies only while it is still the
+  // newest word on that org's switch: no newer click on it, and no SSE frame of
+  // that map since the click — a frame carries the WHOLE map, so it is already
+  // the hub's newer answer for this org too. Else a stale re-read body (or a
+  // rollback) overrode a later click or the hub's own broadcast (QA, XERK-2598).
+  const clicks = new Map();
+  const sseGen = { auto: 0, merge: 0, color: 0 };
+  function claimClick(kind, siteKey) {
+    const k = kind + "\0" + siteKey;
+    const n = (clicks.get(k) || 0) + 1;
+    clicks.set(k, n);
+    const gen = sseGen[kind];
+    return () => clicks.get(k) === n && sseGen[kind] === gen;
+  }
+
   async function hubOrgMap(field) {
     try {
       const r = await fetch("/api/agents");
@@ -422,6 +437,7 @@
   // instantly. Rolls back if the POST fails.
   async function setAutoStart(siteKey, enabled) {
     const had = autoOn(autoMap, siteKey);
+    const newest = claimClick("auto", siteKey);
     autoMap = orgMapCopy(autoMap);
     if (enabled) autoMap[siteKey] = true; else delete autoMap[siteKey];
     paint();
@@ -434,7 +450,7 @@
       ok = r.ok;
     } catch { netErr = true; /* outcome unknown — re-read below */ }
     const hub = !ok && netErr ? await hubOrgMap("autoStartOrgs") : null;
-    if (!ok) {
+    if (!ok && newest()) {
       const on = hub ? autoOn(hub, siteKey) : had;
       autoMap = orgMapCopy(autoMap);
       if (on) autoMap[siteKey] = true; else delete autoMap[siteKey];
@@ -447,6 +463,7 @@
   // branch unreviewed), so it stays its own switch beside auto-start.
   async function setAutoMerge(siteKey, enabled) {
     const had = autoOn(mergeMap, siteKey);
+    const newest = claimClick("merge", siteKey);
     mergeMap = orgMapCopy(mergeMap);
     if (enabled) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
     paint();
@@ -459,7 +476,7 @@
       ok = r.ok;
     } catch { netErr = true; /* outcome unknown — re-read below */ }
     const hub = !ok && netErr ? await hubOrgMap("autoMergeOrgs") : null;
-    if (!ok) {
+    if (!ok && newest()) {
       const on = hub ? autoOn(hub, siteKey) : had;
       mergeMap = orgMapCopy(mergeMap);
       if (on) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
@@ -476,6 +493,7 @@
     const pinOf = (m) => (Object.prototype.hasOwnProperty.call(m, siteKey) &&
       Number.isInteger(m[siteKey]) ? m[siteKey] : null);
     const had = pinOf(colorPins);
+    const newest = claimClick("color", siteKey);
     colorPins = orgMapCopy(colorPins);
     if (slotN) colorPins[siteKey] = slotN; else delete colorPins[siteKey];
     colorFor = null;
@@ -490,7 +508,7 @@
       ok = r.ok;
     } catch { netErr = true; /* outcome unknown — re-read below */ }
     const hub = !ok && netErr ? await hubOrgMap("orgColors") : null;
-    if (!ok) {
+    if (!ok && newest()) {
       // Only this org's pin: another org's may have moved meanwhile (SSE).
       const pin = hub ? pinOf(hub) : had;
       colorPins = orgMapCopy(colorPins);
@@ -512,18 +530,21 @@
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       autoMap = m || {};
+      sseGen.auto++;
       paint();
     });
     es.addEventListener("autoMergeOrgs", (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       mergeMap = m || {};
+      sseGen.merge++;
       paint();
     });
     es.addEventListener("orgColors", (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       colorPins = m || {};
+      sseGen.color++;
       paint();
       // The pins tint cards on every page, so a change (this tab's or another's)
       // repaints more than this control.
