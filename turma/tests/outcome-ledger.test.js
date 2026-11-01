@@ -1245,3 +1245,67 @@ test("XERK-2109: a shadow host's cap does not count the shadows a live eviction 
   assert.equal(shadows.filter((k) => rows.has(k)).length, per, "no other shadow is dropped");
   L._internals.reset();
 });
+
+// ---- XERK-2554: re-keying rows into a tenant -------------------------------------
+
+const T2554 = "a".repeat(32);
+const toTenant = (k) => (k.includes("@") ? null : `${k}@${T2554}`);
+test("XERK-2554: rekey moves live + shadow rows, re-pointing pairOf and the shadow host", () => {
+  L._internals.reset();
+  L.observe([obs()], T0);
+  const live = only();
+  const liveRow = L.sanitizeRow({ ...live, shadow: { sampled: true, id: "sh-0a1b2c3d", model: "sonnet", host: "h2", at: T0 } });
+  const shadow = L.sanitizeRow({ site: live.site, issue: live.issue, host: "h2", sid: "sh-0a1b2c3d", kind: "shadow",
+    pairOf: live.key, cls: "bug", model: "sonnet", firstSeen: T0, updatedAt: T0 });
+  assert.ok(liveRow && shadow);
+  L._internals.rows().set(liveRow.key, liveRow);
+  L._internals.rows().set(shadow.key, shadow);
+  assert.deepEqual(L.hostKeys().sort(), ["h1", "h2"]);
+  assert.deepEqual(L.siteKeys(), ["acme.atlassian.net"]);
+  assert.equal(L.rekey(toTenant, toTenant), 2);
+  const rows = [...L._internals.rows().values()];
+  const nl = rows.find((r) => r.kind !== "shadow");
+  const ns = rows.find((r) => r.kind === "shadow");
+  assert.equal(nl.key, JSON.stringify([`acme.atlassian.net@${T2554}`, "ACME-1", `h1@${T2554}`, "s1"]));
+  assert.equal(nl.shadow.host, `h2@${T2554}`);
+  assert.equal(ns.pairOf, nl.key);
+  assert.equal(ns.host, `h2@${T2554}`);
+  assert.equal(L.rekey(toTenant, toTenant), 0, "a rerun moves nothing");
+});
+
+test("XERK-2554: a key clash keeps the newer row", () => {
+  L._internals.reset();
+  L.observe([obs()], T0);
+  const old = only();
+  const newer = L.sanitizeRow({ ...old, host: `h1@${T2554}`, model: "haiku", updatedAt: old.updatedAt + 5 });
+  L._internals.rows().set(newer.key, newer);
+  assert.equal(L.rekey(toTenant, null), 1);
+  assert.equal(only().model, "haiku");
+});
+
+test("XERK-2554: the Postgres backend upserts the new key and deletes the old", async () => {
+  const table = new Map();
+  const pool = {
+    health: "ready",
+    async query(sql, params = []) {
+      if (/^CREATE TABLE/.test(sql)) return [];
+      if (/^INSERT/.test(sql)) {
+        for (let i = 0; i < params.length; i += 3) table.set(params[i], { updated_at: params[i + 1], doc: params[i + 2] });
+        return [];
+      }
+      if (/^SELECT doc/.test(sql)) return [...table.values()];
+      if (/^DELETE/.test(sql)) { for (const k of params) table.delete(k); return []; }
+      throw new Error(`unexpected SQL ${sql}`);
+    },
+  };
+  L._internals.reset();
+  const store = new L.OutcomeLedgerPgStore(pool);
+  L._internals.setBackend(store);
+  await store.rescan(T0);
+  L.observe([obs()], T0);
+  await store._drain();
+  assert.equal(L.rekey(toTenant, null), 1);
+  await store._drain();
+  assert.deepEqual([...table.keys()], [JSON.stringify(["acme.atlassian.net", "ACME-1", `h1@${T2554}`, "s1"])]);
+  L._internals.reset();
+});

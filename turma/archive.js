@@ -1734,6 +1734,52 @@ function restampOrg(transcriptId, siteKey, host) {
   return true;
 }
 
+// Every row's owner, `{transcriptId, host, siteKey}` (`siteKey` null on a legacy
+// row) — what the pre-tenancy migration (XERK-2554) walks to find the
+// untenanted rows. Synchronous; one pass over the index.
+function listRowOwners() {
+  openDb();
+  if (isPgMode()) {
+    return [...sessionsMap.values()].map((r) => ({
+      transcriptId: r.transcriptId, host: r.host, siteKey: r.siteKey == null ? null : r.siteKey,
+    }));
+  }
+  return db.prepare("SELECT transcriptId, host, siteKey FROM sessions").all()
+    .map((r) => ({ transcriptId: r.transcriptId, host: r.host, siteKey: r.siteKey == null ? null : r.siteKey }));
+}
+
+// Move a row to a new owner (XERK-2554: an untenanted host's rows into its tenant
+// key, `<host>@<tenantId>`, with its decided org scoped the same way). Unlike
+// restampOrg it keeps a legacy NULL org NULL (trust-on-first-sight stays as it
+// was). The file is NOT moved (files are never renamed, XERK-2549); the row, its
+// sidecar and the Postgres of-record follow. Returns whether the row exists.
+function rekeyOwner(transcriptId, host, siteKey) {
+  openDb();
+  const row = idxGetSession(transcriptId);
+  if (!row) return false;
+  const newHost = String(host).slice(0, META_TEXT_MAX);
+  const org = siteKey == null ? null : String(siteKey).slice(0, META_TEXT_MAX);
+  if (row.host === newHost && (row.siteKey == null ? null : row.siteKey) === org) return true;
+  const nowIso = new Date().toISOString();
+  if (isPgMode()) {
+    mapPutSession({ ...row, siteKey: org, host: newHost, updatedAt: nowIso });
+  } else {
+    db.prepare("UPDATE sessions SET siteKey=?, host=?, updatedAt=? WHERE transcriptId=?")
+      .run(org, newHost, nowIso, transcriptId);
+  }
+  if (row.filePath) {
+    const metaPath = filePaths(row.filePath).meta;
+    const sc = readSidecar(metaPath);
+    if (sc) {
+      if (org == null) delete sc.siteKey; else sc.siteKey = org;
+      sc.host = newHost;
+      try { writeSidecar(metaPath, sc); } catch { /* best-effort, like restampOrg */ }
+    }
+  }
+  mirrorSession(transcriptId);
+  return true;
+}
+
 // ---- the raw layer ----------------------------------------------------------
 
 /**
@@ -4143,7 +4189,7 @@ module.exports = {
   ingestRaw, rawCursors, rawLimits, listRawFiles, rawFileFor, rawDirOf,
   safeRawRel, rawDirFor, rawFilePath,
   totalArchiveBytes, totalForCeiling, __resetTotalCache,
-  searchArchive, listArchive, getTranscript, sessionRow, restampOrg,
+  searchArchive, listArchive, getTranscript, sessionRow, restampOrg, listRowOwners, rekeyOwner,
   // Test seam. The raw layer's own `.jsonl` files carry no `.meta`, so the
   // rebuild would skip them anyway — this is exported so the SKIP itself can be
   // pinned rather than that backstop, because the skip is what stops a rebuild

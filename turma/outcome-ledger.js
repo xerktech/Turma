@@ -1129,6 +1129,62 @@ function purgeTenant(tenantId) {
   return gone;
 }
 
+/** Every host key with a row here (XERK-2554: the tenant migration's inventory). */
+function hostKeys() {
+  return [...new Set([...rows.values()].map((r) => r.host))];
+}
+/** Every org (site key) with a row here. */
+function siteKeys() {
+  return [...new Set([...rows.values()].map((r) => r.site))];
+}
+
+/**
+ * Re-key rows whose host or org moves (XERK-2554, migrating a pre-tenancy hub into a
+ * tenant): `mapHost(hostKey)` / `mapSite(siteKey)` answer the new key, or null to
+ * leave it. A row's key is its `[site, issue, host, sid]` tuple, so a moved row gets
+ * a new key; a shadow's `pairOf` follows its live row, and a live row's
+ * sampled-shadow `host` follows the host map. On a key clash the newer `updatedAt`
+ * wins. Postgres upserts the new keys and deletes the old. Returns how many rows
+ * moved key; a rerun maps nothing and moves nothing.
+ */
+function rekey(mapHost, mapSite) {
+  const pick = (fn, v, r) => {
+    let n = null;
+    try { n = typeof fn === "function" ? fn(v, r) : null; } catch { n = null; }
+    return typeof n === "string" && n && n !== v && KEY_PART_RE.test(n) && n.length <= 200 ? n : v;
+  };
+  const renamed = new Map();
+  for (const r of rows.values()) {
+    const host = pick(mapHost, r.host, r), site = pick(mapSite, r.site, r);
+    if (host !== r.host || site !== r.site) renamed.set(r.key, { key: rowKey(site, r.issue, host, r.sid), host, site });
+  }
+  const next = new Map();
+  for (const r of rows.values()) {
+    let nr = r;
+    const to = renamed.get(r.key);
+    if (to) nr = { ...r, key: to.key, host: to.host, site: to.site };
+    if (nr.pairOf && renamed.has(nr.pairOf)) nr = { ...nr, pairOf: renamed.get(nr.pairOf).key };
+    if (nr.shadow && typeof nr.shadow.host === "string") {
+      const sh = pick(mapHost, nr.shadow.host);
+      if (sh !== nr.shadow.host) nr = { ...nr, shadow: { ...nr.shadow, host: sh } };
+    }
+    const cur = next.get(nr.key);
+    if (cur && (cur.updatedAt || 0) > (nr.updatedAt || 0)) continue;
+    next.set(nr.key, nr);
+  }
+  const changed = [...next.values()].filter((r) => rows.get(r.key) !== r);
+  const gone = [...rows.keys()].filter((k) => !next.has(k));
+  if (!changed.length && !gone.length) return 0;
+  rows.clear();
+  for (const [k, r] of next) rows.set(k, r);
+  if (changed.length) backend.onChange(changed);
+  if (gone.length) {
+    if (backend.onDelete) backend.onDelete(gone);
+    else backend.onChange([]);
+  }
+  return renamed.size;
+}
+
 // ---- the file backend (non-HA) ---------------------------------------------------
 
 function load() {
@@ -1407,7 +1463,7 @@ function flush(done) { backend.flush(done); }
 load();
 
 module.exports = {
-  observe, attributeDefects, sanitizeDefectReports, aggregate, tenants, purgeTenant, rowTenant, outcomeOf, metricsText, workClass, modelFamily, sanitizeRow,
+  observe, attributeDefects, sanitizeDefectReports, aggregate, tenants, purgeTenant, hostKeys, siteKeys, rekey, rowTenant, outcomeOf, metricsText, workClass, modelFamily, sanitizeRow,
   shadowCandidates, decideShadow, shadowsDispatchedSince, observeShadows, SHADOW_ID_RE,
   wilson, promotionPasses, liveRate, pairEvidence,
   configure, rehydrate, flush,

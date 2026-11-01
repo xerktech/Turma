@@ -1127,3 +1127,33 @@ test("HA off: configure is a no-op, the file backend stays", async () => {
   await ledger.configure(null, null);
   assert.equal(ledger._internals.getBackend().constructor.name, "Object");
 });
+
+// ---- XERK-2554: re-keying a host into its tenant -------------------------------
+
+const T2554 = "a".repeat(32);
+test("XERK-2554: rekeyHost moves rows to the tenant key, merging by progress", () => {
+  ledger.ingest("h1", [row("a"), row("b", { closedAt: undefined, answer: undefined, waitedMs: undefined, via: undefined })], NOW);
+  // The tenant key already holds `b` CLOSED and its own `c`.
+  ledger.ingest(`h1@${T2554}`, [row("b"), row("c")], NOW);
+  assert.deepEqual(ledger.hostKeys().sort(), ["h1", `h1@${T2554}`]);
+  assert.equal(ledger.rekeyHost("h1", `h1@${T2554}`), 2);
+  assert.deepEqual(ledger.hostKeys(), [`h1@${T2554}`]);
+  const m = ledger._internals.hosts().get(`h1@${T2554}`);
+  assert.deepEqual([...m.keys()].sort(), ["a", "b", "c"]);
+  assert.equal(m.get("b").answer, "allow", "the open copy never reverts the closed row");
+  assert.equal(ledger.rekeyHost("h1", `h1@${T2554}`), 0, "a rerun moves nothing");
+  assert.equal(ledger.rekeyHost(`h1@${T2554}`, `h1@${T2554}@${T2554}`), 0);
+  assert.equal(ledger.rekeyHost("h1", `h2@${T2554}`), 0);
+});
+
+test("XERK-2554: HA rekeyHost upserts under the tenant key and deletes the old rows", async () => {
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool);
+  const now = Date.now();
+  ledger.ingest("h1", [row("a", { openedAt: now - MIN, closedAt: now })], now);
+  await new Promise((r) => ledger.flush(r));
+  assert.deepEqual([...pool.rows.keys()], ["h1\u0000a"]);
+  assert.equal(ledger.rekeyHost("h1", `h1@${T2554}`), 1);
+  await new Promise((r) => ledger.flush(r));
+  assert.deepEqual([...pool.rows.keys()], [`h1@${T2554}\u0000a`]);
+});

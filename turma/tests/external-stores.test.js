@@ -75,6 +75,8 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     "meetingTokens",
     // XERK-2549: tenants whose archive was purged (a tombstone must stick).
     "archivePurgedTenants",
+    // XERK-2554: the pre-tenancy migration's marker (a landed step must stick).
+    "tenantMigration",
   ]) {
     assert.ok(names.has(n), `store ${n} is registered`);
   }
@@ -89,7 +91,7 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     // redeem twice); every other store keeps 5s.
     const immediate = d.name === "dailyBriefs" || d.name === "meetingProposals" ||
       d.name === "tenancy" || d.name === "enrollCodes" || d.name === "meetingTokens" ||
-      d.name === "archivePurgedTenants";
+      d.name === "archivePurgedTenants" || d.name === "tenantMigration";
     assert.equal(persistent[d.key].debounceMs, immediate ? 0 : 5000,
       `${d.name} keeps its debounce`);
   }

@@ -114,6 +114,58 @@ tenants, run by an admin panel.
   Every hydrate re-issues any delete that did not land (Postgres rows, bucket objects), so a purge
   converges even when its own best-effort deletes were lost.
 
+### Moving the pre-tenancy deployment into a tenant (XERK-2554)
+
+- **One owner takes everything untenanted**, named by `TURMA_MIGRATE_OWNER`: `local:<username>`,
+  `oidc:<sub>`, or a bare value matched as a local username, then as one OIDC subject. A bare value
+  that names nobody is refused (a typo must not mint an account); a prefixed one is created — a
+  local owner with an unusable random password (set it in the admin panel), an OIDC owner keyed on
+  the IdP's discovery issuer.
+- **A one-shot, resumable boot step on the leader** (`masterOrchestrationTick`): each store moves in
+  its own idempotent step, and the marker (`/data/tenant-migration.json`, HA-shared) records each
+  step as it lands (after flushing what the step wrote), so a killed hub resumes at the step it was
+  in. `TURMA_MIGRATE_DRY_RUN=1` logs the count per store and changes nothing: no owner is created and
+  the tenant routes stay open.
+- **Until it completes, no tenant user is served tenant data** (503 + `Retry-After`; `/api/me` and
+  sign-in still answer); operators keep the still-untenanted fleet. A failed step, or an owner that
+  cannot be resolved (a typo), keeps it closed until fixed — the safe default for a misconfigured
+  upgrade; it is logged on change and hourly.
+- Completion opens the gate before every host has re-beaten: each host appears in the owner's view
+  on its bind beat (seconds for an online host; an offline one when it returns).
+- **Hosts keep their tokens.** Each untenanted identity is bound to the owner's tenant exactly as a
+  `roll-token?bind=1` binds one; a host still on a name or master token is handed its identity token
+  (`setToken` + `bindTenant`). Its record moves on its next beat (the XERK-2533 bind beat). A released
+  or revoked identity is left alone.
+- **Rows are re-keyed, never copied**: org-keyed stores to `<site>@<t>`, the ledgers, the archive's
+  rows (host + decided org; files stay in the untenanted tree, as XERK-2549 accepts) and the routing
+  policy to the tenant's keys, untenanted push devices to the tenant. A LIVE host's ledger and
+  archive rows move at its bind beat, so its rows never split across two keys.
+- **Later leftovers follow**: the marker keeps the untenanted host and org keys found at the start;
+  for `TURMA_MIGRATE_SETTLE_MS` (14 days) the leader re-keys those keys' late rows (a record pruned
+  after a week offline, a Postgres rescan). A host enrolled untenanted after the move stays the
+  operators', and so does an org it works in (its settings and queue are no longer moved), even
+  when it re-uses a migrated host's name.
+- Residual: a host whose record was already pruned when the run started (offline over a week) has
+  its rows moved but is bound only if it held an identity; one on a name token comes back
+  untenanted, and an operator binds it with `roll-token?bind=1`.
+- **The fleet-wide shared tokens follow the owner**: after the move `TURMA_MEETINGS_TOKEN` posts for
+  the owner's orgs and `TURMA_TRIGGER_TOKEN` names the owner's hosts by device name (an operator
+  host the owner does not hold stays reachable by its plain name), so Tenir and CI need no change.
+- A marker for a different tenant is refused: changing the owner after a move needs the rollback.
+
+#### Rollback
+
+- Take a snapshot first: stop the hub (or scale to 0 under HA) and copy `/data` (every `*.json` store,
+  `users.json`, the archive). Under HA also dump the Postgres ledger + archive-index tables
+  (`usage_*`, `permission_event`, `outcome_session`, the archive index) and the shared store's keys.
+- To roll back: stop the hub, restore that snapshot (and the Postgres dump under HA), and unset
+  `TURMA_MIGRATE_OWNER`. Agent env files need no change: a host's identity token stays valid; its
+  identity is untenanted again in the restored `agent-identities.json`.
+- A host the migration moved off a NAME or master token onto a freshly minted identity token has
+  that identity only in the post-migration store: after a rollback its token names nobody, so give
+  it a fresh enrollment code (or `--agent-token`) once. A host already on its identity token before
+  the snapshot needs nothing.
+
 ### Admin without a tenant: break-glass
 
 - The `TURMA_USER`/`TURMA_PASSWORD` break-glass login (XERK-595) stays, IdP-independent, and maps to

@@ -422,3 +422,29 @@ test("XERK-779: configure + ingest + rehydrate end-to-end through the real ledge
   assert.equal(bTok(sTot(ledger._internals.hosts()["box-1"].repos["git@x/turma"].series)), 150);
   ledger._internals.reset();
 });
+
+test("XERK-2554: rekeyHost writes the tenant key to Postgres and deletes the old host's rows", async () => {
+  ledger._internals.reset();
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool, () => {});
+  const T = "a".repeat(32);
+  ledger.ingest("box-1", {
+    device: "box-1", jira: { siteKey: "acme.atlassian.net" },
+    usage: { totals: bucket(200, 20, 0, 0), days: { "2026-09-11": bucket(200, 20) } },
+    repoUsage: [],
+  });
+  await new Promise((r) => ledger.flush(r));
+  const hostsIn = () => new Set([...pool.tables.values()].flatMap((t) => [...t.values()].map((row) => row.host)));
+  assert.deepEqual([...hostsIn()], ["box-1"]);
+  assert.equal(ledger.rekeyHost("box-1", `box-1@${T}`), true);
+  await new Promise((r) => ledger.flush(r));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual([...hostsIn()], [`box-1@${T}`]);
+  // A promoted replica rescanning finds only the tenant key.
+  const H = ledger._internals.hosts();
+  for (const k of Object.keys(H)) delete H[k];
+  await ledger.rehydrate();
+  assert.deepEqual(ledger.keys(), [`box-1@${T}`]);
+  assert.equal(bTok(sTot(ledger._internals.hosts()[`box-1@${T}`].host)), 220);
+  ledger._internals.reset();
+});

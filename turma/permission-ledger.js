@@ -649,6 +649,42 @@ function purgeTenant(tenantId) {
   return gone;
 }
 
+/** Every host key with a row here (XERK-2554: the tenant migration's inventory). */
+function hostKeys() {
+  return [...hosts.keys()];
+}
+
+// Whether `to` is `from`'s own tenant key: `<from>@<32 hex>`, `from` untenanted.
+const TENANT_SUFFIX_RE = /^@[0-9a-f]{32}$/;
+function isTenantKeyOf(from, to) {
+  return typeof from === "string" && !!from && from !== "__proto__" && typeof to === "string" &&
+    !tenantOfHostKey(from) && to.startsWith(from) && TENANT_SUFFIX_RE.test(to.slice(from.length));
+}
+
+/**
+ * Move every row of host `from` to its tenant key `to` (XERK-2554, migrating a
+ * pre-tenancy hub into a tenant). Rows merge by id; on a clash the row further along
+ * (`rowProgress`) wins, so a re-key never reverts a closed row. Postgres gets the
+ * upserts under `to` and DELETEs of the `(from, id)` pairs (upserts drain first).
+ * Returns how many rows left `from`; a rerun finds it gone and moves nothing.
+ */
+function rekeyHost(from, to) {
+  if (!isTenantKeyOf(from, to)) return 0;
+  const src = hosts.get(from);
+  if (!src) return 0;
+  let dst = hosts.get(to);
+  if (!dst) hosts.set(to, (dst = new Map()));
+  const moved = [];
+  for (const [id, row] of src) {
+    const cur = dst.get(id);
+    if (!cur || rowProgress(row) > rowProgress(cur)) { dst.set(id, row); moved.push(row); }
+  }
+  hosts.delete(from);
+  backend.onChange(to, moved);
+  if (backend.onDelete) backend.onDelete([...src.keys()].map((id) => [from, id]));
+  return src.size;
+}
+
 // ---- the file backend (non-HA) ---------------------------------------------------
 
 function load() {
@@ -1109,7 +1145,7 @@ function flush(done) { backend.flush(done); }
 load();
 
 module.exports = {
-  ingest, aggregate, kindTotals, purgeTenant, sanitizePermissionEvent, suggestedRule, ruleVerdict, configure,
+  ingest, aggregate, kindTotals, purgeTenant, hostKeys, rekeyHost, sanitizePermissionEvent, suggestedRule, ruleVerdict, configure,
   rehydrate, flush, setMemoryLimit,
   LEDGER_FILE, MAX_ROWS, HOST_MAX_ROWS, DAYS, EVENTS_PER_BEAT, T_EVENT, OPEN_MAX_MS,
   SUBCOMMAND_CLIS, BASH_SAFE_HEADS, BASH_SAFE_SUBCOMMANDS, PermissionLedgerPgStore,
