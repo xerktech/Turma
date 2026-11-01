@@ -375,7 +375,14 @@ class HubClient(private val config: Config) {
          * pending. On the companion so it can be unit-tested without a Config.
          */
         fun mapHistory(resp: retrofit2.Response<com.xerktech.turma.model.HistoryResponse>): HistoryResult {
-            if (!resp.isSuccessful) return HistoryResult.Failed(hubErrorMessage(resp))
+            if (!resp.isSuccessful) {
+                // A 404 is an unknown session OR another account's (XERK-2534 answers
+                // both alike): say so, keeping the hub's words.
+                val why = hubErrorMessage(resp)
+                return HistoryResult.Failed(
+                    if (resp.code() == 404) com.xerktech.turma.core.sessionUnavailableMessage(why) else why,
+                )
+            }
             val body = resp.body()
             return if (resp.code() == 202 || body == null || body.pending) {
                 HistoryResult.Pending(body?.cmdId ?: "")

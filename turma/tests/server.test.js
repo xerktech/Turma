@@ -30121,3 +30121,25 @@ test("XERK-2596: the operators' background work never dispatches to a host claim
     T.restore();
   }
 });
+
+test("XERK-2553: /api/me names the caller and never an id", async () => {
+  assert.equal((await request("GET", "/api/me")).status, 401);
+  const bg = await request("GET", "/api/me", { headers: userHeaders });
+  assert.equal(bg.status, 200);
+  const { adminOnly, ...rest } = bg.body;
+  assert.deepEqual(rest, { kind: "breakglass", name: "break-glass", source: "", roles: ["admin"], tenant: false });
+  assert.equal(typeof adminOnly, "boolean");
+  const T = tenants2533();
+  try {
+    const a = (await request("GET", "/api/me", { headers: T.A.h })).body;
+    assert.deepEqual(a, { kind: "user", name: "t2533a", source: "local", roles: ["user"],
+      tenant: true, adminOnly: false });
+    assert.ok(!JSON.stringify(a).includes(T.A.t), "never the tenant id");
+    assert.ok(!JSON.stringify(a).includes(T.A.user.id), "never the user id");
+    // Admin-only is decided by the hosts the principal may drive (tenancy.test.js
+    // pins the empty-fleet side): with an untenanted host in the fleet, break-glass
+    // is that fleet's operator, never admin-only.
+    assert.equal((await request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: "me2553-host" } })).status, 200);
+    assert.equal((await request("GET", "/api/me", { headers: userHeaders })).body.adminOnly, false);
+  } finally { T.restore(); }
+});

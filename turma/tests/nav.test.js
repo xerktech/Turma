@@ -429,3 +429,69 @@ test("XERK-2599: every page opens its stream after its first snapshot, through e
       `${f} replaces a lost stream with one naming a fresh snapshot, never the browser's retry`);
   }
 });
+
+test("XERK-2553: the signed-in label and the admin-only note come from /api/me", () => {
+  const nav = require("../public/nav.js");
+  assert.equal(nav.meLabel({ name: "alice" }), "Signed in as alice");
+  assert.equal(nav.meLabel({ name: "" }), "");
+  assert.equal(nav.meLabel(null), "");
+  assert.equal(nav.adminOnlyNoteHtml({ adminOnly: false }), "");
+  assert.equal(nav.adminOnlyNoteHtml({ adminOnly: "yes" }), "", "strict boolean");
+  assert.match(nav.adminOnlyNoteHtml({ adminOnly: true }), /class="admin-only-note"/);
+  // applyMe: the label rides Sign out's tooltip; the note mounts once after the header.
+  const so = { title: "" }, inserted = [];
+  let note = null;
+  const doc = {
+    getElementById: (id) => (id === "navSignout" ? so
+      : id === "siteHeader" ? { insertAdjacentHTML: (_w, h) => { inserted.push(h); note = {}; } } : null),
+    querySelector: () => note,
+  };
+  nav.applyMe(doc, { name: "<b>x</b>", adminOnly: true });
+  nav.applyMe(doc, { name: "<b>x</b>", adminOnly: true });
+  assert.equal(so.title, "Signed in as <b>x</b>", "a title attribute is text, never markup");
+  assert.equal(inserted.length, 1);
+  // A later answer that is no longer admin-only (a host enrolled) removes it.
+  let removed = 0;
+  note = { remove: () => { removed++; note = null; } };
+  nav.applyMe(doc, { name: "x", adminOnly: false });
+  assert.equal(removed, 1);
+  assert.ok(tabsHtml("x").includes('id="navSignout"'));
+});
+
+test("XERK-2553: the admin-only note is re-checked until the hub stops saying so, through a failed check", async () => {
+  const nav = require("../public/nav.js");
+  const answers = [
+    { ok: true, json: async () => ({ name: "root", adminOnly: true }) },
+    { ok: false, json: async () => ({}) },              // a 503 mid-rollout
+    "throw",                                              // a dropped connection
+    { ok: true, json: async () => ({ name: "root", adminOnly: false }) },
+  ];
+  const timers = [];
+  let note = null, calls = 0;
+  const win = {
+    fetch: async () => { const a = answers[calls++]; if (a === "throw") throw new Error("down"); return a; },
+    setTimeout: (fn) => { timers.push(fn); },
+  };
+  const doc = {
+    defaultView: win,
+    getElementById: (id) => (id === "siteHeader" ? { insertAdjacentHTML: () => { note = { remove: () => { note = null; } }; } } : null),
+    querySelector: () => note,
+  };
+  await nav.loadMe(doc);
+  assert.ok(note, "the note shows");
+  for (let i = 0; i < 3; i++) {
+    assert.equal(timers.length, 1, `check ${i + 2} is scheduled`);
+    await timers.shift()();
+  }
+  assert.equal(calls, 4);
+  assert.equal(note, null, "gone once the hub stops saying admin-only");
+  assert.equal(timers.length, 0, "and the loop stops");
+  // A FIRST load that fails never starts a loop (an older hub without the route).
+  calls = 3; answers[3] = { ok: false, json: async () => ({}) };
+  await nav.loadMe(doc);
+  assert.equal(timers.length, 0);
+  // Nor does a first load whose fetch throws (the hub unreachable at page load).
+  calls = 2;
+  await nav.loadMe(doc);
+  assert.equal(timers.length, 0);
+});

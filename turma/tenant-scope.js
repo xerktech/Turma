@@ -67,6 +67,8 @@ const ROUTES = [
   ["GET", "/board", "signed-in"], ["GET", "/board.html", "signed-in"],
   // signed-in, no tenant data
   ["GET", "/api/ws-token", "signed-in"],
+  // Who the caller is (XERK-2553): its own label + roles, never another tenant's data.
+  ["GET", "/api/me", "signed-in"],
   // The caller's own tenant's Tenir token (XERK-2551; the handler 404s a principal with no tenant).
   ["GET POST", "/api/meetings-token", "signed-in"],
   // Push devices: a phone's own registration. WHICH alerts reach it is the push

@@ -361,6 +361,13 @@ h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 .nav-tabs a.signout { color: var(--muted); background: none; margin-left: 6px; }
 .nav-tabs a.signout:hover { color: var(--critical); background: none; }
 .bottom-nav { display: none; }
+/* An admin-only account's explanation (XERK-2553, nav.js adminOnlyNoteHtml). */
+.admin-only-note {
+  width: calc(100% - 40px); max-width: calc(var(--wrap) - 40px); margin: 12px auto 10px;
+  padding: 10px 14px; box-sizing: border-box;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+  color: var(--ink-2); font-size: 13px; line-height: 1.45;
+}
 
 /* ---- Buttons ------------------------------------------------------------- */
 button {

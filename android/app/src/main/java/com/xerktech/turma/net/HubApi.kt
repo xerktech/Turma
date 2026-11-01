@@ -44,6 +44,10 @@ interface HubApi {
     @GET("api/ws-token")
     suspend fun wsToken(): WsTokenResponse
 
+    /** Who is signed in (XERK-2553); an older hub 404s it. */
+    @GET("api/me")
+    suspend fun me(): com.xerktech.turma.model.Me
+
     @POST("api/agents/{host}/sessions")
     suspend fun spawnSession(@Path("host") host: String, @Body body: SpawnRequest): OkResponse
 

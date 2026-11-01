@@ -1578,6 +1578,21 @@ data class AgentRow(
     val kind: String = "",
 )
 
+/**
+ * `GET /api/me` (XERK-2553): who the app is signed in as. Every field defaults,
+ * so a partial answer degrades to "can't tell" (no label, not admin-only) rather
+ * than failing the decode. The hub builds it field by field (`meView`).
+ */
+@Serializable
+data class Me(
+    val kind: String = "",
+    val name: String = "",
+    val source: String = "",
+    val roles: List<String> = emptyList(),
+    val tenant: Boolean = false,
+    val adminOnly: Boolean = false,
+)
+
 @Serializable
 data class WsTokenResponse(
     val token: String = "",

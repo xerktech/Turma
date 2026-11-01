@@ -68,3 +68,6 @@ The heartbeat payload and what `/api/agents` serves to every client. Spans `hub-
   coercion is the stores' whitelists (`sanitizeDailyBrief`/`dailyBriefWire`,
   `validateDailyBriefSchedule`), so a field added there needs a defaulted field on
   `DailyBrief`/`DailyBriefSchedule`. Android also decodes them per org, so a bad entry drops alone.
+- **`GET /api/me` is TYPED on Android** (`model.Me`, XERK-2553): the hub's `meView` builds it field
+  by field from the principal (strings, a `user`/`admin` role list, two booleans) and never serves
+  the tenant or user id. A field added there needs a defaulted field on `Me`.
