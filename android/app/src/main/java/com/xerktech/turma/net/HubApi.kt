@@ -37,6 +37,10 @@ interface HubApi {
     @GET("api/agents")
     suspend fun listAgents(): AgentsResponse
 
+    /** The same poll with its headers: the ETag names the snapshot for /api/events (XERK-2599). */
+    @GET("api/agents")
+    suspend fun listAgentsResponse(): retrofit2.Response<AgentsResponse>
+
     @GET("api/ws-token")
     suspend fun wsToken(): WsTokenResponse
 

@@ -21212,6 +21212,107 @@ test("rollup XERK-2593: a whole-map SSE frame unchanged for a stream is not sent
   }
 });
 
+test("XERK-2599: a stream opened with the ETag of the snapshot it rendered hears no other tenant's first map change", async () => {
+  const T = tenants2533();
+  const open = [];
+  const connect = async (h, query, extra) => {
+    const s = await new Promise((resolve, reject) => {
+      const req = http.request(baseUrl + "/api/events" + query, { method: "GET", headers: { ...h, ...extra } },
+        (res) => { res.setEncoding("utf8"); resolve({ req, res }); });
+      req.on("error", reject); req.end();
+    });
+    open.push(s);
+    return collectSse(s.res);
+  };
+  const color = (site, h, body) => request("POST", `/api/jira/${site}/color`, { headers: h, body });
+  let sa, sb;
+  try {
+    ({ sa, sb } = await fleet2534(T));
+    assert.equal((await color(sa, T.A.h, { slot: 3 })).status, 200);
+    assert.equal((await color(sb, T.B.h, { slot: 1 })).status, 200);
+    const snap = await request("GET", "/api/agents", { headers: T.A.h });
+    const etag = snap.headers.etag;
+    assert.ok(etag);
+    const seeded = await connect(T.A.h, `?since=${encodeURIComponent(etag)}`);
+    const bare = await connect(T.A.h, "");
+    const stale = await connect(T.A.h, `?since=${encodeURIComponent('"not-the-snapshot"')}`);
+    const reconnect = await connect(T.A.h, `?since=${encodeURIComponent(etag)}`, { "last-event-id": "0" });
+    const oc = (ev) => ev.filter((e) => e.event === "orgColors");
+    // Only B's org changes: A's slice is what A's page already rendered.
+    assert.equal((await color(sb, T.B.h, { slot: 2 })).status, 200);
+    await waitFor(() => oc(bare).length === 1 && oc(stale).length === 1 && oc(reconnect).length === 1);
+    // A real change to A's slice still reaches the seeded stream, and is its first frame.
+    assert.equal((await color(sa, T.A.h, { slot: 4 })).status, 200);
+    await waitFor(() => oc(seeded).length >= 1);
+    assert.equal(oc(seeded).length, 1, "the seeded stream never heard B's change");
+    assert.equal(JSON.parse(oc(seeded)[0].data)[sa], 4);
+    // A change to A's slice landing between A's fetch and its connect is sent AT
+    // connect: the stream is seeded from the snapshot A holds, never the current one.
+    const snap2 = await request("GET", "/api/agents", { headers: T.A.h });
+    assert.equal((await color(sa, T.A.h, { slot: 5 })).status, 200);
+    const late = await connect(T.A.h, `?since=${encodeURIComponent(snap2.headers.etag)}`);
+    await waitFor(() => oc(late).length === 1);
+    assert.equal(JSON.parse(oc(late)[0].data)[sa], 5);
+    assert.equal((await color(sb, T.B.h, { slot: 6 })).status, 200);
+    assert.equal((await color(sa, T.A.h, { slot: 7 })).status, 200);
+    await waitFor(() => oc(late).length === 2);
+    assert.equal(JSON.parse(oc(late)[1].data)[sa], 7, "B's change between never reached it");
+  } finally {
+    for (const s of open) { s.req.destroy(); s.res.destroy(); }
+    if (sa) await color(sa, T.A.h, { auto: true });
+    if (sb) await color(sb, T.B.h, { auto: true });
+    forget2534(T); T.restore();
+  }
+});
+
+test("XERK-2599: a seed is the caller's own view only, and what moved for its hosts is sent at connect", async () => {
+  const T = tenants2533();
+  const open = [];
+  const connect = async (h, query) => {
+    const s = await new Promise((resolve, reject) => {
+      const req = http.request(baseUrl + "/api/events" + query, { method: "GET", headers: h },
+        (res) => { res.setEncoding("utf8"); resolve({ req, res }); });
+      req.on("error", reject); req.end();
+    });
+    let raw = "";
+    s.res.on("data", (c) => { raw += c; });
+    open.push(s);
+    return { events: collectSse(s.res), raw: () => raw };
+  };
+  try {
+    const { ka } = await fleet2534(T);
+    const pa = hub.principalFromToken(T.A.h.cookie.slice("hub_session=".length));
+    const viewA = hub.tenantViewSig(pa);
+    const ea = (await request("GET", "/api/agents", { headers: T.A.h })).headers.etag;
+    const eb = (await request("GET", "/api/agents", { headers: T.B.h })).headers.etag;
+    // B's ETag names B's view: A connecting with it seeds nothing and is told nothing of B.
+    const cross = await connect(T.A.h, `?since=${encodeURIComponent(eb)}`);
+    // A held snapshot that had one more host, and A's own host offline.
+    const held = hub.sseSnapshotSeeds.get(`${viewA}|${ea}`);
+    assert.ok(held, "the snapshot A was served is remembered");
+    hub.sseSnapshotSeeds.set(`${viewA}|"held"`, { digests: new Map(held.digests),
+      online: new Map([[ka, false], ["t2599-gone", true]]) });
+    const moved = await connect(T.A.h, `?since=${encodeURIComponent('"held"')}`);
+    await waitFor(() => moved.events.length >= 2);
+    assert.deepEqual(moved.events.filter((e) => e.event === "removed").map((e) => JSON.parse(e.data)),
+      [{ key: "t2599-gone" }]);
+    const flipped = moved.events.filter((e) => e.event === "agent").map((e) => JSON.parse(e.data));
+    assert.deepEqual(flipped.map((a) => [a.key, a.online]), [[ka, true]], "the online flip is sent");
+    assert.equal(moved.events.filter((e) => e.event !== "agent" && e.event !== "removed").length, 0,
+      "no map moved, so none is sent");
+    // The stream names an event id, so a browser's own retry carries Last-Event-ID.
+    assert.match(cross.raw(), /\nid: 0\n/);
+    assert.equal(cross.events.length, 0, "a foreign ETag writes nothing at connect");
+    // Bounded: the oldest snapshots go first.
+    for (let i = 0; i < hub.SSE_SNAPSHOT_SEEDS_MAX + 20; i++) hub.rememberSnapshotSeed(`t2599|${i}`, { agents: [] });
+    assert.equal(hub.sseSnapshotSeeds.size, hub.SSE_SNAPSHOT_SEEDS_MAX);
+    assert.ok(!hub.sseSnapshotSeeds.has("t2599|0") && hub.sseSnapshotSeeds.has(`t2599|${hub.SSE_SNAPSHOT_SEEDS_MAX + 19}`));
+  } finally {
+    for (const s of open) { s.req.destroy(); s.res.destroy(); }
+    forget2534(T); T.restore();
+  }
+});
+
 test("rollup XERK-2593: two tenants reporting one live transcript id each resolve their own host", async () => {
   const T = tenants2533();
   try {

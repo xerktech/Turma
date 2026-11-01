@@ -2361,6 +2361,7 @@ async function refresh() {
     if (r.status === 304) return;
     etag = r.headers.get("ETag");
     mergeSnapshot(await r.json(), since);
+    if (typeof TurmaNav !== "undefined" && TurmaNav.noteSnapshot) TurmaNav.noteSnapshot(r);
   } catch { /* keep last render */ }
   if (cache) render(cache);
 }
@@ -2381,7 +2382,7 @@ function applyAgent(rec) {
 }
 function connectSSE() {
   let es;
-  try { es = new EventSource("/api/events"); }
+  try { es = new EventSource(typeof TurmaNav !== "undefined" && TurmaNav.eventsUrl ? TurmaNav.eventsUrl() : "/api/events"); }
   catch { setTimeout(connectSSE, sseBackoff); return; }
   es.onopen = () => {
     // A RECONNECT re-reads the whole payload once. Everything else on this page
@@ -2529,15 +2530,18 @@ function connectSSE() {
   TurmaOrg.sse(es);
   es.onerror = () => {
     sseOk = false;
-    if (es.readyState === EventSource.CLOSED) {
-      setTimeout(connectSSE, sseBackoff);
-      sseBackoff = Math.min(sseBackoff * 2, 30000);
-    }
+    // Never the browser's own retry: it replays the old URL, which the hub never
+    // seeds, so other tenants' first map frames would reach it (XERK-2599). Re-read
+    // the snapshot and open a fresh stream naming it.
+    es.close();
+    if (typeof TurmaNav !== "undefined" && TurmaNav.eventsClosed) TurmaNav.eventsClosed();
+    setTimeout(() => refresh().finally(connectSSE), sseBackoff);
+    sseBackoff = Math.min(sseBackoff * 2, 30000);
   };
 }
 
-refresh();
-connectSSE();
+// The stream opens once the first snapshot is in, naming it (XERK-2599).
+refresh().finally(connectSSE);
 setInterval(() => { if (!sseOk) refresh(); }, 15000);
 </script>
 </body>

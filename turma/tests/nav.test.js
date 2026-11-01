@@ -394,3 +394,31 @@ test("nav: every tab reserves its bold width, so the row can't shift between pag
   assert.match(reserve[0], /height:\s*0/);
   assert.match(reserve[0], /visibility:\s*hidden/);
 });
+
+test("XERK-2599: the first stream names the snapshot the page rendered, later ones none", () => {
+  delete require.cache[require.resolve("../public/nav.js")];
+  const nav = require("../public/nav.js");
+  const resp = (etag) => ({ headers: { get: (h) => (h === "ETag" ? etag : null) } });
+  nav.noteSnapshot(resp('"a/b+c="'));
+  assert.equal(nav.eventsUrl(), "/api/events?since=%22a%2Fb%2Bc%3D%22");
+  nav.noteSnapshot(resp('"while-open"'));
+  assert.equal(nav.eventsUrl(), "/api/events", "a snapshot read with a stream open is past what the page holds");
+  // A page that lost its stream re-reads, then names that snapshot again.
+  nav.eventsClosed();
+  assert.equal(nav.eventsUrl(), "/api/events", "closing forgets the snapshot");
+  nav.eventsClosed();
+  nav.noteSnapshot(resp('"fresh"'));
+  assert.equal(nav.eventsUrl(), "/api/events?since=%22fresh%22");
+});
+
+test("XERK-2599: every page opens its stream after its first snapshot, through eventsUrl", () => {
+  for (const f of PAGE_FILES) {
+    const src = fs.readFileSync(path.join(PUBLIC, f), "utf8");
+    assert.match(src, /TurmaNav\.noteSnapshot\(r\)/, `${f} records the snapshot's ETag`);
+    assert.match(src, /new EventSource\([^)]*TurmaNav\.eventsUrl\(\)/, `${f} opens the stream through eventsUrl`);
+    assert.match(src, /\nrefresh\(\)\.finally\(connectSSE\);\n/, `${f} connects once the first snapshot is in`);
+    assert.doesNotMatch(src, /\nconnectSSE\(\);\n/, `${f} never opens the stream before its snapshot`);
+    assert.match(src, /es\.close\(\);\n\s*if \(typeof TurmaNav !== "undefined" && TurmaNav\.eventsClosed\) TurmaNav\.eventsClosed\(\);\n\s*setTimeout\(\(\) => refresh\(\)\.finally\(connectSSE\), sseBackoff\);/,
+      `${f} replaces a lost stream with one naming a fresh snapshot, never the browser's retry`);
+  }
+});

@@ -14,7 +14,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const html = fs.readFileSync(path.join(__dirname, "..", "public", "sessions.html"), "utf8");
-const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
+// The page opens its stream once its first snapshot is in (XERK-2599, pinned in
+// nav.test.js); these tests drive the stream beside an in-flight fetch, so the
+// harness opens it at load as the page did before.
+const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1].replace("\nrefresh().finally(connectSSE);\n", "\nrefresh();\nconnectSSE();\n");
 
 // The page reads window.TurmaBoard.orgColorMap for the org card tint (XERK-142),
 // loaded by board.html alongside sessions.html; require the real module so the

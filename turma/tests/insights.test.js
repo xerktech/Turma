@@ -18,7 +18,10 @@ const html = fs.readFileSync(path.join(__dirname, "..", "public", "insights.html
 // The page loads board.js/nav.js/org.js/newticket.js by <script src>, then its
 // own logic in the one inline block — take the last, which is that block.
 const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
-const script = blocks[blocks.length - 1][1];
+// The page opens its stream once its first snapshot is in (XERK-2599, pinned in
+// nav.test.js); these tests drive the stream beside an in-flight fetch, so the
+// harness opens it at load as the page did before.
+const script = blocks[blocks.length - 1][1].replace("\nrefresh().finally(connectSSE);\n", "\nrefresh();\nconnectSSE();\n");
 
 function makeEl() {
   const el = {

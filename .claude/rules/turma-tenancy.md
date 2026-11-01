@@ -254,6 +254,19 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   - **A whole-map event (`SNAPSHOT_EVENTS`) is skipped for a stream whose slice is unchanged since
     the last frame IT received** (`sseLastSent`, rollup XERK-2593): else every stream heard every
     other tenant's activity. Per stream, never per view: a later stream never saw the earlier frame.
+  - **A new stream is seeded from the snapshot its page RENDERED** (XERK-2599): the page sends that
+    `/api/agents` ETag as `/api/events?since=`; `sseSnapshotSeeds` (view + ETag → frame digests and
+    host online flags, filled by `scopedAgentsCache`) seeds `sseLastSent`, and whatever moved since
+    is sent at connect (maps, `removed`, an online flip). Never seed from the CURRENT body: the
+    fleet ETag moves every beat, and a newer digest would dedupe away the change the page lacks.
+    - Pages open the stream AFTER their first fetch (`refresh().finally(connectSSE)`, `nav.js`
+      `noteSnapshot`/`eventsUrl`): only a snapshot read with NO stream open is named.
+    - A page never takes the browser's own retry: `onerror` closes, `eventsClosed()`, re-reads,
+      reopens naming the new snapshot. Android names its latest poll's (the 6s poll heals the rest).
+    - The stream starts `id: 0`, so any browser auto-reconnect carries Last-Event-ID and is never
+      seeded (it replays an old `since`). Seeds live on the serving leader; a failover drops the
+      stream, and the page re-reads from the new leader before it reconnects.
+    - Tests: `XERK-2599:` in `server.test.js` and `nav.test.js`; `FleetSseSinceTest` (Android).
 - **The ws-token names its principal** (`ws2.<exp>.<claims>.<mac>`, re-read from the store at
   socket open); `/live` 404s another tenant's host. The pre-tenancy `ws.` token is refused.
 - `findSession(id, p)` resolves only the caller's hosts, so another tenant's agent reporting the

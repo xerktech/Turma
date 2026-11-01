@@ -1011,13 +1011,14 @@ async function refresh() {
       body.decisionCounts = cache.decisionCounts;
     }
     cache = body;
+    if (typeof TurmaNav !== "undefined" && TurmaNav.noteSnapshot) TurmaNav.noteSnapshot(r);
   } catch { /* keep the last render */ }
   if (cache) render(cache);
 }
 let sseOk = false, sseBackoff = 2000;
 function connectSSE() {
   let es;
-  try { es = new EventSource("/api/events"); }
+  try { es = new EventSource(typeof TurmaNav !== "undefined" && TurmaNav.eventsUrl ? TurmaNav.eventsUrl() : "/api/events"); }
   catch { setTimeout(connectSSE, sseBackoff); return; }
   es.onopen = () => { sseOk = true; sseBackoff = 2000; };
   // The decisions log changed (any org): every org's served tail.
@@ -1040,16 +1041,19 @@ function connectSSE() {
   TurmaOrg.sse(es);
   es.onerror = () => {
     sseOk = false;
-    if (es.readyState === EventSource.CLOSED) {
-      setTimeout(connectSSE, sseBackoff);
-      sseBackoff = Math.min(sseBackoff * 2, 30000);
-    }
+    // Never the browser's own retry: it replays the old URL, which the hub never
+    // seeds, so other tenants' first map frames would reach it (XERK-2599). Re-read
+    // the snapshot and open a fresh stream naming it.
+    es.close();
+    if (typeof TurmaNav !== "undefined" && TurmaNav.eventsClosed) TurmaNav.eventsClosed();
+    setTimeout(() => refresh().finally(connectSSE), sseBackoff);
+    sseBackoff = Math.min(sseBackoff * 2, 30000);
   };
 }
 TurmaOrg.subscribe(() => { if (cache) render(cache); });
 showPane();
-refresh();
-connectSSE();
+// The stream opens once the first snapshot is in, naming it (XERK-2599).
+refresh().finally(connectSSE);
 // The org list rides the agent payload, which this page does not live-patch, so a
 // slow poll keeps the header's org menu current; a fast one covers a dead stream.
 setInterval(() => refresh(), 60000);
