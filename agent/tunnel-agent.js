@@ -2615,7 +2615,10 @@ function pokeHeartbeat() {
   // poke port instead and we connect to it to wake the beat. Checked at call
   // time (not a load-time const) so the suite can drive both platforms.
   if (process.platform === "win32") { pokeWindows(); return; }
-  const pid = Number(process.env.TURMA_MANAGER_PID) || 1;
+  // Only a positive integer names the manager: -1 would signal every process
+  // this user owns (SIGUSR1's default action terminates), 0 our whole group.
+  const named = Number(process.env.TURMA_MANAGER_PID);
+  const pid = Number.isInteger(named) && named > 0 ? named : 1;
   try {
     process.kill(pid, "SIGUSR1");
   } catch (err) {
