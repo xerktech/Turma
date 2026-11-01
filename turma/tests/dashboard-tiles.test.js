@@ -626,7 +626,29 @@ test("XERK-2598: every page's SSE reconnect re-reads its snapshot", () => {
     const html = fs.readFileSync(path.join(__dirname, "..", "public", f + ".html"), "utf8");
     const open = html.match(/es\.onopen = \(\) => \{([\s\S]*?)\n  \};/);
     assert.ok(open, `${f}: onopen block`);
-    assert.match(open[1], /if \(sseEverOpen\) refresh\(\);/, `${f}: reconnect refresh`);
+    assert.match(open[1], /if \(sseEverOpen\) refresh\((\{ background: true \})?\);/, `${f}: reconnect refresh`);
     assert.match(open[1], /sseEverOpen = true;/, `${f}: first open marked`);
+    // Marked AFTER the check, or the first open refreshes too.
+    assert.ok(open[1].indexOf("if (sseEverOpen)") < open[1].indexOf("sseEverOpen = true"),
+      `${f}: checked before it is marked`);
   }
+});
+
+test("XERK-2598: the reconnect re-read never repaints under a focused <select>", async () => {
+  // The re-read brings a second host the page has not painted yet.
+  const D = loadDashboard(undefined, () => ({ now: Date.now(), agents: [liveHost("a", 1), liveHost("b", 2)] }));
+  await settle();
+  D.setCache({ now: Date.now(), agents: [liveHost("a", 1)] });
+  D.render(D.getCache());
+  const painted = D.els.groups.innerHTML;
+  D.connectSSE();
+  const es = D.sse[D.sse.length - 1];
+  es.onopen();
+  D.setActiveTagName("SELECT");
+  D.fetches.length = 0;
+  es.onopen();                                   // reconnect while the select is open
+  await settle(); await settle();
+  assert.ok(D.fetches.includes("/api/agents"), "the data still lands");
+  assert.equal(D.els.groups.innerHTML, painted, "but nothing is repainted");
+  assert.equal(D.getCache().agents.length, 2, "the snapshot is merged for the next paint");
 });
