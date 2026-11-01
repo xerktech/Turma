@@ -355,9 +355,18 @@
   function update(data) {
     const B = board();
     sites = B.mergeSites((data && data.agents) || []);
-    if (data && data.autoStartOrgs && data.autoStartOrgs !== seenAuto) autoMap = seenAuto = data.autoStartOrgs;
-    if (data && data.autoMergeOrgs && data.autoMergeOrgs !== seenMerge) mergeMap = seenMerge = data.autoMergeOrgs;
-    if (data && data.orgColors && data.orgColors !== seenColors) colorPins = seenColors = data.orgColors;
+    if (data && data.autoStartOrgs && data.autoStartOrgs !== seenAuto) {
+      autoMap = seenAuto = data.autoStartOrgs;
+      hubSays("auto", autoMap);
+    }
+    if (data && data.autoMergeOrgs && data.autoMergeOrgs !== seenMerge) {
+      mergeMap = seenMerge = data.autoMergeOrgs;
+      hubSays("merge", mergeMap);
+    }
+    if (data && data.orgColors && data.orgColors !== seenColors) {
+      colorPins = seenColors = data.orgColors;
+      hubSays("color", colorPins);
+    }
     live = true;
     writeCache();
     paint();
@@ -398,27 +407,44 @@
     return attrs.length ? attrs.map(a => `[${a.name}="${CSS.escape(a.value)}"]`).join("") : null;
   }
 
-  // A POST that failed at the NETWORK level may still have been applied by the
-  // hub (the response was lost), so rolling back blindly can leave this page
-  // disagreeing with the hub until that org's map next changes — the SSE
-  // dedupe (rollup XERK-2593) sends a map only when this stream's slice moves.
-  // So re-read the hub's map and return it; null = couldn't, caller rolls back.
-  // The caller adopts ONLY its own org's entry from it: the body may predate a
-  // later SSE change to another org (or this tab's own optimistic flip there),
-  // and installing it whole regressed those (QA, XERK-2598).
-  // A POST's outcome (re-read or rollback) applies only while it is still the
-  // newest word on that org's switch: no newer click on it, and no SSE frame of
-  // that map since the click — a frame carries the WHOLE map, so it is already
-  // the hub's newer answer for this org too. Else a stale re-read body (or a
-  // rollback) overrode a later click or the hub's own broadcast (QA, XERK-2598).
+  // The three hub-owned switches — auto-start, auto-merge, color pin — share one
+  // optimistic-flip path (`flip`). Rules it keeps, each from a defect (rollup
+  // XERK-2598):
+  // - `confirmed[kind]` is the hub's last word: the newest snapshot update()
+  //   adopted, every SSE frame (a whole map), the re-read below, and an OK
+  //   POST's own org. A failed click resolves to THAT, never to the value the
+  //   switch showed when clicked — which may be an earlier click's unconfirmed
+  //   flip, and nothing would ever correct it.
+  // - Only the NEWEST click on an org's switch resolves it; an older click's
+  //   late failure would undo the newer one.
+  // - A POST that failed at the NETWORK level may still have been applied, so
+  //   it re-reads the hub (`hubOrgMap`) and takes ONLY its own org's entry —
+  //   the body may predate an SSE change to another org — and not even that
+  //   when an SSE frame of that map landed during the re-read (newer word).
+  const FIELD = { auto: "autoStartOrgs", merge: "autoMergeOrgs", color: "orgColors" };
+  const ROUTE = { auto: "autostart", merge: "automerge", color: "color" };
+  const confirmed = { auto: {}, merge: {}, color: {} };
+  const hubGen = { auto: 0, merge: 0, color: 0 };
   const clicks = new Map();
-  const sseGen = { auto: 0, merge: 0, color: 0 };
-  function claimClick(kind, siteKey) {
-    const k = kind + "\0" + siteKey;
-    const n = (clicks.get(k) || 0) + 1;
-    clicks.set(k, n);
-    const gen = sseGen[kind];
-    return () => clicks.get(k) === n && sseGen[kind] === gen;
+
+  function hubSays(kind, map) { confirmed[kind] = map || {}; hubGen[kind]++; }
+  // An org's value in a map: true / a slot number, or null for off / auto.
+  function valueIn(kind, map, siteKey) {
+    if (kind !== "color") return autoOn(map, siteKey) ? true : null;
+    return Object.prototype.hasOwnProperty.call(map, siteKey) && Number.isInteger(map[siteKey])
+      ? map[siteKey] : null;
+  }
+  function withValue(map, siteKey, value) {
+    const m = orgMapCopy(map);
+    if (value) m[siteKey] = value; else delete m[siteKey];
+    return m;
+  }
+  function showLocal(kind, siteKey, value) {
+    if (kind === "auto") autoMap = withValue(autoMap, siteKey, value);
+    else if (kind === "merge") mergeMap = withValue(mergeMap, siteKey, value);
+    else colorPins = withValue(colorPins, siteKey, value);
+    paint();
+    if (kind === "color") notify();
   }
 
   async function hubOrgMap(field) {
@@ -431,91 +457,53 @@
     } catch { return null; }
   }
 
+  async function flip(kind, siteKey, value, body) {
+    const k = kind + "\0" + siteKey;
+    const n = (clicks.get(k) || 0) + 1;
+    clicks.set(k, n);
+    showLocal(kind, siteKey, value);
+    let ok = false, netErr = false;
+    try {
+      const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/${ROUTE[kind]}`,
+        { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify(body) });
+      if (r.status === 401) { location.href = "/login"; return; }
+      ok = r.ok;
+    } catch { netErr = true; /* outcome unknown — re-read below */ }
+    if (ok) { confirmed[kind] = withValue(confirmed[kind], siteKey, value); return; }
+    if (netErr) {
+      const gen = hubGen[kind];
+      const hub = await hubOrgMap(FIELD[kind]);
+      if (hub && hubGen[kind] === gen) {
+        confirmed[kind] = withValue(confirmed[kind], siteKey, valueIn(kind, hub, siteKey));
+      }
+    }
+    if (clicks.get(k) !== n) return;   // a newer click owns this switch now
+    showLocal(kind, siteKey, valueIn(kind, confirmed[kind], siteKey));
+  }
+
   // Flip an org's hub-side auto-start opt-in (XERK-41). Painted optimistically —
   // the hub is authoritative the moment the POST returns and its SSE event keeps
   // every other open page in step, but the local flip makes THIS one respond
-  // instantly. Rolls back if the POST fails.
-  async function setAutoStart(siteKey, enabled) {
-    const had = autoOn(autoMap, siteKey);
-    const newest = claimClick("auto", siteKey);
-    autoMap = orgMapCopy(autoMap);
-    if (enabled) autoMap[siteKey] = true; else delete autoMap[siteKey];
-    paint();
-    let ok = false, netErr = false;
-    try {
-      const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/autostart`,
-        { method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ enabled }) });
-      if (r.status === 401) { location.href = "/login"; return; }
-      ok = r.ok;
-    } catch { netErr = true; /* outcome unknown — re-read below */ }
-    const hub = !ok && netErr ? await hubOrgMap("autoStartOrgs") : null;
-    if (!ok && newest()) {
-      const on = hub ? autoOn(hub, siteKey) : had;
-      autoMap = orgMapCopy(autoMap);
-      if (on) autoMap[siteKey] = true; else delete autoMap[siteKey];
-      paint();
-    }
+  // instantly. Resolves to the hub's word if the POST fails.
+  function setAutoStart(siteKey, enabled) {
+    return flip("auto", siteKey, enabled ? true : null, { enabled });
   }
 
   // Flip an org's hub-side auto-merge opt-in (XERK-550) — the same optimistic
-  // paint + rollback as setAutoStart. Consequential (it merges to the default
-  // branch unreviewed), so it stays its own switch beside auto-start.
-  async function setAutoMerge(siteKey, enabled) {
-    const had = autoOn(mergeMap, siteKey);
-    const newest = claimClick("merge", siteKey);
-    mergeMap = orgMapCopy(mergeMap);
-    if (enabled) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
-    paint();
-    let ok = false, netErr = false;
-    try {
-      const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/automerge`,
-        { method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ enabled }) });
-      if (r.status === 401) { location.href = "/login"; return; }
-      ok = r.ok;
-    } catch { netErr = true; /* outcome unknown — re-read below */ }
-    const hub = !ok && netErr ? await hubOrgMap("autoMergeOrgs") : null;
-    if (!ok && newest()) {
-      const on = hub ? autoOn(hub, siteKey) : had;
-      mergeMap = orgMapCopy(mergeMap);
-      if (on) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
-      paint();
-    }
+  // flip as setAutoStart. Consequential (it merges to the default branch
+  // unreviewed), so it stays its own switch beside auto-start.
+  function setAutoMerge(siteKey, enabled) {
+    return flip("merge", siteKey, enabled ? true : null, { enabled });
   }
 
   // Pin an org's palette slot (1..8), or release it back to auto (slot null) —
-  // XERK-145. Hub-owned durable state like the auto-start opt-in, painted
-  // optimistically and rolled back if the POST fails. notify() runs on every
-  // change so each page repaints its org-tinted cards at once — every page
-  // reads the pins through orgColors() below, so a repaint sees the new map.
-  async function setOrgColor(siteKey, slotN) {
-    const pinOf = (m) => (Object.prototype.hasOwnProperty.call(m, siteKey) &&
-      Number.isInteger(m[siteKey]) ? m[siteKey] : null);
-    const had = pinOf(colorPins);
-    const newest = claimClick("color", siteKey);
-    colorPins = orgMapCopy(colorPins);
-    if (slotN) colorPins[siteKey] = slotN; else delete colorPins[siteKey];
+  // XERK-145. Hub-owned durable state like the auto-start opt-in, flipped the
+  // same way. notify() runs on every change so each page repaints its
+  // org-tinted cards at once — every page reads the pins through orgColors().
+  function setOrgColor(siteKey, slotN) {
     colorFor = null;
-    paint();
-    notify();
-    let ok = false, netErr = false;
-    try {
-      const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/color`,
-        { method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify(slotN ? { slot: slotN } : { auto: true }) });
-      if (r.status === 401) { location.href = "/login"; return; }
-      ok = r.ok;
-    } catch { netErr = true; /* outcome unknown — re-read below */ }
-    const hub = !ok && netErr ? await hubOrgMap("orgColors") : null;
-    if (!ok && newest()) {
-      // Only this org's pin: another org's may have moved meanwhile (SSE).
-      const pin = hub ? pinOf(hub) : had;
-      colorPins = orgMapCopy(colorPins);
-      if (pin) colorPins[siteKey] = pin; else delete colorPins[siteKey];
-      paint();
-      notify();
-    }
+    return flip("color", siteKey, slotN || null, slotN ? { slot: slotN } : { auto: true });
   }
 
   // The current org-color pins, for the pages' own card tints: one live source
@@ -530,21 +518,21 @@
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       autoMap = m || {};
-      sseGen.auto++;
+      hubSays("auto", autoMap);
       paint();
     });
     es.addEventListener("autoMergeOrgs", (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       mergeMap = m || {};
-      sseGen.merge++;
+      hubSays("merge", mergeMap);
       paint();
     });
     es.addEventListener("orgColors", (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       colorPins = m || {};
-      sseGen.color++;
+      hubSays("color", colorPins);
       paint();
       // The pins tint cards on every page, so a change (this tab's or another's)
       // repaints more than this control.

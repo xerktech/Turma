@@ -82,11 +82,14 @@ makes an `android/` change part of the same PR) live there.
 - **`update()` adopts a hub map only from a NEW snapshot object** (rollup XERK-2598): pages call
   `update(cache)` every render but never write `autoStartOrgs`/`autoMergeOrgs` back from SSE, so
   re-adopting the same stale object reverted every SSE-moved or optimistic switch on the next beat.
-- **A POST that fails at the NETWORK level re-reads `/api/agents`** and takes ONLY that org's entry: the hub
-  may have applied it, and the per-stream SSE dedupe no longer resends an unchanged map.
-- **A switch POST's outcome (re-read or rollback) applies only while it is the newest word** on that
-  org's switch (`claimClick`): no newer click on it AND no SSE frame of that map since. A frame is
-  the whole map, so it already answers this org; else a stale body overrode a later click.
+- **The three switches (auto-start, auto-merge, color pin) share ONE optimistic path, `flip`**
+  (rollup XERK-2598); its rules each come from a QA-reproduced defect:
+  - A failed click resolves to `confirmed[kind]`, the hub's last word (adopted snapshot, every SSE
+    frame, an OK POST, the re-read), never to what the switch showed when clicked: that may be an
+    earlier click's unconfirmed flip that nothing would correct.
+  - Only the NEWEST click on an org's switch resolves it; an older click's late outcome is dropped.
+  - A NETWORK failure (the hub may have applied it) re-reads `/api/agents` and takes ONLY its org's
+    entry, and not even that when an SSE frame of that map landed during the re-read.
 - Repaints skip when markup is unchanged (beat can't churn the DOM under an open menu). A handled
   click is flagged on the EVENT, not looked up after — the repaint detaches the clicked node, so a
   `contains()` click-away test would close the menu on the click that opened it.
