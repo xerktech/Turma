@@ -63,13 +63,20 @@ class AccountRepositoryTest {
     }
 
     @Test fun `a hub mid-rollout (5xx) is asked again until it answers`() {
-        val calls = java.util.concurrent.atomic.AtomicInteger()
+        // The hub answers 503 until the test lets it recover; only a repository
+        // that keeps asking after the 503 ever reads the account (QA: a call
+        // counter also counted other readers, so it passed with no retry).
+        val ok = java.util.concurrent.atomic.AtomicBoolean(false)
+        val served503 = java.util.concurrent.atomic.AtomicInteger()
         hub.route("/api/me") {
-            if (calls.incrementAndGet() < 3) okhttp3.mockwebserver.MockResponse().setResponseCode(503).setBody("{}")
+            if (!ok.get()) { served503.incrementAndGet(); okhttp3.mockwebserver.MockResponse().setResponseCode(503).setBody("{}") }
             else okhttp3.mockwebserver.MockResponse().setResponseCode(200)
                 .setHeader("Content-Type", "application/json").setBody("""{"kind":"user","name":"alice"}""")
         }
         val r = repo()
+        hub.awaitValue { if (served503.get() >= 2) true else null } // it asked again after a 503
+        assertNull(r.me.value)
+        ok.set(true)
         assertEquals("alice", hub.awaitValue { r.me.value }.name)
     }
 

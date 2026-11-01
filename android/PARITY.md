@@ -1054,7 +1054,8 @@ those are marked `[MODEL]`.
     (XERK-2552) is web-only, so web shows `ADMIN_ONLY_NOTE` under the header on every page and
     Android covers the app with `AdminOnlyScreen` (same words + Sign out) — Android only while its
     loaded fleet is still empty (`showAdminOnly`), so a host enrolled later lifts it on the next
-    poll. Null / an older hub's 404 = not admin-only, so nothing changes against an older hub.
+    poll; web re-asks `/api/me` every 15s while its note shows and drops it once the hub stops
+    saying admin-only. Null / an older hub's 404 = not admin-only, so nothing changes against an older hub.
   - `net/AccountRepository` re-reads it whenever the stored credential changes, so a sign-in as
     somebody else never shows the previous account; a token refresh for the same sign-in re-reads
     in place (no blink), a 5xx or network failure retries, a 4xx stops.

@@ -415,5 +415,10 @@ test("XERK-2553: the signed-in label and the admin-only note come from /api/me",
   nav.applyMe(doc, { name: "<b>x</b>", adminOnly: true });
   assert.equal(so.title, "Signed in as <b>x</b>", "a title attribute is text, never markup");
   assert.equal(inserted.length, 1);
+  // A later answer that is no longer admin-only (a host enrolled) removes it.
+  let removed = 0;
+  note = { remove: () => { removed++; note = null; } };
+  nav.applyMe(doc, { name: "x", adminOnly: false });
+  assert.equal(removed, 1);
   assert.ok(tabsHtml("x").includes('id="navSignout"'));
 });

@@ -123,14 +123,25 @@
     if (so && label) so.title = label;
     const header = doc.getElementById("siteHeader");
     const html = adminOnlyNoteHtml(me);
-    if (header && html && !doc.querySelector(".admin-only-note")) header.insertAdjacentHTML("afterend", html);
+    const shown = doc.querySelector(".admin-only-note");
+    if (header && html && !shown) header.insertAdjacentHTML("afterend", html);
+    else if (!html && shown && shown.remove) shown.remove();
   }
+  // While the note shows, re-ask: the first host enrolling makes this account a
+  // fleet operator, and the note must not sit above that host until a reload
+  // (Android re-checks against every fleet poll). Stops once the note is gone.
+  const ME_RECHECK_MS = 15000;
   function loadMe(doc) {
-    const f = doc.defaultView && doc.defaultView.fetch;
+    const win = doc.defaultView;
+    const f = win && win.fetch;
     if (typeof f !== "function") return;
-    f.call(doc.defaultView, "/api/me", { credentials: "same-origin" })
+    f.call(win, "/api/me", { credentials: "same-origin" })
       .then((r) => (r.ok ? r.json() : null))
-      .then((me) => { if (me) applyMe(doc, me); })
+      .then((me) => {
+        if (!me) return;
+        applyMe(doc, me);
+        if (me.adminOnly === true && typeof win.setTimeout === "function") win.setTimeout(() => loadMe(doc), ME_RECHECK_MS);
+      })
       .catch(() => {}); // an older hub 404s it: nothing to show
   }
 
