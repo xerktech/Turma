@@ -2041,7 +2041,14 @@ test("XERK-2549: a tenant purge removes every byte and row, and nothing resurrec
     assert.ok(!fs.existsSync(path.join(process.env.ARCHIVE_DIR, `@${T49A}`)), "stale partition reaped");
     // A purged tenant's host stores nothing new.
     assert.equal(push49(`lap@${T49A}`, "p49new", "again", `acme@${T49A}`).bytesStored, 0);
-    assert.deepEqual(archive.manifestCursors(`lap@${T49A}`, [{ id: "p49new2" }], `acme@${T49A}`), {});
+    assert.deepEqual(archive.manifestCursors(`lap@${T49A}`, [{ transcriptId: "p49new2", ...meta49("x") }],
+      `acme@${T49A}`), {});
+    assert.equal(archive.sessionRow("p49new2"), null, "no placeholder row for a purged tenant");
+    assert.deepEqual(archive.inventoryCursors(`lap@${T49A}`, [{ i: "p49new3", s: 10, r: 0 }], `acme@${T49A}`), {});
+    // A replica learning the tombstone reaps its stale partition without a walk.
+    fs.mkdirSync(path.join(process.env.ARCHIVE_DIR, `@${T49A}`, "part"), { recursive: true });
+    assert.equal(archive.reapPurgedPartitions(), 1);
+    assert.ok(!fs.existsSync(path.join(process.env.ARCHIVE_DIR, `@${T49A}`)));
     assert.deepEqual(archive.purgeTenant("not-a-tenant"), { transcripts: 0, files: 0 });
   } finally {
     fs.rmSync(legacyAbs, { force: true }); fs.rmSync(legacyAbs + ".meta", { force: true });

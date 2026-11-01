@@ -52,7 +52,18 @@ Tenancy model: `turma-tenancy.md`.
   debounce). `setTenantPurged` makes rebuild, the pg backfill and the de-dup pass skip it, the
   store walk REAP its partition, and ingest/manifest/inventory store nothing for its hosts. Without
   it a follower's stale local copy is re-indexed on its next boot or promotion.
-- A bucket delete that fails is logged, not retried: the tombstone keeps it out of every index.
+- **The purge's own deletes are best-effort; every hydrate finishes them** (QA-reproduced: a mirror
+  `remove` op dropped after its retries left the rows in Postgres, and the next hydrate reloaded them).
+  - `sessionLoader`/`indexLoader` never load a purged tenant's row and RE-SEND its `remove`
+    (`resendPurgedRemoves`); pg `searchArchive`/`listArchive` drop such rows meanwhile.
+  - `ArchiveMirror` takes `purgedKey`: a purged partition's key is never pushed, never fetched, and
+    the leader deletes it when a hydrate lists it (a failed bucket delete heals on the next hydrate).
+  - `remove()` awaits the in-flight drain first: a PUT already started re-created the object after
+    the delete (QA-reproduced).
+  - The store's `install` runs `reapPurgedPartitions`, so a follower (which never walks the store)
+    drops its stale partition the moment it learns the tombstone.
+  - Residual: a PRE-partition tenant object in the bucket is not keyed by tenant, so only the purge's
+    own delete removes it; rebuild/backfill/hydrate skip it by its sidecar or row `host`.
 
 ## Tests
 

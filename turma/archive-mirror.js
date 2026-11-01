@@ -100,7 +100,7 @@ class ArchiveMirror {
    * @param {Function} [o.onLanded] called after retryBlocked lands a rendered file.
    * @param {Function} [o.log]     console.error-shaped logger.
    */
-  constructor({ blobStore, archiveDir, reindex, isLeader, onLanded, log }) {
+  constructor({ blobStore, archiveDir, reindex, isLeader, onLanded, log, purgedKey }) {
     this.blobStore = blobStore;
     // archiveDir is ARCHIVE_DIR (operator env / a fixed default), not user input;
     // keyFor/pathFor below re-check every derived path against this resolved root.
@@ -109,6 +109,10 @@ class ArchiveMirror {
     this.reindex = typeof reindex === "function" ? reindex : () => {};
     this.isLeader = typeof isLeader === "function" ? isLeader : () => true;
     this.onLanded = typeof onLanded === "function" ? onLanded : () => {};
+    // A key under a PURGED tenant's partition (XERK-2549): never downloaded, never
+    // pushed, and deleted from the bucket when a hydrate lists it — the reconcile
+    // for a purge whose bucket delete failed or was overtaken by an in-flight PUT.
+    this.purgedKey = typeof purgedKey === "function" ? purgedKey : () => false;
     this.log = typeof log === "function" ? log : (m) => console.error(m);
     this._dirty = new Set();
     this._draining = null; // the in-flight drain's promise, while one runs
@@ -184,6 +188,20 @@ class ArchiveMirror {
   // ASYNC part (fire-and-forget, logged): delete the bucket objects. A failed delete
   // is logged, not retried; the purge's tombstone keeps every replica from
   // re-indexing what is left (archive.js `setTenantPurged`).
+  _isPurged(key) {
+    try { return !!this.purgedKey(String(key)); } catch { return false; }
+  }
+
+  _deletePurged(keys) {
+    (async () => {
+      let n = 0;
+      for (const k of keys) {
+        try { await this.blobStore.del(k); n++; } catch { /* the next hydrate retries */ }
+      }
+      this.log(`archive mirror: deleted ${n}/${keys.length} leftover object(s) of purged tenants`);
+    })();
+  }
+
   remove(absPath) {
     const key = this.keyFor(absPath);
     if (!key) return Promise.resolve(0);
@@ -197,6 +215,9 @@ class ArchiveMirror {
     }
     return (async () => {
       let n = 0;
+      // A drain already past the dirty set may be PUTting a key under this tree right
+      // now: wait it out, or its PUT lands after the deletes and re-creates the object.
+      if (this._draining) await this._draining.catch(() => {});
       try {
         const keys = (await this.blobStore.list(key + "/")).filter(under);
         for (const k of [key, ...keys]) { await this.blobStore.del(k); n++; }
@@ -235,6 +256,7 @@ class ArchiveMirror {
       // Blocked = short of the bucket's copy (XERK-1050): never PUT it over that.
       if (this._blocked.has(key)) continue;
       this._dirty.delete(key);
+      if (this._isPurged(key)) continue;   // XERK-2549: never re-create a purged object
       const file = this.pathFor(key);
       if (!file) continue;
       try {
@@ -307,6 +329,14 @@ class ArchiveMirror {
       const isMeta = (k) => String(k).endsWith(".jsonl.meta") && !rawRootOf(k);
       const ordered = listing.filter((it) => !isMeta(it && it.key))
         .concat(listing.filter((it) => isMeta(it && it.key)));
+      // A purged tenant's objects (XERK-2549) are neither classified nor fetched;
+      // the leader deletes them, off this pass.
+      const purged = listing.filter((it) => it && this._isPurged(it.key)).map((it) => it.key);
+      if (purged.length) {
+        listing = listing.filter((it) => !(it && this._isPurged(it.key)));
+        ordered.splice(0, ordered.length, ...ordered.filter((it) => !(it && this._isPurged(it.key))));
+        if (this.isLeader()) this._deletePurged(purged);
+      }
       const fetchedJsonl = new Set();
       const sameJsonl = new Set();   // local `.jsonl` byte-for-byte the bucket's size
       const listedKeys = new Set(listing.map((it) => it && it.key));

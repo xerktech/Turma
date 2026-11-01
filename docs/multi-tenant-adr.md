@@ -111,6 +111,8 @@ tenants, run by an admin panel.
   `archivePurgedTenants` store FIRST, then delete its rows (Postgres via the mirror's `remove` op),
   files, raw directories, partition and bucket objects. The tombstone is what stops a follower's
   stale local copy being re-indexed by the boot backfill or a rebuild; the store walk reaps it.
+  Every hydrate re-issues any delete that did not land (Postgres rows, bucket objects), so a purge
+  converges even when its own best-effort deletes were lost.
 
 ### Admin without a tenant: break-glass
 

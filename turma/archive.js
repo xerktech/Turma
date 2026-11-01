@@ -2093,6 +2093,24 @@ function noteRemove(absPath) {
   if (blobRemover) { try { blobRemover(absPath); } catch { /* best-effort */ } }
 }
 
+// Delete the local partition of every purged tenant (XERK-2549). Run when a replica
+// learns a tombstone (server.js installs the store, at boot and on every remote
+// change), so a follower that never ingests — and so never walks the store — does not
+// keep a purged tenant's stale working copy on its disk. Returns the count removed.
+function reapPurgedPartitions() {
+  let names;
+  try { names = fs.readdirSync(ARCHIVE_DIR, { withFileTypes: true }); } catch { return 0; }
+  let n = 0;
+  for (const d of names) {
+    const m = d.isDirectory() ? TENANT_DIR_RE.exec(d.name) : null;
+    if (!m || !isTenantPurged(m[1])) continue;
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    try { fs.rmSync(path.join(ARCHIVE_DIR, d.name), { recursive: true, force: true }); n++; }
+    catch { /* the next walk */ }
+  }
+  return n;
+}
+
 // Remove EVERY archive byte and index row of one tenant — the store's half of user
 // deletion (server.js registers it with `registerTenantPurge`). Two passes, because
 // a tenant's data can sit in two places:
@@ -2457,7 +2475,9 @@ async function searchArchive(query, opts) {
       scope: opts && opts.scope ? opts.scope : undefined,
       limit,
     });
-    rows = (pgRows || []).map((r) => ({
+    // A purged tenant's rows can outlive its purge in Postgres until the delete lands
+    // (XERK-2549, resendPurgedRemoves): never served meanwhile.
+    rows = (pgRows || []).filter((r) => !isTenantPurged(tenantOfHost(r.host))).map((r) => ({
       transcriptId: r.transcript_id, host: r.host, remoteKey: r.remote_key,
       repo: r.repo, summary: r.summary, endedTs: r.ended_ts,
       role: r.role, ts: r.ts, uuid: r.uuid, snippet: r.snippet,
@@ -2516,7 +2536,7 @@ async function listArchive(opts) {
       repo: opts.repo || undefined, host: opts.host || undefined, limit, offset,
       scope: opts.scope || undefined,
     });
-    const sessions = (rows || []).map((r) => ({
+    const sessions = (rows || []).filter((r) => !isTenantPurged(tenantOfHost(r.host))).map((r) => ({
       transcriptId: r.transcriptId, host: r.host, remoteKey: r.remoteKey, repo: r.repo,
       worktree: r.worktree, summary: r.summary, createdAt: r.createdAt,
       endedTs: r.endedTs, msgCount: r.msgCount,
@@ -2819,8 +2839,20 @@ function rebuildIndex() {
 // re-rebuild from files afterward. Between reset() and done() the local index is
 // partial — archive reads answer "still syncing" exactly as they do during a
 // byte-hydrate, the archive's own honest answer.
+// Ask the of-record AGAIN to delete rows of a purged tenant a hydrate found there
+// (XERK-2549): the purge's own `remove` op is best-effort (a mirror op dropped on
+// overflow, retries spent or a leader dying before it drained is never re-sent), so
+// every boot/promotion hydrate re-issues it until Postgres no longer has the row.
+function resendPurgedRemoves(ids) {
+  if (!ids.size || !indexSink || typeof indexSink.remove !== "function") return;
+  for (const id of ids) { try { indexSink.remove(id); } catch { /* next hydrate */ } }
+  console.error(`archive: ${ids.size} row(s) of purged tenants were still in the index ` +
+    `of-record; not loaded, delete re-sent (XERK-2549)`);
+}
+
 function indexLoader() {
   openDb();
+  const purgedSeen = new Set();
   let upsertS = null;
   let insertE = null;
   return {
@@ -2839,6 +2871,8 @@ function indexLoader() {
     sessions(rows) {
       tx(() => {
         for (const r of rows) {
+          // A purged tenant's row still in the of-record (XERK-2549): never loaded.
+          if (isTenantPurged(tenantOfHost(r.host))) { purgedSeen.add(r.transcriptId); continue; }
           // `?? null` keeps a recorded "" (a real no-org owner, still gated) distinct
           // from a legacy NULL — the same rule rebuildIndex uses for the sidecar.
           upsertS.run(r.transcriptId, r.host ?? null, r.siteKey ?? null, r.remoteKey ?? null,
@@ -2851,6 +2885,7 @@ function indexLoader() {
     entries(rows) {
       tx(() => {
         for (const e of rows) {
+          if (purgedSeen.has(e.transcriptId)) continue;
           insertE.run(String(e.text || ""), e.transcriptId, e.uuid || null,
             e.role || null, e.ts || null);
         }
@@ -2859,6 +2894,7 @@ function indexLoader() {
     done() {
       db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('schemaVersion',?)")
         .run(String(SCHEMA_VERSION));
+      resendPurgedRemoves(purgedSeen);
     },
   };
 }
@@ -2869,10 +2905,13 @@ function indexLoader() {
 // local FTS to build. server.js calls `hydrateSessionsInto(sessionLoader())` under HA
 // while `hydrating` gates ingest, so `reset()` clearing the map never races a write.
 function sessionLoader() {
+  const purgedSeen = new Set();
   return {
     reset() { sessionsMap.clear(); filePathIndex.clear(); },
     sessions(rows) {
       for (const r of rows) {
+        // A purged tenant's row still in Postgres (XERK-2549): never loaded.
+        if (isTenantPurged(tenantOfHost(r.host))) { purgedSeen.add(r.transcriptId); continue; }
         // `?? null` keeps a recorded "" (a real no-org owner, still gated) distinct
         // from a legacy NULL — the same rule rebuildIndex/indexLoader use.
         mapPutSession(newSessionRow({
@@ -2886,8 +2925,8 @@ function sessionLoader() {
       }
     },
     // No entries table and no schema stamp to write — the map is ephemeral, rebuilt
-    // from Postgres every boot/promotion.
-    done() {},
+    // from Postgres every boot/promotion. Re-send the delete for any purged row seen.
+    done() { resendPurgedRemoves(purgedSeen); },
   };
 }
 
@@ -4073,7 +4112,7 @@ function renderedTrajectory(transcriptId, runtime, scope) {
 module.exports = {
   // XERK-2549: the tenant partition, per-tenant quota and purge.
   ARCHIVE_TENANT_MAX, tenantOfHost, tenantOfRel, hostInScope, tenantBytes,
-  setTenantPurged, setBlobRemover, purgeTenant,
+  setTenantPurged, setBlobRemover, purgeTenant, reapPurgedPartitions,
   ARCHIVE_DIR, ARCHIVE_DB, ARCHIVE_TRANSCRIPT_MAX, ARCHIVE_TOTAL_MAX,
   dshTrajectory, dshEventsFile,
   claudeTrajectory, claudeTrajectoryFromText, claudeTrajFile, renderedTrajectory,

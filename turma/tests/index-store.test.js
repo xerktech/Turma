@@ -1673,3 +1673,55 @@ test("XERK-2549 pg mode: a tenant purge removes the map rows, the Postgres rows 
     assert.equal(archive.getTranscript("pg-tb").entries.length, 1, "B untouched");
   } finally { pgTeardown(); }
 });
+
+test("XERK-2549 pg mode: a purge whose Postgres delete was LOST is not undone by the next hydrate", async () => {
+  const mem = pgSetup();
+  const A = "c".repeat(32);
+  const purged = new Set();
+  archive.setTenantPurged((t) => purged.has(t));
+  try {
+    const b = [ent("u-l", "user", "lostword secret")];
+    archive.ingestChunk(`lap@${A}`, "pg-lost", META, 0, Buffer.byteLength(JSON.stringify(b)), b, `acme@${A}`);
+    // The mirror drops the purge's `remove` op (retries spent, queue overflow, leader died).
+    archive.setIndexSink({ ...mem.sink(), remove: () => {} });
+    purged.add(A);
+    archive.purgeTenant(A);
+    assert.ok(mem.sessions.has("pg-lost"), "precondition: Postgres still holds the row");
+    // Postgres search never serves it meanwhile.
+    assert.equal((await archive.searchArchive("lostword")).groups.length, 0);
+    assert.equal((await archive.listArchive({})).sessions.some((s) => s.transcriptId === "pg-lost"), false);
+    // A fresh replica's hydrate does not load it and re-sends the delete.
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    assert.equal(archive.sessionRow("pg-lost"), null, "not resurrected into the map");
+    assert.ok(!mem.sessions.has("pg-lost") && !mem.entries.has("pg-lost"), "the delete was re-sent");
+  } finally { archive.setTenantPurged(null); pgTeardown(); }
+});
+
+test("XERK-2549 pg mode: a file another tenant's surviving row also names is KEPT by the purge", async () => {
+  const mem = pgSetup();
+  const A = "d".repeat(32);
+  try {
+    // A pre-XERK-277 collision: two transcripts, one file, one untenanted.
+    const rel = path.join("part", "2026-07-01__shared__h__shared.jsonl");
+    const abs = path.join(process.env.ARCHIVE_DIR, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, JSON.stringify(ent("x", "user", "shared line")) + "\n");
+    fs.writeFileSync(abs + ".meta", JSON.stringify({ transcriptId: "pg-sh-u", host: "plainsh" }));
+    const row = (id, host) => ({ transcriptId: id, host, filePath: rel, msgCount: 1,
+      bytesStored: 10, archiveBytes: fs.statSync(abs).size });
+    mem.upsertSession(row("pg-sh-a", `lap@${A}`));
+    mem.upsertSession(row("pg-sh-u", "plainsh"));
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    const raw = path.join(abs + ".raw", "pg-sh-a");
+    fs.mkdirSync(raw, { recursive: true });
+    fs.writeFileSync(path.join(raw, "pg-sh-a.jsonl"), "x");
+    archive.purgeTenant(A);
+    assert.ok(fs.existsSync(abs) && fs.existsSync(abs + ".meta"), "the shared file stays");
+    assert.ok(!fs.existsSync(abs + ".raw"), "the tenant's own raw dir and its emptied suffix dir go");
+    assert.equal(archive.sessionRow("pg-sh-a"), null);
+    assert.equal(archive.getTranscript("pg-sh-u").entries.length, 1, "the other row still reads");
+  } finally { pgTeardown(); }
+});

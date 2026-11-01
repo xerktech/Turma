@@ -1246,3 +1246,50 @@ test("XERK-2549: remove() drops a purged tree from the bucket and the local queu
   assert.deepEqual([...m._dirty], ["r/keep.jsonl"], "a purged key is never pushed back up");
   assert.equal(await m.remove("/somewhere/else"), 0, "a path outside ARCHIVE_DIR is ignored");
 });
+
+test("XERK-2549: a PUT in flight when a tenant is purged cannot re-create its object", async () => {
+  const root = mkdtemp("turma-mirror-race-");
+  const T = "c".repeat(32);
+  const store = memStore();
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const put = store.put.bind(store);
+  store.put = async (k, src) => { await gate; return put(k, src); };
+  const purged = new Set();
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {},
+    purgedKey: (k) => purged.has(k.split("/")[0].slice(1)) });
+  const file = path.join(root, `@${T}`, "r", "slow.jsonl");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "x");
+  m.note(file);
+  const draining = m.drain();
+  await new Promise((r) => setImmediate(r));   // the drain is now inside its PUT
+  purged.add(T);
+  fs.rmSync(path.join(root, `@${T}`), { recursive: true, force: true });
+  const removing = m.remove(path.join(root, `@${T}`));
+  release();
+  await draining;
+  await removing;
+  assert.deepEqual([...store.map.keys()], [], "remove waited out the PUT, then deleted it");
+  // A later note of the purged tree never pushes.
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "y");
+  m.note(file);
+  await m.drain();
+  assert.deepEqual([...store.map.keys()], []);
+});
+
+test("XERK-2549: a hydrate neither fetches nor keeps a purged tenant's leftover objects", async () => {
+  const root = mkdtemp("turma-mirror-leftover-");
+  const T = "e".repeat(32);
+  const store = memStore();
+  store.map.set(`@${T}/r/a.jsonl`, Buffer.from("x"));
+  store.map.set("r/keep.jsonl", Buffer.from("k"));
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {},
+    purgedKey: (k) => k.startsWith(`@${T}/`) });
+  await m.hydrate();
+  assert.ok(!fs.existsSync(path.join(root, `@${T}`)), "not downloaded");
+  assert.ok(fs.existsSync(path.join(root, "r", "keep.jsonl")));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual([...store.map.keys()], ["r/keep.jsonl"], "the leader deleted the leftover");
+});

@@ -5001,7 +5001,9 @@ let archivePurgedTenants = archivePurgedTenantsCoerce(readJsonFile(ARCHIVE_PURGE
 const persistArchivePurgedTenants = registerExternalStore({
   name: "archivePurgedTenants", file: ARCHIVE_PURGED_TENANTS_FILE, debounceMs: 0,
   coerce: archivePurgedTenantsCoerce, read: () => archivePurgedTenants,
-  install: (v) => { archivePurgedTenants = v; },
+  // A replica learning a tombstone (boot load, another replica's purge) deletes its
+  // own stale copy of that partition at once: a follower never walks the store.
+  install: (v) => { archivePurgedTenants = v; archive.reapPurgedPartitions(); },
 });
 archive.setTenantPurged((t) => Object.hasOwn(archivePurgedTenants, t));
 registerTenantPurge("archive", (t) => {
@@ -6179,6 +6181,11 @@ function setArchiveMirror(blobStore, ha) {
   archiveMirror = new ArchiveMirror({
     blobStore,
     archiveDir: archive.ARCHIVE_DIR,
+    // A purged tenant's partition keys (XERK-2549): skipped and reaped from the bucket.
+    purgedKey: (k) => {
+      const m = /^@([0-9a-f]{32})\//.exec(k);
+      return !!m && Object.hasOwn(archivePurgedTenants, m[1]);
+    },
     // When a Postgres INDEX of-record is wired (XERK-780), the index is HYDRATED
     // FROM POSTGRES by `hydrateArchive` below — so the byte-hydrate's own reindex is
     // a NO-OP, retiring the expensive per-pod file-walk-and-reparse that was the bulk
