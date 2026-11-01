@@ -423,6 +423,7 @@
   async function setAutoStart(siteKey, enabled) {
     const had = autoOn(autoMap, siteKey);
     const framesAtClick = frames.auto;
+    const ownedAtClick = sseOwns.auto;
     if (sseOpen) sseOwns.auto = true;   // the cached snapshot predates this flip
     autoMap = orgMapCopy(autoMap);
     if (enabled) autoMap[siteKey] = true; else delete autoMap[siteKey];
@@ -437,7 +438,9 @@
     } catch { /* network error — fall through to rollback */ }
     // A frame since the click is the hub's word: keep it over a rollback.
     if (!ok && frames.auto === framesAtClick) {
-      sseOwns.auto = false;   // a later snapshot may correct a lost response
+      // Give back only the ownership the click took: a frame from before the
+      // click still owns the map, so an older in-flight poll can't revert it.
+      sseOwns.auto = ownedAtClick;
       autoMap = orgMapCopy(autoMap);
       if (had) autoMap[siteKey] = true; else delete autoMap[siteKey];
       paint();
@@ -450,6 +453,7 @@
   async function setAutoMerge(siteKey, enabled) {
     const had = autoOn(mergeMap, siteKey);
     const framesAtClick = frames.merge;
+    const ownedAtClick = sseOwns.merge;
     if (sseOpen) sseOwns.merge = true;  // the cached snapshot predates this flip
     mergeMap = orgMapCopy(mergeMap);
     if (enabled) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
@@ -464,7 +468,9 @@
     } catch { /* network error — fall through to rollback */ }
     // A frame since the click is the hub's word: keep it over a rollback.
     if (!ok && frames.merge === framesAtClick) {
-      sseOwns.merge = false;   // a later snapshot may correct a lost response
+      // Give back only the ownership the click took: a frame from before the
+      // click still owns the map, so an older in-flight poll can't revert it.
+      sseOwns.merge = ownedAtClick;
       mergeMap = orgMapCopy(mergeMap);
       if (had) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
       paint();

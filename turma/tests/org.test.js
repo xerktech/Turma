@@ -752,6 +752,34 @@ test("XERK-2600: each click owns its own map, and only while the stream is up", 
   assert.doesNotMatch(slot.innerHTML, /org-chip-merge on/);
 });
 
+test("XERK-2600: a failed click gives back only the ownership it took", async () => {
+  const acme = "acme.atlassian.net", beta = "beta.atlassian.net";
+  for (const [set, ev, re] of [["setAutoStart", "autoStartOrgs", /org-chip-auto on/],
+                               ["setAutoMerge", "autoMergeOrgs", /org-chip-merge on/]]) {
+    global.fetch = () => Promise.resolve({ ok: false, status: 500 });
+    // Owned by a frame from before the click: an older poll stays ignored.
+    let { slot, click } = mountOrg();
+    const stale = { agents: [agent("a", acme), agent("b", beta)], autoStartOrgs: {}, autoMergeOrgs: {} };
+    Org.update(stale);
+    click("data-org-toggle", "");
+    let h = orgStream();
+    h[ev]({ data: JSON.stringify({ [acme]: true }) });
+    await Org[set](beta, true);
+    Org.update({ ...stale, autoStartOrgs: {}, autoMergeOrgs: {} });   // left before the frame
+    assert.match(slot.innerHTML, re, set + ": frame kept");
+    h.error();
+    // Owned only by the click: released, so the next snapshot is the hub's word.
+    ({ slot, click } = mountOrg());
+    Org.update({ agents: [agent("a", acme)], autoStartOrgs: {}, autoMergeOrgs: {} });
+    click("data-org-toggle", "");
+    h = orgStream();
+    await Org[set](acme, false);
+    Org.update({ agents: [agent("a", acme)], autoStartOrgs: { [acme]: true }, autoMergeOrgs: { [acme]: true } });
+    assert.match(slot.innerHTML, re, set + ": released");
+    h.error();
+  }
+});
+
 // ---- wiring: every page must actually obey it -------------------------------
 
 test("org: every page loads board.js, nav.js and org.js, in that order", () => {
