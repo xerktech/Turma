@@ -136,9 +136,11 @@ class FleetRepository(
      * than any poll already in flight.
      */
     fun patchMeeting(siteKey: String, row: com.xerktech.turma.model.Meeting) {
-        val list = meetingProposals[siteKey] ?: return
-        meetingsClock++
-        meetingProposals = meetingProposals + (siteKey to list.map { if (it.meetingId == row.meetingId) row else it })
+        synchronized(meetingsLock) {
+            val list = meetingProposals[siteKey] ?: return
+            meetingsClock++
+            meetingProposals = meetingProposals + (siteKey to list.map { if (it.meetingId == row.meetingId) row else it })
+        }
         emit(_state.value.now, null)
     }
 
@@ -189,7 +191,7 @@ class FleetRepository(
             epicBuilders = resp.epicBuilders
             dailyBriefs = resp.dailyBriefs
             dailyBriefSchedules = resp.dailyBriefSchedules
-            if (meetingsClock == since) meetingProposals = resp.meetingProposals
+            synchronized(meetingsLock) { if (meetingsClock == since) meetingProposals = resp.meetingProposals }
             // Don't let a late/stale poll drag the clock backward under the
             // records we just kept fresh (XERK-812) — same upward coercion upsert
             // uses for an SSE event.
@@ -258,6 +260,10 @@ class FleetRepository(
     // started before one keeps the newer map (the web page's XERK-444 merge).
     @Volatile
     private var meetingsClock = 0
+
+    // One writer at a time for meetingProposals + its clock: the SSE thread, a
+    // poll and a review answer each read-modify-write the map.
+    private val meetingsLock = Any()
 
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
@@ -384,7 +390,10 @@ class FleetRepository(
             // A meeting arrived, was read or reviewed (XERK-2508/2510); whole map.
             "meetingProposals" -> runCatching {
                 TurmaJson.decodeFromString(com.xerktech.turma.model.LenientMeetingsSerializer, data)
-            }.getOrNull()?.let { meetingsClock++; meetingProposals = it; emit(_state.value.now, null) }
+            }.getOrNull()?.let {
+                synchronized(meetingsLock) { meetingsClock++; meetingProposals = it }
+                emit(_state.value.now, null)
+            }
         }
     }
 

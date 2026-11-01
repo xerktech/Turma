@@ -1020,9 +1020,9 @@ those are marked `[MODEL]`.
 - **At parity (XERK-2511)**: the Meetings tab (`ui/MeetingsScreen.kt`) offers Approve / Approve +
   start / Edit / Reject / Log decision, the "New tickets go to" project pick and the same review
   states and refusal words. `meetingProposals` decodes PER MEETING (`LenientMeetingsSerializer`).
-- Platform differences: a created ticket's key is text, not a board link; quote/Tenir links open
-  the system browser. The project pick is kept per phone (SharedPreferences), as the web keeps it
-  per browser.
+- Platform differences: a created ticket's key and a "May duplicate" key are text, not board
+  links; quote/Tenir links open the system browser. The project pick is kept per phone
+  (SharedPreferences), as the web keeps it per browser.
 - Phone-only: the "N proposals from <meeting>" push (channel "Meeting proposals"); a tap opens
   the Meetings tab.
 

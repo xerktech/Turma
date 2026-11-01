@@ -52,6 +52,7 @@ import com.xerktech.turma.core.meetingProject
 import com.xerktech.turma.core.meetingReviewLines
 import com.xerktech.turma.core.meetingReviewable
 import com.xerktech.turma.core.meetingStatusLine
+import com.xerktech.turma.core.meetingsEmptyText
 import com.xerktech.turma.core.meetingsNeedProject
 import com.xerktech.turma.core.mergeSites
 import com.xerktech.turma.core.orgName
@@ -101,7 +102,7 @@ fun MeetingsScreen(modifier: Modifier = Modifier, vm: MeetingsViewModel = viewMo
         ScreenHeader("Meetings")
         if (orgs.isEmpty()) {
             Text(
-                "No meetings yet — when Tenir sends one, its proposed work items show up here.",
+                meetingsEmptyText(fleet.meetingProposals),
                 Modifier.padding(16.dp),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

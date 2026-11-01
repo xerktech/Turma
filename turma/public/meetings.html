@@ -324,7 +324,9 @@ function renderMeetings(data, force = false) {
   for (const s of sites) if (needsProject(own(data.meetingProposals, s))) ensureMeta(s);
   const html = sites.length
     ? sites.map((s) => orgHtml(s, own(data.meetingProposals, s), name(s))).join("")
-    : `<div class="mt-empty">No meetings yet — when Tenir sends one, its proposed work items show up here.</div>`;
+    : `<div class="mt-empty">${Object.values(data.meetingProposals || {}).some((l) => Array.isArray(l) && l.length)
+      ? "No meetings for the orgs picked in the header — pick All orgs to see the others."
+      : "No meetings yet — when Tenir sends one, its proposed work items show up here."}</div>`;
   if (html === painted) return;
   painted = html;
   TurmaNav.preserveScroll($list, () => { $list.innerHTML = html; });
@@ -392,6 +394,12 @@ async function review(k, action, start = false) {
   const hit = findItem(k);
   if (!hit) return;
   const { site, m, it } = hit;
+  // Busy from the first await, not the POST (XERK-2511 QA): while the project's
+  // types load, a second press — a Reject — must not post first and then be
+  // overtaken by this Approve, creating a ticket the operator rejected.
+  busy.add(k);
+  repaint(true);
+  const fail = (text) => { busy.delete(k); failItem(k, text); repaint(true); };
   const body = { action };
   if (action === "approve") {
     const e = edits.get(k);
@@ -400,18 +408,17 @@ async function review(k, action, start = false) {
     body.description = e ? e.description : (it.kind === "decision" ? it.description : ticketDescription(m, it));
     if (it.kind !== "decision") {
       const project = projectOf(site);
-      if (!project) return void failItem(k, "Pick a project for new tickets first");
+      if (!project) return void fail("Pick a project for new tickets first");
       await ensureTypes(site);
       const t = types.get(`${site}\u0000${project}`) || {};
-      if (t.error) return void failItem(k, `Approving failed — ${t.error}`);
+      if (t.error) return void fail(`Approving failed — ${t.error}`);
       const issueType = (e && e.issueType) || defaultType(it.kind, t.types);
-      if (!issueType) return void failItem(k, "That project offers no issue type to create");
+      if (!issueType) return void fail("That project offers no issue type to create");
       body.project = project;
       body.issueType = issueType;
       if (start) body.start = true;
     }
   }
-  busy.add(k);
   itemErr.delete(k);
   repaint(true);
   const what = action === "reject" ? "Rejecting" : it.kind === "decision" ? "Logging the decision" : "Approving";

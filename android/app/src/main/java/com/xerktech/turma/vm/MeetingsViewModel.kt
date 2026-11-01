@@ -186,59 +186,82 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val key = itemKey(siteKey, m.meetingId, it.id)
             if (key in _busy.value || !meetingReviewable(it)) return@launch
-            var body = MeetingReviewRequest(action = action)
-            if (action == "approve") {
-                val d = _drafts.value[key]
-                body = body.copy(
-                    title = d?.title ?: it.title,
-                    description = d?.description
-                        ?: if (it.kind == "decision") it.description else meetingTicketDescription(m, it),
-                    edited = if (d != null && (d.title != d.initialTitle || d.description != d.initialDescription)) true else null,
-                )
-                if (it.kind != "decision") {
-                    ensureMeta(siteKey)
-                    inflight[siteKey]?.join()
-                    val project = projectOf(siteKey)
-                    if (project.isEmpty()) {
-                        val err = (meta.value[siteKey] as? MetaState.Error)?.message
-                        return@launch fail(key, if (err != null) "Approving failed — $err" else "Pick a project for new tickets first")
-                    }
-                    ensureTypes(siteKey)?.join()
-                    val t = meta.value[typesKey(siteKey, project)]
-                    if (t is MetaState.Error) return@launch fail(key, "Approving failed — ${t.message}")
-                    val issueType = d?.issueType?.ifEmpty { null }
-                        ?: meetingDefaultType(it.kind, (t as? MetaState.Types)?.types.orEmpty())
-                    if (issueType.isEmpty()) return@launch fail(key, "That project offers no issue type to create")
-                    body = body.copy(project = project, issueType = issueType, start = if (start) true else null)
-                }
-            }
+            // Busy from the FIRST await, not the POST (XERK-2511 QA): while the
+            // project's types load, a Reject pressed now must not post first and
+            // then be overtaken by this Approve, creating a ticket it rejected.
             _busy.value = _busy.value + key
             _errors.value = _errors.value - key
-            val what = when {
-                action == "reject" -> "Rejecting"
-                it.kind == "decision" -> "Logging the decision"
-                else -> "Approving"
-            }
             val err = try {
-                val r = container.client.api.reviewMeetingItem(siteKey, m.meetingId, it.id, body)
-                val out = r.body()
-                when {
-                    !r.isSuccessful -> "$what failed — ${hubErrorMessage(r)}"
-                    out == null || !out.ok -> "$what failed — " + (out?.error?.ifBlank { null } ?: "the hub refused it")
-                    else -> {
-                        out.meeting?.let { row -> container.fleet.patchMeeting(siteKey, row) }
-                        null
-                    }
-                }
+                val body = prepare(siteKey, m, it, key, action, start)
+                if (body == null) null else post(siteKey, m, it, action, body)
             } catch (e: CancellationException) {
                 _busy.value = _busy.value - key
                 throw e
-            } catch (_: Exception) {
-                "$what failed — the hub is unreachable"
             }
             _busy.value = _busy.value - key
-            if (err != null) fail(key, err) else _drafts.value = _drafts.value - key
+            if (err != null) fail(key, err)
         }
+
+    /** The request body, or null after refusing it locally (the refusal already shown). */
+    private suspend fun prepare(
+        siteKey: String, m: Meeting, it: MeetingItem, key: String, action: String, start: Boolean,
+    ): MeetingReviewRequest? {
+        var body = MeetingReviewRequest(action = action)
+        if (action != "approve") return body
+        val d = _drafts.value[key]
+        body = body.copy(
+            title = d?.title ?: it.title,
+            description = d?.description
+                ?: if (it.kind == "decision") it.description else meetingTicketDescription(m, it),
+            edited = if (d != null && (d.title != d.initialTitle || d.description != d.initialDescription)) true else null,
+        )
+        if (it.kind == "decision") return body
+        ensureMeta(siteKey)
+        inflight[siteKey]?.join()
+        val project = projectOf(siteKey)
+        if (project.isEmpty()) {
+            val err = (meta.value[siteKey] as? MetaState.Error)?.message
+            return refuse(key, if (err != null) "Approving failed — $err" else "Pick a project for new tickets first")
+        }
+        ensureTypes(siteKey)?.join()
+        val t = meta.value[typesKey(siteKey, project)]
+        if (t is MetaState.Error) return refuse(key, "Approving failed — ${t.message}")
+        val issueType = d?.issueType?.ifEmpty { null }
+            ?: meetingDefaultType(it.kind, (t as? MetaState.Types)?.types.orEmpty())
+        if (issueType.isEmpty()) return refuse(key, "That project offers no issue type to create")
+        return body.copy(project = project, issueType = issueType, start = if (start) true else null)
+    }
+
+    private fun refuse(key: String, text: String): MeetingReviewRequest? {
+        fail(key, text)
+        return null
+    }
+
+    /** POST the review; null on success (the hub's row patched in), else the operator-facing error. */
+    private suspend fun post(siteKey: String, m: Meeting, it: MeetingItem, action: String, body: MeetingReviewRequest): String? {
+        val what = when {
+            action == "reject" -> "Rejecting"
+            it.kind == "decision" -> "Logging the decision"
+            else -> "Approving"
+        }
+        return try {
+            val r = container.client.api.reviewMeetingItem(siteKey, m.meetingId, it.id, body)
+            val out = r.body()
+            when {
+                !r.isSuccessful -> "$what failed — ${hubErrorMessage(r)}"
+                out == null || !out.ok -> "$what failed — " + (out?.error?.ifBlank { null } ?: "the hub refused it")
+                else -> {
+                    out.meeting?.let { row -> container.fleet.patchMeeting(siteKey, row) }
+                    _drafts.value = _drafts.value - itemKey(siteKey, m.meetingId, it.id)
+                    null
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            "$what failed — the hub is unreachable"
+        }
+    }
 
     private fun loadPicks(): Map<String, String> =
         prefs.all.mapNotNull { (k, v) -> (v as? String)?.let { k to it } }.toMap()

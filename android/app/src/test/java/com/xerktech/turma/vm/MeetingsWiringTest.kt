@@ -125,6 +125,64 @@ class MeetingsWiringTest {
         assertTrue(k !in vm.drafts.value)
     }
 
+    @Test fun `an editor opened but left unchanged is not an edit`() {
+        seed()
+        hub.json("/api/orgs/", """{ "ok": true }""")
+        val vm = main.track(MeetingsViewModel(hub.app))
+        val m = hub.container.fleet.state.value.meetingProposals.getValue(site).single()
+        vm.startEdit(site, m, m.items[1])
+        kotlinx.coroutines.runBlocking { vm.review(site, m, m.items[1], "approve").join() }
+        assertNull(body("/api/orgs/").edited)
+    }
+
+    @Test fun `a second press while an Approve awaits its types posts nothing`() {
+        seed()
+        val release = java.util.concurrent.CountDownLatch(1)
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [ { "key": "ENG" } ] }""")
+        hub.route("/api/jira/$site/create-meta?project=") {
+            release.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            MockResponse().setHeader("Content-Type", "application/json").setBody("""{ "types": [ { "id": "11", "name": "Bug" } ] }""")
+        }
+        val posts = java.util.concurrent.CopyOnWriteArrayList<String>()
+        hub.route("/api/orgs/") { r ->
+            posts += r.body.readUtf8()
+            MockResponse().setHeader("Content-Type", "application/json").setBody("""{ "ok": true }""")
+        }
+        val vm = main.track(MeetingsViewModel(hub.app))
+        val m = hub.container.fleet.state.value.meetingProposals.getValue(site).single()
+        val approve = vm.review(site, m, m.items[0], "approve")
+        assertTrue(MeetingsViewModel.itemKey(site, "m1", "p1") in vm.busy.value)
+        val reject = vm.review(site, m, m.items[0], "reject")
+        kotlinx.coroutines.runBlocking { reject.join() }
+        assertTrue(posts.isEmpty())
+        release.countDown()
+        kotlinx.coroutines.runBlocking { approve.join() }
+        assertEquals(1, posts.size)
+        assertTrue(posts.single().contains("\"approve\""))
+    }
+
+    @Test fun `a review answer patched in outlives a poll that started before it`() {
+        seed()
+        val fleet = hub.container.fleet
+        val release = java.util.concurrent.CountDownLatch(1)
+        val entered = java.util.concurrent.CountDownLatch(1)
+        hub.route("/api/agents") {
+            entered.countDown()
+            release.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            MockResponse().setHeader("Content-Type", "application/json").setBody(
+                """{ "now": 2, "agents": [ $host ], "meetingProposals": { "$site": [ ${meeting()} ] } }""")
+        }
+        val poll = kotlin.concurrent.thread { kotlinx.coroutines.runBlocking { fleet.refresh() } }
+        assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        val m = fleet.state.value.meetingProposals.getValue(site).single()
+        fleet.patchMeeting(site, m.copy(items = m.items.map {
+            if (it.id == "p1") it.copy(review = com.xerktech.turma.model.MeetingReview("rejected")) else it
+        }))
+        release.countDown()
+        poll.join(10_000)
+        assertEquals("rejected", fleet.state.value.meetingProposals.getValue(site).single().items[0].review?.state)
+    }
+
     @Test fun `a refusal is shown in the hub's words and keeps the item reviewable`() {
         seed()
         hub.json("/api/orgs/", """{ "error": "that proposal's ticket is already being created" }""", code = 409)

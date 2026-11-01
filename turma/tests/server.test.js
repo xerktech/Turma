@@ -29289,6 +29289,12 @@ test("XERK-2511: proposals ready push once per meeting, never for an empty one o
   const c2 = meetCmds2508("mtP2511").find((c) => c.meetingId === "n2");
   await meetResult2508("mtP2511", S, c2, { status: "ok", items: [] });
   assert.equal(notifications.filter((n) => n.title != null).length, 1);
+  // A failed run (retried, then settled failed: one host) never pushes either.
+  await postMeeting2508(S, meeting2508("n4", { title: "Broken" }));
+  const c4 = meetCmds2508("mtP2511").find((c) => c.meetingId === "n4");
+  await meetResult2508("mtP2511", S, c4, { status: "failed", error: "claude -p timed out" });
+  assert.equal(hub.getMeetings()[S].find((m) => m.meetingId === "n4").status, "failed");
+  assert.equal(notifications.filter((n) => n.title != null).length, 1);
   // One proposal reads singular.
   await postMeeting2508(S, meeting2508("n3", { title: "1:1" }));
   const c3 = meetCmds2508("mtP2511").find((c) => c.meetingId === "n3");

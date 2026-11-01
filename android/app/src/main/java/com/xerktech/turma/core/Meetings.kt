@@ -145,6 +145,17 @@ fun meetingStatusLine(m: Meeting): Pair<String, Boolean>? = when {
 fun meetingsNeedProject(list: List<Meeting>): Boolean =
     list.any { m -> m.status == "ok" && m.items.any { it.kind != "decision" && meetingReviewable(it) } }
 
+/**
+ * The empty state. Meetings scoped out by the header's org pick (a push tapped
+ * while another org is picked) say so, rather than "no meetings yet".
+ */
+fun meetingsEmptyText(map: Map<String, List<Meeting>>): String =
+    if (map.values.any { it.isNotEmpty() }) {
+        "No meetings for the orgs picked in the header — pick All orgs to see the others."
+    } else {
+        "No meetings yet — when Tenir sends one, its proposed work items show up here."
+    }
+
 /** The orgs the screen shows: those with meetings, inside the header's scope (empty = all). */
 fun meetingOrgs(map: Map<String, List<Meeting>>, scoped: Set<String>): List<String> =
     map.filter { (k, v) -> v.isNotEmpty() && (scoped.isEmpty() || k in scoped) }.keys.sorted()

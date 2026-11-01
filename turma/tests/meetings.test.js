@@ -174,3 +174,17 @@ test("XERK-2510: a refusal reaches the operator in the hub's words; review state
   assert.match(P.list(), /Reading the captions on k8x-02/);
   assert.match(P.list(), /Could not propose work items — timed out/);
 });
+
+test("XERK-2511: a second press while an Approve awaits its issue types posts nothing", async () => {
+  const P = loadPage((u, init) => (init.method === "POST" ? { ok: true } : META(u)));
+  P.setCache(data());
+  P.renderMeetings(data());
+  await P.settle();
+  const k = P.itemKey(SITE, "m1", "p1");
+  const approving = P.review(k, "approve"); // awaits the project's types before its POST
+  assert.match(P.list(), /aria-disabled="true"[^>]*>Working…</, "busy from the first await");
+  await P.review(k, "reject"); // a Reject in that window must not post, then be overtaken
+  await approving;
+  await P.settle();
+  assert.deepEqual(P.fetches.filter((f) => f.method === "POST").map((f) => f.body.action), ["approve"]);
+});

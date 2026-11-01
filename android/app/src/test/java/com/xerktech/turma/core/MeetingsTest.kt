@@ -99,6 +99,13 @@ class MeetingsTest {
         assertFalse(meetingsNeedProject(listOf(m.copy(status = "running", items = listOf(task)))))
     }
 
+    @Test fun `an empty screen says when the header's pick hides meetings`() {
+        assertEquals("No meetings yet — when Tenir sends one, its proposed work items show up here.",
+            meetingsEmptyText(mapOf("a" to emptyList())))
+        assertEquals("No meetings for the orgs picked in the header — pick All orgs to see the others.",
+            meetingsEmptyText(mapOf("a" to listOf(m))))
+    }
+
     @Test fun `orgs shown are those with meetings inside the header's scope`() {
         val map = mapOf("b" to listOf(m), "a" to listOf(m), "c" to emptyList())
         assertEquals(listOf("a", "b"), meetingOrgs(map, emptySet()))
