@@ -25,24 +25,36 @@ Tenancy model: `turma-tenancy.md`. Decision: `docs/multi-tenant-adr.md` ("an adm
 - The handler block is `url.pathname.startsWith("/api/admin/")`, not a `parts[...]` test: the
   route-table test scans those and would read the block itself as a route.
 
+## Writes are same-origin JSON, and never from an open hub
+
+- A write (POST/PUT/PATCH/DELETE) is refused cross-site (`sameOriginUpgrade`, 403) and needs
+  `content-type: application/json` (415): the hub parses any body as JSON, and a cross-site form
+  rides the Lax cookie on a top-level POST.
+- **An open hub (no login configured) refuses every admin write (409)**: its principal is an admin
+  for EVERY caller, and creating a local account closes the hub — an anonymous caller (or any web
+  page, by CSRF) took the hub over that way (QA).
+
 ## Self-protection
 
 - An admin cannot disable or delete its OWN account (409).
 - A change that leaves no enabled admin AND no break-glass is refused (`adminWayInRemains`, 409):
-  disable, regroup, delete and the group map all check it.
+  disable, regroup, delete and the group map all check it. An SSO admin counts only while OIDC is
+  configured (with it off nobody signs in that way). Tests: `admin-nopassword.test.js`.
 - SSO users: no password reset, no rename (the IdP owns both); their local groups ARE editable.
 
 ## Deleting a user deletes its tenant (`deleteUserAndTenant`), in this order
 
-1. Disable the user (every cookie stops naming anybody).
-2. Queue a `kill` for each running/queued session on its hosts and wait (bounded,
-   `ADMIN_DELETE_KILL_WAIT_MS`, 20s) for each online host to TAKE it — kills ride the next beat,
-   which a revoked token can no longer make, so kills always go BEFORE the revoke.
-3. Revoke every agent identity of the tenant (a roll-bound one becomes a tombstone at its plain
-   origin, the XERK-2383 rule) and bump that origin's name-token generation; cut their tunnels;
-   drop their registry records.
-4. Delete the tenant's enrollment codes. 5. `purgeTenantData` (the ticket queue, ledgers, archive,
-   org stores — every registered purge). 6. Drop the user record.
+1. Close every way in: disable the user, delete its enrollment codes, and run the purges that
+   dispatch new work (`ADMIN_DELETE_EARLY_PURGES`: ticket queue, auto-start, epic runs/builders).
+   While it runs the tenant is in `tenantsBeingDeleted`: a re-enable is 409 and no code of it
+   redeems. A code also never redeems once its owner is disabled or lost the user role.
+2. Queue a `kill` for each live session on its hosts, RE-SCANNED until the wait ends (bounded,
+   `ADMIN_DELETE_KILL_WAIT_MS`, 20s), so a session or host appearing meanwhile is killed too. Kills
+   ride the next beat, which a revoked token can no longer make, so they always go BEFORE the revoke.
+3. Revoke every agent identity of the tenant, read AFTER the wait (a roll-bound one becomes a
+   tombstone at its plain origin, the XERK-2383 rule) and bump that origin's name-token generation;
+   cut their tunnels; drop their registry records.
+4. `purgeTenantData` (ledgers, archive, org stores — every registered purge). 5. Drop the user record.
 - A store that holds a tenant's data registers a purge (`registerTenantPurge`); never special-case
   it here.
 - Single-flight per user (`adminDeletesInFlight`).

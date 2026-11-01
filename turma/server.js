@@ -3322,9 +3322,12 @@ function adminGroupsView() {
 // user holding the admin role. Refusing a change that strands the hub with no
 // admin is the panel's one self-protection (the operator can still fix it from
 // the pod, but that is exactly the trip the panel exists to save).
-function adminWayInRemains(next) {
-  if (breakGlassEnabled()) return true;
-  return Object.values(next.users).some((u) => !u.disabled && tenancy.effectiveRoles(next, u).includes("admin"));
+// An SSO user counts only while OIDC is configured: with it off nobody can sign
+// in that way, whatever role its last login recorded (QA).
+function adminWayInRemains(next, breakGlass = breakGlassEnabled(), oidc = OIDC_ENABLED) {
+  if (breakGlass) return true;
+  return Object.values(next.users).some((u) => !u.disabled && (u.source === "local" || oidc) &&
+    tenancy.effectiveRoles(next, u).includes("admin"));
 }
 const ADMIN_STRANDED = "that would leave no administrator able to sign in (and no break-glass login is set)";
 
@@ -3343,7 +3346,14 @@ const ADMIN_STRANDED = "that would leave no administrator able to sign in (and n
 // kill in time) still has its token revoked, so whatever runs there can never
 // report back into the hub again.
 const ADMIN_DELETE_KILL_WAIT_MS = positiveEnv("ADMIN_DELETE_KILL_WAIT_MS", 20000);
-const adminDeletesInFlight = new Set();
+const adminDeletesInFlight = new Set(); // user ids
+const tenantsBeingDeleted = new Set(); // their tenant ids: no re-enable, no new host meanwhile
+// A session the hub can still stop: anything not already ended.
+const ADMIN_KILLABLE = new Set(["running", "queued", "cloning", "starting"]);
+// The purges that stop NEW work landing in the tenant while its kills are in
+// flight (dispatches from the queue, an epic run or builder, the auto-start
+// sweep). The rest run after the kills, in the full purge.
+const ADMIN_DELETE_EARLY_PURGES = ["ticketQueue", "autoStartOrgs", "epicRuns", "epicBuilders"];
 async function deleteUserAndTenant(p, id) {
   const user = Object.hasOwn(tenancyState.users, id) ? tenancyState.users[id] : null;
   if (!user) return { status: 404, error: "no such user" };
@@ -3353,18 +3363,34 @@ async function deleteUserAndTenant(p, id) {
   const rest = tenancy.deleteUser(tenancyState, id);
   if (!adminWayInRemains(rest)) return { status: 409, error: ADMIN_STRANDED };
   adminDeletesInFlight.add(id);
+  tenantsBeingDeleted.add(t);
   try {
+    // 1. Close every way in: the user's sessions, its unredeemed enrollment codes
+    // (a code minted earlier must not enroll a host mid-delete), and what would
+    // dispatch new work into the tenant.
     if (!user.disabled) setTenancy(tenancy.updateUser(tenancyState, id, { disabled: true }).state);
-    // 2. kill the live sessions on the tenant's hosts.
-    const hosts = Object.keys(agents).filter((k) => tenantOfKey(k) === t);
-    const kills = [];
-    for (const key of hosts) {
-      for (const s of agents[key].sessions || []) {
-        if (s && (s.status === "running" || s.status === "queued") && typeof s.id === "string") {
-          kills.push({ key, cmdId: queueCommand(key, { type: "kill", sessionId: s.id }) });
+    let codes = 0;
+    for (const [cid, rec] of Object.entries(enrollCodes)) {
+      if (rec && rec.tenantId === t) { delete enrollCodes[cid]; codes += 1; }
+    }
+    if (codes) persistEnrollCodes();
+    for (const name of ADMIN_DELETE_EARLY_PURGES) {
+      const fn = tenantPurges.get(name);
+      if (fn) try { fn(t); } catch (e) { console.error(`tenant purge: ${name} failed: ${(e && e.message) || e}`); }
+    }
+    // 2. Kill every live session on the tenant's hosts. Re-scanned until the wait
+    // ends, so a host or session that appears meanwhile is killed too.
+    const tenantHosts = () => Object.keys(agents).filter((k) => tenantOfKey(k) === t);
+    const kills = new Map(); // `${key}\0${sid}` -> {key, cmdId}
+    const queueKills = () => {
+      for (const key of tenantHosts()) {
+        for (const s of agents[key].sessions || []) {
+          if (!s || typeof s.id !== "string" || !ADMIN_KILLABLE.has(s.status)) continue;
+          const k = `${key}\0${s.id}`;
+          if (!kills.has(k)) kills.set(k, { key, cmdId: queueCommand(key, { type: "kill", sessionId: s.id }) });
         }
       }
-    }
+    };
     const taken = (k) => {
       const a = agents[k.key];
       if (!a || Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) return true; // offline: nothing to wait for
@@ -3372,16 +3398,21 @@ async function deleteUserAndTenant(p, id) {
       return !c || !!c.deliveredAt;
     };
     const deadline = Date.now() + ADMIN_DELETE_KILL_WAIT_MS;
-    while (kills.length && !kills.every(taken) && Date.now() < deadline) {
+    queueKills();
+    while (kills.size && Date.now() < deadline) {
+      if ([...kills.values()].every(taken)) break;
       await new Promise((r) => setTimeout(r, 200));
+      queueKills();
     }
-    const killsDelivered = kills.filter((k) => {
+    queueKills(); // whatever reported in the last poll still gets its command
+    const killsDelivered = [...kills.values()].filter((k) => {
       const a = agents[k.key];
       const c = a && (a.commands || []).find((x) => x.cmdId === k.cmdId);
       return a && (!c || !!c.deliveredAt);
     }).length;
-    // 3. revoke the tenant's agent identities (+ the name tokens of plain names a
-    // roll bound in), cut their tunnels, drop their records.
+    // 3. Revoke the tenant's agent identities (+ the name tokens of plain names a
+    // roll bound in), cut their tunnels, drop their records — read NOW, after the
+    // wait, so a host enrolled during it goes too.
     let identitiesRevoked = 0;
     const plainOrigins = new Set();
     for (const [uid, e] of Object.entries(agentIdentities)) {
@@ -3405,6 +3436,7 @@ async function deleteUserAndTenant(p, id) {
       dropTermAgents(key);
       try { controlChannels[key].socket.destroy(); } catch { /* gone */ }
     }
+    const hosts = tenantHosts();
     for (const key of hosts) {
       delete agents[key];
       recordBytes.delete(key);
@@ -3412,26 +3444,21 @@ async function deleteUserAndTenant(p, id) {
       sseBroadcast("removed", { key });
     }
     scheduleSave();
-    // 4. its enrollment codes (the ticket queue is a registered purge below).
-    let codes = 0;
-    for (const [cid, rec] of Object.entries(enrollCodes)) {
-      if (rec && rec.tenantId === t) { delete enrollCodes[cid]; codes += 1; }
-    }
-    if (codes) persistEnrollCodes();
-    // 5. every store's own purge, then 6. the record itself.
+    // 4. Every store's own purge, then 5. the record itself.
     const purge = purgeTenantData(t);
     setTenancy(tenancy.deleteUser(tenancyState, id));
     invalidateAgentsCache();
     return {
       status: 200,
       body: {
-        ok: true, hosts: hosts.length, sessionsKilled: kills.length, killsDelivered,
+        ok: true, hosts: hosts.length, sessionsKilled: kills.size, killsDelivered,
         identitiesRevoked, nameTokens, enrollCodes: codes,
         purge: Object.fromEntries(Object.entries(purge).map(([k, v]) => [k, v && v.error ? "failed" : "ok"])),
       },
     };
   } finally {
     adminDeletesInFlight.delete(id);
+    tenantsBeingDeleted.delete(t);
   }
 }
 // Whitelist, field by field (a hand-edited file or a remote replica's value).
@@ -15496,6 +15523,13 @@ function consumeEnrollCode(code, device, now = Date.now(), check = false) {
   // The host joins the code OWNER's tenant (XERK-2533) — never one the agent
   // names: its registry key and identity are minted inside that tenant.
   const tenantId = typeof rec.tenantId === "string" && TENANT_ID_RE.test(rec.tenantId) ? rec.tenantId : "";
+  // A tenant's code is good only while a user of that tenant can still use it
+  // (XERK-2552): never once its owner was disabled, lost the user role, or is
+  // being deleted — else a code minted earlier enrolls a host nobody owns.
+  if (tenantId && (tenantsBeingDeleted.has(tenantId) || !Object.values(tenancyState.users).some((u) =>
+    u.tenantId === tenantId && !u.disabled && tenancy.effectiveRoles(tenancyState, u).includes("user")))) {
+    return { status: 410, body: { error: "the account this enrollment code belongs to can no longer add hosts — mint a new one" } };
+  }
   const refusal = enrollNameRefusal(device, tenantId);
   if (refusal) return { status: refusal.status, body: { error: refusal.error } };
   const key = tenantHostKey(device, tenantId);
@@ -22347,6 +22381,22 @@ const server = http.createServer(async (req, res) => {
           return v && typeof v === "object" && !Array.isArray(v) ? v : null;
         } catch { return null; }
       };
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        // A write must come from the hub's own page: a cross-site form or fetch
+        // carries the operator's cookie (SameSite=Lax still sends it on a
+        // top-level POST) and the hub reads any body as JSON.
+        if (!sameOriginUpgrade(req)) return json(res, 403, { error: "cross-site request refused" });
+        const ct = String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+        if (req.method !== "DELETE" && ct !== "application/json") {
+          return json(res, 415, { error: "send the body as application/json" });
+        }
+        // An open hub (no login configured) makes every caller an admin, and a
+        // local account would close it: never let an anonymous caller do that.
+        if (p && p.kind === "open") {
+          return json(res, 409, { error: "this hub has no login configured, so anyone could manage its users — " +
+            "set TURMA_PASSWORD or TURMA_BOOTSTRAP_ADMIN_USER/_PASSWORD first" });
+        }
+      }
       if (req.method === "GET" && url.pathname === "/api/admin/users") {
         const users = Object.values(tenancyState.users).map(adminUserView)
           .sort((a, b) => a.name.localeCompare(b.name));
@@ -22404,6 +22454,7 @@ const server = http.createServer(async (req, res) => {
         const said = [];
         if (body.disabled !== undefined) {
           if (typeof body.disabled !== "boolean") return json(res, 400, { error: "disabled must be true or false" });
+          if (tenantsBeingDeleted.has(target.tenantId)) return json(res, 409, { error: "that user is being deleted" });
           if (body.disabled && p && p.kind === "user" && p.userId === target.id) {
             return json(res, 409, { error: "you cannot disable your own account" });
           }

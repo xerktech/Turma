@@ -258,3 +258,84 @@ test("XERK-2552: deleting a user kills its sessions, revokes its hosts, cancels 
   assert.equal(row.actor, "break-glass");
   assert.equal((await request("DELETE", `/api/admin/users/${leaver.id}`, { headers: BASIC })).status, 404);
 });
+
+test("XERK-2552 QA: an admin write must be same-origin JSON (no cross-site form or text/plain post)", async () => {
+  const body = { username: "csrfuser", password: "longenough1" };
+  const evil = await request("POST", "/api/admin/users", { headers: { ...BASIC, origin: "https://evil.example" }, body });
+  assert.equal(evil.status, 403);
+  const data = JSON.stringify(body);
+  const plain = await new Promise((resolve, reject) => {
+    const req = http.request(baseUrl + "/api/admin/users", { method: "POST",
+      headers: { ...BASIC, "content-type": "text/plain", "content-length": Buffer.byteLength(data) } },
+    (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); });
+    req.on("error", reject); req.end(data);
+  });
+  assert.equal(plain, 415);
+  assert.equal(userOf("csrfuser"), undefined);
+  // The hub's own page (Origin = its host) is fine.
+  const own = await request("POST", "/api/admin/users", { headers: { ...BASIC, origin: baseUrl }, body });
+  assert.equal(own.status, 200, own.raw);
+});
+
+test("XERK-2552 QA: a disabled owner's enrollment code no longer enrolls a host", async () => {
+  await addUser("codeowner", ["turma-users"]);
+  const h = await cookieFor("codeowner", "codeowner-password");
+  const code = await request("POST", "/api/enroll-codes", { headers: h, body: {} });
+  assert.equal(code.status, 200);
+  const u = userOf("codeowner");
+  assert.equal((await request("PATCH", `/api/admin/users/${u.id}`, { headers: BASIC, body: { disabled: true } })).status, 200);
+  const en = await request("POST", "/api/agent/enroll", { body: { code: code.body.code, device: "orphanbox" } });
+  assert.equal(en.status, 410, en.raw);
+});
+
+test("XERK-2552 QA: a delete kills sessions that appear during its wait, refuses a re-enable, and leaves no late host", async () => {
+  await addUser("racer", ["turma-users"]);
+  const racer = userOf("racer");
+  const t = racer.tenantId;
+  const h = await cookieFor("racer", "racer-password");
+  const mint = async () => (await request("POST", "/api/enroll-codes", { headers: h, body: {} })).body.code;
+  const en = await request("POST", "/api/agent/enroll", { body: { code: await mint(), device: "racebox" } });
+  const spare = await mint();
+  const token = en.body.token;
+  let sessions = [{ id: "r1", status: "running" }];
+  const beat = () => request("POST", "/api/heartbeat", {
+    headers: { authorization: `Bearer ${token}` }, body: { device: "racebox", sessions },
+  });
+  assert.equal((await beat()).status, 200);
+  const pending = request("DELETE", `/api/admin/users/${racer.id}`, { headers: BASIC });
+  await new Promise((r) => setTimeout(r, 50));
+  // Mid-delete: a re-enable is refused, a code minted before it enrolls nothing.
+  assert.equal((await request("PATCH", `/api/admin/users/${racer.id}`, { headers: BASIC, body: { disabled: false } })).status, 409);
+  const late = await request("POST", "/api/agent/enroll", { body: { code: spare, device: "latebox" } });
+  assert.ok(late.status >= 400, `a pre-delete code must not enroll (got ${late.status})`);
+  // A second session shows up on the next beat.
+  sessions = [{ id: "r1", status: "running" }, { id: "r2", status: "running" }];
+  const killed = new Set();
+  for (let i = 0; i < 25 && killed.size < 2; i++) {
+    const b = await beat();
+    if (b.status !== 200) break;
+    for (const c of b.body.commands || []) if (c.type === "kill") killed.add(c.sessionId);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.deepEqual([...killed].sort(), ["r1", "r2"], "both sessions were killed");
+  const del = await pending;
+  assert.equal(del.status, 200, del.raw);
+  assert.equal(del.body.sessionsKilled, 2);
+  assert.ok(!Object.keys(hub.agents).some((k) => k.endsWith(`@${t}`)), "no host of the tenant remains");
+});
+
+test("XERK-2552 QA: a roll-bound host keeps a tombstone at its plain name and its name token is revoked", async () => {
+  await addUser("roller", ["turma-users"]);
+  const u = userOf("roller");
+  const uid = "c".repeat(32);
+  hub.agentIdentities()[uid] = { origin: "plainhost", home: `plainhost@${u.tenantId}`, at: 1, tenantId: u.tenantId, used: true };
+  const before = hub.nameTokenGen("plainhost");
+  const del = await request("DELETE", `/api/admin/users/${u.id}`, { headers: BASIC });
+  assert.equal(del.status, 200, del.raw);
+  const e = hub.agentIdentities()[uid];
+  assert.ok(e && e.revoked === true, "kept as a tombstone");
+  assert.equal(e.home, "plainhost");
+  assert.equal(e.tenantId, undefined);
+  assert.equal(hub.nameTokenGen("plainhost"), before + 1, "the plain name's token generation was bumped");
+  assert.equal(del.body.nameTokens.revoked, 1);
+});
