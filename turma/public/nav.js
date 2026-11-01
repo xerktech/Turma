@@ -130,19 +130,22 @@
   // While the note shows, re-ask: the first host enrolling makes this account a
   // fleet operator, and the note must not sit above that host until a reload
   // (Android re-checks against every fleet poll). Stops once the note is gone.
+  // A failed RE-check (a hub mid-rollout, a dropped connection) keeps the loop
+  // going, as Android retries a 5xx; only a first load that fails gives up.
   const ME_RECHECK_MS = 15000;
-  function loadMe(doc) {
+  function loadMe(doc, rechecking = false) {
     const win = doc.defaultView;
     const f = win && win.fetch;
-    if (typeof f !== "function") return;
-    f.call(win, "/api/me", { credentials: "same-origin" })
+    if (typeof f !== "function") return Promise.resolve();
+    const again = () => { if (typeof win.setTimeout === "function") win.setTimeout(() => loadMe(doc, true), ME_RECHECK_MS); };
+    return f.call(win, "/api/me", { credentials: "same-origin" })
       .then((r) => (r.ok ? r.json() : null))
       .then((me) => {
-        if (!me) return;
+        if (!me) { if (rechecking) again(); return; }
         applyMe(doc, me);
-        if (me.adminOnly === true && typeof win.setTimeout === "function") win.setTimeout(() => loadMe(doc), ME_RECHECK_MS);
+        if (me.adminOnly === true) again();
       })
-      .catch(() => {}); // an older hub 404s it: nothing to show
+      .catch(() => { if (rechecking) again(); }); // an older hub 404s it: nothing to show
   }
 
   // Mount into the page's placeholders. `data-page` on the <header> picks the
@@ -313,7 +316,7 @@
   }
 
   const api = { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, esc, preserveScroll, toast, refusalText,
-    meLabel, adminOnlyNoteHtml, applyMe, ADMIN_ONLY_NOTE };
+    meLabel, adminOnlyNoteHtml, applyMe, loadMe, ADMIN_ONLY_NOTE };
   if (typeof window !== "undefined") window.TurmaNav = api;
   // Guarded on `document`, not `window`: a test can put a stand-in on a fake
   // global `window` before requiring this and still drive mount() itself.
