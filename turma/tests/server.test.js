@@ -117,6 +117,7 @@ process.env.DAILY_BRIEF_SCHEDULES_FILE = path.join(scratchDir(), `turma-test-dai
 process.env.DAILY_BRIEFS_FILE = path.join(scratchDir(), `turma-test-daily-briefs-${process.pid}.json`);
 process.env.MEETING_PROPOSALS_FILE = path.join(scratchDir(), `turma-test-meeting-proposals-${process.pid}.json`);
 process.env.MEETING_TOKENS_FILE = path.join(scratchDir(), `turma-test-meeting-tokens-${process.pid}.json`);
+process.env.ARCHIVE_PURGED_TENANTS_FILE = path.join(scratchDir(), `turma-test-archive-purged-${process.pid}.json`);
 process.env.DEDUPE_LINK_ORGS_FILE = path.join(scratchDir(), `turma-test-dedupe-link-orgs-${process.pid}.json`);
 process.env.EPIC_BUILDERS_FILE = path.join(scratchDir(), `turma-test-epic-builders-${process.pid}.json`);
 process.env.EPIC_RUNS_FILE = path.join(scratchDir(), `turma-test-epic-runs-${process.pid}.json`);
@@ -29756,6 +29757,7 @@ test("XERK-2550: purgeTenantData removes the tenant's ledger rows and policy, no
     assert.deepEqual(again.usageLedger, { hosts: 1 });
   } finally {
     hub.registerTenantPurge("broken2550", () => ({}));
+    hub.__resetArchivePurgedTenants();
     hub.usageLedger.forget(`u2550@${TA}`);
     hub.usageLedger.forget(`u2550@${TB}`);
     hub.permissionLedger._internals.reset();
@@ -29984,6 +29986,7 @@ test("XERK-2551: purging a tenant removes all of its org data and nobody else's"
     assert.ok(!(SB in autoStartOrgs));
     assert.throws(() => hub.purgeTenantData("nope"));
   } finally {
+    hub.__resetArchivePurgedTenants();
     hub.registerTenantPurge("t2551boom", () => 0);
     for (const k of [SA, SB]) { delete autoStartOrgs[k]; delete hub.getDecisions()[k]; }
     for (const k of Object.keys(hub.ticketAgents)) if (k.includes("acme2551")) delete hub.ticketAgents[k];
@@ -30199,4 +30202,41 @@ test("XERK-2553: /api/me names the caller and never an id", async () => {
     assert.equal((await request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: "me2553-host" } })).status, 200);
     assert.equal((await request("GET", "/api/me", { headers: userHeaders })).body.adminOnly, false);
   } finally { T.restore(); }
+});
+
+test("XERK-2549: a session's archived scrollback is served only inside its host's tenant; purge drops the archive", async () => {
+  const T = tenants2533();
+  const archive = require("../archive.js");
+  try {
+    const { ka, kb, ta, tb, sa } = await fleet2534(T);
+    const meta = { remoteKey: "github.com/x/r", repo: "r", worktree: "/w/t2549",
+      slug: "-w-t2549", createdAt: "2026-08-30T00:00:00Z", summary: "Tenant A secret" };
+    const list = [{ uuid: "s1", role: "user", ts: "2026-08-30T00:00:00Z", text: "tenant A secret" }];
+    archive.ingestChunk(ka, "tid-2549a", meta, 0, Buffer.byteLength(JSON.stringify(list)), list, sa);
+    assert.ok(archive.sessionRow("tid-2549a").filePath.startsWith(`@${T.A.t}`));
+    // Tenant B's agent claims A's transcript id for one of its own sessions.
+    const running = (id) => ({ sessions: [{ id, status: "running", repo: "r", worktreePath: "/w/t2549",
+      transcriptId: "tid-2549a", session: { transcriptAgeSec: 1 } }] });
+    assert.equal((await beat2533(tb, "t2534h", running("sb2549"))).status, 200);
+    const fromB = await request("GET", `/api/agents/${encodeURIComponent(kb)}/sessions/sb2549/history`,
+      { headers: T.B.h });
+    assert.notEqual(fromB.body.fromArchive, true, "B never reads A's archived conversation");
+    assert.ok(!JSON.stringify(fromB.body).includes("tenant A secret"));
+    // A's own host is served it.
+    assert.equal((await beat2533(ta, "t2534h", running("sa2549"))).status, 200);
+    const fromA = await request("GET", `/api/agents/${encodeURIComponent(ka)}/sessions/sa2549/history`,
+      { headers: T.A.h });
+    assert.equal(fromA.body.fromArchive, true);
+    assert.equal(fromA.body.entries[0].text, "tenant A secret");
+    // The archive is part of the one tenant purge.
+    const out = hub.purgeTenantData(T.A.t);
+    assert.equal(out.archive.transcripts, 1);
+    assert.equal(archive.sessionRow("tid-2549a"), null);
+    assert.ok(Object.hasOwn(hub.archivePurgedTenantsState(), T.A.t), "tombstoned for every replica");
+    assert.ok(!fs.existsSync(path.join(process.env.ARCHIVE_DIR, `@${T.A.t}`)));
+  } finally {
+    hub.__resetArchivePurgedTenants();
+    forget2534(T);
+    T.restore();
+  }
 });

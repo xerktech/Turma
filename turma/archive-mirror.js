@@ -178,6 +178,35 @@ class ArchiveMirror {
     return this._dirty.size;
   }
 
+  // archive.js's purge sink (XERK-2549): the of-record copy of `absPath` — a file,
+  // or a directory with everything under it — must go. SYNC part: forget every key
+  // at or under it in the local queues, so nothing re-pushes or re-fetches it.
+  // ASYNC part (fire-and-forget, logged): delete the bucket objects. A failed delete
+  // is logged, not retried; the purge's tombstone keeps every replica from
+  // re-indexing what is left (archive.js `setTenantPurged`).
+  remove(absPath) {
+    const key = this.keyFor(absPath);
+    if (!key) return Promise.resolve(0);
+    const under = (k) => k === key || k.startsWith(key + "/");
+    for (const k of [...this._dirty]) if (under(k)) this._dirty.delete(k);
+    for (const k of [...this._rawWanted]) if (under(k)) this._rawWanted.delete(k);
+    for (const k of [...this._blocked.keys()]) if (under(k)) this._blocked.delete(k);
+    for (const [root, map] of [...this._rawPending]) {
+      if (under(root)) { this._rawPending.delete(root); continue; }
+      for (const k of [...map.keys()]) if (under(k)) map.delete(k);
+    }
+    return (async () => {
+      let n = 0;
+      try {
+        const keys = (await this.blobStore.list(key + "/")).filter(under);
+        for (const k of [key, ...keys]) { await this.blobStore.del(k); n++; }
+      } catch (e) {
+        this.log(`archive mirror: purge of ${key} failed after ${n} objects: ${e && e.message}`);
+      }
+      return n;
+    })();
+  }
+
   // Push every dirty file to the blob store. Best-effort per file: a failed push
   // is re-queued for the next drain. Serialized so two workers never overlap.
   //
@@ -775,7 +804,10 @@ class ArchiveMirror {
 // RAW_DIR_SUFFIX / isRawDir rule — or null for a rendered-layer key.
 function rawRootOf(key) {
   const parts = String(key).split("/");
-  for (let i = 1; i < parts.length - 1; i++) {
+  // A tenant partition (`@<32 hex>/`, XERK-2549) is a root of its own: its repo
+  // folder is the component archive.js's depth guard protects, so skip both.
+  const first = /^@[0-9a-f]{32}$/.test(parts[0]) ? 2 : 1;
+  for (let i = first; i < parts.length - 1; i++) {
     if (parts[i].endsWith(".jsonl.raw")) return parts.slice(0, i + 1).join("/");
   }
   return null;

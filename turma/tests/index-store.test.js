@@ -189,6 +189,7 @@ class MemIndexStore {
         if (this.dropRepairs) return;           // a lost mirror op (pod died, retries spent)
         this.replaceEntries(t, e); this.setCounts(t, n, b); if (done) done();
       },
+      remove: (t) => this.deleteTranscript(t),   // IndexMirror's "remove" op (XERK-2549)
     };
   }
   // Mirrors PgIndexStore.hydrateInto: reset once, then batch-apply sessions + entries.
@@ -1643,4 +1644,32 @@ test("XERK-2534: buildList/buildSearch carry the tenant scope as a bound paramet
   const s = buildSearch("archive", "q:*", { scope: { tenant: t, untenanted: false } });
   assert.match(s.text, /s\.host LIKE \$2/);
   assert.equal(s.params[1], `%@${t}`);
+});
+
+test("XERK-2549 pg mode: a tenant purge removes the map rows, the Postgres rows and the files", async () => {
+  const mem = pgSetup();
+  const A = "a".repeat(32), B = "b".repeat(32);
+  try {
+    const b = (w) => [ent(`u-${w}`, "user", `purgeword ${w}`)];
+    const len = (w) => Buffer.byteLength(JSON.stringify(b(w)));
+    archive.ingestChunk(`lap@${A}`, "pg-ta", META, 0, len("a"), b("a"), `acme@${A}`);
+    archive.ingestChunk(`lap@${B}`, "pg-tb", META, 0, len("b"), b("b"), `acme@${B}`);
+    const relA = archive.sessionRow("pg-ta").filePath;
+    assert.ok(relA.startsWith(`@${A}${path.sep}`), relA);
+    assert.ok(fs.existsSync(path.join(process.env.ARCHIVE_DIR, relA)));
+    const searchIds = async (scope) => (await archive.searchArchive("purgeword", { scope }))
+      .groups.flatMap((g) => g.matches.map((m) => m.transcriptId)).sort();
+    // (The Postgres scope filter itself is pinned by the XERK-2534 SQL-builder case.)
+    assert.equal(archive.getTranscript("pg-ta", { tenant: B, untenanted: false }), null,
+      "A's transcript never reaches B");
+    assert.deepEqual(await searchIds(undefined), ["pg-ta", "pg-tb"]);
+
+    const out = archive.purgeTenant(A);
+    assert.equal(out.transcripts, 1);
+    assert.equal(archive.sessionRow("pg-ta"), null, "map row gone");
+    assert.ok(!mem.sessions.has("pg-ta") && !mem.entries.has("pg-ta"), "Postgres rows gone");
+    assert.ok(!fs.existsSync(path.join(process.env.ARCHIVE_DIR, `@${A}`)), "partition gone");
+    assert.deepEqual(await searchIds(undefined), ["pg-tb"], "nothing of A is searchable");
+    assert.equal(archive.getTranscript("pg-tb").entries.length, 1, "B untouched");
+  } finally { pgTeardown(); }
 });

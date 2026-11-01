@@ -663,6 +663,9 @@ const MEETING_PROPOSALS_FILE =
   process.env.MEETING_PROPOSALS_FILE || "/data/meeting-proposals.json";
 // Each tenant's Tenir bearer, as its SHA-256 only (XERK-2551).
 const MEETING_TOKENS_FILE = process.env.MEETING_TOKENS_FILE || "/data/meeting-tokens.json";
+// Tenants whose archive data was purged (XERK-2549): tombstones every replica reads.
+const ARCHIVE_PURGED_TENANTS_FILE =
+  process.env.ARCHIVE_PURGED_TENANTS_FILE || "/data/archive-purged-tenants.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -4975,6 +4978,47 @@ const persistMeetingTokens = registerExternalStore({
   name: "meetingTokens", file: MEETING_TOKENS_FILE, debounceMs: 0, mode: 0o600,
   coerce: meetingTokensCoerce, read: () => meetingTokens, install: (v) => { meetingTokens = v; },
 });
+// ---- The archive's tenant purge (XERK-2549) ---------------------------------
+// `archivePurgedTenants` (tenantId -> purged-at ms) is a TOMBSTONE set, HA-shared:
+// under HA a follower's local working copy can still hold files the leader purged,
+// and its boot backfill / rebuild would put them back into the index.
+// archive.js skips (and reaps) a tombstoned tenant on every such path. Written
+// with no debounce, BEFORE the purge runs, so a crash mid-purge leaves the tenant
+// skipped everywhere rather than half-present. Bounded; past the cap the OLDEST
+// tombstone goes (by then every replica has long since reaped its local copy).
+const ARCHIVE_PURGED_TENANTS_MAX = 10000;
+function archivePurgedTenantsCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  const rows = Object.entries(raw)
+    .filter(([t, at]) => /^[0-9a-f]{32}$/.test(t) && Number.isSafeInteger(at) && at > 0)
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+    .slice(0, 10000);   // ARCHIVE_PURGED_TENANTS_MAX (inline: runs at module init)
+  for (const [t, at] of rows.sort((a, b) => a[1] - b[1] || (a[0] < b[0] ? -1 : 1))) out[t] = at;
+  return out;
+}
+let archivePurgedTenants = archivePurgedTenantsCoerce(readJsonFile(ARCHIVE_PURGED_TENANTS_FILE));
+const persistArchivePurgedTenants = registerExternalStore({
+  name: "archivePurgedTenants", file: ARCHIVE_PURGED_TENANTS_FILE, debounceMs: 0,
+  coerce: archivePurgedTenantsCoerce, read: () => archivePurgedTenants,
+  install: (v) => { archivePurgedTenants = v; },
+});
+archive.setTenantPurged((t) => Object.hasOwn(archivePurgedTenants, t));
+registerTenantPurge("archive", (t) => {
+  archivePurgedTenants = archivePurgedTenantsCoerce(
+    { ...archivePurgedTenants, [t]: Date.now() });
+  persistArchivePurgedTenants();
+  // The refusal diagnostics are keyed by host: drop the tenant's too.
+  let refusals = 0;
+  for (const k of [...archiveRefusals.keys()]) {
+    if (archive.tenantOfHost(archiveRefusals.get(k).host) === t) {
+      archiveRefusals.delete(k);
+      refusals += 1;
+    }
+  }
+  return { ...archive.purgeTenant(t), refusals };
+});
+
 // The one writer: insert (newest first) or replace a row by meetingId, through
 // the whitelist. Callers re-read rows rather than holding one across a write.
 function putMeeting(siteKey, row) {
@@ -6164,6 +6208,7 @@ function setArchiveMirror(blobStore, ha) {
     },
   });
   archive.setBlobSink((p) => archiveMirror.note(p));
+  archive.setBlobRemover((p) => { archiveMirror.remove(p); });
   // Ingest closes per TRANSCRIPT for rendered files that did not land (XERK-1050).
   archive.setRenderedGate((p) => archiveMirror.renderedBlocked(p));
   // The raw layer stays in the bucket until something needs it (XERK-1043).
@@ -10084,10 +10129,17 @@ function requestTrajectoryTail(live) {
   return true;
 }
 
-function archiveHistory(transcriptId) {
+// `host` (XERK-2549): the session's transcript id is AGENT-asserted, so another
+// tenant's agent could name this tenant's archived transcript and read it back as
+// its own scrollback. Only a row of the host's own tenant (or, for an untenanted
+// host, an untenanted row) is served.
+function archiveHistory(transcriptId, host) {
   if (!transcriptId) return null;
+  const tenant = archive.tenantOfHost(host);
   let t;
-  try { t = archive.getTranscript(transcriptId); } catch { return null; }
+  try {
+    t = archive.getTranscript(transcriptId, { tenant: tenant || null, untenanted: !tenant });
+  } catch { return null; }
   if (!t || !Array.isArray(t.entries) || t.entries.length === 0) return null;
   const all = t.entries;
   const truncated = all.length > HISTORY_ARCHIVE_MSGS;
@@ -22413,7 +22465,7 @@ const server = http.createServer(async (req, res) => {
           // the store is full, so it doesn't push at all this pass. Advisory —
           // archive.ingestChunk enforces both on its own. Same for both paths —
           // it keys on the wanted ids, however they were chosen.
-          const limits = archive.archiveLimits(Object.keys(archiveHave));
+          const limits = archive.archiveLimits(Object.keys(archiveHave), key);
           archiveShed = limits.shed.length ? limits.shed : undefined;
           archiveFull = limits.full || undefined;
           const rawSkip = archive.rawLimits(Object.keys(archiveHave));
@@ -23377,7 +23429,8 @@ const server = http.createServer(async (req, res) => {
     // GET /api/archive/<transcriptId> — one archived session's full transcript.
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "archive" && parts.length === 3) {
       const transcriptId = decodeURIComponent(parts[2]);
-      const t = archive.getTranscript(transcriptId);
+      // Tenant-filtered at the store too (XERK-2549), not only by the route gate.
+      const t = archive.getTranscript(transcriptId, archiveScopeFor(requestPrincipal(req)));
       if (!t) {
         // "Not here" and "not here because we refused it" read identically to
         // the operator, and the clients word the first as "it syncs within a few
@@ -23418,7 +23471,8 @@ const server = http.createServer(async (req, res) => {
       }
       const body = JSON.parse((await readBody(req)) || "{}");
       const target = typeof body.host === "string" ? body.host : "";
-      const row = archive.sessionRow(transcriptId);
+      const scope = archiveScopeFor(requestPrincipal(req));
+      const row = archive.sessionRow(transcriptId, scope);
       if (!row) return json(res, 404, { error: "unknown transcript" });
       if (!row.worktree)
         return json(res, 409, {
@@ -23471,11 +23525,11 @@ const server = http.createServer(async (req, res) => {
         return json(res, 503, {
           error: "this session's raw copy is still syncing from object storage — try again shortly",
         });
-      const files = archive.listRawFiles(transcriptId) || [];
+      const files = archive.listRawFiles(transcriptId, scope) || [];
       const packable = [];
       let conversation = false;
       for (const f of files) {
-        const full = archive.rawFileFor(transcriptId, f.path);
+        const full = archive.rawFileFor(transcriptId, f.path, scope);
         if (!full) continue;
         if (f.path === `${transcriptId}.jsonl`) conversation = true;
         packable.push({ name: f.path, path: full, size: f.bytes });
@@ -23487,7 +23541,11 @@ const server = http.createServer(async (req, res) => {
         });
       if (!target) return json(res, 400, { error: "a target host is required" });
       // Restoring onto a host is driving it (XERK-2533): only one the caller may.
-      const tgt = principalMayDriveHost(requestPrincipal(req), target) ? agents[target] : null;
+      // A restore re-points the row to the target (restampOrg), so the target must be
+      // of the transcript's OWN tenant (XERK-2549): a row never crosses tenants, and
+      // its files stay in that tenant's archive partition.
+      const tgt = principalMayDriveHost(requestPrincipal(req), target) &&
+        archive.tenantOfHost(target) === archive.tenantOfHost(row.host) ? agents[target] : null;
       if (!tgt) return json(res, 404, { error: "unknown target host" });
       if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)
         return json(res, 503, { error: "the target agent is offline" });
@@ -23543,7 +23601,7 @@ const server = http.createServer(async (req, res) => {
       const transcriptId = decodeURIComponent(parts[2]);
       if (!(await rawLocalFor(transcriptId)))
         return json(res, 503, { error: "still syncing from object storage" });
-      const files = archive.listRawFiles(transcriptId);
+      const files = archive.listRawFiles(transcriptId, archiveScopeFor(requestPrincipal(req)));
       if (!files) return json(res, 404, { error: "unknown transcript" });
       return json(res, 200, { transcriptId, files });
     }
@@ -23564,7 +23622,7 @@ const server = http.createServer(async (req, res) => {
       try { rel = decodeURIComponent(parts[4]); } catch { return json(res, 400, { error: "bad file" }); }
       if (!(await rawLocalFor(transcriptId)))
         return json(res, 503, { error: "still syncing from object storage" });
-      const full = archive.rawFileFor(transcriptId, rel);
+      const full = archive.rawFileFor(transcriptId, rel, archiveScopeFor(requestPrincipal(req)));
       if (!full) return json(res, 404, { error: "unknown file" });
       let size;
       try { size = fs.statSync(full).size; } catch { return json(res, 404, { error: "unknown file" }); }
@@ -23591,7 +23649,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "dsh" &&
         parts[3] === "trajectory" && parts.length === 4) {
       const transcriptId = decodeURIComponent(parts[2]);
-      const traj = archive.dshTrajectory(transcriptId);
+      const traj = archive.dshTrajectory(transcriptId, archiveScopeFor(requestPrincipal(req)));
       if (!traj) {
         const r = archiveRefusalFor(transcriptId);
         return json(res, 404, withIngestClosed(r
@@ -23629,14 +23687,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "archive" &&
         parts[3] === "trajectory" && parts.length === 4) {
       const transcriptId = decodeURIComponent(parts[2]);
-      const dsh = archive.dshTrajectory(transcriptId);
+      const caller = requestPrincipal(req);
+      const scope = archiveScopeFor(caller);
+      const dsh = archive.dshTrajectory(transcriptId, scope);
       if (dsh) return json(res, 200, { runtime: "dsh", partial: false, ...dsh });
-      const full = archive.claudeTrajectory(transcriptId);
+      const full = archive.claudeTrajectory(transcriptId, scope);
       if (full) return json(res, 200, { partial: false, ...full });
       // Live full-fidelity for a RUNNING claude/qwen session (XERK-716): reduce
       // the agent's on-demand raw tail if it is cached, else request it and serve
       // the degraded rendered layer now (the client re-polls for the full one).
-      const caller = requestPrincipal(req);
       const live = liveSessionForTranscript(transcriptId, caller);
       if (live && live.agent.trajectory && live.agent.trajectory.available === true) {
         const tail = live.agent.trajectoryTails
@@ -23647,11 +23706,11 @@ const server = http.createServer(async (req, res) => {
           if (reduced) return json(res, 200, { partial: false, live: true, ...reduced });
         }
         const pending = requestTrajectoryTail(live);
-        const degraded = archive.renderedTrajectory(transcriptId, live.runtime);
+        const degraded = archive.renderedTrajectory(transcriptId, live.runtime, scope);
         if (degraded) return json(res, 200, pending ? { ...degraded, pending: true } : degraded);
       }
       const degraded = archive.renderedTrajectory(
-        transcriptId, liveRuntimeForTranscript(transcriptId, caller));
+        transcriptId, liveRuntimeForTranscript(transcriptId, caller), scope);
       if (degraded) return json(res, 200, degraded);
       const r = archiveRefusalFor(transcriptId);
       return json(res, 404, withIngestClosed(r
@@ -24472,7 +24531,7 @@ const server = http.createServer(async (req, res) => {
         // nothing yet do we fall through to the queue-and-202 path.
         const sess = (agents[key].sessions || []).find((x) => x.id === sessionId);
         if (sess && sess.status === "running") {
-          const fromArchive = archiveHistory(sess.transcriptId);
+          const fromArchive = archiveHistory(sess.transcriptId, key);
           if (fromArchive) {
             if (!pending) queueCommand(key, { type: "history", sessionId });
             return json(res, 200, fromArchive);
@@ -26375,6 +26434,9 @@ if (process.env.TURMA_TEST) {
     // The outcome ledger, its sweep and served view (XERK-1839).
     outcomeLedger, outcomeLedgerSweep, modelQualityView, modelShadowSweep, shadowSampled,
     modelPolicySweep, modelPolicyPick, modelPolicyPayload, modelPolicyKey, agentsPayloadFor,
+    // XERK-2549: the archive's tombstone set (a test resets it between purges).
+    archivePurgedTenantsState: () => archivePurgedTenants,
+    __resetArchivePurgedTenants: () => { archivePurgedTenants = archivePurgedTenantsCoerce({}); },
     registerTenantPurge, purgeTenantData, ledgerVisible, ledgerScopeKey, tenantScope, subscriptionKeyOf,
     shadowHostFor,
     __modelPolicyState: () => modelPolicyState,

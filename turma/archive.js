@@ -104,6 +104,17 @@ const ARCHIVE_TRANSCRIPT_MAX = byteCeiling(
 // an error response did (XERK-255).
 const ARCHIVE_TOTAL_MAX = byteCeiling(
   process.env.ARCHIVE_TOTAL_MAX_BYTES, 64 * 1024 * 1024 * 1024);
+// Per-TENANT quota inside that shared ceiling (XERK-2549). The archive never
+// EVICTS — a full store refuses ingest — so the risk between tenants is not one
+// deleting another's data but one tenant filling the shared ceiling and refusing
+// every other tenant's ingest. Each tenant's partition (`@<tenantId>/`) is
+// therefore held to its own quota, measured off the same walk and refused the
+// same way (cursor + `full`, never an error). The untenanted (operators') tree has
+// no quota of its own — only the shared ceiling, as before. Default: an eighth of
+// the shared ceiling; `0` disables it; it can never exceed the ceiling.
+const ARCHIVE_TENANT_MAX = Math.min(
+  byteCeiling(process.env.ARCHIVE_TENANT_MAX_BYTES, Math.floor(ARCHIVE_TOTAL_MAX / 8)),
+  ARCHIVE_TOTAL_MAX || Number.MAX_SAFE_INTEGER);
 
 // Per-transcript ceiling on the RAW layer (XERK-338), covering the conversation
 // file AND its whole session directory together. Sized against the reference
@@ -193,8 +204,53 @@ function repoFolder(meta) {
   return slugify(meta.repo || meta.remoteKey || "unknown", "unknown");
 }
 
+// ---- tenant partition (XERK-2549) -------------------------------------------
+//
+// A tenant host's registry key is `<device>@<32-hex tenantId>` (XERK-2533), so a
+// row's tenant is read off its `host` — never a stored tenant field beside it
+// (turma-tenancy-ledgers.md: it could only disagree). A NEW tenant transcript's
+// files live under a top-level `@<tenantId>/` directory: `@` can never start a
+// repo folder (slugify keeps [a-z0-9._-] only), so the partition never collides
+// with an untenanted repo. That one prefix is what makes per-tenant byte
+// accounting a walk of one subtree, a tenant purge an `rm -rf` of it, and every
+// HA bucket key tenant-namespaced (keys are paths relative to ARCHIVE_DIR).
+const TENANT_ID_RE = /^[0-9a-f]{32}$/;
+const TENANT_DIR_RE = /^@([0-9a-f]{32})$/;
+function tenantOfHost(host) {
+  const m = /@([0-9a-f]{32})$/.exec(typeof host === "string" ? host : "");
+  return m ? m[1] : "";
+}
+// The tenant whose partition a relative path sits in ("" = untenanted tree, which
+// includes a tenant row archived before the partition existed — see purgeTenant).
+function tenantOfRel(relPath) {
+  const m = TENANT_DIR_RE.exec(String(relPath || "").split(/[\\/]/)[0]);
+  return m ? m[1] : "";
+}
+// A read scope (`{tenant, untenanted}`, server.js archiveScopeFor) admits a host
+// exactly as scopeSql/scopeWhere do. Absent scope = no filter.
+function hostInScope(host, scope) {
+  if (!scope) return true;
+  const t = tenantOfHost(host);
+  if (t) return typeof scope.tenant === "string" && scope.tenant === t;
+  return !!scope.untenanted;
+}
+// Tenants the hub has PURGED (server.js wires its durable, HA-shared tombstone
+// set). Every path that rebuilds rows from local files, or measures/keeps them,
+// skips a purged tenant: under HA a follower's local working copy can still hold
+// files the leader purged, and the boot backfill / rebuild would otherwise
+// resurrect them into the index. Unset = nothing is purged.
+let tenantPurged = () => false;
+function setTenantPurged(fn) {
+  tenantPurged = typeof fn === "function" ? fn : () => false;
+}
+function isTenantPurged(t) {
+  if (!t) return false;
+  try { return !!tenantPurged(t); } catch { return false; }
+}
+
 // The organized, human-readable relative path for one transcript:
 //   <repo>/<YYYY-MM-DD>__<summary>__<host>__<shortId>.jsonl
+//   @<tenantId>/<repo>/…  for a tenant host (XERK-2549)
 function archiveRelPath(transcriptId, meta) {
   const date = String(meta.endedTs || meta.createdAt || "").slice(0, 10) || "undated";
   const summary = slugify(meta.summary, "session");
@@ -203,8 +259,12 @@ function archiveRelPath(transcriptId, meta) {
   // Not path-traversable: repoFolder() and every filename part run through
   // slugify(), which collapses anything outside [A-Za-z0-9._-] and strips
   // leading dots/dashes — so no component can contain a separator or '..'.
+  // The tenant prefix is `@` + 32 hex, regex-checked by tenantOfHost — no separator.
+  const tenant = tenantOfHost(meta.host);
   // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
-  return path.join(repoFolder(meta), `${slugify(date, "undated")}__${summary}__${host}__${short}.jsonl`);
+  const rel = path.join(repoFolder(meta), `${slugify(date, "undated")}__${summary}__${host}__${short}.jsonl`);
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  return tenant ? path.join("@" + tenant, rel) : rel;
 }
 
 // ---- the raw layer's paths --------------------------------------------------
@@ -880,6 +940,16 @@ function writeSidecar(metaPath, obj, local) {
 // and waiting one window to see it costs nothing.
 let totalCache = { at: 0, bytes: 0 };
 let writtenSinceWalk = 0;
+// The same baseline + charge, per tenant partition (XERK-2549): the walk fills
+// `tenantCache` (tenantId -> bytes under `@<tenantId>/`), every append charges
+// `tenantWritten`, and the walk zeroes it — so a tenant's figure is exactly as
+// fresh as the store's.
+let tenantCache = new Map();
+let tenantWritten = new Map();
+function chargeTenant(relPath, n) {
+  const t = tenantOfRel(relPath);
+  if (t) tenantWritten.set(t, (tenantWritten.get(t) || 0) + n);
+}
 const TOTAL_CACHE_MS = 5 * 60 * 1000;
 // While the store reads FULL, re-measure far more often. Precision is worth
 // most exactly then — ingest is refusing anyway, so a walk costs no throughput,
@@ -955,14 +1025,15 @@ let lastReclaimAt = 0;
 // files, so the reclaim MUST NOT act on it — dropping live rows for a
 // transiently-unmounted volume would, since ingest appends, duplicate the
 // conversation on re-push (the XERK-280 hazard).
-function walkJsonlBytes(dir, depth, stats) {
+function walkJsonlBytes(dir, depth, stats, inTenant) {
   let names;
   try {
     names = fs.readdirSync(dir, { withFileTypes: true });
   } catch (e) {
     // ENOENT at the root is the store genuinely absent: 0 is right, and is what
     // lets a removed directory be recreated instead of latching full forever.
-    if (depth === 0 && e.code !== "ENOENT") throw e;
+    // (A tenant partition is not the store: unreadable, it costs only its subtree.)
+    if (depth === 0 && !inTenant && e.code !== "ENOENT") throw e;
     // But the file count is now an UNDER-count — the root vanished mid-life
     // (unmounted/renamed, not a fresh empty store) or a subtree was skipped — so
     // mark the walk untrustworthy for the reclaim.
@@ -975,6 +1046,22 @@ function walkJsonlBytes(dir, depth, stats) {
     // this stays inside `dir` — a recursive walk of our own ARCHIVE_DIR.
     // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     const full = path.join(dir, d.name);
+    // A tenant partition (XERK-2549) at the store root: its contents are walked as
+    // a root of their own (repo folders at depth 0, so `isRawDir`'s depth guard
+    // still protects a repo named `x.jsonl.raw`), and its total is recorded per
+    // tenant. A PURGED tenant's partition is a stale local copy (an HA follower's
+    // working copy the leader purged): reap it rather than count it.
+    const tm = depth === 0 && !inTenant && d.isDirectory() ? TENANT_DIR_RE.exec(d.name) : null;
+    if (tm) {
+      if (isTenantPurged(tm[1])) {
+        try { fs.rmSync(full, { recursive: true, force: true }); } catch { /* next walk */ }
+        continue;
+      }
+      const sub = walkJsonlBytes(full, 0, stats, true);
+      if (stats) stats.byTenant.set(tm[1], (stats.byTenant.get(tm[1]) || 0) + sub);
+      bytes += sub;
+      continue;
+    }
     if (d.isDirectory()) {
       // Inside a raw directory EVERY regular file counts, whatever it is named:
       // a session's own files are `.jsonl`, `.json` and `.txt` (the
@@ -1050,7 +1137,7 @@ function totalArchiveBytes(now, maxAgeMs) {
   const age = maxAgeMs === undefined ? TOTAL_CACHE_MS : maxAgeMs;
   if (now - totalCache.at < age) return totalCache.bytes + writtenSinceWalk;
   let bytes;
-  const stats = { files: 0, partial: false };
+  const stats = { files: 0, partial: false, byTenant: new Map() };
   try {
     bytes = walkJsonlBytes(ARCHIVE_DIR, 0, stats);
   } catch (e) {
@@ -1070,6 +1157,8 @@ function totalArchiveBytes(now, maxAgeMs) {
   }
   totalCache = { at: now, bytes };
   writtenSinceWalk = 0;
+  tenantCache = stats.byTenant;
+  tenantWritten = new Map();
   // The walk just enumerated every rendered transcript on disk, so this is the
   // one moment we cheaply know whether the index is holding rows for files an
   // operator has since deleted (XERK-332). Reclaim runs AFTER the cache is set —
@@ -1138,21 +1227,44 @@ function maybeReclaimIndex(now, stats) {
 
 // The ceiling's own read of the total: once it says full, re-measure on the
 // short cadence so freeing space is noticed in seconds rather than minutes.
-function totalForCeiling(now) {
+function totalForCeiling(now, tenant) {
   now = now || Date.now();
   // Read on the short cadence when the last answer was "full", so freeing space
   // is noticed in seconds. One call, not two: asking twice walked twice on the
-  // beat that flipped it.
-  const wasFull = ARCHIVE_TOTAL_MAX > 0 &&
-    totalCache.bytes + writtenSinceWalk >= ARCHIVE_TOTAL_MAX;
+  // beat that flipped it. A tenant at its quota (XERK-2549) gets the same short
+  // cadence, for the same reason.
+  const wasFull = (ARCHIVE_TOTAL_MAX > 0 &&
+    totalCache.bytes + writtenSinceWalk >= ARCHIVE_TOTAL_MAX) ||
+    (!!tenant && ARCHIVE_TENANT_MAX > 0 && tenantBytes(tenant) >= ARCHIVE_TENANT_MAX);
   return totalArchiveBytes(now, wasFull ? FULL_RECHECK_MS : undefined);
+}
+
+// Bytes in one tenant's partition: the walk's baseline plus every byte appended
+// since — the store total's rule, per tenant (XERK-2549).
+function tenantBytes(t) {
+  return (tenantCache.get(t) || 0) + (tenantWritten.get(t) || 0);
+}
+
+// Whether a write by a host of `tenant` ("" = untenanted) must be refused: the
+// shared ceiling first, then that tenant's own quota. Never an error — callers
+// hand back their real cursor plus `full` (XERK-255/267).
+function ceilingRefuses(tenant) {
+  const total = totalForCeiling(undefined, tenant);
+  if (ARCHIVE_TOTAL_MAX && total >= ARCHIVE_TOTAL_MAX) { warnArchiveFull(total); return true; }
+  if (tenant && ARCHIVE_TENANT_MAX && tenantBytes(tenant) >= ARCHIVE_TENANT_MAX) {
+    warnTenantFull(tenant);
+    return true;
+  }
+  return false;
 }
 
 // Test seam: drop the cache so a test observes a recovery without waiting out
 // TOTAL_CACHE_MS, or seed it to put the total at an exact value the filesystem
 // can't easily be coaxed into. Nothing in the serving path calls it.
-function __resetTotalCache(seed) {
+function __resetTotalCache(seed, tenantSeed) {
   writtenSinceWalk = 0;
+  tenantCache = new Map(Object.entries(tenantSeed || {}));
+  tenantWritten = new Map();
   totalCache = seed === undefined ? { at: 0, bytes: 0 } : { at: Date.now(), bytes: seed };
 }
 
@@ -1193,6 +1305,18 @@ function warnArchiveFull(total) {
     `archive is full: ${total} bytes stored, ceiling ${ARCHIVE_TOTAL_MAX} ` +
     `(ARCHIVE_TOTAL_MAX_BYTES) — refusing new deltas so ${ARCHIVE_DIR}'s volume ` +
     `stays writable for the hub's own state`);
+}
+
+// A tenant at its quota (XERK-2549), throttled like the store-full warning.
+let lastTenantFullWarnAt = 0;
+function warnTenantFull(tenant) {
+  const now = Date.now();
+  if (now - lastTenantFullWarnAt < 60 * 60 * 1000) return;
+  lastTenantFullWarnAt = now;
+  console.error(
+    `archive: tenant ${tenant} is at its quota: ${tenantBytes(tenant)} bytes, ` +
+    `quota ${ARCHIVE_TENANT_MAX} (ARCHIVE_TENANT_MAX_BYTES) — refusing that tenant's ` +
+    `new deltas; other tenants are unaffected`);
 }
 
 // Ingest one delta chunk pushed by an agent. `entries` are the already-parsed,
@@ -1348,6 +1472,15 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
   if (rePoint && !legacyNull && !sharedOrg) {
     return { bytesStored: have };
   }
+  // A row never crosses tenants (XERK-2549), whatever the org gate above says —
+  // including the legacy-NULL trust-on-first-sight escape, which would otherwise let
+  // a tenant host that knows an old untenanted transcript id append to it. Its files
+  // live in (or out of) one tenant's partition for life. A purged tenant's host
+  // (XERK-2552 deletes the user) stores nothing either.
+  if (row && row.host && tenantOfHost(row.host) !== tenantOfHost(host)) {
+    return { bytesStored: have };
+  }
+  if (isTenantPurged(tenantOfHost(host))) return { bytesStored: have };
   // Its rendered bytes are not on local disk yet (XERK-1050): store nothing and
   // hand back the cursor — "no progress", never an error status (XERK-255).
   if (renderedBlocked(row)) return { bytesStored: have };
@@ -1355,11 +1488,8 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
   // error status — the agent must read this as "no progress" and move on, never
   // as a chunk to retry (XERK-267). Deleting archives is what reopens it, and
   // needs nothing from us: the total is measured off the files themselves.
-  const total = totalForCeiling();
-  if (ARCHIVE_TOTAL_MAX && total >= ARCHIVE_TOTAL_MAX) {
-    warnArchiveFull(total);
-    return { bytesStored: have, full: true };
-  }
+  // A host's own tenant's quota as well as the shared ceiling (XERK-2549).
+  if (ceilingRefuses(tenantOfHost(host))) return { bytesStored: have, full: true };
   if (Number(startOffset) !== have) return { bytesStored: have };
   // The cursor only ever moves forward. Without this an endOffset BELOW
   // startOffset rewound bytesStored, and the next chunk re-ingested a range
@@ -1485,6 +1615,7 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
       // Charge the store total immediately rather than waiting for the next
       // walk — that gap is what let a burst run 1,200x past the ceiling.
       writtenSinceWalk += Buffer.byteLength(lines);
+      chargeTenant(relPath, Buffer.byteLength(lines));
     }
     if (isPgMode()) {
       // The SAME upsert against the in-memory map (XERK-793): COALESCE createdAt/
@@ -1833,11 +1964,7 @@ function ingestRaw(host, transcriptId, rel, start, buf) {
   if (!buf || !buf.length) return { stored: have };
   if (have + buf.length > MAX_TRANSCRIPT_BYTES) return { stored: have, skip: true };
 
-  const total = totalForCeiling();
-  if (ARCHIVE_TOTAL_MAX && total >= ARCHIVE_TOTAL_MAX) {
-    warnArchiveFull(total);
-    return { stored: have, full: true };
-  }
+  if (ceilingRefuses(tenantOfHost(host))) return { stored: have, full: true };
   // Walked off the raw directory (plus what the bucket still holds), never read
   // back from the row: after a rollout onto an emptyDir the row carries Postgres's
   // figure for bytes this replica no longer has, so the agent re-pushes them from
@@ -1876,6 +2003,7 @@ function ingestRaw(host, transcriptId, rel, start, buf) {
   // Charge the store total immediately rather than waiting for the next walk —
   // the same rule the rendered layer follows, and for the same reason.
   writtenSinceWalk += buf.length;
+  chargeTenant(row.filePath, buf.length);
   const rawNowIso = new Date().toISOString();
   if (isPgMode()) {
     mapPutSession({ ...row, rawBytes: rawBytes + buf.length, updatedAt: rawNowIso });
@@ -1890,10 +2018,10 @@ function ingestRaw(host, transcriptId, rel, start, buf) {
 }
 
 /** The raw files held for one transcript, as [{path, bytes}], newest walk order. */
-function listRawFiles(transcriptId) {
+function listRawFiles(transcriptId, scope) {
   openDb();
   const row = idxGetSession(transcriptId);
-  if (!row || !row.filePath) return null;
+  if (!row || !row.filePath || !hostInScope(row.host, scope)) return null;
   const dir = rawDirFor(row.filePath, transcriptId);
   if (!dir) return null;
   const out = [];
@@ -1920,10 +2048,11 @@ function listRawFiles(transcriptId) {
  * read-back deliberately does not carry (it answers with the CONVERSATION).
  * null when unknown.
  */
-function sessionRow(transcriptId) {
+function sessionRow(transcriptId, scope) {
   openDb();
   const row = idxGetSession(transcriptId);
-  if (!row) return null;
+  // `scope` (XERK-2549): a row outside the caller's tenant scope reads as unknown.
+  if (!row || !hostInScope(row.host, scope)) return null;
   // The subset restore reads (XERK-441) — same columns the sqlite SELECT projected.
   return {
     transcriptId: row.transcriptId, host: row.host, remoteKey: row.remoteKey,
@@ -1934,21 +2063,118 @@ function sessionRow(transcriptId) {
 }
 
 /** The raw directory one transcript's files live under. null when unknown. */
-function rawDirOf(transcriptId) {
+function rawDirOf(transcriptId, scope) {
   openDb();
   const row = idxGetSession(transcriptId);
-  if (!row || !row.filePath) return null;
+  if (!row || !row.filePath || !hostInScope(row.host, scope)) return null;
   return rawDirFor(row.filePath, transcriptId);
 }
 
 /** One raw file's absolute path, for streaming it back. null when unknown. */
-function rawFileFor(transcriptId, rel) {
+function rawFileFor(transcriptId, rel, scope) {
   openDb();
   const row = idxGetSession(transcriptId);
-  if (!row || !row.filePath) return null;
+  if (!row || !row.filePath || !hostInScope(row.host, scope)) return null;
   const full = rawFilePath(row.filePath, transcriptId, rel);
   if (!full) return null;
   try { return fs.statSync(full).isFile() ? full : null; } catch { return null; }
+}
+
+// ---- tenant purge (XERK-2549) -----------------------------------------------
+//
+// The bucket half of a purge under HA: called with each absolute path (a file or a
+// directory to remove WITH everything under it) whose of-record copy must go too.
+// Unset (HA off) = local disk is the whole of-record.
+let blobRemover = null;
+function setBlobRemover(fn) {
+  blobRemover = typeof fn === "function" ? fn : null;
+}
+function noteRemove(absPath) {
+  if (blobRemover) { try { blobRemover(absPath); } catch { /* best-effort */ } }
+}
+
+// Remove EVERY archive byte and index row of one tenant — the store's half of user
+// deletion (server.js registers it with `registerTenantPurge`). Two passes, because
+// a tenant's data can sit in two places:
+//   1. every ROW whose host carries the tenant (`<device>@<tenantId>`) — this also
+//      finds a transcript archived before the partition existed, whose files live in
+//      the untenanted tree: its `.jsonl`, `.meta` and its own raw directory go, the
+//      row and its search entries go (sqlite) or its map row goes and the Postgres
+//      of-record is told to delete it (pg, the mirror's `remove` op);
+//   2. the tenant's whole partition directory, which takes any file no row named.
+// A `.jsonl` another (surviving) row also names — a pre-XERK-277 collision — is kept:
+// that row's conversation is in it. The caller records the tenant as purged FIRST
+// (server.js), so a replica's stale local copy is skipped by every rebuild/backfill.
+// Synchronous; returns {transcripts, files}.
+function purgeTenant(tenantId) {
+  const t = String(tenantId || "");
+  if (!TENANT_ID_RE.test(t)) return { transcripts: 0, files: 0 };
+  openDb();
+  const suffix = "@" + t;
+  const rows = isPgMode()
+    ? [...sessionsMap.values()].filter((r) => typeof r.host === "string" && r.host.endsWith(suffix))
+      .map((r) => ({ transcriptId: r.transcriptId, filePath: r.filePath }))
+    : db.prepare("SELECT transcriptId, filePath FROM sessions WHERE host GLOB ?").all("*" + suffix);
+  const doomed = new Set(rows.map((r) => r.transcriptId));
+  const sharedPath = (relPath, id) => {
+    if (isPgMode()) {
+      for (const r of sessionsMap.values()) {
+        if (r.filePath === relPath && r.transcriptId !== id && !doomed.has(r.transcriptId)) return true;
+      }
+      return false;
+    }
+    return db.prepare("SELECT transcriptId FROM sessions WHERE filePath=? AND transcriptId<>?")
+      .all(relPath, id).some((r) => !doomed.has(r.transcriptId));
+  };
+  let files = 0;
+  const rmPath = (abs, dir) => {
+    try {
+      if (dir) fs.rmSync(abs, { recursive: true, force: true });
+      else fs.unlinkSync(abs);
+      files++;
+    } catch { /* already gone */ }
+    noteRemove(abs);
+  };
+  for (const r of rows) {
+    if (r.filePath) {
+      const paths = filePaths(r.filePath);
+      const rawDir = rawDirFor(r.filePath, r.transcriptId);
+      if (rawDir) {
+        rmPath(rawDir, true);
+        // The suffix directory goes once nothing else lives in it.
+        try { fs.rmdirSync(paths.jsonl + RAW_DIR_SUFFIX); } catch { /* not empty / absent */ }
+      }
+      if (!sharedPath(r.filePath, r.transcriptId)) {
+        rmPath(paths.jsonl, false);
+        rmPath(paths.meta, false);
+      }
+    }
+    if (isPgMode()) {
+      sessionsMap.delete(r.transcriptId);
+      if (r.filePath && filePathIndex.get(r.filePath) === r.transcriptId) filePathIndex.delete(r.filePath);
+      if (indexSink && typeof indexSink.remove === "function") {
+        try { indexSink.remove(r.transcriptId); } catch { /* best-effort, like every mirror op */ }
+      }
+    } else {
+      tx(() => {
+        db.prepare("DELETE FROM entries_fts WHERE transcriptId=?").run(r.transcriptId);
+        db.prepare("DELETE FROM sessions WHERE transcriptId=?").run(r.transcriptId);
+      });
+    }
+    unverifiedCursors.delete(r.transcriptId);
+    dedupPendingIds.delete(r.transcriptId);
+    dedupRepairGen.delete(r.transcriptId);
+  }
+  // The partition itself: a regex-checked `@<32 hex>` under ARCHIVE_DIR.
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  const part = path.join(ARCHIVE_DIR, "@" + t);
+  if (fs.existsSync(part)) rmPath(part, true);
+  else noteRemove(part);
+  // The bytes are gone: re-walk at the next ceiling check rather than wait it out.
+  tenantCache.delete(t);
+  tenantWritten.delete(t);
+  totalCache = { at: 0, bytes: totalCache.bytes };
+  return { transcripts: rows.length, files };
 }
 
 // Upsert metadata rows for a manifest and return the bytes-have cursor map the
@@ -1956,6 +2182,8 @@ function rawFileFor(transcriptId, rel) {
 function manifestCursors(host, manifest, siteKey) {
   openDb();
   const have = {};
+  // A purged tenant's host gets no placeholder rows (XERK-2549).
+  if (isTenantPurged(tenantOfHost(host))) return have;
   // The row this creates is a placeholder (0 bytes) that the OWNER's first chunk
   // fills. Stamp its org here too, or that row's `siteKey` is NULL and the
   // ingestChunk gate (XERK-344) would treat a cross-org host's first chunk as a
@@ -2060,6 +2288,7 @@ function manifestCursors(host, manifest, siteKey) {
 function inventoryCursors(host, inventory, siteKey) {
   openDb();
   const have = {};
+  if (isTenantPurged(tenantOfHost(host))) return have;   // XERK-2549, as manifestCursors
   const pushOrg = String(siteKey == null ? "" : siteKey).slice(0, META_TEXT_MAX);
   let list = Array.isArray(inventory) ? inventory : [];
   if (list.length > ARCHIVE_MANIFEST_CURSOR_MAX) {
@@ -2144,7 +2373,7 @@ function rawCursorsForIds(ids) {
 // go on the wire and skip a push that could only be refused — but it is an
 // optimisation, not the enforcement: ingestChunk applies both ceilings itself,
 // because an agent too old to read either flag keeps pushing regardless.
-function archiveLimits(ids) {
+function archiveLimits(ids, host) {
   openDb();
   const shed = [];
   const list = Array.isArray(ids) ? ids : [];
@@ -2167,7 +2396,12 @@ function archiveLimits(ids) {
       for (const id of list) if (over.has(id)) shed.push(id);
     }
   }
-  return { shed, full: !!(ARCHIVE_TOTAL_MAX && totalForCeiling() >= ARCHIVE_TOTAL_MAX) };
+  // `full` for THIS host: the shared ceiling, or its tenant's quota (XERK-2549).
+  const tenant = tenantOfHost(host);
+  const total = totalForCeiling(undefined, tenant);
+  const full = !!(ARCHIVE_TOTAL_MAX && total >= ARCHIVE_TOTAL_MAX) ||
+    !!(tenant && ARCHIVE_TENANT_MAX && tenantBytes(tenant) >= ARCHIVE_TENANT_MAX);
+  return { shed, full };
 }
 
 // ---- query ------------------------------------------------------------------
@@ -2428,11 +2662,12 @@ function reconcileRow(transcriptId, storedCount, storedBytes, entries, trueBytes
 
 // The full stored transcript of one archived session, read from its canonical
 // organized file (not the index). null when unknown/missing.
-function getTranscript(transcriptId) {
+function getTranscript(transcriptId, scope) {
   openDb();
   const row = idxGetSession(transcriptId);
-  // No row at all — the hub has genuinely never heard of this transcript.
-  if (!row) return null;
+  // No row at all — the hub has genuinely never heard of this transcript. A row
+  // outside the caller's tenant scope (XERK-2549) answers exactly the same.
+  if (!row || !hostInScope(row.host, scope)) return null;
   // A row with no organized file is a manifest PLACEHOLDER (manifestCursors)
   // whose owner has not pushed a content chunk yet — still syncing, so the
   // client's "syncs within a few minutes of ending" 404 wording is correct.
@@ -2479,10 +2714,20 @@ function getTranscript(transcriptId) {
 
 // ---- rebuild ----------------------------------------------------------------
 
-function walkJsonl(dir, out, depth) {
+function walkJsonl(dir, out, depth, inTenant) {
   let names;
   try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
   for (const d of names) {
+    // A tenant partition (XERK-2549) is walked as a root of its own, so its repo
+    // folders sit at depth 0 like the untenanted tree's. A PURGED tenant's partition
+    // is skipped whole: under HA it can be a follower's stale local copy, and every
+    // caller here (rebuild, the pg backfill, the de-dup pass) would bring it back.
+    const tm = !(depth || 0) && !inTenant && d.isDirectory() ? TENANT_DIR_RE.exec(d.name) : null;
+    if (tm) {
+      // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+      if (!isTenantPurged(tm[1])) walkJsonl(path.join(dir, d.name), out, 0, true);
+      continue;
+    }
     // A raw directory is SKIPPED WHOLE (XERK-338). Its contents are the
     // session's own `.jsonl` files, which are not archive rows and carry no
     // `.meta` — descending would read every one of them into memory to decide
@@ -2519,6 +2764,9 @@ function rebuildIndex() {
     const meta = readSidecar(jsonl + ".meta") || {};
     const transcriptId = meta.transcriptId;
     if (!transcriptId) continue; // can't attribute without the sidecar
+    // A purged tenant's file outside its partition (archived before XERK-2549) is a
+    // stale copy too: never rebuild a row for it.
+    if (isTenantPurged(tenantOfHost(meta.host))) continue;
     const relPath = path.relative(ARCHIVE_DIR, jsonl);
     let raw = "";
     try { raw = fs.readFileSync(jsonl, "utf8"); } catch { /* empty */ }
@@ -2863,6 +3111,9 @@ function backfillPgIndexFromFiles() {
     const meta = readSidecar(jsonl + ".meta") || {};
     const transcriptId = meta.transcriptId;
     if (!transcriptId) continue; // can't attribute without the sidecar
+    // A purged tenant's file outside its partition (archived before XERK-2549) is a
+    // stale copy too: never rebuild a row for it.
+    if (isTenantPurged(tenantOfHost(meta.host))) continue;
     const existing = sessionsMap.get(transcriptId);
     if (existing && existing.filePath != null) continue; // already a filed row — known
     const relPath = path.relative(ARCHIVE_DIR, jsonl);
@@ -3196,17 +3447,17 @@ function dshTrajNum(x) {
 
 // The session's native dsh events file inside the raw layer, or null. Matches on
 // the `/dsh/` segment + `.jsonl` so a renamed log file still resolves.
-function dshEventsFile(transcriptId) {
-  const files = listRawFiles(transcriptId);
+function dshEventsFile(transcriptId, scope) {
+  const files = listRawFiles(transcriptId, scope);
   if (!files) return null;
   const hit = files.find((f) => /(^|\/)dsh\/[^/]+\.jsonl$/.test(f.path));
   return hit ? hit.path : null;
 }
 
-function dshTrajectory(transcriptId) {
-  const rel = dshEventsFile(transcriptId);
+function dshTrajectory(transcriptId, scope) {
+  const rel = dshEventsFile(transcriptId, scope);
   if (!rel) return null;
-  const full = rawFileFor(transcriptId, rel);
+  const full = rawFileFor(transcriptId, rel, scope);
   if (!full) return null;
   let text = "", truncated = false;
   try {
@@ -3394,8 +3645,8 @@ function trajTime(e) {
 // ticket says to prefer); the dsh events file lives under `/dsh/` and is excluded
 // by the no-separator match. Falls back to the native Qwen `<tid>/qwen/chat.jsonl`
 // when only the un-projected store is present.
-function claudeTrajFile(transcriptId) {
-  const files = listRawFiles(transcriptId);
+function claudeTrajFile(transcriptId, scope) {
+  const files = listRawFiles(transcriptId, scope);
   if (!files || !files.length) return null;
   const topLevel = files.filter((f) => /^[^/]+\.jsonl$/.test(f.path));
   if (topLevel.length) {
@@ -3434,10 +3685,10 @@ function trajReadTail(full, cap) {
   return { text, truncated };
 }
 
-function claudeTrajectory(transcriptId) {
-  const rel = claudeTrajFile(transcriptId);
+function claudeTrajectory(transcriptId, scope) {
+  const rel = claudeTrajFile(transcriptId, scope);
   if (!rel) return null;
-  const full = rawFileFor(transcriptId, rel);
+  const full = rawFileFor(transcriptId, rel, scope);
   if (!full) return null;
   const read = trajReadTail(full, TRAJ_READ_MAX);
   if (!read) return null;
@@ -3684,9 +3935,9 @@ function claudeTrajectoryFromText(transcriptId, text, truncated) {
 // rendered transcript is itself absent/placeholder, so the route can 404 "not
 // archived". `runtime` is a best-effort hint from the caller (the rendered layer
 // cannot tell claude from qwen — both render identically); defaults to claude.
-function renderedTrajectory(transcriptId, runtime) {
+function renderedTrajectory(transcriptId, runtime, scope) {
   let t;
-  try { t = getTranscript(transcriptId); } catch { return null; }
+  try { t = getTranscript(transcriptId, scope); } catch { return null; }
   if (!t || !Array.isArray(t.entries)) return null;
 
   const snip = (s) => {
@@ -3820,6 +4071,9 @@ function renderedTrajectory(transcriptId, runtime) {
 }
 
 module.exports = {
+  // XERK-2549: the tenant partition, per-tenant quota and purge.
+  ARCHIVE_TENANT_MAX, tenantOfHost, tenantOfRel, hostInScope, tenantBytes,
+  setTenantPurged, setBlobRemover, purgeTenant,
   ARCHIVE_DIR, ARCHIVE_DB, ARCHIVE_TRANSCRIPT_MAX, ARCHIVE_TOTAL_MAX,
   dshTrajectory, dshEventsFile,
   claudeTrajectory, claudeTrajectoryFromText, claudeTrajFile, renderedTrajectory,

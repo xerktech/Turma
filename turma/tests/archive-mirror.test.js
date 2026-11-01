@@ -1221,3 +1221,28 @@ test("a retryBlocked GET that never settles is bounded and cannot wedge a hydrat
   assert.equal(await next, 1);
   assert.deepEqual(gets, ["repo/b.jsonl", "repo/b.jsonl"]);
 });
+
+test("XERK-2549: a tenant partition is skipped when finding a key's raw root", () => {
+  const T = "a".repeat(32);
+  assert.equal(rawRootOf(`@${T}/turma/x.jsonl.raw/t1/t1.jsonl`), `@${T}/turma/x.jsonl.raw`);
+  // A repo folder named like a raw dir under the partition is still a repo folder.
+  assert.equal(rawRootOf(`@${T}/y.jsonl.raw/x.jsonl`), null);
+  assert.equal(rawRootOf("turma/x.jsonl.raw/t1/t1.jsonl"), "turma/x.jsonl.raw");
+});
+
+test("XERK-2549: remove() drops a purged tree from the bucket and the local queues", async () => {
+  const root = mkdtemp("turma-mirror-purge-");
+  const T = "b".repeat(32);
+  const store = memStore();
+  for (const k of [`@${T}/r/a.jsonl`, `@${T}/r/a.jsonl.meta`, `@${T}/r/a.jsonl.raw/t/t.jsonl`, "r/keep.jsonl"]) {
+    store.map.set(k, Buffer.from("x"));
+  }
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {} });
+  m.note(path.join(root, `@${T}`, "r", "a.jsonl"));
+  m.note(path.join(root, "r", "keep.jsonl"));
+  const n = await m.remove(path.join(root, `@${T}`));
+  assert.equal(n, 4, "the directory key plus its three objects were deleted");
+  assert.deepEqual([...store.map.keys()], ["r/keep.jsonl"], "nothing outside the tree is touched");
+  assert.deepEqual([...m._dirty], ["r/keep.jsonl"], "a purged key is never pushed back up");
+  assert.equal(await m.remove("/somewhere/else"), 0, "a path outside ARCHIVE_DIR is ignored");
+});
