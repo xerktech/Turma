@@ -23790,6 +23790,28 @@ const bigMax = () => hub.BODY_INFLIGHT_MAX * hub.BODY_PARSE_COST;
 // bill. Held here so a test can assert the exact charge rather than "> 0".
 const BODY_PARSE_COST_EXPECTED = 3;
 
+test("XERK-2603: the memory limit never exceeds what V8's heap can back", () => {
+  const MiB = 1 << 20;
+  // The prod crash: 512Mi pod, node's default ~256 MB heap -> ceilings sized for 341 MiB, not 512.
+  assert.strictEqual(hub.effectiveMemoryLimit(512 * MiB, 64 * 2 ** 30, 256 * MiB), Math.floor(256 * MiB / 0.75));
+  // With the image's --max-old-space-size-percentage=75 the heap backs the whole container.
+  assert.strictEqual(hub.effectiveMemoryLimit(512 * MiB, 64 * 2 ** 30, 400 * MiB), 512 * MiB);
+  // No cgroup: host RAM, still heap-bounded; an unreadable heap limit leaves it alone.
+  assert.strictEqual(hub.effectiveMemoryLimit(null, 1024 * MiB, 4096 * MiB), 1024 * MiB);
+  assert.strictEqual(hub.effectiveMemoryLimit(512 * MiB, 64 * 2 ** 30, undefined), 512 * MiB);
+  // The running process obeys the bound.
+  assert.ok(hub.MEMORY_LIMIT <= Math.floor(require("v8").getHeapStatistics().heap_size_limit / 0.75) ||
+    process.env.MEMORY_LIMIT_BYTES);
+});
+
+test("XERK-2603: the image runs node with the heap share the ceilings assume", () => {
+  // Dropping the flag fails no other gate: prod would silently fall to ~2/3 ceilings.
+  const df = fs.readFileSync(path.join(__dirname, "..", "Dockerfile"), "utf8");
+  const m = df.match(/^ENTRYPOINT .*"--max-old-space-size-percentage=(\d+)"/m);
+  assert.ok(m, "turma/Dockerfile ENTRYPOINT must pass --max-old-space-size-percentage");
+  assert.strictEqual(Number(m[1]), Math.round(hub.HEAP_SHARE * 100));
+});
+
 test("budget: the ceilings are derived from the container limit, and only tighten", async () => {
   // Fixed numbers are what made this a bug: UPLOAD_TOTAL_MAX_BYTES was a flat
   // 128 MiB, DOUBLE the 256m the hub is deployed with, so it could never refuse

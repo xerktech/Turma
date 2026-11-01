@@ -28,4 +28,7 @@ EXPOSE 8300
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD wget -q -O /dev/null http://127.0.0.1:8300/healthz || exit 1
 
-ENTRYPOINT ["node", "/app/server.js"]
+# V8's default heap is about HALF the cgroup limit (256 MB of the 512Mi pod),
+# which the boot hydrate + reconnect burst crossed (XERK-2603). 75% matches the
+# HEAP_SHARE server.js derives its memory ceilings against.
+ENTRYPOINT ["node", "--max-old-space-size-percentage=75", "/app/server.js"]

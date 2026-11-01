@@ -25,6 +25,7 @@ const http = require("http");
 const net = require("net");
 const fs = require("fs");
 const os = require("os");
+const v8 = require("v8");
 const path = require("path");
 const crypto = require("crypto");
 const { Duplex, Readable } = require("stream");
@@ -418,9 +419,27 @@ let QWEN_ENABLED = true; // [Qwen B] launcher + XERK-520 end-to-end gate verifie
  * cannot be the binding constraint — both fall back to the host's memory, or the
  * derived ceilings come out absurd.
  */
+// Declared before MEMORY_LIMIT: effectiveMemoryLimit reads it during that init.
+const HEAP_SHARE = 0.75;
 const MEMORY_LIMIT = positiveEnv(
   "MEMORY_LIMIT_BYTES",
-  Math.min(containerMemoryLimit() || os.totalmem(), os.totalmem()));
+  effectiveMemoryLimit(containerMemoryLimit(), os.totalmem(), v8.getHeapStatistics().heap_size_limit));
+
+// The ceilings are sized for a V8 heap of HEAP_SHARE of the container (the
+// image runs node with --max-old-space-size-percentage=75). V8's OWN default
+// is about half the cgroup limit, so a node started without that flag hit
+// "JavaScript heap out of memory" at ~256 MB of a 512Mi pod during the boot
+// hydrate + reconnect burst, while every ceiling here assumed 512 (XERK-2603).
+// So the limit the ceilings derive from is never more than the heap V8 will
+// actually allow could back: a smaller heap tightens them instead of
+// crash-looping the hub.
+function effectiveMemoryLimit(container, total, heapLimit) {
+  let limit = Math.min(container || total, total);
+  if (Number.isFinite(heapLimit) && heapLimit > 0) {
+    limit = Math.min(limit, Math.floor(heapLimit / HEAP_SHARE));
+  }
+  return limit;
+}
 // One request may hold an eighth of the container; everything being read at once
 // may hold a quarter. The gap between them is deliberate — it leaves room for the
 // response, the parsed object (a JSON body costs several times its wire size once
@@ -26460,7 +26479,7 @@ if (process.env.TURMA_TEST) {
     // memory-limited container: the ceilings so a test can hold the arithmetic
     // that derives them from the container limit, and charge/release so the
     // "idle hub admits anything, a busy one does not" rule can be held directly.
-    MEMORY_LIMIT, BODY_INFLIGHT_MAX, BODY_INFLIGHT_TOTAL_MAX, UPLOAD_TOTAL_MAX_BYTES,
+    MEMORY_LIMIT, HEAP_SHARE, effectiveMemoryLimit, BODY_INFLIGHT_MAX, BODY_INFLIGHT_TOTAL_MAX, UPLOAD_TOTAL_MAX_BYTES,
     // The archive route's own ceiling and the refusal record behind it
     // (XERK-356): a test has to be able to hold BOTH — that the hub takes a
     // multi-MB delta at all, and that a refused one is still answerable when the
@@ -27528,7 +27547,8 @@ if (process.env.TURMA_TEST) {
     // one `docker logs` (XERK-258, XERK-273).
     const mib = (n) => `${Math.round(n / (1 << 20))} MiB`;
     console.log(
-      `memory limit ${mib(MEMORY_LIMIT)} -> body in-flight ${mib(BODY_INFLIGHT_MAX)}/request, ` +
+      `memory limit ${mib(MEMORY_LIMIT)} (V8 heap ` +
+        `${mib(v8.getHeapStatistics().heap_size_limit)}) -> body in-flight ${mib(BODY_INFLIGHT_MAX)}/request, ` +
         `${mib(BODY_INFLIGHT_TOTAL_MAX)} across both lanes; uploads held ` +
         `${mib(UPLOAD_TOTAL_MAX_BYTES)}; heartbeat ${mib(HEARTBEAT_MAX)} at ` +
         `${HEARTBEAT_PARSE_COST}x; archive chunk ${archiveChunkLabel()} ` +
