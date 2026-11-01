@@ -1216,6 +1216,29 @@ test("XERK-2598: an SSE frame BEFORE the re-read was asked doesn't void the re-r
   assert.ok(autoIsOn(slot, site), "the re-read, asked after the frame, is the newer word");
 });
 
+test("XERK-2598: an older click's re-read never outvotes a newer click's OK", async () => {
+  const site = "rrmaxok.atlassian.net";
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", site)], autoStartOrgs: {} });
+  click("data-org-toggle", "");
+  const handlers = {};
+  Org.sse({ addEventListener: (t, fn) => { handlers[t] = fn; } });
+  let failA, okB, readA, call = 0;
+  global.fetch = (url) => {
+    if (url === "/api/agents") return new Promise((res) => { readA = res; });
+    return ++call === 1 ? new Promise((_, rej) => { failA = () => rej(new TypeError("network")); })
+      : new Promise((res) => { okB = () => res({ ok: true, status: 200 }); });
+  };
+  const a = Org.setAutoStart(site, true);
+  const b = Org.setAutoStart(site, false);
+  handlers.autoStartOrgs({ data: "{}" });                              // B's own frame: off
+  failA(); await tick();                                               // A lost; its re-read is asked
+  okB(); await b;                                                      // B's OK (voided by the frame)
+  readA({ ok: true, status: 200, json: async () => ({ autoStartOrgs: { [site]: true } }) });
+  await a;
+  assert.ok(!autoIsOn(slot, site), "B is newer and the hub took it");
+});
+
 test("XERK-2598: a failed color pick repaints the control back", async () => {
   const { slot } = mountOrg();
   Org.update({ agents: [agent("a", "acme.atlassian.net")], orgColors: {} });
