@@ -68,8 +68,20 @@
 
   const SIGNOUT = "fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;";
 
-  function tabsHtml(active) {
-    const tabs = PAGES.map(p =>
+  // The admin panel's tab (XERK-2552) shows only for a principal holding the admin
+  // role. /api/me answers after first paint, so the last answer is remembered per
+  // browser (`turma-admin`) and the tab painted from it on mount — else it would pop
+  // in on every page load and move the header row (XERK-2432). The hub, not this
+  // flag, decides access: a stale "1" only shows a tab whose page 404s.
+  const ADMIN_TAB = { id: "admin", href: "/admin", label: "Admin" };
+  function adminCached() {
+    try { return typeof localStorage !== "undefined" && localStorage.getItem("turma-admin") === "1"; } catch { return false; }
+  }
+  function rememberAdmin(on) {
+    try { if (typeof localStorage !== "undefined") localStorage.setItem("turma-admin", on ? "1" : "0"); } catch { /* storage off */ }
+  }
+  function tabsHtml(active, showAdmin = active === "admin" || adminCached()) {
+    const tabs = (showAdmin ? [...PAGES, ADMIN_TAB] : PAGES).map(p =>
       // data-label lets app.css reserve each tab's BOLD width, so lighting a
       // different tab on another page can't nudge the header's row (XERK-2432).
       `<a href="${p.href}"${p.id === active ? ' class="active"' : ""} data-label="${esc(p.label)}">${esc(p.label)}</a>`
@@ -115,14 +127,26 @@
     "so there are no hosts, sessions or tickets to show. Sign in with a user account to work in a workspace.";
   function adminOnlyNoteHtml(me) {
     return me && me.adminOnly === true
-      ? `<div class="admin-only-note" role="status">${esc(ADMIN_ONLY_NOTE)}</div>` : "";
+      ? `<div class="admin-only-note" role="status">${esc(ADMIN_ONLY_NOTE)} <a href="/admin">Open the admin panel</a>.</div>` : "";
   }
   function applyMe(doc, me) {
+    const isAdmin = !!(me && Array.isArray(me.roles) && me.roles.includes("admin"));
+    rememberAdmin(isAdmin);
+    // The tab row is Sign out's parent (the header renders them together).
+    const signout = doc.getElementById("navSignout");
+    const tabsEl = signout && signout.parentNode;
+    const hasTab = !!(tabsEl && tabsEl.querySelector && tabsEl.querySelector('a[href="/admin"]'));
+    if (tabsEl && tabsEl.querySelector && hasTab !== isAdmin) {
+      const hdr = doc.getElementById("siteHeader");
+      const page = (hdr && hdr.dataset && hdr.dataset.page) || "";
+      tabsEl.outerHTML = tabsHtml(page, isAdmin || page === "admin");
+    }
     const so = doc.getElementById("navSignout");
     const label = meLabel(me);
     if (so && label) so.title = label;
     const header = doc.getElementById("siteHeader");
-    const html = adminOnlyNoteHtml(me);
+    // The admin panel is where an admin-only account works: no note there.
+    const html = header && header.dataset && header.dataset.page === "admin" ? "" : adminOnlyNoteHtml(me);
     const shown = doc.querySelector(".admin-only-note");
     if (header && html && !shown) header.insertAdjacentHTML("afterend", html);
     else if (!html && shown && shown.remove) shown.remove();

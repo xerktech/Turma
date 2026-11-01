@@ -33,6 +33,7 @@
 //   session       a live session id in the path: 404 unless its host is the principal's
 //   transcript    <tid> in the path: 404 unless its host is the principal's
 //   filtered      the handler filters what it returns to the principal
+//   admin         the admin role only (XERK-2552); identities, never tenant data
 //
 // A pattern segment `:x` matches any one segment; a trailing `*` any remainder.
 const ROUTES = [
@@ -125,6 +126,13 @@ const ROUTES = [
   ["GET PUT", "/api/orgs/:site/daily-brief/schedule", "org"],
   // per repo
   ["POST", "/api/repos/:repo/tier", "repo"],
+  // the admin panel (XERK-2552): identities only
+  ["GET", "/admin", "admin"], ["GET", "/admin.html", "admin"],
+  ["GET POST", "/api/admin/users", "admin"],
+  ["PATCH DELETE", "/api/admin/users/:id", "admin"],
+  ["POST", "/api/admin/users/:id/password", "admin"],
+  ["GET PUT", "/api/admin/groups", "admin"],
+  ["GET", "/api/admin/audit", "admin"],
 ];
 
 // WebSocket upgrades (server.on("upgrade")), the same classes.
@@ -136,7 +144,7 @@ const UPGRADES = [
 ];
 
 const CLASSES = new Set(["public", "agent", "automation", "signed-in", "host", "session", "org",
-  "repo", "transcript", "filtered"]);
+  "repo", "transcript", "filtered", "admin"]);
 
 function compile(pattern) {
   const segs = pattern.split("/").filter(Boolean);

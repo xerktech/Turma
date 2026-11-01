@@ -224,6 +224,7 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   dedupe twin's tracker URL. Keys round-trip unchanged in route URLs.
 - **`purgeTenantData(tenantId)` is the one tenant-delete entry point**; each store registers its own
   purge (`registerTenantPurge`), each run in its own try/catch. A new per-tenant store must register.
+  Deleting a user in the admin panel runs it (kills, revoke, purge order: `turma-admin.md`).
 - The `/api/agents` payload + SSE carry only the caller's orgs' maps (XERK-2534, below).
 - Tests: the `XERK-2551:` cases in `server.test.js`.
 - **A claimed siteKey grants nothing** (XERK-2596): an org's membership, writes and dispatch all
