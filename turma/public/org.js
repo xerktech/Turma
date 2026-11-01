@@ -461,6 +461,8 @@
     const k = kind + "\0" + siteKey;
     const n = (clicks.get(k) || 0) + 1;
     clicks.set(k, n);
+    const newest = () => clicks.get(k) === n;
+    const clickGen = hubGen[kind];
     showLocal(kind, siteKey, value);
     let ok = false, netErr = false;
     try {
@@ -470,15 +472,24 @@
       if (r.status === 401) { location.href = "/login"; return; }
       ok = r.ok;
     } catch { netErr = true; /* outcome unknown — re-read below */ }
-    if (ok) { confirmed[kind] = withValue(confirmed[kind], siteKey, value); return; }
+    // An answer counts as the hub's word only while nothing newer has spoken:
+    // no newer click on this switch, and no SSE frame of the map since it was
+    // asked (a frame is the whole map). A late 200 otherwise overwrote a newer
+    // click's or another client's change, and the next failure painted it.
+    if (ok) {
+      if (newest() && hubGen[kind] === clickGen) {
+        confirmed[kind] = withValue(confirmed[kind], siteKey, value);
+      }
+      return;
+    }
     if (netErr) {
       const gen = hubGen[kind];
       const hub = await hubOrgMap(FIELD[kind]);
-      if (hub && hubGen[kind] === gen) {
+      if (hub && newest() && hubGen[kind] === gen) {
         confirmed[kind] = withValue(confirmed[kind], siteKey, valueIn(kind, hub, siteKey));
       }
     }
-    if (clicks.get(k) !== n) return;   // a newer click owns this switch now
+    if (!newest()) return;   // a newer click owns this switch now
     showLocal(kind, siteKey, valueIn(kind, confirmed[kind], siteKey));
   }
 
