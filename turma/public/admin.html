@@ -206,21 +206,21 @@ function groupsHtml() {
       ${groups.isDefault && !groupDraft ? `<div class="ad-meta">These are the shipped defaults; saving makes them yours to edit.</div>` : ""}</div>`;
 }
 
-// An audit label for an SSO user leads with `oidc:<id>`, which only the hub
-// writes (the display name follows it). That id links to the user's own card,
-// matched by id rather than by text: a display name can be made to look like
-// any label, in a page search too (XERK-2631).
-function auditLabelHtml(label) {
-  const m = /^oidc:([0-9a-f]{32}) /.exec(label);
-  if (!m || !users || !users.some((u) => u.id === m[1])) return esc(label);
-  return `<a href="#user-${m[1]}">oidc:${m[1]}</a>${esc(label.slice(m[0].length - 1))}`;
+// An SSO user's audit label leads with `oidc:<id>`, and the hub sends that id
+// beside the row (actorId/targetId). Only that field links the label to the
+// user's own card, matched by id, never by reading the label: a display name can
+// spell any label, in an older hub's rows and in a page search alike (XERK-2631).
+function auditLabelHtml(label, id) {
+  const lead = id ? `oidc:${id} ` : "";
+  if (!lead || !label.startsWith(lead) || !users || !users.some((u) => u.id === id)) return esc(label);
+  return `<a href="#user-${esc(id)}">oidc:${esc(id)}</a>${esc(label.slice(lead.length - 1))}`;
 }
 
 function auditHtml() {
   if (!audit) return `<div class="ad-meta">Loading…</div>`;
   if (!audit.length) return `<div class="ad-meta">No admin actions yet.</div>`;
   return `<ul class="ad-audit">${audit.map((e) => `<li><span class="when">${esc(fmtWhen(e.at))}</span> ·
-    <b>${auditLabelHtml(e.actor)}</b> <span class="act">${esc(e.action)}</span>${e.target ? ` ${auditLabelHtml(e.target)}` : ""}
+    <b>${auditLabelHtml(e.actor, e.actorId)}</b> <span class="act">${esc(e.action)}</span>${e.target ? ` ${auditLabelHtml(e.target, e.targetId)}` : ""}
     ${e.detail ? `<div class="detail">${esc(e.detail)}</div>` : ""}</li>`).join("")}</ul>`;
 }
 

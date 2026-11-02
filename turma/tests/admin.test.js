@@ -282,8 +282,8 @@ test("XERK-2631: an SSO user is named in the audit log by its fixed id, not only
   assert.equal((await request("PATCH", `/api/admin/users/${user.id}`, { headers: h, body: { groups: ["devs"] } })).status, 200);
   const audit = await request("GET", "/api/admin/audit", { headers: h });
   const rows = audit.body.entries.filter((e) => e.action === "user.update" && e.detail.includes("devs"));
-  assert.deepEqual(rows.map((e) => e.target), [`oidc:${user.id} (rootadmin (local))`],
-    "the stable id leads, so the display name cannot pose as another label");
+  assert.deepEqual(rows.map((e) => [e.target, e.targetId]), [[`oidc:${user.id} (rootadmin (local))`, user.id]],
+    "the stable id leads, so the display name cannot pose as another label; the id rides the row");
   // The actor path names an SSO admin the same way.
   assert.equal(hub.adminActorLabel({ kind: "user", userId: user.id }), `oidc:${user.id} (rootadmin (local))`);
   // A long name is cut so the label survives the row's 120-char cap whole.
@@ -300,6 +300,15 @@ test("XERK-2631: an SSO user is named in the audit log by its fixed id, not only
 test("XERK-2631: an audit row loaded from disk loses bidi overrides", () => {
   const [row] = hub.coerceAdminAudit([{ at: 1, actor: "evil\u202Erev (oidc)", action: "user.update", target: "t\u2066x", detail: "d\u200Fq" }]);
   assert.deepEqual([row.actor, row.target, row.detail], ["evilrev (oidc)", "tx", "dq"]);
+  // An id is kept only where the label it names leads with it.
+  const ok = "a".repeat(32);
+  const [kept, dropped] = hub.coerceAdminAudit([
+    { at: 1, action: "user.update", actor: `oidc:${ok} (A)`, actorId: ok, target: "b (local)", targetId: ok },
+    { at: 2, action: "user.update", actor: `oidc:${ok} (A) (oidc)`, actorId: "x" },
+  ]);
+  assert.equal(kept.actorId, ok);
+  assert.equal(kept.targetId, undefined, "a local label never carries an id");
+  assert.equal(dropped.actorId, undefined);
 });
 
 test("XERK-2631: a display name loses bidi overrides and isolates", () => {

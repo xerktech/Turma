@@ -3369,10 +3369,10 @@ const ADMIN_AUDIT_FILE = process.env.ADMIN_AUDIT_FILE || "/data/admin-audit.json
 const ADMIN_AUDIT_MAX = 1000;
 const ADMIN_AUDIT_ACTIONS = new Set(["user.create", "user.update", "user.password", "user.delete",
   "groups.update"]);
+// Bidi overrides/isolates go too, so a row stored before names were cleaned of
+// them cannot reorder the panel's text (XERK-2631).
 function adminAuditClean(s, max) {
   // eslint-disable-next-line no-control-regex
-  // Bidi overrides/isolates too, so a row stored before names were cleaned of
-  // them cannot reorder the panel's text (XERK-2631).
   return typeof s === "string"
     ? s.replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "").slice(0, max) : "";
 }
@@ -3387,6 +3387,13 @@ function coerceAdminAudit(raw) {
     if (target) row.target = target;
     const detail = adminAuditClean(e.detail, 500);
     if (detail) row.detail = detail;
+    // The SSO user ids the hub wrote with the row (XERK-2631): the panel links a
+    // label to a card only through these, never by parsing the label, since a
+    // row from an older hub carries a display name that may spell any label.
+    for (const [idKey, label] of [["actorId", row.actor], ["targetId", row.target]]) {
+      const id = e[idKey];
+      if (typeof id === "string" && /^[0-9a-f]{32}$/.test(id) && label && label.startsWith(`oidc:${id} `)) row[idKey] = id;
+    }
     out.push(row);
   }
   return out.slice(-ADMIN_AUDIT_MAX);
@@ -3418,10 +3425,16 @@ function adminUserLabel(u) {
 }
 // What /api/login answers (403) a user whose password an admin reset (XERK-2630).
 const PASSWORD_RESET_REFUSAL = "an administrator reset your password — choose a new one to sign in";
+// `target` is a user record (labelled here, its SSO id kept) or a plain string.
 function recordAdminAction(p, action, target, detail, now = Date.now()) {
-  adminAudit = coerceAdminAudit([...adminAudit, {
-    at: now, actor: adminActorLabel(p), action, target: target || "", detail: detail || "",
-  }]);
+  const row = { at: now, actor: adminActorLabel(p), action, target: "", detail: detail || "" };
+  const actorUser = p && p.userId && Object.hasOwn(tenancyState.users, p.userId) ? tenancyState.users[p.userId] : null;
+  if (actorUser && actorUser.source === "oidc") row.actorId = actorUser.id;
+  if (target && typeof target === "object") {
+    row.target = adminUserLabel(target);
+    if (target.source === "oidc") row.targetId = target.id;
+  } else row.target = target || "";
+  adminAudit = coerceAdminAudit([...adminAudit, row]);
   persistAdminAudit();
 }
 // One user as the panel lists it: metadata ONLY — never the tenant id, a
@@ -23337,7 +23350,7 @@ const server = http.createServer(async (req, res) => {
           r = tenancy.createLocalUser(tenancyState, { username, displayName: displayName || username, passwordHash, groups });
         } catch (e) { return json(res, 409, { error: e.message }); }
         setTenancy(r.state);
-        recordAdminAction(p, "user.create", adminUserLabel(r.user), `groups: ${groups.join(", ") || "none"}`);
+        recordAdminAction(p, "user.create", r.user, `groups: ${groups.join(", ") || "none"}`);
         return json(res, 200, { ok: true, user: adminUserView(r.user) });
       }
       const m = /^\/api\/admin\/users\/([0-9a-f]{32})(\/password)?$/.exec(url.pathname);
@@ -23373,7 +23386,7 @@ const server = http.createServer(async (req, res) => {
         try { r = tenancy.updateUser(tenancyState, target.id, patch); } catch (e) { return json(res, 400, { error: e.message }); }
         if (!adminWayInRemains(r.state)) return json(res, 409, { error: ADMIN_STRANDED });
         setTenancy(r.state);
-        recordAdminAction(p, "user.update", adminUserLabel(r.user), said.join("; "));
+        recordAdminAction(p, "user.update", r.user, said.join("; "));
         return json(res, 200, { ok: true, user: adminUserView(r.user) });
       }
       if (m && m[2] && req.method === "POST") {
@@ -23396,15 +23409,14 @@ const server = http.createServer(async (req, res) => {
           passwordResets: resets.slice(-tenancy.PASSWORD_RESETS_KEPT),
         });
         setTenancy(r.state);
-        recordAdminAction(p, "user.password", adminUserLabel(r.user), "password reset; sessions ended, new password required");
+        recordAdminAction(p, "user.password", r.user, "password reset; sessions ended, new password required");
         return json(res, 200, { ok: true, user: adminUserView(r.user) });
       }
       if (m && !m[2] && req.method === "DELETE") {
-        const label = adminUserLabel(target);
         const r = await deleteUserAndTenant(p, target.id);
         if (r.status !== 200) return json(res, r.status, { error: r.error });
         const b = r.body;
-        recordAdminAction(p, "user.delete", label,
+        recordAdminAction(p, "user.delete", target,
           `hosts ${b.hosts}, sessions killed ${b.sessionsKilled} (${b.killsDelivered} taken), ` +
           `agent tokens revoked ${b.identitiesRevoked}, enrollment codes ${b.enrollCodes}` +
           (Object.values(b.purge).includes("failed") ? `, purge failed: ${Object.keys(b.purge).filter((k) => b.purge[k] === "failed").join(", ")}` : ""));

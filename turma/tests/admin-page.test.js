@@ -44,11 +44,22 @@ test("XERK-2631: an SSO card shows its audit id; the audit row links to the card
   assert.ok(!text(page.userHtml(local)).includes("In the audit log"), "a local card is named by its username");
 
   page.set([attacker, victim, local], [{ at: 1, action: "user.update",
-    actor: `oidc:${attackerId} (${spoof})`, target: `oidc:${victimId} (Victim)` }]);
+    actor: `oidc:${attackerId} (${spoof})`, actorId: attackerId, target: `oidc:${victimId} (Victim)`, targetId: victimId }]);
   const row = page.auditHtml();
   const links = [...row.matchAll(/<a href="#user-([0-9a-f]{32})">/g)].map((m) => m[1]);
   assert.deepEqual(links, [attackerId, victimId], `the actor links to the attacker's card, the target to the victim's: ${row}`);
   assert.ok(row.includes(`(oidc:${victimId} (Victim))`), "the spoofed name is shown as plain text, never a link");
+
+  // A row from an older hub carries no id, and its label may be a display name
+  // that spells another account's label: it links nowhere.
+  page.set([attacker, victim], [{ at: 1, action: "user.update", actor: `oidc:${victimId} (Victim) (oidc)` }]);
+  assert.ok(!page.auditHtml().includes("<a "), "an id-less row is never linked by its text");
+  // An id that does not lead the label (a forged pairing) links nowhere either.
+  page.set([attacker, victim], [{ at: 1, action: "user.update", actor: `x oidc:${victimId} (V)`, actorId: victimId }]);
+  assert.ok(!page.auditHtml().includes("<a "));
+  // The name part is escaped inside a linked label.
+  page.set([attacker], [{ at: 1, action: "user.update", actor: `oidc:${attackerId} (<img src=x>)`, actorId: attackerId }]);
+  assert.ok(page.auditHtml().includes("(&lt;img src=x&gt;)"));
 
   // A row for a user no longer listed (deleted) links nowhere.
   page.set([local], [{ at: 1, action: "user.delete", actor: "rootadmin (local)", target: `oidc:${victimId} (Victim)` }]);
