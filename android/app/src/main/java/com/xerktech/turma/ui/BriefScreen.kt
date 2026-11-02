@@ -16,6 +16,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -41,14 +43,57 @@ import com.xerktech.turma.core.briefPage
 import com.xerktech.turma.core.briefSections
 import com.xerktech.turma.core.briefWhenLabel
 import com.xerktech.turma.core.effectiveOrgs
+import com.xerktech.turma.core.meetingsPending
 import com.xerktech.turma.core.mergeSites
 import com.xerktech.turma.core.nextBriefMeeting
 import com.xerktech.turma.core.orgName
 import com.xerktech.turma.model.DailyBrief
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.BriefViewModel
+import com.xerktech.turma.vm.MeetingsViewModel
 import java.time.ZoneId
 import java.util.Locale
+
+/** The Brief screen's two panes, as the web Brief page's sub-tabs (XERK-2623). */
+enum class BriefPane(val label: String) { BRIEF("Daily brief"), MEETINGS("Meetings") }
+
+/**
+ * The Brief tab: the Daily brief and the Meetings review (XERK-2623), one pane
+ * each, as the web's /brief and its #meetings. The pane lives in TurmaApp so a
+ * meetings push can open it.
+ */
+@Composable
+fun BriefScreen(
+    modifier: Modifier = Modifier,
+    pane: BriefPane = BriefPane.BRIEF,
+    onPane: (BriefPane) -> Unit = {},
+    vm: BriefViewModel = viewModel(),
+    meetingsVm: MeetingsViewModel = viewModel(),
+) {
+    LaunchedEffect(Unit) { vm.start() }
+    val fleet by vm.fleet.collectAsStateWithLifecycle()
+    val stored by vm.orgFilter.collectAsStateWithLifecycle()
+    val sites = remember(fleet.agents) { mergeSites(fleet.agents) }
+    val scoped = remember(stored, sites) { effectiveOrgs(stored, sites) }
+    val pending = remember(fleet.meetingProposals, scoped) { meetingsPending(fleet.meetingProposals, scoped) }
+
+    Column(modifier.fillMaxSize()) {
+        ScreenHeader("Brief")
+        TabRow(selectedTabIndex = pane.ordinal, containerColor = MaterialTheme.colorScheme.background) {
+            for (p in BriefPane.entries) {
+                Tab(
+                    selected = p == pane,
+                    onClick = { onPane(p) },
+                    text = { Text(if (p == BriefPane.MEETINGS && pending > 0) "${p.label} ($pending)" else p.label) },
+                )
+            }
+        }
+        when (pane) {
+            BriefPane.BRIEF -> DailyBriefPane(Modifier.weight(1f), vm)
+            BriefPane.MEETINGS -> MeetingsPane(Modifier.weight(1f), meetingsVm)
+        }
+    }
+}
 
 /**
  * The Daily Brief (XERK-2397, the web's Brief page): one org's latest standup
@@ -58,8 +103,7 @@ import java.util.Locale
  * Schedules are edited on the web only (android/PARITY.md).
  */
 @Composable
-fun BriefScreen(modifier: Modifier = Modifier, vm: BriefViewModel = viewModel()) {
-    LaunchedEffect(Unit) { vm.start() }
+private fun DailyBriefPane(modifier: Modifier, vm: BriefViewModel) {
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val stored by vm.orgFilter.collectAsStateWithLifecycle()
     val asking by vm.asking.collectAsStateWithLifecycle()
@@ -93,7 +137,6 @@ fun BriefScreen(modifier: Modifier = Modifier, vm: BriefViewModel = viewModel())
     }
 
     Column(modifier.fillMaxSize()) {
-        ScreenHeader("Brief")
         if (offered.size > 1) {
             Row(
                 Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())

@@ -14,7 +14,7 @@ import org.junit.Test
 import java.time.ZoneOffset
 import java.util.Locale
 
-/** The Meetings screen's pure logic (XERK-2511), pinned to meetings.html's behaviour. */
+/** The Meetings screen's pure logic (XERK-2511), pinned to meetings.js's behaviour. */
 class MeetingsTest {
 
     private val m = Meeting(
@@ -110,5 +110,22 @@ class MeetingsTest {
         val map = mapOf("b" to listOf(m), "a" to listOf(m), "c" to emptyList())
         assertEquals(listOf("a", "b"), meetingOrgs(map, emptySet()))
         assertEquals(listOf("b"), meetingOrgs(map, setOf("b", "c")))
+    }
+
+    @Test fun `the Brief tab counts proposals awaiting review in the shown orgs`() {
+        // XERK-2623, the web's pendingCount: reviewable and not rejected, in ok meetings only.
+        val items = listOf(
+            MeetingItem(id = "p1", kind = "bug", title = "a"),
+            MeetingItem(id = "p2", kind = "task", title = "b", review = MeetingReview(state = "failed")),
+            MeetingItem(id = "p3", kind = "task", title = "c", review = MeetingReview(state = "rejected")),
+            MeetingItem(id = "p4", kind = "decision", title = "d", review = MeetingReview(state = "logged")),
+        )
+        val map = mapOf(
+            "a.net" to listOf(m.copy(items = items), m.copy(meetingId = "m2", status = "running", items = items)),
+            "b.net" to listOf(m.copy(items = items.take(1))),
+        )
+        assertEquals(3, meetingsPending(map, emptySet()))
+        assertEquals(2, meetingsPending(map, setOf("a.net")))
+        assertEquals(0, meetingsPending(emptyMap(), emptySet()))
     }
 }

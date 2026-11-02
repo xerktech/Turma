@@ -84,13 +84,20 @@ val LocalTextSize = staticCompositionLocalOf { TextSizeControl() }
  * single-screen, so there is no per-tab stack worth preserving.
  */
 /**
- * The tab a notification's `click` path opens (XERK-2511), or null. Only the
- * path's first segment counts, so `/meetings?site=…` is the Meetings tab; a
- * session alert routes by host + session instead.
+ * The Brief pane a notification's `click` path opens, or null (XERK-2511, XERK-2623).
+ * The "N proposals" push sends `/brief?site=…#meetings`; an older hub's
+ * `/meetings?site=…` lands on the same pane. A session alert routes by host +
+ * session instead.
  */
-internal fun deepLinkTab(url: String?): TopDest? {
-    val path = url?.substringBefore('?')?.substringBefore('#')?.trim('/') ?: return null
-    return if (path == TopDest.MEETINGS.route) TopDest.MEETINGS else null
+internal fun deepLinkBriefPane(url: String?): BriefPane? {
+    if (url == null) return null
+    val path = url.substringBefore('#').substringBefore('?').trim('/')
+    val fragment = url.substringAfter('#', "")
+    return when {
+        path == "meetings" -> BriefPane.MEETINGS
+        path == TopDest.BRIEF.route -> if (fragment == "meetings") BriefPane.MEETINGS else BriefPane.BRIEF
+        else -> null
+    }
 }
 
 internal fun tabNavOptions(): NavOptionsBuilder.() -> Unit = {
@@ -151,6 +158,9 @@ fun TurmaApp(
         }
     }
 
+    // The Brief tab's pane (XERK-2623): kept across tab switches, set by a meetings push.
+    var briefPane by rememberSaveable { mutableStateOf(BriefPane.BRIEF) }
+
     // Route an FCM tap to the exact session once we're signed in.
     LaunchedEffect(pendingDeepLink, settings.configured) {
         val dl = pendingDeepLink ?: return@LaunchedEffect
@@ -172,9 +182,12 @@ fun TurmaApp(
                 launchSingleTop = true
             }
             nav.navigate(Routes.chat(dl.host, dl.sessionId)) { launchSingleTop = true }
-        } else if (deepLinkTab(dl.url) == TopDest.MEETINGS) {
-            // "N proposals from <meeting>" (XERK-2511): open the Meetings tab.
-            nav.navigate(TopDest.MEETINGS.route, tabNavOptions())
+        } else {
+            // "N proposals from <meeting>" (XERK-2511): Brief, on its Meetings pane.
+            deepLinkBriefPane(dl.url)?.let { p ->
+                briefPane = p
+                nav.navigate(TopDest.BRIEF.route, tabNavOptions())
+            }
         }
         onDeepLinkConsumed()
     }
@@ -247,10 +260,9 @@ fun TurmaApp(
             MainScaffold(TopDest.USAGE, goTab) { m -> UsageScreen(modifier = m) }
         }
         composable(TopDest.BRIEF.route) {
-            MainScaffold(TopDest.BRIEF, goTab) { m -> BriefScreen(modifier = m) }
-        }
-        composable(TopDest.MEETINGS.route) {
-            MainScaffold(TopDest.MEETINGS, goTab) { m -> MeetingsScreen(modifier = m) }
+            MainScaffold(TopDest.BRIEF, goTab) { m ->
+                BriefScreen(modifier = m, pane = briefPane, onPane = { briefPane = it })
+            }
         }
         composable(
             "chat/{host}/{session}",

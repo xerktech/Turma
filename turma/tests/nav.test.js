@@ -14,11 +14,11 @@ const path = require("node:path");
 const { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, preserveScroll } = require("../public/nav.js");
 
 const PUBLIC = path.join(__dirname, "..", "public");
-const PAGE_FILES = ["index.html", "sessions.html", "board.html", "usage.html", "insights.html", "brief.html", "meetings.html"];
+const PAGE_FILES = ["index.html", "sessions.html", "board.html", "usage.html", "insights.html", "brief.html"];
 
 test("nav: every page's tab is in the list, once", () => {
   const ids = PAGES.map(p => p.id);
-  assert.deepEqual(ids, ["dashboard", "sessions", "board", "brief", "meetings", "usage", "insights"]);
+  assert.deepEqual(ids, ["dashboard", "sessions", "board", "brief", "usage", "insights"]);
   assert.equal(new Set(ids).size, ids.length);
 });
 

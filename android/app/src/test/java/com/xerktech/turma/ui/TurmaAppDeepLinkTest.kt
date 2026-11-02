@@ -2,6 +2,7 @@ package com.xerktech.turma.ui
 
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isSelected
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.test.core.app.ApplicationProvider
 import com.xerktech.turma.MainActivity
@@ -59,8 +60,10 @@ class TurmaAppDeepLinkTest {
 
     /**
      * A "N proposals from <meeting>" push carries only a click path (rollup
-     * XERK-2602): tapping it must land on the Meetings tab. `deepLinkTab` is
-     * pinned alone in `BottomNavTabTest`; this pins the effect that acts on it.
+     * XERK-2602): tapping it must land on Brief's Meetings pane (XERK-2623).
+     * `deepLinkBriefPane` is pinned alone in `BottomNavTabTest`; this pins the
+     * effect that acts on it. It asserts the selected pane, not the pane's content:
+     * the screen's default `viewModel()` can hold an earlier test's fleet.
      */
     @Test fun aMeetingsPushOpensTheMeetingsTab() {
         container.config.save("http://localhost:1/", "op", "pw")
@@ -69,13 +72,13 @@ class TurmaAppDeepLinkTest {
             TurmaApp(
                 container = container,
                 wide = false,
-                pendingDeepLink = MainActivity.DeepLink(null, null, "/meetings?site=o.atlassian.net"),
+                pendingDeepLink = MainActivity.DeepLink(null, null, "/brief?site=o.atlassian.net#meetings"),
                 onDeepLinkConsumed = { consumed = true },
             )
         }
         compose.waitForIdle()
         assertTrue("the meetings link must be consumed", consumed)
-        compose.onAllNodes(hasText("No meetings yet", substring = true)).assertCountEquals(1)
+        compose.onAllNodes(hasText("Meetings", substring = true) and isSelected()).assertCountEquals(1)
     }
 
     /** A click path naming no tab is consumed but moves nothing: the app stays on the Dashboard. */
@@ -92,6 +95,6 @@ class TurmaAppDeepLinkTest {
         }
         compose.waitForIdle()
         assertTrue("the link must be consumed", consumed)
-        compose.onAllNodes(hasText("No meetings yet", substring = true)).assertCountEquals(0)
+        compose.onAllNodes(hasText("Meetings", substring = true) and isSelected()).assertCountEquals(0)
     }
 }

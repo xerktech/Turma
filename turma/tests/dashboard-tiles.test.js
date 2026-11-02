@@ -622,7 +622,7 @@ test("XERK-2598: an SSE RECONNECT re-reads /api/agents once; the first open does
 test("XERK-2598: every page's SSE reconnect re-reads its snapshot", () => {
   // The per-stream dedupe sends a whole-map event only when the stream's slice
   // changes, so a fresh stream never repairs what moved while it was down.
-  for (const f of ["index", "sessions", "usage", "insights", "brief", "meetings", "board"]) {
+  for (const f of ["index", "sessions", "usage", "insights", "brief", "board"]) {
     const html = fs.readFileSync(path.join(__dirname, "..", "public", f + ".html"), "utf8");
     const open = html.match(/es\.onopen = \(\) => \{([\s\S]*?)\n  \};/);
     assert.ok(open, `${f}: onopen block`);
