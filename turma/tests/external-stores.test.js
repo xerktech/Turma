@@ -32,7 +32,7 @@ for (const v of [
   "ORG_COLORS_FILE", "REPO_TIERS_FILE", "EPIC_RUNS_FILE", "EPIC_BUILDERS_FILE",
   "USAGE_LEDGER_FILE", "STATE_FILE", "PERMISSION_POLICIES_FILE", "AGENT_IDENTITIES_FILE",
   "DECISIONS_FILE", "MODEL_POLICY_FILE", "DAILY_BRIEF_SCHEDULES_FILE", "DAILY_BRIEFS_FILE",
-  "MEETING_PROPOSALS_FILE", "TENANCY_FILE", "MEETING_TOKENS_FILE", "ARCHIVE_PURGED_TENANTS_FILE",
+  "MEETING_PROPOSALS_FILE", "MEETING_LABELS_FILE", "MEETING_LABEL_MISSES_FILE", "TENANCY_FILE", "MEETING_TOKENS_FILE", "ARCHIVE_PURGED_TENANTS_FILE",
   "ADMIN_AUDIT_FILE",
 ]) {
   process.env[v] = tmp(v.toLowerCase());
@@ -68,6 +68,8 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     "dailyBriefs",
     // XERK-2508: meetings Tenir posted (a 200 promises the row is kept).
     "meetingProposals",
+    // XERK-2638: each org's meeting label, and the labels Tenir sent that name no org.
+    "meetingLabels", "meetingLabelMisses",
     // XERK-2531: one-time host enrollment codes (hashed; a used stamp must stick).
     "enrollCodes",
     // XERK-2530: hub users + tenants.

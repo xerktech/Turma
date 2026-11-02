@@ -1026,6 +1026,9 @@ those are marked `[MODEL]`.
   (SharedPreferences), as the web keeps it per browser.
 - Phone-only: the "N proposals from <meeting>" push (channel "Meeting proposals"); a tap opens
   the Brief tab on its Meetings pane.
+- **Gap (XERK-2638)**: the web pane's "Tenir labels" list and its unmapped-label banner are
+  web-only. Android ignores `meetingLabels`/`meetingLabelMisses` (untyped keys); set or map a
+  label from the web. P2: a one-time setup per org.
 
 ### Nav / Login
 - **Native Authentik SSO is IMPLEMENTED on Android (XERK-591).** `LoginScreen.kt` shows a "Sign in

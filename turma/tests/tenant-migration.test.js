@@ -28,7 +28,7 @@ for (const k of [
   "PERMISSION_POLICIES_FILE", "TRIAGE_ACTIONS_FILE", "PRIORITY_WRITEBACK_ORGS_FILE",
   "DEDUPE_LINK_ORGS_FILE", "AUTOMERGE_ORGS_FILE", "ORG_COLORS_FILE", "REPO_TIERS_FILE",
   "EPIC_RUNS_FILE", "EPIC_BUILDERS_FILE", "DECISIONS_FILE", "TENANCY_FILE",
-  "DAILY_BRIEF_SCHEDULES_FILE", "DAILY_BRIEFS_FILE", "MEETING_PROPOSALS_FILE", "MEETING_TOKENS_FILE",
+  "DAILY_BRIEF_SCHEDULES_FILE", "DAILY_BRIEFS_FILE", "MEETING_PROPOSALS_FILE", "MEETING_LABELS_FILE", "MEETING_LABEL_MISSES_FILE", "MEETING_TOKENS_FILE",
   "ARCHIVE_PURGED_TENANTS_FILE", "USAGE_LEDGER_FILE", "PERMISSION_LEDGER_FILE", "OUTCOME_LEDGER_FILE",
 ]) process.env[k] = path.join(DIR, `${k.toLowerCase()}.json`);
 process.env.MIGRATE_SPOOL_DIR = path.join(DIR, "spool");
@@ -97,6 +97,8 @@ const ORG_SAMPLES = {
     day: "Done.", week: "Done.", next: "Nothing." }]],
   meetingProposals: [SITE, [{ meetingId: "m-2554", status: "ok", title: "Standup", platform: "zoom",
     startedAt: NOW - 6e5, endedAt: NOW, receivedAt: NOW, participants: [], items: [] }]],
+  meetingLabels: [SITE, "acme"],
+  meetingLabelMisses: ["yprime", { at: NOW }],
   ticketAgents: [`${SITE}/ACME-1`, { host: "box2554", at: NOW }],
   ticketModels: [`${SITE}/ACME-1`, { model: "sonnet", at: NOW }],
   ticketRuntimes: [`${SITE}/ACME-1`, { runtime: "dsh", at: NOW }],
@@ -188,7 +190,8 @@ test("XERK-2554: the migration moves every store into the owner's tenant; hosts 
   // Org stores: the plain key is gone, the tenant's holds the value.
   for (const s of hub.tenantOrgStores()) {
     const [k] = ORG_SAMPLES[s.name];
-    const nk = k === SITE ? tk(SITE) : `${tk(SITE)}${k.slice(SITE.length)}`;
+    // A meeting-label miss is keyed by the label, scoped like a site (XERK-2638).
+    const nk = !k.startsWith(SITE) ? `${k}@${T}` : k === SITE ? tk(SITE) : `${tk(SITE)}${k.slice(SITE.length)}`;
     assert.ok(!Object.prototype.hasOwnProperty.call(s.read(), k), `${s.name}: plain key left behind`);
     assert.ok(Object.prototype.hasOwnProperty.call(s.read(), nk), `${s.name}: not moved to ${nk}`);
   }

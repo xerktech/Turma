@@ -665,6 +665,11 @@ const DAILY_BRIEFS_FILE = process.env.DAILY_BRIEFS_FILE || "/data/daily-briefs.j
 // siteKey -> newest-first meetings. Written per meeting/run, human rate.
 const MEETING_PROPOSALS_FILE =
   process.env.MEETING_PROPOSALS_FILE || "/data/meeting-proposals.json";
+// The short label Tenir names each org by (XERK-2638): siteKey -> the
+// operator's label, and the labels Tenir sent that name no org. Human rate.
+const MEETING_LABELS_FILE = process.env.MEETING_LABELS_FILE || "/data/meeting-labels.json";
+const MEETING_LABEL_MISSES_FILE =
+  process.env.MEETING_LABEL_MISSES_FILE || "/data/meeting-label-misses.json";
 // Each tenant's Tenir bearer, as its SHA-256 only (XERK-2551).
 const MEETING_TOKENS_FILE = process.env.MEETING_TOKENS_FILE || "/data/meeting-tokens.json";
 // Tenants whose archive data was purged (XERK-2549): tombstones every replica reads.
@@ -5421,6 +5426,177 @@ function broadcastMeetingsSoon() {
   });
 }
 
+// ---- meeting labels (XERK-2638) -------------------------------------------------
+// Tenir's capture client names each window's org by a short label ("yprime"),
+// never a tracker host; the hub maps it to the org here. Each org's label is the
+// operator's pick (`meetingLabels`), else a slug of its name. The Tenir post
+// still takes a site key in the same URL slot, so an older config keeps working.
+// Contract: .claude/rules/contract-meetings.md.
+const MEETING_LABEL_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+const MEETING_LABEL_MISSES_TENANT_MAX = 20; // per tenant; meetingLabelMissesCoerce inlines 20 x 10
+// A miss already noted is re-written at most this often (Tenir retries).
+const MEETING_LABEL_MISS_REWRITE_MS = 10 * 60e3;
+function meetingLabelsCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw).slice(0, 2000)) {
+    if (k && k.length <= 200 && typeof v === "string" && /^[a-z0-9][a-z0-9_-]{0,39}$/.test(v)) out[k] = v;
+  }
+  return out;
+}
+// Key: the label scoped like a site (`<label>@<tenantId>`), so the payload's
+// per-org scoper shows a tenant its own misses only.
+function meetingLabelMissesCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw).slice(0, 200)) {
+    if (!/^[a-z0-9][a-z0-9_-]{0,39}(@[0-9a-f]{32})?$/.test(k) || !v || typeof v !== "object") continue;
+    if (!Number.isFinite(v.at) || v.at <= 0) continue;
+    out[k] = v.shared === true ? { at: v.at, shared: true } : { at: v.at };
+  }
+  return out;
+}
+let meetingLabels = meetingLabelsCoerce(readJsonFile(MEETING_LABELS_FILE));
+const persistMeetingLabels = registerExternalStore({
+  name: "meetingLabels", file: MEETING_LABELS_FILE,
+  coerce: meetingLabelsCoerce, read: () => meetingLabels, install: (v) => { meetingLabels = v; },
+});
+let meetingLabelMisses = meetingLabelMissesCoerce(readJsonFile(MEETING_LABEL_MISSES_FILE));
+const persistMeetingLabelMisses = registerExternalStore({
+  name: "meetingLabelMisses", file: MEETING_LABEL_MISSES_FILE,
+  coerce: meetingLabelMissesCoerce, read: () => meetingLabelMisses,
+  install: (v) => { meetingLabelMisses = v; },
+});
+// "Acme Corp" -> "acme-corp". "" when nothing label-shaped is left.
+function meetingLabelSlug(text) {
+  const s = String(text || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+/, "").slice(0, 40).replace(/-+$/, "");
+  return MEETING_LABEL_RE.test(s) ? s : "";
+}
+// Each decided org's DEFAULT label: a slug of its name as the clients show it
+// (board.js `orgName`): a host's configured name, else the site without its
+// tenant, Jira suffix or ADO path. One pass over the hosts; the name is cut to
+// MEETING_ORG_NAME_SLUG_MAX first, since `jira.orgName` is agent-sent and
+// unbounded (a 4M-char name blocked every resolve ~800ms, XERK-2638 QA).
+const MEETING_ORG_NAME_SLUG_MAX = 120;
+function defaultMeetingLabels(orgs = decidedOrgs()) {
+  const names = new Map();
+  for (const a of Object.values(agents)) {
+    const n = a && a.jira && typeof a.jira.orgName === "string"
+      ? a.jira.orgName.slice(0, MEETING_ORG_NAME_SLUG_MAX).trim() : "";
+    const org = n ? decidedOrgOf(a) : "";
+    if (org && !names.has(org)) names.set(org, n);
+  }
+  const out = new Map();
+  for (const site of orgs) {
+    let n = names.get(site);
+    if (!n) {
+      const s = baseOfSite(site);
+      n = s.includes("/") ? (s.split("/").filter(Boolean).pop() || s) : s.replace(/\.atlassian\.net$/i, "");
+    }
+    out.set(site, meetingLabelSlug(n.slice(0, MEETING_ORG_NAME_SLUG_MAX)));
+  }
+  return out;
+}
+const ownLabel = (siteKey) => (Object.hasOwn(meetingLabels, siteKey) ? meetingLabels[siteKey] : "");
+// Each decided org's EFFECTIVE label ("" = none): the operator's, else its
+// default unless another org of its tenant took that as its own label (an
+// operator's label outranks a default, so setting one never needs the other
+// org renamed first).
+function effectiveMeetingLabels(orgs = decidedOrgs()) {
+  const defaults = defaultMeetingLabels(orgs);
+  const taken = new Set();
+  for (const s of orgs) if (ownLabel(s)) taken.add(`${tenantOfSite(s)}\u0000${ownLabel(s)}`);
+  const out = new Map();
+  for (const s of orgs) {
+    const own = ownLabel(s), def = defaults.get(s) || "";
+    out.set(s, { label: own || (taken.has(`${tenantOfSite(s)}\u0000${def}`) ? "" : def), custom: !!own });
+  }
+  return out;
+}
+// Every decided org of tenant `t` whose effective label is `label`.
+function meetingLabelHits(label, t, orgs = decidedOrgs()) {
+  const mine = new Set([...orgs].filter((s) => tenantOfSite(s) === t));
+  return [...effectiveMeetingLabels(mine)].filter(([, v]) => v.label === label).map(([s]) => s);
+}
+// What clients read: every decided org, its label ("" = none, so the operator
+// can still give it one) and whether the operator set it.
+function meetingLabelsWire() {
+  const out = Object.create(null);
+  for (const [s, v] of effectiveMeetingLabels()) out[s] = v;
+  return out;
+}
+function broadcastMeetingLabels() {
+  invalidateAgentsCache();
+  sseBroadcast("meetingLabels", meetingLabelsWire());
+  sseBroadcast("meetingLabelMisses", meetingLabelMisses);
+}
+function noteMeetingLabelMiss(label, t, shared, now = Date.now()) {
+  const k = scopeSite(label, t);
+  const cur = Object.hasOwn(meetingLabelMisses, k) ? meetingLabelMisses[k] : null;
+  if (cur && !!cur.shared === shared && now - cur.at < MEETING_LABEL_MISS_REWRITE_MS) return;
+  meetingLabelMisses[k] = shared ? { at: now, shared: true } : { at: now };
+  // Oldest of this tenant out first; past the hard total (the coerce's 200),
+  // from the tenant holding the most (XERK-2621), never another's at random.
+  const ofTenant = Object.keys(meetingLabelMisses).filter((x) => tenantOfSite(x) === t)
+    .sort((x, y) => meetingLabelMisses[x].at - meetingLabelMisses[y].at);
+  while (ofTenant.length > MEETING_LABEL_MISSES_TENANT_MAX) delete meetingLabelMisses[ofTenant.shift()];
+  for (const x of trimByTenant(meetingLabelMisses, MEETING_LABEL_MISSES_TENANT_MAX * 10,
+    (key) => tenantOfSite(key), (v) => v.at, k)) delete meetingLabelMisses[x];
+  persistMeetingLabelMisses();
+  broadcastMeetingLabels();
+}
+function forgetMeetingLabelMiss(label, t) {
+  const k = scopeSite(label, t);
+  if (!Object.hasOwn(meetingLabelMisses, k)) return false;
+  delete meetingLabelMisses[k];
+  persistMeetingLabelMisses();
+  return true;
+}
+// The org a Tenir post's URL names, for the token's tenant `t`: {site} (scoped;
+// an org no host is in still reaches the route's own 404) or {error} for a
+// label no org, or more than one, answers to — noted so the operator can map it.
+function resolveMeetingOrg(urlSite, t) {
+  const scoped = scopeSite(urlSite, t);
+  const orgs = decidedOrgs();
+  if (orgs.has(scoped)) return { site: scoped };
+  const label = urlSite.toLowerCase();
+  if (!MEETING_LABEL_RE.test(label)) return { site: scoped };
+  const hits = meetingLabelHits(label, t, orgs);
+  if (hits.length === 1) {
+    if (forgetMeetingLabelMiss(label, t)) broadcastMeetingLabels();
+    return { site: hits[0] };
+  }
+  noteMeetingLabelMiss(label, t, hits.length > 1);
+  return { error: hits.length
+    ? `more than one org has the meeting label "${label}" — give one of them its own label on the Brief page`
+    : `no org has the meeting label "${label}" — set it on the Brief page` };
+}
+// The operator sets (or, with null, resets) an org's label: {status, body}.
+function setMeetingLabel(siteKey, raw) {
+  if (raw !== null && typeof raw !== "string") return { status: 400, body: { error: "label must be text or null" } };
+  const label = raw === null ? "" : raw.trim().toLowerCase();
+  if (raw !== null && !MEETING_LABEL_RE.test(label)) {
+    return { status: 400, body: { error: "label must be 1-40 lowercase letters, digits, - or _, starting with a letter or digit" } };
+  }
+  const t = tenantOfSite(siteKey);
+  // Only another org's OWN label refuses: a default yields to it (the other
+  // org then has none until the operator gives it one), else a label two
+  // orgs' defaults share could never be mapped (XERK-2638 QA).
+  const other = label && Object.keys(meetingLabels).find((s) => s !== siteKey && meetingLabels[s] === label &&
+    tenantOfSite(s) === t && decidedOrgs().has(s));
+  if (other) {
+    return { status: 409, body: { error: `the org ${baseOfSite(other)} already has the meeting label "${label}"` } };
+  }
+  if (label) meetingLabels[siteKey] = label;
+  else delete meetingLabels[siteKey];
+  persistMeetingLabels();
+  const effective = effectiveMeetingLabels().get(siteKey) || { label: "", custom: !!label };
+  if (effective.label) forgetMeetingLabelMiss(effective.label, t);
+  broadcastMeetingLabels();
+  return { status: 200, body: { ok: true, label: effective.label, custom: effective.custom } };
+}
+
 // Which hosts of an org report a repo by name — CLONED (on-disk `repos[]`) OR
 // merely LISTED among the org's triaged `jira.repoOptions` (a gh-clonable repo no
 // host has cloned yet). Used by the route to refuse a builder pinned to a repo no
@@ -7745,6 +7921,8 @@ const TENANT_ORG_STORES = [
   ["dailyBriefSchedules", () => dailyBriefSchedules, () => persistDailyBriefSchedules()],
   ["dailyBriefs", () => dailyBriefs, () => persistDailyBriefs()],
   ["meetingProposals", () => meetingProposals, () => persistMeetings()],
+  ["meetingLabels", () => meetingLabels, () => persistMeetingLabels()],
+  ["meetingLabelMisses", () => meetingLabelMisses, () => persistMeetingLabelMisses()],
   ["ticketAgents", () => ticketAgents, () => persistTicketAgents(), siteOfTicketKey],
   ["ticketModels", () => ticketModels, () => persistTicketModels(), siteOfTicketKey],
   ["ticketRuntimes", () => ticketRuntimes, () => persistTicketRuntimes(), siteOfTicketKey],
@@ -8620,6 +8798,11 @@ function buildAgentsCache() {
     // operator's review of each (XERK-2510): siteKey -> newest first, never a
     // transcript (meetingProposalsWire).
     meetingProposals: meetingProposalsWire(),
+    // Each org's meeting label (XERK-2638): siteKey -> {label, custom}, and the
+    // labels Tenir sent that no single org answers to: "<label>[@tenant]" ->
+    // {at, shared?}. Hub-owned; the Brief page's Meetings pane maps them.
+    meetingLabels: meetingLabelsWire(),
+    meetingLabelMisses,
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -22813,7 +22996,10 @@ const server = http.createServer(async (req, res) => {
         if (isMeetingsIngest) {
           const t = meetingsTenant(req);
           if (tenantOfSite(site) || t == null) return json(res, 404, { error: "no host is in that org" });
-          parts[2] = encodeURIComponent(scopeSite(site, t));
+          // A short label (XERK-2638) or, from an older config, the site itself.
+          const org = resolveMeetingOrg(site, t);
+          if (org.error) return json(res, 404, { error: org.error });
+          parts[2] = encodeURIComponent(org.site);
         } else if (!principalMaySite(requestPrincipal(req), site)) {
           return json(res, 404, { error: "no host is in that org" });
         }
@@ -26909,6 +27095,30 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, decision });
     }
 
+    // POST /api/orgs/<siteKey>/meeting-label — the operator names the org for
+    // Tenir (XERK-2638). Body {label: "<label>"|null}; null goes back to the
+    // default (a slug of the org's name). 404 an org no host is decided into,
+    // 400 a malformed label, 409 one another org of the tenant already has.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 4 && parts[3] === "meeting-label") {
+      const siteKey = decodeURIComponent(parts[2]);
+      if (!decidedOrgs().has(siteKey)) {
+        return json(res, 404, { error: "no host is in that org" });
+      }
+      let body;
+      try {
+        body = JSON.parse((await readBody(req, 4096)) || "null");
+      } catch (e) {
+        if (e && (e.tooLarge || e.budgetExceeded)) throw e;
+        return json(res, 400, { error: "body is not JSON" });
+      }
+      if (!body || typeof body !== "object" || Array.isArray(body) || !("label" in body)) {
+        return json(res, 400, { error: "body must be {label}" });
+      }
+      const out = setMeetingLabel(siteKey, body.label);
+      return json(res, out.status, out.body);
+    }
+
     // POST /api/orgs/<siteKey>/meetings — Tenir posting a finished meeting
     // (XERK-2508; authed at the gate by TURMA_MEETINGS_TOKEN). 404 an org no
     // host is decided into, before the body is read, so a refusal mints nothing.
@@ -28406,7 +28616,9 @@ if (process.env.TURMA_TEST) {
     getDailyBriefs: () => dailyBriefs, dailyBriefsCoerce, sanitizeDailyBrief, dailyBriefsWire,
     cleanBriefNarrative, dailyBriefDue, dailyBriefTick, startDailyBriefRun,
     ingestDailyBriefResults, dailyBriefRunNowAt,
-    getMeetings: () => meetingProposals, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
+    getMeetings: () => meetingProposals, getMeetingLabels: () => meetingLabels,
+    getMeetingLabelMisses: () => meetingLabelMisses, meetingLabelsCoerce, meetingLabelMissesCoerce,
+    meetingLabelSlug, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
     putMeeting, reviewMeetingItem, settleMeetingReviews, meetingProposalsWire, MEETING_START_WAIT_MS,
     MEETING_CREATE_DEADLINE_MS, acceptMeeting,
     ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETINGS_PENDING_TOTAL_MAX, MEETINGS_PENDING_HARD_FACTOR, MEETING_RUN_TIMEOUT_MS,
