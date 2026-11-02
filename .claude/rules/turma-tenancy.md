@@ -222,6 +222,9 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
 - **Push devices carry the registrant's tenant** (`registerDevice`); `notify`/`dismiss` send only to
   `devicesForHost(host)` — the host's tenant's devices, the operators' for an untenanted host or a
   fleet-wide alert. Pass the host to every new `dismiss`.
+- **`DELETE /api/devices` removes only the caller's tenant's device** (XERK-2557): a held FCM token of
+  another tenant answers the same 200 and drops nothing. Re-registering still MOVES a token (a phone
+  switching accounts); holding the token is proof of the phone.
 - **Clients show the site alone**: `orgName` drops the suffix (board.js + `Board.kt`), as does the
   dedupe twin's tracker URL. Keys round-trip unchanged in route URLs.
 - **`purgeTenantData(tenantId)` is the one tenant-delete entry point**; each store registers its own

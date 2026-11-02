@@ -825,6 +825,14 @@ test("XERK-2556: push, peer roster and migration never cross a tenant", async ()
     assert.ok(toks(A.key).includes("dev2556a") && !toks(A.key).includes("dev2556b") && !toks(A.key).includes("dev2556g"));
     assert.ok(toks(B.key).includes("dev2556b") && !toks(B.key).includes("dev2556a"));
     assert.ok(toks("laptop").includes("dev2556g") && !toks("laptop").some((t) => t === "dev2556a" || t === "dev2556b"));
+    // XERK-2557: B (or an operator) deleting A's token is a quiet no-op; A's own delete works.
+    for (const w of [B, G]) {
+      const d = await request("DELETE", "/api/devices?token=dev2556a", { headers: w.h });
+      assert.equal(d.status, 200, d.raw);
+    }
+    assert.ok(toks(A.key).includes("dev2556a"), "another tenant's DELETE must not drop A's device");
+    assert.equal((await request("DELETE", "/api/devices?token=dev2556a", { headers: A.h })).status, 200);
+    assert.ok(!toks(A.key).includes("dev2556a"), "A's own DELETE removes it");
   } finally {
     for (const t of ["dev2556a", "dev2556b", "dev2556g"]) hub.unregisterDevice(t);
   }

@@ -102,6 +102,8 @@ Each spans components; the rule lives in the named file, which loads when any si
   the container limit** (XERK-258) → `contract-agent-hub.md`.
 - **Ported mirrors**: `board.js` column rule + Triage lane, `hub-agent.py` ↔ `tunnel-agent.js`
   parsers and device naming → `contract-mirrors.md`.
+- **Multi-tenancy** (epic XERK-2529): `requestPrincipal` is the only identity a route reads; a host
+  belongs to one tenant, decided by the hub → `turma-tenancy.md`, `contract-agent-hub.md`.
 - **The Daily Brief** schedule store, `renderDailyBrief` command and `dailyBriefResults` outbox
   (XERK-2390) → `contract-daily-brief.md`.
 - **Meetings**: Tenir's `POST /api/orgs/<site>/meetings`, the proposal store, `extractMeeting`
