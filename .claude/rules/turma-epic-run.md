@@ -38,8 +38,9 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   older-build file can't put an unexpected shape into memory or onto the wire; a malformed record is
   DROPPED, not restored. Its bounds are INLINE LITERALS (64 key / 200 site), never the
   `TICKET_KEY_MAX` / `TICKET_SITE_MAX` consts — it runs at module-init where those consts are in
-  their TDZ (the sibling-normalizer rule). Bounded: `EPIC_RUNS_MAX` runs (oldest `updatedAt` evicted,
-  never the just-armed one), `EPIC_RUN_CHILDREN_MAX` per list — both ride the payload/SSE.
+  their TDZ (the sibling-normalizer rule). Bounded: `EPIC_RUNS_MAX` runs (the oldest `updatedAt` of
+  the tenant holding the most runs evicted, XERK-2621; never the just-armed one),
+  `EPIC_RUN_CHILDREN_MAX` per list — both ride the payload/SSE.
 - **Older clients degrade**: `epicRuns` is a NEW top-level payload key, so an older web/Android build
   ignores it. Nothing is per-agent, so `normalizeRecord` is untouched.
 

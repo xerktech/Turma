@@ -1433,6 +1433,48 @@ registerTenantPurge("modelPolicy", (t) => {
 // gates a host.
 function tenantOfSite(site) { return tenantOfKey(site); }
 function baseOfSite(site) { return baseOfKey(site); }
+// The tenant of a "<siteKey>/<issueKey>" pin key (an ADO siteKey holds a "/" too,
+// so the issue key is what follows the LAST one).
+function tenantOfPinKey(k) {
+  const i = typeof k === "string" ? k.lastIndexOf("/") : -1;
+  return i > 0 ? tenantOfSite(k.slice(0, i)) : "";
+}
+// Bound `map` to `max` entries, each eviction taking the oldest record (by
+// `age`) of the TENANT holding the most (XERK-2621): a store with one fleet-wide
+// cap otherwise let one tenant's volume evict every other tenant's records.
+// Tied tenants lose the oldest victim first. `keep` (the record just written)
+// counts toward its tenant but is never evicted. `tenantOf(key, rec)`; untenanted
+// keys are one tenant (""). Returns the evicted keys.
+function trimByTenant(map, max, tenantOf, age, keep) {
+  const keys = Object.keys(map);
+  const evicted = [];
+  if (keys.length <= max) return evicted;
+  const count = new Map();
+  const victims = new Map();
+  for (const k of keys) {
+    const t = tenantOf(k, map[k]);
+    count.set(t, (count.get(t) || 0) + 1);
+    if (k === keep) continue;
+    if (!victims.has(t)) victims.set(t, []);
+    victims.get(t).push(k);
+  }
+  for (const list of victims.values()) list.sort((a, b) => (age(map[a]) || 0) - (age(map[b]) || 0));
+  for (let over = keys.length - max; over > 0; over--) {
+    let pick = null;
+    for (const [t, list] of victims) {
+      if (!list.length) continue;
+      if (pick === null || count.get(t) > count.get(pick)
+          || (count.get(t) === count.get(pick)
+            && (age(map[list[0]]) || 0) < (age(map[victims.get(pick)[0]]) || 0))) pick = t;
+    }
+    if (pick === null) break;
+    const k = victims.get(pick).shift();
+    count.set(pick, count.get(pick) - 1);
+    delete map[k];
+    evicted.push(k);
+  }
+  return evicted;
+}
 function scopeSite(site, tenantId) {
   if (typeof site !== "string" || !site) return site;
   const base = baseOfKey(site);
@@ -3648,13 +3690,8 @@ function setTicketAgent(siteKey, issueKey, host) {
   if (!host) delete ticketAgents[k];
   else {
     ticketAgents[k] = { host, at: Date.now() };
-    const keys = Object.keys(ticketAgents);
-    if (keys.length > TICKET_AGENTS_MAX) {
-      keys.sort((a, b) => (ticketAgents[a].at || 0) - (ticketAgents[b].at || 0));
-      for (const old of keys.slice(0, keys.length - TICKET_AGENTS_MAX)) {
-        delete ticketAgents[old];
-      }
-    }
+    // Oldest pin of the tenant holding the most (XERK-2621), never another tenant's.
+    trimByTenant(ticketAgents, TICKET_AGENTS_MAX, tenantOfPinKey, (r) => r && r.at, k);
   }
   persistTicketAgents();
   // The pin rides the /api/agents payload (and its own SSE event), so open
@@ -3687,13 +3724,8 @@ function setTicketModel(siteKey, issueKey, model) {
   if (!model) delete ticketModels[k];
   else {
     ticketModels[k] = { model, at: Date.now() };
-    const keys = Object.keys(ticketModels);
-    if (keys.length > TICKET_MODELS_MAX) {
-      keys.sort((a, b) => (ticketModels[a].at || 0) - (ticketModels[b].at || 0));
-      for (const old of keys.slice(0, keys.length - TICKET_MODELS_MAX)) {
-        delete ticketModels[old];
-      }
-    }
+    // Oldest pin of the tenant holding the most (XERK-2621), never another tenant's.
+    trimByTenant(ticketModels, TICKET_MODELS_MAX, tenantOfPinKey, (r) => r && r.at, k);
   }
   persistTicketModels();
   invalidateAgentsCache();
@@ -3745,13 +3777,8 @@ function setTicketRuntime(siteKey, issueKey, runtime) {
   if (!runtime || runtime === "claude") delete ticketRuntimes[k];
   else {
     ticketRuntimes[k] = { runtime, at: Date.now() };
-    const keys = Object.keys(ticketRuntimes);
-    if (keys.length > TICKET_RUNTIMES_MAX) {
-      keys.sort((a, b) => (ticketRuntimes[a].at || 0) - (ticketRuntimes[b].at || 0));
-      for (const old of keys.slice(0, keys.length - TICKET_RUNTIMES_MAX)) {
-        delete ticketRuntimes[old];
-      }
-    }
+    // Oldest pin of the tenant holding the most (XERK-2621), never another tenant's.
+    trimByTenant(ticketRuntimes, TICKET_RUNTIMES_MAX, tenantOfPinKey, (r) => r && r.at, k);
   }
   persistTicketRuntimes();
   invalidateAgentsCache();
@@ -3788,13 +3815,8 @@ function setTicketPlatform(siteKey, issueKey, platform) {
   if (!platform || platform === "any" || !HOST_OS_VALUES.has(platform)) delete ticketPlatforms[k];
   else {
     ticketPlatforms[k] = { platform, at: Date.now() };
-    const keys = Object.keys(ticketPlatforms);
-    if (keys.length > TICKET_PLATFORMS_MAX) {
-      keys.sort((a, b) => (ticketPlatforms[a].at || 0) - (ticketPlatforms[b].at || 0));
-      for (const old of keys.slice(0, keys.length - TICKET_PLATFORMS_MAX)) {
-        delete ticketPlatforms[old];
-      }
-    }
+    // Oldest pin of the tenant holding the most (XERK-2621), never another tenant's.
+    trimByTenant(ticketPlatforms, TICKET_PLATFORMS_MAX, tenantOfPinKey, (r) => r && r.at, k);
   }
   persistTicketPlatforms();
   invalidateAgentsCache();
@@ -3952,13 +3974,8 @@ function setTicketTriageAction(siteKey, issueKey, action) {
     delete ticketTriageActions[k];
   } else {
     ticketTriageActions[k] = { action, at: Date.now() };
-    const keys = Object.keys(ticketTriageActions);
-    if (keys.length > TRIAGE_ACTIONS_MAX) {
-      keys.sort((a, b) => (ticketTriageActions[a].at || 0) - (ticketTriageActions[b].at || 0));
-      for (const old of keys.slice(0, keys.length - TRIAGE_ACTIONS_MAX)) {
-        delete ticketTriageActions[old];
-      }
-    }
+    // Oldest pin of the tenant holding the most (XERK-2621), never another tenant's.
+    trimByTenant(ticketTriageActions, TRIAGE_ACTIONS_MAX, tenantOfPinKey, (r) => r && r.at, k);
   }
   persistTriageActions();
   invalidateAgentsCache();
@@ -4321,16 +4338,12 @@ function armEpicRun(siteKey, epicKey, rows, opts) {
   if (validEpicRunLimit(limit)) rec.maxConcurrent = limit;
   epicRuns[k] = rec;
   // Bound the run map: evict the least-recently-updated once over the cap, like
-  // the ticket-triage-action map. Epics are few, so this is a backstop.
-  const all = Object.keys(epicRuns);
-  if (all.length > EPIC_RUNS_MAX) {
-    all.sort((a, b) => (epicRuns[a].updatedAt || 0) - (epicRuns[b].updatedAt || 0));
-    for (const old of all.slice(0, all.length - EPIC_RUNS_MAX)) {
-      if (old !== k) {
-        delete epicRuns[old];
-        withdrawEpicRunQueue(old, "its epic run was evicted");
-      }
-    }
+  // the ticket-triage-action map. Epics are few, so this is a backstop. Evicts
+  // from the tenant holding the most runs
+  // (XERK-2621), so one tenant arming runs never withdraws another's children.
+  for (const old of trimByTenant(epicRuns, EPIC_RUNS_MAX, (_, r) => tenantOfSite(r && r.siteKey),
+    (r) => r && r.updatedAt, k)) {
+    withdrawEpicRunQueue(old, "its epic run was evicted");
   }
   persistEpicRuns();
   invalidateAgentsCache();
@@ -5340,13 +5353,9 @@ function armEpicBuilder(siteKey, { title, idea, repo, targetHost }) {
   epicBuilders[rec.id] = rec;
   // Bound the map, evicting the least-recently-updated once over the cap (never
   // the just-armed one), like EPIC_RUNS_MAX.
-  const all = Object.keys(epicBuilders);
-  if (all.length > EPIC_BUILDERS_MAX) {
-    all.sort((a, b) => (epicBuilders[a].updatedAt || 0) - (epicBuilders[b].updatedAt || 0));
-    for (const old of all.slice(0, all.length - EPIC_BUILDERS_MAX)) {
-      if (old !== rec.id) delete epicBuilders[old];
-    }
-  }
+  // From the tenant holding the most builders (XERK-2621), never another tenant's.
+  trimByTenant(epicBuilders, EPIC_BUILDERS_MAX, (_, r) => tenantOfSite(r && r.siteKey),
+    (r) => r && r.updatedAt, rec.id);
   publishEpicBuilders();
   return rec;
 }
@@ -15833,8 +15842,8 @@ const ENROLL_CODE_RE = /^te-[0-9a-f]{32}$/;
 const ENROLL_CODE_TTL_MS = positiveEnv("ENROLL_CODE_TTL_MS", 15 * 60 * 1000);
 // Settled (used/expired/revoked) records stay listable this long, then go.
 const ENROLL_CODE_KEEP_MS = 24 * 60 * 60 * 1000;
-const ENROLL_CODES_LIVE_MAX = 20; // unredeemed codes at once
-const ENROLL_CODES_MAX = 200; // records, settled included
+const ENROLL_CODES_LIVE_MAX = 20; // unredeemed codes at once, PER TENANT (XERK-2621)
+const ENROLL_CODES_MAX = 200; // records, settled included, fleet-wide
 // How long a redeemed code's identity is protected from being superseded by
 // another code for the same name before its host first beats (XERK-2574).
 // A healthy host beats within seconds of redeeming; this only has to outlast that.
@@ -15963,16 +15972,30 @@ function mintEnrollCode(owner, device, now = Date.now()) {
     device = "";
   }
   if (sweepEnrollCodes(now)) persistEnrollCodes();
-  const live = Object.values(enrollCodes).filter((r) => enrollCodeState(r, now) === "live").length;
+  // Both caps are judged within the code's tenant (XERK-2621): a fleet-wide live
+  // count let one tenant's 20 codes refuse every other tenant's mint (and told
+  // them how busy it was), and the eviction dropped other tenants' records.
+  const codeTenant = (r) => (r && typeof r.tenantId === "string" ? r.tenantId : "");
+  const live = Object.values(enrollCodes)
+    .filter((r) => codeTenant(r) === tenantId && enrollCodeState(r, now) === "live").length;
   if (live >= ENROLL_CODES_LIVE_MAX) {
     return { status: 409, body: { error: `${live} enrollment codes are still unused — revoke one or let it expire first` } };
   }
   if (Object.keys(enrollCodes).length >= ENROLL_CODES_MAX) {
-    // Oldest settled first; a live one is never dropped (the cap above holds).
-    const settled = Object.entries(enrollCodes)
-      .filter(([, r]) => enrollCodeState(r, now) !== "live")
-      .sort((a, b) => a[1].createdAt - b[1].createdAt);
-    for (const [id] of settled.slice(0, Object.keys(enrollCodes).length - ENROLL_CODES_MAX + 1)) delete enrollCodes[id];
+    // Settled records only (a live one is never dropped), the oldest of the
+    // tenant holding the most settled records first.
+    const settled = {};
+    for (const [id, r] of Object.entries(enrollCodes)) {
+      if (enrollCodeState(r, now) !== "live") settled[id] = r;
+    }
+    const liveCount = Object.keys(enrollCodes).length - Object.keys(settled).length;
+    for (const id of trimByTenant(settled, Math.max(0, ENROLL_CODES_MAX - 1 - liveCount),
+      (_, r) => codeTenant(r), (r) => r.createdAt)) delete enrollCodes[id];
+    if (Object.keys(enrollCodes).length >= ENROLL_CODES_MAX) {
+      // Only live codes are left: a memory backstop past ENROLL_CODES_MAX /
+      // ENROLL_CODES_LIVE_MAX tenants all holding a full set at once.
+      return { status: 409, body: { error: "the hub holds too many unused enrollment codes — try again once some expire" } };
+    }
   }
   const code = ENROLL_CODE_PREFIX + crypto.randomBytes(16).toString("hex");
   const id = crypto.randomBytes(8).toString("hex");
@@ -20144,6 +20167,9 @@ const MEETINGS_PENDING_ORG_MAX = 10;
 const MEETINGS_PENDING_TOTAL_MAX = 20;
 const MEETINGS_PENDING_BYTES_MAX = 2 << 20;
 const MEETINGS_PENDING_BYTES_ORG_MAX = 1 << 20; // so one org can't fill the whole budget
+// The fleet budgets above are FAIR-SHARE lines (XERK-2621, acceptMeeting); this
+// multiple of each is the hard ceiling the store never passes.
+const MEETINGS_PENDING_HARD_FACTOR = 2;
 const meetingSegmentBytes = (m) => (m.segments ? Buffer.byteLength(JSON.stringify(m.segments)) : 0);
 
 // The tenant a Tenir meeting post belongs to (XERK-2551): "" for the fleet
@@ -20244,8 +20270,31 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   if (meetingPendingCount(meetingProposals[siteKey]) >= MEETINGS_PENDING_ORG_MAX) {
     return { status: 429, body: { error: `${MEETINGS_PENDING_ORG_MAX} meetings of this org are already waiting to be read — try again later` } };
   }
-  const pending = Object.values(meetingProposals).flat().filter((m) => MEETING_PENDING.has(m.status));
-  if (pending.length >= MEETINGS_PENDING_TOTAL_MAX) {
+  // The fleet-wide budgets refuse a tenant only once it holds its FAIR SHARE
+  // (the budget split evenly over the tenants with meetings waiting, this one
+  // included), so one tenant filling the hub never 429s another (XERK-2621). A
+  // lone tenant may still use the whole budget. Shares shrink as tenants arrive
+  // and nothing held is evicted, so admission alone would let N tenants reach
+  // budget x H(N) (QA measured 159 of 20); MEETINGS_PENDING_HARD_FACTOR x the
+  // budget is the ceiling nothing passes. Accepted: about four busy tenants
+  // together can fill that ceiling (20+10+7+3), refusing the rest until theirs
+  // are read — still far better than the one tenant a fleet-wide cap took.
+  const pendingBy = new Map(); // tenant -> its pending rows
+  for (const [org, list] of Object.entries(meetingProposals)) {
+    const t = tenantOfSite(org);
+    for (const m of list || []) {
+      if (!MEETING_PENDING.has(m.status)) continue;
+      if (!pendingBy.has(t)) pendingBy.set(t, []);
+      pendingBy.get(t).push(m);
+    }
+  }
+  const tenant = tenantOfSite(siteKey);
+  const pending = [...pendingBy.values()].flat();
+  const mine = pendingBy.get(tenant) || [];
+  const tenants = pendingBy.size + (pendingBy.has(tenant) ? 0 : 1);
+  const full = { status: 429, body: { error: "the hub's queue of meetings waiting to be read is full — try again later" } };
+  if (pending.length >= MEETINGS_PENDING_HARD_FACTOR * MEETINGS_PENDING_TOTAL_MAX) return full;
+  if (pending.length >= MEETINGS_PENDING_TOTAL_MAX && mine.length >= MEETINGS_PENDING_TOTAL_MAX / tenants) {
     return { status: 429, body: { error: `${MEETINGS_PENDING_TOTAL_MAX} meetings are already waiting to be read — try again later` } };
   }
   const sum = (rows) => rows.reduce((n, m) => n + meetingSegmentBytes(m), meetingSegmentBytes(row));
@@ -20253,7 +20302,8 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   if (sum(orgPending) > MEETINGS_PENDING_BYTES_ORG_MAX) {
     return { status: 429, body: { error: "this org's meetings already waiting to be read fill its transcript budget — try again later" } };
   }
-  if (sum(pending) > MEETINGS_PENDING_BYTES_MAX) {
+  if (sum(pending) > MEETINGS_PENDING_HARD_FACTOR * MEETINGS_PENDING_BYTES_MAX) return full;
+  if (sum(pending) > MEETINGS_PENDING_BYTES_MAX && sum(mine) > MEETINGS_PENDING_BYTES_MAX / tenants) {
     return { status: 429, body: { error: "the meetings already waiting to be read fill the hub's transcript budget — try again later" } };
   }
   const kept = putMeeting(siteKey, row);
@@ -27696,7 +27746,7 @@ if (process.env.TURMA_TEST) {
     // Host ⇄ tenant binding (XERK-2533).
     tenantOfKey,
     // XERK-2551: org keys belong to tenants.
-    tenantOfSite, baseOfSite, scopeSite, scopeSiteKeys, unscopeSiteKeys, principalMaySite,
+    tenantOfSite, tenantOfPinKey, trimByTenant, baseOfSite, scopeSite, scopeSiteKeys, unscopeSiteKeys, principalMaySite,
     devicesForHost, mintMeetingsTenantToken, meetingsTenant, notify, rescopeRestoredOrgs,
     baseOfKey,
     agentKeyFor,
@@ -27895,6 +27945,7 @@ if (process.env.TURMA_TEST) {
     DEFAULT_REPO_TIER,
     REPO_TIERS,
     ticketAgents,
+    setTicketAgent,
     ticketModels,
     ticketModelPin,
     ticketSpawnModelFields,
@@ -27974,7 +28025,7 @@ if (process.env.TURMA_TEST) {
     getMeetings: () => meetingProposals, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
     putMeeting, reviewMeetingItem, settleMeetingReviews, meetingProposalsWire, MEETING_START_WAIT_MS,
     MEETING_CREATE_DEADLINE_MS, acceptMeeting,
-    ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETING_RUN_TIMEOUT_MS,
+    ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETINGS_PENDING_TOTAL_MAX, MEETINGS_PENDING_HARD_FACTOR, MEETING_RUN_TIMEOUT_MS,
     MEETING_QUEUE_MAX_MS, MEETINGS_KEEP, MEETINGS_AUTO_MODEL, DAILY_BRIEF_RUN_TIMEOUT_MS, DAILY_BRIEF_LATE_MS,
     decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, permissionAnswerKind,
     decisionsTick, decidedOrgs, DECISIONS_RETAIN_MS,
