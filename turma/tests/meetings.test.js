@@ -1,8 +1,8 @@
-// Unit tests for the Meetings page (public/meetings.html, XERK-2510): the
-// proposal render (escaped model text, quotes linked to that moment in Tenir),
-// the review states, and Approve / Approve + start / Reject posting to the hub.
-// Same harness as brief.test.js: the page's real inline <script> runs against a
-// minimal DOM shim and its helpers are returned out of the sandbox.
+// Unit tests for the Meetings review (public/meetings.js, XERK-2510; the Brief
+// page's Meetings pane since XERK-2623): the proposal render (escaped model text,
+// quotes linked to that moment in Tenir), the review states, and Approve /
+// Approve + start / Reject posting to the hub. The module's real source runs
+// against a minimal DOM shim and its API is returned out of the sandbox.
 
 "use strict";
 
@@ -11,9 +11,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const html = fs.readFileSync(path.join(__dirname, "..", "public", "meetings.html"), "utf8");
-const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
-const script = blocks[blocks.length - 1][1];
+const script = fs.readFileSync(path.join(__dirname, "..", "public", "meetings.js"), "utf8");
 
 function makeEl() {
   const el = {
@@ -29,7 +27,7 @@ function makeEl() {
 
 // `reply(url, init)` answers each non-/api/agents fetch: a body for 200, or
 // {status, body} for a refusal.
-function loadPage(reply = () => ({})) {
+function loadPage(reply = () => ({}), orgKeys = []) {
   const els = {};
   const fetches = [];
   const toasts = [];
@@ -42,7 +40,7 @@ function loadPage(reply = () => ({})) {
   };
   const stubs = {
     document,
-    location: { href: "", search: "", pathname: "/meetings", hash: "" },
+    location: { href: "", search: "", pathname: "/brief", hash: "#meetings" },
     localStorage: { getItem: (k) => store[k] ?? null, setItem: (k, v) => { store[k] = String(v); } },
     fetch: (u, init = {}) => {
       if (fetches.length > 50) return new Promise(() => {});
@@ -58,14 +56,14 @@ function loadPage(reply = () => ({})) {
     console, Date, Math, JSON, encodeURIComponent, Number, String, Object, Array, Map, Set, Promise,
     TurmaNav: { preserveScroll: (el, paint) => paint(), toast: (m) => toasts.push(m),
       refusalText: (what, status, body) => `${what} failed — ${(body && body.error) || `the hub answered HTTP ${status}`}` },
-    TurmaOrg: { getKeys: () => [], update: noop, subscribe: noop, sse: noop },
+    TurmaOrg: { getKeys: () => orgKeys, update: noop, subscribe: noop, sse: noop },
     TurmaBoard: { orgName: (k, o) => o || k, mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
   };
   const keys = Object.keys(stubs);
-  const body = `${script}\n;return { renderMeetings, review, startEdit, edits, setProject, itemKey,
-    setCache: (c) => { cache = c; } };`;
-  const api = new Function(...keys, body)(...keys.map((k) => stubs[k]));
+  new Function(...keys, script)(...keys.map((k) => stubs[k]));
+  const api = stubs.window.TurmaMeetings;
+  api.mount(document.getElementById("meetingList"));
   const settle = async () => { for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r)); };
   return Object.assign(api, { els, fetches, toasts, store, settle, list: () => els.meetingList.innerHTML });
 }
@@ -187,4 +185,32 @@ test("XERK-2511: a second press while an Approve awaits its issue types posts no
   await approving;
   await P.settle();
   assert.deepEqual(P.fetches.filter((f) => f.method === "POST").map((f) => f.body.action), ["approve"]);
+});
+
+test("XERK-2623: the module paints nothing before it is mounted, and counts what awaits review", () => {
+  const P = loadPage(META);
+  const items = meeting().items;
+  // Two reviewable proposals; a rejected, a created and a still-running meeting's count none.
+  assert.equal(P.pendingCount(data()), 2);
+  assert.equal(P.pendingCount(data([meeting({ items: [
+    { ...items[0], review: { state: "rejected", at: 1 } },
+    { ...items[1], review: { state: "logged", at: 1 } }] }),
+  meeting({ meetingId: "m2", status: "running", items: undefined })])), 0);
+  // A failed create is back in the operator's hands.
+  assert.equal(P.pendingCount(data([meeting({ items: [{ ...items[0], review: { state: "failed", at: 1, error: "x" } }] })])), 1);
+  // update() takes the host page's snapshot and paints it.
+  P.update(data());
+  assert.match(P.list(), /Sprint &lt;sync&gt;/);
+});
+
+test("XERK-2623: the header org pick scopes the list and the tab's count", () => {
+  const OTHER = "globex.atlassian.net";
+  const both = { agents: [], meetingProposals: { [SITE]: [meeting()], [OTHER]: [meeting({ meetingId: "g1", title: "Globex sync" })] } };
+  const all = loadPage(META);
+  assert.equal(all.pendingCount(both), 4);
+  const P = loadPage(META, [OTHER]);
+  assert.equal(P.pendingCount(both), 2);
+  P.update(both);
+  assert.match(P.list(), /Globex sync/);
+  assert.doesNotMatch(P.list(), /Sprint &lt;sync&gt;/);
 });

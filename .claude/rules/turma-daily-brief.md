@@ -4,6 +4,7 @@ paths:
   - "turma/tests/brief.test.js"
 ---
 
+<!-- The page's Meetings pane (XERK-2623) is `turma-meetings.md`. -->
 # The Daily Brief page (`/brief`, XERK-2396)
 
 The web surface of the Daily Brief (epic XERK-2390). The wire it reads is
@@ -50,8 +51,10 @@ The web surface of the Daily Brief (epic XERK-2390). The wire it reads is
 - **Every lookup by site goes through `own()`**: an org named `__proto__` read `Object.prototype`
   as its schedule and threw (XERK-1451).
 - Every served string is escaped (model text, host, model, error, org name, site key).
-- Live via the `dailyBriefs` / `dailyBriefSchedules` SSE frames (whole maps); a snapshot fetch
-  merges, never replaces (XERK-444 clocks).
+- Live via the `dailyBriefs` / `dailyBriefSchedules` / `meetingProposals` SSE frames (whole maps);
+  a snapshot fetch merges, never replaces (XERK-444 clocks, one per map).
+- **Two sub-tabs, Daily brief and Meetings** (XERK-2623); the Meetings pane is `meetings.js`, rules
+  in `turma-meetings.md`. Both panes paint on every change, so a switch is instant.
 - Android's Brief tab (XERK-2397) is its counterpart, minus schedule editing (web-only,
   `android/PARITY.md`); a change to what a reader sees here goes to `BriefScreen.kt` too.
 - Tests: `turma/tests/brief.test.js`; the `/brief` case in `server.test.js` (XERK-2386 test).

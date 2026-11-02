@@ -12,6 +12,11 @@ import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
 import com.xerktech.turma.model.DailyBrief
 import com.xerktech.turma.vm.BriefViewModel
+import com.xerktech.turma.vm.MeetingsViewModel
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -100,5 +105,27 @@ class BriefScreenTest {
         val req = hub.findRequest("/daily-brief/run")
         assertEquals("POST", req.method)
         assertEquals("/api/orgs/o%2Facme/daily-brief/run", req.path)
+    }
+
+    @Test fun `the Brief tab switches to the Meetings pane, which counts what awaits review`() {
+        // XERK-2623: Meetings is a pane of Brief, as /brief#meetings on the web.
+        val site = "o.atlassian.net"
+        hub.seedFleet("""
+            { "now": 1, "agents": [ { "key": "h1", "device": "h1", "online": true, "lastSeen": 1,
+                "jira": { "available": true, "siteKey": "$site", "site": "$site", "tickets": [] } } ],
+              "meetingProposals": { "$site": [ { "meetingId": "m1", "status": "ok", "title": "Sprint sync",
+                "items": [ { "id": "p1", "kind": "decision", "title": "Ship on Friday" } ] } ] } }
+        """.trimIndent())
+        val vm = main.track(BriefViewModel(hub.app))
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        compose.setContent {
+            var pane by remember { mutableStateOf(BriefPane.BRIEF) }
+            BriefScreen(pane = pane, onPane = { pane = it }, vm = vm, meetingsVm = mvm)
+        }
+        compose.onNodeWithText("Daily brief").assertExists()
+        compose.onNodeWithText("Sprint sync").assertDoesNotExist()
+        compose.onNodeWithText("Meetings (1)").performClick()
+        compose.onNodeWithText("Sprint sync").assertExists()
+        compose.onNodeWithText("Ship on Friday").assertExists()
     }
 }

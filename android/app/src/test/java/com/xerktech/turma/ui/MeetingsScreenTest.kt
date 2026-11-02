@@ -63,7 +63,7 @@ class MeetingsScreenTest {
     }
 
     private fun show(vm: MeetingsViewModel) = compose.setContent {
-        TurmaTheme { MeetingsScreen(Modifier.fillMaxSize(), vm) }
+        TurmaTheme { MeetingsPane(Modifier.fillMaxSize(), vm) }
     }
 
     @Test fun `a meeting lists its proposals with their actions and states`() {

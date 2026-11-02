@@ -1,99 +1,12 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Turma — Meetings</title>
-<link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="icon" href="/favicon.ico" sizes="32x32">
-<link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<link rel="manifest" href="/site.webmanifest">
-<meta name="theme-color" content="#f9f9f7" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
-<link rel="stylesheet" href="/app.css">
-<style>
-  /* Meetings (XERK-2510, epic XERK-2503): the work items an org host proposed
-     from a meeting Tenir captured, each approved (a ticket on the org's board),
-     edited then approved, or rejected by the operator. Web-only for now
-     (android/PARITY.md). Tokens/base/nav live in app.css. */
-  .mt-org { margin-bottom: 22px; min-width: 0; }
-  .mt-org-head { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; margin-bottom: 10px; }
-  .mt-org-name { font-family: var(--font-display); font-size: 19px; font-weight: 600; margin: 0;
-    flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
-  .mt-target { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2); flex-wrap: wrap; }
-  .mt-target select, .mt-edit select, .mt-edit input, .mt-edit textarea {
-    font: inherit; font-size: 14px; border: 1px solid var(--border); border-radius: var(--radius-sm);
-    background: var(--field); color: var(--ink); padding: 5px 8px; max-width: 100%; min-width: 0;
-  }
-  .mt-target .err { color: var(--critical-text); }
-  .mt-meeting {
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
-    padding: 14px 16px; margin-bottom: 12px; min-width: 0;
-  }
-  .mt-head { display: flex; align-items: baseline; gap: 6px 12px; flex-wrap: wrap; }
-  .mt-head > a { font-size: 13px; color: var(--accent-text); white-space: nowrap; }
-  .mt-title { font-size: 16px; font-weight: 600; margin: 0; flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
-  .mt-meta { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
-  .mt-meta .bit { white-space: nowrap; }
-  .mt-meta .sep::after { content: " · "; white-space: pre; }
-  .mt-status { font-size: 13px; margin-top: 10px; color: var(--ink-2); overflow-wrap: anywhere; }
-  .mt-status.failed { color: var(--critical-text); }
-  .mt-items { list-style: none; margin: 10px 0 0; padding: 0; }
-  .mt-item { border-top: 1px solid var(--hairline); padding: 12px 0 4px; min-width: 0; }
-  .mt-item:first-child { border-top: 0; }
-  .mt-item-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-  .mt-kind {
-    flex: none; font-size: 11px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase;
-    padding: 1px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-text);
-  }
-  .mt-kind.bug { background: color-mix(in srgb, var(--critical) 14%, transparent); color: var(--critical-text); }
-  .mt-kind.decision { background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--good-text); }
-  .mt-item-title { font-weight: 600; font-size: 14.5px; min-width: 0; overflow-wrap: anywhere; flex: 1 1 12em; }
-  .mt-desc { font-size: 13.5px; color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; }
-  .mt-facts { font-size: 12.5px; color: var(--muted); margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
-  .mt-facts a { color: var(--accent-text); }
-  .mt-quotes { margin: 8px 0 0; padding: 0; list-style: none; }
-  .mt-quotes li {
-    border-left: 3px solid var(--hairline); padding: 2px 0 2px 10px; margin-top: 4px;
-    font-size: 13px; color: var(--ink-2); overflow-wrap: anywhere;
-  }
-  .mt-quotes .who { font-weight: 600; color: var(--ink); }
-  .mt-quotes a { font-size: 12px; margin-left: 6px; white-space: nowrap; color: var(--accent-text); }
-  .mt-review { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; font-size: 13px; }
-  .mt-review .state { color: var(--ink-2); overflow-wrap: anywhere; }
-  .mt-review .state.good { color: var(--good-text); }
-  .mt-review .state.bad { color: var(--critical-text); }
-  .mt-review .state a { color: inherit; font-weight: 600; }
-  .mt-item.rejected .mt-item-title, .mt-item.rejected .mt-desc { color: var(--muted); }
-  .mt-edit { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; font-size: 13px; }
-  .mt-edit label { display: flex; flex-direction: column; gap: 4px; color: var(--ink-2); }
-  .mt-edit textarea { min-height: 8em; resize: vertical; }
-  .mt-edit .row { display: flex; gap: 8px; flex-wrap: wrap; }
-  .mt-err { color: var(--critical-text); font-size: 13px; margin-top: 6px; overflow-wrap: anywhere; }
-  .mt-list button[aria-disabled="true"], .mt-list button[aria-disabled="true"]:hover {
-    opacity: 0.5; cursor: default; border-color: var(--border); }
-  .mt-empty { color: var(--muted); font-size: 14px; padding: 24px 0; }
-  .pane-note { color: var(--muted); font-size: 12px; margin: 16px 0 0; }
-  @media (max-width: 600px) {
-    .mt-meeting { padding: 12px; }
-  }
-</style>
-</head>
-<body class="app-shell">
-<header class="site-header" id="siteHeader" data-page="meetings"></header>
-<div class="page-scroll">
-<div class="wrap">
-  <div id="meetingList" class="mt-list"></div>
-  <div class="pane-note">When Tenir captures a meeting, an agent host of the org reads its captions and <b>proposes</b> work items. Nothing reaches the board until you approve one: Approve creates the ticket on that org's board, a decision is added to the org's decisions log, and Reject sets it aside.</div>
-</div>
-</div>
-
-<nav class="bottom-nav" id="bottomNav"></nav>
-<script src="/board.js"></script>
-<script src="/nav.js"></script>
-<script src="/org.js"></script>
-<script src="/newticket.js"></script>
-<script>
+// Meetings review (XERK-2510, moved onto the Brief page by XERK-2623): the work
+// items an org host proposed from a meeting Tenir captured, each approved (a
+// ticket on the org's board), edited then approved, or rejected by the operator.
+//
+// A shared module rather than a page: brief.html mounts it into its Meetings pane
+// and feeds it the fleet snapshot, SSE frames included (update); it opens no stream and fetches no snapshot of its own.
+// Loaded after org.js (it reads TurmaOrg/TurmaBoard/TurmaNav); in server.js's
+// HASHED_ASSETS. Tests: tests/meetings.test.js.
+(() => {
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -131,7 +44,7 @@ const itemKey = (site, mid, iid) => [site, mid, iid].map(encodeURIComponent).joi
 const reviewable = (it) => !it.review || it.review.state === "failed" || it.review.state === "rejected";
 
 // ---- page state ------------------------------------------------------------------
-const $list = document.getElementById("meetingList");
+let $list = null;
 let cache = null;
 let painted = null;
 let paintPending = false;
@@ -315,6 +228,7 @@ function editing() {
   return !!a && $list.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || "");
 }
 function renderMeetings(data, force = false) {
+  if (!$list) return;
   if (pointerDown || (!force && editing())) { paintPending = true; return; }
   paintPending = false;
   const sites = shownOrgs(data);
@@ -330,11 +244,6 @@ function renderMeetings(data, force = false) {
   if (html === painted) return;
   painted = html;
   TurmaNav.preserveScroll($list, () => { $list.innerHTML = html; });
-}
-function render(data) {
-  TurmaOrg.update(data);
-  TurmaNewTicket.update(data);
-  renderMeetings(data);
 }
 const repaint = (force = false) => { if (cache) { painted = null; renderMeetings(cache, force); } };
 
@@ -455,106 +364,70 @@ function startEdit(k) {
   repaint(true);
 }
 
-$list.addEventListener("click", (ev) => {
-  const b = ev.target && ev.target.closest ? ev.target.closest("[data-act],[data-meta-retry]") : null;
-  if (!b) return;
-  if (b.dataset.metaRetry !== undefined) { meta.delete(b.dataset.metaRetry); ensureMeta(b.dataset.metaRetry); return repaint(true); }
-  if (b.getAttribute("aria-disabled") === "true") return;
-  const k = b.dataset.k, act = b.dataset.act;
-  if (act === "approve") review(k, "approve");
-  else if (act === "start") review(k, "approve", true);
-  else if (act === "reject") review(k, "reject");
-  else if (act === "edit") startEdit(k);
-  else if (act === "cancel") { edits.delete(k); itemErr.delete(k); repaint(true); }
-});
-// Draft text lives in `edits`, so a repaint never loses what was typed.
-$list.addEventListener("input", (ev) => {
-  const t = ev.target, d = t && t.dataset;
-  if (!d) return;
-  const k = d.editTitle ?? d.editDesc ?? d.editType;
-  const e = k !== undefined && edits.get(k);
-  if (!e) return;
-  if (d.editTitle !== undefined) e.title = t.value;
-  else if (d.editDesc !== undefined) e.description = t.value;
-  else e.issueType = t.value;
-});
-$list.addEventListener("change", (ev) => {
-  const t = ev.target, d = t && t.dataset;
-  if (!d) return;
-  if (d.project !== undefined) {
-    setProject(d.project, t.value);
-    ensureTypes(d.project);
-    for (const [k, e] of edits) if (k.startsWith(`${encodeURIComponent(d.project)}/`)) e.issueType = "";
-    repaint(true);
-  } else if (d.editType !== undefined) {
-    const e = edits.get(d.editType);
-    if (e) e.issueType = t.value;
-  }
-});
-function flushHeld() { setTimeout(() => { if (paintPending && cache) renderMeetings(cache); }, 0); }
-$list.addEventListener("focusout", flushHeld);
-$list.addEventListener("pointerdown", () => { pointerDown = true; }, true);
-function releasePress() { if (pointerDown) { pointerDown = false; flushHeld(); } }
-for (const ev of ["pointerup", "pointercancel", "contextmenu"]) addEventListener(ev, releasePress, true);
-addEventListener("blur", (e) => { if (e.target === window) releasePress(); });
-
-// ---- the fleet snapshot ------------------------------------------------------------
-// A fetch MERGES, never replaces (XERK-444): an SSE frame that lands while
-// /api/agents is in flight is newer than its body.
-let meetingsClock = 0;
-async function refresh() {
-  const since = meetingsClock;
-  try {
-    const r = await fetch("/api/agents");
-    if (r.status === 401) return void (location.href = "/login");
-    const body = await r.json();
-    if (cache && meetingsClock !== since) body.meetingProposals = cache.meetingProposals;
-    cache = body;
-    if (typeof TurmaNav !== "undefined" && TurmaNav.noteSnapshot) TurmaNav.noteSnapshot(r);
-  } catch { /* keep the last render */ }
-  if (cache) render(cache);
-}
-let sseEverOpen = false;
-let sseOk = false, sseBackoff = 2000;
-function connectSSE() {
-  let es;
-  try { es = new EventSource(typeof TurmaNav !== "undefined" && TurmaNav.eventsUrl ? TurmaNav.eventsUrl() : "/api/events"); }
-  catch { setTimeout(connectSSE, sseBackoff); return; }
-  es.onopen = () => {
-    // A RECONNECT re-reads the payload once, as board.html does (rollup XERK-2598):
-    // the hub sends a whole-map event only when this stream's slice CHANGES, so
-    // nothing on a fresh stream repairs what moved while it was down (a hub
-    // restart or rollout) — and the fallback poll runs only while SSE is down.
-    if (sseEverOpen) refresh();
-    sseEverOpen = true;
-    sseOk = true; sseBackoff = 2000;
-  };
-  // Each frame is the whole map (every org).
-  es.addEventListener("meetingProposals", (e) => {
-    let d;
-    try { d = JSON.parse(e.data); } catch { return; }
-    if (!cache) return void refresh();
-    meetingsClock++;
-    cache.meetingProposals = d;
-    renderMeetings(cache);
+// Wire the review list into `el` (once). The host page owns the snapshot and the
+// stream and hands every change to update() / setProposals().
+function mount(el) {
+  if ($list) return;
+  $list = el;
+  $list.addEventListener("click", (ev) => {
+    const b = ev.target && ev.target.closest ? ev.target.closest("[data-act],[data-meta-retry]") : null;
+    if (!b) return;
+    if (b.dataset.metaRetry !== undefined) { meta.delete(b.dataset.metaRetry); ensureMeta(b.dataset.metaRetry); return repaint(true); }
+    if (b.getAttribute("aria-disabled") === "true") return;
+    const k = b.dataset.k, act = b.dataset.act;
+    if (act === "approve") review(k, "approve");
+    else if (act === "start") review(k, "approve", true);
+    else if (act === "reject") review(k, "reject");
+    else if (act === "edit") startEdit(k);
+    else if (act === "cancel") { edits.delete(k); itemErr.delete(k); repaint(true); }
   });
-  TurmaOrg.sse(es);
-  es.onerror = () => {
-    sseOk = false;
-    // Never the browser's own retry: it replays the old URL, which the hub never
-    // seeds, so other tenants' first map frames would reach it (XERK-2599). Re-read
-    // the snapshot and open a fresh stream naming it.
-    es.close();
-    if (typeof TurmaNav !== "undefined" && TurmaNav.eventsClosed) TurmaNav.eventsClosed();
-    setTimeout(() => refresh().finally(connectSSE), sseBackoff);
-    sseBackoff = Math.min(sseBackoff * 2, 30000);
-  };
+  // Draft text lives in `edits`, so a repaint never loses what was typed.
+  $list.addEventListener("input", (ev) => {
+    const t = ev.target, d = t && t.dataset;
+    if (!d) return;
+    const k = d.editTitle ?? d.editDesc ?? d.editType;
+    const e = k !== undefined && edits.get(k);
+    if (!e) return;
+    if (d.editTitle !== undefined) e.title = t.value;
+    else if (d.editDesc !== undefined) e.description = t.value;
+    else e.issueType = t.value;
+  });
+  $list.addEventListener("change", (ev) => {
+    const t = ev.target, d = t && t.dataset;
+    if (!d) return;
+    if (d.project !== undefined) {
+      setProject(d.project, t.value);
+      ensureTypes(d.project);
+      for (const [k, e] of edits) if (k.startsWith(`${encodeURIComponent(d.project)}/`)) e.issueType = "";
+      repaint(true);
+    } else if (d.editType !== undefined) {
+      const e = edits.get(d.editType);
+      if (e) e.issueType = t.value;
+    }
+  });
+  function flushHeld() { setTimeout(() => { if (paintPending && cache) renderMeetings(cache); }, 0); }
+  $list.addEventListener("focusout", flushHeld);
+  $list.addEventListener("pointerdown", () => { pointerDown = true; }, true);
+  function releasePress() { if (pointerDown) { pointerDown = false; flushHeld(); } }
+  for (const ev of ["pointerup", "pointercancel", "contextmenu"]) addEventListener(ev, releasePress, true);
+  addEventListener("blur", (e) => { if (e.target === window) releasePress(); });
 }
-TurmaOrg.subscribe(() => { if (cache) render(cache); });
-// The stream opens once the first snapshot is in, naming it (XERK-2599).
-refresh().finally(connectSSE);
-setInterval(() => refresh(), 60000);
-setInterval(() => { if (!sseOk) refresh(); }, 15000);
-</script>
-</body>
-</html>
+
+// The host page's snapshot changed (or the org pick did).
+function update(data) { cache = data; renderMeetings(data); }
+// Proposals in the shown orgs still waiting on the operator (for the pane's tab).
+function pendingCount(data) {
+  let n = 0;
+  for (const s of shownOrgs(data)) {
+    for (const m of own(data.meetingProposals, s) || []) {
+      if (m && m.status === "ok") n += (m.items || []).filter((it) => it && reviewable(it) && !(it.review && it.review.state === "rejected")).length;
+    }
+  }
+  return n;
+}
+
+const api = { mount, update, pendingCount,
+  // test hooks (tests/meetings.test.js)
+  renderMeetings, review, startEdit, edits, setProject, itemKey, setCache: (c) => { cache = c; } };
+if (typeof window !== "undefined") window.TurmaMeetings = api;
+})();

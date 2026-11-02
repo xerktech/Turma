@@ -72,7 +72,7 @@ test("assets: every mutable asset has a fingerprinted twin served immutable", ()
   // but not here is served under its bare name only, i.e. back to a TTL.
   assert.deepEqual(
     Object.keys(ASSET_URLS).sort(),
-    ["/app.css", "/board.js", "/chat.js", "/nav.js", "/newticket.js", "/org.js"],
+    ["/app.css", "/board.js", "/chat.js", "/meetings.js", "/nav.js", "/newticket.js", "/org.js"],
   );
   for (const [bare, hashed] of Object.entries(ASSET_URLS)) {
     assert.notEqual(hashed, bare, `${bare} was not fingerprinted`);
