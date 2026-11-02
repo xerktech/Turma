@@ -219,6 +219,47 @@ test("XERK-2630: an admin's reset ends the user's sessions, forces a new passwor
   assert.ok(!/passwordResets|mustChangePassword|sessionEpoch/.test(list.raw));
 });
 
+// An open /api/events stream: resolves `closed` when the hub ends it.
+function openEvents(headers) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(baseUrl + "/api/events", { headers }, (res) => {
+      const closed = new Promise((r) => { res.on("end", r); res.on("close", r); });
+      res.resume();
+      const e = { status: res.statusCode, closed, abort: () => req.destroy() };
+      openStreams.push(e); // a failing test must not hold the server open
+      resolve(e);
+    });
+    req.on("error", reject);
+  });
+}
+
+const openStreams = [];
+test.after(() => { for (const e of openStreams) e.abort(); });
+test("XERK-2630: a stream opened before a reset, or a disable, is closed by it", async () => {
+  await addUser("lu2", ["turma-users"]);
+  const lu2 = userOf("lu2");
+  const h = await cookieFor("lu2", "lu2-password");
+  const ev = await openEvents(h);
+  assert.equal(ev.status, 200);
+  const bystander = await openEvents(await cookieFor("rootadmin", "root-admin-pass"));
+  assert.equal((await request("POST", `/api/admin/users/${lu2.id}/password`, { headers: BASIC, body: { password: "admin-chosen-2" } })).status, 200);
+  await Promise.race([ev.closed, new Promise((_, rej) => setTimeout(() => rej(new Error("stream outlived the reset")), 2000))]);
+  // Disable: the same rule, for a stream opened after the user's own change.
+  assert.equal((await request("POST", "/api/password", {
+    body: { username: "lu2", password: "admin-chosen-2", newPassword: "lu2-own-pass-1" } })).status, 200);
+  const ev2 = await openEvents(await cookieFor("lu2", "lu2-own-pass-1"));
+  assert.equal(ev2.status, 200);
+  assert.equal((await request("PATCH", `/api/admin/users/${lu2.id}`, { headers: BASIC, body: { disabled: true } })).status, 200);
+  await Promise.race([ev2.closed, new Promise((_, rej) => setTimeout(() => rej(new Error("stream outlived the disable")), 2000))]);
+  // Another user's stream is untouched.
+  let bystanderClosed = false;
+  bystander.closed.then(() => { bystanderClosed = true; });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(bystanderClosed, false);
+  bystander.abort();
+  assert.ok([...hub.userStreams].every((e) => e.claims.u !== lu2.id), "no tracked stream of lu2 is left");
+});
+
 test("XERK-2552: an admin cannot disable or delete its own account; SSO-owned fields are refused", async () => {
   const h = await cookieFor("rootadmin", "root-admin-pass");
   const me = userOf("rootadmin");

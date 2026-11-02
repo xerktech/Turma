@@ -3241,11 +3241,33 @@ const persistAgentIdentities = registerExternalStore({
 let tenancyState = tenancy.coerceTenancy(readJsonFile(TENANCY_FILE));
 const persistTenancy = registerExternalStore({
   name: "tenancy", file: TENANCY_FILE, debounceMs: 0, mode: 0o600, // holds password hashes
-  coerce: tenancy.coerceTenancy, read: () => tenancyState, install: (v) => { tenancyState = v; },
+  coerce: tenancy.coerceTenancy, read: () => tenancyState, install: (v) => { tenancyState = v; endStaleUserStreams(); },
 });
 function setTenancy(next) {
   tenancyState = next;
   persistTenancy();
+  endStaleUserStreams();
+}
+// Every long-lived stream a USER principal holds — an SSE stream, a /live or
+// /term socket (XERK-2630). Each is authorized once, when it opens, so a change
+// that ends the user's sign-in (an admin password reset, the user's own change,
+// a disable, a group change that moves its roles or tenant) must close it too:
+// else a stream opened before a reset kept serving the tenant. Re-checked on
+// every store change, local or an HA install.
+const userStreams = new Set(); // { claims, tenantId, roles, close }
+function trackUserStream(p, close) {
+  if (!p || p.kind !== "user") return () => {};
+  const entry = { claims: principalClaims(p), tenantId: p.tenantId, roles: p.roles.join(","), close };
+  userStreams.add(entry);
+  return () => userStreams.delete(entry);
+}
+function endStaleUserStreams() {
+  for (const e of userStreams) {
+    const now = principalFromClaims(e.claims);
+    if (now && now.tenantId === e.tenantId && now.roles.join(",") === e.roles) continue;
+    userStreams.delete(e);
+    try { e.close(); } catch { /* already gone */ }
+  }
 }
 // First run: an initial local admin from env, so a fresh install is
 // administrable from the browser without pod access. Only when the store holds
@@ -23236,7 +23258,8 @@ const server = http.createServer(async (req, res) => {
         try { res.write(": keepalive\n\n"); } catch { /* dropped; close cleans up */ }
       }, 25000);
       keepalive.unref();
-      const drop = () => { clearInterval(keepalive); sseClients.delete(res); };
+      const untrack = trackUserStream(sp, () => res.end());
+      const drop = () => { clearInterval(keepalive); sseClients.delete(res); untrack(); };
       req.on("close", drop);
       res.on("close", drop);
       res.on("error", drop);
@@ -27241,6 +27264,8 @@ server.on("upgrade", async (req, socket, head) => {
       return socket.destroy();
     }
     wsHandshake(socket, req);
+    const untrackLive = trackUserStream(livePrincipal, () => socket.destroy());
+    socket.on("close", untrackLive);
 
     // Register as a watcher (arms the agent tail on the first, when THIS replica
     // owns the control channel). Shared with the relay pseudo-subscriber path.
@@ -27401,7 +27426,8 @@ server.on("upgrade", async (req, socket, head) => {
       return socket.destroy();
     }
     const sessionId = decodeURIComponent(parts[1]);
-    const loc = findSession(sessionId, requestPrincipal(req));
+    const termPrincipal = requestPrincipal(req);
+    const loc = findSession(sessionId, termPrincipal);
     if (!loc) {
       socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
       return socket.destroy();
@@ -27423,7 +27449,8 @@ server.on("upgrade", async (req, socket, head) => {
     if (head && head.length) channel.write(head);
     channel.pipe(socket);
     socket.pipe(channel);
-    const bail = () => { channel.destroy(); socket.destroy(); };
+    const untrackTerm = trackUserStream(termPrincipal, () => socket.destroy());
+    const bail = () => { untrackTerm(); channel.destroy(); socket.destroy(); };
     channel.on("error", bail);
     channel.on("close", bail);
     socket.on("error", bail);
@@ -28153,7 +28180,7 @@ if (process.env.TURMA_TEST) {
     // (`makeSseBus` over an injected store), and hold the local-delivery seam
     // (`sseClients`/`sseDeliverLocal`) and the HA toggle (`__setSseBus`) that
     // `sseBroadcast` gates on.
-    sseBroadcast, sseDeliverLocal, makeSseBus, sseClients, ssePrincipals, sseLastSent, sseSnapshotSeeds, rememberSnapshotSeed, SSE_SNAPSHOT_SEEDS_MAX, SSE_BUS_CHANNEL, SSE_REPLICA_ID,
+    sseBroadcast, sseDeliverLocal, makeSseBus, sseClients, ssePrincipals, userStreams, sseLastSent, sseSnapshotSeeds, rememberSnapshotSeed, SSE_SNAPSHOT_SEEDS_MAX, SSE_BUS_CHANNEL, SSE_REPLICA_ID,
     __setSseBus(v) { sseBus = v; },
     // XERK-764: the cross-replica tunnel directory + control bus. Exported so tests
     // can drive the directory publish/retire/mirror, the freshness-gated
