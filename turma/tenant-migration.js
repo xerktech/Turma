@@ -5,7 +5,14 @@
 // that holds pre-tenancy (untenanted) data and calls `runMigration` once the
 // stores are loaded. A step is
 //
-//   { name, count(t) -> number, apply(t) -> number | Promise<number> }
+//   { name, count(t) -> number, apply(t) -> number | Promise<number>, late?(t) -> number }
+//
+// `late` is for a step added AFTER hubs already completed the migration: such a
+// hub never runs `apply` again, so a completed marker lacking the step runs
+// `late` once instead (`runLateSteps`, needing no TURMA_MIGRATE_OWNER) and
+// records it. It must preserve what the hub served
+// before the upgrade (by then the untenanted data is the operators' too), so it
+// is usually a COPY into the tenant, never the full move `apply` makes.
 //
 // `count` says how much the step would move into tenant `t` (the dry run logs
 // it); `apply` moves it and answers how much it moved. Every step must be
@@ -118,4 +125,24 @@ async function runMigration({ steps, marker, tenantId, owner, dryRun, save, snap
   return { state: "done", marker: m, counts };
 }
 
-module.exports = { runMigration, coerceMarker, countAll };
+// A completed migration's steps added since it ran: each `late` once, into the
+// marker's tenant, recorded so it never re-runs. A failure is retried next call.
+// Answers the (possibly updated) marker.
+async function runLateSteps({ steps, marker, save, now = Date.now, log = console.log }) {
+  let m = coerceMarker(marker);
+  if (!m.completedAt || !ID_RE.test(m.tenantId || "")) return m;
+  for (const s of steps) {
+    if (m.steps[s.name] || typeof s.late !== "function") continue;
+    let moved;
+    try { moved = Number(await s.late(m.tenantId)) || 0; } catch (e) {
+      log(`tenant migration: late step ${s.name} failed: ${(e && e.message) || e} — retried next run`);
+      continue;
+    }
+    m = coerceMarker({ ...m, steps: { ...m.steps, [s.name]: { moved, at: now() } } });
+    await save(m);
+    log(`tenant migration: late step ${s.name} moved ${moved}`);
+  }
+  return m;
+}
+
+module.exports = { runMigration, runLateSteps, coerceMarker, countAll };

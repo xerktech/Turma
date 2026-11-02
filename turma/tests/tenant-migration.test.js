@@ -146,6 +146,7 @@ test("XERK-2554: seed untenanted data in every partitioned store", async () => {
   hub.ticketQueue.push({ siteKey: SITE, issueKey: "ACME-2", source: "manual", at: NOW });
   hub.registerDevice("fcm-2554", "android", ["dismiss"], "");
   hub.__modelPolicyState()["bug/sonnet"] = { state: "promoted", at: NOW, graded: 40, mOnlyFail: 0 };
+  hub.setRepoTier("repo2554", "ignore");    // XERK-2620: an untenanted repo tier
 });
 
 test("XERK-2554: every partitioned store has a migration step (meeting tokens are tenant-only)", () => {
@@ -198,6 +199,33 @@ test("XERK-2554: the migration moves every store into the owner's tenant; hosts 
   assert.equal(hub.ticketQueue.find((e) => e.issueKey === "ACME-2").siteKey, tk(SITE));
   assert.equal(hub.devicesState().find((d) => d.token === "fcm-2554").tenantId, T);
   assert.ok(hub.__modelPolicyState()[`${T}:bug/sonnet`] && !hub.__modelPolicyState()["bug/sonnet"]);
+  // XERK-2620: the repo tier moves under the tenant's key, and reads through its orgs.
+  assert.equal(hub.repoTiers["repo2554@" + T], "ignore");
+  assert.ok(!Object.prototype.hasOwnProperty.call(hub.repoTiers, "repo2554"));
+  assert.equal(hub.isRepoIgnored("repo2554", tk(SITE)), true);
+  assert.equal(hub.isRepoIgnored("repo2554", SITE), false);
+  // A plain tier set after the run is the operators': the leftover sweep never moves it.
+  hub.setRepoTier("ops2620", "archive");
+  hub.migrateTenantLeftovers();
+  assert.equal(hub.repoTiers.ops2620, "archive");
+  assert.ok(!Object.prototype.hasOwnProperty.call(hub.repoTiers, "ops2620@" + T));
+  // A hub migrated BEFORE the step existed (its marker lacks it) runs the late
+  // step once: each plain tier is COPIED to the owner, so both keep what they had.
+  const m0 = hub.tenantMigrationMarker();
+  delete m0.steps.repoTiers;
+  hub.setRepoTier("old2620", "ignore");
+  hub.setRepoTier("own2620", "ignore");
+  hub.setRepoTier("own2620", "live", T);             // the owner already set its own
+  await hub.runTenantLateSteps();
+  assert.equal(hub.repoTiers["own2620@" + T], "live", "a copy never overwrites the owner's own tier");
+  assert.equal(hub.repoTiers["old2620@" + T], "ignore");
+  assert.equal(hub.repoTiers.old2620, "ignore", "the operators keep the tier they had");
+  assert.ok(hub.tenantMigrationMarker().steps.repoTiers, "recorded, so it never re-runs");
+  hub.setRepoTier("old2620", "active", T);           // the owner clears its copy...
+  await hub.runTenantLateSteps();
+  assert.ok(!Object.prototype.hasOwnProperty.call(hub.repoTiers, "old2620@" + T), "...and it stays cleared");
+  for (const k of ["ops2620", "old2620", "own2620"]) hub.setRepoTier(k, "active");
+  hub.setRepoTier("own2620", "active", T);   // back to the run's end state
 
   // The retired host's ledgers and archive rows moved at once.
   assert.ok(hub.usageLedger.has(tk("gone2554")) && !hub.usageLedger.has("gone2554"));

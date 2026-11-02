@@ -261,6 +261,8 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   (the org key carries its tenant, XERK-2551), a repo when a host the caller may drive reports it,
   a transcript when its archived (else live) host is the caller's.
   - A repo or transcript no host reports at all is the operators' (the untenanted world).
+  - **A scoper that RENAMES keys must still mark the payload changed**: `scopePayload` compares key
+    lists, not just sizes (`sameKeys`) — `repoTiers` unscopes `<repo>@<t>` at equal size (XERK-2620).
 - **Every refusal is the 404 an unknown id gets**, never 403 (existence never leaks).
 - **`/api/agents` and every SSE frame go through `scopePayload`/`scopeEvent`**: each top-level key and
   event has a scoper; an unknown one is DROPPED for every view (default-deny). A new payload key or
