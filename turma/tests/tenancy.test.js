@@ -1133,3 +1133,103 @@ test("XERK-2621: the pin maps evict the biggest tenant's oldest pin, never anoth
   const tie = { [`s@${ta}/A`]: { at: 5 }, [`s@${tb}/B`]: { at: 3 } };
   assert.deepEqual(hub.trimByTenant(tie, 1, hub.tenantOfPinKey, (r) => r.at), [`s@${tb}/B`]);
 });
+
+const note2628 = (at) => [{ at, source: "note", text: "x" }];
+function resetDecisions() {
+  const store = hub.getDecisions();
+  for (const k of Object.keys(store)) delete store[k];
+  return store;
+}
+
+test("XERK-2628: one tenant's 100 decision orgs never drop another's log on restore", () => {
+  const ta = "a".repeat(32), tb = "b".repeat(32);
+  const store = resetDecisions();
+  for (let i = 0; i < hub.DECISIONS_ORGS_MAX; i++) store[`a${i}.atlassian.net@${ta}`] = note2628(1000 + i);
+  // Tenant B's first org is accepted: A's cap is not B's.
+  const bSite = `b.atlassian.net@${tb}`;
+  assert.ok(hub.appendDecision(bSite, { source: "note", text: "b decision" }));
+  // A restart / HA restore keeps every org accepted live, B's included.
+  const restored = hub.decisionsCoerce(JSON.parse(JSON.stringify(hub.getDecisions())));
+  assert.equal(Object.keys(restored).length, hub.DECISIONS_ORGS_MAX + 1);
+  assert.equal(restored[bSite][0].text, "b decision");
+  // The coerce's slice is the hard total.
+  const raw = {};
+  for (let i = 0; i < hub.DECISIONS_ORGS_TOTAL + 5; i++) raw[`s${i}`] = note2628(1);
+  assert.equal(Object.keys(hub.decisionsCoerce(raw)).length, hub.DECISIONS_ORGS_TOTAL);
+  resetDecisions();
+});
+
+test("XERK-2628: a full tenant evicts ONE of its own undecided logs, the oldest", () => {
+  const ta = "a".repeat(32), tb = "b".repeat(32);
+  const store = resetDecisions();
+  for (let i = 0; i < hub.DECISIONS_ORGS_MAX; i++) store[`a${i}.atlassian.net@${ta}`] = note2628(2000 + i);
+  store[`a7.atlassian.net@${ta}`] = note2628(5); // A's oldest
+  const bSite = `b.atlassian.net@${tb}`;
+  store[bSite] = note2628(1); // older than all of A's: still never A's to take
+  const aNew = `anew.atlassian.net@${ta}`;
+  assert.ok(hub.appendDecision(aNew, { source: "note", text: "a decision" }));
+  assert.ok(store[bSite], "B's log survives A's prune");
+  assert.ok(!store[`a7.atlassian.net@${ta}`], "A's oldest undecided log was the one evicted");
+  assert.equal(Object.keys(store).length, hub.DECISIONS_ORGS_MAX + 1, "exactly one evicted");
+  resetDecisions();
+});
+
+test("XERK-2628: a full hub evicts one log of the tenant holding the most, never wiping the rest", () => {
+  const ta = "a".repeat(32), tb = "b".repeat(32), tc = "c".repeat(32);
+  const store = resetDecisions();
+  for (let i = 0; i < 99; i++) store[`a${i}.atlassian.net@${ta}`] = note2628(3000 + i);
+  for (let i = 0; i < 100; i++) store[`c${i}.atlassian.net@${tc}`] = note2628(4000 + i);
+  for (let i = 0; i < 100; i++) store[`u${i}.atlassian.net`] = note2628(5000 + i);
+  store[`b.atlassian.net@${tb}`] = note2628(1); // the oldest log in the hub
+  assert.equal(Object.keys(store).length, hub.DECISIONS_ORGS_TOTAL);
+  assert.ok(hub.appendDecision(`anew.atlassian.net@${ta}`, { source: "note", text: "a" }));
+  assert.equal(Object.keys(store).length, hub.DECISIONS_ORGS_TOTAL, "exactly one evicted");
+  assert.ok(store[`b.atlassian.net@${tb}`], "the smallest tenant's log is never the victim");
+  assert.ok(!store[`c0.atlassian.net@${tc}`], "the biggest tenant's oldest log went");
+  resetDecisions();
+});
+
+test("XERK-2628: a tenant full of DECIDED orgs is refused (409 on the note route), nothing deleted", async () => {
+  const { A, B } = await isoFleet();
+  const ta = hub.tenantOfSite(A.site);
+  const store = resetDecisions();
+  const fakes = [];
+  // 100 orgs of A's tenant, each with a host decided into it.
+  for (let i = 0; i < hub.DECISIONS_ORGS_MAX; i++) {
+    const site = `d${i}.atlassian.net@${ta}`;
+    store[site] = note2628(1);
+    const key = `xerk2628-${i}@${ta}`;
+    hub.agents[key] = { orgBound: site, lastSeen: Date.now() };
+    fakes.push(key);
+  }
+  // One more undecided org past the cap: the refusal prunes it, and must publish that.
+  const stale = `stale.atlassian.net@${ta}`;
+  store[stale] = note2628(1);
+  const served = async () => JSON.parse((await request("GET", "/api/agents", { headers: A.h })).raw).decisions || {};
+  try {
+    assert.ok(Object.hasOwn(await served(), stale), "positive control: the stale org is served");
+    const r = await request("POST", `/api/orgs/${encodeURIComponent(A.site)}/decisions`,
+      { headers: A.h, body: { text: "refused note" } });
+    assert.equal(r.status, 409, r.raw);
+    assert.equal(Object.keys(store).length, hub.DECISIONS_ORGS_MAX, "no decided org was evicted");
+    assert.ok(!store[A.site] && !store[stale]);
+    assert.ok(!Object.hasOwn(await served(), stale), "a prune before a refusal is published");
+    // A meeting decision's approve refuses the same way (409, review not stamped).
+    const M = hub.getMeetings();
+    M[A.site] = [hub.sanitizeMeeting({ meetingId: "m2628", status: "ok", title: "Sync", platform: "zoom",
+      startedAt: Date.now() - 1e6, endedAt: Date.now() - 1e5, receivedAt: Date.now(), participants: [],
+      items: [{ kind: "decision", title: "Ship Friday", description: "", quotes: [], duplicateKeys: [] }] })];
+    const rm = await request("POST", `/api/orgs/${encodeURIComponent(A.site)}/meetings/m2628/items/p1`,
+      { headers: A.h, body: { action: "approve" } });
+    assert.equal(rm.status, 409, rm.raw);
+    assert.ok(!hub.getMeetings()[A.site][0].items[0].review, "review not stamped");
+    delete M[A.site];
+    // Another tenant is unaffected.
+    const rb = await request("POST", `/api/orgs/${encodeURIComponent(B.site)}/decisions`,
+      { headers: B.h, body: { text: "b note" } });
+    assert.equal(rb.status, 200, rb.raw);
+  } finally {
+    for (const k of fakes) delete hub.agents[k];
+    resetDecisions();
+  }
+});
