@@ -1475,9 +1475,18 @@ function trimByTenant(map, max, tenantOf, age, keep) {
   }
   return evicted;
 }
+// `site` minus EVERY trailing `@<32hex>` tenant suffix (XERK-2629): one strip
+// left `site@<B>@<B>` from an untenanted host as `site@<B>` — tenant B's org.
+// A tail walk, never a `(?:@hex{32})+$` regex: that retries from every `@` and
+// is quadratic on an agent-sent siteKey (a 528 KB one held the loop 14 s).
+function stripSiteTenantSuffixes(site) {
+  let end = site.length;
+  while (end >= 33 && site.charCodeAt(end - 33) === 64 && TENANT_ID_RE.test(site.slice(end - 32, end))) end -= 33;
+  return end === site.length ? site : site.slice(0, end);
+}
 function scopeSite(site, tenantId) {
   if (typeof site !== "string" || !site) return site;
-  const base = baseOfKey(site);
+  const base = stripSiteTenantSuffixes(site);
   return tenantId ? `${base}@${tenantId}` : base;
 }
 // Payload keys whose objects are session CONTENT (transcripts, logs, ticket
@@ -1662,8 +1671,8 @@ const lowerName = (n) => String(n).toLowerCase();
 function uidHostRefusal(uid, host, now = Date.now()) {
   const e = identityOf(uid);
   if (!e) {
-    return "this agent identity is not registered on this hub — re-provision the host with " +
-      "its own token (node turma/server.js --agent-token <host>)";
+    return "this agent identity is not registered on this hub — re-provision the host with a " +
+      "fresh enrollment code from the dashboard's Add host (turma-agentctl enroll --code <code>)";
   }
   if (!hostKeyUsable(host)) return `${host} is not a usable host name`;
   // The tenant is the IDENTITY's, never the name's (XERK-2533): an agent bound
@@ -1679,7 +1688,7 @@ function uidHostRefusal(uid, host, now = Date.now()) {
   if (e.home === host) {
     return e.released && rec && !rec.agentUid
       ? `${host} was removed and re-registered by another agent — re-provision this host ` +
-        "with its own token (node turma/server.js --agent-token <host>)"
+        "with a fresh enrollment code from the dashboard's Add host (turma-agentctl enroll --code <code>)"
       : null;
   }
   if (rec && !rec.agentUid) return `${host} is registered to another agent — remove it from the dashboard to release the name`;
@@ -3171,8 +3180,14 @@ const persistDevices = registerExternalStore({
 });
 // Each device belongs to the tenant of the principal that registered it
 // (XERK-2551, `tenantId`; absent = the operators'), and is sent only alerts about
-// that tenant's hosts (notify/dismiss). A phone signing in as someone else
-// re-registers the same token, which moves it.
+// that tenant's hosts (notify/dismiss).
+// A token bound to one tenant is never re-bound or released by another
+// (XERK-2622): whoever learned a victim's FCM token could otherwise pull the
+// victim's phone out of its tenant or unregister it. A phone that changes login
+// gets its new tenant by RELEASING the old binding (sign-out unregisters), or,
+// when that release was lost, by rotating its FCM token on the 409 this returns
+// — a fresh token has no binding, and the dead one is pruned on the next send.
+const deviceTenant = (d) => ((d && typeof d.tenantId === "string") ? d.tenantId : "");
 function registerDevice(token, platform, features, tenantId = "") {
   const now = Date.now();
   // What this app build can do (XERK-154). Only a build that declares "dismiss"
@@ -3182,9 +3197,9 @@ function registerDevice(token, platform, features, tenantId = "") {
   const caps = Array.isArray(features) ? features.filter((f) => typeof f === "string") : null;
   const existing = devices.find((d) => d.token === token);
   if (existing) {
+    if (deviceTenant(existing) !== (tenantId || "")) return false;
     existing.platform = platform || existing.platform;
     if (caps) existing.features = caps;
-    if (tenantId) existing.tenantId = tenantId; else delete existing.tenantId;
     existing.seenAt = now;
   } else {
     const d = { token, platform: platform || "android", features: caps || [], addedAt: now, seenAt: now };
@@ -3192,10 +3207,15 @@ function registerDevice(token, platform, features, tenantId = "") {
     devices.push(d);
   }
   persistDevices();
+  return true;
 }
-function unregisterDevice(token) {
+// `tenantId` given (the DELETE route) = only a device of that tenant ("" = the
+// operators') is removed: a caller holding another tenant's FCM token must not
+// silence that tenant's phone (XERK-2557, XERK-2622). Omitted = internal, any tenant.
+function unregisterDevice(token, tenantId) {
   const before = devices.length;
-  devices = devices.filter((d) => d.token !== token);
+  devices = devices.filter((d) => d.token !== token
+    || (tenantId !== undefined && deviceTenant(d) !== tenantId));
   if (devices.length !== before) persistDevices();
 }
 function pruneDevices(deadTokens) {
@@ -3212,7 +3232,7 @@ function listDevices() {
 // for an untenanted host (and a fleet-wide alert, host "").
 function devicesForHost(host) {
   const t = tenantOfKey(host || "");
-  return devices.filter((d) => ((d && typeof d.tenantId === "string") ? d.tenantId : "") === t);
+  return devices.filter((d) => deviceTenant(d) === t);
 }
 
 // ---- ticket -> agent pins (XERK-38) ----------------------------------------
@@ -4599,7 +4619,11 @@ const DAILY_BRIEF_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 // The zone's name as Intl spells it ("utc" -> "UTC"), or "" for anything Intl
 // rejects or an offset zone ("+05:30" — it has no DST rules, and the operator is
 // asked for a named zone). Intl's spelling so a coerced value is a fixed point.
-const DAILY_BRIEF_ORGS_MAX = 100; // dailyBriefSchedulesCoerce inlines the same 100 (module-init TDZ)
+// Orgs PER TENANT (XERK-2626, orgStoreFull); the store holds at most
+// ORG_STORE_TOTAL_FACTOR x this, the hard total dailyBriefSchedulesCoerce inlines
+// as 300 (module-init TDZ).
+const DAILY_BRIEF_ORGS_MAX = 100;
+const ORG_STORE_TOTAL_FACTOR = 3; // shared with meetings (orgStoreFull)
 const DAILY_BRIEF_SITE_MAX = 200; // ...and the same 200
 function canonicalTimeZone(tz) {
   if (typeof tz !== "string" || !/^[A-Za-z]/.test(tz) || tz.length > 64) return "";
@@ -4645,7 +4669,7 @@ function sanitizeDailyBriefSchedule(v) {
 const dailyBriefSchedulesCoerce = (raw) => {
   const out = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const [site, s] of Object.entries(raw).slice(0, 100)) {
+    for (const [site, s] of Object.entries(raw).slice(0, 300)) {
       if (!site || site.length > 200) continue;
       const v = sanitizeDailyBriefSchedule(s);
       if (v) out[site] = v;
@@ -4912,7 +4936,7 @@ function sanitizeDailyBrief(v) {
 const dailyBriefsCoerce = (raw) => {
   const out = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const [site, list] of Object.entries(raw).slice(0, DAILY_BRIEF_ORGS_MAX)) {
+    for (const [site, list] of Object.entries(raw).slice(0, DAILY_BRIEF_ORGS_MAX * ORG_STORE_TOTAL_FACTOR)) {
       if (!site || site.length > DAILY_BRIEF_SITE_MAX || !Array.isArray(list)) continue;
       const kept = keepDailyBriefs(list.slice(0, 1000).map(sanitizeDailyBrief).filter(Boolean));
       if (kept.length) out[site] = kept;
@@ -4985,7 +5009,7 @@ function putDailyBrief(siteKey, row) {
 // restore, remote watch), its field order fixed so a live row is a coerce fixed
 // point. Contract: .claude/rules/contract-meetings.md.
 const MEETINGS_KEEP = 50;
-const MEETINGS_ORGS_MAX = 100;
+const MEETINGS_ORGS_MAX = 100; // per tenant (XERK-2626, orgStoreFull)
 const MEETINGS_SITE_MAX = 200;
 const MEETING_SEGMENTS_MAX = 10000;
 const MEETING_ITEMS_MAX = 30;
@@ -5192,7 +5216,7 @@ function keepMeetings(list) {
 const meetingsCoerce = (raw) => {
   const out = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const [site, list] of Object.entries(raw).slice(0, MEETINGS_ORGS_MAX)) {
+    for (const [site, list] of Object.entries(raw).slice(0, MEETINGS_ORGS_MAX * ORG_STORE_TOTAL_FACTOR)) {
       if (!site || site.length > MEETINGS_SITE_MAX || !Array.isArray(list)) continue;
       const kept = keepMeetings(list.slice(0, 1000).map(sanitizeMeeting).filter(Boolean));
       if (kept.length) out[site] = kept;
@@ -19767,6 +19791,43 @@ function epicRunCompleteSweep() {
 // its newest entry (a host that went quiet or is being re-bound gets it back).
 const DECISIONS_RETAIN_MS = 30 * 24 * 3600 * 1000;
 
+// Is an org-keyed store (briefs, schedules, meetings) too full to take a NEW
+// org `siteKey`? The per-org-count cap `max` is judged within siteKey's TENANT
+// (XERK-2626): one fleet-wide count let a tenant whose hosts are decided into
+// `max` orgs refuse every other tenant's first org, and the decided-org prune
+// never freed those slots. ORG_STORE_TOTAL_FACTOR x `max` is the hard total the
+// store never passes (memory; the coerces slice at it). Accepted: that many
+// tenants each holding `max` decided orgs together fill it. Answers "tenant"
+// (checked FIRST), "hub" or "".
+function orgStoreFull(store, siteKey, max) {
+  const keys = Object.keys(store);
+  const t = tenantOfSite(siteKey);
+  if (keys.filter((k) => tenantOfSite(k) === t).length >= max) return "tenant";
+  return keys.length >= max * ORG_STORE_TOTAL_FACTOR ? "hub" : "";
+}
+// Make room in `store` for a NEW org `siteKey`, deleting orgs `forget(k)`
+// approves: the caller's own tenant's while ITS cap is what is full, and only
+// once that cap has room, any tenant's for the hard total. So a refusal of the
+// caller's own tenant never deletes another tenant's orgs. Answers
+// {full, pruned}; a non-empty `full` is a refusal, and a caller that refuses
+// after a prune must still persist the store.
+function makeRoomForOrg(store, siteKey, max, forget) {
+  const t = tenantOfSite(siteKey);
+  let full = orgStoreFull(store, siteKey, max);
+  let pruned = false;
+  for (const scope of ["tenant", "hub"]) {
+    if (full !== scope) continue;
+    for (const k of Object.keys(store)) {
+      if ((scope === "hub" || tenantOfSite(k) === t) && forget(k)) {
+        delete store[k];
+        pruned = true;
+      }
+    }
+    full = orgStoreFull(store, siteKey, max);
+  }
+  return { full, pruned };
+}
+
 // Every org some host is DECIDED into — the org boundary every other org surface
 // keys on, never a claimed jira.siteKey.
 function decidedOrgs() {
@@ -20077,15 +20138,13 @@ function startDailyBriefRun(siteKey, trigger, now = Date.now(), due = null) {
   // Refuse what the store's coerce would drop: a dropped row would read as "never
   // fired" and the schedule would re-fire every tick. A full store first forgets
   // orgs no host is decided into.
-  if (!Object.hasOwn(dailyBriefs, siteKey)
-      && Object.keys(dailyBriefs).length >= DAILY_BRIEF_ORGS_MAX) {
+  if (!Object.hasOwn(dailyBriefs, siteKey) && orgStoreFull(dailyBriefs, siteKey, DAILY_BRIEF_ORGS_MAX)) {
     const orgs = decidedOrgs();
-    for (const k of Object.keys(dailyBriefs)) {
-      if (!orgs.has(k) && !dailyBriefs[k].some((b) => b.status === "running")) delete dailyBriefs[k];
-    }
-    if (Object.keys(dailyBriefs).length >= DAILY_BRIEF_ORGS_MAX) {
-      return { status: 409, error: `${DAILY_BRIEF_ORGS_MAX} orgs already have briefs — the limit` };
-    }
+    const { full, pruned } = makeRoomForOrg(dailyBriefs, siteKey, DAILY_BRIEF_ORGS_MAX,
+      (k) => !orgs.has(k) && !dailyBriefs[k].some((b) => b.status === "running"));
+    if (full && pruned) persistDailyBriefs();
+    if (full === "tenant") return { status: 409, error: `${DAILY_BRIEF_ORGS_MAX} orgs already have briefs — the limit` };
+    if (full) return { status: 409, error: "the hub holds briefs for too many orgs — try again later" };
   }
   const schedule = dailyBriefScheduleOf(siteKey);
   const lastOk = list.find((b) => b.status === "ok");
@@ -20316,15 +20375,15 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   }
   // Refuse what the coerce would drop: a full store first forgets orgs no host
   // is decided into (and that wait on nothing).
-  if (!Object.hasOwn(meetingProposals, siteKey) &&
-      Object.keys(meetingProposals).length >= MEETINGS_ORGS_MAX) {
+  if (!Object.hasOwn(meetingProposals, siteKey) && orgStoreFull(meetingProposals, siteKey, MEETINGS_ORGS_MAX)) {
     const orgs = decidedOrgs();
-    for (const k of Object.keys(meetingProposals)) {
-      if (!orgs.has(k) && !meetingPendingCount(meetingProposals[k])) delete meetingProposals[k];
-    }
-    if (Object.keys(meetingProposals).length >= MEETINGS_ORGS_MAX) {
+    const { full, pruned } = makeRoomForOrg(meetingProposals, siteKey, MEETINGS_ORGS_MAX,
+      (k) => !orgs.has(k) && !meetingPendingCount(meetingProposals[k]));
+    if (full && pruned) persistMeetings();
+    if (full === "tenant") {
       return { status: 409, body: { error: `${MEETINGS_ORGS_MAX} orgs already have meetings — the limit` } };
     }
+    if (full) return { status: 409, body: { error: "the hub holds meetings for too many orgs — try again later" } };
   }
   if (meetingPendingCount(meetingProposals[siteKey]) >= MEETINGS_PENDING_ORG_MAX) {
     return { status: 429, body: { error: `${MEETINGS_PENDING_ORG_MAX} meetings of this org are already waiting to be read — try again later` } };
@@ -23179,12 +23238,18 @@ const server = http.createServer(async (req, res) => {
       if (!token) return json(res, 400, { error: "token required" });
       const platform = typeof body.platform === "string" ? body.platform : "android";
       const features = Array.isArray(body.features) ? body.features : undefined;
-      registerDevice(token, platform, features, principalTenant(requestPrincipal(req)));
+      // 409 = this token is another tenant's (XERK-2622); the app rotates its
+      // FCM token and registers the new one.
+      if (!registerDevice(token, platform, features, principalTenant(requestPrincipal(req)))) {
+        return json(res, 409, { error: "this device is registered to another account; sign out there first" });
+      }
       return json(res, 200, { ok: true });
     }
     if (req.method === "DELETE" && url.pathname === "/api/devices") {
+      // Only the caller's own tenant's registration; another's is left alone
+      // and answered the same 200, so the route is no oracle for it.
       const token = (url.searchParams.get("token") || "").trim();
-      if (token) unregisterDevice(token);
+      if (token) unregisterDevice(token, principalTenant(requestPrincipal(req)));
       return json(res, 200, { ok: true });
     }
 
@@ -26691,16 +26756,15 @@ const server = http.createServer(async (req, res) => {
         const { value, error } = validateDailyBriefSchedule(merged);
         if (error) return json(res, 400, { error });
         if (!(siteKey in dailyBriefSchedules) &&
-            Object.keys(dailyBriefSchedules).length >= DAILY_BRIEF_ORGS_MAX) {
-          // Any prune frees a slot, so a refusal below never leaves one unpublished;
-          // the set that follows publishes the pruned map.
-          for (const k of Object.keys(dailyBriefSchedules)) {
-            if (!orgs.has(k)) delete dailyBriefSchedules[k];
-          }
-          if (Object.keys(dailyBriefSchedules).length >= DAILY_BRIEF_ORGS_MAX) {
-            return json(res, 409, {
-              error: `${DAILY_BRIEF_ORGS_MAX} orgs already have a meeting schedule — the limit`,
-            });
+            orgStoreFull(dailyBriefSchedules, siteKey, DAILY_BRIEF_ORGS_MAX)) {
+          // The set that follows publishes a pruned map; a refusal publishes its own.
+          const { full, pruned } = makeRoomForOrg(dailyBriefSchedules, siteKey, DAILY_BRIEF_ORGS_MAX,
+            (k) => !orgs.has(k));
+          if (full) {
+            if (pruned) publishDailyBriefSchedules();
+            return json(res, 409, { error: full === "tenant"
+              ? `${DAILY_BRIEF_ORGS_MAX} orgs already have a meeting schedule — the limit`
+              : "the hub holds meeting schedules for too many orgs — try again later" });
           }
         }
         setDailyBriefSchedule(siteKey, value);
@@ -27809,7 +27873,7 @@ if (process.env.TURMA_TEST) {
     // Host ⇄ tenant binding (XERK-2533).
     tenantOfKey,
     // XERK-2551: org keys belong to tenants.
-    tenantOfSite, tenantOfPinKey, trimByTenant, baseOfSite, scopeSite, scopeSiteKeys, unscopeSiteKeys, principalMaySite,
+    tenantOfSite, tenantOfPinKey, trimByTenant, orgStoreFull, makeRoomForOrg, baseOfSite, scopeSite, scopeSiteKeys, unscopeSiteKeys, principalMaySite,
     devicesForHost, mintMeetingsTenantToken, meetingsTenant, notify, rescopeRestoredOrgs,
     baseOfKey,
     agentKeyFor,
