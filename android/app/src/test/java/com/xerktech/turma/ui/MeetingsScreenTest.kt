@@ -70,9 +70,14 @@ class MeetingsScreenTest {
         seed()
         val vm = main.track(MeetingsViewModel(hub.app))
         show(vm)
-        compose.waitUntil(10_000) { vm.projectOf(site) == "ENG" }
+        // Wait on the rendered picker, not on vm.projectOf: the projects land on
+        // an OkHttp thread, so the VM can read "ENG" before the screen's
+        // collector has been dispatched to recompose — an idle check in that
+        // gap still sees "… loading projects" (XERK-2633).
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText("Engineering (ENG) ▾").fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithText("Sprint sync").assertExists()
-        compose.onNodeWithText("Engineering (ENG) ▾").assertExists()
         compose.onNodeWithText("Fix the login 500").assertExists()
         compose.onNodeWithText("Owner: Ann").assertExists()
         compose.onNodeWithText("May duplicate ENG-12").assertExists()
