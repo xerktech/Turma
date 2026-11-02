@@ -70,6 +70,7 @@ Tenancy model: `turma-tenancy.md`. Decision: `docs/multi-tenant-adr.md` ("an adm
 - Every admin write records one row; `detail` is built from fixed fields — never a password.
 - A row names an account by a field its owner cannot change (`adminUserLabel`): a local username,
   or an OIDC user's hub id ahead of its display name (XERK-2631) — the IdP may let a user edit that.
+  - An SSO card shows that `oidc:<id>`, the only way to match a row to a user; never hide it.
 
 ## Clients
 

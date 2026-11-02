@@ -3407,10 +3407,11 @@ function adminActorLabel(p) {
 }
 // An OIDC user leads with its hub user id: the display name is the IdP's, which
 // the user may be able to edit, so on its own it could make a row read as
-// another person's (XERK-2631). The id is fixed for the account's life and is
-// the one the admin panel lists. A local username is already fixed.
+// another person's (XERK-2631). The id is fixed for the account's life and the
+// admin panel shows it on the user's card. A local username is already fixed.
+// The name is cut so the whole label fits the audit row's 120-char target cap.
 function adminUserLabel(u) {
-  return u.source === "local" ? `${u.username} (local)` : `oidc:${u.id} (${u.displayName})`;
+  return u.source === "local" ? `${u.username} (local)` : `oidc:${u.id} (${u.displayName.slice(0, 80)})`;
 }
 // What /api/login answers (403) a user whose password an admin reset (XERK-2630).
 const PASSWORD_RESET_REFUSAL = "an administrator reset your password — choose a new one to sign in";
@@ -28051,6 +28052,7 @@ if (process.env.TURMA_TEST) {
     adminAudit: () => adminAudit,
     deleteUserAndTenant,
     adminWayInRemains,
+    adminActorLabel,
     coerceEnrollCodes,
     serializeAgent,
     tokenHost,

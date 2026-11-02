@@ -135,8 +135,11 @@ function userHtml(u) {
   const roles = u.roles.length ? u.roles.map((r) => `<span class="ad-pill">${esc(r)}</span>`).join(" ")
     : `<span class="ad-pill off">no role</span>`;
   const grp = u.groups.length ? u.groups.map(esc).join(", ") : "none";
+  // The audit log names an SSO user by this id (its IdP display name is the
+  // user's to edit), so the card shows it for the admin to match against.
   const idp = u.source === "oidc"
-    ? `<div class="ad-meta">From the identity provider: ${u.idpRoles.length ? u.idpRoles.map(esc).join(", ") : "no role"} (read-only)</div>` : "";
+    ? `<div class="ad-meta">From the identity provider: ${u.idpRoles.length ? u.idpRoles.map(esc).join(", ") : "no role"} (read-only)</div>
+    <div class="ad-meta">In the audit log: <code>oidc:${esc(u.id)}</code></div>` : "";
   const isYou = u.id === you;
   const disabledPill = u.disabled
     ? `<span class="ad-pill off">${u.disabledBy === "idp" ? "disabled by SSO groups" : "disabled"}</span>` : "";

@@ -284,6 +284,18 @@ test("XERK-2631: an SSO user is named in the audit log by its fixed id, not only
   const rows = audit.body.entries.filter((e) => e.action === "user.update" && e.detail.includes("devs"));
   assert.deepEqual(rows.map((e) => e.target), [`oidc:${user.id} (rootadmin (local))`],
     "the stable id leads, so the display name cannot pose as another label");
+  // The actor path names an SSO admin the same way.
+  assert.equal(hub.adminActorLabel({ kind: "user", userId: user.id }), `oidc:${user.id} (rootadmin (local))`);
+  // A long name is cut so the label survives the row's 120-char cap whole.
+  const long = tenancy.upsertOidcUser(hub.tenancyState(), { iss: "https://idp/", sub: "s-spoof", displayName: "Z".repeat(100), idpRoles: ["user"] });
+  hub.__setTenancy(long.state);
+  const label = hub.adminActorLabel({ kind: "user", userId: user.id });
+  assert.ok(label.length <= 120 && label.endsWith(")"), label);
+});
+
+test("XERK-2631: a display name loses bidi overrides and isolates", () => {
+  const { user } = tenancy.upsertOidcUser(hub.tenancyState(), { iss: "https://idp/", sub: "s-bidi", displayName: "a\u202Eb\u2066c\u200Fd", idpRoles: ["user"] });
+  assert.equal(user.displayName, "abcd");
 });
 
 test("XERK-2552: the group map is replaced whole and validated", async () => {

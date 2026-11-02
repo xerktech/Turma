@@ -106,10 +106,12 @@ function validPassword(pw) {
   return typeof pw === "string" && pw.length >= PASSWORD_MIN && Buffer.byteLength(pw) <= PASSWORD_MAX;
 }
 
+// Control characters and bidi overrides/isolates go: a right-to-left override
+// in a display name would visually reorder the audit row or card after it.
 function cleanText(s, max) {
   if (typeof s !== "string") return "";
   // eslint-disable-next-line no-control-regex
-  return s.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").trim().slice(0, max);
+  return s.replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "").trim().slice(0, max);
 }
 
 const finiteMs = (n) => (Number.isSafeInteger(n) && n > 0 ? n : undefined);
