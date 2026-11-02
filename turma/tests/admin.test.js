@@ -274,6 +274,54 @@ test("XERK-2552: an admin cannot disable or delete its own account; SSO-owned fi
   assert.deepEqual(sso.idpRoles, ["user"], "the IdP's roles are shown, read-only");
 });
 
+test("XERK-2631: an SSO user is named in the audit log by its fixed id, not only its IdP display name", async () => {
+  const h = await cookieFor("rootadmin", "root-admin-pass");
+  // A display name chosen to read as someone else's label.
+  const { state, user } = tenancy.upsertOidcUser(hub.tenancyState(), { iss: "https://idp/", sub: "s-spoof", displayName: "rootadmin (local)", idpRoles: ["user"] });
+  hub.__setTenancy(state);
+  assert.equal((await request("PATCH", `/api/admin/users/${user.id}`, { headers: h, body: { groups: ["devs"] } })).status, 200);
+  const audit = await request("GET", "/api/admin/audit", { headers: h });
+  const rows = audit.body.entries.filter((e) => e.action === "user.update" && e.detail.includes("devs"));
+  assert.deepEqual(rows.map((e) => [e.target, e.targetId]), [[`oidc:${user.id} (rootadmin (local))`, user.id]],
+    "the stable id leads, so the display name cannot pose as another label; the id rides the row");
+  // The actor path names an SSO admin the same way, and its row carries the id.
+  assert.equal(hub.adminActorLabel({ kind: "user", userId: user.id }), `oidc:${user.id} (rootadmin (local))`);
+  hub.recordAdminAction({ kind: "user", userId: user.id }, "user.update", "", "xerk-2631 actor");
+  const mine = hub.adminAudit().find((e) => e.detail === "xerk-2631 actor");
+  assert.equal(mine.actorId, user.id);
+  assert.equal(mine.actor, `oidc:${user.id} (rootadmin (local))`);
+  // A long name is cut so the label survives the row's 120-char cap whole.
+  const long = tenancy.upsertOidcUser(hub.tenancyState(), { iss: "https://idp/", sub: "s-spoof", displayName: "Z".repeat(100), idpRoles: ["user"] });
+  hub.__setTenancy(long.state);
+  const label = hub.adminActorLabel({ kind: "user", userId: user.id });
+  assert.ok(label.length <= 120 && label.endsWith(")"), label);
+  // The cut never leaves half an emoji behind.
+  const emoji = tenancy.upsertOidcUser(hub.tenancyState(), { iss: "https://idp/", sub: "s-spoof", displayName: "x".repeat(79) + "\u{1F600}", idpRoles: ["user"] });
+  hub.__setTenancy(emoji.state);
+  assert.equal(hub.adminActorLabel({ kind: "user", userId: user.id }), `oidc:${user.id} (${"x".repeat(79)})`);
+});
+
+test("XERK-2631: an audit row loaded from disk loses bidi overrides", () => {
+  const [row] = hub.coerceAdminAudit([{ at: 1, actor: "evil\u202Erev (oidc)", action: "user.update", target: "t\u2066x", detail: "d\u200Fq" }]);
+  assert.deepEqual([row.actor, row.target, row.detail], ["evilrev (oidc)", "tx", "dq"]);
+  // An id is kept only where the label it names leads with it.
+  const ok = "a".repeat(32);
+  const [kept, dropped] = hub.coerceAdminAudit([
+    { at: 1, action: "user.update", actor: `oidc:${ok} (A)`, actorId: ok, target: "b (local)", targetId: ok },
+    { at: 2, action: "user.update", actor: `oidc:${ok} (A) (oidc)`, actorId: "x" },
+  ]);
+  assert.equal(kept.actorId, ok);
+  assert.equal(kept.targetId, undefined, "a local label never carries an id");
+  assert.equal(dropped.actorId, undefined);
+  const [long] = hub.coerceAdminAudit([{ at: 3, action: "user.update", actor: `oidc:${ok}a (A)`, actorId: `${ok}a` }]);
+  assert.equal(long.actorId, undefined, "an id must be exactly 32 hex");
+});
+
+test("XERK-2631: a display name loses bidi overrides and isolates", () => {
+  const { user } = tenancy.upsertOidcUser(hub.tenancyState(), { iss: "https://idp/", sub: "s-bidi", displayName: "a\u202Eb\u2066c\u200Fd", idpRoles: ["user"] });
+  assert.equal(user.displayName, "abcd");
+});
+
 test("XERK-2552: the group map is replaced whole and validated", async () => {
   const bad = await request("PUT", "/api/admin/groups", { headers: BASIC, body: { groups: { "turma-users": "root" } } });
   assert.equal(bad.status, 400);

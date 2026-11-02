@@ -35,6 +35,18 @@ tenants, run by an admin panel.
   the web for a week and in Sign out's tooltip. An admin who takes the account over leaves the user
   locked out of their own password and looking at the reset. Rejected: an emailed one-time link (the
   hub sends no mail) and accept-and-document. SSO users' passwords are the IdP's (409).
+- **Rolling the hub back past XERK-2630 erases a reset's trace and opens the reset password**
+  (XERK-2631). An older hub's user coerce drops `sessionEpoch`, `mustChangePassword` and
+  `passwordResets`: it lets the reset password sign in, and its next save writes `users.json`
+  without them, so rolling forward again does not bring them back. An HA rolling update that still
+  runs an older replica has the same window.
+  - Before rolling back: list the local users reset recently (the audit log's `user.password` rows).
+  - After rolling back (or forward again): reset each of them again on the newer hub, so the user
+    chooses a new password and sees the reset.
+- **The reset trace and the audit log name an SSO actor by its hub user id** (`oidc:<id> (<name>)`,
+  XERK-2631): the display name is the IdP's and its owner may be able to change it, so on its own it
+  could make a reset read as someone else's. The admin panel shows each SSO user's id on its card
+  and links an audit row to that card through the id the hub stored with the row.
 - Enforcement on each route is the later tickets of the epic; XERK-2530 lands the identity they key on.
   Until those land every signed-in principal still has today's full access — which exposes nothing
   new, because the only principals that can exist are the bootstrap admin, break-glass, and OIDC users

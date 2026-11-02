@@ -68,6 +68,13 @@ Tenancy model: `turma-tenancy.md`. Decision: `docs/multi-tenant-adr.md` ("an adm
 - `/data/admin-audit.json` (`ADMIN_AUDIT_FILE`), `registerExternalStore`, `debounceMs: 0`, 0600, the
   newest 1000 rows `{at, actor, action, target?, detail?}`; `coerceAdminAudit` is the whitelist.
 - Every admin write records one row; `detail` is built from fixed fields — never a password.
+- A row names an account by a field its owner cannot change (`adminUserLabel`): a local username,
+  or an OIDC user's hub id ahead of its display name (XERK-2631) — the IdP may let a user edit that.
+  - An SSO card shows that `oidc:<id>`, the only way to match a row to a user; never hide it.
+  - A row carries the SSO ids the hub wrote (`actorId`/`targetId`, kept by `coerceAdminAudit` only
+    when the label leads with `oidc:<id> `); the panel links a label to a card ONLY through them
+    (`auditLabelHtml`), never by parsing it: an older hub's rows put the display name first, and a
+    name can mimic any label, even under browser find-in-page folding. Tests: `admin-page.test.js`.
 
 ## Clients
 
