@@ -221,16 +221,25 @@ const labelBusy = new Set();     // site with a label POST in flight
 const labelErr = new Map();      // site -> the hub's refusal
 const missPick = new Map();      // miss key -> the org picked for it
 const missLabel = (k) => String(k).replace(/@[0-9a-f]{32}$/, "");
+let labelsOpen = false;          // the "Tenir labels" list stays as the operator left it
+// Org names as the label UI shows them: two orgs with one name get their site too.
+function labelNamer(orgs, name) {
+  const count = new Map();
+  for (const s of orgs) count.set(name(s), (count.get(name(s)) || 0) + 1);
+  const site = (s) => String(s).replace(/@[0-9a-f]{32}$/, "");
+  return (s) => (count.get(name(s)) > 1 ? `${name(s)} (${site(s)})` : name(s));
+}
 function labelOrgs(data) {
   const keys = TurmaOrg.getKeys();
   const map = data && data.meetingLabels && typeof data.meetingLabels === "object" ? data.meetingLabels : {};
   return Object.keys(map).filter((s) => own(map, s) && typeof own(map, s).label === "string"
     && (!keys.length || keys.includes(s))).sort();
 }
-function missesHtml(data, name) {
+function missesHtml(data, baseName) {
   const map = data && data.meetingLabelMisses && typeof data.meetingLabelMisses === "object" ? data.meetingLabelMisses : {};
   const orgs = labelOrgs(data);
   if (!orgs.length) return "";
+  const name = labelNamer(orgs, baseName);
   return Object.keys(map).filter((k) => LABEL_RE.test(missLabel(k))).sort().map((k) => {
     const label = missLabel(k), m = own(map, k) || {};
     const what = m.shared
@@ -247,22 +256,23 @@ function missesHtml(data, name) {
       + `</div>`;
   }).join("");
 }
-function labelsHtml(data, name) {
+function labelsHtml(data, baseName) {
   const orgs = labelOrgs(data);
   if (!orgs.length) return "";
+  const name = labelNamer(orgs, baseName);
   const rows = orgs.map((s) => {
     const cur = own(data.meetingLabels, s);
     const v = labelDrafts.has(s) ? labelDrafts.get(s) : cur.label;
     const busy = labelBusy.has(s) ? "true" : "false";
     return `<div class="mt-label-row"><span class="name">${esc(name(s))}</span>`
-      + `<input data-label="${esc(s)}" value="${esc(v)}" maxlength="40" spellcheck="false" autocomplete="off" aria-label="Tenir label for ${esc(name(s))}">`
+      + `<input data-label="${esc(s)}" value="${esc(v)}" maxlength="40" spellcheck="false" autocomplete="off" placeholder="no label" aria-label="Tenir label for ${esc(name(s))}">`
       + `<button class="btn-sm" data-label-save="${esc(s)}" aria-disabled="${busy}">Save</button>`
       + (cur.custom ? `<button class="btn-sm" data-label-reset="${esc(s)}" aria-disabled="${busy}" title="Go back to the default label">Reset</button>`
-        : `<span class="def">default</span>`)
+        : `<span class="def">${cur.label ? "default" : "no label — give it one"}</span>`)
       + (labelErr.has(s) ? `<span class="mt-err-inline">${esc(labelErr.get(s))}</span>` : "")
       + `</div>`;
   }).join("");
-  const open = labelDrafts.size || labelErr.size ? " open" : "";
+  const open = labelsOpen || labelDrafts.size || labelErr.size ? " open" : "";
   return `<details class="mt-labels"${open}><summary>Tenir labels</summary>`
     + `<p class="mt-labels-hint">Name each org by its label in the meeting PC's capture.json (<code>"org"</code>).</p>`
     + rows + `</details>`;
@@ -511,6 +521,11 @@ function mount(el) {
       if (e) e.issueType = t.value;
     }
   });
+  // `toggle` doesn't bubble; capture it so a repaint keeps the list as left.
+  $list.addEventListener("toggle", (ev) => {
+    const t = ev.target;
+    if (t && t.classList && t.classList.contains("mt-labels")) labelsOpen = !!t.open;
+  }, true);
   $list.addEventListener("keydown", (ev) => {
     const t = ev.target;
     if (ev.key !== "Enter" || !t || !t.dataset || t.dataset.label === undefined) return;

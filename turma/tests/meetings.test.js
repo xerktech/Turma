@@ -254,3 +254,17 @@ test("XERK-2638: the Tenir labels list and an unmapped label's banner, escaped, 
   assert.doesNotMatch(Q.list(), /data-label="acme/);
   assert.match(Q.list(), /data-label="dev\.azure\.com\/Bolt"/);
 });
+
+test("XERK-2638: an org with no label is still listed and pickable; same-named orgs show their site", () => {
+  const T1 = "twin-a.atlassian.net", T2 = "twin-b.atlassian.net";
+  const d = { agents: [{ org: T1, jira: { siteKey: T1, orgName: "Twin Co" } }, { org: T2, jira: { siteKey: T2, orgName: "Twin Co" } }],
+    meetingProposals: {}, meetingLabels: { [T1]: { label: "", custom: false }, [T2]: { label: "twin-co", custom: true } },
+    meetingLabelMisses: { other: { at: 1 } } };
+  const P = loadPage(META);
+  P.update(d);
+  const html = P.list();
+  assert.match(html, /data-label="twin-a\.atlassian\.net" value="" maxlength="40"[^>]*placeholder="no label"/);
+  assert.match(html, /no label — give it one/);
+  assert.match(html, /<option value="twin-a\.atlassian\.net">Twin Co \(twin-a\.atlassian\.net\)<\/option>/);
+  assert.match(html, /Twin Co \(twin-b\.atlassian\.net\)/);
+});

@@ -25,11 +25,18 @@ ticket builds to this file; change it here first.
   `resolveMeetingOrg`, in the tenant gate before the route: a decided org's site key matches first
   (older configs), else a label `^[a-z0-9][a-z0-9_-]{0,39}$`, case-folded, of the token's tenant.
   - An org's label is the operator's (`meetingLabels`, `POST /api/orgs/<site>/meeting-label
-    {label|null}`, 409 one another org of the tenant has) else a slug of its name (`jira.orgName`,
-    else the site as `board.js` `orgName` derives it). An operator's label outranks a default.
+    {label|null}`) else a slug of its name (`jira.orgName` cut to 120 chars first — it is
+    agent-sent and unbounded — else the site as `board.js` `orgName` derives it).
+  - An operator's label outranks a default: setting one is refused (409) only by another org's
+    OWN label, and an org whose default it takes has none (`""`) until given one. Else a label
+    two orgs' defaults share could never be mapped (QA).
+  - `meetingLabels` lists EVERY decided org, `label:""` included (a name with no ASCII slug), so
+    the operator can always give it one.
   - No org, or two (colliding defaults), answering a label = 404 in words naming it, and the label
-    is noted in `meetingLabelMisses` (`<label>[@tenant]` → `{at, shared?}`, ≤20 per tenant) for
+    is noted in `meetingLabelMisses` (`<label>[@tenant]` → `{at, shared?}`, ≤20 per tenant, 200
+    in all trimmed by `trimByTenant`, a repeat re-written at most every 10 min) for
     the Brief page to map. Tenir keeps retrying a 404, so mapping it delivers the meeting.
+  - Tests: the `XERK-2638:` cases in `server.test.js` (tenant isolation pinned by mutation).
   - Why in Turma: the capture PC should hold no tracker hosts. Tenir needs no version gate: the
     label rides the same URL slot the site key did.
 - Body: `{meetingId, title, platform, startedAt, endedAt, tenirUrl, participants[],

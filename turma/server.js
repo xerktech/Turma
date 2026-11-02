@@ -5473,34 +5473,57 @@ function meetingLabelSlug(text) {
     .replace(/[^a-z0-9]+/g, "-").replace(/^-+/, "").slice(0, 40).replace(/-+$/, "");
   return MEETING_LABEL_RE.test(s) ? s : "";
 }
-// The org's name as the clients show it (board.js `orgName`): a host's
-// configured name, else the site without its tenant, Jira suffix or ADO path.
-function meetingOrgName(siteKey) {
+// Each decided org's DEFAULT label: a slug of its name as the clients show it
+// (board.js `orgName`): a host's configured name, else the site without its
+// tenant, Jira suffix or ADO path. One pass over the hosts; the name is cut to
+// MEETING_ORG_NAME_SLUG_MAX first, since `jira.orgName` is agent-sent and
+// unbounded (a 4M-char name blocked every resolve ~800ms, XERK-2638 QA).
+const MEETING_ORG_NAME_SLUG_MAX = 120;
+function defaultMeetingLabels(orgs = decidedOrgs()) {
+  const names = new Map();
   for (const a of Object.values(agents)) {
-    const n = a && a.jira && typeof a.jira.orgName === "string" ? a.jira.orgName.trim() : "";
-    if (n && decidedOrgOf(a) === siteKey) return n;
+    const n = a && a.jira && typeof a.jira.orgName === "string"
+      ? a.jira.orgName.slice(0, MEETING_ORG_NAME_SLUG_MAX).trim() : "";
+    const org = n ? decidedOrgOf(a) : "";
+    if (org && !names.has(org)) names.set(org, n);
   }
-  const s = baseOfSite(siteKey);
-  if (s.includes("/")) return s.split("/").filter(Boolean).pop() || s;
-  return s.replace(/\.atlassian\.net$/i, "");
+  const out = new Map();
+  for (const site of orgs) {
+    let n = names.get(site);
+    if (!n) {
+      const s = baseOfSite(site);
+      n = s.includes("/") ? (s.split("/").filter(Boolean).pop() || s) : s.replace(/\.atlassian\.net$/i, "");
+    }
+    out.set(site, meetingLabelSlug(n.slice(0, MEETING_ORG_NAME_SLUG_MAX)));
+  }
+  return out;
 }
-const defaultMeetingLabel = (siteKey) => meetingLabelSlug(meetingOrgName(siteKey));
 const ownLabel = (siteKey) => (Object.hasOwn(meetingLabels, siteKey) ? meetingLabels[siteKey] : "");
-// Every decided org of tenant `t` answering to `label`: an operator's label
-// outranks a default, so setting one never needs the other org renamed first.
-function meetingLabelHits(label, t, orgs = decidedOrgs()) {
-  const mine = [...orgs].filter((s) => tenantOfSite(s) === t);
-  const set = mine.filter((s) => ownLabel(s) === label);
-  return set.length ? set : mine.filter((s) => !ownLabel(s) && defaultMeetingLabel(s) === label);
+// Each decided org's EFFECTIVE label ("" = none): the operator's, else its
+// default unless another org of its tenant took that as its own label (an
+// operator's label outranks a default, so setting one never needs the other
+// org renamed first).
+function effectiveMeetingLabels(orgs = decidedOrgs()) {
+  const defaults = defaultMeetingLabels(orgs);
+  const taken = new Set();
+  for (const s of orgs) if (ownLabel(s)) taken.add(`${tenantOfSite(s)}\u0000${ownLabel(s)}`);
+  const out = new Map();
+  for (const s of orgs) {
+    const own = ownLabel(s), def = defaults.get(s) || "";
+    out.set(s, { label: own || (taken.has(`${tenantOfSite(s)}\u0000${def}`) ? "" : def), custom: !!own });
+  }
+  return out;
 }
-// What clients read: every decided org's label, and whether the operator set it.
+// Every decided org of tenant `t` whose effective label is `label`.
+function meetingLabelHits(label, t, orgs = decidedOrgs()) {
+  const mine = new Set([...orgs].filter((s) => tenantOfSite(s) === t));
+  return [...effectiveMeetingLabels(mine)].filter(([, v]) => v.label === label).map(([s]) => s);
+}
+// What clients read: every decided org, its label ("" = none, so the operator
+// can still give it one) and whether the operator set it.
 function meetingLabelsWire() {
   const out = Object.create(null);
-  for (const s of decidedOrgs()) {
-    const own = ownLabel(s);
-    const label = own || defaultMeetingLabel(s);
-    if (label) out[s] = { label, custom: !!own };
-  }
+  for (const [s, v] of effectiveMeetingLabels()) out[s] = v;
   return out;
 }
 function broadcastMeetingLabels() {
@@ -5513,12 +5536,13 @@ function noteMeetingLabelMiss(label, t, shared, now = Date.now()) {
   const cur = Object.hasOwn(meetingLabelMisses, k) ? meetingLabelMisses[k] : null;
   if (cur && !!cur.shared === shared && now - cur.at < MEETING_LABEL_MISS_REWRITE_MS) return;
   meetingLabelMisses[k] = shared ? { at: now, shared: true } : { at: now };
-  // Oldest of this tenant out first, then oldest overall (the coerce's 200).
+  // Oldest of this tenant out first; past the hard total (the coerce's 200),
+  // from the tenant holding the most (XERK-2621), never another's at random.
   const ofTenant = Object.keys(meetingLabelMisses).filter((x) => tenantOfSite(x) === t)
     .sort((x, y) => meetingLabelMisses[x].at - meetingLabelMisses[y].at);
   while (ofTenant.length > MEETING_LABEL_MISSES_TENANT_MAX) delete meetingLabelMisses[ofTenant.shift()];
-  const all = Object.keys(meetingLabelMisses).sort((x, y) => meetingLabelMisses[x].at - meetingLabelMisses[y].at);
-  while (all.length > MEETING_LABEL_MISSES_TENANT_MAX * 10) delete meetingLabelMisses[all.shift()];
+  for (const x of trimByTenant(meetingLabelMisses, MEETING_LABEL_MISSES_TENANT_MAX * 10,
+    (key) => tenantOfSite(key), (v) => v.at, k)) delete meetingLabelMisses[x];
   persistMeetingLabelMisses();
   broadcastMeetingLabels();
 }
@@ -5556,22 +5580,21 @@ function setMeetingLabel(siteKey, raw) {
     return { status: 400, body: { error: "label must be 1-40 lowercase letters, digits, - or _, starting with a letter or digit" } };
   }
   const t = tenantOfSite(siteKey);
-  const effective = label || defaultMeetingLabel(siteKey);
-  if (effective) {
-    const other = [...decidedOrgs()].find((s) => s !== siteKey && tenantOfSite(s) === t &&
-      (ownLabel(s) || defaultMeetingLabel(s)) === effective);
-    // A reset to a default another org already answers to is allowed: the
-    // operator's labels outrank defaults, and the miss list shows the clash.
-    if (other && label) {
-      return { status: 409, body: { error: `the org ${baseOfSite(other)} already has the meeting label "${label}"` } };
-    }
+  // Only another org's OWN label refuses: a default yields to it (the other
+  // org then has none until the operator gives it one), else a label two
+  // orgs' defaults share could never be mapped (XERK-2638 QA).
+  const other = label && Object.keys(meetingLabels).find((s) => s !== siteKey && meetingLabels[s] === label &&
+    tenantOfSite(s) === t && decidedOrgs().has(s));
+  if (other) {
+    return { status: 409, body: { error: `the org ${baseOfSite(other)} already has the meeting label "${label}"` } };
   }
   if (label) meetingLabels[siteKey] = label;
   else delete meetingLabels[siteKey];
   persistMeetingLabels();
-  if (effective) forgetMeetingLabelMiss(effective, t);
+  const effective = effectiveMeetingLabels().get(siteKey) || { label: "", custom: !!label };
+  if (effective.label) forgetMeetingLabelMiss(effective.label, t);
   broadcastMeetingLabels();
-  return { status: 200, body: { ok: true, label: effective, custom: !!label } };
+  return { status: 200, body: { ok: true, label: effective.label, custom: effective.custom } };
 }
 
 // Which hosts of an org report a repo by name — CLONED (on-disk `repos[]`) OR
