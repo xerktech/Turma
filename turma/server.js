@@ -4592,7 +4592,9 @@ function sanitizeDecision(v) {
 const decisionsCoerce = (raw) => {
   const out = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const [site, list] of Object.entries(raw).slice(0, 100)) {
+    // 300 = DECISIONS_ORGS_TOTAL (module-init TDZ): the hard total appendDecision
+    // never passes, so nothing accepted live is dropped on restore (XERK-2628).
+    for (const [site, list] of Object.entries(raw).slice(0, 300)) {
       if (!site || site.length > 200 || !Array.isArray(list)) continue;
       const kept = list.map(sanitizeDecision).filter(Boolean).slice(-200);
       if (kept.length) out[site] = kept;
@@ -19842,6 +19844,51 @@ const DECISIONS_KEEP = 200;        // decisionsCoerce inlines the same 200 (modu
 const DECISIONS_WIRE_TAIL = 20;    // per org on /api/agents + the SSE frame
 const DECISIONS_REPLY_TAIL = 30;   // per heartbeat reply, rendered agent-side
 const DECISION_NOTE_MAX = 500;
+// Orgs with a log PER TENANT, and the store's hard total (decisionsCoerce inlines
+// the 300). Per tenant (XERK-2628): one fleet-wide count let one tenant's orgs
+// crowd every other tenant's log out of the coerce on restart / HA restore.
+const DECISIONS_ORGS_MAX = 100;
+const DECISIONS_ORGS_TOTAL = 300;
+
+// Can the store take a NEW org `siteKey`? A full store (its tenant's cap, else
+// the hard total) evicts as LITTLE as it can: one org at a time, only an org no
+// host is decided into, the one whose newest entry is oldest (so a log already
+// past DECISIONS_RETAIN_MS goes before a fresh one). While the tenant's cap is
+// what is full the victim is the tenant's own, so a tenant's appends never
+// delete another tenant's log; only the hard total takes from the tenant holding
+// the most orgs (XERK-2621's rule). Answers {ok, pruned}.
+function decisionsRoomFor(siteKey) {
+  const t = tenantOfSite(siteKey);
+  const newest = (k) => { const l = decisions[k]; return (l && l.length && l[l.length - 1].at) || 0; };
+  let orgs = null;
+  let pruned = false;
+  for (;;) {
+    const keys = Object.keys(decisions);
+    const counts = new Map();
+    for (const k of keys) counts.set(tenantOfSite(k), (counts.get(tenantOfSite(k)) || 0) + 1);
+    let scope = "";
+    if ((counts.get(t) || 0) >= DECISIONS_ORGS_MAX) scope = "tenant";
+    else if (keys.length >= DECISIONS_ORGS_TOTAL) scope = "hub";
+    if (!scope) return { ok: true, pruned };
+    orgs = orgs || decidedOrgs();
+    let victim = null;
+    for (const k of keys) {
+      if (orgs.has(k) || k === siteKey) continue;
+      const kt = tenantOfSite(k);
+      if (scope === "tenant" && kt !== t) continue;
+      if (victim === null) { victim = k; continue; }
+      const vt = tenantOfSite(victim);
+      if (scope === "hub" && counts.get(kt) !== counts.get(vt)) {
+        if (counts.get(kt) > counts.get(vt)) victim = k;
+        continue;
+      }
+      if (newest(k) < newest(victim)) victim = k;
+    }
+    if (victim === null) return { ok: false, pruned };
+    delete decisions[victim];
+    pruned = true;
+  }
+}
 
 // Append one decision to an org's log (oldest evicted past DECISIONS_KEEP). The
 // caller decided the org — always a DECIDED org, never a claimed siteKey.
@@ -19849,6 +19896,18 @@ function appendDecision(siteKey, entry, now = Date.now()) {
   if (typeof siteKey !== "string" || !siteKey) return null;
   const d = sanitizeDecision({ ...entry, id: crypto.randomBytes(6).toString("hex"), at: now });
   if (!d) return null;
+  if (!Object.hasOwn(decisions, siteKey)) {
+    const room = decisionsRoomFor(siteKey);
+    if (!room.ok) {
+      // A prune may have happened before the refusal: publish the pruned map.
+      if (room.pruned) {
+        persistDecisions();
+        invalidateAgentsCache();
+        broadcastDecisions();
+      }
+      return null;
+    }
+  }
   decisions[siteKey] = [...(decisions[siteKey] || []), d].slice(-DECISIONS_KEEP);
   persistDecisions();
   invalidateAgentsCache();
@@ -20564,7 +20623,7 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   if (item.kind === "decision") {
     const d = appendDecision(siteKey, { source: "meeting",
       text: [title, description].filter(Boolean).join(" — "), label: m.title });
-    if (!d) return refuse(500, "the decision could not be logged");
+    if (!d) return refuse(409, "the hub holds decisions for too many orgs — try again later");
     return save({ state: "logged", at: now, ...(edited ? { edited: true } : {}) });
   }
   const project = meetingText(body.project, 100);
@@ -26605,7 +26664,11 @@ const server = http.createServer(async (req, res) => {
       if (!decidedOrgs().has(siteKey)) {
         return json(res, 404, { error: "no host is in that org" });
       }
-      return json(res, 200, { ok: true, decision: appendDecision(siteKey, { source: "note", text }) });
+      const decision = appendDecision(siteKey, { source: "note", text });
+      if (!decision) {
+        return json(res, 409, { error: "the hub holds decisions for too many orgs — try again later" });
+      }
+      return json(res, 200, { ok: true, decision });
     }
 
     // POST /api/orgs/<siteKey>/meetings — Tenir posting a finished meeting
@@ -28079,6 +28142,7 @@ if (process.env.TURMA_TEST) {
     // The per-org decisions log (XERK-1574). A getter: a restore/watch install
     // REPLACES the map.
     getDecisions: () => decisions, decisionsCoerce, sanitizeDecision, appendDecision,
+    DECISIONS_ORGS_MAX, DECISIONS_ORGS_TOTAL,
     getDailyBriefSchedules: () => dailyBriefSchedules, dailyBriefSchedulesCoerce,
     DAILY_BRIEF_DEFAULT_SCHEDULE, dailyBriefSchedulesWire, dailyBriefSent,
     sanitizeDailyBriefSchedule, setDailyBriefSchedule, nextDailyBriefRun, dailyBriefWindow,
