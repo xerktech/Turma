@@ -19,6 +19,10 @@ Decision, upgrade + rollback notes: `docs/multi-tenant-adr.md` ("Moving the pre-
 - **Every partitioned store needs a migration step** (`registerTenantMigration`, server.js): a store
   that registers a tenant purge and moves no untenanted data into the owner's tenant strands it with
   the operators. `meetingTokens` is the one exemption (tenant-only). Tests pin the parity.
+- **A step added after hubs completed the migration carries `late(t)`** (`runLateSteps`, run from
+  `tenantMigrationTick` whether or not the owner env is still set, recorded in `marker.steps`):
+  `runMigration` never re-runs on a completed marker. `late` must keep what the hub served before
+  the upgrade (usually a copy, not a move). Example: `repoTiers` (XERK-2620).
 - **A step is idempotent**: `count` reads 0 after `apply`, and a second `apply` moves nothing. The
   runner (`tenant-migration.js`) resumes at the first step the marker lacks, so a step must survive
   being re-run after a kill mid-step.

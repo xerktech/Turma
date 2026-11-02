@@ -8000,8 +8000,23 @@ registerTenantMigration({
 });
 // Repo tiers (XERK-2620): an untenanted `<repo>` key becomes `<repo>@<t>`. Only on
 // the first run: a plain tier set afterwards is an operator's, for its own hosts.
+// A hub that completed the migration before this step existed held ONE fleet-wide
+// map its owner and operators both read, so `late` COPIES each plain tier to the
+// owner (where it has none): both keep exactly the tiers they had; only other
+// tenants stop inheriting them.
 registerTenantMigration({
   name: "repoTiers",
+  late: (t) => {
+    let n = 0;
+    for (const k of Object.keys(repoTiers)) {
+      const nk = repoTierKey(k, t);
+      if (tenantOfKey(k) || Object.hasOwn(repoTiers, nk)) continue;
+      repoTiers[nk] = repoTiers[k];
+      n++;
+    }
+    if (n) { persistRepoTiers(); invalidateAgentsCache(); sseBroadcast("repoTiers", repoTiers); }
+    return n;
+  },
   count: (t, scope) => (scope ? 0 : Object.keys(repoTiers).filter((k) => !tenantOfKey(k)).length),
   apply: (t, scope) => {
     if (scope) return 0;
@@ -8211,7 +8226,21 @@ function tenantMigrationOnBind(fromKey, toKey) {
 // Leader tick: run/resume an incomplete migration, else sweep leftovers for
 // TURMA_MIGRATE_SETTLE_MS after completion.
 let tenantMigrationDryRunLogged = false;
+let tenantLateStepsRunning = null;
+function runTenantLateSteps() {
+  const pending = tenantMigrationSteps.some((s) => typeof s.late === "function" && !tenantMigrationMarker.steps[s.name]);
+  if (!pending || tenantLateStepsRunning) return tenantLateStepsRunning;
+  tenantLateStepsRunning = tenantMigration.runLateSteps({
+    steps: tenantMigrationSteps, marker: tenantMigrationMarker,
+    save: async (m) => { await flushMigratedStores(); tenantMigrationMarker = m; await persistTenantMigration(); },
+  }).catch((e) => console.error(`tenant migration: late steps failed: ${(e && e.message) || e}`))
+    .finally(() => { tenantLateStepsRunning = null; });
+  return tenantLateStepsRunning;
+}
 function tenantMigrationTick(now = Date.now()) {
+  // A step added after this hub completed its migration (XERK-2620) runs once,
+  // whether or not TURMA_MIGRATE_OWNER is still set.
+  if (tenantMigrationMarker.completedAt) runTenantLateSteps();
   if (!MIGRATE_OWNER) return;
   if (!tenantMigrationMarker.completedAt) {
     // A dry run counts and logs once; it never moves anything.
@@ -27525,7 +27554,7 @@ if (process.env.TURMA_TEST) {
     registerTenantPurge, purgeTenantData, ledgerVisible, ledgerScopeKey, tenantScope, subscriptionKeyOf,
     shadowHostFor,
     // XERK-2554: the pre-tenancy migration.
-    runTenantMigration, migrateTenantLeftovers, tenantMigrationTick, tenantMigrationGateClosed,
+    runTenantMigration, runTenantLateSteps, migrateTenantLeftovers, tenantMigrationTick, tenantMigrationGateClosed,
     logTenantMigrationError,
     tenantMigrationSteps, tenantMigrationPurgeNames: () => [...tenantPurges.keys()],
     tenantMigrationMarker: () => tenantMigrationMarker, migratedTenant,

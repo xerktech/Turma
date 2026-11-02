@@ -848,6 +848,54 @@ test("XERK-2620: a repo tier is its tenant's, even for a repo another tenant rep
   }
 });
 
+test("XERK-2620: the sweeps read a ticket's tier through its own org", async () => {
+  const { A, B } = await isoFleet();
+  const FULL = { maxSessions: 2, running: 2, queued: 0, free: 0 };
+  const ticket = { key: "ISO-7", summary: "work", status: "To Do", statusCategory: "todo",
+    repoGuess: { repo: "shared-repo", cloned: true }, triage: { priority: "P2", type: "task", actionable: true } };
+  const withTicket = (who) => who.beat({ capacity: FULL,
+    jira: { configured: true, available: true, siteKey: SITE, tickets: [ticket] } });
+  const keys = (site) => hub.autoStartCandidates(site, hub.fleetTicketRows()).map((c) => c.t.key);
+  const dropMine = () => {
+    for (let i = hub.ticketQueue.length - 1; i >= 0; i--) {
+      if (hub.ticketQueue[i].issueKey === "ISO-7") hub.ticketQueue.splice(i, 1);
+    }
+  };
+  try {
+    for (const w of [A, B]) assert.equal((await withTicket(w)).status, 200);
+    const rows = hub.fleetTicketRows();
+    assert.ok(keys(A.site).includes("ISO-7") && keys(B.site).includes("ISO-7"), "positive control");
+    // Both queue (hosts full), then A marks the repo ignore mid-wait.
+    for (const w of [A, B]) assert.ok(hub.enqueueTicketStart(w.site, "ISO-7", "auto"));
+    hub.setRepoTier("shared-repo", "ignore", A.t);
+    // Candidate walk and content gate: A's ticket is out, B's stays in.
+    assert.ok(!keys(A.site).includes("ISO-7"));
+    assert.ok(keys(B.site).includes("ISO-7"));
+    assert.equal(hub.autoStartContentGate(A.site, ticket, "shared-repo", rows).kind, "repo");
+    assert.notEqual((hub.autoStartContentGate(B.site, ticket, "shared-repo", rows) || {}).kind, "repo");
+    // The drain drops only A's auto entry.
+    hub.drainTicketQueue();
+    const left = hub.ticketQueue.filter((e) => e.issueKey === "ISO-7").map((e) => e.siteKey);
+    assert.deepEqual(left, [B.site]);
+  } finally {
+    dropMine();
+    hub.setRepoTier("shared-repo", "active", A.t);
+    for (const w of [A, B]) await w.beat();
+  }
+});
+
+test("XERK-2620: a user+admin principal tiers its tenant's repos, never an operator host's", async () => {
+  const pw = "iso2620d-pass";
+  await addLocalUser("iso2620d", pw, ["turma-users", "turma-admins"]);
+  const res = await login("iso2620d", pw);
+  assert.equal(res.status, 200, res.raw);
+  const h = { cookie: `hub_session=${sessionOf(res)}` };
+  // The untenanted "laptop" (which it may drive) reports this repo; its tenant has no host.
+  const r = await request("POST", `/api/repos/repo-u-${CANARY.U}/tier`, { headers: h, body: { tier: "ignore" } });
+  assert.equal(r.status, 404, r.raw);
+  assert.equal(hub.repoTier(`repo-u-${CANARY.U}`, SITE), "active");
+});
+
 test("XERK-2556: push, peer roster and migration never cross a tenant", async () => {
   const { A, B, G } = await isoFleet();
   for (const [w, tok] of [[A, "dev2556a"], [B, "dev2556b"], [G, "dev2556g"]]) {
