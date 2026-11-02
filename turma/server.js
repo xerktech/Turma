@@ -8214,11 +8214,15 @@ async function runTenantMigration() {
       // A dry run creates nobody: an owner still to be created counts under a
       // placeholder tenant (the counts do not depend on it).
       const found = tenancy.findOwner(tenancyState, MIGRATE_OWNER);
-      if (!found) console.log(`tenant migration (dry run): the owner ${MIGRATE_OWNER} does not exist yet — a real run would create it`);
+      const refused = found ? "" : tenancy.ownerRefusal(tenancyState, MIGRATE_OWNER);
+      if (refused) console.log(`tenant migration (dry run): a real run would refuse the owner: ${refused}`);
+      else if (!found) console.log(`tenant migration (dry run): the owner ${MIGRATE_OWNER} does not exist yet — a real run would create it`);
       owned = { user: found || { id: "", tenantId: "0".repeat(32) }, created: false };
     } else {
       let iss;
-      if (OIDC_ENABLED && /^oidc:/.test(MIGRATE_OWNER) && !tenancy.findOwner(tenancyState, MIGRATE_OWNER)) {
+      // A refused owner throws in ensureOwner without asking the IdP first.
+      if (OIDC_ENABLED && /^oidc:/.test(MIGRATE_OWNER) && !tenancy.findOwner(tenancyState, MIGRATE_OWNER) &&
+          !tenancy.ownerRefusal(tenancyState, MIGRATE_OWNER)) {
         iss = (await oidcDiscovery()).issuer;
       }
       owned = tenancy.ensureOwner(tenancyState, MIGRATE_OWNER, { iss });

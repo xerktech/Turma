@@ -140,6 +140,9 @@ tenants, run by an admin panel.
   that names nobody is refused (a typo must not mint an account); a prefixed one is created — a
   local owner with an unusable random password (set it in the admin panel), an OIDC owner keyed on
   the IdP's discovery issuer.
+- **`oidc:<hub user id>` also names an existing SSO user** (XERK-2634): it is the `oidc:…` value the
+  admin panel shows on the user's card. The IdP's subject (Authentik's default is a hashed user id)
+  is shown nowhere in Turma, so copying the card's value must find that user, not mint a new one.
 - **A one-shot, resumable boot step on the leader** (`masterOrchestrationTick`): each store moves in
   its own idempotent step, and the marker (`/data/tenant-migration.json`, HA-shared) records each
   step as it lands (after flushing what the step wrote), so a killed hub resumes at the step it was
