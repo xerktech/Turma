@@ -990,6 +990,9 @@ test("XERK-2629: stripping a long run of suffixes is linear, not quadratic", () 
   const t0 = process.hrtime.bigint();
   assert.equal(hub.scopeSite(site, ""), site);
   assert.equal(hub.scopeSite(`x.net${`@${t}`.repeat(16000)}`, ""), "x.net");
+  // Only a lower-case id is a tenant suffix (TENANT_HOST_KEY_RE): an upper-case
+  // one is left as typed, so the meetings route still 404s `SITE@<UPPER>`.
+  assert.equal(hub.scopeSite(`x.net@${t.toUpperCase()}`, ""), `x.net@${t.toUpperCase()}`);
   assert.ok(Number(process.hrtime.bigint() - t0) / 1e6 < 500, "scopeSite took too long");
 });
 
