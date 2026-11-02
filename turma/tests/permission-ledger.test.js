@@ -25,7 +25,11 @@ process.env.PERMISSION_LEDGER_SAVE_CHUNK = "2048";   // every save spans many ch
 const ledger = require("../permission-ledger.js");
 const { sanitizePermissionEvent: sanitize, suggestedRule, aggregate } = ledger;
 
-const NOW = Date.parse("2026-10-03T12:00:00Z");
+// Noon UTC of yesterday: inside the 30-day retention however long this file
+// lives (a pinned date expired its rows once the calendar passed it, XERK-2634),
+// and still a fixed noon so day-bucket tests never straddle midnight.
+const DAY_MS = 86400000;
+const NOW = Math.floor(Date.now() / DAY_MS) * DAY_MS - DAY_MS / 2;
 const MIN = 60000;
 const DAY = 86400000;
 
