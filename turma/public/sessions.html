@@ -3175,7 +3175,7 @@ function hostBlock(a, agents, nowSec, lone) {
   }).join("");
   return `<div class="host-block${open ? " open" : ""}">
     <button type="button" class="hname" id="${esc(hostHeadId(a.key))}" aria-expanded="${open}"
-        onclick="toggleHost('${escJs(a.key)}')"><span class="hchev">▶</span><span class="hlabel">${esc(displayKey(a.key))}</span>${
+        onclick="toggleHost('${escJs(a.key)}')"><span class="hchev">▶</span><span class="hlabel">${esc(a.device || displayKey(a.key))}</span>${
       hostCapHtml(a.capacity)}${hostWeeklyHtml(hostWeekly(a, agents, nowSec), nowSec)}</button>
     ${open ? `<div class="repo-btns">${repos}</div>` : ""}
   </div>`;
@@ -4708,7 +4708,7 @@ async function restoreTo(ev, host) {
     // importCmdId, so the page walks onto the restored session when it comes up.
     pendingMigration = out.migrationId;
     pendingMigrationFollowed = false;
-    toast("Restoring onto " + displayKey(host) + "…");
+    toast("Restoring onto " + (tgt ? (tgt.device || displayKey(tgt.key)) : displayKey(host)) + "…");
   } else {
     toast(out.error ? "Restore failed — " + out.error : "Restore failed");
   }

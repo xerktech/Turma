@@ -1184,14 +1184,17 @@
   // siteKey everything is keyed and routed on is untouched.
   // A registry key with its tenant suffix dropped, for DISPLAY only. A tenant's
   // host and org keys are `<base>@<32 lowercase hex>` (server.js tenantHostKey,
-  // tenancy.js TENANT_HOST_KEY_RE, XERK-2551/XERK-2634); the operator should read
-  // "TrueNAS", not the tenant id. Strips exactly that suffix and nothing else —
-  // any other `@tail` is part of the name. Never feed the result back into a
-  // route, map lookup or handler: those keep the raw key.
+  // tenancy.js TENANT_HOST_KEY_RE, XERK-2533/XERK-2551); the operator reads
+  // "TrueNAS", not the tenant id (XERK-2639, XERK-2634). Strips exactly that
+  // suffix and nothing else — any other `@tail` is part of the name. Prefer an
+  // agent record's `device` where one is at hand. Never feed the result back
+  // into a route, map lookup or handler: those keep the raw key. `hostName` is
+  // the same function under the name host-label call sites use.
   const TENANT_SUFFIX_RE = /@[0-9a-f]{32}$/;
   function bareKey(key) {
     return String(key ?? "").replace(TENANT_SUFFIX_RE, "");
   }
+  const hostName = bareKey;
 
   function orgName(siteKey, override) {
     const o = String(override ?? "").trim();
@@ -2866,7 +2869,7 @@
   }
 
   const api = {
-    CATEGORIES, SLOTS, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgSlotPin, orgName, autoStartOn, ageStr,
+    CATEGORIES, SLOTS, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgSlotPin, orgName, hostName, autoStartOn, ageStr,
     createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
     bareKey, prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,

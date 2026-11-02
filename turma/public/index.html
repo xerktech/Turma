@@ -1607,7 +1607,7 @@ function hostCard(a, now) {
           aria-expanded="${collapsed ? "false" : "true"}" title="${collapsed ? "Expand" : "Collapse"} host">
         <span class="caret">▼</span>
         <span class="host-name-text">
-          <h3>${esc(displayKey(a.key))}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
+          <h3>${esc(a.device || displayKey(a.key))}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
           <span class="host-ver">${esc(hostVerLine(a))}</span>
         </span>
       </button>

@@ -92,10 +92,10 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
     TurmaNav: { preserveScroll: (_el, paint) => paint(), toast: (m) => toasts.push(m) },
     TurmaOrg: { get: () => "", update: noop, filter: (a) => orgFilter(a), subscribe: noop, sse: noop,
       orgColors: () => ({}) },
-    // bareKey is the real board.js helper: the host card's title runs through it
-    // (XERK-2634), so a stand-in could hide a wrong strip.
+    // bareKey/hostName are the real board.js helper: host labels run through it
+    // (XERK-2634, XERK-2639), so a stand-in could hide a wrong strip.
     TurmaBoard: { orgName: (k) => k || "", orgColorMap: () => new Map(),
-      bareKey: require("../public/board.js").bareKey },
+      bareKey: require("../public/board.js").bareKey, hostName: require("../public/board.js").hostName },
     TurmaNewTicket: { update: noop },
     console, URL: global.URL, URLSearchParams: global.URLSearchParams,
   };
@@ -606,6 +606,13 @@ test("XERK-2384: a revoke that left the name token live says so", async () => {
     assert.ok(D.fetches.includes("/api/agents/stolen?identity=revoke"));
     assert.equal(D.toasts.some((m) => /name-derived token is not/.test(m)), toasted, String(nameTokenRevoked));
   }
+  // XERK-2639: a tenant host's toast names its device, not its registry key.
+  const key = "TrueNAS@77778a16d8b028aab55c7729d587dbd7";
+  const D = loadDashboard(undefined, () => ({ ok: true, identitiesRevoked: 1, nameTokenRevoked: false }));
+  D.revokeHost(key);
+  D.revokeHost(key);
+  await settle();
+  assert.ok(D.toasts.some((m) => m.startsWith("TrueNAS's agent identity is revoked")), D.toasts.join("|"));
 });
 
 // ---- an SSE reconnect re-reads the payload (rollup XERK-2598) ---------------
