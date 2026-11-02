@@ -27,6 +27,7 @@
 
   form { display: flex; flex-direction: column; gap: 14px; }
   label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--ink-2); font-weight: 600; }
+  label[hidden] { display: none; }
   input {
     background: var(--field); border: 1px solid var(--border);
     border-radius: var(--radius-sm); padding: 10px 12px; width: 100%;
@@ -77,6 +78,10 @@
       </label>
       <label>Password
         <input id="password" name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <!-- XERK-2630: shown when an administrator reset this account's password. -->
+      <label id="newPasswordRow" hidden>New password
+        <input id="newPassword" name="newPassword" type="password" autocomplete="new-password">
       </label>
       <button id="submit" class="primary submit" type="submit">Sign in</button>
     </form>
@@ -149,19 +154,35 @@
     showError(OIDC_ERRORS[errParam]);
   }
 
+  // XERK-2630: after an administrator reset the password, /api/login answers 403
+  // {mustChangePassword}; the form then asks for a new one and posts all three to
+  // /api/password, which signs in once the new password is set.
+  let changing = false;
+  const newRow = document.getElementById("newPasswordRow");
+  const newPw = document.getElementById("newPassword");
+  function askNewPassword(said) {
+    changing = true;
+    newRow.hidden = false;
+    newPw.required = true;
+    newPw.focus();
+    showError(said || "An administrator reset your password. Choose a new one to sign in.");
+  }
+
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     errBox.classList.remove("show");
     submit.disabled = true;
-    submit.textContent = "Signing in…";
+    submit.textContent = changing ? "Saving…" : "Signing in…";
     try {
-      const res = await fetch("/api/login", {
+      const creds = {
+        username: document.getElementById("username").value,
+        password: document.getElementById("password").value,
+      };
+      if (changing) creds.newPassword = newPw.value;
+      const res = await fetch(changing ? "/api/password" : "/api/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          username: document.getElementById("username").value,
-          password: document.getElementById("password").value,
-        }),
+        body: JSON.stringify(creds),
       });
       if (res.ok) {
         // Land wherever the user was headed before the redirect, else the dashboard.
@@ -170,6 +191,10 @@
       }
       if (res.status === 401) {
         showError("Incorrect username or password.");
+      } else if (res.status === 403 && !changing) {
+        const body = await res.json().catch(() => null);
+        if (body && body.mustChangePassword === true) askNewPassword(body.error);
+        else showError(refusalMessage(res.status, body, res.headers.get("Retry-After")));
       } else {
         const body = await res.json().catch(() => null);
         showError(refusalMessage(res.status, body, res.headers.get("Retry-After")));
@@ -178,7 +203,7 @@
       showError("Network error. Please try again.");
     }
     submit.disabled = false;
-    submit.textContent = "Sign in";
+    submit.textContent = changing ? "Set password and sign in" : "Sign in";
   });
 </script>
 </body>

@@ -1074,6 +1074,12 @@ those are marked `[MODEL]`.
     by the hub, so only a stale deep link (a push from a previous sign-in) reaches one.
   - Tests: `core/AccountTest`, `net/AccountRepositoryTest`, `ui/AdminOnlyScreenTest`,
     `net/MapHistoryTest`; web `XERK-2553` in `nav.test.js`; hub `XERK-2553` in `server.test.js`.
+- **An administrator's password reset (XERK-2630) — choosing the new password is WEB-ONLY.** After a
+  reset the hub refuses `/api/login` with 403 `{error, mustChangePassword}` until the user sets a new
+  password at `POST /api/password`. Web's sign-in form asks for it in place; Android shows the hub's
+  words on its login screen (`HubClient.login`'s 403-with-`{error}` branch) and the user sets it on
+  the web. Web also shows the reset (`/api/me`'s `passwordResets`) under the header for a week and in
+  Sign out's tooltip; Android does not show it (deliberate: a small surface, web is where it is set).
 - **Password sign-in goes through `POST /api/login`, as `login.html` does** (XERK-2569). The hub
   checks Basic against its break-glass credential only — never a local account's password — so
   `HubClient.signIn` posts the username/password and carries the returned `hub_session` cookie,

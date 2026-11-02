@@ -495,3 +495,15 @@ test("XERK-2553: the admin-only note is re-checked until the hub stops saying so
   await nav.loadMe(doc);
   assert.equal(timers.length, 0);
 });
+
+test("XERK-2630: an admin's password reset is shown to the user for a week, escaped", () => {
+  const nav = require("../public/nav.js");
+  const now = Date.UTC(2026, 10, 1);
+  const me = (at, by = "root<b> (local)") => ({ passwordResets: [{ at, by }] });
+  assert.equal(nav.passwordResetNoteHtml({}, now), "");
+  assert.equal(nav.passwordResetNoteHtml(me(now - 8 * 24 * 3600 * 1000), now), "", "older than a week");
+  const html = nav.passwordResetNoteHtml(me(now - 3600 * 1000), now);
+  assert.match(html, /class="password-reset-note"/);
+  assert.match(html, /Password reset by root&lt;b&gt; \(local\)/);
+  assert.equal(nav.passwordResetNoteHtml({ passwordResets: [{ at: "x", by: "y" }] }, now), "", "malformed row");
+});

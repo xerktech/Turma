@@ -3334,6 +3334,8 @@ function adminActorLabel(p) {
 function adminUserLabel(u) {
   return u.source === "local" ? `${u.username} (local)` : `${u.displayName} (oidc)`;
 }
+// What /api/login answers (403) a user whose password an admin reset (XERK-2630).
+const PASSWORD_RESET_REFUSAL = "an administrator reset your password — choose a new one to sign in";
 function recordAdminAction(p, action, target, detail, now = Date.now()) {
   adminAudit = coerceAdminAudit([...adminAudit, {
     at: now, actor: adminActorLabel(p), action, target: target || "", detail: detail || "",
@@ -14875,7 +14877,7 @@ function userPrincipal(user) {
 function principalClaims(p) {
   if (p.kind === "breakglass") return { bg: 1, r: ["admin"] };
   const user = Object.hasOwn(tenancyState.users, p.userId) ? tenancyState.users[p.userId] : null;
-  return { u: p.userId, t: user ? user.tenantId : p.tenantId, r: [...p.roles] };
+  return { u: p.userId, t: user ? user.tenantId : p.tenantId, r: [...p.roles], e: user ? user.sessionEpoch || 0 : 0 };
 }
 
 // Who the caller is, as GET /api/me serves it (XERK-2553): the signed-in label a
@@ -14888,6 +14890,7 @@ function meView(p) {
   const kind = p && typeof p.kind === "string" ? p.kind : "open";
   const roles = p && Array.isArray(p.roles) ? p.roles.filter((r) => r === "user" || r === "admin") : [];
   let name = "", source = "";
+  let passwordResets = [];
   if (kind === "user") {
     const u = Object.hasOwn(tenancyState.users, p.userId) ? tenancyState.users[p.userId] : null;
     if (u) {
@@ -14895,6 +14898,8 @@ function meView(p) {
       const label = typeof u.displayName === "string" && u.displayName ? u.displayName
         : typeof u.username === "string" ? u.username : "";
       name = label.slice(0, 100);
+      // XERK-2630: the admin resets of this account's password, newest last.
+      passwordResets = (u.passwordResets || []).map((x) => ({ at: x.at, by: String(x.by).slice(0, 100) }));
     }
   } else if (kind === "breakglass") {
     name = "break-glass";
@@ -14907,7 +14912,7 @@ function meView(p) {
   // An open hub is never admin-only: there is no account to switch to.
   const adminOnly = kind !== "open" && roles.includes("admin") && !tenant &&
     !Object.keys(agents).some((k) => principalMayDriveHost(p, k));
-  return { kind, name, source, roles, tenant, adminOnly };
+  return { kind, name, source, roles, tenant, adminOnly, passwordResets };
 }
 
 // The principal a session token names, re-checked against the store NOW.
@@ -14925,6 +14930,11 @@ function principalFromClaims(c) {
   if (typeof c.u !== "string" || !Object.hasOwn(tenancyState.users, c.u)) return null;
   const user = tenancyState.users[c.u];
   if (user.tenantId !== c.t) return null; // a tenant is the user's for life
+  // XERK-2630: an admin password reset (or the user's own change) bumps the
+  // epoch, ending every token issued before it; a user who must still choose a
+  // new password is signed in nowhere until they do.
+  if ((Number.isSafeInteger(c.e) ? c.e : 0) !== (user.sessionEpoch || 0)) return null;
+  if (user.mustChangePassword) return null;
   return userPrincipal(user);
 }
 
@@ -15194,19 +15204,21 @@ function recordLoginFailure(clientKey, username, now) {
 
 // `counted`: this attempt's failure is already recorded and its backoff already
 // checked (a break-glass miss, breakGlassAttempt) — don't do either twice.
-async function localLogin(username, password, now = Date.now(), clientKey = "local", counted = false) {
+// `forChange` (XERK-2630): the caller is POST /api/password, which may verify a
+// user whose password an admin reset — /api/login answers that user `mustChange`.
+async function localLogin(username, password, now = Date.now(), clientKey = "local", counted = false, forChange = false) {
   const wait = counted ? 0 : loginBackoffMs(clientKey, username, now);
   if (wait) return { throttled: Math.ceil(wait / 1000) };
   if (loginClientsInflight.has(clientKey)) return { busy: true };
   loginClientsInflight.add(clientKey);
   try {
-    return await localLoginVerify(username, password, clientKey, now, counted);
+    return await localLoginVerify(username, password, clientKey, now, counted, forChange);
   } finally {
     loginClientsInflight.delete(clientKey);
   }
 }
 
-async function localLoginVerify(username, password, clientKey, now, counted) {
+async function localLoginVerify(username, password, clientKey, now, counted, forChange) {
   const user = tenancy.findLocalUser(tenancyState, username);
   const hash = (user && user.passwordHash) || tenancy.dummyPasswordHash();
   if (!(await acquireLoginSlot())) return { busy: true };
@@ -15229,6 +15241,9 @@ async function localLoginVerify(username, password, clientKey, now, counted) {
   if (!cur || cur.passwordHash !== user.passwordHash) return {};
   const principal = userPrincipal(cur);
   if (!principal) return {};
+  // Only the RIGHT password learns this, so it tells a guesser nothing.
+  if (forChange) return { principal, user: cur };
+  if (cur.mustChangePassword) return { mustChange: true };
   setTenancy(tenancy.updateUser(tenancyState, cur.id, { lastLoginAt: now }).state);
   return { principal };
 }
@@ -22310,6 +22325,7 @@ const server = http.createServer(async (req, res) => {
       url.pathname === "/login" ||
       url.pathname === "/login.html" ||
       url.pathname === "/api/login" ||
+      url.pathname === "/api/password" ||
       url.pathname === "/api/logout" ||
       // OIDC login/callback/logout (XERK-592) need no existing session — a
       // browser starting the flow has none, and the callback lands with the
@@ -22627,6 +22643,7 @@ const server = http.createServer(async (req, res) => {
             res.setHeader("Retry-After", "1");
             return json(res, 503, { error: "too many sign-ins in progress — try again in a moment" });
           }
+          if (r.mustChange) return json(res, 403, { error: PASSWORD_RESET_REFUSAL, mustChangePassword: true });
           if (!r.principal) return json(res, 401, { error: "invalid credentials" });
           token = issueSessionToken(SESSION_TTL_MS, principalClaims(r.principal));
         }
@@ -22635,6 +22652,59 @@ const server = http.createServer(async (req, res) => {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
         "Set-Cookie": sessionSetCookie(req, token),
+      });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+
+    // A local user changes their own password (XERK-2630): {username, password,
+    // newPassword}. Public like /api/login, because the user an admin reset is
+    // signed in nowhere until they do this; the current password is the proof,
+    // checked through localLogin (same backoff, fairness and scrypt cap). It ends
+    // every other session of the account (the epoch) and signs this one in.
+    if (req.method === "POST" && url.pathname === "/api/password") {
+      let body;
+      try { body = JSON.parse((await readBody(req, 4096)) || "{}"); } catch { body = null; }
+      if (!body || typeof body !== "object" || Array.isArray(body)) return json(res, 400, { error: "body must be a JSON object" });
+      const username = typeof body.username === "string" ? body.username : "";
+      const password = typeof body.password === "string" ? body.password : "";
+      const next = body.newPassword;
+      if (!tenancy.validPassword(next)) {
+        return json(res, 400, { error: `new password must be ${tenancy.PASSWORD_MIN}+ characters` });
+      }
+      if (next === password) return json(res, 400, { error: "choose a password different from the current one" });
+      if (!authEnabled()) return json(res, 404, { error: "no login is configured" });
+      if (!req.socket || !req.socket.remoteAddress) return res.end();
+      const r = await localLogin(username, password, Date.now(), loginClientKey(req), false, true);
+      if (r.throttled) {
+        res.setHeader("Retry-After", String(r.throttled));
+        return json(res, 429, { error: "too many failed sign-ins — try again later" });
+      }
+      if (r.busy) {
+        res.setHeader("Retry-After", "1");
+        return json(res, 503, { error: "too many sign-ins in progress — try again in a moment" });
+      }
+      if (!r.principal) return json(res, 401, { error: "invalid credentials" });
+      if (!(await acquireLoginSlot())) {
+        res.setHeader("Retry-After", "1");
+        return json(res, 503, { error: "too many sign-ins in progress — try again in a moment" });
+      }
+      let passwordHash;
+      try { passwordHash = await tenancy.hashPassword(next); } finally { releaseLoginSlot(); }
+      // The record may have moved during the hash (reset again, disabled, removed).
+      const cur = Object.hasOwn(tenancyState.users, r.user.id) ? tenancyState.users[r.user.id] : null;
+      if (!cur || cur.passwordHash !== r.user.passwordHash || !userPrincipal(cur)) {
+        return json(res, 401, { error: "invalid credentials" });
+      }
+      const u = tenancy.updateUser(tenancyState, cur.id, {
+        passwordHash, mustChangePassword: false, sessionEpoch: (cur.sessionEpoch || 0) + 1, lastLoginAt: Date.now(),
+      });
+      setTenancy(u.state);
+      const principal = userPrincipal(u.user);
+      if (!principal) return json(res, 401, { error: "invalid credentials" });
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "Set-Cookie": sessionSetCookie(req, issueSessionToken(SESSION_TTL_MS, principalClaims(principal))),
       });
       return res.end(JSON.stringify({ ok: true }));
     }
@@ -23059,9 +23129,18 @@ const server = http.createServer(async (req, res) => {
         const passwordHash = await tenancy.hashPassword(body.password);
         // Re-read: the record may have changed (or gone) during the hash.
         if (!Object.hasOwn(tenancyState.users, target.id)) return json(res, 404, { error: "no such user" });
-        const r = tenancy.updateUser(tenancyState, target.id, { passwordHash });
+        // XERK-2630: a reset is not a way into the user's tenant. It ends every
+        // session the user holds, signs the account in nowhere until the user
+        // chooses a new password (/api/password), and is recorded where the user
+        // sees it — so an admin who signs in with the password it set is seen.
+        const cur = tenancyState.users[target.id];
+        const resets = [...(cur.passwordResets || []), { at: Date.now(), by: adminActorLabel(p) }];
+        const r = tenancy.updateUser(tenancyState, target.id, {
+          passwordHash, mustChangePassword: true, sessionEpoch: (cur.sessionEpoch || 0) + 1,
+          passwordResets: resets.slice(-tenancy.PASSWORD_RESETS_KEPT),
+        });
         setTenancy(r.state);
-        recordAdminAction(p, "user.password", adminUserLabel(r.user), "password reset");
+        recordAdminAction(p, "user.password", adminUserLabel(r.user), "password reset; sessions ended, new password required");
         return json(res, 200, { ok: true, user: adminUserView(r.user) });
       }
       if (m && !m[2] && req.method === "DELETE") {
