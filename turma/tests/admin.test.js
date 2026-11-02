@@ -274,6 +274,18 @@ test("XERK-2552: an admin cannot disable or delete its own account; SSO-owned fi
   assert.deepEqual(sso.idpRoles, ["user"], "the IdP's roles are shown, read-only");
 });
 
+test("XERK-2631: an SSO user is named in the audit log by its fixed id, not only its IdP display name", async () => {
+  const h = await cookieFor("rootadmin", "root-admin-pass");
+  // A display name chosen to read as someone else's label.
+  const { state, user } = tenancy.upsertOidcUser(hub.tenancyState(), { iss: "https://idp/", sub: "s-spoof", displayName: "rootadmin (local)", idpRoles: ["user"] });
+  hub.__setTenancy(state);
+  assert.equal((await request("PATCH", `/api/admin/users/${user.id}`, { headers: h, body: { groups: ["devs"] } })).status, 200);
+  const audit = await request("GET", "/api/admin/audit", { headers: h });
+  const rows = audit.body.entries.filter((e) => e.action === "user.update" && e.detail.includes("devs"));
+  assert.deepEqual(rows.map((e) => e.target), [`oidc:${user.id} (rootadmin (local))`],
+    "the stable id leads, so the display name cannot pose as another label");
+});
+
 test("XERK-2552: the group map is replaced whole and validated", async () => {
   const bad = await request("PUT", "/api/admin/groups", { headers: BASIC, body: { groups: { "turma-users": "root" } } });
   assert.equal(bad.status, 400);
