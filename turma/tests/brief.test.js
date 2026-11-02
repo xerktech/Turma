@@ -93,7 +93,7 @@ function loadPage(reply = null, agents = null, hash = "") {
         return what ? `${what} failed — ${why}` : why;
       } },
     TurmaOrg: { getKeys: () => [], update: noop, subscribe: noop, sse: noop },
-    TurmaBoard: { orgName: (k, o) => o || k, mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
+    TurmaBoard: { bareKey: require("../public/board.js").bareKey, orgName: (k, o) => o || k, mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
     TurmaMeetings: { mount: (el) => { meetings.mounted = el; }, update: (d) => meetings.updates.push(d),
       pendingCount: () => meetings.pending },
@@ -683,4 +683,18 @@ test("XERK-2623: a snapshot that left before a meetingProposals frame keeps the 
   await P.settle();
   assert.deepEqual(P.getCache().meetingProposals, { [SITE]: [{ meetingId: "fresh" }] });
   assert.equal(P.meetings.updates.at(-1).meetingProposals[SITE][0].meetingId, "fresh");
+});
+
+// XERK-2634: the brief's host is a registry key, tenant-suffixed after the
+// tenancy migration; both the running line and the meta print the device alone.
+test("a brief written on a tenant host names the host without the tenant", () => {
+  const P = loadPage();
+  const host = "k8x-02@77778a16d8b028aab55c7729d587dbd7";
+  const running = { runId: "b2", status: "running", trigger: "manual", meetingAt: NOW, startedAt: NOW - 120e3,
+    model: "haiku", host };
+  P.renderBriefs(data({ dailyBriefs: { [SITE]: [running, okBrief({ host })] } }), NOW);
+  const h = P.list();
+  assert.match(h, /Writing a brief on k8x-02… started/);
+  assert.match(h, /on k8x-02</);
+  assert.doesNotMatch(h, /77778a16/);
 });

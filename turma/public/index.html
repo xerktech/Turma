@@ -942,6 +942,12 @@ function refusedBadge(a) {
   const why = r.detail ? ": " + esc(r.detail) : "";
   return `<span class="host-auth req" title="The hub is refusing this host's heartbeats${why}${when}. The host looks offline but is up — it just cannot register. Shrink its report or raise the registry budget; the chip clears when the hub accepts a beat again.">⛔ Hub refused</span>`;
 }
+// A host/org key for DISPLAY: board.js bareKey drops a tenant key's `@<32-hex>`
+// suffix (XERK-2634). Handlers, maps and URLs keep the raw key.
+function displayKey(k) {
+  const B = typeof TurmaBoard !== "undefined" ? TurmaBoard : null;
+  return B && B.bareKey ? B.bareKey(k) : String(k ?? "");
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -1601,7 +1607,7 @@ function hostCard(a, now) {
           aria-expanded="${collapsed ? "false" : "true"}" title="${collapsed ? "Expand" : "Collapse"} host">
         <span class="caret">▼</span>
         <span class="host-name-text">
-          <h3>${esc(a.key)}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
+          <h3>${esc(displayKey(a.key))}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
           <span class="host-ver">${esc(hostVerLine(a))}</span>
         </span>
       </button>
@@ -2235,7 +2241,7 @@ function revokeHost(key) {
   twoClick("rv::" + key, async () => {
     const out = await del(`/api/agents/${enc(key)}?identity=revoke`, "Revoke token");
     if (out && out.nameTokenRevoked === false) {
-      toast(`${key}'s agent identity is revoked, but its name-derived token is not ` +
+      toast(`${displayKey(key)}'s agent identity is revoked, but its name-derived token is not ` +
         "(the hub's revoked-token registry is full) — rotate TURMA_AGENT_TOKEN to retire it");
     }
   });

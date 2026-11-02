@@ -28,6 +28,7 @@ import retrofit2.http.GET
 import retrofit2.http.POST
 import retrofit2.http.Path
 import retrofit2.http.Query
+import com.xerktech.turma.core.bareKey
 
 /**
  * The Turma hub REST surface (turma/server.js) as a Retrofit interface.
@@ -556,7 +557,7 @@ fun archiveMissingMessage(e: Throwable, nowMs: Long = System.currentTimeMillis()
         runCatching { TurmaJson.decodeFromJsonElement<ArchiveIngestClosed>(it) }.getOrNull()
     }
     val refused = r?.takeIf { it.error.isNotBlank() }?.let {
-        "${it.host.ifBlank { "The agent" }}\u2019s last push of this conversation " +
+        "${bareKey(it.host).ifBlank { "The agent" }}\u2019s last push of this conversation " +
             "to the archive was refused: ${it.error}."
     }
     // Same range as the web twin: a real epoch-ms stamp a date can print.

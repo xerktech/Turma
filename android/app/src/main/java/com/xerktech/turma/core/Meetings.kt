@@ -135,7 +135,7 @@ fun meetingMetaLine(m: Meeting, zone: ZoneId = ZoneId.systemDefault(), locale: L
 /** The line a meeting shows instead of items, or null when it lists them. */
 fun meetingStatusLine(m: Meeting): Pair<String, Boolean>? = when {
     m.status == "queued" -> "Waiting for a host of this org to read the captions…" to false
-    m.status == "running" -> "Reading the captions" + (if (m.host.isNotEmpty()) " on ${m.host}" else "") + "…" to false
+    m.status == "running" -> "Reading the captions" + (if (m.host.isNotEmpty()) " on ${bareKey(m.host)}" else "") + "…" to false
     m.status == "failed" -> "Could not propose work items — " + m.error.ifEmpty { "the run failed" } to true
     m.items.isEmpty() -> "Nothing to propose from this meeting." to false
     else -> null

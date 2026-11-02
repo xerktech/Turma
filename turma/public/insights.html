@@ -268,6 +268,12 @@
 <script src="/newticket.js"></script>
 
 <script>
+// A host/org key for DISPLAY: board.js bareKey drops a tenant key's `@<32-hex>`
+// suffix (XERK-2634). Handlers, maps and URLs keep the raw key.
+function displayKey(k) {
+  const B = typeof TurmaBoard !== "undefined" ? TurmaBoard : null;
+  return B && B.bareKey ? B.bareKey(k) : String(k ?? "");
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -395,7 +401,7 @@ function decisionsHtml(site, list, now, live, count, name) {
       meta.push(`<span class="sess">${esc(l)}</span>`);
     }
     if (typeof d.at === "number") meta.push(`${esc(ago(d.at, now))} ago`);
-    if (d.host) meta.push(esc(d.host));
+    if (d.host) meta.push(esc(displayKey(d.host)));
     const bits = meta.map((m, i) => `<span class="bit"><span class="v">${m}</span>`
       + `${i < meta.length - 1 ? '<span class="sep"> ·</span>' : ""}</span>`);
     return `<li class="dec-item"><div class="dec-title">${title}</div>`
@@ -416,7 +422,7 @@ function decisionsHtml(site, list, now, live, count, name) {
   return `<section class="dec-org${shut ? " collapsed" : ""}"><div class="dec-head">`
     + `<button type="button" class="dec-toggle" data-collapse="${esc(site)}" aria-expanded="${!shut}">`
     + `<span class="chev" aria-hidden="true">▼</span>`
-    + `<span class="dec-org-name">${esc(name || site)} <span class="n">${total}</span></span></button>`
+    + `<span class="dec-org-name">${esc(name || displayKey(site))} <span class="n">${total}</span></span></button>`
     + `</div>${shut ? "" : body + form}</section>`;
 }
 function renderDecisions(data, now) {

@@ -154,6 +154,7 @@ import com.xerktech.turma.model.TriageActionPin
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.BoardViewModel
 import kotlinx.coroutines.launch
+import com.xerktech.turma.core.bareKey
 
 /** In-flight drag of a card across columns (XERK-141). Held by BoardScreen; the
  *  ghost follows [pointer] (window coords) and drops into [overCat]. */
@@ -1280,7 +1281,7 @@ private fun EpicBuilderStrip(
                     }
                     val meta = buildString {
                         append(orgName(row.siteKey))
-                        if (row.host.isNotBlank()) append(" · ").append(row.host)
+                        if (row.host.isNotBlank()) append(" · ").append(bareKey(row.host))
                     }
                     Text(
                         meta,
@@ -1772,7 +1773,7 @@ private fun AgentPicker(
     onPick: (host: String?) -> Unit,
 ) {
     var open by remember { mutableStateOf(false) }
-    val current = pin?.let { p -> site.hostOptions.find { it.key == p.host }?.name ?: p.host }
+    val current = pin?.let { p -> site.hostOptions.find { it.key == p.host }?.name ?: bareKey(p.host) }
         ?: "Auto — most available agent"
     Box {
         SelectableValue(current, onClick = { open = true }, enabled = enabled, mono = pin != null)

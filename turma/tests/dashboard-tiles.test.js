@@ -92,7 +92,10 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
     TurmaNav: { preserveScroll: (_el, paint) => paint(), toast: (m) => toasts.push(m) },
     TurmaOrg: { get: () => "", update: noop, filter: (a) => orgFilter(a), subscribe: noop, sse: noop,
       orgColors: () => ({}) },
-    TurmaBoard: { orgName: (k) => k || "", orgColorMap: () => new Map() },
+    // bareKey is the real board.js helper: the host card's title runs through it
+    // (XERK-2634), so a stand-in could hide a wrong strip.
+    TurmaBoard: { orgName: (k) => k || "", orgColorMap: () => new Map(),
+      bareKey: require("../public/board.js").bareKey },
     TurmaNewTicket: { update: noop },
     console, URL: global.URL, URLSearchParams: global.URLSearchParams,
   };
@@ -651,4 +654,26 @@ test("XERK-2598: the reconnect re-read never repaints under a focused <select>",
   assert.ok(D.fetches.includes("/api/agents"), "the data still lands");
   assert.equal(D.els.groups.innerHTML, painted, "but nothing is repainted");
   assert.equal(D.getCache().agents.length, 2, "the snapshot is merged for the next paint");
+});
+
+// XERK-2634. A migrated host's registry key is `<device>@<32-hex tenant>`; the
+// card's title shows the device alone, while every handler on the card still
+// carries the raw key the hub routes on.
+test("dashboard: a tenant host's card title drops the @<tenant> suffix; handlers keep the raw key", () => {
+  const D = loadDashboard();
+  const key = "TrueNAS@77778a16d8b028aab55c7729d587dbd7";
+  D.render({ now: Date.now(), agents: [{ ...liveHost(key, 1), device: "" }] });
+  const html = D.els.groups.innerHTML;
+  assert.match(html, /<h3>TrueNAS<\/h3>/);
+  assert.doesNotMatch(html, /<h3>[^<]*@77778a16/);
+  assert.ok(html.includes(`hostToggle('${key}')`), "the collapse handler gets the raw key");
+});
+
+test("dashboard: a host key without an exact @<32-hex> tail is printed as-is", () => {
+  const D = loadDashboard();
+  for (const key of ["TrueNAS", "box@corp", "TrueNAS@77778A16D8B028AAB55C7729D587DBD7",
+    "TrueNAS@77778a16d8b028aab55c7729d587dbd", "TrueNAS@77778a16d8b028aab55c7729d587dbd7x"]) {
+    D.render({ now: Date.now(), agents: [{ ...liveHost(key, 1), device: "" }] });
+    assert.ok(D.els.groups.innerHTML.includes(`<h3>${key}</h3>`), key);
+  }
 });

@@ -433,6 +433,16 @@ class BoardTest {
         assertEquals("self-hosted.example.com", orgName("self-hosted.example.com"))
     }
 
+    // XERK-2634: board.js bareKey's port — exactly a trailing @ + 32 lowercase hex.
+    @Test fun `bare key drops only an exact tenant suffix`() {
+        val t = "77778a16d8b028aab55c7729d587dbd7"
+        assertEquals("TrueNAS", bareKey("TrueNAS@$t"))
+        assertEquals("TrueNAS", bareKey("TrueNAS"))
+        for (k in listOf("TrueNAS@${t.uppercase()}", "TrueNAS@${t.drop(1)}", "TrueNAS@${t}0", "box@corp")) {
+            assertEquals(k, bareKey(k))
+        }
+    }
+
     @Test fun `org name takes the last path segment for azure devops`() {
         assertEquals("myorg", orgName("dev.azure.com/myorg"))
         assertEquals("defaultcollection", orgName("tfs.company.com/tfs/defaultcollection"))

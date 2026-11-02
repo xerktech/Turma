@@ -292,3 +292,13 @@ test("board.html carries the toolbar controls its script binds", () => {
   assert.ok(!src.includes('history.replaceState(null, "", location.pathname);'),
     "the deep link no longer wipes the view's query params");
 });
+
+// XERK-2634: the policy refusal toasts name the org bare, never the tenant key.
+// The save paths are fetch-and-toast glue with no sandbox here, so this pins the
+// source: both toasts route the siteKey through TurmaBoard.bareKey.
+test("board.html's policy refusal toasts print the siteKey bare", () => {
+  const src = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
+  assert.ok(src.includes("`Triage policy for ${B.bareKey(siteKey)}`"));
+  assert.ok(src.includes("`Permission policy for ${B.bareKey(siteKey)}`"));
+  assert.doesNotMatch(src, /policy for \$\{siteKey\}/);
+});
