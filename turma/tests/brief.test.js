@@ -37,8 +37,9 @@ function makeEl() {
 // `reply(url, init)` answers each fetch: a body for 200, {status, body} for a
 // refusal, or a Promise (resolving to a body) to hold the answer. `agents`, when
 // given, answers the boot's /api/agents the same way; else that never lands.
-function loadPage(reply = null, agents = null) {
+function loadPage(reply = null, agents = null, hash = "") {
   const els = {};
+  const meetings = { mounted: null, updates: [], pending: 0 };
   const sse = [];
   const winListeners = {};
   const fetches = [];
@@ -55,7 +56,7 @@ function loadPage(reply = null, agents = null) {
   };
   const stubs = {
     document,
-    location: { href: "", search: "", pathname: "/brief", hash: "" },
+    location: { href: "", search: "", pathname: "/brief", hash },
     navigator: { userAgent: "node", clipboard: { writeText: async (t) => { clip.push(t); } } },
     fetch: (u, init = {}) => {
       // A page that loops on a route would starve the runner: past 50 calls it
@@ -94,9 +95,11 @@ function loadPage(reply = null, agents = null) {
     TurmaOrg: { getKeys: () => [], update: noop, subscribe: noop, sse: noop },
     TurmaBoard: { orgName: (k, o) => o || k, mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
+    TurmaMeetings: { mount: (el) => { meetings.mounted = el; }, update: (d) => meetings.updates.push(d),
+      pendingCount: () => meetings.pending },
   };
   const keys = Object.keys(stubs);
-  const body = `${script}\n;return { render, renderBriefs, briefOrgHtml, briefText, runNow, saveSchedule,
+  const body = `${script}\n;return { pane: () => pane, render, renderBriefs, briefOrgHtml, briefText, runNow, saveSchedule,
     editField, drafts, nextFor, schedOpen, runRefusal, setCache: (c) => { cache = c; }, getCache: () => cache };`;
   const api = new Function(...keys, body)(...keys.map((k) => stubs[k]));
   const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
@@ -104,7 +107,7 @@ function loadPage(reply = null, agents = null) {
   const list = els.briefList;
   // What a test puts "inside" the list: the focused element counts as inside.
   list.contains = (el) => !!el && el.inside === true;
-  return Object.assign(api, { els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document, window: stubs.window,
+  return Object.assign(api, { meetings, els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document, window: stubs.window,
     list: () => list.innerHTML, fire: (name, data) => sse[0].handlers[name]({ data: JSON.stringify(data) }) });
 }
 
@@ -647,4 +650,20 @@ test("XERK-2396: a cancelled press (a drag the browser took) releases the hold",
   for (const fn of P.winListeners.pointercancel) fn({});
   P.runTimers();
   assert.match(P.list(), /Held\./);
+});
+
+test("XERK-2623: the Meetings pane is mounted, fed every snapshot and frame, and #meetings opens it", async () => {
+  const P = loadPage(null, () => data({ meetingProposals: { [SITE]: [{ meetingId: "m1" }] } }));
+  assert.equal(P.pane(), "brief");
+  assert.equal(P.meetings.mounted, P.els.meetingList);
+  P.meetings.pending = 3;
+  await P.settle();
+  assert.equal(P.meetings.updates.length, 1, "the snapshot reaches the pane");
+  assert.equal(P.els.meetingsCount.textContent, "3", "the tab counts what awaits review");
+  P.meetings.pending = 0;
+  P.fire("meetingProposals", { [SITE]: [] });
+  assert.deepEqual(P.meetings.updates.at(-1).meetingProposals, { [SITE]: [] });
+  assert.equal(P.els.meetingsCount.textContent, "");
+  assert.equal(loadPage(null, null, "#meetings").pane(), "meetings");
+  assert.equal(loadPage(null, null, "#nope").pane(), "brief");
 });

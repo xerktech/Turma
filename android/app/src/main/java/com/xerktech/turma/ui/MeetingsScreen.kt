@@ -65,14 +65,15 @@ import com.xerktech.turma.vm.MeetingsViewModel
 import com.xerktech.turma.vm.MetaState
 
 /**
- * Meetings (XERK-2511, the web's /meetings page, XERK-2510): the work items an
+ * Meetings (XERK-2511, the web's meetings review, XERK-2510): the work items an
  * org host proposed from a meeting Tenir captured, each approved (a ticket on
  * the org's board, or a decision added to the decisions log), edited then
  * approved, or rejected. Scoped by the header's org pick. Every served string is
- * plain Text, never markup; a link opens only an http(s) URL.
+ * plain Text, never markup; a link opens only an http(s) URL. The Brief screen's
+ * Meetings pane (XERK-2623), as on the web.
  */
 @Composable
-fun MeetingsScreen(modifier: Modifier = Modifier, vm: MeetingsViewModel = viewModel()) {
+fun MeetingsPane(modifier: Modifier = Modifier, vm: MeetingsViewModel = viewModel()) {
     LaunchedEffect(Unit) { vm.start() }
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val stored by vm.orgFilter.collectAsStateWithLifecycle()
@@ -99,7 +100,6 @@ fun MeetingsScreen(modifier: Modifier = Modifier, vm: MeetingsViewModel = viewMo
     }
 
     Column(modifier.fillMaxSize()) {
-        ScreenHeader("Meetings")
         if (orgs.isEmpty()) {
             Text(
                 meetingsEmptyText(fleet.meetingProposals),

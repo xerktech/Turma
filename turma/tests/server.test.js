@@ -26831,6 +26831,18 @@ test("XERK-2386: the org brief is retired — /brief is the Daily Brief page, an
   delete agents.dcBrief2386;
 });
 
+test("XERK-2623: /meetings lands on the Brief page's Meetings pane, query kept", async () => {
+  for (const [p, loc] of [["/meetings", "/brief#meetings"], ["/meetings.html", "/brief#meetings"],
+    ["/meetings?site=acme.atlassian.net", "/brief?site=acme.atlassian.net#meetings"]]) {
+    const r = await request("GET", p, { headers: userHeaders });
+    assert.equal(r.status, 302, p);
+    assert.equal(r.headers.location, loc, p);
+  }
+  const brief = await request("GET", "/brief", { headers: userHeaders });
+  assert.match(brief.raw, /<script src="\/meetings\.[0-9a-f]{12}\.js"><\/script>/);
+  assert.match(brief.raw, /id="meetingList"/);
+});
+
 test("XERK-2386: the leader's orchestration tick ages out the decisions log", () => {
   const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const tick = src.slice(src.indexOf("function masterOrchestrationTick("));
@@ -29304,7 +29316,7 @@ test("XERK-2511: proposals ready push once per meeting, never for an empty one o
   const pushed = notifications.filter((n) => n.title != null);
   assert.deepEqual(pushed.map((n) => n.title), ["2 proposals from Sprint sync"]);
   assert.deepEqual([pushed[0].data.tags, pushed[0].data.notifKey, pushed[0].data.click, pushed[0].data.host],
-    ["meetings", `meeting:${S}:n1`, `/meetings?site=${encodeURIComponent(S)}`, "mtP2511"]);
+    ["meetings", `meeting:${S}:n1`, `/brief?site=${encodeURIComponent(S)}#meetings`, "mtP2511"]);
   // The outbox re-sends the row until a beat is accepted: no second push.
   await meetResult2508("mtP2511", S, c1, { status: "ok", items });
   assert.equal(notifications.filter((n) => n.title != null).length, 1);

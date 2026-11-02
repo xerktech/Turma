@@ -1,7 +1,7 @@
 ---
 paths:
   - "turma/server.js"
-  - "turma/public/meetings.html"
+  - "turma/public/meetings.js"
   - "turma/tests/meetings.test.js"
   - "agent/hub-agent.py"
   - "turma/tests/server.test.js"
@@ -137,7 +137,8 @@ ticket builds to this file; change it here first.
   - **The running → ok edge pushes "N proposals from <title>"** (XERK-2511,
     `notifyMeetingProposals`): once per meeting, since only that edge sends it; none for an empty
     list or a failure. Routed by the reporting host (its tenant's devices), `tags:"meetings"`,
-    `notifKey: meeting:<site>:<id>`, `click: /meetings?site=…` (Android opens the Meetings tab).
+    `notifKey: meeting:<site>:<id>`, `click: /brief?site=…#meetings` (Android opens Brief's
+    Meetings pane; an older hub's `/meetings?site=…` lands there too, XERK-2623).
   - `ok` with `items: []` is a real answer ("nothing to propose"); `ok` with no `items` array fails.
 - An item (XERK-2509's schema, re-whitelisted by the hub, ≤`MEETING_ITEMS_MAX` (30) per meeting):
   `{kind:"task"|"bug"|"followup"|"decision", title ≤200, description ≤4000, suggestedAssignee

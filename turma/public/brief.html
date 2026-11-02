@@ -14,7 +14,7 @@
 <style>
   /* The Daily Brief (XERK-2396, epic XERK-2390): per org, the latest standup
      brief set for reading aloud, its earlier briefs, Run now, and the meeting
-     schedule that writes it. Tokens/base/nav live in app.css. Web-only for now
+     schedule that writes it. Its Meetings pane (XERK-2623) is meetings.js. Tokens/base/nav live in app.css. Web-only for now
      (android/PARITY.md). */
   .brief-org {
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
@@ -91,14 +91,103 @@
     .brief-read p { font-size: 18px; }
     .sched-form select.tz { width: 100%; }
   }
+  /* Daily brief | Meetings (XERK-2623): the page's two panes, Insights' sub-tab look.
+     One row at any width: a phone scrolls it sideways rather than wrapping a tab. */
+  .subtabs {
+    display: flex; gap: 4px; margin: 0 0 16px; overflow-x: auto; scrollbar-width: none;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .subtabs::-webkit-scrollbar { display: none; }
+  .subtabs a {
+    color: var(--ink-2); text-decoration: none; font-size: 14px; font-weight: 600;
+    padding: 8px 12px; border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap;
+  }
+  .subtabs a:hover { color: var(--ink); }
+  .subtabs a.active { color: var(--accent-text); border-bottom-color: var(--accent); }
+  .subtabs .count {
+    display: inline-block; min-width: 18px; padding: 0 6px; margin-left: 4px; border-radius: 999px;
+    font-size: 11.5px; line-height: 18px; text-align: center; background: var(--accent); color: #fff;
+  }
+  .subtabs .count:empty { display: none; }
+  /* The Meetings pane (XERK-2510): proposals from a Tenir meeting, reviewed by the operator. */
+  .mt-org { margin-bottom: 22px; min-width: 0; }
+  .mt-org-head { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; margin-bottom: 10px; }
+  .mt-org-name { font-family: var(--font-display); font-size: 19px; font-weight: 600; margin: 0;
+    flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+  .mt-target { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2); flex-wrap: wrap; }
+  .mt-target select, .mt-edit select, .mt-edit input, .mt-edit textarea {
+    font: inherit; font-size: 14px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--field); color: var(--ink); padding: 5px 8px; max-width: 100%; min-width: 0;
+  }
+  .mt-target .err { color: var(--critical-text); }
+  .mt-meeting {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    padding: 14px 16px; margin-bottom: 12px; min-width: 0;
+  }
+  .mt-head { display: flex; align-items: baseline; gap: 6px 12px; flex-wrap: wrap; }
+  .mt-head > a { font-size: 13px; color: var(--accent-text); white-space: nowrap; }
+  .mt-title { font-size: 16px; font-weight: 600; margin: 0; flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+  .mt-meta { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+  .mt-meta .bit { white-space: nowrap; }
+  .mt-meta .sep::after { content: " · "; white-space: pre; }
+  .mt-status { font-size: 13px; margin-top: 10px; color: var(--ink-2); overflow-wrap: anywhere; }
+  .mt-status.failed { color: var(--critical-text); }
+  .mt-items { list-style: none; margin: 10px 0 0; padding: 0; }
+  .mt-item { border-top: 1px solid var(--hairline); padding: 12px 0 4px; min-width: 0; }
+  .mt-item:first-child { border-top: 0; }
+  .mt-item-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .mt-kind {
+    flex: none; font-size: 11px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase;
+    padding: 1px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-text);
+  }
+  .mt-kind.bug { background: color-mix(in srgb, var(--critical) 14%, transparent); color: var(--critical-text); }
+  .mt-kind.decision { background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--good-text); }
+  .mt-item-title { font-weight: 600; font-size: 14.5px; min-width: 0; overflow-wrap: anywhere; flex: 1 1 12em; }
+  .mt-desc { font-size: 13.5px; color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; }
+  .mt-facts { font-size: 12.5px; color: var(--muted); margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+  .mt-facts a { color: var(--accent-text); }
+  .mt-quotes { margin: 8px 0 0; padding: 0; list-style: none; }
+  .mt-quotes li {
+    border-left: 3px solid var(--hairline); padding: 2px 0 2px 10px; margin-top: 4px;
+    font-size: 13px; color: var(--ink-2); overflow-wrap: anywhere;
+  }
+  .mt-quotes .who { font-weight: 600; color: var(--ink); }
+  .mt-quotes a { font-size: 12px; margin-left: 6px; white-space: nowrap; color: var(--accent-text); }
+  .mt-review { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; font-size: 13px; }
+  .mt-review .state { color: var(--ink-2); overflow-wrap: anywhere; }
+  .mt-review .state.good { color: var(--good-text); }
+  .mt-review .state.bad { color: var(--critical-text); }
+  .mt-review .state a { color: inherit; font-weight: 600; }
+  .mt-item.rejected .mt-item-title, .mt-item.rejected .mt-desc { color: var(--muted); }
+  .mt-edit { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; font-size: 13px; }
+  .mt-edit label { display: flex; flex-direction: column; gap: 4px; color: var(--ink-2); }
+  .mt-edit textarea { min-height: 8em; resize: vertical; }
+  .mt-edit .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .mt-err { color: var(--critical-text); font-size: 13px; margin-top: 6px; overflow-wrap: anywhere; }
+  .mt-list button[aria-disabled="true"], .mt-list button[aria-disabled="true"]:hover {
+    opacity: 0.5; cursor: default; border-color: var(--border); }
+  .mt-empty { color: var(--muted); font-size: 14px; padding: 24px 0; }
+  @media (max-width: 600px) {
+    .mt-meeting { padding: 12px; }
+  }
 </style>
 </head>
 <body class="app-shell">
 <header class="site-header" id="siteHeader" data-page="brief"></header>
 <div class="page-scroll">
 <div class="wrap">
-  <div id="briefList"></div>
-  <div class="pane-note">An agent host of each org writes its <b>daily brief</b> a few minutes before the org's meeting, from your own tickets in that org: what moved since the last meeting, the week so far and what is next. Times on this page are in your time zone.</div>
+  <nav class="subtabs" id="subtabs">
+    <a href="#brief" data-pane="brief">Daily brief</a>
+    <a href="#meetings" data-pane="meetings">Meetings<span class="count" id="meetingsCount"></span></a>
+  </nav>
+  <section id="pane-brief" data-pane-body="brief">
+    <div id="briefList"></div>
+    <div class="pane-note">An agent host of each org writes its <b>daily brief</b> a few minutes before the org's meeting, from your own tickets in that org: what moved since the last meeting, the week so far and what is next. Times on this page are in your time zone.</div>
+  </section>
+  <section id="pane-meetings" data-pane-body="meetings" hidden>
+    <div id="meetingList" class="mt-list"></div>
+    <div class="pane-note">When Tenir captures a meeting, an agent host of the org reads its captions and <b>proposes</b> work items. Nothing reaches the board until you approve one: Approve creates the ticket on that org's board, a decision is added to the org's decisions log, and Reject sets it aside.</div>
+  </section>
 </div>
 </div>
 
@@ -107,6 +196,7 @@
 <script src="/nav.js"></script>
 <script src="/org.js"></script>
 <script src="/newticket.js"></script>
+<script src="/meetings.js"></script>
 
 <script>
 function esc(s) {
@@ -395,6 +485,31 @@ function render(data) {
   TurmaOrg.update(data);
   TurmaNewTicket.update(data);
   renderBriefs(data, Date.now());
+  renderMeetingsPane(data);
+}
+
+// ---- Daily brief | Meetings (XERK-2623) ------------------------------------------
+// The meetings review (meetings.js) is this page's second pane; `#meetings` opens
+// it, so the old /meetings URL and the "N proposals" push land on it.
+const PANES = ["brief", "meetings"];
+const $meetingsCount = document.getElementById("meetingsCount");
+function paneOf(hash) {
+  const p = String(hash || "").replace(/^#/, "");
+  return PANES.includes(p) ? p : PANES[0];
+}
+let pane = paneOf(location.hash);
+function showPane() {
+  for (const a of document.querySelectorAll("[data-pane]")) a.classList.toggle("active", a.dataset.pane === pane);
+  for (const s of document.querySelectorAll("[data-pane-body]")) s.hidden = s.dataset.paneBody !== pane;
+}
+addEventListener("hashchange", () => { pane = paneOf(location.hash); showPane(); });
+showPane();
+TurmaMeetings.mount(document.getElementById("meetingList"));
+// Painted whichever pane shows, so a switch is instant and the tab's count is live.
+function renderMeetingsPane(data) {
+  TurmaMeetings.update(data);
+  const n = TurmaMeetings.pendingCount(data);
+  $meetingsCount.textContent = n ? String(n) : "";
 }
 function flushHeld() {
   setTimeout(() => { if (paintPending && cache) renderBriefs(cache, Date.now()); }, 0);
@@ -587,15 +702,16 @@ $briefs.addEventListener("toggle", (e) => {
 // ---- the fleet snapshot --------------------------------------------------------
 // A fetch MERGES, never replaces (XERK-444): an SSE frame that lands while
 // /api/agents is in flight is newer than its body.
-let briefsClock = 0, schedulesClock = 0;
+let briefsClock = 0, schedulesClock = 0, meetingsClock = 0;
 async function refresh() {
-  const bsince = briefsClock, ssince = schedulesClock;
+  const bsince = briefsClock, ssince = schedulesClock, msince = meetingsClock;
   try {
     const r = await fetch("/api/agents");
     if (r.status === 401) return void (location.href = "/login");
     const body = await r.json();
     if (cache && briefsClock !== bsince) body.dailyBriefs = cache.dailyBriefs;
     if (cache && schedulesClock !== ssince) body.dailyBriefSchedules = cache.dailyBriefSchedules;
+    if (cache && meetingsClock !== msince) body.meetingProposals = cache.meetingProposals;
     cache = body;
     if (typeof TurmaNav !== "undefined" && TurmaNav.noteSnapshot) TurmaNav.noteSnapshot(r);
   } catch { /* keep the last render */ }
@@ -632,6 +748,14 @@ function connectSSE() {
     schedulesClock++;
     cache.dailyBriefSchedules = d;
     renderBriefs(cache, Date.now());
+  });
+  es.addEventListener("meetingProposals", (e) => {
+    let d;
+    try { d = JSON.parse(e.data); } catch { return; }
+    if (!cache) return void refresh();
+    meetingsClock++;
+    cache.meetingProposals = d;
+    renderMeetingsPane(cache);
   });
   TurmaOrg.sse(es);
   es.onerror = () => {

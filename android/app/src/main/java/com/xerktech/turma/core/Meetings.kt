@@ -12,11 +12,11 @@ import java.util.Locale
 
 /*
  * Meetings (XERK-2511): the pure logic of the Android Meetings screen, ported
- * from turma/public/meetings.html (XERK-2510) so the phone sends the same ticket
+ * from turma/public/meetings.js (XERK-2510) so the phone sends the same ticket
  * text and reads the same states as the web page. JVM-tested in MeetingsTest.
  */
 
-/** An offset into the meeting as m:ss / h:mm:ss (meetings.html `clock`). */
+/** An offset into the meeting as m:ss / h:mm:ss (meetings.js `clock`). */
 fun meetingClock(ms: Long): String {
     val t = maxOf(0L, ms / 1000)
     val h = t / 3600
@@ -154,6 +154,16 @@ fun meetingsEmptyText(map: Map<String, List<Meeting>>): String =
         "No meetings for the orgs picked in the header — pick All orgs to see the others."
     } else {
         "No meetings yet — when Tenir sends one, its proposed work items show up here."
+    }
+
+/**
+ * Proposals in the shown orgs still waiting on the operator — the Brief screen's
+ * Meetings tab count (XERK-2623, web `pendingCount`): reviewable and not rejected.
+ */
+fun meetingsPending(map: Map<String, List<Meeting>>, scoped: Set<String>): Int =
+    meetingOrgs(map, scoped).sumOf { s ->
+        map[s].orEmpty().filter { it.status == "ok" }
+            .sumOf { m -> m.items.count { meetingReviewable(it) && it.review?.state != "rejected" } }
     }
 
 /** The orgs the screen shows: those with meetings, inside the header's scope (empty = all). */

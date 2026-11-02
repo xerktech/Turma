@@ -20327,10 +20327,10 @@ function notifyMeetingProposals(host, siteKey, row) {
   const n = Array.isArray(row.items) ? row.items.length : 0;
   if (!n) return;
   notify(`${n} proposal${n === 1 ? "" : "s"} from ${row.title || "a meeting"}`,
-    "Review them on the Meetings page — nothing reaches the board until you approve.", {
+    "Review them under Brief → Meetings — nothing reaches the board until you approve.", {
       tags: "meetings", route: { host },
       notifKey: `meeting:${siteKey}:${row.meetingId}`,
-      click: `/meetings?site=${encodeURIComponent(siteKey)}`,
+      click: `/brief?site=${encodeURIComponent(siteKey)}#meetings`,
     });
 }
 
@@ -20725,6 +20725,7 @@ const HASHED_ASSETS = [
   ["/nav.js",        "nav.js",        "text/javascript; charset=utf-8"],
   ["/org.js",        "org.js",        "text/javascript; charset=utf-8"],
   ["/newticket.js",  "newticket.js",  "text/javascript; charset=utf-8"],
+  ["/meetings.js",   "meetings.js",   "text/javascript; charset=utf-8"],
 ];
 
 // Bare URL -> fingerprinted URL, the map the HTML rewrite runs on.
@@ -20781,7 +20782,6 @@ const SESSIONS = htmlPage("sessions.html");
 const BOARD = htmlPage("board.html");
 const INSIGHTS = htmlPage("insights.html");
 const BRIEF = htmlPage("brief.html");
-const MEETINGS_PAGE = htmlPage("meetings.html");
 const ADMIN_PAGE = htmlPage("admin.html");
 // Not an `htmlPage`: the login form is served `no-store` (a cached login page
 // is its own problem), so it has no conditional-GET path to carry an ETag for.
@@ -22842,8 +22842,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && (url.pathname === "/brief" || url.pathname === "/brief.html")) {
       return sendPage(req, res, BRIEF);
     }
+    // Meetings live on the Brief page's Meetings pane (XERK-2623); the old URL —
+    // bookmarks, a notification already on a phone — lands there, query kept.
     if (req.method === "GET" && (url.pathname === "/meetings" || url.pathname === "/meetings.html")) {
-      return sendPage(req, res, MEETINGS_PAGE);
+      res.writeHead(302, { Location: `/brief${url.search}#meetings` });
+      return res.end();
     }
 
     // The page was /history until it dropped cost and became token-only. Keep

@@ -1,15 +1,24 @@
 ---
 paths:
-  - "turma/public/meetings.html"
+  - "turma/public/meetings.js"
+  - "turma/public/brief.html"
   - "turma/tests/meetings.test.js"
 ---
 
-# The Meetings page (`/meetings`, XERK-2510)
+# The Meetings review (Brief page → Meetings, XERK-2510, XERK-2623)
 
 The web surface of the Meetings epic (XERK-2503). The wire and the review route are in
-`contract-meetings.md`; this file is the page's own rules.
+`contract-meetings.md`; this file is the review's own rules.
 
-- `/meetings` (nav `meetings`, after Brief) serves `meetings.html`, scoped by the header org pick;
+- **Meetings is a pane of the Brief page, not a page** (XERK-2623, operator's call): `brief.html`'s
+  "Daily brief | Meetings" sub-tabs, `#meetings` selecting it. No nav tab.
+  - `/meetings` (and `.html`) 302s to `/brief<query>#meetings`, so a bookmark or an older push lands.
+  - The tab shows a count of proposals awaiting review (`pendingCount`: reviewable, not rejected).
+- **`meetings.js` is a shared module with NO snapshot or stream of its own**: `brief.html` owns
+  `/api/agents` + SSE, mounts it once (`TurmaMeetings.mount`) and hands it every snapshot and
+  `meetingProposals` frame (`update`). A second EventSource per page would double the hub's fan-out.
+  - It is in `HASHED_ASSETS` (an unlisted shared `/*.js` 404s the page's render).
+- The review is scoped by the header org pick;
   one block per org with meetings, one card per meeting, its proposals inside.
 - **Nothing reaches the board unasked**: every create is the operator's Approve. A `decision`
   item offers "Log decision" (decisions log), never a ticket.
