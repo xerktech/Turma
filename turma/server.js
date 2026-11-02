@@ -3129,8 +3129,14 @@ const persistDevices = registerExternalStore({
 });
 // Each device belongs to the tenant of the principal that registered it
 // (XERK-2551, `tenantId`; absent = the operators'), and is sent only alerts about
-// that tenant's hosts (notify/dismiss). A phone signing in as someone else
-// re-registers the same token, which moves it.
+// that tenant's hosts (notify/dismiss).
+// A token bound to one tenant is never re-bound or released by another
+// (XERK-2622): whoever learned a victim's FCM token could otherwise pull the
+// victim's phone out of its tenant or unregister it. A phone that changes login
+// gets its new tenant by RELEASING the old binding (sign-out unregisters), or,
+// when that release was lost, by rotating its FCM token on the 409 this returns
+// — a fresh token has no binding, and the dead one is pruned on the next send.
+const deviceTenant = (d) => ((d && typeof d.tenantId === "string") ? d.tenantId : "");
 function registerDevice(token, platform, features, tenantId = "") {
   const now = Date.now();
   // What this app build can do (XERK-154). Only a build that declares "dismiss"
@@ -3140,9 +3146,9 @@ function registerDevice(token, platform, features, tenantId = "") {
   const caps = Array.isArray(features) ? features.filter((f) => typeof f === "string") : null;
   const existing = devices.find((d) => d.token === token);
   if (existing) {
+    if (deviceTenant(existing) !== (tenantId || "")) return false;
     existing.platform = platform || existing.platform;
     if (caps) existing.features = caps;
-    if (tenantId) existing.tenantId = tenantId; else delete existing.tenantId;
     existing.seenAt = now;
   } else {
     const d = { token, platform: platform || "android", features: caps || [], addedAt: now, seenAt: now };
@@ -3150,10 +3156,14 @@ function registerDevice(token, platform, features, tenantId = "") {
     devices.push(d);
   }
   persistDevices();
+  return true;
 }
-function unregisterDevice(token) {
+// `tenantId` undefined = any tenant's (hub-internal callers); a string = only
+// that tenant's registration (the route passes the caller's).
+function unregisterDevice(token, tenantId) {
   const before = devices.length;
-  devices = devices.filter((d) => d.token !== token);
+  devices = devices.filter((d) => d.token !== token
+    || (tenantId !== undefined && deviceTenant(d) !== tenantId));
   if (devices.length !== before) persistDevices();
 }
 function pruneDevices(deadTokens) {
@@ -3170,7 +3180,7 @@ function listDevices() {
 // for an untenanted host (and a fleet-wide alert, host "").
 function devicesForHost(host) {
   const t = tenantOfKey(host || "");
-  return devices.filter((d) => ((d && typeof d.tenantId === "string") ? d.tenantId : "") === t);
+  return devices.filter((d) => deviceTenant(d) === t);
 }
 
 // ---- ticket -> agent pins (XERK-38) ----------------------------------------
@@ -23070,12 +23080,18 @@ const server = http.createServer(async (req, res) => {
       if (!token) return json(res, 400, { error: "token required" });
       const platform = typeof body.platform === "string" ? body.platform : "android";
       const features = Array.isArray(body.features) ? body.features : undefined;
-      registerDevice(token, platform, features, principalTenant(requestPrincipal(req)));
+      // 409 = this token is another tenant's (XERK-2622); the app rotates its
+      // FCM token and registers the new one.
+      if (!registerDevice(token, platform, features, principalTenant(requestPrincipal(req)))) {
+        return json(res, 409, { error: "this device is registered to another account; sign out there first" });
+      }
       return json(res, 200, { ok: true });
     }
     if (req.method === "DELETE" && url.pathname === "/api/devices") {
+      // Only the caller's own tenant's registration; another's is left alone
+      // and answered the same 200, so the route is no oracle for it.
       const token = (url.searchParams.get("token") || "").trim();
-      if (token) unregisterDevice(token);
+      if (token) unregisterDevice(token, principalTenant(requestPrincipal(req)));
       return json(res, 200, { ok: true });
     }
 

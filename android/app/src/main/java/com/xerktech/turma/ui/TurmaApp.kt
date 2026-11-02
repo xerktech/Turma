@@ -10,6 +10,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
+import kotlinx.coroutines.launch
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavGraph.Companion.findStartDestination
@@ -105,6 +106,10 @@ internal fun tabNavOptions(): NavOptionsBuilder.() -> Unit = {
     launchSingleTop = true
 }
 
+
+// Process-wide, so it holds across an Activity recreation mid-sign-out.
+private val signOutInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
 @Composable
 fun TurmaApp(
     container: AppContainer,
@@ -149,12 +154,23 @@ fun TurmaApp(
 
     // Unregister push, drop the stored credentials, and return to the login
     // screen clearing the whole back stack (so Back can't re-enter the app).
+    // The push release must land while the credentials still exist (XERK-2622),
+    // so the clear waits for it. It runs on the app scope, not a composition
+    // scope: an Activity recreation (rotation) mid-wait would otherwise cancel
+    // the sign-out and leave the user signed in. The navigation to Login is the
+    // `settings.configured` effect above, which survives recreation too.
+    // One sign-out at a time: a repeat tap during the wait would otherwise clear
+    // the credentials again later — possibly a NEW login made in between.
     val signOut: () -> Unit = {
-        PushRegistrar.unregister(ctx, container)
-        container.config.clear()
-        nav.navigate(Routes.LOGIN) {
-            popUpTo(0) { inclusive = true }
-            launchSingleTop = true
+        if (signOutInFlight.compareAndSet(false, true)) {
+            container.appScope.launch {
+                try {
+                    PushRegistrar.unregister(ctx.applicationContext, container)
+                    container.config.clear()
+                } finally {
+                    signOutInFlight.set(false)
+                }
+            }
         }
     }
 

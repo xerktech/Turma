@@ -104,6 +104,13 @@ wire contract and Web ⇄ Android parity — Android's channels/`Notifications.k
   `node:crypto`, enabled by `FCM_SERVICE_ACCOUNT_JSON`), carrying `tags`/`priority`/`click`/
   `route:{host,sessionId}`. No-op with no device/FCM off. Devices register via `POST /api/devices`,
   unregister via `DELETE /api/devices?token=`; dead tokens pruned on send.
+- A device token is bound to the tenant that registered it (XERK-2622): another tenant's POST gets
+  409 and its DELETE is a silent no-op, so a leaked FCM token can't move or drop a phone.
+  - A login change moves the phone by releasing first: Android's sign-out awaits the DELETE BEFORE
+    clearing credentials (else it is a 401 and the binding stays). Don't restore "re-register moves it".
+  - A lost release is recovered by `PushRegistrar` rotating its FCM token on the 409, re-armed on each
+    successful register so every account switch can rotate once.
+  - Tests: `server.test.js` "XERK-2622: another tenant holding a device's token …".
 - **An addressed alert is retracted from the phone** (XERK-154): stable `notifKey`
   (`question:<host>:<id>`, `review:<host>:<id>`), `dismiss(notifKey)` sends a title-less FCM message,
   once per edge. **Capability-gated** to `features:["dismiss"]` — an older build renders a data-only
