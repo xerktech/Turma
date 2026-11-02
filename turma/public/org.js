@@ -175,7 +175,7 @@
         `<div class="org-row${picked ? " active" : ""}" style="--org:${esc(color)}">` +
         `<button type="button" class="org-row-main has-dot" data-org-key="${esc(s.siteKey)}"` +
         ` role="menuitemcheckbox" aria-checked="${picked ? "true" : "false"}"` +
-        ` title="${esc(s.siteKey)} · ${hosts} host${hosts === 1 ? "" : "s"}">` +
+        ` title="${esc(B.bareKey ? B.bareKey(s.siteKey) : s.siteKey)} · ${hosts} host${hosts === 1 ? "" : "s"}">` +
         `<span class="org-dot" aria-hidden="true"></span>` +
         `<span class="org-row-name">${esc(B.orgName(s.siteKey, s.orgName))}</span>` +
         `<span class="chip-n">${(s.tickets || []).length}</span>` +
@@ -212,7 +212,7 @@
 
   function board() {
     return (typeof window !== "undefined" && window.TurmaBoard) || {
-      orgName: k => k, orgColor: () => "", orgColorMap: () => new Map(),
+      bareKey: k => String(k ?? ""), orgName: k => k, orgColor: () => "", orgColorMap: () => new Map(),
       mergeSites: () => [], ageStr: () => "",
     };
   }

@@ -2716,7 +2716,11 @@
     const title = (s && typeof sessTitle === "function") ? sessTitle(s) : sessionId;
     const meta = (s && typeof sessMeta === "function") ? sessMeta(s) : sessionId;
     if (t) t.textContent = title;
-    if (p) p.textContent = (a ? (a.device || a.key) + " · " : "") + meta;
+    // Display only: drop a tenant key's `@<tenant>` suffix (board.js bareKey, XERK-2634).
+    const host = a ? (a.device || a.key) : "";
+    const bare = (typeof window !== "undefined" && window.TurmaBoard && window.TurmaBoard.bareKey)
+      ? window.TurmaBoard.bareKey(host) : host;
+    if (p) p.textContent = (a ? bare + " · " : "") + meta;
   }
 
   function loadVerbosity(sid) {
@@ -4093,6 +4097,7 @@
       __setSess: (s) => { sess = s; sessionId = s && s.id; },
       __setHostKey: (k) => { hostKey = k; },
       __setAgent: (a) => { agent = a; },
+      __setHeader: (s, a) => { setHeader(s, a); },
       __setModelSwitchPending: (p) => { modelSwitchPending = p; },
       localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts,
       setSessionModelSource, answerPanePrompt,

@@ -3270,3 +3270,21 @@ test("XERK-2399: a 401 bounces to /login instead of toasting", async () => {
   assert.equal(location.href, "/login");
   assert.deepEqual(toasts, [], "an expired session is a re-login, not an error toast");
 });
+
+// XERK-2634: the chat header names the session's host; a tenant host's registry
+// key is `<device>@<32-hex>` and prints as the device alone.
+test("chat header: a tenant host with no device prints without the tenant suffix", () => {
+  const { __setHeader } = require("../public/chat.js");
+  const els = { chatTitle: { textContent: "" }, chatPath: { textContent: "" } };
+  global.document = { getElementById: (id) => els[id] || null };
+  global.window = { TurmaBoard: require("../public/board.js") };
+  try {
+    __setHeader(null, { key: "TrueNAS@77778a16d8b028aab55c7729d587dbd7", device: "" });
+    assert.match(els.chatPath.textContent, /^TrueNAS · /);
+    __setHeader(null, { key: "box@corp", device: "" });
+    assert.match(els.chatPath.textContent, /^box@corp · /);
+  } finally {
+    delete global.document;
+    delete global.window;
+  }
+});

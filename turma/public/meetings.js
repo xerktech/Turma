@@ -7,6 +7,12 @@
 // Loaded after org.js (it reads TurmaOrg/TurmaBoard/TurmaNav); in server.js's
 // HASHED_ASSETS. Tests: tests/meetings.test.js.
 (() => {
+// A host/org key for DISPLAY: board.js bareKey drops a tenant key's `@<32-hex>`
+// suffix (XERK-2634). Handlers, maps and URLs keep the raw key.
+function displayKey(k) {
+  const B = typeof TurmaBoard !== "undefined" ? TurmaBoard : null;
+  return B && B.bareKey ? B.bareKey(k) : String(k ?? "");
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -193,7 +199,7 @@ function meetingHtml(site, m) {
   const link = url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open in Tenir ↗</a>` : "";
   let body;
   if (m.status === "queued") body = `<div class="mt-status">Waiting for a host of this org to read the captions…</div>`;
-  else if (m.status === "running") body = `<div class="mt-status">Reading the captions${m.host ? ` on ${esc(m.host)}` : ""}…</div>`;
+  else if (m.status === "running") body = `<div class="mt-status">Reading the captions${m.host ? ` on ${esc(displayKey(m.host))}` : ""}…</div>`;
   else if (m.status === "failed") body = `<div class="mt-status failed">Could not propose work items — ${esc(m.error || "the run failed")}</div>`;
   else if (!(m.items || []).length) body = `<div class="mt-status">Nothing to propose from this meeting.</div>`;
   else body = `<ul class="mt-items">${m.items.map((it) => itemHtml(site, m, it)).join("")}</ul>`;

@@ -112,7 +112,7 @@ function loadHelpers(fetchReply = null, storage = null) {
     TurmaOrg: { get: () => (orgKeys.length === 1 ? orgKeys[0] : ""), getKeys: () => (orgHooks ? orgHooks.getKeys() : orgKeys),
       update: (d) => { if (orgHooks) orgHooks.update(d); }, filter: (a) => orgFilter(a),
       subscribe: noop, sse: noop, orgColors: () => ({}) },
-    TurmaBoard: { orgName: (k, o) => o || k, orgColorMap: () => ({}),
+    TurmaBoard: { bareKey: require("../public/board.js").bareKey, orgName: (k, o) => o || k, orgColorMap: () => ({}),
       mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
   };
@@ -1417,4 +1417,14 @@ test("a removal re-polls once, however many hosts the hub evicts", async () => {
   await H2.runTimers();
   await new Promise((r) => setImmediate(r));
   assert.equal(H2.fetches.filter((u) => u === "/api/agents").length, 1);
+});
+
+// XERK-2634: a tenant host's key is `<device>@<32-hex>`; the limit card and the
+// series label print the device alone (board.js bareKey).
+test("a tenant host with no device names its limit card and series without the tenant", () => {
+  const key = "TrueNAS@77778a16d8b028aab55c7729d587dbd7";
+  const entries = H.limitEntries([{ key, device: "", limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } }], NOW);
+  assert.deepEqual(entries.map((e) => e.host), ["TrueNAS"]);
+  assert.equal(H.hostLabel({ key, device: "" }), "TrueNAS");
+  assert.equal(H.hostLabel({ key: "box@corp", device: "" }), "box@corp", "a non-tenant @tail stays");
 });

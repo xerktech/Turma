@@ -2154,6 +2154,12 @@ function ago(ms) {
   if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m ago";
   return Math.floor(s / 86400) + "d ago";
 }
+// A host/org key for DISPLAY: board.js bareKey drops a tenant key's `@<32-hex>`
+// suffix (XERK-2634). Handlers, maps and URLs keep the raw key.
+function displayKey(k) {
+  const B = typeof TurmaBoard !== "undefined" ? TurmaBoard : null;
+  return B && B.bareKey ? B.bareKey(k) : String(k ?? "");
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -2743,7 +2749,7 @@ function sessMeta(s) {
 function cardMeta(a, s, idText) {
   const id = idText != null ? idText : s.id;
   const repo = s.repo || "?";
-  const dev = a.device || a.key;
+  const dev = displayKey(a.device || a.key);
   const t = s.ticket || null;
   const key = (t && t.key) || "";
   let ticketHtml = null;
@@ -2952,7 +2958,7 @@ function activeCard({ a, s, live }) {
   // A move in progress: show where it's going until the stage follows it over.
   const mig = migrationFor(a.key, s.id);
   const moving = mig
-    ? `<div class="s-moving"><span class="spin"></span> Moving to ${esc(window.TurmaBoard.hostName(mig.targetHost))}…</div>` : "";
+    ? `<div class="s-moving"><span class="spin"></span> Moving to ${esc(displayKey(mig.targetHost))}…</div>` : "";
   return `<div class="s-card-wrap"${orgTintStyle(a)}>
     <div class="s-card ${cur ? "cur" : ""}">
       <button class="s-hit" ${attachable ? "" : "disabled"}
@@ -3010,7 +3016,7 @@ function moveMenu(a, s) {
   return `<div class="s-menu" onclick="event.stopPropagation()">
     <div class="s-menu-head">Move to…</div>
     ${targets.length
-      ? targets.map(t => `<button onclick="moveTo(event,'${escJs(a.key)}','${escJs(s.id)}','${escJs(t.key)}')">${esc(t.device || t.key)}</button>`).join("")
+      ? targets.map(t => `<button onclick="moveTo(event,'${escJs(a.key)}','${escJs(s.id)}','${escJs(t.key)}')">${esc(displayKey(t.device || t.key))}</button>`).join("")
       : `<div class="s-menu-empty">No eligible agent.</div>`}
     <button onclick="closeMove(event)">Cancel</button>
   </div>`;
@@ -3169,7 +3175,7 @@ function hostBlock(a, agents, nowSec, lone) {
   }).join("");
   return `<div class="host-block${open ? " open" : ""}">
     <button type="button" class="hname" id="${esc(hostHeadId(a.key))}" aria-expanded="${open}"
-        onclick="toggleHost('${escJs(a.key)}')"><span class="hchev">▶</span><span class="hlabel">${esc(a.device || a.key)}</span>${
+        onclick="toggleHost('${escJs(a.key)}')"><span class="hchev">▶</span><span class="hlabel">${esc(a.device || displayKey(a.key))}</span>${
       hostCapHtml(a.capacity)}${hostWeeklyHtml(hostWeekly(a, agents, nowSec), nowSec)}</button>
     ${open ? `<div class="repo-btns">${repos}</div>` : ""}
   </div>`;
@@ -3704,7 +3710,7 @@ function setFrame(id, s, a) {
   const src = `/term/${encodeURIComponent(id)}/`;
   document.getElementById("termTitle").textContent = s ? sessTitle(s) : id;
   document.getElementById("termPath").textContent =
-    (a ? (a.device || a.key) + " · " : "") + (s ? sessMeta(s) : id);
+    (a ? displayKey(a.device || a.key) + " · " : "") + (s ? sessMeta(s) : id);
   document.getElementById("termOpen").href = src;
   navFrame(src);
   armTermWatch(id);
@@ -4412,7 +4418,7 @@ function renderSearch() {
         <button class="sr-row ${m.transcriptId === currentTranscriptId ? "cur" : ""}"
                 data-tid="${esc(m.transcriptId)}" data-title="${esc(m.summary || "")}"
                 data-uuid="${esc(m.uuid || "")}" data-q="${esc(searchQuery)}">
-          <div class="meta">${esc(m.role || "")}<span class="badge">${esc(m.host || "")}</span> · ${esc(shortDate(m.ts))}</div>
+          <div class="meta">${esc(m.role || "")}<span class="badge">${esc(displayKey(m.host))}</span> · ${esc(shortDate(m.ts))}</div>
           <div class="snip">${safeSnippet(m.snippet || "")}</div>
         </button>`).join("")}
     </div>`).join("");
@@ -4446,7 +4452,7 @@ function prBadgeLinkHtml(pr) {
 function archiveRefusalNote(body) {
   const r = body && body.refused;
   if (!r || !r.error) return "";
-  return `${r.host ? esc(r.host) + "&rsquo;s" : "The agent&rsquo;s"} last push of this ` +
+  return `${r.host ? esc(displayKey(r.host)) + "&rsquo;s" : "The agent&rsquo;s"} last push of this ` +
     `conversation to the archive was refused: ${esc(r.error)}.`;
 }
 
@@ -4503,7 +4509,7 @@ async function openEndedSession(id) {
   document.getElementById("trBackLabel").textContent = " Sessions";
   document.getElementById("trTitle").textContent = sessTitle(e.s);
   document.getElementById("trPath").textContent =
-    [(e.a.device || e.a.key), sessMeta(e.s), e.endedMs ? "ended " + ago(Date.now() - e.endedMs) : ""]
+    [displayKey(e.a.device || e.a.key), sessMeta(e.s), e.endedMs ? "ended " + ago(Date.now() - e.endedMs) : ""]
       .filter(Boolean).join(" · ");
   const $prs = document.getElementById("trPrs");
   $prs.innerHTML = (e.s.prs || []).map(prBadgeLinkHtml).join("");
@@ -4667,7 +4673,7 @@ function renderRestoreMenu() {
     ${targets.length
       ? targets.map(a => {
           const cross = restoreCrossOrg(a);
-          return `<button onclick="restoreTo(event,'${escJs(a.key)}')">${esc(a.device || a.key)}${
+          return `<button onclick="restoreTo(event,'${escJs(a.key)}')">${esc(displayKey(a.device || a.key))}${
             cross ? ` <span class="restore-xorg" title="Different org — this session's bytes would be written onto a host in ${esc(orgLabel(orgOfAgent(a)))}">⚠ ${esc(orgLabel(orgOfAgent(a)))}</span>` : ""}</button>`;
         }).join("")
       : `<div class="restore-empty">No online agent has ${esc(restoreMeta.repo || "this repo")} cloned.</div>`}
@@ -4688,7 +4694,7 @@ async function restoreTo(ev, host) {
   const tgtOrg = tgt ? orgOfAgent(tgt) : "";
   if (meta.siteKey && tgtOrg && meta.siteKey !== tgtOrg &&
       !confirm(`This session was archived from the "${orgLabel(meta.siteKey)}" org. ` +
-        `Restoring onto ${tgt ? (tgt.device || tgt.key) : host} writes its conversation ` +
+        `Restoring onto ${displayKey(tgt ? (tgt.device || tgt.key) : host)} writes its conversation ` +
         `onto a host in "${orgLabel(tgtOrg)}", where that org's Claude login can read it.\n\nRestore anyway?`)) {
     return;
   }
@@ -4702,7 +4708,7 @@ async function restoreTo(ev, host) {
     // importCmdId, so the page walks onto the restored session when it comes up.
     pendingMigration = out.migrationId;
     pendingMigrationFollowed = false;
-    toast("Restoring onto " + (tgt ? (tgt.device || tgt.key) : host) + "…");
+    toast("Restoring onto " + (tgt ? (tgt.device || displayKey(tgt.key)) : displayKey(host)) + "…");
   } else {
     toast(out.error ? "Restore failed — " + out.error : "Restore failed");
   }

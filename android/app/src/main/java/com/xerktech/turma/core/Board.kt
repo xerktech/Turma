@@ -772,7 +772,7 @@ fun orgName(siteKey: String, override: String = ""): String {
     if (o.isNotEmpty()) return o
     // A tenant's org key carries its tenant (`<siteKey>@<32-hex>`, XERK-2551);
     // the label is the site alone. Mirrors board.js `orgName`.
-    val site = siteKey.replace(TENANT_SUFFIX, "")
+    val site = bareKey(siteKey)
     if (site.contains('/')) {
         val segs = site.split('/').filter { it.isNotEmpty() }
         return segs.lastOrNull() ?: site
@@ -781,6 +781,14 @@ fun orgName(siteKey: String, override: String = ""): String {
 }
 
 private val TENANT_SUFFIX = Regex("@[0-9a-f]{32}$")
+
+/**
+ * A host or org key with its tenant suffix dropped, for DISPLAY only — a port of
+ * board.js `bareKey` (XERK-2634). A tenant's keys are `<base>@<32 lowercase hex>`;
+ * exactly that suffix goes, any other `@tail` is part of the name. Routes, maps
+ * and actions keep the raw key.
+ */
+fun bareKey(key: String): String = key.replace(TENANT_SUFFIX, "")
 
 /**
  * Whether an org is opted in to auto-start, for the org-chip switch (XERK-41), a
@@ -844,7 +852,7 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
         val hk = a.key.ifBlank { a.device }
         if (hk.isNotBlank()) {
             hostOpts.getOrPut(j.siteKey) { LinkedHashMap() }[hk] =
-                HostOption(hk, a.device.ifBlank { hk }, a.online)
+                HostOption(hk, a.device.ifBlank { bareKey(hk) }, a.online)
         }
         a.models?.let { mb ->
             val set = modelAvail.getOrPut(j.siteKey) { LinkedHashSet() }

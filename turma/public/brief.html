@@ -199,6 +199,12 @@
 <script src="/meetings.js"></script>
 
 <script>
+// A host/org key for DISPLAY: board.js bareKey drops a tenant key's `@<32-hex>`
+// suffix (XERK-2634). Handlers, maps and URLs keep the raw key.
+function displayKey(k) {
+  const B = typeof TurmaBoard !== "undefined" ? TurmaBoard : null;
+  return B && B.bareKey ? B.bareKey(k) : String(k ?? "");
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -317,7 +323,7 @@ function statusHtml(site, head, latest, now) {
   }
   if (!head) return "";
   if (head.status === "running") {
-    const on = head.host ? ` on ${esc(head.host)}` : "";
+    const on = head.host ? ` on ${esc(displayKey(head.host))}` : "";
     return `<div class="brief-status running">Writing ${head.trigger === "manual" ? "a" : "the scheduled"} brief${on}… started ${esc(ago(head.startedAt, now))}</div>`;
   }
   if (head.status === "failed" && head !== latest) {
@@ -340,7 +346,7 @@ function briefOrgHtml(site, { list, schedule, live, name, now }) {
     if (isTime(latest.meetingAt)) meta.push(`For the ${esc(fmtWhen(latest.meetingAt))} meeting`);
     if (isTime(latest.generatedAt)) meta.push(`written ${esc(fmtWhen(latest.generatedAt))}`);
     if (latest.model) meta.push(esc(latest.model));
-    if (latest.host) meta.push(`on ${esc(latest.host)}`);
+    if (latest.host) meta.push(`on ${esc(displayKey(latest.host))}`);
     body = `<div class="brief-meta">${meta.map((m) => `<span class="bit">${m}</span>`).join(" · ")}</div>`
       + `<article class="brief-read">`
       + SECTIONS.filter(([k]) => latest[k]).map(([k, h]) => `<h3>${esc(h)}</h3><p>${esc(latest[k])}</p>`).join("")
@@ -364,7 +370,7 @@ function briefOrgHtml(site, { list, schedule, live, name, now }) {
     ? `<button type="button" class="sched-gear" data-sched-toggle="${esc(site)}" aria-expanded="${open}"`
       + ` aria-label="Schedule settings" title="Schedule: ${esc(scheduleSummary(schedule))}">${GEAR_SVG}</button>`
     : "";
-  return `<section class="brief-org"><div class="brief-head"><div class="brief-title"><h2 class="brief-name">${esc(name || site)}</h2>${gear}</div>${actions}</div>`
+  return `<section class="brief-org"><div class="brief-head"><div class="brief-title"><h2 class="brief-name">${esc(name || displayKey(site))}</h2>${gear}</div>${actions}</div>`
     + (live ? scheduleHtml(site, schedule) : "")
     + statusHtml(site, head, latest, now) + body + earlierHtml
     + `</section>`;

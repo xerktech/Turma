@@ -34,8 +34,11 @@ Rules every client (web, Android) must keep with the hub and with each other.
   within-tenant filter over what the hub already scoped. A ws-token must be fetched per socket.
 - **A host is LABELED by its device, ROUTED by its key** (XERK-2533, XERK-2639). A tenant host's
   registry key is `<device>@<32-hex tenantId>`; showing it leaks the tenant id and reads as noise.
-  - Text shows `a.device || a.key` (Android: `device.ifBlank { key }`); URLs, onclick args and
-    lookups keep `a.key`.
+  - Text shows `a.device || hostName(a.key)` (Android: `device.ifBlank { bareKey(key) }`); URLs,
+    onclick args, option values and lookups keep `a.key`.
   - Where only a key is at hand (a migration's `targetHost`, a pin's `host`, a run's `host`), web
-    labels it with `TurmaBoard.hostName(key)`, which strips the suffix. Tests: board.test.js
-    `hostName: …`, host-header.test.js `hostCard: a tenant host …`.
+    labels it with `TurmaBoard.hostName(key)` (alias `bareKey`; pages call it via `displayKey`),
+    which strips only an exact `@<32 lowercase hex>` tail. Tests: board.test.js `hostName: …`,
+    host-header.test.js `hostCard: a tenant host …`, sessions.test.js Move-to/Restore raw-key cases.
+  - An org's siteKey carries the same suffix (XERK-2634): its LABEL goes through `orgName`/`bareKey`
+    (poll notes, tooltips, policy toasts); routes and `data-site` keep the raw siteKey.
