@@ -114,19 +114,6 @@ function cleanText(s, max) {
   return s.replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "").trim().slice(0, max);
 }
 
-// A display name that spells another account's audit label (`oidc:<id>`)
-// would put that id on the wrong card in the admin panel (XERK-2631). A
-// browser's find-in-page folds width, case, marks and invisible characters, so
-// the name is tested in that folded form; one that matches is stored folded
-// with the colon dropped, so only the real id line on the right card matches.
-const FIND_IGNORED = /[\p{Default_Ignorable_Code_Point}\p{M}]/gu;
-function cleanDisplayName(s) {
-  const name = cleanText(s, DISPLAY_MAX);
-  const folded = name.normalize("NFKD").replace(FIND_IGNORED, "").normalize("NFKC").toLowerCase();
-  const LABEL = /oidc:(?=[0-9a-f]{32})/g;
-  return LABEL.test(folded) ? folded.replace(LABEL, "oidc ") : name;
-}
-
 const finiteMs = (n) => (Number.isSafeInteger(n) && n > 0 ? n : undefined);
 
 // One user record, field by field. Anything malformed drops the record (an id,
@@ -136,7 +123,7 @@ function coerceUser(id, u) {
   if (!ID_RE.test(u.tenantId) || u.tenantId === id) return null;
   if (u.source !== "local" && u.source !== "oidc") return null;
   const out = { id, tenantId: u.tenantId, source: u.source };
-  out.displayName = cleanDisplayName(u.displayName) || "user";
+  out.displayName = cleanText(u.displayName, DISPLAY_MAX) || "user";
   if (u.source === "local") {
     if (typeof u.username !== "string" || !USERNAME_RE.test(u.username)) return null;
     out.username = u.username;
@@ -307,7 +294,7 @@ function upsertOidcUser(state, { iss, sub, displayName, idpRoles, now = Date.now
   }
   const next = {
     ...existing,
-    displayName: cleanDisplayName(displayName) || existing.displayName,
+    displayName: cleanText(displayName, DISPLAY_MAX) || existing.displayName,
     idpRoles: roles,
   };
   const granted = effectiveRoles(state, next).length > 0;

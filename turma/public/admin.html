@@ -25,6 +25,7 @@
   }
   .ad-user { border-top: 1px solid var(--hairline); padding: 12px 0; min-width: 0; }
   .ad-user:first-child { border-top: 0; }
+  .ad-user:target { background: var(--accent-soft); }
   .ad-user-head { display: flex; align-items: baseline; gap: 6px 10px; flex-wrap: wrap; }
   .ad-name { font-weight: 600; font-size: 15px; min-width: 0; overflow-wrap: anywhere; }
   .ad-pill {
@@ -172,7 +173,7 @@ function userHtml(u) {
       ${u.source === "local" ? `<button class="btn-sm" data-act="password" data-id="${u.id}">Reset password</button>` : ""}
       <button class="btn-sm" data-act="toggle" data-id="${u.id}">${u.disabled ? "Enable" : "Disable"}</button>
       <button class="btn-sm kill-btn" data-act="delete" data-id="${u.id}">Delete…</button></div>`;
-  return `<div class="ad-user">
+  return `<div class="ad-user" id="user-${esc(u.id)}">
     <div class="ad-user-head"><span class="ad-name">${esc(u.name)}</span>
       <span class="ad-pill src">${u.source === "oidc" ? "SSO" : "local"}</span> ${roles} ${disabledPill}</div>
     <div class="ad-meta">${meta}</div>
@@ -205,11 +206,21 @@ function groupsHtml() {
       ${groups.isDefault && !groupDraft ? `<div class="ad-meta">These are the shipped defaults; saving makes them yours to edit.</div>` : ""}</div>`;
 }
 
+// An audit label for an SSO user leads with `oidc:<id>`, which only the hub
+// writes (the display name follows it). That id links to the user's own card,
+// matched by id rather than by text: a display name can be made to look like
+// any label, in a page search too (XERK-2631).
+function auditLabelHtml(label) {
+  const m = /^oidc:([0-9a-f]{32}) /.exec(label);
+  if (!m || !users || !users.some((u) => u.id === m[1])) return esc(label);
+  return `<a href="#user-${m[1]}">oidc:${m[1]}</a>${esc(label.slice(m[0].length - 1))}`;
+}
+
 function auditHtml() {
   if (!audit) return `<div class="ad-meta">Loading…</div>`;
   if (!audit.length) return `<div class="ad-meta">No admin actions yet.</div>`;
   return `<ul class="ad-audit">${audit.map((e) => `<li><span class="when">${esc(fmtWhen(e.at))}</span> ·
-    <b>${esc(e.actor)}</b> <span class="act">${esc(e.action)}</span>${e.target ? ` ${esc(e.target)}` : ""}
+    <b>${auditLabelHtml(e.actor)}</b> <span class="act">${esc(e.action)}</span>${e.target ? ` ${auditLabelHtml(e.target)}` : ""}
     ${e.detail ? `<div class="detail">${esc(e.detail)}</div>` : ""}</li>`).join("")}</ul>`;
 }
 
