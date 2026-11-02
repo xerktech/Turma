@@ -37,6 +37,15 @@ paths:
   `sanitizeDecision` is the one whitelist (`source` question|permission|note|meeting — a
   meeting decision is text + `label` = the meeting, XERK-2510; `question` ≤300,
   `answer` ≤200, `text` ≤500; inline literals; null-proto map; a coerce fixed point).
+- **Org count is capped PER TENANT** (XERK-2628, `decisionsRoomFor`): `DECISIONS_ORGS_MAX` (100)
+  orgs per tenant, `DECISIONS_ORGS_TOTAL` (300) hard total, which `decisionsCoerce` slices at — so
+  nothing accepted live is dropped on restore. A fleet-wide 100 slice let one tenant's orgs drop
+  another's log on restart.
+  - A full store evicts ONE undecided org at a time, oldest newest-entry first: the tenant's own
+    while its cap is full, else from the tenant holding the most orgs. Never a bulk wipe — that
+    deleted every other tenant's fresh log on one append (QA).
+  - Only decided orgs left → `appendDecision` returns null (note route 409). Unreachable at the
+    default `AGENTS_MAX` (64 hosts, so ≤64 decided orgs).
 - **No lone surrogate leaves the whitelist**: a cap through an emoji drops the stranded high half,
   any other becomes U+FFFD (`permissionWhy`'s clip too). The agent writes UTF-8, which cannot
   encode one; `_decision_cell` also replaces them, so one bad row never wedges the file.

@@ -60,7 +60,7 @@ ticket builds to this file; change it here first.
 
 - `/data/meeting-proposals.json` (`MEETING_PROPOSALS_FILE`), a `registerExternalStore`
   (HA-safe), siteKey → newest-first meetings, `MEETINGS_KEEP` (50) per org, `MEETINGS_ORGS_MAX`
-  (100) orgs, null-prototype map. `sanitizeMeeting` is the ONE whitelist (route, ingest, restore,
+  (100) orgs per tenant (`orgStoreFull`), null-prototype map. `sanitizeMeeting` is the ONE whitelist (route, ingest, restore,
   remote watch); field order fixed, so a live row is a coerce fixed point.
   - **Written with no debounce** (`debounceMs: 0`): a 200 promises Tenir the meeting is kept.
 - Row: `{meetingId, status:"queued"|"running"|"ok"|"failed", title, platform, startedAt, endedAt,

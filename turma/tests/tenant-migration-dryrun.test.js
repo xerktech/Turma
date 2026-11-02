@@ -17,7 +17,7 @@ process.env.TURMA_MIGRATE_OWNER = "local:nobody2554";
 process.env.TURMA_MIGRATE_DRY_RUN = "1";
 process.env.ARCHIVE_TENANT_MAX_BYTES = "10";   // any moved archive is over it
 for (const k of ["STATE_FILE", "DEVICES_FILE", "AGENT_IDENTITIES_FILE", "TENANT_MIGRATION_FILE", "TENANCY_FILE",
-  "AUTOSTART_ORGS_FILE", "USAGE_LEDGER_FILE", "PERMISSION_LEDGER_FILE", "OUTCOME_LEDGER_FILE", "MODEL_POLICY_FILE"]) {
+  "AUTOSTART_ORGS_FILE", "REPO_TIERS_FILE", "USAGE_LEDGER_FILE", "PERMISSION_LEDGER_FILE", "OUTCOME_LEDGER_FILE", "MODEL_POLICY_FILE"]) {
   process.env[k] = path.join(DIR, `${k.toLowerCase()}.json`);
 }
 process.env.MIGRATE_SPOOL_DIR = path.join(DIR, "spool");
@@ -52,4 +52,16 @@ test("XERK-2554: a dry run moves nothing, creates no owner and closes no route",
   assert.ok(!hub.devicesState().find((d) => d.token === "fcm-dry").tenantId);
   assert.equal(hub.tenantMigrationMarker().tenantId, undefined);
   assert.equal(hub.tenantMigrationGateClosed(), false);
+});
+
+test("XERK-2620: a dry run never runs a completed migration's late steps", async () => {
+  const T = "a".repeat(32);
+  hub.tenancyState().users.dry2620 = { id: "dry2620", tenantId: T };   // a live owner
+  Object.assign(hub.tenantMigrationMarker(), { tenantId: T, completedAt: 1, steps: {} });
+  hub.setRepoTier("dry2620", "ignore");
+  hub.tenantMigrationTick();
+  assert.ok(!Object.prototype.hasOwnProperty.call(hub.repoTiers, `dry2620@${T}`));
+  await hub.runTenantLateSteps();
+  assert.ok(!Object.prototype.hasOwnProperty.call(hub.repoTiers, `dry2620@${T}`));
+  assert.equal(hub.tenantMigrationMarker().steps.repoTiers, undefined, "not recorded, so a real run still does it");
 });

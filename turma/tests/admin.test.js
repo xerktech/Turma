@@ -29,6 +29,7 @@ for (const [k, n] of [
   ["ADMIN_AUDIT_FILE", "admin-audit"], ["NAME_TOKEN_GENS_FILE", "name-token-gens"],
   ["MEETING_TOKENS_FILE", "meeting-tokens"], ["MODEL_POLICY_FILE", "model-policy"],
   ["PERMISSION_LEDGER_FILE", "permission-ledger"], ["OUTCOME_LEDGER_FILE", "outcome-ledger"],
+  ["ARCHIVE_PURGED_TENANTS_FILE", "archive-purged-tenants"],
 ]) process.env[k] = tmp(n);
 process.env.MIGRATE_SPOOL_DIR = mkdtemp("turma-admin-migrations-");
 process.env.ARCHIVE_DIR = mkdtemp("turma-admin-archive-");

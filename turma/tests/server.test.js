@@ -10410,6 +10410,37 @@ test("XERK-487: a repo retiered to ignore while its ticket waits drops from the 
   assert.equal((agents.rtLate.commands || []).length, 0);
 });
 
+test("XERK-2620: tenant repo tiers are keyed by tenant and dropped by the tenant purge", () => {
+  resetRepoTiers();
+  const t = "c".repeat(32);
+  setRepoTier("Hub", "ignore", t);
+  setRepoTier("Hub", "live");
+  assert.equal(repoTiers[`Hub@${t}`], "ignore");
+  assert.equal(isRepoIgnored("Hub", `site.example@${t}`), true);
+  assert.equal(repoTier("Hub", "site.example"), "live");
+  hub.purgeTenantData(t);
+  assert.equal(`Hub@${t}` in repoTiers, false);
+  assert.equal(repoTiers.Hub, "live", "the operators' tier survives another tenant's purge");
+  resetRepoTiers();
+});
+
+test("XERK-2620: a scoper that renames keys at equal size still marks the payload changed", () => {
+  const routeScope = require("../tenant-scope.js");
+  const t = "d".repeat(32);
+  const view = { mayHost: () => true, maySite: () => true, repos: new Set(), fleetRepos: new Set(),
+    seesUntenanted: false, repoTenant: t };
+  const { out, changed } = routeScope.scopePayload({ repoTiers: { [`Hub@${t}`]: "ignore" } }, view);
+  assert.equal(changed, true, "else the raw tenant key is served from the unscoped bytes");
+  assert.deepEqual({ ...out.repoTiers }, { Hub: "ignore" });
+  // Another tenant's and the operators' views get none of it; no view gets none (null).
+  for (const repoTenant of ["e".repeat(32), "", null]) {
+    assert.deepEqual({ ...routeScope.scopePayload({ repoTiers: { [`Hub@${t}`]: "ignore" } },
+      { ...view, repoTenant }).out.repoTiers }, {});
+  }
+  assert.deepEqual({ ...routeScope.scopePayload({ repoTiers: { Hub: "live" } }, { ...view, repoTenant: "" }).out.repoTiers },
+    { Hub: "live" });
+});
+
 test("XERK-487: POST /api/repos/<repo>/tier pins a tier, rides the payload, resets on auto", async () => {
   resetRepoTiers();
   await asBeat("rtApi", "rt3.atlassian.net", { autoStart: false, repos: ["Hub"] });
@@ -29958,8 +29989,12 @@ test("XERK-2551: an alert reaches only its host's tenant's devices", async () =>
     notifications.length = 0;
     hub.notify("x", "y", { route: { host: ka } });
     assert.deepEqual(notifications[0].tokens, ["dev2551a"]);
-    // A phone re-registering under another login moves to that tenant.
-    hub.registerDevice("dev2551a", "android", ["dismiss"], T.B.t);
+    // A phone re-registering under another login moves to that tenant once its
+    // old binding is released (sign-out), never by the re-register alone (XERK-2622).
+    assert.equal(hub.registerDevice("dev2551a", "android", ["dismiss"], T.B.t), false);
+    assert.ok(toks(ka).includes("dev2551a"));
+    hub.unregisterDevice("dev2551a", T.A.t);
+    assert.equal(hub.registerDevice("dev2551a", "android", ["dismiss"], T.B.t), true);
     assert.ok(!toks(ka).includes("dev2551a"));
     // The route records the caller's tenant.
     await request("POST", "/api/devices", { headers: { ...T.A.h, "content-type": "application/json" },
@@ -29967,6 +30002,35 @@ test("XERK-2551: an alert reaches only its host's tenant's devices", async () =>
     assert.ok(toks(ka).includes("dev2551c"));
   } finally {
     for (const t of ["dev2551a", "dev2551b", "dev2551c"]) hub.unregisterDevice(t);
+    T.restore();
+  }
+});
+
+test("XERK-2622: another tenant holding a device's token can neither move nor unregister it", async () => {
+  const T = tenants2533();
+  const json = (h) => ({ ...h, "content-type": "application/json" });
+  const toks = (t) => hub.listDevices().filter((d) => (d.tenantId || "") === t).map((d) => d.token);
+  try {
+    assert.equal((await request("POST", "/api/devices", { headers: json(T.B.h), body: { token: "dev2622b" } })).status, 200);
+    // A re-posts B's token: refused, B keeps it.
+    const mv = await request("POST", "/api/devices", { headers: json(T.A.h), body: { token: "dev2622b" } });
+    assert.equal(mv.status, 409, mv.raw);
+    assert.ok(toks(T.B.t).includes("dev2622b") && !toks(T.A.t).includes("dev2622b"));
+    // A's delete of B's token is answered like any other and changes nothing.
+    assert.equal((await request("DELETE", "/api/devices?token=dev2622b", { headers: T.A.h })).status, 200);
+    assert.ok(toks(T.B.t).includes("dev2622b"));
+    // B's own re-register refreshes it; B's own delete releases it, and then A may take it.
+    assert.equal((await request("POST", "/api/devices", { headers: json(T.B.h), body: { token: "dev2622b" } })).status, 200);
+    assert.equal((await request("DELETE", "/api/devices?token=dev2622b", { headers: T.B.h })).status, 200);
+    assert.ok(!hub.listDevices().some((d) => d.token === "dev2622b"));
+    assert.equal((await request("POST", "/api/devices", { headers: json(T.A.h), body: { token: "dev2622b" } })).status, 200);
+    assert.ok(toks(T.A.t).includes("dev2622b"));
+    // An operator principal cannot take or drop a tenant's device either.
+    assert.equal((await request("POST", "/api/devices", { headers: json(userHeaders), body: { token: "dev2622b" } })).status, 409);
+    await request("DELETE", "/api/devices?token=dev2622b", { headers: userHeaders });
+    assert.ok(toks(T.A.t).includes("dev2622b"));
+  } finally {
+    hub.unregisterDevice("dev2622b");
     T.restore();
   }
 });

@@ -1475,9 +1475,18 @@ function trimByTenant(map, max, tenantOf, age, keep) {
   }
   return evicted;
 }
+// `site` minus EVERY trailing `@<32hex>` tenant suffix (XERK-2629): one strip
+// left `site@<B>@<B>` from an untenanted host as `site@<B>` — tenant B's org.
+// A tail walk, never a `(?:@hex{32})+$` regex: that retries from every `@` and
+// is quadratic on an agent-sent siteKey (a 528 KB one held the loop 14 s).
+function stripSiteTenantSuffixes(site) {
+  let end = site.length;
+  while (end >= 33 && site.charCodeAt(end - 33) === 64 && TENANT_ID_RE.test(site.slice(end - 32, end))) end -= 33;
+  return end === site.length ? site : site.slice(0, end);
+}
 function scopeSite(site, tenantId) {
   if (typeof site !== "string" || !site) return site;
-  const base = baseOfKey(site);
+  const base = stripSiteTenantSuffixes(site);
   return tenantId ? `${base}@${tenantId}` : base;
 }
 // Payload keys whose objects are session CONTENT (transcripts, logs, ticket
@@ -1662,8 +1671,8 @@ const lowerName = (n) => String(n).toLowerCase();
 function uidHostRefusal(uid, host, now = Date.now()) {
   const e = identityOf(uid);
   if (!e) {
-    return "this agent identity is not registered on this hub — re-provision the host with " +
-      "its own token (node turma/server.js --agent-token <host>)";
+    return "this agent identity is not registered on this hub — re-provision the host with a " +
+      "fresh enrollment code from the dashboard's Add host (turma-agentctl enroll --code <code>)";
   }
   if (!hostKeyUsable(host)) return `${host} is not a usable host name`;
   // The tenant is the IDENTITY's, never the name's (XERK-2533): an agent bound
@@ -1679,7 +1688,7 @@ function uidHostRefusal(uid, host, now = Date.now()) {
   if (e.home === host) {
     return e.released && rec && !rec.agentUid
       ? `${host} was removed and re-registered by another agent — re-provision this host ` +
-        "with its own token (node turma/server.js --agent-token <host>)"
+        "with a fresh enrollment code from the dashboard's Add host (turma-agentctl enroll --code <code>)"
       : null;
   }
   if (rec && !rec.agentUid) return `${host} is registered to another agent — remove it from the dashboard to release the name`;
@@ -3171,8 +3180,14 @@ const persistDevices = registerExternalStore({
 });
 // Each device belongs to the tenant of the principal that registered it
 // (XERK-2551, `tenantId`; absent = the operators'), and is sent only alerts about
-// that tenant's hosts (notify/dismiss). A phone signing in as someone else
-// re-registers the same token, which moves it.
+// that tenant's hosts (notify/dismiss).
+// A token bound to one tenant is never re-bound or released by another
+// (XERK-2622): whoever learned a victim's FCM token could otherwise pull the
+// victim's phone out of its tenant or unregister it. A phone that changes login
+// gets its new tenant by RELEASING the old binding (sign-out unregisters), or,
+// when that release was lost, by rotating its FCM token on the 409 this returns
+// — a fresh token has no binding, and the dead one is pruned on the next send.
+const deviceTenant = (d) => ((d && typeof d.tenantId === "string") ? d.tenantId : "");
 function registerDevice(token, platform, features, tenantId = "") {
   const now = Date.now();
   // What this app build can do (XERK-154). Only a build that declares "dismiss"
@@ -3182,9 +3197,9 @@ function registerDevice(token, platform, features, tenantId = "") {
   const caps = Array.isArray(features) ? features.filter((f) => typeof f === "string") : null;
   const existing = devices.find((d) => d.token === token);
   if (existing) {
+    if (deviceTenant(existing) !== (tenantId || "")) return false;
     existing.platform = platform || existing.platform;
     if (caps) existing.features = caps;
-    if (tenantId) existing.tenantId = tenantId; else delete existing.tenantId;
     existing.seenAt = now;
   } else {
     const d = { token, platform: platform || "android", features: caps || [], addedAt: now, seenAt: now };
@@ -3192,10 +3207,15 @@ function registerDevice(token, platform, features, tenantId = "") {
     devices.push(d);
   }
   persistDevices();
+  return true;
 }
-function unregisterDevice(token) {
+// `tenantId` given (the DELETE route) = only a device of that tenant ("" = the
+// operators') is removed: a caller holding another tenant's FCM token must not
+// silence that tenant's phone (XERK-2557, XERK-2622). Omitted = internal, any tenant.
+function unregisterDevice(token, tenantId) {
   const before = devices.length;
-  devices = devices.filter((d) => d.token !== token);
+  devices = devices.filter((d) => d.token !== token
+    || (tenantId !== undefined && deviceTenant(d) !== tenantId));
   if (devices.length !== before) persistDevices();
 }
 function pruneDevices(deadTokens) {
@@ -3212,7 +3232,7 @@ function listDevices() {
 // for an untenanted host (and a fleet-wide alert, host "").
 function devicesForHost(host) {
   const t = tenantOfKey(host || "");
-  return devices.filter((d) => ((d && typeof d.tenantId === "string") ? d.tenantId : "") === t);
+  return devices.filter((d) => deviceTenant(d) === t);
 }
 
 // ---- ticket -> agent pins (XERK-38) ----------------------------------------
@@ -4596,7 +4616,9 @@ function sanitizeDecision(v) {
 const decisionsCoerce = (raw) => {
   const out = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const [site, list] of Object.entries(raw).slice(0, 100)) {
+    // 300 = DECISIONS_ORGS_TOTAL (module-init TDZ): the hard total appendDecision
+    // never passes, so nothing accepted live is dropped on restore (XERK-2628).
+    for (const [site, list] of Object.entries(raw).slice(0, 300)) {
       if (!site || site.length > 200 || !Array.isArray(list)) continue;
       const kept = list.map(sanitizeDecision).filter(Boolean).slice(-200);
       if (kept.length) out[site] = kept;
@@ -4621,7 +4643,11 @@ const DAILY_BRIEF_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 // The zone's name as Intl spells it ("utc" -> "UTC"), or "" for anything Intl
 // rejects or an offset zone ("+05:30" — it has no DST rules, and the operator is
 // asked for a named zone). Intl's spelling so a coerced value is a fixed point.
-const DAILY_BRIEF_ORGS_MAX = 100; // dailyBriefSchedulesCoerce inlines the same 100 (module-init TDZ)
+// Orgs PER TENANT (XERK-2626, orgStoreFull); the store holds at most
+// ORG_STORE_TOTAL_FACTOR x this, the hard total dailyBriefSchedulesCoerce inlines
+// as 300 (module-init TDZ).
+const DAILY_BRIEF_ORGS_MAX = 100;
+const ORG_STORE_TOTAL_FACTOR = 3; // shared with meetings (orgStoreFull)
 const DAILY_BRIEF_SITE_MAX = 200; // ...and the same 200
 function canonicalTimeZone(tz) {
   if (typeof tz !== "string" || !/^[A-Za-z]/.test(tz) || tz.length > 64) return "";
@@ -4667,7 +4693,7 @@ function sanitizeDailyBriefSchedule(v) {
 const dailyBriefSchedulesCoerce = (raw) => {
   const out = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const [site, s] of Object.entries(raw).slice(0, 100)) {
+    for (const [site, s] of Object.entries(raw).slice(0, 300)) {
       if (!site || site.length > 200) continue;
       const v = sanitizeDailyBriefSchedule(s);
       if (v) out[site] = v;
@@ -4934,7 +4960,7 @@ function sanitizeDailyBrief(v) {
 const dailyBriefsCoerce = (raw) => {
   const out = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const [site, list] of Object.entries(raw).slice(0, DAILY_BRIEF_ORGS_MAX)) {
+    for (const [site, list] of Object.entries(raw).slice(0, DAILY_BRIEF_ORGS_MAX * ORG_STORE_TOTAL_FACTOR)) {
       if (!site || site.length > DAILY_BRIEF_SITE_MAX || !Array.isArray(list)) continue;
       const kept = keepDailyBriefs(list.slice(0, 1000).map(sanitizeDailyBrief).filter(Boolean));
       if (kept.length) out[site] = kept;
@@ -5007,7 +5033,7 @@ function putDailyBrief(siteKey, row) {
 // restore, remote watch), its field order fixed so a live row is a coerce fixed
 // point. Contract: .claude/rules/contract-meetings.md.
 const MEETINGS_KEEP = 50;
-const MEETINGS_ORGS_MAX = 100;
+const MEETINGS_ORGS_MAX = 100; // per tenant (XERK-2626, orgStoreFull)
 const MEETINGS_SITE_MAX = 200;
 const MEETING_SEGMENTS_MAX = 10000;
 const MEETING_ITEMS_MAX = 30;
@@ -5214,7 +5240,7 @@ function keepMeetings(list) {
 const meetingsCoerce = (raw) => {
   const out = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const [site, list] of Object.entries(raw).slice(0, MEETINGS_ORGS_MAX)) {
+    for (const [site, list] of Object.entries(raw).slice(0, MEETINGS_ORGS_MAX * ORG_STORE_TOTAL_FACTOR)) {
       if (!site || site.length > MEETINGS_SITE_MAX || !Array.isArray(list)) continue;
       const kept = keepMeetings(list.slice(0, 1000).map(sanitizeMeeting).filter(Boolean));
       if (kept.length) out[site] = kept;
@@ -5726,7 +5752,7 @@ function epicRunDriveSweep() {
       // auto-runs. Skipped silently (re-checked next sweep) rather than queued as
       // a blocked entry that would churn a terminal "gave up" note.
       const repo = ticketRepo(siteKey, childKey, rows);
-      if (!repo || isRepoIgnored(repo)) continue;
+      if (!repo || isRepoIgnored(repo, siteKey)) continue;
       // XERK-1568: a rollup ticket is a findings list, never work — even when an
       // armed epic lists it as a child. Skipped silently like an ignore-tier repo.
       if (isRollupTicket(row)) continue;
@@ -5857,7 +5883,9 @@ const repoTiersCoerce = (raw) => {
   const o = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     for (const [k, v] of Object.entries(raw)) {
-      if (k && k.length <= REPO_NAME_MAX && isRepoTier(v) && v !== DEFAULT_REPO_TIER) o[k] = v;
+      // A tenant's key is `<repo>@<tenantId>` (XERK-2620): the bound is the name's.
+      const base = baseOfKey(k);
+      if (base && base.length <= REPO_NAME_MAX && isRepoTier(v) && v !== DEFAULT_REPO_TIER) o[k] = v;
     }
   }
   return o;
@@ -5903,33 +5931,48 @@ const persistRepoTiers = registerExternalStore({
 // `repoGuess`/`ticketRepo` yields, so a ticket's triaged repo joins cleanly.
 // An unset or blank repo is the default middle tier — the "can't tell" answer,
 // never top — so every caller gets a usable rank without a null check.
-function repoTier(repo) {
-  return (repo && repoTiers[repo]) || DEFAULT_REPO_TIER;
+//
+// A repo NAME carries no tenant, so the store key does (XERK-2620), like an org
+// key (XERK-2551): `<repo>@<tenantId>` for a tenant's repo, the bare name for
+// the operators' (untenanted) one — so two tenants with a same-named repo never
+// share a tier. Readers pass the ORG the ticket belongs to (`siteKey`, which
+// carries the tenant) or a tenant id; clients see their own tenant's keys
+// unscoped (tenant-scope.js `repoTiers`).
+function repoTierKey(repo, tenantId) {
+  return tenantId ? `${repo}@${tenantId}` : repo;
 }
-function repoTierRank(repo) {
-  return REPO_TIER_RANK[repoTier(repo)];
+// `scope` is a scoped siteKey (its tenant is read off it) or "" / absent.
+function repoTier(repo, scope) {
+  return (repo && repoTiers[repoTierKey(repo, tenantOfSite(scope || ""))]) || DEFAULT_REPO_TIER;
+}
+function repoTierRank(repo, scope) {
+  return REPO_TIER_RANK[repoTier(repo, scope)];
 }
 // The one policy the tier store owns outright (XERK-487): an ignore-tier repo is
 // never auto-started. [F]'s allow/deny reads the rank for finer thresholds.
-function isRepoIgnored(repo) {
-  return repoTier(repo) === "ignore";
+function isRepoIgnored(repo, scope) {
+  return repoTier(repo, scope) === "ignore";
 }
-// Set (or, with tier === DEFAULT_REPO_TIER, clear) a repo's tier. The caller has
-// already validated the name and the tier value; this owns the map bookkeeping,
-// mirroring setAutoStartOrg/setOrgColor — durable save, cache bust, SSE frame.
-function setRepoTier(repo, tier) {
-  if (tier && tier !== DEFAULT_REPO_TIER) repoTiers[repo] = tier;
-  else delete repoTiers[repo];
+// Set (or, with tier === DEFAULT_REPO_TIER, clear) a repo's tier in tenant
+// `tenantId` ("" = untenanted). The caller has already validated the name and
+// the tier value; this owns the map bookkeeping, mirroring
+// setAutoStartOrg/setOrgColor — durable save, cache bust, SSE frame.
+function setRepoTier(repo, tier, tenantId = "") {
+  const k = repoTierKey(repo, tenantId);
+  if (tier && tier !== DEFAULT_REPO_TIER) repoTiers[k] = tier;
+  else delete repoTiers[k];
   persistRepoTiers();
   invalidateAgentsCache();
   sseBroadcast("repoTiers", repoTiers);
 }
-// The repo names the fleet actually reports (agents[].repos[].name), so a tier
-// can't be pinned onto a phantom repo — the same "no inventing state the fleet
-// doesn't back" guard the /autostart and /color routes apply to a siteKey.
-function fleetRepoNames() {
+// The repo names tenant `tenantId`'s hosts report (agents[].repos[].name; ""
+// = the untenanted hosts), so a tier can't be pinned onto a phantom repo — the
+// same "no inventing state the fleet doesn't back" guard the /autostart and
+// /color routes apply to a siteKey — nor onto another tenant's.
+function fleetRepoNames(tenantId = "") {
   const names = new Set();
-  for (const a of Object.values(agents)) {
+  for (const [key, a] of Object.entries(agents)) {
+    if (tenantOfKey(key) !== tenantId) continue;
     for (const r of (a && a.repos) || []) if (r && r.name) names.add(r.name);
   }
   return names;
@@ -7681,6 +7724,12 @@ registerTenantPurge("meetingTokens", (t) => {
   persistMeetingTokens();
   return 1;
 });
+// Repo tiers carry their tenant on the key (`<repo>@<t>`, XERK-2620).
+registerTenantPurge("repoTiers", (t) => {
+  const n = dropTenantKeys(repoTiers, t, (k) => k);
+  if (n) { persistRepoTiers(); sseBroadcast("repoTiers", repoTiers); }
+  return n;
+});
 registerTenantPurge("devices", (t) => {
   const before = devices.length;
   devices = devices.filter((d) => !(d && d.tenantId === t));
@@ -7975,6 +8024,40 @@ registerTenantMigration({
     return n;
   },
 });
+// Repo tiers (XERK-2620): an untenanted `<repo>` key becomes `<repo>@<t>`. Only on
+// the first run: a plain tier set afterwards is an operator's, for its own hosts.
+// A hub that completed the migration before this step existed held ONE fleet-wide
+// map its owner and operators both read, so `late` COPIES each plain tier to the
+// owner (where it has none): both keep exactly the tiers they had; only other
+// tenants stop inheriting them.
+registerTenantMigration({
+  name: "repoTiers",
+  late: (t) => {
+    let n = 0;
+    for (const k of Object.keys(repoTiers)) {
+      const nk = repoTierKey(k, t);
+      if (tenantOfKey(k) || Object.hasOwn(repoTiers, nk)) continue;
+      repoTiers[nk] = repoTiers[k];
+      n++;
+    }
+    if (n) { persistRepoTiers(); invalidateAgentsCache(); sseBroadcast("repoTiers", repoTiers); }
+    return n;
+  },
+  count: (t, scope) => (scope ? 0 : Object.keys(repoTiers).filter((k) => !tenantOfKey(k)).length),
+  apply: (t, scope) => {
+    if (scope) return 0;
+    let n = 0;
+    for (const k of Object.keys(repoTiers)) {
+      if (tenantOfKey(k)) continue;
+      const nk = repoTierKey(k, t);
+      if (!Object.hasOwn(repoTiers, nk)) repoTiers[nk] = repoTiers[k];
+      delete repoTiers[k];
+      n++;
+    }
+    if (n) { persistRepoTiers(); invalidateAgentsCache(); sseBroadcast("repoTiers", repoTiers); }
+    return n;
+  },
+});
 // The ledgers: a row's tenant is its host key (XERK-2550), so each host's rows
 // move under `<device>@<tenant>` — the binding alone never carries them.
 registerTenantMigration({
@@ -8169,7 +8252,26 @@ function tenantMigrationOnBind(fromKey, toKey) {
 // Leader tick: run/resume an incomplete migration, else sweep leftovers for
 // TURMA_MIGRATE_SETTLE_MS after completion.
 let tenantMigrationDryRunLogged = false;
+let tenantLateStepsRunning = null;
+function runTenantLateSteps() {
+  // A dry run changes nothing (docs/multi-tenant-adr.md), and an owner deleted
+  // since the run must not get data back into its purged tenant.
+  if (MIGRATE_DRY_RUN) return null;
+  const t = migratedTenant();
+  if (!t || !Object.values(tenancyState.users).some((u) => u && u.tenantId === t)) return null;
+  const pending = tenantMigrationSteps.some((s) => typeof s.late === "function" && !tenantMigrationMarker.steps[s.name]);
+  if (!pending || tenantLateStepsRunning) return tenantLateStepsRunning;
+  tenantLateStepsRunning = tenantMigration.runLateSteps({
+    steps: tenantMigrationSteps, marker: tenantMigrationMarker,
+    save: async (m) => { await flushMigratedStores(); tenantMigrationMarker = m; await persistTenantMigration(); },
+  }).catch((e) => console.error(`tenant migration: late steps failed: ${(e && e.message) || e}`))
+    .finally(() => { tenantLateStepsRunning = null; });
+  return tenantLateStepsRunning;
+}
 function tenantMigrationTick(now = Date.now()) {
+  // A step added after this hub completed its migration (XERK-2620) runs once,
+  // whether or not TURMA_MIGRATE_OWNER is still set.
+  if (tenantMigrationMarker.completedAt) runTenantLateSteps();
   if (!MIGRATE_OWNER) return;
   if (!tenantMigrationMarker.completedAt) {
     // A dry run counts and logs once; it never moves anything.
@@ -12156,7 +12258,7 @@ function tenantViewFor(p) {
     }
   }
   return { mayHost, maySite: (site) => principalMaySite(p, site), repos, fleetRepos,
-    seesUntenanted: mayHost("") };
+    seesUntenanted: mayHost(""), repoTenant: ledgerTenantOf(p) };
 }
 // A stable name for the set of hosts a principal reaches, for memoizing a scoped
 // payload per view (tenant users of one tenant, and the operators, share one).
@@ -18075,7 +18177,7 @@ function drainTicketQueue() {
     // The sweep won't re-queue an ignore-tier repo, so drop it with no churn —
     // exactly like a ticket that lost its triaged repo above. A MANUAL entry is
     // left alone: a hand-started ticket is deliberate intent, not tier-gated.
-    if (e.source === "auto" && isRepoIgnored(repo)) {
+    if (e.source === "auto" && isRepoIgnored(repo, e.siteKey)) {
       drop("its repo is now ignore-tier");
       continue;
     }
@@ -18404,7 +18506,7 @@ function duplicateTwinOpen(siteKey, twinKey, rows) {
 // An absent or unparseable `created` sorts LAST (Infinity) — both comparators
 // test `!==` before subtracting, so two Infinities stay equal and keep board
 // order. `Date.parse` reads Jira's `+0000` and ADO's `Z` alike.
-function triageSortKey(t, repo) {
+function triageSortKey(t, repo, siteKey) {
   const tr = t && typeof t === "object" && t.triage && typeof t.triage === "object"
     ? t.triage : null;
   const created = t && typeof t.created === "string" ? Date.parse(t.created) : NaN;
@@ -18413,7 +18515,7 @@ function triageSortKey(t, repo) {
     Number.isFinite(created) ? created : Infinity,
     tr && TRIAGE_TYPE_WEIGHT[tr.type] !== undefined
       ? TRIAGE_TYPE_WEIGHT[tr.type] : NO_TYPE_WEIGHT,
-    -repoTierRank(repo),
+    -repoTierRank(repo, siteKey),
   ];
 }
 
@@ -18474,7 +18576,7 @@ function ticketQueueOrder(rows) {
   for (const e of ticketQueue) {
     const hit = rows.get(ticketQueueKey(e.siteKey, e.issueKey));
     const row = hit ? hit.row : null;
-    const key = triageSortKey(row, ticketRepo(e.siteKey, e.issueKey, rows));
+    const key = triageSortKey(row, ticketRepo(e.siteKey, e.issueKey, rows), e.siteKey);
     let line = lines.get(e.siteKey);
     if (!line) lines.set(e.siteKey, (line = []));
     line.push({ e, key });
@@ -18514,10 +18616,10 @@ function autoStartCandidates(siteKey, rows) {
   return ticketRowsForSite(rows, siteKey)
     .map((r) => {
       const repo = r.row ? ticketRepo(siteKey, r.row.key, rows) : null;
-      return { t: r.row, repo, key: triageSortKey(r.row, repo) };
+      return { t: r.row, repo, key: triageSortKey(r.row, repo, siteKey) };
     })
     .filter((c) => c.t && c.t.key && c.t.statusCategory === "todo"
-      && c.repo && !isRepoIgnored(c.repo) && !isEpicOrEpicChild(c.t))
+      && c.repo && !isRepoIgnored(c.repo, siteKey) && !isEpicOrEpicChild(c.t))
     .sort((a, b) => {
       for (let i = 0; i < a.key.length; i++) {
         if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
@@ -18970,7 +19072,7 @@ function markResumedTicketAutoStopExempt(host, sessionId) {
 // `autoStartSweep` keeps its own inline gates (their per-drop log lines differ);
 // a cross-check test pins that this composition agrees with that one.
 function autoStartContentGate(siteKey, t, repo, rows) {
-  if (!repo || isRepoIgnored(repo)) return { kind: "repo", reason: "no eligible repo" };
+  if (!repo || isRepoIgnored(repo, siteKey)) return { kind: "repo", reason: "no eligible repo" };
   if (!t || !t.key) return { kind: "repo", reason: "no ticket row" };
   // XERK-635: an epic or an epic child is never eligible for the org auto stream —
   // the epic run drives its children in dependency order. Kept in lock-step with
@@ -19802,6 +19904,43 @@ function epicRunCompleteSweep() {
 // its newest entry (a host that went quiet or is being re-bound gets it back).
 const DECISIONS_RETAIN_MS = 30 * 24 * 3600 * 1000;
 
+// Is an org-keyed store (briefs, schedules, meetings) too full to take a NEW
+// org `siteKey`? The per-org-count cap `max` is judged within siteKey's TENANT
+// (XERK-2626): one fleet-wide count let a tenant whose hosts are decided into
+// `max` orgs refuse every other tenant's first org, and the decided-org prune
+// never freed those slots. ORG_STORE_TOTAL_FACTOR x `max` is the hard total the
+// store never passes (memory; the coerces slice at it). Accepted: that many
+// tenants each holding `max` decided orgs together fill it. Answers "tenant"
+// (checked FIRST), "hub" or "".
+function orgStoreFull(store, siteKey, max) {
+  const keys = Object.keys(store);
+  const t = tenantOfSite(siteKey);
+  if (keys.filter((k) => tenantOfSite(k) === t).length >= max) return "tenant";
+  return keys.length >= max * ORG_STORE_TOTAL_FACTOR ? "hub" : "";
+}
+// Make room in `store` for a NEW org `siteKey`, deleting orgs `forget(k)`
+// approves: the caller's own tenant's while ITS cap is what is full, and only
+// once that cap has room, any tenant's for the hard total. So a refusal of the
+// caller's own tenant never deletes another tenant's orgs. Answers
+// {full, pruned}; a non-empty `full` is a refusal, and a caller that refuses
+// after a prune must still persist the store.
+function makeRoomForOrg(store, siteKey, max, forget) {
+  const t = tenantOfSite(siteKey);
+  let full = orgStoreFull(store, siteKey, max);
+  let pruned = false;
+  for (const scope of ["tenant", "hub"]) {
+    if (full !== scope) continue;
+    for (const k of Object.keys(store)) {
+      if ((scope === "hub" || tenantOfSite(k) === t) && forget(k)) {
+        delete store[k];
+        pruned = true;
+      }
+    }
+    full = orgStoreFull(store, siteKey, max);
+  }
+  return { full, pruned };
+}
+
 // Every org some host is DECIDED into — the org boundary every other org surface
 // keys on, never a claimed jira.siteKey.
 function decidedOrgs() {
@@ -19818,6 +19957,51 @@ const DECISIONS_KEEP = 200;        // decisionsCoerce inlines the same 200 (modu
 const DECISIONS_WIRE_TAIL = 20;    // per org on /api/agents + the SSE frame
 const DECISIONS_REPLY_TAIL = 30;   // per heartbeat reply, rendered agent-side
 const DECISION_NOTE_MAX = 500;
+// Orgs with a log PER TENANT, and the store's hard total (decisionsCoerce inlines
+// the 300). Per tenant (XERK-2628): one fleet-wide count let one tenant's orgs
+// crowd every other tenant's log out of the coerce on restart / HA restore.
+const DECISIONS_ORGS_MAX = 100;
+const DECISIONS_ORGS_TOTAL = 300;
+
+// Can the store take a NEW org `siteKey`? A full store (its tenant's cap, else
+// the hard total) evicts as LITTLE as it can: one org at a time, only an org no
+// host is decided into, the one whose newest entry is oldest (so a log already
+// past DECISIONS_RETAIN_MS goes before a fresh one). While the tenant's cap is
+// what is full the victim is the tenant's own, so a tenant's appends never
+// delete another tenant's log; only the hard total takes from the tenant holding
+// the most orgs (XERK-2621's rule). Answers {ok, pruned}.
+function decisionsRoomFor(siteKey) {
+  const t = tenantOfSite(siteKey);
+  const newest = (k) => { const l = decisions[k]; return (l && l.length && l[l.length - 1].at) || 0; };
+  let orgs = null;
+  let pruned = false;
+  for (;;) {
+    const keys = Object.keys(decisions);
+    const counts = new Map();
+    for (const k of keys) counts.set(tenantOfSite(k), (counts.get(tenantOfSite(k)) || 0) + 1);
+    let scope = "";
+    if ((counts.get(t) || 0) >= DECISIONS_ORGS_MAX) scope = "tenant";
+    else if (keys.length >= DECISIONS_ORGS_TOTAL) scope = "hub";
+    if (!scope) return { ok: true, pruned };
+    orgs = orgs || decidedOrgs();
+    let victim = null;
+    for (const k of keys) {
+      if (orgs.has(k) || k === siteKey) continue;
+      const kt = tenantOfSite(k);
+      if (scope === "tenant" && kt !== t) continue;
+      if (victim === null) { victim = k; continue; }
+      const vt = tenantOfSite(victim);
+      if (scope === "hub" && counts.get(kt) !== counts.get(vt)) {
+        if (counts.get(kt) > counts.get(vt)) victim = k;
+        continue;
+      }
+      if (newest(k) < newest(victim)) victim = k;
+    }
+    if (victim === null) return { ok: false, pruned };
+    delete decisions[victim];
+    pruned = true;
+  }
+}
 
 // Append one decision to an org's log (oldest evicted past DECISIONS_KEEP). The
 // caller decided the org — always a DECIDED org, never a claimed siteKey.
@@ -19825,6 +20009,18 @@ function appendDecision(siteKey, entry, now = Date.now()) {
   if (typeof siteKey !== "string" || !siteKey) return null;
   const d = sanitizeDecision({ ...entry, id: crypto.randomBytes(6).toString("hex"), at: now });
   if (!d) return null;
+  if (!Object.hasOwn(decisions, siteKey)) {
+    const room = decisionsRoomFor(siteKey);
+    if (!room.ok) {
+      // A prune may have happened before the refusal: publish the pruned map.
+      if (room.pruned) {
+        persistDecisions();
+        invalidateAgentsCache();
+        broadcastDecisions();
+      }
+      return null;
+    }
+  }
   decisions[siteKey] = [...(decisions[siteKey] || []), d].slice(-DECISIONS_KEEP);
   persistDecisions();
   invalidateAgentsCache();
@@ -20055,15 +20251,13 @@ function startDailyBriefRun(siteKey, trigger, now = Date.now(), due = null) {
   // Refuse what the store's coerce would drop: a dropped row would read as "never
   // fired" and the schedule would re-fire every tick. A full store first forgets
   // orgs no host is decided into.
-  if (!Object.hasOwn(dailyBriefs, siteKey)
-      && Object.keys(dailyBriefs).length >= DAILY_BRIEF_ORGS_MAX) {
+  if (!Object.hasOwn(dailyBriefs, siteKey) && orgStoreFull(dailyBriefs, siteKey, DAILY_BRIEF_ORGS_MAX)) {
     const orgs = decidedOrgs();
-    for (const k of Object.keys(dailyBriefs)) {
-      if (!orgs.has(k) && !dailyBriefs[k].some((b) => b.status === "running")) delete dailyBriefs[k];
-    }
-    if (Object.keys(dailyBriefs).length >= DAILY_BRIEF_ORGS_MAX) {
-      return { status: 409, error: `${DAILY_BRIEF_ORGS_MAX} orgs already have briefs — the limit` };
-    }
+    const { full, pruned } = makeRoomForOrg(dailyBriefs, siteKey, DAILY_BRIEF_ORGS_MAX,
+      (k) => !orgs.has(k) && !dailyBriefs[k].some((b) => b.status === "running"));
+    if (full && pruned) persistDailyBriefs();
+    if (full === "tenant") return { status: 409, error: `${DAILY_BRIEF_ORGS_MAX} orgs already have briefs — the limit` };
+    if (full) return { status: 409, error: "the hub holds briefs for too many orgs — try again later" };
   }
   const schedule = dailyBriefScheduleOf(siteKey);
   const lastOk = list.find((b) => b.status === "ok");
@@ -20294,15 +20488,15 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   }
   // Refuse what the coerce would drop: a full store first forgets orgs no host
   // is decided into (and that wait on nothing).
-  if (!Object.hasOwn(meetingProposals, siteKey) &&
-      Object.keys(meetingProposals).length >= MEETINGS_ORGS_MAX) {
+  if (!Object.hasOwn(meetingProposals, siteKey) && orgStoreFull(meetingProposals, siteKey, MEETINGS_ORGS_MAX)) {
     const orgs = decidedOrgs();
-    for (const k of Object.keys(meetingProposals)) {
-      if (!orgs.has(k) && !meetingPendingCount(meetingProposals[k])) delete meetingProposals[k];
-    }
-    if (Object.keys(meetingProposals).length >= MEETINGS_ORGS_MAX) {
+    const { full, pruned } = makeRoomForOrg(meetingProposals, siteKey, MEETINGS_ORGS_MAX,
+      (k) => !orgs.has(k) && !meetingPendingCount(meetingProposals[k]));
+    if (full && pruned) persistMeetings();
+    if (full === "tenant") {
       return { status: 409, body: { error: `${MEETINGS_ORGS_MAX} orgs already have meetings — the limit` } };
     }
+    if (full) return { status: 409, body: { error: "the hub holds meetings for too many orgs — try again later" } };
   }
   if (meetingPendingCount(meetingProposals[siteKey]) >= MEETINGS_PENDING_ORG_MAX) {
     return { status: 429, body: { error: `${MEETINGS_PENDING_ORG_MAX} meetings of this org are already waiting to be read — try again later` } };
@@ -20542,7 +20736,7 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   if (item.kind === "decision") {
     const d = appendDecision(siteKey, { source: "meeting",
       text: [title, description].filter(Boolean).join(" — "), label: m.title });
-    if (!d) return refuse(500, "the decision could not be logged");
+    if (!d) return refuse(409, "the hub holds decisions for too many orgs — try again later");
     return save({ state: "logged", at: now, ...(edited ? { edited: true } : {}) });
   }
   const project = meetingText(body.project, 100);
@@ -23221,12 +23415,18 @@ const server = http.createServer(async (req, res) => {
       if (!token) return json(res, 400, { error: "token required" });
       const platform = typeof body.platform === "string" ? body.platform : "android";
       const features = Array.isArray(body.features) ? body.features : undefined;
-      registerDevice(token, platform, features, principalTenant(requestPrincipal(req)));
+      // 409 = this token is another tenant's (XERK-2622); the app rotates its
+      // FCM token and registers the new one.
+      if (!registerDevice(token, platform, features, principalTenant(requestPrincipal(req)))) {
+        return json(res, 409, { error: "this device is registered to another account; sign out there first" });
+      }
       return json(res, 200, { ok: true });
     }
     if (req.method === "DELETE" && url.pathname === "/api/devices") {
+      // Only the caller's own tenant's registration; another's is left alone
+      // and answered the same 200, so the route is no oracle for it.
       const token = (url.searchParams.get("token") || "").trim();
-      if (token) unregisterDevice(token);
+      if (token) unregisterDevice(token, principalTenant(requestPrincipal(req)));
       return json(res, 200, { ok: true });
     }
 
@@ -26642,7 +26842,11 @@ const server = http.createServer(async (req, res) => {
       if (!decidedOrgs().has(siteKey)) {
         return json(res, 404, { error: "no host is in that org" });
       }
-      return json(res, 200, { ok: true, decision: appendDecision(siteKey, { source: "note", text }) });
+      const decision = appendDecision(siteKey, { source: "note", text });
+      if (!decision) {
+        return json(res, 409, { error: "the hub holds decisions for too many orgs — try again later" });
+      }
+      return json(res, 200, { ok: true, decision });
     }
 
     // POST /api/orgs/<siteKey>/meetings — Tenir posting a finished meeting
@@ -26730,16 +26934,15 @@ const server = http.createServer(async (req, res) => {
         const { value, error } = validateDailyBriefSchedule(merged);
         if (error) return json(res, 400, { error });
         if (!(siteKey in dailyBriefSchedules) &&
-            Object.keys(dailyBriefSchedules).length >= DAILY_BRIEF_ORGS_MAX) {
-          // Any prune frees a slot, so a refusal below never leaves one unpublished;
-          // the set that follows publishes the pruned map.
-          for (const k of Object.keys(dailyBriefSchedules)) {
-            if (!orgs.has(k)) delete dailyBriefSchedules[k];
-          }
-          if (Object.keys(dailyBriefSchedules).length >= DAILY_BRIEF_ORGS_MAX) {
-            return json(res, 409, {
-              error: `${DAILY_BRIEF_ORGS_MAX} orgs already have a meeting schedule — the limit`,
-            });
+            orgStoreFull(dailyBriefSchedules, siteKey, DAILY_BRIEF_ORGS_MAX)) {
+          // The set that follows publishes a pruned map; a refusal publishes its own.
+          const { full, pruned } = makeRoomForOrg(dailyBriefSchedules, siteKey, DAILY_BRIEF_ORGS_MAX,
+            (k) => !orgs.has(k));
+          if (full) {
+            if (pruned) publishDailyBriefSchedules();
+            return json(res, 409, { error: full === "tenant"
+              ? `${DAILY_BRIEF_ORGS_MAX} orgs already have a meeting schedule — the limit`
+              : "the hub holds meeting schedules for too many orgs — try again later" });
           }
         }
         setDailyBriefSchedule(siteKey, value);
@@ -26873,13 +27076,19 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, {
           error: `body needs {tier:${REPO_TIERS.map((t) => `"${t}"`).join("|")}} or {auto:true}` });
       }
-      if (!repo || repo.length > REPO_NAME_MAX) {
+      // A name in the tenant-key shape would read as another tenant's key.
+      if (!repo || repo.length > REPO_NAME_MAX || TENANT_KEY_RE.test(repo)) {
         return json(res, 400, { error: "a repo name is required" });
       }
-      if (!fleetRepoNames().has(repo) && !Object.hasOwn(repoTiers, repo)) {
+      // XERK-2620: the tier is the CALLER's tenant's (its one ledger scope: a
+      // tenant user its tenant, an operator the untenanted fleet), and the repo
+      // must be one of that tenant's hosts' — never a same-named repo of another.
+      const tierTenant = ledgerTenantOf(requestPrincipal(req));
+      if (tierTenant === null) return json(res, 404, { error: "no host reports a repo by that name" });
+      if (!fleetRepoNames(tierTenant).has(repo) && !Object.hasOwn(repoTiers, repoTierKey(repo, tierTenant))) {
         return json(res, 404, { error: "no host reports a repo by that name" });
       }
-      setRepoTier(repo, auto ? DEFAULT_REPO_TIER : body.tier);
+      setRepoTier(repo, auto ? DEFAULT_REPO_TIER : body.tier, tierTenant);
       return json(res, 200, { ok: true, tier: auto ? DEFAULT_REPO_TIER : body.tier });
     }
 
@@ -27524,7 +27733,7 @@ if (process.env.TURMA_TEST) {
     registerTenantPurge, purgeTenantData, ledgerVisible, ledgerScopeKey, tenantScope, subscriptionKeyOf,
     shadowHostFor,
     // XERK-2554: the pre-tenancy migration.
-    runTenantMigration, migrateTenantLeftovers, tenantMigrationTick, tenantMigrationGateClosed,
+    runTenantMigration, runTenantLateSteps, migrateTenantLeftovers, tenantMigrationTick, tenantMigrationGateClosed,
     logTenantMigrationError,
     tenantMigrationSteps, tenantMigrationPurgeNames: () => [...tenantPurges.keys()],
     tenantMigrationMarker: () => tenantMigrationMarker, migratedTenant,
@@ -27857,7 +28066,7 @@ if (process.env.TURMA_TEST) {
     // Host ⇄ tenant binding (XERK-2533).
     tenantOfKey,
     // XERK-2551: org keys belong to tenants.
-    tenantOfSite, tenantOfPinKey, trimByTenant, baseOfSite, scopeSite, scopeSiteKeys, unscopeSiteKeys, principalMaySite,
+    tenantOfSite, tenantOfPinKey, trimByTenant, orgStoreFull, makeRoomForOrg, baseOfSite, scopeSite, scopeSiteKeys, unscopeSiteKeys, principalMaySite,
     devicesForHost, mintMeetingsTenantToken, meetingsTenant, notify, rescopeRestoredOrgs,
     baseOfKey,
     agentKeyFor,
@@ -28126,6 +28335,7 @@ if (process.env.TURMA_TEST) {
     // The per-org decisions log (XERK-1574). A getter: a restore/watch install
     // REPLACES the map.
     getDecisions: () => decisions, decisionsCoerce, sanitizeDecision, appendDecision,
+    DECISIONS_ORGS_MAX, DECISIONS_ORGS_TOTAL,
     getDailyBriefSchedules: () => dailyBriefSchedules, dailyBriefSchedulesCoerce,
     DAILY_BRIEF_DEFAULT_SCHEDULE, dailyBriefSchedulesWire, dailyBriefSent,
     sanitizeDailyBriefSchedule, setDailyBriefSchedule, nextDailyBriefRun, dailyBriefWindow,

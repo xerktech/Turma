@@ -13,6 +13,9 @@
 //                          `<siteKey>@<tenantId>`, XERK-2551),
 //     repos / fleetRepos -> repo names the principal's hosts / ANY host reports,
 //     seesUntenanted    -> the principal reaches untenanted (operator) data,
+//     repoTenant        -> the ONE tenant whose repo tiers it reads ("" = the
+//                          untenanted fleet, null = none; server.js
+//                          `ledgerTenantOf`, XERK-2620),
 //   }
 //
 // A repo name carries no tenant, so a repo no host reports at all is ORPHAN data:
@@ -238,8 +241,21 @@ const SCOPERS = {
   ticketQueue: (view) => (list) => Array.isArray(list) ? list.filter((e) => e && orgVisible(view, e.siteKey)) : list,
   migrations: (view) => (list) => Array.isArray(list) ? list.filter((m) => m &&
     (m.srcHost == null || view.mayHost(m.srcHost)) && view.mayHost(m.targetHost)) : list,
-  repoTiers: (view) => (m) => filterMap(m, (k) => repoVisible(view, k)),
+  // A tier key carries its tenant (`<repo>@<tenantId>`, XERK-2620): a view gets
+  // its own tenant's tiers only, under the plain repo name its clients join on.
+  repoTiers: (view) => (m) => repoTiersFor(m, view.repoTenant),
 };
+const TIER_TENANT_RE = /@([0-9a-f]{32})$/;
+function repoTiersFor(m, tenant) {
+  if (!m || typeof m !== "object" || Array.isArray(m)) return m;
+  const out = Object.create(null);
+  if (typeof tenant !== "string") return out;
+  for (const [k, v] of Object.entries(m)) {
+    const hit = TIER_TENANT_RE.exec(k);
+    if ((hit ? hit[1] : "") === tenant) out[hit ? k.slice(0, -33) : k] = v;
+  }
+  return out;
+}
 // SSE events whose name is not their payload key.
 const EVENT_ALIASES = { triageActions: "ticketTriageActions" };
 const SINGLE_HOST_EVENTS = new Set(["agent", "removed"]);
@@ -259,10 +275,17 @@ function scopePayload(obj, view) {
     const s = SCOPERS[k];
     if (!s) { changed = true; continue; }
     const nv = s(view)(v);
-    if (sizeOf(nv) !== sizeOf(v)) changed = true;
+    if (sizeOf(nv) !== sizeOf(v) || !sameKeys(nv, v)) changed = true;
     out[k] = nv;
   }
   return { out, changed };
+}
+// A scoper that RENAMES keys (repoTiers) can keep the size, so a same-size map
+// is unchanged only when its keys are too (arrays are filters: length suffices).
+function sameKeys(a, b) {
+  if (a === b || !a || !b || typeof a !== "object" || Array.isArray(a)) return true;
+  const ka = Object.keys(a), kb = Object.keys(b);
+  return ka.length === kb.length && ka.every((k, i) => k === kb[i]);
 }
 function sizeOf(v) {
   if (Array.isArray(v)) return v.length;
