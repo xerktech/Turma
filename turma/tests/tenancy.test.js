@@ -967,8 +967,9 @@ test("XERK-2629: a doubled or mixed-case tenant suffix on an org never lands in 
     // The pure rule: untenanted keeps no tenant; tenant A gets only A.
     assert.equal(hub.tenantOfSite(hub.scopeSite(site, "")), "", `${site} untenanted`);
     assert.ok(!hub.scopeSite(site, "").endsWith(`@${T}`), `${site} untenanted ends in B`);
-    assert.equal(hub.scopeSite(site, A.t).split("@").filter((p) => p.toLowerCase() === T).length, 0,
-      `${site} scoped into A still names B`);
+    const inA = hub.scopeSite(site, A.t);
+    assert.equal(hub.tenantOfSite(inA), A.t, `${site} scoped into A`);
+    assert.ok(!hub.baseOfSite(inA).endsWith(`@${T}`), `${site} scoped into A keeps B's suffix`);
     // End to end: an untenanted master-token host is never bound into B's org.
     const dev = `dbl2629-${crypto.randomBytes(3).toString("hex")}`;
     const r = await request("POST", "/api/heartbeat", { headers: { authorization: "Bearer agenttok" },
@@ -981,6 +982,15 @@ test("XERK-2629: a doubled or mixed-case tenant suffix on an org never lands in 
     }
     delete hub.agents[dev];
   }
+});
+
+test("XERK-2629: stripping a long run of suffixes is linear, not quadratic", () => {
+  const t = "0123456789abcdef0123456789abcdef";
+  const site = `x.net${`@${t}`.repeat(16000)}X`; // ~528 KB: the regex form held the loop 14 s
+  const t0 = process.hrtime.bigint();
+  assert.equal(hub.scopeSite(site, ""), site);
+  assert.equal(hub.scopeSite(`x.net${`@${t}`.repeat(16000)}`, ""), "x.net");
+  assert.ok(Number(process.hrtime.bigint() - t0) / 1e6 < 500, "scopeSite took too long");
 });
 
 // ---- XERK-2621: a fleet-wide cap never lets one tenant lock out or evict another
