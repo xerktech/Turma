@@ -1475,9 +1475,18 @@ function trimByTenant(map, max, tenantOf, age, keep) {
   }
   return evicted;
 }
+// `site` minus EVERY trailing `@<32hex>` tenant suffix (XERK-2629): one strip
+// left `site@<B>@<B>` from an untenanted host as `site@<B>` — tenant B's org.
+// A tail walk, never a `(?:@hex{32})+$` regex: that retries from every `@` and
+// is quadratic on an agent-sent siteKey (a 528 KB one held the loop 14 s).
+function stripSiteTenantSuffixes(site) {
+  let end = site.length;
+  while (end >= 33 && site.charCodeAt(end - 33) === 64 && TENANT_ID_RE.test(site.slice(end - 32, end))) end -= 33;
+  return end === site.length ? site : site.slice(0, end);
+}
 function scopeSite(site, tenantId) {
   if (typeof site !== "string" || !site) return site;
-  const base = baseOfKey(site);
+  const base = stripSiteTenantSuffixes(site);
   return tenantId ? `${base}@${tenantId}` : base;
 }
 // Payload keys whose objects are session CONTENT (transcripts, logs, ticket

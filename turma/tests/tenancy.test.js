@@ -965,6 +965,45 @@ test("XERK-2556: host names shaped like another tenant's key are no way in", asy
   assert.notEqual(m.status, 200, "a case twin of A's own host");
 });
 
+// XERK-2629: scopeSite stripped ONE `@<32hex>`, so a doubled suffix on an
+// untenanted beat left `site@<B>` — tenant B's org key — as the host's org.
+test("XERK-2629: a doubled or mixed-case tenant suffix on an org never lands in another tenant", async () => {
+  const { A, B } = await isoFleet();
+  const T = B.t, U = B.t.toUpperCase();
+  for (const site of [`dbl.atlassian.net@${T}@${T}`, `dbl.atlassian.net@${T}@${T}@${T}`,
+    `dbl.atlassian.net@${U}@${T}`, `dbl.atlassian.net@${T}@${U}`, `dbl.atlassian.net@${A.t}@${T}`]) {
+    // The pure rule: untenanted keeps no tenant; tenant A gets only A.
+    assert.equal(hub.tenantOfSite(hub.scopeSite(site, "")), "", `${site} untenanted`);
+    assert.ok(!hub.scopeSite(site, "").endsWith(`@${T}`), `${site} untenanted ends in B`);
+    const inA = hub.scopeSite(site, A.t);
+    assert.equal(hub.tenantOfSite(inA), A.t, `${site} scoped into A`);
+    assert.ok(!hub.baseOfSite(inA).endsWith(`@${T}`), `${site} scoped into A keeps B's suffix`);
+    // End to end: an untenanted master-token host is never bound into B's org.
+    const dev = `dbl2629-${crypto.randomBytes(3).toString("hex")}`;
+    const r = await request("POST", "/api/heartbeat", { headers: { authorization: "Bearer agenttok" },
+      body: { device: dev, jira: { configured: true, available: true, siteKey: site, tickets: [] } } });
+    assert.equal(r.status, 200, r.raw);
+    const rec = hub.agents[dev];
+    assert.ok(rec, "the untenanted host beat");
+    for (const v of [rec.orgBound, rec.jira && rec.jira.siteKey]) {
+      assert.equal(hub.tenantOfSite(v || ""), "", `${site} bound ${v} into a tenant`);
+    }
+    delete hub.agents[dev];
+  }
+});
+
+test("XERK-2629: stripping a long run of suffixes is linear, not quadratic", () => {
+  const t = "0123456789abcdef0123456789abcdef";
+  const site = `x.net${`@${t}`.repeat(16000)}X`; // ~528 KB: the regex form held the loop 14 s
+  const t0 = process.hrtime.bigint();
+  assert.equal(hub.scopeSite(site, ""), site);
+  assert.equal(hub.scopeSite(`x.net${`@${t}`.repeat(16000)}`, ""), "x.net");
+  // Only a lower-case id is a tenant suffix (TENANT_HOST_KEY_RE): an upper-case
+  // one is left as typed, so the meetings route still 404s `SITE@<UPPER>`.
+  assert.equal(hub.scopeSite(`x.net@${t.toUpperCase()}`, ""), `x.net@${t.toUpperCase()}`);
+  assert.ok(Number(process.hrtime.bigint() - t0) / 1e6 < 500, "scopeSite took too long");
+});
+
 // ---- XERK-2621: a fleet-wide cap never lets one tenant lock out or evict another
 
 test("XERK-2621: one tenant's unused enrollment codes never refuse another tenant's mint", async () => {
