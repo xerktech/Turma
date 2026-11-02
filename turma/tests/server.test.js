@@ -29330,6 +29330,23 @@ test("XERK-2638: a label resolves, is noted and is set only within the token's t
   }
 });
 
+test("XERK-2638: past the misses' hard total the tenant holding the most loses one, never a small one", async () => {
+  const M = hub.getMeetingLabelMisses();
+  for (const k of Object.keys(M)) delete M[k];
+  const small = "b".repeat(32);
+  for (let i = 0; i < 5; i++) M[`small${i}@${small}`] = { at: 1 + i };          // the OLDEST rows
+  for (let t = 0; t < 10; t++) {
+    const id = String(t).repeat(32);
+    for (let i = 0; i < 19; i++) M[`big${i}@${id}`] = { at: 100 + t * 20 + i };
+  }
+  assert.equal(Object.keys(M).length, 195);
+  for (let i = 0; i < 6; i++) await postMeeting2508(`fleet${i}-2638`, meeting2508(`f${i}`));
+  assert.equal(Object.keys(M).length, 200);
+  assert.equal(Object.keys(M).filter((k) => k.endsWith(`@${small}`)).length, 5, "the small tenant keeps every row");
+  assert.ok(`fleet5-2638` in M, "the newest row is never the one evicted");
+  for (const k of Object.keys(M)) delete M[k];
+});
+
 test("XERK-2638: a site key outranks a label; a huge org name costs a resolve nothing", async () => {
   // A label-shaped site key (a self-hosted tracker) is that org, whoever has the label.
   await beat1574("lbPlain2638", "plainsite2638");

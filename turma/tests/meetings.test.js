@@ -268,3 +268,17 @@ test("XERK-2638: an org with no label is still listed and pickable; same-named o
   assert.match(html, /<option value="twin-a\.atlassian\.net">Twin Co \(twin-a\.atlassian\.net\)<\/option>/);
   assert.match(html, /Twin Co \(twin-b\.atlassian\.net\)/);
 });
+
+test("XERK-2638: the Tenir labels list keeps the open state the operator left it in", () => {
+  const P = loadPage(META);
+  const d = { ...data(), meetingLabels: { [SITE]: { label: "acme", custom: false } }, meetingLabelMisses: {} };
+  P.update(d);
+  assert.match(P.list(), /<details class="mt-labels">/);
+  const toggle = (open) => P.els.meetingList.listeners.toggle[0]({ target: { open, classList: { contains: (c) => c === "mt-labels" } } });
+  toggle(true);
+  P.update({ ...d });
+  assert.match(P.list(), /<details class="mt-labels" open>/);
+  toggle(false);
+  P.update({ ...d });
+  assert.match(P.list(), /<details class="mt-labels">/);
+});
