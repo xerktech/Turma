@@ -1620,8 +1620,8 @@ const lowerName = (n) => String(n).toLowerCase();
 function uidHostRefusal(uid, host, now = Date.now()) {
   const e = identityOf(uid);
   if (!e) {
-    return "this agent identity is not registered on this hub — re-provision the host with " +
-      "its own token (node turma/server.js --agent-token <host>)";
+    return "this agent identity is not registered on this hub — re-provision the host with a " +
+      "fresh enrollment code from the dashboard's Add host (turma-agentctl enroll --code <code>)";
   }
   if (!hostKeyUsable(host)) return `${host} is not a usable host name`;
   // The tenant is the IDENTITY's, never the name's (XERK-2533): an agent bound
@@ -1637,7 +1637,7 @@ function uidHostRefusal(uid, host, now = Date.now()) {
   if (e.home === host) {
     return e.released && rec && !rec.agentUid
       ? `${host} was removed and re-registered by another agent — re-provision this host ` +
-        "with its own token (node turma/server.js --agent-token <host>)"
+        "with a fresh enrollment code from the dashboard's Add host (turma-agentctl enroll --code <code>)"
       : null;
   }
   if (rec && !rec.agentUid) return `${host} is registered to another agent — remove it from the dashboard to release the name`;
@@ -3151,9 +3151,13 @@ function registerDevice(token, platform, features, tenantId = "") {
   }
   persistDevices();
 }
-function unregisterDevice(token) {
+// `tenantId` given (the DELETE route) = only a device of that tenant ("" = the
+// operators') is removed: a caller holding another tenant's FCM token must not
+// silence that tenant's phone (XERK-2557 QA). Omitted = internal, any tenant.
+function unregisterDevice(token, tenantId) {
   const before = devices.length;
-  devices = devices.filter((d) => d.token !== token);
+  devices = devices.filter((d) => d.token !== token ||
+    (tenantId !== undefined && (d.tenantId || "") !== tenantId));
   if (devices.length !== before) persistDevices();
 }
 function pruneDevices(deadTokens) {
@@ -23075,7 +23079,8 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "DELETE" && url.pathname === "/api/devices") {
       const token = (url.searchParams.get("token") || "").trim();
-      if (token) unregisterDevice(token);
+      // Same 200 whether or not it was ours: the reply never says another tenant holds it.
+      if (token) unregisterDevice(token, principalTenant(requestPrincipal(req)));
       return json(res, 200, { ok: true });
     }
 
