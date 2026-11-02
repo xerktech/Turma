@@ -291,6 +291,15 @@ test("XERK-2631: an SSO user is named in the audit log by its fixed id, not only
   hub.__setTenancy(long.state);
   const label = hub.adminActorLabel({ kind: "user", userId: user.id });
   assert.ok(label.length <= 120 && label.endsWith(")"), label);
+  // The cut never leaves half an emoji behind.
+  const emoji = tenancy.upsertOidcUser(hub.tenancyState(), { iss: "https://idp/", sub: "s-spoof", displayName: "x".repeat(79) + "\u{1F600}", idpRoles: ["user"] });
+  hub.__setTenancy(emoji.state);
+  assert.equal(hub.adminActorLabel({ kind: "user", userId: user.id }), `oidc:${user.id} (${"x".repeat(79)})`);
+});
+
+test("XERK-2631: an audit row loaded from disk loses bidi overrides", () => {
+  const [row] = hub.coerceAdminAudit([{ at: 1, actor: "evil\u202Erev (oidc)", action: "user.update", target: "t\u2066x", detail: "d\u200Fq" }]);
+  assert.deepEqual([row.actor, row.target, row.detail], ["evilrev (oidc)", "tx", "dq"]);
 });
 
 test("XERK-2631: a display name loses bidi overrides and isolates", () => {

@@ -115,10 +115,16 @@ function cleanText(s, max) {
 }
 
 // A display name that spells another account's audit label (`oidc:<id>`)
-// would put that id on the wrong card in the admin panel (XERK-2631); the colon
-// is dropped so only the real id line on the right card matches it.
+// would put that id on the wrong card in the admin panel (XERK-2631). A
+// browser's find-in-page folds width, case, marks and invisible characters, so
+// the name is tested in that folded form; one that matches is stored folded
+// with the colon dropped, so only the real id line on the right card matches.
+const FIND_IGNORED = /[\p{Default_Ignorable_Code_Point}\p{M}]/gu;
 function cleanDisplayName(s) {
-  return cleanText(s, DISPLAY_MAX).replace(/oidc:(?=[0-9a-f]{32})/gi, "oidc ");
+  const name = cleanText(s, DISPLAY_MAX);
+  const folded = name.normalize("NFKD").replace(FIND_IGNORED, "").normalize("NFKC").toLowerCase();
+  const LABEL = /oidc:(?=[0-9a-f]{32})/g;
+  return LABEL.test(folded) ? folded.replace(LABEL, "oidc ") : name;
 }
 
 const finiteMs = (n) => (Number.isSafeInteger(n) && n > 0 ? n : undefined);

@@ -71,8 +71,8 @@ Tenancy model: `turma-tenancy.md`. Decision: `docs/multi-tenant-adr.md` ("an adm
 - A row names an account by a field its owner cannot change (`adminUserLabel`): a local username,
   or an OIDC user's hub id ahead of its display name (XERK-2631) — the IdP may let a user edit that.
   - An SSO card shows that `oidc:<id>`, the only way to match a row to a user; never hide it.
-  - A display name never spells `oidc:<32 hex>` (`cleanDisplayName` drops the colon), so no other
-    card reads as that label. Tests: `admin-page.test.js` (renders the page's own `userHtml`).
+  - A display name never spells `oidc:<32 hex>`, tested after the folding browser find-in-page does
+    (width, case, marks, invisibles; `cleanDisplayName`), so a search for a label skips other cards. Tests: `admin-page.test.js` (renders the page's own `userHtml`).
 
 ## Clients
 
