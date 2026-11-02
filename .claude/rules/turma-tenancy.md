@@ -262,7 +262,7 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   - **A user's open SSE, `/live` and `/term` streams close when its sign-in stops resolving**
     (XERK-2630, `trackUserStream`/`endStaleUserStreams`, run on every tenancy store change): a
     reset, own password change, disable, or a role/tenant change. Each stream is authorized only
-    at open, so a new long-lived stream must register too. Tests: `XERK-2630:` in `admin.test.js`.
+    at open, so a new long-lived stream must register too. Tests: `XERK-2630:` in `admin.test.js`, `tenancy.test.js`.
   - **A whole-map event (`SNAPSHOT_EVENTS`) is skipped for a stream whose slice is unchanged since
     the last frame IT received** (`sseLastSent`, rollup XERK-2593): else every stream heard every
     other tenant's activity. Per stream, never per view: a later stream never saw the earlier frame.
