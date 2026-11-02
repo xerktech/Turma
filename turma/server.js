@@ -20276,7 +20276,9 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   // lone tenant may still use the whole budget. Shares shrink as tenants arrive
   // and nothing held is evicted, so admission alone would let N tenants reach
   // budget x H(N) (QA measured 159 of 20); MEETINGS_PENDING_HARD_FACTOR x the
-  // budget is the ceiling nothing passes, reached only with several tenants.
+  // budget is the ceiling nothing passes. Accepted: about four busy tenants
+  // together can fill that ceiling (20+10+7+3), refusing the rest until theirs
+  // are read — still far better than the one tenant a fleet-wide cap took.
   const pendingBy = new Map(); // tenant -> its pending rows
   for (const [org, list] of Object.entries(meetingProposals)) {
     const t = tenantOfSite(org);
@@ -20290,8 +20292,9 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   const pending = [...pendingBy.values()].flat();
   const mine = pendingBy.get(tenant) || [];
   const tenants = pendingBy.size + (pendingBy.has(tenant) ? 0 : 1);
-  if (pending.length >= MEETINGS_PENDING_HARD_FACTOR * MEETINGS_PENDING_TOTAL_MAX
-      || (pending.length >= MEETINGS_PENDING_TOTAL_MAX && mine.length >= MEETINGS_PENDING_TOTAL_MAX / tenants)) {
+  const full = { status: 429, body: { error: "the hub's queue of meetings waiting to be read is full — try again later" } };
+  if (pending.length >= MEETINGS_PENDING_HARD_FACTOR * MEETINGS_PENDING_TOTAL_MAX) return full;
+  if (pending.length >= MEETINGS_PENDING_TOTAL_MAX && mine.length >= MEETINGS_PENDING_TOTAL_MAX / tenants) {
     return { status: 429, body: { error: `${MEETINGS_PENDING_TOTAL_MAX} meetings are already waiting to be read — try again later` } };
   }
   const sum = (rows) => rows.reduce((n, m) => n + meetingSegmentBytes(m), meetingSegmentBytes(row));
@@ -20299,8 +20302,8 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   if (sum(orgPending) > MEETINGS_PENDING_BYTES_ORG_MAX) {
     return { status: 429, body: { error: "this org's meetings already waiting to be read fill its transcript budget — try again later" } };
   }
-  if (sum(pending) > MEETINGS_PENDING_HARD_FACTOR * MEETINGS_PENDING_BYTES_MAX
-      || (sum(pending) > MEETINGS_PENDING_BYTES_MAX && sum(mine) > MEETINGS_PENDING_BYTES_MAX / tenants)) {
+  if (sum(pending) > MEETINGS_PENDING_HARD_FACTOR * MEETINGS_PENDING_BYTES_MAX) return full;
+  if (sum(pending) > MEETINGS_PENDING_BYTES_MAX && sum(mine) > MEETINGS_PENDING_BYTES_MAX / tenants) {
     return { status: 429, body: { error: "the meetings already waiting to be read fill the hub's transcript budget — try again later" } };
   }
   const kept = putMeeting(siteKey, row);

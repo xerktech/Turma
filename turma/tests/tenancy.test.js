@@ -1068,6 +1068,29 @@ test("XERK-2621: the transcript byte budget is fair-shared the same way", async 
   }
 });
 
+test("XERK-2621: many tenants posting just under their shrinking share stop at the byte ceiling", () => {
+  const budget = hub.MEETINGS_PENDING_BYTES_MAX;
+  const ceiling = hub.MEETINGS_PENDING_HARD_FACTOR * budget;
+  const orgs = [];
+  let full = null;
+  try {
+    for (let i = 0; i < 60 && !full; i++) {
+      const org = `shr${i}.example@${crypto.randomBytes(16).toString("hex")}`;
+      orgs.push(org);
+      // Each newcomer's share is budget / (i + 1); post ~90% of it (an org holds at most 1 MiB).
+      // (Other tests' pending rows add tenants, so a post can still miss its share; go on.)
+      const want = Math.min(0.8 * budget / (i + 1), 0.9 * (1 << 20));
+      const r = hub.acceptMeeting(org, meetingBody(`x2621s${i}`, Math.max(1, Math.floor(want / 2100))));
+      if (r.status !== 200 && /is full/.test(r.body.error)) full = r;
+    }
+    const bytes = pendingOf(() => true).reduce((n, m) => n + Buffer.byteLength(JSON.stringify(m.segments || [])), 0);
+    assert.ok(bytes <= ceiling, `pending ${bytes} bytes past the ${ceiling} ceiling`);
+    assert.ok(full && /queue of meetings .* is full/.test(full.body.error), JSON.stringify(full && full.body));
+  } finally {
+    dropMeetings(orgs, "x2621s");
+  }
+});
+
 test("XERK-2621: epic runs and ticket pins past the cap evict only the busiest tenant's", async () => {
   const { A, B } = await isoFleet();
   // Epic runs (EPIC_RUNS_MAX is 3 here).

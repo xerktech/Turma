@@ -43,7 +43,8 @@ ticket builds to this file; change it here first.
   - A fleet-wide budget refuses a tenant only at its FAIR SHARE (budget ÷ tenants with meetings
     waiting, itself included; XERK-2621), so one tenant's backlog never 429s another.
   - Admission alone grows the store to budget x H(N) for N tenants (shares shrink, nothing is
-    evicted), so `MEETINGS_PENDING_HARD_FACTOR` (2) x each budget is a hard ceiling for everyone.
+    evicted), so `MEETINGS_PENDING_HARD_FACTOR` x each budget is a hard ceiling for everyone,
+    answered "queue … is full" (no count). Accepted: ~4 busy tenants together can fill it.
 - A settled row's items fit `MEETING_ITEMS_BYTES_MAX` (64 KiB) of JSON: past it the hub shortens
   descriptions and quotes ("…") by the least that fits; only what cannot fit even then is dropped.
   - Why: the agent's parser allows far more (30 × 4000-char descriptions); a cut dropped items silently.
