@@ -116,7 +116,7 @@ function loadHelpers(fetchReply = null, hash = "#permissions", storage = null, b
     TurmaOrg: { get: () => (orgKeys.length === 1 ? orgKeys[0] : ""), getKeys: () => (orgHooks ? orgHooks.getKeys() : orgKeys),
       update: (d) => { if (orgHooks) orgHooks.update(d); }, filter: (a) => orgFilter(a),
       subscribe: noop, sse: noop, orgColors: () => ({}) },
-    TurmaBoard: board || { orgName: (k, o) => o || k, orgColorMap: () => ({}),
+    TurmaBoard: board || { bareKey: require("../public/board.js").bareKey, orgName: (k, o) => o || k, orgColorMap: () => ({}),
       mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
   };
@@ -1018,4 +1018,13 @@ test("XERK-1849: a late refusal for an org the operator left is discarded", asyn
     assert.match(H12.els.modelQualityCard.innerHTML, /R-1/);
     assert.doesNotMatch(H12.els.modelQualityCard.innerHTML, /acme down/);
   } finally { orgKeys = saved; }
+});
+
+// XERK-2634: a decision's host is the hub's registry key, tenant-suffixed after
+// the tenancy migration; the meta line prints the device alone.
+test("a decision recorded on a tenant host shows the host without the tenant", () => {
+  const html = H.decisionsHtml("a.net",
+    [{ at: 1000, source: "note", text: "n", host: "TrueNAS@77778a16d8b028aab55c7729d587dbd7" }], 5000, false);
+  assert.match(html, /TrueNAS/);
+  assert.doesNotMatch(html, /77778a16/);
 });

@@ -82,6 +82,7 @@ import com.xerktech.turma.model.SearchMatch
 import com.xerktech.turma.model.SessionInfo
 import com.xerktech.turma.vm.ArchiveViewModel
 import com.xerktech.turma.vm.FleetViewModel
+import com.xerktech.turma.core.bareKey
 
 /** One session flattened together with the host that owns it — the row unit. */
 data class FlatSession(
@@ -101,7 +102,7 @@ fun flattenSessions(
 ): List<FlatSession> {
     val q = query.trim().lowercase()
     val all = agents.flatMap { a ->
-        a.sessions.map { FlatSession(a.key, a.device.ifBlank { a.key }, a.online, a.lastSeen, it, a.terminalOnline) }
+        a.sessions.map { FlatSession(a.key, a.device.ifBlank { bareKey(a.key) }, a.online, a.lastSeen, it, a.terminalOnline) }
     }
     val filtered = if (q.isEmpty()) all else all.filter {
         sessionName(it.session).lowercase().contains(q) ||
@@ -179,7 +180,7 @@ fun collectSessions(agents: List<AgentInfo>, query: String): SessionLists {
 
     for (a in agents) {
         val host = a.key
-        val device = a.device.ifBlank { a.key }
+        val device = a.device.ifBlank { bareKey(a.key) }
         for (s in a.sessions) {
             if (s.transcriptId.isNotBlank()) carded.add(key(host, s.transcriptId))
             val flat = FlatSession(host, device, a.online, a.lastSeen, s, a.terminalOnline)
@@ -222,10 +223,10 @@ fun collectSessions(agents: List<AgentInfo>, query: String): SessionLists {
         for (r in a.repos) for (t in r.resumable) {
             if (t.transcriptId.isBlank() || !carded.add(key(a.key, t.transcriptId))) continue
             val name = t.summary.ifBlank { t.transcriptId.take(8) }
-            if (!matches(name, t.repo, a.device.ifBlank { a.key })) continue
+            if (!matches(name, t.repo, a.device.ifBlank { bareKey(a.key) })) continue
             ended.add(
                 EndedSession(
-                    host = a.key, device = a.device.ifBlank { a.key }, online = a.online,
+                    host = a.key, device = a.device.ifBlank { bareKey(a.key) }, online = a.online,
                     kind = EndedKind.RESUMABLE, id = "t:" + t.transcriptId,
                     transcriptId = t.transcriptId, repo = t.repo,
                     name = name,
@@ -370,7 +371,7 @@ fun spawnTargets(
             val repos = a.repos.filter { repo ->
                 !repo.root || a.sessions.none { it.root && it.status == "running" }
             }
-            SpawnHost(a.key, a.device.ifBlank { a.key }, repos, a.capacity, hostWeekly(a, agents, nowSec))
+            SpawnHost(a.key, a.device.ifBlank { bareKey(a.key) }, repos, a.capacity, hostWeekly(a, agents, nowSec))
         }
         .filter { it.repos.isNotEmpty() }
 
@@ -1509,7 +1510,7 @@ private fun SessionCardMenu(
                 )
                 moveTargets.forEach { t ->
                     DropdownMenuItem(
-                        text = { Text(t.device.ifBlank { t.key }) },
+                        text = { Text(t.device.ifBlank { bareKey(t.key) }) },
                         onClick = { dismiss(); onMove(t.key) },
                     )
                 }

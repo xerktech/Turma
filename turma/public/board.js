@@ -877,7 +877,7 @@
       const terminal = r.state === "done" || r.state === "failed";
       const chip = `<span class="eb-state eb-state-${esc(r.state)}">${esc(epicBuilderStateLabel(r.state))}</span>`;
       const host = r.host
-        ? `<span class="eb-host" title="dispatched to ${esc(hostName(r.host))}">${esc(hostName(r.host))}</span>` : "";
+        ? `<span class="eb-host" title="dispatched to ${esc(bareKey(r.host))}">${esc(bareKey(r.host))}</span>` : "";
       let tail = "";
       if (r.state === "done" && r.epicKey) {
         const epicUrl = `/board?ticket=${encodeURIComponent(r.epicKey)}&site=${encodeURIComponent(r.siteKey)}`;
@@ -1057,7 +1057,7 @@
       const hk = a.key || a.device;
       if (hk) {
         rep.hostOpts.set(hk, {
-          key: hk, name: a.device || hk, online: !!a.online });
+          key: hk, name: bareKey(a.device || hk), online: !!a.online });
       }
       const key = site + "\x00" + (j.user || "");
       const prev = byUser.get(key);
@@ -1182,20 +1182,26 @@
   // COLLECTION name ("tfs.co/tfs/DefaultCollection" -> "defaultcollection"), a
   // deployment detail rather than the org. It renames only the LABEL — the
   // siteKey everything is keyed and routed on is untouched.
-  // A host's display name from its registry key alone: a tenant host's key is
-  // `<device>@<32-hex tenantId>` (XERK-2533), and the label is the device
-  // (XERK-2639). Use it only where the agent record (and its `device`) is not at
-  // hand; keep routing on the key.
-  function hostName(key) {
-    return String(key ?? "").replace(/@[0-9a-f]{32}$/, "");
+  // A registry key with its tenant suffix dropped, for DISPLAY only. A tenant's
+  // host and org keys are `<base>@<32 lowercase hex>` (server.js tenantHostKey,
+  // tenancy.js TENANT_HOST_KEY_RE, XERK-2533/XERK-2551); the operator reads
+  // "TrueNAS", not the tenant id (XERK-2639, XERK-2634). Strips exactly that
+  // suffix and nothing else — any other `@tail` is part of the name. Prefer an
+  // agent record's `device` where one is at hand. Never feed the result back
+  // into a route, map lookup or handler: those keep the raw key. `hostName` is
+  // the same function under the name host-label call sites use.
+  const TENANT_SUFFIX_RE = /@[0-9a-f]{32}$/;
+  function bareKey(key) {
+    return String(key ?? "").replace(TENANT_SUFFIX_RE, "");
   }
+  const hostName = bareKey;
 
   function orgName(siteKey, override) {
     const o = String(override ?? "").trim();
     if (o) return o;
     // A tenant's org key carries its tenant (`<siteKey>@<32-hex>`, XERK-2551);
     // the label is the site alone.
-    let s = String(siteKey ?? "").replace(/@[0-9a-f]{32}$/, "");
+    let s = bareKey(siteKey);
     if (s.includes("/")) {
       const segs = s.split("/").filter(Boolean);
       return segs[segs.length - 1] || s;
@@ -1344,7 +1350,7 @@
     const tw = (site && site.tickets || []).find((x) => x && x.key === twin);
     if (tw && tw.url) return tw.url;
     if (!site || !site.siteKey) return "";
-    const host = String(site.siteKey).replace(/@[0-9a-f]{32}$/, ""); // a tenant's org key (XERK-2551)
+    const host = bareKey(site.siteKey); // a tenant's org key (XERK-2551)
     return site.source === "azure"
       ? `https://${host}/_workitems/edit/${twin}`
       : `https://${host}/browse/${twin}`;
@@ -1744,7 +1750,7 @@
     // one shows why on the card (same inline convention as the start-error note).
     if (o.moving) bits.push(`<span class="kc-moving">moving…</span>`);
     else if (o.moveError) bits.push(`<span class="kc-move-err" title="${esc(o.moveError)}">couldn't move</span>`);
-    const org = `<span class="kc-org" style="--org:${esc(color)}" title="${esc(site && site.siteKey || "")}">${esc(t.project || "")}</span>`;
+    const org = `<span class="kc-org" style="--org:${esc(color)}" title="${esc(bareKey(site && site.siteKey))}">${esc(t.project || "")}</span>`;
     if (!isEpicTicket(t) && ticketOutcomeOf(o.sessions)) {
       // A ticket its newest session closed (XERK-1569): that session's chip, the
       // start control after it and the org tag wrap as ONE unit (.kc-tail), so
@@ -1962,7 +1968,7 @@
       bits.push(`<span class="td-dim">Auto — most available agent</span>`);
     } else {
       const opt = (hostOptions || []).find(h => h && h.key === pin.host);
-      bits.push(`<span class="kc-repo">${esc(opt ? opt.name : pin.host)}</span>`);
+      bits.push(`<span class="kc-repo">${esc(opt ? opt.name : bareKey(pin.host))}</span>`);
       // A pinned host that stopped reporting the org (or went quiet) still IS
       // the pin — findTicketHost refuses rather than reroutes — so the row says
       // what that means for the next spawn instead of hiding it.
@@ -1997,7 +2003,7 @@
     // the pin and turning a click-away into a silent release of it (the same
     // trap repoPickerHtml documents).
     const orphan = cur && !opts.some(h => h.key === cur)
-      ? { key: cur, name: hostName(cur), online: false, gone: true } : null;
+      ? { key: cur, name: bareKey(cur), online: false, gone: true } : null;
     const optHtml = (h) => `<option value="${esc(h.key)}"${
       h.key === cur ? " selected" : ""}>${esc(h.name)}${
       h.gone ? " (no longer reports this org)" : h.online ? "" : " (offline)"}</option>`;
@@ -2541,7 +2547,7 @@
     const color = o.color || "var(--muted)";
     return `<div class="td-head">
         <div class="td-crumbs">
-          <span class="kc-org" style="--org:${esc(color)}" title="${esc(o.siteKey || "")}">${esc(v("project") || "")}</span>
+          <span class="kc-org" style="--org:${esc(color)}" title="${esc(bareKey(o.siteKey))}">${esc(v("project") || "")}</span>
           <a class="kc-key" href="${safeUrl(v("url"))}" target="_blank" rel="noopener">${esc(t.key)}</a>
           <span class="kc-type">${esc(v("type") || "")}</span>
         </div>
@@ -2636,7 +2642,7 @@
       notes.push(`<div class="kc-note">Some orgs report only their first ${esc(String(o.capNote || "N"))} tickets (truncated).</div>`);
     }
     for (const s of shown) {
-      if (s.error) notes.push(`<div class="kc-note kc-err">${esc(s.siteKey)}: last poll failed — ${esc(s.error)} (showing last good data)</div>`);
+      if (s.error) notes.push(`<div class="kc-note kc-err">${esc(bareKey(s.siteKey))}: last poll failed — ${esc(s.error)} (showing last good data)</div>`);
     }
     // The id is `preserveScroll`'s stable anchor for the strip's SIDEWAYS scroll
     // (XERK-253): the notes above it come and go with a poll error, which moves
@@ -2865,7 +2871,7 @@
   const api = {
     CATEGORIES, SLOTS, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgSlotPin, orgName, hostName, autoStartOn, ageStr,
     createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
-    prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
+    bareKey, prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     dedupeChipHtml, dedupeTwinUrl,
     agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,

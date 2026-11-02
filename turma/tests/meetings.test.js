@@ -57,7 +57,7 @@ function loadPage(reply = () => ({}), orgKeys = []) {
     TurmaNav: { preserveScroll: (el, paint) => paint(), toast: (m) => toasts.push(m),
       refusalText: (what, status, body) => `${what} failed — ${(body && body.error) || `the hub answered HTTP ${status}`}` },
     TurmaOrg: { getKeys: () => orgKeys, update: noop, subscribe: noop, sse: noop },
-    TurmaBoard: { orgName: (k, o) => o || k, mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
+    TurmaBoard: { bareKey: require("../public/board.js").bareKey, orgName: (k, o) => o || k, mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
   };
   const keys = Object.keys(stubs);
@@ -281,4 +281,13 @@ test("XERK-2638: the Tenir labels list keeps the open state the operator left it
   toggle(false);
   P.update({ ...d });
   assert.match(P.list(), /<details class="mt-labels">/);
+});
+
+// XERK-2634: a meeting's host is a registry key, tenant-suffixed after the
+// tenancy migration; the running line prints the device alone.
+test("a meeting read on a tenant host names the host without the tenant", () => {
+  const P = loadPage(META);
+  P.renderMeetings(data([meeting({ status: "running", host: "k8x-02@77778a16d8b028aab55c7729d587dbd7", items: undefined })]));
+  assert.match(P.list(), /Reading the captions on k8x-02…/);
+  assert.doesNotMatch(P.list(), /77778a16/);
 });

@@ -1828,7 +1828,7 @@ async function savePolicy() {
   paintPolicyPanel();
   // refusalText reads `.error` off the RESPONSE BODY object (XERK-264), so pass
   // `respBody`, not the extracted string, or the toast drops to a bare HTTP status.
-  TurmaNav.toast(TurmaNav.refusalText(`Triage policy for ${siteKey}`, status, respBody));
+  TurmaNav.toast(TurmaNav.refusalText(`Triage policy for ${B.bareKey(siteKey)}`, status, respBody));
 }
 
 $policyBtn.addEventListener("click", openPolicyPanel);
@@ -1913,7 +1913,7 @@ async function permissionRequest(method, body) {
       permState.err = "";
     } else {
       permState.err = d.error || `HTTP ${r.status}`;
-      TurmaNav.toast(TurmaNav.refusalText(`Permission policy for ${siteKey}`, status, d));
+      TurmaNav.toast(TurmaNav.refusalText(`Permission policy for ${B.bareKey(siteKey)}`, status, d));
     }
   } catch {
     permState.err = "the hub is unreachable";

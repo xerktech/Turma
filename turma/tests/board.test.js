@@ -14,7 +14,7 @@ const {
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
   dedupeChipHtml, dedupeTwinUrl,
-  agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
+  agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue, bareKey,
   modelPinOf, modelPickOf, workClassOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
   runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
   platformPinOf, platformFieldHtml, platformPickerHtml, platformPickerValue, prettyPlatform,
@@ -3681,4 +3681,54 @@ test("board.html: a refused epic-run POST paints the open panel's inline error (
   p.epicOps.delete(p.startKey(site.siteKey, "E-1"));
   p.refreshOpenTicket();
   assert.doesNotMatch(panel.innerHTML, /no free host/);
+});
+
+// ---- XERK-2634: a tenant key's @<tenant> suffix is display-only -------------
+
+const TENANT = "77778a16d8b028aab55c7729d587dbd7";
+
+test("bareKey: drops exactly a trailing @ + 32 lowercase hex, nothing else", () => {
+  assert.equal(bareKey(`TrueNAS@${TENANT}`), "TrueNAS");
+  assert.equal(bareKey(`myorg.atlassian.net@${TENANT}`), "myorg.atlassian.net");
+  assert.equal(bareKey("TrueNAS"), "TrueNAS", "a plain key is unchanged");
+  // Not the tenant shape: uppercase hex, 31 / 33 chars, a trailing extra, a
+  // non-hex char, or the suffix mid-string all stay whole.
+  for (const k of [`TrueNAS@${TENANT.toUpperCase()}`, `TrueNAS@${TENANT.slice(1)}`,
+    `TrueNAS@${TENANT}0`, `TrueNAS@${TENANT}x`, `TrueNAS@${TENANT.slice(1)}g`,
+    `TrueNAS@${TENANT}/x`, "box@corp", "a@b@c"]) {
+    assert.equal(bareKey(k), k, k);
+  }
+  // Only the LAST suffix goes.
+  assert.equal(bareKey(`a@${TENANT}@${TENANT}`), `a@${TENANT}`);
+  assert.equal(bareKey(null), "");
+  assert.equal(bareKey(undefined), "");
+});
+
+test("agent picker: a tenant host shows bare, but its option value is the raw key", () => {
+  const key = `TrueNAS@${TENANT}`;
+  const sites = mergeSites([{ ...agent(key, block()), device: "" }]);
+  assert.deepEqual(sites[0].hostOptions, [{ key, name: "TrueNAS", online: true }]);
+  const pick = agentPickerHtml({ host: key }, sites[0].hostOptions);
+  assert.ok(pick.includes(`<option value="${key}" selected>TrueNAS</option>`), pick);
+  assert.equal(agentPickerValue({ host: key }), key, "the change handler compares the raw key");
+  // A pinned host that left the fleet list is carried back bare, valued raw.
+  const orphan = agentPickerHtml({ host: key }, []);
+  assert.ok(orphan.includes(`<option value="${key}" selected>TrueNAS (no longer reports this org)</option>`), orphan);
+  assert.match(agentFieldHtml({ host: key }, []), /<span class="kc-repo">TrueNAS<\/span>/);
+});
+
+test("XERK-2634: a tenant org's poll-error note and org-tag tooltips print the site bare", () => {
+  const siteKey = `acme.atlassian.net@${TENANT}`;
+  const sites = mergeSites([agent("hostA", block({ siteKey, error: "HTTP 401", tickets: [ticket("T-1")] }))]);
+  const board = boardHtml(sites, null, {});
+  assert.ok(board.includes("acme.atlassian.net: last poll failed"), board);
+  // The only place the raw key survives is the routing data-attribute.
+  assert.equal(board.split(TENANT).length - 1, 1, board);
+  assert.ok(board.includes(`data-site="${siteKey}"`), "the card still routes on the raw key");
+  const card = cardHtml(ticket("X-1"), { siteKey }, {});
+  assert.match(card, /<span class="kc-org"[^>]*title="acme\.atlassian\.net">/);
+  const det = detailHtml(ticket("X-1"), null, { siteKey });
+  assert.match(det, /<span class="kc-org"[^>]*title="acme\.atlassian\.net">/);
+  // A key without the exact tenant tail keeps its title whole.
+  assert.match(cardHtml(ticket("X-1"), { siteKey: "box@corp" }, {}), /title="box@corp"/);
 });

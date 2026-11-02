@@ -371,6 +371,12 @@ function scaleTokens(n, unit) {
   const digits = whole >= 1e21 ? BigInt(whole).toString() : String(whole);
   return digits + "." + tenths;
 }
+// A host/org key for DISPLAY: board.js bareKey drops a tenant key's `@<32-hex>`
+// suffix (XERK-2634). Handlers, maps and URLs keep the raw key.
+function displayKey(k) {
+  const B = typeof TurmaBoard !== "undefined" ? TurmaBoard : null;
+  return B && B.bareKey ? B.bareKey(k) : String(k ?? "");
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -419,7 +425,7 @@ function limitEntries(agents, nowSec) {
       && LIMIT_WINDOWS.some(([k]) => typeof (a.limits[k] || {}).usedPct === "number")
       && now - (a.limits.capturedAt || 0) <= LIMIT_MAX_AGE_SEC)
     .map(a => ({
-      host: a.device || a.key,
+      host: displayKey(a.device || a.key),
       // The subscription this host's login is on (XERK-301), or null when it
       // can't say — see limitGroups.
       subKey: subscriptionKeyOf(a),
@@ -656,7 +662,7 @@ function repoLabel(name) { return name === ROOT_REPO ? "Root" : name; }
 // a name that no longer exists anywhere else in the app reads as a live host
 // that simply spent nothing today.
 function hostLabel(a) {
-  const name = (a && (a.device || a.key)) || "";
+  const name = displayKey(a && (a.device || a.key));
   return a && a.retired ? name + " (removed)" : name;
 }
 

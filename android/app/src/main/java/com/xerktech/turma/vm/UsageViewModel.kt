@@ -7,6 +7,7 @@ import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.model.UsageBucket
 import com.xerktech.turma.model.UsageInfo
 import com.xerktech.turma.net.FleetState
+import com.xerktech.turma.core.bareKey
 
 /**
  * Persistent token usage derived from the agents' usage aggregates (repoUsage /
@@ -508,7 +509,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                     groups.add(it)
                     if (subKey != null) byKey[subKey] = it
                 }
-                group.hosts.add(LimitHost(a.device.ifBlank { a.key }, lim.capturedAt))
+                group.hosts.add(LimitHost(a.device.ifBlank { bareKey(a.key) }, lim.capturedAt))
                 group.capturedAt = maxOf(group.capturedAt, lim.capturedAt)
                 // The card's name takes the FRESHEST reporter's label (XERK-541),
                 // the same freshest-first + strict-`>` rule the windows use, so

@@ -219,6 +219,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " transcriptToTrajectory, trajectoryBack, trajScrollClick, trajScrollKey, trajToggleTurn, loadTrajectory,"
       + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml, hostCapHtml, toggleHost, hostWeekly, hostWeeklyHtml, hostHeadId,"
       + " applyAgent, mergeSnapshot, sseClock: () => sseClock,"
+      + " doSearch, setSearchQuery: (q) => { searchQuery = q; },"
       + " setCache: (c) => { cache = c; }, getCache: () => cache, setDraft: (t) => { renameDraft = t; },"
       + " setPendingSelectAt: (t) => { pendingSelectAt = t; }, SELECT_FOLLOW_MS };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
@@ -3971,4 +3972,69 @@ test("hostWeeklyHtml: width, levels, pace tick, a passed reset reads —", () =>
   assert.match(gone, /width:0%/);
   assert.equal(hostWeeklyHtml(null, now), "");
   assert.equal(hostWeeklyHtml({ usedPct: "x" }, now), "");
+});
+
+// XERK-2634. A migrated host's key is `<device>@<32-hex tenant>`. Every place the
+// page PRINTS a host shows the device alone; every handler keeps the raw key.
+const TENANT_KEY = "TrueNAS@77778a16d8b028aab55c7729d587dbd7";
+test("a tenant host's picker header and card meta drop the @<tenant> suffix", () => {
+  const p = loadPage();
+  const data = host([idle("33333", "Tenanted")]);
+  const a = { ...data.host, key: TENANT_KEY, device: "" };
+  p.beat({ now: data.now, agents: [a] });
+  const spawn = p.els.spawn.innerHTML;
+  assert.match(spawn, /<span class="hlabel">TrueNAS<\/span>/);
+  assert.ok(spawn.includes(`onclick="toggleHost('${TENANT_KEY}')"`), "the header's handler keeps the raw key");
+  const meta = p.els.idle.innerHTML.match(/<div class="meta"[^>]*>[\s\S]*?<\/div>/)[0];
+  assert.match(meta, /title="repoX · TrueNAS · 33333"/);
+  assert.doesNotMatch(meta, /77778a16/);
+});
+
+test("a host key whose tail is not exactly @ + 32 lowercase hex is printed whole", () => {
+  for (const key of ["box@corp", "TrueNAS@77778A16D8B028AAB55C7729D587DBD7",
+    "TrueNAS@77778a16d8b028aab55c7729d587dbd"]) {
+    const p = loadPage();
+    const data = host([]);
+    p.beat({ now: data.now, agents: [{ ...data.host, key, device: "" }] });
+    assert.ok(p.els.spawn.innerHTML.includes(`<span class="hlabel">${key}</span>`), key);
+  }
+});
+
+// The Move and Restore pickers PRINT a tenant host bare but must hand the hub the
+// raw key: the migrate/restore routes look the target up by its registry key.
+test("Move to: a tenant target is listed bare and posted with its raw key", async () => {
+  const { beat, toggleCardMenu, openMove, moveTo, posts, els } = loadPage({ postReply: { migrationId: "mig1" } });
+  beat(moveFleet([{ ...otherHost(TENANT_KEY), device: "" }]));
+  toggleCardMenu(click, "11111");
+  openMove(click, "11111");
+  const menu = els.active.innerHTML;
+  assert.ok(menu.includes(`moveTo(event,'hostA','11111','${TENANT_KEY}')">TrueNAS</button>`), menu);
+  await moveTo(click, "hostA", "11111", TENANT_KEY);
+  assert.deepEqual(posts[0].body, { host: TENANT_KEY });
+});
+
+test("Restore to: a tenant target is listed bare, posted raw, and toasted bare", async () => {
+  const { beat, showRestore, toggleRestoreMenu, restoreTo, posts, toasts, els } =
+    loadPage({ postReply: { migrationId: "mig9" } });
+  beat(restoreFleet([{ key: TENANT_KEY, device: "", online: true, lastSeen: Date.now(),
+    repos: [{ name: "repoX" }], sessions: [] }]));
+  showRestore(archived);
+  toggleRestoreMenu(click);
+  const menu = els.trRestoreMenu.innerHTML;
+  assert.ok(menu.includes(`restoreTo(event,'${TENANT_KEY}')">TrueNAS`), menu);
+  await restoreTo(click, TENANT_KEY);
+  assert.deepEqual(posts[0].body, { host: TENANT_KEY });
+  assert.ok(toasts.includes("Restoring onto TrueNAS…"), JSON.stringify(toasts));
+});
+
+test("archive search: a hit's host badge drops the tenant suffix", async () => {
+  const p = loadPage();
+  p.body.classList.add("searching");
+  p.setGet((url) => (url.startsWith("/api/search") ? { groups: [{ repo: "repoX", matches: [
+    { transcriptId: "t1", role: "user", host: TENANT_KEY, ts: 1, snippet: "hi" }] }] } : null));
+  p.setSearchQuery("hi");
+  await p.doSearch("hi");
+  const html = p.els.searchResults.innerHTML;
+  assert.match(html, /<span class="badge">TrueNAS<\/span>/);
+  assert.doesNotMatch(html, /77778a16/);
 });

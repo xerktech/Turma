@@ -66,6 +66,7 @@ import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.RepoInfo
 import com.xerktech.turma.model.SessionInfo
 import com.xerktech.turma.vm.FleetViewModel
+import com.xerktech.turma.core.bareKey
 
 @Composable
 fun FleetScreen(
@@ -300,7 +301,7 @@ private fun HostSection(
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Column(Modifier.weight(1f)) {
-                    Text(agent.device.ifBlank { agent.key }, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                    Text(agent.device.ifBlank { bareKey(agent.key) }, style = MaterialTheme.typography.titleMedium, maxLines = 1)
                     Text(
                         "${codingAgentLabel(agent)} · Turma ${agent.agentVersion.ifBlank { "–" }}",
                         style = MaterialTheme.typography.bodySmall,
