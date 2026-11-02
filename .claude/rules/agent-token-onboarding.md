@@ -55,6 +55,8 @@ Split out of `CLAUDE.md`, which keeps the per-host credential contract (XERK-268
     credential (`consumeEnrollCode`). Lookup → state check → name check → used-stamp in ONE
     synchronous turn, so two racing redemptions cannot both win (the leader is the single writer).
   - It returns the host's IDENTITY token (`issueAgentUid`), and works under `TURMA_AGENT_STRICT`.
+  - `ENROLL_CODES_LIVE_MAX` (20 unused) is PER TENANT and the `ENROLL_CODES_MAX` eviction takes the
+    biggest tenant's oldest settled code (XERK-2621): fleet-wide, one tenant's codes refused all.
   - **A code never takes a name another agent holds** (`enrollNameRefusal`, case-folded) — that
     would hand the code holder that host's token and queued commands. An identity minted for the
     name that never beat is SUPERSEDED, so two machines never share one id.

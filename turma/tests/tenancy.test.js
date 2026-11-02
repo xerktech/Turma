@@ -20,6 +20,7 @@ process.env.TURMA_AGENT_TOKEN = "agenttok";
 process.env.TURMA_BOOTSTRAP_ADMIN_USER = "firstadmin";
 process.env.TURMA_BOOTSTRAP_ADMIN_PASSWORD = "first-admin-pass";
 process.env.TURMA_MEETINGS_TOKEN = "meetingstok"; // XERK-2556: Tenir's route, per-tenant tokens
+process.env.EPIC_BUILDERS_MAX = "4"; // XERK-2621: small enough to drive the eviction
 
 const tmp = (name) => path.join(scratchDir(), `turma-tenancy-${name}-${process.pid}.json`);
 // Every durable store the hub opens gets a scratch file: an unset one writes the
@@ -953,4 +954,84 @@ test("XERK-2556: host names shaped like another tenant's key are no way in", asy
   // A second "laptop" inside one tenant is refused (two machines, one key).
   const m = await request("POST", "/api/enroll-codes", { headers: A.h, body: { device: "Laptop" } });
   assert.notEqual(m.status, 200, "a case twin of A's own host");
+});
+
+// ---- XERK-2621: a fleet-wide cap never lets one tenant lock out or evict another
+
+test("XERK-2621: one tenant's unused enrollment codes never refuse another tenant's mint", async () => {
+  const { A, B } = await isoFleet();
+  const minted = [];
+  let refused = null;
+  for (let i = 0; i < 25 && !refused; i++) {
+    const r = await request("POST", "/api/enroll-codes", { headers: A.h, body: {} });
+    if (r.status === 200) minted.push(JSON.parse(r.raw).enrollCode.id);
+    else refused = r;
+  }
+  try {
+    assert.ok(refused, "A reaches its own cap");
+    assert.equal(refused.status, 409, refused.raw);
+    const b = await request("POST", "/api/enroll-codes", { headers: B.h, body: {} });
+    assert.equal(b.status, 200, `B is refused by A's codes: ${b.raw}`);
+    minted.push(JSON.parse(b.raw).enrollCode.id);
+  } finally {
+    for (const id of minted) {
+      for (const w of [A, B]) await request("DELETE", `/api/enroll-codes/${id}`, { headers: w.h });
+    }
+  }
+});
+
+test("XERK-2621: arming epic builders past the cap evicts only the arming tenant's", async () => {
+  const { A, B } = await isoFleet();
+  const arm = async (w, i) => {
+    const r = await request("POST", `/api/jira/${encodeURIComponent(w.site)}/epic-builder`,
+      { headers: w.h, body: { title: `${w.tag} epic ${i}`, idea: "an idea" } });
+    assert.equal(r.status, 200, r.raw);
+    return JSON.parse(r.raw).run.id;
+  };
+  const bId = await arm(B, "b");
+  const before = Object.keys(JSON.parse((await get("/api/agents", B.h)).raw).epicBuilders || {});
+  let last = null;
+  for (let i = 0; i < 6; i++) last = await arm(A, i); // EPIC_BUILDERS_MAX is 4 here
+  const bNow = Object.keys(JSON.parse((await get("/api/agents", B.h)).raw).epicBuilders || {});
+  assert.ok(bNow.includes(bId), "B's queued builder survives A's burst");
+  assert.deepEqual(bNow.sort(), before.sort(), "none of B's builders were evicted");
+  assert.ok(JSON.parse((await get("/api/agents", A.h)).raw).epicBuilders[last], "A's newest is kept");
+});
+
+test("XERK-2621: one tenant's pending meetings never 429 another tenant's post", async () => {
+  const { A, B } = await isoFleet();
+  const body = (mid) => ({ meetingId: mid, title: "standup", platform: "zoom", startedAt: Date.now() - 60_000,
+    endedAt: Date.now(), participants: ["x"], segments: [{ speaker: "x", text: "said", startMs: 0, endMs: 1 }] });
+  // A fills the fleet budget across several of its orgs (each org holds 10).
+  const orgs = [1, 2, 3].map((n) => `fill${n}.example@${A.t}`);
+  let refused = null;
+  try {
+    for (let i = 0; i < 30 && !refused; i++) {
+      const r = hub.acceptMeeting(orgs[Math.floor(i / 10)], body(`fill-${i}`));
+      if (r.status !== 200) refused = r;
+    }
+    assert.equal(refused && refused.status, 429, "A hits the fleet budget");
+    const b = hub.acceptMeeting(B.site, body(`b-${rand()}`));
+    assert.equal(b.status, 200, `B is refused by A's backlog: ${JSON.stringify(b.body)}`);
+    assert.equal(hub.acceptMeeting(orgs[2], body("fill-more")).status, 429, "A stays refused");
+  } finally {
+    for (const o of orgs) delete hub.getMeetings()[o];
+  }
+});
+
+test("XERK-2621: the pin maps evict the biggest tenant's oldest pin, never another's", () => {
+  const ta = "a".repeat(32), tb = "b".repeat(32);
+  assert.equal(hub.tenantOfPinKey(`dev.azure.com/org@${ta}/123`), ta, "an ADO site keeps its tenant");
+  assert.equal(hub.tenantOfPinKey("x.atlassian.net/X-1"), "");
+  const map = {};
+  for (let i = 0; i < 5; i++) map[`s@${ta}/A-${i}`] = { at: 100 + i };
+  map[`s@${tb}/B-1`] = { at: 1 };
+  map["s/U-1"] = { at: 2 };
+  map[`s@${ta}/A-new`] = { at: 999 };
+  const out = hub.trimByTenant(map, 6, hub.tenantOfPinKey, (r) => r.at, `s@${ta}/A-new`);
+  assert.deepEqual(out, [`s@${ta}/A-0`, `s@${ta}/A-1`]);
+  assert.ok(map[`s@${tb}/B-1`] && map["s/U-1"] && map[`s@${ta}/A-new`]);
+  // Tied tenants: the older victim goes first.
+  const tie = { [`s@${ta}/A`]: { at: 5 }, [`s@${tb}/B`]: { at: 3 } };
+  assert.deepEqual(hub.trimByTenant(tie, 1, hub.tenantOfPinKey, (r) => r.at), [`s@${tb}/B`]);
 });

@@ -40,6 +40,9 @@ ticket builds to this file; change it here first.
   → 429 too many meetings waiting (`MEETINGS_PENDING_ORG_MAX` 10 per org,
   `MEETINGS_PENDING_TOTAL_MAX` 20 fleet-wide, or pending transcripts past
   `MEETINGS_PENDING_BYTES_MAX` 2 MiB fleet-wide, 1 MiB of it per org).
+  - A fleet-wide budget refuses a tenant only at its FAIR SHARE (budget ÷ tenants with meetings
+    waiting, itself included; XERK-2621), so one tenant's backlog never 429s another. Worst case
+    the store holds about twice each budget.
 - A settled row's items fit `MEETING_ITEMS_BYTES_MAX` (64 KiB) of JSON: past it the hub shortens
   descriptions and quotes ("…") by the least that fits; only what cannot fit even then is dropped.
   - Why: the agent's parser allows far more (30 × 4000-char descriptions); a cut dropped items silently.

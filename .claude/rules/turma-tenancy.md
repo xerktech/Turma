@@ -229,6 +229,11 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   Deleting a user in the admin panel runs it (kills, revoke, purge order: `turma-admin.md`).
 - The `/api/agents` payload + SSE carry only the caller's orgs' maps (XERK-2534, below).
 - Tests: the `XERK-2551:` cases in `server.test.js`.
+- **A store with one fleet-wide cap evicts or refuses PER TENANT** (XERK-2621): `trimByTenant` takes
+  the oldest record of the tenant holding the most (pins, triage actions, epic runs/builders,
+  settled enroll codes); live enroll codes cap per tenant; meetings' fleet budgets refuse only a
+  tenant at its fair share. A plain oldest-first cap let one tenant evict or lock out another.
+  Tests: the `XERK-2621:` cases in `tenancy.test.js`.
 - **A claimed siteKey grants nothing** (XERK-2596): an org's membership, writes and dispatch all
   key on the SCOPED org, so a tenant host beating another org's site is only in its own org.
   - Never add an org route outside the `/api/jira|orgs/<site>` guard, nor a host picker that

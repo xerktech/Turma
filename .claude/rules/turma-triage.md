@@ -19,8 +19,8 @@ machinery is in `.claude/rules/turma-board.md`.
 
 - **`ticketTriageActions`** (`TRIAGE_ACTIONS_FILE`, `/data/triage-actions.json`):
   `"<siteKey>/<issueKey>" -> {action: "approve"|"hold"|"reject", at}`. Bounded
-  (`TRIAGE_ACTIONS_MAX`, 500; oldest `at` evicted). The operator's per-ticket verdict on the
-  auto stream.
+  (`TRIAGE_ACTIONS_MAX`, 500; the oldest `at` of the tenant holding the most evicted,
+  XERK-2621). The operator's per-ticket verdict on the auto stream.
 - **`triagePolicies`** (`TRIAGE_POLICIES_FILE`, `/data/triage-policies.json`):
   `siteKey -> {minPriority?, excludeTypes?, repoAllow?, repoDeny?, rateMax?, includeNotActionable?}`
   — the per-org knobs shaping WHAT an enabled org auto-starts. The `/autostart` on/off switch is still the master
