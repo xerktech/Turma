@@ -162,6 +162,12 @@ repos the durable file lacks — operator edits always win.
 - **The read seams the rest of triage consumes**: `repoTierRank` for the auto-stream sort key (tier
   is the LAST tiebreak, below P0/age/type) and [F]'s allow/deny; `isRepoIgnored` for the one policy
   this store owns outright.
+- **A tier key carries its TENANT** (XERK-2620): `<repo>@<tenantId>` for a tenant's repo, the bare
+  name for the operators'. Readers pass the ticket's scoped `siteKey` (`isRepoIgnored(repo, site)`,
+  `repoTierRank`, `triageSortKey`), never a bare repo alone — two tenants with a same-named repo
+  shared one tier that way. The route writes the caller's `ledgerTenantOf` tenant; clients see their
+  own tenant's tiers under the plain name (`tenant-scope.js` `repoTiersFor`). Purge + migration step
+  registered. Tests: `XERK-2620:` in `tenancy.test.js`, `server.test.js`, `tenant-migration.test.js`.
 - **`ignore`-tier repos never auto-start.** `autoStartSweep` skips them (never enqueued) and
   `drainTicketQueue` drops an AUTO entry whose repo was retiered to ignore mid-wait — no churn, like
   a ticket that lost its triaged repo. A MANUAL start is deliberate intent and is **not** tier-gated.

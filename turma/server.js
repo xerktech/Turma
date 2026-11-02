@@ -5726,7 +5726,7 @@ function epicRunDriveSweep() {
       // auto-runs. Skipped silently (re-checked next sweep) rather than queued as
       // a blocked entry that would churn a terminal "gave up" note.
       const repo = ticketRepo(siteKey, childKey, rows);
-      if (!repo || isRepoIgnored(repo)) continue;
+      if (!repo || isRepoIgnored(repo, siteKey)) continue;
       // XERK-1568: a rollup ticket is a findings list, never work — even when an
       // armed epic lists it as a child. Skipped silently like an ignore-tier repo.
       if (isRollupTicket(row)) continue;
@@ -5857,7 +5857,9 @@ const repoTiersCoerce = (raw) => {
   const o = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     for (const [k, v] of Object.entries(raw)) {
-      if (k && k.length <= REPO_NAME_MAX && isRepoTier(v) && v !== DEFAULT_REPO_TIER) o[k] = v;
+      // A tenant's key is `<repo>@<tenantId>` (XERK-2620): the bound is the name's.
+      const base = baseOfKey(k);
+      if (base && base.length <= REPO_NAME_MAX && isRepoTier(v) && v !== DEFAULT_REPO_TIER) o[k] = v;
     }
   }
   return o;
@@ -5903,33 +5905,48 @@ const persistRepoTiers = registerExternalStore({
 // `repoGuess`/`ticketRepo` yields, so a ticket's triaged repo joins cleanly.
 // An unset or blank repo is the default middle tier — the "can't tell" answer,
 // never top — so every caller gets a usable rank without a null check.
-function repoTier(repo) {
-  return (repo && repoTiers[repo]) || DEFAULT_REPO_TIER;
+//
+// A repo NAME carries no tenant, so the store key does (XERK-2620), like an org
+// key (XERK-2551): `<repo>@<tenantId>` for a tenant's repo, the bare name for
+// the operators' (untenanted) one — so two tenants with a same-named repo never
+// share a tier. Readers pass the ORG the ticket belongs to (`siteKey`, which
+// carries the tenant) or a tenant id; clients see their own tenant's keys
+// unscoped (tenant-scope.js `repoTiers`).
+function repoTierKey(repo, tenantId) {
+  return tenantId ? `${repo}@${tenantId}` : repo;
 }
-function repoTierRank(repo) {
-  return REPO_TIER_RANK[repoTier(repo)];
+// `scope` is a scoped siteKey (its tenant is read off it) or "" / absent.
+function repoTier(repo, scope) {
+  return (repo && repoTiers[repoTierKey(repo, tenantOfSite(scope || ""))]) || DEFAULT_REPO_TIER;
+}
+function repoTierRank(repo, scope) {
+  return REPO_TIER_RANK[repoTier(repo, scope)];
 }
 // The one policy the tier store owns outright (XERK-487): an ignore-tier repo is
 // never auto-started. [F]'s allow/deny reads the rank for finer thresholds.
-function isRepoIgnored(repo) {
-  return repoTier(repo) === "ignore";
+function isRepoIgnored(repo, scope) {
+  return repoTier(repo, scope) === "ignore";
 }
-// Set (or, with tier === DEFAULT_REPO_TIER, clear) a repo's tier. The caller has
-// already validated the name and the tier value; this owns the map bookkeeping,
-// mirroring setAutoStartOrg/setOrgColor — durable save, cache bust, SSE frame.
-function setRepoTier(repo, tier) {
-  if (tier && tier !== DEFAULT_REPO_TIER) repoTiers[repo] = tier;
-  else delete repoTiers[repo];
+// Set (or, with tier === DEFAULT_REPO_TIER, clear) a repo's tier in tenant
+// `tenantId` ("" = untenanted). The caller has already validated the name and
+// the tier value; this owns the map bookkeeping, mirroring
+// setAutoStartOrg/setOrgColor — durable save, cache bust, SSE frame.
+function setRepoTier(repo, tier, tenantId = "") {
+  const k = repoTierKey(repo, tenantId);
+  if (tier && tier !== DEFAULT_REPO_TIER) repoTiers[k] = tier;
+  else delete repoTiers[k];
   persistRepoTiers();
   invalidateAgentsCache();
   sseBroadcast("repoTiers", repoTiers);
 }
-// The repo names the fleet actually reports (agents[].repos[].name), so a tier
-// can't be pinned onto a phantom repo — the same "no inventing state the fleet
-// doesn't back" guard the /autostart and /color routes apply to a siteKey.
-function fleetRepoNames() {
+// The repo names tenant `tenantId`'s hosts report (agents[].repos[].name; ""
+// = the untenanted hosts), so a tier can't be pinned onto a phantom repo — the
+// same "no inventing state the fleet doesn't back" guard the /autostart and
+// /color routes apply to a siteKey — nor onto another tenant's.
+function fleetRepoNames(tenantId = "") {
   const names = new Set();
-  for (const a of Object.values(agents)) {
+  for (const [key, a] of Object.entries(agents)) {
+    if (tenantOfKey(key) !== tenantId) continue;
     for (const r of (a && a.repos) || []) if (r && r.name) names.add(r.name);
   }
   return names;
@@ -7681,6 +7698,12 @@ registerTenantPurge("meetingTokens", (t) => {
   persistMeetingTokens();
   return 1;
 });
+// Repo tiers carry their tenant on the key (`<repo>@<t>`, XERK-2620).
+registerTenantPurge("repoTiers", (t) => {
+  const n = dropTenantKeys(repoTiers, t, (k) => k);
+  if (n) { persistRepoTiers(); sseBroadcast("repoTiers", repoTiers); }
+  return n;
+});
 registerTenantPurge("devices", (t) => {
   const before = devices.length;
   devices = devices.filter((d) => !(d && d.tenantId === t));
@@ -7972,6 +7995,25 @@ registerTenantMigration({
       n++;
     }
     if (n) persistModelPolicy();
+    return n;
+  },
+});
+// Repo tiers (XERK-2620): an untenanted `<repo>` key becomes `<repo>@<t>`. Only on
+// the first run: a plain tier set afterwards is an operator's, for its own hosts.
+registerTenantMigration({
+  name: "repoTiers",
+  count: (t, scope) => (scope ? 0 : Object.keys(repoTiers).filter((k) => !tenantOfKey(k)).length),
+  apply: (t, scope) => {
+    if (scope) return 0;
+    let n = 0;
+    for (const k of Object.keys(repoTiers)) {
+      if (tenantOfKey(k)) continue;
+      const nk = repoTierKey(k, t);
+      if (!Object.hasOwn(repoTiers, nk)) repoTiers[nk] = repoTiers[k];
+      delete repoTiers[k];
+      n++;
+    }
+    if (n) { persistRepoTiers(); invalidateAgentsCache(); sseBroadcast("repoTiers", repoTiers); }
     return n;
   },
 });
@@ -12156,7 +12198,7 @@ function tenantViewFor(p) {
     }
   }
   return { mayHost, maySite: (site) => principalMaySite(p, site), repos, fleetRepos,
-    seesUntenanted: mayHost("") };
+    seesUntenanted: mayHost(""), repoTenant: ledgerTenantOf(p) };
 }
 // A stable name for the set of hosts a principal reaches, for memoizing a scoped
 // payload per view (tenant users of one tenant, and the operators, share one).
@@ -18062,7 +18104,7 @@ function drainTicketQueue() {
     // The sweep won't re-queue an ignore-tier repo, so drop it with no churn —
     // exactly like a ticket that lost its triaged repo above. A MANUAL entry is
     // left alone: a hand-started ticket is deliberate intent, not tier-gated.
-    if (e.source === "auto" && isRepoIgnored(repo)) {
+    if (e.source === "auto" && isRepoIgnored(repo, e.siteKey)) {
       drop("its repo is now ignore-tier");
       continue;
     }
@@ -18391,7 +18433,7 @@ function duplicateTwinOpen(siteKey, twinKey, rows) {
 // An absent or unparseable `created` sorts LAST (Infinity) — both comparators
 // test `!==` before subtracting, so two Infinities stay equal and keep board
 // order. `Date.parse` reads Jira's `+0000` and ADO's `Z` alike.
-function triageSortKey(t, repo) {
+function triageSortKey(t, repo, siteKey) {
   const tr = t && typeof t === "object" && t.triage && typeof t.triage === "object"
     ? t.triage : null;
   const created = t && typeof t.created === "string" ? Date.parse(t.created) : NaN;
@@ -18400,7 +18442,7 @@ function triageSortKey(t, repo) {
     Number.isFinite(created) ? created : Infinity,
     tr && TRIAGE_TYPE_WEIGHT[tr.type] !== undefined
       ? TRIAGE_TYPE_WEIGHT[tr.type] : NO_TYPE_WEIGHT,
-    -repoTierRank(repo),
+    -repoTierRank(repo, siteKey),
   ];
 }
 
@@ -18461,7 +18503,7 @@ function ticketQueueOrder(rows) {
   for (const e of ticketQueue) {
     const hit = rows.get(ticketQueueKey(e.siteKey, e.issueKey));
     const row = hit ? hit.row : null;
-    const key = triageSortKey(row, ticketRepo(e.siteKey, e.issueKey, rows));
+    const key = triageSortKey(row, ticketRepo(e.siteKey, e.issueKey, rows), e.siteKey);
     let line = lines.get(e.siteKey);
     if (!line) lines.set(e.siteKey, (line = []));
     line.push({ e, key });
@@ -18501,10 +18543,10 @@ function autoStartCandidates(siteKey, rows) {
   return ticketRowsForSite(rows, siteKey)
     .map((r) => {
       const repo = r.row ? ticketRepo(siteKey, r.row.key, rows) : null;
-      return { t: r.row, repo, key: triageSortKey(r.row, repo) };
+      return { t: r.row, repo, key: triageSortKey(r.row, repo, siteKey) };
     })
     .filter((c) => c.t && c.t.key && c.t.statusCategory === "todo"
-      && c.repo && !isRepoIgnored(c.repo) && !isEpicOrEpicChild(c.t))
+      && c.repo && !isRepoIgnored(c.repo, siteKey) && !isEpicOrEpicChild(c.t))
     .sort((a, b) => {
       for (let i = 0; i < a.key.length; i++) {
         if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
@@ -18957,7 +18999,7 @@ function markResumedTicketAutoStopExempt(host, sessionId) {
 // `autoStartSweep` keeps its own inline gates (their per-drop log lines differ);
 // a cross-check test pins that this composition agrees with that one.
 function autoStartContentGate(siteKey, t, repo, rows) {
-  if (!repo || isRepoIgnored(repo)) return { kind: "repo", reason: "no eligible repo" };
+  if (!repo || isRepoIgnored(repo, siteKey)) return { kind: "repo", reason: "no eligible repo" };
   if (!t || !t.key) return { kind: "repo", reason: "no ticket row" };
   // XERK-635: an epic or an epic child is never eligible for the org auto stream —
   // the epic run drives its children in dependency order. Kept in lock-step with
@@ -26835,13 +26877,19 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, {
           error: `body needs {tier:${REPO_TIERS.map((t) => `"${t}"`).join("|")}} or {auto:true}` });
       }
-      if (!repo || repo.length > REPO_NAME_MAX) {
+      // A name in the tenant-key shape would read as another tenant's key.
+      if (!repo || repo.length > REPO_NAME_MAX || TENANT_KEY_RE.test(repo)) {
         return json(res, 400, { error: "a repo name is required" });
       }
-      if (!fleetRepoNames().has(repo) && !Object.hasOwn(repoTiers, repo)) {
+      // XERK-2620: the tier is the CALLER's tenant's (its one ledger scope: a
+      // tenant user its tenant, an operator the untenanted fleet), and the repo
+      // must be one of that tenant's hosts' — never a same-named repo of another.
+      const tierTenant = ledgerTenantOf(requestPrincipal(req));
+      if (tierTenant === null) return json(res, 404, { error: "no host reports a repo by that name" });
+      if (!fleetRepoNames(tierTenant).has(repo) && !Object.hasOwn(repoTiers, repoTierKey(repo, tierTenant))) {
         return json(res, 404, { error: "no host reports a repo by that name" });
       }
-      setRepoTier(repo, auto ? DEFAULT_REPO_TIER : body.tier);
+      setRepoTier(repo, auto ? DEFAULT_REPO_TIER : body.tier, tierTenant);
       return json(res, 200, { ok: true, tier: auto ? DEFAULT_REPO_TIER : body.tier });
     }
 

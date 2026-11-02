@@ -10410,6 +10410,20 @@ test("XERK-487: a repo retiered to ignore while its ticket waits drops from the 
   assert.equal((agents.rtLate.commands || []).length, 0);
 });
 
+test("XERK-2620: tenant repo tiers are keyed by tenant and dropped by the tenant purge", () => {
+  resetRepoTiers();
+  const t = "c".repeat(32);
+  setRepoTier("Hub", "ignore", t);
+  setRepoTier("Hub", "live");
+  assert.equal(repoTiers[`Hub@${t}`], "ignore");
+  assert.equal(isRepoIgnored("Hub", `site.example@${t}`), true);
+  assert.equal(repoTier("Hub", "site.example"), "live");
+  hub.purgeTenantData(t);
+  assert.equal(`Hub@${t}` in repoTiers, false);
+  assert.equal(repoTiers.Hub, "live", "the operators' tier survives another tenant's purge");
+  resetRepoTiers();
+});
+
 test("XERK-487: POST /api/repos/<repo>/tier pins a tier, rides the payload, resets on auto", async () => {
   resetRepoTiers();
   await asBeat("rtApi", "rt3.atlassian.net", { autoStart: false, repos: ["Hub"] });

@@ -146,6 +146,7 @@ test("XERK-2554: seed untenanted data in every partitioned store", async () => {
   hub.ticketQueue.push({ siteKey: SITE, issueKey: "ACME-2", source: "manual", at: NOW });
   hub.registerDevice("fcm-2554", "android", ["dismiss"], "");
   hub.__modelPolicyState()["bug/sonnet"] = { state: "promoted", at: NOW, graded: 40, mOnlyFail: 0 };
+  hub.setRepoTier("repo2554", "ignore");    // XERK-2620: an untenanted repo tier
 });
 
 test("XERK-2554: every partitioned store has a migration step (meeting tokens are tenant-only)", () => {
@@ -198,6 +199,11 @@ test("XERK-2554: the migration moves every store into the owner's tenant; hosts 
   assert.equal(hub.ticketQueue.find((e) => e.issueKey === "ACME-2").siteKey, tk(SITE));
   assert.equal(hub.devicesState().find((d) => d.token === "fcm-2554").tenantId, T);
   assert.ok(hub.__modelPolicyState()[`${T}:bug/sonnet`] && !hub.__modelPolicyState()["bug/sonnet"]);
+  // XERK-2620: the repo tier moves under the tenant's key, and reads through its orgs.
+  assert.equal(hub.repoTiers["repo2554@" + T], "ignore");
+  assert.ok(!Object.prototype.hasOwnProperty.call(hub.repoTiers, "repo2554"));
+  assert.equal(hub.isRepoIgnored("repo2554", tk(SITE)), true);
+  assert.equal(hub.isRepoIgnored("repo2554", SITE), false);
 
   // The retired host's ledgers and archive rows moved at once.
   assert.ok(hub.usageLedger.has(tk("gone2554")) && !hub.usageLedger.has("gone2554"));

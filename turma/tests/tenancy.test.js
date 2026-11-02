@@ -814,6 +814,40 @@ test("XERK-2556: board ids, epic builders and meetings stay inside their org", a
   assert.equal(rv.status, 404);
 });
 
+test("XERK-2620: a repo tier is its tenant's, even for a repo another tenant reports by the same name", async () => {
+  const { A, B, G } = await isoFleet();
+  const tier = (who, body) => request("POST", "/api/repos/shared-repo/tier", { headers: who.h, body });
+  try {
+    assert.equal((await tier(A, { tier: "ignore" })).status, 200);
+    // A sees its own tier under the plain name; B and the operators see none.
+    const tiersOf = async (w) => JSON.parse((await get("/api/agents", w.h)).raw).repoTiers;
+    assert.equal((await tiersOf(A))["shared-repo"], "ignore");
+    for (const w of [B, G]) {
+      const r = await get("/api/agents", w.h);
+      assert.equal(JSON.parse(r.raw).repoTiers["shared-repo"], undefined, r.raw);
+      assert.ok(!r.raw.includes(A.t), "no tenant-scoped tier key reaches another view");
+    }
+    // The sweeps read through the ticket's org: only A's auto-start is gated.
+    assert.equal(hub.isRepoIgnored("shared-repo", A.site), true);
+    assert.equal(hub.isRepoIgnored("shared-repo", B.site), false);
+    assert.equal(hub.isRepoIgnored("shared-repo", SITE), false);
+    assert.ok(hub.repoTierRank("shared-repo", B.site) > hub.repoTierRank("shared-repo", A.site));
+    // B's own tier never touches A's.
+    assert.equal((await tier(B, { tier: "live" })).status, 200);
+    assert.equal(hub.repoTier("shared-repo", A.site), "ignore");
+    assert.equal(hub.repoTier("shared-repo", B.site), "live");
+    assert.equal((await tiersOf(B))["shared-repo"], "live");
+    // A name in the tenant-key shape is refused (it would read as a tenant's key).
+    const forged = await request("POST", `/api/repos/${encodeURIComponent(`shared-repo@${B.t}`)}/tier`,
+      { headers: A.h, body: { tier: "ignore" } });
+    assert.ok(forged.status === 400 || forged.status === 404, forged.raw);
+    assert.equal(hub.repoTier("shared-repo", B.site), "live");
+  } finally {
+    await tier(A, { auto: true });
+    await tier(B, { auto: true });
+  }
+});
+
 test("XERK-2556: push, peer roster and migration never cross a tenant", async () => {
   const { A, B, G } = await isoFleet();
   for (const [w, tok] of [[A, "dev2556a"], [B, "dev2556b"], [G, "dev2556g"]]) {
