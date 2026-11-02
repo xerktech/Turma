@@ -27,7 +27,7 @@ function makeEl() {
 
 // `reply(url, init)` answers each non-/api/agents fetch: a body for 200, or
 // {status, body} for a refusal.
-function loadPage(reply = () => ({})) {
+function loadPage(reply = () => ({}), orgKeys = []) {
   const els = {};
   const fetches = [];
   const toasts = [];
@@ -56,7 +56,7 @@ function loadPage(reply = () => ({})) {
     console, Date, Math, JSON, encodeURIComponent, Number, String, Object, Array, Map, Set, Promise,
     TurmaNav: { preserveScroll: (el, paint) => paint(), toast: (m) => toasts.push(m),
       refusalText: (what, status, body) => `${what} failed — ${(body && body.error) || `the hub answered HTTP ${status}`}` },
-    TurmaOrg: { getKeys: () => [], update: noop, subscribe: noop, sse: noop },
+    TurmaOrg: { getKeys: () => orgKeys, update: noop, subscribe: noop, sse: noop },
     TurmaBoard: { orgName: (k, o) => o || k, mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
   };
@@ -201,4 +201,16 @@ test("XERK-2623: the module paints nothing before it is mounted, and counts what
   // update() takes the host page's snapshot and paints it.
   P.update(data());
   assert.match(P.list(), /Sprint &lt;sync&gt;/);
+});
+
+test("XERK-2623: the header org pick scopes the list and the tab's count", () => {
+  const OTHER = "globex.atlassian.net";
+  const both = { agents: [], meetingProposals: { [SITE]: [meeting()], [OTHER]: [meeting({ meetingId: "g1", title: "Globex sync" })] } };
+  const all = loadPage(META);
+  assert.equal(all.pendingCount(both), 4);
+  const P = loadPage(META, [OTHER]);
+  assert.equal(P.pendingCount(both), 2);
+  P.update(both);
+  assert.match(P.list(), /Globex sync/);
+  assert.doesNotMatch(P.list(), /Sprint &lt;sync&gt;/);
 });

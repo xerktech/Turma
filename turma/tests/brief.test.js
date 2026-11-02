@@ -667,3 +667,20 @@ test("XERK-2623: the Meetings pane is mounted, fed every snapshot and frame, and
   assert.equal(loadPage(null, null, "#meetings").pane(), "meetings");
   assert.equal(loadPage(null, null, "#nope").pane(), "brief");
 });
+
+test("XERK-2623: a snapshot that left before a meetingProposals frame keeps the frame's map", async () => {
+  // XERK-444 merge clock: a /api/agents body is older than an SSE frame that lands while it is in flight.
+  let release;
+  let n = 0;
+  const P = loadPage(null, () => (++n === 1
+    ? data({ meetingProposals: { [SITE]: [{ meetingId: "old" }] } })
+    : new Promise((r) => { release = r; })));
+  await P.settle();
+  P.sse[0].onopen(); P.sse[0].onopen();           // a reconnect re-reads the snapshot
+  await P.settle();
+  P.fire("meetingProposals", { [SITE]: [{ meetingId: "fresh" }] });
+  release(data({ meetingProposals: { [SITE]: [{ meetingId: "stale" }] } }));
+  await P.settle();
+  assert.deepEqual(P.getCache().meetingProposals, { [SITE]: [{ meetingId: "fresh" }] });
+  assert.equal(P.meetings.updates.at(-1).meetingProposals[SITE][0].meetingId, "fresh");
+});
