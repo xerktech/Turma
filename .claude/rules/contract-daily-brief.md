@@ -23,7 +23,7 @@ ticket builds to this file; change it here first.
     `Asia/Calcutta` on node 24) and weekdays deduped + sorted, so the coerce
     is a fixed point (HA's watch echo dedups). Null-prototype map (XERK-1451).
   - Offset zones (`+05:30`) are refused: a named zone carries the DST rules.
-  - At most 100 orgs, siteKey ≤200 chars. **The route refuses what the coerce would drop** (400
+  - At most 100 orgs per tenant (300 in all, `orgStoreFull`), siteKey ≤200 chars. **The route refuses what the coerce would drop** (400
     long key, 409 full): the file store echoes `persist()` through the coerce synchronously even
     HA-off, so a dropped key answered 200 with nothing stored. A full store first forgets orgs
     no host is decided into.

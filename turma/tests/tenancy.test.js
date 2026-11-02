@@ -1133,3 +1133,183 @@ test("XERK-2621: the pin maps evict the biggest tenant's oldest pin, never anoth
   const tie = { [`s@${ta}/A`]: { at: 5 }, [`s@${tb}/B`]: { at: 3 } };
   assert.deepEqual(hub.trimByTenant(tie, 1, hub.tenantOfPinKey, (r) => r.at), [`s@${tb}/B`]);
 });
+
+test("XERK-2626: one tenant's orgs filling the meetings and brief stores never refuse another tenant's org", async () => {
+  const { A, B } = await isoFleet();
+  const meetings = hub.getMeetings();
+  const briefs = hub.getDailyBriefs();
+  const schedules = hub.getDailyBriefSchedules();
+  // 100 orgs of A, each with a host DECIDED into it (so the full-store prune keeps
+  // them) and a settled meeting, brief and schedule: the old fleet-wide limit.
+  const orgs = Array.from({ length: 100 }, (_, i) => `fill${i}-2626.atlassian.net@${A.t}`);
+  const settledMeeting = (id) => ({ meetingId: id, status: "ok", title: "t", platform: "zoom",
+    startedAt: 1.7e12, endedAt: 1.7e12 + 1, participants: [], receivedAt: 1.7e12 });
+  const schedule = { enabled: true, time: "09:00", timeZone: "UTC", weekdays: [1], leadMinutes: 5, model: "auto" };
+  orgs.forEach((org, i) => {
+    hub.agents[`fill${i}-2626@${A.t}`] = { orgBound: org };
+    meetings[org] = [settledMeeting(`m${i}`)];
+    briefs[org] = [{ runId: `r${i}`, status: "ok", trigger: "manual" }];
+    schedules[org] = schedule;
+  });
+  const body = { meetingId: `m-b-${rand()}`, title: "B standup", platform: "zoom", startedAt: Date.now() - 60_000,
+    endedAt: Date.now(), participants: ["x"], segments: [{ speaker: "x", text: "B said", startMs: 0, endMs: 1 }] };
+  try {
+    // B's first meeting, brief and schedule are its own tenant's first org: admitted.
+    const m = hub.acceptMeeting(B.site, body);
+    assert.equal(m.status, 200, JSON.stringify(m.body));
+    const b = hub.startDailyBriefRun(B.site, "scheduled");
+    assert.ok(b.row, JSON.stringify(b));
+    const s = await request("PUT", `/api/orgs/${encodeURIComponent(B.site)}/daily-brief/schedule`,
+      { headers: B.h, body: schedule });
+    assert.equal(s.status, 200, s.raw);
+    for (const org of orgs) {
+      assert.ok(meetings[org] && briefs[org] && schedules[org], "B's admission evicts none of A's orgs");
+    }
+    // A's 101st org is refused: the limit is A's own.
+    const extra = `fill100-2626.atlassian.net@${A.t}`;
+    hub.agents[`fill100-2626@${A.t}`] = { orgBound: extra };
+    const ma = hub.acceptMeeting(extra, { ...body, meetingId: "m-a-extra" });
+    assert.equal(ma.status, 409);
+    const ba = hub.startDailyBriefRun(extra, "scheduled");
+    assert.equal(ba.status, 409);
+    assert.match(ba.error, /^100 orgs already have briefs/);
+    assert.match(ma.body.error, /^100 orgs already have meetings/);
+    assert.equal(extra in meetings || extra in briefs, false, "a refusal mints no key");
+  } finally {
+    for (let i = 0; i <= 100; i++) delete hub.agents[`fill${i}-2626@${A.t}`];
+    for (const org of [...orgs, B.site]) {
+      if (org !== B.site) { delete meetings[org]; delete schedules[org]; }
+      delete briefs[org];
+    }
+    meetings[B.site] = (meetings[B.site] || []).filter((x) => x.meetingId !== body.meetingId);
+    delete schedules[B.site];
+  }
+});
+
+test("XERK-2626: the org-count limit is per tenant, under a hard total", () => {
+  const T = (c) => c.repeat(32);
+  const fill = (store, tenant, n, tag = "s") => {
+    for (let i = 0; i < n; i++) store[`${tag}${i}.net${tenant ? `@${T(tenant)}` : ""}`] = [];
+  };
+  const store = {};
+  fill(store, "a", 100);
+  assert.equal(hub.orgStoreFull(store, `new.net@${T("a")}`, 100), "tenant");
+  assert.equal(hub.orgStoreFull(store, `new.net@${T("b")}`, 100), "");
+  assert.equal(hub.orgStoreFull(store, "new.net", 100), "", "the untenanted fleet is a tenant of its own");
+  fill(store, "b", 100);
+  fill(store, "", 99);
+  assert.equal(hub.orgStoreFull(store, `new.net@${T("c")}`, 100), "", "one under the hard total");
+  store["last.net"] = [];
+  assert.equal(hub.orgStoreFull(store, `new.net@${T("c")}`, 100), "hub");
+  assert.equal(hub.orgStoreFull(store, `new.net@${T("a")}`, 100), "tenant", "the tenant's own cap is named first");
+
+  // A self-refusal never prunes another tenant: A (decided) at its cap, C forgettable.
+  const s2 = {};
+  fill(s2, "a", 100);
+  fill(s2, "b", 100);
+  fill(s2, "c", 100);
+  const forgetC = (k) => k.endsWith(T("c"));
+  assert.deepEqual(hub.makeRoomForOrg(s2, `new.net@${T("a")}`, 100, forgetC), { full: "tenant", pruned: false });
+  assert.equal(Object.keys(s2).length, 300, "C's orgs survive A's own refusal");
+  // D at the hard total: any tenant's forgettable orgs make room.
+  assert.deepEqual(hub.makeRoomForOrg(s2, `new.net@${T("d")}`, 100, forgetC), { full: "", pruned: true });
+  assert.equal(Object.keys(s2).length, 200);
+  // A over its own cap with forgettable orgs of its own: only A's are pruned.
+  const s3 = {};
+  fill(s3, "a", 100);
+  fill(s3, "b", 50);
+  assert.deepEqual(hub.makeRoomForOrg(s3, `new.net@${T("a")}`, 100, () => true), { full: "", pruned: true });
+  assert.equal(Object.keys(s3).length, 50, "B's orgs survive A's prune");
+});
+
+test("XERK-2626: a restore keeps the hard total of orgs, not the per-tenant cap", () => {
+  const sched = { enabled: true, time: "09:00", timeZone: "UTC", weekdays: [1], leadMinutes: 5, model: "auto" };
+  const meeting = { meetingId: "m1", status: "ok", title: "t", platform: "zoom", startedAt: 1.7e12,
+    endedAt: 1.7e12 + 1, participants: [], receivedAt: 1.7e12, items: [] };
+  const brief = { runId: "0123456789abcdef", status: "failed", trigger: "manual", meetingAt: 1.7e12,
+    dayFrom: 1.7e12 - 1, weekFrom: 1.7e12 - 2, until: 1.7e12, startedAt: 1.7e12, generatedAt: 1.7e12,
+    error: "no host", model: "sonnet" };
+  const raw = (row) => Object.fromEntries(Array.from({ length: 350 }, (_, i) => [`o${i}.net`, row]));
+  assert.equal(Object.keys(hub.dailyBriefSchedulesCoerce(raw(sched))).length, 300);
+  assert.equal(Object.keys(hub.meetingsCoerce(raw([meeting]))).length, 300);
+  assert.equal(Object.keys(hub.dailyBriefsCoerce(raw([brief]))).length, 300);
+});
+
+test("XERK-2626: a refusal after its own tenant's prune still writes the pruned store, in the hub's words", async () => {
+  const { G } = await isoFleet();
+  const T = { a: "a".repeat(32), b: "b".repeat(32), d: "d".repeat(32) };
+  const names = { meetingProposals: hub.getMeetings(), dailyBriefs: hub.getDailyBriefs(),
+    dailyBriefSchedules: hub.getDailyBriefSchedules() };
+  // Start from empty stores so other cases' rows never shift the counts.
+  const saved = {};
+  for (const [n, s] of Object.entries(names)) {
+    saved[n] = { ...s };
+    for (const k of Object.keys(s)) delete s[k];
+  }
+  const meeting = (id) => ({ meetingId: id, status: "ok", title: "t", platform: "zoom", startedAt: 1.7e12,
+    endedAt: 1.7e12 + 1, participants: [], receivedAt: 1.7e12, items: [] });
+  const brief = (i) => ({ runId: (i + 1).toString(16), status: "failed", trigger: "manual",
+    meetingAt: 1.7e12, dayFrom: 1.7e12 - 1, weekFrom: 1.7e12 - 2, until: 1.7e12, startedAt: 1.7e12,
+    generatedAt: 1.7e12, error: "no host", model: "sonnet" });
+  const sched = { enabled: true, time: "09:00", timeZone: "UTC", weekdays: [1], leadMinutes: 5, model: "auto" };
+  // 301 orgs: tenants a and b at their cap, the untenanted fleet at its cap with
+  // ONE org no host is in (`lost`), and one org of tenant d.
+  const lost = "u0-2626.net";
+  const orgs = [];
+  for (let i = 0; i < 100; i++) orgs.push(`a${i}-2626.net@${T.a}`, `b${i}-2626.net@${T.b}`, `u${i}-2626.net`);
+  orgs.push(`d0-2626.net@${T.d}`);
+  const fresh = "new-2626.net";
+  const devices = [];
+  [...orgs, fresh].forEach((org, i) => {
+    if (org === lost) return;
+    const dev = `h${i}-2626`;
+    devices.push(dev);
+    hub.agents[dev] = { orgBound: org };
+  });
+  orgs.forEach((org, i) => {
+    names.meetingProposals[org] = [meeting(`m${i}`)];
+    names.dailyBriefs[org] = [brief(i)];
+    names.dailyBriefSchedules[org] = sched;
+  });
+  // As last written: every store holds `lost`.
+  for (const [n, s] of Object.entries(names)) await hub.liveStore.set(`policy:${n}`, JSON.parse(JSON.stringify(s)));
+  const stored = async (n) => hub.liveStore.get(`policy:${n}`);
+  try {
+    const body = { meetingId: "m-new", title: "x", platform: "zoom", startedAt: Date.now() - 60_000,
+      endedAt: Date.now(), participants: ["x"], segments: [{ speaker: "x", text: "said", startMs: 0, endMs: 1 }] };
+    const m = hub.acceptMeeting(fresh, body);
+    assert.equal(m.status, 409);
+    assert.match(m.body.error, /^the hub holds meetings for too many orgs/);
+    const b = hub.startDailyBriefRun(fresh, "scheduled");
+    assert.equal(b.status, 409);
+    assert.match(b.error, /^the hub holds briefs for too many orgs/);
+    const s = await request("PUT", `/api/orgs/${encodeURIComponent(fresh)}/daily-brief/schedule`,
+      { headers: G.h, body: sched });
+    assert.equal(s.status, 409, s.raw);
+    assert.match(JSON.parse(s.raw).error, /^the hub holds meeting schedules for too many orgs/);
+    for (const [n, s2] of Object.entries(names)) {
+      assert.equal(lost in s2, false, `${n}: the untenanted fleet's own undecided org made room`);
+      assert.equal(fresh in s2, false, `${n}: a refusal mints no key`);
+      assert.equal(Object.keys(s2).length, 300, `${n}: no other tenant's org was pruned`);
+      assert.equal(lost in ((await stored(n)) || {}), false, `${n}: the pruned store was written`);
+    }
+  } finally {
+    for (const d of devices) delete hub.agents[d];
+    for (const [n, s] of Object.entries(names)) {
+      for (const k of Object.keys(s)) delete s[k];
+      Object.assign(s, saved[n]);
+    }
+  }
+});
+
+test("XERK-2626: a tenant's prune that leaves the hard total full goes on to the hub's prune", () => {
+  const T = (c) => c.repeat(32);
+  const store = {};
+  for (let i = 0; i < 100; i++) {
+    for (const t of ["a", "b", "c"]) store[`s${i}.net@${T(t)}`] = [];
+  }
+  store[`gone.net@${T("d")}`] = [];
+  const forget = (k) => k === `s0.net@${T("a")}` || k === `gone.net@${T("d")}`;
+  assert.deepEqual(hub.makeRoomForOrg(store, `new.net@${T("a")}`, 100, forget), { full: "", pruned: true });
+  assert.equal(Object.keys(store).length, 299);
+});
