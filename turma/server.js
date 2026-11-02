@@ -27432,13 +27432,19 @@ server.on("upgrade", async (req, socket, head) => {
       socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
       return socket.destroy();
     }
+    // Registered BEFORE the await (XERK-2630): a reset or disable landing while
+    // the channel opens must close this socket. Registered after it, the claims
+    // were read from the store's NEW epoch and the socket outlived the change.
+    const untrackTerm = trackUserStream(termPrincipal, () => socket.destroy());
     let channel;
     try {
       channel = await openChannel(loc.host, loc.port);
     } catch {
+      untrackTerm();
       socket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
       return socket.destroy();
     }
+    if (socket.destroyed) { untrackTerm(); return channel.destroy(); }
     // Re-issue the browser's upgrade request to ttyd over the channel; ttyd's
     // 101 + WS frames flow straight back (its accept is keyed off the browser's
     // Sec-WebSocket-Key, which we forward verbatim).
@@ -27449,7 +27455,6 @@ server.on("upgrade", async (req, socket, head) => {
     if (head && head.length) channel.write(head);
     channel.pipe(socket);
     socket.pipe(channel);
-    const untrackTerm = trackUserStream(termPrincipal, () => socket.destroy());
     const bail = () => { untrackTerm(); channel.destroy(); socket.destroy(); };
     channel.on("error", bail);
     channel.on("close", bail);
