@@ -237,6 +237,13 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   settled enroll codes); live enroll codes cap per tenant; meetings' fleet budgets refuse only a
   tenant at its fair share. A plain oldest-first cap let one tenant evict or lock out another.
   Tests: the `XERK-2621:` cases in `tenancy.test.js`.
+- **A per-org store's org-count cap is judged per TENANT** (XERK-2626, `orgStoreFull`): briefs,
+  brief schedules, meetings. A fleet-wide count let one tenant's decided orgs refuse every other
+  tenant's first org.
+  - `makeRoomForOrg` prunes the caller's tenant while ITS cap is full, and any tenant's only once
+    that cap has room and the hard total is full: a self-refusal never deletes another's orgs.
+  - `ORG_STORE_TOTAL_FACTOR` (3) x the cap is the hard memory total; the coerces slice at it.
+  - Tests: the `XERK-2626:` cases in `tenancy.test.js`.
 - **A claimed siteKey grants nothing** (XERK-2596): an org's membership, writes and dispatch all
   key on the SCOPED org, so a tenant host beating another org's site is only in its own org.
   - Never add an org route outside the `/api/jira|orgs/<site>` guard, nor a host picker that
