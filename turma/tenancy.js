@@ -114,6 +114,13 @@ function cleanText(s, max) {
   return s.replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "").trim().slice(0, max);
 }
 
+// A display name that spells another account's audit label (`oidc:<id>`)
+// would put that id on the wrong card in the admin panel (XERK-2631); the colon
+// is dropped so only the real id line on the right card matches it.
+function cleanDisplayName(s) {
+  return cleanText(s, DISPLAY_MAX).replace(/oidc:(?=[0-9a-f]{32})/gi, "oidc ");
+}
+
 const finiteMs = (n) => (Number.isSafeInteger(n) && n > 0 ? n : undefined);
 
 // One user record, field by field. Anything malformed drops the record (an id,
@@ -123,7 +130,7 @@ function coerceUser(id, u) {
   if (!ID_RE.test(u.tenantId) || u.tenantId === id) return null;
   if (u.source !== "local" && u.source !== "oidc") return null;
   const out = { id, tenantId: u.tenantId, source: u.source };
-  out.displayName = cleanText(u.displayName, DISPLAY_MAX) || "user";
+  out.displayName = cleanDisplayName(u.displayName) || "user";
   if (u.source === "local") {
     if (typeof u.username !== "string" || !USERNAME_RE.test(u.username)) return null;
     out.username = u.username;
@@ -294,7 +301,7 @@ function upsertOidcUser(state, { iss, sub, displayName, idpRoles, now = Date.now
   }
   const next = {
     ...existing,
-    displayName: cleanText(displayName, DISPLAY_MAX) || existing.displayName,
+    displayName: cleanDisplayName(displayName) || existing.displayName,
     idpRoles: roles,
   };
   const granted = effectiveRoles(state, next).length > 0;

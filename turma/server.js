@@ -3371,7 +3371,10 @@ const ADMIN_AUDIT_ACTIONS = new Set(["user.create", "user.update", "user.passwor
   "groups.update"]);
 function adminAuditClean(s, max) {
   // eslint-disable-next-line no-control-regex
-  return typeof s === "string" ? s.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").slice(0, max) : "";
+  // Bidi overrides/isolates too, so a row stored before names were cleaned of
+  // them cannot reorder the panel's text (XERK-2631).
+  return typeof s === "string"
+    ? s.replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "").slice(0, max) : "";
 }
 function coerceAdminAudit(raw) {
   const list = Array.isArray(raw) ? raw : [];
@@ -3411,7 +3414,7 @@ function adminActorLabel(p) {
 // admin panel shows it on the user's card. A local username is already fixed.
 // The name is cut so the whole label fits the audit row's 120-char target cap.
 function adminUserLabel(u) {
-  return u.source === "local" ? `${u.username} (local)` : `oidc:${u.id} (${u.displayName.slice(0, 80)})`;
+  return u.source === "local" ? `${u.username} (local)` : `oidc:${u.id} (${u.displayName.slice(0, 80).replace(/[\ud800-\udbff]$/, "")})`;
 }
 // What /api/login answers (403) a user whose password an admin reset (XERK-2630).
 const PASSWORD_RESET_REFUSAL = "an administrator reset your password — choose a new one to sign in";
