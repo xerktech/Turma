@@ -518,7 +518,11 @@ test("kindTotals: per-kind counts and summed waits for /metrics", () => {
 // ---- the non-HA file backend ------------------------------------------------
 
 test("file backend: flush writes, load restores and re-sanitizes", async () => {
-  ledger.ingest("h1", [row("1"), row("2")], Date.now());
+  // load() ages rows against the wall clock, so date them from it: rows at the
+  // fixed NOW fall out of the DAYS retention once NOW is that old (XERK-2635).
+  const now = Date.now();
+  const at = { openedAt: now - MIN, closedAt: now };
+  ledger.ingest("h1", [row("1", at), row("2", at)], now);
   await new Promise((r) => ledger.flush(r));
   const raw = JSON.parse(fs.readFileSync(ledger.LEDGER_FILE, "utf8"));
   assert.equal(raw.hosts.h1.length, 2);
