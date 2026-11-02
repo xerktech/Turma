@@ -38,8 +38,8 @@ builder session + its agent-side tracker writes are XERK-723 (C); the operator U
 - **Loaded with a per-field whitelist at boot** (`sanitizeEpicBuilderRecord`): a record with no
   id/siteKey/title is DROPPED, not restored. Its bounds are **INLINE LITERALS** (64/200/500/8000),
   never the `EPIC_BUILDER_*` consts — it runs at module-init where those consts are in their TDZ (the
-  sibling-normalizer rule). Bounded `EPIC_BUILDERS_MAX` runs, oldest-`updatedAt` evicted (never the
-  just-armed one).
+  sibling-normalizer rule). Bounded `EPIC_BUILDERS_MAX` runs, oldest-`updatedAt` of the tenant holding
+  the most evicted (XERK-2621, `trimByTenant`; never the just-armed one).
 - **Older clients degrade**: `epicBuilders` is a NEW top-level payload key an older web/Android build
   ignores.
 
