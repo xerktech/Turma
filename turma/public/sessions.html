@@ -2952,7 +2952,7 @@ function activeCard({ a, s, live }) {
   // A move in progress: show where it's going until the stage follows it over.
   const mig = migrationFor(a.key, s.id);
   const moving = mig
-    ? `<div class="s-moving"><span class="spin"></span> Moving to ${esc(mig.targetHost)}…</div>` : "";
+    ? `<div class="s-moving"><span class="spin"></span> Moving to ${esc(window.TurmaBoard.hostName(mig.targetHost))}…</div>` : "";
   return `<div class="s-card-wrap"${orgTintStyle(a)}>
     <div class="s-card ${cur ? "cur" : ""}">
       <button class="s-hit" ${attachable ? "" : "disabled"}

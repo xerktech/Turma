@@ -205,5 +205,7 @@ test("hostCard: a tenant host is titled by its device, routed by its key", () =>
   const html = hostCard({ key, device: "TrueNAS", online: true, sessions: [], repos: [] }, Date.now());
   assert.match(html, /<h3>TrueNAS(<| )/);
   assert.doesNotMatch(html, /<h3>[^<]*@77778a16/);
+  const xss = hostCard({ key, device: "<img src=x>", online: true, sessions: [], repos: [] }, Date.now());
+  assert.match(xss, /<h3>&lt;img src=x&gt;/);
   assert.match(html, new RegExp(`hostToggle\\('${key}'\\)`));
 });

@@ -9,7 +9,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgName, autoStartOn, ageStr, prioClass,
+  mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgName, hostName, autoStartOn, ageStr, prioClass,
   cardHtml, boardHtml, detailHtml, textHtml, linkify,
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
@@ -404,6 +404,15 @@ test("orgColor: honors a pin, with and without the full set (XERK-145)", () => {
   assert.equal(orgColor("gamma.atlassian.net", four, pins), "var(--s1)");
   // No set: the pin still beats the hash fallback.
   assert.equal(orgColor("gamma.atlassian.net", null, pins), "var(--s1)");
+});
+
+// XERK-2639: a tenant host's key is `<device>@<32-hex>`; its label is the device.
+test("hostName: strips only a full tenant suffix", () => {
+  assert.equal(hostName("TrueNAS@77778a16d8b028aab55c7729d587dbd7"), "TrueNAS");
+  assert.equal(hostName("plainbox"), "plainbox");
+  assert.equal(hostName("a@b"), "a@b");
+  assert.equal(hostName("x@77778a16d8b028aab55c7729d587dbd"), "x@77778a16d8b028aab55c7729d587dbd");
+  assert.equal(hostName(undefined), "");
 });
 
 test("orgName: the org, not the Jira Cloud host", () => {

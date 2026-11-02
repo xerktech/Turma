@@ -3861,6 +3861,12 @@ test("New-session picker labels a tenant host by its device, not its key", () =>
   p.beat({ now: data.now, agents: [data.host] });
   assert.match(p.els.spawn.innerHTML, /<span class="hlabel">hostA<\/span>/);
   assert.doesNotMatch(p.els.spawn.innerHTML, /hlabel">[^<]*@77778a16/);
+  // Routing still uses the key.
+  assert.ok(p.els.spawn.innerHTML.includes(`toggleHost('${key}')`));
+  // The device name is escaped, not injected as markup.
+  data.host.device = "<img src=x>";
+  p.beat({ now: data.now + 1, agents: [data.host] });
+  assert.match(p.els.spawn.innerHTML, /hlabel">&lt;img src=x&gt;</);
 });
 
 // A host with dozens of repos buried every other host's list, so each host is
