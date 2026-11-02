@@ -1231,6 +1231,19 @@ test("a source card shows a 'Moving to …' hint while its migration is in fligh
     "the in-flight move is surfaced on the source card");
 });
 
+test("XERK-2639: the 'Moving to …' hint names a tenant target by its device", () => {
+  const { beat, els } = loadPage();
+  const key = "hostB@77778a16d8b028aab55c7729d587dbd7";
+  const data = moveFleet([{ ...otherHost("hostB"), key }]);
+  data.migrations = [{
+    id: "mig1", srcHost: "hostA", srcSessionId: "11111", targetHost: key,
+    phase: "exporting", importCmdId: null,
+  }];
+  beat(data);
+  assert.ok(els.active.innerHTML.includes("Moving to hostB…"));
+  assert.ok(!els.active.innerHTML.includes("@77778a16"));
+});
+
 test("rename swaps the card for a field seeded with the current name, and saves it", () => {
   const { beat, startRename, submitRename, setDraft, els, posts } = loadPage();
   const { now, host: h } = host([working("11111", "Auto Name")]);
