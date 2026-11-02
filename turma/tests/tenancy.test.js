@@ -896,6 +896,30 @@ test("XERK-2620: a user+admin principal tiers its tenant's repos, never an opera
   assert.equal(hub.repoTier(`repo-u-${CANARY.U}`, SITE), "active");
 });
 
+test("XERK-2620: a completed migration's late tier copy runs with no owner env, never into a deleted tenant", async () => {
+  const { A } = await isoFleet();
+  const m = hub.tenantMigrationMarker();
+  const saved = { tenantId: m.tenantId, completedAt: m.completedAt, steps: m.steps };
+  const ghost = "f".repeat(32);                       // a tenant no user holds (deleted owner)
+  try {
+    hub.setRepoTier("late2620", "ignore");
+    Object.assign(m, { tenantId: ghost, completedAt: 1, steps: {} });
+    hub.tenantMigrationTick();                        // TURMA_MIGRATE_OWNER is unset here
+    assert.ok(!Object.prototype.hasOwnProperty.call(hub.repoTiers, `late2620@${ghost}`), "nothing into a purged tenant");
+    Object.assign(hub.tenantMigrationMarker(), { tenantId: A.t, completedAt: 1, steps: {} });
+    hub.tenantMigrationTick();                        // the TICK runs it (the copy is synchronous)
+    assert.equal(hub.repoTiers[`late2620@${A.t}`], "ignore");
+    await hub.runTenantLateSteps();                   // settle the in-flight run
+    assert.ok(hub.tenantMigrationMarker().steps.repoTiers);
+  } finally {
+    hub.setRepoTier("late2620", "active");
+    hub.setRepoTier("late2620", "active", A.t);
+    const cur = hub.tenantMigrationMarker();
+    for (const k of ["tenantId", "completedAt"]) { if (saved[k] === undefined) delete cur[k]; else cur[k] = saved[k]; }
+    cur.steps = saved.steps;
+  }
+});
+
 test("XERK-2556: push, peer roster and migration never cross a tenant", async () => {
   const { A, B, G } = await isoFleet();
   for (const [w, tok] of [[A, "dev2556a"], [B, "dev2556b"], [G, "dev2556g"]]) {

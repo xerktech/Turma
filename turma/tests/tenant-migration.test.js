@@ -214,14 +214,18 @@ test("XERK-2554: the migration moves every store into the owner's tenant; hosts 
   const m0 = hub.tenantMigrationMarker();
   delete m0.steps.repoTiers;
   hub.setRepoTier("old2620", "ignore");
+  hub.setRepoTier("own2620", "ignore");
+  hub.setRepoTier("own2620", "live", T);             // the owner already set its own
   await hub.runTenantLateSteps();
+  assert.equal(hub.repoTiers["own2620@" + T], "live", "a copy never overwrites the owner's own tier");
   assert.equal(hub.repoTiers["old2620@" + T], "ignore");
   assert.equal(hub.repoTiers.old2620, "ignore", "the operators keep the tier they had");
   assert.ok(hub.tenantMigrationMarker().steps.repoTiers, "recorded, so it never re-runs");
   hub.setRepoTier("old2620", "active", T);           // the owner clears its copy...
   await hub.runTenantLateSteps();
   assert.ok(!Object.prototype.hasOwnProperty.call(hub.repoTiers, "old2620@" + T), "...and it stays cleared");
-  for (const k of ["ops2620", "old2620"]) hub.setRepoTier(k, "active");   // back to the run's end state
+  for (const k of ["ops2620", "old2620", "own2620"]) hub.setRepoTier(k, "active");
+  hub.setRepoTier("own2620", "active", T);   // back to the run's end state
 
   // The retired host's ledgers and archive rows moved at once.
   assert.ok(hub.usageLedger.has(tk("gone2554")) && !hub.usageLedger.has("gone2554"));

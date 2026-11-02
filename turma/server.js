@@ -8228,6 +8228,11 @@ function tenantMigrationOnBind(fromKey, toKey) {
 let tenantMigrationDryRunLogged = false;
 let tenantLateStepsRunning = null;
 function runTenantLateSteps() {
+  // A dry run changes nothing (docs/multi-tenant-adr.md), and an owner deleted
+  // since the run must not get data back into its purged tenant.
+  if (MIGRATE_DRY_RUN) return null;
+  const t = migratedTenant();
+  if (!t || !Object.values(tenancyState.users).some((u) => u && u.tenantId === t)) return null;
   const pending = tenantMigrationSteps.some((s) => typeof s.late === "function" && !tenantMigrationMarker.steps[s.name]);
   if (!pending || tenantLateStepsRunning) return tenantLateStepsRunning;
   tenantLateStepsRunning = tenantMigration.runLateSteps({
