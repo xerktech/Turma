@@ -30004,6 +30004,90 @@ test("XERK-2622: another tenant holding a device's token can neither move nor un
   }
 });
 
+test("XERK-2627: a tenant's device registrations are capped, dropping its least-recently-seen", () => {
+  const T = tenants2533();
+  const toks = (t) => hub.listDevices().filter((d) => (d.tenantId || "") === t).map((d) => d.token);
+  const others = toks(T.B.t).length + toks("").length;
+  try {
+    for (let i = 0; i < 50; i++) assert.equal(hub.registerDevice(`cap2627-${i}`, "android", [], T.A.t), true);
+    assert.equal(toks(T.A.t).length, 50);
+    // The oldest re-registers (a live phone), so the next-oldest is the one dropped.
+    hub.listDevices().find((d) => d.token === "cap2627-0").seenAt = 0;
+    hub.listDevices().find((d) => d.token === "cap2627-1").seenAt = 1;
+    hub.registerDevice("cap2627-0", "android", [], T.A.t);
+    assert.equal(hub.registerDevice("cap2627-new", "android", [], T.A.t), true);
+    const a = toks(T.A.t);
+    assert.equal(a.length, 50);
+    assert.ok(a.includes("cap2627-new") && a.includes("cap2627-0") && !a.includes("cap2627-1"));
+    // Another tenant's and the operators' devices are untouched.
+    assert.equal(toks(T.B.t).length + toks("").length, others);
+  } finally {
+    for (const d of [...hub.listDevices()]) if (d.token.startsWith("cap2627-")) hub.unregisterDevice(d.token);
+    T.restore();
+  }
+});
+
+test("XERK-2627: one user flooding device tokens evicts only their own, past three co-tenants at most", async () => {
+  const T = tenants2533();
+  const toks = (t) => hub.listDevices().filter((d) => (d.tenantId || "") === t).map((d) => d.token);
+  try {
+    hub.registerDevice("flood2627-victim", "android", [], T.A.t, "user:victim");
+    for (let i = 0; i < 60; i++) hub.registerDevice(`flood2627-${i}`, "android", [], T.A.t, "user:flooder");
+    const a = toks(T.A.t);
+    assert.ok(a.includes("flood2627-victim"), "a co-tenant's phone survives another user's flood");
+    // Held at the per-user cap, keeping the newest.
+    const mine = a.filter((t) => t.startsWith("flood2627-") && t !== "flood2627-victim");
+    assert.equal(mine.length, 10);
+    assert.ok(mine.includes("flood2627-59") && !mine.includes("flood2627-49"));
+    // A route POST records who registered it.
+    await request("POST", "/api/devices", { headers: { ...T.A.h, "content-type": "application/json" },
+      body: { token: "flood2627-route" } });
+    assert.match(hub.listDevices().find((d) => d.token === "flood2627-route").by, /^user:./);
+  } finally {
+    for (const d of [...hub.listDevices()]) if (d.token.startsWith("flood2627-")) hub.unregisterDevice(d.token);
+    T.restore();
+  }
+});
+
+test("XERK-2627: at the tenant cap a user keeps up to three devices, then gives up their own oldest", () => {
+  const T = tenants2533();
+  const toks = (t) => hub.listDevices().filter((d) => (d.tenantId || "") === t).map((d) => d.token);
+  try {
+    for (let u = 0; u < 5; u++) for (let i = 0; i < 10; i++) {
+      hub.registerDevice(`own2627-${u}-${i}`, "android", [], T.A.t, `user:u${u}`);
+    }
+    assert.equal(toks(T.A.t).length, 50);
+    // A newcomer's first three devices each displace the tenant's least-recently-seen…
+    for (const n of ["phone", "tablet", "watch"]) hub.registerDevice(`own2627-new-${n}`, "android", [], T.A.t, "user:new");
+    let a = toks(T.A.t);
+    assert.ok(["0", "1", "2"].every((i) => !a.includes(`own2627-0-${i}`)) && a.includes("own2627-0-3"));
+    // …and relaunching them never evicts one another (no phone/tablet ping-pong).
+    for (const n of ["phone", "tablet", "watch"]) hub.registerDevice(`own2627-new-${n}`, "android", [], T.A.t, "user:new");
+    a = toks(T.A.t);
+    assert.ok(["phone", "tablet", "watch"].every((n) => a.includes(`own2627-new-${n}`)));
+    // A fourth gives up the newcomer's own oldest, not anyone else's.
+    hub.listDevices().find((d) => d.token === "own2627-new-phone").seenAt = 1;
+    hub.registerDevice("own2627-new-4th", "android", [], T.A.t, "user:new");
+    a = toks(T.A.t);
+    assert.equal(a.length, 50);
+    assert.ok(a.includes("own2627-new-4th") && !a.includes("own2627-new-phone") && a.includes("own2627-0-3"));
+    // Re-registered by another same-tenant user, a device stays its first
+    // registrant's, so handing tokens around can't reset anyone's allowance.
+    hub.registerDevice("own2627-1-5", "android", [], T.A.t, "user:new");
+    assert.equal(hub.listDevices().find((d) => d.token === "own2627-1-5").by, "user:u1");
+    const before = toks(T.A.t).filter((t) => !t.startsWith("own2627-new-"));
+    for (let c = 0; c < 5; c++) {
+      for (let i = 0; i < 3; i++) hub.registerDevice(`own2627-hop-${c}-${i}`, "android", [], T.A.t, "user:hopA");
+      for (let i = 0; i < 3; i++) hub.registerDevice(`own2627-hop-${c}-${i}`, "android", [], T.A.t, "user:hopB");
+    }
+    const lost = before.filter((t) => !toks(T.A.t).includes(t));
+    assert.equal(lost.length, 3, `two users trading tokens displaced ${lost.length}`);
+  } finally {
+    for (const d of [...hub.listDevices()]) if (d.token.startsWith("own2627-")) hub.unregisterDevice(d.token);
+    T.restore();
+  }
+});
+
 test("XERK-2551: purging a tenant removes all of its org data and nobody else's", async () => {
   const T = tenants2533();
   const SA = `${S2551}@${T.A.t}`, SB = `${S2551}@${T.B.t}`;
