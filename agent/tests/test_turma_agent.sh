@@ -82,6 +82,7 @@ echo "claude=\$(command -v claude || echo missing)" >> "$WORK/manager.log"
 # being replaced claude is absent from PATH, and the manager is what launches
 # sessions into it.
 echo "claudecheck=\$([ -f "$WORK/claude-done" ] && echo done || echo unfinished)" >> "$WORK/manager.log"
+echo "token=\${TURMA_TOKEN:-}" >> "$WORK/manager.log"
 exec -a "\${STUB_ARGV0:-python3}" "$REAL_PYTHON3" "\$@"
 STUB
 chmod +x "$WORK/stub-bin/python3"
@@ -734,6 +735,40 @@ else
 fi
 pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
 pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
+
+# --- Case 18 (XERK-2634): a rolled token in agent-token wins over the config --
+# k8x's env file is a read-only ConfigMap mount, so set_token writes the token
+# beside it and the launcher must read it back; anything not a plain token is
+# ignored and the config's token kept.
+token_case() {  # <label> <expected token>
+  reset_agents
+  rm -f "$WORK/manager.log"
+  PATH="$WORK/stub-bin:$PATH" setsid "$PREFIX/bin/turma-agent" >"$WORK/run18.log" 2>&1 &
+  if wait_for file_has_content "$WORK/manager.log" && wait_for logged "^token=" "$WORK/manager.log" \
+     && grep -qx "token=$2" "$WORK/manager.log"; then
+    ok "$1"
+  else
+    fail "$1: $(grep '^token=' "$WORK/manager.log" 2>/dev/null) / $(cat "$WORK/run18.log")"
+  fi
+  pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
+  pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
+  wait_for no_manager || true
+}
+echo "case: a rolled token in agent-token is the one the manager gets"
+printf 'roll-ed_1.0a9f\n' > "$WORK/agent-token"
+token_case "the manager got the agent-token token" "roll-ed_1.0a9f"
+# shellcheck disable=SC2016  # the literal $(...) is the payload under test.
+printf 'bad token; $(touch %s/pwned)\n' "$WORK" > "$WORK/agent-token"
+token_case "a garbage agent-token is ignored for the config's token" "t"
+if [ ! -e "$WORK/pwned" ]; then ok "the garbage line never ran"; else fail "agent-token content was executed"; fi
+rm -f "$WORK/agent-token"; mkdir "$WORK/agent-token"
+token_case "a directory at agent-token is ignored" "t"
+rmdir "$WORK/agent-token"
+# A symlink is refused even when it points at a valid token: the file must be
+# the one the manager wrote, not wherever a link leads.
+printf 'roll-ed_1.0a9f\n' > "$WORK/elsewhere"; ln -s "$WORK/elsewhere" "$WORK/agent-token"
+token_case "a symlink at agent-token is ignored" "t"
+rm -f "$WORK/agent-token" "$WORK/elsewhere"
 
 if [ "$FAILED" = 0 ]; then echo "all turma-agent launcher tests passed"; else echo "FAILURES"; fi
 exit "$FAILED"

@@ -4109,8 +4109,89 @@ def rewrite_env_var(path, key, value):
                  | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(data)
-    restrict_file_to_owner(tmp)    # 0600 on POSIX; owner-only NTFS ACL on Windows
-    os.replace(tmp, path)          # atomic: a reader never sees a partial file
+    _replace_or_discard(tmp, path)
+
+
+def _replace_or_discard(tmp, path):
+    """Restrict and atomically move a credential temp file into place, or remove
+    it. A failed move (EBUSY onto a read-only bind mount, XERK-2634) must not
+    leave the credential behind in a stray `.tmp` next to the target."""
+    try:
+        restrict_file_to_owner(tmp)  # 0600 on POSIX; owner-only NTFS ACL on Windows
+        os.replace(tmp, path)        # atomic: a reader never sees a partial file
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_token_file(path, token):
+    """Write a hub-pushed agent token as the whole of `path` (TURMA_TOKEN_FILE),
+    atomically and 0600, for an install whose env file is not ours to rewrite —
+    k8x's is a read-only ConfigMap mount, and its config reads this file ahead
+    of the Secret's name token (XERK-2634). Same safety rules as
+    rewrite_env_var: a plain agent token only, per-pid temp, no symlink follow."""
+    if not _AGENT_TOKEN_RE.match(token or ""):
+        raise OSError("refusing to write the token file: value is not a plain agent token")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                 | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(token + "\n")
+    _replace_or_discard(tmp, path)
+
+
+def agent_token_file(env_path):
+    """The token file the bash launcher reads after its config (XERK-2634):
+    TURMA_TOKEN_FILE, else `agent-token` beside the env file. "" on Windows,
+    whose launcher never reads one — a token written there would restart the
+    manager on the old token and the hub would re-send it, a restart loop."""
+    if IS_WINDOWS:
+        return ""
+    return (os.environ.get("TURMA_TOKEN_FILE", "").strip()
+            or os.path.join(os.path.dirname(env_path), "agent-token"))
+
+
+def persist_agent_token(env_path, token):
+    """Persist a rolled TURMA_TOKEN and return the file it landed in. The env
+    file first; when that cannot be rewritten (k8x mounts it read-only from a
+    ConfigMap, XERK-2634) the launcher's token file. A successful env write
+    removes the token file, which the launcher would otherwise prefer over the
+    newer env value; either way the credential temps an older agent left beside
+    the env file (a failed move never cleaned them) are removed."""
+    token_file = agent_token_file(env_path)
+    try:
+        rewrite_env_var(env_path, "TURMA_TOKEN", token)
+        landed = env_path
+    except OSError:
+        if not token_file:
+            raise
+        write_token_file(token_file, token)
+        landed = token_file
+    else:
+        if token_file:
+            # Best effort: the env write already landed, so a token file that
+            # cannot be removed (a directory, a mount) must not report failure.
+            try:
+                os.unlink(token_file)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log(f"token roll: could not remove the stale {token_file}: {e}")
+    stray = re.compile(re.escape(os.path.basename(env_path)) + r"\.\d+\.tmp$")
+    try:
+        for name in os.listdir(os.path.dirname(env_path) or "."):
+            if stray.match(name):
+                try:
+                    os.unlink(os.path.join(os.path.dirname(env_path), name))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return landed
 
 
 def enroll_self():
@@ -4177,7 +4258,7 @@ def enroll_self():
               "against an installed config)", file=sys.stderr)
         return 1
     try:
-        rewrite_env_var(path, "TURMA_TOKEN", token)
+        path = persist_agent_token(path, token)
     except OSError as e:
         print(f"enroll: could not update {path}: {e}", file=sys.stderr)
         return 1
@@ -49201,9 +49282,9 @@ class SessionManager:
                 "way; not restarting")
             return
         try:
-            rewrite_env_var(path, "TURMA_TOKEN", token)
+            path = persist_agent_token(path, token)
         except OSError as e:
-            log(f"setToken: could not update {path}: {e}; not restarting")
+            log(f"setToken: could not save the token beside {path}: {e}; not restarting")
             return
         log(f"setToken: wrote this host's derived token to {path}; restarting "
             "the manager to re-authenticate (sessions preserved)")
@@ -49666,7 +49747,7 @@ def enroll_with_code(code):
               "not writing it", file=sys.stderr)
         return 1
     try:
-        rewrite_env_var(path, "TURMA_TOKEN", token)
+        path = persist_agent_token(path, token)
     except OSError as e:
         print(f"enroll: could not update {path}: {e}", file=sys.stderr)
         return 1

@@ -46512,6 +46512,116 @@ class TestSetToken(unittest.TestCase):
             self.assertIn(f"TURMA_TOKEN={tok}\n", open(p).read())
             restart.assert_called_once()
 
+    def test_set_token_falls_back_to_the_token_file_on_a_read_only_env(self):
+        # XERK-2634: k8x's env file is a read-only ConfigMap mount (os.replace onto
+        # it fails EBUSY); the launcher reads TURMA_TOKEN_FILE after the config.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=agenttok\n")
+            tf = os.path.join(d, "agent-token")
+            sm = ha.SessionManager()
+            sm.device = "nas01"
+            tok = self._derived("nas01")
+            real_replace = os.replace
+            def replace(src, dst):
+                if dst == p:
+                    raise OSError(16, "Device or resource busy")
+                return real_replace(src, dst)
+            with mock.patch.dict(os.environ, {"TURMA_AGENT_ENV": p, "TURMA_TOKEN_FILE": tf}), \
+                 mock.patch.object(ha.os, "replace", side_effect=replace), \
+                 mock.patch.object(sm, "request_restart") as restart:
+                sm.set_token("c1", tok)
+            self.assertEqual(open(tf).read(), tok + "\n")
+            self.assertEqual(os.stat(tf).st_mode & 0o777, 0o600)
+            self.assertEqual(open(p).read(), "TURMA_TOKEN=agenttok\n")
+            self.assertEqual(sorted(os.listdir(d)), ["agent-token", "e.env"])
+            restart.assert_called_once()
+            with self.assertRaises(OSError):
+                ha.write_token_file(tf, "not a token")
+            self.assertEqual(open(tf).read(), tok + "\n")
+            # A later writable roll lands in the env file and drops the stale file.
+            with mock.patch.dict(os.environ, {"TURMA_AGENT_ENV": p, "TURMA_TOKEN_FILE": tf}), \
+                 mock.patch.object(sm, "request_restart"):
+                sm.set_token("c1", tok)
+            self.assertIn(f"TURMA_TOKEN={tok}\n", open(p).read())
+            self.assertFalse(os.path.exists(tf))
+
+    def test_set_token_read_only_env_on_windows_does_not_restart(self):
+        # Windows' launcher reads no token file: even with TURMA_TOKEN_FILE set,
+        # never fall back and restart onto the old token (the hub would re-send
+        # it in a loop). Only the env move fails, so a fallback WOULD succeed.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=agenttok\n")
+            tf = os.path.join(d, "t")
+            sm = ha.SessionManager()
+            sm.device = "nas01"
+            real_replace = os.replace
+            def replace(src, dst):
+                if dst == p:
+                    raise OSError(16, "Device or resource busy")
+                return real_replace(src, dst)
+            with mock.patch.dict(os.environ, {"TURMA_AGENT_ENV": p, "TURMA_TOKEN_FILE": tf}), \
+                 mock.patch.object(ha, "IS_WINDOWS", True), \
+                 mock.patch.object(ha.os, "replace", side_effect=replace), \
+                 mock.patch.object(sm, "request_restart") as restart:
+                sm.set_token("c1", self._derived("nas01"))
+            restart.assert_not_called()
+            self.assertEqual(sorted(os.listdir(d)), ["e.env"])
+
+    def test_an_unremovable_stale_token_file_does_not_fail_a_landed_env_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=agenttok\n")
+            os.mkdir(os.path.join(d, "agent-token"))
+            sm = ha.SessionManager()
+            sm.device = "nas01"
+            tok = self._derived("nas01")
+            env = {k: v for k, v in os.environ.items() if k != "TURMA_TOKEN_FILE"}
+            env["TURMA_AGENT_ENV"] = p
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(ha, "IS_WINDOWS", False), \
+                 mock.patch.object(sm, "request_restart") as restart:
+                sm.set_token("c1", tok)
+            self.assertIn(f"TURMA_TOKEN={tok}\n", open(p).read())
+            restart.assert_called_once()
+
+    def test_an_env_write_drops_a_stale_default_token_file_and_old_temps(self):
+        # QA (XERK-2634): an enroll run without TURMA_TOKEN_FILE exported must
+        # still remove the default agent-token, or the launcher keeps preferring
+        # it; and an older agent's stray credential temps are cleaned.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "turma-agent.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=agenttok\n")
+            for name in ("agent-token", "turma-agent.env.4050527.tmp", "keep.tmp"):
+                with open(os.path.join(d, name), "w") as f:
+                    f.write("x\n")
+            tok = self._derived("nas01")
+            env = {k: v for k, v in os.environ.items() if k != "TURMA_TOKEN_FILE"}
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(ha, "IS_WINDOWS", False):
+                self.assertEqual(ha.persist_agent_token(p, tok), p)
+            self.assertEqual(sorted(os.listdir(d)), ["keep.tmp", "turma-agent.env"])
+            self.assertIn(f"TURMA_TOKEN={tok}\n", open(p).read())
+
+    def test_a_failed_token_move_leaves_no_credential_temp_file(self):
+        # XERK-2634: os.replace onto a bind mount fails EBUSY; the temp holding
+        # the token must not be left next to the target.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=agenttok\n")
+            tok = self._derived("nas01")
+            busy = OSError(16, "Device or resource busy")
+            with mock.patch.object(ha.os, "replace", side_effect=busy):
+                with self.assertRaises(OSError):
+                    ha.rewrite_env_var(p, "TURMA_TOKEN", tok)
+                with self.assertRaises(OSError):
+                    ha.write_token_file(os.path.join(d, "tf"), tok)
+            self.assertEqual(sorted(os.listdir(d)), ["e.env"])
+
     def test_set_token_refuses_a_token_for_another_host(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "e.env")
