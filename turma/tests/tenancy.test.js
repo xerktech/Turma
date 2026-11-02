@@ -200,7 +200,7 @@ test("XERK-2530: a local user signs in and every request carries its user + tena
   assert.equal(p.userId, user.id);
   assert.equal(p.tenantId, user.tenantId);
   assert.deepEqual([...p.roles], ["user"]);
-  assert.deepEqual(hub.sessionTokenClaims(token), { u: user.id, t: user.tenantId, r: ["user"] });
+  assert.deepEqual(hub.sessionTokenClaims(token), { u: user.id, t: user.tenantId, r: ["user"], e: 0 });
   assert.ok(hub.tenancyState().users[user.id].lastLoginAt > 0);
   const api = await request("GET", "/api/agents", { headers: { cookie: `hub_session=${token}` } });
   assert.equal(api.status, 200);
