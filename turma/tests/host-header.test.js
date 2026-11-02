@@ -39,6 +39,8 @@ function loadHeaderModule() {
     // The header's org filter (org.js) — a real dependency of the page now that
     // every list is scoped by it. Stubbed as the identity scope ("all orgs"), so
     // these tests see the whole fabricated fleet.
+    // hostCard names each host's Jira org through board.js.
+    TurmaBoard: { orgName: () => "" },
     TurmaOrg: { get: () => "", filter: (a) => a || [], update() {}, subscribe() {}, sse() {} },
   };
   g.window = g; g.globalThis = g;
@@ -46,7 +48,7 @@ function loadHeaderModule() {
   // Suppress render(): the module body kicks off its own poll on load, whose
   // fetch resolves after the test and would paint into a DOM that isn't there.
   const exportTail = `
-    ;globalThis.__hdr = { codingAgent, hostVerLine, restartBtn, pending, confirming, pendKey, boardHealthBadge, claudeAuthBadge };
+    ;globalThis.__hdr = { codingAgent, hostVerLine, restartBtn, pending, confirming, pendKey, boardHealthBadge, claudeAuthBadge, hostCard };
     render = () => {};
   `;
   const fn = new Function(
@@ -193,4 +195,17 @@ test("boardHealthBadge: the tooltip is HTML-escaped", () => {
   });
   assert.ok(!html.includes("<img"));
   assert.ok(html.includes("&lt;img"));
+});
+
+// A tenant host's registry key is `<device>@<32-hex tenantId>` (XERK-2533); the
+// card's title shows the plain device name, while routing keeps the key (XERK-2639).
+test("hostCard: a tenant host is titled by its device, routed by its key", () => {
+  const { hostCard } = loadHeaderModule();
+  const key = "TrueNAS@77778a16d8b028aab55c7729d587dbd7";
+  const html = hostCard({ key, device: "TrueNAS", online: true, sessions: [], repos: [] }, Date.now());
+  assert.match(html, /<h3>TrueNAS(<| )/);
+  assert.doesNotMatch(html, /<h3>[^<]*@77778a16/);
+  const xss = hostCard({ key, device: "<img src=x>", online: true, sessions: [], repos: [] }, Date.now());
+  assert.match(xss, /<h3>&lt;img src=x&gt;/);
+  assert.match(html, new RegExp(`hostToggle\\('${key}'\\)`));
 });

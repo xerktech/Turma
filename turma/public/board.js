@@ -877,7 +877,7 @@
       const terminal = r.state === "done" || r.state === "failed";
       const chip = `<span class="eb-state eb-state-${esc(r.state)}">${esc(epicBuilderStateLabel(r.state))}</span>`;
       const host = r.host
-        ? `<span class="eb-host" title="dispatched to ${esc(r.host)}">${esc(r.host)}</span>` : "";
+        ? `<span class="eb-host" title="dispatched to ${esc(hostName(r.host))}">${esc(hostName(r.host))}</span>` : "";
       let tail = "";
       if (r.state === "done" && r.epicKey) {
         const epicUrl = `/board?ticket=${encodeURIComponent(r.epicKey)}&site=${encodeURIComponent(r.siteKey)}`;
@@ -1182,6 +1182,14 @@
   // COLLECTION name ("tfs.co/tfs/DefaultCollection" -> "defaultcollection"), a
   // deployment detail rather than the org. It renames only the LABEL — the
   // siteKey everything is keyed and routed on is untouched.
+  // A host's display name from its registry key alone: a tenant host's key is
+  // `<device>@<32-hex tenantId>` (XERK-2533), and the label is the device
+  // (XERK-2639). Use it only where the agent record (and its `device`) is not at
+  // hand; keep routing on the key.
+  function hostName(key) {
+    return String(key ?? "").replace(/@[0-9a-f]{32}$/, "");
+  }
+
   function orgName(siteKey, override) {
     const o = String(override ?? "").trim();
     if (o) return o;
@@ -1989,7 +1997,7 @@
     // the pin and turning a click-away into a silent release of it (the same
     // trap repoPickerHtml documents).
     const orphan = cur && !opts.some(h => h.key === cur)
-      ? { key: cur, name: cur, online: false, gone: true } : null;
+      ? { key: cur, name: hostName(cur), online: false, gone: true } : null;
     const optHtml = (h) => `<option value="${esc(h.key)}"${
       h.key === cur ? " selected" : ""}>${esc(h.name)}${
       h.gone ? " (no longer reports this org)" : h.online ? "" : " (offline)"}</option>`;
@@ -2855,7 +2863,7 @@
   }
 
   const api = {
-    CATEGORIES, SLOTS, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgSlotPin, orgName, autoStartOn, ageStr,
+    CATEGORIES, SLOTS, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgSlotPin, orgName, hostName, autoStartOn, ageStr,
     createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,

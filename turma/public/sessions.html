@@ -2952,7 +2952,7 @@ function activeCard({ a, s, live }) {
   // A move in progress: show where it's going until the stage follows it over.
   const mig = migrationFor(a.key, s.id);
   const moving = mig
-    ? `<div class="s-moving"><span class="spin"></span> Moving to ${esc(mig.targetHost)}…</div>` : "";
+    ? `<div class="s-moving"><span class="spin"></span> Moving to ${esc(window.TurmaBoard.hostName(mig.targetHost))}…</div>` : "";
   return `<div class="s-card-wrap"${orgTintStyle(a)}>
     <div class="s-card ${cur ? "cur" : ""}">
       <button class="s-hit" ${attachable ? "" : "disabled"}
@@ -3169,7 +3169,7 @@ function hostBlock(a, agents, nowSec, lone) {
   }).join("");
   return `<div class="host-block${open ? " open" : ""}">
     <button type="button" class="hname" id="${esc(hostHeadId(a.key))}" aria-expanded="${open}"
-        onclick="toggleHost('${escJs(a.key)}')"><span class="hchev">▶</span><span class="hlabel">${esc(a.key)}</span>${
+        onclick="toggleHost('${escJs(a.key)}')"><span class="hchev">▶</span><span class="hlabel">${esc(a.device || a.key)}</span>${
       hostCapHtml(a.capacity)}${hostWeeklyHtml(hostWeekly(a, agents, nowSec), nowSec)}</button>
     ${open ? `<div class="repo-btns">${repos}</div>` : ""}
   </div>`;
@@ -4702,7 +4702,7 @@ async function restoreTo(ev, host) {
     // importCmdId, so the page walks onto the restored session when it comes up.
     pendingMigration = out.migrationId;
     pendingMigrationFollowed = false;
-    toast("Restoring onto " + host + "…");
+    toast("Restoring onto " + (tgt ? (tgt.device || tgt.key) : host) + "…");
   } else {
     toast(out.error ? "Restore failed — " + out.error : "Restore failed");
   }

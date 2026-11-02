@@ -1601,7 +1601,7 @@ function hostCard(a, now) {
           aria-expanded="${collapsed ? "false" : "true"}" title="${collapsed ? "Expand" : "Collapse"} host">
         <span class="caret">▼</span>
         <span class="host-name-text">
-          <h3>${esc(a.key)}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
+          <h3>${esc(a.device || a.key)}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
           <span class="host-ver">${esc(hostVerLine(a))}</span>
         </span>
       </button>
@@ -2235,7 +2235,7 @@ function revokeHost(key) {
   twoClick("rv::" + key, async () => {
     const out = await del(`/api/agents/${enc(key)}?identity=revoke`, "Revoke token");
     if (out && out.nameTokenRevoked === false) {
-      toast(`${key}'s agent identity is revoked, but its name-derived token is not ` +
+      toast(`${window.TurmaBoard.hostName(key)}'s agent identity is revoked, but its name-derived token is not ` +
         "(the hub's revoked-token registry is full) — rotate TURMA_AGENT_TOKEN to retire it");
     }
   });

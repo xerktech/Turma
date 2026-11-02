@@ -32,3 +32,10 @@ Rules every client (web, Android) must keep with the hub and with each other.
   tenant's host, org, session or transcript reads as absent (404, never 403), and `/api/agents` + SSE
   carry only the caller's hosts and orgs. Clients need no change: the org filter (`org.js`) stays a
   within-tenant filter over what the hub already scoped. A ws-token must be fetched per socket.
+- **A host is LABELED by its device, ROUTED by its key** (XERK-2533, XERK-2639). A tenant host's
+  registry key is `<device>@<32-hex tenantId>`; showing it leaks the tenant id and reads as noise.
+  - Text shows `a.device || a.key` (Android: `device.ifBlank { key }`); URLs, onclick args and
+    lookups keep `a.key`.
+  - Where only a key is at hand (a migration's `targetHost`, a pin's `host`, a run's `host`), web
+    labels it with `TurmaBoard.hostName(key)`, which strips the suffix. Tests: board.test.js
+    `hostName: …`, host-header.test.js `hostCard: a tenant host …`.
