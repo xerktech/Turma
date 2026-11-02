@@ -3172,7 +3172,8 @@ let devices = [];
 const devicesCoerce = (raw) => (Array.isArray(raw) ? raw : [])
   .filter((d) => d && typeof d === "object" && typeof d.token === "string")
   .map((d) => (d.tenantId === undefined || TENANT_ID_RE.test(d.tenantId) ? d
-    : (({ tenantId: _t, ...rest }) => rest)(d)));
+    : (({ tenantId: _t, ...rest }) => rest)(d)))
+  .map((d) => (d.by === undefined || typeof d.by === "string" ? d : (({ by: _b, ...rest }) => rest)(d)));
 devices = devicesCoerce(readJsonFile(DEVICES_FILE));
 const persistDevices = registerExternalStore({
   name: "devices", file: DEVICES_FILE,
@@ -3187,8 +3188,11 @@ const persistDevices = registerExternalStore({
 // gets its new tenant by RELEASING the old binding (sign-out unregisters), or,
 // when that release was lost, by rotating its FCM token on the 409 this returns
 // — a fresh token has no binding, and the dead one is pruned on the next send.
+const DEVICES_PER_TENANT_MAX = positiveEnv("DEVICES_PER_TENANT_MAX", 50);
+const DEVICES_PER_PRINCIPAL_MAX = positiveEnv("DEVICES_PER_PRINCIPAL_MAX", 10);
+const DEVICES_DISPLACE_MAX = 3;
 const deviceTenant = (d) => ((d && typeof d.tenantId === "string") ? d.tenantId : "");
-function registerDevice(token, platform, features, tenantId = "") {
+function registerDevice(token, platform, features, tenantId = "", by = "") {
   const now = Date.now();
   // What this app build can do (XERK-154). Only a build that declares "dismiss"
   // is sent retractions — an older one has no handler for them and would render
@@ -3200,10 +3204,38 @@ function registerDevice(token, platform, features, tenantId = "") {
     if (deviceTenant(existing) !== (tenantId || "")) return false;
     existing.platform = platform || existing.platform;
     if (caps) existing.features = caps;
+    // `by` stays the FIRST registrant's (XERK-2627): moving it on a re-register
+    // would hand a device to another user without either cap running, resetting
+    // the first user's displacement budget for free. A login change releases
+    // the device first (sign-out's DELETE), so a real switch re-attributes.
     existing.seenAt = now;
   } else {
     const d = { token, platform: platform || "android", features: caps || [], addedAt: now, seenAt: now };
     if (tenantId) d.tenantId = tenantId;
+    if (by) d.by = by;
+    // Bounded (XERK-2627): any signed-in user can POST fresh tokens, and a dead
+    // one is pruned only when a send to it fails. Over a cap a device is
+    // dropped, never the newcomer refused — a stale token must not lock a new
+    // phone out, and a live phone re-registers on every launch.
+    // At the tenant cap a caller holding fewer than DEVICES_DISPLACE_MAX devices
+    // displaces the tenant's least-recently-seen one (a phone + tablet both
+    // keep working); past that it gives up its OWN oldest, so one login flooding
+    // tokens (a looping client) silences at most DEVICES_DISPLACE_MAX co-tenant
+    // phones. Logins colluding (DELETE + refill) can exceed that; only the
+    // operators' bucket has several logins, all admins, so that is accepted.
+    const oldest = (list) => list.reduce((a, b) => ((b.seenAt || 0) < (a.seenAt || 0) ? b : a));
+    const bucket = () => devices.filter((x) => deviceTenant(x) === (tenantId || ""));
+    const own = () => (by ? bucket().filter((x) => x.by === by) : []);
+    while (own().length >= DEVICES_PER_PRINCIPAL_MAX) {
+      const drop = oldest(own());
+      devices = devices.filter((x) => x !== drop);
+    }
+    while (bucket().length >= DEVICES_PER_TENANT_MAX) {
+      const mine = own();
+      const others = bucket().filter((x) => !mine.includes(x));
+      const drop = oldest(mine.length >= DEVICES_DISPLACE_MAX || !others.length ? mine : others);
+      devices = devices.filter((x) => x !== drop);
+    }
     devices.push(d);
   }
   persistDevices();
@@ -23417,7 +23449,11 @@ const server = http.createServer(async (req, res) => {
       const features = Array.isArray(body.features) ? body.features : undefined;
       // 409 = this token is another tenant's (XERK-2622); the app rotates its
       // FCM token and registers the new one.
-      if (!registerDevice(token, platform, features, principalTenant(requestPrincipal(req)))) {
+      const who = requestPrincipal(req);
+      // `by` attributes the device to its registrant for the per-user cap
+      // (XERK-2627); open mode and break-glass each count as one registrant.
+      const by = who && who.kind === "user" && who.userId ? `user:${who.userId}` : (who && who.kind) || "";
+      if (!registerDevice(token, platform, features, principalTenant(who), by)) {
         return json(res, 409, { error: "this device is registered to another account; sign out there first" });
       }
       return json(res, 200, { ok: true });

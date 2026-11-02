@@ -111,6 +111,23 @@ wire contract and Web ⇄ Android parity — Android's channels/`Notifications.k
   - A lost release is recovered by `PushRegistrar` rotating its FCM token on the 409, re-armed on each
     successful register so every account switch can rotate once.
   - Tests: `server.test.js` "XERK-2622: another tenant holding a device's token …".
+  - Android tests: `push/PushRegistrarTest` (Firebase faked via `PushRegistrar.tokens`, hub real).
+  - Accepted (rollup XERK-2627): the POST's 409 tells a caller holding a token that another tenant
+    has it, and lets them claim an unbound token first (the owner then rotates). Needs the victim's
+    FCM token, which the hub never serves; the 409 is what lets a phone recover, so it stays.
+- **Devices are capped per registrant and per tenant** (XERK-2627): `DEVICES_PER_PRINCIPAL_MAX` (10)
+  and `DEVICES_PER_TENANT_MAX` (50). Over a cap a device is dropped, never the newcomer refused — a
+  dead token must not lock out a new phone.
+  - At the tenant cap a caller with < `DEVICES_DISPLACE_MAX` (3) devices displaces the tenant's
+    least-recently-seen; past that it gives up its OWN oldest (`by` = `user:<id>`, or the principal
+    kind for open/break-glass). So one login's flood silences at most 3 co-tenant phones, and a
+    phone + tablet don't evict each other. "Evict the tenant's oldest" lets a flood silence everyone; "own first
+    if any" makes a user's devices ping-pong.
+  - `by` is the FIRST registrant's and never moves on a re-register: moving it skips both caps and
+    resets the first user's budget, so two logins trading tokens evicted a whole bucket (QA).
+  - Accepted: logins COLLUDING (one DELETEs its own, another refills) still exceed 3. Only the
+    operators' "" bucket has several logins (a tenant has one user), and they are all admins.
+  - Tests: the three `server.test.js` "XERK-2627: …" device cases.
 - **An addressed alert is retracted from the phone** (XERK-154): stable `notifKey`
   (`question:<host>:<id>`, `review:<host>:<id>`), `dismiss(notifKey)` sends a title-less FCM message,
   once per edge. **Capability-gated** to `features:["dismiss"]` — an older build renders a data-only
