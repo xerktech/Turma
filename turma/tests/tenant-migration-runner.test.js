@@ -90,6 +90,26 @@ test("XERK-2554: the owner spec finds a local user or an OIDC subject, and creat
   assert.equal(tenancy.findOwner(st, "sub-123").oidcSub, "sub-123");
   assert.equal(tenancy.findOwner(st, "oidc:sub-123").oidcSub, "sub-123");
   assert.equal(tenancy.findOwner(st, "local:sub-123"), null);
+  // XERK-2634: the admin panel's `oidc:<hub user id>` names that SSO user, never a new account.
+  const oidcUser = tenancy.findOwner(st, "oidc:sub-123");
+  assert.equal(tenancy.findOwner(st, `oidc:${oidcUser.id}`), oidcUser);
+  const viaId = tenancy.ensureOwner(st, `oidc:${oidcUser.id}`, { iss: "https://idp/" });
+  assert.equal(viaId.created, false);
+  assert.equal(viaId.user, oidcUser);
+  assert.equal(tenancy.findOwner(st, `oidc:${oidcUser.id.toUpperCase()}`), oidcUser);
+  // A bare hub id is not a spec form: it still names nobody.
+  assert.equal(tenancy.findOwner(st, oidcUser.id), null);
+  // A local user's id is not an SSO subject: it never resolves, nor mints an account.
+  const aliceId = tenancy.findOwner(st, "alice").id;
+  assert.equal(tenancy.findOwner(st, `oidc:${aliceId}`), null);
+  assert.throws(() => tenancy.ensureOwner(st, `oidc:${aliceId}`, { iss: "https://idp/" }), /Turma user id/);
+  assert.match(tenancy.ownerRefusal(st, `oidc:${aliceId}`), /Turma user id/);
+  assert.equal(tenancy.ownerRefusal(st, `oidc:${oidcUser.id}`), "");
+  assert.equal(tenancy.ownerRefusal(st, "oidc:brand-new-sub"), "");
+  // A hub id that is also another user's subject names two people: refused, not guessed.
+  const clash = tenancy.upsertOidcUser(st, { iss: "https://idp/", sub: oidcUser.id, idpRoles: ["user"] }).state;
+  assert.equal(tenancy.findOwner(clash, `oidc:${oidcUser.id}`), null);
+  assert.throws(() => tenancy.ensureOwner(clash, `oidc:${oidcUser.id}`, { iss: "https://idp/" }), /Turma user id/);
   // A bare unknown name is a typo, never a new account.
   assert.throws(() => tenancy.ensureOwner(st, "nobody"), /prefix it with local: or oidc:/);
   const r = tenancy.ensureOwner(st, "local:bob");

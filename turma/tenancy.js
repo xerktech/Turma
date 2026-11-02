@@ -374,8 +374,11 @@ function bootstrapAdmin(state, { username, password, now = Date.now() }) {
 
 // The owner TURMA_MIGRATE_OWNER names (XERK-2554): `local:<username>`,
 // `oidc:<sub>`, or a bare value matched as a local username first, then as the
-// subject of exactly one OIDC user. Returns {kind, value} or null when the spec is
-// malformed.
+// subject of exactly one OIDC user. `oidc:<hub user id>` also names that SSO user:
+// it is the value the admin panel and audit log show (XERK-2631), and the IdP's
+// subject is shown nowhere, so an operator copying it must not mint a new account
+// keyed on the wrong subject (XERK-2634). Returns {kind, value} or null when the
+// spec is malformed.
 function parseOwnerSpec(spec) {
   const s = typeof spec === "string" ? spec.trim() : "";
   const m = /^(local|oidc):(.+)$/.exec(s);
@@ -396,7 +399,28 @@ function findOwner(state, spec) {
     if (u || p.kind === "local") return u;
   }
   const hits = Object.values(state.users).filter((u) => u.source === "oidc" && u.oidcSub === p.value);
+  const byId = p.kind === "oidc" ? userById(state, p.value) : null;
+  if (byId && byId.source === "oidc") {
+    // A hub id that is also another user's subject names two people: nobody.
+    return hits.length === 0 || (hits.length === 1 && hits[0] === byId) ? byId : null;
+  }
   return hits.length === 1 ? hits[0] : null;
+}
+// The user whose hub id an owner spec value is (ids are lowercase hex; the
+// admin card prints them that way, a hand-typed copy may not be).
+function userById(state, value) {
+  const id = value.toLowerCase();
+  return Object.hasOwn(state.users, id) ? state.users[id] : null;
+}
+// Why an owner spec that names nobody must not be created, or "". `oidc:<hub
+// user id>` that found nobody is a local user's id or a collision with another
+// user's subject: never mint an SSO account keyed on it. The dry run and the
+// real run both ask this, so they agree on what a real run would do.
+function ownerRefusal(state, spec) {
+  if (findOwner(state, spec)) return "";
+  const p = parseOwnerSpec(spec);
+  if (!p || p.kind !== "oidc" || !userById(state, p.value)) return "";
+  return `oidc:${p.value} is a Turma user id that names no single SSO user — name the owner by its subject`;
 }
 function ownerAmbiguous(state, spec) {
   const p = parseOwnerSpec(spec);
@@ -421,6 +445,8 @@ function ensureOwner(state, spec, { iss, now = Date.now() } = {}) {
   if (!p.kind) {
     throw new Error(`no user is named ${p.value} — prefix it with local: or oidc: to create that owner`);
   }
+  const refused = ownerRefusal(state, spec);
+  if (refused) throw new Error(refused);
   if (p.kind === "local") {
     const r = createLocalUser(state, {
       username: p.value, displayName: p.value, groups: ["turma-users"], now,
@@ -474,6 +500,7 @@ module.exports = {
   bootstrapAdmin,
   parseOwnerSpec,
   findOwner,
+  ownerRefusal,
   ensureOwner,
   TENANT_HOST_KEY_RE,
   tenantOfHostKey,
