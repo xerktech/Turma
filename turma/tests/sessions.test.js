@@ -3851,6 +3851,18 @@ test("render puts the capacity beside the host in the New-session picker", () =>
     /<span class="hlabel">hostA<\/span><span class="hcap full"[^>]*>6 \/ 6<\/span><\/button>/);
 });
 
+// A tenant host's key is `<device>@<tenantId>` (XERK-2533): the picker labels it
+// by the plain device name and still routes by the key (XERK-2639).
+test("New-session picker labels a tenant host by its device, not its key", () => {
+  const p = loadPage();
+  const data = host([]);
+  const key = "hostA@77778a16d8b028aab55c7729d587dbd7";
+  data.host.key = key;
+  p.beat({ now: data.now, agents: [data.host] });
+  assert.match(p.els.spawn.innerHTML, /<span class="hlabel">hostA<\/span>/);
+  assert.doesNotMatch(p.els.spawn.innerHTML, /hlabel">[^<]*@77778a16/);
+});
+
 // A host with dozens of repos buried every other host's list, so each host is
 // collapsed to its header until clicked — except a lone host (nothing to pick
 // between) and a host with an open composer (collapsing must not hide it).
