@@ -133,7 +133,7 @@ function coerceUser(id, u) {
     if (u.mustChangePassword === true) out.mustChangePassword = true;
     const resets = Array.isArray(u.passwordResets) ? u.passwordResets
       .filter((r) => r && typeof r === "object" && finiteMs(r.at))
-      .map((r) => ({ at: r.at, by: cleanText(r.by, DISPLAY_MAX) || "an administrator" }))
+      .map((r) => ({ at: r.at, by: cleanText(r.by, 120) || "an administrator" }))
       .slice(-PASSWORD_RESETS_KEPT) : [];
     if (resets.length) out.passwordResets = resets;
   } else {
