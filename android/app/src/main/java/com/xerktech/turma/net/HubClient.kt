@@ -152,7 +152,11 @@ class HubClient(private val config: Config) {
             bare.newCall(req).execute().use { resp ->
                 when {
                     resp.code == 401 -> LoginOutcome.Refused
-                    resp.code == 429 || resp.code == 503 -> {
+                    // 403 with the hub's own {error} (XERK-2630): an administrator
+                    // reset this password and a new one must be chosen — on the
+                    // web sign-in page. A proxy's 403 carries no such body and
+                    // stays Unavailable.
+                    resp.code == 429 || resp.code == 503 || resp.code == 403 -> {
                         val said = runCatching {
                             TurmaJson.decodeFromString<OkResponse>(resp.body?.string().orEmpty()).error
                         }.getOrNull()?.trim().orEmpty()

@@ -221,6 +221,21 @@ class PasswordLoginTest {
         }
     }
 
+    // XERK-2630: an administrator reset the password. The hub's 403 {error} is
+    // shown in its words (set the new password on the web), never Basic-retried.
+    @Test fun `a reset password's 403 shows the hub's words`() = runBlocking {
+        val said = "an administrator reset your password — choose a new one to sign in"
+        val agentCalls = AtomicInteger()
+        hub.route("/api/login") {
+            MockResponse().setResponseCode(403).setHeader("Content-Type", "application/json")
+                .setBody("{\"error\":\"$said\",\"mustChangePassword\":true}")
+        }
+        hub.route("/api/agents") { agentCalls.incrementAndGet(); MockResponse().setResponseCode(401) }
+        val signIn = hub.container.client.signIn(candidate())
+        assertEquals(SignInResult.HubRefused(said), signIn.result)
+        assertEquals(0, agentCalls.get())
+    }
+
     // A 503 with no {error} (a proxy's page) still falls back to Basic, as before.
     @Test fun `a bare 503 from api login still falls back to Basic`() = runBlocking {
         hub.route("/api/login") { MockResponse().setResponseCode(503).setBody("<html>busy</html>") }

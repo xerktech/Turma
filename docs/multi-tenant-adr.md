@@ -28,6 +28,13 @@ tenants, run by an admin panel.
 - An **admin manages identities only**: create/disable users, reset passwords, edit group membership.
   The admin role grants no read of any tenant's data. An admin who is also a user (an OIDC admin, the
   bootstrap admin) reaches their OWN tenant through their user role, never anyone else's.
+- **A local user's password reset is detected, not prevented (XERK-2630).** The admin sets the new
+  password, so it could sign in with it. Instead the reset ends every session of the account, signs
+  it in nowhere until the user chooses a new password (the admin cannot sign in with the password it
+  set without first replacing it), and records the reset on the user's record, shown to the user on
+  the web for a week and in Sign out's tooltip. An admin who takes the account over leaves the user
+  locked out of their own password and looking at the reset. Rejected: an emailed one-time link (the
+  hub sends no mail) and accept-and-document. SSO users' passwords are the IdP's (409).
 - Enforcement on each route is the later tickets of the epic; XERK-2530 lands the identity they key on.
   Until those land every signed-in principal still has today's full access — which exposes nothing
   new, because the only principals that can exist are the bootstrap admin, break-glass, and OIDC users

@@ -41,6 +41,10 @@ Tenancy model: `turma-tenancy.md`. Decision: `docs/multi-tenant-adr.md` ("an adm
   disable, regroup, delete and the group map all check it. An SSO admin counts only while OIDC is
   configured (with it off nobody signs in that way). Tests: `admin-nopassword.test.js`.
 - SSO users: no password reset, no rename (the IdP owns both); their local groups ARE editable.
+- **A local reset is never a way into the tenant** (XERK-2630): it bumps the user's `sessionEpoch`
+  (every token carries `e`; a stale one names nobody), sets `mustChangePassword` (`/api/login` 403s
+  until `POST /api/password`) and appends `passwordResets` (`/api/me`, shown by `nav.js`). Never
+  drop any of the three to make a reset "just work". Tests: `XERK-2630:` in `admin.test.js`.
 
 ## Deleting a user deletes its tenant (`deleteUserAndTenant`), in this order
 

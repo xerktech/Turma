@@ -150,14 +150,18 @@ test("XERK-2552: create, sign in, regroup, reset password, disable/enable — ea
 
   assert.equal((await request("POST", `/api/admin/users/${id}/password`, { headers: H, body: { password: "second-secret-2" } })).status, 200);
   assert.equal(await cookieFor("newbie", "first-secret-1"), null, "the old password no longer works");
-  const live = await cookieFor("newbie", "second-secret-2");
+  // XERK-2630: the reset password signs in nowhere until the user replaces it.
+  assert.equal(await cookieFor("newbie", "second-secret-2"), null);
+  assert.equal((await request("POST", "/api/password", {
+    body: { username: "newbie", password: "second-secret-2", newPassword: "third-secret-3" } })).status, 200);
+  const live = await cookieFor("newbie", "third-secret-3");
   assert.ok(live);
 
   assert.equal((await request("PATCH", `/api/admin/users/${id}`, { headers: H, body: { disabled: true } })).status, 200);
   assert.equal((await request("GET", "/api/me", { headers: live })).status, 401, "a disable ends the live session");
-  assert.equal(await cookieFor("newbie", "second-secret-2"), null);
+  assert.equal(await cookieFor("newbie", "third-secret-3"), null);
   assert.equal((await request("PATCH", `/api/admin/users/${id}`, { headers: H, body: { disabled: false } })).status, 200);
-  assert.ok(await cookieFor("newbie", "second-secret-2"));
+  assert.ok(await cookieFor("newbie", "third-secret-3"));
 
   const audit = await request("GET", "/api/admin/audit", { headers: H });
   const acts = audit.body.entries.filter((e) => e.target === "newbie (local)").map((e) => e.action);
@@ -167,6 +171,94 @@ test("XERK-2552: create, sign in, regroup, reset password, disable/enable — ea
   // Durable: the store file holds it.
   const fs = require("fs");
   assert.ok(fs.readFileSync(process.env.ADMIN_AUDIT_FILE, "utf8").includes("user.password"));
+});
+
+test("XERK-2630: an admin's reset ends the user's sessions, forces a new password and is shown to the user", async () => {
+  await addUser("lu1", ["turma-users"]);
+  const lu1 = userOf("lu1");
+  const before = await cookieFor("lu1", "lu1-password");
+  assert.ok(before);
+  const admin = await cookieFor("rootadmin", "root-admin-pass");
+  assert.equal((await request("POST", `/api/admin/users/${lu1.id}/password`, { headers: admin, body: { password: "admin-chosen-1" } })).status, 200);
+
+  // Every session the user held is over.
+  assert.equal((await request("GET", "/api/me", { headers: before })).status, 401, "the user's session ends");
+
+  // The admin cannot sign in as the user with the password it set.
+  const asAdmin = await request("POST", "/api/login", { body: { username: "lu1", password: "admin-chosen-1" } });
+  assert.equal(asAdmin.status, 403);
+  assert.equal(asAdmin.body.mustChangePassword, true);
+  assert.ok(!(asAdmin.headers["set-cookie"] || []).join("").includes("hub_session=u2."), "no session");
+  // A wrong password learns nothing about the reset.
+  const wrong = await request("POST", "/api/login", { body: { username: "lu1", password: "not-the-one-1" } });
+  assert.equal(wrong.status, 401);
+
+  // The new password: wrong current 401, too short 400, same as current 400.
+  const chg = (password, newPassword) => request("POST", "/api/password", { body: { username: "lu1", password, newPassword } });
+  assert.equal((await chg("not-the-one-1", "users-own-pass-1")).status, 401);
+  assert.equal((await chg("admin-chosen-1", "short")).status, 400);
+  assert.equal((await chg("admin-chosen-1", "admin-chosen-1")).status, 400);
+  const ok = await chg("admin-chosen-1", "users-own-pass-1");
+  assert.equal(ok.status, 200, ok.raw);
+  const m = (ok.headers["set-cookie"] || []).join("\n").match(/hub_session=([^;]+)/);
+  const fresh = { cookie: `hub_session=${m[1]}` };
+  const me = await request("GET", "/api/me", { headers: fresh });
+  assert.equal(me.status, 200);
+  assert.equal(me.body.tenant, true);
+  // The user sees the reset, and who did it.
+  assert.equal(me.body.passwordResets.length, 1);
+  assert.equal(me.body.passwordResets[0].by, "rootadmin (local)");
+  assert.ok(Number.isFinite(me.body.passwordResets[0].at));
+  assert.equal(await cookieFor("lu1", "admin-chosen-1"), null, "the admin's password is gone");
+
+  // The user's own change also ends other sessions (one an admin may have opened).
+  const other = await cookieFor("lu1", "users-own-pass-1");
+  assert.equal((await chg("users-own-pass-1", "users-own-pass-2")).status, 200);
+  assert.equal((await request("GET", "/api/me", { headers: other })).status, 401);
+  // The admin panel never serves the reset list or the flags.
+  const list = await request("GET", "/api/admin/users", { headers: admin });
+  assert.ok(!/passwordResets|mustChangePassword|sessionEpoch/.test(list.raw));
+});
+
+// An open /api/events stream: resolves `closed` when the hub ends it.
+function openEvents(headers) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(baseUrl + "/api/events", { headers }, (res) => {
+      const closed = new Promise((r) => { res.on("end", r); res.on("close", r); });
+      res.resume();
+      const e = { status: res.statusCode, closed, abort: () => req.destroy() };
+      openStreams.push(e); // a failing test must not hold the server open
+      resolve(e);
+    });
+    req.on("error", reject);
+  });
+}
+
+const openStreams = [];
+test.after(() => { for (const e of openStreams) e.abort(); });
+test("XERK-2630: a stream opened before a reset, or a disable, is closed by it", async () => {
+  await addUser("lu2", ["turma-users"]);
+  const lu2 = userOf("lu2");
+  const h = await cookieFor("lu2", "lu2-password");
+  const ev = await openEvents(h);
+  assert.equal(ev.status, 200);
+  const bystander = await openEvents(await cookieFor("rootadmin", "root-admin-pass"));
+  assert.equal((await request("POST", `/api/admin/users/${lu2.id}/password`, { headers: BASIC, body: { password: "admin-chosen-2" } })).status, 200);
+  await Promise.race([ev.closed, new Promise((_, rej) => setTimeout(() => rej(new Error("stream outlived the reset")), 2000))]);
+  // Disable: the same rule, for a stream opened after the user's own change.
+  assert.equal((await request("POST", "/api/password", {
+    body: { username: "lu2", password: "admin-chosen-2", newPassword: "lu2-own-pass-1" } })).status, 200);
+  const ev2 = await openEvents(await cookieFor("lu2", "lu2-own-pass-1"));
+  assert.equal(ev2.status, 200);
+  assert.equal((await request("PATCH", `/api/admin/users/${lu2.id}`, { headers: BASIC, body: { disabled: true } })).status, 200);
+  await Promise.race([ev2.closed, new Promise((_, rej) => setTimeout(() => rej(new Error("stream outlived the disable")), 2000))]);
+  // Another user's stream is untouched.
+  let bystanderClosed = false;
+  bystander.closed.then(() => { bystanderClosed = true; });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(bystanderClosed, false);
+  bystander.abort();
+  assert.ok([...hub.userStreams].every((e) => e.claims.u !== lu2.id), "no tracked stream of lu2 is left");
 });
 
 test("XERK-2552: an admin cannot disable or delete its own account; SSO-owned fields are refused", async () => {

@@ -28,6 +28,8 @@ const USERNAME_RE = /^[A-Za-z0-9._@-]{1,64}$/;
 const GROUP_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const ID_RE = /^[0-9a-f]{32}$/;
 const DISPLAY_MAX = 100;
+// XERK-2630: how many admin password resets a local user's record remembers.
+const PASSWORD_RESETS_KEPT = 10;
 const PASSWORD_MAX = 1024; // bytes fed to scrypt are bounded before hashing
 const PASSWORD_MIN = 8;
 const SUB_MAX = 255;
@@ -124,6 +126,14 @@ function coerceUser(id, u) {
     if (typeof u.username !== "string" || !USERNAME_RE.test(u.username)) return null;
     out.username = u.username;
     if (parseHash(u.passwordHash)) out.passwordHash = u.passwordHash;
+    // XERK-2630: an admin reset leaves the user signed out until they choose a
+    // new password, and leaves a record of the reset they can see.
+    if (u.mustChangePassword === true) out.mustChangePassword = true;
+    const resets = Array.isArray(u.passwordResets) ? u.passwordResets
+      .filter((r) => r && typeof r === "object" && finiteMs(r.at))
+      .map((r) => ({ at: r.at, by: cleanText(r.by, DISPLAY_MAX) || "an administrator" }))
+      .slice(-PASSWORD_RESETS_KEPT) : [];
+    if (resets.length) out.passwordResets = resets;
   } else {
     if (typeof u.oidcSub !== "string" || !u.oidcSub || u.oidcSub.length > SUB_MAX) return null;
     if (typeof u.oidcIss !== "string" || !u.oidcIss || u.oidcIss.length > ISS_MAX) return null;
@@ -143,6 +153,9 @@ function coerceUser(id, u) {
   out.createdAt = finiteMs(u.createdAt) || 0;
   const last = finiteMs(u.lastLoginAt);
   if (last) out.lastLoginAt = last;
+  // XERK-2630: bumped to end every session token issued before it (a token
+  // carries the epoch it was issued under). Absent = 0, the pre-epoch tokens.
+  if (Number.isSafeInteger(u.sessionEpoch) && u.sessionEpoch > 0) out.sessionEpoch = u.sessionEpoch;
   return out;
 }
 
@@ -435,6 +448,7 @@ module.exports = {
   SCRYPT,
   PASSWORD_MAX,
   PASSWORD_MIN,
+  PASSWORD_RESETS_KEPT,
   USERNAME_RE,
   ID_RE,
   newId,

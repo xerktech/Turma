@@ -43,7 +43,7 @@ const ROUTES = [
   // public
   ["GET", "/healthz", "public"], ["GET", "/readyz", "public"], ["GET", "/metrics", "public"],
   ["GET HEAD", "/login", "public"], ["GET HEAD", "/login.html", "public"],
-  ["POST", "/api/login", "public"], ["POST", "/api/logout", "public"],
+  ["POST", "/api/login", "public"], ["POST", "/api/password", "public"], ["POST", "/api/logout", "public"],
   ["GET", "/api/oidc/config", "public"], ["POST", "/api/oidc/mobile/exchange", "public"],
   ["GET", "/auth/oidc/login", "public"], ["GET", "/auth/oidc/callback", "public"],
   ["GET POST", "/auth/oidc/logout", "public"],

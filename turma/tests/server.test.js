@@ -30263,13 +30263,13 @@ test("XERK-2553: /api/me names the caller and never an id", async () => {
   const bg = await request("GET", "/api/me", { headers: userHeaders });
   assert.equal(bg.status, 200);
   const { adminOnly, ...rest } = bg.body;
-  assert.deepEqual(rest, { kind: "breakglass", name: "break-glass", source: "", roles: ["admin"], tenant: false });
+  assert.deepEqual(rest, { kind: "breakglass", name: "break-glass", source: "", roles: ["admin"], tenant: false, passwordResets: [] });
   assert.equal(typeof adminOnly, "boolean");
   const T = tenants2533();
   try {
     const a = (await request("GET", "/api/me", { headers: T.A.h })).body;
     assert.deepEqual(a, { kind: "user", name: "t2533a", source: "local", roles: ["user"],
-      tenant: true, adminOnly: false });
+      tenant: true, adminOnly: false, passwordResets: [] });
     assert.ok(!JSON.stringify(a).includes(T.A.t), "never the tenant id");
     assert.ok(!JSON.stringify(a).includes(T.A.user.id), "never the user id");
     // Admin-only is decided by the hosts the principal may drive (tenancy.test.js

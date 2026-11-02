@@ -200,7 +200,7 @@ test("XERK-2530: a local user signs in and every request carries its user + tena
   assert.equal(p.userId, user.id);
   assert.equal(p.tenantId, user.tenantId);
   assert.deepEqual([...p.roles], ["user"]);
-  assert.deepEqual(hub.sessionTokenClaims(token), { u: user.id, t: user.tenantId, r: ["user"] });
+  assert.deepEqual(hub.sessionTokenClaims(token), { u: user.id, t: user.tenantId, r: ["user"], e: 0 });
   assert.ok(hub.tenancyState().users[user.id].lastLoginAt > 0);
   const api = await request("GET", "/api/agents", { headers: { cookie: `hub_session=${token}` } });
   assert.equal(api.status, 200);
@@ -1285,6 +1285,48 @@ test("XERK-2621: the pin maps evict the biggest tenant's oldest pin, never anoth
   // Tied tenants: the older victim goes first.
   const tie = { [`s@${ta}/A`]: { at: 5 }, [`s@${tb}/B`]: { at: 3 } };
   assert.deepEqual(hub.trimByTenant(tie, 1, hub.tenantOfPinKey, (r) => r.at), [`s@${tb}/B`]);
+});
+
+// XERK-2630: a /term upgrade is registered before its channel opens, so a reset
+// that lands while the hub waits for the agent's dial-back closes it too.
+test("XERK-2630: a reset during a terminal's channel open closes the terminal", async () => {
+  const pw = "term2630-pass";
+  const user = await addLocalUser("term2630", pw);
+  const h = { cookie: `hub_session=${sessionOf(await login("term2630", pw))}` };
+  const m = await request("POST", "/api/enroll-codes", { headers: h, body: {} });
+  const en = await request("POST", "/api/agent/enroll", { body: { code: JSON.parse(m.raw).code, device: "termbox" } });
+  const tok = JSON.parse(en.raw).token;
+  assert.equal((await request("POST", "/api/heartbeat", { headers: { authorization: `Bearer ${tok}` },
+    body: { device: "termbox", sessions: [{ id: "s-term2630", status: "running", ttydPort: 7790 }] } })).status, 200);
+  const key = `termbox@${user.tenantId}`;
+  let opened = null;
+  hub.controlChannels[key] = { sendOpen: (ch) => { opened = ch; } };
+  const client = net.connect(server.address().port, "127.0.0.1", () => {
+    client.write("GET /term/s-term2630/ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+      `Sec-WebSocket-Key: dGVzdC1rZXktMDEyMzQ1Ng==\r\nSec-WebSocket-Version: 13\r\nCookie: ${h.cookie}\r\n\r\n`);
+  });
+  client.on("error", () => {});
+  const closed = new Promise((r) => client.on("close", r));
+  try {
+    for (let i = 0; i < 100 && !opened; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.ok(opened, "the hub asked the agent for a channel");
+    const glass = { authorization: "Basic " + Buffer.from("glass:glass-pass").toString("base64") };
+    assert.equal((await request("POST", `/api/admin/users/${user.id}/password`, { headers: glass, body: { password: "admin-set-2630" } })).status, 200);
+    // The agent's dial-back arrives after the reset.
+    const { PassThrough } = require("stream");
+    const duplex = new PassThrough();
+    let forwarded = "";
+    duplex.on("data", (c) => { forwarded += c; });
+    hub.pendingChannels[opened].resolve(duplex);
+    await Promise.race([closed, new Promise((_, rej) => setTimeout(() => rej(new Error("terminal outlived the reset")), 2000))]);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(forwarded, "", "the upgrade never reaches ttyd");
+    assert.ok(duplex.destroyed, "the channel is closed");
+    assert.ok([...hub.userStreams].every((e) => e.claims.u !== user.id));
+  } finally {
+    client.destroy();
+    delete hub.controlChannels[key];
+  }
 });
 
 const note2628 = (at) => [{ at, source: "note", text: "x" }];

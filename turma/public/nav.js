@@ -124,6 +124,25 @@
     return me && me.adminOnly === true
       ? `<div class="admin-only-note" role="status">${esc(ADMIN_ONLY_NOTE)} <a href="/admin">Open the admin panel</a>.</div>` : "";
   }
+  // An administrator reset this account's password (XERK-2630): the reset is
+  // shown to the user for a week, so a sign-in they did not make — the admin's,
+  // with the password it set — does not go unseen. The full list rides Sign
+  // out's tooltip for as long as the hub keeps it.
+  const PASSWORD_RESET_NOTE_MS = 7 * 24 * 3600 * 1000;
+  function passwordResets(me) {
+    const list = me && Array.isArray(me.passwordResets) ? me.passwordResets : [];
+    return list.filter((r) => r && Number.isFinite(r.at) && typeof r.by === "string");
+  }
+  function resetLine(r) {
+    return `Password reset by ${r.by} on ${new Date(r.at).toLocaleString()}`;
+  }
+  function passwordResetNoteHtml(me, now = Date.now()) {
+    const list = passwordResets(me);
+    const last = list[list.length - 1];
+    if (!last || now - last.at > PASSWORD_RESET_NOTE_MS) return "";
+    return `<div class="password-reset-note" role="status">${esc(resetLine(last))}. ` +
+      `If you did not ask for it, or a sign-in since then was not yours, tell your administrator.</div>`;
+  }
   function applyMe(doc, me) {
     const isAdmin = !!(me && Array.isArray(me.roles) && me.roles.includes("admin"));
     rememberAdmin(isAdmin);
@@ -138,7 +157,12 @@
     }
     const so = doc.getElementById("navSignout");
     const label = meLabel(me);
-    if (so && label) so.title = label;
+    const resets = passwordResets(me).map(resetLine);
+    if (so && label) so.title = [label, ...resets].join("\n");
+    const resetHtml = passwordResetNoteHtml(me);
+    const resetShown = doc.querySelector(".password-reset-note");
+    const hdrEl = doc.getElementById("siteHeader");
+    if (hdrEl && resetHtml && !resetShown) hdrEl.insertAdjacentHTML("afterend", resetHtml);
     const header = doc.getElementById("siteHeader");
     // The admin panel is where an admin-only account works: no note there.
     const html = header && header.dataset && header.dataset.page === "admin" ? "" : adminOnlyNoteHtml(me);
@@ -353,7 +377,7 @@
   function eventsClosed() { streamOpen = false; snapshotEtag = null; }
 
   const api = { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, esc, preserveScroll, toast, refusalText,
-    meLabel, adminOnlyNoteHtml, applyMe, loadMe, ADMIN_ONLY_NOTE, noteSnapshot, eventsUrl, eventsClosed };
+    meLabel, adminOnlyNoteHtml, passwordResetNoteHtml, applyMe, loadMe, ADMIN_ONLY_NOTE, noteSnapshot, eventsUrl, eventsClosed };
   if (typeof window !== "undefined") window.TurmaNav = api;
   // Guarded on `document`, not `window`: a test can put a stand-in on a fake
   // global `window` before requiring this and still drive mount() itself.

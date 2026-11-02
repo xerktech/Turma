@@ -270,7 +270,11 @@ Decisions + rationale: `docs/multi-tenant-adr.md`. Pure half `turma/tenancy.js`;
   - It runs on top of `agentsPayloadFor`'s per-scope tail (XERK-2550), memoized per payload ETag and
     view (`tenantViewSig`) with its own ETag; a view that loses nothing gets the payload's bytes.
   - An SSE stream is scoped to the principal that opened it (`ssePrincipals`); a stream with none
-    gets nothing. A disabled user's open stream keeps its view until it reconnects.
+    gets nothing.
+  - **A user's open SSE, `/live` and `/term` streams close when its sign-in stops resolving**
+    (XERK-2630, `trackUserStream`/`endStaleUserStreams`, run on every tenancy store change): a
+    reset, own password change, disable, or a role/tenant change. Each stream is authorized only
+    at open, so a new long-lived stream must register too. Tests: `XERK-2630:` in `admin.test.js`, `tenancy.test.js`.
   - **A whole-map event (`SNAPSHOT_EVENTS`) is skipped for a stream whose slice is unchanged since
     the last frame IT received** (`sseLastSent`, rollup XERK-2593): else every stream heard every
     other tenant's activity. Per stream, never per view: a later stream never saw the earlier frame.
