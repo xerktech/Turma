@@ -28068,6 +28068,7 @@ if (process.env.TURMA_TEST) {
     deleteUserAndTenant,
     adminWayInRemains,
     adminActorLabel,
+    recordAdminAction,
     coerceAdminAudit,
     coerceEnrollCodes,
     serializeAgent,

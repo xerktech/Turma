@@ -284,8 +284,12 @@ test("XERK-2631: an SSO user is named in the audit log by its fixed id, not only
   const rows = audit.body.entries.filter((e) => e.action === "user.update" && e.detail.includes("devs"));
   assert.deepEqual(rows.map((e) => [e.target, e.targetId]), [[`oidc:${user.id} (rootadmin (local))`, user.id]],
     "the stable id leads, so the display name cannot pose as another label; the id rides the row");
-  // The actor path names an SSO admin the same way.
+  // The actor path names an SSO admin the same way, and its row carries the id.
   assert.equal(hub.adminActorLabel({ kind: "user", userId: user.id }), `oidc:${user.id} (rootadmin (local))`);
+  hub.recordAdminAction({ kind: "user", userId: user.id }, "user.update", "", "xerk-2631 actor");
+  const mine = hub.adminAudit().find((e) => e.detail === "xerk-2631 actor");
+  assert.equal(mine.actorId, user.id);
+  assert.equal(mine.actor, `oidc:${user.id} (rootadmin (local))`);
   // A long name is cut so the label survives the row's 120-char cap whole.
   const long = tenancy.upsertOidcUser(hub.tenancyState(), { iss: "https://idp/", sub: "s-spoof", displayName: "Z".repeat(100), idpRoles: ["user"] });
   hub.__setTenancy(long.state);
@@ -309,6 +313,8 @@ test("XERK-2631: an audit row loaded from disk loses bidi overrides", () => {
   assert.equal(kept.actorId, ok);
   assert.equal(kept.targetId, undefined, "a local label never carries an id");
   assert.equal(dropped.actorId, undefined);
+  const [long] = hub.coerceAdminAudit([{ at: 3, action: "user.update", actor: `oidc:${ok}a (A)`, actorId: `${ok}a` }]);
+  assert.equal(long.actorId, undefined, "an id must be exactly 32 hex");
 });
 
 test("XERK-2631: a display name loses bidi overrides and isolates", () => {

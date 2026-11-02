@@ -62,6 +62,6 @@ test("XERK-2631: an SSO card shows its audit id; the audit row links to the card
   assert.ok(page.auditHtml().includes("(&lt;img src=x&gt;)"));
 
   // A row for a user no longer listed (deleted) links nowhere.
-  page.set([local], [{ at: 1, action: "user.delete", actor: "rootadmin (local)", target: `oidc:${victimId} (Victim)` }]);
+  page.set([local], [{ at: 1, action: "user.delete", actor: "rootadmin (local)", target: `oidc:${victimId} (Victim)`, targetId: victimId }]);
   assert.ok(!page.auditHtml().includes("<a "), "no link to a card that is not there");
 });
