@@ -957,6 +957,32 @@ test("XERK-2556: host names shaped like another tenant's key are no way in", asy
   assert.notEqual(m.status, 200, "a case twin of A's own host");
 });
 
+// XERK-2629: scopeSite stripped ONE `@<32hex>`, so a doubled suffix on an
+// untenanted beat left `site@<B>` — tenant B's org key — as the host's org.
+test("XERK-2629: a doubled or mixed-case tenant suffix on an org never lands in another tenant", async () => {
+  const { A, B } = await isoFleet();
+  const T = B.t, U = B.t.toUpperCase();
+  for (const site of [`dbl.atlassian.net@${T}@${T}`, `dbl.atlassian.net@${T}@${T}@${T}`,
+    `dbl.atlassian.net@${U}@${T}`, `dbl.atlassian.net@${T}@${U}`, `dbl.atlassian.net@${A.t}@${T}`]) {
+    // The pure rule: untenanted keeps no tenant; tenant A gets only A.
+    assert.equal(hub.tenantOfSite(hub.scopeSite(site, "")), "", `${site} untenanted`);
+    assert.ok(!hub.scopeSite(site, "").endsWith(`@${T}`), `${site} untenanted ends in B`);
+    assert.equal(hub.scopeSite(site, A.t).split("@").filter((p) => p.toLowerCase() === T).length, 0,
+      `${site} scoped into A still names B`);
+    // End to end: an untenanted master-token host is never bound into B's org.
+    const dev = `dbl2629-${crypto.randomBytes(3).toString("hex")}`;
+    const r = await request("POST", "/api/heartbeat", { headers: { authorization: "Bearer agenttok" },
+      body: { device: dev, jira: { configured: true, available: true, siteKey: site, tickets: [] } } });
+    assert.equal(r.status, 200, r.raw);
+    const rec = hub.agents[dev];
+    assert.ok(rec, "the untenanted host beat");
+    for (const v of [rec.orgBound, rec.jira && rec.jira.siteKey]) {
+      assert.equal(hub.tenantOfSite(v || ""), "", `${site} bound ${v} into a tenant`);
+    }
+    delete hub.agents[dev];
+  }
+});
+
 // ---- XERK-2621: a fleet-wide cap never lets one tenant lock out or evict another
 
 test("XERK-2621: one tenant's unused enrollment codes never refuse another tenant's mint", async () => {

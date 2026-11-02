@@ -1475,9 +1475,12 @@ function trimByTenant(map, max, tenantOf, age, keep) {
   }
   return evicted;
 }
+// Strips EVERY trailing `@<32hex>`, in either case (XERK-2629): one strip left
+// `site@<B>@<B>` from an untenanted host as `site@<B>` — tenant B's org key.
+const ANY_SITE_TENANT_SUFFIX_RE = /(?:@[0-9a-f]{32})+$/i;
 function scopeSite(site, tenantId) {
   if (typeof site !== "string" || !site) return site;
-  const base = baseOfKey(site);
+  const base = site.replace(ANY_SITE_TENANT_SUFFIX_RE, "");
   return tenantId ? `${base}@${tenantId}` : base;
 }
 // Payload keys whose objects are session CONTENT (transcripts, logs, ticket
