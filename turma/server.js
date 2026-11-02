@@ -20167,6 +20167,9 @@ const MEETINGS_PENDING_ORG_MAX = 10;
 const MEETINGS_PENDING_TOTAL_MAX = 20;
 const MEETINGS_PENDING_BYTES_MAX = 2 << 20;
 const MEETINGS_PENDING_BYTES_ORG_MAX = 1 << 20; // so one org can't fill the whole budget
+// The fleet budgets above are FAIR-SHARE lines (XERK-2621, acceptMeeting); this
+// multiple of each is the hard ceiling the store never passes.
+const MEETINGS_PENDING_HARD_FACTOR = 2;
 const meetingSegmentBytes = (m) => (m.segments ? Buffer.byteLength(JSON.stringify(m.segments)) : 0);
 
 // The tenant a Tenir meeting post belongs to (XERK-2551): "" for the fleet
@@ -20270,8 +20273,10 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   // The fleet-wide budgets refuse a tenant only once it holds its FAIR SHARE
   // (the budget split evenly over the tenants with meetings waiting, this one
   // included), so one tenant filling the hub never 429s another (XERK-2621). A
-  // lone tenant may still use the whole budget; with others the store can reach
-  // about twice it (each under-share tenant fills up to its share), still bounded.
+  // lone tenant may still use the whole budget. Shares shrink as tenants arrive
+  // and nothing held is evicted, so admission alone would let N tenants reach
+  // budget x H(N) (QA measured 159 of 20); MEETINGS_PENDING_HARD_FACTOR x the
+  // budget is the ceiling nothing passes, reached only with several tenants.
   const pendingBy = new Map(); // tenant -> its pending rows
   for (const [org, list] of Object.entries(meetingProposals)) {
     const t = tenantOfSite(org);
@@ -20285,7 +20290,8 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   const pending = [...pendingBy.values()].flat();
   const mine = pendingBy.get(tenant) || [];
   const tenants = pendingBy.size + (pendingBy.has(tenant) ? 0 : 1);
-  if (pending.length >= MEETINGS_PENDING_TOTAL_MAX && mine.length >= MEETINGS_PENDING_TOTAL_MAX / tenants) {
+  if (pending.length >= MEETINGS_PENDING_HARD_FACTOR * MEETINGS_PENDING_TOTAL_MAX
+      || (pending.length >= MEETINGS_PENDING_TOTAL_MAX && mine.length >= MEETINGS_PENDING_TOTAL_MAX / tenants)) {
     return { status: 429, body: { error: `${MEETINGS_PENDING_TOTAL_MAX} meetings are already waiting to be read — try again later` } };
   }
   const sum = (rows) => rows.reduce((n, m) => n + meetingSegmentBytes(m), meetingSegmentBytes(row));
@@ -20293,7 +20299,8 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   if (sum(orgPending) > MEETINGS_PENDING_BYTES_ORG_MAX) {
     return { status: 429, body: { error: "this org's meetings already waiting to be read fill its transcript budget — try again later" } };
   }
-  if (sum(pending) > MEETINGS_PENDING_BYTES_MAX && sum(mine) > MEETINGS_PENDING_BYTES_MAX / tenants) {
+  if (sum(pending) > MEETINGS_PENDING_HARD_FACTOR * MEETINGS_PENDING_BYTES_MAX
+      || (sum(pending) > MEETINGS_PENDING_BYTES_MAX && sum(mine) > MEETINGS_PENDING_BYTES_MAX / tenants)) {
     return { status: 429, body: { error: "the meetings already waiting to be read fill the hub's transcript budget — try again later" } };
   }
   const kept = putMeeting(siteKey, row);
@@ -27935,6 +27942,7 @@ if (process.env.TURMA_TEST) {
     DEFAULT_REPO_TIER,
     REPO_TIERS,
     ticketAgents,
+    setTicketAgent,
     ticketModels,
     ticketModelPin,
     ticketSpawnModelFields,
@@ -28014,7 +28022,7 @@ if (process.env.TURMA_TEST) {
     getMeetings: () => meetingProposals, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
     putMeeting, reviewMeetingItem, settleMeetingReviews, meetingProposalsWire, MEETING_START_WAIT_MS,
     MEETING_CREATE_DEADLINE_MS, acceptMeeting,
-    ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETING_RUN_TIMEOUT_MS,
+    ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETINGS_PENDING_TOTAL_MAX, MEETINGS_PENDING_HARD_FACTOR, MEETING_RUN_TIMEOUT_MS,
     MEETING_QUEUE_MAX_MS, MEETINGS_KEEP, MEETINGS_AUTO_MODEL, DAILY_BRIEF_RUN_TIMEOUT_MS, DAILY_BRIEF_LATE_MS,
     decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, permissionAnswerKind,
     decisionsTick, decidedOrgs, DECISIONS_RETAIN_MS,
