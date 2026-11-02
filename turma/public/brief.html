@@ -110,6 +110,25 @@
   }
   .subtabs .count:empty { display: none; }
   /* The Meetings pane (XERK-2510): proposals from a Tenir meeting, reviewed by the operator. */
+  .mt-labels { margin-bottom: 18px; font-size: 13px; color: var(--ink-2); }
+  .mt-labels summary { cursor: pointer; color: var(--ink-2); }
+  .mt-labels-hint { color: var(--muted); margin: 6px 0 8px; }
+  .mt-label-row { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; padding: 4px 0; min-width: 0; }
+  .mt-label-row .name { min-width: 8em; font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+  .mt-label-row input, .mt-miss select {
+    font: inherit; padding: 4px 6px; border: 1px solid var(--hairline); border-radius: 6px;
+    background: var(--surface); color: var(--ink); max-width: 100%; }
+  .mt-label-row input { width: 12em; }
+  .mt-label-row .def { color: var(--muted); }
+  .mt-miss { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; margin-bottom: 10px;
+    padding: 8px 10px; border-radius: 8px; font-size: 13px; color: var(--ink);
+    background: color-mix(in srgb, var(--warning) 14%, var(--surface)); }
+  .mt-miss .what { flex: 1 1 18em; min-width: 0; overflow-wrap: anywhere; }
+  .mt-err-inline { color: var(--critical-text); }
+  @media (max-width: 560px) {
+    .mt-label-row .name { flex-basis: 100%; min-width: 0; }
+    .mt-label-row input { flex: 1 1 8em; width: auto; }
+  }
   .mt-org { margin-bottom: 22px; min-width: 0; }
   .mt-org-head { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; margin-bottom: 10px; }
   .mt-org-name { font-family: var(--font-display); font-size: 19px; font-weight: 600; margin: 0;
@@ -702,9 +721,9 @@ $briefs.addEventListener("toggle", (e) => {
 // ---- the fleet snapshot --------------------------------------------------------
 // A fetch MERGES, never replaces (XERK-444): an SSE frame that lands while
 // /api/agents is in flight is newer than its body.
-let briefsClock = 0, schedulesClock = 0, meetingsClock = 0;
+let briefsClock = 0, schedulesClock = 0, meetingsClock = 0, labelsClock = 0;
 async function refresh() {
-  const bsince = briefsClock, ssince = schedulesClock, msince = meetingsClock;
+  const bsince = briefsClock, ssince = schedulesClock, msince = meetingsClock, lsince = labelsClock;
   try {
     const r = await fetch("/api/agents");
     if (r.status === 401) return void (location.href = "/login");
@@ -712,6 +731,10 @@ async function refresh() {
     if (cache && briefsClock !== bsince) body.dailyBriefs = cache.dailyBriefs;
     if (cache && schedulesClock !== ssince) body.dailyBriefSchedules = cache.dailyBriefSchedules;
     if (cache && meetingsClock !== msince) body.meetingProposals = cache.meetingProposals;
+    if (cache && labelsClock !== lsince) {
+      body.meetingLabels = cache.meetingLabels;
+      body.meetingLabelMisses = cache.meetingLabelMisses;
+    }
     cache = body;
     if (typeof TurmaNav !== "undefined" && TurmaNav.noteSnapshot) TurmaNav.noteSnapshot(r);
   } catch { /* keep the last render */ }
@@ -757,6 +780,17 @@ function connectSSE() {
     cache.meetingProposals = d;
     renderMeetingsPane(cache);
   });
+  // Each org's Tenir label and the labels no org has (XERK-2638).
+  for (const ev of ["meetingLabels", "meetingLabelMisses"]) {
+    es.addEventListener(ev, (e) => {
+      let d;
+      try { d = JSON.parse(e.data); } catch { return; }
+      if (!cache) return void refresh();
+      labelsClock++;
+      cache[ev] = d;
+      renderMeetingsPane(cache);
+    });
+  }
   TurmaOrg.sse(es);
   es.onerror = () => {
     sseOk = false;

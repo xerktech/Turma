@@ -214,3 +214,43 @@ test("XERK-2623: the header org pick scopes the list and the tab's count", () =>
   assert.match(P.list(), /Globex sync/);
   assert.doesNotMatch(P.list(), /Sprint &lt;sync&gt;/);
 });
+
+test("XERK-2638: the Tenir labels list and an unmapped label's banner, escaped, post the label", async () => {
+  const B = "dev.azure.com/Bolt";
+  const labeled = { ...data(), meetingLabels: { [SITE]: { label: "acme", custom: false }, [B]: { label: "bolt", custom: true } },
+    meetingLabelMisses: { "north<x>": { at: 1 }, northwind: { at: 2 }, ["globex@" + "a".repeat(32)]: { at: 3, shared: true } } };
+  const P = loadPage((u, init) => (/meeting-label/.test(u)
+    ? (JSON.parse(init.body).label === "taken" ? { status: 409, body: { error: "the org x already has the meeting label \"taken\"" } }
+      : { ok: true, label: JSON.parse(init.body).label || "bolt", custom: JSON.parse(init.body).label !== null })
+    : META(u)));
+  P.update(labeled);
+  const html = P.list();
+  // One row per org; a custom label offers Reset, a default one says so.
+  assert.match(html, /data-label="acme\.atlassian\.net" value="acme"/);
+  assert.match(html, /data-label-reset="dev\.azure\.com\/Bolt"/);
+  assert.doesNotMatch(html, /data-label-reset="acme\.atlassian\.net"/);
+  // A miss shows its plain label (tenant suffix dropped); a malformed key never renders.
+  assert.match(html, /meeting for <b>northwind<\/b>, which no org has/);
+  assert.match(html, /meeting for <b>globex<\/b>, which more than one org answers to/);
+  assert.doesNotMatch(html, /north&lt;x&gt;|north<x>/);
+  // Saving posts the label; null resets; a refusal is shown in the hub's words.
+  await P.saveLabel(B, "northwind");
+  await P.saveLabel(B, null);
+  await P.saveLabel(SITE, "taken");
+  await P.settle();
+  const posts = P.fetches.filter((f) => /meeting-label/.test(f.url));
+  assert.deepEqual(posts.map((f) => [f.url, f.body.label]), [
+    [`/api/orgs/${encodeURIComponent(B)}/meeting-label`, "northwind"],
+    [`/api/orgs/${encodeURIComponent(B)}/meeting-label`, null],
+    [`/api/orgs/${encodeURIComponent(SITE)}/meeting-label`, "taken"]]);
+  assert.match(P.toasts.at(-1), /already has the meeting label/);
+  assert.match(P.list(), /mt-err-inline">Saving the label failed/);
+  // A malformed label never reaches the hub.
+  assert.equal(await P.saveLabel(SITE, "Has Space"), false);
+  assert.equal(P.fetches.filter((f) => /meeting-label/.test(f.url)).length, 3);
+  // The header org pick scopes the rows.
+  const Q = loadPage(META, [B]);
+  Q.update(labeled);
+  assert.doesNotMatch(Q.list(), /data-label="acme/);
+  assert.match(Q.list(), /data-label="dev\.azure\.com\/Bolt"/);
+});

@@ -116,6 +116,8 @@ process.env.DECISIONS_FILE = path.join(scratchDir(), `turma-test-decisions-${pro
 process.env.DAILY_BRIEF_SCHEDULES_FILE = path.join(scratchDir(), `turma-test-daily-brief-schedules-${process.pid}.json`);
 process.env.DAILY_BRIEFS_FILE = path.join(scratchDir(), `turma-test-daily-briefs-${process.pid}.json`);
 process.env.MEETING_PROPOSALS_FILE = path.join(scratchDir(), `turma-test-meeting-proposals-${process.pid}.json`);
+process.env.MEETING_LABELS_FILE = path.join(scratchDir(), `turma-test-meeting-labels-${process.pid}.json`);
+process.env.MEETING_LABEL_MISSES_FILE = path.join(scratchDir(), `turma-test-meeting-label-misses-${process.pid}.json`);
 process.env.MEETING_TOKENS_FILE = path.join(scratchDir(), `turma-test-meeting-tokens-${process.pid}.json`);
 process.env.ARCHIVE_PURGED_TENANTS_FILE = path.join(scratchDir(), `turma-test-archive-purged-${process.pid}.json`);
 process.env.DEDUPE_LINK_ORGS_FILE = path.join(scratchDir(), `turma-test-dedupe-link-orgs-${process.pid}.json`);
@@ -29185,6 +29187,89 @@ test("XERK-2508: the tick waits for a host, retries a silent or departed one, an
   assert.deepEqual([hub.getMeetings()[S][0].status, hub.getMeetings()[S][0].error],
     ["failed", "no online host of this org could read the meeting"]);
   cleanup2508(S, ["mtTOld2508"]);
+});
+
+// ---- XERK-2638: Tenir names an org by a short label the hub maps -------------------
+test("XERK-2638: a meeting posted under an org's label reaches that org; an unknown one is noted", async () => {
+  const A = "lbAcme2638.atlassian.net", B = "dev.azure.com/Bolt2638", C = "lbOther2638.atlassian.net";
+  await beat1574("lb2638a", A);
+  await beat1574("lb2638b", B);
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: "lb2638c",
+    jira: { available: true, configured: true, siteKey: C, orgName: "Ünïon Corp", user: "c@x.com",
+      fetchedAt: new Date().toISOString(), tickets: [] } } });
+  const labels = async () => (await request("GET", "/api/agents", { headers: userHeaders })).body;
+  let d = await labels();
+  // Defaults: a slug of the name the clients show (configured name, Jira host, ADO org).
+  assert.deepEqual([d.meetingLabels[A], d.meetingLabels[B], d.meetingLabels[C]],
+    [{ label: "lbacme2638", custom: false }, { label: "bolt2638", custom: false },
+      { label: "union-corp", custom: false }]);
+  // A label resolves, case-insensitively; the site key still works (older configs).
+  assert.equal((await postMeeting2508("LBAcme2638", meeting2508("l1"))).status, 200);
+  assert.equal((await postMeeting2508(A, meeting2508("l2"))).status, 200);
+  assert.equal((await postMeeting2508("union-corp", meeting2508("l3"))).status, 200);
+  assert.deepEqual(hub.getMeetings()[A].map((m) => m.meetingId).sort(), ["l1", "l2"]);
+  assert.equal(hub.getMeetings()[C].length, 1);
+  // An unknown label is the 404 Tenir retries on, in words naming it, and is noted.
+  const miss = await postMeeting2508("yprime2638", meeting2508("l4"));
+  assert.equal(miss.status, 404);
+  assert.match(miss.body.error, /no org has the meeting label "yprime2638"/);
+  assert.ok(!("yprime2638" in hub.getMeetings()), "a refusal mints no store key");
+  d = await labels();
+  assert.ok(d.meetingLabelMisses.yprime2638 && d.meetingLabelMisses.yprime2638.at > 0);
+  // A non-label key (dots) is the plain old 404, never noted.
+  assert.equal((await postMeeting2508("gone2638.atlassian.net", meeting2508("l5"))).status, 404);
+  assert.ok(!("gone2638.atlassian.net" in (await labels()).meetingLabelMisses));
+  // The operator maps it: setting the label clears the miss and routes the retry.
+  const set = (site, label, headers = userHeaders) => request("POST",
+    `/api/orgs/${encodeURIComponent(site)}/meeting-label`,
+    { headers: { ...headers, "content-type": "application/json" }, body: { label } });
+  for (const bad of ["", "Has space", "a.b", "x".repeat(41), "-lead", 7]) {
+    assert.equal((await set(B, bad)).status, 400, String(bad));
+  }
+  assert.equal((await set("nobody2638.atlassian.net", "x")).status, 404);
+  assert.equal((await set(B, "yprime2638", {})).status, 401);
+  const ok = await set(B, " YPrime2638 ");
+  assert.deepEqual([ok.status, ok.body.label, ok.body.custom], [200, "yprime2638", true]);
+  d = await labels();
+  assert.ok(!("yprime2638" in d.meetingLabelMisses));
+  assert.deepEqual(d.meetingLabels[B], { label: "yprime2638", custom: true });
+  assert.equal((await postMeeting2508("yprime2638", meeting2508("l4"))).status, 200);
+  assert.equal(hub.getMeetings()[B].length, 1);
+  // The old default no longer answers; another org's label is refused (409).
+  assert.equal((await postMeeting2508("bolt2638", meeting2508("l6"))).status, 404);
+  const clash = await set(A, "yprime2638");
+  assert.equal(clash.status, 409);
+  assert.match(clash.body.error, /already has the meeting label/);
+  assert.equal((await set(A, "union-corp")).status, 409, "another org's default is taken too");
+  // null resets to the default.
+  const reset = await set(B, null);
+  assert.deepEqual([reset.status, reset.body.label, reset.body.custom], [200, "bolt2638", false]);
+  assert.equal((await postMeeting2508("bolt2638", meeting2508("l6"))).status, 200);
+  // Two orgs whose defaults collide answer to neither, and say so.
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: "lb2638d",
+    jira: { available: true, configured: true, siteKey: "lbTwin2638.atlassian.net", orgName: "Union Corp",
+      user: "d@x.com", fetchedAt: new Date().toISOString(), tickets: [] } } });
+  const shared = await postMeeting2508("union-corp", meeting2508("l7"));
+  assert.equal(shared.status, 404);
+  assert.match(shared.body.error, /more than one org/);
+  assert.equal((await labels()).meetingLabelMisses["union-corp"].shared, true);
+  for (const k of ["union-corp", "yprime2638", "bolt2638"]) delete hub.getMeetingLabelMisses()[k];
+  delete hub.getMeetingLabels()[B];
+  cleanup2508(A, ["lb2638a", "lb2638b", "lb2638c", "lb2638d"]);
+  for (const k of [B, C]) delete hub.getMeetings()[k];
+});
+
+test("XERK-2638: a tenant's labels and misses are its own", async () => {
+  assert.deepEqual(hub.meetingLabelMissesCoerce({ "ok": { at: 5 }, ["x@" + "a".repeat(32)]: { at: 1, shared: true },
+    "Bad": { at: 1 }, "neg": { at: -1 }, "__proto__": { at: 1 } }),
+  Object.assign(Object.create(null), { ok: { at: 5 }, ["x@" + "a".repeat(32)]: { at: 1, shared: true } }));
+  assert.deepEqual(Object.keys(hub.meetingLabelsCoerce({ s: "ok", t: "Not Ok", u: 3 })), ["s"]);
+  assert.equal(hub.meetingLabelSlug("  Ünïon — Corp!! "), "union-corp");
+  assert.equal(hub.meetingLabelSlug("日本"), "");
+  // The scoper shows a tenant only keys carrying its own tenant.
+  const scope = require("../tenant-scope.js");
+  assert.equal(typeof scope.SCOPERS.meetingLabels, "function");
+  assert.equal(typeof scope.SCOPERS.meetingLabelMisses, "function");
 });
 
 test("XERK-2508: the whitelist, the capability block and the store bound", () => {

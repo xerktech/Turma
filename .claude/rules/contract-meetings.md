@@ -21,6 +21,17 @@ ticket builds to this file; change it here first.
   starts arbitrary sessions) and never the operator login. Unset env = 503 "not configured".
   - Or a TENANT's token derived from it (XERK-2551, `turma-tenancy.md`): the URL names the PLAIN
     site and the token decides the tenant's org; a suffixed URL site is a 404.
+- **The URL's org is a short LABEL Tenir's capture.json names (XERK-2638), or a site key.**
+  `resolveMeetingOrg`, in the tenant gate before the route: a decided org's site key matches first
+  (older configs), else a label `^[a-z0-9][a-z0-9_-]{0,39}$`, case-folded, of the token's tenant.
+  - An org's label is the operator's (`meetingLabels`, `POST /api/orgs/<site>/meeting-label
+    {label|null}`, 409 one another org of the tenant has) else a slug of its name (`jira.orgName`,
+    else the site as `board.js` `orgName` derives it). An operator's label outranks a default.
+  - No org, or two (colliding defaults), answering a label = 404 in words naming it, and the label
+    is noted in `meetingLabelMisses` (`<label>[@tenant]` → `{at, shared?}`, ≤20 per tenant) for
+    the Brief page to map. Tenir keeps retrying a 404, so mapping it delivers the meeting.
+  - Why in Turma: the capture PC should hold no tracker hosts. Tenir needs no version gate: the
+    label rides the same URL slot the site key did.
 - Body: `{meetingId, title, platform, startedAt, endedAt, tenirUrl, participants[],
   segments[{speaker, text, startMs, endMs}]}`.
   - `meetingId` `^[A-Za-z0-9._:-]{1,128}$` (Tenir's own id); `title` ≤300; `platform` ≤40

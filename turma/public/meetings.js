@@ -212,6 +212,93 @@ function targetHtml(site) {
     + m.projects.map((p) => `<option value="${esc(p.key)}"${p.key === cur ? " selected" : ""}>${esc(p.name ? `${p.name} (${p.key})` : p.key)}</option>`).join("");
   return `<label class="mt-target">New tickets go to <select data-project="${esc(site)}">${opts}</select></label>`;
 }
+// ---- Tenir labels (XERK-2638) ---------------------------------------------------------
+// Tenir names each meeting window's org by a short label; the hub maps it to the
+// org (`meetingLabels`) and lists the labels it could not map (`meetingLabelMisses`).
+const LABEL_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+const labelDrafts = new Map();   // site -> the label being typed
+const labelBusy = new Set();     // site with a label POST in flight
+const labelErr = new Map();      // site -> the hub's refusal
+const missPick = new Map();      // miss key -> the org picked for it
+const missLabel = (k) => String(k).replace(/@[0-9a-f]{32}$/, "");
+function labelOrgs(data) {
+  const keys = TurmaOrg.getKeys();
+  const map = data && data.meetingLabels && typeof data.meetingLabels === "object" ? data.meetingLabels : {};
+  return Object.keys(map).filter((s) => own(map, s) && typeof own(map, s).label === "string"
+    && (!keys.length || keys.includes(s))).sort();
+}
+function missesHtml(data, name) {
+  const map = data && data.meetingLabelMisses && typeof data.meetingLabelMisses === "object" ? data.meetingLabelMisses : {};
+  const orgs = labelOrgs(data);
+  if (!orgs.length) return "";
+  return Object.keys(map).filter((k) => LABEL_RE.test(missLabel(k))).sort().map((k) => {
+    const label = missLabel(k), m = own(map, k) || {};
+    const what = m.shared
+      ? `Tenir sent a meeting for <b>${esc(label)}</b>, which more than one org answers to.`
+      : `Tenir sent a meeting for <b>${esc(label)}</b>, which no org has. It keeps retrying.`;
+    const pick = missPick.get(k) || "";
+    const opts = `<option value="">Pick the org</option>` + orgs.map((s) =>
+      `<option value="${esc(s)}"${s === pick ? " selected" : ""}>${esc(name(s))}</option>`).join("");
+    const busy = pick && labelBusy.has(pick);
+    return `<div class="mt-miss"><span class="what">${what}</span>`
+      + `<select data-miss="${esc(k)}" aria-label="Org for ${esc(label)}">${opts}</select>`
+      + `<button class="btn-sm" data-miss-use="${esc(k)}" aria-disabled="${!pick || busy ? "true" : "false"}">Use this label</button>`
+      + (pick && labelErr.has(pick) ? `<span class="mt-err-inline">${esc(labelErr.get(pick))}</span>` : "")
+      + `</div>`;
+  }).join("");
+}
+function labelsHtml(data, name) {
+  const orgs = labelOrgs(data);
+  if (!orgs.length) return "";
+  const rows = orgs.map((s) => {
+    const cur = own(data.meetingLabels, s);
+    const v = labelDrafts.has(s) ? labelDrafts.get(s) : cur.label;
+    const busy = labelBusy.has(s) ? "true" : "false";
+    return `<div class="mt-label-row"><span class="name">${esc(name(s))}</span>`
+      + `<input data-label="${esc(s)}" value="${esc(v)}" maxlength="40" spellcheck="false" autocomplete="off" aria-label="Tenir label for ${esc(name(s))}">`
+      + `<button class="btn-sm" data-label-save="${esc(s)}" aria-disabled="${busy}">Save</button>`
+      + (cur.custom ? `<button class="btn-sm" data-label-reset="${esc(s)}" aria-disabled="${busy}" title="Go back to the default label">Reset</button>`
+        : `<span class="def">default</span>`)
+      + (labelErr.has(s) ? `<span class="mt-err-inline">${esc(labelErr.get(s))}</span>` : "")
+      + `</div>`;
+  }).join("");
+  const open = labelDrafts.size || labelErr.size ? " open" : "";
+  return `<details class="mt-labels"${open}><summary>Tenir labels</summary>`
+    + `<p class="mt-labels-hint">Name each org by its label in the meeting PC's capture.json (<code>"org"</code>).</p>`
+    + rows + `</details>`;
+}
+async function saveLabel(site, label) {
+  if (labelBusy.has(site)) return false;
+  if (label !== null && !LABEL_RE.test(label)) {
+    labelErr.set(site, "Use 1-40 lowercase letters, digits, - or _");
+    repaint(true);
+    return false;
+  }
+  labelBusy.add(site);
+  labelErr.delete(site);
+  repaint(true);
+  let res = null, out = {};
+  try {
+    res = await fetch(`/api/orgs/${encodeURIComponent(site)}/meeting-label`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ label }) });
+    try { out = await res.json(); } catch { out = {}; }
+  } catch { res = null; }
+  labelBusy.delete(site);
+  const ok = !!(res && res.ok);
+  if (!ok) {
+    const text = res ? TurmaNav.refusalText("Saving the label", res.status, out) : "Saving the label failed — the hub is unreachable";
+    labelErr.set(site, text);
+    TurmaNav.toast(text);
+  } else {
+    labelDrafts.delete(site);
+    if (cache && out && typeof out.label === "string") {
+      cache.meetingLabels = { ...(cache.meetingLabels || {}), [site]: { label: out.label, custom: !!out.custom } };
+    }
+  }
+  repaint(true);
+  return ok;
+}
+
 function orgHtml(site, list, name) {
   const target = needsProject(list) ? targetHtml(site) : "";
   return `<div class="mt-org"><div class="mt-org-head"><h2 class="mt-org-name">${esc(name)}</h2>${target}</div>`
@@ -241,9 +328,10 @@ function renderMeetings(data, force = false) {
     : `<div class="mt-empty">${Object.values(data.meetingProposals || {}).some((l) => Array.isArray(l) && l.length)
       ? "No meetings for the orgs picked in the header — pick All orgs to see the others."
       : "No meetings yet — when Tenir sends one, its proposed work items show up here."}</div>`;
-  if (html === painted) return;
-  painted = html;
-  TurmaNav.preserveScroll($list, () => { $list.innerHTML = html; });
+  const full = missesHtml(data, name) + labelsHtml(data, name) + html;
+  if (full === painted) return;
+  painted = full;
+  TurmaNav.preserveScroll($list, () => { $list.innerHTML = full; });
 }
 const repaint = (force = false) => { if (cache) { painted = null; renderMeetings(cache, force); } };
 
@@ -370,8 +458,21 @@ function mount(el) {
   if ($list) return;
   $list = el;
   $list.addEventListener("click", (ev) => {
-    const b = ev.target && ev.target.closest ? ev.target.closest("[data-act],[data-meta-retry]") : null;
+    const b = ev.target && ev.target.closest
+      ? ev.target.closest("[data-act],[data-meta-retry],[data-label-save],[data-label-reset],[data-miss-use]") : null;
     if (!b) return;
+    if (b.dataset.labelSave !== undefined || b.dataset.labelReset !== undefined || b.dataset.missUse !== undefined) {
+      if (b.getAttribute("aria-disabled") === "true") return;
+      if (b.dataset.labelReset !== undefined) return void saveLabel(b.dataset.labelReset, null);
+      if (b.dataset.missUse !== undefined) {
+        const k = b.dataset.missUse, site = missPick.get(k);
+        if (site) saveLabel(site, missLabel(k)).then((ok) => { if (ok) missPick.delete(k); });
+        return;
+      }
+      const site = b.dataset.labelSave;
+      const v = labelDrafts.has(site) ? labelDrafts.get(site) : (own(cache && cache.meetingLabels, site) || {}).label;
+      return void saveLabel(site, String(v || "").trim().toLowerCase());
+    }
     if (b.dataset.metaRetry !== undefined) { meta.delete(b.dataset.metaRetry); ensureMeta(b.dataset.metaRetry); return repaint(true); }
     if (b.getAttribute("aria-disabled") === "true") return;
     const k = b.dataset.k, act = b.dataset.act;
@@ -385,6 +486,7 @@ function mount(el) {
   $list.addEventListener("input", (ev) => {
     const t = ev.target, d = t && t.dataset;
     if (!d) return;
+    if (d.label !== undefined) { labelDrafts.set(d.label, t.value); labelErr.delete(d.label); return; }
     const k = d.editTitle ?? d.editDesc ?? d.editType;
     const e = k !== undefined && edits.get(k);
     if (!e) return;
@@ -395,6 +497,10 @@ function mount(el) {
   $list.addEventListener("change", (ev) => {
     const t = ev.target, d = t && t.dataset;
     if (!d) return;
+    if (d.miss !== undefined) {
+      if (t.value) missPick.set(d.miss, t.value); else missPick.delete(d.miss);
+      return void repaint(true);
+    }
     if (d.project !== undefined) {
       setProject(d.project, t.value);
       ensureTypes(d.project);
@@ -404,6 +510,13 @@ function mount(el) {
       const e = edits.get(d.editType);
       if (e) e.issueType = t.value;
     }
+  });
+  $list.addEventListener("keydown", (ev) => {
+    const t = ev.target;
+    if (ev.key !== "Enter" || !t || !t.dataset || t.dataset.label === undefined) return;
+    ev.preventDefault();
+    const site = t.dataset.label;
+    saveLabel(site, String(t.value || "").trim().toLowerCase());
   });
   function flushHeld() { setTimeout(() => { if (paintPending && cache) renderMeetings(cache); }, 0); }
   $list.addEventListener("focusout", flushHeld);
@@ -428,6 +541,7 @@ function pendingCount(data) {
 
 const api = { mount, update, pendingCount,
   // test hooks (tests/meetings.test.js)
-  renderMeetings, review, startEdit, edits, setProject, itemKey, setCache: (c) => { cache = c; } };
+  renderMeetings, review, startEdit, edits, setProject, itemKey, saveLabel, labelsHtml, missesHtml,
+  setCache: (c) => { cache = c; } };
 if (typeof window !== "undefined") window.TurmaMeetings = api;
 })();
