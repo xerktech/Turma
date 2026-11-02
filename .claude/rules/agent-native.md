@@ -100,6 +100,11 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
     `TURMA_ENROLL_CODE`, never argv. The installer runs it after `install_config`, BEFORE
     `install_service`, and validates `--url` as a plain http(s) URL (it is written unquoted into a
     sourced file). Exit 2 there is a FAILURE (a hub without codes), not the token path's soft skip.
+  - **A roll lands in `agent-token` beside `$CFG` when `$CFG` is read-only** (XERK-2634: k8x mounts
+    it from a ConfigMap, so `os.replace` fails EBUSY and the host never bound to its tenant). The
+    launcher reads that file after the config, and it wins; a successful env write deletes it, or
+    a stale file would silently override every later enroll. Windows never falls back to it (its
+    launcher never reads it, so the manager would restart on the old token in a loop).
   - The actual `set_token`/`enroll_self`/`rewrite_env_var`/`token_device_name` live in `hub-agent.py`
     (see `CLAUDE.md`); nothing under `native/` edits the shared runtime files, per the top of this
     file. Tests: `test_turma_agent.sh`, `test_turma_agentctl.sh`, `TestSetToken` (agent).

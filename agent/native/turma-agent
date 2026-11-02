@@ -162,6 +162,9 @@ export CLAUDE_PROJECTS_ROOT="${CLAUDE_PROJECTS_ROOT:-$HOME/.claude/projects}"
 export REPOS_ROOT="${REPOS_ROOT:-$HOME/git}"
 export DEVICE_NAME="${DEVICE_NAME:-$(hostname)}"
 
+# Where a rolled token lands when $CFG is read-only (read back below).
+export TURMA_TOKEN_FILE="${TURMA_TOKEN_FILE:-$(dirname "$CFG")/agent-token}"
+
 # Optional zero-touch onboarding (XERK-578): when opted in, roll this host onto
 # its OWN derived agent token (XERK-268/284) on start, so a fleet self-rolls off
 # the shared master on its next restart with no per-host ritual. IDEMPOTENT (a
@@ -181,6 +184,21 @@ case "${TURMA_AGENT_SELF_ENROLL:-}" in
     fi
     ;;
 esac
+
+# A rolled token the manager could not write into $CFG (k8x mounts it read-only
+# from a ConfigMap, XERK-2634) lands in this file instead, and wins over the
+# config's TURMA_TOKEN. Exported so the manager knows it may fall back to it; a
+# successful env-file roll deletes it again (hub-agent.py persist_agent_token).
+if [ -f "$TURMA_TOKEN_FILE" ] && [ ! -L "$TURMA_TOKEN_FILE" ] && [ -s "$TURMA_TOKEN_FILE" ]; then
+  _rolled="$(head -n 1 "$TURMA_TOKEN_FILE" || true)"
+  # Only a plain agent token (the same shape hub-agent.py writes): a stray CR or
+  # garbage line must not become the credential.
+  case "$_rolled" in
+    ""|*[!A-Za-z0-9._-]*) echo "[turma-agent] ignoring $TURMA_TOKEN_FILE: not a plain agent token" >&2 ;;
+    *) export TURMA_TOKEN="$_rolled" ;;
+  esac
+  unset _rolled
+fi
 
 TUNNEL_RETRY_SEC="${TUNNEL_RETRY_SEC:-10}"
 
