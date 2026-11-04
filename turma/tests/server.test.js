@@ -14907,6 +14907,19 @@ test("XERK-2673: past the cap a wave the cut empties is dropped (coerce fixed po
   assert.deepEqual(sanitizeEpicRunRecord(JSON.parse(JSON.stringify(run))), run);
 });
 
+test("XERK-2673: a cycle wholly past the cap does not block the run", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  const site = "e2673h.atlassian.net";
+  const kids = Array.from({ length: 500 }, (_, i) => dChild(`K-${i}`, [], "todo"));
+  await asBeat("ed2673h", site, { autoStart: false,
+    tickets: [dEpic(), ...kids, dChild("Y-1", ["Y-2"], "todo"), dChild("Y-2", ["Y-1"], "todo")] });
+  const run = armEpicRun(site, "E-1");
+  assert.equal(run.state, "running");
+  assert.equal("cycle" in run, false, "a cycle among cut children is not the run's");
+  assert.deepEqual(sanitizeEpicRunRecord(JSON.parse(JSON.stringify(run))), run);
+});
+
 test("XERK-2673: pausing a capped run keeps the coerce fixed point", async () => {
   resetEpicD();
   resetEpicRuns();
