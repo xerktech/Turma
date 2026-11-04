@@ -56845,7 +56845,13 @@ class TestRepoDelete(ManagerMixin, unittest.TestCase):
         os.symlink(target, os.path.join(ha.REPOS_ROOT, "L"))
         os.makedirs(os.path.join(ha.WORKTREES_ROOT, "L", "w1"))
         sm.repo_deletes["L"] = {"repo": "L", "status": "deleting", "total": set()}
-        sm._run_repo_delete("L")
+        with mock.patch.object(ha, "run", wraps=ha.run) as run:
+            sm._run_repo_delete("L")
+        # The target outlives the delete, so its entries for the removed
+        # worktrees are pruned, through the link, before it is unlinked.
+        self.assertIn(mock.call(["git", "-C", os.path.join(ha.REPOS_ROOT, "L"),
+                                 "worktree", "prune"],
+                                timeout=ha.PRUNE_GIT_TIMEOUT_SEC), run.call_args_list)
         self.assertEqual(sm.repo_deletes["L"]["status"], "done")
         self.assertFalse(os.path.lexists(os.path.join(ha.REPOS_ROOT, "L")))
         self.assertTrue(os.path.isfile(keep), "the link's target is never removed")
