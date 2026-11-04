@@ -29,8 +29,8 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   is the SAME per-record `sanitizeEpicRunRecord` whitelist boot-load used, applied to a remote value
   too; `persistEpicRuns()` replaces the old `scheduleEpicRunsSave`. HA off: byte-identical file writes,
   same 5s debounce. Mechanics: `.claude/rules/turma-ha-store.md` (wave-3 pattern).
-- **Run record**: `{epicKey, siteKey, state, children[], waves[][], cycle?[], paused?, maxConcurrent?,
-  startedAt, updatedAt}`.
+- **Run record**: `{epicKey, siteKey, state, children[], waves[][], cycle?[], doneChildren?[], paused?,
+  maxConcurrent?, startedAt, updatedAt}`.
   `state ∈ {running, blocked, done}` (`EPIC_RUN_STATES`); `waves` is the topological layering;
   `cycle` is present only when a dependency loop stalls children. `startedAt` is preserved across
   re-arms.
@@ -73,6 +73,24 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   **`404` on pause/resume when no run is armed** (`setEpicRunPaused` returns null) — never a silent arm.
 - `armEpicRun(siteKey, epicKey, rows)` rebuilds the DAG from the current board rows, derives state
   (`blocked` if a cycle; `done` if every child already Done; else `running`), persists, broadcasts.
+
+## A Done child that aged off the board (XERK-2673)
+
+- **The board lists only a recent Done window, so a finished child leaves `fleetTicketRows`.**
+  Rebuilding the run from the rows alone dropped it: a re-arm read "0 / 1 done" on the last child,
+  an aged-off in-epic blocker held its dependents forever, and the run could never complete.
+- **`doneChildren` records every child the run has seen Done** (`noteEpicRunDoneChildren`, on arm
+  and every driver pass, paused runs included). `epicRunChildDone` is the one test: a LISTED child's
+  row decides (reopened → not Done); an UNLISTED one counts by the record. Readiness, completion and
+  the clients' `epicRunView` (`board.js`, `Board.kt`) all go through it.
+- **A re-arm keeps EVERY previous child the board lists nowhere**, leading wave 1: Done only if
+  recorded, else open. Never infer Done from absence — an open child gone unlisted (reassigned, host
+  offline) would otherwise let the run complete and write the epic Done behind it (QA). Cost: a
+  child deleted from the tracker, or reassigned off this board, holds the run AND every in-epic
+  child it blocks (the poll-gap rule below) until the operator cancels and re-arms.
+- A child listed under another epic is dropped. The board's own children fill the
+  `EPIC_RUN_CHILDREN_MAX` cap first, so kept ones never crowd out a live child.
+- Tests: the `XERK-2673:` cases in `server.test.js`, `board.test.js`, `BoardTest.kt`.
 
 ## Pause / resume — the operator hold (XERK-641)
 

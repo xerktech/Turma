@@ -4293,6 +4293,8 @@ function sanitizeEpicRunRecord(v) {
     updatedAt: Number.isFinite(v.updatedAt) ? v.updatedAt : now,
   };
   if (cycle.length) rec.cycle = cycle;
+  const doneChildren = strList(v.doneChildren);   // XERK-2673
+  if (doneChildren.length) rec.doneChildren = doneChildren;
   if (v.paused === true) rec.paused = true;   // operator hold survives a restart (XERK-641)
   if (validEpicRunLimit(v.maxConcurrent)) rec.maxConcurrent = v.maxConcurrent;   // XERK-1860
   return rec;
@@ -4412,25 +4414,51 @@ function armEpicRun(siteKey, epicKey, rows, opts) {
   rows = rows || fleetTicketRows();
   const kids = epicChildRows(siteKey, epicKey, rows);
   const { waves, cycle } = buildEpicWaves(kids);
-  const children = kids
-    .map((k) => k.key)
-    .filter((k, i, a) => typeof k === "string" && k && a.indexOf(k) === i)
+  const k = epicRunKey(siteKey, epicKey);
+  const prev = epicRuns[k];
+  // A Done child ages off the board (the agent lists only a recent Done window),
+  // so a rebuild from the rows alone drops it and the run reads "0 / 1 done" on
+  // its last child (XERK-2673). Keep every previous child the board no longer
+  // lists at all: one the run saw Done counts Done; any other stays NOT Done, so
+  // an open child that merely went unlisted (reassigned, its host offline) never
+  // lets the run complete and write the epic Done behind it. A child still listed
+  // is judged by its row (reopened, or moved to another epic and dropped).
+  if (prev) noteEpicRunDoneChildren(prev, rows);
+  const onBoard = (key) => rows.has(ticketQueueKey(siteKey, key));
+  const kept = ((prev && prev.children) || []).filter((key) => !onBoard(key));
+  // The board's children first, so kept ones never crowd a live child past the cap.
+  const children = [...kids.map((c) => c.key), ...kept]
+    .filter((c, i, a) => typeof c === "string" && c && a.indexOf(c) === i)
     .slice(0, EPIC_RUN_CHILDREN_MAX);
+  const inRun = new Set(children);
+  const keptSet = new Set(kept.filter((c) => inRun.has(c)));
+  // A kept child's blockers are unknown (no row): it leads the first wave.
+  // Drop what the cap cut, and any wave it emptied (the sanitizer drops an empty
+  // wave, so leaving one breaks the coerce fixed point).
+  waves.splice(0, waves.length,
+    ...waves.map((w) => w.filter((c) => inRun.has(c))).filter((w) => w.length));
+  if (keptSet.size) {
+    if (waves.length) waves[0] = [...keptSet, ...waves[0]];
+    else waves.push([...keptSet]);
+  }
+  const prevDone = new Set((prev && prev.doneChildren) || []);
   const isDone = (key) => {
+    if (keptSet.has(key)) return prevDone.has(key);
     const r = rows.get(ticketQueueKey(siteKey, key));
     return !!(r && r.row && r.row.statusCategory === "done");
   };
   const allDone = children.length > 0 && children.every(isDone);
-  const state = cycle.length ? "blocked" : allDone ? "done" : "running";
-  const k = epicRunKey(siteKey, epicKey);
-  const prev = epicRuns[k];
+  const state = cycle.some((c) => inRun.has(c)) ? "blocked" : allDone ? "done" : "running";
   const now = Date.now();
   const rec = {
     epicKey, siteKey, state, children, waves,
     startedAt: prev && Number.isFinite(prev.startedAt) ? prev.startedAt : now,
     updatedAt: now,
   };
-  if (cycle.length) rec.cycle = cycle.slice(0, EPIC_RUN_CHILDREN_MAX);
+  const runCycle = cycle.filter((c) => inRun.has(c));
+  if (runCycle.length) rec.cycle = runCycle;
+  const doneChildren = children.filter(isDone);
+  if (doneChildren.length) rec.doneChildren = doneChildren;
   // A re-arm rebuilds the DAG but PRESERVES an operator hold (XERK-641): arming is
   // "rebuild the plan", not "resume it" — Resume is the only thing that lifts a
   // pause. Preserved like startedAt.
@@ -4478,6 +4506,7 @@ function setEpicRunPaused(siteKey, epicKey, paused) {
   const want = !!paused;
   if (!!run.paused === want) return run;   // idempotent
   if (want) run.paused = true; else delete run.paused;
+  orderEpicRunKeys(run);
   if (want) withdrawEpicRunQueue(epicRunKey(siteKey, epicKey), "its epic run was paused");
   run.updatedAt = Date.now();
   persistEpicRuns();
@@ -5831,7 +5860,9 @@ function epicChildBlockersDone(childRow, run, rows) {
     const br = rows.get(ticketQueueKey(run.siteKey, b));
     const done = !!(br && br.row && br.row.statusCategory === "done");
     if (kids.has(b)) {
-      if (!done) return false;             // an in-epic blocker: must be Done
+      // an in-epic blocker: must be Done (one aged off the board counts by what
+      // the run recorded, XERK-2673)
+      if (!epicRunChildDone(run, b, rows)) return false;
     } else if (br && br.row && !done) {
       return false;                        // a visible external blocker: hold
     }
@@ -5844,10 +5875,39 @@ function epicChildBlockersDone(childRow, run, rows) {
 function epicRunAllChildrenDone(run, rows) {
   const kids = run.children || [];
   if (!kids.length) return false;
-  return kids.every((key) => {
-    const r = rows.get(ticketQueueKey(run.siteKey, key));
-    return !!(r && r.row && r.row.statusCategory === "done");
-  });
+  return kids.every((key) => epicRunChildDone(run, key, rows));
+}
+
+// Is this child of the run Done? Its board row decides while the board lists it;
+// one that has aged off the board (the Done window) counts as Done when the run
+// saw it Done before it left (XERK-2673) — else the run could never complete.
+function epicRunChildDone(run, key, rows) {
+  const r = rows.get(ticketQueueKey(run.siteKey, key));
+  if (r && r.row) return r.row.statusCategory === "done";
+  return Array.isArray(run.doneChildren) && run.doneChildren.includes(key);
+}
+
+// Record which children the run has seen Done, so a child that later ages off the
+// board still counts (XERK-2673). A listed child's row is the truth (a reopened
+// one leaves the set); an unlisted one keeps what was recorded. Returns whether
+// the set changed; the caller persists.
+function noteEpicRunDoneChildren(run, rows) {
+  const kids = run.children || [];
+  const before = run.doneChildren || [];
+  const next = kids.filter((key) => epicRunChildDone(run, key, rows));
+  if (next.length === before.length && next.every((key, i) => key === before[i])) return false;
+  if (next.length) run.doneChildren = next; else delete run.doneChildren;
+  orderEpicRunKeys(run);
+  return true;
+}
+
+// Put an edited run's optional keys back in the sanitizer's order (doneChildren,
+// paused, maxConcurrent last), so a live record stays a coerce fixed point and the
+// HA own-write echo dedups.
+function orderEpicRunKeys(run) {
+  for (const f of ["paused", "maxConcurrent"]) {
+    if (f in run) { const v = run[f]; delete run[f]; run[f] = v; }
+  }
 }
 
 // Re-derive a running run's state as children complete: once every child is Done
@@ -5857,9 +5917,10 @@ function epicRunAllChildrenDone(run, rows) {
 // driven while it is blocked (a cyclic child never becomes ready, so it self-
 // excludes). Persists + broadcasts exactly like armEpicRun, only on a change.
 function advanceEpicRunState(run, rows) {
-  if (run.cycle && run.cycle.length) return;
-  const want = epicRunAllChildrenDone(run, rows) ? "done" : "running";
-  if (run.state === want) return;
+  const noted = noteEpicRunDoneChildren(run, rows);
+  const want = run.cycle && run.cycle.length ? run.state
+    : epicRunAllChildrenDone(run, rows) ? "done" : "running";
+  if (run.state === want && !noted) return;
   run.state = want;
   run.updatedAt = Date.now();
   persistEpicRuns();
@@ -5949,7 +6010,14 @@ function epicRunDriveSweep() {
     // operator is holding it. Already-running children keep running as sessions
     // (the XERK-550 sweeps skip a paused run's children too), and Resume picks the
     // run back up on the next sweep. Fully inert, so just skip it.
-    if (run.paused) continue;
+    if (run.paused) {
+      // Its children still finish while held; record them before they age off
+      // the board (XERK-2673). Bookkeeping only — the state does not advance.
+      if (noteEpicRunDoneChildren(run, rows)) {
+        persistEpicRuns(); invalidateAgentsCache(); sseBroadcast("epicRuns", epicRuns);
+      }
+      continue;
+    }
     const siteKey = run.siteKey;
     let active = null;   // the run's working-children count, for its cap (XERK-1860)
     for (const childKey of run.children || []) {

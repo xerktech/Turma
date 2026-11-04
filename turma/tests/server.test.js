@@ -14822,6 +14822,162 @@ test("XERK-641: sanitizeEpicRunRecord coerces `paused`, and only for a strict tr
   assert.equal("paused" in sanitizeEpicRunRecord({ ...base }), false);
 });
 
+// XERK-2673: a Done child ages off the board (the agent lists only a recent Done
+// window). The run must keep counting it — across a re-arm, for its dependents'
+// readiness, and for completing the run — instead of reading "0 / 1 done".
+test("XERK-2673: a Done child that aged off the board stays a Done child of the run", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  const site = "e2673.atlassian.net";
+  await asBeat("ed2673", site, { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "done"), dChild("C-2", ["C-1"], "todo")] });
+  let run = armEpicRun(site, "E-1");
+  assert.deepEqual(run.doneChildren, ["C-1"], "arming records the Done child");
+  // C-1 leaves the board. The driver keeps it Done, so C-2's in-epic blocker holds no more.
+  await asBeat("ed2673", site, { autoStart: false, tickets: [dEpic(), dChild("C-2", ["C-1"], "todo")] });
+  const rows = fleetTicketRows();
+  assert.equal(rows.has(`${site}\x00C-1`), false);
+  assert.equal(epicRunAllChildrenDone(run, rows), false);
+  assert.equal(epicChildBlockersDone(rows.get(`${site}\x00C-2`).row, run, rows), true,
+    "an aged-off Done blocker does not hold its dependent");
+  // Re-arm: C-1 is kept as a Done child, leading the first wave.
+  run = armEpicRun(site, "E-1");
+  assert.deepEqual(run.children, ["C-2", "C-1"], "the board's children first, then the kept one");
+  assert.deepEqual(run.doneChildren, ["C-1"]);
+  assert.deepEqual(run.waves, [["C-1", "C-2"]], "the kept child leads the first wave");
+  assert.equal(run.state, "running");
+  // C-2 finishes: the run completes although C-1 is not on the board.
+  await asBeat("ed2673", site, { autoStart: false, tickets: [dEpic(), dChild("C-2", ["C-1"], "done")] });
+  epicRunDriveSweep();
+  assert.equal(epicRuns[`${site}/E-1`].state, "done");
+  assert.deepEqual(epicRuns[`${site}/E-1`].doneChildren.slice().sort(), ["C-1", "C-2"]);
+  // A re-arm of the finished run keeps both, so the board reads 2 / 2.
+  run = armEpicRun(site, "E-1");
+  assert.deepEqual(run.children.slice().sort(), ["C-1", "C-2"]);
+  assert.equal(run.state, "done");
+  // The live record is a coerce fixed point (the HA own-write echo dedups).
+  assert.deepEqual(sanitizeEpicRunRecord(run), run);
+});
+
+test("XERK-2673: an OPEN child that went unlisted keeps the run open (no epic Done write)", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  const site = "e2673c.atlassian.net";
+  await asBeat("ed2673c", site, { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "todo"), dChild("C-2", [], "done")] });
+  armEpicRun(site, "E-1");
+  // Both leave the board: C-2 aged off Done, C-1 reassigned / its host offline.
+  await asBeat("ed2673c", site, { autoStart: false, tickets: [dEpic()] });
+  const run = armEpicRun(site, "E-1");
+  assert.deepEqual(run.children.slice().sort(), ["C-1", "C-2"]);
+  assert.deepEqual(run.doneChildren, ["C-2"]);
+  assert.equal(run.state, "running", "an unlisted child never Done is still open");
+  epicRunCompleteSweep();
+  assert.equal((agents.ed2673c.commands || []).some((c) => c.type === "setTicketStatus"), false,
+    "the epic is never written Done behind an open child");
+});
+
+test("XERK-2673: at the children cap, the board's live children win over kept Done ones", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  const site = "e2673d.atlassian.net";
+  const done = Array.from({ length: 500 }, (_, i) => dChild(`D-${i}`, [], "done"));
+  await asBeat("ed2673d", site, { autoStart: false, tickets: [dEpic(), ...done] });
+  armEpicRun(site, "E-1");
+  await asBeat("ed2673d", site, { autoStart: false, tickets: [dEpic(), dChild("N-1", [], "todo")] });
+  const run = armEpicRun(site, "E-1");
+  assert.equal(run.children.length, 500);
+  assert.equal(run.children[0], "N-1");
+  assert.equal(run.state, "running");
+  const inRun = new Set(run.children);
+  assert.ok(run.waves.flat().every((k) => inRun.has(k)), "waves hold only run children");
+  assert.deepEqual(sanitizeEpicRunRecord(JSON.parse(JSON.stringify(run))), run);
+});
+
+test("XERK-2673: past the cap a wave the cut empties is dropped (coerce fixed point)", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  const site = "e2673f.atlassian.net";
+  const kids = Array.from({ length: 500 }, (_, i) => dChild(`K-${i}`, [], "todo"));
+  await asBeat("ed2673f", site, { autoStart: false,
+    tickets: [dEpic(), ...kids, dChild("Z-1", ["K-0"], "todo")] });
+  const run = armEpicRun(site, "E-1");
+  assert.equal(run.children.includes("Z-1"), false);
+  assert.ok(run.waves.every((w) => w.length), "no empty wave");
+  assert.deepEqual(sanitizeEpicRunRecord(JSON.parse(JSON.stringify(run))), run);
+});
+
+test("XERK-2673: a cycle wholly past the cap does not block the run", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  const site = "e2673h.atlassian.net";
+  const kids = Array.from({ length: 500 }, (_, i) => dChild(`K-${i}`, [], "todo"));
+  await asBeat("ed2673h", site, { autoStart: false,
+    tickets: [dEpic(), ...kids, dChild("Y-1", ["Y-2"], "todo"), dChild("Y-2", ["Y-1"], "todo")] });
+  const run = armEpicRun(site, "E-1");
+  assert.equal(run.state, "running");
+  assert.equal("cycle" in run, false, "a cycle among cut children is not the run's");
+  assert.deepEqual(sanitizeEpicRunRecord(JSON.parse(JSON.stringify(run))), run);
+});
+
+test("XERK-2673: pausing a capped run keeps the coerce fixed point", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  const site = "e2673g.atlassian.net";
+  await asBeat("ed2673g", site, { autoStart: false, tickets: [dEpic(), dChild("C-1", [], "todo")] });
+  armEpicRun(site, "E-1", undefined, { maxConcurrent: 2 });
+  const run = setEpicRunPaused(site, "E-1", true);
+  assert.deepEqual(Object.keys(sanitizeEpicRunRecord(JSON.parse(JSON.stringify(run)))), Object.keys(run));
+});
+
+test("XERK-2673: the driver records Done children of a PAUSED run, and a listed reopened blocker holds again", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  const site = "e2673e.atlassian.net";
+  const k = `${site}/E-1`;
+  await asBeat("ed2673e", site, { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "inprogress"), dChild("C-2", ["C-1"], "todo")] });
+  armEpicRun(site, "E-1", undefined, { maxConcurrent: 2 });
+  setEpicRunPaused(site, "E-1", true);
+  assert.deepEqual(sanitizeEpicRunRecord(JSON.parse(JSON.stringify(epicRuns[k]))), epicRuns[k],
+    "pause keeps the coerce fixed point");
+  // C-1 finishes while held: recorded, state untouched, record still a fixed point.
+  await asBeat("ed2673e", site, { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "done"), dChild("C-2", ["C-1"], "todo")] });
+  epicRunDriveSweep();
+  assert.deepEqual(epicRuns[k].doneChildren, ["C-1"]);
+  assert.equal(epicRuns[k].state, "running");
+  assert.deepEqual(sanitizeEpicRunRecord(JSON.parse(JSON.stringify(epicRuns[k]))), epicRuns[k]);
+  // C-1 reopened and LISTED: its row wins over the record, so it holds C-2 again.
+  await asBeat("ed2673e", site, { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "todo"), dChild("C-2", ["C-1"], "todo")] });
+  const rows = fleetTicketRows();
+  assert.equal(epicChildBlockersDone(rows.get(`${site}\x00C-2`).row, epicRuns[k], rows), false);
+  setEpicRunPaused(site, "E-1", false);
+  epicRunDriveSweep();
+  assert.equal("doneChildren" in epicRuns[k], false, "the reopened child leaves the record");
+});
+
+test("XERK-2673: a reopened child leaves doneChildren; a child moved to another epic is dropped", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  const site = "e2673b.atlassian.net";
+  await asBeat("ed2673b", site, { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "done"), dChild("C-2", [], "done"), dChild("C-3", [], "todo")] });
+  armEpicRun(site, "E-1");
+  // C-1 reopened (still listed, To Do); C-2 moved to another epic (listed, other epicKey).
+  await asBeat("ed2673b", site, { autoStart: false, tickets: [dEpic(),
+    dChild("C-1", [], "todo"), { ...dChild("C-2", [], "done"), epicKey: "E-9" }, dChild("C-3", [], "todo")] });
+  const run = armEpicRun(site, "E-1");
+  assert.deepEqual(run.children, ["C-1", "C-3"]);
+  assert.equal("doneChildren" in run, false);
+  // sanitize keeps only strings, and omits an empty list.
+  const base = { epicKey: "E-1", siteKey: site, state: "running", children: ["C-1"],
+    waves: [["C-1"]], startedAt: 1, updatedAt: 2 };
+  assert.deepEqual(sanitizeEpicRunRecord({ ...base, doneChildren: ["C-1", 5, ""] }).doneChildren, ["C-1"]);
+  assert.equal("doneChildren" in sanitizeEpicRunRecord({ ...base, doneChildren: "C-1" }), false);
+});
+
 test("XERK-641: a paused run never auto-completes its epic (epicRunCompleteSweep skips it)", async () => {
   resetEpicD();
   // Arm while the child is NOT done so the run is `running`, pause it, THEN mark the

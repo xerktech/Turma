@@ -1480,6 +1480,20 @@ class BoardTest {
         assertEquals(EpicChildStatus.BLOCKED, view.waves[2][0].status)
     }
 
+    @Test fun `epicRunView counts an aged-off child the hub recorded Done (XERK-2673)`() {
+        val site = epicSite(listOf(child("C-2", blockedBy = listOf("C-1"))))
+        val run = mkRun(children = listOf("C-1", "C-2"), waves = listOf(listOf("C-1", "C-2")))
+            .copy(doneChildren = listOf("C-1"))
+        val view = epicRunView(run, site, emptyMap())
+        assertEquals(2, view.total)
+        assertEquals(1, view.done)
+        assertEquals(EpicChildStatus.DONE, view.waves[0][0].status)
+        assertEquals(EpicChildStatus.READY, view.waves[0][1].status)
+        assertEquals(0, epicRunView(run.copy(doneChildren = emptyList()), site, emptyMap()).done)
+        val reopened = epicSite(listOf(child("C-1"), child("C-2")))
+        assertEquals(0, epicRunView(run, reopened, emptyMap()).done)
+    }
+
     @Test fun `epicRunView derives child status from the live board`() {
         // C-1 Done; C-2 has a running session; C-3 unstarted, its in-epic blocker
         // C-2 not Done -> blocked.

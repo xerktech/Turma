@@ -320,6 +320,9 @@ data class EpicRun(
     val children: List<String> = emptyList(),
     val waves: List<List<String>> = emptyList(),
     val cycle: List<String> = emptyList(),
+    // Children the hub saw Done, so one that aged off the board still counts
+    // (XERK-2673). Absent on an older hub → empty.
+    val doneChildren: List<String> = emptyList(),
     // Operator hold (XERK-641): a paused run starts no new children and its running
     // children are left alone until Resume. Absent on an older hub → false.
     val paused: Boolean = false,

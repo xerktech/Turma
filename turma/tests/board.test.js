@@ -3064,6 +3064,22 @@ test("epicRunView: derives per-child status from the live board (done/running/re
   assert.deepEqual(view.waves.map((w) => w.map((c) => c.key)), [["C-1"], ["C-2", "C-3"]]);
 });
 
+test("XERK-2673: epicRunView counts a child the board no longer lists as Done when the hub recorded it", () => {
+  // C-1 aged out of the board's Done window; the hub kept it in doneChildren.
+  const site = epicSite([ticket("C-2", { statusCategory: "todo", blockedBy: ["C-1"] })]);
+  const r = run({ children: ["C-1", "C-2"], waves: [["C-1", "C-2"]], doneChildren: ["C-1"] });
+  const view = epicRunView(r, site, { sessionIndex: new Map() });
+  assert.equal(view.total, 2);
+  assert.equal(view.done, 1);
+  assert.deepEqual(view.waves[0].map((c) => c.status), ["done", "ready"]);
+  // Without the record (an older hub) the unlisted child is not claimed Done.
+  const old = epicRunView({ ...r, doneChildren: undefined }, site, { sessionIndex: new Map() });
+  assert.equal(old.done, 0);
+  // A listed child's live row wins over the record (reopened).
+  const reopened = epicSite([ticket("C-1", { statusCategory: "todo" }), ticket("C-2", { statusCategory: "todo" })]);
+  assert.equal(epicRunView(r, reopened, { sessionIndex: new Map() }).done, 0);
+});
+
 test("epicRunView: a child with all in-epic blockers Done reads ready (not blocked)", () => {
   const site = epicSite([
     ticket("C-1", { statusCategory: "done" }),
