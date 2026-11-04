@@ -2808,7 +2808,12 @@ function addHostPaint() {
   const panel = document.getElementById("addHostPanel");
   if (!back || !panel) return;
   back.hidden = !addHost.open;
-  if (addHost.open) panel.innerHTML = addHostPanelHtml(addHost, location.origin, Date.now());
+  if (!addHost.open) return;
+  // Keep focus on the same control across the swap (XERK-2676).
+  const B = typeof TurmaBoard !== "undefined" ? TurmaBoard : null;
+  const refocus = B && B.focusKeyIn ? B.focusKeyIn(panel) : null;
+  panel.innerHTML = addHostPanelHtml(addHost, location.origin, Date.now());
+  if (B && B.restoreFocusIn) B.restoreFocusIn(panel, refocus);
 }
 async function addHostLoad() {
   try {
@@ -2822,6 +2827,9 @@ async function addHostLoad() {
 function addHostOpen() {
   addHost = { open: true, codes: null, minted: null, device: "", busy: false, error: "" };
   addHostPaint();
+  // Land keyboard focus in the dialog, not on the button that opened it.
+  const close = document.querySelector("#addHostPanel .td-close");
+  if (close) close.focus();
   addHostLoad();
 }
 function addHostClose() { addHost.open = false; addHost.minted = null; addHostPaint(); }

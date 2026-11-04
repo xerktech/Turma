@@ -111,7 +111,8 @@ function mountNT() {
       });
       return el;
     },
-    addEventListener() {},
+    _listeners: {},
+    addEventListener(t, fn) { (this._listeners[t] ||= []).push(fn); },
     // anyBackdropOpen() looks for a visible .td-backdrop; reflect the backdrops
     // actually appended under the body so td-open removal is exercised honestly.
     querySelector: () => body.children.find(c => c.className === "td-backdrop" && !c.hidden) || null,
@@ -304,4 +305,21 @@ test("newticket: the board no longer owns the button or its modal markup", () =>
   assert.doesNotMatch(html, /id="newTicket"|id="createBackdrop"|id="createPanel"|board-newticket/);
   const css = fs.readFileSync(path.join(PUBLIC, "app.css"), "utf8");
   assert.doesNotMatch(css, /\.board-newticket/);
+});
+
+// XERK-2676: mounting installs the shared modal Tab trap on the document, so
+// every page carrying the header (and so this module) traps Tab in its modals.
+test("newticket: mount wires the shared modal Tab trap to the document", () => {
+  const { doc } = mountNT();
+  const B = global.window.TurmaBoard;
+  const orig = B.trapModalTab;
+  const seen = [];
+  B.trapModalTab = (e, d, w) => { seen.push([e, d, w]); return false; };
+  try {
+    const ev = { key: "Tab" };
+    for (const fn of doc._listeners.keydown || []) fn(ev);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0][0], ev);
+    assert.equal(seen[0][1], doc);
+  } finally { B.trapModalTab = orig; }
 });

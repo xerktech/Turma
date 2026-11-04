@@ -2888,7 +2888,110 @@
       </div>`}`;
   }
 
+  // --- Focus across an innerHTML repaint (XERK-2676) ---------------------------
+  // A panel repainted by innerHTML destroys whatever control held focus, dropping
+  // it to <body> for keyboard/screen-reader users. focusKeyIn notes where focus
+  // sits inside `root` before the swap; restoreFocusIn hands it back after.
+  const cssEscape = (v) => (typeof CSS !== "undefined" && CSS.escape
+    ? CSS.escape(v) : String(v).replace(/["\\]/g, "\\$&"));
+
+  // A selector for the focused control (its data-* attributes, else its id, else
+  // its class, else a link's href) plus its position among the controls that
+  // selector matches — the detail panel's header key link and "Open in Jira"
+  // share an href — and a text field's caret, which a rebuilt field would reset
+  // to 0. null when focus isn't inside `root`.
+  function focusKeyIn(root) {
+    const doc = root && root.ownerDocument;
+    const el = doc && doc.activeElement;
+    if (!el || el === root || !root.contains(el)) return null;
+    const tag = el.tagName.toLowerCase();
+    const data = Array.from(el.attributes).filter(a => a.name.startsWith("data-"))
+      .map(a => `[${a.name}="${cssEscape(a.value)}"]`).join("");
+    const cls = el.classList[0];
+    const href = el.getAttribute("href");
+    const sel = data ? tag + data
+      : el.id ? `#${cssEscape(el.id)}`
+      : cls ? `${tag}.${cssEscape(cls)}`
+      : href ? `${tag}[href="${cssEscape(href)}"]` : null;
+    const key = { sel, nth: 0 };
+    if (sel) key.nth = Array.from(root.querySelectorAll(sel)).indexOf(el);
+    if (typeof el.selectionStart === "number") key.caret = [el.selectionStart, el.selectionEnd];
+    return key;
+  }
+  // Focus the control `key` names in the repainted `root`, caret restored. If it
+  // is gone or won't take focus (a submit disabled while busy), focus the panel
+  // itself: focus stays in the dialog and a stray Enter/Space activates nothing.
+  function restoreFocusIn(root, key) {
+    if (!key) return;
+    const el = key.sel && root.querySelectorAll(key.sel)[key.nth];
+    if (el) {
+      el.focus({ preventScroll: true });
+      if (root.ownerDocument.activeElement === el) {
+        if (key.caret && el.setSelectionRange) {
+          try { el.setSelectionRange(key.caret[0], key.caret[1]); } catch { /* type without a caret */ }
+        }
+        return;
+      }
+    }
+    if (!root.hasAttribute("tabindex")) root.setAttribute("tabindex", "-1");
+    root.focus({ preventScroll: true });
+  }
+
+  // --- Modal Tab trap (XERK-2676) -------------------------------------------
+  // Covers every [role=dialog][aria-modal] panel inside a .td-backdrop (board
+  // detail/policy/epic-builder panels, New ticket, Add host) plus the Sessions
+  // page's open image lightbox. aria-modal
+  // promises focus stays inside, so Tab wraps at the ends instead of walking out
+  // to the page behind. Installed once per page by newticket.js, which every
+  // page with such a modal loads after this file.
+  const MODAL_SEL = '.td-backdrop:not([hidden]) > [role="dialog"][aria-modal="true"], ' +
+    '.img-lightbox.open[role="dialog"][aria-modal="true"]';
+  const TAB_STOP_SEL = "a[href], button, input, select, textarea, summary, [tabindex]";
+
+  // Whether a keyboard Tab can land on `el`. Collapsed <details> contents keep
+  // client rects in Chromium, so they are excluded by hand: only the summary of
+  // the innermost closed <details> stays reachable.
+  function isTabStop(el, win) {
+    if (el.disabled || el.tabIndex < 0) return false;
+    if (el.closest("[hidden]")) return false;
+    for (let d = el.closest("details:not([open])"); d;
+      d = d.parentElement ? d.parentElement.closest("details:not([open])") : null) {
+      if (!(el.tagName === "SUMMARY" && el.parentElement === d)) return false;
+    }
+    if (!el.getClientRects().length) return false;
+    const vis = win.getComputedStyle(el).visibility;
+    return vis !== "hidden" && vis !== "collapse";
+  }
+
+  // Where a Tab (`back` = Shift+Tab) from `active` must go to stay inside
+  // `panel`, or null when the browser's own move already stays inside.
+  function trapTabTarget(panel, active, back, win) {
+    const stops = Array.from(panel.querySelectorAll(TAB_STOP_SEL)).filter(el => isTabStop(el, win));
+    if (!stops.length) return panel;
+    const first = stops[0], last = stops[stops.length - 1];
+    if (active === panel || !panel.contains(active)) return back ? last : first;
+    if (back && active === first) return last;
+    if (!back && active === last) return first;
+    return null;
+  }
+
+  // The keydown handler: traps Tab inside the topmost open modal (the last one
+  // in DOM order is the one drawn on top). True when it moved focus.
+  function trapModalTab(e, doc, win) {
+    if (e.key !== "Tab" || e.altKey || e.ctrlKey || e.metaKey || e.defaultPrevented) return false;
+    const open = doc.querySelectorAll(MODAL_SEL);
+    const panel = open.length ? open[open.length - 1] : null;
+    if (!panel) return false;
+    const to = trapTabTarget(panel, doc.activeElement, e.shiftKey, win);
+    if (!to) return false;
+    e.preventDefault();
+    if (to === panel && !panel.hasAttribute("tabindex")) panel.setAttribute("tabindex", "-1");
+    to.focus();
+    return true;
+  }
+
   const api = {
+    focusKeyIn, restoreFocusIn, isTabStop, trapTabTarget, trapModalTab,
     CATEGORIES, SLOTS, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgSlotPin, orgName, hostName, autoStartOn, ageStr,
     createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
     bareKey, prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
