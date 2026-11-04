@@ -4418,23 +4418,29 @@ function armEpicRun(siteKey, epicKey, rows, opts) {
   const prev = epicRuns[k];
   // A Done child ages off the board (the agent lists only a recent Done window),
   // so a rebuild from the rows alone drops it and the run reads "0 / 1 done" on
-  // its last child (XERK-2673). Keep every child the previous run saw Done that
-  // the board no longer lists at all; one still listed is judged by its row (it
-  // may have been reopened, or moved to another epic).
+  // its last child (XERK-2673). Keep every previous child the board no longer
+  // lists at all: one the run saw Done counts Done; any other stays NOT Done, so
+  // an open child that merely went unlisted (reassigned, its host offline) never
+  // lets the run complete and write the epic Done behind it. A child still listed
+  // is judged by its row (reopened, or moved to another epic and dropped).
   if (prev) noteEpicRunDoneChildren(prev, rows);
   const onBoard = (key) => rows.has(ticketQueueKey(siteKey, key));
-  const kept = ((prev && prev.doneChildren) || []).filter((key) => !onBoard(key));
-  const children = [...kept, ...kids.map((c) => c.key)]
+  const kept = ((prev && prev.children) || []).filter((key) => !onBoard(key));
+  // The board's children first, so kept ones never crowd a live child past the cap.
+  const children = [...kids.map((c) => c.key), ...kept]
     .filter((c, i, a) => typeof c === "string" && c && a.indexOf(c) === i)
     .slice(0, EPIC_RUN_CHILDREN_MAX);
-  // A kept child is finished, so it orders nothing: it leads the first wave.
-  const keptSet = new Set(kept.filter((c) => children.includes(c)));
+  const inRun = new Set(children);
+  const keptSet = new Set(kept.filter((c) => inRun.has(c)));
+  // A kept child's blockers are unknown (no row): it leads the first wave.
+  for (let i = 0; i < waves.length; i++) waves[i] = waves[i].filter((c) => inRun.has(c));
   if (keptSet.size) {
     if (waves.length) waves[0] = [...keptSet, ...waves[0]];
     else waves.push([...keptSet]);
   }
+  const prevDone = new Set((prev && prev.doneChildren) || []);
   const isDone = (key) => {
-    if (keptSet.has(key)) return true;
+    if (keptSet.has(key)) return prevDone.has(key);
     const r = rows.get(ticketQueueKey(siteKey, key));
     return !!(r && r.row && r.row.statusCategory === "done");
   };
@@ -4496,6 +4502,7 @@ function setEpicRunPaused(siteKey, epicKey, paused) {
   const want = !!paused;
   if (!!run.paused === want) return run;   // idempotent
   if (want) run.paused = true; else delete run.paused;
+  orderEpicRunKeys(run);
   if (want) withdrawEpicRunQueue(epicRunKey(siteKey, epicKey), "its epic run was paused");
   run.updatedAt = Date.now();
   persistEpicRuns();
@@ -5886,12 +5893,17 @@ function noteEpicRunDoneChildren(run, rows) {
   const next = kids.filter((key) => epicRunChildDone(run, key, rows));
   if (next.length === before.length && next.every((key, i) => key === before[i])) return false;
   if (next.length) run.doneChildren = next; else delete run.doneChildren;
-  // Keep the sanitizer's key order (paused/maxConcurrent after doneChildren), so a
-  // live record stays a coerce fixed point and the HA own-write echo dedups.
+  orderEpicRunKeys(run);
+  return true;
+}
+
+// Put an edited run's optional keys back in the sanitizer's order (doneChildren,
+// paused, maxConcurrent last), so a live record stays a coerce fixed point and the
+// HA own-write echo dedups.
+function orderEpicRunKeys(run) {
   for (const f of ["paused", "maxConcurrent"]) {
     if (f in run) { const v = run[f]; delete run[f]; run[f] = v; }
   }
-  return true;
 }
 
 // Re-derive a running run's state as children complete: once every child is Done
