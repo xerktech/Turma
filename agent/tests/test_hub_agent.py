@@ -56925,6 +56925,54 @@ class TestRepoDelete(ManagerMixin, unittest.TestCase):
         self.assertFalse(os.path.exists(repo))
         self.assertEqual(os.listdir(os.path.join(ha.REPOS_ROOT, ".turma", "deleting")), [])
 
+    def test_a_vanished_inner_file_never_reads_as_the_tree_gone(self):
+        # QA: a git lockfile renamed away mid-walk raises FileNotFoundError
+        # for an INNER path while the tree is still on disk. That must neither
+        # end the removal early nor be reported as done.
+        tree = os.path.join(self.tmp, "t")
+        os.makedirs(os.path.join(tree, "a"))
+        real = ha.shutil.rmtree
+        calls = []
+
+        def fnf_once(path, *a, **kw):
+            calls.append(path)
+            if len(calls) == 1:
+                raise FileNotFoundError(2, "gone", os.path.join(path, "a", "index.lock"))
+            return real(path, *a, **kw)
+
+        with mock.patch.object(ha.shutil, "rmtree", fnf_once), \
+             mock.patch.object(ha.time, "sleep"):
+            ha.SessionManager._rmtree_retrying(tree)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(os.path.exists(tree))
+        os.makedirs(tree)
+        with mock.patch.object(ha.shutil, "rmtree",
+                               side_effect=FileNotFoundError(2, "gone", "x")), \
+             mock.patch.object(ha.time, "sleep"):
+            with self.assertRaises(OSError):
+                ha.SessionManager._rmtree_retrying(tree)
+
+    def test_an_inner_file_already_gone_is_skipped_by_the_walk(self):
+        # The onerror half: an entry that vanished between listing and unlink
+        # is what removing it wanted; the rest of the tree still goes.
+        tree = os.path.join(self.tmp, "t2")
+        os.makedirs(os.path.join(tree, "d"))
+        open(os.path.join(tree, "d", "f"), "w").close()
+        real_unlink = os.unlink
+        hit = []
+
+        def unlink(p, *a, **kw):
+            if not hit and os.path.basename(str(p)) == "f":
+                hit.append(p)
+                real_unlink(p, *a, **kw)
+                raise FileNotFoundError(2, "gone", p)
+            return real_unlink(p, *a, **kw)
+
+        with mock.patch.object(ha.os, "unlink", unlink):
+            ha.SessionManager._rmtree_retrying(tree)
+        self.assertTrue(hit)
+        self.assertFalse(os.path.exists(tree))
+
     def test_a_leftover_from_an_interrupted_delete_is_swept_by_the_next(self):
         sm = self.make_manager()
         self._setup_repo(sm)

@@ -47,6 +47,10 @@ Progress rides the heartbeat as `repoDeletes: [{repo, status, error, summary, at
   wrote a lock into `.git` mid-rmtree: `rmdir .git` failed "Directory not empty" and the repo was
   left half-deleted (still listed, `.git` empty). Never go back to an in-place rmtree.
 - Each removal first sweeps what an interrupted one left in that trash dir.
+- **Success is the path being GONE, never an exception's type** (`_rmtree_retrying`): a git
+  lockfile renamed away mid-walk raises FileNotFoundError for an INNER path with the tree still
+  there, and treating that as done reported "deleted" over a tree left on disk (QA, 23/30).
+  An inner entry already gone is skipped in `onerror`; the walk repeats until `lexists` is false.
 - A failed delete's note lingers `REPO_DELETE_ERROR_LINGER_SEC` (1h), a done one 5 min.
 - Hub: 400 for the repos root, 409 for an agent that reports no `repoDeletes` array (it would ack
   and never act), 404 for a repo the host does not report. Web-only control (`android/PARITY.md`).

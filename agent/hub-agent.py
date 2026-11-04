@@ -22069,8 +22069,8 @@ PRUNE_RESULT_LINGER_SEC = 60  # keep a FINISHED repo's prune summary in the hear
 REPO_DELETE_SYNC_TIMEOUT_SEC = _env_int("TURMA_REPO_DELETE_SYNC_TIMEOUT_SEC",
                                         1800, minimum=60)
 REPO_DELETE_RESULT_LINGER_SEC = 300  # a FINISHED delete's summary stays this long
-# A FAILED delete's reason stays longer: the button comes back when it goes, and
-# an operator who looked away must still be able to read why nothing happened.
+# A FAILED delete's reason stays longer: an operator who looked away must still
+# be able to read why the repo is still there.
 REPO_DELETE_ERROR_LINGER_SEC = 3600
 # A removal retries an rmtree that hit a transient error (a file appearing under
 # it) this many times, a second apart.
@@ -47360,17 +47360,28 @@ class SessionManager:
     @staticmethod
     def _rmtree_retrying(path):
         """rmtree that retries a transient failure (a file a process still
-        running in the tree created mid-walk); the last failure raises."""
+        running in the tree created, or created and renamed away, mid-walk).
+        Success is the PATH being gone, never an error's type: a git lockfile
+        renamed away under the walk raises FileNotFoundError for an INNER path
+        while the tree is still there (QA). An inner file already gone is
+        skipped; the walk repeats until the path is gone, then raises."""
+        def onerror(func, p, exc):
+            if isinstance(exc[1], FileNotFoundError):
+                return  # already gone: exactly what removing it wanted
+            _rmtree_writable(func, p, exc)
+
+        last = None
         for attempt in range(REPO_DELETE_RMTREE_ATTEMPTS):
             try:
-                shutil.rmtree(path, onerror=_rmtree_writable)
+                shutil.rmtree(path, onerror=onerror)
+            except OSError as e:
+                last = e
+            if not os.path.lexists(path):
                 return
-            except FileNotFoundError:
-                return
-            except OSError:
-                if attempt == REPO_DELETE_RMTREE_ATTEMPTS - 1:
-                    raise
+            if attempt < REPO_DELETE_RMTREE_ATTEMPTS - 1:
                 time.sleep(1)
+        raise last or OSError(f"{path} is still there after "
+                              f"{REPO_DELETE_RMTREE_ATTEMPTS} attempts")
 
     @staticmethod
     def _sweep_repo_trash(trash):
