@@ -5409,6 +5409,43 @@ test("http: prune route queues a prune command per repo; validates host", async 
   assert.equal(ghost.status, 404);
 });
 
+test("XERK-2672: delete-repo route queues deleteRepo only for a reported repo on a capable agent", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  // An agent predating the feature reports no repoDeletes: refused in words.
+  await beat({ device: "hdr-old", repos: [{ name: "Turma" }] });
+  const old = await request("POST", "/api/agents/hdr-old/repos/Turma/delete", {
+    body: {}, headers: userHeaders,
+  });
+  assert.equal(old.status, 409);
+  assert.match(old.body.error, /too old/);
+
+  await beat({ device: "hdr", repos: [{ name: "Turma" }], repoDeletes: [] });
+  const ok = await request("POST", "/api/agents/hdr/repos/Turma/delete", {
+    body: {}, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+  const res = await beat({ device: "hdr", repos: [{ name: "Turma" }], repoDeletes: [] });
+  assert.deepEqual(res.body.commands, [
+    { type: "deleteRepo", repo: "Turma", cmdId: ok.body.cmdId },
+  ]);
+  // A repo the host does not report, and an unknown host, are 404s.
+  const missing = await request("POST", "/api/agents/hdr/repos/Nope/delete", {
+    body: {}, headers: userHeaders,
+  });
+  assert.equal(missing.status, 404);
+  const ghost = await request("POST", "/api/agents/ghost/repos/Turma/delete", {
+    body: {}, headers: userHeaders,
+  });
+  assert.equal(ghost.status, 404);
+  // The progress record rides the served payload.
+  await beat({ device: "hdr", repos: [{ name: "Turma" }],
+    repoDeletes: [{ repo: "Turma", status: "syncing", error: null, summary: "s", at: "t" }] });
+  const agents = await request("GET", "/api/agents", { headers: userHeaders });
+  const a = agents.body.agents.find((x) => x.key === "hdr");
+  assert.equal(a.repoDeletes[0].status, "syncing");
+});
+
 test("http: restart route queues one restartAgent; collapses a mashed button", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });

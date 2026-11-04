@@ -141,3 +141,33 @@ test("a repo git cannot read says so with the reason, never clean", () => {
   assert.match(html, /<span class="git-problem" title="index file smaller than &lt;expected&gt;">git unreadable<\/span>/);
   assert.doesNotMatch(html, /clean/);
 });
+
+// XERK-2672: the per-repo Delete control follows the agent's `repoDeletes`
+// record exactly as Prune follows `prunes`, and is offered only by an agent
+// that reports the field (an older one would ack the command and never act).
+const delHost = (repoDeletes) => ({ key: "truenas", online: true, prunes: [], repoDeletes });
+
+test("delete is offered only by an agent that reports repoDeletes", () => {
+  const { repoBlock } = loadDashboard();
+  assert.doesNotMatch(repoBlock(host([]), REPO, [], Date.now()), /deleteRepo\(/);
+  assert.match(repoBlock(delHost([]), REPO, [], Date.now()), />Delete</);
+  const root = repoBlock(delHost([]), { ...REPO, isRoot: true }, [], Date.now());
+  assert.doesNotMatch(root, /deleteRepo\(/);
+});
+
+test("a delete waiting on the archive keeps the button busy and says so", () => {
+  const { repoBlock } = loadDashboard();
+  const html = repoBlock(delHost([{ repo: "Tenir", status: "syncing",
+    summary: "syncing session data to the hub (1/3)", at: "x" }]), REPO, [], Date.now());
+  assert.match(html, /Deleting…/);
+  assert.match(html, /class="prune-note run">syncing session data to the hub \(1\/3\)</);
+});
+
+test("a delete that gave up shows the agent's reason", () => {
+  const { repoBlock } = loadDashboard();
+  const html = repoBlock(delHost([{ repo: "Tenir", status: "error",
+    error: "the hub archive did not confirm 2 transcript(s) within 30 min, so the repo was kept",
+    summary: "delete stopped; nothing was removed" }]), REPO, [], Date.now());
+  assert.match(html, /class="prune-note err">the hub archive did not confirm 2/);
+  assert.doesNotMatch(html, /Deleting…/);
+});

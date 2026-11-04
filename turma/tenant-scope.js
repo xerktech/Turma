@@ -87,6 +87,7 @@ const ROUTES = [
   // per host (the operator commands)
   ["POST", "/api/agents/:host/clone", "host"],
   ["POST", "/api/agents/:host/repos/:repo/prune", "host"],
+  ["POST", "/api/agents/:host/repos/:repo/delete", "host"],
   ["POST", "/api/agents/:host/restart", "host"],
   ["POST", "/api/agents/:host/roll-token", "host"],
   ["POST", "/api/agents/:host/revoke-name-token", "host"],

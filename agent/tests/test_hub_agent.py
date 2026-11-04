@@ -56639,5 +56639,181 @@ class TestOneshotShutdownAndTmpWrites(ManagerMixin, unittest.TestCase):
         self.assertEqual(open(tmp).read(), "new")
 
 
+class TestRepoDelete(ManagerMixin, unittest.TestCase):
+    """XERK-2672: deleting a repo stops its sessions, waits until the hub's
+    archive reply shows it holds every one of their transcripts, and only then
+    removes the repo and its worktrees. The archive confirmation is driven here
+    by hand: the inventory build, the ship and the reply are each called the
+    way build_payload / queue_archive_sync call them."""
+
+    def _setup_repo(self, sm, name="R", transcripts=("t1",)):
+        repo = os.path.join(ha.REPOS_ROOT, name)
+        os.makedirs(os.path.join(repo, ".git"))
+        wt = os.path.join(ha.WORKTREES_ROOT, name, "w1")
+        os.makedirs(wt)
+        slug = ha._project_slug(wt)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        os.makedirs(d, exist_ok=True)
+        for t in transcripts:
+            write_jsonl(os.path.join(d, t + ".jsonl"),
+                        [_text_entry("u-" + t, "user", "hi")])
+        sm.usage_ledger = {wt: {"repo": name, "remote": "git@x:o/r.git",
+                                "slug": slug}}
+        return repo, wt, d
+
+    def _build_and_ship(self, sm, seq=None):
+        """One inventory build + ship, exactly as the worker and build_payload
+        do it. Returns the offered ids."""
+        rec = next(iter(sm.repo_deletes.values()))
+        seq = rec["minSeq"] if seq is None else seq
+        report = {}
+        inv, _cat = sm._archive_inventory(sm._archive_candidate_inputs(),
+                                          priority=sm._repo_delete_priority(),
+                                          report=report)
+        sm._note_repo_delete_build((seq, report))
+        offered = {e["i"] for e in inv}
+        sm._archive_shipped = (seq, offered, report)
+        return offered
+
+    def test_waits_for_the_archive_then_removes_repo_and_worktrees(self):
+        sm = self.make_manager()
+        repo, wt, tdir = self._setup_repo(sm)
+        sm.registry = [{"id": "s1", "repo": "R", "worktreePath": wt,
+                        "status": "running", "tmuxName": "agent-s1"}]
+        sm.delete_repo("R")
+        self.assertEqual(sm.registry, [], "the repo's session is stopped")
+        self.assertTrue(sm._repo_delete_active("R"))
+        self.assertEqual(sm.repo_deletes["R"]["status"], "syncing")
+        # The hub is still short of t1: nothing is removed.
+        self.assertIn("t1", self._build_and_ship(sm))
+        sm._note_repo_delete_sync({"archiveHave": {"t1": 0}})
+        with mock.patch.object(sm, "_run_repo_delete") as run_del:
+            sm._advance_repo_deletes()
+        run_del.assert_not_called()
+        self.assertTrue(os.path.isdir(repo))
+        # Now the hub holds it all: removal starts, and removes both trees.
+        self._build_and_ship(sm)
+        sm._note_repo_delete_sync({"archiveHave": {}})
+        started = []
+        with mock.patch.object(ha.threading, "Thread") as T:
+            T.side_effect = lambda target, args, **kw: mock.Mock(
+                start=lambda: started.append((target, args)))
+            sm._advance_repo_deletes()
+        self.assertEqual(sm.repo_deletes["R"]["status"], "deleting")
+        self.assertEqual(len(started), 1)
+        target, args = started[0]
+        target(*args)
+        self.assertFalse(os.path.exists(repo))
+        self.assertFalse(os.path.exists(os.path.join(ha.WORKTREES_ROOT, "R")))
+        self.assertTrue(os.path.isfile(os.path.join(tdir, "t1.jsonl")),
+                        "the transcript stays on the host")
+        self.assertEqual(sm.repo_deletes["R"]["status"], "done")
+        sm.closed = [{"id": "s1", "repo": "R"}, {"id": "s2", "repo": "Other"}]
+        sm._advance_repo_deletes()
+        self.assertEqual([c["id"] for c in sm.closed], ["s2"])
+        self.assertFalse(sm._repo_delete_active("R"))
+
+    def test_a_reply_without_archive_cursors_confirms_nothing(self):
+        sm = self.make_manager()
+        self._setup_repo(sm)
+        sm.delete_repo("R")
+        self._build_and_ship(sm)
+        sm._note_repo_delete_sync({"commands": []})   # older hub / hydrating index
+        with mock.patch.object(sm, "_run_repo_delete") as run_del:
+            sm._advance_repo_deletes()
+        run_del.assert_not_called()
+        self.assertEqual(sm.repo_deletes["R"]["confirmed"], set())
+
+    def test_an_inventory_staged_before_the_kills_counts_for_nothing(self):
+        sm = self.make_manager()
+        self._setup_repo(sm)
+        sm.delete_repo("R")
+        rec = sm.repo_deletes["R"]
+        self._build_and_ship(sm, seq=rec["minSeq"] - 1)
+        sm._note_repo_delete_sync({"archiveHave": {}})
+        self.assertIsNone(rec["total"])
+        self.assertEqual(rec["confirmed"], set())
+
+    def test_a_running_slug_at_build_time_never_sets_the_total(self):
+        sm = self.make_manager()
+        _repo, wt, _d = self._setup_repo(sm)
+        sm.delete_repo("R")
+        rec = sm.repo_deletes["R"]
+        # A session running in that worktree drops its slug from the build.
+        sm.registry = [{"id": "x", "repo": "R", "worktreePath": wt,
+                        "status": "running"}]
+        self._build_and_ship(sm)
+        self.assertIsNone(rec["total"])
+
+    def test_times_out_and_keeps_the_repo(self):
+        sm = self.make_manager()
+        repo, _wt, _d = self._setup_repo(sm)
+        sm.delete_repo("R")
+        sm.repo_deletes["R"]["startedMono"] -= ha.REPO_DELETE_SYNC_TIMEOUT_SEC + 1
+        with mock.patch.object(sm, "_run_repo_delete") as run_del:
+            sm._advance_repo_deletes()
+        run_del.assert_not_called()
+        self.assertEqual(sm.repo_deletes["R"]["status"], "error")
+        self.assertIn("kept", sm.repo_deletes["R"]["error"])
+        self.assertTrue(os.path.isdir(repo))
+        self.assertFalse(sm._repo_delete_active("R"))
+
+    def test_a_repo_with_nothing_to_archive_completes(self):
+        sm = self.make_manager()
+        self._setup_repo(sm, transcripts=())
+        sm.delete_repo("R")
+        self._build_and_ship(sm)
+        with mock.patch.object(ha.threading, "Thread") as T:
+            sm._advance_repo_deletes()
+        T.assert_called_once()
+        self.assertEqual(sm.repo_deletes["R"]["status"], "deleting")
+
+    def test_refusals(self):
+        sm = self.make_manager()
+        sm.delete_repo(ha.ROOT_REPO_NAME)
+        self.assertEqual(sm.repo_deletes[ha.ROOT_REPO_NAME]["status"], "error")
+        sm.delete_repo("nope")
+        self.assertEqual(sm.repo_deletes["nope"]["status"], "error")
+        self.assertFalse(sm._repo_delete_active("nope"))
+
+    def test_the_repos_transcripts_lead_the_inventory_window(self):
+        sm = self.make_manager()
+        _repo, wt, tdir = self._setup_repo(sm, transcripts=("old",))
+        os.utime(os.path.join(tdir, "old.jsonl"), (1000, 1000))
+        other = "/w/.turma/worktrees/Other/o1"
+        od = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(other))
+        os.makedirs(od)
+        for i in range(3):
+            write_jsonl(os.path.join(od, f"n{i}.jsonl"), [_text_entry("x", "user", "hi")])
+        sm.usage_ledger[other] = {"repo": "Other", "remote": "",
+                                  "slug": ha._project_slug(other)}
+        sm.delete_repo("R")
+        with mock.patch.object(ha, "ARCHIVE_INVENTORY_MAX", 2), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 1):
+            offered = self._build_and_ship(sm)
+        self.assertIn("old", offered)
+        self.assertEqual(len(offered), 2)
+
+    def test_no_session_launches_in_a_repo_being_deleted(self):
+        sm = self.make_manager()
+        _repo, wt, _d = self._setup_repo(sm)
+        sm.delete_repo("R")
+        with self.assertRaises(RuntimeError):
+            sm._launch_tmux({"id": "z", "repo": "R", "worktreePath": wt,
+                             "tmuxName": "agent-z"})
+        with mock.patch.object(sm, "_refuse_start") as refuse:
+            sm.spawn("R", cmd_id="c1")
+        refuse.assert_called_once()
+        self.assertEqual(sm.registry, [])
+
+    def test_handle_commands_routes_deleteRepo_and_the_payload_reports_it(self):
+        sm = self.make_manager()
+        self._setup_repo(sm)
+        sm.handle_commands([{"cmdId": "c1", "type": "deleteRepo", "repo": "R"}])
+        rows = sm._repo_deletes_payload()
+        self.assertEqual([(r["repo"], r["status"]) for r in rows], [("R", "syncing")])
+        self.assertEqual(set(rows[0]), {"repo", "status", "error", "summary", "at"})
+
+
 if __name__ == "__main__":
     unittest.main()
