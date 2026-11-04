@@ -12638,7 +12638,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
   "dsh", "qwen", "triage", "trajectory", "closeTicket", "defaultRuntime", "gitSources", "github", "hostOs", "inputMaxChars", "jira", "limits", "localModel",
-  "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
+  "logTail", "memory", "models", "prunes", "repoDeletes", "repoUsage", "repos", "reposRoot",
   "sessions", "startedAt", "subscription", "tokenRoll", "uploadMaxBytes", "usage",
   "historyResults", "trajectoryTailResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
@@ -25331,6 +25331,28 @@ const server = http.createServer(async (req, res) => {
       const repo = decodeURIComponent(parts[4]);
       if (!repo) return json(res, 400, { error: "repo required" });
       const cmdId = queueCommand(key, { type: "prune", repo });
+      return json(res, 200, { ok: true, cmdId });
+    }
+
+    // POST /api/agents/<host>/repos/<repo>/delete — delete a repo and every
+    // session worktree cut from it on that host (XERK-2672). The agent stops the
+    // repo's sessions, waits until this hub's archive holds every one of their
+    // transcripts, and only then removes the files; its progress rides the
+    // heartbeat as `repoDeletes`. Refused here only for a host that cannot take it.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "repos" && parts[5] === "delete" && parts.length === 6) {
+      const key = decodeURIComponent(parts[2]);
+      if (!agents[key]) return json(res, 404, { error: "unknown agent" });
+      const repo = decodeURIComponent(parts[4]);
+      if (!repo) return json(res, 400, { error: "repo required" });
+      if (repo === ROOT_REPO_NAME) return json(res, 400, { error: "the repos root cannot be deleted" });
+      if (!(agents[key].repos || []).some((r) => r && r.name === repo)) {
+        return json(res, 404, { error: `${repo} is not a repo on ${agents[key].device || key}` });
+      }
+      if (!Array.isArray(agents[key].repoDeletes)) {
+        return json(res, 409, { error: "this host's agent is too old to delete a repo; update it first" });
+      }
+      const cmdId = queueCommand(key, { type: "deleteRepo", repo });
       return json(res, 200, { ok: true, cmdId });
     }
 

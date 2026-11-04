@@ -22063,6 +22063,12 @@ CLONE_ERROR_LINGER_SEC = 300  # ...longer for a failed one (operator reads it)
 # stale while git is alive. A dir whose newest file is this old is finished/dead.
 CLONE_TMP_MIN_AGE_SEC = 120
 PRUNE_RESULT_LINGER_SEC = 60  # keep a FINISHED repo's prune summary in the heartbeat
+# Deleting a repo (XERK-2672) waits until the hub's archive confirms it holds
+# every transcript of that repo's sessions before anything is removed; past this
+# the delete gives up and leaves the repo (and its stopped sessions) in place.
+REPO_DELETE_SYNC_TIMEOUT_SEC = _env_int("TURMA_REPO_DELETE_SYNC_TIMEOUT_SEC",
+                                        1800, minimum=60)
+REPO_DELETE_RESULT_LINGER_SEC = 300  # a FINISHED delete's summary stays this long
 # A prune runs on its own worker thread (XERK-256), so its git commands are NOT
 # on the heartbeat's critical path and can be bounded generously instead of
 # short: a single `git worktree remove` of a node_modules-carrying tree on a ZFS
@@ -28020,6 +28026,13 @@ class SessionManager:
         self._inventory_wake = threading.Event()
         self._inventory_inputs = None
         self._inventory_ready = None
+        # Repo-delete sync bookkeeping (XERK-2672): the stage sequence number and
+        # priority slugs riding beside the staged inputs, the build's report
+        # beside the published result, and what the LAST shipped inventory held.
+        self._inventory_seq = 0
+        self._inventory_meta_in = None
+        self._inventory_meta_ready = None
+        self._archive_shipped = None
         # Bumped by every full beat that sees the hub NOT offering; a build
         # staged under an older generation is discarded rather than shipped
         # after a rollback-and-re-roll, however long its walk ran.
@@ -28277,6 +28290,10 @@ class SessionManager:
         # thread and read by the beat, so every touch holds _prune_lock.
         self.prunes = {}
         self._prune_lock = threading.Lock()
+        # Repo deletes (XERK-2672), keyed by repo name. The BEAT owns every
+        # record; the removal worker only publishes its outcome under the lock.
+        self.repo_deletes = {}
+        self._repo_delete_lock = threading.Lock()
         self._prune_queue = deque()   # repo names the worker has yet to reach
         self._prune_worker = None
         # Worktrees the worker removed, drained by _poll_prunes. self.closed is
@@ -31797,6 +31814,11 @@ class SessionManager:
         # process owns it: its Enter would land in the relaunched conversation
         # (rollup XERK-1701 #70.1). Every launch passes here, restart included.
         _retire_pane_writers(sess.get("tmuxName"))
+        # No session may come back up in a repo that is being deleted
+        # (XERK-2672): its transcript would keep growing past the archive
+        # confirmation the delete waits for. Every launch path passes here.
+        if not sess.get("root") and self._repo_delete_active(sess.get("repo")):
+            raise RuntimeError(f"{sess.get('repo')} is being deleted from this host")
         # Runtime dispatch (XERK-460). _launch_tmux is the ONE launch choke point
         # every path goes through (spawn provision, resume, restart, resume-any,
         # resume-on-boot), so the claude-vs-dsh branch lives here rather than at
@@ -32687,6 +32709,10 @@ class SessionManager:
         # bridge pointer is last-writer-wins.
         is_root = (repo_name == ROOT_REPO_NAME)
         awaiting_clone = False
+        if not is_root and self._repo_delete_active(repo_name):
+            self._refuse_start(f"{repo_name} is being deleted from this host",
+                               cmd_id=cmd_id)
+            return
         if is_root:
             repo = {"name": ROOT_REPO_NAME, "path": REPOS_ROOT}
         else:
@@ -41527,7 +41553,7 @@ class SessionManager:
             self._archive_inventory_pos = (pos + slots) % len(rest)
         return window
 
-    def _archive_inventory(self, inputs=None):
+    def _archive_inventory(self, inputs=None, priority=None, report=None):
         """The hub-driven replacement for `_archive_manifest` (XERK-431): a cheap
         `[{i, s, r}]` inventory of what this host HAS — transcript id, current
         rendered size, current raw total — over a bounded rotating window. The hub
@@ -41550,7 +41576,28 @@ class SessionManager:
         if inputs is None:
             inputs = self._archive_candidate_inputs()
         out, defer_raw, _universe = self._archive_candidates_from(inputs)
-        window = self._inventory_window(out)
+        if priority:
+            # A repo being deleted (XERK-2672): its not-yet-confirmed
+            # transcripts lead the window so the hub is asked about every one
+            # of them soon, and `report` tells the beat which ids exist in
+            # those slugs and whether any slug was still running at build time.
+            slugs, done = priority
+            pri = [m for m in out if m["slug"] in slugs]
+            head = [m for m in pri if m["transcriptId"] not in done]
+            head = head[:ARCHIVE_INVENTORY_MAX]
+            heads = {m["transcriptId"] for m in head}
+            rest = [m for m in out if m["transcriptId"] not in heads]
+            window = head + self._inventory_window(rest)[
+                :ARCHIVE_INVENTORY_MAX - len(head)]
+            if report is not None:
+                report["all"] = {m["transcriptId"]: m["slug"] for m in pri}
+                # A live worktree session's slug is NOT in `running` (it ships
+                # rendered while running) but in defer_raw, with `r` sent as 0 —
+                # so both sets mean "still live, the hub cannot hold it all".
+                report["running"] = set(slugs) & (set(inputs[0] or ())
+                                                  | set(inputs[1] or ()))
+        else:
+            window = self._inventory_window(out)
         inventory = []
         catalog = {}
         for m in window:
@@ -41765,8 +41812,13 @@ class SessionManager:
         beat — a failed Thread.start() (pids_limit, XERK-402) leaves the snapshot
         staged and the next refresh beat retries."""
         try:
+            # A repo delete in progress (XERK-2672) puts its transcripts at the
+            # head of the window; read on the beat (it owns repo_deletes).
+            priority = self._repo_delete_priority()
             with self._inventory_lock:
+                self._inventory_seq += 1
                 self._inventory_inputs = (self._inventory_gen, inputs)
+                self._inventory_meta_in = (self._inventory_seq, priority)
                 w = self._inventory_worker
                 if w is None or not w.is_alive():
                     w = threading.Thread(target=self._inventory_worker_loop,
@@ -41782,8 +41834,11 @@ class SessionManager:
         ships once."""
         with self._inventory_lock:
             ready, self._inventory_ready = self._inventory_ready, None
+            meta, self._inventory_meta_ready = self._inventory_meta_ready, None
         if ready is None or ready[0] != self._inventory_gen:
             return None
+        # What the repo-delete sync check reads off the reply to this ship.
+        self._inventory_taken_meta = meta
         return ready[1]
 
     def _inventory_worker_loop(self):
@@ -41795,16 +41850,24 @@ class SessionManager:
             self._inventory_wake.clear()
             with self._inventory_lock:
                 staged, self._inventory_inputs = self._inventory_inputs, None
+                meta_in, self._inventory_meta_in = self._inventory_meta_in, None
             if staged is None:
                 continue
             gen, inputs = staged
+            seq, priority = meta_in or (0, None)
+            report = {}
             try:
-                ready = (gen, self._archive_inventory(inputs))
+                # The plain call when no delete is waiting, so the build is
+                # exactly what it always was.
+                ready = (gen, self._archive_inventory(
+                    inputs, priority=priority, report=report) if priority
+                    else self._archive_inventory(inputs))
             except Exception as e:
                 log(f"archive inventory build failed: {type(e).__name__}: {e}")
                 continue
             with self._inventory_lock:
                 self._inventory_ready = ready
+                self._inventory_meta_ready = (seq, report)
 
     def queue_archive_sync(self, reply):
         """Stage a heartbeat reply's archive cursors for the sync WORKER and
@@ -41857,6 +41920,9 @@ class SessionManager:
         # failed start leaves the job staged and a never-started thread in
         # _archive_worker, whose is_alive() is False, so the next beat retries.
         try:
+            # A repo delete waiting on the archive (XERK-2672) learns from this
+            # reply which of its transcripts the hub now holds in full.
+            self._note_repo_delete_sync(reply)
             # Track the hub's capability off EVERY reply (XERK-431), so the NEXT
             # build_payload ships an inventory (or reverts to a manifest if a
             # rolled-back hub stops advertising it). Cheap, and inside the try
@@ -45280,6 +45346,11 @@ class SessionManager:
         if existing and existing.get("status") == "cloning":
             log(f"clone: {name} is already being cloned; ignoring duplicate")
             return
+        # A repo being deleted (XERK-2672) is not re-cloned under the delete:
+        # the removal worker would take the fresh clone with it.
+        if self._repo_delete_active(name):
+            log(f"clone refused: {name} is being deleted from this host")
+            return
         dest = os.path.join(REPOS_ROOT, name)
         # Clone into a private staging dir and rename into place only once it is
         # complete (XERK-374). REPOS_ROOT/<name> therefore only ever appears as a
@@ -46485,6 +46556,9 @@ class SessionManager:
         if not repo_name:
             log("prune refused: no repo named")
             return
+        if self._repo_delete_active(repo_name):
+            log(f"prune refused: {repo_name} is being deleted")
+            return
         with self._prune_lock:
             cur = self.prunes.get(repo_name)
             if cur and cur.get("status") in ("queued", "running"):
@@ -46960,6 +47034,306 @@ class SessionManager:
                 for j in list(self.prunes.values())
             ]
 
+    # --- deleting a repo (XERK-2672) ----------------------------------------
+
+    def _repo_delete_active(self, repo_name):
+        """True while `repo_name` is being deleted (syncing or removing): no
+        session may start in it, and nothing may clone or prune it."""
+        if not isinstance(repo_name, str) or not repo_name:
+            return False
+        with self._repo_delete_lock:
+            rec = self.repo_deletes.get(repo_name)
+            return bool(rec and rec.get("status") in ("syncing", "deleting"))
+
+    def _repo_slugs(self, repo_name):
+        """Every project slug whose transcripts belong to `repo_name`: the
+        attribution ledger's entries for it, the repo dir's own slug and each
+        worktree dir still under WORKTREES_ROOT/<repo>. In-memory plus one
+        listdir, so it is cheap enough for the beat."""
+        slugs = {_project_slug(os.path.join(REPOS_ROOT, repo_name))}
+        for wt, m in (self.usage_ledger or {}).items():
+            m = m or {}
+            if m.get("repo") == repo_name and not m.get("internal"):
+                slugs.add(m.get("slug") or _project_slug(wt))
+        wt_root = os.path.join(WORKTREES_ROOT, repo_name)
+        try:
+            for name in os.listdir(wt_root):
+                slugs.add(_project_slug(os.path.join(wt_root, name)))
+        except OSError:
+            pass
+        return slugs
+
+    def delete_repo(self, repo_name):
+        """Delete a repo from this host, with every session worktree cut from it
+        (its "forks"), WITHOUT losing a session's data (XERK-2672).
+
+        Runs in two phases. Here, on the beat: refuse what must not be deleted,
+        stop every session of the repo (a kill keeps worktree and transcript, so
+        a refusal later leaves them resumable) and mark the repo `syncing`. From
+        then on the archive inventory leads with this repo's transcripts and
+        `_note_repo_delete_sync` records each one the hub's reply shows it holds
+        in FULL (rendered and raw). Only once every one is confirmed does
+        `_advance_repo_deletes` hand the removal to a worker; past
+        REPO_DELETE_SYNC_TIMEOUT_SEC it gives up and removes nothing.
+
+        Transcripts live under PROJECTS_ROOT, outside the repo and its worktrees,
+        so they stay on this host too and usage keeps counting them; the archive
+        confirmation is what lets the data survive the host itself."""
+        name = repo_name.strip() if isinstance(repo_name, str) else ""
+        now = time.time()
+
+        def refuse(why):
+            with self._repo_delete_lock:
+                self.repo_deletes[name or "?"] = {
+                    "repo": name or "?", "status": "error", "error": why,
+                    "summary": "delete refused", "at": now_iso(),
+                    "finishedMono": now}
+            log(f"delete repo {name!r} refused: {why}")
+
+        if not name or name == ROOT_REPO_NAME:
+            return refuse("the repos root cannot be deleted")
+        if not any(r["name"] == name for r in scan_repos()):
+            return refuse(f"{name} is not a repo on this host")
+        with self._repo_delete_lock:
+            cur = self.repo_deletes.get(name)
+            if cur and cur.get("status") in ("syncing", "deleting"):
+                cur["at"] = now_iso()
+                log(f"delete repo {name}: already {cur['status']}")
+                return
+        if self._cloning(name):
+            return refuse(f"{name} is still being cloned")
+        with self._prune_lock:
+            pr = self.prunes.get(name)
+            if pr and pr.get("status") in ("queued", "running"):
+                return refuse(f"{name} is being pruned; try again once it finishes")
+        wt_root = os.path.join(WORKTREES_ROOT, name)
+        if any(self._import_holds(os.path.join(wt_root, d))
+               for d in self._listdir_quiet(wt_root)):
+            return refuse(f"a session is being migrated into {name}")
+        # Mark the repo FIRST, so no session can come back up in it between the
+        # kills below and the removal.
+        with self._repo_delete_lock:
+            self.repo_deletes[name] = {
+                "repo": name, "status": "syncing", "error": None,
+                "summary": "stopping sessions and syncing their data to the hub",
+                "at": now_iso(), "startedMono": now, "finishedMono": None,
+                # Only an inventory staged AFTER the kills can confirm anything:
+                # an earlier one was built while those slugs were still running.
+                "minSeq": self._inventory_seq + 1,
+                "confirmed": set(), "total": None}
+        stopped = 0
+        for sess in list(self.registry):
+            if sess.get("repo") == name and not sess.get("root"):
+                self.kill(sess.get("id"))
+                stopped += 1
+        with self._repo_delete_lock:
+            rec = self.repo_deletes[name]
+            rec["slugs"] = self._repo_slugs(name)
+            rec["stopped"] = stopped
+        log(f"delete repo {name}: stopped {stopped} session(s); waiting for the "
+            f"hub archive to confirm their transcripts")
+
+    @staticmethod
+    def _listdir_quiet(path):
+        try:
+            return os.listdir(path)
+        except OSError:
+            return []
+
+    def _repo_delete_priority(self):
+        """`(slugs, confirmed ids)` for the inventory worker, or None when no
+        delete is waiting on the archive. Never raises (runs on the beat)."""
+        try:
+            slugs, done = set(), set()
+            with self._repo_delete_lock:
+                for rec in self.repo_deletes.values():
+                    if rec.get("status") == "syncing":
+                        slugs |= set(rec.get("slugs") or ())
+                        done |= set(rec.get("confirmed") or ())
+            return (frozenset(slugs), frozenset(done)) if slugs else None
+        except Exception as e:
+            log(f"repo delete priority failed: {type(e).__name__}: {e}")
+            return None
+
+    def _note_repo_delete_sync(self, reply):
+        """Fold one heartbeat reply into each waiting delete. An id the shipped
+        inventory OFFERED that the reply's `archiveHave` does not name is one the
+        hub holds in full (`inventoryCursors` names exactly the short ones). A
+        reply with no `archiveHave` at all (an older hub, a hydrating index)
+        confirms nothing. Never raises — it runs inside queue_archive_sync."""
+        shipped, self._archive_shipped = self._archive_shipped, None
+        try:
+            if not shipped or not isinstance(reply, dict):
+                return
+            have = reply.get("archiveHave")
+            if not isinstance(have, dict):
+                return
+            seq, offered, report = shipped
+            all_ids = report.get("all") or {}
+            # The hub's own raw cap (ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES): an id in
+            # `archiveRawSkip` keeps being named while `rawBytes < r`, but the
+            # hub will never take more of its raw copy. It counts as held once
+            # its RENDERED cursor has reached the size we offered.
+            raw_skip = reply.get("archiveRawSkip")
+            raw_skip = set(raw_skip) if isinstance(raw_skip, list) else set()
+            full = bool(reply.get("archiveFull"))
+
+            def held(t):
+                if t not in have:
+                    return True
+                cur = have.get(t)
+                return (t in raw_skip and isinstance(cur, (int, float))
+                        and not isinstance(cur, bool)
+                        and cur >= (offered.get(t) or 0))
+
+            with self._repo_delete_lock:
+                for rec in self.repo_deletes.values():
+                    if rec.get("status") != "syncing" or seq < rec.get("minSeq", 0):
+                        continue
+                    slugs = rec.get("slugs") or set()
+                    rec["confirmed"] |= {t for t, sl in all_ids.items()
+                                         if sl in slugs and t in offered and held(t)}
+                    rec["archiveFull"] = full
+        except Exception as e:
+            log(f"repo delete sync check failed: {type(e).__name__}: {e}")
+
+    def _note_repo_delete_build(self, meta):
+        """Fold one taken inventory build's report into each waiting delete:
+        the transcript ids that exist in the repo's slugs. Taken from every
+        build, shipped or empty, so a repo with nothing to archive still
+        completes. Only a build staged after the kills, in which none of the
+        repo's slugs was running, is trusted (a running slug is left out of the
+        candidates whole, so its ids would be missing). Never raises."""
+        try:
+            if not meta:
+                return
+            seq, report = meta
+            if "all" not in (report or {}):
+                return
+            all_ids = report["all"]
+            running = report.get("running") or set()
+            with self._repo_delete_lock:
+                for rec in self.repo_deletes.values():
+                    if rec.get("status") != "syncing" or seq < rec.get("minSeq", 0):
+                        continue
+                    slugs = rec.get("slugs") or set()
+                    if not (running & slugs):
+                        rec["total"] = {t for t, sl in all_ids.items() if sl in slugs}
+        except Exception as e:
+            log(f"repo delete build check failed: {type(e).__name__}: {e}")
+
+    def _advance_repo_deletes(self):
+        """Beat side: start the removal of a repo whose data the hub now holds,
+        time out one it never confirmed, re-stop any session that appeared, drop
+        a removed repo's ended-session records, and age out finished summaries.
+        Never raises (runs on the beat)."""
+        try:
+            now = time.time()
+            ready, cleanup = [], []
+            with self._repo_delete_lock:
+                for name, rec in list(self.repo_deletes.items()):
+                    st = rec.get("status")
+                    if st == "syncing":
+                        total = rec.get("total")
+                        confirmed = rec.get("confirmed") or set()
+                        if total is not None and total <= confirmed:
+                            rec["status"] = "deleting"
+                            rec["summary"] = (f"{len(total)} transcript(s) safe "
+                                              f"in the hub archive; removing")
+                            rec["at"] = now_iso()
+                            ready.append(name)
+                        elif now - rec.get("startedMono", now) > REPO_DELETE_SYNC_TIMEOUT_SEC:
+                            left = len(total - confirmed) if total is not None else None
+                            t = REPO_DELETE_SYNC_TIMEOUT_SEC
+                            within = f"{t // 60} min" if t >= 120 else f"{t} s"
+                            why = ("; the hub's archive is full" if rec.get("archiveFull")
+                                   else "")
+                            rec.update(
+                                status="error", at=now_iso(), finishedMono=now,
+                                summary="delete stopped; nothing was removed",
+                                error=("the hub archive did not confirm "
+                                       + (f"{left} transcript(s)" if left is not None
+                                          else "this repo's transcripts")
+                                       + f" within {within}{why}, so the repo was kept; "
+                                       "its sessions are stopped and can be resumed"))
+                            log(f"delete repo {name}: {rec['error']}")
+                        else:
+                            n = len(confirmed)
+                            rec["summary"] = (
+                                f"syncing session data to the hub ({n}/{len(total)})"
+                                if total is not None else
+                                "syncing session data to the hub")
+                    elif st == "done" and not rec.get("cleaned"):
+                        rec["cleaned"] = True
+                        cleanup.append(name)
+                    fin = rec.get("finishedMono")
+                    if fin is not None and now - fin > REPO_DELETE_RESULT_LINGER_SEC:
+                        self.repo_deletes.pop(name, None)
+            # Belt and braces: every launch path refuses a deleting repo, but a
+            # record that appeared in one anyway is stopped back into the closed
+            # history before its files go. That includes the `error` record a
+            # refused Start/Resume leaves: `error` holds a capacity slot, and
+            # killed it stays resumable instead (QA).
+            for sess in list(self.registry):
+                if (not sess.get("root")
+                        and self._repo_delete_active(sess.get("repo"))):
+                    self.kill(sess.get("id"))
+            for name in cleanup:
+                self.closed = [c for c in self.closed if c.get("repo") != name]
+                self.registry = [s for s in self.registry if s.get("repo") != name
+                                 or s.get("root")]
+                self.save()
+            for name in ready:
+                threading.Thread(target=self._run_repo_delete, args=(name,),
+                                 name=f"repo-delete-{name}", daemon=True).start()
+        except Exception as e:
+            log(f"repo delete advance failed: {type(e).__name__}: {e}")
+
+    def _run_repo_delete(self, name):
+        """Worker: remove WORKTREES_ROOT/<repo> (every session worktree cut from
+        it) and then REPOS_ROOT/<repo>. A symlink at either path is unlinked,
+        never followed; rmtree itself never follows a link inside the tree.
+        Records the outcome for the beat; never raises."""
+        try:
+            for root in (WORKTREES_ROOT, REPOS_ROOT):
+                path = os.path.join(root, name)
+                # The name came from scan_repos (a plain child of REPOS_ROOT),
+                # but check the join stays a direct child before removing.
+                if os.path.dirname(os.path.normpath(path)) != os.path.normpath(root):
+                    raise RuntimeError(f"refusing to remove {path}")
+                if os.path.islink(path):
+                    # The link's target is another checkout that outlives this
+                    # delete: drop its entries for the worktrees just removed.
+                    if root == REPOS_ROOT:
+                        run(["git", "-C", path, "worktree", "prune"],
+                            timeout=PRUNE_GIT_TIMEOUT_SEC)
+                    os.unlink(path)
+                elif os.path.isdir(path):
+                    shutil.rmtree(path, onerror=_rmtree_writable)
+            with self._repo_delete_lock:
+                rec = self.repo_deletes.get(name, {})
+                n = len(rec.get("total") or ())
+                rec.update(status="done", error=None, at=now_iso(),
+                           finishedMono=time.time(),
+                           summary=f"deleted; {n} transcript(s) kept in the hub archive")
+            log(f"deleted repo {name} and its worktrees")
+        except Exception as e:
+            with self._repo_delete_lock:
+                rec = self.repo_deletes.get(name, {})
+                rec.update(status="error", at=now_iso(), finishedMono=time.time(),
+                           summary="delete failed part-way",
+                           error=f"removing {name} failed: {e}")
+            log(f"delete repo {name} failed: {e}")
+
+    def _repo_deletes_payload(self):
+        with self._repo_delete_lock:
+            return [
+                {"repo": r.get("repo"), "status": r.get("status"),
+                 "error": r.get("error"), "summary": r.get("summary"),
+                 "at": r.get("at")}
+                for r in list(self.repo_deletes.values())
+            ]
+
     # --- boot auto-resume --------------------------------------------------
 
     def resume_on_boot(self):
@@ -47231,6 +47605,8 @@ class SessionManager:
                     self.clone(cmd.get("repo"), source=cmd.get("source"))
                 elif ctype == "prune":
                     self.prune_repo(cmd.get("repo"))
+                elif ctype == "deleteRepo":
+                    self.delete_repo(cmd.get("repo"))
                 elif ctype == "refreshJira":
                     # The board's manual refresh. Re-checking configured() here
                     # (the hub already targets configured hosts) keeps the
@@ -48537,6 +48913,7 @@ class SessionManager:
                 log(f"hook integrity check failed: {e}")
         self._poll_clones()
         self._poll_prunes()
+        self._advance_repo_deletes()
         if not light:
             self._maybe_reap_ended()
         # Start any queued session that can now run — a freed slot or a
@@ -48841,6 +49218,7 @@ class SessionManager:
                             "free": max(0, MAX_SHADOW_RUNS - self._shadow_runs_active())},
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
+            "repoDeletes": self._repo_deletes_payload(),
             "ackedCommands": list(self.acked),
         }
         # Purely additive, and only present when something is staged — mirrors
@@ -48950,15 +49328,28 @@ class SessionManager:
             if ready is not None:
                 inventory, self._archive_catalog = ready
                 self._archive_sent_inventory = True
+                self._note_repo_delete_build(
+                    getattr(self, "_inventory_taken_meta", None))
                 if inventory:
                     payload["archiveInventory"] = inventory
+                    # The repo-delete sync check (XERK-2672) reads the reply
+                    # to THIS inventory: which ids it offered, and the build's
+                    # report on the slugs being deleted.
+                    meta = getattr(self, "_inventory_taken_meta", None) or (0, {})
+                    self._archive_shipped = (
+                        meta[0], {e["i"]: e.get("s", 0) for e in inventory},
+                        meta[1])
         #
         # Until a reply has said which path this hub takes, NEITHER runs: beat 0
         # after every restart used to take the inline manifest walk by default,
         # paying the very cost this moved off. The first full beat that learns
         # the hub offers stages straight away rather than waiting a refresh cycle.
         stage = refresh or (not light and self._archive_hub_offer
-                            and not self._inventory_staged_once)
+                            and (not self._inventory_staged_once
+                                 # A repo delete waiting on the archive
+                                 # (XERK-2672) re-offers every full beat, so
+                                 # its backlog ships within the timeout.
+                                 or self._repo_delete_priority() is not None))
         if stage and self._archive_offer_known:
             if self._archive_hub_offer:
                 self._archive_sent_inventory = True

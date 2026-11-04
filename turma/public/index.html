@@ -713,6 +713,12 @@ function reconcilePending(agents) {
       const a = byHost.get(p.host);
       const r = a && (a.prunes || []).find(x => x.repo === p.repo);
       if (r && r.at !== p.prevAt) pending.delete(key);
+    } else if (p.kind === "deleteRepo") {
+      // Same shape as prune: done once the agent reports a NEW delete record
+      // for this repo; its own status then drives the button.
+      const a = byHost.get(p.host);
+      const r = a && (a.repoDeletes || []).find(x => x.repo === p.repo);
+      if (r && r.at !== p.prevAt) pending.delete(key);
     } else if (p.kind === "restartAgent") {
       // Done once a fresh manager has beaten in — its startedAt differs from the
       // one showing when we queued the restart. If startedAt wasn't captured (an
@@ -1857,6 +1863,22 @@ function repoBlock(a, repo, sessList, now) {
   const pruneNote = pruneRes
     ? `<div class="prune-note ${pruneRes.status === "error" ? "err" : pruneLive ? "run" : ""}">${esc(pruneRes.status === "error" ? (pruneRes.error || "prune failed") : pruneRes.summary || "pruned")}</div>`
     : "";
+  // Delete (XERK-2672): remove the repo and every session worktree cut from it.
+  // The agent first stops the repo's sessions and waits for the hub archive to
+  // hold all of their transcripts, so the button stays busy through the sync —
+  // driven by the agent's `repoDeletes` record like Prune's. Offered only by an
+  // agent that reports the field (an older one would ack and never act).
+  const delRes = (a.repoDeletes || []).find(d => d.repo === repo.name);
+  const delLive = delRes && (delRes.status === "syncing" || delRes.status === "deleting");
+  const deleting = delLive || pending.has(pendKey("deleteRepo", a.key, repo.name));
+  const delArmed = confirming.has("rd::" + a.key + "::" + repo.name);
+  const canDelete = a.online && !repo.missing && !repo.isRoot && Array.isArray(a.repoDeletes);
+  const deleteBtn = canDelete
+    ? `<button class="btn-sm ${delArmed ? "confirm" : ""}" title="Delete this repo and its session worktrees from the host (session data is synced to the hub first)" ${deleting ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();deleteRepo('${escJs(a.key)}','${escJs(repo.name)}')">${deleting ? '<span class="spin"></span> Deleting…' : delArmed ? "Confirm delete" : "Delete"}</button>`
+    : "";
+  const deleteNote = delRes
+    ? `<div class="prune-note ${delRes.status === "error" ? "err" : delLive ? "run" : ""}">${esc(delRes.status === "error" ? (delRes.error || "delete failed") : delRes.summary || "deleted")}</div>`
+    : "";
   const resumePanel = canResume && resumeOpen.has(rkey)
     ? `<div class="resume-list">${(resumable || legacyClosed).map(item => {
         if (resumable) {
@@ -1891,11 +1913,13 @@ function repoBlock(a, repo, sessList, now) {
       ${meta}
       <span class="r-actions">
         ${pruneBtn}
+        ${deleteBtn}
         ${resumeBtn}
         ${spawnBtn}
       </span>
     </summary>
     ${pruneNote}
+    ${deleteNote}
     ${resumePanel}
     ${composerPanel}
     ${body}
@@ -2456,6 +2480,25 @@ function pruneRepo(key, repo) {
     busy(pendKey("prune", key, repo),
       { kind: "prune", host: key, repo, prevAt: prev ? prev.at : null },
       () => post(`/api/agents/${enc(key)}/repos/${enc(repo)}/prune`, null, "Prune"));
+  });
+}
+
+// Delete a repo from a host (XERK-2672). Arm/confirm, then a browser confirm
+// naming what is lost: the repo dir and its worktrees go, including anything not
+// pushed. Session transcripts are kept — the agent removes nothing until the
+// hub's archive confirms it holds every one of them.
+function deleteRepo(key, repo) {
+  twoClick("rd::" + key + "::" + repo, () => {
+    const host = (cache.agents || []).find(a => a.key === key);
+    const label = (host && host.device) || displayKey(key);
+    if (!confirm(`Delete ${repo} from ${label}?\n\n` +
+        "Its sessions are stopped and their data is synced to the hub archive first. " +
+        "Then the repo and every session worktree are removed from the host — " +
+        "uncommitted changes and unpushed commits or branches are lost.")) return;
+    const prev = host && (host.repoDeletes || []).find(d => d.repo === repo);
+    busy(pendKey("deleteRepo", key, repo),
+      { kind: "deleteRepo", host: key, repo, prevAt: prev ? prev.at : null },
+      () => post(`/api/agents/${enc(key)}/repos/${enc(repo)}/delete`, null, "Delete repo"));
   });
 }
 
