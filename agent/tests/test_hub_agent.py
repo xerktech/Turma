@@ -56968,10 +56968,13 @@ class TestRepoDelete(ManagerMixin, unittest.TestCase):
                 raise FileNotFoundError(2, "gone", p)
             return real_unlink(p, *a, **kw)
 
-        with mock.patch.object(ha.os, "unlink", unlink):
+        with mock.patch.object(ha.os, "unlink", unlink), \
+             mock.patch.object(ha.time, "sleep") as slept:
             ha.SessionManager._rmtree_retrying(tree)
         self.assertTrue(hit)
         self.assertFalse(os.path.exists(tree))
+        # ONE walk: the skip, not the outer retry, is what finished it.
+        slept.assert_not_called()
 
     def test_a_leftover_from_an_interrupted_delete_is_swept_by_the_next(self):
         sm = self.make_manager()
