@@ -302,3 +302,106 @@ test("board.html's policy refusal toasts print the siteKey bare", () => {
   assert.ok(src.includes("`Permission policy for ${B.bareKey(siteKey)}`"));
   assert.doesNotMatch(src, /policy for \$\{siteKey\}/);
 });
+
+// XERK-2676: paintDetail's innerHTML swap must hand focus back to the control
+// that held it (or ✕), not drop it to <body>; closing must return focus to the
+// ticket's card even after a board repaint replaced it. Drives the helpers
+// lifted out of board.html against a minimal fake DOM whose selectors are the
+// exact strings the helpers build.
+test("board.html restores detail-panel focus across repaints and on close", () => {
+  const src = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
+  const pick = (name) => {
+    const m = src.match(new RegExp(`function ${name}\\([^)]*\\) \\{[\\s\\S]*?\\n\\}`));
+    assert.ok(m, `${name} not found`);
+    return m[0];
+  };
+  const paint = pick("paintDetail");
+  assert.ok(paint.indexOf("focusKeyIn($panel)") < paint.indexOf("$panel.innerHTML ="));
+  assert.ok(paint.indexOf("restoreFocusIn($panel, refocus)") > paint.indexOf("$panel.innerHTML ="));
+  assert.match(pick("closeDetail"), /returnFocusTarget\(lastFocus\)/);
+
+  // sel: the one selector string this fake element answers to.
+  const el = (tag, attrs, cls, sel) => ({
+    tagName: tag.toUpperCase(),
+    attributes: Object.entries(attrs).map(([name, value]) => ({ name, value })),
+    classList: cls ? [cls] : [],
+    dataset: Object.fromEntries(Object.entries(attrs).filter(([k]) => k.startsWith("data-"))
+      .map(([k, v]) => [k.slice(5), v])),
+    getAttribute(n) { return attrs[n] === undefined ? null : attrs[n]; },
+    sel: sel || (cls === "td-close" ? ".td-close" : ""),
+    focusArgs: [],
+    focus(o) { this.focusArgs.push(o); },
+  });
+  const panel = (kids) => ({
+    contains: (e) => kids.includes(e),
+    querySelectorAll: (sel) => kids.filter(k => k.sel === sel),
+    querySelector: (sel) => kids.find(k => k.sel === sel) || null,
+  });
+  const doc = { activeElement: null, contains: () => true, querySelector: () => null };
+  const { focusKeyIn, restoreFocusIn, returnFocusTarget } = new Function("document", "CSS",
+    `${pick("focusKeyIn")}\n${pick("restoreFocusIn")}\n${pick("returnFocusTarget")}\n` +
+    "return { focusKeyIn, restoreFocusIn, returnFocusTarget };")(doc, { escape: (v) => v });
+  const close = () => el("button", {}, "td-close");
+
+  // ✕ (class only) → the fresh ✕, without scrolling.
+  const x0 = el("button", {}, "td-close", "button.td-close");
+  doc.activeElement = x0;
+  const k1 = focusKeyIn(panel([x0]));
+  assert.deepEqual(k1, { sel: "button.td-close", nth: 0 });
+  const x1 = el("button", {}, "td-close", "button.td-close");
+  restoreFocusIn(panel([x1]), k1);
+  assert.deepEqual(x1.focusArgs, [{ preventScroll: true }]);
+
+  // A data-* control that survives gets focus alone; one that's gone → ✕.
+  const btnSel = 'button[data-epic-run="1"]';
+  const b0 = el("button", { "data-epic-run": "1", type: "button" }, "", btnSel);
+  doc.activeElement = b0;
+  const k2 = focusKeyIn(panel([b0]));
+  assert.deepEqual(k2, { sel: btnSel, nth: 0 });
+  const b1 = el("button", { "data-epic-run": "1" }, "", btnSel), x2 = close();
+  restoreFocusIn(panel([x2, b1]), k2);
+  assert.equal(b1.focusArgs.length, 1);
+  assert.equal(x2.focusArgs.length, 0);
+  const x3 = close();
+  restoreFocusIn(panel([x3]), k2);
+  assert.equal(x3.focusArgs.length, 1);
+
+  // Bare links sharing an href (header key link vs "Open in Jira") keep their place.
+  const hSel = 'a[href="https://x.test/W-1"]';
+  const head0 = el("a", { href: "https://x.test/W-1" }, "", hSel);
+  const foot0 = el("a", { href: "https://x.test/W-1" }, "", hSel);
+  doc.activeElement = foot0;
+  const k3 = focusKeyIn(panel([head0, foot0]));
+  assert.deepEqual(k3, { sel: hSel, nth: 1 });
+  const head1 = el("a", { href: "https://x.test/W-1" }, "", hSel);
+  const foot1 = el("a", { href: "https://x.test/W-1" }, "", hSel);
+  restoreFocusIn(panel([close(), head1, foot1]), k3);
+  assert.equal(foot1.focusArgs.length, 1);
+  assert.equal(head1.focusArgs.length, 0);
+
+  // A control with no data-*, class or href → ✕.
+  doc.activeElement = el("span", {});
+  const k4 = focusKeyIn(panel([doc.activeElement]));
+  assert.deepEqual(k4, { sel: null, nth: 0 });
+  const x5 = close();
+  restoreFocusIn(panel([x5]), k4);
+  assert.equal(x5.focusArgs.length, 1);
+
+  // Focus outside the panel → nothing is stolen.
+  doc.activeElement = el("input", { "data-search": "1" });
+  assert.equal(focusKeyIn(panel([])), null);
+  const x4 = close();
+  restoreFocusIn(panel([x4]), null);
+  assert.equal(x4.focusArgs.length, 0);
+
+  // Close: the opener card if still attached, else the card redrawn for that ticket.
+  const card = el("div", { "data-key": "W-1", "data-site": "s1" }, "kanban-card");
+  assert.equal(returnFocusTarget(card), card);
+  const redrawn = {};
+  let asked = "";
+  doc.contains = () => false;
+  doc.querySelector = (sel) => { asked = sel; return redrawn; };
+  assert.equal(returnFocusTarget(card), redrawn);
+  assert.equal(asked, '.kanban-card[data-key="W-1"][data-site="s1"]');
+  assert.equal(returnFocusTarget(null), null);
+});

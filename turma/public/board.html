@@ -816,6 +816,42 @@ function modelPickFor(siteKey, ticket, agentPin, runtimePin) {
 }
 const modelPickSig = (p) => (p ? `${p.model}|${p.cls}|${(p.elsewhere || []).join(",")}` : "");
 
+// Where focus sits inside `root`, so a repaint can hand it back (XERK-2676):
+// a selector for the focused control (its data-* attributes, else its class,
+// else a link's href) plus its position among the controls that selector
+// matches — the header key link and "Open in Jira" share an href. null when
+// focus isn't inside `root`.
+function focusKeyIn(root) {
+  const el = document.activeElement;
+  if (!el || el === root || !root.contains(el)) return null;
+  const tag = el.tagName.toLowerCase();
+  const data = Array.from(el.attributes).filter(a => a.name.startsWith("data-"))
+    .map(a => `[${a.name}="${CSS.escape(a.value)}"]`).join("");
+  const cls = el.classList[0];
+  const href = el.getAttribute("href");
+  const sel = data ? tag + data
+    : cls ? `${tag}.${CSS.escape(cls)}`
+    : href ? `${tag}[href="${CSS.escape(href)}"]` : null;
+  if (!sel) return { sel: null, nth: 0 };
+  return { sel, nth: Array.from(root.querySelectorAll(sel)).indexOf(el) };
+}
+// Focus the control `key` names in the repainted `root`, else its close button.
+function restoreFocusIn(root, key) {
+  if (!key) return;
+  const el = (key.sel && root.querySelectorAll(key.sel)[key.nth]) || root.querySelector(".td-close");
+  if (el) el.focus({ preventScroll: true });
+}
+// The card to return focus to on close: `from` itself, or — when a board
+// repaint replaced it while the panel was open — the card now drawn for the
+// same ticket (XERK-2676).
+function returnFocusTarget(from) {
+  if (!from || document.contains(from)) return from || null;
+  const d = from.dataset || {};
+  if (!d.key) return null;
+  return document.querySelector(`.kanban-card[data-key="${CSS.escape(d.key)}"]` +
+    `[data-site="${CSS.escape(d.site || "")}"]`);
+}
+
 function paintDetail() {
   const s = openTicketState;
   if (!s) return;
@@ -874,6 +910,10 @@ function paintDetail() {
   s.outcomeShown = outcomeSig(ticketSessions);
   const noteExpanded = !!prevOutcome && prevOutcome === s.outcomeShown &&
     !!$panel.querySelector(".td-outcome-note[open]");
+  // The innerHTML swap below destroys whatever control held focus, dropping it
+  // to <body> for keyboard/screen-reader users (XERK-2676). Note it first so the
+  // same control (or the close button) can take focus back after the paint.
+  const refocus = focusKeyIn($panel);
   $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
     color: B.orgColor(s.siteKey, lastAllKeys, TurmaOrg.orgColors()),
     siteKey: s.siteKey,
@@ -936,6 +976,7 @@ function paintDetail() {
     epicRunError: epicOp && epicOp.error,
     sessions: ticketSessions,
   });
+  restoreFocusIn($panel, refocus);
   if (noteExpanded) {
     const note = $panel.querySelector(".td-outcome-note");
     if (note) note.open = true;
@@ -1614,7 +1655,8 @@ function closeDetail() {
   $backdrop.hidden = true;
   $panel.replaceChildren();
   syncOverlayLock();
-  if (lastFocus && document.contains(lastFocus)) lastFocus.focus();
+  const back = returnFocusTarget(lastFocus);
+  if (back) back.focus();
   lastFocus = null;
 }
 
