@@ -294,6 +294,21 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
         run("clone queued") { container.client.api.clone(host, CloneRequest(repo, source)) }
     fun prune(host: String, repo: String) = run("prune queued") { container.client.api.prune(host, repo) }
 
+    /**
+     * Delete a repo from its host (XERK-2675). Marked pending with the `at` of the
+     * record showing now, so the button stays busy until the agent reports a NEW
+     * record (web pruneRepo/deleteRepo's prevAt); from then its syncing/deleting
+     * status drives the spinner. A refusal rolls the mark back (see [run]).
+     */
+    fun deleteRepo(host: String, repo: String) {
+        val prev = fleet.value.agents.firstOrNull { it.key == host }
+            ?.let { com.xerktech.turma.core.RepoDelete.record(it, repo) }
+        val key = repoDeleteKey(host, repo)
+        _pending.value = _pending.value +
+            (key to SessPending("repoDelete", System.currentTimeMillis(), prevAt = prev?.at))
+        run("delete queued", key) { container.client.api.deleteRepo(host, repo) }
+    }
+
     /** Restart a host's agent manager (XERK-157). The host announces the expected
      *  downtime, exits for its supervisor to relaunch it, and re-adopts sessions. */
     fun restartAgent(host: String) = run("restart queued") { container.client.api.restartAgent(host) }
@@ -318,7 +333,11 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
         run("answer queued") { container.client.api.answerQuestion(host, id, AnswerRequest(optionIndex, custom)) }
 
     /** One in-flight session action (web index.html `pending` entry). */
-    data class SessPending(val kind: String, val at: Long, val restartCount: Int = 0)
+    data class SessPending(
+        val kind: String, val at: Long, val restartCount: Int = 0,
+        // repoDelete only: the agent record's `at` when it was queued.
+        val prevAt: String? = null,
+    )
 
     companion object {
         // Floor on how long the Refresh spinner stays up, so a poll that returns
@@ -326,6 +345,9 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
         private const val REFRESH_MIN_VISIBLE_MS = 600L
 
         fun pendKey(host: String, id: String) = "$host::$id"
+
+        /** Pending key for a repo delete; the `repo-delete:` prefix can't collide with a session id. */
+        fun repoDeleteKey(host: String, repo: String) = pendKey(host, "repo-delete:$repo")
 
         /**
          * The body a "New session" spawn posts. Pure, and separate from [spawn]
@@ -389,6 +411,8 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
             if (pending.isEmpty()) return pending
             val index = HashMap<String, com.xerktech.turma.model.SessionInfo>()
             for (a in agents) for (s in a.sessions) index[pendKey(a.key, s.id)] = s
+            val deletes = HashMap<String, String>()
+            for (a in agents) for (d in a.repoDeletes.orEmpty()) deletes.putIfAbsent(repoDeleteKey(a.key, d.repo), d.at) // first wins, like RepoDelete.record
             val next = pending.toMutableMap()
             for ((key, p) in pending) {
                 val ttl = if (p.kind == "restart") RESTART_TTL_MS else PENDING_TTL_MS
@@ -399,6 +423,8 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
                     "start" -> s?.status == "running"
                     "resume" -> s != null
                     "restart" -> s != null && s.restartCount != p.restartCount
+                    // A NEW record landed; its status now drives the button.
+                    "repoDelete" -> deletes[key].let { it != null && it != p.prevAt }
                     else -> false
                 }
                 if (done) next.remove(key)

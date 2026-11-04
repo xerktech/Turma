@@ -240,6 +240,15 @@ A pure-core/adapter-shell split:
 - The tunnel marker never shares a line it can't fit beside a half-width host · repo
   (`chatMetaOneLine`); on its own line it wraps at a word (2 lines max) and the bar grows to hold it.
 
+## Decoding agent records (XERK-2675)
+
+- Wire keys are the agent's, not Kotlin's: a repos[] entry flags the root pseudo-repo `(root)` as
+  `isRoot` (sessions say `root`). `RepoInfo.root` carries `@JsonNames("isRoot")`; without it the
+  root row read as a plain repo and was offered Prune and Delete.
+- Build gating fixtures from real wire JSON, never `RepoInfo(root = true)` — that shape hid the bug.
+- `/api/agents` decodes atomically; a new list the hub passes through raw gets a row-lenient
+  serializer (`LenientRepoDeletesSerializer`) so one bad row can't blank every host.
+
 ## Building
 
 - Gradle (wrapper generated in CI, not committed); PR-gated by `android-ci.yml` on `ubuntu-latest`,
