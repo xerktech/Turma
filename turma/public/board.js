@@ -505,9 +505,13 @@
     const keySet = new Set(keys);
     const cycleKeys = Array.isArray(run.cycle) ? run.cycle : [];
     const cycleSet = new Set(cycleKeys);
+    // A child the board no longer lists (aged out of the Done window) is Done when
+    // the hub recorded it so (`run.doneChildren`, XERK-2673) — else the count
+    // reads "0 / 1 done" on an epic's last child.
+    const doneSet = new Set(Array.isArray(run.doneChildren) ? run.doneChildren : []);
     const isDone = (k) => {
       const t = byKey.get(k);
-      return !!(t && categoryOf(t) === "done");
+      return t ? categoryOf(t) === "done" : doneSet.has(k);
     };
     const isRunning = (k) => {
       if (o.ticketQueue && queuedTicketOf(o.ticketQueue, siteKey, k)) return true;

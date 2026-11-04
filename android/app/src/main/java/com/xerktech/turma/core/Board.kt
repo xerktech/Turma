@@ -240,7 +240,10 @@ fun epicRunView(
     val keySet = keys.toSet()
     val cycleKeys = run.cycle
     val cycleSet = cycleKeys.toSet()
-    fun isDone(k: String): Boolean = byKey[k]?.let { categoryOf(it) == "done" } == true
+    // A child the board no longer lists (aged out of the Done window) is Done when
+    // the hub recorded it so (run.doneChildren, XERK-2673).
+    val doneSet = run.doneChildren.toSet()
+    fun isDone(k: String): Boolean = byKey[k]?.let { categoryOf(it) == "done" } ?: doneSet.contains(k)
     fun isRunning(k: String): Boolean {
         if (queuedTicketOf(ticketQueue, siteKey, k) != null) return true
         return ticketSessionsOf(sessionIndex, siteKey, k)
