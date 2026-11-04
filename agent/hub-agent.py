@@ -47170,14 +47170,30 @@ class SessionManager:
                 return
             seq, offered, report = shipped
             all_ids = report.get("all") or {}
+            # The hub's own raw cap (ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES): an id in
+            # `archiveRawSkip` keeps being named while `rawBytes < r`, but the
+            # hub will never take more of its raw copy. It counts as held once
+            # its RENDERED cursor has reached the size we offered.
+            raw_skip = reply.get("archiveRawSkip")
+            raw_skip = set(raw_skip) if isinstance(raw_skip, list) else set()
+            full = bool(reply.get("archiveFull"))
+
+            def held(t):
+                if t not in have:
+                    return True
+                cur = have.get(t)
+                return (t in raw_skip and isinstance(cur, (int, float))
+                        and not isinstance(cur, bool)
+                        and cur >= (offered.get(t) or 0))
+
             with self._repo_delete_lock:
                 for rec in self.repo_deletes.values():
                     if rec.get("status") != "syncing" or seq < rec.get("minSeq", 0):
                         continue
                     slugs = rec.get("slugs") or set()
                     rec["confirmed"] |= {t for t, sl in all_ids.items()
-                                         if sl in slugs and t in offered
-                                         and t not in have}
+                                         if sl in slugs and t in offered and held(t)}
+                    rec["archiveFull"] = full
         except Exception as e:
             log(f"repo delete sync check failed: {type(e).__name__}: {e}")
 
@@ -47228,15 +47244,18 @@ class SessionManager:
                             ready.append(name)
                         elif now - rec.get("startedMono", now) > REPO_DELETE_SYNC_TIMEOUT_SEC:
                             left = len(total - confirmed) if total is not None else None
+                            t = REPO_DELETE_SYNC_TIMEOUT_SEC
+                            within = f"{t // 60} min" if t >= 120 else f"{t} s"
+                            why = ("; the hub's archive is full" if rec.get("archiveFull")
+                                   else "")
                             rec.update(
                                 status="error", at=now_iso(), finishedMono=now,
                                 summary="delete stopped; nothing was removed",
                                 error=("the hub archive did not confirm "
                                        + (f"{left} transcript(s)" if left is not None
                                           else "this repo's transcripts")
-                                       + f" within {REPO_DELETE_SYNC_TIMEOUT_SEC // 60} "
-                                       "min, so the repo was kept; its sessions are "
-                                       "stopped and can be resumed"))
+                                       + f" within {within}{why}, so the repo was kept; "
+                                       "its sessions are stopped and can be resumed"))
                             log(f"delete repo {name}: {rec['error']}")
                         else:
                             n = len(confirmed)
@@ -47251,9 +47270,12 @@ class SessionManager:
                     if fin is not None and now - fin > REPO_DELETE_RESULT_LINGER_SEC:
                         self.repo_deletes.pop(name, None)
             # Belt and braces: every launch path refuses a deleting repo, but a
-            # session found running in one is stopped before its files go.
+            # record that appeared in one anyway is stopped back into the closed
+            # history before its files go. That includes the `error` record a
+            # refused Start/Resume leaves: `error` holds a capacity slot, and
+            # killed it stays resumable instead (QA).
             for sess in list(self.registry):
-                if (not sess.get("root") and sess.get("status") == "running"
+                if (not sess.get("root")
                         and self._repo_delete_active(sess.get("repo"))):
                     self.kill(sess.get("id"))
             for name in cleanup:
@@ -47280,6 +47302,11 @@ class SessionManager:
                 if os.path.dirname(os.path.normpath(path)) != os.path.normpath(root):
                     raise RuntimeError(f"refusing to remove {path}")
                 if os.path.islink(path):
+                    # The link's target is another checkout that outlives this
+                    # delete: drop its entries for the worktrees just removed.
+                    if root == REPOS_ROOT:
+                        run(["git", "-C", path, "worktree", "prune"],
+                            timeout=PRUNE_GIT_TIMEOUT_SEC)
                     os.unlink(path)
                 elif os.path.isdir(path):
                     shutil.rmtree(path, onerror=_rmtree_writable)
@@ -49310,14 +49337,19 @@ class SessionManager:
                     # report on the slugs being deleted.
                     meta = getattr(self, "_inventory_taken_meta", None) or (0, {})
                     self._archive_shipped = (
-                        meta[0], {e["i"] for e in inventory}, meta[1])
+                        meta[0], {e["i"]: e.get("s", 0) for e in inventory},
+                        meta[1])
         #
         # Until a reply has said which path this hub takes, NEITHER runs: beat 0
         # after every restart used to take the inline manifest walk by default,
         # paying the very cost this moved off. The first full beat that learns
         # the hub offers stages straight away rather than waiting a refresh cycle.
         stage = refresh or (not light and self._archive_hub_offer
-                            and not self._inventory_staged_once)
+                            and (not self._inventory_staged_once
+                                 # A repo delete waiting on the archive
+                                 # (XERK-2672) re-offers every full beat, so
+                                 # its backlog ships within the timeout.
+                                 or self._repo_delete_priority() is not None))
         if stage and self._archive_offer_known:
             if self._archive_hub_offer:
                 self._archive_sent_inventory = True

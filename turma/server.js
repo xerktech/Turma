@@ -25345,6 +25345,7 @@ const server = http.createServer(async (req, res) => {
       if (!agents[key]) return json(res, 404, { error: "unknown agent" });
       const repo = decodeURIComponent(parts[4]);
       if (!repo) return json(res, 400, { error: "repo required" });
+      if (repo === ROOT_REPO_NAME) return json(res, 400, { error: "the repos root cannot be deleted" });
       if (!(agents[key].repos || []).some((r) => r && r.name === repo)) {
         return json(res, 404, { error: `${repo} is not a repo on ${agents[key].device || key}` });
       }

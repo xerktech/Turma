@@ -56671,7 +56671,7 @@ class TestRepoDelete(ManagerMixin, unittest.TestCase):
                                           priority=sm._repo_delete_priority(),
                                           report=report)
         sm._note_repo_delete_build((seq, report))
-        offered = {e["i"] for e in inv}
+        offered = {e["i"]: e["s"] for e in inv}
         sm._archive_shipped = (seq, offered, report)
         return offered
 
@@ -56805,6 +56805,72 @@ class TestRepoDelete(ManagerMixin, unittest.TestCase):
             sm.spawn("R", cmd_id="c1")
         refuse.assert_called_once()
         self.assertEqual(sm.registry, [])
+
+    def test_a_transcript_at_the_hubs_raw_cap_counts_once_its_rendered_copy_is_whole(self):
+        # QA: the hub keeps naming an id whose raw copy hit its cap, so without
+        # `archiveRawSkip` such a repo could never be deleted.
+        sm = self.make_manager()
+        self._setup_repo(sm)
+        sm.delete_repo("R")
+        offered = self._build_and_ship(sm)
+        sm._note_repo_delete_sync({"archiveHave": {"t1": offered["t1"] - 1},
+                                   "archiveRawSkip": ["t1"]})
+        self.assertEqual(sm.repo_deletes["R"]["confirmed"], set(),
+                         "a short rendered copy is not held")
+        self._build_and_ship(sm)
+        sm._note_repo_delete_sync({"archiveHave": {"t1": offered["t1"]},
+                                   "archiveRawSkip": ["t1"]})
+        self.assertEqual(sm.repo_deletes["R"]["confirmed"], {"t1"})
+
+    def test_a_full_archive_is_named_when_the_delete_gives_up(self):
+        sm = self.make_manager()
+        self._setup_repo(sm)
+        sm.delete_repo("R")
+        self._build_and_ship(sm)
+        sm._note_repo_delete_sync({"archiveHave": {"t1": 0}, "archiveFull": True})
+        sm.repo_deletes["R"]["startedMono"] -= ha.REPO_DELETE_SYNC_TIMEOUT_SEC + 1
+        with mock.patch.object(ha, "REPO_DELETE_SYNC_TIMEOUT_SEC", 90):
+            sm.repo_deletes["R"]["startedMono"] -= 100
+            sm._advance_repo_deletes()
+        err = sm.repo_deletes["R"]["error"]
+        self.assertIn("archive is full", err)
+        self.assertIn("within 90 s", err)
+
+    def test_a_symlinked_repo_is_unlinked_and_its_target_survives(self):
+        sm = self.make_manager()
+        target = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(os.path.join(target, ".git"))
+        keep = os.path.join(target, "keep.txt")
+        open(keep, "w").write("x")
+        os.symlink(target, os.path.join(ha.REPOS_ROOT, "L"))
+        os.makedirs(os.path.join(ha.WORKTREES_ROOT, "L", "w1"))
+        sm.repo_deletes["L"] = {"repo": "L", "status": "deleting", "total": set()}
+        sm._run_repo_delete("L")
+        self.assertEqual(sm.repo_deletes["L"]["status"], "done")
+        self.assertFalse(os.path.lexists(os.path.join(ha.REPOS_ROOT, "L")))
+        self.assertTrue(os.path.isfile(keep), "the link's target is never removed")
+        self.assertFalse(os.path.exists(os.path.join(ha.WORKTREES_ROOT, "L")))
+
+    def test_a_refused_resume_does_not_hold_a_slot_as_an_error_record(self):
+        sm = self.make_manager()
+        _repo, wt, _d = self._setup_repo(sm)
+        sm.delete_repo("R")
+        sm.registry = [{"id": "e1", "repo": "R", "worktreePath": wt,
+                        "status": "error", "tmuxName": "agent-e1"}]
+        sm._advance_repo_deletes()
+        self.assertEqual(sm.registry, [])
+        self.assertIn("e1", [c.get("id") for c in sm.closed])
+
+    def test_inventory_is_staged_every_full_beat_while_a_delete_waits(self):
+        sm = self.make_manager()
+        self._setup_repo(sm)
+        sm._archive_offer_known = True
+        sm._archive_hub_offer = True
+        sm._inventory_staged_once = True
+        sm.delete_repo("R")
+        with mock.patch.object(sm, "_stage_archive_inventory") as stage:
+            sm.build_payload(1)   # not a refresh beat
+        stage.assert_called_once()
 
     def test_handle_commands_routes_deleteRepo_and_the_payload_reports_it(self):
         sm = self.make_manager()

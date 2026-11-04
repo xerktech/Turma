@@ -771,7 +771,7 @@ those are marked `[MODEL]`.
 - P1 Repo blocks: per-repo **Delete** (XERK-2672) is web-only. The web arms/confirms, POSTs
   `/api/agents/<host>/repos/<repo>/delete`, and shows the agent's `repoDeletes[]` record (busy while
   `status` is `syncing` or `deleting`; `error` shown in the note). Offered only when the host reports
-  a `repoDeletes` array and the repo is not the repos root. Android ignores the key today.
+  a `repoDeletes` array and the repo is not the repos root. Android ignores the key today (XERK-2675).
 - P1 Composer base-branch dropdown + per-repo option persistence.
 
 ### Sessions + Chat (`sessions.html` + `chat.js` → `SessionsScreen`/`ChatScreen`)

@@ -5429,6 +5429,12 @@ test("XERK-2672: delete-repo route queues deleteRepo only for a reported repo on
   assert.deepEqual(res.body.commands, [
     { type: "deleteRepo", repo: "Turma", cmdId: ok.body.cmdId },
   ]);
+  // The repos root is never deletable, even when the host lists it.
+  await beat({ device: "hdr", repos: [{ name: "Turma" }, { name: "(root)" }], repoDeletes: [] });
+  const root = await request("POST", "/api/agents/hdr/repos/(root)/delete", {
+    body: {}, headers: userHeaders,
+  });
+  assert.equal(root.status, 400);
   // A repo the host does not report, and an unknown host, are 404s.
   const missing = await request("POST", "/api/agents/hdr/repos/Nope/delete", {
     body: {}, headers: userHeaders,

@@ -31,9 +31,17 @@ Progress rides the heartbeat as `repoDeletes: [{repo, status, error, summary, at
   keeps counting them (ledger entries with a `remote` keep their repo attribution).
 - While `syncing`/`deleting` no session may launch in the repo (`_launch_tmux` raises, `spawn`
   refuses via `_refuse_start`), and clone/prune of it refuse.
+- **An id at the hub's raw cap counts once its RENDERED cursor reaches the offered size**
+  (`archiveRawSkip`): the hub keeps naming it (`rawBytes < r`) yet never takes more raw, so
+  without this a repo holding one >128 MiB session could never be deleted (QA).
+- While a delete waits the inventory is staged EVERY full beat, not only on refresh beats
+  (every 15th), so a large backlog ships within `REPO_DELETE_SYNC_TIMEOUT_SEC`.
+- A refused Start/Resume leaves an `error` record (which holds a slot); the beat kills any record
+  of a deleting repo back into the closed history.
 - Accepted: an id another host owns, or a rendered-blocked one, is not wanted by the hub and so
-  reads confirmed; a full archive keeps wanting → the delete times out (safe direction).
-- Hub: 409 for an agent that reports no `repoDeletes` array (it would ack and never act); 404 for
-  a repo the host does not report. Web-only control (`android/PARITY.md`).
+  reads confirmed; a full archive keeps wanting → the delete times out, and the error says so.
+- A symlinked repo is unlinked, never followed; its target gets `git worktree prune` first.
+- Hub: 400 for the repos root, 409 for an agent that reports no `repoDeletes` array (it would ack
+  and never act), 404 for a repo the host does not report. Web-only control (`android/PARITY.md`).
 - Tests: `TestRepoDelete`; `XERK-2672:` in `server.test.js`; the Delete cases in
   `dashboard-prune.test.js`.
