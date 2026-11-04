@@ -14894,6 +14894,29 @@ test("XERK-2673: at the children cap, the board's live children win over kept Do
   assert.deepEqual(sanitizeEpicRunRecord(JSON.parse(JSON.stringify(run))), run);
 });
 
+test("XERK-2673: past the cap a wave the cut empties is dropped (coerce fixed point)", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  const site = "e2673f.atlassian.net";
+  const kids = Array.from({ length: 500 }, (_, i) => dChild(`K-${i}`, [], "todo"));
+  await asBeat("ed2673f", site, { autoStart: false,
+    tickets: [dEpic(), ...kids, dChild("Z-1", ["K-0"], "todo")] });
+  const run = armEpicRun(site, "E-1");
+  assert.equal(run.children.includes("Z-1"), false);
+  assert.ok(run.waves.every((w) => w.length), "no empty wave");
+  assert.deepEqual(sanitizeEpicRunRecord(JSON.parse(JSON.stringify(run))), run);
+});
+
+test("XERK-2673: pausing a capped run keeps the coerce fixed point", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  const site = "e2673g.atlassian.net";
+  await asBeat("ed2673g", site, { autoStart: false, tickets: [dEpic(), dChild("C-1", [], "todo")] });
+  armEpicRun(site, "E-1", undefined, { maxConcurrent: 2 });
+  const run = setEpicRunPaused(site, "E-1", true);
+  assert.deepEqual(Object.keys(sanitizeEpicRunRecord(JSON.parse(JSON.stringify(run)))), Object.keys(run));
+});
+
 test("XERK-2673: the driver records Done children of a PAUSED run, and a listed reopened blocker holds again", async () => {
   resetEpicD();
   resetEpicRuns();

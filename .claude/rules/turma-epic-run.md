@@ -86,7 +86,8 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
 - **A re-arm keeps EVERY previous child the board lists nowhere**, leading wave 1: Done only if
   recorded, else open. Never infer Done from absence — an open child gone unlisted (reassigned, host
   offline) would otherwise let the run complete and write the epic Done behind it (QA). Cost: a
-  child deleted from the tracker holds the run until the operator cancels it.
+  child deleted from the tracker, or reassigned off this board, holds the run AND every in-epic
+  child it blocks (the poll-gap rule below) until the operator cancels and re-arms.
 - A child listed under another epic is dropped. The board's own children fill the
   `EPIC_RUN_CHILDREN_MAX` cap first, so kept ones never crowd out a live child.
 - Tests: the `XERK-2673:` cases in `server.test.js`, `board.test.js`, `BoardTest.kt`.

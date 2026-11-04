@@ -4433,7 +4433,10 @@ function armEpicRun(siteKey, epicKey, rows, opts) {
   const inRun = new Set(children);
   const keptSet = new Set(kept.filter((c) => inRun.has(c)));
   // A kept child's blockers are unknown (no row): it leads the first wave.
-  for (let i = 0; i < waves.length; i++) waves[i] = waves[i].filter((c) => inRun.has(c));
+  // Drop what the cap cut, and any wave it emptied (the sanitizer drops an empty
+  // wave, so leaving one breaks the coerce fixed point).
+  waves.splice(0, waves.length,
+    ...waves.map((w) => w.filter((c) => inRun.has(c))).filter((w) => w.length));
   if (keptSet.size) {
     if (waves.length) waves[0] = [...keptSet, ...waves[0]];
     else waves.push([...keptSet]);
@@ -4445,14 +4448,15 @@ function armEpicRun(siteKey, epicKey, rows, opts) {
     return !!(r && r.row && r.row.statusCategory === "done");
   };
   const allDone = children.length > 0 && children.every(isDone);
-  const state = cycle.length ? "blocked" : allDone ? "done" : "running";
+  const state = cycle.some((c) => inRun.has(c)) ? "blocked" : allDone ? "done" : "running";
   const now = Date.now();
   const rec = {
     epicKey, siteKey, state, children, waves,
     startedAt: prev && Number.isFinite(prev.startedAt) ? prev.startedAt : now,
     updatedAt: now,
   };
-  if (cycle.length) rec.cycle = cycle.slice(0, EPIC_RUN_CHILDREN_MAX);
+  const runCycle = cycle.filter((c) => inRun.has(c));
+  if (runCycle.length) rec.cycle = runCycle;
   const doneChildren = children.filter(isDone);
   if (doneChildren.length) rec.doneChildren = doneChildren;
   // A re-arm rebuilds the DAG but PRESERVES an operator hold (XERK-641): arming is
