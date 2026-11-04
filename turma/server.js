@@ -8960,25 +8960,53 @@ function degradedAgentsError(e) {
 // drive and every org/repo/ticket-keyed entry outside its orgs is removed
 // (tenant-scope.js `scopePayload`). Memoized per payload ETag and view, so a poll
 // still costs a 304; a view that loses nothing is served the payload's own bytes.
-const scopedPayloads = new Map(); // `${view}|${etag}` -> {body, etag}
+// Bounded by BYTES, not count (XERK-2684): every entry is a whole-fleet body and the
+// ETag moves on every beat, so a 64-entry count cap held ~64 fleet bodies (5-6 MB
+// each on the real fleet) — the leader's whole V8 heap, crash-looping it every ~20
+// minutes. A hit only matters until the next beat, so each VIEW keeps just its
+// newest ETag (a beat replaces it, never accumulates), and the views together stay
+// under a byte budget, oldest-used evicted; the newest is always kept.
+//   A view that loses nothing stores only the verdict (`entry: null`, 0 bytes) and is
+// served the payload itself, so any number of whole-fleet views hit and cost
+// nothing. A scoped body is stored as `{body, etag}` only, never the payload object
+// (the agents cache also carries the pre-slice body and its scoped tails), counted at
+// two bytes a char (a body with one non-Latin-1 char is stored UTF-16).
+const scopedPayloads = new Map(); // view -> {etag (the payload's), entry: {body, etag} | null}
+const SCOPED_PAYLOADS_MAX_BYTES = Math.max(8 << 20, Math.floor(MEMORY_LIMIT / 16));
+let scopedPayloadBytes = 0;
+const scopedEntryBytes = (e) => (e.entry ? 2 * e.entry.body.length : 0);
+function rememberScopedPayload(view, slot) {
+  const prev = scopedPayloads.get(view);
+  if (prev) { scopedPayloads.delete(view); scopedPayloadBytes -= scopedEntryBytes(prev); }
+  const size = scopedEntryBytes(slot);
+  while (scopedPayloads.size && scopedPayloadBytes + size > SCOPED_PAYLOADS_MAX_BYTES) {
+    const [oldView, old] = scopedPayloads.entries().next().value;
+    scopedPayloads.delete(oldView);
+    scopedPayloadBytes -= scopedEntryBytes(old);
+  }
+  scopedPayloads.set(view, slot);
+  scopedPayloadBytes += size;
+}
+function clearScopedPayloads() { scopedPayloads.clear(); scopedPayloadBytes = 0; }
 function scopedAgentsCache(payload, p) {
   if (!payload || typeof payload.body !== "string") return payload;
-  const key = `${tenantViewSig(p)}|${payload.etag}`;
-  const hit = scopedPayloads.get(key);
-  if (hit) return hit;
+  const view = tenantViewSig(p);
+  const hit = scopedPayloads.get(view);
+  if (hit && hit.etag === payload.etag) {
+    scopedPayloads.delete(view); scopedPayloads.set(view, hit); // most recently used
+    return hit.entry || payload;
+  }
   let obj;
   try { obj = JSON.parse(payload.body); } catch { return { body: '{"agents":[]}', etag: '"scoped-empty"' }; }
   const { out, changed } = routeScope.scopePayload(obj, tenantViewFor(p));
-  let entry = payload;
+  let entry = null;
   if (changed) {
     const body = JSON.stringify(out);
     entry = { body, etag: '"' + crypto.createHash("sha1").update(body).digest("base64") + '"' };
   }
-  rememberSnapshotSeed(`${tenantViewSig(p)}|${entry.etag}`, out);   // XERK-2599
-  // A handful of views per build; old builds' entries are dropped wholesale.
-  if (scopedPayloads.size >= 64) scopedPayloads.clear();
-  scopedPayloads.set(key, entry);
-  return entry;
+  rememberSnapshotSeed(`${view}|${(entry || payload).etag}`, out);   // XERK-2599
+  rememberScopedPayload(view, { etag: payload.etag, entry });
+  return entry || payload;
 }
 function safeAgentsCache() {
   try {
@@ -28434,7 +28462,7 @@ if (process.env.TURMA_TEST) {
     baseOfKey,
     agentKeyFor,
     principalMayDriveHost,
-    tenantViewFor, tenantViewSig, transcriptVisible, archiveScopeFor, scopedAgentsCache,
+    tenantViewFor, tenantViewSig, transcriptVisible, archiveScopeFor, scopedAgentsCache, scopedPayloads, clearScopedPayloads, SCOPED_PAYLOADS_MAX_BYTES, scopedPayloadBytes: () => scopedPayloadBytes,
     wsTokenPrincipal, findSession,
     bindIdentityTenant,
     tenantBoundName,

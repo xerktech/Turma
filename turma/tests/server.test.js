@@ -30796,3 +30796,86 @@ test("XERK-2549: a session's archived scrollback is served only inside its host'
     T.restore();
   }
 });
+
+test("XERK-2684: the scoped-payload memo is bounded by bytes, not entry count", () => {
+  hub.clearScopedPayloads();
+  const max = hub.SCOPED_PAYLOADS_MAX_BYTES;
+  const tid = (n) => String(n).padStart(32, "0").replace(/./g, (c) => "abcdef0123456789"[Number(c)]);
+  const user = (n) => ({ kind: "user", userId: `u2684-${n}`, tenantId: tid(n), roles: ["user"] });
+  // Each tenant owns one fat host (a fleet record's size), the operators one more, and a
+  // new ETag lands per beat — the shape that retained ~64 fleet bodies and filled the
+  // leader's heap. "é" makes the body UTF-16, as real fleet bodies are.
+  const pad = "é".repeat(Math.ceil(max / 12));
+  const fleet = (beat, tenants) => JSON.stringify({ now: beat, agents: [
+    { key: "ops-host", device: "ops-host" },
+    ...tenants.map((n) => ({ key: `big@${tid(n)}`, device: "big", pad })),
+  ] });
+
+  // A whole-fleet view (nothing scoped away) stores no body: any number of beats cost 0.
+  for (let beat = 0; beat < 80; beat++) {
+    const payload = { body: JSON.stringify({ now: beat, agents: [{ key: "ops-host", pad }] }), etag: `"b${beat}"` };
+    assert.ok(hub.scopedAgentsCache(payload, OPERATOR) === payload);
+    assert.ok(hub.scopedAgentsCache(payload, OPERATOR) === payload); // a hit serves the payload too
+  }
+  assert.equal(hub.scopedPayloadBytes(), 0);
+  assert.equal(hub.scopedPayloads.size, 1);
+
+  // Scoped views: each keeps its own body (never another view's), counted 2 bytes/char.
+  hub.clearScopedPayloads();
+  const p1 = { body: fleet(1, [1, 2]), etag: '"t1"' };
+  const a = hub.scopedAgentsCache(p1, user(1));
+  const b = hub.scopedAgentsCache(p1, user(2));
+  assert.notEqual(a.body, b.body);
+  assert.ok(a.body.includes(tid(1)) && !a.body.includes(tid(2)));
+  assert.ok(hub.scopedAgentsCache(p1, user(1)) === a);
+  assert.ok(hub.scopedAgentsCache(p1, user(2)) === b);
+  const o = hub.scopedAgentsCache(p1, OPERATOR); // the operators never see tenant hosts
+  assert.ok(!o.body.includes(tid(1)) && !o.body.includes(tid(2)));
+  assert.ok(hub.scopedAgentsCache(p1, OPERATOR) === o);
+  assert.equal(hub.scopedPayloadBytes(), 2 * (a.body.length + b.body.length + o.body.length));
+  // A new beat re-scopes (never the last beat's body) and replaces the view's bytes.
+  let last = a;
+  for (let beat = 2; beat < 50; beat++) {
+    const next = hub.scopedAgentsCache({ body: fleet(beat, [1, 2]), etag: `"r${beat}"` }, user(1));
+    assert.notEqual(next.etag, last.etag);
+    assert.ok(next.body.includes(`"now":${beat}`), "stale scoped body across beats");
+    last = next;
+  }
+  assert.equal(hub.scopedPayloadBytes(), 2 * (last.body.length + b.body.length + o.body.length));
+  // The memo never holds the payload object itself (its extra fields pin more).
+  assert.equal(hub.scopedAgentsCache({ ...p1, etag: '"t1b"', shared: "x" }, user(1)).shared, undefined);
+
+  // Many fat views stay under the budget, least recently used evicted, newest kept.
+  hub.clearScopedPayloads();
+  const tenants = [1, 2, 3, 4, 5, 6, 7, 8];
+  for (let beat = 0; beat < 10; beat++) {
+    const payload = { body: fleet(beat, tenants), etag: `"m${beat}"` };
+    for (const n of tenants) {
+      const got = hub.scopedAgentsCache(payload, user(n));
+      assert.ok(hub.scopedPayloadBytes() <= max, `memo holds ${hub.scopedPayloadBytes()} bytes over ${max}`);
+      assert.ok(hub.scopedAgentsCache(payload, user(n)) === got); // the newest is a hit
+    }
+  }
+  assert.ok(hub.scopedPayloads.size < tenants.length, `${hub.scopedPayloads.size} fat views kept`);
+
+  // Eviction takes the LEAST RECENTLY USED view: a hit refreshes a view's place.
+  hub.clearScopedPayloads();
+  const fit = { body: fleet(100, tenants), etag: '"lru"' };
+  let n = 1;
+  hub.scopedAgentsCache(fit, user(n));
+  const room = () => hub.scopedPayloadBytes() + 2 * hub.scopedAgentsCache(fit, user(1)).body.length <= max;
+  while (room()) hub.scopedAgentsCache(fit, user(++n)); // fill the budget exactly to the brim
+  hub.scopedAgentsCache(fit, user(1)); // re-use the oldest
+  hub.scopedAgentsCache(fit, user(n + 1)); // one more evicts the least recently used
+  assert.ok(hub.scopedPayloads.has(hub.tenantViewSig(user(1))), "a just-used view was evicted");
+  assert.ok(!hub.scopedPayloads.has(hub.tenantViewSig(user(2))), "the least recently used view was kept");
+
+  // One body larger than the whole budget still memoizes (the newest is always kept).
+  hub.clearScopedPayloads();
+  const huge = { body: JSON.stringify({ agents: [{ key: "ops-host" },
+    { key: `big@${tid(1)}`, pad: "y".repeat(max / 2 + 1) }] }), etag: '"huge"' };
+  const h = hub.scopedAgentsCache(huge, user(1));
+  assert.ok(hub.scopedAgentsCache(huge, user(1)) === h);
+  assert.equal(hub.scopedPayloads.size, 1);
+  hub.clearScopedPayloads();
+});
