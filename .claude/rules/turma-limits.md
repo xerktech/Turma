@@ -24,6 +24,17 @@ with `restart: unless-stopped`
 - **`MEMORY_LIMIT` is never more than `heap_size_limit / HEAP_SHARE`** (`effectiveMemoryLimit`), so a
   node started without the flag tightens every derived ceiling instead of crashing. Boot logs both.
 - Tests: `XERK-2603:` in `server.test.js`.
+- **A memo of whole-fleet payloads is bounded by BYTES, never by entry count** (XERK-2684):
+  the fleet ETag moves every beat, so `scopedPayloads` capped at 64 entries held ~64 fleet bodies
+  (5-6 MB each at 1.5 MB/host records) and filled the leader's 384 MB heap every ~20 min.
+  - Now one entry per VIEW (its newest ETag), views under `SCOPED_PAYLOADS_MAX_BYTES`
+    (container/16), least recently used evicted, newest always kept.
+  - A view that scopes nothing away stores NO body (served the payload itself), so any number
+    of whole-fleet views hit for free; storing a body per view thrashed at 3+ views (QA).
+  - Count a string at 2 bytes/char (UTF-16 once any non-Latin-1 char is in it) and store only
+    `{body, etag}` — the agents-cache object also pins its pre-slice body and scoped tails (QA: 4x).
+  - Any new cache of `/api/agents`-sized strings needs the same. Test: `XERK-2684:` in
+    `server.test.js`.
 
 ## Two bounds
 
