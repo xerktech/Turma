@@ -320,28 +320,37 @@ test("board.html restores detail-panel focus across repaints and on close", () =
   assert.ok(paint.indexOf("restoreFocusIn($panel, refocus)") > paint.indexOf("$panel.innerHTML ="));
   assert.match(pick("closeDetail"), /returnFocusTarget\(lastFocus\)/);
 
-  // sel: the one selector string this fake element answers to.
-  const el = (tag, attrs, cls, sel) => ({
+  // sel: the one selector string this fake element answers to. focus() moves
+  // doc.activeElement unless the control is disabled, like a browser.
+  const doc = { activeElement: null, contains: () => true, querySelector: () => null };
+  const el = (tag, attrs, cls, sel, extra = {}) => ({
     tagName: tag.toUpperCase(),
+    id: attrs.id || "",
     attributes: Object.entries(attrs).map(([name, value]) => ({ name, value })),
     classList: cls ? [cls] : [],
     dataset: Object.fromEntries(Object.entries(attrs).filter(([k]) => k.startsWith("data-"))
       .map(([k, v]) => [k.slice(5), v])),
     getAttribute(n) { return attrs[n] === undefined ? null : attrs[n]; },
-    sel: sel || (cls === "td-close" ? ".td-close" : ""),
+    sel: sel || "",
+    disabled: false,
     focusArgs: [],
-    focus(o) { this.focusArgs.push(o); },
+    focus(o) { this.focusArgs.push(o); if (!this.disabled) doc.activeElement = this; },
+    ...extra,
   });
   const panel = (kids) => ({
+    ownerDocument: doc, attrs: {}, focusArgs: [],
     contains: (e) => kids.includes(e),
     querySelectorAll: (sel) => kids.filter(k => k.sel === sel),
     querySelector: (sel) => kids.find(k => k.sel === sel) || null,
+    hasAttribute(n) { return n in this.attrs; },
+    setAttribute(n, v) { this.attrs[n] = v; },
+    focus(o) { this.focusArgs.push(o); doc.activeElement = this; },
   });
-  const doc = { activeElement: null, contains: () => true, querySelector: () => null };
-  const { focusKeyIn, restoreFocusIn, returnFocusTarget } = new Function("document", "CSS",
-    `${pick("focusKeyIn")}\n${pick("restoreFocusIn")}\n${pick("returnFocusTarget")}\n` +
-    "return { focusKeyIn, restoreFocusIn, returnFocusTarget };")(doc, { escape: (v) => v });
-  const close = () => el("button", {}, "td-close");
+  // The save/restore pair is shared from board.js; board.html binds it from B.
+  assert.match(src, /const \{ focusKeyIn, restoreFocusIn \} = B;/);
+  const { focusKeyIn, restoreFocusIn } = require("../public/board.js");
+  const { returnFocusTarget } = new Function("document", "CSS",
+    `${pick("returnFocusTarget")}\nreturn { returnFocusTarget };`)(doc, { escape: (v) => v });
 
   // ✕ (class only) → the fresh ✕, without scrolling.
   const x0 = el("button", {}, "td-close", "button.td-close");
@@ -351,20 +360,33 @@ test("board.html restores detail-panel focus across repaints and on close", () =
   const x1 = el("button", {}, "td-close", "button.td-close");
   restoreFocusIn(panel([x1]), k1);
   assert.deepEqual(x1.focusArgs, [{ preventScroll: true }]);
+  assert.equal(doc.activeElement, x1);
 
-  // A data-* control that survives gets focus alone; one that's gone → ✕.
+  // A data-* control that survives gets focus alone.
   const btnSel = 'button[data-epic-run="1"]';
   const b0 = el("button", { "data-epic-run": "1", type: "button" }, "", btnSel);
   doc.activeElement = b0;
   const k2 = focusKeyIn(panel([b0]));
   assert.deepEqual(k2, { sel: btnSel, nth: 0 });
-  const b1 = el("button", { "data-epic-run": "1" }, "", btnSel), x2 = close();
+  const b1 = el("button", { "data-epic-run": "1" }, "", btnSel);
+  const x2 = el("button", {}, "td-close", "button.td-close");
   restoreFocusIn(panel([x2, b1]), k2);
-  assert.equal(b1.focusArgs.length, 1);
+  assert.equal(doc.activeElement, b1);
   assert.equal(x2.focusArgs.length, 0);
-  const x3 = close();
-  restoreFocusIn(panel([x3]), k2);
-  assert.equal(x3.focusArgs.length, 1);
+  // Gone → the panel itself (made focusable), never ✕: a stray Space must not close it.
+  // (✕ here answers the bare ".td-close" a regressed fallback would query.)
+  const x3 = el("button", {}, "td-close", ".td-close");
+  const p3 = panel([x3]);
+  restoreFocusIn(p3, k2);
+  assert.equal(doc.activeElement, p3);
+  assert.equal(p3.attrs.tabindex, "-1");
+  assert.equal(x3.focusArgs.length, 0);
+  // Disabled while busy (won't take focus) → the panel itself, not <body>.
+  const busy = el("button", { "data-epic-run": "1" }, "", btnSel, { disabled: true });
+  const pb = panel([busy]);
+  restoreFocusIn(pb, k2);
+  assert.equal(busy.focusArgs.length, 1);
+  assert.equal(doc.activeElement, pb);
 
   // Bare links sharing an href (header key link vs "Open in Jira") keep their place.
   const hSel = 'a[href="https://x.test/W-1"]';
@@ -375,24 +397,36 @@ test("board.html restores detail-panel focus across repaints and on close", () =
   assert.deepEqual(k3, { sel: hSel, nth: 1 });
   const head1 = el("a", { href: "https://x.test/W-1" }, "", hSel);
   const foot1 = el("a", { href: "https://x.test/W-1" }, "", hSel);
-  restoreFocusIn(panel([close(), head1, foot1]), k3);
-  assert.equal(foot1.focusArgs.length, 1);
+  restoreFocusIn(panel([head1, foot1]), k3);
+  assert.equal(doc.activeElement, foot1);
   assert.equal(head1.focusArgs.length, 0);
 
-  // A control with no data-*, class or href → ✕.
+  // A text field keyed by id keeps its caret across the rebuild.
+  const f0 = el("input", { id: "addHostDevice" }, "", "#addHostDevice", { selectionStart: 3, selectionEnd: 5 });
+  doc.activeElement = f0;
+  const k5 = focusKeyIn(panel([f0]));
+  assert.deepEqual(k5, { sel: "#addHostDevice", nth: 0, caret: [3, 5] });
+  let range = null;
+  const f1 = el("input", { id: "addHostDevice" }, "", "#addHostDevice",
+    { selectionStart: 0, selectionEnd: 0, setSelectionRange(a, b) { range = [a, b]; } });
+  restoreFocusIn(panel([f1]), k5);
+  assert.equal(doc.activeElement, f1);
+  assert.deepEqual(range, [3, 5]);
+
+  // A control with no data-*, id, class or href → the panel itself.
   doc.activeElement = el("span", {});
   const k4 = focusKeyIn(panel([doc.activeElement]));
   assert.deepEqual(k4, { sel: null, nth: 0 });
-  const x5 = close();
-  restoreFocusIn(panel([x5]), k4);
-  assert.equal(x5.focusArgs.length, 1);
+  const p4 = panel([]);
+  restoreFocusIn(p4, k4);
+  assert.equal(doc.activeElement, p4);
 
   // Focus outside the panel → nothing is stolen.
   doc.activeElement = el("input", { "data-search": "1" });
   assert.equal(focusKeyIn(panel([])), null);
-  const x4 = close();
-  restoreFocusIn(panel([x4]), null);
-  assert.equal(x4.focusArgs.length, 0);
+  const p5 = panel([]);
+  restoreFocusIn(p5, null);
+  assert.equal(p5.focusArgs.length, 0);
 
   // Close: the opener card if still attached, else the card redrawn for that ticket.
   const card = el("div", { "data-key": "W-1", "data-site": "s1" }, "kanban-card");
@@ -404,4 +438,40 @@ test("board.html restores detail-panel focus across repaints and on close", () =
   assert.equal(returnFocusTarget(card), redrawn);
   assert.equal(asked, '.kanban-card[data-key="W-1"][data-site="s1"]');
   assert.equal(returnFocusTarget(null), null);
+});
+
+// XERK-2676: every board modal that repaints by innerHTML keeps focus across it.
+test("board.html's modal panels keep focus across their innerHTML repaints", () => {
+  const src = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
+  for (const [fn, panel] of [["paintEpicBuilder", "$ebPanel"], ["paintPolicyPanel", "$policyPanel"],
+    ["paintPermissionPanel", "$permPanel"], ["paintDetail", "$panel"]]) {
+    const body = src.match(new RegExp(`function ${fn}\\(\\) \\{[\\s\\S]*?\\n\\}`))[0];
+    const swap = body.indexOf(`${panel}.innerHTML =`);
+    assert.ok(swap > 0, `${fn} swaps ${panel}`);
+    assert.ok(body.indexOf(`focusKeyIn(${panel})`) > -1 && body.indexOf(`focusKeyIn(${panel})`) < swap, fn);
+    assert.ok(body.indexOf(`restoreFocusIn(${panel}, refocus)`) > swap, fn);
+  }
+  assert.match(src, /function openPermissionPanel\(\) \{[\s\S]*?\$permPanel\.querySelector\("\.td-close"\)[\s\S]*?close\.focus\(\)/);
+});
+
+// XERK-2676: the New-ticket and Add-host dialogs take focus on open and keep it
+// across their repaints, through the shared board.js pair.
+test("New ticket and Add host keep keyboard focus inside their dialogs", () => {
+  const nt = fs.readFileSync(path.join(__dirname, "../public/newticket.js"), "utf8");
+  const paint = nt.match(/function paintCreate\(\) \{[\s\S]*?\n  \}/)[0];
+  assert.ok(paint.indexOf("B.focusKeyIn(panel)") < paint.indexOf("panel.innerHTML ="));
+  assert.ok(paint.indexOf("B.restoreFocusIn(panel, refocus)") > paint.indexOf("panel.innerHTML ="));
+  assert.match(nt.match(/function openCreate\(\) \{[\s\S]*?\n  \}/)[0],
+    /paintCreate\(\);[\s\S]*?querySelector\("\.td-close"\)[\s\S]*?\.focus\(\)[\s\S]*?loadMeta\(\)/);
+  const ix = fs.readFileSync(path.join(__dirname, "../public/index.html"), "utf8");
+  const ah = ix.match(/function addHostPaint\(\) \{[\s\S]*?\n\}/)[0];
+  assert.ok(ah.indexOf("B.focusKeyIn(panel)") < ah.indexOf("panel.innerHTML ="));
+  assert.ok(ah.indexOf("B.restoreFocusIn(panel, refocus)") > ah.indexOf("panel.innerHTML ="));
+  assert.match(ix.match(/function addHostOpen\(\) \{[\s\S]*?\n\}/)[0],
+    /addHostPaint\(\);[\s\S]*?#addHostPanel \.td-close[\s\S]*?\.focus\(\)[\s\S]*?addHostLoad\(\)/);
+  // The lightbox is a modal too.
+  const B = require("../public/board.js");
+  let asked = "";
+  B.trapModalTab({ key: "Tab" }, { activeElement: null, querySelectorAll: (s) => { asked = s; return []; } }, {});
+  assert.match(asked, /\.img-lightbox\.open\[role="dialog"\]\[aria-modal="true"\]/);
 });

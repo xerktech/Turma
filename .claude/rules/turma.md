@@ -39,6 +39,11 @@ makes an `android/` change part of the same PR) live there.
   - `chat.js`'s transcript repaint and `sessions.html`'s sidebar keep their OWN bespoke scroll logic
     and must NOT route through it (each has an ordering conflict with a caret/selection restore). New
     recurring repaints without such a conflict should use `preserveScroll`.
+- **Every modal (`[role=dialog][aria-modal]` in a `.td-backdrop`) repaint goes through `board.js`
+  `focusKeyIn`/`restoreFocusIn`** around its `innerHTML` swap (XERK-2676) — else focus (and a
+  field's caret) drops to `<body>` mid-typing. Their fallback is the PANEL itself, never ✕ (a stray
+  Space would close the dialog). Tab wrapping is `trapModalTab`, installed once by `newticket.js`.
+  Tests: `board-view.test.js`, the `XERK-2676:` cases in `board.test.js`.
 - **Any new shared `/*.js` must be in `server.js`'s `HASHED_ASSETS`** (an allowlist) AND loaded after
   `org.js` — a missing entry 404s and takes the module, and the page's render, down. Guarded by
   `newticket.test.js`.

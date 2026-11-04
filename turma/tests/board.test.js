@@ -3792,3 +3792,97 @@ test("XERK-2674: board.html opens the clicked child or epic in the detail panel"
   // A double-click's second click (landing on the backdrop) doesn't close the panel.
   assert.match(src, /\$backdrop\.addEventListener\("click", \(e\) => \{ if \(e\.target === \$backdrop && e\.detail <= 1\) closeDetail\(\); \}\)/);
 });
+
+// XERK-2676: Tab stays inside the topmost open aria-modal panel.
+{
+  const B = require("../public/board.js");
+  const win = { getComputedStyle: (el) => ({ visibility: el.vis || "visible" }) };
+  const node = (o = {}) => ({
+    tagName: "BUTTON", tabIndex: 0, disabled: false, parentElement: null, vis: "visible",
+    rects: 1, ancestors: [], focused: 0,
+    closest(sel) {
+      if (sel === "[hidden]") return this.ancestors.find(a => a.hidden) || null;
+      if (sel === "details:not([open])") return this.ancestors.find(a => a.details && !a.open) || null;
+      return null;
+    },
+    getClientRects() { return new Array(this.rects); },
+    focus() { this.focused++; },
+    ...o,
+  });
+
+  test("XERK-2676: isTabStop skips what a keyboard Tab can't reach", () => {
+    assert.equal(B.isTabStop(node(), win), true);
+    assert.equal(B.isTabStop(node({ disabled: true }), win), false);
+    assert.equal(B.isTabStop(node({ tabIndex: -1 }), win), false);
+    assert.equal(B.isTabStop(node({ ancestors: [{ hidden: true }] }), win), false);
+    assert.equal(B.isTabStop(node({ rects: 0 }), win), false);
+    assert.equal(B.isTabStop(node({ vis: "hidden" }), win), false);
+    // Inside a collapsed <details>: only its own summary is reachable.
+    const det = { details: true, open: false, parentElement: null };
+    det.closest = () => null;
+    assert.equal(B.isTabStop(node({ ancestors: [det] }), win), false);
+    assert.equal(B.isTabStop(node({ tagName: "SUMMARY", parentElement: det, ancestors: [det] }), win), true);
+    // A summary of a closed <details> nested in another closed one is hidden too.
+    const outer = { details: true, open: false, parentElement: null, closest: () => null };
+    const inner = { details: true, open: false, parentElement: { closest: () => outer } };
+    const nested = node({ tagName: "SUMMARY", parentElement: inner, ancestors: [inner] });
+    assert.equal(B.isTabStop(nested, win), false);
+    // An open <details> hides nothing.
+    assert.equal(B.isTabStop(node({ ancestors: [{ details: true, open: true }] }), win), true);
+  });
+
+  const panelOf = (items) => ({
+    items, attrs: {}, focused: 0,
+    querySelectorAll: () => items,
+    contains(e) { return e === this || items.includes(e); },
+    hasAttribute(n) { return n in this.attrs; },
+    setAttribute(n, v) { this.attrs[n] = v; },
+    focus() { this.focused++; },
+  });
+
+  test("XERK-2676: trapTabTarget wraps at the ends and pulls stray focus back in", () => {
+    const a = node(), b = node(), c = node(), tail = node({ vis: "hidden" }), out = node();
+    const p = panelOf([a, b, c, tail]);
+    assert.equal(B.trapTabTarget(p, c, false, win), a);
+    assert.equal(B.trapTabTarget(p, a, true, win), c);
+    assert.equal(B.trapTabTarget(p, b, false, win), null);
+    assert.equal(B.trapTabTarget(p, out, false, win), a);
+    assert.equal(B.trapTabTarget(p, out, true, win), c);
+    assert.equal(B.trapTabTarget(p, p, false, win), a);
+    const empty = panelOf([]);
+    assert.equal(B.trapTabTarget(empty, out, false, win), empty);
+  });
+
+  test("XERK-2676: trapModalTab traps in the LAST open modal and cancels the browser move", () => {
+    const under = panelOf([node()]);
+    const x = node(), y = node();
+    const top = panelOf([x, y]);
+    const ev = (o) => ({ key: "Tab", shiftKey: false, defaultPrevented: false, prevented: 0,
+      preventDefault() { this.prevented++; this.defaultPrevented = true; }, ...o });
+    let asked = "";
+    const doc = { activeElement: y, querySelectorAll: (s) => { asked = s; return [under, top]; } };
+    const e1 = ev();
+    assert.equal(B.trapModalTab(e1, doc, win), true);
+    assert.match(asked, /\.td-backdrop:not\(\[hidden\]\) > \[role="dialog"\]\[aria-modal="true"\]/);
+    assert.equal(e1.prevented, 1);
+    assert.equal(x.focused, 1);
+    // Mid-panel: the browser's own move is left alone.
+    doc.activeElement = x;
+    const e2 = ev();
+    assert.equal(B.trapModalTab(e2, doc, win), false);
+    assert.equal(e2.prevented, 0);
+    // Not Tab, modified, already handled, or no modal open: untouched.
+    for (const o of [{ key: "Enter" }, { ctrlKey: true }, { altKey: true }, { metaKey: true },
+      { defaultPrevented: true }]) {
+      doc.activeElement = y;
+      assert.equal(B.trapModalTab(ev(o), doc, win), false);
+    }
+    assert.equal(B.trapModalTab(ev(), { activeElement: y, querySelectorAll: () => [] }, win), false);
+    // Nothing focusable: the panel itself takes focus, made focusable first.
+    const bare = panelOf([]);
+    const e3 = ev();
+    assert.equal(B.trapModalTab(e3, { activeElement: y, querySelectorAll: () => [bare] }, win), true);
+    assert.equal(bare.attrs.tabindex, "-1");
+    assert.equal(bare.focused, 1);
+  });
+}

@@ -88,7 +88,12 @@
 
   function paintCreate() {
     if (!createState || !panel) return;
-    panel.innerHTML = board().createFormHtml(createState);
+    // Keep focus on the same control across the swap — the meta load repaints
+    // a form the operator may already be typing in (XERK-2676).
+    const B = board();
+    const refocus = B.focusKeyIn ? B.focusKeyIn(panel) : null;
+    panel.innerHTML = B.createFormHtml(createState);
+    if (B.restoreFocusIn) B.restoreFocusIn(panel, refocus);
     orgOptsPainted = board().createOrgOptions(createState.sites, createState.siteKey);
   }
 
@@ -119,6 +124,9 @@
     backdrop.hidden = false;
     if (bodyEl) bodyEl.classList.add("td-open");
     paintCreate();
+    // Land keyboard focus in the dialog, not on the header button behind it.
+    const first = panel.querySelector(".td-close");
+    if (first && first.focus) first.focus();
     loadMeta();
   }
 
@@ -388,6 +396,10 @@
     });
     backdrop.addEventListener("click", (e) => { if (e.target === backdrop) requestCloseCreate(); });
     doc.addEventListener("keydown", (e) => { if (e.key === "Escape" && createState) requestCloseCreate(); });
+    // Tab stays inside whichever page modal is open — this one, or the page's
+    // own (board panels, Add host) — see board.js trapModalTab (XERK-2676).
+    const B = board();
+    if (B.trapModalTab) doc.addEventListener("keydown", (e) => B.trapModalTab(e, doc, doc.defaultView));
   }
 
   const api = { splitLabels, buttonHtml, createDirty, update, mount };

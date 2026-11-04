@@ -816,31 +816,8 @@ function modelPickFor(siteKey, ticket, agentPin, runtimePin) {
 }
 const modelPickSig = (p) => (p ? `${p.model}|${p.cls}|${(p.elsewhere || []).join(",")}` : "");
 
-// Where focus sits inside `root`, so a repaint can hand it back (XERK-2676):
-// a selector for the focused control (its data-* attributes, else its class,
-// else a link's href) plus its position among the controls that selector
-// matches — the header key link and "Open in Jira" share an href. null when
-// focus isn't inside `root`.
-function focusKeyIn(root) {
-  const el = document.activeElement;
-  if (!el || el === root || !root.contains(el)) return null;
-  const tag = el.tagName.toLowerCase();
-  const data = Array.from(el.attributes).filter(a => a.name.startsWith("data-"))
-    .map(a => `[${a.name}="${CSS.escape(a.value)}"]`).join("");
-  const cls = el.classList[0];
-  const href = el.getAttribute("href");
-  const sel = data ? tag + data
-    : cls ? `${tag}.${CSS.escape(cls)}`
-    : href ? `${tag}[href="${CSS.escape(href)}"]` : null;
-  if (!sel) return { sel: null, nth: 0 };
-  return { sel, nth: Array.from(root.querySelectorAll(sel)).indexOf(el) };
-}
-// Focus the control `key` names in the repainted `root`, else its close button.
-function restoreFocusIn(root, key) {
-  if (!key) return;
-  const el = (key.sel && root.querySelectorAll(key.sel)[key.nth]) || root.querySelector(".td-close");
-  if (el) el.focus({ preventScroll: true });
-}
+// Focus save/restore across an innerHTML repaint lives in board.js (XERK-2676).
+const { focusKeyIn, restoreFocusIn } = B;
 // The card to return focus to on close: `from` itself, or — when a board
 // repaint replaced it while the panel was open — the card now drawn for the
 // same ticket (XERK-2676).
@@ -1413,7 +1390,10 @@ function paintEpicBuilder() {
   if (!ebState.siteKey || !sites.some(s => s.siteKey === ebState.siteKey)) {
     ebState.siteKey = sites[0].siteKey;
   }
+  // Keep focus on the same control across the swap (XERK-2676).
+  const refocus = focusKeyIn($ebPanel);
   $ebPanel.innerHTML = B.epicBuilderComposerHtml(sites, ebState);
+  restoreFocusIn($ebPanel, refocus);
 }
 function openEpicBuilder() {
   if (!ebSites().length) return;
@@ -1779,7 +1759,11 @@ function policyPanelHtml() {
 
 function paintPolicyPanel() {
   const html = policyPanelHtml();
-  if (html) $policyPanel.innerHTML = html;
+  if (!html) return;
+  // Keep focus on the same control across the swap (XERK-2676).
+  const refocus = focusKeyIn($policyPanel);
+  $policyPanel.innerHTML = html;
+  restoreFocusIn($policyPanel, refocus);
 }
 
 function openPolicyPanel() {
@@ -1934,7 +1918,12 @@ function permissionPanelHtml() {
 
 function paintPermissionPanel() {
   const html = permissionPanelHtml();
-  if (html) $permPanel.innerHTML = html;
+  if (!html) return;
+  // The GET's answer repaints the panel opened a moment ago; keep focus on the
+  // same control (the ✕ it opened on) across the swap (XERK-2676).
+  const refocus = focusKeyIn($permPanel);
+  $permPanel.innerHTML = html;
+  restoreFocusIn($permPanel, refocus);
 }
 
 // GET or POST the route; the hub's answer becomes the panel's truth. A refusal
@@ -1977,6 +1966,9 @@ function openPermissionPanel() {
   $permBackdrop.hidden = false;
   syncOverlayLock();
   loadPermissionPolicy();
+  // Land keyboard focus in the dialog, like the triage-policy panel (XERK-2676).
+  const close = $permPanel.querySelector(".td-close");
+  if (close) close.focus();
 }
 
 function closePermissionPanel() {
