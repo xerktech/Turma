@@ -56878,6 +56878,73 @@ class TestRepoDelete(ManagerMixin, unittest.TestCase):
             sm.build_payload(1)   # not a refresh beat
         stage.assert_called_once()
 
+    def test_the_repo_leaves_the_scan_before_it_is_removed(self):
+        # Prod (XERK-2672): removed in place, the repo stayed in scan_repos for
+        # the whole rmtree, the agent's per-beat git wrote a lock into .git, and
+        # `rmdir .git` failed "Directory not empty". It is moved aside first.
+        sm = self.make_manager()
+        repo, _wt, _d = self._setup_repo(sm)
+        seen = []
+        real = ha.shutil.rmtree
+
+        def watch(path, *a, **kw):
+            seen.append((path, [r["name"] for r in ha.scan_repos()],
+                         os.path.exists(repo)))
+            return real(path, *a, **kw)
+
+        sm.repo_deletes["R"] = {"repo": "R", "status": "deleting", "total": set()}
+        with mock.patch.object(ha.shutil, "rmtree", watch):
+            sm._run_repo_delete("R")
+        self.assertEqual(sm.repo_deletes["R"]["status"], "done")
+        self.assertFalse(os.path.exists(repo))
+        repo_rm = [x for x in seen if os.path.basename(x[0]).startswith("R.repo-")]
+        self.assertTrue(repo_rm, "the repo was removed from the trash dir")
+        for path, scanned, at_home in repo_rm:
+            self.assertTrue(path.startswith(os.path.join(ha.REPOS_ROOT, ".turma", "deleting")))
+            # Nothing at REPOS_ROOT/R while the tree is walked, so no scan of
+            # REPOS_ROOT (scan_repos itself is stubbed by the harness) finds it.
+            self.assertFalse(at_home)
+
+    def test_a_file_appearing_mid_removal_is_retried_not_left_half_deleted(self):
+        sm = self.make_manager()
+        repo, _wt, _d = self._setup_repo(sm)
+        real = ha.shutil.rmtree
+        calls = []
+
+        def racy(path, *a, **kw):
+            calls.append(path)
+            if len(calls) == 2:   # the repo's first pass: a concurrent git writes
+                raise OSError(39, "Directory not empty", path)
+            return real(path, *a, **kw)
+
+        sm.repo_deletes["R"] = {"repo": "R", "status": "deleting", "total": set()}
+        with mock.patch.object(ha.shutil, "rmtree", racy), \
+             mock.patch.object(ha.time, "sleep"):
+            sm._run_repo_delete("R")
+        self.assertEqual(sm.repo_deletes["R"]["status"], "done")
+        self.assertFalse(os.path.exists(repo))
+        self.assertEqual(os.listdir(os.path.join(ha.REPOS_ROOT, ".turma", "deleting")), [])
+
+    def test_a_leftover_from_an_interrupted_delete_is_swept_by_the_next(self):
+        sm = self.make_manager()
+        self._setup_repo(sm)
+        trash = os.path.join(ha.REPOS_ROOT, ".turma", "deleting")
+        os.makedirs(os.path.join(trash, "Old-1-2", "sub"))
+        sm.repo_deletes["R"] = {"repo": "R", "status": "deleting", "total": set()}
+        sm._run_repo_delete("R")
+        self.assertEqual(os.listdir(trash), [])
+
+    def test_a_failed_delete_keeps_its_reason_up_for_an_hour(self):
+        sm = self.make_manager()
+        now = time.time()
+        sm.repo_deletes["R"] = {"repo": "R", "status": "error", "error": "x",
+                                "finishedMono": now - ha.REPO_DELETE_RESULT_LINGER_SEC - 5}
+        sm.repo_deletes["S"] = {"repo": "S", "status": "done",
+                                "finishedMono": now - ha.REPO_DELETE_RESULT_LINGER_SEC - 5}
+        sm._advance_repo_deletes()
+        self.assertIn("R", sm.repo_deletes)
+        self.assertNotIn("S", sm.repo_deletes)
+
     def test_handle_commands_routes_deleteRepo_and_the_payload_reports_it(self):
         sm = self.make_manager()
         self._setup_repo(sm)

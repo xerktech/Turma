@@ -22069,6 +22069,12 @@ PRUNE_RESULT_LINGER_SEC = 60  # keep a FINISHED repo's prune summary in the hear
 REPO_DELETE_SYNC_TIMEOUT_SEC = _env_int("TURMA_REPO_DELETE_SYNC_TIMEOUT_SEC",
                                         1800, minimum=60)
 REPO_DELETE_RESULT_LINGER_SEC = 300  # a FINISHED delete's summary stays this long
+# A FAILED delete's reason stays longer: the button comes back when it goes, and
+# an operator who looked away must still be able to read why nothing happened.
+REPO_DELETE_ERROR_LINGER_SEC = 3600
+# A removal retries an rmtree that hit a transient error (a file appearing under
+# it) this many times, a second apart.
+REPO_DELETE_RMTREE_ATTEMPTS = 3
 # A prune runs on its own worker thread (XERK-256), so its git commands are NOT
 # on the heartbeat's critical path and can be bounded generously instead of
 # short: a single `git worktree remove` of a node_modules-carrying tree on a ZFS
@@ -47267,7 +47273,9 @@ class SessionManager:
                         rec["cleaned"] = True
                         cleanup.append(name)
                     fin = rec.get("finishedMono")
-                    if fin is not None and now - fin > REPO_DELETE_RESULT_LINGER_SEC:
+                    linger = (REPO_DELETE_ERROR_LINGER_SEC if rec.get("status") == "error"
+                              else REPO_DELETE_RESULT_LINGER_SEC)
+                    if fin is not None and now - fin > linger:
                         self.repo_deletes.pop(name, None)
             # Belt and braces: every launch path refuses a deleting repo, but a
             # record that appeared in one anyway is stopped back into the closed
@@ -47293,8 +47301,19 @@ class SessionManager:
         """Worker: remove WORKTREES_ROOT/<repo> (every session worktree cut from
         it) and then REPOS_ROOT/<repo>. A symlink at either path is unlinked,
         never followed; rmtree itself never follows a link inside the tree.
-        Records the outcome for the beat; never raises."""
+        Records the outcome for the beat; never raises.
+
+        A real dir is first RENAMED into REPOS_ROOT/.turma/deleting/ and removed
+        from there. In place, the repo stayed in scan_repos for the whole rmtree,
+        so the agent's own per-beat `git status` (and the defect scan's fetch)
+        kept writing into `.git` under it: on a real host the rmtree emptied
+        `.git`, a lock file appeared, and `rmdir .git` failed "Directory not
+        empty", leaving a half-deleted repo (XERK-2672 prod). Renamed, nothing
+        new is started there; a git already running finishes in the moved dir,
+        which is why the rmtree also retries."""
         try:
+            trash = os.path.join(REPOS_ROOT, ".turma", "deleting")
+            self._sweep_repo_trash(trash)
             for root in (WORKTREES_ROOT, REPOS_ROOT):
                 path = os.path.join(root, name)
                 # The name came from scan_repos (a plain child of REPOS_ROOT),
@@ -47309,7 +47328,20 @@ class SessionManager:
                             timeout=PRUNE_GIT_TIMEOUT_SEC)
                     os.unlink(path)
                 elif os.path.isdir(path):
-                    shutil.rmtree(path, onerror=_rmtree_writable)
+                    gone = path
+                    try:
+                        os.makedirs(trash, exist_ok=True)
+                        kind = "repo" if root == REPOS_ROOT else "worktrees"
+                        gone = os.path.join(trash, f"{name}.{kind}-{os.getpid()}-"
+                                                   f"{time.time_ns()}")
+                        os.rename(path, gone)
+                    except OSError as e:
+                        # Another filesystem (EXDEV) or no room for the dir:
+                        # remove it where it is, retries still covering a race.
+                        log(f"delete repo {name}: could not move {path} aside "
+                            f"({e}); removing in place")
+                        gone = path
+                    self._rmtree_retrying(gone)
             with self._repo_delete_lock:
                 rec = self.repo_deletes.get(name, {})
                 n = len(rec.get("total") or ())
@@ -47324,6 +47356,40 @@ class SessionManager:
                            summary="delete failed part-way",
                            error=f"removing {name} failed: {e}")
             log(f"delete repo {name} failed: {e}")
+
+    @staticmethod
+    def _rmtree_retrying(path):
+        """rmtree that retries a transient failure (a file a process still
+        running in the tree created mid-walk); the last failure raises."""
+        for attempt in range(REPO_DELETE_RMTREE_ATTEMPTS):
+            try:
+                shutil.rmtree(path, onerror=_rmtree_writable)
+                return
+            except FileNotFoundError:
+                return
+            except OSError:
+                if attempt == REPO_DELETE_RMTREE_ATTEMPTS - 1:
+                    raise
+                time.sleep(1)
+
+    @staticmethod
+    def _sweep_repo_trash(trash):
+        """Remove what an earlier delete left in the trash dir (a manager
+        killed mid-rmtree). Best-effort: a leftover that will not go is retried
+        by the next delete and never fails this one. Never follows a link."""
+        try:
+            names = os.listdir(trash)
+        except OSError:
+            return
+        for n in names:
+            p = os.path.join(trash, n)
+            try:
+                if os.path.islink(p) or not os.path.isdir(p):
+                    os.unlink(p)
+                else:
+                    shutil.rmtree(p, onerror=_rmtree_writable)
+            except OSError as e:
+                log(f"repo delete: could not clear leftover {p}: {e}")
 
     def _repo_deletes_payload(self):
         with self._repo_delete_lock:

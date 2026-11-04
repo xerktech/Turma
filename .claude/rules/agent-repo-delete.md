@@ -41,6 +41,13 @@ Progress rides the heartbeat as `repoDeletes: [{repo, status, error, summary, at
 - Accepted: an id another host owns, or a rendered-blocked one, is not wanted by the hub and so
   reads confirmed; a full archive keeps wanting → the delete times out, and the error says so.
 - A symlinked repo is unlinked, never followed; its target gets `git worktree prune` first.
+- **Removal MOVES each tree into `REPOS_ROOT/.turma/deleting/` first, then rmtree's it there**
+  (`<repo>.repo-…` / `<repo>.worktrees-…`), retrying `REPO_DELETE_RMTREE_ATTEMPTS`. Removed in
+  place on a real host, the repo stayed in `scan_repos` and the agent's own per-beat `git status`
+  wrote a lock into `.git` mid-rmtree: `rmdir .git` failed "Directory not empty" and the repo was
+  left half-deleted (still listed, `.git` empty). Never go back to an in-place rmtree.
+- Each removal first sweeps what an interrupted one left in that trash dir.
+- A failed delete's note lingers `REPO_DELETE_ERROR_LINGER_SEC` (1h), a done one 5 min.
 - Hub: 400 for the repos root, 409 for an agent that reports no `repoDeletes` array (it would ack
   and never act), 404 for a repo the host does not report. Web-only control (`android/PARITY.md`).
 - Tests: `TestRepoDelete`; `XERK-2672:` in `server.test.js`; the Delete cases in
