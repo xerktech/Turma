@@ -533,7 +533,8 @@
     };
     const node = (k) => {
       const t = byKey.get(k);
-      return { key: k, summary: (t && t.summary) || "", status: statusOf(k) };
+      // onBoard: the panel can open only a child the board carries (XERK-2674).
+      return { key: k, summary: (t && t.summary) || "", status: statusOf(k), onBoard: !!t };
     };
     const counts = { done: 0, running: 0, ready: 0, blocked: 0 };
     for (const k of keys) { const s = statusOf(k); if (counts[s] != null) counts[s]++; }
@@ -701,13 +702,22 @@
     const o = opts || {};
     const key = (t && t.key) || "";
     const err = o.error ? `<div class="td-note td-err">${esc(o.error)}</div>` : "";
+    // A child's key + summary open THAT ticket's detail panel in place
+    // (XERK-2674) — the page's click handler keys on data-epic-child.
+    const childOpenHtml = (c) => c.onBoard === false
+      ? `<span class="epic-child-key">${esc(c.key)}</span>
+          <span class="epic-child-sum">${esc(c.summary)}</span>`
+      : `<button class="epic-child-open" type="button"
+            data-epic-child="${esc(c.key)}" title="Open ${esc(c.key)}">
+            <span class="epic-child-key">${esc(c.key)}</span>
+            <span class="epic-child-sum">${esc(c.summary)}</span>
+          </button>`;
     // A board child (epicChildrenOf) row: its column, not a run status.
     const boardChildLi = (c) => {
       const label = (CATEGORIES.find(([k]) => k === c.category) || [, ""])[1];
       return `<li class="epic-child epic-cat-${esc(c.category)}">
           <span class="epic-child-dot"></span>
-          <span class="epic-child-key">${esc(c.key)}</span>
-          <span class="epic-child-sum">${esc(c.summary)}</span>
+          ${childOpenHtml(c)}
           <span class="epic-child-st">${esc(label)}</span>
         </li>`;
     };
@@ -718,8 +728,7 @@
         : c.status === "ready" ? "Ready" : "Blocked";
       return `<li class="epic-child epic-${c.status}">
           <span class="epic-child-dot"></span>
-          <span class="epic-child-key">${esc(c.key)}</span>
-          <span class="epic-child-sum">${esc(c.summary)}</span>
+          ${childOpenHtml(c)}
           <span class="epic-child-st">${st}</span>
         </li>`;
     };
@@ -2545,11 +2554,18 @@
     }
 
     const color = o.color || "var(--muted)";
+    // A sub-ticket links back to its epic's panel (XERK-2674) — only when the
+    // board carries the epic, since the panel opens off the board's tickets.
+    const epicKey = t.epicKey ? String(t.epicKey) : "";
+    const epicCrumb = epicKey && o.site && (o.site.tickets || []).some((x) => x && x.key === epicKey)
+      ? `<button class="td-epic" type="button" data-td-epic="${esc(epicKey)}"
+          title="Back to epic ${esc(epicKey)}">⧉ ${esc(epicKey)}</button>` : "";
     return `<div class="td-head">
         <div class="td-crumbs">
           <span class="kc-org" style="--org:${esc(color)}" title="${esc(bareKey(o.siteKey))}">${esc(v("project") || "")}</span>
           <a class="kc-key" href="${safeUrl(v("url"))}" target="_blank" rel="noopener">${esc(t.key)}</a>
           <span class="kc-type">${esc(v("type") || "")}</span>
+          ${epicCrumb}
         </div>
         <button class="td-close" type="button" aria-label="Close">✕</button>
       </div>

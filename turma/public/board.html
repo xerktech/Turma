@@ -2043,6 +2043,14 @@ $board.addEventListener("keydown", (e) => {
 $panel.addEventListener("click", (e) => {
   if (e.target.closest(".td-close")) return closeDetail();
   if (!openTicketState) return;
+  // An epic's sub-ticket row, or a sub-ticket's epic crumb, opens that ticket's
+  // panel in place (XERK-2674). Focus returns to the card the epic opened from.
+  const nav = e.target.closest("[data-epic-child], [data-td-epic]");
+  if (nav) {
+    const key = nav.dataset.epicChild || nav.dataset.tdEpic;
+    openDetail(key, openTicketState.siteKey, lastFocus);
+    return;
+  }
   // Epic run controls: Start / Re-arm (both arm), Pause / Resume (XERK-641), Cancel.
   const armBtn = e.target.closest("[data-epic-arm]");
   if (armBtn) {

@@ -3732,3 +3732,44 @@ test("XERK-2634: a tenant org's poll-error note and org-tag tooltips print the s
   // A key without the exact tenant tail keeps its title whole.
   assert.match(cardHtml(ticket("X-1"), { siteKey: "box@corp" }, {}), /title="box@corp"/);
 });
+
+// --- XERK-2674: an epic's sub-ticket rows open that ticket's panel -----------
+test("XERK-2674: epic child rows are buttons that open the child's detail", () => {
+  const view = {
+    state: "running", total: 2, done: 0, counts: { done: 0, running: 1, ready: 0, blocked: 0 },
+    waves: [[
+      { key: "C-1", summary: "on <b>board", status: "running", onBoard: true },
+      { key: "C-9", summary: "gone", status: "ready", onBoard: false },
+    ]],
+    cycleChildren: [], cycle: false,
+  };
+  const children = [{ key: "C-4", summary: "added later", category: "todo" }];
+  const html = epicRunPanelHtml(epicTicket("E-1"), view, { children });
+  assert.match(html, /<button class="epic-child-open" type="button"\s+data-epic-child="C-1"[^>]*>[^]*C-1[^]*on &lt;b&gt;board[^]*<\/button>/);
+  assert.match(html, /data-epic-child="C-4"/, "a board child outside the run opens too");
+  assert.doesNotMatch(html, /data-epic-child="C-9"/, "a run child the board no longer carries is plain text");
+  assert.match(html, /epic-child-key">C-9</);
+  // The un-armed preview rows open as well.
+  const prev = epicRunPanelHtml(epicTicket("E-1"), null, { preview: view });
+  assert.match(prev, /data-epic-child="C-1"/);
+});
+
+test("XERK-2674: epicRunView marks whether each child is on the board", () => {
+  const site = { siteKey: "s", tickets: [ticket("C-1", { epicKey: "E-1" })] };
+  const v = epicRunView(run({ children: ["C-1", "C-2"], waves: [["C-1", "C-2"]] }), site, {});
+  assert.deepEqual(v.waves[0].map((c) => [c.key, c.onBoard]), [["C-1", true], ["C-2", false]]);
+});
+
+test("XERK-2674: a sub-ticket's panel links back to its epic only when the board has it", () => {
+  const child = ticket("C-1", { epicKey: "E-1" });
+  const withEpic = detailHtml(child, null, { site: { siteKey: "s", tickets: [epicTicket("E-1"), child] } });
+  assert.match(withEpic, /<button class="td-epic" type="button" data-td-epic="E-1"/);
+  const without = detailHtml(child, null, { site: { siteKey: "s", tickets: [child] } });
+  assert.doesNotMatch(without, /data-td-epic/);
+  assert.doesNotMatch(detailHtml(ticket("X-1"), null, {}), /data-td-epic/);
+});
+
+test("XERK-2674: board.html opens the clicked child or epic in the detail panel", () => {
+  const src = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
+  assert.match(src, /closest\("\[data-epic-child\], \[data-td-epic\]"\)[^]*openDetail\(key, openTicketState\.siteKey/);
+});

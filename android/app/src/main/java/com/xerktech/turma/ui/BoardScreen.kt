@@ -503,7 +503,14 @@ fun BoardScreen(
         val epicChildren = if (isEpicTicket(ticket)) epicChildrenOf(liveSite, ticket.key) else emptyList()
         // A session that closed this ticket itself (XERK-1569) — web's "Closed by" row.
         val closedBy = ticketOutcomeOf(ticketSessionsOf(sessionIndex, site.siteKey, ticket.key))
-        TicketDetailSheet(site, ticket, pin, modelPin, modelPick, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, epicPreview, epicChildren, vm, closedBy, onDismiss = { detail = null })
+        // An epic's sub-ticket row, or a sub-ticket's epic chip, swaps the sheet to
+        // that ticket (XERK-2674, board.js data-epic-child / data-td-epic). Only a
+        // ticket the board carries can open, so the lookup is also the gate.
+        val boardTicket: (String) -> JiraTicket? = { key -> liveSite.tickets.find { it.key == key } }
+        TicketDetailSheet(site, ticket, pin, modelPin, modelPick, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, epicPreview, epicChildren, vm, closedBy,
+            boardTicket = boardTicket,
+            onOpenTicket = { t -> detail = liveSite to t },
+            onDismiss = { detail = null })
     }
 
     if (filterOpen) {
@@ -1010,6 +1017,7 @@ private fun EpicRunSection(
     preview: EpicRunView?,
     children: List<EpicBoardChild>,
     vm: BoardViewModel,
+    onOpenChild: ((String) -> Unit)?,
 ) {
     val scope = rememberCoroutineScope()
     var busy by remember(t.key) { mutableStateOf(false) }
@@ -1071,9 +1079,9 @@ private fun EpicRunSection(
                 } else {
                     Text("${preview.done} / ${preview.total} done", style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
                     EpicProgressBar(preview)
-                    preview.waves.forEachIndexed { i, wave -> EpicWaveGroup("Wave ${i + 1}", wave, cyclic = false) }
+                    preview.waves.forEachIndexed { i, wave -> EpicWaveGroup("Wave ${i + 1}", wave, cyclic = false, onOpenChild) }
                     if (preview.cycleChildren.isNotEmpty()) {
-                        EpicWaveGroup("Cyclic — never becomes ready", preview.cycleChildren, cyclic = true)
+                        EpicWaveGroup("Cyclic — never becomes ready", preview.cycleChildren, cyclic = true, onOpenChild)
                     }
                 }
             }
@@ -1105,12 +1113,12 @@ private fun EpicRunSection(
                 Text("This epic has no children on the board yet.", style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             view.waves.forEachIndexed { i, wave ->
-                EpicWaveGroup("Wave ${i + 1}", wave, cyclic = false)
+                EpicWaveGroup("Wave ${i + 1}", wave, cyclic = false, onOpenChild)
             }
             if (view.cycleChildren.isNotEmpty()) {
-                EpicWaveGroup("Cyclic — never becomes ready", view.cycleChildren, cyclic = true)
+                EpicWaveGroup("Cyclic — never becomes ready", view.cycleChildren, cyclic = true, onOpenChild)
             }
-            if (outside.isNotEmpty()) EpicBoardChildGroup("Not in this run", outside)
+            if (outside.isNotEmpty()) EpicBoardChildGroup("Not in this run", outside, onOpenChild)
             if (view.state != "done") EpicLimitPicker(view.maxConcurrent, enabled = !busy) { limit(it) }
             if (busy) {
                 Text("⏳ working…", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1183,9 +1191,14 @@ private fun EpicProgressBar(view: EpicRunView) {
     }
 }
 
+/** A child row taps through to that ticket's sheet when it can open (XERK-2674). */
+private fun childRowModifier(key: String, onOpenChild: ((String) -> Unit)?): Modifier =
+    if (onOpenChild == null) Modifier.fillMaxWidth()
+    else Modifier.fillMaxWidth().clickable(onClickLabel = "Open $key") { onOpenChild(key) }
+
 /** One wave (or the cycle group) of the epic panel — a labelled list of child rows. */
 @Composable
-private fun EpicWaveGroup(title: String, children: List<EpicChild>, cyclic: Boolean) {
+private fun EpicWaveGroup(title: String, children: List<EpicChild>, cyclic: Boolean, onOpenChild: ((String) -> Unit)?) {
     Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
         Text(
             title.uppercase(),
@@ -1193,7 +1206,7 @@ private fun EpicWaveGroup(title: String, children: List<EpicChild>, cyclic: Bool
             color = if (cyclic) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
         )
         for (c in children) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(childRowModifier(c.key, onOpenChild), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box(Modifier.size(8.dp).clip(CircleShape).background(epicChildColor(c.status)))
                 Text(c.key, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(c.summary, style = MaterialTheme.typography.bodyMedium, maxLines = 1, modifier = Modifier.weight(1f))
@@ -1206,7 +1219,7 @@ private fun EpicWaveGroup(title: String, children: List<EpicChild>, cyclic: Bool
 
 /** A labelled list of an epic's board children, each tinted by its column (board.js boardChildLi). */
 @Composable
-private fun EpicBoardChildGroup(title: String, children: List<EpicBoardChild>) {
+private fun EpicBoardChildGroup(title: String, children: List<EpicBoardChild>, onOpenChild: ((String) -> Unit)?) {
     Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
         Text(title.uppercase(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         for (c in children) {
@@ -1216,7 +1229,7 @@ private fun EpicBoardChildGroup(title: String, children: List<EpicBoardChild>) {
                 else -> MaterialTheme.colorScheme.onSurfaceVariant
             }
             val label = BOARD_CATEGORIES.firstOrNull { it.first == c.category }?.second.orEmpty()
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(childRowModifier(c.key, onOpenChild), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box(Modifier.size(8.dp).clip(CircleShape).background(color))
                 Text(c.key, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(c.summary, style = MaterialTheme.typography.bodyMedium, maxLines = 1, modifier = Modifier.weight(1f))
@@ -1892,9 +1905,13 @@ private fun TicketDetailSheet(
     epicChildren: List<EpicBoardChild>,
     vm: BoardViewModel,
     closedBy: TicketSession?,
+    boardTicket: (String) -> JiraTicket?,
+    onOpenTicket: (JiraTicket) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val siteKey = site.siteKey
+    // Tap-through from the epic panel; a child the board doesn't carry stays inert.
+    val openKey: (String) -> Unit = { key -> boardTicket(key)?.let(onOpenTicket) }
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     // Held in mutable state (not produceState) so a status change (XERK-138) can
     // replace it with the re-fetched issue — the new status brings new options.
@@ -1909,6 +1926,13 @@ private fun TicketDetailSheet(
                 Text(t.key, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Pill(t.status)
                 if (t.priority.isNotBlank()) Pill(t.priority)
+                // A sub-ticket links back to its epic's sheet (board.js td-epic).
+                val epic = t.epicKey?.takeIf { it.isNotBlank() }?.let(boardTicket)
+                if (epic != null) {
+                    Text("⧉ ${epic.key}", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.clickable(onClickLabel = "Back to epic ${epic.key}") { onOpenTicket(epic) })
+                }
             }
             Text(t.summary, style = MaterialTheme.typography.titleMedium)
             StatusSection(site, t, detail, vm, onDetailChange = { detail = it })
@@ -1934,7 +1958,8 @@ private fun TicketDetailSheet(
             // An epic is an organizer: it shows the epic-run panel (Start/progress),
             // not the work-ticket pins (repo/agent/model/runtime), which don't apply.
             if (isEpicTicket(t)) {
-                EpicRunSection(site, t, epicView, epicPreview, epicChildren, vm)
+                EpicRunSection(site, t, epicView, epicPreview, epicChildren, vm,
+                    onOpenChild = { key -> if (boardTicket(key) != null) openKey(key) })
                 // The host-OS requirement applies to an epic too (XERK-693) —
                 // setting it here is what constrains all the epic's subtasks.
                 PlatformSection(site, t, platformPin, null, null, vm)
