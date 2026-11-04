@@ -3771,5 +3771,8 @@ test("XERK-2674: a sub-ticket's panel links back to its epic only when the board
 
 test("XERK-2674: board.html opens the clicked child or epic in the detail panel", () => {
   const src = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
-  assert.match(src, /closest\("\[data-epic-child\], \[data-td-epic\]"\)[^]*openDetail\(key, openTicketState\.siteKey/);
+  // Both targets resolve (the crumb's key too) and focus returns to the opening card.
+  assert.match(src, /closest\("\[data-epic-child\], \[data-td-epic\]"\)[^]*?nav\.dataset\.epicChild \|\| nav\.dataset\.tdEpic[^]*?openDetail\(key, openTicketState\.siteKey, lastFocus\)/);
+  // A double-click's second click (landing on the backdrop) doesn't close the panel.
+  assert.match(src, /\$backdrop\.addEventListener\("click", \(e\) => \{ if \(e\.target === \$backdrop && e\.detail <= 1\) closeDetail\(\); \}\)/);
 });

@@ -1017,7 +1017,7 @@ private fun EpicRunSection(
     preview: EpicRunView?,
     children: List<EpicBoardChild>,
     vm: BoardViewModel,
-    onOpenChild: ((String) -> Unit)?,
+    onOpenChild: ((String) -> (() -> Unit)?)?,
 ) {
     val scope = rememberCoroutineScope()
     var busy by remember(t.key) { mutableStateOf(false) }
@@ -1191,14 +1191,19 @@ private fun EpicProgressBar(view: EpicRunView) {
     }
 }
 
-/** A child row taps through to that ticket's sheet when it can open (XERK-2674). */
-private fun childRowModifier(key: String, onOpenChild: ((String) -> Unit)?): Modifier =
-    if (onOpenChild == null) Modifier.fillMaxWidth()
-    else Modifier.fillMaxWidth().clickable(onClickLabel = "Open $key") { onOpenChild(key) }
+/**
+ * A child row taps through to that ticket's sheet (XERK-2674). `childOpener`
+ * answers null for a child the board doesn't carry, which stays a plain row
+ * (no announced action), like board.js's onBoard:false text.
+ */
+private fun childRowModifier(key: String, childOpener: ((String) -> (() -> Unit)?)?): Modifier {
+    val open = childOpener?.invoke(key) ?: return Modifier.fillMaxWidth()
+    return Modifier.fillMaxWidth().clickable(onClickLabel = "Open $key") { open() }
+}
 
 /** One wave (or the cycle group) of the epic panel — a labelled list of child rows. */
 @Composable
-private fun EpicWaveGroup(title: String, children: List<EpicChild>, cyclic: Boolean, onOpenChild: ((String) -> Unit)?) {
+private fun EpicWaveGroup(title: String, children: List<EpicChild>, cyclic: Boolean, onOpenChild: ((String) -> (() -> Unit)?)?) {
     Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
         Text(
             title.uppercase(),
@@ -1219,7 +1224,7 @@ private fun EpicWaveGroup(title: String, children: List<EpicChild>, cyclic: Bool
 
 /** A labelled list of an epic's board children, each tinted by its column (board.js boardChildLi). */
 @Composable
-private fun EpicBoardChildGroup(title: String, children: List<EpicBoardChild>, onOpenChild: ((String) -> Unit)?) {
+private fun EpicBoardChildGroup(title: String, children: List<EpicBoardChild>, onOpenChild: ((String) -> (() -> Unit)?)?) {
     Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
         Text(title.uppercase(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         for (c in children) {
@@ -1910,8 +1915,6 @@ private fun TicketDetailSheet(
     onDismiss: () -> Unit,
 ) {
     val siteKey = site.siteKey
-    // Tap-through from the epic panel; a child the board doesn't carry stays inert.
-    val openKey: (String) -> Unit = { key -> boardTicket(key)?.let(onOpenTicket) }
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     // Held in mutable state (not produceState) so a status change (XERK-138) can
     // replace it with the re-fetched issue — the new status brings new options.
@@ -1959,7 +1962,7 @@ private fun TicketDetailSheet(
             // not the work-ticket pins (repo/agent/model/runtime), which don't apply.
             if (isEpicTicket(t)) {
                 EpicRunSection(site, t, epicView, epicPreview, epicChildren, vm,
-                    onOpenChild = { key -> if (boardTicket(key) != null) openKey(key) })
+                    onOpenChild = { key -> boardTicket(key)?.let { child -> { onOpenTicket(child) } } })
                 // The host-OS requirement applies to an epic too (XERK-693) —
                 // setting it here is what constrains all the epic's subtasks.
                 PlatformSection(site, t, platformPin, null, null, vm)

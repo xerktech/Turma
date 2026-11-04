@@ -2231,7 +2231,9 @@ $panel.addEventListener("change", (e) => {
   }
   saveRepo(sel.value);
 });
-$backdrop.addEventListener("click", (e) => { if (e.target === $backdrop) closeDetail(); });
+// e.detail > 1 skips a double-click's second click: after an epic's child row
+// opens a shorter panel, that click lands on the backdrop (XERK-2674).
+$backdrop.addEventListener("click", (e) => { if (e.target === $backdrop && e.detail <= 1) closeDetail(); });
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (anyMenuOpen()) return closeMenus(null);
