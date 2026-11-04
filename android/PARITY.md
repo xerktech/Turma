@@ -768,10 +768,8 @@ those are marked `[MODEL]`.
     repo). Android's `prune()` fires and forgets, so its button releases immediately and the
     operator has no sign the sweep is still going. Decode `prunes[]` and mirror `repoBlock`'s rule:
     busy while `status` is `queued` or `running`.
-- P1 Repo blocks: per-repo **Delete** (XERK-2672) is web-only. The web arms/confirms, POSTs
-  `/api/agents/<host>/repos/<repo>/delete`, and shows the agent's `repoDeletes[]` record (busy while
-  `status` is `syncing` or `deleting`; `error` shown in the note). Offered only when the host reports
-  a `repoDeletes` array and the repo is not the repos root. Android ignores the key today (XERK-2675).
+- Repo Delete (XERK-2672) is at parity (XERK-2675): `core/RepoDelete.kt` holds the web's gating,
+  busy and note rules; tests in `core/RepoDeleteTest.kt`.
 - P1 Composer base-branch dropdown + per-repo option persistence.
 
 ### Sessions + Chat (`sessions.html` + `chat.js` → `SessionsScreen`/`ChatScreen`)

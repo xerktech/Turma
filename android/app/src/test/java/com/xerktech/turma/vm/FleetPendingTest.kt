@@ -53,4 +53,26 @@ class FleetPendingTest {
         // Restart's shorter TTL (the fallback for an agent with no restartCount).
         assertTrue(reconcilePending(pend("restart", at = 0), fleet(s), 16_000).isEmpty())
     }
+
+    @Test fun `a repo delete clears only once the agent reports a NEW record`() {
+        val key = FleetViewModel.repoDeleteKey("h1", "Turma")
+        val p = mapOf(key to SessPending("repoDelete", 0, prevAt = "t0"))
+        fun withRecord(at: String?) = listOf(AgentInfo(key = "h1", repoDeletes =
+            at?.let { listOf(com.xerktech.turma.model.RepoDeleteInfo(repo = "Turma", status = "syncing", at = it)) }.orEmpty()))
+        // Nothing yet, or the stale record that was showing when it was queued: hold.
+        assertEquals(1, reconcilePending(p, withRecord(null), 1000).size)
+        assertEquals(1, reconcilePending(p, withRecord("t0"), 1000).size)
+        // A new record landed: its own status drives the button from here.
+        assertTrue(reconcilePending(p, withRecord("t1"), 1000).isEmpty())
+    }
+
+    @Test fun `duplicate repo records resolve to the first, like RepoDelete record`() {
+        val key = FleetViewModel.repoDeleteKey("h1", "Turma")
+        val p = mapOf(key to SessPending("repoDelete", 0, prevAt = "t0"))
+        val dup = listOf(AgentInfo(key = "h1", repoDeletes = listOf(
+            com.xerktech.turma.model.RepoDeleteInfo(repo = "Turma", status = "error", at = "t0"),
+            com.xerktech.turma.model.RepoDeleteInfo(repo = "Turma", status = "syncing", at = "t1"),
+        )))
+        assertEquals(1, reconcilePending(p, dup, 1000).size)
+    }
 }

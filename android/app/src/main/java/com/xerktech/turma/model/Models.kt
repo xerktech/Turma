@@ -14,6 +14,9 @@ import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonEncoder
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonNames
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.json.JsonNull
 
 /**
  * Wire shapes mirrored from the Turma hub (turma/server.js `serializeAgent`,
@@ -298,6 +301,29 @@ object LenientMeetingsSerializer : LenientSiteMapSerializer<List<Meeting>>(
     },
 )
 
+/**
+ * `repoDeletes` decoded row by row (XERK-2675): the hub passes the agent's array
+ * through raw, and `/api/agents` decodes atomically, so one malformed row must
+ * drop alone rather than blank every host. A non-array reads as null (no Delete).
+ */
+object LenientRepoDeletesSerializer : KSerializer<List<RepoDeleteInfo>?> {
+    override val descriptor: SerialDescriptor = ListSerializer(JsonElement.serializer()).descriptor
+
+    override fun deserialize(decoder: Decoder): List<RepoDeleteInfo>? {
+        val arr = (decoder as? JsonDecoder)?.decodeJsonElement() as? JsonArray ?: return null
+        return arr.mapNotNull { row ->
+            runCatching { TurmaJson.decodeFromJsonElement(RepoDeleteInfo.serializer(), row) }.getOrNull()
+        }
+    }
+
+    override fun serialize(encoder: Encoder, value: List<RepoDeleteInfo>?) {
+        val json = encoder as JsonEncoder
+        json.encodeJsonElement(
+            value?.let { TurmaJson.encodeToJsonElement(ListSerializer(RepoDeleteInfo.serializer()), it) } ?: JsonNull,
+        )
+    }
+}
+
 /** `dailyBriefSchedules`: one schedule per org. */
 object LenientSchedulesSerializer : LenientSiteMapSerializer<DailyBriefSchedule>(
     { TurmaJson.encodeToJsonElement(DailyBriefSchedule.serializer(), it) },
@@ -538,6 +564,13 @@ data class AgentInfo(
      */
     val refused: RefusedInfo? = null,
     val repos: List<RepoInfo> = emptyList(),
+    /**
+     * Per-repo delete progress (XERK-2672/2675). NULL is meaningful: an agent
+     * predating repo delete omits the key, acks the command and never acts, and
+     * the hub 409s it — so Delete is offered only when this is non-null.
+     */
+    @Serializable(with = LenientRepoDeletesSerializer::class)
+    val repoDeletes: List<RepoDeleteInfo>? = null,
     val sessions: List<SessionInfo> = emptyList(),
     // The login's probed model list (XERK-33), for the ticket model picker's
     // options; null on an agent predating the probe.
@@ -714,6 +747,20 @@ data class Capacity(
     // Null = the agent didn't say (hub drops a non-int); "can't tell", never full.
     val free: Int? = null,
     val rootRunning: Boolean = false,
+)
+
+/**
+ * One repo delete as the agent reports it (XERK-2672): `status` is
+ * syncing | deleting | done | error; `at` is the agent's ISO-8601 stamp, which
+ * changes on every new command — the signal a queued delete has landed.
+ */
+@Serializable
+data class RepoDeleteInfo(
+    val repo: String = "",
+    val status: String = "",
+    val error: String? = null,
+    val summary: String = "",
+    val at: String = "",
 )
 
 /** An announced in-progress update restart (XERK-29); present only during the grace window. */
@@ -1046,9 +1093,15 @@ data class JiraComment(
     val created: String = "",
 )
 
+@OptIn(ExperimentalSerializationApi::class)
 @Serializable
 data class RepoInfo(
     val name: String = "",
+    // The agent flags the REPOS_ROOT pseudo-repo "(root)" as `isRoot`
+    // (hub-agent root_repo_entry); `root` is kept as an alias for old fixtures.
+    // Decoding only `root` made the root row read as an ordinary repo — offering
+    // Prune and the destructive Delete on it (XERK-2675).
+    @JsonNames("isRoot")
     val root: Boolean = false,
     // ISO-8601 string (agent ranks repos by comparing these as strings), not epoch.
     val lastActivity: String = "",
