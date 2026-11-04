@@ -768,6 +768,8 @@ those are marked `[MODEL]`.
     repo). Android's `prune()` fires and forgets, so its button releases immediately and the
     operator has no sign the sweep is still going. Decode `prunes[]` and mirror `repoBlock`'s rule:
     busy while `status` is `queued` or `running`.
+- Repo Delete (XERK-2672) is at parity (XERK-2675): `core/RepoDelete.kt` holds the web's gating,
+  busy and note rules; tests in `core/RepoDeleteTest.kt`.
 - P1 Composer base-branch dropdown + per-repo option persistence.
 
 ### Sessions + Chat (`sessions.html` + `chat.js` → `SessionsScreen`/`ChatScreen`)

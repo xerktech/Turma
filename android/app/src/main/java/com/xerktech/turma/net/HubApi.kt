@@ -181,6 +181,12 @@ interface HubApi {
     @POST("api/agents/{host}/repos/{repo}/prune")
     suspend fun prune(@Path("host") host: String, @Path("repo") repo: String): OkResponse
 
+    // Delete a repo and its session worktrees from the host (XERK-2672). The hub
+    // 409s an agent that doesn't report `repoDeletes` and 404s an unknown repo;
+    // both come back in the hub's own words via hubErrorMessage.
+    @POST("api/agents/{host}/repos/{repo}/delete")
+    suspend fun deleteRepo(@Path("host") host: String, @Path("repo") repo: String): OkResponse
+
     // Restart the host's agent manager (XERK-157) — e.g. after fixing an expired
     // Claude login — without SSHing in. The agent exits for its supervisor to
     // bring it back; running sessions are re-adopted on boot.

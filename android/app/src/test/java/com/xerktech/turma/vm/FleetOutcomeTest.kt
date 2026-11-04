@@ -88,4 +88,20 @@ class FleetOutcomeTest {
         val msg = spawn()
         assertTrue("reported \"$msg\"", msg.startsWith("✓"))
     }
+
+    /** A refused repo delete (XERK-2675) reports the hub's words and releases the button. */
+    @Test
+    fun `a refused repo delete reports the hub's reason and clears pending`() {
+        hub.route("/api/agents/$host/repos/Turma/delete") {
+            HubHarness.refusal("agent too old to delete repos")
+        }
+        val vm = main.track(FleetViewModel(hub.app))
+        val message = hub.expectMessage(vm.messages)
+        vm.deleteRepo(host, "Turma")
+        assertTrue(vm.pending.value.containsKey(FleetViewModel.repoDeleteKey(host, "Turma")))
+        val msg = message()
+        assertTrue("reported \"$msg\"", msg.startsWith("✗") && msg.contains("too old to delete repos"))
+        assertTrue(hub.findRequest("/repos/Turma/delete").method == "POST")
+        assertTrue(vm.pending.value.isEmpty())
+    }
 }

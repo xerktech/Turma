@@ -108,6 +108,7 @@ fun FleetScreen(
     var resumeFor by remember { mutableStateOf<Pair<String, RepoInfo>?>(null) }
     var actionsFor by remember { mutableStateOf<Pair<String, SessionInfo>?>(null) }
     var pruneFor by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var deleteRepoFor by remember { mutableStateOf<Pair<String, String>?>(null) }
     var restartFor by remember { mutableStateOf<String?>(null) }
 
     Box(modifier) {
@@ -175,6 +176,7 @@ fun FleetScreen(
                         onComposeSpawn = { host, repo, isRoot -> spawnFor = Triple(host, repo, isRoot) },
                         onResume = { host, repo -> resumeFor = host to repo },
                         onPrune = { host, repo -> pruneFor = host to repo },
+                        onDeleteRepo = { host, repo -> deleteRepoFor = host to repo },
                         onRestart = { host -> restartFor = host },
                         onClone = { host, repo, source -> vm.clone(host, repo, source) },
                         onOpenSession = onOpenChat,
@@ -233,6 +235,15 @@ fun FleetScreen(
             onDismiss = { pruneFor = null },
         )
     }
+    deleteRepoFor?.let { (host, repo) ->
+        ConfirmDialog(
+            title = "Delete $repo?",
+            message = com.xerktech.turma.core.RepoDelete.CONFIRM_MESSAGE,
+            confirmLabel = "Delete",
+            onConfirm = { vm.deleteRepo(host, repo); deleteRepoFor = null },
+            onDismiss = { deleteRepoFor = null },
+        )
+    }
     restartFor?.let { host ->
         ConfirmDialog(
             title = "Restart $host's agent?",
@@ -283,6 +294,7 @@ private fun HostSection(
     onComposeSpawn: (String, String, Boolean) -> Unit,
     onResume: (String, RepoInfo) -> Unit,
     onPrune: (String, String) -> Unit,
+    onDeleteRepo: (String, String) -> Unit,
     onRestart: (String) -> Unit,
     onClone: (String, String, String?) -> Unit,
     onOpenSession: (String, String) -> Unit,
@@ -378,6 +390,10 @@ private fun HostSection(
                             onComposeSpawn = { onComposeSpawn(agent.key, repo.name, repo.root) },
                             onResume = { onResume(agent.key, repo) },
                             onPrune = { onPrune(agent.key, repo.name) },
+                            hostOnline = agent.online,
+                            canDelete = com.xerktech.turma.core.RepoDelete.canDelete(agent, repo),
+                            deleteRecord = com.xerktech.turma.core.RepoDelete.record(agent, repo.name),
+                            onDeleteRepo = { onDeleteRepo(agent.key, repo.name) },
                             onOpenSession = { s -> onOpenSession(agent.key, s.id) },
                             onSessionActions = { s -> onSessionActions(agent.key, s) },
                             onCancelQueued = { s -> onCancelQueued(agent.key, s) },
@@ -400,6 +416,10 @@ private fun RepoSection(
     onComposeSpawn: () -> Unit,
     onResume: () -> Unit,
     onPrune: () -> Unit,
+    hostOnline: Boolean,
+    canDelete: Boolean,
+    deleteRecord: com.xerktech.turma.model.RepoDeleteInfo?,
+    onDeleteRepo: () -> Unit,
     onOpenSession: (SessionInfo) -> Unit,
     onSessionActions: (SessionInfo) -> Unit,
     onCancelQueued: (SessionInfo) -> Unit,
@@ -420,7 +440,26 @@ private fun RepoSection(
                 IconButton(onClick = onComposeSpawn, modifier = Modifier.size(32.dp)) { Icon(Icons.Filled.Add, "New session", Modifier.size(18.dp)) }
             }
             if (repo.resumable.isNotEmpty()) GhostButton("Resume", onResume)
-            if (!repo.root) GhostButton("Prune", onPrune)
+            // Like web repoBlock: a command needs a live host to carry it.
+            if (com.xerktech.turma.core.RepoDelete.canPrune(hostOnline, repo)) GhostButton("Prune", onPrune)
+            if (canDelete) {
+                // Busy from the tap until the agent's own record says it's done
+                // (XERK-2675): a delete syncs then removes, minutes on a big repo.
+                val deleting = com.xerktech.turma.core.RepoDelete.busy(
+                    deleteRecord, pending[FleetViewModel.repoDeleteKey(hostKey, repo.name)] != null,
+                )
+                if (deleting) GhostButton("Deleting…", {}, enabled = false)
+                else GhostButton("Delete", onDeleteRepo)
+            }
+        }
+        com.xerktech.turma.core.RepoDelete.note(deleteRecord)?.let { note ->
+            Text(
+                note,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (deleteRecord?.status == "error") com.xerktech.turma.ui.theme.TurmaColors.critical
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 2.dp),
+            )
         }
         Column(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.padding(bottom = 4.dp)) {
             for (s in sessions) {
