@@ -435,11 +435,43 @@ test("attention: sleeping holds, review sorts oldest-waiting first with the why 
   assert.ok(els2.review.innerHTML.includes('<div class="why">stalled\u00a02m</div>'), els2.review.innerHTML);
   assert.ok(els2.review.innerHTML.includes('<span class="dot stalled"></span>'), els2.review.innerHTML);
   assert.ok(els2.review.innerHTML.includes('<div class="state stalled">stalled · Watch CI'), els2.review.innerHTML);
-  // Sleeping: Active, holding, "until HH:MM" — not Ready for review.
-  assert.ok(!r.includes("Asleep"));
-  assert.ok(a.includes("Asleep") && a.includes("💤 sleeping until " + hhmm), a);
+  // Sleeping: its own section below Idle (XERK-2704), holding, "until HH:MM" —
+  // neither Ready for review nor Active.
+  const z = els.sleeping.innerHTML;
+  assert.ok(!r.includes("Asleep"), r);
+  assert.ok(!a.includes("Asleep"), a);
+  assert.ok(z.includes('Sleeping <span class="count">1</span>'), z);
+  assert.ok(z.includes("Asleep") && z.includes("💤 sleeping until " + hhmm), z);
+  assert.ok(/state holding/.test(z), z);
   // …and what it will check then, when the session gave a reason.
-  assert.ok(a.includes("💤 sleeping until " + hhmm + " · check CI"), a);
+  assert.ok(z.includes("💤 sleeping until " + hhmm + " · check CI"), z);
+  // A wake already past is no longer sleeping: back to Ready for review/Idle.
+  const { render: render3, els: els3 } = loadPage();
+  const { now: n3, host: h3 } = host([
+    running("56666", "Woke Up", { paneBusy: false, transcriptAgeSec: 30, lastRole: "user", lastHasToolUse: false,
+      wakeAt: t - 1000 }),
+  ]);
+  render3({ now: n3, agents: [h3] });
+  assert.equal(els3.sleeping.innerHTML, "");
+  assert.ok(els3.idle.innerHTML.includes("Woke Up"), els3.idle.innerHTML);
+  // Only-sleeping fleet: the empty Active section points down at it.
+  const { render: render4, els: els4 } = loadPage();
+  const { now: n4, host: h4 } = host([
+    running("57777", "Dozing", { paneBusy: false, transcriptAgeSec: 30, wakeAt: t + 60 * 60 * 1000 }),
+  ]);
+  render4({ now: n4, agents: [h4] });
+  assert.ok(els4.active.innerHTML.includes("See Sleeping below."), els4.active.innerHTML);
+  assert.ok(els4.sleeping.innerHTML.includes("Dozing"));
+  // A sleeper whose pane is busy is working, not asleep: it stays in Active.
+  const { render: render5, els: els5 } = loadPage();
+  const { now: n5, host: h5 } = host([
+    running("58888", "Busy Sleeper", { paneBusy: true, transcriptAgeSec: 1, wakeAt: t + 60 * 60 * 1000 }),
+  ]);
+  render5({ now: n5, agents: [h5] });
+  assert.ok(els5.active.innerHTML.includes("Busy Sleeper"), els5.active.innerHTML);
+  assert.equal(els5.sleeping.innerHTML, "");
+  // The search overlay hides Sleeping like the other live sections.
+  assert.match(html, /body\.searching #sleeping\b/);
   // Waiting cards lead with the hourglass.
   assert.ok(a.includes("⏳ waiting · Watch CI"));
 });

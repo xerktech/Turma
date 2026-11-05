@@ -460,6 +460,7 @@
   #searchResults { display: none; }
   body.searching #searchResults { display: block; }
   body.searching #review, body.searching #active, body.searching #idle,
+  body.searching #sleeping,
   body.searching #ended, body.searching #spawn { display: none; }
   .sr-hint { color: var(--muted); font-size: 12px; padding: 6px 2px; }
   .sr-group { margin: 10px 0 4px; }
@@ -1280,6 +1281,7 @@
       <div id="review"></div>
       <div id="active"></div>
       <div id="idle"></div>
+      <div id="sleeping"></div>
       <div id="ended"></div>
     </aside>
 
@@ -1444,6 +1446,7 @@
 const $review = document.getElementById("review");
 const $active = document.getElementById("active");
 const $idle = document.getElementById("idle");
+const $sleeping = document.getElementById("sleeping");
 const $ended = document.getElementById("ended");
 const $spawn = document.getElementById("spawn");
 const $queued = document.getElementById("queued");
@@ -2796,6 +2799,9 @@ function render(data) {
   //   Idle             — quiet, and with nothing asking to be looked at:
   //                      a session whose PR already landed, or one that has
   //                      not produced anything yet.
+  //   Sleeping         — asleep until a session-CLI wake (XERK-2704): live and
+  //                      counted like any running session, just parked out of
+  //                      the way below Idle until it wakes itself.
   //
   // All three are live, attachable sessions rendered with the same card;
   // collect() already sorted `running` by a stable key, and filtering preserves
@@ -2805,7 +2811,9 @@ function render(data) {
   const review = [], rest = [];
   for (const x of running) (inReview(x) ? review : rest).push(x);
   review.sort(bySince);
-  const active = rest.filter(x => x.live.kind !== "idle");
+  const asleep = (x) => x.live.kind === "holding" && sleepingUntil(x.s.session, now);
+  const sleeping = rest.filter(asleep);
+  const active = rest.filter(x => x.live.kind !== "idle" && !asleep(x));
   const idle = rest.filter(x => x.live.kind === "idle");
 
   const hosts = agents.filter(a => a.online && (a.repos || []).length);
@@ -2850,11 +2858,19 @@ function render(data) {
       : `<div class="empty" style="padding:28px 0">No active sessions.${
           review.length ? " See Ready for review above."
             : idle.length ? " See Idle below."
+            : sleeping.length ? " See Sleeping below."
             : hosts.length ? " Start one above." : ""}</div>`);
 
   $idle.innerHTML = idle.length
     ? `<h2>Idle <span class="count">${idle.length}</span></h2>
        <div class="s-list">${idle.map(x => activeCard(x)).join("")}</div>`
+    : "";
+
+  // Sleeping (XERK-2704): sessions waiting on a session-CLI wake, out of the way
+  // below Idle. Hidden when empty, like Idle.
+  $sleeping.innerHTML = sleeping.length
+    ? `<h2>Sleeping <span class="count">${sleeping.length}</span></h2>
+       <div class="s-list">${sleeping.map(x => activeCard(x)).join("")}</div>`
     : "";
 
   // Ended sessions: collapsed by default (they're history, not the work at

@@ -340,8 +340,11 @@ words its stage "Queued — <reason>", flipping live once provisioned. Tests: `s
   `sessions.test.js`, `readyForReview` in `server.test.js`.
 - **Where the hub serves attention, IT decides the section — every `needs-you:*` session (question,
   permission, review, stalled), oldest `since` first, each with a `.why` line; `readyForReview`
-  decides only from an older hub. A sleeping session holds in Active** (XERK-1571) —
-  `turma-attention.md`.
+  decides only from an older hub.** `turma-attention.md`.
+- **A sleeping session (session-CLI `wakeAt` ahead) gets its own Sleeping section, below Idle**
+  (XERK-2704; Android `LiveGroups.sleeping`). Presentational only: it is still a running session
+  that holds its slot and counts everywhere, and a needs-you sleeper still lists in Ready for review.
+  A background-shell wait (`holding` without `wakeAt`) stays in Active.
 
 ### Ended sessions
 

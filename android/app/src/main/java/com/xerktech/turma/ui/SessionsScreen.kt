@@ -272,6 +272,8 @@ data class LiveGroups(
     val review: List<RankedSession>,
     val active: List<RankedSession>,
     val idle: List<RankedSession>,
+    /** Asleep until a session-CLI wake (XERK-2704) — parked below Idle. */
+    val sleeping: List<RankedSession> = emptyList(),
 )
 
 /**
@@ -300,12 +302,19 @@ fun rankRunning(rows: List<FlatSession>, now: Long): LiveGroups {
     val (review, rest) = running.partition {
         com.xerktech.turma.core.inReview(it.flat.session, it.state, it.flat.hostLastSeen, now)
     }
+    // Sleeping (XERK-2704): a holding session whose session-CLI wake is still
+    // ahead gets its own section below Idle, out of the way until it wakes.
+    val asleep = { r: RankedSession ->
+        r.state == com.xerktech.turma.core.LiveState.HOLDING &&
+            com.xerktech.turma.core.sessionSleeping(r.flat.session, now)
+    }
     return LiveGroups(
         // Oldest-waiting first by the hub's attention `since` (XERK-1571); it
         // moves only when a card ENTERS the group, so it does not reshuffle per beat.
         review = com.xerktech.turma.core.sortedBySince(review) { it.flat.session.attention },
-        active = rest.filter { it.state != com.xerktech.turma.core.LiveState.IDLE },
+        active = rest.filter { it.state != com.xerktech.turma.core.LiveState.IDLE && !asleep(it) },
         idle = rest.filter { it.state == com.xerktech.turma.core.LiveState.IDLE },
+        sleeping = rest.filter(asleep),
     )
 }
 
@@ -578,7 +587,7 @@ fun SessionsListPane(
     // The live sessions split into the web's Ready-for-review / Active / Idle
     // sections, each in a stable newest-created order (see rankRunning).
     val groups = remember(lists, now) { rankRunning(lists.running, now) }
-    val (review, active, idle) = groups
+    val (review, active, idle, sleeping) = groups
     val queued = lists.queued
     val ended = lists.ended
     var endedOpen by rememberSaveable { mutableStateOf(false) }
@@ -670,6 +679,7 @@ fun SessionsListPane(
                             when {
                                 review.isNotEmpty() -> "No active sessions. See Ready for review above."
                                 idle.isNotEmpty() -> "No active sessions. See Idle below."
+                                sleeping.isNotEmpty() -> "No active sessions. See Sleeping below."
                                 else -> "No active sessions."
                             },
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -695,6 +705,22 @@ fun SessionsListPane(
             if (idle.isNotEmpty()) {
                 item(key = "idle-header") { SectionLabel("Idle (${idle.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
                 items(idle, key = { "i:" + it.flat.host + "/" + it.flat.session.id }) { r ->
+                    SessionListCard(
+                        r.flat, now,
+                        tint = hostTint[r.flat.host],
+                        selected = selectedKey == r.flat.host + "/" + r.flat.session.id,
+                        moveTargets = eligibleMoveTargets(fleet.agents, r.flat.host, r.flat.session),
+                        onKill = { vm.kill(r.flat.host, r.flat.session.id) },
+                        onRename = { name -> vm.setSummary(r.flat.host, r.flat.session.id, name) },
+                        onMove = { target -> vm.migrate(r.flat.host, r.flat.session.id, target) },
+                        onClick = { onSelect(r.flat.host, r.flat.session.id) },
+                    )
+                }
+            }
+            // Sleeping (XERK-2704): waiting on a session-CLI wake — shown only when non-empty.
+            if (sleeping.isNotEmpty()) {
+                item(key = "sleeping-header") { SectionLabel("Sleeping (${sleeping.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
+                items(sleeping, key = { "z:" + it.flat.host + "/" + it.flat.session.id }) { r ->
                     SessionListCard(
                         r.flat, now,
                         tint = hostTint[r.flat.host],
