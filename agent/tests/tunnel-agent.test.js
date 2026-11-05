@@ -1582,6 +1582,58 @@ function scanAll(entries, state) {
   return st;
 }
 
+// XERK-2707 (twin of TestLiveAgentsScan's resume cases): a qa-delta re-pass
+// resumes the SAME agent with SendMessage — `resumedAgentId`, no
+// `async_launched`, and the previous run's notification already stopped it.
+const RESUME_ENTRIES = [
+  { type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_r", name: "SendMessage",
+    input: { to: "agent-1", summary: "Re-QA", message: "..." } }] } },
+  { type: "user", timestamp: "2026-10-03T12:05:00.000Z",
+    message: { content: [{ type: "tool_result", tool_use_id: "toolu_r", content: "Resuming agent agent-1" }] },
+    toolUseResult: { success: true, message: "Resuming agent agent-1", resumedAgentId: "agent-1" } },
+];
+
+test("scanAgentEntry: a SendMessage-resumed agent is live again until its next stop", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const launch = JSON.parse(JSON.stringify(LAUNCH_ENTRIES));
+  launch[0].message.content[0].input.subagent_type = "qa-delta";
+  let st = scanAll([...launch, notif("agent-1", "completed")]);
+  assert.deepEqual(liveAgentsReport(st), []);
+  st = scanAll(RESUME_ENTRIES, st);
+  assert.deepEqual(liveAgentsReport(st), [{ type: "qa-delta", label: "QA the parity change",
+    startedAt: Date.UTC(2026, 9, 3, 12, 5) }]);
+  // The resumed run's own notification (each run's body differs).
+  st = scanAll([notif("agent-1", "failed")], st);
+  assert.deepEqual(liveAgentsReport(st), []);
+  // An unseen agent's resume still counts; a failed one does not; a live one keeps its row.
+  assert.deepEqual(liveAgentsReport(scanAll(RESUME_ENTRIES)).map((r) => [r.type, r.label]), [["agent", ""]]);
+  const failed = [{ ...RESUME_ENTRIES[1], toolUseResult: { success: false, resumedAgentId: "agent-9" } }];
+  assert.deepEqual(liveAgentsReport(scanAll(failed)), []);
+  // A late dequeue COPY of run k's notification (queue `remove`, user turn)
+  // after the resume does not retire the resumed run; a fresh enqueue does,
+  // even byte-identical (a second restart's `stopped`).
+  const done = notif("agent-1", "completed");
+  st = scanAll([...LAUNCH_ENTRIES, done, ...RESUME_ENTRIES, { ...done, operation: "remove" },
+    notif("agent-1", "completed", "user")]);
+  assert.equal(liveAgentsReport(st).length, 1);
+  st = scanAll([done], st);
+  assert.deepEqual(liveAgentsReport(st), []);
+  const stoppedN = notif("agent-1", "stopped");
+  st = scanAll([...LAUNCH_ENTRIES, stoppedN, { ...stoppedN, operation: "remove" }, ...RESUME_ENTRIES, stoppedN]);
+  assert.deepEqual(liveAgentsReport(st), []);
+  // A copy from two runs back (QA delta 3, case 12) stays stale.
+  st = scanAll([...LAUNCH_ENTRIES, done, ...RESUME_ENTRIES, notif("agent-1", "failed"), ...RESUME_ENTRIES,
+    { ...done, operation: "remove" }]);
+  assert.equal(liveAgentsReport(st).length, 1);
+  // Pinned to py's _tn_fingerprint (the snapshot carries these).
+  assert.equal(require("../tunnel-agent.js").tnFingerprint("<task-notification>lone \ud83d trunc</task-notification>"),
+    require("../tunnel-agent.js").tnFingerprint("<task-notification>lone \ufffd trunc</task-notification>"));
+  st = scanAll(LAUNCH_ENTRIES);
+  const before = { ...st.live.get("agent-1") };
+  scanAll(RESUME_ENTRIES, st);
+  assert.deepEqual(st.live.get("agent-1"), before);
+});
+
 test("scanAgentEntry: a launch makes an agent live, named by its own record", () => {
   const { liveAgentsReport } = require("../tunnel-agent.js");
   assert.deepEqual(liveAgentsReport(scanAll(LAUNCH_ENTRIES)),
@@ -3120,6 +3172,23 @@ test("backscanLiveAgents: a stop in the lead-in before the window still wins", (
   const leadState = { live: new Map(), tasks: new Map() };
   mod.backscanLiveAgents(early, leadState, eb.length - (eb.indexOf("backgroundTaskId") + 600));
   assert.deepEqual(mod.liveAgentsReport(leadState), []);
+
+  // XERK-2707: a launch in the lead-in still names a resume inside the window.
+  const agentLaunch = JSON.parse(JSON.stringify(LAUNCH_ENTRIES));
+  agentLaunch[0].message.content[0].input.subagent_type = "qa";
+  const rp = path.join(dir, "resume.jsonl");
+  fs.writeFileSync(rp, [pad, ...agentLaunch, notif("agent-1", "completed"), pad, pad, pad,
+    ...RESUME_ENTRIES].map((e) => JSON.stringify(e)).join("\n") + "\n");
+  const rb = fs.readFileSync(rp, "utf8");
+  const rs = { live: new Map(), tasks: new Map() };
+  mod.backscanLiveAgents(rp, rs, rb.length - (rb.indexOf("<status>completed") + 600));
+  assert.deepEqual(mod.liveAgentsReport(rs).map((r) => [r.type, r.label]), [["qa", "QA the parity change"]]);
+  // ...and the lead-in's enqueue marks the resume's late copy as stale.
+  fs.appendFileSync(rp, JSON.stringify({ ...notif("agent-1", "completed"), operation: "remove" }) + "\n");
+  const rb2 = fs.readFileSync(rp, "utf8");
+  const rs2 = { live: new Map(), tasks: new Map() };
+  mod.backscanLiveAgents(rp, rs2, rb2.length - (rb2.indexOf("<status>completed") + 600));
+  assert.equal(mod.liveAgentsReport(rs2).length, 1);
 });
 
 // XERK-1587: a watch seeds from the manager's published live-agent scan, so a
@@ -3146,6 +3215,26 @@ test("restoreLiveAgents: seeds from the manager's snapshot and folds the gap", (
   st = fresh();
   assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
   assert.deepEqual(mod.liveAgentsReport(st), [{ type: "shell", label: "Watch CI", kind: "wait-external" }]);
+
+  // XERK-2707: the snapshot's launch map relists a resumed agent's own row; a
+  // snapshot without one (older manager) still restores.
+  snap({ liveAgents: {}, stoppedAgents: ["agent-1"],
+         agentRuns: { "agent-1": { type: "qa-delta", label: "QA the parity change" } } });
+  const resumeAt = fs.statSync(p).size;
+  fs.appendFileSync(p, RESUME_ENTRIES.map((e) => JSON.stringify(e) + "\n").join(""));
+  st = fresh();
+  assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
+  assert.deepEqual(mod.liveAgentsReport(st).map((r) => [r.type, r.label]), [["qa-delta", "QA the parity change"]]);
+  // A late copy of a notification the snapshot holds as enqueued-not-dequeued
+  // does not retire the resumed run.
+  const doneText = notif("agent-1", "completed").content;
+  snap({ liveAgents: {}, stoppedAgents: ["agent-1"], stopQueued: { "agent-1": [mod.tnFingerprint(doneText)] } });
+  fs.appendFileSync(p, JSON.stringify({ type: "queue-operation", operation: "remove", content: doneText }) + "\n");
+  st = fresh();
+  assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
+  assert.equal(mod.liveAgentsReport(st).length, 1);
+  fs.truncateSync(p, resumeAt);
+  snap();
 
   // A stop written after the snapshot's offset is applied.
   fs.appendFileSync(p, JSON.stringify({ type: "queue-operation", operation: "enqueue", content:

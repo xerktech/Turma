@@ -33,6 +33,20 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
 - **It comes from the TRANSCRIPT** (`_scan_agent_entry`/`scanAgentEntry`: the structured launch
   record, `<task-notification>`/`TaskStop` on stop), **never from the TUI's footer rows** — those
   are forgeable pane content and linger ~24s past completion. Mechanics: `agent.md`.
+- **A `SendMessage` RESUME is a launch too** (XERK-2707): `{success:true, resumedAgentId}` (the
+  usual qa-delta re-pass) has no `async_launched`, and its id is already in `stoppedAgents` from
+  the previous run. It drops that stop and relists the launch's own row (`agentRuns`, id →
+  {type,label}, carried in the snapshot); the resumed run notifies again under the same id.
+  - Missing it read the session idle for the whole re-pass. Tests: the `resume` cases in
+    `TestLiveAgentsScan`, `a SendMessage-resumed agent` in `tunnel-agent.test.js`.
+  - **A dequeue COPY of the previous run never retires the resumed one** (`stopQueued`/`stopStale`,
+    `_tn_fingerprint`/`tnFingerprint`). Every notification is first a queue `enqueue` (3208/3208
+    on a real host), then a `remove` or user-turn copy; a resume marks its enqueued-not-dequeued
+    ones stale, and their copies landing after it are skipped.
+  - A fresh `enqueue` ALWAYS counts — never dedupe stops by body: a second restart's `stopped`
+    repeats the first byte for byte. Back-scan residual: a stale enqueue outside window + lead-in.
+  - Accepted gap: a message "queued for delivery" to an agent that finishes first resumes it
+    with no transcript record, so that run reads idle.
 
 ## The published live-agent set survives a restart (XERK-1587)
 

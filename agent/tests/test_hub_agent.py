@@ -1757,6 +1757,19 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         # The bounded back-scan alone (no snapshot) misses it — the bug.
         self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"], [])
 
+    def test_a_resume_after_a_restart_keeps_the_launch_row(self):
+        # XERK-2707: the launch→{type,label} map rides the snapshot, so a resume
+        # past the back-scan window still relists the launch's own row.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, TASK_LAUNCH_ENTRIES + [TestLiveAgentsScan.DONE_1])
+        state = {}
+        self._report(state)
+        self._chatter(path)
+        self._report(state)
+        self._append(path, TestLiveAgentsScan.RESUME)
+        self.assertEqual([(r["type"], r["label"]) for r in self._report({})["agents"]],
+                         [("agent", "QA the parity change")])
+
     def test_a_stop_written_while_the_manager_was_down_is_applied(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, SHELL_LAUNCH_ENTRIES)
@@ -1933,6 +1946,68 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         cut = body.index(b"backgroundTaskId") + 200
         with mock.patch.object(ha, "AGENT_BACKSCAN_BYTES", len(body) - cut):
             self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"], [])
+
+    def test_a_resume_relists_a_launch_that_sits_in_the_lead_in(self):
+        # XERK-2707: the lead-in contributes the launch's {type,label} (and its
+        # stop), so a resume inside the window relists the launch's own row.
+        path = os.path.join(self.proj, "s.jsonl")
+        launch = json.loads(json.dumps(TASK_LAUNCH_ENTRIES))
+        launch[0]["message"]["content"][0]["input"]["subagent_type"] = "qa"
+        pad = {"type": "user", "message": {"content": "x" * 1000}}
+        write_jsonl(path, [pad] + launch + [TestLiveAgentsScan.DONE_1] + [pad] * 3
+                    + TestLiveAgentsScan.RESUME)
+        with open(path, "rb") as f:
+            body = f.read()
+        cut = body.index(b"<status>completed") + 600
+        with mock.patch.object(ha, "AGENT_BACKSCAN_BYTES", len(body) - cut):
+            self.assertEqual(
+                [(r["type"], r["label"]) for r in ha.session_report(self.WORKDIR, {})["agents"]],
+                [("qa", "QA the parity change")])
+
+
+    def test_a_stale_copy_is_known_from_an_enqueue_in_the_lead_in(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        pad = {"type": "user", "message": {"content": "x" * 1000}}
+        write_jsonl(path, [pad] + TASK_LAUNCH_ENTRIES + [TestLiveAgentsScan.DONE_1] + [pad] * 3
+                    + TestLiveAgentsScan.RESUME
+                    + [dict(TestLiveAgentsScan.DONE_1, operation="remove")])
+        with open(path, "rb") as f:
+            body = f.read()
+        cut = body.index(b"<status>completed") + 600
+        with mock.patch.object(ha, "AGENT_BACKSCAN_BYTES", len(body) - cut):
+            self.assertEqual(len(ha.session_report(self.WORKDIR, {})["agents"]), 1)
+
+    def test_tn_fingerprint_hashes_a_lone_surrogate_as_js_does(self):
+        # Pinned to node's crypto over U+FFFD (js reads py's snapshot).
+        self.assertEqual(
+            ha._tn_fingerprint("<task-notification>lone \ud83d trunc</task-notification>"),
+            ha._tn_fingerprint("<task-notification>lone \ufffd trunc</task-notification>"))
+
+    def test_a_stale_copy_after_a_restart_still_does_not_retire_the_resumed_run(self):
+        # The enqueued-not-dequeued fingerprints ride the snapshot, so a resume
+        # and its late copy written while the manager was down still hold.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, TASK_LAUNCH_ENTRIES + [TestLiveAgentsScan.DONE_1])
+        state = {}
+        self._report(state)
+        self._chatter(path)
+        self._report(state)
+        self._append(path, TestLiveAgentsScan.RESUME
+                     + [dict(TestLiveAgentsScan.DONE_1, operation="remove")])
+        self.assertEqual(len(self._report({})["agents"]), 1)
+
+    def test_a_restored_snapshot_dedupes_its_stops(self):
+        # A session-writable snapshot listing one stop twice must not outlast a
+        # resume (QA: the JS Set and the py list disagreed).
+        path, _ = self._launch_then_restart()
+        snap = os.path.join(ha.LIVE_AGENTS_DIR, f"{self.SID}.json")
+        with open(snap) as f:
+            body = json.load(f)
+        body.update(liveAgents={}, stoppedAgents=["agent-1", "agent-1"])
+        with open(snap, "w") as f:
+            json.dump(body, f)
+        self._append(path, TestLiveAgentsScan.RESUME)
+        self.assertIn("agent", [r["type"] for r in self._report({})["agents"]])
 
     def test_the_back_scan_window_skips_its_cut_line(self):
         path = os.path.join(self.proj, "s.jsonl")
@@ -4725,6 +4800,84 @@ class TestLiveAgentsScan(unittest.TestCase):
         self.assertEqual(ha.live_agents_report(st),
                          [{"type": "agent", "label": "QA the parity change"}])
 
+
+    # XERK-2707: a qa-delta re-pass resumes the SAME agent with SendMessage. Its
+    # result carries `resumedAgentId`, no `async_launched`, and the previous
+    # run's notification has already stopped that id.
+    RESUME = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_r", "name": "SendMessage",
+             "input": {"to": "agent-1", "summary": "Re-QA", "message": "..."}}]}},
+        {"type": "user", "timestamp": "2026-10-03T12:05:00.000Z",
+         "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_r",
+                                  "content": "Resuming agent agent-1"}]},
+         "toolUseResult": {"success": True, "message": "Resuming agent agent-1",
+                           "resumedAgentId": "agent-1"}},
+    ]
+    DONE_1 = {"type": "queue-operation", "operation": "enqueue",
+              "content": "<task-notification>\n<task-id>agent-1</task-id>\n"
+                         "<status>completed</status>\n</task-notification>"}
+
+    def test_a_resumed_agent_is_live_again_until_its_next_stop(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.DONE_1])
+        self.assertEqual(ha.live_agents_report(st), [])
+        st = self._scan(self.RESUME, st)
+        # The row the launch built: its type and description, not "agent"/"".
+        self.assertEqual(ha.live_agents_report(st), [
+            {"type": "agent", "label": "QA the parity change",
+             "startedAt": ha._ts_ms("2026-10-03T12:05:00.000Z")}])
+        self.assertEqual(st["liveAgents"]["agent-1"]["resolveId"], "agent-1")
+        # The resumed run's own notification (each run's body differs).
+        st = self._scan([dict(self.DONE_1, content=self.DONE_1["content"].replace(
+            "</status>", "</status>\n<summary>pass 2</summary>"))], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_resume_keeps_the_launch_type(self):
+        launch = json.loads(json.dumps(TASK_LAUNCH_ENTRIES))
+        launch[0]["message"]["content"][0]["input"]["subagent_type"] = "qa-delta"
+        st = self._scan(launch + [self.DONE_1] + self.RESUME)
+        self.assertEqual([r["type"] for r in ha.live_agents_report(st)], ["qa-delta"])
+
+    def test_a_resume_of_an_unseen_agent_still_counts_and_a_failed_one_does_not(self):
+        st = self._scan(self.RESUME)
+        self.assertEqual([(r["type"], r["label"]) for r in ha.live_agents_report(st)],
+                         [("agent", "")])
+        failed = [dict(self.RESUME[1], toolUseResult={
+            "success": False, "message": "no", "resumedAgentId": "agent-9"})]
+        self.assertEqual(ha.live_agents_report(self._scan(failed)), [])
+
+    def test_a_late_copy_of_the_previous_stop_does_not_retire_the_resumed_run(self):
+        # Real order (QA, 1 of 61 resumes): run k's notification is enqueued,
+        # the session resumes, THEN its dequeue copies (the queue `remove`, a
+        # user turn) land. Only a fresh enqueue stops the resumed run.
+        remove = dict(self.DONE_1, operation="remove")
+        user = {"type": "user", "message": {"content": self.DONE_1["content"]}}
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.DONE_1] + self.RESUME + [remove, user])
+        self.assertEqual(len(ha.live_agents_report(st)), 1)
+        # Its own notification may repeat the previous body byte for byte (a
+        # `stopped` from a second restart carries no usage): an enqueue counts.
+        st = self._scan([self.DONE_1], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_copy_from_two_runs_back_does_not_retire_the_current_run(self):
+        # QA (delta 3, case 12): E(r1), resume, E(r2), resume, then r1's copy.
+        r2 = dict(self.DONE_1, content=self.DONE_1["content"].replace("completed", "failed"))
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.DONE_1] + self.RESUME + [r2] + self.RESUME
+                        + [dict(self.DONE_1, operation="remove")])
+        self.assertEqual(len(ha.live_agents_report(st)), 1)
+
+    def test_a_second_restart_s_identical_stop_retires_the_resumed_run(self):
+        # QA (delta 2): launch, stopped, resume, the SAME stopped body again.
+        stopped = dict(self.DONE_1, content=self.DONE_1["content"].replace("completed", "stopped"))
+        st = self._scan(TASK_LAUNCH_ENTRIES + [stopped, dict(stopped, operation="remove")]
+                        + self.RESUME + [stopped])
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_resume_of_a_live_agent_keeps_its_row(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES)
+        before = dict(st["liveAgents"]["agent-1"])
+        st = self._scan(self.RESUME, st)
+        self.assertEqual(st["liveAgents"]["agent-1"], before)
 
     def test_a_background_shell_is_live_work(self):
         # The TUI footer says "1 shell" while the session otherwise reads idle.

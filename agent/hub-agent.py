@@ -12214,6 +12214,15 @@ def _async_launch(entry):
     if isinstance(tur.get("backgroundTaskId"), str) and tur["backgroundTaskId"]:
         return {"id": tur["backgroundTaskId"], "type": "shell", "label": "",
                 "resolveId": ""}
+    # A background agent RESUMED by `SendMessage` (XERK-2707) — the usual way a
+    # session runs its next qa-delta pass. Its result carries no
+    # `async_launched`, only `resumedAgentId`, and that id is already stopped by
+    # the previous run's notification; the resumed run notifies again when it
+    # ends, under the same id. A structured field, like the launch record.
+    resumed = tur.get("resumedAgentId")
+    if tur.get("success") is True and isinstance(resumed, str) and resumed:
+        return {"id": resumed, "type": "agent", "label": "", "resolveId": resumed,
+                "resumed": True}
     if tur.get("status") != "async_launched":
         return None
     ident = tur.get("agentId") or tur.get("taskId")
@@ -12236,6 +12245,18 @@ def _async_launch(entry):
             "resolveId": str(ident)}
 
 
+def _tn_fingerprint(text):
+    """A short digest of one `<task-notification>`'s body, or None — what ties a
+    queue `remove`/user-turn COPY to the `enqueue` it dequeues (XERK-2707).
+    Mirror of tunnel-agent.js tnFingerprint, which hashes a lone surrogate as
+    U+FFFD (node's utf8 encoder); so does this, since js reads py's snapshot."""
+    m = TASK_NOTIFICATION_RE.match(text or "")
+    if not m:
+        return None
+    body = m.group(1).encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    return hashlib.sha1(body.encode("utf-8")).hexdigest()[:16]
+
+
 def _scan_agent_entry(entry, state):
     """Fold one transcript entry into `state["liveAgents"]` ({id: {type,label}}).
 
@@ -12248,6 +12269,19 @@ def _scan_agent_entry(entry, state):
     tasks = state.setdefault("agentTasks", {})
     shells = state.setdefault("shellCalls", {})
     stopped = state.setdefault("stoppedAgents", [])
+    # Each agent launch's {type, label}, by its id, so a later resume of it
+    # (XERK-2707) relists the row the launch built.
+    runs = state.setdefault("agentRuns", {})
+    # XERK-2707: Claude Code writes every notification first as a queue
+    # `enqueue` (3208/3208 on a real host), then a `remove` or user-turn COPY
+    # as it is dequeued. `stopQueued` = id -> fingerprints enqueued and not yet
+    # dequeued; a resume moves them to `stopStale`, whose copies landing after
+    # the resume belong to the PREVIOUS run and must not retire the new one.
+    # A fresh enqueue always counts, even byte-identical (a second restart's
+    # `stopped` body repeats the first's exactly), and a stale copy after it is
+    # harmless: the run is already stopped.
+    queued = state.setdefault("stopQueued", {})
+    stale = state.setdefault("stopStale", {})
     msg = entry.get("message") if isinstance(entry, dict) else None
     content = msg.get("content") if isinstance(msg, dict) else None
     if isinstance(content, list):
@@ -12284,6 +12318,20 @@ def _scan_agent_entry(entry, state):
     if launch and launch["type"] == "shell" \
             and sum(1 for a in live.values() if a.get("type") == "shell") >= LIVE_AGENTS_MAX // 2:
         launch = None
+    if launch and launch.get("resumed"):
+        # A resume starts a NEW run of an agent whose previous run stopped, so
+        # that stop no longer wins; an agent still live keeps its row.
+        if launch["id"] in live:
+            launch = None
+        else:
+            if launch["id"] in stopped:
+                stopped.remove(launch["id"])
+            if queued.get(launch["id"]):
+                # MERGED, never replaced: a copy from two runs back is stale too.
+                stale[launch["id"]] = (stale.pop(launch["id"], [])
+                                       + queued.pop(launch["id"]))[-4:]
+                while len(stale) > LIVE_AGENTS_MAX * 4:
+                    stale.pop(next(iter(stale)))
     if launch and len(live) < LIVE_AGENTS_MAX:
         # A notification can be WRITTEN BEFORE the launch it refers to (observed:
         # the queued copy lands at an earlier file offset than the launch, with a
@@ -12316,11 +12364,21 @@ def _scan_agent_entry(entry, state):
                     eta = started + int(math.floor(secs * 1000 + 0.5))   # = JS Math.round
                     if eta <= _MAX_SAFE_INT:
                         row["eta"] = eta
+            elif launch.get("resumed"):
+                prev = runs.get(launch["id"]) or {}
+                row = {"type": prev.get("type") or launch["type"],
+                       "label": prev.get("label") or "",
+                       "resolveId": launch["resolveId"]}
+                started = launched_at
             else:
                 row = {"type": tasks.get(tool_id) or launch["type"],
                        "label": launch["label"],
                        "resolveId": launch.get("resolveId") or ""}
                 started = launched_at
+            if launch["type"] != "shell":
+                runs[launch["id"]] = {"type": row["type"], "label": row["label"]}
+                while len(runs) > LIVE_AGENTS_MAX * 4:
+                    runs.pop(next(iter(runs)))
             if started is not None:
                 row["startedAt"] = started
             live[launch["id"]] = row
@@ -12335,7 +12393,24 @@ def _scan_agent_entry(entry, state):
             if not tn or not tn.get("taskIds"):
                 continue
             if not tn.get("status") or tn["status"] in AGENT_DONE_STATUSES:
-                done.extend(tn["taskIds"])
+                fp = _tn_fingerprint(text)
+                fresh = entry.get("type") == "queue-operation" \
+                    and entry.get("operation") == "enqueue"
+                for tid in tn["taskIds"]:
+                    if fresh:   # the new run's own stop; never clears `stale`
+                        q = queued.pop(tid, None) or []
+                        queued[tid] = (q + [fp])[-4:]
+                        while len(queued) > LIVE_AGENTS_MAX * 4:
+                            queued.pop(next(iter(queued)))
+                    else:
+                        q = queued.get(tid)
+                        if q and fp in q:
+                            q.remove(fp)
+                            if not q:
+                                queued.pop(tid, None)
+                        if fp in (stale.get(tid) or ()):
+                            continue   # the previous run's copy
+                    done.append(tid)
         # The THIRD stop edge: a `TaskStop` the session ran itself. Its
         # structured result names the task, and no notification follows it, so
         # without this a stopped shell (or agent) stays live until restart.
@@ -12562,6 +12637,11 @@ def _backscan_live_agents(path, state):
                 t for t in lead_in.get("stoppedAgents", [])
                 if t not in state.get("stoppedAgents", []))
             del state["stoppedAgents"][:-LIVE_AGENTS_MAX * 4]
+            # A launch there is not live, but a resume of it later still
+            # relists its type and label (XERK-2707).
+            state.setdefault("agentRuns", {}).update(lead_in.get("agentRuns") or {})
+            for key in ("stopQueued", "stopStale"):
+                state.setdefault(key, {}).update(lead_in.get(key) or {})
             lead_in = {}
         _scan_agent_entry(entry, state)
     nl = raw.rfind(b"\n")
@@ -12600,6 +12680,9 @@ def _publish_live_agents(session_id, path, offset, state):
         return
     body = {k: state.get(k) or {} for k in _LIVE_SNAPSHOT_MAPS}
     body["stoppedAgents"] = list(state.get("stoppedAgents") or [])
+    body["agentRuns"] = dict(state.get("agentRuns") or {})
+    body["stopQueued"] = dict(state.get("stopQueued") or {})
+    body["stopStale"] = dict(state.get("stopStale") or {})
     # The QA scan rides the same offset (XERK-1857): `qa` says this manager's
     # scan saw the whole transcript up to it, and `qaCalls` the launches still
     # awaiting a result, so a restart folds the gap instead of going partial.
@@ -12703,7 +12786,18 @@ def _restore_live_agents(session_id, path, state, report=None):
     state["liveAgents"] = live
     state["agentTasks"] = {str(k): v for k, v in maps[1].items() if isinstance(v, str)}
     state["shellCalls"] = {str(k): v for k, v in maps[2].items() if isinstance(v, dict)}
-    state["stoppedAgents"] = [t for t in stopped if isinstance(t, str)][-LIVE_AGENTS_MAX * 4:]
+    state["stoppedAgents"] = list(dict.fromkeys(
+        t for t in stopped if isinstance(t, str)))[-LIVE_AGENTS_MAX * 4:]
+    for key in ("stopQueued", "stopStale"):   # optional: absent before XERK-2707
+        m = snap.get(key) if isinstance(snap.get(key), dict) else {}
+        state[key] = dict(list(
+            (str(k), [f for f in v if isinstance(f, str)][-4:])
+            for k, v in m.items() if isinstance(v, list))[-LIVE_AGENTS_MAX * 4:])
+    # Optional: a snapshot written before XERK-2707 has none.
+    runs = snap.get("agentRuns") if isinstance(snap.get("agentRuns"), dict) else {}
+    state["agentRuns"] = {str(k): {"type": r["type"], "label": r["label"]}
+                          for k, r in ((k, _snapshot_row(v)) for k, v in runs.items())
+                          if r}
     qa = report is not None and snap.get("qa") is True and isinstance(snap.get("qaCalls"), dict)
     if qa:
         # Launches still awaiting a result when it was written; the record
