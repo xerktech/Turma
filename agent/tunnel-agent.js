@@ -1588,7 +1588,7 @@ function scanAgentEntry(entry, state) {
     const resumedAt = tsMs(entry.timestamp);
     if (live.has(launch.id)) launch = null;
     // This run's own stop already landed (written early): stays stopped.
-    else if (own != null && resumedAt != null && own > resumedAt) launch = null;
+    else if (own != null && resumedAt != null && own >= resumedAt) launch = null;
     else {
       stopped.delete(launch.id);
       if ((queued.get(launch.id) || []).length) {

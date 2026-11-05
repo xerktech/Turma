@@ -12284,8 +12284,9 @@ def _scan_agent_entry(entry, state):
     stale = state.setdefault("stopStale", {})
     # XERK-2708: id -> the newest timestamp (epoch ms) of a fresh stop
     # `enqueue`. A resume whose run already stopped (its notification written at
-    # an EARLIER offset than the resume record, with a LATER timestamp) must
-    # not register, or it stays live forever.
+    # an EARLIER offset than the resume record, with a LATER or equal
+    # timestamp) must not register, or it stays live forever. Only an enqueue
+    # sets it: a dequeue copy of the previous run lands after the resume.
     stop_at = state.setdefault("stopAt", {})
     msg = entry.get("message") if isinstance(entry, dict) else None
     content = msg.get("content") if isinstance(msg, dict) else None
@@ -12330,7 +12331,7 @@ def _scan_agent_entry(entry, state):
         resumed_at = _ts_ms(entry.get("timestamp"))
         if launch["id"] in live:
             launch = None
-        elif own is not None and resumed_at is not None and own > resumed_at:
+        elif own is not None and resumed_at is not None and own >= resumed_at:
             # This run's own stop already landed (written early): stays stopped.
             launch = None
         else:
@@ -12812,9 +12813,11 @@ def _restore_live_agents(session_id, path, state, report=None):
             for k, v in m.items() if isinstance(v, list))[-LIVE_AGENTS_MAX * 4:])
     # Optional: absent before XERK-2708. Positive safe integers only.
     stop_at = snap.get("stopAt") if isinstance(snap.get("stopAt"), dict) else {}
+    # An integral float counts, as JS's JSON.parse reads it (1e3 is 1000).
     state["stopAt"] = dict(list(
-        (str(k), v) for k, v in stop_at.items()
-        if isinstance(v, int) and not isinstance(v, bool) and 0 < v <= _MAX_SAFE_INT
+        (str(k), int(v)) for k, v in stop_at.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+        and (not isinstance(v, float) or v.is_integer()) and 0 < v <= _MAX_SAFE_INT
     )[-LIVE_AGENTS_MAX * 4:])
     # Optional: a snapshot written before XERK-2707 has none.
     runs = snap.get("agentRuns") if isinstance(snap.get("agentRuns"), dict) else {}

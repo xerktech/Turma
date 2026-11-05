@@ -1785,13 +1785,15 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         with open(snap) as f:
             body = json.load(f)
         self.assertEqual(body["stopAt"], {"agent-1": ha._ts_ms(own["timestamp"])})
-        body["stopAt"].update({"bad": "x", "neg": -1, "flag": True})
+        body["stopAt"].update({"bad": "x", "neg": -1, "flag": True, "half": 1.5,
+                               "flt": 1000.0})
         with open(snap, "w") as f:
             json.dump(body, f)
         self._append(path, TestLiveAgentsScan.RESUME)
         fresh = {}
         self.assertEqual(self._report(fresh)["agents"], [])
-        self.assertEqual(set(fresh["stopAt"]), {"agent-1"})
+        self.assertEqual(set(fresh["stopAt"]), {"agent-1", "flt"})
+        self.assertIs(type(fresh["stopAt"]["flt"]), int)   # as JS reads 1000.0
 
     def test_a_stop_written_while_the_manager_was_down_is_applied(self):
         path = os.path.join(self.proj, "s.jsonl")
@@ -4915,6 +4917,43 @@ class TestLiveAgentsScan(unittest.TestCase):
                         + [dict(self.DONE_1, timestamp="2026-10-03T12:04:59.999Z")]
                         + self.RESUME)
         self.assertEqual(len(ha.live_agents_report(st)), 1)
+
+    def test_a_stop_in_the_resumes_own_millisecond_is_its_own(self):
+        own = dict(self.DONE_1, timestamp="2026-10-03T12:05:00.000Z")
+        st = self._scan(TASK_LAUNCH_ENTRIES + [own] + self.RESUME)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_only_a_fresh_enqueue_sets_the_stop_time(self):
+        # The previous run's dequeue copy can land late; it must not block a resume.
+        late = [dict(self.DONE_1, operation="remove", timestamp="2026-10-03T12:09:00.000Z"),
+                {"type": "user", "timestamp": "2026-10-03T12:09:00.000Z",
+                 "message": {"content": self.DONE_1["content"]}}]
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.DONE_1] + late + self.RESUME)
+        self.assertNotIn("agent-1", st.get("stopAt", {}))
+        self.assertEqual(len(ha.live_agents_report(st)), 1)
+
+    def test_the_stop_time_map_is_bounded(self):
+        st = {}
+        for i in range(ha.LIVE_AGENTS_MAX * 4 + 10):
+            self._scan([dict(self.DONE_1, timestamp="2026-10-03T12:00:00.000Z",
+                             content=self.DONE_1["content"].replace("agent-1", f"a{i}"))], st)
+        self.assertEqual(len(st["stopAt"]), ha.LIVE_AGENTS_MAX * 4)
+        self.assertNotIn("a0", st["stopAt"])
+
+    def test_the_lead_in_carries_the_stop_time(self):
+        own = dict(self.DONE_1, timestamp="2026-10-03T12:09:00.000Z",
+                   content=self.DONE_1["content"].replace("completed", "failed"))
+        pad = {"type": "user", "message": {"content": "x" * 4000}}
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "t.jsonl")
+        write_jsonl(path, TASK_LAUNCH_ENTRIES + [self.DONE_1, own, pad, pad] + self.RESUME)
+        size = os.path.getsize(path)
+        tail = len(json.dumps(pad)) + sum(len(json.dumps(e)) + 1 for e in self.RESUME) + 10
+        with mock.patch.object(ha, "AGENT_BACKSCAN_BYTES", tail):
+            st = {}
+            ha._backscan_live_agents(path, st)
+        self.assertLess(tail, size)
+        self.assertEqual(ha.live_agents_report(st), [])
 
     def test_the_stop_time_rides_the_snapshot(self):
         own = dict(self.DONE_1, timestamp="2026-10-03T12:09:00.000Z")

@@ -1609,6 +1609,33 @@ test("scanAgentEntry: a resumed run whose own stop was written first stays stopp
   assert.equal(liveAgentsReport(st).length, 1);
 });
 
+test("scanAgentEntry: stopAt is set by a fresh enqueue only, and its own millisecond counts", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const late = "2026-10-03T12:09:00.000Z";
+  let st = scanAll([...LAUNCH_ENTRIES, notif("agent-1", "completed"),
+    { ...notif("agent-1", "completed"), operation: "remove", timestamp: late },
+    { ...notif("agent-1", "completed", "user"), timestamp: late }, ...RESUME_ENTRIES]);
+  assert.ok(!st.stopAt.has("agent-1"));
+  assert.equal(liveAgentsReport(st).length, 1);
+  st = scanAll([...LAUNCH_ENTRIES,
+    { ...notif("agent-1", "completed"), timestamp: "2026-10-03T12:05:00.000Z" }, ...RESUME_ENTRIES]);
+  assert.deepEqual(liveAgentsReport(st), []);
+});
+
+test("backscanLiveAgents: the lead-in carries stopAt", () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-leadin-"));
+  const p = path.join(dir, "t.jsonl");
+  const pad = { type: "user", message: { content: "x".repeat(4000) } };
+  const own = { ...notif("agent-1", "failed"), timestamp: "2026-10-03T12:09:00.000Z" };
+  const lines = [...LAUNCH_ENTRIES, notif("agent-1", "completed"), own, pad, pad, ...RESUME_ENTRIES];
+  fs.writeFileSync(p, lines.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  const tail = JSON.stringify(pad).length + RESUME_ENTRIES.reduce((n, e) => n + JSON.stringify(e).length + 1, 0) + 10;
+  const st = { live: new Map(), tasks: new Map() };
+  mod.backscanLiveAgents(p, st, tail);
+  assert.deepEqual(mod.liveAgentsReport(st), []);
+});
+
 test("restoreLiveAgents: keeps only usable stopAt values", () => {
   const mod = require("../tunnel-agent.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-stopat-"));
