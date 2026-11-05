@@ -5508,7 +5508,9 @@ const MEETING_FOCUS_ROLE_MAX = 300;
 // One line of operator text, control/format characters removed; null = unusable.
 function meetingFocusText(v, cap) {
   if (typeof v !== "string") return null;
-  const t = v.replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/g, " ").trim();
+  // Format characters go (a zero-width space pasted from captions must not split
+  // a name); control characters are breaks. The agent's _meeting_focus_text agrees.
+  const t = v.replace(/\p{Cf}/gu, "").replace(/\p{Cc}/gu, " ").replace(/\s+/g, " ").trim();
   return [...t].length <= cap ? t : null;
 }
 // {names, role} -> the stored shape, or null (malformed, or empty = off).

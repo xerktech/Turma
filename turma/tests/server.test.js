@@ -29402,11 +29402,17 @@ test("XERK-2514: the operator's focus is validated, served, and rides extractMee
   }
   assert.equal((await set({ names: ["Ann"] }, {})).status, 401);
   assert.equal((await set({ names: ["Ann"] }, userHeaders, "nobody2514.atlassian.net")).status, 404);
+  const { req: sseReq, res: sseRes } = await sseConnect(userHeaders);
+  const frames = collectSse(sseRes);
   // Control and bidi characters go; a repeat name (any case) is kept once.
-  const ok = await set({ names: [" Ann\u202e Lee ", "ann lee", "Lee, Ann"], role: " Backend\u0007 dev " });
+  const ok = await set({ names: [" Ann\u202e Lee ", "ann lee", "Le\u200be, Ann"], role: " Backend\u0007 dev " });
   assert.deepEqual([ok.status, ok.body.focus], [200, { names: ["Ann Lee", "Lee, Ann"], role: "Backend dev" }]);
   assert.deepEqual((await request("GET", "/api/agents", { headers: userHeaders })).body.meetingFocus[S],
     { names: ["Ann Lee", "Lee, Ann"], role: "Backend dev" });
+  // Live to an open Brief page, as the whole map.
+  await waitFor(() => frames.some((e) => e.event === "meetingFocus" && S in JSON.parse(e.data)));
+  sseReq.destroy();
+  sseRes.destroy();
   assert.equal((await postMeeting2508(S, meeting2508("f1"))).status, 200);
   const [cmd] = meetCmds2508("mtF2514");
   assert.deepEqual(cmd.focus, { names: ["Ann Lee", "Lee, Ann"], role: "Backend dev" });

@@ -138,6 +138,10 @@ test("XERK-2554: seed untenanted data in every partitioned store", async () => {
   0, Buffer.byteLength(JSON.stringify(list)), list, SITE);
   assert.equal(archive.sessionRow("t2554").host, "gone2554");
 
+  // Every sampled store is migrated too: one dropped from the list would keep
+  // its rows under the old site key.
+  const migrated = new Set(hub.tenantOrgStores().map((s) => s.name));
+  for (const name of Object.keys(ORG_SAMPLES)) assert.ok(migrated.has(name), `${name} is not tenant-migrated`);
   for (const s of hub.tenantOrgStores()) {
     assert.ok(ORG_SAMPLES[s.name], `no sample for org store ${s.name} — add one`);
     const [k, v] = ORG_SAMPLES[s.name];

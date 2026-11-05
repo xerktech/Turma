@@ -25479,26 +25479,31 @@ def _meeting_name_tokens(s):
 
 
 def meeting_focus_is_mine(assignee, focus):
-    """Is `assignee` one of the operator's names? Word sets, so "Habeeb,
-    Malcolm" and "Malcolm" match "Malcolm Habeeb" but "Malcolm Smith" does not."""
+    """Could `assignee` be one of the operator's names? Only a CLEAR mismatch is
+    no: the model already narrowed to the operator's work, and captions spell a
+    person many ways ("Malcolm H.", "Mal Habeeb", "M. Habeeb", "Malcolm
+    (he/him)"), so a strict match threw their own items away (XERK-2514 QA). A
+    word matches when one is the other or begins it (an initial, a short form);
+    any one matching word is enough. "Sara Diaz" vs "Malcolm Habeeb" is no."""
     got = _meeting_name_tokens(assignee)
-    if not got:
-        return False
     for n in focus.get("names") or []:
-        want = _meeting_name_tokens(n)
-        if want and (got <= want or want <= got):
-            return True
+        for w in _meeting_name_tokens(n):
+            if any(g == w or g.startswith(w) or w.startswith(g) for g in got):
+                return True
     return False
 
 
 def meeting_focus_filter(items, focus):
-    """Drop the items the model still assigned to someone else. A null assignee
-    stays (the model kept it for the operator's role). Needs names: with only
-    a role there is no one to compare against."""
+    """Drop the items the model still assigned to someone else: the backstop
+    for a leak, not the narrowing itself (the prompt does that). A null
+    assignee stays (kept for the operator's role), and so does a decision
+    (its assignee may be whoever made it, while it changes the operator's
+    work). Needs names: with only a role there is no one to compare against."""
     if not focus or not focus.get("names"):
         return items
     return [it for it in items
-            if not it.get("suggestedAssignee") or meeting_focus_is_mine(it["suggestedAssignee"], focus)]
+            if it.get("kind") == "decision" or not it.get("suggestedAssignee")
+            or meeting_focus_is_mine(it["suggestedAssignee"], focus)]
 
 
 def meeting_repo_options(cands):

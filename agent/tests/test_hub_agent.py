@@ -56354,13 +56354,20 @@ class TestMeetingWorker(ManagerMixin, unittest.TestCase):
         self.assertNotIn("End of the meeting data", stdin_text)
 
     def test_xerk2514_name_match_is_by_word_set(self):
+        # Only a clear mismatch is dropped: captions spell one person many ways.
         f = {"names": ["Malcolm Habeeb"], "role": ""}
         for who, mine in (("Malcolm Habeeb", True), ("Habeeb, Malcolm", True), ("malcolm", True),
-                          ("MALCOLM HABEEB (Guest)", True), ("Malcolm Smith", False), ("", False)):
+                          ("MALCOLM HABEEB (Guest)", True), ("Malcolm H.", True),
+                          ("Malcolm (he/him)", True), ("Mal Habeeb", True), ("M. Habeeb", True),
+                          ("Sara Diaz", False), ("Jun", False), ("", False)):
             self.assertEqual(ha.meeting_focus_is_mine(who, f), mine, who)
         # Only a role: nobody to compare against, so the model's pick stands.
         items = [{"suggestedAssignee": "Tom"}]
         self.assertEqual(ha.meeting_focus_filter(items, {"names": [], "role": "QA"}), items)
+        # A decision stays whoever made it; another person's task goes.
+        items = [{"kind": "decision", "suggestedAssignee": "Sara Diaz"},
+                 {"kind": "task", "suggestedAssignee": "Sara Diaz"}]
+        self.assertEqual(ha.meeting_focus_filter(items, f), items[:1])
 
     def test_a_redelivered_command_runs_once(self):
         self.sm._stage_meeting(self._cmd())
