@@ -131,6 +131,15 @@ ticket builds to this file; change it here first.
 - `{type:"extractMeeting", runId, siteKey, meetingId, model, runtime}`; `runId` hub-minted
   `^[0-9a-f]{1,32}$`, `model` concrete (`MEETINGS_AUTO_MODEL` = "sonnet", the XERK-2509
   eval's pick, `docs/meeting-items-adr.md`), `runtime` `claude|dsh|qwen`.
+- **Whose work: optional `focus` `{names[], role}`** (XERK-2514), the org's `meetingFocus` (hub
+  store, `POST /api/orgs/<site>/meeting-focus {names, role}`, ≤5 names ≤100, role ≤300, control
+  and format chars stripped; no names and no role clears it). Absent = everyone's work.
+  - Why: a standup is everyone's status; without it every speaker's work became a proposal.
+  - The agent (`normalize_meeting_focus`) appends it AFTER the meeting data as the reviewer's
+    words, JSON-encoded, then drops any item still assigned to a name not in `names`
+    (`meeting_focus_filter`, word-set match: "Lee, Ann" = "Ann Lee"). A null assignee stays.
+  - An older agent ignores the key (no filter, no failure), so no version gate.
+  - Tests: `XERK-2514:` cases in `server.test.js`, `test_hub_agent.py` `TestMeetingWorker`.
 - **The command carries no transcript** (a command rides the host record and `state.json`). The
   agent pulls it: `GET /api/agents/<host>/meetings/<runId>/transcript` (agent-authed, `<host>`
   proved by the credential, XERK-268) answers `{runId, siteKey, meetingId, title, platform,

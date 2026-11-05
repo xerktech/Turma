@@ -315,6 +315,75 @@ async function saveLabel(site, label) {
   return ok;
 }
 
+// ---- Whose work (XERK-2514) ------------------------------------------------------
+// Per org: the operator's names as captions spell them and their role. The agent
+// proposes only their work, so a standup doesn't turn everyone's status into items.
+const focusDrafts = new Map();   // site -> {names, role} being typed
+const focusBusy = new Set();
+const focusErr = new Map();
+let focusOpen = false;
+function focusOf(data, s) {
+  const f = own(data && data.meetingFocus, s);
+  return f && Array.isArray(f.names) ? { names: f.names.join(", "), role: String(f.role || "") }
+    : { names: "", role: "" };
+}
+function focusHtml(data, baseName) {
+  const orgs = labelOrgs(data);
+  if (!orgs.length) return "";
+  const name = labelNamer(orgs, baseName);
+  const set = (s) => !!own(data.meetingFocus, s);
+  const rows = orgs.map((s) => {
+    const v = focusDrafts.get(s) || focusOf(data, s);
+    const busy = focusBusy.has(s) ? "true" : "false";
+    return `<div class="mt-label-row"><span class="name">${esc(name(s))}</span>`
+      + `<input class="mt-focus-names" data-focus-names="${esc(s)}" value="${esc(v.names)}" maxlength="520" autocomplete="off" placeholder="Your name(s), comma-separated" aria-label="Your names in ${esc(name(s))} meetings">`
+      + `<input class="mt-focus-role" data-focus-role="${esc(s)}" value="${esc(v.role)}" maxlength="300" autocomplete="off" placeholder="Your role" aria-label="Your role at ${esc(name(s))}">`
+      + `<button class="btn-sm" data-focus-save="${esc(s)}" aria-disabled="${busy}">Save</button>`
+      + (set(s) ? `<button class="btn-sm" data-focus-clear="${esc(s)}" aria-disabled="${busy}" title="Propose everyone's work again">Clear</button>`
+        : `<span class="def">everyone's work</span>`)
+      + (focusErr.has(s) ? `<span class="mt-err-inline">${esc(focusErr.get(s))}</span>` : "")
+      + `</div>`;
+  }).join("");
+  const open = focusOpen || focusDrafts.size || focusErr.size ? " open" : "";
+  return `<details class="mt-labels mt-focus"${open}><summary>Whose work</summary>`
+    + `<p class="mt-labels-hint">Only work for you (by name, as the captions show it) or your role is proposed. Empty proposes everyone's.</p>`
+    + rows + `</details>`;
+}
+async function saveFocus(site, names, role) {
+  if (focusBusy.has(site)) return false;
+  const list = String(names || "").split(",").map((n) => n.trim()).filter(Boolean);
+  if (list.length > 5) {
+    focusErr.set(site, "At most 5 names");
+    repaint(true);
+    return false;
+  }
+  focusBusy.add(site);
+  focusErr.delete(site);
+  repaint(true);
+  let res = null, out = {};
+  try {
+    res = await fetch(`/api/orgs/${encodeURIComponent(site)}/meeting-focus`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ names: list, role: String(role || "").trim() }) });
+    try { out = await res.json(); } catch { out = {}; }
+  } catch { res = null; }
+  focusBusy.delete(site);
+  const ok = !!(res && res.ok);
+  if (!ok) {
+    const text = res ? TurmaNav.refusalText("Saving whose work", res.status, out) : "Saving whose work failed — the hub is unreachable";
+    focusErr.set(site, text);
+    TurmaNav.toast(text);
+  } else {
+    focusDrafts.delete(site);
+    if (cache) {
+      const m = { ...(cache.meetingFocus || {}) };
+      if (out && out.focus) m[site] = out.focus; else delete m[site];
+      cache.meetingFocus = m;
+    }
+  }
+  repaint(true);
+  return ok;
+}
+
 function orgHtml(site, list, name) {
   const target = needsProject(list) ? targetHtml(site) : "";
   return `<div class="mt-org"><div class="mt-org-head"><h2 class="mt-org-name">${esc(name)}</h2>${target}</div>`
@@ -344,7 +413,7 @@ function renderMeetings(data, force = false) {
     : `<div class="mt-empty">${Object.values(data.meetingProposals || {}).some((l) => Array.isArray(l) && l.length)
       ? "No meetings for the orgs picked in the header — pick All orgs to see the others."
       : "No meetings yet — when Tenir sends one, its proposed work items show up here."}</div>`;
-  const full = missesHtml(data, name) + labelsHtml(data, name) + html;
+  const full = missesHtml(data, name) + focusHtml(data, name) + labelsHtml(data, name) + html;
   if (full === painted) return;
   painted = full;
   TurmaNav.preserveScroll($list, () => { $list.innerHTML = full; });
@@ -475,8 +544,14 @@ function mount(el) {
   $list = el;
   $list.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest
-      ? ev.target.closest("[data-act],[data-meta-retry],[data-label-save],[data-label-reset],[data-miss-use]") : null;
+      ? ev.target.closest("[data-act],[data-meta-retry],[data-label-save],[data-label-reset],[data-miss-use],[data-focus-save],[data-focus-clear]") : null;
     if (!b) return;
+    if (b.dataset.focusSave !== undefined || b.dataset.focusClear !== undefined) {
+      if (b.getAttribute("aria-disabled") === "true") return;
+      if (b.dataset.focusClear !== undefined) return void saveFocus(b.dataset.focusClear, "", "");
+      const site = b.dataset.focusSave, v = focusDrafts.get(site) || focusOf(cache, site);
+      return void saveFocus(site, v.names, v.role);
+    }
     if (b.dataset.labelSave !== undefined || b.dataset.labelReset !== undefined || b.dataset.missUse !== undefined) {
       if (b.getAttribute("aria-disabled") === "true") return;
       if (b.dataset.labelReset !== undefined) return void saveLabel(b.dataset.labelReset, null);
@@ -503,6 +578,14 @@ function mount(el) {
     const t = ev.target, d = t && t.dataset;
     if (!d) return;
     if (d.label !== undefined) { labelDrafts.set(d.label, t.value); labelErr.delete(d.label); return; }
+    if (d.focusNames !== undefined || d.focusRole !== undefined) {
+      const site = d.focusNames ?? d.focusRole;
+      const v = { ...(focusDrafts.get(site) || focusOf(cache, site)) };
+      if (d.focusNames !== undefined) v.names = t.value; else v.role = t.value;
+      focusDrafts.set(site, v);
+      focusErr.delete(site);
+      return;
+    }
     const k = d.editTitle ?? d.editDesc ?? d.editType;
     const e = k !== undefined && edits.get(k);
     if (!e) return;
@@ -530,11 +613,19 @@ function mount(el) {
   // `toggle` doesn't bubble; capture it so a repaint keeps the list as left.
   $list.addEventListener("toggle", (ev) => {
     const t = ev.target;
-    if (t && t.classList && t.classList.contains("mt-labels")) labelsOpen = !!t.open;
+    if (t && t.classList && t.classList.contains("mt-focus")) focusOpen = !!t.open;
+    else if (t && t.classList && t.classList.contains("mt-labels")) labelsOpen = !!t.open;
   }, true);
   $list.addEventListener("keydown", (ev) => {
     const t = ev.target;
-    if (ev.key !== "Enter" || !t || !t.dataset || t.dataset.label === undefined) return;
+    if (ev.key !== "Enter" || !t || !t.dataset) return;
+    const fs = t.dataset.focusNames ?? t.dataset.focusRole;
+    if (fs !== undefined) {
+      ev.preventDefault();
+      const v = focusDrafts.get(fs) || focusOf(cache, fs);
+      return void saveFocus(fs, v.names, v.role);
+    }
+    if (t.dataset.label === undefined) return;
     ev.preventDefault();
     const site = t.dataset.label;
     saveLabel(site, String(t.value || "").trim().toLowerCase());
@@ -563,6 +654,7 @@ function pendingCount(data) {
 const api = { mount, update, pendingCount,
   // test hooks (tests/meetings.test.js)
   renderMeetings, review, startEdit, edits, setProject, itemKey, saveLabel, labelsHtml, missesHtml,
+  saveFocus, focusHtml,
   setCache: (c) => { cache = c; } };
 if (typeof window !== "undefined") window.TurmaMeetings = api;
 })();

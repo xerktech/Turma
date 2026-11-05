@@ -1032,6 +1032,8 @@ those are marked `[MODEL]`.
 - **Gap (XERK-2638)**: the web pane's "Tenir labels" list and its unmapped-label banner are
   web-only. Android ignores `meetingLabels`/`meetingLabelMisses` (untyped keys); set or map a
   label from the web. P2: a one-time setup per org.
+- **Gap (XERK-2514)**: the web pane's "Whose work" list (names + role per org, `meetingFocus`) is
+  web-only; Android ignores the key. Set it from the web. P2: a one-time setup per org.
 
 ### Nav / Login
 - **Native Authentik SSO is IMPLEMENTED on Android (XERK-591).** `LoginScreen.kt` shows a "Sign in

@@ -120,6 +120,8 @@
     background: var(--surface); color: var(--ink); max-width: 100%; }
   .mt-label-row input { width: 12em; }
   .mt-label-row .def { color: var(--muted); }
+  .mt-label-row input.mt-focus-names { width: 16em; }
+  .mt-label-row input.mt-focus-role { width: 14em; }
   .mt-miss { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; margin-bottom: 10px;
     padding: 8px 10px; border-radius: 8px; font-size: 13px; color: var(--ink);
     background: color-mix(in srgb, var(--warning) 14%, var(--surface)); }
@@ -127,7 +129,7 @@
   .mt-err-inline { color: var(--critical-text); }
   @media (max-width: 560px) {
     .mt-label-row .name { flex-basis: 100%; min-width: 0; }
-    .mt-label-row input { flex: 1 1 8em; width: auto; }
+    .mt-label-row input, .mt-label-row input.mt-focus-names, .mt-label-row input.mt-focus-role { flex: 1 1 8em; width: auto; }
   }
   .mt-org { margin-bottom: 22px; min-width: 0; }
   .mt-org-head { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; margin-bottom: 10px; }
@@ -740,6 +742,7 @@ async function refresh() {
     if (cache && labelsClock !== lsince) {
       body.meetingLabels = cache.meetingLabels;
       body.meetingLabelMisses = cache.meetingLabelMisses;
+      body.meetingFocus = cache.meetingFocus;
     }
     cache = body;
     if (typeof TurmaNav !== "undefined" && TurmaNav.noteSnapshot) TurmaNav.noteSnapshot(r);
@@ -786,8 +789,9 @@ function connectSSE() {
     cache.meetingProposals = d;
     renderMeetingsPane(cache);
   });
-  // Each org's Tenir label and the labels no org has (XERK-2638).
-  for (const ev of ["meetingLabels", "meetingLabelMisses"]) {
+  // Each org's Tenir label and the labels no org has (XERK-2638), and whose
+  // work its meetings propose (XERK-2514).
+  for (const ev of ["meetingLabels", "meetingLabelMisses", "meetingFocus"]) {
     es.addEventListener(ev, (e) => {
       let d;
       try { d = JSON.parse(e.data); } catch { return; }

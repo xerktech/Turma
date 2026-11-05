@@ -40,5 +40,8 @@ The web surface of the Meetings epic (XERK-2503). The wire and the review route 
 - **Tenir labels** (XERK-2638): a collapsed "Tenir labels" list (each org's label, editable, Reset
   for an operator's) and a banner per label Tenir sent that no org has, with an org pick and "Use
   this label". Both read the hub's `meetingLabels`/`meetingLabelMisses` (payload + SSE). Web only.
+- **Whose work** (XERK-2514): a collapsed list, one row per org: the operator's names (comma-
+  separated, as captions spell them) and role, Save / Clear. Reads `meetingFocus` (payload +
+  SSE). Web only, like the labels.
 - Android has the same screen (XERK-2511, `android.md`); a change here needs its port there.
 - Tests: `turma/tests/meetings.test.js`.
