@@ -1073,15 +1073,18 @@ test("a hydrate pass abandoned mid-GET aborts that GET (XERK-1701)", async () =>
 
 test("a slow object that outlasts the retry GET deadline lands on a later, longer retry (XERK-1833 QA D1)", async () => {
   const root = mkdtemp("turma-mir-");
-  // Every GET of this key takes 50ms: past a 20ms deadline, inside 80ms.
+  // Every GET of this key takes 250ms: past the 100ms and 200ms deadlines, inside
+  // 400ms. The margins are wide (150ms either side of the landing pass) because this
+  // races two wall-clock timers, and a full parallel `node --test` run loads the CPU
+  // enough to skew a tighter pair (XERK-2706).
   const store = { list: async () => [], stat: async () => null,
-    getToFile: (k, dest) => new Promise((r) => setTimeout(() => { fs.writeFileSync(dest, "big"); r(true); }, 50)) };
+    getToFile: (k, dest) => new Promise((r) => setTimeout(() => { fs.writeFileSync(dest, "big"); r(true); }, 250)) };
   const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
   m._blocked.set("repo/a.jsonl", "x");
-  assert.equal(await m.retryBlocked({ getDeadlineMs: 20 }), 0);
+  assert.equal(await m.retryBlocked({ getDeadlineMs: 100 }), 0);
   assert.match(m._blocked.get("repo/a.jsonl"), /within 0s/);
-  assert.equal(await m.retryBlocked({ getDeadlineMs: 20 }), 0); // 40ms: still short
-  assert.equal(await m.retryBlocked({ getDeadlineMs: 20 }), 1); // 80ms: lands
+  assert.equal(await m.retryBlocked({ getDeadlineMs: 100 }), 0); // 200ms: still short
+  assert.equal(await m.retryBlocked({ getDeadlineMs: 100 }), 1); // 400ms: lands
   assert.equal(m.blockedCount(), 0);
   assert.equal(m._getDeadline.size, 0);
   assert.equal(fs.readFileSync(path.join(root, "repo", "a.jsonl"), "utf8"), "big");
