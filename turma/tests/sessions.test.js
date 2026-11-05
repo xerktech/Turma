@@ -381,6 +381,11 @@ test("background shell kinds: waiting holds, stalled surfaces, work stays workin
                { type: "shell", label: "Watch CI", kind: "wait-external" }] }),
     running("45555", "Blank Shell", { ...finished, transcriptAgeSec: 50 * 60,
       agents: [{ type: "shell", label: "   ", kind: "wait-external" }] }),
+    // XERK-2710: QA agents waiting on their own background work hold the session
+    // Active as waiting, counted as agents.
+    running("46666", "QA Waiter", { ...finished, transcriptAgeSec: 5,
+      agents: [{ type: "qa-delta", label: "", kind: "wait-external" },
+               { type: "qa", label: "", kind: "wait-external" }] }),
   ]);
   render({ now, agents: [h] });
   const a = els.active.innerHTML, r = els.review.innerHTML;
@@ -393,6 +398,8 @@ test("background shell kinds: waiting holds, stalled surfaces, work stays workin
   assert.ok(r.includes("Dead Shell") && r.includes("stalled · Watch CI"), r);
   // A blank label names nothing: the shell count, as Android shows (rollup XERK-1701).
   assert.ok(r.includes("stalled on 1 background shell") && !r.includes("stalled · \u00a0"), r);
+  assert.ok(a.includes("QA Waiter") && a.includes("waiting on 2 background agents"), a);
+  assert.ok(!r.includes("QA Waiter"));
   // A work shell beside a wait: working, named by its WORK rows only.
   assert.ok(a.includes("Test Runner") && a.includes("1 background shell"));
 });

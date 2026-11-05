@@ -641,6 +641,12 @@ class SessionsTest {
             card(waitingOn(shell("wait-external"), shell("wait-timed"), ageSec = 46 * 60.0)))
         assertEquals(st("stalled on 1 background shell", com.xerktech.turma.ui.CardTone.STALLED),
             card(waitingOn(shell("wait-external"), ageSec = 46 * 60.0)))
+        // XERK-2710: an agent waiting on its own work is counted as an agent (web parity).
+        val qa = com.xerktech.turma.model.LiveAgent(type = "qa-delta", label = "", kind = "wait-external")
+        assertEquals(st("stalled on 2 background agents", com.xerktech.turma.ui.CardTone.STALLED),
+            card(waitingOn(qa, qa, ageSec = 46 * 60.0)))
+        assertEquals(st("stalled on 2 background tasks", com.xerktech.turma.ui.CardTone.STALLED),
+            card(waitingOn(qa, shell("wait-timed"), ageSec = 46 * 60.0)))
         assertEquals(st("stopped", com.xerktech.turma.ui.CardTone.IDLE), card(SessionInfo(status = "stopped",
             session = LiveSignals(transcriptAgeSec = 1.0))))
         assertEquals(st("💤 sleeping until ${clockTime(now + 3_600_000L, now)}", com.xerktech.turma.ui.CardTone.HOLDING),

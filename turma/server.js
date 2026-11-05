@@ -17104,12 +17104,21 @@ const ATTENTION_WHY_MAX = 200;
 
 // What a background wait is waiting ON, for the `why` line: the one wait row's
 // label, else a count. Same wording as the clients' backgroundWaitLabel.
+// "1 background agent" / "2 background shells" / "3 background tasks" (mixed) —
+// the clients' backgroundWorkLabel. A wait row may be an AGENT waiting on its own
+// background work (XERK-2710), so a wait count is never assumed to be shells.
+function backgroundRowsLabel(rows) {
+  const n = rows.length;
+  const shells = rows.filter((a) => a && a.type === "shell").length;
+  const noun = !shells ? "agent" : shells === n ? "shell" : "task";
+  return `${n} background ${noun}${n === 1 ? "" : "s"}`;
+}
 function waitSubject(rows) {
   const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
-  // A blank label names nothing: the shell count, as both clients' cards read it.
+  // A blank label names nothing: the row count, as both clients' cards read it.
   const label = waits.length === 1 && typeof waits[0].label === "string" ? waits[0].label.trim() : "";
   if (label) return label;
-  return `${waits.length} background shell${waits.length === 1 ? "" : "s"}`;
+  return backgroundRowsLabel(waits);
 }
 
 // Why a ready-for-review session is the operator's: its live PRs and their CI,
@@ -20177,11 +20186,37 @@ function attentionNudgeText(reason, session) {
       + "on the ticket, and either take a different approach or end the turn with a `Host blocker:` line.";
   }
   const waits = (Array.isArray(s.agents) ? s.agents : []).filter(isWaitRow);
-  const label = waits.length === 1 ? nudgeLabel(waits[0].label) : "";
-  const subject = label ? `Your background shell \`${label}\` has`
-    : waits.length > 1 ? `Your ${waits.length} background shells have` : "Your background shell has";
   const mins = Number.isFinite(s.transcriptAgeSec) ? Math.max(1, Math.round(s.transcriptAgeSec / 60)) : null;
+  // An AGENT waiting on its own background work (XERK-2710) writes its progress to
+  // its own transcript, not this one, so this silence is no sign it is dead — and
+  // "stop it" would kill a live QA pass. Name it as an agent and say to look first.
+  if (waits.length && waits.every((a) => a.type !== "shell")) {
+    const label = waits.length === 1 ? nudgeLabel(waits[0].label) : "";
+    const subject = label ? `Your background agent \`${label}\` is`
+      : waits.length > 1 ? `Your ${waits.length} background agents are` : "Your background agent is";
+    const quietA = mins ? ` and this conversation has been quiet for ${mins} minute${mins === 1 ? "" : "s"}` : "";
+    const its = waits.length > 1 ? "their" : "its";
+    return `${subject} waiting on ${its} own background work${quietA}. Check ${its} progress before `
+      + "deciding anything — do not stop a run that is still working; if it is stuck or dead, "
+      + "say what you know and end the turn.";
+  }
+  const label = waits.length === 1 ? nudgeLabel(waits[0].label) : "";
+  const noun = waits.some((a) => a.type !== "shell") ? "task" : "shell";
+  const subject = label ? `Your background ${noun} \`${label}\` has`
+    : waits.length > 1 ? `Your ${waits.length} background ${noun}s have` : `Your background ${noun} has`;
   const quiet = mins ? `produced nothing for ${mins} minute${mins === 1 ? "" : "s"}` : "gone quiet";
+  // A mix: the stop advice is for the SHELLS only, never a background agent.
+  if (noun === "task") {
+    return `${subject} ${quiet}. Check whether they are still doing anything; if a background shell `
+      + "is waiting on something with a known duration, stop it and use the session CLI's `wake`, "
+      + "but do not stop a background agent that is still working; if they are dead, say what you "
+      + "know and end the turn.";
+  }
+  if (waits.length > 1) {
+    return `${subject} ${quiet}. Check whether they are still doing anything; if one is waiting on `
+      + "something with a known duration, stop it and use the session CLI's `wake`; if they are dead, "
+      + "say what you know and end the turn.";
+  }
   return `${subject} ${quiet}. Check whether it is still doing anything; if it is waiting on `
     + "something with a known duration, stop it and use the session CLI's `wake`; if it is dead, "
     + "say what you know and end the turn.";
@@ -28688,6 +28723,7 @@ if (process.env.TURMA_TEST) {
     prLanded,
     attentionNudged,
     attentionNudgeText,
+    waitSubject,
     ATTENTION_NUDGE_BACKOFF_MS,
     ATTENTION_NUDGE_MAX,
     normalizeAttentionHint,
