@@ -25474,22 +25474,32 @@ def meeting_focus_instruction(focus):
     )
 
 
+# Caption suffixes that are not part of a name: "(he/him)", "(Guest)".
+_MEETING_NAME_NOISE = frozenset(
+    "he him his she her hers they them theirs guest external".split())
+
+
 def _meeting_name_tokens(s):
-    return set(_meeting_norm(s or "").split())
+    return set(_meeting_norm(s or "").split()) - _MEETING_NAME_NOISE
+
+
+def _meeting_words_fit(a, b):
+    """Is every word of `a` the same as, or a short form of, a word of `b`?
+    One word begins the other: an initial ("H"), a short form ("Mal")."""
+    return bool(a) and all(any(x.startswith(y) or y.startswith(x) for y in b) for x in a)
 
 
 def meeting_focus_is_mine(assignee, focus):
-    """Could `assignee` be one of the operator's names? Only a CLEAR mismatch is
-    no: the model already narrowed to the operator's work, and captions spell a
-    person many ways ("Malcolm H.", "Mal Habeeb", "M. Habeeb", "Malcolm
-    (he/him)"), so a strict match threw their own items away (XERK-2514 QA). A
-    word matches when one is the other or begins it (an initial, a short form);
-    any one matching word is enough. "Sara Diaz" vs "Malcolm Habeeb" is no."""
+    """Could `assignee` be one of the operator's names? Captions spell a person
+    many ways ("Malcolm H.", "Mal Habeeb", "M. Habeeb", "Malcolm (he/him)"),
+    and a strict match threw their own items away (XERK-2514 QA); but a word
+    that clashes ("Malcolm Smith", "Sara H.") is someone else. So: every word
+    of one name fits a word of the other, in either direction."""
     got = _meeting_name_tokens(assignee)
     for n in focus.get("names") or []:
-        for w in _meeting_name_tokens(n):
-            if any(g == w or g.startswith(w) or w.startswith(g) for g in got):
-                return True
+        want = _meeting_name_tokens(n)
+        if _meeting_words_fit(got, want) or _meeting_words_fit(want, got):
+            return True
     return False
 
 

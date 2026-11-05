@@ -137,7 +137,10 @@ ticket builds to this file; change it here first.
   - Why: a standup is everyone's status; without it every speaker's work became a proposal.
   - The agent (`normalize_meeting_focus`) appends it AFTER the meeting data as the reviewer's
     words, JSON-encoded, then drops any item still assigned to a name not in `names`
-    (`meeting_focus_filter`, word-set match: "Lee, Ann" = "Ann Lee"). A null assignee stays.
+    (`meeting_focus_filter`). A null assignee and a decision stay.
+  - A name matches when every word of one fits a word of the other (same, or one begins the
+    other): "Malcolm H." and "Lee, Ann" match; "Malcolm Smith" doesn't. Strict equality dropped
+    the operator's own items under a caption spelling (QA); "any word" let a second Malcolm in.
   - An older agent ignores the key (no filter, no failure), so no version gate.
   - Tests: `XERK-2514:` cases in `server.test.js`, `test_hub_agent.py` `TestMeetingWorker`.
 - **The command carries no transcript** (a command rides the host record and `state.json`). The

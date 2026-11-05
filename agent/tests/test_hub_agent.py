@@ -56354,13 +56354,19 @@ class TestMeetingWorker(ManagerMixin, unittest.TestCase):
         self.assertNotIn("End of the meeting data", stdin_text)
 
     def test_xerk2514_name_match_is_by_word_set(self):
-        # Only a clear mismatch is dropped: captions spell one person many ways.
+        # Captions spell one person many ways; a clashing word is someone else.
         f = {"names": ["Malcolm Habeeb"], "role": ""}
         for who, mine in (("Malcolm Habeeb", True), ("Habeeb, Malcolm", True), ("malcolm", True),
                           ("MALCOLM HABEEB (Guest)", True), ("Malcolm H.", True),
                           ("Malcolm (he/him)", True), ("Mal Habeeb", True), ("M. Habeeb", True),
-                          ("Sara Diaz", False), ("Jun", False), ("", False)):
+                          ("Mal", True), ("Malcolm Smith", False), ("Malcolm S.", False),
+                          ("Sara H.", False), ("Dev M.", False), ("Sara Diaz", False),
+                          ("Jun", False), ("", False), ("(Guest)", False)):
             self.assertEqual(ha.meeting_focus_is_mine(who, f), mine, who)
+        # A one-letter word in the operator's own name is not a wildcard.
+        j = {"names": ["J Smith"], "role": ""}
+        for who, mine in (("Jun Park", False), ("Jane Smith", True), ("J. Smith", True)):
+            self.assertEqual(ha.meeting_focus_is_mine(who, j), mine, who)
         # Only a role: nobody to compare against, so the model's pick stands.
         items = [{"suggestedAssignee": "Tom"}]
         self.assertEqual(ha.meeting_focus_filter(items, {"names": [], "role": "QA"}), items)
