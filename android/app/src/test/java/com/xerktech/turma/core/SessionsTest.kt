@@ -643,8 +643,9 @@ class SessionsTest {
             card(waitingOn(shell("wait-external"), ageSec = 46 * 60.0)))
         // XERK-2710: an agent waiting on its own work is counted as an agent (web parity).
         val qa = com.xerktech.turma.model.LiveAgent(type = "qa-delta", label = "", kind = "wait-external")
-        assertEquals(st("stalled on 2 background agents", com.xerktech.turma.ui.CardTone.STALLED),
-            card(waitingOn(qa, qa, ageSec = 46 * 60.0)))
+        // XERK-2712: an all-agent wait never stalls, however long the transcript is quiet.
+        assertEquals(false, backgroundWait(listOf(qa), now - 10 * 3_600_000L, now)?.stalled)
+        assertEquals(true, backgroundWait(listOf(qa, shell("wait-external")), now - 10 * 3_600_000L, now)?.stalled)
         assertEquals(st("stalled on 2 background tasks", com.xerktech.turma.ui.CardTone.STALLED),
             card(waitingOn(qa, shell("wait-timed"), ageSec = 46 * 60.0)))
         assertEquals(st("stopped", com.xerktech.turma.ui.CardTone.IDLE), card(SessionInfo(status = "stopped",

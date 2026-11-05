@@ -27851,17 +27851,20 @@ function nudgeHost(host, sessions, now = Date.now()) {
 }
 const nudges = (host) => (agents[host].commands || []).filter((c) => c.type === "input");
 
-// XERK-2710: an AGENT waiting on its own background work is a wait row too, and its
-// progress is in its own transcript — so its stall nudge must never say "stop it".
-test("XERK-2710: a stalled background AGENT is nudged as an agent and never told to stop", () => {
+test("XERK-2712: an all-agent wait never stalls; a shell beside it still can", () => {
+  const now = Date.now(), quiet = now - 10 * 3600 * 1000;
+  const qa = { type: "qa", label: "QA", kind: "wait-external" };
+  assert.deepEqual(hub.backgroundWait([qa], quiet, now), { state: "waiting", eta: null });
+  const shell = { type: "shell", label: "Watch CI", kind: "wait-external" };
+  assert.equal(hub.backgroundWait([qa, shell], quiet, now).state, "stalled");
+  assert.equal(hub.backgroundWait([shell], quiet, now).state, "stalled");
+});
+
+// XERK-2710: an AGENT waiting on its own background work is a wait row too, and the
+// stop advice in a stall nudge is for shells only. (An all-agent wait never stalls.)
+test("XERK-2710: a stall nudge never tells a background AGENT to stop", () => {
   const sess = (agents) => ({ session: { transcriptAgeSec: 47 * 60, agents } });
   const qa = { type: "qa-delta", label: "Re-QA vr image fixes", kind: "wait-external" };
-  assert.equal(hub.attentionNudgeText("stalled", sess([qa])),
-    "Your background agent `Re-QA vr image fixes` is waiting on its own background work and this "
-    + "conversation has been quiet for 47 minutes. Check its progress before deciding anything — do not "
-    + "stop a run that is still working; if it is stuck or dead, say what you know and end the turn.");
-  assert.match(hub.attentionNudgeText("stalled", sess([qa, { ...qa, label: "x" }])),
-    /^Your 2 background agents are waiting on their own background work .* Check their progress/);
   // A shell beside it keeps the shell advice for the shell only, worded for a mix.
   const mix = hub.attentionNudgeText("stalled", sess([qa, { type: "shell", label: "", kind: "wait-timed" }]));
   assert.match(mix, /^Your 2 background tasks have produced nothing for 47 minutes\. /);
