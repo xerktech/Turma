@@ -5314,6 +5314,26 @@ class TestLiveAgentsScan(unittest.TestCase):
         self.assertIn(f"a{n + 1}", st["liveAgents"])
         self.assertNotIn(f"a{n + 2}", st["liveAgents"])
         self.assertEqual(len(st["liveAgents"]), n)
+        # Only for a launch it will register: a repeat of a live id, or an id
+        # already stopped, gives up nothing.
+        st = self._scan([launch(i) for i in range(n)] + [interim(5)])
+        stop = {"type": "queue-operation", "operation": "enqueue",
+                "content": "<task-notification>\n<task-id>gone</task-id>\n"
+                           "<status>completed</status>\n</task-notification>"}
+        st = self._scan([launch(7), stop, dict(launch(n), toolUseResult=dict(
+            launch(n)["toolUseResult"], agentId="gone"))], st)
+        self.assertIn("a5", st["liveAgents"])
+        self.assertEqual(len(st["liveAgents"]), n)
+        # A waiting SHELL is never given up: it is a shell, not a parked agent.
+        shells = []
+        for i in range(n // 2):
+            shells += json.loads(json.dumps(SHELL_LAUNCH_ENTRIES).replace("toolu_s1", f"ts{i}")
+                                 .replace("bsh1", f"bs{i}"))
+        st = self._scan(shells + [launch(i) for i in range(n // 2)] + [launch(n)])
+        self.assertTrue(all(a.get("kind") == "wait-external" for a in st["liveAgents"].values()
+                            if a["type"] == "shell"))
+        self.assertNotIn(f"a{n}", st["liveAgents"])
+        self.assertEqual(len(st["liveAgents"]), n)
 
 
 class TestTaskNotification(unittest.TestCase):

@@ -1999,6 +1999,24 @@ test("scanAgentEntry: a full table gives up its oldest parked row", () => {
   assert.ok(st.live.has(`a${n + 1}`));
   assert.ok(!st.live.has(`a${n + 2}`), "no parked row left: a full table still drops it");
   assert.equal(st.live.size, n);
+  // Only for a launch it will register: a repeat of a live id, or an id already
+  // stopped, gives up nothing.
+  st = scanAll([...Array.from({ length: n }, (_, i) => launch(i)), interim(5)]);
+  const gone = { ...launch(n), toolUseResult: { ...launch(n).toolUseResult, agentId: "gone" } };
+  st = scanAll([launch(7), notif("gone", "completed"), gone], st);
+  assert.ok(st.live.has("a5"));
+  assert.equal(st.live.size, n);
+  // A waiting SHELL is never given up: it is a shell, not a parked agent.
+  const shell = (i) => [
+    { type: "assistant", message: { content: [{ type: "tool_use", id: `ts${i}`, name: "Bash",
+      input: { command: "gh pr checks 1 --watch", run_in_background: true } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: `ts${i}`, content: "" }] },
+      toolUseResult: { stdout: "", backgroundTaskId: `bs${i}` } }];
+  st = scanAll([...Array.from({ length: n / 2 }, (_, i) => shell(i)).flat(),
+    ...Array.from({ length: n / 2 }, (_, i) => launch(i)), launch(n)]);
+  assert.ok([...st.live.values()].every((a) => a.type !== "shell" || a.kind === "wait-external"));
+  assert.ok(!st.live.has(`a${n}`));
+  assert.equal(st.live.size, n);
 });
 
 test("parsePaneLiveTurn: no longer sources agents from the pane at all", () => {

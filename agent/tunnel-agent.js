@@ -1609,8 +1609,8 @@ function scanAgentEntry(entry, state) {
       }
     }
   }
-  if (launch && live.size >= LIVE_AGENTS_MAX && !stopped.has(launch.id)) {
-    // A full table gives up its OLDEST parked row (an agent waiting on its own
+  if (launch && live.size >= LIVE_AGENTS_MAX && !stopped.has(launch.id) && !live.has(launch.id)) {
+    // A full table gives up its EARLIEST-LAUNCHED parked row (an agent waiting on its own
     // background work, XERK-2710) rather than drop this live launch: some parked
     // agents never send a final notice (XERK-2711). Mirror of _scan_agent_entry.
     for (const [id, a] of live) {

@@ -57,9 +57,9 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
   reads waiting, not idle; its final notice retires it; a `SendMessage` resume makes it work again.
   - Never ignore the notice instead: 14 of 39 such agents on a real host sent no final one, so
     they would read working forever. As a wait they go stalled after `ATTENTION_WAIT_STALL_MIN`.
-  - **A full table (`LIVE_AGENTS_MAX`) gives up its OLDEST parked row to a new launch** (XERK-2711):
+  - **A full table (`LIVE_AGENTS_MAX`) gives up its EARLIEST-LAUNCHED parked row to a new launch** (XERK-2711):
     a parked agent that never sends its final notice would otherwise hold a slot until relaunch.
-    A working row is never evicted. Tests: `a full table gives up its oldest parked row` (both).
+    Never a working row or a waiting shell, and only for a launch it will register. Tests: `a full table gives up its oldest parked row` (both).
   - Keyed on the summary ENDING with the wording (after the quoted description), never on `<note>`.
   - **Its stall nudge never says "stop it"** (`attentionNudgeText`): the parent's silence is no sign
     of death (the agent writes its own transcript), so an all-agent wait is named as an agent and
