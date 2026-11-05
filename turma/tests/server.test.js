@@ -27877,7 +27877,7 @@ test("XERK-2710: a parked background AGENT is nudged as an agent, never as a she
   const b = nudgeHost(host2, [{ session: two, attn: { state: "needs-you:stalled", since: t0, why: "x" } }], t0);
   b.lastSeen = t0;
   hub.attentionNudgeSweep(t0);
-  assert.match(nudges(host2)[0].text, /^Your 2 background agents have produced nothing for 47 minutes\. Check whether they are still doing anything; if one is waiting/);
+  assert.match(nudges(host2)[0].text, /^Your 2 background agents have produced nothing for 47 minutes\. Check whether they are still doing anything; if one is waiting.*; if one is dead, say what you know/);
   assert.equal(att([row("shell"), row("qa")]).why, "2 background tasks");
   assert.equal(att([row("shell"), row("shell")]).why, "2 background shells");
 });
