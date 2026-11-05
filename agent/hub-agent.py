@@ -11670,7 +11670,7 @@ AGENT_DONE_STATUSES = frozenset({"completed", "failed", "killed", "stopped", "er
 # ones whose final notice never comes. Mirror of tunnel-agent.js TN_INTERIM_RE.
 TN_INTERIM_RE = re.compile(
     r"<note>[^<]*(?:background work of its own still running|notifies again if it does)"
-    r"|<summary>[^<]*is waiting on its own background work</summary>")
+    r"|<summary>[^<]*is waiting on its own background work[ \t\r\n]*</summary>")
 
 
 def _tn_interim(text):

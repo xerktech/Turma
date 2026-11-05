@@ -1686,6 +1686,31 @@ test("scanAgentEntry: a SendMessage-resumed agent is live again until its next s
   // Pinned to py's _tn_fingerprint (the snapshot carries these).
   assert.equal(require("../tunnel-agent.js").tnFingerprint("<task-notification>lone \ud83d trunc</task-notification>"),
     require("../tunnel-agent.js").tnFingerprint("<task-notification>lone \ufffd trunc</task-notification>"));
+  // XERK-2710 (twin of the py INTERIM cases): the interim "waiting on its own
+  // background work" notice reads the agent as waiting; its final one retires
+  // it; a resume makes it work again; quoting the phrase is not the notice.
+  const interim = { type: "queue-operation", operation: "enqueue", content:
+    '<task-notification>\n<task-id>agent-1</task-id>\n<status>completed</status>\n' +
+    '<summary>Agent "QA the parity change" is waiting on its own background work</summary>\n' +
+    "</task-notification>" };
+  st = scanAll([...LAUNCH_ENTRIES, interim, { ...interim, operation: "remove" }]);
+  assert.deepEqual(liveAgentsReport(st), [{ type: "agent", label: "QA the parity change", kind: "wait-external" }]);
+  st = scanAll([notif("agent-1", "completed")], st);
+  assert.deepEqual(liveAgentsReport(st), []);
+  st = scanAll([...LAUNCH_ENTRIES, interim, ...RESUME_ENTRIES]);
+  assert.deepEqual(liveAgentsReport(st).map((r) => r.kind), [undefined]);
+  // A shell keeps the kind its command was classified as (py twin:
+  // test_an_interim_notice_never_turns_a_shell_into_an_agent_wait).
+  const workShell = [
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "tw", name: "Bash",
+      input: { command: "npm test", run_in_background: true } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tw", content: "" }] },
+      toolUseResult: { stdout: "", backgroundTaskId: "bsh9" } }];
+  st = scanAll([...workShell, { ...interim, content: interim.content.replace("agent-1", "bsh9") }]);
+  assert.deepEqual(liveAgentsReport(st).map((r) => r.kind), ["work"]);
+  const quoted = { ...interim, content: interim.content.replace("is waiting on its own background work</summary>",
+    'is waiting on its own background work" finished</summary>') };
+  assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, quoted])), []);
   st = scanAll(LAUNCH_ENTRIES);
   const before = { ...st.live.get("agent-1") };
   scanAll(RESUME_ENTRIES, st);

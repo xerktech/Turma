@@ -1537,7 +1537,7 @@ function tnFingerprint(text) {
 // XERK-2710: an INTERIM notice (the agent stopped with background work of its
 // own still running) is not a stop; the row becomes a wait. Mirror of
 // hub-agent.py TN_INTERIM_RE.
-const TN_INTERIM_RE = /<note>[^<]*(?:background work of its own still running|notifies again if it does)|<summary>[^<]*is waiting on its own background work<\/summary>/;
+const TN_INTERIM_RE = /<note>[^<]*(?:background work of its own still running|notifies again if it does)|<summary>[^<]*is waiting on its own background work[ \t\r\n]*<\/summary>/;
 // Only the notification's own tags count, never its <result> (a final report
 // quoting the interim note still stops). Mirror of hub-agent.py _tn_interim.
 function tnInterim(text) {

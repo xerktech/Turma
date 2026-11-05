@@ -5141,6 +5141,52 @@ class TestLiveAgentsScan(unittest.TestCase):
         st = self._scan(TASK_LAUNCH_ENTRIES + [own])
         self.assertEqual(st["stopAt"], {"agent-1": ha._ts_ms("2026-10-03T12:09:00.000Z")})
 
+    # XERK-2710: Claude Code's interim notification — the subagent ended its
+    # turn with background work of its own still running.
+    INTERIM_2 = {"type": "queue-operation", "operation": "enqueue",
+                 "timestamp": "2026-10-03T12:03:00.000Z",
+                 "content": "<task-notification>\n<task-id>agent-1</task-id>\n"
+                            "<status>completed</status>\n<summary>Agent \"QA the parity change\" "
+                            "is waiting on its own background work</summary>\n<note>This agent "
+                            "stopped with background work of its own still running.</note>\n"
+                            "</task-notification>"}
+
+    def test_an_interim_notification_reads_the_agent_as_waiting_not_stopped(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_2,
+                                               dict(self.INTERIM_2, operation="remove")])
+        self.assertEqual(ha.live_agents_report(st), [
+            {"type": "agent", "label": "QA the parity change", "kind": "wait-external"}])
+        # Its final notification retires it.
+        st = self._scan([dict(self.DONE_1, timestamp="2026-10-03T12:04:00.000Z")], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_resume_of_a_waiting_agent_makes_it_work_again(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_2] + self.RESUME)
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], [None])
+
+    def test_an_interim_notice_never_turns_a_shell_into_an_agent_wait(self):
+        # Only an agent/workflow row is relabelled; a shell keeps the kind its
+        # command was classified as. And trailing whitespace still matches.
+        interim = dict(self.INTERIM_2, content=self.INTERIM_2["content"]
+                       .replace("agent-1", "bsh1").replace("work</summary>", "work \r\n</summary>"))
+        st = self._scan(SHELL_LAUNCH_ENTRIES + [interim])
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], ["wait-external"])
+        st = self._scan(TASK_LAUNCH_ENTRIES + [dict(self.INTERIM_2, content=self.INTERIM_2["content"]
+                        .replace("work</summary>", "work \t\n</summary>"))])
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], ["wait-external"])
+        work = json.loads(json.dumps(SHELL_LAUNCH_ENTRIES))
+        work[0]["message"]["content"][0]["input"]["command"] = "npm test"
+        st = self._scan(work + [interim])
+        self.assertEqual([r["kind"] for r in ha.live_agents_report(st)], ["work"])
+
+    def test_the_interim_wording_must_end_the_summary(self):
+        # A description quoting the phrase does not make a FINAL notice interim.
+        final = dict(self.DONE_1, content=self.DONE_1["content"].replace(
+            "</status>", "</status>\n<summary>Agent \"is waiting on its own background "
+                         "work\" finished</summary>"))
+        st = self._scan(TASK_LAUNCH_ENTRIES + [final])
+        self.assertEqual(ha.live_agents_report(st), [])
+
     def test_a_resume_of_a_live_agent_keeps_its_row(self):
         st = self._scan(TASK_LAUNCH_ENTRIES)
         before = dict(st["liveAgents"]["agent-1"])

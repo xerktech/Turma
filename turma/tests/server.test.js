@@ -27851,35 +27851,29 @@ function nudgeHost(host, sessions, now = Date.now()) {
 }
 const nudges = (host) => (agents[host].commands || []).filter((c) => c.type === "input");
 
-test("XERK-2710: a parked background AGENT is nudged as an agent, never as a shell", () => {
-  hub.attentionNudged.clear();
-  const host = "nudge-agent";
-  const t0 = Date.now();
-  const stalled = { id: "s1", status: "running", session: { paneBusy: false, transcriptAgeSec: 47 * 60,
-    agents: [{ type: "qa-delta", label: "Re-QA vr image fixes", kind: "wait-external" }] } };
-  const a = nudgeHost(host, [{ session: stalled, attn: { state: "needs-you:stalled", since: t0, why: "x" } }], t0);
-  a.lastSeen = t0;
-  hub.attentionNudgeSweep(t0);
-  assert.match(nudges(host)[0].text, /^Your background agent `Re-QA vr image fixes` has produced nothing/);
-  // A blank-labelled pair reads as a count, worded by what the rows are.
-  const now = Date.now();
-  const att = (agentsRows) => {
-    const sess = { status: "running", session: { paneBusy: false, transcriptAgeSec: 46 * 60, agents: agentsRows } };
-    return hub.sessionAttention(sess, hub.sessionWorking(sess, now, now), hub.sessionWait(sess, now, now), now);
-  };
-  const row = (type) => ({ type, label: " ", kind: "wait-external" });
-  assert.equal(att([row("qa"), row("qa")]).why, "2 background agents");
-  // A count reads as plural all the way through the advice.
-  hub.attentionNudged.clear();
-  const host2 = "nudge-agents";
-  const two = { id: "s2", status: "running", session: { paneBusy: false, transcriptAgeSec: 47 * 60,
-    agents: [row("qa"), row("qa")] } };
-  const b = nudgeHost(host2, [{ session: two, attn: { state: "needs-you:stalled", since: t0, why: "x" } }], t0);
-  b.lastSeen = t0;
-  hub.attentionNudgeSweep(t0);
-  assert.match(nudges(host2)[0].text, /^Your 2 background agents have produced nothing for 47 minutes\. Check whether they are still doing anything; if one is waiting.*; if one is dead, say what you know/);
-  assert.equal(att([row("shell"), row("qa")]).why, "2 background tasks");
-  assert.equal(att([row("shell"), row("shell")]).why, "2 background shells");
+// XERK-2710: an AGENT waiting on its own background work is a wait row too, and its
+// progress is in its own transcript — so its stall nudge must never say "stop it".
+test("XERK-2710: a stalled background AGENT is nudged as an agent and never told to stop", () => {
+  const sess = (agents) => ({ session: { transcriptAgeSec: 47 * 60, agents } });
+  const qa = { type: "qa-delta", label: "Re-QA vr image fixes", kind: "wait-external" };
+  assert.equal(hub.attentionNudgeText("stalled", sess([qa])),
+    "Your background agent `Re-QA vr image fixes` is waiting on its own background work and this "
+    + "conversation has been quiet for 47 minutes. Check its progress before deciding anything — do not "
+    + "stop a run that is still working; if it is stuck or dead, say what you know and end the turn.");
+  assert.match(hub.attentionNudgeText("stalled", sess([qa, { ...qa, label: "x" }])),
+    /^Your 2 background agents are waiting on their own background work .* Check their progress/);
+  // A shell beside it keeps the shell advice for the shell only, worded for a mix.
+  const mix = hub.attentionNudgeText("stalled", sess([qa, { type: "shell", label: "", kind: "wait-timed" }]));
+  assert.match(mix, /^Your 2 background tasks have produced nothing for 47 minutes\. /);
+  assert.match(mix, /if a background shell is waiting .* stop it .* do not stop a background agent/);
+  // The attention `why` counts what waits, never assuming shells.
+  assert.equal(hub.waitSubject([qa, { ...qa, label: "" }]), "2 background agents");
+  assert.equal(hub.waitSubject([qa, { type: "shell", kind: "wait-timed" }]), "2 background tasks");
+  assert.equal(hub.waitSubject([{ type: "shell", kind: "wait-timed" }, { type: "shell", kind: "wait-external" }]),
+    "2 background shells");
+  // Plural shells read as plural (QA: "2 background shells … whether it is").
+  assert.match(hub.attentionNudgeText("stalled", sess([{ type: "shell", kind: "wait-timed" },
+    { type: "shell", kind: "wait-external" }])), /^Your 2 background shells have .* whether they are still/);
 });
 
 test("XERK-1572: a stalled shell is nudged once per edge, in the operator's voice, with backoff", () => {

@@ -50,16 +50,22 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
     record is that run's stop; never drop the timestamp compare, or the agent is live forever.
   - Accepted gap: a message "queued for delivery" to an agent that finishes first resumes it
     with no transcript record, so that run reads idle.
-- **An INTERIM notice is a wait, not a stop** (XERK-2710, `_tn_interim` ↔ `tnInterim`): an agent
-  ending its turn with background work of its own running notifies `completed` with a "background
-  work of its own still running … notifies again" note. Its fresh enqueue re-kinds the row
-  `wait-external` (copies do nothing); the final notice retires it, a resume makes it work.
-  - Matched on the notice's own tags only, never `<result>`: a report quoting the note is a stop.
+- **An INTERIM notice is a wait, not a stop** (XERK-2710, `_tn_interim` ↔ `tnInterim`): Claude
+  Code's notice (status `completed`) when a subagent ends its turn with its own background work
+  running. Its fresh enqueue re-kinds the row `wait-external` (copies do nothing), so the session
+  reads waiting, not idle; the final notice retires it, a `SendMessage` resume makes it work.
+  - Matched on the summary ENDING "is waiting on its own background work" OR the note "background
+    work of its own still running … notifies again" (older builds pair that note with a "finished"
+    summary) — the notice's own tags only, never `<result>`: a report quoting either is a stop.
   - `interimAt` (id → newest fresh interim timestamp, in the snapshot + lead-in, the `stopAt`
     twin): a launch/resume record timestamped at or before it registers parked, never as work.
-  - Never ignore it: ~40% of such agents on a real host never notified again, so the XERK-1570
-    stall rule bounds them: stalled after the window, the stalled alert, up to two nudges
-    (worded "background agent", `waitNoun`). Tests: the `interim` cases in `TestLiveAgentsScan` ↔ js.
+  - Never ignore it: ~40% of such agents on a real host never notified again, so they would read
+    working forever. As a wait they go stalled after `ATTENTION_WAIT_STALL_MIN` (alert + nudges).
+  - **Its stall nudge never says "stop it"** (`attentionNudgeText`): the parent's silence is no sign
+    of death (the agent writes its own transcript), so an all-agent wait is named as an agent and
+    told to check first. Wait counts name agents/shells/tasks (`backgroundRowsLabel`, web
+    `backgroundWorkLabel`, Android `backgroundRowsLabel`) — never assume a wait row is a shell.
+  - Tests: the `interim` cases in `TestLiveAgentsScan` and `TestSessionReport` ↔ js.
 
 ## The published live-agent set survives a restart (XERK-1587)
 
