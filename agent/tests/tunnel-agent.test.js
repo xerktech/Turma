@@ -3310,6 +3310,20 @@ test("restoreLiveAgents: seeds from the manager's snapshot and folds the gap", (
   assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
   assert.deepEqual(mod.liveAgentsReport(st), [{ type: "shell", label: "Watch CI", kind: "wait-external" }]);
 
+  // XERK-2712: a parked agent keeps its clock across a restart; one with no clock
+  // (an older agent's snapshot) or a future one is given now, so it still expires.
+  const parkedRow = { type: "qa", label: "QA", resolveId: "", kind: "wait-external" };
+  for (const [parkedAt, want] of [[1000, 1000], [undefined, null], [2 ** 52, null]]) {
+    snap({ liveAgents: { a1: { ...parkedRow, parkedAt } } });
+    st = fresh();
+    const before = Date.now();
+    assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
+    const got = st.live.get("a1").parkedAt;
+    if (want != null) assert.equal(got, want);
+    else assert.ok(got >= before && got <= Date.now(), String(got));
+  }
+  assert.deepEqual(mod.liveAgentsReport(st, Date.now() + 3 * 3600 * 1000), []);
+
   // XERK-2707: the snapshot's launch map relists a resumed agent's own row; a
   // snapshot without one (older manager) still restores.
   snap({ liveAgents: {}, stoppedAgents: ["agent-1"],

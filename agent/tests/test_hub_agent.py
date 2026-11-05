@@ -4995,6 +4995,12 @@ class TestLiveAgentsScan(unittest.TestCase):
         self.assertEqual(ha.live_agents_report(st, now_ms=exp), [])
         # The clock survives a restart through the snapshot row.
         self.assertEqual(ha._snapshot_row(st["liveAgents"]["agent-1"])["parkedAt"], parked)
+        # A snapshot row with no clock (an older agent's) or a future one gets now.
+        for bad in (None, 2 ** 52):
+            row = dict(st["liveAgents"]["agent-1"], parkedAt=bad)
+            got = ha._snapshot_row(row)["parkedAt"]
+            self.assertLessEqual(got, int(ha.time.time() * 1000))
+            self.assertGreater(got, exp)
         # A resume makes it work again and clears the clock.
         st = self._scan(self.RESUME, st)
         self.assertNotIn("parkedAt", st["liveAgents"]["agent-1"])

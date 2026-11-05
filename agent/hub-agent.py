@@ -12432,7 +12432,9 @@ def _scan_agent_entry(entry, state):
                 # not working forever: 14 of 39 such agents on a real host
                 # never sent a final notification, and a session whose rows
                 # are all waits goes stalled after ATTENTION_WAIT_STALL_MIN.
-                parked = _ts_ms(entry.get("timestamp")) or int(time.time() * 1000)
+                # Never in the future: a forged or skewed stamp must not hold it forever.
+                now_ms = int(time.time() * 1000)
+                parked = min(_ts_ms(entry.get("timestamp")) or now_ms, now_ms)
                 for tid in tn["taskIds"]:
                     row = live.get(tid)
                     if row is not None and row.get("type") != "shell":
@@ -12790,6 +12792,12 @@ def _snapshot_row(row):
         v = row.get(k)
         if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= _MAX_SAFE_INT:
             out[k] = v
+    # A parked agent row always carries a clock no later than now (XERK-2712):
+    # one from a snapshot that lacks it (an older agent's) or names a future
+    # time would otherwise read waiting forever, since it never stalls.
+    if out["type"] != "shell" and out.get("kind") == SHELL_KIND_WAIT_EXTERNAL:
+        now_ms = int(time.time() * 1000)
+        out["parkedAt"] = min(out.get("parkedAt", now_ms), now_ms)
     return out
 
 
@@ -12895,7 +12903,8 @@ def live_agents_report(state, now_ms=None):
     row carries none (read as `work`, XERK-1570) unless it waits on its own
     background work (`wait-external`, XERK-2710). A row parked that way for
     INTERIM_AGENT_EXPIRE_MS is left out (XERK-2712): its agent most likely
-    finished without a final notice, and a later notice or resume relists it."""
+    finished without a final notice. Only a resume relists it: a repeated
+    interim notice keeps the first notice's clock."""
     now = int(time.time() * 1000) if now_ms is None else now_ms
     out = []
     for a in (state.get("liveAgents") or {}).values():

@@ -1650,7 +1650,9 @@ function scanAgentEntry(entry, state) {
       if (!tn || !tn.taskIds.length) continue;
       if (tnInterim(tn)) {
         // Not a stop (XERK-2710): the row reads as waiting on its own work.
-        const parked = tsMs(entry.timestamp) ?? Date.now();
+        // Never in the future (a skewed stamp must not hold it forever); 0 reads as
+        // no stamp, as py's `or` does.
+        const parked = Math.min(tsMs(entry.timestamp) || Date.now(), Date.now());
         for (const id of tn.taskIds) {
           const row = live.get(id);
           if (row && row.type !== "shell") {
@@ -1781,6 +1783,10 @@ function snapshotRow(v) {
   if (["work", "wait-timed", "wait-external"].includes(v.kind)) row.kind = v.kind;
   for (const k of ["startedAt", "eta", "parkedAt"]) {
     if (Number.isSafeInteger(v[k]) && v[k] >= 0) row[k] = v[k];
+  }
+  // Mirror of _snapshot_row: a parked agent row always has a clock, never later than now.
+  if (row.type !== "shell" && row.kind === "wait-external") {
+    row.parkedAt = Math.min(row.parkedAt ?? Date.now(), Date.now());
   }
   return row;
 }
