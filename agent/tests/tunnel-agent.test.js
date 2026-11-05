@@ -1593,6 +1593,64 @@ const RESUME_ENTRIES = [
     toolUseResult: { success: true, message: "Resuming agent agent-1", resumedAgentId: "agent-1" } },
 ];
 
+// XERK-2708: twin of test_a_resumed_run_whose_stop_was_written_first_stays_stopped.
+test("scanAgentEntry: a resumed run whose own stop was written first stays stopped", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const early = { ...notif("agent-1", "completed"), timestamp: "2026-10-03T12:00:00.000Z" };
+  const own = { ...notif("agent-1", "failed"), timestamp: "2026-10-03T12:09:00.000Z" };
+  let st = scanAll([...LAUNCH_ENTRIES, early, own, ...RESUME_ENTRIES]);
+  assert.deepEqual(liveAgentsReport(st), []);
+  assert.ok(st.stopped.has("agent-1"));
+  st = scanAll([{ ...own, operation: "remove" }], st);
+  assert.deepEqual(liveAgentsReport(st), []);
+  // A previous run's stop OLDER than the resume does not block it.
+  st = scanAll([...LAUNCH_ENTRIES,
+    { ...notif("agent-1", "completed"), timestamp: "2026-10-03T12:04:59.999Z" }, ...RESUME_ENTRIES]);
+  assert.equal(liveAgentsReport(st).length, 1);
+});
+
+test("scanAgentEntry: stopAt is set by a fresh enqueue only, and its own millisecond counts", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const late = "2026-10-03T12:09:00.000Z";
+  let st = scanAll([...LAUNCH_ENTRIES, notif("agent-1", "completed"),
+    { ...notif("agent-1", "completed"), operation: "remove", timestamp: late },
+    { ...notif("agent-1", "completed", "user"), timestamp: late }, ...RESUME_ENTRIES]);
+  assert.ok(!st.stopAt.has("agent-1"));
+  assert.equal(liveAgentsReport(st).length, 1);
+  st = scanAll([...LAUNCH_ENTRIES,
+    { ...notif("agent-1", "completed"), timestamp: "2026-10-03T12:05:00.000Z" }, ...RESUME_ENTRIES]);
+  assert.deepEqual(liveAgentsReport(st), []);
+});
+
+test("backscanLiveAgents: the lead-in carries stopAt", () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-leadin-"));
+  const p = path.join(dir, "t.jsonl");
+  const pad = { type: "user", message: { content: "x".repeat(4000) } };
+  const own = { ...notif("agent-1", "failed"), timestamp: "2026-10-03T12:09:00.000Z" };
+  const lines = [...LAUNCH_ENTRIES, notif("agent-1", "completed"), own, pad, pad, ...RESUME_ENTRIES];
+  fs.writeFileSync(p, lines.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  const tail = JSON.stringify(pad).length + RESUME_ENTRIES.reduce((n, e) => n + JSON.stringify(e).length + 1, 0) + 10;
+  const st = { live: new Map(), tasks: new Map() };
+  mod.backscanLiveAgents(p, st, tail);
+  assert.deepEqual(mod.liveAgentsReport(st), []);
+});
+
+test("restoreLiveAgents: keeps only usable stopAt values", () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-stopat-"));
+  const p = path.join(dir, "conv.jsonl");
+  fs.writeFileSync(p, "");
+  fs.writeFileSync(path.join(dir, "s1.json"), JSON.stringify({
+    v: 1, transcript: "conv.jsonl", offset: 0, liveAgents: {}, agentTasks: {}, shellCalls: {},
+    stoppedAgents: ["agent-1"], stopAt: { "agent-1": 1791029340000, bad: "x", neg: -1, big: 2 ** 60 } }));
+  const st = { live: new Map(), tasks: new Map() };
+  assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
+  assert.deepEqual([...st.stopAt], [["agent-1", 1791029340000]]);
+  mod.scanAgentEntry(RESUME_ENTRIES[1], st);
+  assert.deepEqual(mod.liveAgentsReport(st), []);
+});
+
 test("scanAgentEntry: a SendMessage-resumed agent is live again until its next stop", () => {
   const { liveAgentsReport } = require("../tunnel-agent.js");
   const launch = JSON.parse(JSON.stringify(LAUNCH_ENTRIES));
