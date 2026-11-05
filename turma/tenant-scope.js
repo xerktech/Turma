@@ -126,6 +126,7 @@ const ROUTES = [
   ["POST", "/api/jira/:site/:issue/epic-run", "org"],
   ["POST", "/api/orgs/:site/meetings/:id/items/:item", "org"],
   ["POST", "/api/orgs/:site/meeting-label", "org"],
+  ["POST", "/api/orgs/:site/meeting-focus", "org"],
   ["POST", "/api/orgs/:site/decisions", "org"],
   ["POST", "/api/orgs/:site/daily-brief/run", "org"],
   ["GET PUT", "/api/orgs/:site/daily-brief/schedule", "org"],
@@ -232,7 +233,7 @@ const SCOPERS = {
   autoStartOrgs: bySite, autoMergeOrgs: bySite, priorityWriteBackOrgs: bySite,
   dedupeLinkOrgs: bySite, orgColors: bySite, triagePolicies: bySite,
   decisions: bySite, decisionCounts: bySite, dailyBriefSchedules: bySite,
-  dailyBriefs: bySite, meetingProposals: bySite, meetingLabels: bySite, meetingLabelMisses: bySite,
+  dailyBriefs: bySite, meetingProposals: bySite, meetingLabels: bySite, meetingLabelMisses: bySite, meetingFocus: bySite,
   ticketModels: byTicket, ticketRuntimes: byTicket, ticketPlatforms: byTicket,
   ticketTriageActions: byTicket, epicRuns: byTicket,
   ticketAgents: (view) => (m) => filterMap(m, (k, v) =>

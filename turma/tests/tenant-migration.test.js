@@ -28,7 +28,7 @@ for (const k of [
   "PERMISSION_POLICIES_FILE", "TRIAGE_ACTIONS_FILE", "PRIORITY_WRITEBACK_ORGS_FILE",
   "DEDUPE_LINK_ORGS_FILE", "AUTOMERGE_ORGS_FILE", "ORG_COLORS_FILE", "REPO_TIERS_FILE",
   "EPIC_RUNS_FILE", "EPIC_BUILDERS_FILE", "DECISIONS_FILE", "TENANCY_FILE",
-  "DAILY_BRIEF_SCHEDULES_FILE", "DAILY_BRIEFS_FILE", "MEETING_PROPOSALS_FILE", "MEETING_LABELS_FILE", "MEETING_LABEL_MISSES_FILE", "MEETING_TOKENS_FILE",
+  "DAILY_BRIEF_SCHEDULES_FILE", "DAILY_BRIEFS_FILE", "MEETING_PROPOSALS_FILE", "MEETING_LABELS_FILE", "MEETING_LABEL_MISSES_FILE", "MEETING_FOCUS_FILE", "MEETING_TOKENS_FILE",
   "ARCHIVE_PURGED_TENANTS_FILE", "USAGE_LEDGER_FILE", "PERMISSION_LEDGER_FILE", "OUTCOME_LEDGER_FILE",
 ]) process.env[k] = path.join(DIR, `${k.toLowerCase()}.json`);
 process.env.MIGRATE_SPOOL_DIR = path.join(DIR, "spool");
@@ -99,6 +99,7 @@ const ORG_SAMPLES = {
     startedAt: NOW - 6e5, endedAt: NOW, receivedAt: NOW, participants: [], items: [] }]],
   meetingLabels: [SITE, "acme"],
   meetingLabelMisses: ["yprime", { at: NOW }],
+  meetingFocus: [SITE, { names: ["Ann Lee"], role: "QA lead" }],
   ticketAgents: [`${SITE}/ACME-1`, { host: "box2554", at: NOW }],
   ticketModels: [`${SITE}/ACME-1`, { model: "sonnet", at: NOW }],
   ticketRuntimes: [`${SITE}/ACME-1`, { runtime: "dsh", at: NOW }],
@@ -137,6 +138,10 @@ test("XERK-2554: seed untenanted data in every partitioned store", async () => {
   0, Buffer.byteLength(JSON.stringify(list)), list, SITE);
   assert.equal(archive.sessionRow("t2554").host, "gone2554");
 
+  // Every sampled store is migrated too: one dropped from the list would keep
+  // its rows under the old site key.
+  const migrated = new Set(hub.tenantOrgStores().map((s) => s.name));
+  for (const name of Object.keys(ORG_SAMPLES)) assert.ok(migrated.has(name), `${name} is not tenant-migrated`);
   for (const s of hub.tenantOrgStores()) {
     assert.ok(ORG_SAMPLES[s.name], `no sample for org store ${s.name} — add one`);
     const [k, v] = ORG_SAMPLES[s.name];

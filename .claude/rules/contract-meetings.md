@@ -117,8 +117,8 @@ ticket builds to this file; change it here first.
 - **A `creating` review fails at `MEETING_CREATE_DEADLINE_MS`** (15 min) with no answer: a hub
   killed before the host took the command (debounced queue, unpersisted result caches) otherwise
   left it `creating` forever, refusing both Approve and Reject.
-- `edited` is the page's own flag (or a changed title): the page always sends the meeting context
-  as the description, so a text compare reads every approve as edited.
+- `edited` is the page's own flag (or a changed title): the page always sends a description,
+  so a text compare would misread an approve.
 - Tenir's duplicate answer (`meetingTenirWire`) carries no `review`.
 - A meeting decision's `label` (the meeting title) rides the heartbeat reply (`decisionsReplyFor`).
 - **Approve + start** waits (`session:"waiting"`) until `ticketRepo` resolves the new ticket on the
@@ -131,6 +131,18 @@ ticket builds to this file; change it here first.
 - `{type:"extractMeeting", runId, siteKey, meetingId, model, runtime}`; `runId` hub-minted
   `^[0-9a-f]{1,32}$`, `model` concrete (`MEETINGS_AUTO_MODEL` = "sonnet", the XERK-2509
   eval's pick, `docs/meeting-items-adr.md`), `runtime` `claude|dsh|qwen`.
+- **Whose work: optional `focus` `{names[], role}`** (XERK-2514), the org's `meetingFocus` (hub
+  store, `POST /api/orgs/<site>/meeting-focus {names, role}`, ≤5 names ≤100, role ≤300, control
+  and format chars stripped; no names and no role clears it). Absent = everyone's work.
+  - Why: a standup is everyone's status; without it every speaker's work became a proposal.
+  - The agent (`normalize_meeting_focus`) appends it AFTER the meeting data as the reviewer's
+    words, JSON-encoded, then drops any item still assigned to a name not in `names`
+    (`meeting_focus_filter`). A null assignee and a decision stay.
+  - A name matches when every word of one fits a word of the other (same, or one begins the
+    other): "Malcolm H." and "Lee, Ann" match; "Malcolm Smith" doesn't. Strict equality dropped
+    the operator's own items under a caption spelling (QA); "any word" let a second Malcolm in.
+  - An older agent ignores the key (no filter, no failure), so no version gate.
+  - Tests: `XERK-2514:` cases in `server.test.js`, `test_hub_agent.py` `TestMeetingWorker`.
 - **The command carries no transcript** (a command rides the host record and `state.json`). The
   agent pulls it: `GET /api/agents/<host>/meetings/<runId>/transcript` (agent-authed, `<host>`
   proved by the credential, XERK-268) answers `{runId, siteKey, meetingId, title, platform,

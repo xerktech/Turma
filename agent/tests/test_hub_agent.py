@@ -56152,7 +56152,7 @@ class TestMeetingItems(unittest.TestCase):
         job, err = ha.validate_meeting_command(good)
         self.assertIsNone(err)
         self.assertEqual(job, {"runId": "ab12", "siteKey": "s", "meetingId": "m-1",
-                               "model": "haiku", "runtime": "claude"})
+                               "model": "haiku", "runtime": "claude", "focus": None})
         for over, reportable in (({"runId": "AB"}, False), ({"siteKey": ""}, False),
                                  ({"meetingId": "a/b"}, False), ({"model": "opus"}, True),
                                  ({"model": "auto"}, True), ({"runtime": "x"}, True)):
@@ -56315,6 +56315,69 @@ class TestMeetingWorker(ManagerMixin, unittest.TestCase):
             self.assertIn(it["kind"], ha.MEETING_ITEM_KINDS)
             self.assertTrue(0 < len(it["title"]) <= 200)
             self.assertTrue(1 <= len(it["quotes"]) <= 5)
+
+    def test_xerk2514_focus_narrows_the_prompt_and_drops_others_work(self):
+        """A standup is everyone's status: with the operator's focus the model is
+        told to keep only their work, and an item it still gives to someone else
+        is dropped. Their own and unowned items stay."""
+        tm = TestMeetingItems()
+        tm.doc, tm.t = self.doc, ha.normalize_meeting_transcript(
+            dict(self.doc, runId="ab12"), "ab12", self.SITE)
+        speakers = sorted({s["speaker"] for s in tm.t["segments"]} - {"Tom Okafor"})
+        me = speakers[0]
+        mine = tm.item(title="Mine", suggestedAssignee=me)
+        unowned = tm.item(title="Unowned", suggestedAssignee=None)
+        self.replies = [tm.reply(tm.item(), mine, unowned)]   # item() is Tom's
+        focus = {"names": [" ".join(reversed(me.split())), "x" * 101, 7],
+                 "role": "Backend\u202e engineer"}
+        self.sm.handle_commands([dict(self._cmd(focus=focus), cmdId="c1")])
+        [row] = self._drain()
+        self.assertEqual([i["title"] for i in row["items"]], ["Mine", "Unowned"])
+        [(_, stdin_text)] = self.calls
+        self.assertTrue(stdin_text.startswith(ha.MEETING_INSTRUCTION))
+        tail = stdin_text[stdin_text.index("End of the meeting data"):]
+        self.assertIn(json.dumps(" ".join(reversed(me.split()))), tail)
+        self.assertIn('"role": "Backend engineer"', tail)   # bidi control stripped
+        self.assertNotIn("x" * 101, tail)                    # over-long name dropped
+
+    def test_xerk2514_no_focus_keeps_every_item_and_the_old_prompt(self):
+        tm = TestMeetingItems()
+        tm.doc, tm.t = self.doc, ha.normalize_meeting_transcript(
+            dict(self.doc, runId="ab12"), "ab12", self.SITE)
+        self.replies = [tm.reply(tm.item())]
+        for focus in (None, {}, {"names": [], "role": ""}, "Malcolm", {"names": "Malcolm"}):
+            self.assertIsNone(ha.normalize_meeting_focus(focus), focus)
+        self.sm.handle_commands([dict(self._cmd(focus={"names": "Malcolm"}), cmdId="c1")])
+        [row] = self._drain()
+        self.assertEqual(len(row["items"]), 1)
+        [(_, stdin_text)] = self.calls
+        self.assertNotIn("End of the meeting data", stdin_text)
+
+    def test_xerk2514_name_match_is_by_word_set(self):
+        # Captions spell one person many ways; a clashing word is someone else.
+        f = {"names": ["Malcolm Habeeb"], "role": ""}
+        for who, mine in (("Malcolm Habeeb", True), ("Habeeb, Malcolm", True), ("malcolm", True),
+                          ("MALCOLM HABEEB (Guest)", True), ("Malcolm H.", True),
+                          ("Malcolm (he/him)", True), ("Mal Habeeb", True), ("M. Habeeb", True),
+                          ("Mal", True), ("Malcolm Smith", False), ("Malcolm S.", False),
+                          ("Sara H.", False), ("Dev M.", False), ("Sara Diaz", False),
+                          ("Jun", False), ("", False), ("(Guest)", False)):
+            self.assertEqual(ha.meeting_focus_is_mine(who, f), mine, who)
+        # A one-letter word in the operator's own name is not a wildcard.
+        j = {"names": ["J Smith"], "role": ""}
+        for who, mine in (("Jun Park", False), ("Jane Smith", True), ("J. Smith", True)):
+            self.assertEqual(ha.meeting_focus_is_mine(who, j), mine, who)
+        # Short forms on both sides, and accents either way.
+        self.assertTrue(ha.meeting_focus_is_mine("Malcolm H.", {"names": ["Mal Habeeb"]}))
+        self.assertTrue(ha.meeting_focus_is_mine("Jose G.", {"names": ["José García"]}))
+        self.assertTrue(ha.meeting_focus_is_mine("José Garcia", {"names": ["Jose Garcia"]}))
+        # Only a role: nobody to compare against, so the model's pick stands.
+        items = [{"suggestedAssignee": "Tom"}]
+        self.assertEqual(ha.meeting_focus_filter(items, {"names": [], "role": "QA"}), items)
+        # A decision stays whoever made it; another person's task goes.
+        items = [{"kind": "decision", "suggestedAssignee": "Sara Diaz"},
+                 {"kind": "task", "suggestedAssignee": "Sara Diaz"}]
+        self.assertEqual(ha.meeting_focus_filter(items, f), items[:1])
 
     def test_a_redelivered_command_runs_once(self):
         self.sm._stage_meeting(self._cmd())

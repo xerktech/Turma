@@ -6,7 +6,6 @@ import com.xerktech.turma.model.Meeting
 import com.xerktech.turma.model.MeetingItem
 import java.time.Instant
 import java.time.ZoneId
-import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
@@ -65,25 +64,12 @@ fun meetingDefaultType(kind: String, types: List<CreateType>): String {
 }
 
 /**
- * What the ticket says by default: the proposal, then where it came from — the
- * meeting and its date, each quote with its offset, the Tenir link. Built on the
- * phone so the operator sees exactly what is sent when editing.
+ * What the ticket says by default: the proposal only, as `meetings.js` sends it.
+ * The meeting's title, date, quotes and Tenir link stay in Turma (XERK-2514): the
+ * ticket lands in the org's own tracker, where colleagues read it.
  */
-fun meetingTicketDescription(m: Meeting, it: MeetingItem): String {
-    val lines = mutableListOf<String>()
-    if (it.description.isNotEmpty()) lines += listOf(it.description, "")
-    val date = if (m.startedAt > 0) {
-        " (" + DateTimeFormatter.ISO_LOCAL_DATE.format(Instant.ofEpochMilli(m.startedAt).atOffset(ZoneOffset.UTC)) + ")"
-    } else ""
-    lines += "Proposed from the meeting \"${m.title}\"$date."
-    for (q in it.quotes) {
-        lines += "> " + (if (q.speaker.isNotEmpty()) "${q.speaker}: " else "") + q.text +
-            (if (q.atMs >= 0) " [${meetingClock(q.atMs)}]" else "")
-    }
-    val u = safeMeetingUrl(m.tenirUrl)
-    if (u.isNotEmpty()) lines += "Meeting: $u"
-    return lines.joinToString("\n")
-}
+@Suppress("UNUSED_PARAMETER")
+fun meetingTicketDescription(m: Meeting, it: MeetingItem): String = it.description
 
 /** The draft an Edit opens with: a decision edits its own text, a ticket the full description. */
 fun meetingDraftDescription(m: Meeting, it: MeetingItem): String =

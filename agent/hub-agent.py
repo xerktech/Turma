@@ -25415,6 +25415,111 @@ def normalize_meeting_transcript(doc, run_id, site_key):
             "segments": segs}
 
 
+# Whose work to propose (XERK-2514): the operator's names as captions show them
+# and their role, set per org on the Brief page and sent on `extractMeeting` as
+# `focus`. A standup is everyone's status; without it every speaker's work
+# became a proposal. The model is told to keep only the operator's work, and
+# meeting_focus_filter drops any item it still assigns to someone else.
+MEETING_FOCUS_NAMES_MAX = 5
+MEETING_FOCUS_ROLE_MAX = 300
+
+
+def _meeting_focus_text(v, cap):
+    """Operator text for the focus block: one line, no control/format chars, or ""."""
+    if not isinstance(v, str):
+        return ""
+    s = "".join(ch for ch in v if unicodedata.category(ch) not in ("Cc", "Cf"))
+    s = " ".join(s.split())
+    return s if len(s) <= cap else ""
+
+
+def normalize_meeting_focus(raw):
+    """The command's `focus` -> {"names": [...], "role": str} or None (off).
+    Malformed parts are dropped, never guessed: an unreadable focus is no focus."""
+    if not isinstance(raw, dict):
+        return None
+    names = []
+    for n in raw.get("names") if isinstance(raw.get("names"), list) else []:
+        t = _meeting_focus_text(n, MEETING_NAME_MAX)
+        if t and t.casefold() not in {x.casefold() for x in names}:
+            names.append(t)
+    names = names[:MEETING_FOCUS_NAMES_MAX]
+    role = _meeting_focus_text(raw.get("role"), MEETING_FOCUS_ROLE_MAX)
+    return {"names": names, "role": role} if names or role else None
+
+
+def meeting_focus_instruction(focus):
+    """The instruction block that narrows the items to the operator's own work.
+    The operator wrote `focus`, but it is still JSON-encoded so a name can't
+    pose as an instruction."""
+    if not focus:
+        return ""
+    who = json.dumps(focus, ensure_ascii=False)
+    return (
+        "\n\nEnd of the meeting data. This last part is from the reviewer, not "
+        "the meeting.\n"
+        "Whose work: the person reviewing these items is described here as "
+        f"JSON: {who}. `names` are how they appear in the captions; `role` is "
+        "their job.\n"
+        "- Propose ONLY work that is theirs: work they took on, were asked to "
+        "do or were assigned; a bug or follow-up that falls to them or to "
+        "their role; and a decision that changes their work.\n"
+        "- Many of these meetings are standups where everyone reports their "
+        "own status. Leave out every other person's tasks, updates, bugs and "
+        "follow-ups, even when they sound important.\n"
+        "- When they are the one doing it, set suggestedAssignee to their "
+        "name as spelled in the data. Work nobody took on goes in only when "
+        "it clearly belongs to their role, with suggestedAssignee null.\n"
+        "- Nothing of theirs: {\"items\": []}.\n"
+    )
+
+
+# Caption suffixes that are not part of a name: "(he/him)", "(Guest)".
+_MEETING_NAME_NOISE = frozenset(
+    "he him his she her hers they them theirs guest external".split())
+
+
+def _meeting_name_tokens(s):
+    """A name's words, accents folded ("José" = "Jose": a typed name and a
+    caption need not agree on them), suffix words dropped."""
+    s = "".join(ch for ch in unicodedata.normalize("NFKD", s or "")
+                if not unicodedata.combining(ch))
+    return set(_meeting_norm(s).split()) - _MEETING_NAME_NOISE
+
+
+def _meeting_words_fit(a, b):
+    """Is every word of `a` the same as, or a short form of, a word of `b`?
+    One word begins the other: an initial ("H"), a short form ("Mal")."""
+    return bool(a) and all(any(x.startswith(y) or y.startswith(x) for y in b) for x in a)
+
+
+def meeting_focus_is_mine(assignee, focus):
+    """Could `assignee` be one of the operator's names? Captions spell a person
+    many ways ("Malcolm H.", "Mal Habeeb", "M. Habeeb", "Malcolm (he/him)"),
+    and a strict match threw their own items away (XERK-2514 QA); but a word
+    that clashes ("Malcolm Smith", "Sara H.") is someone else. So: every word
+    of one name fits a word of the other, in either direction."""
+    got = _meeting_name_tokens(assignee)
+    for n in focus.get("names") or []:
+        want = _meeting_name_tokens(n)
+        if _meeting_words_fit(got, want) or _meeting_words_fit(want, got):
+            return True
+    return False
+
+
+def meeting_focus_filter(items, focus):
+    """Drop the items the model still assigned to someone else: the backstop
+    for a leak, not the narrowing itself (the prompt does that). A null
+    assignee stays (kept for the operator's role), and so does a decision
+    (its assignee may be whoever made it, while it changes the operator's
+    work). Needs names: with only a role there is no one to compare against."""
+    if not focus or not focus.get("names"):
+        return items
+    return [it for it in items
+            if it.get("kind") == "decision" or not it.get("suggestedAssignee")
+            or meeting_focus_is_mine(it["suggestedAssignee"], focus)]
+
+
 def meeting_repo_options(cands):
     """The triage candidates (`_triage_candidates`, XERK-325) as the model sees
     them: the same allowlist a ticket's repoGuess is checked against."""
@@ -25642,7 +25747,8 @@ def validate_meeting_command(cmd):
     runtime = cmd.get("runtime")
     if runtime not in DAILY_BRIEF_RUNTIMES_ALL:
         return dict(base, reportable=True), "runtime is not claude, dsh or qwen"
-    return dict(base, model=model, runtime=runtime), None
+    return dict(base, model=model, runtime=runtime,
+                focus=normalize_meeting_focus(cmd.get("focus"))), None
 
 
 def _board_error_summary(e):
@@ -44030,7 +44136,9 @@ class SessionManager:
             return None, "the hub's transcript was not this run's, or had no text"
         repos = meeting_repo_options(self.triage_cands)
         argv = ["claude", "-p", "--model", job["model"], *ATTENTION_HINT_LOCKDOWN]
-        prompt = MEETING_INSTRUCTION + meeting_input(transcript, repos)
+        focus = job.get("focus")
+        prompt = (MEETING_INSTRUCTION + meeting_input(transcript, repos)
+                  + meeting_focus_instruction(focus))
         items, why = None, "the model run failed or timed out"
         for attempt in range(1, MEETING_MAX_ATTEMPTS + 1):
             if attempt > 1:
@@ -44050,6 +44158,11 @@ class SessionManager:
         if items is None:
             return None, (f"the model gave no usable items in {MEETING_MAX_ATTEMPTS} "
                           f"attempts (last: {why})")
+        kept = meeting_focus_filter(items, focus)
+        if len(kept) < len(items):
+            log(f"meeting: run {job['runId']} dropped {len(items) - len(kept)} item(s) "
+                "assigned to someone else")
+        items = kept
         self._meeting_duplicates(items)
         return items, None
 

@@ -670,6 +670,8 @@ const MEETING_PROPOSALS_FILE =
 const MEETING_LABELS_FILE = process.env.MEETING_LABELS_FILE || "/data/meeting-labels.json";
 const MEETING_LABEL_MISSES_FILE =
   process.env.MEETING_LABEL_MISSES_FILE || "/data/meeting-label-misses.json";
+// Whose work an org's meetings propose (XERK-2514): siteKey -> {names, role}.
+const MEETING_FOCUS_FILE = process.env.MEETING_FOCUS_FILE || "/data/meeting-focus.json";
 // Each tenant's Tenir bearer, as its SHA-256 only (XERK-2551).
 const MEETING_TOKENS_FILE = process.env.MEETING_TOKENS_FILE || "/data/meeting-tokens.json";
 // Tenants whose archive data was purged (XERK-2549): tombstones every replica reads.
@@ -5496,6 +5498,65 @@ const persistMeetingLabelMisses = registerExternalStore({
   coerce: meetingLabelMissesCoerce, read: () => meetingLabelMisses,
   install: (v) => { meetingLabelMisses = v; },
 });
+// ---- whose work (XERK-2514) ------------------------------------------------------
+// A standup is everyone's status, so without this every speaker's work became a
+// proposal. The operator names themself (as captions spell it) and their role per
+// org; it rides `extractMeeting` as `focus` and the agent keeps only their work.
+const MEETING_FOCUS_NAMES_MAX = 5;
+const MEETING_FOCUS_NAME_MAX = 100;
+const MEETING_FOCUS_ROLE_MAX = 300;
+// One line of operator text, control/format characters removed; null = unusable.
+function meetingFocusText(v, cap) {
+  if (typeof v !== "string") return null;
+  // Format characters go (a zero-width space pasted from captions must not split
+  // a name); control characters are breaks. The agent's _meeting_focus_text agrees.
+  const t = v.replace(/\p{Cf}/gu, "").replace(/\p{Cc}/gu, " ").replace(/\s+/g, " ").trim();
+  return [...t].length <= cap ? t : null;
+}
+// {names, role} -> the stored shape, or null (malformed, or empty = off).
+function meetingFocusValue(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v) || !Array.isArray(v.names)) return null;
+  if (v.names.length > MEETING_FOCUS_NAMES_MAX) return null;
+  const names = [];
+  for (const n of v.names) {
+    const t = meetingFocusText(n, MEETING_FOCUS_NAME_MAX);
+    if (t === null) return null;
+    if (t && !names.some((x) => x.toLowerCase() === t.toLowerCase())) names.push(t);
+  }
+  const role = v.role === undefined ? "" : meetingFocusText(v.role, MEETING_FOCUS_ROLE_MAX);
+  if (role === null) return null;
+  return names.length || role ? { names, role } : null;
+}
+function meetingFocusCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw).slice(0, 2000)) {
+    const f = k && k.length <= 200 ? meetingFocusValue(v) : null;
+    if (f) out[k] = f;
+  }
+  return out;
+}
+let meetingFocus = meetingFocusCoerce(readJsonFile(MEETING_FOCUS_FILE));
+const persistMeetingFocus = registerExternalStore({
+  name: "meetingFocus", file: MEETING_FOCUS_FILE,
+  coerce: meetingFocusCoerce, read: () => meetingFocus, install: (v) => { meetingFocus = v; },
+});
+// The operator sets (or, with no names and no role, clears) an org's focus.
+function setMeetingFocus(siteKey, body) {
+  const clear = body && Array.isArray(body.names) && !body.names.some((n) => typeof n !== "string" || n.trim())
+    && (body.role === undefined || (typeof body.role === "string" && !body.role.trim()));
+  const f = clear ? null : meetingFocusValue(body);
+  if (!clear && !f) {
+    return { status: 400, body: { error: `names must be up to ${MEETING_FOCUS_NAMES_MAX} names of at most ${MEETING_FOCUS_NAME_MAX} characters, and role text of at most ${MEETING_FOCUS_ROLE_MAX}` } };
+  }
+  if (f) meetingFocus[siteKey] = f;
+  else delete meetingFocus[siteKey];
+  persistMeetingFocus();
+  invalidateAgentsCache();
+  sseBroadcast("meetingFocus", meetingFocus);
+  return { status: 200, body: { ok: true, focus: f } };
+}
+
 // "Acme Corp" -> "acme-corp". "" when nothing label-shaped is left.
 function meetingLabelSlug(text) {
   const s = String(text || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
@@ -7991,6 +8052,7 @@ const TENANT_ORG_STORES = [
   ["meetingProposals", () => meetingProposals, () => persistMeetings()],
   ["meetingLabels", () => meetingLabels, () => persistMeetingLabels()],
   ["meetingLabelMisses", () => meetingLabelMisses, () => persistMeetingLabelMisses()],
+  ["meetingFocus", () => meetingFocus, () => persistMeetingFocus()],
   ["ticketAgents", () => ticketAgents, () => persistTicketAgents(), siteOfTicketKey],
   ["ticketModels", () => ticketModels, () => persistTicketModels(), siteOfTicketKey],
   ["ticketRuntimes", () => ticketRuntimes, () => persistTicketRuntimes(), siteOfTicketKey],
@@ -8871,6 +8933,8 @@ function buildAgentsCache() {
     // {at, shared?}. Hub-owned; the Brief page's Meetings pane maps them.
     meetingLabels: meetingLabelsWire(),
     meetingLabelMisses,
+    // Whose work each org's meetings propose (XERK-2514): siteKey -> {names, role}.
+    meetingFocus,
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -20887,7 +20951,8 @@ const meetingSent = new Set();
 function sendMeetingCommand(siteKey, row, host, now) {
   meetingSent.add(row.runId);
   const cmdId = queueCommand(host, { type: "extractMeeting", runId: row.runId, siteKey,
-    meetingId: row.meetingId, model: row.model, runtime: capabilityRuntime(agents[host], "meetings") });
+    meetingId: row.meetingId, model: row.model, runtime: capabilityRuntime(agents[host], "meetings"),
+    ...(Object.hasOwn(meetingFocus, siteKey) ? { focus: meetingFocus[siteKey] } : {}) });
   return { ...row, status: "running", host, cmdId, sentAt: now,
     tried: [...(row.tried || []), host] };
 }
@@ -21066,8 +21131,8 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   if (!title) return refuse(400, "a title is required");
   const description = meetingText(body.description == null ? item.description : body.description,
     MEETING_TICKET_DESC_MAX, true);
-  // The page sends the meeting context as the description, so only its own
-  // `edited` flag (or a changed title) says the operator rewrote the proposal.
+  // The page always sends a description, so only its own `edited` flag (or a
+  // changed title) says the operator rewrote the proposal.
   const edited = title !== item.title || body.edited === true;
   if (item.kind === "decision") {
     const d = appendDecision(siteKey, { source: "meeting",
@@ -27237,6 +27302,29 @@ const server = http.createServer(async (req, res) => {
       return json(res, out.status, out.body);
     }
 
+    // POST /api/orgs/<siteKey>/meeting-focus — whose work the org's meetings
+    // propose (XERK-2514). Body {names: [...], role}; no names and no role clears
+    // it. 404 an org no host is decided into, 400 a malformed body.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 4 && parts[3] === "meeting-focus") {
+      const siteKey = decodeURIComponent(parts[2]);
+      if (!decidedOrgs().has(siteKey)) {
+        return json(res, 404, { error: "no host is in that org" });
+      }
+      let body;
+      try {
+        body = JSON.parse((await readBody(req, 4096)) || "null");
+      } catch (e) {
+        if (e && (e.tooLarge || e.budgetExceeded)) throw e;
+        return json(res, 400, { error: "body is not JSON" });
+      }
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return json(res, 400, { error: "body must be {names, role}" });
+      }
+      const out = setMeetingFocus(siteKey, body);
+      return json(res, out.status, out.body);
+    }
+
     // POST /api/orgs/<siteKey>/meetings — Tenir posting a finished meeting
     // (XERK-2508; authed at the gate by TURMA_MEETINGS_TOKEN). 404 an org no
     // host is decided into, before the body is read, so a refusal mints nothing.
@@ -28736,6 +28824,7 @@ if (process.env.TURMA_TEST) {
     ingestDailyBriefResults, dailyBriefRunNowAt,
     getMeetings: () => meetingProposals, getMeetingLabels: () => meetingLabels,
     getMeetingLabelMisses: () => meetingLabelMisses, meetingLabelsCoerce, meetingLabelMissesCoerce,
+    getMeetingFocus: () => meetingFocus, meetingFocusCoerce,
     meetingLabelSlug, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
     putMeeting, reviewMeetingItem, settleMeetingReviews, meetingProposalsWire, MEETING_START_WAIT_MS,
     MEETING_CREATE_DEADLINE_MS, acceptMeeting,

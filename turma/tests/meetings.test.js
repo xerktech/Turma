@@ -123,8 +123,8 @@ test("XERK-2510: Approve + start posts the org's project, the kind's issue type 
   assert.equal(post.url, `/api/orgs/${encodeURIComponent(SITE)}/meetings/m1/items/p1`);
   assert.deepEqual([post.body.action, post.body.project, post.body.issueType, post.body.start],
     ["approve", "ACME", "10004", true]);
-  assert.match(post.body.description, /^It 500s\n\nProposed from the meeting "Sprint <sync>"/);
-  assert.match(post.body.description, /> Ann: login <b>is<\/b> broken \[1:01\]/);
+  // The proposal only: no meeting title, quote or Tenir link reaches the tracker (XERK-2514).
+  assert.equal(post.body.description, "It 500s");
   assert.equal("edited" in post.body, false, "the default text is not an edit");
   assert.match(P.list(), /Creating the ticket…/);
   // A decision: its detail fits the decisions log, and an editor opened and changed says so.
@@ -253,6 +253,28 @@ test("XERK-2638: the Tenir labels list and an unmapped label's banner, escaped, 
   Q.update(labeled);
   assert.doesNotMatch(Q.list(), /data-label="acme/);
   assert.match(Q.list(), /data-label="dev\.azure\.com\/Bolt"/);
+});
+
+test("XERK-2514: the Whose work rows, escaped, post names and role; Clear posts empty", async () => {
+  const d = { ...data(), meetingLabels: { [SITE]: { label: "acme", custom: false } },
+    meetingFocus: { [SITE]: { names: ["Ann <b>Lee</b>", "Lee, Ann"], role: "QA \"lead\"" } } };
+  const P = loadPage((u, init) => (/meeting-focus/.test(u)
+    ? (JSON.parse(init.body).names.length ? { ok: true, focus: { names: JSON.parse(init.body).names, role: JSON.parse(init.body).role } }
+      : { ok: true, focus: null })
+    : META(u)));
+  P.update(d);
+  const html = P.list();
+  assert.match(html, /<summary>Whose work<\/summary>/);
+  assert.match(html, /data-focus-names="acme\.atlassian\.net" value="Ann &lt;b&gt;Lee&lt;\/b&gt;, Lee, Ann"/);
+  assert.match(html, /data-focus-role="acme\.atlassian\.net" value="QA &quot;lead&quot;"/);
+  assert.match(html, /data-focus-clear="acme\.atlassian\.net"/);
+  await P.saveFocus(SITE, " Ann Lee ,, Bo ", " QA ");
+  await P.saveFocus(SITE, "", "");
+  assert.equal(await P.saveFocus(SITE, "a,b,c,d,e,f", ""), false, "over 5 names never posts");
+  await P.settle();
+  const posts = P.fetches.filter((f) => /meeting-focus/.test(f.url)).map((f) => f.body);
+  assert.deepEqual(posts, [{ names: ["Ann Lee", "Bo"], role: "QA" }, { names: [], role: "" }]);
+  assert.match(P.list(), /everyone's work/);
 });
 
 test("XERK-2638: an org with no label is still listed and pickable; same-named orgs show their site", () => {

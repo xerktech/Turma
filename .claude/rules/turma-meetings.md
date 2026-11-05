@@ -26,9 +26,9 @@ The web surface of the Meetings epic (XERK-2503). The wire and the review route 
   202-polled): the org's "New tickets go to" project (a lone project preselected, a pick kept per
   viewer in `localStorage`, guarded), the type by kind (`defaultType`: bug → a "Bug" type, else
   "Task"). Edit overrides title, description and type.
-- **The default description carries where it came from** (`ticketDescription`): the proposal,
-  the meeting title + date, each quote with its offset, the Tenir link — built client-side so the
-  operator sees exactly what is sent when editing.
+- **The default description is the proposal only** (`ticketDescription`, XERK-2514): no meeting
+  title, date, quote or Tenir link. The ticket lands in the org's tracker where colleagues read
+  it; captions stay in Turma. Android's `meetingTicketDescription` sends the same.
 - A quote links to that moment as a media fragment on the meeting's link (`#t=<seconds>`);
   every link is rebuilt only from an http(s) URL (`safeUrl`), never served text.
 - **Every served string is escaped** — model text, quotes, speaker, host, error, org name.
@@ -40,5 +40,8 @@ The web surface of the Meetings epic (XERK-2503). The wire and the review route 
 - **Tenir labels** (XERK-2638): a collapsed "Tenir labels" list (each org's label, editable, Reset
   for an operator's) and a banner per label Tenir sent that no org has, with an org pick and "Use
   this label". Both read the hub's `meetingLabels`/`meetingLabelMisses` (payload + SSE). Web only.
+- **Whose work** (XERK-2514): a collapsed list, one row per org: the operator's names (comma-
+  separated, as captions spell them) and role, Save / Clear. Reads `meetingFocus` (payload +
+  SSE). Web only, like the labels.
 - Android has the same screen (XERK-2511, `android.md`); a change here needs its port there.
 - Tests: `turma/tests/meetings.test.js`.
