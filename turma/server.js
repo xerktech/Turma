@@ -17104,12 +17104,21 @@ const ATTENTION_WHY_MAX = 200;
 
 // What a background wait is waiting ON, for the `why` line: the one wait row's
 // label, else a count. Same wording as the clients' backgroundWaitLabel.
+// What a set of wait rows IS, in words: a shell's wait (sleep, CI watch) or a
+// background agent parked on its own work (XERK-2710, an agent row the agent
+// re-kinds `wait-external`), "task" for a mix.
+function waitNoun(waits) {
+  const shells = waits.filter((a) => a && a.type === "shell").length;
+  return shells === waits.length ? "background shell"
+    : shells === 0 ? "background agent" : "background task";
+}
+
 function waitSubject(rows) {
   const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
-  // A blank label names nothing: the shell count, as both clients' cards read it.
+  // A blank label names nothing: the count, as both clients' cards read it.
   const label = waits.length === 1 && typeof waits[0].label === "string" ? waits[0].label.trim() : "";
   if (label) return label;
-  return `${waits.length} background shell${waits.length === 1 ? "" : "s"}`;
+  return `${waits.length} ${waitNoun(waits)}${waits.length === 1 ? "" : "s"}`;
 }
 
 // Why a ready-for-review session is the operator's: its live PRs and their CI,
@@ -20178,8 +20187,9 @@ function attentionNudgeText(reason, session) {
   }
   const waits = (Array.isArray(s.agents) ? s.agents : []).filter(isWaitRow);
   const label = waits.length === 1 ? nudgeLabel(waits[0].label) : "";
-  const subject = label ? `Your background shell \`${label}\` has`
-    : waits.length > 1 ? `Your ${waits.length} background shells have` : "Your background shell has";
+  const noun = waitNoun(waits);
+  const subject = label ? `Your ${noun} \`${label}\` has`
+    : waits.length > 1 ? `Your ${waits.length} ${noun}s have` : `Your ${noun} has`;
   const mins = Number.isFinite(s.transcriptAgeSec) ? Math.max(1, Math.round(s.transcriptAgeSec / 60)) : null;
   const quiet = mins ? `produced nothing for ${mins} minute${mins === 1 ? "" : "s"}` : "gone quiet";
   return `${subject} ${quiet}. Check whether it is still doing anything; if it is waiting on `

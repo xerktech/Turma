@@ -4860,7 +4860,7 @@ class TestLiveAgentsScan(unittest.TestCase):
     # XERK-2710: the INTERIM notice Claude Code sends when a background agent
     # ends its turn with background work of its own still running (real text).
     INTERIM_1 = {"type": "queue-operation", "operation": "enqueue",
-                 "timestamp": "2026-10-03T12:10:00.000Z",
+                 "timestamp": "2026-10-03T12:02:00.000Z",
                  "content": "<task-notification>\n<task-id>agent-1</task-id>\n"
                             "<status>completed</status>\n"
                             "<summary>Agent \"QA the parity change\" is waiting on its own "
@@ -4911,6 +4911,59 @@ class TestLiveAgentsScan(unittest.TestCase):
     def test_an_interim_never_retypes_a_shell_or_resurrects_a_stopped_agent(self):
         st = self._scan(TASK_LAUNCH_ENTRIES + [self.DONE_1, self.INTERIM_1])
         self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_final_notice_quoting_the_interim_note_is_still_a_stop(self):
+        # QA (XERK-2710 #1): a report ABOUT this feature quotes the note.
+        quoting = dict(self.DONE_1, content=self.DONE_1["content"].replace(
+            "</status>", "</status>\n<result>saw <note>This agent stopped with background "
+            "work of its own still running.</note></result>"))
+        self.assertFalse(ha._tn_interim(quoting["content"]))
+        self.assertEqual(ha.live_agents_report(self._scan(TASK_LAUNCH_ENTRIES + [quoting])), [])
+
+    def test_an_interim_written_before_its_resume_record_stays_parked(self):
+        # QA (XERK-2710 #2a): run stopped, SendMessage, the resumed run's own
+        # interim (12:20) is enqueued BEFORE the resume record (12:05) lands.
+        early = dict(self.INTERIM_1, timestamp="2026-10-03T12:20:00.000Z")
+        st = self._scan(TASK_LAUNCH_ENTRIES + [dict(self.DONE_1, timestamp="2026-10-03T12:01:00.000Z"),
+                                               early] + self.RESUME)
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], ["wait-external"])
+        # Its final notice still retires it.
+        st = self._scan([dict(self.DONE_1, content=self.DONE_1["content"] + " ")], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_late_resume_record_does_not_unpark_its_own_runs_interim(self):
+        # QA (XERK-2710 #2b): parked by run 1, then run 2's interim lands
+        # before run 2's resume record.
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_1,
+                                               dict(self.INTERIM_1, timestamp="2026-10-03T12:30:00.000Z")]
+                        + self.RESUME)
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], ["wait-external"])
+
+    def test_an_interim_written_before_its_launch_record_parks_the_launch(self):
+        # QA (XERK-2710 #2c).
+        launch = json.loads(json.dumps(TASK_LAUNCH_ENTRIES))
+        launch[1]["timestamp"] = "2026-10-03T12:00:00.000Z"
+        st = self._scan([self.INTERIM_1] + launch)
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], ["wait-external"])
+
+    def test_a_resume_while_parked_restarts_its_clock(self):
+        # QA (XERK-2710 #5): the resumed run's age counts from the resume.
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_1] + self.RESUME)
+        self.assertEqual(ha.live_agents_report(st)[0]["startedAt"],
+                         ha._ts_ms("2026-10-03T12:05:00.000Z"))
+
+    def test_an_interim_never_retypes_a_shell(self):
+        # QA (XERK-2710 #6): a shell row keeps its own kind.
+        st = self._scan(SHELL_LAUNCH_ENTRIES)
+        (sid, row), = st["liveAgents"].items()
+        kind = row["kind"]
+        st = self._scan([dict(self.INTERIM_1, content=self.INTERIM_1["content"].replace(
+            "agent-1", sid))], st)
+        self.assertEqual(st["liveAgents"][sid]["kind"], kind)
+
+    def test_the_interim_stamp_survives_the_snapshot(self):
+        st = self._scan([dict(self.INTERIM_1, timestamp="2099-01-01T00:00:00.000Z")])
+        self.assertEqual(st["interimAt"], {"agent-1": ha._ts_ms("2099-01-01T00:00:00.000Z")})
 
     def test_a_parked_agent_survives_the_snapshot_as_a_wait(self):
         st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_1])

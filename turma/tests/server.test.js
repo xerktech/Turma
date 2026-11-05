@@ -27851,6 +27851,28 @@ function nudgeHost(host, sessions, now = Date.now()) {
 }
 const nudges = (host) => (agents[host].commands || []).filter((c) => c.type === "input");
 
+test("XERK-2710: a parked background AGENT is nudged as an agent, never as a shell", () => {
+  hub.attentionNudged.clear();
+  const host = "nudge-agent";
+  const t0 = Date.now();
+  const stalled = { id: "s1", status: "running", session: { paneBusy: false, transcriptAgeSec: 47 * 60,
+    agents: [{ type: "qa-delta", label: "Re-QA vr image fixes", kind: "wait-external" }] } };
+  const a = nudgeHost(host, [{ session: stalled, attn: { state: "needs-you:stalled", since: t0, why: "x" } }], t0);
+  a.lastSeen = t0;
+  hub.attentionNudgeSweep(t0);
+  assert.match(nudges(host)[0].text, /^Your background agent `Re-QA vr image fixes` has produced nothing/);
+  // A blank-labelled pair reads as a count, worded by what the rows are.
+  const now = Date.now();
+  const att = (agentsRows) => {
+    const sess = { status: "running", session: { paneBusy: false, transcriptAgeSec: 46 * 60, agents: agentsRows } };
+    return hub.sessionAttention(sess, hub.sessionWorking(sess, now, now), hub.sessionWait(sess, now, now), now);
+  };
+  const row = (type) => ({ type, label: " ", kind: "wait-external" });
+  assert.equal(att([row("qa"), row("qa")]).why, "2 background agents");
+  assert.equal(att([row("shell"), row("qa")]).why, "2 background tasks");
+  assert.equal(att([row("shell"), row("shell")]).why, "2 background shells");
+});
+
 test("XERK-1572: a stalled shell is nudged once per edge, in the operator's voice, with backoff", () => {
   hub.attentionNudged.clear();
   const host = "nudge-stall";

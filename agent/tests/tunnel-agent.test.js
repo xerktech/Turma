@@ -3332,7 +3332,7 @@ test("restoreLiveAgents: seeds from the manager's snapshot and folds the gap", (
 // not a stop: the row becomes a wait until the same task-id notifies again.
 test("scanAgentEntry: an interim notice parks the agent as a wait, not a stop", () => {
   const { liveAgentsReport } = require("../tunnel-agent.js");
-  const interim = { type: "queue-operation", operation: "enqueue", timestamp: "2026-10-03T12:10:00.000Z",
+  const interim = { type: "queue-operation", operation: "enqueue", timestamp: "2026-10-03T12:02:00.000Z",
     content: "<task-notification>\n<task-id>agent-1</task-id>\n<status>completed</status>\n"
       + "<summary>Agent \"QA the parity change\" is waiting on its own background work</summary>\n"
       + "<note>This agent stopped with background work of its own still running. It may resume on its "
@@ -3356,6 +3356,25 @@ test("scanAgentEntry: an interim notice parks the agent as a wait, not a stop", 
   // A resume while parked is work again; a late interim copy does not re-park it.
   st = scanAll([...LAUNCH_ENTRIES, interim, ...RESUME_ENTRIES, { ...interim, operation: "remove" }]);
   assert.deepEqual(liveAgentsReport(st).map((r) => r.kind), [undefined]);
+  // A final notice whose <result> QUOTES the interim note is still a stop (QA #1).
+  const quoting = { ...notif("agent-1", "completed") };
+  quoting.content = quoting.content.replace("</status>", "</status>\n<result>saw <note>This agent stopped "
+    + "with background work of its own still running.</note></result>");
+  assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, quoting])), []);
+  // An interim written before its resume record stays parked (QA #2a/#2b),
+  // and the resume restarts a parked row's clock (QA #5).
+  const late = { ...interim, timestamp: "2026-10-03T12:20:00.000Z" };
+  st = scanAll([...LAUNCH_ENTRIES, { ...notif("agent-1", "completed"), timestamp: "2026-10-03T12:01:00.000Z" },
+    late, ...RESUME_ENTRIES]);
+  assert.deepEqual(liveAgentsReport(st).map((r) => r.kind), ["wait-external"]);
+  st = scanAll([...LAUNCH_ENTRIES, interim, late, ...RESUME_ENTRIES]);
+  assert.deepEqual(liveAgentsReport(st).map((r) => r.kind), ["wait-external"]);
+  st = scanAll([...LAUNCH_ENTRIES, interim, ...RESUME_ENTRIES]);
+  assert.equal(liveAgentsReport(st)[0].startedAt, Date.UTC(2026, 9, 3, 12, 5));
+  // An interim written before its launch record parks the launch (QA #2c).
+  const launch = JSON.parse(JSON.stringify(LAUNCH_ENTRIES));
+  launch[1].timestamp = "2026-10-03T12:00:00.000Z";
+  assert.deepEqual(liveAgentsReport(scanAll([interim, ...launch])).map((r) => r.kind), ["wait-external"]);
   // A stopped agent is not resurrected by a later interim.
   assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, notif("agent-1", "completed"), interim])), []);
 });

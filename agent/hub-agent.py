@@ -11671,6 +11671,13 @@ AGENT_DONE_STATUSES = frozenset({"completed", "failed", "killed", "stopped", "er
 TN_INTERIM_RE = re.compile(
     r"<note>[^<]*(?:background work of its own still running|notifies again if it does)"
     r"|<summary>[^<]*is waiting on its own background work</summary>")
+
+
+def _tn_interim(text):
+    """Is this notification an INTERIM one (XERK-2710)? Only its own tags
+    count, never its <result>: a final report QUOTING the interim note (an
+    agent reporting on this very feature) must still stop the agent."""
+    return bool(TN_INTERIM_RE.search((text or "").split("<result>", 1)[0]))
 # One session's fan-out is a handful; this bounds a pathological transcript.
 LIVE_AGENTS_MAX = 32
 
@@ -12301,6 +12308,11 @@ def _scan_agent_entry(entry, state):
     # timestamp) must not register, or it stays live forever. Only an enqueue
     # sets it: a dequeue copy of the previous run lands after the resume.
     stop_at = state.setdefault("stopAt", {})
+    # XERK-2710: id -> the newest timestamp (epoch ms) of a fresh INTERIM
+    # enqueue. A launch or resume record read AFTER it but timestamped before
+    # it (written late, as XERK-2708 found for stops) is that run, already
+    # parked: it registers as a wait, never as work nothing would retire.
+    interim_at = state.setdefault("interimAt", {})
     msg = entry.get("message") if isinstance(entry, dict) else None
     content = msg.get("content") if isinstance(msg, dict) else None
     if isinstance(content, list):
@@ -12344,9 +12356,17 @@ def _scan_agent_entry(entry, state):
         resumed_at = _ts_ms(entry.get("timestamp"))
         if launch["id"] in live:
             # Resumed while parked on an interim notice (XERK-2710): it is
-            # running again, so its row is work, not a wait.
-            if live[launch["id"]].get("type") != "shell":
-                live[launch["id"]].pop("kind", None)
+            # running again, so its row is work, not a wait — unless this
+            # run's own interim was written first (timestamped at or after
+            # the resume record).
+            row = live[launch["id"]]
+            parked = interim_at.get(launch["id"])
+            if row.get("type") != "shell" and row.get("kind") \
+                    and not (parked is not None and resumed_at is not None
+                             and parked >= resumed_at):
+                row.pop("kind", None)
+                if resumed_at is not None:
+                    row["startedAt"] = resumed_at
             launch = None
         elif own is not None and resumed_at is not None and own >= resumed_at:
             # This run's own stop already landed (written early): stays stopped.
@@ -12409,6 +12429,10 @@ def _scan_agent_entry(entry, state):
                     runs.pop(next(iter(runs)))
             if started is not None:
                 row["startedAt"] = started
+            parked = interim_at.get(launch["id"])
+            if launch["type"] != "shell" and parked is not None \
+                    and launched_at is not None and parked >= launched_at:
+                row["kind"] = SHELL_KIND_WAIT_EXTERNAL   # its interim came first
             live[launch["id"]] = row
     # The notification rides a queued operation, the user turn it becomes once
     # dequeued, or an attachment — never an ASSISTANT turn, which is skipped so
@@ -12422,11 +12446,17 @@ def _scan_agent_entry(entry, state):
                 continue
             fresh = entry.get("type") == "queue-operation" \
                 and entry.get("operation") == "enqueue"
-            if TN_INTERIM_RE.search(text):
+            if _tn_interim(text):
                 # XERK-2710: not a stop — the agent waits on its own work. Only
                 # the fresh enqueue marks it: a dequeue copy can land after a
                 # resume made the row work again.
+                at = _ts_ms(entry.get("timestamp")) if fresh else None
                 for tid in tn["taskIds"] if fresh else ():
+                    if at is not None and at > (interim_at.get(tid) or 0):
+                        interim_at.pop(tid, None)
+                        interim_at[tid] = at
+                        while len(interim_at) > LIVE_AGENTS_MAX * 4:
+                            interim_at.pop(next(iter(interim_at)))
                     row = live.get(tid)
                     if row is not None and row.get("type") != "shell":
                         row["kind"] = SHELL_KIND_WAIT_EXTERNAL
@@ -12683,7 +12713,7 @@ def _backscan_live_agents(path, state):
             # A launch there is not live, but a resume of it later still
             # relists its type and label (XERK-2707).
             state.setdefault("agentRuns", {}).update(lead_in.get("agentRuns") or {})
-            for key in ("stopQueued", "stopStale", "stopAt"):
+            for key in ("stopQueued", "stopStale", "stopAt", "interimAt"):
                 state.setdefault(key, {}).update(lead_in.get(key) or {})
             lead_in = {}
         _scan_agent_entry(entry, state)
@@ -12727,6 +12757,7 @@ def _publish_live_agents(session_id, path, offset, state):
     body["stopQueued"] = dict(state.get("stopQueued") or {})
     body["stopStale"] = dict(state.get("stopStale") or {})
     body["stopAt"] = dict(state.get("stopAt") or {})
+    body["interimAt"] = dict(state.get("interimAt") or {})
     # The QA scan rides the same offset (XERK-1857): `qa` says this manager's
     # scan saw the whole transcript up to it, and `qaCalls` the launches still
     # awaiting a result, so a restart folds the gap instead of going partial.
@@ -12837,14 +12868,16 @@ def _restore_live_agents(session_id, path, state, report=None):
         state[key] = dict(list(
             (str(k), [f for f in v if isinstance(f, str)][-4:])
             for k, v in m.items() if isinstance(v, list))[-LIVE_AGENTS_MAX * 4:])
-    # Optional: absent before XERK-2708. Positive safe integers only.
-    stop_at = snap.get("stopAt") if isinstance(snap.get("stopAt"), dict) else {}
-    # An integral float counts, as JS's JSON.parse reads it (1e3 is 1000).
-    state["stopAt"] = dict(list(
-        (str(k), int(v)) for k, v in stop_at.items()
-        if isinstance(v, (int, float)) and not isinstance(v, bool)
-        and (not isinstance(v, float) or v.is_integer()) and 0 < v <= _MAX_SAFE_INT
-    )[-LIVE_AGENTS_MAX * 4:])
+    # Optional: absent before XERK-2708 (stopAt) / XERK-2710 (interimAt).
+    # Positive safe integers only; an integral float counts, as JS's
+    # JSON.parse reads it (1e3 is 1000).
+    for key in ("stopAt", "interimAt"):
+        m = snap.get(key) if isinstance(snap.get(key), dict) else {}
+        state[key] = dict(list(
+            (str(k), int(v)) for k, v in m.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+            and (not isinstance(v, float) or v.is_integer()) and 0 < v <= _MAX_SAFE_INT
+        )[-LIVE_AGENTS_MAX * 4:])
     # Optional: a snapshot written before XERK-2707 has none.
     runs = snap.get("agentRuns") if isinstance(snap.get("agentRuns"), dict) else {}
     state["agentRuns"] = {str(k): {"type": r["type"], "label": r["label"]}
