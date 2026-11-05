@@ -4995,6 +4995,12 @@ class TestLiveAgentsScan(unittest.TestCase):
         self.assertEqual(ha.live_agents_report(st, now_ms=exp), [])
         # The clock survives a restart through the snapshot row.
         self.assertEqual(ha._snapshot_row(st["liveAgents"]["agent-1"])["parkedAt"], parked)
+        # A future or epoch-0 notice stamp parks at now, never later.
+        for ts in ("2099-01-01T00:00:00.000Z", "1970-01-01T00:00:00.000Z"):
+            before = int(ha.time.time() * 1000)
+            got = self._scan(TASK_LAUNCH_ENTRIES + [dict(self.INTERIM_1, timestamp=ts)])
+            self.assertTrue(before <= got["liveAgents"]["agent-1"]["parkedAt"]
+                            <= int(ha.time.time() * 1000))
         # A snapshot row with no clock (an older agent's) or a future one gets now.
         for bad in (None, 2 ** 52):
             row = dict(st["liveAgents"]["agent-1"], parkedAt=bad)

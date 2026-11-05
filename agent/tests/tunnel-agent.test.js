@@ -1707,6 +1707,12 @@ test("scanAgentEntry: a SendMessage-resumed agent is live again until its next s
   const exp = parked + 3 * 3600 * 1000;
   assert.equal(liveAgentsReport(st, exp - 1).length, 1);
   assert.deepEqual(liveAgentsReport(st, exp), []);
+  // A future or epoch-0 notice stamp parks at now, never later.
+  for (const ts of ["2099-01-01T00:00:00.000Z", "1970-01-01T00:00:00.000Z"]) {
+    const before = Date.now();
+    const got = scanAll([...LAUNCH_ENTRIES, { ...interim, timestamp: ts }]).live.get("agent-1").parkedAt;
+    assert.ok(got >= before && got <= Date.now(), `${ts} -> ${got}`);
+  }
   st = scanAll(RESUME_ENTRIES, st);
   assert.equal(st.live.get("agent-1").parkedAt, undefined);
   assert.equal(liveAgentsReport(st, exp + 1).length, 1);
