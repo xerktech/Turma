@@ -21,6 +21,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFileSync, execFile } = require("child_process");
+const crypto = require("crypto");
 
 const TURMA_URL = process.env.TURMA_URL || "http://turma:8300";
 // Same agent token hub-agent.py heartbeats with (the hub's TURMA_AGENT_TOKEN).
@@ -1510,6 +1511,11 @@ function asyncLaunch(entry) {
   if (typeof tur.backgroundTaskId === "string" && tur.backgroundTaskId) {
     return { id: tur.backgroundTaskId, type: "shell", label: "" };
   }
+  // A background agent RESUMED by `SendMessage` (XERK-2707): no
+  // `async_launched`, only `resumedAgentId`, and its previous run's stop.
+  if (tur.success === true && typeof tur.resumedAgentId === "string" && tur.resumedAgentId) {
+    return { id: tur.resumedAgentId, type: "agent", label: "", resumed: true };
+  }
   if (tur.status !== "async_launched") return null;
   const ident = tur.agentId || tur.taskId;
   if (!ident) return null;
@@ -1521,12 +1527,25 @@ function asyncLaunch(entry) {
            label: String(tur.description || "").trim() };
 }
 
+// Mirror of hub-agent.py _tn_fingerprint (XERK-2707): ties a dequeue copy to
+// the enqueue it came from. A lone surrogate hashes as U+FFFD on both sides.
+function tnFingerprint(text) {
+  const m = TASK_NOTIFICATION_RE.exec(text || "");
+  return m ? crypto.createHash("sha1").update(m[1], "utf8").digest("hex").slice(0, 16) : null;
+}
+
 function scanAgentEntry(entry, state) {
   if (!entry || typeof entry !== "object" || !state) return;
   const live = state.live || (state.live = new Map());
   const tasks = state.tasks || (state.tasks = new Map());
   const shells = state.shells || (state.shells = new Map());
   const stopped = state.stopped || (state.stopped = new Set());
+  // Each agent launch's {type, label} by id, so a resume relists it (XERK-2707).
+  const runs = state.runs || (state.runs = new Map());
+  // XERK-2707 (see hub-agent.py): fingerprints enqueued and not yet dequeued,
+  // moved to `stale` by a resume; a stale copy never retires the new run.
+  const queued = state.queued || (state.queued = new Map());
+  const stale = state.stale || (state.stale = new Map());
   const content = entry.message && entry.message.content;
   let toolId = null;
   if (Array.isArray(content)) {
@@ -1559,6 +1578,20 @@ function scanAgentEntry(entry, state) {
       && [...live.values()].filter((a) => a.type === "shell").length >= Math.floor(LIVE_AGENTS_MAX / 2)) {
     launch = null;
   }
+  if (launch && launch.resumed) {
+    // A resume is a NEW run, so its previous stop no longer wins; a still-live
+    // agent keeps its row.
+    if (live.has(launch.id)) launch = null;
+    else {
+      stopped.delete(launch.id);
+      if ((queued.get(launch.id) || []).length) {
+        // MERGED, never replaced: a copy from two runs back is stale too.
+        stale.set(launch.id, [...(stale.get(launch.id) || []), ...queued.get(launch.id)].slice(-4));
+        queued.delete(launch.id);
+        while (stale.size > LIVE_AGENTS_MAX * 4) stale.delete(stale.keys().next().value);
+      }
+    }
+  }
   if (launch && live.size < LIVE_AGENTS_MAX && !stopped.has(launch.id)) {
     // A stop already seen wins over a later-read launch: a notification can be
     // written at an EARLIER file offset than the launch it refers to. The
@@ -1573,9 +1606,17 @@ function scanAgentEntry(entry, state) {
         const eta = started + Math.round(call.secs * 1000);
         if (Number.isSafeInteger(eta)) row.eta = eta;
       }
+    } else if (launch.resumed) {
+      const prev = runs.get(launch.id) || {};
+      row = { type: prev.type || launch.type, label: prev.label || "" };
+      started = launchedAt;
     } else {
       row = { type: tasks.get(toolId) || launch.type, label: launch.label };
       started = launchedAt;
+    }
+    if (launch.type !== "shell") {
+      runs.set(launch.id, { type: row.type, label: row.label });
+      while (runs.size > LIVE_AGENTS_MAX * 4) runs.delete(runs.keys().next().value);
     }
     if (started != null) row.startedAt = started;
     live.set(launch.id, row);
@@ -1587,7 +1628,28 @@ function scanAgentEntry(entry, state) {
     for (const text of entryTextsForScan(entry)) {
       const tn = parseTaskNotification(text);
       if (!tn || !tn.taskIds.length) continue;
-      if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) done.push(...tn.taskIds);
+      if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) {
+        const fp = tnFingerprint(text);
+        const fresh = entry.type === "queue-operation" && entry.operation === "enqueue";
+        for (const id of tn.taskIds) {
+          if (fresh) {
+            // The new run's own stop; never clears `stale` (XERK-2707).
+            const q = queued.get(id) || [];
+            queued.delete(id);
+            queued.set(id, [...q, fp].slice(-4));
+            while (queued.size > LIVE_AGENTS_MAX * 4) queued.delete(queued.keys().next().value);
+          } else {
+            const q = queued.get(id);
+            const at = q ? q.indexOf(fp) : -1;
+            if (at >= 0) {
+              q.splice(at, 1);
+              if (!q.length) queued.delete(id);
+            }
+            if ((stale.get(id) || []).includes(fp)) continue; // the previous run's copy
+          }
+          done.push(id);
+        }
+      }
     }
     // A `TaskStop` the session ran itself: no notification follows it.
     const tur = entry.toolUseResult;
@@ -1650,6 +1712,12 @@ function backscanLiveAgents(p, state, windowBytes = AGENT_BACKSCAN_BYTES,
     if (inLead) {
       const stopped = state.stopped || (state.stopped = new Set());
       for (const id of leadIn.stopped || []) stopped.add(id);
+      const runs = state.runs || (state.runs = new Map());
+      for (const [id, r] of leadIn.runs || []) runs.set(id, r);
+      for (const key of ["queued", "stale"]) {
+        const m = state[key] || (state[key] = new Map());
+        for (const [id, f] of leadIn[key] || []) m.set(id, f);
+      }
       while (stopped.size > LIVE_AGENTS_MAX * 4) stopped.delete(stopped.values().next().value);
       leadIn = null;
       inLead = false;
@@ -1728,6 +1796,16 @@ function restoreLiveAgents(sessionId, p, state, dir = LIVE_AGENTS_DIR) {
   state.shells = new Map(Object.entries(snap.shellCalls).filter(([, v]) => isObj(v)));
   state.stopped = new Set(snap.stoppedAgents.filter((t) => typeof t === "string")
     .slice(-LIVE_AGENTS_MAX * 4));
+  // Optional: a snapshot written before XERK-2707 has none.
+  for (const [key, wire] of [["queued", "stopQueued"], ["stale", "stopStale"]]) {
+    state[key] = new Map(Object.entries(isObj(snap[wire]) ? snap[wire] : {})
+      .filter(([, v]) => Array.isArray(v))
+      .map(([k, v]) => [k, v.filter((f) => typeof f === "string").slice(-4)])
+      .slice(-LIVE_AGENTS_MAX * 4));
+  }
+  state.runs = new Map(Object.entries(isObj(snap.agentRuns) ? snap.agentRuns : {})
+    .map(([k, v]) => [k, snapshotRow(v)]).filter(([, v]) => v)
+    .map(([k, v]) => [k, { type: v.type, label: v.label }]));
   const end = buf.lastIndexOf(0x0a) + 1; // a line still being written waits for the tail
   for (const line of buf.toString("utf8", 0, end).split("\n")) {
     let entry;
@@ -2923,7 +3001,7 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { queuedPromptEntry, ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, backscanLiveAgents, restoreLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
+  module.exports = { queuedPromptEntry, ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, tnFingerprint, backscanLiveAgents, restoreLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; },
     __setPaneCapture: (f) => { paneCapture = f || captureLiveTurn; },
     captureLiveTurn,
