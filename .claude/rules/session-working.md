@@ -50,6 +50,12 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
     record is that run's stop; never drop the timestamp compare, or the agent is live forever.
   - Accepted gap: a message "queued for delivery" to an agent that finishes first resumes it
     with no transcript record, so that run reads idle.
+- **An INTERIM notice is a wait, not a stop** (XERK-2710, `TN_INTERIM_RE` ↔ its js twin): an
+  agent ending its turn with background work of its own running notifies `completed` with a
+  "background work of its own still running … notifies again" note. Its fresh enqueue re-kinds the
+  row `wait-external` (copies do nothing); the final notice retires it, a resume makes it work.
+  - Never ignore it: 14 of 39 such agents on a host never notified again, so the XERK-1570 stall
+    rule is what bounds them. Tests: the `interim` cases in `TestLiveAgentsScan` ↔ js.
 
 ## The published live-agent set survives a restart (XERK-1587)
 

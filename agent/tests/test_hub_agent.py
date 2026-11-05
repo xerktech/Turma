@@ -4857,6 +4857,66 @@ class TestLiveAgentsScan(unittest.TestCase):
             "</status>", "</status>\n<summary>pass 2</summary>"))], st)
         self.assertEqual(ha.live_agents_report(st), [])
 
+    # XERK-2710: the INTERIM notice Claude Code sends when a background agent
+    # ends its turn with background work of its own still running (real text).
+    INTERIM_1 = {"type": "queue-operation", "operation": "enqueue",
+                 "timestamp": "2026-10-03T12:10:00.000Z",
+                 "content": "<task-notification>\n<task-id>agent-1</task-id>\n"
+                            "<status>completed</status>\n"
+                            "<summary>Agent \"QA the parity change\" is waiting on its own "
+                            "background work</summary>\n"
+                            "<note>This agent stopped with background work of its own still "
+                            "running. It may resume on its own when that work completes or "
+                            "reports, and the same task-id notifies again if it does; the "
+                            "result below may be interim.</note>\n"
+                            "<result>build running</result>\n</task-notification>"}
+
+    def test_an_interim_notice_parks_the_agent_as_a_wait_not_a_stop(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_1])
+        self.assertEqual(ha.live_agents_report(st), [
+            {"type": "agent", "label": "QA the parity change", "kind": "wait-external"}])
+        self.assertNotIn("agent-1", st["stoppedAgents"])
+        # Its dequeue copies are not stops either.
+        copies = [dict(self.INTERIM_1, operation="remove"),
+                  {"type": "user", "message": {"content": self.INTERIM_1["content"]}}]
+        st = self._scan(copies, st)
+        self.assertEqual(len(ha.live_agents_report(st)), 1)
+        # The final notice under the same task-id retires it.
+        st = self._scan([self.DONE_1], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_older_interim_wording_parks_it_too(self):
+        # The "finished" summary older builds sent with the same note.
+        old = dict(self.INTERIM_1, content=self.INTERIM_1["content"].replace(
+            "is waiting on its own background work", "finished"))
+        st = self._scan(TASK_LAUNCH_ENTRIES + [old])
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], ["wait-external"])
+        self.assertTrue(ha.TN_INTERIM_RE.search(old["content"]))
+
+    def test_the_ordinary_completion_note_is_still_a_stop(self):
+        done = dict(self.DONE_1, content=self.DONE_1["content"].replace(
+            "</status>", "</status>\n<note>A task-notification fires each time this agent "
+            "stops with no live background children of its own. The user can send it another "
+            "message and resume it, so the same task-id may notify more than once.</note>"))
+        self.assertIsNone(ha.TN_INTERIM_RE.search(done["content"]))
+        self.assertEqual(ha.live_agents_report(self._scan(TASK_LAUNCH_ENTRIES + [done])), [])
+
+    def test_a_resume_while_parked_makes_the_row_work_again(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_1] + self.RESUME)
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], [None])
+        # A late dequeue copy of the interim does not re-park the resumed run.
+        st = self._scan([dict(self.INTERIM_1, operation="remove")], st)
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], [None])
+
+    def test_an_interim_never_retypes_a_shell_or_resurrects_a_stopped_agent(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.DONE_1, self.INTERIM_1])
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_parked_agent_survives_the_snapshot_as_a_wait(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_1])
+        row = ha._snapshot_row(st["liveAgents"]["agent-1"])
+        self.assertEqual(row["kind"], "wait-external")
+
     def test_a_resume_keeps_the_launch_type(self):
         launch = json.loads(json.dumps(TASK_LAUNCH_ENTRIES))
         launch[0]["message"]["content"][0]["input"]["subagent_type"] = "qa-delta"

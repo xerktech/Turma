@@ -11658,6 +11658,19 @@ def _scan_entry_line(raw, state, report):
 # Every status Claude Code writes is terminal — "the agent stopped" — so the set
 # is a guard against a future non-terminal one, not a filter of today's.
 AGENT_DONE_STATUSES = frozenset({"completed", "failed", "killed", "stopped", "error"})
+# XERK-2710: an INTERIM notice is not a stop. When a background agent ends its
+# turn with background work OF ITS OWN still running (a QA agent waiting on its
+# build), Claude Code notifies `completed` with this <note> (and, on newer
+# builds, the "is waiting on its own background work" summary) and notifies
+# AGAIN under the same task-id once that work reports. Reading it as a stop read
+# the session idle for the whole build. It is not ignored either: of 39 such
+# agents on a real host 14 never notified again, so the row becomes a WAIT
+# (`wait-external`) — the session reads waiting, never Ready for review, and the
+# XERK-1570 stall rule (transcript silent ATTENTION_WAIT_STALL_MIN) bounds the
+# ones whose final notice never comes. Mirror of tunnel-agent.js TN_INTERIM_RE.
+TN_INTERIM_RE = re.compile(
+    r"<note>[^<]*(?:background work of its own still running|notifies again if it does)"
+    r"|<summary>[^<]*is waiting on its own background work</summary>")
 # One session's fan-out is a handful; this bounds a pathological transcript.
 LIVE_AGENTS_MAX = 32
 
@@ -12330,6 +12343,10 @@ def _scan_agent_entry(entry, state):
         own = stop_at.get(launch["id"])
         resumed_at = _ts_ms(entry.get("timestamp"))
         if launch["id"] in live:
+            # Resumed while parked on an interim notice (XERK-2710): it is
+            # running again, so its row is work, not a wait.
+            if live[launch["id"]].get("type") != "shell":
+                live[launch["id"]].pop("kind", None)
             launch = None
         elif own is not None and resumed_at is not None and own >= resumed_at:
             # This run's own stop already landed (written early): stays stopped.
@@ -12403,10 +12420,19 @@ def _scan_agent_entry(entry, state):
             tn = _parse_task_notification(text)
             if not tn or not tn.get("taskIds"):
                 continue
+            fresh = entry.get("type") == "queue-operation" \
+                and entry.get("operation") == "enqueue"
+            if TN_INTERIM_RE.search(text):
+                # XERK-2710: not a stop — the agent waits on its own work. Only
+                # the fresh enqueue marks it: a dequeue copy can land after a
+                # resume made the row work again.
+                for tid in tn["taskIds"] if fresh else ():
+                    row = live.get(tid)
+                    if row is not None and row.get("type") != "shell":
+                        row["kind"] = SHELL_KIND_WAIT_EXTERNAL
+                continue
             if not tn.get("status") or tn["status"] in AGENT_DONE_STATUSES:
                 fp = _tn_fingerprint(text)
-                fresh = entry.get("type") == "queue-operation" \
-                    and entry.get("operation") == "enqueue"
                 at = _ts_ms(entry.get("timestamp")) if fresh else None
                 for tid in tn["taskIds"]:
                     if at is not None and at > (stop_at.get(tid) or 0):
@@ -12854,7 +12880,8 @@ def _restore_live_agents(session_id, path, state, report=None):
 def live_agents_report(state):
     """`state["liveAgents"]` as the heartbeat's [{type, label, kind?, startedAt?,
     eta?}] (no ids: they are internal, and the chat resolves a row back to its
-    transcript by type+label). `kind` rides SHELL rows only — an agent/workflow
+    transcript by type+label). `kind` rides SHELL rows, and an agent row parked
+    on an interim notice (`wait-external`, XERK-2710); any other agent/workflow
     row carries none, which every reader takes as `work` (XERK-1570)."""
     out = []
     for a in (state.get("liveAgents") or {}).values():

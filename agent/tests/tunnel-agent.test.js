@@ -3326,3 +3326,36 @@ test("restoreLiveAgents: seeds from the manager's snapshot and folds the gap", (
   assert.equal(mod.restoreLiveAgents("nope", p, fresh(), dir), false);
   assert.equal(mod.restoreLiveAgents("../s1", p, fresh(), dir), false);
 });
+
+// XERK-2710: twin of TestLiveAgentsScan's interim cases. Claude Code's INTERIM
+// notice (the agent stopped with background work of its own still running) is
+// not a stop: the row becomes a wait until the same task-id notifies again.
+test("scanAgentEntry: an interim notice parks the agent as a wait, not a stop", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const interim = { type: "queue-operation", operation: "enqueue", timestamp: "2026-10-03T12:10:00.000Z",
+    content: "<task-notification>\n<task-id>agent-1</task-id>\n<status>completed</status>\n"
+      + "<summary>Agent \"QA the parity change\" is waiting on its own background work</summary>\n"
+      + "<note>This agent stopped with background work of its own still running. It may resume on its "
+      + "own when that work completes or reports, and the same task-id notifies again if it does; the "
+      + "result below may be interim.</note>\n<result>build running</result>\n</task-notification>" };
+  let st = scanAll([...LAUNCH_ENTRIES, interim]);
+  assert.deepEqual(liveAgentsReport(st), [{ type: "agent", label: "QA the parity change", kind: "wait-external" }]);
+  st = scanAll([{ ...interim, operation: "remove" }, { type: "user", message: { content: interim.content } }], st);
+  assert.equal(liveAgentsReport(st).length, 1);
+  st = scanAll([notif("agent-1", "completed")], st);
+  assert.deepEqual(liveAgentsReport(st), []);
+  // Older "finished" summary with the same note parks it too.
+  const old = { ...interim, content: interim.content.replace("is waiting on its own background work", "finished") };
+  assert.equal(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, old]))[0].kind, "wait-external");
+  // The ordinary completion note is still a stop.
+  const plain = { ...notif("agent-1", "completed"), content: notif("agent-1", "completed").content.replace(
+    "</status>", "</status>\n<note>A task-notification fires each time this agent stops with no live background "
+    + "children of its own. The user can send it another message and resume it, so the same task-id may notify "
+    + "more than once.</note>") };
+  assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, plain])), []);
+  // A resume while parked is work again; a late interim copy does not re-park it.
+  st = scanAll([...LAUNCH_ENTRIES, interim, ...RESUME_ENTRIES, { ...interim, operation: "remove" }]);
+  assert.deepEqual(liveAgentsReport(st).map((r) => r.kind), [undefined]);
+  // A stopped agent is not resurrected by a later interim.
+  assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, notif("agent-1", "completed"), interim])), []);
+});

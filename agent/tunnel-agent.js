@@ -1534,6 +1534,11 @@ function tnFingerprint(text) {
   return m ? crypto.createHash("sha1").update(m[1], "utf8").digest("hex").slice(0, 16) : null;
 }
 
+// XERK-2710: an INTERIM notice (the agent stopped with background work of its
+// own still running) is not a stop; the row becomes a wait. Mirror of
+// hub-agent.py TN_INTERIM_RE.
+const TN_INTERIM_RE = /<note>[^<]*(?:background work of its own still running|notifies again if it does)|<summary>[^<]*is waiting on its own background work<\/summary>/;
+
 function scanAgentEntry(entry, state) {
   if (!entry || typeof entry !== "object" || !state) return;
   const live = state.live || (state.live = new Map());
@@ -1586,7 +1591,12 @@ function scanAgentEntry(entry, state) {
     // agent keeps its row.
     const own = stopAt.get(launch.id);
     const resumedAt = tsMs(entry.timestamp);
-    if (live.has(launch.id)) launch = null;
+    if (live.has(launch.id)) {
+      // Resumed while parked on an interim notice (XERK-2710): work again.
+      const row = live.get(launch.id);
+      if (row.type !== "shell") delete row.kind;
+      launch = null;
+    }
     // This run's own stop already landed (written early): stays stopped.
     else if (own != null && resumedAt != null && own >= resumedAt) launch = null;
     else {
@@ -1635,9 +1645,17 @@ function scanAgentEntry(entry, state) {
     for (const text of entryTextsForScan(entry)) {
       const tn = parseTaskNotification(text);
       if (!tn || !tn.taskIds.length) continue;
+      const fresh = entry.type === "queue-operation" && entry.operation === "enqueue";
+      if (TN_INTERIM_RE.test(text)) {
+        // XERK-2710: not a stop; only the fresh enqueue marks the wait.
+        for (const id of fresh ? tn.taskIds : []) {
+          const row = live.get(id);
+          if (row && row.type !== "shell") row.kind = "wait-external";
+        }
+        continue;
+      }
       if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) {
         const fp = tnFingerprint(text);
-        const fresh = entry.type === "queue-operation" && entry.operation === "enqueue";
         const at = fresh ? tsMs(entry.timestamp) : null;
         for (const id of tn.taskIds) {
           if (at != null && at > (stopAt.get(id) || 0)) {
