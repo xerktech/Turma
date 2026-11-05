@@ -12257,6 +12257,20 @@ def _tn_fingerprint(text):
     return hashlib.sha1(body.encode("utf-8")).hexdigest()[:16]
 
 
+# Claude Code's INTERIM notification (XERK-2710): a background subagent ended
+# its turn with background work of its own still running. Its status reads
+# `completed`, yet the agent is not done — it "notifies again" if it resumes.
+TN_INTERIM_SUFFIX = "is waiting on its own background work"
+
+
+def _tn_interim(tn):
+    """True when a parsed notification is the interim "waiting on its own
+    background work" one. Keyed on Claude Code's own summary wording, after the
+    quoted description, so a description cannot end the summary with it.
+    Mirror of tunnel-agent.js tnInterim."""
+    return (tn.get("summary") or "").rstrip(" \t\r\n").endswith(TN_INTERIM_SUFFIX)
+
+
 def _scan_agent_entry(entry, state):
     """Fold one transcript entry into `state["liveAgents"]` ({id: {type,label}}).
 
@@ -12330,6 +12344,9 @@ def _scan_agent_entry(entry, state):
         own = stop_at.get(launch["id"])
         resumed_at = _ts_ms(entry.get("timestamp"))
         if launch["id"] in live:
+            # A resume of an agent read as waiting on its own work (XERK-2710)
+            # makes it work again.
+            live[launch["id"]].pop("kind", None)
             launch = None
         elif own is not None and resumed_at is not None and own >= resumed_at:
             # This run's own stop already landed (written early): stays stopped.
@@ -12402,6 +12419,17 @@ def _scan_agent_entry(entry, state):
         for text in _entry_texts_for_scan(entry):
             tn = _parse_task_notification(text)
             if not tn or not tn.get("taskIds"):
+                continue
+            if _tn_interim(tn):
+                # Not a stop (XERK-2710): the agent is WAITING on its own
+                # background work, so its row reads as a wait — not idle, and
+                # not working forever: 14 of 39 such agents on a real host
+                # never sent a final notification, and a session whose rows
+                # are all waits goes stalled after ATTENTION_WAIT_STALL_MIN.
+                for tid in tn["taskIds"]:
+                    row = live.get(tid)
+                    if row is not None and row.get("type") != "shell":
+                        row["kind"] = SHELL_KIND_WAIT_EXTERNAL
                 continue
             if not tn.get("status") or tn["status"] in AGENT_DONE_STATUSES:
                 fp = _tn_fingerprint(text)
@@ -12855,7 +12883,8 @@ def live_agents_report(state):
     """`state["liveAgents"]` as the heartbeat's [{type, label, kind?, startedAt?,
     eta?}] (no ids: they are internal, and the chat resolves a row back to its
     transcript by type+label). `kind` rides SHELL rows only — an agent/workflow
-    row carries none, which every reader takes as `work` (XERK-1570)."""
+    row carries none (read as `work`, XERK-1570) unless it waits on its own
+    background work (`wait-external`, XERK-2710)."""
     out = []
     for a in (state.get("liveAgents") or {}).values():
         row = {"type": a["type"], "label": a["label"]}

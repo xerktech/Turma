@@ -309,16 +309,13 @@ fun liveStateLabel(state: LiveState, live: LiveSignals?, now: Long = System.curr
         val started = waits.mapNotNull { it.startedAt }.filter { it <= now }.minOrNull()
         val since = if (started == null) "" else "\u00A0·\u00A0${waitLeftText(now - started)}"
         if (what.isNotEmpty()) return "⏳ waiting$what$since"
-        return "⏳ waiting on ${waits.size} background shell" + (if (waits.size == 1) "" else "s") + since
+        // A wait row may be an agent waiting on its own work (XERK-2710): web backgroundWorkLabel.
+        return "⏳ waiting on ${backgroundRowsLabel(waits)}$since"
     }
     // Only WORK rows name the working state; a waiting shell beside them is not work.
     if (state == LiveState.WORKING && hasLiveWork(live)) {
         if (live?.agents?.any { it.type in QA_AGENT_TYPES } == true) return "QA Review"
-        val rows = live?.agents.orEmpty().filterNot(::isWaitAgent)
-        // A background shell rides `agents` as a `shell` row (web backgroundWorkLabel).
-        val shells = rows.count { it.type == "shell" }
-        val noun = if (shells == 0) "agent" else if (shells == rows.size) "shell" else "task"
-        return "${rows.size} background $noun" + if (rows.size == 1) "" else "s"
+        return backgroundRowsLabel(live?.agents.orEmpty().filterNot(::isWaitAgent))
     }
     return liveStateLabel(state)
 }
@@ -367,7 +364,7 @@ private fun sessionLiveState(session: SessionInfo, agentLastSeen: Long, now: Lon
                 val waits = s.agents.filter(::isWaitAgent)
                 val named = if (waits.size == 1) com.xerktech.turma.core.jsTrim(waits[0].label) else ""
                 val label = if (named.isNotEmpty()) "stalled · $named"
-                    else "stalled on ${waits.size} background shell" + if (waits.size == 1) "" else "s"
+                    else "stalled on ${backgroundRowsLabel(waits)}"
                 CardState(label, CardTone.STALLED)
             } else CardState("idle", CardTone.IDLE)
         }
@@ -535,4 +532,13 @@ fun ContextMeterBar(session: SessionInfo, modifier: Modifier = Modifier) {
             },
         )
     }
+}
+
+// "1 background agent" / "2 background shells" / "3 background tasks" (mixed) — web
+// backgroundWorkLabel. A background shell rides `agents` as a `shell` row, and a wait row
+// may be an agent waiting on its own background work (XERK-2710).
+internal fun backgroundRowsLabel(rows: List<com.xerktech.turma.model.LiveAgent>): String {
+    val shells = rows.count { it.type == "shell" }
+    val noun = if (shells == 0) "agent" else if (shells == rows.size) "shell" else "task"
+    return "${rows.size} background $noun" + if (rows.size == 1) "" else "s"
 }

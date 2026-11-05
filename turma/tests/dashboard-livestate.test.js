@@ -154,6 +154,12 @@ test("dashboard liveState: a wait with no ETA says how long it has waited", () =
   // State row's, and a second number here read as a second stall length.
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [ci] }), onlineHost, NOW).label,
     "stalled · Watch CI on PR #412");
+  // XERK-2710: an agent waiting on its own work is a wait row: counted as an agent.
+  const qa = { type: "qa-delta", label: "", kind: "wait-external", startedAt: NOW - 12 * 60 * 1000 };
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 12 * 60, agents: [qa, qa] }), onlineHost, NOW).label,
+    "⏳ waiting on 2 background agents\u00a0·\u00a012m");
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [qa, ci] }), onlineHost, NOW).label,
+    "stalled on 2 background tasks");
   // A blank label names nothing: the shell count, as Android shows (rollup XERK-1701).
   const blank = { ...ci, label: "   " };
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [blank] }), onlineHost, NOW).label,

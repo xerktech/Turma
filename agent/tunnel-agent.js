@@ -1534,6 +1534,13 @@ function tnFingerprint(text) {
   return m ? crypto.createHash("sha1").update(m[1], "utf8").digest("hex").slice(0, 16) : null;
 }
 
+// Mirror of hub-agent.py _tn_interim (XERK-2710): the interim "waiting on its
+// own background work" notification is not a stop.
+const TN_INTERIM_SUFFIX = "is waiting on its own background work";
+function tnInterim(tn) {
+  return String(tn.summary || "").replace(/[ \t\r\n]+$/, "").endsWith(TN_INTERIM_SUFFIX);
+}
+
 function scanAgentEntry(entry, state) {
   if (!entry || typeof entry !== "object" || !state) return;
   const live = state.live || (state.live = new Map());
@@ -1586,7 +1593,10 @@ function scanAgentEntry(entry, state) {
     // agent keeps its row.
     const own = stopAt.get(launch.id);
     const resumedAt = tsMs(entry.timestamp);
-    if (live.has(launch.id)) launch = null;
+    if (live.has(launch.id)) {
+      delete live.get(launch.id).kind; // a waiting agent resumed works again (XERK-2710)
+      launch = null;
+    }
     // This run's own stop already landed (written early): stays stopped.
     else if (own != null && resumedAt != null && own >= resumedAt) launch = null;
     else {
@@ -1635,6 +1645,14 @@ function scanAgentEntry(entry, state) {
     for (const text of entryTextsForScan(entry)) {
       const tn = parseTaskNotification(text);
       if (!tn || !tn.taskIds.length) continue;
+      if (tnInterim(tn)) {
+        // Not a stop (XERK-2710): the row reads as waiting on its own work.
+        for (const id of tn.taskIds) {
+          const row = live.get(id);
+          if (row && row.type !== "shell") row.kind = "wait-external";
+        }
+        continue;
+      }
       if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) {
         const fp = tnFingerprint(text);
         const fresh = entry.type === "queue-operation" && entry.operation === "enqueue";

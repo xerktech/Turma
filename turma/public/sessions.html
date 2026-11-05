@@ -2391,7 +2391,9 @@ function backgroundWaitLabel(rows, wait, now) {
     if (Number.isSafeInteger(a.startedAt) && a.startedAt <= now && (started == null || a.startedAt < started)) started = a.startedAt;
   const since = started == null || wait.state === "stalled" ? "" : "\u00a0·\u00a0" + ago(now - started).replace(/ ago$/, "");
   if (what) return word + what + since;
-  return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s") + since;
+  // An agent waiting on its own background work is a wait row too (XERK-2710),
+  // so the count names agents/shells/tasks like the working label does.
+  return word + " on " + backgroundWorkLabel(waits) + since;
 }
 // The oppositional QA agents (`qa` on the first pass, `qa-delta` on every pass
 // after) — a card running one is still `working`, so it stays Active, but says

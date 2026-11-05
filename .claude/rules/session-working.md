@@ -51,6 +51,18 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
   - Accepted gap: a message "queued for delivery" to an agent that finishes first resumes it
     with no transcript record, so that run reads idle.
 
+- **"Agent … is waiting on its own background work" is NOT a stop** (XERK-2710, `_tn_interim`/
+  `tnInterim`): Claude Code's interim notice (status `completed`) when a subagent ends its turn with
+  its own background work running. The row turns into a wait (`kind: wait-external`), so the session
+  reads waiting, not idle; its final notice retires it; a `SendMessage` resume makes it work again.
+  - Never ignore the notice instead: 14 of 39 such agents on a real host sent no final one, so
+    they would read working forever. As a wait they go stalled after `ATTENTION_WAIT_STALL_MIN`.
+  - Keyed on the summary ENDING with the wording (after the quoted description), never on `<note>`.
+  - **Its stall nudge never says "stop it"** (`attentionNudgeText`): the parent's silence is no sign
+    of death (the agent writes its own transcript), so an all-agent wait is named as an agent and
+    told to check first. Wait counts name agents/shells/tasks (`backgroundRowsLabel`, web
+    `backgroundWorkLabel`, Android `backgroundRowsLabel`) — never assume a wait row is a shell.
+
 ## The published live-agent set survives a restart (XERK-1587)
 
 - The manager publishes its whole-conversation scan to `~/.turma/live-agents/<sessionId>.json`
