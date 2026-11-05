@@ -21131,8 +21131,8 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   if (!title) return refuse(400, "a title is required");
   const description = meetingText(body.description == null ? item.description : body.description,
     MEETING_TICKET_DESC_MAX, true);
-  // The page sends the meeting context as the description, so only its own
-  // `edited` flag (or a changed title) says the operator rewrote the proposal.
+  // The page always sends a description, so only its own `edited` flag (or a
+  // changed title) says the operator rewrote the proposal.
   const edited = title !== item.title || body.edited === true;
   if (item.kind === "decision") {
     const d = appendDecision(siteKey, { source: "meeting",

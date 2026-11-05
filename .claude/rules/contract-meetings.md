@@ -117,8 +117,8 @@ ticket builds to this file; change it here first.
 - **A `creating` review fails at `MEETING_CREATE_DEADLINE_MS`** (15 min) with no answer: a hub
   killed before the host took the command (debounced queue, unpersisted result caches) otherwise
   left it `creating` forever, refusing both Approve and Reject.
-- `edited` is the page's own flag (or a changed title): the page always sends the meeting context
-  as the description, so a text compare reads every approve as edited.
+- `edited` is the page's own flag (or a changed title): the page always sends a description,
+  so a text compare would misread an approve.
 - Tenir's duplicate answer (`meetingTenirWire`) carries no `review`.
 - A meeting decision's `label` (the meeting title) rides the heartbeat reply (`decisionsReplyFor`).
 - **Approve + start** waits (`session:"waiting"`) until `ticketRepo` resolves the new ticket on the

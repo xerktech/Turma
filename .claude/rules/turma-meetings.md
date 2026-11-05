@@ -26,9 +26,9 @@ The web surface of the Meetings epic (XERK-2503). The wire and the review route 
   202-polled): the org's "New tickets go to" project (a lone project preselected, a pick kept per
   viewer in `localStorage`, guarded), the type by kind (`defaultType`: bug → a "Bug" type, else
   "Task"). Edit overrides title, description and type.
-- **The default description carries where it came from** (`ticketDescription`): the proposal,
-  the meeting title + date, each quote with its offset, the Tenir link — built client-side so the
-  operator sees exactly what is sent when editing.
+- **The default description is the proposal only** (`ticketDescription`, XERK-2514): no meeting
+  title, date, quote or Tenir link. The ticket lands in the org's tracker where colleagues read
+  it; captions stay in Turma. Android's `meetingTicketDescription` sends the same.
 - A quote links to that moment as a media fragment on the meeting's link (`#t=<seconds>`);
   every link is rebuilt only from an http(s) URL (`safeUrl`), never served text.
 - **Every served string is escaped** — model text, quotes, speaker, host, error, org name.

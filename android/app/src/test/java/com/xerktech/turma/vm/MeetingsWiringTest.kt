@@ -97,10 +97,7 @@ class MeetingsWiringTest {
         assertEquals(true, b.start)
         assertNull(b.edited)
         assertEquals("Fix login", b.title)
-        assertEquals(
-            "It 500s\n\nProposed from the meeting \"Sprint sync\" (2023-11-14).\n> Ann: broken [1:01]\nMeeting: https://t/x",
-            b.description,
-        )
+        assertEquals("It 500s", b.description)
         // The hub's answer is in place at once, before any SSE frame.
         val item = hub.container.fleet.state.value.meetingProposals.getValue(site).single().items[0]
         assertEquals("creating", item.review!!.state)

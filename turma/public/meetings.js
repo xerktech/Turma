@@ -86,18 +86,11 @@ function typesOf(site) {
   return p ? types.get(`${site}\u0000${p}`) : null;
 }
 
-// What the ticket says by default: the proposal, then where it came from.
-function ticketDescription(m, it) {
-  const lines = [];
-  if (it.description) lines.push(it.description, "");
-  const when = isTime(m.startedAt) ? ` (${new Date(m.startedAt).toISOString().slice(0, 10)})` : "";
-  lines.push(`Proposed from the meeting "${m.title}"${when}.`);
-  for (const q of it.quotes || []) {
-    lines.push(`> ${q.speaker ? `${q.speaker}: ` : ""}${q.text}${isTime(q.atMs + 1) ? ` [${clock(q.atMs)}]` : ""}`);
-  }
-  const u = safeUrl(m.tenirUrl);
-  if (u) lines.push(`Meeting: ${u}`);
-  return lines.join("\n");
+// What the ticket says by default: the proposal only. The meeting's title,
+// date, quotes and Tenir link stay in Turma (XERK-2514): the ticket lands in
+// the org's own tracker, where colleagues read it, and captions are not theirs to see.
+function ticketDescription(_m, it) {
+  return it.description || "";
 }
 
 // ---- render ------------------------------------------------------------------------

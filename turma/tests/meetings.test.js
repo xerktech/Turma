@@ -123,8 +123,8 @@ test("XERK-2510: Approve + start posts the org's project, the kind's issue type 
   assert.equal(post.url, `/api/orgs/${encodeURIComponent(SITE)}/meetings/m1/items/p1`);
   assert.deepEqual([post.body.action, post.body.project, post.body.issueType, post.body.start],
     ["approve", "ACME", "10004", true]);
-  assert.match(post.body.description, /^It 500s\n\nProposed from the meeting "Sprint <sync>"/);
-  assert.match(post.body.description, /> Ann: login <b>is<\/b> broken \[1:01\]/);
+  // The proposal only: no meeting title, quote or Tenir link reaches the tracker (XERK-2514).
+  assert.equal(post.body.description, "It 500s");
   assert.equal("edited" in post.body, false, "the default text is not an edit");
   assert.match(P.list(), /Creating the ticket…/);
   // A decision: its detail fits the decisions log, and an editor opened and changed says so.

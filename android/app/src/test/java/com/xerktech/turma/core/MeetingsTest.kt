@@ -23,17 +23,11 @@ class MeetingsTest {
         tenirUrl = "https://tenir.example/c/1#x", participants = listOf("Ann", "Bo"),
     )
 
-    @Test fun `a ticket description carries the proposal, the meeting, its quotes and the link`() {
+    @Test fun `a ticket description is the proposal only, no meeting, quotes or link`() {
         val it = MeetingItem(id = "p1", kind = "bug", title = "Fix login", description = "It 500s",
             quotes = listOf(MeetingQuote("Ann", "login is broken", 61_000), MeetingQuote("", "no time", -1)))
-        assertEquals(
-            "It 500s\n\nProposed from the meeting \"Sprint sync\" (2023-11-14).\n" +
-                "> Ann: login is broken [1:01]\n> no time\nMeeting: https://tenir.example/c/1#x",
-            meetingTicketDescription(m, it),
-        )
-        // No description, no date, no link: just where it came from.
-        assertEquals("Proposed from the meeting \"T\".",
-            meetingTicketDescription(Meeting(title = "T", tenirUrl = "javascript:alert(1)"), MeetingItem(title = "x")))
+        assertEquals("It 500s", meetingTicketDescription(m, it))
+        assertEquals("", meetingTicketDescription(Meeting(title = "T"), MeetingItem(title = "x")))
     }
 
     @Test fun `clock and moment links`() {
