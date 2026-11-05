@@ -25480,7 +25480,11 @@ _MEETING_NAME_NOISE = frozenset(
 
 
 def _meeting_name_tokens(s):
-    return set(_meeting_norm(s or "").split()) - _MEETING_NAME_NOISE
+    """A name's words, accents folded ("José" = "Jose": a typed name and a
+    caption need not agree on them), suffix words dropped."""
+    s = "".join(ch for ch in unicodedata.normalize("NFKD", s or "")
+                if not unicodedata.combining(ch))
+    return set(_meeting_norm(s).split()) - _MEETING_NAME_NOISE
 
 
 def _meeting_words_fit(a, b):

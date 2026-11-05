@@ -56367,6 +56367,10 @@ class TestMeetingWorker(ManagerMixin, unittest.TestCase):
         j = {"names": ["J Smith"], "role": ""}
         for who, mine in (("Jun Park", False), ("Jane Smith", True), ("J. Smith", True)):
             self.assertEqual(ha.meeting_focus_is_mine(who, j), mine, who)
+        # Short forms on both sides, and accents either way.
+        self.assertTrue(ha.meeting_focus_is_mine("Malcolm H.", {"names": ["Mal Habeeb"]}))
+        self.assertTrue(ha.meeting_focus_is_mine("Jose G.", {"names": ["José García"]}))
+        self.assertTrue(ha.meeting_focus_is_mine("José Garcia", {"names": ["Jose Garcia"]}))
         # Only a role: nobody to compare against, so the model's pick stands.
         items = [{"suggestedAssignee": "Tom"}]
         self.assertEqual(ha.meeting_focus_filter(items, {"names": [], "role": "QA"}), items)
