@@ -1770,6 +1770,29 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual([(r["type"], r["label"]) for r in self._report({})["agents"]],
                          [("agent", "QA the parity change")])
 
+    def test_a_resumes_own_early_stop_survives_a_restart(self):
+        # XERK-2708: the stop time rides the snapshot, so a resume read after a
+        # restart still sees that its run's stop was written first.
+        path = os.path.join(self.proj, "s.jsonl")
+        own = dict(TestLiveAgentsScan.DONE_1, timestamp="2026-10-03T12:09:00.000Z",
+                   content=TestLiveAgentsScan.DONE_1["content"].replace("completed", "failed"))
+        write_jsonl(path, TASK_LAUNCH_ENTRIES + [TestLiveAgentsScan.DONE_1, own])
+        state = {}
+        self._report(state)
+        self._chatter(path)
+        self._report(state)
+        snap = os.path.join(ha.LIVE_AGENTS_DIR, f"{self.SID}.json")
+        with open(snap) as f:
+            body = json.load(f)
+        self.assertEqual(body["stopAt"], {"agent-1": ha._ts_ms(own["timestamp"])})
+        body["stopAt"].update({"bad": "x", "neg": -1, "flag": True})
+        with open(snap, "w") as f:
+            json.dump(body, f)
+        self._append(path, TestLiveAgentsScan.RESUME)
+        fresh = {}
+        self.assertEqual(self._report(fresh)["agents"], [])
+        self.assertEqual(set(fresh["stopAt"]), {"agent-1"})
+
     def test_a_stop_written_while_the_manager_was_down_is_applied(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, SHELL_LAUNCH_ENTRIES)
@@ -4872,6 +4895,31 @@ class TestLiveAgentsScan(unittest.TestCase):
         st = self._scan(TASK_LAUNCH_ENTRIES + [stopped, dict(stopped, operation="remove")]
                         + self.RESUME + [stopped])
         self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_resumed_run_whose_stop_was_written_first_stays_stopped(self):
+        # XERK-2708: the resumed run's own notification lands at an EARLIER
+        # offset than the resume record, with a LATER timestamp. It must not
+        # leave the agent live forever.
+        own = dict(self.DONE_1, timestamp="2026-10-03T12:09:00.000Z",
+                   content=self.DONE_1["content"].replace("completed", "failed"))
+        early = dict(self.DONE_1, timestamp="2026-10-03T12:00:00.000Z")
+        st = self._scan(TASK_LAUNCH_ENTRIES + [early, own] + self.RESUME)
+        self.assertEqual(ha.live_agents_report(st), [])
+        self.assertIn("agent-1", st["stoppedAgents"])
+        # Its later dequeue copy changes nothing.
+        st = self._scan([dict(own, operation="remove")], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_previous_runs_stop_older_than_the_resume_does_not_block_it(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES
+                        + [dict(self.DONE_1, timestamp="2026-10-03T12:04:59.999Z")]
+                        + self.RESUME)
+        self.assertEqual(len(ha.live_agents_report(st)), 1)
+
+    def test_the_stop_time_rides_the_snapshot(self):
+        own = dict(self.DONE_1, timestamp="2026-10-03T12:09:00.000Z")
+        st = self._scan(TASK_LAUNCH_ENTRIES + [own])
+        self.assertEqual(st["stopAt"], {"agent-1": ha._ts_ms("2026-10-03T12:09:00.000Z")})
 
     def test_a_resume_of_a_live_agent_keeps_its_row(self):
         st = self._scan(TASK_LAUNCH_ENTRIES)

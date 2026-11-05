@@ -45,6 +45,9 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
     ones stale, and their copies landing after it are skipped.
   - A fresh `enqueue` ALWAYS counts — never dedupe stops by body: a second restart's `stopped`
     repeats the first byte for byte. Back-scan residual: a stale enqueue outside window + lead-in.
+  - **A resume whose OWN stop was written first stays stopped** (XERK-2708, `stopAt`: id → newest
+    fresh-enqueue timestamp, in the snapshot + lead-in). An enqueue timestamped AFTER the resume
+    record is that run's stop; never drop the timestamp compare, or the agent is live forever.
   - Accepted gap: a message "queued for delivery" to an agent that finishes first resumes it
     with no transcript record, so that run reads idle.
 

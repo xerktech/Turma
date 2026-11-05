@@ -1546,6 +1546,9 @@ function scanAgentEntry(entry, state) {
   // moved to `stale` by a resume; a stale copy never retires the new run.
   const queued = state.queued || (state.queued = new Map());
   const stale = state.stale || (state.stale = new Map());
+  // XERK-2708 (see hub-agent.py): id -> newest fresh stop-enqueue timestamp, so
+  // a resume whose own stop was written early stays stopped.
+  const stopAt = state.stopAt || (state.stopAt = new Map());
   const content = entry.message && entry.message.content;
   let toolId = null;
   if (Array.isArray(content)) {
@@ -1581,7 +1584,11 @@ function scanAgentEntry(entry, state) {
   if (launch && launch.resumed) {
     // A resume is a NEW run, so its previous stop no longer wins; a still-live
     // agent keeps its row.
+    const own = stopAt.get(launch.id);
+    const resumedAt = tsMs(entry.timestamp);
     if (live.has(launch.id)) launch = null;
+    // This run's own stop already landed (written early): stays stopped.
+    else if (own != null && resumedAt != null && own > resumedAt) launch = null;
     else {
       stopped.delete(launch.id);
       if ((queued.get(launch.id) || []).length) {
@@ -1631,7 +1638,13 @@ function scanAgentEntry(entry, state) {
       if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) {
         const fp = tnFingerprint(text);
         const fresh = entry.type === "queue-operation" && entry.operation === "enqueue";
+        const at = fresh ? tsMs(entry.timestamp) : null;
         for (const id of tn.taskIds) {
+          if (at != null && at > (stopAt.get(id) || 0)) {
+            stopAt.delete(id);
+            stopAt.set(id, at);
+            while (stopAt.size > LIVE_AGENTS_MAX * 4) stopAt.delete(stopAt.keys().next().value);
+          }
           if (fresh) {
             // The new run's own stop; never clears `stale` (XERK-2707).
             const q = queued.get(id) || [];
@@ -1714,7 +1727,7 @@ function backscanLiveAgents(p, state, windowBytes = AGENT_BACKSCAN_BYTES,
       for (const id of leadIn.stopped || []) stopped.add(id);
       const runs = state.runs || (state.runs = new Map());
       for (const [id, r] of leadIn.runs || []) runs.set(id, r);
-      for (const key of ["queued", "stale"]) {
+      for (const key of ["queued", "stale", "stopAt"]) {
         const m = state[key] || (state[key] = new Map());
         for (const [id, f] of leadIn[key] || []) m.set(id, f);
       }
@@ -1803,6 +1816,9 @@ function restoreLiveAgents(sessionId, p, state, dir = LIVE_AGENTS_DIR) {
       .map(([k, v]) => [k, v.filter((f) => typeof f === "string").slice(-4)])
       .slice(-LIVE_AGENTS_MAX * 4));
   }
+  // Optional: absent before XERK-2708. Positive safe integers only.
+  state.stopAt = new Map(Object.entries(isObj(snap.stopAt) ? snap.stopAt : {})
+    .filter(([, v]) => Number.isSafeInteger(v) && v > 0).slice(-LIVE_AGENTS_MAX * 4));
   state.runs = new Map(Object.entries(isObj(snap.agentRuns) ? snap.agentRuns : {})
     .map(([k, v]) => [k, snapshotRow(v)]).filter(([, v]) => v)
     .map(([k, v]) => [k, { type: v.type, label: v.label }]));

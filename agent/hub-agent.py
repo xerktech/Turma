@@ -12282,6 +12282,11 @@ def _scan_agent_entry(entry, state):
     # harmless: the run is already stopped.
     queued = state.setdefault("stopQueued", {})
     stale = state.setdefault("stopStale", {})
+    # XERK-2708: id -> the newest timestamp (epoch ms) of a fresh stop
+    # `enqueue`. A resume whose run already stopped (its notification written at
+    # an EARLIER offset than the resume record, with a LATER timestamp) must
+    # not register, or it stays live forever.
+    stop_at = state.setdefault("stopAt", {})
     msg = entry.get("message") if isinstance(entry, dict) else None
     content = msg.get("content") if isinstance(msg, dict) else None
     if isinstance(content, list):
@@ -12321,7 +12326,12 @@ def _scan_agent_entry(entry, state):
     if launch and launch.get("resumed"):
         # A resume starts a NEW run of an agent whose previous run stopped, so
         # that stop no longer wins; an agent still live keeps its row.
+        own = stop_at.get(launch["id"])
+        resumed_at = _ts_ms(entry.get("timestamp"))
         if launch["id"] in live:
+            launch = None
+        elif own is not None and resumed_at is not None and own > resumed_at:
+            # This run's own stop already landed (written early): stays stopped.
             launch = None
         else:
             if launch["id"] in stopped:
@@ -12396,7 +12406,13 @@ def _scan_agent_entry(entry, state):
                 fp = _tn_fingerprint(text)
                 fresh = entry.get("type") == "queue-operation" \
                     and entry.get("operation") == "enqueue"
+                at = _ts_ms(entry.get("timestamp")) if fresh else None
                 for tid in tn["taskIds"]:
+                    if at is not None and at > (stop_at.get(tid) or 0):
+                        stop_at.pop(tid, None)
+                        stop_at[tid] = at
+                        while len(stop_at) > LIVE_AGENTS_MAX * 4:
+                            stop_at.pop(next(iter(stop_at)))
                     if fresh:   # the new run's own stop; never clears `stale`
                         q = queued.pop(tid, None) or []
                         queued[tid] = (q + [fp])[-4:]
@@ -12640,7 +12656,7 @@ def _backscan_live_agents(path, state):
             # A launch there is not live, but a resume of it later still
             # relists its type and label (XERK-2707).
             state.setdefault("agentRuns", {}).update(lead_in.get("agentRuns") or {})
-            for key in ("stopQueued", "stopStale"):
+            for key in ("stopQueued", "stopStale", "stopAt"):
                 state.setdefault(key, {}).update(lead_in.get(key) or {})
             lead_in = {}
         _scan_agent_entry(entry, state)
@@ -12683,6 +12699,7 @@ def _publish_live_agents(session_id, path, offset, state):
     body["agentRuns"] = dict(state.get("agentRuns") or {})
     body["stopQueued"] = dict(state.get("stopQueued") or {})
     body["stopStale"] = dict(state.get("stopStale") or {})
+    body["stopAt"] = dict(state.get("stopAt") or {})
     # The QA scan rides the same offset (XERK-1857): `qa` says this manager's
     # scan saw the whole transcript up to it, and `qaCalls` the launches still
     # awaiting a result, so a restart folds the gap instead of going partial.
@@ -12793,6 +12810,12 @@ def _restore_live_agents(session_id, path, state, report=None):
         state[key] = dict(list(
             (str(k), [f for f in v if isinstance(f, str)][-4:])
             for k, v in m.items() if isinstance(v, list))[-LIVE_AGENTS_MAX * 4:])
+    # Optional: absent before XERK-2708. Positive safe integers only.
+    stop_at = snap.get("stopAt") if isinstance(snap.get("stopAt"), dict) else {}
+    state["stopAt"] = dict(list(
+        (str(k), v) for k, v in stop_at.items()
+        if isinstance(v, int) and not isinstance(v, bool) and 0 < v <= _MAX_SAFE_INT
+    )[-LIVE_AGENTS_MAX * 4:])
     # Optional: a snapshot written before XERK-2707 has none.
     runs = snap.get("agentRuns") if isinstance(snap.get("agentRuns"), dict) else {}
     state["agentRuns"] = {str(k): {"type": r["type"], "label": r["label"]}
