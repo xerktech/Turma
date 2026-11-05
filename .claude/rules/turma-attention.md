@@ -40,8 +40,8 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
 - `sleeping`: a session-CLI `wakeAt` still in the future (`sessionSleeping`; `eta` = wakeAt, `why` =
   the wake reason). **Never ready for review, never alerted, never auto-merged** — every
   `readyForReview` mirror returns false for it and every client's liveState reads it as holding
-  ("💤 sleeping until 14:05"). It has NO host-online gate (the hub's read has none), so the
-  clients' offline branches honour it too.
+  ("💤 sleeping until 14:05"), listed in the Sessions page's own Sleeping section (XERK-2704).
+  It has NO host-online gate (the hub's read has none), so the clients' offline branches honour it.
 - `waiting` / `needs-you:stalled` are `sessionWait`'s two answers (`session-working.md`); `why` is
   what it waits on (the one wait row's label, else a count), `eta` the newest row ETA.
 - `needs-you:review` = `readyForReview` minus the states above; `why` splits on the existing inputs

@@ -108,6 +108,28 @@ class SessionsFlattenTest {
         assertEquals(listOf("mergedOne", "quietOne"), groups.idle.map { it.flat.session.id }.sorted())
     }
 
+    // XERK-2704: a session asleep until a session-CLI wake gets its own Sleeping
+    // group (below Idle), not Active; a wake already past is just idle again.
+    @Test fun `rankRunning parks a sleeping session in Sleeping`() {
+        fun wake(id: String, at: Long) = flat(id, paneBusy = false).let { f ->
+            f.copy(session = f.session.copy(session = f.session.session!!.copy(wakeAt = at)))
+        }
+        val groups = rankRunning(
+            listOf(
+                wake("asleep", 5_000L), wake("woke", 500L), flat("workOne", paneBusy = true),
+                // Busy with a wake ahead: working, so Active — never Sleeping.
+                flat("busySleeper", paneBusy = true).let { f ->
+                    f.copy(session = f.session.copy(session = f.session.session!!.copy(wakeAt = 5_000L)))
+                },
+            ),
+            now = 1_000L,
+        )
+        assertEquals(listOf("asleep"), groups.sleeping.map { it.flat.session.id })
+        assertEquals(listOf(LiveState.HOLDING), groups.sleeping.map { it.state })
+        assertEquals(listOf("busySleeper", "workOne"), groups.active.map { it.flat.session.id }.sorted())
+        assertEquals(listOf("woke"), groups.idle.map { it.flat.session.id })
+    }
+
     // XERK-1571: Ready for review is ordered oldest-WAITING first by the hub's
     // attention `since`, not by createdAt; the other groups keep createdAt.
     @Test fun `rankRunning orders Ready for review by attention since, oldest first`() {

@@ -866,7 +866,8 @@ those are marked `[MODEL]`.
   (`SessionRenameCard`, painted optimistically until the agent reports the name back or a TTL passes),
   Kill arms "Confirm kill" then confirms. `vm/FleetViewModel.kt` `setSummary`; `net/HubApi.kt`
   `setSummary`/`SummaryRequest`.
-- P1 Sidebar sections: Ready for review / Active / Idle split done (XERK-73 + XERK-224,
+- P1 Sidebar sections: Ready for review / Active / Idle / Sleeping split done (XERK-73 + XERK-224
+  + XERK-2704 Sleeping,
   `rankRunning` → `LiveGroups`); the dedicated Queued section done (XERK-78; the old Stopped group
   folded into Ended). Each live card now carries the web's colored state line, and a
   Ready-for-review card spells out why it qualified ("PR awaiting review" / "finished · awaiting
