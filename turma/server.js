@@ -20192,9 +20192,11 @@ function attentionNudgeText(reason, session) {
     : waits.length > 1 ? `Your ${waits.length} ${noun}s have` : `Your ${noun} has`;
   const mins = Number.isFinite(s.transcriptAgeSec) ? Math.max(1, Math.round(s.transcriptAgeSec / 60)) : null;
   const quiet = mins ? `produced nothing for ${mins} minute${mins === 1 ? "" : "s"}` : "gone quiet";
-  return `${subject} ${quiet}. Check whether it is still doing anything; if it is waiting on `
-    + "something with a known duration, stop it and use the session CLI's `wake`; if it is dead, "
-    + "say what you know and end the turn.";
+  // A count is plural; the advice then speaks of "they" (QA, XERK-2710).
+  const many = !label && waits.length > 1;
+  return `${subject} ${quiet}. Check whether ${many ? "they are" : "it is"} still doing anything; `
+    + `if ${many ? "one is" : "it is"} waiting on something with a known duration, stop it and use the `
+    + `session CLI's \`wake\`; if ${many ? "one is" : "it is"} dead, say what you know and end the turn.`;
 }
 // LEADER-ONLY (masterOrchestrationTick): reads the attention each beat decided.
 function attentionNudgeSweep(now = Date.now()) {

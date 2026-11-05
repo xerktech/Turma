@@ -27869,6 +27869,15 @@ test("XERK-2710: a parked background AGENT is nudged as an agent, never as a she
   };
   const row = (type) => ({ type, label: " ", kind: "wait-external" });
   assert.equal(att([row("qa"), row("qa")]).why, "2 background agents");
+  // A count reads as plural all the way through the advice.
+  hub.attentionNudged.clear();
+  const host2 = "nudge-agents";
+  const two = { id: "s2", status: "running", session: { paneBusy: false, transcriptAgeSec: 47 * 60,
+    agents: [row("qa"), row("qa")] } };
+  const b = nudgeHost(host2, [{ session: two, attn: { state: "needs-you:stalled", since: t0, why: "x" } }], t0);
+  b.lastSeen = t0;
+  hub.attentionNudgeSweep(t0);
+  assert.match(nudges(host2)[0].text, /^Your 2 background agents have produced nothing for 47 minutes\. Check whether they are still doing anything; if one is waiting/);
   assert.equal(att([row("shell"), row("qa")]).why, "2 background tasks");
   assert.equal(att([row("shell"), row("shell")]).why, "2 background shells");
 });

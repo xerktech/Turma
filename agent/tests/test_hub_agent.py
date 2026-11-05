@@ -1795,6 +1795,29 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(set(fresh["stopAt"]), {"agent-1", "flt"})
         self.assertIs(type(fresh["stopAt"]["flt"]), int)   # as JS reads 1000.0
 
+    def test_a_parked_runs_interim_time_survives_a_restart(self):
+        # XERK-2710: the interim time rides the snapshot, so a resume record
+        # read after a restart still sees that its run's interim came first.
+        path = os.path.join(self.proj, "s.jsonl")
+        late = dict(TestLiveAgentsScan.INTERIM_1, timestamp="2026-10-03T12:20:00.000Z")
+        write_jsonl(path, TASK_LAUNCH_ENTRIES
+                    + [dict(TestLiveAgentsScan.DONE_1, timestamp="2026-10-03T12:01:00.000Z"), late])
+        state = {}
+        self._report(state)
+        self._chatter(path)
+        self._report(state)
+        snap = os.path.join(ha.LIVE_AGENTS_DIR, f"{self.SID}.json")
+        with open(snap) as f:
+            body = json.load(f)
+        self.assertEqual(body["interimAt"], {"agent-1": ha._ts_ms(late["timestamp"])})
+        body["interimAt"].update({"bad": "x", "neg": -1, "flag": True})
+        with open(snap, "w") as f:
+            json.dump(body, f)
+        self._append(path, TestLiveAgentsScan.RESUME)
+        fresh = {}
+        self.assertEqual([r.get("kind") for r in self._report(fresh)["agents"]], ["wait-external"])
+        self.assertEqual(set(fresh["interimAt"]), {"agent-1"})
+
     def test_a_stop_written_while_the_manager_was_down_is_applied(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, SHELL_LAUNCH_ENTRIES)
@@ -4952,18 +4975,63 @@ class TestLiveAgentsScan(unittest.TestCase):
         self.assertEqual(ha.live_agents_report(st)[0]["startedAt"],
                          ha._ts_ms("2026-10-03T12:05:00.000Z"))
 
+    def _work_shell(self, ts=None):
+        # A WORK shell: `npm run build` (the stock fixture is already a wait,
+        # so re-kinding it to one would prove nothing).
+        launch = json.loads(json.dumps(SHELL_LAUNCH_ENTRIES))
+        launch[0]["message"]["content"][0]["input"]["command"] = "npm run build"
+        if ts:
+            launch[1]["timestamp"] = ts
+        return launch
+
+    def _interim_for(self, sid, ts="2026-10-03T12:02:00.000Z"):
+        return dict(self.INTERIM_1, timestamp=ts,
+                    content=self.INTERIM_1["content"].replace("agent-1", sid))
+
     def test_an_interim_never_retypes_a_shell(self):
         # QA (XERK-2710 #6): a shell row keeps its own kind.
-        st = self._scan(SHELL_LAUNCH_ENTRIES)
+        st = self._scan(self._work_shell())
         (sid, row), = st["liveAgents"].items()
+        self.assertEqual(row["kind"], "work")
+        st = self._scan([self._interim_for(sid)], st)
+        self.assertEqual(st["liveAgents"][sid]["kind"], "work")
+
+    def test_an_interim_before_a_shells_launch_never_parks_it(self):
+        # QA delta: the launch-path guard — only an agent row is ever parked.
+        sid = self._scan(self._work_shell())["liveAgents"].popitem()[0]
+        st = self._scan([self._interim_for(sid)]
+                        + self._work_shell("2026-10-03T12:00:00.000Z"))
+        self.assertEqual([r["kind"] for r in ha.live_agents_report(st)], ["work"])
+
+    def test_a_resume_naming_a_shell_keeps_its_kind(self):
+        # A resume record naming a shell's id (never real; Bash is no agent)
+        # must not strip the shell's own kind.
+        st = self._scan(SHELL_LAUNCH_ENTRIES)
+        sid, row = next(iter(st["liveAgents"].items()))
         kind = row["kind"]
-        st = self._scan([dict(self.INTERIM_1, content=self.INTERIM_1["content"].replace(
-            "agent-1", sid))], st)
+        resume = json.loads(json.dumps(self.RESUME).replace("agent-1", sid))
+        st = self._scan(resume, st)
         self.assertEqual(st["liveAgents"][sid]["kind"], kind)
 
-    def test_the_interim_stamp_survives_the_snapshot(self):
+    def test_the_interim_time_is_recorded(self):
         st = self._scan([dict(self.INTERIM_1, timestamp="2099-01-01T00:00:00.000Z")])
         self.assertEqual(st["interimAt"], {"agent-1": ha._ts_ms("2099-01-01T00:00:00.000Z")})
+
+    def test_the_lead_in_carries_the_interim_time(self):
+        # A stop, then the resumed run's own interim written before its resume
+        # record, both cut off into the back-scan's lead-in.
+        late = dict(self.INTERIM_1, timestamp="2026-10-03T12:20:00.000Z")
+        pad = {"type": "user", "message": {"content": "x" * 4000}}
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "t.jsonl")
+        write_jsonl(path, TASK_LAUNCH_ENTRIES
+                    + [dict(self.DONE_1, timestamp="2026-10-03T12:01:00.000Z"), late, pad, pad]
+                    + self.RESUME)
+        tail = len(json.dumps(pad)) + sum(len(json.dumps(e)) + 1 for e in self.RESUME) + 10
+        with mock.patch.object(ha, "AGENT_BACKSCAN_BYTES", tail):
+            st = {}
+            ha._backscan_live_agents(path, st)
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], ["wait-external"])
 
     def test_a_parked_agent_survives_the_snapshot_as_a_wait(self):
         st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_1])

@@ -3378,3 +3378,68 @@ test("scanAgentEntry: an interim notice parks the agent as a wait, not a stop", 
   // A stopped agent is not resurrected by a later interim.
   assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, notif("agent-1", "completed"), interim])), []);
 });
+
+// XERK-2710 QA delta: the shell guards and the interimAt persistence, twins of
+// the TestLiveAgentsScan / restart cases.
+test("scanAgentEntry: an interim never parks a WORK shell, before or after its launch", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const shell = (ts) => [
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "tb", name: "Bash",
+      input: { command: "npm run build", description: "Build", run_in_background: true } }] } },
+    { type: "user", timestamp: ts,
+      message: { content: [{ type: "tool_result", tool_use_id: "tb", content: "x" }] },
+      toolUseResult: { stdout: "", backgroundTaskId: "bb" } },
+  ];
+  const interim = { type: "queue-operation", operation: "enqueue", timestamp: "2026-10-03T12:02:00.000Z",
+    content: "<task-notification>\n<task-id>bb</task-id>\n<status>completed</status>\n<note>This agent "
+      + "stopped with background work of its own still running.</note>\n</task-notification>" };
+  assert.deepEqual(liveAgentsReport(scanAll([...shell("2026-10-03T12:00:00.000Z"), interim])).map((r) => r.kind), ["work"]);
+  assert.deepEqual(liveAgentsReport(scanAll([interim, ...shell("2026-10-03T12:00:00.000Z")])).map((r) => r.kind), ["work"]);
+});
+
+const lateInterim = { type: "queue-operation", operation: "enqueue", timestamp: "2026-10-03T12:20:00.000Z",
+  content: "<task-notification>\n<task-id>agent-1</task-id>\n<status>completed</status>\n<note>This agent "
+    + "stopped with background work of its own still running.</note>\n</task-notification>" };
+
+test("backscanLiveAgents: the lead-in carries interimAt", () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-interim-"));
+  const p = path.join(dir, "t.jsonl");
+  const pad = { type: "user", message: { content: "x".repeat(4000) } };
+  const lines = [...LAUNCH_ENTRIES, { ...notif("agent-1", "completed"), timestamp: "2026-10-03T12:01:00.000Z" },
+    lateInterim, pad, pad, ...RESUME_ENTRIES];
+  fs.writeFileSync(p, lines.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  const tail = JSON.stringify(pad).length + RESUME_ENTRIES.reduce((n, e) => n + JSON.stringify(e).length + 1, 0) + 10;
+  const st = { live: new Map(), tasks: new Map() };
+  mod.backscanLiveAgents(p, st, tail);
+  assert.deepEqual(mod.liveAgentsReport(st).map((r) => r.kind), ["wait-external"]);
+});
+
+test("restoreLiveAgents: keeps only usable interimAt values, and they park a later resume", () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-interimat-"));
+  const p = path.join(dir, "conv.jsonl");
+  fs.writeFileSync(p, "");
+  const at = Date.UTC(2026, 9, 3, 12, 20);
+  fs.writeFileSync(path.join(dir, "s1.json"), JSON.stringify({
+    v: 1, transcript: "conv.jsonl", offset: 0, liveAgents: {}, agentTasks: {}, shellCalls: {},
+    stoppedAgents: ["agent-1"], stopAt: { "agent-1": Date.UTC(2026, 9, 3, 12, 1) },
+    agentRuns: { "agent-1": { type: "qa-delta", label: "QA the parity change" } },
+    interimAt: { "agent-1": at, bad: "x", neg: -1, big: 2 ** 60 } }));
+  const st = { live: new Map(), tasks: new Map() };
+  assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
+  assert.deepEqual([...st.interimAt], [["agent-1", at]]);
+  mod.scanAgentEntry(RESUME_ENTRIES[1], st);
+  assert.deepEqual(mod.liveAgentsReport(st).map((r) => r.kind), ["wait-external"]);
+});
+
+test("scanAgentEntry: a resume naming a shell keeps the shell's kind", () => {
+  const st = scanAll([
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "tw", name: "Bash",
+      input: { command: "gh run watch 9", description: "Watch CI", run_in_background: true } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tw", content: "x" }] },
+      toolUseResult: { stdout: "", backgroundTaskId: "bw" } },
+  ]);
+  scanAll(JSON.parse(JSON.stringify(RESUME_ENTRIES).replace(/agent-1/g, "bw")), st);
+  assert.equal(st.live.get("bw").kind, "wait-external");
+});
