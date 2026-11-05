@@ -1699,6 +1699,17 @@ test("scanAgentEntry: a SendMessage-resumed agent is live again until its next s
   assert.deepEqual(liveAgentsReport(st), []);
   st = scanAll([...LAUNCH_ENTRIES, interim, ...RESUME_ENTRIES]);
   assert.deepEqual(liveAgentsReport(st).map((r) => r.kind), [undefined]);
+  // XERK-2712 (twin of test_a_parked_agent_drops_out_after_the_expiry).
+  const stamped = { ...interim, timestamp: "2026-10-03T12:03:00.000Z" };
+  st = scanAll([...LAUNCH_ENTRIES, stamped, { ...stamped, timestamp: "2026-10-03T13:00:00.000Z" }]);
+  const parked = require("../tunnel-agent.js").tsMs("2026-10-03T12:03:00.000Z");
+  assert.equal(st.live.get("agent-1").parkedAt, parked);
+  const exp = parked + 3 * 3600 * 1000;
+  assert.equal(liveAgentsReport(st, exp - 1).length, 1);
+  assert.deepEqual(liveAgentsReport(st, exp), []);
+  st = scanAll(RESUME_ENTRIES, st);
+  assert.equal(st.live.get("agent-1").parkedAt, undefined);
+  assert.equal(liveAgentsReport(st, exp + 1).length, 1);
   // A shell keeps the kind its command was classified as (py twin:
   // test_an_interim_notice_never_turns_a_shell_into_an_agent_wait).
   const workShell = [

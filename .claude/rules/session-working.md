@@ -55,13 +55,21 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
   `tnInterim`): Claude Code's interim notice (status `completed`) when a subagent ends its turn with
   its own background work running. The row turns into a wait (`kind: wait-external`), so the session
   reads waiting, not idle; its final notice retires it; a `SendMessage` resume makes it work again.
-  - Never ignore the notice instead: 14 of 39 such agents on a real host sent no final one, so
-    they would read working forever. As a wait they go stalled after `ATTENTION_WAIT_STALL_MIN`.
+  - Never ignore the notice instead: a third or more of such agents never send a final one, so
+    they would read working forever.
+  - **A parked row expires and never stalls** (XERK-2712, operator decision). 95 of 96 agents
+    had already handed in their report, so "stalled" fired on finished work. The agent drops a
+    row `INTERIM_AGENT_EXPIRE_MS` (3h) after its FIRST interim notice (`parkedAt`, carried in
+    the snapshot, cleared by a resume); 25 of 26 re-notifiers on a real host did so within 2.4h.
+  - Until then it reads waiting: `backgroundWait`'s silence stall counts only when a wait row is
+    a SHELL (all four mirrors) — this transcript's silence says nothing about a subagent.
+  - Rejected: expiring on the subagent transcript's live children (a new incremental scan) and
+    treating a post-handback interim notice as done (reads idle while that work runs).
   - Keyed on the summary ENDING with the wording (after the quoted description), never on `<note>`.
-  - **Its stall nudge never says "stop it"** (`attentionNudgeText`): the parent's silence is no sign
-    of death (the agent writes its own transcript), so an all-agent wait is named as an agent and
-    told to check first. Wait counts name agents/shells/tasks (`backgroundRowsLabel`, web
-    `backgroundWorkLabel`, Android `backgroundRowsLabel`) — never assume a wait row is a shell.
+  - **A stall nudge never says "stop it" to an agent** (`attentionNudgeText`): only a mix with a
+    shell stalls, and its stop advice names the shells. Wait counts name agents/shells/tasks
+    (`backgroundRowsLabel`, web `backgroundWorkLabel`, Android `backgroundRowsLabel`) — never
+    assume a wait row is a shell.
 
 ## The published live-agent set survives a restart (XERK-1587)
 

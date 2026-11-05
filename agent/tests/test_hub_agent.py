@@ -4970,14 +4970,35 @@ class TestLiveAgentsScan(unittest.TestCase):
                             "stopped with background work of its own still running.</note>\n"
                             "</task-notification>"}
 
+    # Read the report beside the fixture's own clock (XERK-2712 expires a parked row).
+    PARKED_NOW = ha._ts_ms("2026-10-03T12:05:00.000Z")
+
     def test_an_interim_notification_reads_the_agent_as_waiting_not_stopped(self):
         st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_1,
                                                dict(self.INTERIM_1, operation="remove")])
-        self.assertEqual(ha.live_agents_report(st), [
+        self.assertEqual(ha.live_agents_report(st, now_ms=self.PARKED_NOW), [
             {"type": "agent", "label": "QA the parity change", "kind": "wait-external"}])
         # Its final notification retires it.
         st = self._scan([dict(self.DONE_1, timestamp="2026-10-03T12:04:00.000Z")], st)
         self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_parked_agent_drops_out_after_the_expiry(self):
+        # XERK-2712: an agent parked by an interim notice that never notifies again
+        # is dropped INTERIM_AGENT_EXPIRE_MS after its FIRST notice (a repeat does
+        # not restart the clock), so its session reads idle, not stalled forever.
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_1, dict(
+            self.INTERIM_1, timestamp="2026-10-03T13:00:00.000Z")])
+        parked = ha._ts_ms("2026-10-03T12:03:00.000Z")
+        self.assertEqual(st["liveAgents"]["agent-1"]["parkedAt"], parked)
+        exp = parked + ha.INTERIM_AGENT_EXPIRE_MS
+        self.assertEqual(len(ha.live_agents_report(st, now_ms=exp - 1)), 1)
+        self.assertEqual(ha.live_agents_report(st, now_ms=exp), [])
+        # The clock survives a restart through the snapshot row.
+        self.assertEqual(ha._snapshot_row(st["liveAgents"]["agent-1"])["parkedAt"], parked)
+        # A resume makes it work again and clears the clock.
+        st = self._scan(self.RESUME, st)
+        self.assertNotIn("parkedAt", st["liveAgents"]["agent-1"])
+        self.assertEqual(len(ha.live_agents_report(st, now_ms=exp + 1)), 1)
 
     def test_a_resume_of_a_waiting_agent_makes_it_work_again(self):
         st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_1] + self.RESUME)
@@ -4989,10 +5010,12 @@ class TestLiveAgentsScan(unittest.TestCase):
         interim = dict(self.INTERIM_1, content=self.INTERIM_1["content"]
                        .replace("agent-1", "bsh1").replace("work</summary>", "work \r\n</summary>"))
         st = self._scan(SHELL_LAUNCH_ENTRIES + [interim])
-        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], ["wait-external"])
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st, now_ms=self.PARKED_NOW)],
+                         ["wait-external"])
         st = self._scan(TASK_LAUNCH_ENTRIES + [dict(self.INTERIM_1, content=self.INTERIM_1["content"]
                         .replace("work</summary>", "work \t\n</summary>"))])
-        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], ["wait-external"])
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st, now_ms=self.PARKED_NOW)],
+                         ["wait-external"])
         work = json.loads(json.dumps(SHELL_LAUNCH_ENTRIES))
         work[0]["message"]["content"][0]["input"]["command"] = "npm test"
         st = self._scan(work + [interim])

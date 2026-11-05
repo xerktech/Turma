@@ -382,8 +382,9 @@ test("background shell kinds: waiting holds, stalled surfaces, work stays workin
     running("45555", "Blank Shell", { ...finished, transcriptAgeSec: 50 * 60,
       agents: [{ type: "shell", label: "   ", kind: "wait-external" }] }),
     // XERK-2710: QA agents waiting on their own background work hold the session
-    // Active as waiting, counted as agents.
-    running("46666", "QA Waiter", { ...finished, transcriptAgeSec: 5,
+    // Active as waiting, counted as agents — and never stall (XERK-2712), so a long
+    // quiet transcript keeps it there.
+    running("46666", "QA Waiter", { ...finished, transcriptAgeSec: 50 * 60,
       agents: [{ type: "qa-delta", label: "", kind: "wait-external" },
                { type: "qa", label: "", kind: "wait-external" }] }),
   ]);
