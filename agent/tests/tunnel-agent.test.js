@@ -1699,6 +1699,23 @@ test("scanAgentEntry: a SendMessage-resumed agent is live again until its next s
   assert.deepEqual(liveAgentsReport(st), []);
   st = scanAll([...LAUNCH_ENTRIES, interim, ...RESUME_ENTRIES]);
   assert.deepEqual(liveAgentsReport(st).map((r) => r.kind), [undefined]);
+  // XERK-2712 (twin of test_a_parked_agent_drops_out_after_the_expiry).
+  const stamped = { ...interim, timestamp: "2026-10-03T12:03:00.000Z" };
+  st = scanAll([...LAUNCH_ENTRIES, stamped, { ...stamped, timestamp: "2026-10-03T13:00:00.000Z" }]);
+  const parked = require("../tunnel-agent.js").tsMs("2026-10-03T12:03:00.000Z");
+  assert.equal(st.live.get("agent-1").parkedAt, parked);
+  const exp = parked + 3 * 3600 * 1000;
+  assert.equal(liveAgentsReport(st, exp - 1).length, 1);
+  assert.deepEqual(liveAgentsReport(st, exp), []);
+  // A future or epoch-0 notice stamp parks at now, never later.
+  for (const ts of ["2099-01-01T00:00:00.000Z", "1970-01-01T00:00:00.000Z"]) {
+    const before = Date.now();
+    const got = scanAll([...LAUNCH_ENTRIES, { ...interim, timestamp: ts }]).live.get("agent-1").parkedAt;
+    assert.ok(got >= before && got <= Date.now(), `${ts} -> ${got}`);
+  }
+  st = scanAll(RESUME_ENTRIES, st);
+  assert.equal(st.live.get("agent-1").parkedAt, undefined);
+  assert.equal(liveAgentsReport(st, exp + 1).length, 1);
   // A shell keeps the kind its command was classified as (py twin:
   // test_an_interim_notice_never_turns_a_shell_into_an_agent_wait).
   const workShell = [
@@ -3337,6 +3354,20 @@ test("restoreLiveAgents: seeds from the manager's snapshot and folds the gap", (
   st = fresh();
   assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
   assert.deepEqual(mod.liveAgentsReport(st), [{ type: "shell", label: "Watch CI", kind: "wait-external" }]);
+
+  // XERK-2712: a parked agent keeps its clock across a restart; one with no clock
+  // (an older agent's snapshot) or a future one is given now, so it still expires.
+  const parkedRow = { type: "qa", label: "QA", resolveId: "", kind: "wait-external" };
+  for (const [parkedAt, want] of [[1000, 1000], [undefined, null], [2 ** 52, null]]) {
+    snap({ liveAgents: { a1: { ...parkedRow, parkedAt } } });
+    st = fresh();
+    const before = Date.now();
+    assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
+    const got = st.live.get("a1").parkedAt;
+    if (want != null) assert.equal(got, want);
+    else assert.ok(got >= before && got <= Date.now(), String(got));
+  }
+  assert.deepEqual(mod.liveAgentsReport(st, Date.now() + 3 * 3600 * 1000), []);
 
   // XERK-2707: the snapshot's launch map relists a resumed agent's own row; a
   // snapshot without one (older manager) still restores.
