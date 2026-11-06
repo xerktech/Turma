@@ -1713,7 +1713,8 @@ test("scanAgentEntry: a SendMessage-resumed agent is live again until its next s
     const got = scanAll([...LAUNCH_ENTRIES, { ...interim, timestamp: ts }]).live.get("agent-1").parkedAt;
     assert.ok(got >= before && got <= Date.now(), `${ts} -> ${got}`);
   }
-  st = scanAll(RESUME_ENTRIES, st);
+  // A resume stamped after both notices (an earlier one is the parked run's own, XERK-2710).
+  st = scanAll(RESUME_ENTRIES.map((e) => ({ ...e, timestamp: "2026-10-03T13:05:00.000Z" })), st);
   assert.equal(st.live.get("agent-1").parkedAt, undefined);
   assert.equal(liveAgentsReport(st, exp + 1).length, 1);
   // A shell keeps the kind its command was classified as (py twin:
@@ -3420,4 +3421,137 @@ test("restoreLiveAgents: seeds from the manager's snapshot and folds the gap", (
     { type: "general-purpose", label: "ok", kind: "wait-timed", startedAt: 5 }]);
   assert.equal(mod.restoreLiveAgents("nope", p, fresh(), dir), false);
   assert.equal(mod.restoreLiveAgents("../s1", p, fresh(), dir), false);
+});
+
+// The interim fixtures are dated 2026-10-03: report at that time, so XERK-2712's
+// 3h expiry is out of the way.
+const FIXTURE_NOW = Date.UTC(2026, 9, 3, 12, 30);
+
+// XERK-2710: twin of TestLiveAgentsScan's interim cases. Claude Code's INTERIM
+// notice (the agent stopped with background work of its own still running) is
+// not a stop: the row becomes a wait until the same task-id notifies again.
+test("scanAgentEntry: an interim notice parks the agent as a wait, not a stop", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const interim = { type: "queue-operation", operation: "enqueue", timestamp: "2026-10-03T12:02:00.000Z",
+    content: "<task-notification>\n<task-id>agent-1</task-id>\n<status>completed</status>\n"
+      + "<summary>Agent \"QA the parity change\" is waiting on its own background work</summary>\n"
+      + "<note>This agent stopped with background work of its own still running. It may resume on its "
+      + "own when that work completes or reports, and the same task-id notifies again if it does; the "
+      + "result below may be interim.</note>\n<result>build running</result>\n</task-notification>" };
+  let st = scanAll([...LAUNCH_ENTRIES, interim]);
+  assert.deepEqual(liveAgentsReport(st, FIXTURE_NOW), [{ type: "agent", label: "QA the parity change", kind: "wait-external" }]);
+  st = scanAll([{ ...interim, operation: "remove" }, { type: "user", message: { content: interim.content } }], st);
+  assert.equal(liveAgentsReport(st, FIXTURE_NOW).length, 1);
+  st = scanAll([notif("agent-1", "completed")], st);
+  assert.deepEqual(liveAgentsReport(st, FIXTURE_NOW), []);
+  // Older "finished" summary with the same note parks it too.
+  const old = { ...interim, content: interim.content.replace("is waiting on its own background work", "finished") };
+  assert.equal(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, old]), FIXTURE_NOW)[0].kind, "wait-external");
+  // The ordinary completion note is still a stop.
+  const plain = { ...notif("agent-1", "completed"), content: notif("agent-1", "completed").content.replace(
+    "</status>", "</status>\n<note>A task-notification fires each time this agent stops with no live background "
+    + "children of its own. The user can send it another message and resume it, so the same task-id may notify "
+    + "more than once.</note>") };
+  assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, plain]), FIXTURE_NOW), []);
+  // A resume while parked is work again; a late interim copy does not re-park it.
+  st = scanAll([...LAUNCH_ENTRIES, interim, ...RESUME_ENTRIES, { ...interim, operation: "remove" }]);
+  assert.deepEqual(liveAgentsReport(st, FIXTURE_NOW).map((r) => r.kind), [undefined]);
+  // A final notice whose <result> QUOTES the interim note is still a stop (QA #1).
+  const quoting = { ...notif("agent-1", "completed") };
+  quoting.content = quoting.content.replace("</status>", "</status>\n<result>saw <note>This agent stopped "
+    + "with background work of its own still running.</note></result>");
+  assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, quoting]), FIXTURE_NOW), []);
+  // An interim written before its resume record stays parked (QA #2a/#2b),
+  // and the resume restarts a parked row's clock (QA #5).
+  const late = { ...interim, timestamp: "2026-10-03T12:20:00.000Z" };
+  st = scanAll([...LAUNCH_ENTRIES, { ...notif("agent-1", "completed"), timestamp: "2026-10-03T12:01:00.000Z" },
+    late, ...RESUME_ENTRIES]);
+  assert.deepEqual(liveAgentsReport(st, FIXTURE_NOW).map((r) => r.kind), ["wait-external"]);
+  st = scanAll([...LAUNCH_ENTRIES, interim, late, ...RESUME_ENTRIES]);
+  assert.deepEqual(liveAgentsReport(st, FIXTURE_NOW).map((r) => r.kind), ["wait-external"]);
+  st = scanAll([...LAUNCH_ENTRIES, interim, ...RESUME_ENTRIES]);
+  assert.equal(liveAgentsReport(st, FIXTURE_NOW)[0].startedAt, Date.UTC(2026, 9, 3, 12, 5));
+  // An interim written before its launch record parks the launch (QA #2c).
+  const launch = JSON.parse(JSON.stringify(LAUNCH_ENTRIES));
+  launch[1].timestamp = "2026-10-03T12:00:00.000Z";
+  assert.deepEqual(liveAgentsReport(scanAll([interim, ...launch]), FIXTURE_NOW).map((r) => r.kind), ["wait-external"]);
+  // A stopped agent is not resurrected by a later interim.
+  assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, notif("agent-1", "completed"), interim]), FIXTURE_NOW), []);
+});
+
+// XERK-2710 QA delta: the shell guards and the interimAt persistence, twins of
+// the TestLiveAgentsScan / restart cases.
+test("scanAgentEntry: an interim never parks a WORK shell, before or after its launch", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const shell = (ts) => [
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "tb", name: "Bash",
+      input: { command: "npm run build", description: "Build", run_in_background: true } }] } },
+    { type: "user", timestamp: ts,
+      message: { content: [{ type: "tool_result", tool_use_id: "tb", content: "x" }] },
+      toolUseResult: { stdout: "", backgroundTaskId: "bb" } },
+  ];
+  const interim = { type: "queue-operation", operation: "enqueue", timestamp: "2026-10-03T12:02:00.000Z",
+    content: "<task-notification>\n<task-id>bb</task-id>\n<status>completed</status>\n<note>This agent "
+      + "stopped with background work of its own still running.</note>\n</task-notification>" };
+  assert.deepEqual(liveAgentsReport(scanAll([...shell("2026-10-03T12:00:00.000Z"), interim])).map((r) => r.kind), ["work"]);
+  assert.deepEqual(liveAgentsReport(scanAll([interim, ...shell("2026-10-03T12:00:00.000Z")])).map((r) => r.kind), ["work"]);
+});
+
+const lateInterim = { type: "queue-operation", operation: "enqueue", timestamp: "2026-10-03T12:20:00.000Z",
+  content: "<task-notification>\n<task-id>agent-1</task-id>\n<status>completed</status>\n<note>This agent "
+    + "stopped with background work of its own still running.</note>\n</task-notification>" };
+
+test("backscanLiveAgents: the lead-in carries interimAt", () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-interim-"));
+  const p = path.join(dir, "t.jsonl");
+  const pad = { type: "user", message: { content: "x".repeat(4000) } };
+  const lines = [...LAUNCH_ENTRIES, { ...notif("agent-1", "completed"), timestamp: "2026-10-03T12:01:00.000Z" },
+    lateInterim, pad, pad, ...RESUME_ENTRIES];
+  fs.writeFileSync(p, lines.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  const tail = JSON.stringify(pad).length + RESUME_ENTRIES.reduce((n, e) => n + JSON.stringify(e).length + 1, 0) + 10;
+  const st = { live: new Map(), tasks: new Map() };
+  mod.backscanLiveAgents(p, st, tail);
+  assert.deepEqual(mod.liveAgentsReport(st, FIXTURE_NOW).map((r) => r.kind), ["wait-external"]);
+});
+
+test("restoreLiveAgents: keeps only usable interimAt values, and they park a later resume", () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-interimat-"));
+  const p = path.join(dir, "conv.jsonl");
+  fs.writeFileSync(p, "");
+  const at = Date.UTC(2026, 9, 3, 12, 20);
+  fs.writeFileSync(path.join(dir, "s1.json"), JSON.stringify({
+    v: 1, transcript: "conv.jsonl", offset: 0, liveAgents: {}, agentTasks: {}, shellCalls: {},
+    stoppedAgents: ["agent-1"], stopAt: { "agent-1": Date.UTC(2026, 9, 3, 12, 1) },
+    agentRuns: { "agent-1": { type: "qa-delta", label: "QA the parity change" } },
+    interimAt: { "agent-1": at, bad: "x", neg: -1, big: 2 ** 60 } }));
+  const st = { live: new Map(), tasks: new Map() };
+  assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
+  assert.deepEqual([...st.interimAt], [["agent-1", at]]);
+  mod.scanAgentEntry(RESUME_ENTRIES[1], st);
+  assert.deepEqual(mod.liveAgentsReport(st, FIXTURE_NOW).map((r) => r.kind), ["wait-external"]);
+});
+
+test("scanAgentEntry: a resume naming a shell keeps the shell's kind", () => {
+  const st = scanAll([
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "tw", name: "Bash",
+      input: { command: "gh run watch 9", description: "Watch CI", run_in_background: true } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tw", content: "x" }] },
+      toolUseResult: { stdout: "", backgroundTaskId: "bw" } },
+  ]);
+  scanAll(JSON.parse(JSON.stringify(RESUME_ENTRIES).replace(/agent-1/g, "bw")), st);
+  assert.equal(st.live.get("bw").kind, "wait-external");
+});
+
+test("scanAgentEntry: a launch parked by an earlier interim expires on its clock (XERK-2710 x XERK-2712)", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const launch = JSON.parse(JSON.stringify(LAUNCH_ENTRIES));
+  launch[1].timestamp = "2026-10-03T12:00:00.000Z";
+  const st = scanAll([{ ...lateInterim, timestamp: "2026-10-03T12:03:00.000Z" }, ...launch]);
+  const parked = Date.UTC(2026, 9, 3, 12, 3);
+  assert.equal(st.live.get("agent-1").parkedAt, parked);
+  const exp = parked + 3 * 3600 * 1000;
+  assert.equal(liveAgentsReport(st, exp - 1).length, 1);
+  assert.deepEqual(liveAgentsReport(st, exp), []);
 });

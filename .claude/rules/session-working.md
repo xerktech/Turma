@@ -50,11 +50,15 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
     record is that run's stop; never drop the timestamp compare, or the agent is live forever.
   - Accepted gap: a message "queued for delivery" to an agent that finishes first resumes it
     with no transcript record, so that run reads idle.
-
-- **"Agent … is waiting on its own background work" is NOT a stop** (XERK-2710, `_tn_interim`/
-  `tnInterim`): Claude Code's interim notice (status `completed`) when a subagent ends its turn with
-  its own background work running. The row turns into a wait (`kind: wait-external`), so the session
-  reads waiting, not idle; its final notice retires it; a `SendMessage` resume makes it work again.
+- **An INTERIM notice is a wait, not a stop** (XERK-2710, `_tn_interim` ↔ `tnInterim`): Claude
+  Code's notice (status `completed`) when a subagent ends its turn with its own background work
+  running. Its fresh enqueue re-kinds the row `wait-external` (copies do nothing), so the session
+  reads waiting, not idle; the final notice retires it, a `SendMessage` resume makes it work.
+  - Matched on the summary ENDING "is waiting on its own background work" OR the note "background
+    work of its own still running … notifies again" (older builds pair that note with a "finished"
+    summary) — the notice's own tags only, never `<result>`: a report quoting either is a stop.
+  - `interimAt` (id → newest fresh interim timestamp, in the snapshot + lead-in, the `stopAt`
+    twin): a launch/resume record timestamped at or before it registers parked, never as work.
   - Never ignore the notice instead: a third or more of such agents never send a final one, so
     they would read working forever.
   - **A parked row expires and never stalls** (XERK-2712, operator decision). 95 of 96 agents
@@ -65,15 +69,15 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
     a SHELL (all four mirrors) — this transcript's silence says nothing about a subagent.
   - Rejected: expiring on the subagent transcript's live children (a new incremental scan) and
     treating a post-handback interim notice as done (reads idle while that work runs).
-  - **Before that, a full table (`LIVE_AGENTS_MAX`) gives up its EARLIEST-LAUNCHED parked row to a
+  - **Before it expires, a full table (`LIVE_AGENTS_MAX`) gives up its EARLIEST-LAUNCHED parked row to a
     new launch** (XERK-2711), so parked rows never crowd out live work. Never a working row or a
     waiting shell, and only for a launch it will register.
     Tests: `a full table gives up its oldest parked row` (both).
-  - Keyed on the summary ENDING with the wording (after the quoted description), never on `<note>`.
   - **A stall nudge never says "stop it" to an agent** (`attentionNudgeText`): only a mix with a
     shell stalls, and its stop advice names the shells. Wait counts name agents/shells/tasks
     (`backgroundRowsLabel`, web `backgroundWorkLabel`, Android `backgroundRowsLabel`) — never
     assume a wait row is a shell.
+  - Tests: the `interim`/`parked` cases in `TestLiveAgentsScan` and `TestSessionReport` ↔ js.
 
 ## The published live-agent set survives a restart (XERK-1587)
 

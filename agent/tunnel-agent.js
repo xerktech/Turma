@@ -1534,14 +1534,17 @@ function tnFingerprint(text) {
   return m ? crypto.createHash("sha1").update(m[1], "utf8").digest("hex").slice(0, 16) : null;
 }
 
-// Mirror of hub-agent.py _tn_interim (XERK-2710): the interim "waiting on its
-// own background work" notification is not a stop.
-const TN_INTERIM_SUFFIX = "is waiting on its own background work";
+// XERK-2710: an INTERIM notice (the agent stopped with background work of its
+// own still running) is not a stop; the row becomes a wait. Mirror of
+// hub-agent.py TN_INTERIM_RE.
+const TN_INTERIM_RE = /<note>[^<]*(?:background work of its own still running|notifies again if it does)|<summary>[^<]*is waiting on its own background work[ \t\r\n]*<\/summary>/;
+// Only the notification's own tags count, never its <result> (a final report
+// quoting the interim note still stops). Mirror of hub-agent.py _tn_interim.
+function tnInterim(text) {
+  return TN_INTERIM_RE.test(String(text || "").split("<result>", 1)[0]);
+}
 // Mirror of INTERIM_AGENT_EXPIRE_MS (XERK-2712): a parked row is dropped after this.
 const INTERIM_AGENT_EXPIRE_MS = 3 * 3600 * 1000;
-function tnInterim(tn) {
-  return String(tn.summary || "").replace(/[ \t\r\n]+$/, "").endsWith(TN_INTERIM_SUFFIX);
-}
 
 function scanAgentEntry(entry, state) {
   if (!entry || typeof entry !== "object" || !state) return;
@@ -1558,6 +1561,9 @@ function scanAgentEntry(entry, state) {
   // XERK-2708 (see hub-agent.py): id -> newest fresh stop-enqueue timestamp, so
   // a resume whose own stop was written early stays stopped.
   const stopAt = state.stopAt || (state.stopAt = new Map());
+  // XERK-2710 (see hub-agent.py): id -> newest fresh interim-enqueue timestamp,
+  // so a launch/resume record written after it registers already parked.
+  const interimAt = state.interimAt || (state.interimAt = new Map());
   const content = entry.message && entry.message.content;
   let toolId = null;
   if (Array.isArray(content)) {
@@ -1596,8 +1602,16 @@ function scanAgentEntry(entry, state) {
     const own = stopAt.get(launch.id);
     const resumedAt = tsMs(entry.timestamp);
     if (live.has(launch.id)) {
-      delete live.get(launch.id).kind; // a waiting agent resumed works again (XERK-2710)
-      delete live.get(launch.id).parkedAt;
+      // Resumed while parked on an interim notice (XERK-2710): work again,
+      // unless this run's own interim was written first.
+      const row = live.get(launch.id);
+      const parked = interimAt.get(launch.id);
+      if (row.type !== "shell" && row.kind
+          && !(parked != null && resumedAt != null && parked >= resumedAt)) {
+        delete row.kind;
+        delete row.parkedAt;
+        if (resumedAt != null) row.startedAt = resumedAt;
+      }
       launch = null;
     }
     // This run's own stop already landed (written early): stays stopped.
@@ -1647,6 +1661,11 @@ function scanAgentEntry(entry, state) {
       while (runs.size > LIVE_AGENTS_MAX * 4) runs.delete(runs.keys().next().value);
     }
     if (started != null) row.startedAt = started;
+    const parked = interimAt.get(launch.id);
+    if (launch.type !== "shell" && parked != null && launchedAt != null && parked >= launchedAt) {
+      row.kind = "wait-external"; // its interim came first
+      row.parkedAt = Math.min(parked, Date.now()); // its expiry clock (XERK-2712)
+    }
     live.set(launch.id, row);
   }
   // Never an ASSISTANT turn — a session merely QUOTING a notification must not
@@ -1656,12 +1675,20 @@ function scanAgentEntry(entry, state) {
     for (const text of entryTextsForScan(entry)) {
       const tn = parseTaskNotification(text);
       if (!tn || !tn.taskIds.length) continue;
-      if (tnInterim(tn)) {
-        // Not a stop (XERK-2710): the row reads as waiting on its own work.
-        // Never in the future (a skewed stamp must not hold it forever); 0 reads as
-        // no stamp, as py's `or` does.
-        const parked = Math.min(tsMs(entry.timestamp) || Date.now(), Date.now());
-        for (const id of tn.taskIds) {
+      const fresh = entry.type === "queue-operation" && entry.operation === "enqueue";
+      if (tnInterim(text)) {
+        // XERK-2710: not a stop; only the fresh enqueue marks the wait.
+        const at = fresh ? tsMs(entry.timestamp) : null;
+        for (const id of fresh ? tn.taskIds : []) {
+          if (at != null && at > (interimAt.get(id) || 0)) {
+            interimAt.delete(id);
+            interimAt.set(id, at);
+            while (interimAt.size > LIVE_AGENTS_MAX * 4) interimAt.delete(interimAt.keys().next().value);
+          }
+        }
+        // Never in the future (a skewed stamp must not hold it forever, XERK-2712).
+        const parked = Math.min(at || Date.now(), Date.now());
+        for (const id of fresh ? tn.taskIds : []) {
           const row = live.get(id);
           if (row && row.type !== "shell") {
             row.kind = "wait-external";
@@ -1672,7 +1699,6 @@ function scanAgentEntry(entry, state) {
       }
       if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) {
         const fp = tnFingerprint(text);
-        const fresh = entry.type === "queue-operation" && entry.operation === "enqueue";
         const at = fresh ? tsMs(entry.timestamp) : null;
         for (const id of tn.taskIds) {
           if (at != null && at > (stopAt.get(id) || 0)) {
@@ -1762,7 +1788,7 @@ function backscanLiveAgents(p, state, windowBytes = AGENT_BACKSCAN_BYTES,
       for (const id of leadIn.stopped || []) stopped.add(id);
       const runs = state.runs || (state.runs = new Map());
       for (const [id, r] of leadIn.runs || []) runs.set(id, r);
-      for (const key of ["queued", "stale", "stopAt"]) {
+      for (const key of ["queued", "stale", "stopAt", "interimAt"]) {
         const m = state[key] || (state[key] = new Map());
         for (const [id, f] of leadIn[key] || []) m.set(id, f);
       }
@@ -1857,6 +1883,9 @@ function restoreLiveAgents(sessionId, p, state, dir = LIVE_AGENTS_DIR) {
   }
   // Optional: absent before XERK-2708. Positive safe integers only.
   state.stopAt = new Map(Object.entries(isObj(snap.stopAt) ? snap.stopAt : {})
+    .filter(([, v]) => Number.isSafeInteger(v) && v > 0).slice(-LIVE_AGENTS_MAX * 4));
+  // Optional: absent before XERK-2710. Same shape as stopAt.
+  state.interimAt = new Map(Object.entries(isObj(snap.interimAt) ? snap.interimAt : {})
     .filter(([, v]) => Number.isSafeInteger(v) && v > 0).slice(-LIVE_AGENTS_MAX * 4));
   state.runs = new Map(Object.entries(isObj(snap.agentRuns) ? snap.agentRuns : {})
     .map(([k, v]) => [k, snapshotRow(v)]).filter(([, v]) => v)
