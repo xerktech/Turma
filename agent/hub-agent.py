@@ -12366,6 +12366,17 @@ def _scan_agent_entry(entry, state):
                                        + queued.pop(launch["id"]))[-4:]
                 while len(stale) > LIVE_AGENTS_MAX * 4:
                     stale.pop(next(iter(stale)))
+    if launch and len(live) >= LIVE_AGENTS_MAX and launch["id"] not in stopped \
+            and launch["id"] not in live:
+        # A full table gives up its EARLIEST-LAUNCHED parked row (an agent waiting on its own
+        # background work, XERK-2710) rather than drop this live launch: some
+        # parked agents never send a final notice, so their rows would otherwise
+        # hold a slot until claude relaunches (XERK-2711). Mirror of scanAgentEntry.
+        parked = next((k for k, a in live.items()
+                       if a.get("type") != "shell"
+                       and a.get("kind") == SHELL_KIND_WAIT_EXTERNAL), None)
+        if parked is not None:
+            del live[parked]
     if launch and len(live) < LIVE_AGENTS_MAX:
         # A notification can be WRITTEN BEFORE the launch it refers to (observed:
         # the queued copy lands at an earlier file offset than the launch, with a

@@ -5321,6 +5321,56 @@ class TestLiveAgentsScan(unittest.TestCase):
         self.assertEqual(len(ha.live_agents_report(st)), ha.LIVE_AGENTS_MAX)
 
 
+    def test_a_full_table_gives_up_its_oldest_parked_row(self):
+        # XERK-2711: a parked agent (XERK-2710 interim notice) that never sends
+        # its final one must not hold a slot a new live launch needs.
+        def launch(i):
+            return {"type": "user", "message": {"content": [
+                        {"type": "tool_result", "tool_use_id": f"t{i}"}]},
+                    "toolUseResult": {"isAsync": True, "status": "async_launched",
+                                      "agentId": f"a{i}", "description": f"job {i}"}}
+
+        def interim(i):
+            return {"type": "queue-operation", "operation": "enqueue",
+                    "content": f"<task-notification>\n<task-id>a{i}</task-id>\n"
+                               f"<status>completed</status>\n<summary>Agent \"job {i}\" "
+                               "is waiting on its own background work</summary>\n"
+                               "</task-notification>"}
+        n = ha.LIVE_AGENTS_MAX
+        st = self._scan([launch(i) for i in range(n)] + [interim(3), interim(1)])
+        st = self._scan([launch(n)], st)
+        live = st["liveAgents"]
+        self.assertEqual(len(live), n)
+        self.assertIn(f"a{n}", live)
+        self.assertNotIn("a1", live)        # the oldest parked row goes (table order)
+        self.assertEqual(live["a3"].get("kind"), "wait-external")
+        # No parked row left to give up: a working-only full table still drops it.
+        st = self._scan([interim(3), launch(n + 1), launch(n + 2)], st)
+        self.assertIn(f"a{n + 1}", st["liveAgents"])
+        self.assertNotIn(f"a{n + 2}", st["liveAgents"])
+        self.assertEqual(len(st["liveAgents"]), n)
+        # Only for a launch it will register: a repeat of a live id, or an id
+        # already stopped, gives up nothing.
+        st = self._scan([launch(i) for i in range(n)] + [interim(5)])
+        stop = {"type": "queue-operation", "operation": "enqueue",
+                "content": "<task-notification>\n<task-id>gone</task-id>\n"
+                           "<status>completed</status>\n</task-notification>"}
+        st = self._scan([launch(7), stop, dict(launch(n), toolUseResult=dict(
+            launch(n)["toolUseResult"], agentId="gone"))], st)
+        self.assertIn("a5", st["liveAgents"])
+        self.assertEqual(len(st["liveAgents"]), n)
+        # A waiting SHELL is never given up: it is a shell, not a parked agent.
+        shells = []
+        for i in range(n // 2):
+            shells += json.loads(json.dumps(SHELL_LAUNCH_ENTRIES).replace("toolu_s1", f"ts{i}")
+                                 .replace("bsh1", f"bs{i}"))
+        st = self._scan(shells + [launch(i) for i in range(n // 2)] + [launch(n)])
+        self.assertTrue(all(a.get("kind") == "wait-external" for a in st["liveAgents"].values()
+                            if a["type"] == "shell"))
+        self.assertNotIn(f"a{n}", st["liveAgents"])
+        self.assertEqual(len(st["liveAgents"]), n)
+
+
 class TestTaskNotification(unittest.TestCase):
     """A background Task/agent finishing arrives as a user-role `<task-notification>`
     turn; it must parse into a structured task_notification block (rendered as an

@@ -65,6 +65,10 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
     a SHELL (all four mirrors) — this transcript's silence says nothing about a subagent.
   - Rejected: expiring on the subagent transcript's live children (a new incremental scan) and
     treating a post-handback interim notice as done (reads idle while that work runs).
+  - **Before that, a full table (`LIVE_AGENTS_MAX`) gives up its EARLIEST-LAUNCHED parked row to a
+    new launch** (XERK-2711), so parked rows never crowd out live work. Never a working row or a
+    waiting shell, and only for a launch it will register.
+    Tests: `a full table gives up its oldest parked row` (both).
   - Keyed on the summary ENDING with the wording (after the quoted description), never on `<note>`.
   - **A stall nudge never says "stop it" to an agent** (`attentionNudgeText`): only a mix with a
     shell stalls, and its stop advice names the shells. Wait counts name agents/shells/tasks
