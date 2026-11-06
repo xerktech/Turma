@@ -1998,6 +1998,45 @@ test("scanAgentEntry: the live set is bounded", () => {
   assert.equal(liveAgentsReport(scanAll(entries)).length, 32);
 });
 
+// XERK-2711 (twin of test_a_full_table_gives_up_its_oldest_parked_row).
+test("scanAgentEntry: a full table gives up its oldest parked row", () => {
+  const launch = (i) => ({ type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: `t${i}` }] },
+    toolUseResult: { isAsync: true, status: "async_launched", agentId: `a${i}`, description: `job ${i}` } });
+  const interim = (i) => ({ type: "queue-operation", operation: "enqueue", content:
+    `<task-notification>\n<task-id>a${i}</task-id>\n<status>completed</status>\n` +
+    `<summary>Agent "job ${i}" is waiting on its own background work</summary>\n</task-notification>` });
+  const n = 32;
+  let st = scanAll([...Array.from({ length: n }, (_, i) => launch(i)), interim(3), interim(1)]);
+  st = scanAll([launch(n)], st);
+  assert.equal(st.live.size, n);
+  assert.ok(st.live.has(`a${n}`));
+  assert.ok(!st.live.has("a1"), "the oldest parked row goes (table order)");
+  assert.equal(st.live.get("a3").kind, "wait-external");
+  st = scanAll([launch(n + 1), launch(n + 2)], st);
+  assert.ok(st.live.has(`a${n + 1}`));
+  assert.ok(!st.live.has(`a${n + 2}`), "no parked row left: a full table still drops it");
+  assert.equal(st.live.size, n);
+  // Only for a launch it will register: a repeat of a live id, or an id already
+  // stopped, gives up nothing.
+  st = scanAll([...Array.from({ length: n }, (_, i) => launch(i)), interim(5)]);
+  const gone = { ...launch(n), toolUseResult: { ...launch(n).toolUseResult, agentId: "gone" } };
+  st = scanAll([launch(7), notif("gone", "completed"), gone], st);
+  assert.ok(st.live.has("a5"));
+  assert.equal(st.live.size, n);
+  // A waiting SHELL is never given up: it is a shell, not a parked agent.
+  const shell = (i) => [
+    { type: "assistant", message: { content: [{ type: "tool_use", id: `ts${i}`, name: "Bash",
+      input: { command: "gh pr checks 1 --watch", run_in_background: true } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: `ts${i}`, content: "" }] },
+      toolUseResult: { stdout: "", backgroundTaskId: `bs${i}` } }];
+  st = scanAll([...Array.from({ length: n / 2 }, (_, i) => shell(i)).flat(),
+    ...Array.from({ length: n / 2 }, (_, i) => launch(i)), launch(n)]);
+  assert.ok([...st.live.values()].every((a) => a.type !== "shell" || a.kind === "wait-external"));
+  assert.ok(!st.live.has(`a${n}`));
+  assert.equal(st.live.size, n);
+});
+
 test("parsePaneLiveTurn: no longer sources agents from the pane at all", () => {
   // The footer rows still ride `status.agents` for their live counters while a
   // turn runs, but the frame's own `agents` is the transcript's answer.

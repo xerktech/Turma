@@ -1626,6 +1626,14 @@ function scanAgentEntry(entry, state) {
       }
     }
   }
+  if (launch && live.size >= LIVE_AGENTS_MAX && !stopped.has(launch.id) && !live.has(launch.id)) {
+    // A full table gives up its EARLIEST-LAUNCHED parked row (an agent waiting on its own
+    // background work, XERK-2710) rather than drop this live launch: some parked
+    // agents never send a final notice (XERK-2711). Mirror of _scan_agent_entry.
+    for (const [id, a] of live) {
+      if (a.type !== "shell" && a.kind === "wait-external") { live.delete(id); break; }
+    }
+  }
   if (launch && live.size < LIVE_AGENTS_MAX && !stopped.has(launch.id)) {
     // A stop already seen wins over a later-read launch: a notification can be
     // written at an EARLIER file offset than the launch it refers to. The
