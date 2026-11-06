@@ -12277,6 +12277,12 @@ def _tn_fingerprint(text):
     return hashlib.sha1(body.encode("utf-8")).hexdigest()[:16]
 
 
+# How long a row parked by an interim notice reads as a wait before it is
+# dropped (XERK-2712). 40% of such agents never notify again although their work
+# is done; of those that do, 25 of 26 on a real host did so within 2.4 hours.
+INTERIM_AGENT_EXPIRE_MS = 3 * 3600 * 1000
+
+
 def _scan_agent_entry(entry, state):
     """Fold one transcript entry into `state["liveAgents"]` ({id: {type,label}}).
 
@@ -12365,6 +12371,7 @@ def _scan_agent_entry(entry, state):
                     and not (parked is not None and resumed_at is not None
                              and parked >= resumed_at):
                 row.pop("kind", None)
+                row.pop("parkedAt", None)
                 if resumed_at is not None:
                     row["startedAt"] = resumed_at
             launch = None
@@ -12433,6 +12440,8 @@ def _scan_agent_entry(entry, state):
             if launch["type"] != "shell" and parked is not None \
                     and launched_at is not None and parked >= launched_at:
                 row["kind"] = SHELL_KIND_WAIT_EXTERNAL   # its interim came first
+                # Its expiry clock (XERK-2712) runs from that interim, never later than now.
+                row["parkedAt"] = min(parked, int(time.time() * 1000))
             live[launch["id"]] = row
     # The notification rides a queued operation, the user turn it becomes once
     # dequeued, or an attachment — never an ASSISTANT turn, which is skipped so
@@ -12457,9 +12466,16 @@ def _scan_agent_entry(entry, state):
                         interim_at[tid] = at
                         while len(interim_at) > LIVE_AGENTS_MAX * 4:
                             interim_at.pop(next(iter(interim_at)))
+                # Never in the future: a forged or skewed stamp must not hold
+                # it forever (XERK-2712).
+                now_ms = int(time.time() * 1000)
+                parked = min(at or now_ms, now_ms)
+                for tid in tn["taskIds"] if fresh else ():
                     row = live.get(tid)
                     if row is not None and row.get("type") != "shell":
                         row["kind"] = SHELL_KIND_WAIT_EXTERNAL
+                        # First notice wins: a repeat must not restart the clock.
+                        row.setdefault("parkedAt", parked)
                 continue
             if not tn.get("status") or tn["status"] in AGENT_DONE_STATUSES:
                 fp = _tn_fingerprint(text)
@@ -12806,10 +12822,16 @@ def _snapshot_row(row):
     out["resolveId"] = rid[:200] if isinstance(rid, str) else ""
     if row.get("kind") in (SHELL_KIND_WORK, SHELL_KIND_WAIT_TIMED, SHELL_KIND_WAIT_EXTERNAL):
         out["kind"] = row["kind"]
-    for k in ("startedAt", "eta"):
+    for k in ("startedAt", "eta", "parkedAt"):
         v = row.get(k)
         if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= _MAX_SAFE_INT:
             out[k] = v
+    # A parked agent row always carries a clock no later than now (XERK-2712):
+    # one from a snapshot that lacks it (an older agent's) or names a future
+    # time would otherwise read waiting forever, since it never stalls.
+    if out["type"] != "shell" and out.get("kind") == SHELL_KIND_WAIT_EXTERNAL:
+        now_ms = int(time.time() * 1000)
+        out["parkedAt"] = min(out.get("parkedAt", now_ms), now_ms)
     return out
 
 
@@ -12910,14 +12932,21 @@ def _restore_live_agents(session_id, path, state, report=None):
     return offset + end
 
 
-def live_agents_report(state):
+def live_agents_report(state, now_ms=None):
     """`state["liveAgents"]` as the heartbeat's [{type, label, kind?, startedAt?,
     eta?}] (no ids: they are internal, and the chat resolves a row back to its
-    transcript by type+label). `kind` rides SHELL rows, and an agent row parked
-    on an interim notice (`wait-external`, XERK-2710); any other agent/workflow
-    row carries none, which every reader takes as `work` (XERK-1570)."""
+    transcript by type+label). `kind` rides SHELL rows only — an agent/workflow
+    row carries none (read as `work`, XERK-1570) unless it waits on its own
+    background work (`wait-external`, XERK-2710). A row parked that way for
+    INTERIM_AGENT_EXPIRE_MS is left out (XERK-2712): its agent most likely
+    finished without a final notice. Only a resume relists it: a repeated
+    interim notice keeps the first notice's clock."""
+    now = int(time.time() * 1000) if now_ms is None else now_ms
     out = []
     for a in (state.get("liveAgents") or {}).values():
+        parked = a.get("parkedAt")
+        if parked is not None and now - parked >= INTERIM_AGENT_EXPIRE_MS:
+            continue
         row = {"type": a["type"], "label": a["label"]}
         for k in ("kind", "startedAt", "eta"):
             if a.get(k) is not None:

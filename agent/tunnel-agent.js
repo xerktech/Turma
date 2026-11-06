@@ -1543,6 +1543,8 @@ const TN_INTERIM_RE = /<note>[^<]*(?:background work of its own still running|no
 function tnInterim(text) {
   return TN_INTERIM_RE.test(String(text || "").split("<result>", 1)[0]);
 }
+// Mirror of INTERIM_AGENT_EXPIRE_MS (XERK-2712): a parked row is dropped after this.
+const INTERIM_AGENT_EXPIRE_MS = 3 * 3600 * 1000;
 
 function scanAgentEntry(entry, state) {
   if (!entry || typeof entry !== "object" || !state) return;
@@ -1607,6 +1609,7 @@ function scanAgentEntry(entry, state) {
       if (row.type !== "shell" && row.kind
           && !(parked != null && resumedAt != null && parked >= resumedAt)) {
         delete row.kind;
+        delete row.parkedAt;
         if (resumedAt != null) row.startedAt = resumedAt;
       }
       launch = null;
@@ -1653,6 +1656,7 @@ function scanAgentEntry(entry, state) {
     const parked = interimAt.get(launch.id);
     if (launch.type !== "shell" && parked != null && launchedAt != null && parked >= launchedAt) {
       row.kind = "wait-external"; // its interim came first
+      row.parkedAt = Math.min(parked, Date.now()); // its expiry clock (XERK-2712)
     }
     live.set(launch.id, row);
   }
@@ -1673,8 +1677,15 @@ function scanAgentEntry(entry, state) {
             interimAt.set(id, at);
             while (interimAt.size > LIVE_AGENTS_MAX * 4) interimAt.delete(interimAt.keys().next().value);
           }
+        }
+        // Never in the future (a skewed stamp must not hold it forever, XERK-2712).
+        const parked = Math.min(at || Date.now(), Date.now());
+        for (const id of fresh ? tn.taskIds : []) {
           const row = live.get(id);
-          if (row && row.type !== "shell") row.kind = "wait-external";
+          if (row && row.type !== "shell") {
+            row.kind = "wait-external";
+            if (row.parkedAt == null) row.parkedAt = parked; // first notice starts the clock
+          }
         }
         continue;
       }
@@ -1796,8 +1807,12 @@ function snapshotRow(v) {
       || typeof v.label !== "string") return null;
   const row = { type: v.type.slice(0, 200), label: v.label.slice(0, 200) };
   if (["work", "wait-timed", "wait-external"].includes(v.kind)) row.kind = v.kind;
-  for (const k of ["startedAt", "eta"]) {
+  for (const k of ["startedAt", "eta", "parkedAt"]) {
     if (Number.isSafeInteger(v[k]) && v[k] >= 0) row[k] = v[k];
+  }
+  // Mirror of _snapshot_row: a parked agent row always has a clock, never later than now.
+  if (row.type !== "shell" && row.kind === "wait-external") {
+    row.parkedAt = Math.min(row.parkedAt ?? Date.now(), Date.now());
   }
   return row;
 }
@@ -1889,9 +1904,11 @@ function entryTextsForScan(entry) {
   return out;
 }
 
-function liveAgentsReport(state) {
+function liveAgentsReport(state, nowMs = Date.now()) {
   if (!state || !state.live) return [];
-  return [...state.live.values()].map((a) => {
+  // A row parked on an interim notice that long is left out (XERK-2712).
+  return [...state.live.values()].filter((a) =>
+    a.parkedAt == null || nowMs - a.parkedAt < INTERIM_AGENT_EXPIRE_MS).map((a) => {
     const row = { type: a.type, label: a.label };
     for (const k of ["kind", "startedAt", "eta"]) if (a[k] != null) row[k] = a[k];
     return row;

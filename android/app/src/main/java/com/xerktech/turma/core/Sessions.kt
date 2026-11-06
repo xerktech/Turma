@@ -83,7 +83,9 @@ fun backgroundWait(rows: List<LiveAgent>, lastWrite: Long, now: Long): Backgroun
     val eta = waits.mapNotNull { it.eta }.maxOrNull()
     if (eta != null && eta > now) return BackgroundWait(stalled = false, eta = eta)
     val overdue = eta != null && lastWrite < eta && now - eta >= WAIT_ETA_GRACE_MS
-    val silent = now - lastWrite >= WAIT_STALL_MS
+    // An agent parked on its own background work never stalls (XERK-2712): this
+    // transcript's silence says nothing about it; the agent drops the row instead.
+    val silent = waits.any { it.type == "shell" } && now - lastWrite >= WAIT_STALL_MS
     return BackgroundWait(stalled = overdue || silent, eta = eta)
 }
 

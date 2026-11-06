@@ -1699,6 +1699,24 @@ test("scanAgentEntry: a SendMessage-resumed agent is live again until its next s
   assert.deepEqual(liveAgentsReport(st), []);
   st = scanAll([...LAUNCH_ENTRIES, interim, ...RESUME_ENTRIES]);
   assert.deepEqual(liveAgentsReport(st).map((r) => r.kind), [undefined]);
+  // XERK-2712 (twin of test_a_parked_agent_drops_out_after_the_expiry).
+  const stamped = { ...interim, timestamp: "2026-10-03T12:03:00.000Z" };
+  st = scanAll([...LAUNCH_ENTRIES, stamped, { ...stamped, timestamp: "2026-10-03T13:00:00.000Z" }]);
+  const parked = require("../tunnel-agent.js").tsMs("2026-10-03T12:03:00.000Z");
+  assert.equal(st.live.get("agent-1").parkedAt, parked);
+  const exp = parked + 3 * 3600 * 1000;
+  assert.equal(liveAgentsReport(st, exp - 1).length, 1);
+  assert.deepEqual(liveAgentsReport(st, exp), []);
+  // A future or epoch-0 notice stamp parks at now, never later.
+  for (const ts of ["2099-01-01T00:00:00.000Z", "1970-01-01T00:00:00.000Z"]) {
+    const before = Date.now();
+    const got = scanAll([...LAUNCH_ENTRIES, { ...interim, timestamp: ts }]).live.get("agent-1").parkedAt;
+    assert.ok(got >= before && got <= Date.now(), `${ts} -> ${got}`);
+  }
+  // A resume stamped after both notices (an earlier one is the parked run's own, XERK-2710).
+  st = scanAll(RESUME_ENTRIES.map((e) => ({ ...e, timestamp: "2026-10-03T13:05:00.000Z" })), st);
+  assert.equal(st.live.get("agent-1").parkedAt, undefined);
+  assert.equal(liveAgentsReport(st, exp + 1).length, 1);
   // A shell keeps the kind its command was classified as (py twin:
   // test_an_interim_notice_never_turns_a_shell_into_an_agent_wait).
   const workShell = [
@@ -3299,6 +3317,20 @@ test("restoreLiveAgents: seeds from the manager's snapshot and folds the gap", (
   assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
   assert.deepEqual(mod.liveAgentsReport(st), [{ type: "shell", label: "Watch CI", kind: "wait-external" }]);
 
+  // XERK-2712: a parked agent keeps its clock across a restart; one with no clock
+  // (an older agent's snapshot) or a future one is given now, so it still expires.
+  const parkedRow = { type: "qa", label: "QA", resolveId: "", kind: "wait-external" };
+  for (const [parkedAt, want] of [[1000, 1000], [undefined, null], [2 ** 52, null]]) {
+    snap({ liveAgents: { a1: { ...parkedRow, parkedAt } } });
+    st = fresh();
+    const before = Date.now();
+    assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
+    const got = st.live.get("a1").parkedAt;
+    if (want != null) assert.equal(got, want);
+    else assert.ok(got >= before && got <= Date.now(), String(got));
+  }
+  assert.deepEqual(mod.liveAgentsReport(st, Date.now() + 3 * 3600 * 1000), []);
+
   // XERK-2707: the snapshot's launch map relists a resumed agent's own row; a
   // snapshot without one (older manager) still restores.
   snap({ liveAgents: {}, stoppedAgents: ["agent-1"],
@@ -3352,6 +3384,10 @@ test("restoreLiveAgents: seeds from the manager's snapshot and folds the gap", (
   assert.equal(mod.restoreLiveAgents("../s1", p, fresh(), dir), false);
 });
 
+// The interim fixtures are dated 2026-10-03: report at that time, so XERK-2712's
+// 3h expiry is out of the way.
+const FIXTURE_NOW = Date.UTC(2026, 9, 3, 12, 30);
+
 // XERK-2710: twin of TestLiveAgentsScan's interim cases. Claude Code's INTERIM
 // notice (the agent stopped with background work of its own still running) is
 // not a stop: the row becomes a wait until the same task-id notifies again.
@@ -3364,44 +3400,44 @@ test("scanAgentEntry: an interim notice parks the agent as a wait, not a stop", 
       + "own when that work completes or reports, and the same task-id notifies again if it does; the "
       + "result below may be interim.</note>\n<result>build running</result>\n</task-notification>" };
   let st = scanAll([...LAUNCH_ENTRIES, interim]);
-  assert.deepEqual(liveAgentsReport(st), [{ type: "agent", label: "QA the parity change", kind: "wait-external" }]);
+  assert.deepEqual(liveAgentsReport(st, FIXTURE_NOW), [{ type: "agent", label: "QA the parity change", kind: "wait-external" }]);
   st = scanAll([{ ...interim, operation: "remove" }, { type: "user", message: { content: interim.content } }], st);
-  assert.equal(liveAgentsReport(st).length, 1);
+  assert.equal(liveAgentsReport(st, FIXTURE_NOW).length, 1);
   st = scanAll([notif("agent-1", "completed")], st);
-  assert.deepEqual(liveAgentsReport(st), []);
+  assert.deepEqual(liveAgentsReport(st, FIXTURE_NOW), []);
   // Older "finished" summary with the same note parks it too.
   const old = { ...interim, content: interim.content.replace("is waiting on its own background work", "finished") };
-  assert.equal(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, old]))[0].kind, "wait-external");
+  assert.equal(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, old]), FIXTURE_NOW)[0].kind, "wait-external");
   // The ordinary completion note is still a stop.
   const plain = { ...notif("agent-1", "completed"), content: notif("agent-1", "completed").content.replace(
     "</status>", "</status>\n<note>A task-notification fires each time this agent stops with no live background "
     + "children of its own. The user can send it another message and resume it, so the same task-id may notify "
     + "more than once.</note>") };
-  assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, plain])), []);
+  assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, plain]), FIXTURE_NOW), []);
   // A resume while parked is work again; a late interim copy does not re-park it.
   st = scanAll([...LAUNCH_ENTRIES, interim, ...RESUME_ENTRIES, { ...interim, operation: "remove" }]);
-  assert.deepEqual(liveAgentsReport(st).map((r) => r.kind), [undefined]);
+  assert.deepEqual(liveAgentsReport(st, FIXTURE_NOW).map((r) => r.kind), [undefined]);
   // A final notice whose <result> QUOTES the interim note is still a stop (QA #1).
   const quoting = { ...notif("agent-1", "completed") };
   quoting.content = quoting.content.replace("</status>", "</status>\n<result>saw <note>This agent stopped "
     + "with background work of its own still running.</note></result>");
-  assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, quoting])), []);
+  assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, quoting]), FIXTURE_NOW), []);
   // An interim written before its resume record stays parked (QA #2a/#2b),
   // and the resume restarts a parked row's clock (QA #5).
   const late = { ...interim, timestamp: "2026-10-03T12:20:00.000Z" };
   st = scanAll([...LAUNCH_ENTRIES, { ...notif("agent-1", "completed"), timestamp: "2026-10-03T12:01:00.000Z" },
     late, ...RESUME_ENTRIES]);
-  assert.deepEqual(liveAgentsReport(st).map((r) => r.kind), ["wait-external"]);
+  assert.deepEqual(liveAgentsReport(st, FIXTURE_NOW).map((r) => r.kind), ["wait-external"]);
   st = scanAll([...LAUNCH_ENTRIES, interim, late, ...RESUME_ENTRIES]);
-  assert.deepEqual(liveAgentsReport(st).map((r) => r.kind), ["wait-external"]);
+  assert.deepEqual(liveAgentsReport(st, FIXTURE_NOW).map((r) => r.kind), ["wait-external"]);
   st = scanAll([...LAUNCH_ENTRIES, interim, ...RESUME_ENTRIES]);
-  assert.equal(liveAgentsReport(st)[0].startedAt, Date.UTC(2026, 9, 3, 12, 5));
+  assert.equal(liveAgentsReport(st, FIXTURE_NOW)[0].startedAt, Date.UTC(2026, 9, 3, 12, 5));
   // An interim written before its launch record parks the launch (QA #2c).
   const launch = JSON.parse(JSON.stringify(LAUNCH_ENTRIES));
   launch[1].timestamp = "2026-10-03T12:00:00.000Z";
-  assert.deepEqual(liveAgentsReport(scanAll([interim, ...launch])).map((r) => r.kind), ["wait-external"]);
+  assert.deepEqual(liveAgentsReport(scanAll([interim, ...launch]), FIXTURE_NOW).map((r) => r.kind), ["wait-external"]);
   // A stopped agent is not resurrected by a later interim.
-  assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, notif("agent-1", "completed"), interim])), []);
+  assert.deepEqual(liveAgentsReport(scanAll([...LAUNCH_ENTRIES, notif("agent-1", "completed"), interim]), FIXTURE_NOW), []);
 });
 
 // XERK-2710 QA delta: the shell guards and the interimAt persistence, twins of
@@ -3437,7 +3473,7 @@ test("backscanLiveAgents: the lead-in carries interimAt", () => {
   const tail = JSON.stringify(pad).length + RESUME_ENTRIES.reduce((n, e) => n + JSON.stringify(e).length + 1, 0) + 10;
   const st = { live: new Map(), tasks: new Map() };
   mod.backscanLiveAgents(p, st, tail);
-  assert.deepEqual(mod.liveAgentsReport(st).map((r) => r.kind), ["wait-external"]);
+  assert.deepEqual(mod.liveAgentsReport(st, FIXTURE_NOW).map((r) => r.kind), ["wait-external"]);
 });
 
 test("restoreLiveAgents: keeps only usable interimAt values, and they park a later resume", () => {
@@ -3455,7 +3491,7 @@ test("restoreLiveAgents: keeps only usable interimAt values, and they park a lat
   assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
   assert.deepEqual([...st.interimAt], [["agent-1", at]]);
   mod.scanAgentEntry(RESUME_ENTRIES[1], st);
-  assert.deepEqual(mod.liveAgentsReport(st).map((r) => r.kind), ["wait-external"]);
+  assert.deepEqual(mod.liveAgentsReport(st, FIXTURE_NOW).map((r) => r.kind), ["wait-external"]);
 });
 
 test("scanAgentEntry: a resume naming a shell keeps the shell's kind", () => {
@@ -3467,4 +3503,16 @@ test("scanAgentEntry: a resume naming a shell keeps the shell's kind", () => {
   ]);
   scanAll(JSON.parse(JSON.stringify(RESUME_ENTRIES).replace(/agent-1/g, "bw")), st);
   assert.equal(st.live.get("bw").kind, "wait-external");
+});
+
+test("scanAgentEntry: a launch parked by an earlier interim expires on its clock (XERK-2710 x XERK-2712)", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const launch = JSON.parse(JSON.stringify(LAUNCH_ENTRIES));
+  launch[1].timestamp = "2026-10-03T12:00:00.000Z";
+  const st = scanAll([{ ...lateInterim, timestamp: "2026-10-03T12:03:00.000Z" }, ...launch]);
+  const parked = Date.UTC(2026, 9, 3, 12, 3);
+  assert.equal(st.live.get("agent-1").parkedAt, parked);
+  const exp = parked + 3 * 3600 * 1000;
+  assert.equal(liveAgentsReport(st, exp - 1).length, 1);
+  assert.deepEqual(liveAgentsReport(st, exp), []);
 });

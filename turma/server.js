@@ -16967,7 +16967,10 @@ function backgroundWait(rows, lastWrite, now) {
   for (const a of waits) if (Number.isSafeInteger(a.eta) && (eta == null || a.eta > eta)) eta = a.eta;
   if (eta != null && eta > now) return { state: "waiting", eta };
   const overdue = eta != null && lastWrite < eta && now - eta >= WAIT_ETA_GRACE_MS;
-  const silent = now - lastWrite >= ATTENTION_WAIT_STALL_MS;
+  // An agent parked on its own background work (XERK-2710) never stalls: this
+  // transcript's silence says nothing about it, and most such agents have long
+  // finished (XERK-2712). The agent drops the row after a few hours instead.
+  const silent = waits.some((a) => a.type === "shell") && now - lastWrite >= ATTENTION_WAIT_STALL_MS;
   return { state: overdue || silent ? "stalled" : "waiting", eta };
 }
 
@@ -20187,25 +20190,13 @@ function attentionNudgeText(reason, session) {
   }
   const waits = (Array.isArray(s.agents) ? s.agents : []).filter(isWaitRow);
   const mins = Number.isFinite(s.transcriptAgeSec) ? Math.max(1, Math.round(s.transcriptAgeSec / 60)) : null;
-  // An AGENT waiting on its own background work (XERK-2710) writes its progress to
-  // its own transcript, not this one, so this silence is no sign it is dead — and
-  // "stop it" would kill a live QA pass. Name it as an agent and say to look first.
-  if (waits.length && waits.every((a) => a.type !== "shell")) {
-    const label = waits.length === 1 ? nudgeLabel(waits[0].label) : "";
-    const subject = label ? `Your background agent \`${label}\` is`
-      : waits.length > 1 ? `Your ${waits.length} background agents are` : "Your background agent is";
-    const quietA = mins ? ` and this conversation has been quiet for ${mins} minute${mins === 1 ? "" : "s"}` : "";
-    const its = waits.length > 1 ? "their" : "its";
-    return `${subject} waiting on ${its} own background work${quietA}. Check ${its} progress before `
-      + "deciding anything — do not stop a run that is still working; if it is stuck or dead, "
-      + "say what you know and end the turn.";
-  }
   const label = waits.length === 1 ? nudgeLabel(waits[0].label) : "";
   const noun = waits.some((a) => a.type !== "shell") ? "task" : "shell";
   const subject = label ? `Your background ${noun} \`${label}\` has`
     : waits.length > 1 ? `Your ${waits.length} background ${noun}s have` : `Your background ${noun} has`;
   const quiet = mins ? `produced nothing for ${mins} minute${mins === 1 ? "" : "s"}` : "gone quiet";
-  // A mix: the stop advice is for the SHELLS only, never a background agent.
+  // An all-agent wait never stalls (XERK-2712), so a wait that reaches here holds a
+  // shell. In a mix the stop advice is for the SHELLS only, never a background agent.
   if (noun === "task") {
     return `${subject} ${quiet}. Check whether they are still doing anything; if a background shell `
       + "is waiting on something with a known duration, stop it and use the session CLI's `wake`, "

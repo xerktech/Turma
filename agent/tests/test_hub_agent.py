@@ -1795,6 +1795,8 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(set(fresh["stopAt"]), {"agent-1", "flt"})
         self.assertIs(type(fresh["stopAt"]["flt"]), int)   # as JS reads 1000.0
 
+    # The fixtures are dated 2026-10-03: keep XERK-2712's expiry out of the way.
+    @mock.patch.object(ha, "INTERIM_AGENT_EXPIRE_MS", 10 ** 15)
     def test_a_parked_runs_interim_time_survives_a_restart(self):
         # XERK-2710: the interim time rides the snapshot, so a resume record
         # read after a restart still sees that its run's interim came first.
@@ -4894,6 +4896,8 @@ class TestLiveAgentsScan(unittest.TestCase):
                             "result below may be interim.</note>\n"
                             "<result>build running</result>\n</task-notification>"}
 
+    # The fixtures are dated 2026-10-03: keep XERK-2712's expiry out of the way.
+    @mock.patch.object(ha, "INTERIM_AGENT_EXPIRE_MS", 10 ** 15)
     def test_an_interim_notice_parks_the_agent_as_a_wait_not_a_stop(self):
         st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_1])
         self.assertEqual(ha.live_agents_report(st), [
@@ -4908,6 +4912,8 @@ class TestLiveAgentsScan(unittest.TestCase):
         st = self._scan([self.DONE_1], st)
         self.assertEqual(ha.live_agents_report(st), [])
 
+    # The fixtures are dated 2026-10-03: keep XERK-2712's expiry out of the way.
+    @mock.patch.object(ha, "INTERIM_AGENT_EXPIRE_MS", 10 ** 15)
     def test_older_interim_wording_parks_it_too(self):
         # The "finished" summary older builds sent with the same note.
         old = dict(self.INTERIM_1, content=self.INTERIM_1["content"].replace(
@@ -4943,6 +4949,8 @@ class TestLiveAgentsScan(unittest.TestCase):
         self.assertFalse(ha._tn_interim(quoting["content"]))
         self.assertEqual(ha.live_agents_report(self._scan(TASK_LAUNCH_ENTRIES + [quoting])), [])
 
+    # The fixtures are dated 2026-10-03: keep XERK-2712's expiry out of the way.
+    @mock.patch.object(ha, "INTERIM_AGENT_EXPIRE_MS", 10 ** 15)
     def test_an_interim_written_before_its_resume_record_stays_parked(self):
         # QA (XERK-2710 #2a): run stopped, SendMessage, the resumed run's own
         # interim (12:20) is enqueued BEFORE the resume record (12:05) lands.
@@ -4954,6 +4962,8 @@ class TestLiveAgentsScan(unittest.TestCase):
         st = self._scan([dict(self.DONE_1, content=self.DONE_1["content"] + " ")], st)
         self.assertEqual(ha.live_agents_report(st), [])
 
+    # The fixtures are dated 2026-10-03: keep XERK-2712's expiry out of the way.
+    @mock.patch.object(ha, "INTERIM_AGENT_EXPIRE_MS", 10 ** 15)
     def test_a_late_resume_record_does_not_unpark_its_own_runs_interim(self):
         # QA (XERK-2710 #2b): parked by run 1, then run 2's interim lands
         # before run 2's resume record.
@@ -4962,6 +4972,8 @@ class TestLiveAgentsScan(unittest.TestCase):
                         + self.RESUME)
         self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], ["wait-external"])
 
+    # The fixtures are dated 2026-10-03: keep XERK-2712's expiry out of the way.
+    @mock.patch.object(ha, "INTERIM_AGENT_EXPIRE_MS", 10 ** 15)
     def test_an_interim_written_before_its_launch_record_parks_the_launch(self):
         # QA (XERK-2710 #2c).
         launch = json.loads(json.dumps(TASK_LAUNCH_ENTRIES))
@@ -5017,6 +5029,8 @@ class TestLiveAgentsScan(unittest.TestCase):
         st = self._scan([dict(self.INTERIM_1, timestamp="2099-01-01T00:00:00.000Z")])
         self.assertEqual(st["interimAt"], {"agent-1": ha._ts_ms("2099-01-01T00:00:00.000Z")})
 
+    # The fixtures are dated 2026-10-03: keep XERK-2712's expiry out of the way.
+    @mock.patch.object(ha, "INTERIM_AGENT_EXPIRE_MS", 10 ** 15)
     def test_the_lead_in_carries_the_interim_time(self):
         # A stop, then the resumed run's own interim written before its resume
         # record, both cut off into the back-scan's lead-in.
@@ -5151,14 +5165,60 @@ class TestLiveAgentsScan(unittest.TestCase):
                             "stopped with background work of its own still running.</note>\n"
                             "</task-notification>"}
 
+    # Read the report beside the fixture's own clock (XERK-2712 expires a parked row).
+    PARKED_NOW = ha._ts_ms("2026-10-03T12:05:00.000Z")
+
     def test_an_interim_notification_reads_the_agent_as_waiting_not_stopped(self):
         st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_2,
                                                dict(self.INTERIM_2, operation="remove")])
-        self.assertEqual(ha.live_agents_report(st), [
+        self.assertEqual(ha.live_agents_report(st, now_ms=self.PARKED_NOW), [
             {"type": "agent", "label": "QA the parity change", "kind": "wait-external"}])
         # Its final notification retires it.
         st = self._scan([dict(self.DONE_1, timestamp="2026-10-03T12:04:00.000Z")], st)
         self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_parked_agent_drops_out_after_the_expiry(self):
+        # XERK-2712: an agent parked by an interim notice that never notifies again
+        # is dropped INTERIM_AGENT_EXPIRE_MS after its FIRST notice (a repeat does
+        # not restart the clock), so its session reads idle, not stalled forever.
+        st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_2, dict(
+            self.INTERIM_2, timestamp="2026-10-03T13:00:00.000Z")])
+        parked = ha._ts_ms("2026-10-03T12:03:00.000Z")
+        self.assertEqual(st["liveAgents"]["agent-1"]["parkedAt"], parked)
+        exp = parked + ha.INTERIM_AGENT_EXPIRE_MS
+        self.assertEqual(len(ha.live_agents_report(st, now_ms=exp - 1)), 1)
+        self.assertEqual(ha.live_agents_report(st, now_ms=exp), [])
+        # The clock survives a restart through the snapshot row.
+        self.assertEqual(ha._snapshot_row(st["liveAgents"]["agent-1"])["parkedAt"], parked)
+        # A future or epoch-0 notice stamp parks at now, never later.
+        for ts in ("2099-01-01T00:00:00.000Z", "1970-01-01T00:00:00.000Z"):
+            before = int(ha.time.time() * 1000)
+            got = self._scan(TASK_LAUNCH_ENTRIES + [dict(self.INTERIM_2, timestamp=ts)])
+            self.assertTrue(before <= got["liveAgents"]["agent-1"]["parkedAt"]
+                            <= int(ha.time.time() * 1000))
+        # A snapshot row with no clock (an older agent's) or a future one gets now.
+        for bad in (None, 2 ** 52):
+            row = dict(st["liveAgents"]["agent-1"], parkedAt=bad)
+            got = ha._snapshot_row(row)["parkedAt"]
+            self.assertLessEqual(got, int(ha.time.time() * 1000))
+            self.assertGreater(got, exp)
+        # A resume makes it work again and clears the clock (one stamped after
+        # both notices: an earlier-stamped resume is the parked run's own, XERK-2710).
+        st = self._scan([dict(e, timestamp="2026-10-03T13:05:00.000Z") for e in self.RESUME], st)
+        self.assertNotIn("parkedAt", st["liveAgents"]["agent-1"])
+        self.assertEqual(len(ha.live_agents_report(st, now_ms=exp + 1)), 1)
+
+    def test_a_launch_parked_by_an_earlier_interim_expires_on_its_clock(self):
+        # XERK-2710 x XERK-2712: an interim written before its launch record parks
+        # the launch, and the expiry runs from that interim.
+        launch = json.loads(json.dumps(TASK_LAUNCH_ENTRIES))
+        launch[1]["timestamp"] = "2026-10-03T12:00:00.000Z"
+        st = self._scan([self.INTERIM_2] + launch)
+        parked = ha._ts_ms(self.INTERIM_2["timestamp"])
+        self.assertEqual(st["liveAgents"]["agent-1"]["parkedAt"], parked)
+        exp = parked + ha.INTERIM_AGENT_EXPIRE_MS
+        self.assertEqual(len(ha.live_agents_report(st, now_ms=exp - 1)), 1)
+        self.assertEqual(ha.live_agents_report(st, now_ms=exp), [])
 
     def test_a_resume_of_a_waiting_agent_makes_it_work_again(self):
         st = self._scan(TASK_LAUNCH_ENTRIES + [self.INTERIM_2] + self.RESUME)
@@ -5170,10 +5230,12 @@ class TestLiveAgentsScan(unittest.TestCase):
         interim = dict(self.INTERIM_2, content=self.INTERIM_2["content"]
                        .replace("agent-1", "bsh1").replace("work</summary>", "work \r\n</summary>"))
         st = self._scan(SHELL_LAUNCH_ENTRIES + [interim])
-        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], ["wait-external"])
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st, now_ms=self.PARKED_NOW)],
+                         ["wait-external"])
         st = self._scan(TASK_LAUNCH_ENTRIES + [dict(self.INTERIM_2, content=self.INTERIM_2["content"]
                         .replace("work</summary>", "work \t\n</summary>"))])
-        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st)], ["wait-external"])
+        self.assertEqual([r.get("kind") for r in ha.live_agents_report(st, now_ms=self.PARKED_NOW)],
+                         ["wait-external"])
         work = json.loads(json.dumps(SHELL_LAUNCH_ENTRIES))
         work[0]["message"]["content"][0]["input"]["command"] = "npm test"
         st = self._scan(work + [interim])

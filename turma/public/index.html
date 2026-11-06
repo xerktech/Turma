@@ -1272,7 +1272,10 @@ function backgroundWait(rows, lastWrite, now) {
   for (const a of waits) if (Number.isSafeInteger(a.eta) && (eta == null || a.eta > eta)) eta = a.eta;
   if (eta != null && eta > now) return { state: "waiting", eta };
   const overdue = eta != null && lastWrite < eta && now - eta >= WAIT_ETA_GRACE_MS;
-  const silent = now - lastWrite >= WAIT_STALL_MS;
+  // An agent parked on its own background work (XERK-2710) never stalls: this
+  // transcript's silence says nothing about it, and most such agents have long
+  // finished (XERK-2712). The agent drops the row after a few hours instead.
+  const silent = waits.some((a) => a.type === "shell") && now - lastWrite >= WAIT_STALL_MS;
   return { state: overdue || silent ? "stalled" : "waiting", eta };
 }
 // "waiting · Sleep · 12m left" / "waiting · Watch CI" / "waiting on 2 background

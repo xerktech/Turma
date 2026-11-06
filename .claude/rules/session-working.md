@@ -59,13 +59,21 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
     summary) — the notice's own tags only, never `<result>`: a report quoting either is a stop.
   - `interimAt` (id → newest fresh interim timestamp, in the snapshot + lead-in, the `stopAt`
     twin): a launch/resume record timestamped at or before it registers parked, never as work.
-  - Never ignore it: ~40% of such agents on a real host never notified again, so they would read
-    working forever. As a wait they go stalled after `ATTENTION_WAIT_STALL_MIN` (alert + nudges).
-  - **Its stall nudge never says "stop it"** (`attentionNudgeText`): the parent's silence is no sign
-    of death (the agent writes its own transcript), so an all-agent wait is named as an agent and
-    told to check first. Wait counts name agents/shells/tasks (`backgroundRowsLabel`, web
-    `backgroundWorkLabel`, Android `backgroundRowsLabel`) — never assume a wait row is a shell.
-  - Tests: the `interim` cases in `TestLiveAgentsScan` and `TestSessionReport` ↔ js.
+  - Never ignore the notice instead: a third or more of such agents never send a final one, so
+    they would read working forever.
+  - **A parked row expires and never stalls** (XERK-2712, operator decision). 95 of 96 agents
+    had already handed in their report, so "stalled" fired on finished work. The agent drops a
+    row `INTERIM_AGENT_EXPIRE_MS` (3h) after its FIRST interim notice (`parkedAt`, carried in
+    the snapshot, cleared by a resume); 25 of 26 re-notifiers on a real host did so within 2.4h.
+  - Until then it reads waiting: `backgroundWait`'s silence stall counts only when a wait row is
+    a SHELL (all four mirrors) — this transcript's silence says nothing about a subagent.
+  - Rejected: expiring on the subagent transcript's live children (a new incremental scan) and
+    treating a post-handback interim notice as done (reads idle while that work runs).
+  - **A stall nudge never says "stop it" to an agent** (`attentionNudgeText`): only a mix with a
+    shell stalls, and its stop advice names the shells. Wait counts name agents/shells/tasks
+    (`backgroundRowsLabel`, web `backgroundWorkLabel`, Android `backgroundRowsLabel`) — never
+    assume a wait row is a shell.
+  - Tests: the `interim`/`parked` cases in `TestLiveAgentsScan` and `TestSessionReport` ↔ js.
 
 ## The published live-agent set survives a restart (XERK-1587)
 
