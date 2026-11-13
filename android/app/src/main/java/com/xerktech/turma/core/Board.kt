@@ -183,6 +183,24 @@ fun isEpicTicket(t: JiraTicket?): Boolean = t?.isEpic == true
 fun epicRunOf(epicRuns: Map<String, EpicRun>?, siteKey: String, epicKey: String): EpicRun? =
     epicRuns?.get("$siteKey/$epicKey")?.takeIf { it.children.isNotEmpty() }
 
+/**
+ * A stand-in ticket for a run child the board no longer lists (aged out of the
+ * Done window), so its sheet can still open — board.js epicChildStub. The sheet's
+ * on-demand fetch fills in the rest from the tracker. null when [key] is not a
+ * child of [run].
+ */
+fun epicChildStub(run: EpicRun?, key: String): JiraTicket? {
+    if (run == null || key !in run.children) return null
+    val done = key in run.doneChildren
+    return JiraTicket(
+        key = key,
+        summary = run.childTitles[key].orEmpty(),
+        status = if (done) "Done" else "",
+        statusCategory = if (done) "done" else "",
+        epicKey = run.epicKey.ifBlank { null },
+    )
+}
+
 /** A child's live status in the run — the four states of board.js epicRunView. */
 enum class EpicChildStatus { DONE, RUNNING, READY, BLOCKED }
 

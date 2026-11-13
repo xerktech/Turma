@@ -481,6 +481,25 @@
     return r;
   }
 
+  // A stand-in ticket for a run child the board no longer lists (it aged out of
+  // the Done window), so its detail panel can still open: the key, the title the
+  // hub recorded, its epic, and Done when the hub saw it Done. The panel's
+  // on-demand fetch fills in the rest straight from the tracker. null when `key`
+  // is not one of the run's children.
+  function epicChildStub(run, key) {
+    if (!run || !Array.isArray(run.children) || !run.children.includes(key)) return null;
+    const titles = run.childTitles && typeof run.childTitles === "object" ? run.childTitles : null;
+    const done = Array.isArray(run.doneChildren) && run.doneChildren.includes(key);
+    return {
+      key,
+      summary: titles && Object.hasOwn(titles, key) && typeof titles[key] === "string" ? titles[key] : "",
+      status: done ? "Done" : "",
+      statusCategory: done ? "done" : "",
+      epicKey: typeof run.epicKey === "string" ? run.epicKey : "",
+      offBoard: true,
+    };
+  }
+
   // The run's LIVE progress, computed from the current board — never re-deriving
   // the DAG (the hub owns `waves`/`children`/`cycle`; only a re-arm rebuilds it).
   // Each child gets one of four states, matching the hub driver's own readiness
@@ -710,11 +729,9 @@
     const key = (t && t.key) || "";
     const err = o.error ? `<div class="td-note td-err">${esc(o.error)}</div>` : "";
     // A child's key + summary open THAT ticket's detail panel in place
-    // (XERK-2674) — the page's click handler keys on data-epic-child.
-    const childOpenHtml = (c) => c.onBoard === false
-      ? `<span class="epic-child-key">${esc(c.key)}</span>
-          <span class="epic-child-sum">${esc(c.summary)}</span>`
-      : `<button class="epic-child-open" type="button"
+    // (XERK-2674) — the page's click handler keys on data-epic-child. A child the
+    // board no longer lists opens too, from the run's record (epicChildStub).
+    const childOpenHtml = (c) => `<button class="epic-child-open" type="button"
             data-epic-child="${esc(c.key)}" title="Open ${esc(c.key)}">
             <span class="epic-child-key">${esc(c.key)}</span>
             <span class="epic-child-sum">${esc(c.summary)}</span>
@@ -3006,7 +3023,7 @@
     platformPinOf, platformFieldHtml, platformPickerHtml, platformPickerValue, prettyPlatform,
     statusFieldHtml, statusPickerHtml, statusPickerValue,
     triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
-    isEpicTicket, epicRunOf, epicRunView, epicRunSig,
+    isEpicTicket, epicRunOf, epicChildStub, epicRunView, epicRunSig,
     epicCardControlHtml, epicProgressBarHtml, epicRunPanelHtml, epicLimitPickerHtml, epicChildrenOf, epicChildrenSig, epicLayerWaves, epicPreviewRun, epicPanelSig,
     FILTER_FIELDS, SORTS, emptyBoardView, boardViewActive, boardViewFilterCount, priorityRank,
     ticketFacets, ticketSearchMatch, boardViewMatches, boardViewSort, boardFilterGroups,

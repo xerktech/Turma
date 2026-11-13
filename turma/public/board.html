@@ -1662,9 +1662,11 @@ async function fetchDetail(siteKey, key, alive) {
   return alive() ? { error: "the host didn't answer in time" } : {};
 }
 
-async function openDetail(key, siteKey, fromEl) {
+// `stub` stands in for a ticket the board no longer lists (an epic run's aged-off
+// child, B.epicChildStub); the on-demand fetch below fills in its detail.
+async function openDetail(key, siteKey, fromEl, stub) {
   const site = lastSites.find(s => s.siteKey === siteKey);
-  const ticket = site && site.tickets.find(t => t.key === key);
+  const ticket = (site && site.tickets.find(t => t.key === key)) || (site && stub) || null;
   if (!ticket) return;
   const mySeq = ++openSeq;
   const alive = () => openSeq === mySeq;
@@ -2082,7 +2084,11 @@ $panel.addEventListener("click", (e) => {
   const nav = e.target.closest("[data-epic-child], [data-td-epic]");
   if (nav) {
     const key = nav.dataset.epicChild || nav.dataset.tdEpic;
-    openDetail(key, openTicketState.siteKey, lastFocus);
+    // A run child the board no longer lists opens from the run's record.
+    const stub = nav.dataset.epicChild
+      ? B.epicChildStub(B.epicRunOf(cache && cache.epicRuns, openTicketState.siteKey, openTicketState.key), key)
+      : null;
+    openDetail(key, openTicketState.siteKey, lastFocus, stub);
     return;
   }
   // Epic run controls: Start / Re-arm (both arm), Pause / Resume (XERK-641), Cancel.

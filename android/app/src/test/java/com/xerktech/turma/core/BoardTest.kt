@@ -1502,6 +1502,19 @@ class BoardTest {
         assertEquals(listOf("Kept title", "Live title"), view.waves[0].map { it.summary })
     }
 
+    @Test fun `epicChildStub opens a run child the board no longer lists`() {
+        val run = mkRun(children = listOf("C-1", "C-2"), waves = listOf(listOf("C-1", "C-2")))
+            .copy(epicKey = "E-1", doneChildren = listOf("C-1"), childTitles = mapOf("C-1" to "First"))
+        val stub = epicChildStub(run, "C-1")!!
+        assertEquals("C-1", stub.key)
+        assertEquals("First", stub.summary)
+        assertEquals("done", stub.statusCategory)
+        assertEquals("E-1", stub.epicKey)
+        assertEquals("", epicChildStub(run, "C-2")!!.statusCategory)
+        assertEquals(null, epicChildStub(run, "X-9"))
+        assertEquals(null, epicChildStub(null, "C-1"))
+    }
+
     @Test fun `epicRunView derives child status from the live board`() {
         // C-1 Done; C-2 has a running session; C-3 unstarted, its in-epic blocker
         // C-2 not Done -> blocked.
