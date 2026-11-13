@@ -67,8 +67,9 @@ class BriefScreenTest {
     """.trimIndent())
 
     private fun show(vm: BriefViewModel = main.track(BriefViewModel(hub.app)),
-                     mvm: MeetingsViewModel = main.track(MeetingsViewModel(hub.app))) =
-        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm) }
+                     mvm: MeetingsViewModel = main.track(MeetingsViewModel(hub.app)),
+                     wide: Boolean = false) =
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = wide) }
 
     private fun open(text: String) {
         compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText(text, substring = true))
@@ -107,6 +108,50 @@ class BriefScreenTest {
         // meeting's title lists the daily entry alone.
         compose.onNodeWithText("‹ Back").performClick()
         compose.onAllNodesWithText("Daily meeting").assertCountEquals(1)
+    }
+
+    // XERK-2878: a tablet / unfolded foldable shows the list and the open entry
+    // side by side, as the web's rail + main pane and the Sessions tab do.
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide shows the list beside the first entry, and a pick swaps only the entry`() {
+        seed(
+            meetings = """{ "meetingId": "m1", "status": "ok", "title": "Design review", "startedAt": $yday,
+                "items": [ { "id": "p1", "kind": "task", "title": "Wire the export" } ] }""",
+        )
+        show(wide = true)
+        // Nothing picked: the first entry (the upcoming daily meeting) is open beside the list.
+        compose.onNodeWithText("Search meetings and proposals").assertExists()
+        compose.onNodeWithText("Run now").assertExists()
+        compose.onNodeWithText("‹ Back").assertDoesNotExist()
+        open("Design review")
+        // The entry pane swapped; the list (and its other entry) stayed.
+        compose.onNodeWithText("Wire the export").assertExists()
+        compose.onNodeWithText("Run now").assertDoesNotExist()
+        compose.onNodeWithText("Daily meeting").assertExists()
+        compose.onNodeWithText("Search meetings and proposals").assertExists()
+    }
+
+    @Test fun `narrow still shows one pane at a time`() {
+        seed()
+        show()
+        compose.onNodeWithText("Run now").assertDoesNotExist()
+        open("Daily meeting")
+        compose.onNodeWithText("Run now").assertExists()
+        compose.onNodeWithText("Search meetings and proposals").assertDoesNotExist()
+        compose.onNodeWithText("‹ Back").performClick()
+        compose.onNodeWithText("Search meetings and proposals").assertExists()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide opens an org's settings in the entry pane and Back closes them`() {
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [] }""")
+        seed()
+        show(wide = true)
+        compose.onNodeWithContentDescription("o settings").performClick()
+        compose.onNodeWithText("o · settings").assertExists()
+        compose.onNodeWithText("Search meetings and proposals").assertExists()
+        compose.onNodeWithText("‹ Back").performClick()
+        compose.onNodeWithText("Run now").assertExists()
     }
 
     @Test fun `Run now is off while a brief is being written`() {

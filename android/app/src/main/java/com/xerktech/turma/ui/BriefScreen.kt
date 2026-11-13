@@ -5,20 +5,24 @@ import android.os.Looper
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -29,13 +33,14 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -51,9 +56,11 @@ import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -91,32 +98,34 @@ import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.BriefViewModel
 import com.xerktech.turma.vm.MeetingsViewModel
 import com.xerktech.turma.vm.MetaState
+import java.time.ZoneId
+import java.util.Locale
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.booleanOrNull
-import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.add
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
-import java.time.ZoneId
-import java.util.Locale
 
 /**
  * The Brief tab (XERK-2858, the web's two-pane triage of XERK-2857): every
  * org's meetings in one list — collapsible orgs, date buckets, Needs review /
  * All / Archived, search — with the Daily brief folded into each org's
  * daily-meeting entry. A phone shows one pane at a time: the list, an entry,
- * or an org's settings, Back returning to the list. [openSite] (a meetings
- * push) unfolds that org on Needs review.
+ * or an org's settings, Back returning to the list; [wide] (tablet / unfolded
+ * foldable) shows the list and the open entry side by side, like the web and
+ * the Sessions tab. [openSite] (a meetings push) unfolds that org on Needs review.
  */
 @Composable
 fun BriefScreen(
     modifier: Modifier = Modifier,
+    wide: Boolean = false,
     openSite: String? = null,
     onOpened: () -> Unit = {},
     vm: BriefViewModel = viewModel(),
@@ -163,49 +172,93 @@ fun BriefScreen(
         }
     }
 
-    BackHandler(enabled = selected.isNotEmpty() || settingsFor.isNotEmpty()) {
-        selected = ""
-        settingsFor = ""
+    // Wide (tablet / unfolded): the list and the open entry side by side, as the
+    // web's rail + main pane. With nothing picked, the first entry the list shows
+    // is open (the web's pickSelected → flat[0]); a picked entry that left the
+    // list falls back the same way rather than to an empty pane.
+    val zone = ZoneId.systemDefault()
+    val firstShown = if (!wide) null else orgs.asSequence()
+        .filter { it !in collapsed }
+        .flatMap { s -> triageBuckets(entries[s].orEmpty(), filter, query, now, zone).flatMap { it.second } }
+        .firstOrNull()
+    val pickedSite = selected.substringBefore('\u0000')
+    val pickedKey = selected.substringAfter('\u0000')
+    val picked = if (selected.isEmpty()) null else entries[pickedSite]?.firstOrNull { it.key == pickedKey }
+    val open = picked ?: firstShown
+
+    // Back closes settings, then (narrow only — wide has no full-screen entry) the entry.
+    BackHandler(enabled = settingsFor.isNotEmpty() || (!wide && selected.isNotEmpty())) {
+        if (settingsFor.isNotEmpty()) settingsFor = "" else selected = ""
+    }
+
+    val detail: @Composable (Modifier) -> Unit = { m ->
+        when {
+            settingsFor.isNotEmpty() -> OrgSettings(
+                m, settingsFor, orgName(settingsFor, names[settingsFor].orEmpty()),
+                fleet, meetingsVm, now, onBack = { settingsFor = "" },
+            )
+            open == null -> {
+                // Gone from the store (evicted, or another org scope): back to the list.
+                if (selected.isNotEmpty()) LaunchedEffect(selected) { selected = "" }
+                if (wide) DetailEmpty(m, filter)
+            }
+            else -> {
+                val site = open.siteKey
+                // Every org's list, in the order shown, so "Next" moves on
+                // across orgs once this one is reviewed.
+                val ordered = orgs.flatMap { s ->
+                    triageBuckets(entries[s].orEmpty(), TriageFilter.ALL, "", now, zone)
+                        .flatMap { it.second }
+                }
+                EntryDetail(
+                    m, open, orgName(site, names[site].orEmpty()), now, fleet,
+                    vm, meetingsVm,
+                    next = triageNext(ordered, open),
+                    onOpen = { n -> selected = "${n.siteKey}\u0000${n.key}" },
+                    onBack = if (wide) null else ({ selected = "" }),
+                )
+            }
+        }
+    }
+    val list: @Composable (Modifier) -> Unit = { m ->
+        TriageList(
+            m, fleet, orgs, names, entries, collapsed, filter, query, now,
+            selected = if (wide && settingsFor.isEmpty()) open else null,
+            onFilter = { filter = it }, onQuery = { query = it },
+            onToggle = meetingsVm::toggleCollapsed,
+            onOpen = { e -> selected = "${e.siteKey}\u0000${e.key}"; settingsFor = "" },
+            onSettings = { settingsFor = it },
+        )
     }
 
     Column(modifier.fillMaxSize()) {
         ScreenHeader("Brief")
         when {
-            settingsFor.isNotEmpty() -> OrgSettings(
-                Modifier.weight(1f), settingsFor, orgName(settingsFor, names[settingsFor].orEmpty()),
-                fleet, meetingsVm, now, onBack = { settingsFor = "" },
-            )
-            selected.isNotEmpty() -> {
-                val site = selected.substringBefore('\u0000')
-                val key = selected.substringAfter('\u0000')
-                val e = entries[site]?.firstOrNull { it.key == key }
-                if (e == null) {
-                    // Gone from the store (evicted, or another org scope): back to the list.
-                    LaunchedEffect(selected) { selected = "" }
-                } else {
-                    // Every org's list, in the order shown, so "Next" moves on
-                    // across orgs once this one is reviewed.
-                    val ordered = orgs.flatMap { s ->
-                        triageBuckets(entries[s].orEmpty(), TriageFilter.ALL, "", now, ZoneId.systemDefault())
-                            .flatMap { it.second }
-                    }
-                    EntryDetail(
-                        Modifier.weight(1f), e, orgName(site, names[site].orEmpty()), now, fleet,
-                        vm, meetingsVm,
-                        next = triageNext(ordered, e),
-                        onOpen = { n -> selected = "${n.siteKey}\u0000${n.key}" },
-                        onBack = { selected = "" },
-                    )
-                }
+            wide -> Row(Modifier.weight(1f).fillMaxWidth()) {
+                list(Modifier.width(360.dp).fillMaxHeight())
+                VerticalDivider()
+                Box(Modifier.weight(1f).fillMaxHeight()) { detail(Modifier) }
             }
-            else -> TriageList(
-                Modifier.weight(1f), fleet, orgs, names, entries, collapsed, filter, query, now,
-                onFilter = { filter = it }, onQuery = { query = it },
-                onToggle = meetingsVm::toggleCollapsed,
-                onOpen = { e -> selected = "${e.siteKey}\u0000${e.key}" },
-                onSettings = { settingsFor = it },
-            )
+            settingsFor.isNotEmpty() || selected.isNotEmpty() -> detail(Modifier.weight(1f))
+            else -> list(Modifier.weight(1f))
         }
+    }
+}
+
+/** The wide main pane when the list shows no entry at all (the web's `mt-empty`). */
+@Composable
+private fun DetailEmpty(modifier: Modifier, filter: TriageFilter) {
+    Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text(
+            when (filter) {
+                TriageFilter.REVIEW -> "Nothing needs review. When Tenir sends a meeting, its proposed work items show up here."
+                TriageFilter.ARCHIVED -> "No archived meetings."
+                else -> "No meetings yet."
+            },
+            Modifier.padding(24.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
     }
 }
 
@@ -234,6 +287,7 @@ private fun TriageList(
     filter: TriageFilter,
     query: String,
     now: Long,
+    selected: TriageEntry?,
     onFilter: (TriageFilter) -> Unit,
     onQuery: (String) -> Unit,
     onToggle: (String) -> Unit,
@@ -324,7 +378,9 @@ private fun TriageList(
                         SectionLabel(bucket.label, Modifier.padding(start = 4.dp, top = 4.dp))
                     }
                     for (e in rows) {
-                        item(key = "e:$site:${e.key}") { EntryRow(e, now, zone, locale) { onOpen(e) } }
+                        item(key = "e:$site:${e.key}") {
+                            EntryRow(e, now, zone, locale, e.siteKey == selected?.siteKey && e.key == selected.key) { onOpen(e) }
+                        }
                     }
                 }
             }
@@ -376,8 +432,14 @@ private fun CountPill(n: Int) {
 }
 
 @Composable
-private fun EntryRow(e: TriageEntry, now: Long, zone: ZoneId, locale: Locale, onClick: () -> Unit) {
-    TurmaCard(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable(onClick = onClick)) {
+private fun EntryRow(e: TriageEntry, now: Long, zone: ZoneId, locale: Locale, current: Boolean, onClick: () -> Unit) {
+    // The wide layout's open entry is marked in the list, as the web rail's is.
+    val shape = RoundedCornerShape(12.dp)
+    val mark = if (current) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, shape) else Modifier
+    TurmaCard(
+        Modifier.fillMaxWidth().clip(shape).then(mark).clickable(onClick = onClick)
+            .semantics { this.selected = current },
+    ) {
         Row(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(triageTitle(e), fontWeight = FontWeight.SemiBold, maxLines = 2)
@@ -431,14 +493,19 @@ private fun EntryDetail(
     mvm: MeetingsViewModel,
     next: TriageEntry?,
     onOpen: (TriageEntry) -> Unit,
-    onBack: () -> Unit,
+    // null on the wide layout: the list stays beside the entry, so there is no Back.
+    onBack: (() -> Unit)?,
 ) {
     val asking by vm.asking.collectAsStateWithLifecycle()
     val zone = ZoneId.systemDefault()
     val locale = Locale.getDefault()
     val site = e.siteKey
     Column(modifier.fillMaxSize()) {
-        BackRow(org, onBack)
+        if (onBack != null) BackRow(org, onBack)
+        else Text(
+            org, Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
+        )
         Column(
             // imePadding: the keyboard must not cover the field being typed into.
             Modifier.fillMaxSize().imePadding().verticalScroll(rememberScrollState())

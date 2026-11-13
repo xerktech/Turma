@@ -722,6 +722,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     rejected one, "x of n reviewed", Archive / Unarchive meeting, and Next once all are reviewed.
   - The org's ⚙ panel: New-tickets project, Whose work (one name per line), Tenir label, and the
     Daily brief schedule with "Daily meeting title contains". Unmapped Tenir labels: one banner.
+- **Wide (tablet / unfolded foldable, Expanded width) is the web's two panes** (XERK-2878): the
+  list beside the open entry, nothing picked = the first entry shown (the web's `pickSelected`),
+  the open entry marked in the list; ⚙ settings open in the entry pane (web: a drawer).
 - Platform differences: a phone shows one pane at a time (list, entry or settings; Back returns),
   as the web does under 760px. No keyboard shortcuts (A/S/E/R/J/K). The project pick is kept per
   phone. A failed create stays in the pending list with Approve to retry it. A long refusal

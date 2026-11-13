@@ -108,6 +108,10 @@ A pure-core/adapter-shell split:
   - A cleared Tenir label sends an explicit `{"label":null}` via `JsonObject`: TurmaJson's
     `explicitNulls=false` would drop a typed null and the hub 400s a body with no `label`.
   - Bottom-nav labels stay ONE line at 11sp; never let one wrap.
+  - **Wide (`MainActivity`'s Expanded width) is list + entry side by side** (XERK-2878), like
+    `SessionsRoute`; nothing picked opens the first entry shown. A Robolectric test of it needs
+    `qualifiers = "w1000dp-…"`: the default screen leaves the 360dp list's neighbour zero-wide,
+    so clicks in that pane silently miss.
   - Tests: `core/MeetingsTriageTest`, `ui/BriefScreenTest`, `ui/MeetingsScreenTest`, `TurmaAppDeepLinkTest`.
 
 ## Images (rollup XERK-2109)
