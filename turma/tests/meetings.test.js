@@ -27,11 +27,11 @@ function makeEl() {
 
 // `reply(url, init)` answers each non-/api/agents fetch: a body for 200, or
 // {status, body} for a refusal.
-function loadPage(reply = () => ({}), orgKeys = []) {
+function loadPage(reply = () => ({}), orgKeys = [], preset = {}) {
   const els = {};
   const fetches = [];
   const toasts = [];
-  const store = {};
+  const store = { ...preset };
   const noop = () => {};
   const document = {
     getElementById(id) { return (els[id] ||= makeEl()); },
@@ -65,7 +65,11 @@ function loadPage(reply = () => ({}), orgKeys = []) {
   const api = stubs.window.TurmaMeetings;
   api.mount(document.getElementById("meetingList"));
   const settle = async () => { for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r)); };
-  return Object.assign(api, { els, fetches, toasts, store, settle, list: () => els.meetingList.innerHTML });
+  // A click on an element carrying `dataset` (what the delegated handler's closest() finds).
+  const click = (dataset, aria = null) => {
+    for (const fn of els.meetingList.listeners.click) fn({ target: { closest: () => ({ dataset, getAttribute: () => aria }) } });
+  };
+  return Object.assign(api, { els, fetches, toasts, store, settle, click, document, list: () => els.meetingList.innerHTML });
 }
 
 const SITE = "acme.atlassian.net";
@@ -89,7 +93,8 @@ test("XERK-2510: a meeting's proposals render escaped, with quotes linked to tha
   P.setCache(data());
   P.renderMeetings(data());
   const h = P.list();
-  assert.match(h, /<h2 class="mt-org-name">Acme<\/h2>/);
+  assert.match(h, /<span class="nm">Acme<\/span>/);
+  assert.match(h, /<h2 class="tri-title">Sprint &lt;sync&gt;<\/h2>/);
   assert.match(h, /Sprint &lt;sync&gt;/);
   assert.match(h, /Fix the &lt;img src=x onerror=alert\(1\)&gt; bug/);
   assert.doesNotMatch(h, /<img|<b>is/);
@@ -152,24 +157,33 @@ test("XERK-2510: a refusal reaches the operator in the hub's words; review state
   await P.review(k1, "approve");
   assert.equal("edited" in P.fetches.filter((f) => f.method === "POST").at(-1).body, false);
   const items = meeting().items;
-  P.renderMeetings(data([meeting({ items: [
+  P.update(data([meeting({ items: [
     { ...items[0], review: { state: "created", at: 1, key: "ACME-9", start: true, session: "queued" } },
     { ...items[1], review: { state: "logged", at: 1 } }] }),
   meeting({ meetingId: "m2", items: [{ ...items[0], review: { state: "failed", at: 1, error: "<boom>" } },
     { ...items[1], review: { state: "rejected", at: 1 } }] })]));
+  P.setFilter("all");
+  P.select(P.entryKey(SITE, "m:m1"));
+  assert.doesNotMatch(P.list(), /Created <a/, "a reviewed proposal leaves the list");
+  P.click({ showReviewed: P.meetingKey(SITE, "m1") });
   const h = P.list();
   assert.match(h, /Created <a href="\/board\?ticket=ACME-9&amp;site=acme\.atlassian\.net">ACME-9<\/a>/);
   assert.match(h, /session starting/);
+  P.select(P.entryKey(SITE, "m:m2"));
+  P.click({ showReviewed: P.meetingKey(SITE, "m2") });
+  const h2 = P.list();
   P.renderMeetings(data([meeting({ items: [{ ...items[0], review: { state: "created", at: 1, key: "ACME-9", start: true,
     session: "failed", sessionError: "<img src=x>" } }] })]));
   assert.match(P.list(), /no session — &lt;img src=x&gt;/);
   assert.match(h, /Added to the decisions log/);
-  assert.match(h, /Not created — &lt;boom&gt;/);
-  assert.match(h, /class="mt-item rejected"/);
+  assert.match(h2, /Not created — &lt;boom&gt;/);
+  assert.match(h2, /class="mt-item rejected"/);
   // A pending or failed run says so instead of items.
-  P.renderMeetings(data([meeting({ status: "running", host: "k8x-02", items: undefined }),
+  P.update(data([meeting({ status: "running", host: "k8x-02", items: undefined }),
     meeting({ meetingId: "m3", status: "failed", error: "timed out", items: undefined })]));
+  P.select(P.entryKey(SITE, "m:m1"));
   assert.match(P.list(), /Reading the captions on k8x-02/);
+  P.select(P.entryKey(SITE, "m:m3"));
   assert.match(P.list(), /Could not propose work items — timed out/);
 });
 
@@ -224,11 +238,15 @@ test("XERK-2638: the Tenir labels list and an unmapped label's banner, escaped, 
       : { ok: true, label: JSON.parse(init.body).label || "bolt", custom: JSON.parse(init.body).label !== null })
     : META(u)));
   P.update(labeled);
+  // Each org's label is in its settings drawer; a custom label offers Reset, a default one says so.
+  P.openDrawer(SITE);
+  assert.match(P.list(), /data-label="acme\.atlassian\.net" value="acme"/);
+  assert.doesNotMatch(P.list(), /data-label-reset="acme\.atlassian\.net"/);
+  P.openDrawer(B);
+  assert.match(P.list(), /data-label-reset="dev\.azure\.com\/Bolt"/);
+  P.openDrawer(null);
   const html = P.list();
-  // One row per org; a custom label offers Reset, a default one says so.
-  assert.match(html, /data-label="acme\.atlassian\.net" value="acme"/);
-  assert.match(html, /data-label-reset="dev\.azure\.com\/Bolt"/);
-  assert.doesNotMatch(html, /data-label-reset="acme\.atlassian\.net"/);
+  assert.doesNotMatch(html, /data-label=/, "no label row outside the drawer");
   // A miss shows its plain label (tenant suffix dropped); a malformed key never renders.
   assert.match(html, /meeting for <b>northwind<\/b>, which no org has/);
   assert.match(html, /meeting for <b>globex<\/b>, which more than one org answers to/);
@@ -244,15 +262,16 @@ test("XERK-2638: the Tenir labels list and an unmapped label's banner, escaped, 
     [`/api/orgs/${encodeURIComponent(B)}/meeting-label`, null],
     [`/api/orgs/${encodeURIComponent(SITE)}/meeting-label`, "taken"]]);
   assert.match(P.toasts.at(-1), /already has the meeting label/);
+  P.openDrawer(SITE);
   assert.match(P.list(), /mt-err-inline">Saving the label failed/);
   // A malformed label never reaches the hub.
   assert.equal(await P.saveLabel(SITE, "Has Space"), false);
   assert.equal(P.fetches.filter((f) => /meeting-label/.test(f.url)).length, 3);
-  // The header org pick scopes the rows.
+  // The header org pick scopes the banner's org pick and the rail.
   const Q = loadPage(META, [B]);
   Q.update(labeled);
-  assert.doesNotMatch(Q.list(), /data-label="acme/);
-  assert.match(Q.list(), /data-label="dev\.azure\.com\/Bolt"/);
+  assert.doesNotMatch(Q.list(), /value="acme\.atlassian\.net"|data-org-toggle="acme/);
+  assert.match(Q.list(), /<option value="dev\.azure\.com\/Bolt">/);
 });
 
 test("XERK-2514: the Whose work rows, escaped, post names and role; Clear posts empty", async () => {
@@ -263,8 +282,10 @@ test("XERK-2514: the Whose work rows, escaped, post names and role; Clear posts 
       : { ok: true, focus: null })
     : META(u)));
   P.update(d);
+  assert.doesNotMatch(P.list(), /data-focus-names=/, "whose work lives in the org's drawer");
+  P.click({ orgSettings: SITE });
   const html = P.list();
-  assert.match(html, /<summary>Whose work<\/summary>/);
+  assert.match(html, /<div class="tri-dlabel">Whose work<\/div>/);
   assert.match(html, /data-focus-names="acme\.atlassian\.net" value="Ann &lt;b&gt;Lee&lt;\/b&gt;, Lee, Ann"/);
   assert.match(html, /data-focus-role="acme\.atlassian\.net" value="QA &quot;lead&quot;"/);
   assert.match(html, /data-focus-clear="acme\.atlassian\.net"/);
@@ -284,25 +305,12 @@ test("XERK-2638: an org with no label is still listed and pickable; same-named o
     meetingLabelMisses: { other: { at: 1 } } };
   const P = loadPage(META);
   P.update(d);
+  P.openDrawer(T1);
   const html = P.list();
   assert.match(html, /data-label="twin-a\.atlassian\.net" value="" maxlength="40"[^>]*placeholder="no label"/);
   assert.match(html, /no label — give it one/);
   assert.match(html, /<option value="twin-a\.atlassian\.net">Twin Co \(twin-a\.atlassian\.net\)<\/option>/);
   assert.match(html, /Twin Co \(twin-b\.atlassian\.net\)/);
-});
-
-test("XERK-2638: the Tenir labels list keeps the open state the operator left it in", () => {
-  const P = loadPage(META);
-  const d = { ...data(), meetingLabels: { [SITE]: { label: "acme", custom: false } }, meetingLabelMisses: {} };
-  P.update(d);
-  assert.match(P.list(), /<details class="mt-labels">/);
-  const toggle = (open) => P.els.meetingList.listeners.toggle[0]({ target: { open, classList: { contains: (c) => c === "mt-labels" } } });
-  toggle(true);
-  P.update({ ...d });
-  assert.match(P.list(), /<details class="mt-labels" open>/);
-  toggle(false);
-  P.update({ ...d });
-  assert.match(P.list(), /<details class="mt-labels">/);
 });
 
 // XERK-2634: a meeting's host is a registry key, tenant-suffixed after the
@@ -312,4 +320,226 @@ test("a meeting read on a tenant host names the host without the tenant", () => 
   P.renderMeetings(data([meeting({ status: "running", host: "k8x-02@77778a16d8b028aab55c7729d587dbd7", items: undefined })]));
   assert.match(P.list(), /Reading the captions on k8x-02…/);
   assert.doesNotMatch(P.list(), /77778a16/);
+});
+
+// ---- XERK-2857: the two-pane triage ---------------------------------------------
+const OTHER = "globex.atlassian.net";
+const two = () => ({ agents: [{ org: SITE, jira: { siteKey: SITE, orgName: "Acme" } }, { org: OTHER, jira: { siteKey: OTHER, orgName: "Globex" } }],
+  meetingProposals: { [SITE]: [meeting()], [OTHER]: [meeting({ meetingId: "g1", title: "Globex sync" })] } });
+
+test("XERK-2857: an org collapses to its header, the pick is kept per viewer, and survives a reload", () => {
+  const P = loadPage(META);
+  P.update(two());
+  assert.match(P.list(), /data-org-toggle="globex\.atlassian\.net" aria-expanded="true"/);
+  assert.match(P.list(), /data-entry="globex\.atlassian\.net\/m%3Ag1"/);
+  P.click({ orgToggle: OTHER });
+  assert.match(P.list(), /data-org-toggle="globex\.atlassian\.net" aria-expanded="false"/);
+  assert.doesNotMatch(P.list(), /data-entry="globex/);
+  assert.match(P.list(), /<span class="nm">Globex<\/span><\/button><span class="tri-count"[^>]*>2</, "a collapsed org still counts");
+  assert.deepEqual(JSON.parse(P.store["turma-meetings-collapsed"]), [OTHER]);
+  // A reload reads it back; a broken store is ignored, never thrown.
+  const R = loadPage(META, [], { "turma-meetings-collapsed": P.store["turma-meetings-collapsed"] });
+  R.update(two());
+  assert.doesNotMatch(R.list(), /data-entry="globex/);
+  const Bad = loadPage(META, [], { "turma-meetings-collapsed": "{not json" });
+  Bad.update(two());
+  assert.match(Bad.list(), /data-entry="globex/);
+  P.click({ orgToggle: OTHER });
+  assert.deepEqual(JSON.parse(P.store["turma-meetings-collapsed"]), []);
+});
+
+test("XERK-2857: a reviewed proposal leaves the list, counts as progress, and shows again under show reviewed with Reopen", () => {
+  const P = loadPage(META);
+  const items = meeting().items;
+  const d = data([meeting({ items: [{ ...items[0], review: { state: "rejected", at: 1 } }, items[1]] })]);
+  P.update(d);
+  let h = P.list();
+  assert.doesNotMatch(h, /Fix the &lt;img/, "a rejected proposal goes away, not greyed");
+  assert.match(h, /1 of 2 reviewed · 1 rejected/);
+  assert.match(h, /aria-valuenow="1"/);
+  assert.match(h, />show reviewed \(1\)</);
+  P.click({ showReviewed: P.meetingKey(SITE, "m1") });
+  h = P.list();
+  assert.match(h, /<ul class="mt-items mt-done"[^>]*><li class="mt-item rejected"/);
+  assert.match(h, /data-act="reopen" data-k="acme\.atlassian\.net\/m1\/p1">Reopen</);
+  assert.doesNotMatch(h.slice(h.indexOf("mt-done")), /data-act="approve"/, "a reviewed one is reopened, not re-approved");
+  assert.match(h, />hide reviewed</);
+});
+
+test("XERK-2857: Needs review / All / Archived filter the rail; a done meeting leaves Needs review", () => {
+  const P = loadPage(META);
+  const items = meeting().items;
+  const done = meeting({ meetingId: "m2", title: "All done", items: [{ ...items[1], review: { state: "logged", at: 1 } }] });
+  const arch = meeting({ meetingId: "m3", title: "Shelved", archivedAt: 1.7e12 + 5e6 });
+  P.update(data([meeting(), done, arch]));
+  const entries = () => (P.list().match(/data-entry="[^"]+"/g) || []).map((x) => decodeURIComponent(x.split("/").pop().slice(0, -1)));
+  assert.deepEqual(entries(), ["m:m1"]);
+  assert.match(P.list(), /data-filter="review" aria-pressed="true"/);
+  P.click({ filter: "all" });
+  assert.deepEqual(entries().sort(), ["m:m1", "m:m2"]);
+  assert.match(P.list(), /<span class="tri-note good" aria-label="all reviewed">✓</);
+  P.click({ filter: "archived" });
+  assert.deepEqual(entries(), ["m:m3"]);
+  assert.match(P.list(), />Unarchive</);
+  // An archived meeting's proposals count nowhere.
+  assert.equal(P.pendingCount(data([arch])), 0);
+  P.click({ filter: "bogus" });
+  assert.match(P.list(), /data-filter="archived" aria-pressed="true"/, "an unknown filter is ignored");
+});
+
+test("XERK-2857: the search matches meeting and proposal titles, case-blind, and echoes escaped", () => {
+  const P = loadPage(META);
+  P.update(two());
+  const typed = (v) => P.els.meetingList.listeners.input.forEach((fn) => fn({ target: { value: v, dataset: { search: "1" } } }));
+  typed("SHIP friday");
+  assert.match(P.list(), /data-entry="acme[^"]*"/);
+  assert.match(P.list(), /data-entry="globex[^"]*"/, "both meetings carry that proposal");
+  typed("globex");
+  assert.doesNotMatch(P.list(), /data-entry="acme/);
+  assert.doesNotMatch(P.list(), /data-org-toggle="acme/, "an org with no match is hidden while searching");
+  typed(`"><img src=x>`);
+  assert.doesNotMatch(P.list(), /<img/);
+  assert.match(P.list(), /value="&quot;&gt;&lt;img src=x&gt;"/);
+  assert.match(P.list(), /Nothing matches “&quot;&gt;&lt;img src=x&gt;”/);
+});
+
+test("XERK-2857: Archive posts {archived}, moves on to the next entry, and a refusal is shown in the hub's words", async () => {
+  let refuse = false;
+  const P = loadPage((u, init) => {
+    if (/\/archive$/.test(u)) {
+      if (refuse) return { status: 409, body: { error: "a meeting still being read can't be archived <yet>" } };
+      return { ok: true, meeting: meeting({ archivedAt: 1.7e12 + 9e6 }) };
+    }
+    return META(u);
+  });
+  const d = data([meeting(), meeting({ meetingId: "m2", title: "Second", startedAt: 1.7e12 - 1e6 })]);
+  P.update(d);
+  assert.equal(P.state().selected, P.entryKey(SITE, "m:m1"));
+  P.click({ archive: P.meetingKey(SITE, "m1"), to: "true" });
+  await P.settle();
+  const post = P.fetches.find((f) => /\/archive$/.test(f.url));
+  assert.equal(post.url, `/api/orgs/${encodeURIComponent(SITE)}/meetings/m1/archive`);
+  assert.deepEqual(post.body, { archived: true });
+  assert.equal(P.state().selected, P.entryKey(SITE, "m:m2"), "the next entry opens");
+  assert.doesNotMatch(P.list(), /data-entry="[^"]*m%3Am1"/);
+  // A busy button refuses a second press; a refusal stays inline and toasts.
+  refuse = true;
+  P.click({ archive: P.meetingKey(SITE, "m2"), to: "true" }, "true");
+  await P.settle();
+  assert.equal(P.fetches.filter((f) => /\/archive$/.test(f.url)).length, 1, "aria-disabled is the guard");
+  await P.archive(P.meetingKey(SITE, "m2"), true);
+  assert.deepEqual(P.toasts, ["Archiving the meeting failed — a meeting still being read can't be archived <yet>"]);
+  assert.match(P.list(), /class="mt-err">Archiving the meeting failed — a meeting still being read can&#39;t be archived &lt;yet&gt;/);
+  // Unarchive sends false.
+  refuse = false;
+  await P.archive(P.meetingKey(SITE, "m1"), false);
+  assert.deepEqual(P.fetches.filter((f) => /\/archive$/.test(f.url)).at(-1).body, { archived: false });
+});
+
+test("XERK-2857: Reopen posts the reopen action; a hub that lacks it answers in its own words", async () => {
+  const items = meeting().items;
+  const rejected = meeting({ items: [{ ...items[0], review: { state: "rejected", at: 1 } }, items[1]] });
+  const P = loadPage((u, init) => (init.method === "POST"
+    ? { status: 400, body: { error: "action must be approve or reject" } } : META(u)));
+  P.update(data([rejected]));
+  P.click({ showReviewed: P.meetingKey(SITE, "m1") });
+  P.click({ act: "reopen", k: P.itemKey(SITE, "m1", "p1") });
+  await P.settle();
+  const post = P.fetches.find((f) => f.method === "POST");
+  assert.equal(post.url, `/api/orgs/${encodeURIComponent(SITE)}/meetings/m1/items/p1`);
+  assert.deepEqual(post.body, { action: "reopen" });
+  assert.deepEqual(P.toasts, ["Reopening failed — action must be approve or reject"]);
+  assert.match(P.list(), /class="mt-err">Reopening failed/);
+});
+
+test("XERK-2857: the last proposal answered moves the selection on; a mid-click repaint never yanks it", async () => {
+  const items = meeting().items;
+  const answered = (m) => ({ ...m, items: m.items.map((it) => ({ ...it, review: { state: it.kind === "decision" ? "logged" : "rejected", at: 1 } })) });
+  const one = meeting({ items: [items[1]] });
+  const second = meeting({ meetingId: "m2", title: "Second", startedAt: 1.7e12 - 1e6 });
+  const P = loadPage((u, init) => (init.method === "POST" ? { ok: true, meeting: answered(one) } : META(u)));
+  P.update(data([one, second]));
+  // An SSE frame saying the selected meeting is done does not take it away.
+  P.update(data([answered(one), second]));
+  assert.equal(P.state().selected, P.entryKey(SITE, "m:m1"));
+  assert.match(P.list(), /data-entry="[^"]*m%3Am1"/);
+  P.update(data([one, second]));
+  await P.review(P.itemKey(SITE, "m1", "p2"), "approve");
+  assert.equal(P.state().selected, P.entryKey(SITE, "m:m2"));
+  assert.doesNotMatch(P.list(), /data-entry="[^"]*m%3Am1"/, "it dropped out of Needs review once the selection moved");
+});
+
+test("XERK-2857: keyboard triage — J/K move, A/R/E act on the current proposal, never while typing", async () => {
+  const P = loadPage((u, init) => (init.method === "POST" ? { ok: true } : META(u)));
+  P.update(data());
+  await P.settle();
+  const key = (k, target = { tagName: "BODY" }, extra = {}) => {
+    let prevented = false;
+    P.onKey({ key: k, target, preventDefault: () => { prevented = true; }, ...extra });
+    return prevented;
+  };
+  const k1 = P.itemKey(SITE, "m1", "p1"), k2 = P.itemKey(SITE, "m1", "p2");
+  assert.equal(key("j"), true);
+  assert.equal(P.state().curItem, k1);
+  assert.match(P.list(), /class="mt-item cur" data-item="acme\.atlassian\.net\/m1\/p1"/);
+  assert.match(P.list(), /Approve <kbd class="mt-kbd" aria-hidden="true">A<\/kbd>/);
+  key("j");
+  assert.equal(P.state().curItem, k2);
+  key("j");
+  assert.equal(P.state().curItem, k2, "J stops at the last");
+  key("k");
+  assert.equal(P.state().curItem, k1);
+  // Typing in a field, a contenteditable, with a modifier, or in a dialog: nothing.
+  for (const [t, extra] of [[{ tagName: "INPUT" }, {}], [{ tagName: "TEXTAREA" }, {}], [{ tagName: "SELECT" }, {}],
+    [{ tagName: "DIV", isContentEditable: true }, {}], [{ tagName: "BODY" }, { ctrlKey: true }], [{ tagName: "BODY" }, { metaKey: true }],
+    [{ tagName: "BUTTON", closest: () => ({}) }, {}]]) {
+    assert.equal(key("r", t, extra), false);
+  }
+  assert.equal(P.fetches.filter((f) => f.method === "POST").length, 0);
+  key("e");
+  assert.ok(P.edits.has(k1), "E opens the editor");
+  P.edits.delete(k1);
+  key("r");
+  await P.settle();
+  assert.deepEqual(P.fetches.filter((f) => f.method === "POST").map((f) => [f.url.split("/").pop(), f.body.action]), [["p1", "reject"]]);
+  // S on a decision does nothing (no session for a decision).
+  key("k"); key("j"); key("j");
+  const before = P.fetches.filter((f) => f.method === "POST").length;
+  P.state().curItem === k2 && key("s");
+  await P.settle();
+  assert.equal(P.fetches.filter((f) => f.method === "POST").length, before);
+  // The settings drawer open: no shortcuts.
+  P.openDrawer(SITE);
+  assert.equal(key("a"), false);
+});
+
+test("XERK-2857: every new string is escaped — org, entry title, settings drawer, unmapped-label banner", () => {
+  const evil = `<img src=x onerror=alert(1)>`;
+  const site = `x"><script>alert(1)</script>`;
+  const d = { agents: [{ org: site, jira: { siteKey: site, orgName: evil } }],
+    meetingProposals: { [site]: [meeting({ title: evil, platform: evil, participants: [evil] })] },
+    meetingLabels: { [site]: { label: "x", custom: true } }, meetingFocus: { [site]: { names: [evil], role: evil } },
+    meetingLabelMisses: { "mis-label": { at: 1 } } };
+  const P = loadPage(META);
+  P.update(d);
+  P.openDrawer(site);
+  const h = P.list();
+  assert.doesNotMatch(h, /<img|<script>/);
+  assert.match(h, /<span class="nm">&lt;img src=x onerror=alert\(1\)&gt;<\/span>/);
+  assert.match(h, /<span class="t">&lt;img/);
+  assert.match(h, /data-org-toggle="x&quot;&gt;&lt;script&gt;/);
+  assert.match(h, /aria-label="Meeting settings for &lt;img/);
+  assert.match(h, /<h2>&lt;img src=x onerror=alert\(1\)&gt; — meeting settings<\/h2>/);
+  assert.match(h, /<option value="x&quot;&gt;&lt;script&gt;alert\(1\)&lt;\/script&gt;">/);
+});
+
+test("XERK-2857: a phone shows one pane at a time — picking an entry opens it, Back returns to the rail", () => {
+  const P = loadPage(META);
+  P.update(two());
+  assert.match(P.list(), /<div class="tri">/);
+  P.click({ entry: P.entryKey(OTHER, "m:g1") });
+  assert.match(P.list(), /<div class="tri show-main">/);
+  assert.match(P.list(), /<h2 class="tri-title">Globex sync<\/h2>/);
+  P.click({ back: "1" });
+  assert.match(P.list(), /<div class="tri">/);
 });
