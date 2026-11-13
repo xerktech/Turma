@@ -299,6 +299,13 @@ paths:
   - Tests: the `XERK-813:` cases in `usage-ledger-store.test.js` (store-level seed round-trip, seed
     idempotence/no-lower, and `configure()` end-to-end seeding a retired + aged-out host so a fresh
     replica scans them).
+- **A re-key drops the old host only once the new key's write LANDED** (rollup XERK-2870):
+  `rekeyHost` settles on `persistKey(to)` — a write of `to` ITSELF — retried every 30s while `to`
+  is held, and only then forgets `from`. Never settle on a whole-store `flush`: the debounce may
+  already have drained and failed `to`, so the flush sees nothing dirty and reads success.
+  - `flushMigratedStores` fails the migration step while `rekeysSettled()` is non-zero, so the
+    marker never completes over history only memory holds. Tests: `XERK-2870:` in
+    `usage-ledger-store.test.js`.
 - Tests: `usage-ledger-store.test.js` drives the REAL `LedgerStore` against an in-memory fake `PgPool`
   that faithfully implements the emitted SQL (no live Postgres in CI, same constraint as
   `pgclient.test.js`): full-fidelity round-trip (repos + models + pre + sub-agent), the GREATEST

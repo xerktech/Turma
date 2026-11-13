@@ -174,6 +174,21 @@ test("XERK-2554: the tenant routes stay closed until the migration completes; op
   assert.equal((await request("GET", "/api/agents", { headers: breakGlass })).status, 200);
 });
 
+test("XERK-2870: a step is not recorded while a usage re-key has not reached Postgres", async () => {
+  const real = hub.usageLedger.rekeysSettled;
+  hub.usageLedger.rekeysSettled = async () => 1;
+  try {
+    const r = await hub.runTenantMigration();
+    assert.equal(r.state, "failed", JSON.stringify(r));
+    assert.match(r.error, /not yet written to Postgres/);
+    const m = hub.tenantMigrationMarker();
+    assert.ok(!m.completedAt, "the marker never completes over an unlanded re-key");
+    assert.equal(hub.tenantMigrationGateClosed(), true);
+  } finally {
+    hub.usageLedger.rekeysSettled = real;
+  }
+});
+
 test("XERK-2554: the migration moves every store into the owner's tenant; hosts keep their identity", async () => {
   const T = owner.tenantId;
   const tk = (k) => `${k}@${T}`;

@@ -1539,11 +1539,54 @@ function rekeyHost(from, to, opts = {}) {
   shortfallLoggedAt.delete(from);
   if (dst) enforceHostShare(to, entry);
   backend.onChange(to, true);
-  backend.flush(() => {
-    // Re-created meanwhile (the host beat under its old key): its own writes own it.
-    if (!Object.prototype.hasOwnProperty.call(hosts, from)) backend.onForget(from);
-  });
+  settleRekey(from, to, backend);
   return true;
+}
+
+// Drop `from`'s durable copy only once `to`'s write has LANDED (rollup XERK-2870):
+// the Postgres backend swallows a failed write, and forgetting `from` after one left
+// a restart with neither key. Settled on a write of `to` ITSELF (`persistKey`), retried
+// while `to` is still held; `from` is kept until then, so a restart reloads it and the
+// migration moves it again. `rekeysSettled` lets the migration wait on it.
+const REKEY_RETRY_MS = 30 * 1000;
+const rekeysPending = new Map(); // from -> the in-flight attempt (a Promise)
+function settleRekey(from, to, b) {
+  const attempt = new Promise((resolve) => {
+    const persist = typeof b.persistKey === "function" ? (k, cb) => b.persistKey(k, cb) : (_k, cb) => b.flush(cb);
+    persist(to, (err) => {
+      resolve();
+      // Superseded (a later re-key of the same host), the backend swapped, or `to`
+      // forgotten (an operator purge): stop, keeping whatever `from` holds.
+      if (rekeysPending.get(from) !== attempt) return;
+      if (backend !== b || !Object.prototype.hasOwnProperty.call(hosts, to)) { rekeysPending.delete(from); return; }
+      if (err) {
+        const t = setTimeout(() => { if (rekeysPending.get(from) === attempt) settleRekey(from, to, b); }, REKEY_RETRY_MS);
+        t.unref?.();
+        return;
+      }
+      rekeysPending.delete(from);
+      // Re-created meanwhile (the host beat under its old key): its own writes own it.
+      if (!Object.prototype.hasOwnProperty.call(hosts, from)) b.onForget(from);
+    });
+  });
+  rekeysPending.set(from, attempt);
+}
+
+/**
+ * Wait (at most `timeoutMs`) for every in-flight re-key write, then return how many
+ * re-keys have still not landed. The tenant migration refuses to record a step while
+ * this is non-zero, so its marker never completes over history only memory holds.
+ */
+async function rekeysSettled(timeoutMs = 10000) {
+  if (rekeysPending.size) {
+    let t;
+    await Promise.race([
+      Promise.all([...rekeysPending.values()]),
+      new Promise((r) => { t = setTimeout(r, timeoutMs); t.unref?.(); }),
+    ]);
+    clearTimeout(t);
+  }
+  return rekeysPending.size;
 }
 
 /** Whether anything is recorded for this host. */
@@ -1554,7 +1597,7 @@ function has(key) {
 load();
 
 module.exports = {
-  ingest, fold, retiredAgents, forget, purgeTenant, has, keys, rekeyHost, flush, configure, rehydrate, setHostAliases,
+  ingest, fold, retiredAgents, forget, purgeTenant, has, keys, rekeyHost, rekeysSettled, flush, configure, rehydrate, setHostAliases,
   LEDGER_FILE, LEDGER_MAX, LEDGER_DAYS, LEDGER_HOSTS, LEDGER_REPOS, RETIRED_MAX,
   LEDGER_MODELS, LEDGER_NAME_MAX, hostShare,
   SYSTEM_USAGE_REPO, isSystemUsageRepo, foldSystemRepos,
@@ -1564,6 +1607,7 @@ module.exports = {
     reset() {
       hosts = Object.create(null);
       shortfallLoggedAt.clear();
+      rekeysPending.clear();
       if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
       if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
       // Restore the default file backend so a test that swapped in the shared one

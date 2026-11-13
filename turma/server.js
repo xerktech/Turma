@@ -8528,6 +8528,10 @@ async function flushMigratedStores() {
   if (!HA_ON && typeof liveStore.flush === "function") liveStore.flush();
   await Promise.all([usageLedger, permissionLedger, outcomeLedger].map((l) =>
     new Promise((resolve) => { try { l.flush(() => resolve()); } catch { resolve(); } })));
+  // A usage re-key whose new key has not landed in Postgres keeps the old host's rows
+  // (rollup XERK-2870): fail the step so the marker never completes over it.
+  const unsettled = await usageLedger.rekeysSettled();
+  if (unsettled) throw new Error(`${unsettled} usage-ledger re-key(s) not yet written to Postgres`);
 }
 // A refusal or failure the tick retries every 15s is logged when it changes, and
 // at most hourly while it holds.
