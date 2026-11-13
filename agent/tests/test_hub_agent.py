@@ -42969,6 +42969,156 @@ class TestJiraCreateMeta(unittest.TestCase):
             self.assertEqual(ha.jira_create_meta()["labels"], [])
 
 
+class TestCreateMetaPaging(unittest.TestCase):
+    """XERK-2874: an org with more than one page of projects lists them all."""
+
+    def test_jira_projects_page_past_the_first_100(self):
+        allp = [{"key": f"P{i:03d}", "name": f"Proj {i:03d}"} for i in range(250)]
+        calls = []
+
+        def fg(path, params):
+            if "project/search" in path:
+                calls.append(dict(params))
+                s, n = params["startAt"], params["maxResults"]
+                page = allp[s:s + n]
+                return {"values": page, "isLast": s + n >= len(allp)}
+            return {"values": []}
+
+        with mock.patch.object(ha, "jira_get", fg):
+            m = ha.jira_create_meta()
+        self.assertEqual([p["key"] for p in m["projects"]], [p["key"] for p in allp])
+        self.assertEqual([c["startAt"] for c in calls], [0, 100, 200])
+
+    def test_jira_projects_are_bounded(self):
+        def fg(path, params):
+            if "project/search" in path:
+                s = params["startAt"]
+                return {"values": [{"key": f"K{s + i}"} for i in range(params["maxResults"])],
+                        "isLast": False}
+            return {"values": []}
+
+        with mock.patch.object(ha, "jira_get", fg):
+            m = ha.jira_create_meta()
+        self.assertEqual(len(m["projects"]), ha.CREATE_META_MAX_PROJECTS)
+
+    def test_a_page_of_keyless_entries_never_loops(self):
+        calls = []
+
+        def fg(path, params):
+            if "project/search" in path:
+                calls.append(1)
+                return {"values": [{"name": "x"}] * 100, "isLast": False}
+            return {"values": []}
+
+        with mock.patch.object(ha, "jira_get", fg):
+            m = ha.jira_create_meta()
+        self.assertEqual(m["projects"], [])
+        self.assertEqual(len(calls), ha.CREATE_META_MAX_PROJECTS // ha.CREATE_META_PROJECT_PAGE)
+
+    def test_a_server_ignoring_the_offset_yields_one_copy(self):
+        page = [{"key": f"P{i}", "name": f"P{i}"} for i in range(100)]
+
+        def fg(path, params):
+            if "project/search" in path:
+                return {"values": page, "isLast": False}
+            return {"values": []}
+
+        with mock.patch.object(ha, "jira_get", fg):
+            m = ha.jira_create_meta()
+        self.assertEqual(len(m["projects"]), 100)
+
+    def test_paging_stops_when_its_budget_is_spent(self):
+        calls = []
+
+        def fg(path, params):
+            if "project/search" in path:
+                calls.append(1)
+                s = params["startAt"]
+                return {"values": [{"key": f"K{s + i}"} for i in range(100)],
+                        "isLast": False}
+            return {"values": []}
+
+        with mock.patch.object(ha, "jira_get", fg), \
+             mock.patch.object(ha, "CREATE_META_PAGES_BUDGET_SEC", 0.0):
+            m = ha.jira_create_meta()
+        self.assertEqual(len(calls), 1)  # the first page always runs
+        self.assertEqual(len(m["projects"]), 100)
+
+    def test_a_later_page_failing_keeps_the_pages_read(self):
+        def fg(path, params):
+            if "project/search" in path:
+                s = params["startAt"]
+                if s >= 200:
+                    raise OSError("timed out")
+                return {"values": [{"key": f"K{s + i:03d}"} for i in range(100)],
+                        "isLast": False}
+            return {"values": []}
+
+        with mock.patch.object(ha, "jira_get", fg):
+            m = ha.jira_create_meta()
+        self.assertEqual(len(m["projects"]), 200)
+
+    def test_a_first_page_failure_still_raises(self):
+        def fg(path, params):
+            raise OSError("timed out")
+
+        with mock.patch.object(ha, "jira_get", fg):
+            with self.assertRaises(OSError):
+                ha.jira_create_meta()
+
+    def test_a_non_string_key_is_dropped(self):
+        def fg(path, params):
+            if "project/search" in path:
+                return {"values": [{"key": ["x"]}, {"key": "OK", "name": "Ok"},
+                                   {"key": "B", "name": 5}],
+                        "isLast": True}
+            return {"values": []}
+
+        with mock.patch.object(ha, "jira_get", fg):
+            m = ha.jira_create_meta()
+        self.assertEqual(m["projects"], [{"key": "B", "name": "B"},
+                                         {"key": "OK", "name": "Ok"}])
+
+    def test_a_non_string_azure_name_is_dropped(self):
+        def req(path, params, body=None):
+            if path == "/_apis/projects":
+                return {"value": [{"name": ["x"]}, {"name": {"n": 1}}, {"name": 3},
+                                  {"name": "Real"}]}
+            return {"value": []}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "azure_req", req):
+            m = ha.azure_create_meta()
+        self.assertEqual(m["projects"], [{"key": "Real", "name": "Real"}])
+
+    def test_azure_projects_are_sorted_by_name(self):
+        def req(path, params, body=None):
+            if path == "/_apis/projects":
+                return {"value": [{"name": "zeta"}, {"name": "Alpha"}, {"name": "mid"}]}
+            return {"value": []}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "azure_req", req):
+            m = ha.azure_create_meta()
+        self.assertEqual([p["name"] for p in m["projects"]], ["Alpha", "mid", "zeta"])
+
+    def test_azure_projects_page_past_the_first_100(self):
+        allp = [{"name": f"Proj {i:03d}"} for i in range(230)]
+        skips = []
+
+        def req(path, params, body=None):
+            if path == "/_apis/projects":
+                skips.append(params["$skip"])
+                return {"value": allp[params["$skip"]:params["$skip"] + params["$top"]]}
+            return {"value": []}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "azure_req", req):
+            m = ha.azure_create_meta()
+        self.assertEqual(len(m["projects"]), 230)
+        self.assertEqual(skips, [0, 100, 200])
+
+
 class TestJiraIssueTypes(unittest.TestCase):
     def test_excludes_subtasks_and_idless(self):
         def fg(path, params):
