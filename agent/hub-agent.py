@@ -27038,6 +27038,38 @@ JIRA_DUPLICATE_LINK_TYPE = "Duplicate"
 # no-op) apart from "never linked" (link it). A blocker can block MANY issues,
 # so the key encodes the ordered pair, not just the source issue.
 BLOCKS_LINK_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-blocks-links.json")
+# Tracker CREATES this host has started or finished, by the hub's cmdId
+# (XERK-2867): {cmdId: {"at": epoch, "row"?: staged result}}. Command de-dup
+# (`self.acked`) lives only in memory, so a manager restart between running a
+# create and the beat that acks it (an update, a rename, a crash) made the hub's
+# at-least-once re-delivery create a SECOND ticket. A re-delivered cmdId found
+# here re-stages the stored answer instead; one marked started with no answer
+# (the restart cut the tracker call short) answers "may have been created".
+CREATED_CMDS_PATH = os.path.join(REGISTRY_DIR, "created-commands.json")
+CREATED_CMDS_MAX = 500
+CREATE_MAYBE_RAN_ERROR = ("this host restarted while creating the ticket — it may "
+                          "have been created, so check the board before making it again")
+
+
+def _created_cmd_row(cid, row):
+    """A stored create answer re-shaped to plain scalars for `cid`, or None
+    (XERK-2867). The file is session-writable: never re-send what it holds as-is
+    (a nested value would also make the next save raise), and never under
+    another cmdId."""
+    if not isinstance(row, dict):
+        return None
+    out = {"cmdId": cid}
+    for k, cap in (("key", 100), ("url", 2000), ("error", 300),
+                   ("warning", 500), ("epicKey", 50)):
+        if k not in row:
+            continue
+        v = row[k]
+        if v is not None and not isinstance(v, str):
+            return None
+        out[k] = v[:cap] if isinstance(v, str) else None
+    if row.get("maybeCreated") is True:
+        out["maybeCreated"] = True
+    return out
 BLOCKS_LINK_LEDGER_MAX = 500
 # The Jira issue-link type name a dependency link uses (XERK-634's collector
 # reads the same canonical name). Must exist in the org's link types, else
@@ -28762,6 +28794,8 @@ class SessionManager:
         # staged-in-the-same-handle_commands-call lifecycle as
         # create_ticket_results.
         self.epic_child_results = []
+        # Durable record of tracker creates by cmdId (XERK-2867, CREATED_CMDS_PATH).
+        self.created_cmds = self._load_created_cmds()
         # Epic Builder runs this host is driving (XERK-724), keyed by the hub's
         # builderId: {id, siteKey, title, idea, repo, state, sessionId,
         # worktreePath, planFile, plan, project, epicKey, error, materializing,
@@ -29242,6 +29276,62 @@ class SessionManager:
         self.duplicate_links.pop(lkey, None)
         self.duplicate_links[lkey] = twin
         self._save_duplicate_links()
+
+    def _load_created_cmds(self):
+        """Read CREATED_CMDS_PATH (XERK-2867). Session-writable like every
+        ~/.turma file, so read through the hardened reader and re-shaped: a junk
+        entry is dropped, never trusted as a stored answer."""
+        data = _read_untrusted_json(CREATED_CMDS_PATH, 4 * 1024 * 1024)
+        out = {}
+        if isinstance(data, dict):
+            for cid, e in data.items():
+                if not isinstance(cid, str) or not cid or len(cid) > 200:
+                    continue
+                if not isinstance(e, dict):
+                    continue
+                at = e.get("at")
+                out[cid] = {"at": at if isinstance(at, (int, float))
+                            and not isinstance(at, bool) else 0}
+                row = _created_cmd_row(cid, e.get("row"))
+                if row is not None:
+                    out[cid]["row"] = row
+        return out
+
+    def _save_created_cmds(self):
+        """Persist the create record (XERK-2867). Oldest entries drop at the cap;
+        a lost entry only reopens the restart window this exists to close."""
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            while len(self.created_cmds) > CREATED_CMDS_MAX:
+                self.created_cmds.pop(next(iter(self.created_cmds)))
+            tmp = CREATED_CMDS_PATH + ".tmp"
+            with _open_tmp_for_replace(tmp) as f:
+                json.dump(self.created_cmds, f)
+            os.replace(tmp, CREATED_CMDS_PATH)
+        except (OSError, ValueError, TypeError, RecursionError) as e:
+            log(f"created-commands ledger save failed: {e}")
+
+    def _create_once(self, cid, results, do_create, maybe_row):
+        """Run a tracker create AT MOST ONCE per cmdId across manager restarts
+        (XERK-2867). `do_create()` returns the staged result row. A cmdId seen
+        before re-stages its stored row, or `maybe_row` when the earlier run was
+        cut short before it answered; the tracker is not called again."""
+        if not cid:
+            results.append(do_create())
+            return
+        prior = self.created_cmds.get(cid)
+        if prior is not None:
+            row = _created_cmd_row(cid, prior.get("row"))
+            results.append(row if row is not None else maybe_row)
+            log(f"create {cid} was already run on this host; re-sending its answer")
+            return
+        self.created_cmds[cid] = {"at": time.time()}
+        self._save_created_cmds()
+        row = do_create()
+        results.append(row)
+        self.created_cmds.pop(cid, None)
+        self.created_cmds[cid] = {"at": time.time(), "row": row}
+        self._save_created_cmds()
 
     def _load_blocks_links(self):
         try:
@@ -41044,18 +41134,23 @@ class SessionManager:
             return fail("a project is required")
         if not issue_type:
             return fail("an issue type is required")
-        try:
-            created = create_board_issue(project, issue_type, summary,
-                                         description, labels)
-            self.create_ticket_results.append(
-                {"cmdId": cid, "key": created.get("key"),
-                 "url": created.get("url"), "error": None,
-                 "warning": None if created.get("assigned")
-                            else unassigned_warning(created)})
-            log(f"created ticket {created.get('key')} in {project}")
-        except Exception as e:
-            log(f"ticket creation failed in {project}: {e}")
-            fail(str(e)[:300])
+        def do_create():
+            try:
+                created = create_board_issue(project, issue_type, summary,
+                                             description, labels)
+                log(f"created ticket {created.get('key')} in {project}")
+                return {"cmdId": cid, "key": created.get("key"),
+                        "url": created.get("url"), "error": None,
+                        "warning": None if created.get("assigned")
+                                   else unassigned_warning(created)}
+            except Exception as e:
+                log(f"ticket creation failed in {project}: {e}")
+                return {"cmdId": cid, "key": None, "url": None,
+                        "error": str(e)[:300]}
+
+        self._create_once(cid, self.create_ticket_results, do_create,
+                          {"cmdId": cid, "key": None, "url": None,
+                           "error": CREATE_MAYBE_RAN_ERROR, "maybeCreated": True})
 
     def _stage_create_epic_child(self, cmd):
         """Handle a {type:"createEpicChild"} command (XERK-723): create a child
@@ -41107,19 +41202,27 @@ class SessionManager:
             return fail("a project is required")
         if not issue_type:
             return fail("an issue type is required")
-        try:
-            created = create_jira_issue(project, issue_type, summary,
-                                        description, labels, parent=epic_key)
-            self.epic_child_results.append(
-                {"cmdId": cid, "key": created.get("key"),
-                 "url": created.get("url"), "epicKey": epic_key[:50],
-                 "error": None,
-                 "warning": None if created.get("assigned")
-                            else unassigned_warning(created)})
-            log(f"created epic child {created.get('key')} under {epic_key}")
-        except Exception as e:
-            log(f"epic child creation failed under {epic_key}: {e}")
-            fail(str(e)[:300])
+        def do_create():
+            try:
+                created = create_jira_issue(project, issue_type, summary,
+                                            description, labels, parent=epic_key)
+                log(f"created epic child {created.get('key')} under {epic_key}")
+                return {"cmdId": cid, "key": created.get("key"),
+                        "url": created.get("url"), "epicKey": epic_key[:50],
+                        "error": None,
+                        "warning": None if created.get("assigned")
+                                   else unassigned_warning(created)}
+            except Exception as e:
+                log(f"epic child creation failed under {epic_key}: {e}")
+                return {"cmdId": cid, "key": None, "url": None,
+                        "epicKey": epic_key[:50], "error": str(e)[:300],
+                        "warning": None}
+
+        self._create_once(cid, self.epic_child_results, do_create,
+                          {"cmdId": cid, "key": None, "url": None,
+                           "epicKey": epic_key[:50],
+                           "error": CREATE_MAYBE_RAN_ERROR, "warning": None,
+                           "maybeCreated": True})
 
     # --- durable archive sync ---------------------------------------------
     # Ship every INACTIVE session's transcript to the hub so history is durable
