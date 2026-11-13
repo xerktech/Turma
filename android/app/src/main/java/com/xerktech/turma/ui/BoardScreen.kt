@@ -691,7 +691,9 @@ private fun KanbanColumn(
             HorizontalDivider(Modifier.padding(top = 4.dp), thickness = 1.dp, color = MaterialTheme.colorScheme.outlineVariant)
         }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            items(cards, key = { it.second.key }) { (site, t) ->
+            // Keyed by org + issue key: two orgs can carry the same key (a shared
+            // Jira project key, ADO numeric ids), and a duplicate LazyColumn key crashes.
+            items(cards, key = { BoardViewModel.startKey(it.first.siteKey, it.second.key) }) { (site, t) ->
                 val moveKey = BoardViewModel.startKey(site.siteKey, t.key)
                 // The epic-run view for an epic card (XERK-638): its armed run off
                 // the payload, resolved to live wave/child progress against this
