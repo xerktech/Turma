@@ -22657,6 +22657,9 @@ JIRA_REFRESH_EVERY = _env_int("TURMA_JIRA_REFRESH_EVERY", 30)  # beats between p
 # because only it sees the whole fleet and can spread the org's sessions across
 # ALL its agents.
 JIRA_TIMEOUT_SEC = 15
+# Whole-body bound on a tracker JSON read (XERK-2880): the socket timeout is
+# per read, so a dripping server could otherwise hold the caller forever.
+BOARD_READ_DEADLINE_SEC = _env_int("TURMA_BOARD_READ_DEADLINE_SEC", 60, minimum=1)
 JIRA_PAGE_SIZE = 100    # /search/jql hard-caps maxResults at 100
 JIRA_MAX_ACTIVE = 150   # not-Done tickets reported (bounds the heartbeat)
 JIRA_MAX_DONE = 50      # recently-Done tickets reported
@@ -22824,14 +22827,36 @@ class BoardHttpError(RuntimeError):
         self.code = code
 
 
+def _read_body_by(resp, deadline):
+    """Read a whole reply body, but give up at `deadline` (monotonic). The
+    socket timeout bounds each READ only, so a server dripping a byte every few
+    seconds never trips it (XERK-2880 QA: a create-meta worker hung forever,
+    and the hub then read the silent agent as too old to implement it)."""
+    read1 = getattr(resp, "read1", None)
+    if read1 is None:
+        return resp.read()
+    chunks = []
+    while True:
+        chunk = read1(65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"tracker reply still arriving after {BOARD_READ_DEADLINE_SEC}s")
+
+
 def _board_urlopen(req):
     """Send one prepared tracker request and parse its JSON reply ({} when the
     body is empty — a Jira transition answers 204). An HTTP error is re-raised
     carrying the server's own explanation; everything else (DNS, TLS, timeout)
-    propagates untouched, since urllib already stringifies those usefully."""
+    propagates untouched, since urllib already stringifies those usefully. The
+    body read is bounded in TOTAL time (`BOARD_READ_DEADLINE_SEC`), not just per
+    read."""
+    deadline = time.monotonic() + BOARD_READ_DEADLINE_SEC
     try:
         with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
-            raw = resp.read().decode()
+            raw = _read_body_by(resp, deadline).decode()
     except urllib.error.HTTPError as e:
         raise BoardHttpError(_http_error_detail(e), getattr(e, "code", None)) from e
     return json.loads(raw) if raw.strip() else {}
@@ -41105,6 +41130,9 @@ class SessionManager:
     def _append_create_meta(self, row):
         with self._create_meta_lock:
             self.create_meta_results.append(row)
+        # Beat now, so the waiting form gets it without sitting out INTERVAL
+        # (inline, the result rode the beat that ran the command).
+        _poke.set()
 
     def _stage_create_meta(self, project):
         """Fetch and stage a {type:"boardCreateMeta"} answer (on the worker; see

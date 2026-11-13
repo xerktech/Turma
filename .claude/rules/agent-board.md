@@ -118,7 +118,10 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   page-through + label read + type read can pass the inline allowance (`contract-agent-hub.md`).
   `handle_commands` only starts the worker; a repeat for a project already in flight is dropped.
   Results append under `_create_meta_lock` and are cleared by identity, like `merge_pr_results`.
-  The hub waits for the late result (`ASYNC_RESULT_KINDS`). Tests: `TestStageCreateMeta`.
+  The hub waits for the late result (`ASYNC_RESULT_KINDS`), and the worker pokes the beat.
+  - **Every tracker JSON body read is bounded in TOTAL** (`_board_urlopen`,
+    `BOARD_READ_DEADLINE_SEC`): a dripping server beat the per-read timeout, the worker never
+    answered, and after 5 min the hub labelled a current agent "too old". Tests: `TestStageCreateMeta`.
 - `set_board_status` **re-reads the available options and applies only a `value` still on offer** —
   the board's workflow decides what a ticket can move to, not the browser.
 - A drag-and-drop move POSTs the target **COLUMN**, not a transition: `_status_option_for_column`

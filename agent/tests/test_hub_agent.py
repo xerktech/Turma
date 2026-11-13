@@ -43618,6 +43618,21 @@ class TestStageCreateMeta(ManagerMixin, unittest.TestCase):
         self.assertIn("could not start", r["error"])
         self.assertEqual(sm._create_meta_inflight, set())
 
+    def test_a_dripping_tracker_reply_is_cut_at_the_deadline(self):
+        class Drip:
+            def read1(self, n):
+                return b"x"
+        # Every read returns a byte (the socket timeout never trips); a deadline
+        # already passed must still end it.
+        with self.assertRaises(TimeoutError):
+            ha._read_body_by(Drip(), ha.time.monotonic() - 1)
+
+    def test_a_normal_reply_is_read_whole(self):
+        import io
+        body = io.BufferedReader(io.BytesIO(b'{"a": 1}' * 20000))
+        self.assertEqual(ha._read_body_by(body, ha.time.monotonic() + 60),
+                         b'{"a": 1}' * 20000)
+
     def test_a_result_appended_mid_beat_survives_the_clear(self):
         sm = self.make_manager()
         sent = {"project": None, "error": None}
