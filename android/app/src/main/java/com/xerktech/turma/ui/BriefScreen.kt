@@ -44,6 +44,7 @@ import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -151,20 +152,16 @@ fun BriefScreen(
     var selected by rememberSaveable { mutableStateOf("") }
     var settingsFor by rememberSaveable { mutableStateOf("") }
 
-    LaunchedEffect(openSite) {
-        val s = openSite ?: return@LaunchedEffect
-        filter = TriageFilter.REVIEW
-        selected = ""
-        settingsFor = ""
-        if (s in collapsed) meetingsVm.toggleCollapsed(s)
-        onOpened()
-    }
-
     val sites = remember(fleet.agents) { mergeSites(fleet.agents) }
     val names = remember(sites) { sites.associate { it.siteKey to it.orgName } }
     val scoped = remember(stored, sites) { effectiveOrgs(stored, sites) }
     val now = remember(fleet) { System.currentTimeMillis() }
-    val orgs = remember(fleet, scoped, sites) { triageOrgs(fleet, scoped, sites.map { it.siteKey }) }
+    // Ordered by org name, then site key, as the web's rail is (localeCompare).
+    val orgs = remember(fleet, scoped, sites, names) {
+        val byName = java.text.Collator.getInstance()
+        triageOrgs(fleet, scoped, sites.map { it.siteKey })
+            .sortedWith(compareBy(byName) { s: String -> orgName(s, names[s].orEmpty()) }.thenBy { it })
+    }
     val entries = remember(fleet, orgs, now) {
         orgs.associateWith { s ->
             triageEntries(s, fleet.meetingProposals[s].orEmpty(), fleet.dailyBriefs[s].orEmpty(),
@@ -173,18 +170,39 @@ fun BriefScreen(
     }
 
     // Wide (tablet / unfolded): the list and the open entry side by side, as the
-    // web's rail + main pane. With nothing picked, the first entry the list shows
-    // is open (the web's pickSelected → flat[0]); a picked entry that left the
-    // list falls back the same way rather than to an empty pane.
+    // web's rail + main pane, so the open entry must always be one the list shows
+    // (the web's buildView/pickSelected): the pick while it is listed (Needs review
+    // keeps it after its last answer), else the first entry shown, which then
+    // becomes the pick — so an entry archived or searched away is never left open
+    // beside a list that no longer has it, and never jumps back when it returns.
     val zone = ZoneId.systemDefault()
-    val firstShown = if (!wide) null else orgs.asSequence()
-        .filter { it !in collapsed }
-        .flatMap { s -> triageBuckets(entries[s].orEmpty(), filter, query, now, zone).flatMap { it.second } }
-        .firstOrNull()
+    fun shown(sel: TriageEntry?, skipCollapsed: Boolean) = orgs.asSequence()
+        .filter { !skipCollapsed || it !in collapsed }
+        .flatMap { s -> triageBuckets(entries[s].orEmpty(), filter, query, now, zone, sel).flatMap { it.second } }
     val pickedSite = selected.substringBefore('\u0000')
     val pickedKey = selected.substringAfter('\u0000')
     val picked = if (selected.isEmpty()) null else entries[pickedSite]?.firstOrNull { it.key == pickedKey }
-    val open = picked ?: firstShown
+    val open = when {
+        !wide -> picked
+        picked != null && shown(picked, false).any { it === picked } -> picked
+        else -> shown(null, true).firstOrNull()
+    }
+    val openKey = open?.let { "${it.siteKey}\u0000${it.key}" }.orEmpty()
+    if (wide && selected.isNotEmpty() && openKey != selected) {
+        LaunchedEffect(selected, openKey) { selected = openKey }
+    }
+
+    // A meetings push opens Brief on Needs review with that org unfolded; wide
+    // also opens that org's first entry (the narrow list just shows it).
+    LaunchedEffect(openSite) {
+        val s = openSite ?: return@LaunchedEffect
+        filter = TriageFilter.REVIEW
+        settingsFor = ""
+        if (s in collapsed) meetingsVm.toggleCollapsed(s)
+        selected = if (!wide) "" else triageBuckets(entries[s].orEmpty(), TriageFilter.REVIEW, query, now, zone)
+            .flatMap { it.second }.firstOrNull()?.let { "${it.siteKey}\u0000${it.key}" }.orEmpty()
+        onOpened()
+    }
 
     // Back closes settings, then (narrow only — wide has no full-screen entry) the entry.
     BackHandler(enabled = settingsFor.isNotEmpty() || (!wide && selected.isNotEmpty())) {
@@ -210,20 +228,21 @@ fun BriefScreen(
                     triageBuckets(entries[s].orEmpty(), TriageFilter.ALL, "", now, zone)
                         .flatMap { it.second }
                 }
-                EntryDetail(
+                // key(): a new entry opens at its top, not at the last one's scroll.
+                key(open.siteKey, open.key) { EntryDetail(
                     m, open, orgName(site, names[site].orEmpty()), now, fleet,
                     vm, meetingsVm,
                     next = triageNext(ordered, open),
                     onOpen = { n -> selected = "${n.siteKey}\u0000${n.key}" },
                     onBack = if (wide) null else ({ selected = "" }),
-                )
+                ) }
             }
         }
     }
     val list: @Composable (Modifier) -> Unit = { m ->
         TriageList(
             m, fleet, orgs, names, entries, collapsed, filter, query, now,
-            selected = if (wide && settingsFor.isEmpty()) open else null,
+            selected = if (wide) open else null,
             onFilter = { filter = it }, onQuery = { query = it },
             onToggle = meetingsVm::toggleCollapsed,
             onOpen = { e -> selected = "${e.siteKey}\u0000${e.key}"; settingsFor = "" },
@@ -340,7 +359,7 @@ private fun TriageList(
             }
             // A search lists only the orgs it hits, as the web's rail does.
             val searching = query.isNotBlank()
-            val bucketsOf = orgs.associateWith { triageBuckets(entries[it].orEmpty(), filter, query, now, zone) }
+            val bucketsOf = orgs.associateWith { triageBuckets(entries[it].orEmpty(), filter, query, now, zone, selected) }
             val shownOrgs = if (searching) orgs.filter { bucketsOf[it].orEmpty().isNotEmpty() } else orgs
             if (searching && shownOrgs.isEmpty() && orgs.isNotEmpty()) {
                 item(key = "nomatch") {

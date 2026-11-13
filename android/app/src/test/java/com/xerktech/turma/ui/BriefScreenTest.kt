@@ -1,10 +1,14 @@
 package com.xerktech.turma.ui
 
 import androidx.activity.ComponentActivity
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isSelected
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -129,6 +133,88 @@ class BriefScreenTest {
         compose.onNodeWithText("Run now").assertDoesNotExist()
         compose.onNodeWithText("Daily meeting").assertExists()
         compose.onNodeWithText("Search meetings and proposals").assertExists()
+    }
+
+    private fun hostOf(key: String, site: String, name: String = "") = """{ "key": "$key", "device": "$key",
+        "online": true, "lastSeen": 1, "jira": { "available": true, "siteKey": "$site", "site": "$site",
+        "orgName": "$name", "tickets": [] } }"""
+
+    private fun meeting(id: String, title: String, review: String = "", archived: Boolean = false) =
+        """{ "meetingId": "$id", "status": "ok", "title": "$title", "startedAt": $yday, "archivedAt": ${if (archived) 5 else 0},
+            "items": [ { "id": "p1", "kind": "task", "title": "Item of $title" $review } ] }"""
+
+    private val wideOpen = hasText("Design review", substring = true) and isSelected()
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide marks the open entry and keeps it listed once its last proposal is answered`() {
+        seed(meetings = meeting("m1", "Design review"))
+        show(wide = true)
+        compose.onNode(hasText("Daily meeting") and isSelected()).assertExists()
+        open("Design review")
+        compose.onNode(wideOpen).assertExists()
+        // Its last proposal answered: Needs review would drop it, but not from under the pointer.
+        seed(meetings = meeting("m1", "Design review", review = """, "review": { "state": "rejected", "at": 5 }"""))
+        compose.waitForIdle()
+        compose.onNode(wideOpen).assertExists()
+        compose.onNodeWithText("Item of Design review").assertDoesNotExist()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide moves off an entry archived away and does not jump back when it returns`() {
+        seed(meetings = meeting("m1", "Design review"))
+        show(wide = true)
+        open("Design review")
+        compose.onNodeWithText("Item of Design review").assertExists()
+        seed(meetings = meeting("m1", "Design review", archived = true))
+        compose.waitForIdle()
+        compose.onNodeWithText("Run now").assertExists()
+        compose.onNodeWithText("Item of Design review").assertDoesNotExist()
+        seed(meetings = meeting("m1", "Design review"))
+        compose.waitForIdle()
+        compose.onNodeWithText("Run now").assertExists()
+        compose.onNode(hasText("Daily meeting") and isSelected()).assertExists()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide skips a collapsed org's entries`() {
+        seed()
+        show(wide = true)
+        compose.onNodeWithText("Run now").assertExists()
+        compose.onNodeWithContentDescription("Collapse o").performClick()
+        compose.onNodeWithText("Run now").assertDoesNotExist()
+        compose.onNodeWithText(
+            "Nothing needs review. When Tenir sends a meeting, its proposed work items show up here.").assertExists()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide orders orgs by name and a meetings push opens the pushed org's entry`() {
+        // "Zed" sorts first by site key, "Alpha" first by name: the web's rail goes by name.
+        hub.seedFleet("""
+            { "now": 1, "agents": [ ${hostOf("h1", "a.atlassian.net", "Zed")}, ${hostOf("h2", "b.atlassian.net", "Alpha")} ],
+              "meetingProposals": { "a.atlassian.net": [ ${meeting("m1", "Zed sync")} ],
+                                    "b.atlassian.net": [ ${meeting("m2", "Alpha sync")} ] } }
+        """.trimIndent())
+        var push by mutableStateOf<String?>(null)
+        val vm = main.track(BriefViewModel(hub.app))
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = true, openSite = push, onOpened = { push = null }) }
+        compose.onNodeWithText("Item of Alpha sync").assertExists()
+        push = "a.atlassian.net"
+        compose.waitForIdle()
+        compose.onNodeWithText("Item of Zed sync").assertExists()
+        compose.onNode(hasText("Zed sync", substring = true) and isSelected()).assertExists()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide system Back closes an org's settings`() {
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [] }""")
+        seed()
+        show(wide = true)
+        compose.onNodeWithContentDescription("o settings").performClick()
+        compose.onNodeWithText("o · settings").assertExists()
+        compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
+        compose.onNodeWithText("o · settings").assertDoesNotExist()
+        compose.onNodeWithText("Run now").assertExists()
     }
 
     @Test fun `narrow still shows one pane at a time`() {

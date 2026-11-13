@@ -131,11 +131,14 @@ fun triageEntries(
  * titles). Needs review lists what waits on the operator, a meeting still
  * being read, and the org's current daily entry (where Run now lives).
  */
-fun triageShows(e: TriageEntry, filter: TriageFilter, query: String): Boolean {
+fun triageShows(e: TriageEntry, filter: TriageFilter, query: String, sel: TriageEntry? = null): Boolean {
     val inFilter = when (filter) {
         TriageFilter.ARCHIVED -> e.archived
         TriageFilter.ALL -> !e.archived
-        TriageFilter.REVIEW -> !e.archived && (e.pending > 0 || e.inflight || e.current)
+        // Needs review keeps the selected entry (the web's `e.key === sel`): one
+        // whose last proposal was just answered never vanishes from under the pointer.
+        TriageFilter.REVIEW -> !e.archived && (e.pending > 0 || e.inflight || e.current ||
+            (sel != null && e.siteKey == sel.siteKey && e.key == sel.key))
     }
     if (!inFilter) return false
     val q = query.trim()
@@ -170,8 +173,9 @@ fun triageBuckets(
     query: String,
     now: Long,
     zone: ZoneId,
+    sel: TriageEntry? = null,
 ): List<Pair<TriageBucket, List<TriageEntry>>> =
-    entries.filter { triageShows(it, filter, query) }
+    entries.filter { triageShows(it, filter, query, sel) }
         .groupBy { triageBucket(it.at, now, zone) }
         .toSortedMap(compareBy { it.ordinal })
         .map { (b, l) ->
