@@ -8523,7 +8523,8 @@ function hostMergePlan() {
   let pending = 0;
   for (const [oldName, newName] of usageLedger.STATIC_HOST_ALIASES) {
     for (const from of named(oldName)) {
-      if (livesAt(from)) continue;
+      // Still running as the old name: not history yet, so keep checking (QA).
+      if (livesAt(from)) { pending++; continue; }
       const tFrom = tenantOfKey(from);
       // These are the operators' machines: their names in another tenant are not them.
       if (tFrom && tFrom !== migratedTenant()) continue;

@@ -1324,21 +1324,20 @@ let hostAliasRoots = new Map();
 // same transcript store): the members of one INSTALL, merged by high-water. The
 // static renames join different installs, which `mergeEntries` sums.
 let installRoots = new Map();
-// The static renames by bare name, applied inside ANY tenant: those machines were
-// bound into a tenant by the pre-tenancy migration (XERK-2554), so their keys
-// carry `@<tenant>` and a plain-name lookup alone missed them.
-const staticAliasRoots = new Map();
-for (const [a, b] of STATIC_HOST_ALIASES) {
-  const [lo, hi] = [a.toLowerCase(), b.toLowerCase()].sort();
-  staticAliasRoots.set(hi, lo);
-}
 // The tenants the static renames apply in besides the untenanted world: the one
 // the pre-tenancy deployment migrated into (server.js `migratedTenant`). Another
 // tenant's hosts that merely share those names are not those machines.
 let staticAliasTenants = new Set();
 function setHostAliases(pairs, staticTenants = []) {
   staticAliasTenants = new Set((Array.isArray(staticTenants) ? staticTenants : []).filter((t) => typeof t === "string" && t));
-  hostAliasRoots = aliasRoots([...STATIC_HOST_ALIASES, ...(Array.isArray(pairs) ? pairs : [])]);
+  // Inside each such tenant the static pairs join its keys too, in the SAME
+  // union as the identity renames — a renamed static host (k8x-01 -> k8x-02)
+  // must land in one group with both its names and the static partner (QA).
+  const tenantStatic = [];
+  for (const t of staticAliasTenants) {
+    for (const [a, b] of STATIC_HOST_ALIASES) tenantStatic.push([`${a}@${t}`, `${b}@${t}`]);
+  }
+  hostAliasRoots = aliasRoots([...STATIC_HOST_ALIASES, ...tenantStatic, ...(Array.isArray(pairs) ? pairs : [])]);
   installRoots = aliasRoots(Array.isArray(pairs) ? pairs : []);
 }
 function aliasRoots(pairs) {
@@ -1377,12 +1376,7 @@ function foldKey(k) {
   const raw = String(k == null ? "" : k);
   const f = raw.toLowerCase();
   const t = tenantOfHostKey(raw);
-  let root = hostAliasRoots.get(f);
-  if (!root && t && staticAliasTenants.has(t)) {
-    const base = f.slice(0, -33);
-    root = staticAliasRoots.has(base) ? staticAliasRoots.get(base) + f.slice(-33) : f;
-  }
-  root = root || f;
+  const root = hostAliasRoots.get(f) || f;
   // The tenant (read off the key as typed, XERK-2550) leads a tenant key's fold,
   // so no case twin or alias can fold one tenant's spend into another's — or an
   // untenanted name that merely lowercases into a tenant key's shape into it.
@@ -1442,8 +1436,9 @@ function mergeEntries(keys) {
 }
 
 function fold(key, record, now = Date.now(), liveKeys = null) {
-  const entry = hosts[key];
-  if (!entry) return null;
+  // A live host with no entry of its own yet still carries its retired twins'
+  // history (XERK-2868 QA: a renamed host's old era was otherwise shown nowhere).
+  const entry = hosts[key] || null;
   // Case-twin siblings the registry does NOT currently list (truly retired) fold
   // into this live host's card; a sibling STILL in the registry keeps its own card
   // this beat, so merging it here would double the fleet total — hence liveKeys.
@@ -1462,7 +1457,7 @@ function fold(key, record, now = Date.now(), liveKeys = null) {
   }
   // Common case: no case-twin AND nothing lost — serve the record as its agent
   // sent it (one map lookup), exactly as before.
-  if (group.length === 1 && !entry.augments) return null;
+  if (group.length === 1 && (!entry || !entry.augments)) return null;
   const merged = group.length > 1 ? mergeEntries(group) : entry;
   const liveUsage = usageOf(record && record.usage);
   const liveRepos = new Map(reposOf(record && record.repoUsage).map((r) => [r.remoteKey, r]));

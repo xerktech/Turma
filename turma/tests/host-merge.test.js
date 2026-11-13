@@ -167,3 +167,45 @@ test("renamed hosts: an old name a machine still runs as is left alone", () => {
   assert.equal(archive.sessionRow("t-k8x-again").host, "k8x");
   delete agents.k8x;
 });
+
+test("renamed hosts: an identity rename of a static host stays one card (no double count)", () => {
+  const R = "e".repeat(32);
+  const b = (x) => ({ input: x, output: 0, cacheWrite: 0, cacheRead: 0 });
+  const rep = (n, day) => ({ totals: b(n), today: b(0), week: b(0), days: { [day]: b(n) }, sessions: 1, lastActivity: `${day}T00:00:00Z`, models: [] });
+  hub.usageLedger.setHostAliases([[`k8x-01@${R}`, `k8x-02@${R}`]], [R]);
+  try {
+    hub.usageLedger.ingest(`k8x@${R}`, { device: "k8x", usage: rep(1000, "2026-05-01"), repoUsage: [] });
+    hub.usageLedger.ingest(`k8x-01@${R}`, { device: "k8x-01", usage: rep(400, "2026-09-01"), repoUsage: [] });
+    // k8x-02 is k8x-01 renamed: the same store, reported again under the new name.
+    hub.usageLedger.ingest(`k8x-02@${R}`, { device: "k8x-02", usage: rep(400, "2026-09-01"), repoUsage: [] });
+    const live = [`k8x-02@${R}`];
+    assert.equal(servedTotal(`k8x-02@${R}`, live), 1400);
+    assert.ok(!hub.usageLedger.retiredAgents(live, NOW).some((x) => x.key.endsWith(R)));
+  } finally {
+    hub.usageLedger.setHostAliases([], [T]);
+  }
+});
+
+test("renamed hosts: a live host with no usage of its own still shows its old name's", () => {
+  const Z = "f".repeat(32);
+  hub.usageLedger.setHostAliases([], [Z]);
+  try {
+    hub.usageLedger.ingest(`maxai@${Z}`, { device: "maxai", usage: usageOf(77), repoUsage: [] });
+    const f = hub.usageLedger.fold(`maxai-win@${Z}`, { usage: null, repoUsage: [] }, NOW, [`maxai-win@${Z}`]);
+    assert.equal(f.usage.totals.input, 77);
+  } finally {
+    hub.usageLedger.setHostAliases([], [T]);
+  }
+});
+
+test("renamed hosts: the tick keeps going while an old name is still live or waits for its host", () => {
+  const H = 3600e3;
+  agents.k8x = { device: "k8x", lastSeen: NOW, sessions: [] };
+  hub.permissionLedger.ingest("k8x", [{ id: "p-tick", kind: "dialog", dialogKind: "permission", tool: "Bash",
+    head: "ls", openedAt: NOW - 1000, closedAt: NOW, waitedMs: 1000, answer: "allow", via: "terminal" }], NOW);
+  hub.hostMergeTick(NOW + H);
+  assert.ok(hub.permissionLedger.hostKeys().includes("k8x"), "moved while the old name still ran");
+  delete agents.k8x;
+  hub.hostMergeTick(NOW + 2 * H);
+  assert.ok(!hub.permissionLedger.hostKeys().includes("k8x"), "a skip for a live old name settled the tick");
+});

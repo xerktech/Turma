@@ -196,6 +196,10 @@ paths:
   `setHostAliases(pairs, [migratedTenant()])`): the pre-tenancy migration put those machines under
   `<name>@<tenant>`, so a plain-key lookup missed them and the old name read as a removed host.
   Another tenant's hosts sharing those names are not them and never fold.
+  - The tenant-suffixed static pairs go in the SAME union as the identity renames: a special
+    lookup branch split the group when a static host was later renamed (QA: double count).
+  - A live host with no entry of its own still folds its retired twins (`fold` no longer returns
+    null on a missing entry), or a renamed host's old era showed nowhere.
 - **Static renames SUM across installs; everything else stays high-water** (`mergeEntries` →
   `installOf` → `sumSeries`). Case twins and identity renames (`formerNames`) are one transcript
   store reported twice (max); k8x/k8x-01 and maxai/maxai-win were different installs, and the
@@ -209,7 +213,8 @@ paths:
   - Sources: untenanted or the migrated tenant only; never while the old name still runs (a live
     record or an identity homed there). Target: same tenant (an untenanted source may join the
     migrated tenant, taking its org with it); exactly one, live preferred.
-  - Settles for the process once a pass moves nothing and no source waits for its target.
+  - Settles for the process once a pass moves nothing and no source waits — for its target, or
+    for the old name to stop running.
   - Waits for HA's outcome rescan (`outcomeLedger.isLoaded`). Tests: `host-merge.test.js`.
 
 ### HA: the Postgres of-record backend (XERK-779, epic XERK-775; was Valkey XERK-758)
