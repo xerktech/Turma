@@ -3,17 +3,19 @@ package com.xerktech.turma.ui
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsNotEnabled
-import androidx.compose.ui.test.hasScrollAction
+import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTextReplacement
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
 import com.xerktech.turma.model.TurmaJson
@@ -69,7 +71,7 @@ class BriefScreenTest {
         compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm) }
 
     private fun open(text: String) {
-        compose.onNode(hasScrollAction()).performScrollToNode(hasText(text, substring = true))
+        compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText(text, substring = true))
         compose.onAllNodesWithText(text, substring = true)[0].performClick()
     }
 
@@ -143,8 +145,8 @@ class BriefScreenTest {
         compose.onNodeWithText("Tenir sends this org's meetings as \"acme\".").performScrollTo().assertExists()
 
         // A name with a comma survives: one name per line.
-        compose.onNodeWithText("Lee, Ann").performTextInput("\nMalcolm H.")
-        compose.onAllNodesWithText("Save")[0].performScrollTo().performClick()
+        compose.onNodeWithText("Lee, Ann").performTextReplacement("Lee, Ann\nMalcolm H.")
+        compose.onNodeWithTag("save-focus").performScrollTo().performClick()
         val f = bodyOf("/meeting-focus")
         assertEquals("""["Lee, Ann","Malcolm H."]""", f["names"].toString())
         assertEquals("\"backend\"", f["role"].toString())
@@ -152,27 +154,28 @@ class BriefScreenTest {
 
         // A blank label goes back to the default: an explicit null on the wire.
         compose.onNodeWithText("acme").performScrollTo().performTextClearance()
-        compose.onAllNodesWithText("Save")[1].performScrollTo().performClick()
+        compose.onNodeWithTag("save-label").performScrollTo().performClick()
         assertEquals("""{"label":null}""", hub.findRequest("/meeting-label").body.readUtf8())
 
         compose.onNodeWithText("standup").performScrollTo().performTextClearance()
         compose.onNodeWithText("standup").assertDoesNotExist()
         compose.onAllNodesWithText("Daily meeting title contains")[0].performTextInput("Daily sync")
-        compose.onAllNodesWithText("Save")[2].performScrollTo().performClick()
-        val s = bodyOf("/daily-brief/schedule")
+        compose.onNodeWithTag("save-schedule").performScrollTo().performClick()
+        val req = hub.findRequest("/daily-brief/schedule")
+        assertEquals("PUT", req.method)
+        val s = TurmaJson.parseToJsonElement(req.body.readUtf8()).jsonObject
         assertEquals("\"Daily sync\"", s["meetingTitle"].toString())
         assertEquals("\"23:59\"", s["time"].toString())
         assertEquals("[0,1,2,3,4,5,6]", s["weekdays"].toString())
-        assertEquals("PUT", hub.findRequest("/daily-brief/schedule").method)
     }
 
     @Test fun `a refused save reports the hub's words`() {
-        hub.route("/api/orgs/$site/meeting-label") { HubHarness.refusal("the org acme already has the meeting label \"x\"") }
+        hub.route("/api/orgs/$site/meeting-label") { HubHarness.refusal("the org acme already has that meeting label") }
         hub.seedFleet("""{ "now": 1, "agents": [ $host ] }""")
         val mvm = main.track(MeetingsViewModel(hub.app))
         val message = hub.expectMessage(mvm.messages)
         mvm.saveLabel(site, "x")
-        assertEquals("✗ Saving the Tenir label failed — the org acme already has the meeting label \"x\"", message())
+        assertEquals("✗ Saving the Tenir label failed — the org acme already has that meeting label", message())
         assertTrue(mvm.saved.value.isEmpty())
     }
 }

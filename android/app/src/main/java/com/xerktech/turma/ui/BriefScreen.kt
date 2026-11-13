@@ -23,7 +23,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -41,6 +47,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
@@ -230,88 +237,89 @@ private fun TriageList(
     val zone = ZoneId.systemDefault()
     val locale = Locale.getDefault()
     val misses = remember(fleet.meetingLabelMisses) { meetingLabelMissLabels(fleet.meetingLabelMisses) }
-    LazyColumn(
-        modifier.fillMaxSize(),
-        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        if (misses.isNotEmpty()) {
-            item(key = "misses") {
-                Text(
-                    "Tenir sent meetings for " + misses.joinToString(", ") { "\"$it\"" } +
-                        ", which no org answers to. Give an org that label in its ⚙ settings and they arrive.",
-                    Modifier.fillMaxWidth()
-                        .background(TurmaColors.critical.copy(alpha = 0.10f), RoundedCornerShape(10.dp))
-                        .padding(10.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
-        }
-        item(key = "controls") {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Row(
-                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    for (f in TriageFilter.entries) {
-                        FilterChip(selected = f == filter, onClick = { onFilter(f) }, label = { Text(f.label) })
-                    }
+    // The filter and search stay put above the list, as the web rail's header does.
+    Column(modifier.fillMaxSize()) {
+        Column(Modifier.padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                for (f in TriageFilter.entries) {
+                    FilterChip(selected = f == filter, onClick = { onFilter(f) }, label = { Text(f.label) })
                 }
-                OutlinedTextField(
-                    query, { onQuery(it.take(200)) }, Modifier.fillMaxWidth(),
-                    placeholder = { Text("Search meetings and proposals") }, singleLine = true,
-                )
             }
+            OutlinedTextField(
+                query, { onQuery(it.take(200)) }, Modifier.fillMaxWidth(),
+                placeholder = { Text("Search meetings and proposals") }, singleLine = true,
+            )
         }
-        if (orgs.isEmpty()) {
-            item(key = "empty") {
-                Text(
-                    "No org is reporting. Meetings and briefs need a host polling a tracker.",
-                    Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-        for (site in orgs) {
-            val list = entries[site].orEmpty()
-            val folded = site in collapsed
-            val pending = list.filter { !it.archived }.sumOf { it.pending }
-            item(key = "org:$site") {
-                OrgGroupHead(orgName(site, names[site].orEmpty()), pending, folded, { onToggle(site) }, { onSettings(site) })
-            }
-            if (folded) continue
-            val buckets = triageBuckets(list, filter, query, now, zone)
-            if (buckets.isEmpty()) {
-                item(key = "none:$site") {
+        LazyColumn(
+            Modifier.weight(1f).fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            if (misses.isNotEmpty()) {
+                item(key = "misses") {
                     Text(
-                        when {
-                            query.isNotBlank() -> "Nothing matches."
-                            filter == TriageFilter.REVIEW -> "Nothing needs review."
-                            filter == TriageFilter.ARCHIVED -> "No archived meetings."
-                            else -> "No meetings yet — when Tenir sends one, its proposed work items show up here."
-                        },
-                        Modifier.padding(start = 8.dp, bottom = 4.dp),
+                        "Tenir sent meetings for " + misses.joinToString(", ") { "\"$it\"" } +
+                            ", which no org answers to. Give an org that label in its settings and they arrive.",
+                        Modifier.fillMaxWidth()
+                            .background(TurmaColors.critical.copy(alpha = 0.10f), RoundedCornerShape(10.dp))
+                            .padding(10.dp),
                         style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }
-            for ((bucket, rows) in buckets) {
-                item(key = "b:$site:${bucket.name}") {
-                    SectionLabel(bucket.label, Modifier.padding(start = 4.dp, top = 4.dp))
-                }
-                for (e in rows) {
-                    item(key = "e:$site:${e.key}") { EntryRow(e, now, zone, locale) { onOpen(e) } }
+            if (orgs.isEmpty()) {
+                item(key = "empty") {
+                    Text(
+                        "No org is reporting. Meetings and briefs need a host polling a tracker.",
+                        Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
-        }
-        item(key = "note") {
-            Text(
-                "Nothing reaches the board until you approve: Approve creates the ticket on that org's " +
-                    "board, a decision is added to the org's decisions log, and Reject sets it aside.",
-                Modifier.padding(vertical = 8.dp),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            for (site in orgs) {
+                val list = entries[site].orEmpty()
+                val folded = site in collapsed
+                val pending = list.filter { !it.archived }.sumOf { it.pending }
+                item(key = "org:$site") {
+                    OrgGroupHead(orgName(site, names[site].orEmpty()), pending, folded, { onToggle(site) }, { onSettings(site) })
+                }
+                if (folded) continue
+                val buckets = triageBuckets(list, filter, query, now, zone)
+                if (buckets.isEmpty()) {
+                    item(key = "none:$site") {
+                        Text(
+                            when {
+                                query.isNotBlank() -> "Nothing matches."
+                                filter == TriageFilter.REVIEW -> "Nothing needs review."
+                                filter == TriageFilter.ARCHIVED -> "No archived meetings."
+                                else -> "No meetings yet — when Tenir sends one, its proposed work items show up here."
+                            },
+                            Modifier.padding(start = 8.dp, bottom = 4.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                for ((bucket, rows) in buckets) {
+                    item(key = "b:$site:${bucket.name}") {
+                        SectionLabel(bucket.label, Modifier.padding(start = 4.dp, top = 4.dp))
+                    }
+                    for (e in rows) {
+                        item(key = "e:$site:${e.key}") { EntryRow(e, now, zone, locale) { onOpen(e) } }
+                    }
+                }
+            }
+            item(key = "note") {
+                Text(
+                    "Nothing reaches the board until you approve: Approve creates the ticket on that org's " +
+                        "board, a decision is added to the org's decisions log, and Reject sets it aside.",
+                    Modifier.padding(vertical = 8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
@@ -323,18 +331,18 @@ private fun OrgGroupHead(name: String, pending: Int, folded: Boolean, onToggle: 
             .semantics { contentDescription = if (folded) "Expand $name" else "Collapse $name" },
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(if (folded) "▸" else "▾", Modifier.padding(horizontal = 6.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Icon(
+            if (folded) Icons.Filled.ChevronRight else Icons.Filled.ExpandMore, null,
+            Modifier.padding(horizontal = 4.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Text(
             name, Modifier.weight(1f).semantics { heading() },
             style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold,
         )
         if (pending > 0) CountPill(pending)
-        Text(
-            "⚙",
-            Modifier.clip8().clickable(onClick = onSettings).padding(horizontal = 12.dp, vertical = 6.dp)
-                .semantics { contentDescription = "$name settings" },
-            fontSize = 18.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        IconButton(onClick = onSettings) {
+            Icon(Icons.Outlined.Settings, "$name settings", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
 }
 
@@ -644,7 +652,7 @@ private fun OrgSettings(
                 role, { role = it.take(300); mvm.clearSaved(site, "focus") }, Modifier.fillMaxWidth(),
                 label = { Text("Role (optional)") }, singleLine = true,
             )
-            SaveRow(k("focus") in saving, k("focus") in saved) { mvm.saveFocus(site, focusNames(names), role) }
+            SaveRow("focus", k("focus") in saving, k("focus") in saved) { mvm.saveFocus(site, focusNames(names), role) }
 
             // Tenir label (XERK-2638): blank goes back to the default slug.
             SectionLabel("Tenir label")
@@ -663,7 +671,7 @@ private fun OrgSettings(
                 own, { own = it.take(40); mvm.clearSaved(site, "label") }, Modifier.fillMaxWidth(),
                 label = { Text("Label (blank = default)") }, singleLine = true,
             )
-            SaveRow(k("label") in saving, k("label") in saved) { mvm.saveLabel(site, own) }
+            SaveRow("label", k("label") in saving, k("label") in saved) { mvm.saveLabel(site, own) }
 
             ScheduleSection(site, fleet.dailyBriefSchedules[site], now, k("schedule") in saving,
                 k("schedule") in saved, { mvm.clearSaved(site, "schedule") }) { mvm.saveSchedule(site, it) }
@@ -673,9 +681,9 @@ private fun OrgSettings(
 }
 
 @Composable
-private fun SaveRow(busy: Boolean, done: Boolean, onSave: () -> Unit) {
+private fun SaveRow(tag: String, busy: Boolean, done: Boolean, onSave: () -> Unit) {
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        PrimaryButton(if (busy) "Saving…" else "Save", onSave, enabled = !busy)
+        PrimaryButton(if (busy) "Saving…" else "Save", onSave, Modifier.testTag("save-$tag"), enabled = !busy)
         if (done) Text("Saved", color = TurmaColors.good, style = MaterialTheme.typography.bodyMedium)
     }
 }
@@ -738,7 +746,7 @@ private fun ScheduleSection(
             "proposals sit under that day's brief.",
         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
-    SaveRow(busy, done) {
+    SaveRow("schedule", busy, done) {
         // The hub merges these over the stored schedule and validates the
         // whole (a 400 in its words), so nothing is checked twice here.
         onSave(buildJsonObject {

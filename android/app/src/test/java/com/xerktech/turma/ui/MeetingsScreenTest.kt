@@ -5,7 +5,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
-import androidx.compose.ui.test.hasScrollAction
+import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.assertCountEquals
@@ -81,7 +81,7 @@ class MeetingsScreenTest {
     }
 
     private fun open(title: String) {
-        compose.onNode(hasScrollAction()).performScrollToNode(hasText(title))
+        compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText(title))
         compose.onNodeWithText(title).performClick()
     }
 
@@ -95,7 +95,7 @@ class MeetingsScreenTest {
         compose.onNodeWithText("Planning").assertDoesNotExist() // nothing pending
         compose.onNodeWithText("Old offsite").assertDoesNotExist()
         compose.onNodeWithText("All").performClick()
-        compose.onNode(hasScrollAction()).performScrollToNode(hasText("Planning"))
+        compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("Planning"))
         compose.onNodeWithText("Planning").assertExists()
         compose.onNodeWithText("Old offsite").assertDoesNotExist()
         compose.onNodeWithText("Archived").performClick()
@@ -159,7 +159,7 @@ class MeetingsScreenTest {
         val r = hub.findRequest("/meetings/m2/items/p4")
         assertEquals("POST", r.method)
         assertEquals("""{"action":"reopen"}""", r.body.readUtf8())
-        compose.onNodeWithText("Archive meeting").performClick()
+        compose.onNodeWithText("Archive meeting").performScrollTo().performClick()
         val a = hub.findRequest("/meetings/m2/archive")
         assertEquals("""{"archived":true}""", a.body.readUtf8())
     }
@@ -179,7 +179,7 @@ class MeetingsScreenTest {
         val vm = main.track(MeetingsViewModel(hub.app))
         show(vm)
         open("Sprint sync")
-        compose.onAllNodesWithText("Edit")[0].performClick()
+        compose.onAllNodesWithText("Edit")[0].performScrollTo().performClick()
         compose.waitUntil(5_000) { vm.drafts.value.isNotEmpty() }
         compose.onNodeWithText("Cancel").performScrollTo().performClick()
         compose.waitUntil(5_000) { vm.drafts.value.isEmpty() }
@@ -217,6 +217,6 @@ class MeetingsScreenTest {
         show(main.track(MeetingsViewModel(hub.app)))
         compose.onNodeWithText(
             "Tenir sent meetings for \"acme\", \"beta\", which no org answers to. " +
-                "Give an org that label in its ⚙ settings and they arrive.").assertExists()
+                "Give an org that label in its settings and they arrive.").assertExists()
     }
 }

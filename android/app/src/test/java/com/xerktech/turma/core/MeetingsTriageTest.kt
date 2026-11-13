@@ -150,7 +150,7 @@ class MeetingsTriageTest {
         assertEquals("Untitled meeting", triageTitle(TriageEntry("m", "s", 0, Meeting())))
         assertEquals(listOf("b", "a"), meetingLabelMissLabels(mapOf(
             "a@0011" to MeetingLabelMiss(at = 1), "b" to MeetingLabelMiss(at = 2), "a" to MeetingLabelMiss(at = 0))))
-        assertEquals(listOf("Lee, Ann", "Bo"), focusNames(" Lee, Ann \n\nbo\nBo\n"))
+        assertEquals(listOf("Lee, Ann", "bo"), focusNames(" Lee, Ann \n\nbo\nBo\n")) // the first spelling stays
     }
 
     @Test fun `the new wire fields decode, and a bad entry drops alone`() {
