@@ -30076,6 +30076,101 @@ test("XERK-2510: a create whose host goes silent fails in honest words; an agent
   cleanup2508(S, ["mtFail2510"]);
 });
 
+// ---- XERK-2865: missing hub state is "can't tell", never "nothing ran" -----------
+
+const approve2865 = (S, mid, iid) =>
+  review2510(S, mid, iid, { action: "approve", project: "ENG", issueType: "1" });
+// The host's beat takes its queued commands: they are now delivered.
+const deliver2865 = (device, S) => beat1574(device, S);
+const beat2865 = (device, headers, extra = {}) =>
+  request("POST", "/api/heartbeat", { body: { device, ...extra },
+    headers: { ...headers, "content-type": "application/json" } });
+
+test("XERK-2865: a host removed after taking a create fails 'may have been created' and blocks Reopen", async () => {
+  const S = "mtRm2865.atlassian.net";
+  await beat1574("mtRm2865", S);
+  hub.putMeeting(S, okMeeting2510("r1"));
+  assert.equal((await approve2865(S, "r1", "p1")).status, 200);
+  await deliver2865("mtRm2865", S);
+  assert.ok(creates2510("mtRm2865")[0].deliveredAt, "the beat delivered the create");
+  delete agents.mtRm2865;   // DELETE /api/agents/<host>
+  hub.settleMeetingReviews();
+  const rv = item2510(S, "r1", "p1").review;
+  assert.deepEqual([rv.state, rv.maybeCreated], ["failed", true]);
+  assert.match(rv.error, /may have been created/);
+  // A reopen would put a duplicate one Approve away.
+  await beat1574("mtRm2865b", S);
+  assert.equal((await review2510(S, "r1", "p1", { action: "reopen" })).status, 409);
+  cleanup2508(S, ["mtRm2865", "mtRm2865b"]);
+});
+
+test("XERK-2865: a create answered under a host's new name settles created, not failed", async () => {
+  const S = "mtRn2865.atlassian.net";
+  await beat2865("mtRnA2865", asAuth(hostAgentToken("mtRnA2865")), {
+    jira: { available: true, configured: true, siteKey: S, user: "u@x.com",
+      fetchedAt: new Date().toISOString(), tickets: [] } });
+  const tok = enrollUid("mtRnA2865");
+  hub.putMeeting(S, okMeeting2510("n1"));
+  assert.equal((await approve2865(S, "n1", "p1")).status, 200);
+  const [c] = creates2510("mtRnA2865");
+  const jira = { available: true, configured: true, siteKey: S, user: "u@x.com",
+    fetchedAt: new Date().toISOString(), tickets: [] };
+  assert.equal((await beat2865("mtRnA2865", asAuth(tok), { jira })).status, 200);
+  // The agent restarts under its new DEVICE_NAME and reports the create there.
+  agents.mtRnA2865.updating = { reason: "restart", at: Date.now(), until: Date.now() + 60000 };
+  const r = await beat2865("mtRnB2865", asAuth(tok), { jira,
+    createTicketResults: [{ cmdId: c.cmdId, key: "ENG-99", url: null, error: null }] });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(agents.mtRnA2865, undefined);
+  hub.settleMeetingReviews();
+  const rv = item2510(S, "n1", "p1").review;
+  assert.deepEqual([rv.state, rv.key], ["created", "ENG-99"]);
+  // And a create still unanswered under the new name keeps waiting on that record.
+  assert.equal((await approve2865(S, "n1", "p2")).status, 200);
+  assert.equal(item2510(S, "n1", "p2").review.host, "mtRnB2865");
+  forget2381("mtRnA2865", "mtRnB2865");
+  delete hub.getMeetings()[S];
+});
+
+test("XERK-2865: a create whose queued command the hub lost is 'can't tell' once its host is silent", async () => {
+  const S = "mtLost2865.atlassian.net";
+  await beat1574("mtLost2865", S);
+  hub.putMeeting(S, okMeeting2510("l1"));
+  assert.equal((await approve2865(S, "l1", "p1")).status, 200);
+  // A hub killed inside the state.json debounce restarts without the command.
+  agents.mtLost2865.commands = (agents.mtLost2865.commands || []).filter((c) => c.type !== "createTicket");
+  agents.mtLost2865.lastSeen = Date.now() - 10 * 60e3;
+  hub.settleMeetingReviews();
+  const rv = item2510(S, "l1", "p1").review;
+  assert.deepEqual([rv.state, rv.maybeCreated], ["failed", true]);
+  assert.match(rv.error, /may have been created/);
+  assert.equal((await review2510(S, "l1", "p1", { action: "reopen" })).status, 409);
+  // Still provably unrun (queued, never delivered): the honest "nothing ran", reopenable.
+  agents.mtLost2865.lastSeen = Date.now();
+  assert.equal((await approve2865(S, "l1", "p2")).status, 200);
+  agents.mtLost2865.lastSeen = Date.now() - 10 * 60e3;
+  hub.settleMeetingReviews();
+  const rv2 = item2510(S, "l1", "p2").review;
+  assert.deepEqual([rv2.state, rv2.error, "maybeCreated" in rv2],
+    ["failed", "the host went offline before the ticket was created", false]);
+  assert.equal((await review2510(S, "l1", "p2", { action: "reopen" })).status, 200);
+  cleanup2508(S, ["mtLost2865"]);
+});
+
+test("XERK-2865: the New-ticket poll never calls a create that left no queued command 'never ran'", async () => {
+  const S = "mtPoll2865.atlassian.net";
+  await beat1574("mtPoll2865", S);
+  const q = await request("POST", `/api/jira/${S}/tickets`, { headers: userHeaders,
+    body: { summary: "x", project: "ENG", issueType: "1" } });
+  assert.equal(q.status, 200);
+  agents.mtPoll2865.commands = (agents.mtPoll2865.commands || []).filter((c) => c.type !== "createTicket");
+  agents.mtPoll2865.lastSeen = Date.now() - 10 * 60e3;
+  const r = await request("GET", `/api/jira/${S}/tickets/${q.body.cmdId}`, { headers: userHeaders });
+  assert.equal(r.status, 503);
+  assert.match(r.body.error, /may have been created/);
+  delete agents.mtPoll2865;
+});
+
 // ---- XERK-2550: usage, ledgers and insights partitioned by tenant -------------
 
 const retiredBeat2550 = (device, n) => {

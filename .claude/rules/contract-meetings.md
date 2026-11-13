@@ -115,6 +115,11 @@ ticket builds to this file; change it here first.
 - `settleMeetingReviews` (on `meetingsTick` and on a beat carrying `createTicketResults`): the
   owning host's `createResults[cmdId]` → `created` (and every org host is asked to `refreshJira`)
   or `failed`; that host offline/gapped → `failed` in the GET poll's honest words (XERK-241).
+- **Missing hub state is "can't tell", never "nothing ran"** (XERK-2865): only a command still
+  queued UNDELIVERED proves no ticket (`commandProvablyUnrun`). A gone host record or queued
+  command (host removed, hub killed inside the state.json debounce) fails with `maybeCreated:
+  true`, which refuses Reopen. A renamed host is found by its `formerNames` (`meetingReviewHost`).
+  The Board's create poll uses the same proof. Tests: `XERK-2865:` in `server.test.js`.
 - **A `creating` review fails at `MEETING_CREATE_DEADLINE_MS`** (15 min) with no answer: a hub
   killed before the host took the command (debounced queue, unpersisted result caches) otherwise
   left it `creating` forever, refusing both Approve and Reject.

@@ -9838,15 +9838,20 @@ function queueCommand(key, cmd) {
   return cmdId;
 }
 
-// Has this command been handed to the agent? The queue drains on ACK, not on
+// Was this command never handed to the agent? The queue drains on ACK, not on
 // delivery, so being queued does NOT mean it never ran — an agent that took a
 // command, ran it and died before acking leaves it sitting there too. Only the
 // `deliveredAt` stamp separates "provably did nothing" from "unknowable", and
 // the two must be reported differently (XERK-241).
-function commandDelivered(key, cmdId, kind) {
+//
+// The only PROOF a command never ran: it still sits in its host's queue,
+// undelivered. A missing record or a missing command proves nothing — a host
+// removed or renamed after delivery, or a hub killed inside the state.json
+// debounce, leaves exactly that — so both read "can't tell" (XERK-2865).
+function commandProvablyUnrun(key, cmdId, kind) {
   const a = agents[key];
   return !!((a && a.commands) || []).find(
-    (c) => c && c.cmdId === cmdId && c.type === kind && c.deliveredAt);
+    (c) => c && c.cmdId === cmdId && c.type === kind && !c.deliveredAt);
 }
 
 // Withdraw a queued command the hub has given up on. This is unconditional, and
@@ -21305,12 +21310,24 @@ function refreshOrgBoard(siteKey) {
   }
 }
 
+// The record a review's create host lives on now: its own key, else the record
+// it was renamed to (XERK-2381; a tenant bind is one too, XERK-2533), which
+// carries the old name in `formerNames` and the create's result (XERK-2865).
+function meetingReviewHost(host) {
+  if (Object.hasOwn(agents, host)) return host;
+  for (const [k, a] of Object.entries(agents)) {
+    if (a && Array.isArray(a.formerNames) && a.formerNames.includes(host)) return k;
+  }
+  return null;
+}
+
 // One review's next state, or the same object when nothing moved.
 function settleMeetingReview(siteKey, rv, now) {
   if (!rv) return rv;
   if (rv.state === "creating") {
-    const { cmdId, host, ...base } = rv;
-    const a = agents[host];
+    const { cmdId, host: reviewHost, ...base } = rv;
+    const host = meetingReviewHost(reviewHost);
+    const a = host ? agents[host] : null;
     const r = a && a.createResults && a.createResults[cmdId];
     if (r) {
       if (r.error || !r.key) {
@@ -21325,21 +21342,26 @@ function settleMeetingReview(siteKey, rv, now) {
     if (a && !gap && now - (a.lastSeen || 0) < OFFLINE_AFTER_MS && now - rv.at >= MEETING_CREATE_DEADLINE_MS) {
       dropQueuedCommand(host, cmdId, "createTicket");
       forgetCreateInFlight(cmdId);
-      return { ...base, state: "failed", at: now, maybeCreated: true, error: "the host never reported "
-        + "the create — it may have been created, so check the board before approving again" };
+      return { ...base, state: "failed", at: now, maybeCreated: true,
+        error: "the host never reported the create — it may "
+        + "have been created, so check the board before approving again" };
     }
     if (!a || gap || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) {
-      // The GET poll's wording (XERK-241): never claim no ticket exists once
-      // the command was handed over.
-      const nothingRan = !a || !commandDelivered(host, cmdId, "createTicket");
+      // The GET poll's wording (XERK-241): never claim no ticket exists unless
+      // the command provably never left the queue. A gone record or command is
+      // "can't tell" (XERK-2865), and so blocks Reopen like the deadline does.
+      const nothingRan = !!a && commandProvablyUnrun(host, cmdId, "createTicket");
       if (a) dropQueuedCommand(host, cmdId, "createTicket");
       forgetCreateInFlight(cmdId);
-      const unknown = !gap && !nothingRan;
-      return { ...base, state: "failed", at: now, ...(unknown ? { maybeCreated: true } : {}),
-        error: gap || (nothingRan
-          ? "the host went offline before the ticket was created"
-          : "the host went silent while creating the ticket — it may have been created, "
-            + "so check the board before approving again") };
+      if (gap || nothingRan) {
+        return { ...base, state: "failed", at: now,
+          error: gap || "the host went offline before the ticket was created" };
+      }
+      return { ...base, state: "failed", at: now, maybeCreated: true, error: a
+        ? "the host went silent while creating the ticket — it may have been created, "
+          + "so check the board before approving again"
+        : "the host is gone — the ticket may have been created, "
+          + "so check the board before approving again" };
     }
     return rv;
   }
@@ -26617,7 +26639,7 @@ const server = http.createServer(async (req, res) => {
         // and died before acking. Claiming otherwise is what turns one intent
         // into two tickets, so say which of the two this is and, when it is the
         // unknowable one, send them to look before remaking it.
-        const nothingRan = !commandDelivered(owner, cmdId, "createTicket");
+        const nothingRan = commandProvablyUnrun(owner, cmdId, "createTicket");
         dropQueuedCommand(owner, cmdId, "createTicket");
         forgetCreateInFlight(cmdId);
         return json(res, 503, { error: nothingRan
