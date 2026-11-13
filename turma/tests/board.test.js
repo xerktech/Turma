@@ -3789,7 +3789,7 @@ test("epicChildStub: a run child off the board opens from the run's record", () 
   const { epicChildStub } = require("../public/board.js");
   const r = { epicKey: "E-1", children: ["C-1", "C-2"], doneChildren: ["C-1"], childTitles: { "C-1": "First" } };
   assert.deepEqual(epicChildStub(r, "C-1"),
-    { key: "C-1", summary: "First", status: "Done", statusCategory: "done", epicKey: "E-1", offBoard: true });
+    { key: "C-1", summary: "First", status: "Done", statusCategory: "done", epicKey: "E-1" });
   const open = epicChildStub(r, "C-2");
   assert.equal(open.summary, "");
   assert.equal(open.statusCategory, "");
@@ -3814,7 +3814,7 @@ test("XERK-2674: a sub-ticket's panel links back to its epic only when the board
 test("XERK-2674: board.html opens the clicked child or epic in the detail panel", () => {
   const src = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
   // Both targets resolve (the crumb's key too) and focus returns to the opening card.
-  assert.match(src, /closest\("\[data-epic-child\], \[data-td-epic\]"\)[^]*?nav\.dataset\.epicChild \|\| nav\.dataset\.tdEpic[^]*?epicChildStub\([^]*?openDetail\(key, openTicketState\.siteKey, lastFocus, stub\)/);
+  assert.match(src, /closest\("\[data-epic-child\], \[data-td-epic\]"\)[^]*?nav\.dataset\.epicChild \|\| nav\.dataset\.tdEpic[^]*?epicChildStub\(B\.epicRunOf\(cache && cache\.epicRuns, openTicketState\.siteKey, openTicketState\.key\), key\)[^]*?openDetail\(key, openTicketState\.siteKey, lastFocus, stub\)/);
   // openDetail falls back to the stub only when the board has no such ticket.
   assert.match(src, /site\.tickets\.find\(t => t\.key === key\)\) \|\| \(site && stub\)/);
   // A double-click's second click (landing on the backdrop) doesn't close the panel.

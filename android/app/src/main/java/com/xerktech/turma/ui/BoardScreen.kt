@@ -125,7 +125,7 @@ import com.xerktech.turma.core.epicChildrenOf
 import com.xerktech.turma.core.epicPreviewRun
 import com.xerktech.turma.core.EpicRunView
 import com.xerktech.turma.core.epicRunOf
-import com.xerktech.turma.core.epicChildStub
+import com.xerktech.turma.core.sheetTicketFor
 import com.xerktech.turma.core.epicRunView
 import com.xerktech.turma.core.isEpicTicket
 import com.xerktech.turma.core.filterSites
@@ -507,10 +507,7 @@ fun BoardScreen(
         // An epic's sub-ticket row, or a sub-ticket's epic chip, swaps the sheet to
         // that ticket (XERK-2674, board.js data-epic-child / data-td-epic). A run
         // child the board no longer lists opens from the run's record (epicChildStub).
-        val boardTicket: (String) -> JiraTicket? = { key ->
-            liveSite.tickets.find { it.key == key }
-                ?: if (isEpicTicket(ticket)) epicChildStub(epicRunOf(fleet.epicRuns, site.siteKey, ticket.key), key) else null
-        }
+        val boardTicket: (String) -> JiraTicket? = { key -> sheetTicketFor(liveSite, ticket, fleet.epicRuns, key) }
         TicketDetailSheet(site, ticket, pin, modelPin, modelPick, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, epicPreview, epicChildren, vm, closedBy,
             boardTicket = boardTicket,
             onOpenTicket = { t -> detail = liveSite to t },

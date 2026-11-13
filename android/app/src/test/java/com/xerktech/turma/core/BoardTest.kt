@@ -1515,6 +1515,21 @@ class BoardTest {
         assertEquals(null, epicChildStub(null, "C-1"))
     }
 
+    @Test fun `sheetTicketFor opens an aged-off run child only from inside its epic`() {
+        val onBoard = child("C-2")
+        val site = epicSite(listOf(onBoard))
+        val epic = site.tickets.first { it.key == "E-1" }
+        val run = mkRun(children = listOf("C-1", "C-2"), waves = listOf(listOf("C-1", "C-2")))
+            .copy(epicKey = "E-1", doneChildren = listOf("C-1"), childTitles = mapOf("C-1" to "First"))
+        val runs = mapOf("${site.siteKey}/E-1" to run)
+        assertEquals("First", sheetTicketFor(site, epic, runs, "C-1")?.summary)
+        assertEquals(onBoard, sheetTicketFor(site, epic, runs, "C-2"))
+        assertEquals(null, sheetTicketFor(site, epic, runs, "X-9"))
+        // From a non-epic sheet only the board's own tickets open (the epic chip).
+        assertEquals(null, sheetTicketFor(site, onBoard, runs, "C-1"))
+        assertEquals(epic, sheetTicketFor(site, onBoard, runs, "E-1"))
+    }
+
     @Test fun `epicRunView derives child status from the live board`() {
         // C-1 Done; C-2 has a running session; C-3 unstarted, its in-epic blocker
         // C-2 not Done -> blocked.

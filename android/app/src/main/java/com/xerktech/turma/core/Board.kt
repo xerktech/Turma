@@ -201,6 +201,16 @@ fun epicChildStub(run: EpicRun?, key: String): JiraTicket? {
     )
 }
 
+/**
+ * Resolve a key tapped inside [open]'s sheet (an epic's child row, or a child's
+ * epic chip) to the ticket to show: the board's own copy, else — inside an
+ * epic — a stand-in for a run child the board no longer lists. null = not
+ * openable.
+ */
+fun sheetTicketFor(site: BoardSite, open: JiraTicket, epicRuns: Map<String, EpicRun>?, key: String): JiraTicket? =
+    site.tickets.find { it.key == key }
+        ?: if (isEpicTicket(open)) epicChildStub(epicRunOf(epicRuns, site.siteKey, open.key), key) else null
+
 /** A child's live status in the run — the four states of board.js epicRunView. */
 enum class EpicChildStatus { DONE, RUNNING, READY, BLOCKED }
 

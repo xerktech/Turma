@@ -496,7 +496,6 @@
       status: done ? "Done" : "",
       statusCategory: done ? "done" : "",
       epicKey: typeof run.epicKey === "string" ? run.epicKey : "",
-      offBoard: true,
     };
   }
 
