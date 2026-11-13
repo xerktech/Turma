@@ -30946,3 +30946,259 @@ test("XERK-2684: the scoped-payload memo is bounded by bytes, not entry count", 
   assert.equal(hub.scopedPayloads.size, 1);
   hub.clearScopedPayloads();
 });
+
+// ---- XERK-2856: Meetings — archive, reopen, the daily meeting ----------------------
+// Wed 2025-11-12, 09:00 in Chicago (CST) = 15:00Z: the org's scheduled standup.
+const CHI2856 = { enabled: true, time: "09:00", timeZone: "America/Chicago",
+  weekdays: [1, 2, 3, 4, 5], leadMinutes: 5, model: "auto" };
+const M2856 = Date.parse("2025-11-12T15:00:00Z");
+const brief2856 = (runId, extra = {}) => hub.sanitizeDailyBrief({ runId, status: "ok",
+  trigger: "scheduled", meetingAt: M2856, dayFrom: M2856 - 864e5, weekFrom: M2856 - 7 * 864e5,
+  until: M2856 - 3e5, startedAt: M2856 - 3e5, generatedAt: M2856 - 2e5, model: "haiku",
+  day: "Shipped ENG-7.", week: "Two fixes.", next: "ENG-9 next.", ...extra });
+const archive2856 = (site, mid, body, headers = userHeaders) =>
+  request("POST", `/api/orgs/${encodeURIComponent(site)}/meetings/${encodeURIComponent(mid)}/archive`,
+    { body, headers });
+const WIRE_KEYS2856 = new Set(["meetingId", "status", "title", "platform", "startedAt", "endedAt",
+  "receivedAt", "tenirUrl", "participants", "daily", "model", "host", "runId", "generatedAt",
+  "archivedAt", "items", "error"]);
+
+test("XERK-2856: the daily meeting is tagged by the schedule's time window, local weekday and zone", () => {
+  const S = "dyT2856.atlassian.net";
+  const daily = (startedAt, title = "Sync") => hub.meetingDailyOf(S, { startedAt, title });
+  assert.equal(daily(M2856), null, "no schedule stored (the shared hub runs no default): not daily");
+  hub.getDailyBriefSchedules()[S] = hub.sanitizeDailyBriefSchedule(CHI2856);
+  // The window is [M - 20min, M + 60min].
+  for (const [at, want] of [[M2856, M2856], [M2856 - 20 * 60e3, M2856], [M2856 + 60 * 60e3, M2856],
+    [M2856 - 20 * 60e3 - 1, null], [M2856 + 60 * 60e3 + 1, null],
+    // Saturday 2025-11-15 09:00 Chicago: not a scheduled weekday.
+    [Date.parse("2025-11-15T15:00:00Z"), null],
+    // Wednesday evening in Chicago: hours from any scheduled meeting.
+    [Date.parse("2025-11-13T00:30:00Z"), null]]) {
+    const d = daily(at);
+    assert.equal(d && d.meetingAt, want, new Date(at).toISOString());
+  }
+  // The zone's LOCAL weekday counts: Honolulu's Wednesday 17:00 is Thursday 03:00Z.
+  const hnl = { ...CHI2856, time: "17:00", timeZone: "Pacific/Honolulu" };
+  const hnlAt = Date.parse("2025-11-13T03:05:00Z");
+  hub.getDailyBriefSchedules()[S] = hub.sanitizeDailyBriefSchedule({ ...hnl, weekdays: [3] });
+  assert.equal(daily(hnlAt).meetingAt, Date.parse("2025-11-13T03:00:00Z"));
+  hub.getDailyBriefSchedules()[S] = hub.sanitizeDailyBriefSchedule({ ...hnl, weekdays: [4] });
+  assert.equal(daily(hnlAt), null, "Thursday in UTC, Wednesday in Honolulu: not a Thursday standup");
+  // By title (case-insensitive substring), at any time: meetingAt is its own start.
+  hub.getDailyBriefSchedules()[S] = hub.sanitizeDailyBriefSchedule({ ...CHI2856, meetingTitle: "stand-UP" });
+  const odd = Date.parse("2025-11-15T20:00:00Z");
+  assert.deepEqual(daily(odd, "Team Stand-up (daily)"), { meetingAt: odd });
+  assert.equal(daily(odd, "Retro"), null);
+  delete hub.getDailyBriefSchedules()[S];
+});
+
+test("XERK-2856: only a stored, enabled schedule tags by time; the title keyword counts regardless", () => {
+  const S = "dyD2856.atlassian.net";
+  const daily = (startedAt, title = "Acme client sync") => hub.meetingDailyOf(S, { startedAt, title });
+  // The unstored default (09:00 New York, Mon-Fri) never tags: a 09:30 NY client call is not a standup.
+  hub.__setDailyBriefDefault(hub.DAILY_BRIEF_DEFAULT_SCHEDULE);
+  try {
+    assert.equal(daily(Date.parse("2025-11-12T14:30:00Z")), null, "default schedule: not daily");
+  } finally {
+    hub.__setDailyBriefDefault(null);
+  }
+  // An opted-out schedule names no meeting time, but its title keyword still applies.
+  hub.getDailyBriefSchedules()[S] = hub.sanitizeDailyBriefSchedule({ ...CHI2856, enabled: false,
+    meetingTitle: "standup" });
+  assert.equal(daily(M2856 + 40 * 60e3), null, "enabled:false: not daily by time");
+  assert.deepEqual(daily(M2856 + 40 * 60e3, "Team Standup"), { meetingAt: M2856 + 40 * 60e3 },
+    "enabled:false: still daily by title");
+  delete hub.getDailyBriefSchedules()[S];
+});
+
+test("XERK-2856: a Tenir POST can store neither daily nor archivedAt", async () => {
+  const S = "dyF2856.atlassian.net";
+  await beat1574("dyFHost2856", S); // no meetings capability: the row stays queued, nothing settles
+  // A stored schedule, but this meeting is neither in its window nor titled for it.
+  hub.getDailyBriefSchedules()[S] = hub.sanitizeDailyBriefSchedule({ ...CHI2856, meetingTitle: "Standup" });
+  const at = M2856 + 5 * 3600e3;
+  const r = await postMeeting2508(S, meeting2508("f1", { title: "Retro", startedAt: at, endedAt: at + 9e5,
+    daily: { meetingAt: M2856, briefRunId: "ab" }, archivedAt: 5 }));
+  assert.equal(r.status, 200);
+  const row = hub.getMeetings()[S].find((m) => m.meetingId === "f1");
+  assert.equal(row.status, "queued");
+  assert.deepEqual(["daily" in row, "archivedAt" in row], [false, false]);
+  delete hub.getDailyBriefSchedules()[S];
+  cleanup2508(S, ["dyFHost2856"]);
+});
+
+test("XERK-2856: the daily link names the meeting's brief, newest ok first, else one from the last day", () => {
+  const S = "dyB2856.atlassian.net";
+  hub.getDailyBriefSchedules()[S] = hub.sanitizeDailyBriefSchedule({ ...CHI2856, meetingTitle: "Standup" });
+  const daily = (startedAt, title = "Sync") => hub.meetingDailyOf(S, { startedAt, title });
+  const failed = (runId, extra) => brief2856(runId, { status: "failed", error: "x", ...extra });
+  // Newest first: a newer failed Run now for M loses to the ok brief for M.
+  hub.getDailyBriefs()[S] = [failed("f2", { trigger: "manual" }), brief2856("a1"),
+    brief2856("b0", { meetingAt: M2856 - 864e5, generatedAt: M2856 - 1e5 })];
+  assert.deepEqual(daily(M2856 + 5 * 60e3), { meetingAt: M2856, briefRunId: "a1" });
+  // Only a failed brief for M: still that meeting's brief.
+  hub.getDailyBriefs()[S] = [failed("f2"), brief2856("b0", { meetingAt: M2856 - 864e5 })];
+  assert.equal(daily(M2856).briefRunId, "f2");
+  // None for M (or a title match): the newest ok brief generated in the 24h before.
+  hub.getDailyBriefs()[S] = [brief2856("c1", { meetingAt: M2856 - 864e5, generatedAt: M2856 - 3 * 3600e3 })];
+  assert.equal(daily(M2856).briefRunId, "c1");
+  const late = M2856 + 5 * 3600e3;
+  assert.deepEqual(daily(late, "Daily standup"), { meetingAt: late, briefRunId: "c1" });
+  const stale = M2856 - 3 * 3600e3 + 864e5 + 1;
+  assert.deepEqual(daily(stale, "Standup"), { meetingAt: stale }, "a brief over a day old is not linked");
+  delete hub.getDailyBriefs()[S];
+  delete hub.getDailyBriefSchedules()[S];
+});
+
+test("XERK-2856: admission tags the daily meeting; Tenir can't set it, never sees it, and the transcript carries the brief", async () => {
+  const S = "dyA2856.atlassian.net";
+  await meetHost2508("dyHost2856", S);
+  // meetingTitle is validated, cleaned, merged and served like every schedule field.
+  const put = (body) => request("PUT", `/api/orgs/${S}/daily-brief/schedule`, { body, headers: userHeaders });
+  for (const bad of [{ ...CHI2856, meetingTitle: "t".repeat(101) }, { ...CHI2856, meetingTitle: 7 }]) {
+    const r = await put(bad);
+    assert.equal(r.status, 400);
+    assert.match(r.body.error, /meetingTitle/);
+  }
+  assert.equal((await put({ ...CHI2856, meetingTitle: "  Stand\u0007up‮  " })).body.schedule.meetingTitle, "Standup");
+  assert.equal((await put({ leadMinutes: 10 })).body.schedule.meetingTitle, "Standup", "a PUT merges");
+  const fleet = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(fleet.body.dailyBriefSchedules[S].meetingTitle, "Standup");
+  assert.equal("meetingTitle" in (await put({ meetingTitle: "" })).body.schedule, false, '"" clears it');
+  await put({ meetingTitle: "Standup" });
+  assert.deepEqual(hub.dailyBriefSchedulesCoerce(JSON.parse(JSON.stringify(hub.getDailyBriefSchedules()))),
+    hub.getDailyBriefSchedules(), "a fixed point");
+  hub.getDailyBriefs()[S] = [brief2856("a1")];
+
+  // Tenir posts the standup; a `daily`/`archivedAt` of its own is ignored.
+  const r = await postMeeting2508(S, meeting2508("s1", { startedAt: M2856 + 60e3, endedAt: M2856 + 9e5,
+    daily: { meetingAt: 1, briefRunId: "ff" }, archivedAt: 5 }));
+  assert.equal(r.status, 200);
+  assert.equal("daily" in r.body.meeting, false, "Tenir's answer carries no daily link");
+  const row = hub.getMeetings()[S][0];
+  assert.deepEqual([row.daily, "archivedAt" in row], [{ meetingAt: M2856, briefRunId: "a1" }, false]);
+  const dup = await postMeeting2508(S, meeting2508("s1"));
+  assert.deepEqual([dup.body.duplicate, "daily" in dup.body.meeting], [true, false]);
+  // The operator's wire serves it.
+  const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.meetingProposals[S][0];
+  assert.deepEqual(served.daily, { meetingAt: M2856, briefRunId: "a1" });
+  // The agent's transcript pull carries the linked ok brief's texts.
+  const [cmd] = meetCmds2508("dyHost2856");
+  assert.equal("daily" in cmd, false, "the command carries no brief text");
+  const url = `/api/agents/dyHost2856/meetings/${cmd.runId}/transcript`;
+  const t = await request("GET", url, { headers: asHost("dyHost2856") });
+  assert.deepEqual(t.body.daily, { meetingAt: M2856, day: "Shipped ENG-7.", week: "Two fixes.", next: "ENG-9 next." });
+  // The brief failed (or left the store): no daily in the pull.
+  hub.getDailyBriefs()[S] = [brief2856("a1", { status: "failed", error: "x" })];
+  assert.equal("daily" in (await request("GET", url, { headers: asHost("dyHost2856") })).body, false);
+  delete hub.getDailyBriefs()[S];
+  assert.equal("daily" in (await request("GET", url, { headers: asHost("dyHost2856") })).body, false);
+  // A meeting that is not the daily one carries none, ever.
+  await meetResult2508("dyHost2856", S, cmd, { status: "ok", items: [] });
+  await postMeeting2508(S, meeting2508("s2", { title: "Retro", startedAt: M2856 + 5 * 3600e3,
+    endedAt: M2856 + 6 * 3600e3 }));
+  assert.equal("daily" in hub.getMeetings()[S][0], false);
+  const [cmd2] = meetCmds2508("dyHost2856").filter((c) => c.meetingId === "s2");
+  assert.equal("daily" in (await request("GET", `/api/agents/dyHost2856/meetings/${cmd2.runId}/transcript`,
+    { headers: asHost("dyHost2856") })).body, false);
+  // Restore keeps the tag and the store is a coerce fixed point.
+  assert.deepEqual(hub.getMeetings()[S][1].daily, { meetingAt: M2856, briefRunId: "a1" });
+  assert.deepEqual(hub.meetingsCoerce(JSON.parse(JSON.stringify(hub.getMeetings()))), hub.getMeetings());
+  delete hub.getDailyBriefSchedules()[S];
+  cleanup2508(S, ["dyHost2856"]);
+});
+
+test("XERK-2856: archive and unarchive a settled meeting; refusals in the hub's words; eviction prefers archived", async () => {
+  const S = "arA2856.atlassian.net";
+  await beat1574("arHost2856", S); // no meetings capability: a posted meeting stays queued
+  hub.putMeeting(S, okMeeting2510("k1"));
+  await postMeeting2508(S, meeting2508("q1"));
+  for (const [mid, body, status, re] of [["k1", {}, 400, /archived/], ["k1", { archived: "yes" }, 400, /archived/],
+    ["k1", [true], 400, /archived/], ["nope", { archived: true }, 404, /meeting/],
+    ["q1", { archived: true }, 409, /still being read/]]) {
+    const r = await archive2856(S, mid, body);
+    assert.equal(r.status, status, JSON.stringify([body, r.body]));
+    assert.match(r.body.error, re);
+  }
+  const phantom = await archive2856("nobody2856.atlassian.net", "k1", { archived: true });
+  assert.deepEqual([phantom.status, phantom.body.error], [404, "no host is in that org"]);
+  // Operator-authed: neither Tenir's token nor an agent's.
+  assert.equal((await archive2856(S, "k1", { archived: true }, meetHeaders2508)).status, 401);
+  assert.equal((await archive2856(S, "k1", { archived: true }, agentHeaders)).status, 401);
+  assert.equal("archivedAt" in hub.getMeetings()[S].find((m) => m.meetingId === "k1"), false);
+  const a = await archive2856(S, "k1", { archived: true });
+  assert.equal(a.status, 200);
+  const at = a.body.meeting.archivedAt;
+  assert.ok(Number.isSafeInteger(at) && at > 0);
+  assert.equal((await archive2856(S, "k1", { archived: true })).body.meeting.archivedAt, at, "re-archive keeps it");
+  const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.meetingProposals[S]
+    .find((m) => m.meetingId === "k1");
+  assert.equal(served.archivedAt, at);
+  // Tenir's duplicate answer never carries the operator's archive mark.
+  const dup = await postMeeting2508(S, meeting2508("k1"));
+  assert.deepEqual([dup.body.duplicate, "archivedAt" in dup.body.meeting], [true, false]);
+  assert.deepEqual(hub.meetingsCoerce(JSON.parse(JSON.stringify(hub.getMeetings()))), hub.getMeetings());
+  const un = await archive2856(S, "k1", { archived: false });
+  assert.deepEqual([un.status, "archivedAt" in un.body.meeting], [200, false]);
+  // A pending row never keeps an archive mark (a forged one is dropped).
+  assert.equal("archivedAt" in hub.sanitizeMeeting({ ...hub.getMeetings()[S].find((m) => m.meetingId === "q1"),
+    archivedAt: 5 }), false);
+  // Eviction: an archived settled row goes before an older unarchived one.
+  const rows = Array.from({ length: 51 }, (_, i) => hub.sanitizeMeeting(okMeeting2510(`e${i}`,
+    i === 10 ? { archivedAt: 1 } : {})));
+  const kept = hub.keepMeetings(rows);
+  assert.equal(kept.length, 50);
+  assert.deepEqual([kept.some((m) => m.meetingId === "e10"), kept.at(-1).meetingId], [false, "e50"]);
+  cleanup2508(S, ["arHost2856"]);
+});
+
+test("XERK-2856: reopen puts a rejected or failed proposal back, unarchives its meeting, refuses the rest", async () => {
+  const S = "roA2856.atlassian.net";
+  await beat1574("roHost2856", S);
+  hub.putMeeting(S, okMeeting2510("r1"));
+  const reopen = (iid) => review2510(S, "r1", iid, { action: "reopen" });
+  // A pending proposal, a logged decision: nothing to reopen.
+  assert.equal((await review2510(S, "r1", "p3", { action: "approve" })).status, 200);
+  for (const iid of ["p1", "p3"]) {
+    const r = await reopen(iid);
+    assert.deepEqual([r.status, r.body.error], [409, "only a rejected or failed proposal can be reopened"]);
+  }
+  assert.equal((await review2510(S, "r1", "p1", { action: "nope" })).status, 400);
+  assert.equal((await reopen("p9")).status, 404);
+  assert.equal((await review2510(S, "r1", "p1", { action: "reopen" }, agentHeaders)).status, 401);
+  // Rejected, archived: reopen clears the review and the archive mark.
+  assert.equal((await review2510(S, "r1", "p1", { action: "reject" })).status, 200);
+  assert.equal((await archive2856(S, "r1", { archived: true })).status, 200);
+  const r = await reopen("p1");
+  assert.equal(r.status, 200);
+  assert.deepEqual(["review" in r.body.meeting.items[0], "archivedAt" in r.body.meeting], [false, false]);
+  assert.equal(item2510(S, "r1", "p1").review, undefined);
+  assert.equal(item2510(S, "r1", "p3").review.state, "logged", "other reviews untouched");
+  // A failed create reopens too.
+  const m = hub.getMeetings()[S][0];
+  hub.putMeeting(S, { ...m, items: m.items.map((i) => (i.id === "p2"
+    ? { ...i, review: { state: "failed", at: Date.now(), error: "boom" } } : i)) });
+  assert.equal((await reopen("p2")).status, 200);
+  assert.equal(item2510(S, "r1", "p2").review, undefined);
+  delete hub.getDecisions()[S];
+  cleanup2508(S, ["roHost2856"]);
+});
+
+test("XERK-2856: the served row never leaks fields beyond the whitelist", async () => {
+  const S = "wlA2856.atlassian.net";
+  await meetHost2508("wlHost2856", S);
+  hub.getDailyBriefSchedules()[S] = hub.sanitizeDailyBriefSchedule(CHI2856);
+  await postMeeting2508(S, meeting2508("w1", { startedAt: M2856, endedAt: M2856 + 9e5, secret: "x" }));
+  hub.putMeeting(S, okMeeting2510("w0", { archivedAt: 7, daily: { meetingAt: M2856, briefRunId: "ab", x: 1 }, junk: 1 }));
+  const fleet = await request("GET", "/api/agents", { headers: userHeaders });
+  for (const row of fleet.body.meetingProposals[S]) {
+    for (const k of Object.keys(row)) assert.ok(WIRE_KEYS2856.has(k), k);
+    if (row.daily) for (const k of Object.keys(row.daily)) assert.ok(["meetingAt", "briefRunId"].includes(k), k);
+  }
+  const rows = fleet.body.meetingProposals[S];
+  assert.ok(rows.some((m) => m.status === "running" && m.daily), "a running daily row was checked");
+  assert.deepEqual(rows.find((m) => m.meetingId === "w0").daily, { meetingAt: M2856, briefRunId: "ab" });
+  delete hub.getDailyBriefSchedules()[S];
+  cleanup2508(S, ["wlHost2856"]);
+});

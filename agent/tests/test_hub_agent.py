@@ -56932,6 +56932,51 @@ class TestMeetingWorker(ManagerMixin, unittest.TestCase):
         [(_, stdin_text)] = self.calls
         self.assertNotIn("End of the meeting data", stdin_text)
 
+    def test_xerk2856_daily_brief_rides_the_prompt_after_the_meeting_data(self):
+        """The hub's pull carries the brief the reviewer read before the daily
+        standup: it is appended AFTER the meeting data, JSON-encoded, with the
+        don't-repeat-the-brief guidance; with a focus there is one closing line."""
+        tm = TestMeetingItems()
+        tm.doc, tm.t = self.doc, ha.normalize_meeting_transcript(
+            dict(self.doc, runId="ab12"), "ab12", self.SITE)
+        brief = {"meetingAt": 1, "day": 'Shipped ENG-7 "fast".‮', "week": "Two fixes.",
+                 "next": "x" * 2500}
+        self.doc = dict(self.doc, daily=brief)
+        self.replies = [tm.reply(tm.item())]
+        self.sm.handle_commands([dict(self._cmd(), cmdId="c1")])
+        [row] = self._drain()
+        self.assertEqual(row["status"], "ok")
+        [(_, stdin_text)] = self.calls
+        data_end = stdin_text.index(ha.meeting_input(tm.t, ha.meeting_repo_options(
+            self.sm.triage_cands))) + 1
+        tail = stdin_text[stdin_text.index("End of the meeting data"):]
+        self.assertGreater(stdin_text.index("End of the meeting data"), data_end)
+        self.assertIn("daily standup", tail)
+        self.assertIn(json.dumps('Shipped ENG-7 "fast".'), tail)   # JSON-encoded, bidi gone
+        self.assertIn('"x' + "x" * 1999 + '"', tail)                # bounded at 2000
+        self.assertNotIn("x" * 2001, tail)
+        self.assertNotIn("meetingAt", tail)
+        self.assertIn("NOT a new item", tail)
+        # With a focus too: the daily block follows it under the one closing line.
+        self.calls.clear()
+        self.replies = [tm.reply(tm.item())]
+        self.sm.handle_commands([dict(self._cmd(runId="cd34", focus={"names": ["Ann"]}), cmdId="c2")])
+        self._drain()
+        [(_, both)] = self.calls
+        self.assertEqual(both.count("End of the meeting data"), 1)
+        self.assertLess(both.index("Whose work"), both.index("daily standup"))
+
+    def test_xerk2856_no_daily_keeps_the_old_prompt(self):
+        for raw in (None, {}, "brief", [], {"day": 7, "week": None}, {"day": "  ​ "}):
+            self.assertIsNone(ha.normalize_meeting_daily(raw), raw)
+        self.assertEqual(ha.meeting_daily_instruction(None), "")
+        self.replies = [self._good_reply()]
+        self.sm.handle_commands([dict(self._cmd(), cmdId="c1")])
+        self._drain()
+        [(_, stdin_text)] = self.calls
+        self.assertNotIn("daily standup", stdin_text)
+        self.assertNotIn("End of the meeting data", stdin_text)
+
     def test_xerk2514_name_match_is_by_word_set(self):
         # Captions spell one person many ways; a clashing word is someone else.
         f = {"names": ["Malcolm Habeeb"], "role": ""}
