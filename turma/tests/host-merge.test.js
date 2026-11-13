@@ -57,7 +57,12 @@ const tenantSite = `${SITE}@${T}`;
 test("renamed hosts: seed the old names' history beside the live hosts", () => {
   // k8x-01 lives in a tenant now (the pre-tenancy migration bound it); its old
   // name's history is both untenanted (never migrated) and migrated.
+  // The pre-tenancy migration moved this deployment into tenant T.
+  Object.assign(hub.tenantMigrationMarker(), { completedAt: NOW - 864e5, tenantId: T });
   agents[`k8x-01@${T}`] = { device: "k8x-01", lastSeen: NOW, sessions: [] };
+  // Another tenant runs a host with the SAME new name: never a target for T's history.
+  agents[`K8X-01@${OTHER}`] = { device: "K8X-01", lastSeen: NOW, sessions: [] };
+  hub.ticketAgents[`${SITE}/ACME-7`] = { host: "MaxAI", at: NOW };
   agents["maxai-win"] = { device: "maxai-win", lastSeen: NOW, sessions: [] };
   seedHost(`k8x-01@${T}`, 50, tenantSite);
   seedHost("k8x", 30);
@@ -84,9 +89,11 @@ test("renamed hosts: every store's rows move to the live host", () => {
   // Nothing dropped: each old name's rows are on the live host.
   const perms = hub.permissionLedger.hostKeys();
   assert.ok(perms.includes(`k8x-01@${T}`) && perms.includes("maxai-win"));
-  // Usage merges by the high-water rule: the live card's day is the max of the three.
+  // Usage SUMS: the old names were different installs, so no era is dropped.
   const card = hub.usageLedger.retiredAgents([], NOW).find((r) => r.key === `k8x-01@${T}`);
-  assert.equal(card.usage.totals.input, 70);
+  assert.equal(card.usage.totals.input, 150);
+  assert.equal(hub.usageLedger.has(`K8X-01@${OTHER}`), false);
+  assert.equal(hub.ticketAgents[`${SITE}/ACME-7`].host, "maxai-win");
   assert.equal(archive.sessionRow("t-k8x").host, `k8x-01@${T}`);
   // An untenanted row moving into the tenant takes its org into the tenant too.
   assert.equal(siteOf("t-k8x"), tenantSite);
@@ -96,6 +103,19 @@ test("renamed hosts: every store's rows move to the live host", () => {
   // Another tenant's same-named host is untouched.
   assert.equal(hub.usageLedger.has(`maxai@${OTHER}`), true);
   assert.equal(archive.sessionRow(`t-maxai@${OTHER}`).host, `maxai@${OTHER}`);
+});
+
+test("renamed hosts: two eras' usage is kept whole (sum, never high-water)", () => {
+  const rep = (total, day, n) => {
+    const b = (x) => ({ input: x, output: 0, cacheWrite: 0, cacheRead: 0 });
+    return { totals: b(total), today: b(0), week: b(0), days: { [day]: b(n) }, sessions: 1, lastActivity: `${day}T00:00:00Z`, models: [] };
+  };
+  hub.usageLedger.ingest("eraold", { device: "eraold", usage: rep(2000, "2026-01-01", 40), repoUsage: [] });
+  hub.usageLedger.ingest("eranew", { device: "eranew", usage: rep(1970, "2026-09-01", 20), repoUsage: [] });
+  const total = (k) => hub.usageLedger.retiredAgents([], NOW).find((r) => r.key === k).usage.totals.input;
+  const before = total("eraold") + total("eranew");
+  assert.ok(hub.usageLedger.rekeyHost("eraold", "eranew", { rename: true }));
+  assert.equal(total("eranew"), before);
 });
 
 test("renamed hosts: a rerun moves nothing", () => {

@@ -437,6 +437,32 @@ function mergeSeries(dst, src) {
   return dst;
 }
 
+// Merge two DIFFERENT installs' series by SUM (XERK-2868, a renamed host): the old
+// name and the new one counted different transcript stores (k8x's cluster-wide
+// agent vs k8x-01's node agent; maxai's WSL home vs maxai-win's Windows one), so
+// neither figure is inside the other and the high-water `mergeSeries` would
+// DROP one era — its `cutoff` rule deletes every day the other side folded into
+// `pre`. Every bucket adds; a day at or before the merged cutoff is FOLDED into
+// `pre` (added, never deleted), so `pre + sum(days)` is exactly both totals.
+function sumSeries(dst, src) {
+  if (!src) return dst;
+  addBucket(dst.pre, src.pre);
+  for (const [d, b] of Object.entries(src.days)) addBucket(dst.days[d] || (dst.days[d] = blankBucket()), b);
+  if (src.cutoff && (!dst.cutoff || src.cutoff > dst.cutoff)) dst.cutoff = src.cutoff;
+  if (dst.cutoff) {
+    for (const d of Object.keys(dst.days)) {
+      if (d <= dst.cutoff) { addBucket(dst.pre, dst.days[d]); delete dst.days[d]; }
+    }
+  }
+  for (const [m, b] of Object.entries(src.models)) addBucket(dst.models[m] || (dst.models[m] = blankBucket()), b);
+  if (src.subagent) addBucket(dst.subagent || (dst.subagent = blankBucket()), src.subagent);
+  dst.sessions = (dst.sessions || 0) + (src.sessions || 0);
+  if (src.lastActivity && (!dst.lastActivity || src.lastActivity > dst.lastActivity)) dst.lastActivity = src.lastActivity;
+  trimModels(dst);
+  trimDays(dst);
+  return dst;
+}
+
 // Hold a series' model map to its cap, biggest spender first. Unlike a trimmed
 // DAY, a dropped model is not folded anywhere: it is a BREAKDOWN of totals that
 // are kept in full elsewhere, so dropping the smallest loses a row of detail and
@@ -911,16 +937,17 @@ let backend = fileBackend;
 // by `entryOf`/`seriesOf`). Every figure is the per-key MAXIMUM ever seen, never a
 // SUM — the two are the SAME durable history reported by different replicas, so a
 // day both saw is `max`, and summing would double-count it.
-function mergeTwoEntries(dst, src) {
+function mergeTwoEntries(dst, src, sum = false) {
   if (!src) return dst;
+  const merge = sum ? sumSeries : mergeSeries;
   if (src.host) {
-    if (dst.host) mergeSeries(dst.host, src.host);
+    if (dst.host) merge(dst.host, src.host);
     else dst.host = cloneSeries(src.host);
   }
   for (const [rk, r] of Object.entries(src.repos || {})) {
     if (rk === "__proto__" || !r) continue;
     if (dst.repos[rk]) {
-      mergeSeries(dst.repos[rk].series, r.series);
+      merge(dst.repos[rk].series, r.series);
       if (r.repo && !dst.repos[rk].repo) dst.repos[rk].repo = r.repo;
       if (r.remote && !dst.repos[rk].remote) dst.repos[rk].remote = r.remote;
     } else {
@@ -1545,7 +1572,7 @@ function isRenameOf(from, to) {
  * `to` that already holds history the two merge by the HIGH-WATER rule
  * (`mergeTwoEntries`: per-day max, never a sum — they are one machine's spend).
  * `opts.rename` instead moves it to ANOTHER host's key (a renamed host merged into
- * the name it beats as now, same high-water rule; `isRenameOf`).
+ * the name it beats as now; the two histories SUM (`sumSeries`, `isRenameOf`).
  * `opts.siteKey`, when a string, replaces the entry's org label (the caller scopes
  * it into the tenant too). `to` is persisted BEFORE `from` is dropped, so a crash in
  * between leaves a duplicate the next run merges away, never a loss. Returns
@@ -1556,7 +1583,9 @@ function rekeyHost(from, to, opts = {}) {
   if (!allowed || !Object.prototype.hasOwnProperty.call(hosts, from)) return false;
   const src = hosts[from];
   const dst = Object.prototype.hasOwnProperty.call(hosts, to) ? hosts[to] : null;
-  const entry = dst ? mergeTwoEntries(dst, src) : src;
+  // A rename joins two installs' histories: SUM them (`sumSeries`), never the
+  // high-water rule, which would drop one era (XERK-2868 QA).
+  const entry = dst ? mergeTwoEntries(dst, src, !!(opts && opts.rename)) : src;
   // `opts.siteKey`: the new org label, or a function of the current one.
   const site = opts && typeof opts.siteKey === "function" ? opts.siteKey(entry.siteKey) : opts && opts.siteKey;
   if (typeof site === "string" && site) entry.siteKey = site;

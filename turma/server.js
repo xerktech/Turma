@@ -8507,39 +8507,49 @@ registerTenantMigration({
 // live record, or an identity living there): that is a machine, not history.
 const HOST_MERGE_EVERY_MS = 10 * 60 * 1000;
 let hostMergeAt = 0;
+// Set once a pass finds nothing to move: an old name that never runs again gets
+// no new rows, so the full archive scan stops (a promoted leader checks once more).
+let hostMergesSettled = false;
 function hostMergePlan() {
   const archiveOwners = archive.listRowOwners();
   const pool = new Set([...Object.keys(agents), ...usageLedger.keys(), ...permissionLedger.hostKeys(),
     ...outcomeLedger.hostKeys(), ...archiveOwners.map((r) => r.host)]);
   const named = (name) => [...pool].filter((k) => typeof k === "string" &&
     baseOfKey(k).toLowerCase() === name.toLowerCase());
-  const livesAt = (k) => Object.prototype.hasOwnProperty.call(agents, k) ||
+  const isLive = (k) => Object.prototype.hasOwnProperty.call(agents, k);
+  const livesAt = (k) => isLive(k) ||
     Object.values(agentIdentities).some((e) => e && !e.revoked && !e.released && e.home === k);
   const plan = [];
   for (const [oldName, newName] of usageLedger.STATIC_HOST_ALIASES) {
-    const live = named(newName).filter((k) => Object.prototype.hasOwnProperty.call(agents, k));
-    const targets = live.length ? live : named(newName);
-    if (targets.length !== 1) {
-      if (targets.length > 1) {
-        logQueueState(`host-merge:${oldName}`, `host merge: ${logName(oldName)} -> ${logName(newName)} skipped — ` +
-          `${targets.length} hosts answer to ${logName(newName)}`);
-      }
-      continue;
-    }
-    const to = targets[0];
-    const tTo = tenantOfKey(to);
     for (const from of named(oldName)) {
-      if (from === to || livesAt(from)) continue;
+      if (livesAt(from)) continue;
       const tFrom = tenantOfKey(from);
-      // Never across tenants; an untenanted old name joins the host wherever it lives now.
-      if (tFrom && tFrom !== tTo) continue;
-      plan.push({ from, to, rescope: !tFrom && !!tTo ? tTo : "" });
+      // A target in the source's own world: its tenant, or — for an untenanted
+      // (pre-tenancy) old name — the operators' or the tenant the pre-tenancy
+      // migration moved this deployment into. Never another tenant's host that
+      // merely shares the name (QA: the owner's history landed in a stranger's).
+      const homeTenant = migratedTenant();
+      const fits = (k) => k !== from && (tenantOfKey(k) === tFrom || (!tFrom && !!homeTenant && tenantOfKey(k) === homeTenant));
+      const candidates = named(newName).filter(fits);
+      const live = candidates.filter(isLive);
+      const targets = live.length ? live : candidates;
+      if (targets.length !== 1) {
+        if (targets.length > 1) {
+          logQueueState(`host-merge:${from}`, `host merge: ${logName(from)} skipped — ` +
+            `${targets.length} hosts answer to ${logName(newName)}`);
+        }
+        continue;
+      }
+      const to = targets[0];
+      const tTo = tenantOfKey(to);
+      plan.push({ from, to, rescope: !tFrom && tTo ? tTo : "" });
     }
   }
   return { plan, archiveOwners };
 }
 function runHostMerges() {
   const { plan, archiveOwners } = hostMergePlan();
+  let pinsMoved = false;
   for (const { from, to, rescope } of plan) {
     const site = (s) => (rescope && plainKey(s) ? scopeSite(s, rescope) : s);
     const usage = usageLedger.rekeyHost(from, to, { rename: true, siteKey: rescope ? site : undefined });
@@ -8551,21 +8561,31 @@ function runHostMerges() {
       if (r.host !== from) continue;
       if (archive.rekeyOwner(r.transcriptId, to, typeof r.siteKey === "string" && r.siteKey ? site(r.siteKey) : r.siteKey)) rows++;
     }
-    if (usage || perms || outcomes || rows) {
+    // A ticket pinned to the old name follows it, as on an identity rename.
+    let pins = 0;
+    for (const p of Object.values(ticketAgents)) {
+      if (p && p.host === from) { p.host = to; pins++; }
+    }
+    if (pins) pinsMoved = true;
+    if (usage || perms || outcomes || rows || pins) {
       console.log(`host merge: ${logName(from)} -> ${logName(to)}: usage ${usage ? "merged" : "none"}, ` +
-        `${perms} permission row(s), ${outcomes} outcome row(s), ${rows} archived session(s)`);
+        `${perms} permission row(s), ${outcomes} outcome row(s), ${rows} archived session(s), ${pins} ticket pin(s)`);
       invalidateAgentsCache();
     }
+  }
+  if (pinsMoved) {
+    persistTicketAgents();
+    sseBroadcast("ticketAgents", ticketAgents);
   }
   return plan.length;
 }
 function hostMergeTick(now = Date.now()) {
-  if (now - hostMergeAt < HOST_MERGE_EVERY_MS) return;
+  if (hostMergesSettled || now - hostMergeAt < HOST_MERGE_EVERY_MS) return;
   // Under HA the outcome table loads after boot; merging into a half-loaded model
   // would lose the rows its rescan then brings back under the old name.
   if (!outcomeLedger.isLoaded()) return;
   hostMergeAt = now;
-  try { runHostMerges(); } catch (e) { console.error(`host merge failed: ${e && e.message}`); }
+  try { if (runHostMerges() === 0) hostMergesSettled = true; } catch (e) { console.error(`host merge failed: ${e && e.message}`); }
 }
 
 // The untenanted host and org keys the deployment holds now — recorded on the

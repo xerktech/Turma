@@ -198,9 +198,15 @@ paths:
 - **The static renames are MERGED, not only folded** (XERK-2868, `hostMergeTick`, leader, every
   10 min): each old name's usage, permission, outcome and archive rows are re-keyed onto the one
   host answering to the new name (`rekeyHost(..., {rename:true})`, `outcomeLedger.rekey`,
-  `archive.rekeyOwner`), each by its own merge rule — nothing is dropped.
-  - Never while the old name still runs (a live record or an identity homed there), never across
-    tenants; an untenanted old name joining a tenant host takes its org into the tenant.
+  `archive.rekeyOwner`, ticket pins) — nothing is dropped.
+  - **Usage SUMS on a rename (`sumSeries`), never high-water**: the two names were different
+    installs (cluster agent vs node agent; WSL vs native Windows), so neither counted the other's
+    transcripts, and `mergeSeries`'s cutoff rule deleted one era outright (QA: 50% lost).
+  - The target is in the source's own tenant, or — for an untenanted old name — the operators' or
+    `migratedTenant()`; never another tenant's host sharing the name (QA: history crossed tenants).
+  - Never while the old name still runs (a live record or an identity homed there); an untenanted
+    old name joining a tenant host takes its org into the tenant.
+  - A pass that moves nothing settles it for the process (the full archive scan stops).
   - Waits for HA's outcome rescan (`outcomeLedger.isLoaded`). Tests: `host-merge.test.js`.
 
 ### HA: the Postgres of-record backend (XERK-779, epic XERK-775; was Valkey XERK-758)
