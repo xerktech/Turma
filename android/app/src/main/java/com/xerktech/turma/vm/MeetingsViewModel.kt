@@ -17,7 +17,6 @@ import com.xerktech.turma.model.MeetingArchiveRequest
 import com.xerktech.turma.model.MeetingItem
 import com.xerktech.turma.model.MeetingReviewRequest
 import com.xerktech.turma.net.FleetState
-import com.xerktech.turma.net.OkResponse
 import com.xerktech.turma.net.hubErrorMessage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -30,6 +29,8 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
@@ -373,18 +374,33 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
             container.client.api.putDailyBriefSchedule(siteKey, fields)
         }
 
-    private fun save(siteKey: String, what: String, verb: String, call: suspend () -> retrofit2.Response<OkResponse>): Job =
+    /** What the hub answered a save with, per "site\u0000what"; [seq] tells two equal answers apart. */
+    data class Stored(val seq: Int, val body: JsonObject)
+
+    private val _stored = MutableStateFlow<Map<String, Stored>>(emptyMap())
+
+    /**
+     * The hub's answer to each section's last save that worked: the values as it
+     * STORED them (trimmed, case-corrected), which the settings fields show.
+     */
+    val stored: StateFlow<Map<String, Stored>> = _stored
+    private var storedSeq = 0
+
+    private fun save(siteKey: String, what: String, verb: String, call: suspend () -> retrofit2.Response<JsonObject>): Job =
         viewModelScope.launch {
             val key = "$siteKey\u0000$what"
             if (key in _saving.value) return@launch
             _saving.value = _saving.value + key
             _saved.value = _saved.value - key
+            var body: JsonObject? = null
             val err = try {
                 val r = call()
-                val out = r.body()
+                body = r.body()
+                val ok = (body?.get("ok") as? JsonPrimitive)?.booleanOrNull
                 when {
                     !r.isSuccessful -> hubErrorMessage(r)
-                    out != null && !out.ok -> out.error.ifBlank { "the hub refused it" }
+                    body != null && ok != true ->
+                        (body["error"] as? JsonPrimitive)?.contentOrNull?.ifBlank { null } ?: "the hub refused it"
                     else -> null
                 }
             } catch (e: CancellationException) {
@@ -396,7 +412,12 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
             _saving.value = _saving.value - key
             // Like every failure surface, the toast only ever means "it did not
             // happen"; a save that worked reads as "Saved" beside its button.
-            if (err != null) _messages.tryEmit("✗ $verb failed — $err") else _saved.value = _saved.value + key
+            if (err != null) {
+                _messages.tryEmit("✗ $verb failed — $err")
+            } else {
+                _stored.value = _stored.value + (key to Stored(++storedSeq, body ?: JsonObject(emptyMap())))
+                _saved.value = _saved.value + key
+            }
             container.fleet.nudge()
         }
 

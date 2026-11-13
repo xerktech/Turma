@@ -465,19 +465,19 @@ interface HubApi {
     suspend fun setMeetingFocus(
         @Path("siteKey") siteKey: String,
         @Body body: kotlinx.serialization.json.JsonObject,
-    ): Response<OkResponse>
+    ): Response<kotlinx.serialization.json.JsonObject>
 
     @POST("api/orgs/{siteKey}/meeting-label")
     suspend fun setMeetingLabel(
         @Path("siteKey") siteKey: String,
         @Body body: kotlinx.serialization.json.JsonObject,
-    ): Response<OkResponse>
+    ): Response<kotlinx.serialization.json.JsonObject>
 
     @PUT("api/orgs/{siteKey}/daily-brief/schedule")
     suspend fun putDailyBriefSchedule(
         @Path("siteKey") siteKey: String,
         @Body body: kotlinx.serialization.json.JsonObject,
-    ): Response<OkResponse>
+    ): Response<kotlinx.serialization.json.JsonObject>
 
     // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
     // like the agent pin — an authoritative 200. Body: {enabled:true|false}.

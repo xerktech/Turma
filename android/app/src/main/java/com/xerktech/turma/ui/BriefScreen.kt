@@ -93,7 +93,12 @@ import com.xerktech.turma.vm.MeetingsViewModel
 import com.xerktech.turma.vm.MetaState
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -640,6 +645,8 @@ private fun OrgSettings(
     val picks by mvm.picks.collectAsStateWithLifecycle()
     val saving by mvm.saving.collectAsStateWithLifecycle()
     val saved by mvm.saved.collectAsStateWithLifecycle()
+    val storedMap by mvm.stored.collectAsStateWithLifecycle()
+    val stored = storedMap
     LaunchedEffect(site) { mvm.ensureMeta(site) }
     val project = meetingProject(picks[site], (meta[site] as? MetaState.Projects)?.projects.orEmpty())
     fun k(what: String) = "$site\u0000$what"
@@ -677,21 +684,31 @@ private fun OrgSettings(
                 role, { role = it.take(300); mvm.clearSaved(site, "focus") }, Modifier.fillMaxWidth(),
                 label = { Text("Role (optional)") }, singleLine = true,
             )
-            // Once the hub took a save, show what it stores (trimmed, one per name).
-            LaunchedEffect(k("focus") in saved) {
-                if (k("focus") in saved) {
-                    namesD.saved(focusNames(names).joinToString("\n"))
-                    roleD.saved(role.trim())
-                }
+            // The hub's answer {focus: {names, role} | null} is what it stored.
+            LaunchedEffect(stored[k("focus")]?.seq) {
+                val body = stored[k("focus")]?.body ?: return@LaunchedEffect
+                val f = body.obj("focus")
+                val cleared = body["focus"] is JsonNull
+                namesD.stored(if (cleared) "" else (f?.get("names") as? JsonArray)
+                    ?.mapNotNull { (it as? JsonPrimitive)?.content }?.joinToString("\n"))
+                roleD.stored(if (cleared) "" else f?.str("role"))
             }
-            SaveRow("focus", k("focus") in saving, k("focus") in saved) { mvm.saveFocus(site, focusNames(names), role) }
+            SaveRow("focus", k("focus") in saving, k("focus") in saved) {
+                namesD.send(); roleD.send()
+                mvm.saveFocus(site, focusNames(names), role)
+            }
 
             // Tenir label (XERK-2638): blank goes back to the default slug.
             SectionLabel("Tenir label")
             val label = fleet.meetingLabels[site]
             val ownD = rememberDraft(site, if (label?.custom == true) label.label else "")
             var own by ownD
-            LaunchedEffect(k("label") in saved) { if (k("label") in saved) ownD.saved(own.trim().lowercase()) }
+            // The hub's answer {label, custom}: an operator's own label, or "" for the default.
+            LaunchedEffect(stored[k("label")]?.seq) {
+                val body = stored[k("label")]?.body ?: return@LaunchedEffect
+                val custom = (body["custom"] as? JsonPrimitive)?.booleanOrNull
+                ownD.stored(if (custom == null) null else if (custom) body.str("label") else "")
+            }
             Text(
                 when {
                     label == null -> "Tenir names this org by a label; this hub has not said which yet."
@@ -705,10 +722,10 @@ private fun OrgSettings(
                 own, { own = it.take(40); mvm.clearSaved(site, "label") }, Modifier.fillMaxWidth(),
                 label = { Text("Label (blank = default)") }, singleLine = true,
             )
-            SaveRow("label", k("label") in saving, k("label") in saved) { mvm.saveLabel(site, own) }
+            SaveRow("label", k("label") in saving, k("label") in saved) { ownD.send(); mvm.saveLabel(site, own) }
 
             ScheduleSection(site, fleet.dailyBriefSchedules[site], now, k("schedule") in saving,
-                k("schedule") in saved, { mvm.clearSaved(site, "schedule") }) { mvm.saveSchedule(site, it) }
+                k("schedule") in saved, storedMap[k("schedule")], { mvm.clearSaved(site, "schedule") }) { mvm.saveSchedule(site, it) }
             Spacer(Modifier.height(16.dp))
         }
     }
@@ -731,6 +748,7 @@ private fun ScheduleSection(
     now: Long,
     busy: Boolean,
     done: Boolean,
+    stored: MeetingsViewModel.Stored?,
     onEdit: () -> Unit,
     onSave: (kotlinx.serialization.json.JsonObject) -> Unit,
 ) {
@@ -747,12 +765,17 @@ private fun ScheduleSection(
     var days by daysD
     var lead by leadD
     var title by titleD
-    // Once the hub took a save, every field is clean and shows what it stores.
-    LaunchedEffect(done) {
-        if (done) {
-            enabledD.saved(enabled); timeD.saved(scheduleTime(time)); zoneD.saved(zone.trim())
-            daysD.saved(days); leadD.saved(lead); titleD.saved(title.trim())
-        }
+    // The hub's answer {schedule} is the schedule as it stored it.
+    LaunchedEffect(stored?.seq) {
+        val body = stored?.body ?: return@LaunchedEffect
+        // An answer with no schedule still marks the fields clean, as typed.
+        val sc = body.obj("schedule")
+        enabledD.stored((sc?.get("enabled") as? JsonPrimitive)?.booleanOrNull)
+        timeD.stored(sc?.str("time"))
+        zoneD.stored(sc?.str("timeZone"))
+        daysD.stored((sc?.get("weekdays") as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.intOrNull })
+        leadD.stored((sc?.get("leadMinutes") as? JsonPrimitive)?.intOrNull?.toString())
+        titleD.stored(if (sc == null) null else sc.str("meetingTitle") ?: "")
     }
     Text(
         nextBriefMeeting(s, now)?.let { "Next meeting " + briefWhenLabel(it, now, ZoneId.systemDefault(), Locale.getDefault()) }
@@ -796,6 +819,7 @@ private fun ScheduleSection(
         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
     SaveRow("schedule", busy, done) {
+        for (d in listOf(enabledD, timeD, zoneD, daysD, leadD, titleD)) d.send()
         // The hub merges these over the stored schedule and validates the
         // whole (a 400 in its words), so nothing is checked twice here.
         onSave(buildJsonObject {
@@ -819,13 +843,15 @@ internal fun scheduleTime(text: String): String {
 /**
  * A settings field's draft (QA): it follows the hub's value until the operator
  * edits it, then keeps the edit when the value changes elsewhere (the web keeps
- * an open draft over SSE). A save the hub took makes it clean again ([saved]),
- * showing the value as the hub will store it, so a later change from another
- * client is followed rather than overwritten by the next save. Rotation-safe.
+ * an open draft over SSE). Save records what was SENT ([send]); when the hub
+ * answers ([stored]) a field still holding that text takes the value as the hub
+ * stored it and follows the hub again, while one typed into since keeps the
+ * new text. Rotation-safe.
  */
 private class Draft<T : Any>(
     private val draft: androidx.compose.runtime.MutableState<T>,
     private val edited: androidx.compose.runtime.MutableState<Boolean>,
+    private val sent: androidx.compose.runtime.MutableState<T?>,
 ) {
     operator fun getValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>): T = draft.value
     operator fun setValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>, v: T) {
@@ -837,15 +863,30 @@ private class Draft<T : Any>(
         if (!edited.value) draft.value = remote
     }
 
-    fun saved(stored: T) {
-        draft.value = stored
+    fun send() {
+        sent.value = draft.value
+    }
+
+    /** The hub's stored value for this field, or null when its answer did not carry one. */
+    fun stored(v: T?) {
+        val was = sent.value ?: return
+        sent.value = null
+        if (draft.value != was) return // typed into while the save was in flight
+        if (v != null) draft.value = v
         edited.value = false
     }
 }
 
 @Composable
 private fun <T : Any> rememberDraft(site: String, remote: T): Draft<T> {
-    val d = Draft(rememberSaveable(site) { mutableStateOf(remote) }, rememberSaveable(site) { mutableStateOf(false) })
+    val d = Draft(
+        rememberSaveable(site) { mutableStateOf(remote) },
+        rememberSaveable(site) { mutableStateOf(false) },
+        remember(site) { mutableStateOf<T?>(null) },
+    )
     LaunchedEffect(remote) { d.follow(remote) }
     return d
 }
+
+private fun JsonObject.str(k: String): String? = (this[k] as? JsonPrimitive)?.takeIf { it.isString }?.content
+private fun JsonObject.obj(k: String): JsonObject? = this[k] as? JsonObject

@@ -187,7 +187,10 @@ class BriefScreenTest {
         // field follows it, and a save the hub rewrote ("0930" -> "09:30") must
         // not pin the field to the typed text and overwrite a later change.
         hub.json("/api/jira/$site/create-meta", """{ "projects": [] }""")
-        hub.json("/api/orgs/$site/daily-brief/schedule", """{ "ok": true }""")
+        // The hub answers with the schedule as it stored it.
+        hub.json("/api/orgs/$site/daily-brief/schedule", """{ "ok": true, "schedule": { "enabled": true,
+            "time": "23:00", "timeZone": "UTC", "weekdays": [0,1,2,3,4,5,6], "leadMinutes": 5,
+            "meetingTitle": "standup" } }""")
         hub.seedFleet("""
             { "now": 1, "agents": [ $host ], "dailyBriefSchedules": { "$site": $schedule },
               "meetingFocus": { "$site": { "names": ["Ann"], "role": "dev" } } }
@@ -216,5 +219,46 @@ class BriefScreenTest {
         fleet.onSseEvent("dailyBriefSchedules", """{ "$site": { "enabled": true, "time": "10:00",
             "timeZone": "UTC", "weekdays": [1], "leadMinutes": 5 } }""")
         compose.waitUntil(15_000) { compose.onAllNodesWithText("10:00").fetchSemanticsNodes().isNotEmpty() }
+    }
+
+    @Test fun `a save shows the values as the hub stored them, keeping text typed while it was in flight`() {
+        // XERK-2858 QA: the stored form comes from the hub's own answer (it
+        // trims and case-corrects), and a field typed into while the save was in
+        // flight keeps the new text instead of being replaced.
+        val release = java.util.concurrent.CountDownLatch(1)
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [] }""")
+        hub.json("/api/orgs/$site/meeting-focus",
+            """{ "ok": true, "focus": { "names": ["Ann"], "role": "Dev" } }""")
+        hub.route("/api/orgs/$site/daily-brief/schedule") {
+            release.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            okhttp3.mockwebserver.MockResponse().setHeader("Content-Type", "application/json").setBody(
+                """{ "ok": true, "schedule": { "enabled": true, "time": "08:00", "timeZone": "America/New_York",
+                    "weekdays": [1,2,3,4,5,6,0], "leadMinutes": 5, "meetingTitle": "standup" } }""")
+        }
+        hub.seedFleet("""
+            { "now": 1, "agents": [ $host ], "dailyBriefSchedules": { "$site": $schedule } }
+        """.trimIndent())
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        show(mvm = mvm)
+        compose.onNodeWithContentDescription("o settings").performClick()
+
+        compose.onNodeWithText("Names, one per line").performTextReplacement("Ann ")
+        compose.onNodeWithText("Role (optional)").performTextReplacement("Dev  ")
+        compose.onNodeWithTag("save-focus").performScrollTo().performClick()
+        compose.waitUntil(5_000) { compose.onAllNodesWithText("Dev").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Ann").assertExists()
+
+        compose.onNodeWithText("UTC").performScrollTo().performTextReplacement("america/new_york")
+        compose.onNodeWithText("23:59").performScrollTo().performTextReplacement("0800")
+        compose.onNodeWithTag("save-schedule").performScrollTo().performClick()
+        compose.waitUntil(5_000) { mvm.saving.value.isNotEmpty() }
+        compose.onNodeWithText("0800").performTextReplacement("0700") // typed while in flight
+        release.countDown()
+        compose.waitUntil(10_000) { mvm.saving.value.isEmpty() }
+        compose.waitUntil(5_000) {
+            compose.onAllNodesWithText("America/New_York").fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("0700").assertExists()
+        compose.onNodeWithText("08:00").assertDoesNotExist()
     }
 }
