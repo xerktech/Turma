@@ -220,6 +220,7 @@ class MeetingsScreenTest {
         }
         val vm = main.track(MeetingsViewModel(hub.app))
         show(vm)
+        open("Planning")
         compose.onNodeWithText("Maybe created — the host is gone — the ticket may have been created").assertExists()
         compose.onAllNodesWithText("Approve").assertCountEquals(0)
         compose.onAllNodesWithText("Edit").assertCountEquals(0)
