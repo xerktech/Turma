@@ -17,6 +17,8 @@
 # by long-lived sleeps, so the parts most likely to bite — the RUNDIR resolution,
 # `$!` capture, and the _pid/_alive round-trip — stay honest.
 set -uo pipefail
+# Run inside an agent session, these point at the host's live credential.
+unset TURMA_TOKEN_FILE TURMA_AGENT_ENV
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NATIVE_DIR="$(dirname "$HERE")/native"
