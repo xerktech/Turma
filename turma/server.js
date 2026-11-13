@@ -4768,11 +4768,18 @@ function validateDailyBriefSchedule(v) {
   if (typeof model !== "string" || !DAILY_BRIEF_MODELS.has(model)) {
     return { error: "model must be auto, haiku or sonnet" };
   }
+  // XERK-2856: a meeting whose title contains this (case-insensitive) is the
+  // org's daily meeting, whatever time it ran. "" / null / absent = none.
+  if (v.meetingTitle != null && (typeof v.meetingTitle !== "string" || [...v.meetingTitle].length > 100)) {
+    return { error: "meetingTitle must be text of at most 100 characters" };
+  }
+  const meetingTitle = meetingText(v.meetingTitle, 100);
   const value = {
     enabled: v.enabled, time: v.time, timeZone,
     weekdays: [...new Set(v.weekdays)].sort((a, b) => a - b),
     leadMinutes, model,
   };
+  if (meetingTitle) value.meetingTitle = meetingTitle;
   if (Number.isSafeInteger(v.updatedAt) && v.updatedAt > 0) value.updatedAt = v.updatedAt;
   return { value };
 }
@@ -5289,6 +5296,13 @@ function sanitizeMeeting(v) {
   if (meetingUrlOk(v.tenirUrl)) out.tenirUrl = v.tenirUrl;
   out.participants = [...new Set((Array.isArray(v.participants) ? v.participants : []).slice(0, 200)
     .map((p) => meetingText(p, 100)).filter(Boolean))].slice(0, 100);
+  // The org's daily meeting (XERK-2856), decided once at admission (meetingDailyOf).
+  if (v.daily && typeof v.daily === "object" && !Array.isArray(v.daily) && dbTime(v.daily.meetingAt) !== null) {
+    out.daily = { meetingAt: v.daily.meetingAt };
+    if (typeof v.daily.briefRunId === "string" && DAILY_BRIEF_RUN_ID_RE.test(v.daily.briefRunId)) {
+      out.daily.briefRunId = v.daily.briefRunId;
+    }
+  }
   if (typeof v.model === "string" && MEETING_MODEL_RE.test(v.model)) out.model = v.model;
   if (typeof v.host === "string" && v.host && v.host.length <= 200) out.host = v.host;
   if (typeof v.runId === "string" && DAILY_BRIEF_RUN_ID_RE.test(v.runId)) out.runId = v.runId;
@@ -5308,6 +5322,9 @@ function sanitizeMeeting(v) {
   } else if (!MEETING_PENDING.has(v.status)) {
     const at = dbTime(v.generatedAt);
     if (at !== null) out.generatedAt = at;
+    // The operator archived it (XERK-2856); a pending row never is.
+    const archivedAt = dbTime(v.archivedAt);
+    if (archivedAt !== null) out.archivedAt = archivedAt;
   }
   if (v.status === "ok") {
     if (!Array.isArray(v.items)) return null;
@@ -5318,11 +5335,14 @@ function sanitizeMeeting(v) {
   }
   return out;
 }
-// Bound an org's list to MEETINGS_KEEP: settled rows go first, oldest first.
+// Bound an org's list to MEETINGS_KEEP: archived settled rows go first, then
+// other settled rows, oldest first; a pending row only when all are pending.
 function keepMeetings(list) {
   const out = list.slice();
-  for (let i = out.length - 1; out.length > MEETINGS_KEEP && i >= 0; i--) {
-    if (!MEETING_PENDING.has(out[i].status)) out.splice(i, 1);
+  for (const drop of [(m) => m.archivedAt, () => true]) {
+    for (let i = out.length - 1; out.length > MEETINGS_KEEP && i >= 0; i--) {
+      if (!MEETING_PENDING.has(out[i].status) && drop(out[i])) out.splice(i, 1);
+    }
   }
   return out.slice(0, MEETINGS_KEEP);
 }
@@ -5430,9 +5450,10 @@ function meetingWire(m) {
   const { segments, cmdId, sentAt, attempt, tried, ...out } = m;
   return out;
 }
-// Tenir's answer: the row with no operator review on it (host, cmdId, key, project).
+// Tenir's answer: the row with no operator review on it (host, cmdId, key, project),
+// nor the hub's own daily link or archive mark (XERK-2856).
 function meetingTenirWire(m) {
-  const out = meetingWire(m);
+  const { daily, archivedAt, ...out } = meetingWire(m);
   if (Array.isArray(out.items)) out.items = out.items.map(({ review, ...it }) => it);
   return out;
 }
@@ -20896,9 +20917,51 @@ function meetingFromBody(body, now) {
   }
   if (!Array.isArray(body.segments) || !body.segments.length) return { error: "segments must be a non-empty list" };
   const row = sanitizeMeeting({ ...body, status: "queued", receivedAt: now, model: undefined,
-    host: undefined, runId: undefined, items: undefined, error: undefined });
+    host: undefined, runId: undefined, items: undefined, error: undefined,
+    daily: undefined, archivedAt: undefined });
   if (!row) return { error: "no segment carries any text" };
   return { row };
+}
+
+// Is this new meeting the org's daily one (XERK-2856)? Decided once, at
+// admission (never on restore): M is the org's scheduled meeting instant nearest
+// `startedAt` (the schedule's zone and weekdays; `enabled` or not — the schedule
+// still names when the meeting is). Daily when it started within
+// [M - MEETING_DAILY_BEFORE_MS, M + MEETING_DAILY_AFTER_MS], or its title holds
+// the schedule's `meetingTitle`. -> {meetingAt, briefRunId?} or null.
+const MEETING_DAILY_BEFORE_MS = 20 * 60e3;
+const MEETING_DAILY_AFTER_MS = 60 * 60e3;
+const MEETING_DAILY_BRIEF_LOOKBACK_MS = 24 * 3600e3;
+function meetingDailyOf(siteKey, row) {
+  const s = sanitizeDailyBriefSchedule(dailyBriefScheduleOf(siteKey));
+  if (!s) return null;
+  const at = row.startedAt;
+  let M = null;
+  for (const t of dailyBriefMeetings(s, at, -1, 1, 3)) {
+    if (M === null || Math.abs(t - at) < Math.abs(M - at)) M = t;
+  }
+  const byTime = M !== null && at >= M - MEETING_DAILY_BEFORE_MS && at <= M + MEETING_DAILY_AFTER_MS;
+  const byTitle = !!s.meetingTitle && row.title.toLowerCase().includes(s.meetingTitle.toLowerCase());
+  if (!byTime && !byTitle) return null;
+  const briefs = dailyBriefs[siteKey] || []; // newest first
+  let brief = null;
+  if (byTime) {
+    const forM = briefs.filter((b) => b.meetingAt === M);
+    brief = forM.find((b) => b.status === "ok") || forM[0] || null;
+  }
+  if (!brief) {
+    brief = briefs.find((b) => b.status === "ok" && b.generatedAt
+      && b.generatedAt <= at && at - b.generatedAt <= MEETING_DAILY_BRIEF_LOOKBACK_MS) || null;
+  }
+  return { meetingAt: byTime ? M : at, ...(brief ? { briefRunId: brief.runId } : {}) };
+}
+// The texts of a daily meeting's linked brief, for the agent's prompt — only
+// while that brief is still stored and `ok`.
+function meetingDailyBrief(siteKey, m) {
+  if (!m.daily || !m.daily.briefRunId) return null;
+  const b = (dailyBriefs[siteKey] || []).find((x) => x.runId === m.daily.briefRunId);
+  if (!b || b.status !== "ok") return null;
+  return { meetingAt: m.daily.meetingAt, day: b.day || "", week: b.week || "", next: b.next || "" };
 }
 
 const meetingPendingCount = (list) => (list || []).filter((m) => MEETING_PENDING.has(m.status)).length;
@@ -20963,11 +21026,12 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   if (sum(pending) > MEETINGS_PENDING_BYTES_MAX && sum(mine) > MEETINGS_PENDING_BYTES_MAX / tenants) {
     return { status: 429, body: { error: "the meetings already waiting to be read fill the hub's transcript budget — try again later" } };
   }
-  const kept = putMeeting(siteKey, row);
+  const daily = meetingDailyOf(siteKey, row);
+  const kept = putMeeting(siteKey, daily ? { ...row, daily } : row);
   if (!kept) return { status: 400, body: { error: "the meeting could not be stored" } };
   dispatchNextMeeting(siteKey, now);
   const m = meetingProposals[siteKey].find((x) => x.meetingId === row.meetingId) || kept;
-  return { status: 200, body: { ok: true, meeting: meetingWire(m) } };
+  return { status: 200, body: { ok: true, meeting: meetingTenirWire(m) } };
 }
 
 // runIds whose command THIS process queued or re-queued (the dailyBriefSent rule:
@@ -21126,8 +21190,8 @@ const MEETING_TICKET_DESC_MAX = 8000;
 function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   const refuse = (status, error) => ({ status, body: { error } });
   if (!body || typeof body !== "object" || Array.isArray(body)) return refuse(400, "the body must be an object");
-  if (body.action !== "approve" && body.action !== "reject") {
-    return refuse(400, 'action must be "approve" or "reject"');
+  if (body.action !== "approve" && body.action !== "reject" && body.action !== "reopen") {
+    return refuse(400, 'action must be "approve", "reject" or "reopen"');
   }
   if (!decidedOrgs().has(siteKey)) return refuse(404, "no host is in that org");
   const m = Object.hasOwn(meetingProposals, siteKey)
@@ -21137,6 +21201,17 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   const item = (m.items || []).find((i) => i.id === itemId);
   if (!item) return refuse(404, "no such proposal");
   const cur = item.review && item.review.state;
+  // Reopen (XERK-2856): a rejected or failed proposal goes back to pending, and
+  // its meeting, having pending work again, leaves the archive.
+  if (body.action === "reopen") {
+    if (cur !== "rejected" && cur !== "failed") {
+      return refuse(409, "only a rejected or failed proposal can be reopened");
+    }
+    const row = putMeeting(siteKey, { ...m, archivedAt: undefined,
+      items: m.items.map((i) => (i.id === itemId ? { ...i, review: undefined } : i)) });
+    return row ? { status: 200, body: { ok: true, meeting: meetingWire(row) } }
+      : refuse(500, "the review could not be stored");
+  }
   if (cur === "creating") return refuse(409, "that proposal's ticket is already being created");
   if (cur === "created") return refuse(409, `that proposal is already ticket ${item.review.key}`);
   if (cur === "logged") return refuse(409, "that decision is already logged");
@@ -21174,6 +21249,26 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   if (q.status !== 200) return q;
   return save({ state: "creating", at: now, project, issueType, cmdId: q.body.cmdId,
     host: q.body.host, ...(edited ? { edited: true } : {}), ...(body.start === true ? { start: true } : {}) });
+}
+
+// Archive (or, with archived:false, unarchive) a settled meeting (XERK-2856).
+// Re-archiving keeps the first archivedAt. A pending meeting is refused: it has
+// no proposals to put away yet.
+function archiveMeeting(siteKey, meetingId, body, now = Date.now()) {
+  const refuse = (status, error) => ({ status, body: { error } });
+  if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.archived !== "boolean") {
+    return refuse(400, "the body must be {archived: true|false}");
+  }
+  if (!decidedOrgs().has(siteKey)) return refuse(404, "no host is in that org");
+  const m = Object.hasOwn(meetingProposals, siteKey)
+    && meetingProposals[siteKey].find((x) => x.meetingId === meetingId);
+  if (!m) return refuse(404, "no such meeting");
+  if (MEETING_PENDING.has(m.status)) {
+    return refuse(409, "that meeting is still being read — archive it once it settles");
+  }
+  const row = putMeeting(siteKey, { ...m, archivedAt: body.archived ? (m.archivedAt || now) : undefined });
+  return row ? { status: 200, body: { ok: true, meeting: meetingWire(row) } }
+    : refuse(500, "the meeting could not be stored");
 }
 
 // Ask every host of the org to re-poll its board, so a just-created ticket
@@ -25008,9 +25103,11 @@ const server = http.createServer(async (req, res) => {
         const m = meetingRunOf(host, siteKey, runId);
         if (m) {
           // The agent is handed its org PLAIN (XERK-2551), as in its command.
+          // A daily meeting carries the brief the reviewer read (XERK-2856).
+          const daily = meetingDailyBrief(siteKey, m);
           return json(res, 200, { runId, siteKey: baseOfSite(siteKey), meetingId: m.meetingId, title: m.title,
             platform: m.platform, startedAt: m.startedAt, endedAt: m.endedAt,
-            participants: m.participants, segments: m.segments });
+            participants: m.participants, segments: m.segments, ...(daily ? { daily } : {}) });
         }
       }
       return json(res, 404, { error: "no such meeting run" });
@@ -27266,7 +27363,7 @@ const server = http.createServer(async (req, res) => {
     // The org must be one a host is DECIDED into, so a refusal mints no store key.
     // POST /api/orgs/<siteKey>/meetings/<meetingId>/items/<itemId> — the
     // operator's review of one proposed work item (XERK-2510), operator-authed
-    // (only the 4-part POST is Tenir's token route). Body {action:"approve"|
+    // (only the 4-part POST is Tenir's token route). Body {action:"approve"|"reopen"|
     // "reject", title?, description?, project?, issueType?, start?}. Approve
     // queues the org's createTicket (a decision goes to the decisions log
     // instead); answers {ok, meeting} or a refusal in the hub's words.
@@ -27279,6 +27376,24 @@ const server = http.createServer(async (req, res) => {
       try { body = JSON.parse((await readBody(req)) || "{}"); }
       catch { return json(res, 400, { error: "the body is not JSON" }); }
       const out = reviewMeetingItem(siteKey, meetingId, itemId, body);
+      return json(res, out.status, out.body);
+    }
+
+    // POST /api/orgs/<siteKey>/meetings/<meetingId>/archive {archived} — the
+    // operator puts a settled meeting away, or back (XERK-2856). Operator-authed
+    // like the item route; answers {ok, meeting} or a refusal in the hub's words.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 6 && parts[3] === "meetings" && parts[5] === "archive") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const meetingId = decodeURIComponent(parts[4]);
+      let body;
+      try {
+        body = JSON.parse((await readBody(req, 4096)) || "null");
+      } catch (e) {
+        if (e && (e.tooLarge || e.budgetExceeded)) throw e;
+        return json(res, 400, { error: "the body is not JSON" });
+      }
+      const out = archiveMeeting(siteKey, meetingId, body);
       return json(res, out.status, out.body);
     }
 
@@ -27429,7 +27544,7 @@ const server = http.createServer(async (req, res) => {
           return json(res, 400, { error: "schedule must be an object" });
         }
         const merged = { ...(dailyBriefScheduleOf(siteKey) || {}) };
-        for (const k of ["enabled", "time", "timeZone", "weekdays", "leadMinutes", "model"]) {
+        for (const k of ["enabled", "time", "timeZone", "weekdays", "leadMinutes", "model", "meetingTitle"]) {
           if (k in body) merged[k] = body[k];
         }
         merged.updatedAt = Date.now();
@@ -28853,7 +28968,7 @@ if (process.env.TURMA_TEST) {
     getMeetingLabelMisses: () => meetingLabelMisses, meetingLabelsCoerce, meetingLabelMissesCoerce,
     getMeetingFocus: () => meetingFocus, meetingFocusCoerce,
     meetingLabelSlug, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
-    putMeeting, reviewMeetingItem, settleMeetingReviews, meetingProposalsWire, MEETING_START_WAIT_MS,
+    putMeeting, reviewMeetingItem, settleMeetingReviews, archiveMeeting, meetingDailyOf, keepMeetings, meetingProposalsWire, MEETING_START_WAIT_MS,
     MEETING_CREATE_DEADLINE_MS, acceptMeeting,
     ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETINGS_PENDING_TOTAL_MAX, MEETINGS_PENDING_HARD_FACTOR, MEETING_RUN_TIMEOUT_MS,
     MEETING_QUEUE_MAX_MS, MEETINGS_KEEP, MEETINGS_AUTO_MODEL, DAILY_BRIEF_RUN_TIMEOUT_MS, DAILY_BRIEF_LATE_MS,

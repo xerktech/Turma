@@ -125,6 +125,7 @@ const ROUTES = [
   ["POST", "/api/jira/:site/:issue/triage", "org"],
   ["POST", "/api/jira/:site/:issue/epic-run", "org"],
   ["POST", "/api/orgs/:site/meetings/:id/items/:item", "org"],
+  ["POST", "/api/orgs/:site/meetings/:id/archive", "org"],
   ["POST", "/api/orgs/:site/meeting-label", "org"],
   ["POST", "/api/orgs/:site/meeting-focus", "org"],
   ["POST", "/api/orgs/:site/decisions", "org"],

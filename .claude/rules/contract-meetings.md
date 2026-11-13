@@ -82,11 +82,12 @@ ticket builds to this file; change it here first.
   remote watch); field order fixed, so a live row is a coerce fixed point.
   - **Written with no debounce** (`debounceMs: 0`): a 200 promises Tenir the meeting is kept.
 - Row: `{meetingId, status:"queued"|"running"|"ok"|"failed", title, platform, startedAt, endedAt,
-  tenirUrl?, participants, receivedAt, model?, host?, runId?, generatedAt?, error?, items?}`.
+  receivedAt, tenirUrl?, participants, daily?, model?, host?, runId?, generatedAt?, archivedAt?,
+  items?, error?}`.
   - `segments` are kept ONLY while `queued`/`running` and dropped once settled; a running row also
     keeps `cmdId, sentAt, attempt, tried`. None of those four, nor `segments`, is ever served.
-  - **Eviction drops settled rows first**, oldest first; a pending row is evicted only when all
-    are pending.
+  - **Eviction drops settled rows first** — archived ones before the rest — oldest first; a
+    pending row is evicted only when all are pending.
 - A meeting arriving while another of the org is running waits `queued`; ONE run per org.
 - An org no host is decided into loses its meetings 30 days after its newest one arrived.
 - **Served** as top-level `meetingProposals` on `/api/agents` + its own `meetingProposals` SSE
@@ -96,7 +97,7 @@ ticket builds to this file; change it here first.
 ## The operator's review (hub, XERK-2510)
 
 - `POST /api/orgs/<siteKey>/meetings/<meetingId>/items/<itemId>` — OPERATOR-authed (only the
-  4-part POST is Tenir's token route). Body `{action:"approve"|"reject", title?, description?,
+  4-part POST is Tenir's token route). Body `{action:"approve"|"reject"|"reopen", title?, description?,
   project?, issueType?, start?}`; answers `{ok, meeting}` or a refusal in the hub's words:
   400 body/action/fields → 404 org no host is decided into / meeting / item → 409 meeting not
   `ok`, item already `creating`/`created`/`logged`, or rejecting a rejected one.
@@ -125,6 +126,28 @@ ticket builds to this file; change it here first.
   board, then `enqueueTicketStart(..., "manual")` — the Start button's queue. Past
   `MEETING_START_WAIT_MS` (2h) it gives up with "start it from the board".
 - Tests: the `XERK-2510:` cases in `server.test.js` (a Jira org AND an ADO org).
+- **Reopen** (XERK-2856): `action:"reopen"` on a `rejected`/`failed` item removes its `review`
+  (pending again), and unarchives the meeting (it has pending work again). Else 409 "only a
+  rejected or failed proposal can be reopened".
+
+## Archive and the daily meeting (hub, XERK-2856)
+
+- `POST /api/orgs/<site>/meetings/<mid>/archive {archived: bool}` — OPERATOR-authed (in
+  `tenant-scope.js`; `isMeetingsIngest` is the 4-part POST only). Answers `{ok, meeting}`.
+  - 400 body → 404 org no host is decided into / meeting → 409 a `queued`/`running` meeting.
+  - `archivedAt` (epoch ms) on a SETTLED row only; re-archiving keeps the first; `false` deletes it.
+- **`daily: {meetingAt, briefRunId?}`** is decided ONCE, at Tenir's POST (`meetingDailyOf`), never
+  on restore or by Tenir's body (`meetingFromBody` drops a sent `daily`/`archivedAt`).
+  - M = the org's scheduled meeting nearest `startedAt` (`dailyBriefScheduleOf`, its zone and LOCAL
+    weekdays, `enabled` ignored). Daily when `startedAt` ∈ [M − 20 min, M + 60 min], or the title
+    contains the schedule's `meetingTitle` (case-insensitive).
+  - `meetingAt` = M on a time match, else the meeting's `startedAt`.
+  - `briefRunId` = the org's brief whose `meetingAt === M` (newest ok first, else newest), else
+    the newest `ok` brief generated in the 24h before `startedAt`; absent when none.
+- `meetingWire` serves `daily` and `archivedAt`; **neither Tenir answer does** (`meetingTenirWire`,
+  used for the first answer and the duplicate): they are the operator's, not Tenir's.
+- Tests: the `XERK-2856:` cases in `server.test.js` (window/weekday/zone, title, brief link,
+  transcript, archive, reopen, wire whitelist).
 
 ## Hub → agent: the `extractMeeting` command (XERK-2508 / XERK-2509)
 
@@ -150,6 +173,13 @@ ticket builds to this file; change it here first.
   decided into `siteKey` and the run is `running`; anything else is 404. The gate is
   `agentHostRefusal`, so (as on every `<host>` route) the operator login and, until
   `TURMA_AGENT_STRICT`, the master token pass it too.
+  - A daily meeting whose linked brief is still stored and `ok` adds `daily: {meetingAt, day,
+    week, next}` (the brief's texts, "" when a section is empty); absent otherwise (XERK-2856).
+  - The agent (`normalize_meeting_daily`, `meeting_daily_instruction`) appends it AFTER the
+    meeting data (after `focus`, under one closing line), JSON-encoded as the reviewer's context:
+    an update on work the brief lists is not new unless it adds a commitment, blocker or decision;
+    an item continuing a ticket the brief names mentions that key in its description.
+    `duplicateKeys` stays search-filled. An older agent ignores `daily`: no version gate.
 - Host: the SAME pick as the Daily Brief (`pickCapabilityHost`): `jiraHostPool(siteKey, true)` ∩
   `meetings.available === true`, a host with `claudeAuth.needsLogin` last, runtime/models as
   `pickDailyBriefHost`.

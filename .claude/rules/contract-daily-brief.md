@@ -17,7 +17,10 @@ ticket builds to this file; change it here first.
 
 - Store: `/data/daily-brief-schedules.json` (`DAILY_BRIEF_SCHEDULES_FILE`), a
   `registerExternalStore`, siteKey → `{enabled, time "HH:MM", timeZone, weekdays [0-6],
-  leadMinutes 1-30 (default 5), model "auto"|"haiku"|"sonnet" (default "auto"), updatedAt}`.
+  leadMinutes 1-30 (default 5), model "auto"|"haiku"|"sonnet" (default "auto"), meetingTitle?,
+  updatedAt}`.
+  - `meetingTitle` (XERK-2856): text ≤100 (`meetingText`-cleaned; "" / null = none, so absent).
+    A meeting whose title contains it is the org's daily meeting (`contract-meetings.md`).
   - `validateDailyBriefSchedule` is the ONE whitelist (route, restore, remote watch); the zone is
     stored as Intl spells it (which may rewrite an alias: `Asia/Kolkata` reads back
     `Asia/Calcutta` on node 24) and weekdays deduped + sorted, so the coerce
