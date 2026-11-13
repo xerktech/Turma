@@ -114,6 +114,11 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   the tracker call and the ack beat let the hub's re-delivery file a second ticket. Marked started
   BEFORE the call; a re-delivered cmdId re-stages the stored row, or `maybeCreated: true` when the
   start had no answer (the hub keeps that flag, so Reopen stays refused). Tests: `xerk2867` cases.
+- **`boardCreateMeta` is fetched OFF the beat** (XERK-2880, `_create_meta_async`): the project
+  page-through + label read + type read can pass the inline allowance (`contract-agent-hub.md`).
+  `handle_commands` only starts the worker; a repeat for a project already in flight is dropped.
+  Results append under `_create_meta_lock` and are cleared by identity, like `merge_pr_results`.
+  The hub waits for the late result (`ASYNC_RESULT_KINDS`). Tests: `TestStageCreateMeta`.
 - `set_board_status` **re-reads the available options and applies only a `value` still on offer** —
   the board's workflow decides what a ticket can move to, not the browser.
 - A drag-and-drop move POSTs the target **COLUMN**, not a transition: `_status_option_for_column`

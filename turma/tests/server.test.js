@@ -7542,6 +7542,17 @@ test("http: the create caches are stripped from the /api/agents payload", async 
 // agent handled them.
 const ackBeat = (device, siteKey, cmdIds, extra = {}) =>
   jiraBeat(device, siteKey, { ackedCommands: cmdIds, ...extra });
+// XERK-2880: boardCreateMeta's result rides a LATER beat (an agent worker), so
+// an ack alone proves no gap — only a wait left resultless past RESULT_WAIT_MAX_MS.
+// Ack, age the wait past that bound, and beat again so the hub settles it.
+const ackBeatPastWait = async (device, siteKey, cmdIds, extra = {}) => {
+  await ackBeat(device, siteKey, cmdIds, extra);
+  for (const id of cmdIds) {
+    const w = (agents[device] && agents[device].resultWaits || {})[id];
+    if (w) w.at = Date.now() - (RESULT_WAIT_MAX_MS + 1000);
+  }
+  return jiraBeat(device, siteKey, extra);
+};
 
 test("http: an acked boardCreateMeta that staged nothing proves the agent is too old", async () => {
   await jiraBeat("gap1", "gap1.atlassian.net", { agentVersion: "0.5.38" });
@@ -7553,8 +7564,14 @@ test("http: an acked boardCreateMeta that staged nothing proves the agent is too
   const still = await request("GET", "/api/jira/gap1.atlassian.net/create-meta", { headers: userHeaders });
   assert.equal(still.status, 202, "an undelivered command must not read as a gap");
 
-  // Acked, with no createMetaResults: the agent doesn't implement it.
+  // Acked, with no createMetaResults: the result rides a later beat now
+  // (XERK-2880: fetched on a worker), so the ack alone concludes nothing...
   await ackBeat("gap1", "gap1.atlassian.net", [first.body.cmdId], { agentVersion: "0.5.38" });
+  assert.equal((agents.gap1.unsupported || {}).boardCreateMeta, undefined,
+    "an acked async command with no result yet is not a gap");
+  // ...until it stays resultless past RESULT_WAIT_MAX_MS: the agent doesn't implement it.
+  agents.gap1.resultWaits[first.body.cmdId].at = Date.now() - (RESULT_WAIT_MAX_MS + 1000);
+  await jiraBeat("gap1", "gap1.atlassian.net", { agentVersion: "0.5.38" });
   const res = await request("GET", "/api/jira/gap1.atlassian.net/create-meta", { headers: userHeaders });
   assert.equal(res.status, 200);
   assert.match(res.body.error, /too old to offer the New-ticket options/);
@@ -7590,7 +7607,7 @@ test("http: New-ticket meta routes AROUND a too-old host to a capable sibling", 
   const first = await request("GET", `/api/jira/${site}/create-meta`, { headers: userHeaders });
   assert.equal(first.status, 202);
   await jiraBeat("gaproute-old", site, { agentVersion: "2.0.48" }); // deliver the command
-  await ackBeat("gaproute-old", site, [first.body.cmdId], { agentVersion: "2.0.48" });
+  await ackBeatPastWait("gaproute-old", site, [first.body.cmdId], { agentVersion: "2.0.48" });
 
   // The next read must NOT refuse: it routes to the capable sibling and queues a
   // fetch there, instead of returning the head's "too old" error.
@@ -7621,8 +7638,8 @@ test("http: New-ticket meta still refuses when EVERY host of the org is too old"
     // settles; the other ack is a harmless no-op).
     await jiraBeat("gapall-a", site, { agentVersion: "2.0.48" });
     await jiraBeat("gapall-b", site, { agentVersion: "2.0.48" });
-    await ackBeat("gapall-a", site, [q.body.cmdId], { agentVersion: "2.0.48" });
-    await ackBeat("gapall-b", site, [q.body.cmdId], { agentVersion: "2.0.48" });
+    await ackBeatPastWait("gapall-a", site, [q.body.cmdId], { agentVersion: "2.0.48" });
+    await ackBeatPastWait("gapall-b", site, [q.body.cmdId], { agentVersion: "2.0.48" });
   }
 
   const res = await request("GET", `/api/jira/${site}/create-meta`, { headers: userHeaders });
@@ -7633,7 +7650,7 @@ test("http: New-ticket meta still refuses when EVERY host of the org is too old"
 test("http: the per-project type fetch proves its gap on its own project", async () => {
   await jiraBeat("gap3", "gap3.atlassian.net", { agentVersion: "0.5.38" });
   const q = await request("GET", "/api/jira/gap3.atlassian.net/create-meta?project=ENG", { headers: userHeaders });
-  await ackBeat("gap3", "gap3.atlassian.net", [q.body.cmdId], { agentVersion: "0.5.38" });
+  await ackBeatPastWait("gap3", "gap3.atlassian.net", [q.body.cmdId], { agentVersion: "0.5.38" });
   const res = await request("GET", "/api/jira/gap3.atlassian.net/create-meta?project=ENG", { headers: userHeaders });
   assert.equal(res.status, 200);
   assert.match(res.body.error, /too old/);
@@ -7642,7 +7659,7 @@ test("http: the per-project type fetch proves its gap on its own project", async
 test("http: an updated agent earns the feature back on its version change", async () => {
   await jiraBeat("gap4", "gap4.atlassian.net", { agentVersion: "0.5.38" });
   const first = await request("GET", "/api/jira/gap4.atlassian.net/create-meta", { headers: userHeaders });
-  await ackBeat("gap4", "gap4.atlassian.net", [first.body.cmdId], { agentVersion: "0.5.38" });
+  await ackBeatPastWait("gap4", "gap4.atlassian.net", [first.body.cmdId], { agentVersion: "0.5.38" });
   assert.match(
     (await request("GET", "/api/jira/gap4.atlassian.net/create-meta", { headers: userHeaders })).body.error,
     /too old/);
@@ -7680,6 +7697,8 @@ test("http: the gap bookkeeping is stripped from /api/agents but the gaps are no
   await jiraBeat("gap7", "gap7.atlassian.net", { agentVersion: "0.5.38" });
   const first = await request("GET", "/api/jira/gap7.atlassian.net/create-meta", { headers: userHeaders });
   await ackBeat("gap7", "gap7.atlassian.net", [first.body.cmdId], { agentVersion: "0.5.38" });
+  agents.gap7.resultWaits[first.body.cmdId].at = Date.now() - (RESULT_WAIT_MAX_MS + 1000);
+  await jiraBeat("gap7", "gap7.atlassian.net", { agentVersion: "0.5.38" });
   const res = await request("GET", "/api/agents", { headers: userHeaders });
   const rec = res.body.agents.find((a) => a.key === "gap7");
   assert.equal(rec.resultWaits, undefined);
@@ -16133,13 +16152,25 @@ test("a per-project boardCreateMeta ack rides the agent's PROVEN capability, not
   assert.equal(next.resultWaits.p1, undefined);
 });
 
+// XERK-2880: the agent fetches create-meta on a WORKER, so its result rides a
+// later beat than the ack — an ack alone is no evidence of a gap.
+test("XERK-2880: an acked boardCreateMeta with no result yet keeps waiting", () => {
+  const next = {
+    agentVersion: "2.3.60", unsupported: {}, createMeta: null, createTypes: {},
+    resultWaits: { c1: { kind: "boardCreateMeta", at: Date.now() } },
+  };
+  resolveResultWaits({ agentVersion: "2.3.60" }, next, []);
+  assert.equal(next.unsupported.boardCreateMeta, undefined);
+  assert.ok(next.resultWaits.c1, "the wait survives for the late result to clear");
+});
+
 test("a genuinely-old agent that has NEVER populated a create-meta cache still stamps the gap", () => {
   const next = {
     agentVersion: "0.5.38",
     unsupported: {},
     createMeta: null,   // a too-old agent acks boardCreateMeta as unknown and stages nothing
     createTypes: {},
-    resultWaits: { c1: { kind: "boardCreateMeta", at: Date.now() } },
+    resultWaits: { c1: { kind: "boardCreateMeta", at: Date.now() - (RESULT_WAIT_MAX_MS + 1000) } },
   };
   resolveResultWaits({ agentVersion: "0.5.38" }, next, []);
   assert.ok(next.unsupported.boardCreateMeta,

@@ -27752,7 +27752,7 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         for name in ("history_results", "subagent_history_results",
                      "jira_issue_results", "ticket_status_results",
-                     "create_meta_results", "create_ticket_results",
+                     "create_ticket_results",
                      "ticket_priority_results", "ticket_link_results"):
             getattr(sm, name).append({"cmdId": name})
         delivered = {"migrationId": "m1"}
@@ -27764,7 +27764,7 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
         sm._clear_delivered_staged(payload)
         for name in ("history_results", "subagent_history_results",
                      "jira_issue_results", "ticket_status_results",
-                     "create_meta_results", "create_ticket_results",
+                     "create_ticket_results",
                      "ticket_priority_results", "ticket_link_results"):
             self.assertEqual(getattr(sm, name), [], name)
         self.assertEqual(sm.spawn_failures, [late])
@@ -43574,6 +43574,59 @@ class TestStageCreateMeta(ManagerMixin, unittest.TestCase):
                                  AZDO_URL="", AZDO_TOKEN=""):
             sm._stage_create_meta(None)
         self.assertIn("no board credentials", sm.create_meta_results[0]["error"])
+
+    # XERK-2880: the tracker reads run OFF the beat.
+    def test_dispatch_only_stages_the_fetch_on_a_worker(self):
+        sm = self.make_manager()
+        with mock.patch.object(sm, "_create_meta_async") as f, \
+                mock.patch.object(sm, "_stage_create_meta") as inline:
+            sm.handle_commands([{"cmdId": "m1", "type": "boardCreateMeta",
+                                 "project": "ENG"}])
+        f.assert_called_once_with("ENG")
+        inline.assert_not_called()
+        self.assertIn("m1", sm.acked)
+
+    def test_the_worker_fetches_and_a_repeat_in_flight_is_dropped(self):
+        sm = self.make_manager()
+        started = []
+
+        class FakeThread:
+            def __init__(self, target, args, **kw):
+                self.target, self.args = target, args
+
+            def start(self):
+                started.append(self)
+        with mock.patch.object(ha.threading, "Thread", FakeThread):
+            sm._create_meta_async(None)
+            sm._create_meta_async(None)   # same request while the first runs
+            sm._create_meta_async("ENG")
+        self.assertEqual([t.args for t in started], [("",), ("ENG",)])
+        with self._cfg(), mock.patch.object(
+                ha, "board_create_meta",
+                return_value={"projects": [], "labels": [], "source": "jira"}):
+            started[0].target(*started[0].args)
+        self.assertEqual(sm.create_meta_results[0]["source"], "jira")
+        self.assertNotIn("", sm._create_meta_inflight, "a finished fetch frees its slot")
+
+    def test_a_failed_thread_start_stages_an_error_on_the_beat(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.threading, "Thread",
+                               side_effect=RuntimeError("pids_limit")):
+            sm._create_meta_async("ENG")
+        r = sm.create_meta_results[0]
+        self.assertEqual(r["project"], "ENG")
+        self.assertIn("could not start", r["error"])
+        self.assertEqual(sm._create_meta_inflight, set())
+
+    def test_a_result_appended_mid_beat_survives_the_clear(self):
+        sm = self.make_manager()
+        sent = {"project": None, "error": None}
+        sm.create_meta_results[:] = [sent]
+        payload = {"createMetaResults": [sent]}
+        late = {"project": "ENG", "types": [], "error": None}
+        sm.create_meta_results.append(late)
+        sm._clear_delivered_staged(payload)
+        self.assertEqual(sm.create_meta_results, [late])
 
 
 class TestStageCreateTicket(ManagerMixin, unittest.TestCase):

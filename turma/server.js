@@ -12122,7 +12122,8 @@ function resultLanded(agent, cmdId, wait) {
 // throttling auto-merge to ~one PR per host per 30 min (the XERK-659 stall was
 // this, not the no-CI grace). Only a genuinely-old agent — which stages a result
 // NEVER — reaches the RESULT_WAIT_MAX_MS timeout, and only then is it a real gap.
-const ASYNC_RESULT_KINDS = new Set(["mergePr"]);
+// `boardCreateMeta` fetches its tracker reads on a worker too (XERK-2880).
+const ASYNC_RESULT_KINDS = new Set(["mergePr", "boardCreateMeta"]);
 
 // Settle every awaited command this beat acked (i.e. that has just left the
 // queue). Runs AFTER the ingests, so `next` already holds anything the beat
