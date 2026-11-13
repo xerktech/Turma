@@ -6003,7 +6003,7 @@ function noteEpicRunDoneChildren(run, rows) {
 // Returns a null-prototype map in `run.children` order (a coerce fixed point), or
 // null when no child has a title.
 function epicRunChildTitles(run, rows, prev) {
-  const seen = {};
+  const seen = Object.create(null);
   for (const key of run.children || []) {
     const r = rows.get(ticketQueueKey(run.siteKey, key));
     const t = r && r.row && r.row.summary;
@@ -6023,7 +6023,8 @@ function epicRunTitlesOf(children, raw) {
     if (!Object.hasOwn(raw, key)) continue;
     const t = raw[key];
     if (typeof t !== "string" || !t.trim()) continue;
-    out[key] = t.slice(0, 200);
+    // Cut by code point, and never leave half a surrogate pair at the end.
+    out[key] = [...t].slice(0, 200).join("");
     any = true;
   }
   return any ? out : null;
@@ -28845,7 +28846,7 @@ if (process.env.TURMA_TEST) {
     buildEpicWaves,
     epicChildRows,
     isEpicOrEpicChild, isRollupTicket,
-    sanitizeEpicRunRecord,
+    sanitizeEpicRunRecord, noteEpicRunDoneChildren, epicRunTitlesOf,
     EPIC_RUN_STATES,
     // Epic Builder (XERK-725, epic XERK-721): the durable run store, its arm/clear
     // + advance helpers, the heartbeat-status ingest, the dispatch driver, the

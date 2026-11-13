@@ -261,7 +261,7 @@ const {
   epicRuns, armEpicRun, clearEpicRun, setEpicRunPaused, setEpicRunLimit, epicRunActiveCount,
   fleetTicketRows,
   buildEpicWaves, epicChildRows,
-  isEpicOrEpicChild, isRollupTicket, sanitizeEpicRunRecord,
+  isEpicOrEpicChild, isRollupTicket, sanitizeEpicRunRecord, noteEpicRunDoneChildren, epicRunTitlesOf,
   epicBuilders, armEpicBuilder, clearEpicBuilder, advanceEpicBuilder,
   ingestEpicBuilderStatus, epicBuilderDriveSweep, epicBuilderClaimLapsed,
   EPIC_BUILDER_REDISPATCH_MS, EPIC_BUILDER_ORPHAN_MS, sanitizeEpicBuilderRecord,
@@ -14988,6 +14988,32 @@ test("XERK-2673: an aged-off child keeps its title on the run", async () => {
   assert.deepEqual(Object.keys(clean.childTitles), ["C-1"]);
   assert.equal(clean.childTitles["C-1"].length, 200);
   assert.equal("childTitles" in sanitizeEpicRunRecord({ ...run, childTitles: "nope" }), false);
+  // A cut never splits an emoji.
+  const emoji = sanitizeEpicRunRecord({ ...run, childTitles: { "C-1": "x".repeat(199) + "\u{1F600}z" } });
+  assert.equal(emoji.childTitles["C-1"], "x".repeat(199) + "\u{1F600}");
+});
+
+test("XERK-2673: childTitles keeps the coerce key order when a child goes Done later, and a quiet sweep changes nothing", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  const site = "e2673o.atlassian.net";
+  const c1 = { ...dChild("C-1", [], "todo"), summary: "First" };
+  const c2 = { ...dChild("C-2", ["C-1"], "todo"), summary: "Second" };
+  await asBeat("ed2673o", site, { autoStart: false, tickets: [dEpic(), c1, c2] });
+  armEpicRun(site, "E-1");
+  const run = epicRuns[`${site}/E-1`];
+  assert.equal("doneChildren" in run, false);
+  await asBeat("ed2673o", site, { autoStart: false, tickets: [dEpic(), { ...c1, statusCategory: "done" }, c2] });
+  const rows = fleetTicketRows();
+  assert.equal(noteEpicRunDoneChildren(run, rows), true);
+  assert.equal(JSON.stringify(sanitizeEpicRunRecord(run)), JSON.stringify(run),
+    "doneChildren added after childTitles still lands before it");
+  assert.equal(noteEpicRunDoneChildren(run, rows), false, "nothing moved, so nothing to persist");
+  // A child keyed __proto__ keeps its title through a sweep.
+  const proto = { ...run, children: ["__proto__"], childTitles: undefined };
+  proto.childTitles = epicRunTitlesOf(["__proto__"], JSON.parse('{"__proto__":"pp"}'));
+  noteEpicRunDoneChildren(proto, new Map());
+  assert.equal(proto.childTitles["__proto__"], "pp");
 });
 
 test("XERK-2673: an OPEN child that went unlisted keeps the run open (no epic Done write)", async () => {
