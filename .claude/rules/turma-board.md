@@ -385,6 +385,9 @@ button and the auto-start sweep.
   means unhandled.
 - `awaitResult`/`resolveResultWaits` settle each queued command, writing `agent.unsupported[kind]`;
   waiting routes refuse with `agentGapError` — create-meta `200 {error}`, create/status `409`.
+- **`boardCreateMeta` and `mergePr` are the exceptions** (`ASYNC_RESULT_KINDS`): the agent runs
+  them on a worker (XERK-2880, XERK-550), so the result lands a beat AFTER the ack. Their gap is
+  concluded only after `RESULT_WAIT_MAX_MS` (5 min) with no result. A new off-beat kind joins it.
 - A gap **clears** on a result landing, `agentVersion` changing, or `UNSUPPORTED_TTL_MS` (backstop
   for a version that doesn't move). Conclude nothing from a queued command. `resultWaits` is
   stripped from the payload; `unsupported` rides it. Tests: `server.test.js`.

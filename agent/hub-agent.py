@@ -22657,6 +22657,9 @@ JIRA_REFRESH_EVERY = _env_int("TURMA_JIRA_REFRESH_EVERY", 30)  # beats between p
 # because only it sees the whole fleet and can spread the org's sessions across
 # ALL its agents.
 JIRA_TIMEOUT_SEC = 15
+# Whole-body bound on a tracker JSON read (XERK-2880): the socket timeout is
+# per read, so a dripping server could otherwise hold the caller forever.
+BOARD_READ_DEADLINE_SEC = _env_int("TURMA_BOARD_READ_DEADLINE_SEC", 60, minimum=1)
 JIRA_PAGE_SIZE = 100    # /search/jql hard-caps maxResults at 100
 JIRA_MAX_ACTIVE = 150   # not-Done tickets reported (bounds the heartbeat)
 JIRA_MAX_DONE = 50      # recently-Done tickets reported
@@ -22835,14 +22838,38 @@ class BoardHttpError(RuntimeError):
         self.code = code
 
 
+def _read_body_by(resp, deadline):
+    """Read a whole reply body, but give up at `deadline` (monotonic). The
+    socket timeout bounds each READ only, so a server dripping a byte every few
+    seconds never trips it (XERK-2880 QA: a create-meta worker hung forever,
+    and the hub then read the silent agent as too old to implement it)."""
+    read1 = getattr(resp, "read1", None)
+    if read1 is None:
+        return resp.read()
+    chunks = []
+    while True:
+        chunk = read1(65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        # A body whose last chunk lands past the deadline is still whole: only
+        # refuse once more is pending (Content-Length says so, else unknown).
+        if time.monotonic() > deadline and getattr(resp, "length", 1) != 0:
+            raise TimeoutError(
+                f"tracker reply still arriving after {BOARD_READ_DEADLINE_SEC}s")
+
+
 def _board_urlopen(req):
     """Send one prepared tracker request and parse its JSON reply ({} when the
     body is empty — a Jira transition answers 204). An HTTP error is re-raised
     carrying the server's own explanation; everything else (DNS, TLS, timeout)
-    propagates untouched, since urllib already stringifies those usefully."""
+    propagates untouched, since urllib already stringifies those usefully. The
+    body read is bounded in TOTAL time (`BOARD_READ_DEADLINE_SEC`), not just per
+    read."""
+    deadline = time.monotonic() + BOARD_READ_DEADLINE_SEC
     try:
         with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
-            raw = resp.read().decode()
+            raw = _read_body_by(resp, deadline).decode()
     except urllib.error.HTTPError as e:
         raise BoardHttpError(_http_error_detail(e), getattr(e, "code", None)) from e
     return json.loads(raw) if raw.strip() else {}
@@ -28463,6 +28490,12 @@ class SessionManager:
         # new ticket (create_ticket_results), both riding the next beat with the
         # same held-across-a-failed-POST lifecycle as jira_issue_results.
         self.create_meta_results = []
+        # create_meta_results has an OFF-BEAT writer (XERK-2880: the tracker
+        # reads run on a worker, _create_meta_async), so appends are lock-guarded
+        # and the beat clears only what it delivered BY IDENTITY, like
+        # merge_pr_results. _create_meta_inflight dedupes a re-asked project.
+        self._create_meta_lock = threading.Lock()
+        self._create_meta_inflight = set()
         self.create_ticket_results = []
         # Staged `setTicketPriority` results (XERK-483: the triage band written
         # back to the tracker's priority field) — same held-across-a-failed-POST
@@ -41134,34 +41167,71 @@ class SessionManager:
     # discipline as _stage_jira_issue (the form is waiting on an answer either
     # way): the metadata a form open needs, and the outcome of a create POST.
 
+    def _create_meta_async(self, project):
+        """Run a {type:"boardCreateMeta"} command on its OWN thread, never the
+        beat (XERK-2880, XERK-395): the project page-through, the label read and
+        a type read are each bounded only by JIRA_TIMEOUT_SEC, which together
+        exceed the inline allowance. A request for a project already being
+        fetched is dropped (its answer is on the way). A failed Thread.start()
+        (pids_limit) is staged as an error HERE, on the beat, so the form is
+        told rather than left waiting."""
+        proj = (project or "").strip()
+        with self._create_meta_lock:
+            if proj in self._create_meta_inflight:
+                return
+            self._create_meta_inflight.add(proj)
+        try:
+            threading.Thread(target=self._run_create_meta, args=(proj,),
+                             name="create-meta", daemon=True).start()
+        except Exception as e:
+            with self._create_meta_lock:
+                self._create_meta_inflight.discard(proj)
+            self._append_create_meta(
+                {"project": proj or None,
+                 "error": f"could not start the create-meta worker: {e}"[:200]})
+
+    def _run_create_meta(self, proj):
+        try:
+            self._stage_create_meta(proj)
+        finally:
+            with self._create_meta_lock:
+                self._create_meta_inflight.discard(proj)
+
+    def _append_create_meta(self, row):
+        with self._create_meta_lock:
+            self.create_meta_results.append(row)
+        # Beat now, so the waiting form gets it without sitting out INTERVAL
+        # (inline, the result rode the beat that ran the command).
+        _poke.set()
+
     def _stage_create_meta(self, project):
-        """Handle a {type:"boardCreateMeta"} command. With no `project`, stage the
-        project + label choices (createMetaResults, no `project` key); with one,
-        stage that project's issue/work-item types (a `project`-keyed result). A
-        failure stages the same shape carrying an `error`."""
+        """Fetch and stage a {type:"boardCreateMeta"} answer (on the worker; see
+        _create_meta_async). With no `project`, stage the project + label choices
+        (createMetaResults, no `project` key); with one, stage that project's
+        issue/work-item types (a `project`-keyed result). A failure stages the
+        same shape carrying an `error`. Never raises."""
         proj = (project or "").strip()
         if not board_configured():
-            self.create_meta_results.append(
+            self._append_create_meta(
                 {"project": proj or None,
                  "error": "no board credentials on this host"})
             return
         try:
             if proj:
-                self.create_meta_results.append(
-                    {"project": proj, "types": board_issue_types(proj), "error": None})
+                row = {"project": proj, "types": board_issue_types(proj), "error": None}
             else:
                 meta = board_create_meta()
-                self.create_meta_results.append({
+                row = {
                     "project": None,
                     "projects": meta.get("projects") or [],
                     "labels": meta.get("labels") or [],
                     "source": meta.get("source"),
                     "error": None,
-                })
+                }
         except Exception as e:
             log(f"board create meta failed ({proj or 'projects'}): {e}")
-            self.create_meta_results.append(
-                {"project": proj or None, "error": str(e)[:200]})
+            row = {"project": proj or None, "error": str(e)[:200]}
+        self._append_create_meta(row)
 
     def _stage_create_ticket(self, cmd):
         """Handle a {type:"createTicket"} command: create the ticket and stage the
@@ -48209,7 +48279,8 @@ class SessionManager:
                         cid, cmd.get("issueKey"), cmd.get("value"),
                         cmd.get("category"))
                 elif ctype == "boardCreateMeta":
-                    self._stage_create_meta(cmd.get("project"))
+                    # Network-bound (XERK-2880): only STAGED here, fetched on a worker.
+                    self._create_meta_async(cmd.get("project"))
                 elif ctype == "createTicket":
                     self._stage_create_ticket(cmd)
                 elif ctype == "setTicketPriority":
@@ -49870,8 +49941,10 @@ class SessionManager:
             payload["ticketStatusResults"] = list(self.ticket_status_results)
         if self.ticket_outcome_results:
             payload["ticketOutcomeResults"] = list(self.ticket_outcome_results)
-        if self.create_meta_results:
-            payload["createMetaResults"] = list(self.create_meta_results)
+        # Snapshotted under the worker's lock (XERK-2880); cleared by identity.
+        with self._create_meta_lock:
+            if self.create_meta_results:
+                payload["createMetaResults"] = list(self.create_meta_results)
         if self.create_ticket_results:
             payload["createTicketResults"] = list(self.create_ticket_results)
         if self.ticket_priority_results:
@@ -50032,7 +50105,6 @@ class SessionManager:
             self.jira_issue_results,
             self.ticket_status_results,
             self.ticket_outcome_results,
-            self.create_meta_results,
             self.create_ticket_results,
             self.ticket_priority_results,
             self.ticket_link_results,
@@ -50051,6 +50123,13 @@ class SessionManager:
         # Same OFF-BEAT-writer discipline for the merge worker's results
         # (XERK-550): clear only what THIS beat delivered, by identity, so a
         # result appended by a merge that finished mid-beat is not lost.
+        # The create-meta worker's results (XERK-2880), the same way.
+        cstaged = payload.get("createMetaResults")
+        if cstaged:
+            delivered = {id(x) for x in cstaged}
+            with self._create_meta_lock:
+                self.create_meta_results[:] = [
+                    x for x in self.create_meta_results if id(x) not in delivered]
         mstaged = payload.get("mergePrResults")
         if mstaged:
             delivered = {id(x) for x in mstaged}
