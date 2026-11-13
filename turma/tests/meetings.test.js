@@ -177,6 +177,14 @@ test("XERK-2510: a refusal reaches the operator in the hub's words; review state
   assert.match(P.list(), /no session — &lt;img src=x&gt;/);
   assert.match(h, /Added to the decisions log/);
   assert.match(h2, /Not created — &lt;boom&gt;/);
+  assert.match(h2, /data-act="reopen" data-k="acme\.atlassian\.net\/m2\/p1"/);
+  // XERK-2864: a create that may have gone through offers no Reopen (Approve stays).
+  P.update(data([meeting({ meetingId: "m2", items: [{ ...items[0],
+    review: { state: "failed", at: 1, error: "may have been created", maybeCreated: true } }] })]));
+  P.select(P.entryKey(SITE, "m:m2"));
+  const h3 = P.list();
+  assert.doesNotMatch(h3, /data-act="reopen"/);
+  assert.match(h3, /data-act="approve" data-k="acme\.atlassian\.net\/m2\/p1"/);
   assert.match(h2, /class="mt-item rejected"/);
   // A pending or failed run says so instead of items.
   P.update(data([meeting({ status: "running", host: "k8x-02", items: undefined }),

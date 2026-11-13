@@ -25737,6 +25737,10 @@ def meeting_daily_instruction(daily, after_focus=False):
         "the meeting adds a new commitment, blocker or decision about it.\n"
         "- When an item continues a ticket the brief names, mention that "
         "ticket key in the item's description.\n"
+        # XERK-2864: without this a haiku run wrote "Not in the brief." into a
+        # description — the model's note to itself, shipped as ticket text.
+        "- Otherwise never mention the brief: a description says what the work "
+        "is, not whether the brief covered it or how you decided.\n"
     )
 
 

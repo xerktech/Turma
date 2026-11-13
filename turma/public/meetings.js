@@ -372,7 +372,7 @@ function itemHtml(site, m, it) {
       + (isDecision ? "" : `<button class="btn-sm" data-act="start" data-k="${esc(k)}"${dis}>Approve + start session${kbd(cur, "S")}</button>`)
       + `<button class="btn-sm" data-act="edit" data-k="${esc(k)}"${dis}>Edit${kbd(cur, "E")}</button>`
       + `<button class="btn-sm" data-act="reject" data-k="${esc(k)}"${dis}>Reject${kbd(cur, "R")}</button>`
-      + (state === "failed" ? `<button class="btn-sm" data-act="reopen" data-k="${esc(k)}"${dis}>Reopen</button>` : "");
+      + (state === "failed" && !it.review.maybeCreated ? `<button class="btn-sm" data-act="reopen" data-k="${esc(k)}"${dis}>Reopen</button>` : "");
   }
   const review = reviewStateHtml(site, it);
   const err = itemErr.get(k);

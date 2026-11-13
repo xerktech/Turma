@@ -30015,6 +30015,25 @@ test("XERK-2510: a create whose host goes silent fails in honest words; an agent
   hub.settleMeetingReviews();
   const rv = item2510(S, "f1", "p2").review;
   assert.deepEqual([rv.state, rv.error], ["failed", "the host went offline before the ticket was created"]);
+  assert.equal("maybeCreated" in rv, false, "nothing ran: no ticket can exist (XERK-2864)");
+  // Delivered, then silent: the hub cannot know, so the warning is kept (XERK-2864).
+  agents.mtFail2510.lastSeen = Date.now();
+  assert.equal((await review2510(S, "f1", "p2", { action: "approve", project: "QA", issueType: "1" })).status, 200);
+  await beat1574("mtFail2510", S);   // the reply hands the command over
+  assert.ok(creates2510("mtFail2510").some((c) => c.project === "QA" && c.deliveredAt));
+  agents.mtFail2510.lastSeen = Date.now() - 10 * 60e3;
+  hub.settleMeetingReviews();
+  const rv2 = item2510(S, "f1", "p2").review;
+  assert.deepEqual([rv2.state, rv2.maybeCreated, /may have been created/.test(rv2.error)], ["failed", true, true]);
+  // A host too old to create tickets (a capability gap) ran nothing, delivered or not.
+  agents.mtFail2510.lastSeen = Date.now();
+  assert.equal((await review2510(S, "f1", "p2", { action: "approve", project: "GAP", issueType: "1" })).status, 200);
+  await beat1574("mtFail2510", S);
+  agents.mtFail2510.unsupported = { createTicket: Date.now() };
+  hub.settleMeetingReviews();
+  const rv3 = item2510(S, "f1", "p2").review;
+  assert.deepEqual([rv3.state, "maybeCreated" in rv3, /too old/.test(rv3.error)], ["failed", false, true]);
+  delete agents.mtFail2510.unsupported;
   assert.equal(creates2510("mtFail2510").filter((c) => c.project === "OPS").length, 0);
 
   // A create no one ever answers (the hub died before the host took it) fails at the
@@ -30030,6 +30049,8 @@ test("XERK-2510: a create whose host goes silent fails in honest words; an agent
   agents.mtFail2510.lastSeen = Date.now();
   assert.deepEqual([item2510(S, "f1", "p1").review.state, /may have been created/.test(item2510(S, "f1", "p1").review.error)],
     ["failed", true]);
+  assert.equal(item2510(S, "f1", "p1").review.maybeCreated, true, "XERK-2864: Reopen is refused on it");
+  assert.equal((await review2510(S, "f1", "p1", { action: "reopen" })).status, 409);
   assert.equal((await review2510(S, "f1", "p1", { action: "reject" })).status, 200);
   // An unedited approve (the page always sends the meeting context) is not "edited".
   assert.equal((await review2510(S, "f1", "p3", { action: "approve", description: "context" })).status, 200);
@@ -31244,6 +31265,27 @@ test("XERK-2856: reopen puts a rejected or failed proposal back, unarchives its 
     ? { ...i, review: { state: "failed", at: Date.now(), error: "boom" } } : i)) });
   assert.equal((await reopen("p2")).status, 200);
   assert.equal(item2510(S, "r1", "p2").review, undefined);
+  // XERK-2864: a create that may have gone through keeps its warning — no Reopen,
+  // while Approve straight from the failed row (warning shown) still works.
+  const m2 = hub.getMeetings()[S][0];
+  hub.putMeeting(S, { ...m2, items: m2.items.map((i) => (i.id === "p2"
+    ? { ...i, review: { state: "failed", at: Date.now(), maybeCreated: true, error: "may have been created" } } : i)) });
+  assert.equal(item2510(S, "r1", "p2").review.maybeCreated, true, "the store keeps the mark");
+  const r3 = await reopen("p2");
+  assert.deepEqual([r3.status, r3.body.error],
+    [409, "that ticket may already exist — check the board, then approve or reject it"]);
+  assert.equal(item2510(S, "r1", "p2").review.state, "failed");
+  // Reject keeps the warning, and Reopen goes back to the warned failure, never pending.
+  assert.equal((await review2510(S, "r1", "p2", { action: "reject" })).status, 200);
+  assert.deepEqual([item2510(S, "r1", "p2").review.state, item2510(S, "r1", "p2").review.maybeCreated],
+    ["rejected", true]);
+  assert.equal((await archive2856(S, "r1", { archived: true })).status, 200);
+  assert.deepEqual(hub.meetingsCoerce(JSON.parse(JSON.stringify(hub.getMeetings()))), hub.getMeetings());
+  assert.equal((await reopen("p2")).status, 200);
+  const back = item2510(S, "r1", "p2").review;
+  assert.deepEqual([back.state, back.maybeCreated, back.error], ["failed", true, "may have been created"]);
+  assert.equal("archivedAt" in hub.getMeetings()[S].find((x) => x.meetingId === "r1"), false, "reopen unarchives");
+  assert.equal((await reopen("p2")).status, 409);
   delete hub.getDecisions()[S];
   cleanup2508(S, ["roHost2856"]);
 });
