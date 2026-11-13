@@ -94,6 +94,11 @@ data class FleetState(
     // Meetings (XERK-2511): each org's meetings and proposed work items, keyed by
     // siteKey. Refreshed by the poll and the "meetingProposals" SSE event.
     val meetingProposals: Map<String, List<com.xerktech.turma.model.Meeting>> = emptyMap(),
+    // The org settings panel's hub-owned values (XERK-2858): Tenir labels and
+    // their misses (XERK-2638), whose work (XERK-2514). Poll + their SSE events.
+    val meetingLabels: Map<String, com.xerktech.turma.model.MeetingLabel> = emptyMap(),
+    val meetingLabelMisses: Map<String, com.xerktech.turma.model.MeetingLabelMiss> = emptyMap(),
+    val meetingFocus: Map<String, com.xerktech.turma.model.MeetingFocus> = emptyMap(),
 )
 
 class FleetRepository(
@@ -192,6 +197,9 @@ class FleetRepository(
             dailyBriefs = resp.dailyBriefs
             dailyBriefSchedules = resp.dailyBriefSchedules
             synchronized(meetingsLock) { if (meetingsClock == since) meetingProposals = resp.meetingProposals }
+            meetingLabels = resp.meetingLabels
+            meetingLabelMisses = resp.meetingLabelMisses
+            meetingFocus = resp.meetingFocus
             // Don't let a late/stale poll drag the clock backward under the
             // records we just kept fresh (XERK-812) — same upward coercion upsert
             // uses for an SSE event.
@@ -256,6 +264,15 @@ class FleetRepository(
     @Volatile
     private var meetingProposals: Map<String, List<com.xerktech.turma.model.Meeting>> = emptyMap()
 
+    @Volatile
+    private var meetingLabels: Map<String, com.xerktech.turma.model.MeetingLabel> = emptyMap()
+
+    @Volatile
+    private var meetingLabelMisses: Map<String, com.xerktech.turma.model.MeetingLabelMiss> = emptyMap()
+
+    @Volatile
+    private var meetingFocus: Map<String, com.xerktech.turma.model.MeetingFocus> = emptyMap()
+
     // Bumped by every meetingProposals SSE frame and local patch: a poll that
     // started before one keeps the newer map (the web page's XERK-444 merge).
     @Volatile
@@ -287,6 +304,9 @@ class FleetRepository(
             dailyBriefs = dailyBriefs,
             dailyBriefSchedules = dailyBriefSchedules,
             meetingProposals = meetingProposals,
+            meetingLabels = meetingLabels,
+            meetingLabelMisses = meetingLabelMisses,
+            meetingFocus = meetingFocus,
         )
     }
 
@@ -394,6 +414,16 @@ class FleetRepository(
                 synchronized(meetingsLock) { meetingsClock++; meetingProposals = it }
                 emit(_state.value.now, null)
             }
+            // An org's Tenir label, a label miss, or whose work changed (XERK-2858).
+            "meetingLabels" -> runCatching {
+                TurmaJson.decodeFromString(com.xerktech.turma.model.LenientMeetingLabelsSerializer, data)
+            }.getOrNull()?.let { meetingLabels = it; emit(_state.value.now, null) }
+            "meetingLabelMisses" -> runCatching {
+                TurmaJson.decodeFromString(com.xerktech.turma.model.LenientLabelMissesSerializer, data)
+            }.getOrNull()?.let { meetingLabelMisses = it; emit(_state.value.now, null) }
+            "meetingFocus" -> runCatching {
+                TurmaJson.decodeFromString(com.xerktech.turma.model.LenientMeetingFocusSerializer, data)
+            }.getOrNull()?.let { meetingFocus = it; emit(_state.value.now, null) }
         }
     }
 

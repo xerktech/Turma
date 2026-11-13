@@ -85,20 +85,19 @@ val LocalTextSize = staticCompositionLocalOf { TextSizeControl() }
  * single-screen, so there is no per-tab stack worth preserving.
  */
 /**
- * The Brief pane a notification's `click` path opens, or null (XERK-2511, XERK-2623).
- * The "N proposals" push sends `/brief?site=…#meetings`; an older hub's
- * `/meetings?site=…` lands on the same pane. A session alert routes by host +
- * session instead.
+ * Whether a notification's `click` path opens the Brief tab, and on which org
+ * (XERK-2511, XERK-2858): the "N proposals" push sends `/brief?site=…#meetings`,
+ * an older hub `/meetings?site=…`; `#brief`, `#meetings` and `/meetings` all
+ * land on the one triage list. Answers the `site` ("" when none), or null when
+ * the path is not the Brief tab. A session alert routes by host + session instead.
  */
-internal fun deepLinkBriefPane(url: String?): BriefPane? {
+internal fun deepLinkBrief(url: String?): String? {
     if (url == null) return null
     val path = url.substringBefore('#').substringBefore('?').trim('/')
-    val fragment = url.substringAfter('#', "")
-    return when {
-        path == "meetings" -> BriefPane.MEETINGS
-        path == TopDest.BRIEF.route -> if (fragment == "meetings") BriefPane.MEETINGS else BriefPane.BRIEF
-        else -> null
-    }
+    if (path != "meetings" && path != TopDest.BRIEF.route) return null
+    val query = url.substringBefore('#').substringAfter('?', "")
+    val site = query.split('&').firstOrNull { it.startsWith("site=") }?.substringAfter("site=").orEmpty()
+    return runCatching { java.net.URLDecoder.decode(site, "UTF-8") }.getOrDefault("")
 }
 
 internal fun tabNavOptions(): NavOptionsBuilder.() -> Unit = {
@@ -174,8 +173,8 @@ fun TurmaApp(
         }
     }
 
-    // The Brief tab's pane (XERK-2623): kept across tab switches, set by a meetings push.
-    var briefPane by rememberSaveable { mutableStateOf(BriefPane.BRIEF) }
+    // The org a meetings push opens on the Brief tab (XERK-2858), consumed once shown.
+    var briefOpenSite by rememberSaveable { mutableStateOf<String?>(null) }
 
     // Route an FCM tap to the exact session once we're signed in.
     LaunchedEffect(pendingDeepLink, settings.configured) {
@@ -199,9 +198,9 @@ fun TurmaApp(
             }
             nav.navigate(Routes.chat(dl.host, dl.sessionId)) { launchSingleTop = true }
         } else {
-            // "N proposals from <meeting>" (XERK-2511): Brief, on its Meetings pane.
-            deepLinkBriefPane(dl.url)?.let { p ->
-                briefPane = p
+            // "N proposals from <meeting>" (XERK-2511): Brief, with that org unfolded.
+            deepLinkBrief(dl.url)?.let { site ->
+                briefOpenSite = site
                 nav.navigate(TopDest.BRIEF.route, tabNavOptions())
             }
         }
@@ -277,7 +276,7 @@ fun TurmaApp(
         }
         composable(TopDest.BRIEF.route) {
             MainScaffold(TopDest.BRIEF, goTab) { m ->
-                BriefScreen(modifier = m, pane = briefPane, onPane = { briefPane = it })
+                BriefScreen(modifier = m, openSite = briefOpenSite, onOpened = { briefOpenSite = null })
             }
         }
         composable(

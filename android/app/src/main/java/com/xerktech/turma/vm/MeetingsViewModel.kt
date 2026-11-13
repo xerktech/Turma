@@ -13,6 +13,7 @@ import com.xerktech.turma.core.meetingTicketDescription
 import com.xerktech.turma.model.CreateProject
 import com.xerktech.turma.model.CreateType
 import com.xerktech.turma.model.Meeting
+import com.xerktech.turma.model.MeetingArchiveRequest
 import com.xerktech.turma.model.MeetingItem
 import com.xerktech.turma.model.MeetingReviewRequest
 import com.xerktech.turma.net.FleetState
@@ -24,6 +25,15 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 
 /** The org's projects, or a project's issue types, as the create-meta route answered. */
 sealed interface MetaState {
@@ -241,6 +251,7 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun post(siteKey: String, m: Meeting, it: MeetingItem, action: String, body: MeetingReviewRequest): String? {
         val what = when {
             action == "reject" -> "Rejecting"
+            action == "reopen" -> "Reopening"
             it.kind == "decision" -> "Logging the decision"
             else -> "Approving"
         }
@@ -263,11 +274,160 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Put a rejected or failed proposal back to review (XERK-2856's "reopen");
+     * the hub also unarchives its meeting. A refusal shows under the item.
+     */
+    fun reopen(siteKey: String, m: Meeting, it: MeetingItem): Job = viewModelScope.launch {
+        val key = itemKey(siteKey, m.meetingId, it.id)
+        if (key in _busy.value) return@launch
+        _busy.value = _busy.value + key
+        _errors.value = _errors.value - key
+        val err = try {
+            post(siteKey, m, it, "reopen", MeetingReviewRequest(action = "reopen"))
+        } catch (e: CancellationException) {
+            _busy.value = _busy.value - key
+            throw e
+        }
+        _busy.value = _busy.value - key
+        if (err != null) fail(key, err)
+    }
+
+    private val _archiving = MutableStateFlow<Set<String>>(emptySet())
+
+    /** "site\u0000meetingId" whose archive POST has not answered yet. */
+    val archiving: StateFlow<Set<String>> = _archiving
+
+    /** Archive or unarchive a whole meeting (XERK-2856); a refusal toasts in the hub's words. */
+    fun archive(siteKey: String, m: Meeting, archived: Boolean): Job = viewModelScope.launch {
+        val key = "$siteKey\u0000${m.meetingId}"
+        if (key in _archiving.value) return@launch
+        _archiving.value = _archiving.value + key
+        val what = if (archived) "Archiving" else "Unarchiving"
+        val err = try {
+            val r = container.client.api.archiveMeeting(siteKey, m.meetingId, MeetingArchiveRequest(archived))
+            val out = r.body()
+            when {
+                !r.isSuccessful -> "$what failed — ${hubErrorMessage(r)}"
+                out == null || !out.ok -> "$what failed — " + (out?.error?.ifBlank { null } ?: "the hub refused it")
+                else -> { out.meeting?.let { row -> container.fleet.patchMeeting(siteKey, row) }; null }
+            }
+        } catch (e: CancellationException) {
+            _archiving.value = _archiving.value - key
+            throw e
+        } catch (_: Exception) {
+            "$what failed — the hub is unreachable"
+        }
+        _archiving.value = _archiving.value - key
+        if (err != null) _messages.tryEmit("✗ $err")
+    }
+
+    private val collapsedPrefs = app.getSharedPreferences(COLLAPSED_PREFS, Context.MODE_PRIVATE)
+    private val _collapsed = MutableStateFlow(
+        runCatching { collapsedPrefs.getStringSet(COLLAPSED_KEY, null)?.toSet() }.getOrNull().orEmpty(),
+    )
+
+    /** Orgs the operator folded in the list, remembered on this phone (the web's localStorage set). */
+    val collapsed: StateFlow<Set<String>> = _collapsed
+
+    fun toggleCollapsed(siteKey: String) {
+        val next = if (siteKey in _collapsed.value) _collapsed.value - siteKey else _collapsed.value + siteKey
+        _collapsed.value = next
+        runCatching { collapsedPrefs.edit().putStringSet(COLLAPSED_KEY, next).apply() }
+    }
+
+    private val _saving = MutableStateFlow<Set<String>>(emptySet())
+
+    /** Settings saves in flight, "site\u0000focus" / "label" / "schedule". */
+    val saving: StateFlow<Set<String>> = _saving
+
+    private val _saved = MutableStateFlow<Set<String>>(emptySet())
+
+    /** Settings saves the hub took (same keys as [saving]); cleared by the next save or edit. */
+    val saved: StateFlow<Set<String>> = _saved
+
+    fun clearSaved(siteKey: String, what: String) {
+        _saved.value = _saved.value - "$siteKey\u0000$what"
+    }
+
+    /** Whose work the org's meetings propose (XERK-2514): no names and no role clears it. */
+    fun saveFocus(siteKey: String, names: List<String>, role: String): Job =
+        save(siteKey, "focus", "Saving whose work") {
+            container.client.api.setMeetingFocus(siteKey, buildJsonObject {
+                putJsonArray("names") { names.forEach { add(JsonPrimitive(it)) } }
+                put("role", role.trim())
+            })
+        }
+
+    /** The org's Tenir label (XERK-2638); blank goes back to the default. */
+    fun saveLabel(siteKey: String, label: String): Job =
+        save(siteKey, "label", "Saving the Tenir label") {
+            val v = label.trim().lowercase()
+            container.client.api.setMeetingLabel(siteKey, buildJsonObject {
+                put("label", if (v.isEmpty()) JsonNull else JsonPrimitive(v))
+            })
+        }
+
+    /** The fields of the org's standup schedule to change; the hub merges them over the stored one. */
+    fun saveSchedule(siteKey: String, fields: JsonObject): Job =
+        save(siteKey, "schedule", "Saving the schedule") {
+            container.client.api.putDailyBriefSchedule(siteKey, fields)
+        }
+
+    /** What the hub answered a save with, per "site\u0000what"; [seq] tells two equal answers apart. */
+    data class Stored(val seq: Int, val body: JsonObject)
+
+    private val _stored = MutableStateFlow<Map<String, Stored>>(emptyMap())
+
+    /**
+     * The hub's answer to each section's last save that worked: the values as it
+     * STORED them (trimmed, case-corrected), which the settings fields show.
+     */
+    val stored: StateFlow<Map<String, Stored>> = _stored
+    private var storedSeq = 0
+
+    private fun save(siteKey: String, what: String, verb: String, call: suspend () -> retrofit2.Response<JsonObject>): Job =
+        viewModelScope.launch {
+            val key = "$siteKey\u0000$what"
+            if (key in _saving.value) return@launch
+            _saving.value = _saving.value + key
+            _saved.value = _saved.value - key
+            var body: JsonObject? = null
+            val err = try {
+                val r = call()
+                body = r.body()
+                val ok = (body?.get("ok") as? JsonPrimitive)?.booleanOrNull
+                when {
+                    !r.isSuccessful -> hubErrorMessage(r)
+                    body != null && ok != true ->
+                        (body["error"] as? JsonPrimitive)?.contentOrNull?.ifBlank { null } ?: "the hub refused it"
+                    else -> null
+                }
+            } catch (e: CancellationException) {
+                _saving.value = _saving.value - key
+                throw e
+            } catch (_: Exception) {
+                "the hub is unreachable"
+            }
+            _saving.value = _saving.value - key
+            // Like every failure surface, the toast only ever means "it did not
+            // happen"; a save that worked reads as "Saved" beside its button.
+            if (err != null) {
+                _messages.tryEmit("✗ $verb failed — $err")
+            } else {
+                _stored.value = _stored.value + (key to Stored(++storedSeq, body ?: JsonObject(emptyMap())))
+                _saved.value = _saved.value + key
+            }
+            container.fleet.nudge()
+        }
+
     private fun loadPicks(): Map<String, String> =
         prefs.all.mapNotNull { (k, v) -> (v as? String)?.let { k to it } }.toMap()
 
     companion object {
         private const val PREFS = "turma-meetings-project"
+        private const val COLLAPSED_PREFS = "turma-meetings-collapsed"
+        private const val COLLAPSED_KEY = "orgs"
 
         /** One item's key: org, meeting and item id, NUL-joined (none can hold a NUL). */
         fun itemKey(siteKey: String, meetingId: String, itemId: String) =

@@ -118,7 +118,38 @@ data class AgentsResponse(
     // an older hub, which reads as "no meetings".
     @Serializable(with = LenientMeetingsSerializer::class)
     val meetingProposals: Map<String, List<Meeting>> = emptyMap(),
+    // The per-org meeting settings the Brief screen's settings panel edits
+    // (XERK-2858): each org's Tenir label (XERK-2638), the labels Tenir sent
+    // that no org answers to (`<label>[@tenant]` -> {at, shared?}), and whose
+    // work the org's meetings propose (XERK-2514). All hub-coerced, decoded per
+    // entry so one malformed org drops alone; absent on an older hub.
+    @Serializable(with = LenientMeetingLabelsSerializer::class)
+    val meetingLabels: Map<String, MeetingLabel> = emptyMap(),
+    @Serializable(with = LenientLabelMissesSerializer::class)
+    val meetingLabelMisses: Map<String, MeetingLabelMiss> = emptyMap(),
+    @Serializable(with = LenientMeetingFocusSerializer::class)
+    val meetingFocus: Map<String, MeetingFocus> = emptyMap(),
 )
+
+/** An org's Tenir label (`meetingLabelsWire`): "" = none; [custom] = the operator set it. */
+@Serializable
+data class MeetingLabel(val label: String = "", val custom: Boolean = false)
+
+/** A label Tenir sent that no single org answers to; [shared] = two orgs' defaults collide. */
+@Serializable
+data class MeetingLabelMiss(val at: Long = 0, val shared: Boolean = false)
+
+/** Whose work an org's meetings propose (`meetingFocusValue`). */
+@Serializable
+data class MeetingFocus(val names: List<String> = emptyList(), val role: String = "")
+
+/**
+ * The hub's tag on the org's daily meeting (XERK-2856): [meetingAt] the
+ * scheduled meeting it matched (else its own start), [briefRunId] the brief
+ * written for it, "" when none.
+ */
+@Serializable
+data class MeetingDaily(val meetingAt: Long = 0, val briefRunId: String = "")
 
 /**
  * One meeting Tenir captured, as the hub serves it (`meetingWire`, XERK-2508).
@@ -141,6 +172,10 @@ data class Meeting(
     val generatedAt: Long = 0,
     val error: String = "",
     val items: List<MeetingItem> = emptyList(),
+    // When the operator archived it (XERK-2856); 0 = not archived.
+    val archivedAt: Long = 0,
+    // Present on the org's daily meeting (XERK-2856).
+    val daily: MeetingDaily? = null,
 )
 
 /**
@@ -242,7 +277,7 @@ data class DailyBrief(
 /**
  * An org's standup schedule (XERK-2391): the meeting's wall [time] "HH:MM" in
  * the named IANA [timeZone], on [weekdays] (0 = Sunday .. 6), the brief written
- * [leadMinutes] before it. Edited on the web only (android/PARITY.md).
+ * [leadMinutes] before it. Edited from the Brief screen's org settings (XERK-2858).
  */
 @Serializable
 data class DailyBriefSchedule(
@@ -253,6 +288,9 @@ data class DailyBriefSchedule(
     val leadMinutes: Int = 5,
     val model: String = "auto",
     val updatedAt: Long = 0,
+    // A meeting whose title contains this (case-insensitive) is the daily
+    // meeting (XERK-2856); "" = none.
+    val meetingTitle: String = "",
 )
 
 /**
@@ -289,6 +327,26 @@ object LenientBriefsSerializer : LenientSiteMapSerializer<List<DailyBrief>>(
             runCatching { TurmaJson.decodeFromJsonElement(DailyBrief.serializer(), row) }.getOrNull()
         }
     },
+)
+
+/** `{ok, meeting}` of the archive route (XERK-2856). */
+@Serializable
+data class MeetingArchiveRequest(val archived: Boolean)
+
+/** `meetingLabels` / `meetingLabelMisses` / `meetingFocus`: one value per org, a bad one dropped. */
+object LenientMeetingLabelsSerializer : LenientSiteMapSerializer<MeetingLabel>(
+    { TurmaJson.encodeToJsonElement(MeetingLabel.serializer(), it) },
+    { v -> TurmaJson.decodeFromJsonElement(MeetingLabel.serializer(), v) },
+)
+
+object LenientLabelMissesSerializer : LenientSiteMapSerializer<MeetingLabelMiss>(
+    { TurmaJson.encodeToJsonElement(MeetingLabelMiss.serializer(), it) },
+    { v -> TurmaJson.decodeFromJsonElement(MeetingLabelMiss.serializer(), v) },
+)
+
+object LenientMeetingFocusSerializer : LenientSiteMapSerializer<MeetingFocus>(
+    { TurmaJson.encodeToJsonElement(MeetingFocus.serializer(), it) },
+    { v -> TurmaJson.decodeFromJsonElement(MeetingFocus.serializer(), v) },
 )
 
 /** `meetingProposals`: per org a list, each meeting decoded on its own. */

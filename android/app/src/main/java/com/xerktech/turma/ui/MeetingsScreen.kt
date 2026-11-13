@@ -64,111 +64,15 @@ import com.xerktech.turma.vm.MeetingDraft
 import com.xerktech.turma.vm.MeetingsViewModel
 import com.xerktech.turma.vm.MetaState
 
-/**
- * Meetings (XERK-2511, the web's meetings review, XERK-2510): the work items an
- * org host proposed from a meeting Tenir captured, each approved (a ticket on
- * the org's board, or a decision added to the decisions log), edited then
- * approved, or rejected. Scoped by the header's org pick. Every served string is
- * plain Text, never markup; a link opens only an http(s) URL. The Brief screen's
- * Meetings pane (XERK-2623), as on the web.
+/*
+ * The pieces of one meeting's review (XERK-2511, the web's meetings.js): a
+ * proposal with its actions and state, the editor, the project pick. The
+ * Brief screen's triage (BriefScreen.kt, XERK-2858) lays them out. Every
+ * served string is plain Text, never markup; a link opens only an http(s) URL.
  */
-@Composable
-fun MeetingsPane(modifier: Modifier = Modifier, vm: MeetingsViewModel = viewModel()) {
-    LaunchedEffect(Unit) { vm.start() }
-    val fleet by vm.fleet.collectAsStateWithLifecycle()
-    val stored by vm.orgFilter.collectAsStateWithLifecycle()
-    val busy by vm.busy.collectAsStateWithLifecycle()
-    val errors by vm.errors.collectAsStateWithLifecycle()
-    val drafts by vm.drafts.collectAsStateWithLifecycle()
-    val meta by vm.meta.collectAsStateWithLifecycle()
-    val picks by vm.picks.collectAsStateWithLifecycle()
-
-    val context = LocalContext.current
-    LaunchedEffect(Unit) {
-        vm.messages.collect { msg ->
-            Handler(Looper.getMainLooper()).post { Toast.makeText(context, msg, Toast.LENGTH_SHORT).show() }
-        }
-    }
-
-    val sites = remember(fleet.agents) { mergeSites(fleet.agents) }
-    val names = remember(sites) { sites.associate { it.siteKey to it.orgName } }
-    val scoped = remember(stored, sites) { effectiveOrgs(stored, sites) }
-    val orgs = remember(fleet.meetingProposals, scoped) { meetingOrgs(fleet.meetingProposals, scoped) }
-    for (s in orgs) {
-        val needs = meetingsNeedProject(fleet.meetingProposals[s].orEmpty())
-        LaunchedEffect(s, needs) { if (needs) vm.ensureMeta(s) }
-    }
-
-    Column(modifier.fillMaxSize()) {
-        if (orgs.isEmpty()) {
-            Text(
-                meetingsEmptyText(fleet.meetingProposals),
-                Modifier.padding(16.dp),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            return@Column
-        }
-        LazyColumn(
-            Modifier.fillMaxSize(),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            for (site in orgs) {
-                val list = fleet.meetingProposals[site].orEmpty()
-                val project = meetingProject(picks[site], (meta[site] as? MetaState.Projects)?.projects.orEmpty())
-                val types = if (project.isEmpty()) null else meta[MeetingsViewModel.typesKey(site, project)]
-                item(key = "org:$site") {
-                    OrgHead(
-                        name = orgName(site, names[site].orEmpty()),
-                        target = if (meetingsNeedProject(list)) {
-                            { ProjectTarget(meta[site], project, { vm.setProject(site, it) }, { vm.retryMeta(site) }) }
-                        } else null,
-                    )
-                }
-                items(list, key = { "m:$site:${it.meetingId}" }) { m ->
-                    MeetingCard(
-                        m = m,
-                        itemState = { it ->
-                            val k = MeetingsViewModel.itemKey(site, m.meetingId, it.id)
-                            ItemUi(k in busy, errors[k], drafts[k])
-                        },
-                        types = types,
-                        onApprove = { it, start -> vm.review(site, m, it, "approve", start) },
-                        onReject = { vm.review(site, m, it, "reject") },
-                        onEdit = { vm.startEdit(site, m, it) },
-                        onDraft = { it, f -> vm.editDraft(MeetingsViewModel.itemKey(site, m.meetingId, it.id), f) },
-                        onCancel = { vm.cancelEdit(MeetingsViewModel.itemKey(site, m.meetingId, it.id)) },
-                    )
-                }
-            }
-            item(key = "note") {
-                Text(
-                    "Nothing reaches the board until you approve: Approve creates the ticket on that org's " +
-                        "board, a decision is added to the org's decisions log, and Reject sets it aside.",
-                    Modifier.padding(vertical = 8.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-    }
-}
 
 /** One item's client-side state: a POST in flight, the hub's refusal, an open editor. */
 data class ItemUi(val busy: Boolean, val error: String?, val draft: MeetingDraft?)
-
-@Composable
-private fun OrgHead(name: String, target: (@Composable () -> Unit)?) {
-    Column(Modifier.fillMaxWidth().padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text(
-            name,
-            Modifier.semantics { heading() },
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.SemiBold,
-        )
-        target?.invoke()
-    }
-}
 
 /** "New tickets go to <project>": the org's projects, the viewer's pick kept on this phone. */
 @Composable
@@ -195,7 +99,7 @@ internal fun ProjectTarget(state: MetaState?, current: String, onPick: (String) 
 
 /** A text button opening a menu of options; [onPick] gets the option's value. */
 @Composable
-private fun Picker(label: String, options: List<Pair<String, String>>, onPick: (String) -> Unit) {
+internal fun Picker(label: String, options: List<Pair<String, String>>, onPick: (String) -> Unit) {
     var open by remember { mutableStateOf(false) }
     Box {
         Text(
@@ -213,57 +117,24 @@ private fun Picker(label: String, options: List<Pair<String, String>>, onPick: (
     }
 }
 
-@Composable
-internal fun MeetingCard(
-    m: Meeting,
-    itemState: (MeetingItem) -> ItemUi,
-    types: MetaState?,
-    onApprove: (MeetingItem, Boolean) -> Unit,
-    onReject: (MeetingItem) -> Unit,
-    onEdit: (MeetingItem) -> Unit,
-    onDraft: (MeetingItem, (MeetingDraft) -> MeetingDraft) -> Unit,
-    onCancel: (MeetingItem) -> Unit,
-) {
-    val uri = LocalUriHandler.current
-    TurmaCard(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(verticalAlignment = Alignment.Top) {
-                Text(m.title, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold)
-                val url = safeMeetingUrl(m.tenirUrl)
-                if (url.isNotEmpty()) GhostButton("Open in Tenir ↗", { uri.openUri(url) })
-            }
-            val metaLine = meetingMetaLine(m)
-            if (metaLine.isNotEmpty()) {
-                Text(metaLine, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            val status = meetingStatusLine(m)
-            if (status != null) {
-                Text(status.first, style = MaterialTheme.typography.bodyMedium,
-                    color = if (status.second) TurmaColors.critical else MaterialTheme.colorScheme.onSurfaceVariant)
-            } else {
-                m.items.forEachIndexed { i, it ->
-                    if (i > 0) HorizontalDivider(Modifier.padding(vertical = 4.dp))
-                    ItemRow(m, it, itemState(it), types, onApprove, onReject, onEdit, onDraft, onCancel)
-                }
-            }
-        }
-    }
-}
+/** What one proposal can do; the screen binds each to its org and meeting. */
+class ItemActions(
+    val onApprove: (MeetingItem, Boolean) -> Unit,
+    val onReject: (MeetingItem) -> Unit,
+    val onReopen: (MeetingItem) -> Unit,
+    val onEdit: (MeetingItem) -> Unit,
+    val onDraft: (MeetingItem, (MeetingDraft) -> MeetingDraft) -> Unit,
+    val onCancel: (MeetingItem) -> Unit,
+)
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ItemRow(
-    m: Meeting,
-    it: MeetingItem,
-    ui: ItemUi,
-    types: MetaState?,
-    onApprove: (MeetingItem, Boolean) -> Unit,
-    onReject: (MeetingItem) -> Unit,
-    onEdit: (MeetingItem) -> Unit,
-    onDraft: (MeetingItem, (MeetingDraft) -> MeetingDraft) -> Unit,
-    onCancel: (MeetingItem) -> Unit,
-) {
+internal fun ItemRow(m: Meeting, it: MeetingItem, ui: ItemUi, types: MetaState?, act: ItemActions) {
+    val onApprove = act.onApprove
+    val onReject = act.onReject
+    val onEdit = act.onEdit
+    val onDraft = act.onDraft
+    val onCancel = act.onCancel
     val uri = LocalUriHandler.current
     val decision = it.kind == "decision"
     val rejected = it.review?.state == "rejected"
@@ -323,7 +194,11 @@ private fun ItemRow(
                 }
             }
         }
-        if (meetingReviewable(it)) {
+        if (rejected) {
+            // A rejected proposal sits under "show reviewed"; Reopen puts it back
+            // to review (XERK-2856), rather than approving it from there.
+            GhostButton(if (ui.busy) "Working…" else "Reopen", { act.onReopen(it) }, enabled = !ui.busy)
+        } else if (meetingReviewable(it)) {
             val d = ui.draft
             if (d != null) {
                 Editor(it, d, ui.busy, types, { f -> onDraft(it, f) }, { start -> onApprove(it, start) }) { onCancel(it) }
@@ -335,7 +210,7 @@ private fun ItemRow(
                     )
                     if (!decision) GhostButton("Approve + start session", { onApprove(it, true) }, enabled = !ui.busy)
                     GhostButton("Edit", { onEdit(it) }, enabled = !ui.busy)
-                    if (!rejected) GhostButton("Reject", { onReject(it) }, enabled = !ui.busy)
+                    GhostButton("Reject", { onReject(it) }, enabled = !ui.busy)
                 }
             }
         }

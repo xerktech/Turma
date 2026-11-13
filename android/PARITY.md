@@ -17,7 +17,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 | Sessions sidebar full-search  | `ui/SessionsScreen.kt`'s search box + "In history" section          |
 | `board.html` + `board.js`     | `ui/BoardScreen.kt`, `core/Board.kt`, `vm/BoardViewModel.kt`       |
 | `usage.html`                  | `ui/UsageScreen.kt`                                                |
-| Brief page (Daily Brief)      | `ui/BriefScreen.kt`, `core/DailyBrief.kt`, `vm/BriefViewModel.kt`  |
+| Brief page (triage + brief)   | `ui/BriefScreen.kt`, `core/MeetingsTriage.kt`, `core/DailyBrief.kt` |
 | `nav.js` (header/bottom-nav)  | `ui/MainScaffold.kt`, `ui/TurmaApp.kt`                             |
 | `org.js` (header org filter)  | `ui/OrgControl.kt`, `vm/OrgViewModel.kt`, `data/OrgFilter.kt`      |
 | `login.html`                  | `ui/LoginScreen.kt`                                                |
@@ -32,9 +32,6 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Insights is WEB-ONLY (operator decision, XERK-2386).** The web's Insights page (`/insights`)
   holds the per-org decisions log, the permission-prompts ledger and model quality (shadow runs);
   Android has none of them, and the web nav's Insights tab has no Android bottom-nav counterpart.
-- **Daily Brief schedule editing is WEB-ONLY (XERK-2397).** Schedules are edited on the web Brief
-  page (XERK-2396) or the `PUT .../daily-brief/schedule` route, never from the phone.
-  - The Android Brief tab reads the brief, shows the next meeting and offers Run now.
 - **No org brief on either client (XERK-2386).** The brief page, its "Brief now" and its push alert
   are retired on the web and Android alike; Android ignores a `briefs` key an older hub still sends.
 - **Manual Refresh button on the Dashboard.** The web dashboard has no explicit refresh control (it
@@ -714,32 +711,28 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   absent fields, refused load blocks Save, org-less board has no button — Robolectric over
   MockWebServer), `vm/PermissionPolicyResultTest.kt` (the response reading).
 
-## Done (XERK-2397 — Daily Brief screen)
+## Brief tab — meetings triage with the Daily brief folded in (XERK-2858)
 
-- Bottom-nav **Brief** tab (`TopDest.BRIEF`), between Board and Usage; the web nav should match.
-  - The picked org's newest finished brief in read-aloud type (Since yesterday / This week / Up
-    next) and "Next meeting …" from the org's schedule.
-  - Run now: off while a brief is being written; a refusal toasts the hub's words.
-  - Earlier briefs as headlines; a Run now row is labelled with when it ran.
-  - A newest failed run shows its reason above the last good brief.
-- The org is the header's pick when it names one; otherwise a chip row offers the scoped orgs.
-- `dailyBriefs` / `dailyBriefSchedules` decode per org (`LenientSiteMapSerializer`), so a malformed
-  entry drops alone. Schedule editing stays web-only (above).
+- **At parity with the web's two-pane triage (XERK-2857)**: one list of every org's meetings,
+  orgs collapsible (remembered per phone), bucketed Upcoming / Today / Yesterday / This week /
+  Earlier, Needs review / All / Archived chips and a search over meeting and proposal titles.
+  - Each org's daily meeting is ONE entry per scheduled `meetingAt`: its brief read aloud on top
+    (Run now on the upcoming one), every capture's proposals below (`core/MeetingsTriage.kt`).
+  - An entry: pending proposals first, reviewed ones behind "Show reviewed (n)", Reopen on a
+    rejected one, "x of n reviewed", Archive / Unarchive meeting, and Next once all are reviewed.
+  - The org's ⚙ panel: New-tickets project, Whose work (one name per line), Tenir label, and the
+    Daily brief schedule with "Daily meeting title contains". Unmapped Tenir labels: one banner.
+- Platform differences: a phone shows one pane at a time (list, entry or settings; Back returns),
+  as the web does under 760px. No keyboard shortcuts (A/S/E/R/J/K). The project pick is kept per
+  phone. A failed create stays in the pending list with Approve to retry it. A long refusal
+  toast is cut at two lines (a platform limit on toasts).
+- `dailyBriefs`, `dailyBriefSchedules`, `meetingLabels`, `meetingLabelMisses` and `meetingFocus`
+  decode per org (`LenientSiteMapSerializer`), so a malformed entry drops alone.
 
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
 those are marked `[MODEL]`.
-
-### Brief (`brief.html` + `meetings.js` → `BriefScreen`) — XERK-2857 triage, port is its own ticket
-
-- **The web Brief page is now one two-pane triage; Android still shows separate Brief / Meetings.**
-  `[MODEL]` Port: org groups (collapsible), entries by Today / Yesterday / This week / Earlier,
-  Needs review / All / Archived + search, the daily meeting as ONE entry pairing its brief
-  (`daily.meetingAt` / `daily.briefRunId`) with that meeting's proposals, reviewed proposals hidden
-  behind "show reviewed" with Reopen (`action:"reopen"`), Archive / Unarchive
-  (`POST .../meetings/<id>/archive {archived}`), and the per-org settings drawer (project, whose
-  work, Tenir label). Keyboard triage (A/S/E/R/J/K) is web-only by nature.
 
 ### Dashboard (`index.html` → `FleetScreen`/`FleetDialogs`)
 
@@ -1029,21 +1022,13 @@ those are marked `[MODEL]`.
   as the cache split above, and for the same reason (no table view yet).
 - P2 Per-day tooltip; the web's texture channel for series 9+ (Android reuses hues past 8).
 
-### Meetings (Brief page's Meetings pane, XERK-2510 / XERK-2623)
-- **At parity (XERK-2511, XERK-2623)**: the Brief tab's Meetings pane (`ui/MeetingsScreen.kt`
-  `MeetingsPane`, with the web's awaiting-review count on its tab) offers Approve / Approve +
-  start / Edit / Reject / Log decision, the "New tickets go to" project pick and the same review
-  states and refusal words. `meetingProposals` decodes PER MEETING (`LenientMeetingsSerializer`).
+### Meetings review (Brief tab, XERK-2510 / XERK-2858)
+- **At parity (XERK-2511, XERK-2858)**: Approve / Approve + start / Edit / Reject / Log decision /
+  Reopen, the same review states and refusal words. `meetingProposals` decodes PER MEETING.
 - Platform differences: a created ticket's key and a "May duplicate" key are text, not board
-  links; quote/Tenir links open the system browser. The project pick is kept per phone
-  (SharedPreferences), as the web keeps it per browser.
+  links; quote/Tenir links open the system browser.
 - Phone-only: the "N proposals from <meeting>" push (channel "Meeting proposals"); a tap opens
-  the Brief tab on its Meetings pane.
-- **Gap (XERK-2638)**: the web pane's "Tenir labels" list and its unmapped-label banner are
-  web-only. Android ignores `meetingLabels`/`meetingLabelMisses` (untyped keys); set or map a
-  label from the web. P2: a one-time setup per org.
-- **Gap (XERK-2514)**: the web pane's "Whose work" list (names + role per org, `meetingFocus`) is
-  web-only; Android ignores the key. Set it from the web. P2: a one-time setup per org.
+  the Brief tab with that org unfolded on Needs review.
 
 ### Nav / Login
 - **Native Authentik SSO is IMPLEMENTED on Android (XERK-591).** `LoginScreen.kt` shows a "Sign in

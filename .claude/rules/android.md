@@ -34,8 +34,8 @@ A pure-core/adapter-shell split:
 | `sessions.html` + `chat.js` | `ui/SessionsScreen.kt` + `ui/ChatScreen.kt` + `vm/ChatViewModel.kt` |
 | `board.js` + `board.html` | `ui/BoardScreen.kt` + `core/Board.kt` + `vm/BoardViewModel.kt` |
 | `usage.html` | `ui/UsageScreen.kt` |
-| Brief page | `ui/BriefScreen.kt` + `core/DailyBrief.kt` + `vm/BriefViewModel.kt` |
-| Brief → Meetings (`meetings.js`) | `ui/MeetingsScreen.kt` (`MeetingsPane`) + `core/Meetings.kt` + `vm/MeetingsViewModel.kt` |
+| Brief page (triage, `meetings.js`) | `ui/BriefScreen.kt` + `core/MeetingsTriage.kt` + `core/DailyBrief.kt` + `vm/BriefViewModel.kt` |
+| Meetings review pieces | `ui/MeetingsScreen.kt` (`ItemRow`) + `core/Meetings.kt` + `vm/MeetingsViewModel.kt` |
 | `nav.js` | `ui/MainScaffold.kt` + `ui/TurmaApp.kt` |
 | `org.js` | `ui/OrgControl.kt` + `vm/OrgViewModel.kt` + `data/OrgFilter.kt` |
 
@@ -87,7 +87,7 @@ A pure-core/adapter-shell split:
   them when an older hub sends them. Tests: `AgentDecodeTest` (briefs/decisions ignored case).
 - **Daily Brief (XERK-2397)**: `dailyBriefs`/`dailyBriefSchedules` decode PER ORG through
   `LenientSiteMapSerializer` (a bad row or schedule drops alone), never as a plain typed map — the
-  `/api/agents` decode is atomic. Schedule editing is web-only (`PARITY.md`). The next meeting is
+  `/api/agents` decode is atomic. The org's ⚙ panel edits the schedule. The next meeting is
   computed on the phone (`nextBriefMeeting`, java.time's gap/overlap rules = the hub's).
   Tests: `AgentDecodeTest` (daily brief cases), `core/DailyBriefTest`, `ui/BriefScreenTest`.
 - **Meetings (XERK-2511)**: `meetingProposals` decodes per meeting; the ticket description and
@@ -95,10 +95,20 @@ A pure-core/adapter-shell split:
   same create. A poll begun before a `meetingProposals` SSE frame or a review answer keeps the
   newer map (`meetingsClock`, the web's XERK-444 merge). Tests: `core/MeetingsTest`,
   `vm/MeetingsWiringTest`, `ui/MeetingsScreenTest`, `BottomNavTabTest`.
-- **Meetings is a pane of the Brief tab, no tab of its own** (XERK-2623, web `/brief#meetings`):
-  `BriefScreen`'s `BriefPane` TabRow; the pane lives in `TurmaApp` (`briefPane`) so a meetings push
-  (`deepLinkBriefPane`) opens it. Bottom-nav labels stay ONE line at 11sp; never let one wrap.
-  Tests: `BriefScreenTest`, `TurmaAppDeepLinkTest`.
+- **The Brief tab is ONE triage list, the Daily brief folded into each org's daily-meeting entry**
+  (XERK-2858, web XERK-2857). `core/MeetingsTriage.kt` `triageEntries` ports the web's `entriesOf`:
+  ONE entry per scheduled `meetingAt` holding EVERY capture tagged `daily` for it and its briefs.
+  - The hub serves meetings newest first, so "first capture wins" pairs the rejoin, not the
+    standup (QA). Test fixtures must be in hub order (`MeetingsTriageTest`).
+  - Needs review always lists the org's `current` daily entry (today's or later, else the newest).
+  - A meetings push (`deepLinkBrief`) opens Brief with its org unfolded (`TurmaApp.briefOpenSite`).
+  - The open entry is looked up in the UNFILTERED entries: one reviewed to zero must not vanish
+    from under the operator because Needs review no longer lists it.
+  - Settings saves toast only a refusal; success reads "Saved" by its button (one failure surface).
+  - A cleared Tenir label sends an explicit `{"label":null}` via `JsonObject`: TurmaJson's
+    `explicitNulls=false` would drop a typed null and the hub 400s a body with no `label`.
+  - Bottom-nav labels stay ONE line at 11sp; never let one wrap.
+  - Tests: `core/MeetingsTriageTest`, `ui/BriefScreenTest`, `ui/MeetingsScreenTest`, `TurmaAppDeepLinkTest`.
 
 ## Images (rollup XERK-2109)
 

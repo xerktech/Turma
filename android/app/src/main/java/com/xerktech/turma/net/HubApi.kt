@@ -26,6 +26,7 @@ import retrofit2.http.Body
 import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.POST
+import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
 import com.xerktech.turma.core.bareKey
@@ -446,6 +447,37 @@ interface HubApi {
         @Path("itemId") itemId: String,
         @Body body: com.xerktech.turma.model.MeetingReviewRequest,
     ): Response<com.xerktech.turma.model.MeetingReviewResponse>
+
+    // Archive / unarchive a meeting (XERK-2856): {archived}. Answers {ok,
+    // meeting}; 409 while it is queued or running, in the hub's words.
+    @POST("api/orgs/{siteKey}/meetings/{meetingId}/archive")
+    suspend fun archiveMeeting(
+        @Path("siteKey") siteKey: String,
+        @Path("meetingId") meetingId: String,
+        @Body body: com.xerktech.turma.model.MeetingArchiveRequest,
+    ): Response<com.xerktech.turma.model.MeetingReviewResponse>
+
+    // An org's meeting settings (XERK-2858's panel): whose work ({names, role},
+    // XERK-2514), its Tenir label ({label: "<label>"|null}, XERK-2638) and its
+    // standup schedule (PUT merges the sent fields, XERK-2391). Raw objects: a
+    // null label must reach the wire, which TurmaJson's explicitNulls=false drops.
+    @POST("api/orgs/{siteKey}/meeting-focus")
+    suspend fun setMeetingFocus(
+        @Path("siteKey") siteKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): Response<kotlinx.serialization.json.JsonObject>
+
+    @POST("api/orgs/{siteKey}/meeting-label")
+    suspend fun setMeetingLabel(
+        @Path("siteKey") siteKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): Response<kotlinx.serialization.json.JsonObject>
+
+    @PUT("api/orgs/{siteKey}/daily-brief/schedule")
+    suspend fun putDailyBriefSchedule(
+        @Path("siteKey") siteKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): Response<kotlinx.serialization.json.JsonObject>
 
     // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
     // like the agent pin — an authoritative 200. Body: {enabled:true|false}.
