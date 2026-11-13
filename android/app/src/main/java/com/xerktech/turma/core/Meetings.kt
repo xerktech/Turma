@@ -41,9 +41,12 @@ fun meetingKindLabel(kind: String): String = when (kind) {
     else -> kind
 }
 
-/** A proposal can be (re)approved unless it is in flight or done. */
-fun meetingReviewable(it: MeetingItem): Boolean =
-    it.review == null || it.review.state == "failed" || it.review.state == "rejected"
+/** Its ticket may already exist (XERK-2865, web `maybeCreated`): only Reject is offered. */
+fun meetingMaybeCreated(it: MeetingItem): Boolean = it.review?.maybeCreated == true
+
+/** A proposal can be (re)approved unless it is in flight, done, or may already exist. */
+fun meetingReviewable(it: MeetingItem): Boolean = !meetingMaybeCreated(it) &&
+    (it.review == null || it.review.state == "failed" || it.review.state == "rejected")
 
 /** Which org's project new tickets go to: the viewer's pick while offered, else a lone project. */
 fun meetingProject(saved: String?, projects: List<CreateProject>): String = when {
@@ -86,7 +89,10 @@ fun meetingReviewLines(it: MeetingItem): List<ReviewLine> {
         "creating" -> listOf(ReviewLine("Creating the ticket…", ReviewTone.NEUTRAL))
         "logged" -> listOf(ReviewLine("✓ Added to the decisions log", ReviewTone.GOOD))
         "rejected" -> listOf(ReviewLine("Rejected", ReviewTone.NEUTRAL))
-        "failed" -> listOf(ReviewLine("Not created — " + r.error.ifEmpty { "the create failed" }, ReviewTone.BAD))
+        "failed" -> listOf(
+            if (r.maybeCreated) ReviewLine("Maybe created — " + r.error.ifEmpty { "check the board" }, ReviewTone.BAD)
+            else ReviewLine("Not created — " + r.error.ifEmpty { "the create failed" }, ReviewTone.BAD),
+        )
         "created" -> buildList {
             add(ReviewLine("✓ Created ${r.key}", ReviewTone.GOOD, r.key))
             if (r.start) {
@@ -149,7 +155,7 @@ fun meetingsEmptyText(map: Map<String, List<Meeting>>): String =
 fun meetingsPending(map: Map<String, List<Meeting>>, scoped: Set<String>): Int =
     meetingOrgs(map, scoped).sumOf { s ->
         map[s].orEmpty().filter { it.status == "ok" }
-            .sumOf { m -> m.items.count { meetingReviewable(it) && it.review?.state != "rejected" } }
+            .sumOf { m -> m.items.count { (meetingReviewable(it) || meetingMaybeCreated(it)) && it.review?.state != "rejected" } }
     }
 
 /** The orgs the screen shows: those with meetings, inside the header's scope (empty = all). */

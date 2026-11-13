@@ -41,7 +41,8 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 - **Nothing reaches the board unasked**: every create is the operator's Approve. A `decision`
   item offers "Log decision" (decisions log), never a ticket.
 - Reviewed (created / logged / rejected) proposals leave the list — never greyed in place — and
-  count in the progress bar; "show reviewed (n)" lists them. Rejected/failed offer Reopen (not a `maybeCreated` failure, XERK-2864).
+  count in the progress bar; "show reviewed (n)" lists them. Rejected/failed offer Reopen;
+  a `maybeCreated` failure offers Reject only and still awaits review (XERK-2864, XERK-2865).
 - Keyboard: A approve, S approve + session (not on a decision), E edit, R reject, J/K move —
   never with a modifier, a key's auto-repeat, focus in a field/contenteditable/dialog, or the
   drawer open (`onKey`).

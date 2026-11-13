@@ -56,10 +56,15 @@ const itemKey = (site, mid, iid) => [site, mid, iid].map(encodeURIComponent).joi
 const meetingKey = (site, mid) => [site, mid].map(encodeURIComponent).join("/");
 const entryKey = (site, id) => [site, id].map(encodeURIComponent).join("/");
 const splitKey = (k) => String(k).split("/").map(decodeURIComponent);
-// A proposal can be (re)approved unless it is in flight or done.
-const reviewable = (it) => !it.review || it.review.state === "failed" || it.review.state === "rejected";
-// Awaiting the operator: a rejected one was answered.
-const isPending = (it) => !!it && reviewable(it) && !(it.review && it.review.state === "rejected");
+// Its ticket may already exist (XERK-2865): the hub refuses Approve and Reopen.
+const maybeCreated = (it) => !!it.review && it.review.maybeCreated === true;
+// A proposal can be (re)approved unless it is in flight, done, or may already exist.
+const reviewable = (it) => !maybeCreated(it)
+  && (!it.review || it.review.state === "failed" || it.review.state === "rejected");
+// Awaiting the operator: a rejected one was answered. A maybe-created one still
+// waits on a board check and a Reject (XERK-2865).
+const isPending = (it) => !!it && (reviewable(it) || maybeCreated(it))
+  && !(it.review && it.review.state === "rejected");
 // Answered and out of the way: hidden behind "show reviewed", never greyed in place.
 const isReviewed = (it) => !!it && !!it.review && ["created", "logged", "rejected"].includes(it.review.state);
 const GEAR_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
@@ -322,6 +327,7 @@ function reviewStateHtml(site, it) {
   if (r.state === "creating") return `<span class="state">Creating the ticket…</span>`;
   if (r.state === "logged") return `<span class="state good">✓ Added to the decisions log</span>`;
   if (r.state === "rejected") return `<span class="state">Rejected</span>`;
+  if (r.state === "failed" && r.maybeCreated) return `<span class="state bad">Maybe created — ${esc(r.error || "check the board")}</span>`;
   if (r.state === "failed") return `<span class="state bad">Not created — ${esc(r.error || "the create failed")}</span>`;
   if (r.state === "created") {
     let s = `<span class="state good">✓ Created <a href="${esc(boardUrl(site, r.key))}">${esc(r.key)}</a></span>`;
@@ -367,6 +373,9 @@ function itemHtml(site, m, it) {
     actions = editHtml(site, m, it, k);
   } else if (state === "rejected") {
     actions = `<button class="btn-sm" data-act="reopen" data-k="${esc(k)}"${dis}>${busy.has(k) ? "Working…" : "Reopen"}</button>`;
+  } else if (state === "failed" && maybeCreated(it)) {
+    // Check the board, then put it away: Approve would make a second ticket.
+    actions = `<button class="btn-sm" data-act="reject" data-k="${esc(k)}"${dis}>${busy.has(k) ? "Working…" : "Reject"}</button>`;
   } else if (reviewable(it)) {
     actions = `<button class="btn-sm primary" data-act="approve" data-k="${esc(k)}"${dis}>${busy.has(k) ? "Working…" : isDecision ? "Log decision" : "Approve"}${kbd(cur, "A")}</button>`
       + (isDecision ? "" : `<button class="btn-sm" data-act="start" data-k="${esc(k)}"${dis}>Approve + start session${kbd(cur, "S")}</button>`)

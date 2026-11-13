@@ -73,6 +73,11 @@ class MeetingsTest {
         assertTrue(meetingReviewable(MeetingItem(review = MeetingReview("failed"))))
         assertFalse(meetingReviewable(MeetingItem(review = MeetingReview("creating"))))
         assertFalse(meetingReviewable(MeetingItem(review = MeetingReview("created"))))
+        // XERK-2865: a create that may have landed is never (re)approvable.
+        assertEquals(listOf("Maybe created — it may exist"),
+            lines(MeetingReview("failed", error = "it may exist", maybeCreated = true)))
+        assertFalse(meetingReviewable(MeetingItem(review = MeetingReview("failed", maybeCreated = true))))
+        assertFalse(meetingReviewable(MeetingItem(review = MeetingReview("rejected", maybeCreated = true))))
     }
 
     @Test fun `meta and status lines`() {

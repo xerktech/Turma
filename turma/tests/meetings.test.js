@@ -178,13 +178,14 @@ test("XERK-2510: a refusal reaches the operator in the hub's words; review state
   assert.match(h, /Added to the decisions log/);
   assert.match(h2, /Not created — &lt;boom&gt;/);
   assert.match(h2, /data-act="reopen" data-k="acme\.atlassian\.net\/m2\/p1"/);
-  // XERK-2864: a create that may have gone through offers no Reopen (Approve stays).
+  // XERK-2864/2865: a create that may have gone through offers neither Reopen nor Approve.
   P.update(data([meeting({ meetingId: "m2", items: [{ ...items[0],
     review: { state: "failed", at: 1, error: "may have been created", maybeCreated: true } }] })]));
   P.select(P.entryKey(SITE, "m:m2"));
   const h3 = P.list();
   assert.doesNotMatch(h3, /data-act="reopen"/);
-  assert.match(h3, /data-act="approve" data-k="acme\.atlassian\.net\/m2\/p1"/);
+  assert.doesNotMatch(h3, /data-act="approve"/);
+  assert.match(h3, /data-act="reject" data-k="acme\.atlassian\.net\/m2\/p1"/);
   assert.match(h2, /class="mt-item rejected"/);
   // A pending or failed run says so instead of items.
   P.update(data([meeting({ status: "running", host: "k8x-02", items: undefined }),
@@ -193,6 +194,32 @@ test("XERK-2510: a refusal reaches the operator in the hub's words; review state
   assert.match(P.list(), /Reading the captions on k8x-02/);
   P.select(P.entryKey(SITE, "m:m3"));
   assert.match(P.list(), /Could not propose work items — timed out/);
+});
+
+test("XERK-2865: a proposal whose ticket may exist offers Reject only, and still awaits review", () => {
+  const P = loadPage(META);
+  const items = meeting().items;
+  const maybe = { state: "failed", at: 1, maybeCreated: true,
+    error: "the host went silent while creating the ticket — it may have been created" };
+  const d = data([meeting({ items: [{ ...items[0], review: maybe }] })]);
+  P.setCache(d);
+  P.renderMeetings(d);
+  P.setFilter("all");
+  P.select(P.entryKey(SITE, "m:m1"));
+  const h = P.list();
+  assert.match(h, /Maybe created — the host went silent/);
+  assert.doesNotMatch(h, /Not created/);
+  const k = P.itemKey(SITE, "m1", items[0].id);
+  const acts = [...h.matchAll(new RegExp(`data-act="(\\w+)" data-k="${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`, "g"))].map((x) => x[1]);
+  assert.deepEqual(acts, ["reject"]);
+  assert.equal(P.pendingCount(d), 1);
+  // Rejected after a check, it keeps only Reopen (the hub returns it to this verdict).
+  const r = data([meeting({ items: [{ ...items[0], review: { ...maybe, state: "rejected" } }] })]);
+  P.update(r);
+  P.select(P.entryKey(SITE, "m:m1"));
+  P.click({ showReviewed: P.meetingKey(SITE, "m1") });
+  assert.match(P.list(), /data-act="reopen"/);
+  assert.doesNotMatch(P.list(), /data-act="approve"/);
 });
 
 test("XERK-2511: a second press while an Approve awaits its issue types posts nothing", async () => {

@@ -30043,14 +30043,16 @@ test("XERK-2510: a create whose host goes silent fails in honest words; an agent
   agents.mtFail2510.lastSeen = Date.now() - 10 * 60e3;
   hub.settleMeetingReviews();
   const rv2 = item2510(S, "f1", "p2").review;
-  assert.deepEqual([rv2.state, rv2.maybeCreated, /may have been created/.test(rv2.error)], ["failed", true, true]);
-  // A host too old to create tickets (a capability gap) ran nothing, delivered or not.
+  assert.deepEqual([rv2.state, rv2.maybeCreated, /check the board/.test(rv2.error)], ["failed", true, true]);
+  // XERK-2865: a second Approve there would make a duplicate, so it is refused.
   agents.mtFail2510.lastSeen = Date.now();
-  assert.equal((await review2510(S, "f1", "p2", { action: "approve", project: "GAP", issueType: "1" })).status, 200);
+  assert.equal((await review2510(S, "f1", "p2", { action: "approve", project: "QA", issueType: "1" })).status, 409);
+  // A host too old to create tickets (a capability gap) ran nothing, delivered or not.
+  assert.equal((await review2510(S, "f1", "p1", { action: "approve", project: "GAP", issueType: "1" })).status, 200);
   await beat1574("mtFail2510", S);
   agents.mtFail2510.unsupported = { createTicket: Date.now() };
   hub.settleMeetingReviews();
-  const rv3 = item2510(S, "f1", "p2").review;
+  const rv3 = item2510(S, "f1", "p1").review;
   assert.deepEqual([rv3.state, "maybeCreated" in rv3, /too old/.test(rv3.error)], ["failed", false, true]);
   delete agents.mtFail2510.unsupported;
   assert.equal(creates2510("mtFail2510").filter((c) => c.project === "OPS").length, 0);
@@ -30066,9 +30068,8 @@ test("XERK-2510: a create whose host goes silent fails in honest words; an agent
   agents.mtFail2510.lastSeen = late;   // still beating, the command long gone
   hub.settleMeetingReviews(late);
   agents.mtFail2510.lastSeen = Date.now();
-  assert.deepEqual([item2510(S, "f1", "p1").review.state, /may have been created/.test(item2510(S, "f1", "p1").review.error)],
-    ["failed", true]);
-  assert.equal(item2510(S, "f1", "p1").review.maybeCreated, true, "XERK-2864: Reopen is refused on it");
+  assert.deepEqual([item2510(S, "f1", "p1").review.state, /check the board/.test(item2510(S, "f1", "p1").review.error),
+    item2510(S, "f1", "p1").review.maybeCreated], ["failed", true, true]);
   assert.equal((await review2510(S, "f1", "p1", { action: "reopen" })).status, 409);
   assert.equal((await review2510(S, "f1", "p1", { action: "reject" })).status, 200);
   // An unedited approve (the page always sends the meeting context) is not "edited".
@@ -30093,6 +30094,160 @@ test("XERK-2510: a create whose host goes silent fails in honest words; an agent
   assert.equal(hub.sanitizeMeeting({ ...okMeeting2510("z"), items: okMeeting2510("z").items.map((i) =>
     ({ ...i, review: { state: "rejected", at: 1 } })) }).items.length, 3);
   cleanup2508(S, ["mtFail2510"]);
+});
+
+// ---- XERK-2865: missing hub state is "can't tell", never "nothing ran" -----------
+
+const approve2865 = (S, mid, iid) =>
+  review2510(S, mid, iid, { action: "approve", project: "ENG", issueType: "1" });
+// The host's beat takes its queued commands: they are now delivered.
+const deliver2865 = (device, S) => beat1574(device, S);
+const beat2865 = (device, headers, extra = {}) =>
+  request("POST", "/api/heartbeat", { body: { device, ...extra },
+    headers: { ...headers, "content-type": "application/json" } });
+
+test("XERK-2865: a host removed after taking a create fails 'may have been created' and blocks Reopen", async () => {
+  const S = "mtRm2865.atlassian.net";
+  await beat1574("mtRm2865", S);
+  hub.putMeeting(S, okMeeting2510("r1"));
+  assert.equal((await approve2865(S, "r1", "p1")).status, 200);
+  await deliver2865("mtRm2865", S);
+  assert.ok(creates2510("mtRm2865")[0].deliveredAt, "the beat delivered the create");
+  delete agents.mtRm2865;   // DELETE /api/agents/<host>
+  hub.settleMeetingReviews();
+  const rv = item2510(S, "r1", "p1").review;
+  assert.deepEqual([rv.state, rv.maybeCreated], ["failed", true]);
+  assert.match(rv.error, /check the board/);
+  // A reopen would put a duplicate one Approve away.
+  await beat1574("mtRm2865b", S);
+  assert.equal((await review2510(S, "r1", "p1", { action: "reopen" })).status, 409);
+  cleanup2508(S, ["mtRm2865", "mtRm2865b"]);
+});
+
+test("XERK-2865: a create answered under a host's new name settles created, not failed", async () => {
+  const S = "mtRn2865.atlassian.net";
+  await beat2865("mtRnA2865", asAuth(hostAgentToken("mtRnA2865")), {
+    jira: { available: true, configured: true, siteKey: S, user: "u@x.com",
+      fetchedAt: new Date().toISOString(), tickets: [] } });
+  const tok = enrollUid("mtRnA2865");
+  hub.putMeeting(S, okMeeting2510("n1"));
+  assert.equal((await approve2865(S, "n1", "p1")).status, 200);
+  const [c] = creates2510("mtRnA2865");
+  const jira = { available: true, configured: true, siteKey: S, user: "u@x.com",
+    fetchedAt: new Date().toISOString(), tickets: [] };
+  assert.equal((await beat2865("mtRnA2865", asAuth(tok), { jira })).status, 200);
+  // The agent restarts under its new DEVICE_NAME and reports the create there.
+  agents.mtRnA2865.updating = { reason: "restart", at: Date.now(), until: Date.now() + 60000 };
+  const r = await beat2865("mtRnB2865", asAuth(tok), { jira,
+    createTicketResults: [{ cmdId: c.cmdId, key: "ENG-99", url: null, error: null }] });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(agents.mtRnA2865, undefined);
+  hub.settleMeetingReviews();
+  const rv = item2510(S, "n1", "p1").review;
+  assert.deepEqual([rv.state, rv.key], ["created", "ENG-99"]);
+  // And a create still unanswered under the new name keeps waiting on that record.
+  assert.equal((await approve2865(S, "n1", "p2")).status, 200);
+  assert.equal(item2510(S, "n1", "p2").review.host, "mtRnB2865");
+  forget2381("mtRnA2865", "mtRnB2865");
+  delete hub.getMeetings()[S];
+});
+
+test("XERK-2865: a create whose queued command the hub lost is 'can't tell' once its host is silent", async () => {
+  const S = "mtLost2865.atlassian.net";
+  await beat1574("mtLost2865", S);
+  hub.putMeeting(S, okMeeting2510("l1"));
+  assert.equal((await approve2865(S, "l1", "p1")).status, 200);
+  // A hub killed inside the state.json debounce restarts without the command.
+  agents.mtLost2865.commands = (agents.mtLost2865.commands || []).filter((c) => c.type !== "createTicket");
+  agents.mtLost2865.lastSeen = Date.now() - 10 * 60e3;
+  hub.settleMeetingReviews();
+  const rv = item2510(S, "l1", "p1").review;
+  assert.deepEqual([rv.state, rv.maybeCreated], ["failed", true]);
+  assert.match(rv.error, /check the board/);
+  assert.equal((await review2510(S, "l1", "p1", { action: "reopen" })).status, 409);
+  // Still provably unrun (queued, never delivered): the honest "nothing ran", reopenable.
+  agents.mtLost2865.lastSeen = Date.now();
+  assert.equal((await approve2865(S, "l1", "p2")).status, 200);
+  agents.mtLost2865.lastSeen = Date.now() - 10 * 60e3;
+  hub.settleMeetingReviews();
+  const rv2 = item2510(S, "l1", "p2").review;
+  assert.deepEqual([rv2.state, rv2.error, "maybeCreated" in rv2],
+    ["failed", "the host went offline before the ticket was created", false]);
+  assert.equal((await review2510(S, "l1", "p2", { action: "reopen" })).status, 200);
+  cleanup2508(S, ["mtLost2865"]);
+});
+
+test("XERK-2865: the New-ticket poll never calls a create that left no queued command 'never ran'", async () => {
+  const S = "mtPoll2865.atlassian.net";
+  await beat1574("mtPoll2865", S);
+  const q = await request("POST", `/api/jira/${S}/tickets`, { headers: userHeaders,
+    body: { summary: "x", project: "ENG", issueType: "1" } });
+  assert.equal(q.status, 200);
+  agents.mtPoll2865.commands = (agents.mtPoll2865.commands || []).filter((c) => c.type !== "createTicket");
+  agents.mtPoll2865.lastSeen = Date.now() - 10 * 60e3;
+  const r = await request("GET", `/api/jira/${S}/tickets/${q.body.cmdId}`, { headers: userHeaders });
+  assert.equal(r.status, 503);
+  assert.match(r.body.error, /may have been created/);
+  delete agents.mtPoll2865;
+});
+
+test("XERK-2865: a maybe-created proposal refuses Approve and Reopen; Reject keeps the verdict", async () => {
+  const S = "mtMb2865.atlassian.net";
+  await beat1574("mtMb2865", S);
+  hub.putMeeting(S, okMeeting2510("m1"));
+  assert.equal((await approve2865(S, "m1", "p1")).status, 200);
+  await deliver2865("mtMb2865", S);
+  agents.mtMb2865.lastSeen = Date.now() - 10 * 60e3;
+  hub.settleMeetingReviews();
+  assert.equal(item2510(S, "m1", "p1").review.maybeCreated, true);
+  agents.mtMb2865.lastSeen = Date.now();
+  const before = creates2510("mtMb2865").length;
+  // A direct Approve is the duplicate itself: refused in the hub's words.
+  const again = await approve2865(S, "m1", "p1");
+  assert.equal(again.status, 409);
+  assert.match(again.body.error, /may have been created/);
+  assert.equal(creates2510("mtMb2865").length, before);
+  // Reject is allowed (the operator checked the board) and keeps the verdict…
+  assert.equal((await review2510(S, "m1", "p1", { action: "reject" })).status, 200);
+  const rj = item2510(S, "m1", "p1").review;
+  assert.deepEqual([rj.state, rj.maybeCreated, /check the board/.test(rj.error)], ["rejected", true, true]);
+  assert.equal((await approve2865(S, "m1", "p1")).status, 409);
+  // …so Reopen returns it to the failed verdict, never to pending.
+  assert.equal((await review2510(S, "m1", "p1", { action: "reopen" })).status, 200);
+  const ro = item2510(S, "m1", "p1").review;
+  assert.deepEqual([ro.state, ro.maybeCreated], ["failed", true]);
+  assert.equal((await review2510(S, "m1", "p1", { action: "reopen" })).status, 409);
+  assert.equal((await approve2865(S, "m1", "p1")).status, 409);
+  // The store keeps it across a round trip.
+  assert.deepEqual(hub.meetingsCoerce(JSON.parse(JSON.stringify(hub.getMeetings()))), hub.getMeetings());
+  cleanup2508(S, ["mtMb2865"]);
+});
+
+test("XERK-2865: a tenant bind after a delivered create reads 'may have been created', not 'agent too old'", async () => {
+  const T = tenants2533();
+  const S = "mtBind2865.atlassian.net";
+  const dev = "t2865bind", kc = `${dev}@${T.C.t}`;
+  try {
+    forget2533(dev, kc);
+    const m = await request("POST", "/api/enroll-codes", { headers: userHeaders, body: {} });
+    const tok = (await request("POST", "/api/agent/enroll", { body: { code: m.body.code, device: dev } })).body.token;
+    const jira = { available: true, configured: true, siteKey: S, user: "u@x.com",
+      fetchedAt: new Date().toISOString(), tickets: [] };
+    assert.equal((await beat2533(tok, dev, { jira })).status, 200);
+    hub.putMeeting(S, okMeeting2510("b1"));
+    assert.equal((await approve2865(S, "b1", "p1")).status, 200);
+    await beat2533(tok, dev, { jira });   // delivered
+    assert.equal((await request("POST", `/api/agents/${dev}/roll-token?bind=1`, { headers: T.C.h, body: {} })).status, 200);
+    assert.equal((await beat2533(tok, dev, { jira })).status, 200);   // the bind beat, no result
+    assert.ok(agents[kc] && !agents[dev]);
+    assert.ok(!(agents[kc].unsupported || {}).createTicket,
+      "a dropped command is no evidence the agent is too old");
+    agents[kc].lastSeen = Date.now() - 10 * 60e3;
+    hub.settleMeetingReviews();
+    const rv = item2510(S, "b1", "p1").review;
+    assert.deepEqual([rv.state, rv.maybeCreated], ["failed", true]);
+    assert.match(rv.error, /check the board/);
+  } finally { forget2533(dev, kc); T.restore(); delete hub.getMeetings()[S]; }
 });
 
 // ---- XERK-2550: usage, ledgers and insights partitioned by tenant -------------
@@ -31292,7 +31447,7 @@ test("XERK-2856: reopen puts a rejected or failed proposal back, unarchives its 
   assert.equal(item2510(S, "r1", "p2").review.maybeCreated, true, "the store keeps the mark");
   const r3 = await reopen("p2");
   assert.deepEqual([r3.status, r3.body.error],
-    [409, "that ticket may already exist — check the board, then approve or reject it"]);
+    [409, hub.MEETING_MAYBE_CREATED_REFUSAL]);
   assert.equal(item2510(S, "r1", "p2").review.state, "failed");
   // Reject keeps the warning, and Reopen goes back to the warned failure, never pending.
   assert.equal((await review2510(S, "r1", "p2", { action: "reject" })).status, 200);
