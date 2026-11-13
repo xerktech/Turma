@@ -78,10 +78,16 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
          * on this screen only because its spend outlived it. Web `hostLabel`.
          */
         val retired: Boolean = false,
+        /** The agent's own device name; blank falls back to [host] minus its tenant suffix. */
+        val device: String = "",
     ) {
+        /** Keyed on the raw registry key, so two tenants' same-named hosts never merge. */
         val skey: String get() = "host::$host"
-        /** What the legend and the chart call it; see [retired]. */
-        val label: String get() = if (retired) "$host (removed)" else host
+        /** What the legend and the chart call it — never the `@<tenant>` key (web `hostLabel`). */
+        val label: String get() {
+            val name = device.ifBlank { bareKey(host) }
+            return if (retired) "$name (removed)" else name
+        }
     }
 
     /** One model's fleet-wide token counts. */
@@ -280,7 +286,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 a.usage?.let { addDays(hostDays, it) }
                     ?: a.repoUsage.forEach { addDays(hostDays, it.usage) }
                 hosts.add(HostTotal(a.key, hostToday, hostWeek, hostTotal, hostDays, hostCache,
-                                    retired = a.retired))
+                                    retired = a.retired, device = a.device))
                 today += hostToday
                 week += hostWeek
                 total += hostTotal

@@ -150,6 +150,15 @@ class ChatUiStateTest {
         assertFalse(after.canSwitchModelSource())
     }
 
+    @Test
+    fun `a tenant host's header never shows its tenant id`() {
+        // A tenant host's key is `<device>@<32 hex>`: the fallback strips it, with or
+        // without an agent record (removed host, or before the fleet list loads).
+        val key = "box@0123456789abcdef0123456789abcdef"
+        assertEquals("box", ChatUiState().fromFleet(AgentInfo(key = key), null, host = key).hostLabel)
+        assertEquals("box", ChatUiState().fromFleet(null, null, host = key).hostLabel)
+    }
+
     // --- the TUI's blocking dialog (session.panePrompt) -----------------------
 
     private fun dialog(detail: String, question: String = "") = SessionInfo(

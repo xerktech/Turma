@@ -1436,6 +1436,45 @@ function makeHost() {
   };
 }
 
+test("alerts: a tenant host's notifications name the host, never its tenant id", () => {
+  const t = "0123456789abcdef0123456789abcdef";
+  const key = `truenas@${t}`;
+  hub.registerDevice("tenant-capture", "android", ["dismiss"], t);
+  try {
+    const alerts = {};
+    let prev = {};
+    const beat = (payload, at) => {
+      const next = { device: "truenas", ...payload, lastSeen: at, alerts };
+      heartbeatAlerts(key, prev, next);
+      prev = next;
+    };
+    const t0 = Date.now();
+    notifications.length = 0;
+    beat({ startedAt: "b1" }, t0);
+    beat({ startedAt: "b2" }, t0 + 1000);
+    beat({ startedAt: "b3", claudeAuth: { needsLogin: true } }, t0 + 2000);
+    beat({ startedAt: "b3", claudeAuth: { needsLogin: false } }, t0 + 3000);
+    beat({ startedAt: "b3", claudeAuth: { needsLogin: false, expiringSoon: true,
+      refreshExpiresAt: t0 + 2 * 24 * 3600 * 1000 } }, t0 + 4000);
+    // A question on a session with no summary and no rcName: the fallback label names the host.
+    beat({ startedAt: "b3", sessions: [{ id: "s1", repo: "Turma", branch: "x", status: "running",
+      session: { paneBusy: false, lastRole: "assistant", transcriptAgeSec: 5, question: "Go?" } }] }, t0 + 5000);
+    alerts.offlineAt = t0;
+    beat({ startedAt: "b3" }, t0 + 6000);
+    const titles2 = titles();
+    for (const want of ["truenas restart loop", "Claude login required on truenas",
+      "Claude login restored on truenas", "Claude login expiring on truenas", "truenas back online"]) {
+      assert.ok(titles2.includes(want), `missing ${want} in ${JSON.stringify(titles2)}`);
+    }
+    assert.ok(titles2.some((x) => x.startsWith("truenas · Turma@x")), JSON.stringify(titles2));
+    for (const n of notifications) {
+      assert.doesNotMatch(`${n.title ?? ""} ${n.body ?? ""}`, /@[0-9a-f]{32}/);
+    }
+  } finally {
+    hub.unregisterDevice("tenant-capture");
+  }
+});
+
 test("alerts: offline recovery fires once and clears the marker", () => {
   const beat = makeHost();
   const now = Date.now();
@@ -8672,6 +8711,30 @@ test("findTicketHost routes a dsh ticket only to a host that offers dsh", async 
     { requireFree: true });
   assert.equal(ok.host, "trCap");
   hub.setTicketRuntime("trRoute.atlassian.net", "ENG-9", null);   // cleanup
+});
+
+test("findTicketHost: a pin refusal names the agent, never its tenant id", async () => {
+  await ticketBeat("trTenPin", "trTenPin.atlassian.net", { key: "ENG-4" });
+  hub.setTicketAgent("trTenPin.atlassian.net", "ENG-4", "ghost@0123456789abcdef0123456789abcdef");
+  try {
+    const r = hub.findTicketHost("trTenPin.atlassian.net", "Turma", "ENG-4", { requireFree: true });
+    assert.match(r.error, /pinned to agent "ghost"/);
+    assert.doesNotMatch(r.error, /@[0-9a-f]{32}/);
+  } finally {
+    hub.setTicketAgent("trTenPin.atlassian.net", "ENG-4", null);
+  }
+});
+
+test("operator-facing host text never interpolates a raw registry key", () => {
+  // Tripwire beside the behavioural tests: the pin refusals, the restore race and
+  // the host notifications reach the operator verbatim, so a tenant key there
+  // leaks its tenant id. Each must go through baseOfKey.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  assert.doesNotMatch(src, /pinned to agent "\$\{pin\.host\}"/);
+  assert.doesNotMatch(src, /came back up on \$\{host\}/);
+  for (const line of src.split("\n").filter((l) => /^\s*notify\(`/.test(l))) {
+    assert.doesNotMatch(line, /\$\{(key|host)\}/, line.trim());
+  }
 });
 
 // ---- XERK-515 [Qwen I]: a ticket can be pinned to the qwen runtime ----------

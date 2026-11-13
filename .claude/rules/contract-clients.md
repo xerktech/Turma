@@ -40,5 +40,10 @@ Rules every client (web, Android) must keep with the hub and with each other.
     labels it with `TurmaBoard.hostName(key)` (alias `bareKey`; pages call it via `displayKey`),
     which strips only an exact `@<32 lowercase hex>` tail. Tests: board.test.js `hostName: …`,
     host-header.test.js `hostCard: a tenant host …`, sessions.test.js Move-to/Restore raw-key cases.
+  - **Hub-composed text names a host by `baseOfKey(key)`, never the raw key**: push notification
+    titles/bodies and refusal `{error}` strings reach the operator verbatim, so no client strips them.
+    Tests: server.test.js `alerts: a tenant host's notification names the host…`.
+  - Android's Usage legend labels a host `device.ifBlank { bareKey(key) }`; its toggle key stays raw.
+    Tests: `UsageViewModelTest` `a tenant host is labelled by its name…`.
   - An org's siteKey carries the same suffix (XERK-2634): its LABEL goes through `orgName`/`bareKey`
     (poll notes, tooltips, policy toasts); routes and `data-site` keep the raw siteKey.
