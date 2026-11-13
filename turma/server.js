@@ -16274,7 +16274,7 @@ function agentHostRefusal(req, host) {
       return { status: 403, error: nameTokenRefusal(host) || "unauthorized" };
     }
     if (!tenantOfKey(host) && bearer && safeEqual(bearer, TURMA_AGENT_TOKEN) && tenantBoundName(host)) {
-      return { status: 403, error: `${host} is bound to a tenant and authenticates only with its own agent identity token, never the fleet master (Remove host on its card releases the name)` };
+      return { status: 403, error: `${baseOfKey(host)} is bound to a tenant and authenticates only with its own agent identity token, never the fleet master (Remove host on its card releases the name)` };
     }
     if (tenantOfKey(host) && bearer && safeEqual(bearer, TURMA_AGENT_TOKEN)) {
       return { status: 403, error: `${baseOfKey(host)} belongs to a tenant and authenticates only with its own agent identity token, never the fleet master` };
@@ -16282,7 +16282,7 @@ function agentHostRefusal(req, host) {
     if (bound) {
       return {
         status: 403,
-        error: `this agent token is ${bound}'s, not ${host}'s — a host's token is derived from its name, so re-derive it if the host was renamed`,
+        error: `this agent token is ${baseOfKey(bound)}'s, not ${baseOfKey(host)}'s — a host's token is derived from its name, so re-derive it if the host was renamed`,
       };
     }
     return { status: 401, error: "unauthorized" };
@@ -16290,7 +16290,7 @@ function agentHostRefusal(req, host) {
   if (kind === "legacy" && TURMA_AGENT_STRICT && TURMA_AGENT_TOKEN) {
     return {
       status: 403,
-      error: `this hub requires ${host}'s own agent token (TURMA_AGENT_STRICT is set), not the fleet master`,
+      error: `this hub requires ${baseOfKey(host)}'s own agent token (TURMA_AGENT_STRICT is set), not the fleet master`,
     };
   }
   return null;
@@ -17373,7 +17373,7 @@ function alertRecovered(key, rec, now) {
   const alerts = rec.alerts;
   if (!alerts || !alerts.offlineAt) return false;
   const where = rec.device ? ` on ${rec.device}` : "";
-  notify(`${key} back online`, `Was offline ${fmtDur(now - alerts.offlineAt)}${where}`, {
+  notify(`${baseOfKey(key)} back online`, `Was offline ${fmtDur(now - alerts.offlineAt)}${where}`, {
     tags: "green_circle",
     route: { host: key },
   });
@@ -17397,7 +17397,7 @@ function heartbeatAlerts(key, prev, next, hints = []) {
     const recent = alerts.boots.filter((b) => now - b.at < 10 * 60 * 1000);
     if (recent.length >= 3 && now - (alerts.loopAlertedAt || 0) > 30 * 60 * 1000) {
       alerts.loopAlertedAt = now;
-      notify(`${key} restart loop`, `${recent.length} container starts in 10 minutes${where}`, {
+      notify(`${baseOfKey(key)} restart loop`, `${recent.length} container starts in 10 minutes${where}`, {
         tags: "rotating_light",
         priority: "urgent",
         route: { host: key },
@@ -17417,7 +17417,7 @@ function heartbeatAlerts(key, prev, next, hints = []) {
     if (ca.needsLogin) {
       if (!alerts.claudeLoginAt) {
         alerts.claudeLoginAt = now;
-        notify(`Claude login required${where}`, `Run 'claude /login' on ${key} — sessions can't authenticate until then.`, {
+        notify(`Claude login required${where}`, `Run 'claude /login' on ${baseOfKey(key)} — sessions can't authenticate until then.`, {
           tags: "key",
           priority: "high",
           route: { host: key },
@@ -17429,7 +17429,7 @@ function heartbeatAlerts(key, prev, next, hints = []) {
     } else {
       if (alerts.claudeLoginAt) {
         delete alerts.claudeLoginAt;
-        notify(`Claude login restored${where}`, `${key} is authenticated again.`, {
+        notify(`Claude login restored${where}`, `${baseOfKey(key)} is authenticated again.`, {
           tags: "green_circle",
           route: { host: key },
         });
@@ -17438,7 +17438,7 @@ function heartbeatAlerts(key, prev, next, hints = []) {
         if (!alerts.claudeExpiringAt) {
           alerts.claudeExpiringAt = now;
           const when = ca.refreshExpiresAt ? ` (expires ${fmtDur(ca.refreshExpiresAt - now)} from now)` : "";
-          notify(`Claude login expiring${where}`, `Re-login soon on ${key}${when} — run 'claude /login'.`, {
+          notify(`Claude login expiring${where}`, `Re-login soon on ${baseOfKey(key)}${when} — run 'claude /login'.`, {
             tags: "key",
             route: { host: key },
           });
@@ -17470,7 +17470,7 @@ function heartbeatAlerts(key, prev, next, hints = []) {
     // the phone — the Sessions screen leads with it too. `rcName` is the
     // structural <host>-<repo>-<key> spawn id, which means nothing at a glance,
     // so it stands in only while a summary has not been generated yet.
-    const label = session.summary || session.rcName || `${key} · ${session.repo}@${session.branch}`;
+    const label = session.summary || session.rcName || `${baseOfKey(key)} · ${session.repo}@${session.branch}`;
     const s = session.session || {}; // null for stopped sessions
 
     const route = { host: key, sessionId: session.id };
@@ -17754,7 +17754,7 @@ function offlineDetectionTick() {
     a.alerts = a.alerts || {};
     a.alerts.offlineAt = now;
     const where = a.device ? ` on ${a.device}` : "";
-    notify(`${key} offline`, `No heartbeat for ${fmtDur(now - (a.lastSeen || 0))}${where}`, {
+    notify(`${baseOfKey(key)} offline`, `No heartbeat for ${fmtDur(now - (a.lastSeen || 0))}${where}`, {
       tags: "red_circle",
       priority: "high",
       route: { host: key },
@@ -25267,7 +25267,7 @@ const server = http.createServer(async (req, res) => {
           (x) => x.transcriptId === transcriptId && x.status === "running");
         if (live)
           return json(res, 409, {
-            error: `that conversation is already running on ${host} — kill it there first`,
+            error: `that conversation is already running on ${baseOfKey(host)} — kill it there first`,
           });
       }
       let inFlight = 0;
@@ -25526,7 +25526,7 @@ const server = http.createServer(async (req, res) => {
         // doesn't UTF-8 round-trip) — the same names hostAgentToken refuses to
         // mint for so a host can't rename itself into a dead credential.
         return json(res, 409, {
-          error: `cannot derive a token for host name ${key} — it is not a ` +
+          error: `cannot derive a token for host name ${baseOfKey(key)} — it is not a ` +
             "usable host key, so rename the host to a plain name first",
         });
       }
@@ -25544,7 +25544,7 @@ const server = http.createServer(async (req, res) => {
       const bindAsk = url.searchParams.get("bind");
       if (canBind && bindAsk !== "1" && bindAsk !== "0") {
         return json(res, 409, {
-          error: `rolling ${key}'s token would bind it to your tenant, after which the hub's ` +
+          error: `rolling ${baseOfKey(key)}'s token would bind it to your tenant, after which the hub's ` +
             "break-glass login can no longer reach it — roll with ?bind=1 to bind it, or ?bind=0 " +
             "to rotate its token and leave it untenanted",
           wouldBind: true,
@@ -25581,7 +25581,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
       if (!hostAgentToken(key)) {
-        return json(res, 409, { error: `${key} is not a usable host name, so no name token exists for it` });
+        return json(res, 409, { error: `${baseOfKey(key)} is not a usable host name, so no name token exists for it` });
       }
       const bumped = await bumpNameTokenGen(key);
       if (bumped.error) return json(res, bumped.status, { error: bumped.error });
@@ -26328,10 +26328,10 @@ const server = http.createServer(async (req, res) => {
       const revoke = identityParam === "revoke";
       if (revoke && !hostHasIdentity(key)) {
         if (!Object.prototype.hasOwnProperty.call(agents, key)) {
-          return json(res, 404, { error: `no host or agent identity is registered as ${key}` });
+          return json(res, 404, { error: `no host or agent identity is registered as ${baseOfKey(key)}` });
         }
         return json(res, 409, {
-          error: `${key} has no agent identity token to revoke — it runs on its name-derived ` +
+          error: `${baseOfKey(key)} has no agent identity token to revoke — it runs on its name-derived ` +
             `token (revoke that with POST /api/agents/${key}/revoke-name-token) or the fleet ` +
             "master (only rotating TURMA_AGENT_TOKEN revokes that), or its agent has been " +
             "renamed (revoke it under its new name)",
@@ -26575,7 +26575,7 @@ const server = http.createServer(async (req, res) => {
             ? { error: cached.error, fetchedAt: cached.fetchedAt, stale: true }
             : { issue: cached.issue, fetchedAt: cached.fetchedAt, stale: true });
         }
-        return json(res, 503, { error: `host ${key} is offline` });
+        return json(res, 503, { error: `host ${baseOfKey(key)} is offline` });
       }
       const pending = (agents[key].commands || [])
         .find((c) => c.type === "jiraIssue" && c.issueKey === issueKey);

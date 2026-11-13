@@ -1436,6 +1436,20 @@ function makeHost() {
   };
 }
 
+test("alerts: a tenant host's notification names the host, never its tenant id", () => {
+  const key = "truenas@0123456789abcdef0123456789abcdef";
+  const now = Date.now();
+  const alerts = { offlineAt: now - 5 * 60 * 1000 };
+  hub.registerDevice("tenant-capture", "android", ["dismiss"], "0123456789abcdef0123456789abcdef");
+  try {
+    notifications.length = 0;
+    heartbeatAlerts(key, { device: "truenas", alerts }, { device: "truenas", lastSeen: now, alerts });
+    assert.deepEqual(titles(), ["truenas back online"]);
+  } finally {
+    hub.unregisterDevice("tenant-capture");
+  }
+});
+
 test("alerts: offline recovery fires once and clears the marker", () => {
   const beat = makeHost();
   const now = Date.now();
