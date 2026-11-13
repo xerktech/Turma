@@ -380,4 +380,59 @@ class BriefScreenTest {
         compose.onNodeWithText("acmeqz").assertExists()
         compose.onAllNodesWithText("Saved").assertCountEquals(0)
     }
+
+    @Test fun `the label and whose work survive a rotation mid-save after an earlier save`() {
+        // The schedule case's twin for the other two sections (QA mutation map):
+        // each sends with its OWN last answer, and typing clears its "Saved".
+        val gate = java.util.concurrent.atomic.AtomicReference(java.util.concurrent.CountDownLatch(0))
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [] }""")
+        hub.route("/api/orgs/$site/meeting-label") {
+            gate.get().await(10, java.util.concurrent.TimeUnit.SECONDS)
+            HubHarness.refusal("label must be 1-40 lowercase letters", 400)
+        }
+        hub.route("/api/orgs/$site/meeting-focus") {
+            gate.get().await(10, java.util.concurrent.TimeUnit.SECONDS)
+            HubHarness.refusal("names must be up to 5 names", 400)
+        }
+        hub.seedFleet("""{ "now": 1, "agents": [ $host ] }""")
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        val vm = main.track(BriefViewModel(hub.app))
+        val restore = androidx.compose.ui.test.junit4.StateRestorationTester(compose)
+        restore.setContent { BriefScreen(vm = vm, meetingsVm = mvm) }
+        compose.onNodeWithContentDescription("o settings").performClick()
+        // An earlier save of each section that worked (answered by the hub).
+        hub.route("/api/orgs/$site/meeting-label") {
+            if (gate.get().count == 0L) okhttp3.mockwebserver.MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("""{ "ok": true, "label": "acmea", "custom": true }""")
+            else { gate.get().await(10, java.util.concurrent.TimeUnit.SECONDS); HubHarness.refusal("label refused", 400) }
+        }
+        hub.route("/api/orgs/$site/meeting-focus") {
+            if (gate.get().count == 0L) okhttp3.mockwebserver.MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("""{ "ok": true, "focus": { "names": [], "role": "one" } }""")
+            else { gate.get().await(10, java.util.concurrent.TimeUnit.SECONDS); HubHarness.refusal("focus refused", 400) }
+        }
+        compose.onNodeWithText("Label (blank = default)").performScrollTo().performTextReplacement("acmea")
+        compose.onNodeWithTag("save-label").performScrollTo().performClick()
+        compose.onNodeWithText("Role (optional)").performScrollTo().performTextReplacement("one")
+        compose.onNodeWithTag("save-focus").performScrollTo().performClick()
+        compose.waitUntil(5_000) { compose.onAllNodesWithText("Saved").fetchSemanticsNodes().size == 2 }
+        // Typing clears that section's "Saved".
+        compose.onNodeWithText("acmea").performScrollTo().performTextReplacement("acmeb")
+        compose.onNodeWithText("one").performScrollTo().performTextReplacement("two")
+        compose.onAllNodesWithText("Saved").assertCountEquals(0)
+        // Both saves held in flight, one at a time, across a rotation; then refused.
+        for ((tag, typed) in listOf("save-label" to "acmeb", "save-focus" to "two")) {
+            val release = java.util.concurrent.CountDownLatch(1)
+            gate.set(release)
+            compose.onNodeWithTag(tag).performScrollTo().performClick()
+            compose.waitUntil(5_000) { mvm.saving.value.isNotEmpty() }
+            restore.emulateSavedInstanceStateRestore()
+            compose.waitForIdle()
+            compose.onAllNodesWithText(typed).assertCountEquals(1)
+            release.countDown()
+            compose.waitUntil(10_000) { mvm.saving.value.isEmpty() }
+            compose.waitForIdle()
+            compose.onAllNodesWithText(typed).assertCountEquals(1)
+        }
+    }
 }
