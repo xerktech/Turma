@@ -416,9 +416,25 @@ class LedgerStore {
   _flushDirty(done) {
     const keys = [...this._dirty];
     this._dirty.clear();
-    const writes = keys.map((key) => this._serialize(key, () => this._persistHost(key)));
+    const writes = keys.map((key) => this._serialize(key, () => this._landHost(key)));
     if (!done) return;
-    Promise.allSettled(writes).then(() => done(null), () => done(null));
+    // `done(err)` when any write did not land, so a drain can tell.
+    Promise.all(writes).then((rs) => done(rs.every(Boolean) ? null : new Error("usage ledger: a Postgres host write failed")));
+  }
+
+  // Write ONE host now and report whether it LANDED (rollup XERK-2870). `rekeyHost`
+  // settles on this, never on a whole-store flush: the debounce timer may already have
+  // drained (and failed) the key, leaving a later flush nothing to report.
+  persistKey(key, done) {
+    this._dirty.delete(key);
+    this._serialize(key, () => this._landHost(key))
+      .then((ok) => done(ok ? null : new Error("usage ledger: a Postgres host write failed")));
+  }
+
+  // `_persistHost` as a boolean that never rejects: false = swallowed write or a throw
+  // (`_serialize` would otherwise turn a throw into `undefined`, read as success).
+  _landHost(key) {
+    return this._persistHost(key).then((ok) => ok !== false, () => false);
   }
 
   // Serialise writes to one host key within this replica (a second write reading a
@@ -446,7 +462,7 @@ class LedgerStore {
   // (`_seedFileModel`, entry supplied directly, since it is NOT in the served model).
   // Returns TRUE when every statement landed, FALSE when a write was swallowed — the
   // seed reads this to decide whether to consume its one-shot or retry; the live flush
-  // ignores it (it re-marks the host dirty on its next beat regardless).
+  // reports it through `_landHost` (a live host re-marks itself dirty on its next beat).
   async _writeEntry(key, entry) {
     // Bound this host's bytes BEFORE decomposing (the per-host `enforceHostShare` is
     // the store's expression of LEDGER_MAX — a host is one logical row-set, so its

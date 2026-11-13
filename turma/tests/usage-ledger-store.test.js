@@ -423,6 +423,50 @@ test("XERK-779: configure + ingest + rehydrate end-to-end through the real ledge
   ledger._internals.reset();
 });
 
+test("XERK-2870: a re-key keeps the old host's rows until the tenant key's write lands", async (t) => {
+  ledger._internals.reset();
+  class FlakyPool extends FakePgPool {
+    constructor() { super(); this.fail = false; }
+    query(text, params) {
+      const sql = String(text).replace(/\s+/g, " ").trim();
+      if (this.fail && /^INSERT INTO "usage_day"/i.test(sql)) return Promise.reject(new Error("blip"));
+      return super.query(text, params);
+    }
+  }
+  const pool = new FlakyPool();
+  await ledger.configure({ ha: true }, pool, () => {});
+  const T = "b".repeat(32);
+  ledger.ingest("box-2", {
+    device: "box-2", jira: { siteKey: "acme.atlassian.net" },
+    usage: { totals: bucket(200, 20, 0, 0), days: { "2026-09-11": bucket(200, 20) } },
+    repoUsage: [],
+  });
+  await new Promise((r) => ledger.flush(r));
+  const dayHosts = () => new Set([...pool.tables.get("usage_day").values()].map((row) => row.host));
+  // Postgres refuses writes through the first attempt AND the debounce flush that
+  // follows it — the debounce draining the key must not read as the write landing.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  pool.fail = true;
+  assert.equal(ledger.rekeyHost("box-2", `box-2@${T}`), true);
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+  t.mock.timers.tick(10 * 1000); // past the store's debounce
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(dayHosts().has("box-2"), "the old host's rows survive a failed write of the new key");
+  assert.ok(!dayHosts().has(`box-2@${T}`));
+  assert.equal(await Promise.race([ledger.rekeysSettled(0), Promise.resolve(1)]) >= 1, true,
+    "the migration sees the re-key unsettled");
+  // Postgres comes back; the next retry writes the new key, THEN drops the old one.
+  pool.fail = false;
+  t.mock.timers.tick(30 * 1000);
+  for (let i = 0; i < 40; i++) await new Promise((r) => setImmediate(r));
+  t.mock.timers.reset();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(dayHosts().has(`box-2@${T}`), "the retry lands the tenant key");
+  assert.ok(!dayHosts().has("box-2"), "and only then deletes the old host's rows");
+  assert.equal(await ledger.rekeysSettled(), 0);
+  ledger._internals.reset();
+});
+
 test("XERK-2554: rekeyHost writes the tenant key to Postgres and deletes the old host's rows", async () => {
   ledger._internals.reset();
   const pool = new FakePgPool();
