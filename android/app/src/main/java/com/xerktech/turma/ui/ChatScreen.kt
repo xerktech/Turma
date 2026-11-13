@@ -97,6 +97,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.bareKey
 import com.xerktech.turma.core.AttachStatus
 import com.xerktech.turma.core.Attachment
 import com.xerktech.turma.core.ChatItem
@@ -291,7 +292,7 @@ fun ChatScreen(
                             // worse than a truncated branch name. When one line
                             // can't hold the whole marker beside a readable meta
                             // ([chatMetaOneLine]), the marker takes its own line.
-                            val hostLabel = state.hostLabel.ifBlank { host }
+                            val hostLabel = state.hostLabel.ifBlank { bareKey(host) }
                             val mark = liveMarker(state.tunnelOnline, state.connected)
                             val markColor = if (state.tunnelOnline) Color.Unspecified else MaterialTheme.colorScheme.error
                             val meta = sessionHeaderMeta(hostLabel, it)

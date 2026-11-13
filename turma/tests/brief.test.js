@@ -17,6 +17,9 @@ const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
 // nav.test.js); these tests drive the stream beside an in-flight fetch, so the
 // harness opens it at load as the page did before.
 const script = blocks[blocks.length - 1][1].replace("\nrefresh().finally(connectSSE);\n", "\nrefresh();\nconnectSSE();\n");
+// The page paints through the real triage module (XERK-2857), loaded first in
+// the same sandbox; a spy records what the page hands it.
+const meetingsScript = fs.readFileSync(path.join(__dirname, "..", "public", "meetings.js"), "utf8");
 
 function makeEl() {
   const el = {
@@ -95,16 +98,23 @@ function loadPage(reply = null, agents = null, hash = "") {
     TurmaOrg: { getKeys: () => [], update: noop, subscribe: noop, sse: noop },
     TurmaBoard: { bareKey: require("../public/board.js").bareKey, orgName: (k, o) => o || k, mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
-    TurmaMeetings: { mount: (el) => { meetings.mounted = el; }, update: (d) => meetings.updates.push(d),
-      pendingCount: () => meetings.pending },
+    localStorage: { getItem: () => null, setItem: noop },
   };
+  const mkeys = Object.keys(stubs);
+  new Function(...mkeys, meetingsScript)(...mkeys.map((k) => stubs[k]));
+  const real = stubs.window.TurmaMeetings;
+  stubs.TurmaMeetings = { ...real,
+    mount: (el, h) => { meetings.mounted = el; real.mount(el, h); },
+    update: (d, f) => { meetings.updates.push(d); real.update(d, f); } };
   const keys = Object.keys(stubs);
-  const body = `${script}\n;return { pane: () => pane, render, renderBriefs, briefOrgHtml, briefText, runNow, saveSchedule,
-    editField, drafts, nextFor, schedOpen, runRefusal, setCache: (c) => { cache = c; }, getCache: () => cache };`;
+  const body = `${script}\n;return { render, renderBriefs, briefHtml, scheduleHtml, briefText, runNow, saveSchedule,
+    editField, drafts, nextFor, runRefusal, setCache: (c) => { cache = c; }, getCache: () => cache };`;
   const api = new Function(...keys, body)(...keys.map((k) => stubs[k]));
+  Object.assign(api, { openDrawer: real.openDrawer, setFilter: real.setFilter, select: real.select,
+    entryKey: real.entryKey, mstate: real.state });
   const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
   const runTimers = () => { for (const t of timers.splice(0)) t(); };
-  const list = els.briefList;
+  const list = els.meetingList;
   // What a test puts "inside" the list: the focused element counts as inside.
   list.contains = (el) => !!el && el.inside === true;
   return Object.assign(api, { meetings, els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document, window: stubs.window,
@@ -127,7 +137,10 @@ test("XERK-2396: the latest brief renders as its three read-aloud sections with 
   const P = loadPage();
   P.renderBriefs(data(), NOW);
   const h = P.list();
-  assert.match(h, /<h2 class="brief-name">Acme<\/h2>/);
+  // The org's daily meeting is a rail entry under the org; selected, it heads the main pane.
+  assert.match(h, /<span class="nm">Acme<\/span>/);
+  assert.match(h, /class="tri-entry sel" data-entry="acme\.atlassian\.net\/d%3A\d+"[^>]*><span class="t">Daily meeting</);
+  assert.match(h, /<h2 class="tri-title">Daily meeting<\/h2><span class="tri-sub">Acme · /);
   assert.match(h, /Since yesterday · still open<\/h3><p>PROJ-1 merged\. PROJ-2 is still open\.<\/p>/);
   assert.match(h, /This week<\/h3><p>Five tickets closed\.<\/p>/);
   assert.match(h, /Up next<\/h3><p>PROJ-3 is next\.<\/p>/);
@@ -160,8 +173,13 @@ test("XERK-2396: a failed newest run shows the hub's reason; earlier briefs list
   P.renderBriefs(data({ dailyBriefs: { [SITE]: [failed, okBrief({ runId: "e5" }), older] } }), NOW);
   const h = P.list();
   assert.match(h, /class="brief-status failed">The .+ brief failed — no online host of this org can write the brief/);
-  assert.match(h, /Earlier briefs<span class="sum">2<\/span>/);
-  assert.match(h, /Yesterday&#39;s first sentence\./);
+  // An earlier day's brief is its own daily entry, listed under All.
+  assert.doesNotMatch(h, /Yesterday&#39;s/);
+  P.setFilter("all");
+  assert.equal((P.list().match(/data-entry=/g) || []).length, 2);
+  P.select(P.entryKey(SITE, `d:${NOW - 86400e3}`));
+  assert.match(P.list(), /<p>Yesterday&#39;s first sentence\.<\/p>/);
+  assert.doesNotMatch(P.list(), /data-run=/, "Run now lives on the current entry only");
 });
 
 test("XERK-2396: model-written text, host, model and org name are escaped", () => {
@@ -209,9 +227,9 @@ test("XERK-2396: the schedule editor defaults to the viewer's zone and weekdays,
   const d = data();
   P.setCache(d);
   P.renderBriefs(d, NOW);
-  assert.match(P.list(), /data-sched-toggle="acme\.atlassian\.net" aria-expanded="false"/);
-  assert.doesNotMatch(P.list(), /data-sched=/, "the schedule hides behind its gear");
-  P.schedOpen.add(SITE);
+  assert.match(P.list(), /data-org-settings="acme\.atlassian\.net" aria-expanded="false"/);
+  assert.doesNotMatch(P.list(), /data-sched=/, "the schedule hides behind the org's gear");
+  P.openDrawer(SITE);
   P.renderBriefs(d, NOW);
   assert.match(P.list(), /aria-expanded="true"/);
   const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -233,7 +251,7 @@ test("XERK-2396: the schedule editor defaults to the viewer's zone and weekdays,
   const put = P.fetches.find((f) => f.method === "PUT");
   assert.equal(put.url, `/api/orgs/${encodeURIComponent(SITE)}/daily-brief/schedule`);
   assert.deepEqual(put.body, { enabled: true, time: "10:00", timeZone: "America/New_York", weekdays: [1, 3],
-    leadMinutes: 7, model: "sonnet" });
+    leadMinutes: 7, model: "sonnet", meetingTitle: "" });
   assert.equal(P.drafts.has(SITE), false, "a saved draft is cleared");
   const h = P.list();
   assert.match(h, /Mon, Wed at 10:00 America\/New_York/);
@@ -247,7 +265,7 @@ test("XERK-2396: a refused save keeps the draft and shows the hub's words", asyn
     : { ok: true, schedule: null, next: null }));
   const d = data();
   P.setCache(d);
-  P.schedOpen.add(SITE);
+  P.openDrawer(SITE);
   P.renderBriefs(d, NOW);
   const form = { dataset: { sched: SITE } };
   for (const i of ["1", "2", "3", "4", "5"]) P.editField(SITE, { dataset: { f: "weekdays" }, value: i, checked: false, closest: () => form });
@@ -263,7 +281,7 @@ test("XERK-2396: the next run comes from the hub's schedule route and is refetch
   const schedule = { enabled: true, time: "09:30", timeZone: "UTC", weekdays: [1], leadMinutes: 5, model: "auto", updatedAt: 1 };
   const d = data({ dailyBriefSchedules: { [SITE]: schedule } });
   P.setCache(d);
-  P.schedOpen.add(SITE);
+  P.openDrawer(SITE);
   P.renderBriefs(d, NOW);
   await P.settle();
   const gets = () => P.fetches.filter((f) => f.method === "GET" && f.url.endsWith("/daily-brief/schedule")).length;
@@ -315,7 +333,7 @@ test("XERK-2396: a background repaint waits while a schedule field has focus; th
   const P = loadPage();
   const d = data();
   P.setCache(d);
-  P.schedOpen.add(SITE);
+  P.openDrawer(SITE);
   P.renderBriefs(d, NOW);
   const before = P.list();
   P.document.activeElement = { tagName: "SELECT", inside: true, dataset: { f: "model" }, closest: () => ({ dataset: { sched: SITE } }) };
@@ -331,7 +349,7 @@ test("XERK-2396: a repaint waits out a pointer press in the list, then paints af
   const d = data();
   P.setCache(d);
   P.renderBriefs(d, NOW);
-  for (const fn of P.els.briefList.listeners.pointerdown) fn({});
+  for (const fn of P.els.meetingList.listeners.pointerdown) fn({});
   d.dailyBriefs = { [SITE]: [okBrief({ day: "Landed mid-press." })] };
   P.renderBriefs(d, NOW);
   assert.doesNotMatch(P.list(), /Landed mid-press/, "no swap between mousedown and mouseup");
@@ -349,7 +367,7 @@ test("XERK-2396: a repaint keeps keyboard focus on the button it was on", () => 
   P.renderBriefs(d, NOW);
   let focused = 0;
   const fresh = { dataset: { run: SITE }, focus: () => { focused++; } };
-  P.els.briefList.querySelectorAll = (sel) => (sel === "button" ? [{ dataset: { copy: SITE } }, fresh] : []);
+  P.els.meetingList.querySelectorAll = (sel) => (sel === "button" ? [{ dataset: { copy: SITE } }, fresh] : []);
   P.document.activeElement = { tagName: "BUTTON", inside: true, dataset: { run: SITE } };
   d.dailyBriefs = { [SITE]: [okBrief({ day: "Changed." })] };
   P.renderBriefs(d, NOW);
@@ -426,7 +444,7 @@ test("XERK-2396: Run now for an org named __proto__ adds an own key, not a proto
   assert.deepEqual(Object.keys(P.getCache().dailyBriefs), ["__proto__"]);
   assert.equal(Object.getPrototypeOf(P.getCache().dailyBriefs), Object.prototype);
   assert.match(P.list(), /Writing a brief on h/);
-  assert.match(P.list(), /<h2 class="brief-name">__proto__<\/h2>/);
+  assert.match(P.list(), /<span class="nm">__proto__<\/span>/);
 });
 
 const fieldIn = (f, value, site = SITE) => ({ tagName: "INPUT", inside: true, dataset: { f }, value,
@@ -447,10 +465,10 @@ test("XERK-2396: Save's busy state and error reach the controls while a field ho
   const P = loadPage((url, init) => (init.method === "PUT" ? new Promise((r) => { releases.push(r); }) : { ok: true, next: null }));
   const d = data();
   P.setCache(d);
-  P.schedOpen.add(SITE);
+  P.openDrawer(SITE);
   P.renderBriefs(d, NOW);
   const form = fakeForm(SITE);
-  P.els.briefList.querySelectorAll = (sel) => (sel === "[data-sched]" ? [form] : []);
+  P.els.meetingList.querySelectorAll = (sel) => (sel === "[data-sched]" ? [form] : []);
   P.document.createElement = () => ({ className: "", textContent: "" });
   // An unsaved draft, so a success's repaint (draft dropped) would differ.
   P.drafts.set(SITE, { enabled: true, time: "09:00", timeZone: "UTC", weekdays: [1], leadMinutes: "7", model: "auto" });
@@ -476,10 +494,10 @@ test("XERK-2396: a refused Save shows its error on the form at once, focus in a 
   const P = loadPage((url, init) => (init.method === "PUT" ? { status: 400, body: { error: "leadMinutes must be a whole number from 1 to 30" } } : { ok: true, next: null }));
   const d = data();
   P.setCache(d);
-  P.schedOpen.add(SITE);
+  P.openDrawer(SITE);
   P.renderBriefs(d, NOW);
   const form = fakeForm(SITE);
-  P.els.briefList.querySelectorAll = (sel) => (sel === "[data-sched]" ? [form] : []);
+  P.els.meetingList.querySelectorAll = (sel) => (sel === "[data-sched]" ? [form] : []);
   P.document.createElement = () => ({ className: "", textContent: "" });
   P.document.activeElement = fieldIn("leadMinutes", "99");
   await P.saveSchedule(SITE);
@@ -497,7 +515,7 @@ test("XERK-2396: Run now's button is disabled in flight and released after, what
   P.setCache(d);
   P.renderBriefs(d, NOW);
   const btn = { dataset: { run: SITE }, aria: "false", setAttribute(k, v) { if (k === "aria-disabled") this.aria = v; } };
-  P.els.briefList.querySelectorAll = (sel) => (sel === "[data-run]" ? [btn] : []);
+  P.els.meetingList.querySelectorAll = (sel) => (sel === "[data-run]" ? [btn] : []);
   const run = P.runNow(SITE);
   assert.equal(btn.aria, "true");
   P.document.activeElement = fieldIn("time", "09:00");
@@ -512,14 +530,14 @@ test("XERK-2396: the gear and Discard paint at once even with a field focused", 
   Q.setCache(d);
   Q.renderBriefs(d, NOW);
   Q.document.activeElement = fieldIn("time", "09:00");
-  const gear = { dataset: { schedToggle: SITE } };
-  for (const fn of Q.els.briefList.listeners.click) fn({ target: { closest: () => gear } });
+  const gear = { dataset: { orgSettings: SITE } };
+  for (const fn of Q.els.meetingList.listeners.click) fn({ target: { closest: () => gear } });
   assert.match(Q.list(), /aria-expanded="true"/);
   Q.drafts.set(SITE, { enabled: true, time: "11:11", timeZone: "UTC", weekdays: [1], leadMinutes: 5, model: "auto" });
   Q.renderBriefs(d, NOW, true);
   assert.match(Q.list(), /value="11:11"/);
   const discard = { dataset: { schedReset: SITE } };
-  for (const fn of Q.els.briefList.listeners.click) fn({ target: { closest: () => discard } });
+  for (const fn of Q.els.meetingList.listeners.click) fn({ target: { closest: () => discard } });
   assert.doesNotMatch(Q.list(), /value="11:11"/);
 });
 
@@ -527,11 +545,11 @@ test("XERK-2396: a repaint gives focus back to the same weekday box", () => {
   const P = loadPage();
   const d = data();
   P.setCache(d);
-  P.schedOpen.add(SITE);
+  P.openDrawer(SITE);
   P.renderBriefs(d, NOW);
   const hits = [];
   const box = (v) => ({ dataset: { f: "weekdays" }, value: v, closest: () => ({ dataset: { sched: SITE } }), focus: () => hits.push(v) });
-  P.els.briefList.querySelectorAll = (sel) => (sel === "[data-f]" ? ["1", "2", "3"].map(box) : []);
+  P.els.meetingList.querySelectorAll = (sel) => (sel === "[data-f]" ? ["1", "2", "3"].map(box) : []);
   P.document.activeElement = fieldIn("weekdays", "3");
   d.dailyBriefs = { [SITE]: [okBrief({ day: "Changed." })] };
   P.renderBriefs(d, NOW, true);
@@ -544,10 +562,10 @@ test("XERK-2396: a successful Save takes a shown error off the form at once", as
     ? (fail ? { status: 400, body: { error: "bad" } } : { ok: true, schedule: null, next: null }) : { ok: true, next: null }));
   const d = data();
   P.setCache(d);
-  P.schedOpen.add(SITE);
+  P.openDrawer(SITE);
   P.renderBriefs(d, NOW);
   const form = fakeForm(SITE);
-  P.els.briefList.querySelectorAll = (sel) => (sel === "[data-sched]" ? [form] : []);
+  P.els.meetingList.querySelectorAll = (sel) => (sel === "[data-sched]" ? [form] : []);
   P.document.createElement = () => ({ className: "", textContent: "" });
   P.document.activeElement = fieldIn("leadMinutes", "9");
   await P.saveSchedule(SITE);
@@ -566,7 +584,7 @@ test("XERK-2396: Run now's answer keeps the button off while the org's run is ru
   P.renderBriefs(d, NOW);
   const before = P.list();
   const btn = { dataset: { run: SITE }, aria: "false", setAttribute(k, v) { if (k === "aria-disabled") this.aria = v; } };
-  P.els.briefList.querySelectorAll = (sel) => (sel === "[data-run]" ? [btn] : []);
+  P.els.meetingList.querySelectorAll = (sel) => (sel === "[data-run]" ? [btn] : []);
   P.document.activeElement = fieldIn("time", "09:00");
   await P.runNow(SITE);
   assert.equal(btn.aria, "true", "the run it started is running");
@@ -578,7 +596,7 @@ test("XERK-2396: a press is released by the window losing focus, never by a fiel
   const d = data();
   P.setCache(d);
   P.renderBriefs(d, NOW);
-  for (const fn of P.els.briefList.listeners.pointerdown) fn({});
+  for (const fn of P.els.meetingList.listeners.pointerdown) fn({});
   d.dailyBriefs = { [SITE]: [okBrief({ day: "Held." })] };
   P.renderBriefs(d, NOW);
   // The press blurred the focused field: still pressed.
@@ -596,7 +614,7 @@ test("XERK-2396: the window losing focus mid-press releases it", () => {
   const d = data();
   P.setCache(d);
   P.renderBriefs(d, NOW);
-  for (const fn of P.els.briefList.listeners.pointerdown) fn({});
+  for (const fn of P.els.meetingList.listeners.pointerdown) fn({});
   d.dailyBriefs = { [SITE]: [okBrief({ day: "Held." })] };
   P.renderBriefs(d, NOW);
   for (const fn of P.winListeners.blur) fn({ target: P.window });
@@ -608,10 +626,10 @@ test("XERK-2396: a repaint keeps keyboard focus on Save", () => {
   const P = loadPage();
   const d = data();
   P.setCache(d);
-  P.schedOpen.add(SITE);
+  P.openDrawer(SITE);
   P.renderBriefs(d, NOW);
   let focused = 0;
-  P.els.briefList.querySelectorAll = (sel) => (sel === "button" ? [{ dataset: { schedSave: SITE }, focus: () => { focused++; } }] : []);
+  P.els.meetingList.querySelectorAll = (sel) => (sel === "button" ? [{ dataset: { schedSave: SITE }, focus: () => { focused++; } }] : []);
   P.document.activeElement = { tagName: "BUTTON", inside: true, dataset: { schedSave: SITE } };
   d.dailyBriefs = { [SITE]: [okBrief({ day: "Changed." })] };
   P.renderBriefs(d, NOW);
@@ -624,7 +642,7 @@ test("XERK-2396: Save and Run now render aria-disabled, never disabled, and thei
   const running = { runId: "r1", status: "running", trigger: "manual", meetingAt: NOW, startedAt: NOW, model: "haiku", host: "h" };
   const d = data();
   P.setCache(d);
-  P.schedOpen.add(SITE);
+  P.openDrawer(SITE);
   P.renderBriefs(d, NOW);
   P.saveSchedule(SITE);
   P.saveSchedule(SITE);
@@ -644,7 +662,7 @@ test("XERK-2396: a cancelled press (a drag the browser took) releases the hold",
   const d = data();
   P.setCache(d);
   P.renderBriefs(d, NOW);
-  for (const fn of P.els.briefList.listeners.pointerdown) fn({});
+  for (const fn of P.els.meetingList.listeners.pointerdown) fn({});
   d.dailyBriefs = { [SITE]: [okBrief({ day: "Held." })] };
   P.renderBriefs(d, NOW);
   for (const fn of P.winListeners.pointercancel) fn({});
@@ -652,20 +670,103 @@ test("XERK-2396: a cancelled press (a drag the browser took) releases the hold",
   assert.match(P.list(), /Held\./);
 });
 
-test("XERK-2623: the Meetings pane is mounted, fed every snapshot and frame, and #meetings opens it", async () => {
-  const P = loadPage(null, () => data({ meetingProposals: { [SITE]: [{ meetingId: "m1" }] } }));
-  assert.equal(P.pane(), "brief");
-  assert.equal(P.meetings.mounted, P.els.meetingList);
-  P.meetings.pending = 3;
+test("XERK-2857: the triage is mounted once on the page's list, fed every snapshot and frame, whatever the hash", async () => {
+  for (const hash of ["", "#brief", "#meetings"]) {
+    const P = loadPage(null, () => data({ meetingProposals: { [SITE]: [{ meetingId: "m1", status: "ok", title: "Sync", items: [] }] } }), hash);
+    assert.equal(P.meetings.mounted, P.els.meetingList);
+    await P.settle();
+    assert.equal(P.meetings.updates.length, 1, "the snapshot reaches the triage");
+    assert.match(P.list(), /Sync|Daily meeting/);
+    P.fire("meetingProposals", { [SITE]: [] });
+    assert.deepEqual(P.meetings.updates.at(-1).meetingProposals, { [SITE]: [] });
+  }
+});
+
+const DAY = 86400e3;
+const mtg = (over = {}) => ({ meetingId: "m1", status: "ok", title: "Standup", startedAt: NOW + 60e3, endedAt: NOW + 900e3,
+  items: [{ id: "p1", kind: "task", title: "Ship the <thing>", description: "" }], ...over });
+
+test("XERK-2857: a daily meeting pairs with its brief: one entry per meetingAt, brief on top, proposals below", () => {
+  const P = loadPage();
+  const yBrief = okBrief({ runId: "y1", meetingAt: NOW - DAY, startedAt: NOW - DAY - 300e3, day: "Yesterday's brief." });
+  const lone = okBrief({ runId: "l1", meetingAt: NOW - 2 * DAY, startedAt: NOW - 2 * DAY - 300e3, day: "A brief with no meeting." });
+  const d = data({
+    dailyBriefs: { [SITE]: [okBrief(), yBrief, lone] },
+    meetingProposals: { [SITE]: [
+      mtg({ daily: { meetingAt: NOW, briefRunId: "a1" } }),
+      // The 24h fallback: linked by runId though its brief named another instant.
+      mtg({ meetingId: "m2", title: "Late standup", startedAt: NOW - DAY + 7200e3, daily: { meetingAt: NOW - DAY + 7200e3, briefRunId: "y1" } }),
+      mtg({ meetingId: "m3", title: "Client <call>", startedAt: NOW - 3600e3 }),
+    ] },
+  });
+  P.setCache(d);
+  P.renderBriefs(d, NOW);
+  P.setFilter("all");
+  const h = P.list();
+  // Today's daily entry, yesterday's linked one, the lone brief, and the client call: four entries.
+  assert.equal((h.match(/data-entry=/g) || []).length, 4);
+  assert.equal((h.match(/<span class="t">Daily meeting</g) || []).length, 3, "no separate entry for a linked brief's own meetingAt");
+  assert.match(h, /<span class="t">Client &lt;call&gt;</);
+  P.select(P.entryKey(SITE, `d:${NOW}`));
+  const today = P.list();
+  assert.match(today, /PROJ-1 merged/);
+  assert.match(today, /<h3 class="tri-h">Proposals<\/h3>[\s\S]*Ship the &lt;thing&gt;/);
+  assert.ok(today.indexOf("PROJ-1 merged") < today.indexOf("Ship the &lt;thing&gt;"), "the brief sits above the proposals");
+  P.select(P.entryKey(SITE, `d:${NOW - DAY + 7200e3}`));
+  assert.match(P.list(), /Yesterday&#39;s brief\./);
+  assert.match(P.list(), /Late standup/);
+  P.select(P.entryKey(SITE, `d:${NOW - 2 * DAY}`));
+  assert.match(P.list(), /A brief with no meeting\./);
+  assert.match(P.list(), /No meeting was captured for this one\./);
+});
+
+test("XERK-2857: a hub without `daily` degrades to a meeting entry and a brief entry", () => {
+  const P = loadPage();
+  const d = data({ meetingProposals: { [SITE]: [mtg()] } });
+  P.setCache(d);
+  P.renderBriefs(d, NOW);
+  const h = P.list();
+  assert.match(h, /<span class="t">Daily meeting</);
+  assert.match(h, /<span class="t">Standup</);
+});
+
+test("XERK-2857: the upcoming daily meeting comes from the hub's next run and says when its brief is written", async () => {
+  const schedule = { enabled: true, time: "09:30", timeZone: "UTC", weekdays: [1, 2, 3, 4, 5], leadMinutes: 5, model: "auto", updatedAt: 1 };
+  const next = { runAt: NOW + DAY - 300e3, meetingAt: NOW + DAY };
+  const P = loadPage(() => ({ ok: true, schedule, next }));
+  const d = data({ dailyBriefs: {}, dailyBriefSchedules: { [SITE]: schedule } });
+  P.setCache(d);
+  P.renderBriefs(d, NOW);
   await P.settle();
-  assert.equal(P.meetings.updates.length, 1, "the snapshot reaches the pane");
-  assert.equal(P.els.meetingsCount.textContent, "3", "the tab counts what awaits review");
-  P.meetings.pending = 0;
-  P.fire("meetingProposals", { [SITE]: [] });
-  assert.deepEqual(P.meetings.updates.at(-1).meetingProposals, { [SITE]: [] });
-  assert.equal(P.els.meetingsCount.textContent, "");
-  assert.equal(loadPage(null, null, "#meetings").pane(), "meetings");
-  assert.equal(loadPage(null, null, "#nope").pane(), "brief");
+  P.renderBriefs(d, NOW); // the lookup's own repaint ran at the wall clock
+  const h = P.list();
+  assert.match(h, /<div class="tri-sec">Upcoming<\/div>/);
+  assert.match(h, /data-entry="acme\.atlassian\.net\/d%3A\d+"[^>]*>.*?brief /);
+  assert.match(h, /The brief is written /);
+  assert.match(h, /data-run="acme\.atlassian\.net"/, "Run now on the upcoming entry");
+  // A disabled schedule names no upcoming meeting.
+  d.dailyBriefSchedules = { [SITE]: { ...schedule, enabled: false } };
+  P.renderBriefs(d, NOW);
+  assert.doesNotMatch(P.list(), /The brief is written/);
+});
+
+test("XERK-2857: the drawer's daily meeting title is escaped, kept as a draft and saved with the schedule", async () => {
+  const stored = { enabled: true, time: "09:00", timeZone: "UTC", weekdays: [1], leadMinutes: 5, model: "auto",
+    meetingTitle: `"><img src=x onerror=alert(1)>` };
+  const P = loadPage((url, init) => (init.method === "PUT" ? { ok: true, schedule: { ...stored, meetingTitle: "standup" }, next: null }
+    : { ok: true, schedule: stored, next: null }));
+  const d = data({ dailyBriefSchedules: { [SITE]: stored } });
+  P.setCache(d);
+  P.openDrawer(SITE);
+  P.renderBriefs(d, NOW);
+  const h = P.list();
+  assert.match(h, /role="dialog" aria-label="Meeting settings for Acme"/);
+  assert.match(h, /data-f="meetingTitle"[^>]*value="&quot;&gt;&lt;img src=x onerror=alert\(1\)&gt;"/);
+  assert.doesNotMatch(h, /<img/);
+  const form = { dataset: { sched: SITE } };
+  P.editField(SITE, { dataset: { f: "meetingTitle" }, value: "  standup ", closest: () => form });
+  await P.saveSchedule(SITE);
+  assert.equal(P.fetches.find((f) => f.method === "PUT").body.meetingTitle, "standup");
 });
 
 test("XERK-2623: a snapshot that left before a meetingProposals frame keeps the frame's map", async () => {

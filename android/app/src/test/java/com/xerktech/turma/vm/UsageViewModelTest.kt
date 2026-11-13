@@ -88,6 +88,18 @@ class UsageViewModelTest {
         assertEquals(listOf("host::gone", "host::live"), ui.byHost.map { it.skey }.sorted())
     }
 
+    @Test fun `a tenant host is labelled by its name, never its tenant id`() {
+        // XERK-2633-class leak: a tenant host's key is `<device>@<32-hex>`, and the
+        // Hosts legend printed it raw. The label is the device (or the bare key);
+        // the toggle key keeps the raw key so two tenants never share a series.
+        val t = "0123456789abcdef0123456789abcdef"
+        val live = AgentInfo(key = "k8x-01@$t", device = "k8x-01", usage = usage(today = 1, week = 1, all = 5))
+        val gone = AgentInfo(key = "MaxAI@$t", retired = true, usage = usage(today = 0, week = 0, all = 7))
+        val ui = UsageViewModel.compute(FleetState(agents = listOf(live, gone)))
+        assertEquals(listOf("MaxAI (removed)", "k8x-01"), ui.byHost.map { it.label }.sorted())
+        assertEquals(listOf("host::MaxAI@$t", "host::k8x-01@$t"), ui.byHost.map { it.skey }.sorted())
+    }
+
     @Test fun `a repo with no remote falls back to its name as the key`() {
         val fleet = FleetState(agents = listOf(
             AgentInfo(key = "h1", repoUsage = listOf(
