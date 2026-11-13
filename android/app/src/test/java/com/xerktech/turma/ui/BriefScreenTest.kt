@@ -93,17 +93,20 @@ class BriefScreenTest {
                 "items": [ { "id": "p1", "kind": "task", "title": "Wire the export" } ] }""",
         )
         show()
-        open("Daily meeting · Team standup")
+        compose.onNodeWithText("All").performClick()
+        compose.onNodeWithText("Search meetings and proposals").performTextInput("Team standup")
+        open("Daily meeting")
+        compose.onNodeWithText("Team standup").assertExists()
         compose.onNodeWithText("Since yesterday").assertExists()
         compose.onNodeWithText("Two tickets shipped.").assertExists()
         compose.onNodeWithText("XERK-9 is next.").performScrollTo().assertExists()
         compose.onNodeWithText("Wire the export").performScrollTo().assertExists()
         // A past meeting's brief is history: Run now writes the NEXT one.
         compose.onNodeWithText("Run now").assertDoesNotExist()
-        // One entry, not a brief entry and a meeting entry.
+        // One entry, not a brief entry and a meeting entry: the search for the
+        // meeting's title lists the daily entry alone.
         compose.onNodeWithText("‹ Back").performClick()
-        compose.onNodeWithText("All").performClick()
-        compose.onAllNodesWithText("Team standup", substring = true).assertCountEquals(1)
+        compose.onAllNodesWithText("Daily meeting").assertCountEquals(1)
     }
 
     @Test fun `Run now is off while a brief is being written`() {

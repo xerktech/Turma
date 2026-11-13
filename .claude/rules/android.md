@@ -96,8 +96,11 @@ A pure-core/adapter-shell split:
   newer map (`meetingsClock`, the web's XERK-444 merge). Tests: `core/MeetingsTest`,
   `vm/MeetingsWiringTest`, `ui/MeetingsScreenTest`, `BottomNavTabTest`.
 - **The Brief tab is ONE triage list, the Daily brief folded into each org's daily-meeting entry**
-  (XERK-2858, web XERK-2857). The pairing is `core/MeetingsTriage.kt` `triageEntries`: one entry
-  per scheduled `meetingAt`, the hub's `daily.briefRunId` link before a `meetingAt` match.
+  (XERK-2858, web XERK-2857). `core/MeetingsTriage.kt` `triageEntries` ports the web's `entriesOf`:
+  ONE entry per scheduled `meetingAt` holding EVERY capture tagged `daily` for it and its briefs.
+  - The hub serves meetings newest first, so "first capture wins" pairs the rejoin, not the
+    standup (QA). Test fixtures must be in hub order (`MeetingsTriageTest`).
+  - Needs review always lists the org's `current` daily entry (today's or later, else the newest).
   - A meetings push (`deepLinkBrief`) opens Brief with its org unfolded (`TurmaApp.briefOpenSite`).
   - The open entry is looked up in the UNFILTERED entries: one reviewed to zero must not vanish
     from under the operator because Needs review no longer lists it.

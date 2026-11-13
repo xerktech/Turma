@@ -717,14 +717,15 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   orgs collapsible (remembered per phone), bucketed Upcoming / Today / Yesterday / This week /
   Earlier, Needs review / All / Archived chips and a search over meeting and proposal titles.
   - Each org's daily meeting is ONE entry per scheduled `meetingAt`: its brief read aloud on top
-    (Run now on the upcoming one), the captured meeting's proposals below (`core/MeetingsTriage.kt`).
+    (Run now on the upcoming one), every capture's proposals below (`core/MeetingsTriage.kt`).
   - An entry: pending proposals first, reviewed ones behind "Show reviewed (n)", Reopen on a
     rejected one, "x of n reviewed", Archive / Unarchive meeting, and Next once all are reviewed.
   - The org's ⚙ panel: New-tickets project, Whose work (one name per line), Tenir label, and the
     Daily brief schedule with "Daily meeting title contains". Unmapped Tenir labels: one banner.
 - Platform differences: a phone shows one pane at a time (list, entry or settings; Back returns),
   as the web does under 760px. No keyboard shortcuts (A/S/E/R/J/K). The project pick is kept per
-  phone. A failed create stays in the pending list with Approve to retry it.
+  phone. A failed create stays in the pending list with Approve to retry it. A long refusal
+  toast is cut at two lines (a platform limit on toasts).
 - `dailyBriefs`, `dailyBriefSchedules`, `meetingLabels`, `meetingLabelMisses` and `meetingFocus`
   decode per org (`LenientSiteMapSerializer`), so a malformed entry drops alone.
 

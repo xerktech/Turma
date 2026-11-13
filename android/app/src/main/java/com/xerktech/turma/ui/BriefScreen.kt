@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
@@ -278,7 +279,19 @@ private fun TriageList(
                     )
                 }
             }
-            for (site in orgs) {
+            // A search lists only the orgs it hits, as the web's rail does.
+            val searching = query.isNotBlank()
+            val bucketsOf = orgs.associateWith { triageBuckets(entries[it].orEmpty(), filter, query, now, zone) }
+            val shownOrgs = if (searching) orgs.filter { bucketsOf[it].orEmpty().isNotEmpty() } else orgs
+            if (searching && shownOrgs.isEmpty() && orgs.isNotEmpty()) {
+                item(key = "nomatch") {
+                    Text(
+                        "Nothing matches “${query.trim()}”.",
+                        Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            for (site in shownOrgs) {
                 val list = entries[site].orEmpty()
                 val folded = site in collapsed
                 val pending = list.filter { !it.archived }.sumOf { it.pending }
@@ -286,12 +299,11 @@ private fun TriageList(
                     OrgGroupHead(orgName(site, names[site].orEmpty()), pending, folded, { onToggle(site) }, { onSettings(site) })
                 }
                 if (folded) continue
-                val buckets = triageBuckets(list, filter, query, now, zone)
+                val buckets = bucketsOf[site].orEmpty()
                 if (buckets.isEmpty()) {
                     item(key = "none:$site") {
                         Text(
                             when {
-                                query.isNotBlank() -> "Nothing matches."
                                 filter == TriageFilter.REVIEW -> "Nothing needs review."
                                 filter == TriageFilter.ARCHIVED -> "No archived meetings."
                                 else -> "No meetings yet — when Tenir sends one, its proposed work items show up here."
@@ -380,13 +392,15 @@ internal fun entrySubline(e: TriageEntry, now: Long, zone: ZoneId, locale: Local
     val bits = mutableListOf<String>()
     if (e.at > 0) bits += briefWhenLabel(e.at, now, zone, locale)
     triageBriefStatus(e)?.let { bits += it }
-    val m = e.meeting
+    val ok = e.meetings.filter { it.status == "ok" }
+    val items = ok.sumOf { it.items.size }
     when {
-        m == null -> if (e.daily && !e.upcoming) bits += "Not captured"
-        m.status == "queued" || m.status == "running" -> bits += "Reading the captions…"
-        m.status == "failed" -> bits += "Could not propose work items"
-        else -> bits += meetingProgress(m) ?: "Nothing to propose"
+        e.meetings.isEmpty() -> if (e.daily && !e.upcoming && e.at < now) bits += "Not captured"
+        items > 0 -> bits += "${items - e.pending} of $items reviewed"
+        ok.isNotEmpty() -> bits += "Nothing to propose"
+        e.meetings.any { it.status == "failed" } && !e.inflight -> bits += "Could not propose work items"
     }
+    if (e.inflight) bits += "Reading the captions…"
     if (e.archived) bits += "Archived"
     return bits.joinToString(" · ")
 }
@@ -421,7 +435,9 @@ private fun EntryDetail(
     Column(modifier.fillMaxSize()) {
         BackRow(org, onBack)
         Column(
-            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 4.dp),
+            // imePadding: the keyboard must not cover the field being typed into.
+            Modifier.fillMaxSize().imePadding().verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 4.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text(triageTitle(e), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge,
@@ -435,12 +451,17 @@ private fun EntryDetail(
                     onRunNow = { vm.runNow(site) },
                 )
             }
-            val m = e.meeting
-            if (m != null) {
-                if (e.daily) HorizontalDivider()
+            // A daily entry holds every capture of that meeting (a rejoin is a
+            // second one), each with its own proposals, as on the web.
+            for (m in e.meetings) {
+                if (e.daily) {
+                    HorizontalDivider()
+                    Text(m.title.ifBlank { "Untitled meeting" }, style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold)
+                }
                 MeetingPart(site, m, mvm)
             }
-            if (m == null || m.status == "ok" && e.pending == 0) {
+            if (e.pending == 0 && !e.inflight) {
                 if (next != null) {
                     PrimaryButton("Next: ${triageTitle(next)} ›", { onOpen(next) }, Modifier.fillMaxWidth())
                 }
@@ -626,7 +647,9 @@ private fun OrgSettings(
     Column(modifier.fillMaxSize()) {
         BackRow("$org · settings", onBack)
         Column(
-            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 4.dp),
+            // imePadding: the keyboard must not cover the field being typed into.
+            Modifier.fillMaxSize().imePadding().verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 4.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text("$org settings", Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge,
@@ -638,8 +661,8 @@ private fun OrgSettings(
             // Whose work (XERK-2514): one name per line, since a name may hold a comma.
             SectionLabel("Whose work")
             val focus = fleet.meetingFocus[site]
-            var names by rememberSaveable(site, focus) { mutableStateOf(focus?.names.orEmpty().joinToString("\n")) }
-            var role by rememberSaveable(site, focus) { mutableStateOf(focus?.role.orEmpty()) }
+            var names by rememberDraft(site, focus?.names.orEmpty().joinToString("\n"))
+            var role by rememberDraft(site, focus?.role.orEmpty())
             Text(
                 "Meetings propose only these people's work (a decision always stays). Empty = everyone's.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -657,7 +680,7 @@ private fun OrgSettings(
             // Tenir label (XERK-2638): blank goes back to the default slug.
             SectionLabel("Tenir label")
             val label = fleet.meetingLabels[site]
-            var own by rememberSaveable(site, label) { mutableStateOf(if (label?.custom == true) label.label else "") }
+            var own by rememberDraft(site, if (label?.custom == true) label.label else "")
             Text(
                 when {
                     label == null -> "Tenir names this org by a label; this hub has not said which yet."
@@ -701,12 +724,12 @@ private fun ScheduleSection(
     onSave: (kotlinx.serialization.json.JsonObject) -> Unit,
 ) {
     SectionLabel("Daily brief")
-    var enabled by rememberSaveable(site, s) { mutableStateOf(s?.enabled ?: false) }
-    var time by rememberSaveable(site, s) { mutableStateOf(s?.time?.ifEmpty { null } ?: "09:30") }
-    var zone by rememberSaveable(site, s) { mutableStateOf(s?.timeZone?.ifEmpty { null } ?: ZoneId.systemDefault().id) }
-    var days by rememberSaveable(site, s) { mutableStateOf(s?.weekdays ?: listOf(1, 2, 3, 4, 5)) }
-    var lead by rememberSaveable(site, s) { mutableStateOf((s?.leadMinutes ?: 5).toString()) }
-    var title by rememberSaveable(site, s) { mutableStateOf(s?.meetingTitle.orEmpty()) }
+    var enabled by rememberDraft(site, s?.enabled ?: false)
+    var time by rememberDraft(site, s?.time?.ifEmpty { null } ?: "09:30")
+    var zone by rememberDraft(site, s?.timeZone?.ifEmpty { null } ?: ZoneId.systemDefault().id)
+    var days by rememberDraft(site, s?.weekdays ?: listOf(1, 2, 3, 4, 5))
+    var lead by rememberDraft(site, (s?.leadMinutes ?: 5).toString())
+    var title by rememberDraft(site, s?.meetingTitle.orEmpty())
     Text(
         nextBriefMeeting(s, now)?.let { "Next meeting " + briefWhenLabel(it, now, ZoneId.systemDefault(), Locale.getDefault()) }
             ?: "No meeting scheduled",
@@ -717,9 +740,11 @@ private fun ScheduleSection(
         Switch(enabled, { enabled = it; onEdit() })
     }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        // A text keyboard: a number pad has no ":" (QA), and "0930" is still
+        // read as 09:30 on save.
         OutlinedTextField(time, { time = it.take(5); onEdit() }, Modifier.weight(1f),
             label = { Text("Meeting time (HH:MM)") }, singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii))
         OutlinedTextField(lead, { lead = it.filter(Char::isDigit).take(3); onEdit() }, Modifier.weight(1f),
             label = { Text("Brief, minutes before") }, singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
@@ -751,11 +776,34 @@ private fun ScheduleSection(
         // whole (a 400 in its words), so nothing is checked twice here.
         onSave(buildJsonObject {
             put("enabled", enabled)
-            put("time", time.trim())
+            put("time", scheduleTime(time))
             put("timeZone", zone.trim())
             putJsonArray("weekdays") { days.forEach { add(JsonPrimitive(it)) } }
             lead.toIntOrNull()?.let { put("leadMinutes", it) }
             put("meetingTitle", title.trim())
         })
     }
+}
+
+/** "0930" / "930" / "9:30" as the hub's "HH:MM"; anything else is sent as typed for the hub to refuse. */
+internal fun scheduleTime(text: String): String {
+    val t = text.trim()
+    val m = Regex("^(\\d{1,2}):?(\\d{2})$").matchEntire(t) ?: return t
+    return m.groupValues[1].padStart(2, '0') + ":" + m.groupValues[2]
+}
+
+/**
+ * A settings field's draft: it follows the hub's value until the operator
+ * edits it, then keeps the edit when the value changes elsewhere (the web keeps
+ * an open draft over SSE). Saved across rotation.
+ */
+@Composable
+private fun <T : Any> rememberDraft(site: String, remote: T): androidx.compose.runtime.MutableState<T> {
+    val draft = rememberSaveable(site) { mutableStateOf(remote) }
+    val base = rememberSaveable(site) { mutableStateOf(remote) }
+    LaunchedEffect(remote) {
+        if (draft.value == base.value) draft.value = remote
+        base.value = remote
+    }
+    return draft
 }

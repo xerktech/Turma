@@ -41,35 +41,42 @@ fun meetingItemsSplit(m: Meeting): Pair<List<MeetingItem>, List<MeetingItem>> =
 fun meetingArchivable(m: Meeting): Boolean = m.status == "ok" || m.status == "failed"
 
 /**
- * One row of the list. A plain meeting carries [meeting]; the org's daily
- * meeting ([daily]) carries the brief written for it and/or the captured
- * meeting, either possibly absent. [at] places it in time; [upcoming] is the
- * schedule's next meeting, not yet held.
+ * One row of the list. A plain meeting is one [meetings] entry; the org's
+ * daily meeting ([daily]) gathers every capture the hub tagged for that
+ * scheduled meeting (newest first) and the briefs written for it, either
+ * possibly empty — the web's `entriesOf`. [at] places it in time; [upcoming]
+ * is the schedule's next meeting; [current] a daily entry for today or later
+ * (or the org's newest one when none is), which Needs review always lists.
  */
 data class TriageEntry(
     val key: String,
     val siteKey: String,
     val at: Long,
-    val meeting: Meeting?,
-    val brief: DailyBrief? = null,
+    val meetings: List<Meeting> = emptyList(),
+    val briefs: List<DailyBrief> = emptyList(),
     val daily: Boolean = false,
     val upcoming: Boolean = false,
+    val current: Boolean = false,
 ) {
-    val pending: Int get() = meeting?.let(::meetingPendingCount) ?: 0
-    val archived: Boolean get() = (meeting?.archivedAt ?: 0L) > 0
+    val pending: Int get() = meetings.sumOf(::meetingPendingCount)
+    val archived: Boolean get() = meetings.isNotEmpty() && meetings.all { it.archivedAt > 0 }
+    val inflight: Boolean get() = meetings.any { it.status == "queued" || it.status == "running" }
+
+    /** The brief the entry reads aloud: the newest finished one, else the newest row. */
+    val brief: DailyBrief? get() = briefs.firstOrNull { it.status == "ok" } ?: briefs.firstOrNull()
 }
 
 private fun meetingAt(m: Meeting): Long = if (m.startedAt > 0) m.startedAt else m.receivedAt
 
-/** The newest finished brief of a group (newest first), else its newest row. */
-private fun pickBrief(rows: List<DailyBrief>): DailyBrief? = rows.firstOrNull { it.status == "ok" } ?: rows.firstOrNull()
+private fun startOfDay(t: Long, zone: ZoneId): Long =
+    Instant.ofEpochMilli(t).atZone(zone).toLocalDate().atStartOfDay(zone).toInstant().toEpochMilli()
 
 /**
- * Every entry of one org, newest first: one per captured meeting, except that
- * the daily meetings are ONE entry per scheduled `meetingAt`, pairing the
- * brief written for it with the meeting the hub tagged `daily` for it. A
- * brief whose meeting was never captured is still an entry, and the
- * schedule's next meeting is one ([upcoming]) before it is held.
+ * Every entry of one org, newest first (the web's `entriesOf`): one per plain
+ * meeting, and ONE per scheduled daily `meetingAt` holding every capture the
+ * hub tagged `daily` for it, the brief each capture links (`briefRunId`), and
+ * every other brief written for that meeting. A brief whose meeting was never
+ * captured is still an entry, and so is the schedule's next meeting.
  */
 fun triageEntries(
     siteKey: String,
@@ -77,52 +84,66 @@ fun triageEntries(
     briefs: List<DailyBrief>,
     schedule: DailyBriefSchedule?,
     now: Long,
+    zone: ZoneId = ZoneId.systemDefault(),
 ): List<TriageEntry> {
     val out = mutableListOf<TriageEntry>()
-    val dailyAt = LinkedHashMap<Long, TriageEntry>()
+    val dayMeetings = LinkedHashMap<Long, MutableList<Meeting>>()
+    val dayBriefs = LinkedHashMap<Long, MutableList<DailyBrief>>()
     val byRun = briefs.filter { it.runId.isNotEmpty() }.associateBy { it.runId }
-    val byAt = briefs.filter { it.meetingAt > 0 }.groupBy { it.meetingAt }
-    val usedBriefs = mutableSetOf<Long>()
+    val claimed = mutableSetOf<String>()
     for (m in meetings) {
         val d = m.daily
-        if (d == null || d.meetingAt <= 0 || d.meetingAt in dailyAt) {
-            // A second capture of the same daily meeting stays a plain entry.
-            out += TriageEntry("m:${m.meetingId}", siteKey, meetingAt(m), m)
-            continue
+        if (d != null && d.meetingAt > 0) {
+            dayMeetings.getOrPut(d.meetingAt) { mutableListOf() } += m
+            val b = byRun[d.briefRunId]
+            if (b != null && claimed.add(b.runId)) dayBriefs.getOrPut(d.meetingAt) { mutableListOf() } += b
+        } else {
+            out += TriageEntry("m:${m.meetingId}", siteKey, meetingAt(m), listOf(m))
         }
-        val brief = byRun[d.briefRunId] ?: pickBrief(byAt[d.meetingAt].orEmpty())
-        if (brief != null && brief.meetingAt > 0) usedBriefs += brief.meetingAt
-        usedBriefs += d.meetingAt
-        dailyAt[d.meetingAt] = TriageEntry("d:${d.meetingAt}", siteKey, d.meetingAt, m, brief, daily = true)
+    }
+    for (b in briefs) {
+        if (b.runId in claimed) continue
+        val at = if (b.meetingAt > 0) b.meetingAt else b.startedAt
+        if (at > 0) dayBriefs.getOrPut(at) { mutableListOf() } += b
     }
     val next = nextBriefMeeting(schedule, now)
-    for ((at, rows) in byAt) {
-        if (at in usedBriefs) continue
-        dailyAt[at] = TriageEntry("d:$at", siteKey, at, null, pickBrief(rows), daily = true, upcoming = at == next)
+    val days = (dayMeetings.keys + dayBriefs.keys + listOfNotNull(next)).distinct()
+    val today = startOfDay(now, zone)
+    val dailies = days.map { at ->
+        TriageEntry(
+            "d:$at", siteKey, at,
+            meetings = dayMeetings[at].orEmpty(),
+            // Served newest first; a linked brief joined out of order, so order again.
+            briefs = dayBriefs[at].orEmpty().sortedByDescending { it.startedAt },
+            daily = true, upcoming = at == next, current = at >= today,
+        )
+    }.toMutableList()
+    if (dailies.none { it.current } && dailies.isNotEmpty()) {
+        val i = dailies.indices.maxBy { dailies[it].at }
+        dailies[i] = dailies[i].copy(current = true)
     }
-    if (next != null && next !in dailyAt) {
-        dailyAt[next] = TriageEntry("d:$next", siteKey, next, null, null, daily = true, upcoming = true)
-    }
-    out += dailyAt.values.map { if (it.at == next && it.meeting == null) it.copy(upcoming = true) else it }
+    out += dailies
     return out.sortedByDescending { it.at }
 }
 
-/** Whether [e] shows under [filter] and matches [query] (meeting and proposal titles). */
+/**
+ * Whether [e] shows under [filter] and matches [query] (meeting and proposal
+ * titles). Needs review lists what waits on the operator, a meeting still
+ * being read, and the org's current daily entry (where Run now lives).
+ */
 fun triageShows(e: TriageEntry, filter: TriageFilter, query: String): Boolean {
     val inFilter = when (filter) {
         TriageFilter.ARCHIVED -> e.archived
         TriageFilter.ALL -> !e.archived
-        TriageFilter.REVIEW -> !e.archived && (
-            e.pending > 0 || e.upcoming ||
-                e.meeting?.status == "queued" || e.meeting?.status == "running")
+        TriageFilter.REVIEW -> !e.archived && (e.pending > 0 || e.inflight || e.current)
     }
     if (!inFilter) return false
     val q = query.trim()
     if (q.isEmpty()) return true
-    val m = e.meeting
     return (e.daily && "daily meeting".contains(q, ignoreCase = true)) ||
-        (m != null && (m.title.contains(q, ignoreCase = true) ||
-            m.items.any { it.title.contains(q, ignoreCase = true) }))
+        e.meetings.any { m ->
+            m.title.contains(q, ignoreCase = true) || m.items.any { it.title.contains(q, ignoreCase = true) }
+        }
 }
 
 /** The list's date buckets, in display order. */
@@ -168,17 +189,14 @@ fun triageNext(ordered: List<TriageEntry>, current: TriageEntry): TriageEntry? {
     return rest.firstOrNull { it.pending > 0 && !it.archived }
 }
 
-/** A daily entry's title: "Daily meeting" plus, once captured, the meeting's own title. */
-fun triageTitle(e: TriageEntry): String = when {
-    e.daily && e.meeting != null && e.meeting.title.isNotBlank() -> "Daily meeting · ${e.meeting.title}"
-    e.daily -> "Daily meeting"
-    else -> e.meeting?.title?.ifBlank { "Untitled meeting" } ?: "Untitled meeting"
-}
+/** An entry's title: "Daily meeting" (the web's `entryTitle`), else the meeting's own. */
+fun triageTitle(e: TriageEntry): String =
+    if (e.daily) "Daily meeting" else e.meetings.firstOrNull()?.title?.ifBlank { null } ?: "Untitled meeting"
 
 /** A daily entry's brief status line, the rail's "brief ready / being written / none". */
 fun triageBriefStatus(e: TriageEntry): String? {
     if (!e.daily) return null
-    val b = e.brief ?: return if (e.upcoming) "No brief yet" else null
+    val b = e.brief ?: return if (e.upcoming || e.current) "No brief yet" else null
     return when (b.status) {
         "running" -> "Brief being written…"
         "failed" -> "Brief not written"

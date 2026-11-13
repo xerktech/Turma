@@ -219,4 +219,36 @@ class MeetingsScreenTest {
             "Tenir sent meetings for \"acme\", \"beta\", which no org answers to. " +
                 "Give an org that label in its settings and they arrive.").assertExists()
     }
+
+    @Test fun `an entry reviewed to zero stays open with Next`() {
+        // XERK-2858 QA: looking the open entry up in the FILTERED list would
+        // drop it from under the operator the moment its last proposal is answered.
+        seed()
+        val reviewed = """{ "ok": true, "meeting": { "meetingId": "m2", "status": "ok", "title": "Sprint sync",
+            "startedAt": $t0, "items": [
+              { "id": "p1", "kind": "bug", "title": "Fix the login 500", "review": { "state": "rejected", "at": 9 } },
+              { "id": "p3", "kind": "decision", "title": "Ship on Friday", "review": { "state": "logged", "at": 9 } } ] } }"""
+        hub.json("/api/orgs/$site/meetings/m2/items/", reviewed)
+        val vm = main.track(MeetingsViewModel(hub.app))
+        show(vm)
+        open("Sprint sync")
+        compose.onAllNodesWithText("Reject")[0].performScrollTo().performClick()
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText("✓ Every proposal is reviewed.").fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("Sprint sync").assertExists()
+        compose.onNodeWithText("2 of 2 reviewed").assertExists()
+    }
+
+    @Test fun `a search lists only the orgs it hits`() {
+        hub.seedFleet("""{ "now": 1, "agents": [ $host, { "key": "h2", "device": "h2", "online": true, "lastSeen": 1,
+            "jira": { "available": true, "siteKey": "b.atlassian.net", "site": "b.atlassian.net", "tickets": [] } } ],
+            "meetingProposals": { "$site": [ { "meetingId": "m1", "status": "ok", "title": "Sprint sync", "startedAt": $t0,
+              "items": [ { "id": "p1", "kind": "task", "title": "Wire it" } ] } ] } }""")
+        show(main.track(MeetingsViewModel(hub.app)))
+        compose.onNodeWithContentDescription("b settings").assertExists()
+        compose.onNodeWithText("Search meetings and proposals").performTextInput("sprint")
+        compose.onNodeWithContentDescription("b settings").assertDoesNotExist()
+        compose.onNodeWithText("Sprint sync").assertExists()
+    }
 }

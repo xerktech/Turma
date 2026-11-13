@@ -9,6 +9,7 @@ import com.xerktech.turma.model.MeetingItem
 import com.xerktech.turma.model.MeetingLabelMiss
 import com.xerktech.turma.model.MeetingReview
 import com.xerktech.turma.model.TurmaJson
+import com.xerktech.turma.ui.scheduleTime
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -17,7 +18,11 @@ import org.junit.Test
 import java.time.ZoneId
 import java.time.ZonedDateTime
 
-/** The Brief screen's triage list (XERK-2858): entries, the daily pairing, filters, buckets. */
+/**
+ * The Brief screen's triage list (XERK-2858), ported from the web's
+ * `entriesOf`/`inFilter`/`bucketOf` (XERK-2857). Fixtures are in HUB order —
+ * newest first — since that order is what the pairing must survive.
+ */
 class MeetingsTriageTest {
     private val utc = ZoneId.of("UTC")
     private fun at(d: Int, h: Int, m: Int = 0) =
@@ -28,6 +33,10 @@ class MeetingsTriageTest {
 
     private fun item(id: String, state: String? = null) =
         MeetingItem(id = id, kind = "task", title = "Item $id", review = state?.let { MeetingReview(state = it) })
+
+    private fun entry(key: String, m: Meeting?, at: Long = now, daily: Boolean = false,
+                      upcoming: Boolean = false, current: Boolean = false, site: String = "s") =
+        TriageEntry(key, site, at, listOfNotNull(m), daily = daily, upcoming = upcoming, current = current)
 
     @Test fun `a proposal is pending until reviewed, a failed create stays pending`() {
         assertTrue(meetingItemPending(item("a")))
@@ -52,45 +61,72 @@ class MeetingsTriageTest {
         assertTrue(meetingArchivable(m.copy(status = "failed")))
     }
 
-    @Test fun `the daily meeting is one entry pairing its brief and its captured meeting`() {
+    @Test fun `the daily meeting is one entry holding every capture and its briefs`() {
         val yday = at(11, 9, 30)
         val briefs = listOf(
-            DailyBrief(runId = "b2", status = "ok", meetingAt = yday, day = "newer"),
-            DailyBrief(runId = "b1", status = "ok", meetingAt = yday, day = "linked"),
+            DailyBrief(runId = "b2", status = "ok", meetingAt = yday, startedAt = yday - 60_000, day = "rerun"),
+            DailyBrief(runId = "b1", status = "ok", meetingAt = yday, startedAt = yday - 300_000, day = "linked"),
             DailyBrief(runId = "b0", status = "ok", meetingAt = at(10, 9, 30), day = "not captured"),
         )
         val meetings = listOf(
+            Meeting(meetingId = "x", status = "ok", title = "Sync", startedAt = at(12, 7)),
+            // The rejoin comes FIRST: the hub serves newest first (XERK-2858 QA).
+            Meeting(meetingId = "d2", status = "ok", title = "Standup (rejoin)", startedAt = yday + 1_200_000,
+                daily = MeetingDaily(yday)),
             Meeting(meetingId = "d", status = "ok", title = "Standup", startedAt = yday + 60_000,
                 daily = MeetingDaily(yday, "b1"), items = listOf(item("1"))),
-            // A second capture of the same daily meeting stays its own entry.
-            Meeting(meetingId = "d2", status = "ok", title = "Standup (2)", startedAt = yday + 120_000,
-                daily = MeetingDaily(yday)),
-            Meeting(meetingId = "x", status = "ok", title = "Sync", startedAt = at(12, 7)),
         )
-        val e = triageEntries("s", meetings, briefs, daily, now)
+        val e = triageEntries("s", meetings, briefs, daily, now, utc)
         val byKey = e.associateBy { it.key }
         val d = byKey.getValue("d:$yday")
-        assertEquals("b1", d.brief?.runId) // the hub's link wins over the newer brief
-        assertEquals("d", d.meeting?.meetingId)
-        assertTrue(d.daily)
-        assertFalse(d.upcoming)
+        assertEquals(listOf("d2", "d"), d.meetings.map { it.meetingId }) // both captures, one entry
+        assertEquals(listOf("b2", "b1"), d.briefs.map { it.runId })
         assertEquals(1, d.pending)
-        assertTrue("m:d2" in byKey)
+        assertFalse("m:d2" in byKey || "m:d" in byKey)
         // A brief whose meeting was never captured is still an entry.
         assertEquals("b0", byKey.getValue("d:${at(10, 9, 30)}").brief?.runId)
-        // Today's 09:30 is ahead: the upcoming entry, with no brief yet.
+        // Today's 09:30 is ahead: the upcoming entry, current, with no brief yet.
         val up = byKey.getValue("d:${at(12, 9, 30)}")
-        assertTrue(up.upcoming)
+        assertTrue(up.upcoming && up.current)
         assertNull(up.brief)
-        assertNull(up.meeting)
-        // Newest first.
+        assertFalse(d.current)
         assertEquals(e.sortedByDescending { it.at }, e)
+    }
+
+    @Test fun `a brief linked to another meetingAt hides only itself`() {
+        // QA: claiming the linked brief's meetingAt hid every other brief written for it.
+        val m9 = at(11, 9, 30)
+        val m10 = at(11, 10, 0)
+        val e = triageEntries("s",
+            listOf(Meeting(meetingId = "d", status = "ok", daily = MeetingDaily(m10, "r1"))),
+            listOf(DailyBrief(runId = "r2", status = "ok", meetingAt = m9), DailyBrief(runId = "r1", status = "ok", meetingAt = m9)),
+            null, now, utc)
+        assertEquals(listOf("r1"), e.single { it.key == "d:$m10" }.briefs.map { it.runId })
+        assertEquals(listOf("r2"), e.single { it.key == "d:$m9" }.briefs.map { it.runId })
+    }
+
+    @Test fun `the upcoming entry stays upcoming once its meeting is captured early`() {
+        // QA: Run now vanished when the standup was captured before its scheduled time.
+        val next = at(12, 9, 30)
+        val e = triageEntries("s",
+            listOf(Meeting(meetingId = "d", status = "running", startedAt = next - 300_000, daily = MeetingDaily(next))),
+            emptyList(), daily, now, utc)
+        val up = e.single { it.daily }
+        assertTrue(up.upcoming)
+        assertEquals(1, up.meetings.size)
+    }
+
+    @Test fun `with no daily entry today the newest is current`() {
+        val e = triageEntries("s", emptyList(),
+            listOf(DailyBrief(runId = "a", status = "ok", meetingAt = at(9, 9, 30)),
+                DailyBrief(runId = "b", status = "ok", meetingAt = at(10, 9, 30))), null, now, utc)
+        assertEquals(listOf(true, false), e.map { it.current })
     }
 
     @Test fun `a brief written for the upcoming meeting is the upcoming entry`() {
         val next = at(12, 9, 30)
         val e = triageEntries("s", emptyList(),
-            listOf(DailyBrief(runId = "b", status = "running", meetingAt = next)), daily, now)
+            listOf(DailyBrief(runId = "b", status = "running", meetingAt = next)), daily, now, utc)
         val up = e.single { it.upcoming }
         assertEquals("b", up.brief?.runId)
         assertEquals("Brief being written…", triageBriefStatus(up))
@@ -98,23 +134,21 @@ class MeetingsTriageTest {
     }
 
     @Test fun `filters and search`() {
-        val pending = TriageEntry("m:a", "s", now, Meeting(meetingId = "a", status = "ok", title = "Sprint",
+        val pending = entry("m:a", Meeting(meetingId = "a", status = "ok", title = "Sprint",
             items = listOf(MeetingItem(id = "1", title = "Fix login"))))
-        val done = TriageEntry("m:b", "s", now, Meeting(meetingId = "b", status = "ok", items = listOf(item("1", "created"))))
-        val archived = TriageEntry("m:c", "s", now, Meeting(meetingId = "c", status = "ok", archivedAt = 5,
-            items = listOf(item("1"))))
-        val running = TriageEntry("m:d", "s", now, Meeting(meetingId = "d", status = "running"))
-        val upcoming = TriageEntry("d:1", "s", now, null, daily = true, upcoming = true)
+        val done = entry("m:b", Meeting(meetingId = "b", status = "ok", items = listOf(item("1", "created"))))
+        val archived = entry("m:c", Meeting(meetingId = "c", status = "ok", archivedAt = 5, items = listOf(item("1"))))
+        val running = entry("m:d", Meeting(meetingId = "d", status = "running"))
+        val current = entry("d:1", null, daily = true, current = true)
+        val past = entry("d:0", null, daily = true)
         fun shown(f: TriageFilter, q: String = "") =
-            listOf(pending, done, archived, running, upcoming).filter { triageShows(it, f, q) }.map { it.key }
+            listOf(pending, done, archived, running, current, past).filter { triageShows(it, f, q) }.map { it.key }
         assertEquals(listOf("m:a", "m:d", "d:1"), shown(TriageFilter.REVIEW))
-        assertEquals(listOf("m:a", "m:b", "m:d", "d:1"), shown(TriageFilter.ALL))
+        assertEquals(listOf("m:a", "m:b", "m:d", "d:1", "d:0"), shown(TriageFilter.ALL))
         assertEquals(listOf("m:c"), shown(TriageFilter.ARCHIVED))
         assertEquals(listOf("m:a"), shown(TriageFilter.ALL, "LOGIN"))
         assertEquals(listOf("m:a"), shown(TriageFilter.ALL, "sprint"))
-        assertEquals(listOf("d:1"), shown(TriageFilter.ALL, "daily"))
-        // An archived meeting's pending work does not count in Needs review.
-        assertEquals(0, listOf(archived).filter { triageShows(it, TriageFilter.REVIEW, "") }.size)
+        assertEquals(listOf("d:1", "d:0"), shown(TriageFilter.ALL, "daily"))
     }
 
     @Test fun `buckets read Upcoming, Today, Yesterday, This week, Earlier`() {
@@ -125,9 +159,9 @@ class MeetingsTriageTest {
         assertEquals(TriageBucket.WEEK, triageBucket(at(6, 9), now, utc))
         assertEquals(TriageBucket.EARLIER, triageBucket(at(5, 9), now, utc))
         val rows = listOf(
-            TriageEntry("a", "s", at(14, 9), null, daily = true, upcoming = true),
-            TriageEntry("b", "s", at(13, 9), null, daily = true, upcoming = true),
-            TriageEntry("c", "s", at(12, 7), Meeting(status = "running")),
+            entry("a", null, at(14, 9), daily = true, upcoming = true),
+            entry("b", null, at(13, 9), daily = true, upcoming = true),
+            entry("c", Meeting(status = "running"), at(12, 7)),
         )
         val b = triageBuckets(rows, TriageFilter.ALL, "", now, utc)
         assertEquals(listOf(TriageBucket.UPCOMING, TriageBucket.TODAY), b.map { it.first })
@@ -135,22 +169,26 @@ class MeetingsTriageTest {
     }
 
     @Test fun `Next moves to the following entry that still needs review, wrapping`() {
-        fun e(k: String, pending: Boolean, site: String = "s") = TriageEntry(k, site, 0,
-            Meeting(meetingId = k, status = "ok", items = listOf(item("1", if (pending) null else "created"))))
+        fun e(k: String, pending: Boolean, site: String = "s") = entry(k,
+            Meeting(meetingId = k, status = "ok", items = listOf(item("1", if (pending) null else "created"))), site = site)
         val list = listOf(e("a", true), e("b", false), e("c", true, "t"))
         assertEquals("c", triageNext(list, list[0])?.key)
         assertEquals("a", triageNext(list, list[2])?.key)
         assertNull(triageNext(listOf(list[0]), list[0]))
     }
 
-    @Test fun `titles, label misses and focus names`() {
-        assertEquals("Daily meeting", triageTitle(TriageEntry("d", "s", 0, null, daily = true)))
-        assertEquals("Daily meeting · Standup",
-            triageTitle(TriageEntry("d", "s", 0, Meeting(title = "Standup"), daily = true)))
-        assertEquals("Untitled meeting", triageTitle(TriageEntry("m", "s", 0, Meeting())))
+    @Test fun `titles, label misses, focus names and the schedule time`() {
+        assertEquals("Daily meeting", triageTitle(entry("d", Meeting(title = "Standup"), daily = true)))
+        assertEquals("Standup", triageTitle(entry("m", Meeting(title = "Standup"))))
+        assertEquals("Untitled meeting", triageTitle(entry("m", Meeting())))
         assertEquals(listOf("b", "a"), meetingLabelMissLabels(mapOf(
             "a@0011" to MeetingLabelMiss(at = 1), "b" to MeetingLabelMiss(at = 2), "a" to MeetingLabelMiss(at = 0))))
         assertEquals(listOf("Lee, Ann", "bo"), focusNames(" Lee, Ann \n\nbo\nBo\n")) // the first spelling stays
+        assertEquals("09:30", scheduleTime("0930"))
+        assertEquals("09:30", scheduleTime("930"))
+        assertEquals("09:30", scheduleTime(" 9:30 "))
+        assertEquals("17:05", scheduleTime("17:05"))
+        assertEquals("9.30", scheduleTime("9.30")) // left for the hub to refuse in its words
     }
 
     @Test fun `the new wire fields decode, and a bad entry drops alone`() {
