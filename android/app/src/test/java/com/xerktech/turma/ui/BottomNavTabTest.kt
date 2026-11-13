@@ -54,14 +54,15 @@ class BottomNavTabTest {
         )
     }
 
-    @Test fun `a meetings push opens Brief on its Meetings pane, nothing else does`() {
-        // XERK-2623: the hub's click path, and an older hub's /meetings one.
-        assertEquals(BriefPane.MEETINGS, deepLinkBriefPane("/brief?site=o.atlassian.net#meetings"))
-        assertEquals(BriefPane.MEETINGS, deepLinkBriefPane("/meetings?site=o.atlassian.net"))
-        assertEquals(BriefPane.MEETINGS, deepLinkBriefPane("/meetings"))
-        assertEquals(BriefPane.BRIEF, deepLinkBriefPane("/brief"))
-        assertEquals(null, deepLinkBriefPane("/board?ticket=X-1#meetings"))
-        assertEquals(null, deepLinkBriefPane("/meetingsx"))
-        assertEquals(null, deepLinkBriefPane(null))
+    @Test fun `a meetings push opens Brief on its org, nothing else does`() {
+        // XERK-2858: #brief, #meetings and /meetings all land on the one triage list.
+        assertEquals("o.atlassian.net", deepLinkBrief("/brief?site=o.atlassian.net#meetings"))
+        assertEquals("o.atlassian.net", deepLinkBrief("/meetings?site=o.atlassian.net"))
+        assertEquals("o/acme", deepLinkBrief("/brief?x=1&site=o%2Facme"))
+        assertEquals("", deepLinkBrief("/meetings"))
+        assertEquals("", deepLinkBrief("/brief#brief"))
+        assertEquals(null, deepLinkBrief("/board?ticket=X-1#meetings"))
+        assertEquals(null, deepLinkBrief("/meetingsx"))
+        assertEquals(null, deepLinkBrief(null))
     }
 }

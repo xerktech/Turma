@@ -1,22 +1,26 @@
 package com.xerktech.turma.ui
 
 import androidx.activity.ComponentActivity
-import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.hasScrollAction
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
-import com.xerktech.turma.core.briefPage
-import com.xerktech.turma.core.usClock
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.test.performTextClearance
+import androidx.compose.ui.test.performTextInput
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
-import com.xerktech.turma.model.DailyBrief
+import com.xerktech.turma.model.TurmaJson
 import com.xerktech.turma.vm.BriefViewModel
 import com.xerktech.turma.vm.MeetingsViewModel
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -24,11 +28,12 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
-import java.time.ZoneId
-import java.time.ZonedDateTime
-import java.util.Locale
 
-/** The Brief screen (XERK-2397): what it reads aloud, and Run now's two outcomes. */
+/**
+ * The Brief tab's Daily brief, folded into each org's daily-meeting entry
+ * (XERK-2858), and the per-org settings panel. Times are relative to the
+ * real clock: the screen reads it, as the phone does.
+ */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class BriefScreenTest {
@@ -42,56 +47,68 @@ class BriefScreenTest {
     @get:Rule(order = 2)
     val compose = createAndroidComposeRule<ComponentActivity>()
 
-    private val ny = ZoneId.of("America/New_York")
-    private fun at(d: Int, h: Int, m: Int) = ZonedDateTime.of(2026, 10, d, h, m, 0, 0, ny).toInstant().toEpochMilli()
-    private val now = at(29, 8, 0)
+    private val site = "o.atlassian.net"
+    private val host = """{ "key": "h1", "device": "h1", "online": true, "lastSeen": 1,
+        "jira": { "available": true, "siteKey": "$site", "site": "$site", "tickets": [] } }"""
+    private val now = System.currentTimeMillis()
+    private val yday = now - 86_400_000L
 
-    private val briefs = listOf(
-        DailyBrief(runId = "b2", status = "ok", meetingAt = at(29, 9, 30), day = "Two tickets shipped.",
-            week = "Five this week.", next = "XERK-9 is next."),
-        // A Run now: labelled with when it ran, not the meeting it preceded.
-        DailyBrief(runId = "b1", status = "ok", trigger = "manual", meetingAt = at(29, 9, 30),
-            startedAt = at(28, 14, 5), headline = "One ticket shipped."),
-    )
+    // Every day at 23:59 UTC, so the next meeting is always still ahead today or tomorrow.
+    private val schedule = """{ "enabled": true, "time": "23:59", "timeZone": "UTC",
+        "weekdays": [0,1,2,3,4,5,6], "leadMinutes": 5, "meetingTitle": "standup" }"""
 
-    private fun body(list: List<DailyBrief>, onRunNow: () -> Unit = {}) = compose.setContent {
-        BriefBody(
-            page = briefPage(list), nextMeeting = at(30, 9, 30), now = now,
-            running = briefPage(list).running != null, asking = false, onRunNow = onRunNow,
-            zone = ny, locale = Locale.US,
-        )
+    private fun seed(briefs: String = "", meetings: String = "") = hub.seedFleet("""
+        { "now": 1, "agents": [ $host ],
+          "dailyBriefSchedules": { "$site": $schedule },
+          "dailyBriefs": { "$site": [ $briefs ] },
+          "meetingProposals": { "$site": [ $meetings ] } }
+    """.trimIndent())
+
+    private fun show(vm: BriefViewModel = main.track(BriefViewModel(hub.app)),
+                     mvm: MeetingsViewModel = main.track(MeetingsViewModel(hub.app))) =
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm) }
+
+    private fun open(text: String) {
+        compose.onNode(hasScrollAction()).performScrollToNode(hasText(text, substring = true))
+        compose.onAllNodesWithText(text, substring = true)[0].performClick()
     }
 
-    @Test fun `the latest brief reads aloud with the next meeting and earlier headlines`() {
-        var ran = 0
-        body(briefs) { ran++ }
-        compose.onNodeWithText(usClock("Next meeting Tomorrow 9:30 AM")).assertExists()
-        compose.onNodeWithText(usClock("For Today 9:30 AM")).assertExists()
+    @Test fun `the upcoming daily meeting is an entry with its brief and Run now`() {
+        seed()
+        show()
+        compose.onNodeWithText("Daily meeting").assertExists()
+        open("Daily meeting")
+        compose.onNodeWithText("Run now").assertExists()
+        compose.onNodeWithText("No brief yet. It is written before the meeting, or Run now writes one.").assertExists()
+    }
+
+    @Test fun `a past daily meeting pairs its brief with the captured meeting's proposals`() {
+        seed(
+            briefs = """{ "runId": "b1", "status": "ok", "meetingAt": $yday, "day": "Two tickets shipped.",
+                "week": "Five this week.", "next": "XERK-9 is next." }""",
+            meetings = """{ "meetingId": "m1", "status": "ok", "title": "Team standup", "startedAt": ${yday + 60_000},
+                "daily": { "meetingAt": $yday, "briefRunId": "b1" },
+                "items": [ { "id": "p1", "kind": "task", "title": "Wire the export" } ] }""",
+        )
+        show()
+        open("Daily meeting · Team standup")
         compose.onNodeWithText("Since yesterday").assertExists()
         compose.onNodeWithText("Two tickets shipped.").assertExists()
-        compose.onNodeWithText("Five this week.").assertExists()
-        compose.onNodeWithText("XERK-9 is next.").assertExists()
-        compose.onNodeWithText(usClock("Yesterday 2:05 PM · Run now")).assertExists()
-        compose.onNodeWithText("One ticket shipped.").assertExists()
-        compose.onNodeWithText("Run now").assertIsEnabled().performClick()
-        assertEquals(1, ran)
+        compose.onNodeWithText("XERK-9 is next.").performScrollTo().assertExists()
+        compose.onNodeWithText("Wire the export").performScrollTo().assertExists()
+        // A past meeting's brief is history: Run now writes the NEXT one.
+        compose.onNodeWithText("Run now").assertDoesNotExist()
+        // One entry, not a brief entry and a meeting entry.
+        compose.onNodeWithText("‹ Back").performClick()
+        compose.onNodeWithText("All").performClick()
+        compose.onAllNodesWithText("Team standup", substring = true).assertCountEquals(1)
     }
 
     @Test fun `Run now is off while a brief is being written`() {
-        body(listOf(DailyBrief(runId = "r", status = "running")) + briefs)
+        seed(briefs = """{ "runId": "r", "status": "running", "meetingAt": ${now + 3_600_000} }""")
+        show()
+        open("Daily meeting")
         compose.onNodeWithText("Writing…").assertIsNotEnabled()
-        compose.onNodeWithText("Two tickets shipped.").assertExists()
-    }
-
-    @Test fun `a Run now brief is headed with when it ran`() {
-        body(listOf(DailyBrief(runId = "m", status = "ok", trigger = "manual", meetingAt = at(30, 9, 30),
-            startedAt = at(29, 7, 15), day = "Ran early.")))
-        compose.onNodeWithText(usClock("Run now · Today 7:15 AM")).assertExists()
-    }
-
-    @Test fun `an org with no brief says so`() {
-        body(emptyList())
-        compose.onNodeWithText("No brief yet. Run now writes one.").assertExists()
     }
 
     @Test fun `a refused Run now reports the hub's own words`() {
@@ -107,25 +124,55 @@ class BriefScreenTest {
         assertEquals("/api/orgs/o%2Facme/daily-brief/run", req.path)
     }
 
-    @Test fun `the Brief tab switches to the Meetings pane, which counts what awaits review`() {
-        // XERK-2623: Meetings is a pane of Brief, as /brief#meetings on the web.
-        val site = "o.atlassian.net"
+    private fun bodyOf(path: String): JsonObject =
+        TurmaJson.parseToJsonElement(hub.findRequest(path).body.readUtf8()).jsonObject
+
+    @Test fun `the settings panel saves whose work, the Tenir label and the schedule`() {
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [ { "key": "ENG", "name": "Engineering" } ] }""")
+        hub.json("/api/orgs/$site/meeting-focus", """{ "ok": true }""")
+        hub.json("/api/orgs/$site/meeting-label", """{ "ok": true }""")
+        hub.json("/api/orgs/$site/daily-brief/schedule", """{ "ok": true }""")
         hub.seedFleet("""
-            { "now": 1, "agents": [ { "key": "h1", "device": "h1", "online": true, "lastSeen": 1,
-                "jira": { "available": true, "siteKey": "$site", "site": "$site", "tickets": [] } } ],
-              "meetingProposals": { "$site": [ { "meetingId": "m1", "status": "ok", "title": "Sprint sync",
-                "items": [ { "id": "p1", "kind": "decision", "title": "Ship on Friday" } ] } ] } }
+            { "now": 1, "agents": [ $host ], "dailyBriefSchedules": { "$site": $schedule },
+              "meetingLabels": { "$site": { "label": "acme", "custom": true } },
+              "meetingFocus": { "$site": { "names": ["Lee, Ann"], "role": "backend" } } }
         """.trimIndent())
-        val vm = main.track(BriefViewModel(hub.app))
         val mvm = main.track(MeetingsViewModel(hub.app))
-        compose.setContent {
-            var pane by remember { mutableStateOf(BriefPane.BRIEF) }
-            BriefScreen(pane = pane, onPane = { pane = it }, vm = vm, meetingsVm = mvm)
-        }
-        compose.onNodeWithText("Daily brief").assertExists()
-        compose.onNodeWithText("Sprint sync").assertDoesNotExist()
-        compose.onNodeWithText("Meetings (1)").performClick()
-        compose.onNodeWithText("Sprint sync").assertExists()
-        compose.onNodeWithText("Ship on Friday").assertExists()
+        show(mvm = mvm)
+        compose.onNodeWithContentDescription("o settings").performClick()
+        compose.onNodeWithText("Tenir sends this org's meetings as \"acme\".").performScrollTo().assertExists()
+
+        // A name with a comma survives: one name per line.
+        compose.onNodeWithText("Lee, Ann").performTextInput("\nMalcolm H.")
+        compose.onAllNodesWithText("Save")[0].performScrollTo().performClick()
+        val f = bodyOf("/meeting-focus")
+        assertEquals("""["Lee, Ann","Malcolm H."]""", f["names"].toString())
+        assertEquals("\"backend\"", f["role"].toString())
+        compose.waitUntil(5_000) { compose.onAllNodesWithText("Saved").fetchSemanticsNodes().isNotEmpty() }
+
+        // A blank label goes back to the default: an explicit null on the wire.
+        compose.onNodeWithText("acme").performScrollTo().performTextClearance()
+        compose.onAllNodesWithText("Save")[1].performScrollTo().performClick()
+        assertEquals("""{"label":null}""", hub.findRequest("/meeting-label").body.readUtf8())
+
+        compose.onNodeWithText("standup").performScrollTo().performTextClearance()
+        compose.onNodeWithText("standup").assertDoesNotExist()
+        compose.onAllNodesWithText("Daily meeting title contains")[0].performTextInput("Daily sync")
+        compose.onAllNodesWithText("Save")[2].performScrollTo().performClick()
+        val s = bodyOf("/daily-brief/schedule")
+        assertEquals("\"Daily sync\"", s["meetingTitle"].toString())
+        assertEquals("\"23:59\"", s["time"].toString())
+        assertEquals("[0,1,2,3,4,5,6]", s["weekdays"].toString())
+        assertEquals("PUT", hub.findRequest("/daily-brief/schedule").method)
+    }
+
+    @Test fun `a refused save reports the hub's words`() {
+        hub.route("/api/orgs/$site/meeting-label") { HubHarness.refusal("the org acme already has the meeting label \"x\"") }
+        hub.seedFleet("""{ "now": 1, "agents": [ $host ] }""")
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        val message = hub.expectMessage(mvm.messages)
+        mvm.saveLabel(site, "x")
+        assertEquals("✗ Saving the Tenir label failed — the org acme already has the meeting label \"x\"", message())
+        assertTrue(mvm.saved.value.isEmpty())
     }
 }

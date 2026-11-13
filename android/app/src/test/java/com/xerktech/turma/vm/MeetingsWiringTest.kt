@@ -205,4 +205,31 @@ class MeetingsWiringTest {
         vm.setProject(site, "B")
         assertEquals("B", vm.projectOf(site))
     }
+
+    @Test fun `the settings maps ride the poll and their own SSE frames`() {
+        hub.seedFleet("""{ "now": 1, "agents": [ $host ],
+            "meetingLabels": { "$site": { "label": "acme" } }, "meetingFocus": { "$site": { "names": ["Ann"] } } }""")
+        val fleet = hub.container.fleet
+        assertEquals("acme", fleet.state.value.meetingLabels.getValue(site).label)
+        assertEquals(listOf("Ann"), fleet.state.value.meetingFocus.getValue(site).names)
+        fleet.onSseEvent("meetingLabels", """{ "$site": { "label": "beta", "custom": true } }""")
+        fleet.onSseEvent("meetingFocus", """{ "$site": { "names": [], "role": "dev" } }""")
+        fleet.onSseEvent("meetingLabelMisses", """{ "zed": { "at": 4 } }""")
+        assertEquals("beta", fleet.state.value.meetingLabels.getValue(site).label)
+        assertEquals("dev", fleet.state.value.meetingFocus.getValue(site).role)
+        assertEquals(setOf("zed"), fleet.state.value.meetingLabelMisses.keys)
+        fleet.onSseEvent("meetingLabels", "not json")
+        assertEquals("beta", fleet.state.value.meetingLabels.getValue(site).label)
+    }
+
+    @Test fun `an archive answer is patched in at once`() {
+        seed()
+        hub.json("/api/orgs/$site/meetings/m1/archive",
+            """{ "ok": true, "meeting": { "meetingId": "m1", "status": "ok", "title": "Sprint sync", "archivedAt": 42 } }""")
+        val vm = main.track(MeetingsViewModel(hub.app))
+        val m = hub.container.fleet.state.value.meetingProposals.getValue(site).single()
+        kotlinx.coroutines.runBlocking { vm.archive(site, m, true).join() }
+        assertEquals(42L, hub.container.fleet.state.value.meetingProposals.getValue(site).single().archivedAt)
+        assertEquals("""{"archived":true}""", hub.findRequest("/archive").body.readUtf8())
+    }
 }

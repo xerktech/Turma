@@ -60,9 +60,9 @@ class TurmaAppDeepLinkTest {
 
     /**
      * A "N proposals from <meeting>" push carries only a click path (rollup
-     * XERK-2602): tapping it must land on Brief's Meetings pane (XERK-2623).
-     * `deepLinkBriefPane` is pinned alone in `BottomNavTabTest`; this pins the
-     * effect that acts on it. It asserts the selected pane, not the pane's content:
+     * XERK-2602): tapping it must land on the Brief tab (XERK-2858).
+     * `deepLinkBrief` is pinned alone in `BottomNavTabTest`; this pins the
+     * effect that acts on it. It asserts the selected tab, not the screen's content:
      * the screen's default `viewModel()` can hold an earlier test's fleet.
      */
     @Test fun aMeetingsPushOpensTheMeetingsTab() {
@@ -78,7 +78,7 @@ class TurmaAppDeepLinkTest {
         }
         compose.waitForIdle()
         assertTrue("the meetings link must be consumed", consumed)
-        compose.onAllNodes(hasText("Meetings", substring = true) and isSelected()).assertCountEquals(1)
+        compose.onAllNodes(hasText("Brief") and isSelected()).assertCountEquals(1)
     }
 
     /** A click path naming no tab is consumed but moves nothing: the app stays on the Dashboard. */
@@ -95,6 +95,6 @@ class TurmaAppDeepLinkTest {
         }
         compose.waitForIdle()
         assertTrue("the link must be consumed", consumed)
-        compose.onAllNodes(hasText("Meetings", substring = true) and isSelected()).assertCountEquals(0)
+        compose.onAllNodes(hasText("Brief") and isSelected()).assertCountEquals(0)
     }
 }
