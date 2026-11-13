@@ -1878,7 +1878,7 @@ function syncLedgerAliases() {
   for (const [k, a] of Object.entries(agents)) {
     if (a && Array.isArray(a.formerNames)) for (const n of a.formerNames) pairs.push([n, k]);
   }
-  usageLedger.setHostAliases(pairs);
+  usageLedger.setHostAliases(pairs, [migratedTenant()]);
 }
 // Retire every other record bound to `uid` once its agent beat in as `newKey`
 // (XERK-2381): the renamed-from record, and any stale HA copy. The new record
@@ -8497,12 +8497,12 @@ registerTenantMigration({
 
 // Hosts renamed BEFORE agents had an identity (XERK-2381's static aliases: k8x ->
 // k8x-01, maxai -> maxai-win) are MERGED into the name they beat as now, so their
-// usage, permission prompts, outcomes and archived sessions all belong to the one
-// agent. The usage fold only joined them on the Usage page, and missed them once
+// permission prompts, outcomes, archived sessions and ticket pins belong to the
+// one agent, and their usage is SUMMED into its card. The usage fold only joined them on the Usage page, and missed them once
 // the pre-tenancy migration put the live name under `@<tenant>`: the old name
-// read as a separate removed host. Nothing is dropped — each ledger merges by its
-// own rule (usage high-water, permission progress, outcome newer), archive rows
-// change owner (files stay put). Idempotent: a pass that finds the old name gone
+// read as a separate removed host. Nothing is dropped — rows move by id
+// (permission progress, outcome newer), archive rows change owner (files stay
+// put), usage stays stored per install and is summed when served. Idempotent: a pass that finds the old name gone
 // moves nothing. An old name is left alone while anything still runs as it (a
 // live record, or an identity living there): that is a machine, not history.
 const HOST_MERGE_EVERY_MS = 10 * 60 * 1000;
@@ -8520,10 +8520,13 @@ function hostMergePlan() {
   const livesAt = (k) => isLive(k) ||
     Object.values(agentIdentities).some((e) => e && !e.revoked && !e.released && e.home === k);
   const plan = [];
+  let pending = 0;
   for (const [oldName, newName] of usageLedger.STATIC_HOST_ALIASES) {
     for (const from of named(oldName)) {
       if (livesAt(from)) continue;
       const tFrom = tenantOfKey(from);
+      // These are the operators' machines: their names in another tenant are not them.
+      if (tFrom && tFrom !== migratedTenant()) continue;
       // A target in the source's own world: its tenant, or — for an untenanted
       // (pre-tenancy) old name — the operators' or the tenant the pre-tenancy
       // migration moved this deployment into. Never another tenant's host that
@@ -8534,6 +8537,7 @@ function hostMergePlan() {
       const live = candidates.filter(isLive);
       const targets = live.length ? live : candidates;
       if (targets.length !== 1) {
+        pending++;
         if (targets.length > 1) {
           logQueueState(`host-merge:${from}`, `host merge: ${logName(from)} skipped — ` +
             `${targets.length} hosts answer to ${logName(newName)}`);
@@ -8545,14 +8549,19 @@ function hostMergePlan() {
       plan.push({ from, to, rescope: !tFrom && tTo ? tTo : "" });
     }
   }
-  return { plan, archiveOwners };
+  return { plan, pending, archiveOwners };
 }
 function runHostMerges() {
-  const { plan, archiveOwners } = hostMergePlan();
+  const { plan, pending, archiveOwners } = hostMergePlan();
   let pinsMoved = false;
+  let moved = 0;
   for (const { from, to, rescope } of plan) {
     const site = (s) => (rescope && plainKey(s) ? scopeSite(s, rescope) : s);
-    const usage = usageLedger.rekeyHost(from, to, { rename: true, siteKey: rescope ? site : undefined });
+    // Usage stays under each install's own key — the Usage page SUMS the static
+    // renames (usage-ledger `mergeEntries`), and a stored sum would double-count on
+    // any rerun (QA). Only a pre-tenancy row joins its own name's tenant key
+    // (the XERK-2554 re-key, high-water: the same install), so the fold can see it.
+    const usage = rescope ? usageLedger.rekeyHost(from, tenantHostKey(from, rescope), { siteKey: site }) : false;
     const perms = permissionLedger.rekeyHost(from, to, { rename: true });
     const outcomes = outcomeLedger.rekey((h) => (h === from ? to : null),
       (s, row) => (row.host === from && rescope && plainKey(s) ? scopeSite(s, rescope) : null));
@@ -8567,8 +8576,9 @@ function runHostMerges() {
       if (p && p.host === from) { p.host = to; pins++; }
     }
     if (pins) pinsMoved = true;
+    moved += (usage ? 1 : 0) + perms + outcomes + rows + pins;
     if (usage || perms || outcomes || rows || pins) {
-      console.log(`host merge: ${logName(from)} -> ${logName(to)}: usage ${usage ? "merged" : "none"}, ` +
+      console.log(`host merge: ${logName(from)} -> ${logName(to)}: usage ${usage ? "re-keyed into the tenant" : "kept (summed on display)"}, ` +
         `${perms} permission row(s), ${outcomes} outcome row(s), ${rows} archived session(s), ${pins} ticket pin(s)`);
       invalidateAgentsCache();
     }
@@ -8577,7 +8587,7 @@ function runHostMerges() {
     persistTicketAgents();
     sseBroadcast("ticketAgents", ticketAgents);
   }
-  return plan.length;
+  return { moved, pending };
 }
 function hostMergeTick(now = Date.now()) {
   if (hostMergesSettled || now - hostMergeAt < HOST_MERGE_EVERY_MS) return;
@@ -8585,7 +8595,12 @@ function hostMergeTick(now = Date.now()) {
   // would lose the rows its rescan then brings back under the old name.
   if (!outcomeLedger.isLoaded()) return;
   hostMergeAt = now;
-  try { if (runHostMerges() === 0) hostMergesSettled = true; } catch (e) { console.error(`host merge failed: ${e && e.message}`); }
+  // Settled once nothing moved and every old name found its host: a source still
+  // waiting for its target (not beaten yet, migration unfinished) keeps it going.
+  try {
+    const r = runHostMerges();
+    if (r.moved === 0 && r.pending === 0) hostMergesSettled = true;
+  } catch (e) { console.error(`host merge failed: ${e && e.message}`); }
 }
 
 // The untenanted host and org keys the deployment holds now — recorded on the

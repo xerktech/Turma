@@ -437,13 +437,15 @@ function mergeSeries(dst, src) {
   return dst;
 }
 
-// Merge two DIFFERENT installs' series by SUM (XERK-2868, a renamed host): the old
-// name and the new one counted different transcript stores (k8x's cluster-wide
-// agent vs k8x-01's node agent; maxai's WSL home vs maxai-win's Windows one), so
-// neither figure is inside the other and the high-water `mergeSeries` would
-// DROP one era — its `cutoff` rule deletes every day the other side folded into
-// `pre`. Every bucket adds; a day at or before the merged cutoff is FOLDED into
-// `pre` (added, never deleted), so `pre + sum(days)` is exactly both totals.
+// Combine two DIFFERENT installs' series by SUM, IN PLACE (XERK-2868): the static
+// renames (k8x's cluster-wide agent vs k8x-01's node agent; maxai's WSL home vs
+// maxai-win's Windows one) counted different transcript stores, so neither figure
+// is inside the other, and the high-water `mergeSeries` would hide one era — its
+// `cutoff` rule drops every day the other side folded into `pre`. Every bucket
+// adds; a day at or before the merged cutoff is FOLDED into `pre` (added, never
+// deleted), so `pre + sum(days)` is exactly both totals. A SERVE-time view only:
+// the stored entries stay apart, so the store's high-water ingest and Postgres's
+// GREATEST upsert never see a sum (a stored sum double-counted on a rerun, QA).
 function sumSeries(dst, src) {
   if (!src) return dst;
   addBucket(dst.pre, src.pre);
@@ -937,17 +939,16 @@ let backend = fileBackend;
 // by `entryOf`/`seriesOf`). Every figure is the per-key MAXIMUM ever seen, never a
 // SUM — the two are the SAME durable history reported by different replicas, so a
 // day both saw is `max`, and summing would double-count it.
-function mergeTwoEntries(dst, src, sum = false) {
+function mergeTwoEntries(dst, src) {
   if (!src) return dst;
-  const merge = sum ? sumSeries : mergeSeries;
   if (src.host) {
-    if (dst.host) merge(dst.host, src.host);
+    if (dst.host) mergeSeries(dst.host, src.host);
     else dst.host = cloneSeries(src.host);
   }
   for (const [rk, r] of Object.entries(src.repos || {})) {
     if (rk === "__proto__" || !r) continue;
     if (dst.repos[rk]) {
-      merge(dst.repos[rk].series, r.series);
+      mergeSeries(dst.repos[rk].series, r.series);
       if (r.repo && !dst.repos[rk].repo) dst.repos[rk].repo = r.repo;
       if (r.remote && !dst.repos[rk].remote) dst.repos[rk].remote = r.remote;
     } else {
@@ -1319,6 +1320,10 @@ const STATIC_HOST_ALIASES = [
 // folded name -> its group's canonical folded name (the smallest member, so the
 // answer never depends on rename order or a rename back to an old name).
 let hostAliasRoots = new Map();
+// Same, over the hub's identity renames ONLY (one install that changed its name,
+// same transcript store): the members of one INSTALL, merged by high-water. The
+// static renames join different installs, which `mergeEntries` sums.
+let installRoots = new Map();
 // The static renames by bare name, applied inside ANY tenant: those machines were
 // bound into a tenant by the pre-tenancy migration (XERK-2554), so their keys
 // carry `@<tenant>` and a plain-name lookup alone missed them.
@@ -1327,7 +1332,16 @@ for (const [a, b] of STATIC_HOST_ALIASES) {
   const [lo, hi] = [a.toLowerCase(), b.toLowerCase()].sort();
   staticAliasRoots.set(hi, lo);
 }
-function setHostAliases(pairs) {
+// The tenants the static renames apply in besides the untenanted world: the one
+// the pre-tenancy deployment migrated into (server.js `migratedTenant`). Another
+// tenant's hosts that merely share those names are not those machines.
+let staticAliasTenants = new Set();
+function setHostAliases(pairs, staticTenants = []) {
+  staticAliasTenants = new Set((Array.isArray(staticTenants) ? staticTenants : []).filter((t) => typeof t === "string" && t));
+  hostAliasRoots = aliasRoots([...STATIC_HOST_ALIASES, ...(Array.isArray(pairs) ? pairs : [])]);
+  installRoots = aliasRoots(Array.isArray(pairs) ? pairs : []);
+}
+function aliasRoots(pairs) {
   const parent = new Map();
   const find = (x) => {
     while (parent.has(x) && parent.get(x) !== x) x = parent.get(x);
@@ -1340,7 +1354,7 @@ function setHostAliases(pairs) {
     if (!parent.has(ra)) parent.set(ra, ra);
     if (!parent.has(rb)) parent.set(rb, rb);
   };
-  for (const pair of [...STATIC_HOST_ALIASES, ...(Array.isArray(pairs) ? pairs : [])]) {
+  for (const pair of pairs) {
     if (!Array.isArray(pair) || pair.length !== 2) continue;
     const [a, b] = pair;
     if (typeof a !== "string" || typeof b !== "string" || !a || !b) continue;
@@ -1355,7 +1369,7 @@ function setHostAliases(pairs) {
     const r = find(name);
     if (r !== name) roots.set(name, r);
   }
-  hostAliasRoots = roots;
+  return roots;
 }
 setHostAliases([]);
 
@@ -1364,7 +1378,7 @@ function foldKey(k) {
   const f = raw.toLowerCase();
   const t = tenantOfHostKey(raw);
   let root = hostAliasRoots.get(f);
-  if (!root && t) {
+  if (!root && t && staticAliasTenants.has(t)) {
     const base = f.slice(0, -33);
     root = staticAliasRoots.has(base) ? staticAliasRoots.get(base) + f.slice(-33) : f;
   }
@@ -1379,19 +1393,41 @@ function foldKey(k) {
 // merged view. `host`/`repos` are fresh, so `hosts` is never mutated; the canonical
 // key/device/siteKey/lastSeen come from the most-recently-seen member so the merged
 // row reads under the host's current casing.
+// Which install a ledger key belongs to: case twins and identity renames are one
+// install (one transcript store); the static renames are separate installs.
+function installOf(k) {
+  const f = String(k).toLowerCase();
+  return installRoots.get(f) || f;
+}
 function mergeEntries(keys) {
+  // High-water WITHIN an install (the same store reported twice), then SUM across
+  // installs (different stores, XERK-2868) — so no era of a static rename is lost.
+  const installs = new Map();
+  for (const k of keys) {
+    const e = hosts[k];
+    if (!e) continue;
+    let g = installs.get(installOf(k));
+    if (!g) installs.set(installOf(k), g = { host: null, repos: Object.create(null) });
+    if (e.host) { if (g.host) mergeSeries(g.host, e.host); else g.host = cloneSeries(e.host); }
+    for (const [rk, r] of Object.entries(e.repos)) {
+      if (rk === "__proto__") continue;
+      if (g.repos[rk]) { mergeSeries(g.repos[rk].series, r.series); if (r.repo && !g.repos[rk].repo) g.repos[rk].repo = r.repo; }
+      else g.repos[rk] = { repo: r.repo, remote: r.remote, series: cloneSeries(r.series) };
+    }
+  }
   let host = null;
   const repos = Object.create(null);
+  for (const g of installs.values()) {
+    if (g.host) { if (host) sumSeries(host, g.host); else host = g.host; }
+    for (const [rk, r] of Object.entries(g.repos)) {
+      if (repos[rk]) { sumSeries(repos[rk].series, r.series); if (r.repo && !repos[rk].repo) repos[rk].repo = r.repo; }
+      else repos[rk] = r;
+    }
+  }
   let device = "", siteKey = "", lastSeen = -1, canonKey = keys[0];
   for (const k of keys) {
     const e = hosts[k];
     if (!e) continue;
-    if (e.host) { if (host) mergeSeries(host, e.host); else host = cloneSeries(e.host); }
-    for (const [rk, r] of Object.entries(e.repos)) {
-      if (rk === "__proto__") continue;
-      if (repos[rk]) { mergeSeries(repos[rk].series, r.series); if (r.repo && !repos[rk].repo) repos[rk].repo = r.repo; }
-      else repos[rk] = { repo: r.repo, remote: r.remote, series: cloneSeries(r.series) };
-    }
     // key/device/siteKey all follow the most-recently-seen member so the merged
     // row reads under the host's CURRENT casing AND its current org (XERK-448 D1:
     // a host that changed both casing and org must scope to the new org, or its
@@ -1555,37 +1591,21 @@ function isTenantKeyOf(from, to) {
   return typeof from === "string" && !!from && from !== "__proto__" && typeof to === "string" &&
     !tenantOfHostKey(from) && to.startsWith(from) && TENANT_SUFFIX_RE.test(to.slice(from.length));
 }
-// Whether `from` may be MERGED into another host's key `to` (a renamed host,
-// `opts.rename`): never out of a tenant or into another tenant — an untenanted
-// name's history may only join a host of its own world or the tenant it migrated
-// into, which the caller decides.
-function isRenameOf(from, to) {
-  if (typeof from !== "string" || !from || from === "__proto__" || typeof to !== "string" || !to ||
-      to === "__proto__" || from === to) return false;
-  const tf = tenantOfHostKey(from);
-  return !tf || tf === tenantOfHostKey(to);
-}
-
 /**
  * Move host `from`'s whole history to its tenant key `to` (XERK-2554, migrating a
  * pre-tenancy hub into a tenant). Into an empty `to` the entry moves as-is; into a
  * `to` that already holds history the two merge by the HIGH-WATER rule
  * (`mergeTwoEntries`: per-day max, never a sum — they are one machine's spend).
- * `opts.rename` instead moves it to ANOTHER host's key (a renamed host merged into
- * the name it beats as now; the two histories SUM (`sumSeries`, `isRenameOf`).
  * `opts.siteKey`, when a string, replaces the entry's org label (the caller scopes
  * it into the tenant too). `to` is persisted BEFORE `from` is dropped, so a crash in
  * between leaves a duplicate the next run merges away, never a loss. Returns
  * whether anything moved; a rerun finds `from` gone and moves nothing.
  */
 function rekeyHost(from, to, opts = {}) {
-  const allowed = opts && opts.rename ? isRenameOf(from, to) : isTenantKeyOf(from, to);
-  if (!allowed || !Object.prototype.hasOwnProperty.call(hosts, from)) return false;
+  if (!isTenantKeyOf(from, to) || !Object.prototype.hasOwnProperty.call(hosts, from)) return false;
   const src = hosts[from];
   const dst = Object.prototype.hasOwnProperty.call(hosts, to) ? hosts[to] : null;
-  // A rename joins two installs' histories: SUM them (`sumSeries`), never the
-  // high-water rule, which would drop one era (XERK-2868 QA).
-  const entry = dst ? mergeTwoEntries(dst, src, !!(opts && opts.rename)) : src;
+  const entry = dst ? mergeTwoEntries(dst, src) : src;
   // `opts.siteKey`: the new org label, or a function of the current one.
   const site = opts && typeof opts.siteKey === "function" ? opts.siteKey(entry.siteKey) : opts && opts.siteKey;
   if (typeof site === "string" && site) entry.siteKey = site;

@@ -192,21 +192,24 @@ paths:
   Same high-water rule; retired members fold only into a group's ONE live member (with two live,
   e.g. an old name re-registered by another machine, they stay retired rows — never counted twice).
   Tests: the `XERK-2381:` cases in `usage-ledger.test.js`.
-- **`STATIC_HOST_ALIASES` match by BARE name inside any tenant** (XERK-2868): the pre-tenancy
-  migration put those machines under `<name>@<tenant>`, and a plain-key lookup missed them, so
-  the old name read as a removed host.
-- **The static renames are MERGED, not only folded** (XERK-2868, `hostMergeTick`, leader, every
-  10 min): each old name's usage, permission, outcome and archive rows are re-keyed onto the one
-  host answering to the new name (`rekeyHost(..., {rename:true})`, `outcomeLedger.rekey`,
-  `archive.rekeyOwner`, ticket pins) — nothing is dropped.
-  - **Usage SUMS on a rename (`sumSeries`), never high-water**: the two names were different
-    installs (cluster agent vs node agent; WSL vs native Windows), so neither counted the other's
-    transcripts, and `mergeSeries`'s cutoff rule deleted one era outright (QA: 50% lost).
-  - The target is in the source's own tenant, or — for an untenanted old name — the operators' or
-    `migratedTenant()`; never another tenant's host sharing the name (QA: history crossed tenants).
-  - Never while the old name still runs (a live record or an identity homed there); an untenanted
-    old name joining a tenant host takes its org into the tenant.
-  - A pass that moves nothing settles it for the process (the full archive scan stops).
+- **`STATIC_HOST_ALIASES` also match by BARE name inside the migrated tenant** (XERK-2868,
+  `setHostAliases(pairs, [migratedTenant()])`): the pre-tenancy migration put those machines under
+  `<name>@<tenant>`, so a plain-key lookup missed them and the old name read as a removed host.
+  Another tenant's hosts sharing those names are not them and never fold.
+- **Static renames SUM across installs; everything else stays high-water** (`mergeEntries` →
+  `installOf` → `sumSeries`). Case twins and identity renames (`formerNames`) are one transcript
+  store reported twice (max); k8x/k8x-01 and maxai/maxai-win were different installs, and the
+  high-water cutoff rule dropped one era outright (QA: 50% of the total).
+- **The sum is SERVE-time only — never store one.** Usage stays under each install's key: a
+  stored sum re-ran on an HA failover (a stale follower still holds the old key; Postgres upserts
+  GREATEST) and double-counted, and absorb's per-counter max froze the live host's models/sessions.
+- **The static renames' other rows MOVE** (`hostMergeTick`, leader, every 10 min): permission,
+  outcome and archive rows (by id / row owner — idempotent) and ticket pins go to the one host
+  answering to the new name; a pre-tenancy usage row only re-keys into its own name's tenant key.
+  - Sources: untenanted or the migrated tenant only; never while the old name still runs (a live
+    record or an identity homed there). Target: same tenant (an untenanted source may join the
+    migrated tenant, taking its org with it); exactly one, live preferred.
+  - Settles for the process once a pass moves nothing and no source waits for its target.
   - Waits for HA's outcome rescan (`outcomeLedger.isLoaded`). Tests: `host-merge.test.js`.
 
 ### HA: the Postgres of-record backend (XERK-779, epic XERK-775; was Valkey XERK-758)
