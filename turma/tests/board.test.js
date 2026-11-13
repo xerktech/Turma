@@ -3080,6 +3080,16 @@ test("XERK-2673: epicRunView counts a child the board no longer lists as Done wh
   assert.equal(epicRunView(r, reopened, { sessionIndex: new Map() }).done, 0);
 });
 
+test("XERK-2673: an aged-off child shows the title the hub recorded", () => {
+  const site = epicSite([ticket("C-2", { statusCategory: "todo", summary: "Live title" })]);
+  const r = run({ children: ["C-1", "C-2"], waves: [["C-1", "C-2"]], doneChildren: ["C-1"],
+    childTitles: { "C-1": "Kept title", "C-2": "Old title" } });
+  const view = epicRunView(r, site, { sessionIndex: new Map() });
+  assert.deepEqual(view.waves[0].map((c) => c.summary), ["Kept title", "Live title"]);
+  // An older hub sends none: the bare key, as before.
+  assert.equal(epicRunView({ ...r, childTitles: undefined }, site, { sessionIndex: new Map() }).waves[0][0].summary, "");
+});
+
 test("epicRunView: a child with all in-epic blockers Done reads ready (not blocked)", () => {
   const site = epicSite([
     ticket("C-1", { statusCategory: "done" }),

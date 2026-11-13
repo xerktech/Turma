@@ -14966,6 +14966,30 @@ test("XERK-2673: a Done child that aged off the board stays a Done child of the 
   assert.deepEqual(sanitizeEpicRunRecord(run), run);
 });
 
+test("XERK-2673: an aged-off child keeps its title on the run", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  const site = "e2673t.atlassian.net";
+  const c1 = { ...dChild("C-1", [], "done"), summary: "First child" };
+  const c2 = { ...dChild("C-2", ["C-1"], "todo"), summary: "Second child" };
+  await asBeat("ed2673t", site, { autoStart: false, tickets: [dEpic(), c1, c2] });
+  let run = armEpicRun(site, "E-1");
+  assert.deepEqual({ ...run.childTitles }, { "C-1": "First child", "C-2": "Second child" });
+  // C-1 leaves the board: the driver keeps its title, and a re-arm does too.
+  await asBeat("ed2673t", site, { autoStart: false, tickets: [dEpic(), { ...c2, summary: "Renamed" }] });
+  epicRunDriveSweep();
+  run = epicRuns[`${site}/E-1`];
+  assert.deepEqual({ ...run.childTitles }, { "C-1": "First child", "C-2": "Renamed" });
+  run = armEpicRun(site, "E-1");
+  assert.equal(run.childTitles["C-1"], "First child");
+  assert.equal(JSON.stringify(sanitizeEpicRunRecord(run)), JSON.stringify(run), "coerce fixed point");
+  // The whitelist: only the run's children, strings, capped.
+  const clean = sanitizeEpicRunRecord({ ...run, childTitles: { "C-1": "x".repeat(500), "Z-9": "stray", "C-2": 7 } });
+  assert.deepEqual(Object.keys(clean.childTitles), ["C-1"]);
+  assert.equal(clean.childTitles["C-1"].length, 200);
+  assert.equal("childTitles" in sanitizeEpicRunRecord({ ...run, childTitles: "nope" }), false);
+});
+
 test("XERK-2673: an OPEN child that went unlisted keeps the run open (no epic Done write)", async () => {
   resetEpicD();
   resetEpicRuns();

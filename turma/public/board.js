@@ -538,7 +538,10 @@
     const node = (k) => {
       const t = byKey.get(k);
       // onBoard: the panel can open only a child the board carries (XERK-2674).
-      return { key: k, summary: (t && t.summary) || "", status: statusOf(k), onBoard: !!t };
+      // A child that aged off the board keeps the title the hub recorded for it.
+      const titles = run.childTitles && typeof run.childTitles === "object" ? run.childTitles : null;
+      const kept = titles && Object.hasOwn(titles, k) && typeof titles[k] === "string" ? titles[k] : "";
+      return { key: k, summary: (t && t.summary) || kept, status: statusOf(k), onBoard: !!t };
     };
     const counts = { done: 0, running: 0, ready: 0, blocked: 0 };
     for (const k of keys) { const s = statusOf(k); if (counts[s] != null) counts[s]++; }

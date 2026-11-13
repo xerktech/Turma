@@ -1494,6 +1494,14 @@ class BoardTest {
         assertEquals(0, epicRunView(run, reopened, emptyMap()).done)
     }
 
+    @Test fun `epicRunView shows an aged-off child's recorded title (XERK-2673)`() {
+        val site = epicSite(listOf(child("C-2", summary = "Live title")))
+        val run = mkRun(children = listOf("C-1", "C-2"), waves = listOf(listOf("C-1", "C-2")))
+            .copy(doneChildren = listOf("C-1"), childTitles = mapOf("C-1" to "Kept title", "C-2" to "Old"))
+        val view = epicRunView(run, site, emptyMap())
+        assertEquals(listOf("Kept title", "Live title"), view.waves[0].map { it.summary })
+    }
+
     @Test fun `epicRunView derives child status from the live board`() {
         // C-1 Done; C-2 has a running session; C-3 unstarted, its in-epic blocker
         // C-2 not Done -> blocked.

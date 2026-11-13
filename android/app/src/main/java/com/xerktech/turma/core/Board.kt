@@ -267,7 +267,9 @@ fun epicRunView(
             if (holds) EpicChildStatus.BLOCKED else EpicChildStatus.READY
         }
     }
-    fun node(k: String) = EpicChild(k, byKey[k]?.summary.orEmpty(), statusOf(k))
+    fun node(k: String) = EpicChild(
+        k, byKey[k]?.summary?.takeIf { it.isNotEmpty() } ?: run.childTitles[k].orEmpty(), statusOf(k),
+    )
     val counts = EpicChildStatus.entries.associateWith { s -> keys.count { statusOf(it) == s } }
     val waves = run.waves.map { w -> w.map { node(it) } }
     val cycleChildren = cycleKeys.map { node(it) }
