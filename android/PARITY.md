@@ -734,16 +734,6 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
 those are marked `[MODEL]`.
 
-### Brief (`brief.html` + `meetings.js` → `BriefScreen`) — XERK-2857 triage, port is its own ticket
-
-- **The web Brief page is now one two-pane triage; Android still shows separate Brief / Meetings.**
-  `[MODEL]` Port: org groups (collapsible), entries by Today / Yesterday / This week / Earlier,
-  Needs review / All / Archived + search, the daily meeting as ONE entry pairing its brief
-  (`daily.meetingAt` / `daily.briefRunId`) with that meeting's proposals, reviewed proposals hidden
-  behind "show reviewed" with Reopen (`action:"reopen"`), Archive / Unarchive
-  (`POST .../meetings/<id>/archive {archived}`), and the per-org settings drawer (project, whose
-  work, Tenir label). Keyboard triage (A/S/E/R/J/K) is web-only by nature.
-
 ### Dashboard (`index.html` → `FleetScreen`/`FleetDialogs`)
 
 - **Add host dialog (XERK-2531) — web only.** The dashboard's "+ Add host" mints a one-time
