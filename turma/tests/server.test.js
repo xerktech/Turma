@@ -8725,6 +8725,18 @@ test("findTicketHost: a pin refusal names the agent, never its tenant id", async
   }
 });
 
+test("operator-facing host text never interpolates a raw registry key", () => {
+  // Tripwire beside the behavioural tests: the pin refusals, the restore race and
+  // the host notifications reach the operator verbatim, so a tenant key there
+  // leaks its tenant id. Each must go through baseOfKey.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  assert.doesNotMatch(src, /pinned to agent "\$\{pin\.host\}"/);
+  assert.doesNotMatch(src, /came back up on \$\{host\}/);
+  for (const line of src.split("\n").filter((l) => /^\s*notify\(`/.test(l))) {
+    assert.doesNotMatch(line, /\$\{(key|host)\}/, line.trim());
+  }
+});
+
 // ---- XERK-515 [Qwen I]: a ticket can be pinned to the qwen runtime ----------
 
 // A ticket host that ALSO offers the qwen runtime — the qwen twin of dshTicketBeat.
