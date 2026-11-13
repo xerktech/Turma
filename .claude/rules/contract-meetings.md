@@ -134,6 +134,8 @@ ticket builds to this file; change it here first.
   `review.maybeCreated: true`, and Reopen answers 409. Reopen wiped the "check the board" warning,
   leaving a clean pending row one Approve from a duplicate ticket; Approve from the failed row,
   warning shown, still works. The web hides its Reopen button there.
+  - Reject keeps the flag + error, and Reopen of such a rejection returns it to that warned
+    `failed` review, never to pending (QA: reject-then-reopen was the bypass).
 
 ## Archive and the daily meeting (hub, XERK-2856)
 

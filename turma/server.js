@@ -5179,6 +5179,11 @@ function sanitizeMeetingReview(v) {
     out.error = meetingText(v.error, MEETING_ERROR_MAX) || "the ticket could not be created";
     if (v.maybeCreated === true) out.maybeCreated = true;
   }
+  // A rejected create that may exist keeps the warning to reopen with (XERK-2864).
+  if (v.state === "rejected" && v.maybeCreated === true) {
+    out.maybeCreated = true;
+    out.error = meetingText(v.error, MEETING_ERROR_MAX) || "the ticket may have been created";
+  }
   if ((v.state === "creating" || v.state === "created") && v.start === true) {
     out.start = true;
     if (v.state === "created") {
@@ -21215,14 +21220,17 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
     if (cur !== "rejected" && cur !== "failed") {
       return refuse(409, "only a rejected or failed proposal can be reopened");
     }
-    // A create that may have gone through keeps its warning (XERK-2864): Reopen
-    // would wipe it and leave a clean pending row one Approve from a duplicate.
-    // Approve stays possible from the failed row, where the warning still shows.
-    if (item.review.maybeCreated) {
+    // A create that may have gone through keeps its warning (XERK-2864): wiping
+    // it leaves a clean pending row one Approve from a duplicate ticket. So a
+    // failed one is not reopened (Approve stays possible there, warning shown),
+    // and a rejected one reopens to that warned failure, never to pending.
+    const mc = item.review.maybeCreated === true;
+    if (mc && cur === "failed") {
       return refuse(409, "that ticket may already exist — check the board, then approve or reject it");
     }
+    const back = mc ? { state: "failed", at: now, maybeCreated: true, error: item.review.error } : undefined;
     const row = putMeeting(siteKey, { ...m, archivedAt: undefined,
-      items: m.items.map((i) => (i.id === itemId ? { ...i, review: undefined } : i)) });
+      items: m.items.map((i) => (i.id === itemId ? { ...i, review: back } : i)) });
     return row ? { status: 200, body: { ok: true, meeting: meetingWire(row) } }
       : refuse(500, "the review could not be stored");
   }
@@ -21237,7 +21245,9 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   };
   if (body.action === "reject") {
     if (cur === "rejected") return refuse(409, "that proposal is already rejected");
-    return save({ state: "rejected", at: now });
+    const prev = item.review;
+    return save({ state: "rejected", at: now, ...(prev && prev.maybeCreated === true
+      ? { maybeCreated: true, error: prev.error } : {}) });
   }
   for (const k of ["title", "description", "project", "issueType"]) {
     if (body[k] != null && typeof body[k] !== "string") return refuse(400, `${k} must be text`);
