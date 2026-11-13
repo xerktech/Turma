@@ -302,4 +302,82 @@ class BriefScreenTest {
         compose.waitUntil(10_000) { mvm.saving.value.isEmpty() }
         compose.waitUntil(5_000) { compose.onAllNodesWithText("10:15").fetchSemanticsNodes().isNotEmpty() }
     }
+
+    @Test fun `a rotation mid-save after an earlier save keeps the typed text`() {
+        // XERK-2858 QA: a rotation replays the PREVIOUS save's answer; taking it
+        // as this save's put the old value back, and a failed save lost the text.
+        val release = java.util.concurrent.CountDownLatch(1)
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [] }""")
+        hub.route("/api/orgs/$site/daily-brief/schedule") {
+            if (calls.incrementAndGet() == 1) {
+                okhttp3.mockwebserver.MockResponse().setHeader("Content-Type", "application/json").setBody(
+                    """{ "ok": true, "schedule": { "enabled": true, "time": "08:00", "timeZone": "UTC",
+                        "weekdays": [0,1,2,3,4,5,6], "leadMinutes": 5, "meetingTitle": "standup" } }""")
+            } else {
+                release.await(10, java.util.concurrent.TimeUnit.SECONDS)
+                HubHarness.refusal("time must be HH:MM on a 24-hour clock", 400)
+            }
+        }
+        hub.seedFleet("""{ "now": 1, "agents": [ $host ], "dailyBriefSchedules": { "$site": $schedule } }""")
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        val vm = main.track(BriefViewModel(hub.app))
+        val restore = androidx.compose.ui.test.junit4.StateRestorationTester(compose)
+        restore.setContent { BriefScreen(vm = vm, meetingsVm = mvm) }
+        compose.onNodeWithContentDescription("o settings").performClick()
+        compose.onNodeWithText("23:59").performScrollTo().performTextReplacement("0800")
+        compose.onNodeWithTag("save-schedule").performScrollTo().performClick()
+        compose.waitUntil(5_000) { compose.onAllNodesWithText("08:00").fetchSemanticsNodes().isNotEmpty() }
+        compose.waitUntil(5_000) { mvm.saving.value.isEmpty() }
+        compose.onNodeWithText("08:00").performScrollTo().performTextReplacement("1015")
+        compose.onNodeWithTag("save-schedule").performScrollTo().performClick()
+        compose.waitUntil(5_000) { mvm.saving.value.isNotEmpty() }
+        restore.emulateSavedInstanceStateRestore()
+        compose.waitForIdle()
+        compose.onAllNodesWithText("1015").assertCountEquals(1)
+        release.countDown()
+        compose.waitUntil(10_000) { mvm.saving.value.isEmpty() }
+        compose.waitForIdle()
+        compose.onAllNodesWithText("1015").assertCountEquals(1)
+    }
+
+    @Test fun `whose work and the label are not Saved beside text typed mid-save`() {
+        val focusGate = java.util.concurrent.CountDownLatch(1)
+        val labelGate = java.util.concurrent.CountDownLatch(1)
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [] }""")
+        hub.route("/api/orgs/$site/meeting-focus") {
+            focusGate.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            okhttp3.mockwebserver.MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("""{ "ok": true, "focus": { "names": [], "role": "lead" } }""")
+        }
+        hub.route("/api/orgs/$site/meeting-label") {
+            labelGate.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            okhttp3.mockwebserver.MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("""{ "ok": true, "label": "acmeq", "custom": true }""")
+        }
+        hub.seedFleet("""{ "now": 1, "agents": [ $host ] }""")
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        show(mvm = mvm)
+        compose.onNodeWithContentDescription("o settings").performClick()
+
+        compose.onNodeWithText("Role (optional)").performTextReplacement("lead")
+        compose.onNodeWithTag("save-focus").performScrollTo().performClick()
+        compose.waitUntil(5_000) { mvm.saving.value.isNotEmpty() }
+        compose.onNodeWithText("lead").performTextReplacement("lead2")
+        focusGate.countDown()
+        compose.waitUntil(10_000) { mvm.saving.value.isEmpty() }
+        compose.waitForIdle()
+        compose.onNodeWithText("lead2").assertExists()
+        compose.onAllNodesWithText("Saved").assertCountEquals(0)
+
+        compose.onNodeWithText("Label (blank = default)").performScrollTo().performTextReplacement("acmeq")
+        compose.onNodeWithTag("save-label").performScrollTo().performClick()
+        compose.waitUntil(5_000) { mvm.saving.value.isNotEmpty() }
+        compose.onNodeWithText("acmeq").performScrollTo().performTextReplacement("acmeqz")
+        labelGate.countDown()
+        compose.waitUntil(10_000) { mvm.saving.value.isEmpty() }
+        compose.waitForIdle()
+        compose.onNodeWithText("acmeqz").assertExists()
+        compose.onAllNodesWithText("Saved").assertCountEquals(0)
+    }
 }

@@ -686,17 +686,19 @@ private fun OrgSettings(
             )
             // The hub's answer {focus: {names, role} | null} is what it stored.
             LaunchedEffect(stored[k("focus")]?.seq) {
-                val body = stored[k("focus")]?.body ?: return@LaunchedEffect
+                val ans = stored[k("focus")] ?: return@LaunchedEffect
+                val body = ans.body
                 val f = body.obj("focus")
                 val cleared = body["focus"] is JsonNull
                 val a = namesD.stored(if (cleared) "" else (f?.get("names") as? JsonArray)
-                    ?.mapNotNull { (it as? JsonPrimitive)?.content }?.joinToString("\n"))
-                val b = roleD.stored(if (cleared) "" else f?.str("role"))
+                    ?.mapNotNull { (it as? JsonPrimitive)?.content }?.joinToString("\n"), ans.seq)
+                val b = roleD.stored(if (cleared) "" else f?.str("role"), ans.seq)
                 // "Saved" never sits beside text the hub has not seen.
                 if (!(a && b)) mvm.clearSaved(site, "focus")
             }
             SaveRow("focus", k("focus") in saving, k("focus") in saved) {
-                namesD.send(); roleD.send()
+                val seq = stored[k("focus")]?.seq ?: 0
+                namesD.send(seq); roleD.send(seq)
                 mvm.saveFocus(site, focusNames(names), role)
             }
 
@@ -707,9 +709,10 @@ private fun OrgSettings(
             var own by ownD
             // The hub's answer {label, custom}: an operator's own label, or "" for the default.
             LaunchedEffect(stored[k("label")]?.seq) {
-                val body = stored[k("label")]?.body ?: return@LaunchedEffect
+                val ans = stored[k("label")] ?: return@LaunchedEffect
+                val body = ans.body
                 val custom = (body["custom"] as? JsonPrimitive)?.booleanOrNull
-                if (!ownD.stored(if (custom == null) null else if (custom) body.str("label") else "")) {
+                if (!ownD.stored(if (custom == null) null else if (custom) body.str("label") else "", ans.seq)) {
                     mvm.clearSaved(site, "label")
                 }
             }
@@ -726,7 +729,10 @@ private fun OrgSettings(
                 own, { own = it.take(40); mvm.clearSaved(site, "label") }, Modifier.fillMaxWidth(),
                 label = { Text("Label (blank = default)") }, singleLine = true,
             )
-            SaveRow("label", k("label") in saving, k("label") in saved) { ownD.send(); mvm.saveLabel(site, own) }
+            SaveRow("label", k("label") in saving, k("label") in saved) {
+                ownD.send(stored[k("label")]?.seq ?: 0)
+                mvm.saveLabel(site, own)
+            }
 
             ScheduleSection(site, fleet.dailyBriefSchedules[site], now, k("schedule") in saving,
                 k("schedule") in saved, storedMap[k("schedule")], { mvm.clearSaved(site, "schedule") }) { mvm.saveSchedule(site, it) }
@@ -771,16 +777,18 @@ private fun ScheduleSection(
     var title by titleD
     // The hub's answer {schedule} is the schedule as it stored it.
     LaunchedEffect(stored?.seq) {
-        val body = stored?.body ?: return@LaunchedEffect
+        val ans = stored ?: return@LaunchedEffect
+        val body = ans.body
+        val q = ans.seq
         // An answer with no schedule still marks the fields clean, as typed.
         val sc = body.obj("schedule")
         val clean = listOf(
-            enabledD.stored((sc?.get("enabled") as? JsonPrimitive)?.booleanOrNull),
-            timeD.stored(sc?.str("time")),
-            zoneD.stored(sc?.str("timeZone")),
-            daysD.stored((sc?.get("weekdays") as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.intOrNull }),
-            leadD.stored((sc?.get("leadMinutes") as? JsonPrimitive)?.intOrNull?.toString()),
-            titleD.stored(if (sc == null) null else sc.str("meetingTitle") ?: ""),
+            enabledD.stored((sc?.get("enabled") as? JsonPrimitive)?.booleanOrNull, q),
+            timeD.stored(sc?.str("time"), q),
+            zoneD.stored(sc?.str("timeZone"), q),
+            daysD.stored((sc?.get("weekdays") as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.intOrNull }, q),
+            leadD.stored((sc?.get("leadMinutes") as? JsonPrimitive)?.intOrNull?.toString(), q),
+            titleD.stored(if (sc == null) null else sc.str("meetingTitle") ?: "", q),
         ).all { it }
         // "Saved" never sits beside text the hub has not seen.
         if (!clean) onEdit()
@@ -827,7 +835,7 @@ private fun ScheduleSection(
         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
     SaveRow("schedule", busy, done) {
-        for (d in listOf(enabledD, timeD, zoneD, daysD, leadD, titleD)) d.send()
+        for (d in listOf(enabledD, timeD, zoneD, daysD, leadD, titleD)) d.send(stored?.seq ?: 0)
         // The hub merges these over the stored schedule and validates the
         // whole (a 400 in its words), so nothing is checked twice here.
         onSave(buildJsonObject {
@@ -860,6 +868,7 @@ private class Draft<T : Any>(
     private val draft: androidx.compose.runtime.MutableState<T>,
     private val edited: androidx.compose.runtime.MutableState<Boolean>,
     private val sent: androidx.compose.runtime.MutableState<T?>,
+    private val sentAfter: androidx.compose.runtime.MutableState<Int>,
 ) {
     operator fun getValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>): T = draft.value
     operator fun setValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>, v: T) {
@@ -871,8 +880,10 @@ private class Draft<T : Any>(
         if (!edited.value) draft.value = remote
     }
 
-    fun send() {
+    /** Record what this save sends; [lastSeq] is the newest answer already seen, never this save's. */
+    fun send(lastSeq: Int) {
         sent.value = draft.value
+        sentAfter.value = lastSeq
     }
 
     /**
@@ -880,7 +891,9 @@ private class Draft<T : Any>(
      * carry one. False when the field was typed into while the save was in
      * flight, so it holds text the hub has not seen.
      */
-    fun stored(v: T?): Boolean {
+    fun stored(v: T?, seq: Int): Boolean {
+        // An answer from before this save (replayed by a rotation) is not its answer (QA).
+        if (seq <= sentAfter.value) return !edited.value
         val was = sent.value ?: return !edited.value
         sent.value = null
         if (draft.value != was) return false
@@ -897,6 +910,7 @@ private fun <T : Any> rememberDraft(site: String, remote: T): Draft<T> {
         rememberSaveable(site) { mutableStateOf(false) },
         // Saveable too: a rotation mid-save must still mark the field clean (QA).
         rememberSaveable(site) { mutableStateOf<T?>(null) },
+        rememberSaveable(site) { mutableStateOf(0) },
     )
     LaunchedEffect(remote) { d.follow(remote) }
     return d
