@@ -1460,10 +1460,15 @@ function rehydrate() {
 
 function flush(done) { backend.flush(done); }
 
+/** Whether the model holds the of-record table (false only while HA's first rescan is pending). */
+function isLoaded() {
+  return backend.loaded !== false;
+}
+
 load();
 
 module.exports = {
-  observe, attributeDefects, sanitizeDefectReports, aggregate, tenants, purgeTenant, hostKeys, siteKeys, rekey, rowTenant, outcomeOf, metricsText, workClass, modelFamily, sanitizeRow,
+  isLoaded, observe, attributeDefects, sanitizeDefectReports, aggregate, tenants, purgeTenant, hostKeys, siteKeys, rekey, rowTenant, outcomeOf, metricsText, workClass, modelFamily, sanitizeRow,
   shadowCandidates, decideShadow, shadowsDispatchedSince, observeShadows, SHADOW_ID_RE,
   wilson, promotionPasses, liveRate, pairEvidence,
   configure, rehydrate, flush,

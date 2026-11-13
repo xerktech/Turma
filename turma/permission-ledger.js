@@ -660,16 +660,25 @@ function isTenantKeyOf(from, to) {
   return typeof from === "string" && !!from && from !== "__proto__" && typeof to === "string" &&
     !tenantOfHostKey(from) && to.startsWith(from) && TENANT_SUFFIX_RE.test(to.slice(from.length));
 }
+// Whether `from` may be MERGED into another host's key `to` (`opts.rename`, a
+// renamed host): never out of a tenant or into another one.
+function isRenameOf(from, to) {
+  if (typeof from !== "string" || !from || from === "__proto__" || typeof to !== "string" || !to ||
+      to === "__proto__" || from === to) return false;
+  const tf = tenantOfHostKey(from);
+  return !tf || tf === tenantOfHostKey(to);
+}
 
 /**
  * Move every row of host `from` to its tenant key `to` (XERK-2554, migrating a
  * pre-tenancy hub into a tenant). Rows merge by id; on a clash the row further along
  * (`rowProgress`) wins, so a re-key never reverts a closed row. Postgres gets the
  * upserts under `to` and DELETEs of the `(from, id)` pairs (upserts drain first).
+ * `opts.rename` moves them to ANOTHER host's key instead (a renamed host, `isRenameOf`).
  * Returns how many rows left `from`; a rerun finds it gone and moves nothing.
  */
-function rekeyHost(from, to) {
-  if (!isTenantKeyOf(from, to)) return 0;
+function rekeyHost(from, to, opts = {}) {
+  if (!(opts && opts.rename ? isRenameOf(from, to) : isTenantKeyOf(from, to))) return 0;
   const src = hosts.get(from);
   if (!src) return 0;
   let dst = hosts.get(to);

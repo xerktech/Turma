@@ -1878,7 +1878,7 @@ function syncLedgerAliases() {
   for (const [k, a] of Object.entries(agents)) {
     if (a && Array.isArray(a.formerNames)) for (const n of a.formerNames) pairs.push([n, k]);
   }
-  usageLedger.setHostAliases(pairs);
+  usageLedger.setHostAliases(pairs, [migratedTenant()]);
 }
 // Retire every other record bound to `uid` once its agent beat in as `newKey`
 // (XERK-2381): the renamed-from record, and any stale HA copy. The new record
@@ -8494,6 +8494,116 @@ registerTenantMigration({
     return n;
   },
 });
+
+// Hosts renamed BEFORE agents had an identity (XERK-2381's static aliases: k8x ->
+// k8x-01, maxai -> maxai-win) are MERGED into the name they beat as now, so their
+// permission prompts, outcomes, archived sessions and ticket pins belong to the
+// one agent, and their usage is SUMMED into its card. The usage fold only joined them on the Usage page, and missed them once
+// the pre-tenancy migration put the live name under `@<tenant>`: the old name
+// read as a separate removed host. Nothing is dropped — rows move by id
+// (permission progress, outcome newer), archive rows change owner (files stay
+// put), usage stays stored per install and is summed when served. Idempotent: a pass that finds the old name gone
+// moves nothing. An old name is left alone while anything still runs as it (a
+// live record, or an identity living there): that is a machine, not history.
+const HOST_MERGE_EVERY_MS = 10 * 60 * 1000;
+let hostMergeAt = 0;
+// Set once a pass finds nothing to move: an old name that never runs again gets
+// no new rows, so the full archive scan stops (a promoted leader checks once more).
+let hostMergesSettled = false;
+function hostMergePlan() {
+  const archiveOwners = archive.listRowOwners();
+  const pool = new Set([...Object.keys(agents), ...usageLedger.keys(), ...permissionLedger.hostKeys(),
+    ...outcomeLedger.hostKeys(), ...archiveOwners.map((r) => r.host)]);
+  const named = (name) => [...pool].filter((k) => typeof k === "string" &&
+    baseOfKey(k).toLowerCase() === name.toLowerCase());
+  const isLive = (k) => Object.prototype.hasOwnProperty.call(agents, k);
+  const livesAt = (k) => isLive(k) ||
+    Object.values(agentIdentities).some((e) => e && !e.revoked && !e.released && e.home === k);
+  const plan = [];
+  let pending = 0;
+  for (const [oldName, newName] of usageLedger.STATIC_HOST_ALIASES) {
+    for (const from of named(oldName)) {
+      // Still running as the old name: not history yet, so keep checking (QA).
+      if (livesAt(from)) { pending++; continue; }
+      const tFrom = tenantOfKey(from);
+      // These are the operators' machines: their names in another tenant are not them.
+      if (tFrom && tFrom !== migratedTenant()) continue;
+      // A target in the source's own world: its tenant, or — for an untenanted
+      // (pre-tenancy) old name — the operators' or the tenant the pre-tenancy
+      // migration moved this deployment into. Never another tenant's host that
+      // merely shares the name (QA: the owner's history landed in a stranger's).
+      const homeTenant = migratedTenant();
+      const fits = (k) => k !== from && (tenantOfKey(k) === tFrom || (!tFrom && !!homeTenant && tenantOfKey(k) === homeTenant));
+      const candidates = named(newName).filter(fits);
+      const live = candidates.filter(isLive);
+      const targets = live.length ? live : candidates;
+      if (targets.length !== 1) {
+        pending++;
+        if (targets.length > 1) {
+          logQueueState(`host-merge:${from}`, `host merge: ${logName(from)} skipped — ` +
+            `${targets.length} hosts answer to ${logName(newName)}`);
+        }
+        continue;
+      }
+      const to = targets[0];
+      const tTo = tenantOfKey(to);
+      plan.push({ from, to, rescope: !tFrom && tTo ? tTo : "" });
+    }
+  }
+  return { plan, pending, archiveOwners };
+}
+function runHostMerges() {
+  const { plan, pending, archiveOwners } = hostMergePlan();
+  let pinsMoved = false;
+  let moved = 0;
+  for (const { from, to, rescope } of plan) {
+    const site = (s) => (rescope && plainKey(s) ? scopeSite(s, rescope) : s);
+    // Usage stays under each install's own key — the Usage page SUMS the static
+    // renames (usage-ledger `mergeEntries`), and a stored sum would double-count on
+    // any rerun (QA). Only a pre-tenancy row joins its own name's tenant key
+    // (the XERK-2554 re-key, high-water: the same install), so the fold can see it.
+    const hadUsage = usageLedger.has(from);
+    const usage = rescope ? usageLedger.rekeyHost(from, tenantHostKey(from, rescope), { siteKey: site }) : false;
+    const perms = permissionLedger.rekeyHost(from, to, { rename: true });
+    const outcomes = outcomeLedger.rekey((h) => (h === from ? to : null),
+      (s, row) => (row.host === from && rescope && plainKey(s) ? scopeSite(s, rescope) : null));
+    let rows = 0;
+    for (const r of archiveOwners) {
+      if (r.host !== from) continue;
+      if (archive.rekeyOwner(r.transcriptId, to, typeof r.siteKey === "string" && r.siteKey ? site(r.siteKey) : r.siteKey)) rows++;
+    }
+    // A ticket pinned to the old name follows it, as on an identity rename.
+    let pins = 0;
+    for (const p of Object.values(ticketAgents)) {
+      if (p && p.host === from) { p.host = to; pins++; }
+    }
+    if (pins) pinsMoved = true;
+    moved += (usage ? 1 : 0) + perms + outcomes + rows + pins;
+    if (usage || perms || outcomes || rows || pins) {
+      console.log(`host merge: ${logName(from)} -> ${logName(to)}: usage ${usage ? "re-keyed into the tenant" : hadUsage ? "kept (summed on display)" : "none"}, ` +
+        `${perms} permission row(s), ${outcomes} outcome row(s), ${rows} archived session(s), ${pins} ticket pin(s)`);
+      invalidateAgentsCache();
+    }
+  }
+  if (pinsMoved) {
+    persistTicketAgents();
+    sseBroadcast("ticketAgents", ticketAgents);
+  }
+  return { moved, pending };
+}
+function hostMergeTick(now = Date.now()) {
+  if (hostMergesSettled || now - hostMergeAt < HOST_MERGE_EVERY_MS) return;
+  // Under HA the outcome table loads after boot; merging into a half-loaded model
+  // would lose the rows its rescan then brings back under the old name.
+  if (!outcomeLedger.isLoaded()) return;
+  hostMergeAt = now;
+  // Settled once nothing moved and every old name found its host: a source still
+  // waiting for its target (not beaten yet, migration unfinished) keeps it going.
+  try {
+    const r = runHostMerges();
+    if (r.moved === 0 && r.pending === 0) hostMergesSettled = true;
+  } catch (e) { console.error(`host merge failed: ${e && e.message}`); }
+}
 
 // The untenanted host and org keys the deployment holds now — recorded on the
 // marker when the run starts, so later leftovers are re-keyed for them only.
@@ -21444,6 +21554,8 @@ function masterOrchestrationTick() {
   // Move the pre-tenancy deployment into its owner's tenant (XERK-2554): run or
   // resume it, then sweep the migrated hosts' leftovers for a settle window.
   tenantMigrationTick();
+  // Fold hosts renamed before agents had an identity into their current name.
+  hostMergeTick();
   // Work dispatched to a host that then died before taking it goes back in the
   // queue (XERK-303), in time for the drain at the end of this same tick to hand
   // it to a host that is actually up.
@@ -28418,7 +28530,7 @@ if (process.env.TURMA_TEST) {
     registerTenantPurge, purgeTenantData, ledgerVisible, ledgerScopeKey, tenantScope, subscriptionKeyOf,
     shadowHostFor,
     // XERK-2554: the pre-tenancy migration.
-    runTenantMigration, runTenantLateSteps, migrateTenantLeftovers, tenantMigrationTick, tenantMigrationGateClosed,
+    runTenantMigration, runHostMerges, hostMergeTick, runTenantLateSteps, migrateTenantLeftovers, tenantMigrationTick, tenantMigrationGateClosed,
     logTenantMigrationError,
     tenantMigrationSteps, tenantMigrationPurgeNames: () => [...tenantPurges.keys()],
     tenantMigrationMarker: () => tenantMigrationMarker, migratedTenant,

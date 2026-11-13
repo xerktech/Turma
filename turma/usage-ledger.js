@@ -437,6 +437,34 @@ function mergeSeries(dst, src) {
   return dst;
 }
 
+// Combine two DIFFERENT installs' series by SUM, IN PLACE (XERK-2868): the static
+// renames (k8x's cluster-wide agent vs k8x-01's node agent; maxai's WSL home vs
+// maxai-win's Windows one) counted different transcript stores, so neither figure
+// is inside the other, and the high-water `mergeSeries` would hide one era — its
+// `cutoff` rule drops every day the other side folded into `pre`. Every bucket
+// adds; a day at or before the merged cutoff is FOLDED into `pre` (added, never
+// deleted), so `pre + sum(days)` is exactly both totals. A SERVE-time view only:
+// the stored entries stay apart, so the store's high-water ingest and Postgres's
+// GREATEST upsert never see a sum (a stored sum double-counted on a rerun, QA).
+function sumSeries(dst, src) {
+  if (!src) return dst;
+  addBucket(dst.pre, src.pre);
+  for (const [d, b] of Object.entries(src.days)) addBucket(dst.days[d] || (dst.days[d] = blankBucket()), b);
+  if (src.cutoff && (!dst.cutoff || src.cutoff > dst.cutoff)) dst.cutoff = src.cutoff;
+  if (dst.cutoff) {
+    for (const d of Object.keys(dst.days)) {
+      if (d <= dst.cutoff) { addBucket(dst.pre, dst.days[d]); delete dst.days[d]; }
+    }
+  }
+  for (const [m, b] of Object.entries(src.models)) addBucket(dst.models[m] || (dst.models[m] = blankBucket()), b);
+  if (src.subagent) addBucket(dst.subagent || (dst.subagent = blankBucket()), src.subagent);
+  dst.sessions = (dst.sessions || 0) + (src.sessions || 0);
+  if (src.lastActivity && (!dst.lastActivity || src.lastActivity > dst.lastActivity)) dst.lastActivity = src.lastActivity;
+  trimModels(dst);
+  trimDays(dst);
+  return dst;
+}
+
 // Hold a series' model map to its cap, biggest spender first. Unlike a trimmed
 // DAY, a dropped model is not folded anywhere: it is a BREAKDOWN of totals that
 // are kept in full elsewhere, so dropping the smallest loses a row of detail and
@@ -1292,7 +1320,27 @@ const STATIC_HOST_ALIASES = [
 // folded name -> its group's canonical folded name (the smallest member, so the
 // answer never depends on rename order or a rename back to an old name).
 let hostAliasRoots = new Map();
-function setHostAliases(pairs) {
+// Same, over the hub's identity renames ONLY (one install that changed its name,
+// same transcript store): the members of one INSTALL, merged by high-water. The
+// static renames join different installs, which `mergeEntries` sums.
+let installRoots = new Map();
+// The tenants the static renames apply in besides the untenanted world: the one
+// the pre-tenancy deployment migrated into (server.js `migratedTenant`). Another
+// tenant's hosts that merely share those names are not those machines.
+let staticAliasTenants = new Set();
+function setHostAliases(pairs, staticTenants = []) {
+  staticAliasTenants = new Set((Array.isArray(staticTenants) ? staticTenants : []).filter((t) => typeof t === "string" && t));
+  // Inside each such tenant the static pairs join its keys too, in the SAME
+  // union as the identity renames — a renamed static host (k8x-01 -> k8x-02)
+  // must land in one group with both its names and the static partner (QA).
+  const tenantStatic = [];
+  for (const t of staticAliasTenants) {
+    for (const [a, b] of STATIC_HOST_ALIASES) tenantStatic.push([`${a}@${t}`, `${b}@${t}`]);
+  }
+  hostAliasRoots = aliasRoots([...STATIC_HOST_ALIASES, ...tenantStatic, ...(Array.isArray(pairs) ? pairs : [])]);
+  installRoots = aliasRoots(Array.isArray(pairs) ? pairs : []);
+}
+function aliasRoots(pairs) {
   const parent = new Map();
   const find = (x) => {
     while (parent.has(x) && parent.get(x) !== x) x = parent.get(x);
@@ -1305,7 +1353,7 @@ function setHostAliases(pairs) {
     if (!parent.has(ra)) parent.set(ra, ra);
     if (!parent.has(rb)) parent.set(rb, rb);
   };
-  for (const pair of [...STATIC_HOST_ALIASES, ...(Array.isArray(pairs) ? pairs : [])]) {
+  for (const pair of pairs) {
     if (!Array.isArray(pair) || pair.length !== 2) continue;
     const [a, b] = pair;
     if (typeof a !== "string" || typeof b !== "string" || !a || !b) continue;
@@ -1320,18 +1368,18 @@ function setHostAliases(pairs) {
     const r = find(name);
     if (r !== name) roots.set(name, r);
   }
-  hostAliasRoots = roots;
+  return roots;
 }
 setHostAliases([]);
 
 function foldKey(k) {
   const raw = String(k == null ? "" : k);
   const f = raw.toLowerCase();
+  const t = tenantOfHostKey(raw);
   const root = hostAliasRoots.get(f) || f;
   // The tenant (read off the key as typed, XERK-2550) leads a tenant key's fold,
   // so no case twin or alias can fold one tenant's spend into another's — or an
   // untenanted name that merely lowercases into a tenant key's shape into it.
-  const t = tenantOfHostKey(raw);
   return t ? `${t}\u0000${root}` : root;
 }
 
@@ -1339,19 +1387,41 @@ function foldKey(k) {
 // merged view. `host`/`repos` are fresh, so `hosts` is never mutated; the canonical
 // key/device/siteKey/lastSeen come from the most-recently-seen member so the merged
 // row reads under the host's current casing.
+// Which install a ledger key belongs to: case twins and identity renames are one
+// install (one transcript store); the static renames are separate installs.
+function installOf(k) {
+  const f = String(k).toLowerCase();
+  return installRoots.get(f) || f;
+}
 function mergeEntries(keys) {
+  // High-water WITHIN an install (the same store reported twice), then SUM across
+  // installs (different stores, XERK-2868) — so no era of a static rename is lost.
+  const installs = new Map();
+  for (const k of keys) {
+    const e = hosts[k];
+    if (!e) continue;
+    let g = installs.get(installOf(k));
+    if (!g) installs.set(installOf(k), g = { host: null, repos: Object.create(null) });
+    if (e.host) { if (g.host) mergeSeries(g.host, e.host); else g.host = cloneSeries(e.host); }
+    for (const [rk, r] of Object.entries(e.repos)) {
+      if (rk === "__proto__") continue;
+      if (g.repos[rk]) { mergeSeries(g.repos[rk].series, r.series); if (r.repo && !g.repos[rk].repo) g.repos[rk].repo = r.repo; }
+      else g.repos[rk] = { repo: r.repo, remote: r.remote, series: cloneSeries(r.series) };
+    }
+  }
   let host = null;
   const repos = Object.create(null);
+  for (const g of installs.values()) {
+    if (g.host) { if (host) sumSeries(host, g.host); else host = g.host; }
+    for (const [rk, r] of Object.entries(g.repos)) {
+      if (repos[rk]) { sumSeries(repos[rk].series, r.series); if (r.repo && !repos[rk].repo) repos[rk].repo = r.repo; }
+      else repos[rk] = r;
+    }
+  }
   let device = "", siteKey = "", lastSeen = -1, canonKey = keys[0];
   for (const k of keys) {
     const e = hosts[k];
     if (!e) continue;
-    if (e.host) { if (host) mergeSeries(host, e.host); else host = cloneSeries(e.host); }
-    for (const [rk, r] of Object.entries(e.repos)) {
-      if (rk === "__proto__") continue;
-      if (repos[rk]) { mergeSeries(repos[rk].series, r.series); if (r.repo && !repos[rk].repo) repos[rk].repo = r.repo; }
-      else repos[rk] = { repo: r.repo, remote: r.remote, series: cloneSeries(r.series) };
-    }
     // key/device/siteKey all follow the most-recently-seen member so the merged
     // row reads under the host's CURRENT casing AND its current org (XERK-448 D1:
     // a host that changed both casing and org must scope to the new org, or its
@@ -1366,8 +1436,9 @@ function mergeEntries(keys) {
 }
 
 function fold(key, record, now = Date.now(), liveKeys = null) {
-  const entry = hosts[key];
-  if (!entry) return null;
+  // A live host with no entry of its own yet still carries its retired twins'
+  // history (XERK-2868 QA: a renamed host's old era was otherwise shown nowhere).
+  const entry = hosts[key] || null;
   // Case-twin siblings the registry does NOT currently list (truly retired) fold
   // into this live host's card; a sibling STILL in the registry keeps its own card
   // this beat, so merging it here would double the fleet total — hence liveKeys.
@@ -1386,7 +1457,7 @@ function fold(key, record, now = Date.now(), liveKeys = null) {
   }
   // Common case: no case-twin AND nothing lost — serve the record as its agent
   // sent it (one map lookup), exactly as before.
-  if (group.length === 1 && !entry.augments) return null;
+  if (group.length === 1 && (!entry || !entry.augments)) return null;
   const merged = group.length > 1 ? mergeEntries(group) : entry;
   const liveUsage = usageOf(record && record.usage);
   const liveRepos = new Map(reposOf(record && record.repoUsage).map((r) => [r.remoteKey, r]));
@@ -1515,7 +1586,6 @@ function isTenantKeyOf(from, to) {
   return typeof from === "string" && !!from && from !== "__proto__" && typeof to === "string" &&
     !tenantOfHostKey(from) && to.startsWith(from) && TENANT_SUFFIX_RE.test(to.slice(from.length));
 }
-
 /**
  * Move host `from`'s whole history to its tenant key `to` (XERK-2554, migrating a
  * pre-tenancy hub into a tenant). Into an empty `to` the entry moves as-is; into a
@@ -1599,7 +1669,7 @@ load();
 module.exports = {
   ingest, fold, retiredAgents, forget, purgeTenant, has, keys, rekeyHost, rekeysSettled, flush, configure, rehydrate, setHostAliases,
   LEDGER_FILE, LEDGER_MAX, LEDGER_DAYS, LEDGER_HOSTS, LEDGER_REPOS, RETIRED_MAX,
-  LEDGER_MODELS, LEDGER_NAME_MAX, hostShare,
+  LEDGER_MODELS, LEDGER_NAME_MAX, hostShare, STATIC_HOST_ALIASES,
   SYSTEM_USAGE_REPO, isSystemUsageRepo, foldSystemRepos,
   // Test seams: the pure reducers, and a way to start from an empty store.
   _internals: {
