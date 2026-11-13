@@ -29999,6 +29999,25 @@ test("XERK-2510: approving a proposal creates the ticket on the right board, Jir
   cleanup2508(A, ["mtAdo2510"]);
 });
 
+test("XERK-2867: a host that restarted mid-create reports it may have run, and Reopen stays refused", async () => {
+  const S = "mtR2867.atlassian.net";
+  await beat1574("mtRst2867", S);
+  hub.putMeeting(S, okMeeting2510("r1"));
+  assert.equal((await review2510(S, "r1", "p1", { action: "approve", project: "ENG", issueType: "1" })).status, 200);
+  const [c1] = creates2510("mtRst2867");
+  await beat1574("mtRst2867", S, { createTicketResults: [{ cmdId: c1.cmdId, error: "this host restarted while creating the ticket — it may have been created, so check the board before making it again", maybeCreated: true }] });
+  const rv = item2510(S, "r1", "p1").review;
+  assert.deepEqual([rv.state, rv.maybeCreated, /may have been created/.test(rv.error)], ["failed", true, true]);
+  assert.equal((await review2510(S, "r1", "p1", { action: "reopen" })).status, 409);
+  assert.equal(agents.mtRst2867.createResults[c1.cmdId].maybeCreated, true);
+  // A plain tracker refusal still carries no flag, so it stays reopenable.
+  assert.equal((await review2510(S, "r1", "p2", { action: "approve", project: "ENG", issueType: "1" })).status, 200);
+  const c2 = creates2510("mtRst2867").find((c) => c.cmdId !== c1.cmdId);
+  await beat1574("mtRst2867", S, { createTicketResults: [{ cmdId: c2.cmdId, error: "project ENG is archived" }] });
+  assert.equal("maybeCreated" in item2510(S, "r1", "p2").review, false);
+  assert.equal((await review2510(S, "r1", "p2", { action: "reopen" })).status, 200);
+});
+
 test("XERK-2510: a create whose host goes silent fails in honest words; an agent cannot forge a review", async () => {
   const S = "mtF2510.atlassian.net";
   await beat1574("mtFail2510", S);

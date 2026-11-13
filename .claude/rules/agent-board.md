@@ -109,6 +109,11 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
     guessed** (`_azure_mine_identities` reads `System.AssignedTo` off the board's `@Me` WIQL, ahead of
     `AZDO_USER` guesses); `_azure_identity_strings` spells each four ways. An unassigned success warns
     with the tracker's own refusal, never "set `AZDO_USER`".
+- **A create runs at most ONCE per cmdId across manager restarts** (XERK-2867, `_create_once`,
+  `~/.turma/created-commands.json`): `self.acked` is in memory, so a restart (update, rename) between
+  the tracker call and the ack beat let the hub's re-delivery file a second ticket. Marked started
+  BEFORE the call; a re-delivered cmdId re-stages the stored row, or `maybeCreated: true` when the
+  start had no answer (the hub keeps that flag, so Reopen stays refused). Tests: `xerk2867` cases.
 - `set_board_status` **re-reads the available options and applies only a `value` still on offer** —
   the board's workflow decides what a ticket can move to, not the browser.
 - A drag-and-drop move POSTs the target **COLUMN**, not a transition: `_status_option_for_column`

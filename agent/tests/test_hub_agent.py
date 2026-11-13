@@ -6549,6 +6549,7 @@ class ManagerMixin:
             ("PRIORITY_WRITE_LEDGER_PATH", os.path.join(self.tmp, "jira-priority-writes.json")),
             ("DUPLICATE_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-duplicate-links.json")),
             ("BLOCKS_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-blocks-links.json")),
+            ("CREATED_CMDS_PATH", os.path.join(self.tmp, "created-commands.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
@@ -34754,6 +34755,7 @@ class TestReapEndedSessions(unittest.TestCase):
             ("PRIORITY_WRITE_LEDGER_PATH", os.path.join(self.tmp, "jira-priority-writes.json")),
             ("DUPLICATE_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-duplicate-links.json")),
             ("BLOCKS_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-blocks-links.json")),
+            ("CREATED_CMDS_PATH", os.path.join(self.tmp, "created-commands.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
@@ -35139,6 +35141,7 @@ class TestPruneRepo(unittest.TestCase):
             ("PRIORITY_WRITE_LEDGER_PATH", os.path.join(self.tmp, "jira-priority-writes.json")),
             ("DUPLICATE_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-duplicate-links.json")),
             ("BLOCKS_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-blocks-links.json")),
+            ("CREATED_CMDS_PATH", os.path.join(self.tmp, "created-commands.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
@@ -43587,6 +43590,75 @@ class TestStageCreateTicket(ManagerMixin, unittest.TestCase):
                 "labels": ["a"]}
         base.update(kw)
         return base
+
+    def test_xerk2867_a_restarted_manager_never_creates_a_redelivered_ticket_twice(self):
+        # The ack set is in memory, so the hub re-delivers an unacked create after
+        # a restart (an update, a rename); the durable record answers it instead.
+        ok = {"key": "ENG-5", "url": "u", "assigned": True}
+        with self._cfg(), mock.patch.object(ha, "create_board_issue",
+                                            return_value=ok) as f:
+            self.make_manager().handle_commands([self._cmd()])
+            again = self.make_manager()
+            again.handle_commands([self._cmd()])
+        self.assertEqual(f.call_count, 1)
+        self.assertEqual(again.create_ticket_results,
+                         [{"cmdId": "c1", "key": "ENG-5", "url": "u", "error": None,
+                           "warning": None}])
+
+    def test_xerk2867_a_create_cut_short_by_a_restart_answers_may_have_run(self):
+        sm = self.make_manager()
+        sm.created_cmds["c1"] = {"at": 1}     # started, the manager died before answering
+        sm._save_created_cmds()
+        with self._cfg(), mock.patch.object(ha, "create_board_issue") as f:
+            again = self.make_manager()
+            again._stage_create_ticket(self._cmd())
+        f.assert_not_called()
+        r = again.create_ticket_results[0]
+        self.assertEqual((r["cmdId"], r["key"], r["maybeCreated"]), ("c1", None, True))
+        self.assertIn("may have been created", r["error"])
+
+    def test_xerk2867_the_record_is_written_before_the_tracker_call(self):
+        # A manager killed INSIDE the tracker call must not create again on restart.
+        with self._cfg(), mock.patch.object(ha, "create_board_issue",
+                                            side_effect=SystemExit(0)) as f:
+            with self.assertRaises(SystemExit):
+                self.make_manager()._stage_create_ticket(self._cmd())
+            again = self.make_manager()
+            again._stage_create_ticket(self._cmd())
+        self.assertEqual(f.call_count, 1)
+        self.assertEqual(again.create_ticket_results[0]["maybeCreated"], True)
+
+    def test_xerk2867_a_junk_record_is_not_trusted(self):
+        with open(ha.CREATED_CMDS_PATH, "w") as fh:
+            json.dump({"c1": "x", "": {}, "c2": {"row": [1]},
+                       "c3": {"row": {"cmdId": "OTHER", "key": {"x": 1}}},
+                       "c4": {"row": {"cmdId": "OTHER", "key": "ENG-9", "url": "u"}}}, fh)
+        sm = self.make_manager()
+        self.assertEqual(sm.created_cmds, {
+            "c2": {"at": 0}, "c3": {"at": 0},
+            "c4": {"at": 0, "row": {"cmdId": "c4", "key": "ENG-9", "url": "u"}}})
+
+    def test_xerk2867_a_deeply_nested_record_cannot_disable_creates(self):
+        deep = "1"
+        for _ in range(1200):
+            deep = "[" + deep + "]"
+        with open(ha.CREATED_CMDS_PATH, "w") as fh:
+            fh.write('{"c9": {"at": 1, "row": {"key": ' + deep + '}, "x": ' + deep + '}}')
+        ok = {"key": "ENG-5", "url": "u", "assigned": True}
+        with self._cfg(), mock.patch.object(ha, "create_board_issue",
+                                            return_value=ok) as f:
+            sm = self.make_manager()
+            sm.handle_commands([self._cmd()])
+        self.assertEqual(f.call_count, 1)
+        self.assertEqual(sm.create_ticket_results[0]["key"], "ENG-5")
+
+    def test_xerk2867_the_record_is_bounded(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "CREATED_CMDS_MAX", 2):
+            for i in range(4):
+                sm.created_cmds[f"c{i}"] = {"at": i}
+            sm._save_created_cmds()
+        self.assertEqual(list(self.make_manager().created_cmds), ["c2", "c3"])
 
     def test_success_stages_key(self):
         sm = self.make_manager()

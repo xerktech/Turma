@@ -11890,6 +11890,8 @@ function ingestCreateResults(agent, results) {
       // A create that succeeded but couldn't be assigned: a success the client
       // still has to say something about, since the board won't show it.
       warning: r.warning || null, fetchedAt: now,
+      // The agent restarted mid-create (XERK-2867): a ticket may exist.
+      ...(r.maybeCreated === true ? { maybeCreated: true } : {}),
     };
   }
   for (const [k, e] of Object.entries(agent.createResults)) {
@@ -21315,7 +21317,8 @@ function settleMeetingReview(siteKey, rv, now) {
     if (r) {
       if (r.error || !r.key) {
         forgetCreateInFlight(cmdId);
-        return { ...base, state: "failed", at: now, error: r.error || "the tracker named no ticket" };
+        return { ...base, state: "failed", at: now, ...(r.maybeCreated === true ? { maybeCreated: true } : {}),
+          error: r.error || "the tracker named no ticket" };
       }
       refreshOrgBoard(siteKey);
       return { ...base, state: "created", at: now, key: r.key, url: r.url || undefined,
