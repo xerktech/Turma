@@ -50,6 +50,7 @@ import com.xerktech.turma.core.meetingMomentUrl
 import com.xerktech.turma.core.meetingOrgs
 import com.xerktech.turma.core.meetingProject
 import com.xerktech.turma.core.meetingReviewLines
+import com.xerktech.turma.core.meetingMaybeCreated
 import com.xerktech.turma.core.meetingReviewable
 import com.xerktech.turma.core.meetingStatusLine
 import com.xerktech.turma.core.meetingsEmptyText
@@ -213,6 +214,9 @@ internal fun ItemRow(m: Meeting, it: MeetingItem, ui: ItemUi, types: MetaState?,
                     GhostButton("Reject", { onReject(it) }, enabled = !ui.busy)
                 }
             }
+        } else if (meetingMaybeCreated(it) && it.review?.state == "failed") {
+            // Check the board, then put it away: Approve would make a second ticket.
+            GhostButton(if (ui.busy) "Working…" else "Reject", { onReject(it) }, enabled = !ui.busy)
         }
         ui.error?.let { e -> Text(e, color = TurmaColors.critical, style = MaterialTheme.typography.bodySmall) }
     }

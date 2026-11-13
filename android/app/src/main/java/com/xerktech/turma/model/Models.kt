@@ -224,6 +224,8 @@ data class MeetingReview(
     val start: Boolean = false,
     val session: String = "",
     val sessionError: String = "",
+    /** The create may have landed (XERK-2865): the hub refuses Approve and Reopen. */
+    val maybeCreated: Boolean = false,
 )
 
 /** POST /api/orgs/<site>/meetings/<id>/items/<item> body (XERK-2510). */

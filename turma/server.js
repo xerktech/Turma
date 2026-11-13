@@ -5177,12 +5177,14 @@ function sanitizeMeetingReview(v) {
   }
   if (v.state === "failed") {
     out.error = meetingText(v.error, MEETING_ERROR_MAX) || "the ticket could not be created";
-    if (v.maybeCreated === true) out.maybeCreated = true;
   }
-  // A rejected create that may exist keeps the warning to reopen with (XERK-2864).
-  if (v.state === "rejected" && v.maybeCreated === true) {
+  // The create may have landed (XERK-2865): Approve and Reopen are refused, so
+  // a second Approve cannot make a duplicate. A Reject keeps it (and its error).
+  if ((v.state === "failed" || v.state === "rejected") && v.maybeCreated === true) {
     out.maybeCreated = true;
-    out.error = meetingText(v.error, MEETING_ERROR_MAX) || "the ticket may have been created";
+    if (v.state === "rejected") {
+      out.error = meetingText(v.error, MEETING_ERROR_MAX) || "the ticket may have been created";
+    }
   }
   if ((v.state === "creating" || v.state === "created") && v.start === true) {
     out.start = true;
@@ -11973,10 +11975,12 @@ const ASYNC_RESULT_KINDS = new Set(["mergePr"]);
 // A version change wipes every gap up front: an update is the one event that
 // makes what this host can do genuinely unknown again, and re-proving a gap
 // costs a single command.
-function resolveResultWaits(prev, next, commands) {
+function resolveResultWaits(prev, next, commands, dropped = new Set()) {
   if ((prev.agentVersion || null) !== (next.agentVersion || null)) next.unsupported = {};
   const waits = next.resultWaits;
   if (!waits) return;
+  // Withdrawn hub-side, never acked: no evidence either way (XERK-2865).
+  for (const cmdId of dropped) delete waits[cmdId];
   const queued = new Set((commands || []).map((c) => c.cmdId));
   const now = Date.now();
   for (const [cmdId, w] of Object.entries(waits)) {
@@ -21205,6 +21209,10 @@ const MEETING_START_WAIT_MS = 2 * 3600e3;
 // `creating` forever, refusing both Approve and Reject (XERK-2510 QA).
 const MEETING_CREATE_DEADLINE_MS = 15 * 60e3;
 const MEETING_TICKET_DESC_MAX = 8000;
+// A maybe-created review's advice (XERK-2865): clients prefix "Maybe created —".
+const MEETING_CHECK_BOARD = "check the board, and make it there if it is missing";
+const MEETING_MAYBE_CREATED_REFUSAL = "that proposal's ticket may have been created — check the "
+  + "board and make it there if it is missing";
 function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   const refuse = (status, error) => ({ status, body: { error } });
   if (!body || typeof body !== "object" || Array.isArray(body)) return refuse(400, "the body must be an object");
@@ -21225,15 +21233,13 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
     if (cur !== "rejected" && cur !== "failed") {
       return refuse(409, "only a rejected or failed proposal can be reopened");
     }
-    // A create that may have gone through keeps its warning (XERK-2864): wiping
-    // it leaves a clean pending row one Approve from a duplicate ticket. So a
-    // failed one is not reopened (Approve stays possible there, warning shown),
-    // and a rejected one reopens to that warned failure, never to pending.
-    const mc = item.review.maybeCreated === true;
-    if (mc && cur === "failed") {
-      return refuse(409, "that ticket may already exist — check the board, then approve or reject it");
-    }
-    const back = mc ? { state: "failed", at: now, maybeCreated: true, error: item.review.error } : undefined;
+    // A create that may have landed never goes back to pending (XERK-2865): a
+    // rejected one returns to its failed verdict, a failed one stays put.
+    const maybe = item.review.maybeCreated === true;
+    if (maybe && cur === "failed") return refuse(409, MEETING_MAYBE_CREATED_REFUSAL);
+    const back = maybe
+      ? { state: "failed", at: now, maybeCreated: true, error: item.review.error }
+      : undefined;
     const row = putMeeting(siteKey, { ...m, archivedAt: undefined,
       items: m.items.map((i) => (i.id === itemId ? { ...i, review: back } : i)) });
     return row ? { status: 200, body: { ok: true, meeting: meetingWire(row) } }
@@ -21242,6 +21248,8 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   if (cur === "creating") return refuse(409, "that proposal's ticket is already being created");
   if (cur === "created") return refuse(409, `that proposal is already ticket ${item.review.key}`);
   if (cur === "logged") return refuse(409, "that decision is already logged");
+  const maybeCreated = !!item.review && item.review.maybeCreated === true;
+  if (maybeCreated && body.action === "approve") return refuse(409, MEETING_MAYBE_CREATED_REFUSAL);
   const save = (review) => {
     const row = putMeeting(siteKey, { ...m,
       items: m.items.map((i) => (i.id === itemId ? { ...i, review } : i)) });
@@ -21250,9 +21258,10 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   };
   if (body.action === "reject") {
     if (cur === "rejected") return refuse(409, "that proposal is already rejected");
-    const prev = item.review;
-    return save({ state: "rejected", at: now, ...(prev && prev.maybeCreated === true
-      ? { maybeCreated: true, error: prev.error } : {}) });
+    // Rejecting keeps the may-have-been-created verdict, so a later Reopen
+    // cannot clear it (XERK-2865).
+    return save({ state: "rejected", at: now,
+      ...(maybeCreated ? { maybeCreated: true, error: item.review.error } : {}) });
   }
   for (const k of ["title", "description", "project", "issueType"]) {
     if (body[k] != null && typeof body[k] !== "string") return refuse(400, `${k} must be text`);
@@ -21343,8 +21352,7 @@ function settleMeetingReview(siteKey, rv, now) {
       dropQueuedCommand(host, cmdId, "createTicket");
       forgetCreateInFlight(cmdId);
       return { ...base, state: "failed", at: now, maybeCreated: true,
-        error: "the host never reported the create — it may "
-        + "have been created, so check the board before approving again" };
+        error: "the host never reported the create — " + MEETING_CHECK_BOARD };
     }
     if (!a || gap || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) {
       // The GET poll's wording (XERK-241): never claim no ticket exists unless
@@ -21358,10 +21366,8 @@ function settleMeetingReview(siteKey, rv, now) {
           error: gap || "the host went offline before the ticket was created" };
       }
       return { ...base, state: "failed", at: now, maybeCreated: true, error: a
-        ? "the host went silent while creating the ticket — it may have been created, "
-          + "so check the board before approving again"
-        : "the host is gone — the ticket may have been created, "
-          + "so check the board before approving again" };
+        ? "the host went silent while creating the ticket — " + MEETING_CHECK_BOARD
+        : "the host is gone — " + MEETING_CHECK_BOARD };
     }
     return rv;
   }
@@ -24166,10 +24172,17 @@ const server = http.createServer(async (req, res) => {
       // 400ing this host's every beat with the internal error text — XERK-235's
       // offline loop. Filtering rather than tolerating also self-heals the record
       // on the first beat, so a junk element cannot outlive one round trip.
-      const commands = (prev.commands || []).filter(
-        (c) => c && typeof c === "object" && !acked.has(c.cmdId) &&
-          ((typeof c.tenant === "string" ? c.tenant : "") === tenantOfKey(key) ||
-           (!c.tenant && c.type === "setToken" && c.bindTenant === tenantOfKey(key))));
+      // A command of another tenant (one queued before a tenant bind) is dropped
+      // unrun. It was never acked, so its result wait must not read as "acked
+      // with no result" — the too-old-agent verdict (XERK-2865).
+      const tenantDropped = new Set();
+      const commands = (prev.commands || []).filter((c) => {
+        if (!c || typeof c !== "object" || acked.has(c.cmdId)) return false;
+        if ((typeof c.tenant === "string" ? c.tenant : "") === tenantOfKey(key) ||
+            (!c.tenant && c.type === "setToken" && c.bindTenant === tenantOfKey(key))) return true;
+        tenantDropped.add(c.cmdId);
+        return false;
+      });
       delete payload.ackedCommands; // don't persist the transient ack list
       // On-demand session history the agent fetched since the last beat (see
       // the {type:"history"} command); ingested into the cache below, not
@@ -24553,7 +24566,7 @@ const server = http.createServer(async (req, res) => {
       ingestEpicBuilderStatus(key, next);
       // Ordered after every ingest above: an ack settles against what this same
       // beat delivered, which is the whole basis of the gap detection.
-      resolveResultWaits(prev, next, commands);
+      resolveResultWaits(prev, next, commands, tenantDropped);
       // Bound the on-demand caches by BYTES, not just by count (XERK-292). The
       // ingests above cap each cache by entry COUNT (HISTORY_MAX_SESSIONS, …),
       // but AGENT_CACHE_KEYS are excluded from every byte gate a beat passes
@@ -29017,7 +29030,7 @@ if (process.env.TURMA_TEST) {
     getMeetingFocus: () => meetingFocus, meetingFocusCoerce,
     meetingLabelSlug, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
     putMeeting, reviewMeetingItem, settleMeetingReviews, archiveMeeting, meetingDailyOf, keepMeetings, meetingProposalsWire, MEETING_START_WAIT_MS,
-    MEETING_CREATE_DEADLINE_MS, acceptMeeting,
+    MEETING_CREATE_DEADLINE_MS, MEETING_MAYBE_CREATED_REFUSAL, acceptMeeting,
     ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETINGS_PENDING_TOTAL_MAX, MEETINGS_PENDING_HARD_FACTOR, MEETING_RUN_TIMEOUT_MS,
     MEETING_QUEUE_MAX_MS, MEETINGS_KEEP, MEETINGS_AUTO_MODEL, DAILY_BRIEF_RUN_TIMEOUT_MS, DAILY_BRIEF_LATE_MS,
     decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, permissionAnswerKind,

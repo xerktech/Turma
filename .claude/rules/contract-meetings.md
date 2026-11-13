@@ -118,8 +118,12 @@ ticket builds to this file; change it here first.
 - **Missing hub state is "can't tell", never "nothing ran"** (XERK-2865): only a command still
   queued UNDELIVERED proves no ticket (`commandProvablyUnrun`). A gone host record or queued
   command (host removed, hub killed inside the state.json debounce) fails with `maybeCreated:
-  true`, which refuses Reopen. A renamed host is found by its `formerNames` (`meetingReviewHost`).
-  The Board's create poll uses the same proof. Tests: `XERK-2865:` in `server.test.js`.
+  true`. A renamed host is found by its `formerNames` (`meetingReviewHost`).
+  - A `maybeCreated` review refuses Approve and Reopen (409); Reject keeps the flag + error, and
+    a Reopen of that returns it to failed+maybeCreated, never pending. Clients offer Reject only.
+  - A command a tenant bind drops unacked clears its result wait, so it never reads "too old".
+  - The Board's create poll uses the same proof. Tests: `XERK-2865:` in `server.test.js`,
+    `meetings.test.js`, android `MeetingsTest`/`MeetingsScreenTest`.
 - **A `creating` review fails at `MEETING_CREATE_DEADLINE_MS`** (15 min) with no answer: a hub
   killed before the host took the command (debounced queue, unpersisted result caches) otherwise
   left it `creating` forever, refusing both Approve and Reject.
@@ -137,8 +141,8 @@ ticket builds to this file; change it here first.
 - **A create that may have gone through is never reopened** (XERK-2864): a failure the hub cannot
   prove ran nothing (deadline, or a delivered command on a silent host) carries
   `review.maybeCreated: true`, and Reopen answers 409. Reopen wiped the "check the board" warning,
-  leaving a clean pending row one Approve from a duplicate ticket; Approve from the failed row,
-  warning shown, still works. The web hides its Reopen button there.
+  leaving a clean pending row one Approve from a duplicate ticket. Approve is refused too
+  (XERK-2865, QA: it made a second ticket); the operator checks the board, then Rejects.
   - Reject keeps the flag + error, and Reopen of such a rejection returns it to that warned
     `failed` review, never to pending (QA: reject-then-reopen was the bypass).
 

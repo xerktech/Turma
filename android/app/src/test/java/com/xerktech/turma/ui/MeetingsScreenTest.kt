@@ -3,6 +3,7 @@ package com.xerktech.turma.ui
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.hasScrollToIndexAction
@@ -200,6 +201,31 @@ class MeetingsScreenTest {
         compose.onNodeWithText("Working…").assertIsNotEnabled()
         release.countDown()
         compose.waitUntil(10_000) { vm.busy.value.isEmpty() }
+    }
+
+    @Test fun `a proposal whose ticket may exist offers Reject only`() {
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [ { "key": "ENG", "name": "Engineering" } ] }""")
+        hub.seedFleet("""
+            { "now": 1, "agents": [ $host ], "meetingProposals": { "$site": [
+              { "meetingId": "m3", "status": "ok", "title": "Planning", "platform": "Zoom",
+                "startedAt": 1700000000000, "endedAt": 1700002700000, "participants": [], "items": [
+                  { "id": "p1", "kind": "task", "title": "Write the doc", "description": "",
+                    "review": { "state": "failed", "at": 5, "maybeCreated": true,
+                      "error": "the host is gone — the ticket may have been created" } } ] } ] } }
+        """.trimIndent())
+        val posted = java.util.concurrent.atomic.AtomicReference<String>()
+        hub.route("/api/orgs/") { req ->
+            posted.set(req.body.readUtf8())
+            okhttp3.mockwebserver.MockResponse().setBody("""{ "ok": true }""")
+        }
+        val vm = main.track(MeetingsViewModel(hub.app))
+        show(vm)
+        compose.onNodeWithText("Maybe created — the host is gone — the ticket may have been created").assertExists()
+        compose.onAllNodesWithText("Approve").assertCountEquals(0)
+        compose.onAllNodesWithText("Edit").assertCountEquals(0)
+        compose.onNodeWithText("Reject").performScrollTo().performClick()
+        compose.waitUntil(10_000) { posted.get() != null }
+        org.junit.Assert.assertTrue(posted.get(), posted.get().contains("\"action\":\"reject\""))
     }
 
     @Test fun `an org with no meetings says nothing needs review`() {

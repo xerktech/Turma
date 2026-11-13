@@ -1025,6 +1025,8 @@ those are marked `[MODEL]`.
 ### Meetings review (Brief tab, XERK-2510 / XERK-2858)
 - **At parity (XERK-2511, XERK-2858)**: Approve / Approve + start / Edit / Reject / Log decision /
   Reopen, the same review states and refusal words. `meetingProposals` decodes PER MEETING.
+- A proposal whose ticket may exist (`review.maybeCreated`, XERK-2865) reads "Maybe created — …"
+  and offers Reject only, on both; Reopen of that rejection returns it to the warning.
 - Platform differences: a created ticket's key and a "May duplicate" key are text, not board
   links; quote/Tenir links open the system browser.
 - Phone-only: the "N proposals from <meeting>" push (channel "Meeting proposals"); a tap opens

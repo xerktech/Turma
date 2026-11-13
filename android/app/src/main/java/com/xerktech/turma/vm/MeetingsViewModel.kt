@@ -8,6 +8,7 @@ import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.core.CreateMetaFetch
 import com.xerktech.turma.core.meetingDefaultType
 import com.xerktech.turma.core.meetingProject
+import com.xerktech.turma.core.meetingMaybeCreated
 import com.xerktech.turma.core.meetingReviewable
 import com.xerktech.turma.core.meetingTicketDescription
 import com.xerktech.turma.model.CreateProject
@@ -195,7 +196,10 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
     fun review(siteKey: String, m: Meeting, it: MeetingItem, action: String, start: Boolean = false): Job =
         viewModelScope.launch {
             val key = itemKey(siteKey, m.meetingId, it.id)
-            if (key in _busy.value || !meetingReviewable(it)) return@launch
+            // A maybe-created proposal may only be put away (XERK-2865).
+            val allowed = meetingReviewable(it) ||
+                (action == "reject" && meetingMaybeCreated(it) && it.review?.state == "failed")
+            if (key in _busy.value || !allowed) return@launch
             // Busy from the FIRST await, not the POST (XERK-2511 QA): while the
             // project's types load, a Reject pressed now must not post first and
             // then be overtaken by this Approve, creating a ticket it rejected.
