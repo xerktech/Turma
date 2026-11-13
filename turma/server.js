@@ -8562,6 +8562,7 @@ function runHostMerges() {
     // renames (usage-ledger `mergeEntries`), and a stored sum would double-count on
     // any rerun (QA). Only a pre-tenancy row joins its own name's tenant key
     // (the XERK-2554 re-key, high-water: the same install), so the fold can see it.
+    const hadUsage = usageLedger.has(from);
     const usage = rescope ? usageLedger.rekeyHost(from, tenantHostKey(from, rescope), { siteKey: site }) : false;
     const perms = permissionLedger.rekeyHost(from, to, { rename: true });
     const outcomes = outcomeLedger.rekey((h) => (h === from ? to : null),
@@ -8579,7 +8580,7 @@ function runHostMerges() {
     if (pins) pinsMoved = true;
     moved += (usage ? 1 : 0) + perms + outcomes + rows + pins;
     if (usage || perms || outcomes || rows || pins) {
-      console.log(`host merge: ${logName(from)} -> ${logName(to)}: usage ${usage ? "re-keyed into the tenant" : "kept (summed on display)"}, ` +
+      console.log(`host merge: ${logName(from)} -> ${logName(to)}: usage ${usage ? "re-keyed into the tenant" : hadUsage ? "kept (summed on display)" : "none"}, ` +
         `${perms} permission row(s), ${outcomes} outcome row(s), ${rows} archived session(s), ${pins} ticket pin(s)`);
       invalidateAgentsCache();
     }
