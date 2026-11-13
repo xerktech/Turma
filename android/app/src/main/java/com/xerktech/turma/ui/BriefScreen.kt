@@ -689,9 +689,11 @@ private fun OrgSettings(
                 val body = stored[k("focus")]?.body ?: return@LaunchedEffect
                 val f = body.obj("focus")
                 val cleared = body["focus"] is JsonNull
-                namesD.stored(if (cleared) "" else (f?.get("names") as? JsonArray)
+                val a = namesD.stored(if (cleared) "" else (f?.get("names") as? JsonArray)
                     ?.mapNotNull { (it as? JsonPrimitive)?.content }?.joinToString("\n"))
-                roleD.stored(if (cleared) "" else f?.str("role"))
+                val b = roleD.stored(if (cleared) "" else f?.str("role"))
+                // "Saved" never sits beside text the hub has not seen.
+                if (!(a && b)) mvm.clearSaved(site, "focus")
             }
             SaveRow("focus", k("focus") in saving, k("focus") in saved) {
                 namesD.send(); roleD.send()
@@ -707,7 +709,9 @@ private fun OrgSettings(
             LaunchedEffect(stored[k("label")]?.seq) {
                 val body = stored[k("label")]?.body ?: return@LaunchedEffect
                 val custom = (body["custom"] as? JsonPrimitive)?.booleanOrNull
-                ownD.stored(if (custom == null) null else if (custom) body.str("label") else "")
+                if (!ownD.stored(if (custom == null) null else if (custom) body.str("label") else "")) {
+                    mvm.clearSaved(site, "label")
+                }
             }
             Text(
                 when {
@@ -770,12 +774,16 @@ private fun ScheduleSection(
         val body = stored?.body ?: return@LaunchedEffect
         // An answer with no schedule still marks the fields clean, as typed.
         val sc = body.obj("schedule")
-        enabledD.stored((sc?.get("enabled") as? JsonPrimitive)?.booleanOrNull)
-        timeD.stored(sc?.str("time"))
-        zoneD.stored(sc?.str("timeZone"))
-        daysD.stored((sc?.get("weekdays") as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.intOrNull })
-        leadD.stored((sc?.get("leadMinutes") as? JsonPrimitive)?.intOrNull?.toString())
-        titleD.stored(if (sc == null) null else sc.str("meetingTitle") ?: "")
+        val clean = listOf(
+            enabledD.stored((sc?.get("enabled") as? JsonPrimitive)?.booleanOrNull),
+            timeD.stored(sc?.str("time")),
+            zoneD.stored(sc?.str("timeZone")),
+            daysD.stored((sc?.get("weekdays") as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.intOrNull }),
+            leadD.stored((sc?.get("leadMinutes") as? JsonPrimitive)?.intOrNull?.toString()),
+            titleD.stored(if (sc == null) null else sc.str("meetingTitle") ?: ""),
+        ).all { it }
+        // "Saved" never sits beside text the hub has not seen.
+        if (!clean) onEdit()
     }
     Text(
         nextBriefMeeting(s, now)?.let { "Next meeting " + briefWhenLabel(it, now, ZoneId.systemDefault(), Locale.getDefault()) }
@@ -867,13 +875,18 @@ private class Draft<T : Any>(
         sent.value = draft.value
     }
 
-    /** The hub's stored value for this field, or null when its answer did not carry one. */
-    fun stored(v: T?) {
-        val was = sent.value ?: return
+    /**
+     * The hub's stored value for this field, or null when its answer did not
+     * carry one. False when the field was typed into while the save was in
+     * flight, so it holds text the hub has not seen.
+     */
+    fun stored(v: T?): Boolean {
+        val was = sent.value ?: return !edited.value
         sent.value = null
-        if (draft.value != was) return // typed into while the save was in flight
+        if (draft.value != was) return false
         if (v != null) draft.value = v
         edited.value = false
+        return true
     }
 }
 
@@ -882,7 +895,8 @@ private fun <T : Any> rememberDraft(site: String, remote: T): Draft<T> {
     val d = Draft(
         rememberSaveable(site) { mutableStateOf(remote) },
         rememberSaveable(site) { mutableStateOf(false) },
-        remember(site) { mutableStateOf<T?>(null) },
+        // Saveable too: a rotation mid-save must still mark the field clean (QA).
+        rememberSaveable(site) { mutableStateOf<T?>(null) },
     )
     LaunchedEffect(remote) { d.follow(remote) }
     return d

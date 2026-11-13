@@ -260,5 +260,46 @@ class BriefScreenTest {
         }
         compose.onNodeWithText("0700").assertExists()
         compose.onNodeWithText("08:00").assertDoesNotExist()
+        // The field holds text the hub has not seen, so the section is not "Saved".
+        compose.onNodeWithTag("save-schedule").performScrollTo()
+        compose.onAllNodesWithText("Saved").assertCountEquals(1) // the focus section's only
+    }
+
+    @Test fun `a label save shows the label as the hub stored it`() {
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [] }""")
+        hub.json("/api/orgs/$site/meeting-label", """{ "ok": true, "label": "qa-team", "custom": true }""")
+        hub.seedFleet("""{ "now": 1, "agents": [ $host ], "meetingLabels": { "$site": { "label": "o", "custom": false } } }""")
+        show(mvm = main.track(MeetingsViewModel(hub.app)))
+        compose.onNodeWithContentDescription("o settings").performClick()
+        compose.onNodeWithText("Label (blank = default)").performScrollTo().performTextReplacement("  QA-Team ")
+        compose.onNodeWithTag("save-label").performScrollTo().performClick()
+        compose.waitUntil(5_000) { compose.onAllNodesWithText("qa-team").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Saved").assertExists()
+    }
+
+    @Test fun `a rotation while a save is in flight still marks the field clean`() {
+        // XERK-2858 QA: what a field sent must survive a rotation, or the answer
+        // leaves it "edited" for good and a later save overwrites other clients.
+        val release = java.util.concurrent.CountDownLatch(1)
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [] }""")
+        hub.route("/api/orgs/$site/daily-brief/schedule") {
+            release.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            okhttp3.mockwebserver.MockResponse().setHeader("Content-Type", "application/json").setBody(
+                """{ "ok": true, "schedule": { "enabled": true, "time": "10:15", "timeZone": "UTC",
+                    "weekdays": [0,1,2,3,4,5,6], "leadMinutes": 5, "meetingTitle": "standup" } }""")
+        }
+        hub.seedFleet("""{ "now": 1, "agents": [ $host ], "dailyBriefSchedules": { "$site": $schedule } }""")
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        val vm = main.track(BriefViewModel(hub.app))
+        val restore = androidx.compose.ui.test.junit4.StateRestorationTester(compose)
+        restore.setContent { BriefScreen(vm = vm, meetingsVm = mvm) }
+        compose.onNodeWithContentDescription("o settings").performClick()
+        compose.onNodeWithText("23:59").performScrollTo().performTextReplacement("1015")
+        compose.onNodeWithTag("save-schedule").performScrollTo().performClick()
+        compose.waitUntil(5_000) { mvm.saving.value.isNotEmpty() }
+        restore.emulateSavedInstanceStateRestore()
+        release.countDown()
+        compose.waitUntil(10_000) { mvm.saving.value.isEmpty() }
+        compose.waitUntil(5_000) { compose.onAllNodesWithText("10:15").fetchSemanticsNodes().isNotEmpty() }
     }
 }
