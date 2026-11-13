@@ -20925,20 +20925,27 @@ function meetingFromBody(body, now) {
 
 // Is this new meeting the org's daily one (XERK-2856)? Decided once, at
 // admission (never on restore): M is the org's scheduled meeting instant nearest
-// `startedAt` (the schedule's zone and weekdays; `enabled` or not — the schedule
-// still names when the meeting is). Daily when it started within
-// [M - MEETING_DAILY_BEFORE_MS, M + MEETING_DAILY_AFTER_MS], or its title holds
-// the schedule's `meetingTitle`. -> {meetingAt, briefRunId?} or null.
+// `startedAt` (a STORED, ENABLED schedule's zone and weekdays — never the
+// default). Daily when it started within [M - MEETING_DAILY_BEFORE_MS,
+// M + MEETING_DAILY_AFTER_MS], or its title holds the stored schedule's
+// `meetingTitle` (enabled or not). -> {meetingAt, briefRunId?} or null.
 const MEETING_DAILY_BEFORE_MS = 20 * 60e3;
 const MEETING_DAILY_AFTER_MS = 60 * 60e3;
 const MEETING_DAILY_BRIEF_LOOKBACK_MS = 24 * 3600e3;
 function meetingDailyOf(siteKey, row) {
-  const s = sanitizeDailyBriefSchedule(dailyBriefScheduleOf(siteKey));
+  // Only a STORED schedule counts — never the unstored default, which every org
+  // runs on and so would tag any 9am meeting daily (XERK-2856 QA).
+  const s = Object.hasOwn(dailyBriefSchedules, siteKey)
+    ? sanitizeDailyBriefSchedule(dailyBriefSchedules[siteKey]) : null;
   if (!s) return null;
   const at = row.startedAt;
   let M = null;
-  for (const t of dailyBriefMeetings(s, at, -1, 1, 3)) {
-    if (M === null || Math.abs(t - at) < Math.abs(M - at)) M = t;
+  // The time window needs the schedule ENABLED (an opt-out names no meeting);
+  // the title keyword is the operator's explicit pick, so it counts regardless.
+  if (s.enabled) {
+    for (const t of dailyBriefMeetings(s, at, -1, 1, 3)) {
+      if (M === null || Math.abs(t - at) < Math.abs(M - at)) M = t;
+    }
   }
   const byTime = M !== null && at >= M - MEETING_DAILY_BEFORE_MS && at <= M + MEETING_DAILY_AFTER_MS;
   const byTitle = !!s.meetingTitle && row.title.toLowerCase().includes(s.meetingTitle.toLowerCase());

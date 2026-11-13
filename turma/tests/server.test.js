@@ -30949,7 +30949,7 @@ test("XERK-2684: the scoped-payload memo is bounded by bytes, not entry count", 
 
 // ---- XERK-2856: Meetings — archive, reopen, the daily meeting ----------------------
 // Wed 2025-11-12, 09:00 in Chicago (CST) = 15:00Z: the org's scheduled standup.
-const CHI2856 = { enabled: false, time: "09:00", timeZone: "America/Chicago",
+const CHI2856 = { enabled: true, time: "09:00", timeZone: "America/Chicago",
   weekdays: [1, 2, 3, 4, 5], leadMinutes: 5, model: "auto" };
 const M2856 = Date.parse("2025-11-12T15:00:00Z");
 const brief2856 = (runId, extra = {}) => hub.sanitizeDailyBrief({ runId, status: "ok",
@@ -30968,7 +30968,7 @@ test("XERK-2856: the daily meeting is tagged by the schedule's time window, loca
   const daily = (startedAt, title = "Sync") => hub.meetingDailyOf(S, { startedAt, title });
   assert.equal(daily(M2856), null, "no schedule stored (the shared hub runs no default): not daily");
   hub.getDailyBriefSchedules()[S] = hub.sanitizeDailyBriefSchedule(CHI2856);
-  // Disabled still names when the meeting is. The window is [M - 20min, M + 60min].
+  // The window is [M - 20min, M + 60min].
   for (const [at, want] of [[M2856, M2856], [M2856 - 20 * 60e3, M2856], [M2856 + 60 * 60e3, M2856],
     [M2856 - 20 * 60e3 - 1, null], [M2856 + 60 * 60e3 + 1, null],
     // Saturday 2025-11-15 09:00 Chicago: not a scheduled weekday.
@@ -30991,6 +30991,41 @@ test("XERK-2856: the daily meeting is tagged by the schedule's time window, loca
   assert.deepEqual(daily(odd, "Team Stand-up (daily)"), { meetingAt: odd });
   assert.equal(daily(odd, "Retro"), null);
   delete hub.getDailyBriefSchedules()[S];
+});
+
+test("XERK-2856: only a stored, enabled schedule tags by time; the title keyword counts regardless", () => {
+  const S = "dyD2856.atlassian.net";
+  const daily = (startedAt, title = "Acme client sync") => hub.meetingDailyOf(S, { startedAt, title });
+  // The unstored default (09:00 New York, Mon-Fri) never tags: a 09:30 NY client call is not a standup.
+  hub.__setDailyBriefDefault(hub.DAILY_BRIEF_DEFAULT_SCHEDULE);
+  try {
+    assert.equal(daily(Date.parse("2025-11-12T14:30:00Z")), null, "default schedule: not daily");
+  } finally {
+    hub.__setDailyBriefDefault(null);
+  }
+  // An opted-out schedule names no meeting time, but its title keyword still applies.
+  hub.getDailyBriefSchedules()[S] = hub.sanitizeDailyBriefSchedule({ ...CHI2856, enabled: false,
+    meetingTitle: "standup" });
+  assert.equal(daily(M2856 + 40 * 60e3), null, "enabled:false: not daily by time");
+  assert.deepEqual(daily(M2856 + 40 * 60e3, "Team Standup"), { meetingAt: M2856 + 40 * 60e3 },
+    "enabled:false: still daily by title");
+  delete hub.getDailyBriefSchedules()[S];
+});
+
+test("XERK-2856: a Tenir POST can store neither daily nor archivedAt", async () => {
+  const S = "dyF2856.atlassian.net";
+  await beat1574("dyFHost2856", S); // no meetings capability: the row stays queued, nothing settles
+  // A stored schedule, but this meeting is neither in its window nor titled for it.
+  hub.getDailyBriefSchedules()[S] = hub.sanitizeDailyBriefSchedule({ ...CHI2856, meetingTitle: "Standup" });
+  const at = M2856 + 5 * 3600e3;
+  const r = await postMeeting2508(S, meeting2508("f1", { title: "Retro", startedAt: at, endedAt: at + 9e5,
+    daily: { meetingAt: M2856, briefRunId: "ab" }, archivedAt: 5 }));
+  assert.equal(r.status, 200);
+  const row = hub.getMeetings()[S].find((m) => m.meetingId === "f1");
+  assert.equal(row.status, "queued");
+  assert.deepEqual(["daily" in row, "archivedAt" in row], [false, false]);
+  delete hub.getDailyBriefSchedules()[S];
+  cleanup2508(S, ["dyFHost2856"]);
 });
 
 test("XERK-2856: the daily link names the meeting's brief, newest ok first, else one from the last day", () => {
@@ -31027,7 +31062,7 @@ test("XERK-2856: admission tags the daily meeting; Tenir can't set it, never see
     assert.match(r.body.error, /meetingTitle/);
   }
   assert.equal((await put({ ...CHI2856, meetingTitle: "  Stand\u0007up‮  " })).body.schedule.meetingTitle, "Standup");
-  assert.equal((await put({ enabled: false })).body.schedule.meetingTitle, "Standup", "a PUT merges");
+  assert.equal((await put({ leadMinutes: 10 })).body.schedule.meetingTitle, "Standup", "a PUT merges");
   const fleet = await request("GET", "/api/agents", { headers: userHeaders });
   assert.equal(fleet.body.dailyBriefSchedules[S].meetingTitle, "Standup");
   assert.equal("meetingTitle" in (await put({ meetingTitle: "" })).body.schedule, false, '"" clears it');

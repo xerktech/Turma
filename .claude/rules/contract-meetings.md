@@ -138,9 +138,12 @@ ticket builds to this file; change it here first.
   - `archivedAt` (epoch ms) on a SETTLED row only; re-archiving keeps the first; `false` deletes it.
 - **`daily: {meetingAt, briefRunId?}`** is decided ONCE, at Tenir's POST (`meetingDailyOf`), never
   on restore or by Tenir's body (`meetingFromBody` drops a sent `daily`/`archivedAt`).
-  - M = the org's scheduled meeting nearest `startedAt` (`dailyBriefScheduleOf`, its zone and LOCAL
-    weekdays, `enabled` ignored). Daily when `startedAt` ∈ [M − 20 min, M + 60 min], or the title
-    contains the schedule's `meetingTitle` (case-insensitive).
+  - Only a STORED schedule counts, never `DAILY_BRIEF_DEFAULT_SCHEDULE`: every org runs on the
+    default, so it tagged any 9am NY meeting daily (QA).
+  - By time, only when that schedule is `enabled`: M = its meeting nearest `startedAt` (its zone
+    and LOCAL weekdays); daily when `startedAt` ∈ [M − 20 min, M + 60 min]. An opt-out names no time.
+  - By title, enabled or not: the title contains the stored `meetingTitle` (case-insensitive) —
+    the operator's explicit pick.
   - `meetingAt` = M on a time match, else the meeting's `startedAt`.
   - `briefRunId` = the org's brief whose `meetingAt === M` (newest ok first, else newest), else
     the newest `ok` brief generated in the 24h before `startedAt`; absent when none.
