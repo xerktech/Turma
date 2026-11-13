@@ -1292,6 +1292,14 @@ const STATIC_HOST_ALIASES = [
 // folded name -> its group's canonical folded name (the smallest member, so the
 // answer never depends on rename order or a rename back to an old name).
 let hostAliasRoots = new Map();
+// The static renames by bare name, applied inside ANY tenant: those machines were
+// bound into a tenant by the pre-tenancy migration (XERK-2554), so their keys
+// carry `@<tenant>` and a plain-name lookup alone missed them.
+const staticAliasRoots = new Map();
+for (const [a, b] of STATIC_HOST_ALIASES) {
+  const [lo, hi] = [a.toLowerCase(), b.toLowerCase()].sort();
+  staticAliasRoots.set(hi, lo);
+}
 function setHostAliases(pairs) {
   const parent = new Map();
   const find = (x) => {
@@ -1327,11 +1335,16 @@ setHostAliases([]);
 function foldKey(k) {
   const raw = String(k == null ? "" : k);
   const f = raw.toLowerCase();
-  const root = hostAliasRoots.get(f) || f;
+  const t = tenantOfHostKey(raw);
+  let root = hostAliasRoots.get(f);
+  if (!root && t) {
+    const base = f.slice(0, -33);
+    root = staticAliasRoots.has(base) ? staticAliasRoots.get(base) + f.slice(-33) : f;
+  }
+  root = root || f;
   // The tenant (read off the key as typed, XERK-2550) leads a tenant key's fold,
   // so no case twin or alias can fold one tenant's spend into another's — or an
   // untenanted name that merely lowercases into a tenant key's shape into it.
-  const t = tenantOfHostKey(raw);
   return t ? `${t}\u0000${root}` : root;
 }
 
@@ -1515,19 +1528,32 @@ function isTenantKeyOf(from, to) {
   return typeof from === "string" && !!from && from !== "__proto__" && typeof to === "string" &&
     !tenantOfHostKey(from) && to.startsWith(from) && TENANT_SUFFIX_RE.test(to.slice(from.length));
 }
+// Whether `from` may be MERGED into another host's key `to` (a renamed host,
+// `opts.rename`): never out of a tenant or into another tenant — an untenanted
+// name's history may only join a host of its own world or the tenant it migrated
+// into, which the caller decides.
+function isRenameOf(from, to) {
+  if (typeof from !== "string" || !from || from === "__proto__" || typeof to !== "string" || !to ||
+      to === "__proto__" || from === to) return false;
+  const tf = tenantOfHostKey(from);
+  return !tf || tf === tenantOfHostKey(to);
+}
 
 /**
  * Move host `from`'s whole history to its tenant key `to` (XERK-2554, migrating a
  * pre-tenancy hub into a tenant). Into an empty `to` the entry moves as-is; into a
  * `to` that already holds history the two merge by the HIGH-WATER rule
  * (`mergeTwoEntries`: per-day max, never a sum — they are one machine's spend).
+ * `opts.rename` instead moves it to ANOTHER host's key (a renamed host merged into
+ * the name it beats as now, same high-water rule; `isRenameOf`).
  * `opts.siteKey`, when a string, replaces the entry's org label (the caller scopes
  * it into the tenant too). `to` is persisted BEFORE `from` is dropped, so a crash in
  * between leaves a duplicate the next run merges away, never a loss. Returns
  * whether anything moved; a rerun finds `from` gone and moves nothing.
  */
 function rekeyHost(from, to, opts = {}) {
-  if (!isTenantKeyOf(from, to) || !Object.prototype.hasOwnProperty.call(hosts, from)) return false;
+  const allowed = opts && opts.rename ? isRenameOf(from, to) : isTenantKeyOf(from, to);
+  if (!allowed || !Object.prototype.hasOwnProperty.call(hosts, from)) return false;
   const src = hosts[from];
   const dst = Object.prototype.hasOwnProperty.call(hosts, to) ? hosts[to] : null;
   const entry = dst ? mergeTwoEntries(dst, src) : src;
@@ -1556,7 +1582,7 @@ load();
 module.exports = {
   ingest, fold, retiredAgents, forget, purgeTenant, has, keys, rekeyHost, flush, configure, rehydrate, setHostAliases,
   LEDGER_FILE, LEDGER_MAX, LEDGER_DAYS, LEDGER_HOSTS, LEDGER_REPOS, RETIRED_MAX,
-  LEDGER_MODELS, LEDGER_NAME_MAX, hostShare,
+  LEDGER_MODELS, LEDGER_NAME_MAX, hostShare, STATIC_HOST_ALIASES,
   SYSTEM_USAGE_REPO, isSystemUsageRepo, foldSystemRepos,
   // Test seams: the pure reducers, and a way to start from an empty store.
   _internals: {

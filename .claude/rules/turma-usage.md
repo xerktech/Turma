@@ -192,6 +192,16 @@ paths:
   Same high-water rule; retired members fold only into a group's ONE live member (with two live,
   e.g. an old name re-registered by another machine, they stay retired rows — never counted twice).
   Tests: the `XERK-2381:` cases in `usage-ledger.test.js`.
+- **`STATIC_HOST_ALIASES` match by BARE name inside any tenant** (XERK-2868): the pre-tenancy
+  migration put those machines under `<name>@<tenant>`, and a plain-key lookup missed them, so
+  the old name read as a removed host.
+- **The static renames are MERGED, not only folded** (XERK-2868, `hostMergeTick`, leader, every
+  10 min): each old name's usage, permission, outcome and archive rows are re-keyed onto the one
+  host answering to the new name (`rekeyHost(..., {rename:true})`, `outcomeLedger.rekey`,
+  `archive.rekeyOwner`), each by its own merge rule — nothing is dropped.
+  - Never while the old name still runs (a live record or an identity homed there), never across
+    tenants; an untenanted old name joining a tenant host takes its org into the tenant.
+  - Waits for HA's outcome rescan (`outcomeLedger.isLoaded`). Tests: `host-merge.test.js`.
 
 ### HA: the Postgres of-record backend (XERK-779, epic XERK-775; was Valkey XERK-758)
 
