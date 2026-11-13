@@ -181,4 +181,40 @@ class BriefScreenTest {
         assertEquals("✗ Saving the Tenir label failed — the org acme already has that meeting label", message())
         assertTrue(mvm.saved.value.isEmpty())
     }
+
+    @Test fun `a settings field follows the hub until edited, and again once saved`() {
+        // XERK-2858 QA: an edit survives a change made elsewhere, an untouched
+        // field follows it, and a save the hub rewrote ("0930" -> "09:30") must
+        // not pin the field to the typed text and overwrite a later change.
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [] }""")
+        hub.json("/api/orgs/$site/daily-brief/schedule", """{ "ok": true }""")
+        hub.seedFleet("""
+            { "now": 1, "agents": [ $host ], "dailyBriefSchedules": { "$site": $schedule },
+              "meetingFocus": { "$site": { "names": ["Ann"], "role": "dev" } } }
+        """.trimIndent())
+        val fleet = hub.container.fleet
+        show(mvm = main.track(MeetingsViewModel(hub.app)))
+        compose.onNodeWithContentDescription("o settings").performClick()
+
+        compose.onNodeWithText("Ann").performTextReplacement("Zed Draft")
+        fleet.onSseEvent("meetingFocus", """{ "$site": { "names": ["Bo"], "role": "PM" } }""")
+        compose.waitUntil(5_000) { compose.onAllNodesWithText("PM").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Zed Draft").assertExists() // edited: kept
+        compose.onNodeWithText("Bo").assertDoesNotExist()
+
+        compose.onNodeWithText("23:59").performScrollTo().performTextReplacement("2300")
+        compose.onNodeWithTag("save-schedule").performScrollTo().performClick()
+        assertEquals("\"23:00\"", TurmaJson.parseToJsonElement(
+            hub.findRequest("/daily-brief/schedule").body.readUtf8()).jsonObject["time"].toString())
+        compose.waitUntil(5_000) { compose.onAllNodesWithText("23:00").fetchSemanticsNodes().isNotEmpty() }
+        // Another client sets 10:00: the hub serves it from now on, so a poll the
+        // save nudged (possibly still answering the old fixture) settles on it.
+        hub.json("/api/agents", """
+            { "now": 2, "agents": [ $host ], "dailyBriefSchedules": { "$site": { "enabled": true,
+              "time": "10:00", "timeZone": "UTC", "weekdays": [1], "leadMinutes": 5 } } }
+        """.trimIndent())
+        fleet.onSseEvent("dailyBriefSchedules", """{ "$site": { "enabled": true, "time": "10:00",
+            "timeZone": "UTC", "weekdays": [1], "leadMinutes": 5 } }""")
+        compose.waitUntil(15_000) { compose.onAllNodesWithText("10:00").fetchSemanticsNodes().isNotEmpty() }
+    }
 }

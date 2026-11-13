@@ -661,8 +661,10 @@ private fun OrgSettings(
             // Whose work (XERK-2514): one name per line, since a name may hold a comma.
             SectionLabel("Whose work")
             val focus = fleet.meetingFocus[site]
-            var names by rememberDraft(site, focus?.names.orEmpty().joinToString("\n"))
-            var role by rememberDraft(site, focus?.role.orEmpty())
+            val namesD = rememberDraft(site, focus?.names.orEmpty().joinToString("\n"))
+            val roleD = rememberDraft(site, focus?.role.orEmpty())
+            var names by namesD
+            var role by roleD
             Text(
                 "Meetings propose only these people's work (a decision always stays). Empty = everyone's.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -675,12 +677,21 @@ private fun OrgSettings(
                 role, { role = it.take(300); mvm.clearSaved(site, "focus") }, Modifier.fillMaxWidth(),
                 label = { Text("Role (optional)") }, singleLine = true,
             )
+            // Once the hub took a save, show what it stores (trimmed, one per name).
+            LaunchedEffect(k("focus") in saved) {
+                if (k("focus") in saved) {
+                    namesD.saved(focusNames(names).joinToString("\n"))
+                    roleD.saved(role.trim())
+                }
+            }
             SaveRow("focus", k("focus") in saving, k("focus") in saved) { mvm.saveFocus(site, focusNames(names), role) }
 
             // Tenir label (XERK-2638): blank goes back to the default slug.
             SectionLabel("Tenir label")
             val label = fleet.meetingLabels[site]
-            var own by rememberDraft(site, if (label?.custom == true) label.label else "")
+            val ownD = rememberDraft(site, if (label?.custom == true) label.label else "")
+            var own by ownD
+            LaunchedEffect(k("label") in saved) { if (k("label") in saved) ownD.saved(own.trim().lowercase()) }
             Text(
                 when {
                     label == null -> "Tenir names this org by a label; this hub has not said which yet."
@@ -724,12 +735,25 @@ private fun ScheduleSection(
     onSave: (kotlinx.serialization.json.JsonObject) -> Unit,
 ) {
     SectionLabel("Daily brief")
-    var enabled by rememberDraft(site, s?.enabled ?: false)
-    var time by rememberDraft(site, s?.time?.ifEmpty { null } ?: "09:30")
-    var zone by rememberDraft(site, s?.timeZone?.ifEmpty { null } ?: ZoneId.systemDefault().id)
-    var days by rememberDraft(site, s?.weekdays ?: listOf(1, 2, 3, 4, 5))
-    var lead by rememberDraft(site, (s?.leadMinutes ?: 5).toString())
-    var title by rememberDraft(site, s?.meetingTitle.orEmpty())
+    val enabledD = rememberDraft(site, s?.enabled ?: false)
+    val timeD = rememberDraft(site, s?.time?.ifEmpty { null } ?: "09:30")
+    val zoneD = rememberDraft(site, s?.timeZone?.ifEmpty { null } ?: ZoneId.systemDefault().id)
+    val daysD = rememberDraft(site, s?.weekdays ?: listOf(1, 2, 3, 4, 5))
+    val leadD = rememberDraft(site, (s?.leadMinutes ?: 5).toString())
+    val titleD = rememberDraft(site, s?.meetingTitle.orEmpty())
+    var enabled by enabledD
+    var time by timeD
+    var zone by zoneD
+    var days by daysD
+    var lead by leadD
+    var title by titleD
+    // Once the hub took a save, every field is clean and shows what it stores.
+    LaunchedEffect(done) {
+        if (done) {
+            enabledD.saved(enabled); timeD.saved(scheduleTime(time)); zoneD.saved(zone.trim())
+            daysD.saved(days); leadD.saved(lead); titleD.saved(title.trim())
+        }
+    }
     Text(
         nextBriefMeeting(s, now)?.let { "Next meeting " + briefWhenLabel(it, now, ZoneId.systemDefault(), Locale.getDefault()) }
             ?: "No meeting scheduled",
@@ -793,17 +817,35 @@ internal fun scheduleTime(text: String): String {
 }
 
 /**
- * A settings field's draft: it follows the hub's value until the operator
+ * A settings field's draft (QA): it follows the hub's value until the operator
  * edits it, then keeps the edit when the value changes elsewhere (the web keeps
- * an open draft over SSE). Saved across rotation.
+ * an open draft over SSE). A save the hub took makes it clean again ([saved]),
+ * showing the value as the hub will store it, so a later change from another
+ * client is followed rather than overwritten by the next save. Rotation-safe.
  */
-@Composable
-private fun <T : Any> rememberDraft(site: String, remote: T): androidx.compose.runtime.MutableState<T> {
-    val draft = rememberSaveable(site) { mutableStateOf(remote) }
-    val base = rememberSaveable(site) { mutableStateOf(remote) }
-    LaunchedEffect(remote) {
-        if (draft.value == base.value) draft.value = remote
-        base.value = remote
+private class Draft<T : Any>(
+    private val draft: androidx.compose.runtime.MutableState<T>,
+    private val edited: androidx.compose.runtime.MutableState<Boolean>,
+) {
+    operator fun getValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>): T = draft.value
+    operator fun setValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>, v: T) {
+        draft.value = v
+        edited.value = true
     }
-    return draft
+
+    fun follow(remote: T) {
+        if (!edited.value) draft.value = remote
+    }
+
+    fun saved(stored: T) {
+        draft.value = stored
+        edited.value = false
+    }
+}
+
+@Composable
+private fun <T : Any> rememberDraft(site: String, remote: T): Draft<T> {
+    val d = Draft(rememberSaveable(site) { mutableStateOf(remote) }, rememberSaveable(site) { mutableStateOf(false) })
+    LaunchedEffect(remote) { d.follow(remote) }
+    return d
 }
