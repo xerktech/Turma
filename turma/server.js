@@ -10364,7 +10364,7 @@ function advanceMigrations() {
                  s.spawnCmdId !== m.importCmdId);
         if (!live) continue;
         m.phase = "failed";
-        m.error = `that conversation came back up on ${host} — the restore was ` +
+        m.error = `that conversation came back up on ${baseOfKey(host)} — the restore was ` +
                   "abandoned rather than run a second claude on it";
         dropMigrationBlob(m);
         m.at = now;
@@ -12528,29 +12528,29 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
     const a = agents[pin.host];
     if (!hostInOrg(a, siteKey)) {
       return { status: 409, error:
-        `this ticket is pinned to agent "${pin.host}", which no longer reports that Jira org` };
+        `this ticket is pinned to agent "${baseOfKey(pin.host)}", which no longer reports that Jira org` };
     }
     if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) {
       return { status: 503, error:
-        `this ticket is pinned to agent "${pin.host}", which is offline` };
+        `this ticket is pinned to agent "${baseOfKey(pin.host)}", which is offline` };
     }
     if (requireFree && !hostHasFreeSlot(a)) {
       return { status: 503, full: true, error:
-        `this ticket is pinned to agent "${pin.host}", which has no free session slot` };
+        `this ticket is pinned to agent "${baseOfKey(pin.host)}", which has no free session slot` };
     }
     // The pinned host cannot run the requested runtime — reported, not routed
     // around, exactly like the triage refusal just below it. Blocked, never
     // full: a slot freeing on that host does not give it the runtime.
     if (wantRuntime && !runtimeOfferedBy(a)) {
       return { status: 503, error:
-        `this ticket is pinned to agent "${pin.host}", which does not offer the ${wantRuntime} runtime` };
+        `this ticket is pinned to agent "${baseOfKey(pin.host)}", which does not offer the ${wantRuntime} runtime` };
     }
     // The pinned host is the wrong OS for the requirement — reported, not routed
     // around, exactly like the runtime refusal above. Blocked, never full: a slot
     // freeing on that host does not change its OS. (XERK-693)
     if (platformReq && !platformOfferedBy(a)) {
       return { status: 503, error:
-        `this ticket is pinned to agent "${pin.host}", which does not run ${platformReq}` };
+        `this ticket is pinned to agent "${baseOfKey(pin.host)}", which does not run ${platformReq}` };
     }
     // The pin says WHICH host, never that the host can run it — reported rather
     // than routed around, exactly like every other pin refusal.
@@ -12567,7 +12567,7 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
     // the click for the common transient case.
     if (!hostTriagedTicket(a, issueKey, repo)) {
       return { status: 503, error:
-        `this ticket is pinned to agent "${pin.host}", which has not triaged it to ${repo}` };
+        `this ticket is pinned to agent "${baseOfKey(pin.host)}", which has not triaged it to ${repo}` };
     }
     // XERK-544/548/555: a dispatch to a pinned host whose Claude subscription has
     // hit a limit is paused — the same rule as the unpinned path, reported not
@@ -12579,8 +12579,8 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
     if (!wantRuntime && (a.defaultRuntime || "claude") === "claude"
         && hostAutoPaused(pin.host, a, pausedSubs)) {
       return { status: 503, paused: true, error: auto
-        ? `this ticket is pinned to agent "${pin.host}", whose Claude subscription has hit its usage limit — auto-start is paused`
-        : `this ticket is pinned to agent "${pin.host}", whose Claude 5-hour usage limit is maxed — it waits until the window resets` };
+        ? `this ticket is pinned to agent "${baseOfKey(pin.host)}", whose Claude subscription has hit its usage limit — auto-start is paused`
+        : `this ticket is pinned to agent "${baseOfKey(pin.host)}", whose Claude 5-hour usage limit is maxed — it waits until the window resets` };
     }
     return { host: pin.host,
       needsClone: !(a.repos || []).some((r) => r && r.name === repo) };

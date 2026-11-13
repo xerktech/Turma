@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
 import android.net.Uri
 import android.provider.OpenableColumns
+import com.xerktech.turma.core.bareKey
 import com.xerktech.turma.core.AttachStatus
 import com.xerktech.turma.core.Attachment
 import com.xerktech.turma.core.ModelSource
@@ -155,7 +156,7 @@ data class ChatUiState(
         now: Long = System.currentTimeMillis(),
     ): ChatUiState = copy(
         session = session,
-        hostLabel = agent?.device?.ifBlank { host } ?: host,
+        hostLabel = agent?.device?.ifBlank { bareKey(host) } ?: bareKey(host),
         tunnelOnline = tunnelOnlineOf(agent),
         uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
         localModel = agent?.localModel,

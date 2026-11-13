@@ -246,7 +246,7 @@ fun FleetScreen(
     }
     restartFor?.let { host ->
         ConfirmDialog(
-            title = "Restart $host's agent?",
+            title = "Restart ${bareKey(host)}'s agent?",
             message = "Restarts the agent manager (e.g. after fixing an expired Claude login). It briefly goes down and comes back; running sessions are re-adopted on boot.",
             confirmLabel = "Restart",
             onConfirm = { vm.restartAgent(host); restartFor = null },
