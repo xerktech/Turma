@@ -183,6 +183,34 @@ fun isEpicTicket(t: JiraTicket?): Boolean = t?.isEpic == true
 fun epicRunOf(epicRuns: Map<String, EpicRun>?, siteKey: String, epicKey: String): EpicRun? =
     epicRuns?.get("$siteKey/$epicKey")?.takeIf { it.children.isNotEmpty() }
 
+/**
+ * A stand-in ticket for a run child the board no longer lists (aged out of the
+ * Done window), so its sheet can still open — board.js epicChildStub. The sheet's
+ * on-demand fetch fills in the rest from the tracker. null when [key] is not a
+ * child of [run].
+ */
+fun epicChildStub(run: EpicRun?, key: String): JiraTicket? {
+    if (run == null || key !in run.children) return null
+    val done = key in run.doneChildren
+    return JiraTicket(
+        key = key,
+        summary = run.childTitles[key].orEmpty(),
+        status = if (done) "Done" else "",
+        statusCategory = if (done) "done" else "",
+        epicKey = run.epicKey.ifBlank { null },
+    )
+}
+
+/**
+ * Resolve a key tapped inside [open]'s sheet (an epic's child row, or a child's
+ * epic chip) to the ticket to show: the board's own copy, else — inside an
+ * epic — a stand-in for a run child the board no longer lists. null = not
+ * openable.
+ */
+fun sheetTicketFor(site: BoardSite, open: JiraTicket, epicRuns: Map<String, EpicRun>?, key: String): JiraTicket? =
+    site.tickets.find { it.key == key }
+        ?: if (isEpicTicket(open)) epicChildStub(epicRunOf(epicRuns, site.siteKey, open.key), key) else null
+
 /** A child's live status in the run — the four states of board.js epicRunView. */
 enum class EpicChildStatus { DONE, RUNNING, READY, BLOCKED }
 
@@ -267,7 +295,9 @@ fun epicRunView(
             if (holds) EpicChildStatus.BLOCKED else EpicChildStatus.READY
         }
     }
-    fun node(k: String) = EpicChild(k, byKey[k]?.summary.orEmpty(), statusOf(k))
+    fun node(k: String) = EpicChild(
+        k, byKey[k]?.summary?.takeIf { it.isNotEmpty() } ?: run.childTitles[k].orEmpty(), statusOf(k),
+    )
     val counts = EpicChildStatus.entries.associateWith { s -> keys.count { statusOf(it) == s } }
     val waves = run.waves.map { w -> w.map { node(it) } }
     val cycleChildren = cycleKeys.map { node(it) }

@@ -125,6 +125,7 @@ import com.xerktech.turma.core.epicChildrenOf
 import com.xerktech.turma.core.epicPreviewRun
 import com.xerktech.turma.core.EpicRunView
 import com.xerktech.turma.core.epicRunOf
+import com.xerktech.turma.core.sheetTicketFor
 import com.xerktech.turma.core.epicRunView
 import com.xerktech.turma.core.isEpicTicket
 import com.xerktech.turma.core.filterSites
@@ -504,9 +505,9 @@ fun BoardScreen(
         // A session that closed this ticket itself (XERK-1569) — web's "Closed by" row.
         val closedBy = ticketOutcomeOf(ticketSessionsOf(sessionIndex, site.siteKey, ticket.key))
         // An epic's sub-ticket row, or a sub-ticket's epic chip, swaps the sheet to
-        // that ticket (XERK-2674, board.js data-epic-child / data-td-epic). Only a
-        // ticket the board carries can open, so the lookup is also the gate.
-        val boardTicket: (String) -> JiraTicket? = { key -> liveSite.tickets.find { it.key == key } }
+        // that ticket (XERK-2674, board.js data-epic-child / data-td-epic). A run
+        // child the board no longer lists opens from the run's record (epicChildStub).
+        val boardTicket: (String) -> JiraTicket? = { key -> sheetTicketFor(liveSite, ticket, fleet.epicRuns, key) }
         TicketDetailSheet(site, ticket, pin, modelPin, modelPick, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, epicPreview, epicChildren, vm, closedBy,
             boardTicket = boardTicket,
             onOpenTicket = { t -> detail = liveSite to t },
@@ -1193,8 +1194,8 @@ private fun EpicProgressBar(view: EpicRunView) {
 
 /**
  * A child row taps through to that ticket's sheet (XERK-2674). `childOpener`
- * answers null for a child the board doesn't carry, which stays a plain row
- * (no announced action), like board.js's onBoard:false text.
+ * answers null for a key it cannot resolve (not on the board and not a run
+ * child), which stays a plain row with no announced action.
  */
 private fun childRowModifier(key: String, childOpener: ((String) -> (() -> Unit)?)?): Modifier {
     val open = childOpener?.invoke(key) ?: return Modifier.fillMaxWidth()

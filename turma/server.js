@@ -4297,6 +4297,8 @@ function sanitizeEpicRunRecord(v) {
   if (cycle.length) rec.cycle = cycle;
   const doneChildren = strList(v.doneChildren);   // XERK-2673
   if (doneChildren.length) rec.doneChildren = doneChildren;
+  const childTitles = epicRunTitlesOf(rec.children, v.childTitles);
+  if (childTitles) rec.childTitles = childTitles;
   if (v.paused === true) rec.paused = true;   // operator hold survives a restart (XERK-641)
   if (validEpicRunLimit(v.maxConcurrent)) rec.maxConcurrent = v.maxConcurrent;   // XERK-1860
   return rec;
@@ -4461,6 +4463,8 @@ function armEpicRun(siteKey, epicKey, rows, opts) {
   if (runCycle.length) rec.cycle = runCycle;
   const doneChildren = children.filter(isDone);
   if (doneChildren.length) rec.doneChildren = doneChildren;
+  const childTitles = epicRunChildTitles(rec, rows, prev && prev.childTitles);
+  if (childTitles) rec.childTitles = childTitles;
   // A re-arm rebuilds the DAG but PRESERVES an operator hold (XERK-641): arming is
   // "rebuild the plan", not "resume it" — Resume is the only thing that lifts a
   // pause. Preserved like startedAt.
@@ -5985,17 +5989,54 @@ function noteEpicRunDoneChildren(run, rows) {
   const kids = run.children || [];
   const before = run.doneChildren || [];
   const next = kids.filter((key) => epicRunChildDone(run, key, rows));
-  if (next.length === before.length && next.every((key, i) => key === before[i])) return false;
+  const doneSame = next.length === before.length && next.every((key, i) => key === before[i]);
+  const titles = epicRunChildTitles(run, rows, run.childTitles);
+  const titlesSame = JSON.stringify(titles) === JSON.stringify(run.childTitles || null);
+  if (doneSame && titlesSame) return false;
   if (next.length) run.doneChildren = next; else delete run.doneChildren;
+  if (titles) run.childTitles = titles; else delete run.childTitles;
   orderEpicRunKeys(run);
   return true;
 }
 
+// Each child's title as the run last saw it on the board, so a child that aged off
+// the board (the Done window) still shows its name in the run's list, not a bare
+// key. A listed child's row is the truth; an unlisted one keeps what was recorded.
+// Returns a null-prototype map in `run.children` order (a coerce fixed point), or
+// null when no child has a title.
+function epicRunChildTitles(run, rows, prev) {
+  const seen = Object.create(null);
+  for (const key of run.children || []) {
+    const r = rows.get(ticketQueueKey(run.siteKey, key));
+    const t = r && r.row && r.row.summary;
+    if (typeof t === "string" && t.trim()) seen[key] = t;
+    else if (prev && Object.hasOwn(prev, key)) seen[key] = prev[key];
+  }
+  return epicRunTitlesOf(run.children, seen);
+}
+
+// The whitelist for `childTitles`: only the run's own children, non-empty strings
+// cut to 200 chars, in children order. Inline literal (module-init TDZ rule).
+function epicRunTitlesOf(children, raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out = Object.create(null);
+  let any = false;
+  for (const key of children || []) {
+    if (!Object.hasOwn(raw, key)) continue;
+    const t = raw[key];
+    if (typeof t !== "string" || !t.trim()) continue;
+    // Cut by code point, and never leave half a surrogate pair at the end.
+    out[key] = [...t].slice(0, 200).join("");
+    any = true;
+  }
+  return any ? out : null;
+}
+
 // Put an edited run's optional keys back in the sanitizer's order (doneChildren,
-// paused, maxConcurrent last), so a live record stays a coerce fixed point and the
-// HA own-write echo dedups.
+// childTitles, paused, maxConcurrent last), so a live record stays a coerce fixed
+// point and the HA own-write echo dedups.
 function orderEpicRunKeys(run) {
-  for (const f of ["paused", "maxConcurrent"]) {
+  for (const f of ["childTitles", "paused", "maxConcurrent"]) {
     if (f in run) { const v = run[f]; delete run[f]; run[f] = v; }
   }
 }
@@ -28959,7 +29000,7 @@ if (process.env.TURMA_TEST) {
     buildEpicWaves,
     epicChildRows,
     isEpicOrEpicChild, isRollupTicket,
-    sanitizeEpicRunRecord,
+    sanitizeEpicRunRecord, noteEpicRunDoneChildren, epicRunTitlesOf,
     EPIC_RUN_STATES,
     // Epic Builder (XERK-725, epic XERK-721): the durable run store, its arm/clear
     // + advance helpers, the heartbeat-status ingest, the dispatch driver, the

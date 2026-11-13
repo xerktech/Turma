@@ -29,7 +29,7 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   is the SAME per-record `sanitizeEpicRunRecord` whitelist boot-load used, applied to a remote value
   too; `persistEpicRuns()` replaces the old `scheduleEpicRunsSave`. HA off: byte-identical file writes,
   same 5s debounce. Mechanics: `.claude/rules/turma-ha-store.md` (wave-3 pattern).
-- **Run record**: `{epicKey, siteKey, state, children[], waves[][], cycle?[], doneChildren?[], paused?,
+- **Run record**: `{epicKey, siteKey, state, children[], waves[][], cycle?[], doneChildren?[], childTitles?{}, paused?,
   maxConcurrent?, startedAt, updatedAt}`.
   `state ∈ {running, blocked, done}` (`EPIC_RUN_STATES`); `waves` is the topological layering;
   `cycle` is present only when a dependency loop stalls children. `startedAt` is preserved across
@@ -88,6 +88,9 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   offline) would otherwise let the run complete and write the epic Done behind it (QA). Cost: a
   child deleted from the tracker, or reassigned off this board, holds the run AND every in-epic
   child it blocks (the poll-gap rule below) until the operator cancels and re-arms.
+- **`childTitles` keeps each child's last-seen title** (`epicRunChildTitles`, same passes as
+  `doneChildren`): an aged-off child otherwise showed a bare key in the run list. Clients fall back
+  to it only when the board no longer lists the child.
 - A child listed under another epic is dropped. The board's own children fill the
   `EPIC_RUN_CHILDREN_MAX` cap first, so kept ones never crowd out a live child.
 - Tests: the `XERK-2673:` cases in `server.test.js`, `board.test.js`, `BoardTest.kt`.

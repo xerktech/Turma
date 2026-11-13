@@ -409,6 +409,9 @@ data class EpicRun(
     // Children the hub saw Done, so one that aged off the board still counts
     // (XERK-2673). Absent on an older hub → empty.
     val doneChildren: List<String> = emptyList(),
+    // Each child's title as the hub last saw it, so one that aged off the board
+    // still shows its name. Absent on an older hub → empty.
+    val childTitles: Map<String, String> = emptyMap(),
     // Operator hold (XERK-641): a paused run starts no new children and its running
     // children are left alone until Resume. Absent on an older hub → false.
     val paused: Boolean = false,

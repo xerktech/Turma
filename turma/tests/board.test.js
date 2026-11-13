@@ -3080,6 +3080,16 @@ test("XERK-2673: epicRunView counts a child the board no longer lists as Done wh
   assert.equal(epicRunView(r, reopened, { sessionIndex: new Map() }).done, 0);
 });
 
+test("XERK-2673: an aged-off child shows the title the hub recorded", () => {
+  const site = epicSite([ticket("C-2", { statusCategory: "todo", summary: "Live title" })]);
+  const r = run({ children: ["C-1", "C-2"], waves: [["C-1", "C-2"]], doneChildren: ["C-1"],
+    childTitles: { "C-1": "Kept title", "C-2": "Old title" } });
+  const view = epicRunView(r, site, { sessionIndex: new Map() });
+  assert.deepEqual(view.waves[0].map((c) => c.summary), ["Kept title", "Live title"]);
+  // An older hub sends none: the bare key, as before.
+  assert.equal(epicRunView({ ...r, childTitles: undefined }, site, { sessionIndex: new Map() }).waves[0][0].summary, "");
+});
+
 test("epicRunView: a child with all in-epic blockers Done reads ready (not blocked)", () => {
   const site = epicSite([
     ticket("C-1", { statusCategory: "done" }),
@@ -3763,8 +3773,7 @@ test("XERK-2674: epic child rows are buttons that open the child's detail", () =
   const html = epicRunPanelHtml(epicTicket("E-1"), view, { children });
   assert.match(html, /<button class="epic-child-open" type="button"\s+data-epic-child="C-1"[^>]*>[^]*C-1[^]*on &lt;b&gt;board[^]*<\/button>/);
   assert.match(html, /data-epic-child="C-4"/, "a board child outside the run opens too");
-  assert.doesNotMatch(html, /data-epic-child="C-9"/, "a run child the board no longer carries is plain text");
-  assert.match(html, /epic-child-key">C-9</);
+  assert.match(html, /data-epic-child="C-9"/, "a run child the board no longer carries opens too");
   // The un-armed preview rows open as well.
   const prev = epicRunPanelHtml(epicTicket("E-1"), null, { preview: view });
   assert.match(prev, /data-epic-child="C-1"/);
@@ -3774,6 +3783,23 @@ test("XERK-2674: epicRunView marks whether each child is on the board", () => {
   const site = { siteKey: "s", tickets: [ticket("C-1", { epicKey: "E-1" })] };
   const v = epicRunView(run({ children: ["C-1", "C-2"], waves: [["C-1", "C-2"]] }), site, {});
   assert.deepEqual(v.waves[0].map((c) => [c.key, c.onBoard]), [["C-1", true], ["C-2", false]]);
+});
+
+test("epicChildStub: a run child off the board opens from the run's record", () => {
+  const { epicChildStub } = require("../public/board.js");
+  const r = { epicKey: "E-1", children: ["C-1", "C-2"], doneChildren: ["C-1"], childTitles: { "C-1": "First" } };
+  assert.deepEqual(epicChildStub(r, "C-1"),
+    { key: "C-1", summary: "First", status: "Done", statusCategory: "done", epicKey: "E-1" });
+  const open = epicChildStub(r, "C-2");
+  assert.equal(open.summary, "");
+  assert.equal(open.statusCategory, "");
+  assert.equal(epicChildStub(r, "X-9"), null, "not a child of the run");
+  assert.equal(epicChildStub(null, "C-1"), null);
+  // An older hub (no titles) still opens, with an empty title the fetch fills.
+  assert.equal(epicChildStub({ ...r, childTitles: undefined }, "C-1").summary, "");
+  // The stub renders a panel with the fetched copy winning.
+  const html = detailHtml(epicChildStub(r, "C-1"), { summary: "First (fetched)", description: "Body" }, {});
+  assert.match(html, /First \(fetched\)/);
 });
 
 test("XERK-2674: a sub-ticket's panel links back to its epic only when the board has it", () => {
@@ -3788,7 +3814,9 @@ test("XERK-2674: a sub-ticket's panel links back to its epic only when the board
 test("XERK-2674: board.html opens the clicked child or epic in the detail panel", () => {
   const src = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
   // Both targets resolve (the crumb's key too) and focus returns to the opening card.
-  assert.match(src, /closest\("\[data-epic-child\], \[data-td-epic\]"\)[^]*?nav\.dataset\.epicChild \|\| nav\.dataset\.tdEpic[^]*?openDetail\(key, openTicketState\.siteKey, lastFocus\)/);
+  assert.match(src, /closest\("\[data-epic-child\], \[data-td-epic\]"\)[^]*?nav\.dataset\.epicChild \|\| nav\.dataset\.tdEpic[^]*?epicChildStub\(B\.epicRunOf\(cache && cache\.epicRuns, openTicketState\.siteKey, openTicketState\.key\), key\)[^]*?openDetail\(key, openTicketState\.siteKey, lastFocus, stub\)/);
+  // openDetail falls back to the stub only when the board has no such ticket.
+  assert.match(src, /site\.tickets\.find\(t => t\.key === key\)\) \|\| \(site && stub\)/);
   // A double-click's second click (landing on the backdrop) doesn't close the panel.
   assert.match(src, /\$backdrop\.addEventListener\("click", \(e\) => \{ if \(e\.target === \$backdrop && e\.detail <= 1\) closeDetail\(\); \}\)/);
 });
