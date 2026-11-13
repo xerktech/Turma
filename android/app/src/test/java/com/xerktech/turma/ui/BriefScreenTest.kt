@@ -5,6 +5,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.hasText
@@ -178,9 +180,9 @@ class BriefScreenTest {
     @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
     @Test fun `wide skips a collapsed org's entries`() {
         seed()
-        show(wide = true)
-        compose.onNodeWithText("Run now").assertExists()
-        compose.onNodeWithContentDescription("Collapse o").performClick()
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        mvm.toggleCollapsed(site)
+        show(mvm = mvm, wide = true)
         compose.onNodeWithText("Run now").assertDoesNotExist()
         compose.onNodeWithText(
             "Nothing needs review. When Tenir sends a meeting, its proposed work items show up here.").assertExists()
@@ -203,6 +205,40 @@ class BriefScreenTest {
         compose.waitForIdle()
         compose.onNodeWithText("Item of Zed sync").assertExists()
         compose.onNode(hasText("Zed sync", substring = true) and isSelected()).assertExists()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide holds a cold-start push until the pushed org has loaded`() {
+        hub.seedFleet("""{ "now": 1, "agents": [] }""")
+        var push by mutableStateOf<String?>("a.atlassian.net")
+        val vm = main.track(BriefViewModel(hub.app))
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = true, openSite = push, onOpened = { push = null }) }
+        compose.waitForIdle()
+        hub.seedFleet("""
+            { "now": 1, "agents": [ ${hostOf("h1", "a.atlassian.net", "Zed")}, ${hostOf("h2", "b.atlassian.net", "Alpha")} ],
+              "meetingProposals": { "a.atlassian.net": [ ${meeting("m1", "Zed sync")} ],
+                                    "b.atlassian.net": [ ${meeting("m2", "Alpha sync")} ] } }
+        """.trimIndent())
+        compose.waitForIdle()
+        // The fleet reaches the screen through the VM's flow, not synchronously.
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("Item of Zed sync").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Item of Zed sync").assertExists()
+        assertEquals(null, push)
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide opens a newly picked entry at its top`() {
+        val many = (0 until 40).joinToString(",") { """{ "id": "p$it", "kind": "task", "title": "Long item $it" }""" }
+        seed(meetings = """{ "meetingId": "m1", "status": "ok", "title": "Long review", "startedAt": $yday,
+                "items": [ $many ] }""")
+        show(wide = true)
+        open("Long review")
+        compose.onNodeWithText("Long item 39").performScrollTo()
+        compose.onNodeWithText("Long item 0").assertIsNotDisplayed()
+        open("Daily meeting")
+        open("Long review")
+        compose.onNodeWithText("Long item 0").assertIsDisplayed()
     }
 
     @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
@@ -241,7 +277,10 @@ class BriefScreenTest {
     }
 
     @Test fun `Run now is off while a brief is being written`() {
-        seed(briefs = """{ "runId": "r", "status": "running", "meetingAt": ${now + 3_600_000} }""")
+        // The schedule's own next meeting (23:59 UTC): now+1h crossed it from 23:00 UTC on.
+        var at = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).withHour(23).withMinute(59).withSecond(0).withNano(0)
+        if (!at.toInstant().isAfter(java.time.Instant.now())) at = at.plusDays(1)
+        seed(briefs = """{ "runId": "r", "status": "running", "meetingAt": ${at.toInstant().toEpochMilli()} }""")
         show()
         open("Daily meeting")
         compose.onNodeWithText("Writing…").assertIsNotEnabled()

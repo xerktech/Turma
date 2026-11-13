@@ -188,19 +188,32 @@ fun BriefScreen(
         else -> shown(null, true).firstOrNull()
     }
     val openKey = open?.let { "${it.siteKey}\u0000${it.key}" }.orEmpty()
-    if (wide && selected.isNotEmpty() && openKey != selected) {
+    // Always, as the web's render does (`selected = v.sel.key`): an entry opened
+    // by default is then the pick too, and behaves the same as one tapped. Not
+    // while a push is pending: it picks the entry, and this would race it.
+    // Never to nothing: a refresh that briefly lists no entry must not drop the pick.
+    if (wide && openSite == null && openKey.isNotEmpty() && openKey != selected) {
         LaunchedEffect(selected, openKey) { selected = openKey }
     }
 
-    // A meetings push opens Brief on Needs review with that org unfolded; wide
-    // also opens that org's first entry (the narrow list just shows it).
+    // A meetings push opens Brief on Needs review with that org unfolded and no
+    // search hiding it; wide also opens that org's first entry (the narrow list
+    // just shows it). On a cold start from the notification the fleet has not
+    // loaded yet, so wide holds the push until that org's entries arrive.
     LaunchedEffect(openSite) {
         val s = openSite ?: return@LaunchedEffect
         filter = TriageFilter.REVIEW
+        query = ""
         settingsFor = ""
         if (s in collapsed) meetingsVm.toggleCollapsed(s)
-        selected = if (!wide) "" else triageBuckets(entries[s].orEmpty(), TriageFilter.REVIEW, query, now, zone)
-            .flatMap { it.second }.firstOrNull()?.let { "${it.siteKey}\u0000${it.key}" }.orEmpty()
+        if (!wide) { selected = ""; onOpened() }
+    }
+    val pushed = openSite?.let { entries[it] }
+    LaunchedEffect(openSite, wide, pushed) {
+        val s = openSite ?: return@LaunchedEffect
+        if (!wide || pushed.isNullOrEmpty()) return@LaunchedEffect
+        triageBuckets(pushed, TriageFilter.REVIEW, "", now, zone).flatMap { it.second }.firstOrNull()
+            ?.let { selected = "${it.siteKey}\u0000${it.key}" }
         onOpened()
     }
 
@@ -217,7 +230,7 @@ fun BriefScreen(
             )
             open == null -> {
                 // Gone from the store (evicted, or another org scope): back to the list.
-                if (selected.isNotEmpty()) LaunchedEffect(selected) { selected = "" }
+                if (!wide && selected.isNotEmpty()) LaunchedEffect(selected) { selected = "" }
                 if (wide) DetailEmpty(m, filter)
             }
             else -> {
