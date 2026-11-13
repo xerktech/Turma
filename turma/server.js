@@ -5177,6 +5177,7 @@ function sanitizeMeetingReview(v) {
   }
   if (v.state === "failed") {
     out.error = meetingText(v.error, MEETING_ERROR_MAX) || "the ticket could not be created";
+    if (v.maybeCreated === true) out.maybeCreated = true;
   }
   if ((v.state === "creating" || v.state === "created") && v.start === true) {
     out.start = true;
@@ -21214,6 +21215,12 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
     if (cur !== "rejected" && cur !== "failed") {
       return refuse(409, "only a rejected or failed proposal can be reopened");
     }
+    // A create that may have gone through keeps its warning (XERK-2864): Reopen
+    // would wipe it and leave a clean pending row one Approve from a duplicate.
+    // Approve stays possible from the failed row, where the warning still shows.
+    if (item.review.maybeCreated) {
+      return refuse(409, "that ticket may already exist — check the board, then approve or reject it");
+    }
     const row = putMeeting(siteKey, { ...m, archivedAt: undefined,
       items: m.items.map((i) => (i.id === itemId ? { ...i, review: undefined } : i)) });
     return row ? { status: 200, body: { ok: true, meeting: meetingWire(row) } }
@@ -21308,8 +21315,8 @@ function settleMeetingReview(siteKey, rv, now) {
     if (a && !gap && now - (a.lastSeen || 0) < OFFLINE_AFTER_MS && now - rv.at >= MEETING_CREATE_DEADLINE_MS) {
       dropQueuedCommand(host, cmdId, "createTicket");
       forgetCreateInFlight(cmdId);
-      return { ...base, state: "failed", at: now, error: "the host never reported the create — it may "
-        + "have been created, so check the board before approving again" };
+      return { ...base, state: "failed", at: now, maybeCreated: true, error: "the host never reported "
+        + "the create — it may have been created, so check the board before approving again" };
     }
     if (!a || gap || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) {
       // The GET poll's wording (XERK-241): never claim no ticket exists once
@@ -21317,10 +21324,12 @@ function settleMeetingReview(siteKey, rv, now) {
       const nothingRan = !a || !commandDelivered(host, cmdId, "createTicket");
       if (a) dropQueuedCommand(host, cmdId, "createTicket");
       forgetCreateInFlight(cmdId);
-      return { ...base, state: "failed", at: now, error: gap || (nothingRan
-        ? "the host went offline before the ticket was created"
-        : "the host went silent while creating the ticket — it may have been created, "
-          + "so check the board before approving again") };
+      const unknown = !gap && !nothingRan;
+      return { ...base, state: "failed", at: now, ...(unknown ? { maybeCreated: true } : {}),
+        error: gap || (nothingRan
+          ? "the host went offline before the ticket was created"
+          : "the host went silent while creating the ticket — it may have been created, "
+            + "so check the board before approving again") };
     }
     return rv;
   }

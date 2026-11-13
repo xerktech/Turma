@@ -129,6 +129,11 @@ ticket builds to this file; change it here first.
 - **Reopen** (XERK-2856): `action:"reopen"` on a `rejected`/`failed` item removes its `review`
   (pending again), and unarchives the meeting (it has pending work again). Else 409 "only a
   rejected or failed proposal can be reopened".
+- **A create that may have gone through is never reopened** (XERK-2864): a failure the hub cannot
+  prove ran nothing (deadline, or a delivered command on a silent host) carries
+  `review.maybeCreated: true`, and Reopen answers 409. Reopen wiped the "check the board" warning,
+  leaving a clean pending row one Approve from a duplicate ticket; Approve from the failed row,
+  warning shown, still works. The web hides its Reopen button there.
 
 ## Archive and the daily meeting (hub, XERK-2856)
 

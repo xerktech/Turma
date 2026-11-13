@@ -56957,6 +56957,7 @@ class TestMeetingWorker(ManagerMixin, unittest.TestCase):
         self.assertNotIn("x" * 2001, tail)
         self.assertNotIn("meetingAt", tail)
         self.assertIn("NOT a new item", tail)
+        self.assertIn("never mention the brief", tail)   # XERK-2864
         # With a focus too: the daily block follows it under the one closing line.
         self.calls.clear()
         self.replies = [tm.reply(tm.item())]
