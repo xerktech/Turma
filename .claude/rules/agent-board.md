@@ -109,6 +109,11 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
     guessed** (`_azure_mine_identities` reads `System.AssignedTo` off the board's `@Me` WIQL, ahead of
     `AZDO_USER` guesses); `_azure_identity_strings` spells each four ways. An unassigned success warns
     with the tracker's own refusal, never "set `AZDO_USER`".
+- **The create pickers' project list is PAGED, bounded and on a budget** (XERK-2874,
+  `_page_board_projects`): one 100-project page hid the rest of a big org. `boardCreateMeta` is
+  answered inline ON THE BEAT, so paging stops at a page count, `CREATE_META_MAX_PROJECTS` and
+  `CREATE_META_PAGES_BUDGET_SEC` of wall clock. Never loop on kept-project count alone (a page of
+  key-less entries looped forever). Tests: `TestCreateMetaPaging`.
 - **A create runs at most ONCE per cmdId across manager restarts** (XERK-2867, `_create_once`,
   `~/.turma/created-commands.json`): `self.acked` is in memory, so a restart (update, rename) between
   the tracker call and the ack beat let the hub's re-delivery file a second ticket. Marked started

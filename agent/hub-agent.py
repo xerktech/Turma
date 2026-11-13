@@ -22678,7 +22678,18 @@ JIRA_LINKS_MAX = 30             # blocks/blocked-by keys kept per issue (XERK-63
 # metadata (projects, issue types, existing labels) on demand — the same
 # {command -> staged result -> next beat} path as issue detail — then POSTs one
 # new issue. Bounded so a big org can't make the meta fetch block a heartbeat.
-CREATE_META_MAX_PROJECTS = 100  # projects offered in the New-ticket picker
+# Projects offered in the New-ticket / meeting-target pickers. Fetched in pages
+# (both trackers cap one page at 100), so an org with many projects still lists
+# them all up to this bound (XERK-2874: a big org's project was missing).
+CREATE_META_MAX_PROJECTS = 1000
+CREATE_META_PROJECT_PAGE = 100
+# boardCreateMeta is answered inline in handle_commands, ON THE BEAT, so the
+# paging gets a wall-clock budget: no new page starts past it, keeping the worst
+# case (budget + one in-flight page + the label read) near the single-page
+# original under the XERK-395 offline threshold. A healthy tracker pages 1000
+# projects in ~2s; a degraded one returns what it read in time.
+CREATE_META_PAGES_BUDGET_SEC = _env_float("TURMA_CREATE_META_PAGES_BUDGET_SEC", 5.0,
+                                          minimum=0.0)
 CREATE_META_MAX_LABELS = 200    # existing labels/tags offered as suggestions
 CREATE_TITLE_MAX_CHARS = 250    # summary/title cap (Jira's own limit is 255)
 CREATE_DESC_MAX_CHARS = 30000   # description cap
@@ -23594,15 +23605,64 @@ def _text_to_adf(text):
     return {"type": "doc", "version": 1, "content": content or [{"type": "paragraph"}]}
 
 
+def _page_board_projects(fetch_page, what):
+    """Collect a tracker's project list page by page, for the create pickers.
+    `fetch_page(offset)` returns (projects, raw_count, more): the shaped
+    projects, how many raw entries the page held (the offset advance), and
+    whether the tracker says more follow. Bounded three ways: the project cap,
+    a fixed PAGE count (a page of entries the shaper drops must not loop
+    forever), and CREATE_META_PAGES_BUDGET_SEC of wall clock (this runs on the
+    beat). Deduped by key, so a server ignoring the offset yields one copy.
+    Sorted by name."""
+    out, seen = [], set()
+    offset = 0
+    deadline = time.monotonic() + CREATE_META_PAGES_BUDGET_SEC
+    max_pages = -(-CREATE_META_MAX_PROJECTS // CREATE_META_PROJECT_PAGE)
+    for n in range(max_pages):
+        if n and time.monotonic() >= deadline:
+            log(f"{what} project list cut at {len(out)} (paging budget spent)")
+            break
+        try:
+            page, raw, more = fetch_page(offset)
+        except Exception as e:
+            if not n:
+                raise  # nothing read yet: the picker shows the tracker's error
+            # A later page failing keeps what was read (a big org saw its first
+            # 100 before paging; an error in their place would be worse).
+            log(f"{what} project list cut at {len(out)} (page failed: {e})")
+            break
+        for p in page:
+            if p["key"] not in seen:
+                seen.add(p["key"])
+                out.append(p)
+        offset += raw
+        if not raw or not more or len(out) >= CREATE_META_MAX_PROJECTS:
+            break
+    out = out[:CREATE_META_MAX_PROJECTS]
+    out.sort(key=lambda p: str(p.get("name") or p["key"]).lower())
+    return out
+
+
 def jira_create_meta():
     """The New-ticket form's project + label choices for a Jira org: the projects
     the user can see (issue types are fetched per-project by jira_issue_types) and
     a bounded list of existing labels to suggest. Exceptions propagate to the
     staged result."""
-    data = jira_get("/rest/api/3/project/search",
-                    {"maxResults": CREATE_META_MAX_PROJECTS, "orderBy": "name"})
-    projects = [{"key": p.get("key"), "name": p.get("name") or p.get("key")}
-                for p in (data.get("values") or []) if p.get("key")]
+    def page(start):
+        data = jira_get("/rest/api/3/project/search",
+                        {"maxResults": CREATE_META_PROJECT_PAGE,
+                         "startAt": start, "orderBy": "name"})
+        values = data.get("values") or []
+        # A name must be a string: Android types it, and one bad value fails
+        # the whole envelope's decode. Anything else falls back to the key.
+        return ([{"key": p.get("key"),
+                  "name": p.get("name") if isinstance(p.get("name"), str)
+                  and p.get("name") else p.get("key")}
+                 for p in values if isinstance(p, dict) and p.get("key")
+                 and isinstance(p.get("key"), str)],
+                len(values), not data.get("isLast", True))
+
+    projects = _page_board_projects(page, "jira")
     labels = []
     try:
         ld = jira_get("/rest/api/3/label", {"maxResults": CREATE_META_MAX_LABELS})
@@ -24603,9 +24663,17 @@ def azure_create_meta():
     """The New-ticket form's project + tag choices for an Azure org: the projects
     the PAT can see (work-item types are fetched per-project by azure_workitem_types)
     plus a bounded list of existing tags to suggest."""
-    data = azure_req("/_apis/projects", {"$top": CREATE_META_MAX_PROJECTS})
-    projects = [{"key": p.get("name"), "name": p.get("name")}
-                for p in (data.get("value") or []) if p.get("name")]
+    def page(skip):
+        data = azure_req("/_apis/projects",
+                         {"$top": CREATE_META_PROJECT_PAGE, "$skip": skip})
+        values = data.get("value") or []
+        # ADO has no isLast: a short page is the last one.
+        return ([{"key": p.get("name"), "name": p.get("name")}
+                 for p in values if isinstance(p, dict) and p.get("name")
+                 and isinstance(p.get("name"), str)],
+                len(values), len(values) >= CREATE_META_PROJECT_PAGE)
+
+    projects = _page_board_projects(page, "azure")
     tags = []
     try:
         # Org-wide tags endpoint (preview); a failure just means no suggestions.
