@@ -54,6 +54,13 @@ spec = importlib.util.spec_from_file_location("hub_agent", MODULE_PATH)
 ha = importlib.util.module_from_spec(spec)
 sys.modules["hub_agent"] = ha
 spec.loader.exec_module(ha)
+# Never let a test touch the REAL host's credential: an agent session exports
+# TURMA_AGENT_ENV and TURMA_TOKEN_FILE, and persist_agent_token unlinks the token
+# file after an env write — so running this suite inside a k8x session deleted
+# that host's identity token and locked it out of the hub (403 on every beat).
+# Tests that need either set it explicitly with mock.patch.dict.
+for _var in ("TURMA_TOKEN_FILE", "TURMA_AGENT_ENV"):
+    os.environ.pop(_var, None)
 # Never let a test sweep the REAL host's processes: resume_on_boot reaps
 # pre-XERK-1588 ttyds, which on a live agent host would signal real terminals.
 ha.PROC_ROOT = tempfile.mkdtemp(prefix="hub-agent-noproc-")
