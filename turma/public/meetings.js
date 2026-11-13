@@ -85,6 +85,8 @@ let filter = "review";
 let query = "";                  // the rail's search, as typed
 let selected = null;             // entry key in the main pane
 let curItem = null;              // item key the keyboard acts on
+let curOrder = [];               // the item order curItem was last seen in (followCursor)
+let selMemo = null;              // the selected entry's org, time, briefs and meetings (pickSelected)
 let narrowMain = false;          // a phone shows the main pane, not the rail
 let drawer = null;               // site whose settings drawer is open
 // Per-viewer niceties in localStorage, every access guarded (private mode throws).
@@ -259,8 +261,39 @@ function buildView(data, sel = selected) {
   // The selection stands while its entry is still in the list (a collapsed org
   // keeps it); else the first entry shown.
   const all = visible.flatMap((o) => o.shown);
+  return { now, name, orgs, visible, flat, sel: pickSelected(all, flat, sel), q };
+}
+// The selected entry, or what took its place: an entry can be re-keyed under the
+// viewer (a title-matched daily meeting claims a brief-only `d:<M>` entry), and
+// jumping to the first entry of another org loses the operator's place. So: the
+// entry now carrying its brief or meeting, else the nearest in time in its org.
+function pickSelected(all, flat, sel) {
   const hit = all.find((e) => e.key === sel);
-  return { now, name, orgs, visible, flat, sel: hit || flat[0] || null, q };
+  if (hit || !sel || !selMemo || selMemo.key !== sel) return hit || flat[0] || null;
+  const same = all.filter((e) => e.site === selMemo.site);
+  const carries = same.find((e) => e.briefs.some((b) => selMemo.runIds.includes(b.runId))
+    || e.meetings.some((m) => selMemo.meetingIds.includes(m.meetingId)));
+  if (carries) return carries;
+  const near = same.slice().sort((a, b) => Math.abs(a.at - selMemo.at) - Math.abs(b.at - selMemo.at))[0];
+  return near || flat[0] || null;
+}
+function rememberSelected(e) {
+  selMemo = e ? { key: e.key, site: e.site, at: e.at, runIds: e.briefs.map((b) => b.runId),
+    meetingIds: e.meetings.map((m) => m.meetingId) } : null;
+}
+// The keyboard cursor follows its place, not its key: when the current proposal
+// leaves the list (answered here, or an SSE frame saying so — the hub broadcasts
+// BEFORE the POST answers), it moves to the one that took its place, the next
+// still listed after it, else the one before. Clearing it made the next A act on
+// the FIRST proposal — a ticket for the wrong one (QA).
+function followCursor(order) {
+  if (curItem && !order.includes(curItem)) {
+    const i = curOrder.indexOf(curItem);
+    const now = new Set(order);
+    curItem = i < 0 ? null : (curOrder.slice(i + 1).find((k) => now.has(k))
+      || curOrder.slice(0, i).reverse().find((k) => now.has(k)) || null);
+  }
+  curOrder = order;
 }
 
 // ---- render: one proposal ---------------------------------------------------------
@@ -724,10 +757,11 @@ function renderMeetings(data, force = false) {
   paintPending = false;
   const v = buildView(data);
   selected = v.sel ? v.sel.key : null;
+  rememberSelected(v.sel);
   // The org's projects are fetched only where an Approve may need one.
   if (v.sel && needsProject(v.sel.meetings)) ensureMeta(v.sel.site);
   if (drawer) ensureMeta(drawer);
-  if (curItem && !itemOrder(v).includes(curItem)) curItem = null;
+  followCursor(itemOrder(v));
   const full = missesHtml(data, v.name)
     + `<div class="tri${narrowMain && v.sel ? " show-main" : ""}">`
     + `<nav class="tri-rail" aria-label="Meetings by org">${railHtml(v)}</nav>`
@@ -850,7 +884,6 @@ async function review(k, action, start = false) {
     : it.kind === "decision" ? "Logging the decision" : "Approving";
   const beforeView = buildView(cache);
   const before = beforeView.flat.map((e) => e.key);
-  const order = itemOrder(beforeView);
   const entry = beforeView.sel;
   let res = null, out = {};
   try {
@@ -864,10 +897,9 @@ async function review(k, action, start = false) {
   } else {
     edits.delete(k);
     if (out.meeting && cache) patchMeeting(site, out.meeting);
-    if (curItem === k && action !== "reopen") {
-      const i = order.indexOf(k);
-      curItem = order[i + 1] || order[i - 1] || null;
-    }
+    // The cursor moves on through followCursor, whichever lands first: this
+    // answer or the SSE frame carrying the same row.
+    followCursor(itemOrder(buildView(cache)));
     // The entry's last proposal answered: on to the next one that needs review.
     if (action !== "reopen" && filter === "review" && entry && entry.key === selected) {
       const after = buildView(cache).sel;
@@ -935,10 +967,11 @@ function select(key) {
 
 // ---- keyboard triage --------------------------------------------------------------
 // A approve, S approve + session, E edit, R reject, J/K next/previous proposal —
-// never while typing (a field, a contenteditable), with a modifier, or with the
-// settings drawer or another dialog open.
+// never a key's auto-repeat, never while typing (a field, a contenteditable), with a
+// modifier, or with the settings drawer or another dialog open.
 function onKey(ev) {
-  if (!$list || !cache || !ev || ev.defaultPrevented || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  // A held key auto-repeats: holding A must not approve proposal after proposal.
+  if (!$list || !cache || !ev || ev.repeat || ev.defaultPrevented || ev.ctrlKey || ev.metaKey || ev.altKey) return;
   const t = ev.target;
   if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || "") || t.isContentEditable)) return;
   if (t && t.closest && t.closest("dialog,[role=dialog]")) return;
@@ -946,6 +979,9 @@ function onKey(ev) {
   const key = String(ev.key || "").toLowerCase();
   if (!["a", "s", "e", "r", "j", "k"].includes(key)) return;
   const order = itemOrder(buildView(cache));
+  // A frame may have moved the list since the last paint (a held repaint): the
+  // cursor follows its place here too, before any key acts on it.
+  followCursor(order);
   if (!order.length) return;
   ev.preventDefault();
   const i = order.indexOf(curItem);

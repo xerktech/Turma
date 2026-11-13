@@ -31,6 +31,9 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   selected entry. **The selection is sticky**: an entry whose last proposal was answered never
   vanishes from under the pointer (an SSE frame included); only our own review/archive moves the
   selection on (`advanceFrom`), and then it drops out.
+- An entry re-keyed under the viewer (a title-matched daily meeting claims a brief-only
+  `d:<M>`) keeps the selection: the entry now carrying its brief/meeting, else the nearest in its
+  org (`pickSelected`) — never another org's first entry (QA).
 - Narrow (<760px): one pane at a time (`show-main`), a Back button.
 
 ## Proposals
@@ -40,7 +43,12 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 - Reviewed (created / logged / rejected) proposals leave the list — never greyed in place — and
   count in the progress bar; "show reviewed (n)" lists them. Rejected/failed offer Reopen.
 - Keyboard: A approve, S approve + session (not on a decision), E edit, R reject, J/K move —
-  never with a modifier, focus in a field/contenteditable/dialog, or the drawer open (`onKey`).
+  never with a modifier, a key's auto-repeat, focus in a field/contenteditable/dialog, or the
+  drawer open (`onKey`).
+- **The cursor follows its place, not its key** (`followCursor`, render AND keypress): the hub's
+  SSE frame lands BEFORE the POST answer, and clearing the cursor made the next A act on the
+  FIRST proposal — a ticket for the wrong one (QA). It moves to the next still listed, else the
+  one before. Tests: `meetings.test.js` "SSE frame beats the POST answer".
 - **Approve needs a project + issue type, from the New-ticket routes** (`GET .../create-meta`,
   202-polled): the org's "New tickets go to" project (a lone project preselected, a pick kept per
   viewer in `localStorage`, guarded), the type by kind (`defaultType`: bug → a "Bug" type, else

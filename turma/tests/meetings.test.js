@@ -543,3 +543,69 @@ test("XERK-2857: a phone shows one pane at a time — picking an entry opens it,
   P.click({ back: "1" });
   assert.match(P.list(), /<div class="tri">/);
 });
+
+// QA D2: the hub broadcasts the meetingProposals frame BEFORE it answers the POST.
+// The cursor must land on the proposal that took the answered one's place either
+// way — clearing it made the next key act on the FIRST proposal (a wrong ticket).
+test("XERK-2857: the keyboard cursor moves to the next proposal when the SSE frame beats the POST answer", async () => {
+  const four = ["p1", "p2", "p3", "p4"].map((id) => ({ id, kind: "task", title: `Item ${id}`, description: "" }));
+  const m = (rejected) => meeting({ items: four.map((it) => (rejected.includes(it.id) ? { ...it, review: { state: "rejected", at: 1 } } : it)) });
+  const answers = [];
+  const P = loadPage((u, init) => (init.method === "POST" ? new Promise((r) => answers.push(r)) : META(u)));
+  P.update(data([m([])]));
+  await P.settle();
+  const key = (k) => P.onKey({ key: k, target: { tagName: "BODY" }, preventDefault() {} });
+  key("j"); key("j");
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p2"));
+  key("r");
+  P.update(data([m(["p2"])]));                 // the frame lands first
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p3"), "the frame moves the cursor on, not off");
+  answers.shift()({ ok: true, meeting: m(["p2"]) });
+  await P.settle();
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p3"), "the answer does not move it twice");
+  key("r");
+  answers.shift()({ ok: true, meeting: m(["p2", "p3"]) });  // the answer first this time
+  await P.settle();
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p4"));
+  P.update(data([m(["p2", "p3"])]));
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p4"));
+  assert.deepEqual(P.fetches.filter((f) => f.method === "POST").map((f) => f.url.split("/").pop()), ["p2", "p3"]);
+  // The last one answered: the cursor steps back to the one before.
+  key("r");
+  P.update(data([m(["p2", "p3", "p4"])]));
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p1"));
+  answers.shift()({ ok: true, meeting: m(["p2", "p3", "p4"]) });
+  await P.settle();
+});
+
+test("XERK-2857: a held key's auto-repeat acts on nothing", async () => {
+  const P = loadPage((u, init) => (init.method === "POST" ? { ok: true } : META(u)));
+  P.update(data());
+  await P.settle();
+  let prevented = false;
+  P.onKey({ key: "r", repeat: true, target: { tagName: "BODY" }, preventDefault: () => { prevented = true; } });
+  P.onKey({ key: "j", repeat: true, target: { tagName: "BODY" }, preventDefault: () => { prevented = true; } });
+  assert.equal(prevented, false);
+  assert.equal(P.state().curItem, null);
+  assert.equal(P.fetches.filter((f) => f.method === "POST").length, 0);
+});
+
+// QA D3: a title-matched daily meeting re-keys the brief-only entry it claims
+// (`d:<M>` → `d:<startedAt>`); the selection follows it, never another org's first entry.
+test("XERK-2857: a selected entry re-keyed under the viewer stays selected as the entry carrying its brief", () => {
+  const M = 1.7e12 + 9 * 3600e3, S = M + 2 * 3600e3;
+  const AAA = "aaa.atlassian.net";
+  const brief = { runId: "b9", status: "ok", trigger: "scheduled", meetingAt: M, startedAt: M - 300e3, day: "D." };
+  const base = (meetings) => ({ agents: [{ org: SITE, jira: { siteKey: SITE, orgName: "Acme" } }, { org: AAA, jira: { siteKey: AAA, orgName: "Aaa" } }],
+    dailyBriefs: { [SITE]: [brief] },
+    meetingProposals: { [SITE]: meetings, [AAA]: [meeting({ meetingId: "a1", title: "Aaa sync" })] } });
+  const P = loadPage(META);
+  P.update(base([]));
+  P.select(P.entryKey(SITE, `d:${M}`));
+  assert.equal(P.state().selected, P.entryKey(SITE, `d:${M}`));
+  P.update(base([meeting({ meetingId: "st", title: "Standup", startedAt: S, daily: { meetingAt: S, briefRunId: "b9" } })]));
+  assert.equal(P.state().selected, P.entryKey(SITE, `d:${S}`), "the entry now carrying its brief");
+  // Gone with nothing carrying it: the nearest entry of the same org, not the first org's.
+  P.update(base([meeting({ meetingId: "x2", title: "Other", startedAt: S + 3600e3 })]));
+  assert.equal(P.state().selected.startsWith(encodeURIComponent(SITE)), true);
+});
