@@ -43627,6 +43627,22 @@ class TestStageCreateMeta(ManagerMixin, unittest.TestCase):
         with self.assertRaises(TimeoutError):
             ha._read_body_by(Drip(), ha.time.monotonic() - 1)
 
+    def test_board_urlopen_cuts_a_dripping_reply(self):
+        class Drip:
+            def read1(self, n):
+                return b" "
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        req = ha.urllib.request.Request("https://example.invalid/x")
+        with mock.patch.object(ha, "BOARD_READ_DEADLINE_SEC", 0), \
+                mock.patch.object(ha.urllib.request, "urlopen", return_value=Drip()):
+            with self.assertRaises(TimeoutError):
+                ha._board_urlopen(req)
+
     def test_a_normal_reply_is_read_whole(self):
         import io
         body = io.BufferedReader(io.BytesIO(b'{"a": 1}' * 20000))

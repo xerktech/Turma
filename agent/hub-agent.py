@@ -22841,7 +22841,9 @@ def _read_body_by(resp, deadline):
         if not chunk:
             return b"".join(chunks)
         chunks.append(chunk)
-        if time.monotonic() > deadline:
+        # A body whose last chunk lands past the deadline is still whole: only
+        # refuse once more is pending (Content-Length says so, else unknown).
+        if time.monotonic() > deadline and getattr(resp, "length", 1) != 0:
             raise TimeoutError(
                 f"tracker reply still arriving after {BOARD_READ_DEADLINE_SEC}s")
 
