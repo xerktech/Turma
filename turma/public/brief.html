@@ -12,28 +12,92 @@
 <meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
 <link rel="stylesheet" href="/app.css">
 <style>
-  /* The Daily Brief (XERK-2396, epic XERK-2390): per org, the latest standup
-     brief set for reading aloud, its earlier briefs, Run now, and the meeting
-     schedule that writes it. Its Meetings pane (XERK-2623) is meetings.js. Tokens/base/nav live in app.css. Android's
-     Brief tab mirrors both panes; schedule editing is web-only (android/PARITY.md). */
-  .brief-org {
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
-    padding: 16px 18px; margin-bottom: 18px; min-width: 0;
+  /* The Brief page (XERK-2396, XERK-2857): one two-pane triage of every org's
+     meetings and daily briefs, painted by meetings.js; the brief block and the
+     schedule editor are this page's (mount hooks). Tokens/base/nav live in app.css.
+     Android's Brief tab is its counterpart (android/PARITY.md). */
+  .wrap.tri-wrap { max-width: 1280px; padding-top: 16px; }
+  .mt-list button[aria-disabled="true"], .mt-list button[aria-disabled="true"]:hover {
+    opacity: 0.5; cursor: default; border-color: var(--border); }
+  .pane-note { color: var(--muted); font-size: 12px; margin: 16px 0 0; }
+  .pane-note kbd, .mt-kbd { font: 11px var(--font-mono); border: 1px solid var(--border); border-radius: 4px;
+    padding: 0 4px; color: var(--muted); background: transparent; }
+  button.primary .mt-kbd { color: inherit; border-color: color-mix(in srgb, currentColor 40%, transparent); }
+
+  /* ---- the two panes ---- */
+  .tri { display: grid; grid-template-columns: minmax(250px, 320px) minmax(0, 1fr); gap: 14px; align-items: start; }
+  .tri-rail, .tri-main {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); min-width: 0;
   }
-  .brief-head { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; }
-  .brief-title { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; }
-  .brief-name {
-    font-family: var(--font-display); font-size: 19px; font-weight: 600; margin: 0;
-    min-width: 0; overflow-wrap: anywhere;
+  .tri-rail { padding: 10px; position: sticky; top: 8px; max-height: calc(100vh - 120px); overflow-y: auto; }
+  .tri-main { padding: 16px 18px; }
+  .tri-search {
+    width: 100%; box-sizing: border-box; font: inherit; font-size: 14px; padding: 6px 10px;
+    border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--field); color: var(--ink);
   }
-  /* The schedule's settings toggle, beside the org name. */
-  button.sched-gear {
+  .tri-filters { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0 4px; }
+  button.tri-chip { border-radius: 999px; padding: 3px 11px; font-size: 12.5px; color: var(--ink-2); }
+  button.tri-chip.on { color: var(--accent-text); border-color: var(--accent); background: var(--accent-soft); }
+  .tri-org { margin-top: 6px; }
+  .tri-org-head { display: flex; align-items: center; gap: 6px; }
+  button.tri-org-toggle {
+    flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; text-align: left;
+    border: 0; background: none; padding: 6px 4px; font-weight: 600; font-size: 14px; color: var(--ink);
+  }
+  .tri-org.closed button.tri-org-toggle { color: var(--ink-2); }
+  .tri-org-toggle .car { width: 1em; color: var(--muted); flex: none; }
+  .tri-org-toggle .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  button.tri-gear {
     flex: none; display: inline-flex; align-items: center; justify-content: center;
-    width: 30px; height: 30px; padding: 0; border-color: transparent; color: var(--muted); border-radius: 50%;
+    width: 28px; height: 28px; padding: 0; border-color: transparent; color: var(--muted); border-radius: 50%;
   }
-  button.sched-gear:hover:not(:disabled) { color: var(--ink); border-color: var(--border); }
-  button.sched-gear[aria-expanded="true"] { color: var(--accent); background: var(--accent-soft); }
-  button.sched-gear svg { width: 18px; height: 18px; }
+  button.tri-gear:hover:not(:disabled) { color: var(--ink); border-color: var(--border); }
+  button.tri-gear[aria-expanded="true"] { color: var(--accent); background: var(--accent-soft); }
+  button.tri-gear svg { width: 16px; height: 16px; }
+  .tri-count {
+    display: inline-block; min-width: 18px; padding: 0 6px; border-radius: 999px; flex: none; box-sizing: border-box;
+    font-size: 11.5px; line-height: 18px; text-align: center; background: var(--accent); color: #fff;
+  }
+  .tri-sec { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 8px 6px 2px 22px; }
+  button.tri-entry {
+    display: flex; align-items: center; gap: 8px; width: calc(100% - 16px); margin: 2px 0 2px 16px; text-align: left;
+    border: 1px solid transparent; background: none; padding: 7px 10px; border-radius: var(--radius-sm);
+    font-size: 13.5px; color: var(--ink); min-width: 0;
+  }
+  button.tri-entry:hover:not(:disabled) { border-color: var(--hairline); }
+  button.tri-entry.sel { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+  button.tri-entry.done { color: var(--ink-2); }
+  .tri-entry .t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tri-entry .w { color: var(--muted); font-size: 11.5px; white-space: nowrap; flex: none; }
+  .tri-entry .sp { flex: 1 1 auto; }
+  .tri-note { color: var(--muted); font-size: 11.5px; white-space: nowrap; flex: none; }
+  .tri-note.bad { color: var(--critical-text); }
+  .tri-note.good { color: var(--good-text); }
+  .tri-none { color: var(--muted); font-size: 12.5px; padding: 6px 6px 6px 22px; }
+  .tri-head { display: flex; align-items: center; gap: 6px 12px; flex-wrap: wrap; }
+  .tri-title { font-family: var(--font-display); font-size: 20px; font-weight: 600; margin: 0; min-width: 0; overflow-wrap: anywhere; }
+  .tri-sub { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  .tri-h { font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin: 22px 0 6px; }
+  button.tri-back { display: none; }
+  .tri-brief { margin-top: 6px; }
+
+  /* ---- the settings drawer ---- */
+  .tri-drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; z-index: 40; width: min(460px, 100vw); box-sizing: border-box;
+    overflow-y: auto; padding: 18px 20px 32px; background: var(--surface); border-left: 1px solid var(--border);
+    box-shadow: -12px 0 32px rgba(0, 0, 0, 0.25);
+  }
+  .tri-drawer-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
+  .tri-drawer-title { flex: 1 1 auto; min-width: 0; }
+  .tri-drawer h2 { font-family: var(--font-display); font-size: 18px; margin: 0; overflow-wrap: anywhere; }
+  .tri-dsec { border-top: 1px solid var(--hairline); padding: 12px 0; font-size: 13px; }
+  .tri-dlabel { font-weight: 600; color: var(--ink-2); margin-bottom: 6px; }
+
+  /* ---- the brief block (this page's) ---- */
+  .brief-head { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; }
+  .brief-head .sp { flex: 1 1 auto; }
+  .brief-head .tri-h { margin: 0; }
+  .brief-block { padding: 2px 0 4px; }
   .brief-actions { display: flex; gap: 8px; flex-wrap: wrap; }
   .brief-status { font-size: 13px; margin-top: 10px; overflow-wrap: anywhere; }
   .brief-status.running { color: var(--ink-2); }
@@ -46,32 +110,19 @@
     font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
     color: var(--muted); margin: 18px 0 4px;
   }
-  .brief-read p { font-size: 20px; line-height: 1.6; margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+  .brief-read p { font-size: 19px; line-height: 1.6; margin: 0; color: var(--ink); overflow-wrap: anywhere; }
   .brief-none { color: var(--muted); font-size: 14px; margin-top: 12px; }
-
-  .brief-org details { margin-top: 14px; border-top: 1px solid var(--hairline); padding-top: 10px; }
-  .brief-sched {
-    margin-top: 12px; padding: 12px 14px; border: 1px solid var(--hairline);
-    border-radius: var(--radius-sm); background: var(--page);
-  }
   .sched-title { font-size: 13px; font-weight: 600; color: var(--ink-2); }
   .sched-title .sum { font-weight: 400; color: var(--muted); margin-left: 6px; overflow-wrap: anywhere; }
-  .brief-org summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink-2); }
-  .brief-org summary .sum { font-weight: 400; color: var(--muted); margin-left: 6px; overflow-wrap: anywhere; }
-  .brief-earlier ul { list-style: none; margin: 8px 0 0; padding: 0; }
-  .brief-earlier li { border-top: 1px solid var(--hairline); padding: 6px 0; font-size: 13px; overflow-wrap: anywhere; }
-  .brief-earlier li:first-child { border-top: 0; }
-  .brief-earlier .when { color: var(--muted); font-size: 12px; margin-right: 8px; white-space: nowrap; }
-  .brief-earlier .bad { color: var(--critical-text); }
-
   .sched-form { display: flex; flex-direction: column; gap: 12px; margin-top: 10px; font-size: 13px; }
   .sched-row { display: flex; flex-wrap: wrap; gap: 12px 18px; }
   .sched-form label.f { display: flex; flex-direction: column; gap: 4px; color: var(--ink-2); min-width: 0; }
-  .sched-form input[type=time], .sched-form input[type=number], .sched-form select {
+  .sched-form input[type=time], .sched-form input[type=number], .sched-form input[type=text], .sched-form select {
     font: inherit; font-size: 14px; border: 1px solid var(--border); border-radius: var(--radius-sm);
     background: var(--field); color: var(--ink); padding: 5px 8px; max-width: 100%;
   }
   .sched-form input[type=number] { width: 6em; }
+  .sched-form input[type=text] { width: 18em; }
   .sched-form select.tz { width: 260px; }
   .sched-form .sw { display: flex; align-items: center; gap: 8px; color: var(--ink); }
   .sched-form fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
@@ -79,83 +130,55 @@
   .sched-days { display: flex; flex-wrap: wrap; gap: 6px 12px; }
   .sched-days label { display: inline-flex; align-items: center; gap: 4px; }
   .sched-next { color: var(--ink-2); }
+  .sched-hint { color: var(--muted); font-size: 12px; }
   .sched-err { color: var(--critical-text); overflow-wrap: anywhere; }
   .sched-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-  .brief-org button[aria-disabled="true"],
-  .brief-org button[aria-disabled="true"]:hover { opacity: 0.5; cursor: default; border-color: var(--border); }
-  .brief-empty { color: var(--muted); font-size: 14px; padding: 24px 0; }
-  .pane-note { color: var(--muted); font-size: 12px; margin: 16px 0 0; }
 
-  @media (max-width: 600px) {
-    .brief-org { padding: 14px 12px; }
-    .brief-read p { font-size: 18px; }
-    .sched-form select.tz { width: 100%; }
-  }
-  /* Daily brief | Meetings (XERK-2623): the page's two panes, Insights' sub-tab look.
-     One row at any width: a phone scrolls it sideways rather than wrapping a tab. */
-  .subtabs {
-    display: flex; gap: 4px; margin: 0 0 16px; overflow-x: auto; scrollbar-width: none;
-    border-bottom: 1px solid var(--hairline);
-  }
-  .subtabs::-webkit-scrollbar { display: none; }
-  .subtabs a {
-    color: var(--ink-2); text-decoration: none; font-size: 14px; font-weight: 600;
-    padding: 8px 12px; border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap;
-  }
-  .subtabs a:hover { color: var(--ink); }
-  .subtabs a.active { color: var(--accent-text); border-bottom-color: var(--accent); }
-  .subtabs .count {
-    display: inline-block; min-width: 18px; padding: 0 6px; margin-left: 4px; border-radius: 999px;
-    font-size: 11.5px; line-height: 18px; text-align: center; background: var(--accent); color: #fff;
-  }
-  .subtabs .count:empty { display: none; }
-  /* The Meetings pane (XERK-2510): proposals from a Tenir meeting, reviewed by the operator. */
-  .mt-labels { margin-bottom: 18px; font-size: 13px; color: var(--ink-2); }
-  .mt-labels summary { cursor: pointer; color: var(--ink-2); }
-  .mt-labels-hint { color: var(--muted); margin: 6px 0 8px; }
-  .mt-label-row { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; padding: 4px 0; min-width: 0; }
-  .mt-label-row .name { min-width: 8em; font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+  /* ---- proposals (meetings.js) ---- */
+  .mt-labels-hint { color: var(--muted); margin: 6px 0 0; font-size: 12.5px; }
+  .mt-label-row { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; padding: 2px 0; min-width: 0; }
   .mt-label-row input, .mt-miss select {
     font: inherit; padding: 4px 6px; border: 1px solid var(--hairline); border-radius: 6px;
-    background: var(--surface); color: var(--ink); max-width: 100%; }
+    background: var(--field); color: var(--ink); max-width: 100%; }
   .mt-label-row input { width: 12em; }
   .mt-label-row .def { color: var(--muted); }
-  .mt-label-row input.mt-focus-names { width: 16em; }
-  .mt-label-row input.mt-focus-role { width: 14em; }
-  .mt-miss { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; margin-bottom: 10px;
-    padding: 8px 10px; border-radius: 8px; font-size: 13px; color: var(--ink);
-    background: color-mix(in srgb, var(--warning) 14%, var(--surface)); }
+  .mt-label-row input.mt-focus-names { width: 100%; box-sizing: border-box; }
+  .mt-label-row input.mt-focus-role { flex: 1 1 10em; }
+  .mt-misses { margin-bottom: 12px; padding: 4px 12px; border-radius: var(--radius-md);
+    border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+    background: color-mix(in srgb, var(--warning) 12%, var(--surface)); }
+  .mt-miss { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; padding: 6px 0; font-size: 13px; color: var(--ink); }
+  .mt-miss + .mt-miss { border-top: 1px solid var(--hairline); }
   .mt-miss .what { flex: 1 1 18em; min-width: 0; overflow-wrap: anywhere; }
   .mt-err-inline { color: var(--critical-text); }
-  @media (max-width: 560px) {
-    .mt-label-row .name { flex-basis: 100%; min-width: 0; }
-    .mt-label-row input, .mt-label-row input.mt-focus-names, .mt-label-row input.mt-focus-role { flex: 1 1 8em; width: auto; }
-  }
-  .mt-org { margin-bottom: 22px; min-width: 0; }
-  .mt-org-head { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; margin-bottom: 10px; }
-  .mt-org-name { font-family: var(--font-display); font-size: 19px; font-weight: 600; margin: 0;
-    flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
-  .mt-target { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2); flex-wrap: wrap; }
+  .mt-target { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2); flex-wrap: wrap; margin-top: 8px; }
   .mt-target select, .mt-edit select, .mt-edit input, .mt-edit textarea {
     font: inherit; font-size: 14px; border: 1px solid var(--border); border-radius: var(--radius-sm);
     background: var(--field); color: var(--ink); padding: 5px 8px; max-width: 100%; min-width: 0;
   }
   .mt-target .err { color: var(--critical-text); }
-  .mt-meeting {
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
-    padding: 14px 16px; margin-bottom: 12px; min-width: 0;
-  }
+  .mt-meeting { min-width: 0; }
+  .mt-meeting:not(.primary) { border: 1px solid var(--hairline); border-radius: var(--radius-md); padding: 12px 14px; margin-top: 10px; }
   .mt-head { display: flex; align-items: baseline; gap: 6px 12px; flex-wrap: wrap; }
-  .mt-head > a { font-size: 13px; color: var(--accent-text); white-space: nowrap; }
+  .mt-tools { display: inline-flex; align-items: center; gap: 10px; margin-left: auto; flex-wrap: wrap; }
+  .mt-tools > a { font-size: 13px; color: var(--accent-text); white-space: nowrap; }
   .mt-title { font-size: 16px; font-weight: 600; margin: 0; flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
   .mt-meta { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+  /* The meta bits wrap between bits (each is nowrap), never off the pane. */
+  div.mt-meta { display: flex; flex-wrap: wrap; }
   .mt-meta .bit { white-space: nowrap; }
   .mt-meta .sep::after { content: " · "; white-space: pre; }
   .mt-status { font-size: 13px; margin-top: 10px; color: var(--ink-2); overflow-wrap: anywhere; }
   .mt-status.failed { color: var(--critical-text); }
+  .mt-prog { height: 6px; background: var(--hairline); border-radius: 3px; overflow: hidden; margin: 12px 0 4px; }
+  .mt-prog i { display: block; height: 100%; background: var(--good); }
+  .mt-progtext { font-size: 12.5px; color: var(--muted); }
+  button.linkish { border: 0; background: none; padding: 0; font: inherit; color: var(--accent-text); cursor: pointer; }
+  button.linkish:hover:not(:disabled) { text-decoration: underline; }
   .mt-items { list-style: none; margin: 10px 0 0; padding: 0; }
-  .mt-item { border-top: 1px solid var(--hairline); padding: 12px 0 4px; min-width: 0; }
-  .mt-item:first-child { border-top: 0; }
+  .mt-item { border: 1px solid var(--hairline); border-radius: var(--radius-md); padding: 12px 14px; margin-top: 10px; min-width: 0; }
+  .mt-item.cur { border-color: var(--accent); }
+  .mt-done .mt-item { background: var(--page); }
   .mt-item-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
   .mt-kind {
     flex: none; font-size: 11px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase;
@@ -185,30 +208,28 @@
   .mt-edit textarea { min-height: 8em; resize: vertical; }
   .mt-edit .row { display: flex; gap: 8px; flex-wrap: wrap; }
   .mt-err { color: var(--critical-text); font-size: 13px; margin-top: 6px; overflow-wrap: anywhere; }
-  .mt-list button[aria-disabled="true"], .mt-list button[aria-disabled="true"]:hover {
-    opacity: 0.5; cursor: default; border-color: var(--border); }
   .mt-empty { color: var(--muted); font-size: 14px; padding: 24px 0; }
-  @media (max-width: 600px) {
-    .mt-meeting { padding: 12px; }
+
+  /* Narrow screens: one pane at a time, a back button to the rail. */
+  @media (max-width: 759px) {
+    .wrap.tri-wrap { padding-left: 12px; padding-right: 12px; }
+    .tri { grid-template-columns: minmax(0, 1fr); }
+    .tri-rail { position: static; max-height: none; }
+    .tri.show-main .tri-rail, .tri:not(.show-main) .tri-main { display: none; }
+    button.tri-back { display: inline-flex; }
+    .tri-main { padding: 14px 12px; }
+    .brief-read p { font-size: 17px; }
+    .sched-form select.tz, .sched-form input[type=text] { width: 100%; }
+    .mt-tools { margin-left: 0; }
   }
 </style>
 </head>
 <body class="app-shell">
 <header class="site-header" id="siteHeader" data-page="brief"></header>
 <div class="page-scroll">
-<div class="wrap">
-  <nav class="subtabs" id="subtabs">
-    <a href="#brief" data-pane="brief">Daily brief</a>
-    <a href="#meetings" data-pane="meetings">Meetings<span class="count" id="meetingsCount"></span></a>
-  </nav>
-  <section id="pane-brief" data-pane-body="brief">
-    <div id="briefList"></div>
-    <div class="pane-note">An agent host of each org writes its <b>daily brief</b> a few minutes before the org's meeting, from your own tickets in that org: what moved since the last meeting, the week so far and what is next. Times on this page are in your time zone.</div>
-  </section>
-  <section id="pane-meetings" data-pane-body="meetings" hidden>
-    <div id="meetingList" class="mt-list"></div>
-    <div class="pane-note">When Tenir captures a meeting, an agent host of the org reads its captions and <b>proposes</b> work items. Nothing reaches the board until you approve one: Approve creates the ticket on that org's board, a decision is added to the org's decisions log, and Reject sets it aside.</div>
-  </section>
+<div class="wrap tri-wrap">
+  <div id="meetingList" class="mt-list"></div>
+  <div class="pane-note">Each org's <b>daily brief</b> is written by one of its agent hosts a few minutes before the org's daily meeting, from your own tickets in that org. When Tenir captures a meeting, a host of the org reads its captions and <b>proposes</b> work items; nothing reaches the board until you approve one. Keys: <kbd>J</kbd>/<kbd>K</kbd> move, <kbd>A</kbd> approve, <kbd>S</kbd> approve + session, <kbd>E</kbd> edit, <kbd>R</kbd> reject. Times are in your time zone.</div>
 </div>
 </div>
 
@@ -264,8 +285,6 @@ function headlineOf(b) {
   const m = /^.*?[.!?](?= |$)/u.exec(b.day || "");
   return m ? m[0] : (b.day || "");
 }
-const GEAR_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
-  + `<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MODELS = ["auto", "haiku", "sonnet"];
 const DEFAULT_SCHEDULE = { enabled: true, time: "09:00", weekdays: [1, 2, 3, 4, 5], leadMinutes: 5, model: "auto" };
@@ -298,7 +317,8 @@ function formValues(site, stored) {
   if (d) return d;
   const s = stored || { ...DEFAULT_SCHEDULE, timeZone: browserZone() };
   return { enabled: s.enabled, time: s.time, timeZone: s.timeZone, weekdays: [...s.weekdays],
-    leadMinutes: s.leadMinutes ?? 5, model: s.model || "auto" };
+    leadMinutes: s.leadMinutes ?? 5, model: s.model || "auto",
+    meetingTitle: typeof s.meetingTitle === "string" ? s.meetingTitle : "" };
 }
 function nextHtml(site, stored) {
   if (!stored) return "No schedule yet — save one to have a brief written before each meeting.";
@@ -307,8 +327,11 @@ function nextHtml(site, stored) {
   if (!n || !n.next) return "";
   return `Next brief: <b>${esc(fmtWhen(n.next.runAt))}</b>, for the ${esc(fmtWhen(n.next.meetingAt))} meeting (your time).`;
 }
-function scheduleHtml(site, stored) {
-  if (!schedOpen.has(site)) return "";
+// The org's schedule editor, in its settings drawer (meetings.js asks for it).
+// Only a live org's: the routes 404 an org no host is decided into.
+function scheduleHtml(site) {
+  if (!liveOrgs.has(site)) return "";
+  const stored = (lastData && own(lastData.dailyBriefSchedules, site)) || null;
   const v = formValues(site, stored);
   const tzs = zones().includes(v.timeZone) ? zones() : [v.timeZone, ...zones()];
   const opt = (val, sel, label = val) => `<option value="${esc(val)}"${val === sel ? " selected" : ""}>${esc(label)}</option>`;
@@ -329,16 +352,18 @@ function scheduleHtml(site, stored) {
     + `<label class="f">Minutes before the meeting<input type="number" data-f="leadMinutes" min="1" max="30" step="1" value="${esc(v.leadMinutes)}"></label>`
     + `<label class="f">Model<select data-f="model">${MODELS.map((m) => opt(m, v.model, m === "auto" ? "auto (haiku)" : m)).join("")}</select></label>`
     + `</div>`
+    + `<label class="f">Daily meeting title contains<input type="text" data-f="meetingTitle" maxlength="100" autocomplete="off" placeholder="e.g. standup" value="${esc(v.meetingTitle)}"></label>`
+    + `<div class="sched-hint">A captured meeting at the schedule's time is the daily one; so is one whose title contains this.</div>`
     + (next ? `<div class="sched-next">${next}</div>` : "")
     + (err ? `<div class="sched-err">${esc(err)}</div>` : "")
     + `<div class="sched-actions"><button type="submit" class="primary btn-sm" data-sched-save="${esc(site)}" aria-disabled="${busy}">${busy ? "Saving…" : "Save schedule"}</button>`
     + (drafts.has(site) ? `<button type="button" class="btn-sm" data-sched-reset="${esc(site)}">Discard changes</button>` : "")
     + `</div></form></div>`;
 }
-function statusHtml(site, head, latest, now) {
+function statusHtml(site, head, latest, now, current) {
   // A refusal stands only until the org's runs move on (a run started
   // elsewhere, or this one settled): a stale "try again" must not hide it.
-  const refused = runRefusal.get(site);
+  const refused = current && runRefusal.get(site);
   if (refused && refused.head === (head ? head.runId : null)) {
     return `<div class="brief-status failed">${esc(refused.text)}</div>`;
   }
@@ -352,56 +377,57 @@ function statusHtml(site, head, latest, now) {
   }
   return "";
 }
-function briefOrgHtml(site, { list, schedule, live, name, now }) {
-  list = Array.isArray(list) ? list : [];
-  const head = list[0];
+// A daily entry's brief (meetings.js's entry: `briefs` newest first for that
+// meetingAt, `upcoming` the hub's next run for it, `current` today's/upcoming).
+// The shown brief is the newest `ok` row; a newer running/failed row is the
+// status line above it, so a run in flight never hides the last brief.
+function briefHtml(site, e) {
+  const now = paintAt || Date.now();
+  const live = liveOrgs.has(site);
+  const list = Array.isArray(e.briefs) ? e.briefs : [];
   const latest = list.find((b) => b.status === "ok" && SECTIONS.some(([k]) => b[k]));
-  const running = head && head.status === "running";
+  const said = latest || list.find((b) => b.status === "ok" && b.headline);
+  // The org's newest row is the run in flight wherever it lands; a current
+  // entry says so (Run now lives there).
+  const orgList = (lastData && own(lastData.dailyBriefs, site)) || [];
+  const orgHead = Array.isArray(orgList) ? orgList[0] : null;
+  const head = e.current && orgHead && orgHead.status === "running" ? orgHead : list[0];
+  const running = orgHead && orgHead.status === "running";
   const actions = `<div class="brief-actions">`
-    + (latest ? `<button type="button" class="btn-sm" data-copy="${esc(site)}">${copied.has(site) ? "Copied" : "Copy"}</button>` : "")
-    + (live ? `<button type="button" class="btn-sm" data-run="${esc(site)}" aria-disabled="${!!(running || runBusy.has(site))}">Run now</button>` : "")
+    + (latest ? `<button type="button" class="btn-sm" data-copy="${esc(site)}" data-copy-run="${esc(latest.runId)}">${copied.has(site) ? "Copied" : "Copy"}</button>` : "")
+    + (live && e.current ? `<button type="button" class="btn-sm" data-run="${esc(site)}" aria-disabled="${!!(running || runBusy.has(site))}">Run now</button>` : "")
     + `</div>`;
   let body;
-  if (latest) {
+  if (said) {
     const meta = [];
-    if (isTime(latest.meetingAt)) meta.push(`For the ${esc(fmtWhen(latest.meetingAt))} meeting`);
-    if (isTime(latest.generatedAt)) meta.push(`written ${esc(fmtWhen(latest.generatedAt))}`);
-    if (latest.model) meta.push(esc(latest.model));
-    if (latest.host) meta.push(`on ${esc(displayKey(latest.host))}`);
+    if (isTime(said.meetingAt)) meta.push(`For the ${esc(fmtWhen(said.meetingAt))} meeting`);
+    if (isTime(said.generatedAt)) meta.push(`written ${esc(fmtWhen(said.generatedAt))}`);
+    if (said.model) meta.push(esc(said.model));
+    if (said.host) meta.push(`on ${esc(displayKey(said.host))}`);
     body = `<div class="brief-meta">${meta.map((m) => `<span class="bit">${m}</span>`).join(" · ")}</div>`
       + `<article class="brief-read">`
-      + SECTIONS.filter(([k]) => latest[k]).map(([k, h]) => `<h3>${esc(h)}</h3><p>${esc(latest[k])}</p>`).join("")
+      + (latest ? SECTIONS.filter(([k]) => latest[k]).map(([k, h]) => `<h3>${esc(h)}</h3><p>${esc(latest[k])}</p>`).join("")
+        : `<p>${esc(headlineOf(said))}</p>`)
       + `</article>`;
+  } else if (head && head.status === "failed") {
+    body = "";
+  } else if (e.upcoming && isTime(e.upcoming.runAt) && !(head && head.status === "running")) {
+    body = `<div class="brief-none">The brief is written ${esc(fmtWhen(e.upcoming.runAt))}.${live ? " Run now writes one sooner." : ""}</div>`;
+  } else if (!head) {
+    body = `<div class="brief-none">No brief was written for this meeting.${live && e.current ? " Run now writes one, or set a schedule with the gear by the org name." : ""}</div>`;
   } else {
-    body = `<div class="brief-none">No brief written yet.${live ? " Run now writes one, or set a schedule with the gear by the org name." : ""}</div>`;
+    body = "";
   }
-  const earlier = list.filter((b) => b !== latest && b.status !== "running");
-  const earlierHtml = earlier.length
-    ? `<details class="brief-earlier" data-earlier-open="${esc(site)}"${earlierOpen.has(site) ? " open" : ""}>`
-      + `<summary>Earlier briefs<span class="sum">${earlier.length}</span></summary><ul>`
-      + earlier.map((b) => `<li><span class="when">${esc(fmtWhen(isTime(b.meetingAt) ? b.meetingAt : b.startedAt))}</span>`
-        + (b.status === "failed"
-          ? `<span class="bad">failed — ${esc(b.error || "the brief could not be written")}</span>`
-          : esc(headlineOf(b)))
-        + `</li>`).join("")
-      + `</ul></details>`
-    : "";
-  const open = schedOpen.has(site);
-  const gear = live
-    ? `<button type="button" class="sched-gear" data-sched-toggle="${esc(site)}" aria-expanded="${open}"`
-      + ` aria-label="Schedule settings" title="Schedule: ${esc(scheduleSummary(schedule))}">${GEAR_SVG}</button>`
-    : "";
-  return `<section class="brief-org"><div class="brief-head"><div class="brief-title"><h2 class="brief-name">${esc(name || displayKey(site))}</h2>${gear}</div>${actions}</div>`
-    + (live ? scheduleHtml(site, schedule) : "")
-    + statusHtml(site, head, latest, now) + body + earlierHtml
-    + `</section>`;
+  return `<section class="brief-block"><div class="brief-head"><h3 class="tri-h">Daily brief</h3><span class="sp"></span>${actions}</div>`
+    + statusHtml(site, head, latest, now, e.current) + body + `</section>`;
 }
 
 // ---- page state ----------------------------------------------------------------
-const $briefs = document.getElementById("briefList");
+// The triage is meetings.js's; it paints this page's brief block and schedule
+// editor through the hooks below, into the one list. Its repaint holds (a field
+// with focus, a pointer press) cover this page's controls too.
+const $briefs = document.getElementById("meetingList");
 const drafts = new Map();      // site -> unsaved schedule form values
-const schedOpen = new Set();   // sites whose schedule settings are open (the gear)
-const earlierOpen = new Set(); // sites whose earlier-briefs list is open
 const schedErr = new Map();    // site -> the hub's refusal of the last save
 const schedBusy = new Set();
 const runBusy = new Set();
@@ -411,11 +437,10 @@ const nextFor = new Map();     // site -> {sig, next, at}: GET .../schedule's `n
 const nextBusy = new Set();
 const NEXT_RETRY_MS = 60000;
 let cache = null;
+let lastData = null;           // the snapshot the last paint was asked for
+let paintAt = 0;               // its "now"
 let liveOrgs = new Set();
 let shownSites = [];
-let painted = null;
-let paintPending = false;
-let pointerDown = false;
 
 function orgsOf(data) {
   const live = new Set();
@@ -425,18 +450,9 @@ function orgsOf(data) {
   for (const s of Object.keys(briefs)) if (Array.isArray(own(briefs, s)) && own(briefs, s).length) all.add(s);
   return { live, all };
 }
-// A repaint replaces the form, so a background one waits while a field in it
-// has focus (a native <select> popup would close, a half-typed time would be
-// lost), and while a pointer is pressed in the list: a swap between mousedown
-// and mouseup makes the browser dispatch no click at all (turma.md, the
-// dashboard's same trap). focusout / pointerup paint what was held.
-function editing() {
-  const ae = document.activeElement;
-  return !!(ae && /^(INPUT|SELECT)$/.test(ae.tagName || "") && typeof $briefs.contains === "function" && $briefs.contains(ae));
-}
 // What has focus, as keys that survive the swap: a button by its data-* site,
 // a form field by its site + field (+ value for a weekday).
-const FOCUS_KEYS = ["run", "copy", "schedToggle", "schedReset", "schedSave"];
+const FOCUS_KEYS = ["run", "copy", "schedReset", "schedSave"];
 function focusKey() {
   const ae = document.activeElement;
   const ds = ae && ae.dataset;
@@ -454,14 +470,12 @@ function restoreFocus(key) {
       && (key.value === undefined || x.value === key.value));
   if (el && el.focus) el.focus();
 }
-// `force`: the viewer's own click (the gear, Discard) paints at once, focus
-// kept on the field or button it was on. Never through a pointer press.
 // Busy state and a save's error go straight onto the controls, never only
 // through a repaint: a repaint is held while a field has focus, and a Save left
 // reading "Saving…" and disabled swallowed the next click (QA). The next
 // repaint draws the same state from schedBusy / schedErr / runBusy.
 function patchSave(site) {
-  painted = null;
+  TurmaMeetings.invalidate();
   const form = [...$briefs.querySelectorAll("[data-sched]")].find((f) => f.dataset.sched === site);
   if (!form) return;
   const busy = schedBusy.has(site);
@@ -479,78 +493,41 @@ function patchSave(site) {
   if (err) { if (text) err.textContent = text; else err.remove(); }
 }
 function patchRun(site) {
-  painted = null;
+  TurmaMeetings.invalidate();
   const running = orgRunning(site);
   for (const b of $briefs.querySelectorAll("[data-run]")) {
     if (b.dataset.run === site) b.setAttribute("aria-disabled", String(runBusy.has(site) || !!running));
   }
 }
+// `force`: the viewer's own click (Discard) paints at once, focus kept on the
+// field or button it was on. Never through a pointer press (meetings.js holds it).
 function renderBriefs(data, now, force = false) {
-  if (pointerDown || (!force && editing())) { paintPending = true; return; }
-  paintPending = false;
   const keys = TurmaOrg.getKeys();
   const { live, all } = orgsOf(data);
   liveOrgs = live;
   shownSites = [...all].filter((s) => !keys.length || keys.includes(s)).sort();
-  const briefs = data.dailyBriefs && typeof data.dailyBriefs === "object" ? data.dailyBriefs : {};
+  lastData = data;
+  paintAt = now;
   const schedules = data.dailyBriefSchedules && typeof data.dailyBriefSchedules === "object" ? data.dailyBriefSchedules : {};
-  const names = new Map((TurmaBoard.mergeSites ? TurmaBoard.mergeSites(data.agents || []) : [])
-    .map((x) => [x.siteKey, x.orgName]));
-  const name = (s) => (TurmaBoard.orgName ? TurmaBoard.orgName(s, names.get(s)) : s);
-  const html = shownSites.length
-    ? shownSites.map((s) => briefOrgHtml(s, { list: own(briefs, s), schedule: own(schedules, s) || null,
-      live: live.has(s), name: name(s), now })).join("")
-    : `<div class="brief-empty">No org yet — no host reports a tracker org.</div>`;
   syncNext(schedules, now);
-  if (html === painted) return;
-  painted = html;
-  const focus = focusKey();
-  TurmaNav.preserveScroll($briefs, () => { $briefs.innerHTML = html; });
-  restoreFocus(focus);
+  TurmaMeetings.update(data, force);
 }
 function render(data) {
   TurmaOrg.update(data);
   TurmaNewTicket.update(data);
   renderBriefs(data, Date.now());
-  renderMeetingsPane(data);
 }
 
-// ---- Daily brief | Meetings (XERK-2623) ------------------------------------------
-// The meetings review (meetings.js) is this page's second pane; `#meetings` opens
-// it, so the old /meetings URL and the "N proposals" push land on it.
-const PANES = ["brief", "meetings"];
-const $meetingsCount = document.getElementById("meetingsCount");
-function paneOf(hash) {
-  const p = String(hash || "").replace(/^#/, "");
-  return PANES.includes(p) ? p : PANES[0];
-}
-let pane = paneOf(location.hash);
-function showPane() {
-  for (const a of document.querySelectorAll("[data-pane]")) a.classList.toggle("active", a.dataset.pane === pane);
-  for (const s of document.querySelectorAll("[data-pane-body]")) s.hidden = s.dataset.paneBody !== pane;
-}
-addEventListener("hashchange", () => { pane = paneOf(location.hash); showPane(); });
-showPane();
-TurmaMeetings.mount(document.getElementById("meetingList"));
-// Painted whichever pane shows, so a switch is instant and the tab's count is live.
-function renderMeetingsPane(data) {
-  TurmaMeetings.update(data);
-  const n = TurmaMeetings.pendingCount(data);
-  $meetingsCount.textContent = n ? String(n) : "";
-}
-function flushHeld() {
-  setTimeout(() => { if (paintPending && cache) renderBriefs(cache, Date.now()); }, 0);
-}
-$briefs.addEventListener("focusout", flushHeld);
-$briefs.addEventListener("pointerdown", () => { pointerDown = true; }, true);
-// Released anywhere (a press can end off the list). The flush is a task later,
-// so the click this press makes has been dispatched first.
-// A context menu or the window losing focus can eat the pointerup; neither may
-// leave every background paint held. `blur` only for the WINDOW: on capture it
-// also fired for the field the press itself blurred, swapping the list mid-press (QA).
-function releasePress() { if (pointerDown) { pointerDown = false; flushHeld(); } }
-for (const ev of ["pointerup", "pointercancel", "contextmenu"]) addEventListener(ev, releasePress, true);
-addEventListener("blur", (e) => { if (e.target === window) releasePress(); });
+// `#brief`, `#meetings` and the old /meetings URL all land on the one pane.
+TurmaMeetings.mount($briefs, {
+  now: () => paintAt || Date.now(),
+  nextOf: (site) => {
+    const sch = lastData && own(lastData.dailyBriefSchedules, site);
+    const n = nextFor.get(site);
+    return sch && sch.enabled && n && n.next ? n.next : null;
+  },
+  briefHtml, scheduleHtml, focusKey, restoreFocus,
+});
 
 // The next run is the hub's to compute (DST, the lead window), so it is read
 // from GET .../schedule for each shown org with a schedule: again when the
@@ -580,7 +557,7 @@ async function fetchNext(site, sig) {
     nextFor.set(site, { sig, next: have ? have.next : null, at: Date.now(), failed: true, retryAt: Date.now() + NEXT_RETRY_MS });
   }
   nextBusy.delete(site);
-  painted = null;
+  TurmaMeetings.invalidate();
   if (cache) renderBriefs(cache, Date.now());
 }
 
@@ -628,8 +605,10 @@ async function saveSchedule(site) {
   if (schedBusy.has(site)) return;
   const stored = (cache && own(cache.dailyBriefSchedules, site)) || null;
   const v = formValues(site, stored);
+  // `meetingTitle` (XERK-2856) marks the org's daily meeting by its title; a
+  // hub without it ignores the field.
   const body = { enabled: v.enabled, time: v.time, timeZone: v.timeZone, weekdays: v.weekdays,
-    leadMinutes: Number(v.leadMinutes), model: v.model };
+    leadMinutes: Number(v.leadMinutes), model: v.model, meetingTitle: String(v.meetingTitle || "").trim() };
   schedBusy.add(site);
   schedErr.delete(site);
   patchSave(site);
@@ -643,16 +622,18 @@ async function saveSchedule(site) {
   } else {
     drafts.delete(site);
     if (out && out.schedule && cache) {
-      cache.dailyBriefSchedules = { ...(cache.dailyBriefSchedules || {}), [site]: out.schedule };
+      cache.dailyBriefSchedules = { ...(cache.dailyBriefSchedules || {}) };
+      Object.defineProperty(cache.dailyBriefSchedules, site, { value: out.schedule, enumerable: true, writable: true, configurable: true });
       nextFor.set(site, { sig: JSON.stringify(out.schedule), next: out.next || null, at: Date.now() });
     }
   }
   patchSave(site);
   if (cache) renderBriefs(cache, Date.now());
 }
-async function copyBrief(site) {
+async function copyBrief(site, runId) {
   const list = (cache && own(cache.dailyBriefs, site)) || [];
-  const b = list.find((x) => x.status === "ok" && SECTIONS.some(([k]) => x[k]));
+  const ok = (x) => x.status === "ok" && SECTIONS.some(([k]) => x[k]);
+  const b = list.find((x) => x.runId === runId && ok(x)) || list.find(ok);
   if (!b) return;
   try {
     await navigator.clipboard.writeText(briefText(b));
@@ -676,7 +657,7 @@ function editField(site, el) {
     if (el.checked) set.add(i); else set.delete(i);
     d.weekdays = [...set].sort((a, b) => a - b);
   } else if (f === "leadMinutes") d.leadMinutes = el.value;
-  else if (f === "time" || f === "timeZone" || f === "model") d[f] = el.value;
+  else if (f === "time" || f === "timeZone" || f === "model" || f === "meetingTitle") d[f] = el.value;
   else return;
   drafts.set(site, d);
 }
@@ -692,8 +673,9 @@ $briefs.addEventListener("change", (e) => {
   const site = formSite(e.target);
   if (site === undefined || !e.target.dataset || !e.target.dataset.f) return;
   editField(site, e.target);
-  // A checkbox or select keeps no half-typed state, so show the Discard button now.
-  if (e.target.type === "checkbox" || e.target.tagName === "SELECT") { paintPending = true; }
+  // A checkbox or select keeps no half-typed state, so show the Discard button
+  // once focus leaves it (the held repaint).
+  if (e.target.type === "checkbox" || e.target.tagName === "SELECT") TurmaMeetings.hold();
 });
 $briefs.addEventListener("submit", (e) => {
   const site = formSite(e.target);
@@ -702,29 +684,16 @@ $briefs.addEventListener("submit", (e) => {
   saveSchedule(site);
 });
 $briefs.addEventListener("click", (e) => {
-  const t = e.target.closest && e.target.closest("[data-run],[data-copy],[data-sched-reset],[data-sched-toggle]");
+  const t = e.target.closest && e.target.closest("[data-run],[data-copy],[data-sched-reset]");
   if (!t) return;
-  if (t.dataset.schedToggle !== undefined) {
-    const site = t.dataset.schedToggle;
-    if (schedOpen.has(site)) schedOpen.delete(site); else schedOpen.add(site);
-    if (cache) renderBriefs(cache, Date.now(), true);
-  } else if (t.dataset.run !== undefined) runNow(t.dataset.run);
-  else if (t.dataset.copy !== undefined) copyBrief(t.dataset.copy);
+  if (t.dataset.run !== undefined) runNow(t.dataset.run);
+  else if (t.dataset.copy !== undefined) copyBrief(t.dataset.copy, t.dataset.copyRun);
   else {
     drafts.delete(t.dataset.schedReset);
     schedErr.delete(t.dataset.schedReset);
     if (cache) renderBriefs(cache, Date.now(), true);
   }
 });
-// `toggle` does not bubble: catch it on capture so a repaint keeps each
-// <details> as the viewer left it.
-$briefs.addEventListener("toggle", (e) => {
-  const d = e.target;
-  if (!d || !d.dataset) return;
-  const site = d.dataset.earlierOpen;
-  if (site === undefined) return;
-  if (d.open) earlierOpen.add(site); else earlierOpen.delete(site);
-}, true);
 
 // ---- the fleet snapshot --------------------------------------------------------
 // A fetch MERGES, never replaces (XERK-444): an SSE frame that lands while
@@ -787,7 +756,7 @@ function connectSSE() {
     if (!cache) return void refresh();
     meetingsClock++;
     cache.meetingProposals = d;
-    renderMeetingsPane(cache);
+    renderBriefs(cache, Date.now());
   });
   // Each org's Tenir label and the labels no org has (XERK-2638), and whose
   // work its meetings propose (XERK-2514).
@@ -798,7 +767,7 @@ function connectSSE() {
       if (!cache) return void refresh();
       labelsClock++;
       cache[ev] = d;
-      renderMeetingsPane(cache);
+      renderBriefs(cache, Date.now());
     });
   }
   TurmaOrg.sse(es);
