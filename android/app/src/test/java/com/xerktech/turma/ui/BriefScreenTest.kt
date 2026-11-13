@@ -145,6 +145,21 @@ class BriefScreenTest {
         """{ "meetingId": "$id", "status": "ok", "title": "$title", "startedAt": $yday, "archivedAt": ${if (archived) 5 else 0},
             "items": [ { "id": "p1", "kind": "task", "title": "Item of $title" $review } ] }"""
 
+    // The fleet reaches the screen through the VM's flow, not synchronously.
+    private fun waitFor(text: String) =
+        compose.waitUntil(10_000) { compose.onAllNodesWithText(text, substring = true).fetchSemanticsNodes().isNotEmpty() }
+
+    private fun waitGone(text: String) =
+        compose.waitUntil(10_000) { compose.onAllNodesWithText(text, substring = true).fetchSemanticsNodes().isEmpty() }
+
+    private fun twoOrgs(alphaReview: String = "") = """
+        { "now": 1, "agents": [ ${hostOf("h1", "a.atlassian.net", "Zed")}, ${hostOf("h2", "b.atlassian.net", "Alpha")} ],
+          "meetingProposals": { "a.atlassian.net": [ ${meeting("m1", "Zed sync")} ],
+                                "b.atlassian.net": [ ${meeting("m2", "Alpha sync", review = alphaReview)} ] } }
+    """
+
+    private val answered = """, "review": { "state": "rejected", "at": 5 }"""
+
     private val wideOpen = hasText("Design review", substring = true) and isSelected()
 
     @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
@@ -155,10 +170,9 @@ class BriefScreenTest {
         open("Design review")
         compose.onNode(wideOpen).assertExists()
         // Its last proposal answered: Needs review would drop it, but not from under the pointer.
-        seed(meetings = meeting("m1", "Design review", review = """, "review": { "state": "rejected", "at": 5 }"""))
-        compose.waitForIdle()
+        seed(meetings = meeting("m1", "Design review", review = answered))
+        waitGone("Approve + start session")
         compose.onNode(wideOpen).assertExists()
-        compose.onNodeWithText("Item of Design review").assertDoesNotExist()
     }
 
     @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
@@ -200,10 +214,11 @@ class BriefScreenTest {
         val vm = main.track(BriefViewModel(hub.app))
         val mvm = main.track(MeetingsViewModel(hub.app))
         compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = true, openSite = push, onOpened = { push = null }) }
-        compose.onNodeWithText("Item of Alpha sync").assertExists()
+        waitFor("Item of Alpha sync")
+        // A search that hides the pushed org is cleared by the push.
+        compose.onNodeWithText("Search meetings and proposals").performTextInput("Alpha")
         push = "a.atlassian.net"
-        compose.waitForIdle()
-        compose.onNodeWithText("Item of Zed sync").assertExists()
+        waitFor("Item of Zed sync")
         compose.onNode(hasText("Zed sync", substring = true) and isSelected()).assertExists()
     }
 
@@ -229,16 +244,42 @@ class BriefScreenTest {
 
     @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
     @Test fun `wide opens a newly picked entry at its top`() {
-        val many = (0 until 40).joinToString(",") { """{ "id": "p$it", "kind": "task", "title": "Long item $it" }""" }
-        seed(meetings = """{ "meetingId": "m1", "status": "ok", "title": "Long review", "startedAt": $yday,
-                "items": [ $many ] }""")
+        // Two entries of the same shape, so only the per-entry key resets the scroll.
+        fun long(id: String, title: String, at: Long) = """{ "meetingId": "$id", "status": "ok", "title": "$title",
+            "startedAt": $at, "items": [ ${(0 until 40).joinToString(",") { """{ "id": "p$it", "kind": "task", "title": "$title item $it" }""" }} ] }"""
+        seed(meetings = long("m1", "First", yday) + "," + long("m2", "Second", yday - 60_000))
         show(wide = true)
-        open("Long review")
-        compose.onNodeWithText("Long item 39").performScrollTo()
-        compose.onNodeWithText("Long item 0").assertIsNotDisplayed()
-        open("Daily meeting")
-        open("Long review")
-        compose.onNodeWithText("Long item 0").assertIsDisplayed()
+        open("First")
+        compose.onNodeWithText("First item 39").performScrollTo()
+        compose.onNodeWithText("First item 0").assertIsNotDisplayed()
+        open("Second")
+        compose.onNodeWithText("Second item 0").assertIsDisplayed()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide keeps the entry it opened by default listed once answered, and through an empty refresh`() {
+        hub.seedFleet(twoOrgs())
+        show(wide = true)
+        waitFor("Item of Alpha sync")
+        hub.seedFleet("""{ "now": 1, "agents": [] }""")
+        hub.seedFleet(twoOrgs(answered))
+        waitFor("Every proposal is reviewed")
+        compose.onNode(hasText("Alpha sync", substring = true) and isSelected()).assertExists()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide drops a push for an org out of scope instead of holding it`() {
+        hub.seedFleet(twoOrgs())
+        hub.container.org.set(setOf("b.atlassian.net"))
+        var push by mutableStateOf<String?>("a.atlassian.net")
+        val vm = main.track(BriefViewModel(hub.app))
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = true, openSite = push, onOpened = { push = null }) }
+        waitFor("Item of Alpha sync")
+        compose.waitUntil(10_000) { push == null }
+        hub.container.org.set(emptySet())
+        waitFor("Zed sync")
+        compose.onNodeWithText("Item of Alpha sync").assertExists()
     }
 
     @Config(sdk = [35], qualifiers = "w1000dp-h800dp")

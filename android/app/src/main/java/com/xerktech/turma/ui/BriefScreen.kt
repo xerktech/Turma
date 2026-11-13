@@ -208,10 +208,14 @@ fun BriefScreen(
         if (s in collapsed) meetingsVm.toggleCollapsed(s)
         if (!wide) { selected = ""; onOpened() }
     }
+    // Held only while the fleet has not yet listed that org: a push for an org
+    // out of the header's scope (or unknown), or a fold to narrow, consumes it
+    // at once, so a stale push never fires minutes later.
     val pushed = openSite?.let { entries[it] }
-    LaunchedEffect(openSite, wide, pushed) {
+    LaunchedEffect(openSite, wide, pushed, orgs) {
         val s = openSite ?: return@LaunchedEffect
-        if (!wide || pushed.isNullOrEmpty()) return@LaunchedEffect
+        if (!wide || (orgs.isNotEmpty() && s !in orgs)) { onOpened(); return@LaunchedEffect }
+        if (pushed.isNullOrEmpty()) return@LaunchedEffect
         triageBuckets(pushed, TriageFilter.REVIEW, "", now, zone).flatMap { it.second }.firstOrNull()
             ?.let { selected = "${it.siteKey}\u0000${it.key}" }
         onOpened()
