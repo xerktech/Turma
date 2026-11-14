@@ -795,3 +795,29 @@ test("XERK-2914: a reveal scrolls the grid to the event and moves focus into its
     cal.setActive(false);
   }
 });
+
+test("XERK-2933: a cross-midnight event's label and When name the end's date", () => {
+  const ev = { host: "h", org: "acme", id: "x", subject: "Late", startMs: at(2026, 10, 31, 22), endMs: at(2026, 11, 1, 3) };
+  const when = /Saturday, October 31, 10:00\s?PM – Sunday, November 1, 3:00\s?AM/;
+  assert.match(cal.fmtLongSpan(ev.startMs, ev.endMs), when);
+  assert.match(cal.detailHtml(ev, at(2026, 11, 2)), when);
+  // A same-day span keeps the short form with no repeated date.
+  const same = cal.fmtLongSpan(at(2026, 11, 9, 9), at(2026, 11, 9, 9, 30));
+  assert.match(same, /^Monday, November 9, 9:00/);
+  assert.equal(same.match(/November/g).length, 1);
+  assert.match(cal.fmtLongSpan(at(2026, 11, 9, 9), at(2026, 11, 9, 9)), /^Monday, November 9, 9:00\s?AM$/);
+});
+
+test("XERK-2933: a cross-midnight event's button aria-label names the end's date on both days", async () => {
+  replies = {
+    "/api/calendar": (url) => (url.includes(`from=${cal.weekStart(at(2026, 11, 11))}`) ? {
+      hosts: [{ host: "h1", device: "box", online: true, syncedAt: NOW, ranges: [[0, 4e12]] }],
+      events: [{ host: "h1", id: "late", org: "", subject: "Night shift", startMs: at(2026, 11, 10, 22), endMs: at(2026, 11, 11, 3) }],
+    } : { events: [], hosts: [] }),
+  };
+  cal.refetch();
+  const html = await show(at(2026, 11, 11));
+  const labels = [...html.matchAll(/aria-label="(Night shift,[^"]*)"/g)].map((m) => m[1]);
+  assert.equal(labels.length, 2, "one button on each day");
+  for (const l of labels) assert.match(l, /Tuesday, November 10, 10:00\s?PM – Wednesday, November 11, 3:00\s?AM/);
+});
