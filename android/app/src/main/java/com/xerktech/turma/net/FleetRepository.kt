@@ -192,6 +192,7 @@ class FleetRepository(
                 }
                 byKey.clear()
                 byKey.putAll(merged)
+                sseOnline.keys.retainAll(merged.keys) // a host the snapshot dropped is gone
             }
             ticketAgents = resp.ticketAgents
             autoStartOrgs = resp.autoStartOrgs
@@ -324,11 +325,8 @@ class FleetRepository(
         )
     }
 
-    @androidx.annotation.VisibleForTesting
-    internal fun upsert(agent: AgentInfo) { upsertFrame(agent) }
-
     /**
-     * [upsert], returning whether the frame was taken; [onTaken] gets the record it
+     * Upserts an SSE agent frame, returning whether it was taken; [onTaken] gets the record it
      * replaced and runs under the same lock, so a poll cannot slip in between (QA).
      */
     private fun upsertFrame(agent: AgentInfo, onTaken: ((prev: AgentInfo?) -> Unit)? = null): Boolean {
