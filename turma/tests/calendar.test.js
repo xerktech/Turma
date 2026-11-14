@@ -102,6 +102,13 @@ test("XERK-2930: an event in the repeated fall-back hour lays out by its length 
   const ev = { startMs: Date.parse("2026-11-01T05:30:00Z"), endMs: Date.parse("2026-11-01T06:00:00Z") };
   const [s] = cal.daySegments([ev], at(2026, 11, 1));
   assert.deepEqual([s.top, s.end, s.bottom], [90, 120, 120]);
+  // An hour from 1:30 EDT to 1:30 EST (wall end == start) and 1:30 EDT – 1:40 EST are full length;
+  // 0:30 EDT – 1:30 EST is two hours; a spring-forward hour keeps its wall rows.
+  const len = (a, b, d) => { const [x] = cal.daySegments([{ startMs: Date.parse(a), endMs: Date.parse(b) }], d); return x.end - x.top; };
+  assert.equal(len("2026-11-01T05:30:00Z", "2026-11-01T06:30:00Z", at(2026, 11, 1)), 60);
+  assert.equal(len("2026-11-01T05:30:00Z", "2026-11-01T06:40:00Z", at(2026, 11, 1)), 70);
+  assert.equal(len("2026-11-01T04:30:00Z", "2026-11-01T06:30:00Z", at(2026, 11, 1)), 120);
+  assert.equal(len("2026-03-08T06:30:00Z", "2026-03-08T07:30:00Z", at(2026, 3, 8)), 120);
   const label = cal.fmtSpan(ev.startMs, ev.endMs);
   assert.match(label, /EDT/);
   assert.match(label, /EST/);

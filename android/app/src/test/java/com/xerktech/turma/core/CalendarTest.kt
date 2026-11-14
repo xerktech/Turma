@@ -164,6 +164,14 @@ class CalendarTest {
         val label = calSpan(s, e, ny, Locale.US)
         assertTrue(label, label.contains("EDT") && label.contains("EST"))
         assertFalse(calSpan(at(2026, 11, 10, 9), at(2026, 11, 10, 10), ny, Locale.US).contains("EST"))
+        // Wall end == start (an hour 1:30 EDT – 1:30 EST) is still an hour; 0:30 EDT – 1:30 EST two.
+        fun len(a: String, b: String) = calDaySegments(
+            listOf(ev("x", java.time.Instant.parse(a).toEpochMilli(), java.time.Instant.parse(b).toEpochMilli())), d, ny,
+        ).single().let { it.end - it.top }
+        assertEquals(60.0, len("2026-11-01T05:30:00Z", "2026-11-01T06:30:00Z"), 0.0)
+        assertEquals(120.0, len("2026-11-01T04:30:00Z", "2026-11-01T06:30:00Z"), 0.0)
+        val long = calSpanLong(s, e, ny, Locale.US)
+        assertTrue(long, long.contains("EDT") && long.contains("1:00 AM EST"))
     }
 
     @Test fun `Teams styles follow busy and my response`() {

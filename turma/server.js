@@ -5789,9 +5789,11 @@ const CAL_BUSY = new Set(["free", "tentative", "busy", "outOfOffice", "workingEl
 const CAL_RESPONSE = new Set(["none", "organizer", "tentative", "accepted", "declined", "notResponded", "unknown"]);
 const CAL_ROLE = new Set(["organizer", "required", "optional", "resource", "unknown"]);
 const CAL_SENSITIVITY = new Set(["normal", "personal", "private", "confidential"]);
-// No quote, angle bracket, space or slash anywhere: clients render the address in
-// markup (a title attribute, a mailto), so only a plain addr-spec shape is served.
-const CAL_EMAIL_RE = /^[^@\s/"'<>`]+@[^@\s/"'<>`]+\.[^@\s/"'<>`]+$/;
+// No double quote, angle bracket, backtick, space, slash, control, line/bidi-control or
+// zero-width character anywhere (CAL_ID_RE's set + U+200B-U+200F, U+FEFF): clients render
+// the address in markup (a title attribute). An apostrophe is legal (o'brien@) and escaped.
+const CAL_EMAIL_PART = "[^@\\s/\"<>`\\u0000-\\u001f\\u007f-\\u009f\\u200b-\\u200f\\u2028-\\u202e\\u2066-\\u2069\\ufeff]+";
+const CAL_EMAIL_RE = new RegExp(`^${CAL_EMAIL_PART}@${CAL_EMAIL_PART}\\.${CAL_EMAIL_PART}$`);
 const CAL_ID_RE = /^[^\u0000-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069]{1,300}$/;
 const CAL_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,7})?)?(?:Z|[+-]\d{2}:\d{2})$/;
 const CAL_DOMAIN_RE = /^(?=.{1,253}$)[a-z0-9-]+(?:\.[a-z0-9-]+)+$/;

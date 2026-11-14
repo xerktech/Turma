@@ -226,9 +226,12 @@ fun calDaySegments(events: List<CalendarEvent>, day: LocalDate, zone: ZoneId): L
     val segs = events.filter { calDrawable(it) && !calInBand(it) && calOnDay(it, day, zone) }.map { ev ->
         val top = calWallMinutes(ev.s(), day, zone)
         var end = if (ev.e() > ev.s()) calWallMinutes(ev.e(), day, zone) else top
-        // The grid is wall-clock, so an event inside the repeated fall-back hour can end
-        // "before" it starts (1:30 EDT – 1:00 EST): lay it out by its elapsed length instead.
-        if (end < top) end = minOf(1440.0, top + (ev.e() - ev.s()) / 60_000.0)
+        // The grid is wall-clock, so an event across the fall-back switch loses the repeated
+        // hour (1:30 EDT – 1:30 EST read zero long): lay it out by its elapsed length instead.
+        val from = maxOf(ev.s(), calDayStartMs(day, zone))
+        if (ev.e() > from && ev.e() < calDayStartMs(day.plusDays(1), zone) &&
+            calOffsetSec(ev.e(), zone) < calOffsetSec(from, zone)
+        ) end = minOf(1440.0, top + (ev.e() - from) / 60_000.0)
         CalSeg(ev, top, end, minOf(1440.0, maxOf(end, top + CAL_MIN_LAYOUT_MIN)))
     }
     return calLayoutDay(segs)
@@ -344,6 +347,9 @@ fun calTime(ms: Long, zone: ZoneId, locale: Locale): String =
     timeFmt(locale).format(Instant.ofEpochMilli(ms).atZone(zone))
 
 /** "9:00 – 9:30 AM"-style span; the end alone on another day reads as the start only (the web's fmtSpan). */
+private fun calOffsetSec(ms: Long, zone: ZoneId): Int =
+    zone.rules.getOffset(Instant.ofEpochMilli(ms)).totalSeconds
+
 fun calSpan(s: Long, e: Long, zone: ZoneId, locale: Locale): String {
     if (e <= s) return calTime(s, zone, locale)
     val a = Instant.ofEpochMilli(s).atZone(zone)
@@ -510,7 +516,16 @@ fun calSpanLong(s: Long, e: Long, zone: ZoneId, locale: Locale): String {
     val day = DateTimeFormatter.ofPattern("EEE, MMM d, h:mm a", locale)
     val start = day.format(Instant.ofEpochMilli(s).atZone(zone))
     if (e <= s) return start
-    val end = if (calDay(s, zone) == calDay(e, zone)) calTime(e, zone, locale) else day.format(Instant.ofEpochMilli(e).atZone(zone))
+    val a = Instant.ofEpochMilli(s).atZone(zone)
+    val b = Instant.ofEpochMilli(e).atZone(zone)
+    // Across a DST switch (the repeated fall-back hour) each end names its zone, as the web does.
+    if (a.offset != b.offset) {
+        val z = DateTimeFormatter.ofPattern("z", locale)
+        val end = if (calDay(s, zone) == calDay(e, zone)) DateTimeFormatter.ofPattern("h:mm a z", locale).format(b)
+        else DateTimeFormatter.ofPattern("EEE, MMM d, h:mm a z", locale).format(b)
+        return "$start ${z.format(a)} – $end"
+    }
+    val end = if (calDay(s, zone) == calDay(e, zone)) calTime(e, zone, locale) else day.format(b)
     return "$start – $end"
 }
 
