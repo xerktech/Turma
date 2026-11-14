@@ -118,7 +118,11 @@ class CalendarViewModelTest {
         assertEquals(true, key in cvm.weeks.value)
         val fleet = hub.container.fleet
         fleet.onSseEvent("calendar", "{}")
+        // Coalesced: no re-read inside the first second (a burst must not re-read per frame).
+        scheduler.runCurrent()
+        assertEquals("re-read before the throttle's second", true, key in cvm.weeks.value)
         scheduler.advanceTimeBy(600); scheduler.runCurrent()
+        assertEquals("re-read before the throttle's second", true, key in cvm.weeks.value)
         fleet.onSseEvent("calendar", "{}")      // 600ms later: must not push the re-read back
         scheduler.advanceTimeBy(500); scheduler.runCurrent()
         // 1.1s after the FIRST frame: the throttled re-read has run (a debounce would wait to 1.6s).
