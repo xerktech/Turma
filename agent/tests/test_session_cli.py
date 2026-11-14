@@ -848,6 +848,9 @@ class WslConfReaderTest(unittest.TestCase):
             b"[interop]\n#x\renabled=false\n": False,                  # but not a comment
             b"[interop]\nen_abled=false\nenabled=false\n": True,
             b"[Interop]\nENABLED=FALSE\n": True,
+            b"[interop]\nenabled=fal\\\nse \n": True,              # trailing blank after a
+            b"[interop]\nenabled=false\\\n   # off\n": True,         # continuation is trimmed
+            b"[interop]\nenabled=\\\n\\\nfalse\t\t\n": True,
         }
         for conf, off in cases.items():
             with self.subTest(conf=conf):

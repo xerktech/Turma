@@ -409,13 +409,13 @@ def wsl_conf_interop_off(path=None) -> bool:
                     if esc is None:
                         valid = False
                         break
-                    val.append(esc)
+                    val.append(esc)       # "" for a continuation: count chars, not items
                 elif c == "#" and not quoted:
                     break
                 else:
                     val.append(c)
                 if c not in " \t":
-                    trimmed = len(val)
+                    trimmed = sum(map(len, val))
                 k += 1
             if valid and not quoted and sec is not None and sec.lower() == "interop" \
                     and key.lower() == "enabled":
