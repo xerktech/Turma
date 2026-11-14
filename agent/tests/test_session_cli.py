@@ -249,7 +249,15 @@ class SessionCliTest(unittest.TestCase):
 # The COM lines of the calendar script, replaced in the pwsh drive by a fake
 # Outlook object model with the same members the script touches.
 _COM_LINES = """  try { $ol = [Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application') }
-  catch { $ol = New-Object -ComObject Outlook.Application }"""
+  catch {
+    if (Get-Process outlook -ErrorAction SilentlyContinue) {
+      throw 'classic Outlook is open but did not answer: is it (or this shell) running as administrator, or is another Outlook version registered for scripts?'
+    }
+    if (Get-Process olk -ErrorAction SilentlyContinue) {
+      throw 'only the new Outlook is open, and it cannot be read: open classic Outlook and retry'
+    }
+    throw 'classic Outlook is not open: open it and retry (this never starts Outlook itself)'
+  }"""
 _FAKE_OUTLOOK = r"""
   $ex = [pscustomobject]@{ PrimarySmtpAddress = 'bo@corp.example' }
   $exEntry = [pscustomobject]@{ Type = 'EX' }
@@ -397,6 +405,17 @@ class CalendarTest(unittest.TestCase):
         doc = self.run_fake(epilogue=(
             "  $script:appts[1].Body = 'https://evilzoom.us/j/1 or https://acme.zoom.us/j/2'"))
         self.assertEqual(doc["events"][1]["joinUrl"], "https://acme.zoom.us/j/2")
+
+    def test_outlook_not_open_is_reported_never_started(self):
+        """The real script with no Outlook to attach to (pwsh has no
+        GetActiveObject, as a PC with Outlook closed has nothing to attach to):
+        it says to open Outlook, and never tries to start one itself."""
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("pwsh not installed")
+        self.assertNotIn("New-Object -ComObject", cli._CALENDAR_PS)
+        with self.assertRaisesRegex(cli.Refused, "classic Outlook is not open"):
+            cli.read_calendar("today", powershell=pwsh)
 
     def test_an_outlook_error_is_reported_not_printed_as_events(self):
         ps = self.fake_ps("echo '{\"ok\":false,\"error\":\"Class not registered\"}'\n")

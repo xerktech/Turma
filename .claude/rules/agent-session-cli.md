@@ -292,6 +292,11 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
 - Reads classic Outlook's default calendar over COM by running Windows PowerShell 5.1 with
   `-EncodedCommand` — through WSL interop on a WSL host, directly on native Windows. As the
   logged-in Windows user, so no Entra ID app, token or shared calendar is involved (operator).
+- **It only ATTACHES to a running classic Outlook (`GetActiveObject`), never starts one.** A COM
+  start launches whichever Outlook is registered for automation — on a PC with an old Office
+  beside Microsoft 365, that one — and opens its account-setup wizard (operator, live). The
+  error names which case it is: Outlook closed, only new Outlook (`olk`) open, or open but
+  unreachable (elevation mismatch / another version registered).
 - **Only two integers reach the script** (a `CALENDAR_RANGES` day offset and length), substituted
   into `_CALENDAR_PS`; days are counted in WINDOWS local time, since the distro's TZ is often UTC.
 - Restrict's dates must be in the user's locale (`ToString('g')`), and `Sort` must precede
