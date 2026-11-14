@@ -122,7 +122,7 @@ class MeetingsTest {
         assertEquals(listOf("b"), meetingOrgs(map, setOf("b", "c")))
     }
 
-    @Test fun `the Brief tab counts proposals awaiting review in the shown orgs`() {
+    @Test fun `the Meetings tab counts proposals awaiting review in the shown orgs`() {
         // XERK-2623, the web's pendingCount: reviewable and not rejected, in ok meetings only.
         val items = listOf(
             MeetingItem(id = "p1", kind = "bug", title = "a"),

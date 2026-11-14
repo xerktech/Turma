@@ -117,7 +117,7 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 
 /**
- * The Brief tab (XERK-2858, the web's two-pane triage of XERK-2857): every
+ * The Meetings tab (XERK-2858, the web's two-pane triage of XERK-2857): every
  * org's meetings in one list — collapsible orgs, date buckets, Needs review /
  * All / Archived, search — with the Daily brief folded into each org's
  * daily-meeting entry. A phone shows one pane at a time: the list, an entry,
@@ -270,7 +270,7 @@ fun BriefScreen(
     }
 
     Column(modifier.fillMaxSize()) {
-        ScreenHeader("Brief")
+        ScreenHeader("Meetings")
         when {
             wide -> Row(Modifier.weight(1f).fillMaxWidth()) {
                 list(Modifier.width(360.dp).fillMaxHeight())

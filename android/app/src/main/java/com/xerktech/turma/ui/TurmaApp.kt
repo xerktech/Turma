@@ -85,16 +85,16 @@ val LocalTextSize = staticCompositionLocalOf { TextSizeControl() }
  * single-screen, so there is no per-tab stack worth preserving.
  */
 /**
- * Whether a notification's `click` path opens the Brief tab, and on which org
- * (XERK-2511, XERK-2858): the "N proposals" push sends `/brief?site=…#meetings`,
- * an older hub `/meetings?site=…`; `#brief`, `#meetings` and `/meetings` all
- * land on the one triage list. Answers the `site` ("" when none), or null when
- * the path is not the Brief tab. A session alert routes by host + session instead.
+ * Whether a notification's `click` path opens the Meetings tab, and on which org
+ * (XERK-2511, XERK-2858, XERK-2893): the "N proposals" push sends `/meetings?site=…`,
+ * an older hub `/brief?site=…#meetings`; both paths and any fragment land on the
+ * one triage list. Answers the `site` ("" when none), or null when the path is
+ * not the Meetings tab. A session alert routes by host + session instead.
  */
 internal fun deepLinkBrief(url: String?): String? {
     if (url == null) return null
     val path = url.substringBefore('#').substringBefore('?').trim('/')
-    if (path != "meetings" && path != TopDest.BRIEF.route) return null
+    if (path != "brief" && path != TopDest.MEETINGS.route) return null
     val query = url.substringBefore('#').substringAfter('?', "")
     val site = query.split('&').firstOrNull { it.startsWith("site=") }?.substringAfter("site=").orEmpty()
     return runCatching { java.net.URLDecoder.decode(site, "UTF-8") }.getOrDefault("")
@@ -173,7 +173,7 @@ fun TurmaApp(
         }
     }
 
-    // The org a meetings push opens on the Brief tab (XERK-2858), consumed once shown.
+    // The org a meetings push opens on the Meetings tab (XERK-2858), consumed once shown.
     var briefOpenSite by rememberSaveable { mutableStateOf<String?>(null) }
 
     // Route an FCM tap to the exact session once we're signed in.
@@ -201,7 +201,7 @@ fun TurmaApp(
             // "N proposals from <meeting>" (XERK-2511): Brief, with that org unfolded.
             deepLinkBrief(dl.url)?.let { site ->
                 briefOpenSite = site
-                nav.navigate(TopDest.BRIEF.route, tabNavOptions())
+                nav.navigate(TopDest.MEETINGS.route, tabNavOptions())
             }
         }
         onDeepLinkConsumed()
@@ -274,8 +274,8 @@ fun TurmaApp(
         composable(TopDest.USAGE.route) {
             MainScaffold(TopDest.USAGE, goTab) { m -> UsageScreen(modifier = m) }
         }
-        composable(TopDest.BRIEF.route) {
-            MainScaffold(TopDest.BRIEF, goTab) { m ->
+        composable(TopDest.MEETINGS.route) {
+            MainScaffold(TopDest.MEETINGS, goTab) { m ->
                 BriefScreen(modifier = m, wide = wide, openSite = briefOpenSite, onOpened = { briefOpenSite = null })
             }
         }

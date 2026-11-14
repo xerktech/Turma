@@ -18,7 +18,7 @@ paths:
 A Teams-style meetings calendar built from each host's classic Outlook (read by the session CLI's
 reader, `agent-session-cli.md`) and Tenir. The hub stores each host's events and serves them; the
 agent reads Outlook off its beat. Every child ticket builds to this file; change it here first.
-Hub half: XERK-2891.
+Hub half: XERK-2891. Agent half: XERK-2895 (below).
 
 ## Agent → hub: the `calendarSync` heartbeat outbox
 
@@ -45,6 +45,37 @@ Hub half: XERK-2891.
   rolls the host back and reads offline, XERK-298): a row over `CALENDAR_SYNC_EVENTS_MAX` (1500)
   events or `CALENDAR_SYNC_BYTES_MAX` (2 MiB of JSON), or a malformed window, leaves the stored
   events untouched and sets `lastError` saying what the cap is. The beat is accepted.
+
+## The agent's sync worker (XERK-2895, `hub-agent.py`)
+
+- **Off the beat**: `_calendar_worker_loop` runs the reads; the beat's `_calendar_tick` is a time
+  compare that wakes it every `CALENDAR_SYNC_EVERY_SEC` (`TURMA_CALENDAR_SYNC_MIN`, 15) or on a
+  `syncCalendar` (`_stage_calendar_sync` only stores the window; a newer one replaces it).
+- **The reader is the session CLI's** (`session_cli_module().read_calendar_windows`), loaded by path:
+  one Outlook reader, one PowerShell script, on WSL and native Windows alike.
+- **Week chunks, each a COMPLETE window**: `calendar_weeks` cuts at UTC Mondays, read
+  `CALENDAR_WEEKS_PER_READ` per PowerShell run. A week that reached the reader's
+  `CALENDAR_SYNC_WINDOW_MAX` is an ERROR row, never a short events row — a truncated authoritative
+  window would delete real events on the hub. Never lift the cap by sending a partial week.
+  - A week with ANY unreadable item (Outlook threw on it, or it has no id) is an error row too:
+    the item is absent from the read, so the hub would delete it.
+  - A pass stages its error rows AFTER its good rows: a good row clears `lastError`, so an
+    earlier error would otherwise be wiped. A week sent as an error row keeps no hash.
+- **Only changed weeks** on the schedule (`_cal_hashes`, whole grid weeks only); a hub command
+  sends every week it covers. Adjacent weeks merge into one row (`calendar_sync_rows`) under
+  `CALENDAR_ROW_EVENTS_MAX` / `CALENDAR_ROW_BYTES_MAX`; a beat carries a second row only within
+  `CALENDAR_BEAT_BYTES_MAX`, so the outbox never makes a beat a hub with a small body cap refuses.
+- **An Outlook failure is one error row in Outlook's words** for the rest of the window, re-sent on
+  the schedule when the text changes or the pass sends any good row (which clears `lastError`),
+  always on a command. It forgets every hash, so the
+  recovery re-sends every week and those good rows clear the hub's `lastError`.
+- Outbox past `CALENDAR_OUTBOX_MAX` drops the oldest AND forgets every hash (never believe the hub
+  has a dropped row).
+- **A host that is neither WSL nor Windows reports `calendar: {available: false}`**, logs "no Outlook
+  here" once at start, and answers a stray `syncCalendar` with that error once.
+- Tests: `TestCalendarSync` in `test_hub_agent.py`; `CalendarSyncReaderTest` in
+  `test_session_cli.py` (the real script under `pwsh`, and `calendar_sync_fixture.json`, a reply
+  recorded from it with a recurring occurrence, a moved exception, a canceled and a private event).
 
 ## The event (`sanitizeCalendarEvent`, the ONE whitelist)
 
@@ -142,6 +173,59 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
   turn) announces which hosts changed: `{<hostKey>: {syncedAt, windowFrom, windowUntil}}`, scoped
   per host like the agent list; clients refetch the range they show.
 - Tests: the `XERK-2891:` cases in `server.test.js`.
+- Linked captures and Turma-only entries ride the same answer (below, XERK-2896); the `org`
+  filter applies to both, so `events` is no longer Outlook-only.
+
+## Tenir captures ⇄ events (hub, XERK-2896)
+
+- **The link is the meeting row's `calendarEventId`** (`contract-meetings.md` row), never a field
+  of the event store: an Outlook id is a GlobalAppointmentID, so one id on two hosts of a tenant is
+  one meeting (the newest-synced host's copy is served), and the link survives a host rename.
+  - `calendarBy`: `auto` (the matcher) | `operator`; `operator` with no id = "never link".
+  - `calendarAmbiguous: true` = the matcher found a tie; nothing linked, flagged for the operator.
+- **Matching** (`calendarBestMatch`), on Tenir's POST and again when a sync CHANGES a host's stored
+  events, an org rule or a host setting (`scheduleCalendarRelink` → `relinkTenantMeetings`).
+  - Relinks run at most once per `CALENDAR_RELINK_MIN_MS` (10s) per tenant, the rest deferred to
+    one trailing timer; an error-only or unchanged sync schedules none. Why: one host re-sending
+    syncs every beat blocked the shared event loop ~0.55 s a beat at the caps (QA).
+  - ≤`CALENDAR_LINK_SCAN_MAX` (200) candidates are scored per capture.
+  - Candidates: events of hosts of the MEETING's tenant only, whose assigned org (else, unassigned
+    and not PINNED unassigned by a series override, the host's decided org) is the meeting's org;
+    never `canceled`.
+  - **Only real meetings** (`calendarLinkCandidate`): someone other than the organizer invited
+    (a resource does not count) or a join link/online meeting; not all-day, ≤12h, not declined, `busy` not free/outOfOffice/workingElsewhere. Why:
+    a capture inside Focus time / Lunch / WFH linked to that block and never left (QA).
+  - A candidate must overlap [startedAt, endedAt] with `CALENDAR_LINK_TOLERANCE_MS` (15 min)
+    either side. Score: time ≤0.6 (overlap of the shorter span + start proximity), title words
+    ≤0.25 (`inferredTitle`, else a non-generic title), join-URL platform +0.1 / −0.2 on a
+    mismatch, participants ≤0.2 (the meeting-focus name rule), a `daily` capture +0.15 for an
+    event starting within 20 min of its `meetingAt` (the XERK-2856 pairing links its occurrence).
+  - Best ≥ `CALENDAR_LINK_MIN_SCORE` (0.35) wins; a runner-up within `CALENDAR_LINK_MARGIN`
+    (0.05) = ambiguous. Tests pin the weights' outcomes, not the numbers.
+- **A link holds while its event is stored**, even `canceled` or moved (the capture is what
+  happened). An auto link to a still-overlapping event yields only to another event scoring over
+  it by the margin (a late invite); one whose event left the store (sync, `calendarTick`) or
+  now counts for another org rematches. An operator's choice is never touched by the matcher.
+- `POST /api/orgs/<site>/meetings/<mid>/calendar` (OPERATOR-authed, `org` class):
+  `{eventId}` link | `{eventId: null}` unlink for good | `{auto: true}` back to the matcher.
+  Exactly one shape (`auto` with `eventId`, or `auto: false`, is a 400).
+  400 body → 404 org no host is decided into / meeting / an id no host of the org's TENANT holds.
+  Answers `{ok, meeting}` (meetingWire, with `calendarEvent`).
+- **Served on `GET /api/calendar`**: every Outlook event carries `source: "outlook"` and
+  `meetings: [{site, meetingId, title}]` (linked captures of orgs the caller may see).
+- **Impromptu captures are Turma-only entries**, derived at serve time (no store), never written
+  to Outlook: a capture with no stored link →
+  `{source:"tenir", host:"", org: site, id:"tenir:<meetingId>", site, meetingId, subject
+  (inferredTitle || title), start, end (UTC ISO), startMs, endMs, allDay:false, platform,
+  participants, status, summary?, tenirUrl?, ambiguous?, calendarEventMissing?}`.
+  - A late invite merges by itself: the next sync links the capture, the entry disappears and the
+    event's `meetings` names it. Only the org's kept rows (`MEETINGS_KEEP`) appear.
+  - **A linked capture whose event this answer does not serve** (moved out of the range, or the
+    event's served org fails the `org` filter) is served as the same entry with `calendarEventId`
+    (+ `moved: true` when the event no longer overlaps it), so it never vanishes from its own day.
+- Tests: the `XERK-2896:` cases in `server.test.js` (tolerance, tie-break, late calendar, late
+  invite, moved/canceled, personal blocks, unserved linked events, private withholding,
+  throttle, two orgs, operator route, tenant isolation).
 
 ## Holidays (hub, XERK-2892)
 
