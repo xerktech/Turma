@@ -69,6 +69,13 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
   the schedule when the text changes or the pass sends any good row (which clears `lastError`),
   always on a command. It forgets every hash, so the
   recovery re-sends every week and those good rows clear the hub's `lastError`.
+  - A command window that reads cleanly but does not COVER the whole failed range proves nothing
+    about the weeks it skipped: the last error row is re-sent after its good rows and kept
+    (XERK-2907); reading the range's start shrinks it to the unread rest. Only a covering command
+    or a clean scheduled pass clears it. A range starts at its failed READ group, so the failing
+    week can sit later inside it: partial overlap must never clear.
+  - A command window that FAILS widens the stored range to include itself, never replaces it;
+    only a scheduled pass (it re-read every week before its failure) replaces the range.
 - Outbox past `CALENDAR_OUTBOX_MAX` drops the oldest AND forgets every hash (never believe the hub
   has a dropped row).
 - **A host that is neither WSL nor Windows reports `calendar: {available: false}`**, logs "no Outlook
