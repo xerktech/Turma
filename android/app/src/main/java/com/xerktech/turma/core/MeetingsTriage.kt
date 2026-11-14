@@ -145,7 +145,7 @@ fun triageShows(e: TriageEntry, filter: TriageFilter, query: String, sel: Triage
     if (q.isEmpty()) return true
     return (e.daily && "daily meeting".contains(q, ignoreCase = true)) ||
         e.meetings.any { m ->
-            m.title.contains(q, ignoreCase = true) || m.items.any { it.title.contains(q, ignoreCase = true) }
+            meetingTitle(m).contains(q, ignoreCase = true) || m.items.any { it.title.contains(q, ignoreCase = true) }
         }
 }
 
@@ -195,7 +195,7 @@ fun triageNext(ordered: List<TriageEntry>, current: TriageEntry): TriageEntry? {
 
 /** An entry's title: "Daily meeting" (the web's `entryTitle`), else the meeting's own. */
 fun triageTitle(e: TriageEntry): String =
-    if (e.daily) "Daily meeting" else e.meetings.firstOrNull()?.title?.ifBlank { null } ?: "Untitled meeting"
+    if (e.daily) "Daily meeting" else e.meetings.firstOrNull()?.let { meetingTitle(it) } ?: "Untitled meeting"
 
 /** A daily entry's brief status line, the rail's "brief ready / being written / none". */
 fun triageBriefStatus(e: TriageEntry): String? {

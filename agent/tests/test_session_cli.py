@@ -350,7 +350,8 @@ class CalendarTest(unittest.TestCase):
         if not pwsh:
             self.skipTest("pwsh not installed")
         script = cli._CALENDAR_PS.replace(_COM_LINES, _FAKE_OUTLOOK).replace(
-            "__START__", "1").replace("__DAYS__", "1").replace("__MAX__", "5")
+            "__FROM__", "[DateTime]::Today.AddDays(1)").replace("__DAYS__", "1").replace(
+            "__MAX__", "5")
         enc = base64.b64encode(script.encode("utf-16-le")).decode()
         r = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
                            capture_output=True, text=True, timeout=120)
@@ -370,8 +371,8 @@ class CalendarTest(unittest.TestCase):
         if not pwsh:
             self.skipTest("pwsh not installed")
         script = cli._CALENDAR_PS.replace(_COM_LINES, prelude + _FAKE_OUTLOOK + "\n" + epilogue)
-        script = script.replace("__START__", "0").replace("__DAYS__", "7").replace(
-            "__MAX__", max_events)
+        script = script.replace("__FROM__", "[DateTime]::Today").replace(
+            "__DAYS__", "7").replace("__MAX__", max_events)
         enc = base64.b64encode(script.encode("utf-16-le")).decode()
         r = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
                            capture_output=True, text=True, timeout=120)
@@ -516,6 +517,50 @@ class CalendarTest(unittest.TestCase):
                     {"ok": True, "events": [{"subject": "x", "attendees": {"name": "a"}}]}):
             with self.assertRaises(cli.Refused):
                 cli.normalize_calendar(bad)
+
+    def script_for(self, *args, **kw):
+        ps = self.fake_ps('echo "$6" > "$(dirname "$0")/enc"\necho \'{"ok":true,"events":[]}\'\n')
+        cli.read_calendar(*args, powershell=ps, **kw)
+        with open(os.path.join(self.tmp, "enc")) as fh:
+            return base64.b64decode(fh.read().strip()).decode("utf-16-le")
+
+    def test_a_date_and_a_span_reach_the_script_as_integers(self):
+        """XERK-2903: a session asking about last Friday names its date."""
+        s = self.script_for("2026-11-13")
+        self.assertIn("$from = (New-Object DateTime 2026, 11, 13)", s)
+        self.assertIn("$from.AddDays(1)", s)
+        s = self.script_for("yesterday", days=3)
+        self.assertIn("$from = [DateTime]::Today.AddDays(-1)", s)
+        self.assertIn("$from.AddDays(3)", s)
+        for edge in ("1900-01-01", "2999-12-31"):     # the year bounds are inclusive
+            self.assertIn("New-Object DateTime", self.script_for(edge, days=31))
+
+    def test_the_real_script_reads_a_dated_window(self):
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("pwsh not installed")
+        start, n = cli.calendar_window("2026-11-13", 2)
+        script = cli._CALENDAR_PS.replace(_COM_LINES, _FAKE_OUTLOOK).replace(
+            "__FROM__", start).replace("__DAYS__", str(n)).replace("__MAX__", "5")
+        enc = base64.b64encode(script.encode("utf-16-le")).decode()
+        r = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
+                           capture_output=True, text=True, timeout=120)
+        doc = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertTrue(doc["from"].startswith("2026-11-13T00:00:00"), doc)
+        self.assertTrue(doc["until"].startswith("2026-11-15T00:00:00"), doc)
+
+    def test_a_bad_date_or_span_exits_2_before_powershell(self):
+        for argv in (["calendar", "2026-13-01"], ["calendar", "friday"],
+                     ["calendar", "2026-11-13; rm -rf /"], ["calendar", "2026-1-3"], ["calendar", "20261113"],
+                     ["calendar", "2026-W46-5"], ["calendar", "9999-12-31"],
+                     ["calendar", "0001-01-01"],
+                     ["calendar", "today", "--days", "0"], ["calendar", "week", "--days", "32"]):
+            err = io.StringIO()
+            with mock.patch.object(cli, "find_powershell") as find, \
+                    mock.patch.object(sys, "stderr", err):
+                self.assertEqual(cli.main(argv), 2, argv)
+            find.assert_not_called()
+            self.assertIn("calendar:", err.getvalue())
 
     def test_calendar_needs_no_session_id_and_writes_nothing(self):
         reqdir = os.path.join(self.tmp, "session-requests")

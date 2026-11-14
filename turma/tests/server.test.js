@@ -117,6 +117,10 @@ process.env.DAILY_BRIEF_SCHEDULES_FILE = path.join(scratchDir(), `turma-test-dai
 process.env.DAILY_BRIEFS_FILE = path.join(scratchDir(), `turma-test-daily-briefs-${process.pid}.json`);
 process.env.MEETING_PROPOSALS_FILE = path.join(scratchDir(), `turma-test-meeting-proposals-${process.pid}.json`);
 process.env.MEETING_FOCUS_FILE = path.join(scratchDir(), `turma-test-meeting-focus-${process.pid}.json`);
+process.env.HOLIDAY_SETTINGS_FILE = path.join(scratchDir(), `turma-test-holiday-settings-${process.pid}.json`);
+process.env.CALENDAR_EVENTS_FILE = path.join(scratchDir(), `turma-test-calendar-events-${process.pid}.json`);
+process.env.CALENDAR_ORG_RULES_FILE = path.join(scratchDir(), `turma-test-calendar-org-rules-${process.pid}.json`);
+process.env.CALENDAR_HOST_SETTINGS_FILE = path.join(scratchDir(), `turma-test-calendar-host-settings-${process.pid}.json`);
 process.env.MEETING_LABELS_FILE = path.join(scratchDir(), `turma-test-meeting-labels-${process.pid}.json`);
 process.env.MEETING_LABEL_MISSES_FILE = path.join(scratchDir(), `turma-test-meeting-label-misses-${process.pid}.json`);
 process.env.MEETING_TOKENS_FILE = path.join(scratchDir(), `turma-test-meeting-tokens-${process.pid}.json`);
@@ -29628,6 +29632,35 @@ test("XERK-2508: a meeting is read by one capable host, which pulls the transcri
   cleanup2508(O, ["mtOther2508"]);
 });
 
+test("XERK-2894: a result's summary and inferred title are kept, bounded and served", async () => {
+  const S = "mtSum2894.atlassian.net";
+  await meetHost2508("mtSum2894", S);
+  await postMeeting2508(S, meeting2508("s1", { title: "Meeting" }));
+  const [cmd] = meetCmds2508("mtSum2894");
+  await meetResult2508("mtSum2894", S, cmd, { status: "ok", items: [],
+    summary: "We met.\u0007  \n\n\n\nDecisions: <b>none</b>\u202e", inferredTitle: "  Login\n bug   triage " });
+  const row = hub.getMeetings()[S][0];
+  assert.deepEqual([row.status, row.title, row.summary, row.inferredTitle],
+    ["ok", "Meeting", "We met.\n\nDecisions: <b>none</b>", "Login bug triage"]);
+  const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.meetingProposals[S][0];
+  assert.deepEqual([served.summary, served.inferredTitle], [row.summary, row.inferredTitle]);
+  assert.deepEqual(hub.meetingsCoerce(JSON.parse(JSON.stringify(hub.getMeetings()))), hub.getMeetings());
+  // Bounded: 4000 code points, and the JSON byte budget; wrong types and empty text are absent.
+  const base = { meetingId: "w1", title: "Meeting", platform: "teams", startedAt: 1, endedAt: 2, receivedAt: 3,
+    status: "ok", items: [] };
+  const big = hub.sanitizeMeeting({ ...base, summary: "😀".repeat(5000), inferredTitle: "t".repeat(500) });
+  assert.equal([...big.summary].length, 4000);
+  assert.ok(Buffer.byteLength(JSON.stringify(big.summary)) <= 16 << 10);
+  assert.equal(big.inferredTitle.length, 120);
+  for (const v of [{ x: 1 }, 7, "", "  \n "]) {
+    const m = hub.sanitizeMeeting({ ...base, summary: v, inferredTitle: v });
+    assert.deepEqual(["summary" in m, "inferredTitle" in m], [false, false]);
+  }
+  // Only a settled ok row carries them.
+  assert.equal("summary" in hub.sanitizeMeeting({ ...base, status: "failed", summary: "s" }), false);
+  cleanup2508(S, ["mtSum2894"]);
+});
+
 test("XERK-2508: the tick waits for a host, retries a silent or departed one, and expires the queue", async () => {
   const S = "mtT2508.atlassian.net";
   await beat1574("mtTOld2508", S);
@@ -31671,4 +31704,392 @@ test("XERK-2856: the served row never leaks fields beyond the whitelist", async 
   assert.deepEqual(rows.find((m) => m.meetingId === "w0").daily, { meetingAt: M2856, briefRunId: "ab" });
   delete hub.getDailyBriefSchedules()[S];
   cleanup2508(S, ["wlHost2856"]);
+});
+
+test("XERK-2894 QA: an inferred title names the push and the decision, and only a generic title takes one", async () => {
+  // The hub's mirror reads the agent's vectors (meeting_title_generic).
+  const vec = JSON.parse(fs.readFileSync(path.join(__dirname, "../../agent/tests/meeting_title_vectors.json"), "utf8"));
+  for (const t of vec.generic) assert.equal(hub.meetingTitleGeneric(t), true, t);
+  for (const t of vec.real) assert.equal(hub.meetingTitleGeneric(t), false, t);
+  const S = "mtQ2894.atlassian.net";
+  await meetHost2508("mtQ2894", S);
+  await postMeeting2508(S, meeting2508("q1", { title: "Meeting" }));
+  const [c1] = meetCmds2508("mtQ2894");
+  notifications.length = 0;
+  await meetResult2508("mtQ2894", S, c1, { status: "ok", inferredTitle: "Login bug triage",
+    items: [{ kind: "decision", title: "Ship Friday" }] });
+  assert.deepEqual(notifications.filter((n) => n.title != null).map((n) => n.title),
+    ["1 proposal from Login bug triage"]);
+  assert.equal((await review2510(S, "q1", "p1", { action: "approve" })).status, 200);
+  assert.equal(hub.getDecisions()[S].at(-1).label, "Login bug triage");
+  // A meeting Tenir named keeps its name: an agent's inferred title is dropped.
+  await postMeeting2508(S, meeting2508("q2", { title: "Q4-2026-roadmap-planning-sync" }));
+  const [c2] = meetCmds2508("mtQ2894").filter((c) => c.meetingId === "q2");
+  await meetResult2508("mtQ2894", S, c2, { status: "ok", items: [], summary: "s", inferredTitle: "Renamed" });
+  const q2 = hub.getMeetings()[S].find((m) => m.meetingId === "q2");
+  assert.deepEqual([q2.title, "inferredTitle" in q2, q2.summary], ["Q4-2026-roadmap-planning-sync", false, "s"]);
+  cleanup2508(S, ["mtQ2894"]);
+  delete hub.getDecisions()[S];
+});
+
+// ---- XERK-2892: holiday catalogs and each org's days off -------------------------------
+test("XERK-2892: an org's holiday settings validate, round-trip, persist and stream", async () => {
+  const S = "hol2892.atlassian.net";
+  await beat1574("hol2892", S);
+  try {
+    const put = (body, headers = userHeaders, site = S) => request("PUT",
+      `/api/orgs/${encodeURIComponent(site)}/holidays`,
+      { headers: { ...headers, "content-type": "application/json" }, body });
+    // Untouched: follows the US catalog, nothing off; the catalog rides the payload.
+    let d = (await request("GET", "/api/agents", { headers: userHeaders })).body;
+    assert.deepEqual(d.holidaySettings[S], { countries: ["US"], off: [] });
+    assert.ok(d.holidayCatalog.US.holidays.some((h) => h.id === "us-thanksgiving"));
+    for (const bad of [[], "x", { countries: "US" }, { countries: ["ZZ"] }, { off: ["us-nope"] },
+      { off: [7] }, { off: ["__proto__"] }, { off: ["us-thanksgiving", null] }]) {
+      assert.equal((await put(bad)).status, 400, JSON.stringify(bad));
+    }
+    // A repeat is kept once, never refused.
+    const dup = await put({ countries: ["US", "US"] });
+    assert.deepEqual([dup.status, dup.body.settings.countries], [200, ["US"]]);
+    assert.equal((await put({ off: [] }, {})).status, 401);
+    assert.equal((await put({ off: [] }, userHeaders, "nobody2892.atlassian.net")).status, 404);
+    assert.ok(!Object.hasOwn(hub.getHolidaySettings(), "nobody2892.atlassian.net"));
+    const { req: sseReq, res: sseRes } = await sseConnect(userHeaders);
+    const frames = collectSse(sseRes);
+    const ok = await put({ off: ["us-thanksgiving", "us-independence-day", "us-thanksgiving"] });
+    assert.deepEqual([ok.status, ok.body.settings],
+      [200, { countries: ["US"], off: ["us-thanksgiving", "us-independence-day"] }]);
+    // A partial PUT merges: countries alone keeps the days off.
+    assert.deepEqual((await put({ countries: ["US"] })).body.settings.off, ["us-thanksgiving", "us-independence-day"]);
+    await waitFor(() => frames.some((e) => e.event === "holidaySettings" &&
+      (JSON.parse(e.data)[S] || {}).off?.length === 2));
+    sseReq.destroy(); sseRes.destroy();
+    d = (await request("GET", "/api/agents", { headers: userHeaders })).body;
+    assert.deepEqual(d.holidaySettings[S], { countries: ["US"], off: ["us-thanksgiving", "us-independence-day"] });
+    // The store is a coerce fixed point (restore), null-prototype, and drops unknowns.
+    const raw = JSON.parse(JSON.stringify(hub.getHolidaySettings()));
+    assert.deepEqual(JSON.parse(JSON.stringify(hub.holidaySettingsCoerce(raw))), raw);
+    const c = hub.holidaySettingsCoerce({ ["__proto__"]: { countries: ["US"], off: [] }, b: { countries: ["ZZ"], off: [] } });
+    assert.equal(Object.getPrototypeOf(c), null);
+    assert.deepEqual(Object.keys(c), ["__proto__"]);
+    // GET /api/holidays: the US catalog's holidays in the window, each naming the orgs off.
+    const get = (q, headers = userHeaders) => request("GET", `/api/holidays?${q}`, { headers });
+    const r = await get("from=2026-07-01&until=2026-11-30");
+    assert.equal(r.status, 200);
+    const july4 = r.body.find((h) => h.id === "us-independence-day");
+    assert.deepEqual([july4.date, july4.actualDate, july4.country], ["2026-07-03", "2026-07-04", "US"]);
+    assert.ok(july4.offFor.includes(S));
+    assert.ok(!r.body.find((h) => h.id === "us-labor-day").offFor.includes(S));
+    assert.deepEqual(r.body.map((h) => h.date), [...r.body.map((h) => h.date)].sort());
+    // Remembered by id: it is off next year too.
+    assert.ok((await get("from=2027-11-01&until=2027-11-30")).body
+      .find((h) => h.id === "us-thanksgiving").offFor.includes(S));
+    for (const q of ["", "from=2026-01-01", "from=2026-02-30&until=2026-03-01",
+      "from=2026-05-01&until=2026-04-01", "from=2026-01-01&until=2027-03-01"]) {
+      assert.equal((await get(q)).status, 400, q);
+    }
+    assert.equal((await get("from=2026-01-01&until=2026-01-31", {})).status, 401);
+    // An org that follows no catalog is never named off, even while another visible org
+    // lists that catalog.
+    const S2 = "hol2892b.atlassian.net";
+    await beat1574("hol2892b", S2);
+    assert.equal((await put({ countries: [], off: ["us-thanksgiving"] }, userHeaders, S2)).status, 200);
+    const nov = (await get("from=2026-11-01&until=2026-11-30")).body.find((h) => h.id === "us-thanksgiving");
+    assert.ok(nov.offFor.includes(S) && !nov.offFor.includes(S2), JSON.stringify(nov.offFor));
+    delete agents.hol2892b; delete hub.getHolidaySettings()[S2];
+    // Following no catalog lists none of its holidays for the org.
+    await put({ countries: [] });
+    assert.ok(!(await get("from=2026-11-01&until=2026-11-30")).body.some((h) => h.offFor.includes(S)));
+  } finally {
+    delete agents.hol2892;
+    delete hub.getHolidaySettings()[S];
+  }
+});
+
+test("XERK-2892: holiday settings and days off are each tenant's own", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await fleet2551(T, "t2892");
+    const put = (site, h, body) => request("PUT", `/api/orgs/${encodeURIComponent(site)}/holidays`,
+      { headers: { ...h, "content-type": "application/json" }, body });
+    assert.equal((await put(F.SA, T.B.h, { off: ["us-christmas"] })).status, 404, "B cannot write A's org");
+    assert.equal((await put(F.SA, userHeaders, { off: ["us-christmas"] })).status, 404, "break-glass has no tenant");
+    assert.equal((await put(F.SA, T.A.h, { off: ["us-christmas"] })).status, 200);
+    assert.equal((await put(F.SB, T.B.h, { off: ["us-labor-day"] })).status, 200);
+    assert.equal((await put(S2551, userHeaders, { off: ["us-memorial-day"] })).status, 200);
+    // Each tenant's payload carries only its own org's settings.
+    const agentsOf = async (h) => (await request("GET", "/api/agents", { headers: h })).body.holidaySettings;
+    const a = await agentsOf(T.A.h), b = await agentsOf(T.B.h), op = await agentsOf(userHeaders);
+    assert.deepEqual(Object.keys(a).filter((k) => k.startsWith(S2551)), [F.SA]);
+    assert.deepEqual(Object.keys(b).filter((k) => k.startsWith(S2551)), [F.SB]);
+    assert.ok(S2551 in op && !(F.SA in op) && !(F.SB in op));
+    // /api/holidays names only the caller's own orgs in offFor.
+    const hol = async (h) => (await request("GET", "/api/holidays?from=2026-05-01&until=2026-12-31",
+      { headers: h })).body;
+    const offFor = (list, id) => list.find((x) => x.id === id).offFor;
+    const ha = await hol(T.A.h), hb = await hol(T.B.h), ho = await hol(userHeaders);
+    assert.deepEqual(offFor(ha, "us-christmas"), [F.SA]);
+    assert.deepEqual(offFor(ha, "us-labor-day"), []);
+    assert.deepEqual(offFor(hb, "us-labor-day"), [F.SB]);
+    assert.deepEqual(offFor(hb, "us-christmas"), []);
+    assert.ok(!JSON.stringify(ho).includes(T.A.t) && !JSON.stringify(ho).includes(T.B.t));
+    assert.deepEqual(offFor(ho, "us-memorial-day"), [S2551]);
+    // A tenant purge drops its org's settings and nobody else's.
+    hub.purgeTenantData(T.A.t);
+    assert.ok(!(F.SA in hub.getHolidaySettings()) && F.SB in hub.getHolidaySettings());
+  } finally {
+    if (F) {
+      forget2533("t2892", F.ka, F.kb, F.kl);
+      for (const k of [F.SA, F.SB, S2551]) delete hub.getHolidaySettings()[k];
+    }
+    T.restore();
+  }
+});
+
+// ---- XERK-2891: the hub stores each host's Outlook events and serves them --------
+const H2891 = 3600 * 1000;
+const iso2891 = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+function ev2891(id, startMs, extra = {}) {
+  return { id, seriesId: "", subject: `Meeting ${id}`, start: iso2891(startMs), end: iso2891(startMs + H2891),
+    allDay: false, location: "", organizer: "Ann", busy: "busy", myResponse: "accepted",
+    canceled: false, recurring: false, attendees: [], joinUrl: "", ...extra };
+}
+const calBeat2891 = (device, extra = {}, headers = agentHeaders) => request("POST", "/api/heartbeat", {
+  headers: { ...headers, "content-type": "application/json" },
+  body: { device, sessions: [], calendar: { available: true }, ...extra },
+});
+const calGet2891 = (from, until, headers = userHeaders, q = "") =>
+  request("GET", `/api/calendar?from=${from}&until=${until}${q}`, { headers });
+const calCmds2891 = (key) => (agents[key].commands || []).filter((c) => c.type === "syncCalendar");
+function forget2891(...keys) {
+  for (const k of keys) {
+    delete agents[k];
+    delete hub.getCalendarEvents()[k];
+    delete hub.getCalendarHostSettings()[k];
+    hub.calendarOnDemandAt.delete(k);
+  }
+}
+
+test("XERK-2891: a sync is authoritative for its window — removed and moved meetings go, canceled ones stay", async () => {
+  const D = "cal2891a";
+  forget2891(D);
+  const now = Date.now();
+  const day = 24 * H2891;
+  const from = now - 7 * day, until = now + 7 * day;
+  const r1 = await calBeat2891(D, { calendarSync: [{ windowFrom: from, windowUntil: until, syncedAt: now, events: [
+    ev2891("gone", now + day),
+    ev2891("cancel", now + 2 * day),
+    ev2891("series:2026-11-20", now + 3 * day, { seriesId: "series", recurring: true }),
+    ev2891("later", now + 30 * day),      // outside the second sync's window
+  ] }] });
+  assert.equal(r1.status, 200);
+  let view = (await calGet2891(from, now + 40 * day)).body;
+  assert.deepEqual(view.events.map((e) => e.id), ["gone", "cancel", "series:2026-11-20", "later"]);
+  // The second read: "gone" was canceled-and-removed, "cancel" is canceled but
+  // still in Outlook, the occurrence moved a day later (same id).
+  await calBeat2891(D, { calendarSync: [{ windowFrom: from, windowUntil: until, syncedAt: now + 1, events: [
+    ev2891("cancel", now + 2 * day, { canceled: true }),
+    ev2891("series:2026-11-20", now + 4 * day, { seriesId: "series", recurring: true }),
+  ] }] });
+  view = (await calGet2891(from, now + 40 * day)).body;
+  assert.deepEqual(view.events.map((e) => e.id), ["cancel", "series:2026-11-20", "later"],
+    "absence inside the window deletes; outside it nothing is touched");
+  assert.equal(view.events[0].canceled, true, "a canceled meeting stays, struck through");
+  assert.equal(view.events[1].start, iso2891(now + 4 * day), "the moved occurrence is at its new time");
+  const host = view.hosts.find((h) => h.host === D);
+  assert.deepEqual([host.windowFrom, host.windowUntil, host.online], [from, until, true]);
+  // A range query returns only overlapping events.
+  assert.deepEqual((await calGet2891(now + 29 * day, now + 31 * day)).body.events.map((e) => e.id), ["later"]);
+  forget2891(D);
+});
+
+test("XERK-2891: an offline host's last good sync is still served; a failed read keeps it with the reason", async () => {
+  const D = "cal2891b";
+  forget2891(D);
+  const now = Date.now();
+  await calBeat2891(D, { calendarSync: [{ windowFrom: now - H2891, windowUntil: now + 48 * H2891, syncedAt: now,
+    events: [ev2891("m1", now + H2891)] }] });
+  await calBeat2891(D, { calendarSync: [{ windowFrom: now - H2891, windowUntil: now + 48 * H2891, syncedAt: now + 5,
+    error: "Outlook is not open" }] });
+  agents[D].lastSeen = now - 10 * 60 * 1000;
+  const view = (await calGet2891(now - H2891, now + 48 * H2891)).body;
+  const host = view.hosts.find((h) => h.host === D);
+  assert.equal(host.online, false);
+  assert.equal(host.lastError, "Outlook is not open");
+  assert.equal(host.pending, undefined, "nothing is asked of an offline host");
+  assert.deepEqual(view.events.filter((e) => e.host === D).map((e) => e.id), ["m1"]);
+  // Removed from the registry, it is still served until the 30-day retention.
+  delete agents[D];
+  assert.equal(hub.calendarTick(now), 0);
+  assert.equal(hub.calendarTick(now + 31 * 24 * H2891), 1);
+  assert.ok(!(D in hub.getCalendarEvents()));
+  forget2891(D);
+});
+
+test("XERK-2891: a reconnect queues syncCalendar for the default window; a live beat does not", async () => {
+  const D = "cal2891c";
+  forget2891(D);
+  // An older agent (no capability) is never asked.
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: D, sessions: [] } });
+  assert.equal(calCmds2891(D).length, 0);
+  const t0 = Date.now();
+  await calBeat2891(D);
+  let cmds = calCmds2891(D);
+  assert.equal(cmds.length, 1, "the capability appearing is a reconnect");
+  assert.ok(Math.abs(cmds[0].from - (t0 - hub.CALENDAR_PAST_MS)) < 5000);
+  assert.ok(Math.abs(cmds[0].until - (t0 + hub.CALENDAR_FUTURE_MS)) < 5000);
+  await calBeat2891(D, { ackedCommands: [cmds[0].cmdId] });
+  assert.equal(calCmds2891(D).length, 0, "a live host's next beat asks nothing");
+  agents[D].lastSeen = Date.now() - 2 * 60 * 1000;   // past OFFLINE_AFTER_MS
+  await calBeat2891(D);
+  assert.equal(calCmds2891(D).length, 1, "back online: the default window is asked for again");
+  // A week outside every synced range queues it once (throttled), marked pending.
+  await calBeat2891(D, { ackedCommands: calCmds2891(D).map((c) => c.cmdId) });
+  const far = Date.now() + 60 * 24 * H2891;
+  const v = (await calGet2891(far, far + 7 * 24 * H2891)).body;
+  assert.equal(v.hosts.find((h) => h.host === D).pending, true);
+  cmds = calCmds2891(D);
+  assert.deepEqual([cmds.length, cmds[0].from, cmds[0].until], [1, far, far + 7 * 24 * H2891]);
+  assert.equal((await calGet2891(far, far + 7 * 24 * H2891)).body.hosts.find((h) => h.host === D).pending, true);
+  assert.equal(calCmds2891(D).length, 1, "asked once, not per GET");
+  forget2891(D);
+});
+
+test("XERK-2891: size caps refuse a sync in the hub's words and keep the last good one", async () => {
+  const D = "cal2891d";
+  forget2891(D);
+  const now = Date.now();
+  const win = { windowFrom: now - H2891, windowUntil: now + 10 * 24 * H2891 };
+  await calBeat2891(D, { calendarSync: [{ ...win, syncedAt: now, events: [ev2891("keep", now + H2891)] }] });
+  const many = Array.from({ length: hub.CALENDAR_SYNC_EVENTS_MAX + 1 }, (_, i) => ev2891(`e${i}`, now + 2 * H2891));
+  const r = await calBeat2891(D, { calendarSync: [{ ...win, syncedAt: now + 1, events: many }] });
+  assert.equal(r.status, 200, "the beat itself is accepted");
+  let h = hub.getCalendarEvents()[D];
+  assert.match(h.lastError, /refused a calendar sync of 1501 events: it keeps at most 1500 a sync/);
+  assert.deepEqual(h.events.map((e) => e.id), ["keep"]);
+  const fat = Array.from({ length: 600 }, (_, i) => ev2891(`f${i}`, now + 2 * H2891, { body: "x".repeat(4000) }));
+  await calBeat2891(D, { calendarSync: [{ ...win, syncedAt: now + 2, events: fat }] });
+  h = hub.getCalendarEvents()[D];
+  assert.match(h.lastError, /the limit is 2048 KiB/);
+  assert.deepEqual(h.events.map((e) => e.id), ["keep"]);
+  await calBeat2891(D, { calendarSync: [{ windowFrom: now, windowUntil: now - 1, events: [] }] });
+  assert.match(hub.getCalendarEvents()[D].lastError, /window must be epoch ms/);
+  // A good sync clears the error.
+  await calBeat2891(D, { calendarSync: [{ ...win, syncedAt: now + 3, events: [ev2891("keep", now + H2891)] }] });
+  assert.equal(hub.getCalendarEvents()[D].lastError, undefined);
+  // The serve range is bounded too.
+  assert.equal((await calGet2891(now, now + 101 * 24 * H2891)).status, 400);
+  forget2891(D);
+});
+
+test("XERK-2891: sanitizeCalendarEvent is a typed, capped fixed point", () => {
+  const raw = ev2891("a\u0007b", Date.now());
+  assert.equal(hub.sanitizeCalendarEvent(raw), null, "a control char in the id drops the event");
+  const e = hub.sanitizeCalendarEvent({ ...ev2891("ok", Date.parse("2026-11-20T09:00:00Z")),
+    subject: " Hi‮ there ", body: "y".repeat(5000), busy: "nope", sensitivity: "secret",
+    attendees: [{ name: "Bo", email: "BO@Acme.COM", role: "required", response: 3 }, "x"],
+    joinUrl: "javascript:alert(1)", categories: ["Red", 7], start: "2026-11-20T09:00:00+00:00" });
+  assert.equal(e.subject, "Hi there");
+  assert.equal([...e.body].length, 4000);
+  assert.deepEqual([e.busy, e.sensitivity, e.joinUrl], ["unknown", "normal", ""]);
+  assert.deepEqual(e.attendees, [{ name: "Bo", email: "bo@acme.com", role: "required", response: "unknown" }]);
+  assert.deepEqual(e.categories, ["Red"]);
+  assert.deepEqual(hub.sanitizeCalendarEvent(e), e, "a stored event re-coerces to itself");
+  assert.equal(hub.sanitizeCalendarEvent({ ...ev2891("bad", Date.now()), start: "tomorrow" }), null);
+  assert.equal(hub.sanitizeCalendarEvent({ ...ev2891("bad", Date.now()), start: "2026-02-30T09:00:00Z" }), null,
+    "an impossible date is refused, never rolled over");
+  // Restore + HA watch run the same whitelist.
+  const coerced = hub.calendarEventsCoerce({ h: { syncedAt: 5, events: [e, e, { id: "x" }] } });
+  assert.deepEqual(coerced.h.events, [e]);
+});
+
+test("XERK-2891: events take an org by rule, default or series override; private ones are withheld", async () => {
+  const D = "cal2891e", SA = "calA2891.atlassian.net", SB = "calB2891.atlassian.net";
+  forget2891(D, "cal2891eb");
+  await beat1574("cal2891eb", SB);
+  await calBeat2891(D, { jira: { available: true, configured: true, siteKey: SA, user: "a@x.com",
+    fetchedAt: new Date().toISOString(), tickets: [] } });
+  const now = Date.now();
+  const att = (email) => ({ name: "", email, role: "required", response: "accepted" });
+  await calBeat2891(D, { calendarSync: [{ windowFrom: now - H2891, windowUntil: now + 48 * H2891, syncedAt: now, events: [
+    ev2891("byOrganizer", now + H2891, { organizerEmail: "ceo@b.example.com", attendees: [att("x@a.example")] }),
+    ev2891("byAttendee", now + 2 * H2891, { attendees: [att("x@a.example"), att("y@gmail.com")] }),
+    ev2891("ambiguous", now + 3 * H2891, { attendees: [att("x@a.example"), att("y@b.example.com")] }),
+    ev2891("pinned", now + 4 * H2891, { seriesId: "ser", attendees: [att("x@a.example")] }),
+    ev2891("secret", now + 5 * H2891, { sensitivity: "private", body: "salary talk", location: "HR",
+      attendees: [att("x@a.example")] }),
+  ] }] });
+  const rules = (site, domains, h = userHeaders) => request("POST", `/api/orgs/${site}/calendar-rules`,
+    { headers: { ...h, "content-type": "application/json" }, body: { domains } });
+  assert.equal((await rules(SA, ["not a domain"])).status, 400);
+  assert.equal((await rules("nobody2891.atlassian.net", ["a.example"])).status, 404);
+  assert.equal((await rules(SA, ["A.example"])).status, 200);
+  assert.equal((await rules(SB, ["b.example.com"])).status, 200);
+  const settings = (body) => request("POST", `/api/agents/${D}/calendar/settings`,
+    { headers: { ...userHeaders, "content-type": "application/json" }, body });
+  let orgs = Object.fromEntries((await calGet2891(now - H2891, now + 48 * H2891)).body.events
+    .filter((e) => e.host === D).map((e) => [e.id, e.org]));
+  assert.deepEqual(orgs, { byOrganizer: SB, byAttendee: SA, ambiguous: "", pinned: SA, secret: SA });
+  assert.equal((await settings({ defaultOrg: "nobody2891.atlassian.net" })).status, 404);
+  assert.equal((await settings({ defaultOrg: SB })).status, 200);
+  assert.equal((await settings({ series: { id: "ser", org: "" } })).status, 200);
+  const view = (await calGet2891(now - H2891, now + 48 * H2891)).body.events.filter((e) => e.host === D);
+  orgs = Object.fromEntries(view.map((e) => [e.id, e.org]));
+  assert.deepEqual([orgs.ambiguous, orgs.pinned], [SB, ""], "default org, then the series pin");
+  const secret = view.find((e) => e.id === "secret");
+  assert.deepEqual([secret.subject, secret.body, secret.location, secret.attendees, secret.private],
+    ["Private event", "", "", [], true]);
+  assert.equal((await settings({ showPrivate: true })).status, 200);
+  const shown = (await calGet2891(now - H2891, now + 48 * H2891)).body.events.find((e) => e.id === "secret");
+  assert.equal(shown.body, "salary talk");
+  // The org filter selects on the assigned org ("" = unassigned).
+  const only = (await calGet2891(now - H2891, now + 48 * H2891, userHeaders, `&org=${SB}`)).body.events
+    .filter((e) => e.host === D).map((e) => e.id);
+  assert.deepEqual(only.sort(), ["ambiguous", "byOrganizer"]);
+  delete hub.getCalendarOrgRules()[SA];
+  delete hub.getCalendarOrgRules()[SB];
+  forget2891(D, "cal2891eb");
+});
+
+test("XERK-2891: each tenant reads only its own hosts' calendars, settings and frames", async () => {
+  const T = tenants2533();
+  const ka = `cal2891t@${T.A.t}`, kb = `cal2891t@${T.B.t}`;
+  forget2533("cal2891t", ka, kb);
+  forget2891(ka, kb, "cal2891u");
+  try {
+    const ta = await enroll2533(T.A, "cal2891t");
+    const tb = await enroll2533(T.B, "cal2891t");
+    const now = Date.now();
+    const sync = (id) => ({ calendar: { available: true }, calendarSync: [{ windowFrom: now - H2891,
+      windowUntil: now + 48 * H2891, syncedAt: now, events: [ev2891(id, now + H2891)] }] });
+    assert.equal((await beat2533(ta, "cal2891t", sync("ofA"))).status, 200);
+    assert.equal((await beat2533(tb, "cal2891t", sync("ofB"))).status, 200);
+    await calBeat2891("cal2891u", sync("ofOps"));
+    const ids = async (h) => (await calGet2891(now - H2891, now + 48 * H2891, h)).body.events
+      .filter((e) => e.host.startsWith("cal2891")).map((e) => `${e.host}:${e.id}`);
+    assert.deepEqual(await ids(T.A.h), [`${ka}:ofA`]);
+    assert.deepEqual(await ids(T.B.h), [`${kb}:ofB`]);
+    assert.deepEqual(await ids(userHeaders), ["cal2891u:ofOps"], "break-glass reaches no tenant's calendar");
+    const hostsOf = async (h) => (await calGet2891(now - H2891, now + 48 * H2891, h)).body.hosts
+      .map((x) => x.host).filter((k) => k.startsWith("cal2891"));
+    assert.deepEqual(await hostsOf(T.A.h), [ka]);
+    // Another tenant's host's settings are the unknown host's 404.
+    const set = (key, h) => request("POST", `/api/agents/${encodeURIComponent(key)}/calendar/settings`,
+      { headers: { ...h, "content-type": "application/json" }, body: { showPrivate: true } });
+    assert.equal((await set(kb, T.A.h)).status, 404);
+    assert.equal((await set(ka, T.A.h)).status, 200);
+    // The SSE frame keeps only hosts the view may drive, and nothing when none is left.
+    const scope = require("../tenant-scope.js");
+    const view = { mayHost: (k) => k === ka };
+    assert.deepEqual(Object.keys(scope.scopeEvent("calendar", { [ka]: {}, [kb]: {} }, view)), [ka]);
+    assert.equal(scope.scopeEvent("calendar", { [kb]: {} }, view), undefined);
+    // Purging a tenant drops its calendar and nothing else.
+    hub.purgeTenantData(T.B.t);
+    assert.ok(!(kb in hub.getCalendarEvents()) && ka in hub.getCalendarEvents());
+  } finally {
+    forget2891(ka, kb, "cal2891u");
+    forget2533("cal2891t", ka, kb);
+    T.restore();
+  }
 });

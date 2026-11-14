@@ -35,7 +35,7 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   - `shadow-done --note` → `{note, requestedAt}` and `shadow-grade --verdict --tests --qa --design
     --note` → the grade (XERK-1847, a shadow run's two sessions). Read on the beat by
     `read_shadow_done`/`read_shadow_grade`, every enum re-validated (`model-quality.md`).
-  - `calendar [today|tomorrow|week]` is the one READ-ONLY subcommand (XERK-2884): no request
+  - `calendar [today|tomorrow|yesterday|week|YYYY-MM-DD] [--days N]` is the one READ-ONLY subcommand (XERK-2884, XERK-2903): no request
     file, no `TURMA_SESSION_ID` needed. Contract in "The calendar reader" below.
 - Exit 0 + one confirmation line on success; **2** on a refusal (usage, a bound, no
   `TURMA_SESSION_ID`, an id that is not a plain name), saying why and writing nothing; 1 on an
@@ -297,8 +297,9 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   beside Microsoft 365, that one — and opens its account-setup wizard (operator, live). The
   error names which case it is: Outlook closed, only new Outlook (`olk`) open, or open but
   unreachable (elevation mismatch / another version registered).
-- **Only two integers reach the script** (a `CALENDAR_RANGES` day offset and length), substituted
-  into `_CALENDAR_PS`; days are counted in WINDOWS local time, since the distro's TZ is often UTC.
+- **Only integers reach the script** (`calendar_window`): a `CALENDAR_RANGES` day offset, or a
+  YYYY-MM-DD date as year/month/day, plus a length (`--days`, 1-31). Days are counted in WINDOWS
+  local time, since the distro's TZ is often UTC; a bad date or span exits 2 before PowerShell.
 - Restrict's dates must be in the user's locale (`ToString('g')`), and `Sort` must precede
   `IncludeRecurrences` or recurring meetings vanish. Enumerate with `GetFirst`/`GetNext`.
 - **Printed stamps use the INVARIANT culture**; only Restrict's literals use the user's. A

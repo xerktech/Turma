@@ -105,6 +105,17 @@ class MeetingsTest {
             meetingsEmptyText(mapOf("a" to listOf(m))))
     }
 
+    @Test fun `XERK-2894 an inferred title names the meeting and the summary splits into paragraphs`() {
+        val ok = Meeting(meetingId = "s", status = "ok", title = "Meeting", inferredTitle = "Login bug triage",
+            summary = "  We met.\nAnn reported it.\n\n\nDecisions: none.  ")
+        assertEquals("Login bug triage", meetingTitle(ok))
+        assertEquals("Meeting", meetingTitle(ok.copy(inferredTitle = "")))
+        assertEquals("Untitled meeting", meetingTitle(ok.copy(title = "", inferredTitle = " ")))
+        assertEquals(listOf("We met.\nAnn reported it.", "Decisions: none."), meetingSummaryParagraphs(ok))
+        assertEquals(emptyList<String>(), meetingSummaryParagraphs(ok.copy(summary = "")))
+        assertEquals(emptyList<String>(), meetingSummaryParagraphs(ok.copy(status = "failed")))
+    }
+
     @Test fun `orgs shown are those with meetings inside the header's scope`() {
         val map = mapOf("b" to listOf(m), "a" to listOf(m), "c" to emptyList())
         assertEquals(listOf("a", "b"), meetingOrgs(map, emptySet()))

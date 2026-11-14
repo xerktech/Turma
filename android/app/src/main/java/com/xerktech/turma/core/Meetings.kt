@@ -124,6 +124,15 @@ fun meetingMetaLine(m: Meeting, zone: ZoneId = ZoneId.systemDefault(), locale: L
     return bits.joinToString(" · ")
 }
 
+/** A meeting's name: the inferred title for a generic Tenir one (XERK-2894), else Tenir's. */
+fun meetingTitle(m: Meeting): String =
+    m.inferredTitle.ifBlank { m.title }.ifBlank { "Untitled meeting" }
+
+/** The summary's paragraphs (split on blank lines) for an `ok` run; empty = none. */
+fun meetingSummaryParagraphs(m: Meeting): List<String> =
+    if (m.status != "ok") emptyList()
+    else m.summary.trim().split(Regex("\n{2,}")).map { it.trim() }.filter { it.isNotEmpty() }
+
 /** The line a meeting shows instead of items, or null when it lists them. */
 fun meetingStatusLine(m: Meeting): Pair<String, Boolean>? = when {
     m.status == "queued" -> "Waiting for a host of this org to read the captions…" to false

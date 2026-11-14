@@ -88,4 +88,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   Daily brief schedule (live orgs only) with "Daily meeting title contains" (`meetingTitle`).
 - Labels Tenir sent that no org has: ONE banner on top, a row per label with an org pick.
 - Android port of the triage is its own ticket (`android/PARITY.md`, Brief section).
+- **A settled meeting shows its written summary above the proposals** (XERK-2894, `summaryHtml`;
+  Android `meetingSummaryParagraphs` in `MeetingPart`): plain text, escaped, paragraphs on blank
+  lines; and is named `meetingTitle` = `inferredTitle || title` everywhere (head, rail, search).
 - Tests: `turma/tests/meetings.test.js`, `turma/tests/brief.test.js` (the `XERK-2857` cases).
