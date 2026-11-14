@@ -80,7 +80,9 @@ CALENDAR_TEXT_MAX = 300
 # is passed as its three integers, so "today" never has to be agreed across OSes.
 CALENDAR_RANGES = {"yesterday": (-1, 1), "today": (0, 1), "tomorrow": (1, 1), "week": (0, 7)}
 CALENDAR_DAYS_MAX = 31
-_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+# A window near year 1 or 9999 overflows .NET DateTime inside PowerShell.
+CALENDAR_YEARS = (1900, 2999)
 # Outlook enums (OlMeetingRecipientType, OlResponseStatus, OlBusyStatus).
 _RECIPIENT_TYPE = {0: "organizer", 1: "required", 2: "optional", 3: "resource"}
 _RESPONSE = {0: "none", 1: "organizer", 2: "tentative", 3: "accepted",
@@ -352,6 +354,8 @@ def calendar_window(when: str, days=None):
             d = datetime.date.fromisoformat(when)
         except ValueError:
             raise Refused(f"{when!r} is not {', '.join(CALENDAR_RANGES)} or a YYYY-MM-DD date")
+        if not CALENDAR_YEARS[0] <= d.year <= CALENDAR_YEARS[1]:
+            raise Refused(f"{when} is outside {CALENDAR_YEARS[0]}-{CALENDAR_YEARS[1]}")
         start, n = f"(New-Object DateTime {d.year}, {d.month}, {d.day})", 1
     if days is not None:
         n = days

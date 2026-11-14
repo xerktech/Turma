@@ -549,7 +549,9 @@ class CalendarTest(unittest.TestCase):
 
     def test_a_bad_date_or_span_exits_2_before_powershell(self):
         for argv in (["calendar", "2026-13-01"], ["calendar", "friday"],
-                     ["calendar", "2026-11-13; rm -rf /"], ["calendar", "2026-1-3"],
+                     ["calendar", "2026-11-13; rm -rf /"], ["calendar", "2026-1-3"], ["calendar", "20261113"],
+                     ["calendar", "2026-W46-5"], ["calendar", "9999-12-31"],
+                     ["calendar", "0001-01-01"],
                      ["calendar", "today", "--days", "0"], ["calendar", "week", "--days", "32"]):
             err = io.StringIO()
             with mock.patch.object(cli, "find_powershell") as find, \
