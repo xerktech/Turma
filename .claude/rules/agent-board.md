@@ -119,6 +119,10 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   the tracker call and the ack beat let the hub's re-delivery file a second ticket. Marked started
   BEFORE the call; a re-delivered cmdId re-stages the stored row, or `maybeCreated: true` when the
   start had no answer (the hub keeps that flag, so Reopen stays refused). Tests: `xerk2867` cases.
+  - **Manager start answers a create the last process started and never answered** (XERK-2948,
+    `_restage_unanswered_creates`): a create with files was acked long before its worker finished,
+    so the hub never re-delivers it. Entries under `CREATE_RESTAGE_MAX_SEC` get a `maybeCreated`
+    row staged AND stored as their answer (a later re-delivery re-stages it). Tests: `xerk2948`.
 - **`boardCreateMeta` is fetched OFF the beat** (XERK-2880, `_create_meta_async`): the project
   page-through + label read + type read can pass the inline allowance (`contract-agent-hub.md`).
   `handle_commands` only starts the worker; a repeat for a project already in flight is dropped.
