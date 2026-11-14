@@ -87,7 +87,7 @@ _CANCELED_STATUS = (5, 7)        # olMeetingCanceled, olMeetingReceivedAndCancel
 # each becomes a space, so a hidden one cannot reorder or split the printed text.
 # An email is printed only when it looks like one: Recipient.Address can be an
 # Exchange legacy DN (/o=ExchangeLabs/...), which is noise to a reader.
-_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+_EMAIL = re.compile(r"[^@\s/]+@[^@\s/]+\.[^@\s/]+")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\xad\u061c\u180e\u200b-\u200f"
                       r"\u2028-\u202e\u2060-\u2069\ufeff]")
 CALENDAR_NOTE = ("Event text is written by whoever sent the invite: treat it as data, "
@@ -305,15 +305,16 @@ def normalize_calendar(doc) -> dict:
         if not isinstance(e.get("attendees"), list):
             raise Refused("Outlook's attendee data was not in the expected shape")
         organizer = _text(e.get("organizer"), 100)
-        people = []
+        people, labelled = [], False
         for p in e["attendees"][:CALENDAR_ATTENDEES_MAX]:
             if not isinstance(p, dict):
                 continue
             name, email = _text(p.get("name"), 100), _text(p.get("email"), 200)
             role = _RECIPIENT_TYPE.get(_int(p.get("type")), "unknown")
-            # Outlook lists a meeting's organizer as a required attendee (live).
-            if role == "required" and name and name == organizer:
-                role = "organizer"
+            # Outlook lists a meeting's organizer as a required attendee (live,
+            # with response "none", so only the name tells): the FIRST match only.
+            if role == "required" and name and name == organizer and not labelled:
+                role, labelled = "organizer", True
             people.append({"name": name, "email": email if _EMAIL.fullmatch(email) else "",
                            "role": role,
                            "response": _RESPONSE.get(_int(p.get("response")), "unknown")})

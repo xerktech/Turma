@@ -502,6 +502,13 @@ class CalendarTest(unittest.TestCase):
             {"name": "Bo", "type": 1, "email": "bo@corp.example"}]}]})["events"][0]["attendees"]
         self.assertEqual([(a["role"], a["email"]) for a in got],
                          [("organizer", ""), ("required", "bo@corp.example")])
+        got = cli.normalize_calendar({"ok": True, "events": [{"organizer": "Ana", "attendees": [
+            {"name": "Ana", "type": 2}, {"name": "Ana", "type": 1, "email": "/o=X/cn=a@b.c"},
+            {"name": "Ana", "type": 1, "email": "x ana@corp.example"}, {"name": "", "type": 1}]},
+            {"organizer": "", "attendees": [{"name": "", "type": 1}]}]})["events"]
+        self.assertEqual([(a["role"], a["email"]) for a in got[0]["attendees"]],
+                         [("optional", ""), ("organizer", ""), ("required", ""), ("required", "")])
+        self.assertEqual(got[1]["attendees"][0]["role"], "required")
         self.assertNotIn("unreadable", cli.normalize_calendar(
             {"ok": True, "skipped": -1, "events": []}))
         for bad in (None, [], {"ok": "true"}, {"ok": True},
