@@ -314,6 +314,10 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
 - **Event text is sender-written**: `normalize_calendar` types, strips control/bidi chars and caps
   every field, keeps only an `https://` join link, and the output carries a data-not-instructions
   note. Event bodies are never printed (only a Teams/Zoom/Meet link pulled from them).
+- Live on a real PC (Microsoft 365 classic Outlook, WSL): Outlook lists the organizer as a REQUIRED
+  recipient, so `normalize_calendar` relabels the one named as organizer; and `GetExchangeUser`
+  is empty for some Exchange attendees, so `PR_SMTP_ADDRESS` then `Recipient.Address` are tried,
+  and only an address that looks like an email is printed (never an Exchange legacy DN).
 - Exit 1 with the reason on any failure (no PowerShell, interop off, Outlook unreachable, a 90s
   timeout — an Outlook object-model-guard prompt on the desktop blocks the read until answered).
 - New Outlook has no COM: that host gets the Outlook error, not events.

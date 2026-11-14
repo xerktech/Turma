@@ -251,7 +251,7 @@ class SessionCliTest(unittest.TestCase):
 _COM_LINES = """  try { $ol = [Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application') }
   catch {
     if (Get-Process outlook -ErrorAction SilentlyContinue) {
-      throw 'classic Outlook is open but did not answer: is it (or this shell) running as administrator, or is another Outlook version registered for scripts?'
+      throw 'classic Outlook is open but did not answer: is it still starting, running as administrator (or this shell is), or is another Outlook version registered for scripts?'
     }
     if (Get-Process olk -ErrorAction SilentlyContinue) {
       throw 'only the new Outlook is open, and it cannot be read: open classic Outlook and retry'
@@ -262,6 +262,11 @@ _FAKE_OUTLOOK = r"""
   $ex = [pscustomobject]@{ PrimarySmtpAddress = 'bo@corp.example' }
   $exEntry = [pscustomobject]@{ Type = 'EX' }
   $exEntry | Add-Member ScriptMethod GetExchangeUser { $script:ex }
+  # Live: GetExchangeUser can be empty; PR_SMTP_ADDRESS then answers.
+  $pa = [pscustomobject]@{}
+  $pa | Add-Member ScriptMethod GetProperty { param($t) if ($t -like '*0x39FE001E') { 'cy@corp.example' } }
+  $noUser = [pscustomobject]@{ Type = 'EX'; PropertyAccessor = $pa }
+  $noUser | Add-Member ScriptMethod GetExchangeUser { $null }
   $script:appts = @(
     [pscustomobject]@{ Subject = 'Standup'; StartUTC = [datetime]'2026-11-13T14:00:00'
       EndUTC = [datetime]'2026-11-13T14:15:00'; AllDayEvent = $false; Location = 'Teams'
@@ -269,10 +274,12 @@ _FAKE_OUTLOOK = r"""
       IsRecurring = $true
       Body = "Join: https://teams.microsoft.com/l/meetup-join/19%3ameeting_x/0?ctx=1 <rest>"
       Recipients = @(
-        [pscustomobject]@{ Name = 'Ana Ortiz'; Type = 0; MeetingResponseStatus = 1
+        [pscustomobject]@{ Name = 'Ana Ortiz'; Type = 1; MeetingResponseStatus = 1
           Address = 'ana@corp.example'; AddressEntry = [pscustomobject]@{ Type = 'SMTP' } },
         [pscustomobject]@{ Name = 'Bo Lin'; Type = 2; MeetingResponseStatus = 4
-          Address = '/o=ExchangeLabs/cn=bo'; AddressEntry = $exEntry }) },
+          Address = '/o=ExchangeLabs/cn=bo'; AddressEntry = $exEntry },
+        [pscustomobject]@{ Name = 'Cy Diaz'; Type = 1; MeetingResponseStatus = 0
+          Address = '/o=ExchangeLabs/cn=cy'; AddressEntry = $noUser }) },
     [pscustomobject]@{ Subject = 'Focus'; StartUTC = [datetime]'2026-11-13T16:00:00'
       EndUTC = [datetime]'2026-11-13T17:00:00'; AllDayEvent = $false; Location = ''
       Organizer = ''; BusyStatus = 2; ResponseStatus = 0; MeetingStatus = 5
@@ -327,10 +334,12 @@ class CalendarTest(unittest.TestCase):
         self.assertEqual(standup["joinUrl"],
                          "https://teams.microsoft.com/l/meetup-join/19%3ameeting_x/0?ctx=1")
         self.assertEqual(standup["attendees"], [
-            {"name": "Ana Ortiz", "email": "ana@corp.example", "role": "organizer",
+            {"name": "Ana Ortiz", "email": "ana@corp.example", "role": "organizer",  # by name
              "response": "organizer"},
             {"name": "Bo Lin", "email": "bo@corp.example", "role": "optional",
-             "response": "declined"}])
+             "response": "declined"},
+            {"name": "Cy Diaz", "email": "cy@corp.example", "role": "required",
+             "response": "none"}])
         self.assertTrue(focus["canceled"])
         self.assertEqual(focus["attendees"], [])
         self.assertEqual(focus["joinUrl"], "")
@@ -406,6 +415,21 @@ class CalendarTest(unittest.TestCase):
             "  $script:appts[1].Body = 'https://evilzoom.us/j/1 or https://acme.zoom.us/j/2'"))
         self.assertEqual(doc["events"][1]["joinUrl"], "https://acme.zoom.us/j/2")
 
+    def test_each_unreachable_outlook_case_says_which(self):
+        """A shadowing Get-Process stands in for which Outlook processes run."""
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("pwsh not installed")
+        for running, said in ((["outlook"], "open but did not answer"),
+                              (["outlook", "olk"], "open but did not answer"),
+                              (["olk"], "only the new Outlook is open")):
+            names = ",".join(f"'{n}'" for n in running)
+            shadow = ("function Get-Process { [CmdletBinding()] param([string[]]$Name) "
+                      f"if (@({names}) -contains $Name[0]) {{ 1 }} }}\n")
+            with mock.patch.object(cli, "_CALENDAR_PS", shadow + cli._CALENDAR_PS):
+                with self.assertRaisesRegex(cli.Refused, said, msg=running):
+                    cli.read_calendar("today", powershell=pwsh)
+
     def test_outlook_not_open_is_reported_never_started(self):
         """The real script with no Outlook to attach to (pwsh has no
         GetActiveObject, as a PC with Outlook closed has nothing to attach to):
@@ -473,6 +497,11 @@ class CalendarTest(unittest.TestCase):
                 {"subject": line, "attendees": []}]})["events"][0]["subject"]
             self.assertEqual(got, "a b", repr(line))
         self.assertEqual(cli._text("Inter\xadnational"), "International")
+        got = cli.normalize_calendar({"ok": True, "events": [{"organizer": "Ana", "attendees": [
+            {"name": "Ana", "type": 1, "email": "/o=ExchangeLabs/ou=x/cn=ana"},
+            {"name": "Bo", "type": 1, "email": "bo@corp.example"}]}]})["events"][0]["attendees"]
+        self.assertEqual([(a["role"], a["email"]) for a in got],
+                         [("organizer", ""), ("required", "bo@corp.example")])
         self.assertNotIn("unreadable", cli.normalize_calendar(
             {"ok": True, "skipped": -1, "events": []}))
         for bad in (None, [], {"ok": "true"}, {"ok": True},
