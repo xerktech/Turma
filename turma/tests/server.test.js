@@ -31984,6 +31984,166 @@ test("XERK-2891: size caps refuse a sync in the hub's words and keep the last go
   forget2891(D);
 });
 
+test("XERK-2905: an over-budget host sheds the furthest bodies before any meeting, and says when it drops one", async () => {
+  const D = "cal2905";
+  forget2891(D);
+  const now = Date.now();
+  const day = 24 * H2891;
+  // 34 weeks of Teams invites at ~3.9 KB of body each: ~2 MB, over the 1.5 MiB host budget.
+  const from = now - 8 * 7 * day, until = now + 26 * 7 * day;
+  const body = "Microsoft Teams meeting. Join on your computer. ".repeat(80);
+  const events = Array.from({ length: 34 * 15 }, (_, i) =>
+    ev2891(`t${i}`, from + Math.floor(i / 15) * 7 * day + (i % 15) * 10 * H2891, { body }));
+  assert.ok(Buffer.byteLength(JSON.stringify(events)) > hub.CALENDAR_HOST_BYTES_MAX);
+  await calBeat2891(D, { calendarSync: [{ windowFrom: from, windowUntil: until, syncedAt: now, events }] });
+  let h = hub.getCalendarEvents()[D];
+  assert.equal(h.events.length, events.length, "every meeting is kept");
+  assert.equal(h.lastError, undefined, "shedding bodies alone is not an error");
+  assert.ok(Buffer.byteLength(JSON.stringify(h.events)) <= hub.CALENDAR_HOST_BYTES_MAX);
+  const far = (e) => (e.endMs < now ? now - e.endMs : Math.max(0, e.startMs - now));
+  const withBody = h.events.filter((e) => e.body), without = h.events.filter((e) => !e.body);
+  assert.ok(withBody.length && without.length);
+  assert.ok(Math.max(...withBody.map(far)) <= Math.min(...without.map(far)), "the nearest meetings keep their bodies");
+  assert.ok(withBody.some((e) => Math.abs(e.startMs - now) < 7 * day), "this week keeps its bodies");
+  // Over the event count: meetings ARE dropped, and the host says so.
+  const before = h.events.length;
+  const more = Array.from({ length: hub.CALENDAR_HOST_EVENTS_MAX }, (_, i) =>
+    ev2891(`n${i}`, until + day + i * H2891));
+  await calBeat2891(D, { calendarSync: [{ windowFrom: until, windowUntil: until + 39 * 7 * day,
+    syncedAt: now + 1, events: more }] });
+  h = hub.getCalendarEvents()[D];
+  assert.equal(h.events.length, hub.CALENDAR_HOST_EVENTS_MAX);
+  assert.equal(h.lastError, `the hub kept ${hub.CALENDAR_HOST_EVENTS_MAX} of ${before + more.length} events: ` +
+    `a host keeps at most ${hub.CALENDAR_HOST_EVENTS_MAX} events and ${hub.CALENDAR_HOST_BYTES_MAX >> 10} KiB, ` +
+    "so the oldest past and furthest future ones were dropped");
+  assert.equal((await calGet2891(now, now + day)).body.hosts.find((x) => x.host === D).lastError, h.lastError);
+  forget2891(D);
+});
+
+test("XERK-2905: a tenant over its byte budget sheds bodies on every host before any meeting goes", async () => {
+  const hosts = ["cal2905t1", "cal2905t2", "cal2905t3", "cal2905t4", "cal2905t5", "cal2905t6"];
+  forget2891(...hosts);
+  const now = Date.now();
+  const day = 24 * H2891;
+  const from = now - 8 * 7 * day, until = now + 26 * 7 * day;
+  const body = "y".repeat(3900);
+  // ~0.95 MB a host, under the host budget; ~5.7 MB together, over the tenant's 4 MiB.
+  for (const D of hosts) {
+    const events = Array.from({ length: 220 }, (_, i) => ev2891(`${D}-${i}`, from + i * 26 * H2891, { body }));
+    await calBeat2891(D, { calendarSync: [{ windowFrom: from, windowUntil: until, syncedAt: now, events }] });
+  }
+  const store = hub.getCalendarEvents();
+  const bytes = hosts.reduce((n, D) => n + store[D].events.reduce((m, e) => m + Buffer.byteLength(JSON.stringify(e)), 0), 0);
+  assert.ok(bytes <= hub.CALENDAR_TENANT_BYTES_MAX, `tenant at ${bytes} bytes`);
+  for (const D of hosts) {
+    assert.equal(store[D].events.length, 220, `${D} keeps every meeting`);
+    assert.equal(store[D].lastError, undefined);
+    assert.ok(store[D].events.some((e) => e.body), `${D} keeps its nearest bodies`);
+  }
+  forget2891(...hosts);
+});
+
+test("XERK-2905: meetings the event cap evicts anyway do not cost near meetings their bodies", async () => {
+  const D = "cal2905c";
+  forget2891(D);
+  const now = Date.now();
+  const day = 24 * H2891;
+  const pad = { location: "L".repeat(300), subject: "S".repeat(300) };
+  const near = Array.from({ length: 10 }, (_, i) => ev2891(`near${i}`, now + i * H2891, { body: "b".repeat(3900) }));
+  const farOld = Array.from({ length: 1490 }, (_, i) => ev2891(`old${i}`, now - 30 * day - i * H2891, pad));
+  await calBeat2891(D, { calendarSync: [{ windowFrom: now - 39 * 7 * day, windowUntil: now + day,
+    syncedAt: now, events: farOld.concat(near) }] });
+  const extra = Array.from({ length: 200 }, (_, i) => ev2891(`fut${i}`, now + 2 * day + i * H2891, pad));
+  await calBeat2891(D, { calendarSync: [{ windowFrom: now + 2 * day, windowUntil: now + 30 * day,
+    syncedAt: now + 1, events: extra }] });
+  const h = hub.getCalendarEvents()[D];
+  assert.equal(h.events.length, hub.CALENDAR_HOST_EVENTS_MAX);
+  assert.equal(h.events.filter((e) => e.id.startsWith("near") && e.body).length, 10, "near bodies survive");
+  assert.match(h.lastError, /^the hub kept 1500 of 1700 events: a host keeps at most 1500 events/);
+  forget2891(D);
+});
+
+test("XERK-2905: a tenant that must evict meetings says so on the host it took them from", async () => {
+  const hosts = ["cal2905e1", "cal2905e2", "cal2905e3"];
+  forget2891(...hosts);
+  const now = Date.now();
+  const day = 24 * H2891;
+  const from = now - 8 * 7 * day, until = now + 26 * 7 * day;
+  const pad = { location: "L".repeat(300), subject: "S".repeat(300), organizer: "O".repeat(100),
+    attendees: [{ name: "A".repeat(100), email: "a@example.com", role: "required", response: "accepted" }] };
+  // No bodies to shed: three hosts of 1100 ~1.3 KB meetings top the tenant's 4 MiB.
+  for (const D of hosts) {
+    const events = Array.from({ length: 1100 }, (_, i) => ev2891(`${D}-${i}`, from + i * 5 * H2891, pad));
+    await calBeat2891(D, { calendarSync: [{ windowFrom: from, windowUntil: until, syncedAt: now, events }] });
+  }
+  const store = hub.getCalendarEvents();
+  const bytes = hosts.reduce((n, D) => n + store[D].events.reduce((m, e) => m + Buffer.byteLength(JSON.stringify(e)), 0), 0);
+  assert.ok(bytes <= hub.CALENDAR_TENANT_BYTES_MAX);
+  const hit = hosts.filter((D) => store[D].lastError);
+  assert.ok(hit.length >= 1);
+  for (const D of hit) {
+    assert.equal(store[D].lastError, `the hub kept ${store[D].events.length} of 1100 events: this tenant's hosts ` +
+      `keep at most ${hub.CALENDAR_TENANT_BYTES_MAX >> 20} MiB of calendar between them, so the oldest past and ` +
+      "furthest future ones were dropped");
+    assert.ok(store[D].events.length < 1100);
+  }
+  forget2891(...hosts);
+});
+
+test("XERK-2905: when both budgets cut a sync, the host's message counts from the sync and names both", async () => {
+  const hosts = ["cal2905o1", "cal2905o2", "cal2905o3"];
+  forget2891(...hosts);
+  const now = Date.now();
+  const day = 24 * H2891;
+  const pad = { location: "L".repeat(300), subject: "S".repeat(300) };
+  const from = now - 8 * 7 * day, until = now + 26 * 7 * day;
+  for (const D of hosts.slice(0, 2)) {
+    const events = Array.from({ length: 1400 }, (_, i) => ev2891(`${D}-${i}`, from + i * 5 * H2891, pad));
+    await calBeat2891(D, { calendarSync: [{ windowFrom: from, windowUntil: until, syncedAt: now, events }] });
+  }
+  const D = hosts[2];
+  const first = Array.from({ length: 1000 }, (_, i) => ev2891(`a${i}`, now + i * H2891, pad));
+  await calBeat2891(D, { calendarSync: [{ windowFrom: now, windowUntil: now + 7 * 7 * day, syncedAt: now, events: first }] });
+  const second = Array.from({ length: 700 }, (_, i) => ev2891(`b${i}`, now + 8 * 7 * day + i * H2891, pad));
+  await calBeat2891(D, { calendarSync: [{ windowFrom: now + 8 * 7 * day, windowUntil: now + 16 * 7 * day,
+    syncedAt: now + 1, events: second }] });
+  const h = hub.getCalendarEvents()[D];
+  assert.ok(h.events.length < hub.CALENDAR_HOST_EVENTS_MAX, "the tenant budget cut below the host cap");
+  assert.equal(h.lastError, `the hub kept ${h.events.length} of 1700 events: a host keeps at most ` +
+    `${hub.CALENDAR_HOST_EVENTS_MAX} events and ${hub.CALENDAR_HOST_BYTES_MAX >> 10} KiB, and this tenant's hosts keep at most ` +
+    `${hub.CALENDAR_TENANT_BYTES_MAX >> 20} MiB of calendar between them, so the oldest past and furthest future ones were dropped`);
+  assert.ok(h.lastError.length <= 300);
+  forget2891(...hosts);
+});
+
+test("XERK-2905: a sibling host that loses bodies to the tenant budget is announced on SSE", async () => {
+  const hosts = ["cal2905s1", "cal2905s2", "cal2905s3"];
+  forget2891(...hosts);
+  const { req, res } = await sseConnect(userHeaders);
+  const frames = collectSse(res);
+  try {
+    const now = Date.now();
+    const day = 24 * H2891;
+    const body = "z".repeat(3000);
+    // s1's meetings are far in the future, so its bodies are the ones the tenant sheds.
+    const at = { cal2905s1: now + 150 * day, cal2905s2: now, cal2905s3: now };
+    for (const D of hosts) {
+      const events = Array.from({ length: 450 }, (_, i) => ev2891(`${D}-${i}`, at[D] + i * 2 * H2891, { body }));
+      await calBeat2891(D, { calendarSync: [{ windowFrom: at[D] - day, windowUntil: at[D] + 60 * day,
+        syncedAt: now, events }] });
+    }
+    const store = hub.getCalendarEvents();
+    assert.ok(store.cal2905s1.events.some((e) => !e.body), "s1 shed bodies");
+    assert.ok(store.cal2905s3.events.every((e) => e.body), "the syncing host kept its bodies");
+    await waitFor(() => frames.some((f) => f.event === "calendar" && "cal2905s1" in JSON.parse(f.data) &&
+      "cal2905s3" in JSON.parse(f.data)));
+  } finally {
+    req.destroy();
+    res.destroy();
+    forget2891(...hosts);
+  }
+});
+
 test("XERK-2891: sanitizeCalendarEvent is a typed, capped fixed point", () => {
   const raw = ev2891("a\u0007b", Date.now());
   assert.equal(hub.sanitizeCalendarEvent(raw), null, "a control char in the id drops the event");

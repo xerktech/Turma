@@ -5944,8 +5944,26 @@ const persistCalendarHostSettings = registerExternalStore({
 // ---- budget --------------------------------------------------------------------
 const calEventBytes = (e) => Buffer.byteLength(JSON.stringify(e));
 const calHostBytes = (h) => h.events.reduce((n, e) => n + calEventBytes(e), 0);
-// Trim `h` to the host caps (or `maxBytes`): the oldest PAST event (by end)
-// first, then the furthest future one. Returns how many it dropped.
+// Over a byte budget, BODIES go before meetings: a body is up to 4000 code
+// points against ~1 KB for the rest of an event, so a full window of Teams
+// invites would otherwise evict whole meetings. The event furthest from `now`
+// (past by end, future by start) loses its body first. Returns bytes saved.
+const calFar = (e, now) => (e.endMs < now ? now - e.endMs : Math.max(0, e.startMs - now));
+function calShedBodies(events, now, excess) {
+  let saved = 0;
+  for (const e of events.filter((x) => x.body).sort((x, y) => calFar(y, now) - calFar(x, now))) {
+    if (saved >= excess) break;
+    const before = calEventBytes(e);
+    e.body = "";
+    saved += before - calEventBytes(e);
+  }
+  return saved;
+}
+// Trim `h` to the host caps (or `maxBytes`). The event cap evicts first (those
+// meetings go regardless, so their bodies must not cost a near one its body),
+// then bodies are shed, and only then are events evicted for bytes. Eviction
+// order: the oldest PAST event (by end) first, then the furthest future one.
+// Returns how many EVENTS it dropped (shed bodies are not counted).
 function calendarTrimHost(h, now, maxBytes = CALENDAR_HOST_BYTES_MAX) {
   let bytes = calHostBytes(h);
   let count = h.events.length;
@@ -5956,28 +5974,50 @@ function calendarTrimHost(h, now, maxBytes = CALENDAR_HOST_BYTES_MAX) {
     return pa ? a.endMs - b.endMs : b.startMs - a.startMs;
   });
   const drop = new Set();
-  for (const e of order) {
-    if (count <= CALENDAR_HOST_EVENTS_MAX && bytes <= maxBytes) break;
-    drop.add(e);
-    count--;
-    bytes -= calEventBytes(e);
-  }
+  let i = 0;
+  const evictWhile = (over) => {
+    for (; i < order.length && over(); i++) {
+      drop.add(order[i]);
+      count--;
+      bytes -= calEventBytes(order[i]);
+    }
+  };
+  evictWhile(() => count > CALENDAR_HOST_EVENTS_MAX);
+  if (bytes > maxBytes) bytes -= calShedBodies(order.slice(i), now, bytes - maxBytes);
+  evictWhile(() => bytes > maxBytes);
   h.events = h.events.filter((e) => !drop.has(e));
   return drop.size;
 }
-// A tenant over its byte budget trims its BIGGEST host first.
-function calendarEnforceTenant(t, now) {
+// A tenant over its byte budget sheds bodies across ALL its hosts first; only
+// then does it evict meetings, from its BIGGEST host first. `origin` names the
+// host whose sync triggered this and how many events that sync started with, so
+// its "kept N of M" counts from the sync rather than from after the host trim.
+function calendarEnforceTenant(t, now, origin = null) {
   const keys = Object.keys(calendarEvents).filter((k) => tenantOfKey(k) === t);
+  let total = keys.reduce((n, k) => n + calHostBytes(calendarEvents[k]), 0);
+  if (total <= CALENDAR_TENANT_BYTES_MAX) return;
+  const before = new Map(keys.map((k) => [k, calHostBytes(calendarEvents[k])]));
+  total -= calShedBodies(keys.flatMap((k) => calendarEvents[k].events), now, total - CALENDAR_TENANT_BYTES_MAX);
   const sizes = new Map(keys.map((k) => [k, calHostBytes(calendarEvents[k])]));
-  let total = [...sizes.values()].reduce((a, b) => a + b, 0);
   while (total > CALENDAR_TENANT_BYTES_MAX) {
     const [big, size] = [...sizes.entries()].sort((a, b) => b[1] - a[1])[0];
     const h = calendarEvents[big];
-    if (!calendarTrimHost(h, now, Math.max(0, size - (total - CALENDAR_TENANT_BYTES_MAX)))) break;
+    const count = origin && origin.key === big ? origin.total : h.events.length;
+    const dropped = calendarTrimHost(h, now, Math.max(0, size - (total - CALENDAR_TENANT_BYTES_MAX)));
     const after = calHostBytes(h);
+    if (after === size) break;
+    if (dropped) {
+      const both = origin && origin.key === big && origin.hostDropped;
+      h.lastError = `the hub kept ${h.events.length} of ${count} events: ` +
+        (both ? `a host keeps at most ${CALENDAR_HOST_EVENTS_MAX} events and ${CALENDAR_HOST_BYTES_MAX >> 10} KiB, and this tenant's hosts ` : "this tenant's hosts ") +
+        `keep at most ${CALENDAR_TENANT_BYTES_MAX >> 20} MiB of calendar between them, so the oldest past and furthest future ones were dropped`;
+      h.lastErrorAt = now;
+    }
     total -= size - after;
     sizes.set(big, after);
   }
+  // A sibling that lost bodies or meetings refetches too, not only the syncing host.
+  for (const k of keys) if (k !== (origin && origin.key) && sizes.get(k) !== before.get(k)) broadcastCalendarSoon(k);
 }
 function calMergeRange(ranges, from, until) {
   const all = (ranges || []).concat([[from, until]]).sort((a, b) => a[0] - b[0]);
@@ -6030,9 +6070,17 @@ function applyCalendarSync(key, row, now) {
     ranges: calMergeRange(prev ? prev.ranges : [], from, until),
     events: kept.concat([...incoming.values()]).sort(calEventOrder),
   };
-  calendarTrimHost(h, now);
+  const total = h.events.length;
+  const dropped = calendarTrimHost(h, now);
+  if (dropped) {
+    // Not silent: the operator sees which budget cost them meetings.
+    h.lastError = `the hub kept ${total - dropped} of ${total} events: a host keeps at most ` +
+      `${CALENDAR_HOST_EVENTS_MAX} events and ${CALENDAR_HOST_BYTES_MAX >> 10} KiB, so the oldest past ` +
+      "and furthest future ones were dropped";
+    h.lastErrorAt = now;
+  }
   calendarEvents[key] = sanitizeCalendarHost(h);
-  calendarEnforceTenant(tenantOfKey(key), now);
+  calendarEnforceTenant(tenantOfKey(key), now, { key, total, hostDropped: dropped });
   // "events" when the stored events differ: only that can change a capture's link.
   return !prev || JSON.stringify(prev.events) !== JSON.stringify(calendarEvents[key].events) ? "events" : true;
 }
