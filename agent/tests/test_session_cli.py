@@ -297,6 +297,59 @@ _FAKE_OUTLOOK = r"""
   $ol.Session | Add-Member ScriptMethod GetDefaultFolder { param($n) [pscustomobject]@{ Items = $script:items } }"""
 
 
+# XERK-2895: a fake Outlook for the hub sync's reader — a recurring series
+# (one plain occurrence, one MOVED exception whose id keeps its original start),
+# a canceled single meeting, a private one, and an item with no id at all.
+_FAKE_SYNC_OUTLOOK = r"""
+  $orgEntry = [pscustomobject]@{ Type = 'SMTP'; Address = 'ana@corp.example' }
+  function Appt($h) {
+    $m = $script:base.Clone(); foreach ($k in $h.Keys) { $m[$k] = $h[$k] }
+    $o = [pscustomobject]$m
+    $o | Add-Member ScriptMethod GetOrganizer { $script:orgEntry }
+    $o
+  }
+  $exPa = [pscustomobject]@{}
+  $exPa | Add-Member ScriptMethod GetProperty { param($t)
+    if ($t -like '*/82280040') { [datetime]'2026-11-17T14:00:00' } else { throw 'no prop' } }
+  $script:base = @{ AllDayEvent = $false; Location = 'Teams'; Organizer = 'Ana Ortiz'; BusyStatus = 2
+    ResponseStatus = 3; MeetingStatus = 1; Recipients = @(); Categories = ''; Sensitivity = 0
+    LastModificationTime = [datetime]'2026-11-01T09:30:00' }
+  $script:appts = @(
+    (Appt (@{ Subject = 'Standup'; GlobalAppointmentID = 'G-STANDUP'; RecurrenceState = 2
+      IsRecurring = $true; StartUTC = [datetime]'2026-11-16T14:00:00'; EndUTC = [datetime]'2026-11-16T14:15:00'
+      Categories = 'Team, Daily'
+      Body = "Agenda`r`n`r`n`r`n`r`nJoin: https://teams.microsoft.com/l/meetup-join/19%3ameeting_x/0?ctx=1" })),
+    (Appt (@{ Subject = 'Standup (moved)'; GlobalAppointmentID = 'G-STANDUP'; RecurrenceState = 3
+      IsRecurring = $true; StartUTC = [datetime]'2026-11-17T15:00:00'; EndUTC = [datetime]'2026-11-17T15:15:00'
+      PropertyAccessor = $exPa; Body = 'moved' })),
+    (Appt (@{ Subject = 'Review'; GlobalAppointmentID = 'G-REVIEW'; RecurrenceState = 0
+      IsRecurring = $false; StartUTC = [datetime]'2026-11-18T16:00:00'; EndUTC = [datetime]'2026-11-18T17:00:00'
+      MeetingStatus = 5; Body = '' })),
+    (Appt (@{ Subject = 'Doctor'; GlobalAppointmentID = 'G-DOC'; RecurrenceState = 0
+      IsRecurring = $false; StartUTC = [datetime]'2026-11-19T10:00:00'; EndUTC = [datetime]'2026-11-19T11:00:00'
+      Sensitivity = 2; Body = 'private notes' })),
+    (Appt (@{ Subject = 'No id'; RecurrenceState = 0; IsRecurring = $false
+      StartUTC = [datetime]'2026-11-20T10:00:00'; EndUTC = [datetime]'2026-11-20T11:00:00'; Body = '' })))
+  $script:items = [pscustomobject]@{ IncludeRecurrences = $false }
+  $script:items | Add-Member ScriptMethod Sort { param($k) }
+  $script:items | Add-Member ScriptMethod Restrict { param($f)
+    [Console]::Error.WriteLine("FILTER=$f")
+    $r = [pscustomobject]@{ i = 0 }
+    $r | Add-Member ScriptMethod GetFirst { $this.i = 1; $script:appts[0] }
+    $r | Add-Member ScriptMethod GetNext {
+      if ($this.i -lt $script:appts.Count) { $this.i++; $script:appts[$this.i - 1] } else { $null } }
+    $r }
+  $ol = [pscustomobject]@{ Session = [pscustomobject]@{} }
+  $ol.Session | Add-Member ScriptMethod GetDefaultFolder { param($n) [pscustomobject]@{ Items = $script:items } }"""
+
+SYNC_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calendar_sync_fixture.json")
+
+
+def _w(events, **window):
+    """The script's JSON for one window of `events`."""
+    return {"ok": True, "windows": [dict(window, events=events)]}
+
+
 ISO = r"^20\d\d-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$"
 
 
@@ -350,7 +403,8 @@ class CalendarTest(unittest.TestCase):
         if not pwsh:
             self.skipTest("pwsh not installed")
         script = cli._CALENDAR_PS.replace(_COM_LINES, _FAKE_OUTLOOK).replace(
-            "__FROM__", "[DateTime]::Today.AddDays(1)").replace("__DAYS__", "1").replace(
+            "__WINDOWS__", cli._windows_ps([("[DateTime]::Today.AddDays(1)",
+                                             "[DateTime]::Today.AddDays(2)")])).replace(
             "__MAX__", "5")
         enc = base64.b64encode(script.encode("utf-16-le")).decode()
         r = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
@@ -371,12 +425,14 @@ class CalendarTest(unittest.TestCase):
         if not pwsh:
             self.skipTest("pwsh not installed")
         script = cli._CALENDAR_PS.replace(_COM_LINES, prelude + _FAKE_OUTLOOK + "\n" + epilogue)
-        script = script.replace("__FROM__", "[DateTime]::Today").replace(
-            "__DAYS__", "7").replace("__MAX__", max_events)
+        script = script.replace("__WINDOWS__", cli._windows_ps(
+            [("[DateTime]::Today", "[DateTime]::Today.AddDays(7)")])).replace("__MAX__", max_events)
         enc = base64.b64encode(script.encode("utf-16-le")).decode()
         r = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
                            capture_output=True, text=True, timeout=120)
-        return json.loads(r.stdout.strip().splitlines()[-1])
+        doc = json.loads(r.stdout.strip().splitlines()[-1])
+        # The first window's fields beside `ok`, and the whole reply as `raw`.
+        return dict(doc["windows"][0], ok=True, raw=doc) if doc.get("ok") else doc
 
     def test_iso_stamps_ignore_the_users_culture(self):
         """fi-FI writes '.' for ':', th-TH a Buddhist year, ar-SA a Hijri one."""
@@ -397,7 +453,7 @@ class CalendarTest(unittest.TestCase):
         self.assertTrue(doc["ok"], doc)
         self.assertEqual([e["subject"] for e in doc["events"]], ["Standup"])
         self.assertEqual(doc["skipped"], 1)
-        self.assertEqual(cli.normalize_calendar(doc)["unreadable"], 1)
+        self.assertEqual(cli.normalize_calendar(doc["raw"])["unreadable"], 1)
 
     def test_every_item_failing_reports_outlooks_reason(self):
         """A security-prompt denial throws on every item: the read stops after a
@@ -448,7 +504,7 @@ class CalendarTest(unittest.TestCase):
             cli.read_calendar("today", powershell=ps)
 
     def test_noise_before_the_json_is_ignored(self):
-        ps = self.fake_ps("echo 'banner'\necho '{\"ok\":true,\"events\":[]}'\n")
+        ps = self.fake_ps("echo 'banner'\necho '{\"ok\":true,\"windows\":[{\"events\":[]}]}'\n")
         self.assertEqual(cli.read_calendar("today", powershell=ps)["events"], [])
 
     def test_no_json_names_the_exit_and_stderr(self):
@@ -469,20 +525,20 @@ class CalendarTest(unittest.TestCase):
             cli.read_calendar("today", powershell=ps)
 
     def test_the_range_is_only_ever_two_integers(self):
-        ps = self.fake_ps('echo "$6" > "$(dirname "$0")/enc"\necho \'{"ok":true,"events":[]}\'\n')
+        ps = self.fake_ps('echo "$6" > "$(dirname "$0")/enc"\necho \'{"ok":true,"windows":[{"events":[]}]}\'\n')
         cli.read_calendar("tomorrow", powershell=ps)
         with open(os.path.join(self.tmp, "enc")) as fh:
             script = base64.b64decode(fh.read().strip()).decode("utf-16-le")
-        self.assertIn("[DateTime]::Today.AddDays(1)", script)
-        self.assertIn("$from.AddDays(1)", script)
+        self.assertIn("$day = [DateTime]::Today.AddDays(1)\n", script)
+        self.assertIn("@(($day), ($day.AddDays(1)))", script)
         self.assertNotIn("__", script)
 
     def test_normalize_types_cleans_and_caps(self):
         evil = "Sync\u202e\x1b[31m" + "x" * 1000
-        data = cli.normalize_calendar({"ok": True, "events": [
+        data = cli.normalize_calendar(_w([
             {"subject": evil, "busy": "2", "myResponse": True, "status": 7,
              "joinUrl": "javascript:alert(1)", "attendees": [{"name": 5, "type": 9}] * 300},
-            "not an event"]})
+            "not an event"]))
         (e,) = data["events"]
         self.assertNotIn("\u202e", e["subject"])
         self.assertNotIn("\x1b", e["subject"])
@@ -494,32 +550,32 @@ class CalendarTest(unittest.TestCase):
         self.assertEqual(e["attendees"][0], {"name": "", "email": "", "role": "unknown",
                                              "response": "unknown"})
         for line in ("a\u2028b", "a\u2029b", "a\u061cb", "a\u2060b", "a\nb"):
-            got = cli.normalize_calendar({"ok": True, "events": [
-                {"subject": line, "attendees": []}]})["events"][0]["subject"]
+            got = cli.normalize_calendar(_w([
+                {"subject": line, "attendees": []}]))["events"][0]["subject"]
             self.assertEqual(got, "a b", repr(line))
         self.assertEqual(cli._text("Inter\xadnational"), "International")
-        got = cli.normalize_calendar({"ok": True, "events": [{"organizer": "Ana", "attendees": [
+        got = cli.normalize_calendar(_w([{"organizer": "Ana", "attendees": [
             {"name": "Ana", "type": 1, "email": "/o=ExchangeLabs/ou=x/cn=ana"},
-            {"name": "Bo", "type": 1, "email": "bo@corp.example"}]}]})["events"][0]["attendees"]
+            {"name": "Bo", "type": 1, "email": "bo@corp.example"}]}]))["events"][0]["attendees"]
         self.assertEqual([(a["role"], a["email"]) for a in got],
                          [("organizer", ""), ("required", "bo@corp.example")])
-        got = cli.normalize_calendar({"ok": True, "events": [{"organizer": "Ana", "attendees": [
+        got = cli.normalize_calendar(_w([{"organizer": "Ana", "attendees": [
             {"name": "Ana", "type": 2}, {"name": "Ana", "type": 1, "email": "/o=X/cn=a@b.c"},
             {"name": "Ana", "type": 1, "email": "x ana@corp.example"}, {"name": "", "type": 1}]},
-            {"organizer": "", "attendees": [{"name": "", "type": 1}]}]})["events"]
+            {"organizer": "", "attendees": [{"name": "", "type": 1}]}]))["events"]
         self.assertEqual([(a["role"], a["email"]) for a in got[0]["attendees"]],
                          [("optional", ""), ("organizer", ""), ("required", ""), ("required", "")])
         self.assertEqual(got[1]["attendees"][0]["role"], "required")
         self.assertNotIn("unreadable", cli.normalize_calendar(
-            {"ok": True, "skipped": -1, "events": []}))
+            _w([], skipped=-1)))
         for bad in (None, [], {"ok": "true"}, {"ok": True},
                     {"ok": True, "events": {"value": [{"subject": "x"}], "Count": 1}},
-                    {"ok": True, "events": [{"subject": "x", "attendees": {"name": "a"}}]}):
+                    _w([{"subject": "x", "attendees": {"name": "a"}}])):
             with self.assertRaises(cli.Refused):
                 cli.normalize_calendar(bad)
 
     def script_for(self, *args, **kw):
-        ps = self.fake_ps('echo "$6" > "$(dirname "$0")/enc"\necho \'{"ok":true,"events":[]}\'\n')
+        ps = self.fake_ps('echo "$6" > "$(dirname "$0")/enc"\necho \'{"ok":true,"windows":[{"events":[]}]}\'\n')
         cli.read_calendar(*args, powershell=ps, **kw)
         with open(os.path.join(self.tmp, "enc")) as fh:
             return base64.b64decode(fh.read().strip()).decode("utf-16-le")
@@ -527,11 +583,11 @@ class CalendarTest(unittest.TestCase):
     def test_a_date_and_a_span_reach_the_script_as_integers(self):
         """XERK-2903: a session asking about last Friday names its date."""
         s = self.script_for("2026-11-13")
-        self.assertIn("$from = (New-Object DateTime 2026, 11, 13)", s)
-        self.assertIn("$from.AddDays(1)", s)
+        self.assertIn("$day = (New-Object DateTime 2026, 11, 13)\n", s)
+        self.assertIn("@(($day), ($day.AddDays(1)))", s)
         s = self.script_for("yesterday", days=3)
-        self.assertIn("$from = [DateTime]::Today.AddDays(-1)", s)
-        self.assertIn("$from.AddDays(3)", s)
+        self.assertIn("$day = [DateTime]::Today.AddDays(-1)\n", s)
+        self.assertIn("@(($day), ($day.AddDays(3)))", s)
         for edge in ("1900-01-01", "2999-12-31"):     # the year bounds are inclusive
             self.assertIn("New-Object DateTime", self.script_for(edge, days=31))
 
@@ -541,11 +597,12 @@ class CalendarTest(unittest.TestCase):
             self.skipTest("pwsh not installed")
         start, n = cli.calendar_window("2026-11-13", 2)
         script = cli._CALENDAR_PS.replace(_COM_LINES, _FAKE_OUTLOOK).replace(
-            "__FROM__", start).replace("__DAYS__", str(n)).replace("__MAX__", "5")
+            "__WINDOWS__", cli._windows_ps([(start, f"{start}.AddDays({n})")])).replace(
+            "__MAX__", "5")
         enc = base64.b64encode(script.encode("utf-16-le")).decode()
         r = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
                            capture_output=True, text=True, timeout=120)
-        doc = json.loads(r.stdout.strip().splitlines()[-1])
+        doc = json.loads(r.stdout.strip().splitlines()[-1])["windows"][0]
         self.assertTrue(doc["from"].startswith("2026-11-13T00:00:00"), doc)
         self.assertTrue(doc["until"].startswith("2026-11-15T00:00:00"), doc)
 
@@ -565,7 +622,7 @@ class CalendarTest(unittest.TestCase):
     def test_calendar_needs_no_session_id_and_writes_nothing(self):
         reqdir = os.path.join(self.tmp, "session-requests")
         out, err = io.StringIO(), io.StringIO()
-        ps = self.fake_ps("echo '{\"ok\":true,\"events\":[]}'\n")
+        ps = self.fake_ps("echo '{\"ok\":true,\"windows\":[{\"events\":[]}]}'\n")
         with mock.patch.object(cli, "REQUESTS_DIR", reqdir), \
                 mock.patch.object(cli, "find_powershell", return_value=ps), \
                 mock.patch.dict(os.environ, {}, clear=False), \
@@ -588,6 +645,107 @@ class CalendarTest(unittest.TestCase):
         with mock.patch.object(cli.shutil, "which", return_value=None), \
                 mock.patch.object(cli.glob, "glob", return_value=[hit]):
             self.assertEqual(cli.find_powershell(), hit)
+
+
+class CalendarSyncReaderTest(unittest.TestCase):
+    """XERK-2895: the hub sync's reader — arbitrary epoch-ms windows, the
+    contract's extra fields, and a window the cap truncated never `complete`."""
+
+    WEEK = 7 * 86400000
+    MON = 1794787200000          # 2026-11-16T00:00Z, a Monday
+
+    def run_sync(self, windows, max_events=50):
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("pwsh not installed")
+        with mock.patch.object(cli, "_CALENDAR_PS", cli._CALENDAR_PS.replace(_COM_LINES, _FAKE_SYNC_OUTLOOK)):
+            return cli.read_calendar_windows(windows, powershell=pwsh, max_events=max_events)
+
+    def test_the_real_script_reads_full_events_per_window(self):
+        (w,) = self.run_sync([(self.MON, self.MON + self.WEEK)])
+        self.assertTrue(w["complete"])
+        self.assertEqual(w["unreadable"], 1)              # the item with no id
+        by = {e["subject"]: e for e in w["events"]}
+        self.assertEqual(set(by), {"Standup", "Standup (moved)", "Review", "Doctor"})
+        st, mv, rv, dr = by["Standup"], by["Standup (moved)"], by["Review"], by["Doctor"]
+        self.assertEqual(st["id"], "G-STANDUP:2026-11-16T14:00:00Z")
+        # A moved exception keeps the id its occurrence had: its ORIGINAL start.
+        self.assertEqual(mv["id"], "G-STANDUP:2026-11-17T14:00:00Z")
+        self.assertEqual((st["seriesId"], mv["seriesId"], rv["seriesId"]), ("G-STANDUP", "G-STANDUP", ""))
+        self.assertEqual(rv["id"], "G-REVIEW")
+        self.assertTrue(rv["canceled"])
+        self.assertEqual(st["categories"], ["Team", "Daily"])
+        self.assertEqual(st["body"], "Agenda\n\nJoin: https://teams.microsoft.com/l/meetup-join/19%3ameeting_x/0?ctx=1")
+        self.assertTrue(st["isOnlineMeeting"])
+        self.assertFalse(rv["isOnlineMeeting"])
+        self.assertEqual(st["organizerEmail"], "ana@corp.example")
+        self.assertRegex(st["lastModified"], ISO)
+        self.assertEqual((st["sensitivity"], dr["sensitivity"]), ("normal", "private"))
+        self.assertRegex(mv["start"], ISO)
+
+    def test_several_windows_in_one_run_and_the_cap_marks_incomplete(self):
+        wins = [(self.MON, self.MON + self.WEEK), (self.MON + self.WEEK, self.MON + 2 * self.WEEK)]
+        got = self.run_sync(wins, max_events=2)
+        self.assertEqual(len(got), 2)
+        for w in got:
+            self.assertFalse(w["complete"])               # 5 items, cap 2
+            self.assertEqual(len(w["events"]), 2)
+        got = self.run_sync(wins, max_events=5)
+        self.assertTrue(all(w["complete"] for w in got))  # exactly the cap is complete
+
+    def test_only_integers_reach_the_script(self):
+        ps = os.path.join(tempfile.mkdtemp(prefix="cal-sync-"), "powershell.exe")
+        self.addCleanup(shutil.rmtree, os.path.dirname(ps), ignore_errors=True)
+        with open(ps, "w") as fh:
+            fh.write('#!/bin/sh\necho "$6" > "$(dirname "$0")/enc"\n'
+                     'echo \'{"ok":true,"windows":[{"events":[],"complete":true}]}\'\n')
+        os.chmod(ps, 0o755)
+        self.assertEqual(cli.read_calendar_windows([(self.MON, self.MON + 1)], powershell=ps),
+                         [{"complete": True, "unreadable": 0, "events": []}])
+        with open(os.path.join(os.path.dirname(ps), "enc")) as fh:
+            script = base64.b64decode(fh.read().strip()).decode("utf-16-le")
+        self.assertIn(f"FromUnixTimeMilliseconds({self.MON}).LocalDateTime", script)
+        self.assertIn(f"$out.Count -lt {cli.CALENDAR_SYNC_WINDOW_MAX}", script)
+        self.assertNotIn("__", script)
+        for bad in ([], [(1, 1)], [(2, 1)], [("1", 2)], [(True, 5)], [(0, 5)], [(1.5, 9)],
+                    [(1, cli.CALENDAR_MS_MAX)], [(1, 2, 3)], ["12"]):
+            with self.assertRaises(cli.Refused, msg=bad):
+                cli.calendar_windows_ps(bad)
+
+    def test_a_window_count_mismatch_is_refused(self):
+        doc = {"ok": True, "windows": [{"events": []}]}
+        with self.assertRaisesRegex(cli.Refused, "1 windows for 2"):
+            cli.normalize_calendar_windows(doc, 2)
+
+    def test_the_recorded_fixture(self):
+        """A reply recorded from the real script (recurring occurrence, moved
+        exception, canceled meeting, private event, an id-less item)."""
+        with open(SYNC_FIXTURE, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        (w,) = cli.normalize_calendar_windows(doc, 1)
+        self.assertEqual(sorted(e["id"] for e in w["events"]),
+                         ["G-DOC", "G-REVIEW", "G-STANDUP:2026-11-16T14:00:00Z",
+                          "G-STANDUP:2026-11-17T14:00:00Z"])
+        # The session view of the same reply drops the sync's fields and the body.
+        printed = cli.normalize_calendar(doc)["events"][0]
+        self.assertNotIn("body", printed)
+        self.assertNotIn("id", printed)
+
+    def test_full_fields_are_typed_and_capped(self):
+        e = {"globalId": "G‮1", "recurrenceState": 2, "originalStart": "2026-01-01T00:00:00Z",
+             "attendees": [{"name": "Ana", "type": 1, "email": "ana@x.example"}], "organizer": "Ana",
+             "body": "a\x00b‮\r\n" + "y" * 9000, "categories": ["  x ", 5, ""] + ["c"] * 40,
+             "sensitivity": "2", "organizerEmail": "/o=ExchangeLabs/cn=ana"}
+        (w,) = cli.normalize_calendar_windows({"ok": True, "windows": [{"events": [e]}]}, 1)
+        (ev,) = w["events"]
+        self.assertEqual(ev["id"], "G 1:2026-01-01T00:00:00Z")
+        self.assertEqual(ev["seriesId"], "G 1")
+        self.assertEqual(len(ev["body"]), cli.CALENDAR_BODY_MAX)
+        self.assertTrue(ev["body"].startswith("a b\ny"))
+        self.assertEqual(ev["categories"], ["x"] + ["c"] * 17)
+        self.assertEqual(ev["sensitivity"], "private")     # unreadable errs private
+        self.assertEqual(ev["organizerEmail"], "ana@x.example")
+        self.assertFalse(ev["isOnlineMeeting"])
 
 
 if __name__ == "__main__":

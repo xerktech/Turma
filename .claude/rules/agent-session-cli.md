@@ -323,5 +323,13 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   timeout — an Outlook object-model-guard prompt on the desktop blocks the read until answered).
 - New Outlook has no COM: that host gets the Outlook error, not events.
 - Taught by `calendar_directive()` only on a WSL kernel with a shell-safe CLI path, Claude only.
+- **The script reads a LIST of windows** (`__WINDOWS__`, XERK-2895), each `complete` only when
+  Outlook ran out of items before `__MAX__`. The `calendar` subcommand reads one; the hub sync
+  (`read_calendar_windows`, epoch-ms windows as `FromUnixTimeMilliseconds(<int>)`) reads several.
+- The sync's full shape adds the contract's id (`GlobalAppointmentID`, plus `:<original start UTC>`
+  for an occurrence/exception — `PidLidExceptionReplaceTime`, so a moved one keeps its id),
+  `seriesId`, `lastModified`, plain-text `body`, `categories`, `sensitivity`, `organizerEmail`.
+  An item with no id is unreadable; an unreadable sensitivity is `private`, never `normal`.
+- The session subcommand still never prints a body or the sync fields (`normalize_calendar`).
 - Tests: `CalendarTest` in `test_session_cli.py` (drives the real script under `pwsh` against a
   fake Outlook object model); `test_calendar_is_taught_only_on_wsl_with_a_safe_path`.

@@ -18,7 +18,7 @@ paths:
 A Teams-style meetings calendar built from each host's classic Outlook (read by the session CLI's
 reader, `agent-session-cli.md`) and Tenir. The hub stores each host's events and serves them; the
 agent reads Outlook off its beat. Every child ticket builds to this file; change it here first.
-Hub half: XERK-2891.
+Hub half: XERK-2891. Agent half: XERK-2895 (below).
 
 ## Agent → hub: the `calendarSync` heartbeat outbox
 
@@ -45,6 +45,37 @@ Hub half: XERK-2891.
   rolls the host back and reads offline, XERK-298): a row over `CALENDAR_SYNC_EVENTS_MAX` (1500)
   events or `CALENDAR_SYNC_BYTES_MAX` (2 MiB of JSON), or a malformed window, leaves the stored
   events untouched and sets `lastError` saying what the cap is. The beat is accepted.
+
+## The agent's sync worker (XERK-2895, `hub-agent.py`)
+
+- **Off the beat**: `_calendar_worker_loop` runs the reads; the beat's `_calendar_tick` is a time
+  compare that wakes it every `CALENDAR_SYNC_EVERY_SEC` (`TURMA_CALENDAR_SYNC_MIN`, 15) or on a
+  `syncCalendar` (`_stage_calendar_sync` only stores the window; a newer one replaces it).
+- **The reader is the session CLI's** (`session_cli_module().read_calendar_windows`), loaded by path:
+  one Outlook reader, one PowerShell script, on WSL and native Windows alike.
+- **Week chunks, each a COMPLETE window**: `calendar_weeks` cuts at UTC Mondays, read
+  `CALENDAR_WEEKS_PER_READ` per PowerShell run. A week that reached the reader's
+  `CALENDAR_SYNC_WINDOW_MAX` is an ERROR row, never a short events row — a truncated authoritative
+  window would delete real events on the hub. Never lift the cap by sending a partial week.
+  - A week with ANY unreadable item (Outlook threw on it, or it has no id) is an error row too:
+    the item is absent from the read, so the hub would delete it.
+  - A pass stages its error rows AFTER its good rows: a good row clears `lastError`, so an
+    earlier error would otherwise be wiped. A week sent as an error row keeps no hash.
+- **Only changed weeks** on the schedule (`_cal_hashes`, whole grid weeks only); a hub command
+  sends every week it covers. Adjacent weeks merge into one row (`calendar_sync_rows`) under
+  `CALENDAR_ROW_EVENTS_MAX` / `CALENDAR_ROW_BYTES_MAX`; a beat carries a second row only within
+  `CALENDAR_BEAT_BYTES_MAX`, so the outbox never makes a beat a hub with a small body cap refuses.
+- **An Outlook failure is one error row in Outlook's words** for the rest of the window, re-sent on
+  the schedule when the text changes or the pass sends any good row (which clears `lastError`),
+  always on a command. It forgets every hash, so the
+  recovery re-sends every week and those good rows clear the hub's `lastError`.
+- Outbox past `CALENDAR_OUTBOX_MAX` drops the oldest AND forgets every hash (never believe the hub
+  has a dropped row).
+- **A host that is neither WSL nor Windows reports `calendar: {available: false}`**, logs "no Outlook
+  here" once at start, and answers a stray `syncCalendar` with that error once.
+- Tests: `TestCalendarSync` in `test_hub_agent.py`; `CalendarSyncReaderTest` in
+  `test_session_cli.py` (the real script under `pwsh`, and `calendar_sync_fixture.json`, a reply
+  recorded from it with a recurring occurrence, a moved exception, a canceled and a private event).
 
 ## The event (`sanitizeCalendarEvent`, the ONE whitelist)
 

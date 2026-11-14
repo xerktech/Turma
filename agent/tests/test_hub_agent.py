@@ -56554,6 +56554,320 @@ class TestDailyBriefPrompt(unittest.TestCase):
         self.assertEqual(ha.DAILY_BRIEF_MODEL, "haiku")
 
 
+class TestCalendarSync(ManagerMixin, unittest.TestCase):
+    """XERK-2895: the agent half of contract-calendar.md — the off-beat Outlook
+    sync, week chunks that are each a COMPLETE window, change hashing, the
+    `calendarSync` outbox and the `syncCalendar` command."""
+
+    WEEK = ha.CALENDAR_WEEK_MS
+    MON = 1794787200000          # 2026-11-16T00:00Z, a Monday
+    FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calendar_sync_fixture.json")
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(ha, "calendar_host_kind", lambda: "wsl")
+        p.start()
+        self.addCleanup(p.stop)
+        self.sm = self.make_manager()
+        self.cli = ha.session_cli_module()
+        self.reads = []
+        self.outlook = {}            # week start -> events; absent = empty week
+        self.incomplete = set()
+        self.unreadable = {}         # week start -> items Outlook threw on
+        self.fail = None
+
+        def read(windows, **kw):
+            self.reads.append(list(windows))
+            if self.fail:
+                raise self.cli.Refused(self.fail)
+            return [{"complete": f not in self.incomplete, "unreadable": self.unreadable.get(f, 0),
+                     "events": list(self.outlook.get(f, []))} for f, _ in windows]
+        p = mock.patch.object(self.cli, "read_calendar_windows", side_effect=read)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(self.sm, "_calendar_tick")      # never a real thread
+        self.tick = p.start()
+        self.addCleanup(p.stop)
+
+    def ev(self, week, n=0, **over):
+        e = {"id": f"G{week}-{n}", "start": f"w{week}", "subject": f"m{n}", "body": ""}
+        e.update(over)
+        return e
+
+    def rows(self):
+        out = list(self.sm.calendar_results)
+        self.sm.calendar_results.clear()
+        return out
+
+    # ---- pure helpers --------------------------------------------------------
+
+    def test_weeks_are_cut_at_utc_mondays_and_the_default_window_is_whole_weeks(self):
+        W, M = self.WEEK, self.MON
+        self.assertEqual(ha.calendar_weeks(M, M + 2 * W), [(M, M + W), (M + W, M + 2 * W)])
+        self.assertEqual(ha.calendar_weeks(M + 5, M + W + 7), [(M + 5, M + W), (M + W, M + W + 7)])
+        self.assertEqual(ha.calendar_weeks(M, M), [])
+        f, u = ha.calendar_default_window(M + 3 * 86400000 + 12345)
+        self.assertEqual(((f - M) % W, (u - M) % W), (0, 0))
+        self.assertLessEqual(f, M + 3 * 86400000 + 12345 - 8 * W)
+        self.assertGreaterEqual(u, M + 26 * W)
+        self.assertLessEqual(u - f, ha.CALENDAR_SPAN_MAX_MS)
+        self.assertEqual(ha.calendar_default_window(M), (M - 8 * W, M + 26 * W))
+
+    def test_validate_command(self):
+        M, W = self.MON, self.WEEK
+        self.assertEqual(ha.validate_calendar_command({"from": M, "until": M + W}), ((M, M + W), None))
+        for bad in ({"from": M, "until": M}, {"from": M + 1, "until": M},
+                    {"from": M, "until": M + 40 * W + 1}, {"from": True, "until": M},
+                    {"from": float(M), "until": M + W}, {"from": "1", "until": M}, {"from": M}):
+            self.assertIsNone(ha.validate_calendar_command(bad)[0], bad)
+        self.assertIsNone(ha.validate_calendar_command("x")[0])
+
+    def test_hashes_ignore_enumeration_order(self):
+        a, b = self.ev(1, 1, start="2026-11-16T09:00:00Z"), self.ev(1, 2, start="2026-11-16T10:00:00Z")
+        self.assertEqual(ha.calendar_events_hash([a, b]), ha.calendar_events_hash([b, a]))
+        self.assertNotEqual(ha.calendar_events_hash([a]), ha.calendar_events_hash([a, b]))
+
+    def test_rows_merge_adjacent_weeks_within_caps_and_dedupe_spanning_events(self):
+        W, M = self.WEEK, self.MON
+        span = self.ev(0, 9)
+        chunks = [(M, M + W, [self.ev(0), span]), (M + W, M + 2 * W, [span, self.ev(1)]),
+                  (M + 3 * W, M + 4 * W, [self.ev(3)])]           # a gap: not adjacent
+        rows = ha.calendar_sync_rows(chunks, 7)
+        self.assertEqual([(r["windowFrom"], r["windowUntil"]) for r in rows],
+                         [(M, M + 2 * W), (M + 3 * W, M + 4 * W)])
+        self.assertEqual([e["id"] for e in rows[0]["events"]], ["G0-0", "G0-9", "G1-0"])
+        self.assertEqual(rows[0]["syncedAt"], 7)
+        with mock.patch.object(ha, "CALENDAR_ROW_EVENTS_MAX", 2):
+            rows = ha.calendar_sync_rows(chunks[:2], 7)
+        self.assertEqual(len(rows), 2)
+        # A single week too big to carry is an ERROR row, never a cut one.
+        fat = [self.ev(0, i, body="x" * 4000) for i in range(200)]
+        (row,) = ha.calendar_sync_rows([(M, M + W, fat)], 7)
+        self.assertNotIn("events", row)
+        self.assertIn("was not synced", row["error"])
+
+    # ---- the command and the capability --------------------------------------
+
+    def test_capability_and_handle_commands_stage_without_reading(self):
+        self.assertEqual(self.sm.build_payload(1, light=True)["calendar"], {"available": True})
+        self.sm.handle_commands([{"type": "syncCalendar", "from": self.MON,
+                                  "until": self.MON + self.WEEK, "cmdId": "c1"}])
+        self.assertEqual(self.sm._cal_want, (self.MON, self.MON + self.WEEK))
+        self.tick.assert_called_with(force_wake=True)
+        self.assertEqual(self.reads, [])
+
+    def test_a_non_windows_host_is_off_and_says_no_outlook_once(self):
+        with mock.patch.object(ha, "calendar_host_kind", lambda: None), \
+                mock.patch.object(ha, "log") as log:
+            sm = self.make_manager()
+        self.assertTrue(any("no Outlook here" in str(c) for c in log.call_args_list))
+        self.assertEqual(sm.build_payload(1, light=True)["calendar"], {"available": False})
+        with mock.patch.object(ha.threading, "Thread") as thread:
+            sm._calendar_tick(force_wake=True)
+            thread.assert_not_called()
+        cmd = {"type": "syncCalendar", "from": self.MON, "until": self.MON + self.WEEK}
+        sm._stage_calendar_sync(cmd)
+        sm._stage_calendar_sync(cmd)
+        (row,) = sm.calendar_results
+        self.assertIn("no Outlook here", row["error"])
+        self.assertEqual(self.reads, [])
+
+    def test_the_tick_wakes_the_worker_only_when_a_sync_is_owed(self):
+        sm = self.make_manager()                           # its tick is not patched
+        with mock.patch.object(ha.threading, "Thread") as thread:
+            sm._calendar_tick()
+            thread.assert_not_called()                     # not due, nothing owed
+            sm._cal_want = (self.MON, self.MON + self.WEEK)
+            sm._calendar_tick()
+            thread.assert_called_once()
+            self.assertTrue(sm._cal_wake.is_set())
+
+    # ---- the sync ------------------------------------------------------------
+
+    def test_a_forced_window_sends_every_week_read_in_groups(self):
+        W, M = self.WEEK, self.MON
+        self.outlook = {M + i * W: [self.ev(i)] for i in range(10)}
+        self.sm._run_calendar_sync(M, M + 10 * W, force=True, now_ms=5)
+        self.assertEqual([len(r) for r in self.reads], [4, 4, 2])
+        (row,) = self.rows()
+        self.assertEqual((row["windowFrom"], row["windowUntil"], row["syncedAt"]), (M, M + 10 * W, 5))
+        self.assertEqual(len(row["events"]), 10)
+        # Forced again with nothing changed: still sent (the hub asked).
+        self.sm._run_calendar_sync(M, M + 10 * W, force=True)
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_a_scheduled_pass_sends_only_the_weeks_that_changed(self):
+        W, M = self.WEEK, self.MON
+        self.outlook = {M + i * W: [self.ev(i)] for i in range(6)}
+        self.sm._run_calendar_sync(M, M + 6 * W, force=False)
+        self.assertEqual(len(self.rows()), 1)               # first pass: all new
+        self.sm._run_calendar_sync(M, M + 6 * W, force=False)
+        self.assertEqual(self.rows(), [])                   # nothing changed
+        self.outlook[M + 2 * W] = [self.ev(2, subject="moved here")]
+        self.outlook[M + 4 * W] = []                        # canceled-and-removed
+        self.sm._run_calendar_sync(M, M + 6 * W, force=False)
+        rows = self.rows()
+        self.assertEqual([(r["windowFrom"], r["windowUntil"]) for r in rows],
+                         [(M + 2 * W, M + 3 * W), (M + 4 * W, M + 5 * W)])
+        self.assertEqual(rows[1]["events"], [])             # authoritative: deletes on the hub
+
+    def test_a_truncated_week_is_never_sent_as_authoritative(self):
+        W, M = self.WEEK, self.MON
+        self.outlook = {M + i * W: [self.ev(i)] for i in range(3)}
+        self.incomplete = {M + W}
+        self.sm._run_calendar_sync(M, M + 3 * W, force=True)
+        rows = self.rows()
+        self.assertEqual([(r["windowFrom"], r["windowUntil"], "events" in r) for r in rows],
+                         [(M, M + W, True), (M + 2 * W, M + 3 * W, True), (M + W, M + 2 * W, False)])
+        self.assertIn(f"more than {self.cli.CALENDAR_SYNC_WINDOW_MAX} events", rows[2]["error"])
+        self.assertNotIn(M + W, self.sm._cal_hashes)
+
+    def test_a_week_with_an_unreadable_item_is_never_sent_as_authoritative(self):
+        """QA D1: the item Outlook threw on is absent from the week, so the hub
+        would DELETE it; the week is an error row and keeps its hub events."""
+        W, M = self.WEEK, self.MON
+        self.outlook = {M + i * W: [self.ev(i)] for i in range(2)}
+        self.unreadable = {M: 1}
+        self.sm._run_calendar_sync(M, M + 2 * W, force=False)
+        good, bad = self.rows()
+        self.assertEqual((good["windowFrom"], good["windowUntil"]), (M + W, M + 2 * W))
+        self.assertEqual((bad["windowFrom"], bad["windowUntil"]), (M, M + W))
+        self.assertIn("could not read 1 item(s)", bad["error"])
+        self.assertNotIn("events", bad)
+
+    def test_error_rows_ride_after_the_good_rows_of_their_pass(self):
+        """QA D3: a good row clears the hub's lastError, so a week's error must
+        not be followed by a later week's good row in the same pass."""
+        W, M = self.WEEK, self.MON
+        self.outlook = {M + i * W: [self.ev(i)] for i in range(3)}
+        self.incomplete = {M}
+        self.sm._run_calendar_sync(M, M + 3 * W, force=True)
+        self.assertEqual(["error" in r for r in self.rows()], [False, True])
+
+    def test_an_oversized_week_is_retried_every_pass(self):
+        """QA D2: the week became an error row, so the hub never got it; its
+        hash must not make the next pass call it unchanged."""
+        W, M = self.WEEK, self.MON
+        self.outlook = {M: [self.ev(0, i, body="x" * 4000) for i in range(200)]}
+        for _ in range(2):
+            self.sm._run_calendar_sync(M, M + W, force=False)
+            (row,) = self.rows()
+            self.assertIn("was not synced", row["error"])
+
+    def test_outlook_errors_are_reported_in_its_words_once_then_recovery_resends(self):
+        W, M = self.WEEK, self.MON
+        self.outlook = {M + i * W: [self.ev(i)] for i in range(6)}
+        self.sm._run_calendar_sync(M, M + 6 * W, force=False)
+        self.rows()
+        self.fail = "classic Outlook is not open: open it and retry (this never starts Outlook itself)"
+        self.sm._run_calendar_sync(M, M + 6 * W, force=False)
+        (row,) = self.rows()
+        self.assertEqual((row["windowFrom"], row["windowUntil"]), (M, M + 6 * W))
+        self.assertEqual(row["error"], self.fail)
+        self.assertNotIn("events", row)
+        self.sm._run_calendar_sync(M, M + 6 * W, force=False)
+        self.assertEqual(self.rows(), [])                   # the same error: not re-sent
+        self.sm._run_calendar_sync(M, M + 6 * W, force=True)
+        self.assertEqual(len(self.rows()), 1)               # the hub asked: answered
+        self.fail = None
+        self.sm._run_calendar_sync(M, M + 6 * W, force=False)
+        (row,) = self.rows()                                # every week again: clears lastError
+        self.assertEqual((row["windowFrom"], row["windowUntil"], len(row["events"])), (M, M + 6 * W, 6))
+
+    def test_a_failure_mid_window_keeps_the_weeks_already_read(self):
+        W, M = self.WEEK, self.MON
+        self.outlook = {M + i * W: [self.ev(i)] for i in range(8)}
+        real = self.cli.read_calendar_windows.side_effect
+
+        def second_fails(windows, **kw):
+            if len(self.reads) == 1:
+                self.reads.append(windows)
+                raise self.cli.Refused("Outlook did not answer in 120s")
+            return real(windows, **kw)
+        self.cli.read_calendar_windows.side_effect = second_fails
+        self.sm._run_calendar_sync(M, M + 8 * W, force=False)
+        good, bad = self.rows()
+        self.assertEqual((good["windowFrom"], good["windowUntil"]), (M, M + 4 * W))
+        self.assertEqual((bad["windowFrom"], bad["windowUntil"]), (M + 4 * W, M + 8 * W))
+        self.assertIn("did not answer", bad["error"])
+
+    def test_a_failure_mid_window_stays_reported_on_every_pass_that_sends_good_rows(self):
+        """QA D5: hashes are forgotten on a failure, so the next pass re-sends the
+        weeks before it; their good rows clear lastError, so the error rides too."""
+        W, M = self.WEEK, self.MON
+        self.outlook = {M + i * W: [self.ev(i)] for i in range(8)}
+        real = self.cli.read_calendar_windows.side_effect
+
+        def later_fails(windows, **kw):
+            if windows[0][0] >= M + 4 * W:
+                self.reads.append(windows)
+                raise self.cli.Refused("Outlook did not answer in 120s")
+            return real(windows, **kw)
+        self.cli.read_calendar_windows.side_effect = later_fails
+        for _ in range(2):
+            self.sm._run_calendar_sync(M, M + 8 * W, force=False)
+            self.assertEqual(["error" in r for r in self.rows()], [False, True])
+
+    def test_the_pass_runs_a_hub_window_first_else_only_when_due(self):
+        with mock.patch.object(self.sm, "_run_calendar_sync") as run:
+            self.sm._calendar_pass()
+            run.assert_not_called()                         # not due yet
+            self.sm._cal_want = (self.MON, self.MON + self.WEEK)
+            self.sm._calendar_pass()
+            run.assert_called_once_with(self.MON, self.MON + self.WEEK, force=True, now_ms=None)
+            self.assertIsNone(self.sm._cal_want)
+            run.reset_mock()
+            self.sm._cal_next_at = 0
+            self.sm._calendar_pass(now_ms=self.MON)
+            run.assert_called_once_with(*ha.calendar_default_window(self.MON), force=False,
+                                        now_ms=self.MON)
+            self.assertGreater(self.sm._cal_next_at, time.monotonic())
+            run.side_effect = RuntimeError("boom")          # never raises
+            self.sm._cal_want = (self.MON, self.MON + self.WEEK)
+            self.sm._calendar_pass()
+
+    def test_the_recorded_fixture_reaches_the_wire(self):
+        with open(self.FIXTURE, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        (w,) = self.cli.normalize_calendar_windows(doc, 1)
+        self.outlook = {self.MON: w["events"]}
+        self.sm._run_calendar_sync(self.MON, self.MON + self.WEEK, force=True)
+        (row,) = self.rows()
+        by = {e["subject"]: e for e in row["events"]}
+        self.assertEqual(by["Standup (moved)"]["id"], "G-STANDUP:2026-11-17T14:00:00Z")
+        self.assertTrue(by["Review"]["canceled"])
+        self.assertEqual(by["Doctor"]["sensitivity"], "private")
+
+    # ---- the outbox ------------------------------------------------------------
+
+    def test_the_outbox_rides_the_beat_bounded_and_cleared_by_identity(self):
+        W, M = self.WEEK, self.MON
+        rows = [{"windowFrom": M + i * W, "windowUntil": M + (i + 1) * W, "syncedAt": 1, "events": []}
+                for i in range(3)]
+        self.sm._cal_push(rows)
+        payload = self.sm.build_payload(1, light=True)
+        self.assertEqual(payload["calendarSync"], rows[:ha.CALENDAR_SYNC_ROWS_MAX])
+        self.sm._cal_push([dict(rows[0])])                  # same content, new row
+        self.sm._clear_delivered_staged(payload)
+        self.assertEqual(self.sm.calendar_results, [rows[2], rows[0]])
+        self.assertEqual(set(self.sm._cal_sizes), {id(r) for r in self.sm.calendar_results})
+
+    def test_a_second_row_rides_only_within_the_beat_byte_budget(self):
+        big = [{"windowFrom": 1, "windowUntil": 2, "syncedAt": 1,
+                "events": [{"body": "x" * (400 << 10)}]} for _ in range(2)]
+        self.sm._cal_push(big)
+        self.assertEqual(len(self.sm.build_payload(1, light=True)["calendarSync"]), 1)
+
+    def test_outbox_overflow_drops_the_oldest_and_forgets_the_hashes(self):
+        self.sm._cal_hashes = {self.MON: "h"}
+        rows = [{"windowFrom": 1, "windowUntil": 2, "syncedAt": i, "error": "x"}
+                for i in range(ha.CALENDAR_OUTBOX_MAX + 3)]
+        self.sm._cal_push(rows)
+        self.assertEqual(self.sm.calendar_results, rows[3:])
+        self.assertEqual(self.sm._cal_hashes, {})
+        self.assertEqual(len(self.sm._cal_sizes), ha.CALENDAR_OUTBOX_MAX)
+
+
 class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):
     """XERK-2394: the `renderDailyBrief` command, its off-beat worker (collector
     + locked-down model, bounded retries) and the `dailyBriefResults` outbox."""
