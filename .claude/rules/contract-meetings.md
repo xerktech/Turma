@@ -82,8 +82,11 @@ ticket builds to this file; change it here first.
   remote watch); field order fixed, so a live row is a coerce fixed point.
   - **Written with no debounce** (`debounceMs: 0`): a 200 promises Tenir the meeting is kept.
 - Row: `{meetingId, status:"queued"|"running"|"ok"|"failed", title, platform, startedAt, endedAt,
-  receivedAt, tenirUrl?, participants, daily?, model?, host?, runId?, generatedAt?, archivedAt?,
-  items?, summary?, inferredTitle?, error?}`.
+  receivedAt, tenirUrl?, participants, daily?, calendarEventId?, calendarBy?, calendarAmbiguous?,
+  model?, host?, runId?, generatedAt?, archivedAt?, items?, summary?, inferredTitle?, error?}`.
+  - **The calendar link** (XERK-2896) is the hub's, set by the matcher or the operator, never by
+    Tenir (`meetingFromBody` drops it; `meetingTenirWire` strips it). Rules:
+    `contract-calendar.md` "Tenir captures ⇄ events".
   - **`summary` / `inferredTitle` ride an `ok` row only** (XERK-2894, after `items` in field
     order): the summary `meetingText` multiline ≤`MEETING_SUMMARY_MAX` (4000) code points and its
     JSON ≤`MEETING_SUMMARY_BYTES_MAX` (16 KiB), measured apart from the items' budget; the title
@@ -172,6 +175,10 @@ ticket builds to this file; change it here first.
   - `meetingAt` = M on a time match, else the meeting's `startedAt`.
   - `briefRunId` = the org's brief whose `meetingAt === M` (newest ok first, else newest), else
     the newest `ok` brief generated in the 24h before `startedAt`; absent when none.
+- `meetingWire` on `/api/agents` and the operator routes adds, for a linked row, `calendarEvent:
+  {host, org, subject, start, end, startMs, endMs, canceled, moved, private?}` (the event as the
+  calendar serves it, private ones withheld; `moved` = it no longer overlaps the capture), or
+  `calendarEventMissing: true` when an operator's event left the store (XERK-2896).
 - `meetingWire` serves `daily` and `archivedAt`; **neither Tenir answer does** (`meetingTenirWire`,
   used for the first answer and the duplicate): they are the operator's, not Tenir's.
 - Tests: the `XERK-2856:` cases in `server.test.js` (window/weekday/zone, title, brief link,

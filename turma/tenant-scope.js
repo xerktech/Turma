@@ -130,6 +130,7 @@ const ROUTES = [
   ["POST", "/api/jira/:site/:issue/epic-run", "org"],
   ["POST", "/api/orgs/:site/meetings/:id/items/:item", "org"],
   ["POST", "/api/orgs/:site/meetings/:id/archive", "org"],
+  ["POST", "/api/orgs/:site/meetings/:id/calendar", "org"],
   ["POST", "/api/orgs/:site/meeting-label", "org"],
   ["POST", "/api/orgs/:site/meeting-focus", "org"],
   ["PUT", "/api/orgs/:site/holidays", "org"],

@@ -31442,6 +31442,7 @@ const archive2856 = (site, mid, body, headers = userHeaders) =>
   request("POST", `/api/orgs/${encodeURIComponent(site)}/meetings/${encodeURIComponent(mid)}/archive`,
     { body, headers });
 const WIRE_KEYS2856 = new Set(["meetingId", "status", "title", "platform", "startedAt", "endedAt",
+  "calendarEventId", "calendarBy", "calendarAmbiguous", "calendarEvent", "calendarEventMissing",
   "receivedAt", "tenirUrl", "participants", "daily", "model", "host", "runId", "generatedAt",
   "archivedAt", "items", "error"]);
 
@@ -32090,6 +32091,262 @@ test("XERK-2891: each tenant reads only its own hosts' calendars, settings and f
   } finally {
     forget2891(ka, kb, "cal2891u");
     forget2533("cal2891t", ka, kb);
+    T.restore();
+  }
+});
+
+// ---- XERK-2896: Tenir captures link to calendar events; impromptu ones are Turma-only --
+// A capture (Tenir POST) of org S against host D's Outlook (unassigned events take
+// D's decided org). Times are in the past: Tenir refuses an endedAt a day ahead.
+const T2896 = Math.floor((Date.now() - 3 * 864e5) / 3.6e6) * 3.6e6;  // on the hour, 3 days ago
+const MIN2896 = 60e3;
+const ev2896 = (id, startMs, mins, extra = {}) => ({ ...ev2891(id, startMs), end: iso2891(startMs + mins * MIN2896), ...extra });
+const calHost2896 = (device, site, events, headers) => (headers
+  ? beat2533(headers, device, { jira: { available: true, configured: true, siteKey: site, user: `${device}@x.com`,
+    fetchedAt: new Date().toISOString(), tickets: [] }, calendar: { available: true },
+  calendarSync: [{ windowFrom: T2896 - 864e5, windowUntil: T2896 + 864e5, syncedAt: Date.now(), events }] })
+  : beat1574(device, site, { calendar: { available: true },
+    calendarSync: [{ windowFrom: T2896 - 864e5, windowUntil: T2896 + 864e5, syncedAt: Date.now(), events }] }));
+const capture2896 = (id, startMs, mins, extra = {}) =>
+  meeting2508(id, { title: "Zoom meeting", platform: "zoom", participants: [], startedAt: startMs,
+    endedAt: startMs + mins * MIN2896, ...extra });
+const row2896 = (site, id) => hub.getMeetings()[site].find((m) => m.meetingId === id);
+const link2896 = (site, mid, body, headers = userHeaders) =>
+  request("POST", `/api/orgs/${encodeURIComponent(site)}/meetings/${encodeURIComponent(mid)}/calendar`,
+    { body, headers: { ...headers, "content-type": "application/json" } });
+const view2896 = async (headers = userHeaders) =>
+  (await calGet2891(T2896 - 864e5, T2896 + 864e5, headers)).body;
+function cleanup2896(site, devices) {
+  forget2891(...devices);
+  cleanup2508(site, devices);
+}
+
+test("XERK-2896: a capture links by time with a 15-minute tolerance; too far off it is impromptu", async () => {
+  const S = "lkA2896.atlassian.net", D = "lkA2896";
+  cleanup2896(S, [D]);
+  try {
+    await calHost2896(D, S, [ev2896("standup", T2896, 30), ev2896("review", T2896 + 4 * 60 * MIN2896, 60)]);
+    // Joined 15 minutes early and ran 10 over: still the standup.
+    assert.equal((await postMeeting2508(S, capture2896("c1", T2896 - 15 * MIN2896, 55))).status, 200);
+    assert.deepEqual([row2896(S, "c1").calendarEventId, row2896(S, "c1").calendarBy], ["standup", "auto"]);
+    // Started 40 minutes after the review ended: nothing matches.
+    await postMeeting2508(S, capture2896("c2", T2896 + 5 * 60 * MIN2896 + 40 * MIN2896, 20));
+    assert.equal(row2896(S, "c2").calendarEventId, undefined);
+    const view = await view2896();
+    const standup = view.events.find((e) => e.id === "standup");
+    assert.equal(standup.source, "outlook");
+    assert.deepEqual(standup.meetings, [{ site: S, meetingId: "c1", title: "Zoom meeting" }]);
+    assert.deepEqual(view.events.find((e) => e.id === "review").meetings, []);
+    // The unlinked capture is a Turma-only entry; the linked one is not.
+    const tenir = view.events.filter((e) => e.source === "tenir" && e.site === S);
+    assert.deepEqual(tenir.map((e) => [e.id, e.org, e.host, e.startMs]),
+      [["tenir:c2", S, "", T2896 + 5 * 60 * MIN2896 + 40 * MIN2896]]);
+    // Unit: no overlap even with the tolerance = not a candidate.
+    const m = { startedAt: T2896 + 46 * MIN2896, endedAt: T2896 + 60 * MIN2896, title: "x", platform: "",
+      participants: [] };
+    assert.equal(hub.calendarLinkScore(m, hub.sanitizeCalendarEvent(ev2896("e", T2896, 30))), 0);
+    assert.ok(hub.calendarLinkScore({ ...m, startedAt: T2896 + 44 * MIN2896 },
+      hub.sanitizeCalendarEvent(ev2896("e", T2896, 30))) > 0);
+  } finally {
+    cleanup2896(S, [D]);
+  }
+});
+
+test("XERK-2896: title, platform and participants break a time tie; a true tie is flagged, not linked", async () => {
+  const S = "lkB2896.atlassian.net", D = "lkB2896";
+  cleanup2896(S, [D]);
+  try {
+    await calHost2896(D, S, [
+      ev2896("budget", T2896, 60, { subject: "Q3 budget review" }),
+      ev2896("hiring", T2896, 60, { subject: "Hiring sync", joinUrl: "https://teams.microsoft.com/l/meetup-join/x" }),
+      ev2896("dupA", T2896 + 3 * 60 * MIN2896, 60, { subject: "Sync" }),
+      ev2896("dupB", T2896 + 3 * 60 * MIN2896, 60, { subject: "Sync" }),
+      ev2896("people", T2896 + 6 * 60 * MIN2896, 60, { subject: "1:1", organizer: "",
+        attendees: [{ name: "Lee, Ann", email: "ann@x.com", role: "required", response: "accepted" }] }),
+      ev2896("others", T2896 + 6 * 60 * MIN2896, 60, { subject: "1:1", organizer: "",
+        attendees: [{ name: "Cy Doe", email: "cy@x.com", role: "required", response: "accepted" }] }),
+    ]);
+    await postMeeting2508(S, capture2896("t1", T2896, 60, { title: "Budget review for Q3" }));
+    assert.equal(row2896(S, "t1").calendarEventId, "budget", "title words win");
+    // A generic title says nothing; the Teams join URL against a Teams capture does.
+    await postMeeting2508(S, capture2896("t2", T2896, 60, { title: "Teams meeting", platform: "teams" }));
+    assert.equal(row2896(S, "t2").calendarEventId, "hiring", "platform wins");
+    await postMeeting2508(S, capture2896("t3", T2896 + 6 * 60 * MIN2896, 60, { participants: ["Ann Lee"] }));
+    assert.equal(row2896(S, "t3").calendarEventId, "people", "participants win");
+    await postMeeting2508(S, capture2896("t4", T2896 + 3 * 60 * MIN2896, 60));
+    const tie = row2896(S, "t4");
+    assert.deepEqual([tie.calendarEventId, tie.calendarAmbiguous], [undefined, true]);
+    const entry = (await view2896()).events.find((e) => e.id === "tenir:t4");
+    assert.equal(entry.ambiguous, true, "flagged for the operator");
+    // The operator picks one; a later sync never overrides that.
+    const r = await link2896(S, "t4", { eventId: "dupB" });
+    assert.equal(r.status, 200);
+    assert.deepEqual([r.body.meeting.calendarEventId, r.body.meeting.calendarBy, r.body.meeting.calendarAmbiguous],
+      ["dupB", "operator", undefined]);
+    assert.equal(r.body.meeting.calendarEvent.subject, "Sync");
+    hub.relinkTenantMeetings(hub.tenantOfSite(S));
+    assert.equal(row2896(S, "t4").calendarEventId, "dupB");
+  } finally {
+    cleanup2896(S, [D]);
+  }
+});
+
+test("XERK-2896: a calendar arriving after the capture links it; a late invite absorbs the Turma-only entry", async () => {
+  const S = "lkC2896.atlassian.net", D = "lkC2896";
+  cleanup2896(S, [D]);
+  try {
+    await beat1574(D, S);   // in the org, no calendar yet
+    await postMeeting2508(S, capture2896("late", T2896, 45, { title: "Design review" }));
+    await postMeeting2508(S, capture2896("adhoc", T2896 + 2 * 60 * MIN2896, 20, { title: "Quick chat" }));
+    assert.equal(row2896(S, "late").calendarEventId, undefined);
+    // The first sync: the scheduled meeting links on the sync, not only on POST.
+    await calHost2896(D, S, [ev2896("design", T2896, 60, { subject: "Design review" })]);
+    assert.equal(row2896(S, "late").calendarEventId, "design");
+    let view = await view2896();
+    assert.ok(view.events.some((e) => e.id === "tenir:adhoc"), "impromptu: a Turma-only entry");
+    // Someone sends the invite after the fact: the next sync merges it.
+    await calHost2896(D, S, [ev2896("design", T2896, 60, { subject: "Design review" }),
+      ev2896("chat", T2896 + 2 * 60 * MIN2896, 15, { subject: "Quick chat" })]);
+    assert.deepEqual([row2896(S, "adhoc").calendarEventId, row2896(S, "adhoc").calendarBy], ["chat", "auto"]);
+    view = await view2896();
+    assert.ok(!view.events.some((e) => e.id === "tenir:adhoc"));
+    assert.deepEqual(view.events.find((e) => e.id === "chat").meetings.map((x) => x.meetingId), ["adhoc"]);
+    // The meetings wire serves the link and the event as the calendar has it.
+    const fleet = (await request("GET", "/api/agents", { headers: userHeaders })).body.meetingProposals[S];
+    const wire = fleet.find((m) => m.meetingId === "adhoc");
+    assert.deepEqual([wire.calendarEventId, wire.calendarEvent.subject, wire.calendarEvent.moved,
+      wire.calendarEvent.canceled], ["chat", "Quick chat", false, false]);
+  } finally {
+    cleanup2896(S, [D]);
+  }
+});
+
+test("XERK-2896: a moved or canceled event keeps its capture and shows both facts; a deleted one rematches", async () => {
+  const S = "lkD2896.atlassian.net", D = "lkD2896";
+  cleanup2896(S, [D]);
+  try {
+    const occ = "series:2026-01-01T10:00:00Z";
+    await calHost2896(D, S, [ev2896(occ, T2896, 30, { seriesId: "series", recurring: true }),
+      ev2896("retro", T2896 + 3 * 60 * MIN2896, 30)]);
+    await postMeeting2508(S, capture2896("mv", T2896, 30));
+    await postMeeting2508(S, capture2896("cx", T2896 + 3 * 60 * MIN2896, 30));
+    assert.deepEqual([row2896(S, "mv").calendarEventId, row2896(S, "cx").calendarEventId], [occ, "retro"]);
+    // The occurrence moves a day later (same id); the retro is canceled.
+    await calHost2896(D, S, [ev2896(occ, T2896 + 864e5 - 3.6e6, 30, { seriesId: "series", recurring: true }),
+      ev2896("retro", T2896 + 3 * 60 * MIN2896, 30, { canceled: true })]);
+    const fleet = (await request("GET", "/api/agents", { headers: userHeaders })).body.meetingProposals[S];
+    const mv = fleet.find((m) => m.meetingId === "mv"), cx = fleet.find((m) => m.meetingId === "cx");
+    assert.deepEqual([mv.calendarEventId, mv.calendarEvent.moved, mv.calendarEvent.startMs],
+      [occ, true, T2896 + 864e5 - 3.6e6]);
+    assert.deepEqual([cx.calendarEventId, cx.calendarEvent.canceled, cx.calendarEvent.moved], ["retro", true, false]);
+    // A canceled event never takes a NEW capture.
+    await postMeeting2508(S, capture2896("cx2", T2896 + 3 * 60 * MIN2896, 30));
+    assert.equal(row2896(S, "cx2").calendarEventId, undefined);
+    // Removed from Outlook altogether: the auto link has nothing to hold, so it rematches (here: none).
+    await calHost2896(D, S, [ev2896(occ, T2896 + 864e5 - 3.6e6, 30, { seriesId: "series", recurring: true })]);
+    assert.equal(row2896(S, "cx").calendarEventId, undefined);
+    assert.ok((await view2896()).events.some((e) => e.id === "tenir:cx"));
+  } finally {
+    cleanup2896(S, [D]);
+  }
+});
+
+test("XERK-2896: two orgs meeting at the same time each link their own org's event", async () => {
+  const A = "lkE2896a.atlassian.net", B = "lkE2896b.atlassian.net";
+  cleanup2896(A, ["lkE2896a"]);
+  cleanup2896(B, ["lkE2896b"]);
+  try {
+    await calHost2896("lkE2896a", A, [ev2896("acme", T2896, 60, { subject: "Weekly sync" })]);
+    await calHost2896("lkE2896b", B, [ev2896("beta", T2896, 60, { subject: "Weekly sync" })]);
+    await postMeeting2508(A, capture2896("a1", T2896, 60, { title: "Weekly sync" }));
+    await postMeeting2508(B, capture2896("b1", T2896, 60, { title: "Weekly sync" }));
+    assert.equal(row2896(A, "a1").calendarEventId, "acme");
+    assert.equal(row2896(B, "b1").calendarEventId, "beta");
+    // By hand the operator may pick any event of the tenant (an org rule can be wrong),
+    // never an id no host of the tenant holds.
+    assert.equal((await link2896(B, "b1", { eventId: "nope" })).status, 404);
+    // The daily pairing: a daily capture prefers the event at its scheduled time.
+    const m = { startedAt: T2896 + 10 * MIN2896, endedAt: T2896 + 40 * MIN2896, title: "Zoom meeting",
+      platform: "zoom", participants: [] };
+    const ev = hub.sanitizeCalendarEvent(ev2896("d", T2896, 30));
+    assert.ok(hub.calendarLinkScore({ ...m, daily: { meetingAt: T2896 } }, ev) > hub.calendarLinkScore(m, ev) + 0.1);
+  } finally {
+    cleanup2896(A, ["lkE2896a"]);
+    cleanup2896(B, ["lkE2896b"]);
+  }
+});
+
+test("XERK-2896: the operator's unlink sticks, auto hands it back; refusals in the hub's words; Tenir sees no link", async () => {
+  const S = "lkF2896.atlassian.net", D = "lkF2896";
+  cleanup2896(S, [D]);
+  try {
+    await calHost2896(D, S, [ev2896("plan", T2896, 60)]);
+    const first = await postMeeting2508(S, capture2896("u1", T2896, 60));
+    assert.equal(row2896(S, "u1").calendarEventId, "plan");
+    for (const k of ["calendarEventId", "calendarBy", "calendarAmbiguous", "calendarEvent"]) {
+      assert.ok(!(k in first.body.meeting), `Tenir's answer carries no ${k}`);
+    }
+    const dup = await postMeeting2508(S, capture2896("u1", T2896, 60, { calendarEventId: "x", calendarBy: "operator" }));
+    assert.ok(!("calendarEventId" in dup.body.meeting));
+    // Tenir cannot set a link on a new capture either.
+    await postMeeting2508(S, capture2896("u2", T2896 + 5 * 60 * MIN2896, 10, { calendarEventId: "plan", calendarBy: "operator" }));
+    assert.deepEqual([row2896(S, "u2").calendarEventId, row2896(S, "u2").calendarBy], [undefined, undefined]);
+    for (const [body, status] of [[null, 400], [{}, 400], [{ eventId: 5 }, 400], [{ eventId: "a\u0007" }, 400],
+      [{ auto: false }, 400]]) {
+      assert.equal((await link2896(S, "u1", body)).status, status, JSON.stringify(body));
+    }
+    assert.equal((await link2896("nobody2896.atlassian.net", "u1", { eventId: null })).status, 404);
+    assert.equal((await link2896(S, "zz", { eventId: null })).status, 404);
+    const un = await link2896(S, "u1", { eventId: null });
+    assert.deepEqual([un.status, un.body.meeting.calendarEventId, un.body.meeting.calendarBy], [200, undefined, "operator"]);
+    hub.relinkTenantMeetings(hub.tenantOfSite(S));
+    assert.equal(row2896(S, "u1").calendarEventId, undefined, "an operator's unlink is never undone by a sync");
+    assert.ok((await view2896()).events.some((e) => e.id === "tenir:u1"));
+    const back = await link2896(S, "u1", { auto: true });
+    assert.deepEqual([back.body.meeting.calendarEventId, back.body.meeting.calendarBy], ["plan", "auto"]);
+    // The link survives the store's whitelist (restore / HA watch).
+    const kept = hub.sanitizeMeeting(row2896(S, "u1"));
+    assert.deepEqual([kept.calendarEventId, kept.calendarBy], ["plan", "auto"]);
+  } finally {
+    cleanup2896(S, [D]);
+  }
+});
+
+test("XERK-2896: tenant isolation — a capture never links to, or shows on, another tenant's calendar", async () => {
+  const T = tenants2533();
+  const S = "lkT2896.atlassian.net";
+  const ka = `lkT2896@${T.A.t}`, kb = `lkT2896@${T.B.t}`;
+  const sa = `${S}@${T.A.t}`, sb = `${S}@${T.B.t}`;
+  forget2533("lkT2896", ka, kb);
+  forget2891(ka, kb);
+  try {
+    const ta = await enroll2533(T.A, "lkT2896");
+    const tb = await enroll2533(T.B, "lkT2896");
+    // Only B's host has an event at that time, with the same id A's capture could guess.
+    await calHost2896("lkT2896", S, [], ta);
+    await calHost2896("lkT2896", S, [ev2896("shared-id", T2896, 60, { subject: "Board meeting" })], tb);
+    const decided = [...hub.decidedOrgs()];
+    assert.ok(decided.includes(sa) && decided.includes(sb), decided.join(","));
+    hub.putMeeting(sa, { ...okMeeting2510("ta1"), title: "Board meeting", startedAt: T2896, endedAt: T2896 + 3.6e6 });
+    hub.relinkTenantMeetings(T.A.t);
+    hub.relinkTenantMeetings(T.B.t);
+    assert.equal(row2896(sa, "ta1").calendarEventId, undefined, "B's event is not A's");
+    assert.equal(hub.setMeetingCalendarLink(sa, "ta1", { eventId: "shared-id" }).status, 404,
+      "an id only another tenant's host holds is unknown");
+    // B sees its event with no capture of A on it, and no Turma-only entry of A.
+    const vb = await view2896(T.B.h);
+    assert.deepEqual(vb.events.find((e) => e.id === "shared-id").meetings, []);
+    assert.ok(!vb.events.some((e) => e.source === "tenir"));
+    const va = await view2896(T.A.h);
+    assert.deepEqual(va.events.filter((e) => e.source === "tenir").map((e) => e.id), ["tenir:ta1"]);
+    assert.ok(!va.events.some((e) => e.id === "shared-id"));
+    // The operator route is tenant-gated: B's cookie cannot touch A's org.
+    assert.equal((await link2896(sa, "ta1", { eventId: null }, T.B.h)).status, 404);
+  } finally {
+    delete hub.getMeetings()[sa];
+    delete hub.getMeetings()[sb];
+    forget2891(ka, kb);
+    forget2533("lkT2896", ka, kb);
     T.restore();
   }
 });
