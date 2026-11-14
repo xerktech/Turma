@@ -70,6 +70,7 @@ const { createLiveStore, sameValue } = require("./store.js");
 const tenancy = require("./tenancy.js");
 const tenantMigration = require("./tenant-migration.js");
 const routeScope = require("./tenant-scope.js");
+const holidays = require("./holidays.js");
 const { createLeader } = require("./leader.js");
 // The archive's object-store backend + mirror (XERK-759, epic XERK-751). The
 // durable archive's BYTES (rendered + raw layers) move to object storage as the
@@ -672,6 +673,13 @@ const MEETING_LABEL_MISSES_FILE =
   process.env.MEETING_LABEL_MISSES_FILE || "/data/meeting-label-misses.json";
 // Whose work an org's meetings propose (XERK-2514): siteKey -> {names, role}.
 const MEETING_FOCUS_FILE = process.env.MEETING_FOCUS_FILE || "/data/meeting-focus.json";
+// Each org's holiday catalogs and days off (XERK-2892): siteKey -> {countries, off}.
+const HOLIDAY_SETTINGS_FILE = process.env.HOLIDAY_SETTINGS_FILE || "/data/holiday-settings.json";
+// The Calendar (XERK-2891, contract-calendar.md): each host's Outlook events, and
+// the operator's org-assignment settings.
+const CALENDAR_EVENTS_FILE = process.env.CALENDAR_EVENTS_FILE || "/data/calendar-events.json";
+const CALENDAR_ORG_RULES_FILE = process.env.CALENDAR_ORG_RULES_FILE || "/data/calendar-org-rules.json";
+const CALENDAR_HOST_SETTINGS_FILE = process.env.CALENDAR_HOST_SETTINGS_FILE || "/data/calendar-host-settings.json";
 // Each tenant's Tenir bearer, as its SHA-256 only (XERK-2551).
 const MEETING_TOKENS_FILE = process.env.MEETING_TOKENS_FILE || "/data/meeting-tokens.json";
 // Tenants whose archive data was purged (XERK-2549): tombstones every replica reads.
@@ -5625,6 +5633,586 @@ function setMeetingFocus(siteKey, body) {
   return { status: 200, body: { ok: true, focus: f } };
 }
 
+// ---- holidays: each org's catalogs and days off (XERK-2892) ------------------------
+// The catalogs are computed by rule (holidays.js); the hub stores only each org's
+// choice: which countries' holidays it follows and which of them are DAYS OFF,
+// by holiday id so a choice holds every year. An org with nothing stored follows
+// HOLIDAY_DEFAULT_COUNTRIES with no day off. Contract: contract-calendar.md.
+const HOLIDAY_DEFAULT_COUNTRIES = ["US"];
+const HOLIDAY_ORGS_MAX = 100;   // per tenant; ORG_STORE_TOTAL_FACTOR x this hub-wide
+const HOLIDAY_SITE_MAX = 200;
+// {countries, off} -> the stored shape, or null when anything in it is unknown,
+// so a 200 always means stored as sent. Order is kept, repeats dropped.
+function holidaySettingsValue(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  if (!Array.isArray(v.countries) || !Array.isArray(v.off)) return null;
+  // Every element must be known, so the deduped lists are bounded by the catalog.
+  if (!v.countries.every(holidays.hasCountry)) return null;
+  if (!v.off.every((id) => typeof id === "string" && Object.hasOwn(holidays.HOLIDAY_COUNTRY, id))) return null;
+  return { countries: [...new Set(v.countries)], off: [...new Set(v.off)] };
+}
+function holidaySettingsCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw).slice(0, HOLIDAY_ORGS_MAX * ORG_STORE_TOTAL_FACTOR)) {
+    const h = k && k.length <= HOLIDAY_SITE_MAX ? holidaySettingsValue(v) : null;
+    if (h) Object.defineProperty(out, k, { value: h, enumerable: true, writable: true, configurable: true });
+  }
+  return out;
+}
+let holidaySettings = holidaySettingsCoerce(readJsonFile(HOLIDAY_SETTINGS_FILE));
+const persistHolidaySettings = registerExternalStore({
+  name: "holidaySettings", file: HOLIDAY_SETTINGS_FILE,
+  coerce: holidaySettingsCoerce, read: () => holidaySettings, install: (v) => { holidaySettings = v; },
+});
+function holidaySettingsOf(siteKey) {
+  return Object.hasOwn(holidaySettings, siteKey) ? holidaySettings[siteKey]
+    : { countries: [...HOLIDAY_DEFAULT_COUNTRIES], off: [] };
+}
+// The wire: every decided org's effective settings (stored or default), plus any
+// stored org no host is in now (bySite scopes both per principal).
+function holidaySettingsWire() {
+  const out = Object.create(null);
+  for (const site of decidedOrgs()) out[site] = holidaySettingsOf(site);
+  for (const [site, h] of Object.entries(holidaySettings)) out[site] = h;
+  return out;
+}
+// PUT body {countries?, off?} merged over the org's settings. Answers {status, body}.
+function setHolidaySettings(siteKey, body, orgs) {
+  if (siteKey.length > HOLIDAY_SITE_MAX) {
+    return { status: 400, body: { error: `org key too long — the limit is ${HOLIDAY_SITE_MAX} characters` } };
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { status: 400, body: { error: "body must be {countries, off}" } };
+  }
+  const merged = { ...holidaySettingsOf(siteKey) };
+  for (const k of ["countries", "off"]) if (k in body) merged[k] = body[k];
+  const value = holidaySettingsValue(merged);
+  if (!value) {
+    return { status: 400, body: { error: `countries must be catalog codes (${Object.keys(holidays.CATALOGS).join(", ")}) and off must be holiday ids from the catalog` } };
+  }
+  if (!Object.hasOwn(holidaySettings, siteKey) && orgStoreFull(holidaySettings, siteKey, HOLIDAY_ORGS_MAX)) {
+    const { full, pruned } = makeRoomForOrg(holidaySettings, siteKey, HOLIDAY_ORGS_MAX, (k) => !orgs.has(k));
+    if (full) {
+      if (pruned) publishHolidaySettings();
+      return { status: 409, body: { error: full === "tenant"
+        ? `${HOLIDAY_ORGS_MAX} orgs already have holiday settings — the limit`
+        : "the hub holds holiday settings for too many orgs — try again later" } };
+    }
+  }
+  Object.defineProperty(holidaySettings, siteKey, { value, enumerable: true, writable: true, configurable: true });
+  publishHolidaySettings();
+  return { status: 200, body: { ok: true, settings: value } };
+}
+function publishHolidaySettings() {
+  persistHolidaySettings();
+  invalidateAgentsCache();
+  sseBroadcast("holidaySettings", holidaySettingsWire());
+}
+// GET /api/holidays: every holiday from `from` to `until` (inclusive) of each
+// country an org principal `p` may see follows, each with the visible orgs that
+// take it OFF. Answers {status, body}.
+function holidaysFor(p, fromText, untilText) {
+  const from = holidays.parseDay(fromText), until = holidays.parseDay(untilText);
+  if (from === null || until === null) {
+    return { status: 400, body: { error: "from and until must be dates as YYYY-MM-DD, in the years 1978 to 2999" } };
+  }
+  if (until < from) return { status: 400, body: { error: "until is before from" } };
+  if ((until - from) / holidays.DAY_MS + 1 > holidays.RANGE_MAX_DAYS) {
+    return { status: 400, body: { error: `at most ${holidays.RANGE_MAX_DAYS} days at a time` } };
+  }
+  const orgs = [...decidedOrgs()].filter((site) => principalMaySite(p, site))
+    .map((site) => [site, holidaySettingsOf(site)]);
+  const countries = new Set();
+  for (const [, h] of orgs) for (const c of h.countries) countries.add(c);
+  const out = [];
+  for (const c of countries) {
+    for (const row of holidays.holidaysIn(c, from, until)) {
+      row.offFor = orgs.filter(([, h]) => h.countries.includes(c) && h.off.includes(row.id)).map(([site]) => site);
+      out.push(row);
+    }
+  }
+  out.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.country < b.country ? -1 : 1));
+  return { status: 200, body: out };
+}
+
+// ---- The Calendar (XERK-2891) -------------------------------------------------
+// Each host's Outlook events, delivered by its `calendarSync` heartbeat outbox,
+// stored per host key (which carries the tenant), served by GET /api/calendar.
+// Contract: .claude/rules/contract-calendar.md.
+const CALENDAR_BODY_MAX = 4000;
+const CALENDAR_SYNC_ROWS_MAX = 2;
+const CALENDAR_SYNC_EVENTS_MAX = 1500;
+const CALENDAR_SYNC_BYTES_MAX = 2 << 20;
+const CALENDAR_WEEK_MS = 7 * 86400000;
+const CALENDAR_SPAN_MAX_MS = 40 * CALENDAR_WEEK_MS;
+const CALENDAR_PAST_MS = 8 * CALENDAR_WEEK_MS;
+const CALENDAR_FUTURE_MS = 26 * CALENDAR_WEEK_MS;
+const CALENDAR_HOST_EVENTS_MAX = 1500;
+const CALENDAR_HOST_BYTES_MAX = 1536 << 10;
+const CALENDAR_TENANT_BYTES_MAX = 4 << 20;
+const CALENDAR_RANGES_MAX = 8;
+const CALENDAR_SERVE_MAX = 5000;
+const CALENDAR_SERVE_SPAN_MS = 100 * 86400000;
+const CALENDAR_ONDEMAND_MIN_MS = 60 * 1000;
+const CALENDAR_HOST_RETAIN_MS = 30 * 86400000;
+const CALENDAR_DOMAINS_MAX = 50;
+const CALENDAR_SERIES_MAX = 500;
+const CAL_BUSY = new Set(["free", "tentative", "busy", "outOfOffice", "workingElsewhere", "unknown"]);
+const CAL_RESPONSE = new Set(["none", "organizer", "tentative", "accepted", "declined", "notResponded", "unknown"]);
+const CAL_ROLE = new Set(["organizer", "required", "optional", "resource", "unknown"]);
+const CAL_SENSITIVITY = new Set(["normal", "personal", "private", "confidential"]);
+const CAL_EMAIL_RE = /^[^@\s/]+@[^@\s/]+\.[^@\s/]+$/;
+const CAL_ID_RE = /^[^\u0000-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069]{1,300}$/;
+const CAL_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,7})?)?(?:Z|[+-]\d{2}:\d{2})$/;
+const CAL_DOMAIN_RE = /^(?=.{1,253}$)[a-z0-9-]+(?:\.[a-z0-9-]+)+$/;
+const CAL_URL_RE = /^https:\/\/[^\s"'<>\\`]+$/;
+
+const calMs = (v) => (Number.isSafeInteger(v) && v > 0 ? v : 0);
+// An ISO stamp WITH offset whose fields name a real time: Date.parse rolls
+// 2026-02-30 over to March 2 instead of refusing it.
+function calIso(v) {
+  if (typeof v !== "string" || v.length > 40 || !CAL_ISO_RE.test(v) || !Number.isFinite(Date.parse(v))) return "";
+  const [y, mo, d] = v.slice(0, 10).split("-").map(Number);
+  const [h, mi] = v.slice(11, 16).split(":").map(Number);
+  const okDay = mo >= 1 && mo <= 12 && d >= 1 && d <= new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  return okDay && h <= 24 && mi <= 59 ? v : "";
+}
+const calEnum = (v, set) => (typeof v === "string" && set.has(v) ? v : "unknown");
+const calId = (v) => (typeof v === "string" && CAL_ID_RE.test(v) ? v : "");
+function calEmail(v) {
+  const e = typeof v === "string" ? v.trim().toLowerCase() : "";
+  return e.length <= 200 && CAL_EMAIL_RE.test(e) ? e : "";
+}
+
+// The ONE event whitelist (ingest, boot restore, HA watch). Field order is fixed
+// and every value re-derives to itself, so a stored event is a coerce fixed point.
+function sanitizeCalendarEvent(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const id = calId(v.id);
+  const start = calIso(v.start);
+  const end = calIso(v.end);
+  if (!id || !start || !end) return null;
+  const startMs = Date.parse(start);
+  const endMs = Date.parse(end);
+  if (endMs < startMs) return null;
+  const attendees = [];
+  for (const p of Array.isArray(v.attendees) ? v.attendees.slice(0, 100) : []) {
+    if (!p || typeof p !== "object" || Array.isArray(p)) continue;
+    attendees.push({ name: meetingText(p.name, 100), email: calEmail(p.email),
+      role: calEnum(p.role, CAL_ROLE), response: calEnum(p.response, CAL_RESPONSE) });
+  }
+  const categories = (Array.isArray(v.categories) ? v.categories.slice(0, 20) : [])
+    .map((c) => meetingText(c, 100)).filter(Boolean);
+  const url = meetingText(v.joinUrl, 500);
+  return {
+    id, seriesId: calId(v.seriesId), subject: meetingText(v.subject, 300),
+    start, end, startMs, endMs, allDay: v.allDay === true,
+    location: meetingText(v.location, 300), organizer: meetingText(v.organizer, 100),
+    organizerEmail: calEmail(v.organizerEmail),
+    busy: calEnum(v.busy, CAL_BUSY), myResponse: calEnum(v.myResponse, CAL_RESPONSE),
+    canceled: v.canceled === true, recurring: v.recurring === true, attendees,
+    joinUrl: CAL_URL_RE.test(url) ? url : "", lastModified: calIso(v.lastModified),
+    body: meetingText(v.body, CALENDAR_BODY_MAX, true), categories,
+    sensitivity: typeof v.sensitivity === "string" && CAL_SENSITIVITY.has(v.sensitivity) ? v.sensitivity : "normal",
+    isOnlineMeeting: v.isOnlineMeeting === true,
+  };
+}
+const calEventOrder = (a, b) => a.startMs - b.startMs || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+function sanitizeCalendarHost(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const out = { syncedAt: calMs(v.syncedAt), windowFrom: calMs(v.windowFrom),
+    windowUntil: calMs(v.windowUntil), ranges: [] };
+  for (const r of Array.isArray(v.ranges) ? v.ranges.slice(0, CALENDAR_RANGES_MAX) : []) {
+    if (Array.isArray(r) && calMs(r[0]) && calMs(r[1]) > r[0]) out.ranges.push([r[0], r[1]]);
+  }
+  const err = meetingText(v.lastError, 300);
+  if (err) {
+    out.lastError = err;
+    out.lastErrorAt = calMs(v.lastErrorAt);
+  }
+  const seen = new Set();
+  out.events = [];
+  for (const e of Array.isArray(v.events) ? v.events.slice(0, CALENDAR_HOST_EVENTS_MAX) : []) {
+    const ev = sanitizeCalendarEvent(e);
+    if (ev && !seen.has(ev.id)) { seen.add(ev.id); out.events.push(ev); }
+  }
+  out.events.sort(calEventOrder);
+  return out;
+}
+function calendarEventsCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw).slice(0, 2000)) {
+    if (!k || k.length > 300) continue;
+    const h = sanitizeCalendarHost(v);
+    if (h) out[k] = h;
+  }
+  return out;
+}
+let calendarEvents = calendarEventsCoerce(readJsonFile(CALENDAR_EVENTS_FILE));
+const persistCalendarEvents = registerExternalStore({
+  name: "calendarEvents", file: CALENDAR_EVENTS_FILE,
+  coerce: calendarEventsCoerce, read: () => calendarEvents, install: (v) => { calendarEvents = v; },
+});
+
+// Settings: per-org domain rules (siteKey -> {domains}) and per-host settings
+// (hostKey -> {defaultOrg?, showPrivate?, seriesOrgs}). Two stores, so the org
+// one rides TENANT_ORG_STORES' purge + migration like every org-keyed store.
+function calDomains(v) {
+  if (!Array.isArray(v) || v.length > CALENDAR_DOMAINS_MAX) return null;
+  const out = [];
+  for (const d of v) {
+    if (typeof d !== "string") return null;
+    const x = d.trim().toLowerCase().replace(/^@/, "");
+    if (!CAL_DOMAIN_RE.test(x)) return null;
+    if (!out.includes(x)) out.push(x);
+  }
+  return out;
+}
+function calendarOrgRulesCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [site, o] of Object.entries(raw).slice(0, 2000)) {
+    const d = site && site.length <= 200 && o && typeof o === "object" ? calDomains(o.domains) : null;
+    if (d && d.length) out[site] = { domains: d };
+  }
+  return out;
+}
+function sanitizeCalendarHostSettings(h) {
+  if (!h || typeof h !== "object" || Array.isArray(h)) return null;
+  const e = {};
+  if (typeof h.defaultOrg === "string" && h.defaultOrg && h.defaultOrg.length <= 200) e.defaultOrg = h.defaultOrg;
+  if (h.showPrivate === true) e.showPrivate = true;
+  const so = Object.create(null);
+  if (h.seriesOrgs && typeof h.seriesOrgs === "object" && !Array.isArray(h.seriesOrgs)) {
+    for (const [id, org] of Object.entries(h.seriesOrgs).slice(-CALENDAR_SERIES_MAX)) {
+      if (calId(id) && typeof org === "string" && org.length <= 200) so[id] = org;
+    }
+  }
+  e.seriesOrgs = so;
+  return e;
+}
+function calendarHostSettingsCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw).slice(0, 2000)) {
+    const e = k && k.length <= 300 ? sanitizeCalendarHostSettings(v) : null;
+    if (e) out[k] = e;
+  }
+  return out;
+}
+let calendarOrgRules = calendarOrgRulesCoerce(readJsonFile(CALENDAR_ORG_RULES_FILE));
+const persistCalendarOrgRules = registerExternalStore({
+  name: "calendarOrgRules", file: CALENDAR_ORG_RULES_FILE,
+  coerce: calendarOrgRulesCoerce, read: () => calendarOrgRules, install: (v) => { calendarOrgRules = v; },
+});
+let calendarHostSettings = calendarHostSettingsCoerce(readJsonFile(CALENDAR_HOST_SETTINGS_FILE));
+const persistCalendarHostSettings = registerExternalStore({
+  name: "calendarHostSettings", file: CALENDAR_HOST_SETTINGS_FILE,
+  coerce: calendarHostSettingsCoerce, read: () => calendarHostSettings,
+  install: (v) => { calendarHostSettings = v; },
+});
+
+// ---- budget --------------------------------------------------------------------
+const calEventBytes = (e) => Buffer.byteLength(JSON.stringify(e));
+const calHostBytes = (h) => h.events.reduce((n, e) => n + calEventBytes(e), 0);
+// Trim `h` to the host caps (or `maxBytes`): the oldest PAST event (by end)
+// first, then the furthest future one. Returns how many it dropped.
+function calendarTrimHost(h, now, maxBytes = CALENDAR_HOST_BYTES_MAX) {
+  let bytes = calHostBytes(h);
+  let count = h.events.length;
+  if (count <= CALENDAR_HOST_EVENTS_MAX && bytes <= maxBytes) return 0;
+  const order = h.events.slice().sort((a, b) => {
+    const pa = a.endMs < now, pb = b.endMs < now;
+    if (pa !== pb) return pa ? -1 : 1;
+    return pa ? a.endMs - b.endMs : b.startMs - a.startMs;
+  });
+  const drop = new Set();
+  for (const e of order) {
+    if (count <= CALENDAR_HOST_EVENTS_MAX && bytes <= maxBytes) break;
+    drop.add(e);
+    count--;
+    bytes -= calEventBytes(e);
+  }
+  h.events = h.events.filter((e) => !drop.has(e));
+  return drop.size;
+}
+// A tenant over its byte budget trims its BIGGEST host first.
+function calendarEnforceTenant(t, now) {
+  const keys = Object.keys(calendarEvents).filter((k) => tenantOfKey(k) === t);
+  const sizes = new Map(keys.map((k) => [k, calHostBytes(calendarEvents[k])]));
+  let total = [...sizes.values()].reduce((a, b) => a + b, 0);
+  while (total > CALENDAR_TENANT_BYTES_MAX) {
+    const [big, size] = [...sizes.entries()].sort((a, b) => b[1] - a[1])[0];
+    const h = calendarEvents[big];
+    if (!calendarTrimHost(h, now, Math.max(0, size - (total - CALENDAR_TENANT_BYTES_MAX)))) break;
+    const after = calHostBytes(h);
+    total -= size - after;
+    sizes.set(big, after);
+  }
+}
+function calMergeRange(ranges, from, until) {
+  const all = (ranges || []).concat([[from, until]]).sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const r of all) {
+    const last = out[out.length - 1];
+    if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+    else out.push([r[0], r[1]]);
+  }
+  return out.slice(-CALENDAR_RANGES_MAX);
+}
+
+// ---- ingest (the `calendarSync` outbox) -----------------------------------------
+function calendarRecordError(key, msg, now) {
+  const h = calendarEvents[key] || { events: [], ranges: [] };
+  calendarEvents[key] = sanitizeCalendarHost({ ...h, lastError: msg, lastErrorAt: now });
+  return true;
+}
+function applyCalendarSync(key, row, now) {
+  const from = calMs(row.windowFrom);
+  const until = calMs(row.windowUntil);
+  if (!from || until <= from || until - from > CALENDAR_SPAN_MAX_MS) {
+    return calendarRecordError(key, "the hub refused a calendar sync: its window must be epoch ms " +
+      `with until after from, at most ${CALENDAR_SPAN_MAX_MS / CALENDAR_WEEK_MS} weeks long`, now);
+  }
+  if (!Array.isArray(row.events)) {
+    return calendarRecordError(key, meetingText(row.error, 300) || "the agent sent no events list", now);
+  }
+  if (row.events.length > CALENDAR_SYNC_EVENTS_MAX) {
+    return calendarRecordError(key, `the hub refused a calendar sync of ${row.events.length} events: ` +
+      `it keeps at most ${CALENDAR_SYNC_EVENTS_MAX} a sync, so read a narrower window`, now);
+  }
+  let bytes;
+  try { bytes = Buffer.byteLength(JSON.stringify(row.events)); } catch { bytes = Infinity; }
+  if (bytes > CALENDAR_SYNC_BYTES_MAX) {
+    return calendarRecordError(key, `the hub refused a calendar sync of ${Math.ceil(bytes / 1024)} KiB: ` +
+      `the limit is ${CALENDAR_SYNC_BYTES_MAX / 1024} KiB, so read a narrower window`, now);
+  }
+  const prev = calendarEvents[key];
+  const incoming = new Map();
+  for (const e of row.events) {
+    const ev = sanitizeCalendarEvent(e);
+    if (ev && !incoming.has(ev.id)) incoming.set(ev.id, ev);
+  }
+  // AUTHORITATIVE for its window: a stored event starting inside it that the sync
+  // does not carry is gone (canceled-and-removed, or moved: same id, new start).
+  const kept = prev ? prev.events.filter((e) => !incoming.has(e.id) && !(e.startMs >= from && e.startMs < until)) : [];
+  const h = {
+    syncedAt: Math.min(calMs(row.syncedAt) || now, now), windowFrom: from, windowUntil: until,
+    ranges: calMergeRange(prev ? prev.ranges : [], from, until),
+    events: kept.concat([...incoming.values()]).sort(calEventOrder),
+  };
+  calendarTrimHost(h, now);
+  calendarEvents[key] = sanitizeCalendarHost(h);
+  calendarEnforceTenant(tenantOfKey(key), now);
+  return true;
+}
+function ingestCalendarSync(key, rows, now = Date.now()) {
+  if (!Array.isArray(rows) || !rows.length) return false;
+  let changed = false;
+  for (const row of rows.slice(0, CALENDAR_SYNC_ROWS_MAX)) {
+    if (row && typeof row === "object" && !Array.isArray(row)) changed = applyCalendarSync(key, row, now) || changed;
+  }
+  if (changed) {
+    persistCalendarEvents();
+    broadcastCalendarSoon(key);
+  }
+  return changed;
+}
+
+// The agent capability block: `calendar: {available}`, strictly boolean; absent
+// stays absent (an older agent would ack syncCalendar and never answer).
+function normalizeCalendarCapability(payload) {
+  if (!payload || typeof payload !== "object" || !("calendar" in payload)) return;
+  const c = payload.calendar;
+  payload.calendar = c && typeof c === "object" && !Array.isArray(c) ? { available: c.available === true } : null;
+}
+const calendarCapable = (a) => !!(a && a.calendar && a.calendar.available === true);
+const calendarHostOnline = (a, now) => !!(a && a.lastSeen && now - a.lastSeen < OFFLINE_AFTER_MS);
+
+// Queue `syncCalendar` — one undelivered per host (a newer one replaces it).
+// Spliced in place: the heartbeat handler holds `a.commands` by reference.
+function queueCalendarSync(key, from, until) {
+  const a = agents[key];
+  if (!a || !calendarCapable(a)) return null;
+  const list = a.commands || [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i] && list[i].type === "syncCalendar" && !list[i].deliveredAt) list.splice(i, 1);
+  }
+  return queueCommand(key, { type: "syncCalendar", from: Math.floor(from), until: Math.floor(until) });
+}
+// On every beat: fold the outbox, then queue the default window on a reconnect
+// (a first beat, a beat after OFFLINE_AFTER_MS of silence, or the capability
+// just appearing — an agent that updated).
+function calendarOnBeat(key, prev, next, rows, now = Date.now()) {
+  try {
+    ingestCalendarSync(key, rows, now);
+  } catch (e) {
+    console.error(`calendar ingest failed: ${e && e.message}`);
+  }
+  if (!calendarCapable(next)) return;
+  const wasLive = prev && calendarCapable(prev) && prev.lastSeen && now - prev.lastSeen <= OFFLINE_AFTER_MS;
+  if (!wasLive) queueCalendarSync(key, now - CALENDAR_PAST_MS, now + CALENDAR_FUTURE_MS);
+}
+
+// ---- serving -------------------------------------------------------------------
+function calendarOrgsOfTenant(t) {
+  return [...decidedOrgs()].filter((s) => tenantOfSite(s) === t);
+}
+function calDomainOf(email) {
+  return email ? email.slice(email.lastIndexOf("@") + 1) : "";
+}
+function calendarEventOrg(ev, orgs, hs) {
+  const so = hs && hs.seriesOrgs;
+  const sid = ev.seriesId || ev.id;
+  if (so && Object.hasOwn(so, sid) && (so[sid] === "" || orgs.includes(so[sid]))) return so[sid];
+  const match = (d) => (d ? orgs.filter((s) => Object.hasOwn(calendarOrgRules, s) &&
+    calendarOrgRules[s].domains.some((x) => d === x || d.endsWith("." + x))) : []);
+  const orgEmail = ev.organizerEmail || (ev.attendees.find((p) => p.role === "organizer") || {}).email || "";
+  const byOrganizer = match(calDomainOf(orgEmail));
+  if (byOrganizer.length === 1) return byOrganizer[0];
+  const hits = new Set();
+  for (const p of ev.attendees) for (const s of match(calDomainOf(p.email))) hits.add(s);
+  if (hits.size === 1) return [...hits][0];
+  if (hs && hs.defaultOrg && orgs.includes(hs.defaultOrg)) return hs.defaultOrg;
+  return "";
+}
+function calendarEventWire(key, ev, orgs, hs) {
+  const out = { host: key, org: calendarEventOrg(ev, orgs, hs), ...ev };
+  if ((ev.sensitivity === "private" || ev.sensitivity === "confidential") && !(hs && hs.showPrivate)) {
+    Object.assign(out, { subject: "Private event", body: "", location: "", organizer: "",
+      organizerEmail: "", attendees: [], joinUrl: "", categories: [], private: true });
+  }
+  return out;
+}
+const calendarOnDemandAt = new Map();
+// The calendar a principal may see for [from, until): hosts it may drive, events
+// overlapping the range, filtered on the ASSIGNED org when `orgs` is a Set.
+function calendarView(p, from, until, orgFilter, now = Date.now()) {
+  const keys = new Set(Object.keys(calendarEvents));
+  for (const [k, a] of Object.entries(agents)) if (calendarCapable(a)) keys.add(k);
+  const hosts = [];
+  let events = [];
+  for (const key of [...keys].sort()) {
+    if (!principalMayDriveHost(p, key)) continue;
+    const a = agents[key];
+    const h = calendarEvents[key];
+    const row = { host: key, device: (a && a.device) || baseOfKey(key), online: calendarHostOnline(a, now),
+      syncedAt: h ? h.syncedAt : 0, windowFrom: h ? h.windowFrom : 0, windowUntil: h ? h.windowUntil : 0,
+      ranges: h ? h.ranges : [] };
+    if (h && h.lastError) Object.assign(row, { lastError: h.lastError, lastErrorAt: h.lastErrorAt });
+    const covered = h && h.ranges.some((r) => r[0] <= from && r[1] >= until);
+    if (!covered && row.online && calendarCapable(a)) {
+      const queued = (a.commands || []).find((c) => c && c.type === "syncCalendar" && c.from <= from && c.until >= until);
+      if (queued) row.pending = true;
+      else if (now - (calendarOnDemandAt.get(key) || 0) >= CALENDAR_ONDEMAND_MIN_MS) {
+        calendarOnDemandAt.set(key, now);
+        if (calendarOnDemandAt.size > 500) calendarOnDemandAt.delete(calendarOnDemandAt.keys().next().value);
+        if (queueCalendarSync(key, from, until)) row.pending = true;
+      }
+    }
+    hosts.push(row);
+    if (!h) continue;
+    const orgs = calendarOrgsOfTenant(tenantOfKey(key));
+    const hs = calendarHostSettings[key];
+    for (const ev of h.events) {
+      if (ev.startMs >= until || ev.endMs < from || (ev.endMs === from && ev.endMs !== ev.startMs)) continue;
+      const w = calendarEventWire(key, ev, orgs, hs);
+      if (orgFilter && !orgFilter.has(w.org)) continue;
+      events.push(w);
+    }
+  }
+  events.sort((a, b) => a.startMs - b.startMs || (a.host < b.host ? -1 : a.host > b.host ? 1 : 0) ||
+    (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const truncated = events.length > CALENDAR_SERVE_MAX;
+  if (truncated) events = events.slice(0, CALENDAR_SERVE_MAX);
+  return truncated ? { from, until, hosts, events, truncated } : { from, until, hosts, events };
+}
+
+// One coalesced `calendar` frame per turn naming the hosts that changed; clients
+// refetch the range they show. `changedAt` keeps two changes from deduping.
+const calendarDirty = new Set();
+let calendarBroadcastQueued = false;
+function broadcastCalendarSoon(key) {
+  calendarDirty.add(key);
+  if (calendarBroadcastQueued) return;
+  calendarBroadcastQueued = true;
+  setImmediate(() => {
+    calendarBroadcastQueued = false;
+    const out = Object.create(null);
+    const now = Date.now();
+    for (const k of calendarDirty) {
+      const h = calendarEvents[k];
+      out[k] = { syncedAt: h ? h.syncedAt : 0, windowFrom: h ? h.windowFrom : 0,
+        windowUntil: h ? h.windowUntil : 0, changedAt: now };
+    }
+    calendarDirty.clear();
+    sseBroadcast("calendar", out);
+  });
+}
+
+// ---- settings routes' logic --------------------------------------------------
+function setCalendarOrgRules(siteKey, body) {
+  const d = body && typeof body === "object" && !Array.isArray(body) ? calDomains(body.domains) : null;
+  if (!d) {
+    return { status: 400, body: { error: `domains must be a list of at most ${CALENDAR_DOMAINS_MAX} ` +
+      "email domains, e.g. [\"acme.com\"]" } };
+  }
+  if (d.length) calendarOrgRules[siteKey] = { domains: d };
+  else delete calendarOrgRules[siteKey];
+  persistCalendarOrgRules();
+  for (const k of Object.keys(calendarEvents)) if (tenantOfKey(k) === tenantOfSite(siteKey)) broadcastCalendarSoon(k);
+  return { status: 200, body: { ok: true, rules: d.length ? { domains: d } : null } };
+}
+function setCalendarHostSettings(key, body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { status: 400, body: { error: "body must be {defaultOrg?, showPrivate?, series?: {id, org}}" } };
+  }
+  const orgs = calendarOrgsOfTenant(tenantOfKey(key));
+  const okOrg = (o) => o === null || (typeof o === "string" && orgs.includes(o));
+  const cur = sanitizeCalendarHostSettings(calendarHostSettings[key] || {});
+  if ("defaultOrg" in body) {
+    if (!okOrg(body.defaultOrg)) return { status: 404, body: { error: "defaultOrg is not an org of this host's tenant that a host is in" } };
+    if (body.defaultOrg === null) delete cur.defaultOrg;
+    else cur.defaultOrg = body.defaultOrg;
+  }
+  if ("showPrivate" in body) {
+    if (typeof body.showPrivate !== "boolean") return { status: 400, body: { error: "showPrivate must be true or false" } };
+    if (body.showPrivate) cur.showPrivate = true;
+    else delete cur.showPrivate;
+  }
+  if ("series" in body) {
+    const s = body.series;
+    if (!s || typeof s !== "object" || !calId(s.id) || !(s.org === null || s.org === "" || okOrg(s.org))) {
+      return { status: s && typeof s === "object" && calId(s.id) ? 404 : 400,
+        body: { error: "series must be {id, org}: org an org of this host's tenant, \"\" for unassigned, or null to clear" } };
+    }
+    delete cur.seriesOrgs[s.id];
+    if (s.org !== null) cur.seriesOrgs[s.id] = s.org;
+  }
+  calendarHostSettings[key] = sanitizeCalendarHostSettings(cur);
+  persistCalendarHostSettings();
+  broadcastCalendarSoon(key);
+  return { status: 200, body: { ok: true, settings: calendarHostSettings[key] } };
+}
+
+// A host gone from the registry keeps its calendar CALENDAR_HOST_RETAIN_MS past
+// its last sync (served offline meanwhile), then loses it.
+function calendarTick(now = Date.now()) {
+  let n = 0;
+  for (const [k, h] of Object.entries(calendarEvents)) {
+    if (Object.hasOwn(agents, k)) continue;
+    if (now - Math.max(h.syncedAt, h.lastErrorAt || 0) > CALENDAR_HOST_RETAIN_MS) {
+      delete calendarEvents[k];
+      delete calendarHostSettings[k];
+      n++;
+    }
+  }
+  if (n) { persistCalendarEvents(); persistCalendarHostSettings(); }
+  return n;
+}
+
 // "Acme Corp" -> "acme-corp". "" when nothing label-shaped is left.
 function meetingLabelSlug(text) {
   const s = String(text || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
@@ -8219,6 +8807,8 @@ const TENANT_ORG_STORES = [
   ["meetingLabels", () => meetingLabels, () => persistMeetingLabels()],
   ["meetingLabelMisses", () => meetingLabelMisses, () => persistMeetingLabelMisses()],
   ["meetingFocus", () => meetingFocus, () => persistMeetingFocus()],
+  ["holidaySettings", () => holidaySettings, () => persistHolidaySettings()],
+  ["calendarOrgRules", () => calendarOrgRules, () => persistCalendarOrgRules()],
   ["ticketAgents", () => ticketAgents, () => persistTicketAgents(), siteOfTicketKey],
   ["ticketModels", () => ticketModels, () => persistTicketModels(), siteOfTicketKey],
   ["ticketRuntimes", () => ticketRuntimes, () => persistTicketRuntimes(), siteOfTicketKey],
@@ -8233,6 +8823,17 @@ for (const [name, read, persist, siteOf] of TENANT_ORG_STORES) {
     return n;
   });
 }
+// The calendar's host-keyed stores (XERK-2891): a host key carries its tenant.
+registerTenantPurge("calendarEvents", (t) => {
+  const n = dropTenantKeys(calendarEvents, t);
+  if (n) persistCalendarEvents();
+  return n;
+});
+registerTenantPurge("calendarHostSettings", (t) => {
+  const n = dropTenantKeys(calendarHostSettings, t);
+  if (n) persistCalendarHostSettings();
+  return n;
+});
 registerTenantPurge("epicBuilders", (t) => {
   const n = dropTenantKeys(epicBuilders, t, (id) => (epicBuilders[id] && epicBuilders[id].siteKey) || "");
   if (n) persistEpicBuilders();
@@ -8508,6 +9109,35 @@ registerTenantMigration({
   },
 });
 for (const store of TENANT_ORG_STORES) registerTenantMigration(orgStoreStep(store));
+// A plain host's calendar + settings move with the host (XERK-2891); a settings
+// value naming a plain org follows that org into the tenant.
+for (const [name, read, persist] of [
+  ["calendarEvents", () => calendarEvents, () => persistCalendarEvents()],
+  ["calendarHostSettings", () => calendarHostSettings, () => persistCalendarHostSettings()],
+]) {
+  registerTenantMigration({
+    name,
+    count: (t, scope) => Object.keys(read()).filter((k) => hostMovable(k, scope)).length,
+    apply: (t, scope) => {
+      const map = read();
+      const moving = Object.keys(map).filter((k) => hostMovable(k, scope));
+      for (const k of moving) {
+        const v = map[k];
+        if (name === "calendarHostSettings") {
+          if (v.defaultOrg && plainKey(v.defaultOrg)) v.defaultOrg = scopeSite(v.defaultOrg, t);
+          for (const [id, org] of Object.entries(v.seriesOrgs || {})) {
+            if (org && plainKey(org)) v.seriesOrgs[id] = scopeSite(org, t);
+          }
+        }
+        const nk = tenantHostKey(k, t);
+        if (!Object.hasOwn(map, nk)) map[nk] = v;
+        delete map[k];
+      }
+      if (moving.length) persist();
+      return moving.length;
+    },
+  });
+}
 registerTenantMigration({
   name: "epicBuilders",
   count: (t, scope) => Object.values(epicBuilders).filter((r) => r && siteMovable(r.siteKey, scope)).length,
@@ -9232,6 +9862,11 @@ function buildAgentsCache() {
     meetingLabelMisses,
     // Whose work each org's meetings propose (XERK-2514): siteKey -> {names, role}.
     meetingFocus,
+    // Each org's holiday catalogs and days off (XERK-2892): siteKey -> {countries,
+    // off}, every decided org (an unset one at its default), and the catalogs the
+    // meetings settings list as checkboxes: country -> {name, holidays:[{id, name}]}.
+    holidaySettings: holidaySettingsWire(),
+    holidayCatalog: holidays.catalogWire(),
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -13050,6 +13685,8 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "dailyBrief", "dailyBriefResults",
   // Meetings (XERK-2508): the capability block and the results outbox.
   "meetings", "meetingResults",
+  // The Calendar (XERK-2891): the capability block and the sync outbox.
+  "calendar", "calendarSync",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -13444,6 +14081,7 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeTrajectory(a);
   normalizeCloseTicket(a);
   normalizeDailyBrief(a);
+  normalizeCalendarCapability(a);
   normalizeRunCapability(a, "meetings");
   // The retired sleeper-pause capability: an older agent still reports it, and
   // the hub never pauses a sleeper, so it is dropped rather than stored.
@@ -21753,6 +22391,8 @@ function masterOrchestrationTick() {
   dailyBriefTick();
   // Ask an org host to read each meeting Tenir posted; settle stuck runs (XERK-2508).
   meetingsTick();
+  // Drop the calendar of a host gone from the registry for 30 days (XERK-2891).
+  calendarTick();
   // Fold ticket sessions into the outcome ledger (XERK-1839). Observes only.
   outcomeLedgerSweep();
   // Sample merged tickets into shadow runs on cheaper models (XERK-1847).
@@ -24228,6 +24868,21 @@ const server = http.createServer(async (req, res) => {
       return json(res, 404, { error: "not found" });
     }
 
+    // GET /api/calendar?from=&until=[&org=a,b] — the caller's hosts' Outlook
+    // events overlapping the range (XERK-2891, contract-calendar.md). Filtered by
+    // principal; queues a syncCalendar for a range a capable host has not synced.
+    if (req.method === "GET" && url.pathname === "/api/calendar") {
+      const from = Number(url.searchParams.get("from"));
+      const until = Number(url.searchParams.get("until"));
+      if (!calMs(from) || !calMs(until) || until <= from || until - from > CALENDAR_SERVE_SPAN_MS) {
+        return json(res, 400, { error: "from and until must be epoch ms, until after from, " +
+          `at most ${CALENDAR_SERVE_SPAN_MS / 86400000} days apart` });
+      }
+      const orgParam = url.searchParams.get("org");
+      const orgFilter = orgParam === null ? null : new Set(orgParam.split(",").slice(0, 100));
+      return json(res, 200, calendarView(requestPrincipal(req), from, until, orgFilter));
+    }
+
     // Who is signed in (XERK-2553): the clients' account label + admin-only screen.
     if (req.method === "GET" && url.pathname === "/api/me") {
       return json(res, 200, meView(requestPrincipal(req)));
@@ -24535,6 +25190,9 @@ const server = http.createServer(async (req, res) => {
       // Meeting proposals (XERK-2508): folded into the proposal store below.
       const meetingResults = payload.meetingResults;
       delete payload.meetingResults;
+      // Calendar syncs (XERK-2891): folded into the calendar store below.
+      const calendarSync = payload.calendarSync;
+      delete payload.calendarSync;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -24877,6 +25535,13 @@ const server = http.createServer(async (req, res) => {
         if (Array.isArray(createTicketResults) && createTicketResults.length) settleMeetingReviews();
       } catch (e) {
         console.error(`meetings ingest failed: ${e && e.message}`);
+      }
+      // The host's Outlook calendar (XERK-2891): fold its sync outbox, and queue
+      // the default window on a reconnect. Never worth the beat.
+      try {
+        calendarOnBeat(key, prev, next, calendarSync, next.lastSeen || Date.now());
+      } catch (e) {
+        console.error(`calendar beat failed: ${e && e.message}`);
       }
       rearmMovedWatches(key, prev, next);
       // A migration finishes the instant its target session heartbeats in — do
@@ -25526,6 +26191,14 @@ const server = http.createServer(async (req, res) => {
       return json(res, 404, { error: "no such upload" });
     }
 
+    // GET /api/holidays?from=YYYY-MM-DD&until=YYYY-MM-DD — the holidays of every
+    // catalog the caller's orgs follow, each with the orgs that take it off
+    // (XERK-2892). Filtered: only the caller's own orgs count or are named.
+    if (req.method === "GET" && url.pathname === "/api/holidays") {
+      const out = holidaysFor(requestPrincipal(req), url.searchParams.get("from"), url.searchParams.get("until"));
+      return json(res, out.status, out.body);
+    }
+
     // GET /api/search?q=&repo=&host=&limit= — instant hub-local full-text search
     // over every archived session (works even for offline hosts).
     if (req.method === "GET" && url.pathname === "/api/search") {
@@ -25939,6 +26612,27 @@ const server = http.createServer(async (req, res) => {
     // by the single user check upstream); this is NOT driveable by a bare master
     // holder. Once TURMA_AGENT_STRICT retires the master the whole fleet is
     // already bound, so the button self-hides (tokenBound below).
+    // POST /api/agents/<host>/calendar/settings — the host's calendar org
+    // assignment + private-event opt-in (XERK-2891). Body {defaultOrg?,
+    // showPrivate?, series?: {id, org}}. 404 a host the caller may not drive.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts.length === 5 && parts[3] === "calendar" && parts[4] === "settings") {
+      const key = decodeURIComponent(parts[2]);
+      if (!principalMayDriveHost(requestPrincipal(req), key) ||
+          (!agents[key] && !Object.hasOwn(calendarEvents, key))) {
+        return json(res, 404, { error: "unknown agent" });
+      }
+      let body;
+      try {
+        body = JSON.parse((await readBody(req, 4096)) || "null");
+      } catch (e) {
+        if (e && (e.tooLarge || e.budgetExceeded)) throw e;
+        return json(res, 400, { error: "body is not JSON" });
+      }
+      const out = setCalendarHostSettings(key, body);
+      return json(res, out.status, out.body);
+    }
+
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "roll-token" && parts.length === 4) {
       const key = decodeURIComponent(parts[2]);
@@ -27793,6 +28487,26 @@ const server = http.createServer(async (req, res) => {
       return json(res, out.status, out.body);
     }
 
+    // POST /api/orgs/<siteKey>/calendar-rules — the email domains whose meetings
+    // are this org's on every host's calendar (XERK-2891). Body {domains: [...]};
+    // [] clears. 404 an org no host is decided into, 400 a malformed body.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 4 && parts[3] === "calendar-rules") {
+      const siteKey = decodeURIComponent(parts[2]);
+      if (!decidedOrgs().has(siteKey)) {
+        return json(res, 404, { error: "no host is in that org" });
+      }
+      let body;
+      try {
+        body = JSON.parse((await readBody(req, 16384)) || "null");
+      } catch (e) {
+        if (e && (e.tooLarge || e.budgetExceeded)) throw e;
+        return json(res, 400, { error: "body is not JSON" });
+      }
+      const out = setCalendarOrgRules(siteKey, body);
+      return json(res, out.status, out.body);
+    }
+
     // POST /api/orgs/<siteKey>/meeting-focus — whose work the org's meetings
     // propose (XERK-2514). Body {names: [...], role}; no names and no role clears
     // it. 404 an org no host is decided into, 400 a malformed body.
@@ -27813,6 +28527,28 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "body must be {names, role}" });
       }
       const out = setMeetingFocus(siteKey, body);
+      return json(res, out.status, out.body);
+    }
+
+    // PUT /api/orgs/<siteKey>/holidays — the operator picks the org's holiday
+    // catalogs and days off (XERK-2892). Body {countries?, off?} merged over the
+    // stored (or default) settings and validated whole. 404 an org no host is
+    // decided into, before the body is read, so a refusal mints no store key.
+    if (req.method === "PUT" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 4 && parts[3] === "holidays") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const orgs = decidedOrgs();
+      if (!orgs.has(siteKey)) {
+        return json(res, 404, { error: "no host is in that org" });
+      }
+      let body;
+      try {
+        body = JSON.parse((await readBody(req, 8192)) || "null");
+      } catch (e) {
+        if (e && (e.tooLarge || e.budgetExceeded)) throw e;
+        return json(res, 400, { error: "body is not JSON" });
+      }
+      const out = setHolidaySettings(siteKey, body, orgs);
       return json(res, out.status, out.body);
     }
 
@@ -28703,6 +29439,13 @@ if (process.env.TURMA_TEST) {
     runTenantMigration, runHostMerges, hostMergeTick, runTenantLateSteps, migrateTenantLeftovers, tenantMigrationTick, tenantMigrationGateClosed,
     logTenantMigrationError,
     tenantMigrationSteps, tenantMigrationPurgeNames: () => [...tenantPurges.keys()],
+    // XERK-2891: the calendar.
+    sanitizeCalendarEvent, calendarEventsCoerce, ingestCalendarSync, calendarView, calendarTick,
+    calendarEventOrg, calendarOnDemandAt,
+    getCalendarEvents: () => calendarEvents, getCalendarHostSettings: () => calendarHostSettings,
+    getCalendarOrgRules: () => calendarOrgRules,
+    CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,
+    CALENDAR_HOST_EVENTS_MAX, CALENDAR_HOST_BYTES_MAX, CALENDAR_TENANT_BYTES_MAX,
     tenantMigrationMarker: () => tenantMigrationMarker, migratedTenant,
     tenantOrgStores: () => TENANT_ORG_STORES.map(([name, read, persist]) => ({ name, read, persist })),
     devicesState: () => devices, ticketQueue, modelPolicyKeyParts,
@@ -29317,6 +30060,7 @@ if (process.env.TURMA_TEST) {
     getMeetings: () => meetingProposals, getMeetingLabels: () => meetingLabels,
     getMeetingLabelMisses: () => meetingLabelMisses, meetingLabelsCoerce, meetingLabelMissesCoerce,
     getMeetingFocus: () => meetingFocus, meetingFocusCoerce,
+    getHolidaySettings: () => holidaySettings, holidaySettingsCoerce,
     meetingLabelSlug, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick, meetingTitleGeneric,
     putMeeting, reviewMeetingItem, settleMeetingReviews, archiveMeeting, meetingDailyOf, keepMeetings, meetingProposalsWire, MEETING_START_WAIT_MS,
     MEETING_CREATE_DEADLINE_MS, MEETING_MAYBE_CREATED_REFUSAL, acceptMeeting,
