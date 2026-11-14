@@ -36,6 +36,30 @@ fun meetingMomentUrl(tenirUrl: String, atMs: Long): String {
     return u.substringBefore('#') + "#t=" + (atMs / 1000)
 }
 
+/** One speaker's run of consecutive lines in a transcript (XERK-2941); [atMs] -1 = no time. */
+data class TranscriptTurn(val speaker: String, val atMs: Long, val text: String)
+
+/** Consecutive lines of one speaker join into one turn, as the web's transcript does. */
+fun meetingTranscriptTurns(segments: List<com.xerktech.turma.model.MeetingTranscriptSegment>): List<TranscriptTurn> {
+    val out = mutableListOf<TranscriptTurn>()
+    for (s in segments) {
+        if (s.text.isBlank()) continue
+        val last = out.lastOrNull()
+        if (last != null && last.speaker == s.speaker) out[out.size - 1] = last.copy(text = last.text + " " + s.text)
+        else out += TranscriptTurn(s.speaker, s.startMs, s.text)
+    }
+    return out
+}
+
+/** An offset into the meeting as m:ss, or h:mm:ss past the hour (the web's `clockOf`). */
+fun transcriptClock(ms: Long): String {
+    val t = maxOf(0L, ms / 1000)
+    val h = t / 3600
+    val m = (t % 3600) / 60
+    val s = (t % 60).toString().padStart(2, '0')
+    return if (h > 0) "$h:${m.toString().padStart(2, '0')}:$s" else "$m:$s"
+}
+
 fun meetingKindLabel(kind: String): String = when (kind) {
     "followup" -> "follow-up"
     else -> kind

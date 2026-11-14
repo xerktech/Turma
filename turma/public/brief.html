@@ -183,6 +183,15 @@
   .mt-meta .sep::after { content: " · "; white-space: pre; }
   .mt-summary { font-size: 13.5px; line-height: 1.45; margin-top: 10px; color: var(--ink-2); overflow-wrap: anywhere; }
   .mt-summary p { margin: 0 0 6px; }
+  .mt-transcript { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--hairline); font-size: 13px; }
+  button.linkish.mt-tr-toggle { font-weight: 600; }
+  .mt-tr { margin-top: 6px; max-height: 60vh; overflow: auto; border: 1px solid var(--hairline);
+    border-radius: var(--radius-md); padding: 6px 10px; }
+  .mt-tr-turn { margin: 0; padding: 1px 0; line-height: 1.4; color: var(--ink-2); overflow-wrap: anywhere; }
+  .mt-tr-turn b { color: var(--ink); font-weight: 600; }
+  .mt-tr-at { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; margin-right: 6px; }
+  a.mt-tr-at { color: var(--accent-text); text-decoration: none; }
+  a.mt-tr-at:hover { text-decoration: underline; }
   .mt-status { font-size: 13px; margin-top: 10px; color: var(--ink-2); overflow-wrap: anywhere; }
   .mt-status.failed { color: var(--critical-text); }
   .mt-prog { height: 6px; background: var(--hairline); border-radius: 3px; overflow: hidden; margin: 12px 0 4px; }

@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
@@ -59,6 +60,12 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withLink
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -88,6 +95,8 @@ import com.xerktech.turma.core.effectiveOrgs
 import com.xerktech.turma.core.focusNames
 import com.xerktech.turma.core.meetingArchivable
 import com.xerktech.turma.core.meetingSummaryParagraphs
+import com.xerktech.turma.core.meetingMomentUrl
+import com.xerktech.turma.core.transcriptClock
 import com.xerktech.turma.core.meetingTitle
 import com.xerktech.turma.core.meetingItemsSplit
 import com.xerktech.turma.core.meetingLabelMissLabels
@@ -794,6 +803,75 @@ internal fun BriefReadAloud(b: DailyBrief, now: Long, zone: ZoneId, locale: Loca
     }
 }
 
+/**
+ * The meeting's full transcript (XERK-2941, web `transcriptHtml`): a toggle that
+ * reads it from the hub once, then the captions by speaker turn, each turn's
+ * time opening that moment in Tenir when the meeting has a link.
+ */
+@Composable
+internal fun TranscriptSection(
+    site: String,
+    m: Meeting,
+    mvm: MeetingsViewModel,
+    // The calendar panel's tint pulls text toward ink (XERK-2939); identity elsewhere.
+    textOn: (androidx.compose.ui.graphics.Color) -> androidx.compose.ui.graphics.Color = { it },
+) {
+    val transcripts by mvm.transcripts.collectAsStateWithLifecycle()
+    var open by rememberSaveable(site, m.meetingId) { mutableStateOf(false) }
+    val uri = LocalUriHandler.current
+    val state = transcripts["$site\u0000${m.meetingId}"]
+    HorizontalDivider(Modifier.padding(top = 8.dp))
+    GhostButton(if (open) "▾ Full transcript" else "▸ Full transcript", {
+        open = !open
+        if (open) mvm.loadTranscript(site, m.meetingId)
+    }, Modifier.testTag("transcript-toggle"))
+    if (!open) return
+    when (state) {
+        null, is MeetingsViewModel.TranscriptState.Loading ->
+            Text("Loading the transcript…", style = MaterialTheme.typography.bodyMedium,
+                color = textOn(MaterialTheme.colorScheme.onSurfaceVariant))
+        is MeetingsViewModel.TranscriptState.Failed ->
+            Text(state.message, style = MaterialTheme.typography.bodyMedium,
+                color = textOn(if (state.missing) MaterialTheme.colorScheme.onSurfaceVariant else TurmaColors.criticalText()))
+        is MeetingsViewModel.TranscriptState.Loaded -> {
+            if (state.turns.isEmpty()) {
+                Text("The transcript has no text.", style = MaterialTheme.typography.bodyMedium)
+                return
+            }
+            // Bounded, so it scrolls inside the entry rather than stretching the list.
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 480.dp).verticalScroll(rememberScrollState())
+                    .testTag("transcript"),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                val timeColor = textOn(MaterialTheme.colorScheme.onSurfaceVariant)
+                val linkColor = textOn(MaterialTheme.colorScheme.primary)
+                // One line per turn, as the web: time, speaker and words run together.
+                for (t in state.turns) {
+                    val line = buildAnnotatedString {
+                        if (t.atMs >= 0) {
+                            val link = meetingMomentUrl(m.tenirUrl, t.atMs)
+                            val clock = transcriptClock(t.atMs)
+                            if (link.isEmpty()) {
+                                withStyle(SpanStyle(color = timeColor)) { append(clock) }
+                            } else {
+                                withLink(LinkAnnotation.Url(link, TextLinkStyles(SpanStyle(color = linkColor)))) { append(clock) }
+                            }
+                            append("  ")
+                        }
+                        withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) {
+                            append(t.speaker.ifBlank { "Unknown speaker" } + ":")
+                        }
+                        append(" ")
+                        append(t.text)
+                    }
+                    Text(line, style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+        }
+    }
+}
+
 /** A captured meeting's review: progress, Archive, the pending proposals, reviewed ones on demand. */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -857,6 +935,7 @@ internal fun MeetingPart(
     if (status != null) {
         Text(status.first, style = MaterialTheme.typography.bodyMedium,
             color = if (status.second) textOn(TurmaColors.criticalText()) else MaterialTheme.colorScheme.onSurfaceVariant)
+        TranscriptSection(site, m, mvm, textOn)
         return
     }
     val act = ItemActions(
@@ -893,6 +972,8 @@ internal fun MeetingPart(
             }
         }
     }
+    // The meeting's own transcript, a section of its own after every proposal.
+    TranscriptSection(site, m, mvm, textOn)
 }
 
 private val WEEKDAY_LETTERS = listOf("S", "M", "T", "W", "T", "F", "S")

@@ -2,6 +2,7 @@
 paths:
   - "turma/server.js"
   - "turma/public/meetings.js"
+  - "turma/meeting-transcripts.js"
   - "turma/tests/meetings.test.js"
   - "agent/hub-agent.py"
   - "turma/tests/server.test.js"
@@ -98,6 +99,25 @@ ticket builds to this file; change it here first.
   - The push ("N proposals from …") and a logged decision's `label` use `meetingDisplayTitle`.
   - `segments` are kept ONLY while `queued`/`running` and dropped once settled; a running row also
     keeps `cmdId, sentAt, attempt, tried`. None of those four, nor `segments`, is ever served.
+  - **The full transcript lives OUTSIDE the policy store** (XERK-2941, `meeting-transcripts.js`):
+    saved at Tenir's POST, one document per meeting, keyed by `meetingId` + `receivedAt` (never the
+    org key, so a tenant migration re-keying the org still finds it).
+    - Off HA a file under `MEETING_TRANSCRIPTS_DIR` (default `<proposals file>-transcripts`); under
+      HA also a Postgres row (`meeting_transcript`, the archive index's pool), read on a local miss.
+      Never the archive bucket: its hydrate lists and pulls every key in it.
+    - Dropped with its row: `sweepMeetingTranscripts` on the leader's `meetingsTick` (files every
+      tick, Postgres every 10 min) deletes what no stored row names; it also back-fills a pending
+      row's document from its `segments`.
+    - **Nothing saved within `SAVE_GRACE_MS` (5 min) is deleted** — a save landing between the
+      sweep's live set and its DELETE was lost from Postgres (QA). Never drop the grace.
+    - **A byte budget, `MEETING_TRANSCRIPTS_MAX_BYTES`** (the container limit, clamped
+      256 MiB..1 GiB): the rows alone allow ~3 GiB. Over it the tenant holding the most bytes
+      loses its OLDEST transcript first (the XERK-2621 rule), never a pending one (the back-fill
+      re-saved it every tick, QA); the row stays and reads "no
+      transcript is kept".
+    - `GET /api/orgs/<site>/meetings/<mid>/transcript` (OPERATOR-authed, `org` class) answers
+      `{meetingId, startedAt, segments}`, read only through the org's stored row; 404 unknown org /
+      meeting, 404 `{missing:true}` for a meeting settled before this build, 503 store unreachable.
   - **Eviction drops settled rows first** — archived ones before the rest — oldest first; a
     pending row is evicted only when all are pending.
 - A meeting arriving while another of the org is running waits `queued`; ONE run per org.

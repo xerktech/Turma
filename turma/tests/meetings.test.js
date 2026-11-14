@@ -146,6 +146,75 @@ test("XERK-2894: the summary renders escaped in paragraphs, and an inferred titl
   }
 });
 
+test("XERK-2941: Show full transcript reads the hub once, groups speaker turns, escapes, and says when none was kept", async () => {
+  const segs = [{ speaker: "Ann", text: "We should fix <b>login</b>.", startMs: 65000, endMs: 66000 },
+    { speaker: "Ann", text: "Today.", startMs: 67000 },
+    { speaker: "<i>Bo</i>", text: "Agreed.", startMs: 3725000 }];
+  const P = loadPage((u) => (/\/transcript$/.test(u)
+    ? (/m2/.test(u) ? { status: 404, body: { error: "no transcript was kept for this meeting", missing: true } }
+      : { meetingId: "m1", segments: segs })
+    : META(u)));
+  const d = data([meeting(), meeting({ meetingId: "m2", title: "Old" })]);
+  P.setCache(d);
+  P.renderMeetings(d);
+  const mk = P.meetingKey("acme.atlassian.net", "m1");
+  assert.match(P.list(), /data-transcript="acme\.atlassian\.net\/m1" aria-expanded="false">▸ Full transcript/);
+  P.click({ transcript: mk });
+  await P.settle();
+  const h = P.list();
+  assert.equal(P.fetches.filter((f) => /\/transcript$/.test(f.url)).length, 1);
+  assert.match(h, /aria-expanded="true">▾ Full transcript/);
+  // Ann's two lines are one turn, at 1:05, linked to that moment in Tenir.
+  assert.match(h, /<p class="mt-tr-turn"><a class="mt-tr-at" href="https:\/\/tenir\.example\/c\/1#t=65"[^>]*>1:05<\/a><b>Ann:<\/b> We should fix &lt;b&gt;login&lt;\/b&gt;\. Today\.<\/p>/);
+  assert.match(h, />1:02:05<\/a><b>&lt;i&gt;Bo&lt;\/i&gt;:<\/b> Agreed\./);
+  assert.doesNotMatch(h, /<b>login|<i>Bo/);
+  // Hide, then show again: no second read.
+  P.click({ transcript: mk });
+  P.click({ transcript: mk });
+  await P.settle();
+  assert.equal(P.fetches.filter((f) => /\/transcript$/.test(f.url)).length, 1);
+  // A meeting read before transcripts were kept says so, not "failed".
+  P.click({ entry: "acme.atlassian.net/m%3Am2" });
+  P.click({ transcript: P.meetingKey("acme.atlassian.net", "m2") });
+  await P.settle();
+  assert.match(P.list(), /<div class="mt-status">No transcript is kept for this meeting/);
+});
+
+test("XERK-2941 QA: a failed transcript read retries on the next open, and a read landing mid-edit waits for focusout", async () => {
+  let fail = true;
+  let release = null;
+  const P = loadPage((u) => {
+    if (!/\/transcript$/.test(u)) return META(u);
+    if (fail) return { status: 503, body: { error: "the transcript store is unreachable — try again shortly" } };
+    return new Promise((r) => { release = () => r({ meetingId: "m1", segments: [{ speaker: "Ann", text: "Hi.", startMs: 0 }] }); });
+  });
+  const d = data();
+  P.setCache(d);
+  P.renderMeetings(d);
+  const mk = P.meetingKey(SITE, "m1");
+  P.click({ transcript: mk });
+  await P.settle();
+  assert.match(P.list(), /<div class="mt-status failed">Loading the transcript failed — the transcript store is unreachable/);
+  // Closed and reopened: read again, and this time it answers while a field is being typed in.
+  fail = false;
+  P.click({ transcript: mk });
+  P.click({ transcript: mk });
+  await P.settle();
+  assert.equal(P.fetches.filter((f) => /\/transcript$/.test(f.url)).length, 2);
+  const list = P.els.meetingList;
+  const field = { tagName: "TEXTAREA", dataset: {} };
+  list.contains = (a) => a === field;
+  P.document.activeElement = field;
+  const before = P.list();
+  release();
+  await P.settle();
+  assert.equal(P.list(), before, "held while the field has focus (QA D1)");
+  P.document.activeElement = null;
+  for (const fn of list.listeners.focusout || []) fn({});
+  P.renderMeetings(d);
+  assert.match(P.list(), /<b>Ann:<\/b> Hi\./);
+});
+
 test("XERK-2885: Retry on a failed project list asks the hub to skip its cached failure", async () => {
   let fail = true;
   const P = loadPage((u) => (/create-meta/.test(u) && !/project=/.test(u) && fail

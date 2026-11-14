@@ -155,6 +155,49 @@ class MeetingsScreenTest {
         compose.onNodeWithText("Reopen").performScrollTo().assertExists()
     }
 
+    @Test fun `XERK-2941 Show full transcript reads it once and lists speaker turns with their time`() {
+        seed()
+        hub.json("/api/orgs/$site/meetings/m2/transcript", """{ "meetingId": "m2", "segments": [
+            { "speaker": "Ann", "text": "We should fix login.", "startMs": 65000 },
+            { "speaker": "Ann", "text": "Today.", "startMs": 67000 },
+            { "speaker": "Bo", "text": "Agreed.", "startMs": 3725000 } ] }""")
+        hub.json("/api/orgs/$site/meetings/m0/transcript",
+            """{ "error": "no transcript was kept for this meeting", "missing": true }""", code = 404)
+        val vm = main.track(MeetingsViewModel(hub.app))
+        show(vm)
+        open("Sprint sync")
+        compose.onNodeWithText("▸ Full transcript").performScrollTo().performClick()
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText("1:05  Ann: We should fix login. Today.").fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("1:02:05  Bo: Agreed.").assertExists()
+        compose.onNodeWithText("▾ Full transcript").performScrollTo().performClick()
+        compose.onNodeWithText("1:02:05  Bo: Agreed.").assertDoesNotExist()
+        compose.onNodeWithText("▸ Full transcript").performScrollTo().performClick()
+        compose.onNodeWithText("1:02:05  Bo: Agreed.").assertExists()
+        // One read: the second open reuses it.
+        hub.findRequest("/m2/transcript")
+        org.junit.Assert.assertNull(hub.findRequestOrNull("/m2/transcript"))
+    }
+
+    @Test fun `XERK-2941 a meeting with no kept transcript says so and is never read again`() {
+        seed()
+        hub.json("/api/orgs/$site/meetings/m2/transcript",
+            """{ "error": "no transcript was kept for this meeting", "missing": true }""", code = 404)
+        val vm = main.track(MeetingsViewModel(hub.app))
+        show(vm)
+        open("Sprint sync")
+        compose.onNodeWithText("▸ Full transcript").performScrollTo().performClick()
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText(MeetingsViewModel.TRANSCRIPT_MISSING).fetchSemanticsNodes().isNotEmpty()
+        }
+        hub.findRequest("/m2/transcript")
+        compose.onNodeWithText("▾ Full transcript").performScrollTo().performClick()
+        compose.onNodeWithText("▸ Full transcript").performScrollTo().performClick()
+        compose.onNodeWithText(MeetingsViewModel.TRANSCRIPT_MISSING).assertExists()
+        org.junit.Assert.assertNull(hub.findRequestOrNull("/m2/transcript"))
+    }
+
     @Test fun `Reopen sends the reopen action and Archive the archive route`() {
         seed()
         hub.json("/api/orgs/$site/meetings/m2/items/p4", """{ "ok": true }""")

@@ -29697,6 +29697,128 @@ test("XERK-2894: a result's summary and inferred title are kept, bounded and ser
   cleanup2508(S, ["mtSum2894"]);
 });
 
+test("XERK-2941: a settled meeting's full transcript is kept, served to its org only, and dropped with its row", async () => {
+  const S = "mtTr2941.atlassian.net";
+  const O = "mtTrO2941.atlassian.net";
+  await meetHost2508("mtTr2941", S);
+  await beat1574("mtTrO2941", O);
+  const long = Array.from({ length: 300 }, (_, i) => ({ speaker: i % 2 ? "Bo" : "Ann",
+    text: `line ${i} <b>x</b>`, startMs: i * 1000, endMs: i * 1000 + 900 }));
+  await postMeeting2508(S, meeting2508("tr1", { segments: long }));
+  const url = (site, id) => `/api/orgs/${encodeURIComponent(site)}/meetings/${encodeURIComponent(id)}/transcript`;
+  // Readable while it waits, and after it settles (the row itself drops its copy).
+  assert.equal((await request("GET", url(S, "tr1"), { headers: userHeaders })).body.segments.length, 300);
+  const [cmd] = meetCmds2508("mtTr2941");
+  await meetResult2508("mtTr2941", S, cmd, { status: "ok", items: [] });
+  const row = hub.getMeetings()[S][0];
+  assert.equal(row.status, "ok");
+  assert.equal("segments" in row, false, "the policy store still drops it");
+  hub.sweepMeetingTranscripts();
+  const got = await request("GET", url(S, "tr1"), { headers: userHeaders });
+  assert.equal(got.status, 200);
+  assert.equal(got.body.meetingId, "tr1");
+  assert.equal(got.body.segments.length, 300);
+  assert.deepEqual(got.body.segments[1], { speaker: "Bo", text: "line 1 <b>x</b>", startMs: 1000, endMs: 1900 });
+  // Operator-authed, and only through the org that holds the row.
+  assert.equal((await request("GET", url(S, "tr1"))).status, 401);
+  assert.equal((await request("GET", url(O, "tr1"), { headers: userHeaders })).status, 404);
+  assert.equal((await request("GET", url(S, "nope"), { headers: userHeaders })).status, 404);
+  assert.equal((await request("GET", url("nobody2941.atlassian.net", "tr1"), { headers: userHeaders })).status, 404);
+  // A meeting settled before transcripts were kept says so.
+  hub.getMeetings()[S].push(hub.sanitizeMeeting({ meetingId: "old1", title: "Old", platform: "zoom",
+    startedAt: 1, endedAt: 2, receivedAt: 3, status: "ok", items: [] }));
+  const old = await request("GET", url(S, "old1"), { headers: userHeaders });
+  assert.deepEqual([old.status, old.body.missing], [404, true]);
+  // Dropped with its row — but never inside the save grace (QA D2: a save racing the sweep).
+  const file = path.join(hub.MEETING_TRANSCRIPTS_DIR, `${hub.meetingTranscripts.keyOf("tr1", row.receivedAt)}.json`);
+  assert.ok(fs.existsSync(file));
+  hub.getMeetings()[S].splice(0, 1);
+  hub.sweepMeetingTranscripts();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(fs.existsSync(file), "a fresh save survives a sweep that does not know its row");
+  hub.sweepMeetingTranscripts(Date.now() + hub.meetingTranscripts.SAVE_GRACE_MS + 1000);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(fs.existsSync(file), false);
+  // A pending row whose document is missing (posted before this build) is back-filled.
+  const pend = hub.sanitizeMeeting({ ...meeting2508("bf2"), status: "queued", receivedAt: 7 });
+  hub.getMeetings()[S].push(pend);
+  assert.equal(hub.meetingTranscripts.has("bf2", 7), false);
+  // The sweep hands the store each row's tenant, age and pending flag (a pending
+  // meeting is never the budget's victim).
+  const realSweep = hub.meetingTranscripts.sweep;
+  let seen = null;
+  hub.meetingTranscripts.sweep = async (live, opts) => { seen = live; return realSweep(live, opts); };
+  try { hub.sweepMeetingTranscripts(); } finally { hub.meetingTranscripts.sweep = realSweep; }
+  assert.deepEqual(seen.get(hub.meetingTranscripts.keyOf("bf2", 7)), { tenant: "", at: 7, pending: true });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(hub.meetingTranscripts.has("bf2", 7), true);
+  hub.getMeetings()[S].pop();
+  cleanup2508(S, ["mtTr2941"]);
+  cleanup2508(O, ["mtTrO2941"]);
+});
+
+test("XERK-2941 QA: the transcript store holds its byte budget by the biggest tenant's oldest, and ignores a colliding id", async () => {
+  const { makeTranscriptStore } = require("../meeting-transcripts.js");
+  const dir = fs.mkdtempSync(path.join(scratchDir(), "mtr2941-"));
+  const st = makeTranscriptStore({ dir, log: { error() {} } });
+  const big = (n) => ({ segments: [{ speaker: "A", text: "x".repeat(n) }] });
+  const live = new Map();
+  // Tenant A: three of ~1000 bytes; tenant B: one.
+  for (const [id, at, t] of [["a1", 1, "A"], ["a2", 2, "A"], ["a3", 3, "A"], ["b1", 1, "B"]]) {
+    st.save(id, at, big(1000));
+    live.set(st.keyOf(id, at), { tenant: t, at });
+  }
+  await st.sweep(live, { maxBytes: 3300, now: Date.now() + st.SAVE_GRACE_MS + 1 });
+  // Only A's oldest goes, never B's (B is the smaller tenant).
+  assert.deepEqual(["a1", "a2", "a3", "b1"].map((id, i) => st.has(id, [1, 2, 3, 1][i])), [false, true, true, true]);
+  // A document that names another meeting reads as absent.
+  fs.writeFileSync(path.join(dir, `${st.keyOf("zz", 9)}.json`), JSON.stringify({ meetingId: "other", receivedAt: 9, segments: [] }));
+  assert.equal(await st.load("zz", 9), null);
+  // The pure picker: biggest tenant first, oldest first, never a pending meeting.
+  assert.deepEqual(st.overBudget(new Map([["k1", { tenant: "A", at: 1 }], ["k2", { tenant: "A", at: 2 }], ["k3", { tenant: "B", at: 0 }]]),
+    new Map([["k1", 10], ["k2", 10], ["k3", 10]]), 20), ["k1"]);
+  assert.deepEqual(st.overBudget(new Map([["k1", { tenant: "A", at: 1, pending: true }], ["k2", { tenant: "A", at: 2 }]]),
+    new Map([["k1", 10], ["k2", 10]]), 15), ["k2"]);
+  assert.deepEqual(st.overBudget(new Map([["k1", { tenant: "A", at: 1, pending: true }]]), new Map([["k1", 10]]), 5), []);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("XERK-2941 QA: the Postgres sweep deletes only rows past the save grace, and the budget's evictions", async () => {
+  const { makeTranscriptStore } = require("../meeting-transcripts.js");
+  const dir = fs.mkdtempSync(path.join(scratchDir(), "mtrpg2941-"));
+  // A fake pool over one in-memory table, answering the SQL the store sends.
+  const rows = new Map(); // key -> {doc, saved_at}
+  const sent = [];
+  const pool = { async query(sql, params = []) {
+    sent.push(sql.replace(/\s+/g, " ").trim());
+    if (/^CREATE TABLE/.test(sql)) return [];
+    if (/^INSERT/.test(sql)) { if (!rows.has(params[0])) rows.set(params[0], { doc: params[1], saved_at: params[2] }); return []; }
+    if (/^SELECT doc/.test(sql)) { const r = rows.get(params[0]); return r ? [{ doc: r.doc }] : []; }
+    if (/^SELECT key, octet_length/.test(sql)) {
+      return [...rows].filter(([, r]) => r.saved_at < params[0]).map(([key, r]) => ({ key, bytes: Buffer.byteLength(r.doc) }));
+    }
+    if (/^DELETE/.test(sql)) { for (const k of params) rows.delete(k); return []; }
+    throw new Error(`unexpected SQL ${sql}`);
+  } };
+  const st = makeTranscriptStore({ dir, pool, log: { error() {} } });
+  const doc = { segments: [{ speaker: "A", text: "x".repeat(500) }] };
+  st.save("old", 1, doc);
+  st.save("fresh", 2, doc);
+  st.save("kept", 3, doc);
+  await new Promise((r) => setTimeout(r, 10));
+  const now = Date.now();
+  rows.get(st.keyOf("old", 1)).saved_at = now - st.SAVE_GRACE_MS - 1;   // past the grace, no live row
+  rows.get(st.keyOf("kept", 3)).saved_at = now - st.SAVE_GRACE_MS - 1;  // past the grace, live
+  // "fresh" has no live row either, but was saved inside the grace: it must survive.
+  await st.sweep(new Map([[st.keyOf("kept", 3), { tenant: "", at: 3 }]]), { withRemote: true, now });
+  assert.deepEqual([...rows.keys()].sort(), [st.keyOf("fresh", 2), st.keyOf("kept", 3)].sort());
+  // A promoted leader's empty disk: the row is sized from Postgres and evicted there by the budget.
+  fs.rmSync(dir, { recursive: true, force: true });
+  await st.sweep(new Map([[st.keyOf("kept", 3), { tenant: "", at: 3 }]]), { withRemote: true, now, maxBytes: 10 });
+  assert.equal(rows.has(st.keyOf("kept", 3)), false);
+  assert.ok(sent.some((s) => /saved_at < \$1/.test(s)), "the remote listing is bounded by the grace");
+});
+
 test("XERK-2508: the tick waits for a host, retries a silent or departed one, and expires the queue", async () => {
   const S = "mtT2508.atlassian.net";
   await beat1574("mtTOld2508", S);

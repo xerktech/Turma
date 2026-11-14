@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -302,6 +303,53 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
         if (err != null) fail(key, err)
     }
 
+    /** A meeting's full transcript as read from the hub (XERK-2941). */
+    sealed interface TranscriptState {
+        data object Loading : TranscriptState
+        data class Loaded(val turns: List<com.xerktech.turma.core.TranscriptTurn>) : TranscriptState
+        data class Failed(val message: String, val missing: Boolean) : TranscriptState
+    }
+
+    private val _transcripts = MutableStateFlow<Map<String, TranscriptState>>(emptyMap())
+
+    /** "site\u0000meetingId" -> its transcript, read on demand (never on the snapshot). */
+    val transcripts: StateFlow<Map<String, TranscriptState>> = _transcripts
+
+    /** Read a meeting's transcript once; a failed read (not a missing one) is read again. */
+    fun loadTranscript(siteKey: String, meetingId: String): Job? {
+        val key = "$siteKey\u0000$meetingId"
+        when (val cur = _transcripts.value[key]) {
+            is TranscriptState.Loading, is TranscriptState.Loaded -> return null
+            is TranscriptState.Failed -> if (cur.missing) return null
+            null -> Unit
+        }
+        _transcripts.value = _transcripts.value + (key to TranscriptState.Loading)
+        return viewModelScope.launch {
+            val next = try {
+                val r = container.client.api.meetingTranscript(siteKey, meetingId)
+                val out = r.body()
+                if (r.isSuccessful && out != null) {
+                    TranscriptState.Loaded(com.xerktech.turma.core.meetingTranscriptTurns(out.segments))
+                } else {
+                    // The error body can be read once: decode it here, word it the web's way.
+                    val err = runCatching { r.errorBody()?.string() }.getOrNull().orEmpty()
+                    val body = runCatching {
+                        com.xerktech.turma.model.TurmaJson.decodeFromString<com.xerktech.turma.model.MeetingTranscriptResponse>(err)
+                    }.getOrNull()
+                    if (r.code() == 404 && body?.missing == true) TranscriptState.Failed(TRANSCRIPT_MISSING, missing = true)
+                    else TranscriptState.Failed("Loading the transcript failed — " +
+                        (body?.error?.ifBlank { null } ?: "the hub answered HTTP ${r.code()}"), missing = false)
+                }
+            } catch (e: CancellationException) {
+                _transcripts.value = _transcripts.value - key
+                throw e
+            } catch (_: Exception) {
+                TranscriptState.Failed("Loading the transcript failed — the hub is unreachable", missing = false)
+            }
+            _transcripts.value = _transcripts.value + (key to next)
+        }
+    }
+
     private val _archiving = MutableStateFlow<Set<String>>(emptySet())
 
     /** "site\u0000meetingId" whose archive POST has not answered yet. */
@@ -466,6 +514,9 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
         prefs.all.mapNotNull { (k, v) -> (v as? String)?.let { k to it } }.toMap()
 
     companion object {
+        /** The web's words for a meeting read before transcripts were kept. */
+        const val TRANSCRIPT_MISSING =
+            "No transcript is kept for this meeting — it was read before Turma kept transcripts, or aged out of the store."
         private const val PREFS = "turma-meetings-project"
         private const val COLLAPSED_PREFS = "turma-meetings-collapsed"
         private const val COLLAPSED_KEY = "orgs"

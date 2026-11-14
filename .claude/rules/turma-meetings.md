@@ -122,6 +122,14 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   Daily brief schedule (live orgs only) with "Daily meeting title contains" (`meetingTitle`).
 - Labels Tenir sent that no org has: ONE banner on top, a row per label with an org pick.
 - Android port of the triage is its own ticket (`android/PARITY.md`, Brief section).
+- **A meeting's full transcript is its own collapsed section AFTER every proposal** (XERK-2941,
+  `transcriptHtml`; ONE per meeting, never per item — the operator's pick;
+  Android `TranscriptSection` in `BriefScreen.kt`): read from the hub ONCE on first open
+  (`transcripts` cache; a failed read retries on the next open, a missing one never), never on the
+  snapshot. Consecutive lines of one speaker are one turn, ONE dense line each (time, name, words
+  inline — the operator's pick over separate rows); a turn's time links to that moment in
+  Tenir (`momentUrl`). Every caption is escaped. Tests: `XERK-2941` in `meetings.test.js`,
+  `MeetingsScreenTest`, `MeetingsTest`.
 - **A settled meeting shows its written summary above the proposals** (XERK-2894, `summaryHtml`;
   Android `meetingSummaryParagraphs` in `MeetingPart`): plain text, escaped, paragraphs on blank
   lines; and is named `meetingTitle` everywhere (head, rail, search; XERK-2899 above).
