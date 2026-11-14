@@ -256,6 +256,52 @@ test("newticket: a dirty close arms the discard confirm; a clean one just closes
   assert.equal(backdrop.hidden, true);
 });
 
+// Closing hands focus back to whatever held it at open, not the page shell
+// (XERK-2911); a gone opener falls back to the header New-ticket button.
+test("newticket: closing returns focus to the opener, else the header button (XERK-2911)", () => {
+  const { body, button, doc } = mountNT();
+  NT.update({ agents: [agent("h1", "acme.atlassian.net")] });
+  const backdrop = body.children[0];
+  const focusable = (el) => { el.focus = () => { doc.activeElement = el; }; return el; };
+  focusable(button);
+  // The dialog's own ✕ takes focus at open, so the shim panel must yield one.
+  const close = focusable({});
+  backdrop.children[0].querySelector = (sel) => (sel === ".td-close" ? close : null);
+  const esc = () => { for (const fn of doc._listeners.keydown || []) fn({ key: "Escape" }); };
+
+  // A calendar event held focus when the form opened: Esc hands it back.
+  const ev = focusable({ isConnected: true });
+  doc.activeElement = ev;
+  for (const fn of button._listeners.click || []) fn({});
+  assert.equal(doc.activeElement, close);
+  esc();
+  assert.equal(backdrop.hidden, true);
+  assert.equal(doc.activeElement, ev);
+
+  // The opener was repainted away while the form was up: the header button.
+  ev.isConnected = false;
+  doc.activeElement = ev;
+  for (const fn of button._listeners.click || []) fn({});
+  esc();
+  assert.equal(doc.activeElement, button);
+
+  // The opener is still in the DOM but refuses focus (disabled/hidden): its
+  // focus() is a no-op, so the close must notice and fall back.
+  const dead = { isConnected: true, focus() {} };
+  doc.activeElement = dead;
+  for (const fn of button._listeners.click || []) fn({});
+  esc();
+  assert.equal(doc.activeElement, button);
+
+  // Opened with focus on <body> (a mouse click in Safari): the header button,
+  // even though <body> itself would take focus.
+  focusable(body);
+  doc.activeElement = body;
+  for (const fn of button._listeners.click || []) fn({});
+  for (const fn of backdrop._listeners.click || []) fn({ target: backdrop });
+  assert.equal(doc.activeElement, button);
+});
+
 // ---- wiring: every page carries it ------------------------------------------
 
 test("newticket: every page loads newticket.js after org.js", () => {
