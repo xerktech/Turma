@@ -358,7 +358,7 @@ function reveal(target) {
     meetingId: typeof target.meetingId === "string" ? target.meetingId : "" };
   anchor = dayStart(at);
   const wd = new Date(at).getDay();
-  if (!narrow && wideMode() === "work" && (wd === 0 || wd === 6)) revealWeek = true;
+  revealWeek = !narrow && wideMode() === "work" && (wd === 0 || wd === 6);   // a weekday reveal ends it
   picker = null;
   detail = null;
   detailFrom = null;

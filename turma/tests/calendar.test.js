@@ -487,7 +487,10 @@ test("XERK-2899 QA: a weekend reveal shows Week (unsaved); navigation drops a re
   cal.refetch();
   for (let i = 0; i < 8; i++) await tick();
   assert.equal(cal._state().detail, null);
-  // A mode pick ends the weekend Week.
+  // A weekday reveal ends the weekend Week; so does a mode pick.
+  cal.reveal({ eventId: "x", startMs: at(2027, 2, 8, 10) });
+  assert.equal(cal._state().mode, "work");
+  cal.reveal({ eventId: "sat", startMs: at(2027, 2, 6, 10) });
   for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset: { mode: "work" } }) } });
   assert.equal(cal._state().mode, "work");
   cal.setActive(false);
