@@ -250,8 +250,8 @@ fun TurmaApp(
             }
         }
         composable(TopDest.SESSIONS.route) {
-            // Sessions is the one adaptive screen: single-pane list (→ full-screen
-            // chat) when narrow, list-detail two-pane when wide. It owns its own
+            // Sessions is adaptive (Brief is too, inside its scaffold): single-pane
+            // list (→ full-screen chat) when narrow, list-detail two-pane when wide. It owns its own
             // scaffold/bottom-nav so it can drop the nav on a compact chat.
             SessionsRoute(
                 wide = wide,
@@ -276,7 +276,7 @@ fun TurmaApp(
         }
         composable(TopDest.BRIEF.route) {
             MainScaffold(TopDest.BRIEF, goTab) { m ->
-                BriefScreen(modifier = m, openSite = briefOpenSite, onOpened = { briefOpenSite = null })
+                BriefScreen(modifier = m, wide = wide, openSite = briefOpenSite, onOpened = { briefOpenSite = null })
             }
         }
         composable(

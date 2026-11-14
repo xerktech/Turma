@@ -1,10 +1,16 @@
 package com.xerktech.turma.ui
 
 import androidx.activity.ComponentActivity
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isSelected
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -67,8 +73,9 @@ class BriefScreenTest {
     """.trimIndent())
 
     private fun show(vm: BriefViewModel = main.track(BriefViewModel(hub.app)),
-                     mvm: MeetingsViewModel = main.track(MeetingsViewModel(hub.app))) =
-        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm) }
+                     mvm: MeetingsViewModel = main.track(MeetingsViewModel(hub.app)),
+                     wide: Boolean = false) =
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = wide) }
 
     private fun open(text: String) {
         compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText(text, substring = true))
@@ -109,8 +116,249 @@ class BriefScreenTest {
         compose.onAllNodesWithText("Daily meeting").assertCountEquals(1)
     }
 
+    // XERK-2878: a tablet / unfolded foldable shows the list and the open entry
+    // side by side, as the web's rail + main pane and the Sessions tab do.
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide shows the list beside the first entry, and a pick swaps only the entry`() {
+        seed(
+            meetings = """{ "meetingId": "m1", "status": "ok", "title": "Design review", "startedAt": $yday,
+                "items": [ { "id": "p1", "kind": "task", "title": "Wire the export" } ] }""",
+        )
+        show(wide = true)
+        // Nothing picked: the first entry (the upcoming daily meeting) is open beside the list.
+        compose.onNodeWithText("Search meetings and proposals").assertExists()
+        compose.onNodeWithText("Run now").assertExists()
+        compose.onNodeWithText("‹ Back").assertDoesNotExist()
+        open("Design review")
+        // The entry pane swapped; the list (and its other entry) stayed.
+        compose.onNodeWithText("Wire the export").assertExists()
+        compose.onNodeWithText("Run now").assertDoesNotExist()
+        compose.onNodeWithText("Daily meeting").assertExists()
+        compose.onNodeWithText("Search meetings and proposals").assertExists()
+    }
+
+    private fun hostOf(key: String, site: String, name: String = "") = """{ "key": "$key", "device": "$key",
+        "online": true, "lastSeen": 1, "jira": { "available": true, "siteKey": "$site", "site": "$site",
+        "orgName": "$name", "tickets": [] } }"""
+
+    private fun meeting(id: String, title: String, review: String = "", archived: Boolean = false) =
+        """{ "meetingId": "$id", "status": "ok", "title": "$title", "startedAt": $yday, "archivedAt": ${if (archived) 5 else 0},
+            "items": [ { "id": "p1", "kind": "task", "title": "Item of $title" $review } ] }"""
+
+    // The fleet reaches the screen through the VM's flow, not synchronously.
+    private fun waitFor(text: String) =
+        compose.waitUntil(10_000) { compose.onAllNodesWithText(text, substring = true).fetchSemanticsNodes().isNotEmpty() }
+
+    private fun waitGone(text: String) =
+        compose.waitUntil(10_000) { compose.onAllNodesWithText(text, substring = true).fetchSemanticsNodes().isEmpty() }
+
+    private fun twoOrgs(alphaReview: String = "") = """
+        { "now": 1, "agents": [ ${hostOf("h1", "a.atlassian.net", "Zed")}, ${hostOf("h2", "b.atlassian.net", "Alpha")} ],
+          "meetingProposals": { "a.atlassian.net": [ ${meeting("m1", "Zed sync")} ],
+                                "b.atlassian.net": [ ${meeting("m2", "Alpha sync", review = alphaReview)} ] } }
+    """
+
+    private val answered = """, "review": { "state": "rejected", "at": 5 }"""
+
+    private val wideOpen = hasText("Design review", substring = true) and isSelected()
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide marks the open entry and keeps it listed once its last proposal is answered`() {
+        seed(meetings = meeting("m1", "Design review"))
+        show(wide = true)
+        compose.onNode(hasText("Daily meeting") and isSelected()).assertExists()
+        open("Design review")
+        compose.onNode(wideOpen).assertExists()
+        // Its last proposal answered: Needs review would drop it, but not from under the pointer.
+        seed(meetings = meeting("m1", "Design review", review = answered))
+        waitGone("Approve + start session")
+        compose.onNode(wideOpen).assertExists()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide moves off an entry archived away and does not jump back when it returns`() {
+        seed(meetings = meeting("m1", "Design review"))
+        show(wide = true)
+        open("Design review")
+        compose.onNodeWithText("Item of Design review").assertExists()
+        seed(meetings = meeting("m1", "Design review", archived = true))
+        compose.waitForIdle()
+        compose.onNodeWithText("Run now").assertExists()
+        compose.onNodeWithText("Item of Design review").assertDoesNotExist()
+        seed(meetings = meeting("m1", "Design review"))
+        compose.waitForIdle()
+        compose.onNodeWithText("Run now").assertExists()
+        compose.onNode(hasText("Daily meeting") and isSelected()).assertExists()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide skips a collapsed org's entries`() {
+        seed()
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        mvm.toggleCollapsed(site)
+        show(mvm = mvm, wide = true)
+        compose.onNodeWithText("Run now").assertDoesNotExist()
+        compose.onNodeWithText(
+            "Nothing needs review. When Tenir sends a meeting, its proposed work items show up here.").assertExists()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide orders orgs by name and a meetings push opens the pushed org's entry`() {
+        // "Zed" sorts first by site key, "Alpha" first by name: the web's rail goes by name.
+        hub.seedFleet("""
+            { "now": 1, "agents": [ ${hostOf("h1", "a.atlassian.net", "Zed")}, ${hostOf("h2", "b.atlassian.net", "Alpha")} ],
+              "meetingProposals": { "a.atlassian.net": [ ${meeting("m1", "Zed sync")} ],
+                                    "b.atlassian.net": [ ${meeting("m2", "Alpha sync")} ] } }
+        """.trimIndent())
+        var push by mutableStateOf<String?>(null)
+        val vm = main.track(BriefViewModel(hub.app))
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = true, openSite = push, onOpened = { push = null }) }
+        waitFor("Item of Alpha sync")
+        // A search that hides the pushed org is cleared by the push.
+        compose.onNodeWithText("Search meetings and proposals").performTextInput("Alpha")
+        push = "a.atlassian.net"
+        waitFor("Item of Zed sync")
+        compose.onNode(hasText("Zed sync", substring = true) and isSelected()).assertExists()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide holds a cold-start push until the pushed org has loaded`() {
+        hub.seedFleet("""{ "now": 1, "agents": [] }""")
+        var push by mutableStateOf<String?>("a.atlassian.net")
+        val vm = main.track(BriefViewModel(hub.app))
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = true, openSite = push, onOpened = { push = null }) }
+        compose.waitForIdle()
+        hub.seedFleet("""
+            { "now": 1, "agents": [ ${hostOf("h1", "a.atlassian.net", "Zed")}, ${hostOf("h2", "b.atlassian.net", "Alpha")} ],
+              "meetingProposals": { "a.atlassian.net": [ ${meeting("m1", "Zed sync")} ],
+                                    "b.atlassian.net": [ ${meeting("m2", "Alpha sync")} ] } }
+        """.trimIndent())
+        compose.waitForIdle()
+        // The fleet reaches the screen through the VM's flow, not synchronously.
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("Item of Zed sync").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Item of Zed sync").assertExists()
+        assertEquals(null, push)
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide opens a newly picked entry at its top`() {
+        // Two entries of the same shape, so only the per-entry key resets the scroll.
+        fun long(id: String, title: String, at: Long) = """{ "meetingId": "$id", "status": "ok", "title": "$title",
+            "startedAt": $at, "items": [ ${(0 until 40).joinToString(",") { """{ "id": "p$it", "kind": "task", "title": "$title item $it" }""" }} ] }"""
+        seed(meetings = long("m1", "First", yday) + "," + long("m2", "Second", yday - 60_000))
+        show(wide = true)
+        open("First")
+        compose.onNodeWithText("First item 39").performScrollTo()
+        compose.onNodeWithText("First item 0").assertIsNotDisplayed()
+        open("Second")
+        compose.onNodeWithText("Second item 0").assertIsDisplayed()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide keeps the entry it opened by default listed once answered, and through an empty refresh`() {
+        hub.seedFleet(twoOrgs())
+        show(wide = true)
+        waitFor("Item of Alpha sync")
+        hub.seedFleet("""{ "now": 1, "agents": [] }""")
+        hub.seedFleet(twoOrgs(answered))
+        waitFor("Every proposal is reviewed")
+        compose.onNode(hasText("Alpha sync", substring = true) and isSelected()).assertExists()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide keeps a tapped entry through an empty refresh`() {
+        hub.seedFleet(twoOrgs())
+        show(wide = true)
+        waitFor("Item of Alpha sync")
+        open("Zed sync")
+        waitFor("Item of Zed sync")
+        // A refresh listing nothing must not drop the pick back to the first entry.
+        hub.seedFleet("""{ "now": 1, "agents": [] }""")
+        waitGone("Zed sync")
+        hub.seedFleet(twoOrgs())
+        waitFor("Zed sync")
+        compose.waitForIdle()
+        compose.onNodeWithText("Item of Zed sync").assertExists()
+        compose.onNodeWithText("Item of Alpha sync").assertDoesNotExist()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `a fold drops a push still waiting for its org`() {
+        hub.seedFleet("""{ "now": 1, "agents": [] }""")
+        var push by mutableStateOf<String?>("a.atlassian.net")
+        var wide by mutableStateOf(true)
+        val vm = main.track(BriefViewModel(hub.app))
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = wide, openSite = push, onOpened = { push = null }) }
+        compose.waitForIdle()
+        assertEquals("a.atlassian.net", push)
+        wide = false
+        compose.waitForIdle()
+        hub.seedFleet(twoOrgs())
+        waitFor("Zed sync")
+        assertEquals(null, push)
+        wide = true
+        waitFor("Item of Alpha sync")
+        compose.onNodeWithText("Item of Zed sync").assertDoesNotExist()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide drops a push for an org out of scope instead of holding it`() {
+        hub.seedFleet(twoOrgs())
+        hub.container.org.set(setOf("b.atlassian.net"))
+        var push by mutableStateOf<String?>("a.atlassian.net")
+        val vm = main.track(BriefViewModel(hub.app))
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = true, openSite = push, onOpened = { push = null }) }
+        waitFor("Item of Alpha sync")
+        compose.waitUntil(10_000) { push == null }
+        hub.container.org.set(emptySet())
+        waitFor("Zed sync")
+        compose.onNodeWithText("Item of Alpha sync").assertExists()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide system Back closes an org's settings`() {
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [] }""")
+        seed()
+        show(wide = true)
+        compose.onNodeWithContentDescription("o settings").performClick()
+        compose.onNodeWithText("o · settings").assertExists()
+        compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
+        compose.onNodeWithText("o · settings").assertDoesNotExist()
+        compose.onNodeWithText("Run now").assertExists()
+    }
+
+    @Test fun `narrow still shows one pane at a time`() {
+        seed()
+        show()
+        compose.onNodeWithText("Run now").assertDoesNotExist()
+        open("Daily meeting")
+        compose.onNodeWithText("Run now").assertExists()
+        compose.onNodeWithText("Search meetings and proposals").assertDoesNotExist()
+        compose.onNodeWithText("‹ Back").performClick()
+        compose.onNodeWithText("Search meetings and proposals").assertExists()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide opens an org's settings in the entry pane and Back closes them`() {
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [] }""")
+        seed()
+        show(wide = true)
+        compose.onNodeWithContentDescription("o settings").performClick()
+        compose.onNodeWithText("o · settings").assertExists()
+        compose.onNodeWithText("Search meetings and proposals").assertExists()
+        compose.onNodeWithText("‹ Back").performClick()
+        compose.onNodeWithText("Run now").assertExists()
+    }
+
     @Test fun `Run now is off while a brief is being written`() {
-        seed(briefs = """{ "runId": "r", "status": "running", "meetingAt": ${now + 3_600_000} }""")
+        // The schedule's own next meeting (23:59 UTC): now+1h crossed it from 23:00 UTC on.
+        var at = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).withHour(23).withMinute(59).withSecond(0).withNano(0)
+        if (!at.toInstant().isAfter(java.time.Instant.now())) at = at.plusDays(1)
+        seed(briefs = """{ "runId": "r", "status": "running", "meetingAt": ${at.toInstant().toEpochMilli()} }""")
         show()
         open("Daily meeting")
         compose.onNodeWithText("Writing…").assertIsNotEnabled()
