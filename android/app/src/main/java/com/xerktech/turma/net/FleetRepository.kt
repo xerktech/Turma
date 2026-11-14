@@ -116,6 +116,8 @@ class FleetRepository(
     // bumped by a `calendar`, `holidaySettings` or `meetingProposals` frame (a
     // Tenir-only capture is announced only by the last) and by every stream
     // (re)open, which may have missed frames. The events are not on the snapshot.
+    // Each host's `online` as its last accepted `agent` frame said (guarded by byKey).
+    private val sseOnline = HashMap<String, Boolean>()
     private val _calendarFrames = MutableStateFlow(0)
     val calendarFrames: StateFlow<Int> = _calendarFrames
 
@@ -337,7 +339,7 @@ class FleetRepository(
     }
 
     private fun remove(key: String) {
-        synchronized(byKey) { byKey.remove(key) }
+        synchronized(byKey) { byKey.remove(key); sseOnline.remove(key) }
         emit(_state.value.now, null)
     }
 
@@ -355,10 +357,16 @@ class FleetRepository(
                 // record, so the calendar's "<host> is offline" notice would wait for the
                 // next read (XERK-2921, web brief.html). Count only an online FLIP: agent
                 // frames arrive every beat, and re-reading on each would cost a read per beat.
-                val was = synchronized(byKey) { byKey[it.key]?.online }
+                // The baseline is the last FRAME's value, never `byKey`: the 6s poll
+                // usually sees `online:false` before the hub's offline frame, and comparing
+                // against it would read the frame as no flip (QA). First sight falls back to
+                // the held record, as the web falls back to its snapshot.
+                val was = synchronized(byKey) { sseOnline[it.key] ?: byKey[it.key]?.online }
                 upsert(it)
-                val now = synchronized(byKey) { byKey[it.key]?.online }
-                if (was != null && now != null && was != now) _calendarFrames.value++
+                val took = synchronized(byKey) {
+                    (byKey[it.key] === it).also { took -> if (took) sseOnline[it.key] = it.online }
+                }
+                if (took && was != null && was != it.online) _calendarFrames.value++
             }
             "removed" -> runCatching { TurmaJson.decodeFromString<JsonObject>(data) }
                 .getOrNull()?.get("key")?.jsonPrimitive?.content?.let { remove(it) }

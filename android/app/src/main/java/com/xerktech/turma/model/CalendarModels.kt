@@ -187,9 +187,15 @@ private val CALENDAR_CONTROL = Regex("[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u
 
 internal fun cleanCalendarText(s: String): String = if (CALENDAR_CONTROL.containsMatchIn(s)) CALENDAR_CONTROL.replace(s, "") else s
 
-/** Every string in [e] (values only; keys are the wire's) through [cleanCalendarText]. */
+// Keys that IDENTIFY a row and are sent back to the hub or matched against its ids:
+// never cleaned, or an id the hub accepts (CAL_ID_RE allows zero-width marks) would
+// round-trip as one it doesn't have (QA).
+private val CALENDAR_ID_KEYS = setOf("host", "id", "seriesId", "org", "matchOrg", "site", "meetingId", "calendarEventId")
+
+/** Every display string in [e] (values only, id keys kept as sent) through [cleanCalendarText]. */
 internal fun cleanCalendarJson(e: JsonElement): JsonElement = when (e) {
-    is kotlinx.serialization.json.JsonObject -> kotlinx.serialization.json.JsonObject(e.mapValues { cleanCalendarJson(it.value) })
+    is kotlinx.serialization.json.JsonObject -> kotlinx.serialization.json.JsonObject(
+        e.mapValues { (k, v) -> if (k in CALENDAR_ID_KEYS) v else cleanCalendarJson(v) })
     is JsonArray -> JsonArray(e.map { cleanCalendarJson(it) })
     is kotlinx.serialization.json.JsonPrimitive ->
         if (e.isString) kotlinx.serialization.json.JsonPrimitive(cleanCalendarText(e.content)) else e

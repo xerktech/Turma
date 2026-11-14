@@ -438,5 +438,11 @@ class CalendarTest {
         assertEquals("Laptop", a.hosts.single().device)
         assertEquals("bad", a.hosts.single().lastError)
         assertEquals("plain é 日本", com.xerktech.turma.model.cleanCalendarText("plain é 日本"))
+        // Ids round-trip to the hub as sent (its CAL_ID_RE accepts zero-width marks).
+        val b = TurmaJson.decodeFromString<CalendarAnswer>(
+            "{\"events\":[{\"host\":\"h\\u200b1\",\"id\":\"a\\ufeffb\",\"seriesId\":\"s\\u2060\",\"startMs\":1,\"endMs\":2}]}")
+        assertEquals("a\ufeffb", b.events.single().id)
+        assertEquals("h\u200b1", b.events.single().host)
+        assertEquals("s\u2060", b.events.single().seriesId)
     }
 }

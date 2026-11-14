@@ -42,4 +42,16 @@ class FleetCalendarFlipTest {
         fleet.onSseEvent("agent", "{not json")
         assertEquals(start + 2, fleet.calendarFrames.value)
     }
+
+    @Test
+    fun `the offline frame still re-reads when the poll saw offline first`() {
+        // The hub's /api/agents reads online:false ~11s before its offline sweep's frame,
+        // and the 6s poll usually lands in that window (QA, real hub).
+        val fleet = hub.container.fleet
+        fleet.onSseEvent("agent", agent(true))
+        hub.seedFleet("""{"now":100,"agents":[${agent(false)}]}""")
+        val start = fleet.calendarFrames.value
+        fleet.onSseEvent("agent", agent(false))
+        assertEquals(start + 1, fleet.calendarFrames.value)
+    }
 }
