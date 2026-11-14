@@ -85,6 +85,8 @@ class TurmaAppDeepLinkTest {
         compose.waitForIdle()
         assertTrue("the meetings link must be consumed", consumed)
         compose.onAllNodes(hasText("Meetings") and isSelected()).assertCountEquals(1)
+        // The tab's header names the page too (XERK-2893), not the old "Brief".
+        compose.onAllNodes(hasText("Brief")).assertCountEquals(0)
     }
 
     /** A click path naming no tab is consumed but moves nothing: the app stays on the Dashboard. */
@@ -101,6 +103,6 @@ class TurmaAppDeepLinkTest {
         }
         compose.waitForIdle()
         assertTrue("the link must be consumed", consumed)
-        compose.onAllNodes(hasText("Brief") and isSelected()).assertCountEquals(0)
+        compose.onAllNodes(hasText("Meetings") and isSelected()).assertCountEquals(0)
     }
 }

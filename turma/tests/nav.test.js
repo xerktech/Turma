@@ -22,6 +22,12 @@ test("nav: every page's tab is in the list, once", () => {
   assert.equal(new Set(ids).size, ids.length);
 });
 
+test("XERK-2893: the Brief tab is now Meetings, at /meetings", () => {
+  const m = PAGES.find(p => p.id === "meetings");
+  assert.equal(m.label, "Meetings");
+  assert.equal(m.href, "/meetings");
+});
+
 test("nav: exactly one tab is marked active, and only the named one", () => {
   for (const p of PAGES) {
     const html = tabsHtml(p.id);

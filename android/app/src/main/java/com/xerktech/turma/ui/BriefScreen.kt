@@ -268,7 +268,7 @@ fun BriefScreen(
     }
 
     Column(modifier.fillMaxSize()) {
-        ScreenHeader("Brief")
+        ScreenHeader("Meetings")
         when {
             wide -> Row(Modifier.weight(1f).fillMaxWidth()) {
                 list(Modifier.width(360.dp).fillMaxHeight())
