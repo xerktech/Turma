@@ -809,20 +809,25 @@ async function fetchMeta(site, project, retry = false) {
   return { error: "the host didn't answer in time" };
 }
 function ensureMeta(site, retry = false) {
-  if (meta.has(site)) return void ensureTypes(site);
+  if (meta.has(site)) return void ensureTypes(site, retry);
   meta.set(site, { loading: true });
   fetchMeta(site, "", retry).then((d) => {
     meta.set(site, d.error ? { error: d.error } : { projects: Array.isArray(d.projects) ? d.projects : [] });
-    ensureTypes(site);
+    ensureTypes(site, retry);
     repaint();
   });
 }
-function ensureTypes(site) {
+// A failed types load is asked again only on an operator's act (`retry`: a project
+// pick, Edit, Approve, Retry), never from a repaint: every repaint calls this, and
+// each answer repaints, so a repaint-driven refetch re-asked the tracker every few
+// seconds for as long as the page stayed open (XERK-2885 QA).
+function ensureTypes(site, retry = false) {
   const p = projectOf(site);
   if (!p) return null;
   const k = `${site}\u0000${p}`;
-  if (types.has(k) && !types.get(k).error) return types.get(k).promise || Promise.resolve();
-  const promise = fetchMeta(site, p, types.has(k)).then((d) => {
+  const cur = types.get(k);
+  if (cur && (!cur.error || !retry)) return cur.promise || Promise.resolve();
+  const promise = fetchMeta(site, p, !!cur).then((d) => {
     types.set(k, d.error ? { error: d.error } : { types: Array.isArray(d.types) ? d.types : [] });
     repaint();
   });
@@ -884,7 +889,7 @@ async function review(k, action, start = false) {
     if (it.kind !== "decision") {
       const project = projectOf(site);
       if (!project) return void fail("Pick a project for new tickets first");
-      await ensureTypes(site);
+      await ensureTypes(site, true);
       const t = types.get(`${site}\u0000${project}`) || {};
       if (t.error) return void fail(`Approving failed — ${t.error}`);
       const issueType = (e && e.issueType) || defaultType(it.kind, t.types);
@@ -971,7 +976,7 @@ function startEdit(k) {
     description: it.kind === "decision" ? (it.description || "") : ticketDescription(m, it) };
   edits.set(k, { ...draft, initial: { ...draft },
     issueType: it.kind === "decision" ? "" : defaultType(it.kind, t && t.types) });
-  if (it.kind !== "decision") ensureTypes(site);
+  if (it.kind !== "decision") ensureTypes(site, true);
   repaint(true);
 }
 function select(key) {
@@ -1108,7 +1113,7 @@ function mount(el, pageHooks = {}) {
     }
     if (d.project !== undefined) {
       setProject(d.project, t.value);
-      ensureTypes(d.project);
+      ensureTypes(d.project, true);
       for (const [k, e] of edits) if (k.startsWith(`${encodeURIComponent(d.project)}/`)) e.issueType = "";
       repaint(true);
     } else if (d.editType !== undefined) {

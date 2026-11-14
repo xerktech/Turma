@@ -323,3 +323,23 @@ test("newticket: mount wires the shared modal Tab trap to the document", () => {
     assert.equal(seen[0][1], doc);
   } finally { B.trapModalTab = orig; }
 });
+
+test("newticket: opening the form asks the hub to skip a cached failure, first request only (XERK-2885)", async () => {
+  const urls = [];
+  const prev = global.fetch;
+  let n = 0;
+  global.fetch = (u) => {
+    urls.push(String(u));
+    const pending = n++ === 0;
+    return Promise.resolve({ status: pending ? 202 : 200, ok: true,
+      json: () => Promise.resolve(pending ? { pending: true } : { projects: [{ key: "A" }, { key: "B" }], labels: [] }) });
+  };
+  try {
+    const { button } = mountNT();
+    NT.update({ agents: [agent("h1", "acme.atlassian.net")] });
+    for (const fn of button._listeners.click || []) fn({});
+    for (let i = 0; i < 100 && urls.length < 2; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(urls, ["/api/jira/acme.atlassian.net/create-meta?retry=1",
+      "/api/jira/acme.atlassian.net/create-meta"]);
+  } finally { global.fetch = prev; }
+});

@@ -160,6 +160,20 @@ class MeetingsWiringTest {
         assertTrue(paths.last { !it.contains("project=") }.endsWith("/create-meta?retry=1"))
     }
 
+    @Test fun `the board's New-ticket sheet asks the hub to skip a cached failure`() {
+        // XERK-2885: opening the sheet is the operator asking again (the web modal's mirror).
+        seed()
+        val paths = java.util.concurrent.CopyOnWriteArrayList<String>()
+        hub.route("/api/jira/$site/create-meta") { r ->
+            paths += r.path.orEmpty()
+            MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("""{ "projects": [ { "key": "ENG" } ] }""")
+        }
+        val vm = main.track(BoardViewModel(hub.app))
+        kotlinx.coroutines.runBlocking { vm.fetchCreateMeta(site, null) }
+        assertEquals(listOf("/api/jira/$site/create-meta?retry=1"), paths.toList())
+    }
+
     @Test fun `a second press while an Approve awaits its types posts nothing`() {
         seed()
         val release = java.util.concurrent.CountDownLatch(1)
