@@ -299,7 +299,8 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   stays under `CALENDAR_ERROR_MAX`. Tests: `test_interop_*` (`test_session_cli.py`),
   `test_install_wsl_interop.sh`.
 - **The wsl.conf reader is mirrored** — `wsl_conf_interop_off` (py) ⇄ `_wsl_interop_disabled`
-  (install.sh), both as WSL's ParseBool reads it (`false`/`0`, quotes, `#`, last value wins); an
+  (install.sh), both as WSL's own parser reads it (`false`/`0`, `#` outside `"` quotes, inner spaces kept,
+  the FIRST `enabled` wins even if invalid); an
   interop-off host is told so, never sent to the installer that refuses it. `WSLInterop-late`
   (older WSL 2.x) counts as registered on both sides.
 - **It only ATTACHES to a running classic Outlook (`GetActiveObject`), never starts one.** A COM

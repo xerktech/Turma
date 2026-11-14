@@ -289,15 +289,24 @@ ensure_glab() {
 : "${BINFMT_MISC:=/proc/sys/fs/binfmt_misc}"
 : "${BINFMT_D:=/etc/binfmt.d}"
 WSL_INTEROP_RULE=':WSLInterop:M::MZ::/init:PF'
-_wsl_interop_disabled() {  # [interop] enabled is false/0 in wsl.conf (WSL's own ParseBool)
-  # WSL's parser: `#` starts a comment, values may be quoted, case is ignored,
-  # and the last `enabled` in the section wins.
+_wsl_interop_disabled() {  # [interop] enabled reads false in wsl.conf, as WSL reads it
+  # WSL's own parser (configfile.cpp + ParseBool): `#` outside quotes starts a
+  # comment, only `"` quotes, inner spaces are kept, case is ignored, and the
+  # FIRST `enabled` wins (a later one is a "duplicated" warning) even when it
+  # is not a valid bool — which leaves interop at its default, on.
+  # Mirrors session_cli.py's wsl_conf_interop_off.
   [ -r "$WSL_CONF" ] && awk '
-    { l = $0; sub(/\r$/, "", l); sub(/#.*/, "", l); gsub(/[[:space:]]/, "", l); l = tolower(l) }
-    l ~ /^\[.*\]$/ { sec = l; next }
-    sec == "[interop]" && l ~ /^enabled=/ {
-      v = substr(l, 9); gsub(/["\047]/, "", v)
-      off = (v == "false" || v == "0")
+    { t = $0; sub(/\r$/, "", t); sub(/^[ \t]+/, "", t) }
+    t == "" || t ~ /^#/ { next }
+    t ~ /^\[/ { s = t; sub(/#.*/, "", s); gsub(/[ \t]/, "", s); sec = tolower(s); next }
+    sec == "[interop]" && !seen {
+      i = index(t, "="); if (!i) next
+      k = tolower(substr(t, 1, i - 1)); sub(/[ \t]+$/, "", k); if (k != "enabled") next
+      v = substr(t, i + 1); sub(/^[ \t]+/, "", v)
+      if (substr(v, 1, 1) == "\"") {
+        v = substr(v, 2); j = index(v, "\""); v = j ? substr(v, 1, j - 1) : "\001"
+      } else { sub(/#.*/, "", v); sub(/[ \t]+$/, "", v) }
+      seen = 1; v = tolower(v); off = (v == "false" || v == "0")
     }
     END { exit !off }' "$WSL_CONF"
 }

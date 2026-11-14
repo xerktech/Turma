@@ -560,13 +560,18 @@ class CalendarTest(unittest.TestCase):
         operator there; every spelling WSL reads as false counts."""
         for conf in ("[interop]\nenabled=false\n", "[interop]\nenabled=0\n",
                      '[interop] # x\nEnabled = "False" # no\n',
-                     "[boot]\nsystemd=true\r\n[interop]\r\nenabled=true\r\nenabled=false\r\n"):
+                     "[boot]\nsystemd=true\r\n[interop]\r\nenabled=false\r\nenabled=true\r\n",
+                     "[interop]\nenabled=false\n[interop]\nenabled=true\n"):
             with self.subTest(conf=conf):
                 msg = self._interop_off(None, conf=conf)
                 self.assertIn("turned off in", msg)
                 self.assertNotIn("installer", msg)
-        for conf in ("[automount]\nenabled=false\n", "[interop]\nenabled=false\nenabled=1\n",
-                     "[interop]\n#enabled=false\n"):
+        # WSL keeps the FIRST value, even an invalid one; only `"` quotes; inner
+        # spaces and a `#` inside quotes are part of the value.
+        for conf in ("[automount]\nenabled=false\n", "[interop]\nenabled=true\nenabled=false\n",
+                     "[interop]\nenabled=off\nenabled=false\n", "[interop]\n#enabled=false\n",
+                     "[interop]\nenabled='false'\n", '[interop]\nenabled="false#x"\n',
+                     "[interop]\nenabled = fal se\n", '[interop]\nenabled="false\n'):
             with self.subTest(conf=conf):
                 self.assertIn("not registered", self._interop_off(None, conf=conf))
 

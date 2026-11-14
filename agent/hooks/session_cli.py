@@ -329,22 +329,37 @@ WSL_CONF = "/etc/wsl.conf"
 
 
 def wsl_conf_interop_off(path=None) -> bool:
-    """True when wsl.conf sets `[interop] enabled` false/0, read as WSL reads
-    it: `#` comments, quotes and case ignored, the last value wins. Mirrors
-    install.sh's `_wsl_interop_disabled`."""
+    """True when wsl.conf's `[interop] enabled` reads false, as WSL's own
+    parser reads it (configfile.cpp + ParseBool): `#` outside quotes starts a
+    comment, only `"` quotes, inner spaces are kept, case is ignored, and the
+    FIRST `enabled` wins even when it is no valid bool (interop then stays on).
+    Mirrors install.sh's `_wsl_interop_disabled`."""
     try:
         with open(path or WSL_CONF, encoding="utf-8", errors="replace") as fh:
             lines = fh.read(1 << 16).splitlines()
     except OSError:
         return False
-    sec, off = "", False
+    sec = ""
     for raw in lines:
-        line = re.sub(r"\s", "", raw.split("#", 1)[0]).lower()
-        if line.startswith("[") and line.endswith("]"):
-            sec = line
-        elif sec == "[interop]" and line.startswith("enabled="):
-            off = line[8:].strip("\"'") in ("false", "0")
-    return off
+        t = raw.lstrip(" \t")
+        if not t or t.startswith("#"):
+            continue
+        if t.startswith("["):
+            sec = re.sub(r"[ \t]", "", t.split("#", 1)[0]).lower()
+            continue
+        if sec != "[interop]" or "=" not in t:
+            continue
+        key, v = t.split("=", 1)
+        if key.rstrip(" \t").lower() != "enabled":
+            continue
+        v = v.lstrip(" \t")
+        if v.startswith('"'):
+            end = v.find('"', 1)
+            v = v[1:end] if end > 0 else "\x01"
+        else:
+            v = v.split("#", 1)[0].rstrip(" \t")
+        return v.lower() in ("false", "0")
+    return False
 
 
 def wsl_interop_hint(binfmt_misc=None, wsl_conf=None) -> str:
