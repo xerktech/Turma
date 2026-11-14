@@ -43905,7 +43905,7 @@ class TestStageCreateTicket(ManagerMixin, unittest.TestCase):
             took = time.monotonic() - t0
         hold.set()
         self.assertLess(took, 10)
-        self.assertIn("a (ran out of time)", rows[0]["warning"])
+        self.assertIn("a (timed out, it may still appear on the ticket)", rows[0]["warning"])
 
     def test_xerk2935_no_file_starts_past_the_deadline(self):
         ok = {"key": "ENG-9", "url": "u", "assigned": True}

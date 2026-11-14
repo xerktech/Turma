@@ -41733,8 +41733,9 @@ class SessionManager:
                 # bytes never trips them: the whole file gets the time left.
                 why = _call_with_deadline(one, max(left, 1.0))
             except TimeoutError:
-                log(f"ticket {key}: attaching {name} ran past the deadline; giving up on it")
-                why = "ran out of time"
+                # The abandoned upload may still finish, so never claim it failed.
+                log(f"ticket {key}: attaching {name} ran past the deadline; no longer waiting")
+                why = "timed out, it may still appear on the ticket"
             except Exception as e:
                 log(f"ticket {key}: attaching {name} failed: {e}")
                 why = str(e)[:120]
