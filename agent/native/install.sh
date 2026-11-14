@@ -290,33 +290,80 @@ ensure_glab() {
 : "${BINFMT_D:=/etc/binfmt.d}"
 WSL_INTEROP_RULE=':WSLInterop:M::MZ::/init:PF'
 _wsl_interop_disabled() {  # [interop] enabled reads false in wsl.conf, as WSL reads it
-  # WSL's own parser (configfile.cpp + ParseBool): `#` outside quotes starts a
-  # comment, only `"` quotes (toggling anywhere in the value; an unterminated
-  # one voids the line), inner spaces are kept, case is ignored, and the
-  # FIRST `enabled` wins (a later one is a "duplicated" warning) even when it
-  # is not a valid bool — which leaves interop at its default, on. Backslash
-  # escapes are not handled (WSL's are; no real interop value uses one).
-  # Mirrors session_cli.py's wsl_conf_interop_off.
-  [ -r "$WSL_CONF" ] && awk '
-    { t = $0; sub(/\r$/, "", t); sub(/^[ \t]+/, "", t) }
-    t == "" || t ~ /^#/ { next }
-    t ~ /^\[/ { s = t; sub(/#.*/, "", s); gsub(/[ \t]/, "", s); sec = tolower(s); next }
-    sec == "[interop]" && !seen {
-      i = index(t, "="); if (!i) next
-      k = tolower(substr(t, 1, i - 1)); sub(/[ \t]+$/, "", k); if (k != "enabled") next
-      raw = substr(t, i + 1); sub(/^[ \t]+/, "", raw); v = ""; q = 0; keep = 0
-      for (n = 1; n <= length(raw); n++) {  # `"` toggles quoting anywhere
-        c = substr(raw, n, 1)
-        if (c == "\"") { q = !q; keep = length(v) }
-        else if (c == "#" && !q) break
-        else { v = v c; if (q) keep = length(v) }
-      }
-      if (q) next  # unterminated quote: an invalid line, it claims nothing
-      tail = substr(v, keep + 1); sub(/[ \t]+$/, "", tail)  # quoted spaces stay
-      v = substr(v, 1, keep) tail
-      seen = 1; v = tolower(v); off = (v == "false" || v == "0")
+  # A port of WSL's own parser (configfile.cpp + ParseBool) — the rules are in
+  # session_cli.py's wsl_conf_interop_off, which this mirrors byte for byte
+  # (agent/tests/test_session_cli.py's parity test runs both). Read per line,
+  # so a `\` continuation carries the value state into the next record; one
+  # that ends the file with no newline is an invalid escape (WSL hits EOF).
+  [ -r "$WSL_CONF" ] || return 1
+  local nonl=0
+  if [ -n "$(tail -c1 "$WSL_CONF")" ]; then nonl=1; fi
+  LC_ALL=C awk -v nonl="$nonl" '
+    function hs(c) { return c == " " || c == "\t" }
+    function alpha(c) { return c != "" && index("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", c) }
+    function alnum(c) { return alpha(c) || (c != "" && index("0123456789", c)) }
+    function claim() {  # a valid value line: the FIRST interop.enabled one decides
+      if (want && !seen) { seen = 1; v = tolower(substr(v, 1, trimmed)); off = (v == "false" || v == "0") }
     }
-    END { exit !off }' "$WSL_CONF"
+    function value(t, k, n,   c, c2) {  # returns where the line resumes; n + 1 skips it
+      while (k <= n) {
+        c = substr(t, k, 1)
+        if (c == "\r") break
+        if (c == "\"") q = !q
+        else if (c == "\\") {
+          if (k == n) { cont = 1; trimmed = length(v); return n + 1 }  # continuation
+          c2 = substr(t, ++k, 1)
+          if (c2 == "\\" || c2 == "\"") v = v c2
+          else if (c2 == "b") v = v "\b"
+          else if (c2 == "n") v = v "\n"
+          else if (c2 == "t") v = v "\t"
+          else return n + 1  # an invalid escape voids the line
+        }
+        else if (c == "#" && !q) { claim(); return n + 1 }
+        else v = v c
+        if (!hs(c)) trimmed = length(v)
+        k++
+      }
+      if (!q) claim()  # an unterminated quote voids the line
+      return q ? n + 1 : k
+    }
+    function header(t, p, n,   j, k, m, c, name) {
+      j = k = p + 1
+      if (!alpha(substr(t, j, 1))) return n + 1  # never reached the name: the section stands
+      while (alnum(substr(t, k, 1))) k++
+      name = substr(t, j, k - j); m = k + 1
+      if (substr(t, k, 1) == "]") {
+        while (hs(substr(t, m, 1))) m++
+        c = substr(t, m, 1)
+        if (m > n || c == "\r" || c == "#") { sec = name; seclen = length(name); return c == "#" ? n + 1 : m }
+      }
+      sec = length(name) >= seclen ? substr(name, 1, seclen) : "\001"  # WSL truncates its buffer
+      return n + 1
+    }
+    function keyval(t, p, n,   k, key) {
+      k = p
+      while (alnum(substr(t, k, 1))) k++
+      key = substr(t, p, k - p)
+      while (hs(substr(t, k, 1))) k++
+      if (substr(t, k, 1) != "=") return n + 1
+      k++
+      while (hs(substr(t, k, 1))) k++
+      want = tolower(sec) == "interop" && tolower(key) == "enabled"
+      v = ""; trimmed = 0; q = 0
+      return value(t, k, n)
+    }
+    {
+      t = $0; n = length(t); p = 1
+      if (cont) { cont = 0; p = value(t, 1, n) }
+      while (p <= n) {
+        c = substr(t, p, 1)
+        if (hs(c) || c == "\r") p++
+        else if (c == "#" || (c != "[" && !alpha(c))) p = n + 1
+        else if (c == "[") p = header(t, p, n)
+        else p = keyval(t, p, n)
+      }
+    }
+    END { if (cont && !nonl && !q) claim(); exit !off }' "$WSL_CONF"
 }
 ensure_wsl_interop() {
   grep -qi microsoft "$WSL_OSRELEASE" 2>/dev/null || return 0

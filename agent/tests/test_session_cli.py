@@ -807,5 +807,81 @@ class CalendarSyncReaderTest(unittest.TestCase):
         self.assertFalse(ev["isOnlineMeeting"])
 
 
+@unittest.skipUnless(shutil.which("bash") and shutil.which("awk"), "needs bash + awk")
+class WslConfReaderTest(unittest.TestCase):
+    """wsl.conf's `[interop] enabled`, read as WSL's configfile.cpp reads it
+    (XERK-2945), by both mirrors: session_cli.py and install.sh's awk."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        with open(os.path.join(AGENT_DIR, "native", "install.sh")) as fh:
+            src = fh.read()
+        start = src.index("_wsl_interop_disabled() {")
+        self.fn = src[start:src.index("\n}\n", start) + 3]
+
+    def both(self, conf: bytes):
+        path = os.path.join(self.tmp, "wsl.conf")
+        with open(path, "wb") as fh:
+            fh.write(conf)
+        sh = subprocess.run(["bash", "-c", self.fn + '_wsl_interop_disabled'],
+                            env={**os.environ, "WSL_CONF": path}, timeout=10).returncode == 0
+        return cli.wsl_conf_interop_off(path), sh
+
+    def test_escapes_and_headers_as_wsl_reads_them(self):
+        cases = {
+            b"[interop]\nenabled=tr\\ue\nenabled=false\n": True,      # invalid escape voids line 2
+            b"[interop]\nenabled=fal\\\nse\n": True,                  # line continuation
+            b"[interop]\nenabled=fal\\\r\nse\n": False,               # CRLF: `\` + \r is invalid
+            b"[interop]\nenabled=fal\\": False,                        # `\` then EOF: invalid
+            b"[interop]\nenabled=false\\\n": True,                     # continuation, then EOF
+            b"[interop]\nenabled=\\\"false\\\"\n": False,              # escaped quotes stay
+            b"[interop]\nenabled=false\\t\n": False,                   # escaped tab not trimmed
+            b"[interop]\nenabled=\\x\nenabled=0\n": True,
+            b"[ interop ]\nenabled=false\n": False,                    # invalid header: no section
+            b"[interop]\n[ boot ]\nenabled=false\n": True,             # ...and the old one stands
+            b"[interop]\n[automount x\nenabled=false\n": False,        # buffer now `automou`
+            b"[interop]\n[interopX y\nenabled=false\n": True,          # buffer truncated: `interop`
+            b"[interop]\n[ab c\nenabled=false\n": False,               # shorter: unmatchable
+            b"[interop]x\nenabled=false\n": False,
+            b"[interop]\renabled=false\n": True,                       # \r ends the header
+            b"[interop]\n#x\renabled=false\n": False,                  # but not a comment
+            b"[interop]\nen_abled=false\nenabled=false\n": True,
+            b"[Interop]\nENABLED=FALSE\n": True,
+        }
+        for conf, off in cases.items():
+            with self.subTest(conf=conf):
+                self.assertEqual(self.both(conf), (off, off))
+
+    def test_the_mirrors_agree_on_fuzzed_configs(self):
+        import random
+        rng = random.Random(2945)
+        heads = ["[interop]", "[boot]", "[ interop ]", "[inter", "[interopZ x", "[interop] #c",
+                 "[interop]x", "#[interop]"]
+        keys = ["enabled", "Enabled", " enabled ", "en abled", "#enabled", "enabled\t"]
+        vals = ["false", "0", "true", "False", '"', "\\", "\\\\", '\\"', "\\n", "\\u", "#",
+                " ", "\t", "x", "\\\n", "\r", "fal", "se"]
+        ends = ["\n", "\r\n", "\r", ""]
+        seen = set()
+        for _ in range(300):
+            lines = []
+            for _ in range(rng.randint(1, 4)):
+                if rng.random() < 0.3:
+                    lines.append(rng.choice(heads))
+                else:
+                    value = "".join(rng.choice(vals) for _ in range(rng.randint(0, 3)))
+                    if rng.random() < 0.4:          # mostly-valid spellings, lightly mangled
+                        value = rng.choice(["false", "0", '"false"', "FALSE"]) + value[:1]
+                    lines.append(rng.choice(keys) + "=" + value)
+            conf = "".join(line + rng.choice(ends) for line in lines)
+            if rng.random() < 0.7:
+                conf = "[interop]\n" + conf
+            py, sh = self.both(conf.encode())
+            self.assertEqual(py, sh, repr(conf))
+            seen.add(py)
+        self.assertEqual(seen, {True, False})   # the corpus reaches both answers
+
+
+
 if __name__ == "__main__":
     unittest.main()
