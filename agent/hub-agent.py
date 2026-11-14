@@ -5516,6 +5516,142 @@ def calendar_directive(cli_path=None, wsl=None):
     return CALENDAR_SYSTEM_PROMPT.format(cli=cli)
 
 
+# ---- the Calendar sync (XERK-2895, contract-calendar.md) ---------------------
+# A background worker reads this host's classic Outlook through the session
+# CLI's reader (hooks/session_cli.py, the ONE Outlook reader) every
+# CALENDAR_SYNC_EVERY_SEC and on the hub's `syncCalendar`, and stages rows on the
+# `calendarSync` heartbeat outbox. Never on the beat (contract-agent-hub.md).
+CALENDAR_SYNC_EVERY_SEC = max(60, _env_int("TURMA_CALENDAR_SYNC_MIN", 15) * 60)
+CALENDAR_WEEK_MS = 7 * 86400000
+# Week chunks start on a UTC Monday (1970-01-05), so the scheduled window's
+# chunks keep the same keys from run to run and their hashes compare.
+CALENDAR_MONDAY_MS = 4 * 86400000
+# The hub's default window (its CALENDAR_PAST_MS / CALENDAR_FUTURE_MS) and caps
+# (CALENDAR_SPAN_MAX_MS, CALENDAR_SYNC_ROWS_MAX): mirror them, never exceed them.
+CALENDAR_PAST_WEEKS = 8
+CALENDAR_FUTURE_WEEKS = 26
+CALENDAR_SPAN_MAX_MS = 40 * CALENDAR_WEEK_MS
+CALENDAR_SYNC_ROWS_MAX = 2
+# One merged row stays well under the hub's 1500 events / 2 MiB, which refuse it
+# whole, and under the smallest heartbeat body a hub states (HEARTBEAT_BODY_MIN):
+# a beat carries a second row only while both fit CALENDAR_BEAT_BYTES_MAX, so the
+# outbox never makes a beat the hub refuses (a refused beat reads offline).
+CALENDAR_ROW_EVENTS_MAX = 1000
+CALENDAR_ROW_BYTES_MAX = 512 << 10
+CALENDAR_BEAT_BYTES_MAX = 640 << 10
+# Weeks read per PowerShell run: each run is bounded by the reader's timeout.
+CALENDAR_WEEKS_PER_READ = 4
+# Undelivered rows kept while the hub is away; past it the oldest drop and every
+# window is re-sent next run (their hashes are forgotten).
+CALENDAR_OUTBOX_MAX = 40
+CALENDAR_ERROR_MAX = 300
+
+_SESSION_CLI_MODULE = None
+
+
+def session_cli_module():
+    """The session CLI loaded as a module (its calendar reader). Loaded once,
+    by path: `hooks/` is no package. Raises on a missing or broken file."""
+    global _SESSION_CLI_MODULE
+    if _SESSION_CLI_MODULE is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("turma_session_cli", session_cli_path())
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _SESSION_CLI_MODULE = mod
+    return _SESSION_CLI_MODULE
+
+
+def calendar_host_kind():
+    """"wsl" / "windows" when this host can reach a Windows user's Outlook,
+    else None (the calendar sync is off and the hub never asks)."""
+    if IS_WINDOWS:
+        return "windows"
+    return "wsl" if _is_wsl() else None
+
+
+def calendar_weeks(from_ms, until_ms):
+    """[from, until) cut at every UTC Monday: the sync's chunks, in order."""
+    out, f = [], from_ms
+    while f < until_ms:
+        nxt = ((f - CALENDAR_MONDAY_MS) // CALENDAR_WEEK_MS + 1) * CALENDAR_WEEK_MS + CALENDAR_MONDAY_MS
+        out.append((f, min(nxt, until_ms)))
+        f = out[-1][1]
+    return out
+
+
+def calendar_default_window(now_ms):
+    """The scheduled window: the hub's default, widened to whole grid weeks."""
+    f = now_ms - CALENDAR_PAST_WEEKS * CALENDAR_WEEK_MS
+    u = now_ms + CALENDAR_FUTURE_WEEKS * CALENDAR_WEEK_MS
+    f = (f - CALENDAR_MONDAY_MS) // CALENDAR_WEEK_MS * CALENDAR_WEEK_MS + CALENDAR_MONDAY_MS
+    u = -((CALENDAR_MONDAY_MS - u) // CALENDAR_WEEK_MS) * CALENDAR_WEEK_MS + CALENDAR_MONDAY_MS
+    return f, u
+
+
+def calendar_events_hash(events):
+    """A window's content hash, independent of Outlook's enumeration order."""
+    blob = json.dumps(sorted(events, key=lambda e: (e.get("start", ""), e.get("id", ""))),
+                      sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def validate_calendar_command(cmd):
+    """A `syncCalendar` command -> ((from, until), None) or (None, error)."""
+    if not isinstance(cmd, dict):
+        return None, "not a command object"
+    f, u = cmd.get("from"), cmd.get("until")
+    if not all(isinstance(x, int) and not isinstance(x, bool) and 0 < x < 2 ** 53 for x in (f, u)):
+        return None, "from/until must be epoch ms"
+    if u <= f or u - f > CALENDAR_SPAN_MAX_MS:
+        return None, "until must be after from, at most 40 weeks later"
+    return (f, u), None
+
+
+def calendar_sync_rows(chunks, synced_at):
+    """Send-worthy chunks [(from, until, events)] -> wire rows, ADJACENT chunks
+    merged while a row stays under CALENDAR_ROW_EVENTS_MAX / _BYTES_MAX (a merged
+    row is authoritative for the union of complete windows, so still exact).
+    Events repeated across chunks (a meeting spanning a week edge) ride once.
+    A single chunk over the byte cap becomes an error row: sent whole it would
+    be refused, and cut it would not be authoritative."""
+    rows, cur, cur_ids, cur_bytes = [], None, set(), 0
+
+    def close():
+        if cur is not None:
+            rows.append(cur)
+
+    for f, u, events in chunks:
+        fresh = [e for e in events if e.get("id") not in cur_ids] if cur else list(events)
+        size = len(json.dumps(fresh, ensure_ascii=False).encode("utf-8"))
+        if (cur is not None and cur["windowUntil"] == f
+                and len(cur["events"]) + len(fresh) <= CALENDAR_ROW_EVENTS_MAX
+                and cur_bytes + size <= CALENDAR_ROW_BYTES_MAX
+                and u - cur["windowFrom"] <= CALENDAR_SPAN_MAX_MS):
+            cur["events"].extend(fresh)
+            cur["windowUntil"] = u
+            cur_ids.update(e.get("id") for e in fresh)
+            cur_bytes += size
+            continue
+        close()
+        cur = None
+        size = len(json.dumps(events, ensure_ascii=False).encode("utf-8"))
+        if size > CALENDAR_ROW_BYTES_MAX or len(events) > CALENDAR_ROW_EVENTS_MAX:
+            rows.append({"windowFrom": f, "windowUntil": u, "syncedAt": synced_at,
+                         "error": (f"the week from {_iso_day(f)} holds {len(events)} events "
+                                   f"({size >> 10} KiB), over the {CALENDAR_ROW_BYTES_MAX >> 10} "
+                                   "KiB a sync row may carry; that week was not synced")})
+            continue
+        cur = {"windowFrom": f, "windowUntil": u, "syncedAt": synced_at, "events": list(events)}
+        cur_ids, cur_bytes = {e.get("id") for e in events}, size
+    close()
+    return rows
+
+
+def _iso_day(ms):
+    return datetime.datetime.fromtimestamp(ms / 1000, tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
 def qwen_ask_mcp_path():
     """Absolute path to the qwen AskUserQuestion MCP server (``qwen/ask_mcp.py``,
     XERK-509 [Qwen C]). Qwen's OWN native ``ask_user_question`` renders in-pane and
@@ -28826,6 +28962,25 @@ class SessionManager:
         # re-sends after losing the delivered answer (a crash before its write).
         self._dbrief_answered = {}
         self.daily_brief_results = []
+        # The Calendar sync (XERK-2895): ONE worker (`_calendar_worker_loop`) reads
+        # Outlook off the beat; `calendar_results` is the `calendarSync` outbox,
+        # cleared BY IDENTITY once a beat carried it. `_cal_want` is a hub
+        # `syncCalendar` window owed (a newer one replaces it); `_cal_hashes`
+        # (week start -> content hash) is what the hub was last sent for that
+        # week. Under `_cal_lock`: the worker appends while the beat snapshots.
+        self._cal_lock = threading.Lock()
+        self._cal_wake = threading.Event()
+        self._cal_worker = None
+        self._cal_want = None
+        self._cal_next_at = time.monotonic() + CALENDAR_SYNC_EVERY_SEC
+        self._cal_hashes = {}
+        self._cal_last_error = None
+        self._cal_said_off = False
+        self.calendar_results = []
+        self._cal_sizes = {}             # id(row) -> its JSON bytes, sized off the beat
+        self.calendar_kind = calendar_host_kind()
+        if self.calendar_kind is None:
+            log("calendar: no Outlook here (not a WSL or Windows host); calendar sync is off")
         # Meeting extraction (XERK-2509), the daily brief's shape: `_meeting_wants`
         # (runId -> owed job, oldest first) goes to ONE worker
         # (`_meeting_worker_loop`); `meeting_results` is the `meetingResults`
@@ -44641,6 +44796,160 @@ class SessionManager:
         if over > 0:
             log(f"daily brief: outbox past {DAILY_BRIEF_RESULTS_MAX}; dropped {over} oldest")
 
+    # ---- the Calendar sync (XERK-2895) ---------------------------------------
+
+    def _stage_calendar_sync(self, cmd):
+        """ON THE BEAT (handle_commands): take a `syncCalendar` — validate it and
+        hand its window to the worker; no I/O. A newer one replaces one not yet
+        started (the hub keeps one undelivered per host the same way). On a host
+        with no Outlook it is answered ONCE with that error, then only logged."""
+        window, error = validate_calendar_command(cmd)
+        if window is None:
+            log(f"calendar: syncCalendar refused ({error})")
+            return
+        if self.calendar_kind is None:
+            if not self._cal_said_off:
+                self._cal_said_off = True
+                self._cal_push([{"windowFrom": window[0], "windowUntil": window[1],
+                                 "syncedAt": int(time.time() * 1000),
+                                 "error": "no Outlook here: this host is not a WSL or Windows host"}])
+            return
+        with self._cal_lock:
+            self._cal_want = window
+        self._calendar_tick(force_wake=True)
+
+    def _calendar_tick(self, force_wake=False):
+        """ON THE BEAT: (re)start the worker and wake it when a sync is owed (a
+        hub window, or the schedule came due). A time compare only; a failed
+        Thread.start() (pids_limit) is retried next beat. Never raises."""
+        if self.calendar_kind is None:
+            return
+        try:
+            with self._cal_lock:
+                due = force_wake or self._cal_want is not None or time.monotonic() >= self._cal_next_at
+                if not due:
+                    return
+                worker = self._cal_worker
+                if worker is None or not worker.is_alive():
+                    worker = threading.Thread(target=self._calendar_worker_loop,
+                                              name="calendar-sync", daemon=True)
+                    worker.start()
+                    self._cal_worker = worker
+            self._cal_wake.set()
+        except Exception as e:
+            log(f"calendar worker could not start: {type(e).__name__}: {e}")
+
+    def _calendar_worker_loop(self):
+        """One sync at a time. Wake cleared BEFORE the want is read, so a
+        command staged mid-run is kept for the next pass."""
+        while True:
+            self._cal_wake.wait()
+            self._cal_wake.clear()
+            self._calendar_pass()
+
+    def _calendar_pass(self, now_ms=None):
+        """OFF THE BEAT: run the owed hub window (forced: every week sent), else
+        the scheduled one (only changed weeks). Never raises."""
+        with self._cal_lock:
+            want, self._cal_want = self._cal_want, None
+            if want is None and time.monotonic() < self._cal_next_at:
+                return
+            if want is None:
+                self._cal_next_at = time.monotonic() + CALENDAR_SYNC_EVERY_SEC
+        try:
+            if want is not None:
+                self._run_calendar_sync(*want, force=True, now_ms=now_ms)
+            else:
+                now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+                self._run_calendar_sync(*calendar_default_window(now_ms), force=False,
+                                        now_ms=now_ms)
+        except Exception as e:
+            log(f"calendar sync failed: {type(e).__name__}: {e}")
+
+    def _run_calendar_sync(self, from_ms, until_ms, force, now_ms=None):
+        """Read [from, until) week by week, CALENDAR_WEEKS_PER_READ weeks a
+        PowerShell run, and stage the rows to send. Each week is a COMPLETE
+        window or is not synced at all: one the reader's cap truncated becomes
+        an error row (the hub keeps its events), never a short authoritative
+        one. The first failed run stops the pass: its error (Outlook's own
+        words) covers the rest of the window, sent once until it changes."""
+        cli = session_cli_module()
+        synced_at = int(time.time() * 1000) if now_ms is None else now_ms
+        weeks = calendar_weeks(from_ms, until_ms)
+        send, rows, error = [], [], None
+        for i in range(0, len(weeks), CALENDAR_WEEKS_PER_READ):
+            group = weeks[i:i + CALENDAR_WEEKS_PER_READ]
+            try:
+                got = cli.read_calendar_windows(group)
+            except cli.Refused as e:
+                error = (str(e) or "Outlook could not be read")[:CALENDAR_ERROR_MAX]
+                error_from = group[0][0]
+                break
+            for (f, u), w in zip(group, got):
+                # An item Outlook threw on (or one with no id) is ABSENT from the
+                # week, so sent it would be deleted on the hub: not complete either.
+                if not w["complete"] or w["unreadable"]:
+                    self._cal_hashes.pop(f, None)
+                    rows.extend(calendar_sync_rows(send, synced_at))
+                    send = []
+                    why = (f"Outlook holds more than {cli.CALENDAR_SYNC_WINDOW_MAX} events"
+                           if not w["complete"] else
+                           f"Outlook could not read {w['unreadable']} item(s)")
+                    rows.append({"windowFrom": f, "windowUntil": u, "syncedAt": synced_at,
+                                 "error": f"{why} in the week from {_iso_day(f)}; that week "
+                                          "was not synced"})
+                    continue
+                h = calendar_events_hash(w["events"])
+                if force or self._cal_hashes.get(f) != h:
+                    send.append((f, u, w["events"]))
+                else:
+                    rows.extend(calendar_sync_rows(send, synced_at))
+                    send = []
+                # Only a whole grid week is keyed: a hub window's partial edge
+                # weeks never recur, so would only grow the map.
+                if u - f == CALENDAR_WEEK_MS and (f - CALENDAR_MONDAY_MS) % CALENDAR_WEEK_MS == 0:
+                    self._cal_hashes[f] = h
+        rows.extend(calendar_sync_rows(send, synced_at))
+        # A week turned into an error row (too big to carry) is not what the hub
+        # holds: forget its hash so every pass tries it again.
+        for r in rows:
+            if "error" in r:
+                for f in [k for k in self._cal_hashes if r["windowFrom"] <= k < r["windowUntil"]]:
+                    del self._cal_hashes[f]
+        if error is not None:
+            # Forget every hash: once Outlook answers again every week is re-sent,
+            # and those good rows are what clear the hub's lastError.
+            self._cal_hashes.clear()
+            # Also re-sent whenever this pass sends a good row: that row clears the
+            # hub's lastError, so the still-failing rest of the window would read healthy.
+            if force or error != self._cal_last_error or any("error" not in r for r in rows):
+                rows.append({"windowFrom": error_from, "windowUntil": until_ms,
+                             "syncedAt": synced_at, "error": error})
+                log(f"calendar: {error}")
+        self._cal_last_error = error
+        # Error rows LAST: a good row clears the hub's lastError, so an earlier
+        # week's error would be wiped by a later week's good row of this pass.
+        self._cal_push([r for r in rows if "error" not in r] + [r for r in rows if "error" in r])
+
+    def _cal_push(self, rows):
+        """Stage rows on the `calendarSync` outbox. Past CALENDAR_OUTBOX_MAX the
+        oldest drop — and every hash is forgotten, so the next run re-sends the
+        weeks those rows carried rather than believe the hub has them."""
+        if not rows:
+            return
+        sizes = [len(json.dumps(r, ensure_ascii=False).encode("utf-8")) for r in rows]
+        with self._cal_lock:
+            self.calendar_results.extend(rows)
+            self._cal_sizes.update(zip(map(id, rows), sizes))
+            over = len(self.calendar_results) - CALENDAR_OUTBOX_MAX
+            if over > 0:
+                for r in self.calendar_results[:over]:
+                    self._cal_sizes.pop(id(r), None)
+                del self.calendar_results[:over]
+                self._cal_hashes.clear()
+        if over > 0:
+            log(f"calendar: outbox past {CALENDAR_OUTBOX_MAX}; dropped {over} oldest")
+
     # ---- meeting work-item extraction (XERK-2509) ----------------------------
 
     def _stage_meeting(self, cmd):
@@ -48377,6 +48686,10 @@ class SessionManager:
                     # The daily brief (XERK-2394): only STAGED here — the
                     # collector and the `claude -p` run on its own worker.
                     self._stage_daily_brief(cmd)
+                elif ctype == "syncCalendar":
+                    # The Calendar (XERK-2895): only STAGED here — the Outlook
+                    # read runs on its own worker.
+                    self._stage_calendar_sync(cmd)
                 elif ctype == "extractMeeting":
                     # Meetings (XERK-2509): only STAGED here — the transcript
                     # fetch, model and duplicate search run on its own worker.
@@ -49866,6 +50179,8 @@ class SessionManager:
         self._daily_brief_tick()
         # The meeting worker (XERK-2509), likewise.
         self._meeting_tick()
+        # The Calendar sync (XERK-2895): a time compare; the read is the worker's.
+        self._calendar_tick()
         # Defect attribution (XERK-1846): the SZZ pass on its own thread.
         self._defect_scan_tick()
         # One snapshot both the session payloads and the mod-status pairing walk,
@@ -50030,6 +50345,9 @@ class SessionManager:
             # (XERK-2394), on which runtimes and models. Absent = "can't".
             "dailyBrief": self._daily_brief_payload(),
             "meetings": self._meetings_payload(),
+            # Whether this manager answers the hub's `syncCalendar` (XERK-2895):
+            # a WSL or Windows host. Absent = an older agent, which the hub never asks.
+            "calendar": {"available": self.calendar_kind is not None},
             # Whether this manager runs the hub's `spawnShadow` (XERK-1847). The
             # hub samples merged tickets only onto a host reporting it;
             # TURMA_MODEL_SHADOW=0 reports false.
@@ -50119,6 +50437,17 @@ class SessionManager:
         with self._meeting_lock:
             if self.meeting_results:
                 payload["meetingResults"] = list(self.meeting_results[:MEETING_RESULTS_MAX])
+        # Calendar sync rows (XERK-2895), oldest first: at most the hub's
+        # CALENDAR_SYNC_ROWS_MAX a beat, a second only within CALENDAR_BEAT_BYTES_MAX.
+        with self._cal_lock:
+            if self.calendar_results:
+                rows, total = [], 0
+                for r in self.calendar_results[:CALENDAR_SYNC_ROWS_MAX]:
+                    total += self._cal_sizes.get(id(r), 0)
+                    if rows and total > CALENDAR_BEAT_BYTES_MAX:
+                        break
+                    rows.append(r)
+                payload["calendarSync"] = rows
         if self.spawn_failures:
             # Snapshotted under the lock the export thread's _refuse_start
             # appends under (XERK-397): post() removes exactly these delivered
@@ -50280,6 +50609,14 @@ class SessionManager:
             with self._meeting_lock:
                 self.meeting_results[:] = [
                     x for x in self.meeting_results if id(x) not in delivered]
+        calstaged = payload.get("calendarSync")
+        if calstaged:
+            delivered = {id(x) for x in calstaged}
+            with self._cal_lock:
+                self.calendar_results[:] = [
+                    x for x in self.calendar_results if id(x) not in delivered]
+                for k in delivered:
+                    self._cal_sizes.pop(k, None)
 
     def post(self, payload):
         """POST one heartbeat. Returns the parsed reply dict, or None on failure
