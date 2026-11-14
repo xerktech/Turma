@@ -54,7 +54,8 @@
     if (!st || (st.created && st.created.key)) return false;
     const v = st.values || {};
     return !!(String(v.summary || "").trim() ||
-      String(v.description || "").trim() || String(v.labels || "").trim());
+      String(v.description || "").trim() || String(v.labels || "").trim() ||
+      (st.files || []).length);
   }
 
   // The header button. Kept out of nav.js so the chrome stays purely structural
@@ -120,6 +121,7 @@
       sites: list, siteKey: pick.siteKey, source: pick.source || "jira",
       meta: {}, types: {},
       values: { project: "", issueType: "", summary: "", description: "", labels: "" },
+      files: [],
       busy: false, error: "", created: null,
     };
     // Remember where the keyboard user was, so closing hands focus back there
@@ -247,9 +249,9 @@
     paintCreate();
   }
 
-  async function pollCreate(siteKey, cmdId) {
+  async function pollCreate(siteKey, cmdId, waitMs = 60000) {
     const url = `/api/jira/${encodeURIComponent(siteKey)}/tickets/${encodeURIComponent(cmdId)}`;
-    const deadline = Date.now() + 60000;
+    const deadline = Date.now() + waitMs;
     let delay = 700;
     while (createState && Date.now() < deadline) {
       let r;
@@ -264,22 +266,50 @@
     return { error: "the create didn't complete in time" };
   }
 
+  // Upload one picked file to the hub now (XERK-2935), so Create only has to
+  // name it. The hub stages it for the host that will create the ticket.
+  async function uploadFile(file) {
+    const s = createState;
+    if (!s) return;
+    const entry = { name: file.name || "file", size: file.size, status: "uploading" };
+    s.files.push(entry);
+    paintCreate();
+    let r, d = {};
+    try {
+      r = await fetch(`/api/jira/${encodeURIComponent(s.siteKey)}/uploads?name=${encodeURIComponent(entry.name)}`,
+        { method: "POST", headers: { "content-type": "application/octet-stream" }, body: file });
+      try { d = await r.json(); } catch { /* non-JSON error body */ }
+    } catch { r = null; }
+    if (r && r.status === 401) { location.href = "/login"; return; }
+    if (createState !== s || !s.files.includes(entry)) return;   // closed or removed meanwhile
+    if (r && r.ok && d.uploadId) {
+      entry.status = "ready"; entry.uploadId = d.uploadId; entry.name = d.name || entry.name;
+    } else {
+      entry.status = "error";
+      entry.error = r ? (d.error || `HTTP ${r.status}`) : "the hub is unreachable";
+    }
+    paintCreate();
+  }
+
   async function submitCreate() {
     const s = createState;
     if (!s || s.busy) return;
     syncCreateFields();
     const v = s.values;
     if (!v.project || !v.issueType || !(v.summary || "").trim()) return;
+    if ((s.files || []).some((f) => f.status === "uploading")) return;
     s.busy = true; s.error = "";
     paintCreate();
     const labels = splitLabels(v.labels, s.source);
+    const uploadIds = (s.files || []).filter((f) => f.status === "ready").map((f) => f.uploadId);
     let r, body = {};
     try {
       r = await fetch(`/api/jira/${encodeURIComponent(s.siteKey)}/tickets`, {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({
           project: v.project, issueType: v.issueType,
-          summary: v.summary.trim(), description: v.description, labels }),
+          summary: v.summary.trim(), description: v.description, labels,
+          ...(uploadIds.length ? { uploadIds } : {}) }),
       });
     } catch { if (createState === s) { s.busy = false; s.error = "the hub is unreachable"; paintCreate(); } return; }
     if (r.status === 401) { location.href = "/login"; return; }
@@ -288,11 +318,14 @@
       if (createState === s) { s.busy = false; s.error = body.error || `HTTP ${r.status}`; paintCreate(); }
       return;
     }
-    const out = await pollCreate(s.siteKey, body.cmdId);
+    // Files are downloaded and re-uploaded to the tracker by the host, so a
+    // create carrying them gets longer to answer.
+    const out = await pollCreate(s.siteKey, body.cmdId, uploadIds.length ? 300000 : 60000);
     if (createState !== s) return;         // closed while the create was in flight
     s.busy = false;
     if (out.error) { s.error = out.error; return void paintCreate(); }
     s.created = { key: out.key, url: out.url, warning: out.warning || "" };
+    s.files = [];
     paintCreate();
   }
 
@@ -383,12 +416,37 @@
         createState.values.summary = "";
         createState.values.description = "";
         createState.values.labels = "";
+        createState.files = [];
         return void paintCreate();
       }
       if (e.target.closest("[data-cf-submit]")) return void submitCreate();
+      if (e.target.closest("[data-cf-attach]")) {
+        const input = panel.querySelector("[data-cf-file-input]");
+        if (input) input.click();
+        return;
+      }
+      const rm = e.target.closest("[data-cf-file-remove]");
+      if (rm) {
+        syncCreateFields();
+        createState.files.splice(Number(rm.getAttribute("data-cf-file-remove")), 1);
+        return void paintCreate();
+      }
     });
     panel.addEventListener("change", (e) => {
       if (!createState) return;
+      const picker = e.target.closest("[data-cf-file-input]");
+      if (picker) {
+        syncCreateFields();
+        const max = board().CREATE_FILES_MAX || 10;
+        const room = max - createState.files.length;
+        const picked = Array.from(picker.files || []);
+        for (const f of picked.slice(0, Math.max(0, room))) uploadFile(f);
+        if (picked.length > room) {
+          createState.error = `at most ${max} files per ticket`;
+          paintCreate();
+        }
+        return;
+      }
       const org = e.target.closest("[data-cf-org]");
       if (org) {
         syncCreateFields();
@@ -398,6 +456,7 @@
         createState.values.project = "";
         createState.values.issueType = "";
         createState.values.labels = "";     // wording differs per source
+        createState.files = [];             // staged for a host of the old org
         createState.error = "";
         return void loadMeta();
       }

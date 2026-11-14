@@ -10617,6 +10617,8 @@ function forwardBodyRoute(req) {
   try { parts = new URL(req.url, "http://x").pathname.split("/").filter(Boolean); } catch { return ""; }
   if (parts[0] !== "api") return "";
   if (parts[1] === "heartbeat" && parts.length === 2) return agentPresentedRefusal(req) ? "" : "heartbeat";
+  if (parts[1] === "jira" && parts[3] === "uploads" && parts.length === 4)
+    return userAuthorized(req) ? "upload" : "";
   if (parts[1] !== "agents") return "";
   const uploads = (parts[3] === "uploads" && parts.length === 4) ||
     (parts[3] === "sessions" && parts[5] === "uploads" && parts.length === 6);
@@ -12568,6 +12570,20 @@ function normalizeCloseTicket(payload) {
   payload.closeTicket = { available: t.available === true };
 }
 
+// Whether this host's manager attaches the files a `createTicket` carries
+// (XERK-2935). Coerced like normalizeCloseTicket: strict boolean, unusable
+// becomes NULL, ABSENT stays absent ("this host can't" — an older agent would
+// create the ticket and silently drop the files).
+function normalizeTicketAttachments(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const t = payload.ticketAttachments;
+  if (!t || typeof t !== "object" || Array.isArray(t)) {
+    if ("ticketAttachments" in payload) payload.ticketAttachments = null;
+    return;
+  }
+  payload.ticketAttachments = { available: t.available === true };
+}
+
 // The Daily Brief (XERK-2391) capability block: whether this host's manager runs a
 // `renderDailyBrief` command. Only a host reporting it is asked — an older agent
 // would ack the command and never answer. Coerced like normalizeCloseTicket; the
@@ -13283,7 +13299,8 @@ function resultLanded(agent, cmdId, wait) {
     // clearing the wait here never serves stale data.
     return !!agent.createMeta || Object.keys(agent.createTypes || {}).length > 0;
   }
-  if (wait.kind === "createTicket") return !!(agent.createResults || {})[cmdId];
+  if (wait.kind === "createTicket" || wait.kind === "createTicketFiles")
+    return !!(agent.createResults || {})[cmdId];
   if (wait.kind === "setTicketStatus") return !!(agent.statusResults || {})[cmdId];
   if (wait.kind === "setTicketPriority") return !!(agent.priorityResults || {})[cmdId];
   if (wait.kind === "createDuplicateLink") return !!(agent.linkResults || {})[cmdId];
@@ -13304,7 +13321,9 @@ function resultLanded(agent, cmdId, wait) {
 // this, not the no-CI grace). Only a genuinely-old agent — which stages a result
 // NEVER — reaches the RESULT_WAIT_MAX_MS timeout, and only then is it a real gap.
 // `boardCreateMeta` fetches its tracker reads on a worker too (XERK-2880).
-const ASYNC_RESULT_KINDS = new Set(["mergePr", "boardCreateMeta"]);
+// "createTicketFiles" is a create carrying files (XERK-2935), which the agent
+// runs on a worker so it can download and upload them.
+const ASYNC_RESULT_KINDS = new Set(["mergePr", "boardCreateMeta", "createTicketFiles"]);
 
 // Settle every awaited command this beat acked (i.e. that has just left the
 // queue). Runs AFTER the ingests, so `next` already holds anything the beat
@@ -13594,12 +13613,28 @@ function forgetCreateInFlight(cmdId) {
     }
   }
 }
+// Files for a new ticket (XERK-2935) are staged on the hub relay (XERK-234)
+// under this sessionId sentinel, scoped to the host that will create the ticket.
+const TICKET_UPLOAD_SID = "#ticket";
+
+// The online host of the org that will create a ticket WITH files: one whose
+// manager attaches them (`ticketAttachments`). Same health ranking as a create.
+function pickTicketAttachHost(siteKey) {
+  const pool = jiraHostPool(siteKey, true).filter((k) =>
+    agents[k] && agents[k].ticketAttachments && agents[k].ticketAttachments.available === true &&
+    !agentGapError(agents[k], "createTicket", ""));
+  if (!pool.length) return null;
+  const top = jiraHostHealthy(agents[pool[0]]);
+  return pool.find((k) => jiraHostHealthy(agents[k]) === top) || pool[0];
+}
+
 // Queue a tracker create on the org's ranked online board-write host: the ONE
 // path the New-ticket route (XERK-137/241) and a meeting proposal's approval
 // (XERK-2510) take, so both get the same single-flight, gap and routing rules.
 // Returns {status, body}: 200 {ok, cmdId, host} (an identical create still in
 // flight rejoins its cmdId), else a refusal in the hub's own words.
-function queueCreateTicket(siteKey, { project, issueType, summary, description = "", labels = [] }) {
+function queueCreateTicket(siteKey, { project, issueType, summary, description = "", labels = [] },
+  { host = null, uploads = null } = {}) {
   if (!summary) return { status: 400, body: { error: "a title is required" } };
   if (!project) return { status: 400, body: { error: "a project is required" } };
   if (!issueType) return { status: 400, body: { error: "an issue type is required" } };
@@ -13613,7 +13648,9 @@ function queueCreateTicket(siteKey, { project, issueType, summary, description =
   const fields = [siteKey, project, issueType, summary, description, labels];
   const inFlight = findCreateInFlight(...fields);
   if (inFlight) return { status: 200, body: { ok: true, cmdId: inFlight.cmdId, host: inFlight.host } };
-  const key = pickBoardWriteHost(siteKey, "createTicket");
+  // A create carrying files goes to the host its files were staged for (the
+  // blob GET is host-scoped), already checked by the caller.
+  const key = host || pickBoardWriteHost(siteKey, "createTicket");
   if (!key) {
     return findJiraHost(siteKey, false)
       ? { status: 503, body: { error: "no online host reports that org" } }
@@ -13623,10 +13660,10 @@ function queueCreateTicket(siteKey, { project, issueType, summary, description =
   // client would otherwise poll the outcome until it timed out.
   const gap = agentGapError(agents[key], "createTicket", "create tickets");
   if (gap) return { status: 409, body: { error: gap } };
-  const cmdId = queueCommand(key, {
-    type: "createTicket", project, issueType, summary, description, labels,
-  });
-  awaitResult(agents[key], cmdId, "createTicket");
+  const cmd = { type: "createTicket", project, issueType, summary, description, labels };
+  if (uploads && uploads.length) cmd.uploads = uploads;
+  const cmdId = queueCommand(key, cmd);
+  awaitResult(agents[key], cmdId, cmd.uploads ? "createTicketFiles" : "createTicket");
   rememberCmdHost(cmdId, key, "createTicket");
   rememberCreateInFlight(fields, cmdId, key);
   return { status: 200, body: { ok: true, cmdId, host: key } };
@@ -14104,7 +14141,7 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "dsh", "qwen", "triage", "trajectory", "closeTicket", "defaultRuntime", "gitSources", "github", "hostOs", "inputMaxChars", "jira", "limits", "localModel",
+  "dsh", "qwen", "triage", "trajectory", "closeTicket", "ticketAttachments", "defaultRuntime", "gitSources", "github", "hostOs", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoDeletes", "repoUsage", "repos", "reposRoot",
   "sessions", "startedAt", "subscription", "tokenRoll", "uploadMaxBytes", "usage",
   "historyResults", "trajectoryTailResults", "subagentHistoryResults", "jiraIssueResults",
@@ -14513,6 +14550,7 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeTriage(a);
   normalizeTrajectory(a);
   normalizeCloseTicket(a);
+  normalizeTicketAttachments(a);
   normalizeDailyBrief(a);
   normalizeCalendarCapability(a);
   normalizeRunCapability(a, "meetings");
@@ -28030,8 +28068,49 @@ const server = http.createServer(async (req, res) => {
         ? body.labels.filter((l) => typeof l === "string" && l.trim())
             .map((l) => l.trim()).slice(0, 20)
         : [];
-      const out = queueCreateTicket(siteKey, { project, issueType, summary, description, labels });
+      // Files staged by POST .../uploads (XERK-2935). They must all sit on one
+      // host, which must still be online in the org and attach files; else the
+      // operator re-attaches rather than gets a ticket missing its files.
+      const wantUploads = Array.isArray(body.uploadIds)
+        ? body.uploadIds.filter((s) => typeof s === "string" && s) : [];
+      if (wantUploads.length > UPLOAD_MAX_PER_MESSAGE)
+        return json(res, 400, { error: `at most ${UPLOAD_MAX_PER_MESSAGE} attachments` });
+      let fileHost = null;
+      const files = [];
+      if (wantUploads.length) {
+        sweepUploads();
+        for (const id of wantUploads) {
+          const u = uploads.get(id);
+          if (!u || u.sessionId !== TICKET_UPLOAD_SID || (fileHost && u.host !== fileHost) ||
+              !hostInOrg(agents[u.host], siteKey))
+            return json(res, 404, { error: "an attachment expired before the ticket was created — re-attach it" });
+          fileHost = u.host;
+          files.push({ id: u.id, name: u.name, size: u.size });
+        }
+        const a = agents[fileHost];
+        if (!a || Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS ||
+            !(a.ticketAttachments && a.ticketAttachments.available === true))
+          return json(res, 409, { error: "the host holding your files is no longer available — re-attach them" });
+      }
+      const out = queueCreateTicket(siteKey, { project, issueType, summary, description, labels },
+        { host: fileHost, uploads: files });
       return json(res, out.status, out.body);
+    }
+
+    // POST /api/jira/<siteKey>/uploads?name=<file> -> stage one file for a new
+    // ticket (XERK-2935). Body is the raw bytes, the same relay and caps as a
+    // chat attachment (XERK-234); the host that will create the ticket is
+    // chosen NOW, since the agent's blob GET is host-scoped.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "uploads") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const key = pickTicketAttachHost(siteKey);
+      if (!key) {
+        return findJiraHost(siteKey, false)
+          ? json(res, 409, { error: "no online host of this org can attach files to a ticket — update its agent" })
+          : json(res, 404, { error: "no host reports that org" });
+      }
+      return stageUpload(req, res, url, key, TICKET_UPLOAD_SID);
     }
 
     // GET /api/jira/<siteKey>/tickets/<cmdId> -> poll a create's outcome
