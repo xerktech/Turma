@@ -135,6 +135,8 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 - **What re-reads it** (each a QA finding): `calendar`, `holidaySettings` AND `meetingProposals`
   frames (a Tenir-only capture is announced only by the last), coalesced 1s (`calendarSoon`); a
   stream reconnect; a 60s poll while the stream is down.
+  - An `agent` frame whose `online` FLIPS (XERK-2921): a host going offline sends no calendar
+    frame. Only a flip, never every beat (one read per beat per host otherwise).
   - `refetch()` re-reads only the shown weeks + neighbours and DROPS every other cached week: a
     frame re-reading every week ever browsed grew without bound (and re-queued host syncs).
   - A failed read is retried every 20s while shown and at once on showing; it never sticks.

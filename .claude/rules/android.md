@@ -123,7 +123,8 @@ A pure-core/adapter-shell split:
   `vm/CalendarViewModel.kt` (the week cache; `/api/calendar` is not on the snapshot).
   - Week math is `LocalDate` (java.time's calendar), never `+ 86_400_000`: a DST day is 23/25h.
   - Re-reads on `FleetRepository.calendarFrames` (`calendar`, `holidaySettings`,
-    `meetingProposals` frames + every stream open), coalesced 1s; a 60s poll while `streamUp` is
+    `meetingProposals` frames, an `agent` frame that flips `online` (XERK-2921), every stream
+    open), coalesced 1s; a 60s poll while `streamUp` is
     false. A re-read drops every week but the shown ± one and the notes review's upcoming weeks.
   - The week cache is written with `update{}` and its bookkeeping under a lock: a read's answer
     resumes off the main thread in tests, and two weeks landing at once lost one (stuck loading).
@@ -140,7 +141,9 @@ A pure-core/adapter-shell split:
   - A block's `testTag` goes BEFORE its `clearAndSetSemantics`: after it, the tag is cleared too.
   - The view switch and mode picks are `FilterChip`s: `SegmentedButton` taps never reached
     `onClick` under Robolectric (measured), so a test could not drive them.
-  - Tests: `core/CalendarTest`, `ui/CalendarScreenTest`.
+  - Calendar rows (events, hosts) strip control/bidi chars at decode (`cleanCalendarJson`, the
+    hub's `meetingText` class): defence against an older/forwarding hub (XERK-2921).
+  - Tests: `core/CalendarTest`, `ui/CalendarScreenTest`. `net/FleetCalendarFlipTest`.
 
 ## Images (rollup XERK-2109)
 
