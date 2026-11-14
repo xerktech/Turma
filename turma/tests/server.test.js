@@ -32217,6 +32217,12 @@ test("XERK-2891: events take an org by rule, default or series override; private
   assert.equal((await settings({ defaultOrg: "nobody2891.atlassian.net" })).status, 404);
   assert.equal((await settings({ defaultOrg: SB })).status, 200);
   assert.equal((await settings({ series: { id: "ser", org: "" } })).status, 400, "no org is not an org");
+  // A malformed org is a 400, never "not an org of this tenant" (rollup XERK-2944).
+  for (const org of [5, true, {}, [SA], undefined]) {
+    assert.equal((await settings({ series: { id: "ser", org } })).status, 400, `series org ${JSON.stringify(org)}`);
+  }
+  assert.equal((await settings({ series: { id: "ser", org: "nobody2891.atlassian.net" } })).status, 404);
+  assert.equal((await settings({ defaultOrg: 5 })).status, 400, "a non-string defaultOrg is malformed");
   assert.equal((await settings({ series: { id: "ser", org: SB } })).status, 200);
   let view = (await calGet2891(now - H2891, now + 48 * H2891)).body.events.filter((e) => e.host === D);
   orgs = Object.fromEntries(view.map((e) => [e.id, e.org]));
