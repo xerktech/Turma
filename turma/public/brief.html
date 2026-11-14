@@ -183,6 +183,15 @@
   .mt-meta .sep::after { content: " · "; white-space: pre; }
   .mt-summary { font-size: 13.5px; line-height: 1.45; margin-top: 10px; color: var(--ink-2); overflow-wrap: anywhere; }
   .mt-summary p { margin: 0 0 6px; }
+  .mt-transcript { margin-top: 12px; font-size: 13px; }
+  .mt-tr { margin-top: 8px; max-height: 60vh; overflow: auto; border: 1px solid var(--hairline);
+    border-radius: var(--radius-md); padding: 4px 12px; }
+  .mt-tr-turn { padding: 8px 0; border-bottom: 1px solid var(--hairline); }
+  .mt-tr-turn:last-child { border-bottom: 0; }
+  .mt-tr-who { display: flex; gap: 8px; align-items: baseline; font-size: 12.5px; }
+  .mt-tr-at { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 3.5em; }
+  a.mt-tr-at { color: var(--accent-text); }
+  .mt-tr-turn p { margin: 2px 0 0; line-height: 1.45; color: var(--ink-2); overflow-wrap: anywhere; }
   .mt-status { font-size: 13px; margin-top: 10px; color: var(--ink-2); overflow-wrap: anywhere; }
   .mt-status.failed { color: var(--critical-text); }
   .mt-prog { height: 6px; background: var(--hairline); border-radius: 3px; overflow: hidden; margin: 12px 0 4px; }

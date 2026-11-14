@@ -235,6 +235,23 @@ data class MeetingItem(
     val review: MeetingReview? = null,
 )
 
+/** One caption line of a meeting's full transcript (XERK-2941); [startMs] -1 = none. */
+@Serializable
+data class MeetingTranscriptSegment(
+    val speaker: String = "",
+    val text: String = "",
+    val startMs: Long = -1,
+)
+
+/** `GET .../meetings/<id>/transcript`: the segments, or the hub's refusal ([missing] = none was kept). */
+@Serializable
+data class MeetingTranscriptResponse(
+    val meetingId: String = "",
+    val segments: List<MeetingTranscriptSegment> = emptyList(),
+    val error: String = "",
+    val missing: Boolean = false,
+)
+
 /** A caption line backing an item; [atMs] is the offset into the meeting, -1 = none. */
 @Serializable
 data class MeetingQuote(

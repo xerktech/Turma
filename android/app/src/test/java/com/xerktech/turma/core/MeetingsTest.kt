@@ -138,4 +138,18 @@ class MeetingsTest {
         assertEquals(2, meetingsPending(map, setOf("a.net")))
         assertEquals(0, meetingsPending(emptyMap(), emptySet()))
     }
+
+    @Test fun `XERK-2941 transcript turns join one speaker's lines and the clock reads m-ss or h-mm-ss`() {
+        val segs = listOf(
+            com.xerktech.turma.model.MeetingTranscriptSegment("Ann", "One.", 1000),
+            com.xerktech.turma.model.MeetingTranscriptSegment("Ann", "Two.", 2000),
+            com.xerktech.turma.model.MeetingTranscriptSegment("Bo", "  ", 3000),
+            com.xerktech.turma.model.MeetingTranscriptSegment("Bo", "Three.", -1),
+        )
+        assertEquals(listOf(TranscriptTurn("Ann", 1000, "One. Two."), TranscriptTurn("Bo", -1, "Three.")),
+            meetingTranscriptTurns(segs))
+        assertEquals("0:00", transcriptClock(0))
+        assertEquals("1:05", transcriptClock(65_999))
+        assertEquals("1:02:05", transcriptClock(3_725_000))
+    }
 }

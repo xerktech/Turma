@@ -450,6 +450,14 @@ interface HubApi {
         @Body body: com.xerktech.turma.model.MeetingReviewRequest,
     ): Response<com.xerktech.turma.model.MeetingReviewResponse>
 
+    // A meeting's full transcript (XERK-2941), read on demand: {meetingId,
+    // segments}, or 404 {error, missing:true} when none was kept.
+    @GET("api/orgs/{siteKey}/meetings/{meetingId}/transcript")
+    suspend fun meetingTranscript(
+        @Path("siteKey") siteKey: String,
+        @Path("meetingId") meetingId: String,
+    ): Response<com.xerktech.turma.model.MeetingTranscriptResponse>
+
     // Archive / unarchive a meeting (XERK-2856): {archived}. Answers {ok,
     // meeting}; 409 while it is queued or running, in the hub's words.
     @POST("api/orgs/{siteKey}/meetings/{meetingId}/archive")

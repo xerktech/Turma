@@ -29697,6 +29697,49 @@ test("XERK-2894: a result's summary and inferred title are kept, bounded and ser
   cleanup2508(S, ["mtSum2894"]);
 });
 
+test("XERK-2941: a settled meeting's full transcript is kept, served to its org only, and dropped with its row", async () => {
+  const S = "mtTr2941.atlassian.net";
+  const O = "mtTrO2941.atlassian.net";
+  await meetHost2508("mtTr2941", S);
+  await beat1574("mtTrO2941", O);
+  const long = Array.from({ length: 300 }, (_, i) => ({ speaker: i % 2 ? "Bo" : "Ann",
+    text: `line ${i} <b>x</b>`, startMs: i * 1000, endMs: i * 1000 + 900 }));
+  await postMeeting2508(S, meeting2508("tr1", { segments: long }));
+  const url = (site, id) => `/api/orgs/${encodeURIComponent(site)}/meetings/${encodeURIComponent(id)}/transcript`;
+  // Readable while it waits, and after it settles (the row itself drops its copy).
+  assert.equal((await request("GET", url(S, "tr1"), { headers: userHeaders })).body.segments.length, 300);
+  const [cmd] = meetCmds2508("mtTr2941");
+  await meetResult2508("mtTr2941", S, cmd, { status: "ok", items: [] });
+  const row = hub.getMeetings()[S][0];
+  assert.equal(row.status, "ok");
+  assert.equal("segments" in row, false, "the policy store still drops it");
+  hub.sweepMeetingTranscripts();
+  const got = await request("GET", url(S, "tr1"), { headers: userHeaders });
+  assert.equal(got.status, 200);
+  assert.equal(got.body.meetingId, "tr1");
+  assert.equal(got.body.segments.length, 300);
+  assert.deepEqual(got.body.segments[1], { speaker: "Bo", text: "line 1 <b>x</b>", startMs: 1000, endMs: 1900 });
+  // Operator-authed, and only through the org that holds the row.
+  assert.equal((await request("GET", url(S, "tr1"))).status, 401);
+  assert.equal((await request("GET", url(O, "tr1"), { headers: userHeaders })).status, 404);
+  assert.equal((await request("GET", url(S, "nope"), { headers: userHeaders })).status, 404);
+  assert.equal((await request("GET", url("nobody2941.atlassian.net", "tr1"), { headers: userHeaders })).status, 404);
+  // A meeting settled before transcripts were kept says so.
+  hub.getMeetings()[S].push(hub.sanitizeMeeting({ meetingId: "old1", title: "Old", platform: "zoom",
+    startedAt: 1, endedAt: 2, receivedAt: 3, status: "ok", items: [] }));
+  const old = await request("GET", url(S, "old1"), { headers: userHeaders });
+  assert.deepEqual([old.status, old.body.missing], [404, true]);
+  // Dropped with its row.
+  const file = path.join(hub.MEETING_TRANSCRIPTS_DIR, `${hub.meetingTranscripts.keyOf("tr1", row.receivedAt)}.json`);
+  assert.ok(fs.existsSync(file));
+  hub.getMeetings()[S].splice(0, 1);
+  hub.sweepMeetingTranscripts();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(fs.existsSync(file), false);
+  cleanup2508(S, ["mtTr2941"]);
+  cleanup2508(O, ["mtTrO2941"]);
+});
+
 test("XERK-2508: the tick waits for a host, retries a silent or departed one, and expires the queue", async () => {
   const S = "mtT2508.atlassian.net";
   await beat1574("mtTOld2508", S);

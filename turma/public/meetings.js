@@ -106,6 +106,9 @@ const types = new Map();         // site\0project -> {loading} | {types} | {erro
 const archBusy = new Set();      // meeting keys with an archive POST in flight
 const archErr = new Map();       // meeting key -> the hub's refusal
 const showReviewed = new Set();  // meeting keys whose reviewed proposals are shown
+// The full transcript (XERK-2941), read on demand from the hub, never on the snapshot.
+const transcriptOpen = new Set(); // meeting keys whose transcript is shown
+const transcripts = new Map();    // meeting key -> {loading} | {html, count} | {error, missing?}
 const FILTERS = [["review", "Needs review"], ["all", "All"], ["archived", "Archived"]];
 let filter = "review";
 let query = "";                  // the rail's search, as typed
@@ -532,6 +535,71 @@ function summaryHtml(m) {
     .map((p) => `<p>${p.split("\n").map(esc).join("<br>")}</p>`).join("");
   return `<div class="mt-summary" aria-label="Summary">${paras}</div>`;
 }
+// The full transcript (XERK-2941): a toggle, then the captions by speaker turn.
+// Consecutive lines of one speaker are one turn; each turn's time links to that
+// moment in Tenir when the meeting has a link. Every caption is escaped.
+function clockOf(ms) {
+  const t = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), sec = String(t % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+}
+function transcriptBodyHtml(m, segments) {
+  const turns = [];
+  for (const seg of segments) {
+    if (!seg || typeof seg.text !== "string" || !seg.text.trim()) continue;
+    const speaker = typeof seg.speaker === "string" ? seg.speaker : "";
+    const last = turns[turns.length - 1];
+    if (last && last.speaker === speaker) last.lines.push(seg.text);
+    else turns.push({ speaker, at: seg.startMs, lines: [seg.text] });
+  }
+  if (!turns.length) return { html: `<div class="mt-status">The transcript has no text.</div>`, count: 0 };
+  const html = turns.map((t) => {
+    const at = isTime(Number(t.at) + 1) ? clockOf(t.at) : "";
+    const link = at ? momentUrl(m.tenirUrl, t.at) : "";
+    const when = !at ? "" : link
+      ? `<a class="mt-tr-at" href="${esc(link)}" target="_blank" rel="noopener noreferrer">${esc(at)}</a>`
+      : `<span class="mt-tr-at">${esc(at)}</span>`;
+    return `<div class="mt-tr-turn"><div class="mt-tr-who">${when}<b>${esc(t.speaker || "Unknown speaker")}</b></div>`
+      + `<p>${t.lines.map(esc).join(" ")}</p></div>`;
+  }).join("");
+  return { html, count: turns.length };
+}
+function transcriptHtml(site, m) {
+  const mk = meetingKey(site, m.meetingId);
+  const open = transcriptOpen.has(mk);
+  const t = transcripts.get(mk);
+  const btn = `<button type="button" class="linkish" data-transcript="${esc(mk)}" aria-expanded="${open}">`
+    + `${open ? "Hide transcript" : "Show full transcript"}</button>`;
+  let body = "";
+  if (open) {
+    if (!t || t.loading) body = `<div class="mt-status">Loading the transcript…</div>`;
+    else if (t.error) body = `<div class="mt-status${t.missing ? "" : " failed"}">${esc(t.error)}</div>`;
+    else body = `<div class="mt-tr" aria-label="Transcript">${t.html}</div>`;
+  }
+  return `<div class="mt-transcript">${btn}${body}</div>`;
+}
+async function loadTranscript(mk) {
+  const [site, mid] = mk.split("/").map(decodeURIComponent);
+  const m = meetingsOf(cache, site).find((x) => x.meetingId === mid) || { meetingId: mid };
+  transcripts.set(mk, { loading: true });
+  repaint(true);
+  let res = null, out = {};
+  try {
+    res = await fetch(`/api/orgs/${encodeURIComponent(site)}/meetings/${encodeURIComponent(mid)}/transcript`);
+    try { out = await res.json(); } catch { out = {}; }
+  } catch { res = null; }
+  if (res && res.ok && out && Array.isArray(out.segments)) {
+    transcripts.set(mk, transcriptBodyHtml(m, out.segments));
+  } else if (res && res.status === 404 && out && out.missing) {
+    transcripts.set(mk, { error: "No transcript was kept for this meeting — it was read before Turma kept transcripts.", missing: true });
+  } else {
+    const text = res ? TurmaNav.refusalText("Loading the transcript", res.status, out)
+      : "Loading the transcript failed — the hub is unreachable";
+    transcripts.set(mk, { error: text });
+  }
+  repaint(true);
+}
+
 // `primary`: the entry IS this meeting (its title heads the pane, with the back
 // button); else it sits under a daily meeting's brief.
 // `people`: the names too (the calendar's panel, XERK-2898; the notes view shows a count).
@@ -576,6 +644,7 @@ function meetingHtml(site, m, { primary = false, orgName = "", back = "", people
     + (people && (m.participants || []).length
       ? `<div class="mt-people" aria-label="Participants">${m.participants.map((p) => `<span>${esc(p)}</span>`).join("")}</div>` : "")
     + summaryHtml(m)
+    + transcriptHtml(site, m)
     + body + `</section>`;
 }
 
@@ -971,7 +1040,7 @@ function fieldIn(root) {
 const editing = () => fieldIn($list);
 // What has focus, as keys that survive the swap: the page's own (hooks) first,
 // else one of this pane's controls by its data attribute.
-const FOCUS_ATTRS = ["search", "filter", "openCal", "orgToggle", "orgSettings", "entry", "showReviewed", "archive",
+const FOCUS_ATTRS = ["search", "filter", "openCal", "orgToggle", "orgSettings", "entry", "showReviewed", "transcript", "archive",
   "drawerClose", "back", "labelSave", "labelReset", "focusSave", "focusClear", "missUse", "metaFocus",
   "calDomains", "calDomainsSave", "holOff", "holCountry"];
 function focusKey(root = $list) {
@@ -1397,7 +1466,7 @@ function onKey(ev) {
 function onClick(ev) {
   const b = ev.target && ev.target.closest
     ? ev.target.closest("[data-act],[data-meta-retry],[data-label-save],[data-label-reset],[data-miss-use],[data-focus-save],[data-focus-clear],[data-cal-domains-save],"
-      + "[data-entry],[data-filter],[data-org-toggle],[data-org-settings],[data-drawer-close],[data-back],[data-show-reviewed],[data-archive],[data-open-cal]") : null;
+      + "[data-entry],[data-filter],[data-org-toggle],[data-org-settings],[data-drawer-close],[data-back],[data-show-reviewed],[data-transcript],[data-archive],[data-open-cal]") : null;
   if (!b) return;
   const d = b.dataset;
   if (d.openCal !== undefined) {
@@ -1416,6 +1485,17 @@ function onClick(ev) {
   if (d.back !== undefined) { narrowMain = false; return void repaint(true); }
   if (d.showReviewed !== undefined) {
     if (showReviewed.has(d.showReviewed)) showReviewed.delete(d.showReviewed); else showReviewed.add(d.showReviewed);
+    return void repaint(true);
+  }
+  if (d.transcript !== undefined) {
+    const mk = d.transcript;
+    if (transcriptOpen.has(mk)) transcriptOpen.delete(mk);
+    else {
+      transcriptOpen.add(mk);
+      // A failed read is retried on the next open; a kept one is reused.
+      const t = transcripts.get(mk);
+      if (!t || (t.error && !t.missing)) return void loadTranscript(mk);
+    }
     return void repaint(true);
   }
   if (d.archive !== undefined) {
@@ -1571,7 +1651,7 @@ function pendingCount(data) {
 const api = { mount, update, invalidate, hold, pendingCount, reveal, showPanel, meetingState, patch,
   // test hooks (tests/meetings.test.js, tests/brief.test.js)
   renderMeetings, review, archive, startEdit, edits, setProject, itemKey, entryKey, meetingKey, saveLabel,
-  missesHtml, saveFocus, onKey, entriesOf, select, fmtSpan,
+  missesHtml, saveFocus, onKey, entriesOf, select, fmtSpan, transcriptBodyHtml, loadTranscript,
   openDrawer: (s) => { drawer = s; repaint(true); },
   setFilter: (f) => { filter = f; repaint(true); },
   setQuery: (q) => { query = q; repaint(true); },

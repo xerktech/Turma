@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
@@ -88,6 +89,8 @@ import com.xerktech.turma.core.effectiveOrgs
 import com.xerktech.turma.core.focusNames
 import com.xerktech.turma.core.meetingArchivable
 import com.xerktech.turma.core.meetingSummaryParagraphs
+import com.xerktech.turma.core.meetingMomentUrl
+import com.xerktech.turma.core.transcriptClock
 import com.xerktech.turma.core.meetingTitle
 import com.xerktech.turma.core.meetingItemsSplit
 import com.xerktech.turma.core.meetingLabelMissLabels
@@ -794,6 +797,61 @@ internal fun BriefReadAloud(b: DailyBrief, now: Long, zone: ZoneId, locale: Loca
     }
 }
 
+/**
+ * The meeting's full transcript (XERK-2941, web `transcriptHtml`): a toggle that
+ * reads it from the hub once, then the captions by speaker turn, each turn's
+ * time opening that moment in Tenir when the meeting has a link.
+ */
+@Composable
+internal fun TranscriptSection(site: String, m: Meeting, mvm: MeetingsViewModel) {
+    val transcripts by mvm.transcripts.collectAsStateWithLifecycle()
+    var open by rememberSaveable(site, m.meetingId) { mutableStateOf(false) }
+    val uri = LocalUriHandler.current
+    val state = transcripts["$site\u0000${m.meetingId}"]
+    GhostButton(if (open) "Hide transcript" else "Show full transcript", {
+        open = !open
+        if (open) mvm.loadTranscript(site, m.meetingId)
+    }, Modifier.testTag("transcript-toggle"))
+    if (!open) return
+    when (state) {
+        null, is MeetingsViewModel.TranscriptState.Loading ->
+            Text("Loading the transcript…", style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        is MeetingsViewModel.TranscriptState.Failed ->
+            Text(state.message, style = MaterialTheme.typography.bodyMedium,
+                color = if (state.missing) MaterialTheme.colorScheme.onSurfaceVariant else TurmaColors.critical)
+        is MeetingsViewModel.TranscriptState.Loaded -> {
+            if (state.turns.isEmpty()) {
+                Text("The transcript has no text.", style = MaterialTheme.typography.bodyMedium)
+                return
+            }
+            // Bounded, so it scrolls inside the entry rather than stretching the list.
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 480.dp).verticalScroll(rememberScrollState())
+                    .testTag("transcript"),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                for (t in state.turns) {
+                    Column {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (t.atMs >= 0) {
+                                val link = meetingMomentUrl(m.tenirUrl, t.atMs)
+                                Text(transcriptClock(t.atMs), style = MaterialTheme.typography.labelMedium,
+                                    color = if (link.isEmpty()) MaterialTheme.colorScheme.onSurfaceVariant
+                                    else MaterialTheme.colorScheme.primary,
+                                    modifier = if (link.isEmpty()) Modifier else Modifier.clickable { uri.openUri(link) })
+                            }
+                            Text(t.speaker.ifBlank { "Unknown speaker" }, style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold)
+                        }
+                        Text(t.text, style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+            }
+        }
+    }
+}
+
 /** A captured meeting's review: progress, Archive, the pending proposals, reviewed ones on demand. */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -850,6 +908,7 @@ internal fun MeetingPart(
     for (para in meetingSummaryParagraphs(m)) {
         Text(para, style = MaterialTheme.typography.bodyMedium)
     }
+    TranscriptSection(site, m, mvm)
     if (needsProject) {
         ProjectTarget(meta[site], project, { mvm.setProject(site, it) }, { mvm.retryMeta(site) })
     }

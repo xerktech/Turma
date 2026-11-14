@@ -80,6 +80,7 @@ const { createLeader } = require("./leader.js");
 // returns null, the mirror is never wired, and archive.js's local ARCHIVE_DIR
 // tree stays the of-record, byte-identical.
 const { createBlobStore } = require("./blobstore.js");
+const { makeTranscriptStore } = require("./meeting-transcripts.js");
 const { ArchiveMirror } = require("./archive-mirror.js");
 // The stdlib Postgres client (XERK-776) + the archive's Postgres INDEX of-record
 // (XERK-780, epic XERK-775). The archive's searchable index moves onto Postgres as
@@ -669,6 +670,13 @@ const MEETING_PROPOSALS_FILE =
 // The short label Tenir names each org by (XERK-2638): siteKey -> the
 // operator's label, and the labels Tenir sent that name no org. Human rate.
 const MEETING_LABELS_FILE = process.env.MEETING_LABELS_FILE || "/data/meeting-labels.json";
+// A meeting's full transcript, one file per meeting, kept as long as its row
+// (XERK-2941). Postgres is the of-record under HA (meeting-transcripts.js).
+// Beside the proposal store by default, so a test's scratch store gets its own dir.
+const MEETING_TRANSCRIPTS_DIR = process.env.MEETING_TRANSCRIPTS_DIR
+  || MEETING_PROPOSALS_FILE.replace(/\.json$/, "") + "-transcripts";
+// Files on /data, Postgres beside them under HA (the archive index's pool).
+const meetingTranscripts = makeTranscriptStore({ dir: MEETING_TRANSCRIPTS_DIR, pool: archiveIndexPool });
 const MEETING_LABEL_MISSES_FILE =
   process.env.MEETING_LABEL_MISSES_FILE || "/data/meeting-label-misses.json";
 // Whose work an org's meetings propose (XERK-2514): siteKey -> {names, role}.
@@ -22417,6 +22425,39 @@ function meetingDailyBrief(siteKey, m) {
 const meetingPendingCount = (list) => (list || []).filter((m) => MEETING_PENDING.has(m.status)).length;
 
 // The answer to a valid POST: {status, body}. Idempotent on meetingId.
+// The full transcript outlives the row's own copy (XERK-2941): saved at Tenir's
+// POST, served by GET .../meetings/<id>/transcript, dropped with its row.
+function saveMeetingTranscript(m) {
+  if (!m || !Array.isArray(m.segments) || !m.segments.length) return false;
+  return meetingTranscripts.save(m.meetingId, m.receivedAt,
+    { startedAt: m.startedAt, participants: m.participants || [], segments: m.segments });
+}
+// Leader-only, on meetingsTick: back-fill a pending row's transcript (one that
+// arrived before this build, or on a replica whose disk is gone), then drop every
+// document no stored row names. Postgres is swept every MEETING_TRANSCRIPT_SWEEP_MS.
+const MEETING_TRANSCRIPT_SWEEP_MS = 10 * 60e3;
+let meetingTranscriptRemoteSweptAt = 0;
+let meetingTranscriptSweeping = false;
+function sweepMeetingTranscripts(now = Date.now()) {
+  if (meetingTranscriptSweeping) return;
+  const live = new Set();
+  for (const list of Object.values(meetingProposals)) {
+    for (const m of list || []) {
+      if (!m || !m.meetingId || !m.receivedAt) continue;
+      live.add(meetingTranscripts.keyOf(m.meetingId, m.receivedAt));
+      if (MEETING_PENDING.has(m.status) && !meetingTranscripts.has(m.meetingId, m.receivedAt)) {
+        saveMeetingTranscript(m);
+      }
+    }
+  }
+  const withRemote = now - meetingTranscriptRemoteSweptAt >= MEETING_TRANSCRIPT_SWEEP_MS;
+  if (withRemote) meetingTranscriptRemoteSweptAt = now;
+  meetingTranscriptSweeping = true;
+  meetingTranscripts.sweep(live, { withRemote })
+    .catch((e) => console.error(`meetings: transcript sweep failed: ${e && e.message}`))
+    .finally(() => { meetingTranscriptSweeping = false; });
+}
+
 function acceptMeeting(siteKey, body, now = Date.now()) {
   const { row, error } = meetingFromBody(body, now);
   if (error) return { status: 400, body: { error } };
@@ -22480,6 +22521,7 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   const kept = putMeeting(siteKey, { ...row, ...(daily ? { daily } : {}),
     ...meetingCalendarLinkFields(siteKey, { ...row, daily }, calendarCandidateIndex(tenantOfSite(siteKey))) });
   if (!kept) return { status: 400, body: { error: "the meeting could not be stored" } };
+  saveMeetingTranscript(kept);
   dispatchNextMeeting(siteKey, now);
   const m = meetingProposals[siteKey].find((x) => x.meetingId === row.meetingId) || kept;
   return { status: 200, body: { ok: true, meeting: meetingTenirWire(m) } };
@@ -22593,6 +22635,11 @@ function meetingsTick(now = Date.now()) {
     settleMeetingReviews(now);
   } catch (e) {
     console.error(`meetings: settling reviews failed: ${e && e.message}`);
+  }
+  try {
+    sweepMeetingTranscripts(now);
+  } catch (e) {
+    console.error(`meetings: transcript sweep failed: ${e && e.message}`);
   }
   const orgs = decidedOrgs();
   for (const [siteKey, list] of Object.entries(meetingProposals)) {
@@ -29005,6 +29052,31 @@ const server = http.createServer(async (req, res) => {
       return json(res, out.status, out.body);
     }
 
+    // GET /api/orgs/<siteKey>/meetings/<meetingId>/transcript — the meeting's full
+    // transcript (XERK-2941), operator-authed like the archive route. Read through
+    // the org's stored row only, so the org guard scopes it. 404 for an unknown org
+    // or meeting, or a meeting whose transcript was never kept (one settled before
+    // this build); 503 while the store is unreachable.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 6 && parts[3] === "meetings" && parts[5] === "transcript") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const meetingId = decodeURIComponent(parts[4]);
+      if (!decidedOrgs().has(siteKey)) return json(res, 404, { error: "no host is in that org" });
+      const m = (Object.hasOwn(meetingProposals, siteKey) ? meetingProposals[siteKey] : [])
+        .find((x) => x.meetingId === meetingId);
+      if (!m) return json(res, 404, { error: "no such meeting" });
+      let doc;
+      try {
+        doc = await meetingTranscripts.load(m.meetingId, m.receivedAt);
+      } catch (e) {
+        return json(res, 503, { error: `${e.message} — try again shortly` });
+      }
+      if (!doc && Array.isArray(m.segments)) doc = { segments: m.segments };
+      if (!doc) return json(res, 404, { error: "no transcript was kept for this meeting", missing: true });
+      return json(res, 200, { meetingId: m.meetingId, startedAt: m.startedAt,
+        segments: Array.isArray(doc.segments) ? doc.segments : [] });
+    }
+
     // POST /api/orgs/<siteKey>/meetings/<meetingId>/archive {archived} — the
     // operator puts a settled meeting away, or back (XERK-2856). Operator-authed
     // like the item route; answers {ok, meeting} or a refusal in the hub's words.
@@ -30668,7 +30740,7 @@ if (process.env.TURMA_TEST) {
     meetingLabelSlug, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick, meetingTitleGeneric,
     putMeeting, reviewMeetingItem, settleMeetingReviews, archiveMeeting, meetingDailyOf, keepMeetings, meetingProposalsWire, MEETING_START_WAIT_MS,
     MEETING_CREATE_DEADLINE_MS, MEETING_MAYBE_CREATED_REFUSAL, acceptMeeting,
-    ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETINGS_PENDING_TOTAL_MAX, MEETINGS_PENDING_HARD_FACTOR, MEETING_RUN_TIMEOUT_MS,
+    ingestMeetingResults, normalizeRunCapability, meetingSent, meetingTranscripts, sweepMeetingTranscripts, MEETING_TRANSCRIPTS_DIR, MEETINGS_PENDING_BYTES_MAX, MEETINGS_PENDING_TOTAL_MAX, MEETINGS_PENDING_HARD_FACTOR, MEETING_RUN_TIMEOUT_MS,
     MEETING_QUEUE_MAX_MS, MEETINGS_KEEP, MEETINGS_AUTO_MODEL, DAILY_BRIEF_RUN_TIMEOUT_MS, DAILY_BRIEF_LATE_MS,
     decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, permissionAnswerKind,
     decisionsTick, decidedOrgs, DECISIONS_RETAIN_MS,

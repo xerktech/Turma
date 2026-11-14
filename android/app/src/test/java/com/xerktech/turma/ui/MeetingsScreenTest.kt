@@ -155,6 +155,33 @@ class MeetingsScreenTest {
         compose.onNodeWithText("Reopen").performScrollTo().assertExists()
     }
 
+    @Test fun `XERK-2941 Show full transcript reads it once and lists speaker turns with their time`() {
+        seed()
+        hub.json("/api/orgs/$site/meetings/m2/transcript", """{ "meetingId": "m2", "segments": [
+            { "speaker": "Ann", "text": "We should fix login.", "startMs": 65000 },
+            { "speaker": "Ann", "text": "Today.", "startMs": 67000 },
+            { "speaker": "Bo", "text": "Agreed.", "startMs": 3725000 } ] }""")
+        hub.json("/api/orgs/$site/meetings/m0/transcript",
+            """{ "error": "no transcript was kept for this meeting", "missing": true }""", code = 404)
+        val vm = main.track(MeetingsViewModel(hub.app))
+        show(vm)
+        open("Sprint sync")
+        compose.onNodeWithText("Show full transcript").performScrollTo().performClick()
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText("We should fix login. Today.").fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("1:05").assertExists()
+        compose.onNodeWithText("1:02:05").assertExists()
+        compose.onNodeWithText("Agreed.").assertExists()
+        compose.onNodeWithText("Hide transcript").performScrollTo().performClick()
+        compose.onNodeWithText("Agreed.").assertDoesNotExist()
+        compose.onNodeWithText("Show full transcript").performScrollTo().performClick()
+        compose.onNodeWithText("Agreed.").assertExists()
+        // One read: the second open reuses it.
+        hub.findRequest("/m2/transcript")
+        org.junit.Assert.assertNull(hub.findRequestOrNull("/m2/transcript"))
+    }
+
     @Test fun `Reopen sends the reopen action and Archive the archive route`() {
         seed()
         hub.json("/api/orgs/$site/meetings/m2/items/p4", """{ "ok": true }""")
