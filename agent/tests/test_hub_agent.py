@@ -18795,9 +18795,35 @@ class TestSafeUploadName(unittest.TestCase):
         self.assertEqual(len(out), ha.UPLOAD_NAME_MAX)
         self.assertTrue(out.endswith(".png"))
 
-    def test_characters_outside_the_safe_set_become_underscores(self):
-        self.assertEqual(ha.safe_upload_name("déjà vu (1).PNG"), "d_j_ vu (1).PNG")
-        self.assertEqual(ha.safe_upload_name("a\nb;rm -rf.txt"), "a_b_rm -rf.txt")
+    def test_letters_of_any_script_survive_and_invisibles_are_dropped(self):
+        # XERK-2947. The same table as the hub's server.test.js and android's
+        # UploadsTest — the three must agree.
+        cases = [
+            ("déjà vu (1).PNG", "déjà vu (1).PNG"),
+            ("e\u0301te\u0301.png", "\u00e9t\u00e9.png"),  # NFD in, NFC out
+            ("報告書.pdf", "報告書.pdf"),
+            ("Привет мир.txt", "Привет мир.txt"),
+            ("invoice\u202egnp.exe", "invoicegnp.exe"),    # bidi override
+            ("a\u200bb.png", "ab.png"),                    # zero-width
+            ("a\ufe0fb.png", "ab.png"),                    # variation selector
+            ("a\nb;rm -rf.txt", "ab_rm -rf.txt"),          # control dropped
+            ("\U0001F4F7 shot.png", "_ shot.png"),          # one _ per code point
+            ("a\u00a0b.png", "a_b.png"),                   # non-ASCII space
+            ("a\uff0fb", "a_b"),                           # fullwidth solidus
+            ("\ud800x.png", "_x.png"),                     # lone surrogate
+        ]
+        for raw, want in cases:
+            self.assertEqual(ha.safe_upload_name(raw), want, repr(raw))
+
+    def test_a_cut_counts_code_points_and_utf8_bytes(self):
+        # ext4 caps a name at 255 bytes; 100 CJK letters would be 300.
+        self.assertEqual(ha.safe_upload_name("字" * 130 + ".png"), "字" * 78 + ".png")
+        self.assertEqual(ha.safe_upload_name("\U00020000" * 130 + ".png"),
+                         "\U00020000" * 59 + ".png")
+        self.assertEqual(ha.safe_upload_name("é" * 130 + ".png"), "é" * 96 + ".png")
+        # Room is left for _unique_upload_path's "-<8 hex>" suffix.
+        self.assertLessEqual(
+            len(ha.safe_upload_name("字" * 130).encode()) + 9, 255)
 
     def test_the_directory_is_under_uploads_whatever_the_id(self):
         d = ha.upload_dir_for("../../root")

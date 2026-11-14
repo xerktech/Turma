@@ -943,21 +943,38 @@ const uploads = new Map();
  * A filename safe to hand an agent that will join it onto a directory path.
  * Both sides sanitize (the agent must never trust a name off the wire), but the
  * hub does it FIRST so the name the operator sees on the chip is the name the
- * file lands under. Keeps a readable ASCII skeleton: basename only, no
- * separators, no control bytes, no leading dot (a dotfile hides the upload).
+ * file lands under. Basename only, no separators, no leading dot (a dotfile
+ * hides the upload). Letters, digits and combining marks of any script survive
+ * (XERK-2947: "été.png" must not land as "_t_.png"); invisible characters —
+ * controls, bidi overrides, zero-width and variation selectors — are dropped,
+ * and anything else (symbols, punctuation, non-ASCII spaces) becomes "_".
+ * Mirrored by the agent's safe_upload_name and android's sanitizeUploadName.
  */
+const UPLOAD_NAME_MAX = 100;        // code points, not UTF-16 units
+const UPLOAD_NAME_MAX_BYTES = 240;  // UTF-8; ext4 caps a name at 255 and the
+                                    // agent may add a "-<8 hex>" dedup suffix
+const UPLOAD_NAME_INVISIBLE_RE = /[\p{Cc}\p{Cf}\u034f\ufe00-\ufe0f\u{e0100}-\u{e01ef}]/gu;
+const UPLOAD_NAME_BAD_RE = /[^\p{L}\p{N}\p{Mn}\p{Mc}._ ()+-]/gu;
+const utf8Len = (cps) => Buffer.byteLength(cps.join(""), "utf8");
+
 function safeUploadName(name) {
-  let s = String(name == null ? "" : name);
+  let s = String(name == null ? "" : name).normalize("NFC");
   s = s.split(/[\\/]/).pop() || "";               // basename, both separators
-  s = s.replace(/[\u0000-\u001f\u007f]/g, "");     // control bytes
-  s = s.replace(/[^A-Za-z0-9._ ()+-]/g, "_");     // conservative charset
+  s = s.replace(UPLOAD_NAME_INVISIBLE_RE, "");     // controls, bidi, zero-width
+  s = s.replace(UPLOAD_NAME_BAD_RE, "_");          // letters/digits/marks + a few
   s = s.replace(/\s+/g, " ").trim().replace(/^\.+/, "").trim();
-  if (s.length > 100) {
+  // Measured in code points (Array.from), so a cut never splits a surrogate pair
+  // and the three mirrors agree on where it falls.
+  const cps = Array.from(s);
+  if (cps.length > UPLOAD_NAME_MAX || utf8Len(cps) > UPLOAD_NAME_MAX_BYTES) {
     // Keep the extension — it is what tells the agent (and Claude Code's Read)
     // what kind of file this is; truncating it away would make a .png unreadable.
-    const dot = s.lastIndexOf(".");
-    const ext = dot > 0 && s.length - dot <= 12 ? s.slice(dot) : "";
-    s = s.slice(0, 100 - ext.length) + ext;
+    const dot = cps.lastIndexOf(".");
+    const ext = dot > 0 && cps.length - dot <= 12 ? cps.slice(dot) : [];
+    const head = cps.slice(0, UPLOAD_NAME_MAX - ext.length);
+    const budget = UPLOAD_NAME_MAX_BYTES - utf8Len(ext);
+    while (head.length && utf8Len(head) > budget) head.pop();
+    s = head.concat(ext).join("");
   }
   return s || "upload";
 }

@@ -1263,11 +1263,17 @@ WORKTREE_RETENTION_SEC = _env_int("TURMA_WORKTREE_RETENTION_SEC", 3 * 86400,
                                   minimum=0)
 REAP_TERM_GRACE_SEC = 5   # SIGTERM, then SIGKILL whatever is still there
 REAP_REFLOG_MAX = 500     # HEAD reflog entries checked; a longer one keeps the tree
-# Filename charset, mirrored from the hub's safeUploadName. The hub sanitizes
+# Filename rules, mirrored from the hub's safeUploadName. The hub sanitizes
 # first so the operator's chip shows the landing name; this repeats it because a
-# name arriving over the wire must never be able to escape UPLOADS_DIR.
-UPLOAD_NAME_BAD_RE = re.compile(r"[^A-Za-z0-9._ ()+-]")
-UPLOAD_NAME_MAX = 100
+# name arriving over the wire must never be able to escape UPLOADS_DIR. Letters,
+# digits and combining marks of any script are kept (XERK-2947); see
+# _upload_name_char for the rest.
+UPLOAD_NAME_OK_ASCII = frozenset("._ ()+-")
+UPLOAD_NAME_INVISIBLE = frozenset(
+    [0x034F, *range(0xFE00, 0xFE10), *range(0xE0100, 0xE01F0)])
+UPLOAD_NAME_MAX = 100        # code points
+UPLOAD_NAME_MAX_BYTES = 240  # UTF-8: ext4 caps a name at 255, and
+                             # _unique_upload_path may add "-<8 hex>"
 # Ticket attachments (XERK-242). A ticket's own screenshots and files are part of
 # what it asks for, and the session may have no board creds to go and fetch them
 # with — so they are pulled off the tracker at spawn and written into that session's
@@ -18361,25 +18367,52 @@ def _clean_input_text(text):
 
 # ---- file attachments (XERK-234) --------------------------------------------
 
+def _upload_name_char(ch):
+    """One character of an upload name: kept, dropped ("") or "_".
+
+    Invisible characters — controls, format/bidi/zero-width (Cc, Cf) and the
+    variation selectors / grapheme joiner — are dropped outright. Letters,
+    digits and non-enclosing marks of any script are kept; everything else
+    outside UPLOAD_NAME_OK_ASCII (symbols, punctuation, non-ASCII spaces,
+    lone surrogates) becomes "_"."""
+    if ord(ch) in UPLOAD_NAME_INVISIBLE:
+        return ""
+    cat = unicodedata.category(ch)
+    if cat in ("Cc", "Cf"):
+        return ""
+    if ch.isascii():
+        return ch if ch.isalnum() or ch in UPLOAD_NAME_OK_ASCII else "_"
+    return ch if cat[0] in "LN" or cat in ("Mn", "Mc") else "_"
+
+
+def _utf8_len(s):
+    return len(s.encode("utf-8", "surrogatepass"))
+
+
 def safe_upload_name(name):
     """A filename that can only ever land INSIDE the uploads directory.
 
     Mirrors the hub's safeUploadName. The hub sanitizes first (so the chip the
     operator sees names the file that lands), but this is not a formality: the
     name arrives over the wire, and a `../` or an absolute path reaching
-    os.path.join would write anywhere the agent can. Everything outside a
-    conservative ASCII set becomes `_`; the extension survives a length cut,
-    because it is what tells Claude Code's Read what kind of file this is."""
-    s = str(name or "")
+    os.path.join would write anywhere the agent can. Only letters, digits,
+    marks and `._ ()+-` survive (see _upload_name_char); the extension survives
+    a length cut, because it is what tells Claude Code's Read what kind of
+    file this is."""
+    s = unicodedata.normalize("NFC", str(name or ""))
     s = re.split(r"[\\/]", s)[-1]           # basename, both separators
-    s = UPLOAD_NAME_BAD_RE.sub("_", s)
+    s = "".join(_upload_name_char(ch) for ch in s)
     s = re.sub(r"\s+", " ", s).strip()
     s = s.lstrip(".")                        # never a dotfile — a hidden upload
     s = s.strip()
-    if len(s) > UPLOAD_NAME_MAX:
+    if len(s) > UPLOAD_NAME_MAX or _utf8_len(s) > UPLOAD_NAME_MAX_BYTES:
         stem, dot, ext = s.rpartition(".")
         ext = f".{ext}" if dot and stem and len(ext) <= 11 else ""
-        s = s[:UPLOAD_NAME_MAX - len(ext)] + ext
+        head = s[:UPLOAD_NAME_MAX - len(ext)]
+        budget = UPLOAD_NAME_MAX_BYTES - _utf8_len(ext)
+        while head and _utf8_len(head) > budget:
+            head = head[:-1]
+        s = head + ext
     return s or "upload"
 
 

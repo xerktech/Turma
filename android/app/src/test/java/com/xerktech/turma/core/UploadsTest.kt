@@ -47,8 +47,32 @@ class UploadsTest {
     }
 
     @Test
-    fun `characters outside the safe set become underscores`() {
-        assertEquals("d_j_ vu (1).PNG", Uploads.sanitizeUploadName("déjà vu (1).PNG"))
+    fun `letters of any script survive and invisibles are dropped`() {
+        // XERK-2947. The same table as the hub's server.test.js and the agent's
+        // TestSafeUploadName — the three must agree.
+        val cases = listOf(
+            "déjà vu (1).PNG" to "déjà vu (1).PNG",
+            "e\u0301te\u0301.png" to "\u00e9t\u00e9.png",   // NFD in, NFC out
+            "報告書.pdf" to "報告書.pdf",
+            "Привет мир.txt" to "Привет мир.txt",
+            "invoice\u202egnp.exe" to "invoicegnp.exe",     // bidi override
+            "a\u200bb.png" to "ab.png",                     // zero-width
+            "a\ufe0fb.png" to "ab.png",                     // variation selector
+            "a\nb;rm -rf.txt" to "ab_rm -rf.txt",           // control dropped
+            "\uD83D\uDCF7 shot.png" to "_ shot.png",        // one _ per code point
+            "a\u00a0b.png" to "a_b.png",                    // non-ASCII space
+            "a\uff0fb" to "a_b",                            // fullwidth solidus
+            "\uD800x.png" to "_x.png",                      // lone surrogate
+        )
+        for ((raw, want) in cases) assertEquals(raw, want, Uploads.sanitizeUploadName(raw))
+    }
+
+    @Test
+    fun `a cut counts code points and utf8 bytes`() {
+        assertEquals("字".repeat(78) + ".png", Uploads.sanitizeUploadName("字".repeat(130) + ".png"))
+        val astral = "\uD840\uDC00"
+        assertEquals(astral.repeat(59) + ".png", Uploads.sanitizeUploadName(astral.repeat(130) + ".png"))
+        assertEquals("é".repeat(96) + ".png", Uploads.sanitizeUploadName("é".repeat(130) + ".png"))
     }
 
     // --- the capability flag ------------------------------------------------

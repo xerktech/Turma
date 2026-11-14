@@ -23348,12 +23348,38 @@ test("uploads: safeUploadName can never escape the uploads directory", () => {
   assert.equal(safeUploadName("  ..hidden.png"), "hidden.png");
   assert.equal(safeUploadName(""), "upload");
   assert.equal(safeUploadName("."), "upload");
-  // Anything outside the safe set becomes an underscore, and an over-long name
-  // keeps its extension — that is what says what kind of file it is.
-  assert.equal(safeUploadName("déjà vu (1).PNG"), "d_j_ vu (1).PNG");
+  // An over-long name keeps its extension — that is what says what kind of
+  // file it is.
   const long = safeUploadName("a".repeat(130) + ".png");
   assert.equal(long.length, 100);
   assert.ok(long.endsWith(".png"));
+});
+
+test("uploads: safeUploadName keeps letters of any script and drops invisibles (XERK-2947)", () => {
+  // The same table is asserted by the agent's TestSafeUploadName and android's
+  // UploadsTest — the three must agree, since the hub's answer is the chip.
+  const cases = [
+    ["déjà vu (1).PNG", "déjà vu (1).PNG"],
+    ["e\u0301te\u0301.png", "\u00e9t\u00e9.png"],   // NFD in, NFC out
+    ["報告書.pdf", "報告書.pdf"],
+    ["Привет мир.txt", "Привет мир.txt"],
+    ["invoice\u202egnp.exe", "invoicegnp.exe"],     // bidi override dropped
+    ["a\u200bb.png", "ab.png"],                     // zero-width dropped
+    ["a\ufe0fb.png", "ab.png"],                     // variation selector dropped
+    ["a\nb;rm -rf.txt", "ab_rm -rf.txt"],           // control dropped, ; -> _
+    ["\u{1F4F7} shot.png", "_ shot.png"],            // one _ per code point
+    ["a\u00a0b.png", "a_b.png"],                    // non-ASCII space
+    ["a\uff0fb", "a_b"],                            // fullwidth solidus
+    ["\ud800x.png", "_x.png"],                      // lone surrogate
+  ];
+  for (const [input, want] of cases) assert.equal(safeUploadName(input), want, JSON.stringify(input));
+  // A cut counts code points and UTF-8 bytes (ext4 caps a name at 255): it never
+  // splits a surrogate pair and always keeps the extension.
+  const cjk = safeUploadName("字".repeat(130) + ".png");
+  assert.equal(cjk, "字".repeat(78) + ".png");
+  const astral = safeUploadName("\u{20000}".repeat(130) + ".png");
+  assert.equal(astral, "\u{20000}".repeat(59) + ".png");
+  assert.equal(safeUploadName("é".repeat(130) + ".png"), "é".repeat(96) + ".png");
 });
 
 test("uploads: uploadCapFor is the capability flag as well as the cap", () => {
