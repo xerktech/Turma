@@ -223,13 +223,17 @@ async function getJson(url) {
 }
 // Read one week (Monday–Sunday) of events + holidays. A read already in flight
 // is asked again once it lands, so a frame mid-read is never lost.
-async function loadWeek(ws) {
-  const org = orgKeyOf();
+// The read keeps the org pick it started with (its cache key), so a pick changed
+// mid-read never leaves that entry loading or fills it with another pick's events.
+async function loadWeek(ws, keys = orgKeys()) {
+  keys = keys.slice().sort();
+  const org = keys.join(",");
   const w = weekEntry(ws, org);
   if (w.loading) { w.again = true; return; }
   w.loading = true;
   w.again = false;
-  const keys = orgKeys();
+  clearTimeout(w.retry);
+  w.retry = 0;
   const q = keys.length ? `&org=${encodeURIComponent(keys.join(","))}` : "";
   try {
     const [cal, hol] = await Promise.all([
@@ -243,33 +247,41 @@ async function loadWeek(ws) {
     w.err = String((e && e.message) || e);
   }
   w.loading = false;
-  clearTimeout(w.retry);
-  w.retry = 0;
-  if (w.cal && hostNotices(w.cal, ws).some((n) => n.syncing)) {
-    w.retry = setTimeout(() => { w.retry = 0; if (active) loadWeek(ws); }, RETRY_PENDING_MS);
+  if (weeks.get(`${org}|${ws}`) !== w) return;           // dropped by refetch() meanwhile
+  if (w.again) return void loadWeek(ws, keys);
+  // A failed read (a hub rollout, a 503) and a host still syncing are both read
+  // again later; while hidden the timer only clears, and showing re-asks.
+  if (w.err || (w.cal && hostNotices(w.cal, ws).some((n) => n.syncing))) {
+    w.retry = setTimeout(() => { w.retry = 0; if (active) loadWeek(ws, keys); }, RETRY_PENDING_MS);
     if (w.retry && w.retry.unref) w.retry.unref();
   }
-  if (w.again) return void loadWeek(ws);
   if (active) paint();
 }
 // Fetch what is shown (and the weeks either side, so ‹ › paints at once).
-function ensureLoaded(days) {
+function wantedWeeks(days) {
   const vis = weeksOf(days);
-  const all = [addDays(vis[0], -7), ...vis, addDays(vis[vis.length - 1], 7)];
-  for (const ws of all) {
+  return [addDays(vis[0], -7), ...vis, addDays(vis[vis.length - 1], 7)];
+}
+function ensureLoaded(days) {
+  for (const ws of wantedWeeks(days)) {
     const w = weekEntry(ws);
-    if (!w.cal && !w.loading && !w.err) loadWeek(ws);
+    if ((!w.cal || w.err) && !w.loading && !w.retry) loadWeek(ws);
   }
 }
-// The hub said a host's calendar (or an org's days off) changed: re-read every
-// week held for the current org pick; other picks are dropped, re-read when shown.
+// Something the calendar shows changed (a host's sync, an org's days off, a Tenir
+// capture), or the stream was down: re-read only the shown weeks and the ones
+// either side. Every other week is dropped and read again when shown, so a frame
+// costs the same however many weeks this tab has browsed. The shown weeks keep
+// their copy on screen until the new one lands.
 function refetch() {
   const org = orgKeyOf();
+  const keep = new Set(wantedWeeks(visibleDays(anchor, mode())).map((ws) => `${org}|${ws}`));
   for (const [k, w] of [...weeks]) {
-    if (!k.startsWith(`${org}|`)) { clearTimeout(w.retry); weeks.delete(k); continue; }
-    if (active) loadWeek(Number(k.slice(org.length + 1)));
-    else { w.cal = null; w.hol = null; w.err = ""; }
+    if (keep.has(k) && active) continue;
+    clearTimeout(w.retry);
+    weeks.delete(k);
   }
+  if (active) for (const k of keep) loadWeek(Number(k.slice(org.length + 1)));
 }
 // The events, holidays and host rows of the shown weeks, an event held by two weeks once.
 function collect(days) {
@@ -310,11 +322,14 @@ function hostNotices(cal, ws) {
 }
 function noticeText(n, now) {
   const when = ago(n.syncedAt, now);
+  // lastError is the hub's or Outlook's own words ("Outlook is not open", "the hub
+  // kept N of M events…"), so it is quoted as is, never re-labelled.
+  const err = n.error ? ` Last sync problem: ${n.error}` : "";
   if (n.offline) {
-    return n.never ? `${n.device} is offline and has not synced this week; its events may be missing.`
-      : `${n.device} is offline — showing its calendar as last synced${when ? ` ${when}` : ""}.`;
+    return (n.never ? `${n.device} is offline and has not synced this week; its events may be missing.`
+      : `${n.device} is offline — showing its calendar as last synced${when ? ` ${when}` : ""}.`) + err;
   }
-  if (n.error) return `${n.device}: Outlook not reachable (${n.error})${when ? ` — last synced ${when}` : ""}.`;
+  if (n.error) return `${n.device}: the calendar sync reported a problem — ${n.error}${when ? ` (last synced ${when})` : ""}.`;
   return `Syncing ${n.device}'s Outlook for this week…`;
 }
 
@@ -541,7 +556,7 @@ function neighbour(btn, key) {
   return null;
 }
 function onKey(ev) {
-  if (!active || !ev) return;
+  if (!active || !ev || ev.defaultPrevented) return;
   if (ev.key === "Escape") {
     if (picker !== null) { picker = null; paint(true); focusQ("[data-open-picker]"); ev.preventDefault(); return; }
     if (detail) { closeDetail(); ev.preventDefault(); return; }
@@ -612,7 +627,9 @@ function mount(el, opts = {}) {
     }
     if (d.pick !== undefined) { picker = null; go(Number(d.pick)); focusQ("[data-open-picker]"); }
   });
-  $root.addEventListener("keydown", onKey);
+  // On the document, so Esc closes the picker / panel after a click elsewhere;
+  // arrows act only on a focused event button (onKey checks the target).
+  (typeof document !== "undefined" && document.addEventListener ? document : $root).addEventListener("keydown", onKey);
   // Swipe left/right on the grid moves like › / ‹ (the narrow layout's arrows).
   let touch = null;
   $root.addEventListener("touchstart", (ev) => {

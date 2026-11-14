@@ -310,6 +310,8 @@
     .mt-tools { margin-left: 0; }
     .cal { padding: 8px; }
     button.cal-range { font-size: 15px; }
+    /* Over the phone's bottom nav (z 40), whose bar otherwise hides the panel's end. */
+    .cal-detail { z-index: 45; }
   }
 </style>
 </head>
@@ -848,7 +850,7 @@ function connectSSE() {
     // the hub sends a whole-map event only when this stream's slice CHANGES, so
     // nothing on a fresh stream repairs what moved while it was down (a hub
     // restart or rollout) — and the fallback poll runs only while SSE is down.
-    if (sseEverOpen) refresh();
+    if (sseEverOpen) { refresh(); TurmaCalendar.refetch(); }
     sseEverOpen = true;
     sseOk = true; sseBackoff = 2000;
   };
@@ -876,6 +878,8 @@ function connectSSE() {
     meetingsClock++;
     cache.meetingProposals = d;
     renderBriefs(cache, Date.now());
+    // A Tenir capture is a calendar entry too, and the hub announces it only here.
+    calendarSoon();
   });
   // Each org's Tenir label and the labels no org has (XERK-2638), and whose
   // work its meetings propose (XERK-2514).
@@ -890,8 +894,8 @@ function connectSSE() {
     });
   }
   // The calendar reads its own routes; these frames only say what changed.
-  es.addEventListener("calendar", () => TurmaCalendar.refetch());
-  es.addEventListener("holidaySettings", () => TurmaCalendar.refetch());
+  es.addEventListener("calendar", () => calendarSoon());
+  es.addEventListener("holidaySettings", () => calendarSoon());
   TurmaOrg.sse(es);
   es.onerror = () => {
     sseOk = false;
@@ -905,6 +909,13 @@ function connectSSE() {
   };
 }
 TurmaOrg.subscribe(() => { if (cache) render(cache); });
+// Frames come in bursts (a review is one meetingProposals frame per answer), so
+// the calendar re-reads once per burst.
+let calendarTimer = 0;
+function calendarSoon() {
+  if (calendarTimer) return;
+  calendarTimer = setTimeout(() => { calendarTimer = 0; TurmaCalendar.refetch(); }, 1000);
+}
 // The stream opens once the first snapshot is in, naming it (XERK-2599).
 refresh().finally(connectSSE);
 // The org list rides the agent payload, which this page does not live-patch, so a
@@ -912,6 +923,8 @@ refresh().finally(connectSSE);
 // The 30s repaint keeps "started Nm ago" and the next-run lookup current.
 setInterval(() => refresh(), 60000);
 setInterval(() => { if (!sseOk) refresh(); }, 15000);
+// With the stream down no calendar frame arrives, so the calendar polls too.
+setInterval(() => { if (!sseOk) TurmaCalendar.refetch(); }, 60000);
 setInterval(() => { if (cache) renderBriefs(cache, Date.now()); }, 30000);
 </script>
 </body>

@@ -21,6 +21,8 @@ globalThis.fetch = async (u) => {
   const url = String(u);
   const key = Object.keys(replies).find((k) => url.startsWith(k));
   const body = key ? replies[key](url) : (url.startsWith("/api/holidays") ? [] : { events: [], hosts: [] });
+  // A reply of {status, body} is a refusal.
+  if (body && body.status) return { status: body.status, ok: false, json: async () => body.body || {} };
   return { status: 200, ok: true, json: async () => body };
 };
 const cal = require("../public/calendar.js");
@@ -195,7 +197,90 @@ test("XERK-2897: host notices — Outlook unreachable and a covered online host"
     { host: "b", device: "b", online: true, ranges: [[ws - 1, ws + 8 * 86400000]] },
   ] }, ws);
   assert.equal(n.length, 1);
-  assert.equal(cal.noticeText(n[0], NOW), "a: Outlook not reachable (Outlook is not open) — last synced 2 min ago.");
+  // lastError is quoted in the hub's / Outlook's own words, never re-labelled.
+  assert.equal(cal.noticeText(n[0], NOW), "a: the calendar sync reported a problem — Outlook is not open (last synced 2 min ago).");
+  const off = cal.hostNotices({ hosts: [{ host: "c", device: "c", online: false, ranges: [[ws - 1, ws + 8 * 86400000]],
+    lastError: "the hub kept 1500 of 1600 events", syncedAt: NOW - 120000 }] }, ws);
+  assert.equal(cal.noticeText(off[0], NOW),
+    "c is offline — showing its calendar as last synced 2 min ago. Last sync problem: the hub kept 1500 of 1600 events");
   assert.equal(cal.safeHttps("javascript:alert(1)"), "");
   assert.equal(cal.safeHttps('https://x.test/"onmouseover'), "");
+});
+
+test("XERK-2897: the org pick is the cache key — another pick's events never show", async () => {
+  const ws = cal.weekStart(at(2027, 2, 3));
+  replies = {
+    "/api/calendar": (url) => ({ hosts: [], events: url.includes("org=a.atlassian.net") && url.includes(`from=${ws}`)
+      ? [{ host: "h1", id: "A1", org: "a.atlassian.net", subject: "Only for A", startMs: at(2027, 2, 3, 9), endMs: at(2027, 2, 3, 10) }]
+      : [] }),
+  };
+  orgKeys = ["a.atlassian.net"];
+  assert.match(await show(at(2027, 2, 3)), /Only for A/);
+  orgKeys = ["b.atlassian.net"];
+  assert.doesNotMatch(await show(at(2027, 2, 3)), /Only for A/);
+  orgKeys = [];
+});
+
+test("XERK-2897: holiday names and an org color are escaped / whitelisted", async () => {
+  const evil = "<img src=x onerror=alert(2)>";
+  const board = globalThis.TurmaBoard;
+  globalThis.TurmaBoard = { ...board, orgColorMap: () => new Map([["acme", "red;background:url(x)"]]) };
+  replies = {
+    "/api/holidays": () => [{ id: "h", date: "2027-03-03", name: evil, country: "US", offFor: [] }],
+    "/api/calendar": () => ({ hosts: [], events: [{ host: "h1", id: "c1", org: "acme", subject: "Colored",
+      startMs: at(2027, 3, 3, 9), endMs: at(2027, 3, 3, 10) }] }),
+  };
+  cal.refetch();
+  const html = await show(at(2027, 3, 3));
+  globalThis.TurmaBoard = board;
+  assert.match(html, /Colored/);
+  assert.ok(!html.includes("<img"), "holiday name escaped");
+  assert.ok(!html.includes("url(x)"), "an org color is inlined only as var(--sN)");
+});
+
+test("XERK-2897: a 401 sends the page to the login", async () => {
+  replies = { "/api/calendar": () => ({ status: 401 }) };
+  globalThis.location.href = "";
+  cal.refetch();
+  await show(at(2027, 4, 7));
+  assert.equal(globalThis.location.href, "/login");
+});
+
+test("XERK-2897: a failed read is retried, a hidden view asks nothing, and a frame re-reads only the shown weeks", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let fail = true;
+  const asked = [];
+  replies = {
+    "/api/calendar": (url) => {
+      asked.push(url);
+      if (fail) return { status: 503, body: { error: "hub restarting" } };
+      return { hosts: [], events: [{ host: "h1", id: "r1", org: "", subject: "Back again",
+        startMs: at(2027, 5, 5, 9), endMs: at(2027, 5, 5, 10) }] };
+    },
+  };
+  cal.refetch();
+  let html = await show(at(2027, 5, 5));
+  assert.match(html, /hub restarting/);
+  fail = false;
+  // Hidden: the retry timer fires but reads nothing.
+  cal.setActive(false);
+  asked.length = 0;
+  t.mock.timers.tick(20000);
+  for (let i = 0; i < 6; i++) await tick();
+  assert.equal(asked.length, 0, "no read while hidden");
+  // Shown again: the failed weeks are read again at once.
+  html = await show(at(2027, 5, 5));
+  assert.match(html, /Back again/);
+  assert.doesNotMatch(html, /hub restarting/);
+  // Still failing while shown: the timer re-reads it.
+  fail = true; cal.refetch(); for (let i = 0; i < 6; i++) await tick();
+  assert.match(cal.calendarHtml(), /hub restarting/);
+  fail = false; t.mock.timers.tick(20000); for (let i = 0; i < 6; i++) await tick();
+  assert.match(cal.calendarHtml(), /Back again/);
+  // Browse ten weeks, then a frame: only the shown week and its neighbours are read.
+  for (let i = 1; i <= 10; i++) await show(cal.addDays(at(2027, 5, 5), 7 * i));
+  asked.length = 0;
+  cal.refetch();
+  for (let i = 0; i < 6; i++) await tick();
+  assert.equal(asked.length, 3, `one read per wanted week, not per week ever seen: ${asked.length}`);
 });

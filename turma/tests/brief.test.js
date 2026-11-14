@@ -836,9 +836,26 @@ test("XERK-2897: the Calendar / Notes review switch shows one view, remembers th
   assert.equal(loadPage(null, null, "", { store: { "turma-meetings-view": "bogus" } }).els.calendarView.hidden, false);
 });
 
-test("XERK-2897: the hub's calendar and holidaySettings frames ask the calendar to re-read", () => {
-  const P = loadPage();
+test("XERK-2897: calendar, holidaySettings and meetingProposals frames re-read the calendar once per burst", async () => {
+  const P = loadPage(null, () => data({}));
+  await P.settle();
+  P.runTimers();
   P.fire("calendar", { h1: { syncedAt: 1 } });
   P.fire("holidaySettings", {});
+  P.fire("meetingProposals", {});                  // a Tenir capture is announced only here
+  assert.equal(P.calendarRefetches(), 0, "coalesced");
+  P.runTimers();
+  assert.equal(P.calendarRefetches(), 1);
+  P.fire("meetingProposals", {});
+  P.runTimers();
   assert.equal(P.calendarRefetches(), 2);
+});
+
+test("XERK-2897: a stream reconnect re-reads the calendar (frames missed while down)", async () => {
+  const P = loadPage(null, () => data({}));
+  await P.settle();
+  P.sse[0].onopen();
+  assert.equal(P.calendarRefetches(), 0, "the first open is not a reconnect");
+  P.sse[0].onopen();
+  assert.equal(P.calendarRefetches(), 1);
 });

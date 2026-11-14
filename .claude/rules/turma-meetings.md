@@ -101,11 +101,19 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   viewer in `localStorage` (`turma-meetings-view`, guarded), Calendar by default. A `?site=` link
   (the proposals push) opens Notes review. The hidden view's keys are inert (`offsetParent`).
 - **`calendar.js` reads its own routes** (`/api/calendar` per Monday–Sunday week, prefetching the
-  weeks either side; `/api/holidays` for the same days). The `calendar` / `holidaySettings` SSE
-  frames only call `refetch()`; the org pick is part of the cache key (`<orgs>|<week>`).
+  weeks either side; `/api/holidays` for the same days). The org pick is part of the cache key
+  (`<orgs>|<week>`); a read keeps the pick it started with.
+- **What re-reads it** (each a QA finding): `calendar`, `holidaySettings` AND `meetingProposals`
+  frames (a Tenir-only capture is announced only by the last), coalesced 1s (`calendarSoon`); a
+  stream reconnect; a 60s poll while the stream is down.
+  - `refetch()` re-reads only the shown weeks + neighbours and DROPS every other cached week: a
+    frame re-reading every week ever browsed grew without bound (and re-queued host syncs).
+  - A failed read is retried every 20s while shown and at once on showing; it never sticks.
   - A host whose stored `ranges` miss the week, or `pending`, reads "Syncing …" and is re-read
     every 20s; the hub queues the sync itself on that GET. Offline / `lastError` hosts get a stale
-    notice in the hub's words; the calendar still renders the hub's copy.
+    notice; the calendar still renders the hub's copy.
+  - `lastError` is quoted as is, never labelled "Outlook" (the hub's budget errors ride it too),
+    and an offline host shows it as well.
 - **Week math is local wall time via `Date` setters** (`addDays`, `weekStart`), never `+ 86400000`:
   a DST week has a 23/25h day. Event rows use wall minutes (`wallMinutes`). Tests pin both DST
   edges and the year boundary.
