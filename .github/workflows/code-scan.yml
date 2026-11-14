@@ -197,7 +197,10 @@ jobs:
     # would skip this required check with it. A failed lookup also runs the tests.
     if: ${{ !cancelled() && needs.tested-tree.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A hang guard, not a speed target: the suite already takes 11-15 min on a
+    # hosted runner, and at 15 it cancelled a green release (#1433). Splitting the
+    # job is the real fix for its length.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       # Same setup-python the Semgrep job already relies on; the tests are
