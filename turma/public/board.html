@@ -399,6 +399,10 @@ function render(data) {
   // horizontally-scrollable strip (.kanban-cols) whose swipe kept snapping back
   // to the first column a few seconds in (XERK-35), and each column list
   // (.kc-list) scrolls vertically too. preserveScroll keeps both across the swap.
+  // The swap also destroys a keyboard-focused card (or a control on one), which
+  // would drop focus to <body> every beat (XERK-2913); focusKeyIn/restoreFocusIn
+  // re-find it in the new grid by its data-key/data-site.
+  const refocus = focusKeyIn($board);
   TurmaNav.preserveScroll($board, () => {
     $board.innerHTML = B.boardHtml(sites, orgFilter, {
       allKeys, sessionIndex, starts: sweepStarts(data.agents || [], sessionIndex),
@@ -418,6 +422,7 @@ function render(data) {
       // its run off this map (its own SSE event keeps it live).
       epicRuns: data.epicRuns,
     });
+    restoreFocusIn($board, refocus);
   });
 }
 

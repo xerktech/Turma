@@ -303,6 +303,28 @@ test("board.html's policy refusal toasts print the siteKey bare", () => {
   assert.doesNotMatch(src, /policy for \$\{siteKey\}/);
 });
 
+// XERK-2913: the board's per-beat grid swap must re-find a keyboard-focused card
+// (or a control on one) by its data-key/data-site, not drop focus to <body>.
+test("board.html restores card focus across the board repaint", () => {
+  const src = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
+  const m = src.match(/function render\([^)]*\) \{[\s\S]*?\n\}/);
+  assert.ok(m, "render not found");
+  const r = m[0];
+  const swap = r.indexOf("$board.innerHTML = B.boardHtml(");
+  assert.ok(swap > 0);
+  assert.ok(r.indexOf("focusKeyIn($board)") > 0 && r.indexOf("focusKeyIn($board)") < swap);
+  assert.ok(r.indexOf("restoreFocusIn($board, refocus)") > swap);
+  // A card's key is its stable data-* pair, so the rebuilt card answers it.
+  const { focusKeyIn } = require("../public/board.js");
+  const card = { tagName: "DIV", id: "", classList: ["kanban-card"],
+    attributes: [{ name: "data-key", value: "W-1" }, { name: "data-site", value: "s" }],
+    getAttribute: () => null };
+  const doc = { activeElement: card };
+  const board = { ownerDocument: doc, contains: (e) => e === card,
+    querySelectorAll: () => [card] };
+  assert.deepEqual(focusKeyIn(board), { sel: 'div[data-key="W-1"][data-site="s"]', nth: 0 });
+});
+
 // XERK-2676: paintDetail's innerHTML swap must hand focus back to the control
 // that held it (or ✕), not drop it to <body>; closing must return focus to the
 // ticket's card even after a board repaint replaced it. Drives the helpers
