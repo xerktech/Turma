@@ -29743,7 +29743,14 @@ test("XERK-2941: a settled meeting's full transcript is kept, served to its org 
   const pend = hub.sanitizeMeeting({ ...meeting2508("bf2"), status: "queued", receivedAt: 7 });
   hub.getMeetings()[S].push(pend);
   assert.equal(hub.meetingTranscripts.has("bf2", 7), false);
-  hub.sweepMeetingTranscripts();
+  // The sweep hands the store each row's tenant, age and pending flag (a pending
+  // meeting is never the budget's victim).
+  const realSweep = hub.meetingTranscripts.sweep;
+  let seen = null;
+  hub.meetingTranscripts.sweep = async (live, opts) => { seen = live; return realSweep(live, opts); };
+  try { hub.sweepMeetingTranscripts(); } finally { hub.meetingTranscripts.sweep = realSweep; }
+  assert.deepEqual(seen.get(hub.meetingTranscripts.keyOf("bf2", 7)), { tenant: "", at: 7, pending: true });
+  await new Promise((r) => setTimeout(r, 20));
   assert.equal(hub.meetingTranscripts.has("bf2", 7), true);
   hub.getMeetings()[S].pop();
   cleanup2508(S, ["mtTr2941"]);
