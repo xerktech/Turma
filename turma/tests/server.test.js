@@ -29767,10 +29767,49 @@ test("XERK-2941 QA: the transcript store holds its byte budget by the biggest te
   // A document that names another meeting reads as absent.
   fs.writeFileSync(path.join(dir, `${st.keyOf("zz", 9)}.json`), JSON.stringify({ meetingId: "other", receivedAt: 9, segments: [] }));
   assert.equal(await st.load("zz", 9), null);
-  // The pure picker: biggest tenant first, oldest first.
+  // The pure picker: biggest tenant first, oldest first, never a pending meeting.
   assert.deepEqual(st.overBudget(new Map([["k1", { tenant: "A", at: 1 }], ["k2", { tenant: "A", at: 2 }], ["k3", { tenant: "B", at: 0 }]]),
     new Map([["k1", 10], ["k2", 10], ["k3", 10]]), 20), ["k1"]);
+  assert.deepEqual(st.overBudget(new Map([["k1", { tenant: "A", at: 1, pending: true }], ["k2", { tenant: "A", at: 2 }]]),
+    new Map([["k1", 10], ["k2", 10]]), 15), ["k2"]);
+  assert.deepEqual(st.overBudget(new Map([["k1", { tenant: "A", at: 1, pending: true }]]), new Map([["k1", 10]]), 5), []);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("XERK-2941 QA: the Postgres sweep deletes only rows past the save grace, and the budget's evictions", async () => {
+  const { makeTranscriptStore } = require("../meeting-transcripts.js");
+  const dir = fs.mkdtempSync(path.join(scratchDir(), "mtrpg2941-"));
+  // A fake pool over one in-memory table, answering the SQL the store sends.
+  const rows = new Map(); // key -> {doc, saved_at}
+  const sent = [];
+  const pool = { async query(sql, params = []) {
+    sent.push(sql.replace(/\s+/g, " ").trim());
+    if (/^CREATE TABLE/.test(sql)) return [];
+    if (/^INSERT/.test(sql)) { if (!rows.has(params[0])) rows.set(params[0], { doc: params[1], saved_at: params[2] }); return []; }
+    if (/^SELECT doc/.test(sql)) { const r = rows.get(params[0]); return r ? [{ doc: r.doc }] : []; }
+    if (/^SELECT key, octet_length/.test(sql)) {
+      return [...rows].filter(([, r]) => r.saved_at < params[0]).map(([key, r]) => ({ key, bytes: Buffer.byteLength(r.doc) }));
+    }
+    if (/^DELETE/.test(sql)) { for (const k of params) rows.delete(k); return []; }
+    throw new Error(`unexpected SQL ${sql}`);
+  } };
+  const st = makeTranscriptStore({ dir, pool, log: { error() {} } });
+  const doc = { segments: [{ speaker: "A", text: "x".repeat(500) }] };
+  st.save("old", 1, doc);
+  st.save("fresh", 2, doc);
+  st.save("kept", 3, doc);
+  await new Promise((r) => setTimeout(r, 10));
+  const now = Date.now();
+  rows.get(st.keyOf("old", 1)).saved_at = now - st.SAVE_GRACE_MS - 1;   // past the grace, no live row
+  rows.get(st.keyOf("kept", 3)).saved_at = now - st.SAVE_GRACE_MS - 1;  // past the grace, live
+  // "fresh" has no live row either, but was saved inside the grace: it must survive.
+  await st.sweep(new Map([[st.keyOf("kept", 3), { tenant: "", at: 3 }]]), { withRemote: true, now });
+  assert.deepEqual([...rows.keys()].sort(), [st.keyOf("fresh", 2), st.keyOf("kept", 3)].sort());
+  // A promoted leader's empty disk: the row is sized from Postgres and evicted there by the budget.
+  fs.rmSync(dir, { recursive: true, force: true });
+  await st.sweep(new Map([[st.keyOf("kept", 3), { tenant: "", at: 3 }]]), { withRemote: true, now, maxBytes: 10 });
+  assert.equal(rows.has(st.keyOf("kept", 3)), false);
+  assert.ok(sent.some((s) => /saved_at < \$1/.test(s)), "the remote listing is bounded by the grace");
 });
 
 test("XERK-2508: the tick waits for a host, retries a silent or departed one, and expires the queue", async () => {

@@ -112,7 +112,8 @@ ticket builds to this file; change it here first.
       sweep's live set and its DELETE was lost from Postgres (QA). Never drop the grace.
     - **A byte budget, `MEETING_TRANSCRIPTS_MAX_BYTES`** (the container limit, clamped
       256 MiB..1 GiB): the rows alone allow ~3 GiB. Over it the tenant holding the most bytes
-      loses its OLDEST transcript first (the XERK-2621 rule); the row stays and reads "no
+      loses its OLDEST transcript first (the XERK-2621 rule), never a pending one (the back-fill
+      re-saved it every tick, QA); the row stays and reads "no
       transcript is kept".
     - `GET /api/orgs/<site>/meetings/<mid>/transcript` (OPERATOR-authed, `org` class) answers
       `{meetingId, startedAt, segments}`, read only through the org's stored row; 404 unknown org /

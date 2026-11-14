@@ -186,7 +186,11 @@ function makeTranscriptStore({ dir, pool = null, log = console } = {}) {
     if (total <= maxBytes) return [];
     const byTenant = new Map();
     for (const [key, bytes] of sizes) {
-      const { tenant = "", at = 0 } = live.get(key) || {};
+      const { tenant = "", at = 0, pending = false } = live.get(key) || {};
+      // A meeting still waiting to be read is never evicted: the caller back-fills
+      // its document from the row, so evicting it re-saved and re-evicted it every
+      // tick (QA). It still counts toward the total.
+      if (pending) continue;
       if (!byTenant.has(tenant)) byTenant.set(tenant, { bytes: 0, keys: [] });
       const t = byTenant.get(tenant);
       t.bytes += bytes;

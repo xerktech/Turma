@@ -22450,7 +22450,7 @@ function sweepMeetingTranscripts(now = Date.now()) {
     for (const m of list || []) {
       if (!m || !m.meetingId || !m.receivedAt) continue;
       live.set(meetingTranscripts.keyOf(m.meetingId, m.receivedAt),
-        { tenant: tenantOfSite(site) || "", at: m.receivedAt });
+        { tenant: tenantOfSite(site) || "", at: m.receivedAt, pending: MEETING_PENDING.has(m.status) });
       if (MEETING_PENDING.has(m.status) && !meetingTranscripts.has(m.meetingId, m.receivedAt)) {
         saveMeetingTranscript(m);
       }
