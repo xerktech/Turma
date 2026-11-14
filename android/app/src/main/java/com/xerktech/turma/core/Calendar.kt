@@ -380,8 +380,14 @@ fun calLongSpan(s: Long, e: Long, zone: ZoneId, locale: Locale): String {
 }
 
 /** "Monday, November 9, 9:00 AM – 9:30 AM" or "…, all day". */
-fun calWhenText(ev: CalendarEvent, zone: ZoneId, locale: Locale): String =
-    if (calInBand(ev)) "${calLongDay(calDay(ev.s(), zone), locale)}, all day" else calLongSpan(ev.s(), ev.e(), zone, locale)
+fun calWhenText(ev: CalendarEvent, zone: ZoneId, locale: Locale): String {
+    if (!ev.allDay) return calLongSpan(ev.s(), ev.e(), zone, locale)
+    // A multi-day all-day event names its last day too; its end is exclusive midnight (XERK-2934).
+    val first = calDay(ev.s(), zone)
+    val last = calDay(ev.e() - 1, zone)
+    return if (ev.e() > ev.s() && last != first) "${calLongDay(first, locale)} – ${calLongDay(last, locale)}, all day"
+    else "${calLongDay(first, locale)}, all day"
+}
 
 /** The range label: "November 9 – 13, 2026", across a month or year boundary too. */
 fun calRangeLabel(days: List<LocalDate>, locale: Locale): String {
@@ -402,7 +408,8 @@ fun calWeekdayLabel(d: LocalDate, short: Boolean, locale: Locale): String =
 /** The sentence a screen reader says for an event (the web's `ariaOf` + the badge). */
 fun calAria(ev: CalendarEvent, day: LocalDate, orgLabel: String, badge: CalBadge, zone: ZoneId, locale: Locale): String {
     val bits = mutableListOf(calTitle(ev))
-    bits += if (calInBand(ev)) "${calLongDay(day, locale)}, all day"
+    // A timed event of 24h+ sits in the all-day band but keeps its times (XERK-2934).
+    bits += if (ev.allDay) "${calLongDay(day, locale)}, all day"
     else calLongSpan(ev.s(), ev.e(), zone, locale)
     if (ev.location.isNotEmpty()) bits += ev.location
     bits += orgLabel

@@ -463,7 +463,8 @@ function noticeText(n, now) {
 const TENIR_SVG = `<svg class="cal-tenir" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v6A1.5 1.5 0 0 1 12.5 11H7l-3 3v-3h-.5A1.5 1.5 0 0 1 2 9.5z"/><path fill="var(--surface)" d="M5 5h1v3H5zm2-1h1v5H7zm2 1.5h1v2H9zm2-.5h1v3h-1z"/></svg>`;
 function ariaOf(ev, day) {
   const bits = [titleOf(ev)];
-  bits.push(inBand(ev) ? `${fmtLongDay(day)}, all day` : fmtLongSpan(ev.startMs, ev.endMs));
+  // A timed event of 24h+ sits in the all-day band but keeps its times (XERK-2934).
+  bits.push(ev.allDay === true ? `${fmtLongDay(day)}, all day` : fmtLongSpan(ev.startMs, ev.endMs));
   if (ev.location) bits.push(String(ev.location));
   bits.push(orgLabel(ev.org));
   if (ev.busy === "tentative" || ev.myResponse === "tentative") bits.push("tentative");
@@ -608,7 +609,11 @@ function originalStart(ev) {
   return Number.isFinite(t) ? t : NaN;
 }
 function whenText(ev) {
-  return inBand(ev) ? `${fmtLongDay(ev.startMs)}, all day` : fmtLongSpan(ev.startMs, ev.endMs);
+  if (ev.allDay !== true) return fmtLongSpan(ev.startMs, ev.endMs);
+  // A multi-day all-day event names its last day too; its end is exclusive midnight (XERK-2934).
+  const last = ev.endMs - 1;
+  return ev.endMs > ev.startMs && dayStart(last) !== dayStart(ev.startMs)
+    ? `${fmtLongDay(ev.startMs)} – ${fmtLongDay(last)}, all day` : `${fmtLongDay(ev.startMs)}, all day`;
 }
 // Plain text as HTML: every line escaped, joined by <br>; "" for none.
 function linesHtml(t) {
