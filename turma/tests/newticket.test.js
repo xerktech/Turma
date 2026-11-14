@@ -444,6 +444,11 @@ test("XERK-2935: picked files make the form dirty and gate Create while uploadin
   assert.doesNotMatch(ready, /data-cf-submit="1" disabled/);
   assert.match(ready, /&lt;x&gt;\.png/);            // escaped
   assert.match(ready, /data-cf-file-remove="0"/);
+  // A failed file holds Create until it is removed or re-attached (QA).
+  const failed = B.createFormHtml({ ...base, files: [{ name: "a", status: "error", error: "too large" }] });
+  assert.match(failed, /data-cf-submit="1" disabled/);
+  assert.match(failed, /Remove the files that failed/);
+  assert.match(B.createFilesHtml([], "At most 10 files per ticket."), /At most 10 files/);
   const err = B.createFilesHtml([{ name: "a", status: "error", error: "file too large" }]);
   assert.match(err, /cf-file-err/);
   assert.match(err, /file too large/);

@@ -1030,7 +1030,7 @@ function publishUploadDir(u) {
  * serves through it unchanged. Body is raw bytes (no multipart), same 413/503
  * distinction and TTL ceiling the running-session route always used.
  */
-async function stageUpload(req, res, url, key, sessionId) {
+async function stageUpload(req, res, url, key, sessionId, extraReply = null) {
   const cap = uploadCapFor(agents[key]);
   if (!cap)
     return json(res, 409, {
@@ -1084,7 +1084,7 @@ async function stageUpload(req, res, url, key, sessionId) {
   // Publish the byte-free directory entry so a pull that lands on another replica
   // can relay the bytes from here (XERK-787). No-op with HA off.
   publishUploadDir(u);
-  return json(res, 200, { ok: true, uploadId: id, name, size: bytes.length });
+  return json(res, 200, { ok: true, uploadId: id, name, size: bytes.length, ...(extraReply || {}) });
 }
 
 /**
@@ -13572,17 +13572,21 @@ registerGuardMirror("createInFlight", {
 // folding them would not just suppress a retry — it would discard the second
 // one's text and report it created under the first one's key. Hashing also keeps
 // an unbounded operator-supplied summary out of the map's keys.
-const createFp = (siteKey, project, issueType, summary, description, labels) =>
+// A create carrying files (XERK-2935) folds its upload ids in, so it never
+// rejoins a file-less create (which would drop the files) nor one with others.
+const createFp = (siteKey, project, issueType, summary, description, labels, fileIds) =>
   crypto.createHash("sha256")
-    .update(JSON.stringify([siteKey, project, issueType, summary, description, labels]))
+    .update(JSON.stringify(fileIds && fileIds.length
+      ? [siteKey, project, issueType, summary, description, labels, fileIds]
+      : [siteKey, project, issueType, summary, description, labels]))
     .digest("hex");
-function findCreateInFlight(siteKey, project, issueType, summary, description, labels) {
+function findCreateInFlight(siteKey, project, issueType, summary, description, labels, fileIds) {
   const now = Date.now();
   for (const [fp, e] of createInFlight) {
     if (now - e.at > CREATE_INFLIGHT_TTL_MS) createInFlight.delete(fp);
   }
   const e = createInFlight.get(
-    createFp(siteKey, project, issueType, summary, description, labels));
+    createFp(siteKey, project, issueType, summary, description, labels, fileIds));
   if (!e) return null;
   const a = agents[e.host];
   // Resolved (or its host is gone): it's a finished piece of work, so an
@@ -13619,10 +13623,16 @@ const TICKET_UPLOAD_SID = "#ticket";
 
 // The online host of the org that will create a ticket WITH files: one whose
 // manager attaches them (`ticketAttachments`). Same health ranking as a create.
+function ticketAttachCapable(k) {
+  const a = agents[k];
+  return !!(a && a.ticketAttachments && a.ticketAttachments.available === true &&
+    !agentGapError(a, "createTicket", ""));
+}
+function ticketAttachHostOk(siteKey, k) {
+  return Object.hasOwn(agents, k) && jiraHostPool(siteKey, true).includes(k) && ticketAttachCapable(k);
+}
 function pickTicketAttachHost(siteKey) {
-  const pool = jiraHostPool(siteKey, true).filter((k) =>
-    agents[k] && agents[k].ticketAttachments && agents[k].ticketAttachments.available === true &&
-    !agentGapError(agents[k], "createTicket", ""));
+  const pool = jiraHostPool(siteKey, true).filter(ticketAttachCapable);
   if (!pool.length) return null;
   const top = jiraHostHealthy(agents[pool[0]]);
   return pool.find((k) => jiraHostHealthy(agents[k]) === top) || pool[0];
@@ -13645,7 +13655,8 @@ function queueCreateTicket(siteKey, { project, issueType, summary, description =
   // yet is a retry, not a second ticket, so it rejoins the first cmdId. Once
   // that create RESOLVES, an identical one is a new ticket again — deliberate
   // repeats stay possible.
-  const fields = [siteKey, project, issueType, summary, description, labels];
+  const fields = [siteKey, project, issueType, summary, description, labels,
+    (uploads || []).map((u) => u.id).sort()];
   const inFlight = findCreateInFlight(...fields);
   if (inFlight) return { status: 200, body: { ok: true, cmdId: inFlight.cmdId, host: inFlight.host } };
   // A create carrying files goes to the host its files were staged for (the
@@ -27574,6 +27585,8 @@ const server = http.createServer(async (req, res) => {
       // is what the following /input carries; nothing reaches the session until
       // that message is sent, so an attachment the operator removes just expires.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "uploads") {
+        // "#ticket" is the New-ticket relay's sentinel (XERK-2935), never a session.
+        if (sessionId.startsWith("#")) return json(res, 404, { error: "no such session" });
         return stageUpload(req, res, url, key, sessionId);
       }
       // POST /api/agents/<host>/sessions/<id>/input -> forward free-text input
@@ -28071,19 +28084,33 @@ const server = http.createServer(async (req, res) => {
       // Files staged by POST .../uploads (XERK-2935). They must all sit on one
       // host, which must still be online in the org and attach files; else the
       // operator re-attaches rather than gets a ticket missing its files.
-      const wantUploads = Array.isArray(body.uploadIds)
-        ? body.uploadIds.filter((s) => typeof s === "string" && s) : [];
+      if (body.uploadIds !== undefined && (!Array.isArray(body.uploadIds) ||
+          !body.uploadIds.every((x) => typeof x === "string" && x)))
+        return json(res, 400, { error: "uploadIds must be a list of upload ids" });
+      const wantUploads = [...new Set(body.uploadIds || [])];
       if (wantUploads.length > UPLOAD_MAX_PER_MESSAGE)
         return json(res, 400, { error: `at most ${UPLOAD_MAX_PER_MESSAGE} attachments` });
       let fileHost = null;
       const files = [];
       if (wantUploads.length) {
         sweepUploads();
+        const gone = () => json(res, 404, { error: "an attachment expired before the ticket was created — re-attach it" });
         for (const id of wantUploads) {
-          const u = uploads.get(id);
-          if (!u || u.sessionId !== TICKET_UPLOAD_SID || (fileHost && u.host !== fileHost) ||
+          let u = uploads.get(id);
+          // A miss under HA: the staging POST may have landed on another
+          // replica; its byte-free directory entry names host + sentinel (XERK-787).
+          if (!u && uploadStoreShared) {
+            let dir = null;
+            try { dir = await uploadStore.get(UPLOAD_DIR_PREFIX + id); } catch { dir = null; }
+            if (dir && typeof dir.host === "string")
+              u = { id, host: dir.host, sessionId: dir.sessionId,
+                    name: safeUploadName(dir.name), size: Number.isFinite(dir.size) ? dir.size : 0 };
+          }
+          if (!u || u.sessionId !== TICKET_UPLOAD_SID || !Object.hasOwn(agents, u.host) ||
               !hostInOrg(agents[u.host], siteKey))
-            return json(res, 404, { error: "an attachment expired before the ticket was created — re-attach it" });
+            return gone();
+          if (fileHost && u.host !== fileHost)
+            return json(res, 409, { error: "these files were staged on different hosts — remove and re-attach them" });
           fileHost = u.host;
           files.push({ id: u.id, name: u.name, size: u.size });
         }
@@ -28104,13 +28131,16 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
         parts.length === 4 && parts[3] === "uploads") {
       const siteKey = decodeURIComponent(parts[2]);
-      const key = pickTicketAttachHost(siteKey);
+      // The form's later files go to the host its first one went to (`?host=`
+      // from that reply), so one ticket's files never split across hosts.
+      const want = url.searchParams.get("host");
+      const key = (want && ticketAttachHostOk(siteKey, want)) ? want : pickTicketAttachHost(siteKey);
       if (!key) {
         return findJiraHost(siteKey, false)
           ? json(res, 409, { error: "no online host of this org can attach files to a ticket — update its agent" })
           : json(res, 404, { error: "no host reports that org" });
       }
-      return stageUpload(req, res, url, key, TICKET_UPLOAD_SID);
+      return stageUpload(req, res, url, key, TICKET_UPLOAD_SID, { host: key });
     }
 
     // GET /api/jira/<siteKey>/tickets/<cmdId> -> poll a create's outcome

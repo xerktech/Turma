@@ -2814,7 +2814,7 @@
   // where meta = {loading|error|projects,labels}, types = {loading|error|types}.
   // The New-ticket form's attachments row (XERK-2935): one chip per picked
   // file, uploaded to the hub as soon as it is picked, plus the picker button.
-  function createFilesHtml(files) {
+  function createFilesHtml(files, note) {
     const list = files || [];
     const chips = list.map((f, i) => {
       const state = f.status === "uploading" ? " · uploading…"
@@ -2829,7 +2829,9 @@
         <div class="cf-files">${chips}
           <button type="button" class="cf-btn cf-attach" data-cf-attach="1"${full ? " disabled" : ""}>📎 Attach files</button>
           <input type="file" multiple hidden data-cf-file-input="1">
-        </div></div>`;
+        </div>${list.some((f) => f.status === "error")
+          ? `<div class="cf-note cf-err">Remove the files that failed, or attach them again.</div>` : ""}${
+          note ? `<div class="cf-note">${esc(note)}</div>` : ""}</div>`;
   }
   const CREATE_FILES_MAX = 10;
 
@@ -2893,7 +2895,9 @@
     const suggestions = (meta.labels || []).slice(0, 200)
       .map((l) => `<option value="${esc(l)}"></option>`).join("");
     const files = s.files || [];
-    const uploading = files.some((f) => f.status === "uploading");
+    // A file still uploading, or one that failed, holds Create: sending without
+    // it would make a ticket silently missing a file (XERK-2935).
+    const uploading = files.some((f) => f.status !== "ready");
     const canSubmit = !!(v.project && v.issueType && (v.summary || "").trim()) && !s.busy && !uploading;
     return `<div class="cf-head">
         <h2>New ticket</h2>
@@ -2912,7 +2916,7 @@
           <input type="text" data-cf-labels="1" list="cf-label-suggestions"
             placeholder="comma-separated ${esc(labelWord)}s" value="${esc(v.labels || "")}">
           <datalist id="cf-label-suggestions">${suggestions}</datalist></label>
-        ${createFilesHtml(files)}
+        ${createFilesHtml(files, s.filesNote)}
       </div>
       ${s.error ? `<div class="cf-note cf-err">Couldn't create — ${esc(s.error)}</div>` : ""}
       ${s.confirmDiscard

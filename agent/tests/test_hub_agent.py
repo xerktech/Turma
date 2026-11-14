@@ -43869,6 +43869,41 @@ class TestStageCreateTicket(ManagerMixin, unittest.TestCase):
         sm.create_ticket_async_results.drop({id(x) for x in payload["createTicketResults"]})
         self.assertEqual(len(sm.create_ticket_async_results), 0)
 
+    def test_xerk2935_the_create_never_runs_on_the_beat_and_its_row_clears_by_identity(self):
+        ok = {"key": "ENG-8", "url": "u", "assigned": True}
+        sm = self.make_manager()
+        gate = threading.Event()
+
+        def slow(*_a, **_k):
+            gate.wait(10)
+        with self._cfg(), \
+                mock.patch.object(ha, "create_board_issue", return_value=ok), \
+                mock.patch.object(sm, "_download_upload", return_value=b"x"), \
+                mock.patch.object(ha, "attach_board_file", side_effect=slow):
+            sm.handle_commands([self._cmd(uploads=[{"id": "u1", "name": "a"}])])
+            # handle_commands returned while the attach is still blocked.
+            self.assertEqual(len(sm.create_ticket_async_results), 0)
+            gate.set()
+            rows = self._wait_async(sm)
+        payload = {"createTicketResults": list(rows)}
+        late = {"cmdId": "late"}
+        sm.create_ticket_async_results.append(late)
+        sm._clear_delivered_staged(payload)
+        self.assertEqual(sm.create_ticket_async_results.snapshot(), [late])
+
+    def test_xerk2935_no_file_starts_past_the_deadline(self):
+        ok = {"key": "ENG-9", "url": "u", "assigned": True}
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(ha, "TICKET_FILES_DEADLINE_SEC", 0), \
+                mock.patch.object(ha, "create_board_issue", return_value=ok), \
+                mock.patch.object(sm, "_download_upload") as dl, \
+                mock.patch.object(ha, "attach_board_file") as att:
+            sm._stage_create_ticket(self._cmd(uploads=[{"id": "u1", "name": "a"}]))
+            rows = self._wait_async(sm)
+        dl.assert_not_called()
+        att.assert_not_called()
+        self.assertIn("a (ran out of time)", rows[0]["warning"])
+
     def test_xerk2935_a_failed_attachment_never_fails_the_create(self):
         ok = {"key": "ENG-6", "url": "u", "assigned": True}
         sm = self.make_manager()

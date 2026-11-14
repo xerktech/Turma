@@ -1222,6 +1222,10 @@ UPLOAD_DIR_MODE = 0o777 if IS_WINDOWS else 0o700
 UPLOAD_MAX_BYTES = _env_int("TURMA_UPLOAD_MAX_BYTES", 1 << 25)  # 32 MiB
 UPLOAD_MAX_PER_MESSAGE = _env_int("TURMA_UPLOAD_MAX_PER_MESSAGE", 10)
 UPLOAD_DOWNLOAD_TIMEOUT_SEC = _env_int("TURMA_UPLOAD_TIMEOUT_SEC", 60)
+# Wall clock for attaching a new ticket's files (XERK-2935). No file STARTS
+# after it, so the whole create answers well inside the web form's 6-minute
+# wait (one in-flight upload can overshoot by its own timeouts, ~75s).
+TICKET_FILES_DEADLINE_SEC = _env_int("TURMA_TICKET_FILES_DEADLINE_SEC", 150, minimum=10)
 # Whole-batch wall clock for downloading a SPAWN's composer attachments, which
 # happens ON the beat at provision (unlike the running-session path, which is off
 # the beat). Bounds the beat cost well under OFFLINE_AFTER_MS (75s) even if a blob
@@ -41682,12 +41686,18 @@ class SessionManager:
         ticket `key`. Returns "<name> (<reason>)" for each file that did not
         attach; a failed attachment never fails the create (the ticket exists)."""
         missed = []
+        deadline = time.monotonic() + TICKET_FILES_DEADLINE_SEC
         for item in files:
             name = safe_upload_name(item.get("name"))
             if not key:
                 missed.append(f"{name} (no ticket key)")
                 continue
-            blob = self._download_upload(item.get("id"))
+            left = deadline - time.monotonic()
+            if left <= 0:
+                missed.append(f"{name} (ran out of time)")
+                continue
+            blob = self._download_upload(
+                item.get("id"), timeout=min(UPLOAD_DOWNLOAD_TIMEOUT_SEC, left))
             if blob is None:
                 missed.append(f"{name} (expired on the hub)")
                 continue

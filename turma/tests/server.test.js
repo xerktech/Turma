@@ -32909,3 +32909,45 @@ test("XERK-2935: ticketAttachments is coerced to a strict boolean block", () => 
   hub.normalizeRecord(b);
   assert.equal(b.ticketAttachments, null);
 });
+
+test("XERK-2935 QA: files never ride a rejoined file-less create, stay on one host, and stay in the org", async () => {
+  const site = "tf3.atlassian.net";
+  const cap = { uploadMaxBytes: 1 << 20, ticketAttachments: { available: true } };
+  await jiraBeat("tf3a", site, cap);
+  await jiraBeat("tf3b", site, cap);
+  const stageT = (q = "") => requestRaw("POST", `/api/jira/${site}/uploads?name=f.txt${q}`,
+    { body: Buffer.from("f"), headers: userHeaders });
+  const post = (extra) => request("POST", `/api/jira/${site}/tickets`, { headers: userHeaders,
+    body: { project: "ENG", issueType: "1", summary: "Rejoin me", ...extra } });
+  const plain = await post({});
+  const one = await stageT();
+  assert.ok(["tf3a", "tf3b"].includes(one.body.host));
+  // ?host= keeps a second file on the first one's host.
+  const two = await stageT(`&host=${one.body.host}`);
+  assert.equal(two.body.host, one.body.host);
+  const withFiles = await post({ uploadIds: [one.body.uploadId, two.body.uploadId, one.body.uploadId] });
+  assert.equal(withFiles.status, 200);
+  assert.notEqual(withFiles.body.cmdId, plain.body.cmdId);
+  assert.equal(withFiles.body.host, one.body.host);
+  const cmd = agents[one.body.host].commands.find((c) => c.cmdId === withFiles.body.cmdId);
+  assert.deepEqual(cmd.uploads.map((u) => u.id), [one.body.uploadId, two.body.uploadId]);  // deduped
+  // A malformed id list is refused, never quietly emptied.
+  assert.equal((await post({ uploadIds: [1] })).status, 400);
+  assert.equal((await post({ uploadIds: "x" })).status, 400);
+  // Files split across hosts are refused with a reason that says so.
+  const other = one.body.host === "tf3a" ? "tf3b" : "tf3a";
+  const three = await stageT(`&host=${other}`);
+  assert.equal(three.body.host, other);
+  const split = await post({ summary: "Split", uploadIds: [one.body.uploadId, three.body.uploadId] });
+  assert.equal(split.status, 409);
+  assert.match(split.body.error, /different hosts/);
+  // Another org's ticket file is not this org's.
+  await jiraBeat("tf4", "tf4.atlassian.net", cap);
+  const foreign = await requestRaw("POST", "/api/jira/tf4.atlassian.net/uploads?name=g.txt",
+    { body: Buffer.from("g"), headers: userHeaders });
+  assert.equal((await post({ summary: "Foreign", uploadIds: [foreign.body.uploadId] })).status, 404);
+  // The chat route cannot mint a ticket file through the sentinel.
+  const chat = await requestRaw("POST", `/api/agents/tf3a/sessions/${encodeURIComponent("#ticket")}/uploads?name=x`,
+    { body: Buffer.from("x"), headers: userHeaders });
+  assert.notEqual(chat.status, 200);
+});
