@@ -30,7 +30,14 @@ function keyOf(meetingId, receivedAt) {
 }
 
 function makeTranscriptStore({ dir, pool = null, log = console } = {}) {
-  const fileOf = (key) => path.join(dir, `${key}.json`);
+  const KEY_RE = /^[0-9a-f]{40}$/;
+  const fileOf = (key) => {
+    // A key is only ever keyOf's hex digest (or a listed name the sweep matched
+    // against the same shape), so it can never name a path outside `dir`.
+    if (!KEY_RE.test(key)) throw new Error(`not a transcript key: ${String(key).slice(0, 60)}`);
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    return path.join(dir, `${key}.json`);
+  };
   const SAVE_GRACE_MS = 5 * 60e3;
   // Keys saved locally whose Postgres write has not landed yet (HA only).
   const unsynced = new Set();
