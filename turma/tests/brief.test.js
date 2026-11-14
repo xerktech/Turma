@@ -40,26 +40,36 @@ function makeEl() {
 // `reply(url, init)` answers each fetch: a body for 200, {status, body} for a
 // refusal, or a Promise (resolving to a body) to hold the answer. `agents`, when
 // given, answers the boot's /api/agents the same way; else that never lands.
-function loadPage(reply = null, agents = null, hash = "") {
+function loadPage(reply = null, agents = null, hash = "", { search = "", store = {} } = {}) {
   const els = {};
+  let calendarRefetches = 0;
+  const calendarActive = [];
+  const viewButtons = ["calendar", "notes"].map((v) => {
+    const b = makeEl();
+    b.dataset.view = v;
+    b.attrs = {};
+    b.setAttribute = (k, val) => { b.attrs[k] = val; };
+    return b;
+  });
   const meetings = { mounted: null, updates: [], pending: 0 };
   const sse = [];
   const winListeners = {};
   const fetches = [];
   const toasts = [];
   const timers = [];
+  const intervals = [];
   const clip = [];
   const noop = () => {};
   const document = {
     getElementById(id) { return (els[id] ||= makeEl()); },
     createElement() { return makeEl(); },
-    querySelector() { return null; }, querySelectorAll() { return []; },
+    querySelector() { return null; }, querySelectorAll(sel) { return sel === "[data-view]" ? viewButtons : []; },
     addEventListener: noop, removeEventListener: noop,
     body: makeEl(), documentElement: makeEl(), activeElement: null,
   };
   const stubs = {
     document,
-    location: { href: "", search: "", pathname: "/brief", hash },
+    location: { href: "", search, pathname: "/brief", hash },
     navigator: { userAgent: "node", clipboard: { writeText: async (t) => { clip.push(t); } } },
     fetch: (u, init = {}) => {
       // A page that loops on a route would starve the runner: past 50 calls it
@@ -85,7 +95,7 @@ function loadPage(reply = null, agents = null, hash = "") {
       constructor() { sse.push(this); this.handlers = {}; this.readyState = 1; }
       addEventListener(name, fn) { this.handlers[name] = fn; } close() {}
     },
-    setInterval: () => 0, clearInterval: noop,
+    setInterval: (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; }, clearInterval: noop,
     setTimeout: (fn) => { timers.push(fn); return timers.length; }, clearTimeout: noop,
     addEventListener: (name, fn) => { (winListeners[name] ||= []).push(fn); }, removeEventListener: noop,
     window: { name: "the window" },
@@ -98,7 +108,9 @@ function loadPage(reply = null, agents = null, hash = "") {
     TurmaOrg: { getKeys: () => [], update: noop, subscribe: noop, sse: noop },
     TurmaBoard: { bareKey: require("../public/board.js").bareKey, orgName: (k, o) => o || k, mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
-    localStorage: { getItem: () => null, setItem: noop },
+    // The Calendar view (XERK-2897) has its own suite (calendar.test.js); here it only records.
+    TurmaCalendar: { mount: noop, update: noop, refetch: () => { calendarRefetches++; }, setActive: (on) => { calendarActive.push(on); } },
+    localStorage: { getItem: (k) => store[k] ?? null, setItem: (k, v) => { store[k] = String(v); } },
   };
   const mkeys = Object.keys(stubs);
   new Function(...mkeys, meetingsScript)(...mkeys.map((k) => stubs[k]));
@@ -117,7 +129,7 @@ function loadPage(reply = null, agents = null, hash = "") {
   const list = els.meetingList;
   // What a test puts "inside" the list: the focused element counts as inside.
   list.contains = (el) => !!el && el.inside === true;
-  return Object.assign(api, { meetings, els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document, window: stubs.window,
+  return Object.assign(api, { viewButtons, calendarActive, store, calendarRefetches: () => calendarRefetches, intervals, meetings, els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document, window: stubs.window,
     list: () => list.innerHTML, fire: (name, data) => sse[0].handlers[name]({ data: JSON.stringify(data) }) });
 }
 
@@ -798,4 +810,65 @@ test("a brief written on a tenant host names the host without the tenant", () =>
   assert.match(h, /Writing a brief on k8x-02… started/);
   assert.match(h, /on k8x-02</);
   assert.doesNotMatch(h, /77778a16/);
+});
+
+test("XERK-2897: the Calendar / Notes review switch shows one view, remembers the pick, and a push link opens the notes", () => {
+  const P = loadPage();
+  // First visit: the calendar.
+  assert.equal(P.els.calendarView.hidden, false);
+  assert.equal(P.els.meetingList.hidden, true);
+  assert.equal(P.els.notesNote.hidden, true);
+  assert.deepEqual(P.calendarActive, [true]);
+  assert.equal(P.viewButtons[0].attrs["aria-pressed"], "true");
+  // Picking Notes review swaps the panes, stops the calendar and is remembered.
+  P.viewButtons[1].listeners.click[0]();
+  assert.equal(P.els.calendarView.hidden, true);
+  assert.equal(P.els.meetingList.hidden, false);
+  assert.equal(P.els.notesNote.hidden, false);
+  assert.deepEqual(P.calendarActive, [true, false]);
+  assert.equal(P.store["turma-meetings-view"], "notes");
+  assert.equal(P.viewButtons[1].attrs["aria-pressed"], "true");
+  // The next visit opens on it.
+  assert.equal(loadPage(null, null, "", { store: { "turma-meetings-view": "notes" } }).els.meetingList.hidden, false);
+  // A proposals push (`/meetings?site=…`) opens the notes review whatever was picked.
+  const pushed = loadPage(null, null, "", { search: `?site=${SITE}`, store: { "turma-meetings-view": "calendar" } });
+  assert.equal(pushed.els.meetingList.hidden, false);
+  // Unusable storage falls back to the calendar.
+  assert.equal(loadPage(null, null, "", { store: { "turma-meetings-view": "bogus" } }).els.calendarView.hidden, false);
+});
+
+test("XERK-2897: calendar, holidaySettings and meetingProposals frames re-read the calendar once per burst", async () => {
+  const P = loadPage(null, () => data({}));
+  await P.settle();
+  P.runTimers();
+  P.fire("calendar", { h1: { syncedAt: 1 } });
+  P.fire("holidaySettings", {});
+  P.fire("meetingProposals", {});                  // a Tenir capture is announced only here
+  assert.equal(P.calendarRefetches(), 0, "coalesced");
+  P.runTimers();
+  assert.equal(P.calendarRefetches(), 1);
+  P.fire("meetingProposals", {});
+  P.runTimers();
+  assert.equal(P.calendarRefetches(), 2);
+});
+
+test("XERK-2897: a stream reconnect re-reads the calendar (frames missed while down)", async () => {
+  const P = loadPage(null, () => data({}));
+  await P.settle();
+  P.sse[0].onopen();
+  assert.equal(P.calendarRefetches(), 0, "the first open is not a reconnect");
+  P.sse[0].onopen();
+  assert.equal(P.calendarRefetches(), 1);
+});
+
+test("XERK-2897: with the stream down the calendar polls every 60s; up, it does not", async () => {
+  const P = loadPage(null, () => data({}));
+  await P.settle();
+  const polls = () => { for (const i of P.intervals.filter((x) => x.ms === 60000)) i.fn(); };
+  P.sse[0].onopen();
+  polls();
+  assert.equal(P.calendarRefetches(), 0, "stream up: frames carry the changes");
+  P.sse[0].onerror();
+  polls();
+  assert.equal(P.calendarRefetches(), 1);
 });

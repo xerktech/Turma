@@ -22902,6 +22902,7 @@ const HASHED_ASSETS = [
   ["/org.js",        "org.js",        "text/javascript; charset=utf-8"],
   ["/newticket.js",  "newticket.js",  "text/javascript; charset=utf-8"],
   ["/meetings.js",   "meetings.js",   "text/javascript; charset=utf-8"],
+  ["/calendar.js",   "calendar.js",   "text/javascript; charset=utf-8"],
 ];
 
 // Bare URL -> fingerprinted URL, the map the HTML rewrite runs on.

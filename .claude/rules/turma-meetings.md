@@ -4,9 +4,11 @@ paths:
   - "turma/public/brief.html"
   - "turma/tests/meetings.test.js"
   - "turma/tests/brief.test.js"
+  - "turma/public/calendar.js"
+  - "turma/tests/calendar.test.js"
 ---
 
-# The meetings triage (Meetings page, XERK-2510, XERK-2623, XERK-2857, XERK-2893)
+# The Meetings page: triage + calendar (XERK-2510, XERK-2623, XERK-2857, XERK-2893, XERK-2897)
 
 The web surface of the Meetings epic (XERK-2503). The wire, the review/archive routes and the
 `daily` pairing are in `contract-meetings.md`; this file is the triage's own rules.
@@ -92,3 +94,52 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   Android `meetingSummaryParagraphs` in `MeetingPart`): plain text, escaped, paragraphs on blank
   lines; and is named `meetingTitle` = `inferredTitle || title` everywhere (head, rail, search).
 - Tests: `turma/tests/meetings.test.js`, `turma/tests/brief.test.js` (the `XERK-2857` cases).
+
+## The Calendar view (`calendar.js`, XERK-2897)
+
+- **Two views, one page**: `brief.html` shows a Calendar / Notes review switch; the pick is per
+  viewer in `localStorage` (`turma-meetings-view`, guarded), Calendar by default. A `?site=` link
+  (the proposals push) opens Notes review. The hidden view's keys are inert (`offsetParent`).
+- **`calendar.js` reads its own routes** (`/api/calendar` per Monday–Sunday week, prefetching the
+  weeks either side; `/api/holidays` for the same days). The org pick is part of the cache key
+  (`<orgs>|<week>`); a read keeps the pick it started with.
+- **What re-reads it** (each a QA finding): `calendar`, `holidaySettings` AND `meetingProposals`
+  frames (a Tenir-only capture is announced only by the last), coalesced 1s (`calendarSoon`); a
+  stream reconnect; a 60s poll while the stream is down.
+  - `refetch()` re-reads only the shown weeks + neighbours and DROPS every other cached week: a
+    frame re-reading every week ever browsed grew without bound (and re-queued host syncs).
+  - A failed read is retried every 20s while shown and at once on showing; it never sticks.
+  - A host whose stored `ranges` miss the week, or `pending`, reads "Syncing …" and is re-read
+    every 20s; the hub queues the sync itself on that GET. Offline / `lastError` hosts get a stale
+    notice; the calendar still renders the hub's copy.
+  - `lastError` is quoted as is, never labelled "Outlook" (the hub's budget errors ride it too),
+    and an offline host shows it as well.
+- **Week math is local wall time via `Date` setters** (`addDays`, `weekStart`), never `+ 86400000`:
+  a DST week has a 23/25h day. Event rows use wall minutes (`wallMinutes`). Tests pin both DST
+  edges and the year boundary.
+- **Teams decisions** (researched on Microsoft's "Manage your calendar in Teams" / new-calendar
+  docs; recorded so a later change doesn't drift):
+  - Work week (Mon–Fri) is the default; Week is Mon–Sun; ‹ › move a week; Today; the range label
+    opens a mini-month (month ‹ ›, year « »). Narrow (<760px): Day / 3 days, arrows + swipe.
+  - 30-min rows (24px), working hours 8–17 shaded white, the grid opens scrolled to 8:00, a red
+    now-line with a dot on today, today's header in the accent with a top bar.
+  - Events: a 22% tint of the org color with a 4px solid left bar (unassigned = neutral);
+    overlaps share the width and widen into free columns to the right (`layoutDay`).
+  - Tentative / not responded = hatched; free / declined = outlined; canceled = "Canceled: " +
+    strikethrough (kept, as Teams keeps them); past = dimmed; Tenir-only (`source:"tenir"`) = a
+    caption glyph. All-day and ≥24h events ride the all-day band, one chip per day (Teams draws a
+    spanning bar; not worth the layout here).
+  - Holidays sit in the all-day band; a day off for an org in view (`offFor` ∩ header pick) is
+    hatched grey with "Day off · <org>".
+- **Read-only**: nothing drags, creates or edits. A click opens a placeholder side panel
+  (`detailHtml`) that the detail ticket (XERK-2898) replaces.
+- Keyboard: events are buttons in day order; ↑/↓ within a day, ←/→ to the nearest event of the
+  next day, Esc closes the picker / panel. Every event carries an aria-label sentence.
+- **Esc listens on the document** (so it works after a click elsewhere) and yields to a SHOWN
+  modal (`MODAL_OPEN`) or an Esc already `defaultPrevented`. Never test a modal's mere presence:
+  `#createPanel[aria-modal]` stays in the DOM while hidden (QA).
+- Every served string is escaped (subject, location, organizer, device, error, holiday, org);
+  a join link is rebuilt only from an `https://` URL (`safeHttps`); an org color is inlined only
+  as `var(--sN)` (`safeColor`).
+- Android: XERK-2900 (`android/PARITY.md`). Tests: `turma/tests/calendar.test.js`, the
+  `XERK-2897` cases in `brief.test.js`.

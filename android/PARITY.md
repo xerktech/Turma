@@ -731,6 +731,10 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   toast is cut at two lines (a platform limit on toasts).
 - `dailyBriefs`, `dailyBriefSchedules`, `meetingLabels`, `meetingLabelMisses` and `meetingFocus`
   decode per org (`LenientSiteMapSerializer`), so a malformed entry drops alone.
+- **GAP — the Calendar view (XERK-2897, web only so far)**: the web Meetings page opens on a
+  Teams-style week calendar (`calendar.js`) with a Calendar / Notes review switch; Android still
+  shows only the triage. Its port (week grid, day/3-day on a phone, detail, view switch) is
+  XERK-2900.
 
 ## Open (subsequent installments), by screen and priority
 

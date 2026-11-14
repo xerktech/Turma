@@ -212,6 +212,91 @@
   .mt-err { color: var(--critical-text); font-size: 13px; margin-top: 6px; overflow-wrap: anywhere; }
   .mt-empty { color: var(--muted); font-size: 14px; padding: 24px 0; }
 
+
+  /* ---- the view switch + the Calendar view (calendar.js, XERK-2897) ---- */
+  .mt-views { display: flex; gap: 6px; margin: 0 0 12px; }
+  button.tri-chip[aria-pressed="true"] { color: var(--accent-text); border-color: var(--accent); background: var(--accent-soft); }
+  .cal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 10px 12px 12px; min-width: 0; }
+  .cal-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+  .cal-bar .sp { flex: 1 1 auto; }
+  .cal-modes { display: inline-flex; gap: 6px; }
+  button.cal-ic { min-width: 30px; height: 30px; padding: 0 6px; font-size: 18px; line-height: 1; }
+  .cal-range-wrap { position: relative; }
+  button.cal-range { border: 0; background: none; font-family: var(--font-display); font-size: 17px; font-weight: 600; color: var(--ink); padding: 4px 6px; }
+  button.cal-range .car { color: var(--muted); font-size: 12px; }
+  .cal-picker { position: absolute; z-index: 30; top: calc(100% + 4px); left: 0; width: 288px; padding: 10px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2); }
+  .cal-picker-head { display: flex; align-items: center; gap: 2px; margin-bottom: 6px; }
+  .cal-picker-title { flex: 1 1 auto; text-align: center; white-space: nowrap; font-weight: 600; font-size: 13.5px; }
+  .cal-picker-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+  .cal-pw { text-align: center; font-size: 11px; color: var(--muted); padding: 2px 0; }
+  button.cal-pd { border: 0; background: none; padding: 5px 0; font-size: 12.5px; border-radius: 4px; color: var(--ink); }
+  button.cal-pd.out { color: var(--muted); }
+  button.cal-pd.in { background: var(--accent-soft); color: var(--accent-text); }
+  button.cal-pd.today { box-shadow: inset 0 0 0 1.5px var(--accent); font-weight: 600; }
+  .cal-notes { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+  .cal-note { font-size: 12.5px; color: var(--ink-2); overflow-wrap: anywhere; }
+  .cal-note.warn { color: var(--warning-text); }
+  .cal-note.bad { color: var(--critical-text); }
+  .cal-grid { border: 1px solid var(--hairline); border-radius: var(--radius-sm); overflow: hidden; }
+  .cal-row { display: grid; }
+  .cal-heads > div, .cal-band > div { border-left: 1px solid var(--hairline); min-width: 0; }
+  .cal-heads > div:first-child, .cal-band > div:first-child { border-left: 0; }
+  .cal-dh { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0 6px; padding: 6px 8px; }
+  .cal-dh .n { font-size: 22px; font-weight: 300; line-height: 1.1; }
+  .cal-dh .w { font-size: 12.5px; color: var(--ink-2); }
+  .cal-dh.today .n, .cal-dh.today .w { color: var(--accent-text); font-weight: 600; }
+  .cal-dh.today { box-shadow: inset 0 3px 0 var(--accent); }
+  .cal-dh .offnote { flex-basis: 100%; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cal-band { border-top: 1px solid var(--hairline); border-bottom: 1px solid var(--border); min-height: 26px; }
+  .cal-band-lbl { font-size: 10.5px; color: var(--muted); padding: 5px 4px; text-align: right; }
+  .cal-band-day { padding: 2px; display: flex; flex-direction: column; gap: 2px; }
+  .cal-hol { font-size: 11.5px; padding: 2px 6px; border-radius: 3px; background: var(--hairline); color: var(--ink-2);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cal-scroll { height: clamp(360px, calc(100vh - 290px), 900px); overflow-y: auto; overscroll-behavior: contain; }
+  .cal-body { position: relative; }
+  .cal-gutter { position: relative; }
+  .cal-hr { position: absolute; right: 6px; transform: translateY(-50%); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+  .cal-col { position: relative; border-left: 1px solid var(--hairline);
+    /* hour lines solid, half-hour dashed-light; non-working hours shaded (Teams) */
+    background:
+      repeating-linear-gradient(to bottom, var(--hairline) 0 1px, transparent 1px 48px),
+      repeating-linear-gradient(to bottom, transparent 0 24px, color-mix(in srgb, var(--hairline) 45%, transparent) 24px 25px, transparent 25px 48px),
+      linear-gradient(to bottom, var(--page) 0 384px, transparent 384px 816px, var(--page) 816px); }
+  .cal-col.off, .cal-band-day.off, .cal-dh.off { background-color: color-mix(in srgb, var(--muted) 10%, transparent); }
+  .cal-col.off { background-image:
+      repeating-linear-gradient(to bottom, var(--hairline) 0 1px, transparent 1px 48px),
+      repeating-linear-gradient(135deg, color-mix(in srgb, var(--muted) 9%, transparent) 0 6px, transparent 6px 12px); }
+  .cal-now { position: absolute; left: 0; right: 0; height: 0; border-top: 2px solid #d13438; z-index: 3; pointer-events: none; }
+  .cal-now::before { content: ""; position: absolute; left: -5px; top: -6px; width: 10px; height: 10px; border-radius: 50%; background: #d13438; }
+  .cal-ev { --org: var(--muted); position: absolute; box-sizing: border-box; overflow: hidden; z-index: 2;
+    display: flex; flex-direction: column; align-items: stretch; gap: 1px; text-align: left; padding: 2px 6px 2px 8px;
+    border: 0; border-left: 4px solid var(--org); border-radius: 4px; font: inherit; font-size: 12px; line-height: 1.25;
+    color: var(--ink); background: color-mix(in srgb, var(--org) 22%, var(--surface)); cursor: pointer; }
+  .cal-ev:hover { background: color-mix(in srgb, var(--org) 32%, var(--surface)); }
+  .cal-ev:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; z-index: 4; }
+  .cal-ev .t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; gap: 4px; }
+  .cal-ev .m { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; }
+  .cal-ev.short { justify-content: center; padding-top: 0; padding-bottom: 0; }
+  .cal-ev.allday { position: static; padding: 2px 6px; }
+  .cal-ev.tentative { background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--org) 26%, var(--surface)) 0 5px, var(--surface) 5px 10px); }
+  .cal-ev.free { background: var(--surface); box-shadow: inset 0 0 0 1px var(--org); }
+  .cal-ev.canceled .t, .cal-ev.canceled .m { text-decoration: line-through; }
+  .cal-ev.canceled { background: color-mix(in srgb, var(--org) 10%, var(--surface)); }
+  .cal-ev.past { opacity: 0.55; }
+  .cal-tenir { width: 13px; height: 13px; flex: none; color: var(--org); }
+  .cal-detail { position: fixed; top: 0; right: 0; bottom: 0; z-index: 40; width: min(420px, 100vw); box-sizing: border-box;
+    overflow-y: auto; padding: 18px 20px 32px; background: var(--surface); border-left: 1px solid var(--border);
+    box-shadow: -12px 0 32px rgba(0, 0, 0, 0.25); }
+  .cal-detail-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
+  .cal-detail h2 { flex: 1 1 auto; font-family: var(--font-display); font-size: 18px; margin: 0; overflow-wrap: anywhere; }
+  .cal-dstate { font-size: 12px; color: var(--muted); text-transform: capitalize; margin-bottom: 6px; }
+  .cal-drow { display: flex; gap: 10px; font-size: 13.5px; padding: 5px 0; border-top: 1px solid var(--hairline); }
+  .cal-drow .k { flex: 0 0 84px; color: var(--muted); }
+  .cal-drow .v { min-width: 0; overflow-wrap: anywhere; }
+  .cal-drow a { color: var(--accent-text); }
+  .cal-dnote { color: var(--muted); font-size: 12.5px; margin-top: 14px; }
+
   /* Narrow screens: one pane at a time, a back button to the rail. */
   @media (max-width: 759px) {
     .wrap.tri-wrap { padding-left: 12px; padding-right: 12px; }
@@ -223,6 +308,10 @@
     .brief-read p { font-size: 17px; }
     .sched-form select.tz, .sched-form input[type=text] { width: 100%; }
     .mt-tools { margin-left: 0; }
+    .cal { padding: 8px; }
+    button.cal-range { font-size: 15px; }
+    /* Over the phone's bottom nav (z 40), whose bar otherwise hides the panel's end. */
+    .cal-detail { z-index: 45; }
   }
 </style>
 </head>
@@ -230,8 +319,13 @@
 <header class="site-header" id="siteHeader" data-page="meetings"></header>
 <div class="page-scroll">
 <div class="wrap tri-wrap">
+  <div class="mt-views" role="group" aria-label="Meetings view">
+    <button type="button" class="tri-chip" data-view="calendar" aria-pressed="false">Calendar</button>
+    <button type="button" class="tri-chip" data-view="notes" aria-pressed="false">Notes review</button>
+  </div>
+  <div id="calendarView" class="cal" hidden></div>
   <div id="meetingList" class="mt-list"></div>
-  <div class="pane-note">Each org's <b>daily brief</b> is written by one of its agent hosts a few minutes before the org's daily meeting, from your own tickets in that org. When Tenir captures a meeting, a host of the org reads its captions and <b>proposes</b> work items; nothing reaches the board until you approve one. Keys: <kbd>J</kbd>/<kbd>K</kbd> move, <kbd>A</kbd> approve, <kbd>S</kbd> approve + session, <kbd>E</kbd> edit, <kbd>R</kbd> reject. Times are in your time zone.</div>
+  <div class="pane-note" id="notesNote">Each org's <b>daily brief</b> is written by one of its agent hosts a few minutes before the org's daily meeting, from your own tickets in that org. When Tenir captures a meeting, a host of the org reads its captions and <b>proposes</b> work items; nothing reaches the board until you approve one. Keys: <kbd>J</kbd>/<kbd>K</kbd> move, <kbd>A</kbd> approve, <kbd>S</kbd> approve + session, <kbd>E</kbd> edit, <kbd>R</kbd> reject. Times are in your time zone.</div>
 </div>
 </div>
 
@@ -241,6 +335,7 @@
 <script src="/org.js"></script>
 <script src="/newticket.js"></script>
 <script src="/meetings.js"></script>
+<script src="/calendar.js"></script>
 
 <script>
 // A host/org key for DISPLAY: board.js bareKey drops a tenant key's `@<32-hex>`
@@ -513,6 +608,7 @@ function renderBriefs(data, now, force = false) {
   const schedules = data.dailyBriefSchedules && typeof data.dailyBriefSchedules === "object" ? data.dailyBriefSchedules : {};
   syncNext(schedules, now);
   TurmaMeetings.update(data, force);
+  TurmaCalendar.update(data);
 }
 function render(data) {
   TurmaOrg.update(data);
@@ -530,6 +626,29 @@ TurmaMeetings.mount($briefs, {
   },
   briefHtml, scheduleHtml, focusKey, restoreFocus,
 });
+
+// The Calendar view (XERK-2897, calendar.js) and the notes review share the page;
+// the last one picked is kept per viewer (guarded: storage may throw). A push's
+// `?site=` deep link is about proposals, so it opens the notes review.
+const VIEW_KEY = "turma-meetings-view";
+const $calendar = document.getElementById("calendarView");
+TurmaCalendar.mount($calendar, { now: () => Date.now() });
+function storedView() {
+  try { const v = localStorage.getItem(VIEW_KEY); return v === "notes" || v === "calendar" ? v : null; } catch { return null; }
+}
+let view = /[?&]site=/.test(location.search || "") ? "notes" : (storedView() || "calendar");
+function showView(v, remember = false) {
+  view = v === "notes" ? "notes" : "calendar";
+  if (remember) { try { localStorage.setItem(VIEW_KEY, view); } catch { /* per-viewer nicety */ } }
+  $calendar.hidden = view !== "calendar";
+  $briefs.hidden = view !== "notes";
+  const note = document.getElementById("notesNote");
+  if (note) note.hidden = view !== "notes";
+  for (const b of document.querySelectorAll("[data-view]")) b.setAttribute("aria-pressed", String(b.dataset.view === view));
+  TurmaCalendar.setActive(view === "calendar");
+}
+for (const b of document.querySelectorAll("[data-view]")) b.addEventListener("click", () => showView(b.dataset.view, true));
+showView(view);
 
 // The next run is the hub's to compute (DST, the lead window), so it is read
 // from GET .../schedule for each shown org with a schedule: again when the
@@ -732,6 +851,8 @@ function connectSSE() {
     // nothing on a fresh stream repairs what moved while it was down (a hub
     // restart or rollout) — and the fallback poll runs only while SSE is down.
     if (sseEverOpen) refresh();
+    // The calendar reads its own routes, so its frames missed while down are re-read too.
+    if (sseEverOpen) TurmaCalendar.refetch();
     sseEverOpen = true;
     sseOk = true; sseBackoff = 2000;
   };
@@ -759,6 +880,8 @@ function connectSSE() {
     meetingsClock++;
     cache.meetingProposals = d;
     renderBriefs(cache, Date.now());
+    // A Tenir capture is a calendar entry too, and the hub announces it only here.
+    calendarSoon();
   });
   // Each org's Tenir label and the labels no org has (XERK-2638), and whose
   // work its meetings propose (XERK-2514).
@@ -772,6 +895,9 @@ function connectSSE() {
       renderBriefs(cache, Date.now());
     });
   }
+  // The calendar reads its own routes; these frames only say what changed.
+  es.addEventListener("calendar", () => calendarSoon());
+  es.addEventListener("holidaySettings", () => calendarSoon());
   TurmaOrg.sse(es);
   es.onerror = () => {
     sseOk = false;
@@ -785,6 +911,13 @@ function connectSSE() {
   };
 }
 TurmaOrg.subscribe(() => { if (cache) render(cache); });
+// Frames come in bursts (a review is one meetingProposals frame per answer), so
+// the calendar re-reads once per burst.
+let calendarTimer = 0;
+function calendarSoon() {
+  if (calendarTimer) return;
+  calendarTimer = setTimeout(() => { calendarTimer = 0; TurmaCalendar.refetch(); }, 1000);
+}
 // The stream opens once the first snapshot is in, naming it (XERK-2599).
 refresh().finally(connectSSE);
 // The org list rides the agent payload, which this page does not live-patch, so a
@@ -792,6 +925,8 @@ refresh().finally(connectSSE);
 // The 30s repaint keeps "started Nm ago" and the next-run lookup current.
 setInterval(() => refresh(), 60000);
 setInterval(() => { if (!sseOk) refresh(); }, 15000);
+// With the stream down no calendar frame arrives, so the calendar polls too.
+setInterval(() => { if (!sseOk) TurmaCalendar.refetch(); }, 60000);
 setInterval(() => { if (cache) renderBriefs(cache, Date.now()); }, 30000);
 </script>
 </body>
