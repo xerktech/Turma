@@ -568,7 +568,7 @@ function transcriptHtml(site, m) {
   const mk = meetingKey(site, m.meetingId);
   const open = transcriptOpen.has(mk);
   const t = transcripts.get(mk);
-  const btn = `<button type="button" class="linkish" data-transcript="${esc(mk)}" aria-expanded="${open}">`
+  const btn = `<button type="button" class="linkish mt-tr-toggle" data-transcript="${esc(mk)}" aria-expanded="${open}">`
     + `${open ? "▾" : "▸"} Full transcript</button>`;
   let body = "";
   if (open) {
@@ -576,7 +576,7 @@ function transcriptHtml(site, m) {
     else if (t.error) body = `<div class="mt-status${t.missing ? "" : " failed"}">${esc(t.error)}</div>`;
     else body = `<div class="mt-tr" aria-label="Transcript">${t.html}</div>`;
   }
-  return `<div class="mt-transcript">${btn}${body}</div>`;
+  return `<div class="mt-transcript" aria-label="Meeting transcript">${btn}${body}</div>`;
 }
 async function loadTranscript(mk) {
   const [site, mid] = mk.split("/").map(decodeURIComponent);
@@ -644,8 +644,9 @@ function meetingHtml(site, m, { primary = false, orgName = "", back = "", people
     + (people && (m.participants || []).length
       ? `<div class="mt-people" aria-label="Participants">${m.participants.map((p) => `<span>${esc(p)}</span>`).join("")}</div>` : "")
     + summaryHtml(m)
-    + transcriptHtml(site, m)
-    + body + `</section>`;
+    + body
+    // The meeting's own transcript, a section of its own after every proposal.
+    + transcriptHtml(site, m) + `</section>`;
 }
 
 // ---- render: the rail ---------------------------------------------------------------

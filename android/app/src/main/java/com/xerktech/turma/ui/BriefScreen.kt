@@ -814,6 +814,7 @@ internal fun TranscriptSection(site: String, m: Meeting, mvm: MeetingsViewModel)
     var open by rememberSaveable(site, m.meetingId) { mutableStateOf(false) }
     val uri = LocalUriHandler.current
     val state = transcripts["$site\u0000${m.meetingId}"]
+    HorizontalDivider(Modifier.padding(top = 8.dp))
     GhostButton(if (open) "▾ Full transcript" else "▸ Full transcript", {
         open = !open
         if (open) mvm.loadTranscript(site, m.meetingId)
@@ -921,7 +922,6 @@ internal fun MeetingPart(
     for (para in meetingSummaryParagraphs(m)) {
         Text(para, style = MaterialTheme.typography.bodyMedium)
     }
-    TranscriptSection(site, m, mvm)
     if (needsProject) {
         ProjectTarget(meta[site], project, { mvm.setProject(site, it) }, { mvm.retryMeta(site) })
     }
@@ -929,6 +929,7 @@ internal fun MeetingPart(
     if (status != null) {
         Text(status.first, style = MaterialTheme.typography.bodyMedium,
             color = if (status.second) textOn(TurmaColors.criticalText()) else MaterialTheme.colorScheme.onSurfaceVariant)
+        TranscriptSection(site, m, mvm)
         return
     }
     val act = ItemActions(
@@ -965,6 +966,8 @@ internal fun MeetingPart(
             }
         }
     }
+    // The meeting's own transcript, a section of its own after every proposal.
+    TranscriptSection(site, m, mvm)
 }
 
 private val WEEKDAY_LETTERS = listOf("S", "M", "T", "W", "T", "F", "S")
