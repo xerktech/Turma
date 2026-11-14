@@ -16,7 +16,7 @@
      meetings and daily briefs, painted by meetings.js; the brief block and the
      schedule editor are this page's (mount hooks). Tokens/base/nav live in app.css.
      Android's Meetings tab is its counterpart (android/PARITY.md). */
-  .wrap.tri-wrap { max-width: 1280px; padding-top: 16px; }
+  .wrap.tri-wrap { --tri-wrap: 1280px; max-width: var(--tri-wrap); padding-top: 16px; }
   .mt-list button[aria-disabled="true"], .mt-list button[aria-disabled="true"]:hover {
     opacity: 0.5; cursor: default; border-color: var(--border); }
   .pane-note { color: var(--muted); font-size: 12px; margin: 16px 0 0; }
@@ -313,9 +313,11 @@
   .cal-ev.canceled { background: color-mix(in srgb, var(--org) 10%, var(--surface)); }
   .cal-ev.past { opacity: 0.55; }
   .cal-tenir { width: 13px; height: 13px; flex: none; color: var(--org); }
-  /* An open detail panel covers the viewport's right edge: on a wide window, the week gives up
-     that width so the rightmost day (and the event just clicked) stays in view. */
-  @media (min-width: 1100px) { .cal:has(> .cal-detail:not([hidden])) > .cal-main { margin-right: 468px; } }
+  /* An open detail panel (480px) covers the viewport's right edge: on a wide window, the week gives
+     up only the part the panel overlaps, so the rightmost day (and the event clicked) stays in view.
+     The grid ends 33px (wrap 20 + .cal 12 + border 1) plus the centred wrap's side gap from the edge. */
+  @media (min-width: 1100px) { .cal:has(> .cal-detail:not([hidden])) > .cal-main {
+    margin-right: max(0px, 447px - max(0px, (100vw - var(--tri-wrap)) / 2)); } }
   .cal-detail { position: fixed; top: 0; right: 0; bottom: 0; z-index: 40; width: min(480px, 100vw); box-sizing: border-box;
     overflow-y: auto; padding: 18px 20px 32px; background: var(--surface); border-left: 1px solid var(--border);
     box-shadow: -12px 0 32px rgba(0, 0, 0, 0.25); }

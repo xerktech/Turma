@@ -867,3 +867,10 @@ test("XERK-2943: a short block still carries its time line; the drawn height (CS
   assert.match(html, /<button type="button" class="cal-ev" [^>]*aria-label="Quick,[^"]*"><span class="cal-evb"><span class="t"><span class="tx">Quick<\/span><\/span><span class="m">9:00\s–\s9:15\sAM<\/span><\/span><\/button>/);
   assert.doesNotMatch(html, /class="cal-ev[^"]*\bshort\b/);
 });
+
+test("XERK-2943: brief.html keeps the CSS that sizes short blocks and clears the detail panel", () => {
+  const css = require("fs").readFileSync(require("path").join(__dirname, "..", "public", "brief.html"), "utf8");
+  assert.match(css, /\.cal-ev:not\(\.allday\) \{ container-type: size;/);
+  assert.match(css, /@container \(height < 34px\) \{[^}]*\.cal-evb \{[^}]*\}\s*\.cal-evb \.m \{ display: none; \}/);
+  assert.match(css, /\.cal:has\(> \.cal-detail:not\(\[hidden\]\)\) > \.cal-main \{\s*margin-right: max\(0px, 447px - max\(0px, \(100vw - var\(--tri-wrap\)\) \/ 2\)\);/);
+});
