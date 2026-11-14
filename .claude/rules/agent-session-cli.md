@@ -298,6 +298,10 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   (`ensure_wsl_interop`); `disabled` → the `echo 1` fix. It rides the calendar notice, so it
   stays under `CALENDAR_ERROR_MAX`. Tests: `test_interop_*` (`test_session_cli.py`),
   `test_install_wsl_interop.sh`.
+- **The wsl.conf reader is mirrored** — `wsl_conf_interop_off` (py) ⇄ `_wsl_interop_disabled`
+  (install.sh), both as WSL's ParseBool reads it (`false`/`0`, quotes, `#`, last value wins); an
+  interop-off host is told so, never sent to the installer that refuses it. `WSLInterop-late`
+  (older WSL 2.x) counts as registered on both sides.
 - **It only ATTACHES to a running classic Outlook (`GetActiveObject`), never starts one.** A COM
   start launches whichever Outlook is registered for automation — on a PC with an old Office
   beside Microsoft 365, that one — and opens its account-setup wizard (operator, live). The

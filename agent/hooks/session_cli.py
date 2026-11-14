@@ -325,25 +325,54 @@ def _shadow_grade(sid: str, args) -> str:
 
 
 BINFMT_MISC = "/proc/sys/fs/binfmt_misc"
+WSL_CONF = "/etc/wsl.conf"
 
 
-def wsl_interop_hint(binfmt_misc=None) -> str:
-    """Why a Windows program got ENOEXEC here, and the fix (XERK-2938): the
-    kernel's `WSLInterop` binfmt entry is missing (systemd on WSL can drop it
-    after boot) or registered but disabled. Kept short: it rides the calendar
-    notice, capped at CALENDAR_ERROR_MAX."""
-    d = binfmt_misc or BINFMT_MISC
+def wsl_conf_interop_off(path=None) -> bool:
+    """True when wsl.conf sets `[interop] enabled` false/0, read as WSL reads
+    it: `#` comments, quotes and case ignored, the last value wins. Mirrors
+    install.sh's `_wsl_interop_disabled`."""
     try:
-        with open(os.path.join(d, "WSLInterop"), encoding="utf-8") as fh:
-            state = fh.readline().strip()
-    except FileNotFoundError:
+        with open(path or WSL_CONF, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read(1 << 16).splitlines()
+    except OSError:
+        return False
+    sec, off = "", False
+    for raw in lines:
+        line = re.sub(r"\s", "", raw.split("#", 1)[0]).lower()
+        if line.startswith("[") and line.endswith("]"):
+            sec = line
+        elif sec == "[interop]" and line.startswith("enabled="):
+            off = line[8:].strip("\"'") in ("false", "0")
+    return off
+
+
+def wsl_interop_hint(binfmt_misc=None, wsl_conf=None) -> str:
+    """Why a Windows program got ENOEXEC here, and the fix (XERK-2938): interop
+    turned off in wsl.conf, the kernel's `WSLInterop` binfmt entry missing
+    (systemd on WSL can drop it after boot), or registered but disabled. Kept
+    short: it rides the calendar notice, capped at CALENDAR_ERROR_MAX."""
+    d = binfmt_misc or BINFMT_MISC
+    if wsl_conf_interop_off(wsl_conf):
+        return (f"WSL interop is turned off in {wsl_conf or WSL_CONF} ([interop] enabled); "
+                "turn it on, then run 'wsl --shutdown' in Windows")
+    state, entry = None, "WSLInterop"
+    for name in ("WSLInterop", "WSLInterop-late"):
+        try:
+            with open(os.path.join(d, name), encoding="utf-8") as fh:
+                state, entry = fh.readline().strip(), name
+            if state == "enabled":
+                break
+        except FileNotFoundError:
+            continue
+        except OSError:
+            state = state or ""
+    if state is None:
         return ("WSL interop is not registered: re-run the Turma agent installer, "
                 "or run 'wsl --shutdown' in Windows and reopen the distro")
-    except OSError:
-        state = ""
     if state == "disabled":
         return ("WSL interop is disabled: echo 1 | sudo tee "
-                f"{os.path.join(d, 'WSLInterop')}")
+                f"{os.path.join(d, entry)}")
     return "WSL interop looks off: Windows programs cannot start from this distro"
 
 

@@ -518,16 +518,21 @@ class CalendarTest(unittest.TestCase):
             with self.assertRaisesRegex(cli.Refused, "did not answer"):
                 cli.read_calendar("today", powershell=ps)
 
-    def _interop_off(self, state):
-        """ENOEXEC from a fake .exe, with the WSLInterop binfmt entry in
-        `state` (None = not registered)."""
+    def _interop_off(self, state, conf=None, entry="WSLInterop"):
+        """ENOEXEC from a fake .exe, with the `entry` binfmt entry in `state`
+        (None = not registered) and `conf` as /etc/wsl.conf."""
         ps = self.fake_ps("\x7fELF-not-really", shebang=False)
         binfmt = os.path.join(self.tmp, "binfmt")
         os.makedirs(binfmt, exist_ok=True)
         if state is not None:
-            with open(os.path.join(binfmt, "WSLInterop"), "w") as fh:
+            with open(os.path.join(binfmt, entry), "w") as fh:
                 fh.write(f"{state}\ninterpreter /init\nflags: PF\n")
-        with mock.patch.object(cli, "BINFMT_MISC", binfmt):
+        wsl_conf = os.path.join(self.tmp, "wsl.conf")
+        if conf is not None:
+            with open(wsl_conf, "w") as fh:
+                fh.write(conf)
+        with mock.patch.object(cli, "BINFMT_MISC", binfmt), \
+                mock.patch.object(cli, "WSL_CONF", wsl_conf):
             with self.assertRaises(cli.Refused) as cm:
                 cli.read_calendar("today", powershell=ps)
         msg = str(cm.exception)
@@ -545,6 +550,25 @@ class CalendarTest(unittest.TestCase):
     def test_interop_disabled_names_the_fix(self):
         msg = self._interop_off("disabled")
         self.assertIn("echo 1 | sudo tee", msg)
+
+    def test_interop_late_entry_counts_as_registered(self):
+        msg = self._interop_off("disabled", entry="WSLInterop-late")
+        self.assertIn("WSLInterop-late", msg)
+
+    def test_interop_off_in_wsl_conf_is_named_not_the_installer(self):
+        """The installer refuses to override wsl.conf, so never send the
+        operator there; every spelling WSL reads as false counts."""
+        for conf in ("[interop]\nenabled=false\n", "[interop]\nenabled=0\n",
+                     '[interop] # x\nEnabled = "False" # no\n',
+                     "[boot]\nsystemd=true\r\n[interop]\r\nenabled=true\r\nenabled=false\r\n"):
+            with self.subTest(conf=conf):
+                msg = self._interop_off(None, conf=conf)
+                self.assertIn("turned off in", msg)
+                self.assertNotIn("installer", msg)
+        for conf in ("[automount]\nenabled=false\n", "[interop]\nenabled=false\nenabled=1\n",
+                     "[interop]\n#enabled=false\n"):
+            with self.subTest(conf=conf):
+                self.assertIn("not registered", self._interop_off(None, conf=conf))
 
     def test_interop_enabled_but_failing_is_still_named(self):
         self.assertIn("interop looks off", self._interop_off("enabled"))

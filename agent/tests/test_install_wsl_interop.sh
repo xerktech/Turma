@@ -63,6 +63,32 @@ else fail "overrode enabled=false"; fi
 run_case otheroff "$WSL" $'[automount]\nenabled=false' no
 if [ -f "$CONF" ]; then ok "enabled=false in another section does not count"; else fail "misread [automount]"; fi
 
+# Every spelling WSL's own parser reads as false (ParseBool, `#` comments,
+# quotes, CRLF, last value wins) must be honoured; a true one must not.
+i=0
+for conf in $'[interop]\nenabled=0' $'[interop]\nenabled="false"' $'[interop]\nenabled = false # no' \
+            $'[interop] # x\nenabled=false' $'[interop]\r\nenabled=false\r' $'[interop]\nenabled=true\nenabled=false'; do
+  i=$((i + 1)); run_case "off$i" "$WSL" "$conf" no
+  if [ ! -e "$CONF" ] && [ ! -s "$REG" ]; then ok "honours off spelling $i"
+  else fail "overrode off spelling $i: $(printf '%q' "$conf")"; fi
+done
+for conf in $'[interop]\nenabled=false\nenabled=1' $'[interop]\n# enabled=false'; do
+  i=$((i + 1)); run_case "on$i" "$WSL" "$conf" no
+  if [ -f "$CONF" ]; then ok "an on/commented spelling still installs ($i)"; else fail "misread on spelling $i"; fi
+done
+
+run_case late "$WSL" - no
+echo enabled > "$WORK/late/binfmt_misc/WSLInterop-late"
+: > "$REG"; rm -f "$CONF"
+mkdir -p "$WORK/late/etc/binfmt.d"; echo ':WSLInterop-late:M::MZ::/init:PF' > "$WORK/late/etc/binfmt.d/x.conf"
+# shellcheck disable=SC2016  # expanded by the child shell.
+WSL_OSRELEASE="$WORK/late/osrelease" WSL_CONF="$WORK/late/etc/wsl.conf" BINFMT_MISC="$WORK/late/binfmt_misc" \
+  BINFMT_D="$WORK/late/etc/binfmt.d" bash -c '
+    info() { :; }; warn() { :; }; have_sudo() { return 0; }; SUDO=""
+    . "$1"; ensure_wsl_interop' _ "$WORK/fn.sh"
+if [ ! -s "$REG" ] && [ ! -e "$CONF" ]; then ok "a WSLInterop-late entry counts as registered"
+else fail "duplicated a WSLInterop-late registration"; fi
+
 run_case linux "6.1.0-18-amd64" - no
 if [ ! -e "$CONF" ] && [ ! -s "$REG" ]; then ok "does nothing off WSL"; else fail "touched a non-WSL host"; fi
 

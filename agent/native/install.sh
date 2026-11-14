@@ -289,14 +289,17 @@ ensure_glab() {
 : "${BINFMT_MISC:=/proc/sys/fs/binfmt_misc}"
 : "${BINFMT_D:=/etc/binfmt.d}"
 WSL_INTEROP_RULE=':WSLInterop:M::MZ::/init:PF'
-_wsl_interop_disabled() {  # [interop] enabled=false in wsl.conf
+_wsl_interop_disabled() {  # [interop] enabled is false/0 in wsl.conf (WSL's own ParseBool)
+  # WSL's parser: `#` starts a comment, values may be quoted, case is ignored,
+  # and the last `enabled` in the section wins.
   [ -r "$WSL_CONF" ] && awk '
-    /^[[:space:]]*\[/ { sec = tolower($0); gsub(/[[:space:]]/, "", sec); next }
-    sec == "[interop]" {
-      l = tolower($0); gsub(/[[:space:]]/, "", l)
-      if (l == "enabled=false") found = 1
+    { l = $0; sub(/\r$/, "", l); sub(/#.*/, "", l); gsub(/[[:space:]]/, "", l); l = tolower(l) }
+    l ~ /^\[.*\]$/ { sec = l; next }
+    sec == "[interop]" && l ~ /^enabled=/ {
+      v = substr(l, 9); gsub(/["\047]/, "", v)
+      off = (v == "false" || v == "0")
     }
-    END { exit !found }' "$WSL_CONF"
+    END { exit !off }' "$WSL_CONF"
 }
 ensure_wsl_interop() {
   grep -qi microsoft "$WSL_OSRELEASE" 2>/dev/null || return 0
@@ -305,10 +308,11 @@ ensure_wsl_interop() {
     return 0
   fi
   local conf="$BINFMT_D/WSLInterop.conf" need_conf=no need_reg=no
-  if ! grep -rqs '^:WSLInterop:' "$BINFMT_D" /usr/lib/binfmt.d /run/binfmt.d 2>/dev/null; then
+  if ! grep -rqs '^:WSLInterop\(-late\)\?:' "$BINFMT_D" /usr/lib/binfmt.d /run/binfmt.d 2>/dev/null; then
     need_conf=yes
   fi
-  if [ -e "$BINFMT_MISC/register" ] && [ ! -e "$BINFMT_MISC/WSLInterop" ]; then need_reg=yes; fi
+  if [ -e "$BINFMT_MISC/register" ] && [ ! -e "$BINFMT_MISC/WSLInterop" ] \
+     && [ ! -e "$BINFMT_MISC/WSLInterop-late" ]; then need_reg=yes; fi
   [ "$need_conf" = yes ] || [ "$need_reg" = yes ] || return 0
   if ! have_sudo && [ "$(id -u)" != 0 ]; then
     warn "WSL interop needs root to persist; run:"
