@@ -174,13 +174,32 @@ test("XERK-2554: the tenant routes stay closed until the migration completes; op
   assert.equal((await request("GET", "/api/agents", { headers: breakGlass })).status, 200);
 });
 
+test("XERK-2870: no step is recorded until the usage ledger has loaded", async () => {
+  const { isLoaded, rehydrate } = hub.usageLedger;
+  let rescans = 0;
+  hub.usageLedger.isLoaded = () => false;
+  hub.usageLedger.rehydrate = () => { rescans++; return Promise.resolve(); };
+  try {
+    const r = await hub.runTenantMigration();
+    assert.equal(r.state, "failed", JSON.stringify(r));
+    assert.match(r.error, /not finished loading/);
+    assert.ok(rescans >= 1, "the load is retried");
+    assert.deepEqual(Object.keys(hub.tenantMigrationMarker().steps || {}), []);
+  } finally {
+    Object.assign(hub.usageLedger, { isLoaded, rehydrate });
+  }
+});
+
 test("XERK-2870: a step is not recorded while a usage re-key has not reached Postgres", async () => {
   const real = hub.usageLedger.rekeysSettled;
-  hub.usageLedger.rekeysSettled = async () => 1;
+  // Unsaved once the usage step has re-keyed "gone2554": that step's save is refused.
+  hub.usageLedger.rekeysSettled = async () => (hub.usageLedger.has("gone2554") ? 0 : 1);
   try {
     const r = await hub.runTenantMigration();
     assert.equal(r.state, "failed", JSON.stringify(r));
     assert.match(r.error, /not yet written to Postgres/);
+    assert.ok(!hub.usageLedger.has("gone2554"), "the usage step ran before its save was refused");
+    assert.ok(!hub.tenantMigrationMarker().steps.usageLedger, "and was not recorded");
     const m = hub.tenantMigrationMarker();
     assert.ok(!m.completedAt, "the marker never completes over an unlanded re-key");
     assert.equal(hub.tenantMigrationGateClosed(), true);
@@ -280,6 +299,12 @@ test("XERK-2554: the migration moves every store into the owner's tenant; hosts 
   // …and break-glass no longer reaches it.
   const bg = await request("GET", "/api/agents", { headers: breakGlass });
   assert.ok(!bg.body.agents.some((x) => x.key === tk("box2554")));
+});
+
+test("XERK-2870: a usage step resumed after a refused save still counts the hosts it moved", () => {
+  // The first run re-keyed gone2554 in memory before its save was refused; the
+  // resumed run found nothing left to move, and must not record 0.
+  assert.equal(hub.tenantMigrationMarker().steps.usageLedger.moved, 1);
 });
 
 test("XERK-2554: a rerun is a no-op", async () => {

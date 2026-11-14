@@ -982,6 +982,9 @@ function sharedOps() {
     keys: () => Object.keys(hosts),
     coerce: (raw) => entryOf(raw),
     mergeEntry: (dst, src) => mergeTwoEntries(dst, src),
+    // A re-key still settling (rollup XERK-2870): its old key's stored rows ARE the
+    // history being moved, so a rescan (reconnect, promotion) must not load them back.
+    skipLoad: (key) => rekeysPending.has(key),
     enforceHostShare,
     SAVE_DEBOUNCE_MS,
     // The four token keys, so the Postgres LedgerStore decomposes/reassembles a
@@ -1064,6 +1067,11 @@ async function configure(haConfig, pgClient, onExternalChange) {
 // rescan its retired-host view would be as stale as its own boot scan. Live hosts
 // self-heal on their next beat; a rescan closes the retired-host gap. Idempotent
 // (every scan max-merges rows into the live model and can only raise a figure).
+/** Whether the model holds every stored host (the file backend always does). */
+function isLoaded() {
+  return backend.loaded !== false;
+}
+
 function rehydrate() {
   return backend.rescan ? backend.rescan() : Promise.resolve();
 }
@@ -1393,12 +1401,14 @@ function installOf(k) {
   const f = String(k).toLowerCase();
   return installRoots.get(f) || f;
 }
-function mergeEntries(keys) {
+function mergeEntries(keys, overrides = null) {
   // High-water WITHIN an install (the same store reported twice), then SUM across
   // installs (different stores, XERK-2868) — so no era of a static rename is lost.
+  // `overrides` stands in for a member's stored entry (`fold`'s live install).
+  const entryAt = (k) => (overrides && Object.prototype.hasOwnProperty.call(overrides, k) ? overrides[k] : hosts[k]);
   const installs = new Map();
   for (const k of keys) {
-    const e = hosts[k];
+    const e = entryAt(k);
     if (!e) continue;
     let g = installs.get(installOf(k));
     if (!g) installs.set(installOf(k), g = { host: null, repos: Object.create(null) });
@@ -1420,7 +1430,7 @@ function mergeEntries(keys) {
   }
   let device = "", siteKey = "", lastSeen = -1, canonKey = keys[0];
   for (const k of keys) {
-    const e = hosts[k];
+    const e = entryAt(k);
     if (!e) continue;
     // key/device/siteKey all follow the most-recently-seen member so the merged
     // row reads under the host's CURRENT casing AND its current org (XERK-448 D1:
@@ -1433,6 +1443,31 @@ function mergeEntries(keys) {
     } else if (!siteKey && e.siteKey) siteKey = e.siteKey;
   }
   return { host, repos, device, siteKey, lastSeen: Math.max(0, lastSeen), augments: true, key: canonKey };
+}
+
+// A copy of the live host's stored entry (or a blank one) raised by its report —
+// what the store would hold had the beat been ingested. `fold`'s view only.
+function liveInstallEntry(entry, record, liveUsage, liveRepos, now) {
+  const out = {
+    device: (entry && entry.device) || (record && typeof record.device === "string" ? record.device : ""),
+    siteKey: (entry && entry.siteKey) ||
+      (record && record.jira && typeof record.jira.siteKey === "string" ? record.jira.siteKey : ""),
+    lastSeen: Math.max((entry && entry.lastSeen) || 0, now),
+    host: entry && entry.host ? cloneSeries(entry.host) : null,
+    repos: Object.create(null),
+  };
+  if (liveUsage) absorb(out.host || (out.host = blankSeries()), liveUsage);
+  if (entry) {
+    for (const [rk, r] of Object.entries(entry.repos)) {
+      if (rk !== "__proto__") out.repos[rk] = { repo: r.repo, remote: r.remote, series: cloneSeries(r.series) };
+    }
+  }
+  for (const [rk, r] of liveRepos) {
+    if (rk === "__proto__") continue;
+    const slot = out.repos[rk] || (out.repos[rk] = { repo: r.repo, remote: r.remote, series: blankSeries() });
+    absorb(slot.series, r.usage);
+  }
+  return out;
 }
 
 function fold(key, record, now = Date.now(), liveKeys = null) {
@@ -1458,9 +1493,15 @@ function fold(key, record, now = Date.now(), liveKeys = null) {
   // Common case: no case-twin AND nothing lost — serve the record as its agent
   // sent it (one map lookup), exactly as before.
   if (group.length === 1 && (!entry || !entry.augments)) return null;
-  const merged = group.length > 1 ? mergeEntries(group) : entry;
   const liveUsage = usageOf(record && record.usage);
   const liveRepos = new Map(reposOf(record && record.repoUsage).map((r) => [r.remoteKey, r]));
+  // The live report belongs to the live host's OWN install: raise that install by
+  // it BEFORE installs are summed (rollup XERK-2870). Raising the sum afterwards
+  // read a live host with no entry yet as the per-day max of its report and its
+  // old install's history, so the overlapping days lost one install's spend.
+  const merged = group.length > 1
+    ? mergeEntries(group, { [key]: liveInstallEntry(entry, record, liveUsage, liveRepos, now) })
+    : entry;
   return {
     usage: merged.host ? servedSeries(merged.host, liveUsage, now) : (record && record.usage) || null,
     repoUsage: repoBlocks(merged, liveRepos, now),
@@ -1598,6 +1639,9 @@ function isTenantKeyOf(from, to) {
  */
 function rekeyHost(from, to, opts = {}) {
   if (!isTenantKeyOf(from, to) || !Object.prototype.hasOwnProperty.call(hosts, from)) return false;
+  // Never before the store loaded (rollup XERK-2870): memory may hold only the new
+  // beats, and settling would replace the stored history with them.
+  if (!isLoaded()) return false;
   const src = hosts[from];
   const dst = Object.prototype.hasOwnProperty.call(hosts, to) ? hosts[to] : null;
   const entry = dst ? mergeTwoEntries(dst, src) : src;
@@ -1613,33 +1657,52 @@ function rekeyHost(from, to, opts = {}) {
   return true;
 }
 
-// Drop `from`'s durable copy only once `to`'s write has LANDED (rollup XERK-2870):
+// Replace `from`'s durable copy only once `to`'s write has LANDED (rollup XERK-2870):
 // the Postgres backend swallows a failed write, and forgetting `from` after one left
-// a restart with neither key. Settled on a write of `to` ITSELF (`persistKey`), retried
-// while `to` is still held; `from` is kept until then, so a restart reloads it and the
-// migration moves it again. `rekeysSettled` lets the migration wait on it.
+// a restart with neither key. Settled on a write of `to` ITSELF (`persistKey`),
+// retried every REKEY_RETRY_MS; `from` keeps its rows until then, so a restart
+// reloads them and the migration moves them again. `rekeysSettled` lets it wait.
 const REKEY_RETRY_MS = 30 * 1000;
 const rekeysPending = new Map(); // from -> the in-flight attempt (a Promise)
 function settleRekey(from, to, b) {
-  const attempt = new Promise((resolve) => {
-    const persist = typeof b.persistKey === "function" ? (k, cb) => b.persistKey(k, cb) : (_k, cb) => b.flush(cb);
-    persist(to, (err) => {
-      resolve();
-      // Superseded (a later re-key of the same host), the backend swapped, or `to`
-      // forgotten (an operator purge): stop, keeping whatever `from` holds.
-      if (rekeysPending.get(from) !== attempt) return;
-      if (backend !== b || !Object.prototype.hasOwnProperty.call(hosts, to)) { rekeysPending.delete(from); return; }
-      if (err) {
-        const t = setTimeout(() => { if (rekeysPending.get(from) === attempt) settleRekey(from, to, b); }, REKEY_RETRY_MS);
-        t.unref?.();
-        return;
-      }
-      rekeysPending.delete(from);
-      // Re-created meanwhile (the host beat under its old key): its own writes own it.
-      if (!Object.prototype.hasOwnProperty.call(hosts, from)) b.onForget(from);
-    });
-  });
+  const has = (k) => Object.prototype.hasOwnProperty.call(hosts, k);
+  // One durable step, judged when it runs: write `to` (unless forgotten — an
+  // operator forget or a tenant purge), then replace `from`'s durable copy with
+  // what memory holds for it now: nothing (delete), or — when it beat again
+  // meanwhile — only the new beats. Keeping its old rows would let a restart load
+  // the moved history twice, or reload purged history untenanted (rollup XERK-2870).
+  const step = (cb) => {
+    const settleFrom = () => {
+      if (!has(from)) return forgetDurable(b, from, cb);
+      forgetDurable(b, from, (err) => (err ? cb(err) : persistDurable(b, from, cb)));
+    };
+    if (!has(to)) return settleFrom();
+    persistDurable(b, to, (err) => (err ? cb(err) : settleFrom()));
+  };
+  let attempt = null;
+  attempt = Promise.resolve().then(() => new Promise((resolve) => step((err) => {
+    resolve();
+    // Superseded (a later re-key of the same host) or the backend swapped: stop.
+    if (rekeysPending.get(from) !== attempt) return;
+    if (backend !== b) { rekeysPending.delete(from); return; }
+    if (err) {
+      const t = setTimeout(() => { if (rekeysPending.get(from) === attempt) settleRekey(from, to, b); }, REKEY_RETRY_MS);
+      t.unref?.();
+      return;
+    }
+    rekeysPending.delete(from);
+  })));
   rekeysPending.set(from, attempt);
+}
+// Write / delete ONE host and report whether it landed. A backend without the
+// per-key calls (the file backend) rewrites everything, so its flush is the answer.
+function persistDurable(b, key, cb) {
+  if (typeof b.persistKey === "function") b.persistKey(key, cb); else b.flush(cb);
+}
+function forgetDurable(b, key, cb) {
+  if (typeof b.forgetKey === "function") return b.forgetKey(key, cb);
+  b.onForget(key);
+  b.flush(cb);
 }
 
 /**
@@ -1667,7 +1730,7 @@ function has(key) {
 load();
 
 module.exports = {
-  ingest, fold, retiredAgents, forget, purgeTenant, has, keys, rekeyHost, rekeysSettled, flush, configure, rehydrate, setHostAliases,
+  ingest, fold, retiredAgents, forget, purgeTenant, has, keys, rekeyHost, rekeysSettled, isLoaded, flush, configure, rehydrate, setHostAliases,
   LEDGER_FILE, LEDGER_MAX, LEDGER_DAYS, LEDGER_HOSTS, LEDGER_REPOS, RETIRED_MAX,
   LEDGER_MODELS, LEDGER_NAME_MAX, hostShare, STATIC_HOST_ALIASES,
   SYSTEM_USAGE_REPO, isSystemUsageRepo, foldSystemRepos,
