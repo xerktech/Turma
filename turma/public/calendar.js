@@ -18,7 +18,7 @@ const WORK_FROM_H = 8, WORK_UNTIL_H = 17;  // the shaded working hours; the grid
 const MIN_LAYOUT_MIN = 20;          // a shorter (or zero-length) event lays out as 20 minutes (one readable line)
 const NARROW_PX = 760;
 const RETRY_PENDING_MS = 20000;     // a sync the hub queued: re-read in case its frame is missed
-const MODAL_OPEN = '.td-backdrop:not([hidden]) > [aria-modal="true"], .img-lightbox.open[aria-modal="true"], dialog[open]';
+const MODAL_OPEN = '.td-backdrop:not([hidden]) > [aria-modal="true"]';
 const RETRY_ERROR_MAX_MS = 300000;  // a failed read's longest back-off
 const MODE_KEY = "turma-calendar-mode";
 
