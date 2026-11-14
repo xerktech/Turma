@@ -98,6 +98,14 @@ paths:
   PowerShell-on-POSIX suites + the `agent/win` pty-protocol test, Python + Node suites).
   Runs on EVERY PR (no paths filter): its `Unit tests` check is required by the main ruleset.
   All jobs run on GitHub-hosted runners (`ubuntu-latest`; `pwsh` ships there).
+- **The unit tests are PARALLEL jobs** (XERK-2889): `unit-python` (5 shards via
+  `.github/scripts/unittest_shard.py`, round-robin per test case), `unit-node` (3,
+  `node --test --test-shard`), `unit-misc`, `unit-native`, `unit-windows`. A release waits on them.
+  - The required check is the aggregating `Unit tests` job: it runs even when a shard failed and
+    fails unless EVERY test job is `success` — a skipped required check would not block a merge.
+  - It records `tested-tree-<tree>` only after all of them passed.
+  - Run sequentially they took 11.5-15 min and cancelled a release at the 15-min cap. A job
+    nearing its 8-min timeout means add a shard or speed the test up — never raise the timeout.
 - **A release re-runs `code-scan.yml` on the commit it ships** (XERK-1542): `release.yml`'s
   `code-scan` job calls it (`workflow_call`) and `plan` needs it, so a red main publishes nothing.
   - A PR is tested against its base, not the main it lands on — two green PRs can merge red.
@@ -139,7 +147,8 @@ in root `.trivyignore` (reviewed, each with a reason); anything unlisted fails.
 **Every workflow runs on GitHub-hosted `ubuntu-latest`**, including the hub image build (`gha`
 layer cache follows the job).
 
-- Hosted bills **rounded UP per job** — prefer fewer batched jobs.
+- The repo is PUBLIC, so hosted minutes are free: wall-clock wins, and splitting a slow job
+  into parallel ones is preferred over batching (it is what a release waits on).
 - **Self-hosted-box workarounds are DELETED, not disabled** — reintroducing any is a regression:
   workspace-ownership reset steps, per-job `DOCKER_CONFIG` scoping, `docker image/builder prune`,
   throwaway `node:24-alpine` for `npm view`, `mingc/android-build-box`. If a job genuinely needs
