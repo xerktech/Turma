@@ -141,9 +141,14 @@ A pure-core/adapter-shell split:
   - A block's `testTag` goes BEFORE its `clearAndSetSemantics`: after it, the tag is cleared too.
   - The view switch and mode picks are `FilterChip`s: `SegmentedButton` taps never reached
     `onClick` under Robolectric (measured), so a test could not drive them.
+  - The flip is judged against the last ACCEPTED `agent` frame (`sseOnline`), never `byKey`: the
+    poll usually reads `online:false` before the hub's offline frame, and `byKey` then hid the flip
+    (QA). Compare, take and record under ONE `byKey` lock (`upsertFrame`). Tests:
+    `net/FleetCalendarFlipTest`.
   - Calendar rows (events, hosts) strip control/bidi chars at decode (`cleanCalendarJson`, the
-    hub's `meetingText` class): defence against an older/forwarding hub (XERK-2921).
-  - Tests: `core/CalendarTest`, `ui/CalendarScreenTest`. `net/FleetCalendarFlipTest`.
+    hub's `meetingText` class) EXCEPT the id keys (`CALENDAR_ID_KEYS`): ids round-trip to the hub,
+    whose `CAL_ID_RE` accepts zero-width marks. Defence against an older/forwarding hub (XERK-2921).
+  - Tests: `core/CalendarTest`, `ui/CalendarScreenTest`.
 
 ## Images (rollup XERK-2109)
 

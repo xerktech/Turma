@@ -54,4 +54,14 @@ class FleetCalendarFlipTest {
         fleet.onSseEvent("agent", agent(false))
         assertEquals(start + 1, fleet.calendarFrames.value)
     }
+
+    @Test
+    fun `a removed host comes back with no stale baseline`() {
+        val fleet = hub.container.fleet
+        fleet.onSseEvent("agent", agent(false))
+        fleet.onSseEvent("removed", """{"key":"h1"}""")
+        val start = fleet.calendarFrames.value
+        fleet.onSseEvent("agent", agent(true, lastSeen = 200)) // first sight again
+        assertEquals(start, fleet.calendarFrames.value)
+    }
 }

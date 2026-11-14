@@ -325,17 +325,25 @@ class FleetRepository(
     }
 
     @androidx.annotation.VisibleForTesting
-    internal fun upsert(agent: AgentInfo) {
-        if (agent.key.isEmpty()) return
+    internal fun upsert(agent: AgentInfo) { upsertFrame(agent) }
+
+    /**
+     * [upsert], returning whether the frame was taken; [onTaken] gets the record it
+     * replaced and runs under the same lock, so a poll cannot slip in between (QA).
+     */
+    private fun upsertFrame(agent: AgentInfo, onTaken: ((prev: AgentInfo?) -> Unit)? = null): Boolean {
+        if (agent.key.isEmpty()) return false
         // Same freshness guard as refresh() (XERK-812): drop an SSE event older
         // than the record we already hold, so a late/out-of-order event can't
         // regress a session's question (or any other field) to a stale value.
         synchronized(byKey) {
             val cur = byKey[agent.key]
-            if (cur != null && cur.lastSeen > agent.lastSeen) return
+            if (cur != null && cur.lastSeen > agent.lastSeen) return false
             byKey[agent.key] = agent
+            onTaken?.invoke(cur)
         }
         emit(_state.value.now.coerceAtLeast(agent.lastSeen), null)
+        return true
     }
 
     private fun remove(key: String) {
@@ -361,12 +369,13 @@ class FleetRepository(
                 // usually sees `online:false` before the hub's offline frame, and comparing
                 // against it would read the frame as no flip (QA). First sight falls back to
                 // the held record, as the web falls back to its snapshot.
-                val was = synchronized(byKey) { sseOnline[it.key] ?: byKey[it.key]?.online }
-                upsert(it)
-                val took = synchronized(byKey) {
-                    (byKey[it.key] === it).also { took -> if (took) sseOnline[it.key] = it.online }
+                var flipped = false
+                upsertFrame(it) { prev ->
+                    val was = sseOnline[it.key] ?: prev?.online
+                    flipped = was != null && was != it.online
+                    sseOnline[it.key] = it.online
                 }
-                if (took && was != null && was != it.online) _calendarFrames.value++
+                if (flipped) _calendarFrames.value++
             }
             "removed" -> runCatching { TurmaJson.decodeFromString<JsonObject>(data) }
                 .getOrNull()?.get("key")?.jsonPrimitive?.content?.let { remove(it) }
