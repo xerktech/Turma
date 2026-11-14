@@ -21,6 +21,8 @@ file; change it here first.
   - `observed: "us"` moves a weekend date to Friday (Saturday) or Monday (Sunday). A Saturday
     1 January is observed 31 December of the PREVIOUS year, so a window evaluates year+1 too.
   - Only `US` (11 federal holidays) today.
+  - Years 1978–2999 only (`YEAR_MIN`): before 1978 the Monday-holiday and Veterans Day laws
+    differ, so the rules would answer wrongly. Lower it only with era rules added.
 - **A holiday `id` is stable across years** (`us-thanksgiving`): an org's days off are kept by id
   and apply every year. Never rename an id — it silently un-marks that day for every org.
 - Store: `/data/holiday-settings.json` (`HOLIDAY_SETTINGS_FILE`), a `registerExternalStore`,

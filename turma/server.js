@@ -5675,7 +5675,7 @@ function publishHolidaySettings() {
 function holidaysFor(p, fromText, untilText) {
   const from = holidays.parseDay(fromText), until = holidays.parseDay(untilText);
   if (from === null || until === null) {
-    return { status: 400, body: { error: "from and until must be dates as YYYY-MM-DD" } };
+    return { status: 400, body: { error: "from and until must be dates as YYYY-MM-DD, in the years 1978 to 2999" } };
   }
   if (until < from) return { status: 400, body: { error: "until is before from" } };
   if ((until - from) / holidays.DAY_MS + 1 > holidays.RANGE_MAX_DAYS) {
@@ -25602,8 +25602,6 @@ const server = http.createServer(async (req, res) => {
       return json(res, 404, { error: "no such upload" });
     }
 
-    // GET /api/search?q=&repo=&host=&limit= — instant hub-local full-text search
-    // over every archived session (works even for offline hosts).
     // GET /api/holidays?from=YYYY-MM-DD&until=YYYY-MM-DD — the holidays of every
     // catalog the caller's orgs follow, each with the orgs that take it off
     // (XERK-2892). Filtered: only the caller's own orgs count or are named.
@@ -25612,6 +25610,8 @@ const server = http.createServer(async (req, res) => {
       return json(res, out.status, out.body);
     }
 
+    // GET /api/search?q=&repo=&host=&limit= — instant hub-local full-text search
+    // over every archived session (works even for offline hosts).
     if (req.method === "GET" && url.pathname === "/api/search") {
       const q = (url.searchParams.get("q") || "").trim();
       if (q.length < 2) return json(res, 400, { error: "query too short" });

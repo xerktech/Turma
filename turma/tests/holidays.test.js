@@ -46,6 +46,7 @@ test("XERK-2892: a holiday is listed only from the year it began; windows are in
   assert.deepEqual(dateOf(2020, "us-juneteenth"), []);
   assert.deepEqual(dateOf(2021, "us-juneteenth"), ["2021-06-18"]); // a Saturday
   assert.deepEqual(dateOf(1985, "us-mlk-day"), []);
+  assert.equal(holidays.parseDay("1978-01-01"), Date.UTC(1978, 0, 1));
   const d = holidays.parseDay("2026-11-26");
   assert.deepEqual(holidays.holidaysIn("US", d, d).map((h) => h.id), ["us-thanksgiving"]);
   assert.deepEqual(holidays.holidaysIn("ZZ", d, d), []);
@@ -53,7 +54,7 @@ test("XERK-2892: a holiday is listed only from the year it began; windows are in
 });
 
 test("XERK-2892: parseDay takes only real calendar dates in range", () => {
-  for (const bad of ["2026-02-30", "2026-13-01", "26-01-01", "2026-1-1", "1899-12-31", "3000-01-01",
+  for (const bad of ["2026-02-30", "2026-13-01", "26-01-01", "2026-1-1", "1977-12-31", "3000-01-01",
     "2026-01-01T00:00", "", null, 20260101]) {
     assert.equal(holidays.parseDay(bad), null, String(bad));
   }

@@ -31730,6 +31730,14 @@ test("XERK-2892: an org's holiday settings validate, round-trip, persist and str
       assert.equal((await get(q)).status, 400, q);
     }
     assert.equal((await get("from=2026-01-01&until=2026-01-31", {})).status, 401);
+    // An org that follows no catalog is never named off, even while another visible org
+    // lists that catalog.
+    const S2 = "hol2892b.atlassian.net";
+    await beat1574("hol2892b", S2);
+    assert.equal((await put({ countries: [], off: ["us-thanksgiving"] }, userHeaders, S2)).status, 200);
+    const nov = (await get("from=2026-11-01&until=2026-11-30")).body.find((h) => h.id === "us-thanksgiving");
+    assert.ok(nov.offFor.includes(S) && !nov.offFor.includes(S2), JSON.stringify(nov.offFor));
+    delete agents.hol2892b; delete hub.getHolidaySettings()[S2];
     // Following no catalog lists none of its holidays for the org.
     await put({ countries: [] });
     assert.ok(!(await get("from=2026-11-01&until=2026-11-30")).body.some((h) => h.offFor.includes(S)));

@@ -42,9 +42,11 @@ const CATALOGS = {
   },
 };
 
-// The years a query may reach: wide enough for any calendar a person navigates,
-// narrow enough that a hostile `from`/`until` cannot ask for a loop of millennia.
-const YEAR_MIN = 1900;
+// The years a query may reach. 1978 is the first year the current rules hold for
+// every holiday (the Monday-holiday law took effect in 1971 and Veterans Day went
+// back to 11 November in 1978), so earlier years would be answered wrongly. The
+// top bound keeps a hostile `from`/`until` from asking for a loop of millennia.
+const YEAR_MIN = 1978;
 const YEAR_MAX = 2999;
 // The longest window one GET answers (a year view plus its edge weeks).
 const RANGE_MAX_DAYS = 400;
