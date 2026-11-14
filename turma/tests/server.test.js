@@ -32472,3 +32472,55 @@ test("XERK-2896: relinks are throttled per tenant and skip error-only syncs; an 
     cleanup2896(S, [D]);
   }
 });
+
+test("XERK-2896: an event reassigned to another org drops its capture; an organizer-only block takes none", async () => {
+  const S = "lkK2896a.atlassian.net", S2 = "lkK2896b.atlassian.net", D = "lkK2896", D2 = "lkK2896o";
+  cleanup2896(S, [D]);
+  cleanup2896(S2, [D2]);
+  try {
+    await beat1574(D2, S2);   // S2 is a decided org of the same tenant
+    await calHost2896(D, S, [ev2896("st", T2896, 30),
+      ev2896("blk", T2896 + 3 * 60 * MIN2896, 60, { attendees: [{ name: "Me", email: "me@x.com", role: "organizer",
+        response: "organizer" }] })]);
+    await postMeeting2508(S, capture2896("c", T2896, 30));
+    assert.equal(row2896(S, "c").calendarEventId, "st");
+    assert.equal((await request("POST", `/api/agents/${D}/calendar/settings`, { headers: { ...userHeaders,
+      "content-type": "application/json" }, body: { series: { id: "st", org: S2 } } })).status, 200);
+    assert.equal(row2896(S, "c").calendarEventId, undefined, "now S2's event: S's capture lets go");
+    await postMeeting2508(S, capture2896("b", T2896 + 3 * 60 * MIN2896 + 10 * MIN2896, 20));
+    assert.equal(row2896(S, "b").calendarEventId, undefined, "only the organizer on it: a personal block");
+  } finally {
+    cleanup2896(S, [D]);
+    cleanup2896(S2, [D2]);
+  }
+});
+
+test("XERK-2896: a moved event holds its capture against a competing one; the throttle catches up", async () => {
+  const S = "lkL2896.atlassian.net", D = "lkL2896";
+  cleanup2896(S, [D]);
+  const t = hub.tenantOfSite(S);
+  try {
+    await calHost2896(D, S, [ev2896("orig", T2896, 30)]);
+    await postMeeting2508(S, capture2896("c", T2896, 30));
+    // Moved a day out while another meeting now sits at the capture's time: the capture keeps "orig".
+    await calHost2896(D, S, [ev2896("orig", T2896 + 20 * 60 * MIN2896, 30), ev2896("other", T2896, 30)]);
+    assert.equal(row2896(S, "c").calendarEventId, "orig");
+    // An identical re-sync schedules nothing.
+    hub.__setCalendarRelinkMinMs(60e3);
+    hub.calendarRelinkAt.set(t, Date.now());
+    await calHost2896(D, S, [ev2896("orig", T2896 + 20 * 60 * MIN2896, 30), ev2896("other", T2896, 30)]);
+    assert.equal(hub.calendarRelinkTimers.has(t), false);
+    // A change inside the gap is relinked when the trailing timer fires.
+    hub.__setCalendarRelinkMinMs(150);
+    hub.calendarRelinkAt.set(t, Date.now());
+    await calHost2896(D, S, [ev2896("other", T2896, 30)]);
+    assert.equal(row2896(S, "c").calendarEventId, "orig", "deferred");
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(hub.calendarRelinkTimers.has(t), false);
+    assert.equal(row2896(S, "c").calendarEventId, "other", "the trailing relink ran");
+  } finally {
+    if (hub.calendarRelinkTimers.has(t)) { clearTimeout(hub.calendarRelinkTimers.get(t)); hub.calendarRelinkTimers.delete(t); }
+    hub.__setCalendarRelinkMinMs(0);
+    cleanup2896(S, [D]);
+  }
+});

@@ -6306,7 +6306,8 @@ function calendarEventLookup(t) {
 function calendarLinkCandidate(ev) {
   if (ev.allDay || ev.endMs - ev.startMs > CALENDAR_LINK_EVENT_MAX_MS) return false;
   if (ev.myResponse === "declined" || CAL_NOT_MEETING_BUSY.has(ev.busy)) return false;
-  return ev.attendees.length > 0 || !!ev.joinUrl || ev.isOnlineMeeting;
+  return ev.attendees.some((p) => p.role !== "organizer" && p.role !== "resource") ||
+    !!ev.joinUrl || ev.isOnlineMeeting;
 }
 // Every event a capture of tenant `t` could link to, with the org it counts for,
 // sorted by start, plus the lookup.
@@ -6398,7 +6399,12 @@ function meetingCalendarLinkFields(siteKey, m, index) {
     return { calendarEventId: m.calendarEventId, calendarBy: "operator", calendarAmbiguous: undefined };
   }
   const keep = { calendarEventId: m.calendarEventId, calendarBy: "auto", calendarAmbiguous: undefined };
-  const cur = m.calendarEventId && index.byId.get(m.calendarEventId);
+  let cur = m.calendarEventId && index.byId.get(m.calendarEventId);
+  // An event reassigned to another org (rule, default or series override) is no
+  // longer this capture's: the link goes back to the matcher (XERK-2896 QA).
+  if (cur && calendarMatchOrg(cur.key, cur.ev, calendarOrgsOfTenant(index.t), calendarHostSettings[cur.key]) !== siteKey) {
+    cur = null;
+  }
   if (cur) {
     if (cur.ev.canceled || !calOverlapsCapture(m, cur.ev)) return keep;
     const hit = calendarBestMatch(siteKey, m, index);

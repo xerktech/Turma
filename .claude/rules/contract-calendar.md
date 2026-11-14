@@ -182,8 +182,8 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
   - Candidates: events of hosts of the MEETING's tenant only, whose assigned org (else, unassigned
     and not PINNED unassigned by a series override, the host's decided org) is the meeting's org;
     never `canceled`.
-  - **Only real meetings** (`calendarLinkCandidate`): someone invited or a join link/online
-    meeting; not all-day, ≤12h, not declined, `busy` not free/outOfOffice/workingElsewhere. Why:
+  - **Only real meetings** (`calendarLinkCandidate`): someone other than the organizer invited
+    (a resource does not count) or a join link/online meeting; not all-day, ≤12h, not declined, `busy` not free/outOfOffice/workingElsewhere. Why:
     a capture inside Focus time / Lunch / WFH linked to that block and never left (QA).
   - A candidate must overlap [startedAt, endedAt] with `CALENDAR_LINK_TOLERANCE_MS` (15 min)
     either side. Score: time ≤0.6 (overlap of the shorter span + start proximity), title words
@@ -194,8 +194,8 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
     (0.05) = ambiguous. Tests pin the weights' outcomes, not the numbers.
 - **A link holds while its event is stored**, even `canceled` or moved (the capture is what
   happened). An auto link to a still-overlapping event yields only to another event scoring over
-  it by the margin (a late invite); one whose event left the store (sync, `calendarTick`)
-  rematches. An operator's choice is never touched by the matcher.
+  it by the margin (a late invite); one whose event left the store (sync, `calendarTick`) or
+  now counts for another org rematches. An operator's choice is never touched by the matcher.
 - `POST /api/orgs/<site>/meetings/<mid>/calendar` (OPERATOR-authed, `org` class):
   `{eventId}` link | `{eventId: null}` unlink for good | `{auto: true}` back to the matcher.
   Exactly one shape (`auto` with `eventId`, or `auto: false`, is a 400).
