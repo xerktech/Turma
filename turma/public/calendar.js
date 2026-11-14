@@ -840,6 +840,7 @@ let lastHtml = "";
 function paint(force = false) {
   if (!$root || !active) return;
   const html = calendarHtml();
+  let revealed = false;
   if (force || html !== lastHtml) {
     lastHtml = html;
     const sig = focusSig();
@@ -848,11 +849,12 @@ function paint(force = false) {
     if (T) T.preserveScroll($grid, put); else put();
     restoreFocusSig(sig);
     const sc = $grid.querySelector && $grid.querySelector("#calScroll");
+    revealed = !!(sc && scrollToMin >= 0);
     if (sc && scrollToMin >= 0) { sc.scrollTop = Math.max(0, (scrollToMin / 30) * SLOT_PX - HOUR_PX); scrolled = true; }
     else if (sc && !scrolled) { sc.scrollTop = WORK_FROM_H * HOUR_PX - 12; scrolled = true; }  // 8 AM label in view
     scrollToMin = -1;
   }
-  refit();
+  refit(revealed);
   paintDetail(force);
   if (revealFocus) { revealFocus = false; if ($side && !$side.hidden && $side.focus) $side.focus(); }
 }
@@ -860,11 +862,13 @@ function paint(force = false) {
 // scrollTop is 0; once a resize makes the pane scroll again, open it at 8 AM like
 // a fresh paint instead of leaving it stuck at midnight (XERK-2937).
 let fitWas = false;
-function refit() {
-  const sc = $grid && $grid.querySelector && $grid.querySelector("#calScroll");
-  if (!sc) return;
+// Hidden (Notes review) the pane measures 0x0, which says nothing, so it is
+// skipped; a paint that just scrolled to a revealed event keeps that scroll.
+function refit(keep = false) {
+  const sc = active && $grid && $grid.querySelector && $grid.querySelector("#calScroll");
+  if (!sc || !sc.clientHeight) return;
   const fits = sc.scrollHeight <= sc.clientHeight + 1;
-  if (fitWas && !fits) sc.scrollTop = WORK_FROM_H * HOUR_PX - 12;
+  if (fitWas && !fits && !keep) sc.scrollTop = WORK_FROM_H * HOUR_PX - 12;
   fitWas = fits;
 }
 // The detail panel paints apart from the grid, into its own element: the grid's

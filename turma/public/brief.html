@@ -224,7 +224,9 @@
 
 
   /* ---- the view switch + the Calendar view (calendar.js, XERK-2897) ---- */
-  .mt-views { display: flex; gap: 6px; margin: 0 0 12px; }
+  /* Held at the header's content column (--wrap less its 20px padding) in both views,
+     so the switch never jumps sideways when the calendar widens (XERK-2937). */
+  .mt-views { display: flex; gap: 6px; margin: 0 auto 12px; width: min(100%, calc(var(--wrap) - 40px)); }
   button.tri-chip[aria-pressed="true"] { color: var(--accent-text); border-color: var(--accent); background: var(--accent-soft); }
   .cal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 10px 12px 12px; min-width: 0; }
   /* The shown calendar fills the page's height, and widens to the board's
@@ -234,8 +236,6 @@
      overflowed when a notice wrapped. Below the 360px floor the page scrolls. */
   .page-scroll:has(> .tri-wrap > .cal:not([hidden])) { display: flex; flex-direction: column; }
   .wrap.tri-wrap:has(> .cal:not([hidden])) { max-width: var(--wrap-board); flex: 1 0 auto; width: 100%; padding-bottom: 16px; display: flex; flex-direction: column; }
-  /* The switch stays in the header's column, so it never jumps sideways between views. */
-  .wrap.tri-wrap:has(> .cal:not([hidden])) > .mt-views { max-width: var(--wrap); width: 100%; margin-inline: auto; flex: none; }
   .cal:not([hidden]) { flex: 1 0 auto; display: flex; flex-direction: column; }
   .cal-main { flex: 1 0 auto; display: flex; flex-direction: column; }
   .cal-main > * { flex: none; }
