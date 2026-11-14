@@ -296,32 +296,42 @@ _wsl_interop_disabled() {  # [interop] enabled reads false in wsl.conf, as WSL r
   # so a `\` continuation carries the value state into the next record; one
   # that ends the file with no newline is an invalid escape (WSL hits EOF).
   [ -r "$WSL_CONF" ] || return 1
-  local nonl=0
-  if [ -n "$(tail -c1 "$WSL_CONF")" ]; then nonl=1; fi
+  local nonl=0  # wc, not $(tail -c1): a command substitution drops a final NUL
+  if [ -s "$WSL_CONF" ] && [ "$(tail -c1 "$WSL_CONF" | wc -l)" -eq 0 ]; then nonl=1; fi
   LC_ALL=C awk -v nonl="$nonl" '
+    BEGIN { NUL = sprintf("%c", 0); VMAX = 8 }
     function hs(c) { return c == " " || c == "\t" }
     function alpha(c) { return c != "" && index("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", c) }
     function alnum(c) { return alpha(c) || (c != "" && index("0123456789", c)) }
-    function claim() {  # a valid value line: the FIRST interop.enabled one decides
-      if (want && !seen) { seen = 1; v = tolower(substr(v, 1, trimmed)); off = (v == "false" || v == "0") }
+    # WSL hands ParseBool a C string, so a NUL ends the value. Only the first VMAX
+    # chars are kept (appending char by char is quadratic in mawk); a value whose
+    # trimmed length passes that, with no NUL inside it, cannot be a bool.
+    function claim(   z) {  # a valid value line: the FIRST interop.enabled one decides
+      if (want && !seen) {
+        seen = 1; z = NUL == "" ? 0 : index(v, NUL)  # "" in awks that cut records at a NUL
+        if (z) v = substr(v, 1, z - 1)
+        else v = trimmed > length(v) ? "x" : substr(v, 1, trimmed)
+        v = tolower(v); off = (v == "false" || v == "0")
+      }
     }
+    function app(c) { if (++vl <= VMAX) v = v c }
     function value(t, k, n,   c, c2) {  # returns where the line resumes; n + 1 skips it
       while (k <= n) {
         c = substr(t, k, 1)
         if (c == "\r") break
         if (c == "\"") q = !q
         else if (c == "\\") {
-          if (k == n) { cont = 1; trimmed = length(v); return n + 1 }  # continuation
+          if (k == n) { cont = 1; trimmed = vl; return n + 1 }  # continuation
           c2 = substr(t, ++k, 1)
-          if (c2 == "\\" || c2 == "\"") v = v c2
-          else if (c2 == "b") v = v "\b"
-          else if (c2 == "n") v = v "\n"
-          else if (c2 == "t") v = v "\t"
+          if (c2 == "\\" || c2 == "\"") app(c2)
+          else if (c2 == "b") app("\b")
+          else if (c2 == "n") app("\n")
+          else if (c2 == "t") app("\t")
           else return n + 1  # an invalid escape voids the line
         }
         else if (c == "#" && !q) { claim(); return n + 1 }
-        else v = v c
-        if (!hs(c)) trimmed = length(v)
+        else app(c)
+        if (!hs(c)) trimmed = vl
         k++
       }
       if (!q) claim()  # an unterminated quote voids the line
@@ -349,7 +359,7 @@ _wsl_interop_disabled() {  # [interop] enabled reads false in wsl.conf, as WSL r
       k++
       while (hs(substr(t, k, 1))) k++
       want = tolower(sec) == "interop" && tolower(key) == "enabled"
-      v = ""; trimmed = 0; q = 0
+      v = ""; vl = 0; trimmed = 0; q = 0
       return value(t, k, n)
     }
     {

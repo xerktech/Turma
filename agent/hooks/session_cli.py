@@ -347,7 +347,7 @@ def wsl_conf_interop_off(path=None) -> bool:
     ends a value or header. Keys and `true`/`false` ignore case; the FIRST
     valid `interop.enabled` line wins even when it is no bool (interop then
     stays on). Bytes are read one per character (WSL's fgetwc is
-    locale-dependent for non-ASCII). Mirrors install.sh's
+    locale-dependent for non-ASCII); a NUL ends the value. Mirrors install.sh's
     `_wsl_interop_disabled`; the parity test pins the two together."""
     try:
         with open(path or WSL_CONF, "rb") as fh:
@@ -398,7 +398,7 @@ def wsl_conf_interop_off(path=None) -> bool:
             k += 1
             while k < n and s[k] in " \t":
                 k += 1
-            val, trimmed, quoted, valid = [], 0, False, True
+            val, vlen, trimmed, quoted, valid = [], 0, 0, False, True
             while k < n and s[k] not in "\r\n":
                 c = s[k]
                 if c == '"':
@@ -410,16 +410,19 @@ def wsl_conf_interop_off(path=None) -> bool:
                         valid = False
                         break
                     val.append(esc)       # "" for a continuation: count chars, not items
+                    vlen += len(esc)
                 elif c == "#" and not quoted:
                     break
                 else:
                     val.append(c)
+                    vlen += 1
                 if c not in " \t":
-                    trimmed = sum(map(len, val))
+                    trimmed = vlen
                 k += 1
             if valid and not quoted and sec is not None and sec.lower() == "interop" \
                     and key.lower() == "enabled":
-                return "".join(val)[:trimmed].lower() in ("false", "0")
+                # WSL hands ParseBool a C string (wcsrtombs on c_str()): a NUL ends it
+                return "".join(val)[:trimmed].split("\0", 1)[0].lower() in ("false", "0")
             i = eol(k) if not valid or quoted or (k < n and s[k] == "#") else k
     return False
 
