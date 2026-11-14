@@ -347,8 +347,8 @@ def wsl_conf_interop_off(path=None) -> bool:
     ends a value or header. Keys and `true`/`false` ignore case; the FIRST
     valid `interop.enabled` line wins even when it is no bool (interop then
     stays on). Bytes are read one per character (WSL's fgetwc is
-    locale-dependent for non-ASCII); a NUL ends the value. Mirrors install.sh's
-    `_wsl_interop_disabled`; the parity test pins the two together."""
+    locale-dependent for non-ASCII); a NUL ends the value. install.sh's
+    `_wsl_interop_state` calls this very function, so there is no mirror."""
     try:
         with open(path or WSL_CONF, "rb") as fh:
             s = fh.read().decode("latin-1")

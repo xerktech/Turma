@@ -289,98 +289,25 @@ ensure_glab() {
 : "${BINFMT_MISC:=/proc/sys/fs/binfmt_misc}"
 : "${BINFMT_D:=/etc/binfmt.d}"
 WSL_INTEROP_RULE=':WSLInterop:M::MZ::/init:PF'
-_wsl_interop_disabled() {  # [interop] enabled reads false in wsl.conf, as WSL reads it
-  # A port of WSL's own parser (configfile.cpp + ParseBool) — the rules are in
-  # session_cli.py's wsl_conf_interop_off, which this mirrors byte for byte
-  # (agent/tests/test_session_cli.py's parity test runs both). Read per line,
-  # so a `\` continuation carries the value state into the next record; one
-  # that ends the file with no newline is an invalid escape (WSL hits EOF).
-  [ -r "$WSL_CONF" ] || return 1
-  local nonl=0  # wc, not $(tail -c1): a command substitution drops a final NUL
-  if [ -s "$WSL_CONF" ] && [ "$(tail -c1 "$WSL_CONF" | wc -l)" -eq 0 ]; then nonl=1; fi
-  LC_ALL=C awk -v nonl="$nonl" '
-    BEGIN { NUL = sprintf("%c", 0); VMAX = 8 }
-    function hs(c) { return c == " " || c == "\t" }
-    function alpha(c) { return c != "" && index("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", c) }
-    function alnum(c) { return alpha(c) || (c != "" && index("0123456789", c)) }
-    # WSL hands ParseBool a C string, so a NUL ends the value. Only the first VMAX
-    # chars are kept (appending char by char is quadratic in mawk); a value whose
-    # trimmed length passes that, with no NUL inside it, cannot be a bool.
-    function claim(   z) {  # a valid value line: the FIRST interop.enabled one decides
-      if (want && !seen) {
-        seen = 1; z = NUL == "" ? 0 : index(v, NUL)  # "" in awks that cut records at a NUL
-        if (z) v = substr(v, 1, z - 1)
-        else v = trimmed > length(v) ? "x" : substr(v, 1, trimmed)
-        v = tolower(v); off = (v == "false" || v == "0")
-      }
-    }
-    function app(c) { if (++vl <= VMAX) v = v c }
-    function value(t, k, n,   c, c2) {  # returns where the line resumes; n + 1 skips it
-      while (k <= n) {
-        c = substr(t, k, 1)
-        if (c == "\r") break
-        if (c == "\"") q = !q
-        else if (c == "\\") {
-          if (k == n) { cont = 1; trimmed = vl; return n + 1 }  # continuation
-          c2 = substr(t, ++k, 1)
-          if (c2 == "\\" || c2 == "\"") app(c2)
-          else if (c2 == "b") app("\b")
-          else if (c2 == "n") app("\n")
-          else if (c2 == "t") app("\t")
-          else return n + 1  # an invalid escape voids the line
-        }
-        else if (c == "#" && !q) { claim(); return n + 1 }
-        else app(c)
-        if (!hs(c)) trimmed = vl
-        k++
-      }
-      if (!q) claim()  # an unterminated quote voids the line
-      return q ? n + 1 : k
-    }
-    function header(t, p, n,   j, k, m, c, name) {
-      j = k = p + 1
-      if (!alpha(substr(t, j, 1))) return n + 1  # never reached the name: the section stands
-      while (alnum(substr(t, k, 1))) k++
-      name = substr(t, j, k - j); m = k + 1
-      if (substr(t, k, 1) == "]") {
-        while (hs(substr(t, m, 1))) m++
-        c = substr(t, m, 1)
-        if (m > n || c == "\r" || c == "#") { sec = name; seclen = length(name); return c == "#" ? n + 1 : m }
-      }
-      sec = length(name) >= seclen ? substr(name, 1, seclen) : "\001"  # WSL truncates its buffer
-      return n + 1
-    }
-    function keyval(t, p, n,   k, key) {
-      k = p
-      while (alnum(substr(t, k, 1))) k++
-      key = substr(t, p, k - p)
-      while (hs(substr(t, k, 1))) k++
-      if (substr(t, k, 1) != "=") return n + 1
-      k++
-      while (hs(substr(t, k, 1))) k++
-      want = tolower(sec) == "interop" && tolower(key) == "enabled"
-      v = ""; vl = 0; trimmed = 0; q = 0
-      return value(t, k, n)
-    }
-    {
-      t = $0; n = length(t); p = 1
-      if (cont) { cont = 0; p = value(t, 1, n) }
-      while (p <= n) {
-        c = substr(t, p, 1)
-        if (hs(c) || c == "\r") p++
-        else if (c == "#" || (c != "[" && !alpha(c))) p = n + 1
-        else if (c == "[") p = header(t, p, n)
-        else p = keyval(t, p, n)
-      }
-    }
-    END { if (cont && !nonl && !q) claim(); exit !off }' "$WSL_CONF"
+_wsl_interop_state() {  # wsl.conf's [interop] enabled, as WSL reads it: prints on|off|unknown
+  # One reader, not a mirror: session_cli.py's wsl_conf_interop_off (a port of
+  # WSL's own parser). python3 is ensured by ensure_apt_pkgs and the agent cannot
+  # run without it. -I keeps the cwd and PYTHON* env out of the import path.
+  [ -r "$WSL_CONF" ] || { echo on; return; }
+  local rc=0
+  python3 -SI -c 'import sys; sys.path.insert(0, sys.argv[1]); import session_cli
+sys.exit(10 if session_cli.wsl_conf_interop_off(sys.argv[2]) else 11)' \
+    "$SRC_DIR/hooks" "$WSL_CONF" >/dev/null 2>&1 || rc=$?
+  case $rc in 10) echo off ;; 11) echo on ;; *) echo unknown ;; esac
 }
 ensure_wsl_interop() {
   grep -qi microsoft "$WSL_OSRELEASE" 2>/dev/null || return 0
-  if _wsl_interop_disabled; then
-    info "WSL interop is disabled in $WSL_CONF — the calendar sync will not reach Outlook"
-    return 0
-  fi
+  case "$(_wsl_interop_state)" in
+    off) info "WSL interop is disabled in $WSL_CONF — the calendar sync will not reach Outlook"
+         return 0 ;;
+    unknown) warn "could not read $WSL_CONF with python3; leaving WSL interop as it is"
+         return 0 ;;  # never risk overriding an operator's enabled=false
+  esac
   local conf="$BINFMT_D/WSLInterop.conf" need_conf=no need_reg=no
   if ! grep -rqs '^:WSLInterop\(-late\)\?:' "$BINFMT_D" /usr/lib/binfmt.d /run/binfmt.d 2>/dev/null; then
     need_conf=yes
