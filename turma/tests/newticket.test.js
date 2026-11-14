@@ -267,7 +267,7 @@ test("newticket: closing returns focus to the opener, else the header button (XE
   // The dialog's own ✕ takes focus at open, so the shim panel must yield one.
   const close = focusable({});
   backdrop.children[0].querySelector = (sel) => (sel === ".td-close" ? close : null);
-  const esc = () => { for (const fn of doc._listeners.keydown || []) fn({ key: "Escape" }); };
+  const esc = () => { for (const fn of doc._listeners.keydown || []) fn({ key: "Escape", preventDefault() {}, stopPropagation() {} }); };
 
   // A calendar event held focus when the form opened: Esc hands it back.
   const ev = focusable({ isConnected: true });
