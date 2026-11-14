@@ -6032,6 +6032,67 @@ function epicRunTitlesOf(children, raw) {
   return any ? out : null;
 }
 
+// Fill in the title of every run child the run has none for (XERK-2673
+// follow-up): a child that left the board before `childTitles` existed, or a
+// finished run the driver no longer visits. Its board row answers first, then
+// an issue an org host already fetched; failing both, ask an online org host to
+// fetch it (the same `jiraIssue` command the ticket panel uses). That fetch runs
+// on the host's heartbeat, so at most EPIC_TITLE_FETCHES_PER_SWEEP go out per
+// sweep, and one ticket is asked at most EPIC_TITLE_FETCH_TRIES times per
+// process, EPIC_TITLE_RETRY_MS apart (a deleted ticket never answers).
+const EPIC_TITLE_FETCHES_PER_SWEEP = 2;
+const EPIC_TITLE_FETCH_TRIES = 3;
+const EPIC_TITLE_RETRY_MS = 10 * 60 * 1000;
+const EPIC_TITLE_ASKED_MAX = 2000;
+const epicTitleAsked = new Map();   // `${siteKey}\x00${key}` -> {at, n}
+
+function cachedIssueSummary(siteKey, key) {
+  for (const k of jiraHostPool(siteKey, false)) {
+    const e = Object.hasOwn(agents[k].jiraIssues || {}, key) ? agents[k].jiraIssues[key] : null;
+    const t = e && e.issue && e.issue.summary;
+    if (typeof t === "string" && t.trim()) return t;
+  }
+  return "";
+}
+
+function epicRunTitleBackfillSweep(rows, now = Date.now()) {
+  rows = rows || fleetTicketRows();
+  let budget = EPIC_TITLE_FETCHES_PER_SWEEP;
+  let changed = false;
+  for (const run of Object.values(epicRuns)) {
+    if (!run || !Array.isArray(run.children)) continue;
+    const titles = run.childTitles || {};
+    const found = {};
+    for (const key of run.children) {
+      if (Object.hasOwn(titles, key)) continue;
+      const r = rows.get(ticketQueueKey(run.siteKey, key));
+      const onBoard = r && r.row && typeof r.row.summary === "string" ? r.row.summary : "";
+      const t = onBoard.trim() ? onBoard : cachedIssueSummary(run.siteKey, key);
+      if (t) { found[key] = t; continue; }
+      if (budget <= 0 || !isIssueKey(key)) continue;
+      const mk = `${run.siteKey}\x00${key}`;
+      const asked = epicTitleAsked.get(mk);
+      if (asked && (asked.n >= EPIC_TITLE_FETCH_TRIES || now - asked.at < EPIC_TITLE_RETRY_MS)) continue;
+      const host = findJiraHost(run.siteKey, true);
+      if (!host) continue;
+      if (!(agents[host].commands || []).some((c) => c.type === "jiraIssue" && c.issueKey === key)) {
+        queueCommand(host, { type: "jiraIssue", issueKey: key });
+      }
+      epicTitleAsked.delete(mk);
+      epicTitleAsked.set(mk, { at: now, n: ((asked && asked.n) || 0) + 1 });
+      while (epicTitleAsked.size > EPIC_TITLE_ASKED_MAX) {
+        epicTitleAsked.delete(epicTitleAsked.keys().next().value);
+      }
+      budget--;
+    }
+    if (!Object.keys(found).length) continue;
+    const merged = epicRunTitlesOf(run.children, { ...titles, ...found });
+    if (merged) { run.childTitles = merged; orderEpicRunKeys(run); changed = true; }
+  }
+  if (changed) { persistEpicRuns(); invalidateAgentsCache(); sseBroadcast("epicRuns", epicRuns); }
+  return changed;
+}
+
 // Put an edited run's optional keys back in the sanitizer's order (doneChildren,
 // childTitles, paused, maxConcurrent last), so a live record stays a coerce fixed
 // point and the HA own-write echo dedups.
@@ -21610,6 +21671,8 @@ function masterOrchestrationTick() {
   // in this same tick. Epics + their children are excluded from autoStartSweep
   // above (XERK-635), so the two streams never contend for the same ticket.
   epicRunDriveSweep();
+  // Fetch the titles of epic-run children that left the board untitled.
+  epicRunTitleBackfillSweep();
   // Epic Builder dispatch (XERK-725): hand each queued builder run to a capable
   // host through findTicketHost. No-op with none queued; one already dispatched is
   // left to its host. Retries a held (no free host) builder each tick.
@@ -29001,7 +29064,7 @@ if (process.env.TURMA_TEST) {
     buildEpicWaves,
     epicChildRows,
     isEpicOrEpicChild, isRollupTicket,
-    sanitizeEpicRunRecord, noteEpicRunDoneChildren, epicRunTitlesOf,
+    sanitizeEpicRunRecord, noteEpicRunDoneChildren, epicRunTitlesOf, epicRunTitleBackfillSweep, epicTitleAsked,
     EPIC_RUN_STATES,
     // Epic Builder (XERK-725, epic XERK-721): the durable run store, its arm/clear
     // + advance helpers, the heartbeat-status ingest, the dispatch driver, the

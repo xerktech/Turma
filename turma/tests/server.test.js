@@ -261,7 +261,7 @@ const {
   epicRuns, armEpicRun, clearEpicRun, setEpicRunPaused, setEpicRunLimit, epicRunActiveCount,
   fleetTicketRows,
   buildEpicWaves, epicChildRows,
-  isEpicOrEpicChild, isRollupTicket, sanitizeEpicRunRecord, noteEpicRunDoneChildren, epicRunTitlesOf,
+  isEpicOrEpicChild, isRollupTicket, sanitizeEpicRunRecord, noteEpicRunDoneChildren, epicRunTitlesOf, epicRunTitleBackfillSweep, epicTitleAsked,
   epicBuilders, armEpicBuilder, clearEpicBuilder, advanceEpicBuilder,
   ingestEpicBuilderStatus, epicBuilderDriveSweep, epicBuilderClaimLapsed,
   EPIC_BUILDER_REDISPATCH_MS, EPIC_BUILDER_ORPHAN_MS, sanitizeEpicBuilderRecord,
@@ -14983,6 +14983,81 @@ test("XERK-2673: a Done child that aged off the board stays a Done child of the 
   assert.equal(run.state, "done");
   // The live record is a coerce fixed point (the HA own-write echo dedups).
   assert.deepEqual(sanitizeEpicRunRecord(run), run);
+});
+
+test("XERK-2673: a child that left the board untitled gets its title fetched from the tracker", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  epicTitleAsked.clear();
+  const site = "e2673b.atlassian.net";
+  const kids = ["C-1", "C-3", "C-4"].map((k) => ({ ...dChild(k, [], "done"), summary: `${k} title` }));
+  const c2 = { ...dChild("C-2", [], "todo"), summary: "Second" };
+  await asBeat("ed2673b", site, { autoStart: false, tickets: [dEpic(), ...kids, c2] });
+  armEpicRun(site, "E-1");
+  const run = epicRuns[`${site}/E-1`];
+  // A run recorded before childTitles existed: only the on-board child is titled.
+  run.childTitles = epicRunTitlesOf(run.children, { "C-2": "Second" });
+  await asBeat("ed2673b", site, { autoStart: false, tickets: [dEpic(), c2] });
+  agents.ed2673b.commands = [];
+  const fetches = () => agents.ed2673b.commands.filter((c) => c.type === "jiraIssue").map((c) => c.issueKey);
+  assert.equal(epicRunTitleBackfillSweep(), false);
+  assert.equal(fetches().length, 2, "at most two fetches a sweep");
+  epicRunTitleBackfillSweep();
+  assert.equal(fetches().length, 3, "the third goes out next sweep, the first two are not re-asked");
+  // The host answers: the next sweep records the titles, and a quiet sweep after changes nothing.
+  agents.ed2673b.jiraIssues = Object.fromEntries(["C-1", "C-3", "C-4"].map((k) =>
+    [k, { issue: { key: k, summary: `${k} from tracker` }, error: null, fetchedAt: Date.now() }]));
+  assert.equal(epicRunTitleBackfillSweep(), true);
+  assert.deepEqual({ ...run.childTitles }, {
+    "C-1": "C-1 from tracker", "C-2": "Second", "C-3": "C-3 from tracker", "C-4": "C-4 from tracker" });
+  assert.equal(JSON.stringify(sanitizeEpicRunRecord(run)), JSON.stringify(run), "coerce fixed point");
+  assert.equal(epicRunTitleBackfillSweep(), false);
+  // A ticket that never answers is asked a bounded number of times, then left alone.
+  epicTitleAsked.clear();
+  delete run.childTitles["C-4"];
+  agents.ed2673b.jiraIssues = {};
+  agents.ed2673b.commands = [];
+  const t0 = Date.now();
+  for (let i = 0; i < 6; i++) {
+    epicRunTitleBackfillSweep(undefined, t0 + i * 11 * 60 * 1000);
+    agents.ed2673b.commands = [];
+  }
+  assert.equal(epicTitleAsked.get(`${site}\x00C-4`).n, 3);
+});
+
+test("XERK-2673: the title backfill never asks an offline host, never doubles a pending fetch, and keeps a paused run a fixed point", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  epicTitleAsked.clear();
+  const site = "e2673c.atlassian.net";
+  const c1 = { ...dChild("C-1", [], "done"), summary: "One" };
+  const c2 = { ...dChild("C-2", [], "todo"), summary: "Two" };
+  await asBeat("ed2673c", site, { autoStart: false, tickets: [dEpic(), c1, c2] });
+  armEpicRun(site, "E-1");
+  const run = epicRuns[`${site}/E-1`];
+  // A record from before childTitles existed: no key at all, so a new one would land after these.
+  delete run.childTitles;
+  run.paused = true;
+  run.maxConcurrent = 2;
+  await asBeat("ed2673c", site, { autoStart: false, tickets: [dEpic(), c2] });
+  const fetches = () => agents.ed2673c.commands.filter((c) => c.type === "jiraIssue").length;
+  // Offline: nothing queued, no try spent.
+  const seen = agents.ed2673c.lastSeen;
+  agents.ed2673c.lastSeen = 0;
+  agents.ed2673c.commands = [];
+  epicRunTitleBackfillSweep();
+  assert.equal(fetches(), 0);
+  assert.equal(epicTitleAsked.has(`${site}\x00C-1`), false);
+  agents.ed2673c.lastSeen = seen;
+  // A fetch already pending (the ticket panel's) is reused, not doubled.
+  queueCommand("ed2673c", { type: "jiraIssue", issueKey: "C-1" });
+  epicRunTitleBackfillSweep();
+  assert.equal(fetches(), 1);
+  // The answer lands on a paused, capped run: still a coerce fixed point.
+  agents.ed2673c.jiraIssues = { "C-1": { issue: { key: "C-1", summary: "One" }, error: null, fetchedAt: Date.now() } };
+  assert.equal(epicRunTitleBackfillSweep(), true);
+  assert.equal(run.childTitles["C-1"], "One");
+  assert.equal(JSON.stringify(sanitizeEpicRunRecord(run)), JSON.stringify(run));
 });
 
 test("XERK-2673: an aged-off child keeps its title on the run", async () => {

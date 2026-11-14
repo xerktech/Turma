@@ -91,6 +91,9 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
 - **`childTitles` keeps each child's last-seen title** (`epicRunChildTitles`, same passes as
   `doneChildren`): an aged-off child otherwise showed a bare key in the run list. Clients fall back
   to it only when the board no longer lists the child.
+- **A child with no recorded title gets one fetched** (`epicRunTitleBackfillSweep`, leader tick, every
+  run incl. `done`): its board row, else an org host's cached issue, else a `jiraIssue` fetch. That
+  fetch runs on the host's BEAT, so ≤2 per sweep and ≤3 tries per ticket per process — keep it bounded.
 - A child listed under another epic is dropped. The board's own children fill the
   `EPIC_RUN_CHILDREN_MAX` cap first, so kept ones never crowd out a live child.
 - Tests: the `XERK-2673:` cases in `server.test.js`, `board.test.js`, `BoardTest.kt`.
