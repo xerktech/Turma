@@ -850,7 +850,9 @@ function connectSSE() {
     // the hub sends a whole-map event only when this stream's slice CHANGES, so
     // nothing on a fresh stream repairs what moved while it was down (a hub
     // restart or rollout) — and the fallback poll runs only while SSE is down.
-    if (sseEverOpen) { refresh(); TurmaCalendar.refetch(); }
+    if (sseEverOpen) refresh();
+    // The calendar reads its own routes, so its frames missed while down are re-read too.
+    if (sseEverOpen) TurmaCalendar.refetch();
     sseEverOpen = true;
     sseOk = true; sseBackoff = 2000;
   };
