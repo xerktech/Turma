@@ -27,6 +27,7 @@ import com.xerktech.turma.harness.MainDispatcherRule
 import com.xerktech.turma.model.TurmaJson
 import com.xerktech.turma.vm.BriefViewModel
 import com.xerktech.turma.vm.MeetingsViewModel
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertEquals
@@ -468,7 +469,15 @@ class BriefScreenTest {
         compose.onNodeWithContentDescription("o settings").performClick()
 
         compose.onNodeWithText("Ann").performTextReplacement("Zed Draft")
+        // The hub serves the change from now on, as a real one would: the screen's
+        // live poll (6s) otherwise lands the old focus over the SSE frame (XERK-2908).
+        hub.json("/api/agents", """
+            { "now": 2, "agents": [ $host ], "dailyBriefSchedules": { "$site": $schedule },
+              "meetingFocus": { "$site": { "names": ["Bo"], "role": "PM" } } }
+        """.trimIndent())
         fleet.onSseEvent("meetingFocus", """{ "$site": { "names": ["Bo"], "role": "PM" } }""")
+        // A poll landing after the frame must not undo it.
+        runBlocking { fleet.refresh() }
         compose.waitUntil(10_000) { compose.onAllNodesWithText("PM").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Zed Draft").assertExists() // edited: kept
         compose.onNodeWithText("Bo").assertDoesNotExist()
@@ -683,7 +692,8 @@ class BriefScreenTest {
         compose.onNodeWithTag("save-label").performScrollTo().performClick()
         compose.onNodeWithText("Role (optional)").performScrollTo().performTextReplacement("one")
         compose.onNodeWithTag("save-focus").performScrollTo().performClick()
-        compose.waitUntil(5_000) { compose.onAllNodesWithText("Saved").fetchSemanticsNodes().size == 2 }
+        // Two hub round trips: the same 10s budget as every other round trip here (XERK-2908).
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("Saved").fetchSemanticsNodes().size == 2 }
         // Typing clears that section's "Saved".
         compose.onNodeWithText("acmea").performScrollTo().performTextReplacement("acmeb")
         compose.onNodeWithText("one").performScrollTo().performTextReplacement("two")
