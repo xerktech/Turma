@@ -516,15 +516,16 @@ function timedHtml(seg, day, colors, now) {
   const top = (seg.top / 30) * SLOT_PX;
   const h = ((seg.bottom - seg.top) / 30) * SLOT_PX - 2;
   const left = (seg.col / seg.cols) * 100, width = (seg.span / seg.cols) * 100;
-  const short = h < 34;
+  // Whether the time line fits is the block's DRAWN height, not this one: a tall
+  // pane stretches the rows, so brief.html decides it with a container query.
   const meta = [fmtSpan(ev.startMs, ev.endMs), ev.location ? String(ev.location) : ""].filter(Boolean).join(" · ");
-  const cls = ["cal-ev", ...styleOf(ev, now), short ? "short" : ""].filter(Boolean).join(" ");
+  const cls = ["cal-ev", ...styleOf(ev, now)].filter(Boolean).join(" ");
   const b = badgeOf(ev);
   return `<button type="button" class="${cls}" data-ev="${evIndex(ev)}" data-day="${day}" data-top="${seg.top}"`
     + ` style="${evStyle(ev, colors)}top:${top}px;height:${h}px;left:calc(${left}% + 1px);width:calc(${width}% - 4px)"`
     + ` aria-label="${esc([ariaOf(ev, day), badgeAria(b)].filter(Boolean).join(", "))}">`
-    + `<span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${badgeHtml(b)}</span>`
-    + (short ? "" : `<span class="m">${esc(meta)}</span>`) + `</button>`;
+    + `<span class="cal-evb"><span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${badgeHtml(b)}</span>`
+    + `<span class="m">${esc(meta)}</span></span></button>`;
 }
 function bandHtml(day, events, holidays, colors, now) {
   const key = dayKey(day);
