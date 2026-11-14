@@ -6290,14 +6290,19 @@ function calendarMatchOrg(key, ev, orgs, hs) {
 // meeting; the newest-synced host's copy is served.
 function calendarEventLookup(t) {
   const byId = new Map();
+  const copies = new Map(); // id -> every host's copy, newest-synced first
   for (const [key, h] of Object.entries(calendarEvents)) {
     if (tenantOfKey(key) !== t) continue;
     for (const ev of h.events) {
+      const c = { key, ev, syncedAt: h.syncedAt };
       const prev = byId.get(ev.id);
-      if (!prev || h.syncedAt > prev.syncedAt) byId.set(ev.id, { key, ev, syncedAt: h.syncedAt });
+      if (!prev || h.syncedAt > prev.syncedAt) byId.set(ev.id, c);
+      if (!copies.has(ev.id)) copies.set(ev.id, []);
+      copies.get(ev.id).push(c);
     }
   }
-  return { t, byId };
+  for (const list of copies.values()) if (list.length > 1) list.sort((a, b) => b.syncedAt - a.syncedAt);
+  return { t, byId, copies };
 }
 // A real meeting, not a personal block (Focus time, Lunch, Gym, WFH): someone
 // else is invited or it has a join link; shown busy/tentative; not declined; not
@@ -6399,12 +6404,13 @@ function meetingCalendarLinkFields(siteKey, m, index) {
     return { calendarEventId: m.calendarEventId, calendarBy: "operator", calendarAmbiguous: undefined };
   }
   const keep = { calendarEventId: m.calendarEventId, calendarBy: "auto", calendarAmbiguous: undefined };
-  let cur = m.calendarEventId && index.byId.get(m.calendarEventId);
-  // An event reassigned to another org (rule, default or series override) is no
-  // longer this capture's: the link goes back to the matcher (XERK-2896 QA).
-  if (cur && calendarMatchOrg(cur.key, cur.ev, calendarOrgsOfTenant(index.t), calendarHostSettings[cur.key]) !== siteKey) {
-    cur = null;
-  }
+  // The stored copy that still counts for this org. None = the event was
+  // reassigned to another org (rule, default or series override) and the link goes
+  // back to the matcher. Any host's copy counts: one id on two hosts of different
+  // orgs is one meeting (XERK-2896 QA).
+  const orgs = calendarOrgsOfTenant(index.t);
+  const cur = m.calendarEventId && (index.copies.get(m.calendarEventId) || [])
+    .find((c) => calendarMatchOrg(c.key, c.ev, orgs, calendarHostSettings[c.key]) === siteKey);
   if (cur) {
     if (cur.ev.canceled || !calOverlapsCapture(m, cur.ev)) return keep;
     const hit = calendarBestMatch(siteKey, m, index);

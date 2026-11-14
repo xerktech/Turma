@@ -32524,3 +32524,36 @@ test("XERK-2896: a moved event holds its capture against a competing one; the th
     cleanup2896(S, [D]);
   }
 });
+
+test("XERK-2896: one event on two orgs' hosts keeps each org's link when moved; candidate shapes", async () => {
+  const S = "lkM2896a.atlassian.net", S2 = "lkM2896b.atlassian.net", D = "lkM2896", D2 = "lkM2896o";
+  cleanup2896(S, [D]);
+  cleanup2896(S2, [D2]);
+  try {
+    await calHost2896(D, S, [ev2896("sh", T2896, 30)]);
+    await postMeeting2508(S, capture2896("c", T2896, 30));
+    assert.equal(row2896(S, "c").calendarEventId, "sh");
+    // The same invite on a host of S2, synced newest; then the meeting moves and is canceled.
+    await calHost2896(D2, S2, [ev2896("sh", T2896, 30)]);
+    for (const evs of [[ev2896("sh", T2896 + 20 * 60 * MIN2896, 30)],
+      [ev2896("sh", T2896 + 20 * 60 * MIN2896, 30, { canceled: true })]]) {
+      await calHost2896(D, S, evs);
+      await calHost2896(D2, S2, evs);
+      assert.deepEqual([row2896(S, "c").calendarEventId, row2896(S, "c").calendarBy], ["sh", "auto"]);
+    }
+    // Which events count as a real meeting.
+    const H = 60 * MIN2896;
+    await calHost2896(D, S, [
+      ev2896("res", T2896 + 2 * H, 30, { attendees: [{ name: "Room 4", email: "r4@x.com", role: "resource", response: "accepted" }] }),
+      ev2896("url", T2896 + 4 * H, 30, { attendees: [], joinUrl: "https://zoom.us/j/1" }),
+      ev2896("onl", T2896 + 6 * H, 30, { attendees: [], isOnlineMeeting: true }),
+    ]);
+    for (const [id, at, want] of [["r", 2, undefined], ["u", 4, "url"], ["o", 6, "onl"]]) {
+      await postMeeting2508(S, capture2896(id, T2896 + at * H, 30));
+      assert.equal(row2896(S, id).calendarEventId, want, id);
+    }
+  } finally {
+    cleanup2896(S, [D]);
+    cleanup2896(S2, [D2]);
+  }
+});
