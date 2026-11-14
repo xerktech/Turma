@@ -285,7 +285,18 @@
     color: var(--ink); background: color-mix(in srgb, var(--org) 22%, var(--surface)); cursor: pointer; }
   .cal-ev:hover { background: color-mix(in srgb, var(--org) 32%, var(--surface)); }
   .cal-ev:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; z-index: 4; }
-  .cal-ev .t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; gap: 4px; }
+  .cal-ev .t { font-weight: 600; overflow: hidden; white-space: nowrap; display: flex; align-items: center; gap: 4px; }
+  .cal-ev .t .tx { min-width: 0; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; }
+  /* A capture's review state on its block (XERK-2898): proposals waiting, or a spinner while read. */
+  .cal-badge { flex: none; margin-left: auto; display: inline-flex; align-items: center; gap: 2px; padding: 0 5px; height: 16px;
+    border-radius: 8px; font-size: 11px; font-weight: 700; color: #fff; background: var(--accent); }
+  .cal-badge svg { width: 11px; height: 11px; }
+  .cal-badge.reading { background: none; padding: 0; }
+  .cal-spin { width: 11px; height: 11px; border-radius: 50%; border: 2px solid color-mix(in srgb, var(--org) 35%, transparent);
+    border-top-color: var(--org); animation: cal-spin 0.9s linear infinite; }
+  @keyframes cal-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .cal-spin { animation: none; border-top-color: var(--org); border-right-color: var(--org); } }
+  .cal-ev.past:has(.cal-badge:not(.reading)) { opacity: 0.8; }
   .cal-ev .m { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; }
   .cal-ev.short { justify-content: center; padding-top: 0; padding-bottom: 0; }
   .cal-ev.allday { position: static; padding: 2px 6px; }
@@ -295,7 +306,7 @@
   .cal-ev.canceled { background: color-mix(in srgb, var(--org) 10%, var(--surface)); }
   .cal-ev.past { opacity: 0.55; }
   .cal-tenir { width: 13px; height: 13px; flex: none; color: var(--org); }
-  .cal-detail { position: fixed; top: 0; right: 0; bottom: 0; z-index: 40; width: min(420px, 100vw); box-sizing: border-box;
+  .cal-detail { position: fixed; top: 0; right: 0; bottom: 0; z-index: 40; width: min(480px, 100vw); box-sizing: border-box;
     overflow-y: auto; padding: 18px 20px 32px; background: var(--surface); border-left: 1px solid var(--border);
     box-shadow: -12px 0 32px rgba(0, 0, 0, 0.25); }
   .cal-detail-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
@@ -305,7 +316,29 @@
   .cal-drow .k { flex: 0 0 84px; color: var(--muted); }
   .cal-drow .v { min-width: 0; overflow-wrap: anywhere; }
   .cal-drow a { color: var(--accent-text); }
-  .cal-dnote { color: var(--muted); font-size: 12.5px; margin-top: 14px; }
+  .cal-dnote { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }
+  .cal-detail:focus { outline: none; }
+  .cal-dsec { border-top: 1px solid var(--hairline); padding: 8px 0 4px; font-size: 13.5px; }
+  .cal-dlabel { color: var(--muted); font-size: 12.5px; margin-bottom: 4px; }
+  button.cal-dlabel { padding: 0; }
+  .cal-dbody { white-space: normal; overflow-wrap: anywhere; color: var(--ink-2); font-size: 13px; max-height: 50vh; overflow-y: auto; }
+  .cal-people { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+  .cal-people li { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+  .cal-people .who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cal-people .role { color: var(--muted); font-size: 12px; }
+  .cal-people .resp { margin-left: auto; flex: none; font-size: 12px; color: var(--muted); }
+  .cal-people .resp.accepted { color: var(--good-text); }
+  .cal-people .resp.declined { color: var(--critical-text); }
+  .cal-people .resp.tentative { color: var(--warning-text); }
+  .cal-cat { display: inline-block; font-size: 12px; padding: 1px 7px; margin: 0 4px 2px 0; border-radius: 9px; background: var(--hairline); }
+  .cal-link { border-top: 1px solid var(--hairline); padding: 8px 0; font-size: 13px; }
+  .cal-link-what { color: var(--ink-2); margin-bottom: 6px; overflow-wrap: anywhere; }
+  .cal-link-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .cal-link-row select { min-width: 0; max-width: 100%; flex: 1 1 200px; }
+  .cal-dmt .mt-meeting { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px; }
+  .cal-dmt .tri-brief { margin-top: 8px; }
+  .mt-people { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0; }
+  .mt-people span { font-size: 12px; padding: 1px 8px; border-radius: 9px; background: var(--hairline); color: var(--ink-2); }
 
   /* Narrow screens: one pane at a time, a back button to the rail. */
   @media (max-width: 759px) {
@@ -321,7 +354,7 @@
     .cal { padding: 8px; }
     button.cal-range { font-size: 15px; }
     /* Over the phone's bottom nav (z 40), whose bar otherwise hides the panel's end. */
-    .cal-detail { z-index: 45; }
+    .cal-detail { z-index: 45; width: 100vw; border-left: 0; box-shadow: none; padding: 14px 16px 88px; }
   }
 </style>
 </head>
@@ -821,7 +854,7 @@ $briefs.addEventListener("submit", (e) => {
   e.preventDefault();
   saveSchedule(site);
 });
-$briefs.addEventListener("click", (e) => {
+function onBriefClick(e) {
   const t = e.target.closest && e.target.closest("[data-run],[data-copy],[data-sched-reset]");
   if (!t) return;
   if (t.dataset.run !== undefined) runNow(t.dataset.run);
@@ -831,7 +864,10 @@ $briefs.addEventListener("click", (e) => {
     schedErr.delete(t.dataset.schedReset);
     if (cache) renderBriefs(cache, Date.now(), true);
   }
-});
+}
+$briefs.addEventListener("click", onBriefClick);
+// The calendar's event panel shows a daily meeting's brief block too (XERK-2898).
+$calendar.addEventListener("click", onBriefClick);
 
 // ---- the fleet snapshot --------------------------------------------------------
 // A fetch MERGES, never replaces (XERK-444): an SSE frame that lands while

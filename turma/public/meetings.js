@@ -505,7 +505,7 @@ function calLineHtml(m) {
 }
 // An "Open in calendar" button for `target` ({site, meetingId?, eventId?, startMs}).
 function openCalHtml(target) {
-  if (!hooks.openCalendar) return "";
+  if (!hooks.openCalendar || inPanelPaint) return "";   // the calendar's own panel needs no way back to it
   calTargets.push(target);
   return `<button type="button" class="btn-sm" data-open-cal="${calTargets.length - 1}">Open in calendar</button>`;
 }
@@ -523,7 +523,8 @@ function summaryHtml(m) {
 }
 // `primary`: the entry IS this meeting (its title heads the pane, with the back
 // button); else it sits under a daily meeting's brief.
-function meetingHtml(site, m, { primary = false, orgName = "", back = "" } = {}) {
+// `people`: the names too (the calendar's panel, XERK-2898; the notes view shows a count).
+function meetingHtml(site, m, { primary = false, orgName = "", back = "", people = false } = {}) {
   const url = safeUrl(m.tenirUrl);
   const link = url ? `<a class="mt-tenir" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open in Tenir ↗</a>` : "";
   const mk = meetingKey(site, m.meetingId);
@@ -561,6 +562,8 @@ function meetingHtml(site, m, { primary = false, orgName = "", back = "" } = {})
     + `<div class="mt-meta">${meetingMeta(m, orgName)}</div>`
     + calLineHtml(m)
     + (aerr ? `<div class="mt-err">${esc(aerr)}</div>` : "")
+    + (people && (m.participants || []).length
+      ? `<div class="mt-people" aria-label="Participants">${m.participants.map((p) => `<span>${esc(p)}</span>`).join("")}</div>` : "")
     + summaryHtml(m)
     + body + `</section>`;
 }
@@ -860,19 +863,20 @@ function drawerHtml(data, v) {
 }
 
 // ---- paint -----------------------------------------------------------------------------
-function editing() {
+function fieldIn(root) {
   const a = document.activeElement;
-  return !!a && $list.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || "");
+  return !!a && !!root && root.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || "");
 }
+const editing = () => fieldIn($list);
 // What has focus, as keys that survive the swap: the page's own (hooks) first,
 // else one of this pane's controls by its data attribute.
 const FOCUS_ATTRS = ["search", "filter", "openCal", "orgToggle", "orgSettings", "entry", "showReviewed", "archive",
   "drawerClose", "back", "labelSave", "labelReset", "focusSave", "focusClear", "missUse", "metaFocus"];
-function focusKey() {
-  if (hooks.focusKey) { const k = hooks.focusKey(); if (k) return { page: k }; }
+function focusKey(root = $list) {
+  if (root === $list && hooks.focusKey) { const k = hooks.focusKey(); if (k) return { page: k }; }
   const a = document.activeElement;
   const ds = a && a.dataset;
-  if (!ds || !$list.contains(a)) return null;
+  if (!ds || !root.contains(a)) return null;
   if (ds.act !== undefined) return { attr: "k", v: ds.k, act: ds.act };
   const attr = FOCUS_ATTRS.find((x) => ds[x] !== undefined);
   if (!attr) return null;
@@ -880,10 +884,10 @@ function focusKey() {
   try { if (attr === "search") range = [a.selectionStart, a.selectionEnd]; } catch { /* no selection API */ }
   return { attr, v: ds[attr], range };
 }
-function restoreFocus(key) {
+function restoreFocus(key, root = $list) {
   if (!key) return;
   if (key.page) return void (hooks.restoreFocus && hooks.restoreFocus(key.page));
-  const el = [...$list.querySelectorAll("button,input,select,[data-meta-focus]")].find((x) => x.dataset && x.dataset[key.attr] === key.v
+  const el = [...root.querySelectorAll("button,input,select,[data-meta-focus]")].find((x) => x.dataset && x.dataset[key.attr] === key.v
     && (key.act === undefined || x.dataset.act === key.act));
   if (!el || !el.focus) return;
   el.focus();
@@ -891,6 +895,7 @@ function restoreFocus(key) {
 }
 function renderMeetings(data, force = false) {
   if (!$list) return;
+  paintPanel(force);
   if (pointerDown || (!force && editing())) { paintPending = true; return; }
   paintPending = false;
   if (revealing) resolveReveal(data);
@@ -900,7 +905,7 @@ function renderMeetings(data, force = false) {
   // The org's projects are fetched only where an Approve may need one.
   if (v.sel && needsProject(v.sel.meetings)) ensureMeta(v.sel.site);
   if (drawer) ensureMeta(drawer);
-  followCursor(itemOrder(v));
+  followCursor(activeOrder(v));
   calTargets.length = 0;
   const full = missesHtml(data, v.name)
     + `<div class="tri${narrowMain && v.sel ? " show-main" : ""}">`
@@ -994,13 +999,18 @@ function advanceFrom(oldKey, beforeKeys) {
   const i = beforeKeys.indexOf(oldKey);
   selected = beforeKeys.slice(i + 1).find((k) => keys.has(k))
     || beforeKeys.slice(0, Math.max(0, i)).reverse().find((k) => keys.has(k)) || null;
-  curItem = null;
+  // The NOTES view's cursor: while a panel is open the live one is the panel's
+  // (QA: wiping it made the next R reject the panel's first proposal).
+  if (panelOn()) { if (panel.listCur) panel.listCur = { curItem: null, curOrder: [] }; } else curItem = null;
 }
 async function review(k, action, start = false) {
   if (busy.has(k)) return;
   const hit = findItem(k);
   if (!hit) return;
   const { site, m, it } = hit;
+  // Pressed in the calendar's panel: decided NOW, not at the answer, which may land
+  // after the panel closed (QA: the notes view's selection then moved).
+  const fromPanel = panelOn();
   // Busy from the first await, not the POST (XERK-2511 QA): while the project's
   // types load, a second press — a Reject — must not post first and then be
   // overtaken by this Approve, creating a ticket the operator rejected.
@@ -1047,9 +1057,10 @@ async function review(k, action, start = false) {
     if (out.meeting && cache) patchMeeting(site, out.meeting);
     // The cursor moves on through followCursor, whichever lands first: this
     // answer or the SSE frame carrying the same row.
-    followCursor(itemOrder(buildView(cache)));
-    // The entry's last proposal answered: on to the next one that needs review.
-    if (action !== "reopen" && filter === "review" && entry && entry.key === selected) {
+    followCursor(activeOrder(buildView(cache)));
+    // The entry's last proposal answered: on to the next one that needs review
+    // (the notes view's selection; the calendar's panel stays on its event).
+    if (!fromPanel && action !== "reopen" && filter === "review" && entry && entry.key === selected) {
       const after = buildView(cache).sel;
       if (after && after.key === entry.key && !after.pending && !after.inflight && !after.current) {
         selected = null;
@@ -1071,6 +1082,7 @@ function patchMeeting(site, row) {
 async function archive(mk, archived) {
   if (archBusy.has(mk)) return;
   const [site, mid] = splitKey(mk);
+  const fromPanel = panelOn();
   archBusy.add(mk);
   archErr.delete(mk);
   repaint(true);
@@ -1090,7 +1102,7 @@ async function archive(mk, archived) {
     TurmaNav.toast(text);
   } else if (out && out.meeting && cache) {
     patchMeeting(site, out.meeting);
-    if (was) advanceFrom(was, before);
+    if (was && !fromPanel) advanceFrom(was, before);
   }
   repaint(true);
 }
@@ -1140,6 +1152,105 @@ function resolveReveal(data) {
   curItem = null;
   narrowMain = true;
 }
+// ---- the calendar's panel (XERK-2898) ----------------------------------------------
+// The Calendar view's event detail shows a linked capture's summary, people and
+// proposals, reviewed IN PLACE with the very controls above (itemHtml, review,
+// the busy / escaping / keyboard rules): this module paints that part into an
+// element calendar.js hands it, and wires the same handlers onto it. The panel
+// has its own paint hold (a focused field or a press inside it) and takes the
+// A/S/E/R/J/K keys while it shows a meeting; the hidden notes view's stay inert.
+// spec: {site, meetingIds[], dailyAt?} — the daily entry whose meetingAt is
+// within DAILY_NEAR_MS of `dailyAt` shows its brief too (the notes view's block).
+const DAILY_NEAR_MS = 20 * 60000;
+let inPanelPaint = false;        // panelHtml is painting (openCalHtml offers no "Open in calendar")
+let panel = null;                // {el, spec, painted, pending, scroller, onPaint}
+const wired = new WeakSet();
+const panelOn = () => !!(panel && panel.spec);
+function panelRows() {
+  if (!panelOn() || !cache) return [];
+  const list = meetingsOf(cache, panel.spec.site);
+  return panel.spec.meetingIds.map((id) => list.find((m) => m.meetingId === id)).filter(Boolean);
+}
+function panelEntry(rows) {
+  const { site, dailyAt } = panel.spec;
+  const ids = rows.map((m) => m.meetingId);
+  return entriesOf(cache, site, nowMs()).find((e) => e.daily
+    && (e.meetings.some((m) => ids.includes(m.meetingId))
+      || (!rows.length && isTime(dailyAt) && Math.abs(e.at - dailyAt) <= DAILY_NEAR_MS))) || null;
+}
+function panelOrder() {
+  const out = [];
+  for (const m of panelRows()) {
+    if (m.status !== "ok") continue;
+    for (const it of m.items || []) if (it && !isReviewed(it) && reviewable(it)) out.push(itemKey(panel.spec.site, m.meetingId, it.id));
+  }
+  return out;
+}
+// The items the keyboard (and followCursor) walk: the panel's while it is on.
+const activeOrder = (v) => (panelOn() ? panelOrder() : itemOrder(v));
+function panelHtml() {
+  const rows = panelRows();
+  const e = panelEntry(rows);
+  if (!rows.length && !e) return "";
+  const site = panel.spec.site;
+  if (needsProject(rows)) ensureMeta(site);
+  const orgName = nameMap(cache)(site);
+  const brief = e && hooks.briefHtml ? `<div class="tri-brief">${hooks.briefHtml(site, e)}</div>` : "";
+  inPanelPaint = true;
+  try {
+    return `<div class="mt-panel">${brief}${rows.map((m) => meetingHtml(site, m, { orgName, people: true })).join("")}</div>`;
+  } finally { inPanelPaint = false; }
+}
+function paintPanel(force = false) {
+  if (!panel || !cache) return;
+  if (pointerDown || (!force && fieldIn(panel.el))) { panel.pending = true; return; }
+  panel.pending = false;
+  const html = panelOn() ? panelHtml() : "";
+  if (html === panel.painted) return;
+  panel.painted = html;
+  const focus = focusKey(panel.el);
+  const put = () => { panel.el.innerHTML = html; };
+  if (panel.scroller) TurmaNav.preserveScroll(panel.scroller, put); else put();
+  restoreFocus(focus, panel.el);
+  if (panel.onPaint) panel.onPaint(!!html);
+}
+// Show `spec`'s meetings in `el` (null: nothing). Answers whether it painted any.
+function showPanel(el, spec, opts = {}) {
+  if (!el) return false;
+  if (!wired.has(el)) {
+    wired.add(el);
+    el.addEventListener("click", onClick);
+    el.addEventListener("input", onInput);
+    el.addEventListener("change", onChange);
+    el.addEventListener("focusout", flushHeld);
+    el.addEventListener("pointerdown", () => { pointerDown = true; }, true);
+  }
+  const next = spec && typeof spec.site === "string"
+    ? { site: spec.site, meetingIds: (Array.isArray(spec.meetingIds) ? spec.meetingIds : []).filter((x) => typeof x === "string"),
+      dailyAt: isTime(spec.dailyAt) ? spec.dailyAt : 0 } : null;
+  const changed = !panel || panel.el !== el || JSON.stringify(next) !== JSON.stringify(panel.spec);
+  if (changed) {
+    // The notes view's cursor is put aside while a panel shows a meeting, and back after.
+    const was = panel && panel.spec;
+    const listCur = was ? panel.listCur : { curItem, curOrder };
+    panel = { el, spec: next, painted: null, pending: false, listCur: next ? listCur : null };
+    if (next) { curItem = null; curOrder = []; } else if (listCur) ({ curItem, curOrder } = listCur);
+  }
+  panel.scroller = opts.scroller || null;
+  panel.onPaint = typeof opts.onPaint === "function" ? opts.onPaint : null;
+  if (changed) paintPanel(true);
+  return !!panel.painted;
+}
+// A capture's review state, for the calendar's badges: proposals still waiting,
+// or the captions still being read.
+function meetingState(data, site, meetingId) {
+  const m = meetingsOf(data, site).find((x) => x.meetingId === meetingId);
+  if (!m) return null;
+  return { pending: isTime(m.archivedAt) ? 0 : meetingPending(m), reading: m.status === "queued" || m.status === "running",
+    title: meetingTitle(m), calendarBy: m.calendarBy === "operator" ? "operator" : m.calendarBy === "auto" ? "auto" : "" };
+}
+// The hub's answer to a calendar relink (`{ok, meeting}`): the row, as it is now.
+function patch(site, row) { if (cache) { patchMeeting(site, row); repaint(true); } }
 
 // ---- keyboard triage --------------------------------------------------------------
 // A approve, S approve + session, E edit, R reject, J/K next/previous proposal —
@@ -1151,10 +1262,12 @@ function onKey(ev) {
   const t = ev.target;
   if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || "") || t.isContentEditable)) return;
   if (t && t.closest && t.closest("dialog,[role=dialog]")) return;
-  if (drawer || $list.offsetParent === null) return;
+  // The calendar's panel (XERK-2898) takes the keys while it shows a meeting;
+  // else the hidden notes view's keys are inert.
+  if (!panelOn() && (drawer || $list.offsetParent === null)) return;
   const key = String(ev.key || "").toLowerCase();
   if (!["a", "s", "e", "r", "j", "k"].includes(key)) return;
-  const order = itemOrder(buildView(cache));
+  const order = activeOrder(buildView(cache));
   // A frame may have moved the list since the last paint (a held repaint): the
   // cursor follows its place here too, before any key acts on it.
   followCursor(order);
@@ -1164,7 +1277,8 @@ function onKey(ev) {
   if (key === "j" || key === "k") {
     curItem = i < 0 ? order[0] : order[Math.max(0, Math.min(order.length - 1, i + (key === "j" ? 1 : -1)))];
     repaint(true);
-    const el = $list.querySelector && $list.querySelector(".mt-item.cur");
+    const root = panelOn() ? panel.el : $list;
+    const el = root.querySelector && root.querySelector(".mt-item.cur");
     if (el && el.scrollIntoView) el.scrollIntoView({ block: "nearest" });
     return;
   }
@@ -1178,109 +1292,119 @@ function onKey(ev) {
   else review(k, "reject");
 }
 
+function onClick(ev) {
+  const b = ev.target && ev.target.closest
+    ? ev.target.closest("[data-act],[data-meta-retry],[data-label-save],[data-label-reset],[data-miss-use],[data-focus-save],[data-focus-clear],"
+      + "[data-entry],[data-filter],[data-org-toggle],[data-org-settings],[data-drawer-close],[data-back],[data-show-reviewed],[data-archive],[data-open-cal]") : null;
+  if (!b) return;
+  const d = b.dataset;
+  if (d.openCal !== undefined) {
+    const t = calTargets[Number(d.openCal)];
+    if (t && hooks.openCalendar) hooks.openCalendar(t);
+    return;
+  }
+  if (d.entry !== undefined) return void select(d.entry);
+  if (d.filter !== undefined) {
+    if (FILTERS.some(([f]) => f === d.filter)) filter = d.filter;
+    return void repaint(true);
+  }
+  if (d.orgToggle !== undefined) { setCollapsed(d.orgToggle, !collapsed.has(d.orgToggle)); return void repaint(true); }
+  if (d.orgSettings !== undefined) { drawer = drawer === d.orgSettings ? null : d.orgSettings; return void repaint(true); }
+  if (d.drawerClose !== undefined) { drawer = null; return void repaint(true); }
+  if (d.back !== undefined) { narrowMain = false; return void repaint(true); }
+  if (d.showReviewed !== undefined) {
+    if (showReviewed.has(d.showReviewed)) showReviewed.delete(d.showReviewed); else showReviewed.add(d.showReviewed);
+    return void repaint(true);
+  }
+  if (d.archive !== undefined) {
+    if (b.getAttribute("aria-disabled") === "true") return;
+    return void archive(d.archive, d.to === "true");
+  }
+  if (d.focusSave !== undefined || d.focusClear !== undefined) {
+    if (b.getAttribute("aria-disabled") === "true") return;
+    if (d.focusClear !== undefined) return void saveFocus(d.focusClear, "", "");
+    const site = d.focusSave, v = focusDrafts.get(site) || focusOf(cache, site);
+    return void saveFocus(site, v.names, v.role);
+  }
+  if (d.labelSave !== undefined || d.labelReset !== undefined || d.missUse !== undefined) {
+    if (b.getAttribute("aria-disabled") === "true") return;
+    if (d.labelReset !== undefined) return void saveLabel(d.labelReset, null);
+    if (d.missUse !== undefined) {
+      const k = d.missUse, site = missPick.get(k);
+      if (site) saveLabel(site, missLabel(k)).then((ok) => { if (ok) missPick.delete(k); });
+      return;
+    }
+    const site = d.labelSave;
+    const v = labelDrafts.has(site) ? labelDrafts.get(site) : (own(cache && cache.meetingLabels, site) || {}).label;
+    return void saveLabel(site, String(v || "").trim().toLowerCase());
+  }
+  if (d.metaRetry !== undefined) { meta.delete(d.metaRetry); ensureMeta(d.metaRetry, true); return repaint(true); }
+  if (d.act === undefined || b.getAttribute("aria-disabled") === "true") return;
+  const k = d.k, act = d.act;
+  if (k !== undefined && act !== "cancel") curItem = k;
+  if (act === "approve") review(k, "approve");
+  else if (act === "start") review(k, "approve", true);
+  else if (act === "reject") review(k, "reject");
+  else if (act === "reopen") review(k, "reopen");
+  else if (act === "edit") startEdit(k);
+  else if (act === "cancel") { edits.delete(k); itemErr.delete(k); repaint(true); }
+}
+// Draft text lives in `edits`, so a repaint never loses what was typed.
+function onInput(ev) {
+  const t = ev.target, d = t && t.dataset;
+  if (!d) return;
+  // The search filters as it is typed: its own paint is forced (a field has
+  // focus), and focus + caret go back to it.
+  if (d.search !== undefined) { query = String(t.value || ""); return void repaint(true); }
+  if (d.label !== undefined) { labelDrafts.set(d.label, t.value); labelErr.delete(d.label); return; }
+  if (d.focusNames !== undefined || d.focusRole !== undefined) {
+    const site = d.focusNames ?? d.focusRole;
+    const v = { ...(focusDrafts.get(site) || focusOf(cache, site)) };
+    if (d.focusNames !== undefined) v.names = t.value; else v.role = t.value;
+    focusDrafts.set(site, v);
+    focusErr.delete(site);
+    return;
+  }
+  const k = d.editTitle ?? d.editDesc ?? d.editType;
+  const e = k !== undefined && edits.get(k);
+  if (!e) return;
+  if (d.editTitle !== undefined) e.title = t.value;
+  else if (d.editDesc !== undefined) e.description = t.value;
+  else e.issueType = t.value;
+}
+function onChange(ev) {
+  const t = ev.target, d = t && t.dataset;
+  if (!d) return;
+  if (d.miss !== undefined) {
+    if (t.value) missPick.set(d.miss, t.value); else missPick.delete(d.miss);
+    return void repaint(true);
+  }
+  if (d.project !== undefined) {
+    setProject(d.project, t.value);
+    ensureTypes(d.project, true);
+    for (const [k, e] of edits) if (k.startsWith(`${encodeURIComponent(d.project)}/`)) e.issueType = "";
+    repaint(true);
+  } else if (d.editType !== undefined) {
+    const e = edits.get(d.editType);
+    if (e) e.issueType = t.value;
+  }
+}
+
+function flushHeld() {
+  setTimeout(() => {
+    if (paintPending && cache) renderMeetings(cache);
+    else if (panel && panel.pending) paintPanel();
+  }, 0);
+}
 // Wire the triage into `el` (once). The host page owns the snapshot and the
 // stream and hands every change to update(); `pageHooks` render the brief.
 function mount(el, pageHooks = {}) {
   if ($list) return;
   $list = el;
   hooks = pageHooks || {};
-  $list.addEventListener("click", (ev) => {
-    const b = ev.target && ev.target.closest
-      ? ev.target.closest("[data-act],[data-meta-retry],[data-label-save],[data-label-reset],[data-miss-use],[data-focus-save],[data-focus-clear],"
-        + "[data-entry],[data-filter],[data-org-toggle],[data-org-settings],[data-drawer-close],[data-back],[data-show-reviewed],[data-archive],[data-open-cal]") : null;
-    if (!b) return;
-    const d = b.dataset;
-    if (d.openCal !== undefined) {
-      const t = calTargets[Number(d.openCal)];
-      if (t && hooks.openCalendar) hooks.openCalendar(t);
-      return;
-    }
-    if (d.entry !== undefined) return void select(d.entry);
-    if (d.filter !== undefined) {
-      if (FILTERS.some(([f]) => f === d.filter)) filter = d.filter;
-      return void repaint(true);
-    }
-    if (d.orgToggle !== undefined) { setCollapsed(d.orgToggle, !collapsed.has(d.orgToggle)); return void repaint(true); }
-    if (d.orgSettings !== undefined) { drawer = drawer === d.orgSettings ? null : d.orgSettings; return void repaint(true); }
-    if (d.drawerClose !== undefined) { drawer = null; return void repaint(true); }
-    if (d.back !== undefined) { narrowMain = false; return void repaint(true); }
-    if (d.showReviewed !== undefined) {
-      if (showReviewed.has(d.showReviewed)) showReviewed.delete(d.showReviewed); else showReviewed.add(d.showReviewed);
-      return void repaint(true);
-    }
-    if (d.archive !== undefined) {
-      if (b.getAttribute("aria-disabled") === "true") return;
-      return void archive(d.archive, d.to === "true");
-    }
-    if (d.focusSave !== undefined || d.focusClear !== undefined) {
-      if (b.getAttribute("aria-disabled") === "true") return;
-      if (d.focusClear !== undefined) return void saveFocus(d.focusClear, "", "");
-      const site = d.focusSave, v = focusDrafts.get(site) || focusOf(cache, site);
-      return void saveFocus(site, v.names, v.role);
-    }
-    if (d.labelSave !== undefined || d.labelReset !== undefined || d.missUse !== undefined) {
-      if (b.getAttribute("aria-disabled") === "true") return;
-      if (d.labelReset !== undefined) return void saveLabel(d.labelReset, null);
-      if (d.missUse !== undefined) {
-        const k = d.missUse, site = missPick.get(k);
-        if (site) saveLabel(site, missLabel(k)).then((ok) => { if (ok) missPick.delete(k); });
-        return;
-      }
-      const site = d.labelSave;
-      const v = labelDrafts.has(site) ? labelDrafts.get(site) : (own(cache && cache.meetingLabels, site) || {}).label;
-      return void saveLabel(site, String(v || "").trim().toLowerCase());
-    }
-    if (d.metaRetry !== undefined) { meta.delete(d.metaRetry); ensureMeta(d.metaRetry, true); return repaint(true); }
-    if (d.act === undefined || b.getAttribute("aria-disabled") === "true") return;
-    const k = d.k, act = d.act;
-    if (k !== undefined && act !== "cancel") curItem = k;
-    if (act === "approve") review(k, "approve");
-    else if (act === "start") review(k, "approve", true);
-    else if (act === "reject") review(k, "reject");
-    else if (act === "reopen") review(k, "reopen");
-    else if (act === "edit") startEdit(k);
-    else if (act === "cancel") { edits.delete(k); itemErr.delete(k); repaint(true); }
-  });
-  // Draft text lives in `edits`, so a repaint never loses what was typed.
-  $list.addEventListener("input", (ev) => {
-    const t = ev.target, d = t && t.dataset;
-    if (!d) return;
-    // The search filters as it is typed: its own paint is forced (a field has
-    // focus), and focus + caret go back to it.
-    if (d.search !== undefined) { query = String(t.value || ""); return void repaint(true); }
-    if (d.label !== undefined) { labelDrafts.set(d.label, t.value); labelErr.delete(d.label); return; }
-    if (d.focusNames !== undefined || d.focusRole !== undefined) {
-      const site = d.focusNames ?? d.focusRole;
-      const v = { ...(focusDrafts.get(site) || focusOf(cache, site)) };
-      if (d.focusNames !== undefined) v.names = t.value; else v.role = t.value;
-      focusDrafts.set(site, v);
-      focusErr.delete(site);
-      return;
-    }
-    const k = d.editTitle ?? d.editDesc ?? d.editType;
-    const e = k !== undefined && edits.get(k);
-    if (!e) return;
-    if (d.editTitle !== undefined) e.title = t.value;
-    else if (d.editDesc !== undefined) e.description = t.value;
-    else e.issueType = t.value;
-  });
-  $list.addEventListener("change", (ev) => {
-    const t = ev.target, d = t && t.dataset;
-    if (!d) return;
-    if (d.miss !== undefined) {
-      if (t.value) missPick.set(d.miss, t.value); else missPick.delete(d.miss);
-      return void repaint(true);
-    }
-    if (d.project !== undefined) {
-      setProject(d.project, t.value);
-      ensureTypes(d.project, true);
-      for (const [k, e] of edits) if (k.startsWith(`${encodeURIComponent(d.project)}/`)) e.issueType = "";
-      repaint(true);
-    } else if (d.editType !== undefined) {
-      const e = edits.get(d.editType);
-      if (e) e.issueType = t.value;
-    }
-  });
+  $list.addEventListener("click", onClick);
+  $list.addEventListener("input", onInput);
+  $list.addEventListener("change", onChange);
   $list.addEventListener("keydown", (ev) => {
     const t = ev.target;
     if (!t || !t.dataset) return;
@@ -1298,7 +1422,6 @@ function mount(el, pageHooks = {}) {
     saveLabel(site, String(t.value || "").trim().toLowerCase());
   });
   if (typeof document.addEventListener === "function") document.addEventListener("keydown", onKey);
-  function flushHeld() { setTimeout(() => { if (paintPending && cache) renderMeetings(cache); }, 0); }
   $list.addEventListener("focusout", flushHeld);
   $list.addEventListener("pointerdown", () => { pointerDown = true; }, true);
   // Released anywhere (a press can end off the list). The flush is a task later,
@@ -1330,14 +1453,14 @@ function pendingCount(data) {
   return n;
 }
 
-const api = { mount, update, invalidate, hold, pendingCount, reveal,
+const api = { mount, update, invalidate, hold, pendingCount, reveal, showPanel, meetingState, patch,
   // test hooks (tests/meetings.test.js, tests/brief.test.js)
   renderMeetings, review, archive, startEdit, edits, setProject, itemKey, entryKey, meetingKey, saveLabel,
   missesHtml, saveFocus, onKey, entriesOf, select,
   openDrawer: (s) => { drawer = s; repaint(true); },
   setFilter: (f) => { filter = f; repaint(true); },
   setQuery: (q) => { query = q; repaint(true); },
-  state: () => ({ selected, curItem, filter, drawer, narrowMain, collapsed: [...collapsed] }),
+  state: () => ({ selected, curItem, filter, drawer, narrowMain, collapsed: [...collapsed], panel: panel && panel.spec }),
   setCache: (c) => { cache = c; },
   setHooks: (h) => { Object.assign(hooks, h); } };
 if (typeof window !== "undefined") window.TurmaMeetings = api;
