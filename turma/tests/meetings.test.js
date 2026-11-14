@@ -933,3 +933,20 @@ test("XERK-2899 QA: an org color is only a palette slot; a week-out meeting carr
   const day = far.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
   assert.ok(h.includes(`<span class="w">${day} `), `dated: ${day}`);
 });
+
+test("XERK-2914: every paint numbers its Open in calendar buttons afresh, so an index never outlives its paint", () => {
+  const opened = [];
+  const soon = Date.now() + 2 * 864e5;
+  const P = calPage([calEv("soon", soon)], opened);
+  const d = data([]);
+  P.setCache(d);
+  P.setFilter("all");
+  P.select(P.entryKey(SITE, "c:soon"));
+  for (let i = 0; i < 3; i++) P.renderMeetings(d);
+  assert.deepEqual([...P.list().matchAll(/data-open-cal="(\d+)"/g)].map((m) => m[1]), ["0"]);
+  P.click({ openCal: "0" });
+  assert.deepEqual(opened, [{ site: SITE, eventId: "soon", startMs: soon }]);
+  // An index from an earlier paint that this one did not hand out opens nothing.
+  P.click({ openCal: "1" });
+  assert.equal(opened.length, 1);
+});

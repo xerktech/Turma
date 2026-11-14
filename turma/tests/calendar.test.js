@@ -512,3 +512,33 @@ test("XERK-2899 QA: a hidden calendar still retries a failed upcoming week", { t
   for (let i = 0; i < 8; i++) await tick();
   assert.ok(asked.length > first, "the notes review's weeks are read again while hidden");
 });
+
+test("XERK-2914: a reveal scrolls the grid to the event and moves focus into its panel, once", async () => {
+  NOW = at(2026, 11, 12, 10, 30);
+  replies = { "/api/calendar": () => ({ hosts: [], events: [
+    { host: "h1", id: "late", org: "acme", subject: "Late one", startMs: at(2027, 2, 3, 15), endMs: at(2027, 2, 3, 16) },
+  ] }) };
+  const scroller = { scrollTop: 0 };
+  const panel = { focused: 0, focus() { this.focused++; } };
+  const qs = root.querySelector;
+  root.querySelector = (sel) => (sel === "#calScroll" ? scroller : sel === ".cal-detail" ? panel : null);
+  try {
+    cal.refetch();
+    cal.setActive(true);
+    cal.reveal({ site: "acme", eventId: "late", startMs: at(2027, 2, 3, 15) });
+    for (let i = 0; i < 8; i++) await tick();
+    assert.equal(cal._state().detail && cal._state().detail.id, "late");
+    // 15:00 is row 30 of 24px; one hour of context sits above it.
+    assert.equal(scroller.scrollTop, (900 / 30) * 24 - 48, "the grid scrolls to the event");
+    assert.equal(panel.focused, 1, "the panel takes focus");
+    // A later repaint leaves the operator's scroll and focus alone.
+    scroller.scrollTop = 5;
+    cal.refetch();
+    for (let i = 0; i < 4; i++) await tick();
+    assert.equal(scroller.scrollTop, 5);
+    assert.equal(panel.focused, 1);
+  } finally {
+    root.querySelector = qs;
+    cal.setActive(false);
+  }
+});
