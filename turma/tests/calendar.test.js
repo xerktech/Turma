@@ -864,7 +864,7 @@ test("XERK-2943: a short block still carries its time line; the drawn height (CS
   ] }) };
   cal.refetch();
   const html = await show(at(2027, 4, 7));
-  assert.match(html, /<button type="button" class="cal-ev" [^>]*aria-label="Quick,[^"]*"><span class="cal-evb"><span class="t"><span class="tx">Quick<\/span><\/span><span class="m">9:00\s–\s9:15\sAM<\/span><\/span><\/button>/);
+  assert.match(html, /<button type="button" class="cal-ev[^"]*" [^>]*aria-label="Quick,[^"]*"><span class="cal-evb"><span class="t"><span class="tx">Quick<\/span><\/span><span class="m">9:00\s–\s9:15\sAM<\/span><\/span><\/button>/);
   assert.doesNotMatch(html, /class="cal-ev[^"]*\bshort\b/);
 });
 
