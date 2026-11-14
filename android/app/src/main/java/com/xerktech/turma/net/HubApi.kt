@@ -459,6 +459,34 @@ interface HubApi {
         @Body body: com.xerktech.turma.model.MeetingArchiveRequest,
     ): Response<com.xerktech.turma.model.MeetingReviewResponse>
 
+    // The Calendar view (XERK-2900, contract-calendar.md): one Monday–Sunday week
+    // of every visible host's Outlook events + Turma-only Tenir captures. `org` is
+    // the header pick (comma-joined), null = every org. A range no host has synced
+    // makes the hub queue a sync (`pending`).
+    @GET("api/calendar")
+    suspend fun calendar(
+        @Query("from") from: Long,
+        @Query("until") until: Long,
+        @Query("org") org: String? = null,
+    ): Response<com.xerktech.turma.model.CalendarAnswer>
+
+    // Holidays of the days [from, until] ("YYYY-MM-DD", inclusive), each with the
+    // orgs it is a day off for (XERK-2892).
+    @GET("api/holidays")
+    suspend fun holidays(
+        @Query("from") from: String,
+        @Query("until") until: String,
+    ): Response<kotlinx.serialization.json.JsonElement>
+
+    // Relink a capture to a calendar event (XERK-2896): {eventId} | {eventId:
+    // null} (never link) | {auto: true}. Answers {ok, meeting} or the hub's {error}.
+    @POST("api/orgs/{siteKey}/meetings/{meetingId}/calendar")
+    suspend fun relinkMeeting(
+        @Path("siteKey") siteKey: String,
+        @Path("meetingId") meetingId: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): Response<com.xerktech.turma.model.MeetingCalendarResponse>
+
     // An org's meeting settings (XERK-2858's panel): whose work ({names, role},
     // XERK-2514), its Tenir label ({label: "<label>"|null}, XERK-2638) and its
     // standup schedule (PUT merges the sent fields, XERK-2391). Raw objects: a

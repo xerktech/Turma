@@ -56,6 +56,13 @@ class BriefScreenTest {
     @get:Rule(order = 2)
     val compose = createAndroidComposeRule<ComponentActivity>()
 
+    // The Meetings tab opens on the Calendar (XERK-2900); these tests drive the notes review.
+    private val cvm by lazy {
+        main.track(com.xerktech.turma.vm.CalendarViewModel(hub.app)).also {
+            it.setView(com.xerktech.turma.vm.CalendarViewModel.VIEW_NOTES)
+        }
+    }
+
     private val site = "o.atlassian.net"
     private val host = """{ "key": "h1", "device": "h1", "online": true, "lastSeen": 1,
         "jira": { "available": true, "siteKey": "$site", "site": "$site", "tickets": [] } }"""
@@ -76,7 +83,7 @@ class BriefScreenTest {
     private fun show(vm: BriefViewModel = main.track(BriefViewModel(hub.app)),
                      mvm: MeetingsViewModel = main.track(MeetingsViewModel(hub.app)),
                      wide: Boolean = false) =
-        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = wide) }
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, calendarVm = cvm, wide = wide) }
 
     private fun open(text: String) {
         compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText(text, substring = true))
@@ -214,7 +221,7 @@ class BriefScreenTest {
         var push by mutableStateOf<String?>(null)
         val vm = main.track(BriefViewModel(hub.app))
         val mvm = main.track(MeetingsViewModel(hub.app))
-        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = true, openSite = push, onOpened = { push = null }) }
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, calendarVm = cvm, wide = true, openSite = push, onOpened = { push = null }) }
         waitFor("Item of Alpha sync")
         // A search that hides the pushed org is cleared by the push.
         compose.onNodeWithText("Search meetings and proposals").performTextInput("Alpha")
@@ -229,7 +236,7 @@ class BriefScreenTest {
         var push by mutableStateOf<String?>("a.atlassian.net")
         val vm = main.track(BriefViewModel(hub.app))
         val mvm = main.track(MeetingsViewModel(hub.app))
-        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = true, openSite = push, onOpened = { push = null }) }
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, calendarVm = cvm, wide = true, openSite = push, onOpened = { push = null }) }
         compose.waitForIdle()
         hub.seedFleet("""
             { "now": 1, "agents": [ ${hostOf("h1", "a.atlassian.net", "Zed")}, ${hostOf("h2", "b.atlassian.net", "Alpha")} ],
@@ -292,7 +299,7 @@ class BriefScreenTest {
         var wide by mutableStateOf(true)
         val vm = main.track(BriefViewModel(hub.app))
         val mvm = main.track(MeetingsViewModel(hub.app))
-        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = wide, openSite = push, onOpened = { push = null }) }
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, calendarVm = cvm, wide = wide, openSite = push, onOpened = { push = null }) }
         compose.waitForIdle()
         assertEquals("a.atlassian.net", push)
         wide = false
@@ -312,7 +319,7 @@ class BriefScreenTest {
         var push by mutableStateOf<String?>("a.atlassian.net")
         val vm = main.track(BriefViewModel(hub.app))
         val mvm = main.track(MeetingsViewModel(hub.app))
-        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = true, openSite = push, onOpened = { push = null }) }
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, calendarVm = cvm, wide = true, openSite = push, onOpened = { push = null }) }
         waitFor("Item of Alpha sync")
         compose.waitUntil(10_000) { push == null }
         hub.container.org.set(emptySet())
@@ -569,7 +576,7 @@ class BriefScreenTest {
         val mvm = main.track(MeetingsViewModel(hub.app))
         val vm = main.track(BriefViewModel(hub.app))
         val restore = androidx.compose.ui.test.junit4.StateRestorationTester(compose)
-        restore.setContent { BriefScreen(vm = vm, meetingsVm = mvm) }
+        restore.setContent { BriefScreen(vm = vm, meetingsVm = mvm, calendarVm = cvm) }
         compose.onNodeWithContentDescription("o settings").performClick()
         compose.onNodeWithText("23:59").performScrollTo().performTextReplacement("1015")
         compose.onNodeWithTag("save-schedule").performScrollTo().performClick()
@@ -600,7 +607,7 @@ class BriefScreenTest {
         val mvm = main.track(MeetingsViewModel(hub.app))
         val vm = main.track(BriefViewModel(hub.app))
         val restore = androidx.compose.ui.test.junit4.StateRestorationTester(compose)
-        restore.setContent { BriefScreen(vm = vm, meetingsVm = mvm) }
+        restore.setContent { BriefScreen(vm = vm, meetingsVm = mvm, calendarVm = cvm) }
         compose.onNodeWithContentDescription("o settings").performClick()
         compose.onNodeWithText("23:59").performScrollTo().performTextReplacement("0800")
         compose.onNodeWithTag("save-schedule").performScrollTo().performClick()
@@ -675,7 +682,7 @@ class BriefScreenTest {
         val mvm = main.track(MeetingsViewModel(hub.app))
         val vm = main.track(BriefViewModel(hub.app))
         val restore = androidx.compose.ui.test.junit4.StateRestorationTester(compose)
-        restore.setContent { BriefScreen(vm = vm, meetingsVm = mvm) }
+        restore.setContent { BriefScreen(vm = vm, meetingsVm = mvm, calendarVm = cvm) }
         compose.onNodeWithContentDescription("o settings").performClick()
         // An earlier save of each section that worked (answered by the hub).
         hub.route("/api/orgs/$site/meeting-label") {

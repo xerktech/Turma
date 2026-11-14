@@ -169,7 +169,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 - Every served string is escaped (subject, location, organizer, device, error, holiday, org);
   a join link is rebuilt only from an `https://` URL (`safeHttps`); an org color is inlined only
   as `var(--sN)` (`safeColor`).
-- Android: XERK-2900 (`android/PARITY.md`). Tests: `turma/tests/calendar.test.js`, the
+- Android ports it in `ui/CalendarScreen.kt` (XERK-2900, `android.md`). Tests: `turma/tests/calendar.test.js`, the
   `XERK-2897` cases in `brief.test.js`.
 
 ## The event detail panel (XERK-2898)
