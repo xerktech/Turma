@@ -132,7 +132,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 - **Two views, one page**: `brief.html` shows a Calendar / Notes review switch; the pick is per
   viewer in `localStorage` (`turma-meetings-view`, guarded), Calendar by default. A `?site=` link
   (the proposals push) opens Notes review. The hidden view's keys are inert (`offsetParent`).
-- **`calendar.js` reads its own routes** (`/api/calendar` per Monday–Sunday week, prefetching the
+- **`calendar.js` reads its own routes** (`/api/calendar` per Sunday–Saturday week, prefetching the
   weeks either side; `/api/holidays` for the same days). The org pick is part of the cache key
   (`<orgs>|<week>`); a read keeps the pick it started with.
 - **What re-reads it** (each a QA finding): `calendar`, `holidaySettings` AND `meetingProposals`
@@ -160,6 +160,11 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   docs; recorded so a later change doesn't drift):
   - Work week (Mon–Fri) is the default; Week is Mon–Sun; ‹ › move a week; Today; the range label
     opens a mini-month (month ‹ ›, year « »). Narrow (<760px): Day / 3 days, arrows + swipe.
+  - **The calendar fills the page** (XERK-2937): a flex chain down to `.cal-scroll`, never a
+    `100vh - N` guess (a wrapped notice broke it). The Calendar view alone widens to `--wrap-board`.
+    Rows stretch past 24px only when the pane is taller than the day (`--slot`, `100cqh / 48` on
+    the `container-type: size` pane), so every top/height goes through `slots()`, never px.
+    Scroll math stays in `SLOT_PX`: a stretched day never scrolls.
   - 30-min rows (24px), working hours 8–17 shaded white, the grid opens scrolled to 8:00, a red
     now-line with a dot on today, today's header in the accent with a top bar.
   - Events: a 22% tint of the org color with a 4px solid left bar (unassigned = neutral);

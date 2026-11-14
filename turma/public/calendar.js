@@ -17,7 +17,11 @@
 const DAY_MS = 86400000;
 const SLOT_PX = 24;                 // one 30-minute row
 const HOUR_PX = SLOT_PX * 2;
-const DAY_PX = HOUR_PX * 24;
+// A length of `n` 30-minute rows. The grid stretches its rows to fill a pane
+// taller than the day (XERK-2937): `--slot` is SLOT_PX until the day fits, then
+// grows (brief.html, .cal-body). Scroll math stays in SLOT_PX: a stretched day
+// never scrolls.
+const slots = (n, minus = 0) => `calc(var(--slot, ${SLOT_PX}px) * ${n}${minus ? ` - ${minus}px` : ""})`;
 const WORK_FROM_H = 8, WORK_UNTIL_H = 17;  // the shaded working hours; the grid opens at 8:00
 const MIN_LAYOUT_MIN = 20;          // a shorter (or zero-length) event lays out as 20 minutes (one readable line)
 const NARROW_PX = 760;
@@ -49,8 +53,8 @@ function saveStore(key, v) {
 // ---- week math (local wall time; Date's own calendar arithmetic, so DST days are 23/25h) ----
 function dayStart(ms) { const d = new Date(ms); d.setHours(0, 0, 0, 0); return d.getTime(); }
 function addDays(ms, n) { const d = new Date(dayStart(ms)); d.setDate(d.getDate() + n); d.setHours(0, 0, 0, 0); return d.getTime(); }
-// The Monday of `ms`'s week (Teams' week runs Monday–Sunday; Work week is Monday–Friday).
-function weekStart(ms) { const d = new Date(dayStart(ms)); return addDays(d.getTime(), -((d.getDay() + 6) % 7)); }
+// The Sunday of `ms`'s week: the week runs Sunday–Saturday (XERK-2940); Work week is its Monday–Friday.
+function weekStart(ms) { const d = new Date(dayStart(ms)); return addDays(d.getTime(), -d.getDay()); }
 const pad = (n) => String(n).padStart(2, "0");
 function dayKey(ms) { const d = new Date(ms); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
 // "YYYY-MM-DD" → that local midnight (a holiday's date is a calendar day, not an instant).
@@ -61,7 +65,7 @@ function parseDayKey(s) {
 const MODES = { work: 5, week: 7, day: 1, three: 3 };
 // The days a mode shows around `anchor`.
 function visibleDays(anchor, mode) {
-  const first = mode === "work" || mode === "week" ? weekStart(anchor) : dayStart(anchor);
+  const first = mode === "work" ? addDays(weekStart(anchor), 1) : mode === "week" ? weekStart(anchor) : dayStart(anchor);
   const n = MODES[mode] || 5;
   return Array.from({ length: n }, (_, i) => addDays(first, i));
 }
@@ -69,7 +73,7 @@ function visibleDays(anchor, mode) {
 function stepAnchor(anchor, mode, dir) {
   return addDays(anchor, dir * (mode === "work" || mode === "week" ? 7 : (MODES[mode] || 1)));
 }
-// The weeks (Monday ms) a set of days touches: what is fetched.
+// The weeks (Sunday ms) a set of days touches: what is fetched.
 function weeksOf(days) { return [...new Set(days.map(weekStart))]; }
 // "November 9–13, 2026" (Intl formats the range across a month or year boundary).
 function rangeLabel(days) {
@@ -227,6 +231,7 @@ let detail = null;                // the event whose detail panel is open
 let lastGot = null;               // collect() of the last paint: the relink candidates
 let $grid = null, $side = null, $info = null, $mt = null;
 let descOpen = false;             // the open event's description is expanded
+let attOpen = false;              // the open event's attendee list is expanded (collapsed by default, XERK-2942)
 let panelHas = false;             // meetings.js painted the capture into the panel
 const linkBusy = new Set();       // capture keys with a relink POST in flight
 const linkErr = new Map();        // capture key -> the hub's refusal
@@ -294,7 +299,7 @@ async function getJson(url) {
   }
   return body;
 }
-// Read one week (Monday–Sunday) of events + holidays. A read already in flight
+// Read one week (Sunday–Saturday) of events + holidays. A read already in flight
 // is asked again once it lands, so a frame mid-read is never lost.
 // The read keeps the org pick it started with (its cache key), so a pick changed
 // mid-read never leaves that entry loading or fills it with another pick's events.
@@ -519,7 +524,6 @@ function evStyle(ev, colors) {
 }
 function timedHtml(seg, day, colors, now) {
   const ev = seg.ev;
-  const top = (seg.top / 30) * SLOT_PX;
   const h = ((seg.bottom - seg.top) / 30) * SLOT_PX - 2;
   const left = (seg.col / seg.cols) * 100, width = (seg.span / seg.cols) * 100;
   const short = h < 34;
@@ -527,7 +531,7 @@ function timedHtml(seg, day, colors, now) {
   const cls = ["cal-ev", ...styleOf(ev, now), short ? "short" : ""].filter(Boolean).join(" ");
   const b = badgeOf(ev);
   return `<button type="button" class="${cls}" data-ev="${evIndex(ev)}" data-day="${day}" data-top="${seg.top}"`
-    + ` style="${evStyle(ev, colors)}top:${top}px;height:${h}px;left:calc(${left}% + 1px);width:calc(${width}% - 4px)"`
+    + ` style="${evStyle(ev, colors)}top:${slots(seg.top / 30)};height:${slots((seg.bottom - seg.top) / 30, 2)};left:calc(${left}% + 1px);width:calc(${width}% - 4px)"`
     + ` aria-label="${esc([ariaOf(ev, day), badgeAria(b)].filter(Boolean).join(", "))}">`
     + `<span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${badgeHtml(b)}</span>`
     + (short ? "" : `<span class="m">${esc(meta)}</span>`) + `</button>`;
@@ -697,6 +701,7 @@ function detailHtml(ev, now, hasPanel = false) {
   const openNotesBtn = openNotes && notesTarget(ev, now)
     ? `<div class="cal-drow"><button type="button" class="btn-sm" data-open-notes>Open in notes review</button></div>` : "";
   const att = Array.isArray(ev.attendees) ? attendeesHtml(ev.attendees) : "";
+  const attN = att ? (att.match(/<li>/g) || []).length : 0;
   // The description as Outlook wrote it: escaped line by line, breaks kept.
   const descHtml = linesHtml(ev.body);
   const notes = [];
@@ -722,7 +727,9 @@ function detailHtml(ev, now, hasPanel = false) {
     + (join ? `<div class="cal-drow"><a href="${esc(join)}" target="_blank" rel="noopener noreferrer">Join meeting</a></div>` : "")
     + openNotesBtn
     + notes.map((n) => `<p class="cal-dnote">${esc(n)}</p>`).join("")
-    + (att ? `<div class="cal-dsec"><div class="cal-dlabel">Attendees</div>${att}</div>` : "")
+    // Collapsed by default like the description (XERK-2942): a big invite list buries the rest.
+    + (att ? `<div class="cal-dsec"><button type="button" class="linkish cal-dlabel" data-att-toggle aria-expanded="${attOpen}">`
+      + `${attOpen ? "▾" : "▸"} Attendees (${attN})</button>${attOpen ? att : ""}</div>` : "")
     + (descHtml ? `<div class="cal-dsec"><button type="button" class="linkish cal-dlabel" data-body-toggle aria-expanded="${descOpen}">`
       // descHtml is linesHtml's output: every line esc()'d (Semgrep reads `ev.body` as an Express req.body).
       // nosemgrep: javascript.express.security.injection.raw-html-format.raw-html-format
@@ -889,11 +896,11 @@ function calendarHtml() {
       + `</div>`;
   }).join("");
   const band = days.map((d) => `<div class="cal-band-day${offOrgs(d, got.holidays).length ? " off" : ""}">${bandHtml(d, got.events, got.holidays, colors, now)}</div>`).join("");
-  const hours = Array.from({ length: 24 }, (_, h) => `<div class="cal-hr" style="top:${h * HOUR_PX}px">${h ? esc(new Date(2000, 0, 1, h).toLocaleTimeString([], { hour: "numeric" })) : ""}</div>`).join("");
+  const hours = Array.from({ length: 24 }, (_, h) => `<div class="cal-hr" style="top:${slots(h * 2)}">${h ? esc(new Date(2000, 0, 1, h).toLocaleTimeString([], { hour: "numeric" })) : ""}</div>`).join("");
   const body = days.map((d) => {
     const isToday = dayKey(d) === today;
     const segs = daySegments(got.events, d);
-    const nowLine = isToday ? `<div class="cal-now" style="top:${(wallMinutes(now, d) / 30) * SLOT_PX}px" aria-hidden="true"></div>` : "";
+    const nowLine = isToday ? `<div class="cal-now" style="top:${slots(wallMinutes(now, d) / 30)}" aria-hidden="true"></div>` : "";
     return `<div class="cal-col${isToday ? " today" : ""}${offOrgs(d, got.holidays).length ? " off" : ""}" data-col="${d}">`
       + segs.map((s) => timedHtml(s, d, colors, now)).join("") + nowLine + `</div>`;
   }).join("");
@@ -904,7 +911,7 @@ function calendarHtml() {
     + `<div class="cal-grid" role="region" aria-label="${esc(label)}">`
     + `<div class="cal-row cal-heads" style="${cols}"><div></div>${heads}</div>`
     + `<div class="cal-row cal-band" style="${cols}"><div class="cal-band-lbl">All day</div>${band}</div>`
-    + `<div class="cal-scroll" id="calScroll"><div class="cal-row cal-body" style="${cols};height:${DAY_PX}px">`
+    + `<div class="cal-scroll" id="calScroll"><div class="cal-row cal-body" style="${cols};height:${slots(48)}">`
     + `<div class="cal-gutter">${hours}</div>${body}</div></div></div>`;
 }
 
@@ -934,6 +941,7 @@ let lastHtml = "";
 function paint(force = false) {
   if (!$root || !active) return;
   const html = calendarHtml();
+  let revealed = false;
   if (force || html !== lastHtml) {
     lastHtml = html;
     const sig = focusSig();
@@ -942,12 +950,27 @@ function paint(force = false) {
     if (T) T.preserveScroll($grid, put); else put();
     restoreFocusSig(sig);
     const sc = $grid.querySelector && $grid.querySelector("#calScroll");
+    revealed = !!(sc && scrollToMin >= 0);
     if (sc && scrollToMin >= 0) { sc.scrollTop = Math.max(0, (scrollToMin / 30) * SLOT_PX - HOUR_PX); scrolled = true; }
     else if (sc && !scrolled) { sc.scrollTop = WORK_FROM_H * HOUR_PX - 12; scrolled = true; }  // 8 AM label in view
     scrollToMin = -1;
   }
+  refit(revealed);
   paintDetail(force);
   if (revealFocus) { revealFocus = false; if ($side && !$side.hidden && $side.focus) $side.focus(); }
+}
+// A stretched day (the pane taller than 24h) has nothing to scroll, so its
+// scrollTop is 0; once a resize makes the pane scroll again, open it at 8 AM like
+// a fresh paint instead of leaving it stuck at midnight (XERK-2937).
+let fitWas = false;
+// Hidden (Notes review) the pane measures 0x0, which says nothing, so it is
+// skipped; a paint that just scrolled to a revealed event keeps that scroll.
+function refit(keep = false) {
+  const sc = active && $grid && $grid.querySelector && $grid.querySelector("#calScroll");
+  if (!sc || !sc.clientHeight) return;
+  const fits = sc.scrollHeight <= sc.clientHeight + 1;
+  if (fitWas && !fits && !keep) sc.scrollTop = WORK_FROM_H * HOUR_PX - 12;
+  fitWas = fits;
 }
 // The detail panel paints apart from the grid, into its own element: the grid's
 // repaints (a frame, the clock) never swap the controls under the operator.
@@ -983,7 +1006,7 @@ function paintDetail(force = false) {
   lastDetail = html;
   const a = typeof document !== "undefined" ? document.activeElement : null;
   const ds = a && $info.contains && $info.contains(a) && a.dataset ? a.dataset : null;
-  const k = ds && ["linkPick", "linkGo", "linkUnlink", "linkAuto", "bodyToggle", "closeDetail", "seriesOrg"].find((x) => ds[x] !== undefined);
+  const k = ds && ["linkPick", "linkGo", "linkUnlink", "linkAuto", "bodyToggle", "attToggle", "closeDetail", "seriesOrg"].find((x) => ds[x] !== undefined);
   $info.innerHTML = html;
   if (k && $info.querySelectorAll) {
     const el = [...$info.querySelectorAll("button,select")].find((x) => x.dataset && x.dataset[k] === ds[k]);
@@ -1052,7 +1075,7 @@ function closeDetail() {
 }
 function openDetail(e, from) {
   detailFrom = from;
-  if (!detail || evKey(detail) !== evKey(e)) { descOpen = false; linkPick.clear(); linkErr.clear(); }
+  if (!detail || evKey(detail) !== evKey(e)) { descOpen = false; attOpen = false; linkPick.clear(); linkErr.clear(); }
   detail = e;
   picker = null;
   paint(true);
@@ -1143,10 +1166,11 @@ function mount(el, opts = {}) {
   const mq = typeof window !== "undefined" && window.matchMedia ? window.matchMedia(`(max-width: ${NARROW_PX - 1}px)`) : null;
   narrow = !!(mq && mq.matches);
   if (mq && mq.addEventListener) mq.addEventListener("change", (e) => { narrow = !!e.matches; paint(true); });
+  if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("resize", () => refit());  // never pass the Event as `keep`
   $root.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest
       ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail],"
-        + "[data-open-notes],[data-body-toggle],[data-link-go],[data-link-unlink],[data-link-auto],[data-host-settings]") : null;
+        + "[data-open-notes],[data-body-toggle],[data-att-toggle],[data-link-go],[data-link-unlink],[data-link-auto],[data-host-settings]") : null;
     if (!b) {
       if (picker !== null && !(ev.target && ev.target.closest && ev.target.closest(".cal-picker"))) { picker = null; paint(true); }
       return;
@@ -1165,6 +1189,7 @@ function mount(el, opts = {}) {
       return;
     }
     if (d.bodyToggle !== undefined) { descOpen = !descOpen; return void paintDetail(true); }
+    if (d.attToggle !== undefined) { attOpen = !attOpen; return void paintDetail(true); }
     if (d.linkGo !== undefined || d.linkUnlink !== undefined || d.linkAuto !== undefined) {
       if (b.getAttribute && b.getAttribute("aria-disabled") === "true") return;
       if (d.linkUnlink !== undefined) return void relink(d.linkUnlink, { eventId: null });

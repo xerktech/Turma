@@ -32,17 +32,23 @@ const cal = require("../public/calendar.js");
 const at = (y, mo, d, h = 0, mi = 0) => new Date(y, mo - 1, d, h, mi).getTime();
 const ymd = (ms) => cal.dayKey(ms);
 
-test("XERK-2897: week math — Monday starts, local midnights across the fall-back DST week", () => {
-  // US DST ends Sunday 2026-11-01.
-  const days = cal.visibleDays(at(2026, 10, 29, 15), "week");
-  assert.deepEqual(days.map(ymd), ["2026-10-26", "2026-10-27", "2026-10-28", "2026-10-29", "2026-10-30", "2026-10-31", "2026-11-01"]);
+test("XERK-2940: week math — Sunday starts, local midnights across the fall-back DST week", () => {
+  // US DST ends Sunday 2026-11-01, the first day of its week.
+  const days = cal.visibleDays(at(2026, 11, 4, 15), "week");
+  assert.deepEqual(days.map(ymd), ["2026-11-01", "2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06", "2026-11-07"]);
   for (const d of days) assert.equal(new Date(d).getHours(), 0);
-  assert.equal(days[6] - days[5], 86400000);           // Sat → Sun is still a full day
-  assert.equal(cal.addDays(days[6], 1) - days[6], 25 * 3600000); // Sunday has 25 hours
-  assert.deepEqual(cal.visibleDays(at(2026, 10, 29), "work").map(ymd).slice(-1), ["2026-10-30"]);
-  // › from that week lands on the next Monday at midnight, not 23:00.
+  assert.equal(days[1] - days[0], 25 * 3600000);       // Sunday has 25 hours
+  assert.equal(days[6] - days[5], 86400000);
+  // The week before runs Sunday Oct 25 – Saturday Oct 31; Work week is its Monday–Friday.
+  assert.deepEqual(cal.visibleDays(at(2026, 10, 29), "week").map(ymd).slice(0, 1), ["2026-10-25"]);
+  assert.deepEqual(cal.visibleDays(at(2026, 10, 29), "work").map(ymd), ["2026-10-26", "2026-10-27", "2026-10-28", "2026-10-29", "2026-10-30"]);
+  // A Sunday is the first day of its own week, not the last of the one before (XERK-2940).
+  assert.equal(ymd(cal.weekStart(at(2026, 11, 15, 12))), "2026-11-15");
+  assert.equal(ymd(cal.weekStart(at(2026, 11, 14, 12))), "2026-11-08");
+  assert.deepEqual(cal.visibleDays(at(2026, 11, 14), "work").map(ymd).slice(0, 1), ["2026-11-09"]);
+  // › from that week lands on the DST Sunday at midnight, not 23:00.
   const next = cal.visibleDays(cal.stepAnchor(at(2026, 10, 29), "week", 1), "week");
-  assert.equal(ymd(next[0]), "2026-11-02");
+  assert.equal(ymd(next[0]), "2026-11-01");
   assert.equal(new Date(next[0]).getHours(), 0);
   // 9:00 on the DST day sits on the 9:00 row, not 8:00 or 10:00.
   assert.equal(cal.wallMinutes(at(2026, 11, 1, 9), at(2026, 11, 1)), 540);
@@ -50,22 +56,22 @@ test("XERK-2897: week math — Monday starts, local midnights across the fall-ba
 
 test("XERK-2897: week math — spring-forward and a week across the year boundary", () => {
   const spring = cal.visibleDays(at(2026, 3, 8, 12), "week");  // DST starts Sunday 2026-03-08
-  assert.equal(ymd(spring[0]), "2026-03-02");
-  assert.equal(cal.addDays(spring[6], 1) - spring[6], 23 * 3600000);
+  assert.equal(ymd(spring[0]), "2026-03-08");
+  assert.equal(spring[1] - spring[0], 23 * 3600000);
   assert.equal(cal.wallMinutes(at(2026, 3, 8, 9), at(2026, 3, 8)), 540);
 
   const nye = cal.visibleDays(at(2026, 12, 31), "week");
-  assert.deepEqual([ymd(nye[0]), ymd(nye[6])], ["2026-12-28", "2027-01-03"]);
+  assert.deepEqual([ymd(nye[0]), ymd(nye[6])], ["2026-12-27", "2027-01-02"]);
   const label = cal.rangeLabel(nye);
   assert.match(label, /2026/);
   assert.match(label, /2027/);
   assert.equal(ymd(cal.stepAnchor(at(2027, 1, 1), "week", -1)), "2026-12-25");
   // A narrow three-day view across a week edge reads both weeks.
-  const three = cal.visibleDays(at(2027, 1, 3), "three");
-  assert.deepEqual(three.map(ymd), ["2027-01-03", "2027-01-04", "2027-01-05"]);
-  assert.deepEqual(cal.weeksOf(three).map(ymd), ["2026-12-28", "2027-01-04"]);
-  assert.equal(ymd(cal.stepAnchor(three[0], "three", 1)), "2027-01-06");
-  assert.equal(ymd(cal.stepAnchor(three[0], "day", -1)), "2027-01-02");
+  const three = cal.visibleDays(at(2027, 1, 2), "three");
+  assert.deepEqual(three.map(ymd), ["2027-01-02", "2027-01-03", "2027-01-04"]);
+  assert.deepEqual(cal.weeksOf(three).map(ymd), ["2026-12-27", "2027-01-03"]);
+  assert.equal(ymd(cal.stepAnchor(three[0], "three", 1)), "2027-01-05");
+  assert.equal(ymd(cal.stepAnchor(three[0], "day", -1)), "2027-01-01");
   // The ticket's example: Work week of Nov 9 2026 reads "November 9 – 13, 2026".
   assert.match(cal.rangeLabel(cal.visibleDays(at(2026, 11, 11), "work")), /^November 9\s*–\s*13, 2026$/);
 });
@@ -188,6 +194,23 @@ test("XERK-2897: every served string is escaped; canceled + Tenir events render 
   assert.equal(side.hidden, false);
   assert.match(info.innerHTML, /id="calDetailTitle">Canceled: &lt;img/);
   assert.ok(!root.innerHTML.includes("<img"));
+});
+
+test("XERK-2937: grid geometry is in --slot rows, so a tall pane stretches the day", async () => {
+  replies = {
+    "/api/calendar": (url) => (url.includes(`from=${cal.weekStart(at(2026, 11, 11))}`) ? {
+      hosts: [{ host: "h1", device: "box", online: true, syncedAt: NOW, ranges: [[0, 4e12]] }],
+      events: [{ host: "h1", id: "g1", org: "", subject: "Sync", startMs: at(2026, 11, 11, 9, 30), endMs: at(2026, 11, 11, 11) }],
+    } : { events: [], hosts: [] }),
+  };
+  cal.refetch();
+  const html = await show(at(2026, 11, 11));
+  const slot = (n) => `calc(var(--slot, 24px) * ${n})`;
+  // 9:30 is row 19; 90 minutes is 3 rows less the 2px gap.
+  assert.ok(html.includes(`top:${slot(19)};height:calc(var(--slot, 24px) * 3 - 2px);`), "event placed in rows");
+  assert.ok(html.includes(`class="cal-hr" style="top:${slot(20)}"`), "10 AM label on row 20");
+  assert.ok(html.includes(`;height:${slot(48)}">`), "the day is 48 rows tall");
+  assert.ok(!/top:\d+px/.test(html), "no fixed-px row geometry left");
 });
 
 test("XERK-2897: holidays fill the all-day band; a day off shades only for the orgs in view", async () => {
@@ -440,6 +463,12 @@ test("XERK-2898: the detail shows Outlook's details — moved, canceled, recurre
   assert.match(h, /Part of a recurring series/);
   assert.match(h, /&lt;img src=x onerror=alert\(1\)&gt; \(o@x\.example\)/);
   assert.match(h, /<span class="k">You<\/span><span class="v">Accepted</);
+  // The attendee list starts collapsed (XERK-2942): a toggle naming the count, no names.
+  assert.match(h, /data-att-toggle aria-expanded="false">▸ Attendees \(2\)<\/button>/);
+  assert.doesNotMatch(h, /cal-people/, "the attendees start collapsed");
+  click({ attToggle: "" });
+  h = cal._els().info.innerHTML;
+  assert.match(h, /data-att-toggle aria-expanded="true">▾ Attendees \(2\)/);
   assert.match(h, /<span class="who" title="a@x\.example">&lt;img[^<]*<\/span><span class="role">optional<\/span><span class="resp declined">Declined/);
   assert.match(h, /<span class="who">b@x\.example<\/span><span class="resp accepted">Accepted/);
   assert.match(h, /<span class="cal-cat">&lt;img[^<]*<\/span><span class="cal-cat">Blue<\/span><\/span>/);
@@ -452,6 +481,11 @@ test("XERK-2898: the detail shows Outlook's details — moved, canceled, recurre
   assert.match(h, /<div class="cal-dbody">line one<br>&lt;img src=x onerror=alert\(1\)&gt;<\/div>/);
   click({ closeDetail: "" });
   assert.equal(cal._els().side.hidden, true);
+  // Reopened, the attendee list is collapsed again (XERK-2942).
+  h = await openEvent(at(2027, 3, 10), "Canceled: Plan");
+  assert.match(h, /data-att-toggle aria-expanded="false"/);
+  assert.doesNotMatch(h, /cal-people/);
+  click({ closeDetail: "" });
   // A join link is only ever an https URL.
   assert.doesNotMatch(cal.detailHtml({ host: "h", id: "x", startMs: 1, endMs: 2, joinUrl: "javascript:alert(1)" }, 0), /Join meeting|javascript:/);
   // An occurrence still at its original start says nothing about a move.
@@ -820,6 +854,31 @@ test("XERK-2933: a cross-midnight event's button aria-label names the end's date
   const labels = [...html.matchAll(/aria-label="(Night shift,[^"]*)"/g)].map((m) => m[1]);
   assert.equal(labels.length, 2, "one button on each day");
   for (const l of labels) assert.match(l, /Tuesday, November 10, 10:00\s?PM – Wednesday, November 11, 3:00\s?AM/);
+});
+
+test("XERK-2940: a Sunday starts its week — reveal, holiday read and the date picker", async () => {
+  NOW = at(2028, 5, 13, 10);                         // a Saturday, in a week no other test read
+  const asked = [];
+  replies = {
+    "/api/calendar": (url) => { asked.push(url); return { hosts: [], events: [] }; },
+    "/api/holidays": (url) => { asked.push(url); return []; },
+  };
+  cal.setActive(true);
+  assert.equal(cal._state().mode, "work");
+  // A Sunday meeting is drawn in Week, in the week that Sunday starts.
+  cal.reveal({ eventId: "sun", startMs: at(2028, 5, 14, 10) });
+  for (let i = 0; i < 8; i++) await tick();
+  assert.equal(cal._state().mode, "week", "a Sunday reveal shows Week, not Work week");
+  assert.equal(cal.dayKey(cal.visibleDays(cal._state().anchor, "week")[0]), "2028-05-14");
+  // Holidays are read for that Sunday through Saturday, so a Sunday holiday is not dropped.
+  assert.ok(asked.some((u) => u.startsWith("/api/holidays?from=2028-05-14&until=2028-05-20")), asked.join("\n"));
+  // The mini-month opens on a Sunday: May 2028's first cell is Sunday, April 30.
+  for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset: { openPicker: "" } }) } });
+  const first = /data-pick="(\d+)"/.exec(cal.calendarHtml());
+  assert.ok(first, "the picker is open");
+  assert.equal(cal.dayKey(Number(first[1])), "2028-04-30");
+  assert.equal(new Date(Number(first[1])).getDay(), 0);
+  cal.setActive(false);
 });
 
 test("XERK-2934: a timed event of 24h+ keeps its times; a real all-day event still reads 'all day'", () => {

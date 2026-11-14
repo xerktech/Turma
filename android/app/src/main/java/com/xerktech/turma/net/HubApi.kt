@@ -459,7 +459,7 @@ interface HubApi {
         @Body body: com.xerktech.turma.model.MeetingArchiveRequest,
     ): Response<com.xerktech.turma.model.MeetingReviewResponse>
 
-    // The Calendar view (XERK-2900, contract-calendar.md): one Monday–Sunday week
+    // The Calendar view (XERK-2900, contract-calendar.md): one Sunday–Saturday week
     // of every visible host's Outlook events + Turma-only Tenir captures. `org` is
     // the header pick (comma-joined), null = every org. A range no host has synced
     // makes the hub queue a sync (`pending`).

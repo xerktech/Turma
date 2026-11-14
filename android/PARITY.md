@@ -746,6 +746,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     Outlook subject with its time + invitees, Impromptu, Open in calendar.
   - Platform differences: no keyboard walking (←/→/↑/↓, Esc) and no A/S/E/R/J/K in the panel;
     the date picker is Material's, not the web's mini-month.
+  - The grid fills the screen on both (XERK-2937). The web also stretches its 30-min rows when
+    the pane is taller than a 24-hour day (1152px); Android keeps 24dp rows, since no phone or
+    tablet screen is that tall. The web widens the Calendar view to the board's 1640px column.
   - On for every org, no feature flag (XERK-2901). A host going offline or back re-reads the
     open week on both clients (the hub's `calendar` frame), so the stale-host notice is live.
 - **Calendar settings (XERK-2929)**: an org's ⚙ settings edit its days off (a tick per catalog

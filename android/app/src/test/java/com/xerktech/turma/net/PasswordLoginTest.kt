@@ -47,9 +47,12 @@ class PasswordLoginTest {
 
     // /api/agents accepts only the given session cookie (as a hub does for a
     // local account, whose password it never checks as Basic).
+    // MockWebServer serves each connection on its own thread, so concurrent calls
+    // append to [seen] at once: record under its lock (a bare ArrayList crashed
+    // a request mid-add in CI, failing the concurrent-401 case).
     private fun agentsAcceptOnly(token: String, seen: MutableList<RecordedRequest> = mutableListOf()) =
         hub.route("/api/agents") { req ->
-            seen += req
+            synchronized(seen) { seen += req }
             if (req.getHeader("Cookie") == "hub_session=$token")
                 MockResponse().setResponseCode(200)
                     .setHeader("Content-Type", "application/json").setBody("{\"agents\":[]}")
