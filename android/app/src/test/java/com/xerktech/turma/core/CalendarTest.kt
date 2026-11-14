@@ -422,4 +422,27 @@ class CalendarTest {
         assertEquals("operator", ms[0].calendarBy)
         assertNull(ms[1].calendarEvent)
     }
+
+    @Test fun `XERK-2921 control and bidi characters in a calendar row are stripped at decode`() {
+        // An older or forwarding hub that skipped sanitizeCalendarEvent (QA proxy: "ctl\u0007…").
+        val a = TurmaJson.decodeFromString<CalendarAnswer>(
+            "{\"hosts\":[{\"host\":\"h1\",\"device\":\"Lap\\u202etop\",\"lastError\":\"bad\\u0000\"}]," +
+                "\"events\":[{\"host\":\"h1\",\"id\":\"a\",\"startMs\":1,\"endMs\":2," +
+                "\"subject\":\"ctl\\u0007 \\u202eevil\\u200b\",\"body\":\"line1\\nline2\\tx\\u009f\"," +
+                "\"attendees\":[{\"name\":\"A\\u2066nn\"}],\"categories\":[\"R\\ufeffed\"]}]}")
+        val e = a.events.single()
+        assertEquals("ctl evil", e.subject)
+        assertEquals("line1\nline2\tx", e.body)        // newline and tab are kept
+        assertEquals("Ann", e.attendees.single().name)
+        assertEquals(listOf("Red"), e.categories)
+        assertEquals("Laptop", a.hosts.single().device)
+        assertEquals("bad", a.hosts.single().lastError)
+        assertEquals("plain é 日本", com.xerktech.turma.model.cleanCalendarText("plain é 日本"))
+        // Ids round-trip to the hub as sent (its CAL_ID_RE accepts zero-width marks).
+        val b = TurmaJson.decodeFromString<CalendarAnswer>(
+            "{\"events\":[{\"host\":\"h\\u200b1\",\"id\":\"a\\ufeffb\",\"seriesId\":\"s\\u2060\",\"startMs\":1,\"endMs\":2}]}")
+        assertEquals("a\ufeffb", b.events.single().id)
+        assertEquals("h\u200b1", b.events.single().host)
+        assertEquals("s\u2060", b.events.single().seriesId)
+    }
 }

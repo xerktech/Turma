@@ -154,12 +154,18 @@ data class MeetingCalendarEvent(
 data class MeetingCalendarResponse(val ok: Boolean = false, val meeting: Meeting? = null, val error: String = "")
 
 /** A list decoded row by row: a malformed row drops alone; a non-array reads as empty. */
-open class LenientListSerializer<T>(private val item: KSerializer<T>) : KSerializer<List<T>> {
+open class LenientListSerializer<T>(
+    private val item: KSerializer<T>,
+    // Strip control/bidi/format characters from every string of a row (XERK-2921).
+    private val clean: Boolean = false,
+) : KSerializer<List<T>> {
     override val descriptor: SerialDescriptor = ListSerializer(JsonElement.serializer()).descriptor
 
     override fun deserialize(decoder: Decoder): List<T> {
         val arr = (decoder as? JsonDecoder)?.decodeJsonElement() as? JsonArray ?: return emptyList()
-        return arr.mapNotNull { row -> runCatching { TurmaJson.decodeFromJsonElement(item, row) }.getOrNull() }
+        return arr.mapNotNull { row ->
+            runCatching { TurmaJson.decodeFromJsonElement(item, if (clean) cleanCalendarJson(row) else row) }.getOrNull()
+        }
     }
 
     override fun serialize(encoder: Encoder, value: List<T>) {
@@ -167,8 +173,34 @@ open class LenientListSerializer<T>(private val item: KSerializer<T>) : KSeriali
     }
 }
 
-object LenientCalendarEventsSerializer : LenientListSerializer<CalendarEvent>(CalendarEvent.serializer())
-object LenientCalendarHostsSerializer : LenientListSerializer<CalendarHost>(CalendarHost.serializer())
+object LenientCalendarEventsSerializer : LenientListSerializer<CalendarEvent>(CalendarEvent.serializer(), clean = true)
+object LenientCalendarHostsSerializer : LenientListSerializer<CalendarHost>(CalendarHost.serializer(), clean = true)
+
+/**
+ * The hub's `meetingText` character class (C0 but tab/newline, DEL + C1, zero-width
+ * and bidi marks, line/paragraph separators, word joiners, BOM), removed. The hub
+ * already strips them in `sanitizeCalendarEvent`; this is defence against an older
+ * or forwarding hub (XERK-2921): drawn as plain Text there is no markup risk, but a
+ * bidi override still reorders what the operator reads.
+ */
+private val CALENDAR_CONTROL = Regex("[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u009f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2069\\ufeff]")
+
+internal fun cleanCalendarText(s: String): String = if (CALENDAR_CONTROL.containsMatchIn(s)) CALENDAR_CONTROL.replace(s, "") else s
+
+// Keys that IDENTIFY a row and are sent back to the hub or matched against its ids:
+// never cleaned, or an id the hub accepts (CAL_ID_RE allows zero-width marks) would
+// round-trip as one it doesn't have (QA).
+private val CALENDAR_ID_KEYS = setOf("host", "id", "seriesId", "org", "matchOrg", "site", "meetingId", "calendarEventId")
+
+/** Every display string in [e] (values only, id keys kept as sent) through [cleanCalendarText]. */
+internal fun cleanCalendarJson(e: JsonElement): JsonElement = when (e) {
+    is kotlinx.serialization.json.JsonObject -> kotlinx.serialization.json.JsonObject(
+        e.mapValues { (k, v) -> if (k in CALENDAR_ID_KEYS) v else cleanCalendarJson(v) })
+    is JsonArray -> JsonArray(e.map { cleanCalendarJson(it) })
+    is kotlinx.serialization.json.JsonPrimitive ->
+        if (e.isString) kotlinx.serialization.json.JsonPrimitive(cleanCalendarText(e.content)) else e
+    else -> e
+}
 object LenientAttendeesSerializer : LenientListSerializer<CalendarAttendee>(CalendarAttendee.serializer())
 object LenientCapturesSerializer : LenientListSerializer<CalendarCapture>(CalendarCapture.serializer())
 /**

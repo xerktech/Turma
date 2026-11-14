@@ -855,6 +855,37 @@ test("XERK-2897: calendar, holidaySettings and meetingProposals frames re-read t
   assert.equal(P.calendarRefetches(), 2);
 });
 
+test("XERK-2921: an agent frame re-reads the calendar only when the host's online flips", async () => {
+  const P = loadPage(null, () => data({}));
+  await P.settle();
+  P.runTimers();
+  P.fire("agent", { key: "h1", online: true });    // first sight, nothing to compare
+  P.fire("agent", { key: "h1", online: true });    // a beat: no flip
+  P.runTimers();
+  assert.equal(P.calendarRefetches(), 0, "a beat is not a flip");
+  P.fire("agent", { key: "h1", online: false });   // the offline sweep's frame
+  P.runTimers();
+  assert.equal(P.calendarRefetches(), 1, "offline re-reads, so the notice appears");
+  P.fire("agent", { key: "h1", online: true });
+  P.runTimers();
+  assert.equal(P.calendarRefetches(), 2, "back online re-reads too");
+  P.fire("agent", { key: "h2" });                  // no online flag: ignored
+  P.fire("agent", { key: "h1", online: "false" }); // a non-boolean is not a flip
+  P.fire("agent", "junk");
+  P.sse[0].handlers.agent({ data: "{not json" });  // unparseable: ignored, no throw
+  P.runTimers();
+  assert.equal(P.calendarRefetches(), 2);
+});
+
+test("XERK-2921: a host's first agent frame compares against the snapshot's online", async () => {
+  const P = loadPage(null, () => data({ agents: [{ key: "h1", online: true }] }));
+  await P.settle();
+  P.runTimers();
+  P.fire("agent", { key: "h1", online: false });   // first frame, but the snapshot said online
+  P.runTimers();
+  assert.equal(P.calendarRefetches(), 1);
+});
+
 test("XERK-2897: a stream reconnect re-reads the calendar (frames missed while down)", async () => {
   const P = loadPage(null, () => data({}));
   await P.settle();

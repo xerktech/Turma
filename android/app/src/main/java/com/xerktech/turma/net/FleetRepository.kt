@@ -116,6 +116,8 @@ class FleetRepository(
     // bumped by a `calendar`, `holidaySettings` or `meetingProposals` frame (a
     // Tenir-only capture is announced only by the last) and by every stream
     // (re)open, which may have missed frames. The events are not on the snapshot.
+    // Each host's `online` as its last accepted `agent` frame said (guarded by byKey).
+    private val sseOnline = HashMap<String, Boolean>()
     private val _calendarFrames = MutableStateFlow(0)
     val calendarFrames: StateFlow<Int> = _calendarFrames
 
@@ -190,6 +192,7 @@ class FleetRepository(
                 }
                 byKey.clear()
                 byKey.putAll(merged)
+                sseOnline.keys.retainAll(merged.keys) // a host the snapshot dropped is gone
             }
             ticketAgents = resp.ticketAgents
             autoStartOrgs = resp.autoStartOrgs
@@ -322,22 +325,27 @@ class FleetRepository(
         )
     }
 
-    @androidx.annotation.VisibleForTesting
-    internal fun upsert(agent: AgentInfo) {
-        if (agent.key.isEmpty()) return
+    /**
+     * Upserts an SSE agent frame, returning whether it was taken; [onTaken] gets the record it
+     * replaced and runs under the same lock, so a poll cannot slip in between (QA).
+     */
+    private fun upsertFrame(agent: AgentInfo, onTaken: ((prev: AgentInfo?) -> Unit)? = null): Boolean {
+        if (agent.key.isEmpty()) return false
         // Same freshness guard as refresh() (XERK-812): drop an SSE event older
         // than the record we already hold, so a late/out-of-order event can't
         // regress a session's question (or any other field) to a stale value.
         synchronized(byKey) {
             val cur = byKey[agent.key]
-            if (cur != null && cur.lastSeen > agent.lastSeen) return
+            if (cur != null && cur.lastSeen > agent.lastSeen) return false
             byKey[agent.key] = agent
+            onTaken?.invoke(cur)
         }
         emit(_state.value.now.coerceAtLeast(agent.lastSeen), null)
+        return true
     }
 
     private fun remove(key: String) {
-        synchronized(byKey) { byKey.remove(key) }
+        synchronized(byKey) { byKey.remove(key); sseOnline.remove(key) }
         emit(_state.value.now, null)
     }
 
@@ -350,7 +358,23 @@ class FleetRepository(
     internal fun onSseEvent(type: String?, data: String) {
         if (type == "calendar" || type == "holidaySettings" || type == "meetingProposals") _calendarFrames.value++
         when (type) {
-            "agent" -> runCatching { TurmaJson.decodeFromString<AgentInfo>(data) }.getOrNull()?.let { upsert(it) }
+            "agent" -> runCatching { TurmaJson.decodeFromString<AgentInfo>(data) }.getOrNull()?.let {
+                // A host going offline (or back) sends no calendar frame, only its agent
+                // record, so the calendar's "<host> is offline" notice would wait for the
+                // next read (XERK-2921, web brief.html). Count only an online FLIP: agent
+                // frames arrive every beat, and re-reading on each would cost a read per beat.
+                // The baseline is the last FRAME's value, never `byKey`: the 6s poll
+                // usually sees `online:false` before the hub's offline frame, and comparing
+                // against it would read the frame as no flip (QA). First sight falls back to
+                // the held record, as the web falls back to its snapshot.
+                var flipped = false
+                upsertFrame(it) { prev ->
+                    val was = sseOnline[it.key] ?: prev?.online
+                    flipped = was != null && was != it.online
+                    sseOnline[it.key] = it.online
+                }
+                if (flipped) _calendarFrames.value++
+            }
             "removed" -> runCatching { TurmaJson.decodeFromString<JsonObject>(data) }
                 .getOrNull()?.get("key")?.jsonPrimitive?.content?.let { remove(it) }
             // A ticket->agent pin changed somewhere; the event carries
