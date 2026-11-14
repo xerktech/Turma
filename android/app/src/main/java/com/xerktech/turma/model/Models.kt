@@ -129,7 +129,32 @@ data class AgentsResponse(
     val meetingLabelMisses: Map<String, MeetingLabelMiss> = emptyMap(),
     @Serializable(with = LenientMeetingFocusSerializer::class)
     val meetingFocus: Map<String, MeetingFocus> = emptyMap(),
+    // Each decided org's days off (XERK-2892) and the holiday catalogs it may
+    // pick from, and each org's calendar email domains (XERK-2929): the settings
+    // panel edits them. Hub-coerced, decoded per entry; absent on an older hub,
+    // which hides both sections.
+    @Serializable(with = LenientHolidaySettingsSerializer::class)
+    val holidaySettings: Map<String, HolidaySettings> = emptyMap(),
+    @Serializable(with = LenientHolidayCatalogSerializer::class)
+    val holidayCatalog: Map<String, HolidayCountry> = emptyMap(),
+    @Serializable(with = LenientCalendarOrgRulesSerializer::class)
+    val calendarOrgRules: Map<String, CalendarOrgRule> = emptyMap(),
 )
+
+/** An org's days off (`holidaySettingsWire`): the catalogs it follows and the holiday ids it takes off. */
+@Serializable
+data class HolidaySettings(val countries: List<String> = emptyList(), val off: List<String> = emptyList())
+
+/** One catalog of `holidayCatalog` (`catalogWire`): its name and its holidays. */
+@Serializable
+data class HolidayCountry(val name: String = "", val holidays: List<HolidayEntry> = emptyList())
+
+@Serializable
+data class HolidayEntry(val id: String = "", val name: String = "")
+
+/** An org's calendar email-domain rule (`calendarOrgRules`). */
+@Serializable
+data class CalendarOrgRule(val domains: List<String> = emptyList())
 
 /** An org's Tenir label (`meetingLabelsWire`): "" = none; [custom] = the operator set it. */
 @Serializable
@@ -362,6 +387,22 @@ object LenientLabelMissesSerializer : LenientSiteMapSerializer<MeetingLabelMiss>
 object LenientMeetingFocusSerializer : LenientSiteMapSerializer<MeetingFocus>(
     { TurmaJson.encodeToJsonElement(MeetingFocus.serializer(), it) },
     { v -> TurmaJson.decodeFromJsonElement(MeetingFocus.serializer(), v) },
+)
+
+object LenientHolidaySettingsSerializer : LenientSiteMapSerializer<HolidaySettings>(
+    { TurmaJson.encodeToJsonElement(HolidaySettings.serializer(), it) },
+    { v -> TurmaJson.decodeFromJsonElement(HolidaySettings.serializer(), v) },
+)
+
+/** `holidayCatalog`: keyed by country code, not siteKey, but the same per-entry decode. */
+object LenientHolidayCatalogSerializer : LenientSiteMapSerializer<HolidayCountry>(
+    { TurmaJson.encodeToJsonElement(HolidayCountry.serializer(), it) },
+    { v -> TurmaJson.decodeFromJsonElement(HolidayCountry.serializer(), v) },
+)
+
+object LenientCalendarOrgRulesSerializer : LenientSiteMapSerializer<CalendarOrgRule>(
+    { TurmaJson.encodeToJsonElement(CalendarOrgRule.serializer(), it) },
+    { v -> TurmaJson.decodeFromJsonElement(CalendarOrgRule.serializer(), v) },
 )
 
 /** `meetingProposals`: per org a list, each meeting decoded on its own. */

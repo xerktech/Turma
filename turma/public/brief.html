@@ -149,6 +149,9 @@
     background: var(--field); color: var(--ink); max-width: 100%; }
   .mt-label-row input { width: 12em; }
   .mt-label-row .def { color: var(--muted); }
+  .mt-hol-country { display: block; padding: 2px 0; font-weight: 600; }
+  .mt-hol-days { display: grid; grid-template-columns: repeat(auto-fill, minmax(12em, 1fr)); gap: 2px 12px; padding: 2px 0 6px 1.4em; }
+  .mt-hol-days label { display: flex; gap: 6px; align-items: baseline; min-width: 0; overflow-wrap: anywhere; }
   .mt-label-row input.mt-focus-names { width: 100%; box-sizing: border-box; }
   .mt-label-row input.mt-focus-role { flex: 1 1 10em; }
   .mt-misses { margin-bottom: 12px; padding: 4px 12px; border-radius: var(--radius-md);
@@ -344,6 +347,13 @@
   .cal-dstate { font-size: 12px; color: var(--muted); text-transform: capitalize; margin-bottom: 6px; }
   .cal-drow { display: flex; gap: 10px; font-size: 13.5px; padding: 5px 0; border-top: 1px solid var(--hairline); }
   .cal-drow .k { flex: 0 0 84px; color: var(--muted); }
+  .cal-drow .v select { max-width: 100%; }
+  .cal-hostset { border: 1px solid var(--hairline); border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; font-size: 13px; }
+  .cal-hostset .cal-dnote { margin: 0 0 6px; }
+  .cal-hostrow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 6px 0; border-top: 1px solid var(--hairline); min-width: 0; }
+  .cal-hostrow b { overflow-wrap: anywhere; min-width: 0; }
+  .cal-hostrow label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+  .cal-hostrow select { max-width: 100%; min-width: 0; }
   .cal-drow .v { min-width: 0; overflow-wrap: anywhere; }
   .cal-drow a { color: var(--accent-text); }
   .cal-dnote { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }
@@ -916,6 +926,8 @@ async function refresh() {
       body.meetingLabels = cache.meetingLabels;
       body.meetingLabelMisses = cache.meetingLabelMisses;
       body.meetingFocus = cache.meetingFocus;
+      body.holidaySettings = cache.holidaySettings;
+      body.calendarOrgRules = cache.calendarOrgRules;
     }
     cache = body;
     if (typeof TurmaNav !== "undefined" && TurmaNav.noteSnapshot) TurmaNav.noteSnapshot(r);
@@ -970,7 +982,8 @@ function connectSSE() {
   });
   // Each org's Tenir label and the labels no org has (XERK-2638), and whose
   // work its meetings propose (XERK-2514).
-  for (const ev of ["meetingLabels", "meetingLabelMisses", "meetingFocus"]) {
+  // Each org's days off and calendar email domains, which its drawer edits (XERK-2929).
+  for (const ev of ["meetingLabels", "meetingLabelMisses", "meetingFocus", "holidaySettings", "calendarOrgRules"]) {
     es.addEventListener(ev, (e) => {
       let d;
       try { d = JSON.parse(e.data); } catch { return; }
@@ -978,11 +991,11 @@ function connectSSE() {
       labelsClock++;
       cache[ev] = d;
       renderBriefs(cache, Date.now());
+      if (ev === "holidaySettings" || ev === "calendarOrgRules") calendarSoon();
     });
   }
   // The calendar reads its own routes; these frames only say what changed.
   es.addEventListener("calendar", () => calendarSoon());
-  es.addEventListener("holidaySettings", () => calendarSoon());
   // A host going offline (or back) sends no calendar frame, only its agent record,
   // so the calendar's "<host> is offline" notice would wait for the next read
   // (rollup XERK-2921). Re-read only on an online FLIP: agent frames arrive every

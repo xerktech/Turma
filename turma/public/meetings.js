@@ -852,6 +852,89 @@ async function saveFocus(site, names, role) {
   return ok;
 }
 
+// ---- Days off + calendar email domains (XERK-2929) --------------------------------------
+// Per org: which holiday catalogs it follows and which of their days it takes off
+// (PUT /holidays, saved on each tick), and the email domains whose meetings are its
+// own on every calendar (POST /calendar-rules).
+const calBusy = new Set();       // `${kind}|${site}` with a save in flight
+const calErr = new Map();        // `${kind}|${site}` -> the hub's refusal
+const domainDrafts = new Map();  // site -> the domains being typed
+function setOwn(map, k, v) {
+  Object.defineProperty(map, k, { value: v, enumerable: true, writable: true, configurable: true });
+}
+function holidayRowHtml(data, s) {
+  const h = own(data.holidaySettings, s);
+  const cat = data.holidayCatalog && typeof data.holidayCatalog === "object" ? data.holidayCatalog : {};
+  const countries = h && Array.isArray(h.countries) ? h.countries : [];
+  const off = new Set(h && Array.isArray(h.off) ? h.off : []);
+  // aria-disabled, never disabled: a disabled box drops focus to <body> (turma-meetings.md).
+  const dis = calBusy.has(`hol|${s}`) ? ' aria-disabled="true"' : "";
+  const parts = [];
+  for (const code of Object.keys(cat).sort()) {
+    const c = cat[code] || {};
+    const on = countries.includes(code);
+    parts.push(`<label class="mt-hol-country"><input type="checkbox" data-hol-country="${esc(code)}" data-hol-site="${esc(s)}"${on ? " checked" : ""}${dis}> ${esc(c.name || code)} holidays</label>`);
+    if (!on) continue;
+    const list = Array.isArray(c.holidays) ? c.holidays : [];
+    parts.push(`<div class="mt-hol-days" role="group" aria-label="${esc(c.name || code)} days off">`
+      + list.map((x) => `<label><input type="checkbox" data-hol-off="${esc(x.id)}" data-hol-site="${esc(s)}"${off.has(x.id) ? " checked" : ""}${dis}> ${esc(x.name)}</label>`).join("")
+      + `</div>`);
+  }
+  const err = calErr.get(`hol|${s}`);
+  return parts.join("") + (err ? `<div class="mt-err-inline">${esc(err)}</div>` : "");
+}
+function domainsOf(data, s) {
+  const r = own(data && data.calendarOrgRules, s);
+  return r && Array.isArray(r.domains) ? r.domains.join(", ") : "";
+}
+function domainRowHtml(data, s) {
+  const v = domainDrafts.has(s) ? domainDrafts.get(s) : domainsOf(data, s);
+  const busy = calBusy.has(`dom|${s}`) ? "true" : "false";
+  const err = calErr.get(`dom|${s}`);
+  return `<div class="mt-label-row">`
+    + `<input class="mt-focus-names" data-cal-domains="${esc(s)}" value="${esc(v)}" maxlength="2000" spellcheck="false" autocomplete="off" placeholder="e.g. acme.com, acme.co.uk" aria-label="Email domains whose meetings are this org's">`
+    + `<button class="btn-sm" data-cal-domains-save="${esc(s)}" aria-disabled="${busy}">Save</button>`
+    + (err ? `<span class="mt-err-inline">${esc(err)}</span>` : "")
+    + `</div>`;
+}
+async function saveCal(kind, site, url, method, body, what, apply) {
+  const k = `${kind}|${site}`;
+  if (calBusy.has(k)) return false;
+  calBusy.add(k);
+  calErr.delete(k);
+  repaint(true);
+  let res = null, out = {};
+  try {
+    res = await fetch(url, { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    try { out = await res.json(); } catch { out = {}; }
+  } catch { res = null; }
+  calBusy.delete(k);
+  const ok = !!(res && res.ok);
+  if (!ok) {
+    const text = res ? TurmaNav.refusalText(what, res.status, out) : `${what} failed — the hub is unreachable`;
+    calErr.set(k, text);
+    TurmaNav.toast(text);
+  } else if (cache) apply(out);
+  repaint(true);
+  return ok;
+}
+function saveHolidays(site, patch) {
+  return saveCal("hol", site, `/api/orgs/${encodeURIComponent(site)}/holidays`, "PUT", patch, "Saving the days off", (out) => {
+    if (!out || !out.settings) return;
+    cache.holidaySettings = { ...(cache.holidaySettings || {}) };
+    setOwn(cache.holidaySettings, site, out.settings);
+  });
+}
+function saveDomains(site, text) {
+  const domains = String(text || "").split(/[\s,;]+/).map((x) => x.trim().toLowerCase().replace(/^@/, "")).filter(Boolean);
+  return saveCal("dom", site, `/api/orgs/${encodeURIComponent(site)}/calendar-rules`, "POST", { domains }, "Saving the email domains", (out) => {
+    domainDrafts.delete(site);
+    cache.calendarOrgRules = { ...(cache.calendarOrgRules || {}) };
+    if (out && out.rules) setOwn(cache.calendarOrgRules, site, out.rules);
+    else delete cache.calendarOrgRules[site];
+  });
+}
+
 // ---- the settings drawer (one org) ---------------------------------------------------
 function drawerHtml(data, v) {
   if (!drawer) return "";
@@ -870,19 +953,27 @@ function drawerHtml(data, v) {
     + (labeled ? sec("Tenir label", labelRowHtml(data, site),
       "This org's label in the meeting PC's capture.json (<code>\"org\"</code>).") : "")
     + (sched ? sec("Daily brief", sched) : "")
+    + (own(data.holidaySettings, site) ? sec("Days off", holidayRowHtml(data, site),
+      "Ticked holidays are shaded as days off on the Meetings calendar.") : "")
+    + (own(data.holidaySettings, site) ? sec("Calendar email domains", domainRowHtml(data, site),
+      "A meeting organized by (else, with invitees from only) these domains is this org's on every Outlook calendar. Empty clears.") : "")
     + `</aside>`;
 }
 
 // ---- paint -----------------------------------------------------------------------------
 function fieldIn(root) {
   const a = document.activeElement;
+  // A day-off box saves on its tick and holds no draft, so its focus never holds a repaint
+  // (it would sit stale through every SSE frame after a mouse tick; FOCUS_ATTRS restores it).
+  if (a && a.dataset && a.dataset.holSite !== undefined) return false;
   return !!a && !!root && root.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || "");
 }
 const editing = () => fieldIn($list);
 // What has focus, as keys that survive the swap: the page's own (hooks) first,
 // else one of this pane's controls by its data attribute.
 const FOCUS_ATTRS = ["search", "filter", "openCal", "orgToggle", "orgSettings", "entry", "showReviewed", "archive",
-  "drawerClose", "back", "labelSave", "labelReset", "focusSave", "focusClear", "missUse", "metaFocus"];
+  "drawerClose", "back", "labelSave", "labelReset", "focusSave", "focusClear", "missUse", "metaFocus",
+  "calDomains", "calDomainsSave", "holOff", "holCountry"];
 function focusKey(root = $list) {
   if (root === $list && hooks.focusKey) { const k = hooks.focusKey(); if (k) return { page: k }; }
   const a = document.activeElement;
@@ -1305,7 +1396,7 @@ function onKey(ev) {
 
 function onClick(ev) {
   const b = ev.target && ev.target.closest
-    ? ev.target.closest("[data-act],[data-meta-retry],[data-label-save],[data-label-reset],[data-miss-use],[data-focus-save],[data-focus-clear],"
+    ? ev.target.closest("[data-act],[data-meta-retry],[data-label-save],[data-label-reset],[data-miss-use],[data-focus-save],[data-focus-clear],[data-cal-domains-save],"
       + "[data-entry],[data-filter],[data-org-toggle],[data-org-settings],[data-drawer-close],[data-back],[data-show-reviewed],[data-archive],[data-open-cal]") : null;
   if (!b) return;
   const d = b.dataset;
@@ -1330,6 +1421,11 @@ function onClick(ev) {
   if (d.archive !== undefined) {
     if (b.getAttribute("aria-disabled") === "true") return;
     return void archive(d.archive, d.to === "true");
+  }
+  if (d.calDomainsSave !== undefined) {
+    if (b.getAttribute("aria-disabled") === "true") return;
+    const site = d.calDomainsSave;
+    return void saveDomains(site, domainDrafts.has(site) ? domainDrafts.get(site) : domainsOf(cache, site));
   }
   if (d.focusSave !== undefined || d.focusClear !== undefined) {
     if (b.getAttribute("aria-disabled") === "true") return;
@@ -1368,6 +1464,7 @@ function onInput(ev) {
   // focus), and focus + caret go back to it.
   if (d.search !== undefined) { query = String(t.value || ""); return void repaint(true); }
   if (d.label !== undefined) { labelDrafts.set(d.label, t.value); labelErr.delete(d.label); return; }
+  if (d.calDomains !== undefined) { domainDrafts.set(d.calDomains, t.value); calErr.delete(`dom|${d.calDomains}`); return; }
   if (d.focusNames !== undefined || d.focusRole !== undefined) {
     const site = d.focusNames ?? d.focusRole;
     const v = { ...(focusDrafts.get(site) || focusOf(cache, site)) };
@@ -1389,6 +1486,13 @@ function onChange(ev) {
   if (d.miss !== undefined) {
     if (t.value) missPick.set(d.miss, t.value); else missPick.delete(d.miss);
     return void repaint(true);
+  }
+  if (d.holSite !== undefined && (d.holCountry !== undefined || d.holOff !== undefined)) {
+    const site = d.holSite, h = own(cache && cache.holidaySettings, site) || { countries: [], off: [] };
+    if (calBusy.has(`hol|${site}`)) return void repaint(true);   // in flight: the repaint puts the tick back
+    const flip = (list, x) => (t.checked ? [...new Set([...list, x])] : list.filter((y) => y !== x));
+    return void saveHolidays(site, d.holCountry !== undefined ? { countries: flip(h.countries || [], d.holCountry) }
+      : { off: flip(h.off || [], d.holOff) });
   }
   if (d.project !== undefined) {
     setProject(d.project, t.value);

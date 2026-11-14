@@ -965,6 +965,85 @@ test("XERK-2934: a 24h+ timed event's band button aria-label names both ends", a
   assert.match(html, /aria-label="Holiday,[^"]*Thursday, November 12, all day/);
 });
 
+test("XERK-2929: per-host settings and the per-series org control post the hub's settings route", async () => {
+  const D = at(2027, 9, 14);
+  const hostRow = { host: "h1", device: "Box <1>", online: true, syncedAt: NOW, ranges: [[0, 4e12]],
+    org: "acme", orgs: ["acme", "auto", "beta"], defaultOrg: "", showPrivate: false };
+  const ev = { host: "h1", id: "G1:x", seriesId: "G1", recurring: true, org: "acme", source: "outlook", subject: "Weekly",
+    startMs: at(2027, 9, 14, 10), endMs: at(2027, 9, 14, 11), meetings: [] };
+  let answer = { ok: true, settings: {} };
+  replies = { "/api/calendar": () => ({ hosts: [hostRow], events: [ev] }), "/api/agents/": () => answer };
+  const fire = (name, ds, extra = {}) => { for (const fn of root.listeners[name]) fn({ target: { dataset: ds, closest: () => ({ dataset: ds }), ...extra } }); };
+  try {
+    cal.update({ agents: [{ key: "h1", org: "acme" }] });
+    let h = await show(D);
+    assert.match(h, /data-host-settings aria-expanded="false"/);
+    fire("click", { hostSettings: "" });
+    h = cal.calendarHtml();
+    assert.match(h, /<b>Box &lt;1&gt;<\/b>/);
+    assert.match(h, /<option value="" selected>Its own org \(acme\)<\/option><option value="acme">acme<\/option><option value="auto">auto<\/option><option value="beta">beta<\/option>/);
+    posts.length = 0;
+    fire("change", { hostDefault: "h1" }, { value: "beta" });
+    for (let i = 0; i < 6; i++) await tick();
+    fire("change", { hostPrivate: "h1" }, { checked: true });
+    for (let i = 0; i < 6; i++) await tick();
+    fire("change", { hostDefault: "h1" }, { value: "" });
+    for (let i = 0; i < 6; i++) await tick();
+    assert.deepEqual(posts.map((p) => [p.url, p.body]), [["/api/agents/h1/calendar/settings", { defaultOrg: "beta" }],
+      ["/api/agents/h1/calendar/settings", { showPrivate: true }], ["/api/agents/h1/calendar/settings", { defaultOrg: null }]]);
+    // The event panel: Automatic names the served org; a pick pins the whole series.
+    h = cal.detailHtml(ev, D);
+    assert.match(h, /data-series-org="h1\/G1%3Ax"/);
+    assert.match(h, /<option value="auto" selected>Automatic \(acme\)<\/option><option value="=acme">acme<\/option>/);
+    assert.doesNotMatch(h, /No org/, "no pinned-unassigned choice (XERK-2936)");
+    assert.match(h, /for the whole series/);
+    assert.match(cal.detailHtml({ ...ev, seriesOrg: "beta" }, D), /<option value="=beta" selected>beta/);
+    posts.length = 0;
+    fire("change", { seriesOrg: "h1/G1%3Ax" }, { value: "=beta" });
+    for (let i = 0; i < 6; i++) await tick();
+    fire("change", { seriesOrg: "h1/G1%3Ax" }, { value: "auto" });
+    for (let i = 0; i < 6; i++) await tick();
+    fire("change", { seriesOrg: "h1/G1%3Ax" }, { value: "=auto" });
+    for (let i = 0; i < 6; i++) await tick();
+    assert.deepEqual(posts.map((p) => p.body), [{ series: { id: "G1", org: "beta" } }, { series: { id: "G1", org: null } },
+      { series: { id: "G1", org: "auto" } }], "an org keyed \"auto\" is not the Automatic choice (QA)");
+    // An org keyed like the sentinel never collides with it.
+    const odd = cal.detailHtml(ev, D).replace(/\n/g, "");
+    assert.equal((odd.match(/ selected/g) || []).length, 1);
+    // Busy controls are aria-disabled, never disabled (focus would fall to <body>).
+    assert.doesNotMatch(cal.calendarHtml() + cal.detailHtml(ev, D), / disabled[ >]/);
+    // The pick shows at once, before the re-read (a focused select is not repainted by it).
+    await openEvent(D, "Weekly");
+    replies["/api/agents/"] = () => new Promise((r) => setTimeout(() => r({ ok: true, settings: {} }), 30));
+    const saving = cal.saveHost("h1", { series: { id: "G1", org: "beta" } });
+    assert.match(cal._els().info.innerHTML, /<option value="=beta" selected>/);
+    await saving;
+    assert.match(cal._els().info.innerHTML, /<option value="=beta" selected>/);
+    // A read landing while the select keeps focus still repaints it (it holds no draft).
+    globalThis.document = { activeElement: { tagName: "SELECT", inside: true, dataset: { seriesOrg: "h1/G1%3Ax" } } };
+    try {
+      const stale = (await (replies["/api/calendar"])()).events[0];
+      replies["/api/calendar"] = () => ({ hosts: [hostRow], events: [{ ...stale, seriesOrg: "acme" }] });
+      cal.refetch();
+      for (let i = 0; i < 6; i++) await tick();
+      assert.match(cal._els().info.innerHTML, /<option value="=acme" selected>/);
+      replies["/api/calendar"] = () => ({ hosts: [hostRow], events: [stale] });
+      cal.refetch();
+      for (let i = 0; i < 6; i++) await tick();
+    } finally { delete globalThis.document; }
+    // A refused pick is undone.
+    replies["/api/agents/"] = () => ({ status: 404, body: { error: "nope" } });
+    await cal.saveHost("h1", { series: { id: "G1", org: "acme" } });
+    assert.match(cal._els().info.innerHTML, /<option value="=beta" selected>/);
+    replies["/api/agents/"] = () => answer;
+    // A refusal is the hub's words, escaped, on the host's row.
+    answer = { status: 404, body: { error: "defaultOrg is not an <org>" } };
+    fire("change", { hostDefault: "h1" }, { value: "beta" });
+    for (let i = 0; i < 6; i++) await tick();
+    assert.match(cal.calendarHtml(), /Saving the calendar settings failed — defaultOrg is not an &lt;org&gt;/);
+  } finally { fire("click", { hostSettings: "" }); click({ closeDetail: "" }); }
+});
+
 test("XERK-2943: a short block still carries its time line; the drawn height (CSS) decides if it shows", async () => {
   cal.update({ agents: [] });
   replies = { "/api/calendar": () => ({ hosts: [], events: [

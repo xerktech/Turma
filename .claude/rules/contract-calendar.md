@@ -144,6 +144,11 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
   (host route, `principalMayDriveHost`); `defaultOrg`/`series.org` null clears, else must be a
   decided org of the host's tenant (404). ≤500 series overrides per host (oldest dropped).
 - They answer `{ok, rules}` / `{ok, settings}` and broadcast a `calendar` frame for the host(s) affected.
+- **Read back for the settings UI** (XERK-2929): rules ride `/api/agents` as `calendarOrgRules`
+  (`bySite`) + its own SSE frame; each `/api/calendar` `hosts[]` row carries `org` (decided),
+  `orgs` (what it may pick), `defaultOrg` ("" = none), `showPrivate`; an event the operator
+  pinned carries `seriesOrg` (only a pin that still counts). Web: Meetings drawer (days off, domains), calendar gear (host),
+  event panel (series). Android mirrors all three.
 
 ## The event store
 

@@ -6190,6 +6190,10 @@ function calendarEventWire(key, ev, orgs, hs) {
   // `meeting` (XERK-2936): a real meeting by the matcher's rule, judged BEFORE a private
   // event's attendees and join link are withheld, so clients never re-derive it.
   const out = { host: key, org: calendarEventOrg(key, ev, orgs, hs), ...ev, meeting: calendarLinkCandidate(ev) };
+  // The operator's per-series pick, so the event panel shows it (XERK-2929) — only a pin
+  // that still counts (calendarEventOrg skips one naming an org no host is in).
+  const so = hs && hs.seriesOrgs, sid = ev.seriesId || ev.id;
+  if (so && Object.hasOwn(so, sid) && orgs.includes(so[sid])) out.seriesOrg = so[sid];
   if ((ev.sensitivity === "private" || ev.sensitivity === "confidential") && !(hs && hs.showPrivate)) {
     Object.assign(out, { subject: "Private event", body: "", location: "", organizer: "",
       organizerEmail: "", attendees: [], joinUrl: "", categories: [], private: true });
@@ -6213,6 +6217,10 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       syncedAt: h ? h.syncedAt : 0, windowFrom: h ? h.windowFrom : 0, windowUntil: h ? h.windowUntil : 0,
       ranges: h ? h.ranges : [] };
     if (h && h.lastError) Object.assign(row, { lastError: h.lastError, lastErrorAt: h.lastErrorAt });
+    // Its settings and the orgs they may name, for the settings UI (XERK-2929).
+    const hs0 = calendarHostSettings[key];
+    Object.assign(row, { org: a ? decidedOrgOf(a) : "", orgs: calendarOrgsOfTenant(tenantOfKey(key)).sort(),
+      defaultOrg: (hs0 && hs0.defaultOrg) || "", showPrivate: !!(hs0 && hs0.showPrivate) });
     const covered = h && h.ranges.some((r) => r[0] <= from && r[1] >= until);
     if (!covered && row.online && calendarCapable(a)) {
       const queued = (a.commands || []).find((c) => c && c.type === "syncCalendar" && c.from <= from && c.until >= until);
@@ -6280,6 +6288,8 @@ function setCalendarOrgRules(siteKey, body) {
   if (d.length) calendarOrgRules[siteKey] = { domains: d };
   else delete calendarOrgRules[siteKey];
   persistCalendarOrgRules();
+  invalidateAgentsCache();
+  sseBroadcast("calendarOrgRules", calendarOrgRules);
   for (const k of Object.keys(calendarEvents)) if (tenantOfKey(k) === tenantOfSite(siteKey)) broadcastCalendarSoon(k);
   scheduleCalendarRelink(tenantOfSite(siteKey));
   return { status: 200, body: { ok: true, rules: d.length ? { domains: d } : null } };
@@ -10295,6 +10305,8 @@ function buildAgentsCache() {
     // meetings settings list as checkboxes: country -> {name, holidays:[{id, name}]}.
     holidaySettings: holidaySettingsWire(),
     holidayCatalog: holidays.catalogWire(),
+    // Each org's calendar email-domain rules (XERK-2929): siteKey -> {domains}.
+    calendarOrgRules,
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.

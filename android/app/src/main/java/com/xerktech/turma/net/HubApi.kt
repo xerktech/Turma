@@ -509,6 +509,31 @@ interface HubApi {
         @Body body: kotlinx.serialization.json.JsonObject,
     ): Response<kotlinx.serialization.json.JsonObject>
 
+    // An org's days off (XERK-2892): {countries} | {off}, each the full list.
+    // Answers {ok, settings} or the hub's {error}.
+    @PUT("api/orgs/{siteKey}/holidays")
+    suspend fun putHolidaySettings(
+        @Path("siteKey") siteKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): Response<kotlinx.serialization.json.JsonObject>
+
+    // An org's calendar email domains (XERK-2929): {domains: [...]}, [] clears.
+    // Answers {ok, rules | null} or the hub's {error}.
+    @POST("api/orgs/{siteKey}/calendar-rules")
+    suspend fun setCalendarOrgRules(
+        @Path("siteKey") siteKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): Response<kotlinx.serialization.json.JsonObject>
+
+    // A host's calendar settings (XERK-2929): {defaultOrg: site | null} |
+    // {showPrivate} | {series: {id, org: site | "" | null}}. Raw objects: a null
+    // must reach the wire. Answers {ok, settings} or the hub's {error}.
+    @POST("api/agents/{host}/calendar/settings")
+    suspend fun setCalendarHostSettings(
+        @Path("host") host: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): Response<kotlinx.serialization.json.JsonObject>
+
     // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
     // like the agent pin — an authoritative 200. Body: {enabled:true|false}.
     @POST("api/jira/{siteKey}/autostart")

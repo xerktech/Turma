@@ -100,7 +100,7 @@ class CalendarScreenTest {
      * Serve `/api/calendar` as the hub does: only the events overlapping the
      * asked range, so a week's answer never carries another week's meeting.
      */
-    private fun serve(online: Boolean, vararg events: String) {
+    private fun serve(online: Boolean, vararg events: String, hostExtra: String = "") {
         val rows = events.flatMap { TurmaJson.decodeFromString<kotlinx.serialization.json.JsonArray>("[$it]") }
             .map { it as JsonObject }
         hub.route("/api/calendar") { req ->
@@ -114,7 +114,7 @@ class CalendarScreenTest {
             }
             okhttp3.mockwebserver.MockResponse().setHeader("Content-Type", "application/json").setBody(
                 """{ "from": $from, "until": $until,
-                  "hosts": [ { "host": "h1", "device": "Desk", "online": $online, "syncedAt": 1, "ranges": [[0, 9000000000000000]] } ],
+                  "hosts": [ { "host": "h1", "device": "Desk", "online": $online, "syncedAt": 1, "ranges": [[0, 9000000000000000]]$hostExtra } ],
                   "events": ${kotlinx.serialization.json.JsonArray(hit)} }""",
             )
         }
@@ -315,5 +315,79 @@ class CalendarScreenTest {
         // The grid stays beside it.
         compose.onNodeWithTag("cal-range").assertExists()
         compose.onNode(event("Overlap")).assertExists()
+    }
+
+    // ---- Calendar settings (XERK-2929) -----------------------------------------------------
+
+    private val other = "p.atlassian.net"
+    private val settingsRow = """, "org": "$site", "orgs": ["$other", "$site"], "defaultOrg": "", "showPrivate": false"""
+
+    /** One Outlook event today on h1, with the host's settings row; [extra] adds event fields. */
+    private fun seedSettings(extra: String = "") {
+        hub.seedFleet("""{ "now": 1, "agents": [ $host ] }""")
+        serve(true, """
+            { "host": "h1", "org": "$site", "id": "E9", "seriesId": "S9", "source": "outlook", "subject": "Weekly sync",
+              "startMs": ${t(today, 10)}, "endMs": ${t(today, 11)}, "busy": "busy", "myResponse": "accepted"$extra }""",
+            hostExtra = settingsRow)
+        hub.json("/api/holidays", "[]")
+    }
+
+    private fun settingsBody(): String = hub.findRequest("/api/agents/h1/calendar/settings").body.readUtf8()
+
+    private fun awaitEnabled(tag: String) = compose.waitUntil(10_000) {
+        compose.onAllNodes(hasTestTag(tag) and androidx.compose.ui.test.isEnabled()).fetchSemanticsNodes().isNotEmpty()
+    }
+
+    @Test fun `the calendar's settings save each host's default org and private events`() {
+        seedSettings()
+        hub.json("/api/agents/h1/calendar/settings", """{ "ok": true, "settings": {} }""")
+        show()
+        awaitEvent("Weekly sync")
+        compose.onNodeWithTag("cal-settings").performClick()
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("Its own org (o)", substring = true).fetchSemanticsNodes().isNotEmpty() }
+
+        compose.onNodeWithTag("cal-host-default-h1").performClick()
+        compose.onNodeWithText("p").performClick()
+        assertEquals("""{"defaultOrg":"$other"}""", settingsBody())
+
+        // The first option goes back to the host's own org: an explicit null on the wire.
+        awaitEnabled("cal-host-default-h1")
+        compose.onNodeWithTag("cal-host-default-h1").performClick()
+        compose.onAllNodesWithText("Its own org (o)")[0].performClick()
+        assertEquals("""{"defaultOrg":null}""", settingsBody())
+
+        awaitEnabled("cal-host-private-h1")
+        compose.onNodeWithTag("cal-host-private-h1").performClick()
+        assertEquals("""{"showPrivate":true}""", settingsBody())
+    }
+
+    @Test fun `an event's Org picker pins its series to an org, with no No-org choice`() {
+        seedSettings()
+        hub.json("/api/agents/h1/calendar/settings", """{ "ok": true, "settings": {} }""")
+        show()
+        awaitEvent("Weekly sync")
+        compose.onNode(event("Weekly sync")).performScrollTo().performClick()
+        compose.onNodeWithText("Automatic (o)", substring = true).performClick()
+        // XERK-2936: every meeting has an org, so there is no pin to none.
+        assertEquals(0, compose.onAllNodesWithText("No org").fetchSemanticsNodes().size)
+        compose.onNodeWithText("p").performClick()
+        assertEquals("""{"series":{"id":"S9","org":"$other"}}""", settingsBody())
+    }
+
+    @Test fun `a pinned series goes back to Automatic, and a refusal reads in the hub's words`() {
+        seedSettings(""", "recurring": true, "seriesOrg": "$other" """)
+        hub.route("/api/agents/h1/calendar/settings") { HubHarness.refusal("that series is not on this host's calendar", 404) }
+        val cvm = calendarVm()
+        show(cvm)
+        awaitEvent("Weekly sync")
+        compose.onNode(event("Weekly sync")).performScrollTo().performClick()
+        compose.onNodeWithText("for the whole series").assertExists()
+        val message = hub.expectMessage(cvm.messages)
+        compose.onNodeWithTag("cal-series-org").performClick()
+        compose.onNodeWithText("Automatic").performClick()
+        assertEquals("""{"series":{"id":"S9","org":null}}""", settingsBody())
+        val want = "Setting the meeting's org failed — that series is not on this host's calendar"
+        assertEquals("✗ $want", message())
+        compose.waitUntil(5_000) { compose.onAllNodesWithText(want).fetchSemanticsNodes().isNotEmpty() }
     }
 }
