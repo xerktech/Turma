@@ -1047,7 +1047,7 @@ function mount(el, opts = {}) {
   const mq = typeof window !== "undefined" && window.matchMedia ? window.matchMedia(`(max-width: ${NARROW_PX - 1}px)`) : null;
   narrow = !!(mq && mq.matches);
   if (mq && mq.addEventListener) mq.addEventListener("change", (e) => { narrow = !!e.matches; paint(true); });
-  if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("resize", refit);
+  if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("resize", () => refit());  // never pass the Event as `keep`
   $root.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest
       ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail],"
