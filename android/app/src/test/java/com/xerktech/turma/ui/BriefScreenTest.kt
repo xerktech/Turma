@@ -268,6 +268,43 @@ class BriefScreenTest {
     }
 
     @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `wide keeps a tapped entry through an empty refresh`() {
+        hub.seedFleet(twoOrgs())
+        show(wide = true)
+        waitFor("Item of Alpha sync")
+        open("Zed sync")
+        waitFor("Item of Zed sync")
+        // A refresh listing nothing must not drop the pick back to the first entry.
+        hub.seedFleet("""{ "now": 1, "agents": [] }""")
+        waitGone("Zed sync")
+        hub.seedFleet(twoOrgs())
+        waitFor("Zed sync")
+        compose.waitForIdle()
+        compose.onNodeWithText("Item of Zed sync").assertExists()
+        compose.onNodeWithText("Item of Alpha sync").assertDoesNotExist()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
+    @Test fun `a fold drops a push still waiting for its org`() {
+        hub.seedFleet("""{ "now": 1, "agents": [] }""")
+        var push by mutableStateOf<String?>("a.atlassian.net")
+        var wide by mutableStateOf(true)
+        val vm = main.track(BriefViewModel(hub.app))
+        val mvm = main.track(MeetingsViewModel(hub.app))
+        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, wide = wide, openSite = push, onOpened = { push = null }) }
+        compose.waitForIdle()
+        assertEquals("a.atlassian.net", push)
+        wide = false
+        compose.waitForIdle()
+        hub.seedFleet(twoOrgs())
+        waitFor("Zed sync")
+        assertEquals(null, push)
+        wide = true
+        waitFor("Item of Alpha sync")
+        compose.onNodeWithText("Item of Zed sync").assertDoesNotExist()
+    }
+
+    @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
     @Test fun `wide drops a push for an org out of scope instead of holding it`() {
         hub.seedFleet(twoOrgs())
         hub.container.org.set(setOf("b.atlassian.net"))
