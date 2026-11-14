@@ -1,5 +1,6 @@
 package com.xerktech.turma.core
 
+import java.text.Normalizer
 import java.util.Locale
 
 /**
@@ -33,23 +34,41 @@ object Uploads {
      */
     const val MAX_PER_MESSAGE = 10
 
-    private val BAD_NAME = Regex("[^A-Za-z0-9._ ()+\\-]")
-    private const val NAME_MAX = 100
+    /** Controls, format/bidi/zero-width, variation selectors: dropped outright. */
+    private val INVISIBLE = Regex("[\\p{Cc}\\p{Cf}\\u034F\\uFE00-\\uFE0F\\x{E0100}-\\x{E01EF}]")
+    /** Anything but letters, digits, marks of any script and `._ ()+-`: "_". */
+    // Nd/Nl, not all of N: superscript digits would let "COM¹.txt" (a Windows device) through.
+    private val BAD_NAME = Regex("[^\\p{L}\\p{Nd}\\p{Nl}\\p{Mn}\\p{Mc}._ ()+\\-]")
+    private const val NAME_MAX = 100        // code points
+    private const val NAME_MAX_BYTES = 240  // UTF-8 (ext4: 255, less the agent's dedup suffix)
+
+    private fun utf8Len(s: String) = s.toByteArray(Charsets.UTF_8).size
 
     /**
      * A filename safe to send as the upload's `name`. The hub sanitizes too (and
      * the agent again, since a name off the wire is joined onto a path), but
      * doing it here means the chip shows the name the file will land under
-     * rather than one the hub silently rewrote. Port of `safeUploadName`.
+     * rather than one the hub silently rewrote. Port of `safeUploadName`:
+     * non-ASCII letters survive (XERK-2947), and lengths count code points so a
+     * cut never splits a surrogate pair.
      */
     fun sanitizeUploadName(name: String?): String {
         var s = (name ?: "").substringAfterLast('/').substringAfterLast('\\')
+        s = INVISIBLE.replace(s, "")
+        // NFC after the drop, so a second pass (the hub's, the agent's) is a no-op.
+        s = Normalizer.normalize(s, Normalizer.Form.NFC)
         s = BAD_NAME.replace(s, "_")
-        s = Regex("\\s+").replace(s, " ").trim().trimStart('.').trim()
-        if (s.length > NAME_MAX) {
-            val dot = s.lastIndexOf('.')
-            val ext = if (dot > 0 && s.length - dot <= 12) s.substring(dot) else ""
-            s = s.take(NAME_MAX - ext.length) + ext
+        // Dots and spaces off the front together: ". .bashrc" is not a dotfile.
+        s = Regex("\\s+").replace(s, " ").trimStart('.', ' ').trim()
+        val cps = s.codePoints().toArray()
+        if (cps.size > NAME_MAX || utf8Len(s) > NAME_MAX_BYTES) {
+            val dot = cps.lastIndexOf('.'.code)
+            val ext = if (dot > 0 && cps.size - dot <= 12) cps.copyOfRange(dot, cps.size) else IntArray(0)
+            val extStr = String(ext, 0, ext.size)
+            var n = minOf(cps.size, NAME_MAX - ext.size)
+            val budget = NAME_MAX_BYTES - utf8Len(extStr)
+            while (n > 0 && utf8Len(String(cps, 0, n)) > budget) n--
+            s = (String(cps, 0, n) + extStr).trim()  // a cut can end on a space
         }
         return s.ifEmpty { "upload" }
     }

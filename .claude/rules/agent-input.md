@@ -271,6 +271,18 @@ composed.**
   sides (joined onto a path); a transfer failure is NAMED, never dropped. **`uploadMaxBytes` is the
   cap AND the capability flag**: an agent reporting none drops uploads untold, so the hub refuses and
   composers hide the 📎. Tests: `TestStoreUploads`, `TestSendInputUploads`, `UploadsTest`.
+- **Upload names keep letters of any script (XERK-2947)**: hub `safeUploadName`, agent
+  `safe_upload_name` and android `sanitizeUploadName` are one rule and share one test table.
+  - DROP invisibles (Cc, Cf, variation selectors, U+034F), THEN NFC, then map anything but
+    L/Nd/Nl/Mn/Mc and `._ ()+-` to `_`. NFC before the drop breaks idempotence (the agent's
+    re-sanitize recomposes, so chip != landing name). No `No`: `COM¹` is a Windows device.
+    Enclosing marks and variation selectors are `_SLICE_UNSAFE_RE` material, invisible on a chip.
+  - Must stay idempotent (each side re-sanitizes the last): strip `[. ]` off the front together
+    (`. .bashrc`), trim after a cut. Tests assert `f(f(x)) == f(x)` on the shared table.
+  - Cut at 100 CODE POINTS and 240 UTF-8 bytes (ext4: 255, less the dedup `-<8hex>`), never
+    UTF-16 units — a JS/Kotlin `.slice` on length splits a surrogate pair.
+  - Runtimes' Unicode tables differ at the margin (node 24 / py 3.12 / JDK 17 = Unicode 16/15/13):
+    a just-assigned letter the agent's table lacks lands as `_` though the chip shows it.
 
 ## Machine messages through the bridge mod (XERK-2135)
 
