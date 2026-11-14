@@ -261,11 +261,11 @@ ready-for-review, ended sessions, composer, terminal.
 See `.claude/rules/turma-insights.md` — the sub-pages (decisions, permission prompts, model
 quality), the decisions log, and what is left of the retired org brief.
 
-## Daily Brief page (`/brief`)
+## Daily Brief (on the Meetings page, `/meetings`)
 
 See `.claude/rules/turma-daily-brief.md` — per-org read-aloud brief, Run now, the schedule editor.
 
-## Meetings (Brief page's Meetings pane, XERK-2510 / XERK-2623)
+## Meetings page (`/meetings`, XERK-2510 / XERK-2623 / XERK-2893)
 
 See `.claude/rules/turma-meetings.md` — review of the work items proposed from a Tenir meeting.
 

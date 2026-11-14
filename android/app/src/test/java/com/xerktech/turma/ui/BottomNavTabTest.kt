@@ -49,15 +49,17 @@ class BottomNavTabTest {
         // Mirrors nav.js PAGES (pinned by turma/tests/nav.test.js) minus the web-only
         // Insights page (XERK-2386); the bar renders TopDest.entries in declaration order.
         assertEquals(
-            listOf("dashboard", "sessions", "board", "brief", "usage"),
+            listOf("dashboard", "sessions", "board", "meetings", "usage"),
             TopDest.entries.map { it.route },
         )
     }
 
-    @Test fun `a meetings push opens Brief on its org, nothing else does`() {
-        // XERK-2858: #brief, #meetings and /meetings all land on the one triage list.
-        assertEquals("o.atlassian.net", deepLinkBrief("/brief?site=o.atlassian.net#meetings"))
+    @Test fun `a meetings push opens Meetings on its org, nothing else does`() {
+        // XERK-2893: the hub now sends /meetings; an older hub's /brief (any fragment) still lands.
         assertEquals("o.atlassian.net", deepLinkBrief("/meetings?site=o.atlassian.net"))
+        assertEquals("", deepLinkBrief("/brief"))
+        assertEquals(null, deepLinkBrief("/briefx"))
+        assertEquals("o.atlassian.net", deepLinkBrief("/brief?site=o.atlassian.net#meetings"))
         assertEquals("o/acme", deepLinkBrief("/brief?x=1&site=o%2Facme"))
         assertEquals("", deepLinkBrief("/meetings"))
         assertEquals("", deepLinkBrief("/brief#brief"))

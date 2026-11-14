@@ -5,8 +5,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Analytics
+import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.GridView
-import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.ViewKanban
 import androidx.compose.material3.Icon
@@ -30,9 +30,9 @@ enum class TopDest(val route: String, val label: String, val icon: ImageVector) 
     DASHBOARD("dashboard", "Dashboard", Icons.Filled.GridView),
     SESSIONS("sessions", "Sessions", Icons.Filled.Terminal),
     BOARD("board", "Board", Icons.Filled.ViewKanban),
-    // The Daily Brief (XERK-2397), the web's Brief page; between Board and Usage
-    // by operator choice.
-    BRIEF("brief", "Brief", Icons.Filled.RecordVoiceOver),
+    // The web's Meetings page (XERK-2893; was Brief, XERK-2397): the meetings
+    // triage with the Daily Brief folded in. Between Board and Usage by operator choice.
+    MEETINGS("meetings", "Meetings", Icons.Filled.CalendarMonth),
     USAGE("usage", "Usage", Icons.Filled.Analytics),
 }
 

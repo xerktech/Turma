@@ -1,4 +1,4 @@
-// Meetings triage (XERK-2510; the Brief page's one pane since XERK-2857): every
+// Meetings triage (XERK-2510; the Meetings page's one pane since XERK-2857): every
 // org's meetings and daily briefs in a two-pane triage. The rail groups entries
 // by org (collapsible) and date; the main pane works one entry at a time: a
 // meeting's proposals, or a daily meeting's brief with that meeting's proposals.

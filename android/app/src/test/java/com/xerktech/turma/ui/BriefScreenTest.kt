@@ -38,7 +38,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 /**
- * The Brief tab's Daily brief, folded into each org's daily-meeting entry
+ * The Meetings tab's Daily brief, folded into each org's daily-meeting entry
  * (XERK-2858), and the per-org settings panel. Times are relative to the
  * real clock: the screen reads it, as the phone does.
  */

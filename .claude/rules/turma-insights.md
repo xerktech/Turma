@@ -26,7 +26,7 @@ paths:
   still DROPS an older agent's `briefRender`/`briefNarratives` (kept in `HEARTBEAT_KNOWN_KEYS`)
   and `normalizeRecord` strips them from a restored record too. An existing `/data/briefs.json`
   is ignored.
-  - `/brief` is now the meeting-scheduled Daily Brief's page: `turma-daily-brief.md`.
+  - `/brief` now redirects to `/meetings`, home of the Daily Brief: `turma-daily-brief.md`.
 - Tests: the `XERK-2386:` cases in `insights.test.js` and `server.test.js`; `nav.test.js`.
 
 ## The decisions log (XERK-1574)

@@ -5,13 +5,15 @@ paths:
 ---
 
 <!-- The page's triage layout (rail, entries, drawer) is meetings.js: `turma-meetings.md`. -->
-# The Daily Brief page (`/brief`, XERK-2396, XERK-2857)
+# The Daily Brief on the Meetings page (`/meetings`, XERK-2396, XERK-2857, XERK-2893)
 
 The web surface of the Daily Brief (epic XERK-2390). The wire it reads is
 `contract-daily-brief.md`; this file is the brief's own rules on the page.
 
-- `/brief` (nav `brief`, after Board) serves `brief.html`. The URL was the retired org brief's
-  (XERK-2386), so an old bookmark lands here.
+- `/meetings` (nav `meetings`, label "Meetings", after Board) serves `brief.html` (XERK-2893).
+  `/brief` and `/brief.html` 302 → `/meetings<query>` so bookmarks and older pushes still land.
+  - The file keeps its name: renaming it means HASHED_ASSETS, routes and tests move together.
+  - The Daily Brief keeps its name INSIDE the page; only the page/tab is called Meetings.
 - **The page is one triage painted by `meetings.js`** (XERK-2857); `brief.html` owns the snapshot,
   the SSE and the brief's state, and hands the triage hooks: `briefHtml(site, entry)` (the brief
   block of a daily entry), `scheduleHtml(site)` (the drawer's editor), `nextOf`, `focusKey` /
@@ -52,6 +54,6 @@ The web surface of the Daily Brief (epic XERK-2390). The wire it reads is
 - Every served string is escaped (model text, host, model, error, org name, site key, title).
 - Live via the `dailyBriefs` / `dailyBriefSchedules` / `meetingProposals` / label / focus SSE
   frames (whole maps); a snapshot fetch merges, never replaces (XERK-444 clocks, one per map).
-- Android's Brief tab (XERK-2858) is its counterpart, triage and two-pane wide layout included
+- Android's Meetings tab (XERK-2858) is its counterpart, triage and two-pane wide layout included
   (`android/PARITY.md`); a change to what a reader sees here goes to `BriefScreen.kt` too.
-- Tests: `turma/tests/brief.test.js`; the `/brief` case in `server.test.js` (XERK-2386 test).
+- Tests: `turma/tests/brief.test.js`; the `/meetings` cases in `server.test.js` (XERK-2386, XERK-2893 tests).
