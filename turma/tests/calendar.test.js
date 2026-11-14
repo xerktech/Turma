@@ -20,7 +20,7 @@ globalThis.location = { href: "" };
 globalThis.fetch = async (u) => {
   const url = String(u);
   const key = Object.keys(replies).find((k) => url.startsWith(k));
-  const body = key ? replies[key](url) : (url.startsWith("/api/holidays") ? [] : { events: [], hosts: [] });
+  const body = await (key ? replies[key](url) : (url.startsWith("/api/holidays") ? [] : { events: [], hosts: [] }));
   // A reply of {status, body} is a refusal.
   if (body && body.status) return { status: body.status, ok: false, json: async () => body.body || {} };
   return { status: 200, ok: true, json: async () => body };
@@ -328,31 +328,48 @@ test("XERK-2897: failures back off; showing again asks at once; a dropped week i
   orgKeys = [];
 });
 
-test("XERK-2897: Esc closes the detail from the calendar or <body>, never under a dialog or a handled key", async () => {
+test("XERK-2897: Esc closes the detail from anywhere, never under a shown modal or a handled key", async () => {
   replies = { "/api/calendar": () => ({ hosts: [], events: [{ host: "h1", id: "e", org: "", subject: "Esc me",
     startMs: at(2027, 9, 8, 9), endMs: at(2027, 9, 8, 10) }] }) };
   cal.refetch();
   const html = await show(at(2027, 9, 8));
   const btn = /data-ev="(\d+)" data-day="(\d+)"/.exec(html);
   const open = () => { for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset: { ev: btn[1], day: btn[2] } }) } }); };
-  const esc = (target, extra = {}) => { for (const f of root.listeners.keydown) f({ key: "Escape", target, preventDefault() {}, ...extra }); };
-  const body = {};
-  let modal = null;
-  globalThis.document = { body, documentElement: {}, querySelector: () => modal };
+  const esc = (extra = {}) => { for (const f of root.listeners.keydown) f({ key: "Escape", target: {}, preventDefault() {}, ...extra }); };
+  let shown = null;
+  // Only a SHOWN modal counts: the New-ticket panel is always in the DOM, hidden.
+  globalThis.document = { querySelector: (sel) => (sel.includes(":not([hidden])") ? shown : {}) };
   try {
     open();
-    esc({ inside: false });                                  // focus in the header / another widget
-    assert.ok(cal._state().detail, "an Esc meant for something else");
-    modal = {};
-    esc(body);
-    assert.ok(cal._state().detail, "a dialog is open: its Esc");
-    esc({ inside: true }, { defaultPrevented: true });
-    assert.ok(cal._state().detail, "already handled");
-    modal = null;
-    esc(body);
-    assert.equal(cal._state().detail, null, "from <body> after a click elsewhere");
-    open();
-    esc({ inside: true });
-    assert.equal(cal._state().detail, null, "from inside the calendar");
+    shown = {};
+    esc();
+    assert.ok(cal._state().detail, "a shown modal owns the Esc");
+    shown = null;
+    esc({ defaultPrevented: true });
+    assert.ok(cal._state().detail, "a menu or modal already handled it");
+    esc();
+    assert.equal(cal._state().detail, null, "from anywhere else (header, body, the calendar)");
   } finally { delete globalThis.document; }
+});
+
+test("XERK-2897: a read the frame dropped is not retried off screen", { timeout: 10000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const week = cal.weekStart(at(2027, 11, 3));
+  const asked = [];
+  let release;
+  replies = { "/api/calendar": (url) => {
+    if (!url.includes(`from=${week}&`)) return { hosts: [], events: [] };
+    asked.push(url);
+    return new Promise((r) => { release = r; });
+  } };
+  cal.refetch();
+  await show(at(2027, 11, 3));
+  assert.equal(asked.length, 1);
+  await show(cal.addDays(at(2027, 11, 3), 21));            // browse away; that week is off screen
+  cal.refetch();                                           // ...and a frame drops it
+  release({ status: 503, body: { error: "slow and failed" } });
+  for (let i = 0; i < 6; i++) await tick();
+  t.mock.timers.tick(60000);
+  for (let i = 0; i < 6; i++) await tick();
+  assert.equal(asked.length, 1, "the dropped week's failure arms no retry");
 });

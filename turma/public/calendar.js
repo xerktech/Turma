@@ -18,6 +18,7 @@ const WORK_FROM_H = 8, WORK_UNTIL_H = 17;  // the shaded working hours; the grid
 const MIN_LAYOUT_MIN = 20;          // a shorter (or zero-length) event lays out as 20 minutes (one readable line)
 const NARROW_PX = 760;
 const RETRY_PENDING_MS = 20000;     // a sync the hub queued: re-read in case its frame is missed
+const MODAL_OPEN = '.td-backdrop:not([hidden]) > [aria-modal="true"], .img-lightbox.open[aria-modal="true"], dialog[open]';
 const RETRY_ERROR_MAX_MS = 300000;  // a failed read's longest back-off
 const MODE_KEY = "turma-calendar-mode";
 
@@ -563,13 +564,10 @@ function neighbour(btn, key) {
 function onKey(ev) {
   if (!active || !ev || ev.defaultPrevented) return;
   if (ev.key === "Escape") {
-    // Ours only from inside the calendar, or from nowhere (focus on <body> after a
-    // click elsewhere) with no dialog open: the Esc of a modal or menu is theirs.
-    const t = ev.target;
-    const inside = t && $root && $root.contains && $root.contains(t);
-    const nowhere = !t || (typeof document !== "undefined" && (t === document.body || t === document.documentElement));
-    if (!inside && !(nowhere && !(typeof document !== "undefined" && document.querySelector
-      && document.querySelector("[aria-modal=true],dialog[open]")))) return;
+    // A menu or modal that took the Esc marks it handled (org.js, newticket.js, which
+    // listen before us); a SHOWN modal (backdrop not hidden) owns it regardless.
+    // The New-ticket panel stays in the DOM while hidden, so presence alone is no test.
+    if (typeof document !== "undefined" && document.querySelector && document.querySelector(MODAL_OPEN)) return;
     if (picker !== null) { picker = null; paint(true); focusQ("[data-open-picker]"); ev.preventDefault(); return; }
     if (detail) { closeDetail(); ev.preventDefault(); return; }
     return;

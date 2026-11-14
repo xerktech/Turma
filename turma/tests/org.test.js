@@ -224,7 +224,8 @@ function mountOrg({ storedOrg = null, storedBoardOrg = null, storedSites = null 
   };
   const doc = {
     getElementById: (id) => (id === "hdrOrg" ? slot : null),
-    addEventListener() {},
+    _listeners: {},
+    addEventListener(t, fn) { (this._listeners[t] ||= []).push(fn); },
   };
   global.localStorage = {
     getItem: (k) => (k in store ? store[k] : null),
@@ -243,7 +244,7 @@ function mountOrg({ storedOrg = null, storedBoardOrg = null, storedSites = null 
     };
     for (const fn of slot._listeners.click || []) fn({ target });
   };
-  return { slot, store, click };
+  return { slot, store, click, doc };
 }
 
 test("org: a stored pick is read at mount, and applies once its org reports", () => {
@@ -494,6 +495,18 @@ test("org: a repaint with no focused control focuses nothing", () => {
   slot.querySelector = () => { asked++; return { focus() { throw new Error("focused"); } }; };
   click("data-org-toggle", "");
   assert.equal(asked, 0);
+});
+
+test("org: Esc closing the open menu is marked handled; a shut menu leaves it (XERK-2897)", () => {
+  const { slot, click, doc } = mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")] });
+  const esc = () => { const ev = { key: "Escape", prevented: false, preventDefault() { this.prevented = true; } };
+    for (const fn of doc._listeners.keydown || []) fn(ev); return ev; };
+  assert.equal(esc().prevented, false, "shut: the page's own Esc");
+  click("data-org-toggle", "");
+  assert.match(slot.innerHTML, /org-menu/);
+  assert.equal(esc().prevented, true);
+  assert.doesNotMatch(slot.innerHTML, /org-menu/);
 });
 
 test("org: the auto switch flips optimistically and rolls back on a failed POST", async () => {

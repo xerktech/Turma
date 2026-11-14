@@ -135,6 +135,9 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   (`detailHtml`) that the detail ticket (XERK-2898) replaces.
 - Keyboard: events are buttons in day order; ↑/↓ within a day, ←/→ to the nearest event of the
   next day, Esc closes the picker / panel. Every event carries an aria-label sentence.
+- **Esc listens on the document** (so it works after a click elsewhere) and yields to a SHOWN
+  modal (`MODAL_OPEN`) or an Esc already `defaultPrevented`. Never test a modal's mere presence:
+  `#createPanel[aria-modal]` stays in the DOM while hidden (QA).
 - Every served string is escaped (subject, location, organizer, device, error, holiday, org);
   a join link is rebuilt only from an `https://` URL (`safeHttps`); an org color is inlined only
   as `var(--sN)` (`safeColor`).

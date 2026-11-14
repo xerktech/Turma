@@ -399,7 +399,10 @@
       }
     });
     backdrop.addEventListener("click", (e) => { if (e.target === backdrop) requestCloseCreate(); });
-    doc.addEventListener("keydown", (e) => { if (e.key === "Escape" && createState) requestCloseCreate(); });
+    doc.addEventListener("keydown", (e) => {
+      // Marked handled, so a page's own Esc (the calendar's panel behind) leaves it to the modal.
+      if (e.key === "Escape" && createState) { e.preventDefault(); requestCloseCreate(); }
+    });
     // Tab stays inside whichever page modal is open — this one, or the page's
     // own (board panels, Add host) — see board.js trapModalTab (XERK-2676).
     const B = board();
