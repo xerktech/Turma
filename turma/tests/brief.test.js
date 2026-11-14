@@ -40,8 +40,17 @@ function makeEl() {
 // `reply(url, init)` answers each fetch: a body for 200, {status, body} for a
 // refusal, or a Promise (resolving to a body) to hold the answer. `agents`, when
 // given, answers the boot's /api/agents the same way; else that never lands.
-function loadPage(reply = null, agents = null, hash = "") {
+function loadPage(reply = null, agents = null, hash = "", { search = "", store = {} } = {}) {
   const els = {};
+  let calendarRefetches = 0;
+  const calendarActive = [];
+  const viewButtons = ["calendar", "notes"].map((v) => {
+    const b = makeEl();
+    b.dataset.view = v;
+    b.attrs = {};
+    b.setAttribute = (k, val) => { b.attrs[k] = val; };
+    return b;
+  });
   const meetings = { mounted: null, updates: [], pending: 0 };
   const sse = [];
   const winListeners = {};
@@ -53,13 +62,13 @@ function loadPage(reply = null, agents = null, hash = "") {
   const document = {
     getElementById(id) { return (els[id] ||= makeEl()); },
     createElement() { return makeEl(); },
-    querySelector() { return null; }, querySelectorAll() { return []; },
+    querySelector() { return null; }, querySelectorAll(sel) { return sel === "[data-view]" ? viewButtons : []; },
     addEventListener: noop, removeEventListener: noop,
     body: makeEl(), documentElement: makeEl(), activeElement: null,
   };
   const stubs = {
     document,
-    location: { href: "", search: "", pathname: "/brief", hash },
+    location: { href: "", search, pathname: "/brief", hash },
     navigator: { userAgent: "node", clipboard: { writeText: async (t) => { clip.push(t); } } },
     fetch: (u, init = {}) => {
       // A page that loops on a route would starve the runner: past 50 calls it
@@ -98,7 +107,9 @@ function loadPage(reply = null, agents = null, hash = "") {
     TurmaOrg: { getKeys: () => [], update: noop, subscribe: noop, sse: noop },
     TurmaBoard: { bareKey: require("../public/board.js").bareKey, orgName: (k, o) => o || k, mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
-    localStorage: { getItem: () => null, setItem: noop },
+    // The Calendar view (XERK-2897) has its own suite (calendar.test.js); here it only records.
+    TurmaCalendar: { mount: noop, update: noop, refetch: () => { calendarRefetches++; }, setActive: (on) => { calendarActive.push(on); } },
+    localStorage: { getItem: (k) => store[k] ?? null, setItem: (k, v) => { store[k] = String(v); } },
   };
   const mkeys = Object.keys(stubs);
   new Function(...mkeys, meetingsScript)(...mkeys.map((k) => stubs[k]));
@@ -117,7 +128,7 @@ function loadPage(reply = null, agents = null, hash = "") {
   const list = els.meetingList;
   // What a test puts "inside" the list: the focused element counts as inside.
   list.contains = (el) => !!el && el.inside === true;
-  return Object.assign(api, { meetings, els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document, window: stubs.window,
+  return Object.assign(api, { viewButtons, calendarActive, store, calendarRefetches: () => calendarRefetches, meetings, els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document, window: stubs.window,
     list: () => list.innerHTML, fire: (name, data) => sse[0].handlers[name]({ data: JSON.stringify(data) }) });
 }
 
@@ -798,4 +809,36 @@ test("a brief written on a tenant host names the host without the tenant", () =>
   assert.match(h, /Writing a brief on k8x-02… started/);
   assert.match(h, /on k8x-02</);
   assert.doesNotMatch(h, /77778a16/);
+});
+
+test("XERK-2897: the Calendar / Notes review switch shows one view, remembers the pick, and a push link opens the notes", () => {
+  const P = loadPage();
+  // First visit: the calendar.
+  assert.equal(P.els.calendarView.hidden, false);
+  assert.equal(P.els.meetingList.hidden, true);
+  assert.equal(P.els.notesNote.hidden, true);
+  assert.deepEqual(P.calendarActive, [true]);
+  assert.equal(P.viewButtons[0].attrs["aria-pressed"], "true");
+  // Picking Notes review swaps the panes, stops the calendar and is remembered.
+  P.viewButtons[1].listeners.click[0]();
+  assert.equal(P.els.calendarView.hidden, true);
+  assert.equal(P.els.meetingList.hidden, false);
+  assert.equal(P.els.notesNote.hidden, false);
+  assert.deepEqual(P.calendarActive, [true, false]);
+  assert.equal(P.store["turma-meetings-view"], "notes");
+  assert.equal(P.viewButtons[1].attrs["aria-pressed"], "true");
+  // The next visit opens on it.
+  assert.equal(loadPage(null, null, "", { store: { "turma-meetings-view": "notes" } }).els.meetingList.hidden, false);
+  // A proposals push (`/meetings?site=…`) opens the notes review whatever was picked.
+  const pushed = loadPage(null, null, "", { search: `?site=${SITE}`, store: { "turma-meetings-view": "calendar" } });
+  assert.equal(pushed.els.meetingList.hidden, false);
+  // Unusable storage falls back to the calendar.
+  assert.equal(loadPage(null, null, "", { store: { "turma-meetings-view": "bogus" } }).els.calendarView.hidden, false);
+});
+
+test("XERK-2897: the hub's calendar and holidaySettings frames ask the calendar to re-read", () => {
+  const P = loadPage();
+  P.fire("calendar", { h1: { syncedAt: 1 } });
+  P.fire("holidaySettings", {});
+  assert.equal(P.calendarRefetches(), 2);
 });
