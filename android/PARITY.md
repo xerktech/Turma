@@ -746,6 +746,10 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     Outlook subject with its time + invitees, Impromptu, Open in calendar.
   - Platform differences: no keyboard walking (←/→/↑/↓, Esc) and no A/S/E/R/J/K in the panel;
     the date picker is Material's, not the web's mini-month.
+  - On for every org, no feature flag (XERK-2901). A host going offline or back re-reads the
+    open week on both clients (the hub's `calendar` frame), so the stale-host notice is live.
+  - Not on either client yet: the calendar settings (holiday days off, org domain rules, a
+    host's default org / show private / per-series org) — XERK-2929, web and Android together.
 
 ## Open (subsequent installments), by screen and priority
 

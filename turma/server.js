@@ -6134,7 +6134,28 @@ function calendarOnBeat(key, prev, next, rows, now = Date.now()) {
   }
   if (!calendarCapable(next)) return;
   const wasLive = prev && calendarCapable(prev) && prev.lastSeen && now - prev.lastSeen <= OFFLINE_AFTER_MS;
-  if (!wasLive) queueCalendarSync(key, now - CALENDAR_PAST_MS, now + CALENDAR_FUTURE_MS);
+  if (!wasLive) {
+    queueCalendarSync(key, now - CALENDAR_PAST_MS, now + CALENDAR_FUTURE_MS);
+    // Back online: open pages drop the stale notice now, not when the resync lands.
+    calendarOfflineSent.delete(key);
+    if (calendarEvents[key]) broadcastCalendarSoon(key);
+  }
+}
+// A host crossing to offline sends its `calendar` frame (XERK-2901): `online` rides only
+// the GET /api/calendar answer, so without a frame an open page never re-reads and
+// never shows the stale-host notice. Once per offline run; a beat clears it.
+const calendarOfflineSent = new Set();
+function calendarOfflineEdge(key, a, now) {
+  if (!calendarEvents[key] && !calendarCapable(a)) return;
+  if (calendarHostOnline(a, now)) {
+    // Back online: a host whose calendar went unavailable never reaches calendarOnBeat's
+    // reconnect broadcast, so the sweep clears its notice.
+    if (calendarOfflineSent.delete(key)) broadcastCalendarSoon(key);
+    return;
+  }
+  if (calendarOfflineSent.has(key)) return;
+  calendarOfflineSent.add(key);
+  broadcastCalendarSoon(key);
 }
 
 // ---- serving -------------------------------------------------------------------
@@ -19097,8 +19118,10 @@ function offlineDetectionTick() {
   if (!isLeader()) return;
   const now = Date.now();
   if (now - BOOT_AT < BOOT_GRACE_MS) return;
+  for (const k of calendarOfflineSent) if (!agents[k]) calendarOfflineSent.delete(k);
   for (const [key, a] of Object.entries(agents)) {
     const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
+    calendarOfflineEdge(key, a, now);
     // An announced update in progress isn't an outage — hold the offline alert
     // until its grace window lapses. If the update gets stuck the host crosses
     // to genuinely-offline once `until` passes and this fires as normal (XERK-29).
@@ -29871,7 +29894,7 @@ if (process.env.TURMA_TEST) {
     tenantMigrationSteps, tenantMigrationPurgeNames: () => [...tenantPurges.keys()],
     // XERK-2891: the calendar.
     sanitizeCalendarEvent, calendarEventsCoerce, ingestCalendarSync, calendarView, calendarTick,
-    calendarEventOrg, calendarOnDemandAt,
+    calendarEventOrg, calendarOnDemandAt, calendarOfflineEdge,
     // XERK-2896: linking captures to calendar events.
     calendarLinkScore, calendarBestMatch, calendarCandidateIndex, relinkTenantMeetings, setMeetingCalendarLink,
     scheduleCalendarRelink, calendarRelinkTimers, calendarRelinkAt,

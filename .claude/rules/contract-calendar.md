@@ -9,7 +9,12 @@ paths:
   - "turma/public/calendar*"
   - "turma/tests/server.test.js"
   - "turma/tests/holidays.test.js"
+  - "turma/tests/calendar.test.js"
+  - "turma/public/brief.html"
+  - "turma/tenant-migration.js"
   - "agent/tests/test_hub_agent.py"
+  - "agent/tests/test_session_cli.py"
+  - "agent/tests/calendar_sync_fixture.json"
   - "android/app/src/main/java/**/Calendar*.kt"
 ---
 
@@ -19,6 +24,11 @@ A Teams-style meetings calendar built from each host's classic Outlook (read by 
 reader, `agent-session-cli.md`) and Tenir. The hub stores each host's events and serves them; the
 agent reads Outlook off its beat. Every child ticket builds to this file; change it here first.
 Hub half: XERK-2891. Agent half: XERK-2895 (below).
+- **The client halves live in their own files**: web calendar view, event panel and notes-review
+  links in `turma-meetings.md`; Android in `android.md` ("The Calendar view") and
+  `android/PARITY.md`. This file is the wire they both read.
+- **No feature flag**: the calendar is on for every org (XERK-2901). Its only gates are the host
+  (WSL/Windows with classic Outlook) and `calendar.available` on the beat.
 
 ## Agent → hub: the `calendarSync` heartbeat outbox
 
@@ -177,8 +187,14 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
   the ASSIGNED org ("" selects unassigned). ≤`CALENDAR_SERVE_MAX` (5000) events, earliest first.
   `pending: true` = a `syncCalendar` was queued for this range.
 - **Not on `/api/agents`**: too big for the snapshot. A coalesced `calendar` SSE frame (one per
-  turn) announces which hosts changed: `{<hostKey>: {syncedAt, windowFrom, windowUntil}}`, scoped
-  per host like the agent list; clients refetch the range they show.
+  turn) announces which hosts changed: `{<hostKey>: {syncedAt, windowFrom, windowUntil, changedAt}}`,
+  scoped per host like the agent list; clients refetch the range they show.
+  - `changedAt` (ms) keeps two changes from deduping as one identical whole-map frame.
+- **A host's online flip sends that frame too** (XERK-2901): `online` rides only the GET answer, so
+  without it an open page never re-read and never showed the stale-host notice. The leader's
+  offline sweep sends it once per offline run (`calendarOfflineEdge`); the reconnect beat sends it
+  before the resync lands (`calendarOnBeat`), else the next sweep does (a host whose calendar
+  went unavailable). Test: `XERK-2901:` in `server.test.js`.
 - Tests: the `XERK-2891:` cases in `server.test.js`.
 - Linked captures and Turma-only entries ride the same answer (below, XERK-2896); the `org`
   filter applies to both, so `events` is no longer Outlook-only.
@@ -261,7 +277,7 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
   over the stored (else default) settings and validated whole. 404 an org no host is decided into
   (before the body, so it mints nothing) → 400 unknown code/id → 409 store full. Answers
   `{ok, settings}`.
-- Served on `/api/agents` (the meetings settings drawer reads it there) + SSE:
+- Served on `/api/agents` + SSE (no client edits it yet: the settings UI is XERK-2929):
   - `holidaySettings`: every decided org's effective settings (`bySite`-scoped), its own frame.
   - `holidayCatalog`: country → `{name, holidays: [{id, name}]}`, hub-wide (no tenant data).
 - `GET /api/holidays?from=YYYY-MM-DD&until=YYYY-MM-DD` (`filtered`), inclusive, ≤400 days →
