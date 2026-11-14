@@ -43990,6 +43990,83 @@ class TestStageCreateTicket(ManagerMixin, unittest.TestCase):
         self.assertEqual((r["cmdId"], r["key"], r["maybeCreated"]), ("c1", None, True))
         self.assertIn("may have been created", r["error"])
 
+    def test_xerk2948_a_restart_answers_an_acked_create_it_cut_short(self):
+        # A create with files runs on a worker long after its ack, so a restart
+        # mid-attach leaves a started entry the hub never re-delivers. The new
+        # manager stages the "may have been created" row on its own.
+        sm = self.make_manager()
+        sm.created_cmds["c1"] = {"at": time.time()}
+        sm._save_created_cmds()
+        again = self.make_manager()
+        self.assertEqual(len(again.create_ticket_results), 1)
+        r = again.create_ticket_results[0]
+        self.assertEqual((r["cmdId"], r["key"], r["maybeCreated"]), ("c1", None, True))
+        self.assertIn("may have been created", r["error"])
+        # Stored as the answer: a later restart stages nothing more, and a
+        # re-delivery re-stages the same row without calling the tracker.
+        third = self.make_manager()
+        self.assertEqual(third.create_ticket_results, [])
+        with self._cfg(), mock.patch.object(ha, "create_board_issue") as f:
+            third._stage_create_ticket(self._cmd())
+        f.assert_not_called()
+        self.assertEqual(third.create_ticket_results, [r])
+
+    def test_xerk2948_the_restaged_row_rides_the_heartbeat(self):
+        sm = self.make_manager()
+        sm.created_cmds["c1"] = {"at": time.time()}
+        sm._save_created_cmds()
+        again = self.make_manager()
+        rows = again.build_payload(0).get("createTicketResults") or []
+        self.assertEqual([x["cmdId"] for x in rows], ["c1"])
+        self.assertTrue(rows[0]["maybeCreated"])
+
+    def test_xerk2948_an_old_or_answered_entry_is_not_restaged(self):
+        sm = self.make_manager()
+        sm.created_cmds["old"] = {"at": time.time() - ha.CREATE_RESTAGE_MAX_SEC - 60}
+        sm.created_cmds["done"] = {"at": time.time(),
+                                   "row": {"cmdId": "done", "key": "ENG-1", "url": "u"}}
+        sm._save_created_cmds()
+        self.assertEqual(self.make_manager().create_ticket_results, [])
+
+    def test_xerk2948_an_epic_child_is_restaged_on_its_own_list(self):
+        sm = self.make_manager()
+        sm.created_cmds["e1"] = {"at": time.time(), "kind": "epicChild"}
+        sm._save_created_cmds()
+        again = self.make_manager()
+        self.assertEqual(again.create_ticket_results, [])
+        self.assertEqual([(x["cmdId"], x["maybeCreated"]) for x in again.epic_child_results],
+                         [("e1", True)])
+
+    def test_xerk2948_a_planted_flood_restages_only_the_newest(self):
+        sm = self.make_manager()
+        now = time.time()
+        for i in range(ha.CREATE_RESTAGE_MAX + 30):
+            sm.created_cmds[f"c{i}"] = {"at": now - 1000 + i}
+        sm._save_created_cmds()
+        for i in range(ha.CREATE_RESTAGE_MAX + 5):   # future-dated junk never wins a slot
+            sm.created_cmds[f"f{i}"] = {"at": now + 1e9}
+        sm.created_cmds["inf"] = {"at": float("inf")}
+        sm._save_created_cmds()
+        rows = self.make_manager().create_ticket_results
+        self.assertEqual(len(rows), ha.CREATE_RESTAGE_MAX)
+        self.assertEqual(rows[0]["cmdId"], f"c{ha.CREATE_RESTAGE_MAX + 29}")
+
+    def test_xerk2948_an_epic_child_create_records_its_kind(self):
+        sm = self.make_manager()
+        seen = {}
+        real = sm._create_once
+
+        def spy(cid, results, do_create, maybe, kind=None):
+            seen["kind"] = kind
+            return real(cid, results, lambda: maybe, maybe, kind=kind)
+        with mock.patch.object(sm, "_create_once", side_effect=spy), \
+                mock.patch.object(ha, "board_configured", return_value=True), \
+                mock.patch.object(ha, "board_source", return_value="jira"):
+            sm.handle_commands([{"type": "createEpicChild", "cmdId": "e9",
+                                 "epicKey": "ENG-1", "project": "ENG",
+                                 "issueType": "10001", "summary": "s"}])
+        self.assertEqual(seen.get("kind"), "epicChild")
+
     def test_xerk2867_the_record_is_written_before_the_tracker_call(self):
         # A manager killed INSIDE the tracker call must not create again on restart.
         with self._cfg(), mock.patch.object(ha, "create_board_issue",

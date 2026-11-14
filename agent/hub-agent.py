@@ -27455,6 +27455,18 @@ CREATED_CMDS_PATH = os.path.join(REGISTRY_DIR, "created-commands.json")
 CREATED_CMDS_MAX = 500
 CREATE_MAYBE_RAN_ERROR = ("this host restarted while creating the ticket — it may "
                           "have been created, so check the board before making it again")
+# A create started this recently with no answer is answered "may have been
+# created" at manager start (XERK-2948): its command was likely acked already,
+# so the hub will never re-deliver it, and only a staged row ends the wait.
+# Older entries are history nobody is still waiting on.
+CREATE_RESTAGE_MAX_SEC = 24 * 3600
+# At most this many are restaged, newest first: the ledger file is
+# session-writable, and a planted flood of entries would otherwise bloat the
+# beat past a small hub's heartbeat cap and evict real rows from the hub's
+# per-host result cache (CREATE_RESULT_MAX, 40). The rest are left unanswered.
+# A future-dated (or inf) `at` is skipped too, or a planted one would take
+# every slot ahead of a real entry.
+CREATE_RESTAGE_MAX = 20
 
 
 def _call_with_deadline(fn, seconds):
@@ -29283,6 +29295,7 @@ class SessionManager:
         self.epic_child_results = []
         # Durable record of tracker creates by cmdId (XERK-2867, CREATED_CMDS_PATH).
         self.created_cmds = self._load_created_cmds()
+        self._restage_unanswered_creates()
         # Epic Builder runs this host is driving (XERK-724), keyed by the hub's
         # builderId: {id, siteKey, title, idea, repo, state, sessionId,
         # worktreePath, planFile, plan, project, epicKey, error, materializing,
@@ -29779,6 +29792,8 @@ class SessionManager:
                 at = e.get("at")
                 out[cid] = {"at": at if isinstance(at, (int, float))
                             and not isinstance(at, bool) else 0}
+                if e.get("kind") == "epicChild":
+                    out[cid]["kind"] = "epicChild"
                 row = _created_cmd_row(cid, e.get("row"))
                 if row is not None:
                     out[cid]["row"] = row
@@ -29798,7 +29813,37 @@ class SessionManager:
         except (OSError, ValueError, TypeError, RecursionError) as e:
             log(f"created-commands ledger save failed: {e}")
 
-    def _create_once(self, cid, results, do_create, maybe_row):
+    def _restage_unanswered_creates(self):
+        """At manager start, answer every create the previous process started
+        but never answered (XERK-2948). Such a create was most likely already
+        acked (a create with files runs on a worker for minutes after its ack),
+        so the hub never re-delivers it, and without a row its poll times out
+        silently. Stage a `maybeCreated` row for it and store that row as its
+        answer, so a re-delivery that does come re-stages the same row. Only
+        recent entries (`CREATE_RESTAGE_MAX_SEC`): an older one has no waiter."""
+        now = time.time()
+        staged = 0
+        with _CREATED_CMDS_LOCK:
+            due = [(cid, e) for cid, e in self.created_cmds.items()
+                   if "row" not in e
+                   and 0 <= now - e.get("at", 0) <= CREATE_RESTAGE_MAX_SEC]
+            due.sort(key=lambda x: x[1].get("at", 0), reverse=True)
+            for cid, e in due[:CREATE_RESTAGE_MAX]:
+                epic = e.get("kind") == "epicChild"
+                maybe = {"cmdId": cid, "key": None, "url": None,
+                         "error": CREATE_MAYBE_RAN_ERROR, "maybeCreated": True}
+                if epic:
+                    maybe.update({"epicKey": None, "warning": None})
+                e["row"] = maybe
+                (self.epic_child_results if epic
+                 else self.create_ticket_results).append(dict(maybe))
+                staged += 1
+            if staged:
+                self._save_created_cmds()
+        if staged:
+            log(f"re-staged {staged} create(s) a restart cut short as 'may have been created'")
+
+    def _create_once(self, cid, results, do_create, maybe_row, kind=None):
         """Run a tracker create AT MOST ONCE per cmdId across manager restarts
         (XERK-2867). `do_create()` returns the staged result row. A cmdId seen
         before re-stages its stored row, or `maybe_row` when the earlier run was
@@ -29814,6 +29859,8 @@ class SessionManager:
                 log(f"create {cid} was already run on this host; re-sending its answer")
                 return
             self.created_cmds[cid] = {"at": time.time()}
+            if kind:
+                self.created_cmds[cid]["kind"] = kind
             self._save_created_cmds()
         row = do_create()
         results.append(row)
@@ -41813,7 +41860,7 @@ class SessionManager:
                           {"cmdId": cid, "key": None, "url": None,
                            "epicKey": epic_key[:50],
                            "error": CREATE_MAYBE_RAN_ERROR, "warning": None,
-                           "maybeCreated": True})
+                           "maybeCreated": True}, kind="epicChild")
 
     # --- durable archive sync ---------------------------------------------
     # Ship every INACTIVE session's transcript to the hub so history is durable
