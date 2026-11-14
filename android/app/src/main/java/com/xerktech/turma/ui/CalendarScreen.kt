@@ -996,7 +996,7 @@ private fun HostSettings(rows: Map<String, com.xerktech.turma.model.CalendarHost
 /**
  * The event's org and the operator's per-series pick of it (XERK-2929, the web's
  * `seriesOrgHtml`): "Automatic" leaves it to the domain rules / host default /
- * host org; "No org" pins it to none.
+ * host org. No "No org" pin: the hub refuses "" (XERK-2936).
  */
 @Composable
 private fun SeriesOrgRow(ev: CalendarEvent, h: com.xerktech.turma.model.CalendarHost, orgLabel: (String) -> String, cvm: CalendarViewModel) {
@@ -1004,9 +1004,8 @@ private fun SeriesOrgRow(ev: CalendarEvent, h: com.xerktech.turma.model.Calendar
     val errs by cvm.setErr.collectAsStateWithLifecycle()
     val pinned = ev.seriesOrg != null
     val auto = if (pinned) "Automatic" else "Automatic (${orgLabel(ev.org)})"
-    // Values are "auto" or "=" + the org ("=" alone = No org), so no org key can collide.
-    val options = listOf(AUTO_ORG to auto) + h.orgs.orEmpty().filter { it.isNotEmpty() }.map { "=$it" to orgLabel(it) } +
-        ("=" to "No org")
+    // Values are "auto" or "=" + the org, so no org key can collide with Automatic.
+    val options = listOf(AUTO_ORG to auto) + h.orgs.orEmpty().filter { it.isNotEmpty() }.map { "=$it" to orgLabel(it) }
     val cur = ev.seriesOrg?.let { "=$it" } ?: AUTO_ORG
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
         Text("Org", Modifier.width(84.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

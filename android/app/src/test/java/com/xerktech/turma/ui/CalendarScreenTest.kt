@@ -91,7 +91,8 @@ class CalendarScreenTest {
                 { "host": "h1", "org": "$site", "matchOrg": "$site", "id": "E2", "source": "outlook", "subject": "Overlap",
                   "startMs": ${t(today, 10, 30)}, "endMs": ${t(today, 11, 30)}, "busy": "tentative", "myResponse": "tentative" },
                 { "host": "h1", "org": "$site", "matchOrg": "$site", "id": "E3", "source": "outlook", "subject": "Planning",
-                  "startMs": ${t(tomorrow, 14)}, "endMs": ${t(tomorrow, 15)}, "busy": "busy", "myResponse": "accepted" }""")
+                  "startMs": ${t(tomorrow, 14)}, "endMs": ${t(tomorrow, 15)}, "busy": "busy", "myResponse": "accepted",
+                  "joinUrl": "https://teams.microsoft.com/l/plan" }""")
         hub.json("/api/holidays", """[ { "id": "us-test", "date": "$today", "name": "Test Day", "offFor": ["$site"] } ]""")
     }
 
@@ -360,23 +361,21 @@ class CalendarScreenTest {
         assertEquals("""{"showPrivate":true}""", settingsBody())
     }
 
-    @Test fun `an event's Org picker pins its series to an org or to none`() {
+    @Test fun `an event's Org picker pins its series to an org, with no No-org choice`() {
         seedSettings()
         hub.json("/api/agents/h1/calendar/settings", """{ "ok": true, "settings": {} }""")
         show()
         awaitEvent("Weekly sync")
         compose.onNode(event("Weekly sync")).performScrollTo().performClick()
         compose.onNodeWithText("Automatic (o)", substring = true).performClick()
-        compose.onNodeWithText("No org").performClick()
-        assertEquals("""{"series":{"id":"S9","org":""}}""", settingsBody())
-        awaitEnabled("cal-series-org")
-        compose.onNodeWithTag("cal-series-org").performClick()
+        // XERK-2936: every meeting has an org, so there is no pin to none.
+        assertEquals(0, compose.onAllNodesWithText("No org").fetchSemanticsNodes().size)
         compose.onNodeWithText("p").performClick()
         assertEquals("""{"series":{"id":"S9","org":"$other"}}""", settingsBody())
     }
 
     @Test fun `a pinned series goes back to Automatic, and a refusal reads in the hub's words`() {
-        seedSettings(""", "recurring": true, "seriesOrg": "" """)
+        seedSettings(""", "recurring": true, "seriesOrg": "$other" """)
         hub.route("/api/agents/h1/calendar/settings") { HubHarness.refusal("that series is not on this host's calendar", 404) }
         val cvm = calendarVm()
         show(cvm)
@@ -384,7 +383,7 @@ class CalendarScreenTest {
         compose.onNode(event("Weekly sync")).performScrollTo().performClick()
         compose.onNodeWithText("for the whole series").assertExists()
         val message = hub.expectMessage(cvm.messages)
-        compose.onNodeWithText("No org", substring = true).performClick()
+        compose.onNodeWithTag("cal-series-org").performClick()
         compose.onNodeWithText("Automatic").performClick()
         assertEquals("""{"series":{"id":"S9","org":null}}""", settingsBody())
         val want = "Setting the meeting's org failed — that series is not on this host's calendar"

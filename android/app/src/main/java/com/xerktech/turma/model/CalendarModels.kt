@@ -68,6 +68,8 @@ data class CalendarEvent(
     val sensitivity: String = "",
     val isOnlineMeeting: Boolean = false,
     val private: Boolean = false,
+    /** XERK-2936: the hub's "real meeting" verdict, judged before a private event is withheld; null = older hub. */
+    val meeting: Boolean? = null,
     @Serializable(with = LenientCapturesSerializer::class)
     val meetings: List<CalendarCapture> = emptyList(),
     // The org the hub's capture matcher counts it for (XERK-2898); null = an older hub.

@@ -147,9 +147,18 @@ function styleOf(ev, now) {
 // A meeting the notes review lists as upcoming (XERK-2899): an Outlook event that is
 // a timed, live meeting of an org — not a holiday-like all-day block, a canceled or
 // declined one, a free / out-of-office / working-elsewhere block, or one already captured.
+// Only a REAL meeting, as the hub's matcher reads it: every event now has an org (XERK-2936),
+// so Focus time and Lunch would otherwise list. The hub's `meeting` flag decides — it is
+// judged before a private event's attendees and link are withheld; an older hub sends none.
 const NOT_MEETING_BUSY = new Set(["free", "outOfOffice", "workingElsewhere"]);
+function isRealMeeting(ev) {
+  if (typeof ev.meeting === "boolean") return ev.meeting;
+  return (Array.isArray(ev.attendees) && ev.attendees.some((p) => p && p.role !== "organizer" && p.role !== "resource"))
+    || !!ev.joinUrl || ev.isOnlineMeeting === true;
+}
 function isUpcomingMeeting(ev, now) {
   return !!ev && ev.source !== "tenir" && typeof ev.org === "string" && !!ev.org && !inBand(ev)
+    && isRealMeeting(ev)
     && ev.canceled !== true && ev.myResponse !== "declined" && !NOT_MEETING_BUSY.has(ev.busy)
     && !(Array.isArray(ev.meetings) && ev.meetings.length)
     && num(ev.endMs) && ev.endMs > now && ev.startMs < now + UPCOMING_MS;
@@ -600,8 +609,8 @@ function hostOrg(host) {
   const a = data && Array.isArray(data.agents) ? data.agents.find((x) => x && x.key === host) : null;
   return a && typeof a.org === "string" ? a.org : "";
 }
-// An event's org as the hub's capture matcher reads it: the served `matchOrg` (a series
-// pinned to no org is ""), else (an older hub) its assigned org, else its host's.
+// An event's org as the hub's capture matcher reads it: the served `matchOrg`, else (an
+// older hub) its assigned org, else its host's.
 const eventOrg = (ev) => (typeof ev.matchOrg === "string" ? ev.matchOrg
   : ev.org || (ev.source === "tenir" ? "" : hostOrg(ev.host)));
 const capKey = (c) => [c.site, c.meetingId].map(encodeURIComponent).join("/");
@@ -740,11 +749,12 @@ function detailHtml(ev, now, hasPanel = false) {
     + (!tenir && !caps.length && ev.startMs < now ? `<p class="cal-dnote">Tenir captured nothing for this event.</p>` : "");
 }
 // The event's org, and the operator's per-series pick of it (XERK-2929): "Automatic"
-// leaves it to the domain rules / host default / host org; "No org" pins it to none.
+// leaves it to the domain rules / host default / host org. There is no "No org" pin
+// (XERK-2936: every meeting of a host in an org has one; the hub refuses "").
 function seriesOrgHtml(ev, hrow) {
   const k = String(ev.host);
   const pinned = typeof ev.seriesOrg === "string";
-  // Values are "auto" or "=" + the org ("=" alone = No org): no org key can collide.
+  // Values are "auto" or "=" + the org: no org key can collide with Automatic.
   const cur = pinned ? `=${ev.seriesOrg}` : "auto";
   const orgs = hrow.orgs.filter((o) => typeof o === "string" && o);
   const opt = (v, label) => `<option value="${esc(v)}"${v === cur ? " selected" : ""}>${esc(label)}</option>`;
@@ -754,7 +764,7 @@ function seriesOrgHtml(ev, hrow) {
   return `<div class="cal-drow"><span class="k">Org</span><span class="v">`
     + `<select data-series-org="${esc(evDomKey(ev))}" aria-label="Org for ${esc(what)}"${dis}>`
     + opt("auto", pinned ? "Automatic" : `Automatic (${orgLabel(ev.org)})`)
-    + orgs.map((o) => opt(`=${o}`, orgLabel(o))).join("") + opt("=", "No org") + `</select>`
+    + orgs.map((o) => opt(`=${o}`, orgLabel(o))).join("") + `</select>`
     + (ev.recurring === true ? ` <span class="cal-dnote">for the whole series</span>` : "")
     + (setErr.has(k) ? `<span class="mt-err">${esc(setErr.get(k))}</span>` : "")
     + `</span></div>`;

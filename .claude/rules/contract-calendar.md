@@ -117,15 +117,17 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
   (`subject: "Private event"`, `private: true`) unless that host's `showPrivate` setting is on.
   Withheld at SERVE time; the store keeps them so the opt-in needs no resync.
 
-## Org assignment (served as `org` on each event, "" = unassigned)
+## Org assignment (served as `org` on each event)
 
 A host's calendar is one person's Outlook and may span orgs. Decided at serve time, in order:
-1. The host's per-series override (`seriesOrgs[seriesId || id]`), even "" (pinned unassigned).
+1. The host's per-series override (`seriesOrgs[seriesId || id]`).
 2. Domain rules: the org whose `domains` contain the ORGANIZER's email domain; else the one org
    matching any attendee's domain, only when exactly one org matches (two = ambiguous, skipped).
 3. The host's `defaultOrg`.
-4. The host's own decided org (XERK-2929) — so a single-org user needs no settings at all.
-5. "" — only a series pinned to none, or a host decided into no org; drawn in a neutral color.
+4. The host's decided org (`decidedOrgOf`). "" only for a host in no decided org.
+- **Every meeting of a host in an org has an org** (XERK-2936, operator rule): there is no
+  "pinned unassigned" override — a series pin of "" is a 400, and a stored one is dropped. Before
+  this, events no rule matched served "" and drew grey on every client.
 - Only orgs of the HOST's tenant count (org key tenant == host key tenant), and only orgs some
   host is decided into; a rule or setting naming another tenant's org is refused at the route.
 - A domain is lowercase `^[a-z0-9.-]{1,253}$` with a dot; `sub.a.com` matches rule `a.com`.
@@ -145,7 +147,7 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
 - **Read back for the settings UI** (XERK-2929): rules ride `/api/agents` as `calendarOrgRules`
   (`bySite`) + its own SSE frame; each `/api/calendar` `hosts[]` row carries `org` (decided),
   `orgs` (what it may pick), `defaultOrg` ("" = none), `showPrivate`; an event the operator
-  pinned carries `seriesOrg`. Web: Meetings drawer (days off, domains), calendar gear (host),
+  pinned carries `seriesOrg` (only a pin that still counts). Web: Meetings drawer (days off, domains), calendar gear (host),
   event panel (series). Android mirrors all three.
 
 ## The event store
@@ -190,7 +192,7 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
   Answers `{from, until, hosts: [{host, device, online, syncedAt, windowFrom, windowUntil,
   ranges, lastError?, lastErrorAt?, pending?}], events: [{host, org, ...event}]}` — only hosts the
   caller may drive (`principalMayDriveHost`), only events overlapping the range, `org` filter on
-  the ASSIGNED org ("" selects unassigned). ≤`CALENDAR_SERVE_MAX` (5000) events, earliest first.
+  the event's `org`. ≤`CALENDAR_SERVE_MAX` (5000) events, earliest first.
   `pending: true` = a `syncCalendar` was queued for this range.
 - **Not on `/api/agents`**: too big for the snapshot. A coalesced `calendar` SSE frame (one per
   turn) announces which hosts changed: `{<hostKey>: {syncedAt, windowFrom, windowUntil, changedAt}}`,
@@ -218,8 +220,8 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
     one trailing timer; an error-only or unchanged sync schedules none. Why: one host re-sending
     syncs every beat blocked the shared event loop ~0.55 s a beat at the caps (QA).
   - ≤`CALENDAR_LINK_SCAN_MAX` (200) candidates are scored per capture.
-  - Candidates: events of hosts of the MEETING's tenant only, whose served org (which ends at the
-    host's decided org) is the meeting's org; never `canceled`.
+  - Candidates: events of hosts of the MEETING's tenant only, whose `org` is the meeting's org;
+    never `canceled`.
   - **Only real meetings** (`calendarLinkCandidate`): someone other than the organizer invited
     (a resource does not count) or a join link/online meeting; not all-day, ≤12h, not declined, `busy` not free/outOfOffice/workingElsewhere. Why:
     a capture inside Focus time / Lunch / WFH linked to that block and never left (QA).
@@ -241,8 +243,12 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
   Answers `{ok, meeting}` (meetingWire, with `calendarEvent`).
 - **Served on `GET /api/calendar`**: every Outlook event carries `source: "outlook"` and
   `meetings: [{site, meetingId, title}]` (linked captures of orgs the caller may see).
-  - And `matchOrg` (XERK-2898): the org the matcher counts it for — now always equal to `org`,
-    since the served org ends at the host's decided org (XERK-2929). Kept for older clients.
+  - And `matchOrg` (XERK-2898): the org the matcher counts it for — equal to `org` since
+    XERK-2936. The web panel's relink candidates and daily-brief org read it; absent = an older hub.
+  - And `meeting` (XERK-2936): `calendarLinkCandidate(ev)`, judged BEFORE a private event's
+    attendees/link are withheld. Clients list an upcoming meeting only when it is true (web
+    `isRealMeeting`, Android `calRealMeeting`), never re-deriving it from redacted fields;
+    absent = an older hub, where they fall back to attendees/link. Typed on Android (`Boolean?`).
 - **Impromptu captures are Turma-only entries**, derived at serve time (no store), never written
   to Outlook: a capture with no stored link →
   `{source:"tenir", host:"", org: site, id:"tenir:<meetingId>", site, meetingId, subject

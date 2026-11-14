@@ -328,46 +328,99 @@ BINFMT_MISC = "/proc/sys/fs/binfmt_misc"
 WSL_CONF = "/etc/wsl.conf"
 
 
+_ALPHA = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+_ALNUM = _ALPHA | frozenset("0123456789")
+_WSL_ESCAPES = {"\\": "\\", '"': '"', "b": "\b", "n": "\n", "t": "\t", "\n": ""}
+
+
 def wsl_conf_interop_off(path=None) -> bool:
-    """True when wsl.conf's `[interop] enabled` reads false, as WSL's own
-    parser reads it (configfile.cpp + ParseBool): `#` outside quotes starts a
-    comment; `"` toggles quoting anywhere, and an unterminated one voids the
-    line; quoted and inner spaces are kept; case is ignored; the FIRST
-    `enabled` wins even when it is no valid bool (interop then stays on).
-    Backslash escapes are not handled. Mirrors install.sh's
-    `_wsl_interop_disabled`."""
+    """True when wsl.conf's `[interop] enabled` reads false, as WSL reads it.
+
+    A port of WSL's own parser (src/shared/configfile/configfile.cpp
+    ParseConfigFile + ParseBool), which wsl.conf runs with invalid lines
+    skipped: a header is `[` alpha alnum* `]` then only spaces or a `#`
+    comment; a key is alpha alnum*; in a value `#` outside `"` starts a
+    comment, `"` toggles quoting anywhere, `\\` escapes `\\ " b n t` and a
+    newline (continuation); an invalid escape or an unterminated quote voids
+    the line. An invalid header keeps the previous section (WSL truncates its
+    name buffer to the old section's length). Only `\\n` ends a line, `\\r`
+    ends a value or header. Keys and `true`/`false` ignore case; the FIRST
+    valid `interop.enabled` line wins even when it is no bool (interop then
+    stays on). Bytes are read one per character (WSL's fgetwc is
+    locale-dependent for non-ASCII). Mirrors install.sh's
+    `_wsl_interop_disabled`; the parity test pins the two together."""
     try:
-        with open(path or WSL_CONF, encoding="utf-8", errors="replace") as fh:
-            lines = fh.read().splitlines()
+        with open(path or WSL_CONF, "rb") as fh:
+            s = fh.read().decode("latin-1")
     except OSError:
         return False
-    sec = ""
-    for raw in lines:
-        t = raw.lstrip(" \t")
-        if not t or t.startswith("#"):
-            continue
-        if t.startswith("["):
-            sec = re.sub(r"[ \t]", "", t.split("#", 1)[0]).lower()
-            continue
-        if sec != "[interop]" or "=" not in t:
-            continue
-        key, v = t.split("=", 1)
-        if key.rstrip(" \t").lower() != "enabled":
-            continue
-        out, quoted, keep = [], False, 0
-        for c in v.lstrip(" \t"):          # `"` toggles quoting anywhere
-            if c == '"':
-                quoted, keep = not quoted, len(out)
-            elif c == "#" and not quoted:
-                break
-            else:
-                out.append(c)
-                keep = len(out) if quoted else keep
-        if quoted:                         # unterminated: invalid, claims nothing
-            continue
-        v = "".join(out)
-        v = v[:keep] + v[keep:].rstrip(" \t")    # spaces inside quotes stay
-        return v.lower() in ("false", "0")
+    n, i = len(s), 0
+    sec, sec_len = "", 0                   # sec None: an invalid header made it unmatchable
+
+    def eol(j):                            # an invalid line or comment runs to the next \n
+        k = s.find("\n", j)
+        return n if k < 0 else k + 1
+
+    while i < n:
+        c = s[i]
+        if c in " \t\r\n":
+            i += 1
+        elif c == "#":
+            i = eol(i)
+        elif c == "[":
+            j = k = i + 1
+            if j >= n or s[j] not in _ALPHA:
+                i = eol(i)                 # never reached the name: the section stands
+                continue
+            while k < n and s[k] in _ALNUM:
+                k += 1
+            name, m = s[j:k], k + 1
+            if k < n and s[k] == "]":
+                while m < n and s[m] in " \t":
+                    m += 1
+                if m >= n or s[m] in "\r\n#":
+                    sec, sec_len, i = name, len(name), m
+                    continue
+            sec = name[:sec_len] if len(name) >= sec_len else None
+            i = eol(k)
+        elif c not in _ALPHA:
+            i = eol(i)
+        else:
+            k = i
+            while k < n and s[k] in _ALNUM:
+                k += 1
+            key = s[i:k]
+            while k < n and s[k] in " \t":
+                k += 1
+            if k >= n or s[k] != "=":
+                i = eol(k)
+                continue
+            k += 1
+            while k < n and s[k] in " \t":
+                k += 1
+            val, trimmed, quoted, valid = [], 0, False, True
+            while k < n and s[k] not in "\r\n":
+                c = s[k]
+                if c == '"':
+                    quoted = not quoted
+                elif c == "\\":
+                    k += 1
+                    esc = _WSL_ESCAPES.get(s[k] if k < n else "")
+                    if esc is None:
+                        valid = False
+                        break
+                    val.append(esc)       # "" for a continuation: count chars, not items
+                elif c == "#" and not quoted:
+                    break
+                else:
+                    val.append(c)
+                if c not in " \t":
+                    trimmed = sum(map(len, val))
+                k += 1
+            if valid and not quoted and sec is not None and sec.lower() == "interop" \
+                    and key.lower() == "enabled":
+                return "".join(val)[:trimmed].lower() in ("false", "0")
+            i = eol(k) if not valid or quoted or (k < n and s[k] == "#") else k
     return False
 
 

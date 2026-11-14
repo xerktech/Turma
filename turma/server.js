@@ -5918,7 +5918,7 @@ function sanitizeCalendarHostSettings(h) {
   const so = Object.create(null);
   if (h.seriesOrgs && typeof h.seriesOrgs === "object" && !Array.isArray(h.seriesOrgs)) {
     for (const [id, org] of Object.entries(h.seriesOrgs).slice(-CALENDAR_SERIES_MAX)) {
-      if (calId(id) && typeof org === "string" && org.length <= 200) so[id] = org;
+      if (calId(id) && typeof org === "string" && org && org.length <= 200) so[id] = org;
     }
   }
   e.seriesOrgs = so;
@@ -6169,11 +6169,12 @@ function calendarOrgsOfTenant(t) {
 function calDomainOf(email) {
   return email ? email.slice(email.lastIndexOf("@") + 1) : "";
 }
-// `key` (the event's host) adds step 4: the host's own decided org (XERK-2929).
-function calendarEventOrg(ev, orgs, hs, key = "") {
+// An event's org (XERK-2936): every event of a host decided into an org has one. A rule or
+// setting can name another org of the tenant; with none, it is the host's own decided org.
+function calendarEventOrg(key, ev, orgs, hs) {
   const so = hs && hs.seriesOrgs;
   const sid = ev.seriesId || ev.id;
-  if (so && Object.hasOwn(so, sid) && (so[sid] === "" || orgs.includes(so[sid]))) return so[sid];
+  if (so && Object.hasOwn(so, sid) && orgs.includes(so[sid])) return so[sid];
   const match = (d) => (d ? orgs.filter((s) => Object.hasOwn(calendarOrgRules, s) &&
     calendarOrgRules[s].domains.some((x) => d === x || d.endsWith("." + x))) : []);
   const orgEmail = ev.organizerEmail || (ev.attendees.find((p) => p.role === "organizer") || {}).email || "";
@@ -6183,15 +6184,16 @@ function calendarEventOrg(ev, orgs, hs, key = "") {
   for (const p of ev.attendees) for (const s of match(calDomainOf(p.email))) hits.add(s);
   if (hits.size === 1) return [...hits][0];
   if (hs && hs.defaultOrg && orgs.includes(hs.defaultOrg)) return hs.defaultOrg;
-  const own = key && agents[key] ? decidedOrgOf(agents[key]) : "";
-  return own && orgs.includes(own) ? own : "";
+  return agents[key] ? decidedOrgOf(agents[key]) : "";
 }
 function calendarEventWire(key, ev, orgs, hs) {
-  const out = { host: key, org: calendarEventOrg(ev, orgs, hs, key), ...ev };
-  // The operator's per-series pick, so the event panel shows it (XERK-2929).
+  // `meeting` (XERK-2936): a real meeting by the matcher's rule, judged BEFORE a private
+  // event's attendees and join link are withheld, so clients never re-derive it.
+  const out = { host: key, org: calendarEventOrg(key, ev, orgs, hs), ...ev, meeting: calendarLinkCandidate(ev) };
+  // The operator's per-series pick, so the event panel shows it (XERK-2929) — only a pin
+  // that still counts (calendarEventOrg skips one naming an org no host is in).
   const so = hs && hs.seriesOrgs, sid = ev.seriesId || ev.id;
-  // Only a pin that still counts (calendarEventOrg skips one naming an org no host is in).
-  if (so && Object.hasOwn(so, sid) && (so[sid] === "" || orgs.includes(so[sid]))) out.seriesOrg = so[sid];
+  if (so && Object.hasOwn(so, sid) && orgs.includes(so[sid])) out.seriesOrg = so[sid];
   if ((ev.sensitivity === "private" || ev.sensitivity === "confidential") && !(hs && hs.showPrivate)) {
     Object.assign(out, { subject: "Private event", body: "", location: "", organizer: "",
       organizerEmail: "", attendees: [], joinUrl: "", categories: [], private: true });
@@ -6239,8 +6241,8 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       if (orgFilter && !orgFilter.has(w.org)) continue;
       const lk = `${tenantOfKey(key)}\u0000${ev.id}`;
       w.meetings = tenir.links.get(lk) || [];
-      // The org the capture matcher counts it for (XERK-2898): an unassigned event's
-      // host org, "" when a series override pins it to none. Clients relink by it.
+      // The org the capture matcher counts it for (XERK-2898): its org (XERK-2936).
+      // Clients relink by it.
       w.matchOrg = w.org;
       tenir.linked.delete(lk);   // served: its captures ride on it
       events.push({ source: "outlook", ...w });
@@ -6311,9 +6313,9 @@ function setCalendarHostSettings(key, body) {
   }
   if ("series" in body) {
     const s = body.series;
-    if (!s || typeof s !== "object" || !calId(s.id) || !(s.org === null || s.org === "" || okOrg(s.org))) {
-      return { status: s && typeof s === "object" && calId(s.id) ? 404 : 400,
-        body: { error: "series must be {id, org}: org an org of this host's tenant, \"\" for unassigned, or null to clear" } };
+    if (!s || typeof s !== "object" || !calId(s.id) || !(s.org === null || okOrg(s.org))) {
+      return { status: s && typeof s === "object" && calId(s.id) && s.org !== "" ? 404 : 400,
+        body: { error: "series must be {id, org}: org an org of this host's tenant, or null to clear" } };
     }
     delete cur.seriesOrgs[s.id];
     if (s.org !== null) cur.seriesOrgs[s.id] = s.org;
@@ -6363,11 +6365,6 @@ const CAL_NOT_MEETING_BUSY = new Set(["free", "outOfOffice", "workingElsewhere"]
 const CAL_PLATFORM_HOSTS = [["teams", /(^|\.)teams\.(microsoft|live)\.com$/], ["zoom", /(^|\.)zoom(gov)?\.us$/],
   ["meet", /(^|\.)meet\.google\.com$/], ["webex", /(^|\.)webex\.com$/]];
 
-// The org an event counts for when matching: its served org, which ends at its
-// host's decided org (XERK-2929) unless a series override pins it to none.
-function calendarMatchOrg(key, ev, orgs, hs) {
-  return calendarEventOrg(ev, orgs, hs, key);
-}
 // id -> {key, ev, syncedAt} for tenant `t`'s stored events: what a link resolves
 // against. Cheap (no org decision), so the wire and the view build it freely. An
 // id held by two hosts (two people's Outlooks invited to one meeting) is one
@@ -6407,7 +6404,7 @@ function calendarCandidateIndex(t) {
     if (tenantOfKey(key) !== t) continue;
     const hs = calendarHostSettings[key];
     for (const ev of h.events) {
-      if (calendarLinkCandidate(ev)) list.push({ key, ev, org: calendarMatchOrg(key, ev, orgs, hs) });
+      if (calendarLinkCandidate(ev)) list.push({ key, ev, org: calendarEventOrg(key, ev, orgs, hs) });
     }
   }
   list.sort((a, b) => a.ev.startMs - b.ev.startMs);
@@ -6494,7 +6491,7 @@ function meetingCalendarLinkFields(siteKey, m, index) {
   // orgs is one meeting (XERK-2896 QA).
   const orgs = calendarOrgsOfTenant(index.t);
   const cur = m.calendarEventId && (index.copies.get(m.calendarEventId) || [])
-    .find((c) => calendarMatchOrg(c.key, c.ev, orgs, calendarHostSettings[c.key]) === siteKey);
+    .find((c) => calendarEventOrg(c.key, c.ev, orgs, calendarHostSettings[c.key]) === siteKey);
   if (cur) {
     if (cur.ev.canceled || !calOverlapsCapture(m, cur.ev)) return keep;
     const hit = calendarBestMatch(siteKey, m, index);
@@ -6560,11 +6557,11 @@ function meetingCalendarEventWire(siteKey, m, index) {
   const orgs = calendarOrgsOfTenant(ix.t);
   // The copy counting for the capture's org (newest first), else the newest copy.
   const all = ix.copies.get(m.calendarEventId) || [];
-  const c = all.find((x) => calendarMatchOrg(x.key, x.ev, orgs, calendarHostSettings[x.key]) === siteKey) || all[0];
+  const c = all.find((x) => calendarEventOrg(x.key, x.ev, orgs, calendarHostSettings[x.key]) === siteKey) || all[0];
   if (!c) return null;
   const hs = calendarHostSettings[c.key];
   const w = calendarEventWire(c.key, c.ev, orgs, hs);
-  const out = { host: c.key, org: calendarMatchOrg(c.key, c.ev, orgs, hs), subject: w.subject,
+  const out = { host: c.key, org: calendarEventOrg(c.key, c.ev, orgs, hs), subject: w.subject,
     start: w.start, end: w.end, startMs: w.startMs, endMs: w.endMs, canceled: w.canceled,
     moved: !calOverlapsCapture(m, w),
     // Who was invited, as Outlook names them (the notes review shows them beside the
@@ -30017,7 +30014,7 @@ if (process.env.TURMA_TEST) {
     tenantMigrationSteps, tenantMigrationPurgeNames: () => [...tenantPurges.keys()],
     // XERK-2891: the calendar.
     sanitizeCalendarEvent, calendarEventsCoerce, ingestCalendarSync, calendarView, calendarTick,
-    calendarEventOrg, calendarOnDemandAt, calendarOfflineEdge,
+    calendarEventOrg, calendarHostSettingsCoerce, calendarOnDemandAt, calendarOfflineEdge,
     // XERK-2896: linking captures to calendar events.
     calendarLinkScore, calendarBestMatch, calendarCandidateIndex, relinkTenantMeetings, setMeetingCalendarLink,
     scheduleCalendarRelink, calendarRelinkTimers, calendarRelinkAt,
