@@ -127,6 +127,10 @@ A pure-core/adapter-shell split:
     false. A re-read drops every week but the shown ± one and the notes review's upcoming weeks.
   - The week cache is written with `update{}` and its bookkeeping under a lock: a read's answer
     resumes off the main thread in tests, and two weeks landing at once lost one (stuck loading).
+  - **Tablets and foldables get the week by the calendar's OWN width**, not the app's `wide`
+    (Expanded ≥840dp): week modes from 600dp (`CAL_WEEK_MIN_WIDTH`), so a portrait tablet or an
+    unfolded foldable (Medium) never shows Day / 3 days; the detail sits beside the grid only from
+    840dp, below that it is full screen. Operator's requirement (XERK-2900).
   - The detail reviews a capture with the notes review's own `MeetingPart`/`DailyPart`, never a fork.
   - A block's `testTag` goes BEFORE its `clearAndSetSemantics`: after it, the tag is cleared too.
   - The view switch and mode picks are `FilterChip`s: `SegmentedButton` taps never reached

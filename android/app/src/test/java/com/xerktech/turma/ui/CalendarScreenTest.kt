@@ -275,6 +275,26 @@ class CalendarScreenTest {
     }
 
     @Test
+    @Config(sdk = [35], qualifiers = "w700dp-h900dp")
+    fun `an unfolded foldable or portrait tablet gets the week, and the detail full screen`() {
+        // Medium width: the app's `wide` (Expanded) is false, the calendar still shows weeks.
+        seed()
+        show(wide = false)
+        compose.onNodeWithTag("cal-mode-WORK").assertIsSelected()
+        compose.onNodeWithTag("cal-mode-DAY").assertDoesNotExist()
+        compose.onNodeWithTag("cal-mode-WEEK").performClick()
+        awaitEvent(subject)
+        compose.onNodeWithTag("cal-dh-${com.xerktech.turma.core.calWeekStart(today)}").assertExists()
+        compose.onNodeWithTag("cal-dh-${com.xerktech.turma.core.calWeekStart(today).plusDays(6)}").assertExists()
+        // Too narrow for the grid and a 400dp panel side by side: the detail takes the screen.
+        compose.onNode(event(subject)).performScrollTo().performClick()
+        compose.onNodeWithTag("cal-detail").assertExists()
+        compose.onNodeWithTag("cal-range").assertDoesNotExist()
+        // The week pick is kept apart from a phone's Day / 3 days.
+        assertEquals(com.xerktech.turma.core.CalMode.WEEK, calendarVm().modes.value[true])
+    }
+
+    @Test
     @Config(sdk = [35], qualifiers = "w1000dp-h800dp")
     fun `a wide screen opens on the Work week and shows the detail beside the grid`() {
         seed()

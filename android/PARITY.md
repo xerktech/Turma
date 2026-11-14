@@ -734,7 +734,8 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **The Calendar view (XERK-2897/2898/2899 → Android XERK-2900)**: a Calendar / Notes review switch
   (kept per phone; a meetings push opens Notes review) over the same `/api/calendar` +
   `/api/holidays` reads (`ui/CalendarScreen.kt`, `core/Calendar.kt`, `vm/CalendarViewModel.kt`).
-  - Phone: Day / 3 days under the week's day strip, ‹ › and swipe; wide: Work week / Week. The
+  - Phone: Day / 3 days under the week's day strip, ‹ › and swipe; a tablet or foldable (the
+    calendar ≥600dp wide, Medium included): Work week / Week, the detail beside it from 840dp. The
     range label opens a date picker (the web: a mini-month). Today, the all-day band with holidays
     and day-off hatching, org-tinted blocks side by side, tentative hatched, free outlined,
     canceled struck, past dimmed, the Tenir glyph, review badges, stale-host notices.

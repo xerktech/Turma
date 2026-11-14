@@ -174,11 +174,48 @@ private fun neutral(): Color = MaterialTheme.colorScheme.onSurfaceVariant
  * (consumed through [onRevealed]); [onOpenNotes] answers "Open in notes review";
  * [dailyFor] finds an org's daily entry for a daily-meeting event's brief.
  */
-@OptIn(ExperimentalMaterial3Api::class)
+/**
+ * Tablets and foldables get the week. The app's [wide] (Expanded, ≥840dp) is not
+ * enough on its own: a portrait tablet (~800dp) or an unfolded foldable (~670dp)
+ * is Medium, and a Day view there wastes the screen. So the calendar measures
+ * itself: the week modes from [CAL_WEEK_MIN_WIDTH] (the web's 760px narrow
+ * line, in dp for a phone held sideways too), the detail beside the grid only
+ * where both fit ([CAL_SIDE_MIN_WIDTH]); below that the detail is full screen.
+ */
+internal val CAL_WEEK_MIN_WIDTH = 600.dp
+internal val CAL_SIDE_MIN_WIDTH = 840.dp
+
 @Composable
 internal fun CalendarView(
     modifier: Modifier,
     wide: Boolean,
+    fleet: FleetState,
+    scoped: Set<String>,
+    names: Map<String, String>,
+    colors: Map<String, Int>,
+    cvm: CalendarViewModel,
+    bvm: BriefViewModel,
+    mvm: MeetingsViewModel,
+    reveal: CalTarget?,
+    onRevealed: () -> Unit,
+    onOpenNotes: (NotesTarget) -> Unit,
+    dailyFor: (String, Long) -> TriageEntry?,
+) {
+    BoxWithConstraints(modifier) {
+        CalendarBody(
+            Modifier.fillMaxSize(), weekly = wide || maxWidth >= CAL_WEEK_MIN_WIDTH,
+            side = wide || maxWidth >= CAL_SIDE_MIN_WIDTH,
+            fleet, scoped, names, colors, cvm, bvm, mvm, reveal, onRevealed, onOpenNotes, dailyFor,
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CalendarBody(
+    modifier: Modifier,
+    weekly: Boolean,
+    side: Boolean,
     fleet: FleetState,
     scoped: Set<String>,
     names: Map<String, String>,
@@ -208,8 +245,8 @@ internal fun CalendarView(
     val anchor = LocalDate.ofEpochDay(anchorDay)
     // A weekend meeting revealed into Work week shows Week until a mode pick (web XERK-2899 QA).
     var revealWeek by rememberSaveable { mutableStateOf(false) }
-    val picked = modes[wide] ?: CalMode.of(null, wide)
-    val mode = if (wide && revealWeek) CalMode.WEEK else picked
+    val picked = modes[weekly] ?: CalMode.of(null, weekly)
+    val mode = if (weekly && revealWeek) CalMode.WEEK else picked
     val days = calVisibleDays(anchor, mode)
     val keys = remember(scoped) { scoped.sorted() }
     LaunchedEffect(days, keys) { cvm.show(days, keys) }
@@ -233,7 +270,7 @@ internal fun CalendarView(
         val t = reveal ?: return@LaunchedEffect
         val d = calDay(t.startMs, zone)
         go(d)
-        revealWeek = wide && picked == CalMode.WORK && d.dayOfWeek.value >= DayOfWeek.SATURDAY.value
+        revealWeek = weekly && picked == CalMode.WORK && d.dayOfWeek.value >= DayOfWeek.SATURDAY.value
         closeDetail()
     }
     // Judged only once the grid shows the target's day: the range of the week
@@ -284,16 +321,16 @@ internal fun CalendarView(
     val grid: @Composable (Modifier) -> Unit = { m ->
         Column(m) {
             CalToolbar(
-                wide, mode, days, anchor, cvm.today(), locale,
+                weekly, mode, days, anchor, cvm.today(), locale,
                 onToday = { revealWeek = false; go(cvm.today()) },
                 onStep = { dir -> go(calStep(anchor, mode, dir)) },
                 onPicker = { picker = true },
-                onMode = { revealWeek = false; cvm.setMode(wide, it) },
+                onMode = { revealWeek = false; cvm.setMode(weekly, it) },
                 onDay = { go(it) },
             )
             CalNotices(range, now, zone, locale)
             WeekGrid(
-                Modifier.weight(1f), wide, days, range, now, zone, locale, fleet, keys, names, colors,
+                Modifier.weight(1f), weekly, days, range, now, zone, locale, fleet, keys, names, colors,
                 detailKey = detail?.key, scrollTo = scrollTo, onScrolled = { scrollTo = -1.0 },
                 onOpen = ::openDetail,
                 onSwipe = { dir -> go(calStep(anchor, mode, dir)) },
@@ -303,14 +340,14 @@ internal fun CalendarView(
     val panel: @Composable (Modifier, CalendarEvent) -> Unit = { m, ev ->
         key(ev.key) {
             CalendarDetail(
-                m, ev, wide, now, zone, locale, fleet, names, range.events, cvm, bvm, mvm,
+                m, ev, side, now, zone, locale, fleet, names, range.events, cvm, bvm, mvm,
                 onClose = ::closeDetail, onOpenNotes = onOpenNotes, dailyFor = dailyFor,
             )
         }
     }
     when {
         detail == null -> grid(modifier.fillMaxSize())
-        wide -> Row(modifier.fillMaxSize()) {
+        side -> Row(modifier.fillMaxSize()) {
             grid(Modifier.weight(1f).fillMaxHeight())
             VerticalDivider()
             panel(Modifier.width(400.dp).fillMaxHeight(), detail)
