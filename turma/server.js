@@ -954,15 +954,22 @@ const UPLOAD_NAME_MAX = 100;        // code points, not UTF-16 units
 const UPLOAD_NAME_MAX_BYTES = 240;  // UTF-8; ext4 caps a name at 255 and the
                                     // agent may add a "-<8 hex>" dedup suffix
 const UPLOAD_NAME_INVISIBLE_RE = /[\p{Cc}\p{Cf}\u034f\ufe00-\ufe0f\u{e0100}-\u{e01ef}]/gu;
-const UPLOAD_NAME_BAD_RE = /[^\p{L}\p{N}\p{Mn}\p{Mc}._ ()+-]/gu;
+// Nd/Nl, not all of N: superscript digits (No) would let "COM¹.txt" through, a
+// Windows device name.
+const UPLOAD_NAME_BAD_RE = /[^\p{L}\p{Nd}\p{Nl}\p{Mn}\p{Mc}._ ()+-]/gu;
 const utf8Len = (cps) => Buffer.byteLength(cps.join(""), "utf8");
 
 function safeUploadName(name) {
-  let s = String(name == null ? "" : name).normalize("NFC");
+  let s = String(name == null ? "" : name);
   s = s.split(/[\\/]/).pop() || "";               // basename, both separators
   s = s.replace(UPLOAD_NAME_INVISIBLE_RE, "");     // controls, bidi, zero-width
+  // NFC AFTER the drop: an invisible between a base and its mark would otherwise
+  // leave an uncomposed pair that the agent's second pass recomposes, so the file
+  // would land under a different name than the chip shows.
+  s = s.normalize("NFC");
   s = s.replace(UPLOAD_NAME_BAD_RE, "_");          // letters/digits/marks + a few
-  s = s.replace(/\s+/g, " ").trim().replace(/^\.+/, "").trim();
+  // Dots AND spaces off the front together: ". .bashrc" must not end as a dotfile.
+  s = s.replace(/\s+/g, " ").replace(/^[. ]+/, "").trim();
   // Measured in code points (Array.from), so a cut never splits a surrogate pair
   // and the three mirrors agree on where it falls.
   const cps = Array.from(s);
@@ -974,7 +981,7 @@ function safeUploadName(name) {
     const head = cps.slice(0, UPLOAD_NAME_MAX - ext.length);
     const budget = UPLOAD_NAME_MAX_BYTES - utf8Len(ext);
     while (head.length && utf8Len(head) > budget) head.pop();
-    s = head.concat(ext).join("");
+    s = head.concat(ext).join("").trim();          // a cut can end on a space
   }
   return s || "upload";
 }

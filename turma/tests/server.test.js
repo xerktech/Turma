@@ -23371,8 +23371,18 @@ test("uploads: safeUploadName keeps letters of any script and drops invisibles (
     ["a\u00a0b.png", "a_b.png"],                    // non-ASCII space
     ["a\uff0fb", "a_b"],                            // fullwidth solidus
     ["\ud800x.png", "_x.png"],                      // lone surrogate
+    ["re\u00ad\u0301sume\u0301.pdf", "r\u00e9sum\u00e9.pdf"], // NFC after the drop
+    ["COM\u00b9.txt", "COM_.txt"],                  // superscript: a Windows device
+    [". .bashrc", "bashrc"],                         // never a dotfile
+    [". ..", "upload"],
   ];
-  for (const [input, want] of cases) assert.equal(safeUploadName(input), want, JSON.stringify(input));
+  for (const [input, want] of cases) {
+    assert.equal(safeUploadName(input), want, JSON.stringify(input));
+    // Idempotent: the agent re-sanitizes the hub's answer, so a second pass that
+    // changed it would land the file under a name the chip does not show.
+    assert.equal(safeUploadName(want), want, JSON.stringify(want));
+  }
+  assert.equal(safeUploadName("a".repeat(99) + " " + "b".repeat(10)), "a".repeat(99));
   // A cut counts code points and UTF-8 bytes (ext4 caps a name at 255): it never
   // splits a surrogate pair and always keeps the extension.
   const cjk = safeUploadName("字".repeat(130) + ".png");

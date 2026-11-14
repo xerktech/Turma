@@ -18811,9 +18811,17 @@ class TestSafeUploadName(unittest.TestCase):
             ("a\u00a0b.png", "a_b.png"),                   # non-ASCII space
             ("a\uff0fb", "a_b"),                           # fullwidth solidus
             ("\ud800x.png", "_x.png"),                     # lone surrogate
+            ("re\u00ad\u0301sume\u0301.pdf", "r\u00e9sum\u00e9.pdf"),  # NFC after drop
+            ("COM\u00b9.txt", "COM_.txt"),                 # a Windows device name
+            (". .bashrc", "bashrc"),                        # never a dotfile
+            (". ..", "upload"),
         ]
         for raw, want in cases:
             self.assertEqual(ha.safe_upload_name(raw), want, repr(raw))
+            # Idempotent: this side re-sanitizes the hub's answer, and a second
+            # pass that changed it would land the file under another name.
+            self.assertEqual(ha.safe_upload_name(want), want, repr(want))
+        self.assertEqual(ha.safe_upload_name("a" * 99 + " " + "b" * 10), "a" * 99)
 
     def test_a_cut_counts_code_points_and_utf8_bytes(self):
         # ext4 caps a name at 255 bytes; 100 CJK letters would be 300.

@@ -37,7 +37,8 @@ object Uploads {
     /** Controls, format/bidi/zero-width, variation selectors: dropped outright. */
     private val INVISIBLE = Regex("[\\p{Cc}\\p{Cf}\\u034F\\uFE00-\\uFE0F\\x{E0100}-\\x{E01EF}]")
     /** Anything but letters, digits, marks of any script and `._ ()+-`: "_". */
-    private val BAD_NAME = Regex("[^\\p{L}\\p{N}\\p{Mn}\\p{Mc}._ ()+\\-]")
+    // Nd/Nl, not all of N: superscript digits would let "COM¹.txt" (a Windows device) through.
+    private val BAD_NAME = Regex("[^\\p{L}\\p{Nd}\\p{Nl}\\p{Mn}\\p{Mc}._ ()+\\-]")
     private const val NAME_MAX = 100        // code points
     private const val NAME_MAX_BYTES = 240  // UTF-8 (ext4: 255, less the agent's dedup suffix)
 
@@ -52,11 +53,13 @@ object Uploads {
      * cut never splits a surrogate pair.
      */
     fun sanitizeUploadName(name: String?): String {
-        var s = Normalizer.normalize(name ?: "", Normalizer.Form.NFC)
-        s = s.substringAfterLast('/').substringAfterLast('\\')
+        var s = (name ?: "").substringAfterLast('/').substringAfterLast('\\')
         s = INVISIBLE.replace(s, "")
+        // NFC after the drop, so a second pass (the hub's, the agent's) is a no-op.
+        s = Normalizer.normalize(s, Normalizer.Form.NFC)
         s = BAD_NAME.replace(s, "_")
-        s = Regex("\\s+").replace(s, " ").trim().trimStart('.').trim()
+        // Dots and spaces off the front together: ". .bashrc" is not a dotfile.
+        s = Regex("\\s+").replace(s, " ").trimStart('.', ' ').trim()
         val cps = s.codePoints().toArray()
         if (cps.size > NAME_MAX || utf8Len(s) > NAME_MAX_BYTES) {
             val dot = cps.lastIndexOf('.'.code)
@@ -65,7 +68,7 @@ object Uploads {
             var n = minOf(cps.size, NAME_MAX - ext.size)
             val budget = NAME_MAX_BYTES - utf8Len(extStr)
             while (n > 0 && utf8Len(String(cps, 0, n)) > budget) n--
-            s = String(cps, 0, n) + extStr
+            s = (String(cps, 0, n) + extStr).trim()  // a cut can end on a space
         }
         return s.ifEmpty { "upload" }
     }

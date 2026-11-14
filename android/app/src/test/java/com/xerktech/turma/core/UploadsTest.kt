@@ -63,8 +63,17 @@ class UploadsTest {
             "a\u00a0b.png" to "a_b.png",                    // non-ASCII space
             "a\uff0fb" to "a_b",                            // fullwidth solidus
             "\uD800x.png" to "_x.png",                      // lone surrogate
+            "re\u00ad\u0301sume\u0301.pdf" to "r\u00e9sum\u00e9.pdf", // NFC after the drop
+            "COM\u00b9.txt" to "COM_.txt",                  // a Windows device name
+            ". .bashrc" to "bashrc",                         // never a dotfile
+            ". .." to "upload",
         )
-        for ((raw, want) in cases) assertEquals(raw, want, Uploads.sanitizeUploadName(raw))
+        for ((raw, want) in cases) {
+            assertEquals(raw, want, Uploads.sanitizeUploadName(raw))
+            // Idempotent: the hub and agent re-sanitize this answer.
+            assertEquals(want, want, Uploads.sanitizeUploadName(want))
+        }
+        assertEquals("a".repeat(99), Uploads.sanitizeUploadName("a".repeat(99) + " " + "b".repeat(10)))
     }
 
     @Test

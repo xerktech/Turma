@@ -18375,14 +18375,19 @@ def _upload_name_char(ch):
     digits and non-enclosing marks of any script are kept; everything else
     outside UPLOAD_NAME_OK_ASCII (symbols, punctuation, non-ASCII spaces,
     lone surrogates) becomes "_"."""
-    if ord(ch) in UPLOAD_NAME_INVISIBLE:
-        return ""
-    cat = unicodedata.category(ch)
-    if cat in ("Cc", "Cf"):
+    if _upload_name_invisible(ch):
         return ""
     if ch.isascii():
         return ch if ch.isalnum() or ch in UPLOAD_NAME_OK_ASCII else "_"
-    return ch if cat[0] in "LN" or cat in ("Mn", "Mc") else "_"
+    # Nd/Nl, not all of N: superscript digits (No) would let "COM¹.txt" through,
+    # a Windows device name.
+    cat = unicodedata.category(ch)
+    return ch if cat[0] == "L" or cat in ("Nd", "Nl", "Mn", "Mc") else "_"
+
+
+def _upload_name_invisible(ch):
+    return (ord(ch) in UPLOAD_NAME_INVISIBLE
+            or unicodedata.category(ch) in ("Cc", "Cf"))
 
 
 def _utf8_len(s):
@@ -18399,12 +18404,14 @@ def safe_upload_name(name):
     marks and `._ ()+-` survive (see _upload_name_char); the extension survives
     a length cut, because it is what tells Claude Code's Read what kind of
     file this is."""
-    s = unicodedata.normalize("NFC", str(name or ""))
-    s = re.split(r"[\\/]", s)[-1]           # basename, both separators
+    s = re.split(r"[\\/]", str(name or ""))[-1]   # basename, both separators
+    # Drop invisibles BEFORE NFC, else a dropped char between a base and its mark
+    # leaves a pair a second pass recomposes (chip and landing name would differ).
+    s = "".join(ch for ch in s if not _upload_name_invisible(ch))
+    s = unicodedata.normalize("NFC", s)
     s = "".join(_upload_name_char(ch) for ch in s)
-    s = re.sub(r"\s+", " ", s).strip()
-    s = s.lstrip(".")                        # never a dotfile — a hidden upload
-    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    s = s.lstrip(". ").strip()   # never a dotfile, even ". .bashrc"
     if len(s) > UPLOAD_NAME_MAX or _utf8_len(s) > UPLOAD_NAME_MAX_BYTES:
         stem, dot, ext = s.rpartition(".")
         ext = f".{ext}" if dot and stem and len(ext) <= 11 else ""
@@ -18412,7 +18419,7 @@ def safe_upload_name(name):
         budget = UPLOAD_NAME_MAX_BYTES - _utf8_len(ext)
         while head and _utf8_len(head) > budget:
             head = head[:-1]
-        s = head + ext
+        s = (head + ext).strip()             # a cut can end on a space
     return s or "upload"
 
 
