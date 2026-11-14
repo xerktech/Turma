@@ -1,17 +1,137 @@
 ---
 paths:
   - "turma/server.js"
-  - "turma/holidays.js"
   - "turma/tenant-scope.js"
+  - "turma/holidays.js"
   - "turma/public/meetings.js"
+  - "agent/hub-agent.py"
+  - "agent/hooks/session_cli.py"
+  - "turma/public/calendar*"
   - "turma/tests/server.test.js"
   - "turma/tests/holidays.test.js"
+  - "agent/tests/test_hub_agent.py"
+  - "android/app/src/main/java/**/Calendar*.kt"
 ---
 
 # The Calendar wire contract (epic XERK-2890)
 
-A Teams-style meetings calendar built from Outlook and Tenir. Every child ticket builds to this
-file; change it here first.
+A Teams-style meetings calendar built from each host's classic Outlook (read by the session CLI's
+reader, `agent-session-cli.md`) and Tenir. The hub stores each host's events and serves them; the
+agent reads Outlook off its beat. Every child ticket builds to this file; change it here first.
+Hub half: XERK-2891.
+
+## Agent → hub: the `calendarSync` heartbeat outbox
+
+- **Delivery is a results OUTBOX on the heartbeat** (`calendarSync`, like `dailyBriefResults`),
+  not a field re-sent every beat and not a route of its own.
+  - Why: the beat already proves the host (XERK-268) and the agent stays outbound-only; a sync is
+    sent ONCE and cleared when a beat carrying it was accepted, so an offline hub costs no retry
+    code. A whole window re-sent every 20s beat would cost the heartbeat's 6x parse each time.
+  - ≤`CALENDAR_SYNC_ROWS_MAX` (2) rows a beat; `calendarSync` is deleted from the payload before
+    the record is stored (never on `/api/agents`).
+- Row: `{windowFrom, windowUntil, syncedAt, events[]}` — a read that worked — or
+  `{windowFrom, windowUntil, syncedAt, error}` — one that did not ("Outlook is not open", ≤300).
+  - Times are epoch ms; `windowUntil > windowFrom`, span ≤ `CALENDAR_SPAN_MAX_MS` (40 weeks).
+  - **The host is the beat's own key**, never a field of the row (a `host` sent is ignored).
+- **A sync is AUTHORITATIVE for its window**: every stored event of that host whose start lies in
+  `[windowFrom, windowUntil)` and is absent from the row is DELETED. That is how a meeting
+  canceled-and-removed, or a moved occurrence (its id stays, its start changes), disappears from
+  where it was. Events of the row are upserted by `id` (first copy of a repeated id wins).
+  - `canceled: true` events STAY (clients strike them through); only absence deletes.
+  - Outside the window nothing is touched, so a narrow on-demand sync never drops other weeks.
+- A failed row records `lastError` + `lastErrorAt` on the host and KEEPS its last good events.
+  A good row clears `lastError`.
+- **Size refusals are recorded in the hub's own words, never a 413 of the beat** (a refused beat
+  rolls the host back and reads offline, XERK-298): a row over `CALENDAR_SYNC_EVENTS_MAX` (1500)
+  events or `CALENDAR_SYNC_BYTES_MAX` (2 MiB of JSON), or a malformed window, leaves the stored
+  events untouched and sets `lastError` saying what the cap is. The beat is accepted.
+
+## The event (`sanitizeCalendarEvent`, the ONE whitelist)
+
+- The session CLI's normalized fields: `subject` ≤300, `start`/`end` ISO 8601 WITH offset ≤40
+  (Outlook's local wall time; the hub derives `startMs`/`endMs` and drops an event whose start
+  does not parse or whose end precedes it), `allDay`, `location` ≤300, `organizer` ≤100,
+  `busy` (free|tentative|busy|outOfOffice|workingElsewhere|unknown), `myResponse`
+  (none|organizer|tentative|accepted|declined|notResponded|unknown), `canceled`, `recurring`,
+  `attendees` ≤100 `{name ≤100, email ≤200 (email-shaped or ""), role
+  (organizer|required|optional|resource|unknown), response}`, `joinUrl` (`https://` ≤500, else "").
+- PLUS: `id` (required, ≤300, no control chars: the Outlook GlobalAppointmentID, and for a
+  recurring occurrence or exception `<GlobalAppointmentID>:<original start ISO>`), `seriesId`
+  ≤300 (the GlobalAppointmentID; "" for a single event), `lastModified` ISO ≤40, `body` plain
+  text ≤`CALENDAR_BODY_MAX` (4000 code points), `categories` ≤20 × ≤100, `sensitivity`
+  (normal|personal|private|confidential), `isOnlineMeeting`, `organizerEmail` ≤200.
+- Text is code points with control/bidi/format characters removed (`meetingText`); a wrong-typed
+  field becomes its "can't tell" value ("" / false / [] / "unknown"), never a guess.
+- Field order is fixed, so a stored event is a coerce FIXED POINT (the HA watch echo dedups).
+- Used by the ingest, the boot restore and the HA watch (`calendarEventsCoerce`). Rendered text is
+  sender-written: every client renders it ESCAPED.
+- **A private/confidential event is served with subject, body, location and attendees withheld**
+  (`subject: "Private event"`, `private: true`) unless that host's `showPrivate` setting is on.
+  Withheld at SERVE time; the store keeps them so the opt-in needs no resync.
+
+## Org assignment (served as `org` on each event, "" = unassigned)
+
+A host's calendar is one person's Outlook and may span orgs. Decided at serve time, in order:
+1. The host's per-series override (`seriesOrgs[seriesId || id]`), even "" (pinned unassigned).
+2. Domain rules: the org whose `domains` contain the ORGANIZER's email domain; else the one org
+   matching any attendee's domain, only when exactly one org matches (two = ambiguous, skipped).
+3. The host's `defaultOrg`.
+4. "" — clients draw it in a neutral color.
+- Only orgs of the HOST's tenant count (org key tenant == host key tenant), and only orgs some
+  host is decided into; a rule or setting naming another tenant's org is refused at the route.
+- A domain is lowercase `^[a-z0-9.-]{1,253}$` with a dot; `sub.a.com` matches rule `a.com`.
+
+## Settings (hub store, operator-authed, tenant-scoped)
+
+- Two `registerExternalStore`s: `/data/calendar-org-rules.json` (`CALENDAR_ORG_RULES_FILE`,
+  siteKey → `{domains[]}`, a `TENANT_ORG_STORES` member) and `/data/calendar-host-settings.json`
+  (`CALENDAR_HOST_SETTINGS_FILE`, hostKey → `{defaultOrg?, showPrivate?, seriesOrgs{}}`).
+  Split so each is keyed like its tenant's other stores (org key vs host key).
+- `POST /api/orgs/<site>/calendar-rules {domains: [..]}` (org route: 404 an org no host is
+  decided into; ≤50 domains; `[]` clears).
+- `POST /api/agents/<host>/calendar/settings {defaultOrg?, showPrivate?, series?: {id, org}}`
+  (host route, `principalMayDriveHost`); `defaultOrg`/`series.org` null clears, else must be a
+  decided org of the host's tenant (404). ≤500 series overrides per host (oldest dropped).
+- They answer `{ok, rules}` / `{ok, settings}` and broadcast a `calendar` frame for the host(s) affected.
+
+## The event store
+
+- `/data/calendar-events.json` (`CALENDAR_EVENTS_FILE`), `registerExternalStore`, hostKey →
+  `{syncedAt, windowFrom, windowUntil, ranges[[from, until]] ≤8, lastError?, lastErrorAt?,
+  events[]}`. The host key carries the tenant (XERK-2533), so the store needs no tenant field.
+- **Budget**: ~1 KB/event; default window −8w..+26w (`CALENDAR_PAST_MS` / `CALENDAR_FUTURE_MS`).
+  Per host ≤`CALENDAR_HOST_EVENTS_MAX` (1500) and ≤`CALENDAR_HOST_BYTES_MAX` (1.5 MiB); per
+  tenant ≤`CALENDAR_TENANT_BYTES_MAX` (4 MiB); hosts are bounded by `AGENTS_MAX`. Eviction: OLDEST PAST event
+  first (by end), then the furthest future; a tenant over budget trims its biggest host first.
+  - Why Postgres is not used: the store is written whole and stays under ~10 MiB fleet-wide at
+    these caps, the meetings store's budget class. Raise the caps only by moving it to Postgres.
+- **Keeps the last good sync per host**: an offline host's calendar is still served (`online:false`
+  beside it). A host removed from the registry loses its calendar 30 days after its last sync.
+- Tenant purge + migration step for `calendarEvents`, `calendarHostSettings` (a host's plain
+  org values follow it into the tenant) and `calendarOrgRules`. Tests: `tenant-migration.test.js`.
+
+## Hub → agent: the `syncCalendar` command
+
+- `{type:"syncCalendar", from, until}` epoch ms, span ≤ 40 weeks. Queued only to an online host
+  reporting `calendar: {available: true}` (`normalizeCalendarCapability`, strict boolean; absent
+  = older agent, which would ack and never answer). At most one undelivered per host (a newer one
+  replaces it).
+- **Queued on reconnect**: a beat after `OFFLINE_AFTER_MS` of silence (or a host's first beat)
+  queues the default window at once. Also when `GET /api/calendar` asks a range no stored range of
+  that host covers (throttled per host, `CALENDAR_ONDEMAND_MIN_MS` 60s).
+
+## Served
+
+- `GET /api/calendar?from=&until=[&org=a,b]` (filtered route): `until - from` ≤ 100 days.
+  Answers `{from, until, hosts: [{host, device, online, syncedAt, windowFrom, windowUntil,
+  ranges, lastError?, lastErrorAt?, pending?}], events: [{host, org, ...event}]}` — only hosts the
+  caller may drive (`principalMayDriveHost`), only events overlapping the range, `org` filter on
+  the ASSIGNED org ("" selects unassigned). ≤`CALENDAR_SERVE_MAX` (5000) events, earliest first.
+  `pending: true` = a `syncCalendar` was queued for this range.
+- **Not on `/api/agents`**: too big for the snapshot. A coalesced `calendar` SSE frame (one per
+  turn) announces which hosts changed: `{<hostKey>: {syncedAt, windowFrom, windowUntil}}`, scoped
+  per host like the agent list; clients refetch the range they show.
+- Tests: the `XERK-2891:` cases in `server.test.js`.
 
 ## Holidays (hub, XERK-2892)
 

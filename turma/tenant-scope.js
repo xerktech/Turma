@@ -85,12 +85,15 @@ const ROUTES = [
   ["GET", "/api/holidays", "filtered"],
   ["GET POST", "/api/enroll-codes", "filtered"], ["DELETE", "/api/enroll-codes/:id", "filtered"],
   ["POST", "/api/jira/refresh", "filtered"],
+  // The caller's hosts' calendars (XERK-2891): calendarView keeps only hosts it may drive.
+  ["GET", "/api/calendar", "filtered"],
   // per host (the operator commands)
   ["POST", "/api/agents/:host/clone", "host"],
   ["POST", "/api/agents/:host/repos/:repo/prune", "host"],
   ["POST", "/api/agents/:host/repos/:repo/delete", "host"],
   ["POST", "/api/agents/:host/restart", "host"],
   ["POST", "/api/agents/:host/roll-token", "host"],
+  ["POST", "/api/agents/:host/calendar/settings", "host"],
   ["POST", "/api/agents/:host/revoke-name-token", "host"],
   ["POST", "/api/agents/:host/transcripts/:tid/resume", "host"],
   ["POST", "/api/agents/:host/uploads", "host"],
@@ -130,6 +133,7 @@ const ROUTES = [
   ["POST", "/api/orgs/:site/meeting-label", "org"],
   ["POST", "/api/orgs/:site/meeting-focus", "org"],
   ["PUT", "/api/orgs/:site/holidays", "org"],
+  ["POST", "/api/orgs/:site/calendar-rules", "org"],
   ["POST", "/api/orgs/:site/decisions", "org"],
   ["POST", "/api/orgs/:site/daily-brief/run", "org"],
   ["GET PUT", "/api/orgs/:site/daily-brief/schedule", "org"],
@@ -252,6 +256,12 @@ const SCOPERS = {
   // A tier key carries its tenant (`<repo>@<tenantId>`, XERK-2620): a view gets
   // its own tenant's tiers only, under the plain repo name its clients join on.
   repoTiers: (view) => (m) => repoTiersFor(m, view.repoTenant),
+  // The `calendar` SSE frame (XERK-2891): hostKey -> what changed. Only hosts the
+  // view may drive; nothing at all when none is left (no other tenant's timing).
+  calendar: (view) => (m) => {
+    const out = filterMap(m, (k) => view.mayHost(k));
+    return out && typeof out === "object" && Object.keys(out).length ? out : undefined;
+  },
 };
 const TIER_TENANT_RE = /@([0-9a-f]{32})$/;
 function repoTiersFor(m, tenant) {

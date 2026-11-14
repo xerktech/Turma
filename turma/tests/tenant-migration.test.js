@@ -28,7 +28,7 @@ for (const k of [
   "PERMISSION_POLICIES_FILE", "TRIAGE_ACTIONS_FILE", "PRIORITY_WRITEBACK_ORGS_FILE",
   "DEDUPE_LINK_ORGS_FILE", "AUTOMERGE_ORGS_FILE", "ORG_COLORS_FILE", "REPO_TIERS_FILE",
   "EPIC_RUNS_FILE", "EPIC_BUILDERS_FILE", "DECISIONS_FILE", "TENANCY_FILE",
-  "DAILY_BRIEF_SCHEDULES_FILE", "DAILY_BRIEFS_FILE", "MEETING_PROPOSALS_FILE", "MEETING_LABELS_FILE", "MEETING_LABEL_MISSES_FILE", "MEETING_FOCUS_FILE", "HOLIDAY_SETTINGS_FILE", "MEETING_TOKENS_FILE",
+  "DAILY_BRIEF_SCHEDULES_FILE", "DAILY_BRIEFS_FILE", "MEETING_PROPOSALS_FILE", "MEETING_LABELS_FILE", "MEETING_LABEL_MISSES_FILE", "MEETING_FOCUS_FILE", "HOLIDAY_SETTINGS_FILE", "CALENDAR_EVENTS_FILE", "CALENDAR_ORG_RULES_FILE", "CALENDAR_HOST_SETTINGS_FILE", "MEETING_TOKENS_FILE",
   "ARCHIVE_PURGED_TENANTS_FILE", "USAGE_LEDGER_FILE", "PERMISSION_LEDGER_FILE", "OUTCOME_LEDGER_FILE",
 ]) process.env[k] = path.join(DIR, `${k.toLowerCase()}.json`);
 process.env.MIGRATE_SPOOL_DIR = path.join(DIR, "spool");
@@ -101,6 +101,7 @@ const ORG_SAMPLES = {
   meetingLabelMisses: ["yprime", { at: NOW }],
   meetingFocus: [SITE, { names: ["Ann Lee"], role: "QA lead" }],
   holidaySettings: [SITE, { countries: ["US"], off: ["us-thanksgiving"] }],
+  calendarOrgRules: [SITE, { domains: ["acme.example"] }],
   ticketAgents: [`${SITE}/ACME-1`, { host: "box2554", at: NOW }],
   ticketModels: [`${SITE}/ACME-1`, { model: "sonnet", at: NOW }],
   ticketRuntimes: [`${SITE}/ACME-1`, { runtime: "dsh", at: NOW }],
@@ -138,6 +139,9 @@ test("XERK-2554: seed untenanted data in every partitioned store", async () => {
     slug: "s", createdAt: "2026-10-01T00:00:00Z", endedTs: "2026-10-01T00:00:00Z", summary: "s" },
   0, Buffer.byteLength(JSON.stringify(list)), list, SITE);
   assert.equal(archive.sessionRow("t2554").host, "gone2554");
+  // XERK-2891: a host's calendar and its settings (which name a plain org).
+  hub.getCalendarEvents().gone2554 = { syncedAt: NOW, windowFrom: 1, windowUntil: 2, ranges: [], events: [] };
+  hub.getCalendarHostSettings().gone2554 = { defaultOrg: SITE, seriesOrgs: Object.assign(Object.create(null), { s1: SITE }) };
 
   // Every sampled store is migrated too: one dropped from the list would keep
   // its rows under the old site key.
@@ -274,6 +278,9 @@ test("XERK-2554: the migration moves every store into the owner's tenant; hosts 
   assert.ok(hub.usageLedger.has(tk("gone2554")) && !hub.usageLedger.has("gone2554"));
   assert.deepEqual(hub.permissionLedger.hostKeys().filter((h) => h.startsWith("gone2554")), [tk("gone2554")]);
   assert.deepEqual(hub.outcomeLedger.hostKeys(), [tk("gone2554")]);
+  assert.ok(!hub.getCalendarEvents().gone2554 && hub.getCalendarEvents()[tk("gone2554")]);
+  const cs = hub.getCalendarHostSettings()[tk("gone2554")];
+  assert.deepEqual([cs.defaultOrg, cs.seriesOrgs.s1], [`${SITE}@${T}`, `${SITE}@${T}`]);
   assert.deepEqual(hub.outcomeLedger.siteKeys(), [tk(SITE)]);
   const row = archive.listRowOwners().find((x) => x.transcriptId === "t2554");
   assert.equal(row.host, tk("gone2554"));
