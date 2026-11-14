@@ -97,6 +97,31 @@ test("XERK-2897: an event spanning midnight is clipped to each day; a 24h+ one r
   assert.equal(cal.daySegments([{ allDay: true, startMs: at(2026, 11, 10), endMs: at(2026, 11, 11) }], at(2026, 11, 10)).length, 0);
 });
 
+test("XERK-2930: an event in the repeated fall-back hour lays out by its length and names both zones", () => {
+  // 2026-11-01 05:30Z is 1:30 EDT; 06:00Z is 1:00 EST — the clock runs backwards.
+  const ev = { startMs: Date.parse("2026-11-01T05:30:00Z"), endMs: Date.parse("2026-11-01T06:00:00Z") };
+  const [s] = cal.daySegments([ev], at(2026, 11, 1));
+  assert.deepEqual([s.top, s.end, s.bottom], [90, 120, 120]);
+  // An hour from 1:30 EDT to 1:30 EST (wall end == start) and 1:30 EDT – 1:40 EST are full length;
+  // 0:30 EDT – 1:30 EST is two hours; a spring-forward hour keeps its wall rows.
+  const len = (a, b, d) => { const [x] = cal.daySegments([{ startMs: Date.parse(a), endMs: Date.parse(b) }], d); return x.end - x.top; };
+  assert.equal(len("2026-11-01T05:30:00Z", "2026-11-01T06:30:00Z", at(2026, 11, 1)), 60);
+  assert.equal(len("2026-11-01T05:30:00Z", "2026-11-01T06:40:00Z", at(2026, 11, 1)), 70);
+  assert.equal(len("2026-11-01T04:30:00Z", "2026-11-01T06:30:00Z", at(2026, 11, 1)), 120);
+  assert.equal(len("2026-03-08T06:30:00Z", "2026-03-08T07:30:00Z", at(2026, 3, 8)), 120);
+  // An end PAST the repeated hour keeps its wall row: 1:30 EDT – 9:00 EST ends at 9:00, and
+  // an overnight 10 pm EDT – 3:00 EST ends at 3:00 on Nov 1.
+  const [lg] = cal.daySegments([{ startMs: Date.parse("2026-11-01T05:30:00Z"), endMs: Date.parse("2026-11-01T14:00:00Z") }], at(2026, 11, 1));
+  assert.equal(lg.end, 540);
+  const [ov] = cal.daySegments([{ startMs: Date.parse("2026-11-01T02:00:00Z"), endMs: Date.parse("2026-11-01T08:00:00Z") }], at(2026, 11, 1));
+  assert.deepEqual([ov.top, ov.end], [0, 180]);
+  const label = cal.fmtSpan(ev.startMs, ev.endMs);
+  assert.match(label, /EDT/);
+  assert.match(label, /EST/);
+  // An ordinary span keeps its plain label.
+  assert.doesNotMatch(cal.fmtSpan(at(2026, 11, 10, 9), at(2026, 11, 10, 10)), /E[SD]T/);
+});
+
 test("XERK-2897: canceled, past, tentative, free and Tenir-only styling", () => {
   const now = at(2026, 11, 14, 12);
   assert.deepEqual(cal.styleOf({ canceled: true, startMs: now + 1, endMs: now + 2 }, now), ["canceled"]);

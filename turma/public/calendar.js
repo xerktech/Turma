@@ -81,7 +81,17 @@ function rangeLabel(days) {
   } catch { return new Date(a).toDateString(); }
 }
 const fmtTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+// UTC offset of local wall time at ms, in minutes (changes across a DST switch).
+const offsetAt = (ms) => -new Date(ms).getTimezoneOffset();
 function fmtSpan(s, e) {
+  // A span across a DST switch (the repeated fall-back hour) names each end's zone,
+  // so "1:30 – 1:00 AM" reads "1:30 AM EDT – 1:00 AM EST".
+  if (e > s && offsetAt(s) !== offsetAt(e)) {
+    try {
+      const z = new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit", timeZoneName: "short" });
+      return `${z.format(s)} – ${z.format(e)}`;
+    } catch { /* fall through */ }
+  }
   try {
     const f = new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" });
     if (typeof f.formatRange === "function" && e > s && dayStart(s) === dayStart(e)) return f.formatRange(s, e);
@@ -190,7 +200,16 @@ function daySegments(events, day) {
   for (const ev of events) {
     if (inBand(ev) || !onDay(ev, day)) continue;
     const top = wallMinutes(ev.startMs, day);
-    const end = ev.endMs > ev.startMs ? wallMinutes(ev.endMs, day) : top;
+    let end = ev.endMs > ev.startMs ? wallMinutes(ev.endMs, day) : top;
+    // The grid is wall-clock, so an end in the SECOND pass of the repeated fall-back hour
+    // reads an hour early (1:30 EDT – 1:30 EST is zero long): push it down by the hour the
+    // clock repeated. An end past the repeated hour (9:00 EST) already sits on its row.
+    const from = Math.max(ev.startMs, day);
+    const back = offsetAt(from) - offsetAt(ev.endMs);
+    if (ev.endMs > from && ev.endMs < addDays(day, 1) && back > 0
+      && offsetAt(ev.endMs - back * 60000) !== offsetAt(ev.endMs)) {
+      end = Math.min(1440, end + back);
+    }
     segs.push({ ev, top, end, bottom: Math.min(1440, Math.max(end, top + MIN_LAYOUT_MIN)) });
   }
   return layoutDay(segs);
@@ -1089,7 +1108,7 @@ const api = {
   mount, update, setActive, refetch, upcoming, reveal,
   // pure helpers, for tests
   dayStart, addDays, weekStart, dayKey, parseDayKey, visibleDays, stepAnchor, weeksOf, rangeLabel,
-  wallMinutes, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
+  wallMinutes, fmtSpan, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
   calendarHtml, safeHttps, isUpcomingMeeting, notesTarget, UPCOMING_MS,
   detailHtml, panelSpec, badgeOf, fmtLongSpan, originalStart, relink, evDomKey,
   _state: () => ({ anchor, mode: mode(), weeks, detail, picker }),

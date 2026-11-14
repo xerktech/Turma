@@ -1273,3 +1273,16 @@ test("XERK-2914: archiving from the calendar panel leaves the notes view's selec
   // own fallback for a selection that left Needs review picks the first entry.
   assert.equal(P.state().selected, P.entryKey(SITE, "m:m0"));
 });
+
+test("XERK-2930: a span across the fall-back switch names its zones, never '1:30 AM – 1:00 AM'", () => {
+  const tz = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    const api = loadPage();
+    const label = api.fmtSpan(Date.parse("2026-11-01T05:30:00Z"), Date.parse("2026-11-01T06:00:00Z"));
+    assert.match(label, /EDT – 1:00\sAM EST/);
+    // Across midnight the end names its zone too (1:30 alone is ambiguous that night).
+    assert.match(api.fmtSpan(Date.parse("2026-11-01T03:00:00Z"), Date.parse("2026-11-01T06:30:00Z")), /1:30\sAM EST$/);
+    assert.doesNotMatch(api.fmtSpan(Date.parse("2026-11-10T14:00:00Z"), Date.parse("2026-11-10T15:00:00Z")), /E[SD]T/);
+  } finally { if (tz === undefined) delete process.env.TZ; else process.env.TZ = tz; }
+});

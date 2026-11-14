@@ -48,7 +48,18 @@ const safeHttps = (u) => (typeof u === "string" && /^https:\/\/[^\s"'<>`\\]+$/i.
 const safeColor = (c) => (typeof c === "string" && /^var\(--s[1-8]\)$/.test(c) ? c : "");
 function fmtSpan(s, e) {
   const day = (ms) => new Date(ms).toDateString();
-  return isTime(e) && e > s ? `${fmtWhen(s)} – ${day(s) === day(e) ? fmtTime(e) : fmtWhen(e)}` : fmtWhen(s);
+  if (!(isTime(e) && e > s)) return fmtWhen(s);
+  // Across a DST switch (the repeated fall-back hour) the end names its zone, as the
+  // calendar's label does, so "1:30 AM – 1:00 AM" reads "… 1:00 AM EST".
+  const off = (ms) => new Date(ms).getTimezoneOffset();
+  if (off(s) !== off(e)) {
+    try {
+      const z = (ms) => new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZoneName: "short" });
+      const zone = (ms) => z(ms).replace(/^.*\s(\S+)$/, "$1");
+      return `${fmtWhen(s)} ${zone(s)} – ${day(s) === day(e) ? z(e) : `${fmtWhen(e)} ${zone(e)}`}`;
+    } catch { /* fall through */ }
+  }
+  return `${fmtWhen(s)} – ${day(s) === day(e) ? fmtTime(e) : fmtWhen(e)}`;
 }
 // A daily entry and its calendar occurrence are one meeting when they start this close.
 const DAILY_EVENT_MS = 20 * 60000;
@@ -1456,7 +1467,7 @@ function pendingCount(data) {
 const api = { mount, update, invalidate, hold, pendingCount, reveal, showPanel, meetingState, patch,
   // test hooks (tests/meetings.test.js, tests/brief.test.js)
   renderMeetings, review, archive, startEdit, edits, setProject, itemKey, entryKey, meetingKey, saveLabel,
-  missesHtml, saveFocus, onKey, entriesOf, select,
+  missesHtml, saveFocus, onKey, entriesOf, select, fmtSpan,
   openDrawer: (s) => { drawer = s; repaint(true); },
   setFilter: (f) => { filter = f; repaint(true); },
   setQuery: (q) => { query = q; repaint(true); },

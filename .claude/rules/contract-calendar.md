@@ -101,7 +101,7 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
   does not parse or whose end precedes it), `allDay`, `location` ≤300, `organizer` ≤100,
   `busy` (free|tentative|busy|outOfOffice|workingElsewhere|unknown), `myResponse`
   (none|organizer|tentative|accepted|declined|notResponded|unknown), `canceled`, `recurring`,
-  `attendees` ≤100 `{name ≤100, email ≤200 (email-shaped or ""), role
+  `attendees` ≤100 `{name ≤100, email ≤200 (email-shaped with no `"`/`<`/`>`/backtick/space/control/bidi/zero-width char, else ""), role
   (organizer|required|optional|resource|unknown), response}`, `joinUrl` (`https://` ≤500, else "").
 - PLUS: `id` (required, ≤300, no control chars: the Outlook GlobalAppointmentID, and for a
   recurring occurrence or exception `<GlobalAppointmentID>:<original start ISO>`), `seriesId`
