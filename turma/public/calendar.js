@@ -209,7 +209,10 @@ let scrollToMin = -1;             // the grid scrolls to this wall minute on the
 
 const wideMode = () => (modes && (modes.wide === "week" || modes.wide === "work") ? modes.wide : "work");
 const narrowMode = () => (modes && (modes.narrow === "three" || modes.narrow === "day") ? modes.narrow : "day");
-const mode = () => (narrow ? narrowMode() : wideMode());
+// A weekend meeting revealed from the notes review shows the full Week (XERK-2899 QA:
+// Work week drew a panel for an event not on the grid). Not saved: a mode pick ends it.
+let revealWeek = false;
+const mode = () => (narrow ? narrowMode() : (revealWeek ? "week" : wideMode()));
 function setMode(m) {
   if (!(m in MODES)) return;
   modes = { ...(modes && typeof modes === "object" ? modes : {}), [narrow ? "narrow" : "wide"]: m };
@@ -354,6 +357,8 @@ function reveal(target) {
     site: typeof target.site === "string" ? target.site : "",
     meetingId: typeof target.meetingId === "string" ? target.meetingId : "" };
   anchor = dayStart(at);
+  const wd = new Date(at).getDay();
+  if (!narrow && wideMode() === "work" && (wd === 0 || wd === 6)) revealWeek = true;
   picker = null;
   detail = null;
   detailFrom = null;
@@ -691,7 +696,7 @@ function closeDetail() {
   paint(true);
   if (back) restoreFocusSig(back);
 }
-function go(ms) { anchor = dayStart(ms); paint(true); }
+function go(ms) { revealing = null; anchor = dayStart(ms); paint(true); }
 
 function mount(el, opts = {}) {
   if ($root) return;
@@ -728,7 +733,7 @@ function mount(el, opts = {}) {
     }
     if (d.step !== undefined) return void go(stepAnchor(anchor, mode(), Number(d.step) < 0 ? -1 : 1));
     if (d.calToday !== undefined) return void go(nowFn());
-    if (d.mode !== undefined) { setMode(d.mode); return void paint(true); }
+    if (d.mode !== undefined) { revealWeek = false; revealing = null; setMode(d.mode); return void paint(true); }
     if (d.openPicker !== undefined) {
       picker = picker === null ? new Date(new Date(anchor).getFullYear(), new Date(anchor).getMonth(), 1).getTime() : null;
       paint(true);

@@ -6532,7 +6532,7 @@ function meetingCalendarEventWire(siteKey, m, index) {
     start: w.start, end: w.end, startMs: w.startMs, endMs: w.endMs, canceled: w.canceled,
     moved: !calOverlapsCapture(m, w),
     // Who was invited, as Outlook names them (the notes review shows them beside the
-    // capture, XERK-2899): names only, no rooms, capped so 20 rows an org stay small.
+    // capture, XERK-2899): a name (its email when nameless), no rooms, capped so 20 rows an org stay small.
     attendees: w.attendees.filter((p) => p.role !== "resource").map((p) => p.name || p.email)
       .filter(Boolean).slice(0, CALENDAR_WIRE_ATTENDEES_MAX) };
   if (w.private) out.private = true;

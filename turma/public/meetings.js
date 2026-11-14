@@ -573,6 +573,8 @@ function entryTitle(e) {
 function entryWhen(e, now) {
   if (!isTime(e.at)) return "";
   const b = bucketOf(e.at, now);
+  // Six days out or more, a weekday alone reads as this week's (XERK-2899 QA): add the date.
+  if (b === "Upcoming" && e.at >= startOfDay(now) + 6 * 864e5) return `${fmtDay(e.at)} ${fmtTime(e.at)}`;
   return b === "Today" ? fmtTime(e.at) : b === "Upcoming" || b === "Yesterday" ? `${fmtDay(e.at).split(",")[0]} ${fmtTime(e.at)}` : fmtDay(e.at);
 }
 function entrySide(e) {

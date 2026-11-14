@@ -918,3 +918,18 @@ test("XERK-2899: Open in notes review selects the capture or meeting wherever th
   assert.deepEqual(P.state().collapsed, []);
   assert.equal(P.state().selected, P.entryKey(SITE, "m:m1"));
 });
+
+test("XERK-2899 QA: an org color is only a palette slot; a week-out meeting carries its date", () => {
+  const G = "globex.atlassian.net";
+  const far = new Date(); far.setDate(far.getDate() + 6); far.setHours(9, 0, 0, 0);
+  const P = calPage([calEv("a", Date.now() + 2 * 864e5), calEv("g", far.getTime(), { org: G })]);
+  const d = { ...data([]), agents: [{ org: SITE, jira: { siteKey: SITE, orgName: "Acme" } }, { org: G, jira: { siteKey: G, orgName: "Globex" } }] };
+  P.setCache(d);
+  P.setFilter("all");
+  const h = P.list();
+  assert.match(h, /data-entry="[^"]*c%3Aa"[^>]*style="--org:var\(--s3\)"/);
+  assert.match(h, /data-entry="[^"]*c%3Ag">/, "a non-palette color paints neutral");
+  assert.doesNotMatch(h, /url\(x\)/);
+  const day = far.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+  assert.ok(h.includes(`<span class="w">${day} `), `dated: ${day}`);
+});

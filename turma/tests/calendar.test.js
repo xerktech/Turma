@@ -453,3 +453,59 @@ test("XERK-2899: reveal() opens the week and the event carrying a capture; the p
   assert.equal(cal.dayKey(cal._state().anchor), "2026-12-03");
   cal.setActive(false);
 });
+
+test("XERK-2899 QA: a weekend reveal shows Week (unsaved); navigation drops a reveal still waiting", { timeout: 10000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  NOW = at(2026, 11, 12, 10, 30);
+  const wk = cal.weekStart(at(2027, 2, 6));
+  let fail = true;
+  replies = { "/api/calendar": (url) => {
+    if (!url.includes(`from=${wk}&`)) return { hosts: [], events: [] };
+    if (fail) return { status: 503, body: { error: "down" } };
+    return { hosts: [], events: [{ host: "h1", id: "sat", org: "acme", subject: "Saturday sync",
+      startMs: at(2027, 2, 6, 10), endMs: at(2027, 2, 6, 11) }] };
+  } };
+  cal.setActive(true);
+  assert.equal(cal._state().mode, "work");
+  cal.reveal({ eventId: "sat", startMs: at(2027, 2, 6, 10) });
+  for (let i = 0; i < 8; i++) await tick();
+  assert.equal(cal._state().mode, "week", "a Saturday meeting is drawn, not just paneled");
+  assert.equal(cal._state().detail, null, "its week failed: nothing to open yet");
+  // The viewer moves on; the week recovering later must not yank them back.
+  cal._go(at(2027, 3, 3));
+  fail = false;
+  cal._go(at(2027, 2, 6));
+  t.mock.timers.tick(20000);
+  for (let i = 0; i < 8; i++) await tick();
+  assert.match(cal.calendarHtml(), /Saturday sync/);
+  assert.equal(cal._state().detail, null);
+  // An id the week does not hold is dropped once read: a later read that has it opens nothing.
+  cal.reveal({ eventId: "later", startMs: at(2027, 2, 6, 10) });
+  for (let i = 0; i < 8; i++) await tick();
+  replies["/api/calendar"] = () => ({ hosts: [], events: [{ host: "h1", id: "later", org: "acme", subject: "Later",
+    startMs: at(2027, 2, 6, 12), endMs: at(2027, 2, 6, 13) }] });
+  cal.refetch();
+  for (let i = 0; i < 8; i++) await tick();
+  assert.equal(cal._state().detail, null);
+  // A mode pick ends the weekend Week.
+  for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset: { mode: "work" } }) } });
+  assert.equal(cal._state().mode, "work");
+  cal.setActive(false);
+});
+
+test("XERK-2899 QA: a hidden calendar still retries a failed upcoming week", { timeout: 10000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  NOW = at(2027, 6, 2, 10);
+  let fail = true;
+  const asked = [];
+  replies = { "/api/calendar": (url) => { asked.push(url); return fail ? { status: 503, body: { error: "down" } } : { hosts: [], events: [] }; } };
+  cal.setActive(false);
+  cal.upcoming("acme");
+  for (let i = 0; i < 8; i++) await tick();
+  const first = asked.length;
+  assert.ok(first >= 1);
+  fail = false;
+  t.mock.timers.tick(20000);
+  for (let i = 0; i < 8; i++) await tick();
+  assert.ok(asked.length > first, "the notes review's weeks are read again while hidden");
+});

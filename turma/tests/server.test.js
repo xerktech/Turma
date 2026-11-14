@@ -32579,6 +32579,25 @@ test("XERK-2896: a linked capture whose event is not served still shows on its o
   }
 });
 
+test("XERK-2899: a linked capture's invitees: names (email when nameless), no rooms, at most 30", async () => {
+  const S = "lkA2899.atlassian.net", D = "lkA2899";
+  cleanup2896(S, [D]);
+  try {
+    const many = Array.from({ length: 35 }, (_, i) => ({ name: `P${i}`, email: `p${i}@x.com`, role: "required", response: "accepted" }));
+    await calHost2896(D, S, [ev2896("big", T2896, 30, { attendees: [
+      { name: "Room 4B", email: "room@x.com", role: "resource", response: "accepted" },
+      { name: "", email: "noname@x.com", role: "optional", response: "none" }, ...many] })]);
+    await postMeeting2508(S, capture2896("c", T2896, 30));
+    const fleet = (await request("GET", "/api/agents", { headers: userHeaders })).body.meetingProposals[S];
+    const at = fleet.find((m) => m.meetingId === "c").calendarEvent.attendees;
+    assert.equal(at.length, 30);
+    assert.deepEqual(at.slice(0, 3), ["noname@x.com", "P0", "P1"]);
+    assert.ok(!at.includes("Room 4B"), "a room is not an invitee");
+  } finally {
+    cleanup2896(S, [D]);
+  }
+});
+
 test("XERK-2896: a private event stays withheld beside its capture", async () => {
   const S = "lkI2896.atlassian.net", D = "lkI2896";
   cleanup2896(S, [D]);

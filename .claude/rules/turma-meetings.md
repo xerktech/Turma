@@ -60,6 +60,8 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 - **Impromptu** = no `calendarEventId` and no `calendarEvent`: labeled in the rail and the pane.
 - **Open in calendar** (`hooks.openCalendar` → `TurmaCalendar.reveal`) moves to the week and opens
   the event's panel: matched by the capture (`meetings[]` or its Tenir-only entry) before the id.
+  A weekend event in Work week shows Week until a mode pick (`revealWeek`, unsaved); any
+  navigation drops a reveal still waiting on its week.
 - **Open in notes review** (the calendar panel, `notesTarget` → `TurmaMeetings.reveal`) selects the
   capture or upcoming entry, switching Archived ⇄ All, clearing a hiding search, opening its org.
   A target not listed yet resolves on a later paint (≤30s).
