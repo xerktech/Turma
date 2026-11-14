@@ -227,6 +227,7 @@ let detail = null;                // the event whose detail panel is open
 let lastGot = null;               // collect() of the last paint: the relink candidates
 let $grid = null, $side = null, $info = null, $mt = null;
 let descOpen = false;             // the open event's description is expanded
+let attOpen = false;              // the open event's attendee list is expanded (collapsed by default, XERK-2942)
 let panelHas = false;             // meetings.js painted the capture into the panel
 const linkBusy = new Set();       // capture keys with a relink POST in flight
 const linkErr = new Map();        // capture key -> the hub's refusal
@@ -684,6 +685,7 @@ function detailHtml(ev, now, hasPanel = false) {
   const openNotesBtn = openNotes && notesTarget(ev, now)
     ? `<div class="cal-drow"><button type="button" class="btn-sm" data-open-notes>Open in notes review</button></div>` : "";
   const att = Array.isArray(ev.attendees) ? attendeesHtml(ev.attendees) : "";
+  const attN = att ? (att.match(/<li>/g) || []).length : 0;
   // The description as Outlook wrote it: escaped line by line, breaks kept.
   const descHtml = linesHtml(ev.body);
   const notes = [];
@@ -709,7 +711,9 @@ function detailHtml(ev, now, hasPanel = false) {
     + (join ? `<div class="cal-drow"><a href="${esc(join)}" target="_blank" rel="noopener noreferrer">Join meeting</a></div>` : "")
     + openNotesBtn
     + notes.map((n) => `<p class="cal-dnote">${esc(n)}</p>`).join("")
-    + (att ? `<div class="cal-dsec"><div class="cal-dlabel">Attendees</div>${att}</div>` : "")
+    // Collapsed by default like the description (XERK-2942): a big invite list buries the rest.
+    + (att ? `<div class="cal-dsec"><button type="button" class="linkish cal-dlabel" data-att-toggle aria-expanded="${attOpen}">`
+      + `${attOpen ? "▾" : "▸"} Attendees (${attN})</button>${attOpen ? att : ""}</div>` : "")
     + (descHtml ? `<div class="cal-dsec"><button type="button" class="linkish cal-dlabel" data-body-toggle aria-expanded="${descOpen}">`
       // descHtml is linesHtml's output: every line esc()'d (Semgrep reads `ev.body` as an Express req.body).
       // nosemgrep: javascript.express.security.injection.raw-html-format.raw-html-format
@@ -877,7 +881,7 @@ function paintDetail(force = false) {
   lastDetail = html;
   const a = typeof document !== "undefined" ? document.activeElement : null;
   const ds = a && $info.contains && $info.contains(a) && a.dataset ? a.dataset : null;
-  const k = ds && ["linkPick", "linkGo", "linkUnlink", "linkAuto", "bodyToggle", "closeDetail"].find((x) => ds[x] !== undefined);
+  const k = ds && ["linkPick", "linkGo", "linkUnlink", "linkAuto", "bodyToggle", "attToggle", "closeDetail"].find((x) => ds[x] !== undefined);
   $info.innerHTML = html;
   if (k && $info.querySelectorAll) {
     const el = [...$info.querySelectorAll("button,select")].find((x) => x.dataset && x.dataset[k] === ds[k]);
@@ -946,7 +950,7 @@ function closeDetail() {
 }
 function openDetail(e, from) {
   detailFrom = from;
-  if (!detail || evKey(detail) !== evKey(e)) { descOpen = false; linkPick.clear(); linkErr.clear(); }
+  if (!detail || evKey(detail) !== evKey(e)) { descOpen = false; attOpen = false; linkPick.clear(); linkErr.clear(); }
   detail = e;
   picker = null;
   paint(true);
@@ -1026,7 +1030,7 @@ function mount(el, opts = {}) {
   $root.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest
       ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail],"
-        + "[data-open-notes],[data-body-toggle],[data-link-go],[data-link-unlink],[data-link-auto]") : null;
+        + "[data-open-notes],[data-body-toggle],[data-att-toggle],[data-link-go],[data-link-unlink],[data-link-auto]") : null;
     if (!b) {
       if (picker !== null && !(ev.target && ev.target.closest && ev.target.closest(".cal-picker"))) { picker = null; paint(true); }
       return;
@@ -1044,6 +1048,7 @@ function mount(el, opts = {}) {
       return;
     }
     if (d.bodyToggle !== undefined) { descOpen = !descOpen; return void paintDetail(true); }
+    if (d.attToggle !== undefined) { attOpen = !attOpen; return void paintDetail(true); }
     if (d.linkGo !== undefined || d.linkUnlink !== undefined || d.linkAuto !== undefined) {
       if (b.getAttribute && b.getAttribute("aria-disabled") === "true") return;
       if (d.linkUnlink !== undefined) return void relink(d.linkUnlink, { eventId: null });

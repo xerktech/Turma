@@ -156,6 +156,10 @@ class CalendarScreenTest {
         compose.onNode(event(subject)).performScrollTo().performClick()
         compose.onNodeWithTag("cal-detail").assertExists()
         compose.onNodeWithText("Room 1").assertExists()
+        // The attendee list starts collapsed (XERK-2942) and opens on its toggle.
+        compose.onNodeWithText("Declined").assertDoesNotExist()
+        compose.onNodeWithText("Attendees (2)", substring = true).assertExists()
+        compose.onNodeWithTag("cal-attendees").performScrollTo().performClick()
         compose.onNodeWithText("Declined").performScrollTo().assertExists()
         compose.onNodeWithTag("cal-join").assertExists()
         compose.onNodeWithTag("cal-desc").performScrollTo().performClick()

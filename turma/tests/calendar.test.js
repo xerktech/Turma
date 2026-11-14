@@ -440,6 +440,12 @@ test("XERK-2898: the detail shows Outlook's details — moved, canceled, recurre
   assert.match(h, /Part of a recurring series/);
   assert.match(h, /&lt;img src=x onerror=alert\(1\)&gt; \(o@x\.example\)/);
   assert.match(h, /<span class="k">You<\/span><span class="v">Accepted</);
+  // The attendee list starts collapsed (XERK-2942): a toggle naming the count, no names.
+  assert.match(h, /data-att-toggle aria-expanded="false">▸ Attendees \(2\)<\/button>/);
+  assert.doesNotMatch(h, /cal-people/, "the attendees start collapsed");
+  click({ attToggle: "" });
+  h = cal._els().info.innerHTML;
+  assert.match(h, /data-att-toggle aria-expanded="true">▾ Attendees \(2\)/);
   assert.match(h, /<span class="who" title="a@x\.example">&lt;img[^<]*<\/span><span class="role">optional<\/span><span class="resp declined">Declined/);
   assert.match(h, /<span class="who">b@x\.example<\/span><span class="resp accepted">Accepted/);
   assert.match(h, /<span class="cal-cat">&lt;img[^<]*<\/span><span class="cal-cat">Blue<\/span><\/span>/);

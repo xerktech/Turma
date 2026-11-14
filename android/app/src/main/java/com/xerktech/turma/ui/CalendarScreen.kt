@@ -796,6 +796,7 @@ private fun CalendarDetail(
     val hostOrg: (String) -> String = { h -> fleet.agents.firstOrNull { it.key == h }?.org.orEmpty() }
     val orgLabel: (String) -> String = { s -> if (s.isEmpty()) "No org" else com.xerktech.turma.core.orgName(s, names[s].orEmpty()) }
     var descOpen by rememberSaveable { mutableStateOf(false) }
+    var attOpen by rememberSaveable { mutableStateOf(false) }   // collapsed by default (XERK-2942)
     Column(modifier.fillMaxSize().testTag("cal-detail")) {
         Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(
@@ -853,8 +854,8 @@ private fun CalendarDetail(
             for (n in notes) Text(n, style = MaterialTheme.typography.bodySmall, color = muted)
             val people = ev.attendees.filter { it.name.isNotEmpty() || it.email.isNotEmpty() }
             if (people.isNotEmpty()) {
-                SectionLabel("Attendees")
-                for (a in people) {
+                GhostButton((if (attOpen) "▾" else "▸") + " Attendees (${people.size})", { attOpen = !attOpen }, Modifier.testTag("cal-attendees"))
+                if (attOpen) for (a in people) {
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(a.name.ifEmpty { a.email }, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.bodyMedium)
                         val role = when (a.role) { "optional" -> "optional"; "resource" -> "room"; else -> "" }
