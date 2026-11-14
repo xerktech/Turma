@@ -99,10 +99,20 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
 - `/data/calendar-events.json` (`CALENDAR_EVENTS_FILE`), `registerExternalStore`, hostKey →
   `{syncedAt, windowFrom, windowUntil, ranges[[from, until]] ≤8, lastError?, lastErrorAt?,
   events[]}`. The host key carries the tenant (XERK-2533), so the store needs no tenant field.
-- **Budget**: ~1 KB/event; default window −8w..+26w (`CALENDAR_PAST_MS` / `CALENDAR_FUTURE_MS`).
-  Per host ≤`CALENDAR_HOST_EVENTS_MAX` (1500) and ≤`CALENDAR_HOST_BYTES_MAX` (1.5 MiB); per
-  tenant ≤`CALENDAR_TENANT_BYTES_MAX` (4 MiB); hosts are bounded by `AGENTS_MAX`. Eviction: OLDEST PAST event
-  first (by end), then the furthest future; a tenant over budget trims its biggest host first.
+- **Budget**: ~1 KB/event without its body; default window −8w..+26w (`CALENDAR_PAST_MS` /
+  `CALENDAR_FUTURE_MS`). Per host ≤`CALENDAR_HOST_EVENTS_MAX` (1500) and ≤`CALENDAR_HOST_BYTES_MAX`
+  (1.5 MiB); per tenant ≤`CALENDAR_TENANT_BYTES_MAX` (4 MiB); hosts are bounded by `AGENTS_MAX`.
+- **Over budget, bodies go before meetings** (XERK-2905): the event furthest from now loses its
+  body first. A Teams invite carries 1.5-3 KB of body, so a full window of them would otherwise
+  evict whole meetings. A shed body is served as `""`. Tests: `server.test.js` "XERK-2905".
+- A host over the 1500-event cap evicts down to it BEFORE shedding bodies (those meetings go anyway).
+- A tenant over budget sheds bodies across ALL its hosts first, so one host's meetings never go
+  while another keeps its bodies.
+- A sibling host whose bodies or meetings the tenant trim took gets its own `calendar` frame.
+- Only then are events evicted: OLDEST PAST first (by end), then the furthest future; a tenant
+  trims its biggest host first.
+- **Evicting events sets that host's `lastError`** (host or tenant budget) ("the hub kept N of M events…"); shed
+  bodies alone are not an error. The next sync that fits clears it.
   - Why Postgres is not used: the store is written whole and stays under ~10 MiB fleet-wide at
     these caps, the meetings store's budget class. Raise the caps only by moving it to Postgres.
 - **Keeps the last good sync per host**: an offline host's calendar is still served (`online:false`
