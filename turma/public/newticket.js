@@ -165,9 +165,13 @@
     const url = `/api/jira/${encodeURIComponent(siteKey)}/create-meta${q}`;
     const deadline = Date.now() + 45000;
     let delay = 600;
+    // Opening the form (or picking a project) is the operator asking again, so
+    // the first request tells the hub not to replay a cached failure
+    // (XERK-2885); a cached good answer is still served. Polls go without it.
+    let u = `${url}${q ? "&" : "?"}retry=1`;
     while (alive() && Date.now() < deadline) {
       let r;
-      try { r = await fetch(url); } catch { return { error: "the hub is unreachable" }; }
+      try { r = await fetch(u); u = url; } catch { return { error: "the hub is unreachable" }; }
       if (r.status === 401) { location.href = "/login"; return {}; }
       if (r.status === 202) { await sleep(delay); delay = Math.min(delay * 1.5, 3000); continue; }
       let d = {};

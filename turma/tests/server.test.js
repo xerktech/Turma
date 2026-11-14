@@ -6865,6 +6865,40 @@ test("http: create-meta ?project= fetches that project's issue types", async () 
   assert.deepEqual(res.body.types, [{ id: "1", name: "Task" }]);
 });
 
+test("http: create-meta ?retry=1 drops a cached failure and asks the host again (XERK-2885)", async () => {
+  await jiraBeat("cm4", "cm4.atlassian.net");
+  const url = "/api/jira/cm4.atlassian.net/create-meta";
+  const get = (q = "") => request("GET", url + q, { headers: userHeaders });
+  const first = await get();
+  await jiraBeat("cm4", "cm4.atlassian.net", {
+    ackedCommands: [first.body.cmdId],
+    createMetaResults: [{ project: null, error: "Jira said 403 Forbidden" }],
+  });
+  // The failure is cached: a plain GET (a poll) still reads it.
+  assert.deepEqual((await get()).body, { error: "Jira said 403 Forbidden" });
+  // Retry evicts it and queues a NEW fetch; the polls without ?retry wait on it.
+  const retry = await get("?retry=1");
+  assert.equal(retry.status, 202);
+  assert.notEqual(retry.body.cmdId, first.body.cmdId);
+  assert.equal((await get()).status, 202);
+  const beat = await jiraBeat("cm4", "cm4.atlassian.net", {
+    createMetaResults: [{ project: null, projects: [{ key: "ENG", name: "Eng" }], labels: [], source: "jira", error: null }],
+  });
+  assert.deepEqual(beat.body.commands, [{ type: "boardCreateMeta", cmdId: retry.body.cmdId }]);
+  assert.deepEqual((await get()).body.projects, [{ key: "ENG", name: "Eng" }]);
+  // A good cached answer is NOT evicted by ?retry=1 — no tracker round trip.
+  const good = await get("?retry=1");
+  assert.equal(good.status, 200);
+  assert.deepEqual(good.body.projects, [{ key: "ENG", name: "Eng" }]);
+  // Same for a project's types.
+  const t = await get("?project=ENG");
+  await jiraBeat("cm4", "cm4.atlassian.net", { ackedCommands: [t.body.cmdId], createMetaResults: [{ project: "ENG", error: "nope" }] });
+  assert.deepEqual((await get("?project=ENG")).body, { error: "nope" });
+  const tr = await get("?project=ENG&retry=1");
+  assert.equal(tr.status, 202);
+  assert.notEqual(tr.body.cmdId, t.body.cmdId);
+});
+
 test("http: create-meta 404s an org nobody reports and 503s when its host is offline", async () => {
   const none = await request("GET", "/api/jira/nobody-cm.atlassian.net/create-meta", { headers: userHeaders });
   assert.equal(none.status, 404);

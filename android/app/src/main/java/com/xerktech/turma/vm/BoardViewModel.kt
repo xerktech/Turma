@@ -854,7 +854,9 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
      * 202-poll-with-backoff shape as [fetchIssue].
      */
     suspend fun fetchCreateMeta(siteKey: String, project: String?): CreateMetaFetch =
-        fetchCreateMetaFrom(container.client.api, siteKey, project)
+        // Opening the sheet / picking a project is the operator asking again, so
+        // never replay a cached failure (XERK-2885) — the web modal's mirror.
+        fetchCreateMetaFrom(container.client.api, siteKey, project, retry = true)
 
     /**
      * Create a ticket, then poll its outcome by the cmdId the POST returns — the
@@ -962,13 +964,18 @@ internal suspend fun fetchCreateMetaFrom(
     api: com.xerktech.turma.net.HubApi,
     siteKey: String,
     project: String?,
+    retry: Boolean = false,
 ): CreateMetaFetch {
     val deadline = System.currentTimeMillis() + 45_000
     var delayMs = 600L
     val wantTypes = !project.isNullOrBlank()
+    // `retry` rides only the first request (XERK-2885): the hub drops a cached
+    // failure and re-asks the tracker; the polls then read the new answer.
+    var retryOnce = retry
     while (System.currentTimeMillis() < deadline) {
         val outcome = try {
-            val resp = api.createMeta(siteKey, project?.ifBlank { null })
+            val resp = api.createMeta(siteKey, project?.ifBlank { null }, if (retryOnce) 1 else null)
+            retryOnce = false
             classifyCreateMeta(resp.code(), resp.body(), wantTypes)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e

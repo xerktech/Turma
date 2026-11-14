@@ -247,6 +247,8 @@ interface HubApi {
     suspend fun createMeta(
         @Path("siteKey") siteKey: String,
         @Query("project") project: String? = null,
+        // 1 = drop a cached failure and ask the tracker again (XERK-2885).
+        @Query("retry") retry: Int? = null,
     ): Response<CreateMetaEnvelope>
 
     // Create a ticket on the org's board. 200 {ok, cmdId, host}, or 4xx/5xx

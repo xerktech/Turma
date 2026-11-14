@@ -116,6 +116,93 @@ test("XERK-2510: a meeting's proposals render escaped, with quotes linked to tha
   assert.match(P.list(), /<option value="ACME" selected>Acme \(ACME\)<\/option>/);
 });
 
+test("XERK-2885: Retry on a failed project list asks the hub to skip its cached failure", async () => {
+  let fail = true;
+  const P = loadPage((u) => (/create-meta/.test(u) && !/project=/.test(u) && fail
+    ? { error: "Jira said 403 Forbidden" } : META(u)));
+  P.setCache(data());
+  P.renderMeetings(data());
+  await P.settle();
+  P.renderMeetings(data());
+  assert.match(P.list(), /Jira said 403 Forbidden<\/span> <button class="btn-sm" data-meta-retry="acme\.atlassian\.net" data-meta-focus="acme\.atlassian\.net">Retry/);
+  assert.ok(P.fetches.every((f) => !/retry=1/.test(f.url)), "a first load serves the cache");
+  fail = false;
+  P.click({ metaRetry: SITE });
+  // While loading, a focusable placeholder holds the same focus key.
+  assert.match(P.list(), /<span class="mt-meta" tabindex="-1" data-meta-focus="acme\.atlassian\.net">loading projects/);
+  await P.settle();
+  const metas = P.fetches.filter((f) => /create-meta/.test(f.url) && !/project=/.test(f.url));
+  assert.equal(metas.at(-1).url, `/api/jira/${encodeURIComponent(SITE)}/create-meta?retry=1`);
+  P.renderMeetings(data());
+  assert.match(P.list(), /<select data-project="acme\.atlassian\.net" aria-label="New tickets go to" data-meta-focus="acme\.atlassian\.net">/);
+});
+
+test("XERK-2885: a failed types load is not re-asked on repaint, only on the operator's act", async () => {
+  let typesOk = false;
+  const P = loadPage((u, init) => (init.method === "POST" ? { ok: true, meeting: meeting() }
+    : /project=/.test(u) && !typesOk ? { error: "Jira said 403 Forbidden" } : META(u)));
+  P.setCache(data());
+  P.renderMeetings(data());
+  await P.settle();
+  const typeFetches = () => P.fetches.filter((f) => /project=/.test(f.url));
+  assert.equal(typeFetches().length, 1);
+  // Every repaint calls ensureMeta -> ensureTypes; an errored entry must stay put
+  // (it used to re-ask the tracker every few seconds while the page was open).
+  for (let i = 0; i < 5; i++) { P.renderMeetings(data(), true); await P.settle(); }
+  assert.equal(typeFetches().length, 1, "no repaint-driven refetch");
+  // Edit and a project pick are acts too: each asks again with retry=1.
+  P.startEdit(P.itemKey(SITE, "m1", "p1"));
+  await P.settle();
+  assert.equal(typeFetches().length, 2);
+  assert.match(typeFetches()[1].url, /project=ACME&retry=1$/);
+  P.edits.clear();
+  for (const fn of P.els.meetingList.listeners.change) fn({ target: { value: "ACME", dataset: { project: SITE } } });
+  await P.settle();
+  assert.equal(typeFetches().length, 3);
+  assert.match(typeFetches()[2].url, /project=ACME&retry=1$/);
+  // Approve is an act: it asks again, telling the hub to skip its cached failure.
+  typesOk = true;
+  await P.review(P.itemKey(SITE, "m1", "p1"), "approve");
+  assert.equal(typeFetches().length, 4);
+  assert.match(typeFetches()[3].url, /project=ACME&retry=1$/);
+  assert.equal(P.fetches.filter((f) => f.method === "POST").length, 1);
+});
+
+test("XERK-2885: only the first request of a Retry carries retry=1; its polls go without", async () => {
+  let n = 0;
+  const P = loadPage((u) => (/create-meta/.test(u) && !/project=/.test(u)
+    ? (n++ === 0 ? { error: "Jira said 403 Forbidden" } : n <= 3 ? { status: 202, body: { pending: true } } : META(u))
+    : META(u)));
+  P.setCache(data());
+  P.renderMeetings(data());
+  await P.settle();
+  P.click({ metaRetry: SITE });
+  for (let i = 0; i < 4; i++) await P.settle();
+  const urls = P.fetches.filter((f) => /create-meta/.test(f.url) && !/project=/.test(f.url)).map((f) => f.url);
+  const base = `/api/jira/${encodeURIComponent(SITE)}/create-meta`;
+  assert.deepEqual(urls, [base, `${base}?retry=1`, base, base]);
+});
+
+test("XERK-2885: focus on Retry follows the swap to the picker instead of dropping to <body>", async () => {
+  let fail = true;
+  const P = loadPage((u) => (/create-meta/.test(u) && !/project=/.test(u) && fail
+    ? { error: "Jira said 403 Forbidden" } : META(u)));
+  P.setCache(data());
+  P.renderMeetings(data());
+  await P.settle();
+  const list = P.els.meetingList;
+  const focused = [];
+  // A focused control of the pane, and the controls the repaint leaves behind.
+  P.document.activeElement = { dataset: { metaFocus: SITE }, tagName: "BUTTON" };
+  list.contains = (el) => el === P.document.activeElement;
+  list.querySelectorAll = (sel) => (/\[data-meta-focus\]/.test(sel)
+    ? [{ dataset: { metaFocus: SITE }, focus() { focused.push(SITE); } }] : []);
+  fail = false;
+  P.click({ metaRetry: SITE });
+  await P.settle();
+  assert.ok(focused.length >= 2, `focus restored on the loading swap and the picker (${focused.length})`);
+});
+
 test("XERK-2510: Approve + start posts the org's project, the kind's issue type and the meeting context", async () => {
   const P = loadPage((u, init) => (init.method === "POST"
     ? { ok: true, meeting: meeting({ items: [{ ...meeting().items[0], review: { state: "creating", at: 1, start: true } }, meeting().items[1]] }) }
@@ -322,7 +409,7 @@ test("the settings drawer says \"New tickets go to\" once; the inline picker kee
   P.click({ orgSettings: SITE });
   const drawer = drawerOf(P);
   assert.equal(visibleTarget(drawer), 1, "only the section heading shows it");
-  assert.match(drawer, /<label class="mt-target"><select data-project="acme\.atlassian\.net" aria-label="New tickets go to">/);
+  assert.match(drawer, /<label class="mt-target"><select data-project="acme\.atlassian\.net" aria-label="New tickets go to"[^>]*>/);
 });
 
 test("the settings drawer says \"New tickets go to\" once while the projects load and when they fail", async () => {
