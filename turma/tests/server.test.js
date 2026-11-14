@@ -32771,3 +32771,59 @@ test("XERK-2896: the newest copy of a shared event decides; a stale copy holds n
     cleanup2896(S, [D, D2]);
   }
 });
+
+test("XERK-2901: a calendar host going offline and back sends a calendar frame each time", async () => {
+  const D = "cal2901off";
+  forget2891(D);
+  const frames = [];
+  const res = { write: (f) => frames.push(f) };
+  hub.ssePrincipals.set(res, OPERATOR); hub.sseClients.add(res);
+  const calFrames = () => frames.filter((f) => f.includes("event: calendar") && f.includes(D)).length;
+  // A frame carries `changedAt` (ms); two in one millisecond are one frame to the dedupe.
+  const turn = async () => { await new Promise((r) => setTimeout(r, 3)); for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
+  try {
+    const now = Date.now();
+    assert.equal((await calBeat2891(D, { calendarSync: [{ windowFrom: now - H2891, windowUntil: now + 48 * H2891,
+      syncedAt: now, events: [ev2891("off1", now + H2891)] }] })).status, 200);
+    await turn();
+    const base = calFrames();
+    // Silent past OFFLINE_AFTER_MS: one frame on the edge, none on later ticks.
+    agents[D].lastSeen = Date.now() - 2 * 60 * 1000;
+    hub.calendarOfflineEdge(D, agents[D], Date.now());
+    await turn();
+    assert.equal(calFrames(), base + 1, "the offline edge announces the host");
+    hub.calendarOfflineEdge(D, agents[D], Date.now());
+    await turn();
+    assert.equal(calFrames(), base + 1, "once per offline run");
+    // Its calendar is still served, marked offline.
+    const h = (await calGet2891(now - H2891, now + 48 * H2891)).body.hosts.find((x) => x.host === D);
+    assert.equal(h.online, false);
+    // The reconnect beat announces it again at once, before any resync lands.
+    assert.equal((await calBeat2891(D)).status, 200);
+    await turn();
+    assert.equal(calFrames(), base + 2, "the reconnect announces the host");
+    // A host that comes back with its calendar unavailable still clears the notice.
+    agents[D].lastSeen = Date.now() - 2 * 60 * 1000;
+    hub.calendarOfflineEdge(D, agents[D], Date.now());
+    await turn();
+    assert.equal(calFrames(), base + 3);
+    assert.equal((await calBeat2891(D, { calendar: { available: false } })).status, 200);
+    await turn();
+    assert.equal(calFrames(), base + 3, "the non-capable beat skips calendarOnBeat's broadcast");
+    hub.calendarOfflineEdge(D, agents[D], Date.now());
+    await turn();
+    assert.equal(calFrames(), base + 4, "the sweep announces it back online");
+    hub.calendarOfflineEdge(D, agents[D], Date.now());
+    await turn();
+    assert.equal(calFrames(), base + 4, "once");
+    // The leader's offline sweep is what calls the edge (its boot grace keeps a test from ticking it).
+    assert.match(String(hub.offlineDetectionTick), /calendarOfflineEdge\(key, a, now\)/);
+    // A host with no calendar at all never sends one.
+    hub.calendarOfflineEdge("cal2901none", { lastSeen: 1 }, Date.now());
+    await turn();
+    assert.equal(frames.filter((f) => f.includes("cal2901none")).length, 0);
+  } finally {
+    hub.sseClients.delete(res); hub.ssePrincipals.delete(res);
+    forget2891(D);
+  }
+});
