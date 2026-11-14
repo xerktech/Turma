@@ -36,6 +36,7 @@ A pure-core/adapter-shell split:
 | `usage.html` | `ui/UsageScreen.kt` |
 | Meetings page (`brief.html` triage, `meetings.js`) | `ui/BriefScreen.kt` + `core/MeetingsTriage.kt` + `core/DailyBrief.kt` + `vm/BriefViewModel.kt` |
 | Meetings review pieces | `ui/MeetingsScreen.kt` (`ItemRow`) + `core/Meetings.kt` + `vm/MeetingsViewModel.kt` |
+| Meetings calendar (`calendar.js`) | `ui/CalendarScreen.kt` + `core/Calendar.kt` + `vm/CalendarViewModel.kt` |
 | `nav.js` | `ui/MainScaffold.kt` + `ui/TurmaApp.kt` |
 | `org.js` | `ui/OrgControl.kt` + `vm/OrgViewModel.kt` + `data/OrgFilter.kt` |
 
@@ -116,6 +117,30 @@ A pure-core/adapter-shell split:
     `qualifiers = "w1000dp-…"`: the default screen leaves the 360dp list's neighbour zero-wide,
     so clicks in that pane silently miss.
   - Tests: `core/MeetingsTriageTest`, `ui/BriefScreenTest`, `ui/MeetingsScreenTest`, `TurmaAppDeepLinkTest`.
+
+- **The Calendar view (XERK-2900, web XERK-2897/2898/2899)** is `ui/CalendarScreen.kt` +
+  `core/Calendar.kt` (pure ports of calendar.js: week math, `layoutDay`, badges, notices) +
+  `vm/CalendarViewModel.kt` (the week cache; `/api/calendar` is not on the snapshot).
+  - Week math is `LocalDate` (java.time's calendar), never `+ 86_400_000`: a DST day is 23/25h.
+  - Re-reads on `FleetRepository.calendarFrames` (`calendar`, `holidaySettings`,
+    `meetingProposals` frames + every stream open), coalesced 1s; a 60s poll while `streamUp` is
+    false. A re-read drops every week but the shown ± one and the notes review's upcoming weeks.
+  - The week cache is written with `update{}` and its bookkeeping under a lock: a read's answer
+    resumes off the main thread in tests, and two weeks landing at once lost one (stuck loading).
+  - **Tablets and foldables get the week by the calendar's OWN width**, not the app's `wide`
+    (Expanded ≥840dp): week modes from 600dp (`CAL_WEEK_MIN_WIDTH`), so a portrait tablet or an
+    unfolded foldable (Medium) never shows Day / 3 days; the detail sits beside the grid only from
+    840dp, below that it is full screen. Operator's requirement (XERK-2900).
+  - Calendar reads go through `HubClient.calendarApi` (its own OkHttp dispatcher + 20s call timeout),
+    never the shared `api`: three weeks × (calendar + holidays) per step filled the shared 5-per-host
+    slots, and a stalled `/api/calendar` froze the `/api/agents` poll for 60s+ (QA). Tests:
+    `vm/CalendarViewModelTest`.
+  - A push shows Notes review WITHOUT saving it (`setView(.., remember = false)`, web `?site=`).
+  - The detail reviews a capture with the notes review's own `MeetingPart`/`DailyPart`, never a fork.
+  - A block's `testTag` goes BEFORE its `clearAndSetSemantics`: after it, the tag is cleared too.
+  - The view switch and mode picks are `FilterChip`s: `SegmentedButton` taps never reached
+    `onClick` under Robolectric (measured), so a test could not drive them.
+  - Tests: `core/CalendarTest`, `ui/CalendarScreenTest`.
 
 ## Images (rollup XERK-2109)
 

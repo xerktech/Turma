@@ -180,6 +180,15 @@ data class Meeting(
     // generic Tenir one (XERK-2894); "" = none (an older agent or hub).
     val summary: String = "",
     val inferredTitle: String = "",
+    // The capture's calendar link (XERK-2896, the hub's): the Outlook event id,
+    // who set it ("auto" | "operator"), a matcher tie, the event as served
+    // (XERK-2899), and an operator's event gone from the store.
+    val calendarEventId: String = "",
+    val calendarBy: String = "",
+    val calendarAmbiguous: Boolean = false,
+    @Serializable(with = LenientMeetingCalendarEventSerializer::class)
+    val calendarEvent: MeetingCalendarEvent? = null,
+    val calendarEventMissing: Boolean = false,
 )
 
 /**

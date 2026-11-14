@@ -206,6 +206,35 @@ class HubClient(private val config: Config) {
             .create(HubApi::class.java)
     }
 
+    // The Calendar view's reads (XERK-2900 QA): their own dispatcher and a call
+    // timeout. On the shared client, three weeks × (calendar + holidays) per
+    // navigation filled OkHttp's 5-per-host slots (SSE holds one for good), so a
+    // hub stalling /api/calendar froze the /api/agents poll for 60s and more.
+    private val calendarHttp: OkHttpClient by lazy {
+        http.newBuilder()
+            .dispatcher(okhttp3.Dispatcher().apply { maxRequestsPerHost = 4 })
+            .callTimeout(20, TimeUnit.SECONDS)
+            .build()
+    }
+
+    @Volatile
+    private var calendarBuilt: Pair<String, HubApi>? = null
+
+    /** [api] on the calendar's own client: a stalled calendar read never queues other calls. */
+    val calendarApi: HubApi
+        get() {
+            val base = config.current.baseUrl
+            calendarBuilt?.let { (url, api) -> if (url == base) return api }
+            synchronized(this) {
+                calendarBuilt?.let { (url, api) -> if (url == base) return api }
+                val api = Retrofit.Builder().baseUrl(base).client(calendarHttp)
+                    .addConverterFactory(TurmaJson.asConverterFactory(contentType)).build()
+                    .create(HubApi::class.java)
+                calendarBuilt = base to api
+                return api
+            }
+        }
+
     /** Current API, rebuilt if the configured hub URL changed. */
     val api: HubApi
         get() {

@@ -57,6 +57,10 @@ data class TriageEntry(
     val daily: Boolean = false,
     val upcoming: Boolean = false,
     val current: Boolean = false,
+    // An upcoming calendar meeting (XERK-2899): its own entry ([cal]), or the
+    // daily meeting's occurrence joined to its daily entry.
+    val event: com.xerktech.turma.model.CalendarEvent? = null,
+    val cal: Boolean = false,
 ) {
     val pending: Int get() = meetings.sumOf(::meetingPendingCount)
     val archived: Boolean get() = meetings.isNotEmpty() && meetings.all { it.archivedAt > 0 }
@@ -85,6 +89,8 @@ fun triageEntries(
     schedule: DailyBriefSchedule?,
     now: Long,
     zone: ZoneId = ZoneId.systemDefault(),
+    // The org's upcoming calendar meetings (calUpcoming), earliest first.
+    events: List<com.xerktech.turma.model.CalendarEvent> = emptyList(),
 ): List<TriageEntry> {
     val out = mutableListOf<TriageEntry>()
     val dayMeetings = LinkedHashMap<Long, MutableList<Meeting>>()
@@ -122,6 +128,18 @@ fun triageEntries(
         val i = dailies.indices.maxBy { dailies[it].at }
         dailies[i] = dailies[i].copy(current = true)
     }
+    // The upcoming calendar meetings (XERK-2899): the daily meeting's occurrence
+    // joins its daily entry; any other is an entry of its own. One already
+    // captured is that capture's (its `calendarEventId`).
+    val linked = meetings.map { it.calendarEventId }.filter { it.isNotEmpty() }.toSet()
+    val seen = mutableSetOf<String>()
+    for (ev in events) {
+        val at = ev.startMs ?: continue
+        if (ev.id.isEmpty() || ev.id in linked || !seen.add(ev.id)) continue
+        val i = dailies.indexOfFirst { it.event == null && kotlin.math.abs(it.at - at) <= CAL_DAILY_EVENT_MS }
+        if (i >= 0) dailies[i] = dailies[i].copy(event = ev)
+        else out += TriageEntry("c:${ev.id}", siteKey, at, event = ev, cal = true)
+    }
     out += dailies
     return out.sortedByDescending { it.at }
 }
@@ -144,6 +162,7 @@ fun triageShows(e: TriageEntry, filter: TriageFilter, query: String, sel: Triage
     val q = query.trim()
     if (q.isEmpty()) return true
     return (e.daily && "daily meeting".contains(q, ignoreCase = true)) ||
+        (e.event?.subject?.contains(q, ignoreCase = true) == true) ||
         e.meetings.any { m ->
             meetingTitle(m).contains(q, ignoreCase = true) || m.items.any { it.title.contains(q, ignoreCase = true) }
         }
@@ -195,7 +214,8 @@ fun triageNext(ordered: List<TriageEntry>, current: TriageEntry): TriageEntry? {
 
 /** An entry's title: "Daily meeting" (the web's `entryTitle`), else the meeting's own. */
 fun triageTitle(e: TriageEntry): String =
-    if (e.daily) "Daily meeting" else e.meetings.firstOrNull()?.let { meetingTitle(it) } ?: "Untitled meeting"
+    if (e.cal) jsTrim(e.event?.subject.orEmpty()).ifEmpty { "(no title)" }
+    else if (e.daily) "Daily meeting" else e.meetings.firstOrNull()?.let { meetingTitle(it) } ?: "Untitled meeting"
 
 /** A daily entry's brief status line, the rail's "brief ready / being written / none". */
 fun triageBriefStatus(e: TriageEntry): String? {
