@@ -17518,7 +17518,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             f"--name {shlex.quote(sess['rcName'])} "
             f"--permission-mode auto --settings {shlex.quote(settings)} "
             f"--append-system-prompt "
-            f"{shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers + ha.wake_directive())}",
+            f"{shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers + ha.wake_directive() + ha.calendar_directive())}",
         )
         # The guard settings file was written and wires four PreToolUse
         # matchers: the Bash guard, the ~/.claude file guard, the
@@ -17788,7 +17788,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             path=ha.PEERS_FILE, sid=sm.registry[0]["id"], host=sm.device)
         self.assertIn(
             "--append-system-prompt "
-            + shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers + ha.wake_directive()),
+            + shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers + ha.wake_directive() + ha.calendar_directive()),
             cmd,
         )
 
@@ -25487,7 +25487,7 @@ class TestSessionDirective(ManagerMixin, unittest.TestCase):
         policy = sm._session_directive(self._sess())
         peers = ha.PEERS_SYSTEM_PROMPT.format(path=ha.PEERS_FILE, sid="abcde", host=sm.device)
         self.assertEqual(policy, ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT
-                         + peers + ha.wake_directive())
+                         + peers + ha.wake_directive() + ha.calendar_directive())
         self.assertIn("do not sleep in a", policy)
         self.assertIn(" wake <N>m <what to check>` and end the turn", policy)
 
@@ -25508,6 +25508,21 @@ class TestSessionDirective(ManagerMixin, unittest.TestCase):
         cmd = ha.wake_directive(safe).split("`")[1]
         prefix = ha.session_cli_allow_rule(safe)[len("Bash("):-len(":*)")]
         self.assertTrue(cmd.startswith(prefix + " wake "), (cmd, prefix))
+
+    def test_calendar_is_taught_only_on_wsl_with_a_safe_path(self):
+        """XERK-2884: the calendar command works only through WSL interop (the
+        Windows agent's path is never shell-safe), and must match the allow rule."""
+        safe = "/opt/turma-agent/hooks/session_cli.py"
+        self.assertEqual(ha.calendar_directive(safe, wsl=False), "")
+        self.assertEqual(ha.calendar_directive("/home/a b/hooks/session_cli.py", wsl=True), "")
+        cmd = ha.calendar_directive(safe, wsl=True).split("`")[1]
+        prefix = ha.session_cli_allow_rule(safe)[len("Bash("):-len(":*)")]
+        self.assertTrue(cmd.startswith(prefix + " calendar "), (cmd, prefix))
+        sm = self.make_manager()
+        with mock.patch.object(ha, "_is_wsl", return_value=True):
+            self.assertIn(" calendar [today|tomorrow|week]", sm._session_directive(self._sess()))
+            for rt in ("dsh", "qwen"):
+                self.assertNotIn(" calendar ", sm._session_directive(self._sess(agentType=rt), "X"))
 
     def test_dsh_and_qwen_are_not_taught_the_cli(self):
         sm = self.make_manager()

@@ -134,7 +134,7 @@ test("XERK-2885: Retry on a failed project list asks the hub to skip its cached 
   const metas = P.fetches.filter((f) => /create-meta/.test(f.url) && !/project=/.test(f.url));
   assert.equal(metas.at(-1).url, `/api/jira/${encodeURIComponent(SITE)}/create-meta?retry=1`);
   P.renderMeetings(data());
-  assert.match(P.list(), /<select data-project="acme\.atlassian\.net" data-meta-focus="acme\.atlassian\.net">/);
+  assert.match(P.list(), /<select data-project="acme\.atlassian\.net" aria-label="New tickets go to" data-meta-focus="acme\.atlassian\.net">/);
 });
 
 test("XERK-2885: a failed types load is not re-asked on repaint, only on the operator's act", async () => {
@@ -394,6 +394,37 @@ test("XERK-2638: the Tenir labels list and an unmapped label's banner, escaped, 
   Q.update(labeled);
   assert.doesNotMatch(Q.list(), /value="acme\.atlassian\.net"|data-org-toggle="acme/);
   assert.match(Q.list(), /<option value="dev\.azure\.com\/Bolt">/);
+});
+
+// A visible "New tickets go to" is text right after a tag; the select's aria-label is not.
+const visibleTarget = (h) => (h.match(/>New tickets go to/g) || []).length;
+const drawerOf = (P) => P.list().slice(P.list().indexOf('<aside class="tri-drawer"'));
+
+test("the settings drawer says \"New tickets go to\" once; the inline picker keeps its own label", async () => {
+  const P = loadPage(META);
+  P.update(data());
+  await P.settle();
+  P.update(data(), true);
+  assert.match(P.list(), /<label class="mt-target">New tickets go to <select/, "inline picker keeps its words");
+  P.click({ orgSettings: SITE });
+  const drawer = drawerOf(P);
+  assert.equal(visibleTarget(drawer), 1, "only the section heading shows it");
+  assert.match(drawer, /<label class="mt-target"><select data-project="acme\.atlassian\.net" aria-label="New tickets go to"[^>]*>/);
+});
+
+test("the settings drawer says \"New tickets go to\" once while the projects load and when they fail", async () => {
+  const loading = loadPage(() => new Promise(() => {}));
+  loading.update(data());
+  loading.click({ orgSettings: SITE });
+  assert.match(drawerOf(loading), /loading projects/);
+  assert.equal(visibleTarget(drawerOf(loading)), 1);
+
+  const failed = loadPage((u) => (/create-meta/.test(u) ? { error: "Jira said 403 Forbidden" } : {}));
+  failed.update(data());
+  await failed.settle();
+  failed.click({ orgSettings: SITE });
+  assert.match(drawerOf(failed), /Jira said 403 Forbidden/);
+  assert.equal(visibleTarget(drawerOf(failed)), 1);
 });
 
 test("XERK-2514: the Whose work rows, escaped, post names and role; Clear posts empty", async () => {

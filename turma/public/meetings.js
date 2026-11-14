@@ -401,18 +401,21 @@ function itemHtml(site, m, it) {
 function needsProject(list) {
   return list.some((m) => m.status === "ok" && (m.items || []).some((it) => it.kind !== "decision" && reviewable(it)));
 }
-function targetHtml(site) {
+// `inDrawer`: the settings drawer already heads this section "New tickets go to",
+// so the picker drops its own copy of the words and keeps them as its accessible name.
+function targetHtml(site, inDrawer = false) {
+  const lead = inDrawer ? "" : "New tickets go to ";
   const m = meta.get(site);
   // `data-meta-focus` marks the one control that stands for this org's project
   // target in each state (loading → error/Retry → picker), so focus taken by
   // Retry follows the swap instead of dropping to <body> (XERK-2885).
   const mf = `data-meta-focus="${esc(site)}"`;
-  if (!m || m.loading) return `<div class="mt-target">New tickets go to … <span class="mt-meta" tabindex="-1" ${mf}>loading projects</span></div>`;
-  if (m.error) return `<div class="mt-target">New tickets go to … <span class="err">${esc(m.error)}</span> <button class="btn-sm" data-meta-retry="${esc(site)}" ${mf}>Retry</button></div>`;
+  if (!m || m.loading) return `<div class="mt-target">${lead}… <span class="mt-meta" tabindex="-1" ${mf}>loading projects</span></div>`;
+  if (m.error) return `<div class="mt-target">${lead}… <span class="err">${esc(m.error)}</span> <button class="btn-sm" data-meta-retry="${esc(site)}" ${mf}>Retry</button></div>`;
   const cur = projectOf(site);
   const opts = (cur ? "" : `<option value="">Pick a project</option>`)
     + m.projects.map((p) => `<option value="${esc(p.key)}"${p.key === cur ? " selected" : ""}>${esc(p.name ? `${p.name} (${p.key})` : p.key)}</option>`).join("");
-  return `<label class="mt-target">New tickets go to <select data-project="${esc(site)}" ${mf}>${opts}</select></label>`;
+  return `<label class="mt-target">${lead}<select data-project="${esc(site)}" aria-label="New tickets go to" ${mf}>${opts}</select></label>`;
 }
 function archiveButton(site, m) {
   // A meeting still being read can't be archived (the hub's 409); no button then.
@@ -725,7 +728,7 @@ function drawerHtml(data, v) {
     + `<div class="tri-drawer-head"><div class="tri-drawer-title"><h2>${esc(orgName)} — meeting settings</h2>`
     + `<div class="mt-meta">${esc(displayKey(site))}</div></div>`
     + `<button type="button" class="btn-sm" data-drawer-close="1" aria-label="Close settings">✕</button></div>`
-    + sec("New tickets go to", targetHtml(site))
+    + sec("New tickets go to", targetHtml(site, true))
     + (labeled ? sec("Whose work", focusRowHtml(data, site),
       "Only work for you (by name, as the captions show it) or your role is proposed. Empty proposes everyone's.") : "")
     + (labeled ? sec("Tenir label", labelRowHtml(data, site),
