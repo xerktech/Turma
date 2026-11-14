@@ -108,16 +108,14 @@ for m in os re json session_cli sitecustomize; do echo 'import sys; sys.exit(10)
 if [ -f "$WORK/shadow/etc/binfmt.d/WSLInterop.conf" ]; then ok "cwd/PYTHONPATH modules cannot shadow the reader"
 else fail "a planted module changed the answer: $(cat "$WORK/shadow/out")"; fi
 
-# Present but unreadable (root-owned 0600 as non-root): unknown, never "on".
-if [ "$(id -u)" != 0 ]; then
-  run_case noperm "$WSL" $'[interop]\nenabled=false' no
-else  # root reads anything; fake the unreadable test instead.
-  # shellcheck disable=SC2016  # sed patterns, not expansions.
-  sed -i 's/\[ -r "\$WSL_CONF" \]/false/' "$WORK/fn.sh"
-  run_case noperm "$WSL" $'[interop]\nenabled=false' no
-  # shellcheck disable=SC2016  # a sed pattern, not an expansion.
-  sed -n '/^: "\${WSL_OSRELEASE:=/,/^}$/p;/^ensure_wsl_interop() {/,/^}$/p' "$INSTALL" > "$WORK/fn.sh"
-fi
+# Present but unreadable (root-owned 0600, run without sudo): unknown, never "on".
+# Faked by failing the -r test, since root reads anything and run_case writes
+# the file as the caller.
+# shellcheck disable=SC2016  # sed patterns, not expansions.
+sed -i 's/\[ -r "\$WSL_CONF" \]/false/' "$WORK/fn.sh"
+run_case noperm "$WSL" $'[interop]\nenabled=false' no
+# shellcheck disable=SC2016  # a sed pattern, not an expansion.
+sed -n '/^: "\${WSL_OSRELEASE:=/,/^}$/p;/^ensure_wsl_interop() {/,/^}$/p' "$INSTALL" > "$WORK/fn.sh"
 if [ ! -e "$CONF" ] && [ ! -s "$REG" ] && grep -q "could not read" "$WORK/noperm/out"; then
   ok "an unreadable wsl.conf is unknown, not on"
 else fail "treated an unreadable wsl.conf as on: $(cat "$WORK/noperm/out")"; fi

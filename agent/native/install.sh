@@ -306,7 +306,7 @@ ensure_wsl_interop() {
   case "$(_wsl_interop_state)" in
     off) info "WSL interop is disabled in $WSL_CONF — the calendar sync will not reach Outlook"
          return 0 ;;
-    unknown) warn "could not read $WSL_CONF with python3; leaving WSL interop as it is"
+    unknown) warn "could not read $WSL_CONF; leaving WSL interop as it is"
          return 0 ;;  # never risk overriding an operator's enabled=false
   esac
   local conf="$BINFMT_D/WSLInterop.conf" need_conf=no need_reg=no
