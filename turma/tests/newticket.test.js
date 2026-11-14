@@ -343,3 +343,16 @@ test("newticket: opening the form asks the hub to skip a cached failure, first r
       "/api/jira/acme.atlassian.net/create-meta"]);
   } finally { global.fetch = prev; }
 });
+
+test("newticket: Esc on an open form is marked handled, a shut form leaves it (XERK-2897)", () => {
+  const { body, button, doc } = mountNT();
+  NT.update({ agents: [agent("h1", "acme.atlassian.net")] });
+  const backdrop = body.children[0];
+  const esc = () => { const ev = { key: "Escape", prevented: false, preventDefault() { this.prevented = true; } };
+    for (const fn of doc._listeners.keydown || []) fn(ev); return ev; };
+  assert.equal(esc().prevented, false, "shut: not ours");
+  for (const fn of button._listeners.click || []) fn({});
+  assert.equal(backdrop.hidden, false);
+  assert.equal(esc().prevented, true);
+  assert.equal(backdrop.hidden, true, "a clean form closes");
+});

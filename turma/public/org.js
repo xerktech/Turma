@@ -630,7 +630,8 @@
       if (open && !e.turmaOrgHandled && !slot.contains(e.target)) { close(); paint(); }
     });
     doc.addEventListener("keydown", (e) => {
-      if (open && e.key === "Escape") { close(); paint(); }
+      // Marked handled, so a page's own Esc (the calendar's panel) leaves it to the menu.
+      if (open && e.key === "Escape") { e.preventDefault(); close(); paint(); }
     });
     // Another tab changed the scope — follow it, so the fleet doesn't disagree
     // with itself across two windows.

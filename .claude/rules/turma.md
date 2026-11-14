@@ -63,6 +63,8 @@ makes an `android/` change part of the same PR) live there.
   - HTML shells also revalidate (`private, no-cache` + ETag → 304): a held shell keeps pointing at the
     previous release's hashed URLs otherwise. Every static asset carries an ETag and 304s on a
     conditional GET (`etagMatches` handles weak/list/`*` forms). Tests: `assets.test.js`.
+- **A shared widget that consumes Esc calls `preventDefault()`** (org menu, New-ticket modal), so a
+  page's own document-level Esc (the calendar's panel, XERK-2897) leaves it alone. Keep it.
 - Tests: `nav.test.js`.
 
 ## The org filter (`turma/public/org.js`, XERK-62)
