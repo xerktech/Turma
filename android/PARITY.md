@@ -746,10 +746,6 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     Outlook subject with its time + invitees, Impromptu, Open in calendar.
   - Platform differences: no keyboard walking (←/→/↑/↓, Esc) and no A/S/E/R/J/K in the panel;
     the date picker is Material's, not the web's mini-month.
-- **GAP — the calendar re-reads on a host's online flip (XERK-2921, web only)**: an `agent` frame
-  whose `online` differs from the last one seen re-reads the calendar, so "<host> is offline"
-  shows at once. Android's calendar (XERK-2900) should re-read on the same flip
-  (`FleetRepository` calendar frames).
 
 ## Open (subsequent installments), by screen and priority
 
