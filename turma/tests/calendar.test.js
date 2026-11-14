@@ -439,7 +439,7 @@ test("XERK-2897: a read the frame dropped is not retried off screen", { timeout:
 const dataAttr = (k) => `[data-${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}]`;
 function control(dataset) {
   const t = { dataset, inside: true, getAttribute: () => null };
-  t.closest = (sel) => (Object.keys(dataset).some((k) => sel.split(",").includes(dataAttr(k))) ? t : null);
+  t.closest = (sel) => (Object.keys(dataset).some((k) => sel.split(",").map((s) => s.trim()).includes(dataAttr(k))) ? t : null);
   return t;
 }
 const click = (dataset) => { for (const f of root.listeners.click) f({ target: control(dataset) }); };
