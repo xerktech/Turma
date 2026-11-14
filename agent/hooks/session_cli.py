@@ -119,6 +119,7 @@ try {
   $found = $items.Restrict("[Start] < '" + $until.ToString('g') + "' AND [End] > '" + $from.ToString('g') + "'")
   $out = New-Object System.Collections.ArrayList
   $skipped = 0
+  $firstError = ''
   $a = $found.GetFirst()
   while ($a -ne $null -and $out.Count -lt __MAX__) {
    try {
@@ -142,7 +143,11 @@ try {
       busy = $a.BusyStatus; myResponse = $a.ResponseStatus; status = $a.MeetingStatus
       recurring = $a.IsRecurring; attendees = @($people); joinUrl = $url
     })
-   } catch { $skipped++ }
+   } catch {
+    $skipped++
+    if (-not $firstError) { $firstError = $_.Exception.Message }
+    if ($out.Count -eq 0 -and $skipped -ge 5) { throw $firstError }
+   }
     $a = $found.GetNext()
   }
   ConvertTo-Json -InputObject @{ ok = $true; from = (Local $from); until = (Local $until); skipped = $skipped; events = @($out) } -Depth 5 -Compress
@@ -257,7 +262,8 @@ def find_powershell():
 
 
 def _text(v, cap=CALENDAR_TEXT_MAX) -> str:
-    return re.sub(r"\s+", " ", _CONTROL.sub(" ", v if isinstance(v, str) else "")).strip()[:cap]
+    v = (v if isinstance(v, str) else "").replace("\xad", "")
+    return re.sub(r"\s+", " ", _CONTROL.sub(" ", v)).strip()[:cap]
 
 
 def _int(v):
@@ -301,7 +307,7 @@ def normalize_calendar(doc) -> dict:
             "joinUrl": url if url.startswith("https://") else ""})
     out = {"from": _text(doc.get("from"), 40), "until": _text(doc.get("until"), 40),
            "note": CALENDAR_NOTE, "events": events}
-    if _int(doc.get("skipped")):
+    if (_int(doc.get("skipped")) or 0) > 0:
         out["unreadable"] = doc["skipped"]       # items Outlook threw on, left out
     return out
 

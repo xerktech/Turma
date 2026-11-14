@@ -381,6 +381,18 @@ class CalendarTest(unittest.TestCase):
         self.assertEqual(doc["skipped"], 1)
         self.assertEqual(cli.normalize_calendar(doc)["unreadable"], 1)
 
+    def test_every_item_failing_reports_outlooks_reason(self):
+        """A security-prompt denial throws on every item: the read stops after a
+        few with Outlook's message instead of returning an empty calendar."""
+        breaker = "".join(
+            f"  $script:appts += [pscustomobject]@{{ Subject = 'x{i}'; StartUTC = 'denied' }}\n"
+            for i in range(10))
+        doc = self.run_fake(epilogue=(
+            "  $script:appts = @()\n" + breaker))
+        self.assertFalse(doc["ok"], doc)
+        with self.assertRaisesRegex(cli.Refused, "Outlook could not be read: .+"):
+            cli.normalize_calendar(doc)
+
     def test_a_lookalike_zoom_domain_is_not_a_join_link(self):
         doc = self.run_fake(epilogue=(
             "  $script:appts[1].Body = 'https://evilzoom.us/j/1 or https://acme.zoom.us/j/2'"))
@@ -437,10 +449,13 @@ class CalendarTest(unittest.TestCase):
         self.assertEqual(len(e["attendees"]), cli.CALENDAR_ATTENDEES_MAX)
         self.assertEqual(e["attendees"][0], {"name": "", "email": "", "role": "unknown",
                                              "response": "unknown"})
-        for line in ("a\u2028b", "a\u2029b", "a\u061cb", "a\xadb", "a\u2060b", "a\nb"):
+        for line in ("a\u2028b", "a\u2029b", "a\u061cb", "a\u2060b", "a\nb"):
             got = cli.normalize_calendar({"ok": True, "events": [
                 {"subject": line, "attendees": []}]})["events"][0]["subject"]
             self.assertEqual(got, "a b", repr(line))
+        self.assertEqual(cli._text("Inter\xadnational"), "International")
+        self.assertNotIn("unreadable", cli.normalize_calendar(
+            {"ok": True, "skipped": -1, "events": []}))
         for bad in (None, [], {"ok": "true"}, {"ok": True},
                     {"ok": True, "events": {"value": [{"subject": "x"}], "Count": 1}},
                     {"ok": True, "events": [{"subject": "x", "attendees": {"name": "a"}}]}):

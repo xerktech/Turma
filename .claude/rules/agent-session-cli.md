@@ -298,7 +298,9 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   `IncludeRecurrences` or recurring meetings vanish. Enumerate with `GetFirst`/`GetNext`.
 - **Printed stamps use the INVARIANT culture**; only Restrict's literals use the user's. A
   culture's own `ToString` writes `T09.00.00` (fi-FI) or a Buddhist/Hijri year (th-TH, ar-SA).
-- One item that throws is skipped and counted (`unreadable`), never failing the whole read.
+- One item that throws is skipped and counted (`unreadable`), never failing the whole read —
+  unless the first 5 all throw: that is Outlook refusing (a security-prompt denial hits every
+  item), so the read stops with its message rather than prompt per item.
 - A non-list `events`/`attendees` is REFUSED, not read as "no meetings": PS 5.1 can wrap an
   array as `{value, Count}`, and an empty calendar would hide that.
 - `powershell.exe` is found on PATH, else under `/mnt/*/Windows/…`: a systemd-started agent's
