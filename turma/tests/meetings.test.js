@@ -16,7 +16,7 @@ const calendarScript = fs.readFileSync(path.join(__dirname, "..", "public", "cal
 
 function makeEl() {
   const el = {
-    _html: "", textContent: "", value: "", dataset: {}, style: {}, listeners: {},
+    _html: "", textContent: "", value: "", dataset: {}, style: { setProperty() {}, removeProperty() {} }, listeners: {},
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
     addEventListener(name, fn) { (this.listeners[name] ||= []).push(fn); }, removeEventListener() {},
     appendChild(c) { return c; }, querySelector() { return null; }, querySelectorAll() { return []; },

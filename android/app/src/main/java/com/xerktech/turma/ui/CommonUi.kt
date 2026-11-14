@@ -77,10 +77,13 @@ fun TurmaCard(modifier: Modifier = Modifier, tint: Color? = null, content: @Comp
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(14.dp),
-        color = if (tint != null) lerp(surface, tint, ORG_TINT_AMOUNT) else surface,
+        color = orgCardColor(tint, surface),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
     ) { content() }
 }
+
+/** A card's surface with its org colour mixed in ([ORG_TINT_AMOUNT]); no org = [surface]. */
+fun orgCardColor(tint: Color?, surface: Color): Color = if (tint != null) lerp(surface, tint, ORG_TINT_AMOUNT) else surface
 
 /** How far an org colour is mixed into a card's surface — matches the web's 12%. */
 const val ORG_TINT_AMOUNT = 0.12f

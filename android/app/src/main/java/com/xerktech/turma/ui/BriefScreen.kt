@@ -803,6 +803,9 @@ internal fun MeetingPart(
     mvm: MeetingsViewModel,
     // The notes review's "Open in calendar" (XERK-2899); null inside the calendar's own detail.
     onOpenCalendar: ((com.xerktech.turma.core.CalTarget) -> Unit)? = null,
+    // A status colour's text form over the surface it sits on: the calendar panel's org tint
+    // pulls it toward ink (`calOnTint`, XERK-2939); the notes review draws on the plain surface.
+    textOn: (androidx.compose.ui.graphics.Color) -> androidx.compose.ui.graphics.Color = { it },
 ) {
     val busy by mvm.busy.collectAsStateWithLifecycle()
     val errors by mvm.errors.collectAsStateWithLifecycle()
@@ -853,7 +856,7 @@ internal fun MeetingPart(
     val status = meetingStatusLine(m)
     if (status != null) {
         Text(status.first, style = MaterialTheme.typography.bodyMedium,
-            color = if (status.second) TurmaColors.critical else MaterialTheme.colorScheme.onSurfaceVariant)
+            color = if (status.second) textOn(TurmaColors.criticalText()) else MaterialTheme.colorScheme.onSurfaceVariant)
         return
     }
     val act = ItemActions(
@@ -870,7 +873,7 @@ internal fun MeetingPart(
         ItemUi(k in busy, errors[k], drafts[k])
     }
     if (pending.isEmpty()) {
-        Text("✓ Every proposal is reviewed.", color = TurmaColors.good, style = MaterialTheme.typography.bodyMedium)
+        Text("✓ Every proposal is reviewed.", color = textOn(TurmaColors.workingText()), style = MaterialTheme.typography.bodyMedium)
     }
     for (it in pending) {
         TurmaCard(Modifier.fillMaxWidth()) {

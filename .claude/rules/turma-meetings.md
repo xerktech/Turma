@@ -205,6 +205,15 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     PRESS, never at the answer (the panel may have closed by then, QA). Its cursor is put aside
     while a panel shows a meeting and restored after.
   - The panel's aside is NOT `role=dialog`: meetings.js ignores keys from inside a dialog.
+- **The panel wears its event's org tint** (XERK-2939): `--org` set on the aside from the event's
+  ASSIGNED org (`safeColor`, the grid block's own); unassigned = plain.
+  - **The tint is EXACTLY the session card's** (operator's rule): web 12% `color-mix` like
+    `.kanban-card`/`sessions.html`; Android `orgCardColor`, the one `TurmaCard` uses.
+  - **Every text token is pulled halfway to ink inside the panel** (`--muted`, `--*-text`, read
+    from `--cal-*` captured on `.cal`; Android `calOnTint` over primary/onSurfaceVariant/status,
+    and `MeetingPart(textOn=)` for the capture's own status lines). On the plain token, muted fell
+    to 2.4:1, critical to 3.2:1 and the decision chip to 2.8:1 on a light tint (QA). A new text
+    colour in the panel needs the same treatment. Tests: `CalendarPanelTintTest`.
 - **An event counts for the org the hub's matcher reads** (`eventOrg` = the served `matchOrg`;
   an older hub: assigned org, else the host's): for the daily brief and relink candidates (QA:
   another org's unassigned event was offered).

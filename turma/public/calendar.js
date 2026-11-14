@@ -1006,6 +1006,9 @@ function paintDetail(force = false) {
     return;
   }
   $side.hidden = false;
+  // The panel wears its event's org color (XERK-2939), like the event it opened from.
+  const c = safeColor(detail.org ? colorMap().get(detail.org) : "");
+  if (c) $side.style.setProperty("--org", c); else $side.style.removeProperty("--org");
   if (!force && (sidePress || fieldFocused($info))) { sidePending = true; return; }
   sidePending = false;
   if (M) {
