@@ -277,6 +277,60 @@ ensure_glab() {
   chmod +x "$PREFIX/bin/glab"
 }
 
+# ---- WSL interop (XERK-2938) ----------------------------------------------
+# The calendar sync runs powershell.exe through WSL interop, i.e. the kernel's
+# `WSLInterop` binfmt_misc entry. WSL's init registers it at boot, but with
+# [boot] systemd=true, systemd-binfmt.service can run after it and leave the
+# entry gone — every Windows program then fails with "Exec format error". A
+# persisted binfmt.d entry makes systemd itself re-register it on every boot.
+# Never overrides an operator's `[interop] enabled=false` in /etc/wsl.conf.
+: "${WSL_OSRELEASE:=/proc/sys/kernel/osrelease}"
+: "${WSL_CONF:=/etc/wsl.conf}"
+: "${BINFMT_MISC:=/proc/sys/fs/binfmt_misc}"
+: "${BINFMT_D:=/etc/binfmt.d}"
+WSL_INTEROP_RULE=':WSLInterop:M::MZ::/init:PF'
+_wsl_interop_disabled() {  # [interop] enabled=false in wsl.conf
+  [ -r "$WSL_CONF" ] && awk '
+    /^[[:space:]]*\[/ { sec = tolower($0); gsub(/[[:space:]]/, "", sec); next }
+    sec == "[interop]" {
+      l = tolower($0); gsub(/[[:space:]]/, "", l)
+      if (l == "enabled=false") found = 1
+    }
+    END { exit !found }' "$WSL_CONF"
+}
+ensure_wsl_interop() {
+  grep -qi microsoft "$WSL_OSRELEASE" 2>/dev/null || return 0
+  if _wsl_interop_disabled; then
+    info "WSL interop is disabled in $WSL_CONF — the calendar sync will not reach Outlook"
+    return 0
+  fi
+  local conf="$BINFMT_D/WSLInterop.conf" need_conf=no need_reg=no
+  if ! grep -rqs '^:WSLInterop:' "$BINFMT_D" /usr/lib/binfmt.d /run/binfmt.d 2>/dev/null; then
+    need_conf=yes
+  fi
+  if [ -e "$BINFMT_MISC/register" ] && [ ! -e "$BINFMT_MISC/WSLInterop" ]; then need_reg=yes; fi
+  [ "$need_conf" = yes ] || [ "$need_reg" = yes ] || return 0
+  if ! have_sudo && [ "$(id -u)" != 0 ]; then
+    warn "WSL interop needs root to persist; run:"
+    warn "  echo '$WSL_INTEROP_RULE' | sudo tee $conf; echo '$WSL_INTEROP_RULE' | sudo tee $BINFMT_MISC/register"
+    return 0
+  fi
+  if [ "$need_conf" = yes ]; then
+    if $SUDO mkdir -p "$BINFMT_D" && echo "$WSL_INTEROP_RULE" | $SUDO tee "$conf" >/dev/null; then
+      info "WSL interop: wrote $conf so systemd re-registers it every boot"
+    else
+      warn "could not write $conf"
+    fi
+  fi
+  if [ "$need_reg" = yes ]; then
+    if echo "$WSL_INTEROP_RULE" | $SUDO tee "$BINFMT_MISC/register" >/dev/null 2>&1; then
+      info "WSL interop: re-registered (Windows programs start again)"
+    else
+      warn "could not re-register WSL interop; run 'wsl --shutdown' from Windows and reopen the distro"
+    fi
+  fi
+}
+
 # ---- file install ---------------------------------------------------------
 install_files() {
   info "installing runtime files into $PREFIX"
@@ -658,6 +712,7 @@ if [ "$INSTALL_DEPS" = yes ]; then
   ensure_glab
   ensure_claude
   if dsh_wanted; then ensure_dsh; fi
+  ensure_wsl_interop
 else
   info "--no-install-deps: skipping prerequisite installation"
 fi

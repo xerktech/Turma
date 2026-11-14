@@ -518,11 +518,36 @@ class CalendarTest(unittest.TestCase):
             with self.assertRaisesRegex(cli.Refused, "did not answer"):
                 cli.read_calendar("today", powershell=ps)
 
-    def test_interop_off_is_named(self):
-        """With WSL interop off, a .exe is just an unrunnable file (ENOEXEC)."""
+    def _interop_off(self, state):
+        """ENOEXEC from a fake .exe, with the WSLInterop binfmt entry in
+        `state` (None = not registered)."""
         ps = self.fake_ps("\x7fELF-not-really", shebang=False)
-        with self.assertRaisesRegex(cli.Refused, "interop looks off"):
-            cli.read_calendar("today", powershell=ps)
+        binfmt = os.path.join(self.tmp, "binfmt")
+        os.makedirs(binfmt, exist_ok=True)
+        if state is not None:
+            with open(os.path.join(binfmt, "WSLInterop"), "w") as fh:
+                fh.write(f"{state}\ninterpreter /init\nflags: PF\n")
+        with mock.patch.object(cli, "BINFMT_MISC", binfmt):
+            with self.assertRaises(cli.Refused) as cm:
+                cli.read_calendar("today", powershell=ps)
+        msg = str(cm.exception)
+        self.assertIn("Exec format error", msg)
+        self.assertLessEqual(len(msg.replace(ps, "/mnt/c/Windows/System32/WindowsPowerShell/"
+                                             "v1.0/powershell.exe")), 300)
+        return msg
+
+    def test_interop_unregistered_names_the_fix(self):
+        """XERK-2938: systemd on WSL dropped the WSLInterop binfmt entry."""
+        msg = self._interop_off(None)
+        self.assertIn("WSL interop is not registered", msg)
+        self.assertIn("re-run the Turma agent installer", msg)
+
+    def test_interop_disabled_names_the_fix(self):
+        msg = self._interop_off("disabled")
+        self.assertIn("echo 1 | sudo tee", msg)
+
+    def test_interop_enabled_but_failing_is_still_named(self):
+        self.assertIn("interop looks off", self._interop_off("enabled"))
 
     def test_the_range_is_only_ever_two_integers(self):
         ps = self.fake_ps('echo "$6" > "$(dirname "$0")/enc"\necho \'{"ok":true,"windows":[{"events":[]}]}\'\n')

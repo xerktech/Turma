@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import errno
 import glob
 import json
 import os
@@ -323,6 +324,29 @@ def _shadow_grade(sid: str, args) -> str:
     return f"shadow-grade recorded ({args.verdict}); the manager will report it and end this session"
 
 
+BINFMT_MISC = "/proc/sys/fs/binfmt_misc"
+
+
+def wsl_interop_hint(binfmt_misc=None) -> str:
+    """Why a Windows program got ENOEXEC here, and the fix (XERK-2938): the
+    kernel's `WSLInterop` binfmt entry is missing (systemd on WSL can drop it
+    after boot) or registered but disabled. Kept short: it rides the calendar
+    notice, capped at CALENDAR_ERROR_MAX."""
+    d = binfmt_misc or BINFMT_MISC
+    try:
+        with open(os.path.join(d, "WSLInterop"), encoding="utf-8") as fh:
+            state = fh.readline().strip()
+    except FileNotFoundError:
+        return ("WSL interop is not registered: re-run the Turma agent installer, "
+                "or run 'wsl --shutdown' in Windows and reopen the distro")
+    except OSError:
+        state = ""
+    if state == "disabled":
+        return ("WSL interop is disabled: echo 1 | sudo tee "
+                f"{os.path.join(d, 'WSLInterop')}")
+    return "WSL interop looks off: Windows programs cannot start from this distro"
+
+
 def find_powershell():
     """Windows PowerShell on this host, or None. On WSL a systemd-started agent's
     sessions usually lack the Windows half of PATH, so the usual install paths
@@ -526,8 +550,7 @@ def _run_calendar_ps(windows_ps: str, max_events: int, timeout: int, powershell=
         raise Refused(f"Outlook did not answer in {timeout}s (is a security "
                       "prompt open in Outlook on the Windows desktop?)")
     except OSError as e:
-        hint = (" (WSL interop looks off: Windows programs cannot start from this distro)"
-                if e.errno == 8 else "")
+        hint = f" ({wsl_interop_hint()})" if e.errno == errno.ENOEXEC else ""
         raise Refused(f"could not start {ps}: {e.strerror or e}{hint}")
     out = proc.stdout.decode("utf-8-sig", "replace").strip()
     # Only the last line is the script's JSON; a profile banner or CLIXML noise
