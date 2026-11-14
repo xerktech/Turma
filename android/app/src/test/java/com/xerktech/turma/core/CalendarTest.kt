@@ -154,6 +154,18 @@ class CalendarTest {
         assertEquals(560.0, s.bottom, 0.0)
     }
 
+    @Test fun `an event in the repeated fall-back hour lays out by its length and names both zones`() {
+        val d = LocalDate.of(2026, 11, 1)
+        val s = java.time.Instant.parse("2026-11-01T05:30:00Z").toEpochMilli()
+        val e = java.time.Instant.parse("2026-11-01T06:00:00Z").toEpochMilli()
+        val seg = calDaySegments(listOf(ev("f", s, e)), d, ny).single()
+        assertEquals(90.0, seg.top, 0.0)
+        assertEquals(120.0, seg.end, 0.0)
+        val label = calSpan(s, e, ny, Locale.US)
+        assertTrue(label, label.contains("EDT") && label.contains("EST"))
+        assertFalse(calSpan(at(2026, 11, 10, 9), at(2026, 11, 10, 10), ny, Locale.US).contains("EST"))
+    }
+
     @Test fun `Teams styles follow busy and my response`() {
         val now = at(2026, 11, 10, 12)
         val s = at(2026, 11, 10, 9)

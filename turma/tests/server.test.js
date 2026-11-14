@@ -32164,6 +32164,14 @@ test("XERK-2891: sanitizeCalendarEvent is a typed, capped fixed point", () => {
   assert.deepEqual(e.attendees, [{ name: "Bo", email: "bo@acme.com", role: "required", response: "unknown" }]);
   assert.deepEqual(e.categories, ["Red"]);
   assert.deepEqual(hub.sanitizeCalendarEvent(e), e, "a stored event re-coerces to itself");
+  // XERK-2930: only a plain addr-spec shape is served.
+  for (const bad of ['evil"@acme.com', "a<b@acme.com", "a@acme.com>", "a'b@acme.com", "a`b@acme.com"]) {
+    const x = hub.sanitizeCalendarEvent({ ...ev2891("q", Date.parse("2026-11-20T09:00:00Z")),
+      organizerEmail: bad, attendees: [{ name: "Q", email: bad, role: "required" }] });
+    assert.equal(x.organizerEmail, "", bad);
+    assert.equal(x.attendees[0].email, "", bad);
+  }
+
   assert.equal(hub.sanitizeCalendarEvent({ ...ev2891("bad", Date.now()), start: "tomorrow" }), null);
   assert.equal(hub.sanitizeCalendarEvent({ ...ev2891("bad", Date.now()), start: "2026-02-30T09:00:00Z" }), null,
     "an impossible date is refused, never rolled over");

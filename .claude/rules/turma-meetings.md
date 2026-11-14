@@ -148,6 +148,9 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 - **Week math is local wall time via `Date` setters** (`addDays`, `weekStart`), never `+ 86400000`:
   a DST week has a 23/25h day. Event rows use wall minutes (`wallMinutes`). Tests pin both DST
   edges and the year boundary.
+- **An event in the repeated fall-back hour lays out by its elapsed length** (XERK-2930): its wall
+  end precedes its start (1:30 EDT – 1:00 EST). The grid stays wall-clock so 9:00 is row 18; only
+  an inverted end is replaced. Its label names both zones (`fmtSpan`, Android `calSpan`).
 - **Teams decisions** (researched on Microsoft's "Manage your calendar in Teams" / new-calendar
   docs; recorded so a later change doesn't drift):
   - Work week (Mon–Fri) is the default; Week is Mon–Sun; ‹ › move a week; Today; the range label

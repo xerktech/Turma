@@ -5789,7 +5789,9 @@ const CAL_BUSY = new Set(["free", "tentative", "busy", "outOfOffice", "workingEl
 const CAL_RESPONSE = new Set(["none", "organizer", "tentative", "accepted", "declined", "notResponded", "unknown"]);
 const CAL_ROLE = new Set(["organizer", "required", "optional", "resource", "unknown"]);
 const CAL_SENSITIVITY = new Set(["normal", "personal", "private", "confidential"]);
-const CAL_EMAIL_RE = /^[^@\s/]+@[^@\s/]+\.[^@\s/]+$/;
+// No quote, angle bracket, space or slash anywhere: clients render the address in
+// markup (a title attribute, a mailto), so only a plain addr-spec shape is served.
+const CAL_EMAIL_RE = /^[^@\s/"'<>`]+@[^@\s/"'<>`]+\.[^@\s/"'<>`]+$/;
 const CAL_ID_RE = /^[^\u0000-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069]{1,300}$/;
 const CAL_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,7})?)?(?:Z|[+-]\d{2}:\d{2})$/;
 const CAL_DOMAIN_RE = /^(?=.{1,253}$)[a-z0-9-]+(?:\.[a-z0-9-]+)+$/;
