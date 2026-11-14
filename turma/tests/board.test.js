@@ -3914,3 +3914,24 @@ test("XERK-2674: board.html opens the clicked child or epic in the detail panel"
     assert.equal(bare.focused, 1);
   });
 }
+
+// XERK-2912: the board's document Esc must leave an Esc a stacked shared modal (New ticket) already
+// handled — closing the detail panel underneath too dropped focus to <body>.
+test("XERK-2912: board Esc leaves a handled Esc alone, else closes the detail panel", () => {
+  const src = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
+  const m = src.match(/document\.addEventListener\("keydown", \(e\) => \{\n(\s*\/\/[^\n]*\n)*\s*if \(e\.key !== "Escape"[\s\S]*?\n\}\);/);
+  assert.ok(m, "the board's Esc handler is found");
+  const body = m[0].replace(/^document\.addEventListener\("keydown", /, "").replace(/\);$/, "");
+  const run = (ev, open) => {
+    let closed = 0;
+    const h = new Function("openTicketState", "anyMenuOpen", "closeMenus", "$ebBackdrop", "$policyBackdrop",
+      "$permBackdrop", "closeDetail", "closeEpicBuilder", "closePolicyPanel", "closePermissionPanel",
+      `return ${body};`)(open, () => false, () => {}, { hidden: true }, { hidden: true }, { hidden: true },
+      () => { closed++; }, () => {}, () => {}, () => {});
+    h(ev);
+    return closed;
+  };
+  assert.equal(run({ key: "Escape", defaultPrevented: true }, { ticket: {} }), 0);
+  assert.equal(run({ key: "Escape", defaultPrevented: false }, { ticket: {} }), 1);
+  assert.equal(run({ key: "Enter", defaultPrevented: false }, { ticket: {} }), 0);
+});

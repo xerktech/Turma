@@ -2275,7 +2275,9 @@ $panel.addEventListener("change", (e) => {
 // opens a shorter panel, that click lands on the backdrop (XERK-2674).
 $backdrop.addEventListener("click", (e) => { if (e.target === $backdrop && e.detail <= 1) closeDetail(); });
 document.addEventListener("keydown", (e) => {
-  if (e.key !== "Escape") return;
+  // A shared widget that took this Esc (the New-ticket modal stacked over the detail panel, the
+  // org menu) marks it handled; closing the panel too would drop focus to <body> (XERK-2912).
+  if (e.key !== "Escape" || e.defaultPrevented) return;
   if (anyMenuOpen()) return closeMenus(null);
   if (!openTicketState && !$ebBackdrop.hidden) return closeEpicBuilder();
   if (!openTicketState && !$policyBackdrop.hidden) return closePolicyPanel();
