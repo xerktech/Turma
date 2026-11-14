@@ -108,6 +108,8 @@ Each spans components; the rule lives in the named file, which loads when any si
   (XERK-2390) → `contract-daily-brief.md`.
 - **Meetings**: Tenir's `POST /api/orgs/<site>/meetings`, the proposal store, `extractMeeting`
   and the `meetingResults` outbox (XERK-2508) → `contract-meetings.md`.
+- **The Calendar**: the `calendarSync` outbox, `syncCalendar` command, event whitelist and
+  `GET /api/calendar` (XERK-2891) → `contract-calendar.md`.
 - **"Working" is `paneBusy` OR live background WORK** (XERK-245, XERK-1570) → `session-working.md`.
 
 ## Conventions
