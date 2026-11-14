@@ -750,6 +750,10 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     open week on both clients (the hub's `calendar` frame), so the stale-host notice is live.
   - Not on either client yet: the calendar settings (holiday days off, org domain rules, a
     host's default org / show private / per-series org) — XERK-2929, web and Android together.
+  - XERK-2943 (web) needs no Android change: a wide web window now narrows the week while the
+    detail panel is open, which Android already does by placing the detail beside the grid. The web
+    also hides a block's time line by the block's drawn height (`SHORT_DP` against fixed `SLOT_DP`
+    rows on Android, which never stretch).
 
 ## Open (subsequent installments), by screen and priority
 
