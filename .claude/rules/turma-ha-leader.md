@@ -199,6 +199,9 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   (holder/other/sole-survivor + wedged-observation staleness), re-lead on recovery, and the
   always-lead default; in `forward.test.js` the refuse-not-degrade when the lease is held elsewhere,
   the sole-survivor still serving, and the byte-identical default.
+- A dead leader in `forward.test.js` is `DEAD_LEADER` (its dials are refused in-process), never a
+  freed `listen(0)` port: that port returns to the pool, a parallel test file can take it, and the
+  "dead" leader answers (XERK-2950).
 
 ### Verifying HA for real (the local stack recipe)
 
