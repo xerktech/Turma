@@ -1,0 +1,24 @@
+## haiku: 8/8 pass the parser first time
+  cost/meeting median $0.0034  max $0.0048
+  latency      median 7.2s  max 16.8s
+  expected items met 21/23, right assignee 21, extra items 4, forbidden 1
+  summary chars median 574 max 1071, paragraphs median 4, Decisions line 8/8, Actions line 8/8, injected text repeated 0
+## sonnet: 8/8 pass the parser first time
+  cost/meeting median $0.0553  max $0.0672
+  latency      median 5.4s  max 8.6s
+  expected items met 22/23, right assignee 22, extra items 2, forbidden 0
+  summary chars median 695 max 1090, paragraphs median 4, Decisions line 8/8, Actions line 8/8, injected text repeated 0
+--- generic titles ('Meeting') ---
+## haiku: 7/8 pass the parser first time
+  cost/meeting median $0.0030  max $0.0048
+  latency      median 5.1s  max 16.0s
+  expected items met 22/23, right assignee 22, extra items 2, forbidden 0
+  summary chars median 622 max 1107, paragraphs median 4, Decisions line 8/8, Actions line 8/8, injected text repeated 0
+  inferred titles 7/8: Kafka vs managed queue for billing events; Bug triage: Android crash, reset email delay, CHF symbol, Safari export; Release candidate check and Friday ship decision; Status round, iOS notification bug, feature freeze and chart accessibility pairing; VPC quota failure and certificate renewal; Meeting (personal check-in, no work items); Sprint 42 check-in; -
+  FAIL vague-ideas rep0: title is not one line of 1-120 chars
+## sonnet: 8/8 pass the parser first time
+  cost/meeting median $0.0556  max $0.0669
+  latency      median 5.5s  max 8.9s
+  expected items met 22/23, right assignee 22, extra items 2, forbidden 0
+  summary chars median 698 max 1067, paragraphs median 5, Decisions line 8/8, Actions line 8/8, injected text repeated 0
+  inferred titles 8/8: Billing events: managed queue vs Kafka and event schema format; Bug triage: Android crash, reset emails, CHF symbol, Safari export; Release candidate check and Friday ship decision; Team status round, disk alert threshold, iOS notification bug and audit feature freeze; Infra: VPC quota limit, cert renewal failure, and region setup; Casual team catch-up chat; Sprint 42 planning: invoice retry, pagination, Postgres upgrade; Onboarding survey follow-up and parked feature ideas

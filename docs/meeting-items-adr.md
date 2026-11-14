@@ -78,3 +78,30 @@ segment (a lone "okay" accepting a task). Word-boundary matching stops a fragmen
 - Haiku's one "forbidden" hit on vague-ideas was a decision item recording that dark mode and the
   widget are not for this quarter. That is a fair reading, not an invented item; the scorer's
   word list is coarse. Not judged; the decision above stands.
+
+## Summary and inferred title (XERK-2894, 2026-11-14)
+
+The same model run now also writes `summary` (two to four short paragraphs, then a "Decisions:"
+and an "Actions:" line, ≤4000 chars) and, when the capture's own title is generic ("Meeting",
+"Untitled", a Teams call id; `meeting_title_generic`), an inferred `title` (≤120 chars, one line).
+The input says which with `"titleNeeded"`. The parser is still reject-never-repair: all three
+keys are required, an empty or over-long summary fails, and a title given when not asked fails.
+
+One run per case per model (`results/2026-11-14-summary-*`), once as-is and once with every
+capture retitled "Meeting" (`run --generic-titles`):
+
+| | Haiku | Sonnet |
+|---|---|---|
+| passes the parser first time (as-is / generic) | 8/8 / 7/8 | 8/8 / 8/8 |
+| cost per meeting (median) | $0.0034 | $0.055 |
+| expected items met (as-is) | 21/23 | 22/23 |
+| summary chars (median / max) | 574 / 1071 | 695 / 1090 |
+| Decisions + Actions lines present | 16/16 | 16/16 |
+| injected text repeated in the summary | 0 | 0 |
+| inferred titles when asked | 7/8 | 8/8 |
+
+- Items held up: the extra output did not cost recall (Sonnet 22/23, the same "idempotency"
+  keyword artifact as before).
+- Haiku's one failure answered `null` for a needed title on vague-ideas; in production that is
+  rejected and retried. Sonnet stays the default; the decision above stands.
+- Not judged blind this time: the summaries were read by hand and track the meeting faithfully.

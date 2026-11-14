@@ -30,6 +30,10 @@ Wire: `contract-meetings.md`. Model decision and eval: `docs/meeting-items-adr.m
   - `suggestedAssignee` must be a participant or a speaker; `repoGuess` a name from `repos`;
   - unknown/missing keys, an unknown kind, over-long fields or >30 items fail the reply.
   - `[]` is a real answer ("nothing to propose") and ships as `ok, items: []`.
+  - **The reply is exactly `{items, summary, title}`** (XERK-2894, `parse_meeting_reply`):
+    `summary` 1..`MEETING_SUMMARY_MAX` chars, always written; `title` a one-line inferred title
+    ONLY when `meeting_title_generic` (empty, "Meeting"/"Untitled"…, a call id) put
+    `"titleNeeded": true` in the input, else it must be null. Eval: ADR "Summary and inferred title".
 - **The model never writes `duplicateKeys`**: a model-named key is a guess. The agent fills it
   from a READ-ONLY search (`meeting_duplicate_keys`: a Jira JQL `summary ~` / an ADO WIQL
   `CONTAINS` over OPEN issues of the org's projects, any assignee), ranked client-side by shared

@@ -5139,6 +5139,19 @@ const MEETING_SEGMENTS_MAX = 10000;
 const MEETING_ITEMS_MAX = 30;
 const MEETING_ITEMS_BYTES_MAX = 64 << 10;
 const MEETING_ERROR_MAX = 300;
+// The written summary and the title inferred for a generic Tenir title (XERK-2894).
+// The summary is held to its own JSON byte budget beside the items' (a settled row
+// is written whole with the store); 4000 code points can never pass 16 KiB.
+const MEETING_SUMMARY_MAX = 4000;
+const MEETING_SUMMARY_BYTES_MAX = 16 << 10;
+const MEETING_INFERRED_TITLE_MAX = 120;
+function meetingSummary(v) {
+  let s = meetingText(v, MEETING_SUMMARY_MAX, true);
+  while (s && Buffer.byteLength(JSON.stringify(s)) > MEETING_SUMMARY_BYTES_MAX) {
+    s = cpPrefix(s, [...s].length - 64).trimEnd();
+  }
+  return s;
+}
 const MEETING_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 // No quote, bracket, space, control, format (bidi) or invisible character: the
 // URL will be rendered as a link (XERK-2510), and those spoof its text.
@@ -5341,6 +5354,10 @@ function sanitizeMeeting(v) {
   if (v.status === "ok") {
     if (!Array.isArray(v.items)) return null;
     out.items = sanitizeMeetingItems(v.items);
+    const summary = meetingSummary(v.summary);
+    if (summary) out.summary = summary;
+    const inferredTitle = meetingText(v.inferredTitle, MEETING_INFERRED_TITLE_MAX);
+    if (inferredTitle) out.inferredTitle = inferredTitle;
   }
   if (v.status === "failed") {
     out.error = meetingText(v.error, MEETING_ERROR_MAX) || "the meeting could not be read";
@@ -21378,6 +21395,7 @@ function ingestMeetingResults(key, rows, now = Date.now()) {
       items: r.items.map((it) => (it && typeof it === "object" && !Array.isArray(it)
         ? { ...it, review: undefined } : it)),
       model: typeof r.model === "string" && MEETING_MODEL_RE.test(r.model) ? r.model : row.model,
+      summary: r.summary, inferredTitle: r.inferredTitle,
     });
     if (ok) {
       notifyMeetingProposals(key, r.siteKey, ok);
