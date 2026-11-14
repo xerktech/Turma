@@ -57,6 +57,7 @@ function loadPage(reply = null, agents = null, hash = "", { search = "", store =
   const fetches = [];
   const toasts = [];
   const timers = [];
+  const intervals = [];
   const clip = [];
   const noop = () => {};
   const document = {
@@ -94,7 +95,7 @@ function loadPage(reply = null, agents = null, hash = "", { search = "", store =
       constructor() { sse.push(this); this.handlers = {}; this.readyState = 1; }
       addEventListener(name, fn) { this.handlers[name] = fn; } close() {}
     },
-    setInterval: () => 0, clearInterval: noop,
+    setInterval: (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; }, clearInterval: noop,
     setTimeout: (fn) => { timers.push(fn); return timers.length; }, clearTimeout: noop,
     addEventListener: (name, fn) => { (winListeners[name] ||= []).push(fn); }, removeEventListener: noop,
     window: { name: "the window" },
@@ -128,7 +129,7 @@ function loadPage(reply = null, agents = null, hash = "", { search = "", store =
   const list = els.meetingList;
   // What a test puts "inside" the list: the focused element counts as inside.
   list.contains = (el) => !!el && el.inside === true;
-  return Object.assign(api, { viewButtons, calendarActive, store, calendarRefetches: () => calendarRefetches, meetings, els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document, window: stubs.window,
+  return Object.assign(api, { viewButtons, calendarActive, store, calendarRefetches: () => calendarRefetches, intervals, meetings, els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document, window: stubs.window,
     list: () => list.innerHTML, fire: (name, data) => sse[0].handlers[name]({ data: JSON.stringify(data) }) });
 }
 
@@ -857,5 +858,17 @@ test("XERK-2897: a stream reconnect re-reads the calendar (frames missed while d
   P.sse[0].onopen();
   assert.equal(P.calendarRefetches(), 0, "the first open is not a reconnect");
   P.sse[0].onopen();
+  assert.equal(P.calendarRefetches(), 1);
+});
+
+test("XERK-2897: with the stream down the calendar polls every 60s; up, it does not", async () => {
+  const P = loadPage(null, () => data({}));
+  await P.settle();
+  const polls = () => { for (const i of P.intervals.filter((x) => x.ms === 60000)) i.fn(); };
+  P.sse[0].onopen();
+  polls();
+  assert.equal(P.calendarRefetches(), 0, "stream up: frames carry the changes");
+  P.sse[0].onerror();
+  polls();
   assert.equal(P.calendarRefetches(), 1);
 });

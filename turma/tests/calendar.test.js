@@ -110,7 +110,7 @@ test("XERK-2897: canceled, past, tentative, free and Tenir-only styling", () => 
 const tick = () => new Promise((r) => setImmediate(r));
 function el() {
   const e = { _html: "", listeners: {}, addEventListener(n, f) { (this.listeners[n] ||= []).push(f); },
-    querySelector() { return null; }, querySelectorAll() { return []; }, contains() { return false; } };
+    querySelector() { return null; }, querySelectorAll() { return []; }, contains(t) { return !!t && t.inside === true; } };
   Object.defineProperty(e, "innerHTML", { get() { return this._html; }, set(v) { this._html = String(v); } });
   return e;
 }
@@ -246,7 +246,7 @@ test("XERK-2897: a 401 sends the page to the login", async () => {
   assert.equal(globalThis.location.href, "/login");
 });
 
-test("XERK-2897: a failed read is retried, a hidden view asks nothing, and a frame re-reads only the shown weeks", async (t) => {
+test("XERK-2897: a failed read is retried, a hidden view asks nothing, and a frame re-reads only the shown weeks", { timeout: 10000 }, async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   let fail = true;
   const asked = [];
@@ -283,4 +283,76 @@ test("XERK-2897: a failed read is retried, a hidden view asks nothing, and a fra
   cal.refetch();
   for (let i = 0; i < 6; i++) await tick();
   assert.equal(asked.length, 3, `one read per wanted week, not per week ever seen: ${asked.length}`);
+});
+
+test("XERK-2897: failures back off; showing again asks at once; a dropped week is read fresh; key order is one pick", { timeout: 10000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let fail = true, subject = "First";
+  const asked = [];
+  const week = cal.weekStart(at(2027, 8, 4));
+  replies = {
+    "/api/calendar": (url) => {
+      if (url.includes(`from=${week}&`)) asked.push(url);
+      if (fail) return { status: 404, body: { error: "not found" } };
+      return { hosts: [], events: [{ host: "h1", id: "x", org: "", subject, startMs: at(2027, 8, 4, 9), endMs: at(2027, 8, 4, 10) }] };
+    },
+  };
+  const settle = async () => { for (let i = 0; i < 6; i++) await tick(); };
+  cal.refetch();
+  await show(at(2027, 8, 4));
+  assert.equal(asked.length, 1);
+  t.mock.timers.tick(20000); await settle();
+  assert.equal(asked.length, 2, "first retry after 20s");
+  t.mock.timers.tick(20000); await settle();
+  assert.equal(asked.length, 2, "the second waits 40s");
+  t.mock.timers.tick(20000); await settle();
+  assert.equal(asked.length, 3);
+  // Hidden while its back-off runs, then shown: asked at once.
+  cal.setActive(false);
+  fail = false;
+  cal.setActive(true); await settle();
+  assert.equal(asked.length, 4);
+  assert.match(cal.calendarHtml(), /First/);
+  // Browse away, a frame drops this week, browse back: read fresh, not the old copy.
+  await show(at(2027, 10, 6));
+  cal.refetch(); await settle();
+  subject = "Second";
+  assert.match(await show(at(2027, 8, 4)), /Second/);
+  // One pick whatever order the header lists it in: no second read.
+  orgKeys = ["b.atlassian.net", "a.atlassian.net"];
+  await show(at(2027, 8, 4));
+  const n = asked.length;
+  orgKeys = ["a.atlassian.net", "b.atlassian.net"];
+  await show(at(2027, 8, 4));
+  assert.equal(asked.length, n);
+  orgKeys = [];
+});
+
+test("XERK-2897: Esc closes the detail from the calendar or <body>, never under a dialog or a handled key", async () => {
+  replies = { "/api/calendar": () => ({ hosts: [], events: [{ host: "h1", id: "e", org: "", subject: "Esc me",
+    startMs: at(2027, 9, 8, 9), endMs: at(2027, 9, 8, 10) }] }) };
+  cal.refetch();
+  const html = await show(at(2027, 9, 8));
+  const btn = /data-ev="(\d+)" data-day="(\d+)"/.exec(html);
+  const open = () => { for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset: { ev: btn[1], day: btn[2] } }) } }); };
+  const esc = (target, extra = {}) => { for (const f of root.listeners.keydown) f({ key: "Escape", target, preventDefault() {}, ...extra }); };
+  const body = {};
+  let modal = null;
+  globalThis.document = { body, documentElement: {}, querySelector: () => modal };
+  try {
+    open();
+    esc({ inside: false });                                  // focus in the header / another widget
+    assert.ok(cal._state().detail, "an Esc meant for something else");
+    modal = {};
+    esc(body);
+    assert.ok(cal._state().detail, "a dialog is open: its Esc");
+    esc({ inside: true }, { defaultPrevented: true });
+    assert.ok(cal._state().detail, "already handled");
+    modal = null;
+    esc(body);
+    assert.equal(cal._state().detail, null, "from <body> after a click elsewhere");
+    open();
+    esc({ inside: true });
+    assert.equal(cal._state().detail, null, "from inside the calendar");
+  } finally { delete globalThis.document; }
 });

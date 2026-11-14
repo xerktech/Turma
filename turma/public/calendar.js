@@ -18,6 +18,7 @@ const WORK_FROM_H = 8, WORK_UNTIL_H = 17;  // the shaded working hours; the grid
 const MIN_LAYOUT_MIN = 20;          // a shorter (or zero-length) event lays out as 20 minutes (one readable line)
 const NARROW_PX = 760;
 const RETRY_PENDING_MS = 20000;     // a sync the hub queued: re-read in case its frame is missed
+const RETRY_ERROR_MAX_MS = 300000;  // a failed read's longest back-off
 const MODE_KEY = "turma-calendar-mode";
 
 function esc(s) {
@@ -243,16 +244,20 @@ async function loadWeek(ws, keys = orgKeys()) {
     w.cal = cal && Array.isArray(cal.events) ? cal : { events: [], hosts: [] };
     w.hol = Array.isArray(hol) ? hol : [];
     w.err = "";
+    w.fails = 0;
   } catch (e) {
     w.err = String((e && e.message) || e);
+    w.fails = (w.fails || 0) + 1;
   }
   w.loading = false;
   if (weeks.get(`${org}|${ws}`) !== w) return;           // dropped by refetch() meanwhile
   if (w.again) return void loadWeek(ws, keys);
   // A failed read (a hub rollout, a 503) and a host still syncing are both read
-  // again later; while hidden the timer only clears, and showing re-asks.
+  // again later; while hidden the timer only clears, and showing re-asks. Failures
+  // back off (20s doubling to 5 min): an older hub's 404 is no reason to hammer it.
   if (w.err || (w.cal && hostNotices(w.cal, ws).some((n) => n.syncing))) {
-    w.retry = setTimeout(() => { w.retry = 0; if (active) loadWeek(ws, keys); }, RETRY_PENDING_MS);
+    const wait = w.err ? Math.min(RETRY_PENDING_MS * 2 ** (w.fails - 1), RETRY_ERROR_MAX_MS) : RETRY_PENDING_MS;
+    w.retry = setTimeout(() => { w.retry = 0; if (active) loadWeek(ws, keys); }, wait);
     if (w.retry && w.retry.unref) w.retry.unref();
   }
   if (active) paint();
@@ -558,6 +563,13 @@ function neighbour(btn, key) {
 function onKey(ev) {
   if (!active || !ev || ev.defaultPrevented) return;
   if (ev.key === "Escape") {
+    // Ours only from inside the calendar, or from nowhere (focus on <body> after a
+    // click elsewhere) with no dialog open: the Esc of a modal or menu is theirs.
+    const t = ev.target;
+    const inside = t && $root && $root.contains && $root.contains(t);
+    const nowhere = !t || (typeof document !== "undefined" && (t === document.body || t === document.documentElement));
+    if (!inside && !(nowhere && !(typeof document !== "undefined" && document.querySelector
+      && document.querySelector("[aria-modal=true],dialog[open]")))) return;
     if (picker !== null) { picker = null; paint(true); focusQ("[data-open-picker]"); ev.preventDefault(); return; }
     if (detail) { closeDetail(); ev.preventDefault(); return; }
     return;
@@ -650,7 +662,11 @@ function mount(el, opts = {}) {
 function update(snapshot) { data = snapshot; if (active) paint(); }
 function setActive(on) {
   active = !!on;
-  if (active) { lastHtml = ""; paint(true); }
+  if (!active) return;
+  // Shown again: a failed week is asked at once, not when its back-off ends.
+  for (const w of weeks.values()) if (w.err && w.retry) { clearTimeout(w.retry); w.retry = 0; }
+  lastHtml = "";
+  paint(true);
 }
 
 const api = {
