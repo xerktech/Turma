@@ -117,6 +117,7 @@ process.env.DAILY_BRIEF_SCHEDULES_FILE = path.join(scratchDir(), `turma-test-dai
 process.env.DAILY_BRIEFS_FILE = path.join(scratchDir(), `turma-test-daily-briefs-${process.pid}.json`);
 process.env.MEETING_PROPOSALS_FILE = path.join(scratchDir(), `turma-test-meeting-proposals-${process.pid}.json`);
 process.env.MEETING_FOCUS_FILE = path.join(scratchDir(), `turma-test-meeting-focus-${process.pid}.json`);
+process.env.HOLIDAY_SETTINGS_FILE = path.join(scratchDir(), `turma-test-holiday-settings-${process.pid}.json`);
 process.env.MEETING_LABELS_FILE = path.join(scratchDir(), `turma-test-meeting-labels-${process.pid}.json`);
 process.env.MEETING_LABEL_MISSES_FILE = path.join(scratchDir(), `turma-test-meeting-label-misses-${process.pid}.json`);
 process.env.MEETING_TOKENS_FILE = path.join(scratchDir(), `turma-test-meeting-tokens-${process.pid}.json`);
@@ -31670,4 +31671,111 @@ test("XERK-2856: the served row never leaks fields beyond the whitelist", async 
   assert.deepEqual(rows.find((m) => m.meetingId === "w0").daily, { meetingAt: M2856, briefRunId: "ab" });
   delete hub.getDailyBriefSchedules()[S];
   cleanup2508(S, ["wlHost2856"]);
+});
+
+// ---- XERK-2892: holiday catalogs and each org's days off -------------------------------
+test("XERK-2892: an org's holiday settings validate, round-trip, persist and stream", async () => {
+  const S = "hol2892.atlassian.net";
+  await beat1574("hol2892", S);
+  try {
+    const put = (body, headers = userHeaders, site = S) => request("PUT",
+      `/api/orgs/${encodeURIComponent(site)}/holidays`,
+      { headers: { ...headers, "content-type": "application/json" }, body });
+    // Untouched: follows the US catalog, nothing off; the catalog rides the payload.
+    let d = (await request("GET", "/api/agents", { headers: userHeaders })).body;
+    assert.deepEqual(d.holidaySettings[S], { countries: ["US"], off: [] });
+    assert.ok(d.holidayCatalog.US.holidays.some((h) => h.id === "us-thanksgiving"));
+    for (const bad of [[], "x", { countries: "US" }, { countries: ["ZZ"] }, { off: ["us-nope"] },
+      { off: [7] }, { off: ["__proto__"] }, { off: ["us-thanksgiving", null] }]) {
+      assert.equal((await put(bad)).status, 400, JSON.stringify(bad));
+    }
+    // A repeat is kept once, never refused.
+    const dup = await put({ countries: ["US", "US"] });
+    assert.deepEqual([dup.status, dup.body.settings.countries], [200, ["US"]]);
+    assert.equal((await put({ off: [] }, {})).status, 401);
+    assert.equal((await put({ off: [] }, userHeaders, "nobody2892.atlassian.net")).status, 404);
+    assert.ok(!Object.hasOwn(hub.getHolidaySettings(), "nobody2892.atlassian.net"));
+    const { req: sseReq, res: sseRes } = await sseConnect(userHeaders);
+    const frames = collectSse(sseRes);
+    const ok = await put({ off: ["us-thanksgiving", "us-independence-day", "us-thanksgiving"] });
+    assert.deepEqual([ok.status, ok.body.settings],
+      [200, { countries: ["US"], off: ["us-thanksgiving", "us-independence-day"] }]);
+    // A partial PUT merges: countries alone keeps the days off.
+    assert.deepEqual((await put({ countries: ["US"] })).body.settings.off, ["us-thanksgiving", "us-independence-day"]);
+    await waitFor(() => frames.some((e) => e.event === "holidaySettings" &&
+      (JSON.parse(e.data)[S] || {}).off?.length === 2));
+    sseReq.destroy(); sseRes.destroy();
+    d = (await request("GET", "/api/agents", { headers: userHeaders })).body;
+    assert.deepEqual(d.holidaySettings[S], { countries: ["US"], off: ["us-thanksgiving", "us-independence-day"] });
+    // The store is a coerce fixed point (restore), null-prototype, and drops unknowns.
+    const raw = JSON.parse(JSON.stringify(hub.getHolidaySettings()));
+    assert.deepEqual(JSON.parse(JSON.stringify(hub.holidaySettingsCoerce(raw))), raw);
+    const c = hub.holidaySettingsCoerce({ ["__proto__"]: { countries: ["US"], off: [] }, b: { countries: ["ZZ"], off: [] } });
+    assert.equal(Object.getPrototypeOf(c), null);
+    assert.deepEqual(Object.keys(c), ["__proto__"]);
+    // GET /api/holidays: the US catalog's holidays in the window, each naming the orgs off.
+    const get = (q, headers = userHeaders) => request("GET", `/api/holidays?${q}`, { headers });
+    const r = await get("from=2026-07-01&until=2026-11-30");
+    assert.equal(r.status, 200);
+    const july4 = r.body.find((h) => h.id === "us-independence-day");
+    assert.deepEqual([july4.date, july4.actualDate, july4.country], ["2026-07-03", "2026-07-04", "US"]);
+    assert.ok(july4.offFor.includes(S));
+    assert.ok(!r.body.find((h) => h.id === "us-labor-day").offFor.includes(S));
+    assert.deepEqual(r.body.map((h) => h.date), [...r.body.map((h) => h.date)].sort());
+    // Remembered by id: it is off next year too.
+    assert.ok((await get("from=2027-11-01&until=2027-11-30")).body
+      .find((h) => h.id === "us-thanksgiving").offFor.includes(S));
+    for (const q of ["", "from=2026-01-01", "from=2026-02-30&until=2026-03-01",
+      "from=2026-05-01&until=2026-04-01", "from=2026-01-01&until=2027-03-01"]) {
+      assert.equal((await get(q)).status, 400, q);
+    }
+    assert.equal((await get("from=2026-01-01&until=2026-01-31", {})).status, 401);
+    // Following no catalog lists none of its holidays for the org.
+    await put({ countries: [] });
+    assert.ok(!(await get("from=2026-11-01&until=2026-11-30")).body.some((h) => h.offFor.includes(S)));
+  } finally {
+    delete agents.hol2892;
+    delete hub.getHolidaySettings()[S];
+  }
+});
+
+test("XERK-2892: holiday settings and days off are each tenant's own", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await fleet2551(T, "t2892");
+    const put = (site, h, body) => request("PUT", `/api/orgs/${encodeURIComponent(site)}/holidays`,
+      { headers: { ...h, "content-type": "application/json" }, body });
+    assert.equal((await put(F.SA, T.B.h, { off: ["us-christmas"] })).status, 404, "B cannot write A's org");
+    assert.equal((await put(F.SA, userHeaders, { off: ["us-christmas"] })).status, 404, "break-glass has no tenant");
+    assert.equal((await put(F.SA, T.A.h, { off: ["us-christmas"] })).status, 200);
+    assert.equal((await put(F.SB, T.B.h, { off: ["us-labor-day"] })).status, 200);
+    assert.equal((await put(S2551, userHeaders, { off: ["us-memorial-day"] })).status, 200);
+    // Each tenant's payload carries only its own org's settings.
+    const agentsOf = async (h) => (await request("GET", "/api/agents", { headers: h })).body.holidaySettings;
+    const a = await agentsOf(T.A.h), b = await agentsOf(T.B.h), op = await agentsOf(userHeaders);
+    assert.deepEqual(Object.keys(a).filter((k) => k.startsWith(S2551)), [F.SA]);
+    assert.deepEqual(Object.keys(b).filter((k) => k.startsWith(S2551)), [F.SB]);
+    assert.ok(S2551 in op && !(F.SA in op) && !(F.SB in op));
+    // /api/holidays names only the caller's own orgs in offFor.
+    const hol = async (h) => (await request("GET", "/api/holidays?from=2026-05-01&until=2026-12-31",
+      { headers: h })).body;
+    const offFor = (list, id) => list.find((x) => x.id === id).offFor;
+    const ha = await hol(T.A.h), hb = await hol(T.B.h), ho = await hol(userHeaders);
+    assert.deepEqual(offFor(ha, "us-christmas"), [F.SA]);
+    assert.deepEqual(offFor(ha, "us-labor-day"), []);
+    assert.deepEqual(offFor(hb, "us-labor-day"), [F.SB]);
+    assert.deepEqual(offFor(hb, "us-christmas"), []);
+    assert.ok(!JSON.stringify(ho).includes(T.A.t) && !JSON.stringify(ho).includes(T.B.t));
+    assert.deepEqual(offFor(ho, "us-memorial-day"), [S2551]);
+    // A tenant purge drops its org's settings and nobody else's.
+    hub.purgeTenantData(T.A.t);
+    assert.ok(!(F.SA in hub.getHolidaySettings()) && F.SB in hub.getHolidaySettings());
+  } finally {
+    if (F) {
+      forget2533("t2892", F.ka, F.kb, F.kl);
+      for (const k of [F.SA, F.SB, S2551]) delete hub.getHolidaySettings()[k];
+    }
+    T.restore();
+  }
 });

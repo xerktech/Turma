@@ -70,6 +70,7 @@ const { createLiveStore, sameValue } = require("./store.js");
 const tenancy = require("./tenancy.js");
 const tenantMigration = require("./tenant-migration.js");
 const routeScope = require("./tenant-scope.js");
+const holidays = require("./holidays.js");
 const { createLeader } = require("./leader.js");
 // The archive's object-store backend + mirror (XERK-759, epic XERK-751). The
 // durable archive's BYTES (rendered + raw layers) move to object storage as the
@@ -672,6 +673,8 @@ const MEETING_LABEL_MISSES_FILE =
   process.env.MEETING_LABEL_MISSES_FILE || "/data/meeting-label-misses.json";
 // Whose work an org's meetings propose (XERK-2514): siteKey -> {names, role}.
 const MEETING_FOCUS_FILE = process.env.MEETING_FOCUS_FILE || "/data/meeting-focus.json";
+// Each org's holiday catalogs and days off (XERK-2892): siteKey -> {countries, off}.
+const HOLIDAY_SETTINGS_FILE = process.env.HOLIDAY_SETTINGS_FILE || "/data/holiday-settings.json";
 // Each tenant's Tenir bearer, as its SHA-256 only (XERK-2551).
 const MEETING_TOKENS_FILE = process.env.MEETING_TOKENS_FILE || "/data/meeting-tokens.json";
 // Tenants whose archive data was purged (XERK-2549): tombstones every replica reads.
@@ -5590,6 +5593,109 @@ function setMeetingFocus(siteKey, body) {
   return { status: 200, body: { ok: true, focus: f } };
 }
 
+// ---- holidays: each org's catalogs and days off (XERK-2892) ------------------------
+// The catalogs are computed by rule (holidays.js); the hub stores only each org's
+// choice: which countries' holidays it follows and which of them are DAYS OFF,
+// by holiday id so a choice holds every year. An org with nothing stored follows
+// HOLIDAY_DEFAULT_COUNTRIES with no day off. Contract: contract-calendar.md.
+const HOLIDAY_DEFAULT_COUNTRIES = ["US"];
+const HOLIDAY_ORGS_MAX = 100;   // per tenant; ORG_STORE_TOTAL_FACTOR x this hub-wide
+const HOLIDAY_SITE_MAX = 200;
+// {countries, off} -> the stored shape, or null when anything in it is unknown,
+// so a 200 always means stored as sent. Order is kept, repeats dropped.
+function holidaySettingsValue(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  if (!Array.isArray(v.countries) || !Array.isArray(v.off)) return null;
+  // Every element must be known, so the deduped lists are bounded by the catalog.
+  if (!v.countries.every(holidays.hasCountry)) return null;
+  if (!v.off.every((id) => typeof id === "string" && Object.hasOwn(holidays.HOLIDAY_COUNTRY, id))) return null;
+  return { countries: [...new Set(v.countries)], off: [...new Set(v.off)] };
+}
+function holidaySettingsCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw).slice(0, HOLIDAY_ORGS_MAX * ORG_STORE_TOTAL_FACTOR)) {
+    const h = k && k.length <= HOLIDAY_SITE_MAX ? holidaySettingsValue(v) : null;
+    if (h) Object.defineProperty(out, k, { value: h, enumerable: true, writable: true, configurable: true });
+  }
+  return out;
+}
+let holidaySettings = holidaySettingsCoerce(readJsonFile(HOLIDAY_SETTINGS_FILE));
+const persistHolidaySettings = registerExternalStore({
+  name: "holidaySettings", file: HOLIDAY_SETTINGS_FILE,
+  coerce: holidaySettingsCoerce, read: () => holidaySettings, install: (v) => { holidaySettings = v; },
+});
+function holidaySettingsOf(siteKey) {
+  return Object.hasOwn(holidaySettings, siteKey) ? holidaySettings[siteKey]
+    : { countries: [...HOLIDAY_DEFAULT_COUNTRIES], off: [] };
+}
+// The wire: every decided org's effective settings (stored or default), plus any
+// stored org no host is in now (bySite scopes both per principal).
+function holidaySettingsWire() {
+  const out = Object.create(null);
+  for (const site of decidedOrgs()) out[site] = holidaySettingsOf(site);
+  for (const [site, h] of Object.entries(holidaySettings)) out[site] = h;
+  return out;
+}
+// PUT body {countries?, off?} merged over the org's settings. Answers {status, body}.
+function setHolidaySettings(siteKey, body, orgs) {
+  if (siteKey.length > HOLIDAY_SITE_MAX) {
+    return { status: 400, body: { error: `org key too long — the limit is ${HOLIDAY_SITE_MAX} characters` } };
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { status: 400, body: { error: "body must be {countries, off}" } };
+  }
+  const merged = { ...holidaySettingsOf(siteKey) };
+  for (const k of ["countries", "off"]) if (k in body) merged[k] = body[k];
+  const value = holidaySettingsValue(merged);
+  if (!value) {
+    return { status: 400, body: { error: `countries must be catalog codes (${Object.keys(holidays.CATALOGS).join(", ")}) and off must be holiday ids from the catalog` } };
+  }
+  if (!Object.hasOwn(holidaySettings, siteKey) && orgStoreFull(holidaySettings, siteKey, HOLIDAY_ORGS_MAX)) {
+    const { full, pruned } = makeRoomForOrg(holidaySettings, siteKey, HOLIDAY_ORGS_MAX, (k) => !orgs.has(k));
+    if (full) {
+      if (pruned) publishHolidaySettings();
+      return { status: 409, body: { error: full === "tenant"
+        ? `${HOLIDAY_ORGS_MAX} orgs already have holiday settings — the limit`
+        : "the hub holds holiday settings for too many orgs — try again later" } };
+    }
+  }
+  Object.defineProperty(holidaySettings, siteKey, { value, enumerable: true, writable: true, configurable: true });
+  publishHolidaySettings();
+  return { status: 200, body: { ok: true, settings: value } };
+}
+function publishHolidaySettings() {
+  persistHolidaySettings();
+  invalidateAgentsCache();
+  sseBroadcast("holidaySettings", holidaySettingsWire());
+}
+// GET /api/holidays: every holiday from `from` to `until` (inclusive) of each
+// country an org principal `p` may see follows, each with the visible orgs that
+// take it OFF. Answers {status, body}.
+function holidaysFor(p, fromText, untilText) {
+  const from = holidays.parseDay(fromText), until = holidays.parseDay(untilText);
+  if (from === null || until === null) {
+    return { status: 400, body: { error: "from and until must be dates as YYYY-MM-DD" } };
+  }
+  if (until < from) return { status: 400, body: { error: "until is before from" } };
+  if ((until - from) / holidays.DAY_MS + 1 > holidays.RANGE_MAX_DAYS) {
+    return { status: 400, body: { error: `at most ${holidays.RANGE_MAX_DAYS} days at a time` } };
+  }
+  const orgs = [...decidedOrgs()].filter((site) => principalMaySite(p, site))
+    .map((site) => [site, holidaySettingsOf(site)]);
+  const countries = new Set();
+  for (const [, h] of orgs) for (const c of h.countries) countries.add(c);
+  const out = [];
+  for (const c of countries) {
+    for (const row of holidays.holidaysIn(c, from, until)) {
+      row.offFor = orgs.filter(([, h]) => h.countries.includes(c) && h.off.includes(row.id)).map(([site]) => site);
+      out.push(row);
+    }
+  }
+  out.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.country < b.country ? -1 : 1));
+  return { status: 200, body: out };
+}
+
 // "Acme Corp" -> "acme-corp". "" when nothing label-shaped is left.
 function meetingLabelSlug(text) {
   const s = String(text || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
@@ -8184,6 +8290,7 @@ const TENANT_ORG_STORES = [
   ["meetingLabels", () => meetingLabels, () => persistMeetingLabels()],
   ["meetingLabelMisses", () => meetingLabelMisses, () => persistMeetingLabelMisses()],
   ["meetingFocus", () => meetingFocus, () => persistMeetingFocus()],
+  ["holidaySettings", () => holidaySettings, () => persistHolidaySettings()],
   ["ticketAgents", () => ticketAgents, () => persistTicketAgents(), siteOfTicketKey],
   ["ticketModels", () => ticketModels, () => persistTicketModels(), siteOfTicketKey],
   ["ticketRuntimes", () => ticketRuntimes, () => persistTicketRuntimes(), siteOfTicketKey],
@@ -9197,6 +9304,11 @@ function buildAgentsCache() {
     meetingLabelMisses,
     // Whose work each org's meetings propose (XERK-2514): siteKey -> {names, role}.
     meetingFocus,
+    // Each org's holiday catalogs and days off (XERK-2892): siteKey -> {countries,
+    // off}, every decided org (an unset one at its default), and the catalogs the
+    // meetings settings list as checkboxes: country -> {name, holidays:[{id, name}]}.
+    holidaySettings: holidaySettingsWire(),
+    holidayCatalog: holidays.catalogWire(),
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -25492,6 +25604,14 @@ const server = http.createServer(async (req, res) => {
 
     // GET /api/search?q=&repo=&host=&limit= — instant hub-local full-text search
     // over every archived session (works even for offline hosts).
+    // GET /api/holidays?from=YYYY-MM-DD&until=YYYY-MM-DD — the holidays of every
+    // catalog the caller's orgs follow, each with the orgs that take it off
+    // (XERK-2892). Filtered: only the caller's own orgs count or are named.
+    if (req.method === "GET" && url.pathname === "/api/holidays") {
+      const out = holidaysFor(requestPrincipal(req), url.searchParams.get("from"), url.searchParams.get("until"));
+      return json(res, out.status, out.body);
+    }
+
     if (req.method === "GET" && url.pathname === "/api/search") {
       const q = (url.searchParams.get("q") || "").trim();
       if (q.length < 2) return json(res, 400, { error: "query too short" });
@@ -27780,6 +27900,28 @@ const server = http.createServer(async (req, res) => {
       return json(res, out.status, out.body);
     }
 
+    // PUT /api/orgs/<siteKey>/holidays — the operator picks the org's holiday
+    // catalogs and days off (XERK-2892). Body {countries?, off?} merged over the
+    // stored (or default) settings and validated whole. 404 an org no host is
+    // decided into, before the body is read, so a refusal mints no store key.
+    if (req.method === "PUT" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 4 && parts[3] === "holidays") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const orgs = decidedOrgs();
+      if (!orgs.has(siteKey)) {
+        return json(res, 404, { error: "no host is in that org" });
+      }
+      let body;
+      try {
+        body = JSON.parse((await readBody(req, 8192)) || "null");
+      } catch (e) {
+        if (e && (e.tooLarge || e.budgetExceeded)) throw e;
+        return json(res, 400, { error: "body is not JSON" });
+      }
+      const out = setHolidaySettings(siteKey, body, orgs);
+      return json(res, out.status, out.body);
+    }
+
     // POST /api/orgs/<siteKey>/meetings — Tenir posting a finished meeting
     // (XERK-2508; authed at the gate by TURMA_MEETINGS_TOKEN). 404 an org no
     // host is decided into, before the body is read, so a refusal mints nothing.
@@ -29281,6 +29423,7 @@ if (process.env.TURMA_TEST) {
     getMeetings: () => meetingProposals, getMeetingLabels: () => meetingLabels,
     getMeetingLabelMisses: () => meetingLabelMisses, meetingLabelsCoerce, meetingLabelMissesCoerce,
     getMeetingFocus: () => meetingFocus, meetingFocusCoerce,
+    getHolidaySettings: () => holidaySettings, holidaySettingsCoerce,
     meetingLabelSlug, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
     putMeeting, reviewMeetingItem, settleMeetingReviews, archiveMeeting, meetingDailyOf, keepMeetings, meetingProposalsWire, MEETING_START_WAIT_MS,
     MEETING_CREATE_DEADLINE_MS, MEETING_MAYBE_CREATED_REFUSAL, acceptMeeting,
