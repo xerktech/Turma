@@ -5147,6 +5147,37 @@ const MEETING_SEGMENTS_MAX = 10000;
 const MEETING_ITEMS_MAX = 30;
 const MEETING_ITEMS_BYTES_MAX = 64 << 10;
 const MEETING_ERROR_MAX = 300;
+// The written summary and the title inferred for a generic Tenir title (XERK-2894).
+// The summary is held to its own JSON byte budget beside the items' (a settled row
+// is written whole with the store); 4000 code points can never pass 16 KiB.
+const MEETING_SUMMARY_MAX = 4000;
+const MEETING_SUMMARY_BYTES_MAX = 16 << 10;
+const MEETING_INFERRED_TITLE_MAX = 120;
+// A meeting title that names nothing — the mirror of hub-agent.py's
+// meeting_title_generic (both pass agent/tests/meeting_title_vectors.json). An
+// inferred title is kept only for such a meeting, so an agent cannot rename a
+// meeting Tenir named.
+const MEETING_GENERIC_TITLES = new Set(["meeting", "untitled", "untitled meeting", "new meeting",
+  "call", "new call", "teams meeting", "microsoft teams meeting", "teams call", "zoom meeting",
+  "google meet", "meet", "meeting now", "instant meeting", "personal meeting room", "recording",
+  "capture"]);
+function meetingTitleGeneric(title) {
+  const t = String(title || "").split(/\s+/).filter(Boolean).join(" ");
+  if (!t) return true;
+  if (MEETING_GENERIC_TITLES.has(t.toLowerCase().replace(/^[ .:-]+|[ .:-]+$/g, ""))) return true;
+  if (/^[0-9][0-9 -]{7,}[0-9]$/.test(t) && t.replace(/\D/g, "").length >= 9) return true;
+  return !t.includes(" ") && (/^(?:\d+:)?meeting_[A-Za-z0-9_=-]+(?:@thread\.v2)?$/.test(t)
+    || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t));
+}
+// What a meeting is called on every operator surface (push, decisions log, pages).
+const meetingDisplayTitle = (m) => m.inferredTitle || m.title;
+function meetingSummary(v) {
+  let s = meetingText(v, MEETING_SUMMARY_MAX, true);
+  while (s && Buffer.byteLength(JSON.stringify(s)) > MEETING_SUMMARY_BYTES_MAX) {
+    s = cpPrefix(s, [...s].length - 64).trimEnd();
+  }
+  return s;
+}
 const MEETING_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 // No quote, bracket, space, control, format (bidi) or invisible character: the
 // URL will be rendered as a link (XERK-2510), and those spoof its text.
@@ -5349,6 +5380,10 @@ function sanitizeMeeting(v) {
   if (v.status === "ok") {
     if (!Array.isArray(v.items)) return null;
     out.items = sanitizeMeetingItems(v.items);
+    const summary = meetingSummary(v.summary);
+    if (summary) out.summary = summary;
+    const inferredTitle = meetingText(v.inferredTitle, MEETING_INFERRED_TITLE_MAX);
+    if (inferredTitle && meetingTitleGeneric(v.title)) out.inferredTitle = inferredTitle;
   }
   if (v.status === "failed") {
     out.error = meetingText(v.error, MEETING_ERROR_MAX) || "the meeting could not be read";
@@ -21994,7 +22029,7 @@ function meetingRunOf(host, siteKey, runId) {
 function notifyMeetingProposals(host, siteKey, row) {
   const n = Array.isArray(row.items) ? row.items.length : 0;
   if (!n) return;
-  notify(`${n} proposal${n === 1 ? "" : "s"} from ${row.title || "a meeting"}`,
+  notify(`${n} proposal${n === 1 ? "" : "s"} from ${meetingDisplayTitle(row) || "a meeting"}`,
     "Review them under Brief → Meetings — nothing reaches the board until you approve.", {
       tags: "meetings", route: { host },
       notifKey: `meeting:${siteKey}:${row.meetingId}`,
@@ -22016,6 +22051,7 @@ function ingestMeetingResults(key, rows, now = Date.now()) {
       items: r.items.map((it) => (it && typeof it === "object" && !Array.isArray(it)
         ? { ...it, review: undefined } : it)),
       model: typeof r.model === "string" && MEETING_MODEL_RE.test(r.model) ? r.model : row.model,
+      summary: r.summary, inferredTitle: r.inferredTitle,
     });
     if (ok) {
       notifyMeetingProposals(key, r.siteKey, ok);
@@ -22149,7 +22185,7 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   const edited = title !== item.title || body.edited === true;
   if (item.kind === "decision") {
     const d = appendDecision(siteKey, { source: "meeting",
-      text: [title, description].filter(Boolean).join(" — "), label: m.title });
+      text: [title, description].filter(Boolean).join(" — "), label: meetingDisplayTitle(m) });
     if (!d) return refuse(409, "the hub holds decisions for too many orgs — try again later");
     return save({ state: "logged", at: now, ...(edited ? { edited: true } : {}) });
   }
@@ -30025,7 +30061,7 @@ if (process.env.TURMA_TEST) {
     getMeetingLabelMisses: () => meetingLabelMisses, meetingLabelsCoerce, meetingLabelMissesCoerce,
     getMeetingFocus: () => meetingFocus, meetingFocusCoerce,
     getHolidaySettings: () => holidaySettings, holidaySettingsCoerce,
-    meetingLabelSlug, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
+    meetingLabelSlug, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick, meetingTitleGeneric,
     putMeeting, reviewMeetingItem, settleMeetingReviews, archiveMeeting, meetingDailyOf, keepMeetings, meetingProposalsWire, MEETING_START_WAIT_MS,
     MEETING_CREATE_DEADLINE_MS, MEETING_MAYBE_CREATED_REFUSAL, acceptMeeting,
     ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETINGS_PENDING_TOTAL_MAX, MEETINGS_PENDING_HARD_FACTOR, MEETING_RUN_TIMEOUT_MS,

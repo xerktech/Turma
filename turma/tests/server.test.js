@@ -29631,6 +29631,35 @@ test("XERK-2508: a meeting is read by one capable host, which pulls the transcri
   cleanup2508(O, ["mtOther2508"]);
 });
 
+test("XERK-2894: a result's summary and inferred title are kept, bounded and served", async () => {
+  const S = "mtSum2894.atlassian.net";
+  await meetHost2508("mtSum2894", S);
+  await postMeeting2508(S, meeting2508("s1", { title: "Meeting" }));
+  const [cmd] = meetCmds2508("mtSum2894");
+  await meetResult2508("mtSum2894", S, cmd, { status: "ok", items: [],
+    summary: "We met.\u0007  \n\n\n\nDecisions: <b>none</b>\u202e", inferredTitle: "  Login\n bug   triage " });
+  const row = hub.getMeetings()[S][0];
+  assert.deepEqual([row.status, row.title, row.summary, row.inferredTitle],
+    ["ok", "Meeting", "We met.\n\nDecisions: <b>none</b>", "Login bug triage"]);
+  const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.meetingProposals[S][0];
+  assert.deepEqual([served.summary, served.inferredTitle], [row.summary, row.inferredTitle]);
+  assert.deepEqual(hub.meetingsCoerce(JSON.parse(JSON.stringify(hub.getMeetings()))), hub.getMeetings());
+  // Bounded: 4000 code points, and the JSON byte budget; wrong types and empty text are absent.
+  const base = { meetingId: "w1", title: "Meeting", platform: "teams", startedAt: 1, endedAt: 2, receivedAt: 3,
+    status: "ok", items: [] };
+  const big = hub.sanitizeMeeting({ ...base, summary: "😀".repeat(5000), inferredTitle: "t".repeat(500) });
+  assert.equal([...big.summary].length, 4000);
+  assert.ok(Buffer.byteLength(JSON.stringify(big.summary)) <= 16 << 10);
+  assert.equal(big.inferredTitle.length, 120);
+  for (const v of [{ x: 1 }, 7, "", "  \n "]) {
+    const m = hub.sanitizeMeeting({ ...base, summary: v, inferredTitle: v });
+    assert.deepEqual(["summary" in m, "inferredTitle" in m], [false, false]);
+  }
+  // Only a settled ok row carries them.
+  assert.equal("summary" in hub.sanitizeMeeting({ ...base, status: "failed", summary: "s" }), false);
+  cleanup2508(S, ["mtSum2894"]);
+});
+
 test("XERK-2508: the tick waits for a host, retries a silent or departed one, and expires the queue", async () => {
   const S = "mtT2508.atlassian.net";
   await beat1574("mtTOld2508", S);
@@ -31674,6 +31703,32 @@ test("XERK-2856: the served row never leaks fields beyond the whitelist", async 
   assert.deepEqual(rows.find((m) => m.meetingId === "w0").daily, { meetingAt: M2856, briefRunId: "ab" });
   delete hub.getDailyBriefSchedules()[S];
   cleanup2508(S, ["wlHost2856"]);
+});
+
+test("XERK-2894 QA: an inferred title names the push and the decision, and only a generic title takes one", async () => {
+  // The hub's mirror reads the agent's vectors (meeting_title_generic).
+  const vec = JSON.parse(fs.readFileSync(path.join(__dirname, "../../agent/tests/meeting_title_vectors.json"), "utf8"));
+  for (const t of vec.generic) assert.equal(hub.meetingTitleGeneric(t), true, t);
+  for (const t of vec.real) assert.equal(hub.meetingTitleGeneric(t), false, t);
+  const S = "mtQ2894.atlassian.net";
+  await meetHost2508("mtQ2894", S);
+  await postMeeting2508(S, meeting2508("q1", { title: "Meeting" }));
+  const [c1] = meetCmds2508("mtQ2894");
+  notifications.length = 0;
+  await meetResult2508("mtQ2894", S, c1, { status: "ok", inferredTitle: "Login bug triage",
+    items: [{ kind: "decision", title: "Ship Friday" }] });
+  assert.deepEqual(notifications.filter((n) => n.title != null).map((n) => n.title),
+    ["1 proposal from Login bug triage"]);
+  assert.equal((await review2510(S, "q1", "p1", { action: "approve" })).status, 200);
+  assert.equal(hub.getDecisions()[S].at(-1).label, "Login bug triage");
+  // A meeting Tenir named keeps its name: an agent's inferred title is dropped.
+  await postMeeting2508(S, meeting2508("q2", { title: "Q4-2026-roadmap-planning-sync" }));
+  const [c2] = meetCmds2508("mtQ2894").filter((c) => c.meetingId === "q2");
+  await meetResult2508("mtQ2894", S, c2, { status: "ok", items: [], summary: "s", inferredTitle: "Renamed" });
+  const q2 = hub.getMeetings()[S].find((m) => m.meetingId === "q2");
+  assert.deepEqual([q2.title, "inferredTitle" in q2, q2.summary], ["Q4-2026-roadmap-planning-sync", false, "s"]);
+  cleanup2508(S, ["mtQ2894"]);
+  delete hub.getDecisions()[S];
 });
 
 // ---- XERK-2892: holiday catalogs and each org's days off -------------------------------

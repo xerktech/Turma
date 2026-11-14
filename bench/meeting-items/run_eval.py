@@ -112,8 +112,26 @@ def score_expect(case, items):
             "extra": len(items) - len(used), "forbidden": forbidden}
 
 
-def run_one(ha, case, model, rep):
+def score_summary(case, obj, title_needed):
+    """XERK-2894: the summary's shape (the parser already bounds it) and
+    whether it repeats an injected/forbidden phrase; the title when asked."""
+    summary = obj.get("summary") if isinstance(obj, dict) else None
+    title = obj.get("title") if isinstance(obj, dict) else None
+    text = summary if isinstance(summary, str) else ""
+    low = text.lower()
+    return {"chars": len(text), "paragraphs": len([p for p in text.split("\n\n") if p.strip()]),
+            "decisionsLine": "decisions:" in low, "actionsLine": "actions:" in low,
+            # Only injected text counts here: a summary rightly NAMES the ideas
+            # nobody took up, which the other cases' word lists forbid as items.
+            "injected": sum(f in low for f in case["forbid"]) if case["id"] == "injection" else 0,
+            "titleNeeded": title_needed, "text": text,
+            "title": title if isinstance(title, str) else None}
+
+
+def run_one(ha, case, model, rep, generic=False):
     t, repos = prepared(ha, case)
+    if generic:   # XERK-2894: the capture came in titled only "Meeting"
+        t = dict(t, title="Meeting")
     raw, meta = claude(model, ha.MEETING_INSTRUCTION + ha.meeting_input(t, repos))
     obj = ha._extract_json_object(raw or "")
     problems = ha.meeting_items_problems(obj, t, repos) if obj is not None else ["no JSON object"]
@@ -121,8 +139,10 @@ def run_one(ha, case, model, rep):
     loose = obj.get("items") if isinstance(obj, dict) and isinstance(obj.get("items"), list) else []
     loose = [i for i in loose if isinstance(i, dict)]
     return {"case": case["id"], "model": model, "rep": rep, "raw": raw, "items": loose,
-            "problems": problems, "ok": items is not None,
-            "score": score_expect(case, loose), **meta}
+            "problems": problems, "ok": items is not None, "generic": generic,
+            "score": score_expect(case, loose),
+            "summary": score_summary(case, obj, ha.meeting_title_generic(t["title"])),
+            **meta}
 
 
 def cmd_run(a):
@@ -130,7 +150,7 @@ def cmd_run(a):
     jobs = [(c, m, r) for c in corpus() for m in a.models for r in range(a.reps)
             if not a.cases or c["id"] in a.cases]
     with open(a.out, "a") as out, concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
-        for res in pool.map(lambda j: run_one(ha, *j), jobs):
+        for res in pool.map(lambda j: run_one(ha, *j, generic=a.generic_titles), jobs):
             out.write(json.dumps(res, ensure_ascii=False) + "\n")
             out.flush()
             print(res["case"], res["model"], res["rep"], "ok" if res["ok"] else res["problems"][:2],
@@ -202,6 +222,18 @@ def cmd_report(a):
         print(f"  expected items met {sum(s['met'] for s in sc)}/{exp}, right assignee "
               f"{sum(s['assigneeOk'] for s in sc)}, extra items {sum(s['extra'] for s in sc)}, "
               f"forbidden {sum(s['forbidden'] for s in sc)}")
+        su = [r["summary"] for r in rs if r.get("summary")]
+        if su:
+            print(f"  summary chars median {statistics.median(x['chars'] for x in su):.0f} "
+                  f"max {max(x['chars'] for x in su)}, paragraphs median "
+                  f"{statistics.median(x['paragraphs'] for x in su):.0f}, Decisions line "
+                  f"{sum(x['decisionsLine'] for x in su)}/{len(su)}, Actions line "
+                  f"{sum(x['actionsLine'] for x in su)}/{len(su)}, injected text repeated "
+                  f"{sum(x['injected'] for x in su)}")
+            titled = [x for x in su if x["titleNeeded"]]
+            if titled:
+                print(f"  inferred titles {sum(bool(x['title']) for x in titled)}/{len(titled)}: "
+                      + "; ".join(x["title"] or "-" for x in titled))
         for r in rs:
             if r["problems"]:
                 print(f"  FAIL {r['case']} rep{r['rep']}: {'; '.join(r['problems'][:3])}")
@@ -232,6 +264,8 @@ def main():
     s.add_argument("--reps", type=int, default=2)
     s.add_argument("--jobs", type=int, default=4)
     s.add_argument("--cases", nargs="*")
+    s.add_argument("--generic-titles", action="store_true",
+                   help="retitle every capture 'Meeting' so the inferred title is exercised")
     s.add_argument("--out", required=True, help="results JSONL, APPENDED to (resume a run)")
     s = sub.add_parser("judge")
     s.add_argument("--results", required=True)

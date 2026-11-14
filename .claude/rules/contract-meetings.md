@@ -83,7 +83,16 @@ ticket builds to this file; change it here first.
   - **Written with no debounce** (`debounceMs: 0`): a 200 promises Tenir the meeting is kept.
 - Row: `{meetingId, status:"queued"|"running"|"ok"|"failed", title, platform, startedAt, endedAt,
   receivedAt, tenirUrl?, participants, daily?, model?, host?, runId?, generatedAt?, archivedAt?,
-  items?, error?}`.
+  items?, summary?, inferredTitle?, error?}`.
+  - **`summary` / `inferredTitle` ride an `ok` row only** (XERK-2894, after `items` in field
+    order): the summary `meetingText` multiline ≤`MEETING_SUMMARY_MAX` (4000) code points and its
+    JSON ≤`MEETING_SUMMARY_BYTES_MAX` (16 KiB), measured apart from the items' budget; the title
+    one line ≤120. Empty or wrong-typed = absent. `inferredTitle` never replaces `title`: clients
+    show `inferredTitle || title`. Both are plain text, rendered ESCAPED.
+  - **The hub keeps `inferredTitle` only for a GENERIC title** (`meetingTitleGeneric`, the mirror
+    of the agent's `meeting_title_generic`; both pass `agent/tests/meeting_title_vectors.json` —
+    add a vector there, never to one side), so an agent cannot rename a meeting Tenir named.
+  - The push ("N proposals from …") and a logged decision's `label` use `meetingDisplayTitle`.
   - `segments` are kept ONLY while `queued`/`running` and dropped once settled; a running row also
     keeps `cmdId, sentAt, attempt, tried`. None of those four, nor `segments`, is ever served.
   - **Eviction drops settled rows first** — archived ones before the rest — oldest first; a
@@ -214,7 +223,8 @@ ticket builds to this file; change it here first.
 
 - `meetings: {available, runtimes, models}`, coerced by `normalizeRunCapability` exactly like
   `dailyBrief` (absent = can't; unusable → null).
-- `meetingResults: [{runId, siteKey, meetingId, status:"ok"|"failed", items?, model?, error?}]`,
+- `meetingResults: [{runId, siteKey, meetingId, status:"ok"|"failed", items?, summary?,
+  inferredTitle?, model?, error?}]`,
   ≤5 rows a beat; outbox semantics (the agent clears a row once a beat carrying it was accepted).
   - Accepted only from the host asked, for that run, while it is still decided into `siteKey`
     (XERK-348) and the run is still `running`. A re-sent row after that changes nothing.
@@ -224,6 +234,7 @@ ticket builds to this file; change it here first.
     `notifKey: meeting:<site>:<id>`, `click: /brief?site=…#meetings` (Android opens Brief's
     Meetings pane; an older hub's `/meetings?site=…` lands there too, XERK-2623).
   - `ok` with `items: []` is a real answer ("nothing to propose"); `ok` with no `items` array fails.
+  - An older agent sends no `summary`: the row is simply without one (no version gate).
 - An item (XERK-2509's schema, re-whitelisted by the hub, ≤`MEETING_ITEMS_MAX` (30) per meeting):
   `{kind:"task"|"bug"|"followup"|"decision", title ≤200, description ≤4000, suggestedAssignee
   ≤100?, due ≤40?, quotes[{speaker ≤100, text ≤500, atMs}] ≤5, duplicateKeys[] ≤5 issue keys,
@@ -234,4 +245,5 @@ ticket builds to this file; change it here first.
     offers `meetings.runtimes: ["claude"]` alone (agent half: `agent-meetings.md`).
 - Both keys are in `HEARTBEAT_KNOWN_KEYS`; `meetingResults` is deleted from the payload before
   the record is stored.
-- Tests: the `XERK-2508:` cases in `server.test.js`; agent: `TestMeetingWorker`.
+- Tests: the `XERK-2508:`/`XERK-2894:` cases in `server.test.js`; agent: `TestMeetingWorker`,
+  `TestMeetingItems`; clients: `XERK-2894` in `meetings.test.js` and android `MeetingsTest`.

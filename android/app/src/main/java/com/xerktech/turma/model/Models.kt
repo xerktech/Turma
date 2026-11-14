@@ -176,6 +176,10 @@ data class Meeting(
     val archivedAt: Long = 0,
     // Present on the org's daily meeting (XERK-2856).
     val daily: MeetingDaily? = null,
+    // The written summary of a settled `ok` run, and the title inferred for a
+    // generic Tenir one (XERK-2894); "" = none (an older agent or hub).
+    val summary: String = "",
+    val inferredTitle: String = "",
 )
 
 /**

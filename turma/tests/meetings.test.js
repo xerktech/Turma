@@ -116,6 +116,26 @@ test("XERK-2510: a meeting's proposals render escaped, with quotes linked to tha
   assert.match(P.list(), /<option value="ACME" selected>Acme \(ACME\)<\/option>/);
 });
 
+test("XERK-2894: the summary renders escaped in paragraphs, and an inferred title names the meeting", async () => {
+  const P = loadPage(META);
+  const d = data([meeting({ title: "Meeting", inferredTitle: "Login <b>bug</b> triage",
+    summary: "We met about <script>x</script>.\nAnn reported it.\n\nDecisions: ship Friday." })]);
+  P.setCache(d);
+  P.renderMeetings(d);
+  const h = P.list();
+  assert.match(h, /<h2 class="tri-title">Login &lt;b&gt;bug&lt;\/b&gt; triage<\/h2>/);
+  assert.match(h, /<div class="mt-summary" aria-label="Summary"><p>We met about &lt;script&gt;x&lt;\/script&gt;\.<br>Ann reported it\.<\/p><p>Decisions: ship Friday\.<\/p><\/div>/);
+  assert.doesNotMatch(h, /<script>|<b>bug/);
+  // No summary (an older agent) = no block; a failed row never shows one.
+  for (const over of [{}, { status: "failed", error: "x", summary: "s" }]) {
+    const d2 = data([meeting(over)]);
+    P.setCache(d2);
+    P.renderMeetings(d2);
+    assert.doesNotMatch(P.list(), /mt-summary/);
+    assert.match(P.list(), /Sprint &lt;sync&gt;/);
+  }
+});
+
 test("XERK-2885: Retry on a failed project list asks the hub to skip its cached failure", async () => {
   let fail = true;
   const P = loadPage((u) => (/create-meta/.test(u) && !/project=/.test(u) && fail
@@ -549,6 +569,15 @@ test("XERK-2857: the search matches meeting and proposal titles, case-blind, and
   assert.match(P.list(), /data-entry="globex[^"]*"/, "both meetings carry that proposal");
   typed("globex");
   assert.doesNotMatch(P.list(), /data-entry="acme/);
+  // XERK-2894: an inferred title is searchable too.
+  const d = two();
+  d.meetingProposals[SITE][0].inferredTitle = "Login bug triage";
+  P.update(d);
+  typed("login BUG");
+  assert.match(P.list(), /data-entry="acme[^"]*"/);
+  assert.doesNotMatch(P.list(), /data-entry="globex/);
+  P.update(two());
+  typed("globex");
   assert.doesNotMatch(P.list(), /data-org-toggle="acme/, "an org with no match is hidden while searching");
   typed(`"><img src=x>`);
   assert.doesNotMatch(P.list(), /<img/);
