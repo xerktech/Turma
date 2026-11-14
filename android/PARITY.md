@@ -742,6 +742,10 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   details (moved/canceled, recurrence, attendees + responses, body, categories), a linked capture's
   summary + proposals reviewed in place, its relink/unlink, the Daily brief for a daily event, and
   a review-count / reading badge on each block. Ported with the calendar in XERK-2900.
+- **GAP — the calendar re-reads on a host's online flip (XERK-2921, web only)**: an `agent` frame
+  whose `online` differs from the last one seen re-reads the calendar, so "<host> is offline"
+  shows at once. Android's calendar (XERK-2900) should re-read on the same flip
+  (`FleetRepository` calendar frames).
 
 ## Open (subsequent installments), by screen and priority
 

@@ -894,6 +894,8 @@ async function refresh() {
 }
 let sseEverOpen = false;
 let sseOk = false, sseBackoff = 2000;
+// Each host's last-seen `online`, from agent frames (the calendar re-reads on a flip).
+const hostOnline = new Map();
 function connectSSE() {
   let es;
   try { es = new EventSource(typeof TurmaNav !== "undefined" && TurmaNav.eventsUrl ? TurmaNav.eventsUrl() : "/api/events"); }
@@ -951,6 +953,22 @@ function connectSSE() {
   // The calendar reads its own routes; these frames only say what changed.
   es.addEventListener("calendar", () => calendarSoon());
   es.addEventListener("holidaySettings", () => calendarSoon());
+  // A host going offline (or back) sends no calendar frame, only its agent record,
+  // so the calendar's "<host> is offline" notice would wait for the next read
+  // (rollup XERK-2921). Re-read only on an online FLIP: agent frames arrive every
+  // beat, and re-reading on each would cost a calendar read per beat per host.
+  es.addEventListener("agent", (e) => {
+    let a;
+    try { a = JSON.parse(e.data); } catch { return; }
+    if (!a || typeof a.key !== "string" || typeof a.online !== "boolean") return;
+    let was = hostOnline.get(a.key);
+    if (was === undefined && cache && Array.isArray(cache.agents)) {
+      const rec = cache.agents.find((x) => x && x.key === a.key);
+      if (rec && typeof rec.online === "boolean") was = rec.online;
+    }
+    hostOnline.set(a.key, a.online);
+    if (was !== undefined && was !== a.online) calendarSoon();
+  });
   TurmaOrg.sse(es);
   es.onerror = () => {
     sseOk = false;
