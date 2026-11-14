@@ -6204,6 +6204,9 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       if (orgFilter && !orgFilter.has(w.org)) continue;
       const lk = `${tenantOfKey(key)}\u0000${ev.id}`;
       w.meetings = tenir.links.get(lk) || [];
+      // The org the capture matcher counts it for (XERK-2898): an unassigned event's
+      // host org, "" when a series override pins it to none. Clients relink by it.
+      w.matchOrg = w.org || calendarMatchOrg(key, ev, orgs, hs);
       tenir.linked.delete(lk);   // served: its captures ride on it
       events.push({ source: "outlook", ...w });
     }

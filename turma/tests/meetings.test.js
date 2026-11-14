@@ -12,6 +12,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const script = fs.readFileSync(path.join(__dirname, "..", "public", "meetings.js"), "utf8");
+const calendarScript = fs.readFileSync(path.join(__dirname, "..", "public", "calendar.js"), "utf8");
 
 function makeEl() {
   const el = {
@@ -27,7 +28,9 @@ function makeEl() {
 
 // `reply(url, init)` answers each non-/api/agents fetch: a body for 200, or
 // {status, body} for a refusal.
-function loadPage(reply = () => ({}), orgKeys = [], preset = {}) {
+// `opts.hooks`: the page's mount hooks; `opts.calendar`: also run calendar.js in the
+// same sandbox (the Calendar view's panel reviews through this module, XERK-2898).
+function loadPage(reply = () => ({}), orgKeys = [], preset = {}, opts = {}) {
   const els = {};
   const fetches = [];
   const toasts = [];
@@ -64,7 +67,13 @@ function loadPage(reply = () => ({}), orgKeys = [], preset = {}) {
   const keys = Object.keys(stubs);
   new Function(...keys, script)(...keys.map((k) => stubs[k]));
   const api = stubs.window.TurmaMeetings;
-  api.mount(document.getElementById("meetingList"));
+  api.mount(document.getElementById("meetingList"), opts.hooks || {});
+  if (opts.calendar) {
+    stubs.TurmaMeetings = api;
+    const ck = Object.keys(stubs);
+    new Function(...ck, calendarScript)(...ck.map((k) => stubs[k]));
+    api.cal = stubs.window.TurmaCalendar;
+  }
   const settle = async () => { for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r)); };
   // A click on an element carrying `dataset` (what the delegated handler's closest() finds).
   const click = (dataset, aria = null) => {
@@ -793,6 +802,293 @@ test("XERK-2857: a selected entry re-keyed under the viewer stays selected as th
   assert.equal(P.state().selected.startsWith(encodeURIComponent(SITE)), true);
 });
 
+// ---- XERK-2898: reviewing from the calendar's event panel ---------------------------
+const panelClick = (el, dataset, aria = null) => {
+  for (const fn of el.listeners.click) fn({ target: { closest: () => ({ dataset, getAttribute: () => aria }) } });
+};
+
+test("XERK-2898: the calendar panel renders a capture's summary, people and proposals — escaped, with the notes view's controls", async () => {
+  const P = loadPage(META);
+  const d = data([meeting({ summary: "Talked <b>login</b>.", participants: ["Ann <x>", "Bo"] })]);
+  P.update(d);
+  const el = P.document.createElement();
+  assert.equal(P.showPanel(el, { site: SITE, meetingIds: ["m1"] }), true);
+  const h = el.innerHTML;
+  assert.match(h, /<div class="mt-people" aria-label="Participants"><span>Ann &lt;x&gt;<\/span><span>Bo<\/span><\/div>/);
+  assert.match(h, /<div class="mt-summary" aria-label="Summary"><p>Talked &lt;b&gt;login&lt;\/b&gt;\.<\/p><\/div>/);
+  assert.match(h, /Fix the &lt;img src=x onerror=alert\(1\)&gt; bug/);
+  assert.match(h, /href="https:\/\/tenir\.example\/c\/1"[^>]*>Open in Tenir/);
+  assert.match(h, /data-act="approve" data-k="acme\.atlassian\.net\/m1\/p1"/);
+  assert.match(h, />Log decision</);
+  assert.doesNotMatch(h, /<img|<b>login/);
+  assert.deepEqual(P.state().panel, { site: SITE, meetingIds: ["m1"], dailyAt: 0 });
+  // A meeting the snapshot does not carry paints nothing (the calendar shows its own copy).
+  assert.equal(P.showPanel(el, { site: SITE, meetingIds: ["nope"] }), false);
+  assert.equal(el.innerHTML, "");
+  // A wrong-typed spec is no panel at all.
+  assert.equal(P.showPanel(el, { site: 7 }), false);
+  assert.equal(P.state().panel, null);
+});
+
+test("XERK-2898: review from the calendar — Reject posts, the busy guard holds, the notes view's selection stays put", async () => {
+  const answers = [];
+  const P = loadPage((u, init) => (init.method === "POST" ? new Promise((r) => answers.push(r)) : META(u)));
+  const two = [meeting(), meeting({ meetingId: "m2", title: "Other", startedAt: 1.6e12 })];
+  P.update(data(two));
+  await P.settle();
+  const before = P.state().selected;
+  const el = P.document.createElement();
+  P.showPanel(el, { site: SITE, meetingIds: ["m1"] });
+  panelClick(el, { act: "reject", k: P.itemKey(SITE, "m1", "p1") });
+  assert.match(el.innerHTML, /data-act="reject" data-k="acme\.atlassian\.net\/m1\/p1" aria-disabled="true">Reject/);
+  panelClick(el, { act: "reject", k: P.itemKey(SITE, "m1", "p1") }, "true");   // a second press while busy
+  await P.settle();
+  assert.equal(P.fetches.filter((f) => f.method === "POST").length, 1);
+  const rejected = meeting({ items: meeting().items.map((it) => (it.id === "p1" ? { ...it, review: { state: "rejected", at: 1 } } : it)) });
+  answers.shift()({ ok: true, meeting: rejected });
+  await P.settle();
+  assert.doesNotMatch(el.innerHTML, /data-k="acme\.atlassian\.net\/m1\/p1"/, "a reviewed proposal leaves the list");
+  assert.match(el.innerHTML, /1 of 2 reviewed/);
+  assert.equal(P.state().selected, before, "reviewing in the calendar never moves the notes view");
+  // A refusal shows in the hub's words, inline and as the toast.
+  P.showPanel(el, null);
+  const R = loadPage((u, init) => (init.method === "POST" ? { status: 409, body: { error: "already <creating>" } } : META(u)));
+  R.update(data());
+  await R.settle();
+  const el2 = R.document.createElement();
+  R.showPanel(el2, { site: SITE, meetingIds: ["m1"] });
+  panelClick(el2, { act: "reject", k: R.itemKey(SITE, "m1", "p2") });
+  await R.settle();
+  assert.match(el2.innerHTML, /Rejecting failed — already &lt;creating&gt;/);
+  assert.deepEqual(R.toasts, ["Rejecting failed — already <creating>"]);
+});
+
+test("XERK-2898: the keys act on the panel while it shows a meeting, and the cursor follows its place when the SSE frame beats the POST", async () => {
+  const four = ["p1", "p2", "p3", "p4"].map((id) => ({ id, kind: "task", title: `Item ${id}`, description: "" }));
+  const m = (rejected) => meeting({ items: four.map((it) => (rejected.includes(it.id) ? { ...it, review: { state: "rejected", at: 1 } } : it)) });
+  const answers = [];
+  const P = loadPage((u, init) => (init.method === "POST" ? new Promise((r) => answers.push(r)) : META(u)));
+  // The notes view is hidden (the calendar is shown): its keys are inert...
+  P.els.meetingList.offsetParent = null;
+  P.update(data([m([]), meeting({ meetingId: "m2", title: "Other" })]));
+  await P.settle();
+  const key = (k) => P.onKey({ key: k, target: { tagName: "BODY" }, preventDefault() {} });
+  key("j");
+  assert.equal(P.state().curItem, null);
+  // ...until the calendar's panel shows a meeting: then they walk ITS proposals.
+  const el = P.document.createElement();
+  P.showPanel(el, { site: SITE, meetingIds: ["m1"] });
+  key("j"); key("j");
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p2"));
+  assert.match(el.innerHTML, /class="mt-item cur" data-item="acme\.atlassian\.net\/m1\/p2"/);
+  key("r");
+  P.update(data([m(["p2"]), meeting({ meetingId: "m2", title: "Other" })]));   // the frame lands first
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p3"), "the frame moves the cursor on, not off");
+  answers.shift()({ ok: true, meeting: m(["p2"]) });
+  await P.settle();
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p3"), "the answer does not move it twice");
+  key("r");
+  answers.shift()({ ok: true, meeting: m(["p2", "p3"]) });                  // the answer first this time
+  await P.settle();
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p4"));
+  assert.deepEqual(P.fetches.filter((f) => f.method === "POST").map((f) => f.url.split("/").pop()), ["p2", "p3"]);
+  // A key typed into the panel's Edit field is the field's.
+  key("e");
+  assert.match(el.innerHTML, /data-edit-title=/);
+  const before = P.fetches.length;
+  P.onKey({ key: "r", target: { tagName: "TEXTAREA" }, preventDefault() {} });
+  assert.equal(P.fetches.length, before);
+  // The panel closed: inert again.
+  P.showPanel(el, null);
+  key("j");
+  assert.equal(P.fetches.length, before);
+  assert.equal(P.state().curItem, null);
+});
+
+test("XERK-2898: a daily meeting's event shows the Daily brief, as the notes view does", async () => {
+  const seen = [];
+  const hooks = { briefHtml: (site, e) => { seen.push(e); return `<section class="brief-block">BRIEF ${e.briefs.length}</section>`; } };
+  const P = loadPage(META, [], {}, { hooks });
+  const at = 1.7e12;
+  const d = data([meeting({ daily: { meetingAt: at, briefRunId: "r1" } })]);
+  d.dailyBriefs = { [SITE]: [{ runId: "r1", status: "ok", meetingAt: at, startedAt: at - 3e5, day: "d" }, { runId: "r0", status: "ok", meetingAt: at - 864e5 }] };
+  P.update(d);
+  const el = P.document.createElement();
+  P.showPanel(el, { site: SITE, meetingIds: ["m1"], dailyAt: at + 60000 });
+  assert.match(el.innerHTML, /<div class="mt-panel"><div class="tri-brief"><section class="brief-block">BRIEF 1<\/section><\/div><section class="mt-meeting">/);
+  // A daily event no capture is linked to yet (upcoming, or not captured): the brief of its meetingAt alone.
+  P.showPanel(el, { site: SITE, meetingIds: [], dailyAt: at - 864e5 + 5 * 60000 });
+  assert.match(el.innerHTML, /BRIEF 1/);
+  assert.doesNotMatch(el.innerHTML, /mt-meeting/);
+  assert.equal(seen[seen.length - 1].briefs[0].runId, "r0");
+  // Further than 20 minutes from any daily meeting: nothing.
+  P.showPanel(el, { site: SITE, meetingIds: [], dailyAt: at - 864e5 + 30 * 60000 });
+  assert.equal(el.innerHTML, "");
+});
+
+test("XERK-2898: meetingState — proposals pending, a meeting being read, archived counts none", () => {
+  const P = loadPage(META);
+  assert.deepEqual(P.meetingState(data(), SITE, "m1"), { pending: 2, reading: false, title: "Sprint <sync>", calendarBy: "" });
+  const one = meeting({ items: meeting().items.map((it, i) => (i ? { ...it, review: { state: "logged", at: 1 } } : it)), calendarBy: "operator" });
+  assert.deepEqual(P.meetingState(data([one]), SITE, "m1"), { pending: 1, reading: false, title: "Sprint <sync>", calendarBy: "operator" });
+  assert.equal(P.meetingState(data([meeting({ archivedAt: 5 })]), SITE, "m1").pending, 0);
+  assert.deepEqual(P.meetingState(data([meeting({ status: "running", items: undefined })]), SITE, "m1"),
+    { pending: 0, reading: true, title: "Sprint <sync>", calendarBy: "" });
+  assert.equal(P.meetingState(data(), SITE, "nope"), null);
+  assert.equal(P.meetingState(data(), "__proto__", "m1"), null);
+});
+
+test("XERK-2898: end to end — click a past event on the calendar, review its capture in the panel, the badge counts down", async () => {
+  const start = Date.now() - 2 * 864e5;
+  const answers = [];
+  const ev = { host: "h1", id: "OUT1", org: SITE, source: "outlook", subject: "Sprint sync", startMs: start, endMs: start + 18e5,
+    meetings: [{ site: SITE, meetingId: "m1", title: "Sprint <sync>" }] };
+  const P = loadPage((u, init) => {
+    if (u.startsWith("/api/calendar")) return { hosts: [], events: [ev] };
+    if (u.startsWith("/api/holidays")) return [];
+    if (init.method === "POST") return new Promise((r) => answers.push(r));
+    return META(u);
+  }, [], {}, { calendar: true });
+  const cal = P.cal;
+  const root = P.document.createElement();
+  cal.mount(root, { now: () => Date.now() });
+  const d = data([meeting({ startedAt: start, endedAt: start + 18e5 })]);
+  P.update(d);
+  cal.update(d);
+  cal.setActive(true);
+  cal._go(start);
+  await P.settle();
+  const grid = cal._els().grid.innerHTML;
+  assert.match(grid, /, 2 proposals to review"/);
+  const btn = /data-ev="(\d+)" data-day="(\d+)"/.exec(grid);
+  for (const fn of root.listeners.click) fn({ target: { closest: () => ({ dataset: { ev: btn[1], day: btn[2] }, getAttribute: () => null }) } });
+  const { mt, info } = cal._els();
+  assert.match(info.innerHTML, /Tenir capture: <b>Sprint &lt;sync&gt;<\/b>/);
+  assert.match(mt.innerHTML, /Fix the &lt;img src=x onerror=alert\(1\)&gt; bug/);
+  // Log the decision from the calendar.
+  panelClick(mt, { act: "approve", k: P.itemKey(SITE, "m1", "p2") });
+  await P.settle();
+  const post = P.fetches.find((f) => f.method === "POST");
+  assert.equal(post.url, `/api/orgs/${SITE}/meetings/m1/items/p2`);
+  assert.equal(post.body.action, "approve");
+  const logged = meeting({ startedAt: start, endedAt: start + 18e5,
+    items: meeting().items.map((it) => (it.id === "p2" ? { ...it, review: { state: "logged", at: 1 } } : it)) });
+  answers.shift()({ ok: true, meeting: logged });
+  await P.settle();
+  const d2 = data([logged]);
+  P.update(d2);
+  cal.update(d2);
+  assert.match(cal._els().grid.innerHTML, /, 1 proposal to review"/);
+  assert.match(mt.innerHTML, /1 of 2 reviewed/);
+  // Closing the event closes the panel: the keys go back to the (hidden) notes view.
+  for (const fn of root.listeners.click) fn({ target: { closest: () => ({ dataset: { closeDetail: "" }, getAttribute: () => null }) } });
+  assert.equal(P.state().panel, null);
+  assert.equal(mt.innerHTML, "");
+});
+
+test("XERK-2898 QA: a review pressed in the panel never moves the notes view, even when the panel closed before the answer", async () => {
+  // (An archive takes the entry out of Needs review, so that selection moves wherever it was pressed.)
+  for (const what of ["review"]) {
+    const answers = [];
+    const P = loadPage((u, init) => (init.method === "POST" ? new Promise((r) => answers.push(r)) : META(u)));
+    const one = meeting({ items: [meeting().items[0]] });
+    const other = meeting({ meetingId: "m2", title: "Other", startedAt: 1.6e12 });
+    P.update(data([one, other]));
+    await P.settle();
+    P.select(P.entryKey(SITE, "m:m1"));
+    const el = P.document.createElement();
+    P.showPanel(el, { site: SITE, meetingIds: ["m1"] });
+    if (what === "review") panelClick(el, { act: "reject", k: P.itemKey(SITE, "m1", "p1") });
+    else P.archive(P.meetingKey(SITE, "m1"), true);
+    await P.settle();
+    P.showPanel(el, null);                                   // the panel closes before the answer
+    const row = what === "review" ? meeting({ items: [{ ...meeting().items[0], review: { state: "rejected", at: 1 } }] })
+      : { ...one, archivedAt: 5 };
+    answers.shift()({ ok: true, meeting: row });
+    await P.settle();
+    assert.equal(P.state().selected, P.entryKey(SITE, "m:m1"), `${what}: the selection stays`);
+  }
+});
+
+test("XERK-2898 QA: J walks the PANEL's meeting, not the notes view's selection; the notes cursor comes back after", async () => {
+  const P = loadPage(META);
+  const m2 = meeting({ meetingId: "m2", title: "Other", startedAt: 1.6e12 });
+  P.update(data([meeting(), m2]));
+  await P.settle();
+  P.select(P.entryKey(SITE, "m:m2"));
+  const key = (k) => P.onKey({ key: k, target: { tagName: "BODY" }, preventDefault() {} });
+  key("j");
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m2", "p1"));
+  const el = P.document.createElement();
+  P.showPanel(el, { site: SITE, meetingIds: ["m1"] });
+  key("j");
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p1"), "the panel's meeting, not the notes view's m2");
+  P.showPanel(el, null);
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m2", "p1"), "the notes view's cursor is back");
+});
+
+test("XERK-2898 QA: the panel's repaint waits while one of its fields has focus, and lands on focusout", async () => {
+  const P = loadPage(META);
+  P.update(data());
+  await P.settle();
+  const el = P.document.createElement();
+  P.showPanel(el, { site: SITE, meetingIds: ["m1"] });
+  const field = { tagName: "TEXTAREA", dataset: {} };
+  el.contains = (a) => a === field;
+  P.document.activeElement = field;
+  const before = el.innerHTML;
+  P.update(data([meeting({ title: "Renamed" })]));               // an SSE frame while typing
+  assert.equal(el.innerHTML, before, "held");
+  P.document.activeElement = null;
+  for (const fn of el.listeners.focusout) fn({});
+  assert.match(el.innerHTML, /Renamed/, "painted once focus left");
+});
+
+test("XERK-2898 QA: a notes-view review that lands while a panel is open leaves the PANEL's cursor alone", async () => {
+  const answers = [];
+  const P = loadPage((u, init) => (init.method === "POST" ? new Promise((r) => answers.push(r)) : META(u)));
+  const last = meeting({ meetingId: "m2", title: "Other", startedAt: 1.6e12, items: [meeting().items[0]] });
+  const three = meeting({ items: ["p1", "p2", "p3"].map((id) => ({ id, kind: "task", title: id, description: "" })) });
+  P.update(data([three, last]));
+  await P.settle();
+  P.select(P.entryKey(SITE, "m:m2"));
+  P.click({ act: "reject", k: P.itemKey(SITE, "m2", "p1") });        // pressed in the notes view
+  await P.settle();
+  const el = P.document.createElement();
+  P.showPanel(el, { site: SITE, meetingIds: ["m1"] });
+  const key = (k) => P.onKey({ key: k, target: { tagName: "BODY" }, preventDefault() {} });
+  key("j"); key("j");
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p2"));
+  answers.shift()({ ok: true, meeting: { ...last, items: [{ ...last.items[0], review: { state: "rejected", at: 1 } }] } });
+  await P.settle();
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p2"), "the panel cursor survives the notes view's answer");
+  key("r");
+  await P.settle();
+  assert.match(P.fetches.filter((f) => f.method === "POST").pop().url, /\/m1\/items\/p2$/);
+  // The notes view moved on meanwhile: its saved cursor was reset, so closing the panel
+  // never brings back one pointing into the entry just answered.
+  P.showPanel(el, null);
+  assert.equal(P.state().curItem, null);
+});
+
+test("XERK-2898 QA: the review answer follows the panel's order, not the notes view's", async () => {
+  const answers = [];
+  const P = loadPage((u, init) => (init.method === "POST" ? new Promise((r) => answers.push(r)) : META(u)));
+  const four = ["p1", "p2", "p3"].map((id) => ({ id, kind: "task", title: id, description: "" }));
+  const m1 = (rej) => meeting({ items: four.map((it) => (rej.includes(it.id) ? { ...it, review: { state: "rejected", at: 1 } } : it)) });
+  P.update(data([m1([]), meeting({ meetingId: "m2", title: "Other", startedAt: 1.6e12 })]));
+  await P.settle();
+  P.select(P.entryKey(SITE, "m:m2"));
+  const el = P.document.createElement();
+  P.showPanel(el, { site: SITE, meetingIds: ["m1"] });
+  const key = (k) => P.onKey({ key: k, target: { tagName: "BODY" }, preventDefault() {} });
+  key("j"); key("j");
+  key("r");                                                         // p2; no frame this time, only the answer
+  answers.shift()({ ok: true, meeting: m1(["p2"]) });
+  await P.settle();
+  assert.equal(P.state().curItem, P.itemKey(SITE, "m1", "p3"));
+});
+
 // ---- XERK-2899: the calendar in the notes review --------------------------------------
 const HOUR = 3600000;
 const calEv = (id, startMs, over = {}) => ({ host: "h1", id, org: SITE, source: "outlook", subject: id,
@@ -932,4 +1228,15 @@ test("XERK-2899 QA: an org color is only a palette slot; a week-out meeting carr
   assert.doesNotMatch(h, /url\(x\)/);
   const day = far.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
   assert.ok(h.includes(`<span class="w">${day} `), `dated: ${day}`);
+});
+
+test("XERK-2898: the calendar's own panel offers no 'Open in calendar'; the notes view still does", async () => {
+  const P = loadPage(META, [], {}, { hooks: { openCalendar: () => {} } });
+  P.update(data());
+  await P.settle();
+  assert.match(P.list(), /data-open-cal=/);
+  const el = P.document.createElement();
+  P.showPanel(el, { site: SITE, meetingIds: ["m1"] });
+  assert.match(el.innerHTML, /data-act="approve"/);
+  assert.doesNotMatch(el.innerHTML, /data-open-cal/);
 });

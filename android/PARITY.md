@@ -738,6 +738,10 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **GAP — the calendar in the notes review (XERK-2899, web only)**: upcoming calendar meetings in
   the rail, a linked capture's Outlook title/time/invitees, the Impromptu label, and Open in
   calendar / Open in notes review. Ports with the calendar (XERK-2900).
+- **GAP — the calendar's event detail panel (XERK-2898, web only so far)**: a click opens Outlook's
+  details (moved/canceled, recurrence, attendees + responses, body, categories), a linked capture's
+  summary + proposals reviewed in place, its relink/unlink, the Daily brief for a daily event, and
+  a review-count / reading badge on each block. Ported with the calendar in XERK-2900.
 
 ## Open (subsequent installments), by screen and priority
 

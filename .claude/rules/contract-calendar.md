@@ -220,6 +220,9 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
   Answers `{ok, meeting}` (meetingWire, with `calendarEvent`).
 - **Served on `GET /api/calendar`**: every Outlook event carries `source: "outlook"` and
   `meetings: [{site, meetingId, title}]` (linked captures of orgs the caller may see).
+  - And `matchOrg` (XERK-2898): the org the matcher counts it for (`calendarMatchOrg`: its
+    assigned org, else its host's decided org, "" when a series override pins it to none). The
+    web panel's relink candidates and daily-brief org read it; absent = an older hub.
 - **Impromptu captures are Turma-only entries**, derived at serve time (no store), never written
   to Outlook: a capture with no stored link →
   `{source:"tenir", host:"", org: site, id:"tenir:<meetingId>", site, meetingId, subject
