@@ -27,8 +27,11 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class CalendarViewModelTest {
+    // Virtual time for the frame throttle; everything else runs eagerly as usual.
+    private val scheduler = kotlinx.coroutines.test.TestCoroutineScheduler()
+
     @get:Rule(order = 0)
-    val main = MainDispatcherRule()
+    val main = MainDispatcherRule(kotlinx.coroutines.test.UnconfinedTestDispatcher(scheduler))
 
     @get:Rule(order = 1)
     val hub = HubHarness()
@@ -102,5 +105,23 @@ class CalendarViewModelTest {
         cvm.setView(CalendarViewModel.VIEW_NOTES, remember = false)
         assertEquals(CalendarViewModel.VIEW_NOTES, cvm.view.value)
         assertEquals(CalendarViewModel.VIEW_CALENDAR, vm().view.value)
+    }
+
+    @Test fun `frames are throttled like the web's, never pushed back by the next one`() {
+        hub.json("/api/holidays", "[]")
+        hub.json("/api/calendar", empty)
+        val cvm = vm()
+        val ws = LocalDate.of(2026, 11, 9)
+        runBlocking { withTimeout(10_000) { cvm.loadWeek(ws, emptyList())!!.join() } }
+        // Not shown and no upcoming list: a re-read keeps nothing, so it drops this week.
+        val key = cvm.weekKey(ws, emptyList())
+        assertEquals(true, key in cvm.weeks.value)
+        val fleet = hub.container.fleet
+        fleet.onSseEvent("calendar", "{}")
+        scheduler.advanceTimeBy(600); scheduler.runCurrent()
+        fleet.onSseEvent("calendar", "{}")      // 600ms later: must not push the re-read back
+        scheduler.advanceTimeBy(500); scheduler.runCurrent()
+        // 1.1s after the FIRST frame: the throttled re-read has run (a debounce would wait to 1.6s).
+        assertFalse("the re-read waited out the second frame", key in cvm.weeks.value)
     }
 }

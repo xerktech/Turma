@@ -392,16 +392,20 @@ class CalendarTest {
                   "meetings": [ { "site": "o", "meetingId": "m1", "title": "T" } ] },
                 { "host": "h1", "id": "b", "startMs": "soon" },
                 { "host": "h1", "id": "c", "startMs": 5, "endMs": 6, "categories": { "x": 1 }, "participants": "Ann" },
+                { "host": "h1", "id": "d", "startMs": 5, "endMs": 6, "categories": [1, "Red", null, {"x": 1}], "participants": ["Ann", 2] },
                 { "source": "tenir", "id": "tenir:m2", "site": "o", "meetingId": "m2", "startMs": 3, "endMs": 4 }
               ] }
         """.trimIndent())
         // A wrong-typed list field reads as empty; the event stays (the web keeps it).
-        assertEquals(listOf("a", "c", "tenir:m2"), a.events.map { it.id })
+        assertEquals(listOf("a", "c", "d", "tenir:m2"), a.events.map { it.id })
+        // Only string entries count, as the web filters them; a number never becomes "1".
+        assertEquals(listOf("Red"), a.events[2].categories)
+        assertEquals(listOf("Ann"), a.events[2].participants)
         assertEquals("<b>x</b>", a.events[0].subject)   // text, never markup
         assertEquals(listOf("Ann"), a.events[0].attendees.map { it.name })
         assertEquals(1, a.hosts.size)
         assertTrue(a.truncated)
-        assertTrue(a.events[2].tenir)
+        assertTrue(a.events[3].tenir)
     }
 
     @Test fun `a malformed calendarEvent reads as none and keeps its meeting`() {

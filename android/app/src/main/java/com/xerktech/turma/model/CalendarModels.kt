@@ -171,8 +171,24 @@ object LenientCalendarEventsSerializer : LenientListSerializer<CalendarEvent>(Ca
 object LenientCalendarHostsSerializer : LenientListSerializer<CalendarHost>(CalendarHost.serializer())
 object LenientAttendeesSerializer : LenientListSerializer<CalendarAttendee>(CalendarAttendee.serializer())
 object LenientCapturesSerializer : LenientListSerializer<CalendarCapture>(CalendarCapture.serializer())
-/** A list of strings where one wrong-typed field must not drop the whole event (the web keeps it). */
-object LenientStringsSerializer : LenientListSerializer<String>(String.serializer())
+/**
+ * A list of strings where one wrong-typed field must not drop the whole event
+ * (the web keeps it): a non-array reads as empty, and only STRING entries count,
+ * as the web's `typeof c === "string"` filter — TurmaJson's lenient decode would
+ * otherwise turn a number into "1".
+ */
+object LenientStringsSerializer : KSerializer<List<String>> {
+    override val descriptor: SerialDescriptor = ListSerializer(JsonElement.serializer()).descriptor
+
+    override fun deserialize(decoder: Decoder): List<String> {
+        val arr = (decoder as? JsonDecoder)?.decodeJsonElement() as? JsonArray ?: return emptyList()
+        return arr.mapNotNull { (it as? kotlinx.serialization.json.JsonPrimitive)?.takeIf { p -> p.isString }?.content }
+    }
+
+    override fun serialize(encoder: Encoder, value: List<String>) {
+        (encoder as JsonEncoder).encodeJsonElement(TurmaJson.encodeToJsonElement(ListSerializer(String.serializer()), value))
+    }
+}
 object LenientHolidaysSerializer : LenientListSerializer<Holiday>(Holiday.serializer())
 
 /**
