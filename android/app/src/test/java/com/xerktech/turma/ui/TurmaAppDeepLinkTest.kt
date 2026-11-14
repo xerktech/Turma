@@ -85,7 +85,8 @@ class TurmaAppDeepLinkTest {
         compose.waitForIdle()
         assertTrue("the meetings link must be consumed", consumed)
         compose.onAllNodes(hasText("Meetings") and isSelected()).assertCountEquals(1)
-        // The tab's header names the page too (XERK-2893), not the old "Brief".
+        // The tab's header names the page too (XERK-2893): the tab + the header, never "Brief".
+        compose.onAllNodes(hasText("Meetings")).assertCountEquals(2)
         compose.onAllNodes(hasText("Brief")).assertCountEquals(0)
     }
 
