@@ -116,6 +116,8 @@ sed -i 's/\[ -r "\$WSL_CONF" \]/false/' "$WORK/fn.sh"
 run_case noperm "$WSL" $'[interop]\nenabled=false' no
 # shellcheck disable=SC2016  # a sed pattern, not an expansion.
 sed -n '/^: "\${WSL_OSRELEASE:=/,/^}$/p;/^ensure_wsl_interop() {/,/^}$/p' "$INSTALL" > "$WORK/fn.sh"
+# shellcheck disable=SC2016  # a grep pattern, not an expansion.
+grep -q '\[ -r "\$WSL_CONF" \]' "$WORK/fn.sh" || { echo "FAIL: fn.sh not restored after noperm"; exit 1; }
 if [ ! -e "$CONF" ] && [ ! -s "$REG" ] && grep -q "could not read" "$WORK/noperm/out"; then
   ok "an unreadable wsl.conf is unknown, not on"
 else fail "treated an unreadable wsl.conf as on: $(cat "$WORK/noperm/out")"; fi
