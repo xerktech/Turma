@@ -38,6 +38,24 @@ function listen(server) {
   return new Promise((r) => server.listen(0, "127.0.0.1", () => r(server.address().port)));
 }
 
+// A leader address that refuses every dial, by construction (XERK-2950). A port freed by
+// listen(0)+close() goes straight back to the ephemeral pool: under a parallel run another
+// test file can listen on it (or the dial can self-connect), the "dead" leader answers, and
+// a case that needs a failed dial sees a live one. So dials to this address never reach
+// the network: forward.js's net.connect gets a socket that fails with ECONNREFUSED.
+const DEAD_LEADER = "127.0.0.1:9";
+const realConnect = net.connect;
+net.connect = function connect(...args) {
+  const o = args[0];
+  if (o && typeof o === "object" && `${o.host}:${o.port}` === DEAD_LEADER) {
+    const s = new net.Socket();
+    const err = Object.assign(new Error(`connect ECONNREFUSED ${DEAD_LEADER}`), { code: "ECONNREFUSED" });
+    process.nextTick(() => s.destroy(err));
+    return s;
+  }
+  return realConnect.apply(this, args);
+};
+
 // A follower whose store already names a leader at `addr`.
 // `pub` = extra fields on the leader's published entry (its body caps, XERK-939).
 async function follower(addr, opts = {}, pub = {}) {
@@ -244,8 +262,7 @@ test("XERK-919: a request held for a missing leader is forwarded the moment one 
 });
 
 test("XERK-919: a dead leader address is held against, then served locally only once the bound lapses", async () => {
-  const dead = net.createServer(); const dport = await listen(dead); dead.close(); // a port nobody listens on
-  const { f } = await follower(`127.0.0.1:${dport}`, { holdMs: 200 });
+  const { f } = await follower(DEAD_LEADER, { holdMs: 200 });
   const { srv, port } = await followerServer(f);
   const t0 = Date.now();
   const r = await request(port, { path: "/api/agents" });
@@ -897,10 +914,7 @@ test("XERK-939: a STALE leader entry (store link down, still forwarded to) is no
 });
 
 test("XERK-939 QA: a CRASHED leader's caps refuse nothing — the dial fails, the request is held, then served", async () => {
-  const dead = http.createServer();
-  const dport = await listen(dead);
-  await new Promise((r) => dead.close(r));
-  const { f } = await follower(`127.0.0.1:${dport}`, { bodyRoute: () => "hb", cooldownMs: 60000 },
+  const { f } = await follower(DEAD_LEADER, { bodyRoute: () => "hb", cooldownMs: 60000 },
     { bodyCaps: { hb: 100 }, drainSlack: 10 });
   const { srv, port } = await followerServer(f);
   const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) });
@@ -911,11 +925,8 @@ test("XERK-939 QA: a CRASHED leader's caps refuse nothing — the dial fails, th
 });
 
 test("XERK-939 QA: a failed liveness dial frees its refusal slot — the next leader's oversize body is refused", async () => {
-  const dead = http.createServer();
-  const dport = await listen(dead);
-  await new Promise((r) => dead.close(r));
   const { leader, seen, port: lport } = await countingLeader();
-  const { f, store } = await follower(`127.0.0.1:${dport}`, { bodyRoute: () => "hb", drainMax: 1 },
+  const { f, store } = await follower(DEAD_LEADER, { bodyRoute: () => "hb", drainMax: 1 },
     { bodyCaps: { hb: 100 }, drainSlack: 10 });
   const { srv, port } = await followerServer(f);
   const held = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) });
