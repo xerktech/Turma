@@ -21,13 +21,15 @@ fail() { echo "  FAIL: $1"; FAILED=1; }
 # Guarded: a renamed function must fail loudly, not test an empty file.
 # shellcheck disable=SC2016  # a sed pattern, not an expansion.
 sed -n '/^: "\${WSL_OSRELEASE:=/,/^}$/p;/^ensure_wsl_interop() {/,/^}$/p' "$INSTALL" > "$WORK/fn.sh"
-if ! grep -q "ensure_wsl_interop()" "$WORK/fn.sh" || ! grep -q "_wsl_interop_disabled()" "$WORK/fn.sh"; then
+if ! grep -q "ensure_wsl_interop()" "$WORK/fn.sh" || ! grep -q "_wsl_interop_state()" "$WORK/fn.sh"; then
   echo "FAIL: could not extract ensure_wsl_interop from $INSTALL (renamed?)"; exit 1
 fi
 
 RULE=':WSLInterop:M::MZ::/init:PF'
 CONF=""; REG=""
 
+SRC_DIR="$(dirname "$HERE")"  # the reader is agent/hooks/session_cli.py
+export SRC_DIR
 run_case() {  # <name> <osrelease> <wsl.conf body|-> <registered yes|no>
   local d="$WORK/$1"
   mkdir -p "$d/binfmt_misc" "$d/etc"
@@ -92,6 +94,33 @@ WSL_OSRELEASE="$WORK/late/osrelease" WSL_CONF="$WORK/late/etc/wsl.conf" BINFMT_M
     . "$1"; ensure_wsl_interop' _ "$WORK/fn.sh"
 if [ ! -s "$REG" ] && [ ! -e "$CONF" ]; then ok "a WSLInterop-late entry counts as registered"
 else fail "duplicated a WSLInterop-late registration"; fi
+
+# python3 cannot read wsl.conf (no session_cli.py): leave interop alone, say so.
+SRC_DIR="$WORK/nosrc" run_case unreadable "$WSL" $'[interop]\nenabled=false' no
+if [ ! -e "$CONF" ] && [ ! -s "$REG" ] && grep -q "could not read" "$WORK/unreadable/out"; then
+  ok "an unreadable wsl.conf never overrides it"
+else fail "acted on an unreadable wsl.conf: $(cat "$WORK/unreadable/out")"; fi
+
+# -SI: a planted module in the cwd must not decide the answer (exit 10 means "off").
+mkdir -p "$WORK/evil"
+for m in os re json session_cli sitecustomize; do echo 'import sys; sys.exit(10)' > "$WORK/evil/$m.py"; done
+(cd "$WORK/evil" && PYTHONPATH="$WORK/evil" run_case shadow "$WSL" $'[interop]\nenabled=true' no)
+if [ -f "$WORK/shadow/etc/binfmt.d/WSLInterop.conf" ]; then ok "cwd/PYTHONPATH modules cannot shadow the reader"
+else fail "a planted module changed the answer: $(cat "$WORK/shadow/out")"; fi
+
+# Present but unreadable (root-owned 0600, run without sudo): unknown, never "on".
+# Faked by failing the -r test, since root reads anything and run_case writes
+# the file as the caller.
+# shellcheck disable=SC2016  # sed patterns, not expansions.
+sed -i 's/\[ -r "\$WSL_CONF" \]/false/' "$WORK/fn.sh"
+run_case noperm "$WSL" $'[interop]\nenabled=false' no
+# shellcheck disable=SC2016  # a sed pattern, not an expansion.
+sed -n '/^: "\${WSL_OSRELEASE:=/,/^}$/p;/^ensure_wsl_interop() {/,/^}$/p' "$INSTALL" > "$WORK/fn.sh"
+# shellcheck disable=SC2016  # a grep pattern, not an expansion.
+grep -q '\[ -r "\$WSL_CONF" \]' "$WORK/fn.sh" || { echo "FAIL: fn.sh not restored after noperm"; exit 1; }
+if [ ! -e "$CONF" ] && [ ! -s "$REG" ] && grep -q "could not read" "$WORK/noperm/out"; then
+  ok "an unreadable wsl.conf is unknown, not on"
+else fail "treated an unreadable wsl.conf as on: $(cat "$WORK/noperm/out")"; fi
 
 run_case linux "6.1.0-18-amd64" - no
 if [ ! -e "$CONF" ] && [ ! -s "$REG" ]; then ok "does nothing off WSL"; else fail "touched a non-WSL host"; fi

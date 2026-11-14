@@ -807,26 +807,19 @@ class CalendarSyncReaderTest(unittest.TestCase):
         self.assertFalse(ev["isOnlineMeeting"])
 
 
-@unittest.skipUnless(shutil.which("bash") and shutil.which("awk"), "needs bash + awk")
 class WslConfReaderTest(unittest.TestCase):
     """wsl.conf's `[interop] enabled`, read as WSL's configfile.cpp reads it
-    (XERK-2945), by both mirrors: session_cli.py and install.sh's awk."""
+    (XERK-2945). install.sh calls this same reader (test_install_wsl_interop.sh)."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        with open(os.path.join(AGENT_DIR, "native", "install.sh")) as fh:
-            src = fh.read()
-        start = src.index("_wsl_interop_disabled() {")
-        self.fn = src[start:src.index("\n}\n", start) + 3]
 
-    def both(self, conf: bytes):
+    def read(self, conf: bytes):
         path = os.path.join(self.tmp, "wsl.conf")
         with open(path, "wb") as fh:
             fh.write(conf)
-        sh = subprocess.run(["bash", "-c", self.fn + '_wsl_interop_disabled'],
-                            env={**os.environ, "WSL_CONF": path}, timeout=10).returncode == 0
-        return cli.wsl_conf_interop_off(path), sh
+        return cli.wsl_conf_interop_off(path)
 
     def test_escapes_and_headers_as_wsl_reads_them(self):
         cases = {
@@ -855,48 +848,18 @@ class WslConfReaderTest(unittest.TestCase):
             b"[interop]\nenabled=fal\x00se\n": False,
             b"[interop]\nenabled=\x00\n": False,                     # empty: no bool
             b"[interop]\nenabled=false\\\n\x00": True,              # continuation, final NUL
-            b"[interop]\nenabled=falsexxxxxx\n": False,               # past the awk's kept chars
+            b"[interop]\nenabled=falsexxxxxx\n": False,
             b"[interop]\nenabled=false" + b" " * 50 + b"\n": True,
             b"[interop]\nenabled=0" + b" " * 50 + b"x\n": False,
         }
         for conf, off in cases.items():
             with self.subTest(conf=conf):
-                self.assertEqual(self.both(conf), (off, off))
-
-    def test_the_mirrors_agree_on_fuzzed_configs(self):
-        import random
-        rng = random.Random(2945)
-        heads = ["[interop]", "[boot]", "[ interop ]", "[inter", "[interopZ x", "[interop] #c",
-                 "[interop]x", "#[interop]"]
-        keys = ["enabled", "Enabled", " enabled ", "en abled", "#enabled", "enabled\t"]
-        vals = ["false", "0", "true", "False", '"', "\\", "\\\\", '\\"', "\\n", "\\u", "#",
-                " ", "\t", "x", "\\\n", "\r", "fal", "se", "\x00"]
-        ends = ["\n", "\r\n", "\r", ""]
-        seen = set()
-        for _ in range(300):
-            lines = []
-            for _ in range(rng.randint(1, 4)):
-                if rng.random() < 0.3:
-                    lines.append(rng.choice(heads))
-                else:
-                    value = "".join(rng.choice(vals) for _ in range(rng.randint(0, 3)))
-                    if rng.random() < 0.4:          # mostly-valid spellings, lightly mangled
-                        value = rng.choice(["false", "0", '"false"', "FALSE"]) + value[:1]
-                    lines.append(rng.choice(keys) + "=" + value)
-            conf = "".join(line + rng.choice(ends) for line in lines)
-            if rng.random() < 0.7:
-                conf = "[interop]\n" + conf
-            py, sh = self.both(conf.encode())
-            self.assertEqual(py, sh, repr(conf))
-            seen.add(py)
-        self.assertEqual(seen, {True, False})   # the corpus reaches both answers
+                self.assertEqual(self.read(conf), off)
 
     def test_a_huge_value_line_stays_fast(self):
-        # Appending char by char made the awk quadratic under mawk (2.8 s at 300 KB).
         import time
         t = time.monotonic()
-        self.assertEqual(self.both(b"[interop]\nenabled=" + b"x" * 300_000 + b"\n"),
-                         (False, False))
+        self.assertFalse(self.read(b"[interop]\nenabled=" + b"x" * 300_000 + b"\n"))
         self.assertLess(time.monotonic() - t, 2.0)
 
 
