@@ -190,14 +190,72 @@ jobs:
           [ "$tested" = true ] || echo "Tree ${tree:-<lookup failed>} has no passing PR Unit tests record; running them."
           echo "tested=$tested" >> "$GITHUB_OUTPUT"
 
-  tests:
-    name: Unit tests
+  # The unit tests run as parallel jobs, not one sequential job (XERK-2889): run one
+  # after another they took 11.5-15 min, which a release waits on. Every suite still
+  # runs; Python and the main Node suites are split into shards. The required check
+  # is the `Unit tests` job below, which passes only when every one of these did.
+  # Each job's timeout is a hang guard sized to ~3x its normal run; a job creeping
+  # toward it is the cue to add a shard, never to raise the number.
+  unit-python:
+    name: Unit tests (python ${{ matrix.shard }}/5)
     needs: tested-tree
-    # !cancelled(): on pull_request tested-tree is skipped, and a plain needs
-    # would skip this required check with it. A failed lookup also runs the tests.
     if: ${{ !cancelled() && needs.tested-tree.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v7
+      # Same setup-python the Semgrep job already relies on; the tests are
+      # stdlib unittest only (no pip installs — mirrors the image's no-pip
+      # stance), so this is the whole Python toolchain.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # tmux is not on ubuntu-latest; the XERK-1042 exact-target tests (python
+      # TestTmuxExactTargets, node captureLiveTurn) drive a real one
+      # and silently skip without it.
+      - name: Install tmux
+        run: sudo apt-get update -q && sudo apt-get install -y -q tmux
+      - name: Python unit tests (agent/hub-agent.py)
+        run: python3 .github/scripts/unittest_shard.py agent/tests ${{ matrix.shard }} 5
+
+  unit-node:
+    name: Unit tests (node ${{ matrix.shard }}/3)
+    needs: tested-tree
+    if: ${{ !cancelled() && needs.tested-tree.outputs.tested != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v7
+      # Node 24 to match the agent/turma images' base. This used to run in a
+      # throwaway node:24-alpine container because the self-hosted runner had no
+      # node on PATH; a hosted runner has node, so setup-node pins the version
+      # directly and skips the image pull. node:test is built in; the tests have
+      # zero npm dependencies, so there is nothing to install.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      # tmux is not on ubuntu-latest; the XERK-1042 exact-target tests (python
+      # TestTmuxExactTargets, node captureLiveTurn) drive a real one
+      # and silently skip without it.
+      - name: Install tmux
+        run: sudo apt-get update -q && sudo apt-get install -y -q tmux
+      - name: Node unit tests (turma/server.js + agent/tunnel-agent.js + release scripts)
+        run: node --test --test-shard=${{ matrix.shard }}/3 turma/tests/*.test.js agent/tests/*.test.js .github/scripts/tests/*.test.js
+
+  unit-misc:
+    name: Unit tests (gates, bench, small suites, updater)
+    needs: tested-tree
+    if: ${{ !cancelled() && needs.tested-tree.outputs.tested != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v7
       # Same setup-python the Semgrep job already relies on; the tests are
@@ -239,13 +297,6 @@ jobs:
             fi
           done
           exit "$fail"
-      # tmux is not on ubuntu-latest; the XERK-1042 exact-target tests (python
-      # TestTmuxExactTargets, node captureLiveTurn) drive a real one
-      # and silently skip without it.
-      - name: Install tmux
-        run: sudo apt-get update -q && sudo apt-get install -y -q tmux
-      - name: Python unit tests (agent/hub-agent.py)
-        run: python3 -m unittest discover -s agent/tests -p "test_*.py" -v
       # bench/archive holds the XERK-445 routing-eval tooling, including
       # scrub.py -- the redactor that decides what may leave the box. Nothing
       # under bench/ was executed by any gate until this step existed, and a QA
@@ -262,8 +313,6 @@ jobs:
       # constraint). Nothing under bench/ (vs bench/archive/) was gated before.
       - name: Python unit tests (bench harness)
         run: python3 -m unittest discover -s bench/tests -p "test_*.py" -t bench -v
-      - name: Node unit tests (turma/server.js + agent/tunnel-agent.js + release scripts)
-        run: node --test turma/tests/*.test.js agent/tests/*.test.js .github/scripts/tests/*.test.js
       - name: Node unit tests (dsh safety guard)
         # The dsh guard's deny-policy proof (shells out to the real guard.py /
         # fileguard.py). drive-real-dsh.mjs needs a real dsh install and is a
@@ -288,12 +337,29 @@ jobs:
       # updater in step. Pure shell, extracted real funcs + throwaway prefix.
       - name: Native installer dsh tests (agent/native/install.sh)
         run: ./agent/tests/test_install_dsh.sh
-      # bootstrap.sh is the README's curl|bash front door, so it runs off main
-      # on hosts with no checkout — a bug there has no deployed copy to fix.
-      # Covers its resolution decision (carried assets, newest build) and its
-      # refusal to install unverified bits. Pure shell + a curl stub.
-      - name: Native bootstrap tests (agent/native/bootstrap.sh)
-        run: ./agent/tests/test_bootstrap.sh
+
+  unit-native:
+    name: Unit tests (native launcher + controller)
+    needs: tested-tree
+    if: ${{ !cancelled() && needs.tested-tree.outputs.tested != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+      # Same setup-python the Semgrep job already relies on; the tests are
+      # stdlib unittest only (no pip installs — mirrors the image's no-pip
+      # stance), so this is the whole Python toolchain.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # Node 24 to match the agent/turma images' base. This used to run in a
+      # throwaway node:24-alpine container because the self-hosted runner had no
+      # node on PATH; a hosted runner has node, so setup-node pins the version
+      # directly and skips the image pull. node:test is built in; the tests have
+      # zero npm dependencies, so there is nothing to install.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
       # The native launcher supervises the reverse tunnel, which every web
       # terminal rides. Its failure mode is silent and permanent — the host still
       # heartbeats, so it reads ONLINE while every session reads "terminal
@@ -319,6 +385,21 @@ jobs:
       # unattended no-hang, NOPASSWD, and a declined password. Shell + sudo stubs.
       - name: Native installer sudo-probe tests (agent/native/install.sh)
         run: ./agent/tests/test_install_sudo.sh
+      # bootstrap.sh is the README's curl|bash front door, so it runs off main
+      # on hosts with no checkout — a bug there has no deployed copy to fix.
+      # Covers its resolution decision (carried assets, newest build) and its
+      # refusal to install unverified bits. Pure shell + a curl stub.
+      - name: Native bootstrap tests (agent/native/bootstrap.sh)
+        run: ./agent/tests/test_bootstrap.sh
+
+  unit-windows:
+    name: Unit tests (Windows PowerShell)
+    needs: tested-tree
+    if: ${{ !cancelled() && needs.tested-tree.outputs.tested != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
       # The native WINDOWS launcher (agent/native/windows/turma-agent.ps1, XERK-669)
       # is the PowerShell port of the bash launcher, so it gets the same coverage:
       # PSScriptAnalyzer is the ShellCheck analog (correctness rules on, tuned by the
@@ -398,8 +479,32 @@ jobs:
       - name: Native Windows updater tests (agent/native/windows/turma-agent-update.ps1)
         shell: pwsh
         run: ./agent/tests/test_turma_agent_update_ps1.ps1
-      # The record tested-tree looks up: this exact tree passed every step above.
-      # Last step, so it uploads only when the whole job succeeded. PR runs only —
+
+  tests:
+    name: Unit tests
+    needs: [tested-tree, unit-python, unit-node, unit-misc, unit-native, unit-windows]
+    # !cancelled(): on pull_request tested-tree is skipped, and a plain needs
+    # would skip this required check with it. A failed lookup also runs the tests.
+    # It runs when a shard FAILED too, so the required check reports the failure
+    # instead of being skipped (a skipped required check would not block a merge).
+    if: ${{ !cancelled() && needs.tested-tree.outputs.tested != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every test job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "tested-tree + test job results: $RESULTS"
+          # Every test job must be a success; tested-tree (skipped on a PR) is not checked.
+          for r in ${{ needs.unit-python.result }} ${{ needs.unit-node.result }} \
+                   ${{ needs.unit-misc.result }} ${{ needs.unit-native.result }} \
+                   ${{ needs.unit-windows.result }}; do
+            [ "$r" = success ] || { echo "::error::a unit test job ended $r"; exit 1; }
+          done
+      - uses: actions/checkout@v7
+      # The record tested-tree looks up: this exact tree passed every unit test job.
+      # Last step, so it uploads only when every job above succeeded. PR runs only —
       # a release's own run has nobody downstream to read it.
       - name: Record tested tree
         if: github.event_name == 'pull_request'

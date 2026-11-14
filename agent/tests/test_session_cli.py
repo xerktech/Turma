@@ -456,7 +456,7 @@ class CalendarTest(unittest.TestCase):
             cli.read_calendar("today", powershell=ps)
 
     def test_a_hung_outlook_times_out(self):
-        ps = self.fake_ps("sleep 5\n")
+        ps = self.fake_ps("exec sleep 5\n")   # exec: no orphan holds the pipe open
         with mock.patch.object(cli, "CALENDAR_TIMEOUT_SEC", 0.5):
             with self.assertRaisesRegex(cli.Refused, "did not answer"):
                 cli.read_calendar("today", powershell=ps)
