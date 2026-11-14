@@ -196,11 +196,14 @@ function daySegments(events, day) {
     if (inBand(ev) || !onDay(ev, day)) continue;
     const top = wallMinutes(ev.startMs, day);
     let end = ev.endMs > ev.startMs ? wallMinutes(ev.endMs, day) : top;
-    // The grid is wall-clock, so an event across the fall-back switch loses the repeated
-    // hour (1:30 EDT – 1:30 EST read zero long): lay it out by its elapsed length instead.
+    // The grid is wall-clock, so an end in the SECOND pass of the repeated fall-back hour
+    // reads an hour early (1:30 EDT – 1:30 EST is zero long): push it down by the hour the
+    // clock repeated. An end past the repeated hour (9:00 EST) already sits on its row.
     const from = Math.max(ev.startMs, day);
-    if (ev.endMs > from && ev.endMs < addDays(day, 1) && offsetAt(ev.endMs) < offsetAt(from)) {
-      end = Math.min(1440, top + (ev.endMs - from) / 60000);
+    const back = offsetAt(from) - offsetAt(ev.endMs);
+    if (ev.endMs > from && ev.endMs < addDays(day, 1) && back > 0
+      && offsetAt(ev.endMs - back * 60000) !== offsetAt(ev.endMs)) {
+      end = Math.min(1440, end + back);
     }
     segs.push({ ev, top, end, bottom: Math.min(1440, Math.max(end, top + MIN_LAYOUT_MIN)) });
   }

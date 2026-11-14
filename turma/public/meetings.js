@@ -55,7 +55,8 @@ function fmtSpan(s, e) {
   if (off(s) !== off(e)) {
     try {
       const z = (ms) => new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZoneName: "short" });
-      return `${fmtWhen(s)} ${z(s).replace(/^.*\s(\S+)$/, "$1")} – ${day(s) === day(e) ? z(e) : fmtWhen(e)}`;
+      const zone = (ms) => z(ms).replace(/^.*\s(\S+)$/, "$1");
+      return `${fmtWhen(s)} ${zone(s)} – ${day(s) === day(e) ? z(e) : `${fmtWhen(e)} ${zone(e)}`}`;
     } catch { /* fall through */ }
   }
   return `${fmtWhen(s)} – ${day(s) === day(e) ? fmtTime(e) : fmtWhen(e)}`;

@@ -170,6 +170,8 @@ class CalendarTest {
         ).single().let { it.end - it.top }
         assertEquals(60.0, len("2026-11-01T05:30:00Z", "2026-11-01T06:30:00Z"), 0.0)
         assertEquals(120.0, len("2026-11-01T04:30:00Z", "2026-11-01T06:30:00Z"), 0.0)
+        // An end past the repeated hour keeps its wall row (1:30 EDT – 9:00 EST ends at 9:00).
+        assertEquals(450.0, len("2026-11-01T05:30:00Z", "2026-11-01T14:00:00Z"), 0.0)
         val long = calSpanLong(s, e, ny, Locale.US)
         assertTrue(long, long.contains("EDT") && long.contains("1:00 AM EST"))
     }

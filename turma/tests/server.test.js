@@ -32170,7 +32170,8 @@ test("XERK-2891: sanitizeCalendarEvent is a typed, capped fixed point", () => {
       organizerEmail: ok }).organizerEmail, ok, ok);
   }
   for (const bad of ['evil"@acme.com', "a<b@acme.com", "a@acme.com>", "a`b@acme.com",
-    "x\u202e@acme.com", "x\u200b@acme.com", "x\u0000@acme.com"]) {
+    "x\u202e@acme.com", "x\u200b@acme.com", "x\u0000@acme.com", "x\u061c@acme.com", "x\u2060@acme.com",
+    "x\u00ad@acme.com"]) {
     const x = hub.sanitizeCalendarEvent({ ...ev2891("q", Date.parse("2026-11-20T09:00:00Z")),
       organizerEmail: bad, attendees: [{ name: "Q", email: bad, role: "required" }] });
     assert.equal(x.organizerEmail, "", bad);

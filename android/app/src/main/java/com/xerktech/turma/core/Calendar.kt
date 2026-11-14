@@ -226,12 +226,14 @@ fun calDaySegments(events: List<CalendarEvent>, day: LocalDate, zone: ZoneId): L
     val segs = events.filter { calDrawable(it) && !calInBand(it) && calOnDay(it, day, zone) }.map { ev ->
         val top = calWallMinutes(ev.s(), day, zone)
         var end = if (ev.e() > ev.s()) calWallMinutes(ev.e(), day, zone) else top
-        // The grid is wall-clock, so an event across the fall-back switch loses the repeated
-        // hour (1:30 EDT – 1:30 EST read zero long): lay it out by its elapsed length instead.
+        // The grid is wall-clock, so an end in the SECOND pass of the repeated fall-back hour
+        // reads an hour early (1:30 EDT – 1:30 EST is zero long): push it down by the hour the
+        // clock repeated. An end past the repeated hour (9:00 EST) already sits on its row.
         val from = maxOf(ev.s(), calDayStartMs(day, zone))
-        if (ev.e() > from && ev.e() < calDayStartMs(day.plusDays(1), zone) &&
-            calOffsetSec(ev.e(), zone) < calOffsetSec(from, zone)
-        ) end = minOf(1440.0, top + (ev.e() - from) / 60_000.0)
+        val back = calOffsetSec(from, zone) - calOffsetSec(ev.e(), zone)
+        if (ev.e() > from && ev.e() < calDayStartMs(day.plusDays(1), zone) && back > 0 &&
+            calOffsetSec(ev.e() - back * 1000L, zone) != calOffsetSec(ev.e(), zone)
+        ) end = minOf(1440.0, end + back / 60.0)
         CalSeg(ev, top, end, minOf(1440.0, maxOf(end, top + CAL_MIN_LAYOUT_MIN)))
     }
     return calLayoutDay(segs)

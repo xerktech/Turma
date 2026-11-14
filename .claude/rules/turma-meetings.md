@@ -148,11 +148,11 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 - **Week math is local wall time via `Date` setters** (`addDays`, `weekStart`), never `+ 86400000`:
   a DST week has a 23/25h day. Event rows use wall minutes (`wallMinutes`). Tests pin both DST
   edges and the year boundary.
-- **An event ending after the fall-back switch lays out by its elapsed length** (XERK-2930): on
-  the wall clock it loses the repeated hour (1:30 EDT – 1:30 EST reads zero). Keyed on the end's
-  UTC offset being below the start's, never on `end < top` (misses equal/later wall ends). The grid
-  stays wall-clock so 9:00 is row 18. Labels name both zones (`calendar.js`/`meetings.js`
-  `fmtSpan`, Android `calSpan`/`calSpanLong`).
+- **An end in the SECOND pass of the repeated fall-back hour moves down by that hour** (XERK-2930):
+  on the wall clock 1:30 EDT – 1:30 EST reads zero long. Only an end inside the repeated hour moves
+  (offset an hour earlier differs); an end past it (9:00 EST) keeps its row, and `end < top` alone
+  misses equal/later wall ends. The grid stays wall-clock so 9:00 is row 18. Labels name both
+  zones (`calendar.js`/`meetings.js` `fmtSpan`, Android `calSpan`/`calSpanLong`).
 - **Teams decisions** (researched on Microsoft's "Manage your calendar in Teams" / new-calendar
   docs; recorded so a later change doesn't drift):
   - Work week (Mon–Fri) is the default; Week is Mon–Sun; ‹ › move a week; Today; the range label

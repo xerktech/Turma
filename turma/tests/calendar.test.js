@@ -109,6 +109,12 @@ test("XERK-2930: an event in the repeated fall-back hour lays out by its length 
   assert.equal(len("2026-11-01T05:30:00Z", "2026-11-01T06:40:00Z", at(2026, 11, 1)), 70);
   assert.equal(len("2026-11-01T04:30:00Z", "2026-11-01T06:30:00Z", at(2026, 11, 1)), 120);
   assert.equal(len("2026-03-08T06:30:00Z", "2026-03-08T07:30:00Z", at(2026, 3, 8)), 120);
+  // An end PAST the repeated hour keeps its wall row: 1:30 EDT – 9:00 EST ends at 9:00, and
+  // an overnight 10 pm EDT – 3:00 EST ends at 3:00 on Nov 1.
+  const [lg] = cal.daySegments([{ startMs: Date.parse("2026-11-01T05:30:00Z"), endMs: Date.parse("2026-11-01T14:00:00Z") }], at(2026, 11, 1));
+  assert.equal(lg.end, 540);
+  const [ov] = cal.daySegments([{ startMs: Date.parse("2026-11-01T02:00:00Z"), endMs: Date.parse("2026-11-01T08:00:00Z") }], at(2026, 11, 1));
+  assert.deepEqual([ov.top, ov.end], [0, 180]);
   const label = cal.fmtSpan(ev.startMs, ev.endMs);
   assert.match(label, /EDT/);
   assert.match(label, /EST/);
