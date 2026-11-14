@@ -75,11 +75,18 @@ import com.xerktech.turma.vm.MetaState
 /** One item's client-side state: a POST in flight, the hub's refusal, an open editor. */
 data class ItemUi(val busy: Boolean, val error: String?, val draft: MeetingDraft?)
 
-/** "New tickets go to <project>": the org's projects, the viewer's pick kept on this phone. */
+/**
+ * "New tickets go to <project>": the org's projects, the viewer's pick kept on this phone.
+ * [showLabel] false where a section heading already says "New tickets go to" (the org settings).
+ */
 @Composable
-internal fun ProjectTarget(state: MetaState?, current: String, onPick: (String) -> Unit, onRetry: () -> Unit) {
+internal fun ProjectTarget(
+    state: MetaState?, current: String, onPick: (String) -> Unit, onRetry: () -> Unit, showLabel: Boolean = true,
+) {
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text("New tickets go to", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (showLabel) {
+            Text("New tickets go to", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
         when (state) {
             null, MetaState.Loading -> Text("… loading projects", style = MaterialTheme.typography.bodyMedium)
             is MetaState.Error -> {

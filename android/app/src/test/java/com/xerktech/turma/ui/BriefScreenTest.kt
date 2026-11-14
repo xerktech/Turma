@@ -380,6 +380,26 @@ class BriefScreenTest {
     private fun bodyOf(path: String): JsonObject =
         TurmaJson.parseToJsonElement(hub.findRequest(path).body.readUtf8()).jsonObject
 
+    // The section heading says it; the picker under it must not say it again (the inline
+    // picker on a meeting has no heading, so it keeps its own label).
+    @Test fun `org settings say New tickets go to once with projects loaded`() {
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [ { "key": "ENG", "name": "Engineering" }, { "key": "OPS", "name": "Ops" } ] }""")
+        seed()
+        show()
+        compose.onNodeWithContentDescription("o settings").performClick()
+        waitFor("Pick a project")
+        compose.onAllNodesWithText("New tickets go to", ignoreCase = true).assertCountEquals(1)
+    }
+
+    @Test fun `org settings say New tickets go to once when the projects fail to load`() {
+        hub.json("/api/jira/$site/create-meta", """{ "error": "jira said no" }""")
+        seed()
+        show()
+        compose.onNodeWithContentDescription("o settings").performClick()
+        waitFor("jira said no")
+        compose.onAllNodesWithText("New tickets go to", ignoreCase = true).assertCountEquals(1)
+    }
+
     @Test fun `the settings panel saves whose work, the Tenir label and the schedule`() {
         hub.json("/api/jira/$site/create-meta", """{ "projects": [ { "key": "ENG", "name": "Engineering" } ] }""")
         hub.json("/api/orgs/$site/meeting-focus", """{ "ok": true }""")
