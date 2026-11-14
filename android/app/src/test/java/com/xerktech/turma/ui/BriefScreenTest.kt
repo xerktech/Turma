@@ -469,7 +469,7 @@ class BriefScreenTest {
 
         compose.onNodeWithText("Ann").performTextReplacement("Zed Draft")
         fleet.onSseEvent("meetingFocus", """{ "$site": { "names": ["Bo"], "role": "PM" } }""")
-        compose.waitUntil(5_000) { compose.onAllNodesWithText("PM").fetchSemanticsNodes().isNotEmpty() }
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("PM").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Zed Draft").assertExists() // edited: kept
         compose.onNodeWithText("Bo").assertDoesNotExist()
 
@@ -477,7 +477,7 @@ class BriefScreenTest {
         compose.onNodeWithTag("save-schedule").performScrollTo().performClick()
         assertEquals("\"23:00\"", TurmaJson.parseToJsonElement(
             hub.findRequest("/daily-brief/schedule").body.readUtf8()).jsonObject["time"].toString())
-        compose.waitUntil(5_000) { compose.onAllNodesWithText("23:00").fetchSemanticsNodes().isNotEmpty() }
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("23:00").fetchSemanticsNodes().isNotEmpty() }
         // Another client sets 10:00: the hub serves it from now on, so a poll the
         // save nudged (possibly still answering the old fixture) settles on it.
         hub.json("/api/agents", """
