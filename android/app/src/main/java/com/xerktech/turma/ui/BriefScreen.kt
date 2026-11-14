@@ -809,7 +809,13 @@ internal fun BriefReadAloud(b: DailyBrief, now: Long, zone: ZoneId, locale: Loca
  * time opening that moment in Tenir when the meeting has a link.
  */
 @Composable
-internal fun TranscriptSection(site: String, m: Meeting, mvm: MeetingsViewModel) {
+internal fun TranscriptSection(
+    site: String,
+    m: Meeting,
+    mvm: MeetingsViewModel,
+    // The calendar panel's tint pulls text toward ink (XERK-2939); identity elsewhere.
+    textOn: (androidx.compose.ui.graphics.Color) -> androidx.compose.ui.graphics.Color = { it },
+) {
     val transcripts by mvm.transcripts.collectAsStateWithLifecycle()
     var open by rememberSaveable(site, m.meetingId) { mutableStateOf(false) }
     val uri = LocalUriHandler.current
@@ -823,10 +829,10 @@ internal fun TranscriptSection(site: String, m: Meeting, mvm: MeetingsViewModel)
     when (state) {
         null, is MeetingsViewModel.TranscriptState.Loading ->
             Text("Loading the transcript…", style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                color = textOn(MaterialTheme.colorScheme.onSurfaceVariant))
         is MeetingsViewModel.TranscriptState.Failed ->
             Text(state.message, style = MaterialTheme.typography.bodyMedium,
-                color = if (state.missing) MaterialTheme.colorScheme.onSurfaceVariant else TurmaColors.critical)
+                color = textOn(if (state.missing) MaterialTheme.colorScheme.onSurfaceVariant else TurmaColors.criticalText()))
         is MeetingsViewModel.TranscriptState.Loaded -> {
             if (state.turns.isEmpty()) {
                 Text("The transcript has no text.", style = MaterialTheme.typography.bodyMedium)
@@ -838,8 +844,8 @@ internal fun TranscriptSection(site: String, m: Meeting, mvm: MeetingsViewModel)
                     .testTag("transcript"),
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
-                val timeColor = MaterialTheme.colorScheme.onSurfaceVariant
-                val linkColor = MaterialTheme.colorScheme.primary
+                val timeColor = textOn(MaterialTheme.colorScheme.onSurfaceVariant)
+                val linkColor = textOn(MaterialTheme.colorScheme.primary)
                 // One line per turn, as the web: time, speaker and words run together.
                 for (t in state.turns) {
                     val line = buildAnnotatedString {
@@ -929,7 +935,7 @@ internal fun MeetingPart(
     if (status != null) {
         Text(status.first, style = MaterialTheme.typography.bodyMedium,
             color = if (status.second) textOn(TurmaColors.criticalText()) else MaterialTheme.colorScheme.onSurfaceVariant)
-        TranscriptSection(site, m, mvm)
+        TranscriptSection(site, m, mvm, textOn)
         return
     }
     val act = ItemActions(
@@ -967,7 +973,7 @@ internal fun MeetingPart(
         }
     }
     // The meeting's own transcript, a section of its own after every proposal.
-    TranscriptSection(site, m, mvm)
+    TranscriptSection(site, m, mvm, textOn)
 }
 
 private val WEEKDAY_LETTERS = listOf("S", "M", "T", "W", "T", "F", "S")
