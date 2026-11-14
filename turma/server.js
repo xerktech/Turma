@@ -5628,8 +5628,15 @@ const CAL_DOMAIN_RE = /^(?=.{1,253}$)[a-z0-9-]+(?:\.[a-z0-9-]+)+$/;
 const CAL_URL_RE = /^https:\/\/[^\s"'<>\\`]+$/;
 
 const calMs = (v) => (Number.isSafeInteger(v) && v > 0 ? v : 0);
-const calIso = (v) => (typeof v === "string" && v.length <= 40 && CAL_ISO_RE.test(v) &&
-  Number.isFinite(Date.parse(v)) ? v : "");
+// An ISO stamp WITH offset whose fields name a real time: Date.parse rolls
+// 2026-02-30 over to March 2 instead of refusing it.
+function calIso(v) {
+  if (typeof v !== "string" || v.length > 40 || !CAL_ISO_RE.test(v) || !Number.isFinite(Date.parse(v))) return "";
+  const [y, mo, d] = v.slice(0, 10).split("-").map(Number);
+  const [h, mi] = v.slice(11, 16).split(":").map(Number);
+  const okDay = mo >= 1 && mo <= 12 && d >= 1 && d <= new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  return okDay && h <= 24 && mi <= 59 ? v : "";
+}
 const calEnum = (v, set) => (typeof v === "string" && set.has(v) ? v : "unknown");
 const calId = (v) => (typeof v === "string" && CAL_ID_RE.test(v) ? v : "");
 function calEmail(v) {

@@ -31825,6 +31825,8 @@ test("XERK-2891: sanitizeCalendarEvent is a typed, capped fixed point", () => {
   assert.deepEqual(e.categories, ["Red"]);
   assert.deepEqual(hub.sanitizeCalendarEvent(e), e, "a stored event re-coerces to itself");
   assert.equal(hub.sanitizeCalendarEvent({ ...ev2891("bad", Date.now()), start: "tomorrow" }), null);
+  assert.equal(hub.sanitizeCalendarEvent({ ...ev2891("bad", Date.now()), start: "2026-02-30T09:00:00Z" }), null,
+    "an impossible date is refused, never rolled over");
   // Restore + HA watch run the same whitelist.
   const coerced = hub.calendarEventsCoerce({ h: { syncedAt: 5, events: [e, e, { id: "x" }] } });
   assert.deepEqual(coerced.h.events, [e]);
