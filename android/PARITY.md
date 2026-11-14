@@ -735,6 +735,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   Teams-style week calendar (`calendar.js`) with a Calendar / Notes review switch; Android still
   shows only the triage. Its port (week grid, day/3-day on a phone, detail, view switch) is
   XERK-2900.
+- **GAP — the calendar in the notes review (XERK-2899, web only)**: upcoming calendar meetings in
+  the rail, a linked capture's Outlook title/time/invitees, the Impromptu label, and Open in
+  calendar / Open in notes review. Ports with the calendar (XERK-2900).
 
 ## Open (subsequent installments), by screen and priority
 

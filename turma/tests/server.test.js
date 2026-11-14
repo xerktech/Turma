@@ -32380,6 +32380,8 @@ test("XERK-2896: a calendar arriving after the capture links it; a late invite a
     const wire = fleet.find((m) => m.meetingId === "adhoc");
     assert.deepEqual([wire.calendarEventId, wire.calendarEvent.subject, wire.calendarEvent.moved,
       wire.calendarEvent.canceled], ["chat", "Quick chat", false, false]);
+    // XERK-2899: the notes review shows who Outlook invited (names, no rooms).
+    assert.deepEqual(wire.calendarEvent.attendees, ["Bo Ray"]);
   } finally {
     cleanup2896(S, [D]);
   }
@@ -32587,6 +32589,7 @@ test("XERK-2896: a private event stays withheld beside its capture", async () =>
     const fleet = (await request("GET", "/api/agents", { headers: userHeaders })).body.meetingProposals[S];
     const ev = fleet.find((m) => m.meetingId === "c").calendarEvent;
     assert.deepEqual([ev.subject, ev.private], ["Private event", true]);
+    assert.deepEqual(ev.attendees, [], "XERK-2899: a private event's attendees stay withheld");
     assert.ok(!JSON.stringify(fleet).includes("Medical") && !JSON.stringify(fleet).includes("Clinic"));
     const r = await link2896(S, "c", { eventId: "pv" });
     assert.equal(r.body.meeting.calendarEvent.subject, "Private event");

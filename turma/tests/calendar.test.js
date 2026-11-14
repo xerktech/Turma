@@ -373,3 +373,83 @@ test("XERK-2897: a read the frame dropped is not retried off screen", { timeout:
   for (let i = 0; i < 6; i++) await tick();
   assert.equal(asked.length, 1, "the dropped week's failure arms no retry");
 });
+
+// ---- XERK-2899: the notes review's upcoming list and the two-way jump ----------------
+// Last in the file: once the notes review asks for upcoming meetings, the calendar
+// keeps reading those weeks while hidden (what the "hidden asks nothing" case pins
+// for a calendar nobody else reads).
+test("XERK-2899: upcoming() reads the coming week while hidden and lists only live org meetings", async () => {
+  NOW = at(2026, 11, 12, 10, 30);       // Thursday: the next 7 days cross into the following week
+  const m = (id, h, extra = {}) => ({ host: "h1", id, org: "acme", subject: id, joinUrl: "https://zoom.us/j/1",
+    startMs: at(2026, 11, 12, h), endMs: at(2026, 11, 12, h + 1), ...extra });
+  const asked = [];
+  replies = { "/api/calendar": (url) => {
+    asked.push(url);
+    if (url.includes(`from=${cal.weekStart(at(2026, 11, 16))}&`)) {
+      return { hosts: [], events: [{ host: "h1", id: "next-mon", org: "acme", subject: "Planning",
+        startMs: at(2026, 11, 16, 9), endMs: at(2026, 11, 16, 10) },
+      { host: "h1", id: "far", org: "acme", subject: "Too far", startMs: at(2026, 11, 20, 9), endMs: at(2026, 11, 20, 10) }] };
+    }
+    return { hosts: [], events: [
+      m("live", 11), m("now", 10),                                   // started, not ended: still upcoming
+      { ...m("live", 11), host: "h2" },                              // the same meeting on a second host
+      m("past", 8), m("canceled", 13, { canceled: true }), m("declined", 13, { myResponse: "declined" }),
+      m("focus", 14, { busy: "free" }), m("wfh", 14, { busy: "workingElsewhere" }),
+      m("allday", 0, { allDay: true, endMs: at(2026, 11, 13) }), m("other", 15, { org: "rival" }),
+      m("captured", 15, { meetings: [{ site: "acme", meetingId: "c1", title: "x" }] }),
+      { host: "", id: "tenir:t1", source: "tenir", org: "acme", site: "acme", meetingId: "t1", subject: "Adhoc",
+        startMs: at(2026, 11, 12, 16), endMs: at(2026, 11, 12, 17) },
+    ] };
+  } };
+  let landed = 0;
+  cal._setHooks({ onData: () => { landed++; } });
+  cal.setActive(false);
+  cal.refetch();
+  assert.deepEqual(cal.upcoming("acme"), [], "nothing read yet");
+  for (let i = 0; i < 6; i++) await tick();
+  assert.ok(landed >= 2, "the page hears each read land");
+  assert.deepEqual(cal.upcoming("acme").map((e) => e.id), ["now", "live", "next-mon"]);
+  assert.deepEqual(cal.upcoming("rival").map((e) => e.id), ["other"]);
+  // A frame while hidden re-reads exactly those weeks.
+  asked.length = 0;
+  cal.refetch();
+  for (let i = 0; i < 6; i++) await tick();
+  assert.equal(asked.length, 2, `the two upcoming weeks: ${asked.join(" ")}`);
+});
+
+test("XERK-2899: reveal() opens the week and the event carrying a capture; the panel jumps back", async () => {
+  NOW = at(2026, 11, 12, 10, 30);
+  const week = cal.weekStart(at(2026, 12, 2));
+  replies = { "/api/calendar": (url) => (url.includes(`from=${week}&`) ? { hosts: [], events: [
+    { host: "h1", id: "ev-1", org: "acme", subject: "Retro", startMs: at(2026, 12, 2, 15), endMs: at(2026, 12, 2, 16),
+      meetings: [{ site: "acme", meetingId: "cap-1", title: "Retro" }] },
+    { host: "h1", id: "ev-2", org: "acme", subject: "Other", startMs: at(2026, 12, 3, 9), endMs: at(2026, 12, 3, 10) },
+    { host: "", id: "tenir:cap-2", source: "tenir", org: "acme", site: "acme", meetingId: "cap-2", subject: "Hallway",
+      startMs: at(2026, 12, 4, 11), endMs: at(2026, 12, 4, 12) },
+  ] } : { hosts: [], events: [] }) };
+  const jumps = [];
+  cal._setHooks({ openNotes: (t) => jumps.push(t) });
+  cal.refetch();
+  cal.setActive(true);
+  cal.reveal({ site: "acme", meetingId: "cap-1", eventId: "ev-1", startMs: at(2026, 12, 2, 15) });
+  for (let i = 0; i < 8; i++) await tick();
+  assert.equal(cal.dayKey(cal._state().anchor), "2026-12-02");
+  assert.equal(cal._state().detail && cal._state().detail.id, "ev-1");
+  assert.match(root.innerHTML, /data-open-notes>Open in notes review</);
+  for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset: { openNotes: "" } }) } });
+  assert.deepEqual(jumps, [{ site: "acme", meetingId: "cap-1" }]);
+  // A Tenir-only capture is found by its meeting id; a past, unlinked event has no way back.
+  cal.reveal({ site: "acme", meetingId: "cap-2", startMs: at(2026, 12, 4, 11) });
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(cal._state().detail.id, "tenir:cap-2");
+  assert.deepEqual(cal.notesTarget(cal._state().detail, NOW), { site: "acme", meetingId: "cap-2" });
+  assert.deepEqual(cal.notesTarget({ id: "u", org: "acme", startMs: NOW + 3600000, endMs: NOW + 7200000 }, NOW),
+    { site: "acme", eventId: "u" }, "an upcoming meeting opens its notes-review entry");
+  assert.equal(cal.notesTarget({ id: "p", org: "acme", startMs: NOW - 7200000, endMs: NOW - 3600000 }, NOW), null);
+  // An id this week does not hold leaves the panel shut, on that week.
+  cal.reveal({ eventId: "nope", startMs: at(2026, 12, 3, 9) });
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(cal._state().detail, null);
+  assert.equal(cal.dayKey(cal._state().anchor), "2026-12-03");
+  cal.setActive(false);
+});

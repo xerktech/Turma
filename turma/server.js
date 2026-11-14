@@ -6518,6 +6518,7 @@ function relinkTenantMeetings(t) {
 }
 // A linked row's event as clients show it beside the capture: withheld like the
 // calendar withholds it (private), `moved` when it no longer overlaps the capture.
+const CALENDAR_WIRE_ATTENDEES_MAX = 30;
 function meetingCalendarEventWire(siteKey, m, index) {
   const ix = index && index.t === tenantOfSite(siteKey) ? index : calendarEventLookup(tenantOfSite(siteKey));
   const orgs = calendarOrgsOfTenant(ix.t);
@@ -6529,7 +6530,11 @@ function meetingCalendarEventWire(siteKey, m, index) {
   const w = calendarEventWire(c.key, c.ev, orgs, hs);
   const out = { host: c.key, org: calendarMatchOrg(c.key, c.ev, orgs, hs), subject: w.subject,
     start: w.start, end: w.end, startMs: w.startMs, endMs: w.endMs, canceled: w.canceled,
-    moved: !calOverlapsCapture(m, w) };
+    moved: !calOverlapsCapture(m, w),
+    // Who was invited, as Outlook names them (the notes review shows them beside the
+    // capture, XERK-2899): names only, no rooms, capped so 20 rows an org stay small.
+    attendees: w.attendees.filter((p) => p.role !== "resource").map((p) => p.name || p.email)
+      .filter(Boolean).slice(0, CALENDAR_WIRE_ATTENDEES_MAX) };
   if (w.private) out.private = true;
   return out;
 }

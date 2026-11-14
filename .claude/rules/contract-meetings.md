@@ -176,9 +176,9 @@ ticket builds to this file; change it here first.
   - `briefRunId` = the org's brief whose `meetingAt === M` (newest ok first, else newest), else
     the newest `ok` brief generated in the 24h before `startedAt`; absent when none.
 - `meetingWire` on `/api/agents` and the operator routes adds, for a linked row, `calendarEvent:
-  {host, org, subject, start, end, startMs, endMs, canceled, moved, private?}` (the event as the
-  calendar serves it, private ones withheld; `org` the one it matched under; `moved` = it no
-  longer overlaps the capture), or
+  {host, org, subject, start, end, startMs, endMs, canceled, moved, attendees, private?}` (the
+  event as the calendar serves it, private ones withheld; `org` the one it matched under; `moved` =
+  it no longer overlaps the capture; `attendees` = invitee names, no resources, ≤30, XERK-2899), or
   `calendarEventMissing: true` when an operator's event left the store (XERK-2896).
 - `meetingWire` serves `daily` and `archivedAt`; **neither Tenir answer does** (`meetingTenirWire`,
   used for the first answer and the duplicate): they are the operator's, not Tenir's.

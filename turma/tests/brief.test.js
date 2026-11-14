@@ -43,6 +43,7 @@ function makeEl() {
 function loadPage(reply = null, agents = null, hash = "", { search = "", store = {} } = {}) {
   const els = {};
   let calendarRefetches = 0;
+  const calendarOpts = [], calendarUpcoming = [], calendarReveals = [];
   const calendarActive = [];
   const viewButtons = ["calendar", "notes"].map((v) => {
     const b = makeEl();
@@ -109,7 +110,9 @@ function loadPage(reply = null, agents = null, hash = "", { search = "", store =
     TurmaBoard: { bareKey: require("../public/board.js").bareKey, orgName: (k, o) => o || k, mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
     // The Calendar view (XERK-2897) has its own suite (calendar.test.js); here it only records.
-    TurmaCalendar: { mount: noop, update: noop, refetch: () => { calendarRefetches++; }, setActive: (on) => { calendarActive.push(on); } },
+    TurmaCalendar: { mount: (el, o) => { calendarOpts.push(o); }, update: noop, refetch: () => { calendarRefetches++; },
+      setActive: (on) => { calendarActive.push(on); },
+      upcoming: (site) => calendarUpcoming.filter((e) => e.org === site), reveal: (t) => { calendarReveals.push(t); } },
     localStorage: { getItem: (k) => store[k] ?? null, setItem: (k, v) => { store[k] = String(v); } },
   };
   const mkeys = Object.keys(stubs);
@@ -129,7 +132,7 @@ function loadPage(reply = null, agents = null, hash = "", { search = "", store =
   const list = els.meetingList;
   // What a test puts "inside" the list: the focused element counts as inside.
   list.contains = (el) => !!el && el.inside === true;
-  return Object.assign(api, { viewButtons, calendarActive, store, calendarRefetches: () => calendarRefetches, intervals, meetings, els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document, window: stubs.window,
+  return Object.assign(api, { viewButtons, calendarActive, calendarOpts, calendarUpcoming, calendarReveals, store, calendarRefetches: () => calendarRefetches, intervals, meetings, els, fetches, toasts, clip, settle, runTimers, sse, winListeners, document, window: stubs.window,
     list: () => list.innerHTML, fire: (name, data) => sse[0].handlers[name]({ data: JSON.stringify(data) }) });
 }
 
