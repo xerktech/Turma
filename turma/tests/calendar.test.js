@@ -532,9 +532,9 @@ test("XERK-2898: badges count proposals still needing review; a meeting being re
     ] }) };
     cal.refetch();
     const html = await show(at(2027, 4, 7));
-    assert.match(html, /aria-label="Review me,[^"]*, 3 proposals to review"><span class="t"><span class="tx">Review me<\/span><span class="cal-badge" aria-hidden="true"><svg[^]*?<\/svg>3<\/span>/);
-    assert.match(html, /aria-label="Reading,[^"]*, the meeting is being read"><span class="t"><span class="tx">Reading<\/span><span class="cal-badge reading" aria-hidden="true"><span class="cal-spin">/);
-    assert.match(html, /aria-label="Plain,[^"]*"><span class="t"><span class="tx">Plain<\/span><\/span>/);
+    assert.match(html, /aria-label="Review me,[^"]*, 3 proposals to review"><span class="cal-evb"><span class="t"><span class="tx">Review me<\/span><span class="cal-badge" aria-hidden="true"><svg[^]*?<\/svg>3<\/span>/);
+    assert.match(html, /aria-label="Reading,[^"]*, the meeting is being read"><span class="cal-evb"><span class="t"><span class="tx">Reading<\/span><span class="cal-badge reading" aria-hidden="true"><span class="cal-spin">/);
+    assert.match(html, /aria-label="Plain,[^"]*"><span class="cal-evb"><span class="t"><span class="tx">Plain<\/span><\/span>/);
   } finally { delete globalThis.TurmaMeetings; }
 });
 
@@ -914,4 +914,23 @@ test("XERK-2934: a 24h+ timed event's band button aria-label names both ends", a
   }
   // A real all-day event's button still reads "all day".
   assert.match(html, /aria-label="Holiday,[^"]*Thursday, November 12, all day/);
+});
+
+test("XERK-2943: a short block still carries its time line; the drawn height (CSS) decides if it shows", async () => {
+  cal.update({ agents: [] });
+  replies = { "/api/calendar": () => ({ hosts: [], events: [
+    { host: "h1", id: "q", org: "", subject: "Quick", startMs: at(2027, 4, 7, 9), endMs: at(2027, 4, 7, 9) + 15 * 60000 },
+  ] }) };
+  cal.refetch();
+  const html = await show(at(2027, 4, 7));
+  assert.match(html, /<button type="button" class="cal-ev[^"]*" [^>]*aria-label="Quick,[^"]*"><span class="cal-evb"><span class="t"><span class="tx">Quick<\/span><\/span><span class="m">9:00\s–\s9:15\sAM<\/span><\/span><\/button>/);
+  assert.doesNotMatch(html, /class="cal-ev[^"]*\bshort\b/);
+});
+
+test("XERK-2943: brief.html keeps the CSS that sizes short blocks and clears the detail panel", () => {
+  const css = require("fs").readFileSync(require("path").join(__dirname, "..", "public", "brief.html"), "utf8");
+  assert.match(css, /\.wrap\.tri-wrap \{ --tri-wrap: 1280px; max-width: var\(--tri-wrap\);/);
+  assert.match(css, /\.cal-ev:not\(\.allday\) \{ container-type: size;/);
+  assert.match(css, /@container \(height < 34px\) \{[^}]*\.cal-evb \{[^}]*\}\s*\.cal-evb \.m \{ display: none; \}/);
+  assert.match(css, /\.cal:has\(> \.cal-detail:not\(\[hidden\]\)\) > \.cal-main \{\s*margin-right: max\(0px, 447px - max\(0px, \(100vw - var\(--tri-wrap\)\) \/ 2\)\);/);
 });
