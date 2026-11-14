@@ -60,6 +60,12 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withLink
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -808,7 +814,7 @@ internal fun TranscriptSection(site: String, m: Meeting, mvm: MeetingsViewModel)
     var open by rememberSaveable(site, m.meetingId) { mutableStateOf(false) }
     val uri = LocalUriHandler.current
     val state = transcripts["$site\u0000${m.meetingId}"]
-    GhostButton(if (open) "Hide transcript" else "Show full transcript", {
+    GhostButton(if (open) "▾ Full transcript" else "▸ Full transcript", {
         open = !open
         if (open) mvm.loadTranscript(site, m.meetingId)
     }, Modifier.testTag("transcript-toggle"))
@@ -829,23 +835,30 @@ internal fun TranscriptSection(site: String, m: Meeting, mvm: MeetingsViewModel)
             Column(
                 Modifier.fillMaxWidth().heightIn(max = 480.dp).verticalScroll(rememberScrollState())
                     .testTag("transcript"),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
+                val timeColor = MaterialTheme.colorScheme.onSurfaceVariant
+                val linkColor = MaterialTheme.colorScheme.primary
+                // One line per turn, as the web: time, speaker and words run together.
                 for (t in state.turns) {
-                    Column {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            if (t.atMs >= 0) {
-                                val link = meetingMomentUrl(m.tenirUrl, t.atMs)
-                                Text(transcriptClock(t.atMs), style = MaterialTheme.typography.labelMedium,
-                                    color = if (link.isEmpty()) MaterialTheme.colorScheme.onSurfaceVariant
-                                    else MaterialTheme.colorScheme.primary,
-                                    modifier = if (link.isEmpty()) Modifier else Modifier.clickable { uri.openUri(link) })
+                    val line = buildAnnotatedString {
+                        if (t.atMs >= 0) {
+                            val link = meetingMomentUrl(m.tenirUrl, t.atMs)
+                            val clock = transcriptClock(t.atMs)
+                            if (link.isEmpty()) {
+                                withStyle(SpanStyle(color = timeColor)) { append(clock) }
+                            } else {
+                                withLink(LinkAnnotation.Url(link, TextLinkStyles(SpanStyle(color = linkColor)))) { append(clock) }
                             }
-                            Text(t.speaker.ifBlank { "Unknown speaker" }, style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.SemiBold)
+                            append("  ")
                         }
-                        Text(t.text, style = MaterialTheme.typography.bodyMedium)
+                        withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) {
+                            append(t.speaker.ifBlank { "Unknown speaker" } + ":")
+                        }
+                        append(" ")
+                        append(t.text)
                     }
+                    Text(line, style = MaterialTheme.typography.bodyMedium)
                 }
             }
         }

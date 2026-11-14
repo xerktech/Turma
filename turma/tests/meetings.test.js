@@ -158,15 +158,15 @@ test("XERK-2941: Show full transcript reads the hub once, groups speaker turns, 
   P.setCache(d);
   P.renderMeetings(d);
   const mk = P.meetingKey("acme.atlassian.net", "m1");
-  assert.match(P.list(), /data-transcript="acme\.atlassian\.net\/m1" aria-expanded="false">Show full transcript/);
+  assert.match(P.list(), /data-transcript="acme\.atlassian\.net\/m1" aria-expanded="false">▸ Full transcript/);
   P.click({ transcript: mk });
   await P.settle();
   const h = P.list();
   assert.equal(P.fetches.filter((f) => /\/transcript$/.test(f.url)).length, 1);
-  assert.match(h, /Hide transcript/);
+  assert.match(h, /aria-expanded="true">▾ Full transcript/);
   // Ann's two lines are one turn, at 1:05, linked to that moment in Tenir.
-  assert.match(h, /<a class="mt-tr-at" href="https:\/\/tenir\.example\/c\/1#t=65"[^>]*>1:05<\/a><b>Ann<\/b><\/div><p>We should fix &lt;b&gt;login&lt;\/b&gt;\. Today\.<\/p>/);
-  assert.match(h, />1:02:05<\/a><b>&lt;i&gt;Bo&lt;\/i&gt;<\/b>/);
+  assert.match(h, /<p class="mt-tr-turn"><a class="mt-tr-at" href="https:\/\/tenir\.example\/c\/1#t=65"[^>]*>1:05<\/a><b>Ann:<\/b> We should fix &lt;b&gt;login&lt;\/b&gt;\. Today\.<\/p>/);
+  assert.match(h, />1:02:05<\/a><b>&lt;i&gt;Bo&lt;\/i&gt;:<\/b> Agreed\./);
   assert.doesNotMatch(h, /<b>login|<i>Bo/);
   // Hide, then show again: no second read.
   P.click({ transcript: mk });

@@ -559,8 +559,8 @@ function transcriptBodyHtml(m, segments) {
     const when = !at ? "" : link
       ? `<a class="mt-tr-at" href="${esc(link)}" target="_blank" rel="noopener noreferrer">${esc(at)}</a>`
       : `<span class="mt-tr-at">${esc(at)}</span>`;
-    return `<div class="mt-tr-turn"><div class="mt-tr-who">${when}<b>${esc(t.speaker || "Unknown speaker")}</b></div>`
-      + `<p>${t.lines.map(esc).join(" ")}</p></div>`;
+    // One line per turn: time, speaker and words run together, so the transcript reads dense.
+    return `<p class="mt-tr-turn">${when}<b>${esc(t.speaker || "Unknown speaker")}:</b> ${t.lines.map(esc).join(" ")}</p>`;
   }).join("");
   return { html, count: turns.length };
 }
@@ -569,7 +569,7 @@ function transcriptHtml(site, m) {
   const open = transcriptOpen.has(mk);
   const t = transcripts.get(mk);
   const btn = `<button type="button" class="linkish" data-transcript="${esc(mk)}" aria-expanded="${open}">`
-    + `${open ? "Hide transcript" : "Show full transcript"}</button>`;
+    + `${open ? "▾" : "▸"} Full transcript</button>`;
   let body = "";
   if (open) {
     if (!t || t.loading) body = `<div class="mt-status">Loading the transcript…</div>`;
