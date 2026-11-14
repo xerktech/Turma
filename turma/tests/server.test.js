@@ -32212,23 +32212,33 @@ test("XERK-2891: events take an org by rule, default or series override; private
     { headers: { ...userHeaders, "content-type": "application/json" }, body });
   let orgs = Object.fromEntries((await calGet2891(now - H2891, now + 48 * H2891)).body.events
     .filter((e) => e.host === D).map((e) => [e.id, e.org]));
-  assert.deepEqual(orgs, { byOrganizer: SB, byAttendee: SA, ambiguous: "", pinned: SA, secret: SA });
+  // XERK-2936: no rule decides it, so it is the host's own org — never "".
+  assert.deepEqual(orgs, { byOrganizer: SB, byAttendee: SA, ambiguous: SA, pinned: SA, secret: SA });
   assert.equal((await settings({ defaultOrg: "nobody2891.atlassian.net" })).status, 404);
   assert.equal((await settings({ defaultOrg: SB })).status, 200);
-  assert.equal((await settings({ series: { id: "ser", org: "" } })).status, 200);
-  const view = (await calGet2891(now - H2891, now + 48 * H2891)).body.events.filter((e) => e.host === D);
+  assert.equal((await settings({ series: { id: "ser", org: "" } })).status, 400, "no org is not an org");
+  assert.equal((await settings({ series: { id: "ser", org: SB } })).status, 200);
+  let view = (await calGet2891(now - H2891, now + 48 * H2891)).body.events.filter((e) => e.host === D);
   orgs = Object.fromEntries(view.map((e) => [e.id, e.org]));
-  assert.deepEqual([orgs.ambiguous, orgs.pinned], [SB, ""], "default org, then the series pin");
+  assert.deepEqual([orgs.ambiguous, orgs.pinned, orgs.byAttendee], [SB, SB, SA], "default org, then the series pin");
+  assert.equal((await settings({ series: { id: "ser", org: SA } })).status, 200);
+  view = (await calGet2891(now - H2891, now + 48 * H2891)).body.events.filter((e) => e.host === D);
+  assert.ok(view.every((e) => e.org && e.matchOrg === e.org), "every event has an org, served as matchOrg too");
+  assert.equal(view.find((e) => e.id === "pinned").org, SA, "the series pin beats the default");
   const secret = view.find((e) => e.id === "secret");
+  // XERK-2936: the "real meeting" verdict is judged before the private event is withheld.
+  assert.deepEqual([secret.attendees, secret.meeting], [[], true]);
   assert.deepEqual([secret.subject, secret.body, secret.location, secret.attendees, secret.private],
     ["Private event", "", "", [], true]);
   assert.equal((await settings({ showPrivate: true })).status, 200);
   const shown = (await calGet2891(now - H2891, now + 48 * H2891)).body.events.find((e) => e.id === "secret");
   assert.equal(shown.body, "salary talk");
-  // The org filter selects on the assigned org ("" = unassigned).
+  // The org filter selects on the event's org.
   const only = (await calGet2891(now - H2891, now + 48 * H2891, userHeaders, `&org=${SB}`)).body.events
     .filter((e) => e.host === D).map((e) => e.id);
   assert.deepEqual(only.sort(), ["ambiguous", "byOrganizer"]);
+  // XERK-2936: a stored "" pin from an older hub is dropped, so the event keeps an org.
+  assert.deepEqual(hub.calendarHostSettingsCoerce({ h: { seriesOrgs: { ser: "" } } }).h.seriesOrgs, Object.create(null));
   delete hub.getCalendarOrgRules()[SA];
   delete hub.getCalendarOrgRules()[SB];
   forget2891(D, "cal2891eb");
@@ -32551,18 +32561,14 @@ test("XERK-2896: personal blocks never take a capture; a late invite replaces a 
       ev2896("pinned", T2896 + 15 * H, 60),
       ev2896("allhands", T2896 + 17 * H, 120, { subject: "All hands" }),
     ]);
-    // The pinned event is unassigned on purpose: it must not fall back to the host's org.
-    assert.equal((await request("POST", `/api/agents/${D}/calendar/settings`, { headers: { ...userHeaders,
-      "content-type": "application/json" }, body: { series: { id: "pinned", org: "" } } })).status, 200);
     for (const [id, at] of [["f", T2896 + 20 * MIN2896], ["w", T2896 + 3 * H], ["g", T2896 + 11 * H + 10 * MIN2896],
-      ["d", T2896 + 13 * H], ["p", T2896 + 15 * H]]) {
+      ["d", T2896 + 13 * H]]) {
       await postMeeting2508(S, capture2896(id, at, 20, { participants: ["Cy Doe"] }));
       assert.equal(row2896(S, id).calendarEventId, undefined, id);
     }
     // XERK-2898: each Outlook event serves the org the matcher counts it for, so a
-    // client relinks by the same rule: the pinned one counts for no org.
+    // client relinks by the same rule.
     const served = (await view2896()).events.filter((e) => e.host === D);
-    assert.equal(served.find((e) => e.id === "pinned").matchOrg, "");
     assert.equal(served.find((e) => e.id === "allhands").matchOrg, S);
     // An impromptu call inside the all-hands slot links to it (no better event yet)...
     await postMeeting2508(S, capture2896("ah", T2896 + 17 * H + 30 * MIN2896, 30, { title: "Customer call",
@@ -32590,9 +32596,10 @@ test("XERK-2896: a linked capture whose event is not served still shows on its o
     const hour = async (q = "") => (await calGet2891(T2896 - MIN2896, T2896 + 60 * MIN2896, userHeaders, q)).body.events;
     // Served with its event: one Outlook entry carrying it, no Turma-only copy.
     assert.deepEqual((await hour()).filter((e) => e.id === "mv" || e.id === "tenir:c").map((e) => e.id), ["mv"]);
-    // The org filter: the unassigned event serves as org "" — the capture still shows under its org.
-    const byOrg = (await hour(`&org=${encodeURIComponent(S)}`)).filter((e) => e.id === "tenir:c");
-    assert.deepEqual(byOrg.map((e) => [e.calendarEventId, e.moved]), [["mv", undefined]]);
+    // The org filter (XERK-2936): an event with no rule serves as its host's org, so it is
+    // listed under that org with its capture on it.
+    const byOrg = (await hour(`&org=${encodeURIComponent(S)}`)).filter((e) => e.id === "mv" || e.id === "tenir:c");
+    assert.deepEqual(byOrg.map((e) => [e.id, e.org, e.meetings.map((m) => m.meetingId)]), [["mv", S, ["c"]]]);
     // Moved 20 h later: the capture's own hour still has it, marked moved.
     await calHost2896(D, S, [ev2896("mv", T2896 + 20 * 60 * MIN2896, 30)]);
     const moved = (await hour()).filter((e) => e.id === "tenir:c");

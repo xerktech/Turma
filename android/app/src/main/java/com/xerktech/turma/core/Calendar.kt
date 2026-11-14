@@ -140,9 +140,18 @@ private val NOT_MEETING_BUSY = setOf("free", "outOfOffice", "workingElsewhere")
  * working elsewhere, or already captured — ending after [now], starting within a week.
  */
 fun calIsUpcomingMeeting(ev: CalendarEvent, now: Long): Boolean =
-    !ev.tenir && ev.org.isNotEmpty() && calDrawable(ev) && !calInBand(ev) && !ev.canceled &&
+    !ev.tenir && ev.org.isNotEmpty() && calRealMeeting(ev) && calDrawable(ev) && !calInBand(ev) && !ev.canceled &&
         ev.myResponse != "declined" && ev.busy !in NOT_MEETING_BUSY && ev.meetings.isEmpty() &&
         ev.e() > now && ev.s() < now + CAL_UPCOMING_MS
+
+/**
+ * A real meeting as the hub's matcher reads it (`calendarLinkCandidate`). Every event has an
+ * org since XERK-2936, so without it Focus time and Lunch listed as upcoming meetings. The
+ * hub's [CalendarEvent.meeting] decides (judged before a private event is withheld); an older
+ * hub sends none: someone else invited, or a join link.
+ */
+fun calRealMeeting(ev: CalendarEvent): Boolean = ev.meeting
+    ?: (ev.attendees.any { it.role != "organizer" && it.role != "resource" } || ev.joinUrl.isNotEmpty() || ev.isOnlineMeeting)
 
 /** The upcoming calendar meetings of [site] from [events], earliest first, one per Outlook id. */
 fun calUpcoming(site: String, events: List<CalendarEvent>, now: Long): List<CalendarEvent> =
@@ -444,9 +453,8 @@ fun calMovedFrom(ev: CalendarEvent): Long? {
 }
 
 /**
- * The org the hub's capture matcher counts an event for: the served `matchOrg`
- * (a series pinned to no org is ""), else (an older hub) its assigned org, else
- * its host's decided org ([hostOrg]).
+ * The org the hub's capture matcher counts an event for: the served `matchOrg`,
+ * else (an older hub) its assigned org, else its host's decided org ([hostOrg]).
  */
 fun calEventOrg(ev: CalendarEvent, hostOrg: (String) -> String): String =
     ev.matchOrg ?: ev.org.ifEmpty { if (ev.tenir) "" else hostOrg(ev.host) }
