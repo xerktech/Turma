@@ -242,7 +242,7 @@ const SCOPERS = {
   autoStartOrgs: bySite, autoMergeOrgs: bySite, priorityWriteBackOrgs: bySite,
   dedupeLinkOrgs: bySite, orgColors: bySite, triagePolicies: bySite,
   decisions: bySite, decisionCounts: bySite, dailyBriefSchedules: bySite,
-  dailyBriefs: bySite, meetingProposals: bySite, meetingLabels: bySite, meetingLabelMisses: bySite, meetingFocus: bySite,
+  dailyBriefs: bySite, meetingProposals: bySite, meetingLabels: bySite, meetingLabelMisses: bySite, meetingFocus: bySite, calendarOrgRules: bySite,
   holidaySettings: bySite,
   ticketModels: byTicket, ticketRuntimes: byTicket, ticketPlatforms: byTicket,
   ticketTriageActions: byTicket, epicRuns: byTicket,

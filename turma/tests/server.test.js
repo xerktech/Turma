@@ -32212,13 +32212,22 @@ test("XERK-2891: events take an org by rule, default or series override; private
     { headers: { ...userHeaders, "content-type": "application/json" }, body });
   let orgs = Object.fromEntries((await calGet2891(now - H2891, now + 48 * H2891)).body.events
     .filter((e) => e.host === D).map((e) => [e.id, e.org]));
-  assert.deepEqual(orgs, { byOrganizer: SB, byAttendee: SA, ambiguous: "", pinned: SA, secret: SA });
+  // Ambiguous by rule: the host's own decided org (XERK-2929), not "".
+  assert.deepEqual(orgs, { byOrganizer: SB, byAttendee: SA, ambiguous: SA, pinned: SA, secret: SA });
   assert.equal((await settings({ defaultOrg: "nobody2891.atlassian.net" })).status, 404);
   assert.equal((await settings({ defaultOrg: SB })).status, 200);
   assert.equal((await settings({ series: { id: "ser", org: "" } })).status, 200);
   const view = (await calGet2891(now - H2891, now + 48 * H2891)).body.events.filter((e) => e.host === D);
   orgs = Object.fromEntries(view.map((e) => [e.id, e.org]));
   assert.deepEqual([orgs.ambiguous, orgs.pinned], [SB, ""], "default org, then the series pin");
+  // XERK-2929: the settings UI reads back what it set — the host row, the pin, the rules.
+  assert.deepEqual(view.find((e) => e.id === "pinned").seriesOrg, "");
+  assert.equal(view.find((e) => e.id === "ambiguous").seriesOrg, undefined);
+  const hostRow = (await calGet2891(now - H2891, now + 48 * H2891)).body.hosts.find((h) => h.host === D);
+  assert.deepEqual([hostRow.org, hostRow.defaultOrg, hostRow.showPrivate, hostRow.orgs.includes(SA) && hostRow.orgs.includes(SB)],
+    [SA, SB, false, true]);
+  const fleet = (await request("GET", "/api/agents", { headers: userHeaders })).body;
+  assert.deepEqual(fleet.calendarOrgRules[SA], { domains: ["a.example"] });
   const secret = view.find((e) => e.id === "secret");
   assert.deepEqual([secret.subject, secret.body, secret.location, secret.attendees, secret.private],
     ["Private event", "", "", [], true]);
@@ -32590,9 +32599,10 @@ test("XERK-2896: a linked capture whose event is not served still shows on its o
     const hour = async (q = "") => (await calGet2891(T2896 - MIN2896, T2896 + 60 * MIN2896, userHeaders, q)).body.events;
     // Served with its event: one Outlook entry carrying it, no Turma-only copy.
     assert.deepEqual((await hour()).filter((e) => e.id === "mv" || e.id === "tenir:c").map((e) => e.id), ["mv"]);
-    // The org filter: the unassigned event serves as org "" — the capture still shows under its org.
-    const byOrg = (await hour(`&org=${encodeURIComponent(S)}`)).filter((e) => e.id === "tenir:c");
-    assert.deepEqual(byOrg.map((e) => [e.calendarEventId, e.moved]), [["mv", undefined]]);
+    // The org filter: a rule-less event serves as its host's org (XERK-2929), so it
+    // carries the capture under that org — no Turma-only copy.
+    const byOrg = (await hour(`&org=${encodeURIComponent(S)}`)).filter((e) => e.id === "mv" || e.id === "tenir:c");
+    assert.deepEqual(byOrg.map((e) => [e.id, e.org, e.meetings.map((m) => m.meetingId)]), [["mv", S, ["c"]]]);
     // Moved 20 h later: the capture's own hour still has it, marked moved.
     await calHost2896(D, S, [ev2896("mv", T2896 + 20 * 60 * MIN2896, 30)]);
     const moved = (await hour()).filter((e) => e.id === "tenir:c");
@@ -32839,5 +32849,37 @@ test("XERK-2901: a calendar host going offline and back sends a calendar frame e
   } finally {
     hub.sseClients.delete(res); hub.ssePrincipals.delete(res);
     forget2891(D);
+  }
+});
+
+test("XERK-2929: calendar email-domain rules are each tenant's own, on /api/agents and their SSE frame", async () => {
+  const T = tenants2533();
+  let F, sa, sb;
+  try {
+    F = await fleet2551(T, "t2929");
+    const rules = (site, h, domains) => request("POST", `/api/orgs/${encodeURIComponent(site)}/calendar-rules`,
+      { headers: { ...h, "content-type": "application/json" }, body: { domains } });
+    sa = await sseConnect(T.A.h);
+    sb = await sseConnect(T.B.h);
+    const fa = collectSse(sa.res), fb = collectSse(sb.res);
+    assert.equal((await rules(F.SA, T.B.h, ["evil.example"])).status, 404, "B cannot write A's org");
+    assert.equal((await rules(F.SA, T.A.h, ["a2929.example"])).status, 200);
+    assert.equal((await rules(F.SB, T.B.h, ["b2929.example"])).status, 200);
+    const agentsOf = async (h) => (await request("GET", "/api/agents", { headers: h })).body.calendarOrgRules;
+    const a = await agentsOf(T.A.h), b = await agentsOf(T.B.h);
+    assert.deepEqual([a[F.SA], F.SB in a], [{ domains: ["a2929.example"] }, false]);
+    assert.deepEqual([b[F.SB], F.SA in b], [{ domains: ["b2929.example"] }, false]);
+    // The frame is pushed on each change, scoped per viewer like the payload.
+    await waitFor(() => fa.some((e) => e.event === "calendarOrgRules" && F.SA in JSON.parse(e.data)));
+    await waitFor(() => fb.some((e) => e.event === "calendarOrgRules" && F.SB in JSON.parse(e.data)));
+    assert.ok(!fb.some((e) => e.event === "calendarOrgRules" && e.data.includes("a2929.example")), "B never sees A's rules");
+    assert.ok(!fa.some((e) => e.event === "calendarOrgRules" && e.data.includes("b2929.example")), "A never sees B's rules");
+  } finally {
+    for (const s of [sa, sb]) if (s) { s.req.destroy(); s.res.destroy(); }
+    if (F) {
+      forget2533("t2929", F.ka, F.kb, F.kl);
+      for (const k of [F.SA, F.SB]) delete hub.getCalendarOrgRules()[k];
+    }
+    T.restore();
   }
 });

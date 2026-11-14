@@ -6,12 +6,16 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.core.CreateMetaFetch
+import com.xerktech.turma.core.calendarDomains
 import com.xerktech.turma.core.meetingDefaultType
 import com.xerktech.turma.core.meetingProject
 import com.xerktech.turma.core.meetingMaybeCreated
 import com.xerktech.turma.core.meetingReviewable
 import com.xerktech.turma.core.meetingTicketDescription
+import com.xerktech.turma.model.CalendarOrgRule
 import com.xerktech.turma.model.CreateProject
+import com.xerktech.turma.model.HolidaySettings
+import com.xerktech.turma.model.TurmaJson
 import com.xerktech.turma.model.CreateType
 import com.xerktech.turma.model.Meeting
 import com.xerktech.turma.model.MeetingArchiveRequest
@@ -379,6 +383,31 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
             container.client.api.putDailyBriefSchedule(siteKey, fields)
         }
 
+    /**
+     * The org's days off (XERK-2929): [patch] is `{countries}` or `{off}`, each the
+     * full list. The answer's settings patch the fleet, so the ticks hold at once.
+     */
+    fun saveHolidays(siteKey: String, patch: JsonObject): Job =
+        save(siteKey, "holidays", "Saving the days off", apply = { out ->
+            (out["settings"] as? JsonObject)?.let { v ->
+                runCatching { TurmaJson.decodeFromJsonElement(HolidaySettings.serializer(), v) }.getOrNull()
+                    ?.let { container.fleet.patchHolidaySettings(siteKey, it) }
+            }
+        }) { container.client.api.putHolidaySettings(siteKey, patch) }
+
+    /** The org's calendar email domains (XERK-2929), as typed; none clears them. */
+    fun saveDomains(siteKey: String, text: String): Job =
+        save(siteKey, "domains", "Saving the email domains", apply = { out ->
+            val rules = (out["rules"] as? JsonObject)?.let { v ->
+                runCatching { TurmaJson.decodeFromJsonElement(CalendarOrgRule.serializer(), v) }.getOrNull()
+            }
+            container.fleet.patchCalendarOrgRules(siteKey, rules)
+        }) {
+            container.client.api.setCalendarOrgRules(siteKey, buildJsonObject {
+                putJsonArray("domains") { calendarDomains(text).forEach { add(JsonPrimitive(it)) } }
+            })
+        }
+
     /** What the hub answered a save with, per "site\u0000what"; [seq] tells two equal answers apart. */
     data class Stored(val seq: Int, val body: JsonObject)
 
@@ -391,7 +420,13 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
     val stored: StateFlow<Map<String, Stored>> = _stored
     private var storedSeq = 0
 
-    private fun save(siteKey: String, what: String, verb: String, call: suspend () -> retrofit2.Response<JsonObject>): Job =
+    private fun save(
+        siteKey: String,
+        what: String,
+        verb: String,
+        apply: (JsonObject) -> Unit = {},
+        call: suspend () -> retrofit2.Response<JsonObject>,
+    ): Job =
         viewModelScope.launch {
             val key = "$siteKey\u0000$what"
             if (key in _saving.value) return@launch
@@ -420,6 +455,7 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
             if (err != null) {
                 _messages.tryEmit("✗ $verb failed — $err")
             } else {
+                body?.let(apply)
                 _stored.value = _stored.value + (key to Stored(++storedSeq, body ?: JsonObject(emptyMap())))
                 _saved.value = _saved.value + key
             }

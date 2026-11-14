@@ -107,13 +107,20 @@ internal fun ProjectTarget(
 
 /** A text button opening a menu of options; [onPick] gets the option's value. */
 @Composable
-internal fun Picker(label: String, options: List<Pair<String, String>>, onPick: (String) -> Unit) {
+internal fun Picker(
+    label: String,
+    options: List<Pair<String, String>>,
+    onPick: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+) {
     var open by remember { mutableStateOf(false) }
     Box {
         Text(
             "$label ▾",
-            Modifier.clip(RoundedCornerShape(8.dp)).clickable { open = true }.padding(horizontal = 6.dp, vertical = 4.dp),
-            color = MaterialTheme.colorScheme.primary,
+            modifier.clip(RoundedCornerShape(8.dp)).clickable(enabled = enabled) { open = true }
+                .padding(horizontal = 6.dp, vertical = 4.dp),
+            color = if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.SemiBold,
         )

@@ -231,6 +231,9 @@ let panelHas = false;             // meetings.js painted the capture into the pa
 const linkBusy = new Set();       // capture keys with a relink POST in flight
 const linkErr = new Map();        // capture key -> the hub's refusal
 const linkPick = new Map();       // capture key -> the picked event's key
+let hostSetOpen = false;          // the per-host calendar settings are shown (XERK-2929)
+const setBusy = new Set();        // host keys with a settings POST in flight
+const setErr = new Map();         // host key -> the hub's refusal
 let sidePress = false, sidePending = false;
 let shown = [];                   // the events of the last paint, indexed by data-ev
 let scrolled = false;             // the grid opened at working hours once
@@ -412,7 +415,7 @@ function revealHit(ev) {
 // The events, holidays and host rows of the shown weeks, an event held by two weeks once.
 function collect(days) {
   const evs = new Map(), hol = new Map();
-  const hosts = new Map();
+  const hosts = new Map(), hostRows = new Map();
   let loading = false, err = "", truncated = false, have = true;
   for (const ws of weeksOf(days)) {
     const w = weekEntry(ws);
@@ -425,10 +428,13 @@ function collect(days) {
       evs.set(`${ev.host}\u0000${ev.id}`, ev);
     }
     for (const n of hostNotices(w.cal, ws)) if (!hosts.has(n.host) || n.syncing) hosts.set(n.host, n);
+    for (const h of (Array.isArray(w.cal.hosts) ? w.cal.hosts : [])) {
+      if (h && typeof h.host === "string" && Array.isArray(h.orgs)) hostRows.set(h.host, h);
+    }
     for (const h of w.hol || []) if (h && typeof h.date === "string") hol.set(`${h.date}\u0000${h.id}`, h);
   }
   const list = [...evs.values()].sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
-  return { events: list, holidays: [...hol.values()], notices: [...hosts.values()], loading, err, truncated, have };
+  return { events: list, holidays: [...hol.values()], notices: [...hosts.values()], hostRows, loading, err, truncated, have };
 }
 // One line per host whose copy may be stale: offline, Outlook unreachable, or a
 // week the hub has not read yet (it queued a sync when asked: `pending`).
@@ -672,7 +678,9 @@ function detailHtml(ev, now, hasPanel = false) {
   row("When", whenText(ev));
   if (moved) row("Moved", `from ${fmtWhenLong(orig)}`);
   if (tenir && ev.moved === true) row("Moved", "its Outlook event moved to another time");
-  row("Org", orgLabel(ev.org));
+  const hrow = !tenir && lastGot && lastGot.hostRows ? lastGot.hostRows.get(ev.host) : null;
+  if (hrow && typeof ev.id === "string" && ev.id) rows.push(seriesOrgHtml(ev, hrow));
+  else row("Org", orgLabel(ev.org));
   if (ev.recurring === true) row("Repeats", "Part of a recurring series");
   row("Where", ev.location ? String(ev.location) : "");
   const org = ev.organizer ? String(ev.organizer) : "";
@@ -723,6 +731,91 @@ function detailHtml(ev, now, hasPanel = false) {
     + (caps.length ? caps.map((c) => captureLinkHtml(ev, c)).join("") : "")
     + (!tenir && !caps.length && ev.startMs < now ? `<p class="cal-dnote">Tenir captured nothing for this event.</p>` : "");
 }
+// The event's org, and the operator's per-series pick of it (XERK-2929): "Automatic"
+// leaves it to the domain rules / host default / host org; "No org" pins it to none.
+function seriesOrgHtml(ev, hrow) {
+  const k = String(ev.host);
+  const pinned = typeof ev.seriesOrg === "string";
+  // Values are "auto" or "=" + the org ("=" alone = No org): no org key can collide.
+  const cur = pinned ? `=${ev.seriesOrg}` : "auto";
+  const orgs = hrow.orgs.filter((o) => typeof o === "string" && o);
+  const opt = (v, label) => `<option value="${esc(v)}"${v === cur ? " selected" : ""}>${esc(label)}</option>`;
+  // aria-disabled, never disabled: a disabled control drops focus to <body> (turma-meetings.md).
+  const dis = setBusy.has(k) ? ' aria-disabled="true"' : "";
+  const what = ev.recurring === true ? "every meeting in this series" : "this event";
+  return `<div class="cal-drow"><span class="k">Org</span><span class="v">`
+    + `<select data-series-org="${esc(evDomKey(ev))}" aria-label="Org for ${esc(what)}"${dis}>`
+    + opt("auto", pinned ? "Automatic" : `Automatic (${orgLabel(ev.org)})`)
+    + orgs.map((o) => opt(`=${o}`, orgLabel(o))).join("") + opt("=", "No org") + `</select>`
+    + (ev.recurring === true ? ` <span class="cal-dnote">for the whole series</span>` : "")
+    + (setErr.has(k) ? `<span class="mt-err">${esc(setErr.get(k))}</span>` : "")
+    + `</span></div>`;
+}
+// Each host's calendar settings (XERK-2929): the org its unmatched meetings take,
+// and whether its private events are shown.
+function hostSettingsHtml(rows) {
+  const list = [...rows.values()].sort((a, b) => String(a.device || a.host).localeCompare(String(b.device || b.host)));
+  if (!list.length) return `<div class="cal-hostset"><p class="cal-dnote">No host has synced a calendar yet.</p></div>`;
+  return `<div class="cal-hostset" role="group" aria-label="Calendar settings">`
+    + `<p class="cal-dnote">A meeting no email-domain rule (Meetings settings) claims takes its host's default org.</p>`
+    + list.map((h) => {
+      const k = String(h.host);
+      const name = String(h.device || h.host);
+      const dis = setBusy.has(k) ? ' aria-disabled="true"' : "";
+      const own = typeof h.org === "string" && h.org ? `Its own org (${orgLabel(h.org)})` : "No org";
+      const opts = `<option value=""${h.defaultOrg ? "" : " selected"}>${esc(own)}</option>`
+        + h.orgs.filter((o) => typeof o === "string" && o)
+          .map((o) => `<option value="${esc(o)}"${o === h.defaultOrg ? " selected" : ""}>${esc(orgLabel(o))}</option>`).join("");
+      return `<div class="cal-hostrow"><b>${esc(name)}</b>`
+        + `<label>Default org <select data-host-default="${esc(k)}"${dis}>${opts}</select></label>`
+        + `<label><input type="checkbox" data-host-private="${esc(k)}"${h.showPrivate === true ? " checked" : ""}${dis}> Show private events</label>`
+        + (setErr.has(k) ? `<span class="mt-err">${esc(setErr.get(k))}</span>` : "")
+        + `</div>`;
+    }).join("") + `</div>`;
+}
+// POST /api/agents/<host>/calendar/settings; the hub's `calendar` frame re-reads too.
+// A series pick is applied to the read events first (undone on a refusal): the save's
+// repaints are forced into a FOCUSED select, and the refetch's paint is held while it
+// keeps focus, so without this the select showed the previous pick (QA XERK-2929).
+function pinSeries(host, s) {
+  const undo = [];
+  for (const w of weeks.values()) {
+    for (const ev of (w.cal && Array.isArray(w.cal.events) ? w.cal.events : [])) {
+      if (!ev || ev.host !== host || ev.source === "tenir" || (ev.seriesId || ev.id) !== s.id) continue;
+      undo.push([ev, Object.prototype.hasOwnProperty.call(ev, "seriesOrg"), ev.seriesOrg]);
+      if (s.org === null) delete ev.seriesOrg; else ev.seriesOrg = s.org;
+    }
+  }
+  // Reversed: one event object held by two week entries is recorded twice.
+  return () => { for (const [ev, had, v] of undo.reverse()) { if (had) ev.seriesOrg = v; else delete ev.seriesOrg; } };
+}
+async function saveHost(host, body) {
+  if (setBusy.has(host)) return;
+  setBusy.add(host);
+  setErr.delete(host);
+  const undo = body.series ? pinSeries(host, body.series) : null;
+  paint(true);
+  paintDetail(true);
+  let res = null, out = {};
+  try {
+    res = await fetch(`/api/agents/${encodeURIComponent(host)}/calendar/settings`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    try { out = await res.json(); } catch { out = {}; }
+  } catch { res = null; }
+  setBusy.delete(host);
+  const T = typeof TurmaNav !== "undefined" ? TurmaNav : null;
+  const what = body.series ? "Setting the meeting's org" : "Saving the calendar settings";
+  if (res && res.status === 401) { location.href = "/login"; return; }
+  if (!res || !res.ok) {
+    const text = res ? (T && T.refusalText ? T.refusalText(what, res.status, out)
+      : `${what} failed — ${(out && out.error) || `the hub answered HTTP ${res.status}`}`) : `${what} failed — the hub is unreachable`;
+    setErr.set(host, text);
+    if (T && T.toast) T.toast(text);
+    if (undo) undo();
+  } else refetch();
+  paint(true);
+  paintDetail(true);
+}
 // What meetings.js shows below the details: the linked captures of ONE org (the
 // first's), and a daily meeting's brief when the event is that org's daily meeting.
 function panelSpec(ev) {
@@ -745,7 +838,7 @@ function headerHtml(days) {
     + (picker !== null ? pickerHtml(days, nowFn()) : "") + `</span>`
     + `<span class="sp"></span><span class="cal-modes" role="group" aria-label="View">`
     + opts.map(([k, l]) => `<button type="button" class="tri-chip${k === m ? " on" : ""}" data-mode="${k}" aria-pressed="${k === m}">${l}</button>`).join("")
-    + `</span></div>`;
+    + `</span><button type="button" class="cal-ic" data-host-settings aria-expanded="${hostSetOpen}" aria-label="Calendar settings" title="Calendar settings">⚙</button></div>`;
 }
 function calendarHtml() {
   const now = nowFn();
@@ -806,6 +899,7 @@ function calendarHtml() {
   }).join("");
   const label = `Calendar, ${rangeLabel(days)}`;
   return headerHtml(days)
+    + (hostSetOpen ? hostSettingsHtml(got.hostRows) : "")
     + (notes.length ? `<div class="cal-notes" aria-live="polite">${notes.join("")}</div>` : "")
     + `<div class="cal-grid" role="region" aria-label="${esc(label)}">`
     + `<div class="cal-row cal-heads" style="${cols}"><div></div>${heads}</div>`
@@ -821,7 +915,8 @@ function focusSig() {
   const d = a.dataset || {};
   if (d.ev !== undefined) { const ev = shown[Number(d.ev)]; return ev ? { ev: `${ev.host}\u0000${ev.id}`, day: d.day } : null; }
   for (const k of ["step", "mode", "pick", "pmonth"]) if (d[k] !== undefined) return { sel: `[data-${k}="${d[k]}"]` };
-  for (const k of ["calToday", "openPicker", "closeDetail"]) if (d[k] !== undefined) return { sel: `[data-${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}]` };
+  for (const k of ["hostDefault", "hostPrivate"]) if (d[k] !== undefined) return { attr: k, v: d[k] };
+  for (const k of ["calToday", "openPicker", "closeDetail", "hostSettings"]) if (d[k] !== undefined) return { sel: `[data-${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}]` };
   return null;
 }
 function restoreFocusSig(sig) {
@@ -830,6 +925,8 @@ function restoreFocusSig(sig) {
   if (sig.ev) {
     const i = shown.findIndex((e) => `${e.host}\u0000${e.id}` === sig.ev);
     if (i >= 0) el = $root.querySelector(`[data-ev="${i}"][data-day="${sig.day}"]`) || $root.querySelector(`[data-ev="${i}"]`);
+  } else if (sig.attr) {
+    el = [...$root.querySelectorAll("select,input")].find((x) => x.dataset && x.dataset[sig.attr] === sig.v) || null;
   } else el = $root.querySelector(sig.sel);
   if (el && el.focus) el.focus({ preventScroll: true });
 }
@@ -857,6 +954,10 @@ function paint(force = false) {
 // meetings.js paints the capture part into `$mt` itself, with its own hold.
 const fieldFocused = (el) => {
   const a = typeof document !== "undefined" ? document.activeElement : null;
+  // The series Org select saves on change and holds no draft: holding its repaint left
+  // it showing a stale read (a frame landing mid-save) until blur (QA XERK-2929).
+  // paintDetail puts focus back on it by its data key.
+  if (a && a.dataset && a.dataset.seriesOrg !== undefined) return false;
   return !!a && !!el && !!el.contains && el.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || "");
 };
 let lastDetail = "";
@@ -882,7 +983,7 @@ function paintDetail(force = false) {
   lastDetail = html;
   const a = typeof document !== "undefined" ? document.activeElement : null;
   const ds = a && $info.contains && $info.contains(a) && a.dataset ? a.dataset : null;
-  const k = ds && ["linkPick", "linkGo", "linkUnlink", "linkAuto", "bodyToggle", "closeDetail"].find((x) => ds[x] !== undefined);
+  const k = ds && ["linkPick", "linkGo", "linkUnlink", "linkAuto", "bodyToggle", "closeDetail", "seriesOrg"].find((x) => ds[x] !== undefined);
   $info.innerHTML = html;
   if (k && $info.querySelectorAll) {
     const el = [...$info.querySelectorAll("button,select")].find((x) => x.dataset && x.dataset[k] === ds[k]);
@@ -1021,7 +1122,21 @@ function mount(el, opts = {}) {
   }
   $root.addEventListener("change", (ev) => {
     const t = ev.target, d = t && t.dataset;
-    if (!d || d.linkPick === undefined) return;
+    if (!d) return;
+    const host = d.hostDefault ?? d.hostPrivate;
+    // A change while that host's save is in flight is put back by the repaint.
+    if ((host !== undefined && setBusy.has(host)) || (t.getAttribute && t.getAttribute("aria-disabled") === "true")) {
+      return void (paint(true), paintDetail(true));
+    }
+    if (d.hostDefault !== undefined) return void saveHost(d.hostDefault, { defaultOrg: t.value || null });
+    if (d.hostPrivate !== undefined) return void saveHost(d.hostPrivate, { showPrivate: !!t.checked });
+    if (d.seriesOrg !== undefined) {
+      const e = ((lastGot && lastGot.events) || []).find((x) => evDomKey(x) === d.seriesOrg);
+      if (!e) return;
+      const id = typeof e.seriesId === "string" && e.seriesId ? e.seriesId : e.id;
+      return void saveHost(String(e.host), { series: { id, org: t.value === "auto" ? null : String(t.value).replace(/^=/, "") } });
+    }
+    if (d.linkPick === undefined) return;
     if (t.value) linkPick.set(d.linkPick, t.value); else linkPick.delete(d.linkPick);
     paintDetail(true);
   });
@@ -1031,7 +1146,7 @@ function mount(el, opts = {}) {
   $root.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest
       ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail],"
-        + "[data-open-notes],[data-body-toggle],[data-link-go],[data-link-unlink],[data-link-auto]") : null;
+        + "[data-open-notes],[data-body-toggle],[data-link-go],[data-link-unlink],[data-link-auto],[data-host-settings]") : null;
     if (!b) {
       if (picker !== null && !(ev.target && ev.target.closest && ev.target.closest(".cal-picker"))) { picker = null; paint(true); }
       return;
@@ -1043,6 +1158,7 @@ function mount(el, opts = {}) {
       return;
     }
     if (d.closeDetail !== undefined) return void closeDetail();
+    if (d.hostSettings !== undefined) { hostSetOpen = !hostSetOpen; return void paint(true); }
     if (d.openNotes !== undefined) {
       const t = notesTarget(detail, nowFn());
       if (t && openNotes) openNotes(t);
@@ -1110,7 +1226,7 @@ const api = {
   dayStart, addDays, weekStart, dayKey, parseDayKey, visibleDays, stepAnchor, weeksOf, rangeLabel,
   wallMinutes, fmtSpan, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
   calendarHtml, safeHttps, isUpcomingMeeting, notesTarget, UPCOMING_MS,
-  detailHtml, panelSpec, badgeOf, fmtLongSpan, originalStart, relink, evDomKey,
+  detailHtml, panelSpec, badgeOf, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost,
   _state: () => ({ anchor, mode: mode(), weeks, detail, picker }),
   _els: () => ({ grid: $grid, side: $side, info: $info, mt: $mt }),
   _go: go,

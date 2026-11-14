@@ -9,6 +9,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -541,4 +543,28 @@ internal fun backgroundRowsLabel(rows: List<com.xerktech.turma.model.LiveAgent>)
     val shells = rows.count { it.type == "shell" }
     val noun = if (shells == 0) "agent" else if (shells == rows.size) "shell" else "task"
     return "${rows.size} background $noun" + if (rows.size == 1) "" else "s"
+}
+
+/** A checkbox and its label, the whole row toggling (like the web's `<label>`). */
+@Composable
+internal fun CheckRow(
+    text: String,
+    checked: Boolean,
+    onChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    bold: Boolean = false,
+) {
+    Row(
+        modifier.fillMaxWidth().toggleable(
+            value = checked, enabled = enabled, role = androidx.compose.ui.semantics.Role.Checkbox, onValueChange = onChange,
+        ),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        androidx.compose.material3.Checkbox(checked = checked, onCheckedChange = null, enabled = enabled)
+        Text(
+            text, style = MaterialTheme.typography.bodyMedium,
+            fontWeight = if (bold) androidx.compose.ui.text.font.FontWeight.SemiBold else null,
+        )
+    }
 }

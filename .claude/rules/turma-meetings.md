@@ -104,6 +104,9 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 - Drafts live in `edits`; **a repaint waits while a field has focus or a pointer is down**, the
   press released on pointerup/pointercancel/contextmenu and the WINDOW's blur only (never a
   capture blur). The search's own paint is forced and gives focus + caret back.
+- **A control that saves on change and holds no draft is exempt from the focus hold** (the
+  day-off boxes, the calendar's series Org select, XERK-2929): held, it showed a stale read until
+  blur. Its busy state is `aria-disabled` too, and focus is restored by its data key.
 - Buttons go `aria-disabled` while busy, never `disabled`; `busy` / `archBusy` / `labelBusy` /
   `focusBusy` are the guard. Busy from the first await (XERK-2511: a Reject must not overtake an
   Approve that is still loading its types).

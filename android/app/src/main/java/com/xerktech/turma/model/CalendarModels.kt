@@ -72,6 +72,8 @@ data class CalendarEvent(
     val meetings: List<CalendarCapture> = emptyList(),
     // The org the hub's capture matcher counts it for (XERK-2898); null = an older hub.
     val matchOrg: String? = null,
+    // The operator's per-series org pick (XERK-2929): null = automatic, "" = pinned to No org.
+    val seriesOrg: String? = null,
     // A Tenir-only entry's own fields (XERK-2896).
     val site: String = "",
     val meetingId: String = "",
@@ -105,6 +107,13 @@ data class CalendarHost(
     val lastError: String = "",
     val lastErrorAt: Long = 0,
     val pending: Boolean = false,
+    // Its calendar settings and the orgs they may name (XERK-2929): [org] the
+    // host's decided org, [orgs] null on an older hub (no settings shown),
+    // [defaultOrg] "" = none.
+    val org: String = "",
+    val orgs: List<String>? = null,
+    val defaultOrg: String = "",
+    val showPrivate: Boolean = false,
 )
 
 /** `GET /api/calendar` (contract-calendar.md "Served"). */
@@ -190,7 +199,8 @@ internal fun cleanCalendarText(s: String): String = if (CALENDAR_CONTROL.contain
 // Keys that IDENTIFY a row and are sent back to the hub or matched against its ids:
 // never cleaned, or an id the hub accepts (CAL_ID_RE allows zero-width marks) would
 // round-trip as one it doesn't have (QA).
-private val CALENDAR_ID_KEYS = setOf("host", "id", "seriesId", "org", "matchOrg", "site", "meetingId", "calendarEventId")
+private val CALENDAR_ID_KEYS = setOf("host", "id", "seriesId", "org", "matchOrg", "site", "meetingId", "calendarEventId",
+    "orgs", "defaultOrg", "seriesOrg")
 
 /** Every display string in [e] (values only, id keys kept as sent) through [cleanCalendarText]. */
 internal fun cleanCalendarJson(e: JsonElement): JsonElement = when (e) {

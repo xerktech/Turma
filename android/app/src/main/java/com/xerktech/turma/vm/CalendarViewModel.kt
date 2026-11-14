@@ -314,6 +314,49 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private val _setBusy = MutableStateFlow<Set<String>>(emptySet())
+
+    /** Host keys with a calendar-settings POST in flight (XERK-2929). */
+    val setBusy: StateFlow<Set<String>> = _setBusy
+
+    private val _setErr = MutableStateFlow<Map<String, String>>(emptyMap())
+
+    /** The hub's refusal per host, shown by its settings row and the event's Org picker. */
+    val setErr: StateFlow<Map<String, String>> = _setErr
+
+    /**
+     * A host's calendar settings (`POST /api/agents/<host>/calendar/settings`,
+     * XERK-2929): `{defaultOrg: site | null}`, `{showPrivate}` or `{series: {id,
+     * org: site | "" | null}}`. A save that held re-reads the shown weeks.
+     */
+    fun saveHost(host: String, body: JsonObject): Job? {
+        if (host in _setBusy.value) return null
+        _setBusy.update { it + host }
+        _setErr.update { it - host }
+        val what = if ("series" in body) "Setting the meeting's org" else "Saving the calendar settings"
+        return viewModelScope.launch {
+            val err = try {
+                val r = container.client.api.setCalendarHostSettings(host, body)
+                val ok = (r.body()?.get("ok") as? kotlinx.serialization.json.JsonPrimitive)?.content == "true"
+                when {
+                    !r.isSuccessful -> "$what failed — ${hubErrorMessage(r)}"
+                    !ok -> "$what failed — the hub refused it"
+                    else -> null
+                }
+            } catch (e: CancellationException) {
+                _setBusy.update { it - host }
+                throw e
+            } catch (_: Exception) {
+                "$what failed — the hub is unreachable"
+            }
+            _setBusy.update { it - host }
+            if (err != null) {
+                _setErr.update { it + (host to err) }
+                _messages.tryEmit("✗ $err")
+            } else refetch()
+        }
+    }
+
     /** Today on this phone's clock (tests pin it). */
     fun today(): LocalDate = calDay(nowFn(), zone)
 

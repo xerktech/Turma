@@ -748,8 +748,13 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     the date picker is Material's, not the web's mini-month.
   - On for every org, no feature flag (XERK-2901). A host going offline or back re-reads the
     open week on both clients (the hub's `calendar` frame), so the stale-host notice is live.
-  - Not on either client yet: the calendar settings (holiday days off, org domain rules, a
-    host's default org / show private / per-series org) — XERK-2929, web and Android together.
+- **Calendar settings (XERK-2929)**: an org's ⚙ settings edit its days off (a tick per catalog
+  country and per holiday, each saved at once) and its calendar email domains; the calendar's ⚙
+  lists each host's Default org + Show private events; an Outlook event's Org row picks the
+  series' org (Automatic / an org / No org). `holidaySettings`, `holidayCatalog` and
+  `calendarOrgRules` decode per entry.
+  - Platform difference: a refused save toasts (and the calendar's rows show it inline); the
+    settings panel's refusal is the toast alone, as its other sections (one failure surface).
 
 ## Open (subsequent installments), by screen and priority
 

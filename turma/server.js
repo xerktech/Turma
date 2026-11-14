@@ -6169,7 +6169,8 @@ function calendarOrgsOfTenant(t) {
 function calDomainOf(email) {
   return email ? email.slice(email.lastIndexOf("@") + 1) : "";
 }
-function calendarEventOrg(ev, orgs, hs) {
+// `key` (the event's host) adds step 4: the host's own decided org (XERK-2929).
+function calendarEventOrg(ev, orgs, hs, key = "") {
   const so = hs && hs.seriesOrgs;
   const sid = ev.seriesId || ev.id;
   if (so && Object.hasOwn(so, sid) && (so[sid] === "" || orgs.includes(so[sid]))) return so[sid];
@@ -6182,10 +6183,15 @@ function calendarEventOrg(ev, orgs, hs) {
   for (const p of ev.attendees) for (const s of match(calDomainOf(p.email))) hits.add(s);
   if (hits.size === 1) return [...hits][0];
   if (hs && hs.defaultOrg && orgs.includes(hs.defaultOrg)) return hs.defaultOrg;
-  return "";
+  const own = key && agents[key] ? decidedOrgOf(agents[key]) : "";
+  return own && orgs.includes(own) ? own : "";
 }
 function calendarEventWire(key, ev, orgs, hs) {
-  const out = { host: key, org: calendarEventOrg(ev, orgs, hs), ...ev };
+  const out = { host: key, org: calendarEventOrg(ev, orgs, hs, key), ...ev };
+  // The operator's per-series pick, so the event panel shows it (XERK-2929).
+  const so = hs && hs.seriesOrgs, sid = ev.seriesId || ev.id;
+  // Only a pin that still counts (calendarEventOrg skips one naming an org no host is in).
+  if (so && Object.hasOwn(so, sid) && (so[sid] === "" || orgs.includes(so[sid]))) out.seriesOrg = so[sid];
   if ((ev.sensitivity === "private" || ev.sensitivity === "confidential") && !(hs && hs.showPrivate)) {
     Object.assign(out, { subject: "Private event", body: "", location: "", organizer: "",
       organizerEmail: "", attendees: [], joinUrl: "", categories: [], private: true });
@@ -6209,6 +6215,10 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       syncedAt: h ? h.syncedAt : 0, windowFrom: h ? h.windowFrom : 0, windowUntil: h ? h.windowUntil : 0,
       ranges: h ? h.ranges : [] };
     if (h && h.lastError) Object.assign(row, { lastError: h.lastError, lastErrorAt: h.lastErrorAt });
+    // Its settings and the orgs they may name, for the settings UI (XERK-2929).
+    const hs0 = calendarHostSettings[key];
+    Object.assign(row, { org: a ? decidedOrgOf(a) : "", orgs: calendarOrgsOfTenant(tenantOfKey(key)).sort(),
+      defaultOrg: (hs0 && hs0.defaultOrg) || "", showPrivate: !!(hs0 && hs0.showPrivate) });
     const covered = h && h.ranges.some((r) => r[0] <= from && r[1] >= until);
     if (!covered && row.online && calendarCapable(a)) {
       const queued = (a.commands || []).find((c) => c && c.type === "syncCalendar" && c.from <= from && c.until >= until);
@@ -6231,7 +6241,7 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       w.meetings = tenir.links.get(lk) || [];
       // The org the capture matcher counts it for (XERK-2898): an unassigned event's
       // host org, "" when a series override pins it to none. Clients relink by it.
-      w.matchOrg = w.org || calendarMatchOrg(key, ev, orgs, hs);
+      w.matchOrg = w.org;
       tenir.linked.delete(lk);   // served: its captures ride on it
       events.push({ source: "outlook", ...w });
     }
@@ -6276,6 +6286,8 @@ function setCalendarOrgRules(siteKey, body) {
   if (d.length) calendarOrgRules[siteKey] = { domains: d };
   else delete calendarOrgRules[siteKey];
   persistCalendarOrgRules();
+  invalidateAgentsCache();
+  sseBroadcast("calendarOrgRules", calendarOrgRules);
   for (const k of Object.keys(calendarEvents)) if (tenantOfKey(k) === tenantOfSite(siteKey)) broadcastCalendarSoon(k);
   scheduleCalendarRelink(tenantOfSite(siteKey));
   return { status: 200, body: { ok: true, rules: d.length ? { domains: d } : null } };
@@ -6351,14 +6363,10 @@ const CAL_NOT_MEETING_BUSY = new Set(["free", "outOfOffice", "workingElsewhere"]
 const CAL_PLATFORM_HOSTS = [["teams", /(^|\.)teams\.(microsoft|live)\.com$/], ["zoom", /(^|\.)zoom(gov)?\.us$/],
   ["meet", /(^|\.)meet\.google\.com$/], ["webex", /(^|\.)webex\.com$/]];
 
-// The org an event counts for when matching: its assigned org, else (unassigned,
-// and not PINNED unassigned by a series override) its host's decided org.
+// The org an event counts for when matching: its served org, which ends at its
+// host's decided org (XERK-2929) unless a series override pins it to none.
 function calendarMatchOrg(key, ev, orgs, hs) {
-  const org = calendarEventOrg(ev, orgs, hs);
-  if (org) return org;
-  const so = hs && hs.seriesOrgs;
-  if (so && Object.hasOwn(so, ev.seriesId || ev.id)) return "";
-  return agents[key] ? decidedOrgOf(agents[key]) : "";
+  return calendarEventOrg(ev, orgs, hs, key);
 }
 // id -> {key, ev, syncedAt} for tenant `t`'s stored events: what a link resolves
 // against. Cheap (no org decision), so the wire and the view build it freely. An
@@ -10300,6 +10308,8 @@ function buildAgentsCache() {
     // meetings settings list as checkboxes: country -> {name, holidays:[{id, name}]}.
     holidaySettings: holidaySettingsWire(),
     holidayCatalog: holidays.catalogWire(),
+    // Each org's calendar email-domain rules (XERK-2929): siteKey -> {domains}.
+    calendarOrgRules,
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.

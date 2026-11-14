@@ -3,6 +3,7 @@ package com.xerktech.turma.core
 import com.xerktech.turma.model.CalendarAnswer
 import com.xerktech.turma.model.CalendarCapture
 import com.xerktech.turma.model.CalendarEvent
+import com.xerktech.turma.model.CalendarHost
 import com.xerktech.turma.model.Holiday
 import com.xerktech.turma.model.Meeting
 import java.time.DayOfWeek
@@ -563,6 +564,8 @@ data class CalRange(
     val err: String = "",
     val truncated: Boolean = false,
     val have: Boolean = false,
+    // Each host's settings row (one that carries `orgs`, XERK-2929), by host key.
+    val hostRows: Map<String, CalendarHost> = emptyMap(),
 )
 
 /**
@@ -573,6 +576,7 @@ fun calCollect(days: List<LocalDate>, zone: ZoneId, weekOf: (LocalDate) -> CalWe
     val evs = LinkedHashMap<String, CalendarEvent>()
     val hol = LinkedHashMap<String, Holiday>()
     val hosts = LinkedHashMap<String, HostNotice>()
+    val hostRows = LinkedHashMap<String, CalendarHost>()
     var loading = false
     var err = ""
     var truncated = false
@@ -589,8 +593,9 @@ fun calCollect(days: List<LocalDate>, zone: ZoneId, weekOf: (LocalDate) -> CalWe
         for (n in calHostNotices(cal, from, calDayStartMs(ws.plusDays(7), zone))) {
             if (n.host !in hosts || n.syncing) hosts[n.host] = n
         }
+        for (h in cal.hosts) if (h.host.isNotEmpty() && h.orgs != null) hostRows[h.host] = h
         for (h in w.hol.orEmpty()) if (h.date.isNotEmpty()) hol["${h.date}\u0000${h.id}"] = h
     }
     val list = evs.values.sortedWith(compareBy<CalendarEvent> { it.startMs }.thenBy { it.endMs })
-    return CalRange(list, hol.values.toList(), hosts.values.toList(), loading, err, truncated, have)
+    return CalRange(list, hol.values.toList(), hosts.values.toList(), loading, err, truncated, have, hostRows)
 }

@@ -897,7 +897,8 @@ private val WEEKDAY_LETTERS = listOf("S", "M", "T", "W", "T", "F", "S")
 /**
  * One org's settings (the web's ⚙ drawer): where new tickets go, whose work
  * the meetings propose, the Tenir label, and the daily brief schedule with
- * the daily-meeting title keyword. Each section saves on its own.
+ * the daily-meeting title keyword, and (decided orgs) the days off and calendar
+ * email domains (XERK-2929). Each section saves on its own.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -1005,6 +1006,62 @@ private fun OrgSettings(
 
             ScheduleSection(site, fleet.dailyBriefSchedules[site], now, k("schedule") in saving,
                 k("schedule") in saved, storedMap[k("schedule")], { mvm.clearSaved(site, "schedule") }) { mvm.saveSchedule(site, it) }
+
+            // Days off + calendar email domains (XERK-2929): decided orgs only (the hub lists them).
+            val hol = fleet.holidaySettings[site]
+            if (hol != null) {
+                SectionLabel("Days off")
+                Text(
+                    "Ticked holidays are shaded as days off on the Meetings calendar.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                val holBusy = k("holidays") in saving
+                // Each tick saves at once, sending the whole list (the web's `flip`).
+                fun flip(list: List<String>, x: String, on: Boolean) =
+                    if (on) (list + x).distinct() else list.filter { it != x }
+                fun send(field: String, list: List<String>) = mvm.saveHolidays(site, buildJsonObject {
+                    putJsonArray(field) { list.forEach { add(JsonPrimitive(it)) } }
+                })
+                for ((code, c) in fleet.holidayCatalog.toSortedMap()) {
+                    val on = code in hol.countries
+                    val name = c.name.ifEmpty { code }
+                    CheckRow("$name holidays", on, { send("countries", flip(hol.countries, code, it)) },
+                        Modifier.testTag("hol-country-$code"), enabled = !holBusy, bold = true)
+                    if (!on) continue
+                    for (x in c.holidays) {
+                        CheckRow(x.name, x.id in hol.off, { send("off", flip(hol.off, x.id, it)) },
+                            Modifier.padding(start = 24.dp).testTag("hol-off-${x.id}"), enabled = !holBusy)
+                    }
+                }
+
+                SectionLabel("Calendar email domains")
+                Text(
+                    "A meeting organized by (else, with invitees from only) these domains is this org's on every " +
+                        "Outlook calendar. Empty clears.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                val domD = rememberDraft(site, fleet.calendarOrgRules[site]?.domains.orEmpty().joinToString(", "))
+                var dom by domD
+                // The hub's answer {rules: {domains} | null} is what it stored.
+                LaunchedEffect(stored[k("domains")]?.seq) {
+                    val ans = stored[k("domains")] ?: return@LaunchedEffect
+                    val v = when (val r = ans.body["rules"]) {
+                        is JsonNull -> ""
+                        is JsonObject -> (r["domains"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.content }
+                            ?.joinToString(", ")
+                        else -> null
+                    }
+                    if (!domD.stored(v, ans.seq)) mvm.clearSaved(site, "domains")
+                }
+                OutlinedTextField(
+                    dom, { dom = it.take(2000); mvm.clearSaved(site, "domains") }, Modifier.fillMaxWidth().testTag("cal-domains"),
+                    label = { Text("Email domains, e.g. acme.com, acme.co.uk") }, singleLine = true,
+                )
+                SaveRow("domains", k("domains") in saving, k("domains") in saved) {
+                    domD.send(stored[k("domains")]?.seq ?: 0)
+                    mvm.saveDomains(site, dom)
+                }
+            }
             Spacer(Modifier.height(16.dp))
         }
     }

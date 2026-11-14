@@ -906,3 +906,71 @@ test("XERK-2897: with the stream down the calendar polls every 60s; up, it does 
   polls();
   assert.equal(P.calendarRefetches(), 1);
 });
+
+test("XERK-2929: the drawer sets the org's days off and calendar email domains", async () => {
+  const P = loadPage((url, init) => {
+    if (url.endsWith("/holidays")) {
+      const b = JSON.parse(init.body);
+      return { ok: true, settings: { countries: b.countries || ["US"], off: b.off || [] } };
+    }
+    if (url.endsWith("/calendar-rules")) {
+      const b = JSON.parse(init.body);
+      return b.domains.includes("bad") ? { status: 400, body: { error: "domains must be <email> domains" } }
+        : { ok: true, rules: b.domains.length ? { domains: b.domains } : null };
+    }
+    return { ok: true };
+  });
+  const d = data({ holidaySettings: { [SITE]: { countries: ["US"], off: ["us-july4"] } },
+    holidayCatalog: { US: { name: "United States", holidays: [{ id: "us-july4", name: "Independence Day" },
+      { id: "us-thanksgiving", name: "Thanksgiving <Day>" }] } },
+    calendarOrgRules: { [SITE]: { domains: ["acme.com"] } } });
+  P.setCache(d);
+  P.openDrawer(SITE);
+  P.renderBriefs(d, NOW);
+  let h = P.list();
+  assert.match(h, /Days off/);
+  assert.match(h, /data-hol-off="us-july4" data-hol-site="acme\.atlassian\.net" checked> Independence Day/);
+  assert.match(h, /data-hol-off="us-thanksgiving" data-hol-site="acme\.atlassian\.net"> Thanksgiving &lt;Day&gt;/, "escaped, unticked");
+  assert.match(h, /data-cal-domains="acme\.atlassian\.net" value="acme\.com"/);
+  const change = (ds, checked) => { for (const fn of P.els.meetingList.listeners.change) fn({ target: { dataset: ds, checked } }); };
+  const click = (ds) => { for (const fn of P.els.meetingList.listeners.click) fn({ target: { closest: () => ({ dataset: ds, getAttribute: () => null }) } }); };
+  const input = (ds, value) => { for (const fn of P.els.meetingList.listeners.input) fn({ target: { dataset: ds, value } }); };
+  // Ticking a day off PUTs the whole list; the answer is what the drawer shows.
+  change({ holOff: "us-thanksgiving", holSite: SITE }, true);
+  await P.settle();
+  assert.deepEqual(P.fetches.filter((f) => f.method === "PUT").map((f) => [f.url, f.body]),
+    [[`/api/orgs/${SITE}/holidays`, { off: ["us-july4", "us-thanksgiving"] }]]);
+  assert.match(P.list(), /data-hol-off="us-thanksgiving" data-hol-site="acme\.atlassian\.net" checked>/);
+  // Unticking the country hides its days.
+  change({ holCountry: "US", holSite: SITE }, false);
+  await P.settle();
+  assert.deepEqual(P.fetches.filter((f) => f.method === "PUT").at(-1).body, { countries: [] });
+  assert.doesNotMatch(P.list(), /data-hol-off=/);
+  // Domains: typed, normalised (case, @, separators), saved; a refusal keeps the draft.
+  input({ calDomains: SITE }, "@Acme.com, bad");
+  click({ calDomainsSave: SITE });
+  await P.settle();
+  assert.deepEqual(P.fetches.filter((f) => f.url.endsWith("/calendar-rules")).map((f) => f.body), [{ domains: ["acme.com", "bad"] }]);
+  h = P.list();
+  assert.match(h, /value="@Acme\.com, bad"/);
+  assert.match(h, /Saving the email domains failed — domains must be &lt;email&gt; domains/);
+  input({ calDomains: SITE }, "acme.com  ACME.co.uk");
+  click({ calDomainsSave: SITE });
+  await P.settle();
+  assert.deepEqual(P.fetches.filter((f) => f.url.endsWith("/calendar-rules")).at(-1).body, { domains: ["acme.com", "acme.co.uk"] });
+  assert.match(P.list(), /data-cal-domains="acme\.atlassian\.net" value="acme\.com, acme\.co\.uk"/);
+});
+
+test("XERK-2929: a focused day-off box never holds the drawer stale through an SSE frame", async () => {
+  const P = loadPage(() => ({ ok: true }));
+  const d = data({ holidaySettings: { [SITE]: { countries: ["US"], off: [] } },
+    holidayCatalog: { US: { name: "United States", holidays: [{ id: "us-july4", name: "Independence Day" }] } } });
+  P.setCache(d);
+  P.openDrawer(SITE);
+  P.renderBriefs(d, NOW);
+  // After a mouse tick the box keeps focus; another client's save must still show.
+  P.document.activeElement = { tagName: "INPUT", inside: true, dataset: { holOff: "us-july4", holSite: SITE } };
+  P.fire("holidaySettings", { [SITE]: { countries: ["US"], off: ["us-july4"] } });
+  assert.match(P.list(), /data-hol-off="us-july4" data-hol-site="acme\.atlassian\.net" checked>/);
+  assert.doesNotMatch(P.list(), / disabled[ >]/);
+});
