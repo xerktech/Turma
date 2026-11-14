@@ -305,6 +305,8 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   - Change one side, change the other: `WslConfReaderTest` (`test_session_cli.py`) fuzzes both
     for parity. An interop-off host is told so, never sent to the installer that refuses it.
   - `WSLInterop-late` (older WSL 2.x) counts as registered on both sides.
+  - A NUL ends the value (WSL hands ParseBool a C string). The awk keeps only `VMAX` value
+    chars: appending per char is quadratic in mawk. Never drop the cap. Tests: `WslConfReaderTest`.
 - **It only ATTACHES to a running classic Outlook (`GetActiveObject`), never starts one.** A COM
   start launches whichever Outlook is registered for automation — on a PC with an old Office
   beside Microsoft 365, that one — and opens its account-setup wizard (operator, live). The

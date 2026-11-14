@@ -851,6 +851,13 @@ class WslConfReaderTest(unittest.TestCase):
             b"[interop]\nenabled=fal\\\nse \n": True,              # trailing blank after a
             b"[interop]\nenabled=false\\\n   # off\n": True,         # continuation is trimmed
             b"[interop]\nenabled=\\\n\\\nfalse\t\t\n": True,
+            b"[interop]\nenabled=false\x00junk\n": True,             # a NUL ends the C string
+            b"[interop]\nenabled=fal\x00se\n": False,
+            b"[interop]\nenabled=\x00\n": False,                     # empty: no bool
+            b"[interop]\nenabled=false\\\n\x00": True,              # continuation, final NUL
+            b"[interop]\nenabled=falsexxxxxx\n": False,               # past the awk's kept chars
+            b"[interop]\nenabled=false" + b" " * 50 + b"\n": True,
+            b"[interop]\nenabled=0" + b" " * 50 + b"x\n": False,
         }
         for conf, off in cases.items():
             with self.subTest(conf=conf):
@@ -863,7 +870,7 @@ class WslConfReaderTest(unittest.TestCase):
                  "[interop]x", "#[interop]"]
         keys = ["enabled", "Enabled", " enabled ", "en abled", "#enabled", "enabled\t"]
         vals = ["false", "0", "true", "False", '"', "\\", "\\\\", '\\"', "\\n", "\\u", "#",
-                " ", "\t", "x", "\\\n", "\r", "fal", "se"]
+                " ", "\t", "x", "\\\n", "\r", "fal", "se", "\x00"]
         ends = ["\n", "\r\n", "\r", ""]
         seen = set()
         for _ in range(300):
@@ -883,6 +890,14 @@ class WslConfReaderTest(unittest.TestCase):
             self.assertEqual(py, sh, repr(conf))
             seen.add(py)
         self.assertEqual(seen, {True, False})   # the corpus reaches both answers
+
+    def test_a_huge_value_line_stays_fast(self):
+        # Appending char by char made the awk quadratic under mawk (2.8 s at 300 KB).
+        import time
+        t = time.monotonic()
+        self.assertEqual(self.both(b"[interop]\nenabled=" + b"x" * 300_000 + b"\n"),
+                         (False, False))
+        self.assertLess(time.monotonic() - t, 2.0)
 
 
 
