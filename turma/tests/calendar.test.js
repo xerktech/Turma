@@ -827,3 +827,28 @@ test("XERK-2933: a cross-midnight event's button aria-label names the end's date
   assert.equal(labels.length, 2, "one button on each day");
   for (const l of labels) assert.match(l, /Tuesday, November 10, 10:00\s?PM – Wednesday, November 11, 3:00\s?AM/);
 });
+
+test("XERK-2940: a Sunday starts its week — reveal, holiday read and the date picker", async () => {
+  NOW = at(2028, 5, 13, 10);                         // a Saturday, in a week no other test read
+  const asked = [];
+  replies = {
+    "/api/calendar": (url) => { asked.push(url); return { hosts: [], events: [] }; },
+    "/api/holidays": (url) => { asked.push(url); return []; },
+  };
+  cal.setActive(true);
+  assert.equal(cal._state().mode, "work");
+  // A Sunday meeting is drawn in Week, in the week that Sunday starts.
+  cal.reveal({ eventId: "sun", startMs: at(2028, 5, 14, 10) });
+  for (let i = 0; i < 8; i++) await tick();
+  assert.equal(cal._state().mode, "week", "a Sunday reveal shows Week, not Work week");
+  assert.equal(cal.dayKey(cal.visibleDays(cal._state().anchor, "week")[0]), "2028-05-14");
+  // Holidays are read for that Sunday through Saturday, so a Sunday holiday is not dropped.
+  assert.ok(asked.some((u) => u.startsWith("/api/holidays?from=2028-05-14&until=2028-05-20")), asked.join("\n"));
+  // The mini-month opens on a Sunday: May 2028's first cell is Sunday, April 30.
+  for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset: { openPicker: "" } }) } });
+  const first = /data-pick="(\d+)"/.exec(cal.calendarHtml());
+  assert.ok(first, "the picker is open");
+  assert.equal(cal.dayKey(Number(first[1])), "2028-04-30");
+  assert.equal(new Date(Number(first[1])).getDay(), 0);
+  cal.setActive(false);
+});
