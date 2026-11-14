@@ -15025,6 +15025,41 @@ test("XERK-2673: a child that left the board untitled gets its title fetched fro
   assert.equal(epicTitleAsked.get(`${site}\x00C-4`).n, 3);
 });
 
+test("XERK-2673: the title backfill never asks an offline host, never doubles a pending fetch, and keeps a paused run a fixed point", async () => {
+  resetEpicD();
+  resetEpicRuns();
+  epicTitleAsked.clear();
+  const site = "e2673c.atlassian.net";
+  const c1 = { ...dChild("C-1", [], "done"), summary: "One" };
+  const c2 = { ...dChild("C-2", [], "todo"), summary: "Two" };
+  await asBeat("ed2673c", site, { autoStart: false, tickets: [dEpic(), c1, c2] });
+  armEpicRun(site, "E-1");
+  const run = epicRuns[`${site}/E-1`];
+  // A record from before childTitles existed: no key at all, so a new one would land after these.
+  delete run.childTitles;
+  run.paused = true;
+  run.maxConcurrent = 2;
+  await asBeat("ed2673c", site, { autoStart: false, tickets: [dEpic(), c2] });
+  const fetches = () => agents.ed2673c.commands.filter((c) => c.type === "jiraIssue").length;
+  // Offline: nothing queued, no try spent.
+  const seen = agents.ed2673c.lastSeen;
+  agents.ed2673c.lastSeen = 0;
+  agents.ed2673c.commands = [];
+  epicRunTitleBackfillSweep();
+  assert.equal(fetches(), 0);
+  assert.equal(epicTitleAsked.has(`${site}\x00C-1`), false);
+  agents.ed2673c.lastSeen = seen;
+  // A fetch already pending (the ticket panel's) is reused, not doubled.
+  queueCommand("ed2673c", { type: "jiraIssue", issueKey: "C-1" });
+  epicRunTitleBackfillSweep();
+  assert.equal(fetches(), 1);
+  // The answer lands on a paused, capped run: still a coerce fixed point.
+  agents.ed2673c.jiraIssues = { "C-1": { issue: { key: "C-1", summary: "One" }, error: null, fetchedAt: Date.now() } };
+  assert.equal(epicRunTitleBackfillSweep(), true);
+  assert.equal(run.childTitles["C-1"], "One");
+  assert.equal(JSON.stringify(sanitizeEpicRunRecord(run)), JSON.stringify(run));
+});
+
 test("XERK-2673: an aged-off child keeps its title on the run", async () => {
   resetEpicD();
   resetEpicRuns();
