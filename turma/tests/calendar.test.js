@@ -458,6 +458,11 @@ test("XERK-2898: the detail shows Outlook's details — moved, canceled, recurre
   assert.match(h, /<div class="cal-dbody">line one<br>&lt;img src=x onerror=alert\(1\)&gt;<\/div>/);
   click({ closeDetail: "" });
   assert.equal(cal._els().side.hidden, true);
+  // Reopened, the attendee list is collapsed again (XERK-2942).
+  h = await openEvent(at(2027, 3, 10), "Canceled: Plan");
+  assert.match(h, /data-att-toggle aria-expanded="false"/);
+  assert.doesNotMatch(h, /cal-people/);
+  click({ closeDetail: "" });
   // A join link is only ever an https URL.
   assert.doesNotMatch(cal.detailHtml({ host: "h", id: "x", startMs: 1, endMs: 2, joinUrl: "javascript:alert(1)" }, 0), /Join meeting|javascript:/);
   // An occurrence still at its original start says nothing about a move.
