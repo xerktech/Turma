@@ -796,3 +796,38 @@ test("XERK-2933: a cross-midnight event's button aria-label names the end's date
   assert.equal(labels.length, 2, "one button on each day");
   for (const l of labels) assert.match(l, /Tuesday, November 10, 10:00\s?PM – Wednesday, November 11, 3:00\s?AM/);
 });
+
+test("XERK-2934: a timed event of 24h+ keeps its times; a real all-day event still reads 'all day'", () => {
+  const ev = { host: "h", org: "acme", id: "x", subject: "Offsite", startMs: at(2026, 11, 9, 9), endMs: at(2026, 11, 10, 10) };
+  assert.ok(cal.inBand(ev), "still drawn in the all-day band");
+  const when = /Monday, November 9, 9:00\s?AM – Tuesday, November 10, 10:00\s?AM/;
+  assert.match(cal.detailHtml(ev, at(2026, 11, 10)), when);
+  assert.doesNotMatch(cal.detailHtml(ev, at(2026, 11, 10)), /all day/);
+  const allDay = { ...ev, allDay: true, startMs: at(2026, 11, 9), endMs: at(2026, 11, 10) };
+  assert.match(cal.detailHtml(allDay, at(2026, 11, 9)), /Monday, November 9, all day/);
+  // A multi-day all-day event names its last day (end is exclusive midnight).
+  const multi = { ...allDay, endMs: at(2026, 11, 12) };
+  assert.match(cal.detailHtml(multi, at(2026, 11, 9)), /Monday, November 9 – Wednesday, November 11, all day/);
+});
+
+test("XERK-2934: a 24h+ timed event's band button aria-label names both ends", async () => {
+  replies = {
+    "/api/calendar": (url) => (url.includes(`from=${cal.weekStart(at(2026, 11, 11))}`) ? {
+      hosts: [{ host: "h1", device: "box", online: true, syncedAt: NOW, ranges: [[0, 4e12]] }],
+      events: [
+        { host: "h1", id: "long", org: "", subject: "Offsite", startMs: at(2026, 11, 9, 9), endMs: at(2026, 11, 10, 10) },
+        { host: "h1", id: "ad", org: "", subject: "Holiday", allDay: true, startMs: at(2026, 11, 12), endMs: at(2026, 11, 13) },
+      ],
+    } : { events: [], hosts: [] }),
+  };
+  cal.refetch();
+  const html = await show(at(2026, 11, 11));
+  const labels = [...html.matchAll(/aria-label="(Offsite,[^"]*)"/g)].map((m) => m[1]);
+  assert.ok(labels.length >= 1);
+  for (const l of labels) {
+    assert.match(l, /Monday, November 9, 9:00\s?AM – Tuesday, November 10, 10:00\s?AM/);
+    assert.doesNotMatch(l, /all day/);
+  }
+  // A real all-day event's button still reads "all day".
+  assert.match(html, /aria-label="Holiday,[^"]*Thursday, November 12, all day/);
+});
