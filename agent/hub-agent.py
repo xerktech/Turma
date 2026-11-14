@@ -28894,6 +28894,7 @@ class SessionManager:
         self._cal_next_at = time.monotonic() + CALENDAR_SYNC_EVERY_SEC
         self._cal_hashes = {}
         self._cal_last_error = None
+        self._cal_last_error_range = None   # (from, until) the last Outlook error covered
         self._cal_said_off = False
         self.calendar_results = []
         self._cal_sizes = {}             # id(row) -> its JSON bytes, sized off the beat
@@ -44845,6 +44846,31 @@ class SessionManager:
                 rows.append({"windowFrom": error_from, "windowUntil": until_ms,
                              "syncedAt": synced_at, "error": error})
                 log(f"calendar: {error}")
+            # A scheduled pass re-read everything before error_from, so its range
+            # replaces the old one; a hub window read only itself, so the weeks the
+            # old range named outside it are still unproven and stay in the range.
+            prev = self._cal_last_error_range
+            if force and prev and self._cal_last_error is not None:
+                self._cal_last_error_range = (min(prev[0], error_from), max(prev[1], until_ms))
+            else:
+                self._cal_last_error_range = (error_from, until_ms)
+        elif (force and self._cal_last_error is not None and self._cal_last_error_range
+              and not (from_ms <= self._cal_last_error_range[0]
+                       and until_ms >= self._cal_last_error_range[1])):
+            # A hub window that read cleanly but did not cover ALL the weeks the
+            # last pass failed on proves nothing about the weeks it skipped: its
+            # good rows would clear the hub's lastError, so the still-standing
+            # error rides after them. A window that read the range's start shrinks
+            # it to what is still unread.
+            ef, eu = self._cal_last_error_range
+            if from_ms <= ef < until_ms:
+                ef = until_ms
+            self._cal_last_error_range = (ef, eu)
+            rows.append({"windowFrom": ef, "windowUntil": eu, "syncedAt": synced_at,
+                         "error": self._cal_last_error})
+            error = self._cal_last_error
+        else:
+            self._cal_last_error_range = None
         self._cal_last_error = error
         # Error rows LAST: a good row clears the hub's lastError, so an earlier
         # week's error would be wiped by a later week's good row of this pass.

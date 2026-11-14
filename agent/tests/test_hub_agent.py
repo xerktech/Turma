@@ -56574,12 +56574,12 @@ class TestCalendarSync(ManagerMixin, unittest.TestCase):
         self.outlook = {}            # week start -> events; absent = empty week
         self.incomplete = set()
         self.unreadable = {}         # week start -> items Outlook threw on
-        self.fail = None
+        self.outlook_fail = None
 
         def read(windows, **kw):
             self.reads.append(list(windows))
-            if self.fail:
-                raise self.cli.Refused(self.fail)
+            if self.outlook_fail:
+                raise self.cli.Refused(self.outlook_fail)
             return [{"complete": f not in self.incomplete, "unreadable": self.unreadable.get(f, 0),
                      "events": list(self.outlook.get(f, []))} for f, _ in windows]
         p = mock.patch.object(self.cli, "read_calendar_windows", side_effect=read)
@@ -56759,17 +56759,17 @@ class TestCalendarSync(ManagerMixin, unittest.TestCase):
         self.outlook = {M + i * W: [self.ev(i)] for i in range(6)}
         self.sm._run_calendar_sync(M, M + 6 * W, force=False)
         self.rows()
-        self.fail = "classic Outlook is not open: open it and retry (this never starts Outlook itself)"
+        self.outlook_fail = "classic Outlook is not open: open it and retry (this never starts Outlook itself)"
         self.sm._run_calendar_sync(M, M + 6 * W, force=False)
         (row,) = self.rows()
         self.assertEqual((row["windowFrom"], row["windowUntil"]), (M, M + 6 * W))
-        self.assertEqual(row["error"], self.fail)
+        self.assertEqual(row["error"], self.outlook_fail)
         self.assertNotIn("events", row)
         self.sm._run_calendar_sync(M, M + 6 * W, force=False)
         self.assertEqual(self.rows(), [])                   # the same error: not re-sent
         self.sm._run_calendar_sync(M, M + 6 * W, force=True)
         self.assertEqual(len(self.rows()), 1)               # the hub asked: answered
-        self.fail = None
+        self.outlook_fail = None
         self.sm._run_calendar_sync(M, M + 6 * W, force=False)
         (row,) = self.rows()                                # every week again: clears lastError
         self.assertEqual((row["windowFrom"], row["windowUntil"], len(row["events"])), (M, M + 6 * W, 6))
@@ -56807,6 +56807,84 @@ class TestCalendarSync(ManagerMixin, unittest.TestCase):
         for _ in range(2):
             self.sm._run_calendar_sync(M, M + 8 * W, force=False)
             self.assertEqual(["error" in r for r in self.rows()], [False, True])
+
+    def test_a_hub_window_short_of_the_failing_weeks_keeps_the_error(self):
+        """XERK-2907: a clean on-demand read of earlier weeks must not clear the
+        error later weeks still have; one that reaches them may."""
+        W, M = self.WEEK, self.MON
+        self.outlook = {M + i * W: [self.ev(i)] for i in range(8)}
+        real = self.cli.read_calendar_windows.side_effect
+        failing = {"on": True}
+
+        def later_fails(windows, **kw):
+            if failing["on"] and windows[0][0] >= M + 4 * W:
+                self.reads.append(windows)
+                raise self.cli.Refused("Outlook did not answer in 120s")
+            return real(windows, **kw)
+        self.cli.read_calendar_windows.side_effect = later_fails
+        self.sm._run_calendar_sync(M, M + 8 * W, force=False)
+        self.rows()
+        self.sm._run_calendar_sync(M, M + 2 * W, force=True)    # never reaches week 4
+        good, bad = self.rows()
+        self.assertNotIn("error", good)
+        self.assertEqual((bad["windowFrom"], bad["windowUntil"]), (M + 4 * W, M + 8 * W))
+        self.assertIn("did not answer", bad["error"])
+        self.assertEqual(self.sm._cal_last_error, bad["error"])
+        failing["on"] = False
+        self.sm._run_calendar_sync(M + 4 * W, M + 6 * W, force=True)   # covers only its start
+        good, bad = self.rows()
+        self.assertEqual((bad["windowFrom"], bad["windowUntil"]), (M + 6 * W, M + 8 * W))
+        self.sm._run_calendar_sync(M + 6 * W, M + 8 * W, force=True)   # covers the rest
+        self.assertEqual(["error" in r for r in self.rows()], [False])
+        self.assertIsNone(self.sm._cal_last_error)
+        self.sm._run_calendar_sync(M, M + 2 * W, force=True)    # nothing left to re-assert
+        self.assertEqual(["error" in r for r in self.rows()], [False])
+
+    def test_a_failing_hub_window_widens_the_range_never_narrows_it(self):
+        """XERK-2907 QA: a hub window that fails while Outlook is down, then reads
+        clean once it is up, must not clear an error the wider range still owes."""
+        W, M = self.WEEK, self.MON
+        self.outlook = {M + i * W: [self.ev(i)] for i in range(12)}
+        self.outlook_fail = "Outlook did not answer in 120s"
+        self.sm._run_calendar_sync(M, M + 12 * W, force=False)
+        self.rows()
+        self.sm._run_calendar_sync(M + 8 * W, M + 9 * W, force=True)
+        self.rows()
+        self.assertEqual(self.sm._cal_last_error_range, (M, M + 12 * W))
+        self.outlook_fail = None
+        self.sm._run_calendar_sync(M + 8 * W, M + 9 * W, force=True)
+        self.assertEqual(["error" in r for r in self.rows()], [False, True])
+        self.assertIsNotNone(self.sm._cal_last_error)
+        self.sm._run_calendar_sync(M, M + 12 * W, force=False)     # the schedule settles it
+        self.assertFalse(any("error" in r for r in self.rows()))
+        self.assertIsNone(self.sm._cal_last_error)
+
+    def test_a_clean_scheduled_pass_clears_the_error_and_a_new_failure_moves_its_range(self):
+        """XERK-2907: only a hub window keeps a standing error; the schedule's own
+        clean read is authoritative, and a later failure replaces the range."""
+        W, M = self.WEEK, self.MON
+        self.outlook = {M + i * W: [self.ev(i)] for i in range(12)}
+        real = self.cli.read_calendar_windows.side_effect
+        fail_from = {"at": M + 4 * W}
+
+        def fails_from(windows, **kw):
+            if fail_from["at"] is not None and windows[0][0] >= fail_from["at"]:
+                self.reads.append(windows)
+                raise self.cli.Refused("Outlook did not answer in 120s")
+            return real(windows, **kw)
+        self.cli.read_calendar_windows.side_effect = fails_from
+        self.sm._run_calendar_sync(M, M + 12 * W, force=False)
+        self.rows()
+        fail_from["at"] = M + 8 * W                              # a new failing range
+        self.sm._run_calendar_sync(M, M + 12 * W, force=False)
+        self.assertEqual(self.sm._cal_last_error_range, (M + 8 * W, M + 12 * W))
+        self.rows()
+        self.sm._run_calendar_sync(M + 4 * W, M + 6 * W, force=True)   # outside the new range
+        self.assertEqual(["error" in r for r in self.rows()], [False, True])
+        fail_from["at"] = None
+        self.sm._run_calendar_sync(M + 12 * W, M + 14 * W, force=False)   # schedule, clean
+        self.assertEqual(["error" in r for r in self.rows()], [False])
+        self.assertIsNone(self.sm._cal_last_error)
 
     def test_the_pass_runs_a_hub_window_first_else_only_when_due(self):
         with mock.patch.object(self.sm, "_run_calendar_sync") as run:
