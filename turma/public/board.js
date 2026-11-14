@@ -2956,6 +2956,36 @@
     root.focus({ preventScroll: true });
   }
 
+  // --- Focus across the board grid's per-beat repaint (XERK-2913) -------------
+  // A whole-board selector+index key would hand focus to ANOTHER ticket's key
+  // link once a newer ticket is inserted ahead of it, so the board keys focus by
+  // its CARD (data-key + data-site, stable across reorders) and, for a control
+  // on the card, by that control's place within the card alone. null when focus
+  // isn't inside `board`.
+  function cardSel(key, site) {
+    return `.kanban-card[data-key="${cssEscape(key)}"][data-site="${cssEscape(site)}"]`;
+  }
+  function boardFocusKey(board) {
+    const doc = board && board.ownerDocument;
+    const el = doc && doc.activeElement;
+    if (!el || !board.contains(el)) return null;
+    const card = el.closest && el.closest(".kanban-card");
+    if (!card) return { inner: focusKeyIn(board) };
+    return { card: [card.getAttribute("data-key"), card.getAttribute("data-site")],
+      inner: el === card ? null : focusKeyIn(card) };
+  }
+  // The control on the rebuilt card, else the card itself (a control that left or
+  // can't take focus — Start turning into its "starting…" span), else — the card
+  // is gone (filtered out, removed) — the board itself, never <body>.
+  function restoreBoardFocus(board, k) {
+    if (!k) return;
+    if (!k.card) return restoreFocusIn(board, k.inner || { sel: null });
+    const card = board.querySelector(cardSel(k.card[0], k.card[1]));
+    if (!card) return restoreFocusIn(board, { sel: null });
+    if (k.inner) return restoreFocusIn(card, k.inner);
+    card.focus({ preventScroll: true });
+  }
+
   // --- Modal Tab trap (XERK-2676) -------------------------------------------
   // Covers every [role=dialog][aria-modal] panel inside a .td-backdrop (board
   // detail/policy/epic-builder panels, New ticket, Add host) plus the Sessions
@@ -3010,7 +3040,7 @@
   }
 
   const api = {
-    focusKeyIn, restoreFocusIn, isTabStop, trapTabTarget, trapModalTab,
+    focusKeyIn, restoreFocusIn, boardFocusKey, restoreBoardFocus, isTabStop, trapTabTarget, trapModalTab,
     CATEGORIES, SLOTS, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgSlotPin, orgName, hostName, autoStartOn, ageStr,
     createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
     bareKey, prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,

@@ -44,6 +44,13 @@ makes an `android/` change part of the same PR) live there.
   field's caret) drops to `<body>` mid-typing. Their fallback is the PANEL itself, never ✕ (a stray
   Space would close the dialog). Tab wrapping is `trapModalTab`, installed once by `newticket.js`.
   Tests: `board-view.test.js`, the `XERK-2676:` cases in `board.test.js`.
+- **The board's per-beat grid swap goes through `boardFocusKey`/`restoreBoardFocus`** (XERK-2913) —
+  else a keyboard-focused card drops to `<body>` every beat.
+  - Keyed by CARD (`data-key`/`data-site`), then the control's place within that card: a whole-board
+    index hands focus to another ticket's key link once a ticket is inserted ahead.
+  - The restore sets `refocusing` so the `focusin` scroll-into-view skips it: `preserveScroll` leaves
+    a scroller at 0 alone, so that scroll yanked a strip the user swiped back home onto the card.
+  - Tests: `board-view.test.js` `restores card focus across the board repaint`.
 - **Any new shared `/*.js` must be in `server.js`'s `HASHED_ASSETS`** (an allowlist) AND loaded after
   `org.js` — a missing entry 404s and takes the module, and the page's render, down. Guarded by
   `newticket.test.js`.

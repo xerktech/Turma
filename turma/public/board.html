@@ -170,6 +170,8 @@ let view = (() => {
 })();
 // What the last render saw, so the toolbar can repaint between beats.
 let viewGroups = [], viewShown = 0, viewTotal = 0;
+// True only while render() hands focus back across its grid swap (XERK-2913).
+let refocusing = false;
 
 function saveView() {
   const qs = new URLSearchParams(B.boardViewToParams(view)).toString();
@@ -399,6 +401,10 @@ function render(data) {
   // horizontally-scrollable strip (.kanban-cols) whose swipe kept snapping back
   // to the first column a few seconds in (XERK-35), and each column list
   // (.kc-list) scrolls vertically too. preserveScroll keeps both across the swap.
+  // The swap also destroys a keyboard-focused card (or a control on one), which
+  // would drop focus to <body> every beat (XERK-2913); boardFocusKey /
+  // restoreBoardFocus re-find it in the new grid by its data-key/data-site.
+  const refocus = B.boardFocusKey($board);
   TurmaNav.preserveScroll($board, () => {
     $board.innerHTML = B.boardHtml(sites, orgFilter, {
       allKeys, sessionIndex, starts: sweepStarts(data.agents || [], sessionIndex),
@@ -418,6 +424,11 @@ function render(data) {
       // its run off this map (its own SSE event keeps it live).
       epicRuns: data.epicRuns,
     });
+    // Not a user's focus move, so the focusin scroll-into-view below must not
+    // run: it would drag a strip/column the user scrolled back to 0 (which
+    // preserveScroll doesn't restore) onto the card every beat.
+    refocusing = true;
+    try { B.restoreBoardFocus($board, refocus); } finally { refocusing = false; }
   });
 }
 
@@ -782,6 +793,7 @@ window.addEventListener("pointerup", onDragEnd);
 window.addEventListener("pointercancel", onDragEnd);
 
 // Keyboard: keep the focused card inside the column strip's viewport (XERK-253).
+// `refocusing` marks render()'s own focus restore, which must not scroll.
 // The browser only auto-scrolls a focused element into view when it is ENTIRELY
 // out of view, and the strip now scrolls on the desktop too — so tabbing into a
 // column that is half off the right edge drew the focus ring clipped and never
@@ -790,7 +802,7 @@ window.addEventListener("pointercancel", onDragEnd);
 // in; `nearest` moves the minimum, and the strip's `scroll-padding` leaves the
 // ring room. Not during a drag — that gesture owns the scroll.
 $board.addEventListener("focusin", (e) => {
-  if (dragActive()) return;
+  if (dragActive() || refocusing) return;
   const el = e.target.closest && e.target.closest(".kanban-card, .kanban-col");
   if (el) el.scrollIntoView({ block: "nearest", inline: "nearest" });
 });

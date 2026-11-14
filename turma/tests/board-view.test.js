@@ -303,6 +303,98 @@ test("board.html's policy refusal toasts print the siteKey bare", () => {
   assert.doesNotMatch(src, /policy for \$\{siteKey\}/);
 });
 
+// XERK-2913: the board's per-beat grid swap must hand focus back to the same
+// TICKET's card/control (never another ticket's after a reorder, never <body>),
+// and that restore must not trigger the focusin scroll-into-view.
+test("board.html restores card focus across the board repaint", () => {
+  const src = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
+  const m = src.match(/function render\([^)]*\) \{[\s\S]*?\n\}/);
+  assert.ok(m, "render not found");
+  const r = m[0];
+  const save = r.search(/^ {2}const refocus = B\.boardFocusKey\(\$board\);$/m);
+  const swap = r.indexOf("$board.innerHTML = B.boardHtml(");
+  const restore = r.search(/^ {4}refocusing = true;\n {4}try \{ B\.restoreBoardFocus\(\$board, refocus\); \} finally \{ refocusing = false; \}$/m);
+  assert.ok(save > 0 && save < swap && restore > swap, "save → swap → restore");
+  assert.match(src, /addEventListener\("focusin", \(e\) => \{\n {2}if \(dragActive\(\) \|\| refocusing\) return;/);
+
+  const { boardFocusKey, restoreBoardFocus } = require("../public/board.js");
+  const doc = { activeElement: null };
+  // A tiny fake DOM: nodes with a parent, attributes, and matches() for the few
+  // selector shapes the helpers build.
+  const node = (tag, attrs = {}, cls = "", kids = []) => {
+    const n = { tagName: tag.toUpperCase(), id: "", classList: cls ? [cls] : [], kids, parent: null,
+      attributes: Object.entries(attrs).map(([name, value]) => ({ name, value })),
+      focusable: true, focusArgs: [], attrs: { ...attrs },
+      getAttribute(a) { return a in this.attrs ? this.attrs[a] : null; },
+      hasAttribute(a) { return a in this.attrs; },
+      setAttribute(a, v) { this.attrs[a] = v; },
+      focus(o) { this.focusArgs.push(o); if (this.focusable) doc.activeElement = this; },
+      ownerDocument: doc,
+      all() { return this.kids.flatMap(k => [k, ...k.all()]); },
+      contains(e) { return e === this || this.all().includes(e); },
+      closest(sel) { for (let c = this; c; c = c.parent) if (c.matches(sel)) return c; return null; },
+      matches(sel) {
+        const card = sel.match(/^\.kanban-card\[data-key="(.*)"\]\[data-site="(.*)"\]$/);
+        if (sel === ".kanban-card") return this.classList[0] === "kanban-card";
+        if (card) return this.classList[0] === "kanban-card" && this.attrs["data-key"] === card[1]
+          && this.attrs["data-site"] === card[2];
+        const tc = sel.match(/^(\w+)\.([\w-]+)$/);
+        if (tc) return this.tagName.toLowerCase() === tc[1] && this.classList[0] === tc[2];
+        const td = sel.match(/^(\w+)\[([\w-]+)="(.*)"\]$/);
+        if (td) return this.tagName.toLowerCase() === td[1] && this.attrs[td[2]] === td[3];
+        return false;
+      },
+      querySelectorAll(sel) { return this.all().filter(k => k.matches(sel)); },
+      querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+    };
+    kids.forEach(k => { k.parent = n; });
+    return n;
+  };
+  const card = (key) => node("div", { "data-key": key, "data-site": "s", tabindex: "0" }, "kanban-card",
+    [node("a", { href: `https://x.test/${key}` }, "kc-key"), node("button", { "data-start": key })]);
+  const board = (keys) => node("div", {}, "", keys.map(card));
+  const keyLink = (b, k) => b.querySelector(`.kanban-card[data-key="${k}"][data-site="s"]`).kids[0];
+
+  // The card itself → the rebuilt card.
+  let b0 = board(["W-2", "W-3"]);
+  doc.activeElement = b0.kids[1];
+  let k = boardFocusKey(b0);
+  let b1 = board(["W-9", "W-2", "W-3"]);
+  restoreBoardFocus(b1, k);
+  assert.equal(doc.activeElement, b1.kids[2]);
+  assert.deepEqual(doc.activeElement.focusArgs, [{ preventScroll: true }]);
+
+  // A key link stays on ITS ticket after a newer ticket is inserted ahead.
+  b0 = board(["W-2", "W-3"]);
+  doc.activeElement = keyLink(b0, "W-3");
+  k = boardFocusKey(b0);
+  b1 = board(["W-9", "W-2", "W-3"]);
+  restoreBoardFocus(b1, k);
+  assert.equal(doc.activeElement, keyLink(b1, "W-3"));
+
+  // A control that won't take focus any more → its card, not the board or <body>.
+  b0 = board(["W-3"]);
+  doc.activeElement = b0.kids[0].kids[1];
+  k = boardFocusKey(b0);
+  b1 = board(["W-3"]);
+  b1.kids[0].kids[1].focusable = false;
+  restoreBoardFocus(b1, k);
+  assert.equal(doc.activeElement, b1.kids[0]);
+
+  // The card is gone → the board itself, made focusable.
+  b1 = board(["W-2"]);
+  restoreBoardFocus(b1, k);
+  assert.equal(doc.activeElement, b1);
+  assert.equal(b1.attrs.tabindex, "-1");
+
+  // Focus outside the board is never taken.
+  const outside = node("input", { id: "q" });
+  doc.activeElement = outside;
+  assert.equal(boardFocusKey(board(["W-2"])), null);
+  restoreBoardFocus(board(["W-2"]), null);
+  assert.equal(doc.activeElement, outside);
+});
+
 // XERK-2676: paintDetail's innerHTML swap must hand focus back to the control
 // that held it (or ✕), not drop it to <body>; closing must return focus to the
 // ticket's card even after a board repaint replaced it. Drives the helpers
