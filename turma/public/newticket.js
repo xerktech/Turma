@@ -157,11 +157,21 @@
 
   // Return focus to the control that had it when the form opened (XERK-2911).
   // If that control is gone or won't take focus (a calendar repaint replaced
-  // it, it became disabled), fall back to the header New-ticket button.
+  // it, it became disabled), fall back to a page modal still open underneath
+  // (the board detail panel repainted while the form was up, XERK-2912) — the
+  // header button sits behind that modal's backdrop — else the header button.
+  function underlyingModal() {
+    if (!docRef || typeof docRef.querySelectorAll !== "function") return null;
+    const open = [...docRef.querySelectorAll(".td-backdrop:not([hidden]) [role=dialog][aria-modal=true]")]
+      .filter((p) => p !== panel);
+    const top = open[open.length - 1];
+    if (top && top.hasAttribute && !top.hasAttribute("tabindex")) top.setAttribute("tabindex", "-1");
+    return top || null;
+  }
   function restoreOpenerFocus() {
     const prev = opener;
     opener = null;
-    for (const el of [prev, btnEl]) {
+    for (const el of [prev, underlyingModal(), btnEl]) {
       if (!el || !el.focus || el.isConnected === false) continue;
       el.focus({ preventScroll: true });
       if (!docRef || docRef.activeElement === el) return;

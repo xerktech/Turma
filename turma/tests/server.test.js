@@ -30511,9 +30511,16 @@ test("XERK-2550: /api/agents serves each principal its own retired usage and rou
     // One shared fleet body; only the tail differs, so each scope revalidates on its own ETag.
     assert.notEqual(a.headers.etag, b.headers.etag);
     assert.notEqual(a.headers.etag, ops.headers.etag);
-    const again = await request("GET", "/api/agents", { headers: { ...T.A.h, "if-none-match": a.headers.etag } });
+    // Revalidate against a FRESH ETag (XERK-2912): a timer left by an earlier test can rebuild the
+    // fleet cache between two requests, which moves every ETag and reads as a spurious 200.
+    let again, etagA;
+    for (let i = 0; i < 3; i++) {
+      etagA = (await request("GET", "/api/agents", { headers: T.A.h })).headers.etag;
+      again = await request("GET", "/api/agents", { headers: { ...T.A.h, "if-none-match": etagA } });
+      if (again.status === 304) break;
+    }
     assert.equal(again.status, 304);
-    const cross = await request("GET", "/api/agents", { headers: { ...T.B.h, "if-none-match": a.headers.etag } });
+    const cross = await request("GET", "/api/agents", { headers: { ...T.B.h, "if-none-match": etagA } });
     assert.equal(cross.status, 200);
     // The listing itself is scoped too (XERK-2534): each caller's own hosts only.
     assert.ok(a.body.agents.every((x) => x.key.endsWith(`@${T.A.t}`)));

@@ -402,3 +402,27 @@ test("newticket: Esc on an open form is marked handled, a shut form leaves it (X
   assert.equal(esc().prevented, true);
   assert.equal(backdrop.hidden, true, "a clean form closes");
 });
+
+// XERK-2912: a gone opener with a page modal still open underneath (the board detail panel
+// repainted while the form was up) hands focus to that modal, never to the header button
+// behind its backdrop.
+test("newticket: a gone opener falls back to a page modal still open underneath (XERK-2912)", () => {
+  const { body, button, doc } = mountNT();
+  NT.update({ agents: [agent("h1", "acme.atlassian.net")] });
+  const backdrop = body.children[0];
+  const focusable = (el) => { el.focus = () => { doc.activeElement = el; }; return el; };
+  focusable(button);
+  const close = focusable({});
+  backdrop.children[0].querySelector = (sel) => (sel === ".td-close" ? close : null);
+  const attrs = {};
+  const detail = focusable({ hasAttribute: (k) => k in attrs, setAttribute: (k, v) => { attrs[k] = v; } });
+  doc.querySelectorAll = (sel) => (/td-backdrop:not\(\[hidden\]\)/.test(sel) ? [detail, backdrop.children[0]] : []);
+  const ev = focusable({ isConnected: true });
+  doc.activeElement = ev;
+  for (const fn of button._listeners.click || []) fn({});
+  ev.isConnected = false;
+  for (const fn of doc._listeners.keydown || []) fn({ key: "Escape", preventDefault() {}, stopPropagation() {} });
+  assert.equal(backdrop.hidden, true);
+  assert.equal(doc.activeElement, detail);
+  assert.equal(attrs.tabindex, "-1");
+});
