@@ -6302,7 +6302,7 @@ function setCalendarHostSettings(key, body) {
   const okOrg = (o) => o === null || (typeof o === "string" && orgs.includes(o));
   const cur = sanitizeCalendarHostSettings(calendarHostSettings[key] || {});
   if ("defaultOrg" in body) {
-    if (!okOrg(body.defaultOrg)) return { status: 404, body: { error: "defaultOrg is not an org of this host's tenant that a host is in" } };
+    if (!okOrg(body.defaultOrg)) return { status: typeof body.defaultOrg === "string" ? 404 : 400, body: { error: "defaultOrg is not an org of this host's tenant that a host is in" } };
     if (body.defaultOrg === null) delete cur.defaultOrg;
     else cur.defaultOrg = body.defaultOrg;
   }
@@ -6314,7 +6314,10 @@ function setCalendarHostSettings(key, body) {
   if ("series" in body) {
     const s = body.series;
     if (!s || typeof s !== "object" || !calId(s.id) || !(s.org === null || okOrg(s.org))) {
-      return { status: s && typeof s === "object" && calId(s.id) && s.org !== "" ? 404 : 400,
+      // 404 only for a well-formed series naming an org this tenant lacks; a
+      // non-string org, "" (no org is not an org, XERK-2936) or a bad id is a
+      // malformed body, 400 (rollup XERK-2944).
+      return { status: s && typeof s === "object" && calId(s.id) && typeof s.org === "string" && s.org !== "" ? 404 : 400,
         body: { error: "series must be {id, org}: org an org of this host's tenant, or null to clear" } };
     }
     delete cur.seriesOrgs[s.id];
